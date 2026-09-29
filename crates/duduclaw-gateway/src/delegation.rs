@@ -103,7 +103,9 @@ impl DelegationEnvelope {
 
         // Constraints
         if !self.context.constraints.is_empty() {
-            let list = self.context.constraints
+            let list = self
+                .context
+                .constraints
                 .iter()
                 .map(|c| format!("- {c}"))
                 .collect::<Vec<_>>()
@@ -113,7 +115,9 @@ impl DelegationEnvelope {
 
         // Task chain (prior steps)
         if !self.context.task_chain.is_empty() {
-            let chain = self.context.task_chain
+            let chain = self
+                .context
+                .task_chain
                 .iter()
                 .map(|e| format!("- **{}** ({}): {}", e.agent_id, e.status, e.summary))
                 .collect::<Vec<_>>()
@@ -134,7 +138,10 @@ impl DelegationEnvelope {
                 sections.push("## Output Format\nRespond with a unified diff.".to_string());
             }
             OutputFormat::Decision => {
-                sections.push("## Output Format\nRespond with: APPROVED or REJECTED followed by rationale.".to_string());
+                sections.push(
+                    "## Output Format\nRespond with: APPROVED or REJECTED followed by rationale."
+                        .to_string(),
+                );
             }
         }
 
@@ -250,13 +257,11 @@ mod tests {
         let env = DelegationEnvelope {
             task: "Verify result".to_string(),
             context: DelegationContext {
-                task_chain: vec![
-                    TaskChainEntry {
-                        agent_id: "coder".to_string(),
-                        status: "completed".to_string(),
-                        summary: "Implemented auth fix".to_string(),
-                    },
-                ],
+                task_chain: vec![TaskChainEntry {
+                    agent_id: "coder".to_string(),
+                    status: "completed".to_string(),
+                    summary: "Implemented auth fix".to_string(),
+                }],
                 ..Default::default()
             },
             expected_output: OutputSpec::default(),

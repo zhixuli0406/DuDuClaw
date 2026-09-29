@@ -1,7 +1,8 @@
 //! UDS client SDK — one request per connection, mirroring the server's
 //! transport (see `protocol.rs` module docs). Lives in this crate (not the
 //! gateway) so client and server share one source of truth for the wire
-//! format, the same reasoning `duduclaw-cli-worker::client` documents for
+//! format, the same reasoning the former `duduclaw-cli-worker::client`
+//! (removed 2026-09 with the PTY pool) documented for
 //! its own `WorkerClient`.
 
 use std::path::PathBuf;

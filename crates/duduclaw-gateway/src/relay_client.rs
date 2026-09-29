@@ -38,8 +38,8 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use duduclaw_core::relay_protocol::{ClientFrame, DeviceInboundFrame, HookFrame, ServerFrame};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
@@ -115,7 +115,9 @@ async fn run_relay_client(home_dir: PathBuf, ctx: Arc<ReplyContext>, cfg: RelayC
         // re-registration is a no-op 200 on the relay side, see
         // `duduclaw-relay/src/device_register.rs`), so a transient relay
         // restart never leaves this box permanently unregistered.
-        if let Err(e) = register_device(&http, &cfg.url, &identity, cfg.device_name.as_deref()).await {
+        if let Err(e) =
+            register_device(&http, &cfg.url, &identity, cfg.device_name.as_deref()).await
+        {
             warn!(device_id = %identity.device_id(), error = %e, "relay client: device registration failed");
             crate::metrics::global_metrics().relay_reconnect();
             retries = back_off(retries).await;
@@ -209,10 +211,11 @@ async fn run_session(
     let ws_url = crate::relay_config::hook_ws_endpoint(base_url, identity.device_id())
         .map_err(|e| format!("bad relay url: {e}"))?;
 
-    let (ws_stream, _resp) = tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(&ws_url))
-        .await
-        .map_err(|_| "connect timed out".to_string())?
-        .map_err(|e| format!("ws connect failed: {e}"))?;
+    let (ws_stream, _resp) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(&ws_url))
+            .await
+            .map_err(|_| "connect timed out".to_string())?
+            .map_err(|e| format!("ws connect failed: {e}"))?;
 
     let (mut sink, mut stream) = ws_stream.split();
 
@@ -221,7 +224,7 @@ async fn run_session(
     let nonce_b64 = match duduclaw_core::relay_protocol::parse_device_inbound(&challenge_text) {
         DeviceInboundFrame::Control(ServerFrame::Challenge { nonce_b64 }) => nonce_b64,
         DeviceInboundFrame::Control(ServerFrame::Error { message }) => {
-            return Err(format!("relay rejected connection before auth: {message}"))
+            return Err(format!("relay rejected connection before auth: {message}"));
         }
         other => return Err(format!("expected a challenge frame, got {other:?}")),
     };
@@ -235,7 +238,7 @@ async fn run_session(
     match duduclaw_core::relay_protocol::parse_device_inbound(&ready_text) {
         DeviceInboundFrame::Control(ServerFrame::Ready) => {}
         DeviceInboundFrame::Control(ServerFrame::Error { message }) => {
-            return Err(format!("relay auth rejected: {message}"))
+            return Err(format!("relay auth rejected: {message}"));
         }
         other => return Err(format!("expected a ready frame, got {other:?}")),
     }
@@ -322,7 +325,9 @@ async fn route_hook(frame: HookFrame, line_state: &LineState) {
         "line" => inject_line_hook(frame, line_state).await,
         other => {
             debug!(channel = other, frame_id = %frame.id, "relay client: unsupported channel — dropped");
-            crate::metrics::global_metrics().relay_frame(other, "unsupported").await;
+            crate::metrics::global_metrics()
+                .relay_frame(other, "unsupported")
+                .await;
         }
     }
 }
@@ -338,14 +343,19 @@ async fn inject_line_hook(frame: HookFrame, line_state: &LineState) {
         Ok(b) => b,
         Err(e) => {
             warn!(frame_id = %frame.id, error = %e, "relay client: hook frame body_b64 did not decode — dropped");
-            crate::metrics::global_metrics().relay_frame("line", "bad_signature").await;
+            crate::metrics::global_metrics()
+                .relay_frame("line", "bad_signature")
+                .await;
             return;
         }
     };
 
     let mut headers = HeaderMap::new();
     for (name, value) in &frame.headers {
-        match (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
+        match (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
             (Ok(name), Ok(value)) => {
                 headers.insert(name, value);
             }
@@ -360,12 +370,19 @@ async fn inject_line_hook(frame: HookFrame, line_state: &LineState) {
         }
     }
 
-    let status = crate::line::handle_line_webhook(line_state.clone(), &headers, Bytes::from(body)).await;
-    let outcome = if status.is_success() { "ok" } else { "bad_signature" };
+    let status =
+        crate::line::handle_line_webhook(line_state.clone(), &headers, Bytes::from(body)).await;
+    let outcome = if status.is_success() {
+        "ok"
+    } else {
+        "bad_signature"
+    };
     if outcome == "bad_signature" {
         warn!(frame_id = %frame.id, status = %status, "relay client: LINE webhook verification failed — dropped");
     }
-    crate::metrics::global_metrics().relay_frame("line", outcome).await;
+    crate::metrics::global_metrics()
+        .relay_frame("line", outcome)
+        .await;
 }
 
 /// The box's LAN-facing IPv4 address, if it has one. Uses the standard
@@ -431,20 +448,29 @@ mod tests {
     static METRICS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn test_ctx(home: &std::path::Path) -> Arc<ReplyContext> {
-        let registry = Arc::new(tokio::sync::RwLock::new(duduclaw_agent::AgentRegistry::new(
-            home.join("agents"),
-        )));
-        let sessions = Arc::new(crate::session::SessionManager::new(&home.join("sessions.db")).unwrap());
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            duduclaw_agent::AgentRegistry::new(home.join("agents")),
+        ));
+        let sessions =
+            Arc::new(crate::session::SessionManager::new(&home.join("sessions.db")).unwrap());
         let status: crate::channel_reply::ChannelStatusMap =
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
-        Arc::new(ReplyContext::new(registry, home.to_path_buf(), sessions, status, tx))
+        Arc::new(ReplyContext::new(
+            registry,
+            home.to_path_buf(),
+            sessions,
+            status,
+            tx,
+        ))
     }
 
     fn write_line_config(home: &std::path::Path, secret: &str, token: &str) {
         std::fs::write(
             home.join("config.toml"),
-            format!("[channels]\nline_channel_token = \"{token}\"\nline_channel_secret = \"{secret}\"\n"),
+            format!(
+                "[channels]\nline_channel_token = \"{token}\"\nline_channel_secret = \"{secret}\"\n"
+            ),
         )
         .unwrap();
     }
@@ -458,7 +484,11 @@ mod tests {
         BASE64.encode(mac.finalize().into_bytes())
     }
 
-    fn hook_frame_for(channel: &str, headers: std::collections::BTreeMap<String, String>, body: &[u8]) -> String {
+    fn hook_frame_for(
+        channel: &str,
+        headers: std::collections::BTreeMap<String, String>,
+        body: &[u8],
+    ) -> String {
         let frame = serde_json::json!({
             "type": "hook",
             "id": "test-frame-1",
@@ -502,13 +532,20 @@ mod tests {
         let body = br#"{"events":[]}"#;
         let mut headers = std::collections::BTreeMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        headers.insert("x-line-signature".to_string(), "totally-wrong-signature".to_string());
+        headers.insert(
+            "x-line-signature".to_string(),
+            "totally-wrong-signature".to_string(),
+        );
         let text = hook_frame_for("line", headers, body);
 
         let before = relay_frame_count("line", "bad_signature").await;
         handle_hook_text(&text, &line_state).await;
         let after = relay_frame_count("line", "bad_signature").await;
-        assert_eq!(after, before + 1, "an invalid signature must fail closed and be counted");
+        assert_eq!(
+            after,
+            before + 1,
+            "an invalid signature must fail closed and be counted"
+        );
     }
 
     #[tokio::test]
@@ -692,7 +729,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200, "the relay always answers 200 once structurally valid");
+        assert_eq!(
+            resp.status(),
+            200,
+            "the relay always answers 200 once structurally valid"
+        );
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while relay_frame_count("line", "ok").await <= before_ok {

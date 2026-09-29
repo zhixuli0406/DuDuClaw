@@ -146,7 +146,10 @@ pub fn forward_summaries(
     for r in rows {
         let entry = by_agent.entry(r.agent_id.clone()).or_insert_with(|| {
             (
-                ForwardAgentSummary { agent_id: r.agent_id.clone(), ..Default::default() },
+                ForwardAgentSummary {
+                    agent_id: r.agent_id.clone(),
+                    ..Default::default()
+                },
                 0.0, // brier sum
                 0,   // brier n
                 0.0, // composite sum
@@ -357,7 +360,9 @@ pub struct ForwardChainRound {
     pub error_breakdown: Option<ChainErrorBreakdown>,
 }
 
-fn tool_classes_to_strings(set: &std::collections::BTreeSet<super::tool_class::ToolClass>) -> Vec<String> {
+fn tool_classes_to_strings(
+    set: &std::collections::BTreeSet<super::tool_class::ToolClass>,
+) -> Vec<String> {
     set.iter()
         .filter_map(|t| serde_json::to_value(t).ok())
         .filter_map(|v| v.as_str().map(str::to_string))
@@ -547,7 +552,11 @@ pub fn forward_calibration(db_path: &Path, agent_id: &str) -> ForwardCalibration
         .map(|u| 1.0 - avg_brier / u);
     let bins = reliability_bins_equal_freq(&samples, 3)
         .into_iter()
-        .map(|b| CalibrationBin { p_mean: b.p_mean, emp_rate: b.emp_rate, n: b.n })
+        .map(|b| CalibrationBin {
+            p_mean: b.p_mean,
+            emp_rate: b.emp_rate,
+            n: b.n,
+        })
         .collect();
     let label = if n < CALIBRATION_MIN_SAMPLES {
         "candidate"
@@ -585,7 +594,11 @@ pub struct ForwardStateRow {
 }
 
 /// Learned state buckets, most-sampled first. Any failure ⇒ empty.
-pub fn forward_states(db_path: &Path, agent_filter: Option<&str>, limit: usize) -> Vec<ForwardStateRow> {
+pub fn forward_states(
+    db_path: &Path,
+    agent_filter: Option<&str>,
+    limit: usize,
+) -> Vec<ForwardStateRow> {
     if !db_path.exists() {
         return Vec::new();
     }
@@ -642,27 +655,54 @@ mod tests {
         conn.execute(
             insert,
             rusqlite::params![
-                "p1", "t1", "trader", 1, "canonical", "2026-08-13T01:00:00+00:00",
-                Some("{}"), Some("full"), Some(0.1_f64), Some("negligible"),
-                Some("2026-08-13T02:00:00+00:00"), Some(0.04_f64)
+                "p1",
+                "t1",
+                "trader",
+                1,
+                "canonical",
+                "2026-08-13T01:00:00+00:00",
+                Some("{}"),
+                Some("full"),
+                Some(0.1_f64),
+                Some("negligible"),
+                Some("2026-08-13T02:00:00+00:00"),
+                Some(0.04_f64)
             ],
         )
         .unwrap();
         conn.execute(
             insert,
             rusqlite::params![
-                "p2", "t2", "trader", 1, "prior", "2026-08-13T03:00:00+00:00",
-                Some("{}"), Some("mcp_only"), Some(0.9_f64), Some("critical"),
-                Some("2026-08-13T04:00:00+00:00"), Some(0.64_f64)
+                "p2",
+                "t2",
+                "trader",
+                1,
+                "prior",
+                "2026-08-13T03:00:00+00:00",
+                Some("{}"),
+                Some("mcp_only"),
+                Some(0.9_f64),
+                Some("critical"),
+                Some("2026-08-13T04:00:00+00:00"),
+                Some(0.64_f64)
             ],
         )
         .unwrap();
         conn.execute(
             insert,
             rusqlite::params![
-                "p3", "t3", "trader", 2, "canonical", "2026-08-13T05:00:00+00:00",
-                None::<String>, None::<String>, None::<f64>, None::<String>,
-                None::<String>, None::<f64>
+                "p3",
+                "t3",
+                "trader",
+                2,
+                "canonical",
+                "2026-08-13T05:00:00+00:00",
+                None::<String>,
+                None::<String>,
+                None::<f64>,
+                None::<String>,
+                None::<String>,
+                None::<f64>
             ],
         )
         .unwrap();
@@ -670,9 +710,18 @@ mod tests {
         conn.execute(
             insert,
             rusqlite::params![
-                "p4", "t4", "helper", 1, "marginal", "2026-08-13T01:30:00+00:00",
-                Some("{}"), Some("none"), Some(0.5_f64), Some("moderate"),
-                Some("2026-08-13T01:45:00+00:00"), None::<f64>
+                "p4",
+                "t4",
+                "helper",
+                1,
+                "marginal",
+                "2026-08-13T01:30:00+00:00",
+                Some("{}"),
+                Some("none"),
+                Some(0.5_f64),
+                Some("moderate"),
+                Some("2026-08-13T01:45:00+00:00"),
+                None::<f64>
             ],
         )
         .unwrap();
@@ -707,7 +756,10 @@ mod tests {
         let avg = trader.avg_brier.unwrap();
         assert!((avg - 0.34).abs() < 1e-9, "avg of 0.04/0.64, got {avg}");
         // Newest settled row wins the last_settled_at slot.
-        assert_eq!(trader.last_settled_at.as_deref(), Some("2026-08-13T04:00:00+00:00"));
+        assert_eq!(
+            trader.last_settled_at.as_deref(),
+            Some("2026-08-13T04:00:00+00:00")
+        );
 
         let helper = summaries.iter().find(|s| s.agent_id == "helper").unwrap();
         assert_eq!(helper.settled, 1);
@@ -768,7 +820,10 @@ mod tests {
             observed_outcome: ObservedOutcome::Accepted,
             observed_artifact: ArtifactShape::TextOnly,
             fidelity: ObservationFidelity::McpOnly,
-            window: ("2026-08-13T01:00:00+00:00".into(), "2026-08-13T02:00:00+00:00".into()),
+            window: (
+                "2026-08-13T01:00:00+00:00".into(),
+                "2026-08-13T02:00:00+00:00".into(),
+            ),
             runtime: "claude".into(),
         };
         serde_json::to_string(&o).unwrap()
@@ -789,18 +844,37 @@ mod tests {
         conn.execute(
             insert,
             rusqlite::params![
-                "p2", "t1", "trader", 2, prediction_json_fixture(0.4), "prior",
-                "2026-08-13T03:00:00+00:00", None::<String>, None::<String>,
-                None::<f64>, None::<String>, None::<String>, None::<f64>
+                "p2",
+                "t1",
+                "trader",
+                2,
+                prediction_json_fixture(0.4),
+                "prior",
+                "2026-08-13T03:00:00+00:00",
+                None::<String>,
+                None::<String>,
+                None::<f64>,
+                None::<String>,
+                None::<String>,
+                None::<f64>
             ],
         )
         .unwrap();
         conn.execute(
             insert,
             rusqlite::params![
-                "p1", "t1", "trader", 1, prediction_json_fixture(0.8), "statistical",
-                "2026-08-13T01:00:00+00:00", observation_json_fixture(), "mcp_only",
-                Some(0.1_f64), Some("negligible"), Some("2026-08-13T02:00:00+00:00"),
+                "p1",
+                "t1",
+                "trader",
+                1,
+                prediction_json_fixture(0.8),
+                "statistical",
+                "2026-08-13T01:00:00+00:00",
+                observation_json_fixture(),
+                "mcp_only",
+                Some(0.1_f64),
+                Some("negligible"),
+                Some("2026-08-13T02:00:00+00:00"),
                 Some(0.04_f64)
             ],
         )
@@ -809,9 +883,19 @@ mod tests {
         conn.execute(
             insert,
             rusqlite::params![
-                "p3", "t1", "trader", 3, "not json", "prior",
-                "2026-08-13T05:00:00+00:00", None::<String>, None::<String>,
-                None::<f64>, None::<String>, None::<String>, None::<f64>
+                "p3",
+                "t1",
+                "trader",
+                3,
+                "not json",
+                "prior",
+                "2026-08-13T05:00:00+00:00",
+                None::<String>,
+                None::<String>,
+                None::<f64>,
+                None::<String>,
+                None::<String>,
+                None::<f64>
             ],
         )
         .unwrap();
@@ -831,7 +915,10 @@ mod tests {
         let breakdown = chain[0].error_breakdown.as_ref().unwrap();
         assert!((breakdown.tool_set_error - 0.5).abs() < 1e-9);
         assert!(breakdown.outcome_error_applicable);
-        assert!(chain[1].error_breakdown.is_none(), "unsettled row has no breakdown");
+        assert!(
+            chain[1].error_breakdown.is_none(),
+            "unsettled row has no breakdown"
+        );
         let exp = chain[0].expected.as_ref().unwrap();
         assert_eq!(exp.tool_classes, vec!["read", "exec"]);
         assert_eq!(exp.call_band, (2, 8));
@@ -845,7 +932,10 @@ mod tests {
         assert_eq!(chain[1].round, 2);
         assert!(chain[1].observed.is_none());
         assert_eq!(chain[2].round, 3);
-        assert!(chain[2].expected.is_none(), "bad JSON must degrade, not drop");
+        assert!(
+            chain[2].expected.is_none(),
+            "bad JSON must degrade, not drop"
+        );
         assert!(forward_chain(&db_path, "unknown-task").is_empty());
     }
 
@@ -902,7 +992,11 @@ mod tests {
         }
         let v = forward_calibration(&db_path, "trader");
         assert!(v.n >= 8);
-        assert_eq!(v.label, "supported", "bss={:?} res={:?}", v.brier_skill_score, v.resolution);
+        assert_eq!(
+            v.label, "supported",
+            "bss={:?} res={:?}",
+            v.brier_skill_score, v.resolution
+        );
         assert!(!v.bins.is_empty());
         // Unknown agent stays honest-empty.
         assert_eq!(forward_calibration(&db_path, "nobody").label, "candidate");

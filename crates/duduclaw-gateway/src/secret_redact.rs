@@ -141,7 +141,10 @@ fn redact_word<'a>(word: &'a str, prev_word: Option<&str>) -> Cow<'a, str> {
 
     // 2. `Bearer <tok>` / `token <tok>` pairs — keyword AND credential shape.
     if let Some(p) = prev_word {
-        let key = p.trim_end_matches(':').trim_end_matches('=').to_ascii_lowercase();
+        let key = p
+            .trim_end_matches(':')
+            .trim_end_matches('=')
+            .to_ascii_lowercase();
         if AUTH_KEYWORDS.contains(&key.as_str()) && looks_like_opaque_credential(word) {
             return Cow::Owned(mask_secret(word));
         }
@@ -172,22 +175,35 @@ fn redact_word<'a>(word: &'a str, prev_word: Option<&str>) -> Cow<'a, str> {
 /// match would fire on `monkey` (key), `design` / `assign` (sign) and
 /// `authority` (auth).
 const SENSITIVE_PARAM_WORDS: &[&str] = &[
-    "secret", "secrets", "token", "tokens", "password", "passwd", "pwd", "key",
-    "keys", "sign", "signature", "credential", "credentials", "auth", "session",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+    "password",
+    "passwd",
+    "pwd",
+    "key",
+    "keys",
+    "sign",
+    "signature",
+    "credential",
+    "credentials",
+    "auth",
+    "session",
 ];
 
 /// Vendor parameter names that are a single unsplittable word, so the
 /// word-equality rule above cannot see the marker inside them.
 const SENSITIVE_PARAM_EXACT: &[&str] = &[
-    "corpsecret",   // WeCom /cgi-bin/gettoken
-    "appsecret",    // DingTalk /gettoken
-    "appkey",       // DingTalk
-    "accesskey",    // generic cloud vendors
-    "secretkey",    //
-    "apikey",       //
-    "sessionkey",   //
-    "accesstoken",  //
-    "authtoken",    //
+    "corpsecret",  // WeCom /cgi-bin/gettoken
+    "appsecret",   // DingTalk /gettoken
+    "appkey",      // DingTalk
+    "accesskey",   // generic cloud vendors
+    "secretkey",   //
+    "apikey",      //
+    "sessionkey",  //
+    "accesstoken", //
+    "authtoken",   //
 ];
 
 fn is_sensitive_param(name: &str) -> bool {
@@ -240,7 +256,11 @@ fn mask_url(url: &str) -> Cow<'_, str> {
         }
     }
 
-    if changed { Cow::Owned(out) } else { Cow::Borrowed(url) }
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(url)
+    }
 }
 
 fn mask_path_segment(seg: &str) -> Cow<'_, str> {
@@ -289,7 +309,12 @@ pub(crate) fn split_telegram_token(s: &str) -> Option<(&str, char, &str)> {
 fn mask_telegram_token(s: &str) -> String {
     match split_telegram_token(s) {
         Some((id, sep, secret)) => {
-            format!("{}***{}***{}", first_chars(id, 4), sep, last_chars(secret, 4))
+            format!(
+                "{}***{}***{}",
+                first_chars(id, 4),
+                sep,
+                last_chars(secret, 4)
+            )
         }
         None => mask_secret(s),
     }
@@ -297,13 +322,23 @@ fn mask_telegram_token(s: &str) -> String {
 
 /// Vendor prefixes that unambiguously mark a credential.
 const SECRET_PREFIXES: &[&str] = &[
-    "xoxb-", "xoxp-", "xoxa-", "xoxe-", "xoxs-", "xapp-", // Slack
-    "sk-",          // OpenAI / Anthropic
-    "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", // GitHub
-    "ddc_",  // DuDuClaw MCP API keys
-    "EAA",   // Meta / WhatsApp Cloud access tokens
-    "AIza",  // Google API keys
-    "ya29.", // Google OAuth access tokens
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxe-",
+    "xoxs-",
+    "xapp-", // Slack
+    "sk-",   // OpenAI / Anthropic
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_", // GitHub
+    "ddc_",        // DuDuClaw MCP API keys
+    "EAA",         // Meta / WhatsApp Cloud access tokens
+    "AIza",        // Google API keys
+    "ya29.",       // Google OAuth access tokens
 ];
 
 fn has_secret_prefix(w: &str) -> bool {
@@ -317,15 +352,20 @@ fn is_dotted_token_shape(w: &str) -> bool {
         && parts[0].len() >= 20
         && parts[1].len() >= 5
         && parts[2].len() >= 20
-        && parts
-            .iter()
-            .all(|p| p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        && parts.iter().all(|p| {
+            p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
 }
 
 // ── Small helpers ───────────────────────────────────────────────────────────
 
 fn is_delim(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | ',' | ';')
+    c.is_whitespace()
+        || matches!(
+            c,
+            '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | ',' | ';'
+        )
 }
 
 fn first_chars(s: &str, n: usize) -> String {
@@ -378,11 +418,21 @@ mod tests {
     }
 
     fn discord_token() -> String {
-        ["MTIzNDU2Nzg5MDEyMzQ1Njc4", ".GhIjKl", ".abcdefghijklmnopqrstuvwxyz12"].concat()
+        [
+            "MTIzNDU2Nzg5MDEyMzQ1Njc4",
+            ".GhIjKl",
+            ".abcdefghijklmnopqrstuvwxyz12",
+        ]
+        .concat()
     }
 
     fn jwt() -> String {
-        ["eyJhbGciOiJIUzI1NiJ9", ".eyJzdWIiOiIxIn0", ".dBjftJeZ4CVPmB92K27uhbUJU1p1r"].concat()
+        [
+            "eyJhbGciOiJIUzI1NiJ9",
+            ".eyJzdWIiOiIxIn0",
+            ".dBjftJeZ4CVPmB92K27uhbUJU1p1r",
+        ]
+        .concat()
     }
 
     /// The dashboard error shape reported in WP12. Note the corrupted `-`
@@ -418,7 +468,10 @@ mod tests {
         );
         let out = redact_secrets(&s);
         assert!(out.contains("bot7000***:***YZ12"), "{out}");
-        assert!(out.contains("getUpdates?offset=0"), "non-secret query kept: {out}");
+        assert!(
+            out.contains("getUpdates?offset=0"),
+            "non-secret query kept: {out}"
+        );
     }
 
     #[test]
@@ -433,9 +486,13 @@ mod tests {
         let wecom = "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=ww1234567890&corpsecret=SsuperSecretValue1234567890abcdef";
         let out = redact_secrets(wecom);
         assert!(!out.contains("SsuperSecretValue1234567890abcdef"), "{out}");
-        assert!(out.contains("corpid=ww1234567890"), "corpid is an identifier, kept: {out}");
+        assert!(
+            out.contains("corpid=ww1234567890"),
+            "corpid is an identifier, kept: {out}"
+        );
 
-        let ding = "https://oapi.dingtalk.com/gettoken?appkey=abc&appsecret=zzzzzzzzzzzzzzzzzzzzzzzzz";
+        let ding =
+            "https://oapi.dingtalk.com/gettoken?appkey=abc&appsecret=zzzzzzzzzzzzzzzzzzzzzzzzz";
         let out = redact_secrets(ding);
         assert!(!out.contains("zzzzzzzzzzzzzzzzzzzzzzzzz"), "{out}");
     }
@@ -518,10 +575,7 @@ mod tests {
                 format!("Authorization: Bearer {}", anthropic_key()),
                 "abcdefghijklmnopqrstuvwx".to_string(),
             ),
-            (
-                format!("token {} rejected", tg_secret()),
-                tg_secret(),
-            ),
+            (format!("token {} rejected", tg_secret()), tg_secret()),
             (
                 format!("Bearer {}", jwt()),
                 "dBjftJeZ4CVPmB92K27uhbUJU1p1r".to_string(),
@@ -544,11 +598,26 @@ mod tests {
     #[test]
     fn vendor_credential_params_are_still_masked() {
         for (url, secret) in [
-            ("https://x/y?corpsecret=SsuperSecretValue1234567890", "SsuperSecretValue1234567890"),
-            ("https://x/y?appsecret=SsuperSecretValue1234567890", "SsuperSecretValue1234567890"),
-            ("https://x/y?access_token=SsuperSecretValue1234567890", "SsuperSecretValue1234567890"),
-            ("https://x/y?api-key=SsuperSecretValue1234567890", "SsuperSecretValue1234567890"),
-            ("https://x/y?client.secret=SsuperSecretValue1234567890", "SsuperSecretValue1234567890"),
+            (
+                "https://x/y?corpsecret=SsuperSecretValue1234567890",
+                "SsuperSecretValue1234567890",
+            ),
+            (
+                "https://x/y?appsecret=SsuperSecretValue1234567890",
+                "SsuperSecretValue1234567890",
+            ),
+            (
+                "https://x/y?access_token=SsuperSecretValue1234567890",
+                "SsuperSecretValue1234567890",
+            ),
+            (
+                "https://x/y?api-key=SsuperSecretValue1234567890",
+                "SsuperSecretValue1234567890",
+            ),
+            (
+                "https://x/y?client.secret=SsuperSecretValue1234567890",
+                "SsuperSecretValue1234567890",
+            ),
         ] {
             let out = redact_secrets(url);
             assert!(!out.contains(secret), "credential survived: {out}");

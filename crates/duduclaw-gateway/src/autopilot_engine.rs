@@ -38,15 +38,21 @@ use crate::task_store::{ActivityRow, TaskStore};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AutopilotEvent {
-    TaskCreated { task: Value },
-    TaskUpdated { task: Value },
+    TaskCreated {
+        task: Value,
+    },
+    TaskUpdated {
+        task: Value,
+    },
     TaskStatusChanged {
         task_id: String,
         from: String,
         to: String,
         task: Value,
     },
-    ActivityNew { activity: Value },
+    ActivityNew {
+        activity: Value,
+    },
     ChannelMessage {
         channel: String,
         agent_id: String,
@@ -56,7 +62,9 @@ pub enum AutopilotEvent {
         agent_id: String,
         idle_minutes: i64,
     },
-    CronTick { now: String },
+    CronTick {
+        now: String,
+    },
     /// R2 foresight: a running task's trajectory prefix predicts failure
     /// (critical threshold crossed). Emitted by `foresight::emit_alarm`
     /// through the events.db bridge (`run.at_risk`). Policy-driven: the
@@ -163,6 +171,29 @@ pub enum AutopilotEvent {
         agent_id: String,
         source: String,
     },
+    /// G4 (2026-09 feature audit): one Odoo ERP change observed by the
+    /// `odoo_events` bridge — either the background poller
+    /// (`config.toml [odoo] poll_enabled`, default **off**) or the
+    /// `POST /webhook/odoo` endpoint (`[odoo] webhook_enabled`, default off,
+    /// shared-secret verified fail-closed). Both paths converge on this one
+    /// variant so a rule does not care which transport delivered the change.
+    ///
+    /// `event_type` is one of `duduclaw_odoo::events::EVENT_TYPES`
+    /// (`odoo.crm.lead_created`, `odoo.sale.order_confirmed`, …) for the
+    /// poller; the webhook passes the sender's `event` string through
+    /// verbatim, so rule authors should match on it explicitly rather than
+    /// assume the closed set.
+    ///
+    /// `record` is the raw Odoo record; its top-level scalar keys are
+    /// flattened by `to_fields()` (minus the reserved names) so a rule writes
+    /// `{"field":"stage_id","op":"eq","value":3}` with no new operator — the
+    /// same convenience `Tick` has.
+    OdooEvent {
+        event_type: String,
+        model: String,
+        record_id: i64,
+        record: Value,
+    },
 }
 
 impl AutopilotEvent {
@@ -181,6 +212,7 @@ impl AutopilotEvent {
             Self::Tick { .. } => "tick",
             Self::CepTrigger { .. } => "cep_trigger",
             Self::SecurityEvent { .. } => "security_event",
+            Self::OdooEvent { .. } => "odoo_event",
         }
     }
 
@@ -192,7 +224,12 @@ impl AutopilotEvent {
             Self::TaskCreated { task } | Self::TaskUpdated { task } => {
                 map.insert("task".into(), task.clone());
             }
-            Self::TaskStatusChanged { task_id, from, to, task } => {
+            Self::TaskStatusChanged {
+                task_id,
+                from,
+                to,
+                task,
+            } => {
                 map.insert("task_id".into(), Value::String(task_id.clone()));
                 map.insert("from".into(), Value::String(from.clone()));
                 map.insert("to".into(), Value::String(to.clone()));
@@ -201,17 +238,21 @@ impl AutopilotEvent {
             Self::ActivityNew { activity } => {
                 map.insert("activity".into(), activity.clone());
             }
-            Self::ChannelMessage { channel, agent_id, text } => {
+            Self::ChannelMessage {
+                channel,
+                agent_id,
+                text,
+            } => {
                 map.insert("channel".into(), Value::String(channel.clone()));
                 map.insert("agent_id".into(), Value::String(agent_id.clone()));
                 map.insert("text".into(), Value::String(text.clone()));
             }
-            Self::AgentIdle { agent_id, idle_minutes } => {
+            Self::AgentIdle {
+                agent_id,
+                idle_minutes,
+            } => {
                 map.insert("agent_id".into(), Value::String(agent_id.clone()));
-                map.insert(
-                    "idle_minutes".into(),
-                    Value::Number((*idle_minutes).into()),
-                );
+                map.insert("idle_minutes".into(), Value::Number((*idle_minutes).into()));
             }
             Self::CronTick { now } => {
                 map.insert("now".into(), Value::String(now.clone()));
@@ -234,12 +275,14 @@ impl AutopilotEvent {
                 map.insert("level".into(), Value::String(level.clone()));
                 map.insert(
                     "reasons".into(),
-                    Value::Array(
-                        reasons.iter().map(|r| Value::String(r.clone())).collect(),
-                    ),
+                    Value::Array(reasons.iter().map(|r| Value::String(r.clone())).collect()),
                 );
             }
-            Self::OsFileEvent { agent_id, path, change } => {
+            Self::OsFileEvent {
+                agent_id,
+                path,
+                change,
+            } => {
                 map.insert("agent_id".into(), Value::String(agent_id.clone()));
                 map.insert("path".into(), Value::String(path.clone()));
                 map.insert("kind".into(), Value::String(change.clone()));
@@ -251,10 +294,7 @@ impl AutopilotEvent {
                     map.insert("file_name".into(), Value::String(name.to_string()));
                 }
                 if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                    map.insert(
-                        "extension".into(),
-                        Value::String(ext.to_ascii_lowercase()),
-                    );
+                    map.insert("extension".into(), Value::String(ext.to_ascii_lowercase()));
                 }
             }
             Self::OsFrontmostEvent {
@@ -265,10 +305,7 @@ impl AutopilotEvent {
             } => {
                 map.insert("agent_id".into(), Value::String(agent_id.clone()));
                 map.insert("app".into(), Value::String(app.clone()));
-                map.insert(
-                    "window_title".into(),
-                    Value::String(window_title.clone()),
-                );
+                map.insert("window_title".into(), Value::String(window_title.clone()));
                 map.insert("prev_app".into(), Value::String(prev_app.clone()));
             }
             Self::Tick { source, ts, fields } => {
@@ -293,7 +330,11 @@ impl AutopilotEvent {
                 map.insert("source".into(), Value::String(source.clone()));
                 map.insert("ts".into(), Value::String(ts.clone()));
             }
-            Self::CepTrigger { rule_id, then_event, fields } => {
+            Self::CepTrigger {
+                rule_id,
+                then_event,
+                fields,
+            } => {
                 map.insert("rule_id".into(), Value::String(rule_id.clone()));
                 map.insert("then_event".into(), Value::String(then_event.clone()));
                 if let Value::Object(inner) = fields {
@@ -302,16 +343,55 @@ impl AutopilotEvent {
                     }
                 }
             }
-            Self::SecurityEvent { severity, event_type, agent_id, source } => {
+            Self::SecurityEvent {
+                severity,
+                event_type,
+                agent_id,
+                source,
+            } => {
                 map.insert("severity".into(), Value::String(severity.clone()));
                 map.insert("event_type".into(), Value::String(event_type.clone()));
                 map.insert("agent_id".into(), Value::String(agent_id.clone()));
                 map.insert("source".into(), Value::String(source.clone()));
             }
+            Self::OdooEvent {
+                event_type,
+                model,
+                record_id,
+                record,
+            } => {
+                // Scalar record keys land at the top level so a rule reads
+                // `stage_id` / `amount_total` directly. Objects and arrays are
+                // NOT flattened (they stay reachable through the dotted
+                // `record.x.y` path), and the event's own identity fields can
+                // never be shadowed — same defence-in-depth `Tick` applies to
+                // its reserved names, here against a hostile Odoo row rather
+                // than a hand-written config.
+                if let Value::Object(inner) = record {
+                    for (k, v) in inner {
+                        if ODOO_RESERVED_FIELD_NAMES.iter().any(|r| *r == k.as_str()) {
+                            continue;
+                        }
+                        if v.is_object() || v.is_array() {
+                            continue;
+                        }
+                        map.insert(k.clone(), v.clone());
+                    }
+                }
+                map.insert("event_type".into(), Value::String(event_type.clone()));
+                map.insert("model".into(), Value::String(model.clone()));
+                map.insert("record_id".into(), Value::Number((*record_id).into()));
+                map.insert("record".into(), record.clone());
+            }
         }
         map
     }
 }
+
+/// Field names an `odoo_event` record may never shadow — the event's own
+/// identity plus the `event` discriminator every event carries.
+pub const ODOO_RESERVED_FIELD_NAMES: &[&str] =
+    &["event", "event_type", "model", "record_id", "record"];
 
 // ─── Condition evaluator ────────────────────────────────────
 
@@ -336,7 +416,10 @@ pub fn evaluate(conditions: &Value, fields: &serde_json::Map<String, Value>) -> 
         .get("field")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let op = conditions.get("op").and_then(|v| v.as_str()).unwrap_or("eq");
+    let op = conditions
+        .get("op")
+        .and_then(|v| v.as_str())
+        .unwrap_or("eq");
     let expected = conditions.get("value").cloned().unwrap_or(Value::Null);
     let actual = lookup_path_opt(fields, field);
     apply_op(op, actual.as_ref(), &expected)
@@ -347,10 +430,7 @@ pub fn evaluate(conditions: &Value, fields: &serde_json::Map<String, Value>) -> 
 /// distinguish "field absent" from "field set to null", because allowing
 /// `eq null` to match an absent field caused 5/5 autopilot mass-fire bug
 /// (RFC-22 P1-9b).
-fn lookup_path_opt(
-    fields: &serde_json::Map<String, Value>,
-    path: &str,
-) -> Option<Value> {
+fn lookup_path_opt(fields: &serde_json::Map<String, Value>, path: &str) -> Option<Value> {
     if path.is_empty() {
         return None;
     }
@@ -377,8 +457,9 @@ fn lookup_path(fields: &serde_json::Map<String, Value>, path: &str) -> Value {
 /// `cep_matcher::validate_sequence_spec` (P3-3) validates a sequence rule's
 /// `match` condition shape at write time before any event ever reaches
 /// `apply_op`.
-pub const CONDITION_OPS: &[&str] =
-    &["eq", "neq", "in", "not_in", "gt", "gte", "lt", "lte", "contains"];
+pub const CONDITION_OPS: &[&str] = &[
+    "eq", "neq", "in", "not_in", "gt", "gte", "lt", "lte", "contains",
+];
 
 fn apply_op(op: &str, actual: Option<&Value>, expected: &Value) -> bool {
     // Missing fields never satisfy any comparison — including `eq null`.
@@ -398,10 +479,18 @@ fn apply_op(op: &str, actual: Option<&Value>, expected: &Value) -> bool {
             .as_array()
             .map(|arr| !arr.iter().any(|v| v == actual))
             .unwrap_or(true),
-        "gt" => number_pair(actual, expected).map(|(a, e)| a > e).unwrap_or(false),
-        "gte" => number_pair(actual, expected).map(|(a, e)| a >= e).unwrap_or(false),
-        "lt" => number_pair(actual, expected).map(|(a, e)| a < e).unwrap_or(false),
-        "lte" => number_pair(actual, expected).map(|(a, e)| a <= e).unwrap_or(false),
+        "gt" => number_pair(actual, expected)
+            .map(|(a, e)| a > e)
+            .unwrap_or(false),
+        "gte" => number_pair(actual, expected)
+            .map(|(a, e)| a >= e)
+            .unwrap_or(false),
+        "lt" => number_pair(actual, expected)
+            .map(|(a, e)| a < e)
+            .unwrap_or(false),
+        "lte" => number_pair(actual, expected)
+            .map(|(a, e)| a <= e)
+            .unwrap_or(false),
         "contains" => match (actual, expected) {
             (Value::String(a), Value::String(e)) => a.contains(e.as_str()),
             (Value::Array(a), _) => a.iter().any(|v| v == expected),
@@ -423,10 +512,7 @@ fn number_pair(a: &Value, b: &Value) -> Option<(f64, f64)> {
 /// Unknown keys resolve to empty string. `{ }` with no valid closing brace
 /// are left alone. Intended for action templates like
 /// `"🚨 Urgent task: {task.title}"`.
-pub fn render_template(
-    template: &str,
-    fields: &serde_json::Map<String, Value>,
-) -> String {
+pub fn render_template(template: &str, fields: &serde_json::Map<String, Value>) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(open) = rest.find('{') {
@@ -694,6 +780,15 @@ pub struct AutopilotEngine {
     /// configure one. Overridable via [`AutopilotEngine::with_screener`] so
     /// the screening path is testable without a model file.
     screener: Arc<dyn crate::autopilot_screen::LocalScreener>,
+    /// O15 — the installation default a rule's `action.screen` inherits when
+    /// it omits `on_unavailable`, derived from `[tick] preset`.
+    ///
+    /// Resolved lazily and cached: reading it eagerly in `new()` would make
+    /// every constructor (tests included) touch the filesystem, and reading it
+    /// per fire would put a `config.toml` parse on the hot path. `None`
+    /// preset ⇒ [`crate::autopilot_screen::OnUnavailable::Pass`], i.e.
+    /// byte-identical to the pre-O15 behavior.
+    screen_default: std::sync::OnceLock<crate::autopilot_screen::OnUnavailable>,
 }
 
 impl AutopilotEngine {
@@ -719,7 +814,18 @@ impl AutopilotEngine {
             os_goal_debounce: tokio::sync::Mutex::new(HashMap::new()),
             tick_hub: None,
             screener,
+            screen_default: std::sync::OnceLock::new(),
         }
+    }
+
+    /// O15 — the `on_unavailable` default rules inherit from `[tick] preset`.
+    /// Read from disk at most once per engine; see the field's doc comment.
+    fn screen_default(&self) -> crate::autopilot_screen::OnUnavailable {
+        *self.screen_default.get_or_init(|| {
+            crate::autopilot_screen::OnUnavailable::from_preset(
+                crate::tick_config::TickPreset::from_home(&self.home_dir),
+            )
+        })
     }
 
     /// Replace the WP3 screening backend (tests / future alternative local
@@ -745,10 +851,7 @@ impl AutopilotEngine {
     /// action will be scored by the gate before firing. Additive — leaves
     /// `new()` callers unchanged (their `proactive_notify` rules, if any,
     /// fail-closed suppress until a gate is wired).
-    pub fn with_proactive_gate(
-        mut self,
-        gate: Arc<crate::proactive_gate::ProactiveGate>,
-    ) -> Self {
+    pub fn with_proactive_gate(mut self, gate: Arc<crate::proactive_gate::ProactiveGate>) -> Self {
         self.proactive_gate = Some(gate);
         self
     }
@@ -756,10 +859,7 @@ impl AutopilotEngine {
     /// Opt into the HITL approval gate (additive; leaves `new()` callers
     /// unchanged). Rules with `require_approval = true` will request human
     /// approval instead of dispatching immediately.
-    pub fn with_approval_broker(
-        mut self,
-        broker: Arc<crate::approval::ApprovalBroker>,
-    ) -> Self {
+    pub fn with_approval_broker(mut self, broker: Arc<crate::approval::ApprovalBroker>) -> Self {
         self.approval_broker = Some(broker);
         self
     }
@@ -781,7 +881,9 @@ impl AutopilotEngine {
     async fn circuit_check(&self, rule_id: &str) -> (bool, Option<&'static str>) {
         let now = std::time::Instant::now();
         let mut map = self.circuit.lock().await;
-        let state = map.entry(rule_id.to_string()).or_insert_with(CircuitState::new_closed);
+        let state = map
+            .entry(rule_id.to_string())
+            .or_insert_with(CircuitState::new_closed);
 
         match state {
             CircuitState::Closed { fires } => {
@@ -852,17 +954,19 @@ impl AutopilotEngine {
                     // (classic logging-while-burning anti-pattern).
                     let ts = self.task_store.clone();
                     tokio::spawn(async move {
-                        let _ = ts.append_activity(&crate::task_store::ActivityRow {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            event_type: "autopilot_lag".into(),
-                            agent_id: "autopilot".into(),
-                            task_id: None,
-                            summary: format!("Autopilot dropped {n} events (bus lagged)"),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                            metadata: Some(
-                                serde_json::json!({ "dropped_events": n }).to_string(),
-                            ),
-                        }).await;
+                        let _ = ts
+                            .append_activity(&crate::task_store::ActivityRow {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                event_type: "autopilot_lag".into(),
+                                agent_id: "autopilot".into(),
+                                task_id: None,
+                                summary: format!("Autopilot dropped {n} events (bus lagged)"),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                metadata: Some(
+                                    serde_json::json!({ "dropped_events": n }).to_string(),
+                                ),
+                            })
+                            .await;
                     });
                 }
                 Err(broadcast::error::RecvError::Closed) => {
@@ -877,7 +981,12 @@ impl AutopilotEngine {
         // P3-3 lightweight CEP: a synthetic trigger from `CepMatcher` names its
         // target rule directly and has already resolved the temporal pattern —
         // it bypasses the trigger_event/conditions dispatch loop below entirely.
-        if let AutopilotEvent::CepTrigger { rule_id, then_event, fields } = event {
+        if let AutopilotEvent::CepTrigger {
+            rule_id,
+            then_event,
+            fields,
+        } = event
+        {
             let rule = match self.store.get_rule(rule_id).await {
                 Ok(Some(r)) => r,
                 Ok(None) => {
@@ -919,8 +1028,7 @@ impl AutopilotEngine {
                 // this event's name (it's an unused placeholder for such rules).
                 && r.sequence.is_none()
         }) {
-            let conditions: Value =
-                serde_json::from_str(&rule.conditions).unwrap_or(Value::Null);
+            let conditions: Value = serde_json::from_str(&rule.conditions).unwrap_or(Value::Null);
             if !evaluate(&conditions, &fields) {
                 continue;
             }
@@ -979,16 +1087,22 @@ impl AutopilotEngine {
                         CIRCUIT_HALF_OPEN_PROBE_WINDOW.as_secs()
                     ),
                 ),
-                _ => ("circuit_closed", "circuit breaker CLOSED — probe succeeded, rule restored".into()),
+                _ => (
+                    "circuit_closed",
+                    "circuit breaker CLOSED — probe succeeded, rule restored".into(),
+                ),
             };
-            let _ = self.store.append_history(&AutopilotHistoryRow {
-                id: uuid::Uuid::new_v4().to_string(),
-                rule_id: rule.id.clone(),
-                rule_name: rule.name.clone(),
-                triggered_at: chrono::Utc::now().to_rfc3339(),
-                result: result_tag.into(),
-                details: Some(details),
-            }).await;
+            let _ = self
+                .store
+                .append_history(&AutopilotHistoryRow {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    rule_id: rule.id.clone(),
+                    rule_name: rule.name.clone(),
+                    triggered_at: chrono::Utc::now().to_rfc3339(),
+                    result: result_tag.into(),
+                    details: Some(details),
+                })
+                .await;
 
             // Push a symptom notice + "暫停這條規則" button — ONLY on
             // a fresh Closed→Open trip ("open"), never on a HalfOpen probe
@@ -1043,7 +1157,10 @@ impl AutopilotEngine {
             crate::metrics::global_metrics().tick_screen(outcome);
         }
         if let Some(tag) = screen.as_ref().and_then(|d| d.result_tag) {
-            let detail = screen.as_ref().map(|d| d.detail.clone()).unwrap_or_default();
+            let detail = screen
+                .as_ref()
+                .map(|d| d.detail.clone())
+                .unwrap_or_default();
             info!(
                 rule = %rule.name,
                 rule_id = %rule.id,
@@ -1109,10 +1226,7 @@ impl AutopilotEngine {
 
         let summary = match &outcome {
             Ok(_) => format!("Autopilot rule '{}' fired on {event_name}", rule.name),
-            Err(e) => format!(
-                "Autopilot rule '{}' failed on {event_name}: {e}",
-                rule.name
-            ),
+            Err(e) => format!("Autopilot rule '{}' failed on {event_name}: {e}", rule.name),
         };
         let _ = self
             .task_store
@@ -1146,7 +1260,9 @@ impl AutopilotEngine {
         fields: &serde_json::Map<String, Value>,
     ) -> Option<crate::autopilot_screen::ScreenDecision> {
         use crate::autopilot_screen::{ScreenPlan, run_screen, unavailable_decision};
-        match crate::autopilot_screen::plan_screen(action) {
+        // O15 — a rule that spells `on_unavailable` out still wins; this only
+        // supplies the default for rules that do not.
+        match crate::autopilot_screen::plan_screen_with_default(action, self.screen_default()) {
             ScreenPlan::Absent => None,
             ScreenPlan::Unusable {
                 reason,
@@ -1241,8 +1357,7 @@ impl AutopilotEngine {
             Some((m, _)) => m,
             None => fields,
         };
-        let banner: Option<&str> =
-            perception.as_ref().and_then(|(_, b)| b.as_deref());
+        let banner: Option<&str> = perception.as_ref().and_then(|(_, b)| b.as_deref());
 
         // ── HITL approval gate ────────────────────────────────
         // If the rule opts into human approval AND a broker is wired,
@@ -1260,12 +1375,16 @@ impl AutopilotEngine {
                     "rule_id": rule_id,
                     "rule_name": rule_name,
                 });
-                let summary = format!(
-                    "Autopilot 規則「{rule_name}」請求核准以執行 {action_type} 動作"
-                );
+                let summary =
+                    format!("Autopilot 規則「{rule_name}」請求核准以執行 {action_type} 動作");
                 let id = broker
-                    .request("autopilot", "autopilot_action", &summary, payload,
-                             crate::approval::DEFAULT_TTL_SECONDS)
+                    .request(
+                        "autopilot",
+                        "autopilot_action",
+                        &summary,
+                        payload,
+                        crate::approval::DEFAULT_TTL_SECONDS,
+                    )
                     .await?;
                 info!(
                     approval_id = %id,
@@ -1283,7 +1402,8 @@ impl AutopilotEngine {
             "notify" => self.action_notify(action, eff_fields, banner).await,
             "run_skill" => self.action_run_skill(action, eff_fields, banner).await,
             "proactive_notify" => {
-                self.action_proactive_notify(action, fields, eff_fields, banner).await
+                self.action_proactive_notify(action, fields, eff_fields, banner)
+                    .await
             }
             "" => Err(format!("rule {rule_name}/{rule_id}: action.type required")),
             other => Err(format!(
@@ -1447,7 +1567,9 @@ impl AutopilotEngine {
             // is tried (prevents path traversal / injection when the notify
             // rule's chat_id comes from less-trusted rule config).
             if channel == "discord" && !crate::channel_sender::is_valid_discord_chat_id(chat_id) {
-                return Err(format!("invalid discord chat_id (not a snowflake): {chat_id}"));
+                return Err(format!(
+                    "invalid discord chat_id (not a snowflake): {chat_id}"
+                ));
             }
             let candidates = resolve_channel_tokens(&self.home_dir, channel).await?;
             let mut last_err = String::new();
@@ -1479,8 +1601,7 @@ impl AutopilotEngine {
         // `goal_notify::channel_token`'s BUG-1). WebChat and unknown
         // channels are refused inside `resolve_channel_target`.
         let target =
-            crate::channel_sender::resolve_channel_target(&self.home_dir, channel, chat_id)
-                .await?;
+            crate::channel_sender::resolve_channel_target(&self.home_dir, channel, chat_id).await?;
         crate::channel_sender::create_sender(&target, notify_http_client().clone())
             .send_text(&text)
             .await
@@ -1581,8 +1702,10 @@ impl AutopilotEngine {
         }
         let aid = agent_id.to_string();
         let q = query.to_string();
+        let home = self.home_dir.clone();
         tokio::task::spawn_blocking(move || {
-            let engine = duduclaw_memory::SqliteMemoryEngine::new(&db_path).ok()?;
+            // H4: single construction point (`[memory] novelty_gate` + `w_vec`).
+            let engine = crate::memory_factory::build_memory_engine(&db_path, &home).ok()?;
             let rt = tokio::runtime::Handle::current();
             let facts = rt.block_on(engine.search_facts(&aid, &q, 5)).ok()?;
             if facts.is_empty() {
@@ -1847,9 +1970,7 @@ impl AutopilotEngine {
             Ok(canon) => {
                 if let Ok(allowed) = tokio::fs::canonicalize(&skills_dir).await {
                     if !canon.starts_with(&allowed) {
-                        return Err(format!(
-                            "skill path escapes SKILLS dir: {canon:?}"
-                        ));
+                        return Err(format!("skill path escapes SKILLS dir: {canon:?}"));
                     }
                 }
             }
@@ -1906,7 +2027,11 @@ impl AutopilotEngine {
 /// Pure and side-effect-free so it can be unit-tested without a running
 /// engine or database.
 fn resolve_tick_field_name(cfg: &crate::prediction::belief::BeliefConfig, subject: &str) -> String {
-    if let Some((field_name, _)) = cfg.tick_subject_map.iter().find(|(_, s)| s.as_str() == subject) {
+    if let Some((field_name, _)) = cfg
+        .tick_subject_map
+        .iter()
+        .find(|(_, s)| s.as_str() == subject)
+    {
         return field_name.clone();
     }
     format!("z{subject}")
@@ -1931,7 +2056,8 @@ fn is_safe_skill_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 128 {
         return false;
     }
-    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 // ─── Channel send helpers ───────────────────────────────────
@@ -2005,10 +2131,7 @@ fn row_to_event(event: &str, payload_json: &str) -> Option<AutopilotEvent> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            score: payload
-                .get("score")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
+            score: payload.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0),
             level: payload
                 .get("level")
                 .and_then(|v| v.as_str())
@@ -2196,12 +2319,10 @@ pub fn spawn_events_db_poll(
                         // bus against double-dispatching already-broadcast OS
                         // events) — a feedback row is never an autopilot event.
                         if let Some(ref dtx) = dashboard_tx {
-                            if let Some(frame) =
-                                crate::dashboard_feedback::dashboard_push_frame(
-                                    &row.event,
-                                    &row.payload,
-                                )
-                            {
+                            if let Some(frame) = crate::dashboard_feedback::dashboard_push_frame(
+                                &row.event,
+                                &row.payload,
+                            ) {
                                 let _ = dtx.send(frame);
                             }
                         }
@@ -2226,8 +2347,7 @@ pub fn spawn_events_db_poll(
 
             // Periodic retention — keeps events.db size bounded.
             if last_prune.elapsed() >= EVENTS_PRUNE_INTERVAL {
-                let cutoff = (chrono::Utc::now()
-                    - chrono::Duration::days(EVENTS_RETENTION_DAYS))
+                let cutoff = (chrono::Utc::now() - chrono::Duration::days(EVENTS_RETENTION_DAYS))
                     .to_rfc3339();
                 match store.prune_before(&cutoff).await {
                     Ok(n) if n > 0 => debug!(deleted = n, "pruned old events"),
@@ -2391,7 +2511,11 @@ mod tests {
             // regardless of which key spelling produced it.
             assert_eq!(ev.event_name(), "os_file");
             match ev {
-                AutopilotEvent::OsFileEvent { agent_id, path, change } => {
+                AutopilotEvent::OsFileEvent {
+                    agent_id,
+                    path,
+                    change,
+                } => {
                     assert_eq!(agent_id, "scout");
                     assert_eq!(path, "/inbox/a.pdf");
                     assert_eq!(change, "modified");
@@ -2556,8 +2680,89 @@ mod tests {
         assert_eq!(f["event"], Value::String("tick".into()));
         assert_eq!(f["source"], Value::String("real-source".into()));
         assert_eq!(f["ts"], Value::String("2026-08-11T09:00:00+00:00".into()));
-        assert!(!f.contains_key("kind"), "reserved name is dropped, not merged");
+        assert!(
+            !f.contains_key("kind"),
+            "reserved name is dropped, not merged"
+        );
         assert_eq!(f["price"].as_i64(), Some(1), "ordinary fields still pass");
+    }
+
+    // ── G4: Odoo ERP change events ──────────────────────────────────────────
+
+    fn odoo_event(record: Value) -> AutopilotEvent {
+        AutopilotEvent::OdooEvent {
+            event_type: "odoo.sale.order_confirmed".into(),
+            model: "sale.order".into(),
+            record_id: 42,
+            record,
+        }
+    }
+
+    #[test]
+    fn odoo_event_name_and_scalar_field_flattening() {
+        let ev = odoo_event(serde_json::json!({
+            "state": "sale",
+            "amount_total": 1250.5,
+            "name": "SO0042",
+            // Nested shapes stay reachable through `record.*` but are not
+            // flattened — a rule should not get `id` from a partner tuple.
+            "partner_id": {"id": 7, "name": "Acme"},
+            "tags": ["vip"],
+        }));
+        assert_eq!(ev.event_name(), "odoo_event");
+
+        let f = ev.to_fields();
+        assert_eq!(f["event"], Value::String("odoo_event".into()));
+        assert_eq!(f["event_type"], Value::String("odoo.sale.order_confirmed".into()));
+        assert_eq!(f["model"], Value::String("sale.order".into()));
+        assert_eq!(f["record_id"].as_i64(), Some(42));
+        assert_eq!(f["state"], Value::String("sale".into()));
+        assert_eq!(f["amount_total"].as_f64(), Some(1250.5));
+        assert!(!f.contains_key("partner_id"), "objects are not flattened");
+        assert!(!f.contains_key("tags"), "arrays are not flattened");
+        // …but the whole record is still addressable by dotted path.
+        assert_eq!(f["record"]["partner_id"]["name"], "Acme");
+
+        // A rule condition reads the flattened field with no new operator.
+        assert!(evaluate(
+            &serde_json::json!({"field": "state", "op": "eq", "value": "sale"}),
+            &f
+        ));
+        assert!(evaluate(
+            &serde_json::json!({"field": "record.partner_id.name", "op": "eq", "value": "Acme"}),
+            &f
+        ));
+    }
+
+    #[test]
+    fn odoo_record_cannot_shadow_the_events_own_identity() {
+        // The record comes from the customer's ERP (or, on the webhook path,
+        // from whoever holds the shared secret). It must never be able to
+        // rename the event it arrived in.
+        let f = odoo_event(serde_json::json!({
+            "event": "task_created",
+            "event_type": "spoofed",
+            "model": "res.users",
+            "record_id": 999,
+            "record": "nonsense",
+            "state": "sale",
+        }))
+        .to_fields();
+        assert_eq!(f["event"], Value::String("odoo_event".into()));
+        assert_eq!(f["event_type"], Value::String("odoo.sale.order_confirmed".into()));
+        assert_eq!(f["model"], Value::String("sale.order".into()));
+        assert_eq!(f["record_id"].as_i64(), Some(42));
+        assert!(f["record"].is_object(), "record stays the real record");
+        assert_eq!(f["state"], Value::String("sale".into()));
+    }
+
+    #[test]
+    fn odoo_event_is_a_legal_cep_sequence_event() {
+        assert!(
+            crate::cep_matcher::KNOWN_EVENT_NAMES.contains(&"odoo_event"),
+            "\"order confirmed, then no payment within 7 days\" is exactly the \
+             shape the sequence matcher exists for"
+        );
     }
 
     #[test]
@@ -2647,7 +2852,10 @@ mod tests {
         let fields = ev.to_fields();
         assert_eq!(fields["event"], Value::String("security_event".into()));
         assert_eq!(fields["severity"], Value::String("critical".into()));
-        assert_eq!(fields["event_type"], Value::String("prompt_injection".into()));
+        assert_eq!(
+            fields["event_type"],
+            Value::String("prompt_injection".into())
+        );
         assert_eq!(fields["agent_id"], Value::String("agent-1".into()));
         assert_eq!(fields["source"], Value::String("audit".into()));
     }
@@ -2663,7 +2871,12 @@ mod tests {
         .to_string();
         let ev = row_to_event("security_event", &payload).expect("mapped");
         match ev {
-            AutopilotEvent::SecurityEvent { severity, event_type, agent_id, source } => {
+            AutopilotEvent::SecurityEvent {
+                severity,
+                event_type,
+                agent_id,
+                source,
+            } => {
                 assert_eq!(severity, "warning");
                 assert_eq!(event_type, "circuit_breaker_tripped");
                 assert_eq!(agent_id, "agent-9");
@@ -2677,7 +2890,12 @@ mod tests {
     fn row_to_event_security_event_missing_fields_gets_defaults() {
         let ev = row_to_event("security_event", "{}").expect("mapped with defaults");
         match ev {
-            AutopilotEvent::SecurityEvent { severity, event_type, agent_id, source } => {
+            AutopilotEvent::SecurityEvent {
+                severity,
+                event_type,
+                agent_id,
+                source,
+            } => {
                 assert_eq!(severity, "warning");
                 assert_eq!(event_type, "unknown");
                 assert_eq!(agent_id, "system");
@@ -2877,10 +3095,7 @@ mod tests {
         let fields = fields_from(serde_json::json!({
             "task": { "title": "Ship v2", "priority": "urgent" }
         }));
-        let out = render_template(
-            "[{task.priority}] {task.title}!",
-            &fields,
-        );
+        let out = render_template("[{task.priority}] {task.title}!", &fields);
         assert_eq!(out, "[urgent] Ship v2!");
     }
 
@@ -2981,8 +3196,8 @@ mod tests {
     }
 
     async fn make_engine() -> (AutopilotEngine, std::path::PathBuf) {
-        let tmp_dir = std::env::temp_dir()
-            .join(format!("duduclaw-circuit-{}", uuid::Uuid::new_v4()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("duduclaw-circuit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let store = Arc::new(AutopilotStore::open(&tmp_dir).unwrap());
         let ts = Arc::new(TaskStore::open(&tmp_dir).unwrap());
@@ -3158,7 +3373,10 @@ mod tests {
         );
         let (eff_fields, banner) = sanitize_perception_fields(&fields, home.path())
             .expect("os_file events are always recognized as perception events");
-        assert!(banner.is_some(), "role-marker injection should raise a banner");
+        assert!(
+            banner.is_some(),
+            "role-marker injection should raise a banner"
+        );
 
         let rendered = render_template("整理 {file_name}（{kind}）到 {path}", &eff_fields);
         // Angle brackets are defanged (fullwidth) — the tag can't break out of
@@ -3354,8 +3572,10 @@ mod tests {
     // near-miss like "autopilot-engine" or "autopilot_rule".
     #[tokio::test(flavor = "current_thread")]
     async fn action_delegate_stamps_autopilot_as_system_sender() {
-        let tmp_dir =
-            std::env::temp_dir().join(format!("duduclaw-autopilot-delegate-{}", uuid::Uuid::new_v4()));
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "duduclaw-autopilot-delegate-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let store = Arc::new(AutopilotStore::open(&tmp_dir).unwrap());
         let ts = Arc::new(TaskStore::open(&tmp_dir).unwrap());
@@ -3405,8 +3625,8 @@ mod tests {
         source: &str,
         count: usize,
     ) -> (AutopilotEngine, Arc<MessageQueue>, std::path::PathBuf) {
-        let tmp_dir = std::env::temp_dir()
-            .join(format!("duduclaw-autopilot-tick-{}", uuid::Uuid::new_v4()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("duduclaw-autopilot-tick-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let store = Arc::new(AutopilotStore::open(&tmp_dir).unwrap());
         let ts = Arc::new(TaskStore::open(&tmp_dir).unwrap());
@@ -3426,9 +3646,8 @@ mod tests {
             .await;
         }
 
-        let engine =
-            AutopilotEngine::new(tmp_dir.clone(), store, ts, Some(mq.clone()), rx)
-                .with_tick_hub(hub);
+        let engine = AutopilotEngine::new(tmp_dir.clone(), store, ts, Some(mq.clone()), rx)
+            .with_tick_hub(hub);
         (engine, mq, tmp_dir)
     }
 
@@ -3509,7 +3728,10 @@ mod tests {
             change: "created".into(),
         }
         .to_fields();
-        engine.action_delegate(&action, &fields, None).await.unwrap();
+        engine
+            .action_delegate(&action, &fields, None)
+            .await
+            .unwrap();
 
         let payload = mq.pending_messages(10).await.unwrap()[0].payload.clone();
         assert_eq!(payload, "整理收件匣");
@@ -3630,8 +3852,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn screen_yes_dispatches_and_annotates_history() {
         let screener = ScriptedScreener::ok("YES");
-        let (payloads, history, tmp) =
-            fire_screened(&screened_rule(Some(local_screen("pass"))), screener.clone(), 5).await;
+        let (payloads, history, tmp) = fire_screened(
+            &screened_rule(Some(local_screen("pass"))),
+            screener.clone(),
+            5,
+        )
+        .await;
 
         assert_eq!(payloads.len(), 1, "a YES verdict lets the delegate through");
         assert!(payloads[0].contains("twse-2330"));
@@ -3660,7 +3886,10 @@ mod tests {
         );
         let details = history[0].details.clone().unwrap();
         assert!(details.contains("NO"), "{details}");
-        assert!(details.contains("tick"), "the triggering event is recorded: {details}");
+        assert!(
+            details.contains("tick"),
+            "the triggering event is recorded: {details}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3701,7 +3930,10 @@ mod tests {
             fire_screened(&screened_rule(None), screener.clone(), 5).await;
 
         assert_eq!(payloads.len(), 1, "pre-WP3 rules dispatch unchanged");
-        assert!(screener.calls().is_empty(), "no inference for unscreened rules");
+        assert!(
+            screener.calls().is_empty(),
+            "no inference for unscreened rules"
+        );
         // Byte-identical details to before this change — no annotation.
         assert_eq!(history[0].details.as_deref(), Some("Triggered by tick"));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3717,7 +3949,10 @@ mod tests {
             fire_screened(&screened_rule(Some(bad)), screener.clone(), 5).await;
 
         assert!(payloads.is_empty());
-        assert!(screener.calls().is_empty(), "a broken spec never reaches the model");
+        assert!(
+            screener.calls().is_empty(),
+            "a broken spec never reaches the model"
+        );
         assert_eq!(
             history[0].result,
             crate::autopilot_screen::RESULT_SCREEN_UNAVAILABLE
@@ -3729,13 +3964,20 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn screen_prompt_carries_the_tick_window_for_tick_events() {
         let screener = ScriptedScreener::ok("YES");
-        let (_, _, tmp) =
-            fire_screened(&screened_rule(Some(local_screen("pass"))), screener.clone(), 30).await;
+        let (_, _, tmp) = fire_screened(
+            &screened_rule(Some(local_screen("pass"))),
+            screener.clone(),
+            30,
+        )
+        .await;
 
         let prompt = screener.calls().remove(0);
         assert!(prompt.contains("只有真的需要人介入才回 YES"));
         assert!(prompt.contains("<recent_ticks source=\"twse-2330\""));
-        assert!(prompt.contains("</recent_ticks>"), "DATA block stays terminated");
+        assert!(
+            prompt.contains("</recent_ticks>"),
+            "DATA block stays terminated"
+        );
         assert!(
             prompt.len() <= crate::autopilot_screen::MAX_SCREEN_PROMPT_BYTES,
             "screen prompt is {} bytes",
@@ -3765,7 +4007,10 @@ mod tests {
         assert!(prompt.contains("<event name=\"os_file\">"));
         assert!(prompt.contains("kind=created"), "{prompt}");
         assert!(prompt.contains("file_name=契約.pdf"), "{prompt}");
-        assert!(!prompt.contains("<recent_ticks"), "no window for non-tick events");
+        assert!(
+            !prompt.contains("<recent_ticks"),
+            "no window for non-tick events"
+        );
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
@@ -3795,7 +4040,10 @@ mod tests {
         let prompt = screener.calls().remove(0);
         // Same two guarantees `execute_action` gives the delegate prompt:
         // the markup is defanged and the banner leads.
-        assert!(prompt.contains("[SECURITY NOTICE]"), "banner missing: {prompt}");
+        assert!(
+            prompt.contains("[SECURITY NOTICE]"),
+            "banner missing: {prompt}"
+        );
         assert!(
             !prompt.contains("<system>"),
             "raw markup reached the screener: {prompt}"
@@ -3819,7 +4067,10 @@ mod tests {
         let (payloads, history, tmp) =
             fire_screened(&screened_rule(Some(screen)), Arc::new(Hanging), 5).await;
 
-        assert!(started.elapsed() < Duration::from_secs(20), "the timeout actually fires");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the timeout actually fires"
+        );
         assert!(payloads.is_empty());
         assert_eq!(
             history[0].result,
@@ -3840,7 +4091,10 @@ mod tests {
             .fire_matched_rule(&rule, "tick", &tick_fields("twse-2330"))
             .await;
 
-        let hub = engine.tick_hub.as_ref().expect("hub wired by engine_with_ticks");
+        let hub = engine
+            .tick_hub
+            .as_ref()
+            .expect("hub wired by engine_with_ticks");
         assert_eq!(hub.screen_counts(), (1, 0, 0));
         assert_eq!(
             hub.wake_counts().await,
@@ -3944,7 +4198,11 @@ mod tests {
 
         let hub = engine.tick_hub.as_ref().unwrap();
         assert_eq!(hub.screen_counts(), (0, 0, 1));
-        assert_eq!(mq.pending_messages(10).await.unwrap().len(), 1, "still dispatches");
+        assert_eq!(
+            mq.pending_messages(10).await.unwrap().len(),
+            1,
+            "still dispatches"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3980,7 +4238,10 @@ mod tests {
             (0, 0, 0),
             "no `screen` key on the rule ⇒ no screening verdict happened at all"
         );
-        assert_eq!(hub.wake_counts().await, vec![("rule-screen".to_string(), 1)]);
+        assert_eq!(
+            hub.wake_counts().await,
+            vec![("rule-screen".to_string(), 1)]
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4015,7 +4276,10 @@ mod tests {
                 .await;
         }
         let hub = engine.tick_hub.as_ref().unwrap();
-        assert_eq!(hub.wake_counts().await, vec![("rule-screen".to_string(), 3)]);
+        assert_eq!(
+            hub.wake_counts().await,
+            vec![("rule-screen".to_string(), 3)]
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4031,8 +4295,10 @@ mod tests {
     #[test]
     fn resolve_tick_field_name_prefers_explicit_config_map_over_convention() {
         let mut cfg = crate::prediction::belief::BeliefConfig::default();
-        cfg.tick_subject_map
-            .insert("conversion_rate".to_string(), "trial_conversion_rate".to_string());
+        cfg.tick_subject_map.insert(
+            "conversion_rate".to_string(),
+            "trial_conversion_rate".to_string(),
+        );
         // An explicit mapping wins even though the z-prefix convention would
         // have resolved to a different (wrong) field name here.
         assert_eq!(

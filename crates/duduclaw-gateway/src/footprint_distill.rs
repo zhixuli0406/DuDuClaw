@@ -605,7 +605,10 @@ impl FootprintTracker {
     /// `<home>/os/<agent>/footprint-aggregate.json` — the crash/restart
     /// snapshot of one agent's in-progress day bucket.
     fn snapshot_path(&self, agent_id: &str) -> PathBuf {
-        self.home_dir.join("os").join(agent_id).join("footprint-aggregate.json")
+        self.home_dir
+            .join("os")
+            .join(agent_id)
+            .join("footprint-aggregate.json")
     }
 
     /// Persist every tracked agent's in-progress bucket (atomic tmp+rename).
@@ -622,7 +625,9 @@ impl FootprintTracker {
         for (agent_id, stats) in snapshot {
             let path = self.snapshot_path(&agent_id);
             let Some(dir) = path.parent() else { continue };
-            let Ok(json) = serde_json::to_vec(&stats) else { continue };
+            let Ok(json) = serde_json::to_vec(&stats) else {
+                continue;
+            };
             let write = std::fs::create_dir_all(dir).and_then(|_| {
                 let tmp = path.with_extension("json.tmp");
                 std::fs::write(&tmp, &json)?;
@@ -639,11 +644,18 @@ impl FootprintTracker {
     /// rolls it over and distills it, so a restart shortly after midnight
     /// still gets yesterday's memories. Unreadable/invalid files are ignored.
     pub fn load_snapshots(&self) {
-        let agents: Vec<String> =
-            self.enabled_agents.lock().unwrap().iter().cloned().collect();
+        let agents: Vec<String> = self
+            .enabled_agents
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
         for agent_id in agents {
             let path = self.snapshot_path(&agent_id);
-            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
             let Ok(stats) = serde_json::from_slice::<AgentDayStats>(&bytes) else {
                 warn!(agent = %agent_id, "P4-4 footprint snapshot unreadable — starting fresh");
                 continue;
@@ -787,14 +799,14 @@ mod tests {
     #[test]
     fn default_direction_footprint_is_deny_by_default() {
         for body in [
-            "",                                  // empty file
-            "[os_watch]\n",                      // section, no key
-            "[os_watch]\npaths = [\"~/x\"]\n",   // watching, but no footprint
-            "[os_watch]\nfootprint = false\n",   // explicit off
+            "",                                   // empty file
+            "[os_watch]\n",                       // section, no key
+            "[os_watch]\npaths = [\"~/x\"]\n",    // watching, but no footprint
+            "[os_watch]\nfootprint = false\n",    // explicit off
             "[os_watch]\nfootprint = \"true\"\n", // wrong type — NOT coerced
-            "[os_watch]\nfootprint = 1\n",       // wrong type
-            "os_watch = \"scalar\"\n",           // wrong-typed section
-            "not valid [[[ toml",                // malformed file
+            "[os_watch]\nfootprint = 1\n",        // wrong type
+            "os_watch = \"scalar\"\n",            // wrong-typed section
+            "not valid [[[ toml",                 // malformed file
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("agent.toml"), body).unwrap();
@@ -810,7 +822,11 @@ mod tests {
 
         // Only an explicit `true` turns it on.
         let on = tempfile::tempdir().unwrap();
-        std::fs::write(on.path().join("agent.toml"), "[os_watch]\nfootprint = true\n").unwrap();
+        std::fs::write(
+            on.path().join("agent.toml"),
+            "[os_watch]\nfootprint = true\n",
+        )
+        .unwrap();
         assert!(read_footprint_enabled(on.path()));
     }
 
@@ -1404,9 +1420,19 @@ mod tests {
         // A fresh tracker (= restarted gateway) restores the bucket.
         let t2 = FootprintTracker::new(home.path().to_path_buf(), enabled_set("a1"));
         t2.load_snapshots();
-        let restored = t2.state.lock().unwrap().get("a1").cloned().expect("bucket restored");
+        let restored = t2
+            .state
+            .lock()
+            .unwrap()
+            .get("a1")
+            .cloned()
+            .expect("bucket restored");
         assert_eq!(restored.date, now.date_naive());
-        assert_eq!(restored.app_seconds.get("Xcode"), Some(&600), "10 min of Xcode kept");
+        assert_eq!(
+            restored.app_seconds.get("Xcode"),
+            Some(&600),
+            "10 min of Xcode kept"
+        );
         assert_eq!(
             restored.current_app.as_ref().map(|(a, _)| a.as_str()),
             Some("Safari"),
@@ -1414,7 +1440,11 @@ mod tests {
         );
 
         // Corrupt file → ignored, fresh start (never a panic).
-        std::fs::write(home.path().join("os/a1/footprint-aggregate.json"), b"not json").unwrap();
+        std::fs::write(
+            home.path().join("os/a1/footprint-aggregate.json"),
+            b"not json",
+        )
+        .unwrap();
         let t3 = FootprintTracker::new(home.path().to_path_buf(), enabled_set("a1"));
         t3.load_snapshots();
         assert!(t3.state.lock().unwrap().get("a1").is_none());

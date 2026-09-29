@@ -30,13 +30,15 @@ use tracing::{debug, warn};
 use crate::gvu::stagnation::{StagnationSignal, StagnationSnapshot};
 use crate::gvu::text_gradient::TextGradient;
 use crate::gvu::verifier::CanaryTest;
-use crate::gvu::verifier_gate::{run_gates, GateInput};
+use crate::gvu::verifier_gate::{GateInput, run_gates};
 use crate::gvu::verifier_measure::{CaseScore, MeasureScorer, ScoreRequest};
-use crate::playbook::delta::{validate_all, PlaybookDelta, ValidationCtx};
+use crate::playbook::delta::{PlaybookDelta, ValidationCtx, validate_all};
 use crate::playbook::gene::EvalCaseRef;
 
-use super::prompt::{self, is_holdout, PromptContext};
-use super::snapshot::{deterministic_sample, PendingFailureNote, PlaybookSnapshot, INNER_LOOP_SAMPLE_MAX};
+use super::prompt::{self, PromptContext, is_holdout};
+use super::snapshot::{
+    INNER_LOOP_SAMPLE_MAX, PendingFailureNote, PlaybookSnapshot, deterministic_sample,
+};
 
 /// §3.7.3 — hard ceiling on inner rounds.
 pub const MAX_INNER_ROUNDS: u32 = 3;
@@ -153,7 +155,9 @@ fn strip_holdout_links(
     let mut rejected = Vec::new();
     for d in deltas {
         let cases: &[EvalCaseRef] = match &d {
-            PlaybookDelta::Add { eval_cases, .. } | PlaybookDelta::Link { eval_cases, .. } => eval_cases,
+            PlaybookDelta::Add { eval_cases, .. } | PlaybookDelta::Link { eval_cases, .. } => {
+                eval_cases
+            }
             _ => &[],
         };
         match prompt::reject_holdout_links(cases) {
@@ -177,11 +181,17 @@ fn enforce_intent_ops(
         let is_add = matches!(d, PlaybookDelta::Add { .. });
         match intent {
             Optimize if is_add => {
-                rejected.push((d, "optimize rounds may not add entries (§3.2.3)".to_string()));
+                rejected.push((
+                    d,
+                    "optimize rounds may not add entries (§3.2.3)".to_string(),
+                ));
                 continue;
             }
             Innovate if is_add && adds_kept >= 1 => {
-                rejected.push((d, "innovate rounds may add at most one entry (§3.2.3)".to_string()));
+                rejected.push((
+                    d,
+                    "innovate rounds may add at most one entry (§3.2.3)".to_string(),
+                ));
                 continue;
             }
             _ => {}
@@ -214,14 +224,14 @@ fn stagnation_escalation(stag: &Option<StagnationSnapshot>) -> Option<String> {
         }
     }
     s.signals.iter().find_map(|sig| match sig {
-        StagnationSignal::RepeatedRejectionReason { occurrences, reason_prefix, .. }
-            if *occurrences >= 2 =>
-        {
-            Some(format!(
-                "the same rejection has fired {occurrences} times (\"{reason_prefix}\") — \
+        StagnationSignal::RepeatedRejectionReason {
+            occurrences,
+            reason_prefix,
+            ..
+        } if *occurrences >= 2 => Some(format!(
+            "the same rejection has fired {occurrences} times (\"{reason_prefix}\") — \
                  escalating instead of spending another inner round"
-            ))
-        }
+        )),
         _ => None,
     })
 }
@@ -335,7 +345,11 @@ where
             .collect();
 
         let mut round_gradients: Vec<TextGradient> = Vec::new();
-        for (d, reason) in holdout_rejects.iter().chain(&intent_rejects).chain(&schema_rejects) {
+        for (d, reason) in holdout_rejects
+            .iter()
+            .chain(&intent_rejects)
+            .chain(&schema_rejects)
+        {
             round_gradients.push(TextGradient::blocking(
                 "G-Schema",
                 "delta",
@@ -405,7 +419,12 @@ where
         {
             let mut assertion_gradient: Option<TextGradient> = None;
             for d in &schema_ok {
-                let crate::playbook::delta::PlaybookDelta::Add { eval_cases, assertions, content, .. } = d
+                let crate::playbook::delta::PlaybookDelta::Add {
+                    eval_cases,
+                    assertions,
+                    content,
+                    ..
+                } = d
                 else {
                     continue;
                 };
@@ -468,7 +487,12 @@ where
         {
             let mut hack_gradient: Option<TextGradient> = None;
             for d in &schema_ok {
-                let crate::playbook::delta::PlaybookDelta::Add { content, assertions, eval_cases, .. } = d
+                let crate::playbook::delta::PlaybookDelta::Add {
+                    content,
+                    assertions,
+                    eval_cases,
+                    ..
+                } = d
                 else {
                     continue;
                 };
@@ -498,7 +522,10 @@ where
                         round_gradients.push(TextGradient::advisory(
                             "M-RewardHack",
                             &delta_target(d),
-                            &format!("reward-hacking signal {} (Measure-side): {}", f.id, f.detail),
+                            &format!(
+                                "reward-hacking signal {} (Measure-side): {}",
+                                f.id, f.detail
+                            ),
                             "",
                         ));
                     }
@@ -579,21 +606,27 @@ where
         outcome.partial_cases = scored.clone();
 
         // ---- e. satisfied? ----------------------------------------------
-        let failures: Vec<&CaseScore> =
-            scored.iter().filter(|c| c.score < SATISFIED_CASE_SCORE).collect();
+        let failures: Vec<&CaseScore> = scored
+            .iter()
+            .filter(|c| c.score < SATISFIED_CASE_SCORE)
+            .collect();
         if failures.is_empty() {
             outcome.exit = InnerLoopExit::Satisfied;
             return outcome;
         }
 
         for f in &failures {
-            outcome
-                .pending_notes
-                .push(PendingFailureNote::new("", &format!("case {} failed", f.case), &format!("eval:{}", f.case)));
+            outcome.pending_notes.push(PendingFailureNote::new(
+                "",
+                &format!("case {} failed", f.case),
+                &format!("eval:{}", f.case),
+            ));
         }
         ctx.previous_gradients = round_gradients;
-        ctx.previous_case_failures =
-            failures.iter().map(|f| format!("{} failed", f.case)).collect();
+        ctx.previous_case_failures = failures
+            .iter()
+            .map(|f| format!("{} failed", f.case))
+            .collect();
     }
 
     outcome.exit = if outcome.deltas.is_empty() {
@@ -606,9 +639,9 @@ where
 
 fn delta_target(d: &PlaybookDelta) -> String {
     match d {
-        PlaybookDelta::Add { content, category, .. } => {
-            crate::playbook::dedup::dedup_key(content, *category)
-        }
+        PlaybookDelta::Add {
+            content, category, ..
+        } => crate::playbook::dedup::dedup_key(content, *category),
         PlaybookDelta::Revise { id, .. }
         | PlaybookDelta::Link { id, .. }
         | PlaybookDelta::Record { id, .. }

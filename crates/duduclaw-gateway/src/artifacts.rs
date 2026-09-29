@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use duduclaw_core::truncate_bytes;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Durable provenance ledger, next to `tool_calls.jsonl` / `task_changes.jsonl`.
 pub const ARTIFACTS_FILE: &str = "artifacts.jsonl";
@@ -345,22 +345,34 @@ const INTERNAL_DIRS: &[&str] = &[
 /// machinery. Conservative on purpose: a missed row is recoverable from the
 /// 「變更」tab, a wrong one teaches the user the 產物 list cannot be trusted.
 pub fn is_artifact_path(path: &str) -> bool {
-    let p = Path::new(path);
-    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    if INTERNAL_NAMES.contains(&name) {
+    if is_internal_agent_path(path) {
         return false;
     }
-    let ext_ok = p
+    Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| ARTIFACT_EXTS.contains(&e.to_ascii_lowercase().as_str()));
-    if !ext_ok {
-        return false;
+        .is_some_and(|e| ARTIFACT_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// `true` when a path names agent machinery — an [`INTERNAL_NAMES`] file, or
+/// anything under an [`INTERNAL_DIRS`] segment.
+///
+/// The veto half of [`is_artifact_path`], split out because the two halves
+/// answer different questions and only one of them applies to a **declared**
+/// artifact. A packet's `artifacts[].path` is an explicit hand-over, so the
+/// extension allowlist (a heuristic for *guessing* deliverables out of a
+/// sweep) must not apply to it — a `.txt`, `.json` or `.py` deliverable is
+/// perfectly real. "This is the agent's own brain, not a hand-over" applies
+/// regardless of who declared it.
+pub fn is_internal_agent_path(path: &str) -> bool {
+    let p = Path::new(path);
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+        return true;
+    };
+    if INTERNAL_NAMES.contains(&name) {
+        return true;
     }
-    // Any internal directory anywhere on the path disqualifies it.
-    !p.components().any(|c| {
+    p.components().any(|c| {
         c.as_os_str()
             .to_str()
             .is_some_and(|s| INTERNAL_DIRS.contains(&s))
@@ -1054,12 +1066,104 @@ pub struct GoalArchiveReport {
 /// copy on disk.
 fn goal_archive_already_present(dir: &Path, display_name: &str, size: u64) -> bool {
     let target = sanitize_name(display_name);
-    list_bucket(dir)
-        .into_iter()
-        .any(|(name, entry_size, _)| {
-            entry_size == size
-                && split_archived_name(&name).is_some_and(|(_, sanitized)| sanitized == target)
-        })
+    list_bucket(dir).into_iter().any(|(name, entry_size, _)| {
+        entry_size == size
+            && split_archived_name(&name).is_some_and(|(_, sanitized)| sanitized == target)
+    })
+}
+
+/// A team member may create a file through shell without emitting a native
+/// Write event. Read explicit artifact paths from bounded, task-scoped packets;
+/// the archive loop still checks every resolved path against the workspace.
+fn team_packet_archive_candidates(
+    home_dir: &Path,
+    task_id: &str,
+    agent_dir: &Path,
+) -> Vec<(String, Option<u32>)> {
+    if !duduclaw_core::is_valid_agent_id(task_id) {
+        return Vec::new();
+    }
+    let root = home_dir
+        .join(duduclaw_core::task_packet::TEAM_PACKETS_DIR)
+        .join(task_id);
+    let mut candidates = Vec::new();
+    let Ok(rounds) = std::fs::read_dir(root) else {
+        return candidates;
+    };
+    for round_entry in rounds.flatten() {
+        let Ok(round_kind) = round_entry.file_type() else {
+            continue;
+        };
+        if !round_kind.is_dir() || round_kind.is_symlink() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(round_entry.path()) else {
+            continue;
+        };
+        for entry in files.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_file() || kind.is_symlink() {
+                continue;
+            }
+            if entry.path().extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.len() > duduclaw_core::task_packet::TASK_PACKET_MAX_BYTES as u64 {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(packet) =
+                serde_json::from_slice::<duduclaw_core::task_packet::TaskPacket>(&bytes)
+            else {
+                continue;
+            };
+            if packet.goal_id != task_id || packet.validate().is_err() {
+                continue;
+            }
+            for artifact in packet.artifacts {
+                let Some(path) = artifact.path.filter(|p| !p.trim().is_empty()) else {
+                    continue;
+                };
+                let source = Path::new(&path);
+                let source = if source.is_absolute() {
+                    source.to_path_buf()
+                } else {
+                    agent_dir.join(source)
+                };
+                let resolved = source.to_string_lossy().into_owned();
+                // Review finding (P2): the sweep half of this candidate list
+                // is filtered by `is_artifact_path`, but the team-packet half
+                // used to be appended AFTER that filter and only had to clear
+                // the containment + size checks. A packet declaring
+                // `artifacts[].path = "SOUL.md"` /
+                // `"state/working_state.json"` / `".claude/settings.json"` is
+                // inside the workspace, so it passed — and the agent's own
+                // machinery was copied into `attachments/` and served by
+                // `/files`, which is exactly the "the 產物 list cannot be
+                // trusted" lesson `is_artifact_path` exists to avoid teaching.
+                //
+                // Only the machinery veto applies here, not the extension
+                // allowlist: the allowlist is a heuristic for *guessing*
+                // deliverables out of a file sweep, and a packet's
+                // `artifacts[]` is an explicit declaration — a `.txt`, `.json`
+                // or `.py` hand-over is a real one.
+                if is_internal_agent_path(&resolved) {
+                    debug!(
+                        task = task_id, path = %resolved,
+                        "team packet declared agent machinery as an artifact — not archived"
+                    );
+                    continue;
+                }
+                candidates.push((resolved, Some(packet.round)));
+            }
+        }
+    }
+    candidates
 }
 
 /// WP-4B: archive a goal task's produced deliverable-shaped files into the
@@ -1110,7 +1214,8 @@ pub async fn archive_goal_task_artifacts(
     }
     if !crate::files_api::is_safe_agent_id(agent_id) {
         warn!(
-            task = task_id, agent = agent_id,
+            task = task_id,
+            agent = agent_id,
             "WP-4B goal archive: agent id failed the safety allowlist — archiving skipped entirely"
         );
         return report;
@@ -1129,7 +1234,7 @@ pub async fn archive_goal_task_artifacts(
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut total_bytes: u64 = 0;
 
-    for change in crate::task_changes::collect_task_changes(
+    let mut candidates: Vec<(String, Option<u32>)> = crate::task_changes::collect_task_changes(
         home_dir,
         task_id,
         // Same convention as `collect_task_artifacts`: an empty agent drops
@@ -1142,26 +1247,32 @@ pub async fn archive_goal_task_artifacts(
         crate::task_changes::MAX_QUERY_LIMIT,
     )
     .changes
-    {
-        if !matches!(
+    .into_iter()
+    .filter(|change| {
+        matches!(
             change.op,
             crate::task_changes::ChangeOp::Write | crate::task_changes::ChangeOp::Edit
-        ) || !change.success
-            || !is_artifact_path(&change.path)
-        {
-            continue;
-        }
+        ) && change.success
+            && is_artifact_path(&change.path)
+    })
+    .map(|change| (change.path, change.round))
+    .collect();
+    candidates.extend(team_packet_archive_candidates(
+        home_dir, task_id, &agent_dir,
+    ));
+
+    for (path, round) in candidates {
         // Newest-first input ⇒ the first time we see a path is its most
         // recent version; later (older) rows for the same path are skipped.
-        if !seen.insert(change.path.clone()) {
+        if !seen.insert(path.clone()) {
             continue;
         }
 
-        let src = Path::new(&change.path);
+        let src = Path::new(&path);
         if !src.is_absolute() {
             report.skipped_outside_root += 1;
             warn!(
-                task = task_id, path = %change.path,
+                task = task_id, path = %path,
                 "WP-4B goal archive: source path is not absolute — skipped"
             );
             continue;
@@ -1176,7 +1287,7 @@ pub async fn archive_goal_task_artifacts(
         if !canon_src.starts_with(&canon_root) || canon_src.starts_with(&canon_attach) {
             report.skipped_outside_root += 1;
             warn!(
-                task = task_id, path = %change.path,
+                task = task_id, path = %path,
                 "WP-4B goal archive: source path escapes the agent workspace — skipped (possible symlink escape)"
             );
             continue;
@@ -1192,7 +1303,7 @@ pub async fn archive_goal_task_artifacts(
         if size > crate::media::MAX_FILE_SIZE {
             report.skipped_oversize += 1;
             warn!(
-                task = task_id, path = %change.path, size,
+                task = task_id, path = %path, size,
                 "WP-4B goal archive: file exceeds the per-file cap — skipped"
             );
             continue;
@@ -1200,7 +1311,7 @@ pub async fn archive_goal_task_artifacts(
         if total_bytes.saturating_add(size) > GOAL_ARCHIVE_MAX_TOTAL_BYTES {
             report.skipped_oversize += 1;
             warn!(
-                task = task_id, path = %change.path, size,
+                task = task_id, path = %path, size,
                 "WP-4B goal archive: per-task archive budget exhausted — skipped"
             );
             continue;
@@ -1220,13 +1331,12 @@ pub async fn archive_goal_task_artifacts(
             Ok(d) => d,
             Err(e) => {
                 report.skipped_missing += 1;
-                warn!(task = task_id, path = %change.path, error = %e, "WP-4B goal archive: read failed — skipped");
+                warn!(task = task_id, path = %path, error = %e, "WP-4B goal archive: read failed — skipped");
                 continue;
             }
         };
 
-        match crate::media::save_attachment_in_base_untracked(&agent_dir, &data, display_name)
-            .await
+        match crate::media::save_attachment_in_base_untracked(&agent_dir, &data, display_name).await
         {
             Ok(saved) => {
                 total_bytes = total_bytes.saturating_add(data.len() as u64);
@@ -1239,7 +1349,7 @@ pub async fn archive_goal_task_artifacts(
                     &SaveContext {
                         origin: ArtifactOrigin::Swept,
                         task_id: Some(task_id),
-                        round: change.round,
+                        round,
                         channel: None,
                         source_path: Some(src),
                     },
@@ -1247,7 +1357,7 @@ pub async fn archive_goal_task_artifacts(
             }
             Err(e) => {
                 warn!(
-                    task = task_id, path = %change.path, error = %e,
+                    task = task_id, path = %path, error = %e,
                     "WP-4B goal archive: archive copy failed — settle continues"
                 );
             }
@@ -1657,7 +1767,13 @@ mod tests {
         std::fs::create_dir_all(&attach).unwrap();
         let saved = attach.join("1755000000000_live.docx");
         std::fs::write(&saved, b"x").unwrap();
-        record_saved(&base, &saved, "live.docx", 1, &ctx_declared(Path::new("/s")));
+        record_saved(
+            &base,
+            &saved,
+            "live.docx",
+            1,
+            &ctx_declared(Path::new("/s")),
+        );
 
         let r = backfill(home);
         assert_eq!(r.added(), 0);
@@ -1677,6 +1793,124 @@ mod tests {
     }
 
     // ── WP-4B: goal-loop settle archiving ─────────────────────────────────
+
+    #[tokio::test]
+    async fn team_packet_artifact_without_native_write_is_downloadable_after_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent_dir = home.join("agents/sales");
+        std::fs::create_dir_all(agent_dir.join("notes")).unwrap();
+        std::fs::write(agent_dir.join("notes/result.txt"), b"team result").unwrap();
+        std::fs::write(home.join("agents/secret.txt"), b"not a deliverable").unwrap();
+        let packet = duduclaw_core::task_packet::packet_path(
+            home,
+            "task-1",
+            1,
+            duduclaw_core::Role::Executor,
+            duduclaw_core::Role::Verifier,
+        )
+        .unwrap();
+        std::fs::create_dir_all(packet.parent().unwrap()).unwrap();
+        std::fs::write(
+            &packet,
+            serde_json::json!({
+                "packet_id": "pk-1", "goal_id": "task-1", "round": 1,
+                "from_role": "executor", "to_role": "verifier",
+                "objective": "Review result", "output_format": "files",
+                "artifacts": [
+                    {"id": "result", "path": "notes/result.txt"},
+                    {"id": "escape", "path": "../secret.txt"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let report = archive_goal_task_artifacts(home, "task-1", "sales").await;
+        assert_eq!(report.archived, 1);
+        assert_eq!(report.skipped_outside_root, 1);
+        let rows = provenance_index(home, Some("sales"));
+        let (archived_name, saved) = rows
+            .iter()
+            .find(|(_, row)| row.display_name == "result.txt")
+            .unwrap();
+        assert_eq!(saved.task_id.as_deref(), Some("task-1"));
+        assert_eq!(saved.round, Some(1));
+        assert!(agent_dir.join("attachments").join(archived_name).is_file());
+    }
+
+    /// Review finding (P2) regression: the packet-declared candidates were
+    /// appended AFTER the `is_artifact_path` filter, so a packet naming
+    /// `SOUL.md`, `state/…` or `.claude/…` — all *inside* the workspace, so
+    /// containment passed — got the agent's own machinery copied into
+    /// `attachments/` and served by `/files`. The existing test above only
+    /// covered the `../secret.txt` containment escape.
+    #[tokio::test]
+    async fn a_packet_cannot_declare_agent_machinery_as_a_downloadable_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent_dir = home.join("agents/sales");
+        std::fs::create_dir_all(agent_dir.join("notes")).unwrap();
+        std::fs::create_dir_all(agent_dir.join("state")).unwrap();
+        std::fs::create_dir_all(agent_dir.join(".claude")).unwrap();
+        std::fs::write(agent_dir.join("SOUL.md"), b"# persona").unwrap();
+        std::fs::write(agent_dir.join("CLAUDE.md"), b"# instructions").unwrap();
+        std::fs::write(agent_dir.join("state/working_state.json"), b"{}").unwrap();
+        std::fs::write(agent_dir.join(".claude/settings.json"), b"{}").unwrap();
+        std::fs::write(agent_dir.join("notes/result.txt"), b"team result").unwrap();
+
+        let packet = duduclaw_core::task_packet::packet_path(
+            home,
+            "task-2",
+            1,
+            duduclaw_core::Role::Executor,
+            duduclaw_core::Role::Verifier,
+        )
+        .unwrap();
+        std::fs::create_dir_all(packet.parent().unwrap()).unwrap();
+        std::fs::write(
+            &packet,
+            serde_json::json!({
+                "packet_id": "pk-2", "goal_id": "task-2", "round": 1,
+                "from_role": "executor", "to_role": "verifier",
+                "objective": "Review result", "output_format": "files",
+                "artifacts": [
+                    {"id": "soul", "path": "SOUL.md"},
+                    {"id": "claude", "path": "CLAUDE.md"},
+                    {"id": "state", "path": "state/working_state.json"},
+                    {"id": "settings", "path": ".claude/settings.json"},
+                    {"id": "real", "path": "notes/result.txt"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let report = archive_goal_task_artifacts(home, "task-2", "sales").await;
+        assert_eq!(
+            report.archived, 1,
+            "only the real deliverable may be archived: {report:?}"
+        );
+        let rows = provenance_index(home, Some("sales"));
+        let names: Vec<&str> = rows.values().map(|row| row.display_name.as_str()).collect();
+        assert_eq!(names, vec!["result.txt"], "{names:?}");
+        let attachments: Vec<String> = std::fs::read_dir(agent_dir.join("attachments"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for forbidden in [
+            "SOUL.md",
+            "CLAUDE.md",
+            "working_state.json",
+            "settings.json",
+        ] {
+            assert!(
+                !attachments.iter().any(|a| a.ends_with(forbidden)),
+                "{forbidden} must never reach attachments/: {attachments:?}"
+            );
+        }
+    }
 
     fn write_native(path: &Path, content: &[u8]) -> crate::runtime::NativeToolEvent {
         std::fs::write(path, content).unwrap();

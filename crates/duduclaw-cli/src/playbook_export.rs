@@ -133,7 +133,8 @@ mod tests {
             strategy: Vec::new(),
             rationale: "seed".to_string(),
         };
-        let outcome = playbook::apply_deltas(&engine, agent, vec![add], &[], evals.path(), Utc::now()).await;
+        let outcome =
+            playbook::apply_deltas(&engine, agent, vec![add], &[], evals.path(), Utc::now()).await;
         assert_eq!(outcome.applied.len(), 1, "seed delta must apply cleanly");
     }
 
@@ -142,7 +143,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let err = cmd_playbook_export(
             home.path(),
-            ExportOptions { agent: "../evil".to_string(), out: None },
+            ExportOptions {
+                agent: "../evil".to_string(),
+                out: None,
+            },
         )
         .await
         .unwrap_err();
@@ -155,14 +159,21 @@ mod tests {
         let out = home.path().join("genes.json");
         cmd_playbook_export(
             home.path(),
-            ExportOptions { agent: "no-such-agent".to_string(), out: Some(out.clone()) },
+            ExportOptions {
+                agent: "no-such-agent".to_string(),
+                out: Some(out.clone()),
+            },
         )
         .await
         .unwrap();
 
         let raw = std::fs::read_to_string(&out).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed, serde_json::json!([]), "no entries ⇒ empty array, never fabricated");
+        assert_eq!(
+            parsed,
+            serde_json::json!([]),
+            "no entries ⇒ empty array, never fabricated"
+        );
     }
 
     #[tokio::test]
@@ -172,9 +183,15 @@ mod tests {
         seed_one_entry(home.path(), agent).await;
 
         let out = home.path().join("genes.json");
-        cmd_playbook_export(home.path(), ExportOptions { agent: agent.to_string(), out: Some(out.clone()) })
-            .await
-            .unwrap();
+        cmd_playbook_export(
+            home.path(),
+            ExportOptions {
+                agent: agent.to_string(),
+                out: Some(out.clone()),
+            },
+        )
+        .await
+        .unwrap();
 
         let raw = std::fs::read_to_string(&out).unwrap();
         let genes: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
@@ -184,7 +201,10 @@ mod tests {
         assert_eq!(gene["gene_schema"], serde_json::json!("1.0"));
         assert_eq!(gene["type"], serde_json::json!("gene"));
         assert_eq!(gene["category"], serde_json::json!("repair"));
-        assert_eq!(gene["summary"], serde_json::json!("when in doubt, ask for the order id"));
+        assert_eq!(
+            gene["summary"],
+            serde_json::json!("when in doubt, ask for the order id")
+        );
         assert_eq!(
             gene["validation"],
             serde_json::json!([{"kind": "duduclaw_eval", "ref": "s/c"}])
@@ -192,7 +212,10 @@ mod tests {
         // Patched-in ids this CLI has (to_gene's own signature can't carry them).
         assert_eq!(gene["x-duduclaw"]["agent_id"], serde_json::json!(agent));
         let entry_id = gene["x-duduclaw"]["entry_id"].as_str().unwrap();
-        assert!(!entry_id.is_empty(), "entry_id must be patched in, not left empty");
+        assert!(
+            !entry_id.is_empty(),
+            "entry_id must be patched in, not left empty"
+        );
 
         // Round-trips through `from_gene` (the x-duduclaw entry_id/agent_id
         // patch doesn't participate in `from_gene`'s return type, so this

@@ -35,16 +35,16 @@ const POLICY_ASK_POLL: Duration = Duration::from_secs(2);
 /// ignores the other tables). More robust than requiring the whole
 /// `AgentConfig` to parse.
 #[derive(serde::Deserialize, Default)]
-struct PolicyOnlyConfig {
+pub(crate) struct PolicyOnlyConfig {
     #[serde(default)]
-    capabilities: duduclaw_core::types::CapabilitiesConfig,
+    pub(crate) capabilities: duduclaw_core::types::CapabilitiesConfig,
 }
 
 /// The `os_*` MCP tools gated by the `[capabilities] os_native` master switch.
 /// P2-4 adds three read-only structured sensing tools (frontmost app/window,
 /// Spotlight search, today's calendar) alongside the P1 action/status tools —
 /// same gate, no ActionGuard (they have no host side-effect).
-const OS_NATIVE_TOOLS: &[&str] = &[
+pub(crate) const OS_NATIVE_TOOLS: &[&str] = &[
     "os_notify",
     "os_watch_status",
     "os_open",
@@ -57,7 +57,7 @@ const OS_NATIVE_TOOLS: &[&str] = &[
 /// switch (WP3.3). Recording captures live browser traffic / desktop
 /// screenshots, so it is deny-by-default per agent — same enforcement shape
 /// as [`OS_NATIVE_TOOLS`].
-const RECORDING_TOOLS: &[&str] = &[
+pub(crate) const RECORDING_TOOLS: &[&str] = &[
     "browser_record_start",
     "browser_record_stop",
     "desktop_record_start",
@@ -77,7 +77,7 @@ const RECORDING_TOOLS: &[&str] = &[
 /// agent's own machine footprint, `system_operator` is "this agent may
 /// operate the box on a human's behalf" — an agent can hold either, both,
 /// or neither.
-const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
+pub(crate) const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
     "os_device_status",
     "os_system_status",
     "os_check_update",
@@ -112,7 +112,7 @@ const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
 /// A2 added the read-only `codrive_status`. It is gated identically and on
 /// purpose: an agent without the co-drive capability has no business
 /// learning whether a human is currently at the shared desktop.
-const CODRIVE_TOOLS: &[&str] = &["codrive_run", "codrive_status"];
+pub(crate) const CODRIVE_TOOLS: &[&str] = &["codrive_run", "codrive_status"];
 
 /// The read-only SQL connector tools gated by the per-agent
 /// `[capabilities] db_sources` grant list (WP-D,
@@ -125,7 +125,37 @@ const CODRIVE_TOOLS: &[&str] = &["codrive_run", "codrive_status"];
 /// source it may touch is checked inside each handler, which is the layer that
 /// knows the `source` argument — `db_sources` (the listing tool) takes none
 /// and simply lists what the agent was granted.
-const DB_SOURCE_TOOLS: &[&str] = &["db_sources", "db_tables", "db_select", "db_query"];
+pub(crate) const DB_SOURCE_TOOLS: &[&str] = &["db_sources", "db_tables", "db_select", "db_query"];
+
+/// The Computer Use tool face gated by `[capabilities] computer_use`.
+///
+/// O7: this list is the authority for BOTH the dispatch gate (the match guard
+/// in `mcp::dispatch::handle_tools_call`, which is what actually denies the
+/// call) and the `tools/list` filter — they used to be a hand-written match
+/// arm and nothing respectively, so a capability-less agent was shown seven
+/// tools every call would reject.
+pub(crate) const COMPUTER_USE_TOOLS: &[&str] = &[
+    "computer_screenshot",
+    "computer_click",
+    "computer_type",
+    "computer_key",
+    "computer_scroll",
+    "computer_session_start",
+    "computer_session_stop",
+];
+
+/// The RFC-26 Live Run Forking tools, gated by the per-agent `[fork] enabled`
+/// toggle. The hard gate stays inside each handler (`mcp_fork::require_enabled`);
+/// this list exists so `tools/list` can keep *discoverable ⇔ callable* for an
+/// agent that never opted into forking.
+pub(crate) const FORK_TOOLS: &[&str] = &[
+    "fork_run",
+    "inspect_branches",
+    "diff_branches",
+    "merge_or_select",
+    "terminate_branch",
+    "fork_cost",
+];
 
 /// Neutralize `os_notify` `title`/`body` in place for the user's visual surface
 /// (P2-5). Each value is replaced by its perception-sanitized form (control
@@ -199,9 +229,30 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
     if agent_id.is_empty() {
         return AgentGateConfig::default();
     }
-    let toml_path = home_dir.join("agents").join(agent_id).join("agent.toml");
+    let ephemeral = duduclaw_gateway::ephemeral::is_ephemeral_id(agent_id);
+    let agent_dir = if ephemeral {
+        match duduclaw_gateway::ephemeral::resolve_agent_dir(home_dir, agent_id) {
+            Some(dir) => dir,
+            None => {
+                return AgentGateConfig {
+                    allowed_tools: vec!["__invalid_ephemeral__".into()],
+                    ..AgentGateConfig::default()
+                };
+            }
+        }
+    } else {
+        home_dir.join("agents").join(agent_id)
+    };
+    let toml_path = agent_dir.join("agent.toml");
     let Ok(content) = tokio::fs::read_to_string(&toml_path).await else {
-        return AgentGateConfig::default();
+        return if ephemeral {
+            AgentGateConfig {
+                allowed_tools: vec!["__invalid_ephemeral__".into()],
+                ..AgentGateConfig::default()
+            }
+        } else {
+            AgentGateConfig::default()
+        };
     };
     match toml::from_str::<PolicyOnlyConfig>(&content) {
         Ok(cfg) => AgentGateConfig {
@@ -222,7 +273,14 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
                  and os_native / recording / system_operator / codrive default to false, \
                  db_sources to empty (fail-closed)"
             );
-            AgentGateConfig::default()
+            if ephemeral {
+                AgentGateConfig {
+                    allowed_tools: vec!["__invalid_ephemeral__".into()],
+                    ..AgentGateConfig::default()
+                }
+            } else {
+                AgentGateConfig::default()
+            }
         }
     }
 }
@@ -398,9 +456,7 @@ impl McpDispatcher {
         // hidden tools out of discovery, but a malicious external client can
         // still call any tool by name via `tools/call`. Mirror the filter
         // here so non-discoverable tools are also non-callable.
-        if principal.is_external
-            && !crate::mcp_auth::external_tool_allowed(tool_name, principal)
-        {
+        if principal.is_external && !crate::mcp_auth::external_tool_allowed(tool_name, principal) {
             warn!(
                 client_id = %principal.client_id,
                 tool = %tool_name,
@@ -416,9 +472,7 @@ impl McpDispatcher {
 
         // ── 1. Scope check ───────────────────────────────────────────────────
         if let Some(required) = crate::mcp_auth::tool_requires_scope(tool_name) {
-            if !principal.scopes.contains(&required)
-                && !principal.scopes.contains(&Scope::Admin)
-            {
+            if !principal.scopes.contains(&required) && !principal.scopes.contains(&Scope::Admin) {
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
                 let detail = format!("required {required:?}, principal lacks it (and Admin)");
                 self.audit_dispatch_denial(tool_name, params, "insufficient_scope", &detail);
@@ -440,8 +494,11 @@ impl McpDispatcher {
         // an argument value that cannot even be serialized is treated as
         // blocked rather than being waved through.
         {
-            let agent_id: &str =
-                if principal.is_external { "external" } else { principal.client_id.as_str() };
+            let agent_id: &str = if principal.is_external {
+                "external"
+            } else {
+                principal.client_id.as_str()
+            };
             let args_str = match serde_json::to_string(
                 params.get("arguments").unwrap_or(&Value::Null),
             ) {
@@ -540,7 +597,8 @@ impl McpDispatcher {
         // agent.toml plainly said `codrive = true`). For the internal key the
         // acting agent is `default_agent` (DUDUCLAW_AGENT_ID, token-verified
         // at startup), so gate on that instead.
-        let gate_agent: &str = if principal.client_id == duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID
+        let gate_agent: &str = if principal.client_id
+            == duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID
             && !self.default_agent.is_empty()
         {
             &self.default_agent
@@ -632,36 +690,30 @@ impl McpDispatcher {
                         %reason,
                         "PolicyKernel denied tool call"
                     );
-                    duduclaw_gateway::otel::record_tool_outcome(
-                        &tracing::Span::current(),
-                        false,
-                    );
-                    return jsonrpc_error(
-                        id,
-                        -32003,
-                        &format!("Denied by policy: {reason}"),
-                    );
+                    duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+                    return jsonrpc_error(id, -32003, &format!("Denied by policy: {reason}"));
                 }
                 duduclaw_security::policy_kernel::Decision::Ask { risk } => {
                     // D-2: lazily open the broker only on escalation (rare),
                     // avoiding a constructor/signature change on every
                     // McpDispatcher::new call site.
-                    let broker =
-                        match duduclaw_gateway::approval::ApprovalBroker::open(&self.home_dir) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!(error = %e, "ApprovalBroker unavailable — denying (fail-closed)");
-                                duduclaw_gateway::otel::record_tool_outcome(
-                                    &tracing::Span::current(),
-                                    false,
-                                );
-                                return jsonrpc_error(
-                                    id,
-                                    -32003,
-                                    "Approval required but broker unavailable (fail-closed deny)",
-                                );
-                            }
-                        };
+                    let broker = match duduclaw_gateway::approval::ApprovalBroker::open(
+                        &self.home_dir,
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, "ApprovalBroker unavailable — denying (fail-closed)");
+                            duduclaw_gateway::otel::record_tool_outcome(
+                                &tracing::Span::current(),
+                                false,
+                            );
+                            return jsonrpc_error(
+                                id,
+                                -32003,
+                                "Approval required but broker unavailable (fail-closed deny)",
+                            );
+                        }
+                    };
                     let approval_id = match broker
                         .request(
                             &principal.client_id,
@@ -731,7 +783,10 @@ impl McpDispatcher {
                 .map(crate::mcp_redaction::McpRedactionLayer::args_contain_tokens)
                 .unwrap_or(false);
             if has_tokens {
-                let args = params_owned.get("arguments").cloned().unwrap_or(Value::Null);
+                let args = params_owned
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 match crate::mcp_redaction::decide_tool_args_with(
                     &layer.manager,
                     tool_name,
@@ -747,7 +802,10 @@ impl McpDispatcher {
                     duduclaw_redaction::EgressDecision::Passthrough(_) => {
                         // Leave args verbatim (tokens stay as placeholders).
                     }
-                    duduclaw_redaction::EgressDecision::Deny { reason, tokens_seen } => {
+                    duduclaw_redaction::EgressDecision::Deny {
+                        reason,
+                        tokens_seen,
+                    } => {
                         warn!(
                             client_id = %principal.client_id,
                             tool = %tool_name,
@@ -844,7 +902,12 @@ impl McpDispatcher {
                 "工具「{tool_name}」需要人機共駕能力，但此代理未啟用。請在 agent.toml 設定 \
                  [capabilities] codrive = true 後再使用。"
             );
-            self.audit_dispatch_denial(tool_name, &params_owned, "codrive_capability_missing", &msg);
+            self.audit_dispatch_denial(
+                tool_name,
+                &params_owned,
+                "codrive_capability_missing",
+                &msg,
+            );
             return jsonrpc_error(id, -32003, &msg);
         }
 
@@ -866,7 +929,12 @@ impl McpDispatcher {
                  ③ 呼叫 agent_update 工具並帶 db_sources_add 參數（僅限依委派政策有權編輯該員工的呼叫者）。\
                  授權會寫入該員工的 [capabilities] db_sources（名稱對應 config.toml 的 [db_sources.<名稱>]）。"
             );
-            self.audit_dispatch_denial(tool_name, &params_owned, "db_sources_capability_missing", &msg);
+            self.audit_dispatch_denial(
+                tool_name,
+                &params_owned,
+                "db_sources_capability_missing",
+                &msg,
+            );
             return jsonrpc_error(id, -32003, &msg);
         }
 
@@ -918,26 +986,36 @@ impl McpDispatcher {
         // Zero-overhead for the vast majority of agents: an empty `scoped_tools`
         // set short-circuits before any DB work.
         if !principal.is_external {
-            let agent_dir = self
-                .home_dir
-                .join("agents")
-                .join(&principal.client_id);
+            // W3-3b: use the SAME acting-agent resolution as §3.4's capability
+            // gate. `principal.client_id` is `gateway-internal` for every
+            // MCP child the gateway spawns, so reading
+            // `agents/gateway-internal/agent.toml` found no `scoped_tools` and
+            // this gate silently opened (fail-OPEN) on exactly the production
+            // path it was written for — the same defect the 2026-09-05 fix
+            // closed one gate above, missed here. `.ephemeral/` is resolved
+            // too, so a role member's own `scoped_tools` are honoured.
+            let agent_dir =
+                match duduclaw_gateway::ephemeral::resolve_agent_dir(&self.home_dir, gate_agent) {
+                    Some(dir) => dir,
+                    None => self.home_dir.join("agents").join(gate_agent),
+                };
             let scoped = duduclaw_gateway::capability_grants::scoped_tools(&agent_dir);
             if duduclaw_gateway::capability_grants::set_contains_tool(&scoped, tool_name) {
-                let has_grant = match duduclaw_gateway::capability_grants::CapabilityGrantStore::open(
-                    &self.home_dir,
-                ) {
-                    Ok(store) => store.has_active_grant(&principal.client_id, tool_name).await,
-                    Err(e) => {
-                        warn!(
-                            agent = %principal.client_id,
-                            tool = %tool_name,
-                            error = %e,
-                            "capability grant store unavailable — denying scoped tool (fail-closed)"
-                        );
-                        false
-                    }
-                };
+                let has_grant =
+                    match duduclaw_gateway::capability_grants::CapabilityGrantStore::open(
+                        &self.home_dir,
+                    ) {
+                        Ok(store) => store.has_active_grant(gate_agent, tool_name).await,
+                        Err(e) => {
+                            warn!(
+                                agent = %gate_agent,
+                                tool = %tool_name,
+                                error = %e,
+                                "capability grant store unavailable — denying scoped tool (fail-closed)"
+                            );
+                            false
+                        }
+                    };
                 if !has_grant {
                     duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
                     let msg = format!(
@@ -1036,6 +1114,25 @@ mod tests {
     use crate::mcp_auth::{Principal, Scope};
     use crate::mcp_namespace::NamespaceContext;
 
+    #[tokio::test]
+    async fn role_member_gate_reads_ephemeral_config_and_refuses_missing_scaffold() {
+        let home = tempfile::tempdir().unwrap();
+        let member = "eph-planner-123456";
+        let dir = home.path().join("agents/.ephemeral").join(member);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            "[capabilities]\nallowed_tools = [\"team_handoff\"]\n",
+        )
+        .unwrap();
+
+        let gate = load_agent_gate_config(home.path(), member).await;
+        assert_eq!(gate.allowed_tools, vec!["team_handoff"]);
+        std::fs::remove_file(dir.join("agent.toml")).unwrap();
+        let missing = load_agent_gate_config(home.path(), member).await;
+        assert_eq!(missing.allowed_tools, vec!["__invalid_ephemeral__"]);
+    }
+
     // ── os_notify perception neutralization (P2-5) ──────────────
 
     #[test]
@@ -1119,8 +1216,7 @@ mod tests {
         let http = reqwest::Client::new();
         let memory_path = home_dir.join("memory.db");
         let memory = Arc::new(
-            duduclaw_memory::SqliteMemoryEngine::new(&memory_path)
-                .expect("test memory db"),
+            duduclaw_memory::SqliteMemoryEngine::new(&memory_path).expect("test memory db"),
         );
         let odoo: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
         McpDispatcher::new(
@@ -1146,11 +1242,12 @@ mod tests {
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(1);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
-            result["error"]["code"],
-            -32003,
+            result["error"]["code"], -32003,
             "Expected scope error code -32003, got: {result}"
         );
         let msg = result["error"]["message"].as_str().unwrap_or("");
@@ -1174,13 +1271,167 @@ mod tests {
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(2);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         // Should NOT be -32003 (scope denied)
         let code = result["error"]["code"].as_i64().unwrap_or(0);
         assert_ne!(
             code, -32003,
             "Admin scope should bypass scope check, got: {result}"
+        );
+    }
+
+    /// W3-3b (debt #12): moving `team_handoff` off `Scope::MemoryWrite` onto
+    /// its own internal-only `Scope::TeamHandoff` must NOT break the internal
+    /// callers. Every gateway-spawned MCP child authenticates with the
+    /// `admin`-scoped `gateway-internal` key, and Admin substitutes for any
+    /// required scope at this gate — so no key-issuance change is needed and
+    /// none was made (writing an unknown scope string into `config.toml`
+    /// would zero out the scope set of any older binary reading the same
+    /// file: `load_key_registry` does `parse_scopes(..).unwrap_or_default()`).
+    #[tokio::test]
+    async fn admin_still_reaches_team_handoff_after_the_scope_split() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("team_handoff", serde_json::json!({}));
+        let id = serde_json::json!(7);
+
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
+
+        let code = result["error"]["code"].as_i64().unwrap_or(0);
+        assert_ne!(
+            code, -32003,
+            "the gateway-internal admin key must keep reaching team_handoff: {result}"
+        );
+    }
+
+    /// The other half: a principal holding only `memory:write` — the scope the
+    /// tool used to be filed under — is now refused at the scope gate.
+    #[tokio::test]
+    async fn memory_write_alone_no_longer_reaches_team_handoff() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+
+        let principal = make_principal(vec![Scope::MemoryWrite], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("team_handoff", serde_json::json!({}));
+        let id = serde_json::json!(8);
+
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
+
+        assert_eq!(
+            result["error"]["code"].as_i64(),
+            Some(-32003),
+            "memory:write must no longer clear the team_handoff scope gate: {result}"
+        );
+    }
+
+    /// W3-3b (debt #9): the PORTICO `scoped_tools` gate read
+    /// `agents/<principal.client_id>/agent.toml`, but every MCP child the
+    /// gateway spawns authenticates as `gateway-internal` — so it found no
+    /// `scoped_tools` and the gate silently opened on exactly the production
+    /// path it exists for. It now resolves the acting agent the same way the
+    /// capability gate one layer above already did.
+    #[tokio::test]
+    async fn scoped_tools_gate_follows_the_acting_agent_not_the_internal_client_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // `make_dispatcher` uses default_agent = "dudu".
+        let agent_dir = tmp.path().join("agents").join("dudu");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\nscoped_tools = [\"memory_search\"]\n",
+        )
+        .unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+
+        let principal = Principal {
+            client_id: duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID.to_string(),
+            scopes: [Scope::Admin].into_iter().collect(),
+            is_external: false,
+            created_at: chrono::Utc::now(),
+        };
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(9);
+
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
+
+        assert_eq!(
+            result["error"]["code"].as_i64(),
+            Some(-32003),
+            "a scoped tool with no active grant must be denied: {result}"
+        );
+        let msg = result["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("階段性授權"),
+            "must be the capability-grant denial, not the scope denial: {msg}"
+        );
+    }
+
+    /// Same gate, `.ephemeral/` layout: a team role member's own
+    /// `scoped_tools` live in its scaffold.
+    #[tokio::test]
+    async fn scoped_tools_gate_resolves_an_ephemeral_role_member_scaffold() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let member = "eph-agnes-r1-executor-ab12";
+        let dir = tmp
+            .path()
+            .join("agents")
+            .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+            .join(member);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            "[capabilities]\nscoped_tools = [\"memory_search\"]\n",
+        )
+        .unwrap();
+
+        let home_dir = tmp.path().to_path_buf();
+        let memory = Arc::new(
+            duduclaw_memory::SqliteMemoryEngine::new(&home_dir.join("memory.db"))
+                .expect("test memory db"),
+        );
+        let odoo: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        let dispatcher = McpDispatcher::new(
+            home_dir,
+            reqwest::Client::new(),
+            memory,
+            member.to_string(),
+            odoo,
+            RateLimiter::new(),
+            DailyQuota::new(),
+        );
+
+        let principal = Principal {
+            client_id: duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID.to_string(),
+            scopes: [Scope::Admin].into_iter().collect(),
+            is_external: false,
+            created_at: chrono::Utc::now(),
+        };
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(10);
+
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
+
+        assert_eq!(
+            result["error"]["code"].as_i64(),
+            Some(-32003),
+            "the scaffold's scoped_tools must be honoured: {result}"
         );
     }
 
@@ -1197,14 +1448,17 @@ mod tests {
 
         // Exhaust the Read bucket (100 req/min)
         for _ in 0..100 {
-            let _ = dispatcher.rate_limiter.check(&principal.client_id, OpType::Read);
+            let _ = dispatcher
+                .rate_limiter
+                .check(&principal.client_id, OpType::Read);
         }
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
-            result["error"]["code"],
-            -32029,
+            result["error"]["code"], -32029,
             "Expected rate-limit error code -32029, got: {result}"
         );
     }
@@ -1224,7 +1478,9 @@ mod tests {
         );
         let id = serde_json::json!(4);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         // The call should NOT fail with a namespace/security error -32003.
         // (It may succeed or fail for other reasons, but not path traversal.)
@@ -1250,7 +1506,9 @@ mod tests {
         );
         let id = serde_json::json!(5);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
@@ -1265,7 +1523,10 @@ mod tests {
         // The block must leave a forensic trail in security_audit.jsonl.
         let log = std::fs::read_to_string(tmp.path().join("security_audit.jsonl"))
             .expect("audit log should exist after a block");
-        assert!(log.contains("prompt_injection"), "block must emit audit event");
+        assert!(
+            log.contains("prompt_injection"),
+            "block must emit audit event"
+        );
     }
 
     // ── Test: PolicyKernel forbid rule denies a matching tool call (P1-2) ──────
@@ -1293,7 +1554,9 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(7);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
@@ -1315,7 +1578,9 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(8);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         // Must NOT be a policy denial (may fail downstream for other reasons).
         let msg = result["error"]["message"].as_str().unwrap_or("");
@@ -1348,7 +1613,9 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(30);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
@@ -1373,7 +1640,13 @@ effect = "forbid"
         let store =
             duduclaw_gateway::capability_grants::CapabilityGrantStore::open(tmp.path()).unwrap();
         store
-            .grant("test-client", Some("task-1"), "memory_search", "capability_request", 3600)
+            .grant(
+                "test-client",
+                Some("task-1"),
+                "memory_search",
+                "capability_request",
+                3600,
+            )
             .await
             .unwrap();
 
@@ -1382,7 +1655,9 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(31);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         let msg = result["error"]["message"].as_str().unwrap_or("");
         assert!(
@@ -1405,7 +1680,9 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(32);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         let msg = result["error"]["message"].as_str().unwrap_or("");
         assert!(
@@ -1440,7 +1717,12 @@ effect = "forbid"
             ),
         ] {
             let result = dispatcher
-                .dispatch_tool_call(&principal, &ns_ctx, &make_params(tool, args), &serde_json::json!(n))
+                .dispatch_tool_call(
+                    &principal,
+                    &ns_ctx,
+                    &make_params(tool, args),
+                    &serde_json::json!(n),
+                )
                 .await;
             assert_eq!(
                 result["error"]["code"], -32003,
@@ -1538,14 +1820,19 @@ effect = "forbid"
         );
         let id = serde_json::json!(40);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
             "os_notify without os_native must be denied, got: {result}"
         );
         let msg = result["error"]["message"].as_str().unwrap_or("");
-        assert!(msg.contains("os_native"), "denial must mention os_native, got: {msg}");
+        assert!(
+            msg.contains("os_native"),
+            "denial must mention os_native, got: {msg}"
+        );
     }
 
     /// os_native = false explicitly is also denied.
@@ -1560,7 +1847,9 @@ effect = "forbid"
         let params = make_params("os_open", serde_json::json!({ "target": "https://x.com" }));
         let id = serde_json::json!(41);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
@@ -1583,7 +1872,9 @@ effect = "forbid"
         let params = make_params("os_watch_status", serde_json::json!({}));
         let id = serde_json::json!(42);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         // Reaches the handler; returns a normal tool result (no error object).
         assert!(
@@ -1608,13 +1899,18 @@ effect = "forbid"
         ] {
             let params = make_params(tool, args);
             let id = serde_json::json!(43);
-            let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+            let result = dispatcher
+                .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+                .await;
             assert_eq!(
                 result["error"]["code"], -32003,
                 "{tool} without os_native must be denied, got: {result}"
             );
             let msg = result["error"]["message"].as_str().unwrap_or("");
-            assert!(msg.contains("os_native"), "{tool}: denial must mention os_native, got: {msg}");
+            assert!(
+                msg.contains("os_native"),
+                "{tool}: denial must mention os_native, got: {msg}"
+            );
         }
     }
 
@@ -1633,7 +1929,9 @@ effect = "forbid"
         for tool in super::RECORDING_TOOLS {
             let params = make_params(tool, serde_json::json!({ "id": "rec-x" }));
             let id = serde_json::json!(50);
-            let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+            let result = dispatcher
+                .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+                .await;
             assert_eq!(
                 result["error"]["code"], -32003,
                 "{tool} without the recording capability must be denied, got: {result}"
@@ -1658,7 +1956,9 @@ effect = "forbid"
         let params = make_params("browser_record_stop", serde_json::json!({ "id": "rec-x" }));
         let id = serde_json::json!(51);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
@@ -1683,7 +1983,9 @@ effect = "forbid"
         );
         let id = serde_json::json!(52);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         // Reaches the handler (unknown recording → tool-level error, not a
         // JSON-RPC capability denial).
@@ -1713,9 +2015,14 @@ effect = "forbid"
         let principal = make_principal(vec![Scope::Admin], false);
         let ns_ctx = make_ns_ctx(false);
         for tool in super::SYSTEM_OPERATOR_TOOLS {
-            let params = make_params(tool, serde_json::json!({ "confirm": true, "action": "restart", "target": "system" }));
+            let params = make_params(
+                tool,
+                serde_json::json!({ "confirm": true, "action": "restart", "target": "system" }),
+            );
             let id = serde_json::json!(60);
-            let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+            let result = dispatcher
+                .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+                .await;
             assert_eq!(
                 result["error"]["code"], -32003,
                 "{tool} without system_operator must be denied, got: {result}"
@@ -1741,7 +2048,9 @@ effect = "forbid"
         let params = make_params("os_device_status", serde_json::json!({}));
         let id = serde_json::json!(61);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
@@ -1765,7 +2074,9 @@ effect = "forbid"
         let params = make_params("os_device_status", serde_json::json!({}));
         let id = serde_json::json!(62);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
@@ -1787,7 +2098,9 @@ effect = "forbid"
         let params = make_params("os_device_status", serde_json::json!({}));
         let id = serde_json::json!(63);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         // Reaches the handler at the JSON-RPC level (no -32003 capability
         // denial) — the tool itself still refuses fail-closed off-appliance,
@@ -1814,7 +2127,9 @@ effect = "forbid"
         let params = make_params("os_device_status", serde_json::json!({}));
         let id = serde_json::json!(64);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
@@ -1835,10 +2150,15 @@ effect = "forbid"
 
         let principal = make_principal(vec![Scope::MemoryRead], false);
         let ns_ctx = make_ns_ctx(false);
-        let params = make_params("memory_search", serde_json::json!({ "query": "weather today" }));
+        let params = make_params(
+            "memory_search",
+            serde_json::json!({ "query": "weather today" }),
+        );
         let id = serde_json::json!(6);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         // May fail downstream for other reasons, but NOT with an injection block.
         let msg = result["error"]["message"].as_str().unwrap_or("");
@@ -1874,8 +2194,8 @@ effect = "forbid"
             );
         }
         let paths = duduclaw_redaction::ManagerPaths::under_home(home);
-        let manager =
-            duduclaw_redaction::RedactionManager::open(cfg, paths).expect("redaction manager opens");
+        let manager = duduclaw_redaction::RedactionManager::open(cfg, paths)
+            .expect("redaction manager opens");
         Arc::new(crate::mcp_redaction::McpRedactionLayer {
             manager: Arc::new(manager),
             // agent_id here is ignored by the dispatcher (it uses
@@ -1899,7 +2219,9 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": EMAIL_TOKEN }));
         let id = serde_json::json!(21);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32007,
@@ -1942,7 +2264,9 @@ effect = "forbid"
         unsafe {
             std::env::set_var("DUDUCLAW_REDACTION_SCOPES", "RedactionAdmin");
         }
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
         unsafe {
             std::env::remove_var("DUDUCLAW_REDACTION_SCOPES");
         }
@@ -1984,7 +2308,9 @@ effect = "forbid"
         let params = make_params("web_fetch", serde_json::json!({ "url": EMAIL_TOKEN }));
         let id = serde_json::json!(23);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32007,
@@ -2002,10 +2328,15 @@ effect = "forbid"
 
         let principal = make_principal(vec![Scope::Admin], false);
         let ns_ctx = make_ns_ctx(false);
-        let params = make_params("memory_search", serde_json::json!({ "query": "weather today" }));
+        let params = make_params(
+            "memory_search",
+            serde_json::json!({ "query": "weather today" }),
+        );
         let id = serde_json::json!(24);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         let code = result["error"]["code"].as_i64().unwrap_or(0);
         assert_ne!(
@@ -2078,14 +2409,19 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(60);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
             "denied_tools must block the MCP call, got: {result}"
         );
         let msg = result["error"]["message"].as_str().unwrap_or("");
-        assert!(msg.contains("denied_tools"), "denial must mention denied_tools, got: {msg}");
+        assert!(
+            msg.contains("denied_tools"),
+            "denial must mention denied_tools, got: {msg}"
+        );
     }
 
     /// A dashboard-authored qualified entry (`mcp__duduclaw__<name>`) must
@@ -2105,7 +2441,9 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(61);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
@@ -2126,14 +2464,19 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(62);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         assert_eq!(
             result["error"]["code"], -32003,
             "a tool outside the allowlist must be blocked, got: {result}"
         );
         let msg = result["error"]["message"].as_str().unwrap_or("");
-        assert!(msg.contains("allowed_tools"), "denial must mention allowed_tools, got: {msg}");
+        assert!(
+            msg.contains("allowed_tools"),
+            "denial must mention allowed_tools, got: {msg}"
+        );
     }
 
     /// The tool named in `allowed_tools` passes this gate (may still fail
@@ -2143,14 +2486,19 @@ effect = "forbid"
     async fn allowed_tools_allowlist_passes_listed_tool() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_dispatcher(&tmp).await;
-        write_scoped_toml(&tmp, "[capabilities]\nallowed_tools = [\"memory_search\"]\n");
+        write_scoped_toml(
+            &tmp,
+            "[capabilities]\nallowed_tools = [\"memory_search\"]\n",
+        );
 
         let principal = make_principal(vec![Scope::Admin], false);
         let ns_ctx = make_ns_ctx(false);
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(63);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         let msg = result["error"]["message"].as_str().unwrap_or("");
         assert!(
@@ -2172,7 +2520,9 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(64);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
 
         let msg = result["error"]["message"].as_str().unwrap_or("");
         assert!(
@@ -2202,7 +2552,9 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(70);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
         assert_eq!(result["error"]["code"], -32003);
 
         let rows = read_tool_call_rows(&tmp);
@@ -2225,7 +2577,9 @@ effect = "forbid"
         let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
         let id = serde_json::json!(71);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
         assert_eq!(result["error"]["code"], -32003);
 
         let rows = read_tool_call_rows(&tmp);
@@ -2245,10 +2599,15 @@ effect = "forbid"
 
         let principal = make_principal(vec![Scope::Admin], false);
         let ns_ctx = make_ns_ctx(false);
-        let params = make_params("memory_search", serde_json::json!({ "query": "secret plan" }));
+        let params = make_params(
+            "memory_search",
+            serde_json::json!({ "query": "secret plan" }),
+        );
         let id = serde_json::json!(72);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
         assert_eq!(result["error"]["code"], -32003);
 
         let rows = read_tool_call_rows(&tmp);
@@ -2280,8 +2639,13 @@ effect = "forbid"
         );
         let id = serde_json::json!(73);
 
-        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
-        assert!(result.get("error").is_none(), "memory_store must succeed, got: {result}");
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id)
+            .await;
+        assert!(
+            result.get("error").is_none(),
+            "memory_store must succeed, got: {result}"
+        );
 
         let rows = read_tool_call_rows(&tmp);
         let row = rows
@@ -2289,6 +2653,9 @@ effect = "forbid"
             .find(|r| r["tool_name"] == "memory_store")
             .expect("memory_store is state-changing and must be audited");
         assert_eq!(row["success"], true);
-        assert!(row.get("error_class").is_none(), "success rows must not carry error_class: {row}");
+        assert!(
+            row.get("error_class").is_none(),
+            "success rows must not carry error_class: {row}"
+        );
     }
 }

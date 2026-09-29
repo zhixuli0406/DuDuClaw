@@ -121,9 +121,16 @@ pub fn census_languages(files: &[String]) -> Vec<LanguageStat> {
     }
     let mut stats: Vec<LanguageStat> = counts
         .into_iter()
-        .map(|(extension, file_count)| LanguageStat { extension, file_count })
+        .map(|(extension, file_count)| LanguageStat {
+            extension,
+            file_count,
+        })
         .collect();
-    stats.sort_by(|a, b| b.file_count.cmp(&a.file_count).then_with(|| a.extension.cmp(&b.extension)));
+    stats.sort_by(|a, b| {
+        b.file_count
+            .cmp(&a.file_count)
+            .then_with(|| a.extension.cmp(&b.extension))
+    });
     stats.truncate(MAX_LANGUAGE_BUCKETS);
     stats
 }
@@ -465,7 +472,10 @@ mod tests {
     #[test]
     fn hotspots_only_include_files_touched_by_security_commits() {
         let raw = commit("chore: bump deps", &["package.json"])
-            + &commit("fix: auth bypass in login", &["src/auth.rs", "src/login.rs"])
+            + &commit(
+                "fix: auth bypass in login",
+                &["src/auth.rs", "src/login.rs"],
+            )
             + &commit("docs: typo", &["README.md"]);
         let hotspots = parse_git_log_hotspots(&raw);
         let files: Vec<&str> = hotspots.iter().map(|h| h.file.as_str()).collect();
@@ -504,7 +514,10 @@ mod tests {
     #[test]
     fn hotspots_ignore_stray_lines_before_first_commit_marker() {
         // Defensive: malformed/truncated output must not panic or misattribute.
-        let raw = format!("garbage-line-with-no-marker\n{}", commit("fix: x", &["a.rs"]));
+        let raw = format!(
+            "garbage-line-with-no-marker\n{}",
+            commit("fix: x", &["a.rs"])
+        );
         let hotspots = parse_git_log_hotspots(&raw);
         assert_eq!(hotspots.len(), 1);
         assert_eq!(hotspots[0].file, "a.rs");
@@ -518,7 +531,9 @@ mod tests {
         let status = compute_git_history(dir.path()).await;
         match status {
             GitHistoryStatus::Unavailable { reason } => {
-                assert!(reason.contains("not a git repository") || reason.contains("git not found"));
+                assert!(
+                    reason.contains("not a git repository") || reason.contains("git not found")
+                );
             }
             GitHistoryStatus::Available { .. } => panic!("expected Unavailable for a non-git dir"),
         }

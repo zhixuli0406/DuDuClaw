@@ -31,7 +31,7 @@ use crate::gvu::mistake_notebook::MistakeEntry;
 use crate::gvu::stagnation::{StagnationSignal, StagnationSnapshot};
 use crate::gvu::telemetry::TelemetrySummary;
 use crate::gvu::text_gradient::TextGradient;
-use crate::gvu::version_store::{ExperimentSummary, SoulVersion};
+use crate::gvu::version_store::ExperimentSummary;
 use crate::playbook::delta::ExistingEntry;
 use crate::playbook::gene::EvalCaseRef;
 
@@ -40,8 +40,7 @@ use super::snapshot::PlaybookSnapshot;
 
 /// The structured editing manual, compiled into the binary so a stripped
 /// deployment can never lose it at runtime.
-pub const PLAYBOOK_EDITING_GUIDE: &str =
-    include_str!("../../playbook/PLAYBOOK_EDITING_GUIDE.md");
+pub const PLAYBOOK_EDITING_GUIDE: &str = include_str!("../../playbook/PLAYBOOK_EDITING_GUIDE.md");
 
 /// Path segments marking a held-out eval case.
 ///
@@ -70,7 +69,10 @@ pub fn is_holdout(case: &EvalCaseRef) -> bool {
 pub fn reject_holdout_links(cases: &[EvalCaseRef]) -> Result<(), String> {
     for c in cases {
         if is_holdout(c) {
-            return Err(format!("held-out cases cannot be linked to entries: {}", c.0));
+            return Err(format!(
+                "held-out cases cannot be linked to entries: {}",
+                c.0
+            ));
         }
     }
     Ok(())
@@ -94,8 +96,6 @@ pub struct PromptContext {
     pub inner_round: u32,
     pub must_not: Vec<String>,
     pub must_always: Vec<String>,
-    /// Lineage: last 5 SOUL versions.
-    pub versions: Vec<SoulVersion>,
     pub experiments: ExperimentSummary,
     /// Rejection distribution over the trailing 30 days.
     pub telemetry: Option<TelemetrySummary>,
@@ -175,8 +175,10 @@ fn block2(snapshot: &PlaybookSnapshot, ctx: &PromptContext) -> String {
         for e in &live {
             // §3.5 lock 3: the SECOND held-out filter. Even if a held-out ref
             // somehow made it into an entry's metadata, it stops here.
-            let cases: Vec<&str> =
-                visible_cases(&e.meta.eval_cases).iter().map(|c| c.0.as_str()).collect();
+            let cases: Vec<&str> = visible_cases(&e.meta.eval_cases)
+                .iter()
+                .map(|c| c.0.as_str())
+                .collect();
             s.push_str(&format!(
                 "- id={} category={} state={} net={} streak={} signals={:?} cases={:?}\n  {}\n",
                 e.id,
@@ -199,21 +201,14 @@ fn block2(snapshot: &PlaybookSnapshot, ctx: &PromptContext) -> String {
         crate::playbook::PLAYBOOK_MAX_ENTRIES
     ));
 
-    s.push_str("## Version lineage (most recent first)\n");
-    if ctx.versions.is_empty() {
-        s.push_str("(no prior versions)\n");
-    } else {
-        for v in ctx.versions.iter().take(5) {
-            s.push_str(&format!(
-                "- [{}] {} ({})\n",
-                v.status.as_str(),
-                duduclaw_core::truncate_chars(&v.soul_summary, 120),
-                v.applied_at.format("%Y-%m-%d"),
-            ));
-        }
-    }
+    // S11 (2026-09-29): the "## Version lineage" block that used to sit here
+    // listed SOUL.md versions. Nothing writes those any more (the legacy SOUL
+    // rewrite path is gone), so it could only ever have rendered "(no prior
+    // versions)" — a permanently empty section costs prompt tokens and
+    // implies a history that does not exist. The experiment log below is the
+    // lineage AEE actually has.
     s.push_str(&format!(
-        "\nExperiments: {} total, {} applied, {} abandoned, success rate {:.0}%.\n",
+        "## Lineage\n\nExperiments: {} total, {} applied, {} abandoned, success rate {:.0}%.\n",
         ctx.experiments.total_experiments,
         ctx.experiments.applied_count,
         ctx.experiments.abandoned_count,
@@ -276,7 +271,11 @@ fn block3(ctx: &PromptContext) -> String {
                 s.push_str("(none)\n");
             } else {
                 for m in ctx.mistakes.iter().take(5) {
-                    let kind = if m.source_kind.is_empty() { "unattributed" } else { &m.source_kind };
+                    let kind = if m.source_kind.is_empty() {
+                        "unattributed"
+                    } else {
+                        &m.source_kind
+                    };
                     s.push_str(&format!(
                         "- [{}/{}] {}\n",
                         m.category.as_str(),
@@ -314,7 +313,11 @@ fn block3(ctx: &PromptContext) -> String {
             s.push_str("## Stagnation detected — change direction\n");
             for sig in &stag.signals {
                 match sig {
-                    StagnationSignal::RepeatedRejectionReason { occurrences, reason_prefix, .. } => {
+                    StagnationSignal::RepeatedRejectionReason {
+                        occurrences,
+                        reason_prefix,
+                        ..
+                    } => {
                         s.push_str(&format!(
                             "- The SAME rejection has fired {occurrences} times: \"{reason_prefix}\". \
                              Do not go that way again.\n"
@@ -323,7 +326,10 @@ fn block3(ctx: &PromptContext) -> String {
                     StagnationSignal::ConsecutiveNonApplied { count, .. } => {
                         s.push_str(&format!("- {count} consecutive rounds applied nothing.\n"));
                     }
-                    StagnationSignal::ZeroApplyWindow { days, trigger_count } => {
+                    StagnationSignal::ZeroApplyWindow {
+                        days,
+                        trigger_count,
+                    } => {
                         s.push_str(&format!(
                             "- {trigger_count} attempts over {days} days, none applied.\n"
                         ));
@@ -337,7 +343,10 @@ fn block3(ctx: &PromptContext) -> String {
     if !ctx.previous_gradients.is_empty() || !ctx.previous_case_failures.is_empty() {
         s.push_str("## Feedback from your previous attempt this round\n");
         for g in &ctx.previous_gradients {
-            s.push_str(&format!("- [{}] {} → {}\n", g.source_layer, g.critique, g.suggestion));
+            s.push_str(&format!(
+                "- [{}] {} → {}\n",
+                g.source_layer, g.critique, g.suggestion
+            ));
         }
         for f in &ctx.previous_case_failures {
             s.push_str(&format!("- [eval] {f}\n"));
@@ -352,7 +361,9 @@ fn block3(ctx: &PromptContext) -> String {
 mod tests {
     use super::*;
     use crate::playbook::delta::ExistingEntry;
-    use crate::playbook::entry::{PlaybookCategory, PlaybookMeta, PlaybookState, PLAYBOOK_SCHEMA_VERSION};
+    use crate::playbook::entry::{
+        PLAYBOOK_SCHEMA_VERSION, PlaybookCategory, PlaybookMeta, PlaybookState,
+    };
     use crate::prediction::rule_lifecycle::RuleStats;
 
     fn entry_with_cases(id: &str, cases: &[&str]) -> ExistingEntry {
@@ -363,10 +374,14 @@ mod tests {
                 assertions: Default::default(),
                 schema_version: PLAYBOOK_SCHEMA_VERSION,
                 category: PlaybookCategory::Repair,
+                transferability: Default::default(),
                 signals_match: vec!["mistake:factual".to_string()],
                 strategy: Vec::new(),
                 failure_history: Vec::new(),
-                eval_cases: cases.iter().map(|c| EvalCaseRef((*c).to_string())).collect(),
+                eval_cases: cases
+                    .iter()
+                    .map(|c| EvalCaseRef((*c).to_string()))
+                    .collect(),
                 applications: Vec::new(),
                 success_streak: 0,
                 state: PlaybookState::Active,
@@ -385,7 +400,9 @@ mod tests {
         assert!(is_holdout(&EvalCaseRef("ceo/_holdout/refund".into())));
         assert!(is_holdout(&EvalCaseRef("_holdout/refund".into())));
         // The spelling the shipped suites actually use.
-        assert!(is_holdout(&EvalCaseRef("b2b-billing/held-out/p1-heldout-auditor-001".into())));
+        assert!(is_holdout(&EvalCaseRef(
+            "b2b-billing/held-out/p1-heldout-auditor-001".into()
+        )));
         // A suite whose NAME merely contains the token must not be captured…
         assert!(!is_holdout(&EvalCaseRef("my_holdout_notes/refund".into())));
         // …nor a case name that embeds it.
@@ -407,30 +424,51 @@ mod tests {
             entry_with_cases("e1", &["ceo/normal-a", "ceo/_holdout/secret-one"]),
             entry_with_cases("e2", &["ceo/_holdout/secret-two"]),
         ]);
-        let ctx = PromptContext { agent_id: "ceo".into(), ..Default::default() };
+        let ctx = PromptContext {
+            agent_id: "ceo".into(),
+            ..Default::default()
+        };
         let prompt = assemble(&snap, &ctx);
-        assert!(!prompt.contains("secret-one"), "held-out case name leaked into the prompt");
+        assert!(
+            !prompt.contains("secret-one"),
+            "held-out case name leaked into the prompt"
+        );
         assert!(!prompt.contains("secret-two"));
-        assert!(prompt.contains("ceo/normal-a"), "non-held-out cases must still be visible");
+        assert!(
+            prompt.contains("ceo/normal-a"),
+            "non-held-out cases must still be visible"
+        );
 
         // The token itself appears exactly once, in block 1's guide section
         // telling the model held-out cases exist and are off limits. It must
         // never appear in block 2, which is where real case refs are listed.
         let blocks: Vec<&str> = prompt.split(CACHE_SPLIT_MARKER).collect();
         for seg in super::HOLDOUT_SEGMENTS {
-            assert!(!blocks[1].contains(seg), "'{seg}' leaked into the playbook listing");
-            assert!(!blocks[2].contains(seg), "'{seg}' leaked into the round block");
+            assert!(
+                !blocks[1].contains(seg),
+                "'{seg}' leaked into the playbook listing"
+            );
+            assert!(
+                !blocks[2].contains(seg),
+                "'{seg}' leaked into the round block"
+            );
         }
     }
 
     #[test]
     fn prompt_has_exactly_three_cache_blocks() {
-        let ctx = PromptContext { agent_id: "a".into(), ..Default::default() };
+        let ctx = PromptContext {
+            agent_id: "a".into(),
+            ..Default::default()
+        };
         let prompt = assemble(&PlaybookSnapshot::default(), &ctx);
         assert_eq!(prompt.matches(CACHE_SPLIT_MARKER).count(), 2);
         let blocks: Vec<&str> = prompt.split(CACHE_SPLIT_MARKER).collect();
         assert_eq!(blocks.len(), 3);
-        assert!(blocks[0].contains("Playbook Editing Guide"), "guide belongs in block 1");
+        assert!(
+            blocks[0].contains("Playbook Editing Guide"),
+            "guide belongs in block 1"
+        );
         assert!(blocks[1].contains("Current playbook"));
         assert!(blocks[2].contains("This round"));
     }
@@ -441,11 +479,19 @@ mod tests {
         // being a stable cache prefix.
         let a = assemble(
             &PlaybookSnapshot::default(),
-            &PromptContext { agent_id: "agent-a".into(), inner_round: 1, ..Default::default() },
+            &PromptContext {
+                agent_id: "agent-a".into(),
+                inner_round: 1,
+                ..Default::default()
+            },
         );
         let b = assemble(
             &PlaybookSnapshot::new(vec![entry_with_cases("e", &["s/c"])]),
-            &PromptContext { agent_id: "agent-b".into(), inner_round: 3, ..Default::default() },
+            &PromptContext {
+                agent_id: "agent-b".into(),
+                inner_round: 3,
+                ..Default::default()
+            },
         );
         let first = |p: &str| p.split(CACHE_SPLIT_MARKER).next().unwrap().to_string();
         assert_eq!(first(&a), first(&b));
@@ -464,7 +510,11 @@ mod tests {
 
     #[test]
     fn missing_telemetry_is_labelled_not_silently_omitted() {
-        let ctx = PromptContext { agent_id: "a".into(), telemetry: None, ..Default::default() };
+        let ctx = PromptContext {
+            agent_id: "a".into(),
+            telemetry: None,
+            ..Default::default()
+        };
         let prompt = assemble(&PlaybookSnapshot::default(), &ctx);
         assert!(prompt.contains("unavailable"));
     }

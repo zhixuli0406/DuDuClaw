@@ -20,11 +20,11 @@
 //! accidental unlock.
 
 pub use duduclaw_gateway::premium_templates::{
-    discover_in, find_premium_templates_dir, PremiumIndustry,
+    PremiumIndustry, discover_in, find_premium_templates_dir,
 };
 
 use duduclaw_license::{
-    load_default, FeatureGate, LicenseError, LicenseTier, EMBEDDED_FEATURES_TOML,
+    EMBEDDED_FEATURES_TOML, FeatureGate, LicenseError, LicenseTier, load_default,
 };
 
 /// The feature flag (in `features.toml`) that unlocks premium templates.

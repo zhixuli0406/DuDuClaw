@@ -68,7 +68,10 @@ pub struct ResearchConfig {
 
 impl Default for ResearchConfig {
     fn default() -> Self {
-        Self { self_study: false, self_study_hour: DEFAULT_SELF_STUDY_HOUR }
+        Self {
+            self_study: false,
+            self_study_hour: DEFAULT_SELF_STUDY_HOUR,
+        }
     }
 }
 
@@ -99,7 +102,10 @@ impl ResearchConfig {
             .filter(|h| (0..=23).contains(h))
             .map(|h| h as u32)
             .unwrap_or(DEFAULT_SELF_STUDY_HOUR);
-        Self { self_study, self_study_hour }
+        Self {
+            self_study,
+            self_study_hour,
+        }
     }
 }
 
@@ -281,8 +287,8 @@ impl SelfStudyScheduler {
             }
 
             let meta_key = format!("self_study_last:{agent_id}");
-            let already_ran =
-                belief::get_meta(&prediction_db, &meta_key).as_deref() == Some(today_local.as_str());
+            let already_ran = belief::get_meta(&prediction_db, &meta_key).as_deref()
+                == Some(today_local.as_str());
             if !should_run_now(local_now.hour(), cfg.self_study_hour, already_ran) {
                 continue;
             }
@@ -313,7 +319,9 @@ impl SelfStudyScheduler {
                     info!(agent = %agent_id, subject = %subject, "self_study: 已建立晚間自主研究目標");
                     created += 1;
                 }
-                Err(e) => warn!(agent = %agent_id, subject = %subject, error = %e, "self_study: 建立研究任務失敗"),
+                Err(e) => {
+                    warn!(agent = %agent_id, subject = %subject, error = %e, "self_study: 建立研究任務失敗")
+                }
             }
         }
         created
@@ -663,7 +671,11 @@ mod tests {
         let created_again = sched.tick().await;
         assert_eq!(created_again, 0);
         let tasks_after = store.list_tasks(None, Some("trader"), None).await.unwrap();
-        assert_eq!(tasks_after.len(), 1, "must not double-create on a second tick");
+        assert_eq!(
+            tasks_after.len(),
+            1,
+            "must not double-create on a second tick"
+        );
     }
 
     #[tokio::test]

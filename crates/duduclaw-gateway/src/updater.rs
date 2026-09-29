@@ -309,10 +309,16 @@ pub struct StageError {
 
 impl StageError {
     pub fn transient(message: impl Into<String>) -> Self {
-        Self { class: FailureClass::Transient, message: message.into() }
+        Self {
+            class: FailureClass::Transient,
+            message: message.into(),
+        }
     }
     pub fn fatal(message: impl Into<String>) -> Self {
-        Self { class: FailureClass::Fatal, message: message.into() }
+        Self {
+            class: FailureClass::Fatal,
+            message: message.into(),
+        }
     }
 }
 
@@ -449,7 +455,10 @@ fn is_newer(current: &str, latest: &str) -> bool {
         let s = s.strip_prefix('v').unwrap_or(s);
         let parts: Vec<&str> = s.split('.').collect();
         let parse_component = |p: &str| -> u32 {
-            p.split('-').next().and_then(|n| n.parse().ok()).unwrap_or(0)
+            p.split('-')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
         };
         let major = parts.first().map(|p| parse_component(p)).unwrap_or(0);
         let minor = parts.get(1).map(|p| parse_component(p)).unwrap_or(0);
@@ -506,15 +515,25 @@ fn paired_cli_tag(tag: &str) -> Option<&str> {
 /// matrix `artifact:` names.
 fn platform_asset_suffix() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    { "darwin-arm64.tar.gz" }
+    {
+        "darwin-arm64.tar.gz"
+    }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    { "darwin-x64.tar.gz" }
+    {
+        "darwin-x64.tar.gz"
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    { "linux-x64.tar.gz" }
+    {
+        "linux-x64.tar.gz"
+    }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    { "linux-arm64.tar.gz" }
+    {
+        "linux-arm64.tar.gz"
+    }
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    { "windows-x64.zip" }
+    {
+        "windows-x64.zip"
+    }
     #[cfg(not(any(
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64"),
@@ -522,14 +541,20 @@ fn platform_asset_suffix() -> &'static str {
         all(target_os = "linux", target_arch = "aarch64"),
         all(target_os = "windows", target_arch = "x86_64"),
     )))]
-    { "unknown" }
+    {
+        "unknown"
+    }
 }
 
 fn binary_name() -> &'static str {
     #[cfg(target_os = "windows")]
-    { "duduclaw.exe" }
+    {
+        "duduclaw.exe"
+    }
     #[cfg(not(target_os = "windows"))]
-    { "duduclaw" }
+    {
+        "duduclaw"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -540,9 +565,7 @@ fn binary_name() -> &'static str {
 pub fn is_valid_download_url(url: &str) -> bool {
     let repo = github_repo();
     let prefix = format!("https://github.com/{repo}/releases/download/");
-    url.starts_with(&prefix)
-        && !url.contains("..")
-        && url.len() < 512
+    url.starts_with(&prefix) && !url.contains("..") && url.len() < 512
 }
 
 // ---------------------------------------------------------------------------
@@ -655,7 +678,10 @@ pub async fn check_update() -> Result<UpdateInfo, String> {
     // resolve the paired CLI release before comparing versions.
     let release = resolve_cli_release(&client, repo, release).await?;
 
-    let latest = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
+    let latest = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name);
     let available = is_newer(current_version(), latest);
     let install_method = detect_install_method();
 
@@ -721,8 +747,7 @@ pub async fn apply_update_with_progress(
     // breaks the code-signature seal — the Tauri updater owns this install.
     if matches!(detect_install_method(), InstallMethod::Desktop) {
         return Err(
-            "桌面版由 DuDuClaw App 自動更新（重新啟動 App 即會套用新版本），此處不執行覆寫"
-                .into(),
+            "桌面版由 DuDuClaw App 自動更新（重新啟動 App 即會套用新版本），此處不執行覆寫".into(),
         );
     }
 
@@ -760,7 +785,9 @@ pub async fn apply_update_with_progress(
     }
     // [R3:H1] Reject empty checksum_url BEFORE downloading
     if checksum_url.is_empty() {
-        return Err("No checksum URL provided — refusing update without integrity verification".into());
+        return Err(
+            "No checksum URL provided — refusing update without integrity verification".into(),
+        );
     }
     if !is_valid_download_url(checksum_url) {
         return Err(format!("Rejected unsafe checksum URL: {checksum_url}"));
@@ -830,7 +857,11 @@ pub async fn apply_update_with_progress(
     let bytes = with_retries(
         &DOWNLOAD_RETRY_DELAYS_SECS,
         &|attempt, max_attempts| {
-            on_progress(UpdateProgress { phase: "downloading", attempt, max_attempts })
+            on_progress(UpdateProgress {
+                phase: "downloading",
+                attempt,
+                max_attempts,
+            })
         },
         |_attempt| download_and_verify_once(&client, download_url, checksum_url, &signature_url),
     )
@@ -1115,7 +1146,9 @@ async fn apply_update_inner(
                 backup_path.display()
             ));
         }
-        return Err(format!("Failed to install new binary (rolled back successfully): {e}"));
+        return Err(format!(
+            "Failed to install new binary (rolled back successfully): {e}"
+        ));
     }
 
     // [H4] Clean up backup
@@ -1163,7 +1196,10 @@ fn extract_from_tar_gz(archive_bytes: &[u8], target: &str) -> Result<Vec<u8>, St
     let gz = flate2::read::GzDecoder::new(archive_bytes);
     let mut archive = tar::Archive::new(gz);
 
-    for entry in archive.entries().map_err(|e| format!("Invalid tar.gz: {e}"))? {
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("Invalid tar.gz: {e}"))?
+    {
         let mut entry = entry.map_err(|e| format!("Archive entry error: {e}"))?;
 
         // [R2:NH3] Reject symlinks and hard links
@@ -1179,17 +1215,18 @@ fn extract_from_tar_gz(archive_bytes: &[u8], target: &str) -> Result<Vec<u8>, St
 
         // [R2:NH3] Reject absolute paths and path traversal
         if path.is_absolute()
-            || path.components().any(|c| matches!(c,
-                std::path::Component::ParentDir | std::path::Component::RootDir))
+            || path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::RootDir
+                )
+            })
         {
             warn!(?path, "Skipping unsafe archive entry");
             continue;
         }
 
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         if file_name == target {
             // [R2:NC2] Size-limited read
@@ -1213,8 +1250,7 @@ fn extract_from_zip(archive_bytes: &[u8], target: &str) -> Result<Vec<u8>, Strin
     use std::io::Read;
 
     let cursor = std::io::Cursor::new(archive_bytes);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| format!("Invalid zip: {e}"))?;
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("Invalid zip: {e}"))?;
 
     for i in 0..archive.len() {
         let mut file = archive
@@ -1267,7 +1303,11 @@ struct GitHubRelease {
 fn tag_from_latest_location(location: &str) -> Option<String> {
     let (_, tag) = location.rsplit_once("/releases/tag/")?;
     let tag = tag.trim_end_matches('/');
-    if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | 'v')) {
+    if tag.is_empty()
+        || !tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | 'v'))
+    {
         return None;
     }
     Some(tag.to_string())
@@ -1355,7 +1395,12 @@ async fn check_latest_via_redirect(ua: &str, repo: &str) -> Result<GitHubRelease
         .headers()
         .get(reqwest::header::LOCATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| format!("releases/latest returned {} without a redirect", resp.status()))?;
+        .ok_or_else(|| {
+            format!(
+                "releases/latest returned {} without a redirect",
+                resp.status()
+            )
+        })?;
     let tag = tag_from_latest_location(location)
         .ok_or_else(|| format!("unrecognized releases/latest redirect: {location}"))?;
     Ok(synthesize_release(repo, &tag))
@@ -1428,7 +1473,9 @@ mod tests {
     #[test]
     fn test_reject_foreign_url() {
         assert!(!is_valid_download_url("https://evil.com/duduclaw.tar.gz"));
-        assert!(!is_valid_download_url("https://github.com/attacker/repo/releases/download/v1/x.tar.gz"));
+        assert!(!is_valid_download_url(
+            "https://github.com/attacker/repo/releases/download/v1/x.tar.gz"
+        ));
     }
 
     #[test]
@@ -1548,7 +1595,9 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         header.set_size(content.len() as u64);
         header.set_mode(0o755);
         header.set_cksum();
-        tar_builder.append_data(&mut header, "duduclaw", &content[..]).unwrap();
+        tar_builder
+            .append_data(&mut header, "duduclaw", &content[..])
+            .unwrap();
         let tar_bytes = tar_builder.into_inner().unwrap();
 
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -1569,7 +1618,9 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         header.set_entry_type(tar::EntryType::Symlink);
         header.set_size(0);
         header.set_cksum();
-        tar_builder.append_link(&mut header, "duduclaw", "/etc/evil").unwrap();
+        tar_builder
+            .append_link(&mut header, "duduclaw", "/etc/evil")
+            .unwrap();
         let tar_bytes = tar_builder.into_inner().unwrap();
 
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -1596,16 +1647,10 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
     fn test_auto_update_config_override() {
         let tmp = std::env::temp_dir().join("duduclaw-test-auto-update-cfg");
         let _ = std::fs::create_dir_all(&tmp);
-        std::fs::write(
-            tmp.join("config.toml"),
-            "[gateway]\nauto_update = true\n",
-        ).unwrap();
+        std::fs::write(tmp.join("config.toml"), "[gateway]\nauto_update = true\n").unwrap();
         assert!(auto_update_enabled(&tmp));
 
-        std::fs::write(
-            tmp.join("config.toml"),
-            "[gateway]\nauto_update = false\n",
-        ).unwrap();
+        std::fs::write(tmp.join("config.toml"), "[gateway]\nauto_update = false\n").unwrap();
         assert!(!auto_update_enabled(&tmp));
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1631,7 +1676,9 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
     #[test]
     fn tag_from_latest_location_parses_and_fences() {
         assert_eq!(
-            tag_from_latest_location("https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.46.1"),
+            tag_from_latest_location(
+                "https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.46.1"
+            ),
             Some("v1.46.1".to_string())
         );
         assert_eq!(
@@ -1639,9 +1686,15 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
             Some("v2.0.0-rc.1".to_string())
         );
         // No tag segment / empty / hostile characters → None.
-        assert_eq!(tag_from_latest_location("https://github.com/x/y/releases"), None);
+        assert_eq!(
+            tag_from_latest_location("https://github.com/x/y/releases"),
+            None
+        );
         assert_eq!(tag_from_latest_location(".../releases/tag/"), None);
-        assert_eq!(tag_from_latest_location(".../releases/tag/v1.0.0?x=../../evil"), None);
+        assert_eq!(
+            tag_from_latest_location(".../releases/tag/v1.0.0?x=../../evil"),
+            None
+        );
     }
 
     // ── desktop-v* claiming "Latest" (2026-07-29 field report) ──
@@ -1676,7 +1729,10 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         // Real-world shape: a log line precedes the version line.
         let out = "[duduclaw] effective log level: config.toml [general] log_level=info\nduduclaw 1.46.2\n";
         assert_eq!(parse_cli_version_output(out), Some("1.46.2".to_string()));
-        assert_eq!(parse_cli_version_output("duduclaw v1.46.2"), Some("1.46.2".to_string()));
+        assert_eq!(
+            parse_cli_version_output("duduclaw v1.46.2"),
+            Some("1.46.2".to_string())
+        );
         assert_eq!(parse_cli_version_output("no version here"), None);
         // Two-dot requirement rejects filenames like config.toml or bare "1.46".
         assert_eq!(parse_cli_version_output("config.toml 1.46"), None);
@@ -1687,9 +1743,9 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         let r = synthesize_release("zhixuli0406/DuDuClaw", "v1.46.2");
         assert_eq!(r.tag_name, "v1.46.2");
         assert_eq!(r.assets.len(), 1);
-        assert!(r.assets[0]
-            .browser_download_url
-            .starts_with("https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.46.2/duduclaw-"));
+        assert!(r.assets[0].browser_download_url.starts_with(
+            "https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.46.2/duduclaw-"
+        ));
         assert!(is_valid_download_url(&r.assets[0].browser_download_url));
     }
 
@@ -1723,7 +1779,10 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         let good_sum = format!("{:x}", Sha256::digest(good));
 
         // Happy path: matching digest + valid signature.
-        assert!(verify_archive_integrity(good, &format!("{good_sum}  duduclaw.tar.gz\n"), TEST_SIG).is_ok());
+        assert!(
+            verify_archive_integrity(good, &format!("{good_sum}  duduclaw.tar.gz\n"), TEST_SIG)
+                .is_ok()
+        );
 
         // Checksum mismatch → fatal, never retried.
         let wrong_sum = "a".repeat(64);
@@ -1733,7 +1792,9 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
 
         // Unparseable checksum sidecar → fatal.
         assert_eq!(
-            verify_archive_integrity(good, "no digest here", TEST_SIG).unwrap_err().class,
+            verify_archive_integrity(good, "no digest here", TEST_SIG)
+                .unwrap_err()
+                .class,
             FailureClass::Fatal
         );
 
@@ -1752,10 +1813,8 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         let calls = AtomicU32::new(0);
         let seen: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
         // Zero delays keep the test instant; production uses [5, 15].
-        let out: Result<&str, StageError> = with_retries(
-            &[0, 0],
-            &|a, m| seen.lock().unwrap().push((a, m)),
-            |_| {
+        let out: Result<&str, StageError> =
+            with_retries(&[0, 0], &|a, m| seen.lock().unwrap().push((a, m)), |_| {
                 let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
                 async move {
                     if n < 3 {
@@ -1764,9 +1823,8 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
                         Ok("installed")
                     }
                 }
-            },
-        )
-        .await;
+            })
+            .await;
         assert_eq!(out.unwrap(), "installed");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         // Progress reported for every attempt, including the first.
@@ -1824,8 +1882,14 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
             InstallMethod::Pro
         );
         // Pre-existing variants are untouched.
-        assert_eq!(serde_json::to_string(&InstallMethod::Desktop).unwrap(), "\"desktop\"");
-        assert_eq!(serde_json::to_string(&InstallMethod::Homebrew).unwrap(), "\"homebrew\"");
+        assert_eq!(
+            serde_json::to_string(&InstallMethod::Desktop).unwrap(),
+            "\"desktop\""
+        );
+        assert_eq!(
+            serde_json::to_string(&InstallMethod::Homebrew).unwrap(),
+            "\"homebrew\""
+        );
     }
 
     #[test]
@@ -1867,13 +1931,18 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         unsafe { std::env::set_var("DUDUCLAW_IN_CONTAINER", "1") };
         // Garbage bytes: the container gate must fire BEFORE any extraction, so
         // the error is the container refusal, never "binary not found in archive".
-        let err = install_verified_binary(b"not an archive").await.unwrap_err();
+        let err = install_verified_binary(b"not an archive")
+            .await
+            .unwrap_err();
         match prev {
             Some(v) => unsafe { std::env::set_var("DUDUCLAW_IN_CONTAINER", v) },
             None => unsafe { std::env::remove_var("DUDUCLAW_IN_CONTAINER") },
         }
         assert!(err.contains("容器"), "unexpected error: {err}");
-        assert!(err.contains("image"), "should point at the image update path: {err}");
+        assert!(
+            err.contains("image"),
+            "should point at the image update path: {err}"
+        );
     }
 
     #[test]
@@ -1912,7 +1981,14 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         let sidecar = format!("{good_sum}  duduclaw.tar.gz\n");
         // Same key material with one flipped base64 char → valid shape, wrong key.
         let mut other = UPDATE_PUBKEY.to_string();
-        other.replace_range(10..11, if &UPDATE_PUBKEY[10..11] == "A" { "B" } else { "A" });
+        other.replace_range(
+            10..11,
+            if &UPDATE_PUBKEY[10..11] == "A" {
+                "B"
+            } else {
+                "A"
+            },
+        );
         assert!(verify_archive_with_pubkey(good, &sidecar, TEST_SIG, &other).is_err());
         // A malformed key is an error, never a pass.
         assert!(verify_archive_with_pubkey(good, &sidecar, TEST_SIG, "not-a-key").is_err());
@@ -1922,7 +1998,9 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
     fn desktop_bundle_paths_detected() {
         // Pure-path check mirrors detect_install_method's first rule.
         assert!("/Applications/DuDuClaw.app/Contents/MacOS/duduclaw".contains(".app/Contents/"));
-        assert!(!"/Users/x/.nvm/versions/node/v24/lib/node_modules/duduclaw/bin/duduclaw"
-            .contains(".app/Contents/"));
+        assert!(
+            !"/Users/x/.nvm/versions/node/v24/lib/node_modules/duduclaw/bin/duduclaw"
+                .contains(".app/Contents/")
+        );
     }
 }

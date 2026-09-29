@@ -2,7 +2,7 @@
 //!
 //! Before this module, the [`PredictionEngine`] only ran for *channel-facing*
 //! agents — the ones that receive user messages directly through
-//! `channel_reply::build_reply_with_session`.  Sub-agents dispatched via the
+//! `channel_reply::build_guarded_reply_with_session`.  Sub-agents dispatched via the
 //! bus queue (in `dispatcher.rs`) bypassed it entirely.  In a 19-agent
 //! deployment this meant 18 of the 19 agents had **zero** rows in
 //! `prediction.db.user_models` and zero entries in `prediction_log`, so the
@@ -45,7 +45,7 @@ use tracing::{debug, warn};
 
 use crate::gvu::loop_::GvuLoop;
 use crate::gvu::mistake_notebook::MistakeNotebook;
-use crate::gvu::trigger::{maybe_run_gvu, TriggerSource};
+use crate::gvu::trigger::{TriggerSource, maybe_run_gvu};
 use crate::prediction::engine::PredictionEngine;
 use crate::prediction::metrics::ConversationMetrics;
 use crate::session::SessionMessage;
@@ -133,7 +133,11 @@ pub async fn record_subagent_prediction(
     }
 
     let user_id = synthetic_user_id(&sender_agent, &origin_agent);
-    let session_id = format!("subagent:{}:{}", agent_id, chrono::Utc::now().timestamp_millis());
+    let session_id = format!(
+        "subagent:{}:{}",
+        agent_id,
+        chrono::Utc::now().timestamp_millis()
+    );
 
     // 1. Predict
     let prediction = prediction_engine
@@ -142,13 +146,7 @@ pub async fn record_subagent_prediction(
 
     // 2. Build synthetic metrics from a fake 2-turn session
     let messages = build_synthetic_messages(&payload, &response_text);
-    let metrics = ConversationMetrics::extract(
-        &session_id,
-        &agent_id,
-        &user_id,
-        &messages,
-        0,
-    );
+    let metrics = ConversationMetrics::extract(&session_id, &agent_id, &user_id, &messages, 0);
 
     // 3. Calculate the error and reuse the embedding (if any) for update.
     let (error, embedding) = prediction_engine
@@ -189,9 +187,7 @@ pub async fn record_subagent_prediction(
         let agent_dir_for_llm = agent_dir.clone();
         let agent_id_for_llm = agent_id.clone();
         let payload_preview: String = payload.chars().take(400).collect();
-        let extra = format!(
-            "Sub-agent dispatch payload preview:\n{payload_preview}"
-        );
+        let extra = format!("Sub-agent dispatch payload preview:\n{payload_preview}");
 
         // LLM caller via utility dispatch (RFC-25 N2): this agent's runtime
         // provider + utility model, falling back to global config then Claude,
@@ -249,7 +245,13 @@ pub fn spawn_record(
     let origin = origin_agent.unwrap_or_default();
     tokio::spawn(async move {
         if let Err(e) = std::panic::AssertUnwindSafe(record_subagent_prediction(
-            pe, agent_id, sender, origin, payload, response_text, gvu_ctx,
+            pe,
+            agent_id,
+            sender,
+            origin,
+            payload,
+            response_text,
+            gvu_ctx,
         ))
         .catch_unwind()
         .await

@@ -32,7 +32,10 @@ impl std::fmt::Display for RunIdentityError {
         match self {
             RunIdentityError::InvalidAgentId => write!(f, "invalid agent id"),
             RunIdentityError::CapabilityMissing(id) => {
-                write!(f, "agent {id:?} does not have [capabilities] codrive = true")
+                write!(
+                    f,
+                    "agent {id:?} does not have [capabilities] codrive = true"
+                )
             }
         }
     }

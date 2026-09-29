@@ -124,11 +124,7 @@ pub struct ActivityMetrics {
 // Data collection
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn collect(
-    home_dir: &Path,
-    days: u32,
-    agent_filter: Option<&str>,
-) -> Result<ReportData> {
+async fn collect(home_dir: &Path, days: u32, agent_filter: Option<&str>) -> Result<ReportData> {
     // Open data sources. Missing DBs are auto-created empty by the
     // underlying constructors — that yields zero counts, which is fine.
     let cost_db: PathBuf = home_dir.join("cost_telemetry.db");
@@ -217,7 +213,10 @@ async fn collect(
 
         let active = cost_metrics.requests_current > 0
             || activity.total > 0
-            || reliability.as_ref().map(|r| r.total_events > 0).unwrap_or(false);
+            || reliability
+                .as_ref()
+                .map(|r| r.total_events > 0)
+                .unwrap_or(false);
         if active {
             active_count += 1;
         }
@@ -314,7 +313,11 @@ pub fn render_markdown(report: &ReportData) -> String {
     let total_requests: u64 = report.agents.iter().map(|a| a.cost.requests_current).sum();
     let total_requests_prev: u64 = report.agents.iter().map(|a| a.cost.requests_previous).sum();
     let total_cost: u64 = report.agents.iter().map(|a| a.cost.cost_millicents).sum();
-    let total_cost_prev: u64 = report.agents.iter().map(|a| a.cost.cost_millicents_previous).sum();
+    let total_cost_prev: u64 = report
+        .agents
+        .iter()
+        .map(|a| a.cost.cost_millicents_previous)
+        .sum();
     let total_input: u64 = report.agents.iter().map(|a| a.cost.input_tokens).sum();
     let total_output: u64 = report.agents.iter().map(|a| a.cost.output_tokens).sum();
     let total_activity: u64 = report.agents.iter().map(|a| a.activity.total).sum();
@@ -334,8 +337,14 @@ pub fn render_markdown(report: &ReportData) -> String {
         fmt_usd(total_cost_prev),
         fmt_delta(total_cost, total_cost_prev)
     ));
-    out.push_str(&format!("| Input Token | {} | — | — |\n", fmt_num(total_input)));
-    out.push_str(&format!("| Output Token | {} | — | — |\n", fmt_num(total_output)));
+    out.push_str(&format!(
+        "| Input Token | {} | — | — |\n",
+        fmt_num(total_input)
+    ));
+    out.push_str(&format!(
+        "| Output Token | {} | — | — |\n",
+        fmt_num(total_output)
+    ));
     out.push_str(&format!(
         "| 任務活動事件總數 | {} | — | — |\n\n",
         fmt_num(total_activity)
@@ -360,10 +369,7 @@ pub fn render_markdown(report: &ReportData) -> String {
                 fmt_num(agent.cost.input_tokens),
                 fmt_num(agent.cost.output_tokens),
                 fmt_usd(agent.cost.cost_millicents),
-                fmt_delta(
-                    agent.cost.requests_current,
-                    agent.cost.requests_previous
-                )
+                fmt_delta(agent.cost.requests_current, agent.cost.requests_previous)
             ));
         }
         out.push('\n');
@@ -486,7 +492,11 @@ fn fmt_usd(millicents: u64) -> String {
 /// Render a current-vs-previous percentage delta as "+12.5%" / "-3.0%" / "—".
 fn fmt_delta(current: u64, previous: u64) -> String {
     if previous == 0 {
-        return if current == 0 { "—".into() } else { "new".into() };
+        return if current == 0 {
+            "—".into()
+        } else {
+            "new".into()
+        };
     }
     let delta = current as f64 - previous as f64;
     let pct = delta / previous as f64 * 100.0;

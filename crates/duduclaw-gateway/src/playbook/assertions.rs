@@ -72,7 +72,9 @@ fn tool_matches(assert_token: &str, called: &str) -> bool {
 
 /// ASCII-case-insensitive, CJK-exact substring test.
 fn text_contains(haystack: &str, needle: &str) -> bool {
-    haystack.to_lowercase().contains(&needle.trim().to_lowercase())
+    haystack
+        .to_lowercase()
+        .contains(&needle.trim().to_lowercase())
 }
 
 /// Parse a recorded transcript (stream-json JSONL) into [`TranscriptFacts`].
@@ -146,12 +148,16 @@ pub fn check_facts(assertions: &EntryAssertions, facts: &TranscriptFacts) -> Vec
     }
     for s in &assertions.output_contains {
         if !text_contains(&facts.final_text, s) {
-            violations.push(format!("output_contains: `{s}` missing from the final reply"));
+            violations.push(format!(
+                "output_contains: `{s}` missing from the final reply"
+            ));
         }
     }
     for s in &assertions.output_not_contains {
         if text_contains(&facts.final_text, s) {
-            violations.push(format!("output_not_contains: `{s}` present in the final reply"));
+            violations.push(format!(
+                "output_not_contains: `{s}` present in the final reply"
+            ));
         }
     }
     violations
@@ -220,7 +226,12 @@ pub fn replay_assertions(
 mod tests {
     use super::*;
 
-    fn asserts(must_use: &[&str], not_use: &[&str], contains: &[&str], not_contains: &[&str]) -> EntryAssertions {
+    fn asserts(
+        must_use: &[&str],
+        not_use: &[&str],
+        contains: &[&str],
+        not_contains: &[&str],
+    ) -> EntryAssertions {
         EntryAssertions {
             must_use_tools: must_use.iter().map(|s| s.to_string()).collect(),
             must_not_use_tools: not_use.iter().map(|s| s.to_string()).collect(),
@@ -268,7 +279,11 @@ mod tests {
         );
         assert!(matches!(out, AssertionReplay::Unverified(_)));
         // Present but content-free transcript ⇒ still Unverified.
-        std::fs::write(dir.path().join("s").join("c.transcript.jsonl"), "not json\n").unwrap();
+        std::fs::write(
+            dir.path().join("s").join("c.transcript.jsonl"),
+            "not json\n",
+        )
+        .unwrap();
         let out = replay_assertions(
             dir.path(),
             &[EvalCaseRef("s/c".to_string())],
@@ -301,7 +316,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("s").join("held-out")).unwrap();
         std::fs::write(
-            dir.path().join("s").join("held-out").join("c.transcript.jsonl"),
+            dir.path()
+                .join("s")
+                .join("held-out")
+                .join("c.transcript.jsonl"),
             TRANSCRIPT,
         )
         .unwrap();

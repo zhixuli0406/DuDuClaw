@@ -3,7 +3,7 @@
 //! Converts AI reply text into platform-native rich message formats:
 //! Discord Embeds, Telegram MarkdownV2, LINE Flex Messages, Slack Block Kit.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Platform-aware message limits.
 pub mod limits {
@@ -78,7 +78,11 @@ pub struct ActionButton {
 
 impl ActionButton {
     pub fn new(label: impl Into<String>, action_id: impl Into<String>, style: ButtonStyle) -> Self {
-        Self { label: label.into(), action_id: action_id.into(), style }
+        Self {
+            label: label.into(),
+            action_id: action_id.into(),
+            style,
+        }
     }
 }
 
@@ -113,7 +117,9 @@ impl ResponseMode {
 
 impl RichMessage {
     pub fn text(content: impl Into<String>) -> Self {
-        Self { components: vec![RichComponent::Text(content.into())] }
+        Self {
+            components: vec![RichComponent::Text(content.into())],
+        }
     }
 
     pub fn embed(description: impl Into<String>) -> Self {
@@ -126,7 +132,6 @@ impl RichMessage {
             }],
         }
     }
-
 }
 
 // ── Discord formatting ─────────────────────────────────────────
@@ -200,17 +205,21 @@ pub fn to_discord_messages_mode(
     // Long replies → embed(s). Build all chunks first (never dropped).
     let chunks = split_text(text, limits::DISCORD_EMBED_DESC);
     let last_idx = chunks.len().saturating_sub(1);
-    let embeds: Vec<Value> = chunks.iter().enumerate().map(|(i, chunk)| {
-        let mut embed = json!({
-            "description": chunk,
-            "color": color,
-        });
-        // Footer only on the very last embed of the whole reply.
-        if i == last_idx {
-            embed["footer"] = json!({ "text": footer_text });
-        }
-        embed
-    }).collect();
+    let embeds: Vec<Value> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let mut embed = json!({
+                "description": chunk,
+                "color": color,
+            });
+            // Footer only on the very last embed of the whole reply.
+            if i == last_idx {
+                embed["footer"] = json!({ "text": footer_text });
+            }
+            embed
+        })
+        .collect();
 
     // Pack embeds into messages, respecting both the 10-embeds and the
     // 6000-aggregate-char limits. Each chunk is already ≤ DISCORD_EMBED_DESC
@@ -220,7 +229,10 @@ pub fn to_discord_messages_mode(
     let mut current_chars = 0usize;
 
     for embed in embeds {
-        let embed_chars = embed["description"].as_str().map(|s| s.chars().count()).unwrap_or(0);
+        let embed_chars = embed["description"]
+            .as_str()
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
         let would_overflow_count = current.len() >= DISCORD_MAX_EMBEDS_PER_MSG;
         let would_overflow_chars =
             !current.is_empty() && current_chars + embed_chars > DISCORD_EMBED_AGGREGATE;
@@ -314,7 +326,8 @@ pub fn to_line_flex_message_styled(text: &str, agent_name: Option<&str>, error: 
             "size": "sm",
             "color": LINE_ERROR_ACCENT
         }));
-        body_contents.push(json!({ "type": "separator", "margin": "sm", "color": LINE_ERROR_ACCENT }));
+        body_contents
+            .push(json!({ "type": "separator", "margin": "sm", "color": LINE_ERROR_ACCENT }));
     }
     for (is_code, segment) in split_code_segments(text) {
         if is_code {
@@ -392,15 +405,13 @@ pub fn to_line_flex_message_styled(text: &str, agent_name: Option<&str>, error: 
 
 /// Format a reply as Slack Block Kit message.
 pub fn to_slack_blocks(text: &str) -> Value {
-    let blocks = vec![
-        json!({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": to_slack_mrkdwn(text)
-            }
-        })
-    ];
+    let blocks = vec![json!({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": to_slack_mrkdwn(text)
+        }
+    })];
 
     json!({ "blocks": blocks })
 }
@@ -451,21 +462,28 @@ fn to_slack_mrkdwn(text: &str) -> String {
                 let mut link_text = String::new();
                 let mut found_close = false;
                 for inner in chars.by_ref() {
-                    if inner == ']' { found_close = true; break; }
+                    if inner == ']' {
+                        found_close = true;
+                        break;
+                    }
                     link_text.push(inner);
                 }
                 if found_close && chars.peek() == Some(&'(') {
                     chars.next(); // consume '('
                     let mut url = String::new();
                     for inner in chars.by_ref() {
-                        if inner == ')' { break; }
+                        if inner == ')' {
+                            break;
+                        }
                         url.push(inner);
                     }
                     link_result.push_str(&format!("<{url}|{link_text}>"));
                 } else {
                     link_result.push('[');
                     link_result.push_str(&link_text);
-                    if found_close { link_result.push(']'); }
+                    if found_close {
+                        link_result.push(']');
+                    }
                 }
             } else {
                 link_result.push(c);
@@ -530,7 +548,11 @@ pub fn split_text(text: &str, max_len: usize) -> Vec<String> {
         // but protect against pathological inputs).
         if search_end <= start {
             // Force at least one character forward
-            let next = text[start..].char_indices().nth(1).map(|(i, _)| start + i).unwrap_or(text.len());
+            let next = text[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| start + i)
+                .unwrap_or(text.len());
             chunks.push(text[start..next].to_string());
             start = next;
             continue;
@@ -548,7 +570,11 @@ pub fn split_text(text: &str, max_len: usize) -> Vec<String> {
         };
 
         // Ensure forward progress
-        let split_at = if split_at <= start { search_end } else { split_at };
+        let split_at = if split_at <= start {
+            search_end
+        } else {
+            split_at
+        };
 
         let raw_chunk = &text[start..split_at];
 
@@ -678,7 +704,7 @@ pub fn line_quick_reply() -> Value {
 // leads to "已婉拒" — the verb a person pressed is the verb they are told
 // afterwards.
 
-use crate::decision_action::{encode, DecisionAct, DecisionSource};
+use crate::decision_action::{DecisionAct, DecisionSource, encode};
 
 /// Per-platform button markup for a pending decision, or `None` for a channel
 /// with no inline-button support (the caller then degrades to plain text plus
@@ -1101,7 +1127,7 @@ pub fn line_autopilot_pause_quick_reply(rule_id: &str) -> Value {
 // only owns the per-platform button shape, the same split every other
 // button family in this file uses.
 
-use crate::goal_intent::{encode_gintent_action, GIntentChoice};
+use crate::goal_intent::{GIntentChoice, encode_gintent_action};
 
 /// Telegram inline keyboard: accept as goal / plan first / dismiss to chat.
 pub fn telegram_gintent_buttons(nonce: &str) -> Value {
@@ -1188,9 +1214,16 @@ mod tests {
         )
         .expect("telegram approvals have buttons");
         let rows = kb["inline_keyboard"].as_array().expect("keyboard rows");
-        assert_eq!(rows.len(), 2, "decision row untouched, Mini App row appended");
+        assert_eq!(
+            rows.len(),
+            2,
+            "decision row untouched, Mini App row appended"
+        );
         // Row 0 is byte-identical to what the card carried before the spike.
-        assert_eq!(rows[0], telegram_broker_approval_buttons("ap-1")["inline_keyboard"][0]);
+        assert_eq!(
+            rows[0],
+            telegram_broker_approval_buttons("ap-1")["inline_keyboard"][0]
+        );
         assert_eq!(rows[1][0]["text"], "🔎 查看詳情");
         assert_eq!(
             rows[1][0]["web_app"]["url"],
@@ -1220,7 +1253,12 @@ mod tests {
         }
         // A channel with no buttons at all still degrades to None.
         assert_eq!(
-            decision_markup_with_miniapp("whatsapp", DecisionSource::Approval, "x-1", Some("https://a/b")),
+            decision_markup_with_miniapp(
+                "whatsapp",
+                DecisionSource::Approval,
+                "x-1",
+                Some("https://a/b")
+            ),
             None
         );
     }
@@ -1237,7 +1275,11 @@ mod tests {
             json!({ "inline_keyboard": "not an array" }),
         ] {
             let before = markup.clone();
-            assert!(!attach_telegram_web_app_button(&mut markup, "🔎 查看詳情", "https://a/b"));
+            assert!(!attach_telegram_web_app_button(
+                &mut markup,
+                "🔎 查看詳情",
+                "https://a/b"
+            ));
             assert_eq!(markup, before);
         }
     }
@@ -1265,7 +1307,12 @@ mod tests {
         assert!(msg.get("embeds").is_some());
         let embed = &msg["embeds"][0];
         assert_eq!(embed["color"], DUDUCLAW_COLOR);
-        assert!(embed["footer"]["text"].as_str().unwrap().contains("test-agent"));
+        assert!(
+            embed["footer"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("test-agent")
+        );
     }
 
     #[test]
@@ -1287,7 +1334,7 @@ mod tests {
         let chunks = split_text(text, 12);
         assert!(chunks.len() >= 2);
         // Each chunk should end at a newline boundary
-        for chunk in &chunks[..chunks.len()-1] {
+        for chunk in &chunks[..chunks.len() - 1] {
             assert!(chunk.ends_with('\n'));
         }
     }
@@ -1328,29 +1375,51 @@ mod tests {
         // several messages. Crucially, NO embed may be dropped.
         let big = "a".repeat(limits::DISCORD_EMBED_DESC * 12);
         let msgs = to_discord_messages(&big, Some("agent"), false);
-        assert!(msgs.len() > 1, "expected multiple messages, got {}", msgs.len());
+        assert!(
+            msgs.len() > 1,
+            "expected multiple messages, got {}",
+            msgs.len()
+        );
 
         let mut total_embeds = 0usize;
         for m in &msgs {
             let embeds = m["embeds"].as_array().expect("each message has embeds");
             // Never exceed Discord's 10-embed-per-message hard limit.
-            assert!(embeds.len() <= 10, "message exceeds 10 embeds: {}", embeds.len());
+            assert!(
+                embeds.len() <= 10,
+                "message exceeds 10 embeds: {}",
+                embeds.len()
+            );
             // Never exceed the 6000 aggregate-char cap (unless a single embed
             // alone is larger, which split_text prevents at 4096).
-            let agg: usize = embeds.iter()
-                .map(|e| e["description"].as_str().map(|s| s.chars().count()).unwrap_or(0))
+            let agg: usize = embeds
+                .iter()
+                .map(|e| {
+                    e["description"]
+                        .as_str()
+                        .map(|s| s.chars().count())
+                        .unwrap_or(0)
+                })
                 .sum();
             assert!(agg <= 6000, "message exceeds 6000 aggregate chars: {agg}");
             total_embeds += embeds.len();
         }
         // 12 * 4096 chars split at 4096 → at least 12 embeds, all preserved.
-        assert!(total_embeds >= 12, "embeds were dropped: only {total_embeds}");
+        assert!(
+            total_embeds >= 12,
+            "embeds were dropped: only {total_embeds}"
+        );
 
         // Footer must appear exactly once, on the final embed.
         let last_msg = msgs.last().unwrap();
         let last_embeds = last_msg["embeds"].as_array().unwrap();
         let last_embed = last_embeds.last().unwrap();
-        assert!(last_embed["footer"]["text"].as_str().unwrap().contains("agent"));
+        assert!(
+            last_embed["footer"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("agent")
+        );
     }
 
     #[test]
@@ -1375,7 +1444,10 @@ mod tests {
         let long_text = "a".repeat(300);
         let msgs = to_discord_messages_mode(&long_text, Some("agent"), false, ResponseMode::Plain);
         for m in &msgs {
-            assert!(m.get("embeds").is_none(), "plain mode must not produce embeds");
+            assert!(
+                m.get("embeds").is_none(),
+                "plain mode must not produce embeds"
+            );
             assert!(m.get("content").is_some());
         }
     }
@@ -1383,7 +1455,10 @@ mod tests {
     #[test]
     fn test_discord_embed_mode_forces_embed_for_short() {
         let msgs = to_discord_messages_mode("Hi!", None, false, ResponseMode::Embed);
-        assert!(msgs[0].get("embeds").is_some(), "embed mode must embed even short replies");
+        assert!(
+            msgs[0].get("embeds").is_some(),
+            "embed mode must embed even short replies"
+        );
     }
 
     #[test]
@@ -1411,8 +1486,13 @@ mod tests {
         let msg = to_line_flex_message(&md, Some("agent"));
         assert_eq!(msg["type"], "flex");
         let contents = msg["contents"]["body"]["contents"].as_array().unwrap();
-        let has_code_panel = contents.iter().any(|c| c["backgroundColor"] == LINE_CODE_BG);
-        assert!(has_code_panel, "code block should render as a dark panel box");
+        let has_code_panel = contents
+            .iter()
+            .any(|c| c["backgroundColor"] == LINE_CODE_BG);
+        assert!(
+            has_code_panel,
+            "code block should render as a dark panel box"
+        );
     }
 
     #[test]
@@ -1422,7 +1502,10 @@ mod tests {
         let contents = msg["contents"]["body"]["contents"].as_array().unwrap();
         assert_eq!(contents[0]["text"], "⚠️ 錯誤");
         assert_eq!(contents[0]["color"], LINE_ERROR_ACCENT);
-        assert_eq!(msg["contents"]["styles"]["body"]["backgroundColor"], "#FFF5F5");
+        assert_eq!(
+            msg["contents"]["styles"]["body"]["backgroundColor"],
+            "#FFF5F5"
+        );
     }
 
     // ── Interactive component builders ─────────────────────────────
@@ -1431,7 +1514,10 @@ mod tests {
     fn test_discord_buttons_custom_ids() {
         let row = discord_conversation_buttons("discord:thread:123");
         let comps = row["components"].as_array().unwrap();
-        assert_eq!(comps[0]["custom_id"], "duduclaw:new_session:discord:thread:123");
+        assert_eq!(
+            comps[0]["custom_id"],
+            "duduclaw:new_session:discord:thread:123"
+        );
         assert_eq!(comps[1]["custom_id"], "duduclaw:agent_menu");
     }
 
@@ -1461,7 +1547,7 @@ mod tests {
 
     // ── Decision buttons: every source × every button-capable channel ──
 
-    use crate::decision_action::{parse, DecisionAct, DecisionSource};
+    use crate::decision_action::{DecisionAct, DecisionSource, parse};
 
     /// Pull the action id(s) out of whatever shape a platform uses for them.
     /// Telegram/Discord may spread buttons across MULTIPLE rows (the goal
@@ -1524,16 +1610,30 @@ mod tests {
         // differs (primary+secondary tiers, LINE drops the secondary pair
         // entirely) and gets its own dedicated tests below.
         let cases = [
-            (DecisionSource::Install, vec![DecisionAct::Approve, DecisionAct::Deny]),
-            (DecisionSource::Kickoff, vec![DecisionAct::Approve, DecisionAct::Deny]),
-            (DecisionSource::Approval, vec![DecisionAct::Approve, DecisionAct::Deny]),
+            (
+                DecisionSource::Install,
+                vec![DecisionAct::Approve, DecisionAct::Deny],
+            ),
+            (
+                DecisionSource::Kickoff,
+                vec![DecisionAct::Approve, DecisionAct::Deny],
+            ),
+            (
+                DecisionSource::Approval,
+                vec![DecisionAct::Approve, DecisionAct::Deny],
+            ),
             (DecisionSource::Autopilot, vec![DecisionAct::Pause]),
         ];
         for (source, acts) in cases {
             for channel in ["telegram", "discord", "slack", "line"] {
                 let markup = decision_markup(channel, source, "id-9").expect("markup must exist");
                 let ids = action_ids(channel, &markup);
-                assert_eq!(ids.len(), acts.len(), "{channel}/{:?} button count", source.token());
+                assert_eq!(
+                    ids.len(),
+                    acts.len(),
+                    "{channel}/{:?} button count",
+                    source.token()
+                );
                 for (raw, act) in ids.iter().zip(acts.iter()) {
                     let decoded = parse(raw).unwrap_or_else(|| panic!("undecodable: {raw}"));
                     assert_eq!(decoded.source, source);
@@ -1558,7 +1658,10 @@ mod tests {
         for channel in ["telegram", "discord", "slack", "line"] {
             let markup = decision_markup(channel, DecisionSource::Goal, "t9").unwrap();
             let ids = action_ids(channel, &markup);
-            assert!(ids.len() >= 2, "{channel}: expected at least the two primary actions");
+            assert!(
+                ids.len() >= 2,
+                "{channel}: expected at least the two primary actions"
+            );
             let first_two: Vec<DecisionAct> =
                 ids[..2].iter().map(|raw| parse(raw).unwrap().act).collect();
             assert_eq!(
@@ -1617,7 +1720,9 @@ mod tests {
     #[test]
     fn goal_buttons_discord_secondary_tier_is_a_second_action_row() {
         let markup = discord_goal_buttons("t9");
-        let rows = markup.as_array().expect("discord goal markup is an array of rows");
+        let rows = markup
+            .as_array()
+            .expect("discord goal markup is an array of rows");
         assert_eq!(rows.len(), 2);
         for row in rows {
             assert_eq!(row["type"], 1);
@@ -1681,7 +1786,8 @@ mod tests {
         let tg = telegram_gintent_buttons("nonce-1");
         let row = tg["inline_keyboard"][0].as_array().unwrap();
         assert_eq!(row.len(), 3);
-        let (choice, nonce) = parse_gintent_action(row[0]["callback_data"].as_str().unwrap()).unwrap();
+        let (choice, nonce) =
+            parse_gintent_action(row[0]["callback_data"].as_str().unwrap()).unwrap();
         assert_eq!(choice, GIntentChoice::AcceptGoal);
         assert_eq!(nonce, "nonce-1");
         // Never accidentally routed through the unified decision codec —
@@ -1691,14 +1797,16 @@ mod tests {
         let dc = discord_gintent_buttons("nonce-2");
         let comps = dc["components"].as_array().unwrap();
         assert_eq!(comps.len(), 3);
-        let (choice, nonce) = parse_gintent_action(comps[1]["custom_id"].as_str().unwrap()).unwrap();
+        let (choice, nonce) =
+            parse_gintent_action(comps[1]["custom_id"].as_str().unwrap()).unwrap();
         assert_eq!(choice, GIntentChoice::PlanFirst);
         assert_eq!(nonce, "nonce-2");
 
         let sl = slack_gintent_buttons("nonce-3");
         let elements = sl["elements"].as_array().unwrap();
         assert_eq!(elements.len(), 3);
-        let (choice, nonce) = parse_gintent_action(elements[2]["action_id"].as_str().unwrap()).unwrap();
+        let (choice, nonce) =
+            parse_gintent_action(elements[2]["action_id"].as_str().unwrap()).unwrap();
         assert_eq!(choice, GIntentChoice::DismissChat);
         assert_eq!(nonce, "nonce-3");
         assert_eq!(elements[2]["value"], "nonce-3");

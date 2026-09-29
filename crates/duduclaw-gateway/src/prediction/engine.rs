@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -85,8 +85,14 @@ impl PredictionError {
     /// Call this after `calculate_error()` to incorporate task completion signals.
     /// Adjusts composite_error by adding a weighted task_completion penalty,
     /// then reclassifies the error category.
-    pub fn apply_outcome(&mut self, outcome: &ConversationOutcome, metacognition: &super::metacognition::AdaptiveThresholds) {
-        if outcome.task_completed == Some(false) || outcome.satisfaction == SatisfactionSignal::Negative {
+    pub fn apply_outcome(
+        &mut self,
+        outcome: &ConversationOutcome,
+        metacognition: &super::metacognition::AdaptiveThresholds,
+    ) {
+        if outcome.task_completed == Some(false)
+            || outcome.satisfaction == SatisfactionSignal::Negative
+        {
             self.task_completion_failure = true;
 
             // Proportional penalty: boost error by 15% of remaining headroom (review #24).
@@ -121,7 +127,10 @@ pub struct DriftBudget {
 
 impl DriftBudget {
     pub fn new(baseline: String, max_drift_ratio: f64) -> Self {
-        Self { baseline, max_drift_ratio }
+        Self {
+            baseline,
+            max_drift_ratio,
+        }
     }
 
     /// Check if proposed content is within the drift budget.
@@ -179,7 +188,11 @@ impl DriftBudget {
             union += ca.max(cb);
         }
 
-        if union == 0 { 0.0 } else { 1.0 - (intersection as f64 / union as f64) }
+        if union == 0 {
+            0.0
+        } else {
+            1.0 - (intersection as f64 / union as f64)
+        }
     }
 }
 
@@ -235,9 +248,12 @@ impl EvolutionHealthMonitor {
         }
 
         let mean = self.improvements.iter().sum::<f64>() / self.improvements.len() as f64;
-        let variance = self.improvements.iter()
+        let variance = self
+            .improvements
+            .iter()
             .map(|x| (x - mean).powi(2))
-            .sum::<f64>() / self.improvements.len() as f64;
+            .sum::<f64>()
+            / self.improvements.len() as f64;
 
         if mean.abs() < 0.01 && variance < 0.001 {
             EvolutionHealth::Stalled
@@ -286,10 +302,7 @@ pub struct PredictionEngine {
 
 impl PredictionEngine {
     /// Create a new prediction engine, initializing SQLite tables and loading cached models.
-    pub fn new(
-        db_path: PathBuf,
-        meta_path: Option<PathBuf>,
-    ) -> Self {
+    pub fn new(db_path: PathBuf, meta_path: Option<PathBuf>) -> Self {
         Self::new_with_embedding(db_path, meta_path, None, 100)
     }
 
@@ -387,8 +400,9 @@ impl PredictionEngine {
             CREATE INDEX IF NOT EXISTS idx_evolution_agent_ts
                 ON evolution_events(agent_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_evolution_type
-                ON evolution_events(event_type);"
-        ).map_err(|e| e.to_string())?;
+                ON evolution_events(event_type);",
+        )
+        .map_err(|e| e.to_string())?;
 
         // WP-A7 (design-task-forward-model-2026-08-06.md §5.1): task-layer
         // forward-model tables, same `prediction.db` file. `prediction_log`
@@ -644,7 +658,8 @@ impl PredictionEngine {
                 (surprise, true)
             } else if let Some(m) = model {
                 // Tier 2: Vocabulary novelty (no embedding model or embed failed)
-                let surprise = Self::compute_vocabulary_novelty(&actual.user_text, &m.historical_bigrams);
+                let surprise =
+                    Self::compute_vocabulary_novelty(&actual.user_text, &m.historical_bigrams);
                 (surprise, false)
             } else {
                 // Tier 3: Keyword overlap (cold start, no history at all)
@@ -655,17 +670,20 @@ impl PredictionEngine {
 
         // Unexpected correction: uses graded score when available, raw count as fallback.
         // Consistent with the has_feedback_detail check above.
-        let unexpected_correction = prediction.expected_satisfaction > 0.6 && if has_feedback_detail {
-            actual.feedback_details.weighted_correction_score > 0.5
-        } else {
-            actual.user_corrections > 0
-        };
+        let unexpected_correction = prediction.expected_satisfaction > 0.6
+            && if has_feedback_detail {
+                actual.feedback_details.weighted_correction_score > 0.5
+            } else {
+                actual.user_corrections > 0
+            };
 
-        let unexpected_follow_up = prediction.expected_follow_up_rate < 0.3
-            && actual.user_follow_ups > 2;
+        let unexpected_follow_up =
+            prediction.expected_follow_up_rate < 0.3 && actual.user_follow_ups > 2;
 
         // Indirect disagreement signal (from FeedbackDetail)
-        let indirect_disagreement_score = actual.feedback_details.severity_counts
+        let indirect_disagreement_score = actual
+            .feedback_details
+            .severity_counts
             .get("IndirectDisagreement")
             .copied()
             .unwrap_or(0) as f64
@@ -731,7 +749,9 @@ impl PredictionEngine {
         // Record in consecutive errors buffer
         {
             let mut errors = self.consecutive_errors.lock().await;
-            let buf = errors.entry(actual.agent_id.clone()).or_insert_with(std::collections::VecDeque::new);
+            let buf = errors
+                .entry(actual.agent_id.clone())
+                .or_insert_with(std::collections::VecDeque::new);
             buf.push_back(category);
             while buf.len() > 10 {
                 buf.pop_front();
@@ -786,9 +806,9 @@ impl PredictionEngine {
 
         {
             let mut models = self.models.lock().await;
-            let model = models
-                .entry(key.clone())
-                .or_insert_with(|| UserModel::new(metrics.user_id.clone(), metrics.agent_id.clone()));
+            let model = models.entry(key.clone()).or_insert_with(|| {
+                UserModel::new(metrics.user_id.clone(), metrics.agent_id.clone())
+            });
             model.update_from_metrics(metrics);
             if let Some(emb) = embedding {
                 model.update_embedding(emb, self.max_embedding_history);
@@ -841,7 +861,9 @@ impl PredictionEngine {
     ) -> Option<tokio::task::JoinHandle<()>> {
         let model = {
             let models = self.models.lock().await;
-            models.get(&(user_id.to_string(), agent_id.to_string())).cloned()
+            models
+                .get(&(user_id.to_string(), agent_id.to_string()))
+                .cloned()
         };
 
         if let Some(model) = model {
@@ -975,13 +997,18 @@ impl PredictionEngine {
             if actual.extracted_topics.iter().any(|t| t == expected) {
                 0.0
             } else {
-                let best_overlap = actual.extracted_topics.iter().map(|t| {
-                    let expected_chars: std::collections::HashSet<char> = expected.chars().collect();
-                    let topic_chars: std::collections::HashSet<char> = t.chars().collect();
-                    let inter = expected_chars.intersection(&topic_chars).count() as f64;
-                    let union = expected_chars.union(&topic_chars).count().max(1) as f64;
-                    inter / union
-                }).fold(0.0_f64, f64::max);
+                let best_overlap = actual
+                    .extracted_topics
+                    .iter()
+                    .map(|t| {
+                        let expected_chars: std::collections::HashSet<char> =
+                            expected.chars().collect();
+                        let topic_chars: std::collections::HashSet<char> = t.chars().collect();
+                        let inter = expected_chars.intersection(&topic_chars).count() as f64;
+                        let union = expected_chars.union(&topic_chars).count().max(1) as f64;
+                        inter / union
+                    })
+                    .fold(0.0_f64, f64::max);
                 (1.0 - best_overlap) * 0.7
             }
         } else {
@@ -1039,7 +1066,16 @@ mod tests {
         // 2 high-risk + 6 low-risk for agent-a; category strings are the
         // Debug names written by `calculate_error` (`format!("{category:?}")`
         // — 'Significant', never 'significant').
-        for cat in ["Significant", "Critical", "Negligible", "Negligible", "Negligible", "Moderate", "Moderate", "Negligible"] {
+        for cat in [
+            "Significant",
+            "Critical",
+            "Negligible",
+            "Negligible",
+            "Negligible",
+            "Moderate",
+            "Moderate",
+            "Negligible",
+        ] {
             conn.execute(
                 "INSERT INTO prediction_log (agent_id, user_id, composite_error, category, timestamp)
                  VALUES ('agent-a', 'u', 0.5, ?1, '2026-08-12T00:00:00Z')",
@@ -1056,7 +1092,11 @@ mod tests {
         .expect("insert row");
 
         let rate = engine.high_risk_base_rate("agent-a", 8).await;
-        assert_eq!(rate, Some(2.0 / 8.0), "2 of agent-a's 8 turns were high-risk");
+        assert_eq!(
+            rate,
+            Some(2.0 / 8.0),
+            "2 of agent-a's 8 turns were high-risk"
+        );
 
         // Below min_samples → None (callers fall back to the coin-flip prior).
         assert_eq!(engine.high_risk_base_rate("agent-a", 9).await, None);

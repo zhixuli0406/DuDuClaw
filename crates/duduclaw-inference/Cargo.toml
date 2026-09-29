@@ -7,6 +7,10 @@ description = "Local LLM inference engine for DuDuClaw — multi-backend support
 [dependencies]
 duduclaw-core = { workspace = true }
 duduclaw-security = { workspace = true }
+# O11: the shared OpenAI-compat provider — this crate's `openai_compat.rs` is a
+# thin `InferenceBackend` shell over it rather than a second reqwest client.
+# No cycle: duduclaw-llm depends on core + security only, never on inference.
+duduclaw-llm = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -23,6 +27,7 @@ futures-util = { workspace = true }
 urlencoding = "2"
 regex-lite = "0.1"
 zeroize = "1"
+ucci = { git = "https://github.com/varunkotte6/ucci", rev = "80cd2319cc2b41e3a5c35a64acd6b5dcbf5c217b" }
 
 # ONNX Runtime for Embedding (prediction engine semantic similarity)
 ort = { version = "2.0.0-rc.12", optional = true }
@@ -34,28 +39,19 @@ tokenizers = { version = "0.21", optional = true, default-features = false, feat
 # Local Whisper ASR (whisper.cpp binding)
 whisper-rs = { version = "0.13", optional = true }
 
-# LLM inference — llama.cpp
-llama-cpp-2 = { version = "0.1", optional = true, features = ["sampler"] }
-
-# LLM inference — mistral.rs (Rust-native)
-mistralrs-core = { version = "0.7", optional = true }
-# Required by mistralrs-core RequestMessage types
-indexmap = { version = "2", optional = true }
-either = { version = "1", optional = true }
+# NOTE (2026-09-29): the in-process llama.cpp (`llama-cpp-2`) and mistral.rs
+# (`mistralrs-core` + `indexmap` + `either`) backends, and the
+# `metal`/`cuda`/`vulkan`/`mistralrs*` features that gated them, were removed
+# with the backends themselves — `release.sh` never built any of them, so no
+# shipped binary ever contained one. Run a local OpenAI-compatible server
+# instead (llama-server / Ollama / vLLM) and point `[openai_compat]` at it.
+# See `wiki/reports/feature-audit-2026-09-29.md` T1-D3 / T3-S5.
 
 [features]
 default = ["cpu"]
 cpu = []
 onnx = ["dep:ort", "dep:ndarray", "dep:tokenizers"]
 whisper = ["dep:whisper-rs"]
-metal = ["llama-cpp-2/metal"]
-cuda = ["llama-cpp-2/cuda"]
-vulkan = ["llama-cpp-2/vulkan"]
-# mistral.rs backends
-mistralrs = ["dep:mistralrs-core", "dep:indexmap", "dep:either"]
-mistralrs-metal = ["mistralrs", "mistralrs-core/metal"]
-mistralrs-cuda = ["mistralrs", "mistralrs-core/cuda"]
-mistralrs-flash-attn = ["mistralrs-cuda", "mistralrs-core/flash-attn"]
 
 [dev-dependencies]
 tempfile = "3"

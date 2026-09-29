@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::mcp_auth::{Principal, Scope};
-use crate::mcp_namespace::{assert_can_access, NamespaceContext};
+use crate::mcp_namespace::{NamespaceContext, assert_can_access};
 
 // ── Request types ─────────────────────────────────────────────────────────────
 
@@ -391,7 +391,7 @@ impl<'a> WikiHandler<'a> {
 mod tests {
     use super::*;
     use crate::mcp_auth::Principal;
-    use crate::mcp_namespace::{resolve, NamespaceContext};
+    use crate::mcp_namespace::{NamespaceContext, resolve};
     use chrono::Utc;
     use std::collections::HashSet;
     use tempfile::TempDir;

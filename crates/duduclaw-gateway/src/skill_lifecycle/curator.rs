@@ -180,7 +180,9 @@ fn scope_dir(home_dir: &Path, scope: &str) -> Option<PathBuf> {
         if !duduclaw_core::is_valid_department(dept) {
             return None;
         }
-        return Some(duduclaw_agent::skill_loader::department_skills_dir(home_dir, dept));
+        return Some(duduclaw_agent::skill_loader::department_skills_dir(
+            home_dir, dept,
+        ));
     }
     let id = scope.strip_prefix("agent:")?;
     if id.is_empty() || !is_safe_component(id) {
@@ -444,8 +446,7 @@ pub async fn run_pass(
         // not disuse (normal/hub skills are never stamped by the Skill
         // tool-use path).
         let has_usage_signal = recorded_last_used.is_some();
-        let effective_last_used =
-            recorded_last_used.unwrap_or_else(|| rec.first_seen.clone());
+        let effective_last_used = recorded_last_used.unwrap_or_else(|| rec.first_seen.clone());
         let days_unused = days_since(&effective_last_used, now);
 
         match decide(rec.status, rec.pinned, days_unused, has_usage_signal, cfg) {
@@ -928,7 +929,10 @@ mod tests {
 
         let report = run_pass(&home, &store, &cfg(), now).await.unwrap();
         assert_eq!(report.newly_stale, vec!["daily-driver [global]"]);
-        assert!(report.newly_archived.is_empty(), "no-signal ⇒ never archived");
+        assert!(
+            report.newly_archived.is_empty(),
+            "no-signal ⇒ never archived"
+        );
         assert!(
             skills.join("daily-driver.md").is_file(),
             "file must stay in the loader root"
@@ -980,7 +984,12 @@ mod tests {
             report.errors
         );
         assert_eq!(
-            store.curation_get("foo", SCOPE_GLOBAL).await.unwrap().unwrap().status,
+            store
+                .curation_get("foo", SCOPE_GLOBAL)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             CurationStatus::Unmanaged
         );
 

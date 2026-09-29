@@ -224,19 +224,18 @@ pub(crate) fn jsonrpc_error(id: &Value, code: i64, message: &str) -> Value {
     })
 }
 
-async fn write_response(
-    stdout: &mut tokio::io::Stdout,
-    response: &Value,
-) -> Result<()> {
+async fn write_response(stdout: &mut tokio::io::Stdout, response: &Value) -> Result<()> {
     let mut output = serde_json::to_string(response)
         .map_err(|e| DuDuClawError::Gateway(format!("Failed to serialize response: {e}")))?;
     output.push('\n');
-    stdout.write_all(output.as_bytes()).await.map_err(|e| {
-        DuDuClawError::Gateway(format!("Failed to write to stdout: {e}"))
-    })?;
-    stdout.flush().await.map_err(|e| {
-        DuDuClawError::Gateway(format!("Failed to flush stdout: {e}"))
-    })?;
+    stdout
+        .write_all(output.as_bytes())
+        .await
+        .map_err(|e| DuDuClawError::Gateway(format!("Failed to write to stdout: {e}")))?;
+    stdout
+        .flush()
+        .await
+        .map_err(|e| DuDuClawError::Gateway(format!("Failed to flush stdout: {e}")))?;
     Ok(())
 }
 
@@ -423,9 +422,10 @@ pub async fn run_acp_server(home_dir: &Path) -> Result<()> {
 
     loop {
         line.clear();
-        let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-            DuDuClawError::Gateway(format!("Failed to read from stdin: {e}"))
-        })?;
+        let bytes_read = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| DuDuClawError::Gateway(format!("Failed to read from stdin: {e}")))?;
 
         if bytes_read == 0 {
             // EOF — client disconnected
@@ -449,10 +449,7 @@ pub async fn run_acp_server(home_dir: &Path) -> Result<()> {
         };
 
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let method = request
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
         let response = match method {

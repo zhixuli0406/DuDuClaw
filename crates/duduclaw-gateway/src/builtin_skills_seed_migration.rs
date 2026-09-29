@@ -155,7 +155,10 @@ mod tests {
 
         assert!(!report.already_done);
         assert!(report.error.is_none());
-        assert!(!report.seeded.is_empty(), "something must have been written");
+        assert!(
+            !report.seeded.is_empty(),
+            "something must have been written"
+        );
         assert!(marker_path(home.path()).exists());
 
         let skills_root = home.path().join("skills");

@@ -194,7 +194,11 @@ mod tests {
     fn plan_approval_defaults_off() {
         assert!(!CodriveConfig::default().plan_approval);
         let home = tempdir();
-        std::fs::write(home.join("config.toml"), "[codrive]\nmax_session_secs = 30\n").unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[codrive]\nmax_session_secs = 30\n",
+        )
+        .unwrap();
         assert!(!CodriveConfig::from_home(&home).plan_approval);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -202,7 +206,11 @@ mod tests {
     #[test]
     fn plan_approval_can_be_turned_on() {
         let home = tempdir();
-        std::fs::write(home.join("config.toml"), "[codrive]\nplan_approval = true\n").unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[codrive]\nplan_approval = true\n",
+        )
+        .unwrap();
         assert!(CodriveConfig::from_home(&home).plan_approval);
         let _ = std::fs::remove_dir_all(&home);
     }

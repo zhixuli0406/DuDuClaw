@@ -48,9 +48,9 @@ use std::sync::Mutex as StdMutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -219,16 +219,21 @@ pub struct MaintenanceStore {
 impl MaintenanceStore {
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         let db_path = home_dir.join("maintenance.db");
-        let conn = Connection::open(&db_path).map_err(|e| format!("open maintenance store: {e}"))?;
+        let conn =
+            Connection::open(&db_path).map_err(|e| format!("open maintenance store: {e}"))?;
         Self::init_schema(&conn)?;
         info!(?db_path, "MaintenanceStore initialized");
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| format!("open in-memory: {e}"))?;
         Self::init_schema(&conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn init_schema(conn: &Connection) -> Result<(), String> {
@@ -348,7 +353,10 @@ impl MaintenanceStore {
     /// TTL-expired-but-unswept), stamping `revoke_reason`. Returns the
     /// PRE-revoke window (so the caller can run close actions for its
     /// `sub_capabilities`) or `None` if nothing was open.
-    async fn revoke_unrevoked(&self, revoke_reason: &str) -> Result<Option<MaintenanceWindow>, String> {
+    async fn revoke_unrevoked(
+        &self,
+        revoke_reason: &str,
+    ) -> Result<Option<MaintenanceWindow>, String> {
         let Some(window) = self.unrevoked_row().await? else {
             return Ok(None);
         };
@@ -456,15 +464,22 @@ pub struct MaintenanceAuditLog {
 impl MaintenanceAuditLog {
     pub fn open(home_dir: &Path) -> std::io::Result<Self> {
         let path = home_dir.join("maintenance_audit.jsonl");
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            {
                 warn!(error = %e, path = %path.display(), "maintenance: could not chmod 0600 the audit log");
             }
         }
-        Ok(Self { file: StdMutex::new(file), path })
+        Ok(Self {
+            file: StdMutex::new(file),
+            path,
+        })
     }
 
     /// Append one JSON line: `{"ts_ms":.., "kind":.., ...fields}`. Fail-open
@@ -472,7 +487,10 @@ impl MaintenanceAuditLog {
     /// uses) — a broken audit sink must never become a reason to block the
     /// actual enable/disable/sweep/view action it is trying to record.
     pub fn record(&self, kind: &str, fields: Value) {
-        let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
         let mut event = match fields {
             Value::Object(map) => map,
             _ => serde_json::Map::new(),
@@ -579,7 +597,11 @@ async fn run_close_actions(sub_capabilities: &[String]) -> Option<String> {
     // read-side flag consulted by `maintenance.status()`/the dashboard, so
     // "closing" it is exactly "the flag now reads false", which the revoke
     // itself already accomplished.
-    if errors.is_empty() { None } else { Some(errors.join("; ")) }
+    if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
+    }
 }
 
 /// Run the open action(s) for a window's `sub_capabilities`. Fail-closed:
@@ -592,7 +614,10 @@ async fn run_open_actions(sub_capabilities: &[String]) -> Result<(), String> {
         let ops = crate::device_ops::select_sysd_ops().ok_or_else(|| {
             "SSH sub-capability requires the appliance's privileged daemon, which is not reachable on this host".to_string()
         })?;
-        let out = ops.ssh_start().await.map_err(|e| format!("ssh_start: {e}"))?;
+        let out = ops
+            .ssh_start()
+            .await
+            .map_err(|e| format!("ssh_start: {e}"))?;
         if !out.success {
             return Err(format!("ssh_start exited non-zero: {}", out.stderr.trim()));
         }
@@ -620,7 +645,8 @@ pub async fn enable(
         return Err(format!("ttl_hours must be in 1..={MAX_TTL_HOURS}"));
     }
     let store = MaintenanceStore::open(home_dir)?;
-    let audit = MaintenanceAuditLog::open(home_dir).map_err(|e| format!("open maintenance audit log: {e}"))?;
+    let audit = MaintenanceAuditLog::open(home_dir)
+        .map_err(|e| format!("open maintenance audit log: {e}"))?;
 
     if store.active_window().await?.is_some() {
         return Err("maintenance mode is already active".to_string());
@@ -636,10 +662,15 @@ pub async fn enable(
                 "error": open_err,
             }),
         );
-        return Err(format!("could not open the requested sub-capabilities: {open_err}"));
+        return Err(format!(
+            "could not open the requested sub-capabilities: {open_err}"
+        ));
     }
 
-    match store.enable(enabled_by, enabled_by_email, ttl_hours, &sub_caps).await {
+    match store
+        .enable(enabled_by, enabled_by_email, ttl_hours, &sub_caps)
+        .await
+    {
         Ok(window) => {
             audit.record(
                 "enabled",
@@ -677,7 +708,8 @@ pub async fn disable(
     reason: Option<&str>,
 ) -> Result<Option<MaintenanceWindow>, String> {
     let store = MaintenanceStore::open(home_dir)?;
-    let audit = MaintenanceAuditLog::open(home_dir).map_err(|e| format!("open maintenance audit log: {e}"))?;
+    let audit = MaintenanceAuditLog::open(home_dir)
+        .map_err(|e| format!("open maintenance audit log: {e}"))?;
     let Some(window) = store.disable().await? else {
         return Ok(None);
     };
@@ -811,10 +843,15 @@ pub async fn log_access(
     let Some(window) = store.active_window().await? else {
         return Err("maintenance mode is not active".to_string());
     };
-    if !window.sub_capabilities.iter().any(|c| c == SUB_CAPABILITY_SHOW_DETAILS) {
+    if !window
+        .sub_capabilities
+        .iter()
+        .any(|c| c == SUB_CAPABILITY_SHOW_DETAILS)
+    {
         return Err("show_details sub-capability is not unlocked in the active window".to_string());
     }
-    let audit = MaintenanceAuditLog::open(home_dir).map_err(|e| format!("open maintenance audit log: {e}"))?;
+    let audit = MaintenanceAuditLog::open(home_dir)
+        .map_err(|e| format!("open maintenance audit log: {e}"))?;
     fields.insert("window_id".to_string(), json!(window.id));
     fields.insert("viewed_by".to_string(), json!(viewed_by));
     fields.insert("viewed_by_email".to_string(), json!(viewed_by_email));
@@ -851,8 +888,11 @@ pub async fn status_json(home_dir: &Path) -> Result<Value, String> {
 /// why `history` reads the richer file: it also carries every fine-grained
 /// access event, not just enable/disable/expire transitions).
 pub fn history_json(home_dir: &Path, limit: usize, offset: usize) -> Result<Value, String> {
-    let audit = MaintenanceAuditLog::open(home_dir).map_err(|e| format!("open maintenance audit log: {e}"))?;
-    let events = audit.read_recent(limit, offset).map_err(|e| format!("read maintenance history: {e}"))?;
+    let audit = MaintenanceAuditLog::open(home_dir)
+        .map_err(|e| format!("open maintenance audit log: {e}"))?;
+    let events = audit
+        .read_recent(limit, offset)
+        .map_err(|e| format!("read maintenance history: {e}"))?;
     Ok(json!({ "events": events }))
 }
 
@@ -863,7 +903,12 @@ mod tests {
     async fn window(ttl_hours: i64) -> (MaintenanceStore, MaintenanceWindow) {
         let store = MaintenanceStore::open_in_memory().unwrap();
         let w = store
-            .enable("u1", "admin@local", ttl_hours, &[SUB_CAPABILITY_SSH.to_string()])
+            .enable(
+                "u1",
+                "admin@local",
+                ttl_hours,
+                &[SUB_CAPABILITY_SSH.to_string()],
+            )
             .await
             .unwrap();
         (store, w)
@@ -879,44 +924,86 @@ mod tests {
             SUB_CAPABILITY_SHOW_DETAILS.to_string(),
         ])
         .unwrap();
-        assert_eq!(ok, vec![SUB_CAPABILITY_SSH.to_string(), SUB_CAPABILITY_SHOW_DETAILS.to_string()]);
+        assert_eq!(
+            ok,
+            vec![
+                SUB_CAPABILITY_SSH.to_string(),
+                SUB_CAPABILITY_SHOW_DETAILS.to_string()
+            ]
+        );
     }
 
     #[tokio::test]
     async fn enable_refuses_ttl_out_of_range() {
         let store = MaintenanceStore::open_in_memory().unwrap();
-        assert!(store.enable("u1", "a@b", 0, &[SUB_CAPABILITY_SSH.to_string()]).await.is_err());
-        assert!(store
-            .enable("u1", "a@b", MAX_TTL_HOURS + 1, &[SUB_CAPABILITY_SSH.to_string()])
-            .await
-            .is_err());
-        assert!(store
-            .enable("u1", "a@b", MAX_TTL_HOURS, &[SUB_CAPABILITY_SSH.to_string()])
-            .await
-            .is_ok());
+        assert!(
+            store
+                .enable("u1", "a@b", 0, &[SUB_CAPABILITY_SSH.to_string()])
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .enable(
+                    "u1",
+                    "a@b",
+                    MAX_TTL_HOURS + 1,
+                    &[SUB_CAPABILITY_SSH.to_string()]
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .enable(
+                    "u1",
+                    "a@b",
+                    MAX_TTL_HOURS,
+                    &[SUB_CAPABILITY_SSH.to_string()]
+                )
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn enable_refuses_when_already_active_no_accumulation() {
         let store = MaintenanceStore::open_in_memory().unwrap();
-        store.enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()]).await.unwrap();
-        let second = store.enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()]).await;
-        assert!(second.is_err(), "a second enable while one is active must be refused");
+        store
+            .enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()])
+            .await
+            .unwrap();
+        let second = store
+            .enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()])
+            .await;
+        assert!(
+            second.is_err(),
+            "a second enable while one is active must be refused"
+        );
     }
 
     #[tokio::test]
     async fn active_window_reflects_ttl_expiry_without_a_sweep() {
         let store = MaintenanceStore::open_in_memory().unwrap();
         // TTL 24h so the row is comfortably active for read-consistency checks.
-        store.enable("u1", "a@b", 24, &[SUB_CAPABILITY_SSH.to_string()]).await.unwrap();
+        store
+            .enable("u1", "a@b", 24, &[SUB_CAPABILITY_SSH.to_string()])
+            .await
+            .unwrap();
         assert!(store.active_window().await.unwrap().is_some());
     }
 
     #[tokio::test]
     async fn expire_stale_is_a_noop_before_ttl_and_revokes_after() {
         let store = MaintenanceStore::open_in_memory().unwrap();
-        let w = store.enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()]).await.unwrap();
-        assert!(store.expire_stale().await.unwrap().is_none(), "not expired yet");
+        let w = store
+            .enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()])
+            .await
+            .unwrap();
+        assert!(
+            store.expire_stale().await.unwrap().is_none(),
+            "not expired yet"
+        );
 
         // Force expiry by rewriting expires_at into the past directly (unit
         // test, not an integration timing test).
@@ -924,7 +1011,10 @@ mod tests {
             let conn = store.conn.lock().await;
             conn.execute(
                 "UPDATE maintenance_windows SET expires_at = ?1 WHERE id = ?2",
-                params![(Utc::now() - chrono::Duration::seconds(10)).to_rfc3339(), w.id],
+                params![
+                    (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339(),
+                    w.id
+                ],
             )
             .unwrap();
         }
@@ -942,7 +1032,10 @@ mod tests {
         let (store, w) = window(4).await;
         let revoked = store.disable().await.unwrap().unwrap();
         assert_eq!(revoked.id, w.id);
-        assert_eq!(revoked.revoked_at, None, "returned row is the PRE-revoke snapshot");
+        assert_eq!(
+            revoked.revoked_at, None,
+            "returned row is the PRE-revoke snapshot"
+        );
         assert!(store.active_window().await.unwrap().is_none());
 
         // A second disable with nothing active is a harmless no-op, not an error.
@@ -952,7 +1045,10 @@ mod tests {
     #[tokio::test]
     async fn reassert_closed_on_boot_force_closes_even_with_ttl_remaining() {
         let store = MaintenanceStore::open_in_memory().unwrap();
-        store.enable("u1", "a@b", 24, &[SUB_CAPABILITY_SSH.to_string()]).await.unwrap();
+        store
+            .enable("u1", "a@b", 24, &[SUB_CAPABILITY_SSH.to_string()])
+            .await
+            .unwrap();
         assert!(store.active_window().await.unwrap().is_some());
 
         let reasserted = store.reassert_closed_on_boot().await.unwrap();
@@ -960,7 +1056,10 @@ mod tests {
         assert!(store.active_window().await.unwrap().is_none());
 
         let windows = store.recent_windows(10).await.unwrap();
-        assert_eq!(windows[0].revoke_reason.as_deref(), Some(REVOKE_REASON_RESTART));
+        assert_eq!(
+            windows[0].revoke_reason.as_deref(),
+            Some(REVOKE_REASON_RESTART)
+        );
 
         // Idempotent on a clean boot (nothing was open).
         assert!(store.reassert_closed_on_boot().await.unwrap().is_none());
@@ -969,7 +1068,10 @@ mod tests {
     #[tokio::test]
     async fn is_active_fails_closed_on_unparseable_expiry() {
         let store = MaintenanceStore::open_in_memory().unwrap();
-        let w = store.enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()]).await.unwrap();
+        let w = store
+            .enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()])
+            .await
+            .unwrap();
         {
             let conn = store.conn.lock().await;
             conn.execute(
@@ -995,25 +1097,42 @@ mod tests {
     #[tokio::test]
     async fn reminder_due_fires_only_in_the_configured_window() {
         let store = MaintenanceStore::open_in_memory().unwrap();
-        let w = store.enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()]).await.unwrap();
-        assert!(!w.reminder_due(Utc::now()), "must not be due immediately after enabling");
+        let w = store
+            .enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()])
+            .await
+            .unwrap();
+        assert!(
+            !w.reminder_due(Utc::now()),
+            "must not be due immediately after enabling"
+        );
 
-        let almost_expired = Utc::now() + chrono::Duration::seconds((w.ttl_seconds as f64 * 0.9) as i64);
+        let almost_expired =
+            Utc::now() + chrono::Duration::seconds((w.ttl_seconds as f64 * 0.9) as i64);
         assert!(w.reminder_due(almost_expired));
 
         let already_expired = Utc::now() + chrono::Duration::seconds(w.ttl_seconds + 10);
-        assert!(!w.reminder_due(already_expired), "past expiry is a denial, not a reminder");
+        assert!(
+            !w.reminder_due(already_expired),
+            "past expiry is a denial, not a reminder"
+        );
     }
 
     #[tokio::test]
     async fn mark_reminded_is_idempotent_and_stops_further_reminders() {
         let store = MaintenanceStore::open_in_memory().unwrap();
-        let w = store.enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()]).await.unwrap();
+        let w = store
+            .enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()])
+            .await
+            .unwrap();
         store.mark_reminded(&w.id).await.unwrap();
         let windows = store.recent_windows(1).await.unwrap();
         assert!(windows[0].reminded_at.is_some());
-        let almost_expired = Utc::now() + chrono::Duration::seconds((w.ttl_seconds as f64 * 0.9) as i64);
-        assert!(!windows[0].reminder_due(almost_expired), "already reminded ⇒ never due again");
+        let almost_expired =
+            Utc::now() + chrono::Duration::seconds((w.ttl_seconds as f64 * 0.9) as i64);
+        assert!(
+            !windows[0].reminder_due(almost_expired),
+            "already reminded ⇒ never due again"
+        );
     }
 
     #[test]
@@ -1048,11 +1167,18 @@ mod tests {
     fn audit_log_skips_unparseable_lines_without_losing_earlier_ones() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("maintenance_audit.jsonl");
-        std::fs::write(&path, "{\"kind\":\"enabled\",\"ts_ms\":1}\nnot json\n{\"kind\":\"disabled\",\"ts_ms\":2}\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "{\"kind\":\"enabled\",\"ts_ms\":1}\nnot json\n{\"kind\":\"disabled\",\"ts_ms\":2}\n",
+        )
+        .unwrap();
         let log = MaintenanceAuditLog::open(dir.path()).unwrap();
         let rows = log.read_recent(10, 0).unwrap();
-        assert_eq!(rows.len(), 2, "the malformed line must be skipped, not abort the whole read");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the malformed line must be skipped, not abort the whole read"
+        );
     }
 
     #[cfg(unix)]
@@ -1100,7 +1226,10 @@ mod tests {
         assert_eq!(status["active"], true);
         assert_eq!(status["window"]["id"], window.id);
 
-        let disabled = disable(home.path(), "u1", Some("done for the day")).await.unwrap().unwrap();
+        let disabled = disable(home.path(), "u1", Some("done for the day"))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(disabled.id, window.id);
 
         let status = status_json(home.path()).await.unwrap();
@@ -1115,8 +1244,18 @@ mod tests {
     #[tokio::test]
     async fn enable_ssh_off_appliance_fails_closed_without_persisting_a_window() {
         let home = tempfile::tempdir().unwrap();
-        let result = enable(home.path(), "u1", "admin@local", 4, &[SUB_CAPABILITY_SSH.to_string()]).await;
-        assert!(result.is_err(), "SSH cannot open without a reachable sysd daemon");
+        let result = enable(
+            home.path(),
+            "u1",
+            "admin@local",
+            4,
+            &[SUB_CAPABILITY_SSH.to_string()],
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "SSH cannot open without a reachable sysd daemon"
+        );
 
         // The failed open must never have left a window on record.
         let status = status_json(home.path()).await.unwrap();
@@ -1128,19 +1267,38 @@ mod tests {
     #[tokio::test]
     async fn enable_refuses_double_enable_through_the_orchestration_layer() {
         let home = tempfile::tempdir().unwrap();
-        enable(home.path(), "u1", "a@b", 4, &[SUB_CAPABILITY_SHOW_DETAILS.to_string()])
-            .await
-            .unwrap();
-        let second = enable(home.path(), "u1", "a@b", 4, &[SUB_CAPABILITY_SHOW_DETAILS.to_string()]).await;
+        enable(
+            home.path(),
+            "u1",
+            "a@b",
+            4,
+            &[SUB_CAPABILITY_SHOW_DETAILS.to_string()],
+        )
+        .await
+        .unwrap();
+        let second = enable(
+            home.path(),
+            "u1",
+            "a@b",
+            4,
+            &[SUB_CAPABILITY_SHOW_DETAILS.to_string()],
+        )
+        .await;
         assert!(second.is_err());
     }
 
     #[tokio::test]
     async fn sweep_expired_maintenance_window_closes_and_audits() {
         let home = tempfile::tempdir().unwrap();
-        let window = enable(home.path(), "u1", "a@b", 4, &[SUB_CAPABILITY_SHOW_DETAILS.to_string()])
-            .await
-            .unwrap();
+        let window = enable(
+            home.path(),
+            "u1",
+            "a@b",
+            4,
+            &[SUB_CAPABILITY_SHOW_DETAILS.to_string()],
+        )
+        .await
+        .unwrap();
 
         // Force expiry directly on the store, same technique as the
         // store-level test above.
@@ -1149,7 +1307,10 @@ mod tests {
             let conn = store.conn.lock().await;
             conn.execute(
                 "UPDATE maintenance_windows SET expires_at = ?1 WHERE id = ?2",
-                params![(Utc::now() - chrono::Duration::seconds(10)).to_rfc3339(), window.id],
+                params![
+                    (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339(),
+                    window.id
+                ],
             )
             .unwrap();
         }
@@ -1175,9 +1336,15 @@ mod tests {
     #[tokio::test]
     async fn reassert_closed_on_boot_orchestration_force_closes_and_audits() {
         let home = tempfile::tempdir().unwrap();
-        enable(home.path(), "u1", "a@b", 24, &[SUB_CAPABILITY_SHOW_DETAILS.to_string()])
-            .await
-            .unwrap();
+        enable(
+            home.path(),
+            "u1",
+            "a@b",
+            24,
+            &[SUB_CAPABILITY_SHOW_DETAILS.to_string()],
+        )
+        .await
+        .unwrap();
 
         let closed = reassert_closed_on_boot(home.path()).await;
         assert_eq!(closed, 1);
@@ -1198,9 +1365,17 @@ mod tests {
         // No window open at all ⇒ refused.
         let mut fields = serde_json::Map::new();
         fields.insert("operation".to_string(), json!("device.update_apply"));
-        assert!(log_access(home.path(), "u1", "a@b", "access_view_detail", fields.clone())
+        assert!(
+            log_access(
+                home.path(),
+                "u1",
+                "a@b",
+                "access_view_detail",
+                fields.clone()
+            )
             .await
-            .is_err());
+            .is_err()
+        );
 
         // Window open but WITHOUT show_details ⇒ still refused. Opened via the
         // low-level store directly (not the `enable()` orchestration, which
@@ -1208,16 +1383,33 @@ mod tests {
         // get a "window active, show_details NOT among its capabilities"
         // fixture state.
         let store = MaintenanceStore::open(home.path()).unwrap();
-        store.enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()]).await.unwrap();
-        assert!(log_access(home.path(), "u1", "a@b", "access_view_detail", fields.clone())
+        store
+            .enable("u1", "a@b", 4, &[SUB_CAPABILITY_SSH.to_string()])
             .await
-            .is_err());
+            .unwrap();
+        assert!(
+            log_access(
+                home.path(),
+                "u1",
+                "a@b",
+                "access_view_detail",
+                fields.clone()
+            )
+            .await
+            .is_err()
+        );
         store.disable().await.unwrap();
 
         // Window open WITH show_details ⇒ succeeds and is auditable.
-        enable(home.path(), "u1", "a@b", 4, &[SUB_CAPABILITY_SHOW_DETAILS.to_string()])
-            .await
-            .unwrap();
+        enable(
+            home.path(),
+            "u1",
+            "a@b",
+            4,
+            &[SUB_CAPABILITY_SHOW_DETAILS.to_string()],
+        )
+        .await
+        .unwrap();
         log_access(home.path(), "u1", "a@b", "access_view_detail", fields)
             .await
             .unwrap();

@@ -91,7 +91,9 @@ pub enum WriterCapability {
 
 impl WriterCapability {
     pub fn for_agent(agent_id: impl Into<String>) -> Self {
-        WriterCapability::Mcp { agent_id: agent_id.into() }
+        WriterCapability::Mcp {
+            agent_id: agent_id.into(),
+        }
     }
 
     /// Caller-facing label for audit logs / error messages. Never returns
@@ -150,7 +152,10 @@ impl WikiScopePolicy {
     pub fn load_from(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(raw) => match parse_toml(&raw) {
-                Ok(map) => Self { namespaces: map, loaded_from: Some(path.to_path_buf()) },
+                Ok(map) => Self {
+                    namespaces: map,
+                    loaded_from: Some(path.to_path_buf()),
+                },
                 Err(e) => {
                     warn!(
                         "Skipping malformed wiki scope policy at {:?}: {} \
@@ -187,11 +192,7 @@ impl WikiScopePolicy {
 
     /// Resolve the namespace from a wiki-relative `page_path` and check
     /// whether `caller` may write to it.
-    pub fn check_write(
-        &self,
-        page_path: &str,
-        caller: &WriterCapability,
-    ) -> Result<(), ScopeDeny> {
+    pub fn check_write(&self, page_path: &str, caller: &WriterCapability) -> Result<(), ScopeDeny> {
         let namespace = top_level_namespace(page_path);
         let mode = self.mode_for(&namespace);
 
@@ -205,11 +206,10 @@ impl WikiScopePolicy {
 
             // Read-only namespace: only writers whose internal capability
             // matches `synced_from` are allowed.
-            (NamespaceMode::ReadOnly { synced_from }, WriterCapability::Internal { capability })
-                if capability == synced_from =>
-            {
-                Ok(())
-            }
+            (
+                NamespaceMode::ReadOnly { synced_from },
+                WriterCapability::Internal { capability },
+            ) if capability == synced_from => Ok(()),
             (NamespaceMode::ReadOnly { synced_from }, _) => Err(ScopeDeny {
                 namespace,
                 mode: "read_only".into(),
@@ -336,7 +336,10 @@ pub fn check_department_access(
 
 /// Resolves `<home_dir>/shared/wiki/.scope.toml`.
 pub fn scope_file_path(home_dir: &Path) -> PathBuf {
-    home_dir.join("shared").join("wiki").join(SCOPE_POLICY_FILENAME)
+    home_dir
+        .join("shared")
+        .join("wiki")
+        .join(SCOPE_POLICY_FILENAME)
 }
 
 /// Extract the top-level namespace from a wiki-relative path. Pages directly
@@ -425,47 +428,55 @@ mod tests {
             .map(|a| format!("\"{a}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        let body = format!(
-            "[namespaces.policies]\nmode = \"agent_allowlist\"\nagents = [{list}]\n"
-        );
+        let body =
+            format!("[namespaces.policies]\nmode = \"agent_allowlist\"\nagents = [{list}]\n");
         let map = parse_toml(&body).unwrap();
-        WikiScopePolicy { namespaces: map, loaded_from: None }
+        WikiScopePolicy {
+            namespaces: map,
+            loaded_from: None,
+        }
     }
 
     #[test]
     fn agent_allowlist_admits_listed_agent_exactly() {
         let p = allowlist_policy(&["agnes", "boss"]);
-        assert!(p
-            .check_write("policies/hr.md", &WriterCapability::for_agent("agnes"))
-            .is_ok());
+        assert!(
+            p.check_write("policies/hr.md", &WriterCapability::for_agent("agnes"))
+                .is_ok()
+        );
         // Exact match only — a superstring id must NOT pass (convention #2).
-        assert!(p
-            .check_write("policies/hr.md", &WriterCapability::for_agent("agnes-2"))
-            .is_err());
+        assert!(
+            p.check_write("policies/hr.md", &WriterCapability::for_agent("agnes-2"))
+                .is_err()
+        );
         // Agent not on the list is denied.
-        assert!(p
-            .check_write("policies/hr.md", &WriterCapability::for_agent("intruder"))
-            .is_err());
+        assert!(
+            p.check_write("policies/hr.md", &WriterCapability::for_agent("intruder"))
+                .is_err()
+        );
     }
 
     #[test]
     fn agent_allowlist_operator_always_allowed() {
         let p = allowlist_policy(&["agnes"]);
-        assert!(p
-            .check_write("policies/hr.md", &WriterCapability::Operator)
-            .is_ok());
+        assert!(
+            p.check_write("policies/hr.md", &WriterCapability::Operator)
+                .is_ok()
+        );
     }
 
     #[test]
     fn agent_allowlist_empty_is_fail_closed() {
         // Empty list denies every agent (operator-only equivalent), never open.
         let p = allowlist_policy(&[]);
-        assert!(p
-            .check_write("policies/hr.md", &WriterCapability::for_agent("agnes"))
-            .is_err());
-        assert!(p
-            .check_write("policies/hr.md", &WriterCapability::Operator)
-            .is_ok());
+        assert!(
+            p.check_write("policies/hr.md", &WriterCapability::for_agent("agnes"))
+                .is_err()
+        );
+        assert!(
+            p.check_write("policies/hr.md", &WriterCapability::Operator)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -474,7 +485,10 @@ mod tests {
         let snap = p.snapshot();
         let ns = snap.iter().find(|s| s.namespace == "policies").unwrap();
         assert_eq!(ns.mode, "agent_allowlist");
-        assert_eq!(ns.agents.as_deref(), Some(&["agnes".to_string(), "boss".to_string()][..]));
+        assert_eq!(
+            ns.agents.as_deref(),
+            Some(&["agnes".to_string(), "boss".to_string()][..])
+        );
     }
 
     // ── WP7 built-in department access ────────────────────────────
@@ -584,7 +598,9 @@ mod tests {
         );
         let p = WikiScopePolicy::load_for(tmp.path());
         let caller = WriterCapability::for_agent("agnes");
-        let err = p.check_write("identity/discord-users.md", &caller).unwrap_err();
+        let err = p
+            .check_write("identity/discord-users.md", &caller)
+            .unwrap_err();
         assert_eq!(err.namespace, "identity");
         assert_eq!(err.mode, "read_only");
         assert!(err.reason.contains("identity-provider"));
@@ -603,7 +619,9 @@ mod tests {
             "#,
         );
         let p = WikiScopePolicy::load_for(tmp.path());
-        let caller = WriterCapability::Internal { capability: "identity-provider".into() };
+        let caller = WriterCapability::Internal {
+            capability: "identity-provider".into(),
+        };
         assert!(p.check_write("identity/discord-users.md", &caller).is_ok());
     }
 
@@ -619,7 +637,9 @@ mod tests {
             "#,
         );
         let p = WikiScopePolicy::load_for(tmp.path());
-        let caller = WriterCapability::Internal { capability: "policy-registry".into() };
+        let caller = WriterCapability::Internal {
+            capability: "policy-registry".into(),
+        };
         assert!(p.check_write("identity/x.md", &caller).is_err());
     }
 
@@ -637,7 +657,9 @@ mod tests {
 
         for caller in [
             WriterCapability::for_agent("agnes"),
-            WriterCapability::Internal { capability: "identity-provider".into() },
+            WriterCapability::Internal {
+                capability: "identity-provider".into(),
+            },
         ] {
             let err = p.check_write("policies/security.md", &caller).unwrap_err();
             assert_eq!(err.mode, "operator_only");
@@ -659,8 +681,14 @@ mod tests {
             "#,
         );
         let p = WikiScopePolicy::load_for(tmp.path());
-        assert!(p.check_write("identity/x.md", &WriterCapability::Operator).is_ok());
-        assert!(p.check_write("policies/y.md", &WriterCapability::Operator).is_ok());
+        assert!(
+            p.check_write("identity/x.md", &WriterCapability::Operator)
+                .is_ok()
+        );
+        assert!(
+            p.check_write("policies/y.md", &WriterCapability::Operator)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -712,7 +740,10 @@ mod tests {
     fn writer_capability_label_is_audit_friendly() {
         assert_eq!(WriterCapability::for_agent("agnes").label(), "agent:agnes");
         assert_eq!(
-            WriterCapability::Internal { capability: "identity-provider".into() }.label(),
+            WriterCapability::Internal {
+                capability: "identity-provider".into()
+            }
+            .label(),
             "internal:identity-provider"
         );
         assert_eq!(WriterCapability::Operator.label(), "operator");

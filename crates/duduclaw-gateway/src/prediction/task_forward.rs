@@ -17,7 +17,6 @@
 //! **Not wired into any hot path in this change** (goal_loop.rs /
 //! dispatch_engine.rs hooking is WP-A9, out of scope here). This module is
 //! self-contained, offline-testable, and has zero production callers today
-//! — exactly like `foresight_gate` (WP-B4) is meant to.
 
 use std::collections::BTreeSet;
 
@@ -345,7 +344,10 @@ pub struct TaskPredictionError {
 /// existing dual-process-router category (§4 platform integration point),
 /// not a new domain-specific correctness notion.
 pub fn task_prediction_correct(error: &TaskPredictionError) -> bool {
-    matches!(error.category, ErrorCategory::Negligible | ErrorCategory::Moderate)
+    matches!(
+        error.category,
+        ErrorCategory::Negligible | ErrorCategory::Moderate
+    )
 }
 
 /// Brier calibration score for one settled prediction: scores
@@ -423,7 +425,9 @@ fn artifact_error(expected: ArtifactShape, observed: ArtifactShape) -> f64 {
 pub enum DiffOutcome {
     /// `fidelity == None`: nothing computable. Carries the reason for the
     /// caller to log verbatim (opus-playbook §5: "空結果優於假結果").
-    Unobservable { reason: &'static str },
+    Unobservable {
+        reason: &'static str,
+    },
     Computed(TaskPredictionError),
 }
 
@@ -440,7 +444,10 @@ pub fn diff(
         };
     }
 
-    let tool_err = tool_set_error(&prediction.expected_tool_classes, &observation.observed_tool_classes);
+    let tool_err = tool_set_error(
+        &prediction.expected_tool_classes,
+        &observation.observed_tool_classes,
+    );
     let vol_err = volume_error(prediction.expected_call_band, observation.observed_calls);
     let art_err = artifact_error(prediction.expected_artifact, observation.observed_artifact);
 
@@ -448,7 +455,10 @@ pub fn diff(
 
     let outcome_applicable = observation.observed_outcome != ObservedOutcome::Unknown;
     let outcome_err = if outcome_applicable {
-        if observation.observed_outcome.matches(prediction.expected_outcome) {
+        if observation
+            .observed_outcome
+            .matches(prediction.expected_outcome)
+        {
             0.0
         } else {
             1.0
@@ -481,7 +491,8 @@ pub fn diff(
     // §3.3: an Unknown-outcome round under McpOnly has too little signal
     // left after renormalization (w_tool + w_artifact carries all the
     // weight) — record but do not feed the statistical bucket / A4.
-    let eligible_for_stats = outcome_applicable || observation.fidelity == ObservationFidelity::Full;
+    let eligible_for_stats =
+        outcome_applicable || observation.fidelity == ObservationFidelity::Full;
 
     DiffOutcome::Computed(TaskPredictionError {
         tool_set_error: tool_err,
@@ -642,7 +653,9 @@ mod tests {
         let thresholds = AdaptiveThresholds::default();
         match diff(pred, obs, &thresholds) {
             DiffOutcome::Unobservable { .. } => {}
-            DiffOutcome::Computed(_) => panic!("None fidelity must never produce a composite_error"),
+            DiffOutcome::Computed(_) => {
+                panic!("None fidelity must never produce a composite_error")
+            }
         }
     }
 
@@ -760,7 +773,10 @@ mod tests {
         match diff(pred, obs, &thresholds) {
             DiffOutcome::Computed(err) => {
                 assert!(
-                    matches!(err.category, ErrorCategory::Significant | ErrorCategory::Critical),
+                    matches!(
+                        err.category,
+                        ErrorCategory::Significant | ErrorCategory::Critical
+                    ),
                     "fixture must land in Significant/Critical, got {:?}",
                     err.category
                 );
@@ -804,7 +820,10 @@ mod tests {
             DiffOutcome::Computed(e) => e,
             DiffOutcome::Unobservable { .. } => panic!("should compute"),
         };
-        assert!(matches!(err_bad.category, ErrorCategory::Significant | ErrorCategory::Critical));
+        assert!(matches!(
+            err_bad.category,
+            ErrorCategory::Significant | ErrorCategory::Critical
+        ));
         assert_eq!(
             calibration_brier_score(&err_bad),
             calibration::brier_binary(0.9, false)
@@ -820,7 +839,10 @@ mod tests {
         let thresholds = AdaptiveThresholds::default();
         match diff(pred, obs, &thresholds) {
             DiffOutcome::Computed(err) => {
-                assert!(err.eligible_for_stats, "Full fidelity keeps enough signal even without outcome");
+                assert!(
+                    err.eligible_for_stats,
+                    "Full fidelity keeps enough signal even without outcome"
+                );
             }
             DiffOutcome::Unobservable { .. } => panic!("should compute"),
         }

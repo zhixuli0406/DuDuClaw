@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `[planner]` settings from `agent.toml`. Fail-safe default: clarify first.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,7 +19,10 @@ pub struct PlannerSettings {
 
 impl Default for PlannerSettings {
     fn default() -> Self {
-        PlannerSettings { clarify_first: true, max_questions: 3 }
+        PlannerSettings {
+            clarify_first: true,
+            max_questions: 3,
+        }
     }
 }
 
@@ -35,7 +38,10 @@ pub fn parse_planner_settings(toml_str: &str) -> PlannerSettings {
         None => return def,
     };
     PlannerSettings {
-        clarify_first: p.get("clarify_first").and_then(|v| v.as_bool()).unwrap_or(def.clarify_first),
+        clarify_first: p
+            .get("clarify_first")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(def.clarify_first),
         max_questions: p
             .get("max_questions")
             .and_then(|v| v.as_integer())
@@ -45,8 +51,15 @@ pub fn parse_planner_settings(toml_str: &str) -> PlannerSettings {
     }
 }
 
+/// Read `[planner]` for the calling agent.
+///
+/// Resolved through [`crate::mcp::caller_agent_dir`] rather than a bare
+/// `agents/<id>` join: an `eph-*` team role member lives at
+/// `<home>/agents/.ephemeral/<id>/`, so the bare join silently missed its
+/// `agent.toml` and every role member fell back to the default settings. An
+/// ordinary registry id resolves byte-identically to the old join.
 pub fn load_planner_settings(home_dir: &Path, agent_id: &str) -> PlannerSettings {
-    let path = home_dir.join("agents").join(agent_id).join("agent.toml");
+    let path = crate::mcp::caller_agent_dir(home_dir, agent_id).join("agent.toml");
     match std::fs::read_to_string(&path) {
         Ok(s) => parse_planner_settings(&s),
         Err(_) => PlannerSettings::default(),
@@ -116,7 +129,10 @@ mod tests {
 
     #[test]
     fn parse_missing_section_default() {
-        assert_eq!(parse_planner_settings("[agent]\nname='x'"), PlannerSettings::default());
+        assert_eq!(
+            parse_planner_settings("[agent]\nname='x'"),
+            PlannerSettings::default()
+        );
     }
 
     #[test]
@@ -135,13 +151,16 @@ mod tests {
     #[tokio::test]
     async fn plan_start_requires_task() {
         let home = tempfile::tempdir().unwrap();
-        assert!(is_error(&handle_plan_start(&json!({}), home.path(), "a1").await));
+        assert!(is_error(
+            &handle_plan_start(&json!({}), home.path(), "a1").await
+        ));
     }
 
     #[tokio::test]
     async fn plan_start_clarify_first_default() {
         let home = tempfile::tempdir().unwrap();
-        let v = handle_plan_start(&json!({"task": "ship the billing page"}), home.path(), "a1").await;
+        let v =
+            handle_plan_start(&json!({"task": "ship the billing page"}), home.path(), "a1").await;
         assert!(!is_error(&v));
         let p: Value = serde_json::from_str(&text(&v)).unwrap();
         assert_eq!(p["clarify_first"], true);
@@ -153,10 +172,58 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let agent_dir = home.path().join("agents").join("a1");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), "[planner]\nclarify_first = false\n").unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[planner]\nclarify_first = false\n",
+        )
+        .unwrap();
         let v = handle_plan_start(&json!({"task": "x"}), home.path(), "a1").await;
         let p: Value = serde_json::from_str(&text(&v)).unwrap();
         assert_eq!(p["clarify_first"], false);
         assert!(text(&v).contains("direct mode"));
+    }
+
+    /// Regression (2026-09-28 audit, debt #9 same-family): a team role member
+    /// is an `eph-*` agent scaffolded at `<home>/agents/.ephemeral/<id>/`. The
+    /// bare `agents/<id>` join never saw its `agent.toml`, so a role member
+    /// that had turned clarify-first off was still handed the clarify-first
+    /// scaffold every round.
+    #[tokio::test]
+    async fn eph_caller_planner_settings_resolve_inside_the_ephemeral_scaffold() {
+        let home = tempfile::tempdir().unwrap();
+        let eph = "eph-agnes-r1-planner-ab12";
+        let scaffold = home
+            .path()
+            .join("agents")
+            .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+            .join(eph);
+        std::fs::create_dir_all(&scaffold).unwrap();
+        std::fs::write(
+            scaffold.join("agent.toml"),
+            "[planner]\nclarify_first = false\nmax_questions = 2\n",
+        )
+        .unwrap();
+
+        let s = load_planner_settings(home.path(), eph);
+        assert!(!s.clarify_first);
+        assert_eq!(s.max_questions, 2);
+
+        let v = handle_plan_start(&json!({"task": "x"}), home.path(), eph).await;
+        assert!(text(&v).contains("direct mode"));
+        // Nothing was minted in the registry on the way there.
+        assert!(!home.path().join("agents").join(eph).exists());
+    }
+
+    /// The companion half: an ordinary registry id is byte-identical to the
+    /// pre-fix `agents/<id>/agent.toml` join.
+    #[test]
+    fn ordinary_caller_planner_settings_still_read_the_registry_path() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents").join("agnes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[planner]\nmax_questions = 5\n").unwrap();
+        let s = load_planner_settings(home.path(), "agnes");
+        assert!(s.clarify_first);
+        assert_eq!(s.max_questions, 5);
     }
 }

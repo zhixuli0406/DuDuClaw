@@ -550,8 +550,10 @@ mod tests {
             MastLabel::Mode(MastMode::PrematureTermination).category_str(),
             "task_verification"
         );
-        assert!(MastLabel::Mode(MastMode::StepRepetition)
-            .display()
-            .contains("Step Repetition"));
+        assert!(
+            MastLabel::Mode(MastMode::StepRepetition)
+                .display()
+                .contains("Step Repetition")
+        );
     }
 }

@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::info;
@@ -207,8 +207,12 @@ pub fn strip_html_fence(raw: &str) -> String {
 /// `Err` when no markup is present at all (pure prose ⇒ generation failed).
 pub fn extract_html_fragment(raw: &str) -> Result<String, String> {
     let t = strip_html_fence(raw);
-    let start = t.find('<').ok_or_else(|| "模型未輸出 HTML 內容".to_string())?;
-    let end = t.rfind('>').ok_or_else(|| "模型未輸出 HTML 內容".to_string())?;
+    let start = t
+        .find('<')
+        .ok_or_else(|| "模型未輸出 HTML 內容".to_string())?;
+    let end = t
+        .rfind('>')
+        .ok_or_else(|| "模型未輸出 HTML 內容".to_string())?;
     if end < start {
         return Err("模型未輸出 HTML 內容".into());
     }
@@ -227,14 +231,18 @@ impl CustomWidgetStore {
             Connection::open(&db_path).map_err(|e| format!("open custom widgets store: {e}"))?;
         Self::init_schema(&conn)?;
         info!(?db_path, "CustomWidgetStore initialized");
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| format!("open in-memory: {e}"))?;
         Self::init_schema(&conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn init_schema(conn: &Connection) -> Result<(), String> {
@@ -269,8 +277,15 @@ impl CustomWidgetStore {
         origin: WidgetOrigin,
         created_by_user: &str,
     ) -> Result<String, String> {
-        self.create_with_cap(title, description, html, origin, created_by_user, max_widgets_per_user())
-            .await
+        self.create_with_cap(
+            title,
+            description,
+            html,
+            origin,
+            created_by_user,
+            max_widgets_per_user(),
+        )
+        .await
     }
 
     /// Same as [`create`](Self::create) but takes the cap explicitly. Lets
@@ -367,7 +382,10 @@ impl CustomWidgetStore {
         description: Option<&str>,
         html: Option<&str>,
     ) -> Result<(), String> {
-        let existing = self.get(id).await?.ok_or_else(|| "找不到此 widget".to_string())?;
+        let existing = self
+            .get(id)
+            .await?
+            .ok_or_else(|| "找不到此 widget".to_string())?;
         if existing.created_by_user != actor_user {
             return Err("只有建立者可以編輯此 widget".into());
         }
@@ -389,7 +407,10 @@ impl CustomWidgetStore {
 
     /// Set the instance-wide sharing flag. Owner only.
     pub async fn set_shared(&self, id: &str, actor_user: &str, shared: bool) -> Result<(), String> {
-        let existing = self.get(id).await?.ok_or_else(|| "找不到此 widget".to_string())?;
+        let existing = self
+            .get(id)
+            .await?
+            .ok_or_else(|| "找不到此 widget".to_string())?;
         if existing.created_by_user != actor_user {
             return Err("只有建立者可以變更分享狀態".into());
         }
@@ -405,8 +426,16 @@ impl CustomWidgetStore {
 
     /// Delete a widget. Owner may delete their own; `actor_is_admin` may
     /// delete anyone's (the gallery moderation path).
-    pub async fn remove(&self, id: &str, actor_user: &str, actor_is_admin: bool) -> Result<(), String> {
-        let existing = self.get(id).await?.ok_or_else(|| "找不到此 widget".to_string())?;
+    pub async fn remove(
+        &self,
+        id: &str,
+        actor_user: &str,
+        actor_is_admin: bool,
+    ) -> Result<(), String> {
+        let existing = self
+            .get(id)
+            .await?
+            .ok_or_else(|| "找不到此 widget".to_string())?;
         if existing.created_by_user != actor_user && !actor_is_admin {
             return Err("只有建立者或管理員可以刪除此 widget".into());
         }
@@ -449,7 +478,13 @@ mod tests {
     async fn create_get_roundtrip_and_visibility() {
         let store = CustomWidgetStore::open_in_memory().unwrap();
         let id = store
-            .create("成本卡", "今日成本", "<div>hi</div>", WidgetOrigin::Html, "alice")
+            .create(
+                "成本卡",
+                "今日成本",
+                "<div>hi</div>",
+                WidgetOrigin::Html,
+                "alice",
+            )
             .await
             .unwrap();
         let w = store.get(&id).await.unwrap().unwrap();
@@ -475,7 +510,12 @@ mod tests {
             .create("t", "", "<div/>", WidgetOrigin::Ai, "alice")
             .await
             .unwrap();
-        assert!(store.update(&id, "mallory", Some("x"), None, None).await.is_err());
+        assert!(
+            store
+                .update(&id, "mallory", Some("x"), None, None)
+                .await
+                .is_err()
+        );
         assert!(store.set_shared(&id, "mallory", true).await.is_err());
         assert!(store.remove(&id, "mallory", false).await.is_err());
         // Admin may remove anyone's (moderation).
@@ -486,13 +526,19 @@ mod tests {
     #[test]
     fn fence_stripping_is_defensive_only() {
         assert_eq!(strip_html_fence("<div>x</div>"), "<div>x</div>");
-        assert_eq!(strip_html_fence("```html\n<div>x</div>\n```"), "<div>x</div>");
+        assert_eq!(
+            strip_html_fence("```html\n<div>x</div>\n```"),
+            "<div>x</div>"
+        );
         assert_eq!(strip_html_fence("```\n<div>x</div>\n```"), "<div>x</div>");
     }
 
     #[test]
     fn fragment_extraction_cuts_surrounding_prose() {
-        assert_eq!(extract_html_fragment("<div>x</div>").unwrap(), "<div>x</div>");
+        assert_eq!(
+            extract_html_fragment("<div>x</div>").unwrap(),
+            "<div>x</div>"
+        );
         // Narration around the markup (the observed live-test failure mode).
         assert_eq!(
             extract_html_fragment("輸出如下：\n<div>x</div>\n以上就是內容。").unwrap(),
@@ -530,9 +576,18 @@ mod tests {
     async fn count_owned_reflects_created_widgets() {
         let store = CustomWidgetStore::open_in_memory().unwrap();
         assert_eq!(store.count_owned("alice").await.unwrap(), 0);
-        store.create("a", "", "<div/>", WidgetOrigin::Html, "alice").await.unwrap();
-        store.create("b", "", "<div/>", WidgetOrigin::Html, "alice").await.unwrap();
-        store.create("c", "", "<div/>", WidgetOrigin::Html, "bob").await.unwrap();
+        store
+            .create("a", "", "<div/>", WidgetOrigin::Html, "alice")
+            .await
+            .unwrap();
+        store
+            .create("b", "", "<div/>", WidgetOrigin::Html, "alice")
+            .await
+            .unwrap();
+        store
+            .create("c", "", "<div/>", WidgetOrigin::Html, "bob")
+            .await
+            .unwrap();
         assert_eq!(store.count_owned("alice").await.unwrap(), 2);
         assert_eq!(store.count_owned("bob").await.unwrap(), 1);
     }
@@ -544,7 +599,14 @@ mod tests {
         let store = CustomWidgetStore::open_in_memory().unwrap();
         for i in 0..2 {
             store
-                .create_with_cap(&format!("w{i}"), "", "<div/>", WidgetOrigin::Html, "alice", 2)
+                .create_with_cap(
+                    &format!("w{i}"),
+                    "",
+                    "<div/>",
+                    WidgetOrigin::Html,
+                    "alice",
+                    2,
+                )
                 .await
                 .unwrap();
         }
@@ -563,7 +625,14 @@ mod tests {
         // cap = 0 means unlimited, even for a user already at/over a nonzero cap.
         for i in 0..5 {
             store
-                .create_with_cap(&format!("u{i}"), "", "<div/>", WidgetOrigin::Html, "alice", 0)
+                .create_with_cap(
+                    &format!("u{i}"),
+                    "",
+                    "<div/>",
+                    WidgetOrigin::Html,
+                    "alice",
+                    0,
+                )
                 .await
                 .unwrap();
         }
@@ -572,15 +641,24 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_oversize_and_empty() {
         let store = CustomWidgetStore::open_in_memory().unwrap();
-        assert!(store
-            .create("", "", "<div/>", WidgetOrigin::Html, "a")
-            .await
-            .is_err());
-        assert!(store
-            .create("t", "", "", WidgetOrigin::Html, "a")
-            .await
-            .is_err());
+        assert!(
+            store
+                .create("", "", "<div/>", WidgetOrigin::Html, "a")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .create("t", "", "", WidgetOrigin::Html, "a")
+                .await
+                .is_err()
+        );
         let big = "x".repeat(MAX_WIDGET_HTML_BYTES + 1);
-        assert!(store.create("t", "", &big, WidgetOrigin::Html, "a").await.is_err());
+        assert!(
+            store
+                .create("t", "", &big, WidgetOrigin::Html, "a")
+                .await
+                .is_err()
+        );
     }
 }

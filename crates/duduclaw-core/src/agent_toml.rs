@@ -44,7 +44,7 @@ use serde::Deserialize;
 use crate::lenient::{TomlFlag, TomlNumber, Tri};
 use crate::types::{
     CapabilitiesConfig, ForkSection, GuardrailsSection, MemoryConfig, NoiseBandSection,
-    OsWatchSection, RuntimeSection,
+    OsWatchSection, RuntimeSection, TeamConfig,
 };
 #[cfg(test)]
 use crate::types::PolicyEffect;
@@ -84,11 +84,12 @@ pub struct ModelSectionView {
 /// defaults would loosen `AgentConfig` itself.
 ///
 /// Carried as `Option<AgentSectionView>` on [`AgentTomlSections`] because the
-/// **presence of the `[agent]` table is load-bearing** for two readers:
-/// `export_to::read_agent` and `budget::agent_display_name` both bail out
-/// entirely when `table.get("agent").and_then(|v| v.as_table())` is `None`.
-/// Collapsing "no `[agent]` table" into "an all-empty one" would turn a
-/// skipped export into an export of a blank agent.
+/// **presence of the `[agent]` table is load-bearing**: `budget::agent_display_name`
+/// bails out entirely when `table.get("agent").and_then(|v| v.as_table())` is
+/// `None`. Collapsing "no `[agent]` table" into "an all-empty one" would turn a
+/// skipped agent into one with a blank identity. (The agentcompanies exporter
+/// `export_to::read_agent` relied on the same distinction; it was removed in
+/// 2026-09.)
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct AgentSectionView {
@@ -148,9 +149,20 @@ pub struct BudgetSectionView {
 #[serde(default, rename_all = "snake_case")]
 pub struct EvolutionSectionView {
     #[serde(deserialize_with = "crate::lenient::opt")]
-    pub legacy_soul_evolution: Option<bool>,
-    #[serde(deserialize_with = "crate::lenient::opt")]
     pub strategy: Option<String>,
+    /// H3 (2026-09-29) — the three skill-lifecycle knobs that now have live
+    /// readers. Missing ⇒ `None` ⇒ the accessor's own default; the clamp and
+    /// the default both stay at the call site, as with every other view here.
+    #[serde(deserialize_with = "crate::lenient::opt_number_lossy")]
+    pub skill_synthesis_threshold: Option<f64>,
+    #[serde(deserialize_with = "crate::lenient::opt_number_lossy")]
+    pub skill_synthesis_cooldown_hours: Option<f64>,
+    #[serde(deserialize_with = "crate::lenient::opt_number_lossy")]
+    pub skill_graduation_min_lift: Option<f64>,
+    /// `max_active_skills` — the concurrent-skill cap, read per agent by
+    /// `gateway::channel_reply` → `SkillActivationController`.
+    #[serde(deserialize_with = "crate::lenient::opt_number_lossy")]
+    pub max_active_skills: Option<f64>,
     /// Integer literals ARE accepted here — the opposite of `[fork]`'s budget
     /// quirk. See [`crate::lenient::opt_number_lossy`].
     #[serde(deserialize_with = "crate::lenient::opt_number_lossy")]
@@ -295,6 +307,20 @@ pub struct AgentTomlSections {
     pub mcp: McpSectionView,
     #[serde(deserialize_with = "crate::lenient::or_default")]
     pub goal_intent: GoalIntentSectionView,
+    /// `[team]` — per-employee Team-as-Agent role overrides (P1/WP-1).
+    ///
+    /// No narrow "view" struct: unlike `[model]` / `[agent]` / `[budget]`,
+    /// [`TeamConfig`] has **no required fields** — every key is `Option` so
+    /// the global → per-employee cascade can stay field-wise — so the typed
+    /// struct already satisfies the total-parse contract and is reused
+    /// verbatim, the same way `[capabilities]` and `[memory]` are. One
+    /// schema, no drift guard needed.
+    ///
+    /// This section has no shadow-reader predecessor (it is new surface), so
+    /// there is no historical default direction to reproduce: absent ⇒
+    /// all-`None` ⇒ every value cascades to `config.toml [team]`.
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub team: TeamConfig,
 }
 
 /// Parse the sections out of an `agent.toml` string.
@@ -441,8 +467,6 @@ skill_auto_activate = false
 skill_security_scan = true
 gvu_enabled = false
 max_silence_hours = 168.0
-max_gvu_generations = 0
-observation_period_hours = 24.0
 skill_token_budget = 500
 max_active_skills = 2
 "#;
@@ -470,7 +494,6 @@ delegation_routing = true
 [runtime]
 provider = "codex"
 fallback = "gemini"
-pty_pool_enabled = true
 
 [guardrails]
 enabled = true
@@ -499,6 +522,20 @@ effect = "forbid"
 [memory]
 decision_continuity = true
 decision_ttl_days = 3
+
+[team]
+enabled = true
+executor_fanout = 2
+gate = "auto"
+
+[team.roles.executor]
+runtime = "codex"
+model = "gpt-5.5"
+effort = "medium"
+
+[team.roles.verifier]
+runtime = "gemini"
+model = "gemini-3.7-flash"
 "#;
 
     #[test]
@@ -506,7 +543,6 @@ decision_ttl_days = 3
         let s = parse(&full());
         assert_eq!(s.runtime.provider.as_deref(), Some("codex"));
         assert_eq!(s.runtime.fallback.as_deref(), Some("gemini"));
-        assert_eq!(s.runtime.pty_pool_enabled, Some(true));
         assert!(s.guardrails.enabled && s.guardrails.redact_pii);
         assert_eq!(s.os_watch.paths, vec!["~/x".to_string()]);
         assert_eq!(s.os_watch.debounce_ms, Some(900));
@@ -515,6 +551,80 @@ decision_ttl_days = 3
         assert_eq!(s.capabilities.autonomy_level.as_deref(), Some("operator"));
         assert_eq!(s.memory.decision_ttl_days, Some(3));
         assert_eq!(s.model.utility.as_deref(), Some("u-model"));
+        assert_eq!(s.team.enabled, Some(true));
+        assert_eq!(s.team.executor_fanout, Some(2));
+        assert_eq!(s.team.roles.executor.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(s.team.roles.verifier.runtime.as_deref(), Some("gemini"));
+    }
+
+    /// `[team]` has no shadow-reader predecessor, so its "default direction"
+    /// is set here rather than inherited: absent ⇒ every value `None`, so the
+    /// whole section cascades to `config.toml [team]`.
+    ///
+    /// The switch itself defaults **on** since v1.66 (X2). What keeps this
+    /// agent Solo is that it named no roles, so executor and verifier both
+    /// cascade onto its own model and `validate_team` refuses the spec — see
+    /// `types::default_on_unconfigured_team_cannot_form`.
+    #[test]
+    fn default_direction_team_absent_is_all_unset() {
+        let s = parse(&minimal());
+        assert!(s.team.is_default());
+        assert_eq!(s.team.enabled, None);
+        assert_eq!(s.team.executor_fanout, None);
+        assert_eq!(s.team.gate, None);
+        assert!(s.team.roles.is_empty(), "no roles ⇒ no team can form");
+        assert!(
+            s.team.is_enabled(),
+            "the switch is on by default; the gate and the cascade decide Solo"
+        );
+    }
+
+    /// The section must stay as tolerant as every other one: a scalar where
+    /// the table belongs, or a wrong-typed key inside it, degrades to the
+    /// default instead of taking the agent out of the registry.
+    #[test]
+    fn team_section_tolerates_wrong_types_without_losing_the_agent() {
+        let s = parse(&format!(
+            "{BASE}
+[model]
+preferred = \"m\"
+fallback = \"f\"
+account_pool = []
+team = \"on\"
+"
+        ));
+        assert!(s.team.is_default());
+
+        let s = parse(&format!(
+            "{BASE}
+[model]
+preferred = \"m\"
+fallback = \"f\"
+account_pool = []
+             [team]
+enabled = 1
+executor_fanout = \"two\"
+             [team.roles.executor]
+runtime = 42
+model = \"gpt-5.5\"
+"
+        ));
+        assert_eq!(s.team.enabled, None, "an integer is not a bool");
+        assert_eq!(s.team.executor_fanout, None);
+        assert_eq!(s.team.roles.executor.runtime, None);
+        // …and the well-typed sibling key still survives.
+        assert_eq!(s.team.roles.executor.model.as_deref(), Some("gpt-5.5"));
+    }
+
+    /// The `agent.toml` reader and the typed `AgentConfig` must see the same
+    /// `[team]`, or the dashboard and the dispatcher would disagree.
+    #[test]
+    fn team_view_matches_the_typed_agent_config() {
+        let text = full();
+        let sections = parse(&text);
+        let typed: crate::types::AgentConfig =
+            toml::from_str(&text).expect("the full fixture is a valid AgentConfig");
+        assert_eq!(sections.team, typed.team);
     }
 
     /// Drift guard: the narrow [`ModelSectionView`] and the typed
@@ -771,16 +881,33 @@ max_branches = "many"
         .replace(
             "skill_token_budget = 500",
             "skill_token_budget = 500\n\
-             legacy_soul_evolution = true\n\
              strategy = \"innovate\"\n\
-             aee_settle_hours = 48\n",
+             aee_settle_hours = 48\n\
+             skill_synthesis_threshold = 5\n\
+             skill_synthesis_cooldown_hours = 12\n\
+             skill_graduation_min_lift = 0.25\n",
         )
             + "\n[evolution.noise_band]\ncases = 0.02\njudge = 3\n";
 
         let full_cfg: crate::types::AgentConfig = toml::from_str(&text).unwrap();
         let view = parse(&text).evolution;
-        assert_eq!(view.legacy_soul_evolution, full_cfg.evolution.legacy_soul_evolution);
         assert_eq!(view.strategy, full_cfg.evolution.strategy);
+        assert_eq!(
+            view.skill_synthesis_threshold,
+            Some(full_cfg.evolution.skill_synthesis_threshold as f64)
+        );
+        assert_eq!(
+            view.skill_synthesis_cooldown_hours,
+            Some(full_cfg.evolution.skill_synthesis_cooldown_hours as f64)
+        );
+        assert_eq!(
+            view.skill_graduation_min_lift,
+            Some(full_cfg.evolution.skill_graduation_min_lift)
+        );
+        assert_eq!(
+            view.max_active_skills,
+            Some(full_cfg.evolution.max_active_skills as f64)
+        );
         assert_eq!(view.aee_settle_hours, full_cfg.evolution.aee_settle_hours);
         assert_eq!(view.noise_band, full_cfg.evolution.noise_band);
 
@@ -793,10 +920,10 @@ max_branches = "many"
         );
     }
 
-    /// The `[agent]` section's *presence* is load-bearing for two readers
-    /// (`export_to::read_agent`, `budget::agent_display_name`), so the view
-    /// must distinguish "no table" from "an empty table". A wrong-typed
-    /// section reads as absent, matching `as_table()` returning `None`.
+    /// The `[agent]` section's *presence* is load-bearing for
+    /// `budget::agent_display_name`, so the view must distinguish "no table"
+    /// from "an empty table". A wrong-typed section reads as absent, matching
+    /// `as_table()` returning `None`.
     #[test]
     fn agent_section_presence_is_distinguishable_from_emptiness() {
         assert!(parse("").agent.is_none(), "no table ⇒ None");
@@ -950,12 +1077,7 @@ max_branches = "many"
     fn second_pass_keys_are_not_materialized_on_rewrite() {
         let cfg: crate::types::AgentConfig = toml::from_str(&minimal()).unwrap();
         let out = toml::to_string_pretty(&cfg).unwrap();
-        for key in [
-            "auto_approve_install",
-            "legacy_soul_evolution",
-            "aee_settle_hours",
-            "noise_band",
-        ] {
+        for key in ["auto_approve_install", "aee_settle_hours", "noise_band"] {
             assert!(!out.contains(key), "{key} must not be materialized:\n{out}");
         }
     }

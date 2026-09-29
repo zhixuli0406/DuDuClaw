@@ -252,7 +252,10 @@ impl OsFrontmostRegistry {
         };
         info!(agent = %agent_id, poll_secs = secs, "starting frontmost polling");
         // `<home>/agents/<id>` → `<home>` (for the daily app-switch log).
-        let home_dir = agent_dir.parent().and_then(|p| p.parent()).map(Path::to_path_buf);
+        let home_dir = agent_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf);
         let poll = spawn_agent_poll(agent_id.to_string(), secs, tx, home_dir);
         self.tasks.lock().await.insert(
             agent_id.to_string(),
@@ -355,14 +358,14 @@ mod tests {
     #[test]
     fn default_direction_frontmost_poll_never_polls_on_a_bad_config() {
         for body in [
-            "",                                        // empty file
-            "[os_watch]\n",                            // section, no key
-            "[os_watch]\nfrontmost_poll_secs = 0\n",   // explicit disable
-            "[os_watch]\nfrontmost_poll_secs = -5\n",  // negative
+            "",                                           // empty file
+            "[os_watch]\n",                               // section, no key
+            "[os_watch]\nfrontmost_poll_secs = 0\n",      // explicit disable
+            "[os_watch]\nfrontmost_poll_secs = -5\n",     // negative
             "[os_watch]\nfrontmost_poll_secs = \"60\"\n", // wrong type
             "[os_watch]\nfrontmost_poll_secs = 60.5\n",   // float ⇒ not an int
-            "os_watch = \"scalar\"\n",                 // wrong-typed section
-            "not valid toml [[[",                      // malformed file
+            "os_watch = \"scalar\"\n",                    // wrong-typed section
+            "not valid toml [[[",                         // malformed file
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("agent.toml"), body).unwrap();
@@ -510,8 +513,7 @@ mod tests {
 
         assert!(!stale.exists(), "stale day-file pruned");
         let today = chrono::Local::now().date_naive();
-        let content =
-            std::fs::read_to_string(dir.join(frontmost_log_name(today))).unwrap();
+        let content = std::fs::read_to_string(dir.join(frontmost_log_name(today))).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
         let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();

@@ -30,7 +30,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::info;
@@ -97,9 +97,9 @@ fn is_within(path: &Path, ancestor: &Path) -> bool {
 /// intersect the load path (fail-closed check the tests assert).
 pub fn drafts_is_isolated(home_dir: &Path) -> bool {
     let drafts = drafts_root(home_dir);
-    loader_scan_roots(home_dir).iter().all(|root| {
-        !is_within(&drafts, root) && !is_within(root, &drafts)
-    })
+    loader_scan_roots(home_dir)
+        .iter()
+        .all(|root| !is_within(&drafts, root) && !is_within(root, &drafts))
 }
 
 // ── Status machine ──────────────────────────────────────────
@@ -284,7 +284,8 @@ impl CustomSkillStore {
     /// Open (or create) `<home>/custom_skills.db`.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         let db_path = home_dir.join("custom_skills.db");
-        let conn = Connection::open(&db_path).map_err(|e| format!("open custom skills store: {e}"))?;
+        let conn =
+            Connection::open(&db_path).map_err(|e| format!("open custom skills store: {e}"))?;
         Self::init_schema(&conn)?;
         info!(?db_path, "CustomSkillStore initialized");
         Ok(Self {
@@ -412,7 +413,10 @@ impl CustomSkillStore {
     }
 
     /// Look up a record by its linked approval id (for the decide side-effect).
-    pub async fn get_by_approval(&self, approval_id: &str) -> Result<Option<CustomSkillRecord>, String> {
+    pub async fn get_by_approval(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<CustomSkillRecord>, String> {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT id, slug, display_name, description_human, time_saved_value, time_saved_unit,
@@ -437,9 +441,13 @@ impl CustomSkillStore {
             ),
             None => (format!("{SELECT_ALL} ORDER BY created_at DESC"), vec![]),
         };
-        let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare list: {e}"))?;
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-            bind.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("prepare list: {e}"))?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt
             .query_map(params_ref.as_slice(), row_to_record)
             .map_err(|e| format!("query list: {e}"))?
@@ -620,7 +628,9 @@ impl CustomSkillStore {
 
     /// `last_used_at` per approved-registry slug (auxiliary usage signal the
     /// curator merges with the curation rows' own stamps).
-    pub async fn registry_last_used_map(&self) -> Result<std::collections::HashMap<String, String>, String> {
+    pub async fn registry_last_used_map(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, String> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare("SELECT slug, last_used_at FROM custom_skill_registry WHERE last_used_at IS NOT NULL")
@@ -660,7 +670,9 @@ impl CustomSkillStore {
     pub async fn list_approved(&self) -> Result<Vec<CustomSkillRecord>, String> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
-            .prepare(&format!("{SELECT_ALL} WHERE status = 'approved' ORDER BY approved_at DESC"))
+            .prepare(&format!(
+                "{SELECT_ALL} WHERE status = 'approved' ORDER BY approved_at DESC"
+            ))
             .map_err(|e| format!("prepare list_approved: {e}"))?;
         let rows = stmt
             .query_map([], row_to_record)
@@ -739,7 +751,11 @@ impl CustomSkillStore {
                 to.as_str()
             ));
         }
-        let approved_at: Option<String> = if set_approved_at { Some(now.clone()) } else { None };
+        let approved_at: Option<String> = if set_approved_at {
+            Some(now.clone())
+        } else {
+            None
+        };
         conn.execute(
             "UPDATE custom_skill_registry SET
                 status           = ?2,
@@ -748,7 +764,14 @@ impl CustomSkillStore {
                 approved_at      = COALESCE(?5, approved_at),
                 updated_at       = ?6
              WHERE id = ?1",
-            params![id, to.as_str(), approval_id, rejection_reason, approved_at, now],
+            params![
+                id,
+                to.as_str(),
+                approval_id,
+                rejection_reason,
+                approved_at,
+                now
+            ],
         )
         .map_err(|e| format!("transition custom skill: {e}"))?;
         Ok(())
@@ -855,7 +878,9 @@ pub fn estimate_saved_hours(rec: &CustomSkillRecord, now: DateTime<Utc>) -> f64 
 /// `approved_at` timestamp. `None`/unparseable/future ⇒ 0.0.
 fn months_since(approved_at: Option<&str>, now: DateTime<Utc>) -> f64 {
     let Some(ts) = approved_at else { return 0.0 };
-    let Ok(dt) = DateTime::parse_from_rfc3339(ts) else { return 0.0 };
+    let Ok(dt) = DateTime::parse_from_rfc3339(ts) else {
+        return 0.0;
+    };
     let days = (now - dt.with_timezone(&Utc)).num_seconds() as f64 / 86_400.0;
     (days / 30.0).max(0.0)
 }
@@ -930,7 +955,8 @@ mod tests {
         .unwrap();
 
         // The loader's real roots must NOT surface it.
-        let global = duduclaw_agent::registry::AgentRegistry::load_skills(&home.join("skills")).await;
+        let global =
+            duduclaw_agent::registry::AgentRegistry::load_skills(&home.join("skills")).await;
         assert!(global.is_empty(), "draft leaked into global skills scan");
         let agent = duduclaw_agent::registry::AgentRegistry::load_skills(
             &home.join("agents").join("alice").join("SKILLS"),
@@ -941,8 +967,13 @@ mod tests {
         // Positive control: the draft IS present if you scan the drafts dir
         // directly — proving the file is real and the isolation is about the
         // loader never choosing that root.
-        let direct = duduclaw_agent::registry::AgentRegistry::load_skills(&draft_dir(&home, id)).await;
-        assert_eq!(direct.len(), 1, "control: draft should be found under its own dir");
+        let direct =
+            duduclaw_agent::registry::AgentRegistry::load_skills(&draft_dir(&home, id)).await;
+        assert_eq!(
+            direct.len(),
+            1,
+            "control: draft should be found under its own dir"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -968,7 +999,10 @@ mod tests {
 
     #[test]
     fn status_from_db_fails_safe_to_retired() {
-        assert_eq!(CustomSkillStatus::from_db("garbage"), CustomSkillStatus::Retired);
+        assert_eq!(
+            CustomSkillStatus::from_db("garbage"),
+            CustomSkillStatus::Retired
+        );
     }
 
     #[test]
@@ -990,13 +1024,28 @@ mod tests {
         assert_eq!(store.list(Some("alice")).await.unwrap().len(), 1);
 
         // Draft → generating → pending → approved, with approval linkage.
-        store.transition("s1", CustomSkillStatus::Generating, None, None, false).await.unwrap();
-        store.transition("s1", CustomSkillStatus::PendingApproval, Some("appr-1"), None, false).await.unwrap();
+        store
+            .transition("s1", CustomSkillStatus::Generating, None, None, false)
+            .await
+            .unwrap();
+        store
+            .transition(
+                "s1",
+                CustomSkillStatus::PendingApproval,
+                Some("appr-1"),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             store.get_by_approval("appr-1").await.unwrap().map(|r| r.id),
             Some("s1".to_string())
         );
-        store.transition("s1", CustomSkillStatus::Approved, None, None, true).await.unwrap();
+        store
+            .transition("s1", CustomSkillStatus::Approved, None, None, true)
+            .await
+            .unwrap();
         let got = store.get("s1").await.unwrap().unwrap();
         assert_eq!(got.status, CustomSkillStatus::Approved);
         assert!(got.approved_at.is_some());
@@ -1004,7 +1053,12 @@ mod tests {
         assert_eq!(store.count_approved().await.unwrap(), 1);
 
         // Illegal transition is refused.
-        assert!(store.transition("s2", CustomSkillStatus::Approved, None, None, true).await.is_err());
+        assert!(
+            store
+                .transition("s2", CustomSkillStatus::Approved, None, None, true)
+                .await
+                .is_err()
+        );
     }
 
     // ── Saved-hours: two distinct semantics ─────────────────
@@ -1082,8 +1136,14 @@ mod tests {
 
         // G5: the increment stamped last_used_at on the approved slug.
         let map = store.registry_last_used_map().await.unwrap();
-        assert!(map.contains_key("daily-report"), "increment must stamp last_used_at");
-        assert!(!map.contains_key("draft-only"), "unapproved slug must not be stamped");
+        assert!(
+            map.contains_key("daily-report"),
+            "increment must stamp last_used_at"
+        );
+        assert!(
+            !map.contains_key("draft-only"),
+            "unapproved slug must not be stamped"
+        );
     }
 
     // ── G5 curation store ────────────────────────────────────
@@ -1094,9 +1154,23 @@ mod tests {
         let now = Utc::now().to_rfc3339();
 
         // First sighting inserts; second is a no-op that preserves first_seen.
-        assert!(store.curation_upsert_seen("web-scraper", "global", &now).await.unwrap());
-        assert!(!store.curation_upsert_seen("web-scraper", "global", "2030-01-01T00:00:00Z").await.unwrap());
-        let rec = store.curation_get("web-scraper", "global").await.unwrap().unwrap();
+        assert!(
+            store
+                .curation_upsert_seen("web-scraper", "global", &now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .curation_upsert_seen("web-scraper", "global", "2030-01-01T00:00:00Z")
+                .await
+                .unwrap()
+        );
+        let rec = store
+            .curation_get("web-scraper", "global")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.first_seen, now);
         assert_eq!(rec.status, CurationStatus::Active);
         assert!(!rec.pinned);
@@ -1105,32 +1179,75 @@ mod tests {
         // Usage increment touches curation last_used_at even without an
         // approved registry row (usage is a fact about the file).
         store.increment_usage_by_slug("web-scraper").await.unwrap();
-        let rec = store.curation_get("web-scraper", "global").await.unwrap().unwrap();
-        assert!(rec.last_used_at.is_some(), "usage must stamp curation last_used_at");
+        let rec = store
+            .curation_get("web-scraper", "global")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            rec.last_used_at.is_some(),
+            "usage must stamp curation last_used_at"
+        );
 
         // Pin toggle + status transitions persist.
-        assert!(store.curation_set_pinned("web-scraper", "global", true, &now).await.unwrap());
-        assert!(store
-            .curation_set_status("web-scraper", "global", CurationStatus::Stale, None, &now)
+        assert!(
+            store
+                .curation_set_pinned("web-scraper", "global", true, &now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .curation_set_status("web-scraper", "global", CurationStatus::Stale, None, &now)
+                .await
+                .unwrap()
+        );
+        let rec = store
+            .curation_get("web-scraper", "global")
             .await
-            .unwrap());
-        let rec = store.curation_get("web-scraper", "global").await.unwrap().unwrap();
+            .unwrap()
+            .unwrap();
         assert!(rec.pinned);
         assert_eq!(rec.status, CurationStatus::Stale);
 
         // Missing row: pin/status return false, get returns None.
-        assert!(!store.curation_set_pinned("nope", "global", true, &now).await.unwrap());
-        assert!(store.curation_get("nope", "global").await.unwrap().is_none());
+        assert!(
+            !store
+                .curation_set_pinned("nope", "global", true, &now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .curation_get("nope", "global")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Remove.
-        assert!(store.curation_remove("web-scraper", "global").await.unwrap());
-        assert!(store.curation_get("web-scraper", "global").await.unwrap().is_none());
+        assert!(
+            store
+                .curation_remove("web-scraper", "global")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .curation_get("web-scraper", "global")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn curation_status_from_db_fails_safe_to_stale() {
         assert_eq!(CurationStatus::from_db("active"), CurationStatus::Active);
-        assert_eq!(CurationStatus::from_db("archived"), CurationStatus::Archived);
+        assert_eq!(
+            CurationStatus::from_db("archived"),
+            CurationStatus::Archived
+        );
         // Unknown must never map to a state that triggers a file move.
         assert_eq!(CurationStatus::from_db("garbage"), CurationStatus::Stale);
     }
@@ -1139,7 +1256,10 @@ mod tests {
     async fn curator_meta_roundtrip() {
         let store = CustomSkillStore::open_in_memory().unwrap();
         assert!(store.meta_get("last_run_at").await.unwrap().is_none());
-        store.meta_set("last_run_at", "2026-07-11T00:00:00Z").await.unwrap();
+        store
+            .meta_set("last_run_at", "2026-07-11T00:00:00Z")
+            .await
+            .unwrap();
         assert_eq!(
             store.meta_get("last_run_at").await.unwrap().as_deref(),
             Some("2026-07-11T00:00:00Z")
@@ -1151,7 +1271,14 @@ mod tests {
         let store = CustomSkillStore::open_in_memory().unwrap();
         store.insert(&rec("s1", "alice")).await.unwrap();
         store
-            .update_human_fields("s1", Some("Renamed"), None, Some(2.0), Some("hours_per_month"), None)
+            .update_human_fields(
+                "s1",
+                Some("Renamed"),
+                None,
+                Some(2.0),
+                Some("hours_per_month"),
+                None,
+            )
             .await
             .unwrap();
         let got = store.get("s1").await.unwrap().unwrap();

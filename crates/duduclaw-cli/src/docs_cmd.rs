@@ -102,7 +102,11 @@ fn parse_table_row(row: &str) -> Option<DocTopic> {
         .or_else(|| filename.strip_suffix(".json"))
         .unwrap_or(filename)
         .to_string();
-    Some(DocTopic { slug, path: path.to_string(), description })
+    Some(DocTopic {
+        slug,
+        path: path.to_string(),
+        description,
+    })
 }
 
 /// Every `docs/features/` + `docs/guides/` topic — exactly the two sections
@@ -152,7 +156,9 @@ fn try_open_browser(url: &str) -> bool {
     let status = if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(url).status()
     } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd").args(["/C", "start", "", url]).status()
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()
     } else {
         std::process::Command::new("xdg-open").arg(url).status()
     };
@@ -200,7 +206,9 @@ pub async fn run(topic: Option<String>) -> Result<()> {
             if try_open_browser(&url) {
                 println!("已嘗試在瀏覽器開啟。");
             } else {
-                println!("無法自動開啟瀏覽器（可能是無圖形介面的伺服器環境），請手動複製上方連結開啟。");
+                println!(
+                    "無法自動開啟瀏覽器（可能是無圖形介面的伺服器環境），請手動複製上方連結開啟。"
+                );
             }
         }
         many => {
@@ -343,17 +351,32 @@ mod tests {
                 t.path.starts_with("features/") || t.path.starts_with("guides/"),
                 "topic leaked from an unexpected section: {t:?}"
             );
-            assert!(!t.path.ends_with("README.md"), "index page leaked as a topic: {t:?}");
+            assert!(
+                !t.path.ends_with("README.md"),
+                "index page leaked as a topic: {t:?}"
+            );
             assert!(!t.slug.is_empty());
-            assert!(!t.description.is_empty(), "topic with no description: {t:?}");
+            assert!(
+                !t.description.is_empty(),
+                "topic with no description: {t:?}"
+            );
         }
     }
 
     #[test]
     fn known_real_topics_resolve() {
         let topics = all_topics();
-        assert!(!resolve(&topics, "evals").is_empty(), "guides/evals.md must resolve");
-        assert!(!resolve(&topics, "playbook").is_empty(), "the AEE/playbook feature doc must resolve");
-        assert!(!resolve(&topics, "goal-loop").is_empty(), "guides/goal-loop.md must resolve");
+        assert!(
+            !resolve(&topics, "evals").is_empty(),
+            "guides/evals.md must resolve"
+        );
+        assert!(
+            !resolve(&topics, "playbook").is_empty(),
+            "the AEE/playbook feature doc must resolve"
+        );
+        assert!(
+            !resolve(&topics, "goal-loop").is_empty(),
+            "guides/goal-loop.md must resolve"
+        );
     }
 }

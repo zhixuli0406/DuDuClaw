@@ -20,7 +20,7 @@
 //!   query/citation only and is never auto-written into the shared wiki.
 
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Duration;
 
@@ -73,7 +73,10 @@ pub enum NotionApiError {
     NotFound(String),
     /// 429 — rate limited after one retry.
     RateLimited,
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for NotionApiError {
@@ -224,7 +227,10 @@ async fn notion_request(
             403 => NotionApiError::Forbidden(msg),
             404 => NotionApiError::NotFound(msg),
             429 => NotionApiError::RateLimited,
-            _ => NotionApiError::Api { status: code, message: msg },
+            _ => NotionApiError::Api {
+                status: code,
+                message: msg,
+            },
         });
     }
 }
@@ -282,7 +288,11 @@ pub async fn notion_page_read(
     .await?;
 
     let title = extract_notion_title(&page);
-    let url = page.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let url = page
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let last_edited = page
         .get("last_edited_time")
         .and_then(|v| v.as_str())
@@ -333,7 +343,10 @@ pub async fn notion_page_read(
             blocks_truncated = true;
             break;
         }
-        let has_more = resp.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+        let has_more = resp
+            .get("has_more")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         cursor = resp
             .get("next_cursor")
             .and_then(|v| v.as_str())
@@ -441,7 +454,11 @@ fn extract_notion_title(obj: &Value) -> String {
 
 fn parse_search_hit(obj: &Value) -> NotionSearchHit {
     NotionSearchHit {
-        id: obj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        id: obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         title: extract_notion_title(obj),
         object_type: obj
             .get("object")
@@ -453,7 +470,11 @@ fn parse_search_hit(obj: &Value) -> NotionSearchHit {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        url: obj.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        url: obj
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
     }
 }
 
@@ -475,7 +496,10 @@ fn block_to_text(block: &Value) -> Option<String> {
         "bulleted_list_item" => format!("- {base}"),
         "numbered_list_item" => format!("1. {base}"),
         "to_do" => {
-            let checked = inner.get("checked").and_then(|v| v.as_bool()).unwrap_or(false);
+            let checked = inner
+                .get("checked")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             format!("[{}] {base}", if checked { "x" } else { " " })
         }
         "quote" => format!("> {base}"),
@@ -605,7 +629,8 @@ mod tests {
         let para = json!({"type": "paragraph", "paragraph": {"rich_text": [{"plain_text": "hi"}]}});
         assert_eq!(block_to_text(&para).as_deref(), Some("hi"));
 
-        let h1 = json!({"type": "heading_1", "heading_1": {"rich_text": [{"plain_text": "Title"}]}});
+        let h1 =
+            json!({"type": "heading_1", "heading_1": {"rich_text": [{"plain_text": "Title"}]}});
         assert_eq!(block_to_text(&h1).as_deref(), Some("# Title"));
 
         let bullet = json!({"type": "bulleted_list_item", "bulleted_list_item": {"rich_text": [{"plain_text": "point"}]}});
@@ -621,7 +646,10 @@ mod tests {
         assert_eq!(block_to_text(&quote).as_deref(), Some("> q"));
 
         let code = json!({"type": "code", "code": {"rich_text": [{"plain_text": "let x=1;"}], "language": "rust"}});
-        assert_eq!(block_to_text(&code).as_deref(), Some("```rust\nlet x=1;\n```"));
+        assert_eq!(
+            block_to_text(&code).as_deref(),
+            Some("```rust\nlet x=1;\n```")
+        );
 
         let row = json!({"type": "table_row", "table_row": {"cells": [[{"plain_text": "a"}], [{"plain_text": "b"}]]}});
         assert_eq!(block_to_text(&row).as_deref(), Some("| a | b |"));

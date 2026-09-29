@@ -36,14 +36,16 @@ pub async fn detect_hardware() -> HardwareInfo {
     }
 }
 
-fn recommend_backend(gpu: &GpuType) -> BackendType {
-    match gpu {
-        GpuType::AppleSilicon => BackendType::LlamaCpp, // Metal backend
-        GpuType::NvidiaCuda => BackendType::LlamaCpp,   // CUDA backend
-        GpuType::AmdRocm | GpuType::Vulkan => BackendType::LlamaCpp, // Vulkan backend
-        GpuType::IntelArc => BackendType::LlamaCpp,     // SYCL or Vulkan
-        GpuType::None => BackendType::LlamaCpp,         // CPU fallback
-    }
+/// The only backend DuDuClaw actually ships is the OpenAI-compatible HTTP
+/// client, so hardware detection no longer picks between in-process engines —
+/// it reports the GPU (which still drives `recommended_max_model_gb` and the
+/// model-registry hints) and recommends running a local OpenAI-compatible
+/// server (llama-server / Ollama / vLLM) on it. The llama.cpp / mistral.rs
+/// recommendations were removed on 2026-09-29 together with those backends
+/// (`wiki/reports/feature-audit-2026-09-29.md` T1-D3 / T3-S5); recommending a
+/// backend that always fails to build is worse than recommending none.
+fn recommend_backend(_gpu: &GpuType) -> BackendType {
+    BackendType::OpenAiCompat
 }
 
 async fn detect_gpu() -> (GpuType, String) {

@@ -232,7 +232,14 @@ pub async fn run_script(
     if script.watch_mode {
         match client.send(&CodriveCmd::Watch { enable: true }).await {
             Ok(_) => {
-                ticker(home_dir, agent_id, "codrive_session", &session_id, "已啟用旁觀模式（人離開自動暫停）").await;
+                ticker(
+                    home_dir,
+                    agent_id,
+                    "codrive_session",
+                    &session_id,
+                    "已啟用旁觀模式（人離開自動暫停）",
+                )
+                .await;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "codrive: failed to enable watch mode — continuing without idle supervision");

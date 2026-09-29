@@ -83,7 +83,9 @@ impl GvuGenerationStats {
 
         // Only count non-abandoned runs — abandoned entries would deflate the
         // late_rate and prevent depth extension (review #25).
-        let accepted: Vec<_> = self.recent_outcomes.iter()
+        let accepted: Vec<_> = self
+            .recent_outcomes
+            .iter()
             .filter(|r| r.accepted_at_generation.is_some())
             .collect();
 
@@ -91,7 +93,8 @@ impl GvuGenerationStats {
             return 3; // Not enough accepted data
         }
 
-        let late_successes = accepted.iter()
+        let late_successes = accepted
+            .iter()
             .filter(|r| r.accepted_at_generation.map(|g| g >= 3).unwrap_or(false))
             .count() as f64;
 
@@ -296,7 +299,7 @@ pub struct ChangePointDetector {
 impl Default for ChangePointDetector {
     fn default() -> Self {
         Self {
-            running_mean: 0.3,  // initial estimate
+            running_mean: 0.3, // initial estimate
             count: 0,
             cusum_pos: 0.0,
             cusum_neg: 0.0,
@@ -314,8 +317,10 @@ impl ChangePointDetector {
         // CUSUM deviation BEFORE updating mean — otherwise the deviation is always
         // near-zero because we'd be comparing against a mean that includes this observation.
         // (Audit issue #3: neutered change-point detector)
-        self.cusum_pos = (self.cusum_pos + composite_error - self.running_mean - self.slack).max(0.0);
-        self.cusum_neg = (self.cusum_neg - composite_error + self.running_mean - self.slack).max(0.0);
+        self.cusum_pos =
+            (self.cusum_pos + composite_error - self.running_mean - self.slack).max(0.0);
+        self.cusum_neg =
+            (self.cusum_neg - composite_error + self.running_mean - self.slack).max(0.0);
 
         // THEN update running mean (Welford's online mean)
         self.count += 1;
@@ -370,7 +375,6 @@ pub struct MetaCognition {
     pub total_predictions: u64,
 
     // ── Hardening: anti-dark-room (Risk 2) ─────────────────────
-
     /// Surprise deficit tracker — forces exploration when predictions are
     /// consistently too accurate (dark room convergence).
     #[serde(default)]
@@ -392,7 +396,6 @@ pub struct MetaCognition {
     pub consecutive_non_negligible: u64,
 
     // ── Hardening: anti-feedback-loop (Risk 3) ─────────────────
-
     /// CUSUM change-point detector — replaces fixed evaluation interval.
     #[serde(default)]
     pub change_detector: ChangePointDetector,
@@ -403,7 +406,6 @@ pub struct MetaCognition {
     pub original_sig_improvement_rate: Option<f64>,
 
     // ── Proactive self-calibration (Phase D3) ───────────────────
-
     /// Proactive message threshold (0.0-1.0). Only send proactive messages
     /// when the motivation score exceeds this threshold.
     /// Self-calibrates based on user accept/dismiss feedback.
@@ -427,7 +429,6 @@ pub struct MetaCognition {
     pub proactive_since_last_cal: u64,
 
     // ── GVU adaptive depth (Phase 1.3) ─────────────────────
-
     /// GVU generation outcome tracking for adaptive iteration depth.
     /// Determines whether to extend beyond the default 3 generations.
     #[serde(default)]
@@ -576,10 +577,18 @@ impl MetaCognition {
         // Blend 30% original + 70% current to prevent feedback loop amplification.
         // (Gerstgrasser et al. ICLR 2025 "Is Model Collapse Inevitable?")
         if self.original_sig_improvement_rate.is_none()
-            && self.layer_stats.get(&sig_key).map(|s| s.window_count()).unwrap_or(0) >= 5
+            && self
+                .layer_stats
+                .get(&sig_key)
+                .map(|s| s.window_count())
+                .unwrap_or(0)
+                >= 5
         {
             self.original_sig_improvement_rate = Some(current_sig_rate);
-            info!(rate = format!("{current_sig_rate:.2}"), "Anchored original sig improvement rate");
+            info!(
+                rate = format!("{current_sig_rate:.2}"),
+                "Anchored original sig improvement rate"
+            );
         }
 
         let sig_rate = if let Some(original) = self.original_sig_improvement_rate {
@@ -614,13 +623,27 @@ impl MetaCognition {
         let mut adjusted = false;
 
         // If Significant triggers rarely lead to improvement → too sensitive, raise threshold
-        if sig_rate < 0.3 && self.layer_stats.get(&sig_key).map(|s| s.window_count()).unwrap_or(0) >= 5 {
+        if sig_rate < 0.3
+            && self
+                .layer_stats
+                .get(&sig_key)
+                .map(|s| s.window_count())
+                .unwrap_or(0)
+                >= 5
+        {
             self.thresholds.moderate_upper = (self.thresholds.moderate_upper + 0.05).min(0.85);
             adjusted = true;
         }
 
         // If Significant triggers frequently lead to improvement → too conservative
-        if sig_rate > 0.7 && self.layer_stats.get(&sig_key).map(|s| s.window_count()).unwrap_or(0) >= 5 {
+        if sig_rate > 0.7
+            && self
+                .layer_stats
+                .get(&sig_key)
+                .map(|s| s.window_count())
+                .unwrap_or(0)
+                >= 5
+        {
             self.thresholds.moderate_upper = (self.thresholds.moderate_upper - 0.03).max(0.2);
             adjusted = true;
         }
@@ -757,11 +780,9 @@ impl MetaCognition {
         let conn = rusqlite::Connection::open(prediction_db)
             .map_err(|e| format!("open prediction.db: {e}"))?;
         let total: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM prediction_log",
-                [],
-                |r| r.get::<_, i64>(0).map(|v| v as u64),
-            )
+            .query_row("SELECT COUNT(*) FROM prediction_log", [], |r| {
+                r.get::<_, i64>(0).map(|v| v as u64)
+            })
             .unwrap_or(0);
         if total > self.total_predictions {
             self.total_predictions = total;
@@ -770,9 +791,7 @@ impl MetaCognition {
         // approximately — clamp to <= total. We use the same DB count as a
         // conservative upper bound so `should_evaluate` becomes true if the
         // interval has been exceeded.
-        if self.predictions_since_last_eval < total
-            && total >= self.evaluation_interval
-        {
+        if self.predictions_since_last_eval < total && total >= self.evaluation_interval {
             self.predictions_since_last_eval = total;
         }
 
@@ -886,7 +905,12 @@ impl MetaCognition {
 
     /// Get proactive stats summary.
     pub fn proactive_stats(&self) -> (u64, u64, u64, f64) {
-        (self.proactive_sent, self.proactive_accepted, self.proactive_dismissed, self.proactive_threshold)
+        (
+            self.proactive_sent,
+            self.proactive_accepted,
+            self.proactive_dismissed,
+            self.proactive_threshold,
+        )
     }
 }
 
@@ -930,9 +954,7 @@ mod bug4_tests {
         let tmp = TempDir::new().unwrap();
         let db = tmp.path().join("prediction.db");
         // 50 rows in DB.
-        let rows: Vec<_> = (0..50)
-            .map(|_| ("a", "Negligible", 0.05))
-            .collect();
+        let rows: Vec<_> = (0..50).map(|_| ("a", "Negligible", 0.05)).collect();
         seed_prediction_db(&db, &rows);
 
         let mut meta = MetaCognition::default();
@@ -943,9 +965,7 @@ mod bug4_tests {
         assert_eq!(meta.total_predictions, 50);
         // layer_stats should reflect the per-category counts.
         assert_eq!(
-            meta.layer_stats
-                .get("Negligible")
-                .map(|s| s.total_triggers),
+            meta.layer_stats.get("Negligible").map(|s| s.total_triggers),
             Some(50)
         );
     }
@@ -1003,10 +1023,8 @@ mod bug4_tests {
         let mut meta = MetaCognition::default();
         meta.total_predictions = 5;
         meta.predictions_since_last_eval = 0;
-        meta.layer_stats.insert(
-            "Negligible".into(),
-            LayerEffectiveness::default(),
-        );
+        meta.layer_stats
+            .insert("Negligible".into(), LayerEffectiveness::default());
         let fired = meta.force_evaluation_if_overdue();
         assert!(!fired, "below interval — no forced eval");
     }
@@ -1068,7 +1086,10 @@ mod bug4_tests {
             .iter()
             .filter(|&&c| c == ErrorCategory::Critical)
             .count();
-        assert_eq!(crit_recent, 0, "early Critical burst must age out of window");
+        assert_eq!(
+            crit_recent, 0,
+            "early Critical burst must age out of window"
+        );
 
         meta.evaluate_and_adjust();
         assert!(

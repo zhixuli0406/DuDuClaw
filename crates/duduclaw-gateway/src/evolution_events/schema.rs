@@ -277,11 +277,7 @@ pub struct AuditEvent {
 
 impl AuditEvent {
     /// Construct a new event with the current UTC time.
-    pub fn now(
-        event_type: AuditEventType,
-        agent_id: impl Into<String>,
-        outcome: Outcome,
-    ) -> Self {
+    pub fn now(event_type: AuditEventType, agent_id: impl Into<String>, outcome: Outcome) -> Self {
         Self {
             timestamp: chrono::Utc::now().to_rfc3339(),
             event_type,
@@ -354,16 +350,12 @@ impl StagnationDetectionConfig {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(ws) = self.window_seconds {
             if ws == 0 {
-                return Err(
-                    "stagnation_detection.window_seconds must be >= 1 (got 0)".into(),
-                );
+                return Err("stagnation_detection.window_seconds must be >= 1 (got 0)".into());
             }
         }
         if let Some(tt) = self.trigger_threshold {
             if tt == 0 {
-                return Err(
-                    "stagnation_detection.trigger_threshold must be >= 1 (got 0)".into(),
-                );
+                return Err("stagnation_detection.trigger_threshold must be >= 1 (got 0)".into());
             }
         }
         Ok(())
@@ -396,9 +388,7 @@ pub fn validate(event: &AuditEvent) -> Result<(), String> {
 
     // P0 constraint: signal_suppressed events must not carry a generation.
     if event.event_type == AuditEventType::SignalSuppressed && event.generation.is_some() {
-        return Err(
-            "signal_suppressed events must not carry a generation (P1 reserved)".into(),
-        );
+        return Err("signal_suppressed events must not carry a generation (P1 reserved)".into());
     }
 
     Ok(())
@@ -539,8 +529,11 @@ mod tests {
 
     #[test]
     fn test_signal_suppressed_without_generation_passes() {
-        let ev =
-            AuditEvent::now(AuditEventType::SignalSuppressed, "agent-x", Outcome::Suppressed);
+        let ev = AuditEvent::now(
+            AuditEventType::SignalSuppressed,
+            "agent-x",
+            Outcome::Suppressed,
+        );
         assert!(validate(&ev).is_ok());
     }
 
@@ -614,7 +607,10 @@ mod tests {
     #[test]
     fn test_event_type_display() {
         assert_eq!(AuditEventType::SkillActivate.to_string(), "skill_activate");
-        assert_eq!(AuditEventType::SignalSuppressed.to_string(), "signal_suppressed");
+        assert_eq!(
+            AuditEventType::SignalSuppressed.to_string(),
+            "signal_suppressed"
+        );
         assert_eq!(AuditEventType::SkillGraduate.to_string(), "skill_graduate");
     }
 
@@ -654,7 +650,10 @@ mod tests {
     fn test_skill_graduate_validation_passes() {
         let ev = AuditEvent::now(AuditEventType::SkillGraduate, "agent-001", Outcome::Success)
             .with_skill_id("some-skill");
-        assert!(validate(&ev).is_ok(), "skill_graduate with valid fields must pass validation");
+        assert!(
+            validate(&ev).is_ok(),
+            "skill_graduate with valid fields must pass validation"
+        );
     }
 
     #[test]
@@ -699,7 +698,10 @@ mod tests {
             let ev = AuditEvent::now(AuditEventType::SecurityScan, "a", outcome);
             let json = serde_json::to_string(&ev).unwrap();
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-            assert_eq!(v["outcome"], expected, "P0 outcome serialisation must not change");
+            assert_eq!(
+                v["outcome"], expected,
+                "P0 outcome serialisation must not change"
+            );
         }
     }
 
@@ -950,16 +952,46 @@ mod tests {
     fn test_w19_p1_event_types_display() {
         let cases = [
             (AuditEventType::GovernanceViolation, "governance_violation"),
-            (AuditEventType::GovernanceApprovalRequested, "governance_approval_requested"),
-            (AuditEventType::GovernanceApprovalDecided, "governance_approval_decided"),
-            (AuditEventType::GovernancePolicyChanged, "governance_policy_changed"),
-            (AuditEventType::GovernanceQuotaReset, "governance_quota_reset"),
-            (AuditEventType::DurabilityRetryAttempt, "durability_retry_attempt"),
-            (AuditEventType::DurabilityRetryExhausted, "durability_retry_exhausted"),
-            (AuditEventType::DurabilityCircuitOpened, "durability_circuit_opened"),
-            (AuditEventType::DurabilityCircuitRecovered, "durability_circuit_recovered"),
-            (AuditEventType::DurabilityCheckpointSaved, "durability_checkpoint_saved"),
-            (AuditEventType::DurabilityDlqReplayed, "durability_dlq_replayed"),
+            (
+                AuditEventType::GovernanceApprovalRequested,
+                "governance_approval_requested",
+            ),
+            (
+                AuditEventType::GovernanceApprovalDecided,
+                "governance_approval_decided",
+            ),
+            (
+                AuditEventType::GovernancePolicyChanged,
+                "governance_policy_changed",
+            ),
+            (
+                AuditEventType::GovernanceQuotaReset,
+                "governance_quota_reset",
+            ),
+            (
+                AuditEventType::DurabilityRetryAttempt,
+                "durability_retry_attempt",
+            ),
+            (
+                AuditEventType::DurabilityRetryExhausted,
+                "durability_retry_exhausted",
+            ),
+            (
+                AuditEventType::DurabilityCircuitOpened,
+                "durability_circuit_opened",
+            ),
+            (
+                AuditEventType::DurabilityCircuitRecovered,
+                "durability_circuit_recovered",
+            ),
+            (
+                AuditEventType::DurabilityCheckpointSaved,
+                "durability_checkpoint_saved",
+            ),
+            (
+                AuditEventType::DurabilityDlqReplayed,
+                "durability_dlq_replayed",
+            ),
         ];
         for (t, expected) in cases {
             assert_eq!(t.to_string(), expected, "Display mismatch for {expected}");
@@ -970,15 +1002,47 @@ mod tests {
     fn test_all_w19_p1_events_validate_pass() {
         let events = [
             AuditEvent::now(AuditEventType::GovernanceViolation, "a", Outcome::Blocked),
-            AuditEvent::now(AuditEventType::GovernanceApprovalRequested, "a", Outcome::Pending),
-            AuditEvent::now(AuditEventType::GovernanceApprovalDecided, "a", Outcome::Approved),
-            AuditEvent::now(AuditEventType::GovernancePolicyChanged, "a", Outcome::Success),
+            AuditEvent::now(
+                AuditEventType::GovernanceApprovalRequested,
+                "a",
+                Outcome::Pending,
+            ),
+            AuditEvent::now(
+                AuditEventType::GovernanceApprovalDecided,
+                "a",
+                Outcome::Approved,
+            ),
+            AuditEvent::now(
+                AuditEventType::GovernancePolicyChanged,
+                "a",
+                Outcome::Success,
+            ),
             AuditEvent::now(AuditEventType::GovernanceQuotaReset, "a", Outcome::Success),
-            AuditEvent::now(AuditEventType::DurabilityRetryAttempt, "a", Outcome::Failure),
-            AuditEvent::now(AuditEventType::DurabilityRetryExhausted, "a", Outcome::Failure),
-            AuditEvent::now(AuditEventType::DurabilityCircuitOpened, "a", Outcome::Triggered),
-            AuditEvent::now(AuditEventType::DurabilityCircuitRecovered, "a", Outcome::Recovered),
-            AuditEvent::now(AuditEventType::DurabilityCheckpointSaved, "a", Outcome::Success),
+            AuditEvent::now(
+                AuditEventType::DurabilityRetryAttempt,
+                "a",
+                Outcome::Failure,
+            ),
+            AuditEvent::now(
+                AuditEventType::DurabilityRetryExhausted,
+                "a",
+                Outcome::Failure,
+            ),
+            AuditEvent::now(
+                AuditEventType::DurabilityCircuitOpened,
+                "a",
+                Outcome::Triggered,
+            ),
+            AuditEvent::now(
+                AuditEventType::DurabilityCircuitRecovered,
+                "a",
+                Outcome::Recovered,
+            ),
+            AuditEvent::now(
+                AuditEventType::DurabilityCheckpointSaved,
+                "a",
+                Outcome::Success,
+            ),
             AuditEvent::now(AuditEventType::DurabilityDlqReplayed, "a", Outcome::Success),
         ];
         for ev in events {
@@ -994,19 +1058,23 @@ mod tests {
 
     #[test]
     fn test_proactive_quadrant_serialises() {
-        let ev = AuditEvent::now(AuditEventType::ProactiveQuadrant, "agent-x", Outcome::Success)
-            .with_trigger_signal("proactive_gate_calibration")
-            .with_metadata(serde_json::json!({
-                "correct_detection": 3,
-                "false_alarm": 1,
-                "missed_need": 0,
-                "non_response": 2,
-                "correct_silence": 5,
-                "unknown": 0,
-                "fa_rate": 0.25,
-                "mn_rate": null,
-                "lookback_secs": 86400
-            }));
+        let ev = AuditEvent::now(
+            AuditEventType::ProactiveQuadrant,
+            "agent-x",
+            Outcome::Success,
+        )
+        .with_trigger_signal("proactive_gate_calibration")
+        .with_metadata(serde_json::json!({
+            "correct_detection": 3,
+            "false_alarm": 1,
+            "missed_need": 0,
+            "non_response": 2,
+            "correct_silence": 5,
+            "unknown": 0,
+            "fa_rate": 0.25,
+            "mn_rate": null,
+            "lookback_secs": 86400
+        }));
         let json = serde_json::to_string(&ev).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["event_type"], "proactive_quadrant");

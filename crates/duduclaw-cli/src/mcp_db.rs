@@ -54,11 +54,17 @@ fn db_error(msg: &str) -> Value {
 ///
 /// Fail-closed: an invalid agent id, a missing file, or malformed TOML all
 /// yield an empty list, which denies everything.
+///
+/// The directory comes from [`crate::mcp::caller_agent_dir`], not a bare
+/// `agents/<id>` join: a team role member is an `eph-*` agent scaffolded at
+/// `<home>/agents/.ephemeral/<id>/`, so the bare join read a non-existent
+/// `agent.toml` and denied every source it had actually been granted. A
+/// non-`eph-` id resolves byte-identically to the old join.
 fn granted_sources(home_dir: &Path, agent_id: &str) -> Vec<String> {
     if !duduclaw_core::is_valid_agent_id(agent_id) {
         return Vec::new();
     }
-    let agent_dir = home_dir.join("agents").join(agent_id);
+    let agent_dir = crate::mcp::caller_agent_dir(home_dir, agent_id);
     duduclaw_core::agent_toml::load(&agent_dir)
         .capabilities
         .db_sources
@@ -82,10 +88,7 @@ async fn resolve_granted(
     }
     let grants = granted_sources(home_dir, agent_id);
     // Exact, trimmed, ASCII-case-insensitive — never substring.
-    if !grants
-        .iter()
-        .any(|g| g.trim().eq_ignore_ascii_case(source))
-    {
+    if !grants.iter().any(|g| g.trim().eq_ignore_ascii_case(source)) {
         return Err(format!(
             "此代理沒有資料來源「{source}」的授權。已授權的來源：{}。\
              如需開通，有三條合法途徑：① 儀表板 設定 → 去識別化 → 資料來源精靈第 4 步「授權 AI 員工」；\
@@ -179,7 +182,10 @@ pub async fn handle_db_sources(home_dir: &Path, agent_id: &str) -> Value {
 // ── db_tables ───────────────────────────────────────────────────────────────
 
 pub async fn handle_db_tables(arguments: &Value, home_dir: &Path, agent_id: &str) -> Value {
-    let source = arguments.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let source = arguments
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let entry = match resolve_granted(home_dir, agent_id, source).await {
         Ok(e) => e,
         Err(msg) => return db_error(&msg),
@@ -210,7 +216,10 @@ pub async fn handle_db_tables(arguments: &Value, home_dir: &Path, agent_id: &str
                 "db_tables",
                 &format!("source={}", entry.name),
                 true,
-                &[("db_source", json!(entry.name)), ("tables", json!(tables.len()))],
+                &[
+                    ("db_source", json!(entry.name)),
+                    ("tables", json!(tables.len())),
+                ],
             );
             db_json(&payload)
         }
@@ -221,7 +230,10 @@ pub async fn handle_db_tables(arguments: &Value, home_dir: &Path, agent_id: &str
 // ── db_select ───────────────────────────────────────────────────────────────
 
 pub async fn handle_db_select(arguments: &Value, home_dir: &Path, agent_id: &str) -> Value {
-    let source = arguments.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let source = arguments
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let entry = match resolve_granted(home_dir, agent_id, source).await {
         Ok(e) => e,
         Err(msg) => return db_error(&msg),
@@ -270,7 +282,9 @@ pub async fn handle_db_select(arguments: &Value, home_dir: &Path, agent_id: &str
         "source={} table={table} filters={} limit={}",
         entry.name,
         req.filter.len(),
-        req.limit.map(|v| v.to_string()).unwrap_or_else(|| "default".into())
+        req.limit
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "default".into())
     );
     match result {
         Ok(out) => {
@@ -306,7 +320,10 @@ pub async fn handle_db_select(arguments: &Value, home_dir: &Path, agent_id: &str
 // ── db_query ────────────────────────────────────────────────────────────────
 
 pub async fn handle_db_query(arguments: &Value, home_dir: &Path, agent_id: &str) -> Value {
-    let source = arguments.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let source = arguments
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let entry = match resolve_granted(home_dir, agent_id, source).await {
         Ok(e) => e,
         Err(msg) => return db_error(&msg),
@@ -440,9 +457,10 @@ fn parse_filters(value: Option<&Value>) -> Result<Vec<Filter>, String> {
     if v.is_null() {
         return Ok(Vec::new());
     }
-    let arr = v
-        .as_array()
-        .ok_or_else(|| "filter 必須是陣列，例如 [{\"column\":\"name\",\"op\":\"=\",\"value\":\"王小明\"}]".to_string())?;
+    let arr = v.as_array().ok_or_else(|| {
+        "filter 必須是陣列，例如 [{\"column\":\"name\",\"op\":\"=\",\"value\":\"王小明\"}]"
+            .to_string()
+    })?;
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let obj = item
@@ -512,8 +530,10 @@ mod tests {
     #[test]
     fn filters_reject_unknown_operators_and_bad_shapes() {
         assert!(
-            parse_filters(Some(&json!([{ "column": "a", "op": "; DROP", "value": 1 }])))
-                .is_err()
+            parse_filters(Some(
+                &json!([{ "column": "a", "op": "; DROP", "value": 1 }])
+            ))
+            .is_err()
         );
         assert!(parse_filters(Some(&json!([{ "op": "=", "value": 1 }]))).is_err());
         assert!(parse_filters(Some(&json!("not an array"))).is_err());
@@ -562,8 +582,11 @@ mod tests {
         .unwrap();
         let agent_dir = dir.path().join("agents").join("worker");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), "[capabilities]\ndb_sources = [\"crm\"]\n")
-            .unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ndb_sources = [\"crm\"]\n",
+        )
+        .unwrap();
 
         let err = resolve_granted(dir.path(), "worker", "payroll")
             .await
@@ -583,8 +606,11 @@ mod tests {
         .unwrap();
         let agent_dir = dir.path().join("agents").join("worker");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), "[capabilities]\ndb_sources = [\"crm\"]\n")
-            .unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ndb_sources = [\"crm\"]\n",
+        )
+        .unwrap();
 
         assert!(
             resolve_granted(dir.path(), "worker", "crm_payroll")
@@ -599,8 +625,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().join("agents").join("worker");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), "[capabilities]\ndb_sources = [\"crm\"]\n")
-            .unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ndb_sources = [\"crm\"]\n",
+        )
+        .unwrap();
 
         let err = resolve_granted(dir.path(), "worker", "crm")
             .await
@@ -618,8 +647,11 @@ mod tests {
         .unwrap();
         let agent_dir = dir.path().join("agents").join("worker");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), "[capabilities]\ndb_sources = [\"crm\"]\n")
-            .unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ndb_sources = [\"crm\"]\n",
+        )
+        .unwrap();
 
         let err = resolve_granted(dir.path(), "worker", "crm")
             .await
@@ -647,8 +679,11 @@ mod tests {
         .unwrap();
         let agent_dir = dir.path().join("agents").join("worker");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), "[capabilities]\ndb_sources = [\"crm\"]\n")
-            .unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ndb_sources = [\"crm\"]\n",
+        )
+        .unwrap();
 
         let out = handle_db_sources(dir.path(), "worker").await;
         let text = text_of(&out);
@@ -671,8 +706,11 @@ mod tests {
         .unwrap();
         let agent_dir = dir.path().join("agents").join("worker");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), "[capabilities]\ndb_sources = [\"crm\"]\n")
-            .unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ndb_sources = [\"crm\"]\n",
+        )
+        .unwrap();
 
         let out = handle_db_query(
             &json!({ "source": "crm", "sql": "SELECT 1" }),
@@ -701,8 +739,11 @@ mod tests {
         .unwrap();
         let agent_dir = dir.path().join("agents").join("worker");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), "[capabilities]\ndb_sources = [\"crm\"]\n")
-            .unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ndb_sources = [\"crm\"]\n",
+        )
+        .unwrap();
 
         let out = handle_db_query(
             &json!({ "source": "crm", "sql": "SELECT 1" }),
@@ -711,7 +752,10 @@ mod tests {
         )
         .await;
         let text = text_of(&out);
-        assert!(!text.contains("設有資料表白名單"), "gate must not fire: {text}");
+        assert!(
+            !text.contains("設有資料表白名單"),
+            "gate must not fire: {text}"
+        );
         assert!(text.contains("never-created.sqlite"), "{text}");
     }
 
@@ -727,8 +771,11 @@ mod tests {
         .unwrap();
         let agent_dir = dir.path().join("agents").join("worker");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"), "[capabilities]\ndb_sources = [\"crm\"]\n")
-            .unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ndb_sources = [\"crm\"]\n",
+        )
+        .unwrap();
 
         let out = handle_db_select(
             &json!({ "source": "crm", "table": "customers" }),
@@ -753,7 +800,52 @@ mod tests {
     #[tokio::test]
     async fn missing_source_argument_is_explained() {
         let dir = tempfile::tempdir().unwrap();
-        let err = resolve_granted(dir.path(), "worker", "  ").await.unwrap_err();
+        let err = resolve_granted(dir.path(), "worker", "  ")
+            .await
+            .unwrap_err();
         assert!(err.contains("source"), "{err}");
+    }
+
+    /// Regression (2026-09-28 audit, debt #9 same-family): an `eph-*` team
+    /// role member is scaffolded at `<home>/agents/.ephemeral/<id>/`. Reading
+    /// the bare `agents/<id>` path found no `agent.toml` and so denied every
+    /// `db_sources` grant the scaffold actually carried.
+    #[test]
+    fn eph_caller_db_grants_resolve_inside_the_ephemeral_scaffold() {
+        let home = tempfile::tempdir().unwrap();
+        let eph = "eph-agnes-r1-executor-ab12";
+        let scaffold = home
+            .path()
+            .join("agents")
+            .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+            .join(eph);
+        std::fs::create_dir_all(&scaffold).unwrap();
+        std::fs::write(
+            scaffold.join("agent.toml"),
+            "[capabilities]\ndb_sources = [\"crm\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(granted_sources(home.path(), eph), vec!["crm".to_string()]);
+        // …and nothing was minted in the registry on the way there.
+        assert!(!home.path().join("agents").join(eph).exists());
+    }
+
+    /// The companion half: an ordinary registry id keeps reading
+    /// `<home>/agents/<id>/agent.toml`, byte-identical to the pre-fix join.
+    #[test]
+    fn ordinary_caller_db_grants_still_read_the_registry_path() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents").join("agnes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            "[capabilities]\ndb_sources = [\"payroll\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            granted_sources(home.path(), "agnes"),
+            vec!["payroll".to_string()]
+        );
     }
 }

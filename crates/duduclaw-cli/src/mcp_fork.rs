@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use duduclaw_fork::store::{BranchRow, ForkRow, ForkStore};
 
@@ -185,7 +185,9 @@ fn require_enabled(settings: &ForkSettings) -> Option<Value> {
     if settings.enabled {
         None
     } else {
-        Some(err("forking is disabled for this agent (set [fork] enabled = true in agent.toml)"))
+        Some(err(
+            "forking is disabled for this agent (set [fork] enabled = true in agent.toml)",
+        ))
     }
 }
 
@@ -238,7 +240,11 @@ pub async fn handle_fork_run(args: &Value, home_dir: &Path, agent_id: &str) -> V
     let strategies: Vec<String> = args
         .get("strategies")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     let requested = args
         .get("n")
@@ -264,7 +270,11 @@ pub async fn handle_fork_run(args: &Value, home_dir: &Path, agent_id: &str) -> V
         tracing::info!(
             "fork_run: capped branches {requested} -> {n} (max_branches={}, accounts={})",
             settings.max_branches,
-            if account_cap == usize::MAX { settings.max_branches } else { account_cap }
+            if account_cap == usize::MAX {
+                settings.max_branches
+            } else {
+                account_cap
+            }
         );
     }
 
@@ -467,7 +477,10 @@ pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &st
         Some(f) => f.to_string(),
         None => return err("fork_id is required"),
     };
-    let explicit = args.get("branch_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let explicit = args
+        .get("branch_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let fork = match store.get_fork(&fork_id) {
         Ok(Some(f)) => f,
@@ -487,7 +500,9 @@ pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &st
             id
         }
         None => {
-            return err("automatic judge selection runs during fork execution; pass branch_id to select explicitly here");
+            return err(
+                "automatic judge selection runs during fork execution; pass branch_id to select explicitly here",
+            );
         }
     };
 
@@ -524,7 +539,13 @@ pub async fn handle_terminate_branch(args: &Value, home_dir: &Path, agent_id: &s
     // Signal the executor to skip the branch if it hasn't started yet (a running
     // subprocess is killed on task drop / shutdown via kill_on_drop).
     crate::mcp_fork_exec::request_cancel(&branch_id);
-    match store.update_branch(&branch_id, "terminated", current.spent_usd, &current.output, current.test_exit_code) {
+    match store.update_branch(
+        &branch_id,
+        "terminated",
+        current.spent_usd,
+        &current.output,
+        current.test_exit_code,
+    ) {
         Ok(true) => ok(format!("branch {branch_id} terminated")),
         Ok(false) => err(format!("branch not found in fork: {branch_id}")),
         Err(e) => err(format!("store error: {e}")),
@@ -619,7 +640,8 @@ test_timeout_s = 60
 
     #[test]
     fn parse_rejects_invalid_values_failsafe() {
-        let s = parse_fork_settings("[fork]\nenabled=true\nmax_branches=0\ndefault_budget_usd=-1.0\n");
+        let s =
+            parse_fork_settings("[fork]\nenabled=true\nmax_branches=0\ndefault_budget_usd=-1.0\n");
         // invalid max_branches/budget fall back to defaults, enabled honored
         assert!(s.enabled);
         assert_eq!(s.max_branches, 4);
@@ -641,21 +663,28 @@ test_timeout_s = 60
                 .fine_grained_judge
         );
         // Malformed value falls back to the default (false).
-        assert!(
-            !parse_fork_settings("[fork]\nfine_grained_judge=\"yes\"\n").fine_grained_judge
-        );
+        assert!(!parse_fork_settings("[fork]\nfine_grained_judge=\"yes\"\n").fine_grained_judge);
     }
 
     #[test]
     fn parse_judge_setting() {
         // Default: heuristic — byte-identical behavior for existing configs.
-        assert_eq!(parse_fork_settings("[fork]\nenabled=true\n").judge, "heuristic");
+        assert_eq!(
+            parse_fork_settings("[fork]\nenabled=true\n").judge,
+            "heuristic"
+        );
         assert_eq!(ForkSettings::default().judge, "heuristic");
         // Opt-in LLM judge parses (case/whitespace tolerant).
         assert_eq!(parse_fork_settings("[fork]\njudge=\"llm\"\n").judge, "llm");
-        assert_eq!(parse_fork_settings("[fork]\njudge=\" LLM \"\n").judge, "llm");
+        assert_eq!(
+            parse_fork_settings("[fork]\njudge=\" LLM \"\n").judge,
+            "llm"
+        );
         // Unknown / malformed values fall back to heuristic (fail-safe).
-        assert_eq!(parse_fork_settings("[fork]\njudge=\"gpt9\"\n").judge, "heuristic");
+        assert_eq!(
+            parse_fork_settings("[fork]\njudge=\"gpt9\"\n").judge,
+            "heuristic"
+        );
         assert_eq!(parse_fork_settings("[fork]\njudge=42\n").judge, "heuristic");
     }
 
@@ -694,8 +723,14 @@ test_timeout_s = 60
         let s = parse_fork_settings(
             "[fork]\nenabled=true\ndefault_budget_usd=1\naggregate_budget_usd=3\n",
         );
-        assert_eq!(s.default_budget_usd, 0.50, "integer literal ⇒ default (historical)");
-        assert_eq!(s.aggregate_budget_usd, 1.50, "integer literal ⇒ default (historical)");
+        assert_eq!(
+            s.default_budget_usd, 0.50,
+            "integer literal ⇒ default (historical)"
+        );
+        assert_eq!(
+            s.aggregate_budget_usd, 1.50,
+            "integer literal ⇒ default (historical)"
+        );
 
         // Float literals are honored, which is the documented way to write it.
         let s = parse_fork_settings(
@@ -738,10 +773,16 @@ test_timeout_s = 60
         let dir = home.path().join("agents").join("a1");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("agent.toml"), body).unwrap();
-        assert_eq!(load_fork_settings(home.path(), "a1"), parse_fork_settings(body));
+        assert_eq!(
+            load_fork_settings(home.path(), "a1"),
+            parse_fork_settings(body)
+        );
 
         // Unknown agent ⇒ defaults, never an error.
-        assert_eq!(load_fork_settings(home.path(), "nope"), ForkSettings::default());
+        assert_eq!(
+            load_fork_settings(home.path(), "nope"),
+            ForkSettings::default()
+        );
     }
 
     #[test]
@@ -813,7 +854,8 @@ test_timeout_s = 60
         let payload: Value = serde_json::from_str(&text(&run)).unwrap();
         let fork_id = payload["fork_id"].as_str().unwrap();
 
-        let inspect = handle_inspect_branches(&json!({"fork_id": fork_id}), home.path(), "a1").await;
+        let inspect =
+            handle_inspect_branches(&json!({"fork_id": fork_id}), home.path(), "a1").await;
         assert!(!is_error(&inspect));
         let ip: Value = serde_json::from_str(&text(&inspect)).unwrap();
         assert_eq!(ip["branches"].as_array().unwrap().len(), 2);
@@ -836,7 +878,10 @@ test_timeout_s = 60
         let run = handle_fork_run(&json!({"prompt": "x", "n": 2}), home.path(), "a1").await;
         let payload: Value = serde_json::from_str(&text(&run)).unwrap();
         let fork_id = payload["fork_id"].as_str().unwrap().to_string();
-        let winner = payload["branches"][0]["branch_id"].as_str().unwrap().to_string();
+        let winner = payload["branches"][0]["branch_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let m = handle_merge_or_select(
             &json!({"fork_id": fork_id, "branch_id": winner}),
@@ -872,7 +917,10 @@ test_timeout_s = 60
         let run = handle_fork_run(&json!({"prompt": "x", "n": 2}), home.path(), "a1").await;
         let payload: Value = serde_json::from_str(&text(&run)).unwrap();
         let fork_id = payload["fork_id"].as_str().unwrap().to_string();
-        let bid = payload["branches"][0]["branch_id"].as_str().unwrap().to_string();
+        let bid = payload["branches"][0]["branch_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let t = handle_terminate_branch(
             &json!({"fork_id": fork_id, "branch_id": bid}),
@@ -882,7 +930,8 @@ test_timeout_s = 60
         .await;
         assert!(!is_error(&t));
 
-        let inspect = handle_inspect_branches(&json!({"fork_id": fork_id}), home.path(), "a1").await;
+        let inspect =
+            handle_inspect_branches(&json!({"fork_id": fork_id}), home.path(), "a1").await;
         let ip: Value = serde_json::from_str(&text(&inspect)).unwrap();
         let states: Vec<&str> = ip["branches"]
             .as_array()
@@ -899,7 +948,12 @@ test_timeout_s = 60
         let run = handle_fork_run(&json!({"prompt": "x", "n": 2}), home.path(), "a1").await;
         let payload: Value = serde_json::from_str(&text(&run)).unwrap();
         let fork_id = payload["fork_id"].as_str().unwrap().to_string();
-        let v = handle_diff_branches(&json!({"fork_id": fork_id, "branch_a": "x"}), home.path(), "a1").await;
+        let v = handle_diff_branches(
+            &json!({"fork_id": fork_id, "branch_a": "x"}),
+            home.path(),
+            "a1",
+        )
+        .await;
         assert!(is_error(&v)); // branch_b missing
     }
 }

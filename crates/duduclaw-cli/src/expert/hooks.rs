@@ -88,8 +88,8 @@ fn build_summary(slug: &str, hooks_dir: &Path, files: &[String]) -> String {
     );
     for rel in files {
         let content = std::fs::read_to_string(hooks_dir.join(rel)).unwrap_or_default();
-        let excerpt = duduclaw_core::truncate_chars(content.trim(), HOOK_EXCERPT_CHARS)
-            .replace('\n', " ⏎ ");
+        let excerpt =
+            duduclaw_core::truncate_chars(content.trim(), HOOK_EXCERPT_CHARS).replace('\n', " ⏎ ");
         out.push_str(&format!("\n- {rel}: {excerpt}"));
     }
     out
@@ -193,7 +193,13 @@ pub(super) async fn import_hooks(
     });
     let approval_id = match ApprovalBroker::open(&ctx.home) {
         Ok(broker) => match broker
-            .request(slug, HOOKS_ACTION_KIND, &summary, payload, HOOKS_APPROVAL_TTL_SECS)
+            .request(
+                slug,
+                HOOKS_ACTION_KIND,
+                &summary,
+                payload,
+                HOOKS_APPROVAL_TTL_SECS,
+            )
             .await
         {
             Ok(id) => Some(id.to_string()),
@@ -203,7 +209,11 @@ pub(super) async fn import_hooks(
             }
         },
         Err(e) => {
-            report.warning("hooks", slug, format!("開啟 approvals.db 失敗（維持停用）: {e}"));
+            report.warning(
+                "hooks",
+                slug,
+                format!("開啟 approvals.db 失敗（維持停用）: {e}"),
+            );
             None
         }
     };

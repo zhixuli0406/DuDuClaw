@@ -86,7 +86,10 @@ mod tests {
         assert_eq!(filter_agent_id(None), None);
         assert_eq!(filter_agent_id(Some("".to_string())), None);
         assert_eq!(filter_agent_id(Some("  ".to_string())), None);
-        assert_eq!(filter_agent_id(Some(" ceo ".to_string())), Some("ceo".to_string()));
+        assert_eq!(
+            filter_agent_id(Some(" ceo ".to_string())),
+            Some("ceo".to_string())
+        );
     }
 
     /// Pure stand-in for the env-reading half of [`caller_agent_id`], so the
@@ -102,7 +105,12 @@ mod tests {
         // circuit to Ok without ever touching a broker/home_dir, so an
         // intentionally-invalid path is safe to pass.
         assert!(std::env::var(duduclaw_core::ENV_AGENT_ID).is_err());
-        let result = gate(Path::new("/nonexistent/path/should/never/be/touched"), "test", "test_tool").await;
+        let result = gate(
+            Path::new("/nonexistent/path/should/never/be/touched"),
+            "test",
+            "test_tool",
+        )
+        .await;
         assert!(result.is_ok(), "{result:?}");
     }
 }

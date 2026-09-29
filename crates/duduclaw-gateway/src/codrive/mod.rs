@@ -89,20 +89,18 @@ mod tests_mode;
 #[cfg(all(test, unix))]
 mod live_tests;
 
-pub use atspi_locate::{locate as atspi_locate_dispatch, LocateOutcome as AtspiLocateOutcome};
+pub use atspi_locate::{LocateOutcome as AtspiLocateOutcome, locate as atspi_locate_dispatch};
 pub use client::{
     CodriveAck, CodriveButton, CodriveButtonState, CodriveClient, CodriveClientError, CodriveCmd,
     CodriveEvent,
 };
 pub use config::CodriveConfig;
 pub use driver::{CodriveRunReport, CodriveStepReport, run_script};
+pub use identity::{RunIdentityError, resolve_run_identity};
 pub use mode::{CodriveDrivingMode, CodriveHandoverReason};
-pub use status::{
-    query_status as query_codrive_status, CodriveDrivingState, CodriveStatusReport,
-};
-pub use identity::{resolve_run_identity, RunIdentityError};
-pub use registry::{dispatch as registry_dispatch, DispatchOutcome as RegistryDispatchOutcome};
+pub use registry::{DispatchOutcome as RegistryDispatchOutcome, dispatch as registry_dispatch};
 pub use script::{
     ApiActionRequest, CodriveAction, CodriveConsequential, CodriveHighlight, CodriveScript,
     CodriveStep, ConsequentialClass, LocateRequest,
 };
+pub use status::{CodriveDrivingState, CodriveStatusReport, query_status as query_codrive_status};

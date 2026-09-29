@@ -17,11 +17,11 @@
 //!              └── append wiki_trust_history row (Phase 5 audit)
 //! ```
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -124,7 +124,10 @@ impl TrustStoreConfig {
             {
                 cfg.verified_fact_negative_resistance = (v as f32).clamp(0.0, 1.0);
             }
-            if let Some(v) = s.get("max_active_conversations").and_then(|v| v.as_integer()) {
+            if let Some(v) = s
+                .get("max_active_conversations")
+                .and_then(|v| v.as_integer())
+            {
                 cfg.max_active_conversations = v.clamp(16, 1_000_000) as usize;
             }
         }
@@ -242,6 +245,7 @@ pub struct TrustUpdateOutcome {
 pub struct WikiTrustStore {
     conn: Arc<Mutex<Connection>>,
     config: TrustStoreConfig,
+    db_path: Option<PathBuf>,
     /// v1.10: advisory exclusive lock on a sentinel file next to the DB.
     /// `Arc` so cloned `WikiTrustStore` instances share the lock; the file
     /// handle is held for the entire lifetime of the store. Dropped at
@@ -258,10 +262,13 @@ impl WikiTrustStore {
 
     pub fn open_with_config(path: impl AsRef<Path>, config: TrustStoreConfig) -> Result<Self> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| DuDuClawError::Memory(format!("create trust db dir: {e}")))?;
-        }
+        let home = path.parent()
+            .ok_or_else(|| DuDuClawError::Memory("trust db path has no home directory".into()))?;
+        std::fs::create_dir_all(home)
+            .map_err(|e| DuDuClawError::Memory(format!("create trust db dir: {e}")))?;
+        // Home-level: the probe and any schema migration affect every agent's
+        // trust rows at once, so they are not attributable to one Wiki root.
+        let fence = crate::wiki_fence::WikiDeliveryFence::for_trust_home(home);
 
         // v1.10: acquire advisory exclusive lock on sentinel file. SQLite
         // WAL handles concurrent readers + 1 writer within a single process,
@@ -270,30 +277,146 @@ impl WikiTrustStore {
         // a clear message so operators know to fix their deployment.
         let lock_file = Self::acquire_advisory_lock(path)?;
 
+        // Probe with a read-only connection while holding a shared delivery
+        // lease. A fully initialized DB needs no schema write on reopen, so
+        // it remains available while another reader delivers a Wiki source.
+        let ready = {
+            let _read_lease =
+                fence.lock_shared_with_timeout(crate::wiki_fence::OPEN_FENCE_WAIT)?;
+            Self::schema_ready(path)?
+        };
+        // Initialization and migrations still require the writer fence. Its
+        // epoch advances before the first possible schema or row mutation.
+        // The wait is deliberately short: opening is a startup-shaped path
+        // whose caller can retry, and a migration must not sit behind an
+        // in-flight delivery read for the full write budget.
+        let _opening_fence = if ready {
+            None
+        } else {
+            Some(fence.lock_exclusive_with_timeout(crate::wiki_fence::OPEN_FENCE_WAIT)?)
+        };
+
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
+                | if ready { OpenFlags::empty() } else { OpenFlags::SQLITE_OPEN_CREATE }
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| DuDuClawError::Memory(format!("open trust db {}: {e}", path.display())))?;
 
-        // WAL mode, busy_timeout 5s — these settings are important for the
-        // many-writer scenario when prediction errors fire from background tasks.
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| DuDuClawError::Memory(format!("enable WAL: {e}")))?;
-        conn.pragma_update(None, "busy_timeout", 5000)
+        conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| DuDuClawError::Memory(format!("busy_timeout: {e}")))?;
+        if !ready {
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(|e| DuDuClawError::Memory(format!("enable WAL: {e}")))?;
+        }
+        // Per-connection setting: safe on a completed schema reopen and
+        // needed to retain the previous WAL writer performance profile.
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| DuDuClawError::Memory(format!("synchronous: {e}")))?;
+        if !ready {
+            Self::ensure_schema(&conn)?;
+        }
 
-        Self::ensure_schema(&conn)?;
+        let canonical_path = path.canonicalize().map_err(|e| {
+            DuDuClawError::Memory(format!(
+                "canonicalize trust db {} for delivery fence: {e}",
+                path.display()
+            ))
+        })?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             config,
+            db_path: Some(canonical_path),
             lock_file: Some(Arc::new(lock_file)),
         })
+    }
+
+    /// A conservative read-only schema probe. Missing or old objects select
+    /// the migration path; malformed databases fail without attempting DDL.
+    fn schema_ready(path: &Path) -> Result<bool> {
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(DuDuClawError::Memory(format!("stat trust db {}: {e}", path.display()))),
+            Ok(meta) if !meta.is_file() => return Err(DuDuClawError::Memory("trust db is not a regular file".into())),
+            Ok(_) => {}
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ).map_err(|e| DuDuClawError::Memory(format!("probe trust db {}: {e}", path.display())))?;
+        let journal: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(|e| DuDuClawError::Memory(format!("probe trust db journal: {e}")))?;
+        if !journal.eq_ignore_ascii_case("wal") {
+            return Ok(false);
+        }
+        for (kind, name) in [
+            ("table", "wiki_trust_state"),
+            ("table", "wiki_trust_history"),
+            ("table", "wiki_trust_rate"),
+            ("table", "wiki_trust_conv_cap"),
+            ("table", "wiki_trust_meta"),
+            ("table", "wiki_trust_ccr_revisions"),
+            ("index", "idx_wiki_trust_agent"),
+            ("index", "idx_wiki_trust_agent_trust"),
+            ("index", "idx_wiki_trust_archived"),
+            ("index", "idx_wiki_trust_history_page"),
+            ("index", "idx_wiki_trust_history_ts"),
+            ("index", "idx_wiki_trust_history_agent_kind_ts"),
+            ("trigger", "wiki_trust_ccr_after_insert"),
+            ("trigger", "wiki_trust_ccr_after_update"),
+            ("trigger", "wiki_trust_ccr_after_delete"),
+        ] {
+            let exists = conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |_| Ok(()),
+            ).optional().map_err(|e| DuDuClawError::Memory(format!("probe trust schema {name}: {e}")))?;
+            if exists.is_none() {
+                return Ok(false);
+            }
+        }
+        for (table, column) in [
+            ("wiki_trust_state", "last_correction_at"),
+            ("wiki_trust_state", "archive_due_at"),
+            ("wiki_trust_conv_cap", "cap_budget_id"),
+        ] {
+            let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))
+                .map_err(|e| DuDuClawError::Memory(format!("probe trust column {table}: {e}")))?;
+            let mut rows = statement.query([])
+                .map_err(|e| DuDuClawError::Memory(format!("probe trust column {table}: {e}")))?;
+            let mut found = false;
+            while let Some(row) = rows.next()
+                .map_err(|e| DuDuClawError::Memory(format!("probe trust column {table}: {e}")))? {
+                if row.get::<_, String>(1).map_err(|e| DuDuClawError::Memory(format!("probe trust column {table}: {e}")))? == column {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Ok(false);
+            }
+        }
+        for (key, value) in [
+            ("ccr_revision_trigger_v1", "1"),
+            ("conv_cap_abs_migration_done", "1"),
+        ] {
+            let found: Option<String> = conn.query_row(
+                "SELECT value FROM wiki_trust_meta WHERE key=?1",
+                [key],
+                |row| row.get(0),
+            ).optional().map_err(|e| DuDuClawError::Memory(format!("probe trust meta {key}: {e}")))?;
+            if found.as_deref() != Some(value) {
+                return Ok(false);
+            }
+        }
+        let incarnation: Option<String> = conn.query_row(
+            "SELECT value FROM wiki_trust_meta WHERE key='ccr_db_incarnation_v1'",
+            [],
+            |row| row.get(0),
+        ).optional().map_err(|e| DuDuClawError::Memory(format!("probe trust incarnation: {e}")))?;
+        Ok(incarnation.as_deref().is_some_and(|value| !value.is_empty()))
     }
 
     /// Acquire an advisory exclusive lock on `<path>.lock` so a second
@@ -340,16 +463,113 @@ impl WikiTrustStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             config,
+            db_path: None,
             lock_file: None,
         })
+    }
+
+    /// Check whether this process-wide handle belongs to an exact on-disk
+    /// trust database before reusing it for a causal source scope.
+    pub fn is_backed_by(&self, path: &Path) -> bool {
+        self.db_path
+            .as_ref()
+            .is_some_and(|owned| path.canonicalize().ok().as_ref() == Some(owned))
+    }
+
+    /// Return the home-level delivery fence for an on-disk trust store. An
+    /// in-memory store has no shared filesystem state and returns `None`.
+    ///
+    /// W2-B: this is the fence for trust writes that cannot be attributed to
+    /// a single Wiki root (`meta_set`, retention pruning, raw connection
+    /// access) and for the open probe / schema migration. Row writes that
+    /// *can* be attributed take the Wiki root fence instead — see
+    /// [`Self::page_fence`].
+    pub fn delivery_fence(&self) -> Option<crate::wiki_fence::WikiDeliveryFence> {
+        self.trust_home()
+            .map(crate::wiki_fence::WikiDeliveryFence::for_trust_home)
+    }
+
+    /// Directory that owns `wiki_trust.db`; `None` for an in-memory store.
+    fn trust_home(&self) -> Option<&Path> {
+        self.db_path.as_deref().and_then(Path::parent)
+    }
+
+    /// Fence for the Wiki root that owns `agent_id`'s trust rows.
+    ///
+    /// An id that cannot name a directory falls back to the home fence: that
+    /// is the wider lock, never no lock at all.
+    fn page_fence(&self, agent_id: &str) -> Option<crate::wiki_fence::WikiDeliveryFence> {
+        let home = self.trust_home()?;
+        Some(if duduclaw_core::is_valid_agent_id(agent_id) {
+            crate::wiki_fence::WikiDeliveryFence::for_agent_wiki(home, agent_id)
+        } else {
+            crate::wiki_fence::WikiDeliveryFence::for_trust_home(home)
+        })
+    }
+
+    /// Exclusive guard over the Wiki root that owns one agent's rows.
+    fn page_mutation_guard(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<crate::wiki_fence::WikiMutationGuard>> {
+        self.page_mutation_guard_with_wait(agent_id, crate::wiki_fence::WRITE_FENCE_WAIT)
+    }
+
+    fn page_mutation_guard_with_wait(
+        &self,
+        agent_id: &str,
+        wait: std::time::Duration,
+    ) -> Result<Option<crate::wiki_fence::WikiMutationGuard>> {
+        self.page_fence(agent_id)
+            .map(|fence| fence.lock_exclusive_with_timeout(wait).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Exclusive guard over the trust home, for writes with no single owning
+    /// Wiki root.
+    fn home_mutation_guard(&self) -> Result<Option<crate::wiki_fence::WikiMutationGuard>> {
+        self.delivery_fence()
+            .map(|fence| fence.exclusive_for_write())
+            .transpose()
+    }
+
+    /// Guards for every Wiki root touched by a multi-row write, one per
+    /// directory. Acquired in sorted path order and deduplicated so two
+    /// concurrent batches can never take the same pair in opposite orders.
+    fn grouped_mutation_guards<'a>(
+        &self,
+        agent_ids: impl Iterator<Item = &'a str>,
+    ) -> Result<Vec<crate::wiki_fence::WikiMutationGuard>> {
+        if self.trust_home().is_none() {
+            return Ok(Vec::new());
+        }
+        let mut scopes: Vec<PathBuf> = agent_ids
+            .filter_map(|agent_id| self.page_fence(agent_id))
+            .map(|fence| fence.home_dir().to_path_buf())
+            .collect();
+        scopes.sort();
+        scopes.dedup();
+        let mut guards = Vec::with_capacity(scopes.len());
+        for scope in scopes {
+            guards.push(
+                crate::wiki_fence::WikiDeliveryFence::new(scope).exclusive_for_write()?,
+            );
+        }
+        Ok(guards)
     }
 
     fn ensure_schema(conn: &Connection) -> Result<()> {
         // Best-effort column migration for existing v1 DBs. Errors are
         // ignored — if the column already exists, SQLite returns "duplicate
         // column" which we want to swallow.
-        let _ = conn.execute("ALTER TABLE wiki_trust_state ADD COLUMN last_correction_at TEXT", []);
-        let _ = conn.execute("ALTER TABLE wiki_trust_state ADD COLUMN archive_due_at TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE wiki_trust_state ADD COLUMN last_correction_at TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE wiki_trust_state ADD COLUMN archive_due_at TEXT",
+            [],
+        );
 
         conn.execute_batch(
             r#"
@@ -436,6 +656,55 @@ impl WikiTrustStore {
         )
         .map_err(|e| DuDuClawError::Memory(format!("trust db schema: {e}")))?;
 
+        // CCR bindings must not revive when an ACL/trust row is changed and
+        // restored inside the same SQLite `datetime('now')` second. Install
+        // durable per-page generations in one writer transaction before any
+        // Wiki MCP verifier can bind a source. The triggers cover writes from
+        // this API and direct SQLite INSERT/UPDATE/DELETE after installation.
+        // Keep generations after deletion so reinsertion cannot reuse one.
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS wiki_trust_ccr_revisions (
+                 page_path TEXT NOT NULL, agent_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision > 0 AND typeof(revision)='integer'),
+                 PRIMARY KEY(page_path,agent_id)
+             );
+             INSERT OR IGNORE INTO wiki_trust_ccr_revisions(page_path,agent_id,revision)
+                 SELECT page_path,agent_id,1 FROM wiki_trust_state;
+             CREATE TRIGGER IF NOT EXISTS wiki_trust_ccr_after_insert
+             AFTER INSERT ON wiki_trust_state BEGIN
+                 INSERT INTO wiki_trust_ccr_revisions(page_path,agent_id,revision)
+                     VALUES(NEW.page_path,NEW.agent_id,1)
+                     ON CONFLICT(page_path,agent_id)
+                     DO UPDATE SET revision=revision+1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS wiki_trust_ccr_after_update
+             AFTER UPDATE ON wiki_trust_state BEGIN
+                 INSERT INTO wiki_trust_ccr_revisions(page_path,agent_id,revision)
+                     VALUES(OLD.page_path,OLD.agent_id,1)
+                     ON CONFLICT(page_path,agent_id)
+                     DO UPDATE SET revision=revision+1;
+                 INSERT INTO wiki_trust_ccr_revisions(page_path,agent_id,revision)
+                     VALUES(NEW.page_path,NEW.agent_id,1)
+                     ON CONFLICT(page_path,agent_id)
+                     DO UPDATE SET revision=revision+1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS wiki_trust_ccr_after_delete
+             AFTER DELETE ON wiki_trust_state BEGIN
+                 INSERT INTO wiki_trust_ccr_revisions(page_path,agent_id,revision)
+                     VALUES(OLD.page_path,OLD.agent_id,1)
+                     ON CONFLICT(page_path,agent_id)
+                     DO UPDATE SET revision=revision+1;
+             END;
+             INSERT INTO wiki_trust_meta(key,value)
+                 VALUES('ccr_revision_trigger_v1','1')
+                 ON CONFLICT(key) DO UPDATE SET value='1';
+             INSERT OR IGNORE INTO wiki_trust_meta(key,value)
+                 VALUES('ccr_db_incarnation_v1',lower(hex(randomblob(16))));
+             COMMIT;",
+        )
+        .map_err(|e| DuDuClawError::Memory(format!("trust CCR revisions: {e}")))?;
+
         // R2 data migrations — idempotent on fresh DBs.
         // 1. conv_cap was previously stored signed; ABS-fix the existing rows
         //    so the cap stays accurate after upgrade (review DB Item 5).
@@ -497,7 +766,10 @@ impl WikiTrustStore {
 
     /// Read a meta value by key. Returns `None` if missing.
     pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
         match conn.query_row(
             "SELECT value FROM wiki_trust_meta WHERE key = ?1",
             params![key],
@@ -511,7 +783,11 @@ impl WikiTrustStore {
 
     /// Upsert a meta value by key.
     pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
+        let _fence = self.home_mutation_guard()?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
         conn.execute(
             "INSERT INTO wiki_trust_meta(key, value) VALUES(?1, ?2)
              ON CONFLICT(key) DO UPDATE SET
@@ -526,7 +802,10 @@ impl WikiTrustStore {
     // ── Read ────────────────────────────────────────────────────
 
     pub fn get(&self, page_path: &str, agent_id: &str) -> Result<Option<WikiTrustSnapshot>> {
-        let conn = self.conn.lock().map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
         let row = conn
             .query_row(
                 "SELECT page_path, agent_id, trust, citation_count, error_signal_count,
@@ -553,7 +832,10 @@ impl WikiTrustStore {
         max_trust: f32,
         limit: usize,
     ) -> Result<Vec<WikiTrustSnapshot>> {
-        let conn = self.conn.lock().map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT page_path, agent_id, trust, citation_count, error_signal_count,
@@ -617,8 +899,14 @@ impl WikiTrustStore {
         if page_paths.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
-        let placeholders = std::iter::repeat("?").take(page_paths.len()).collect::<Vec<_>>().join(",");
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
+        let placeholders = std::iter::repeat("?")
+            .take(page_paths.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "SELECT page_path, agent_id, trust, citation_count, error_signal_count,
                     success_signal_count, last_signal_at, last_verified, do_not_inject,
@@ -656,7 +944,11 @@ impl WikiTrustStore {
     /// Increment citation_count for a page (no trust change).
     /// Used at retrieval time to track exposure independently of feedback.
     pub fn record_citation(&self, page_path: &str, agent_id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
+        let _fence = self.page_mutation_guard(agent_id)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
         let default_trust = self.config.default_trust as f64;
         conn.execute(
             "INSERT INTO wiki_trust_state(page_path, agent_id, trust, citation_count, updated_at)
@@ -688,6 +980,7 @@ impl WikiTrustStore {
         if !signal.is_actionable() {
             return Ok(UpsertResult::SkippedNeutral);
         }
+        let _fence = self.page_mutation_guard(agent_id)?;
         let mut conn = self
             .conn
             .lock()
@@ -699,7 +992,12 @@ impl WikiTrustStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| DuDuClawError::Memory(format!("trust txn begin: {e}")))?;
         let result = self.upsert_signal_in_tx(
-            &tx, page_path, agent_id, signal, conversation_id, composite_error,
+            &tx,
+            page_path,
+            agent_id,
+            signal,
+            conversation_id,
+            composite_error,
         )?;
         tx.commit()
             .map_err(|e| DuDuClawError::Memory(format!("trust txn commit: {e}")))?;
@@ -766,14 +1064,16 @@ impl WikiTrustStore {
                  FROM wiki_trust_state
                  WHERE page_path = ?1 AND agent_id = ?2",
                 params![page_path, agent_id],
-                |r| Ok((
-                    r.get::<_, f64>(0)? as f32,
-                    r.get::<_, i64>(1)? as u32,
-                    r.get::<_, i64>(2)? as u32,
-                    r.get::<_, i64>(3)? as u32,
-                    r.get::<_, i64>(4)? != 0,
-                    r.get::<_, i64>(5)? != 0,
-                )),
+                |r| {
+                    Ok((
+                        r.get::<_, f64>(0)? as f32,
+                        r.get::<_, i64>(1)? as u32,
+                        r.get::<_, i64>(2)? as u32,
+                        r.get::<_, i64>(3)? as u32,
+                        r.get::<_, i64>(4)? != 0,
+                        r.get::<_, i64>(5)? != 0,
+                    ))
+                },
             )
             .map(Some)
             .or_else(|e| match e {
@@ -781,14 +1081,8 @@ impl WikiTrustStore {
                 _ => Err(DuDuClawError::Memory(format!("trust read for upsert: {e}"))),
             })?;
 
-        let (
-            old_trust,
-            citation_count,
-            mut error_count,
-            mut success_count,
-            was_archived,
-            locked,
-        ) = current.unwrap_or((default_trust, 0, 0, 0, false, false));
+        let (old_trust, citation_count, mut error_count, mut success_count, was_archived, locked) =
+            current.unwrap_or((default_trust, 0, 0, 0, false, false));
 
         if locked {
             return Ok(UpsertResult::SkippedLocked);
@@ -956,6 +1250,31 @@ impl WikiTrustStore {
         do_not_inject: Option<bool>,
         reason: Option<&str>,
     ) -> Result<TrustUpdateOutcome> {
+        self.manual_set_with_wait(
+            page_path,
+            agent_id,
+            new_trust,
+            lock,
+            do_not_inject,
+            reason,
+            crate::wiki_fence::WRITE_FENCE_WAIT,
+        )
+    }
+
+    /// `manual_set` with an explicit fence wait. Only the fence tests need a
+    /// shorter budget than [`crate::wiki_fence::WRITE_FENCE_WAIT`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn manual_set_with_wait(
+        &self,
+        page_path: &str,
+        agent_id: &str,
+        new_trust: f32,
+        lock: bool,
+        do_not_inject: Option<bool>,
+        reason: Option<&str>,
+        fence_wait: std::time::Duration,
+    ) -> Result<TrustUpdateOutcome> {
+        let _fence = self.page_mutation_guard_with_wait(agent_id, fence_wait)?;
         let mut conn = self
             .conn
             .lock()
@@ -974,13 +1293,15 @@ impl WikiTrustStore {
                  FROM wiki_trust_state
                  WHERE page_path = ?1 AND agent_id = ?2",
                 params![page_path, agent_id],
-                |r| Ok((
-                    r.get::<_, f64>(0)? as f32,
-                    r.get::<_, i64>(1)? != 0,
-                    r.get::<_, i64>(2)? as u32,
-                    r.get::<_, i64>(3)? as u32,
-                    r.get::<_, i64>(4)? as u32,
-                )),
+                |r| {
+                    Ok((
+                        r.get::<_, f64>(0)? as f32,
+                        r.get::<_, i64>(1)? != 0,
+                        r.get::<_, i64>(2)? as u32,
+                        r.get::<_, i64>(3)? as u32,
+                        r.get::<_, i64>(4)? as u32,
+                    ))
+                },
             )
             .map(Some)
             .or_else(|e| match e {
@@ -1070,7 +1391,11 @@ impl WikiTrustStore {
 
     /// Mark `last_verified = now` — called after a successful audit / GVU pass.
     pub fn mark_verified(&self, page_path: &str, agent_id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
+        let _fence = self.page_mutation_guard(agent_id)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
         conn.execute(
             "UPDATE wiki_trust_state
              SET last_verified = datetime('now'), updated_at = datetime('now')
@@ -1092,6 +1417,7 @@ impl WikiTrustStore {
         keep_history_days: i64,
         max_rows_per_pass: i64,
     ) -> Result<(u64, u64, u64)> {
+        let _fence = self.home_mutation_guard()?;
         // Chunked DELETE that releases the in-process Mutex BETWEEN batches
         // (review CRITICAL R3-3 / HIGH-DB R2 Item 8). Previously the loop
         // held the same MutexGuard across all batches, so concurrent
@@ -1217,6 +1543,10 @@ impl WikiTrustStore {
         if signals.is_empty() {
             return Ok(Vec::new());
         }
+        // One guard per Wiki root touched by the batch (sorted, deduped).
+        let _fences = self.grouped_mutation_guards(
+            signals.iter().map(|(_, agent_id, ..)| agent_id.as_str()),
+        )?;
         let mut conn = self
             .conn
             .lock()
@@ -1238,14 +1568,7 @@ impl WikiTrustStore {
             }
             // Any error here drops the Tx via its Drop impl → automatic
             // rollback. Caller sees the error and an empty/short `out`.
-            let r = self.upsert_signal_in_tx(
-                &tx,
-                page,
-                agent,
-                *sig,
-                conv.as_deref(),
-                *err,
-            )?;
+            let r = self.upsert_signal_in_tx(&tx, page, agent, *sig, conv.as_deref(), *err)?;
             out.push(r);
         }
 
@@ -1322,6 +1645,7 @@ impl WikiTrustStore {
         agent_id: &str,
         recent_negative_count: u32,
     ) -> Result<()> {
+        let _fence = self.page_mutation_guard(agent_id)?;
         // (review HIGH R4 BUG-1) Wrap both writes in a single transaction so
         // a process crash between them can't leave `last_correction_at` set
         // (cooldown active) without a corresponding history row (audit
@@ -1405,6 +1729,7 @@ impl WikiTrustStore {
     where
         F: FnOnce(&Connection) -> Result<R>,
     {
+        let _fence = self.home_mutation_guard()?;
         let conn = self
             .conn
             .lock()
@@ -1421,6 +1746,7 @@ impl WikiTrustStore {
         agent_id: &str,
         days: i64,
     ) -> Result<()> {
+        let _fence = self.page_mutation_guard(agent_id)?;
         let conn = self
             .conn
             .lock()
@@ -1441,11 +1767,8 @@ impl WikiTrustStore {
     /// agent, reverses their cumulative deltas per page, and restores the
     /// pre-rollback `trust` value as a fresh manual_set audit entry.
     /// Returns `(pages_rolled_back, total_history_entries_reversed)`.
-    pub fn rollback_since(
-        &self,
-        agent_id: &str,
-        since: DateTime<Utc>,
-    ) -> Result<(u64, u64)> {
+    pub fn rollback_since(&self, agent_id: &str, since: DateTime<Utc>) -> Result<(u64, u64)> {
+        let _fence = self.page_mutation_guard(agent_id)?;
         let mut conn = self
             .conn
             .lock()
@@ -1595,10 +1918,7 @@ impl WikiTrustStore {
     /// Export trust state mutations newer than `since` for federation.
     /// The receiving peer applies these via `import_federated`. Operates per-agent
     /// (Q1): each entry already carries its `agent_id`.
-    pub fn export_federated(
-        &self,
-        since: DateTime<Utc>,
-    ) -> Result<Vec<FederatedTrustUpdate>> {
+    pub fn export_federated(&self, since: DateTime<Utc>) -> Result<Vec<FederatedTrustUpdate>> {
         let conn = self
             .conn
             .lock()
@@ -1651,10 +1971,11 @@ impl WikiTrustStore {
     ///   are exempt — the local override always wins.
     /// - Increment `error_signal_count`/`success_signal_count` is *not*
     ///   propagated, only the trust value (counts are local observations).
-    pub fn import_federated(
-        &self,
-        updates: &[FederatedTrustUpdate],
-    ) -> Result<u64> {
+    pub fn import_federated(&self, updates: &[FederatedTrustUpdate]) -> Result<u64> {
+        // One guard per Wiki root touched by the import (sorted, deduped).
+        let _fences = self.grouped_mutation_guards(
+            updates.iter().map(|update| update.agent_id.as_str()),
+        )?;
         let mut conn = self
             .conn
             .lock()
@@ -1687,12 +2008,14 @@ impl WikiTrustStore {
                      FROM wiki_trust_state
                      WHERE page_path = ?1 AND agent_id = ?2",
                     params![u.page_path, u.agent_id],
-                    |r| Ok((
-                        r.get::<_, f64>(0)? as f32,
-                        r.get::<_, i64>(1)? != 0,
-                        r.get::<_, i64>(2)? != 0,
-                        r.get::<_, String>(3)?,
-                    )),
+                    |r| {
+                        Ok((
+                            r.get::<_, f64>(0)? as f32,
+                            r.get::<_, i64>(1)? != 0,
+                            r.get::<_, i64>(2)? != 0,
+                            r.get::<_, String>(3)?,
+                        ))
+                    },
                 )
                 .map(Some)
                 .or_else(|e| match e {
@@ -1815,10 +2138,9 @@ impl WikiTrustStore {
     ///
     /// CRITICAL (review C3): wraps inserts per agent in a single transaction.
     /// 100k+ pages would be unusably slow under autocommit (~1 fsync per row).
-    pub fn bootstrap_from_wiki(
-        &self,
-        agents_dir: &std::path::Path,
-    ) -> Result<(u64, u64)> {
+    pub fn bootstrap_from_wiki(&self, agents_dir: &std::path::Path) -> Result<(u64, u64)> {
+        // W2-B: one Wiki root at a time. A single home-wide guard here used
+        // to hold every agent's fence for the whole walk.
         let mut inserted = 0u64;
         let mut skipped = 0u64;
 
@@ -1848,6 +2170,7 @@ impl WikiTrustStore {
                 continue;
             }
 
+            let _fence = self.page_mutation_guard(&agent_id)?;
             let mut conn = self
                 .conn
                 .lock()
@@ -1887,7 +2210,10 @@ impl WikiTrustStore {
 
     /// Number of state rows — diagnostics only.
     pub fn row_count(&self) -> Result<u64> {
-        let conn = self.conn.lock().map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| DuDuClawError::Memory("trust db poisoned".into()))?;
         conn.query_row("SELECT COUNT(*) FROM wiki_trust_state", [], |r| {
             r.get::<_, i64>(0)
         })
@@ -2049,7 +2375,13 @@ mod tests {
     fn upsert_signal_neutral_is_noop() {
         let s = store();
         let result = s
-            .upsert_signal("p.md", "agnes", TrustSignal::Neutral, Some("c1"), Some(0.30))
+            .upsert_signal(
+                "p.md",
+                "agnes",
+                TrustSignal::Neutral,
+                Some("c1"),
+                Some(0.30),
+            )
             .unwrap();
         assert!(matches!(result, UpsertResult::SkippedNeutral));
         assert!(s.get("p.md", "agnes").unwrap().is_none());
@@ -2079,33 +2411,56 @@ mod tests {
     fn per_conversation_cap_resists_sign_flip_drain() {
         // Regression for review C2: a malicious actor flipping +0.05 / -0.05
         // signals must NOT reset the per-conversation cap to zero.
-        let cfg = TrustStoreConfig { per_conversation_cap: 0.10, ..Default::default() };
+        let cfg = TrustStoreConfig {
+            per_conversation_cap: 0.10,
+            ..Default::default()
+        };
         let s = WikiTrustStore::in_memory_with_config(cfg).unwrap();
 
-        let _ = applied(s.upsert_signal(
-            "p.md", "agnes",
-            TrustSignal::Negative { magnitude: 0.05 },
-            Some("c1"), None,
-        ).unwrap());
-        let _ = applied(s.upsert_signal(
-            "p.md", "agnes",
-            TrustSignal::Positive { magnitude: 0.05 },
-            Some("c1"), None,
-        ).unwrap());
+        let _ = applied(
+            s.upsert_signal(
+                "p.md",
+                "agnes",
+                TrustSignal::Negative { magnitude: 0.05 },
+                Some("c1"),
+                None,
+            )
+            .unwrap(),
+        );
+        let _ = applied(
+            s.upsert_signal(
+                "p.md",
+                "agnes",
+                TrustSignal::Positive { magnitude: 0.05 },
+                Some("c1"),
+                None,
+            )
+            .unwrap(),
+        );
         // Total budget consumed: 0.05 + 0.05 = 0.10. Cap is 0.10 → next signal
         // must be rejected entirely, not silently allowed because deltas
         // cancelled to zero in the accumulator.
-        let third = s.upsert_signal(
-            "p.md", "agnes",
-            TrustSignal::Negative { magnitude: 0.05 },
-            Some("c1"), None,
-        ).unwrap();
-        assert!(matches!(third, UpsertResult::SkippedConvCap), "cap must reject after 0.10");
+        let third = s
+            .upsert_signal(
+                "p.md",
+                "agnes",
+                TrustSignal::Negative { magnitude: 0.05 },
+                Some("c1"),
+                None,
+            )
+            .unwrap();
+        assert!(
+            matches!(third, UpsertResult::SkippedConvCap),
+            "cap must reject after 0.10"
+        );
     }
 
     #[test]
     fn per_conversation_cap_limits_total_movement() {
-        let cfg = TrustStoreConfig { per_conversation_cap: 0.10, ..Default::default() };
+        let cfg = TrustStoreConfig {
+            per_conversation_cap: 0.10,
+            ..Default::default()
+        };
         let s = WikiTrustStore::in_memory_with_config(cfg).unwrap();
 
         // First negative signal: −0.10 (full magnitude).
@@ -2214,7 +2569,10 @@ mod tests {
             )
             .unwrap();
         let snap = s.get("p.md", "agnes").unwrap().unwrap();
-        assert!(snap.do_not_inject, "should still be archived under hysteresis");
+        assert!(
+            snap.do_not_inject,
+            "should still be archived under hysteresis"
+        );
 
         // Push above recovery threshold.
         let _ = s
@@ -2227,15 +2585,21 @@ mod tests {
             )
             .unwrap();
         let snap = s.get("p.md", "agnes").unwrap().unwrap();
-        assert!(!snap.do_not_inject, "should clear once trust ≥ recovery_threshold");
+        assert!(
+            !snap.do_not_inject,
+            "should clear once trust ≥ recovery_threshold"
+        );
     }
 
     #[test]
     fn list_low_trust_orders_ascending() {
         let s = store();
-        s.manual_set("hi.md", "agnes", 0.85, false, None, None).unwrap();
-        s.manual_set("low.md", "agnes", 0.15, false, None, None).unwrap();
-        s.manual_set("mid.md", "agnes", 0.50, false, None, None).unwrap();
+        s.manual_set("hi.md", "agnes", 0.85, false, None, None)
+            .unwrap();
+        s.manual_set("low.md", "agnes", 0.15, false, None, None)
+            .unwrap();
+        s.manual_set("mid.md", "agnes", 0.50, false, None, None)
+            .unwrap();
 
         let listed = s.list_low_trust("agnes", 0.6, 10).unwrap();
         assert_eq!(listed.len(), 2);
@@ -2246,7 +2610,8 @@ mod tests {
     #[test]
     fn get_many_returns_only_known_pages() {
         let s = store();
-        s.manual_set("a.md", "agnes", 0.9, false, None, None).unwrap();
+        s.manual_set("a.md", "agnes", 0.9, false, None, None)
+            .unwrap();
         let map = s
             .get_many("agnes", &["a.md".into(), "b.md".into()])
             .unwrap();
@@ -2280,7 +2645,8 @@ mod tests {
         // v1.10 atomic batch: input order = output order, types correct.
         let s = store();
         // Pre-lock one page so we get a SkippedLocked result.
-        s.manual_set("locked.md", "agnes", 0.95, true, None, None).unwrap();
+        s.manual_set("locked.md", "agnes", 0.95, true, None, None)
+            .unwrap();
         let batch = vec![
             (
                 "ok.md".to_string(),
@@ -2529,9 +2895,12 @@ mod tests {
         .unwrap();
 
         // Ineligible: too few citations.
-        s.manual_set("sources/cold.md", "agnes", 0.85, false, None, None).unwrap();
+        s.manual_set("sources/cold.md", "agnes", 0.85, false, None, None)
+            .unwrap();
 
-        let candidates = s.list_promotion_candidates("agnes", 20, 0.7, 30, 10).unwrap();
+        let candidates = s
+            .list_promotion_candidates("agnes", 20, 0.7, 30, 10)
+            .unwrap();
         assert_eq!(candidates, vec!["sources/hot.md".to_string()]);
     }
 
@@ -2579,8 +2948,22 @@ mod tests {
         // Q1 decision: trust is per-(page, agent). Two agents may have
         // independent trust on the same page.
         let s = store();
-        s.upsert_signal("p.md", "agnes", TrustSignal::Negative { magnitude: 0.10 }, None, None).unwrap();
-        s.upsert_signal("p.md", "tl",    TrustSignal::Positive { magnitude: 0.05 }, None, None).unwrap();
+        s.upsert_signal(
+            "p.md",
+            "agnes",
+            TrustSignal::Negative { magnitude: 0.10 },
+            None,
+            None,
+        )
+        .unwrap();
+        s.upsert_signal(
+            "p.md",
+            "tl",
+            TrustSignal::Positive { magnitude: 0.05 },
+            None,
+            None,
+        )
+        .unwrap();
         let agnes = s.get("p.md", "agnes").unwrap().unwrap();
         let tl = s.get("p.md", "tl").unwrap().unwrap();
         assert!(agnes.trust < tl.trust);

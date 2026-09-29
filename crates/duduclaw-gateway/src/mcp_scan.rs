@@ -12,14 +12,26 @@
 use duduclaw_agent::mcp_template::McpServerDef;
 
 use crate::skill_lifecycle::security_scanner::{
-    classify_risk, FindingCategory, FindingSeverity, SecurityFinding, SecurityScanResult,
+    FindingCategory, FindingSeverity, SecurityFinding, SecurityScanResult, classify_risk,
 };
 
 /// Shell interpreters — spawning one as the MCP command means the args are an
 /// arbitrary shell script.
 const SHELL_COMMANDS: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "fish", "ksh", "csh", "tcsh", "cmd", "cmd.exe", "powershell",
-    "powershell.exe", "pwsh", "pwsh.exe",
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "fish",
+    "ksh",
+    "csh",
+    "tcsh",
+    "cmd",
+    "cmd.exe",
+    "powershell",
+    "powershell.exe",
+    "pwsh",
+    "pwsh.exe",
 ];
 
 /// Downloaders — `curl`/`wget` as the server command is a fetch-and-run or
@@ -67,7 +79,11 @@ fn command_base(command: &str) -> String {
 /// the value is going to be interpreted by a shell (MCP args are passed as an
 /// argv array, so their presence signals an injection attempt).
 fn has_shell_metachars(s: &str) -> bool {
-    s.contains("$(") || s.contains('`') || s.contains("&&") || s.contains("||") || s.contains(';')
+    s.contains("$(")
+        || s.contains('`')
+        || s.contains("&&")
+        || s.contains("||")
+        || s.contains(';')
         || s.contains('|') && !s.starts_with("--")
 }
 
@@ -88,7 +104,10 @@ pub fn scan_mcp_server_def(name: &str, def: &McpServerDef) -> SecurityScanResult
         findings.push(finding(
             FindingCategory::BoundaryViolation,
             FindingSeverity::Critical,
-            format!("invalid server name '{}' (allowed: A-Za-z0-9._- max 64)", duduclaw_core::truncate_chars(name, 40)),
+            format!(
+                "invalid server name '{}' (allowed: A-Za-z0-9._- max 64)",
+                duduclaw_core::truncate_chars(name, 40)
+            ),
             name,
         ));
     }
@@ -147,7 +166,9 @@ pub fn scan_mcp_server_def(name: &str, def: &McpServerDef) -> SecurityScanResult
             findings.push(finding(
                 FindingCategory::CodeExecution,
                 FindingSeverity::Error,
-                format!("argument '{a}' evaluates inline code instead of running a published server"),
+                format!(
+                    "argument '{a}' evaluates inline code instead of running a published server"
+                ),
                 a,
             ));
         }
@@ -155,7 +176,10 @@ pub fn scan_mcp_server_def(name: &str, def: &McpServerDef) -> SecurityScanResult
             findings.push(finding(
                 FindingCategory::CodeExecution,
                 FindingSeverity::Critical,
-                format!("container escape flag '{}'", duduclaw_core::truncate_chars(a, 40)),
+                format!(
+                    "container escape flag '{}'",
+                    duduclaw_core::truncate_chars(a, 40)
+                ),
                 a,
             ));
         }
@@ -189,7 +213,9 @@ pub fn scan_mcp_server_def(name: &str, def: &McpServerDef) -> SecurityScanResult
         }
     }
 
-    let serialized = serde_json::to_string(def).map(|s| s.len()).unwrap_or(usize::MAX);
+    let serialized = serde_json::to_string(def)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX);
     if serialized > MAX_DEF_BYTES {
         findings.push(finding(
             FindingCategory::SizeAnomaly,
@@ -201,7 +227,11 @@ pub fn scan_mcp_server_def(name: &str, def: &McpServerDef) -> SecurityScanResult
 
     let risk_level = classify_risk(&findings);
     let passed = risk_level < crate::skill_lifecycle::security_scanner::RiskLevel::High;
-    SecurityScanResult { passed, risk_level, findings }
+    SecurityScanResult {
+        passed,
+        risk_level,
+        findings,
+    }
 }
 
 #[cfg(test)]
@@ -219,7 +249,13 @@ mod tests {
 
     #[test]
     fn clean_npx_server_passes() {
-        let r = scan_mcp_server_def("filesystem", &def("npx", &["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]));
+        let r = scan_mcp_server_def(
+            "filesystem",
+            &def(
+                "npx",
+                &["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+            ),
+        );
         assert!(r.passed, "findings: {:?}", r.findings);
     }
 
@@ -276,7 +312,11 @@ mod tests {
     fn unknown_binary_warns_but_passes() {
         let r = scan_mcp_server_def("custom", &def("/opt/tools/my-mcp-server", &["--port", "0"]));
         assert!(r.passed);
-        assert!(r.findings.iter().any(|f| f.severity == FindingSeverity::Warning));
+        assert!(
+            r.findings
+                .iter()
+                .any(|f| f.severity == FindingSeverity::Warning)
+        );
     }
 
     #[test]
@@ -307,7 +347,11 @@ mod tests {
         // curated built-in definition must keep passing it.
         for item in duduclaw_agent::mcp_template::marketplace_catalog() {
             let r = scan_mcp_server_def(&item.id, &item.default_def);
-            assert!(r.passed, "builtin '{}' failed scan: {:?}", item.id, r.findings);
+            assert!(
+                r.passed,
+                "builtin '{}' failed scan: {:?}",
+                item.id, r.findings
+            );
         }
     }
 }

@@ -169,9 +169,19 @@ fn is_dangerous_key_combo(key: &str) -> bool {
 
 /// Stop words that should immediately halt a computer use session.
 const STOP_WORDS: &[&str] = &[
-    "停", "停止", "別動", "不要繼續", "不要做了",
-    "やめて", "止めて", "ストップ",
-    "stop", "halt", "abort", "cancel", "quit",
+    "停",
+    "停止",
+    "別動",
+    "不要繼續",
+    "不要做了",
+    "やめて",
+    "止めて",
+    "ストップ",
+    "stop",
+    "halt",
+    "abort",
+    "cancel",
+    "quit",
 ];
 
 /// Check if a message is an emergency stop command.
@@ -209,7 +219,10 @@ mod tests {
         let ctx = make_ctx(ComputerAction::LeftClick {
             coordinate: [100, 200],
         });
-        assert_eq!(assess_risk(&ctx, &ComputerUseConfig::default()), RiskLevel::Low);
+        assert_eq!(
+            assess_risk(&ctx, &ComputerUseConfig::default()),
+            RiskLevel::Low
+        );
     }
 
     #[test]
@@ -218,7 +231,10 @@ mod tests {
             coordinate: [100, 200],
         });
         ctx.targets_sensitive_input = true;
-        assert_eq!(assess_risk(&ctx, &ComputerUseConfig::default()), RiskLevel::High);
+        assert_eq!(
+            assess_risk(&ctx, &ComputerUseConfig::default()),
+            RiskLevel::High
+        );
     }
 
     #[test]
@@ -226,7 +242,10 @@ mod tests {
         let ctx = make_ctx(ComputerAction::Type {
             text: "4242 4242 4242 4242".to_string(),
         });
-        assert_eq!(assess_risk(&ctx, &ComputerUseConfig::default()), RiskLevel::High);
+        assert_eq!(
+            assess_risk(&ctx, &ComputerUseConfig::default()),
+            RiskLevel::High
+        );
     }
 
     #[test]
@@ -235,7 +254,10 @@ mod tests {
             coordinate: [100, 200],
         });
         ctx.active_window_title = Some("Terminal — zsh".to_string());
-        assert_eq!(assess_risk(&ctx, &ComputerUseConfig::default()), RiskLevel::Blocked);
+        assert_eq!(
+            assess_risk(&ctx, &ComputerUseConfig::default()),
+            RiskLevel::Blocked
+        );
     }
 
     #[test]
@@ -298,7 +320,10 @@ mod tests {
         let ctx = make_ctx(ComputerAction::Key {
             text: "ctrl+alt+delete".to_string(),
         });
-        assert_eq!(assess_risk(&ctx, &ComputerUseConfig::default()), RiskLevel::Medium);
+        assert_eq!(
+            assess_risk(&ctx, &ComputerUseConfig::default()),
+            RiskLevel::Medium
+        );
     }
 
     #[test]

@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
-use duduclaw_memory::feedback::{global_tracker, CitationTracker, TrustSignal};
-use duduclaw_memory::trust_store::{global_trust_store, WikiTrustStore};
+use duduclaw_memory::feedback::{CitationTracker, TrustSignal, global_tracker};
+use duduclaw_memory::trust_store::{WikiTrustStore, global_trust_store};
 
 use super::engine::PredictionError;
 
@@ -131,17 +131,32 @@ impl TrustFeedbackBus {
             // (review BLOCKER R2-1). Falls back to conversation_id if absent
             // — that's the case for non-channel callers like cron tasks,
             // where per-turn cap is the safer default than no cap.
-            let cap_key = citation
-                .session_id
-                .as_deref()
-                .unwrap_or(conversation_id);
-            match self.store.upsert_signal(
+            let cap_key = citation.session_id.as_deref().unwrap_or(conversation_id);
+            let mut outcome = self.store.upsert_signal(
                 &citation.page_path,
                 &citation.agent_id,
                 scaled_signal,
                 Some(cap_key),
                 Some(composite_error),
-            ) {
+            );
+            // W2-B: the Wiki delivery fence is contended, not broken. A
+            // dropped trust signal used to be invisible here; warn and retry
+            // once before giving up, and never swallow it silently.
+            if matches!(&outcome, Err(error) if duduclaw_memory::is_fence_busy(error)) {
+                warn!(
+                    page = %citation.page_path,
+                    agent = %citation.agent_id,
+                    "wiki trust upsert hit the delivery fence; retrying once"
+                );
+                outcome = self.store.upsert_signal(
+                    &citation.page_path,
+                    &citation.agent_id,
+                    scaled_signal,
+                    Some(cap_key),
+                    Some(composite_error),
+                );
+            }
+            match outcome {
                 Ok(duduclaw_memory::UpsertResult::Applied(outcome)) => {
                     applied += 1;
                     crate::metrics::global_metrics().wiki_trust_signal_applied();
@@ -181,11 +196,13 @@ impl TrustFeedbackBus {
                     // treat as no-op without a counter bump.
                 }
                 Err(e) => {
+                    let fence_busy = duduclaw_memory::is_fence_busy(&e);
                     warn!(
                         page = %citation.page_path,
                         agent = %citation.agent_id,
                         error = %e,
-                        "wiki trust upsert failed (non-fatal)"
+                        fence_busy,
+                        "wiki trust upsert failed (non-fatal; signal dropped)"
                     );
                 }
             }
@@ -208,9 +225,9 @@ mod tests {
     use duduclaw_memory::feedback::WikiCitation;
 
     fn dummy_error(composite: f64) -> PredictionError {
-        use chrono::Utc;
         use crate::prediction::engine::{ErrorCategory, Prediction};
         use crate::prediction::metrics::{ConversationMetrics, FeedbackDetail};
+        use chrono::Utc;
 
         let prediction = Prediction {
             expected_satisfaction: 0.5,
@@ -289,6 +306,33 @@ mod tests {
         assert!(b.error_signal_count >= 1);
     }
 
+    /// Regression (W2-B/b): a contended Wiki delivery fence used to make
+    /// `upsert_signal` fail instantly, and the bus dropped the trust signal
+    /// with only a log line. The write now waits out the read window, so the
+    /// signal still lands.
+    #[test]
+    fn contended_delivery_fence_no_longer_drops_the_trust_signal() {
+        let home = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CitationTracker::new());
+        let store =
+            Arc::new(WikiTrustStore::open(home.path().join("wiki_trust.db")).unwrap());
+        let bus = TrustFeedbackBus::new(tracker.clone(), store.clone());
+        tracker.record(page_citation("conv-fence", "concepts/a.md", "agnes"));
+
+        let lease = duduclaw_memory::WikiDeliveryFence::for_agent_wiki(home.path(), "agnes")
+            .try_shared()
+            .unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(lease);
+        });
+        let applied = bus.on_prediction_error("conv-fence", "agnes", &dummy_error(0.85));
+        holder.join().unwrap();
+
+        assert_eq!(applied, 1, "trust signal must not be dropped on contention");
+        assert!(store.get("concepts/a.md", "agnes").unwrap().unwrap().trust < 0.5);
+    }
+
     #[test]
     fn positive_signal_raises_trust() {
         let tracker = Arc::new(CitationTracker::new());
@@ -346,7 +390,10 @@ mod tests {
         // so doubling can saturate at the cap rather than fully doubling.
         // Verify GVU has fallen *at least as much* (and ideally more, which
         // is what the cap allows).
-        assert!(gvu.trust <= pred.trust, "GVU magnitude should not be smaller");
+        assert!(
+            gvu.trust <= pred.trust,
+            "GVU magnitude should not be smaller"
+        );
     }
 
     #[test]
@@ -363,7 +410,10 @@ mod tests {
 
         bus.on_prediction_error("c1", "agnes", &dummy_error(0.85));
 
-        let v = store.get("concepts/cron-facts.md", "agnes").unwrap().unwrap();
+        let v = store
+            .get("concepts/cron-facts.md", "agnes")
+            .unwrap()
+            .unwrap();
         let u = store.get("sources/old-talk.md", "agnes").unwrap().unwrap();
         // VerifiedFact's negative magnitude is halved → its trust drops less.
         assert!(v.trust > u.trust, "verified_fact should retain more trust");

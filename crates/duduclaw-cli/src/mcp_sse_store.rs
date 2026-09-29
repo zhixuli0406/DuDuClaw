@@ -68,10 +68,7 @@ impl ConnectionEntry {
     /// Replay events after the given `last_event_id`.
     /// Returns `Some(events)` if the ID is found; `None` if it's not in the buffer.
     fn replay_after(&self, last_event_id: &str) -> Option<Vec<SseEvent>> {
-        let pos = self
-            .buffer
-            .iter()
-            .position(|e| e.id == last_event_id)?;
+        let pos = self.buffer.iter().position(|e| e.id == last_event_id)?;
         Some(self.buffer.iter().skip(pos + 1).cloned().collect())
     }
 }
@@ -280,7 +277,10 @@ mod tests {
     fn push_event_unknown_connection_returns_none() {
         let store = make_store();
         let result = store.push_event("nonexistent", "progress", "data");
-        assert!(result.is_none(), "Pushing to unknown connection should return None");
+        assert!(
+            result.is_none(),
+            "Pushing to unknown connection should return None"
+        );
     }
 
     // ── Test: different connections are isolated ──────────────────────────────
@@ -304,7 +304,10 @@ mod tests {
     // Backdates last_active by 11min via `Instant::now() - 660s`, which panics on
     // a fresh-boot Windows runner (uptime < 11min → monotonic-clock underflow).
     // The eviction logic itself is platform-independent and covered on Unix.
-    #[cfg_attr(windows, ignore = "backdated Instant underflows on fresh-boot Windows CI")]
+    #[cfg_attr(
+        windows,
+        ignore = "backdated Instant underflows on fresh-boot Windows CI"
+    )]
     #[test]
     fn evict_idle_removes_inactive_connections() {
         let store = make_store();
@@ -320,7 +323,11 @@ mod tests {
 
         assert_eq!(store.connection_count(), 1);
         store.evict_idle();
-        assert_eq!(store.connection_count(), 0, "Stale connection should be evicted");
+        assert_eq!(
+            store.connection_count(),
+            0,
+            "Stale connection should be evicted"
+        );
     }
 
     // ── Test: evict_idle preserves active connections ─────────────────────────
@@ -331,7 +338,11 @@ mod tests {
         store.push_event("active_conn", "heartbeat", "ping");
 
         store.evict_idle();
-        assert_eq!(store.connection_count(), 1, "Active connection should be preserved");
+        assert_eq!(
+            store.connection_count(),
+            1,
+            "Active connection should be preserved"
+        );
     }
 
     // ── Test: ownership is recorded and enforced ──────────────────────────────
@@ -341,8 +352,14 @@ mod tests {
         let (tx, _rx) = broadcast::channel(4);
         store.register_connection("owned", tx, "alice");
 
-        assert!(store.is_owner("owned", "alice"), "alice owns the connection");
-        assert!(!store.is_owner("owned", "mallory"), "mallory must not own it");
+        assert!(
+            store.is_owner("owned", "alice"),
+            "alice owns the connection"
+        );
+        assert!(
+            !store.is_owner("owned", "mallory"),
+            "mallory must not own it"
+        );
         // Fail-closed: unknown connection is owned by nobody.
         assert!(!store.is_owner("ghost", "alice"));
     }

@@ -35,7 +35,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -151,10 +151,7 @@ pub fn refresh_decision(
 ) -> RefreshDecision {
     // 1) Revocation is terminal — checked before fingerprint (§9.2 step 3).
     if rec.status == "revoked" {
-        let effective_from = rec
-            .revoked_at
-            .clone()
-            .unwrap_or_else(|| now.to_rfc3339());
+        let effective_from = rec.revoked_at.clone().unwrap_or_else(|| now.to_rfc3339());
         return RefreshDecision::Revoked { effective_from };
     }
     // 2) Fingerprint mismatch → forbidden.
@@ -176,7 +173,10 @@ async fn refresh_handler(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if !within_rate_limit(&REFRESH_RATE_LIMITER, addr.ip(), 30) {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "rate_limited" })))
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "rate_limited" })),
+        )
             .into_response();
     }
 
@@ -323,7 +323,10 @@ async fn crl_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
     if !within_rate_limit(&CRL_RATE_LIMITER, addr.ip(), 60) {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "rate_limited" })))
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "rate_limited" })),
+        )
             .into_response();
     }
 
@@ -345,7 +348,13 @@ async fn crl_handler(
         .collect();
 
     let generated_at = Utc::now();
-    let signature = match sign_crl(generated_at, &revoked, CRL_TTL_SECONDS, ISSUER_KEY_ID, &seed) {
+    let signature = match sign_crl(
+        generated_at,
+        &revoked,
+        CRL_TTL_SECONDS,
+        ISSUER_KEY_ID,
+        &seed,
+    ) {
         Ok(s) => s,
         Err(_) => return internal_error(),
     };
@@ -379,7 +388,10 @@ async fn branding_sign_handler(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if !within_rate_limit(&BRANDING_SIGN_RATE_LIMITER, addr.ip(), 10) {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "rate_limited" })))
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "rate_limited" })),
+        )
             .into_response();
     }
 

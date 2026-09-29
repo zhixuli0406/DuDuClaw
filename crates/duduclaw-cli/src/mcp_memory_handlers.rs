@@ -323,9 +323,7 @@ pub async fn handle_memory_read(
                 "content": [{ "type": "text", "text": payload.to_string() }]
             })
         }
-        Ok(None) => mcp_forbidden(&format!(
-            "memory not found or access denied: {memory_id}"
-        )),
+        Ok(None) => mcp_forbidden(&format!("memory not found or access denied: {memory_id}")),
         Err(e) => mcp_error(&format!("Error reading memory: {e}")),
     }
 }
@@ -477,12 +475,10 @@ pub async fn handle_memory_get_at(
         _ => return mcp_error("Missing required parameter: predicate"),
     };
     let at = match params.get("at").and_then(|v| v.as_str()) {
-        Some(a) if !a.trim().is_empty() => {
-            match chrono::DateTime::parse_from_rfc3339(a.trim()) {
-                Ok(dt) => dt.with_timezone(&chrono::Utc),
-                Err(e) => return mcp_error(&format!("Invalid 'at' (must be RFC3339): {e}")),
-            }
-        }
+        Some(a) if !a.trim().is_empty() => match chrono::DateTime::parse_from_rfc3339(a.trim()) {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(e) => return mcp_error(&format!("Invalid 'at' (must be RFC3339): {e}")),
+        },
         _ => return mcp_error("Missing required parameter: at (RFC3339 timestamp)"),
     };
     let namespace = &ns_ctx.write_namespace;
@@ -526,12 +522,10 @@ pub async fn handle_memory_invalidate_by_origin(
         _ => return mcp_error("Missing required parameter: origin"),
     };
     let since = match params.get("since").and_then(|v| v.as_str()) {
-        Some(s) if !s.trim().is_empty() => {
-            match chrono::DateTime::parse_from_rfc3339(s.trim()) {
-                Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
-                Err(e) => return mcp_error(&format!("Invalid 'since' (must be RFC3339): {e}")),
-            }
-        }
+        Some(s) if !s.trim().is_empty() => match chrono::DateTime::parse_from_rfc3339(s.trim()) {
+            Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+            Err(e) => return mcp_error(&format!("Invalid 'since' (must be RFC3339): {e}")),
+        },
         _ => None,
     };
     let namespace = &ns_ctx.write_namespace;
@@ -623,7 +617,9 @@ fn cluster_by_tag(entries: &[MemoryEntry]) -> Vec<(String, Vec<String>)> {
     for e in entries {
         let snippet = duduclaw_core::truncate_bytes(&e.content, 240).to_string();
         if e.tags.is_empty() {
-            map.entry("(untagged)".to_string()).or_default().push(snippet);
+            map.entry("(untagged)".to_string())
+                .or_default()
+                .push(snippet);
         } else {
             for t in &e.tags {
                 map.entry(t.clone()).or_default().push(snippet.clone());
@@ -888,10 +884,7 @@ mod tests {
     fn external_ns(client_id: &str) -> NamespaceContext {
         NamespaceContext {
             write_namespace: format!("external/{client_id}"),
-            read_namespaces: vec![
-                format!("external/{client_id}"),
-                "shared/public".to_string(),
-            ],
+            read_namespaces: vec![format!("external/{client_id}"), "shared/public".to_string()],
         }
     }
 
@@ -935,10 +928,7 @@ mod tests {
     fn internal_ns(agent_id: &str) -> NamespaceContext {
         NamespaceContext {
             write_namespace: format!("internal/{agent_id}"),
-            read_namespaces: vec![
-                format!("internal/{agent_id}"),
-                "shared/public".to_string(),
-            ],
+            read_namespaces: vec![format!("internal/{agent_id}"), "shared/public".to_string()],
         }
     }
 
@@ -947,16 +937,11 @@ mod tests {
     }
 
     fn text_of(v: &Value) -> String {
-        v["content"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .to_string()
+        v["content"][0]["text"].as_str().unwrap_or("").to_string()
     }
 
     fn is_error(v: &Value) -> bool {
-        v.get("isError")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false)
+        v.get("isError").and_then(|x| x.as_bool()).unwrap_or(false)
     }
 
     fn error_code(v: &Value) -> Option<u64> {
@@ -1073,12 +1058,8 @@ mod tests {
         let entry_id = store_payload["id"].as_str().unwrap().to_string();
 
         // Client B tries to read Client A's entry by ID
-        let read_resp = handle_memory_read(
-            &params(serde_json::json!({ "id": entry_id })),
-            &mem,
-            &ns_b,
-        )
-        .await;
+        let read_resp =
+            handle_memory_read(&params(serde_json::json!({ "id": entry_id })), &mem, &ns_b).await;
 
         assert!(is_error(&read_resp), "cross-namespace read must fail");
         assert_eq!(
@@ -1159,7 +1140,10 @@ mod tests {
         )
         .await;
 
-        assert!(is_error(&read_resp), "external client must not read internal memory");
+        assert!(
+            is_error(&read_resp),
+            "external client must not read internal memory"
+        );
         assert_eq!(
             error_code(&read_resp),
             Some(403),
@@ -1174,13 +1158,7 @@ mod tests {
         let quota = DailyQuota::new();
         let ns = external_ns("test");
 
-        let resp = handle_memory_store(
-            &params(serde_json::json!({})),
-            &mem,
-            &ns,
-            &quota,
-        )
-        .await;
+        let resp = handle_memory_store(&params(serde_json::json!({})), &mem, &ns, &quota).await;
 
         assert!(is_error(&resp));
         assert!(text_of(&resp).contains("content"));
@@ -1202,24 +1180,14 @@ mod tests {
         )
         .await;
 
-        let resp = handle_memory_search(
-            &params(serde_json::json!({ "query": "rust" })),
-            &mem,
-            &ns,
-        )
-        .await;
+        let resp =
+            handle_memory_search(&params(serde_json::json!({ "query": "rust" })), &mem, &ns).await;
 
         assert!(!is_error(&resp));
         let text = text_of(&resp);
         let payload: Value = serde_json::from_str(&text).unwrap();
-        assert!(
-            payload["results"].is_array(),
-            "results must be an array"
-        );
-        assert!(
-            payload["total"].is_number(),
-            "total must be a number"
-        );
+        assert!(payload["results"].is_array(), "results must be an array");
+        assert!(payload["total"].is_number(), "total must be a number");
     }
 
     // ── T8: memory_search is scoped to caller namespace ───────────────────────
@@ -1262,12 +1230,7 @@ mod tests {
         let mem = SqliteMemoryEngine::in_memory().unwrap();
         let ns = external_ns("test");
 
-        let resp = handle_memory_search(
-            &params(serde_json::json!({})),
-            &mem,
-            &ns,
-        )
-        .await;
+        let resp = handle_memory_search(&params(serde_json::json!({})), &mem, &ns).await;
 
         assert!(is_error(&resp));
     }
@@ -1294,12 +1257,8 @@ mod tests {
         let store_payload: Value = serde_json::from_str(&store_text).unwrap();
         let id = store_payload["id"].as_str().unwrap();
 
-        let read_resp = handle_memory_read(
-            &params(serde_json::json!({ "id": id })),
-            &mem,
-            &ns,
-        )
-        .await;
+        let read_resp =
+            handle_memory_read(&params(serde_json::json!({ "id": id })), &mem, &ns).await;
 
         assert!(!is_error(&read_resp), "read should succeed: {read_resp}");
         let text = text_of(&read_resp);
@@ -1307,10 +1266,7 @@ mod tests {
 
         assert_eq!(record["id"].as_str().unwrap(), id);
         assert_eq!(record["content"].as_str().unwrap(), "stored content");
-        assert_eq!(
-            record["namespace"].as_str().unwrap(),
-            "external/reader"
-        );
+        assert_eq!(record["namespace"].as_str().unwrap(), "external/reader");
         assert!(record["created_at"].is_string());
     }
 
@@ -1320,12 +1276,7 @@ mod tests {
         let mem = SqliteMemoryEngine::in_memory().unwrap();
         let ns = external_ns("test");
 
-        let resp = handle_memory_read(
-            &params(serde_json::json!({})),
-            &mem,
-            &ns,
-        )
-        .await;
+        let resp = handle_memory_read(&params(serde_json::json!({})), &mem, &ns).await;
 
         assert!(is_error(&resp));
         assert!(text_of(&resp).contains("id"));
@@ -1355,12 +1306,8 @@ mod tests {
             p["id"].as_str().unwrap().to_string()
         };
 
-        let read_resp = handle_memory_read(
-            &params(serde_json::json!({ "id": id })),
-            &mem,
-            &ns,
-        )
-        .await;
+        let read_resp =
+            handle_memory_read(&params(serde_json::json!({ "id": id })), &mem, &ns).await;
 
         let text = text_of(&read_resp);
         let record: Value = serde_json::from_str(&text).unwrap();
@@ -1406,10 +1353,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
         assert_eq!(payload["total_found"].as_u64().unwrap(), 2);
         assert_eq!(payload["total_missing"].as_u64().unwrap(), 1);
-        assert_eq!(
-            payload["missing_ids"][0].as_str().unwrap(),
-            "missing-xyz"
-        );
+        assert_eq!(payload["missing_ids"][0].as_str().unwrap(), "missing-xyz");
     }
 
     // ── F3-T2: empty / missing ids param → error ──────────────────────────────
@@ -1457,12 +1401,9 @@ mod tests {
         };
 
         // Client B batch-fetches A's id → must land in missing_ids, no content.
-        let resp = handle_memory_fetch_batch(
-            &params(serde_json::json!({ "ids": [id] })),
-            &mem,
-            &ns_b,
-        )
-        .await;
+        let resp =
+            handle_memory_fetch_batch(&params(serde_json::json!({ "ids": [id] })), &mem, &ns_b)
+                .await;
         let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
         assert_eq!(payload["total_found"].as_u64().unwrap(), 0);
         assert_eq!(payload["total_missing"].as_u64().unwrap(), 1);

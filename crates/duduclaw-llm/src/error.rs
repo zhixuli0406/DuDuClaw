@@ -123,7 +123,10 @@ pub fn classify_http(status: u16, body: &str, retry_after: Option<Duration>) -> 
         return LlmError::InvalidRequest(snippet(body));
     }
     // 529 = Anthropic "overloaded" — retryable, keep as Http 5xx-class.
-    LlmError::Http { status, body_snippet: snippet(body) }
+    LlmError::Http {
+        status,
+        body_snippet: snippet(body),
+    }
 }
 
 /// Provider-agnostic detection of "prompt too long" error messages.
@@ -155,8 +158,17 @@ mod tests {
 
     #[test]
     fn classify_429_is_rate_limited_with_retry_after() {
-        let e = classify_http(429, r#"{"error":{"type":"rate_limit_error"}}"#, Some(Duration::from_secs(30)));
-        assert_eq!(e, LlmError::RateLimited { retry_after: Some(Duration::from_secs(30)) });
+        let e = classify_http(
+            429,
+            r#"{"error":{"type":"rate_limit_error"}}"#,
+            Some(Duration::from_secs(30)),
+        );
+        assert_eq!(
+            e,
+            LlmError::RateLimited {
+                retry_after: Some(Duration::from_secs(30))
+            }
+        );
         assert!(e.is_retryable());
         assert!(e.is_failover());
     }
@@ -164,7 +176,11 @@ mod tests {
     #[test]
     fn classify_429_insufficient_quota_is_billing_not_rate_limit() {
         // OpenAI quota exhaustion arrives as 429 + insufficient_quota.
-        let e = classify_http(429, r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#, None);
+        let e = classify_http(
+            429,
+            r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+            None,
+        );
         assert_eq!(e, LlmError::Billing);
         assert!(!e.is_retryable());
         assert!(e.is_failover());
@@ -172,12 +188,18 @@ mod tests {
 
     #[test]
     fn classify_402_is_billing() {
-        assert_eq!(classify_http(402, "Payment Required", None), LlmError::Billing);
+        assert_eq!(
+            classify_http(402, "Payment Required", None),
+            LlmError::Billing
+        );
     }
 
     #[test]
     fn classify_401_403_are_auth() {
-        assert_eq!(classify_http(401, r#"{"error":{"type":"authentication_error"}}"#, None), LlmError::Auth);
+        assert_eq!(
+            classify_http(401, r#"{"error":{"type":"authentication_error"}}"#, None),
+            LlmError::Auth
+        );
         assert_eq!(classify_http(403, "forbidden", None), LlmError::Auth);
         assert!(LlmError::Auth.is_failover());
         assert!(!LlmError::Auth.is_retryable());
@@ -186,13 +208,25 @@ mod tests {
     #[test]
     fn classify_context_window_messages_across_providers() {
         // Anthropic
-        let e = classify_http(400, r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#, None);
+        let e = classify_http(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#,
+            None,
+        );
         assert_eq!(e, LlmError::ContextWindowExceeded);
         // OpenAI
-        let e = classify_http(400, r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 400000 tokens"}}"#, None);
+        let e = classify_http(
+            400,
+            r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 400000 tokens"}}"#,
+            None,
+        );
         assert_eq!(e, LlmError::ContextWindowExceeded);
         // Gemini
-        let e = classify_http(400, r#"{"error":{"message":"The input token count exceeds the maximum number of tokens allowed"}}"#, None);
+        let e = classify_http(
+            400,
+            r#"{"error":{"message":"The input token count exceeds the maximum number of tokens allowed"}}"#,
+            None,
+        );
         assert_eq!(e, LlmError::ContextWindowExceeded);
         assert!(e.is_failover());
     }

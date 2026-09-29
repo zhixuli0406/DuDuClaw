@@ -49,11 +49,12 @@ const CALL_COUNT_HISTORY_CAP: usize = 50;
 // ═══════════════════════════════════════════════════════════════════════
 
 /// `[task_forward_model]` config (design §7.3). **`enabled` defaults to
-/// `false`** — with it unset/false, the two hot-path hooks
+/// `true` since v1.54** — the calibrated forward model is a default-ON
+/// platform capability. Setting it `false` turns the two hot-path hooks
 /// (`goal_loop.rs`'s predict-before-dispatch, `dispatch_engine.rs`'s
-/// settle-on-review) never construct a `TaskForwardModel` and are complete
-/// no-ops, so `enabled = false` behavior is byte-identical to before this
-/// change (design §7.3 "回退路徑").
+/// settle-on-review) into complete no-ops that never construct a
+/// `TaskForwardModel`, which is byte-identical to the pre-A3 behavior
+/// (design §7.3 "回退路徑").
 ///
 /// Parsed in isolation from a generic `toml::Table` — same convention as
 /// `GoalLoopConfig::from_home` (`goal_loop.rs`) — so a missing/malformed
@@ -63,7 +64,8 @@ const CALL_COUNT_HISTORY_CAP: usize = 50;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct TaskForwardModelConfig {
-    /// Master switch. `false` ⇒ both hot-path hooks are no-ops.
+    /// Master switch. **Defaults `true` (v1.54).** `false` ⇒ both hot-path
+    /// hooks are no-ops.
     pub enabled: bool,
     /// T3 (design §11, §2.3 stage 4): reserved for the cold-start LLM
     /// prediction-source stage. **Not consumed** by
@@ -83,12 +85,6 @@ pub struct TaskForwardModelConfig {
     /// comment. `TaskForwardModel::predict` uses the fixed [`MATURE_N`]
     /// constant today.
     pub mature_n: u32,
-    /// WP-B4 `foresight_gate` τ (design §6.4, T7). Consumed by
-    /// `foresight_gate::ForesightGateConfig`, not by this module.
-    pub foresight_tau: f64,
-    /// WP-B4 `foresight_gate` recent-k window (design §6.4, T7). Consumed by
-    /// `foresight_gate::ForesightGateConfig`, not by this module.
-    pub foresight_recent_k: usize,
     /// WP-A4 sub-switch (design §6.5): the induce/inject/settle rule
     /// pipeline (`prediction::task_rule_induce`). Only consulted when
     /// `enabled = true` — A4 is a strict downstream of A3, so `enabled =
@@ -108,8 +104,7 @@ pub struct TaskForwardModelConfig {
     /// gates dispatch/accept behavior, only whether `brier_score` gets
     /// computed and persisted (a nullable column / nullable transition
     /// fields). Nothing here runs unless the outer `enabled` master switch
-    /// (still default `false`) is on, so turning this default on cannot
-    /// change any agent's behavior until the forward model itself is enabled.
+    /// (also default `true` since v1.54) is on.
     /// Set `false` to keep the forward model running while skipping the
     /// calibration calculation entirely (leaving those fields `NULL`/`None`,
     /// byte-identical to the pre-calibration behavior).
@@ -125,8 +120,8 @@ pub struct TaskForwardModelConfig {
     /// out-of-sample every settle (`dispatch_engine`'s injected-rule held-out
     /// path AND the shadow→promotion prequential pass), and promoted only
     /// when their record beats the frozen climatology baseline. Nothing here
-    /// runs unless the outer `enabled` master switch (still default `false`)
-    /// is on. Set `false` to keep the forward model running while settlement
+    /// runs unless the outer `enabled` master switch (also default `true`
+    /// since v1.54) is on. Set `false` to keep the forward model running while settlement
     /// uses the unchanged `ErrorCategory`-credit lifecycle and no shadow tags
     /// are ever minted (byte-identical to the pre-WP3 behavior). See
     /// `prediction::rule_gate`.
@@ -147,8 +142,6 @@ impl Default for TaskForwardModelConfig {
             cold_start_llm: false,
             min_samples: MIN_SAMPLES,
             mature_n: MATURE_N,
-            foresight_tau: super::foresight_gate::DEFAULT_FORESIGHT_TAU,
-            foresight_recent_k: super::foresight_gate::DEFAULT_FORESIGHT_RECENT_K,
             rule_induction: true,
             // calibrated forward model + held-out rule gate: on with the master.
             calibration_enabled: true,
@@ -368,7 +361,8 @@ impl TaskStateModel {
         if let Some(outcome) = observed_outcome_as_expected(error.observation.observed_outcome) {
             self.outcome_counts.bump(outcome);
         }
-        self.artifact_counts.bump(error.observation.observed_artifact);
+        self.artifact_counts
+            .bump(error.observation.observed_artifact);
         self.n_samples += 1;
     }
 
@@ -396,7 +390,14 @@ fn observed_outcome_as_expected(observed: ObservedOutcome) -> Option<ExpectedOut
 
 /// Built-in prior table by `GoalKind`, consulted when both the canonical
 /// and marginal buckets are cold (design §2.3 stage 3).
-fn prior_for(goal_kind: GoalKind) -> (BTreeSet<ToolClass>, (u32, u32), ExpectedOutcome, ArtifactShape) {
+fn prior_for(
+    goal_kind: GoalKind,
+) -> (
+    BTreeSet<ToolClass>,
+    (u32, u32),
+    ExpectedOutcome,
+    ArtifactShape,
+) {
     use ToolClass::*;
     match goal_kind {
         GoalKind::CodingSimple => (
@@ -429,7 +430,12 @@ fn prior_for(goal_kind: GoalKind) -> (BTreeSet<ToolClass>, (u32, u32), ExpectedO
             ExpectedOutcome::Accept,
             ArtifactShape::ExternalEffect,
         ),
-        GoalKind::Unknown => (BTreeSet::new(), (0, 5), ExpectedOutcome::Accept, ArtifactShape::TextOnly),
+        GoalKind::Unknown => (
+            BTreeSet::new(),
+            (0, 5),
+            ExpectedOutcome::Accept,
+            ArtifactShape::TextOnly,
+        ),
     }
 }
 
@@ -477,11 +483,17 @@ pub(crate) fn init_task_tables(conn: &Connection) -> Result<(), String> {
     // in directly; an existing pre-calibration DB gets the column added
     // here, and the CREATE TABLE below is then itself a no-op. Either way
     // idempotent — "duplicate column" errors are deliberately swallowed.
-    let _ = conn.execute("ALTER TABLE task_prediction_log ADD COLUMN brier_score REAL", []);
+    let _ = conn.execute(
+        "ALTER TABLE task_prediction_log ADD COLUMN brier_score REAL",
+        [],
+    );
     // 2026-08-14: per-dimension error breakdown — previously the four
     // sub-errors were computed at settle and immediately discarded, so
     // "which dimension did the prediction miss" was unanswerable.
-    let _ = conn.execute("ALTER TABLE task_prediction_log ADD COLUMN error_json TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE task_prediction_log ADD COLUMN error_json TEXT",
+        [],
+    );
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS task_prediction_log (
@@ -572,7 +584,12 @@ impl TaskForwardModel {
     /// WP-A4 injection-side bookkeeping: record which task-rule ids
     /// `goal_loop.rs` injected into this round's dispatch prompt. No-op for
     /// an empty list (nothing to settle later).
-    pub async fn record_injected_task_rules(&self, task_id: &str, round: u32, rule_ids: Vec<String>) {
+    pub async fn record_injected_task_rules(
+        &self,
+        task_id: &str,
+        round: u32,
+        rule_ids: Vec<String>,
+    ) {
         if rule_ids.is_empty() {
             return;
         }
@@ -593,7 +610,11 @@ impl TaskForwardModel {
     /// guess.
     pub async fn take_injected_task_rules(&self, task_id: &str, round: u32) -> Vec<String> {
         let key = format!("{task_id}#{round}");
-        self.injected_task_rules.lock().await.remove(&key).unwrap_or_default()
+        self.injected_task_rules
+            .lock()
+            .await
+            .remove(&key)
+            .unwrap_or_default()
     }
 
     fn load_all_models(&self) -> Result<(), String> {
@@ -784,8 +805,14 @@ impl TaskForwardModel {
                   prediction_source, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
-                    prediction_id, task_id, agent_id, round, state_key, prediction_json,
-                    source, created_at
+                    prediction_id,
+                    task_id,
+                    agent_id,
+                    round,
+                    state_key,
+                    prediction_json,
+                    source,
+                    created_at
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -815,7 +842,8 @@ impl TaskForwardModel {
     ) -> Result<(), String> {
         let db_path = self.db_path.clone();
         let prediction_id = error.prediction.prediction_id.clone();
-        let observation_json = serde_json::to_string(&error.observation).map_err(|e| e.to_string())?;
+        let observation_json =
+            serde_json::to_string(&error.observation).map_err(|e| e.to_string())?;
         let fidelity = error.fidelity.as_str().to_string();
         let composite_error = error.composite_error;
         let category = format!("{:?}", error.category).to_lowercase();
@@ -844,8 +872,14 @@ impl TaskForwardModel {
                      category = ?4, settled_at = ?5, brier_score = ?6, error_json = ?8
                  WHERE prediction_id = ?7",
                 params![
-                    observation_json, fidelity, composite_error, category, settled_at,
-                    brier_score, prediction_id, error_json
+                    observation_json,
+                    fidelity,
+                    composite_error,
+                    category,
+                    settled_at,
+                    brier_score,
+                    prediction_id,
+                    error_json
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -877,10 +911,16 @@ impl TaskForwardModel {
             let marginal_clone = marginal_model.clone();
             drop(models);
 
-            if let Some(handle) = self.save_model(&canonical_key, &agent_id, &canonical_clone).await {
+            if let Some(handle) = self
+                .save_model(&canonical_key, &agent_id, &canonical_clone)
+                .await
+            {
                 let _ = handle.await;
             }
-            if let Some(handle) = self.save_model(&marginal_key, &agent_id, &marginal_clone).await {
+            if let Some(handle) = self
+                .save_model(&marginal_key, &agent_id, &marginal_clone)
+                .await
+            {
                 let _ = handle.await;
             }
         }
@@ -945,10 +985,10 @@ impl TaskForwardModel {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::task_forward::{
         DiffOutcome, ObservationFidelity, RoundPhase, TaskObservation, diff,
     };
+    use super::*;
     use crate::prediction::engine::ErrorCategory;
     use crate::prediction::metacognition::AdaptiveThresholds;
 
@@ -1161,7 +1201,10 @@ mod tests {
         let mut pred2 = model.predict("t1", "agnes", 1, sk).await;
         pred2.prediction_id = uuid::Uuid::new_v4().to_string();
         let result = model.log_prediction(&pred2).await;
-        assert!(result.is_err(), "duplicate (task_id, round) must be rejected by the unique index");
+        assert!(
+            result.is_err(),
+            "duplicate (task_id, round) must be rejected by the unique index"
+        );
     }
 
     // ── WP-A9: get_prediction (settle-side lookup) ──
@@ -1191,7 +1234,10 @@ mod tests {
         // v1.54: the forward model is a default-ON platform capability.
         let dir = tempfile::tempdir().unwrap();
         let cfg = TaskForwardModelConfig::from_home(dir.path());
-        assert!(cfg.enabled, "no config.toml ⇒ enabled defaults to true (v1.54)");
+        assert!(
+            cfg.enabled,
+            "no config.toml ⇒ enabled defaults to true (v1.54)"
+        );
         assert_eq!(cfg, TaskForwardModelConfig::default());
     }
 
@@ -1218,8 +1264,14 @@ mod tests {
         let cfg = TaskForwardModelConfig::from_home(dir.path());
         assert!(cfg.enabled);
         assert_eq!(cfg.min_samples, 7);
-        assert_eq!(cfg.mature_n, MATURE_N, "unset field keeps the struct default");
-        assert!(cfg.rule_induction, "WP-A4 sub-switch defaults true (opt-out, not opt-in)");
+        assert_eq!(
+            cfg.mature_n, MATURE_N,
+            "unset field keeps the struct default"
+        );
+        assert!(
+            cfg.rule_induction,
+            "WP-A4 sub-switch defaults true (opt-out, not opt-in)"
+        );
     }
 
     #[test]
@@ -1253,8 +1305,14 @@ mod tests {
         // learning gates — so predict-act-verify, proper-scoring, and the
         // held-out rule gate run for every agent out of the box.
         let d = TaskForwardModelConfig::default();
-        assert!(d.calibration_enabled, "v1.54: calibration_enabled defaults ON");
-        assert!(d.held_out_gate_enabled, "v1.54: held_out_gate_enabled defaults ON");
+        assert!(
+            d.calibration_enabled,
+            "v1.54: calibration_enabled defaults ON"
+        );
+        assert!(
+            d.held_out_gate_enabled,
+            "v1.54: held_out_gate_enabled defaults ON"
+        );
         assert!(d.enabled, "v1.54: the master switch defaults ON too");
 
         // A config.toml with the section present but these keys unset inherits
@@ -1266,8 +1324,14 @@ mod tests {
         )
         .unwrap();
         let cfg = TaskForwardModelConfig::from_home(dir.path());
-        assert!(cfg.calibration_enabled, "unset calibration key inherits the ON default");
-        assert!(cfg.held_out_gate_enabled, "unset held-out key inherits the ON default");
+        assert!(
+            cfg.calibration_enabled,
+            "unset calibration key inherits the ON default"
+        );
+        assert!(
+            cfg.held_out_gate_enabled,
+            "unset held-out key inherits the ON default"
+        );
     }
 
     #[test]
@@ -1351,7 +1415,11 @@ mod tests {
         let DiffOutcome::Computed(err) = diff(pred, obs, &thresholds) else {
             panic!("should compute");
         };
-        assert_eq!(err.category, ErrorCategory::Negligible, "perfect-match fixture stays Negligible");
+        assert_eq!(
+            err.category,
+            ErrorCategory::Negligible,
+            "perfect-match fixture stays Negligible"
+        );
         model.settle_prediction(&err, true).await.unwrap();
         let expected = super::super::calibration::brier_binary(0.65, true);
         assert_eq!(read_brier_score(&db_path, &prediction_id), Some(expected));
@@ -1384,18 +1452,38 @@ mod tests {
     #[tokio::test]
     async fn injected_task_rules_distinguishes_task_and_round() {
         let (model, _dir) = temp_model().await;
-        model.record_injected_task_rules("t1", 1, vec!["r1".to_string()]).await;
-        model.record_injected_task_rules("t1", 2, vec!["r2".to_string()]).await;
-        model.record_injected_task_rules("t2", 1, vec!["r3".to_string()]).await;
+        model
+            .record_injected_task_rules("t1", 1, vec!["r1".to_string()])
+            .await;
+        model
+            .record_injected_task_rules("t1", 2, vec!["r2".to_string()])
+            .await;
+        model
+            .record_injected_task_rules("t2", 1, vec!["r3".to_string()])
+            .await;
 
-        assert_eq!(model.take_injected_task_rules("t1", 1).await, vec!["r1".to_string()]);
-        assert_eq!(model.take_injected_task_rules("t1", 2).await, vec!["r2".to_string()]);
-        assert_eq!(model.take_injected_task_rules("t2", 1).await, vec!["r3".to_string()]);
+        assert_eq!(
+            model.take_injected_task_rules("t1", 1).await,
+            vec!["r1".to_string()]
+        );
+        assert_eq!(
+            model.take_injected_task_rules("t1", 2).await,
+            vec!["r2".to_string()]
+        );
+        assert_eq!(
+            model.take_injected_task_rules("t2", 1).await,
+            vec!["r3".to_string()]
+        );
     }
 
     #[tokio::test]
     async fn injected_task_rules_never_recorded_is_empty() {
         let (model, _dir) = temp_model().await;
-        assert!(model.take_injected_task_rules("no-such-task", 1).await.is_empty());
+        assert!(
+            model
+                .take_injected_task_rules("no-such-task", 1)
+                .await
+                .is_empty()
+        );
     }
 }

@@ -7,7 +7,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use duduclaw_core::truncate_bytes;
 use axum::{
     Router,
     body::Bytes,
@@ -15,12 +14,13 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use duduclaw_core::truncate_bytes;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tracing::{error, info, warn};
 
-use crate::channel_reply::{ReplyContext, build_reply_with_session, set_channel_connected};
+use crate::channel_reply::{ReplyContext, build_guarded_reply_with_session, set_channel_connected};
 
 const GRAPH_API: &str = "https://graph.facebook.com/v20.0";
 
@@ -147,14 +147,13 @@ struct WhatsAppState {
 /// Create the WhatsApp webhook router.
 ///
 /// Returns `None` if WhatsApp is not configured.
-pub async fn start_whatsapp_webhook(
-    home_dir: &Path,
-    ctx: Arc<ReplyContext>,
-) -> Option<Router> {
+pub async fn start_whatsapp_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -> Option<Router> {
     let access_token = read_wa_config(home_dir, "whatsapp_access_token").await?;
     let verify_token = read_wa_config(home_dir, "whatsapp_verify_token").await?;
     let phone_number_id = read_wa_config(home_dir, "whatsapp_phone_number_id").await?;
-    let app_secret = read_wa_config(home_dir, "whatsapp_app_secret").await.unwrap_or_default();
+    let app_secret = read_wa_config(home_dir, "whatsapp_app_secret")
+        .await
+        .unwrap_or_default();
 
     if access_token.is_empty() || phone_number_id.is_empty() {
         return None;
@@ -178,7 +177,14 @@ pub async fn start_whatsapp_webhook(
     }
 
     info!("📱 WhatsApp webhook starting (phone: {phone_number_id})");
-    set_channel_connected(&ctx.channel_status, "whatsapp", true, None, Some(&ctx.event_tx)).await;
+    set_channel_connected(
+        &ctx.channel_status,
+        "whatsapp",
+        true,
+        None,
+        Some(&ctx.event_tx),
+    )
+    .await;
     // access_token / verify_token / app_secret / phone_number_id above are
     // used only to decide whether to mount the router at all — they are
     // intentionally not stored in `WhatsAppState` (WP-8A: see its doc
@@ -267,7 +273,9 @@ async fn receive_webhook(
     // token). The gating decision lives in the pure `webhook_signature_ok`
     // helper so it's covered by unit tests independent of axum state; the
     // branches below only decide which log message to emit.
-    let sig_str = headers.get("x-hub-signature-256").and_then(|h| h.to_str().ok());
+    let sig_str = headers
+        .get("x-hub-signature-256")
+        .and_then(|h| h.to_str().ok());
     if !webhook_signature_ok(&app_secret, sig_str, &body) {
         if app_secret.is_empty() {
             // Warn once per process so a misconfigured deployment doesn't
@@ -312,23 +320,39 @@ async fn receive_webhook(
                     }
 
                     let sender = &msg.from;
-                    let base_text = msg.text.as_ref().map(|t| t.body.clone()).unwrap_or_default();
+                    let base_text = msg
+                        .text
+                        .as_ref()
+                        .map(|t| t.body.clone())
+                        .unwrap_or_default();
                     let mut attachment_lines: Vec<String> = Vec::new();
                     // WP1.3: land inbound files under the resolved agent's dir.
-                    let attach_base = crate::channel_reply::resolve_attachment_base(
-                        state.ctx.as_ref(), None,
-                    ).await;
+                    let attach_base =
+                        crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), None)
+                            .await;
 
                     // ── Download and save media attachments ──
                     let media_info: Option<(&str, &str, &str)> = match msg.msg_type.as_str() {
                         "image" => msg.image.as_ref().map(|m| {
-                            (m.id.as_str(), m.mime_type.as_deref().unwrap_or("image/jpeg"), "image")
+                            (
+                                m.id.as_str(),
+                                m.mime_type.as_deref().unwrap_or("image/jpeg"),
+                                "image",
+                            )
                         }),
                         "audio" => msg.audio.as_ref().map(|m| {
-                            (m.id.as_str(), m.mime_type.as_deref().unwrap_or("audio/ogg"), "audio")
+                            (
+                                m.id.as_str(),
+                                m.mime_type.as_deref().unwrap_or("audio/ogg"),
+                                "audio",
+                            )
                         }),
                         "video" => msg.video.as_ref().map(|m| {
-                            (m.id.as_str(), m.mime_type.as_deref().unwrap_or("video/mp4"), "video")
+                            (
+                                m.id.as_str(),
+                                m.mime_type.as_deref().unwrap_or("video/mp4"),
+                                "video",
+                            )
                         }),
                         _ => None,
                     };
@@ -340,9 +364,17 @@ async fn receive_webhook(
                                 let mt = crate::media::media_type_from_mime(mime);
                                 let ext = crate::media::extension_from_mime(mime);
                                 let fname = format!("{type_label}.{ext}");
-                                match crate::media::save_attachment_in_base(&attach_base, &data, &fname).await {
+                                match crate::media::save_attachment_in_base(
+                                    &attach_base,
+                                    &data,
+                                    &fname,
+                                )
+                                .await
+                                {
                                     Ok(path) => {
-                                        attachment_lines.push(crate::media::format_attachment_ref(&mt, &fname, &path));
+                                        attachment_lines.push(crate::media::format_attachment_ref(
+                                            &mt, &fname, &path,
+                                        ));
                                     }
                                     Err(e) => warn!("Failed to save WhatsApp {type_label}: {e}"),
                                 }
@@ -353,15 +385,26 @@ async fn receive_webhook(
 
                     // Handle document (has filename)
                     if let Some(doc) = &msg.document {
-                        let mime = doc.mime_type.as_deref().unwrap_or("application/octet-stream");
+                        let mime = doc
+                            .mime_type
+                            .as_deref()
+                            .unwrap_or("application/octet-stream");
                         let fname = doc.filename.as_deref().unwrap_or("document");
                         info!("📩 WhatsApp [{sender}]: document ({fname})");
                         match download_media(&state.http, &access_token, &doc.id).await {
                             Ok(data) => {
                                 let mt = crate::media::media_type_from_mime(mime);
-                                match crate::media::save_attachment_in_base(&attach_base, &data, fname).await {
+                                match crate::media::save_attachment_in_base(
+                                    &attach_base,
+                                    &data,
+                                    fname,
+                                )
+                                .await
+                                {
                                     Ok(path) => {
-                                        attachment_lines.push(crate::media::format_attachment_ref(&mt, fname, &path));
+                                        attachment_lines.push(crate::media::format_attachment_ref(
+                                            &mt, fname, &path,
+                                        ));
                                     }
                                     Err(e) => warn!("Failed to save WhatsApp document: {e}"),
                                 }
@@ -377,11 +420,17 @@ async fn receive_webhook(
                     let mut context_lines: Vec<String> = Vec::new();
                     // Never prefix a chat command — the command parser matches
                     // on the leading slash of the whole input.
-                    if let Some(wa_ctx) = msg.context.as_ref().filter(|_| !base_text.trim_start().starts_with('/')) {
+                    if let Some(wa_ctx) = msg
+                        .context
+                        .as_ref()
+                        .filter(|_| !base_text.trim_start().starts_with('/'))
+                    {
                         if wa_ctx.forwarded || wa_ctx.frequently_forwarded {
-                            context_lines.push("〔此訊息為使用者轉發的內容，非使用者本人所寫〕".to_string());
+                            context_lines
+                                .push("〔此訊息為使用者轉發的內容，非使用者本人所寫〕".to_string());
                         }
-                        if wa_ctx.id.is_some() && !wa_ctx.forwarded && !wa_ctx.frequently_forwarded {
+                        if wa_ctx.id.is_some() && !wa_ctx.forwarded && !wa_ctx.frequently_forwarded
+                        {
                             context_lines.push(
                                 "〔使用者以「回覆」引用了一則先前訊息；WhatsApp 未附引用原文，請從近期對話推斷所指內容〕"
                                     .to_string(),
@@ -407,7 +456,10 @@ async fn receive_webhook(
                         continue;
                     }
 
-                    info!("📩 WhatsApp [{sender}]: {}", truncate_bytes(&input_text, 80));
+                    info!(
+                        "📩 WhatsApp [{sender}]: {}",
+                        truncate_bytes(&input_text, 80)
+                    );
 
                     // Chat commands
                     if crate::chat_commands::is_command(&input_text) {
@@ -420,8 +472,14 @@ async fn receive_webhook(
                                     .unwrap_or_default()
                             };
                             let reply = crate::chat_commands::handle_command(
-                                &cmd, &state.ctx, &session_id, &agent_id, true, sender,
-                            ).await;
+                                &cmd,
+                                &state.ctx,
+                                &session_id,
+                                &agent_id,
+                                true,
+                                sender,
+                            )
+                            .await;
                             send_text(&state.http, &access_token, &phone_id, sender, &reply).await;
                             continue;
                         }
@@ -431,7 +489,10 @@ async fn receive_webhook(
                     // the reply arrives; one-shot — tied to the inbound wamid).
                     if !msg.id.is_empty() {
                         crate::channel_typing::whatsapp_typing_once(
-                            &state.http, &access_token, &phone_id, &msg.id,
+                            &state.http,
+                            &access_token,
+                            &phone_id,
+                            &msg.id,
                         )
                         .await;
                     }
@@ -448,34 +509,56 @@ async fn receive_webhook(
                             .checked_sub(std::time::Duration::from_secs(120))
                             .unwrap_or_else(std::time::Instant::now),
                     ));
-                    let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
-                        if !matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. }) {
-                            return;
-                        }
-                        {
-                            let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
-                            let throttle =
-                                crate::channel_capabilities::progress_throttle_secs("whatsapp")
-                                    .unwrap_or(60);
-                            if last.elapsed().as_secs() < throttle {
+                    let on_progress: crate::channel_reply::ProgressCallback =
+                        Box::new(move |event| {
+                            if !matches!(
+                                event,
+                                crate::channel_reply::ProgressEvent::TodoUpdate { .. }
+                            ) {
                                 return;
                             }
-                            *last = std::time::Instant::now();
-                        }
-                        let msg_text = event.to_display();
-                        let c = progress_http.clone();
-                        let t = progress_token.clone();
-                        let p = progress_phone.clone();
-                        let to = progress_to.clone();
-                        tokio::spawn(async move {
-                            send_text(&c, &t, &p, &to, &msg_text).await;
+                            {
+                                let mut last =
+                                    last_progress.lock().unwrap_or_else(|e| e.into_inner());
+                                let throttle =
+                                    crate::channel_capabilities::progress_throttle_secs("whatsapp")
+                                        .unwrap_or(60);
+                                if last.elapsed().as_secs() < throttle {
+                                    return;
+                                }
+                                *last = std::time::Instant::now();
+                            }
+                            let msg_text = event.to_display();
+                            let c = progress_http.clone();
+                            let t = progress_token.clone();
+                            let p = progress_phone.clone();
+                            let to = progress_to.clone();
+                            tokio::spawn(async move {
+                                send_text(&c, &t, &p, &to, &msg_text).await;
+                            });
                         });
-                    });
 
                     let session_id = format!("whatsapp:{sender}");
-                    let reply = build_reply_with_session(
-                        &input_text, &state.ctx, &session_id, sender, Some(on_progress),
-                    ).await;
+                    let guarded = build_guarded_reply_with_session(
+                        &input_text,
+                        &state.ctx,
+                        &session_id,
+                        sender,
+                        Some(on_progress),
+                    )
+                    .await;
+
+                    if !guarded.still_valid().await {
+                        send_text(
+                            &state.http,
+                            &access_token,
+                            &phone_id,
+                            sender,
+                            crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+                        )
+                        .await;
+                        continue;
+                    }
 
                     // WP1.3: 📎DELIVER: outbound — upload generated files via
                     // the WhatsApp media API, strip the marker.
@@ -486,10 +569,27 @@ async fn receive_webhook(
                             to: sender.clone(),
                             http: state.http.clone(),
                         };
-                        crate::channel_reply::deliver_documents_for_reply(
-                            state.ctx.as_ref(), None, reply, &doc_sender,
-                        ).await
+                        crate::channel_reply::deliver_documents_for_reply_guarded(
+                            state.ctx.as_ref(),
+                            None,
+                            guarded.text.clone(),
+                            &doc_sender,
+                            Some(&guarded),
+                        )
+                        .await
                     };
+
+                    if !guarded.still_valid().await {
+                        send_text(
+                            &state.http,
+                            &access_token,
+                            &phone_id,
+                            sender,
+                            crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+                        )
+                        .await;
+                        continue;
+                    }
 
                     // Guard: don't send empty replies
                     if reply.trim().is_empty() {
@@ -501,6 +601,17 @@ async fn receive_webhook(
                     // tables → monospace blocks), chunked under the 4096 cap.
                     let formatted = crate::markdown_render::to_whatsapp_text(&reply);
                     for chunk in crate::channel_format::split_text(&formatted, 4000) {
+                        if !guarded.still_valid().await {
+                            send_text(
+                                &state.http,
+                                &access_token,
+                                &phone_id,
+                                sender,
+                                crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+                            )
+                            .await;
+                            break;
+                        }
                         send_text(&state.http, &access_token, &phone_id, sender, &chunk).await;
                     }
                 }
@@ -538,7 +649,10 @@ async fn send_text(
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            error!("WhatsApp send failed ({status}): {}", truncate_bytes(&text, 200));
+            error!(
+                "WhatsApp send failed ({status}): {}",
+                truncate_bytes(&text, 200)
+            );
         }
         Err(e) => error!("WhatsApp send error: {e}"),
         _ => {}
@@ -578,8 +692,13 @@ async fn download_media(
 
 /// Constant-time byte comparison to prevent timing attacks.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn verify_signature(body: &[u8], secret: &str, signature: &str) -> bool {
@@ -677,7 +796,11 @@ mod tests {
     fn test_webhook_signature_ok_rejects_invalid_signature() {
         let secret = "test_app_secret";
         let body = b"{\"entry\":[{\"changes\":[]}]}";
-        assert!(!webhook_signature_ok(secret, Some("sha256=0000forged0000"), body));
+        assert!(!webhook_signature_ok(
+            secret,
+            Some("sha256=0000forged0000"),
+            body
+        ));
         // Body tampered after signing (secret is correct, payload is not).
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(b"{\"entry\":[{\"changes\":[{\"tampered\":true}]}]}");

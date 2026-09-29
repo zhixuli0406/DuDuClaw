@@ -30,9 +30,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use duduclaw_odoo::{
-    AgentOdooConfig, OdooConfig, OdooConfigResolver, OdooConnector,
-};
+use duduclaw_odoo::{AgentOdooConfig, OdooConfig, OdooConfigResolver, OdooConnector};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
@@ -356,7 +354,10 @@ mod tests {
         let pool = OdooConnectorPool::default();
         pool.register_agent(
             "alpha-pm",
-            AgentOdooConfig { profile: Some("alpha".into()), ..Default::default() },
+            AgentOdooConfig {
+                profile: Some("alpha".into()),
+                ..Default::default()
+            },
         )
         .await;
         assert_eq!(
@@ -406,7 +407,11 @@ mod tests {
                 Arc::new(Mutex::new(PoolSlot::default())),
             );
         }
-        assert_eq!(pool.slots().await.len(), 2, "precondition: two seeded slots");
+        assert_eq!(
+            pool.slots().await.len(),
+            2,
+            "precondition: two seeded slots"
+        );
 
         pool.set_global(OdooConfig::default()).await;
 
@@ -436,7 +441,10 @@ mod tests {
         // The override changes `profile`, which changes the pool key.
         pool.register_agent(
             "alpha-pm",
-            AgentOdooConfig { profile: Some("alpha".into()), ..Default::default() },
+            AgentOdooConfig {
+                profile: Some("alpha".into()),
+                ..Default::default()
+            },
         )
         .await;
 
@@ -465,11 +473,18 @@ mod tests {
 
         pool.register_agent(
             "beta-pm",
-            AgentOdooConfig { allowed_models: vec!["res.partner".into()], ..Default::default() },
+            AgentOdooConfig {
+                allowed_models: vec!["res.partner".into()],
+                ..Default::default()
+            },
         )
         .await;
 
-        assert_eq!(pool.pool_key("beta-pm").await, key, "profile unchanged ⇒ same key");
+        assert_eq!(
+            pool.pool_key("beta-pm").await,
+            key,
+            "profile unchanged ⇒ same key"
+        );
         assert!(pool.slots().await.is_empty());
     }
 
@@ -513,12 +528,13 @@ mod tests {
             ..Default::default()
         };
 
-        let creds =
-            OdooConnectorPool::merge_credentials(&global, Some(&agent_cfg), |enc: String| async move {
-                Ok(format!("dec({enc})"))
-            })
-            .await
-            .unwrap();
+        let creds = OdooConnectorPool::merge_credentials(
+            &global,
+            Some(&agent_cfg),
+            |enc: String| async move { Ok(format!("dec({enc})")) },
+        )
+        .await
+        .unwrap();
         assert_eq!(creds.credential, "dec(ENC_ALPHA)");
         assert_eq!(creds.config.username, "alpha_user");
     }
@@ -541,12 +557,13 @@ mod tests {
         let mut global = OdooConfig::default();
         global.api_key_enc = "secret://vault/odoo-api-key".into();
 
-        let creds = OdooConnectorPool::merge_credentials(&global, None, |cred: String| async move {
-            assert!(cred.starts_with("secret://"));
-            Ok(format!("resolved({cred})"))
-        })
-        .await
-        .unwrap();
+        let creds =
+            OdooConnectorPool::merge_credentials(&global, None, |cred: String| async move {
+                assert!(cred.starts_with("secret://"));
+                Ok(format!("resolved({cred})"))
+            })
+            .await
+            .unwrap();
         assert_eq!(creds.credential, "resolved(secret://vault/odoo-api-key)");
     }
 

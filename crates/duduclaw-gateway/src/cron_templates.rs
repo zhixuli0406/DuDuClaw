@@ -10,7 +10,7 @@
 //! so a typo can never ship a template that the scheduler would reject.
 
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// One preset routine template surfaced in the dashboard.
 ///

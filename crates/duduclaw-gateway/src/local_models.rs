@@ -190,7 +190,11 @@ pub async fn install(
             downloader::download_model_shards(&triples, &dest_dir, Some(progress)).await
         } else {
             let url = format!("https://huggingface.co/{repo_owned}/resolve/main/{file_owned}");
-            let base = file_owned.rsplit('/').next().unwrap_or(&file_owned).to_string();
+            let base = file_owned
+                .rsplit('/')
+                .next()
+                .unwrap_or(&file_owned)
+                .to_string();
             downloader::download_model(&url, "", &dest_dir, &base, Some(progress)).await
         };
 
@@ -213,10 +217,13 @@ pub async fn install(
         }
     });
 
-    registry()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(id, JobSlot { job, handle: Some(handle) });
+    registry().lock().unwrap_or_else(|p| p.into_inner()).insert(
+        id,
+        JobSlot {
+            job,
+            handle: Some(handle),
+        },
+    );
     Ok(id)
 }
 
@@ -232,7 +239,9 @@ pub fn install_status() -> serde_json::Value {
 /// left in place so a re-install resumes from where it stopped.
 pub fn cancel(job_id: u64) -> Result<(), String> {
     let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
-    let slot = reg.get_mut(&job_id).ok_or_else(|| "查無此下載任務".to_string())?;
+    let slot = reg
+        .get_mut(&job_id)
+        .ok_or_else(|| "查無此下載任務".to_string())?;
     if let Some(handle) = slot.handle.take() {
         handle.abort();
     }
@@ -254,7 +263,9 @@ pub async fn remove(filename: &str, home_dir: &Path) -> Result<(), String> {
         return Err(format!("檔名不合法：{filename}"));
     }
     let path = home_dir.join("models").join(filename);
-    tokio::fs::remove_file(&path).await.map_err(|e| format!("刪除失敗：{e}"))
+    tokio::fs::remove_file(&path)
+        .await
+        .map_err(|e| format!("刪除失敗：{e}"))
 }
 
 #[cfg(test)]
@@ -286,16 +297,28 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn install_rejects_bad_repo_and_duplicate() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(install("no-slash", "f.gguf", vec![], 0, dir.path()).await.is_err());
+        assert!(
+            install("no-slash", "f.gguf", vec![], 0, dir.path())
+                .await
+                .is_err()
+        );
         // A queued job blocks a duplicate for the same (repo, file). The
         // spawned download will fail fast (fake repo) — that's fine, the
         // dedup check happens against the registered state first.
-        let id = install("org/fake-repo-x", "f.gguf", vec![], 10, dir.path()).await.unwrap();
+        let id = install("org/fake-repo-x", "f.gguf", vec![], 10, dir.path())
+            .await
+            .unwrap();
         let dup = install("org/fake-repo-x", "f.gguf", vec![], 10, dir.path()).await;
         assert!(dup.is_err());
         let _ = cancel(id);
         let status = install_status();
-        assert!(status["jobs"].as_array().unwrap().iter().any(|j| j["id"] == id));
+        assert!(
+            status["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|j| j["id"] == id)
+        );
     }
 
     #[test]

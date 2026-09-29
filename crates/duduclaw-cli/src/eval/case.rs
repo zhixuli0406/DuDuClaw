@@ -55,12 +55,21 @@ pub struct CaseMeta {
     pub agent: String,
     /// The user prompt sent to the agent.
     pub prompt: String,
+    /// P2b full-team probe only. This is the frozen goal contract shown to
+    /// planner and verifier; ordinary executor/verifier cells ignore it.
+    #[serde(default)]
+    pub team_acceptance: Option<String>,
     /// Optional system prompt override passed via `--system-prompt-file`.
     #[serde(default)]
     pub system_prompt: Option<String>,
     /// Model id (default [`DEFAULT_EVAL_MODEL`]).
     #[serde(default)]
     pub model: Option<String>,
+    /// Pinned backend for this case's committed transcript. Absent means
+    /// Claude, preserving every existing suite. A non-Claude recording must
+    /// declare this together with its model; CLI overrides still cannot record.
+    #[serde(default)]
+    pub runtime: Option<String>,
     /// Live-run wall-clock budget.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
@@ -173,6 +182,20 @@ impl EvalCaseFile {
         if self.case.prompt.trim().is_empty() {
             return Err("[case] prompt must not be empty".into());
         }
+        if let Some(runtime) = self.case.runtime.as_deref() {
+            let provider =
+                duduclaw_core::types::RuntimeType::from_id(runtime).ok_or_else(|| {
+                    format!("[case] runtime {runtime:?} is not a runtime on this build")
+                })?;
+            let Some(model) = self.case.model.as_deref().filter(|m| !m.trim().is_empty()) else {
+                return Err("[case] runtime requires a pinned [case] model".into());
+            };
+            if !duduclaw_gateway::runtime_config::model_matches_provider(model, provider) {
+                return Err(format!(
+                    "[case] model {model:?} does not match runtime {runtime:?}"
+                ));
+            }
+        }
         if !(1..=3600).contains(&self.case.timeout_secs) {
             return Err("[case] timeout_secs must be 1..=3600".into());
         }
@@ -180,8 +203,7 @@ impl EvalCaseFile {
             return Err("[case] max_turns must be 1..=100".into());
         }
         if let Some(t) = &self.case.transcript {
-            validate_relative_path(t)
-                .map_err(|e| format!("[case] transcript {t:?}: {e}"))?;
+            validate_relative_path(t).map_err(|e| format!("[case] transcript {t:?}: {e}"))?;
         }
         if let Some(re) = &self.expect.output_regex {
             regex::Regex::new(re)
@@ -224,6 +246,29 @@ impl EvalCaseFile {
     pub fn model(&self) -> &str {
         self.case.model.as_deref().unwrap_or(DEFAULT_EVAL_MODEL)
     }
+
+    /// The runtime this case pins, when it pins one.
+    ///
+    /// `None` ⇒ the case declares no runtime and the caller's own default
+    /// (Claude) applies. `validate()` has already refused an id that is not a
+    /// runtime on this build **and** a `runtime` without a `model`, so the
+    /// parse here cannot silently fall back to Claude for a typo'd id — but it
+    /// returns `Option` rather than unwrapping because `runtime()` may be
+    /// called on a case built in a test without going through `validate`.
+    ///
+    /// Review finding 10: this accessor is what
+    /// [`super::runner::RunOverrides::effective_runtime`] needs. Before it
+    /// existed, `[case] runtime = "codex"` was validated and then read by
+    /// nobody, so `--record` handed the case's `gpt-5.6-sol` to the **Claude**
+    /// CLI as a `--model` and the declared non-Claude baseline never happened.
+    pub fn runtime(&self) -> Option<duduclaw_core::types::RuntimeType> {
+        self.case
+            .runtime
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .and_then(duduclaw_core::types::RuntimeType::from_id)
+    }
 }
 
 /// Reject absolute paths and parent-directory escapes in a case-relative
@@ -259,8 +304,8 @@ fn validate_relative_path(p: &str) -> Result<(), String> {
 pub fn load_case(path: &Path) -> Result<EvalCaseFile, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let parsed: EvalCaseFile = toml::from_str(&raw)
-        .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    let parsed: EvalCaseFile =
+        toml::from_str(&raw).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
     parsed
         .validate()
         .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -295,8 +340,8 @@ pub fn discover_cases(root: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn collect_toml(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
         let path = entry.path();
@@ -314,9 +359,7 @@ mod tests {
     use super::*;
 
     fn minimal(extra: &str) -> String {
-        format!(
-            "[case]\nname = \"t1\"\nagent = \"support-bot\"\nprompt = \"hi\"\n{extra}"
-        )
+        format!("[case]\nname = \"t1\"\nagent = \"support-bot\"\nprompt = \"hi\"\n{extra}")
     }
 
     #[test]
@@ -328,6 +371,37 @@ mod tests {
         assert_eq!(case.case.timeout_secs, 180);
         assert_eq!(case.case.max_turns, 25);
         assert_eq!(case.model(), DEFAULT_EVAL_MODEL);
+    }
+
+    #[test]
+    fn pinned_runtime_requires_a_model_and_known_backend() {
+        let valid: EvalCaseFile = toml::from_str(&minimal(
+            "runtime = \"codex\"\nmodel = \"gpt-5.6-sol\"\n[expect]\noutput_contains = [\"ok\"]\n",
+        ))
+        .unwrap();
+        valid.validate().unwrap();
+        assert_eq!(valid.case.runtime.as_deref(), Some("codex"));
+
+        let missing_model: EvalCaseFile =
+            toml::from_str(&minimal("runtime = \"codex\"\n")).unwrap();
+        assert!(missing_model.validate().unwrap_err().contains("pinned"));
+
+        let unknown: EvalCaseFile = toml::from_str(&minimal(
+            "runtime = \"not-a-runtime\"\nmodel = \"some-model\"\n",
+        ))
+        .unwrap();
+        assert!(unknown.validate().unwrap_err().contains("not a runtime"));
+
+        let mismatched: EvalCaseFile = toml::from_str(&minimal(
+            "runtime = \"codex\"\nmodel = \"claude-haiku-4-5\"\n",
+        ))
+        .unwrap();
+        assert!(
+            mismatched
+                .validate()
+                .unwrap_err()
+                .contains("does not match")
+        );
     }
 
     #[test]
@@ -402,7 +476,10 @@ mod tests {
         let case: EvalCaseFile = toml::from_str(&toml).unwrap();
         case.validate().unwrap();
         assert_eq!(case.expect.grounded[0].min_overlap_chars, 20);
-        assert_eq!(case.expect.grounded[0].output_regex.as_deref(), Some("(?i)refund"));
+        assert_eq!(
+            case.expect.grounded[0].output_regex.as_deref(),
+            Some("(?i)refund")
+        );
     }
 
     #[test]

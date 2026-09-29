@@ -660,7 +660,8 @@ mod tests {
         let l = tainted_ledger(payload);
         assert_eq!(l.span_count(), 1);
         assert_eq!(
-            l.check_args(&json!({"body": format!("好的，{payload}，馬上")})).len(),
+            l.check_args(&json!({"body": format!("好的，{payload}，馬上")}))
+                .len(),
             1
         );
 
@@ -737,9 +738,10 @@ mod tests {
         l.register("curated wiki paragraph content", SourceKind::Wiki);
         l.register("remembered semantic fact content", SourceKind::Memory);
         assert_eq!(l.span_count(), 0);
-        assert!(l
-            .check_args(&json!({"q": "curated wiki paragraph content"}))
-            .is_empty());
+        assert!(
+            l.check_args(&json!({"q": "curated wiki paragraph content"}))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -800,9 +802,10 @@ mod tests {
         let l = seed_default_ledger(&req);
         assert_eq!(l.span_count(), 2);
         // System prompt text does NOT taint.
-        assert!(l
-            .check_args(&json!({"q": "system prompt trusted content"}))
-            .is_empty());
+        assert!(
+            l.check_args(&json!({"q": "system prompt trusted content"}))
+                .is_empty()
+        );
         // User + tool-result text does.
         assert_eq!(
             l.check_args(&json!({"q": "user tainted message content"}))
@@ -940,10 +943,11 @@ mod tests {
         // Args are clean, but coverage is incomplete → block (fail-closed).
         let d = evaluate_call(&c, &l, "send_email", &json!({"body": "clean text here"}));
         assert!(d.block_reason.is_some());
-        assert!(d
-            .flags
-            .iter()
-            .any(|f| f.kind == FlagKind::LedgerOverflow && f.blocked));
+        assert!(
+            d.flags
+                .iter()
+                .any(|f| f.kind == FlagKind::LedgerOverflow && f.blocked)
+        );
         // Non-sensitive tools still run even under overflow.
         let d = evaluate_call(&c, &l, "search", &json!({"q": "clean"}));
         assert!(d.block_reason.is_none());
@@ -951,9 +955,10 @@ mod tests {
         let c = cfg(ProvenancePolicy::Warn, &["send_email"]);
         let d = evaluate_call(&c, &l, "send_email", &json!({"body": "clean text here"}));
         assert!(d.block_reason.is_none());
-        assert!(d
-            .flags
-            .iter()
-            .any(|f| f.kind == FlagKind::LedgerOverflow && !f.blocked));
+        assert!(
+            d.flags
+                .iter()
+                .any(|f| f.kind == FlagKind::LedgerOverflow && !f.blocked)
+        );
     }
 }

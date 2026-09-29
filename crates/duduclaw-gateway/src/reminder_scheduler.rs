@@ -175,7 +175,9 @@ fn parse_relative_duration(input: &str) -> Result<Duration, String> {
             num_buf.push(ch);
         } else {
             if num_buf.is_empty() {
-                return Err(format!("Unexpected character '{ch}' without preceding number"));
+                return Err(format!(
+                    "Unexpected character '{ch}' without preceding number"
+                ));
             }
             let n: i64 = num_buf
                 .parse()
@@ -204,9 +206,7 @@ fn parse_relative_duration(input: &str) -> Result<Duration, String> {
     }
 
     if !found_any || total_secs <= 0 {
-        return Err(format!(
-            "Duration must be positive. Got: '{input}'"
-        ));
+        return Err(format!("Duration must be positive. Got: '{input}'"));
     }
 
     Ok(Duration::seconds(total_secs))
@@ -311,10 +311,18 @@ async fn build_reminder_typing_guard(
     }
     let config = read_config(home_dir).await?;
     let token = decrypt_channel_token(
-        &config, "telegram_bot_token_enc", "telegram_bot_token", home_dir,
-    ).await;
+        &config,
+        "telegram_bot_token_enc",
+        "telegram_bot_token",
+        home_dir,
+    )
+    .await;
     crate::channel_typing::typing_guard_for(
-        http.clone(), "telegram", &reminder.chat_id, None, &token,
+        http.clone(),
+        "telegram",
+        &reminder.chat_id,
+        None,
+        &token,
     )
 }
 
@@ -333,8 +341,7 @@ fn acquire_lock(home_dir: &Path) -> Result<std::fs::File, String> {
         .write(true)
         .open(lock_path(home_dir))
         .map_err(|e| format!("Failed to open lockfile: {e}"))?;
-    duduclaw_core::platform::flock_exclusive(&file)
-        .map_err(|e| format!("flock failed: {e}"))?;
+    duduclaw_core::platform::flock_exclusive(&file).map_err(|e| format!("flock failed: {e}"))?;
     Ok(file)
 }
 
@@ -380,12 +387,11 @@ fn save_reminders_sync(home_dir: &Path, reminders: &[Reminder]) -> Result<(), St
 
     std::fs::write(&tmp_path, &content)
         .map_err(|e| format!("Failed to write temp reminders: {e}"))?;
-    std::fs::rename(&tmp_path, &path)
-        .map_err(|e| {
-            // Clean up tmp on rename failure
-            let _ = std::fs::remove_file(&tmp_path);
-            format!("Failed to rename temp reminders: {e}")
-        })?;
+    std::fs::rename(&tmp_path, &path).map_err(|e| {
+        // Clean up tmp on rename failure
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("Failed to rename temp reminders: {e}")
+    })?;
     Ok(())
 }
 
@@ -438,7 +444,9 @@ pub async fn append_reminder_checked(
 
         let pending_count = reminders
             .iter()
-            .filter(|existing| existing.status == ReminderStatus::Pending && existing.agent_id == agent)
+            .filter(|existing| {
+                existing.status == ReminderStatus::Pending && existing.agent_id == agent
+            })
             .count();
 
         if pending_count >= max_per_agent {
@@ -475,10 +483,7 @@ pub struct ReminderScheduler {
 }
 
 impl ReminderScheduler {
-    pub fn new(
-        home_dir: PathBuf,
-        registry: Arc<RwLock<AgentRegistry>>,
-    ) -> Self {
+    pub fn new(home_dir: PathBuf, registry: Arc<RwLock<AgentRegistry>>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -578,10 +583,7 @@ impl ReminderScheduler {
 
         {
             let mut wheel = self.time_wheel.write().await;
-            let due_keys: Vec<DateTime<Utc>> = wheel
-                .range(..=now)
-                .map(|(k, _)| *k)
-                .collect();
+            let due_keys: Vec<DateTime<Utc>> = wheel.range(..=now).map(|(k, _)| *k).collect();
 
             for key in due_keys {
                 if let Some(reminders) = wheel.remove(&key) {
@@ -715,7 +717,8 @@ async fn run_gc(home_dir: &Path) {
             }
             // Remove delivered/cancelled/failed older than 24h
             // If created_at is missing, use trigger_at as fallback
-            let ts = r.created_at
+            let ts = r
+                .created_at
                 .as_ref()
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&Utc))
@@ -750,17 +753,12 @@ async fn deliver_reminder(
     reminder: &Reminder,
 ) -> Result<(), String> {
     let text = match reminder.mode {
-        ReminderMode::Direct => {
-            reminder
-                .message
-                .clone()
-                .unwrap_or_else(|| "(empty reminder)".to_string())
-        }
+        ReminderMode::Direct => reminder
+            .message
+            .clone()
+            .unwrap_or_else(|| "(empty reminder)".to_string()),
         ReminderMode::AgentCallback => {
-            let prompt = reminder
-                .prompt
-                .as_deref()
-                .unwrap_or("(no prompt provided)");
+            let prompt = reminder.prompt.as_deref().unwrap_or("(no prompt provided)");
 
             // Scan prompt for injection before sending to Claude
             let scan = input_guard::scan_input(prompt, input_guard::DEFAULT_BLOCK_THRESHOLD);
@@ -771,10 +769,7 @@ async fn deliver_reminder(
                 ));
             }
 
-            let full_prompt = format!(
-                "[Reminder Callback: {}] {}",
-                reminder.id, prompt
-            );
+            let full_prompt = format!("[Reminder Callback: {}] {}", reminder.id, prompt);
 
             // Best-effort typing indicator on the reminder's own delivery
             // channel for the duration of the CLI call — AgentCallback
@@ -800,7 +795,10 @@ async fn deliver_reminder(
     // its single 2s retry). Held across the channel I/O, NOT across the LLM call
     // above. The permit is dropped at the end of this scope.
     {
-        let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
+        let _permit = sem
+            .acquire()
+            .await
+            .map_err(|_| "Semaphore closed".to_string())?;
 
         // Retry once on failure
         let result =
@@ -869,7 +867,9 @@ pub async fn cancel_reminder(
             if r.id == id_owned && r.status == ReminderStatus::Pending {
                 if let Some(ref caller) = caller_owned {
                     if r.agent_id != *caller {
-                        return Err("Permission denied: you can only cancel your own reminders".to_string());
+                        return Err(
+                            "Permission denied: you can only cancel your own reminders".to_string()
+                        );
                     }
                 }
                 r.status = ReminderStatus::Cancelled;
@@ -921,9 +921,13 @@ telegram_bot_token = "plain-tg-token"
 "#
         .parse()
         .unwrap();
-        let token =
-            decrypt_channel_token(&config, "telegram_bot_token_enc", "telegram_bot_token", &home)
-                .await;
+        let token = decrypt_channel_token(
+            &config,
+            "telegram_bot_token_enc",
+            "telegram_bot_token",
+            &home,
+        )
+        .await;
         assert_eq!(token, "plain-tg-token");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -939,9 +943,13 @@ telegram_bot_token = "secret://vault/tg-token"
 "#
         .parse()
         .unwrap();
-        let token =
-            decrypt_channel_token(&config, "telegram_bot_token_enc", "telegram_bot_token", &home)
-                .await;
+        let token = decrypt_channel_token(
+            &config,
+            "telegram_bot_token_enc",
+            "telegram_bot_token",
+            &home,
+        )
+        .await;
         assert_eq!(token, "");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -971,7 +979,9 @@ telegram_bot_token = "secret://vault/tg-token"
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_target_slack_missing_token_errors() {
         let home = tmp_home();
-        let err = resolve_channel_target(&home, "slack", "C123").await.unwrap_err();
+        let err = resolve_channel_target(&home, "slack", "C123")
+            .await
+            .unwrap_err();
         assert!(err.contains("slack_bot_token"), "got: {err}");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -980,7 +990,9 @@ telegram_bot_token = "secret://vault/tg-token"
     async fn resolve_target_slack_token_present_resolves() {
         let home = tmp_home();
         write_config(&home, "[channels]\nslack_bot_token = \"xoxb-test\"\n");
-        let target = resolve_channel_target(&home, "slack", "C123").await.unwrap();
+        let target = resolve_channel_target(&home, "slack", "C123")
+            .await
+            .unwrap();
         assert_eq!(target.channel_type, "slack");
         assert_eq!(target.token, "xoxb-test");
         assert_eq!(target.chat_id, "C123");
@@ -998,9 +1010,14 @@ telegram_bot_token = "secret://vault/tg-token"
             &home,
             "[channels]\ngooglechat_service_account_json = \"marker-only\"\n",
         );
-        let target = resolve_channel_target(&home, "googlechat", "spaces/AAAA").await.unwrap();
+        let target = resolve_channel_target(&home, "googlechat", "spaces/AAAA")
+            .await
+            .unwrap();
         assert_eq!(target.channel_type, "googlechat");
-        assert_eq!(target.token, "", "self-configuring sender ignores this field");
+        assert_eq!(
+            target.token, "",
+            "self-configuring sender ignores this field"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1010,7 +1027,10 @@ telegram_bot_token = "secret://vault/tg-token"
         let err = resolve_channel_target(&home, "googlechat", "spaces/AAAA")
             .await
             .unwrap_err();
-        assert!(err.contains("googlechat_service_account_json"), "got: {err}");
+        assert!(
+            err.contains("googlechat_service_account_json"),
+            "got: {err}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1018,7 +1038,9 @@ telegram_bot_token = "secret://vault/tg-token"
     async fn resolve_target_wecom_marker_present_resolves() {
         let home = tmp_home();
         write_config(&home, "[channels]\nwecom_corp_secret = \"marker-only\"\n");
-        let target = resolve_channel_target(&home, "wecom", "zhangsan").await.unwrap();
+        let target = resolve_channel_target(&home, "wecom", "zhangsan")
+            .await
+            .unwrap();
         assert_eq!(target.channel_type, "wecom");
         assert_eq!(target.chat_id, "zhangsan");
         let _ = std::fs::remove_dir_all(&home);
@@ -1027,7 +1049,9 @@ telegram_bot_token = "secret://vault/tg-token"
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_target_wecom_marker_absent_errors() {
         let home = tmp_home();
-        let err = resolve_channel_target(&home, "wecom", "zhangsan").await.unwrap_err();
+        let err = resolve_channel_target(&home, "wecom", "zhangsan")
+            .await
+            .unwrap_err();
         assert!(err.contains("wecom_corp_secret"), "got: {err}");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1039,7 +1063,9 @@ telegram_bot_token = "secret://vault/tg-token"
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_target_webchat_is_refused_not_silently_dropped() {
         let home = tmp_home();
-        let err = resolve_channel_target(&home, "webchat", "conn-1").await.unwrap_err();
+        let err = resolve_channel_target(&home, "webchat", "conn-1")
+            .await
+            .unwrap_err();
         assert!(err.contains("webchat"), "got: {err}");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1100,7 +1126,9 @@ telegram_bot_token = "secret://vault/tg-token"
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_target_feishu_missing_config_errors_without_network() {
         let home = tmp_home();
-        let err = resolve_channel_target(&home, "feishu", "oc_xxx").await.unwrap_err();
+        let err = resolve_channel_target(&home, "feishu", "oc_xxx")
+            .await
+            .unwrap_err();
         assert!(err.contains("feishu_app_id"), "got: {err}");
         let _ = std::fs::remove_dir_all(&home);
     }

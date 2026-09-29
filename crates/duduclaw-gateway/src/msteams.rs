@@ -29,18 +29,18 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
-use axum::Router;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use duduclaw_core::truncate_bytes;
 
-use crate::channel_reply::{build_reply_with_session, set_channel_connected, ReplyContext};
+use crate::channel_reply::{ReplyContext, build_guarded_reply_with_session, set_channel_connected};
 
 const BF_JWKS_URL: &str = "https://login.botframework.com/v1/.well-known/keys";
 const BF_ISSUER: &str = "https://api.botframework.com";
@@ -87,7 +87,9 @@ impl TeamsCreds {
         if app_id.trim().is_empty() || app_password.trim().is_empty() {
             return None;
         }
-        let tenant_id = read_config(home_dir, "teams_tenant_id").await.unwrap_or_default();
+        let tenant_id = read_config(home_dir, "teams_tenant_id")
+            .await
+            .unwrap_or_default();
         Some(TeamsCreds {
             home_dir: home_dir.to_path_buf(),
             app_id,
@@ -161,7 +163,10 @@ impl TeamsCreds {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("token status {status}: {}", truncate_bytes(&body, 200)));
+            return Err(format!(
+                "token status {status}: {}",
+                truncate_bytes(&body, 200)
+            ));
         }
         let body: serde_json::Value = resp.json().await.map_err(|e| format!("token parse: {e}"))?;
         let token = body
@@ -258,8 +263,10 @@ fn save_conversation_ref(home_dir: &Path, conversation_id: &str, conv: Conversat
         store.insert(cid.clone(), conv.clone());
         // Prune oldest entries past the cap.
         if store.len() > CONV_STORE_CAP {
-            let mut by_age: Vec<(String, u64)> =
-                store.iter().map(|(k, v)| (k.clone(), v.updated_at)).collect();
+            let mut by_age: Vec<(String, u64)> = store
+                .iter()
+                .map(|(k, v)| (k.clone(), v.updated_at))
+                .collect();
             by_age.sort_by_key(|(_, t)| *t);
             for (k, _) in by_age.into_iter().take(store.len() - CONV_STORE_CAP) {
                 store.remove(&k);
@@ -285,10 +292,17 @@ pub fn lookup_conversation_ref(home_dir: &Path, conversation_id: &str) -> Option
 /// consistently present on every activity (Teams only sometimes includes
 /// it), and 1:1 chat activities carry no `team`/`channel` block at all — a
 /// missing field maps to `None` here, never guessed at.
-fn extract_teams_coords(activity: &serde_json::Value) -> (Option<String>, Option<String>, Option<String>) {
-    let non_empty = |v: &serde_json::Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
-    let group_id = activity.pointer("/channelData/team/aadGroupId").and_then(non_empty);
-    let channel_name = activity.pointer("/channelData/channel/name").and_then(non_empty);
+fn extract_teams_coords(
+    activity: &serde_json::Value,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let non_empty =
+        |v: &serde_json::Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    let group_id = activity
+        .pointer("/channelData/team/aadGroupId")
+        .and_then(non_empty);
+    let channel_name = activity
+        .pointer("/channelData/channel/name")
+        .and_then(non_empty);
     let tenant_id = activity
         .pointer("/channelData/tenant/id")
         .or_else(|| activity.pointer("/conversation/tenantId"))
@@ -303,7 +317,9 @@ pub async fn send_text_to_conversation(
     conversation_id: &str,
     markdown: &str,
 ) -> Result<(), String> {
-    send_text_to_conversation_with_id(home_dir, conversation_id, markdown).await.map(|_| ())
+    send_text_to_conversation_with_id(home_dir, conversation_id, markdown)
+        .await
+        .map(|_| ())
 }
 
 /// Like [`send_text_to_conversation`] but returns the FIRST chunk's activity
@@ -346,16 +362,33 @@ pub(crate) async fn send_text_to_conversation_with_id(
 /// Read config and build the Teams webhook router. `None` when unconfigured.
 pub async fn start_teams_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -> Option<Router> {
     let creds = TeamsCreds::from_config(home_dir).await?;
-    let state = Arc::new(TeamsState { ctx: ctx.clone(), creds });
+    let state = Arc::new(TeamsState {
+        ctx: ctx.clone(),
+        creds,
+    });
 
     match state.creds.get_token().await {
         Ok(_) => {
             info!("✅ Microsoft Teams webhook ready at /webhook/teams");
-            set_channel_connected(&ctx.channel_status, "teams", true, None, Some(&ctx.event_tx)).await;
+            set_channel_connected(
+                &ctx.channel_status,
+                "teams",
+                true,
+                None,
+                Some(&ctx.event_tx),
+            )
+            .await;
         }
         Err(e) => {
             warn!("Teams: connector auth failed (webhook still mounted): {e}");
-            set_channel_connected(&ctx.channel_status, "teams", false, Some(e), Some(&ctx.event_tx)).await;
+            set_channel_connected(
+                &ctx.channel_status,
+                "teams",
+                false,
+                Some(e),
+                Some(&ctx.event_tx),
+            )
+            .await;
         }
     }
 
@@ -441,7 +474,11 @@ async fn webhook_handler(
         .get("serviceUrl")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if let Some(claim_url) = claims.get("serviceurl").or_else(|| claims.get("serviceUrl")).and_then(|v| v.as_str()) {
+    if let Some(claim_url) = claims
+        .get("serviceurl")
+        .or_else(|| claims.get("serviceUrl"))
+        .and_then(|v| v.as_str())
+    {
         // Compare ignoring a single trailing slash.
         if claim_url.trim_end_matches('/') != activity_service_url.trim_end_matches('/') {
             warn!("Teams webhook: serviceUrl claim mismatch");
@@ -518,10 +555,16 @@ fn teams_quoted_context(activity: &serde_json::Value) -> Option<String> {
             continue;
         }
         let html = a.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let Some(open) = html.find("<blockquote") else { continue };
-        let Some(tag_end) = html[open..].find('>') else { continue };
+        let Some(open) = html.find("<blockquote") else {
+            continue;
+        };
+        let Some(tag_end) = html[open..].find('>') else {
+            continue;
+        };
         let body_start = open + tag_end + 1;
-        let Some(body_len) = html[body_start..].find("</blockquote>") else { continue };
+        let Some(body_len) = html[body_start..].find("</blockquote>") else {
+            continue;
+        };
         let quote = html_to_text(&html[body_start..body_start + body_len]);
         if !quote.is_empty() {
             return Some(crate::channel_format::format_quoted_context(
@@ -543,10 +586,16 @@ fn teams_quoted_reply_id(activity: &serde_json::Value) -> Option<String> {
             continue;
         }
         let html = a.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let Some(open) = html.find("<blockquote") else { continue };
-        let Some(tag_end) = html[open..].find('>') else { continue };
+        let Some(open) = html.find("<blockquote") else {
+            continue;
+        };
+        let Some(tag_end) = html[open..].find('>') else {
+            continue;
+        };
         let tag = &html[open..open + tag_end];
-        let Some(id_pos) = tag.find("itemid=\"") else { continue };
+        let Some(id_pos) = tag.find("itemid=\"") else {
+            continue;
+        };
         let rest = &tag[id_pos + "itemid=\"".len()..];
         let Some(end) = rest.find('"') else { continue };
         let id = rest[..end].trim();
@@ -599,7 +648,11 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         warn!("Teams: message activity missing serviceUrl/conversation.id");
         return;
     }
-    let activity_id = activity.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let activity_id = activity
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let sender_name = activity
         .pointer("/from/name")
         .and_then(|v| v.as_str())
@@ -629,7 +682,8 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
     // activity that doesn't carry `channelData` (a bare follow-up message,
     // or Teams simply not sending it that time) never regresses an
     // already-known coordinate back to `None`.
-    let (mut teams_group_id, mut teams_channel_name, mut teams_tenant_id) = extract_teams_coords(activity);
+    let (mut teams_group_id, mut teams_channel_name, mut teams_tenant_id) =
+        extract_teams_coords(activity);
     if let Some(existing) = lookup_conversation_ref(&state.ctx.home_dir, &target.conversation_id) {
         teams_group_id = teams_group_id.or(existing.teams_group_id);
         teams_channel_name = teams_channel_name.or(existing.teams_channel_name);
@@ -665,8 +719,12 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
     // both forms are tried (the quoted activity id pins the exact card).
     if !text.is_empty() {
         if let Some(quoted_id) = teams_quoted_reply_id(activity) {
-            let base_conv =
-                target.conversation_id.split(';').next().unwrap_or("").to_string();
+            let base_conv = target
+                .conversation_id
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .to_string();
             let mut outcome = crate::decision_text::route_text_reply(
                 &state.ctx.home_dir,
                 "teams",
@@ -702,9 +760,8 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
     // ── Typing indicator (Teams renders ~3s; refresh every 3s) ──
     let typing_state = state.clone();
     let typing_target = target.clone();
-    let typing_guard = crate::channel_typing::TypingGuard::start(
-        std::time::Duration::from_secs(3),
-        move || {
+    let typing_guard =
+        crate::channel_typing::TypingGuard::start(std::time::Duration::from_secs(3), move || {
             let st = typing_state.clone();
             let tg = typing_target.clone();
             async move {
@@ -716,8 +773,7 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
                 });
                 let _ = send_activity(&st.creds, &tg, &body).await;
             }
-        },
-    );
+        });
 
     // ── Progress: post one status activity, then edit it in place ──
     let progress_state = state.clone();
@@ -740,10 +796,14 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         ) {
             return;
         }
-        let is_todo = matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. });
+        let is_todo = matches!(
+            event,
+            crate::channel_reply::ProgressEvent::TodoUpdate { .. }
+        );
         {
             let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
-            let throttle = crate::channel_capabilities::progress_throttle_secs("teams").unwrap_or(30);
+            let throttle =
+                crate::channel_capabilities::progress_throttle_secs("teams").unwrap_or(30);
             if !is_todo && last.elapsed().as_secs() < throttle {
                 return;
             }
@@ -769,14 +829,21 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         if let Some(cmd) = crate::chat_commands::parse_command(&text, None) {
             let agent_id = {
                 let reg = state.ctx.registry.read().await;
-                reg.main_agent().map(|a| a.config.agent.name.clone()).unwrap_or_default()
+                reg.main_agent()
+                    .map(|a| a.config.agent.name.clone())
+                    .unwrap_or_default()
             };
             let reply = crate::chat_commands::handle_command(
-                &cmd, &state.ctx, &session_id, &agent_id, true, &sender_id,
+                &cmd,
+                &state.ctx,
+                &session_id,
+                &agent_id,
+                true,
+                &sender_id,
             )
             .await;
             drop(typing_guard);
-            deliver_reply(&state.creds, &target, &reply).await;
+            deliver_reply(&state.creds, &target, &reply, None).await;
             return;
         }
     }
@@ -788,16 +855,23 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
             crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), None).await;
         for (name, url) in &file_attachments {
             match crate::media::download_url(
-                &state.ctx.http, url, None, crate::media::MAX_FILE_SIZE as usize,
+                &state.ctx.http,
+                url,
+                None,
+                crate::media::MAX_FILE_SIZE as usize,
             )
             .await
             {
-                Ok(bytes) => match crate::media::save_attachment_in_base(&attach_base, &bytes, name).await {
-                    Ok(path) => attachment_lines.push(crate::media::format_attachment_ref(
-                        &crate::media::MediaType::File, name, &path,
-                    )),
-                    Err(e) => warn!("Teams: failed to save attachment {name}: {e}"),
-                },
+                Ok(bytes) => {
+                    match crate::media::save_attachment_in_base(&attach_base, &bytes, name).await {
+                        Ok(path) => attachment_lines.push(crate::media::format_attachment_ref(
+                            &crate::media::MediaType::File,
+                            name,
+                            &path,
+                        )),
+                        Err(e) => warn!("Teams: failed to save attachment {name}: {e}"),
+                    }
+                }
                 Err(e) => warn!("Teams: failed to download attachment {name}: {e}"),
             }
         }
@@ -817,8 +891,32 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         format!("{text}\n\n{}", attachment_lines.join("\n"))
     };
 
-    let reply = build_reply_with_session(&input_text, &state.ctx, &session_id, &sender_id, Some(on_progress)).await;
+    // `sender_id` falls back to a literal placeholder when the activity has no
+    // `from.id`; it keeps that value everywhere it is an addressing or logging
+    // key (decision-button routing, the document sender, the audit trail), but
+    // it must never become the CCR principal — every unidentified sender would
+    // hash to one shared retrieval scope. `reply_principal_for_sender` yields
+    // "" there, which turns CCR off for the turn (fail-closed).
+    let guarded = build_guarded_reply_with_session(
+        &input_text,
+        &state.ctx,
+        &session_id,
+        crate::ccr_runtime::reply_principal_for_sender(&sender_id),
+        Some(on_progress),
+    )
+    .await;
     drop(typing_guard);
+
+    if !guarded.still_valid().await {
+        deliver_reply(
+            &state.creds,
+            &target,
+            crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+            None,
+        )
+        .await;
+        return;
+    }
 
     // WP1.3: 📎DELIVER: — Teams file upload is not wired, so the sender's
     // default `send_document` degrades to a text notice (→ dashboard Files
@@ -829,9 +927,14 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
             target.conversation_id.clone(),
             sender_id.clone(),
         );
-        crate::channel_reply::deliver_documents_for_reply(
-            state.ctx.as_ref(), None, reply, doc_sender.as_ref(),
-        ).await
+        crate::channel_reply::deliver_documents_for_reply_guarded(
+            state.ctx.as_ref(),
+            None,
+            guarded.text.clone(),
+            doc_sender.as_ref(),
+            Some(&guarded),
+        )
+        .await
     };
 
     // Remove the interim progress activity — the final reply supersedes it.
@@ -843,7 +946,7 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         warn!("Teams: reply is empty — skipping send");
         return;
     }
-    deliver_reply(&state.creds, &target, &reply).await;
+    deliver_reply(&state.creds, &target, &reply, Some(&guarded)).await;
 }
 
 /// Outbound delivery coordinates for one conversation.
@@ -873,12 +976,26 @@ fn message_activity(target: &TeamsTarget, text: &str, reply: bool) -> serde_json
 }
 
 /// Render markdown for Teams and send, chunked.
-async fn deliver_reply(creds: &TeamsCreds, target: &TeamsTarget, reply_markdown: &str) {
+async fn deliver_reply(
+    creds: &TeamsCreds,
+    target: &TeamsTarget,
+    reply_markdown: &str,
+    guarded: Option<&crate::channel_reply::GuardedReply>,
+) {
     let formatted = crate::markdown_render::to_teams_markdown(reply_markdown);
     for (i, chunk) in crate::channel_format::split_text(&formatted, TEAMS_TEXT_CHUNK)
         .iter()
         .enumerate()
     {
+        if crate::channel_reply::guard_lost(guarded).await {
+            let refusal = message_activity(
+                target,
+                crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+                i == 0,
+            );
+            send_activity(creds, target, &refusal).await;
+            return;
+        }
         let body = message_activity(target, chunk, i == 0);
         send_activity(creds, target, &body).await;
     }
@@ -901,7 +1018,14 @@ async fn send_activity(
         "{}/v3/conversations/{}/activities",
         target.service_url, target.conversation_id
     );
-    match creds.http.post(&url).bearer_auth(&token).json(body).send().await {
+    match creds
+        .http
+        .post(&url)
+        .bearer_auth(&token)
+        .json(body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => resp
             .json::<serde_json::Value>()
             .await
@@ -910,7 +1034,10 @@ async fn send_activity(
         Ok(resp) => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            error!("Teams send failed ({status}): {}", truncate_bytes(&text, 200));
+            error!(
+                "Teams send failed ({status}): {}",
+                truncate_bytes(&text, 200)
+            );
             None
         }
         Err(e) => {
@@ -938,7 +1065,14 @@ async fn update_activity(
         "{}/v3/conversations/{}/activities/{}",
         target.service_url, target.conversation_id, activity_id
     );
-    if let Err(e) = creds.http.put(&url).bearer_auth(&token).json(body).send().await {
+    if let Err(e) = creds
+        .http
+        .put(&url)
+        .bearer_auth(&token)
+        .json(body)
+        .send()
+        .await
+    {
         warn!("Teams update error: {e}");
     }
 }
@@ -976,7 +1110,11 @@ mod tests {
         });
         assert_eq!(
             extract_teams_coords(&activity),
-            (Some("grp-1".to_string()), Some("General".to_string()), Some("tenant-1".to_string()))
+            (
+                Some("grp-1".to_string()),
+                Some("General".to_string()),
+                Some("tenant-1".to_string())
+            )
         );
     }
 
@@ -985,7 +1123,10 @@ mod tests {
         let activity = serde_json::json!({
             "conversation": { "id": "conv-1", "tenantId": "tenant-2" }
         });
-        assert_eq!(extract_teams_coords(&activity), (None, None, Some("tenant-2".to_string())));
+        assert_eq!(
+            extract_teams_coords(&activity),
+            (None, None, Some("tenant-2".to_string()))
+        );
     }
 
     #[test]
@@ -1082,7 +1223,10 @@ mod tests {
             },
         );
         let mode = std::fs::metadata(&store).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "conversation store must be owner-only, got {mode:o}");
+        assert_eq!(
+            mode, 0o600,
+            "conversation store must be owner-only, got {mode:o}"
+        );
     }
 
     #[test]
@@ -1111,7 +1255,9 @@ mod tests {
     // ── WP-8A / credentials doctrine P2 ─────────────────────────────────
 
     async fn write_config(home: &Path, body: &str) {
-        tokio::fs::write(home.join("config.toml"), body).await.unwrap();
+        tokio::fs::write(home.join("config.toml"), body)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1134,10 +1280,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         write_config(home, "[channels]\nteams_app_id = \"app-1\"\n").await;
-        assert!(TeamsCreds::from_config(home).await.is_none(), "missing password");
+        assert!(
+            TeamsCreds::from_config(home).await.is_none(),
+            "missing password"
+        );
 
         write_config(home, "[channels]\nteams_app_password = \"secret-1\"\n").await;
-        assert!(TeamsCreds::from_config(home).await.is_none(), "missing app_id");
+        assert!(
+            TeamsCreds::from_config(home).await.is_none(),
+            "missing app_id"
+        );
     }
 
     /// `resolve_fresh` is what `get_token`'s refresh path (WP-8A) calls
@@ -1187,7 +1339,9 @@ mod tests {
         // Simulate config.toml becoming unreadable (e.g. deleted mid-flight)
         // — an outbound credential fails open to the last known secret
         // rather than breaking every send.
-        tokio::fs::remove_file(home.join("config.toml")).await.unwrap();
+        tokio::fs::remove_file(home.join("config.toml"))
+            .await
+            .unwrap();
         let (id, pw, _) = creds.resolve_fresh().await;
         assert_eq!(id, "app-1");
         assert_eq!(pw, "original-secret");
@@ -1243,7 +1397,10 @@ mod quoted_context_tests {
                             <p>需要你的決定…</p></blockquote><p>同意</p>"
             }]
         });
-        assert_eq!(teams_quoted_reply_id(&activity).as_deref(), Some("1755083112345"));
+        assert_eq!(
+            teams_quoted_reply_id(&activity).as_deref(),
+            Some("1755083112345")
+        );
     }
 
     #[test]
@@ -1308,6 +1465,56 @@ mod quoted_context_tests {
                 "999"
             )
             .is_none()
+        );
+    }
+}
+
+/// Regression guard for the anonymous-sender CCR leak: this adapter used to
+/// pass its `"unknown"` placeholder straight into the reply pipeline's
+/// `user_id`, so every sender the webhook could not identify hashed to the
+/// same `source_acl` and could retrieve the others' saved tool originals.
+#[cfg(test)]
+mod ccr_principal_tests {
+    use crate::ccr_runtime::source_scan::call_args_at;
+    use crate::ccr_runtime::{reply_principal_for_sender, source_acl_for_principal};
+
+    const SRC: &str = include_str!("msteams.rs");
+    const AGENT: &str = "agent-a";
+    const SESSION: &str = "msteams:19:conv-1";
+
+    /// Structural: every `build_guarded_reply_with_session` call in this file
+    /// must launder its principal. Checked over the real source because the
+    /// call site lives inside a long async webhook handler that cannot be
+    /// driven from a unit test.
+    #[test]
+    fn every_guarded_reply_call_launders_the_ccr_principal() {
+        let args = call_args_at(SRC, "build_guarded_reply_with_session(", 3);
+        assert!(
+            !args.is_empty(),
+            "no guarded-reply call found — did the call site move?"
+        );
+        for arg in args {
+            assert!(
+                arg.starts_with("crate::ccr_runtime::reply_principal_for_sender("),
+                "the CCR principal argument must be laundered, found `{arg}`"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unidentified_sender_disables_ccr_instead_of_sharing_one_scope() {
+        let anonymous = reply_principal_for_sender("unknown");
+        assert!(anonymous.is_empty());
+        assert!(
+            source_acl_for_principal(AGENT, SESSION, anonymous).is_none(),
+            "an unidentified sender must disable CCR, never pool into one scope"
+        );
+
+        let alice = reply_principal_for_sender("29:alice");
+        let bob = reply_principal_for_sender("29:bob");
+        assert_ne!(
+            source_acl_for_principal(AGENT, SESSION, alice).unwrap(),
+            source_acl_for_principal(AGENT, SESSION, bob).unwrap()
         );
     }
 }

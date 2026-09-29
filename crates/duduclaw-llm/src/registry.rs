@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::moa::{MoaSpec, DEFAULT_PROPOSER_MAX_TOKENS};
+use crate::moa::{DEFAULT_PROPOSER_MAX_TOKENS, MoaSpec};
 use crate::provider::split_model_id;
 use crate::types::NormalizedUsage;
 
@@ -208,7 +208,9 @@ impl ModelRegistry {
         }
         // First-loaded wins for bare-id collisions; same-provider overrides
         // keep pointing at the (replaced) qualified entry.
-        self.bare_index.entry(bare).or_insert_with(|| qualified.clone());
+        self.bare_index
+            .entry(bare)
+            .or_insert_with(|| qualified.clone());
         self.models.insert(qualified, info);
     }
 
@@ -289,11 +291,11 @@ impl ModelRegistry {
         // keep their own rates — matching how providers bill cached prefixes).
         let input_cost = match input_mult {
             Some(cliff) => {
-                let below = usage
-                    .input_tokens
-                    .min(cliff.threshold_tokens.saturating_sub(
-                        usage.cache_read_tokens + usage.cache_write_tokens,
-                    ));
+                let below = usage.input_tokens.min(
+                    cliff
+                        .threshold_tokens
+                        .saturating_sub(usage.cache_read_tokens + usage.cache_write_tokens),
+                );
                 let above = usage.input_tokens - below;
                 below as f64 * info.input_mc as f64 / MTOK
                     + above as f64 * info.input_mc as f64 * cliff.input_mult / MTOK
@@ -301,8 +303,16 @@ impl ModelRegistry {
             None => usage.input_tokens as f64 * info.input_mc as f64 / MTOK,
         };
 
-        let cache_read_rate = if info.cache_read_mc > 0 { info.cache_read_mc } else { info.input_mc };
-        let cache_write_rate = if info.cache_write_mc > 0 { info.cache_write_mc } else { info.input_mc };
+        let cache_read_rate = if info.cache_read_mc > 0 {
+            info.cache_read_mc
+        } else {
+            info.input_mc
+        };
+        let cache_write_rate = if info.cache_write_mc > 0 {
+            info.cache_write_mc
+        } else {
+            info.input_mc
+        };
         let cache_cost = usage.cache_read_tokens as f64 * cache_read_rate as f64 / MTOK
             + usage.cache_write_tokens as f64 * cache_write_rate as f64 / MTOK;
 
@@ -318,7 +328,11 @@ mod tests {
     use super::*;
 
     fn usage(input: u64, output: u64) -> NormalizedUsage {
-        NormalizedUsage { input_tokens: input, output_tokens: output, ..Default::default() }
+        NormalizedUsage {
+            input_tokens: input,
+            output_tokens: output,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -461,7 +475,10 @@ mod tests {
             .expect("merge");
         assert_eq!(n, 2);
         assert_eq!(reg.get("anthropic/claude-sonnet-5").unwrap().input_mc, 111);
-        assert_eq!(reg.get("local/my-local-model").unwrap().context_window, 32_000);
+        assert_eq!(
+            reg.get("local/my-local-model").unwrap().context_window,
+            32_000
+        );
         // Bare lookup still resolves after override.
         assert_eq!(reg.get("claude-sonnet-5").unwrap().input_mc, 111);
         // Model count: 17 vendored + 1 new.
@@ -543,7 +560,10 @@ mod tests {
         "#;
         reg.merge_toml_str(doc2).expect("re-merge");
         assert_eq!(reg.moa_specs().count(), 2);
-        assert_eq!(reg.moa_spec("planner").unwrap().proposers, vec!["openai/gpt-5.4"]);
+        assert_eq!(
+            reg.moa_spec("planner").unwrap().proposers,
+            vec!["openai/gpt-5.4"]
+        );
     }
 
     #[test]
@@ -599,18 +619,19 @@ mod tests {
         assert!(reg.moa_spec("broken").is_none());
 
         // Nested moa: member is rejected too.
-        assert!(reg
-            .merge_toml_str(
+        assert!(
+            reg.merge_toml_str(
                 r#"
                 [moa.nested]
                 proposers = ["moa:other"]
                 aggregator = "anthropic/claude-sonnet-5"
                 "#
             )
-            .is_err());
+            .is_err()
+        );
         // max_parallel = 0 is rejected.
-        assert!(reg
-            .merge_toml_str(
+        assert!(
+            reg.merge_toml_str(
                 r#"
                 [moa.zero]
                 proposers = ["anthropic/claude-sonnet-5"]
@@ -618,6 +639,7 @@ mod tests {
                 max_parallel = 0
                 "#
             )
-            .is_err());
+            .is_err()
+        );
     }
 }

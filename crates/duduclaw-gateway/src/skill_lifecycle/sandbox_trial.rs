@@ -137,10 +137,7 @@ const DISCARD_LIFT_THRESHOLD: f64 = -0.02;
 const EXTENSION_AMOUNT: u32 = 10;
 
 /// Evaluate a sandboxed skill's trial performance.
-pub fn evaluate_trial(
-    tracker: &SkillLiftTracker,
-    sandboxed: &SandboxedSkill,
-) -> TrialOutcome {
+pub fn evaluate_trial(tracker: &SkillLiftTracker, sandboxed: &SandboxedSkill) -> TrialOutcome {
     let lift = tracker.lift();
     let conversations_used = sandboxed.conversations_used();
 
@@ -310,8 +307,7 @@ impl SandboxStore {
 
     /// Remove completed trials (graduated or discarded) from memory.
     pub fn cleanup(&mut self) {
-        self.skills
-            .retain(|_, s| s.status == TrialStatus::Active);
+        self.skills.retain(|_, s| s.status == TrialStatus::Active);
     }
 
     /// Get all sandboxed skills (for telemetry).
@@ -339,7 +335,9 @@ fn is_safe_skill_name(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Write a graduated skill to the agent's SKILLS/ directory.

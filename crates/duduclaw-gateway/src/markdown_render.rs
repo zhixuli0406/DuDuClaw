@@ -31,7 +31,10 @@ pub enum MdBlock {
     /// Fenced code block. `lang` may be empty.
     CodeFence { lang: String, code: String },
     /// GFM pipe table.
-    Table { headers: Vec<String>, rows: Vec<Vec<String>> },
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
     /// Contiguous `>` block quote (content lines joined with '\n').
     Quote(String),
     /// Horizontal rule.
@@ -75,15 +78,15 @@ pub fn parse_markdown_blocks(text: &str) -> Vec<MdBlock> {
                 i += 1;
             }
             i += 1; // skip closing fence (or run past EOF)
-            blocks.push(MdBlock::CodeFence { lang, code: code_lines.join("\n") });
+            blocks.push(MdBlock::CodeFence {
+                lang,
+                code: code_lines.join("\n"),
+            });
             continue;
         }
 
         // ── Table (header row + separator row) ──
-        if trimmed.starts_with('|')
-            && i + 1 < lines.len()
-            && is_table_separator(lines[i + 1])
-        {
+        if trimmed.starts_with('|') && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
             flush_para(&mut para, &mut blocks);
             let headers = split_table_row(trimmed);
             i += 2; // skip header + separator
@@ -220,7 +223,8 @@ fn char_width(c: char) -> usize {
         || (0xFF00..=0xFF60).contains(&cp)     // Fullwidth forms
         || (0xFFE0..=0xFFE6).contains(&cp)
         || (0x1F300..=0x1FAFF).contains(&cp)   // Emoji
-        || (0x20000..=0x3FFFD).contains(&cp)   // CJK ext B+
+        || (0x20000..=0x3FFFD).contains(&cp)
+    // CJK ext B+
     {
         2
     } else {
@@ -260,7 +264,9 @@ const TABLE_COL_CAP: usize = 28;
 /// Render a table as aligned monospace text (for code-block contexts:
 /// Telegram `<pre>`, Discord/WhatsApp ``` fences).
 pub fn render_table_monospace(headers: &[String], rows: &[Vec<String>]) -> String {
-    let ncols = headers.len().max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    let ncols = headers
+        .len()
+        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
     if ncols == 0 {
         return String::new();
     }
@@ -363,7 +369,9 @@ pub enum InlineTarget {
 
 /// Escape Telegram-HTML special chars.
 pub fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Convert inline markdown (`**bold**`, `~~strike~~`, `` `code` ``,
@@ -550,7 +558,10 @@ pub fn to_telegram_html(text: &str) -> String {
                 parts.push(lines.join("\n"));
             }
             MdBlock::Heading { text, .. } => {
-                parts.push(format!("<b>{}</b>", convert_inline(&text, InlineTarget::TelegramHtml)));
+                parts.push(format!(
+                    "<b>{}</b>",
+                    convert_inline(&text, InlineTarget::TelegramHtml)
+                ));
             }
             MdBlock::CodeFence { lang, code } => {
                 if lang.is_empty() {
@@ -571,7 +582,11 @@ pub fn to_telegram_html(text: &str) -> String {
             }
             MdBlock::Quote(q) => {
                 // Expandable blockquote for long quotes keeps messages compact.
-                let tag = if q.lines().count() > 3 { "<blockquote expandable>" } else { "<blockquote>" };
+                let tag = if q.lines().count() > 3 {
+                    "<blockquote expandable>"
+                } else {
+                    "<blockquote>"
+                };
                 parts.push(format!(
                     "{tag}{}</blockquote>",
                     convert_inline(&q, InlineTarget::TelegramHtml)
@@ -597,11 +612,17 @@ pub fn to_whatsapp_text(text: &str) -> String {
                 parts.push(lines.join("\n"));
             }
             MdBlock::Heading { text, .. } => {
-                parts.push(format!("*{}*", convert_inline(&text, InlineTarget::WhatsApp)));
+                parts.push(format!(
+                    "*{}*",
+                    convert_inline(&text, InlineTarget::WhatsApp)
+                ));
             }
             MdBlock::CodeFence { code, .. } => parts.push(format!("```\n{code}\n```")),
             MdBlock::Table { headers, rows } => {
-                parts.push(format!("```\n{}\n```", render_table_monospace(&headers, &rows)));
+                parts.push(format!(
+                    "```\n{}\n```",
+                    render_table_monospace(&headers, &rows)
+                ));
             }
             MdBlock::Quote(q) => {
                 let quoted: Vec<String> = q
@@ -630,11 +651,17 @@ pub fn to_googlechat_text(text: &str) -> String {
                 parts.push(lines.join("\n"));
             }
             MdBlock::Heading { text, .. } => {
-                parts.push(format!("*{}*", convert_inline(&text, InlineTarget::GoogleChat)));
+                parts.push(format!(
+                    "*{}*",
+                    convert_inline(&text, InlineTarget::GoogleChat)
+                ));
             }
             MdBlock::CodeFence { code, .. } => parts.push(format!("```\n{code}\n```")),
             MdBlock::Table { headers, rows } => {
-                parts.push(format!("```\n{}\n```", render_table_monospace(&headers, &rows)));
+                parts.push(format!(
+                    "```\n{}\n```",
+                    render_table_monospace(&headers, &rows)
+                ));
             }
             MdBlock::Quote(q) => {
                 let quoted: Vec<String> = q
@@ -663,7 +690,10 @@ pub fn to_line_plain(text: &str) -> String {
                 parts.push(lines.join("\n"));
             }
             MdBlock::Heading { text, .. } => {
-                parts.push(format!("【{}】", convert_inline(&text, InlineTarget::Plain)));
+                parts.push(format!(
+                    "【{}】",
+                    convert_inline(&text, InlineTarget::Plain)
+                ));
             }
             MdBlock::CodeFence { code, .. } => {
                 parts.push(format!("──────\n{code}\n──────"));
@@ -699,7 +729,10 @@ pub fn preprocess_discord_markdown(text: &str) -> String {
             }
             MdBlock::CodeFence { lang, code } => parts.push(format!("```{lang}\n{code}\n```")),
             MdBlock::Table { headers, rows } => {
-                parts.push(format!("```\n{}\n```", render_table_monospace(&headers, &rows)));
+                parts.push(format!(
+                    "```\n{}\n```",
+                    render_table_monospace(&headers, &rows)
+                ));
             }
             MdBlock::Quote(q) => {
                 let quoted: Vec<String> = q.lines().map(|l| format!("> {l}")).collect();
@@ -722,7 +755,10 @@ pub fn to_teams_markdown(text: &str) -> String {
             MdBlock::Heading { text, .. } => parts.push(format!("**{text}**")),
             MdBlock::CodeFence { lang, code } => parts.push(format!("```{lang}\n{code}\n```")),
             MdBlock::Table { headers, rows } => {
-                parts.push(format!("```\n{}\n```", render_table_monospace(&headers, &rows)));
+                parts.push(format!(
+                    "```\n{}\n```",
+                    render_table_monospace(&headers, &rows)
+                ));
             }
             MdBlock::Quote(q) => {
                 let quoted: Vec<String> = q.lines().map(|l| format!("> {l}")).collect();
@@ -787,7 +823,10 @@ mod tests {
                     "{name} lost the space in {phrase:?}\n--- rendered ---\n{out}"
                 );
             }
-            assert!(!out.contains("Transcriptsaving"), "{name} glued words together");
+            assert!(
+                !out.contains("Transcriptsaving"),
+                "{name} glued words together"
+            );
         }
     }
 
@@ -861,7 +900,8 @@ mod tests {
 
     #[test]
     fn line_plain_strips_markup() {
-        let plain = to_line_plain("# 標題\n\n**bold** 與 `code`\n\n| a | b |\n|---|---|\n| 1 | 2 |");
+        let plain =
+            to_line_plain("# 標題\n\n**bold** 與 `code`\n\n| a | b |\n|---|---|\n| 1 | 2 |");
         assert!(plain.contains("【標題】"));
         assert!(plain.contains("bold 與 code"));
         assert!(!plain.contains("**"));
@@ -871,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn discord_table_to_fence_rest_untouched(){
+    fn discord_table_to_fence_rest_untouched() {
         let src = "# H1\n\n**bold**\n\n| a | b |\n|---|---|\n| 1 | 2 |";
         let out = preprocess_discord_markdown(src);
         assert!(out.contains("# H1"));
@@ -893,7 +933,10 @@ mod tests {
     fn cjk_table_alignment() {
         let t = render_table_monospace(
             &["名稱".into(), "s".into()],
-            &[vec!["中文字".into(), "x".into()], vec!["ab".into(), "y".into()]],
+            &[
+                vec!["中文字".into(), "x".into()],
+                vec!["ab".into(), "y".into()],
+            ],
         );
         let lines: Vec<&str> = t.lines().collect();
         // Separator positions must align: pipe column index consistent by display width.

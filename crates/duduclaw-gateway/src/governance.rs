@@ -78,13 +78,22 @@ pub struct Decider {
 
 impl Decider {
     pub fn human_board() -> Self {
-        Self { is_agent: false, has_board_rights: true }
+        Self {
+            is_agent: false,
+            has_board_rights: true,
+        }
     }
     pub fn human_regular() -> Self {
-        Self { is_agent: false, has_board_rights: false }
+        Self {
+            is_agent: false,
+            has_board_rights: false,
+        }
     }
     pub fn agent() -> Self {
-        Self { is_agent: true, has_board_rights: false }
+        Self {
+            is_agent: true,
+            has_board_rights: false,
+        }
     }
 }
 
@@ -142,15 +151,24 @@ mod tests {
         assert!(!can_decide(&ApprovalKind::StrategicPlan, Decider::agent()));
         assert!(!can_decide(&ApprovalKind::AgentHire, Decider::agent()));
         // Regular human (no board rights) also refused.
-        assert!(!can_decide(&ApprovalKind::StrategicPlan, Decider::human_regular()));
+        assert!(!can_decide(
+            &ApprovalKind::StrategicPlan,
+            Decider::human_regular()
+        ));
         // Human with board rights: allowed.
-        assert!(can_decide(&ApprovalKind::StrategicPlan, Decider::human_board()));
+        assert!(can_decide(
+            &ApprovalKind::StrategicPlan,
+            Decider::human_board()
+        ));
         assert!(can_decide(&ApprovalKind::AgentHire, Decider::human_board()));
     }
 
     #[test]
     fn non_board_kinds_unrestricted_by_this_predicate() {
-        assert!(can_decide(&ApprovalKind::SkillActivation, Decider::human_regular()));
+        assert!(can_decide(
+            &ApprovalKind::SkillActivation,
+            Decider::human_regular()
+        ));
         assert!(can_decide(&ApprovalKind::ToolCall, Decider::agent()));
     }
 

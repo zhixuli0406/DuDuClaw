@@ -204,10 +204,22 @@ async fn reconcile_one(home_dir: &Path, agent_id: &str, http: &reqwest::Client) 
     match report.target.as_str() {
         "system" => reconcile_system(home_dir, agent_id, &raw_entry.value, report, http).await,
         "device" => {
-            reconcile_device(home_dir, agent_id, &raw_entry.value, &raw_entry.expires_at, report, http).await
+            reconcile_device(
+                home_dir,
+                agent_id,
+                &raw_entry.value,
+                &raw_entry.expires_at,
+                report,
+                http,
+            )
+            .await
         }
         other => {
-            warn!(agent = agent_id, target = other, "pending_update_report 的 target 既非 device 也非 system，略過");
+            warn!(
+                agent = agent_id,
+                target = other,
+                "pending_update_report 的 target 既非 device 也非 system，略過"
+            );
         }
     }
 }
@@ -246,7 +258,10 @@ async fn reconcile_system(
         .await;
         match write {
             Ok(Ok(_)) => {
-                info!(agent = agent_id, "system 目標更新偵測完成，排程 3 秒後自我重啟");
+                info!(
+                    agent = agent_id,
+                    "system 目標更新偵測完成，排程 3 秒後自我重啟"
+                );
                 tokio::spawn(async {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     duduclaw_core::platform::request_restart_after_shutdown();
@@ -280,7 +295,16 @@ async fn reconcile_system(
     let current = crate::updater::current_version();
     let expected = report.expected_version.clone().unwrap_or_default();
     let (text, success) = compose_system_report(current, &expected);
-    finalize_report(home_dir, agent_id, &report.reply_channel_raw, &text, success, "system", http).await;
+    finalize_report(
+        home_dir,
+        agent_id,
+        &report.reply_channel_raw,
+        &text,
+        success,
+        "system",
+        http,
+    )
+    .await;
 }
 
 /// Pure: has `now` moved at least `grace_secs` past `since`? Factored out so
@@ -305,7 +329,10 @@ fn compose_system_report(current: &str, expected: &str) -> (String, bool) {
         );
     }
     if current == expected {
-        (format!("系統本體更新已完成重新啟動，目前執行版本是 v{current}。"), true)
+        (
+            format!("系統本體更新已完成重新啟動，目前執行版本是 v{current}。"),
+            true,
+        )
     } else {
         (
             format!(
@@ -358,7 +385,9 @@ async fn reconcile_device(
     report: PendingUpdateReport,
     http: &reqwest::Client,
 ) {
-    let assessment = crate::device_ops::select_device_ops().boot_assessment_status().await;
+    let assessment = crate::device_ops::select_device_ops()
+        .boot_assessment_status()
+        .await;
     match classify_boot_assessment(&assessment) {
         BootVerdict::Good => {
             // B5 (OS security line P0): the update just survived its boot
@@ -444,7 +473,10 @@ async fn finalize_report(
 ) {
     let delivered = deliver(home_dir, agent_id, reply_channel_raw, text, http).await;
     if !delivered {
-        warn!(agent = agent_id, target, "更新結果通知目前無法投遞，保留 pending_update_report 待下一輪重試");
+        warn!(
+            agent = agent_id,
+            target, "更新結果通知目前無法投遞，保留 pending_update_report 待下一輪重試"
+        );
         return;
     }
     let home = home_dir.to_path_buf();
@@ -461,7 +493,10 @@ async fn finalize_report(
         success,
         &[],
     );
-    info!(agent = agent_id, target, success, "跨重啟更新結果已回報並清除待辦狀態");
+    info!(
+        agent = agent_id,
+        target, success, "跨重啟更新結果已回報並清除待辦狀態"
+    );
 }
 
 async fn deliver(
@@ -473,9 +508,15 @@ async fn deliver(
 ) -> bool {
     if let Some(raw) = reply_channel_raw {
         if let Some((channel, chat_id)) = crate::decision_notify::parse_origin(raw) {
-            match crate::reminder_scheduler::send_channel_message(home_dir, http, &channel, &chat_id, text).await {
+            match crate::reminder_scheduler::send_channel_message(
+                home_dir, http, &channel, &chat_id, text,
+            )
+            .await
+            {
                 Ok(()) => return true,
-                Err(e) => warn!(agent = agent_id, channel, error = %e, "原始對話通道投遞失敗，改用 agent 預設通知通道"),
+                Err(e) => {
+                    warn!(agent = agent_id, channel, error = %e, "原始對話通道投遞失敗，改用 agent 預設通知通道")
+                }
             }
         }
     }
@@ -524,9 +565,21 @@ mod tests {
     #[test]
     fn past_grace_window_boundary() {
         let t0 = Utc::now();
-        assert!(!past_grace_window(t0, t0 + chrono::Duration::seconds(119), 120));
-        assert!(past_grace_window(t0, t0 + chrono::Duration::seconds(120), 120));
-        assert!(past_grace_window(t0, t0 + chrono::Duration::seconds(121), 120));
+        assert!(!past_grace_window(
+            t0,
+            t0 + chrono::Duration::seconds(119),
+            120
+        ));
+        assert!(past_grace_window(
+            t0,
+            t0 + chrono::Duration::seconds(120),
+            120
+        ));
+        assert!(past_grace_window(
+            t0,
+            t0 + chrono::Duration::seconds(121),
+            120
+        ));
     }
 
     #[test]
@@ -547,19 +600,49 @@ mod tests {
     #[test]
     fn classify_boot_assessment_exact_match_not_substring() {
         use crate::device_ops::{DeviceOpError, OpOutput};
-        let good = Ok(OpOutput { success: true, stdout: "good\n".into(), stderr: String::new() });
+        let good = Ok(OpOutput {
+            success: true,
+            stdout: "good\n".into(),
+            stderr: String::new(),
+        });
         assert_eq!(classify_boot_assessment(&good), BootVerdict::Good);
-        let clean = Ok(OpOutput { success: true, stdout: "  CLEAN  ".into(), stderr: String::new() });
+        let clean = Ok(OpOutput {
+            success: true,
+            stdout: "  CLEAN  ".into(),
+            stderr: String::new(),
+        });
         assert_eq!(classify_boot_assessment(&clean), BootVerdict::Good);
-        let bad = Ok(OpOutput { success: true, stdout: "bad".into(), stderr: String::new() });
+        let bad = Ok(OpOutput {
+            success: true,
+            stdout: "bad".into(),
+            stderr: String::new(),
+        });
         assert_eq!(classify_boot_assessment(&bad), BootVerdict::Bad);
-        let indeterminate = Ok(OpOutput { success: true, stdout: "indeterminate".into(), stderr: String::new() });
-        assert_eq!(classify_boot_assessment(&indeterminate), BootVerdict::Unknown);
+        let indeterminate = Ok(OpOutput {
+            success: true,
+            stdout: "indeterminate".into(),
+            stderr: String::new(),
+        });
+        assert_eq!(
+            classify_boot_assessment(&indeterminate),
+            BootVerdict::Unknown
+        );
         // A "goodish" garbage value must NOT classify as Good via substring.
-        let garbage = Ok(OpOutput { success: true, stdout: "goodbye".into(), stderr: String::new() });
+        let garbage = Ok(OpOutput {
+            success: true,
+            stdout: "goodbye".into(),
+            stderr: String::new(),
+        });
         assert_eq!(classify_boot_assessment(&garbage), BootVerdict::Unknown);
-        let failed_spawn = Ok(OpOutput { success: false, stdout: "good".into(), stderr: "boom".into() });
-        assert_eq!(classify_boot_assessment(&failed_spawn), BootVerdict::Unknown);
+        let failed_spawn = Ok(OpOutput {
+            success: false,
+            stdout: "good".into(),
+            stderr: "boom".into(),
+        });
+        assert_eq!(
+            classify_boot_assessment(&failed_spawn),
+            BootVerdict::Unknown
+        );
         let err: crate::device_ops::OpResult = Err(DeviceOpError::Unsupported("no sysd".into()));
         assert_eq!(classify_boot_assessment(&err), BootVerdict::Unknown);
     }
@@ -567,9 +650,18 @@ mod tests {
     #[test]
     fn device_must_finalize_unknown_boundary() {
         let now = Utc::now();
-        assert!(!device_must_finalize_unknown(now + chrono::Duration::seconds(301), now));
-        assert!(device_must_finalize_unknown(now + chrono::Duration::seconds(300), now));
-        assert!(device_must_finalize_unknown(now - chrono::Duration::seconds(1), now));
+        assert!(!device_must_finalize_unknown(
+            now + chrono::Duration::seconds(301),
+            now
+        ));
+        assert!(device_must_finalize_unknown(
+            now + chrono::Duration::seconds(300),
+            now
+        ));
+        assert!(device_must_finalize_unknown(
+            now - chrono::Duration::seconds(1),
+            now
+        ));
     }
 
     // ── sweep glue: state machine transitions ──────────────────
@@ -597,7 +689,10 @@ mod tests {
         .unwrap();
         let client = reqwest::Client::new();
         sweep(home.path(), &client).await;
-        assert_eq!(read_raw(home.path(), "sysop").as_deref(), Some("not-json-at-all"));
+        assert_eq!(
+            read_raw(home.path(), "sysop").as_deref(),
+            Some("not-json-at-all")
+        );
     }
 
     #[tokio::test]
@@ -617,7 +712,8 @@ mod tests {
         );
         let client = reqwest::Client::new();
         sweep(home.path(), &client).await;
-        let raw = read_raw(home.path(), "sysop").expect("entry must still exist (too early to finalize)");
+        let raw =
+            read_raw(home.path(), "sysop").expect("entry must still exist (too early to finalize)");
         let parsed: PendingUpdateReport = serde_json::from_str(&raw).unwrap();
         assert!(parsed.restart_triggered);
         assert!(parsed.restart_triggered_at.is_some());
@@ -666,7 +762,9 @@ mod tests {
                 initiated_at: None,
                 reply_channel_raw: None,
                 restart_triggered: true,
-                restart_triggered_at: Some((Utc::now() - chrono::Duration::seconds(200)).to_rfc3339()),
+                restart_triggered_at: Some(
+                    (Utc::now() - chrono::Duration::seconds(200)).to_rfc3339(),
+                ),
             },
         );
         let client = reqwest::Client::new();
@@ -700,6 +798,9 @@ mod tests {
         // TTL far from expiry" branch without needing a real appliance.
         sweep(home.path(), &client).await;
         let after = read_raw(home.path(), "sysop").unwrap();
-        assert_eq!(before, after, "far from TTL expiry, an Unknown verdict must not trigger any write");
+        assert_eq!(
+            before, after,
+            "far from TTL expiry, an Unknown verdict must not trigger any write"
+        );
     }
 }

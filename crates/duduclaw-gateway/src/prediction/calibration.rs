@@ -256,8 +256,7 @@ pub fn wilson_bounds(k: u64, n: u64, z: f64) -> (f64, f64) {
     let z2 = z * z;
     let denom = 1.0 + z2 / n_f;
     let center = (p_hat + z2 / (2.0 * n_f)) / denom;
-    let margin =
-        (z / denom) * ((p_hat * (1.0 - p_hat) / n_f) + z2 / (4.0 * n_f * n_f)).sqrt();
+    let margin = (z / denom) * ((p_hat * (1.0 - p_hat) / n_f) + z2 / (4.0 * n_f * n_f)).sqrt();
     let lo = (center - margin).clamp(0.0, 1.0);
     let hi = (center + margin).clamp(0.0, 1.0);
     (lo, hi)
@@ -314,19 +313,8 @@ pub fn psr(sr_obs: f64, sr_ref: f64, n: u64, skew: f64, kurt: f64) -> f64 {
 /// Returns `NaN` if `SR_obs <= SR_ref` (target never reachable), `conf` is
 /// outside `(0,1)`, or the variance term is non-positive.
 // MinTRL: Bailey & López de Prado, SSRN 2460551 (2012), eq. for minimum track record.
-pub fn min_track_record_length(
-    sr_obs: f64,
-    sr_ref: f64,
-    skew: f64,
-    kurt: f64,
-    conf: f64,
-) -> f64 {
-    if sr_obs.is_nan()
-        || sr_ref.is_nan()
-        || skew.is_nan()
-        || kurt.is_nan()
-        || conf.is_nan()
-    {
+pub fn min_track_record_length(sr_obs: f64, sr_ref: f64, skew: f64, kurt: f64, conf: f64) -> f64 {
+    if sr_obs.is_nan() || sr_ref.is_nan() || skew.is_nan() || kurt.is_nan() || conf.is_nan() {
         return f64::NAN;
     }
     if !(conf > 0.0 && conf < 1.0) {
@@ -637,8 +625,11 @@ mod tests {
         assert!(approx(m.resolution, 0.25));
         assert!(approx(m.uncertainty, 0.25));
         // Brier identity.
-        let brier: f64 =
-            samples.iter().map(|(c, o)| brier_binary(*c, *o)).sum::<f64>() / samples.len() as f64;
+        let brier: f64 = samples
+            .iter()
+            .map(|(c, o)| brier_binary(*c, *o))
+            .sum::<f64>()
+            / samples.len() as f64;
         assert!(approx(brier, m.reliability - m.resolution + m.uncertainty));
     }
 
@@ -826,7 +817,10 @@ mod tests {
             HonestLabel::IndistinguishableFromLuck
         );
         // NaN bounds (insufficient N) → Candidate.
-        assert_eq!(honest_label(f64::NAN, f64::NAN, 0.99), HonestLabel::Candidate);
+        assert_eq!(
+            honest_label(f64::NAN, f64::NAN, 0.99),
+            HonestLabel::Candidate
+        );
         // NaN PSR treated as failing → luck.
         assert_eq!(
             honest_label(0.55, 0.75, f64::NAN),

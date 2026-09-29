@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use tracing::warn;
 
 use super::verifier_measure::{AntiDriftState, MeasureVector};
@@ -60,7 +60,9 @@ impl ChampionStore {
     /// Open (and lazily create) the table. Mirrors `VersionStore`'s
     /// connection convention: one short-lived connection per call, no pool.
     pub fn new(db_path: &Path) -> Self {
-        let store = Self { db_path: db_path.to_path_buf() };
+        let store = Self {
+            db_path: db_path.to_path_buf(),
+        };
         if let Err(e) = store.init() {
             warn!(db = %db_path.display(), "gvu_champion: table init failed: {e}");
         }
@@ -126,7 +128,9 @@ impl ChampionStore {
             established_at: DateTime::parse_from_rfc3339(&row.2)
                 .map(|t| t.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()),
-            anti_drift: AntiDriftState { consecutive_matches: row.3.max(0) as u32 },
+            anti_drift: AntiDriftState {
+                consecutive_matches: row.3.max(0) as u32,
+            },
             round_seq: row.4.max(0) as u64,
             holdout_rotation_due: row.5 != 0,
         })
@@ -232,9 +236,15 @@ mod tests {
         let c = Champion {
             agent_id: "a1".into(),
             snapshot_hash: snapshot_hash(&["k1".into()]),
-            measure: MeasureVector { judge: Some(0.8), anti_sycophancy: 1.0, ..Default::default() },
+            measure: MeasureVector {
+                judge: Some(0.8),
+                anti_sycophancy: 1.0,
+                ..Default::default()
+            },
             established_at: Utc::now(),
-            anti_drift: AntiDriftState { consecutive_matches: 2 },
+            anti_drift: AntiDriftState {
+                consecutive_matches: 2,
+            },
             round_seq: 41,
             holdout_rotation_due: true,
         };

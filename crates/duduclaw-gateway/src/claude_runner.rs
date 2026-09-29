@@ -11,9 +11,9 @@ use duduclaw_llm::ChatProvider as _;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::llm_fallback::{
+use crate::failover::FailoverManager;
+use crate::failover::model::{
     emit_llm_fallback_audit, format_fallback_error_message, is_llm_fallback_error,
-    should_attempt_model_fallback,
 };
 
 /// Shared `Arc<TaskStore>` injected by `server.rs` at startup so
@@ -345,18 +345,63 @@ async fn build_pending_tasks_section(home_dir: &Path, agent_id: &str) -> Option<
     ))
 }
 
-/// Resolve the effective working directory for a Claude CLI subprocess.
+/// Caller-imposed overrides for one preloaded-agent dispatch.
 ///
-/// If L0 worktree isolation is active (task-local `WORKTREE_PATH` is set),
-/// use the worktree path. Otherwise fall back to the agent's base directory.
-fn effective_work_dir(agent_dir: &Path) -> Option<PathBuf> {
-    // Check worktree task-local first.
-    let wt = WORKTREE_PATH.try_with(|opt| opt.clone()).ok().flatten();
-    if let Some(ref p) = wt {
-        if p.exists() {
-            return Some(p.clone());
+/// Team-as-Agent live round 3 (`DESIGN-team-as-agent-2026-09.md` §4.3, E2/E3)
+/// needs three things a role member's dispatch must do differently from an
+/// ordinary agent's, and nothing else:
+///
+/// * **`work_dir`** — run in the employee's workspace, not the member's
+///   throwaway scaffold, so files the member writes survive immediate GC.
+/// * **`allow_cross_family_failover`** — `false` for a role member, so an
+///   executor configured for codex can never be silently answered by Claude
+///   and logged as codex. The round degrades explicitly instead.
+/// * **`mcp_config_path`** — with the cwd moved, the Claude CLI would
+///   auto-discover the *employee's* `.mcp.json` and the member would speak as
+///   its parent. Naming the member's own file (plus `--strict-mcp-config`)
+///   keeps cwd and identity independent.
+///
+/// [`Default`] is the pre-existing behaviour on every field, so every caller
+/// that does not opt in is byte-identical.
+#[derive(Debug, Clone)]
+pub struct DispatchOverrides {
+    pub work_dir: Option<PathBuf>,
+    pub allow_cross_family_failover: bool,
+    pub mcp_config_path: Option<PathBuf>,
+}
+
+impl Default for DispatchOverrides {
+    fn default() -> Self {
+        Self {
+            work_dir: None,
+            // `true` is what every pre-existing caller did.
+            allow_cross_family_failover: true,
+            mcp_config_path: None,
         }
     }
+}
+
+/// The identity half of a spawn, when it is not simply "the cwd".
+///
+/// Normally a Claude CLI spawn's cwd IS the agent directory, so one path
+/// answers both "where does this run" and "whose config is this". A team role
+/// member breaks that tie (see [`DispatchOverrides`]); these two fields carry
+/// the identity half down to [`prepare_claude_cmd`] without changing what
+/// `work_dir` means anywhere. Both `None` ⇒ every argv and config read is
+/// byte-identical to before this type existed.
+#[derive(Debug, Clone, Copy, Default)]
+struct SpawnIdentity<'a> {
+    /// Directory whose `agent.toml` supplies identity-scoped config —
+    /// `[model] effort`, `[capabilities] scoped_tools` grants, minimal-context
+    /// resolution. Falls back to `work_dir`.
+    config_dir: Option<&'a Path>,
+    /// Explicit `--mcp-config` source file. Falls back to cwd auto-discovery.
+    mcp_config: Option<&'a Path>,
+}
+
+/// Resolve the effective working directory for a Claude CLI subprocess:
+/// the agent's own directory when it exists.
+fn effective_work_dir(agent_dir: &Path) -> Option<PathBuf> {
     agent_dir.exists().then(|| agent_dir.to_path_buf())
 }
 
@@ -400,7 +445,15 @@ pub async fn call_claude_for_agent_with_type(
         agent_id,
         prompt,
         request_type,
-        call_claude_for_agent_impl(home_dir, registry, agent_id, prompt, request_type, None),
+        call_claude_for_agent_impl(
+            home_dir,
+            registry,
+            agent_id,
+            prompt,
+            request_type,
+            None,
+            DispatchOverrides::default(),
+        ),
     )
     .await
 }
@@ -435,7 +488,9 @@ where
     // the settle-side evidence consumers (forward-model observe / grounding /
     // judge digest). Cloning the accumulated events is read-only. Only when
     // no scope exists (plain cron / bus dispatch) do we install our own.
-    let outer_scope = crate::runtime::NATIVE_TOOL_COLLECTOR.try_with(|_| ()).is_ok();
+    let outer_scope = crate::runtime::NATIVE_TOOL_COLLECTOR
+        .try_with(|_| ())
+        .is_ok();
     let (result, events) = if outer_scope {
         let r = fut.await;
         let ev = crate::runtime::NATIVE_TOOL_COLLECTOR
@@ -459,8 +514,10 @@ where
         Ok(text) => ("completed".to_string(), text.clone()),
         Err(e) => ("error".to_string(), e.clone()),
     };
-    let steps: Vec<(String, bool)> =
-        events.iter().map(|e| (e.tool_name.clone(), e.success)).collect();
+    let steps: Vec<(String, bool)> = events
+        .iter()
+        .map(|e| (e.tool_name.clone(), e.success))
+        .collect();
     if let Some(store) = crate::run_steps::shared_store(home_dir) {
         let agent = agent_id.to_string();
         let source = request_type.as_str().to_string();
@@ -468,7 +525,13 @@ where
         let preview_in = duduclaw_core::truncate_chars(prompt, 500);
         let _ = tokio::task::spawn_blocking(move || {
             if let Err(e) = store.record_dispatch_run(
-                &agent, &source, &started_at, &ended_at, &status, &preview_in, &preview_out,
+                &agent,
+                &source,
+                &started_at,
+                &ended_at,
+                &status,
+                &preview_in,
+                &preview_out,
                 &steps,
             ) {
                 tracing::debug!(error = %e, "dispatch run record failed (ignored)");
@@ -547,15 +610,58 @@ pub async fn call_claude_for_agent_preloaded(
     prompt: &str,
     request_type: crate::cost_telemetry::RequestType,
 ) -> Result<String, String> {
-    let agent_id = agent.config.agent.name.clone();
-    invoke_recorded(
+    call_claude_for_agent_preloaded_with(
         home_dir,
-        &agent_id,
+        registry,
+        agent,
         prompt,
         request_type,
-        call_claude_for_agent_impl(home_dir, registry, &agent_id, prompt, request_type, Some(agent)),
+        DispatchOverrides::default(),
     )
     .await
+}
+
+/// [`call_claude_for_agent_preloaded`] with caller-imposed
+/// [`DispatchOverrides`]. `DispatchOverrides::default()` ⇒ identical
+/// behaviour, which is exactly what the plain entry point passes.
+///
+/// The overrides reach non-Claude runtimes through the
+/// [`crate::runtime::SPAWN_OVERRIDE`] task-local scoped here (a task-local
+/// threads transparently through the whole async call chain, so
+/// `runtime_dispatch::AgentPrompt` and `RuntimeContext` need no new field);
+/// the Claude CLI path reads them directly from the struct below.
+pub async fn call_claude_for_agent_preloaded_with(
+    home_dir: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent: &duduclaw_agent::LoadedAgent,
+    prompt: &str,
+    request_type: crate::cost_telemetry::RequestType,
+    overrides: DispatchOverrides,
+) -> Result<String, String> {
+    let agent_id = agent.config.agent.name.clone();
+    let spawn_override = crate::runtime::SpawnOverride {
+        work_dir: overrides.work_dir.clone(),
+    };
+    crate::runtime::SPAWN_OVERRIDE
+        .scope(
+            spawn_override,
+            invoke_recorded(
+                home_dir,
+                &agent_id,
+                prompt,
+                request_type,
+                call_claude_for_agent_impl(
+                    home_dir,
+                    registry,
+                    &agent_id,
+                    prompt,
+                    request_type,
+                    Some(agent),
+                    overrides,
+                ),
+            ),
+        )
+        .await
 }
 
 /// OTel `gen_ai.system` for a runtime.
@@ -620,6 +726,9 @@ async fn call_claude_for_agent_impl(
     prompt: &str,
     request_type: crate::cost_telemetry::RequestType,
     preloaded: Option<&duduclaw_agent::LoadedAgent>,
+    // Team-as-Agent role members only; `DispatchOverrides::default()` is what
+    // every other caller passes and is behaviourally a no-op.
+    overrides: DispatchOverrides,
 ) -> Result<String, String> {
     let reg = registry.read().await;
 
@@ -706,44 +815,68 @@ async fn call_claude_for_agent_impl(
     // switch can silently change model/tools/evolution posture; without this
     // the agent keeps reasoning from its old self-image and misattributes
     // capability-driven failures to itself.
-    let tasks_suffix =
-        match crate::preset_prompt::build_preset_section(home_dir, agent_id) {
-            Some(ps) => Some(match tasks_suffix {
-                Some(t) => format!("{t}\n\n{ps}"),
-                None => ps,
-            }),
-            None => tasks_suffix,
-        };
+    let tasks_suffix = match crate::preset_prompt::build_preset_section(home_dir, agent_id) {
+        Some(ps) => Some(match tasks_suffix {
+            Some(t) => format!("{t}\n\n{ps}"),
+            None => ps,
+        }),
+        None => tasks_suffix,
+    };
     // Cross-wake working state: the agent's authoritative key-value posture
     // + handoff note (working_state.rs, D3 ghost-memory fix). Placed BEFORE
     // the recent-actions feed — standing authority first, action evidence
     // second. Same uncached dynamic block as the task queue.
-    let tasks_suffix =
-        match crate::working_state::build_working_state_section(home_dir, agent_id) {
-            Some(ws) => Some(match tasks_suffix {
-                Some(t) => format!("{t}\n\n{ws}"),
-                None => ws,
-            }),
-            None => tasks_suffix,
-        };
+    let tasks_suffix = match crate::working_state::build_working_state_section(home_dir, agent_id) {
+        Some(ws) => Some(match tasks_suffix {
+            Some(t) => format!("{t}\n\n{ws}"),
+            None => ws,
+        }),
+        None => tasks_suffix,
+    };
     // Cross-invocation continuity: recent self-action feed from the audit
     // log, so a dispatch/cron/heartbeat run opens aware of what this agent
     // already did in other invocations (channel replies included). Same
     // uncached dynamic block as the task queue.
-    let tasks_suffix =
-        match crate::recent_actions::build_recent_actions_section(home_dir, agent_id) {
-            Some(actions) => Some(match tasks_suffix {
-                Some(t) => format!("{t}\n\n{actions}"),
-                None => actions,
-            }),
-            None => tasks_suffix,
-        };
+    let tasks_suffix = match crate::recent_actions::build_recent_actions_section(home_dir, agent_id)
+    {
+        Some(actions) => Some(match tasks_suffix {
+            Some(t) => format!("{t}\n\n{actions}"),
+            None => actions,
+        }),
+        None => tasks_suffix,
+    };
 
     // Install agent-file-guard PreToolUse hook before any spawn.
     // Blocks the sub-agent from using raw Write/Edit to create
     // agent-structure files outside <home>/agents/<name>/.
     // Best-effort — logs warning on failure and continues.
     let agent_dir = agent_dir_owned;
+    // Team-as-Agent (design §4.3 E3): a role member runs in the employee's
+    // workspace while `agent_dir` stays its own scaffold. An override that
+    // does not resolve to a real directory is ignored (falls back to the
+    // ordinary rule) rather than producing a spawn in a nonexistent cwd.
+    let work_dir_override: Option<PathBuf> = overrides
+        .work_dir
+        .as_deref()
+        .filter(|p| p.is_dir())
+        .map(PathBuf::from);
+    if overrides.work_dir.is_some() && work_dir_override.is_none() {
+        warn!(
+            agent = %agent_id,
+            requested = ?overrides.work_dir,
+            "dispatch work_dir override does not exist — falling back to the agent directory"
+        );
+    }
+    // Identity-scoped config always stays with the agent directory, so an
+    // overridden cwd never silently swaps the member's `[model] effort`,
+    // scoped-tool grants or minimal-context setting for the employee's.
+    let spawn_identity = SpawnIdentity {
+        config_dir: work_dir_override.as_ref().map(|_| agent_dir.as_path()),
+        mcp_config: overrides.mcp_config_path.as_deref(),
+    };
+    // Effort is normally read from the cwd (which is the agent dir); resolve
+    // it explicitly here so an overridden cwd cannot lose it.
+    let dispatch_effort = duduclaw_core::effort::read_agent_effort(&agent_dir);
 
     // RFC-25 Phase 2: when the delegated agent's [runtime] provider is not
     // Claude, route the whole task through the provider-agnostic choke-point
@@ -867,6 +1000,13 @@ async fn call_claude_for_agent_impl(
                 conversation_history: &[],
                 request_type: crate::cost_telemetry::RequestType::Dispatch,
                 runtime_settings: Some(&delegation_settings),
+                effort: None,
+                // P0/WP-B: ordinary caller passes `true` — failover
+                // behavior unchanged. A team role member passes `false`
+                // (live round 3 E2): an executor configured for codex must
+                // never be silently answered by Claude and then recorded as
+                // codex; the round degrades explicitly instead.
+                allow_cross_family_failover: overrides.allow_cross_family_failover,
             },
         )
         .await;
@@ -882,116 +1022,6 @@ async fn call_claude_for_agent_impl(
                 error = %e,
                 "Failed to install agent-file-guard hook — continuing without enforcement"
             );
-        }
-
-        // Phase 3.C.5 (2026-05-14): dispatcher PTY short-circuit.
-        //
-        // When the agent opts in to `[runtime] pty_pool_enabled = true`,
-        // dispatcher-side invocations short-circuit local offload + hybrid
-        // routing and go straight to the PTY pool. The semantic is "I've
-        // chosen PTY-as-runtime; respect that across all entry points
-        // (channel reply + sub-agent dispatch)".
-        //
-        // Cost gates (local offload, model fallback) are intentionally
-        // bypassed because:
-        // 1. The operator's intent is clear from the flag.
-        // 2. PTY interactive mode reuses sessions across turns, so the
-        //    cost saving from local offload is less material.
-        // 3. Mixing PTY-with-local-offload would create surprising
-        //    behaviour — the in-session conversation context would get
-        //    truncated by occasional local-offload diversions.
-        let runtime_mode = crate::pty_runtime::runtime_mode_for_agent(&agent_dir);
-        if runtime_mode == crate::pty_runtime::RuntimeMode::PtyPool {
-            info!(
-                agent = %agent_name,
-                mode = runtime_mode.as_str(),
-                "dispatcher: short-circuit through PTY pool (skipping local offload + hybrid routing)"
-            );
-            // Stall detection + hard cap, same policy as the channel path
-            // (per-agent configurable via `agent.toml [runtime]`).
-            let hard_cap = crate::pty_runtime::interactive_repl_deadline(Some(&agent_dir));
-            let idle_timeout = crate::pty_runtime::interactive_repl_idle_timeout(Some(&agent_dir));
-            // Round 4 deferred-cleanup (LOW F-3): canonical options entry.
-            // Unbind from hardcoded Claude: the PtyPool kind follows the agent's
-            // configured provider. Non-Claude providers are short-circuited to
-            // `runtime_dispatch` above (the `non_claude_provider` guard), so this
-            // resolves to Claude in practice today — but the coupling is gone.
-            let cli_kind = crate::pty_runtime::cli_kind_for_provider(delegation_settings.provider)
-                .unwrap_or(duduclaw_cli_runtime::CliKind::Claude);
-            // Gap A fix: route each rotator-selected account's credential env
-            // into the PTY pool (per-account `account_id` + `env`), mirroring the
-            // channel-reply path. Previously this dispatcher short-circuit called
-            // `acquire_and_invoke_with` with NO account_id / env, so PTY-pooled
-            // sub-agent dispatch ran under whatever ambient OAuth happened to live
-            // in `~/.claude/` — breaking multi-account isolation and the managed
-            // worker's HS14 per-account scoping. Use the same `rotate_cli_spawn`
-            // primitive the channel path uses so failover + per-account cooldown
-            // apply here too.
-            // WP10 M1: feed the demotion breaker from this path too. The
-            // breaker is read upstream at `runtime_mode_for_agent` (line above),
-            // so a demoted agent never enters this block and falls through to
-            // the fresh-spawn path below — consistent with channel reply. But
-            // without recording here, dispatcher-only agents would never
-            // ACCUMULATE toward demotion and would keep paying the stall tax.
-            let record_pty_outcome = |r: &Result<String, String>| match r {
-                Ok(_) => crate::pty_runtime::record_pty_success(agent_id),
-                Err(e) if crate::pty_runtime::is_pty_transport_error(e) => {
-                    crate::pty_runtime::record_pty_transport_failure(agent_id);
-                }
-                Err(_) => {}
-            };
-            match get_rotator(home_dir).await {
-                Ok(rotator) if rotator.count().await > 0 => {
-                    let out = crate::channel_reply::rotate_cli_spawn(
-                        &rotator,
-                        &account_pool,
-                        move |env_vars, _retry_hint| {
-                            let account_id =
-                                crate::channel_reply::account_id_from_env_vars(&env_vars);
-                            async move {
-                                let acquire = crate::pty_runtime::AcquireOptions::new(
-                                    agent_id,
-                                    cli_kind,
-                                    cli_bare_mode,
-                                )
-                                .account_id(account_id.as_deref())
-                                .env(env_vars.clone());
-                                crate::pty_runtime::acquire_and_invoke_with(
-                                    crate::pty_runtime::InvokeOptions::new(
-                                        acquire,
-                                        prompt,
-                                        hard_cap,
-                                        idle_timeout,
-                                    ),
-                                )
-                                .await
-                            }
-                        },
-                        prompt.len(),
-                    )
-                    .await;
-                    record_pty_outcome(&out);
-                    return out;
-                }
-                _ => {
-                    // No rotator accounts / rotator unavailable → ambient-env
-                    // fallback (the user's default `claude auth login` session),
-                    // matching the pre-fix behaviour.
-                    let acquire =
-                        crate::pty_runtime::AcquireOptions::new(agent_id, cli_kind, cli_bare_mode);
-                    let out = crate::pty_runtime::acquire_and_invoke_with(
-                        crate::pty_runtime::InvokeOptions::new(
-                            acquire,
-                            prompt,
-                            hard_cap,
-                            idle_timeout,
-                        ),
-                    )
-                    .await;
-                    record_pty_outcome(&out);
-                    return out;
-                }
-            }
         }
     }
 
@@ -1029,7 +1059,9 @@ async fn call_claude_for_agent_impl(
         "claude" => {
             // Skip local entirely, go straight to Claude API
             info!(agent = %agent_name, model = %claude_model, "Claude-only mode");
-            let wd = effective_work_dir(&agent_dir);
+            let wd = work_dir_override
+                .clone()
+                .or_else(|| effective_work_dir(&agent_dir));
             let primary_result = call_with_rotation(
                 home_dir,
                 agent_id,
@@ -1041,13 +1073,15 @@ async fn call_claude_for_agent_impl(
                 wd.as_deref(),
                 cli_bare_mode,
                 &account_pool,
+                dispatch_effort,
+                spawn_identity,
             )
             .await;
             return match primary_result {
                 Ok(text) => Ok(text),
                 Err(ref e)
-                    if is_llm_fallback_error(e)
-                        && should_attempt_model_fallback(&claude_model, &fallback_model) =>
+                    if FailoverManager::model_fallback_for(&claude_model, &fallback_model, e)
+                        .is_some() =>
                 {
                     warn!(
                         primary = %claude_model,
@@ -1068,6 +1102,8 @@ async fn call_claude_for_agent_impl(
                         wd.as_deref(),
                         cli_bare_mode,
                         &account_pool,
+                        dispatch_effort,
+                        spawn_identity,
                     )
                     .await
                     .map_err(|fe| {
@@ -1146,7 +1182,9 @@ async fn call_claude_for_agent_impl(
     // if CLI fails with rate limit (all OAuth accounts exhausted).
     // In "cli" mode: CLI is the only cloud path.
     // In "direct" mode: skip CLI, go straight to Direct API.
-    let wd = effective_work_dir(&agent_dir);
+    let wd = work_dir_override
+        .clone()
+        .or_else(|| effective_work_dir(&agent_dir));
     // 2026-09-05 (DuDuClaw OS QEMU walkthrough): an appliance ships no Claude
     // Code CLI at all, so "cli"/"auto" (agent.toml's default) died right here
     // with "Claude CLI not found" on every dispatch — the goal task sat in
@@ -1171,6 +1209,8 @@ async fn call_claude_for_agent_impl(
             wd.as_deref(),
             cli_bare_mode,
             &account_pool,
+            dispatch_effort,
+            spawn_identity,
         )
         .await
         {
@@ -1178,8 +1218,9 @@ async fn call_claude_for_agent_impl(
             Err(e) => {
                 let is_rate = is_rate_limit_error(&e);
                 let is_fallback_trigger = is_llm_fallback_error(&e);
-                let can_model_fallback = is_fallback_trigger
-                    && should_attempt_model_fallback(&claude_model, &fallback_model);
+                let can_model_fallback =
+                    FailoverManager::model_fallback_for(&claude_model, &fallback_model, &e)
+                        .is_some();
 
                 if can_model_fallback {
                     // Model-level fallback takes priority over account-level
@@ -1206,6 +1247,8 @@ async fn call_claude_for_agent_impl(
                         wd.as_deref(),
                         cli_bare_mode,
                         &account_pool,
+                        dispatch_effort,
+                        spawn_identity,
                     )
                     .await
                     .map_err(|fe| {
@@ -1274,8 +1317,7 @@ async fn call_claude_for_agent_impl(
     {
         Ok(text) => Ok(text),
         Err(ref e)
-            if is_llm_fallback_error(e)
-                && should_attempt_model_fallback(&claude_model, &fallback_model) =>
+            if FailoverManager::model_fallback_for(&claude_model, &fallback_model, e).is_some() =>
         {
             warn!(
                 primary = %claude_model,
@@ -1405,7 +1447,7 @@ fn build_llm_chat_request(
     dynamic_system_suffix: Option<&str>,
     prompt: &str,
 ) -> duduclaw_llm::ChatRequest {
-    use duduclaw_llm::{ChatMessage, ChatRequest, SystemBlock, CACHE_SPLIT_MARKER};
+    use duduclaw_llm::{CACHE_SPLIT_MARKER, ChatMessage, ChatRequest, SystemBlock};
 
     let mut req = ChatRequest::new(model);
     for segment in system_prompt.split(CACHE_SPLIT_MARKER) {
@@ -1590,6 +1632,34 @@ pub(crate) fn filter_tool_defs(
 /// the tool loop (G2). Fail-safe: any resolve/spawn/handshake/list failure logs
 /// a warning and returns `None`, so the caller degrades to a tools-less answer
 /// rather than failing the whole reply.
+fn finish_mcp_tool_registry(
+    agent_id: &str,
+    home: &Path,
+    registry: Option<duduclaw_llm::ToolRegistry>,
+) -> Option<duduclaw_llm::ToolRegistry> {
+    let mut registry = registry?;
+    crate::causal_mcp_source::fence_declared_verified_routes(home, &mut registry);
+    if let Some(runtime) = crate::ccr_runtime::for_agent(home, agent_id) {
+        if let Err(error) =
+            crate::causal_mcp_source::register_verified_causal_routes(home, &mut registry, &runtime)
+        {
+            warn!(agent = %agent_id, error = %error,
+                "verified causal route config malformed — MCP results withheld unless independently verified");
+            registry.require_source_attestation_for_all_tools();
+            registry.disable_ccr_for_all_tools();
+        }
+        if let Err(error) =
+            crate::wiki_mcp_source::register_verified_wiki_routes(home, &mut registry, &runtime)
+        {
+            warn!(agent = %agent_id, error = %error,
+                "verified Wiki route config malformed — MCP results withheld unless independently verified");
+            registry.require_source_attestation_for_all_tools();
+            registry.disable_ccr_for_all_tools();
+        }
+    }
+    Some(registry)
+}
+
 pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_llm::ToolRegistry> {
     let bin = duduclaw_core::resolve_duduclaw_bin();
     if !bin.is_absolute() {
@@ -1629,7 +1699,7 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
     // redaction rules match on — the same namespace `duduclaw mcp-proxy`
     // applies on the CLI path. Routing/collision behaviour is unchanged.
     if externals.is_empty() {
-        return match duduclaw_llm::ToolRegistry::from_clients_named(
+        let registry = match duduclaw_llm::ToolRegistry::from_clients_named(
             vec![("duduclaw".to_string(), internal)],
             Vec::new(),
         )
@@ -1641,6 +1711,7 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
                 None
             }
         };
+        return finish_mcp_tool_registry(agent_id, &home_dir, registry);
     }
 
     let mut clients = vec![("duduclaw".to_string(), internal)];
@@ -1682,7 +1753,7 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
         }
     }
 
-    match duduclaw_llm::ToolRegistry::from_clients_named(clients, filters).await {
+    let registry = match duduclaw_llm::ToolRegistry::from_clients_named(clients, filters).await {
         Ok(reg) => Some(reg),
         Err(e) => {
             // A misbehaving external server can fail the combined tools/list.
@@ -1696,7 +1767,8 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
             .await
             .ok()
         }
-    }
+    };
+    finish_mcp_tool_registry(agent_id, &home_dir, registry)
 }
 
 /// Where a direct-API key came from — the pure output of [`choose_key_source`].
@@ -1787,7 +1859,7 @@ async fn run_llm_provider(
             return Err(ChainError {
                 message: e,
                 failover: false,
-            })
+            });
         }
     };
     let (account_id, key) = match key_source {
@@ -1801,7 +1873,7 @@ async fn run_llm_provider(
             return Err(ChainError {
                 message: e,
                 failover: false,
-            })
+            });
         }
     };
 
@@ -1847,6 +1919,8 @@ async fn run_llm_provider(
         }
     };
 
+    let ccr_runtime = crate::ccr_runtime::for_agent(&duduclaw_core::duduclaw_home(), agent_id);
+
     info!(
         provider = provider_id,
         model,
@@ -1883,37 +1957,44 @@ async fn run_llm_provider(
                 &prov_sensitive,
                 prompt,
             );
-            // WP-6E: Code Mode Phase 0 measurement gate
-            // (`commercial/docs/DESIGN-code-mode-2026-08.md` §8.1) — beneficiary
-            // #2 of the design's §2 list. Pure observation layered over
-            // `RecordingProvider`; forwards everything verbatim.
-            let probe = crate::tool_loop_probe::ToolLoopProbe::new(&provider);
-            let loop_result = duduclaw_llm::run_tool_loop_with_provenance(
-                &probe,
+            let loop_result = duduclaw_llm::run_tool_loop_with_provenance_and_ccr(
+                &provider,
                 req,
                 &guarded,
                 duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
                 prov_cfg,
                 redaction_interceptor,
+                ccr_runtime,
             )
             .await;
-            // Before the error is mapped away: a partially-run turn is still a
-            // truthful measurement.
-            probe.finish_and_record(
-                agent_id,
-                crate::tool_loop_probe::ProbePath::DirectApi,
-                model,
-            );
-            loop_result.map(|out| {
-                if !out.provenance_flags.is_empty() {
-                    tracing::warn!(
-                        agent = %agent_id,
-                        flags = out.provenance_flags.len(),
-                        "provenance: tainted-argument flags raised in tool loop"
-                    );
+            // `match` rather than `Result::map`: retaining the CCR delivery
+            // guards revalidates off the reactor and therefore needs an await,
+            // which a sync closure cannot host.
+            match loop_result {
+                Err(error) => Err(error),
+                Ok(out) => {
+                    if !out.provenance_flags.is_empty() {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            flags = out.provenance_flags.len(),
+                            "provenance: tainted-argument flags raised in tool loop"
+                        );
+                    }
+                    if !crate::ccr_runtime::capture_delivery_guards(out.ccr_delivery_guards).await {
+                        tracing::warn!(agent = %agent_id, "CCR delivery guard could not be retained");
+                        let mut response = out.response;
+                        response.parts = vec![duduclaw_llm::ContentPart::Text(
+                            crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT.to_string(),
+                        )];
+                        Ok(response)
+                    } else {
+                        if !out.response.text().trim().is_empty() {
+                            crate::ccr_runtime::capture_saved_results(out.ccr_saved_results);
+                        }
+                        Ok(out.response)
+                    }
                 }
-                out.response
-            })
+            }
         }
         None => provider.complete(&req).await,
     };
@@ -2043,7 +2124,11 @@ async fn try_direct_api(
         if let Some(rotator) = rotator {
             if let Some(env) = rotator.select_for_provider("anthropic").await {
                 if env.auth_method == duduclaw_agent::account_rotator::AuthMethod::ApiKey {
-                    if let Some(key) = env.raw_key.clone().or_else(|| env.env_vars.get("ANTHROPIC_API_KEY").cloned()) {
+                    if let Some(key) = env
+                        .raw_key
+                        .clone()
+                        .or_else(|| env.env_vars.get("ANTHROPIC_API_KEY").cloned())
+                    {
                         if !key.is_empty() {
                             info!(account = %env.id, "Direct API: using the stored [[accounts]] API key");
                             api_key = key;
@@ -2454,6 +2539,34 @@ pub(crate) async fn reset_inference_engine() {
     }
 }
 
+/// Await every in-flight `ucci_shadow_strong` observation on the cached
+/// engine, if one was ever built.
+///
+/// W3-4 detached the UCCI LocalStrong shadow generation so it stops blocking
+/// the fast reply, which means a shadow can still be running when the process
+/// is asked to exit — and its calibration row would simply be lost. The
+/// gateway's graceful-shutdown sequence calls this (bounded, warn-only on
+/// timeout) between the prediction-engine flush and the worker-supervisor
+/// teardown.
+///
+/// Reads the singleton rather than taking an engine argument because the
+/// shutdown path has no engine handle of its own; `INFERENCE_ENGINE` is the
+/// one place a gateway-owned [`duduclaw_inference::InferenceEngine`] lives
+/// (`autopilot_screen` and `local_llm` both borrow from it). An engine that
+/// was never initialised, or one built with `ucci_shadow_strong` off, has no
+/// tasks to await and this costs nothing.
+pub(crate) async fn flush_inference_shadow_observations() {
+    // Clone the Arc out before awaiting so the cache lock is not held across
+    // the (potentially seconds-long) shadow generations.
+    let engine = match INFERENCE_ENGINE.get() {
+        Some(cache) => cache.read().await.clone(),
+        None => None,
+    };
+    if let Some(engine) = engine {
+        engine.flush_shadow_observations().await;
+    }
+}
+
 /// Get or create the inference engine singleton.
 ///
 /// `pub(crate)`: also the entry point for `autopilot_screen::InferenceScreener`
@@ -2776,6 +2889,11 @@ async fn call_with_rotation(
     // The dispatched agent's `agent.toml [model] account_pool`. Narrows the
     // rotator candidate set (fail-open); empty ⇒ rotation unchanged.
     account_pool: &[String],
+    // P1/WP-3: per-call reasoning effort for this dispatch/cron/heartbeat turn.
+    effort: Option<duduclaw_core::effort::Effort>,
+    // Team-as-Agent: the identity half of the spawn when it is not the cwd.
+    // `SpawnIdentity::default()` ⇒ byte-identical to before this existed.
+    identity: SpawnIdentity<'_>,
 ) -> Result<String, String> {
     // HIGH-A defence-in-depth: a `moa:` virtual model can never be served by
     // a CLI spawn. Reject BEFORE the rotator is even constructed so a
@@ -2784,6 +2902,14 @@ async fn call_with_rotation(
     if let Some(msg) = crate::channel_reply::reject_moa_on_cli_path(model) {
         return Err(msg);
     }
+    // P1/WP-3: explicit effort wins, else the dispatched agent's own
+    // `agent.toml [model] effort` (`work_dir` is the agent directory).
+    let effort = effort.or_else(|| {
+        identity
+            .config_dir
+            .or(work_dir)
+            .and_then(duduclaw_core::effort::read_agent_effort)
+    });
 
     // Pre-flight: check 200K price cliff
     if let Some(estimated) = crate::cost_telemetry::check_price_cliff(system_prompt, prompt) {
@@ -2813,15 +2939,45 @@ async fn call_with_rotation(
         }
         info!(agent_id, "No rotator accounts — using ambient env fallback");
         let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let resp =
-            call_claude_with_env(prompt, model, system_prompt, &empty, capabilities, work_dir)
-                .await?;
+        let resp = call_claude_with_env(
+            prompt,
+            model,
+            system_prompt,
+            &empty,
+            capabilities,
+            work_dir,
+            effort,
+            identity,
+        )
+        .await?;
 
         if let Some(ref usage) = resp.usage {
+            crate::runtime::record_role_usage(crate::role_turns::RoleTurnUsage {
+                usage_input_tokens: Some(usage.total_input()),
+                usage_output_tokens: Some(usage.output_tokens),
+                usage_cache_read_tokens: Some(usage.cache_read_tokens),
+                usage_legs: None,
+            });
             if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
-                telemetry.record(agent_id, request_type, model, usage).await;
+                if let Ok(a) = crate::runtime::ROLE_COST_ATTRIBUTION.try_with(Clone::clone) {
+                    telemetry
+                        .record_team_role(
+                            agent_id,
+                            request_type,
+                            a.role,
+                            &a.episode_id,
+                            model,
+                            usage,
+                        )
+                        .await;
+                } else {
+                    telemetry.record(agent_id, request_type, model, usage).await;
+                }
             }
         }
+        // Truthful attribution (Team-as-Agent live round 3 E2): the Claude CLI
+        // answered, on `model`. No-op outside a `RUNTIME_OUTCOME` scope.
+        crate::runtime::record_runtime_outcome(duduclaw_core::types::RuntimeType::Claude, model);
         return Ok(resp.text);
     }
 
@@ -2858,6 +3014,8 @@ async fn call_with_rotation(
                 &selected.env_vars,
                 capabilities,
                 work_dir,
+                effort,
+                identity,
             ),
         );
         match bare_scope.await {
@@ -2878,6 +3036,11 @@ async fn call_with_rotation(
                     ((prompt.len() + response.text.len()) / 1000).max(1) as u64
                 };
                 rotator.on_success(&selected.id, cost).await;
+                // Truthful attribution (Team-as-Agent live round 3 E2).
+                crate::runtime::record_runtime_outcome(
+                    duduclaw_core::types::RuntimeType::Claude,
+                    model,
+                );
 
                 // D7: an account answered ⇒ if a previous run had declared an
                 // "all accounts failed authentication" outage, close it and
@@ -2888,8 +3051,28 @@ async fn call_with_rotation(
 
                 // Record telemetry
                 if let Some(ref usage) = response.usage {
+                    crate::runtime::record_role_usage(crate::role_turns::RoleTurnUsage {
+                        usage_input_tokens: Some(usage.total_input()),
+                        usage_output_tokens: Some(usage.output_tokens),
+                        usage_cache_read_tokens: Some(usage.cache_read_tokens),
+                        usage_legs: None,
+                    });
                     if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
-                        telemetry.record(agent_id, request_type, model, usage).await;
+                        if let Ok(a) = crate::runtime::ROLE_COST_ATTRIBUTION.try_with(Clone::clone)
+                        {
+                            telemetry
+                                .record_team_role(
+                                    agent_id,
+                                    request_type,
+                                    a.role,
+                                    &a.episode_id,
+                                    model,
+                                    usage,
+                                )
+                                .await;
+                        } else {
+                            telemetry.record(agent_id, request_type, model, usage).await;
+                        }
                     }
                 }
 
@@ -3036,7 +3219,10 @@ pub(crate) fn ingest_stream_json_event_for_native_tools(
                 if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
                     continue;
                 }
-                let id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or_default();
+                let id = block
+                    .get("tool_use_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 let popped = if !id.is_empty() {
                     open_native_calls
                         .iter()
@@ -3048,7 +3234,10 @@ pub(crate) fn ingest_stream_json_event_for_native_tools(
                 .or_else(|| open_native_calls.pop());
                 if let Some((_, idx)) = popped {
                     if let Some(ev) = native_events.get_mut(idx) {
-                        ev.success = !block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                        ev.success = !block
+                            .get("is_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         // R1: the tool_result's `content` is either a bare
                         // string, or (Claude's actual tool_result shape) an
                         // array of content blocks — join every `text` block,
@@ -3392,11 +3581,6 @@ tokio::task_local! {
     /// [`REPLY_CHANNEL`] for the channel dimension.
     pub static CHANNEL_REPLY_USER_ID: String;
 
-    /// Worktree path override injected by the dispatcher when L0 worktree
-    /// isolation is enabled.  `prepare_claude_cmd` uses this as the working
-    /// directory instead of the agent's base directory.
-    pub static WORKTREE_PATH: Option<std::path::PathBuf>;
-
     /// **#15 (2026-05-12)** — when set to `true`, `prepare_claude_cmd`
     /// adds `--bare` to the spawned `claude` subprocess. This disables
     /// CLAUDE.md auto-discovery (the leak documented in #15's spike)
@@ -3449,6 +3633,60 @@ pub(crate) fn mcp_proxy_cli_args(
     Some((args, proxied))
 }
 
+/// The `--mcp-config` flags for this spawn, with an optional **explicit**
+/// config source that overrides cwd auto-discovery.
+///
+/// `explicit = None` ⇒ exactly [`mcp_proxy_cli_args`], i.e. the pre-existing
+/// behaviour (nothing at all unless redaction is active).
+///
+/// `explicit = Some(path)` is the Team-as-Agent case (design §4.3 E3). A role
+/// member's cwd is the *employee's* workspace, and the Claude CLI would
+/// auto-discover `<cwd>/.mcp.json` — so the member's duduclaw MCP server would
+/// boot with the employee's `DUDUCLAW_AGENT_ID` and every `team_handoff`,
+/// every audit row and every capability check would be attributed to the
+/// parent. Naming the member's own `.mcp.json` and adding
+/// `--strict-mcp-config` (which stops the CLI from ALSO merging the ambient
+/// and cwd configs) is what keeps cwd and identity independent.
+///
+/// The explicit file still goes through the RFC-23 redaction rewrite when
+/// redaction is active, so a role member's external MCP servers are proxied
+/// exactly like anybody else's.
+///
+/// A requested-but-missing explicit file degrades to the `None` behaviour with
+/// a `warn` rather than spawning with no MCP at all; the composer refuses to
+/// dispatch in that case, so this is a belt-and-braces branch.
+fn mcp_config_cli_args(
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    explicit: Option<&Path>,
+) -> Option<(Vec<String>, Option<tempfile::TempPath>)> {
+    let Some(path) = explicit else {
+        return mcp_proxy_cli_args(home_dir, work_dir).map(|(args, guard)| (args, Some(guard)));
+    };
+    if !path.exists() {
+        warn!(
+            path = %path.display(),
+            "explicit --mcp-config file is missing — falling back to cwd auto-discovery"
+        );
+        return mcp_proxy_cli_args(home_dir, work_dir).map(|(args, guard)| (args, Some(guard)));
+    }
+    let (target, guard) = match crate::redaction_proxy::maybe_proxy_mcp_config(home_dir, path) {
+        Some(proxied) => {
+            let rendered = proxied.to_string_lossy().to_string();
+            (rendered, Some(proxied))
+        }
+        None => (path.to_string_lossy().to_string(), None),
+    };
+    Some((
+        vec![
+            "--mcp-config".to_string(),
+            target,
+            "--strict-mcp-config".to_string(),
+        ],
+        guard,
+    ))
+}
+
 /// Guards whose lifetime must cover the spawned child: the temp files the
 /// command line points at are deleted when these drop.
 ///
@@ -3475,6 +3713,13 @@ fn prepare_claude_cmd(
     // for this spawn. Production passes the process home; tests pass a temp
     // root so the gate can be exercised without touching process state.
     home_dir: &Path,
+    // P1/WP-3: per-call reasoning effort. `None` ⇒ no `--effort` flag, so the
+    // dispatch/cron/heartbeat/goal-loop argv is byte-identical to before.
+    effort: Option<duduclaw_core::effort::Effort>,
+    // Team-as-Agent: which directory owns this spawn's identity-scoped config,
+    // and an explicit `--mcp-config` source. Both `None` (every pre-existing
+    // caller) ⇒ the cwd answers both questions, exactly as before.
+    identity: SpawnIdentity<'_>,
 ) -> (tokio::process::Command, ClaudeCmdGuards) {
     let mut cmd = duduclaw_core::platform::async_command_for(claude_path);
 
@@ -3485,7 +3730,7 @@ fn prepare_claude_cmd(
     // agent used it or not. Clear the env and seed only the allowlisted
     // base (PATH/HOME/locale/terminal/proxy — see
     // `duduclaw_core::spawn_env` for the full list and rationale, mirrors
-    // the pattern already shipped in `worker_supervisor.rs`). The
+    // the pattern the former `worker_supervisor.rs` shipped). The
     // account-rotator-resolved credentials (`env_vars` in
     // `call_claude_with_env`, applied further below) and every other
     // explicit `cmd.env(...)` call in this function run AFTER this and
@@ -3502,19 +3747,37 @@ fn prepare_claude_cmd(
     // gate correctly but attributes to "unknown" if it were ever non-empty
     // — in practice those callers pass `capabilities = None`, so nothing is
     // ever granted or logged for them.
-    let git_env_granted =
-        duduclaw_core::apply_agent_cli_env_allowlist_for(&mut cmd, capabilities);
+    // Identity-scoped config directory. Defaults to the cwd — which IS the
+    // agent directory for every caller but a team role member.
+    let config_dir = identity.config_dir.or(work_dir);
+    let git_env_granted = duduclaw_core::apply_agent_cli_env_allowlist_for(&mut cmd, capabilities);
+    // A team role is a short-lived `-p` main conversation, so give its
+    // otherwise stable role/identity prefix the one-hour cache window. This
+    // applies only to a validated role-member scaffold; ordinary agent and
+    // ephemeral spawns keep their existing CLI cache policy. The subagent
+    // variable covers any Claude-internal worker the role may start.
+    if config_dir
+        .and_then(crate::ephemeral::read_role_member)
+        .is_some()
+    {
+        cmd.env("CLAUDE_CODE_PROMPT_CACHE_TTL", "1h");
+        cmd.env("CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL", "1h");
+    }
     if !git_env_granted.is_empty() {
-        let agent_id = work_dir
+        let agent_id = config_dir
             .and_then(|d| d.file_name())
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
-        let home_dir = work_dir
+        let home_dir = config_dir
             .and_then(|d| d.parent())
             .and_then(|p| p.parent())
             .map(std::path::PathBuf::from)
             .unwrap_or_else(duduclaw_core::platform::duduclaw_home);
-        duduclaw_security::audit::log_git_credentials_granted(&home_dir, agent_id, &git_env_granted);
+        duduclaw_security::audit::log_git_credentials_granted(
+            &home_dir,
+            agent_id,
+            &git_env_granted,
+        );
         // C1 producer 甲 companion — see `security_autopilot.rs`.
         crate::security_autopilot::emit_git_credentials_granted(agent_id);
     }
@@ -3527,10 +3790,10 @@ fn prepare_claude_cmd(
     // RFC-23 §13.6: override that auto-discovery with a proxied copy when
     // redaction is active (see `mcp_proxy_cli_args`). `None` ⇒ no flags at
     // all, auto-discovery unchanged.
-    let mcp_proxy_guard = match mcp_proxy_cli_args(home_dir, work_dir) {
+    let mcp_proxy_guard = match mcp_config_cli_args(home_dir, work_dir, identity.mcp_config) {
         Some((args, guard)) => {
             cmd.args(&args);
-            Some(guard)
+            guard
         }
         None => None,
     };
@@ -3572,6 +3835,23 @@ fn prepare_claude_cmd(
         "50",
     ]);
 
+    // P1/WP-3: per-call reasoning effort. `--effort <low|medium|high|xhigh|max>`
+    // verified on Claude Code 2.1.258 (`--help`), per-invocation only (the CLI
+    // does not persist it as the default). This is the single argv assembly
+    // point for dispatch / cron / heartbeat / goal-loop, so one `if` covers all
+    // four. `None` ⇒ the flag is absent and the argv is byte-identical.
+    //
+    // CACHE: effort is part of the cached prefix — flipping it mid-conversation
+    // invalidates the prompt cache. Keep it steady per conversation.
+    if let Some(effort) = effort {
+        cmd.args([
+            "--effort",
+            effort
+                .clamp_for(duduclaw_core::types::RuntimeType::Claude)
+                .as_str(),
+        ]);
+    }
+
     // Apply tool restrictions based on agent capabilities (deny-by-default)
     let caps = capabilities.cloned().unwrap_or_default();
 
@@ -3591,13 +3871,13 @@ fn prepare_claude_cmd(
 
     let mut denied = caps.disallowed_tools();
     // WP3 (PORTICO) auxiliary enforcement: fold in any `scoped_tools` that lack
-    // an active task-scoped grant. `work_dir` is the agent directory, from which
+    // an active task-scoped grant. `config_dir` is the agent directory, from which
     // the helper derives home + agent_id and reads the shared grant store
     // (fail-closed: on any store error every scoped tool is disallowed). The MCP
     // dispatch gate is the PRIMARY enforcement; this is defense-in-depth so a
     // scoped tool is also absent from the CLI's own allow surface. `None`
-    // work_dir or a non-agent dir yields an empty list (zero effect).
-    if let Some(dir) = work_dir {
+    // config_dir or a non-agent dir yields an empty list (zero effect).
+    if let Some(dir) = config_dir {
         let scoped_disallow = crate::capability_grants::scoped_disallow_for_agent_dir(dir);
         if !scoped_disallow.is_empty() {
             denied.extend(scoped_disallow);
@@ -3618,16 +3898,17 @@ fn prepare_claude_cmd(
     // schema the allowlist would not auto-approve is pure token waste here.
     // `project,local` keeps the agent's own `.claude/settings.json`. Default ON;
     // env kill-switch / per-agent [runtime] minimal_context = false opts out.
-    if duduclaw_core::agent_toml::resolve_minimal_context(work_dir) {
+    if duduclaw_core::agent_toml::resolve_minimal_context(config_dir) {
         cmd.args(["--setting-sources", "project,local"]);
-        let tools = caps.minimal_builtin_tools(&duduclaw_core::types::DISPATCH_DEFAULT_BUILTIN_TOOLS);
+        let tools =
+            caps.minimal_builtin_tools(&duduclaw_core::types::DISPATCH_DEFAULT_BUILTIN_TOOLS);
         cmd.args(["--tools", &tools.join(",")]);
     }
 
-    // Signal bash-gate.sh to allow browser automation commands
-    if caps.browser_via_bash {
-        cmd.env("DUDUCLAW_BROWSER_VIA_BASH", "1");
-    }
+    // NOTE: `caps.browser_via_bash` deliberately injects no env flag. The
+    // `bash-gate.sh` allowlist that read `DUDUCLAW_BROWSER_VIA_BASH` was
+    // removed in `ba015a48`; the capability still gates tools via
+    // `disallowed_tools()` and the codex/gemini sandbox level.
 
     // RFC-23 §14.4: arm the data-file guard PreToolUse hook for this spawn.
     // Same predicate as the two `channel_reply` spawn sites so dispatch /
@@ -3714,8 +3995,64 @@ fn prepare_claude_cmd(
 
     (
         cmd,
-        ClaudeCmdGuards { prompt: prompt_guard, mcp_proxy: mcp_proxy_guard },
+        ClaudeCmdGuards {
+            prompt: prompt_guard,
+            mcp_proxy: mcp_proxy_guard,
+        },
     )
+}
+
+#[cfg(test)]
+mod role_cache_ttl_tests {
+    use super::*;
+
+    fn ttl(cmd: &tokio::process::Command, key: &str) -> Option<String> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn one_hour_cache_ttl_is_scoped_to_valid_role_members() {
+        let tmp = tempfile::tempdir().unwrap();
+        let role_dir = tmp.path().join("agents/.ephemeral/eph-role");
+        std::fs::create_dir_all(&role_dir).unwrap();
+        std::fs::write(
+            role_dir.join("agent.toml"),
+            "[team_member]\nrole = \"planner\"\ntask_id = \"t1\"\nround = 1\nparent = \"boss\"\n",
+        )
+        .unwrap();
+        let build = |config_dir: Option<&Path>| {
+            prepare_claude_cmd(
+                "claude",
+                "PING",
+                "claude-sonnet-4-6",
+                "stable",
+                None,
+                None,
+                tmp.path(),
+                None,
+                SpawnIdentity {
+                    config_dir,
+                    mcp_config: None,
+                },
+            )
+            .0
+        };
+        let role = build(Some(&role_dir));
+        assert_eq!(
+            ttl(&role, "CLAUDE_CODE_PROMPT_CACHE_TTL").as_deref(),
+            Some("1h")
+        );
+        assert_eq!(
+            ttl(&role, "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL").as_deref(),
+            Some("1h")
+        );
+        let ordinary = build(None);
+        assert_eq!(ttl(&ordinary, "CLAUDE_CODE_PROMPT_CACHE_TTL"), None);
+    }
 }
 
 /// Call claude CLI with custom env vars (supports both OAuth and API key).
@@ -3726,6 +4063,10 @@ async fn call_claude_with_env(
     env_vars: &std::collections::HashMap<String, String>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     work_dir: Option<&Path>,
+    // P1/WP-3: per-call reasoning effort, forwarded to `prepare_claude_cmd`.
+    effort: Option<duduclaw_core::effort::Effort>,
+    // Team-as-Agent: identity-scoped config dir + explicit `--mcp-config`.
+    identity: SpawnIdentity<'_>,
 ) -> Result<ClaudeResponse, String> {
     let claude = duduclaw_core::which_claude().ok_or("Claude CLI not found")?;
     // `_cmd_guards` holds the `--system-prompt-file` and (RFC-23 §13.6)
@@ -3738,6 +4079,8 @@ async fn call_claude_with_env(
         capabilities,
         work_dir,
         &duduclaw_core::platform::duduclaw_home(),
+        effort,
+        identity,
     );
 
     for (key, value) in env_vars {
@@ -3793,10 +4136,18 @@ mod native_tool_collector_tests {
     fn ingest_pairs_tool_use_with_success_result_by_id() {
         let mut events = Vec::new();
         let mut open = Vec::new();
-        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Bash"), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &assistant_tool_use("tu_1", "Bash"),
+            &mut events,
+            &mut open,
+        );
         assert_eq!(events.len(), 1);
         assert!(events[0].success, "provisional success before pairing");
-        ingest_stream_json_event_for_native_tools(&user_tool_result("tu_1", false), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &user_tool_result("tu_1", false),
+            &mut events,
+            &mut open,
+        );
         assert_eq!(events[0].tool_name, "Bash");
         assert!(events[0].success);
         assert!(open.is_empty());
@@ -3806,8 +4157,16 @@ mod native_tool_collector_tests {
     fn ingest_pairs_tool_use_with_error_result() {
         let mut events = Vec::new();
         let mut open = Vec::new();
-        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Bash"), &mut events, &mut open);
-        ingest_stream_json_event_for_native_tools(&user_tool_result("tu_1", true), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &assistant_tool_use("tu_1", "Bash"),
+            &mut events,
+            &mut open,
+        );
+        ingest_stream_json_event_for_native_tools(
+            &user_tool_result("tu_1", true),
+            &mut events,
+            &mut open,
+        );
         assert!(!events[0].success);
     }
 
@@ -3818,10 +4177,26 @@ mod native_tool_collector_tests {
         // than assuming strict FIFO/LIFO order.
         let mut events = Vec::new();
         let mut open = Vec::new();
-        ingest_stream_json_event_for_native_tools(&assistant_tool_use("id-a", "Read"), &mut events, &mut open);
-        ingest_stream_json_event_for_native_tools(&assistant_tool_use("id-b", "Write"), &mut events, &mut open);
-        ingest_stream_json_event_for_native_tools(&user_tool_result("id-a", true), &mut events, &mut open);
-        ingest_stream_json_event_for_native_tools(&user_tool_result("id-b", false), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &assistant_tool_use("id-a", "Read"),
+            &mut events,
+            &mut open,
+        );
+        ingest_stream_json_event_for_native_tools(
+            &assistant_tool_use("id-b", "Write"),
+            &mut events,
+            &mut open,
+        );
+        ingest_stream_json_event_for_native_tools(
+            &user_tool_result("id-a", true),
+            &mut events,
+            &mut open,
+        );
+        ingest_stream_json_event_for_native_tools(
+            &user_tool_result("id-b", false),
+            &mut events,
+            &mut open,
+        );
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].tool_name, "Read");
         assert!(!events[0].success);
@@ -3833,10 +4208,18 @@ mod native_tool_collector_tests {
     fn ingest_unpaired_tool_use_stays_provisionally_successful() {
         let mut events = Vec::new();
         let mut open = Vec::new();
-        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Bash"), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &assistant_tool_use("tu_1", "Bash"),
+            &mut events,
+            &mut open,
+        );
         assert_eq!(events.len(), 1);
         assert!(events[0].success);
-        assert_eq!(open.len(), 1, "still outstanding — no matching tool_result arrived");
+        assert_eq!(
+            open.len(),
+            1,
+            "still outstanding — no matching tool_result arrived"
+        );
     }
 
     #[test]
@@ -3861,7 +4244,11 @@ mod native_tool_collector_tests {
         let mut open = Vec::new();
         // A tool_result whose id matches nothing outstanding — must not
         // panic, must not corrupt any other entry.
-        ingest_stream_json_event_for_native_tools(&user_tool_result("nonexistent", true), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &user_tool_result("nonexistent", true),
+            &mut events,
+            &mut open,
+        );
         assert!(events.is_empty());
     }
 
@@ -3885,7 +4272,11 @@ mod native_tool_collector_tests {
 
     // ── R1: result_text / input_text capture ─────────────────────────────
 
-    fn assistant_tool_use_with_input(id: &str, name: &str, input: serde_json::Value) -> serde_json::Value {
+    fn assistant_tool_use_with_input(
+        id: &str,
+        name: &str,
+        input: serde_json::Value,
+    ) -> serde_json::Value {
         serde_json::json!({
             "type": "assistant",
             "message": {
@@ -3896,7 +4287,11 @@ mod native_tool_collector_tests {
         })
     }
 
-    fn user_tool_result_with_content(id: &str, is_error: bool, content: serde_json::Value) -> serde_json::Value {
+    fn user_tool_result_with_content(
+        id: &str,
+        is_error: bool,
+        content: serde_json::Value,
+    ) -> serde_json::Value {
         serde_json::json!({
             "type": "user",
             "message": {
@@ -3912,31 +4307,56 @@ mod native_tool_collector_tests {
         let mut events = Vec::new();
         let mut open = Vec::new();
         ingest_stream_json_event_for_native_tools(
-            &assistant_tool_use_with_input("tu_1", "Bash", serde_json::json!({"command": "cat report.md"})),
+            &assistant_tool_use_with_input(
+                "tu_1",
+                "Bash",
+                serde_json::json!({"command": "cat report.md"}),
+            ),
             &mut events,
             &mut open,
         );
-        assert!(events[0].input_text.as_deref().unwrap().contains("cat report.md"));
+        assert!(
+            events[0]
+                .input_text
+                .as_deref()
+                .unwrap()
+                .contains("cat report.md")
+        );
     }
 
     #[test]
     fn ingest_captures_result_text_from_bare_string_content() {
         let mut events = Vec::new();
         let mut open = Vec::new();
-        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Read"), &mut events, &mut open);
         ingest_stream_json_event_for_native_tools(
-            &user_tool_result_with_content("tu_1", false, serde_json::json!("quarterly revenue: 1.2M")),
+            &assistant_tool_use("tu_1", "Read"),
             &mut events,
             &mut open,
         );
-        assert_eq!(events[0].result_text.as_deref(), Some("quarterly revenue: 1.2M"));
+        ingest_stream_json_event_for_native_tools(
+            &user_tool_result_with_content(
+                "tu_1",
+                false,
+                serde_json::json!("quarterly revenue: 1.2M"),
+            ),
+            &mut events,
+            &mut open,
+        );
+        assert_eq!(
+            events[0].result_text.as_deref(),
+            Some("quarterly revenue: 1.2M")
+        );
     }
 
     #[test]
     fn ingest_joins_multiple_text_blocks_in_result_content() {
         let mut events = Vec::new();
         let mut open = Vec::new();
-        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Read"), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &assistant_tool_use("tu_1", "Read"),
+            &mut events,
+            &mut open,
+        );
         ingest_stream_json_event_for_native_tools(
             &user_tool_result_with_content(
                 "tu_1",
@@ -3949,14 +4369,21 @@ mod native_tool_collector_tests {
             &mut events,
             &mut open,
         );
-        assert_eq!(events[0].result_text.as_deref(), Some("first line\nsecond line"));
+        assert_eq!(
+            events[0].result_text.as_deref(),
+            Some("first line\nsecond line")
+        );
     }
 
     #[test]
     fn ingest_masks_secret_in_result_text() {
         let mut events = Vec::new();
         let mut open = Vec::new();
-        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Bash"), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &assistant_tool_use("tu_1", "Bash"),
+            &mut events,
+            &mut open,
+        );
         ingest_stream_json_event_for_native_tools(
             &user_tool_result_with_content(
                 "tu_1",
@@ -3982,7 +4409,11 @@ mod native_tool_collector_tests {
         // `None` (see `mask_and_cap`'s trim-then-empty-check).
         let mut events = Vec::new();
         let mut open = Vec::new();
-        ingest_stream_json_event_for_native_tools(&assistant_tool_use("tu_1", "Bash"), &mut events, &mut open);
+        ingest_stream_json_event_for_native_tools(
+            &assistant_tool_use("tu_1", "Bash"),
+            &mut events,
+            &mut open,
+        );
         assert_eq!(events[0].input_text.as_deref(), Some("{}"));
     }
 }
@@ -4096,6 +4527,8 @@ mod direct_api_routing_tests {
             None,
             false,
             &[],
+            None,
+            SpawnIdentity::default(),
         )
         .await
         .expect_err("moa id must be rejected on the CLI-rotation path");
@@ -4179,9 +4612,18 @@ mod chain_tests {
     #[test]
     fn inference_retry_window_is_time_limited_not_permanent() {
         use super::inference_retry_window_open;
-        assert!(!inference_retry_window_open(100, 0), "never failed ⇒ open to try");
-        assert!(inference_retry_window_open(100, 160), "inside the 60 s window ⇒ suppressed");
-        assert!(!inference_retry_window_open(160, 160), "window elapsed ⇒ re-probe");
+        assert!(
+            !inference_retry_window_open(100, 0),
+            "never failed ⇒ open to try"
+        );
+        assert!(
+            inference_retry_window_open(100, 160),
+            "inside the 60 s window ⇒ suppressed"
+        );
+        assert!(
+            !inference_retry_window_open(160, 160),
+            "window elapsed ⇒ re-probe"
+        );
         assert!(!inference_retry_window_open(1000, 160));
     }
 
@@ -4405,9 +4847,10 @@ mod chain_tests {
             ..Default::default()
         };
         let out = filter_tool_defs(defs.clone(), Some(&caps2));
-        assert!(out
-            .iter()
-            .all(|d| d.name != "tasks_list" && d.name != "computer"));
+        assert!(
+            out.iter()
+                .all(|d| d.name != "tasks_list" && d.name != "computer")
+        );
 
         // Allowlist mode: only listed tools survive (fail-closed).
         let caps3 = CapabilitiesConfig {
@@ -4422,9 +4865,10 @@ mod chain_tests {
     #[test]
     fn mcp_envs_carry_agent_id() {
         let envs = mcp_client_envs("agnes");
-        assert!(envs
-            .iter()
-            .any(|(k, v)| k == duduclaw_core::ENV_AGENT_ID && v == "agnes"));
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == duduclaw_core::ENV_AGENT_ID && v == "agnes")
+        );
     }
 
     // ── G3: rotation-vs-env key selection ───────────────────────────────
@@ -4468,7 +4912,7 @@ mod chain_tests {
 
 #[cfg(test)]
 mod redaction_proxy_cli_args_tests {
-    use super::mcp_proxy_cli_args;
+    use super::{DispatchOverrides, mcp_config_cli_args, mcp_proxy_cli_args};
     use serde_json::json;
 
     /// `<home>/agents/<id>/.mcp.json` with the built-in server plus one
@@ -4538,7 +4982,10 @@ mod redaction_proxy_cli_args_tests {
         let body: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&guard).unwrap()).unwrap();
         // The built-in server is untouched — it already redacts.
-        assert_eq!(body["mcpServers"]["duduclaw"]["args"], json!(["mcp-server"]));
+        assert_eq!(
+            body["mcpServers"]["duduclaw"]["args"],
+            json!(["mcp-server"])
+        );
         assert_eq!(
             body["mcpServers"]["duduclaw"]["command"],
             json!("/opt/duduclaw/bin/duduclaw")
@@ -4598,5 +5045,105 @@ mod redaction_proxy_cli_args_tests {
         assert!(path.exists());
         drop(guard);
         assert!(!path.exists(), "the per-spawn temp config must not linger");
+    }
+
+    // ── Team-as-Agent (live round 3 E3): cwd and identity are separable ──
+
+    /// A role member's cwd is the employee's workspace, so CLI auto-discovery
+    /// would boot its MCP server with the EMPLOYEE's agent id. Naming the
+    /// member's own `.mcp.json` plus `--strict-mcp-config` is what keeps the
+    /// two independent.
+    #[test]
+    fn explicit_mcp_config_pins_identity_against_cwd_auto_discovery() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let employee = tmp.path().join("agents").join("agnes");
+        let member = tmp
+            .path()
+            .join("agents")
+            .join(".ephemeral")
+            .join("eph-agnes-r1-planner-abc");
+        std::fs::create_dir_all(&employee).unwrap();
+        std::fs::create_dir_all(&member).unwrap();
+        // Both files exist; the member's must win.
+        std::fs::write(
+            employee.join(".mcp.json"),
+            json!({"mcpServers": {"duduclaw": {"command": "/x", "args": ["mcp-server"],
+                   "env": {"DUDUCLAW_AGENT_ID": "agnes"}}}})
+            .to_string(),
+        )
+        .unwrap();
+        let member_mcp = member.join(".mcp.json");
+        std::fs::write(
+            &member_mcp,
+            json!({"mcpServers": {"duduclaw": {"command": "/x", "args": ["mcp-server"],
+                   "env": {"DUDUCLAW_AGENT_ID": "eph-agnes-r1-planner-abc"}}}})
+            .to_string(),
+        )
+        .unwrap();
+
+        let (args, guard) =
+            mcp_config_cli_args(tmp.path(), Some(&employee), Some(&member_mcp)).unwrap();
+        assert_eq!(args[0], "--mcp-config");
+        assert_eq!(args[1], member_mcp.to_string_lossy());
+        assert_eq!(args[2], "--strict-mcp-config");
+        assert_eq!(args.len(), 3);
+        // Redaction is off in this temp home, so nothing is rewritten and no
+        // temp file needs to outlive the child.
+        assert!(guard.is_none(), "unexpected rewritten temp config");
+    }
+
+    #[test]
+    fn no_explicit_mcp_config_keeps_the_pre_existing_behaviour() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("agents").join("agnes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".mcp.json"),
+            json!({"mcpServers": {"duduclaw": {"command": "/x", "args": ["mcp-server"]}}})
+                .to_string(),
+        )
+        .unwrap();
+        // Redaction inactive ⇒ no flags at all, auto-discovery untouched.
+        assert!(mcp_config_cli_args(tmp.path(), Some(&dir), None).is_none());
+    }
+
+    #[test]
+    fn a_missing_explicit_mcp_config_degrades_instead_of_spawning_blind() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("agents").join("agnes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = tmp.path().join("nope").join(".mcp.json");
+        // Same result as passing None — the composer refuses to dispatch in
+        // this case, so this is the belt-and-braces branch.
+        assert!(mcp_config_cli_args(tmp.path(), Some(&dir), Some(&missing)).is_none());
+    }
+
+    #[test]
+    fn dispatch_overrides_default_is_the_pre_existing_behaviour() {
+        let d = DispatchOverrides::default();
+        assert!(d.work_dir.is_none());
+        assert!(d.mcp_config_path.is_none());
+        // Cross-family failover stays ON for everyone but a role member.
+        assert!(d.allow_cross_family_failover);
+    }
+}
+
+#[cfg(test)]
+mod inference_shadow_flush_tests {
+    //! W3-4 debt: the detached UCCI shadow needs a shutdown drain, and that
+    //! drain must be free on the overwhelming majority of installs where no
+    //! local engine was ever built.
+
+    #[tokio::test]
+    async fn flush_is_a_no_op_when_no_engine_was_ever_built() {
+        // No `get_inference_engine` call has happened on this path, so the
+        // singleton is either unset or holds `None`; either way the flush
+        // must return immediately rather than block shutdown.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::flush_inference_shadow_observations(),
+        )
+        .await
+        .expect("flushing without an engine must not block");
     }
 }

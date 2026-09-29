@@ -264,7 +264,9 @@ impl std::str::FromStr for ProfileMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "quick" => Ok(ProfileMode::Quick),
             "deep" => Ok(ProfileMode::Deep),
-            other => Err(format!("unknown profile {other:?} (expected \"quick\" or \"deep\")")),
+            other => Err(format!(
+                "unknown profile {other:?} (expected \"quick\" or \"deep\")"
+            )),
         }
     }
 }
@@ -398,7 +400,10 @@ impl Summary {
                     _ => {}
                 }
             }
-            if f.evidence.iter().any(|e| e.kind == EvidenceKind::PocTranscript) {
+            if f.evidence
+                .iter()
+                .any(|e| e.kind == EvidenceKind::PocTranscript)
+            {
                 poc_ran += 1;
             }
         }
@@ -503,8 +508,20 @@ mod tests {
 
     #[test]
     fn finding_id_is_deterministic_for_identical_inputs() {
-        let a = compute_finding_id("gitleaks", "generic-api-key", "config.py", Some(12), "snippet");
-        let b = compute_finding_id("gitleaks", "generic-api-key", "config.py", Some(12), "snippet");
+        let a = compute_finding_id(
+            "gitleaks",
+            "generic-api-key",
+            "config.py",
+            Some(12),
+            "snippet",
+        );
+        let b = compute_finding_id(
+            "gitleaks",
+            "generic-api-key",
+            "config.py",
+            Some(12),
+            "snippet",
+        );
         assert_eq!(a, b);
         assert!(a.starts_with("gitleaks-"));
     }
@@ -512,12 +529,30 @@ mod tests {
     #[test]
     fn finding_id_differs_when_any_identity_field_differs() {
         let base = compute_finding_id("gitleaks", "rule", "file.py", Some(1), "snip");
-        assert_ne!(base, compute_finding_id("semgrep", "rule", "file.py", Some(1), "snip"));
-        assert_ne!(base, compute_finding_id("gitleaks", "other-rule", "file.py", Some(1), "snip"));
-        assert_ne!(base, compute_finding_id("gitleaks", "rule", "other.py", Some(1), "snip"));
-        assert_ne!(base, compute_finding_id("gitleaks", "rule", "file.py", Some(2), "snip"));
-        assert_ne!(base, compute_finding_id("gitleaks", "rule", "file.py", None, "snip"));
-        assert_ne!(base, compute_finding_id("gitleaks", "rule", "file.py", Some(1), "other"));
+        assert_ne!(
+            base,
+            compute_finding_id("semgrep", "rule", "file.py", Some(1), "snip")
+        );
+        assert_ne!(
+            base,
+            compute_finding_id("gitleaks", "other-rule", "file.py", Some(1), "snip")
+        );
+        assert_ne!(
+            base,
+            compute_finding_id("gitleaks", "rule", "other.py", Some(1), "snip")
+        );
+        assert_ne!(
+            base,
+            compute_finding_id("gitleaks", "rule", "file.py", Some(2), "snip")
+        );
+        assert_ne!(
+            base,
+            compute_finding_id("gitleaks", "rule", "file.py", None, "snip")
+        );
+        assert_ne!(
+            base,
+            compute_finding_id("gitleaks", "rule", "file.py", Some(1), "other")
+        );
     }
 
     #[test]
@@ -578,11 +613,8 @@ mod tests {
         );
         needs_human_high.status = FindingStatus::NeedsHuman;
 
-        let summary = Summary::from_findings(
-            &[refuted_high, suppressed_critical, needs_human_high],
-            1,
-            0,
-        );
+        let summary =
+            Summary::from_findings(&[refuted_high, suppressed_critical, needs_human_high], 1, 0);
         assert_eq!(summary.total_findings, 3, "report still lists everything");
         assert_eq!(summary.by_severity.critical, 0, "suppressed is inert");
         assert_eq!(

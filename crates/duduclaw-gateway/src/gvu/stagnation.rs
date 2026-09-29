@@ -512,7 +512,7 @@ impl StagnationMonitor {
     }
 
     /// Long-running task: tick on a fixed interval until cancelled. Mirrors
-    /// `ObservationFinalizer::run` (same 30-minute cadence when wired up in
+    /// the AEE settlement sweeper (same 30-minute cadence when wired up in
     /// `server.rs`).
     pub async fn run(self: Arc<Self>, interval: std::time::Duration) {
         let mut ticker = tokio::time::interval(interval);

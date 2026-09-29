@@ -147,7 +147,10 @@ impl AdmissionConfig {
             return Self::default();
         };
         match table.get("dispatch") {
-            Some(section) => section.clone().try_into::<AdmissionConfig>().unwrap_or_default(),
+            Some(section) => section
+                .clone()
+                .try_into::<AdmissionConfig>()
+                .unwrap_or_default(),
             None => Self::default(),
         }
     }
@@ -320,7 +323,10 @@ pub fn enqueue(
             },
         );
         save_state(&path, &state)?;
-        Ok::<EnqueueOutcome, std::io::Error>(EnqueueOutcome::Queued { ticket_id, position: live + 1 })
+        Ok::<EnqueueOutcome, std::io::Error>(EnqueueOutcome::Queued {
+            ticket_id,
+            position: live + 1,
+        })
     })
     .map_err(|e: std::io::Error| format!("spawn admission queue unavailable: {e}"))
 }
@@ -380,7 +386,10 @@ pub fn sweep_expired(home_dir: &Path, class: &str) -> Vec<QueuedSpawn> {
         let all_expired = prune_expired_state(&mut state, now_ms);
         save_state(&path, &state)?;
         Ok::<Vec<QueuedSpawn>, std::io::Error>(
-            all_expired.into_iter().filter(|t| t.class == class).collect(),
+            all_expired
+                .into_iter()
+                .filter(|t| t.class == class)
+                .collect(),
         )
     })
     .unwrap_or_default()
@@ -423,6 +432,258 @@ pub fn invalidate_owner(home_dir: &Path, class: &str, owner: &str) -> Vec<Queued
     .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// Team role members (Team-as-Agent P1/WP-2) — the gateway-internal entry
+// ---------------------------------------------------------------------------
+
+/// Admission class for **team role-member** spawns.
+///
+/// Deliberately its own class, not the `"ephemeral"` one the MCP
+/// `spawn_ephemeral` tool uses, for two independent reasons:
+///
+/// 1. **Replay shape.** The ephemeral drain
+///    (`duduclaw-gateway::ephemeral::drain_admission_queue`) reconstructs a
+///    ticket into an `EphemeralSpawnSpec` (parent / instruction / tools /
+///    tier). A role-member payload carries a different shape
+///    (`runtime` / `model` / `effort` / `role` / `task_id` / `round`), so a
+///    shared class would let that drain replay a role member as a plain
+///    ephemeral — silently dropping the whole per-role model assignment, which
+///    is the entire point of a team.
+/// 2. **Ownership of replay.** A role member belongs to one round of one live
+///    goal task. Who may re-admit it ten minutes later is the composer's
+///    decision, not a maintenance tick's. The queue is *shared* (one state
+///    file, one `queue_max_depth` / `queue_item_ttl_secs`, one lock — as the
+///    design requires); only the class label separates the two rails.
+pub const ROLE_TEAM_ADMISSION_CLASS: &str = "role_team";
+
+/// Outcome of [`try_admit_role_member`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleMemberAdmission {
+    /// Capacity was free — the caller may scaffold now.
+    Admitted,
+    /// Over capacity and durably queued. `position` is the 1-based FIFO rank.
+    Queued { ticket_id: String, position: u32 },
+    /// Neither admitted nor queued: `admission = "fail"`, the queue is at
+    /// `queue_max_depth`, or the queue file could not be written. The caller
+    /// must surface this (the composer runs the round Solo / degrades), never
+    /// spawn anyway.
+    Rejected { reason: String },
+}
+
+/// Durably queue one deferred role-member spawn.
+///
+/// Thin, typed wrapper over [`enqueue`] pinned to
+/// [`ROLE_TEAM_ADMISSION_CLASS`] so no call site has to remember the class
+/// string. `owner_key` should be the owning task/round scope (e.g.
+/// `"<task_id>#<round>"`) so [`invalidate_role_members`] can purge a round's
+/// queued members the moment that round reaches a terminal state.
+pub fn enqueue_role_member(
+    home_dir: &Path,
+    cfg: &AdmissionConfig,
+    owner_key: Option<&str>,
+    payload: serde_json::Value,
+) -> Result<EnqueueOutcome, String> {
+    enqueue(home_dir, ROLE_TEAM_ADMISSION_CLASS, cfg, owner_key, payload)
+}
+
+/// Decide whether a role member may be scaffolded right now, queuing it if not.
+///
+/// This is the **gateway-internal** counterpart to the `spawn_ephemeral` MCP
+/// tool's queue-vs-fail branch. Before WP-2 the only such branch lived in
+/// `duduclaw-cli::mcp` (the agent-facing tool); the gateway's own
+/// `ephemeral::scaffold` path had no entry at all and simply returned the hard
+/// capacity `Err` — which for a team round would silently cost the round a
+/// role. There is no second internal entry to reuse: `invalidate_owner` is
+/// called from the dispatcher and `dequeue_next` from the ephemeral drain, but
+/// nothing inside the gateway ever *enqueued*.
+///
+/// `live_count` is the caller's own measurement of live spawns (for the
+/// ephemeral rail: scaffold directories on disk). This function deliberately
+/// does not measure it — the capacity model belongs to the caller (see module
+/// docs) — and deliberately does not scaffold: admission and creation stay
+/// separate so the TOCTOU-safe count+create inside `scaffold` remains the one
+/// authority on the cap.
+///
+/// # Superseded
+///
+/// That last paragraph is exactly why nothing calls this: production admission
+/// runs through `duduclaw_gateway::ephemeral::admit_role_member`, which
+/// *attempts* the scaffold and queues only on the anchored
+/// `EPHEMERAL_CAPACITY_ERROR_PREFIX` error — so the cap is measured by the one
+/// TOCTOU-safe count+create instead of by a separate `live_count` the caller
+/// has to keep honest. Two admission answers for one queue is one too many,
+/// and the caller-supplied count is the one that can be wrong.
+///
+/// Kept (rather than deleted) as the typed shape a future *replay* path would
+/// need — see [`ROLE_TEAM_ADMISSION_CLASS`] on why replay belongs to the
+/// composer — and still unit-tested, so it cannot rot into a trap.
+#[deprecated(
+    since = "1.66.0",
+    note = "no production caller: use duduclaw_gateway::ephemeral::admit_role_member, \
+            which measures capacity through the TOCTOU-safe scaffold attempt"
+)]
+pub fn try_admit_role_member(
+    home_dir: &Path,
+    cfg: &AdmissionConfig,
+    live_count: u32,
+    owner_key: Option<&str>,
+    payload: serde_json::Value,
+) -> RoleMemberAdmission {
+    let cap = clamp_min_one(cfg.ephemeral_max_active, "ephemeral_max_active");
+    if live_count < cap {
+        return RoleMemberAdmission::Admitted;
+    }
+    match enqueue_role_member(home_dir, cfg, owner_key, payload) {
+        Ok(EnqueueOutcome::Queued {
+            ticket_id,
+            position,
+        }) => RoleMemberAdmission::Queued {
+            ticket_id,
+            position,
+        },
+        Ok(EnqueueOutcome::Rejected { reason }) => RoleMemberAdmission::Rejected { reason },
+        // `enqueue` is the one function in this module that does NOT fail open
+        // (module docs): a request we cannot durably persist must be rejected,
+        // not silently admitted past the cap.
+        Err(e) => RoleMemberAdmission::Rejected { reason: e },
+    }
+}
+
+/// Pop the oldest live queued role member. Pinned to
+/// [`ROLE_TEAM_ADMISSION_CLASS`]; replay is the composer's job (see the class
+/// constant's docs for why no maintenance tick does it).
+///
+/// # Superseded
+///
+/// No production caller, and popping by position is the wrong primitive for
+/// the composer: a waiting round holds *its own* ticket id, so it asks
+/// [`role_member_ticket_status`] whether it is the FIFO head and then removes
+/// exactly that id with [`remove_role_member_ticket`]. Popping the head would
+/// hand round A the ticket round B is waiting on — the hazard
+/// `remove_role_member_ticket`'s own doc warns about. Kept for the replay path
+/// that does not exist yet, and still unit-tested.
+#[deprecated(
+    since = "1.66.0",
+    note = "no production caller: a waiting round uses role_member_ticket_status + \
+            remove_role_member_ticket on its OWN ticket id, never a positional pop"
+)]
+pub fn dequeue_role_member(home_dir: &Path) -> DequeueResult {
+    dequeue_next(home_dir, ROLE_TEAM_ADMISSION_CLASS)
+}
+
+/// The composer's view of one role-member ticket. Only the FIFO head may try
+/// to scaffold; everybody else waits. A missing or expired ticket is terminal
+/// for its waiting round, never an implicit permission to run without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleMemberTicketStatus {
+    Front,
+    Waiting,
+    Gone,
+}
+
+pub fn role_member_ticket_status(
+    home_dir: &Path,
+    ticket_id: &str,
+) -> Result<RoleMemberTicketStatus, std::io::Error> {
+    let path = home_dir.join(STATE_FILE);
+    let now_ms = now_epoch_ms();
+    crate::with_file_lock(&path, || {
+        let state = load_state(&path);
+        let Some(own) = state
+            .tickets
+            .get(ticket_id)
+            .filter(|t| t.class == ROLE_TEAM_ADMISSION_CLASS && t.expires_ms > now_ms)
+        else {
+            return Ok(RoleMemberTicketStatus::Gone);
+        };
+        let first = state
+            .tickets
+            .values()
+            .filter(|t| t.class == ROLE_TEAM_ADMISSION_CLASS && t.expires_ms > now_ms)
+            .min_by_key(|t| t.seq)
+            .is_some_and(|t| t.ticket_id == own.ticket_id);
+        Ok(if first {
+            RoleMemberTicketStatus::Front
+        } else {
+            RoleMemberTicketStatus::Waiting
+        })
+    })
+}
+
+/// Remove precisely the ticket this composer owned after it has scaffolded,
+/// failed or been cancelled. Never pop the queue head by position: another
+/// round may have expired or consumed it while this future was suspended.
+pub fn remove_role_member_ticket(home_dir: &Path, ticket_id: &str) -> Result<bool, std::io::Error> {
+    let path = home_dir.join(STATE_FILE);
+    crate::with_file_lock(&path, || {
+        let mut state = load_state(&path);
+        let removed = state
+            .tickets
+            .get(ticket_id)
+            .is_some_and(|t| t.class == ROLE_TEAM_ADMISSION_CLASS);
+        if removed {
+            state.tickets.remove(ticket_id);
+            save_state(&path, &state)?;
+        }
+        Ok(removed)
+    })
+}
+
+/// Purge every queued role member belonging to `owner` — the round/task scope
+/// passed as `owner_key` at enqueue time. Call this at every terminal state of
+/// the round (accept / reject / needs_human / cancel), mirroring the
+/// dispatcher's turn-end invalidation of ephemeral tickets.
+pub fn invalidate_role_members(home_dir: &Path, owner: &str) -> Vec<QueuedSpawn> {
+    invalidate_owner(home_dir, ROLE_TEAM_ADMISSION_CLASS, owner)
+}
+
+/// Live queued role-member depth (observability / tests).
+pub fn role_member_queue_depth(home_dir: &Path) -> u32 {
+    queue_depth(home_dir, ROLE_TEAM_ADMISSION_CLASS)
+}
+
+/// Startup advisory: is `ephemeral_max_active` large enough for the configured
+/// team shape? Returns `Some(warning)` when it is not, `None` when it is.
+///
+/// The arithmetic (design `DESIGN-team-as-agent-2026-09.md` §3.8, fix ③):
+/// every goal round scaffolds one member per role, a task may run up to
+/// `iteration_cap` rounds, and `max_concurrent` tasks may be in flight — and
+/// role-member scaffolds only leave the count when the round ends, so the
+/// worst-case live count is the product. Under the cap, the overflow goes to
+/// the admission queue and, if capacity never frees inside
+/// `queue_item_ttl_secs`, expires — i.e. a round quietly loses a role. Better
+/// said once at startup than diagnosed later from a missing verifier.
+///
+/// A pure function: the caller (WP-4, gated on `[team] enabled`) owns the log
+/// and the audit sink. Zero in any factor ⇒ nothing can overflow ⇒ `None`.
+pub fn role_team_capacity_check(
+    ephemeral_max_active: u32,
+    max_concurrent: u32,
+    iteration_cap: u32,
+    roles: u32,
+) -> Option<String> {
+    // Saturating so an absurd configured value reports rather than wrapping
+    // into a small number that would look fine.
+    let needed = max_concurrent
+        .saturating_mul(iteration_cap)
+        .saturating_mul(roles);
+    if needed == 0 {
+        return None;
+    }
+    let effective = clamp_min_one(ephemeral_max_active, "ephemeral_max_active");
+    if effective >= needed {
+        return None;
+    }
+    Some(format!(
+        "[dispatch] ephemeral_max_active = {effective} is below the {needed} concurrent role \
+         members a team can need ({max_concurrent} concurrent tasks × {iteration_cap} rounds × \
+         {roles} roles). Over the cap, role spawns queue and may expire after \
+         [dispatch] queue_item_ttl_secs — a round can then silently run short of a role. \
+         Raise ephemeral_max_active to at least {needed}, or lower \
+         [goal_loop] max_concurrent / iteration_cap."
+    ))
+}
+
 /// Live (unexpired) queue depth for `class` (observability / tests). Prunes
 /// expired tickets as a side effect so a stale file does not over-report.
 pub fn queue_depth(home_dir: &Path, class: &str) -> u32 {
@@ -462,19 +723,31 @@ mod tests {
     #[test]
     fn admission_mode_parses_from_toml_lowercase() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[dispatch]\nadmission = \"fail\"\n")
-            .unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[dispatch]\nadmission = \"fail\"\n",
+        )
+        .unwrap();
         let c = AdmissionConfig::from_home(dir.path());
         assert_eq!(c.admission, AdmissionMode::Fail);
 
         let dir2 = tempfile::tempdir().unwrap();
-        std::fs::write(dir2.path().join("config.toml"), "[dispatch]\nadmission = \"queue\"\n")
-            .unwrap();
-        assert_eq!(AdmissionConfig::from_home(dir2.path()).admission, AdmissionMode::Queue);
+        std::fs::write(
+            dir2.path().join("config.toml"),
+            "[dispatch]\nadmission = \"queue\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            AdmissionConfig::from_home(dir2.path()).admission,
+            AdmissionMode::Queue
+        );
 
         // Absent config ⇒ default is Queue (the H19 behavior change).
         let empty = tempfile::tempdir().unwrap();
-        assert_eq!(AdmissionConfig::from_home(empty.path()).admission, AdmissionMode::Queue);
+        assert_eq!(
+            AdmissionConfig::from_home(empty.path()).admission,
+            AdmissionMode::Queue
+        );
     }
 
     #[test]
@@ -498,14 +771,34 @@ mod tests {
     fn enqueue_then_fifo_dequeue() {
         let dir = tempfile::tempdir().unwrap();
         let c = cfg(AdmissionMode::Queue, 10, 600);
-        let a = enqueue(dir.path(), "ephemeral", &c, None, serde_json::json!({"n": 1})).unwrap();
-        let b = enqueue(dir.path(), "ephemeral", &c, None, serde_json::json!({"n": 2})).unwrap();
+        let a = enqueue(
+            dir.path(),
+            "ephemeral",
+            &c,
+            None,
+            serde_json::json!({"n": 1}),
+        )
+        .unwrap();
+        let b = enqueue(
+            dir.path(),
+            "ephemeral",
+            &c,
+            None,
+            serde_json::json!({"n": 2}),
+        )
+        .unwrap();
         let (a_id, a_pos) = match a {
-            EnqueueOutcome::Queued { ticket_id, position } => (ticket_id, position),
+            EnqueueOutcome::Queued {
+                ticket_id,
+                position,
+            } => (ticket_id, position),
             other => panic!("expected Queued, got {other:?}"),
         };
         let (_b_id, b_pos) = match b {
-            EnqueueOutcome::Queued { ticket_id, position } => (ticket_id, position),
+            EnqueueOutcome::Queued {
+                ticket_id,
+                position,
+            } => (ticket_id, position),
             other => panic!("expected Queued, got {other:?}"),
         };
         assert_eq!(a_pos, 1);
@@ -571,15 +864,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // TTL 0 ⇒ already expired the instant it is written.
         let c_expiring = cfg(AdmissionMode::Queue, 10, 0);
-        let a =
-            enqueue(dir.path(), "ephemeral", &c_expiring, None, serde_json::json!({"n": "a"}))
-                .unwrap();
+        let a = enqueue(
+            dir.path(),
+            "ephemeral",
+            &c_expiring,
+            None,
+            serde_json::json!({"n": "a"}),
+        )
+        .unwrap();
         assert!(matches!(a, EnqueueOutcome::Queued { .. }));
 
         // A fresh, non-expiring ticket enqueued after.
         let c_live = cfg(AdmissionMode::Queue, 10, 600);
-        let b = enqueue(dir.path(), "ephemeral", &c_live, None, serde_json::json!({"n": "b"}))
-            .unwrap();
+        let b = enqueue(
+            dir.path(),
+            "ephemeral",
+            &c_live,
+            None,
+            serde_json::json!({"n": "b"}),
+        )
+        .unwrap();
         assert!(matches!(b, EnqueueOutcome::Queued { .. }));
 
         // dequeue_next must report the expired one as dropped, and return the
@@ -609,11 +913,30 @@ mod tests {
     fn invalidate_owner_removes_only_matching_tickets() {
         let dir = tempfile::tempdir().unwrap();
         let c = cfg(AdmissionMode::Queue, 10, 600);
-        enqueue(dir.path(), "ephemeral", &c, Some("turn-1"), serde_json::json!({"n": 1}))
-            .unwrap();
-        enqueue(dir.path(), "ephemeral", &c, Some("turn-2"), serde_json::json!({"n": 2}))
-            .unwrap();
-        enqueue(dir.path(), "ephemeral", &c, None, serde_json::json!({"n": 3})).unwrap();
+        enqueue(
+            dir.path(),
+            "ephemeral",
+            &c,
+            Some("turn-1"),
+            serde_json::json!({"n": 1}),
+        )
+        .unwrap();
+        enqueue(
+            dir.path(),
+            "ephemeral",
+            &c,
+            Some("turn-2"),
+            serde_json::json!({"n": 2}),
+        )
+        .unwrap();
+        enqueue(
+            dir.path(),
+            "ephemeral",
+            &c,
+            None,
+            serde_json::json!({"n": 3}),
+        )
+        .unwrap();
         assert_eq!(queue_depth(dir.path(), "ephemeral"), 3);
 
         let removed = invalidate_owner(dir.path(), "ephemeral", "turn-1");
@@ -668,8 +991,241 @@ mod tests {
         // durable queue file.
         let dir = tempfile::tempdir().unwrap();
         let c = cfg(AdmissionMode::Queue, 10, 600);
-        enqueue(dir.path(), "ephemeral", &c, None, serde_json::json!({"n": 1})).unwrap();
-        enqueue(dir.path(), "ephemeral", &c, None, serde_json::json!({"n": 2})).unwrap();
+        enqueue(
+            dir.path(),
+            "ephemeral",
+            &c,
+            None,
+            serde_json::json!({"n": 1}),
+        )
+        .unwrap();
+        enqueue(
+            dir.path(),
+            "ephemeral",
+            &c,
+            None,
+            serde_json::json!({"n": 2}),
+        )
+        .unwrap();
         assert_eq!(queue_depth(dir.path(), "ephemeral"), 2);
+    }
+
+    // ── Role-member admission (WP-2) ─────────────────────────────────────
+
+    fn role_cfg(max_active: u32) -> AdmissionConfig {
+        AdmissionConfig {
+            ephemeral_max_active: max_active,
+            ..AdmissionConfig::default()
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // exercises the deprecated-but-kept role admission helpers
+    fn role_member_admitted_under_cap_and_queued_at_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = role_cfg(4);
+        assert_eq!(
+            try_admit_role_member(dir.path(), &c, 3, Some("task1#1"), serde_json::json!({})),
+            RoleMemberAdmission::Admitted
+        );
+        // Nothing queued while admitted — admission must not be a side effect.
+        assert_eq!(role_member_queue_depth(dir.path()), 0);
+
+        let at_cap = try_admit_role_member(
+            dir.path(),
+            &c,
+            4,
+            Some("task1#1"),
+            serde_json::json!({"r": 1}),
+        );
+        assert!(
+            matches!(at_cap, RoleMemberAdmission::Queued { position: 1, .. }),
+            "at capacity the member must queue, never hard-fail: {at_cap:?}"
+        );
+        assert_eq!(role_member_queue_depth(dir.path()), 1);
+    }
+
+    #[test]
+    #[allow(deprecated)] // exercises the deprecated-but-kept role admission helpers
+    fn role_member_cap_of_zero_is_clamped_to_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = role_cfg(0);
+        // live 0 < clamped cap 1 ⇒ admitted (a limit can be adjusted, never
+        // fully disabled — so `0` must not mean "always queue" either).
+        assert_eq!(
+            try_admit_role_member(dir.path(), &c, 0, None, serde_json::json!({})),
+            RoleMemberAdmission::Admitted
+        );
+        assert!(matches!(
+            try_admit_role_member(dir.path(), &c, 1, None, serde_json::json!({})),
+            RoleMemberAdmission::Queued { .. }
+        ));
+    }
+
+    #[test]
+    #[allow(deprecated)] // exercises the deprecated-but-kept role admission helpers
+    fn role_member_rejected_when_admission_mode_is_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = AdmissionConfig {
+            admission: AdmissionMode::Fail,
+            ephemeral_max_active: 1,
+            ..AdmissionConfig::default()
+        };
+        let out = try_admit_role_member(dir.path(), &c, 1, None, serde_json::json!({}));
+        assert!(
+            matches!(out, RoleMemberAdmission::Rejected { .. }),
+            "{out:?}"
+        );
+        assert_eq!(role_member_queue_depth(dir.path()), 0);
+    }
+
+    #[test]
+    #[allow(deprecated)] // exercises the deprecated-but-kept role admission helpers
+    fn role_member_rejected_when_queue_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = AdmissionConfig {
+            ephemeral_max_active: 1,
+            queue_max_depth: 2,
+            ..AdmissionConfig::default()
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                try_admit_role_member(dir.path(), &c, 1, None, serde_json::json!({})),
+                RoleMemberAdmission::Queued { .. }
+            ));
+        }
+        let out = try_admit_role_member(dir.path(), &c, 1, None, serde_json::json!({}));
+        assert!(
+            matches!(out, RoleMemberAdmission::Rejected { .. }),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)] // exercises the deprecated-but-kept role admission helpers
+    fn role_member_queue_is_separate_from_the_ephemeral_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = role_cfg(1);
+        enqueue(
+            dir.path(),
+            "ephemeral",
+            &c,
+            None,
+            serde_json::json!({"who": "eph"}),
+        )
+        .unwrap();
+        try_admit_role_member(dir.path(), &c, 1, None, serde_json::json!({"who": "role"}));
+
+        assert_eq!(queue_depth(dir.path(), "ephemeral"), 1);
+        assert_eq!(role_member_queue_depth(dir.path()), 1);
+
+        // The ephemeral drain can never pop a role member (wrong replay shape).
+        let popped = dequeue_next(dir.path(), "ephemeral").ticket.unwrap();
+        assert_eq!(popped.payload["who"], "eph");
+        let popped = dequeue_role_member(dir.path()).ticket.unwrap();
+        assert_eq!(popped.payload["who"], "role");
+    }
+
+    #[test]
+    #[allow(deprecated)] // exercises the deprecated-but-kept role admission helpers
+    fn composer_ticket_waits_for_fifo_head_and_removes_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let c = cfg(AdmissionMode::Queue, 10, 600);
+        let first = match enqueue_role_member(home, &c, Some("task-a#1"), serde_json::json!({})).unwrap() {
+            EnqueueOutcome::Queued { ticket_id, .. } => ticket_id,
+            other => panic!("{other:?}"),
+        };
+        let second = match enqueue_role_member(home, &c, Some("task-b#1"), serde_json::json!({})).unwrap() {
+            EnqueueOutcome::Queued { ticket_id, .. } => ticket_id,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(role_member_ticket_status(home, &first).unwrap(), RoleMemberTicketStatus::Front);
+        assert_eq!(role_member_ticket_status(home, &second).unwrap(), RoleMemberTicketStatus::Waiting);
+        assert!(remove_role_member_ticket(home, &first).unwrap());
+        assert_eq!(role_member_ticket_status(home, &first).unwrap(), RoleMemberTicketStatus::Gone);
+        assert_eq!(role_member_ticket_status(home, &second).unwrap(), RoleMemberTicketStatus::Front);
+        assert!(!remove_role_member_ticket(home, &first).unwrap());
+        assert_eq!(role_member_queue_depth(home), 1);
+    }
+
+    #[test]
+    #[allow(deprecated)] // exercises the deprecated-but-kept role admission helpers
+    fn invalidate_role_members_purges_only_that_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = role_cfg(1);
+        try_admit_role_member(
+            dir.path(),
+            &c,
+            1,
+            Some("t1#1"),
+            serde_json::json!({"r": "a"}),
+        );
+        try_admit_role_member(
+            dir.path(),
+            &c,
+            1,
+            Some("t1#1"),
+            serde_json::json!({"r": "b"}),
+        );
+        try_admit_role_member(
+            dir.path(),
+            &c,
+            1,
+            Some("t1#2"),
+            serde_json::json!({"r": "c"}),
+        );
+        assert_eq!(role_member_queue_depth(dir.path()), 3);
+
+        let removed = invalidate_role_members(dir.path(), "t1#1");
+        assert_eq!(removed.len(), 2);
+        assert_eq!(role_member_queue_depth(dir.path()), 1);
+        // The other round's ticket survives.
+        assert_eq!(
+            dequeue_role_member(dir.path()).ticket.unwrap().payload["r"],
+            "c"
+        );
+    }
+
+    // ── Capacity advisory ────────────────────────────────────────────────
+
+    #[test]
+    fn capacity_check_flags_the_design_default_overflow() {
+        // Design §3.8: 3 concurrent tasks × 5 rounds × 3 roles = 45 > 32.
+        let w = role_team_capacity_check(32, 3, 5, 3).expect("45 > 32 must warn");
+        assert!(w.contains("45"), "warning must state the needed count: {w}");
+        assert!(
+            w.contains("32"),
+            "warning must state the configured cap: {w}"
+        );
+    }
+
+    #[test]
+    fn capacity_check_is_silent_when_the_cap_suffices() {
+        assert_eq!(role_team_capacity_check(45, 3, 5, 3), None);
+        assert_eq!(role_team_capacity_check(48, 3, 5, 3), None);
+        // Solo-shaped configuration: 1 × 5 × 1 = 5.
+        assert_eq!(role_team_capacity_check(32, 1, 5, 1), None);
+    }
+
+    #[test]
+    fn capacity_check_handles_zero_and_clamped_cap() {
+        // Nothing can overflow when a factor is zero.
+        assert_eq!(role_team_capacity_check(1, 0, 5, 3), None);
+        assert_eq!(role_team_capacity_check(1, 3, 0, 3), None);
+        assert_eq!(role_team_capacity_check(1, 3, 5, 0), None);
+        // A configured cap of 0 is reported as its clamped effective value 1.
+        let w = role_team_capacity_check(0, 1, 1, 2).expect("1 < 2 must warn");
+        assert!(
+            w.contains("= 1"),
+            "must report the clamped effective cap: {w}"
+        );
+    }
+
+    #[test]
+    fn capacity_check_saturates_instead_of_wrapping() {
+        // An absurd product must still warn, never wrap into a small number
+        // that would look satisfiable.
+        assert!(role_team_capacity_check(u32::MAX - 1, u32::MAX, 2, 2).is_some());
     }
 }

@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -107,8 +107,7 @@ impl MessageQueue {
     /// Open (or create) the message queue at `<home>/message_queue.db`.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         let db_path = home_dir.join("message_queue.db");
-        let conn =
-            Connection::open(&db_path).map_err(|e| format!("open message queue: {e}"))?;
+        let conn = Connection::open(&db_path).map_err(|e| format!("open message queue: {e}"))?;
         Self::init_schema(&conn)?;
         info!(?db_path, "MessageQueue initialized");
         Ok(Self {
@@ -195,8 +194,10 @@ impl MessageQueue {
         if existing.iter().any(|c| c == column) {
             return Ok(());
         }
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
-            .map_err(|e| format!("add {column} to {table}: {e}"))?;
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {coltype}"
+        ))
+        .map_err(|e| format!("add {column} to {table}: {e}"))?;
         info!(table, column, "message_queue migration: added column");
         Ok(())
     }
@@ -360,9 +361,7 @@ impl MessageQueue {
             sender: row.get(1)?,
             target: row.get(2)?,
             payload: row.get(3)?,
-            status: MessageStatus::from_str(
-                &row.get::<_, String>(4).unwrap_or_default(),
-            ),
+            status: MessageStatus::from_str(&row.get::<_, String>(4).unwrap_or_default()),
             retry_count: row.get(5)?,
             delegation_depth: row.get(6)?,
             origin_agent: row.get(7)?,
@@ -386,7 +385,9 @@ impl MessageQueue {
             .map_err(|e| format!("prepare count: {e}"))?;
 
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(|e| format!("query count: {e}"))?;
 
         let mut result = Vec::new();
@@ -422,7 +423,10 @@ impl MessageQueue {
 
     /// Atomically consume a delegation callback by message_id (DELETE RETURNING).
     /// Returns `None` if no callback was registered for this message.
-    pub async fn take_callback(&self, message_id: &str) -> Result<Option<DelegationCallback>, String> {
+    pub async fn take_callback(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<DelegationCallback>, String> {
         let conn = self.conn.lock().await;
         conn.query_row(
             "DELETE FROM delegation_callbacks WHERE message_id = ?1 \

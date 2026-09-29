@@ -1,0 +1,208 @@
+{
+  "cost_source": "synthetic",
+  "observations": [
+    {
+      "task_id": "exact_value",
+      "arm": "raw",
+      "success": true,
+      "billed_cost_millicents": 50,
+      "telemetry": {
+        "provider_rounds": 1,
+        "usage_reported_rounds": 1,
+        "provider_usage": {
+          "input_tokens": 1000,
+          "output_tokens": 100,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "reasoning_tokens": 0
+        },
+        "elapsed_millis": 100
+      },
+      "conditions": {
+        "task_input_sha256": "fb830d7c62e1549cbab5fc6bd76e69c4306e002d702202bc6226c346a6ec7192",
+        "source_set_sha256": "bb70b3449b396d3cfe8866a83db1fc6dbbb196eb6978cc79c2f87e13747c08ed",
+        "model_settings_sha256": "c12028637c4db47f6eec48f02b934cc447f8c31323d275c0c512e519a3d290dd",
+        "authorization_sha256": "88581325450037daab8d2112af41df38b2b0324fbe1968935692091f19624906"
+      }
+    },
+    {
+      "task_id": "exact_value",
+      "arm": "lossless",
+      "success": true,
+      "billed_cost_millicents": 45,
+      "telemetry": {
+        "provider_rounds": 1,
+        "usage_reported_rounds": 1,
+        "provider_usage": {
+          "input_tokens": 800,
+          "output_tokens": 100,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "reasoning_tokens": 0
+        },
+        "elapsed_millis": 95
+      },
+      "conditions": {
+        "task_input_sha256": "fb830d7c62e1549cbab5fc6bd76e69c4306e002d702202bc6226c346a6ec7192",
+        "source_set_sha256": "bb70b3449b396d3cfe8866a83db1fc6dbbb196eb6978cc79c2f87e13747c08ed",
+        "model_settings_sha256": "c12028637c4db47f6eec48f02b934cc447f8c31323d275c0c512e519a3d290dd",
+        "authorization_sha256": "88581325450037daab8d2112af41df38b2b0324fbe1968935692091f19624906"
+      }
+    },
+    {
+      "task_id": "exact_value",
+      "arm": "lossy",
+      "success": true,
+      "billed_cost_millicents": 35,
+      "telemetry": {
+        "provider_rounds": 1,
+        "usage_reported_rounds": 1,
+        "provider_usage": {
+          "input_tokens": 500,
+          "output_tokens": 100,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "reasoning_tokens": 0
+        },
+        "elapsed_millis": 90
+      },
+      "conditions": {
+        "task_input_sha256": "fb830d7c62e1549cbab5fc6bd76e69c4306e002d702202bc6226c346a6ec7192",
+        "source_set_sha256": "bb70b3449b396d3cfe8866a83db1fc6dbbb196eb6978cc79c2f87e13747c08ed",
+        "model_settings_sha256": "c12028637c4db47f6eec48f02b934cc447f8c31323d275c0c512e519a3d290dd",
+        "authorization_sha256": "88581325450037daab8d2112af41df38b2b0324fbe1968935692091f19624906"
+      }
+    },
+    {
+      "task_id": "exact_value",
+      "arm": "ccr",
+      "success": true,
+      "billed_cost_millicents": 30,
+      "telemetry": {
+        "provider_rounds": 1,
+        "usage_reported_rounds": 1,
+        "provider_usage": {
+          "input_tokens": 450,
+          "output_tokens": 100,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "reasoning_tokens": 0
+        },
+        "ccr_compressed_results": 1,
+        "ccr_original_bytes": 6000,
+        "ccr_delivered_bytes": 1000,
+        "elapsed_millis": 90
+      },
+      "conditions": {
+        "task_input_sha256": "fb830d7c62e1549cbab5fc6bd76e69c4306e002d702202bc6226c346a6ec7192",
+        "source_set_sha256": "bb70b3449b396d3cfe8866a83db1fc6dbbb196eb6978cc79c2f87e13747c08ed",
+        "model_settings_sha256": "c12028637c4db47f6eec48f02b934cc447f8c31323d275c0c512e519a3d290dd",
+        "authorization_sha256": "88581325450037daab8d2112af41df38b2b0324fbe1968935692091f19624906"
+      }
+    },
+    {
+      "task_id": "rare_error",
+      "arm": "raw",
+      "success": true,
+      "billed_cost_millicents": 50,
+      "telemetry": {
+        "provider_rounds": 1,
+        "usage_reported_rounds": 1,
+        "provider_usage": {
+          "input_tokens": 1000,
+          "output_tokens": 100,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "reasoning_tokens": 0
+        },
+        "elapsed_millis": 100
+      },
+      "conditions": {
+        "task_input_sha256": "fe2ba5daec6722d3ad8048cc789c1bc023ae6c4432ea40aa5eb2eef9d6ed79b1",
+        "source_set_sha256": "939ab426923ae67856080ee8ce6dbf0497ad34d825a8a82ad0d92233880e4154",
+        "model_settings_sha256": "c12028637c4db47f6eec48f02b934cc447f8c31323d275c0c512e519a3d290dd",
+        "authorization_sha256": "88581325450037daab8d2112af41df38b2b0324fbe1968935692091f19624906"
+      }
+    },
+    {
+      "task_id": "rare_error",
+      "arm": "lossless",
+      "success": true,
+      "billed_cost_millicents": 45,
+      "telemetry": {
+        "provider_rounds": 1,
+        "usage_reported_rounds": 1,
+        "provider_usage": {
+          "input_tokens": 800,
+          "output_tokens": 100,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "reasoning_tokens": 0
+        },
+        "elapsed_millis": 95
+      },
+      "conditions": {
+        "task_input_sha256": "fe2ba5daec6722d3ad8048cc789c1bc023ae6c4432ea40aa5eb2eef9d6ed79b1",
+        "source_set_sha256": "939ab426923ae67856080ee8ce6dbf0497ad34d825a8a82ad0d92233880e4154",
+        "model_settings_sha256": "c12028637c4db47f6eec48f02b934cc447f8c31323d275c0c512e519a3d290dd",
+        "authorization_sha256": "88581325450037daab8d2112af41df38b2b0324fbe1968935692091f19624906"
+      }
+    },
+    {
+      "task_id": "rare_error",
+      "arm": "lossy",
+      "success": false,
+      "billed_cost_millicents": 35,
+      "telemetry": {
+        "provider_rounds": 1,
+        "usage_reported_rounds": 1,
+        "provider_usage": {
+          "input_tokens": 500,
+          "output_tokens": 100,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "reasoning_tokens": 0
+        },
+        "elapsed_millis": 90
+      },
+      "conditions": {
+        "task_input_sha256": "fe2ba5daec6722d3ad8048cc789c1bc023ae6c4432ea40aa5eb2eef9d6ed79b1",
+        "source_set_sha256": "939ab426923ae67856080ee8ce6dbf0497ad34d825a8a82ad0d92233880e4154",
+        "model_settings_sha256": "c12028637c4db47f6eec48f02b934cc447f8c31323d275c0c512e519a3d290dd",
+        "authorization_sha256": "88581325450037daab8d2112af41df38b2b0324fbe1968935692091f19624906"
+      }
+    },
+    {
+      "task_id": "rare_error",
+      "arm": "ccr",
+      "success": false,
+      "billed_cost_millicents": 30,
+      "telemetry": {
+        "provider_rounds": 2,
+        "usage_reported_rounds": 2,
+        "provider_usage": {
+          "input_tokens": 600,
+          "output_tokens": 150,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "reasoning_tokens": 0
+        },
+        "ccr_compressed_results": 1,
+        "ccr_original_bytes": 6000,
+        "ccr_delivered_bytes": 1000,
+        "ccr_find_attempts": 1,
+        "ccr_find_hits": 1,
+        "ccr_retrieve_attempts": 1,
+        "ccr_retrieve_successes": 1,
+        "ccr_retrieved_bytes": 500,
+        "elapsed_millis": 130
+      },
+      "conditions": {
+        "task_input_sha256": "fe2ba5daec6722d3ad8048cc789c1bc023ae6c4432ea40aa5eb2eef9d6ed79b1",
+        "source_set_sha256": "939ab426923ae67856080ee8ce6dbf0497ad34d825a8a82ad0d92233880e4154",
+        "model_settings_sha256": "c12028637c4db47f6eec48f02b934cc447f8c31323d275c0c512e519a3d290dd",
+        "authorization_sha256": "88581325450037daab8d2112af41df38b2b0324fbe1968935692091f19624906"
+      }
+    }
+  ]
+}

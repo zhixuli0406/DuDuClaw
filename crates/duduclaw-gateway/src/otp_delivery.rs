@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::channel_sender::{create_sender, ChannelTarget};
+use crate::channel_sender::{ChannelTarget, create_sender};
 use crate::config_crypto::channel_dm_token_candidates;
 
 /// Sends an already-composed OTP message to a channel DM. Fail-closed: a
@@ -81,7 +81,10 @@ impl OtpDeliverer for ConfigOtpDeliverer {
                 token,
                 extra_id: None,
             };
-            match create_sender(&target, self.http.clone()).send_text(text).await {
+            match create_sender(&target, self.http.clone())
+                .send_text(text)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(e) => last_err = format!("otp delivery failed: {e}"),
             }
@@ -127,13 +130,18 @@ mod tests {
     #[tokio::test]
     async fn mock_records_delivery() {
         let mock = MockDeliverer::default();
-        mock.deliver("telegram", "tg-123", "code 000000").await.unwrap();
+        mock.deliver("telegram", "tg-123", "code 000000")
+            .await
+            .unwrap();
         assert_eq!(mock.sent.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn mock_failure_propagates() {
-        let mock = MockDeliverer { fail: true, ..Default::default() };
+        let mock = MockDeliverer {
+            fail: true,
+            ..Default::default()
+        };
         assert!(mock.deliver("telegram", "tg-123", "x").await.is_err());
     }
 

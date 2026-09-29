@@ -143,7 +143,9 @@ pub fn attach_provenance(
     index: &std::collections::BTreeMap<String, crate::artifacts::FileProvenance>,
 ) {
     for f in files.iter_mut() {
-        let Some(p) = index.get(&f.name) else { continue };
+        let Some(p) = index.get(&f.name) else {
+            continue;
+        };
         f.origin = Some(p.origin.as_str().to_string());
         f.task_id = p.task_id.clone();
         f.round = p.round;
@@ -185,8 +187,17 @@ pub struct FileListFilter {
 impl FileListFilter {
     /// `true` when every field is absent — the filter changes nothing.
     fn is_noop(&self) -> bool {
-        self.query.as_deref().map(str::trim).unwrap_or("").is_empty()
-            && self.task_id.as_deref().map(str::trim).unwrap_or("").is_empty()
+        self.query
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+            && self
+                .task_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
             && self.since_ms.is_none()
             && self.until_ms.is_none()
     }
@@ -206,7 +217,11 @@ pub fn filter_files(files: Vec<FileEntry>, filter: &FileListFilter) -> Vec<FileE
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_lowercase);
-    let task_id = filter.task_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let task_id = filter
+        .task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     files
         .into_iter()
@@ -351,14 +366,20 @@ pub fn find_soffice() -> Option<PathBuf> {
         "/usr/bin/libreoffice",
         "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
     ];
-    CANDIDATES.iter().map(Path::new).find(|p| p.is_file()).map(Path::to_path_buf)
+    CANDIDATES
+        .iter()
+        .map(Path::new)
+        .find(|p| p.is_file())
+        .map(Path::to_path_buf)
 }
 
 /// Cache directory for converted preview PDFs. Scoped per agent (or the
 /// shared bucket) so identically-named files from different agents can't
 /// collide: `<home>/cache/preview/<agent | _shared>/`.
 pub fn preview_cache_dir(home: &Path, agent: Option<&str>) -> PathBuf {
-    home.join("cache").join("preview").join(agent.unwrap_or("_shared"))
+    home.join("cache")
+        .join("preview")
+        .join(agent.unwrap_or("_shared"))
 }
 
 /// Percent-encode `name` for an RFC 5987 `filename*=UTF-8''…` parameter so a
@@ -562,7 +583,10 @@ mod tests {
         // Matches on display name (CJK exact substring).
         let out = filter_files(
             files.clone(),
-            &FileListFilter { query: Some("報告".into()), ..Default::default() },
+            &FileListFilter {
+                query: Some("報告".into()),
+                ..Default::default()
+            },
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "1_a.docx");
@@ -570,7 +594,10 @@ mod tests {
         // Matches on origin, case-insensitively.
         let out = filter_files(
             files.clone(),
-            &FileListFilter { query: Some("UPLOADED".into()), ..Default::default() },
+            &FileListFilter {
+                query: Some("UPLOADED".into()),
+                ..Default::default()
+            },
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "2_b.pdf");
@@ -578,7 +605,10 @@ mod tests {
         // No match ⇒ honest empty, not a fallback to "everything".
         let out = filter_files(
             files,
-            &FileListFilter { query: Some("nope".into()), ..Default::default() },
+            &FileListFilter {
+                query: Some("nope".into()),
+                ..Default::default()
+            },
         );
         assert!(out.is_empty());
     }
@@ -593,7 +623,10 @@ mod tests {
 
         let out = filter_files(
             files,
-            &FileListFilter { task_id: Some("task-1".into()), ..Default::default() },
+            &FileListFilter {
+                task_id: Some("task-1".into()),
+                ..Default::default()
+            },
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "1_a.docx");
@@ -608,7 +641,11 @@ mod tests {
         ];
         let out = filter_files(
             files,
-            &FileListFilter { since_ms: Some(200), until_ms: Some(300), ..Default::default() },
+            &FileListFilter {
+                since_ms: Some(200),
+                until_ms: Some(300),
+                ..Default::default()
+            },
         );
         let names: Vec<&str> = out.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["mid.pdf", "new.pdf"]);

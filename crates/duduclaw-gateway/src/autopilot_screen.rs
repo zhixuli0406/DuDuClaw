@@ -17,7 +17,11 @@
 //!   unparseable all take the same [`OnUnavailable`] path, which defaults to
 //!   `pass` — the deterministic conditions already matched, and the per-rule
 //!   circuit breaker plus the per-source rate cap remain the real guards.
-//!   `on_unavailable = "drop"` opts a rule into fail-closed.
+//!   `on_unavailable = "drop"` opts a rule into fail-closed. Since O15
+//!   (2026-09) an install can flip that *default* for every rule that stays
+//!   silent, via `config.toml [tick] preset = "conservative"`; a rule that
+//!   spells the key out always wins, and with no preset the default is the
+//!   historical `pass`.
 //! - **Strict verdict parsing (D3, revised 2026-08-11).** Only the first
 //!   whitespace-delimited token decides: edge ASCII punctuation is stripped
 //!   from it, then it must equal `YES` / `NO` case-insensitively. `NO.` and
@@ -123,6 +127,18 @@ impl OnUnavailable {
             _ => None,
         }
     }
+
+    /// O15 — resolve the *installation* default a rule inherits when it does
+    /// not spell `on_unavailable` out itself, from `[tick] preset`.
+    ///
+    /// `None` (no preset configured) keeps the historical fail-open default,
+    /// so an install without a `preset` key behaves byte-identically. An
+    /// explicit `on_unavailable` on the rule always wins over this.
+    pub fn from_preset(preset: Option<crate::tick_config::TickPreset>) -> Self {
+        preset
+            .and_then(|p| Self::parse(p.screen_on_unavailable()))
+            .unwrap_or(Self::Pass)
+    }
 }
 
 /// A validated, ready-to-run screening spec.
@@ -154,7 +170,19 @@ pub enum ScreenPlan {
 
 /// Read `action.screen` into a [`ScreenPlan`]. Never panics, never errors —
 /// the caller always gets a decidable plan.
+///
+/// Uses the historical fail-open default for a rule that omits
+/// `on_unavailable`; see [`plan_screen_with_default`] for the O15 variant the
+/// runtime uses, which lets `[tick] preset` supply that default instead.
 pub fn plan_screen(action: &Value) -> ScreenPlan {
+    plan_screen_with_default(action, OnUnavailable::Pass)
+}
+
+/// [`plan_screen`], with the installation default for a rule that omits
+/// `on_unavailable` supplied by the caller (O15: `[tick] preset`).
+///
+/// An explicit `on_unavailable` on the rule always wins over `default`.
+pub fn plan_screen_with_default(action: &Value, default: OnUnavailable) -> ScreenPlan {
     let raw = match action.get("screen") {
         None | Some(Value::Null) => return ScreenPlan::Absent,
         Some(v) => v,
@@ -165,9 +193,9 @@ pub fn plan_screen(action: &Value) -> ScreenPlan {
         .get("on_unavailable")
         .and_then(|v| v.as_str())
         .and_then(OnUnavailable::parse)
-        .unwrap_or(OnUnavailable::Pass);
+        .unwrap_or(default);
 
-    match validate_screen_spec(raw) {
+    match validate_screen_spec_with_default(raw, default) {
         Ok(spec) => ScreenPlan::Spec(spec),
         Err(reason) => ScreenPlan::Unusable {
             reason,
@@ -182,6 +210,15 @@ pub fn plan_screen(action: &Value) -> ScreenPlan {
 /// implementation (a validator that accepts what the runtime then rejects is
 /// the classic way these two drift apart).
 pub fn validate_screen_spec(raw: &Value) -> Result<ScreenSpec, String> {
+    validate_screen_spec_with_default(raw, OnUnavailable::Pass)
+}
+
+/// [`validate_screen_spec`], with the installation default for an omitted
+/// `on_unavailable` supplied by the caller (O15: `[tick] preset`).
+pub fn validate_screen_spec_with_default(
+    raw: &Value,
+    default: OnUnavailable,
+) -> Result<ScreenSpec, String> {
     let obj = raw
         .as_object()
         .ok_or_else(|| "action.screen must be a JSON object".to_string())?;
@@ -211,7 +248,7 @@ pub fn validate_screen_spec(raw: &Value) -> Result<ScreenSpec, String> {
     }
 
     let on_unavailable = match obj.get("on_unavailable") {
-        None | Some(Value::Null) => OnUnavailable::Pass,
+        None | Some(Value::Null) => default,
         Some(v) => {
             let s = v
                 .as_str()
@@ -352,11 +389,7 @@ impl ScreenDecision {
         }
     }
 
-    fn drop_now(
-        outcome: ScreenOutcome,
-        tag: &'static str,
-        detail: impl Into<String>,
-    ) -> Self {
+    fn drop_now(outcome: ScreenOutcome, tag: &'static str, detail: impl Into<String>) -> Self {
         Self {
             dispatch: false,
             outcome,
@@ -649,8 +682,8 @@ mod tests {
             "I think yes", // verdict must be the FIRST token
             "Sure, no need",
             "是",
-            "yesterday",  // stripping must not turn a longer word into a verdict
-            "no-go",      // interior punctuation is not an edge
+            "yesterday", // stripping must not turn a longer word into a verdict
+            "no-go",     // interior punctuation is not an edge
             "nope.",
         ] {
             assert_eq!(parse_verdict(reply), None, "reply={reply:?}");
@@ -1035,7 +1068,11 @@ mod tests {
     async fn timeout_follows_the_policy_both_ways() {
         let open = run_screen(&HangingScreener, &test_spec(OnUnavailable::Pass), "").await;
         assert!(open.dispatch);
-        assert_eq!(open.outcome, ScreenOutcome::Unavailable, "a timeout is never a pass");
+        assert_eq!(
+            open.outcome,
+            ScreenOutcome::Unavailable,
+            "a timeout is never a pass"
+        );
         assert!(open.detail.contains("逾時"), "{}", open.detail);
 
         let closed = run_screen(&HangingScreener, &test_spec(OnUnavailable::Drop), "").await;
@@ -1111,5 +1148,79 @@ mod tests {
         )
         .await;
         assert!(d.detail.len() < 400, "detail is {} bytes", d.detail.len());
+    }
+
+    // ── O15: `[tick] preset` supplies the omitted-`on_unavailable` default ──
+
+    /// The default entry points are unchanged: a rule that omits
+    /// `on_unavailable` still fails OPEN, exactly as before O15.
+    #[test]
+    fn plan_screen_without_preset_keeps_fail_open_default() {
+        let action = json!({ "screen": { "mode": "local", "prompt": "只有異常才回 YES" } });
+        match plan_screen(&action) {
+            ScreenPlan::Spec(s) => assert_eq!(s.on_unavailable, OnUnavailable::Pass),
+            other => panic!("expected Spec, got {other:?}"),
+        }
+    }
+
+    /// The conservative preset flips that default to fail-closed for rules
+    /// that did not state a policy.
+    #[test]
+    fn preset_default_applies_when_rule_omits_policy() {
+        let action = json!({ "screen": { "mode": "local", "prompt": "只有異常才回 YES" } });
+        match plan_screen_with_default(&action, OnUnavailable::Drop) {
+            ScreenPlan::Spec(s) => assert_eq!(s.on_unavailable, OnUnavailable::Drop),
+            other => panic!("expected Spec, got {other:?}"),
+        }
+    }
+
+    /// …and an explicit rule-level policy still wins over the preset, in both
+    /// directions.
+    #[test]
+    fn explicit_rule_policy_beats_preset_default() {
+        let pass_rule = json!({
+            "screen": { "mode": "local", "prompt": "q", "on_unavailable": "pass" }
+        });
+        match plan_screen_with_default(&pass_rule, OnUnavailable::Drop) {
+            ScreenPlan::Spec(s) => assert_eq!(s.on_unavailable, OnUnavailable::Pass),
+            other => panic!("expected Spec, got {other:?}"),
+        }
+        let drop_rule = json!({
+            "screen": { "mode": "local", "prompt": "q", "on_unavailable": "drop" }
+        });
+        match plan_screen_with_default(&drop_rule, OnUnavailable::Pass) {
+            ScreenPlan::Spec(s) => assert_eq!(s.on_unavailable, OnUnavailable::Drop),
+            other => panic!("expected Spec, got {other:?}"),
+        }
+    }
+
+    /// A structurally broken spec still settles by the effective policy —
+    /// with a conservative preset that means the fire is suppressed rather
+    /// than waved through.
+    #[test]
+    fn unusable_spec_settles_by_preset_default() {
+        let broken = json!({ "screen": { "mode": "local" } }); // no prompt
+        match plan_screen_with_default(&broken, OnUnavailable::Drop) {
+            ScreenPlan::Unusable { on_unavailable, .. } => {
+                assert_eq!(on_unavailable, OnUnavailable::Drop);
+            }
+            other => panic!("expected Unusable, got {other:?}"),
+        }
+    }
+
+    /// `OnUnavailable::from_preset` maps the two presets and treats "no
+    /// preset" as the historical fail-open default.
+    #[test]
+    fn on_unavailable_from_preset_mapping() {
+        use crate::tick_config::TickPreset;
+        assert_eq!(OnUnavailable::from_preset(None), OnUnavailable::Pass);
+        assert_eq!(
+            OnUnavailable::from_preset(Some(TickPreset::Conservative)),
+            OnUnavailable::Drop
+        );
+        assert_eq!(
+            OnUnavailable::from_preset(Some(TickPreset::Aggressive)),
+            OnUnavailable::Pass
+        );
     }
 }

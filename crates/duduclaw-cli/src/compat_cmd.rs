@@ -1,8 +1,9 @@
 //! `duduclaw compat` — CP-1/A3 operator CLI surface for the `compat.d`
 //! declarative app-compatibility runner registry
 //! (`duduclaw_core::compat_runners`). See
-//! `commercial/docs/DESIGN-app-compat-layer-2026-08.md` §1 and
-//! `docs/guides/app-compat.md`.
+//! `commercial/docs/DESIGN-app-compat-layer-2026-08.md` §1 and the
+//! DuDuClaw-OS repo's `docs/guides/app-compat.md` (moved there 2026-09-29;
+//! this module is OS-only and lives behind the `app-compat` cargo feature).
 //!
 //! Read-only in this wave (CP-1/A3): this surface reports what `compat.d`
 //! declares and whether each runner's `require_tool` set currently
@@ -23,7 +24,11 @@ pub fn cmd_compat_list(json: bool) -> Result<()> {
         let rows: Vec<serde_json::Value> = statuses
             .iter()
             .map(|status| match status {
-                RunnerStatus::Ok { decl, source, missing_tools } => serde_json::json!({
+                RunnerStatus::Ok {
+                    decl,
+                    source,
+                    missing_tools,
+                } => serde_json::json!({
                     "status": if missing_tools.is_empty() { "ready" } else { "missing" },
                     "id": decl.id,
                     "display_name": decl.display_name,
@@ -64,13 +69,25 @@ pub fn cmd_compat_list(json: bool) -> Result<()> {
 
     for status in &statuses {
         match status {
-            RunnerStatus::Ok { decl, missing_tools, .. } => {
+            RunnerStatus::Ok {
+                decl,
+                missing_tools,
+                ..
+            } => {
                 let state = if missing_tools.is_empty() {
                     style("ready".to_string()).green().to_string()
                 } else {
-                    style(format!("missing: {}", missing_tools.join(", "))).yellow().to_string()
+                    style(format!("missing: {}", missing_tools.join(", ")))
+                        .yellow()
+                        .to_string()
                 };
-                println!("{:<14} {:<28} {:<14} {}", decl.id, decl.display_name, decl.from_os.as_str(), state);
+                println!(
+                    "{:<14} {:<28} {:<14} {}",
+                    decl.id,
+                    decl.display_name,
+                    decl.from_os.as_str(),
+                    state
+                );
                 if !missing_tools.is_empty() {
                     if let Some(hint) = &decl.install_hint {
                         println!("               → {hint}");

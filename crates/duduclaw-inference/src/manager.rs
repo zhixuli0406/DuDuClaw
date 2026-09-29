@@ -5,12 +5,15 @@
 //!
 //! ```text
 //! Priority order:
-//!   1. Exo P2P cluster (if available — largest models)
-//!   2. llamafile (if running — portable, zero-install)
-//!   3. llama.cpp / mistral.rs (direct GGUF — best performance)
-//!   4. OpenAI-compat (external server)
-//!   5. Cloud API (Claude — fallback, highest quality)
+//!   1. llamafile (if running — portable, zero-install)
+//!   2. Direct backend (an in-process `InferenceBackend`)
+//!   3. OpenAI-compat (external server)
+//!   4. Cloud API (Claude — fallback, highest quality)
 //! ```
+//!
+//! The Exo P2P cluster mode was removed on 2026-09-29
+//! (`wiki/reports/feature-audit-2026-09-29.md` T3-S4): pointing
+//! `[openai_compat] base_url` at an Exo endpoint reaches the same cluster.
 //!
 //! The manager periodically health-checks all backends and auto-switches
 //! to the best available one.
@@ -24,18 +27,15 @@ use tracing::info;
 
 use crate::config::InferenceConfig;
 use crate::error::Result;
-use crate::exo_cluster::ExoCluster;
 use crate::llamafile::LlamafileManager;
 
 /// Which mode the manager is currently using.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceMode {
-    /// Exo P2P cluster
-    ExoCluster,
     /// llamafile local server
     Llamafile,
-    /// Direct backend (llama.cpp / mistral.rs)
+    /// Direct backend (an in-process `InferenceBackend`)
     DirectBackend,
     /// External OpenAI-compatible server
     OpenAiCompat,
@@ -46,7 +46,6 @@ pub enum InferenceMode {
 impl std::fmt::Display for InferenceMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ExoCluster => write!(f, "exo-cluster"),
             Self::Llamafile => write!(f, "llamafile"),
             Self::DirectBackend => write!(f, "direct"),
             Self::OpenAiCompat => write!(f, "openai-compat"),
@@ -59,14 +58,12 @@ impl std::fmt::Display for InferenceMode {
 #[derive(Debug, Clone, Serialize)]
 pub struct ManagerStatus {
     pub current_mode: InferenceMode,
-    pub exo_available: bool,
     pub llamafile_available: bool,
 }
 
 /// Multi-mode inference manager with automatic failover.
 pub struct InferenceManager {
     current_mode: RwLock<InferenceMode>,
-    exo: Option<Arc<ExoCluster>>,
     llamafile: Option<Arc<LlamafileManager>>,
     last_health_check: RwLock<Option<Instant>>,
     health_check_interval: Duration,
@@ -75,17 +72,12 @@ pub struct InferenceManager {
 impl InferenceManager {
     /// Create a new manager from config.
     pub fn new(config: &InferenceConfig) -> Self {
-        let exo = config.exo.as_ref()
-            .filter(|c| c.enabled)
-            .map(|c| Arc::new(ExoCluster::new(c.clone())));
-
         let llamafile = config.llamafile.as_ref()
             .filter(|c| c.enabled)
             .map(|c| Arc::new(LlamafileManager::new(c.clone())));
 
         Self {
             current_mode: RwLock::new(InferenceMode::CloudOnly),
-            exo,
             llamafile,
             last_health_check: RwLock::new(None),
             health_check_interval: Duration::from_secs(30),
@@ -125,12 +117,6 @@ impl InferenceManager {
         let mode = self.current_mode().await;
 
         match mode {
-            InferenceMode::ExoCluster => {
-                if let Some(ref exo) = self.exo {
-                    return exo.api_base_url().await;
-                }
-                None
-            }
             InferenceMode::Llamafile => {
                 if let Some(ref lf) = self.llamafile {
                     return Some(lf.api_base_url());
@@ -146,23 +132,18 @@ impl InferenceManager {
     }
 
     /// Get the model name for the current mode.
+    ///
+    /// Always `None` since the Exo P2P mode was removed (2026-09-29,
+    /// `wiki/reports/feature-audit-2026-09-29.md` T3-S4): the remaining modes
+    /// all report their model through the backend, not the manager. Kept so
+    /// `InferenceEngine::init` keeps its "manager-provided model" shape for
+    /// whatever mode comes next.
     pub async fn get_model(&self) -> Option<String> {
-        let mode = self.current_mode().await;
-        match mode {
-            InferenceMode::ExoCluster => {
-                self.exo.as_ref().map(|e| e.model().to_string())
-            }
-            _ => None,
-        }
+        None
     }
 
     /// Get full manager status.
     pub async fn status(&self) -> ManagerStatus {
-        let exo_available = match &self.exo {
-            Some(exo) => exo.health_check().await,
-            None => false,
-        };
-
         let llamafile_available = match &self.llamafile {
             Some(lf) => lf.is_healthy().await,
             None => false,
@@ -170,7 +151,6 @@ impl InferenceManager {
 
         ManagerStatus {
             current_mode: *self.current_mode.read().await,
-            exo_available,
             llamafile_available,
         }
     }
@@ -199,20 +179,9 @@ impl InferenceManager {
         }
     }
 
-    /// Get the Exo cluster reference.
-    pub fn exo(&self) -> Option<&Arc<ExoCluster>> {
-        self.exo.as_ref()
-    }
-
     /// Select the best available mode based on health checks.
     async fn select_best_mode(&self) -> InferenceMode {
-        // 1. Try Exo cluster (highest priority — can run largest models)
-        if let Some(ref exo) = self.exo
-            && exo.is_enabled() && exo.health_check().await {
-                return InferenceMode::ExoCluster;
-            }
-
-        // 2. Try llamafile (portable, already running)
+        // 1. Try llamafile (portable, already running)
         if let Some(ref lf) = self.llamafile
             && lf.is_enabled() {
                 if lf.is_healthy().await {
@@ -224,7 +193,7 @@ impl InferenceManager {
                 }
             }
 
-        // 3. Direct backend is handled by InferenceEngine
+        // 2. Direct backend is handled by InferenceEngine
         // We return CloudOnly and let the engine decide
         InferenceMode::CloudOnly
     }

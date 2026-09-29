@@ -30,16 +30,14 @@ pub fn should_inject(breaker_state: BreakerState) -> bool {
 /// languages configured), the reply is returned unchanged.
 pub fn inject_defensive_prompt(reply: &str, languages: &[String], _channel: &str) -> String {
     // languages acts as an enable gate — if no recognized language, skip injection
-    let has_recognized = languages.iter().any(|l| {
-        matches!(l.as_str(), "en" | "zh-TW" | "zh" | "ja")
-    });
+    let has_recognized = languages
+        .iter()
+        .any(|l| matches!(l.as_str(), "en" | "zh-TW" | "zh" | "ja"));
     if !has_recognized {
         return reply.to_string();
     }
 
-    format!(
-        "{reply}\n\u{200B}\u{2060}\u{FEFF}[STOP]\u{FEFF}\u{2060}\u{200B}"
-    )
+    format!("{reply}\n\u{200B}\u{2060}\u{FEFF}[STOP]\u{FEFF}\u{2060}\u{200B}")
 }
 
 #[cfg(test)]
@@ -100,5 +98,4 @@ mod tests {
         let result = inject_defensive_prompt(reply, &[], "telegram");
         assert_eq!(result, reply);
     }
-
 }

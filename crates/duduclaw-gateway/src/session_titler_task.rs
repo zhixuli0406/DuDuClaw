@@ -92,10 +92,10 @@ pub(crate) fn decide_titling<'a>(
 pub(crate) fn format_title_prompt(transcript: &str) -> String {
     let bounded = duduclaw_core::truncate_chars(transcript, TITLE_TRANSCRIPT_MAX_CHARS);
     let language_rule = match duduclaw_core::dominant_variant(&bounded) {
-        duduclaw_core::ChineseVariant::Traditional =>
-            "- 這段對話使用繁體中文，標題必須用繁體中文（臺灣用語），一個簡體字都不可以出現",
-        duduclaw_core::ChineseVariant::Simplified =>
-            "- 这段对话使用简体中文，标题必须用简体中文",
+        duduclaw_core::ChineseVariant::Traditional => {
+            "- 這段對話使用繁體中文，標題必須用繁體中文（臺灣用語），一個簡體字都不可以出現"
+        }
+        duduclaw_core::ChineseVariant::Simplified => "- 这段对话使用简体中文，标题必须用简体中文",
         duduclaw_core::ChineseVariant::None => "- 使用對話本身的主要語言",
     };
     format!(
@@ -115,7 +115,12 @@ pub(crate) fn format_title_prompt(transcript: &str) -> String {
 pub(crate) fn sanitize_title(raw: &str) -> Option<String> {
     let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
     let stripped = line
-        .trim_matches(|c: char| matches!(c, '"' | '\'' | '「' | '」' | '『' | '』' | '《' | '》' | '“' | '”'))
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '「' | '」' | '『' | '』' | '《' | '》' | '“' | '”'
+            )
+        })
         .trim();
     if stripped.is_empty() {
         return None;
@@ -194,13 +199,22 @@ pub(crate) async fn tick_once(
     };
     let to_run = decide_titling(&candidates, params);
     if to_run.is_empty() {
-        debug!(candidates = candidates.len(), "titler: nothing to title this tick");
+        debug!(
+            candidates = candidates.len(),
+            "titler: nothing to title this tick"
+        );
         return;
     }
-    info!(scheduled = to_run.len(), candidates = candidates.len(), "titler: dispatching");
+    info!(
+        scheduled = to_run.len(),
+        candidates = candidates.len(),
+        "titler: dispatching"
+    );
     for c in to_run {
         match title_one(session_manager, home_dir, c).await {
-            Ok(title) => info!(session_id = %c.session_id, title = %title, "titler: persisted title"),
+            Ok(title) => {
+                info!(session_id = %c.session_id, title = %title, "titler: persisted title")
+            }
             Err(e) => warn!(
                 session_id = %c.session_id,
                 error = %e,
@@ -314,8 +328,14 @@ mod tests {
 
     #[test]
     fn sanitize_title_strips_quotes_and_caps() {
-        assert_eq!(sanitize_title("「週報排程討論」\n多餘行"), Some("週報排程討論".to_string()));
-        assert_eq!(sanitize_title("  \n\n\"Deploy pipeline\"  "), Some("Deploy pipeline".to_string()));
+        assert_eq!(
+            sanitize_title("「週報排程討論」\n多餘行"),
+            Some("週報排程討論".to_string())
+        );
+        assert_eq!(
+            sanitize_title("  \n\n\"Deploy pipeline\"  "),
+            Some("Deploy pipeline".to_string())
+        );
         assert_eq!(sanitize_title("   \n  "), None);
         // CJK-safe cap at 40 chars.
         let long = "很".repeat(80);
@@ -329,14 +349,20 @@ mod tests {
         let zh_tw = format_title_prompt(
             "user: 幫我看一下這個月的客戶資料整理進度\nassistant: 好的，我先讀取檔案。",
         );
-        assert!(zh_tw.contains("繁體中文"), "zh-TW transcript must request 繁體中文");
+        assert!(
+            zh_tw.contains("繁體中文"),
+            "zh-TW transcript must request 繁體中文"
+        );
         assert!(zh_tw.contains("臺灣用語"));
         assert!(!zh_tw.contains("使用對話本身的主要語言"));
 
         let zh_cn = format_title_prompt(
             "user: 帮我看一下这个月的客户资料整理进度\nassistant: 好的，我先读取文件。",
         );
-        assert!(zh_cn.contains("简体中文"), "zh-CN transcript must stay Simplified");
+        assert!(
+            zh_cn.contains("简体中文"),
+            "zh-CN transcript must stay Simplified"
+        );
 
         let en = format_title_prompt("user: summarise this month's customer data cleanup");
         assert!(en.contains("使用對話本身的主要語言"));
@@ -363,10 +389,16 @@ mod tests {
     #[test]
     fn align_title_script_is_a_noop_outside_its_scope() {
         let zh_cn = "user: 帮我整理这个月的客户资料\nassistant: 好的。";
-        assert_eq!(align_title_script("客户资料整理", zh_cn), ("客户资料整理".to_string(), false));
+        assert_eq!(
+            align_title_script("客户资料整理", zh_cn),
+            ("客户资料整理".to_string(), false)
+        );
 
         let zh_tw = "user: 幫我整理這個月的客戶資料\nassistant: 好的。";
-        assert_eq!(align_title_script("客戶資料整理", zh_tw), ("客戶資料整理".to_string(), false));
+        assert_eq!(
+            align_title_script("客戶資料整理", zh_tw),
+            ("客戶資料整理".to_string(), false)
+        );
         assert_eq!(
             align_title_script("Customer data cleanup", zh_tw),
             ("Customer data cleanup".to_string(), false)
@@ -385,7 +417,12 @@ mod tests {
     #[tokio::test]
     async fn tick_once_handles_empty_store() {
         let (sm, _tmp) = make_session_manager();
-        tick_once(&sm, std::path::Path::new("/nonexistent"), &TitleParams::default()).await;
+        tick_once(
+            &sm,
+            std::path::Path::new("/nonexistent"),
+            &TitleParams::default(),
+        )
+        .await;
     }
 
     /// Sessions below `min_turns` never reach the LLM; stored title stays empty.
@@ -394,7 +431,12 @@ mod tests {
         let (sm, _tmp) = make_session_manager();
         sm.get_or_create("s1", "agent-a").await.unwrap();
         sm.append_message("s1", "user", "hi", 1).await.unwrap();
-        tick_once(&sm, std::path::Path::new("/nonexistent"), &TitleParams::default()).await;
+        tick_once(
+            &sm,
+            std::path::Path::new("/nonexistent"),
+            &TitleParams::default(),
+        )
+        .await;
         let (title, through) = sm.get_title("s1").await.unwrap();
         assert!(title.is_empty());
         assert_eq!(through, 0);
@@ -406,8 +448,12 @@ mod tests {
     async fn stored_title_preferred_and_window_bounds_candidates() {
         let (sm, _tmp) = make_session_manager();
         sm.get_or_create("s2", "agent-a").await.unwrap();
-        sm.append_message("s2", "user", "hello there", 2).await.unwrap();
-        sm.append_message("s2", "assistant", "hi!", 2).await.unwrap();
+        sm.append_message("s2", "user", "hello there", 2)
+            .await
+            .unwrap();
+        sm.append_message("s2", "assistant", "hi!", 2)
+            .await
+            .unwrap();
 
         let listed = sm.list_sessions(None, 10).await.unwrap();
         assert_eq!(listed[0].title, "hello there"); // fallback pre-title
@@ -432,7 +478,9 @@ mod tests {
         let (sm, _tmp) = make_session_manager();
         sm.get_or_create("s3", "agent-a").await.unwrap();
         for i in 0..5 {
-            sm.append_message("s3", "user", &format!("turn {i}"), 1).await.unwrap();
+            sm.append_message("s3", "user", &format!("turn {i}"), 1)
+                .await
+                .unwrap();
         }
         let text = sm.read_last_n_turns_text("s3", 2).await.unwrap();
         assert!(!text.contains("turn 2"));

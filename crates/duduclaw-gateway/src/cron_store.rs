@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -343,7 +343,15 @@ impl CronStore {
                  SET name = ?2, agent_id = ?3, cron = ?4, task = ?5,
                      enabled = ?6, updated_at = ?7
                  WHERE id = ?1",
-                params![id, name, agent_id, cron, task, if enabled { 1 } else { 0 }, now],
+                params![
+                    id,
+                    name,
+                    agent_id,
+                    cron,
+                    task,
+                    if enabled { 1 } else { 0 },
+                    now
+                ],
             )
             .map_err(|e| format!("update cron task: {e}"))?;
         Ok(changed > 0)
@@ -662,7 +670,10 @@ impl CronStore {
         if let Err(e) = tokio::fs::rename(&jsonl_path, &archive).await {
             warn!("failed to archive legacy cron_tasks.jsonl: {e}");
         } else {
-            info!(migrated, "legacy cron_tasks.jsonl migrated to SQLite and archived");
+            info!(
+                migrated,
+                "legacy cron_tasks.jsonl migrated to SQLite and archived"
+            );
         }
 
         Ok(migrated)
@@ -736,10 +747,7 @@ mod tests {
         let enabled = store.list_enabled().await.unwrap();
         assert!(enabled.is_empty());
 
-        store
-            .record_run("t1", false, Some("boom"))
-            .await
-            .unwrap();
+        store.record_run("t1", false, Some("boom")).await.unwrap();
         let got = store.get("t1").await.unwrap().unwrap();
         assert_eq!(got.run_count, 1);
         assert_eq!(got.failure_count, 1);
@@ -871,17 +879,15 @@ mod tests {
 
         // Promote to a condition trigger.
         store
-            .update_trigger(
-                "g1",
-                "condition",
-                Some("echo '{\"fire\":true}'"),
-                None,
-            )
+            .update_trigger("g1", "condition", Some("echo '{\"fire\":true}'"), None)
             .await
             .unwrap();
         let got = store.get("g1").await.unwrap().unwrap();
         assert_eq!(got.trigger_kind, "condition");
-        assert_eq!(got.condition_script.as_deref(), Some("echo '{\"fire\":true}'"));
+        assert_eq!(
+            got.condition_script.as_deref(),
+            Some("echo '{\"fire\":true}'")
+        );
         assert!(got.watch_command.is_none());
 
         // update_fields must preserve the trigger columns (it only touches
@@ -892,7 +898,10 @@ mod tests {
             .unwrap();
         let got = store.get("g1").await.unwrap().unwrap();
         assert_eq!(got.trigger_kind, "condition");
-        assert_eq!(got.condition_script.as_deref(), Some("echo '{\"fire\":true}'"));
+        assert_eq!(
+            got.condition_script.as_deref(),
+            Some("echo '{\"fire\":true}'")
+        );
     }
 
     #[tokio::test]
@@ -918,7 +927,10 @@ mod tests {
 
         // Oversize state is rejected fail-closed and never stored.
         let big = "y".repeat(crate::condition_eval::MAX_STATE_BYTES + 1);
-        let err = store.update_condition_state("s1", Some(&big)).await.unwrap_err();
+        let err = store
+            .update_condition_state("s1", Some(&big))
+            .await
+            .unwrap_err();
         assert!(err.contains("exceeds"), "unexpected error: {err}");
         // Prior value is unchanged.
         let got = store.get("s1").await.unwrap().unwrap();

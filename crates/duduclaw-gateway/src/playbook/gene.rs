@@ -13,8 +13,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::entry::{
-    Application, FailureNote, PlaybookCategory, PlaybookMeta, PlaybookState,
-    PLAYBOOK_SCHEMA_VERSION,
+    Application, FailureNote, PLAYBOOK_SCHEMA_VERSION, PlaybookCategory, PlaybookMeta,
+    PlaybookState,
 };
 use crate::prediction::rule_lifecycle::RuleStats;
 
@@ -117,6 +117,7 @@ pub fn to_gene(content: &str, meta: &PlaybookMeta, stats: &RuleStats) -> serde_j
             "dedup_key": meta.dedup_key,
             "embed_model": meta.embed_model,
             "origin": meta.origin,
+            "transferability": meta.transferability,
             "derived_from": meta.derived_from,
             "rule_stats": {"helpful": stats.helpful, "harmful": stats.harmful},
             "entry_id": "",
@@ -162,12 +163,19 @@ pub fn from_gene(v: &serde_json::Value) -> Result<(String, PlaybookMeta, RuleSta
         .and_then(|a| a.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|c| c.get("ref").and_then(|r| r.as_str()).map(|s| EvalCaseRef(s.to_string())))
+                .filter_map(|c| {
+                    c.get("ref")
+                        .and_then(|r| r.as_str())
+                        .map(|s| EvalCaseRef(s.to_string()))
+                })
                 .collect()
         })
         .unwrap_or_default();
 
-    let success_streak = v.get("success_streak").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+    let success_streak = v
+        .get("success_streak")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0) as u32;
     let failure_history: Vec<FailureNote> = v
         .get("failure_history")
         .cloned()
@@ -196,13 +204,21 @@ pub fn from_gene(v: &serde_json::Value) -> Result<(String, PlaybookMeta, RuleSta
         .and_then(|s| s.as_str())
         .map(String::from)
         .unwrap_or_else(|| super::dedup::dedup_key(&summary, category));
-    let embed_model = x.get("embed_model").and_then(|s| s.as_str()).map(String::from);
+    let embed_model = x
+        .get("embed_model")
+        .and_then(|s| s.as_str())
+        .map(String::from);
     let origin = x
         .get("origin")
         .and_then(|s| s.as_str())
         .map(String::from)
         .unwrap_or_else(|| "agent_derived".to_string());
     let derived_from = string_array(x.get("derived_from"));
+    let transferability = x
+        .get("transferability")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
     let rule_stats: RuleStats = x
         .get("rule_stats")
         .cloned()
@@ -212,6 +228,7 @@ pub fn from_gene(v: &serde_json::Value) -> Result<(String, PlaybookMeta, RuleSta
     let meta = PlaybookMeta {
         schema_version,
         category,
+        transferability,
         signals_match,
         strategy,
         failure_history,
@@ -231,13 +248,18 @@ pub fn from_gene(v: &serde_json::Value) -> Result<(String, PlaybookMeta, RuleSta
 
 fn string_array(v: Option<&serde_json::Value>) -> Vec<String> {
     v.and_then(|a| a.as_array())
-        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playbook::entry::Transferability;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -267,7 +289,13 @@ mod tests {
         };
 
         let n_signals = rng.gen_range(0..4);
-        let signal_pool = ["*", "mistake:capability", "channel:telegram", "kw:refund", "tool:tasks_create"];
+        let signal_pool = [
+            "*",
+            "mistake:capability",
+            "channel:telegram",
+            "kw:refund",
+            "tool:tasks_create",
+        ];
         let signals_match: Vec<String> = (0..n_signals)
             .map(|_| signal_pool[rng.gen_range(0..signal_pool.len())].to_string())
             .collect();
@@ -295,7 +323,11 @@ mod tests {
                 at: "2026-08-06T00:00:00Z".to_string(),
                 outcome: "negligible".to_string(),
                 score: (i as f64) / 3.0,
-                ctx: if i % 2 == 0 { Some(format!("ctx-{i}")) } else { None },
+                ctx: if i % 2 == 0 {
+                    Some(format!("ctx-{i}"))
+                } else {
+                    None
+                },
             })
             .collect();
 
@@ -308,6 +340,11 @@ mod tests {
         let meta = PlaybookMeta {
             schema_version: PLAYBOOK_SCHEMA_VERSION,
             category,
+            transferability: if rng.gen_bool(0.5) {
+                Transferability::FactConstraint
+            } else {
+                Transferability::ModelGuidance
+            },
             signals_match,
             strategy,
             failure_history,
@@ -319,7 +356,9 @@ mod tests {
             dedup_key: format!("{:016x}", rng.r#gen::<u64>()),
             embed_model,
             origin: "agent_derived".to_string(),
-            derived_from: (0..rng.gen_range(0..3)).map(|i| format!("mistake-{i}")).collect(),
+            derived_from: (0..rng.gen_range(0..3))
+                .map(|i| format!("mistake-{i}"))
+                .collect(),
             assertions: Default::default(),
         };
         let stats = RuleStats {
@@ -350,6 +389,7 @@ mod tests {
         let meta = PlaybookMeta {
             schema_version: PLAYBOOK_SCHEMA_VERSION,
             category: PlaybookCategory::Repair,
+            transferability: Transferability::ModelGuidance,
             signals_match: vec!["*".to_string()],
             strategy: Vec::new(),
             failure_history: Vec::new(),

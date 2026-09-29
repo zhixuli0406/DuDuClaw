@@ -70,7 +70,7 @@ use std::path::Path;
 use serde_json::Value;
 use tracing::warn;
 
-use duduclaw_security::perception::{sanitize_perception_text, DEFAULT_PERCEPTION_MAX_CHARS};
+use duduclaw_security::perception::{DEFAULT_PERCEPTION_MAX_CHARS, sanitize_perception_text};
 
 /// TTL (seconds) a situation-gate human approval waits for a decision. Expiry
 /// counts as a denial (ApprovalBroker fail-closed). Matches the ActionGuard /

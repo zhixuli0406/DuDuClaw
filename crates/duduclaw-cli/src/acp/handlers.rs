@@ -136,7 +136,9 @@ pub async fn handle_prompt_with_agent(
         None => {
             return vec![SessionUpdate::Error {
                 session_id: session_id.to_string(),
-                message: format!("ACP: unknown target agent '{agent_id}' (no such agent, and no Main-role agent for 'default')"),
+                message: format!(
+                    "ACP: unknown target agent '{agent_id}' (no such agent, and no Main-role agent for 'default')"
+                ),
             }];
         }
     };

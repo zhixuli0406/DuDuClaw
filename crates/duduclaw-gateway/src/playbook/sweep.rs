@@ -25,14 +25,14 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 
-use duduclaw_memory::engine::{ebbinghaus_retrievability, RetrievalWeights};
 use duduclaw_memory::SqliteMemoryEngine;
+use duduclaw_memory::engine::{RetrievalWeights, ebbinghaus_retrievability};
 
 use super::entry::{
-    PlaybookCategory, PlaybookMeta, PlaybookState, LEGACY_RULE_SOURCE_EVENT, PLAYBOOK_MAX_ENTRIES,
-    PLAYBOOK_SOURCE_EVENT,
+    LEGACY_RULE_SOURCE_EVENT, PLAYBOOK_MAX_ENTRIES, PLAYBOOK_SOURCE_EVENT, PlaybookCategory,
+    PlaybookMeta, PlaybookState,
 };
-use crate::prediction::rule_lifecycle::{RuleStats, RETIRED_RULE_TAG};
+use crate::prediction::rule_lifecycle::{RETIRED_RULE_TAG, RuleStats};
 
 /// Retrievability below which an Active entry is parked as Stale. Aligned
 /// with `duduclaw_memory::decay::MemoryDecayPolicy::default().min_retrievability`
@@ -85,7 +85,8 @@ pub fn gdi_score(
     now: DateTime<Utc>,
     w: &RetrievalWeights,
 ) -> f64 {
-    let intrinsic = (net as f64 / 6.0).clamp(0.0, 1.0) * 0.6 + (success_streak as f64 / 5.0).clamp(0.0, 1.0) * 0.4;
+    let intrinsic = (net as f64 / 6.0).clamp(0.0, 1.0) * 0.6
+        + (success_streak as f64 / 5.0).clamp(0.0, 1.0) * 0.4;
     let usage = ((1.0 + access_count as f64).ln() / 21.0f64.ln()).clamp(0.0, 1.0);
     let anchor = last_accessed.unwrap_or(timestamp);
     let days = (now - anchor).num_seconds().max(0) as f64 / 86_400.0;
@@ -100,7 +101,11 @@ pub fn gdi_score(
 /// capacity eviction (operator/compliance content should never be
 /// auto-retired — §1.7.3), though they still count toward the 40-entry
 /// denominator.
-pub async fn run_playbook_sweep(engine: &SqliteMemoryEngine, agent_id: &str, now: DateTime<Utc>) -> SweepReport {
+pub async fn run_playbook_sweep(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    now: DateTime<Utc>,
+) -> SweepReport {
     let weights = RetrievalWeights::default();
     let mut report = SweepReport::default();
 
@@ -112,10 +117,21 @@ pub async fn run_playbook_sweep(engine: &SqliteMemoryEngine, agent_id: &str, now
         crate::prediction::rule_staleness::refresh_rule_source_staleness(engine, agent_id).await;
 
     // Pass 1: Active→Stale, Stale→Retired.
-    let mut still_active_probation: Vec<(String, i64, u32, u32, Option<DateTime<Utc>>, DateTime<Utc>, f64)> = Vec::new();
+    let mut still_active_probation: Vec<(
+        String,
+        i64,
+        u32,
+        u32,
+        Option<DateTime<Utc>>,
+        DateTime<Utc>,
+        f64,
+    )> = Vec::new();
 
     for source_event in [PLAYBOOK_SOURCE_EVENT, LEGACY_RULE_SOURCE_EVENT] {
-        let rows = match engine.list_valid_by_source_event(agent_id, source_event, 200).await {
+        let rows = match engine
+            .list_valid_by_source_event(agent_id, source_event, 200)
+            .await
+        {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -132,11 +148,22 @@ pub async fn run_playbook_sweep(engine: &SqliteMemoryEngine, agent_id: &str, now
 
             match meta.state {
                 PlaybookState::Active => {
-                    if is_stale(mem_entry.last_accessed, mem_entry.timestamp, mem_entry.access_count, mem_entry.importance, now, &weights) {
+                    if is_stale(
+                        mem_entry.last_accessed,
+                        mem_entry.timestamp,
+                        mem_entry.access_count,
+                        mem_entry.importance,
+                        now,
+                        &weights,
+                    ) {
                         meta.state = PlaybookState::Stale;
                         let mut new_metadata = metadata.clone();
                         meta.merge_into(&mut new_metadata);
-                        if engine.update_metadata(agent_id, &mem_entry.id, &new_metadata).await.unwrap_or(false) {
+                        if engine
+                            .update_metadata(agent_id, &mem_entry.id, &new_metadata)
+                            .await
+                            .unwrap_or(false)
+                        {
                             report.staled.push(mem_entry.id.clone());
                         }
                     } else {
@@ -171,9 +198,16 @@ pub async fn run_playbook_sweep(engine: &SqliteMemoryEngine, agent_id: &str, now
                         meta.state = PlaybookState::Retired;
                         let mut new_metadata = metadata.clone();
                         meta.merge_into(&mut new_metadata);
-                        let _ = engine.update_metadata(agent_id, &mem_entry.id, &new_metadata).await;
                         let _ = engine
-                            .set_importance_and_add_tag(agent_id, &mem_entry.id, RETIRED_IMPORTANCE, RETIRED_RULE_TAG)
+                            .update_metadata(agent_id, &mem_entry.id, &new_metadata)
+                            .await;
+                        let _ = engine
+                            .set_importance_and_add_tag(
+                                agent_id,
+                                &mem_entry.id,
+                                RETIRED_IMPORTANCE,
+                                RETIRED_RULE_TAG,
+                            )
                             .await;
                         report.retired.push(mem_entry.id.clone());
                     }
@@ -199,7 +233,11 @@ pub async fn run_playbook_sweep(engine: &SqliteMemoryEngine, agent_id: &str, now
                 if let Some(mut meta) = PlaybookMeta::from_metadata(&metadata) {
                     meta.state = PlaybookState::Stale;
                     meta.merge_into(&mut metadata);
-                    if engine.update_metadata(agent_id, &id, &metadata).await.unwrap_or(false) {
+                    if engine
+                        .update_metadata(agent_id, &id, &metadata)
+                        .await
+                        .unwrap_or(false)
+                    {
                         report.evicted.push(id);
                     }
                 }
@@ -231,7 +269,10 @@ pub fn spawn_playbook_sweep_loop(
 
             let agent_ids: Vec<String> = {
                 let reg = registry.read().await;
-                reg.list().iter().map(|a| a.config.agent.name.clone()).collect()
+                reg.list()
+                    .iter()
+                    .map(|a| a.config.agent.name.clone())
+                    .collect()
             };
             if agent_ids.is_empty() {
                 continue;
@@ -294,6 +335,7 @@ mod tests {
         let meta = PlaybookMeta {
             schema_version: crate::playbook::entry::PLAYBOOK_SCHEMA_VERSION,
             category,
+            transferability: Default::default(),
             signals_match: vec!["*".to_string()],
             strategy: Vec::new(),
             failure_history: Vec::new(),
@@ -323,7 +365,10 @@ mod tests {
         };
         let mut blob = serde_json::json!({"rule_stats": {"helpful": 1, "harmful": 0}});
         meta.merge_into(&mut blob);
-        let temporal = TemporalMeta { metadata: Some(blob), ..Default::default() };
+        let temporal = TemporalMeta {
+            metadata: Some(blob),
+            ..Default::default()
+        };
         engine.store_temporal(agent, entry, temporal).await.unwrap()
     }
 
@@ -332,13 +377,25 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-sweep-stale";
         let old = Utc::now() - chrono::Duration::days(400);
-        let id = store_entry(&engine, agent, "old rule", PlaybookState::Active, PlaybookCategory::Repair, 5.0, old).await;
+        let id = store_entry(
+            &engine,
+            agent,
+            "old rule",
+            PlaybookState::Active,
+            PlaybookCategory::Repair,
+            5.0,
+            old,
+        )
+        .await;
 
         let report = run_playbook_sweep(&engine, agent, Utc::now()).await;
         assert!(report.staled.contains(&id));
 
         let meta = engine.get_metadata(agent, &id).await.unwrap().unwrap();
-        assert_eq!(PlaybookMeta::from_metadata(&meta).unwrap().state, PlaybookState::Stale);
+        assert_eq!(
+            PlaybookMeta::from_metadata(&meta).unwrap().state,
+            PlaybookState::Stale
+        );
     }
 
     #[tokio::test]
@@ -346,7 +403,16 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-sweep-retire";
         let old = Utc::now() - chrono::Duration::days(400);
-        let id = store_entry(&engine, agent, "very old rule", PlaybookState::Stale, PlaybookCategory::Repair, 5.0, old).await;
+        let id = store_entry(
+            &engine,
+            agent,
+            "very old rule",
+            PlaybookState::Stale,
+            PlaybookCategory::Repair,
+            5.0,
+            old,
+        )
+        .await;
 
         let report = run_playbook_sweep(&engine, agent, Utc::now()).await;
         assert!(report.retired.contains(&id));
@@ -360,12 +426,24 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-sweep-regulatory";
         let old = Utc::now() - chrono::Duration::days(400);
-        let id = store_entry(&engine, agent, "compliance rule", PlaybookState::Active, PlaybookCategory::Regulatory, 5.0, old).await;
+        let id = store_entry(
+            &engine,
+            agent,
+            "compliance rule",
+            PlaybookState::Active,
+            PlaybookCategory::Regulatory,
+            5.0,
+            old,
+        )
+        .await;
 
         let report = run_playbook_sweep(&engine, agent, Utc::now()).await;
         assert!(!report.staled.contains(&id));
         let meta = engine.get_metadata(agent, &id).await.unwrap().unwrap();
-        assert_eq!(PlaybookMeta::from_metadata(&meta).unwrap().state, PlaybookState::Active);
+        assert_eq!(
+            PlaybookMeta::from_metadata(&meta).unwrap().state,
+            PlaybookState::Active
+        );
     }
 
     #[tokio::test]
@@ -376,23 +454,43 @@ mod tests {
         // One more than the cap, all fresh so nothing goes Stale via pass 1.
         let mut ids = Vec::new();
         for i in 0..(PLAYBOOK_MAX_ENTRIES + 1) {
-            let id = store_entry(&engine, agent, &format!("rule {i}"), PlaybookState::Active, PlaybookCategory::Repair, 8.0, now).await;
+            let id = store_entry(
+                &engine,
+                agent,
+                &format!("rule {i}"),
+                PlaybookState::Active,
+                PlaybookCategory::Repair,
+                8.0,
+                now,
+            )
+            .await;
             ids.push(id);
         }
         let report = run_playbook_sweep(&engine, agent, now).await;
-        assert_eq!(report.evicted.len(), 1, "exactly one entry evicted to get back to the cap");
+        assert_eq!(
+            report.evicted.len(),
+            1,
+            "exactly one entry evicted to get back to the cap"
+        );
 
         // Evicted entry still exists (Stale, not deleted).
         let evicted_id = &report.evicted[0];
-        let meta = engine.get_metadata(agent, evicted_id).await.unwrap().unwrap();
-        assert_eq!(PlaybookMeta::from_metadata(&meta).unwrap().state, PlaybookState::Stale);
+        let meta = engine
+            .get_metadata(agent, evicted_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            PlaybookMeta::from_metadata(&meta).unwrap().state,
+            PlaybookState::Stale
+        );
         let still_readable = engine.get_by_id(agent, evicted_id).await.unwrap();
         assert!(still_readable.is_some(), "eviction never deletes the row");
     }
 
     #[tokio::test]
     async fn sweep_flags_rule_whose_source_fact_was_superseded() {
-        use crate::prediction::rule_staleness::{record_source_facts, SOURCE_STALE_RULE_TAG};
+        use crate::prediction::rule_staleness::{SOURCE_STALE_RULE_TAG, record_source_facts};
 
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-sweep-source-stale";
@@ -430,6 +528,7 @@ mod tests {
         let mut meta = PlaybookMeta {
             schema_version: crate::playbook::entry::PLAYBOOK_SCHEMA_VERSION,
             category: PlaybookCategory::Repair,
+            transferability: Default::default(),
             signals_match: vec!["*".to_string()],
             strategy: Vec::new(),
             failure_history: Vec::new(),
@@ -461,7 +560,14 @@ mod tests {
         record_source_facts(&mut blob, &[fact_id.clone()]);
         meta.merge_into(&mut blob);
         let rule_id = engine
-            .store_temporal(agent, rule_entry, TemporalMeta { metadata: Some(blob), ..Default::default() })
+            .store_temporal(
+                agent,
+                rule_entry,
+                TemporalMeta {
+                    metadata: Some(blob),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -499,7 +605,10 @@ mod tests {
 
         // Now the sweep propagates the supersession up to the rule.
         let report = run_playbook_sweep(&engine, agent, now).await;
-        assert!(report.source_staled.contains(&rule_id), "rule flagged after its source was superseded");
+        assert!(
+            report.source_staled.contains(&rule_id),
+            "rule flagged after its source was superseded"
+        );
         let stored = engine.get_by_id(agent, &rule_id).await.unwrap().unwrap();
         assert!(stored.tags.iter().any(|t| t == SOURCE_STALE_RULE_TAG));
     }
@@ -509,7 +618,16 @@ mod tests {
         let w = RetrievalWeights::default();
         let now = Utc::now();
         let strong = gdi_score(6, 5, 20, Some(now), now, 8.0, now, &w);
-        let weak = gdi_score(0, 0, 0, None, now - chrono::Duration::days(400), 1.0, now, &w);
+        let weak = gdi_score(
+            0,
+            0,
+            0,
+            None,
+            now - chrono::Duration::days(400),
+            1.0,
+            now,
+            &w,
+        );
         assert!(strong > weak);
     }
 }

@@ -81,11 +81,13 @@ fn telemetry_path(home_dir: &Path) -> PathBuf {
 /// Derive the DuDuClaw home directory from an already-open `VersionStore`.
 ///
 /// `VersionStore`'s db_path is always `<home>/evolution.db` in production
-/// (see `server.rs` / `duduclaw-cli evolution finalize`), so this avoids
-/// threading a new `home_dir` parameter through `verify_all_with_mistakes`
-/// and `Updater::apply` — both already carry a `&VersionStore`.
+/// (see `server.rs`), so this avoids threading a new `home_dir` parameter
+/// through callers that already carry a `&VersionStore`.
 fn home_dir_from_store(version_store: &VersionStore) -> Option<PathBuf> {
-    version_store.db_path_ref().parent().map(|p| p.to_path_buf())
+    version_store
+        .db_path_ref()
+        .parent()
+        .map(|p| p.to_path_buf())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -114,7 +116,15 @@ pub fn record_rejection_from_store(
         );
         return;
     };
-    record_rejection(&home_dir, agent_id, stage, layer, reason, proposal_content, generation);
+    record_rejection(
+        &home_dir,
+        agent_id,
+        stage,
+        layer,
+        reason,
+        proposal_content,
+        generation,
+    );
 }
 
 /// Append one rejection/skip record to `<home_dir>/evolution_telemetry.jsonl`.
@@ -224,25 +234,74 @@ mod tests {
     #[test]
     fn record_and_summarize_round_trip() {
         let tmp = TempDir::new().unwrap();
-        record_rejection(tmp.path(), "agent-a", "verify", "L1-Deterministic", "too long", "content-1", 1);
-        record_rejection(tmp.path(), "agent-a", "verify", "L1-Deterministic", "too long again", "content-2", 2);
-        record_rejection(tmp.path(), "agent-a", "verify", "L3-LLMJudge", "low score", "content-3", 1);
-        record_rejection(tmp.path(), "agent-a", "apply", "cap_lines", "over cap", "content-4", 1);
+        record_rejection(
+            tmp.path(),
+            "agent-a",
+            "verify",
+            "L1-Deterministic",
+            "too long",
+            "content-1",
+            1,
+        );
+        record_rejection(
+            tmp.path(),
+            "agent-a",
+            "verify",
+            "L1-Deterministic",
+            "too long again",
+            "content-2",
+            2,
+        );
+        record_rejection(
+            tmp.path(),
+            "agent-a",
+            "verify",
+            "L3-LLMJudge",
+            "low score",
+            "content-3",
+            1,
+        );
+        record_rejection(
+            tmp.path(),
+            "agent-a",
+            "apply",
+            "cap_lines",
+            "over cap",
+            "content-4",
+            1,
+        );
         // Different agent — must not pollute agent-a's summary.
-        record_rejection(tmp.path(), "agent-b", "verify", "L1-Deterministic", "unrelated", "content-5", 1);
+        record_rejection(
+            tmp.path(),
+            "agent-b",
+            "verify",
+            "L1-Deterministic",
+            "unrelated",
+            "content-5",
+            1,
+        );
 
         let summary = telemetry_summary(tmp.path(), "agent-a", 7);
         assert_eq!(summary.total, 4);
         assert_eq!(
-            summary.by_stage_layer.get("verify").and_then(|m| m.get("L1-Deterministic")),
+            summary
+                .by_stage_layer
+                .get("verify")
+                .and_then(|m| m.get("L1-Deterministic")),
             Some(&2)
         );
         assert_eq!(
-            summary.by_stage_layer.get("verify").and_then(|m| m.get("L3-LLMJudge")),
+            summary
+                .by_stage_layer
+                .get("verify")
+                .and_then(|m| m.get("L3-LLMJudge")),
             Some(&1)
         );
         assert_eq!(
-            summary.by_stage_layer.get("apply").and_then(|m| m.get("cap_lines")),
+            summary
+                .by_stage_layer
+                .get("apply")
+                .and_then(|m| m.get("cap_lines")),
             Some(&1)
         );
     }
@@ -260,11 +319,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // All multi-byte CJK so a naive byte-slice would panic mid-character.
         let long_reason: String = "拒絕原因".repeat(200); // way over 500 bytes
-        record_rejection(tmp.path(), "agent-a", "verify", "L3-LLMJudge", &long_reason, "content", 1);
+        record_rejection(
+            tmp.path(),
+            "agent-a",
+            "verify",
+            "L3-LLMJudge",
+            &long_reason,
+            "content",
+            1,
+        );
 
         let path = telemetry_path(tmp.path());
         let content = std::fs::read_to_string(&path).unwrap();
-        let record: RejectionRecord = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        let record: RejectionRecord =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert!(
             record.reason.len() <= REASON_MAX_BYTES,
             "reason must be capped at {REASON_MAX_BYTES} bytes, got {} bytes",
@@ -291,10 +359,21 @@ mod tests {
             generation: 1,
         };
         std::fs::write(&path, format!("{}\n", serde_json::to_string(&old).unwrap())).unwrap();
-        record_rejection(tmp.path(), "agent-a", "verify", "L1-Deterministic", "recent", "c", 1);
+        record_rejection(
+            tmp.path(),
+            "agent-a",
+            "verify",
+            "L1-Deterministic",
+            "recent",
+            "c",
+            1,
+        );
 
         let summary = telemetry_summary(tmp.path(), "agent-a", 7);
-        assert_eq!(summary.total, 1, "only the recent record should count within a 7-day window");
+        assert_eq!(
+            summary.total, 1,
+            "only the recent record should count within a 7-day window"
+        );
     }
 
     #[test]
@@ -302,9 +381,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = telemetry_path(tmp.path());
         std::fs::write(&path, "not-json\n{\"garbage\": true}\n").unwrap();
-        record_rejection(tmp.path(), "agent-a", "verify", "L1-Deterministic", "ok", "c", 1);
+        record_rejection(
+            tmp.path(),
+            "agent-a",
+            "verify",
+            "L1-Deterministic",
+            "ok",
+            "c",
+            1,
+        );
 
         let summary = telemetry_summary(tmp.path(), "agent-a", 7);
-        assert_eq!(summary.total, 1, "corrupt lines must be skipped, not abort the summary");
+        assert_eq!(
+            summary.total, 1,
+            "corrupt lines must be skipped, not abort the summary"
+        );
     }
 }

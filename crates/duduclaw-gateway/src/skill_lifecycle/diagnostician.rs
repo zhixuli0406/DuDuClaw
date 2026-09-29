@@ -74,7 +74,9 @@ pub fn diagnose(
     // Determine primary cause
     let primary_cause = if error.unexpected_correction {
         if error.actual.avg_assistant_response_length > 500.0 {
-            ErrorCause::StyleMismatch { aspect: "too_verbose".to_string() }
+            ErrorCause::StyleMismatch {
+                aspect: "too_verbose".to_string(),
+            }
         } else {
             ErrorCause::PrecisionIssue
         }
@@ -82,11 +84,16 @@ pub fn diagnose(
         if topics.is_empty() {
             ErrorCause::ExpectationMismatch
         } else {
-            ErrorCause::DomainGap { topic: topics.first().cloned().unwrap_or_default() }
+            ErrorCause::DomainGap {
+                topic: topics.first().cloned().unwrap_or_default(),
+            }
         }
     } else if error.topic_surprise > 0.5 {
         ErrorCause::DomainGap {
-            topic: topics.first().cloned().unwrap_or_else(|| "unknown".to_string()),
+            topic: topics
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string()),
         }
     } else {
         ErrorCause::Unknown
@@ -108,7 +115,10 @@ pub fn diagnose(
 
     // Determine action based on what's available
     let (skill_gap, action) = if !suggested_skills.is_empty() {
-        (None, DiagnosisAction::ActivateSkills(suggested_skills.clone()))
+        (
+            None,
+            DiagnosisAction::ActivateSkills(suggested_skills.clone()),
+        )
     } else if !topics.is_empty() {
         let topic = topics.first().cloned().unwrap_or_default();
         let gap = SkillGap {

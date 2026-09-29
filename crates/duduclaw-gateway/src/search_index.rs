@@ -88,14 +88,18 @@ const ARTIFACTS_TAIL_READ_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Clamp a caller-supplied per-source limit into `[1, MAX_PER_SOURCE_LIMIT]`.
 pub fn clamp_limit(requested: Option<usize>) -> usize {
-    requested.unwrap_or(DEFAULT_PER_SOURCE_LIMIT).clamp(1, MAX_PER_SOURCE_LIMIT)
+    requested
+        .unwrap_or(DEFAULT_PER_SOURCE_LIMIT)
+        .clamp(1, MAX_PER_SOURCE_LIMIT)
 }
 
 /// Escape SQLite LIKE metacharacters so a search term containing `%`/`_`
 /// matches literally under an `ESCAPE '\'` clause — the same convention
 /// `session.rs::search_hidden_messages` and `gdpr_like_escape` already use.
 fn like_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Search conversation turns in `sessions.db`.
@@ -244,7 +248,10 @@ pub fn search_artifacts(
             continue;
         }
         let display_name = v.get("display_name").and_then(|x| x.as_str()).unwrap_or("");
-        let archived_name = v.get("archived_name").and_then(|x| x.as_str()).unwrap_or("");
+        let archived_name = v
+            .get("archived_name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
         let origin = v.get("origin").and_then(|x| x.as_str()).unwrap_or("");
         let channel = v.get("channel").and_then(|x| x.as_str()).unwrap_or("");
         let task_id = v.get("task_id").and_then(|x| x.as_str());
@@ -252,15 +259,27 @@ pub fn search_artifacts(
         if !haystack.contains(&query_lower) {
             continue;
         }
-        let name = if display_name.is_empty() { archived_name } else { display_name };
+        let name = if display_name.is_empty() {
+            archived_name
+        } else {
+            display_name
+        };
         let produced_at = v.get("produced_at").and_then(|x| x.as_str()).unwrap_or("");
         hits.push(SearchHit {
             source: SOURCE_ARTIFACT,
             id: archived_name.to_string(),
             title: truncate_bytes(name, TITLE_MAX_BYTES).to_string(),
             snippet: truncate_bytes(origin, SNIPPET_MAX_BYTES).to_string(),
-            agent_id: if row_agent.is_empty() { None } else { Some(row_agent.to_string()) },
-            timestamp: if produced_at.is_empty() { None } else { Some(produced_at.to_string()) },
+            agent_id: if row_agent.is_empty() {
+                None
+            } else {
+                Some(row_agent.to_string())
+            },
+            timestamp: if produced_at.is_empty() {
+                None
+            } else {
+                Some(produced_at.to_string())
+            },
             jump: serde_json::json!({
                 "agent_id": if row_agent.is_empty() { None } else { Some(row_agent) },
                 "archived_name": archived_name,
@@ -372,10 +391,16 @@ mod tests {
     async fn seed_sessions_db(path: &Path) -> crate::session::SessionManager {
         let mgr = crate::session::SessionManager::new(path).unwrap();
         mgr.get_or_create("sess-sales-1", "sales").await.unwrap();
-        mgr.append_message("sess-sales-1", "user", "報價單在哪裡？", 5).await.unwrap();
-        mgr.append_message("sess-sales-1", "assistant", "報價單已經寄出了", 5).await.unwrap();
+        mgr.append_message("sess-sales-1", "user", "報價單在哪裡？", 5)
+            .await
+            .unwrap();
+        mgr.append_message("sess-sales-1", "assistant", "報價單已經寄出了", 5)
+            .await
+            .unwrap();
         mgr.get_or_create("sess-hr-1", "hr").await.unwrap();
-        mgr.append_message("sess-hr-1", "user", "請假流程是什麼", 5).await.unwrap();
+        mgr.append_message("sess-hr-1", "user", "請假流程是什麼", 5)
+            .await
+            .unwrap();
         mgr
     }
 
@@ -495,7 +520,9 @@ mod tests {
 
     #[test]
     fn memory_hits_shapes_and_caps() {
-        let entries: Vec<_> = (0..5).map(|i| mem_entry(&format!("m{i}"), "客戶反饋內容")).collect();
+        let entries: Vec<_> = (0..5)
+            .map(|i| mem_entry(&format!("m{i}"), "客戶反饋內容"))
+            .collect();
         let hits = memory_hits("sales", &entries, 3);
         assert_eq!(hits.len(), 3);
         assert!(hits.iter().all(|h| h.source == SOURCE_MEMORY));
@@ -504,7 +531,11 @@ mod tests {
 
     #[test]
     fn wiki_hits_shapes_snippet_from_context_lines_and_marks_shared() {
-        let raw = vec![wiki_hit("sop/onboarding.md", "Onboarding SOP", &["line one", "line two"])];
+        let raw = vec![wiki_hit(
+            "sop/onboarding.md",
+            "Onboarding SOP",
+            &["line one", "line two"],
+        )];
         let hits = wiki_hits(SOURCE_WIKI, Some("hr"), &raw, 10);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].snippet, "line one line two");

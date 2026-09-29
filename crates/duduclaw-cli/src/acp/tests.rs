@@ -52,7 +52,7 @@ fn test_agent_card_v1_0_required_fields() {
 #[test]
 fn test_both_well_known_paths_resolve() {
     use super::server::{
-        resolve_well_known_card, WELL_KNOWN_AGENT_CARD_PATH, WELL_KNOWN_AGENT_CARD_PATH_LEGACY,
+        WELL_KNOWN_AGENT_CARD_PATH, WELL_KNOWN_AGENT_CARD_PATH_LEGACY, resolve_well_known_card,
     };
 
     // v1.0 path.
@@ -86,7 +86,12 @@ fn test_streaming_variants_return_unsupported_operation() {
         assert_eq!(response["id"], 7);
         // A2A spec-shaped UnsupportedOperationError, not a bare method-not-found.
         assert_eq!(response["error"]["code"], -32004);
-        assert!(response["error"]["message"].as_str().unwrap().contains(method));
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(method)
+        );
         assert!(response.get("result").is_none());
     }
 }
@@ -152,7 +157,10 @@ async fn test_tasks_send_via_handler() {
     // Empty test home → no agents → execution fails → state "failed"; a real
     // home with agents → "completed". Accept both (RFC-25 Phase 3 audit fix).
     let state = task["state"].as_str().unwrap();
-    assert!(state == "completed" || state == "failed", "unexpected state: {state}");
+    assert!(
+        state == "completed" || state == "failed",
+        "unexpected state: {state}"
+    );
     assert!(task["result"].as_str().is_some());
 
     let artifacts = result["artifacts"].as_array().unwrap();
@@ -213,9 +221,9 @@ fn test_agent_discover() {
 
 mod message_send_tests {
     use crate::acp::message_send::{
+        BusProbe, BusTaskIndex, MAX_MESSAGE_TEXT_BYTES, ParsedSendMessage, SendParamError,
         append_bus_task_sync, build_bus_task_json, enqueue_and_respond, parse_message_send_params,
-        probe_bus_task_state, BusProbe, BusTaskIndex, ParsedSendMessage, SendParamError,
-        MAX_MESSAGE_TEXT_BYTES,
+        probe_bus_task_state,
     };
 
     fn text_part(text: &str) -> serde_json::Value {
@@ -268,8 +276,7 @@ mod message_send_tests {
         assert!(matches!(err, SendParamError::Invalid(_)));
 
         // Parts present but only whitespace text.
-        let err =
-            parse_message_send_params(&send_params(vec![text_part("   \n  ")])).unwrap_err();
+        let err = parse_message_send_params(&send_params(vec![text_part("   \n  ")])).unwrap_err();
         assert!(matches!(err, SendParamError::Invalid(_)));
 
         // Empty parts array.
@@ -292,11 +299,8 @@ mod message_send_tests {
 
         // Two parts whose SUM exceeds the cap are rejected too.
         let half = "b".repeat(MAX_MESSAGE_TEXT_BYTES / 2 + 10);
-        let err = parse_message_send_params(&send_params(vec![
-            text_part(&half),
-            text_part(&half),
-        ]))
-        .unwrap_err();
+        let err = parse_message_send_params(&send_params(vec![text_part(&half), text_part(&half)]))
+            .unwrap_err();
         assert!(matches!(err, SendParamError::Invalid(_)));
     }
 
@@ -413,10 +417,20 @@ mod message_send_tests {
         // Optional response-side fields (response, in_reply_to, coalesced_ids,
         // turn_id, session_id) must be ABSENT on submissions, matching the
         // dispatcher's own skip_serializing_if behavior.
-        let v = build_bus_task_json("task-1", "agent-x", "do the thing", "2026-07-05T00:00:00Z", 0);
+        let v = build_bus_task_json(
+            "task-1",
+            "agent-x",
+            "do the thing",
+            "2026-07-05T00:00:00Z",
+            0,
+        );
         let obj = v.as_object().expect("object");
 
-        assert_eq!(obj.len(), 8, "exactly the 8 submission fields, got: {obj:?}");
+        assert_eq!(
+            obj.len(),
+            8,
+            "exactly the 8 submission fields, got: {obj:?}"
+        );
         assert_eq!(v["type"], "agent_message");
         assert_eq!(v["message_id"], "task-1");
         assert_eq!(v["agent_id"], "agent-x");
@@ -425,7 +439,13 @@ mod message_send_tests {
         assert_eq!(v["delegation_depth"], 0);
         assert_eq!(v["origin_agent"], "a2a-client");
         assert_eq!(v["sender_agent"], "a2a-client");
-        for absent in ["response", "in_reply_to", "coalesced_ids", "turn_id", "session_id"] {
+        for absent in [
+            "response",
+            "in_reply_to",
+            "coalesced_ids",
+            "turn_id",
+            "session_id",
+        ] {
             assert!(obj.get(absent).is_none(), "{absent} must be omitted");
         }
     }
@@ -562,20 +582,22 @@ mod message_send_tests {
 
         // 1) Still queued → submitted. tasks/get accepts A2A `id` param name.
         let params = serde_json::json!({ "id": task_id });
-        let got = crate::acp::server::handle_tasks_get(&id, &params, &mgr, &index, home.path())
-            .await;
+        let got =
+            crate::acp::server::handle_tasks_get(&id, &params, &mgr, &index, home.path()).await;
         assert_eq!(got["result"]["status"]["state"], "submitted");
         assert_eq!(got["result"]["kind"], "task");
 
         // 2) Dispatcher consumed the line, no response yet → working (honest note).
         std::fs::write(&queue, "").unwrap();
-        let got = crate::acp::server::handle_tasks_get(&id, &params, &mgr, &index, home.path())
-            .await;
+        let got =
+            crate::acp::server::handle_tasks_get(&id, &params, &mgr, &index, home.path()).await;
         assert_eq!(got["result"]["status"]["state"], "working");
-        assert!(got["result"]["metadata"]["note"]
-            .as_str()
-            .unwrap()
-            .contains("channels"));
+        assert!(
+            got["result"]["metadata"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("channels")
+        );
 
         // 3) agent_response appended → completed with the text as an artifact.
         let response_line = serde_json::json!({
@@ -587,8 +609,8 @@ mod message_send_tests {
             "in_reply_to": task_id,
         });
         std::fs::write(&queue, format!("{response_line}\n")).unwrap();
-        let got = crate::acp::server::handle_tasks_get(&id, &params, &mgr, &index, home.path())
-            .await;
+        let got =
+            crate::acp::server::handle_tasks_get(&id, &params, &mgr, &index, home.path()).await;
         assert_eq!(got["result"]["status"]["state"], "completed");
         assert_eq!(
             got["result"]["artifacts"][0]["parts"][0]["text"],
@@ -597,8 +619,8 @@ mod message_send_tests {
 
         // 4) Unknown id (not in index) → TaskNotFoundError.
         let params = serde_json::json!({ "id": "never-submitted" });
-        let got = crate::acp::server::handle_tasks_get(&id, &params, &mgr, &index, home.path())
-            .await;
+        let got =
+            crate::acp::server::handle_tasks_get(&id, &params, &mgr, &index, home.path()).await;
         assert_eq!(got["error"]["code"], -32001);
     }
 
@@ -619,18 +641,16 @@ mod message_send_tests {
             }
         });
         let id = serde_json::json!(31);
-        let response = crate::acp::message_send::handle_message_send(
-            &id,
-            &params,
-            home.path(),
-            &mut index,
-        )
-        .await;
+        let response =
+            crate::acp::message_send::handle_message_send(&id, &params, home.path(), &mut index)
+                .await;
         assert_eq!(response["error"]["code"], -32602);
-        assert!(response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("ghost-agent"));
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("ghost-agent")
+        );
         assert!(!home.path().join("bus_queue.jsonl").exists());
     }
 }

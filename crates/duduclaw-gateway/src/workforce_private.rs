@@ -98,7 +98,11 @@ pub fn should_flag(
 
 /// Has an unconfirmed flag created at `created_at_rfc3339` expired at `now`?
 /// Confirmed flags never expire here (the caller checks `confirmed` first).
-pub fn flag_expired(cfg: &PrivateUseConfig, created_at_rfc3339: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+pub fn flag_expired(
+    cfg: &PrivateUseConfig,
+    created_at_rfc3339: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
     match chrono::DateTime::parse_from_rfc3339(created_at_rfc3339) {
         Ok(created) => {
             let age = now.signed_duration_since(created.with_timezone(&chrono::Utc));
@@ -128,24 +132,60 @@ mod tests {
     fn disabled_or_no_baseline_never_flags() {
         let mut c = cfg();
         c.enabled = false;
-        assert!(!should_flag(&c, PrivacyClass::SuspectedPrivate, 0.99, "u1", "tg"));
+        assert!(!should_flag(
+            &c,
+            PrivacyClass::SuspectedPrivate,
+            0.99,
+            "u1",
+            "tg"
+        ));
         // Enabled but no baseline ⇒ still fail-closed.
         let mut c2 = cfg();
         c2.business_scope = String::new();
         c2.business_scope_wiki_page = String::new();
         assert!(!c2.detection_enabled());
-        assert!(!should_flag(&c2, PrivacyClass::SuspectedPrivate, 0.99, "u1", "tg"));
+        assert!(!should_flag(
+            &c2,
+            PrivacyClass::SuspectedPrivate,
+            0.99,
+            "u1",
+            "tg"
+        ));
     }
 
     #[test]
     fn only_high_confidence_suspected_private_flags() {
         let c = cfg();
-        assert!(should_flag(&c, PrivacyClass::SuspectedPrivate, 0.80, "u1", "tg"));
-        assert!(should_flag(&c, PrivacyClass::SuspectedPrivate, 0.95, "u1", "tg"));
+        assert!(should_flag(
+            &c,
+            PrivacyClass::SuspectedPrivate,
+            0.80,
+            "u1",
+            "tg"
+        ));
+        assert!(should_flag(
+            &c,
+            PrivacyClass::SuspectedPrivate,
+            0.95,
+            "u1",
+            "tg"
+        ));
         // Below threshold ⇒ no flag.
-        assert!(!should_flag(&c, PrivacyClass::SuspectedPrivate, 0.79, "u1", "tg"));
+        assert!(!should_flag(
+            &c,
+            PrivacyClass::SuspectedPrivate,
+            0.79,
+            "u1",
+            "tg"
+        ));
         // Undetermined ⇒ NEVER flagged, even at confidence 1.0.
-        assert!(!should_flag(&c, PrivacyClass::Undetermined, 1.0, "u1", "tg"));
+        assert!(!should_flag(
+            &c,
+            PrivacyClass::Undetermined,
+            1.0,
+            "u1",
+            "tg"
+        ));
         // Business ⇒ never flagged.
         assert!(!should_flag(&c, PrivacyClass::Business, 1.0, "u1", "tg"));
     }
@@ -153,10 +193,22 @@ mod tests {
     #[test]
     fn exempt_user_or_channel_never_flags() {
         let c = cfg();
-        assert!(!should_flag(&c, PrivacyClass::SuspectedPrivate, 0.99, "u-boss", "tg"));
+        assert!(!should_flag(
+            &c,
+            PrivacyClass::SuspectedPrivate,
+            0.99,
+            "u-boss",
+            "tg"
+        ));
         let mut c2 = cfg();
         c2.exempt = vec!["private-channel".into()];
-        assert!(!should_flag(&c2, PrivacyClass::SuspectedPrivate, 0.99, "u1", "private-channel"));
+        assert!(!should_flag(
+            &c2,
+            PrivacyClass::SuspectedPrivate,
+            0.99,
+            "u1",
+            "private-channel"
+        ));
     }
 
     #[test]

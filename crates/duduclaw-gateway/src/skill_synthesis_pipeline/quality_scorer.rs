@@ -150,7 +150,10 @@ pub fn parse_events_from_file(path: &Path) -> Vec<TrajectoryEvent> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
-            warn!("Failed to read evolution events file {}: {e}", path.display());
+            warn!(
+                "Failed to read evolution events file {}: {e}",
+                path.display()
+            );
             return Vec::new();
         }
     };
@@ -270,7 +273,10 @@ pub fn group_into_trajectories<'a>(
     // Separate events by agent.
     let mut by_agent: HashMap<&str, Vec<&TrajectoryEvent>> = HashMap::new();
     for event in events {
-        by_agent.entry(event.agent_id.as_str()).or_default().push(event);
+        by_agent
+            .entry(event.agent_id.as_str())
+            .or_default()
+            .push(event);
     }
 
     let mut groups: Vec<Vec<&TrajectoryEvent>> = Vec::new();
@@ -315,10 +321,7 @@ pub fn group_into_trajectories<'a>(
 /// ```
 ///
 /// Returns 0.0 for an empty slice.
-pub fn calculate_quality_score(
-    events: &[&TrajectoryEvent],
-    config: &ScorerConfig,
-) -> f64 {
+pub fn calculate_quality_score(events: &[&TrajectoryEvent], config: &ScorerConfig) -> f64 {
     if events.is_empty() {
         return 0.0;
     }
@@ -512,7 +515,10 @@ mod tests {
         ];
         let refs: Vec<&TrajectoryEvent> = events.iter().collect();
         let score = calculate_quality_score(&refs, &default_config());
-        assert!((score - 0.6075).abs() < 1e-9, "expected 0.6075, got {score}");
+        assert!(
+            (score - 0.6075).abs() < 1e-9,
+            "expected 0.6075, got {score}"
+        );
     }
 
     #[test]
@@ -542,7 +548,11 @@ mod tests {
             make_event("agent-a", 7, true, 0.5, 0.5), // +7h, exceeds 6h window
         ];
         let groups = group_into_trajectories(&events, &default_config());
-        assert_eq!(groups.len(), 2, "Events 7h apart should be in separate windows");
+        assert_eq!(
+            groups.len(),
+            2,
+            "Events 7h apart should be in separate windows"
+        );
     }
 
     #[test]
@@ -585,7 +595,10 @@ mod tests {
         // top 20% of 5 = ceil(1) = 1 trajectory
         assert_eq!(total, 5, "Total window count must be 5 (one per agent)");
         assert_eq!(result.len(), 1, "Top 20% of 5 should yield 1 trajectory");
-        assert_eq!(result[0].agent_id, "agent-a", "Highest scoring agent should win");
+        assert_eq!(
+            result[0].agent_id, "agent-a",
+            "Highest scoring agent should win"
+        );
         assert!((result[0].quality_score - 0.840).abs() < 1e-9);
     }
 
@@ -648,7 +661,11 @@ mod tests {
         std::fs::write(&path, lines.join("\n")).unwrap();
 
         let events = parse_events_from_file(&path);
-        assert_eq!(events.len(), 2, "Only gvu_generation events should be parsed");
+        assert_eq!(
+            events.len(),
+            2,
+            "Only gvu_generation events should be parsed"
+        );
         assert!(events[0].is_success);
         assert!((events[0].effectiveness_score_delta - 0.7).abs() < 1e-9);
         assert!((events[0].task_complexity - 0.8).abs() < 1e-9);
@@ -670,7 +687,11 @@ mod tests {
         std::fs::write(&path, lines.join("\n")).unwrap();
 
         let events = parse_events_from_file(&path);
-        assert_eq!(events.len(), 1, "Malformed lines should be skipped gracefully");
+        assert_eq!(
+            events.len(),
+            1,
+            "Malformed lines should be skipped gracefully"
+        );
     }
 
     #[test]
@@ -685,7 +706,10 @@ mod tests {
     #[test]
     fn test_parse_events_from_file_nonexistent() {
         let events = parse_events_from_file(Path::new("/nonexistent/path/2099-01-01.jsonl"));
-        assert!(events.is_empty(), "Missing file should return empty vec, not panic");
+        assert!(
+            events.is_empty(),
+            "Missing file should return empty vec, not panic"
+        );
     }
 
     #[test]
@@ -698,7 +722,10 @@ mod tests {
 
         let events = parse_events_from_file(&path);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].effectiveness_score_delta, 1.0, "Should clamp to 1.0");
+        assert_eq!(
+            events[0].effectiveness_score_delta, 1.0,
+            "Should clamp to 1.0"
+        );
         assert_eq!(events[0].task_complexity, 0.0, "Should clamp to 0.0");
     }
 

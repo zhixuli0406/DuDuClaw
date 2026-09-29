@@ -86,7 +86,10 @@ pub(crate) fn build_minimal_inner(input: MinimalInput<'_>) -> String {
         input.display_name,
         input.default_language,
     ) {
-        audit.push(crate::prompt_audit::PromptSection::new("identity_directive", &s));
+        audit.push(crate::prompt_audit::PromptSection::new(
+            "identity_directive",
+            &s,
+        ));
         parts.push(s);
     }
 
@@ -292,13 +295,7 @@ mod tests {
 
     #[test]
     fn minimal_prompt_includes_pinned_at_tail() {
-        let prompt = build_minimal_inner(input(
-            Some("soul"),
-            None,
-            "",
-            "Use polite tone.",
-            5,
-        ));
+        let prompt = build_minimal_inner(input(Some("soul"), None, "", "Use polite tone.", 5));
         let mcp_pos = prompt.find("Available MCP Tools").unwrap();
         let pin_pos = prompt.find("Pinned Task Instructions").unwrap();
         assert!(

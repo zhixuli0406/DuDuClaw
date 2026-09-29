@@ -48,7 +48,11 @@ pub fn render_summary(report: &AuditReport, fail_on: Severity) -> String {
             out.push_str(&format!(
                 "  [異常] {} — {}\n",
                 run.engine,
-                if run.timed_out { format!("逾時：{err}") } else { err.clone() }
+                if run.timed_out {
+                    format!("逾時：{err}")
+                } else {
+                    err.clone()
+                }
             ));
         } else {
             out.push_str(&format!(
@@ -58,7 +62,10 @@ pub fn render_summary(report: &AuditReport, fail_on: Severity) -> String {
         }
     }
     for missing in &report.engines_missing {
-        out.push_str(&format!("  [略過] {} — {}\n", missing.engine, missing.reason));
+        out.push_str(&format!(
+            "  [略過] {} — {}\n",
+            missing.engine, missing.reason
+        ));
     }
     if report.engines_run.is_empty() && report.engines_missing.is_empty() {
         out.push_str("  （無引擎資訊）\n");
@@ -296,10 +303,22 @@ mod tests {
             },
             engines_run: vec![],
             engines_missing: vec![
-                EngineMissing { engine: "semgrep".to_string(), reason: "not installed".to_string() },
-                EngineMissing { engine: "gitleaks".to_string(), reason: "not installed".to_string() },
-                EngineMissing { engine: "osv-scanner".to_string(), reason: "network policy".to_string() },
-                EngineMissing { engine: "cargo-audit".to_string(), reason: "not applicable".to_string() },
+                EngineMissing {
+                    engine: "semgrep".to_string(),
+                    reason: "not installed".to_string(),
+                },
+                EngineMissing {
+                    engine: "gitleaks".to_string(),
+                    reason: "not installed".to_string(),
+                },
+                EngineMissing {
+                    engine: "osv-scanner".to_string(),
+                    reason: "network policy".to_string(),
+                },
+                EngineMissing {
+                    engine: "cargo-audit".to_string(),
+                    reason: "not applicable".to_string(),
+                },
             ],
             findings: vec![],
             summary: Summary::from_findings(&[], 0, 4),
@@ -349,7 +368,10 @@ mod tests {
         let mut report = base_report(vec![]);
         report.profile.mode = ProfileMode::Deep;
         report.profile.intake = Some(RepoProfile {
-            language_census: vec![LanguageStat { extension: "rs".to_string(), file_count: 42 }],
+            language_census: vec![LanguageStat {
+                extension: "rs".to_string(),
+                file_count: 42,
+            }],
             entry_points: vec!["src/main.rs".to_string()],
             git_history: GitHistoryStatus::Available {
                 hotspots: vec![HotspotFile {

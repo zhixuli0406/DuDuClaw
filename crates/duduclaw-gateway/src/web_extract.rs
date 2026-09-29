@@ -114,9 +114,8 @@ pub fn extract_multiple(
     let mut results: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
 
     for query in selectors {
-        let sel = Selector::parse(&query.selector).map_err(|e| {
-            ExtractError::InvalidSelector(format!("{}: {e}", query.selector))
-        })?;
+        let sel = Selector::parse(&query.selector)
+            .map_err(|e| ExtractError::InvalidSelector(format!("{}: {e}", query.selector)))?;
 
         let values: Vec<serde_json::Value> = document
             .select(&sel)
@@ -143,9 +142,7 @@ fn format_element(el: &scraper::ElementRef<'_>, format: OutputFormat) -> serde_j
             let text: String = el.text().collect::<Vec<_>>().join(" ").trim().to_string();
             serde_json::Value::String(text)
         }
-        OutputFormat::Html => {
-            serde_json::Value::String(el.inner_html())
-        }
+        OutputFormat::Html => serde_json::Value::String(el.inner_html()),
         OutputFormat::Json => {
             let tag = el.value().name().to_string();
             let text: String = el.text().collect::<Vec<_>>().join(" ").trim().to_string();

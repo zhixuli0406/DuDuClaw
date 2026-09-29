@@ -585,3 +585,437 @@ async fn tc_http_10_stream_call_missing_conn_id_returns_422() {
         "缺 conn_id 應回傳 400 Bad Request（Axum Query extractor 行為）"
     );
 }
+
+// ── H13: Streamable-HTTP (`/mcp`) + Remote-OAuth coverage ────────────────────
+//
+// Both surfaces are remote-reachable and were shipping with 2 and 5 unit tests
+// respectively, none of them exercising the HTTP layer. These tests drive the
+// real router.
+
+/// Build a temp home carrying one INTERNAL key (operator proof for the OAuth
+/// consent step) alongside the external-key helper above.
+fn make_home_with_internal_key(key: &str, client_id: &str, scopes: &[&str]) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let scopes_toml = scopes
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let content = format!(
+        r#"
+[mcp_keys."{key}"]
+client_id = "{client_id}"
+scopes = [{scopes_toml}]
+created_at = "{created_at}"
+is_external = false
+"#
+    );
+    let mut f = std::fs::File::create(dir.path().join("config.toml")).unwrap();
+    f.write_all(content.as_bytes()).unwrap();
+    dir
+}
+
+fn post_mcp(body: &str, bearer: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header("Content-Type", "application/json");
+    if let Some(t) = bearer {
+        b = b.header("Authorization", format!("Bearer {t}"));
+    }
+    b.body(Body::from(body.to_string())).unwrap()
+}
+
+async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+/// No Authorization header ⇒ 401, and (spec MUST) a `WWW-Authenticate` header
+/// pointing at the RFC 9728 resource-metadata document so a remote client can
+/// discover the OAuth flow instead of guessing.
+#[tokio::test]
+async fn mcp_streamable_rejects_missing_token_with_www_authenticate() {
+    let dir = TempDir::new().unwrap();
+    let app = build_router(&make_cfg(dir.path()), make_dispatcher(dir.path()));
+
+    let resp = app
+        .oneshot(post_mcp(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let www = resp
+        .headers()
+        .get("WWW-Authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        www.contains("Bearer") && www.contains("resource_metadata"),
+        "401 must advertise the OAuth discovery document, got: {www:?}"
+    );
+}
+
+/// A syntactically valid but unregistered key ⇒ 401, never a tool call.
+#[tokio::test]
+async fn mcp_streamable_rejects_wrong_token() {
+    let key = "ddc_dev_00112233445566778899aabbccddeeff";
+    let dir = make_home_with_key(key, "streamable-client", &["memory:read"]);
+    let app = build_router(&make_cfg(dir.path()), make_dispatcher(dir.path()));
+
+    let wrong = "ddc_dev_ffeeddccbbaa99887766554433221100";
+    let resp = app
+        .oneshot(post_mcp(
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            Some(wrong),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Malformed JSON ⇒ 400 with JSON-RPC `-32700` (Parse error), not a 500 and
+/// not a silent 200.
+#[tokio::test]
+async fn mcp_streamable_invalid_json_returns_parse_error() {
+    let key = "ddc_dev_0a1b2c3d4e5f60718293a4b5c6d7e8f9";
+    let dir = make_home_with_key(key, "streamable-client", &["memory:read"]);
+    let app = build_router(&make_cfg(dir.path()), make_dispatcher(dir.path()));
+
+    let resp = app
+        .oneshot(post_mcp("{not json at all", Some(key)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let j = body_json(resp).await;
+    assert_eq!(j["error"]["code"].as_i64(), Some(-32700), "body: {j}");
+}
+
+/// Session handling, asserted as it actually is: this endpoint is **stateless**
+/// (spec-legal). It never issues an `Mcp-Session-Id`, `GET`/`DELETE` answer 405,
+/// and a client that sends a session id anyway is still served — continuation
+/// works because there is no session to lose, not because one is resumed.
+#[tokio::test]
+async fn mcp_streamable_is_stateless_across_requests() {
+    let key = "ddc_dev_11223344556677889900aabbccddeeff";
+    let dir = make_home_with_key(key, "streamable-client", &["memory:read"]);
+    let cfg = make_cfg(dir.path());
+
+    // First request: initialize. No session id is minted.
+    let app = build_router(&cfg, make_dispatcher(dir.path()));
+    let resp = app
+        .oneshot(post_mcp(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+            Some(key),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("Mcp-Session-Id").is_none(),
+        "a stateless server must not mint a session id"
+    );
+    let j = body_json(resp).await;
+    assert_eq!(j["result"]["protocolVersion"].as_str(), Some("2025-06-18"));
+
+    // Second request carrying a made-up session id: still served.
+    let app = build_router(&cfg, make_dispatcher(dir.path()));
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Mcp-Session-Id", "made-up-session")
+        .body(Body::from(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["id"].as_i64(), Some(2), "body: {j}");
+
+    // GET / DELETE are the spec's 405s (no server push, no sessions).
+    for method in [Method::GET, Method::DELETE] {
+        let app = build_router(&cfg, make_dispatcher(dir.path()));
+        let req = Request::builder()
+            .method(method.clone())
+            .uri("/mcp")
+            .header("Authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} /mcp must answer 405"
+        );
+    }
+}
+
+/// An unsupported `MCP-Protocol-Version` header is refused at the door (400),
+/// rather than silently negotiated down.
+#[tokio::test]
+async fn mcp_streamable_rejects_unknown_protocol_version() {
+    let key = "ddc_dev_22334455667788990011aabbccddeeff";
+    let dir = make_home_with_key(key, "streamable-client", &["memory:read"]);
+    let app = build_router(&make_cfg(dir.path()), make_dispatcher(dir.path()));
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {key}"))
+        .header("MCP-Protocol-Version", "1999-01-01")
+        .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── OAuth 2.1 surface ────────────────────────────────────────────────────────
+
+fn pkce_pair(verifier: &str) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+fn post_form(uri: &str, form: &[(&str, &str)]) -> Request<Body> {
+    let body = form
+        .iter()
+        .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// Full Dynamic Client Registration round trip: register → operator-approved
+/// consent → PKCE token exchange → the minted token actually works on `/mcp`.
+#[tokio::test]
+async fn mcp_oauth_dcr_round_trip_mints_a_usable_token() {
+    let operator_key = "ddc_dev_33445566778899001122aabbccddeeff";
+    let dir = make_home_with_internal_key(operator_key, "operator", &["memory:read"]);
+    let cfg = make_cfg(dir.path());
+    let redirect_uri = "http://127.0.0.1:33418/callback";
+
+    // 1. Register.
+    let app = build_router(&cfg, make_dispatcher(dir.path()));
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/register")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "redirect_uris": [redirect_uri],
+                "client_name": "Integration Test Client",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let reg = body_json(resp).await;
+    let client_id = reg["client_id"].as_str().expect("client_id").to_string();
+    assert!(client_id.starts_with("mcp_"), "reg: {reg}");
+
+    // 2. Consent (operator proof = an internal key).
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let challenge = pkce_pair(verifier);
+    let app = build_router(&cfg, make_dispatcher(dir.path()));
+    let resp = app
+        .oneshot(post_form(
+            "/oauth/decision",
+            &[
+                ("client_id", &client_id),
+                ("redirect_uri", redirect_uri),
+                ("state", "xyz"),
+                ("code_challenge", &challenge),
+                ("scope", "memory:read"),
+                ("operator_key", operator_key),
+                ("action", "approve"),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_redirection(),
+        "approval must redirect with a code, got {}",
+        resp.status()
+    );
+    let location = resp
+        .headers()
+        .get("Location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let code = location
+        .split(&['?', '&'][..])
+        .find_map(|kv| kv.strip_prefix("code="))
+        .map(|c| urlencoding::decode(c).unwrap().into_owned())
+        .expect("authorization code in redirect");
+
+    // 3. Token exchange with the matching PKCE verifier.
+    let app = build_router(&cfg, make_dispatcher(dir.path()));
+    let resp = app
+        .oneshot(post_form(
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", verifier),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tok = body_json(resp).await;
+    let access = tok["access_token"].as_str().expect("access_token").to_string();
+    assert!(access.starts_with("ddc_oauth_"), "token body: {tok}");
+
+    // 4. The minted token authenticates on the Streamable-HTTP endpoint.
+    let app = build_router(&cfg, make_dispatcher(dir.path()));
+    let resp = app
+        .oneshot(post_mcp(
+            r#"{"jsonrpc":"2.0","id":9,"method":"ping"}"#,
+            Some(&access),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["id"].as_i64(), Some(9), "body: {j}");
+
+    // 5. The code is single-use: replaying it fails.
+    let app = build_router(&cfg, make_dispatcher(dir.path()));
+    let resp = app
+        .oneshot(post_form(
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", verifier),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "an authorization code must not be redeemable twice"
+    );
+}
+
+/// DCR is fail-closed on the redirect URI: a non-loopback `http://` target is
+/// refused at registration, so no consent screen can ever bounce a code there.
+#[tokio::test]
+async fn mcp_oauth_register_rejects_unacceptable_redirect_uri() {
+    let dir = TempDir::new().unwrap();
+    let app = build_router(&make_cfg(dir.path()), make_dispatcher(dir.path()));
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/register")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "redirect_uris": ["http://localhost.evil.com/cb"] }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let j = body_json(resp).await;
+    assert_eq!(j["error"].as_str(), Some("invalid_redirect_uri"), "body: {j}");
+}
+
+/// Consent without a valid INTERNAL operator key never mints a code — an
+/// external key cannot self-escalate into an OAuth grant.
+#[tokio::test]
+async fn mcp_oauth_decision_requires_internal_operator_key() {
+    let external_key = "ddc_dev_44556677889900112233aabbccddeeff";
+    let dir = make_home_with_key(external_key, "external-client", &["memory:read"]);
+    let cfg = make_cfg(dir.path());
+    let redirect_uri = "http://127.0.0.1:33418/callback";
+
+    let app = build_router(&cfg, make_dispatcher(dir.path()));
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/register")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "redirect_uris": [redirect_uri] }).to_string(),
+        ))
+        .unwrap();
+    let reg = body_json(app.oneshot(req).await.unwrap()).await;
+    let client_id = reg["client_id"].as_str().unwrap().to_string();
+
+    for key in [external_key, "ddc_dev_00000000000000000000000000000000"] {
+        let app = build_router(&cfg, make_dispatcher(dir.path()));
+        let resp = app
+            .oneshot(post_form(
+                "/oauth/decision",
+                &[
+                    ("client_id", &client_id),
+                    ("redirect_uri", redirect_uri),
+                    ("state", ""),
+                    ("code_challenge", &pkce_pair("verifier-verifier-verifier-x")),
+                    ("scope", "memory:read"),
+                    ("operator_key", key),
+                    ("action", "approve"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "key {key} must not be able to approve a grant"
+        );
+        assert!(
+            resp.headers().get("Location").is_none(),
+            "a rejected approval must never redirect a code anywhere"
+        );
+    }
+}
+
+/// The unauthenticated RFC 9728 / RFC 8414 discovery documents are served and
+/// name the endpoints a remote client needs.
+#[tokio::test]
+async fn mcp_oauth_discovery_documents_are_public_and_complete() {
+    let dir = TempDir::new().unwrap();
+    let cfg = make_cfg(dir.path());
+
+    let app = build_router(&cfg, make_dispatcher(dir.path()));
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/.well-known/oauth-protected-resource")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert!(j.get("resource").is_some(), "body: {j}");
+
+    let app = build_router(&cfg, make_dispatcher(dir.path()));
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/.well-known/oauth-authorization-server")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    for key in [
+        "authorization_endpoint",
+        "token_endpoint",
+        "registration_endpoint",
+    ] {
+        assert!(j.get(key).is_some(), "{key} missing from metadata: {j}");
+    }
+}

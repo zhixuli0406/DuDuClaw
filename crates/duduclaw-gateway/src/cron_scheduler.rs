@@ -314,7 +314,7 @@ async fn dispatch_cron_task(
     task: &CronTaskRow,
     invoker: &dyn AgentInvoker,
 ) {
-    use crate::condition_eval::{evaluate_condition, evaluate_on_exit, TriggerKind};
+    use crate::condition_eval::{TriggerKind, evaluate_condition, evaluate_on_exit};
 
     // ── P3 runaway guard: cross-process circuit breaker on the cron feedback
     //    path (paper 2607.01641). A misconfigured cron (e.g. `* * * * *` that
@@ -323,9 +323,12 @@ async fn dispatch_cron_task(
     //    (fail-visible), never silently; the breaker self-closes after cooldown.
     {
         let cfg = duduclaw_core::DispatchGuardConfig::from_home(home_dir);
-        let decision =
-            duduclaw_core::dispatch_guard_check(home_dir, "cron", &task.agent_id, &cfg);
-        if let duduclaw_core::DispatchGuardDecision::Trip { reason, retry_after_secs } = decision {
+        let decision = duduclaw_core::dispatch_guard_check(home_dir, "cron", &task.agent_id, &cfg);
+        if let duduclaw_core::DispatchGuardDecision::Trip {
+            reason,
+            retry_after_secs,
+        } = decision
+        {
             warn!(
                 id = %task.id,
                 name = %task.name,
@@ -470,14 +473,17 @@ async fn execute_cron_task(
     // `None` and does not affect dispatch.
     let typing_guard = build_cron_typing_guard(home_dir, task).await;
 
-    let dispatch_fut = crate::claude_runner::DELEGATION_ENV
-        .scope(delegation_env, async {
-            invoker
-                .invoke(home_dir, registry, &task.agent_id, &prompt)
-                .await
-        });
+    let dispatch_fut = crate::claude_runner::DELEGATION_ENV.scope(delegation_env, async {
+        invoker
+            .invoke(home_dir, registry, &task.agent_id, &prompt)
+            .await
+    });
     let result = match reply_channel_override {
-        Some(rc) => crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut).await,
+        Some(rc) => {
+            crate::claude_runner::REPLY_CHANNEL
+                .scope(rc, dispatch_fut)
+                .await
+        }
         None => dispatch_fut.await,
     };
     drop(typing_guard);
@@ -694,7 +700,9 @@ async fn deliver_cron_result(
 async fn resolve_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> String {
     if let Some(tok) = crate::config_crypto::resolve_agent_channel_token_via_reports_to(
         home_dir, agent_id, channel,
-    ).await {
+    )
+    .await
+    {
         return tok.expose_owned();
     }
 
@@ -725,7 +733,11 @@ async fn build_cron_typing_guard(
     let chat_id = task.notify_chat_id.as_deref()?;
     let token = resolve_channel_token(home_dir, &task.agent_id, "telegram").await;
     crate::channel_typing::typing_guard_for(
-        reqwest::Client::new(), "telegram", chat_id, task.notify_thread_id.as_deref(), &token,
+        reqwest::Client::new(),
+        "telegram",
+        chat_id,
+        task.notify_thread_id.as_deref(),
+        &token,
     )
 }
 
@@ -1019,10 +1031,17 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 1);
         let store = CronStore::open(dir.path()).unwrap();
         let got = store.get("sr1").await.unwrap().unwrap();
-        assert_eq!(got.run_count, 1, "standalone run should record exactly one run");
+        assert_eq!(
+            got.run_count, 1,
+            "standalone run should record exactly one run"
+        );
     }
 
-    fn task_with_notify(channel: Option<&str>, chat: Option<&str>, thread: Option<&str>) -> CronTaskRow {
+    fn task_with_notify(
+        channel: Option<&str>,
+        chat: Option<&str>,
+        thread: Option<&str>,
+    ) -> CronTaskRow {
         let mut row = CronTaskRow::new(
             "test-id".to_string(),
             "test-name".to_string(),
@@ -1038,12 +1057,21 @@ mod tests {
 
     #[test]
     fn reply_channel_none_when_notify_unset() {
-        assert_eq!(cron_reply_channel_string(&task_with_notify(None, None, None)), None);
+        assert_eq!(
+            cron_reply_channel_string(&task_with_notify(None, None, None)),
+            None
+        );
         // Partial — channel but no chat — also None (deliver_cron_result
         // would reject this anyway).
-        assert_eq!(cron_reply_channel_string(&task_with_notify(Some("discord"), None, None)), None);
+        assert_eq!(
+            cron_reply_channel_string(&task_with_notify(Some("discord"), None, None)),
+            None
+        );
         // Empty strings treated same as missing.
-        assert_eq!(cron_reply_channel_string(&task_with_notify(Some(""), Some(""), None)), None);
+        assert_eq!(
+            cron_reply_channel_string(&task_with_notify(Some(""), Some(""), None)),
+            None
+        );
     }
 
     #[test]
@@ -1130,7 +1158,9 @@ mod tests {
         begin_takeover(dir.path(), "telegram", "12345");
         let other = task_with_notify(Some("telegram"), Some("99999"), None);
         assert!(
-            deliver_cron_result(dir.path(), &other, "結果").await.is_err(),
+            deliver_cron_result(dir.path(), &other, "結果")
+                .await
+                .is_err(),
             "a takeover must not mute unrelated conversations"
         );
     }

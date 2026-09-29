@@ -34,11 +34,15 @@ impl fmt::Display for AuditError {
 impl std::error::Error for AuditError {}
 
 impl From<std::io::Error> for AuditError {
-    fn from(e: std::io::Error) -> Self { Self::IoError(e.to_string()) }
+    fn from(e: std::io::Error) -> Self {
+        Self::IoError(e.to_string())
+    }
 }
 
 impl From<serde_json::Error> for AuditError {
-    fn from(e: serde_json::Error) -> Self { Self::ParseError(e.to_string()) }
+    fn from(e: serde_json::Error) -> Self {
+        Self::ParseError(e.to_string())
+    }
 }
 
 /// A single browser automation audit record, serialised as one JSONL line.
@@ -143,11 +147,7 @@ impl BrowserAuditLog {
     }
 
     /// Save a PNG screenshot and return its path.
-    pub fn save_screenshot(
-        &self,
-        agent_id: &str,
-        png_data: &[u8],
-    ) -> Result<PathBuf, AuditError> {
+    pub fn save_screenshot(&self, agent_id: &str, png_data: &[u8]) -> Result<PathBuf, AuditError> {
         let dir = self.screenshots_dir(agent_id);
         fs::create_dir_all(&dir)?;
 
@@ -211,7 +211,11 @@ impl BrowserAuditLog {
         }
 
         if removed > 0 {
-            info!(removed, retention_days = self.retention_days, "expired screenshots cleaned");
+            info!(
+                removed,
+                retention_days = self.retention_days,
+                "expired screenshots cleaned"
+            );
         }
         Ok(removed)
     }
@@ -225,16 +229,16 @@ impl BrowserAuditLog {
         if !path.exists() {
             return Ok(true);
         }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| AuditError::IoError(e.to_string()))?;
+        let content =
+            std::fs::read_to_string(&path).map_err(|e| AuditError::IoError(e.to_string()))?;
 
         let mut expected_prev = "0".repeat(64);
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            let record: serde_json::Value = serde_json::from_str(line)
-                .map_err(|e| AuditError::ParseError(e.to_string()))?;
+            let record: serde_json::Value =
+                serde_json::from_str(line).map_err(|e| AuditError::ParseError(e.to_string()))?;
 
             let stored_prev = record
                 .get("_prev_hash")
@@ -363,7 +367,8 @@ mod tests {
         let log = BrowserAuditLog::new(tmp.path(), 7);
 
         log.log_action(&make_entry("bot1", "L1", "fetch")).unwrap();
-        log.log_action(&make_entry("bot2", "L2", "extract")).unwrap();
+        log.log_action(&make_entry("bot2", "L2", "extract"))
+            .unwrap();
         log.log_action(&make_entry("bot1", "L3", "click")).unwrap();
 
         let entries = log.entries_for_agent("bot1", 10).unwrap();

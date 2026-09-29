@@ -96,10 +96,7 @@ mod tests {
 
     #[test]
     fn normalize_strips_punct_and_collapses_whitespace() {
-        assert_eq!(
-            normalize_for_key("  Hello,   World!!  "),
-            "hello world"
-        );
+        assert_eq!(normalize_for_key("  Hello,   World!!  "), "hello world");
     }
 
     #[test]
@@ -131,12 +128,27 @@ mod tests {
     fn near_duplicate_id_respects_threshold_and_model() {
         let query = vec![1.0f32, 0.0];
         let candidates = vec![
-            ("a".to_string(), Some(vec![1.0, 0.0]), Some("m1".to_string())), // cos=1.0
-            ("b".to_string(), Some(vec![0.0, 1.0]), Some("m1".to_string())), // cos=0.0
-            ("c".to_string(), Some(vec![1.0, 0.0]), Some("m2".to_string())), // wrong model
-            ("d".to_string(), None, Some("m1".to_string())),                // no embedding
+            (
+                "a".to_string(),
+                Some(vec![1.0, 0.0]),
+                Some("m1".to_string()),
+            ), // cos=1.0
+            (
+                "b".to_string(),
+                Some(vec![0.0, 1.0]),
+                Some("m1".to_string()),
+            ), // cos=0.0
+            (
+                "c".to_string(),
+                Some(vec![1.0, 0.0]),
+                Some("m2".to_string()),
+            ), // wrong model
+            ("d".to_string(), None, Some("m1".to_string())), // no embedding
         ];
-        assert_eq!(near_duplicate_id(&query, "m1", &candidates), Some("a".to_string()));
+        assert_eq!(
+            near_duplicate_id(&query, "m1", &candidates),
+            Some("a".to_string())
+        );
         assert_eq!(near_duplicate_id(&query, "m3", &candidates), None);
         assert_eq!(near_duplicate_id(&query, "m1", &[]), None);
     }

@@ -1,5 +1,6 @@
 //! A7a `display` group — a thin client for comp's `shell_control` socket
-//! (`crates/duduclaw-comp/src/shell_control/protocol.rs`). See
+//! (DuDuClaw-OS repo, `crates/duduclaw-comp/src/shell_control/protocol.rs`;
+//! that crate moved out of this repo on 2026-09-29). See
 //! `commercial/docs/DESIGN-os-self-drive-2026-08.md` §3/§7/§8 for why this
 //! hand-rolls the wire JSON instead of depending on `duduclaw-comp` (a
 //! smithay/Wayland crate that would break the macOS dev build, and whose own
@@ -14,7 +15,7 @@
 
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Same value the wire protocol's own `MAX_REQUEST_LINE_BYTES` uses on the
 /// server side — a sane upper bound for a reply we read into memory.
@@ -91,11 +92,18 @@ async fn call(req: Value) -> Result<Value, String> {
         ));
     }
 
-    let resp: Value = serde_json::from_str(buf.trim())
-        .map_err(|e| format!("shell socket 回應不是合法 JSON：{e}（原始內容：{}）", buf.trim()))?;
+    let resp: Value = serde_json::from_str(buf.trim()).map_err(|e| {
+        format!(
+            "shell socket 回應不是合法 JSON：{e}（原始內容：{}）",
+            buf.trim()
+        )
+    })?;
 
     if resp.get("ok").and_then(Value::as_bool) == Some(false) {
-        let err = resp.get("error").and_then(Value::as_str).unwrap_or("unknown_error");
+        let err = resp
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown_error");
         if err == "unauthorized" {
             return Err(
                 "shell socket 拒絕連線（unauthorized）——same-uid SO_PEERCRED 邊界：呼叫者與 comp/\
@@ -112,28 +120,42 @@ async fn call(req: Value) -> Result<Value, String> {
 
 #[cfg(not(unix))]
 async fn call(_req: Value) -> Result<Value, String> {
-    Err("duduclaw os display 命令僅支援 Unix（Linux/macOS）——這個平台沒有 shell_control socket。"
-        .to_string())
+    Err(
+        "duduclaw os display 命令僅支援 Unix（Linux/macOS）——這個平台沒有 shell_control socket。"
+            .to_string(),
+    )
 }
 
 pub async fn cursor_size_get() -> Result<String, String> {
     let resp = call(json!({ "op": "get_cursor_source" })).await?;
-    Ok(format!("{:#}", resp.get("cursor").cloned().unwrap_or(Value::Null)))
+    Ok(format!(
+        "{:#}",
+        resp.get("cursor").cloned().unwrap_or(Value::Null)
+    ))
 }
 
 pub async fn cursor_size_set(size: i64) -> Result<String, String> {
     let resp = call(json!({ "op": "set_cursor_size", "params": { "size": size } })).await?;
-    Ok(format!("{:#}", resp.get("cursor").cloned().unwrap_or(Value::Null)))
+    Ok(format!(
+        "{:#}",
+        resp.get("cursor").cloned().unwrap_or(Value::Null)
+    ))
 }
 
 pub async fn cursor_source_get() -> Result<String, String> {
     let resp = call(json!({ "op": "get_cursor_source" })).await?;
-    Ok(format!("{:#}", resp.get("cursor").cloned().unwrap_or(Value::Null)))
+    Ok(format!(
+        "{:#}",
+        resp.get("cursor").cloned().unwrap_or(Value::Null)
+    ))
 }
 
 pub async fn cursor_source_set(source: &str) -> Result<String, String> {
     let resp = call(json!({ "op": "set_cursor_source", "params": { "source": source } })).await?;
-    Ok(format!("{:#}", resp.get("cursor").cloned().unwrap_or(Value::Null)))
+    Ok(format!(
+        "{:#}",
+        resp.get("cursor").cloned().unwrap_or(Value::Null)
+    ))
 }
 
 pub async fn theme_set(theme: &str) -> Result<String, String> {
@@ -163,7 +185,10 @@ mod tests {
     /// Spin up a stub `shell_control`-shaped server on a temp socket and
     /// point `call` at it via `XDG_RUNTIME_DIR` — proves the request/
     /// response wire round trip works without needing a real compositor.
-    async fn run_stub(dir: &std::path::Path, respond: impl FnOnce(Value) -> Value + Send + 'static) {
+    async fn run_stub(
+        dir: &std::path::Path,
+        respond: impl FnOnce(Value) -> Value + Send + 'static,
+    ) {
         let sock_path = dir.join("duduclaw-shell.sock");
         let listener = UnixListener::bind(&sock_path).expect("bind stub socket");
         tokio::spawn(async move {
@@ -207,7 +232,11 @@ mod tests {
     async fn unauthorized_response_is_translated_to_the_uid_boundary_message() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        run_stub(dir.path(), |_req| json!({ "ok": false, "error": "unauthorized" })).await;
+        run_stub(
+            dir.path(),
+            |_req| json!({ "ok": false, "error": "unauthorized" }),
+        )
+        .await;
 
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", dir.path()) };
         let result = theme_set("dark").await;

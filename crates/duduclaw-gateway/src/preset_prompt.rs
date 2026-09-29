@@ -41,13 +41,22 @@ pub fn build_preset_section(home_dir: &Path, agent_id: &str) -> Option<String> {
         .ok()
         .and_then(|s| s.parse::<toml::Table>().ok())
         .unwrap_or_default();
-    let (_, resolution) =
-        duduclaw_core::preset::resolve_for_agent(&home, agent_id, &raw_table);
+    let (_, resolution) = duduclaw_core::preset::resolve_for_agent(&home, agent_id, &raw_table);
 
     let body = match resolution {
         PresetResolution::Unbound => return None,
-        PresetResolution::Applied { preset_id, version, label, changed_fields, .. } => {
-            let label = if label.trim().is_empty() { preset_id.clone() } else { label };
+        PresetResolution::Applied {
+            preset_id,
+            version,
+            label,
+            changed_fields,
+            ..
+        } => {
+            let label = if label.trim().is_empty() {
+                preset_id.clone()
+            } else {
+                label
+            };
             let overrides = if changed_fields.is_empty() {
                 String::new()
             } else {
@@ -55,7 +64,11 @@ pub fn build_preset_section(home_dir: &Path, agent_id: &str) -> Option<String> {
             };
             format!("你目前套用職務組合「{label}」（{preset_id} v{version}）{overrides}。")
         }
-        PresetResolution::Unresolved { preset_id, version, reason } => format!(
+        PresetResolution::Unresolved {
+            preset_id,
+            version,
+            reason,
+        } => format!(
             "⚠️ 你原本綁定的職務組合「{preset_id}」（v{version}）目前無法套用（{reason}），\
              現在只用你自己 agent.toml 裡明寫的設定運作，工具與能力範圍可能比預期窄。\
              這不是你的錯——請回報管理者確認職務組合是否需要重新綁定。"
@@ -113,15 +126,23 @@ mod tests {
     #[test]
     fn bound_agent_sees_the_label_version_and_overrides() {
         let h = home();
-        write_agent(h.path(), "bob", "[model]\npreferred = \"claude-sonnet-4-6\"\nfallback = \"claude-haiku-4-5\"\naccount_pool = []\n");
+        write_agent(
+            h.path(),
+            "bob",
+            "[model]\npreferred = \"claude-sonnet-4-6\"\nfallback = \"claude-haiku-4-5\"\naccount_pool = []\n",
+        );
         write_preset(h.path(), "sales-followup", PRESET);
         let dir = h.path().join("agents").join("bob");
-        duduclaw_core::preset::bind(h.path(), "bob", &dir, "sales-followup", "tester", "test").unwrap();
+        duduclaw_core::preset::bind(h.path(), "bob", &dir, "sales-followup", "tester", "test")
+            .unwrap();
 
         let section = build_preset_section(h.path(), "bob").expect("must produce a section");
         assert!(section.contains("業務跟進助理"));
         assert!(section.contains("sales-followup v1.0.0"));
-        assert!(section.contains("model.preferred"), "the agent's own model override must be listed");
+        assert!(
+            section.contains("model.preferred"),
+            "the agent's own model override must be listed"
+        );
     }
 
     #[test]
@@ -130,10 +151,15 @@ mod tests {
         write_agent(h.path(), "bob", "");
         write_preset(h.path(), "sales-followup", PRESET);
         let dir = h.path().join("agents").join("bob");
-        duduclaw_core::preset::bind(h.path(), "bob", &dir, "sales-followup", "tester", "test").unwrap();
+        duduclaw_core::preset::bind(h.path(), "bob", &dir, "sales-followup", "tester", "test")
+            .unwrap();
 
         // The preset disappears out from under the binding.
-        std::fs::remove_dir_all(duduclaw_core::preset::preset_dir(h.path(), "sales-followup")).unwrap();
+        std::fs::remove_dir_all(duduclaw_core::preset::preset_dir(
+            h.path(),
+            "sales-followup",
+        ))
+        .unwrap();
 
         let section = build_preset_section(h.path(), "bob").expect("must warn, not go silent");
         assert!(section.contains("⚠️"));

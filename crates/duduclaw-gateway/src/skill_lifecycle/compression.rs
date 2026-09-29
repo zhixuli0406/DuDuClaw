@@ -30,7 +30,11 @@ impl CompressedSkill {
         let tag = name.to_string();
 
         let summary = if let Some(desc) = description {
-            if desc.len() > 5 { desc.to_string() } else { first_lines(content, 2) }
+            if desc.len() > 5 {
+                desc.to_string()
+            } else {
+                first_lines(content, 2)
+            }
         } else {
             first_lines(content, 2)
         };
@@ -84,7 +88,9 @@ pub struct CompressedSkillCache {
 
 impl CompressedSkillCache {
     pub fn new() -> Self {
-        Self { skills: HashMap::new() }
+        Self {
+            skills: HashMap::new(),
+        }
     }
 
     /// Refresh cache from loaded agent skills.

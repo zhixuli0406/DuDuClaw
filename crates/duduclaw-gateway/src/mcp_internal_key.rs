@@ -68,6 +68,16 @@ fn mint_key() -> String {
 }
 
 /// The `[mcp_keys.<key>]` table body for a freshly minted internal key.
+///
+/// The scope list stays exactly `["admin"]`. When a tool is moved onto a new
+/// internal-only scope (2026-09-28: `team_handoff` → `team:handoff`) there is
+/// nothing to add here: the MCP dispatch gate accepts `Scope::Admin` as a
+/// substitute for any required scope, so this key already reaches it. Writing
+/// the newer scope string into `config.toml` would be strictly worse — an
+/// older binary reading the same file parses the scope array with
+/// `parse_scopes(..).unwrap_or_default()` (`duduclaw-cli/src/mcp_auth.rs`),
+/// so one unrecognised entry silently collapses the whole key to *no* scopes
+/// and every CLI child loses its tool surface on a downgrade.
 fn internal_key_entry(now: DateTime<Utc>) -> toml::Value {
     let mut entry = toml::map::Map::new();
     entry.insert(
@@ -335,7 +345,10 @@ mod tests {
         write_internal_key(dir.path(), old, "not-a-timestamp");
 
         let key = ensure_internal_mcp_key(dir.path()).unwrap();
-        assert_ne!(key, old, "an undatable key must never be trusted as current");
+        assert_ne!(
+            key, old,
+            "an undatable key must never be trusted as current"
+        );
         let content = config_text(dir.path());
         assert!(content.contains(&key));
         assert!(

@@ -76,7 +76,7 @@ pub struct SecauditOptions {
 /// `Result<(), Error>`) because the task spec requires a specific 0/1/2
 /// three-way contract that the generic "any Err ⇒ exit 1" wrapper in
 /// `entry_point()` can't express — same pattern already used by
-/// `Commands::DesktopRecordWorker` in lib.rs.
+/// `ToolingCommands::DesktopRecordWorker` in lib.rs.
 pub async fn cmd_secaudit(home_dir: &Path, opts: SecauditOptions) -> i32 {
     let profile_mode: ProfileMode = match opts.profile.parse() {
         Ok(m) => m,
@@ -127,8 +127,16 @@ pub async fn cmd_secaudit(home_dir: &Path, opts: SecauditOptions) -> i32 {
     };
 
     if profile_mode == ProfileMode::Deep {
-        run_ai_steps(home_dir, &repo_root, &opts, intake_profile.as_ref(), &mut engines_run, &mut engines_missing, &mut findings)
-            .await;
+        run_ai_steps(
+            home_dir,
+            &repo_root,
+            &opts,
+            intake_profile.as_ref(),
+            &mut engines_run,
+            &mut engines_missing,
+            &mut findings,
+        )
+        .await;
     }
 
     let summary = Summary::from_findings(&findings, engines_run.len(), engines_missing.len());
@@ -176,7 +184,10 @@ pub async fn cmd_secaudit(home_dir: &Path, opts: SecauditOptions) -> i32 {
     // a bare `duduclaw secaudit` with neither flag.
     if opts.report.is_some() || opts.save {
         if let Some(event_severity) = secaudit_findings_event_severity(&audit_report.summary) {
-            let high_plus = audit_report.summary.by_severity.count_at_or_above(Severity::High);
+            let high_plus = audit_report
+                .summary
+                .by_severity
+                .count_at_or_above(Severity::High);
             duduclaw_security::audit::append_audit_event(
                 home_dir,
                 &duduclaw_security::audit::AuditEvent::new(
@@ -211,7 +222,9 @@ pub async fn cmd_secaudit(home_dir: &Path, opts: SecauditOptions) -> i32 {
 /// `schema::Summary::from_findings`), so a refuted ai_audit candidate at
 /// Critical severity correctly does not trigger this event either, same
 /// fail-closed-toward-refuted discipline the `--fail-on` CI gate uses.
-fn secaudit_findings_event_severity(summary: &Summary) -> Option<duduclaw_security::audit::Severity> {
+fn secaudit_findings_event_severity(
+    summary: &Summary,
+) -> Option<duduclaw_security::audit::Severity> {
     let high_plus = summary.by_severity.count_at_or_above(Severity::High);
     if high_plus == 0 {
         return None;
@@ -248,7 +261,12 @@ async fn run_ai_steps(
         intake::GitHistoryStatus::Unavailable { .. } => Vec::new(),
     };
     let all_files = intake::walk_repo_files(repo_root);
-    let modules = ai_audit::rank_modules(&all_files, &hotspots, &intake_profile.entry_points, opts.max_modules);
+    let modules = ai_audit::rank_modules(
+        &all_files,
+        &hotspots,
+        &intake_profile.entry_points,
+        opts.max_modules,
+    );
 
     let ai_caller = llm_util::SecauditCaller {
         home_dir: home_dir.to_path_buf(),
@@ -315,7 +333,11 @@ mod tests {
     #[tokio::test]
     async fn invalid_repo_path_exits_2() {
         let home = tempfile::tempdir().unwrap();
-        let code = cmd_secaudit(home.path(), opts(PathBuf::from("/definitely/does/not/exist/xyz"))).await;
+        let code = cmd_secaudit(
+            home.path(),
+            opts(PathBuf::from("/definitely/does/not/exist/xyz")),
+        )
+        .await;
         assert_eq!(code, 2);
     }
 
@@ -582,6 +604,9 @@ mod tests {
         let code = cmd_secaudit(home.path(), o).await;
         assert_eq!(code, 0);
         let audit_path = home.path().join("security_audit.jsonl");
-        assert!(!audit_path.exists(), "no persistence requested ⇒ no audit event ⇒ file never created");
+        assert!(
+            !audit_path.exists(),
+            "no persistence requested ⇒ no audit event ⇒ file never created"
+        );
     }
 }

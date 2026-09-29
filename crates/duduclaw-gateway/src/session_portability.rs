@@ -443,7 +443,7 @@ impl SessionManager {
         ) {
             Ok(v) => v,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Ok(RollbackDecision::NothingToRollback)
+                return Ok(RollbackDecision::NothingToRollback);
             }
             Err(e) => return Err(DuDuClawError::Gateway(format!("rollback checkpoint: {e}"))),
         };
@@ -598,7 +598,10 @@ mod tests {
             HandoffTarget::Resolved("telegram:100".to_string())
         );
         // No session at all.
-        assert_eq!(resolve_handoff_target(&[], "slack:C1"), HandoffTarget::NoSession);
+        assert_eq!(
+            resolve_handoff_target(&[], "slack:C1"),
+            HandoffTarget::NoSession
+        );
     }
 
     #[test]

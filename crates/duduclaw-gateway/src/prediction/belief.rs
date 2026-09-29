@@ -120,7 +120,10 @@ pub struct BeliefConfig {
 
 impl Default for BeliefConfig {
     fn default() -> Self {
-        Self { flat_band_pct: DEFAULT_FLAT_BAND_PCT, tick_subject_map: HashMap::new() }
+        Self {
+            flat_band_pct: DEFAULT_FLAT_BAND_PCT,
+            tick_subject_map: HashMap::new(),
+        }
     }
 }
 
@@ -141,7 +144,10 @@ impl BeliefConfig {
         let Some(section) = table.get("belief") else {
             return default;
         };
-        section.clone().try_into::<BeliefConfig>().unwrap_or(default)
+        section
+            .clone()
+            .try_into::<BeliefConfig>()
+            .unwrap_or(default)
     }
 
     /// [`submit`] / [`settle`] only receive `db_path` (per the platform API
@@ -280,8 +286,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
 }
 
 fn open_conn(db_path: &Path) -> Result<Connection, String> {
-    let conn =
-        Connection::open(db_path).map_err(|e| format!("open prediction.db: {e}"))?;
+    let conn = Connection::open(db_path).map_err(|e| format!("open prediction.db: {e}"))?;
     ensure_schema(&conn)?;
     Ok(conn)
 }
@@ -519,7 +524,11 @@ pub fn settle(
     };
 
     let outcome = if realized_direction == "flat" {
-        if row.direction == "flat" { "hit" } else { "flat_band" }
+        if row.direction == "flat" {
+            "hit"
+        } else {
+            "flat_band"
+        }
     } else if row.direction == realized_direction {
         "hit"
     } else {
@@ -613,8 +622,7 @@ pub fn recent(db_path: &Path, agent: Option<&str>, limit: usize) -> Vec<BeliefRo
             stmt.query_map(params![a, limit], map_row)?.collect()
         })(),
         None => (|| -> rusqlite::Result<Vec<BeliefRow>> {
-            let sql =
-                format!("SELECT {SELECT_COLUMNS} FROM belief_log ORDER BY id DESC LIMIT ?1");
+            let sql = format!("SELECT {SELECT_COLUMNS} FROM belief_log ORDER BY id DESC LIMIT ?1");
             let mut stmt = conn.prepare(&sql)?;
             stmt.query_map(params![limit], map_row)?.collect()
         })(),
@@ -701,7 +709,11 @@ pub fn stats(db_path: &Path, agent: &str) -> BeliefStats {
         n_settled: n_settled_u64,
         insufficient_samples: false,
         hit_rate: Some(hit_rate),
-        hit_rate_wilson_low: if wilson_lo.is_nan() { None } else { Some(wilson_lo) },
+        hit_rate_wilson_low: if wilson_lo.is_nan() {
+            None
+        } else {
+            Some(wilson_lo)
+        },
         mean_brier: mean_brier_raw,
         overconfidence,
         per_subject,
@@ -808,7 +820,7 @@ pub fn unsettled_today(db_path: &Path, agent_id: &str) -> Vec<BeliefRow> {
 // WP3 prompt rendering (pure — no I/O). Format mirrors the existing
 // `## 工作狀態` / `## 近期自身行動` injected-section convention (plain
 // markdown headers, zh-TW body, no XML escaping needed since these are not
-// wrapped in an XML `<state>` block like `goal_state.rs`'s A1 blocks are).
+// wrapped in an XML `<state>` block like `goal_loop/state.rs`'s A1 blocks are).
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Render the pre-dispatch `## 信念校準（程式化統計，勿自行臆測歷史）`
@@ -847,9 +859,7 @@ pub fn render_calibration_section(stats: &BeliefStats) -> Option<String> {
             n = stats.n_settled,
         )
     };
-    Some(format!(
-        "## 信念校準（程式化統計，勿自行臆測歷史）\n{body}"
-    ))
+    Some(format!("## 信念校準（程式化統計，勿自行臆測歷史）\n{body}"))
 }
 
 /// Render one `## 信念對照` diff line for an unsettled belief against a live
@@ -938,7 +948,10 @@ mod tests {
         let mut b = belief("trader", "2317", "up", 0.6, 100.0);
         b.horizon = "x".repeat(1000);
         let id = submit(&db, b).unwrap();
-        let row = recent(&db, Some("trader"), 10).into_iter().find(|r| r.belief_id == id).unwrap();
+        let row = recent(&db, Some("trader"), 10)
+            .into_iter()
+            .find(|r| r.belief_id == id)
+            .unwrap();
         assert_eq!(row.horizon.chars().count(), 40);
     }
 
@@ -949,7 +962,10 @@ mod tests {
             let mut b = belief("trader", "2317", "up", 0.6, 100.0);
             b.horizon = label.to_string();
             let id = submit(&db, b).unwrap();
-            let row = recent(&db, Some("trader"), 10).into_iter().find(|r| r.belief_id == id).unwrap();
+            let row = recent(&db, Some("trader"), 10)
+                .into_iter()
+                .find(|r| r.belief_id == id)
+                .unwrap();
             assert_eq!(row.horizon, label);
         }
     }
@@ -994,7 +1010,10 @@ mod tests {
         let mut b = belief("trader", "  2317   TW  ", "up", 0.6, 100.0);
         b.rationale = Some("x".repeat(1000));
         let id = submit(&db, b).unwrap();
-        let row = recent(&db, Some("trader"), 10).into_iter().find(|r| r.belief_id == id).unwrap();
+        let row = recent(&db, Some("trader"), 10)
+            .into_iter()
+            .find(|r| r.belief_id == id)
+            .unwrap();
         assert_eq!(row.subject, "2317 TW");
         assert_eq!(row.rationale.unwrap().chars().count(), 400);
     }
@@ -1057,17 +1076,29 @@ mod tests {
         let (db, _dir) = temp_db();
         // Before marking: not injected.
         let id1 = submit(&db, belief("trader", "2317", "up", 0.6, 100.0)).unwrap();
-        let row1 = recent(&db, Some("trader"), 10).into_iter().find(|r| r.belief_id == id1).unwrap();
+        let row1 = recent(&db, Some("trader"), 10)
+            .into_iter()
+            .find(|r| r.belief_id == id1)
+            .unwrap();
         assert!(!row1.stats_injected);
 
         mark_stats_injected(&db, "trader").unwrap();
         let id2 = submit(&db, belief("trader", "TAIEX", "down", 0.6, 18000.0)).unwrap();
-        let row2 = recent(&db, Some("trader"), 10).into_iter().find(|r| r.belief_id == id2).unwrap();
-        assert!(row2.stats_injected, "submit within the 12h window after marking must be stamped");
+        let row2 = recent(&db, Some("trader"), 10)
+            .into_iter()
+            .find(|r| r.belief_id == id2)
+            .unwrap();
+        assert!(
+            row2.stats_injected,
+            "submit within the 12h window after marking must be stamped"
+        );
 
         // A different agent's marker must not leak across agents.
         let id3 = submit(&db, belief("someone-else", "2317", "up", 0.6, 100.0)).unwrap();
-        let row3 = recent(&db, Some("someone-else"), 10).into_iter().find(|r| r.belief_id == id3).unwrap();
+        let row3 = recent(&db, Some("someone-else"), 10)
+            .into_iter()
+            .find(|r| r.belief_id == id3)
+            .unwrap();
         assert!(!row3.stats_injected);
     }
 
@@ -1149,12 +1180,18 @@ mod tests {
         assert!(err.contains("diverges"), "{err}");
 
         // The belief must remain unsettled after a refused settlement.
-        let row = recent(&db, Some("trader"), 10).into_iter().find(|r| r.belief_id == id).unwrap();
+        let row = recent(&db, Some("trader"), 10)
+            .into_iter()
+            .find(|r| r.belief_id == id)
+            .unwrap();
         assert!(row.settled_at.is_none());
 
         // A subsequent settle with a consistent tick must still succeed.
         let settled = settle(&db, "trader", &id, 110.0, Some(110.2)).unwrap();
-        assert_eq!(settled.settle_source.as_deref(), Some("agent+tick_verified"));
+        assert_eq!(
+            settled.settle_source.as_deref(),
+            Some("agent+tick_verified")
+        );
     }
 
     #[test]
@@ -1238,7 +1275,10 @@ mod tests {
         assert!(s.insufficient_samples);
         assert_eq!(s.n_total, 2);
         assert_eq!(s.n_settled, 0);
-        assert!(s.per_subject.is_empty(), "no settled rows ⇒ no per-subject breakdown");
+        assert!(
+            s.per_subject.is_empty(),
+            "no settled rows ⇒ no per-subject breakdown"
+        );
     }
 
     // ── stats: Wilson bound + overconfidence at N=30 (known-value cross-check
@@ -1290,7 +1330,10 @@ mod tests {
         assert_eq!(by_2317.n_settled, 2);
         assert_eq!(by_2317.hits, 1);
         let by_taiex = s.per_subject.iter().find(|r| r.subject == "TAIEX").unwrap();
-        assert_eq!(by_taiex.n_settled, 1, "the unsettled TAIEX row must not be counted");
+        assert_eq!(
+            by_taiex.n_settled, 1,
+            "the unsettled TAIEX row must not be counted"
+        );
         assert_eq!(by_taiex.hits, 1);
     }
 
@@ -1301,10 +1344,16 @@ mod tests {
         let (db, _dir) = temp_db();
         assert_eq!(get_meta(&db, "self_study_last:trader"), None);
         set_meta(&db, "self_study_last:trader", "2026-08-14").unwrap();
-        assert_eq!(get_meta(&db, "self_study_last:trader").as_deref(), Some("2026-08-14"));
+        assert_eq!(
+            get_meta(&db, "self_study_last:trader").as_deref(),
+            Some("2026-08-14")
+        );
         // Upsert overwrites, does not duplicate.
         set_meta(&db, "self_study_last:trader", "2026-08-15").unwrap();
-        assert_eq!(get_meta(&db, "self_study_last:trader").as_deref(), Some("2026-08-15"));
+        assert_eq!(
+            get_meta(&db, "self_study_last:trader").as_deref(),
+            Some("2026-08-15")
+        );
         // A different key is independent.
         assert_eq!(get_meta(&db, "self_study_last:someone-else"), None);
     }
@@ -1354,11 +1403,15 @@ mod tests {
         let cfg = BeliefConfig::from_home(dir.path());
         assert!((cfg.flat_band_pct - 0.5).abs() < 1e-9);
         assert_eq!(
-            cfg.tick_subject_map.get("conversion_rate").map(String::as_str),
+            cfg.tick_subject_map
+                .get("conversion_rate")
+                .map(String::as_str),
             Some("trial_conversion_rate")
         );
         assert_eq!(
-            cfg.tick_subject_map.get("complaint_count").map(String::as_str),
+            cfg.tick_subject_map
+                .get("complaint_count")
+                .map(String::as_str),
             Some("daily_complaints")
         );
     }
@@ -1366,7 +1419,11 @@ mod tests {
     #[test]
     fn belief_config_missing_tick_subject_map_defaults_to_empty() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[belief]\nflat_band_pct = 0.5\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[belief]\nflat_band_pct = 0.5\n",
+        )
+        .unwrap();
         let cfg = BeliefConfig::from_home(dir.path());
         assert!(cfg.tick_subject_map.is_empty());
     }
@@ -1413,7 +1470,12 @@ mod tests {
 
     // ── render_tick_diff_line / render_tick_diff_section ──
 
-    fn belief_row_fixture(subject: &str, direction: &str, prob: f64, ref_value: Option<f64>) -> BeliefRow {
+    fn belief_row_fixture(
+        subject: &str,
+        direction: &str,
+        prob: f64,
+        ref_value: Option<f64>,
+    ) -> BeliefRow {
         BeliefRow {
             belief_id: "b1".to_string(),
             agent_id: "trader".to_string(),
@@ -1459,12 +1521,19 @@ mod tests {
         assert!(render_tick_diff_section(&[]).is_none());
         let rows = vec![
             (belief_row_fixture("2317", "up", 0.6, Some(100.0)), 105.0),
-            (belief_row_fixture("TAIEX", "down", 0.7, Some(18000.0)), 17500.0),
+            (
+                belief_row_fixture("TAIEX", "down", 0.7, Some(18000.0)),
+                17500.0,
+            ),
         ];
         let section = render_tick_diff_section(&rows).unwrap();
         assert!(section.starts_with("## 信念對照"));
         assert!(section.contains("2317"));
         assert!(section.contains("TAIEX"));
-        assert_eq!(section.matches('\n').count(), 2, "one header line + two belief lines");
+        assert_eq!(
+            section.matches('\n').count(),
+            2,
+            "one header line + two belief lines"
+        );
     }
 }

@@ -85,8 +85,7 @@ mod launchd {
         // and default to 18789, so a gateway actually running on a
         // config.toml-configured port would go un-found: `service stop`
         // would report "no process found" while the gateway kept running.
-        let (port, _source) =
-            duduclaw_core::gateway_port_for_home(&duduclaw_core::duduclaw_home());
+        let (port, _source) = duduclaw_core::gateway_port_for_home(&duduclaw_core::duduclaw_home());
 
         // 1. Unload from launchctl (stops auto-restart via KeepAlive). Both the
         //    current and the legacy label, whichever is registered.
@@ -139,7 +138,10 @@ mod launchd {
             }
             if std::time::Instant::now() >= deadline {
                 // 4. SIGKILL remaining processes
-                println!("Graceful shutdown timed out. Sending SIGKILL to: {:?}", remaining);
+                println!(
+                    "Graceful shutdown timed out. Sending SIGKILL to: {:?}",
+                    remaining
+                );
                 for &pid in &remaining {
                     duduclaw_core::platform::kill_process(pid as u32).ok();
                 }
@@ -152,7 +154,15 @@ mod launchd {
                 if still_alive.is_empty() {
                     println!("✓ Service killed. Port {port} released.");
                 } else {
-                    eprintln!("⚠ Could not kill process(es): {:?}. Try: kill -9 {}", still_alive, still_alive.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "));
+                    eprintln!(
+                        "⚠ Could not kill process(es): {:?}. Try: kill -9 {}",
+                        still_alive,
+                        still_alive
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
                 }
                 return Ok(());
             }
@@ -165,12 +175,10 @@ mod launchd {
             .args(["-ti", &format!(":{port}")])
             .output();
         match output {
-            Ok(out) => {
-                String::from_utf8_lossy(&out.stdout)
-                    .split_whitespace()
-                    .filter_map(|s| s.parse::<i32>().ok())
-                    .collect()
-            }
+            Ok(out) => String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .filter_map(|s| s.parse::<i32>().ok())
+                .collect(),
             Err(_) => Vec::new(),
         }
     }

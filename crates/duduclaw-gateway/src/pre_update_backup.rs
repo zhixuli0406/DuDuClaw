@@ -85,8 +85,7 @@ pub fn snapshot_before_update(home: &Path, version: &str) -> Result<SnapshotRepo
         std::fs::remove_dir_all(&dest)
             .map_err(|e| format!("cannot clear stale snapshot {}: {e}", dest.display()))?;
     }
-    std::fs::create_dir_all(&dest)
-        .map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
+    std::fs::create_dir_all(&dest).map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
 
     let mut files_copied = 0usize;
     let mut bytes_copied = 0u64;
@@ -165,8 +164,7 @@ pub fn snapshot_before_update(home: &Path, version: &str) -> Result<SnapshotRepo
 /// more useful skipped-with-a-warning than partially copied — a truncated
 /// `agent.toml` is a landmine for whoever eventually restores from it.
 fn copy_capped(src: &Path, dest: &Path, remaining_budget: u64) -> Result<u64, String> {
-    let meta =
-        std::fs::metadata(src).map_err(|e| format!("cannot stat {}: {e}", src.display()))?;
+    let meta = std::fs::metadata(src).map_err(|e| format!("cannot stat {}: {e}", src.display()))?;
     if meta.len() > remaining_budget {
         return Err(format!(
             "{} is {} bytes, over the remaining {remaining_budget}-byte snapshot budget",
@@ -242,7 +240,10 @@ mod tests {
 
         let report = snapshot_before_update(home.path(), "0.2.0").unwrap();
 
-        assert_eq!(report.files_copied, 3, "config.toml + org.toml + a/agent.toml");
+        assert_eq!(
+            report.files_copied, 3,
+            "config.toml + org.toml + a/agent.toml"
+        );
         let dest = home.path().join("backups/pre-update-0.2.0");
         assert_eq!(report.dir, dest);
         assert!(dest.join("config.toml").is_file());
@@ -264,7 +265,10 @@ mod tests {
         let report = snapshot_before_update(home.path(), "0.1.0").unwrap();
         assert_eq!(report.files_copied, 0);
         assert_eq!(report.bytes_copied, 0);
-        assert!(report.dir.is_dir(), "the (empty) snapshot dir must still exist");
+        assert!(
+            report.dir.is_dir(),
+            "the (empty) snapshot dir must still exist"
+        );
     }
 
     #[test]
@@ -287,7 +291,10 @@ mod tests {
 
         let report = snapshot_before_update(home.path(), "0.2.0").unwrap();
         assert!(
-            !report.dir.join("leftover-from-a-crashed-attempt.txt").exists(),
+            !report
+                .dir
+                .join("leftover-from-a-crashed-attempt.txt")
+                .exists(),
             "a stale prior attempt must be cleared, not merged into"
         );
     }
@@ -301,7 +308,10 @@ mod tests {
 
         let err = copy_capped(&src, &dest, 50).unwrap_err();
         assert!(err.contains("over the remaining"));
-        assert!(!dest.exists(), "an over-budget file must not be partially written");
+        assert!(
+            !dest.exists(),
+            "an over-budget file must not be partially written"
+        );
 
         // Exactly at budget still succeeds.
         let n = copy_capped(&src, &dest, 100).unwrap();
@@ -322,7 +332,8 @@ mod tests {
         for i in 0..(RETENTION_COUNT + 3) {
             let p = backups_root.join(format!("pre-update-0.{i}.0"));
             std::fs::create_dir_all(&p).unwrap();
-            let mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i as u64 * 100);
+            let mtime =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i as u64 * 100);
             #[cfg(not(windows))]
             let dir_handle = std::fs::File::open(&p).unwrap();
             #[cfg(windows)]
@@ -354,7 +365,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(
-            remaining.iter().filter(|n| n.starts_with(SNAPSHOT_PREFIX)).count(),
+            remaining
+                .iter()
+                .filter(|n| n.starts_with(SNAPSHOT_PREFIX))
+                .count(),
             RETENTION_COUNT
         );
         // The newest ones (highest index) must be the survivors.

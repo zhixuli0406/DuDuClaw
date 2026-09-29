@@ -11,10 +11,10 @@
 pub mod calibration;
 // Read-only dashboard views over the forward-model audit trail (generic —
 // works for every agent; the LWM trading experiment is just one producer).
-pub mod forward_view;
 pub mod engine;
 pub mod feedback_bus;
 pub mod forced_reflection;
+pub mod forward_view;
 // Market Belief Loop (design-market-belief-loop-2026-08.md WP1): structured,
 // programmatically-settled beliefs about external subjects — parallel to,
 // and independent of, the task-layer forward model below.
@@ -33,13 +33,12 @@ pub mod user_model;
 // predicts what a goal-loop dispatch round will DO (tool classes, call
 // volume, outcome, artifact shape), not user reaction. Not wired into any
 // hot path yet (WP-A9 is out of scope for this change).
-pub mod tool_class;
+pub mod rule_gate;
 pub mod task_forward;
 pub mod task_forward_store;
 pub mod task_observe;
+pub mod tool_class;
 pub mod transition;
-pub mod foresight_gate;
-pub mod rule_gate;
 // ── A4 rule induce/update/prune (design §6.5) ──
 pub mod task_rule_induce;
 

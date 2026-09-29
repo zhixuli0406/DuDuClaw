@@ -1,0 +1,288 @@
+{
+  "version": "ccr-native-replay-v1",
+  "origin": "synthetic",
+  "tasks": [
+    {
+      "task_id": "ticket-exact",
+      "oracle_exact": "EXACT-001",
+      "arms": [
+        {
+          "arm": "raw",
+          "task_input": "Find the exact ticket value",
+          "source_result": "Ticket evidence EXACT-001",
+          "model_settings_json": "{\"temperature\":0,\"tools\":[\"fixture_read\"]}",
+          "authorization": {
+            "tenant_id": "local",
+            "agent_id": "agent",
+            "session_id": "session",
+            "principal_id": "user-1",
+            "source_acl": "agent:agent:session:session:principal-sha256:c6c289e49e9c05b2145860387b73bcb18df43fb09a1e4a4a9713c76c88bb541b",
+            "source_server": "synthetic-eval",
+            "source_tool": "fixture_read",
+            "provider_id": "synthetic",
+            "model_id": "mock-v1"
+          },
+          "responses": [
+            {
+              "parts": [
+                {
+                  "ToolCall": {
+                    "id": "source-call",
+                    "name": "fixture_read",
+                    "args": {}
+                  }
+                }
+              ],
+              "stop": "ToolUse",
+              "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "model_used": "mock-v1",
+              "provider": "synthetic"
+            },
+            {
+              "parts": [
+                {
+                  "Text": "The value is EXACT-001"
+                }
+              ],
+              "stop": "EndTurn",
+              "usage": {
+                "input_tokens": 20,
+                "output_tokens": 3,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "model_used": "mock-v1",
+              "provider": "synthetic"
+            }
+          ],
+          "telemetry": {
+            "provider_rounds": 2,
+            "usage_reported_rounds": 2,
+            "provider_usage": {
+              "input_tokens": 30,
+              "output_tokens": 5,
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "reasoning_tokens": 0
+            },
+            "elapsed_millis": 50
+          }
+        },
+        {
+          "arm": "lossless",
+          "task_input": "Find the exact ticket value",
+          "source_result": "Ticket evidence EXACT-001",
+          "model_settings_json": "{\"temperature\":0,\"tools\":[\"fixture_read\"]}",
+          "authorization": {
+            "tenant_id": "local",
+            "agent_id": "agent",
+            "session_id": "session",
+            "principal_id": "user-1",
+            "source_acl": "agent:agent:session:session:principal-sha256:c6c289e49e9c05b2145860387b73bcb18df43fb09a1e4a4a9713c76c88bb541b",
+            "source_server": "synthetic-eval",
+            "source_tool": "fixture_read",
+            "provider_id": "synthetic",
+            "model_id": "mock-v1"
+          },
+          "responses": [
+            {
+              "parts": [
+                {
+                  "ToolCall": {
+                    "id": "source-call",
+                    "name": "fixture_read",
+                    "args": {}
+                  }
+                }
+              ],
+              "stop": "ToolUse",
+              "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "model_used": "mock-v1",
+              "provider": "synthetic"
+            },
+            {
+              "parts": [
+                {
+                  "Text": "The value is EXACT-001"
+                }
+              ],
+              "stop": "EndTurn",
+              "usage": {
+                "input_tokens": 20,
+                "output_tokens": 3,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "model_used": "mock-v1",
+              "provider": "synthetic"
+            }
+          ],
+          "telemetry": {
+            "provider_rounds": 2,
+            "usage_reported_rounds": 2,
+            "provider_usage": {
+              "input_tokens": 30,
+              "output_tokens": 5,
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "reasoning_tokens": 0
+            },
+            "elapsed_millis": 50
+          }
+        },
+        {
+          "arm": "lossy",
+          "task_input": "Find the exact ticket value",
+          "source_result": "Ticket evidence EXACT-001",
+          "model_settings_json": "{\"temperature\":0,\"tools\":[\"fixture_read\"]}",
+          "authorization": {
+            "tenant_id": "local",
+            "agent_id": "agent",
+            "session_id": "session",
+            "principal_id": "user-1",
+            "source_acl": "agent:agent:session:session:principal-sha256:c6c289e49e9c05b2145860387b73bcb18df43fb09a1e4a4a9713c76c88bb541b",
+            "source_server": "synthetic-eval",
+            "source_tool": "fixture_read",
+            "provider_id": "synthetic",
+            "model_id": "mock-v1"
+          },
+          "responses": [
+            {
+              "parts": [
+                {
+                  "ToolCall": {
+                    "id": "source-call",
+                    "name": "fixture_read",
+                    "args": {}
+                  }
+                }
+              ],
+              "stop": "ToolUse",
+              "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "model_used": "mock-v1",
+              "provider": "synthetic"
+            },
+            {
+              "parts": [
+                {
+                  "Text": "The value is unavailable"
+                }
+              ],
+              "stop": "EndTurn",
+              "usage": {
+                "input_tokens": 20,
+                "output_tokens": 3,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "model_used": "mock-v1",
+              "provider": "synthetic"
+            }
+          ],
+          "telemetry": {
+            "provider_rounds": 2,
+            "usage_reported_rounds": 2,
+            "provider_usage": {
+              "input_tokens": 30,
+              "output_tokens": 5,
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "reasoning_tokens": 0
+            },
+            "elapsed_millis": 50
+          }
+        },
+        {
+          "arm": "ccr",
+          "task_input": "Find the exact ticket value",
+          "source_result": "Ticket evidence EXACT-001",
+          "model_settings_json": "{\"temperature\":0,\"tools\":[\"fixture_read\"]}",
+          "authorization": {
+            "tenant_id": "local",
+            "agent_id": "agent",
+            "session_id": "session",
+            "principal_id": "user-1",
+            "source_acl": "agent:agent:session:session:principal-sha256:c6c289e49e9c05b2145860387b73bcb18df43fb09a1e4a4a9713c76c88bb541b",
+            "source_server": "synthetic-eval",
+            "source_tool": "fixture_read",
+            "provider_id": "synthetic",
+            "model_id": "mock-v1"
+          },
+          "responses": [
+            {
+              "parts": [
+                {
+                  "ToolCall": {
+                    "id": "source-call",
+                    "name": "fixture_read",
+                    "args": {}
+                  }
+                }
+              ],
+              "stop": "ToolUse",
+              "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "model_used": "mock-v1",
+              "provider": "synthetic"
+            },
+            {
+              "parts": [
+                {
+                  "Text": "The value is EXACT-001"
+                }
+              ],
+              "stop": "EndTurn",
+              "usage": {
+                "input_tokens": 20,
+                "output_tokens": 3,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0
+              },
+              "model_used": "mock-v1",
+              "provider": "synthetic"
+            }
+          ],
+          "telemetry": {
+            "provider_rounds": 2,
+            "usage_reported_rounds": 2,
+            "provider_usage": {
+              "input_tokens": 30,
+              "output_tokens": 5,
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "reasoning_tokens": 0
+            },
+            "elapsed_millis": 50
+          }
+        }
+      ]
+    }
+  ]
+}

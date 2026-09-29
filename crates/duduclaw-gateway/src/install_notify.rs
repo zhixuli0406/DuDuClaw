@@ -24,8 +24,8 @@ use std::path::Path;
 use serde_json::json;
 use tracing::{info, warn};
 
-use duduclaw_auth::models::{User, UserRole, UserStatus};
 use duduclaw_auth::UserDb;
+use duduclaw_auth::models::{User, UserRole, UserStatus};
 
 use crate::decision_action::DecisionSource;
 use crate::decision_notify::DecisionCard;
@@ -137,7 +137,11 @@ fn notify_body(req: &InstallRequest) -> String {
          編號：{id}",
         prefix = crate::decision_notify::reason_prefix(DecisionSource::Install),
         title = req.title,
-        who = if req.requester_email.is_empty() { &req.requester_id } else { &req.requester_email },
+        who = if req.requester_email.is_empty() {
+            &req.requester_id
+        } else {
+            &req.requester_email
+        },
         role = zh_role(&req.requester_role),
         desc = duduclaw_core::truncate_chars(&req.description, 200),
         risk = req.risk_level,
@@ -173,10 +177,10 @@ pub async fn notify_install_approvers(home_dir: &Path, db: &UserDb, req: &Instal
         return;
     }
 
-    let http = reqwest::Client::new();
     // A clickable deep link to the unified inbox — `None` when no
     // dashboard base URL is configured/derivable.
-    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Approval, &req.id);
+    let link =
+        crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Approval, &req.id);
     let body = notify_body(req);
     let card = DecisionCard {
         source: DecisionSource::Install,
@@ -185,6 +189,10 @@ pub async fn notify_install_approvers(home_dir: &Path, db: &UserDb, req: &Instal
         link: link.as_deref(),
         no_button_hint: NO_BUTTON_HINT,
     };
+    // Who may approve (and therefore who gets a card) is `approvers_for` +
+    // the user DB's *verified* channel links — unchanged. Only the send loop
+    // below moved into `notify_push` (O5).
+    let mut targets: Vec<(String, String)> = Vec::new();
     for approver in &approvers {
         let channels = match db.verified_channels_for_user(&approver.id) {
             Ok(c) => c,
@@ -194,28 +202,15 @@ pub async fn notify_install_approvers(home_dir: &Path, db: &UserDb, req: &Instal
             }
         };
         for ident in channels {
-            let candidates =
-                crate::config_crypto::channel_dm_token_candidates(home_dir, &ident.channel).await;
-            if candidates.is_empty() {
-                info!(channel = %ident.channel, "install-notify: no bot token configured; skipping");
-                continue;
-            }
-            for token in &candidates {
-                if crate::decision_notify::deliver(
-                    home_dir,
-                    &http,
-                    &ident.channel,
-                    token,
-                    &ident.channel_user_id,
-                    &card,
-                )
-                .await
-                {
-                    break;
-                }
-            }
+            targets.push((ident.channel, ident.channel_user_id));
         }
     }
+    crate::notify_push::push(
+        home_dir,
+        &card,
+        &crate::notify_push::NotifyDest::LinkedUsers { targets },
+    )
+    .await;
 }
 
 /// Notify the requester of their request's FINAL outcome (approved+executed /
@@ -230,7 +225,14 @@ pub async fn notify_requester(home_dir: &Path, db: &UserDb, req: &InstallRequest
     };
     let http = reqwest::Client::new();
     for ident in channels {
-        send_plain_text(home_dir, &http, &ident.channel, &ident.channel_user_id, text).await;
+        send_plain_text(
+            home_dir,
+            &http,
+            &ident.channel,
+            &ident.channel_user_id,
+            text,
+        )
+        .await;
     }
 }
 
@@ -256,7 +258,8 @@ async fn send_plain_text(
     }
     let mut sent = false;
     for token in &candidates {
-        if crate::goal_notify::send_plain_text(home_dir, http, channel, token, chat_id, text).await {
+        if crate::channel_sender::send_plain_text(home_dir, http, channel, token, chat_id, text).await
+        {
             sent = true;
             break;
         }
@@ -295,7 +298,16 @@ pub async fn decide_from_channel(
     if action.source != DecisionSource::Install {
         return None;
     }
-    Some(apply_decision(home_dir, channel, channel_user_id, &action.id, action.approve()).await)
+    Some(
+        apply_decision(
+            home_dir,
+            channel,
+            channel_user_id,
+            &action.id,
+            action.approve(),
+        )
+        .await,
+    )
 }
 
 /// Apply an already-decoded sign-off to `install_requests`. Called by the
@@ -337,7 +349,7 @@ pub(crate) async fn apply_decision(
             return Err(crate::decision_notify::refusal_text(
                 crate::decision_notify::PressAuth::DenyUnknown,
                 "核准",
-            ))
+            ));
         }
         Err(e) => return Err(format!("查詢身分失敗：{e}")),
     };
@@ -359,7 +371,14 @@ pub(crate) async fn apply_decision(
     let decider = format!("{}:{}", user.role, user.id);
     let dept = user.department.as_deref();
     let outcome = match store
-        .decide(request_id, &decider, &user.role.to_string(), dept, approve, "")
+        .decide(
+            request_id,
+            &decider,
+            &user.role.to_string(),
+            dept,
+            approve,
+            "",
+        )
         .await
     {
         Ok(o) => o,
@@ -433,7 +452,10 @@ pub(crate) async fn apply_decision(
                         home_dir,
                         &db,
                         &req,
-                        &format!("⚠️ 您的安裝申請「{}」已同意，但安裝執行失敗：{e}", req.title),
+                        &format!(
+                            "⚠️ 您的安裝申請「{}」已同意，但安裝執行失敗：{e}",
+                            req.title
+                        ),
                     )
                     .await;
                     Ok(format!("已完成簽核，但安裝執行失敗：{e}"))
@@ -551,7 +573,11 @@ pub(crate) fn sanitize_tmp_file_stem(name: &str) -> String {
         .skip_while(|c| *c == '.')
         .take(64)
         .collect();
-    if cleaned.is_empty() { "skill".to_string() } else { cleaned }
+    if cleaned.is_empty() {
+        "skill".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Apply an approved install to disk (skill file / `.mcp.json` entry).
@@ -567,14 +593,25 @@ pub async fn apply_install_request(
 ) -> Result<serde_json::Value, String> {
     match req.kind.as_str() {
         "skill" => {
-            let scope = req.payload.get("scope").and_then(|v| v.as_str()).unwrap_or("");
-            let content = req.payload.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let scope = req
+                .payload
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let content = req
+                .payload
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if scope.is_empty() || content.is_empty() {
                 return Err("request payload missing scope/content".into());
             }
             let scan = crate::skill_lifecycle::security_scanner::scan_skill(content, None);
             if !scan.passed {
-                return Err(format!("re-scan rejected skill: risk {:?}", scan.risk_level));
+                return Err(format!(
+                    "re-scan rejected skill: risk {:?}",
+                    scan.risk_level
+                ));
             }
             let skill_name = content
                 .lines()
@@ -593,13 +630,20 @@ pub async fn apply_install_request(
             std::fs::write(&tmp_file, content).map_err(|e| format!("write temp file: {e}"))?;
             let quarantine = home_dir.join("quarantine");
             let result = if scope == "global" {
-                duduclaw_agent::skill_loader::install_skill_global(&tmp_file, home_dir, &quarantine).await
+                duduclaw_agent::skill_loader::install_skill_global(&tmp_file, home_dir, &quarantine)
+                    .await
             } else if let Some(dept) = scope.strip_prefix("department:") {
                 if !duduclaw_core::is_valid_department(dept) {
                     let _ = std::fs::remove_file(&tmp_file);
                     return Err("invalid department in scope".into());
                 }
-                duduclaw_agent::skill_loader::install_skill_department(&tmp_file, home_dir, dept, &quarantine).await
+                duduclaw_agent::skill_loader::install_skill_department(
+                    &tmp_file,
+                    home_dir,
+                    dept,
+                    &quarantine,
+                )
+                .await
             } else {
                 if !crate::handlers::is_valid_agent_id(scope) {
                     let _ = std::fs::remove_file(&tmp_file);
@@ -613,9 +657,17 @@ pub async fn apply_install_request(
             Ok(json!({ "skill_name": parsed.meta.name, "scope": scope }))
         }
         "mcp" => {
-            use duduclaw_agent::mcp_template::{add_server_to_config, McpServerDef};
-            let agent_id = req.payload.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-            let server_name = req.payload.get("server_name").and_then(|v| v.as_str()).unwrap_or("");
+            use duduclaw_agent::mcp_template::{McpServerDef, add_server_to_config};
+            let agent_id = req
+                .payload
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let server_name = req
+                .payload
+                .get("server_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let def: McpServerDef = req
                 .payload
                 .get("server_def")
@@ -631,7 +683,10 @@ pub async fn apply_install_request(
             }
             let scan = crate::mcp_scan::scan_mcp_server_def(server_name, &def);
             if !scan.passed {
-                return Err(format!("re-scan rejected MCP server: risk {:?}", scan.risk_level));
+                return Err(format!(
+                    "re-scan rejected MCP server: risk {:?}",
+                    scan.risk_level
+                ));
             }
             let agent_dir = home_dir.join("agents").join(agent_id);
             if !agent_dir.is_dir() {
@@ -755,9 +810,12 @@ mod tests {
     async fn resolve_channel_target_prefers_a_recorded_card_over_approver_lookup() {
         let dir = tempfile::tempdir().unwrap();
         let db = UserDb::new(&dir.path().join("auth.db")).unwrap();
-        let admin = db.create_user("admin@x", "Admin", "pw", UserRole::Admin).unwrap();
+        let admin = db
+            .create_user("admin@x", "Admin", "pw", UserRole::Admin)
+            .unwrap();
         // The approver has a linked channel too — the recorded card must still win.
-        db.bind_channel_identity(&admin.id, "telegram", "999", true).unwrap();
+        db.bind_channel_identity(&admin.id, "telegram", "999", true)
+            .unwrap();
 
         let request = req("manager", None, None);
         crate::decision_message_store::record_card_message(
@@ -766,23 +824,39 @@ mod tests {
             &request.id,
             "slack",
             "C123",
-            &crate::decision_card::PushedMessage { edit_chat_id: "C123".into(), message_id: "m1".into() },
+            &crate::decision_card::PushedMessage {
+                edit_chat_id: "C123".into(),
+                message_id: "m1".into(),
+            },
         );
 
         let target = resolve_channel_target(dir.path(), &db, &request).await;
-        assert_eq!(target, Some(("slack".to_string(), "C123".to_string(), Some("m1".to_string()))));
+        assert_eq!(
+            target,
+            Some((
+                "slack".to_string(),
+                "C123".to_string(),
+                Some("m1".to_string())
+            ))
+        );
     }
 
     #[tokio::test]
     async fn resolve_channel_target_falls_back_to_first_approver_channel_when_no_card_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let db = UserDb::new(&dir.path().join("auth.db")).unwrap();
-        let admin = db.create_user("admin@x", "Admin", "pw", UserRole::Admin).unwrap();
-        db.bind_channel_identity(&admin.id, "telegram", "555", true).unwrap();
+        let admin = db
+            .create_user("admin@x", "Admin", "pw", UserRole::Admin)
+            .unwrap();
+        db.bind_channel_identity(&admin.id, "telegram", "555", true)
+            .unwrap();
 
         let request = req("manager", None, None);
         let target = resolve_channel_target(dir.path(), &db, &request).await;
-        assert_eq!(target, Some(("telegram".to_string(), "555".to_string(), None)));
+        assert_eq!(
+            target,
+            Some(("telegram".to_string(), "555".to_string(), None))
+        );
     }
 
     #[tokio::test]
@@ -790,10 +864,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = UserDb::new(&dir.path().join("auth.db")).unwrap();
         // Admin exists (so `approvers_for` isn't empty) but never linked a channel.
-        db.create_user("admin@x", "Admin", "pw", UserRole::Admin).unwrap();
+        db.create_user("admin@x", "Admin", "pw", UserRole::Admin)
+            .unwrap();
 
         let request = req("manager", None, None);
-        assert_eq!(resolve_channel_target(dir.path(), &db, &request).await, None);
+        assert_eq!(
+            resolve_channel_target(dir.path(), &db, &request).await,
+            None
+        );
     }
 
     // ── H1: dashboard collapse summary (`spawn_dashboard_collapse`,
@@ -804,7 +882,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = InstallRequestStore::open(dir.path()).unwrap();
         let id = store
-            .create("skill", "客戶名單整理", "d", "emp", "emp@x", "employee", None, "Low", &json!([]), &json!({}), 3600)
+            .create(
+                "skill",
+                "客戶名單整理",
+                "d",
+                "emp",
+                "emp@x",
+                "employee",
+                None,
+                "Low",
+                &json!([]),
+                &json!({}),
+                3600,
+            )
             .await
             .unwrap();
         let summary = install_collapse_summary(dir.path(), &id).await;
@@ -844,7 +934,9 @@ mod tests {
             "duduclaw:install_approve:", // id-less ⇒ fail-closed
         ] {
             assert!(
-                decide_from_channel(dir.path(), "telegram", "u1", data).await.is_none(),
+                decide_from_channel(dir.path(), "telegram", "u1", data)
+                    .await
+                    .is_none(),
                 "should not claim {data}"
             );
         }
@@ -853,11 +945,18 @@ mod tests {
         // cannot sign off an install.
         for data in [
             "duduclaw:install_approve:r1".to_string(),
-            crate::decision_action::encode(DecisionSource::Install, crate::decision_action::DecisionAct::Approve, "r1"),
+            crate::decision_action::encode(
+                DecisionSource::Install,
+                crate::decision_action::DecisionAct::Approve,
+                "r1",
+            ),
         ] {
             let out = decide_from_channel(dir.path(), "telegram", "u1", &data).await;
             assert!(out.is_some(), "must claim {data}");
-            assert!(out.unwrap().is_err(), "unidentified account must be refused: {data}");
+            assert!(
+                out.unwrap().is_err(),
+                "unidentified account must be refused: {data}"
+            );
         }
         // …and no auth database was conjured as a side effect.
         assert!(!dir.path().join("users.db").exists());

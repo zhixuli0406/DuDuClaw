@@ -148,8 +148,15 @@ fn classify_mcp(name: &str) -> Option<ToolClass> {
         "agent_status" | "list_agents" => ToolClass::Read,
 
         // ── Wiki (shared_wiki_* / wiki_*) ──
-        "wiki_ls" | "wiki_read" | "wiki_stats" | "wiki_graph" | "wiki_trust_audit"
-        | "wiki_trust_history" | "wiki_namespace_status" | "shared_wiki_ls" | "shared_wiki_read"
+        "wiki_ls"
+        | "wiki_read"
+        | "wiki_stats"
+        | "wiki_graph"
+        | "wiki_trust_audit"
+        | "wiki_trust_history"
+        | "wiki_namespace_status"
+        | "shared_wiki_ls"
+        | "shared_wiki_read"
         | "shared_wiki_stats" => ToolClass::Read,
         "wiki_search" | "shared_wiki_search" => ToolClass::Search,
         "wiki_write" | "wiki_dedup" | "wiki_lint" | "wiki_rebuild_fts" | "wiki_share"
@@ -162,18 +169,41 @@ fn classify_mcp(name: &str) -> Option<ToolClass> {
         "skill_list" | "skill_curator_status" | "skill_synthesis_status" | "shared_skill_list" => {
             ToolClass::Read
         }
-        "skill_extract" | "skill_graduate" | "skill_pin" | "skill_from_recording"
-        | "skill_hub_install" | "skill_bank_feedback" | "shared_skill_adopt"
+        "skill_extract"
+        | "skill_graduate"
+        | "skill_pin"
+        | "skill_from_recording"
+        | "skill_hub_install"
+        | "skill_bank_feedback"
+        | "shared_skill_adopt"
         | "shared_skill_share" => ToolClass::Write,
         "skill_security_scan" | "skill_synthesis_run" => ToolClass::Exec,
 
         // ── Google Workspace / Notion / GitHub external APIs ──
-        "gmail_create_draft" | "gmail_read" | "gmail_search" | "calendar_create_event"
-        | "calendar_list_events" | "drive_read" | "drive_search" | "docs_append" | "docs_read"
-        | "sheets_append" | "sheets_read" | "slides_read" | "forms_get"
-        | "forms_list_responses" | "google_status" | "notion_page_append" | "notion_page_read"
-        | "notion_search" | "notion_status" | "github_issue_comment" | "github_issue_read"
-        | "github_pr_read" | "github_search_issues" | "github_status" => ToolClass::Net,
+        "gmail_create_draft"
+        | "gmail_read"
+        | "gmail_search"
+        | "calendar_create_event"
+        | "calendar_list_events"
+        | "drive_read"
+        | "drive_search"
+        | "docs_append"
+        | "docs_read"
+        | "sheets_append"
+        | "sheets_read"
+        | "slides_read"
+        | "forms_get"
+        | "forms_list_responses"
+        | "google_status"
+        | "notion_page_append"
+        | "notion_page_read"
+        | "notion_search"
+        | "notion_status"
+        | "github_issue_comment"
+        | "github_issue_read"
+        | "github_pr_read"
+        | "github_search_issues"
+        | "github_status" => ToolClass::Net,
 
         // ── Net (web / channel send / OS notify) ──
         "web_extract" | "web_fetch_cached" | "web_search" | "send_message" | "send_photo"
@@ -192,27 +222,61 @@ fn classify_mcp(name: &str) -> Option<ToolClass> {
         "run_cron_task" => ToolClass::Exec,
 
         // ── Misc read-only status/query tools ──
-        "audit_trail_query" | "autopilot_list" | "channel_config_list" | "channel_status"
-        | "cost_agents" | "cost_multi_vs_single" | "cost_recent"
-        | "cost_summary" | "cost_users" | "evolution_status" | "fork_cost" | "diff_branches"
-        | "inspect_branches" | "hardware_info" | "inference_status" | "llamafile_list"
-        | "model_list" | "model_recommend" | "os_calendar_today" | "os_frontmost"
-        | "os_watch_status" | "reliability_summary" | "session_restore_context"
-        | "user_code_profile" | "user_profile_get" => ToolClass::Read,
+        "audit_trail_query"
+        | "autopilot_list"
+        | "channel_config_list"
+        | "channel_status"
+        | "cost_agents"
+        | "cost_multi_vs_single"
+        | "cost_recent"
+        | "cost_summary"
+        | "cost_users"
+        | "evolution_status"
+        | "fork_cost"
+        | "diff_branches"
+        | "inspect_branches"
+        | "hardware_info"
+        | "inference_status"
+        | "llamafile_list"
+        | "model_list"
+        | "model_recommend"
+        | "os_calendar_today"
+        | "os_frontmost"
+        | "os_watch_status"
+        | "reliability_summary"
+        | "session_restore_context"
+        | "user_code_profile"
+        | "user_profile_get" => ToolClass::Read,
         "identity_resolve" | "model_search" | "os_spotlight_search" => ToolClass::Search,
 
         // ── Config/state mutation ──
-        "channel_config" | "evolution_toggle" | "inference_mode" | "jitrl_feedback"
-        | "log_mood" | "pairing_manage" | "submit_feedback" | "user_profile_record"
-        | "terminate_branch" | "merge_or_select" | "canvas_clear" | "canvas_push" => {
-            ToolClass::Write
-        }
+        "channel_config"
+        | "evolution_toggle"
+        | "inference_mode"
+        | "pairing_manage"
+        | "submit_feedback"
+        | "user_profile_record"
+        | "terminate_branch"
+        | "merge_or_select"
+        | "canvas_clear"
+        | "canvas_push" => ToolClass::Write,
 
         // ── Local execution / model lifecycle / media ──
-        "execute_program" | "model_download" | "model_load" | "model_unload"
-        | "llamafile_start" | "llamafile_stop" | "office_script" | "os_open" | "route_query"
-        | "synthesize_speech" | "transcribe_audio" | "fork_run"
-        | "browser_record_start" | "browser_record_stop" | "desktop_record_start"
+        "execute_program"
+        | "model_download"
+        | "model_load"
+        | "model_unload"
+        | "llamafile_start"
+        | "llamafile_stop"
+        | "office_script"
+        | "os_open"
+        | "route_query"
+        | "synthesize_speech"
+        | "transcribe_audio"
+        | "fork_run"
+        | "browser_record_start"
+        | "browser_record_stop"
+        | "desktop_record_start"
         | "desktop_record_stop" => ToolClass::Exec,
 
         _ => return None,
@@ -256,57 +320,210 @@ mod tests {
     // every name below asserts a *specific* non-`Other` class so a future
     // accidental mapping change is caught.
     const ALL_MCP_TOOL_NAMES: &[&str] = &[
-        "activity_list", "activity_post", "agent_remove", "agent_status", "agent_update",
-        "agent_update_soul", "audit_trail_query", "autopilot_list", "browser_record_start",
-        "browser_record_stop", "calendar_create_event", "calendar_list_events",
-        "cancel_reminder", "canvas_clear", "canvas_push", "capability_request",
-        "channel_config", "channel_config_list", "channel_status", "check_responses",
-        "code_map", "computer_click", "computer_key", "computer_screenshot",
-        "computer_scroll", "computer_session_start", "computer_session_stop",
-        "computer_type", "cost_agents", "cost_multi_vs_single", "cost_recent",
-        "cost_summary", "cost_users", "create_agent", "create_reminder", "create_task",
-        "decision_list", "decision_resolve", "delete_cron_task", "desktop_record_start",
-        "desktop_record_stop", "diff_branches", "docs_append", "docs_read", "drive_read",
-        "drive_search", "evolution_status", "evolution_toggle", "execute_program",
-        "fork_cost", "fork_run", "forms_get", "forms_list_responses",
-        "github_issue_comment", "github_issue_read", "github_pr_read",
-        "github_search_issues", "github_status", "gmail_create_draft", "gmail_read",
-        "gmail_search", "goals_create", "goals_list", "google_status", "gtasks_complete",
-        "gtasks_create", "gtasks_list", "gtasks_lists", "hardware_info", "identity_resolve",
-        "inference_mode", "inference_status", "inspect_branches", "jitrl_feedback",
-        "list_agents", "list_cron_tasks", "list_reminders", "llamafile_list",
-        "llamafile_start", "llamafile_stop", "log_mood", "memory_alias_add",
-        "memory_alias_list", "memory_consolidation_status", "memory_episodic_pressure",
-        "memory_fetch_batch", "memory_get_at", "memory_get_history", "memory_improve",
-        "memory_invalidate_by_origin", "memory_read", "memory_search",
-        "memory_search_by_layer", "memory_store", "memory_successful_conversations",
-        "merge_or_select", "model_download", "model_list", "model_load", "model_recommend",
-        "model_search", "model_unload", "notion_page_append", "notion_page_read",
-        "notion_search", "notion_status", "odoo_connect", "odoo_crm_create_lead",
-        "odoo_crm_leads", "odoo_crm_update_stage", "odoo_execute", "odoo_inventory_check",
-        "odoo_inventory_products", "odoo_invoice_list", "odoo_partner_search",
-        "odoo_payment_status", "odoo_report", "odoo_sale_confirm",
-        "odoo_sale_create_quotation", "odoo_sale_orders", "odoo_schema_fields",
-        "odoo_search", "odoo_status", "office_script", "os_calendar_today",
-        "os_frontmost", "os_notify", "os_open", "os_spotlight_search", "os_watch_status",
-        "pairing_manage", "pause_cron_task", "plan_get", "plan_start", "plan_update_step",
-        "reliability_summary", "route_query", "run_cron_task", "schedule_task",
-        "send_message", "send_photo", "send_sticker", "send_to_agent",
-        "session_restore_context", "shared_skill_adopt", "shared_skill_list",
-        "shared_skill_share", "shared_wiki_delete", "shared_wiki_lint", "shared_wiki_ls",
-        "shared_wiki_read", "shared_wiki_search", "shared_wiki_stats", "shared_wiki_write",
-        "sheets_append", "sheets_read", "skill_bank_feedback", "skill_bank_search",
-        "skill_curator_status", "skill_extract", "skill_from_recording", "skill_gaps",
-        "skill_graduate", "skill_hub_install", "skill_list", "skill_pin", "skill_search",
-        "skill_security_scan", "skill_synthesis_run", "skill_synthesis_status",
-        "slides_read", "spawn_agent", "spawn_ephemeral", "submit_feedback",
-        "synthesize_speech", "task_status", "tasks_block", "tasks_claim", "tasks_complete",
-        "tasks_create", "tasks_list", "tasks_renew", "tasks_update", "terminate_branch",
-        "transcribe_audio", "update_cron_task", "user_code_profile", "user_profile_get",
-        "user_profile_record", "web_extract", "web_fetch_cached", "web_search",
-        "wiki_dedup", "wiki_export", "wiki_graph", "wiki_lint", "wiki_ls",
-        "wiki_namespace_status", "wiki_read", "wiki_rebuild_fts", "wiki_search",
-        "wiki_share", "wiki_stats", "wiki_trust_audit", "wiki_trust_history", "wiki_write",
+        "activity_list",
+        "activity_post",
+        "agent_remove",
+        "agent_status",
+        "agent_update",
+        "agent_update_soul",
+        "audit_trail_query",
+        "autopilot_list",
+        "browser_record_start",
+        "browser_record_stop",
+        "calendar_create_event",
+        "calendar_list_events",
+        "cancel_reminder",
+        "canvas_clear",
+        "canvas_push",
+        "capability_request",
+        "channel_config",
+        "channel_config_list",
+        "channel_status",
+        "check_responses",
+        "code_map",
+        "computer_click",
+        "computer_key",
+        "computer_screenshot",
+        "computer_scroll",
+        "computer_session_start",
+        "computer_session_stop",
+        "computer_type",
+        "cost_agents",
+        "cost_multi_vs_single",
+        "cost_recent",
+        "cost_summary",
+        "cost_users",
+        "create_agent",
+        "create_reminder",
+        "create_task",
+        "decision_list",
+        "decision_resolve",
+        "delete_cron_task",
+        "desktop_record_start",
+        "desktop_record_stop",
+        "diff_branches",
+        "docs_append",
+        "docs_read",
+        "drive_read",
+        "drive_search",
+        "evolution_status",
+        "evolution_toggle",
+        "execute_program",
+        "fork_cost",
+        "fork_run",
+        "forms_get",
+        "forms_list_responses",
+        "github_issue_comment",
+        "github_issue_read",
+        "github_pr_read",
+        "github_search_issues",
+        "github_status",
+        "gmail_create_draft",
+        "gmail_read",
+        "gmail_search",
+        "goals_create",
+        "goals_list",
+        "google_status",
+        "gtasks_complete",
+        "gtasks_create",
+        "gtasks_list",
+        "gtasks_lists",
+        "hardware_info",
+        "identity_resolve",
+        "inference_mode",
+        "inference_status",
+        "inspect_branches",
+        "list_agents",
+        "list_cron_tasks",
+        "list_reminders",
+        "llamafile_list",
+        "llamafile_start",
+        "llamafile_stop",
+        "memory_alias_add",
+        "memory_alias_list",
+        "memory_consolidation_status",
+        "memory_episodic_pressure",
+        "memory_fetch_batch",
+        "memory_get_at",
+        "memory_get_history",
+        "memory_improve",
+        "memory_invalidate_by_origin",
+        "memory_read",
+        "memory_search",
+        "memory_search_by_layer",
+        "memory_store",
+        "memory_successful_conversations",
+        "merge_or_select",
+        "model_download",
+        "model_list",
+        "model_load",
+        "model_recommend",
+        "model_search",
+        "model_unload",
+        "notion_page_append",
+        "notion_page_read",
+        "notion_search",
+        "notion_status",
+        "odoo_connect",
+        "odoo_crm_create_lead",
+        "odoo_crm_leads",
+        "odoo_crm_update_stage",
+        "odoo_execute",
+        "odoo_inventory_check",
+        "odoo_inventory_products",
+        "odoo_invoice_list",
+        "odoo_partner_search",
+        "odoo_payment_status",
+        "odoo_report",
+        "odoo_sale_confirm",
+        "odoo_sale_create_quotation",
+        "odoo_sale_orders",
+        "odoo_schema_fields",
+        "odoo_search",
+        "odoo_status",
+        "office_script",
+        "os_calendar_today",
+        "os_frontmost",
+        "os_notify",
+        "os_open",
+        "os_spotlight_search",
+        "os_watch_status",
+        "pairing_manage",
+        "pause_cron_task",
+        "plan_get",
+        "plan_start",
+        "plan_update_step",
+        "reliability_summary",
+        "route_query",
+        "run_cron_task",
+        "schedule_task",
+        "send_message",
+        "send_photo",
+        "send_sticker",
+        "send_to_agent",
+        "session_restore_context",
+        "shared_skill_adopt",
+        "shared_skill_list",
+        "shared_skill_share",
+        "shared_wiki_delete",
+        "shared_wiki_lint",
+        "shared_wiki_ls",
+        "shared_wiki_read",
+        "shared_wiki_search",
+        "shared_wiki_stats",
+        "shared_wiki_write",
+        "sheets_append",
+        "sheets_read",
+        "skill_bank_feedback",
+        "skill_bank_search",
+        "skill_curator_status",
+        "skill_extract",
+        "skill_from_recording",
+        "skill_gaps",
+        "skill_graduate",
+        "skill_hub_install",
+        "skill_list",
+        "skill_pin",
+        "skill_search",
+        "skill_security_scan",
+        "skill_synthesis_run",
+        "skill_synthesis_status",
+        "slides_read",
+        "spawn_agent",
+        "spawn_ephemeral",
+        "submit_feedback",
+        "synthesize_speech",
+        "task_status",
+        "tasks_block",
+        "tasks_claim",
+        "tasks_complete",
+        "tasks_create",
+        "tasks_list",
+        "tasks_renew",
+        "tasks_update",
+        "terminate_branch",
+        "transcribe_audio",
+        "update_cron_task",
+        "user_code_profile",
+        "user_profile_get",
+        "user_profile_record",
+        "web_extract",
+        "web_fetch_cached",
+        "web_search",
+        "wiki_dedup",
+        "wiki_export",
+        "wiki_graph",
+        "wiki_lint",
+        "wiki_ls",
+        "wiki_namespace_status",
+        "wiki_read",
+        "wiki_rebuild_fts",
+        "wiki_search",
+        "wiki_share",
+        "wiki_stats",
+        "wiki_trust_audit",
+        "wiki_trust_history",
+        "wiki_write",
         // Tools deliberately left unmapped today (no single obvious class,
         // low-traffic in the goal loop dispatch path) — asserted `Other`
         // explicitly below so a future accidental mapping isn't silently
@@ -374,16 +591,46 @@ mod tests {
 
     #[test]
     fn classify_native_claude_code_tools() {
-        assert_eq!(ToolClass::classify(RuntimeType::Claude, "Read"), ToolClass::Read);
-        assert_eq!(ToolClass::classify(RuntimeType::Claude, "Write"), ToolClass::Write);
-        assert_eq!(ToolClass::classify(RuntimeType::Claude, "Edit"), ToolClass::Write);
-        assert_eq!(ToolClass::classify(RuntimeType::Claude, "Grep"), ToolClass::Search);
-        assert_eq!(ToolClass::classify(RuntimeType::Claude, "Glob"), ToolClass::Search);
-        assert_eq!(ToolClass::classify(RuntimeType::Claude, "Bash"), ToolClass::Exec);
-        assert_eq!(ToolClass::classify(RuntimeType::Claude, "WebFetch"), ToolClass::Net);
-        assert_eq!(ToolClass::classify(RuntimeType::Claude, "WebSearch"), ToolClass::Net);
-        assert_eq!(ToolClass::classify(RuntimeType::Claude, "Task"), ToolClass::Delegate);
-        assert_eq!(ToolClass::classify(RuntimeType::Claude, "TodoWrite"), ToolClass::TaskBoard);
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Claude, "Read"),
+            ToolClass::Read
+        );
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Claude, "Write"),
+            ToolClass::Write
+        );
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Claude, "Edit"),
+            ToolClass::Write
+        );
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Claude, "Grep"),
+            ToolClass::Search
+        );
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Claude, "Glob"),
+            ToolClass::Search
+        );
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Claude, "Bash"),
+            ToolClass::Exec
+        );
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Claude, "WebFetch"),
+            ToolClass::Net
+        );
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Claude, "WebSearch"),
+            ToolClass::Net
+        );
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Claude, "Task"),
+            ToolClass::Delegate
+        );
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Claude, "TodoWrite"),
+            ToolClass::TaskBoard
+        );
     }
 
     #[test]
@@ -391,8 +638,14 @@ mod tests {
         // Claude's Bash, codex's shell, gemini's run_shell_command are "the
         // same thing" per the design rationale — must land in the same class
         // regardless of which runtime produced the name.
-        assert_eq!(ToolClass::classify(RuntimeType::Claude, "Bash"), ToolClass::Exec);
-        assert_eq!(ToolClass::classify(RuntimeType::Codex, "shell"), ToolClass::Exec);
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Claude, "Bash"),
+            ToolClass::Exec
+        );
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Codex, "shell"),
+            ToolClass::Exec
+        );
         assert_eq!(
             ToolClass::classify(RuntimeType::Gemini, "run_shell_command"),
             ToolClass::Exec
@@ -405,7 +658,10 @@ mod tests {
             ToolClass::classify(RuntimeType::Claude, "totally_unknown_tool_xyz"),
             ToolClass::Other
         );
-        assert_eq!(ToolClass::classify(RuntimeType::Codex, ""), ToolClass::Other);
+        assert_eq!(
+            ToolClass::classify(RuntimeType::Codex, ""),
+            ToolClass::Other
+        );
     }
 
     #[test]
@@ -415,10 +671,21 @@ mod tests {
 
     #[test]
     fn other_ratio_threshold_below_and_above() {
-        let below = vec![ToolClass::Other, ToolClass::Read, ToolClass::Read, ToolClass::Read, ToolClass::Read];
+        let below = vec![
+            ToolClass::Other,
+            ToolClass::Read,
+            ToolClass::Read,
+            ToolClass::Read,
+            ToolClass::Read,
+        ];
         assert!(!other_ratio_exceeds_threshold(&below)); // 1/5 = 0.20, not > 0.20
 
-        let above = vec![ToolClass::Other, ToolClass::Other, ToolClass::Read, ToolClass::Read];
+        let above = vec![
+            ToolClass::Other,
+            ToolClass::Other,
+            ToolClass::Read,
+            ToolClass::Read,
+        ];
         assert!(other_ratio_exceeds_threshold(&above)); // 2/4 = 0.50
     }
 

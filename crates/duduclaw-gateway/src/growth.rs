@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{NaiveDate, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::info;
@@ -93,7 +93,8 @@ pub struct GrowthFacts {
 impl GrowthFacts {
     /// Base XP from countable facts (excludes one-time achievement bonuses).
     pub fn base_xp(&self) -> u64 {
-        self.tasks_completed.saturating_mul(XP_PER_TASK)
+        self.tasks_completed
+            .saturating_mul(XP_PER_TASK)
             .saturating_add(self.skills_acquired.saturating_mul(XP_PER_SKILL))
             .saturating_add(self.knowledge_pages.saturating_mul(XP_PER_KNOWLEDGE_PAGE))
             .saturating_add(self.routines_completed.saturating_mul(XP_PER_ROUTINE))
@@ -343,7 +344,11 @@ pub fn compute_snapshot(facts: &GrowthFacts) -> GrowthSnapshot {
             unlocked,
             // Cap displayed progress at the denominator so the bar never
             // exceeds 100% (e.g. 250 completed tasks vs. a 100 threshold).
-            progress_current: if denom > 0 { current.min(denom) } else { current },
+            progress_current: if denom > 0 {
+                current.min(denom)
+            } else {
+                current
+            },
             progress_denominator: denom,
             xp_reward: def.xp_reward,
             available,
@@ -437,7 +442,12 @@ impl GrowthStore {
     /// Record the first-observed unlock of an achievement. Idempotent —
     /// `INSERT OR IGNORE` keeps the earliest timestamp. Returns true if this
     /// call was the one that inserted (i.e. a *newly* unlocked achievement).
-    pub async fn record_unlock(&self, id: &str, xp_awarded: u64, now: &str) -> Result<bool, String> {
+    pub async fn record_unlock(
+        &self,
+        id: &str,
+        xp_awarded: u64,
+        now: &str,
+    ) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let changed = conn
             .execute(
@@ -560,7 +570,11 @@ impl GrowthStore {
         let snaps = self.inbox_snapshots().await?;
         let parsed: Vec<(NaiveDate, i64)> = snaps
             .iter()
-            .filter_map(|(d, c)| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok().map(|nd| (nd, *c)))
+            .filter_map(|(d, c)| {
+                NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                    .ok()
+                    .map(|nd| (nd, *c))
+            })
             .collect();
         Ok(inbox_zero_streak(&parsed))
     }
@@ -581,7 +595,9 @@ pub async fn snapshot_with_store(
         }
     }
     let facts_json = serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string());
-    let _ = store.save_snapshot(snap.xp, snap.level, &facts_json, &now).await;
+    let _ = store
+        .save_snapshot(snap.xp, snap.level, &facts_json, &now)
+        .await;
     let times = store.unlock_times().await?;
     Ok((snap, times))
 }
@@ -655,7 +671,10 @@ mod tests {
     // ── Achievement judgments (≥3) ──────────────────────────
 
     fn find<'a>(snap: &'a GrowthSnapshot, id: &str) -> &'a AchievementState {
-        snap.achievements.iter().find(|a| a.id == id).expect("achievement present")
+        snap.achievements
+            .iter()
+            .find(|a| a.id == id)
+            .expect("achievement present")
     }
 
     #[test]
@@ -703,7 +722,11 @@ mod tests {
         let snap = compute_snapshot(&GrowthFacts::default());
         for a in &snap.achievements {
             assert!(a.available, "{} must be available (no deferred left)", a.id);
-            assert!(a.unavailable_reason.is_none(), "{} carries no gap reason", a.id);
+            assert!(
+                a.unavailable_reason.is_none(),
+                "{} carries no gap reason",
+                a.id
+            );
         }
     }
 
@@ -803,11 +826,23 @@ mod tests {
         let store = GrowthStore::open_in_memory().unwrap();
         // Day 1 recorded with 5 actionable, then re-recorded as 0 (cleared) →
         // MIN keeps 0.
-        store.record_inbox_snapshot("2026-07-09", 5, "2026-07-09T01:00:00+00:00").await.unwrap();
-        store.record_inbox_snapshot("2026-07-09", 0, "2026-07-09T20:00:00+00:00").await.unwrap();
-        store.record_inbox_snapshot("2026-07-10", 0, "2026-07-10T09:00:00+00:00").await.unwrap();
+        store
+            .record_inbox_snapshot("2026-07-09", 5, "2026-07-09T01:00:00+00:00")
+            .await
+            .unwrap();
+        store
+            .record_inbox_snapshot("2026-07-09", 0, "2026-07-09T20:00:00+00:00")
+            .await
+            .unwrap();
+        store
+            .record_inbox_snapshot("2026-07-10", 0, "2026-07-10T09:00:00+00:00")
+            .await
+            .unwrap();
         // A later same-day re-record with a HIGHER count must not overwrite the min.
-        store.record_inbox_snapshot("2026-07-10", 4, "2026-07-10T23:00:00+00:00").await.unwrap();
+        store
+            .record_inbox_snapshot("2026-07-10", 4, "2026-07-10T23:00:00+00:00")
+            .await
+            .unwrap();
         let snaps = store.inbox_snapshots().await.unwrap();
         let map: HashMap<String, i64> = snaps.into_iter().collect();
         assert_eq!(map.get("2026-07-09"), Some(&0));
@@ -832,9 +867,19 @@ mod tests {
         let store = GrowthStore::open_in_memory().unwrap();
         let t1 = "2026-07-10T00:00:00+00:00";
         let t2 = "2026-07-11T00:00:00+00:00";
-        assert!(store.record_unlock("first_task_done", 20, t1).await.unwrap());
+        assert!(
+            store
+                .record_unlock("first_task_done", 20, t1)
+                .await
+                .unwrap()
+        );
         // Second record keeps the earliest timestamp and reports "not new".
-        assert!(!store.record_unlock("first_task_done", 20, t2).await.unwrap());
+        assert!(
+            !store
+                .record_unlock("first_task_done", 20, t2)
+                .await
+                .unwrap()
+        );
         let times = store.unlock_times().await.unwrap();
         assert_eq!(times.get("first_task_done").map(String::as_str), Some(t1));
     }
@@ -842,11 +887,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn snapshot_with_store_records_and_merges_unlocks() {
         let store = GrowthStore::open_in_memory().unwrap();
-        let (snap, times) = snapshot_with_store(&store, &facts(1, 0, 0, 0)).await.unwrap();
+        let (snap, times) = snapshot_with_store(&store, &facts(1, 0, 0, 0))
+            .await
+            .unwrap();
         assert!(find(&snap, "first_task_done").unlocked);
         assert!(times.contains_key("first_task_done"));
         // Re-running with the same facts is stable and does not duplicate.
-        let (snap2, times2) = snapshot_with_store(&store, &facts(1, 0, 0, 0)).await.unwrap();
+        let (snap2, times2) = snapshot_with_store(&store, &facts(1, 0, 0, 0))
+            .await
+            .unwrap();
         assert_eq!(snap, snap2);
         assert_eq!(times.len(), times2.len());
     }
@@ -854,13 +903,23 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn daily_report_cache_roundtrips() {
         let store = GrowthStore::open_in_memory().unwrap();
-        assert!(store.get_daily_report("2026-07-09").await.unwrap().is_none());
+        assert!(
+            store
+                .get_daily_report("2026-07-09")
+                .await
+                .unwrap()
+                .is_none()
+        );
         store
             .put_daily_report("2026-07-09", r#"{"tasks":3}"#, "2026-07-10T00:00:00+00:00")
             .await
             .unwrap();
         assert_eq!(
-            store.get_daily_report("2026-07-09").await.unwrap().as_deref(),
+            store
+                .get_daily_report("2026-07-09")
+                .await
+                .unwrap()
+                .as_deref(),
             Some(r#"{"tasks":3}"#)
         );
     }

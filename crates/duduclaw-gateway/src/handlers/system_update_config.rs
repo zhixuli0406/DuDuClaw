@@ -1,0 +1,916 @@
+//! Split out of the pre-split `handlers.rs` (P12b). Pure movement.
+
+#[allow(unused_imports)]
+use super::*;
+
+impl MethodHandler {
+    // ── System Config Update ─────────────────────────────────
+
+    /// Update system-level config.toml fields (whitelist only).
+    ///
+    /// Only allows safe, non-sensitive fields: `log_level`, `rotation_strategy`.
+    /// Uses atomic write (temp + rename) and never touches token/key fields.
+    pub(crate) async fn handle_system_update_config(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+        let mut changes: Vec<String> = Vec::new();
+        // Cleaned remote-access allowlist to hot-apply AFTER a successful write
+        // (Some(..) iff the payload carried `allowed_origins`).
+        let mut applied_origins: Option<Vec<String>> = None;
+
+        // ── log_level ──
+        if let Some(v) = params.get("log_level").and_then(|v| v.as_str()) {
+            match v {
+                "trace" | "debug" | "info" | "warn" | "error" => {
+                    // `[general] log_level` is the key the CLI actually reads
+                    // at startup (`read_log_level_from_config`, precedence
+                    // RUST_LOG → config → default). Until 2026-09-06 this
+                    // wrote `[logging] level`, which nothing reads — the
+                    // dashboard reported success and the level never
+                    // changed.
+                    let general = table
+                        .entry("general")
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut();
+                    if let Some(general) = general {
+                        general.insert("log_level".into(), toml::Value::String(v.into()));
+                        changes.push(format!("general.log_level = \"{v}\""));
+                    }
+                }
+                _ => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Invalid log_level '{v}'. Valid: trace, debug, info, warn, error"),
+                    );
+                }
+            }
+        }
+
+        // ── rotation_strategy ──
+        if let Some(v) = params.get("rotation_strategy").and_then(|v| v.as_str()) {
+            match v {
+                "priority" | "round_robin" | "least_cost" | "failover" => {
+                    let rotation = table
+                        .entry("rotation")
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut();
+                    if let Some(rotation) = rotation {
+                        rotation.insert("strategy".into(), toml::Value::String(v.into()));
+                        changes.push(format!("rotation.strategy = \"{v}\""));
+                    }
+                }
+                _ => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!(
+                            "Invalid rotation_strategy '{v}'. Valid: priority, round_robin, least_cost, failover"
+                        ),
+                    );
+                }
+            }
+        }
+
+        // ── auto_update (Pro only) ──
+        if let Some(v) = params.get("auto_update").and_then(|v| v.as_bool()) {
+            let gateway = table
+                .entry("gateway")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(gateway) = gateway {
+                gateway.insert("auto_update".into(), toml::Value::Boolean(v));
+                changes.push(format!("gateway.auto_update = {v}"));
+            }
+        }
+
+        // ── G.1 [gateway] bind / port / auth_token (restart required) ──
+        // bind/port/auth_token change the listening socket + admin token, which
+        // are read once at gateway start — we persist + flag, never hot-apply.
+        {
+            let has_gw = ["bind", "port", "auth_token"]
+                .iter()
+                .any(|k| params.get(*k).is_some());
+            if has_gw {
+                let gateway = table
+                    .entry("gateway")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                if let Some(v) = params.get("bind").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    // Fail-closed: only a literal IP is accepted (127.0.0.1 /
+                    // 0.0.0.0 / custom). Rejects hostnames + injection strings.
+                    if !is_valid_bind_addr(v) {
+                        return WsFrame::error_response(
+                            "",
+                            "gateway.bind must be a valid IP address (e.g. 127.0.0.1 or 0.0.0.0)",
+                        );
+                    }
+                    gateway.insert("bind".into(), toml::Value::String(v.into()));
+                    changes.push(format!("gateway.bind = \"{v}\" (restart required)"));
+                }
+                if let Some(v) = params.get("port").and_then(|v| v.as_u64()) {
+                    if v == 0 || v > 65535 {
+                        return WsFrame::error_response("", "gateway.port must be 1-65535");
+                    }
+                    gateway.insert("port".into(), toml::Value::Integer(v as i64));
+                    changes.push(format!("gateway.port = {v} (restart required)"));
+                }
+                if let Some(v) = params.get("auth_token").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    // auth_token is the dashboard admin token — encrypt at rest.
+                    gateway.remove("auth_token");
+                    if v.is_empty() {
+                        gateway.remove("auth_token_enc");
+                        changes.push("gateway.auth_token cleared (restart required)".into());
+                    } else if v == SECRET_MASK_SET {
+                        // untouched — leave existing value
+                    } else if let Some(enc) = crate::config_crypto::encrypt_value(v, &self.home_dir)
+                    {
+                        gateway.insert("auth_token_enc".into(), toml::Value::String(enc));
+                        changes.push("gateway.auth_token = [ENCRYPTED] (restart required)".into());
+                    } else {
+                        return WsFrame::error_response("", "Failed to encrypt gateway.auth_token");
+                    }
+                }
+            }
+        }
+
+        // ── G.1b [gateway] allowed_origins (remote-access allowlist, hot-applied) ──
+        // Array of remote dashboard origins (host / host:port / full URL). Each
+        // entry is cleaned via the gateway's normalize step (scheme + trailing
+        // slash stripped, empties dropped); the cleaned list is persisted and,
+        // on a successful write, hot-applied via `set_allowed_origins` (which
+        // re-merges the DUDUCLAW_ALLOWED_ORIGINS env) — no restart needed.
+        if let Some(arr) = params.get("allowed_origins").and_then(|v| v.as_array()) {
+            let cleaned: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(crate::server::normalize_origin_entry)
+                .collect();
+            let gateway = table
+                .entry("gateway")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            let toml_arr: Vec<toml::Value> = cleaned
+                .iter()
+                .map(|s| toml::Value::String(s.clone()))
+                .collect();
+            gateway.insert("allowed_origins".into(), toml::Value::Array(toml_arr));
+            changes.push(format!(
+                "gateway.allowed_origins = {} entr{}",
+                cleaned.len(),
+                if cleaned.len() == 1 { "y" } else { "ies" }
+            ));
+            applied_origins = Some(cleaned);
+        }
+
+        // ── G.2 [rotation] health_check_interval_seconds / cooldown_after_rate_limit_seconds ──
+        {
+            let has_rot = [
+                "health_check_interval_seconds",
+                "cooldown_after_rate_limit_seconds",
+            ]
+            .iter()
+            .any(|k| params.get(*k).is_some());
+            if has_rot {
+                let rotation = table
+                    .entry("rotation")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                for key in &[
+                    "health_check_interval_seconds",
+                    "cooldown_after_rate_limit_seconds",
+                ] {
+                    if let Some(v) = params.get(*key).and_then(|v| v.as_u64()) {
+                        if v == 0 || v > 86400 {
+                            return WsFrame::error_response(
+                                "",
+                                &format!("rotation.{key} must be 1-86400"),
+                            );
+                        }
+                        rotation.insert((*key).into(), toml::Value::Integer(v as i64));
+                        changes.push(format!("rotation.{key} = {v}"));
+                    }
+                }
+            }
+        }
+
+        // ── G.3 [general] name / default_agent / inference_mode / default_language ──
+        {
+            let has_gen = [
+                "name",
+                "default_agent",
+                "inference_mode",
+                "default_language",
+            ]
+            .iter()
+            .any(|k| params.get(*k).is_some());
+            if has_gen {
+                let general = table
+                    .entry("general")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                // Gateway display name = the mDNS instance name shown in the
+                // desktop picker. Empty clears it (falls back to hostname).
+                if let Some(v) = params.get("name").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    if v.len() > 64 {
+                        return WsFrame::error_response("", "general.name must be ≤ 64 chars");
+                    }
+                    if v.is_empty() {
+                        general.remove("name");
+                        changes.push("general.name cleared".into());
+                    } else {
+                        general.insert("name".into(), toml::Value::String(v.into()));
+                        changes.push(format!("general.name = \"{v}\""));
+                    }
+                }
+                if let Some(v) = params.get("default_agent").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    if !v.is_empty() && !is_valid_agent_id(v) {
+                        return WsFrame::error_response("", "Invalid default_agent id");
+                    }
+                    general.insert("default_agent".into(), toml::Value::String(v.into()));
+                    changes.push(format!("general.default_agent = \"{v}\""));
+                }
+                if let Some(v) = params.get("inference_mode").and_then(|v| v.as_str()) {
+                    match v {
+                        "local" | "claude" | "hybrid" => {
+                            general.insert("inference_mode".into(), toml::Value::String(v.into()));
+                            changes.push(format!("general.inference_mode = \"{v}\""));
+                        }
+                        _ => {
+                            return WsFrame::error_response(
+                                "",
+                                "Invalid inference_mode. Valid: local, claude, hybrid",
+                            );
+                        }
+                    }
+                }
+                // WP: global default reply language. Empty string clears it
+                // (agent reverts to "follow the user's input language" — the
+                // pre-existing behaviour). Not an enum: any BCP-47-ish tag is
+                // accepted so operators aren't blocked on a code the
+                // dashboard dropdown hasn't been updated to offer yet; the
+                // prompt-injection side (`prompt_identity::language_instruction`)
+                // degrades gracefully to the raw code for unrecognized values.
+                if let Some(v) = params.get("default_language").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    if v.is_empty() {
+                        general.remove("default_language");
+                        changes.push("general.default_language cleared".into());
+                    } else {
+                        general.insert("default_language".into(), toml::Value::String(v.into()));
+                        changes.push(format!("general.default_language = \"{v}\""));
+                    }
+                }
+            }
+        }
+
+        // ── G.3b [server] mdns_advertise (LAN discovery broadcast, restart required) ──
+        // Read once at gateway start (server.rs) — persist + flag, never hot-apply.
+        if let Some(v) = params.get("mdns_advertise").and_then(|v| v.as_bool()) {
+            let server = table
+                .entry("server")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            server.insert("mdns_advertise".into(), toml::Value::Boolean(v));
+            changes.push(format!("server.mdns_advertise = {v} (restart required)"));
+        }
+
+        // ── G.3c [skills] gap_digest_enabled (daily skill-gap digest, hot-applied) ──
+        // Re-read from config.toml on every digest tick (skill_gap_digest.rs),
+        // so persisting is enough — no restart, no hot-reload plumbing.
+        if let Some(v) = params.get("gap_digest_enabled").and_then(|v| v.as_bool()) {
+            let skills = table
+                .entry("skills")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(skills) = skills {
+                skills.insert("gap_digest_enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("skills.gap_digest_enabled = {v}"));
+            } else {
+                return WsFrame::error_response("", "Invalid [skills] section in config.toml");
+            }
+        }
+
+        // ── [memory] novelty_gate (B1 write-time near-duplicate rejection) ──
+        // NOT hot-applied like gap_digest_enabled above: `mcp.rs::
+        // novelty_gate_enabled_from_config` is read once, when a `duduclaw
+        // mcp-server` process starts (`maybe_with_semantic_embedder`), and
+        // cached in that process's `SqliteMemoryEngine` for its lifetime.
+        // Persisting here is still correct — a NEW MCP server process (the
+        // next agent session under the default fresh-spawn CLI runtime picks
+        // this up on its very next turn) reads the new value — but an
+        // already-running long-lived session (PTY-pool mode) will not see
+        // the change until it restarts. Flagged in `changes` so the caller
+        // can surface the same "restart/new-session" honesty the dashboard
+        // needs instead of implying instant effect.
+        if let Some(v) = params.get("novelty_gate_enabled").and_then(|v| v.as_bool()) {
+            let memory = table
+                .entry("memory")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(memory) = memory {
+                memory.insert("novelty_gate".into(), toml::Value::Boolean(v));
+                changes.push(format!(
+                    "memory.novelty_gate = {v} (applies to new sessions)"
+                ));
+            } else {
+                return WsFrame::error_response("", "Invalid [memory] section in config.toml");
+            }
+        }
+
+        // ── S20 [miniapp] enabled (Telegram Mini App approval screen) ──
+        // Until 2026-09 `[miniapp] enabled` had no dashboard surface at all, so
+        // the feature was only reachable by hand-editing `config.toml`. The
+        // routes read the key per request (`miniapp::enabled`), so persisting
+        // it here takes effect on the very next request — no restart.
+        if let Some(v) = params.get("miniapp_enabled").and_then(|v| v.as_bool()) {
+            let miniapp = table
+                .entry("miniapp")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(miniapp) = miniapp {
+                miniapp.insert("enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("miniapp.enabled = {v}"));
+            } else {
+                return WsFrame::error_response("", "Invalid [miniapp] section in config.toml");
+            }
+        }
+
+        // ── W2-8 [notify] daily_digest / daily_digest_at (dashboard toggle) ──
+        // Re-read from config.toml on every `DailyDigestScheduler` tick
+        // (`notify_digest.rs::DigestConfig::from_home`), so persisting is
+        // enough — no restart, no hot-reload plumbing (same posture as
+        // gap_digest_enabled above). `daily_digest_at` is validated with the
+        // SAME parser the scheduler itself uses (`notify_digest::parse_clock`)
+        // so a malformed time is rejected here rather than silently falling
+        // back to 09:00 hours later when the scheduler's own fail-open read
+        // path hits it.
+        {
+            let has_notify = ["daily_digest", "daily_digest_at"]
+                .iter()
+                .any(|k| params.get(*k).is_some());
+            if has_notify {
+                let notify = table
+                    .entry("notify")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut();
+                let Some(notify) = notify else {
+                    return WsFrame::error_response("", "Invalid [notify] section in config.toml");
+                };
+                if let Some(v) = params.get("daily_digest").and_then(|v| v.as_bool()) {
+                    notify.insert("daily_digest".into(), toml::Value::Boolean(v));
+                    changes.push(format!("notify.daily_digest = {v}"));
+                }
+                if let Some(v) = params.get("daily_digest_at").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    if crate::notify_digest::parse_clock(v).is_none() {
+                        return WsFrame::error_response(
+                            "",
+                            &format!(
+                                "Invalid notify.daily_digest_at '{v}' (need \"HH:MM\", e.g. \"09:00\")"
+                            ),
+                        );
+                    }
+                    notify.insert("daily_digest_at".into(), toml::Value::String(v.into()));
+                    changes.push(format!("notify.daily_digest_at = \"{v}\""));
+                }
+            }
+        }
+
+        // ── G.4 [logging] format (pretty/json) ──
+        if let Some(v) = params.get("log_format").and_then(|v| v.as_str()) {
+            match v {
+                "pretty" | "json" => {
+                    let logging = table
+                        .entry("logging")
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut()
+                        .unwrap();
+                    logging.insert("format".into(), toml::Value::String(v.into()));
+                    changes.push(format!("logging.format = \"{v}\""));
+                }
+                _ => return WsFrame::error_response("", "Invalid log_format. Valid: pretty, json"),
+            }
+        }
+
+        // ── G.7 [secret_manager] backend / vault_addr / vault_token(→_enc) / vault_mount ──
+        if let Some(sm) = params.get("secret_manager").and_then(|v| v.as_object()) {
+            let section = table
+                .entry("secret_manager")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            if let Some(v) = sm.get("backend").and_then(|v| v.as_str()) {
+                // Must match the real `SecretBackend` enum (secret_manager/mod.rs):
+                // local | vault | env | onepassword | infisical. The prior list
+                // ("config"/"keychain") named backends that do not exist and
+                // rejected "local" (the default), so any valid selection failed.
+                match v {
+                    "local" | "vault" | "env" | "onepassword" | "infisical" => {
+                        section.insert("backend".into(), toml::Value::String(v.into()));
+                        changes.push(format!("secret_manager.backend = \"{v}\""));
+                    }
+                    _ => {
+                        return WsFrame::error_response(
+                            "",
+                            "Invalid secret_manager.backend. Valid: local, vault, env, onepassword, infisical",
+                        );
+                    }
+                }
+            }
+            for (param_key, toml_key) in
+                &[("vault_addr", "vault_addr"), ("vault_mount", "vault_mount")]
+            {
+                if let Some(v) = sm.get(*param_key).and_then(|v| v.as_str()) {
+                    section.insert((*toml_key).into(), toml::Value::String(v.trim().into()));
+                    changes.push(format!("secret_manager.{toml_key} = \"{}\"", v.trim()));
+                }
+            }
+            // vault_token → encrypt to vault_token_enc (G.7 / XC.5).
+            if let Some(v) = sm.get("vault_token").and_then(|v| v.as_str()) {
+                let v = v.trim();
+                section.remove("vault_token");
+                if v.is_empty() {
+                    section.remove("vault_token_enc");
+                    changes.push("secret_manager.vault_token cleared".into());
+                } else if v == SECRET_MASK_SET {
+                    // untouched
+                } else if let Some(enc) = crate::config_crypto::encrypt_value(v, &self.home_dir) {
+                    section.insert("vault_token_enc".into(), toml::Value::String(enc));
+                    changes.push("secret_manager.vault_token = [ENCRYPTED]".into());
+                } else {
+                    return WsFrame::error_response(
+                        "",
+                        "Failed to encrypt secret_manager.vault_token",
+                    );
+                }
+            }
+        }
+
+        // ── v1.39 config knobs ─────────────────────────────────────────────
+        // knowledge_guard / goal_loop / dispatch / memory / topology_evolution.
+        // Sent as nested objects (like `secret_manager` / `voice`). Two classes:
+        //   • "easy" per-use-read knobs (knowledge_guard.*, goal_loop.planner_enabled,
+        //     memory.graph_embed_seed) — the consumer re-reads config.toml on every
+        //     use, so the write alone takes effect; surfaced to the UI as `applied`.
+        //   • "hard" startup-read knobs (goal_loop.iteration_cap_simple,
+        //     dispatch.policy, topology_evolution.enabled) — a long-lived driver
+        //     captured the value at boot, so we abort+respawn the driver after the
+        //     write; surfaced as `hot_reloaded`.
+        let mut applied_immediate = false;
+        let mut reload_goal_loop = false;
+        let mut reload_topology = false;
+        let mut reload_dispatch = false;
+
+        // [knowledge_guard] enabled / window_secs / max_per_subject
+        if let Some(kg) = params.get("knowledge_guard").and_then(|v| v.as_object()) {
+            let section = table
+                .entry("knowledge_guard")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            if let Some(v) = kg.get("enabled").and_then(|v| v.as_bool()) {
+                section.insert("enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("knowledge_guard.enabled = {v}"));
+                applied_immediate = true;
+            }
+            if let Some(v) = kg.get("window_secs").and_then(|v| v.as_u64()) {
+                if v == 0 || v > 604_800 {
+                    return WsFrame::error_response(
+                        "",
+                        "knowledge_guard.window_secs must be 1-604800",
+                    );
+                }
+                section.insert("window_secs".into(), toml::Value::Integer(v as i64));
+                changes.push(format!("knowledge_guard.window_secs = {v}"));
+                applied_immediate = true;
+            }
+            if let Some(v) = kg.get("max_per_subject").and_then(|v| v.as_u64()) {
+                if v == 0 || v > 10_000 {
+                    return WsFrame::error_response(
+                        "",
+                        "knowledge_guard.max_per_subject must be 1-10000",
+                    );
+                }
+                section.insert("max_per_subject".into(), toml::Value::Integer(v as i64));
+                changes.push(format!("knowledge_guard.max_per_subject = {v}"));
+                applied_immediate = true;
+            }
+        }
+
+        // [goal_loop] planner_enabled (easy) / iteration_cap_simple (hard) /
+        // resume_on_restart (WP-E — boot-only read, neither hot-reloaded nor
+        // "easy": `GoalLoopConfig::from_home` / `pause_inflight_on_restart`
+        // are only consulted at gateway boot, never on a config hot-reload —
+        // see `goal_loop.rs`'s own doc comment on that function. So this
+        // write persists but deliberately does NOT set `applied_immediate`
+        // or any `reload_*` flag, same posture as the G.1 gateway.bind/port
+        // "restart required" fields above.
+        if let Some(gl) = params.get("goal_loop").and_then(|v| v.as_object()) {
+            let section = table
+                .entry("goal_loop")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            if let Some(v) = gl.get("planner_enabled").and_then(|v| v.as_bool()) {
+                section.insert("planner_enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("goal_loop.planner_enabled = {v}"));
+                applied_immediate = true;
+            }
+            if let Some(v) = gl.get("iteration_cap_simple").and_then(|v| v.as_u64()) {
+                if !(1..=20).contains(&v) {
+                    return WsFrame::error_response(
+                        "",
+                        "goal_loop.iteration_cap_simple must be 1-20",
+                    );
+                }
+                section.insert(
+                    "iteration_cap_simple".into(),
+                    toml::Value::Integer(v as i64),
+                );
+                changes.push(format!("goal_loop.iteration_cap_simple = {v} (hot reload)"));
+                reload_goal_loop = true;
+            }
+            // Fail-closed whitelist: exactly "auto" or "pause", nothing else
+            // — an unrecognized value must be rejected at write time here,
+            // not silently degrade later at `ResumeOnRestart::from_str_lenient`
+            // read time (that lenient fallback exists for hand-edited
+            // config.toml, not for a value this RPC itself just accepted).
+            if let Some(v) = gl.get("resume_on_restart").and_then(|v| v.as_str()) {
+                match v {
+                    "auto" | "pause" => {
+                        section.insert("resume_on_restart".into(), toml::Value::String(v.into()));
+                        changes.push(format!(
+                            "goal_loop.resume_on_restart = \"{v}\" (takes effect on next gateway restart)"
+                        ));
+                    }
+                    _ => {
+                        return WsFrame::error_response(
+                            "",
+                            "Invalid goal_loop.resume_on_restart. Valid: auto, pause",
+                        );
+                    }
+                }
+            }
+        }
+
+        // [dispatch] enabled (hard — gates the dispatch engine + goal-loop
+        // driver) / policy (hard — captured by the goal-loop driver at boot)
+        if let Some(dp) = params.get("dispatch").and_then(|v| v.as_object()) {
+            if let Some(v) = dp.get("enabled").and_then(|v| v.as_bool()) {
+                let section = table
+                    .entry("dispatch")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                section.insert("enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("dispatch.enabled = {v} (hot reload)"));
+                reload_dispatch = true;
+            }
+            if let Some(v) = dp.get("policy").and_then(|v| v.as_str()) {
+                match v {
+                    "fixed_hierarchy" | "round_robin" | "llm_select" => {
+                        let section = table
+                            .entry("dispatch")
+                            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                            .as_table_mut()
+                            .unwrap();
+                        section.insert("policy".into(), toml::Value::String(v.into()));
+                        changes.push(format!("dispatch.policy = \"{v}\" (hot reload)"));
+                        reload_goal_loop = true;
+                    }
+                    _ => {
+                        return WsFrame::error_response(
+                            "",
+                            "Invalid dispatch.policy. Valid: fixed_hierarchy, round_robin, llm_select",
+                        );
+                    }
+                }
+            }
+            // WP-5D judge seam: `[dispatch] judge` (easy — `review_goal_tasks`
+            // re-reads it per reviewed task, exactly like `two_stage_judge`, so
+            // no driver respawn is needed for the switch to take effect).
+            //
+            // Deliberately NOT settable here: `judge_command` /
+            // `judge_timeout_secs`. Those name an executable, and this RPC is
+            // reachable from the dashboard; keeping them file-only (where
+            // `org_field_guard` already DENIES agent writes to
+            // `<home>/config.toml`) means no dashboard or agent path can point
+            // the judge seam at an arbitrary binary. Value set is enumerated
+            // here and validated again by `JudgeMode::from_config_str` at read
+            // time — an unknown value falls back to `mav`, the strongest
+            // verifier.
+            if let Some(v) = dp.get("judge").and_then(|v| v.as_str()) {
+                match crate::judge_mode::JudgeMode::from_config_str(v) {
+                    Some(mode) => {
+                        let section = table
+                            .entry("dispatch")
+                            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                            .as_table_mut()
+                            .unwrap();
+                        section.insert("judge".into(), toml::Value::String(mode.as_str().into()));
+                        changes.push(format!(
+                            "dispatch.judge = \"{}\" (hot reload)",
+                            mode.as_str()
+                        ));
+                        // T5/O12 (feature audit 2026-09-29): `evaluator_only`
+                        // and `human_only` are deprecated. Still accepted (a
+                        // deployment already on one keeps working, and the
+                        // dashboard keeps showing it), but every *write* of a
+                        // deprecated value leaves a warning and an audit row
+                        // so the migration is traceable. Removal: v1.68.0.
+                        if mode.is_deprecated() {
+                            warn!(
+                                value = mode.as_str(),
+                                replacement =
+                                    mode.deprecation_replacement().unwrap_or("mav"),
+                                remove_in = "v1.68.0",
+                                "dispatch.judge set to a deprecated mode via system.update_config"
+                            );
+                            crate::security_autopilot::audit_and_emit(
+                                &self.home_dir,
+                                &duduclaw_security::audit::AuditEvent::new(
+                                    "judge_mode_deprecated",
+                                    &ctx.user_id,
+                                    duduclaw_security::audit::Severity::Warning,
+                                    json!({
+                                        "value": mode.as_str(),
+                                        "replacement": mode
+                                            .deprecation_replacement()
+                                            .unwrap_or("mav"),
+                                        "remove_in": "v1.68.0",
+                                        "source": "system.update_config",
+                                    }),
+                                ),
+                            );
+                        }
+                    }
+                    None => {
+                        return WsFrame::error_response(
+                            "",
+                            "Invalid dispatch.judge. Valid: mav, evaluator_only, external, human_only",
+                        );
+                    }
+                }
+            }
+        }
+
+        // [memory] graph_embed_seed (easy — re-read on every memory RPC)
+        if let Some(mem) = params.get("memory").and_then(|v| v.as_object()) {
+            if let Some(v) = mem.get("graph_embed_seed").and_then(|v| v.as_bool()) {
+                let section = table
+                    .entry("memory")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                section.insert("graph_embed_seed".into(), toml::Value::Boolean(v));
+                changes.push(format!("memory.graph_embed_seed = {v}"));
+                applied_immediate = true;
+            }
+        }
+
+        // [topology_evolution] enabled (hard — gates the D5 driver at boot)
+        if let Some(te) = params.get("topology_evolution").and_then(|v| v.as_object()) {
+            if let Some(v) = te.get("enabled").and_then(|v| v.as_bool()) {
+                let section = table
+                    .entry("topology_evolution")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                section.insert("enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("topology_evolution.enabled = {v} (hot reload)"));
+                reload_topology = true;
+            }
+        }
+
+        // [belief] flat_band_pct (easy — `BeliefConfig::from_db_path` re-reads
+        // config.toml on every `belief::settle` call) / tick_subject_map (easy
+        // — read by the autopilot tick-wake hook on every tick).
+        if let Some(bl) = params.get("belief").and_then(|v| v.as_object()) {
+            let section = table
+                .entry("belief")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            if let Some(v) = bl.get("flat_band_pct").and_then(|v| v.as_f64()) {
+                if !(0.01..=10.0).contains(&v) {
+                    return WsFrame::error_response("", "belief.flat_band_pct must be 0.01-10.0");
+                }
+                section.insert("flat_band_pct".into(), toml::Value::Float(v));
+                changes.push(format!("belief.flat_band_pct = {v}"));
+                applied_immediate = true;
+            }
+            if let Some(map) = bl.get("tick_subject_map").and_then(|v| v.as_object()) {
+                if map.len() > 32 {
+                    return WsFrame::error_response(
+                        "",
+                        "belief.tick_subject_map supports at most 32 entries",
+                    );
+                }
+                let mut tsm_table = toml::map::Map::new();
+                for (k, v) in map {
+                    if k.trim().is_empty() || k.chars().count() > 64 {
+                        return WsFrame::error_response(
+                            "",
+                            "belief.tick_subject_map keys must be non-empty and <= 64 chars",
+                        );
+                    }
+                    let Some(v_str) = v.as_str() else {
+                        return WsFrame::error_response(
+                            "",
+                            "belief.tick_subject_map values must be strings",
+                        );
+                    };
+                    if v_str.trim().is_empty() || v_str.chars().count() > 64 {
+                        return WsFrame::error_response(
+                            "",
+                            "belief.tick_subject_map values must be non-empty and <= 64 chars",
+                        );
+                    }
+                    tsm_table.insert(k.clone(), toml::Value::String(v_str.to_string()));
+                }
+                section.insert("tick_subject_map".into(), toml::Value::Table(tsm_table));
+                changes.push(format!("belief.tick_subject_map = {} entries", map.len()));
+                applied_immediate = true;
+            }
+        }
+
+        // ── voice (persisted to inference.toml [voice], where VoiceConfig reads it) ──
+        // Track how many config.toml changes were accumulated BEFORE the voice
+        // block so the early-return below stays correct for mixed payloads.
+        let config_toml_changes = changes.len();
+        if let Some(voice) = params.get("voice").and_then(|v| v.as_object()) {
+            const VALID_ASR: &[&str] = &["auto", "whisper-api", "whisper-local"];
+            const VALID_TTS: &[&str] = &["auto", "edge-tts", "minimax", "openai-tts", "piper"];
+
+            let inference_path = self.home_dir.join("inference.toml");
+            let mut inf_table = self.read_config_table(&inference_path).await;
+            let mut voice_dirty = false;
+            let voice_table = inf_table
+                .entry("voice")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(voice_table) = voice_table {
+                if let Some(v) = voice.get("asr_provider").and_then(|v| v.as_str()) {
+                    if !VALID_ASR.contains(&v) {
+                        return WsFrame::error_response(
+                            "",
+                            &format!(
+                                "Invalid asr_provider '{v}'. Valid: {}",
+                                VALID_ASR.join(", ")
+                            ),
+                        );
+                    }
+                    voice_table.insert("asr_provider".into(), toml::Value::String(v.into()));
+                    voice_dirty = true;
+                }
+                if let Some(v) = voice.get("tts_provider").and_then(|v| v.as_str()) {
+                    if !VALID_TTS.contains(&v) {
+                        return WsFrame::error_response(
+                            "",
+                            &format!(
+                                "Invalid tts_provider '{v}'. Valid: {}",
+                                VALID_TTS.join(", ")
+                            ),
+                        );
+                    }
+                    voice_table.insert("tts_provider".into(), toml::Value::String(v.into()));
+                    voice_dirty = true;
+                }
+                if let Some(v) = voice.get("asr_language").and_then(|v| v.as_str()) {
+                    voice_table.insert("asr_language".into(), toml::Value::String(v.into()));
+                    voice_dirty = true;
+                }
+                if let Some(v) = voice.get("tts_voice").and_then(|v| v.as_str()) {
+                    voice_table.insert("tts_voice".into(), toml::Value::String(v.into()));
+                    voice_dirty = true;
+                }
+                if let Some(v) = voice.get("voice_reply_enabled").and_then(|v| v.as_bool()) {
+                    voice_table.insert("voice_reply_enabled".into(), toml::Value::Boolean(v));
+                    voice_dirty = true;
+                }
+            }
+
+            if voice_dirty {
+                let tmp = inference_path.with_extension("toml.tmp");
+                if let Err(e) = self.write_config_table(&tmp, &inf_table).await {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Failed to write inference.toml: {e}"),
+                    );
+                }
+                if let Err(e) = tokio::fs::rename(&tmp, &inference_path).await {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Failed to commit inference.toml: {e}"),
+                    );
+                }
+                changes.push("voice (inference.toml)".to_string());
+            }
+
+            // `voice` may be the only effective field in the payload;
+            // config.toml itself is untouched in that case, so return early
+            // before the config.toml write below complains about
+            // "no valid fields".
+            if config_toml_changes == 0 && !changes.is_empty() {
+                info!(?changes, "system.update_config completed");
+                duduclaw_security::audit::log_config_changed(
+                    &self.home_dir,
+                    &ctx.email,
+                    &format!("{:?}", ctx.role).to_lowercase(),
+                    &changes,
+                );
+                // C1 producer 甲 companion — see `security_autopilot.rs`.
+                crate::security_autopilot::emit_config_changed();
+                return WsFrame::ok_response("", json!({ "success": true, "changes": changes }));
+            }
+        }
+
+        if changes.is_empty() {
+            return WsFrame::error_response(
+                "",
+                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple/resume_on_restart), dispatch(enabled/policy), memory(graph_embed_seed), topology_evolution(enabled), belief(flat_band_pct/tick_subject_map)",
+            );
+        }
+
+        // Atomic write: temp + rename
+        let tmp_path = config_path.with_extension("toml.tmp");
+        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
+            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+        }
+
+        // Hot-apply the remote-access allowlist so the dashboard save takes
+        // effect immediately — no gateway restart. Only reached once the config
+        // write above committed successfully.
+        let origins_applied = if let Some(cleaned) = applied_origins {
+            crate::server::set_allowed_origins(cleaned);
+            true
+        } else {
+            false
+        };
+
+        // Hot reload the long-lived background drivers whose config was captured
+        // at boot. abort+respawn with the freshly-written config (drivers are
+        // stateless periodic pollers — durable state lives in SQLite, so an abort
+        // between ticks is safe). Report which reloaded so the UI can confirm.
+        let mut hot_reloaded: Vec<&'static str> = Vec::new();
+        if reload_dispatch {
+            // Order matters: the engine (re)constructs the shared forward-model
+            // Arc when `[task_forward_model]` is enabled, and the goal-loop
+            // driver respawn below picks that same Arc up for its predict hook.
+            self.respawn_dispatch_engine().await;
+            self.respawn_goal_loop_driver().await;
+            hot_reloaded.push("dispatch");
+        }
+        if reload_goal_loop && !reload_dispatch {
+            self.respawn_goal_loop_driver().await;
+        }
+        if reload_goal_loop {
+            hot_reloaded.push("goal_loop");
+        }
+        if reload_topology {
+            self.respawn_topology_driver().await;
+            hot_reloaded.push("topology_evolution");
+        }
+
+        info!(?changes, ?hot_reloaded, "system.update_config completed");
+        // B5 (OS security line P0): every accepted `config.toml` write is now
+        // auditable — same shape/spirit as `delegation.set`'s pre-existing
+        // `delegation_config_changed` event below. Fired only here (and at
+        // the voice-only early-return above), i.e. only once the write is
+        // durably committed — a rejected/failed update never reaches this
+        // point.
+        duduclaw_security::audit::log_config_changed(
+            &self.home_dir,
+            &ctx.email,
+            &format!("{:?}", ctx.role).to_lowercase(),
+            &changes,
+        );
+        // C1 producer 甲 companion — see `security_autopilot.rs`.
+        crate::security_autopilot::emit_config_changed();
+        WsFrame::ok_response(
+            "",
+            json!({
+                "success": true,
+                "changes": changes,
+                // Signals the UI that a live-applied field took effect without a
+                // restart: allowed_origins hot-apply OR an "easy" per-use-read knob.
+                "applied": origins_applied || applied_immediate,
+                // Drivers that were abort+respawned with the new config.
+                "hot_reloaded": hot_reloaded,
+            }),
+        )
+    }
+}

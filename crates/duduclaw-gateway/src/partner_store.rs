@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{Datelike, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 // ── Data types ──────────────────────────────────────────────
@@ -142,8 +142,8 @@ impl PartnerStore {
     }
 
     fn open_conn(&self) -> Result<Connection, String> {
-        let conn = Connection::open(&self.db_path)
-            .map_err(|e| format!("open partner store: {e}"))?;
+        let conn =
+            Connection::open(&self.db_path).map_err(|e| format!("open partner store: {e}"))?;
         // Busy timeout keeps short writes resilient against concurrent readers.
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| format!("busy_timeout: {e}"))?;
@@ -272,12 +272,12 @@ impl PartnerStore {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let binds_ref: Vec<&dyn rusqlite::types::ToSql> =
-            bind.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let binds_ref: Vec<&dyn rusqlite::types::ToSql> = bind
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
 
-        let rows = stmt
-            .query_map(binds_ref.as_slice(), row_to_customer)
-            .ok();
+        let rows = stmt.query_map(binds_ref.as_slice(), row_to_customer).ok();
         match rows {
             Some(iter) => iter.filter_map(Result::ok).collect(),
             None => Vec::new(),
@@ -319,11 +319,7 @@ impl PartnerStore {
     }
 
     /// Patch only the fields set to `Some` in `patch`.
-    pub fn update_customer(
-        &self,
-        id: &str,
-        patch: &PartnerCustomerPatch,
-    ) -> Result<(), String> {
+    pub fn update_customer(&self, id: &str, patch: &PartnerCustomerPatch) -> Result<(), String> {
         let conn = self.open_conn()?;
 
         // Build SET clause dynamically, matching the approach in task_store.
@@ -409,11 +405,7 @@ impl PartnerStore {
         };
 
         let total_sold: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM partner_customers",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM partner_customers", [], |r| r.get(0))
             .unwrap_or(0);
         let active_customers: i64 = conn
             .query_row(
@@ -431,11 +423,7 @@ impl PartnerStore {
             .unwrap_or(0);
 
         let now = Utc::now();
-        let month_start = format!(
-            "{:04}-{:02}-01T00:00:00+00:00",
-            now.year(),
-            now.month()
-        );
+        let month_start = format!("{:04}-{:02}-01T00:00:00+00:00", now.year(), now.month());
         let this_month_commission_cents: i64 = conn
             .query_row(
                 "SELECT COALESCE(SUM(commission_cents), 0)

@@ -63,9 +63,13 @@ pub enum ServiceAccountError {
     KeyFileMalformed(String),
     /// `client_email` / `private_key` absent — usually an OAuth client JSON
     /// pasted in by mistake instead of a service-account key.
-    #[error("service account key file is missing `{0}` (is this a service-account key, not an OAuth client?)")]
+    #[error(
+        "service account key file is missing `{0}` (is this a service-account key, not an OAuth client?)"
+    )]
     KeyFileIncomplete(&'static str),
-    #[error("`[integrations.google_service_account] subject` must be the email of a user in the Workspace domain")]
+    #[error(
+        "`[integrations.google_service_account] subject` must be the email of a user in the Workspace domain"
+    )]
     InvalidSubject,
     #[error("failed to sign the assertion (bad private key?): {0}")]
     SigningFailed(String),
@@ -127,8 +131,14 @@ pub fn parse_config(
         return Ok(None);
     };
 
-    let key_file = section.get("key_file").and_then(|v| v.as_str()).unwrap_or_default();
-    let subject = section.get("subject").and_then(|v| v.as_str()).unwrap_or_default();
+    let key_file = section
+        .get("key_file")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let subject = section
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     build_config(key_file, subject, home_dir).map(Some)
 }
 
@@ -183,7 +193,9 @@ fn is_email_like(s: &str) -> bool {
 /// Load and validate a service-account key file.
 pub fn load_key(path: &Path) -> Result<ServiceAccountKey, ServiceAccountError> {
     if !path.exists() {
-        return Err(ServiceAccountError::KeyFileMissing(path.display().to_string()));
+        return Err(ServiceAccountError::KeyFileMissing(
+            path.display().to_string(),
+        ));
     }
     let raw = std::fs::read_to_string(path)
         .map_err(|e| ServiceAccountError::KeyFileUnreadable(e.to_string()))?;
@@ -234,7 +246,10 @@ pub fn build_claims(
         iss: key.client_email.clone(),
         sub: subject.to_string(),
         scope: scopes.join(" "),
-        aud: key.token_uri.clone().unwrap_or_else(|| DEFAULT_TOKEN_URI.to_string()),
+        aud: key
+            .token_uri
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TOKEN_URI.to_string()),
         iat: now_secs,
         exp: now_secs + ASSERTION_TTL_SECS,
     }
@@ -277,7 +292,10 @@ pub async fn get_token(
     let claims = build_claims(&key, &config.subject, scopes, now);
     let assertion = sign_assertion(&key, &claims)?;
 
-    let token_uri = key.token_uri.clone().unwrap_or_else(|| DEFAULT_TOKEN_URI.to_string());
+    let token_uri = key
+        .token_uri
+        .clone()
+        .unwrap_or_else(|| DEFAULT_TOKEN_URI.to_string());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .build()
@@ -295,15 +313,19 @@ pub async fn get_token(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let client_id = key.client_id.clone().unwrap_or_else(|| "(see key file `client_id`)".into());
+        let client_id = key
+            .client_id
+            .clone()
+            .unwrap_or_else(|| "(see key file `client_id`)".into());
         return Err(ServiceAccountError::Rejected(
             summarize_token_error(&body, status.as_u16()),
             client_id,
         ));
     }
 
-    let parsed: TokenResponse = serde_json::from_str(&body)
-        .map_err(|e| ServiceAccountError::RequestFailed(format!("malformed token response: {e}")))?;
+    let parsed: TokenResponse = serde_json::from_str(&body).map_err(|e| {
+        ServiceAccountError::RequestFailed(format!("malformed token response: {e}"))
+    })?;
     let ttl = Duration::from_secs(parsed.expires_in.unwrap_or(ASSERTION_TTL_SECS));
     let good_until = Instant::now() + ttl.saturating_sub(EXPIRY_SKEW);
     cache().write().await.insert(
@@ -329,12 +351,18 @@ struct TokenResponse {
 pub fn summarize_token_error(body: &str, status: u16) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         let code = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
-        let desc = v.get("error_description").and_then(|e| e.as_str()).unwrap_or("");
+        let desc = v
+            .get("error_description")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
         if !code.is_empty() {
             return if desc.is_empty() {
                 format!("HTTP {status}: {code}")
             } else {
-                format!("HTTP {status}: {code} — {}", duduclaw_core::truncate_chars(desc, 200))
+                format!(
+                    "HTTP {status}: {code} — {}",
+                    duduclaw_core::truncate_chars(desc, 200)
+                )
             };
         }
     }
@@ -401,7 +429,9 @@ subject = "boss@customer.com"
 key_file = "sa.json"
 subject = "boss@customer.com"
 "#;
-        let cfg = parse_config(toml, Path::new("/home/.duduclaw")).unwrap().unwrap();
+        let cfg = parse_config(toml, Path::new("/home/.duduclaw"))
+            .unwrap()
+            .unwrap();
         assert_eq!(cfg.key_file, PathBuf::from("/home/.duduclaw/sa.json"));
     }
 
@@ -418,7 +448,13 @@ subject = "boss@customer.com"
 
     #[test]
     fn parse_config_rejects_non_email_subject() {
-        for bad in ["my-project-id", "boss@localhost", "@customer.com", "a@b@c.com", ""] {
+        for bad in [
+            "my-project-id",
+            "boss@localhost",
+            "@customer.com",
+            "a@b@c.com",
+            "",
+        ] {
             let toml = format!(
                 "[integrations.google_service_account]\nkey_file = \"sa.json\"\nsubject = \"{bad}\"\n"
             );
@@ -478,8 +514,12 @@ subject = "boss@customer.com"
     fn parse_key_rejects_oauth_client_json() {
         // The classic operator mistake: pasting the OAuth client JSON, which has
         // `client_id`/`client_secret` but no `client_email`/`private_key`.
-        let raw = r#"{"installed":{"client_id":"x.apps.googleusercontent.com","client_secret":"y"}}"#;
-        assert!(matches!(parse_key(raw), Err(ServiceAccountError::KeyFileMalformed(_))));
+        let raw =
+            r#"{"installed":{"client_id":"x.apps.googleusercontent.com","client_secret":"y"}}"#;
+        assert!(matches!(
+            parse_key(raw),
+            Err(ServiceAccountError::KeyFileMalformed(_))
+        ));
     }
 
     #[test]
@@ -489,7 +529,10 @@ subject = "boss@customer.com"
         let raw = "{\"client_email\":\"a@b.com\",\"private_key\":\"SUPERSECRETKEYMATERIAL\",}";
         let err = parse_key(raw).unwrap_err();
         let msg = err.to_string();
-        assert!(!msg.contains("SUPERSECRETKEYMATERIAL"), "leaked key material: {msg}");
+        assert!(
+            !msg.contains("SUPERSECRETKEYMATERIAL"),
+            "leaked key material: {msg}"
+        );
         assert!(msg.contains("line"), "expected a position, got: {msg}");
     }
 
@@ -501,7 +544,12 @@ subject = "boss@customer.com"
             token_uri: None,
             client_id: None,
         };
-        let c = build_claims(&key, "boss@customer.com", &["scope.a", "scope.b"], 1_000_000);
+        let c = build_claims(
+            &key,
+            "boss@customer.com",
+            &["scope.a", "scope.b"],
+            1_000_000,
+        );
         assert_eq!(c.iss, "sa@proj.iam.gserviceaccount.com");
         // `sub` is the impersonated user — the delegation itself. Getting this
         // wrong silently authenticates as the service account instead.
@@ -528,7 +576,8 @@ subject = "boss@customer.com"
     fn sign_assertion_rejects_a_bogus_key_without_leaking_it() {
         let key = ServiceAccountKey {
             client_email: "sa@proj.iam.gserviceaccount.com".into(),
-            private_key: "-----BEGIN PRIVATE KEY-----\nNOTAREALKEY\n-----END PRIVATE KEY-----".into(),
+            private_key: "-----BEGIN PRIVATE KEY-----\nNOTAREALKEY\n-----END PRIVATE KEY-----"
+                .into(),
             client_id: None,
             token_uri: None,
         };
@@ -558,7 +607,10 @@ subject = "boss@customer.com"
     fn rejected_error_names_the_client_id_to_authorize() {
         // The operator's next action is pasting this id into Admin console, so
         // the error must hand it to them.
-        let e = ServiceAccountError::Rejected("HTTP 401: unauthorized_client".into(), "1234567890".into());
+        let e = ServiceAccountError::Rejected(
+            "HTTP 401: unauthorized_client".into(),
+            "1234567890".into(),
+        );
         let msg = e.to_string();
         assert!(msg.contains("1234567890"), "{msg}");
         assert!(msg.contains("Domain Wide Delegation"), "{msg}");

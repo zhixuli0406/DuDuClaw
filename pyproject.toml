@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "duduclaw"
 version = "1.65.1"
-description = "Open-source AI Agent platform unifying Claude / Codex / Gemini CLIs. Multi-LLM routing, 80+ MCP tools, 7 messaging channels."
+description = "Open-source AI Agent platform unifying Claude / Codex / Gemini CLIs. Multi-LLM routing, 243 MCP tools, 11 messaging channels."
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
 authors = [{ name = "Louis Li", email = "zhixuli0406@gmail.com" }]
@@ -44,9 +44,15 @@ Changelog = "https://github.com/zhixuli0406/DuDuClaw/blob/main/CHANGELOG.md"
 packages = ["python/duduclaw"]
 # Include non-Python data files (YAML registry)
 artifacts = ["python/duduclaw/**/*.yaml"]
+# `memory_eval` is a repo-only benchmarking harness (2026-09-29 audit, S12): it
+# has no runtime caller, nothing in CI runs it, and it was 58% of every wheel we
+# shipped. It stays in the repository — see python/README.md for how to run it
+# from a checkout — and stops being downloaded by `pip install duduclaw`.
+exclude = ["python/duduclaw/memory_eval/**"]
 
 [tool.hatch.build.targets.sdist]
 include = ["python/duduclaw/**", "python/README.md", "LICENSE"]
+exclude = ["python/duduclaw/memory_eval/**"]
 
 [tool.ruff]
 target-version = "py310"

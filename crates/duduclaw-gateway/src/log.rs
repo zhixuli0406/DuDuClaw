@@ -8,8 +8,8 @@ use std::sync::OnceLock;
 
 use tokio::sync::broadcast;
 use tracing::{Event, Level, Subscriber};
-use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
 /// Global sender initialised once in [`init_log_broadcaster`].
 static LOG_TX: OnceLock<broadcast::Sender<String>> = OnceLock::new();
@@ -152,7 +152,9 @@ impl<S: Subscriber> Layer<S> for BroadcastLayer {
         };
 
         // Capture the message field from the event
-        let mut visitor = MessageVisitor { message: String::new() };
+        let mut visitor = MessageVisitor {
+            message: String::new(),
+        };
         event.record(&mut visitor);
 
         if visitor.message.is_empty() {
@@ -170,8 +172,14 @@ impl<S: Subscriber> Layer<S> for BroadcastLayer {
 /// Handles multiple occurrences of the same prefix and end-of-string values.
 fn scrub_sensitive(msg: &str) -> String {
     let sensitive_prefixes = [
-        "api_key=", "token=", "secret=", "password=", "credential=",
-        "Bearer ", "Bot ", "ANTHROPIC_API_KEY=",
+        "api_key=",
+        "token=",
+        "secret=",
+        "password=",
+        "credential=",
+        "Bearer ",
+        "Bot ",
+        "ANTHROPIC_API_KEY=",
     ];
     // WP12: prefix scanning misses credentials embedded in a URL *path* — a
     // Telegram error prints `…/bot<token>/getMe`, which none of the prefixes
@@ -187,7 +195,9 @@ fn scrub_sensitive(msg: &str) -> String {
                 break; // prefix at very end, nothing to redact
             }
             let value_end = result[value_start..]
-                .find(|c: char| c.is_whitespace() || c == ',' || c == '"' || c == '\'' || c == '}' || c == ']')
+                .find(|c: char| {
+                    c.is_whitespace() || c == ',' || c == '"' || c == '\'' || c == '}' || c == ']'
+                })
                 .map(|i| value_start + i)
                 .unwrap_or(result.len());
             if value_end > value_start {

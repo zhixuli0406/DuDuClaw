@@ -9,9 +9,8 @@
 //! via a lightweight JSON-RPC protocol.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use duduclaw_core::error::{DuDuClawError, Result};
 
@@ -110,7 +109,6 @@ impl PtcRpcServer {
     pub fn call_count(&self) -> u64 {
         self.call_count.load(Ordering::Relaxed)
     }
-
 }
 
 impl Drop for PtcRpcServer {
@@ -150,10 +148,7 @@ impl PtcSandbox {
     /// Execute a script as a direct child process (no container isolation).
     ///
     /// The script has access to the PTC RPC socket for MCP tool calls.
-    pub async fn execute(
-        req: &ScriptRequest,
-        rpc_server: &PtcRpcServer,
-    ) -> Result<ScriptResult> {
+    pub async fn execute(req: &ScriptRequest, rpc_server: &PtcRpcServer) -> Result<ScriptResult> {
         let start = std::time::Instant::now();
 
         // Write script to a temporary file
@@ -175,24 +170,39 @@ impl PtcSandbox {
                     .map_err(|e| DuDuClawError::Agent(format!("Failed to write script: {e}")))?;
                 // Also write the PTC client stub alongside
                 let client_path = tmp_dir.join("ptc_client.py");
-                std::fs::write(&client_path, python_client_stub())
-                    .map_err(|e| DuDuClawError::Agent(format!("Failed to write client stub: {e}")))?;
-                (path.clone(), duduclaw_core::platform::python3_command().to_string(), vec![path.to_string_lossy().to_string()])
+                std::fs::write(&client_path, python_client_stub()).map_err(|e| {
+                    DuDuClawError::Agent(format!("Failed to write client stub: {e}"))
+                })?;
+                (
+                    path.clone(),
+                    duduclaw_core::platform::python3_command().to_string(),
+                    vec![path.to_string_lossy().to_string()],
+                )
             }
             ScriptLanguage::Bash => {
                 #[cfg(not(windows))]
                 {
                     let path = tmp_dir.join("script.sh");
-                    std::fs::write(&path, &req.script)
-                        .map_err(|e| DuDuClawError::Agent(format!("Failed to write script: {e}")))?;
-                    (path.clone(), "bash".to_string(), vec![path.to_string_lossy().to_string()])
+                    std::fs::write(&path, &req.script).map_err(|e| {
+                        DuDuClawError::Agent(format!("Failed to write script: {e}"))
+                    })?;
+                    (
+                        path.clone(),
+                        "bash".to_string(),
+                        vec![path.to_string_lossy().to_string()],
+                    )
                 }
                 #[cfg(windows)]
                 {
                     let path = tmp_dir.join("script.cmd");
-                    std::fs::write(&path, &req.script)
-                        .map_err(|e| DuDuClawError::Agent(format!("Failed to write script: {e}")))?;
-                    (path.clone(), "cmd".to_string(), vec!["/C".to_string(), path.to_string_lossy().to_string()])
+                    std::fs::write(&path, &req.script).map_err(|e| {
+                        DuDuClawError::Agent(format!("Failed to write script: {e}"))
+                    })?;
+                    (
+                        path.clone(),
+                        "cmd".to_string(),
+                        vec!["/C".to_string(), path.to_string_lossy().to_string()],
+                    )
                 }
             }
         };
@@ -202,11 +212,24 @@ impl PtcSandbox {
             .args(&args)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("HOME", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default())
-            .env("USERPROFILE", std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default())
+            .env(
+                "HOME",
+                std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_default(),
+            )
+            .env(
+                "USERPROFILE",
+                std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .unwrap_or_default(),
+            )
             .env("LANG", std::env::var("LANG").unwrap_or_default())
             .env("PYTHONUNBUFFERED", "1")
-            .env("DUDUCLAW_PTC_SOCKET", rpc_server.socket_path().to_string_lossy().as_ref())
+            .env(
+                "DUDUCLAW_PTC_SOCKET",
+                rpc_server.socket_path().to_string_lossy().as_ref(),
+            )
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -274,7 +297,9 @@ impl PtcSandbox {
                     truncated,
                 })
             }
-            Ok(Err(e)) => Err(DuDuClawError::Agent(format!("Script execution failed: {e}"))),
+            Ok(Err(e)) => Err(DuDuClawError::Agent(format!(
+                "Script execution failed: {e}"
+            ))),
             Err(_) => {
                 // CRITICAL: Kill child process on timeout to prevent orphaned processes
                 let _ = child.kill().await;
@@ -332,8 +357,9 @@ impl PtcSandbox {
                 std::fs::write(&path, &req.script)
                     .map_err(|e| DuDuClawError::Agent(format!("Failed to write script: {e}")))?;
                 let client_path = tmp_dir.join("ptc_client.py");
-                std::fs::write(&client_path, python_client_stub())
-                    .map_err(|e| DuDuClawError::Agent(format!("Failed to write client stub: {e}")))?;
+                std::fs::write(&client_path, python_client_stub()).map_err(|e| {
+                    DuDuClawError::Agent(format!("Failed to write client stub: {e}"))
+                })?;
                 (
                     format!("{CONTAINER_WORKSPACE}/script.py"),
                     vec![
@@ -347,11 +373,15 @@ impl PtcSandbox {
                 std::fs::write(&path, &req.script)
                     .map_err(|e| DuDuClawError::Agent(format!("Failed to write script: {e}")))?;
                 let client_path = tmp_dir.join("ptc_client.sh");
-                std::fs::write(&client_path, bash_client_stub())
-                    .map_err(|e| DuDuClawError::Agent(format!("Failed to write client stub: {e}")))?;
+                std::fs::write(&client_path, bash_client_stub()).map_err(|e| {
+                    DuDuClawError::Agent(format!("Failed to write client stub: {e}"))
+                })?;
                 (
                     format!("{CONTAINER_WORKSPACE}/script.sh"),
-                    vec!["bash".to_string(), format!("{CONTAINER_WORKSPACE}/script.sh")],
+                    vec![
+                        "bash".to_string(),
+                        format!("{CONTAINER_WORKSPACE}/script.sh"),
+                    ],
                 )
             }
         };
@@ -398,10 +428,6 @@ impl PtcSandbox {
             ],
             sandbox_enabled: true,
             network_access: false, // --network=none
-            worktree_enabled: false,
-            worktree_auto_merge: true,
-            worktree_cleanup_on_exit: true,
-            worktree_copy_files: vec![],
             cmd: container_cmd,
             env: vec![("DUDUCLAW_PTC_SOCKET".to_string(), container_socket)],
         };

@@ -4,7 +4,7 @@
 //! ## Why this exists
 //!
 //! Before this module, every notification exit in the gateway
-//! (`goal_notify::notify_agent_plain`, `decision_notify::deliver`,
+//! (`goal_notify::notify_agent_plain`, `notify_push::push`,
 //! `channel_alerts`, the budget breaker push, the GVU stagnation /
 //! consolidation pushes, the skill-gap digest) decided *on its own* whether
 //! and when to interrupt someone. There was no way to say "not at 3am", no
@@ -201,7 +201,11 @@ impl QuietWindow {
 
     /// `HH:MM-HH:MM` round-trip, for operator-facing surfaces.
     pub fn to_display(self) -> String {
-        format!("{}-{}", self.start.format("%H:%M"), self.end.format("%H:%M"))
+        format!(
+            "{}-{}",
+            self.start.format("%H:%M"),
+            self.end.format("%H:%M")
+        )
     }
 }
 
@@ -303,7 +307,11 @@ pub enum GateDecision {
 /// - No window configured ⇒ always delivers.
 /// - Outside the window ⇒ delivers.
 /// - Inside the window ⇒ defer to the window's end.
-pub fn gate(level: NotifyLevel, window: Option<QuietWindow>, local_now: NaiveDateTime) -> GateDecision {
+pub fn gate(
+    level: NotifyLevel,
+    window: Option<QuietWindow>,
+    local_now: NaiveDateTime,
+) -> GateDecision {
     if !level.is_suppressible() {
         return GateDecision::Deliver;
     }
@@ -368,10 +376,7 @@ pub fn load_agent_policy(home_dir: &Path, agent_id: &str) -> QuietPolicy {
     let mut tz = NotifyTz::System;
     let mut window = None;
 
-    let agent_toml = home_dir
-        .join("agents")
-        .join(agent_id)
-        .join("agent.toml");
+    let agent_toml = home_dir.join("agents").join(agent_id).join("agent.toml");
     if let Ok(content) = std::fs::read_to_string(&agent_toml) {
         if let Ok(table) = content.parse::<toml::Table>() {
             if let Some(p) = table.get("proactive").and_then(|v| v.as_table()) {
@@ -600,8 +605,8 @@ pub fn enqueue(home_dir: &Path, notice: DeferredNotice) -> bool {
         let (kept, stale, overflow) = prune(notices, now);
         if stale > 0 || overflow > 0 {
             warn!(
-                stale, overflow,
-                "notify-governance: 排隊中的通知已達上限或過期，已丟棄（未送出）"
+                stale,
+                overflow, "notify-governance: 排隊中的通知已達上限或過期，已丟棄（未送出）"
             );
         }
         write_queue(&path, &kept)
@@ -627,11 +632,14 @@ pub fn take_due(home_dir: &Path, now: DateTime<Utc>) -> Vec<DeferredNotice> {
         let notices = read_queue(&path);
         let (kept, stale, overflow) = prune(notices, now);
         if stale > 0 || overflow > 0 {
-            warn!(stale, overflow, "notify-governance: 排隊通知過期或溢位，已丟棄（未送出）");
+            warn!(
+                stale,
+                overflow, "notify-governance: 排隊通知過期或溢位，已丟棄（未送出）"
+            );
         }
-        let (due, pending): (Vec<_>, Vec<_>) = kept.into_iter().partition(|n| {
-            n.deliver_after_dt().map(|t| t <= now).unwrap_or(true)
-        });
+        let (due, pending): (Vec<_>, Vec<_>) = kept
+            .into_iter()
+            .partition(|n| n.deliver_after_dt().map(|t| t <= now).unwrap_or(true));
         write_queue(&path, &pending)?;
         Ok(due)
     });
@@ -750,7 +758,8 @@ impl DeferredNotifyDrainer {
         // Plain notices → one merged message per destination.
         for batch in merge_plain(&due) {
             let Some(token) =
-                crate::goal_notify::channel_token(&self.home_dir, &batch.agent_id, &batch.channel).await
+                crate::goal_notify::channel_token(&self.home_dir, &batch.agent_id, &batch.channel)
+                    .await
             else {
                 warn!(
                     channel = %batch.channel,
@@ -759,7 +768,7 @@ impl DeferredNotifyDrainer {
                 );
                 continue;
             };
-            let ok = crate::goal_notify::send_plain_text(
+            let ok = crate::channel_sender::send_plain_text(
                 &self.home_dir,
                 &http,
                 &batch.channel,
@@ -801,7 +810,8 @@ impl DeferredNotifyDrainer {
     /// "此決定已處理" style refusal, so the cost is one stale card, never a
     /// double-apply.
     async fn deliver_decision(&self, http: &reqwest::Client, n: &DeferredNotice) -> bool {
-        let (Some(src_token), Some(decision_id)) = (n.decision_source.as_deref(), n.decision_id.as_deref())
+        let (Some(src_token), Some(decision_id)) =
+            (n.decision_source.as_deref(), n.decision_id.as_deref())
         else {
             warn!("notify-governance: 延後的決定卡缺少來源或 id，略過");
             return false;
@@ -821,10 +831,7 @@ impl DeferredNotifyDrainer {
             decision_id,
             body: &n.text,
             link: n.link.as_deref(),
-            no_button_hint: n
-                .no_button_hint
-                .as_deref()
-                .unwrap_or("請至儀表板處理。"),
+            no_button_hint: n.no_button_hint.as_deref().unwrap_or("請至儀表板處理。"),
         };
         crate::decision_notify::deliver_now(
             &self.home_dir,
@@ -863,7 +870,9 @@ pub(crate) mod tests {
     }
 
     fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(y, mo, d).unwrap().and_time(t(h, mi))
+        NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_time(t(h, mi))
     }
 
     // ── parsing ──────────────────────────────────────────────────
@@ -892,7 +901,10 @@ pub(crate) mod tests {
     fn accepts_single_digit_hours_and_surrounding_space() {
         assert_eq!(
             QuietWindow::parse("  9:05 - 17:00 "),
-            Some(QuietWindow { start: t(9, 5), end: t(17, 0) })
+            Some(QuietWindow {
+                start: t(9, 5),
+                end: t(17, 0)
+            })
         );
     }
 
@@ -900,9 +912,20 @@ pub(crate) mod tests {
     fn malformed_windows_fail_open_to_none() {
         // Every one of these must mean "no quiet hours", never "mute all".
         for bad in [
-            "", "   ", "22:00", "22:00-", "-08:00", "22-08", "22:00-08:00-09:00",
-            "25:00-08:00", "22:61-08:00", "abc-def", "22:00–08:00", // en-dash
-            "22:00_08:00", "-", "::",
+            "",
+            "   ",
+            "22:00",
+            "22:00-",
+            "-08:00",
+            "22-08",
+            "22:00-08:00-09:00",
+            "25:00-08:00",
+            "22:61-08:00",
+            "abc-def",
+            "22:00–08:00", // en-dash
+            "22:00_08:00",
+            "-",
+            "::",
         ] {
             assert_eq!(QuietWindow::parse(bad), None, "must fail open: {bad:?}");
         }
@@ -918,8 +941,14 @@ pub(crate) mod tests {
 
     #[test]
     fn display_round_trips() {
-        assert_eq!(QuietWindow::parse("22:00-08:00").unwrap().to_display(), "22:00-08:00");
-        assert_eq!(QuietWindow::parse("9:05-17:00").unwrap().to_display(), "09:05-17:00");
+        assert_eq!(
+            QuietWindow::parse("22:00-08:00").unwrap().to_display(),
+            "22:00-08:00"
+        );
+        assert_eq!(
+            QuietWindow::parse("9:05-17:00").unwrap().to_display(),
+            "09:05-17:00"
+        );
     }
 
     // ── next_end_after ───────────────────────────────────────────
@@ -941,14 +970,23 @@ pub(crate) mod tests {
     #[test]
     fn same_day_window_ends_the_same_day() {
         let w = QuietWindow::parse("09:00-17:00").unwrap();
-        assert_eq!(w.next_end_after(dt(2026, 8, 11, 10, 0)), dt(2026, 8, 11, 17, 0));
+        assert_eq!(
+            w.next_end_after(dt(2026, 8, 11, 10, 0)),
+            dt(2026, 8, 11, 17, 0)
+        );
     }
 
     #[test]
     fn month_and_year_rollover_are_handled() {
         let w = QuietWindow::parse("22:00-08:00").unwrap();
-        assert_eq!(w.next_end_after(dt(2026, 12, 31, 23, 0)), dt(2027, 1, 1, 8, 0));
-        assert_eq!(w.next_end_after(dt(2026, 1, 31, 23, 0)), dt(2026, 2, 1, 8, 0));
+        assert_eq!(
+            w.next_end_after(dt(2026, 12, 31, 23, 0)),
+            dt(2027, 1, 1, 8, 0)
+        );
+        assert_eq!(
+            w.next_end_after(dt(2026, 1, 31, 23, 0)),
+            dt(2026, 2, 1, 8, 0)
+        );
     }
 
     // ── the gate ─────────────────────────────────────────────────
@@ -956,7 +994,10 @@ pub(crate) mod tests {
     #[test]
     fn l3_is_never_suppressed() {
         let w = QuietWindow::parse("22:00-08:00");
-        assert_eq!(gate(NotifyLevel::Act, w, dt(2026, 8, 11, 3, 0)), GateDecision::Deliver);
+        assert_eq!(
+            gate(NotifyLevel::Act, w, dt(2026, 8, 11, 3, 0)),
+            GateDecision::Deliver
+        );
     }
 
     #[test]
@@ -980,7 +1021,10 @@ pub(crate) mod tests {
     #[test]
     fn no_window_means_no_suppression_at_any_level() {
         for lvl in [NotifyLevel::Fyi, NotifyLevel::Confirm, NotifyLevel::Act] {
-            assert_eq!(gate(lvl, None, dt(2026, 8, 11, 3, 0)), GateDecision::Deliver);
+            assert_eq!(
+                gate(lvl, None, dt(2026, 8, 11, 3, 0)),
+                GateDecision::Deliver
+            );
         }
     }
 
@@ -988,7 +1032,10 @@ pub(crate) mod tests {
     fn boundary_minutes_behave_as_documented() {
         let w = QuietWindow::parse("22:00-08:00");
         // 21:59 delivers, 22:00 defers, 07:59 defers, 08:00 delivers.
-        assert_eq!(gate(NotifyLevel::Fyi, w, dt(2026, 8, 11, 21, 59)), GateDecision::Deliver);
+        assert_eq!(
+            gate(NotifyLevel::Fyi, w, dt(2026, 8, 11, 21, 59)),
+            GateDecision::Deliver
+        );
         assert!(matches!(
             gate(NotifyLevel::Fyi, w, dt(2026, 8, 11, 22, 0)),
             GateDecision::DeferUntil(_)
@@ -997,7 +1044,10 @@ pub(crate) mod tests {
             gate(NotifyLevel::Fyi, w, dt(2026, 8, 11, 7, 59)),
             GateDecision::DeferUntil(_)
         ));
-        assert_eq!(gate(NotifyLevel::Fyi, w, dt(2026, 8, 11, 8, 0)), GateDecision::Deliver);
+        assert_eq!(
+            gate(NotifyLevel::Fyi, w, dt(2026, 8, 11, 8, 0)),
+            GateDecision::Deliver
+        );
     }
 
     // ── level vocabulary ─────────────────────────────────────────
@@ -1052,7 +1102,9 @@ pub(crate) mod tests {
         let tz = NotifyTz::Named(chrono_tz::America::New_York);
         let utc = tz.to_utc(dt(2026, 3, 8, 2, 30));
         // Must land on a real instant just after the gap, not panic.
-        let back = utc.with_timezone(&chrono_tz::America::New_York).naive_local();
+        let back = utc
+            .with_timezone(&chrono_tz::America::New_York)
+            .naive_local();
         assert!(back >= dt(2026, 3, 8, 3, 0), "resolved to {back}");
     }
 
@@ -1081,7 +1133,10 @@ pub(crate) mod tests {
         let note = policy.suppression_note_zh().unwrap();
         assert!(note.contains("22:00-08:00"));
         assert!(note.contains("延後"));
-        assert!(note.contains("照常即時送達"), "the exemption must be stated, not implied");
+        assert!(
+            note.contains("照常即時送達"),
+            "the exemption must be stated, not implied"
+        );
         assert!(QuietPolicy::none().suppression_note_zh().is_none());
     }
 
@@ -1130,7 +1185,11 @@ pub(crate) mod tests {
     #[test]
     fn malformed_agent_window_fails_open() {
         let dir = tempfile::tempdir().unwrap();
-        write_agent(dir.path(), "kiki", "[proactive]\nquiet_hours = \"晚上到早上\"\n");
+        write_agent(
+            dir.path(),
+            "kiki",
+            "[proactive]\nquiet_hours = \"晚上到早上\"\n",
+        );
         assert_eq!(load_agent_policy(dir.path(), "kiki").window, None);
     }
 
@@ -1148,7 +1207,11 @@ pub(crate) mod tests {
             QuietWindow::parse("01:00-05:00")
         );
         // Agent value ⇒ agent wins.
-        write_agent(dir.path(), "kiki", "[proactive]\nquiet_hours = \"22:00-08:00\"\n");
+        write_agent(
+            dir.path(),
+            "kiki",
+            "[proactive]\nquiet_hours = \"22:00-08:00\"\n",
+        );
         assert_eq!(
             load_agent_policy(dir.path(), "kiki").window,
             QuietWindow::parse("22:00-08:00")
@@ -1160,7 +1223,11 @@ pub(crate) mod tests {
     #[test]
     fn raw_quiet_hours_returns_the_agents_own_value_verbatim() {
         let dir = tempfile::tempdir().unwrap();
-        write_agent(dir.path(), "kiki", "[proactive]\nquiet_hours = \"  22:00-08:00 \"\n");
+        write_agent(
+            dir.path(),
+            "kiki",
+            "[proactive]\nquiet_hours = \"  22:00-08:00 \"\n",
+        );
         assert_eq!(agent_raw_quiet_hours(dir.path(), "kiki"), "22:00-08:00");
     }
 
@@ -1190,7 +1257,11 @@ pub(crate) mod tests {
         // input is rejected. An operator re-opening the form must see
         // exactly what's on disk, not a silently-blanked field.
         let dir = tempfile::tempdir().unwrap();
-        write_agent(dir.path(), "kiki", "[proactive]\nquiet_hours = \"晚上到早上\"\n");
+        write_agent(
+            dir.path(),
+            "kiki",
+            "[proactive]\nquiet_hours = \"晚上到早上\"\n",
+        );
         assert_eq!(agent_raw_quiet_hours(dir.path(), "kiki"), "晚上到早上");
     }
 
@@ -1203,7 +1274,11 @@ pub(crate) mod tests {
     #[test]
     fn malformed_global_window_fails_open() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[notify]\nquiet_hours = \"nope\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[notify]\nquiet_hours = \"nope\"\n",
+        )
+        .unwrap();
         assert_eq!(load_global_window(dir.path()), None);
         std::fs::write(dir.path().join("config.toml"), "not [ valid toml").unwrap();
         assert_eq!(load_global_window(dir.path()), None);
@@ -1234,8 +1309,14 @@ pub(crate) mod tests {
     fn enqueue_then_take_due_returns_only_ripe_notices() {
         let dir = tempfile::tempdir().unwrap();
         let now = Utc::now();
-        assert!(enqueue(dir.path(), notice("a", now, now - chrono::Duration::minutes(1), "ripe")));
-        assert!(enqueue(dir.path(), notice("b", now, now + chrono::Duration::hours(4), "later")));
+        assert!(enqueue(
+            dir.path(),
+            notice("a", now, now - chrono::Duration::minutes(1), "ripe")
+        ));
+        assert!(enqueue(
+            dir.path(),
+            notice("b", now, now + chrono::Duration::hours(4), "later")
+        ));
 
         let due = take_due(dir.path(), now);
         assert_eq!(due.len(), 1);
@@ -1281,7 +1362,12 @@ pub(crate) mod tests {
     fn prune_drops_stale_and_caps_the_queue() {
         let now = Utc::now();
         let fresh = notice("f", now, now, "fresh");
-        let stale = notice("s", now - chrono::Duration::hours(MAX_QUEUE_AGE_HOURS + 1), now, "stale");
+        let stale = notice(
+            "s",
+            now - chrono::Duration::hours(MAX_QUEUE_AGE_HOURS + 1),
+            now,
+            "stale",
+        );
         let (kept, dropped_stale, overflow) = prune(vec![fresh, stale], now);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, "f");
@@ -1302,7 +1388,10 @@ pub(crate) mod tests {
         let (kept, _, overflow) = prune(many, now);
         assert_eq!(kept.len(), MAX_QUEUE_ENTRIES);
         assert_eq!(overflow, 5);
-        assert_eq!(kept.last().unwrap().id, format!("n{}", MAX_QUEUE_ENTRIES + 4));
+        assert_eq!(
+            kept.last().unwrap().id,
+            format!("n{}", MAX_QUEUE_ENTRIES + 4)
+        );
     }
 
     #[test]
@@ -1459,7 +1548,10 @@ pub(crate) mod tests {
         write_agent(
             dir.path(),
             "kiki",
-            &format!("[proactive]\nquiet_hours = \"{}\"\n", window_excluding_now()),
+            &format!(
+                "[proactive]\nquiet_hours = \"{}\"\n",
+                window_excluding_now()
+            ),
         );
         let policy = load_agent_policy(dir.path(), "kiki");
         let now = Utc::now();
@@ -1480,7 +1572,10 @@ pub(crate) mod tests {
         let until = load_agent_policy(dir.path(), "kiki")
             .decide(NotifyLevel::Fyi, now)
             .unwrap();
-        assert!(until > now, "a deferral that is already due would deliver instantly");
+        assert!(
+            until > now,
+            "a deferral that is already due would deliver instantly"
+        );
         assert!(
             until - now <= chrono::Duration::hours(25),
             "no quiet window can hold a notification for more than a day"

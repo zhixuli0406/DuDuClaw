@@ -27,7 +27,6 @@ duduclaw-identity = { workspace = true }
 # the model; the dashboard is not such an embedder.
 duduclaw-redaction = { workspace = true, features = ["ner"] }
 duduclaw-cli-runtime = { workspace = true }
-duduclaw-cli-worker = { workspace = true }
 duduclaw-license = { workspace = true }
 duduclaw-os = { workspace = true }
 duduclaw-llm = { workspace = true }
@@ -116,6 +115,27 @@ openssl-sys = { version = "0.9", optional = true }
 # target-gated.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# OpenTelemetry GenAI tracing + OTLP export (feature "otel", default OFF —
+# zero deps / zero overhead when disabled; spans are plain `tracing` either
+# way, the feature only compiles the OTLP export layer in src/otel.rs).
+# grpc-tonic transport (default) keeps us off reqwest 0.13 (otlp's http default
+# would duplicate the gateway's reqwest 0.12). tls-webpki-roots supports HTTPS
+# gRPC collectors (Langfuse/Grafana Cloud). Mutually-compatible 0.32/0.33 set.
+#
+# H7 (2026-09-29): these five lived under `[target.'cfg(target_os = "linux")'
+# .dependencies]`, so `--features otel` could not compile on macOS or Windows
+# at all — the crates were simply never linked. Nothing had ever built the
+# feature, so the breakage was invisible. They are `optional = true`, which is
+# what keeps them out of a default build; target-gating them on top of that
+# only removed platforms. Moved into the plain dependency table.
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic", "tls-webpki-roots"], optional = true }
+tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
+# Already in the otel tree via opentelemetry-otlp's grpc-tonic transport; named
+# directly only for tonic::metadata::MetadataKey (non-panicking header insert).
+tonic = { version = "0.14", default-features = false, optional = true }
+
 [target.'cfg(unix)'.dependencies]
 # "fs" (statvfs) + "net" (ifaddrs) added for WP-B appliance `device.status`
 # disk/network readings (crates/duduclaw-gateway/src/device.rs) — both are
@@ -157,30 +177,14 @@ atspi = "0.30"
 # Discord voice channel support (Songbird)
 songbird = { version = "0.5", optional = true, features = ["driver", "rustls", "receive"] }
 
-# OpenTelemetry GenAI tracing + OTLP export (feature "otel", default OFF —
-# zero deps / zero overhead when disabled; spans are plain `tracing` either
-# way, the feature only compiles the OTLP export layer in src/otel.rs).
-# grpc-tonic transport (default) keeps us off reqwest 0.13 (otlp's http default
-# would duplicate the gateway's reqwest 0.12). tls-webpki-roots supports HTTPS
-# gRPC collectors (Langfuse/Grafana Cloud). Mutually-compatible 0.32/0.33 set.
-opentelemetry = { version = "0.32", default-features = false, features = ["trace"], optional = true }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"], optional = true }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic", "tls-webpki-roots"], optional = true }
-tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
-# Already in the otel tree via opentelemetry-otlp's grpc-tonic transport; named
-# directly only for tonic::metadata::MetadataKey (non-panicking header insert).
-tonic = { version = "0.14", default-features = false, optional = true }
-
 [features]
 default = ["dashboard", "desktop"]
 desktop = ["dep:duduclaw-desktop", "dep:enigo"]
 dashboard = ["dep:duduclaw-dashboard"]
 vendored-openssl = ["openssl-sys/vendored"]
-metal = ["duduclaw-inference/metal"]
-cuda = ["duduclaw-inference/cuda"]
-vulkan = ["duduclaw-inference/vulkan"]
-mistralrs-metal = ["duduclaw-inference/mistralrs-metal"]
-mistralrs-cuda = ["duduclaw-inference/mistralrs-cuda"]
+# `metal`/`cuda`/`vulkan`/`mistralrs-*` forwarding removed 2026-09-29 together
+# with the in-process llama.cpp / mistral.rs backends they gated
+# (`wiki/reports/feature-audit-2026-09-29.md` T1-D3 / T3-S5).
 discord-voice = ["dep:songbird"]
 # OpenTelemetry GenAI tracing + OTLP export (see src/otel.rs). Default OFF.
 otel = [
@@ -193,6 +197,9 @@ otel = [
 
 [dev-dependencies]
 tempfile = "3"
+# `Router::oneshot` for middleware regression tests (decision_gate) — drives the
+# real router in-process instead of binding a port. Already in the tree via axum.
+tower = { version = "0.5", features = ["util"] }
 # P2 license control-plane integration tests need to name the license types and
 # encode signatures against the clean (non-test) lib build.
 duduclaw-license = { workspace = true }

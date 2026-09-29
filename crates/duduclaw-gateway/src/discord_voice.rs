@@ -27,8 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::{info, warn, debug};
-
+use tracing::{debug, info, warn};
 
 /// Discord voice channel session state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +112,10 @@ impl UserAudioBuffer {
     fn append_samples(&mut self, data: &[i16]) {
         let mut remaining = Self::MAX_BUFFER_SAMPLES.saturating_sub(self.samples.len());
         if remaining == 0 {
-            warn!(user_id = self.user_id, "Audio buffer full (30s), forcing clear");
+            warn!(
+                user_id = self.user_id,
+                "Audio buffer full (30s), forcing clear"
+            );
             self.samples.clear();
             remaining = Self::MAX_BUFFER_SAMPLES;
         }
@@ -195,7 +197,8 @@ impl DiscordVoiceManager {
             return false;
         }
         sessions.insert(guild_id, VoiceChannelState::Connecting);
-        self.active_count.store(sessions.len() as u32, std::sync::atomic::Ordering::Release);
+        self.active_count
+            .store(sessions.len() as u32, std::sync::atomic::Ordering::Release);
         info!(guild_id, "Discord voice: joining channel");
         true
     }
@@ -220,13 +223,16 @@ impl DiscordVoiceManager {
     pub async fn record_leave(&self, guild_id: u64) {
         let mut sessions = self.sessions.write().await;
         sessions.remove(&guild_id);
-        self.active_count.store(sessions.len() as u32, std::sync::atomic::Ordering::Release);
+        self.active_count
+            .store(sessions.len() as u32, std::sync::atomic::Ordering::Release);
         info!(guild_id, "Discord voice: left channel");
     }
 
     /// Get the state of a specific guild's voice session.
     pub async fn get_state(&self, guild_id: u64) -> VoiceChannelState {
-        self.sessions.read().await
+        self.sessions
+            .read()
+            .await
             .get(&guild_id)
             .copied()
             .unwrap_or(VoiceChannelState::Disconnected)
@@ -253,7 +259,8 @@ impl DiscordVoiceManager {
         // Append new audio to per-user buffers
         for (&user_id, samples) in user_audio {
             let buffer = buffers.entry(user_id).or_insert_with(|| {
-                let name = user_names.get(&user_id)
+                let name = user_names
+                    .get(&user_id)
                     .cloned()
                     .unwrap_or_else(|| format!("User-{user_id}"));
                 UserAudioBuffer::new(user_id, name)
@@ -324,7 +331,10 @@ impl SongbirdReceiver {
 #[cfg(feature = "discord-voice")]
 #[async_trait]
 impl songbird::events::EventHandler for SongbirdReceiver {
-    async fn act(&self, ctx: &songbird::events::EventContext<'_>) -> Option<songbird::events::Event> {
+    async fn act(
+        &self,
+        ctx: &songbird::events::EventContext<'_>,
+    ) -> Option<songbird::events::Event> {
         use songbird::events::EventContext;
 
         if let EventContext::VoiceTick(tick) = ctx {
@@ -341,7 +351,8 @@ impl songbird::events::EventHandler for SongbirdReceiver {
                     // access control or billing.
                     let session_id = ssrc as u64;
                     user_audio.insert(session_id, decoded.clone());
-                    user_names.entry(session_id)
+                    user_names
+                        .entry(session_id)
                         .or_insert_with(|| format!("Voice-{ssrc}"));
                 }
             }
@@ -357,7 +368,12 @@ impl songbird::events::EventHandler for SongbirdReceiver {
 
                 // Send ASR-ready segments without holding the lock
                 for (user_id, display_name, pcm) in ready {
-                    if self.asr_tx.send((user_id, display_name, pcm)).await.is_err() {
+                    if self
+                        .asr_tx
+                        .send((user_id, display_name, pcm))
+                        .await
+                        .is_err()
+                    {
                         warn!("Discord voice: ASR channel closed");
                         break;
                     }
@@ -404,8 +420,7 @@ pub async fn join_voice_channel(
         let mut handler = handler_lock.lock().await;
 
         // Enable decoding of received audio
-        let config = songbird::Config::default()
-            .decode_mode(songbird::driver::DecodeMode::Decode);
+        let config = songbird::Config::default().decode_mode(songbird::driver::DecodeMode::Decode);
         handler.set_config(config);
 
         // Register event handlers
@@ -414,15 +429,15 @@ pub async fn join_voice_channel(
             SongbirdReceiver::new(voice_manager.clone(), asr_tx),
         );
 
-        handler.add_global_event(
-            CoreEvent::SpeakingStateUpdate.into(),
-            SpeakingStateHandler,
-        );
+        handler.add_global_event(CoreEvent::SpeakingStateUpdate.into(), SpeakingStateHandler);
     }
 
     // Transition Connecting → Connected
     voice_manager.record_connected(guild_id).await;
-    info!(guild_id, channel_id, "Discord voice: joined channel with Songbird");
+    info!(
+        guild_id,
+        channel_id, "Discord voice: joined channel with Songbird"
+    );
 
     Ok(asr_rx)
 }
@@ -434,10 +449,17 @@ struct SpeakingStateHandler;
 #[cfg(feature = "discord-voice")]
 #[async_trait]
 impl songbird::events::EventHandler for SpeakingStateHandler {
-    async fn act(&self, ctx: &songbird::events::EventContext<'_>) -> Option<songbird::events::Event> {
+    async fn act(
+        &self,
+        ctx: &songbird::events::EventContext<'_>,
+    ) -> Option<songbird::events::Event> {
         use songbird::events::EventContext;
         if let EventContext::SpeakingStateUpdate(speaking) = ctx {
-            debug!(ssrc = speaking.ssrc, speaking = speaking.speaking, "Discord voice: speaking state");
+            debug!(
+                ssrc = speaking.ssrc,
+                speaking = speaking.speaking,
+                "Discord voice: speaking state"
+            );
         }
         None
     }
@@ -532,7 +554,9 @@ mod tests {
         user_names.insert(42u64, "TestUser".to_string());
 
         // First tick: audio arrives
-        let ready = mgr.process_voice_tick(&user_audio, &user_names, &mut buffers).await;
+        let ready = mgr
+            .process_voice_tick(&user_audio, &user_names, &mut buffers)
+            .await;
         // With 0s silence timeout, should be ready immediately
         assert!(!ready.is_empty() || buffers.contains_key(&42));
     }

@@ -9,8 +9,8 @@
 //! send a natural-language stop word from their phone.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -19,8 +19,8 @@ use tracing::{error, info, warn};
 
 use crate::channel_sender::ChannelSender;
 use crate::computer_use::{
-    mask_screenshot_regions, ComputerAction, ComputerUseError, ComputerUseSession, MaskingConfig,
-    Message,
+    ComputerAction, ComputerUseError, ComputerUseSession, MaskingConfig, Message,
+    mask_screenshot_regions,
 };
 use crate::risk_detector::{self, ActionContext, RiskLevel};
 use crate::screenshot_audit::{AuditEntry, BrowserAuditLog};
@@ -51,15 +51,26 @@ const MAX_CONCURRENT_SESSIONS: usize = 5;
 /// Window titles that indicate a credential / secret context. Mirrors the
 /// `capture_masked_screenshot` list so masking and risk assessment agree.
 const SENSITIVE_WINDOW_MARKERS: &[&str] = &[
-    "1password", "bitwarden", "lastpass", "keepass",
-    "keychain", "密碼", "password", "credential",
-    "ssh", "gpg", "pgp",
+    "1password",
+    "bitwarden",
+    "lastpass",
+    "keepass",
+    "keychain",
+    "密碼",
+    "password",
+    "credential",
+    "ssh",
+    "gpg",
+    "pgp",
 ];
 
 /// D12: does this action enter input (text/keystrokes) that could land in a
 /// sensitive field? `Type` and `Key` write characters; clicks/moves do not.
 fn action_targets_input(action: &ComputerAction) -> bool {
-    matches!(action, ComputerAction::Type { .. } | ComputerAction::Key { .. })
+    matches!(
+        action,
+        ComputerAction::Type { .. } | ComputerAction::Key { .. }
+    )
 }
 
 /// D12: is the focused window a known credential / secret context?
@@ -76,7 +87,10 @@ fn window_is_sensitive(title: Option<&str>) -> bool {
 /// Register an orchestrator's control handle in the global registry.
 ///
 /// Returns `Err` if the maximum concurrent session limit is reached.
-pub async fn register_session(session_id: &str, control: Arc<OrchestratorControl>) -> Result<(), ComputerUseError> {
+pub async fn register_session(
+    session_id: &str,
+    control: Arc<OrchestratorControl>,
+) -> Result<(), ComputerUseError> {
     let mut registry = session_registry().lock().await;
     if registry.len() >= MAX_CONCURRENT_SESSIONS {
         return Err(ComputerUseError::ApiError(format!(
@@ -259,11 +273,7 @@ impl Drop for ComputerUseOrchestrator {
 }
 
 impl ComputerUseOrchestrator {
-    pub fn new(
-        agent_id: String,
-        home_dir: PathBuf,
-        config: ComputerUseConfig,
-    ) -> Self {
+    pub fn new(agent_id: String, home_dir: PathBuf, config: ComputerUseConfig) -> Self {
         Self {
             container_id: None,
             session: None,
@@ -285,7 +295,11 @@ impl ComputerUseOrchestrator {
     // ── Container lifecycle ───────────────────────────────────
 
     /// Start a computer use container and wait for the virtual display.
-    pub async fn start_session(&mut self, api_key: &str, model: &str) -> Result<(), ComputerUseError> {
+    pub async fn start_session(
+        &mut self,
+        api_key: &str,
+        model: &str,
+    ) -> Result<(), ComputerUseError> {
         info!(agent = %self.agent_id, "Starting computer use session");
 
         // SEC: Validate container image name to prevent docker flag injection
@@ -330,7 +344,10 @@ impl ComputerUseOrchestrator {
         // Environment variables for the entrypoint
         args.extend([
             "-e".to_string(),
-            format!("DISPLAY_SIZE={}x{}", self.config.display_width, self.config.display_height),
+            format!(
+                "DISPLAY_SIZE={}x{}",
+                self.config.display_width, self.config.display_height
+            ),
             "-e".to_string(),
             "DISPLAY=:99".to_string(),
         ]);
@@ -442,9 +459,10 @@ impl ComputerUseOrchestrator {
 
     /// L5a: capture screenshot via `scrot` inside the container.
     async fn capture_screenshot_container(&self) -> Result<String, ComputerUseError> {
-        let container = self.container_id.as_deref().ok_or_else(|| {
-            ComputerUseError::ApiError("No active container".to_string())
-        })?;
+        let container = self
+            .container_id
+            .as_deref()
+            .ok_or_else(|| ComputerUseError::ApiError("No active container".to_string()))?;
 
         let capture = tokio::process::Command::new("docker")
             .args(["exec", container, "scrot", "-o", "/tmp/screen.png"])
@@ -510,11 +528,8 @@ impl ComputerUseOrchestrator {
         // as a fail-safe. This previously only happened (and only in Native
         // mode); a container detection failure used to leak an unmasked image.
         if let Some(ref container) = self.container_id {
-            match crate::computer_use::detect_sensitive_regions(
-                container,
-                &self.masking.patterns,
-            )
-            .await
+            match crate::computer_use::detect_sensitive_regions(container, &self.masking.patterns)
+                .await
             {
                 Ok(regions) if !regions.is_empty() => {
                     return mask_screenshot_regions(&b64, &regions, self.masking.fill_color);
@@ -537,9 +552,17 @@ impl ComputerUseOrchestrator {
         if let Some(ref title) = self.get_active_window_title().await {
             let lower = title.to_lowercase();
             let sensitive_windows = [
-                "1password", "bitwarden", "lastpass", "keepass",
-                "keychain", "密碼", "password", "credential",
-                "ssh", "gpg", "pgp",
+                "1password",
+                "bitwarden",
+                "lastpass",
+                "keepass",
+                "keychain",
+                "密碼",
+                "password",
+                "credential",
+                "ssh",
+                "gpg",
+                "pgp",
             ];
             if sensitive_windows.iter().any(|w| lower.contains(w)) {
                 warn!(window = %title, "Sensitive window detected — masking full screenshot");
@@ -553,17 +576,19 @@ impl ComputerUseOrchestrator {
     /// Mask the entire screenshot. Used as the fail-closed safety measure when
     /// sensitive-region detection fails or a known credential window is focused.
     fn mask_full_screen(&self, b64: &str) -> Result<String, ComputerUseError> {
-        let regions = vec![[0_u32, 0, self.config.display_width, self.config.display_height]];
+        let regions = vec![[
+            0_u32,
+            0,
+            self.config.display_width,
+            self.config.display_height,
+        ]];
         mask_screenshot_regions(b64, &regions, self.masking.fill_color)
     }
 
     // ── Action execution ──────────────────────────────────────
 
     /// Execute a single `ComputerAction`, dispatching L5a (container) or L5b (native).
-    pub async fn execute_action(
-        &self,
-        action: &ComputerAction,
-    ) -> Result<(), ComputerUseError> {
+    pub async fn execute_action(&self, action: &ComputerAction) -> Result<(), ComputerUseError> {
         // Common actions handled the same in both modes
         match action {
             ComputerAction::Screenshot => return Ok(()), // handled separately
@@ -585,9 +610,10 @@ impl ComputerUseOrchestrator {
         &self,
         action: &ComputerAction,
     ) -> Result<(), ComputerUseError> {
-        let container = self.container_id.as_deref().ok_or_else(|| {
-            ComputerUseError::ApiError("No active container".to_string())
-        })?;
+        let container = self
+            .container_id
+            .as_deref()
+            .ok_or_else(|| ComputerUseError::ApiError("No active container".to_string()))?;
 
         let args = action_to_docker_args(container, action);
 
@@ -600,17 +626,16 @@ impl ComputerUseOrchestrator {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             warn!(action = ?action, stderr = %stderr, "xdotool command failed");
-            return Err(ComputerUseError::ApiError(format!("xdotool failed: {stderr}")));
+            return Err(ComputerUseError::ApiError(format!(
+                "xdotool failed: {stderr}"
+            )));
         }
         Ok(())
     }
 
     /// L5b: execute on host via `enigo` (mouse/keyboard) through spawn_blocking.
     #[cfg(feature = "desktop")]
-    async fn execute_action_native(
-        &self,
-        action: &ComputerAction,
-    ) -> Result<(), ComputerUseError> {
+    async fn execute_action_native(&self, action: &ComputerAction) -> Result<(), ComputerUseError> {
         let action = action.clone();
         tokio::task::spawn_blocking(move || {
             use enigo::{Axis, Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
@@ -620,63 +645,86 @@ impl ComputerUseOrchestrator {
 
             match action {
                 ComputerAction::LeftClick { coordinate: [x, y] } => {
-                    enigo.move_mouse(x as i32, y as i32, Coordinate::Abs)
+                    enigo
+                        .move_mouse(x as i32, y as i32, Coordinate::Abs)
                         .map_err(|e| ComputerUseError::ApiError(format!("mouse_move: {e}")))?;
-                    enigo.button(Button::Left, Direction::Click)
+                    enigo
+                        .button(Button::Left, Direction::Click)
                         .map_err(|e| ComputerUseError::ApiError(format!("click: {e}")))?;
                 }
                 ComputerAction::RightClick { coordinate: [x, y] } => {
-                    enigo.move_mouse(x as i32, y as i32, Coordinate::Abs)
+                    enigo
+                        .move_mouse(x as i32, y as i32, Coordinate::Abs)
                         .map_err(|e| ComputerUseError::ApiError(format!("mouse_move: {e}")))?;
-                    enigo.button(Button::Right, Direction::Click)
+                    enigo
+                        .button(Button::Right, Direction::Click)
                         .map_err(|e| ComputerUseError::ApiError(format!("click: {e}")))?;
                 }
                 ComputerAction::DoubleClick { coordinate: [x, y] } => {
-                    enigo.move_mouse(x as i32, y as i32, Coordinate::Abs)
+                    enigo
+                        .move_mouse(x as i32, y as i32, Coordinate::Abs)
                         .map_err(|e| ComputerUseError::ApiError(format!("mouse_move: {e}")))?;
-                    enigo.button(Button::Left, Direction::Click)
+                    enigo
+                        .button(Button::Left, Direction::Click)
                         .map_err(|e| ComputerUseError::ApiError(format!("click1: {e}")))?;
-                    enigo.button(Button::Left, Direction::Click)
+                    enigo
+                        .button(Button::Left, Direction::Click)
                         .map_err(|e| ComputerUseError::ApiError(format!("click2: {e}")))?;
                 }
                 ComputerAction::Type { ref text } => {
-                    enigo.text(text)
+                    enigo
+                        .text(text)
                         .map_err(|e| ComputerUseError::ApiError(format!("type: {e}")))?;
                 }
                 ComputerAction::Key { ref text } => {
                     // Parse key combo and execute
                     let parts: Vec<&str> = text.split('+').collect();
                     for part in &parts[..parts.len().saturating_sub(1)] {
-                        if let Some(k) = duduclaw_desktop::controller::parse_enigo_key(part.trim()) {
+                        if let Some(k) = duduclaw_desktop::controller::parse_enigo_key(part.trim())
+                        {
                             let _ = enigo.key(k, Direction::Press);
                         }
                     }
                     if let Some(last) = parts.last() {
-                        if let Some(k) = duduclaw_desktop::controller::parse_enigo_key(last.trim()) {
+                        if let Some(k) = duduclaw_desktop::controller::parse_enigo_key(last.trim())
+                        {
                             let _ = enigo.key(k, Direction::Click);
                         }
                     }
                     for part in parts[..parts.len().saturating_sub(1)].iter().rev() {
-                        if let Some(k) = duduclaw_desktop::controller::parse_enigo_key(part.trim()) {
+                        if let Some(k) = duduclaw_desktop::controller::parse_enigo_key(part.trim())
+                        {
                             let _ = enigo.key(k, Direction::Release);
                         }
                     }
                 }
-                ComputerAction::Scroll { coordinate: [x, y], ref direction, amount } => {
-                    enigo.move_mouse(x as i32, y as i32, Coordinate::Abs)
+                ComputerAction::Scroll {
+                    coordinate: [x, y],
+                    ref direction,
+                    amount,
+                } => {
+                    enigo
+                        .move_mouse(x as i32, y as i32, Coordinate::Abs)
                         .map_err(|e| ComputerUseError::ApiError(format!("mouse_move: {e}")))?;
-                    let clicks = if direction == "up" { amount as i32 } else { -(amount as i32) };
-                    enigo.scroll(clicks, Axis::Vertical)
+                    let clicks = if direction == "up" {
+                        amount as i32
+                    } else {
+                        -(amount as i32)
+                    };
+                    enigo
+                        .scroll(clicks, Axis::Vertical)
                         .map_err(|e| ComputerUseError::ApiError(format!("scroll: {e}")))?;
                 }
                 ComputerAction::MouseMove { coordinate: [x, y] } => {
-                    enigo.move_mouse(x as i32, y as i32, Coordinate::Abs)
+                    enigo
+                        .move_mouse(x as i32, y as i32, Coordinate::Abs)
                         .map_err(|e| ComputerUseError::ApiError(format!("mouse_move: {e}")))?;
                 }
                 ComputerAction::Zoom { coordinate } => {
                     let cx = ((coordinate[0] + coordinate[2]) / 2) as i32;
                     let cy = ((coordinate[1] + coordinate[3]) / 2) as i32;
-                    enigo.move_mouse(cx, cy, Coordinate::Abs)
+                    enigo
+                        .move_mouse(cx, cy, Coordinate::Abs)
                         .map_err(|e| ComputerUseError::ApiError(format!("mouse_move: {e}")))?;
                     // Simulate ctrl+plus for zoom
                     let _ = enigo.key(enigo::Key::Control, Direction::Press);
@@ -741,7 +789,13 @@ impl ComputerUseOrchestrator {
                 // Container mode: query inside the container
                 let container = self.container_id.as_deref()?;
                 let output = tokio::process::Command::new("docker")
-                    .args(["exec", container, "xdotool", "getactivewindow", "getwindowname"])
+                    .args([
+                        "exec",
+                        container,
+                        "xdotool",
+                        "getactivewindow",
+                        "getwindowname",
+                    ])
                     .output()
                     .await
                     .ok()?;
@@ -796,7 +850,9 @@ impl ComputerUseOrchestrator {
             }
             // Only reset failure counter when actually resuming from a paused state
             if was_paused {
-                self.control.consecutive_failures.store(0, Ordering::Release);
+                self.control
+                    .consecutive_failures
+                    .store(0, Ordering::Release);
             }
 
             // ── Check session timeout ──
@@ -839,9 +895,10 @@ impl ComputerUseOrchestrator {
             }
 
             // ── Call Claude Vision API ──
-            let session = self.session.as_mut().ok_or_else(|| {
-                ComputerUseError::ApiError("No active session".to_string())
-            })?;
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| ComputerUseError::ApiError("No active session".to_string()))?;
 
             let result = session
                 .execute_step(&screenshot_b64, task, &self.conversation)
@@ -850,7 +907,9 @@ impl ComputerUseOrchestrator {
             match result {
                 Ok(cu_result) => {
                     // Reset failure counter on success
-                    self.control.consecutive_failures.store(0, Ordering::Release);
+                    self.control
+                        .consecutive_failures
+                        .store(0, Ordering::Release);
 
                     // Collect text response
                     if let Some(ref text) = cu_result.text_response {
@@ -875,8 +934,8 @@ impl ComputerUseOrchestrator {
                         // into a known credential/secret context — i.e. a
                         // `Type`/`Key` action while a sensitive window is
                         // focused.
-                        let targets_sensitive_input =
-                            action_targets_input(action) && window_is_sensitive(window_title.as_deref());
+                        let targets_sensitive_input = action_targets_input(action)
+                            && window_is_sensitive(window_title.as_deref());
                         let action_ctx = ActionContext {
                             action: action.clone(),
                             model_reasoning: cu_result.text_response.clone(),
@@ -886,10 +945,15 @@ impl ComputerUseOrchestrator {
                         let risk = risk_detector::assess_risk(&action_ctx, &self.config);
 
                         // Also check CONTRACT.toml must_not rules
-                        let contract_blocked = self.check_contract_must_not(action, &cu_result.text_response);
+                        let contract_blocked =
+                            self.check_contract_must_not(action, &cu_result.text_response);
 
                         if contract_blocked || risk == RiskLevel::Blocked {
-                            let reason = if contract_blocked { "CONTRACT.toml 約束" } else { "安全規則" };
+                            let reason = if contract_blocked {
+                                "CONTRACT.toml 約束"
+                            } else {
+                                "安全規則"
+                            };
                             sender
                                 .send_text(&format!("🚫 操作被 {reason} 阻擋：{action:?}"))
                                 .await
@@ -960,7 +1024,12 @@ impl ComputerUseOrchestrator {
                                 if risk == RiskLevel::Medium {
                                     // Medium risk: notify channel with screenshot
                                     if let Ok(ss) = self.capture_masked_screenshot().await {
-                                        self.send_screenshot_to_channel(&ss, "⚠️ 中風險操作已執行", sender).await;
+                                        self.send_screenshot_to_channel(
+                                            &ss,
+                                            "⚠️ 中風險操作已執行",
+                                            sender,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -970,7 +1039,8 @@ impl ComputerUseOrchestrator {
                     // Send after-screenshot to channel
                     if self.config.screenshot_interval != ScreenshotInterval::Manual {
                         if let Ok(ss) = self.capture_masked_screenshot().await {
-                            self.send_screenshot_to_channel(&ss, "📸 操作後", sender).await;
+                            self.send_screenshot_to_channel(&ss, "📸 操作後", sender)
+                                .await;
 
                             // Save to audit
                             if let Ok(png_bytes) =
@@ -1055,10 +1125,7 @@ impl ComputerUseOrchestrator {
         // Build a semantic description of the action (not Rust Debug format)
         // so CONTRACT.toml rules written in natural language can match.
         let action_str = action_to_semantic_string(action);
-        let reasoning = model_reasoning
-            .as_deref()
-            .unwrap_or("")
-            .to_lowercase();
+        let reasoning = model_reasoning.as_deref().unwrap_or("").to_lowercase();
 
         for rule in &self.config.contract_must_not {
             let rule_lower = rule.to_lowercase();
@@ -1073,9 +1140,9 @@ impl ComputerUseOrchestrator {
                 continue; // rule has no matchable keywords
             }
             // Require ALL significant keywords to match (AND logic, not ANY)
-            let matched = keywords.iter().all(|kw| {
-                action_str.contains(kw) || reasoning.contains(kw)
-            });
+            let matched = keywords
+                .iter()
+                .all(|kw| action_str.contains(kw) || reasoning.contains(kw));
             if matched {
                 warn!(
                     rule = %rule,
@@ -1091,7 +1158,10 @@ impl ComputerUseOrchestrator {
     /// Check the threat level and pause/stop if needed.
     ///
     /// Called at the top of each loop iteration. Reads the threat level
-    /// from `~/.duduclaw/threat_level` (same file used by bash-gate.sh).
+    /// from `~/.duduclaw/threat_level`. The file has no writer inside the
+    /// workspace since the `.claude/hooks/` shell scripts were removed in
+    /// `ba015a48` — it is an operator-controlled kill switch: absent or
+    /// unreadable ⇒ `GREEN` (computer use proceeds).
     pub async fn check_threat_level(&self, sender: &dyn ChannelSender) -> bool {
         let threat_path = self.home_dir.join("threat_level");
         let level = tokio::fs::read_to_string(&threat_path)
@@ -1101,13 +1171,19 @@ impl ComputerUseOrchestrator {
 
         match level.as_str() {
             "RED" => {
-                sender.send_text("🔴 威脅等級 RED — 電腦操作已緊急終止").await.ok();
+                sender
+                    .send_text("🔴 威脅等級 RED — 電腦操作已緊急終止")
+                    .await
+                    .ok();
                 self.control.stopped.store(true, Ordering::Release);
                 true
             }
             "YELLOW" => {
                 if !self.control.paused.load(Ordering::Acquire) {
-                    sender.send_text("🟡 威脅等級 YELLOW — 電腦操作已暫停").await.ok();
+                    sender
+                        .send_text("🟡 威脅等級 YELLOW — 電腦操作已暫停")
+                        .await
+                        .ok();
                     self.control.paused.store(true, Ordering::Release);
                 }
                 false
@@ -1141,7 +1217,11 @@ fn action_to_semantic_string(action: &ComputerAction) -> String {
         ComputerAction::Key { text } => {
             format!("key press: {}", text.to_lowercase())
         }
-        ComputerAction::Scroll { coordinate: [x, y], direction, amount } => {
+        ComputerAction::Scroll {
+            coordinate: [x, y],
+            direction,
+            amount,
+        } => {
             format!("scroll {direction} {amount} at {x},{y}")
         }
         ComputerAction::MouseMove { coordinate: [x, y] } => {
@@ -1158,17 +1238,22 @@ fn action_to_semantic_string(action: &ComputerAction) -> String {
 /// Validate container image name against injection.
 fn validate_image_name(name: &str) -> Result<(), ComputerUseError> {
     if name.is_empty() || name.len() > 256 {
-        return Err(ComputerUseError::ApiError("Invalid image name length".into()));
-    }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || "._/-:".contains(c)) {
         return Err(ComputerUseError::ApiError(
-            format!("Invalid container image name (illegal chars): {name}"),
+            "Invalid image name length".into(),
         ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._/-:".contains(c))
+    {
+        return Err(ComputerUseError::ApiError(format!(
+            "Invalid container image name (illegal chars): {name}"
+        )));
     }
     if name.contains("--") || name.contains(' ') || name.contains("..") || name.starts_with('/') {
-        return Err(ComputerUseError::ApiError(
-            format!("Container image name contains forbidden pattern: {name}"),
-        ));
+        return Err(ComputerUseError::ApiError(format!(
+            "Container image name contains forbidden pattern: {name}"
+        )));
     }
     Ok(())
 }
@@ -1196,7 +1281,9 @@ fn should_isolate_network(network_access: bool, valid_domains: &[String]) -> boo
 fn validate_xdotool_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 64
-        && key.chars().all(|c| c.is_ascii_alphanumeric() || "+-_".contains(c))
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-_".contains(c))
         && !key.starts_with('-')
 }
 
@@ -1339,66 +1426,121 @@ mod tests {
 
     #[test]
     fn action_to_docker_args_left_click() {
-        let args = action_to_docker_args("test-container", &ComputerAction::LeftClick {
-            coordinate: [100, 200],
-        });
-        assert_eq!(args, vec![
-            "exec", "test-container",
-            "xdotool", "mousemove", "--sync", "100", "200", "click", "1",
-        ]);
+        let args = action_to_docker_args(
+            "test-container",
+            &ComputerAction::LeftClick {
+                coordinate: [100, 200],
+            },
+        );
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "test-container",
+                "xdotool",
+                "mousemove",
+                "--sync",
+                "100",
+                "200",
+                "click",
+                "1",
+            ]
+        );
     }
 
     #[test]
     fn action_to_docker_args_type_text() {
-        let args = action_to_docker_args("c1", &ComputerAction::Type {
-            text: "hello".to_string(),
-        });
-        assert_eq!(args, vec![
-            "exec", "c1",
-            "xdotool", "type", "--clearmodifiers", "--", "hello",
-        ]);
+        let args = action_to_docker_args(
+            "c1",
+            &ComputerAction::Type {
+                text: "hello".to_string(),
+            },
+        );
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "c1",
+                "xdotool",
+                "type",
+                "--clearmodifiers",
+                "--",
+                "hello",
+            ]
+        );
     }
 
     #[test]
     fn action_to_docker_args_key() {
-        let args = action_to_docker_args("c1", &ComputerAction::Key {
-            text: "ctrl+s".to_string(),
-        });
-        assert_eq!(args, vec![
-            "exec", "c1",
-            "xdotool", "key", "--clearmodifiers", "--", "ctrl+s",
-        ]);
+        let args = action_to_docker_args(
+            "c1",
+            &ComputerAction::Key {
+                text: "ctrl+s".to_string(),
+            },
+        );
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "c1",
+                "xdotool",
+                "key",
+                "--clearmodifiers",
+                "--",
+                "ctrl+s",
+            ]
+        );
     }
 
     #[test]
     fn action_to_docker_args_scroll_down() {
-        let args = action_to_docker_args("c1", &ComputerAction::Scroll {
-            coordinate: [50, 100],
-            direction: "down".to_string(),
-            amount: 3,
-        });
-        assert_eq!(args, vec![
-            "exec", "c1",
-            "xdotool", "mousemove", "--sync", "50", "100",
-            "click", "--repeat", "3", "5",
-        ]);
+        let args = action_to_docker_args(
+            "c1",
+            &ComputerAction::Scroll {
+                coordinate: [50, 100],
+                direction: "down".to_string(),
+                amount: 3,
+            },
+        );
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "c1",
+                "xdotool",
+                "mousemove",
+                "--sync",
+                "50",
+                "100",
+                "click",
+                "--repeat",
+                "3",
+                "5",
+            ]
+        );
     }
 
     #[test]
     fn action_to_docker_args_scroll_up() {
-        let args = action_to_docker_args("c1", &ComputerAction::Scroll {
-            coordinate: [50, 100],
-            direction: "up".to_string(),
-            amount: 2,
-        });
+        let args = action_to_docker_args(
+            "c1",
+            &ComputerAction::Scroll {
+                coordinate: [50, 100],
+                direction: "up".to_string(),
+                amount: 2,
+            },
+        );
         assert!(args.contains(&"4".to_string())); // button 4 = up
     }
 
     #[test]
     fn action_to_docker_args_double_click() {
-        let args = action_to_docker_args("c1", &ComputerAction::DoubleClick {
-            coordinate: [300, 400],
-        });
+        let args = action_to_docker_args(
+            "c1",
+            &ComputerAction::DoubleClick {
+                coordinate: [300, 400],
+            },
+        );
         assert!(args.contains(&"--repeat".to_string()));
         assert!(args.contains(&"2".to_string()));
     }
@@ -1437,9 +1579,9 @@ mod tests {
         let raw = vec![
             "example.com".to_string(),
             "*.gov.tw".to_string(),
-            "127.0.0.1".to_string(),   // IP-literal → dropped
+            "127.0.0.1".to_string(),     // IP-literal → dropped
             "evil.com/path".to_string(), // URL structure → dropped
-            "exa%2ecom".to_string(),   // percent-encoding → dropped
+            "exa%2ecom".to_string(),     // percent-encoding → dropped
         ];
         let ok = valid_egress_domains(&raw);
         assert_eq!(ok, vec!["example.com".to_string(), "*.gov.tw".to_string()]);
@@ -1502,7 +1644,9 @@ mod tests {
         // Register MAX sessions
         for i in 0..MAX_CONCURRENT_SESSIONS {
             let ctl = Arc::new(OrchestratorControl::new());
-            register_session(&format!("test-sess-{i}"), ctl).await.unwrap();
+            register_session(&format!("test-sess-{i}"), ctl)
+                .await
+                .unwrap();
         }
         // Next one should fail
         let ctl = Arc::new(OrchestratorControl::new());

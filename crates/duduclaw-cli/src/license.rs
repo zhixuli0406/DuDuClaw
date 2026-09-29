@@ -22,13 +22,13 @@
 use std::fs;
 use std::path::PathBuf;
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use clap::Subcommand;
 
 use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_license::{
-    generate_fingerprint, load_default, save_default, storage, FeatureGate, License,
-    LicenseError, LicenseTier, EMBEDDED_FEATURES_TOML,
+    EMBEDDED_FEATURES_TOML, FeatureGate, License, LicenseError, LicenseTier, generate_fingerprint,
+    load_default, save_default, storage,
 };
 
 #[derive(Subcommand)]
@@ -173,18 +173,18 @@ async fn control_error(resp: reqwest::Response) -> DuDuClawError {
     let body = resp.text().await.unwrap_or_default();
     let msg = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
-        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| body.chars().take(200).collect());
     DuDuClawError::License(format!("control-plane returned HTTP {status}: {msg}"))
 }
 
 // ── redeem (partner / free) ───────────────────────────────────
 
-async fn cmd_redeem(
-    code: &str,
-    customer_id: Option<String>,
-    email: Option<String>,
-) -> Result<()> {
+async fn cmd_redeem(code: &str, customer_id: Option<String>, email: Option<String>) -> Result<()> {
     let fingerprint = generate_fingerprint();
     let endpoint = format!("{}/v1/partner/redeem", control_url().trim_end_matches('/'));
     let body = serde_json::json!({
@@ -340,7 +340,9 @@ async fn cmd_activate(key_input: &str) -> Result<()> {
         eprintln!("   Current machine:     {current_fp}");
         eprintln!();
         eprintln!("   If you intended this license for a different machine, do not activate here.");
-        eprintln!("   If you are migrating, use `duduclaw license export` on the old machine first.");
+        eprintln!(
+            "   If you are migrating, use `duduclaw license export` on the old machine first."
+        );
         return Err(DuDuClawError::License(
             "license fingerprint mismatch — refusing to install".into(),
         ));
@@ -351,14 +353,17 @@ async fn cmd_activate(key_input: &str) -> Result<()> {
         return Err(DuDuClawError::License("license is expired".into()));
     }
 
-    let path = save_default(&license).map_err(|e| {
-        DuDuClawError::License(format!("failed to save license: {e}"))
-    })?;
+    let path = save_default(&license)
+        .map_err(|e| DuDuClawError::License(format!("failed to save license: {e}")))?;
 
     println!("✓ License activated");
     println!("  Tier:           {}", license.tier);
     println!("  Customer ID:    {}", license.customer_id);
-    println!("  Expires:        {} ({} days)", license.expires_at, license.days_until_expiry());
+    println!(
+        "  Expires:        {} ({} days)",
+        license.expires_at,
+        license.days_until_expiry()
+    );
     println!("  Saved to:       {}", path.display());
 
     Ok(())
@@ -370,19 +375,16 @@ fn parse_license_input(input: &str) -> Result<License> {
     // 1. Path
     let as_path = PathBuf::from(trimmed);
     if as_path.exists() {
-        let json = fs::read_to_string(&as_path).map_err(|e| {
-            DuDuClawError::License(format!("read {}: {e}", as_path.display()))
-        })?;
-        return serde_json::from_str(&json).map_err(|e| {
-            DuDuClawError::License(format!("parse license file: {e}"))
-        });
+        let json = fs::read_to_string(&as_path)
+            .map_err(|e| DuDuClawError::License(format!("read {}: {e}", as_path.display())))?;
+        return serde_json::from_str(&json)
+            .map_err(|e| DuDuClawError::License(format!("parse license file: {e}")));
     }
 
     // 2. Raw JSON
     if trimmed.starts_with('{') {
-        return serde_json::from_str(trimmed).map_err(|e| {
-            DuDuClawError::License(format!("parse license JSON: {e}"))
-        });
+        return serde_json::from_str(trimmed)
+            .map_err(|e| DuDuClawError::License(format!("parse license JSON: {e}")));
     }
 
     // 3. Base64
@@ -426,9 +428,8 @@ fn print_opensource_status() {
 }
 
 fn print_status(license: &License) -> Result<()> {
-    let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML).map_err(|e| {
-        DuDuClawError::License(format!("embedded features.toml is broken: {e}"))
-    })?;
+    let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML)
+        .map_err(|e| DuDuClawError::License(format!("embedded features.toml is broken: {e}")))?;
 
     let current_fp = generate_fingerprint();
     let fp_matches = license.is_valid_for_machine(&current_fp);
@@ -447,7 +448,10 @@ fn print_status(license: &License) -> Result<()> {
     println!("Issued at:        {}", license.issued_at);
     println!("Expires:          {}", license.expires_at);
     if expired {
-        println!("Status:           ⚠️  EXPIRED ({} days overdue)", -days_until);
+        println!(
+            "Status:           ⚠️  EXPIRED ({} days overdue)",
+            -days_until
+        );
     } else if days_until < 14 {
         println!("Status:           ⚠️  Expires in {days_until} days");
     } else {
@@ -459,7 +463,10 @@ fn print_status(license: &License) -> Result<()> {
     if fp_matches {
         println!("Machine:          ✓ {current_fp}");
     } else {
-        println!("Machine:          ✗ mismatch (license: {}, current: {current_fp})", license.machine_fingerprint);
+        println!(
+            "Machine:          ✗ mismatch (license: {}, current: {current_fp})",
+            license.machine_fingerprint
+        );
     }
 
     // Phone-home freshness
@@ -473,7 +480,9 @@ fn print_status(license: &License) -> Result<()> {
             println!(
                 "Phone-home:       ⏳ overdue ({days_since_ph} days; refresh interval = {phone_home_interval}d)"
             );
-            println!("                  Run `duduclaw license refresh` when the control-plane is reachable.");
+            println!(
+                "                  Run `duduclaw license refresh` when the control-plane is reachable."
+            );
         } else {
             println!("Phone-home:       ✓ {days_since_ph} days ago");
         }
@@ -481,19 +490,42 @@ fn print_status(license: &License) -> Result<()> {
         println!("Phone-home:       not required");
     }
 
+    // Two separate lists on purpose (D17, 2026-09): the first three are real
+    // capability gates a code path consults; the rest are things a human
+    // promises to do and nothing in the binary enforces. Printing them in one
+    // undifferentiated block made eight service promises look like feature
+    // switches.
     println!();
     println!("Unlocked commercial modules:");
-    let feature_flags = [
+    let capability_gates = [
         ("premium_templates", "Premium industry SOUL.md templates"),
-        ("industry_evolution_params", "Tuned Evolution / GVU parameters"),
+        (
+            "industry_evolution_params",
+            "Tuned Evolution / GVU parameters",
+        ),
+        ("white_label", "White-label / OEM redistribution"),
+    ];
+    for (flag, label) in capability_gates {
+        let mark = if gate.check(license.tier, flag) {
+            "✓"
+        } else {
+            "—"
+        };
+        println!("  {mark} {label}");
+    }
+
+    println!();
+    println!("Service commitments (not enforced by the software):");
+    let commitments = [
         ("dashboard_enterprise", "Audit log export + ROI report"),
         ("priority_security_patch", "Immediate security patches"),
         ("private_discord_support", "Private Discord support channel"),
         ("odoo_integration_supported", "Odoo ERP integration (Cloud)"),
-        ("white_label", "White-label / OEM redistribution"),
+        ("redistribution", "Embed in your own product for sale"),
+        ("dedicated_engineer", "Dedicated engineer"),
     ];
-    for (flag, label) in feature_flags {
-        let mark = if gate.check(license.tier, flag) {
+    for (flag, label) in commitments {
+        let mark = if gate.service_commitment(license.tier, flag) {
             "✓"
         } else {
             "—"
@@ -556,10 +588,7 @@ async fn cmd_refresh() -> Result<()> {
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<no body>".into());
+        let body_text = response.text().await.unwrap_or_else(|_| "<no body>".into());
         return Err(DuDuClawError::License(format!(
             "control-plane returned HTTP {status}: {body_text}"
         )));
@@ -576,20 +605,14 @@ async fn cmd_refresh() -> Result<()> {
                 DuDuClawError::License("missing 'license' in active response".into())
             })?;
             let new_license: License = serde_json::from_value(new_license_value.clone())
-                .map_err(|e| {
-                    DuDuClawError::License(format!("parse new license: {e}"))
-                })?;
+                .map_err(|e| DuDuClawError::License(format!("parse new license: {e}")))?;
 
-            let saved_to = save_default(&new_license).map_err(|e| {
-                DuDuClawError::License(format!("save new license: {e}"))
-            })?;
+            let saved_to = save_default(&new_license)
+                .map_err(|e| DuDuClawError::License(format!("save new license: {e}")))?;
 
             println!("✓ License refreshed");
             println!("  Tier:           {}", new_license.tier);
-            println!(
-                "  Days remaining: {}",
-                new_license.days_until_expiry()
-            );
+            println!("  Days remaining: {}", new_license.days_until_expiry());
             println!("  Saved to:       {}", saved_to.display());
 
             if let Some(warnings) = envelope.get("warnings").and_then(|v| v.as_array()) {
@@ -661,12 +684,10 @@ async fn cmd_export(as_base64: bool) -> Result<()> {
 // ── import ────────────────────────────────────────────────────
 
 async fn cmd_import(path: &PathBuf) -> Result<()> {
-    let json = fs::read_to_string(path).map_err(|e| {
-        DuDuClawError::License(format!("read {}: {e}", path.display()))
-    })?;
-    let license: License = serde_json::from_str(&json).map_err(|e| {
-        DuDuClawError::License(format!("parse {}: {e}", path.display()))
-    })?;
+    let json = fs::read_to_string(path)
+        .map_err(|e| DuDuClawError::License(format!("read {}: {e}", path.display())))?;
+    let license: License = serde_json::from_str(&json)
+        .map_err(|e| DuDuClawError::License(format!("parse {}: {e}", path.display())))?;
 
     // Same fingerprint check as activate
     let current_fp = generate_fingerprint();
@@ -679,8 +700,8 @@ async fn cmd_import(path: &PathBuf) -> Result<()> {
         ));
     }
 
-    let saved_to = save_default(&license)
-        .map_err(|e| DuDuClawError::License(format!("save: {e}")))?;
+    let saved_to =
+        save_default(&license).map_err(|e| DuDuClawError::License(format!("save: {e}")))?;
 
     println!("✓ License imported");
     println!("  Tier:    {}", license.tier);

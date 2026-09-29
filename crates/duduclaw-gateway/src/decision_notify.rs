@@ -34,8 +34,8 @@
 
 use std::path::Path;
 
-use duduclaw_auth::models::{UserRole, UserStatus};
 use duduclaw_auth::UserDb;
+use duduclaw_auth::models::{UserRole, UserStatus};
 
 use crate::decision_action::{DecisionAct, DecisionAction, DecisionSource};
 use crate::notify_governance::NotifyLevel;
@@ -60,7 +60,9 @@ use crate::notify_governance::NotifyLevel;
 ///   notice).
 pub fn notify_level(source: DecisionSource) -> NotifyLevel {
     match source {
-        DecisionSource::Goal | DecisionSource::Approval | DecisionSource::Install => NotifyLevel::Act,
+        DecisionSource::Goal | DecisionSource::Approval | DecisionSource::Install => {
+            NotifyLevel::Act
+        }
         DecisionSource::Kickoff | DecisionSource::Autopilot => NotifyLevel::Confirm,
     }
 }
@@ -133,7 +135,11 @@ pub(crate) fn approver_links(home_dir: &Path) -> Vec<(String, String)> {
 /// Verified only: an unverified `channel_identities` row is an unconfirmed
 /// claim typed into a binding form, never proof of identity — filing one
 /// against a manager's account would otherwise inherit their rights.
-pub(crate) fn mapped_role(home_dir: &Path, channel: &str, channel_user_id: &str) -> Option<UserRole> {
+pub(crate) fn mapped_role(
+    home_dir: &Path,
+    channel: &str,
+    channel_user_id: &str,
+) -> Option<UserRole> {
     let db = open_user_db(home_dir)?;
     let uid = db
         .find_verified_user_id_by_channel(channel, channel_user_id)
@@ -337,29 +343,11 @@ pub(crate) struct DecisionCard<'a> {
     pub no_button_hint: &'a str,
 }
 
-/// Push one decision card to one destination, **through the notification
-/// governance layer** ([`crate::notify_governance`]).
-///
-/// [`NotifyLevel::Act`] cards (goal `needs_human`, high-risk approvals,
-/// install sign-offs) go out immediately whatever the hour. [`NotifyLevel::Confirm`]
-/// cards (kickoff gates, a paused autopilot rule) are queued during quiet
-/// hours and re-rendered — buttons and all — when the window ends.
-///
-/// Returns `true` when the card was delivered **or** queued; both mean "the
-/// caller's job here is done". `false` means neither happened.
-pub(crate) async fn deliver(
-    home_dir: &Path,
-    http: &reqwest::Client,
-    channel: &str,
-    token: &str,
-    chat_id: &str,
-    card: &DecisionCard<'_>,
-) -> bool {
-    !matches!(
-        deliver_outcome(home_dir, http, channel, token, chat_id, card).await,
-        DeliverOutcome::Failed
-    )
-}
+// O5 (2026-09-29): the boolean `deliver()` wrapper was removed. Its four
+// callers were the four notification modules, and each of them read the same
+// meaning out of it — "not Failed ⇒ my job is done" — which is now
+// `Receipt::delivered` in `notify_push`. Callers that need the three-state
+// answer use [`deliver_outcome`] below directly.
 
 /// What [`deliver_outcome`] did with a card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,7 +462,8 @@ pub(crate) async fn deliver_now(
                 Some(url) => format!("{}\n\n👉 {url}", card.body),
                 None => card.body.to_string(),
             };
-            match crate::goal_notify::send_with_markup(http, channel, token, chat_id, &body, markup).await
+            match crate::channel_sender::send_with_markup(http, channel, token, chat_id, &body, markup)
+                .await
             {
                 Ok(pushed) => {
                     if let Some(p) = &pushed {
@@ -539,7 +528,8 @@ pub(crate) async fn deliver_now(
                     }
                 };
             }
-            crate::goal_notify::send_plain_text(home_dir, http, channel, token, chat_id, &text).await
+            crate::channel_sender::send_plain_text(home_dir, http, channel, token, chat_id, &text)
+                .await
         }
     }
 }
@@ -593,8 +583,14 @@ async fn dispatch_inner(
 ) -> Result<String, String> {
     match action.source {
         DecisionSource::Goal => {
-            crate::goal_notify::apply_needs_human(home_dir, channel, channel_user_id, &action.id, action.act)
-                .await
+            crate::goal_notify::apply_needs_human(
+                home_dir,
+                channel,
+                channel_user_id,
+                &action.id,
+                action.act,
+            )
+            .await
         }
         DecisionSource::Kickoff => {
             crate::goal_notify::apply_kickoff(
@@ -627,7 +623,8 @@ async fn dispatch_inner(
             .await
         }
         DecisionSource::Autopilot => {
-            crate::autopilot_notify::apply_pause(home_dir, channel, channel_user_id, &action.id).await
+            crate::autopilot_notify::apply_pause(home_dir, channel, channel_user_id, &action.id)
+                .await
         }
     }
 }
@@ -636,7 +633,10 @@ async fn dispatch_inner(
 /// acknowledgement and the collapsed card so a person is told the same word
 /// twice. `install`-class refusals read softer ("婉拒") than a high-risk
 /// refusal ("拒絕").
-pub(crate) fn settled_verb(source: DecisionSource, act: DecisionAct) -> crate::decision_card::DecisionVerb {
+pub(crate) fn settled_verb(
+    source: DecisionSource,
+    act: DecisionAct,
+) -> crate::decision_card::DecisionVerb {
     use crate::decision_card::DecisionVerb;
     match (source, act) {
         (_, DecisionAct::Retry) => DecisionVerb::Retried,
@@ -676,8 +676,14 @@ mod tests {
 
     #[test]
     fn approvers_are_allowed_by_role() {
-        assert_eq!(authorize_press(Some(UserRole::Admin), true, false), PressAuth::Allow);
-        assert_eq!(authorize_press(Some(UserRole::Manager), true, false), PressAuth::Allow);
+        assert_eq!(
+            authorize_press(Some(UserRole::Admin), true, false),
+            PressAuth::Allow
+        );
+        assert_eq!(
+            authorize_press(Some(UserRole::Manager), true, false),
+            PressAuth::Allow
+        );
     }
 
     #[test]
@@ -725,7 +731,11 @@ mod tests {
         let targets = vec![("telegram".to_string(), "555".to_string())];
         assert!(!destination_matches_any(&targets, "telegram", "999"));
         assert_eq!(
-            authorize_press(None, false, destination_matches_any(&targets, "telegram", "999")),
+            authorize_press(
+                None,
+                false,
+                destination_matches_any(&targets, "telegram", "999")
+            ),
             PressAuth::DenyUnknown
         );
     }
@@ -743,9 +753,18 @@ mod tests {
 
     #[test]
     fn parse_origin_accepts_channel_sessions() {
-        assert_eq!(parse_origin("telegram:12345"), Some(("telegram".into(), "12345".into())));
-        assert_eq!(parse_origin("telegram:12345:678"), Some(("telegram".into(), "12345".into())));
-        assert_eq!(parse_origin("discord:thread:999"), Some(("discord".into(), "999".into())));
+        assert_eq!(
+            parse_origin("telegram:12345"),
+            Some(("telegram".into(), "12345".into()))
+        );
+        assert_eq!(
+            parse_origin("telegram:12345:678"),
+            Some(("telegram".into(), "12345".into()))
+        );
+        assert_eq!(
+            parse_origin("discord:thread:999"),
+            Some(("discord".into(), "999".into()))
+        );
     }
 
     #[test]
@@ -780,7 +799,10 @@ mod tests {
         let approvers = resolve_targets(
             None,
             None,
-            vec![("discord".into(), "D1".into()), ("line".into(), "U9".into())],
+            vec![
+                ("discord".into(), "D1".into()),
+                ("line".into(), "U9".into()),
+            ],
         );
         assert_eq!(approvers.len(), 2);
 
@@ -808,19 +830,43 @@ mod tests {
     #[test]
     fn settled_verbs_follow_the_state_vocabulary() {
         use crate::decision_card::DecisionVerb;
-        assert_eq!(settled_verb(DecisionSource::Goal, DecisionAct::Retry), DecisionVerb::Retried);
-        assert_eq!(settled_verb(DecisionSource::Goal, DecisionAct::Done), DecisionVerb::MarkedDone);
-        assert_eq!(settled_verb(DecisionSource::Goal, DecisionAct::Abort), DecisionVerb::Abandoned);
-        assert_eq!(settled_verb(DecisionSource::Autopilot, DecisionAct::Pause), DecisionVerb::Paused);
-        assert_eq!(settled_verb(DecisionSource::Kickoff, DecisionAct::Approve), DecisionVerb::Approved);
+        assert_eq!(
+            settled_verb(DecisionSource::Goal, DecisionAct::Retry),
+            DecisionVerb::Retried
+        );
+        assert_eq!(
+            settled_verb(DecisionSource::Goal, DecisionAct::Done),
+            DecisionVerb::MarkedDone
+        );
+        assert_eq!(
+            settled_verb(DecisionSource::Goal, DecisionAct::Abort),
+            DecisionVerb::Abandoned
+        );
+        assert_eq!(
+            settled_verb(DecisionSource::Autopilot, DecisionAct::Pause),
+            DecisionVerb::Paused
+        );
+        assert_eq!(
+            settled_verb(DecisionSource::Kickoff, DecisionAct::Approve),
+            DecisionVerb::Approved
+        );
         // An install refusal reads softer than a high-risk refusal.
         assert_eq!(
             settled_verb(DecisionSource::Install, DecisionAct::Deny),
             DecisionVerb::DeclinedInstall
         );
-        assert_eq!(settled_verb(DecisionSource::Approval, DecisionAct::Deny), DecisionVerb::Denied);
-        assert_eq!(settled_verb(DecisionSource::Kickoff, DecisionAct::Deny), DecisionVerb::Denied);
-        assert_eq!(settled_verb(DecisionSource::Goal, DecisionAct::Takeover), DecisionVerb::TakenOver);
+        assert_eq!(
+            settled_verb(DecisionSource::Approval, DecisionAct::Deny),
+            DecisionVerb::Denied
+        );
+        assert_eq!(
+            settled_verb(DecisionSource::Kickoff, DecisionAct::Deny),
+            DecisionVerb::Denied
+        );
+        assert_eq!(
+            settled_verb(DecisionSource::Goal, DecisionAct::Takeover),
+            DecisionVerb::TakenOver
+        );
     }
 
     // ── reason vocabulary (W1-6) ────────────────────────────────
@@ -838,7 +884,10 @@ mod tests {
         for s in all {
             let p = reason_prefix(s);
             assert!(!p.is_empty());
-            assert!(seen.insert(p), "reason_prefix must be distinct per source: {p}");
+            assert!(
+                seen.insert(p),
+                "reason_prefix must be distinct per source: {p}"
+            );
         }
     }
 
@@ -846,9 +895,15 @@ mod tests {
     fn reason_prefix_matches_the_agreed_wording() {
         assert_eq!(reason_prefix(DecisionSource::Goal), "🤔 自主任務等你決定");
         assert_eq!(reason_prefix(DecisionSource::Kickoff), "🚀 新任務要開工");
-        assert_eq!(reason_prefix(DecisionSource::Approval), "⚠️ 高風險動作需要你同意");
+        assert_eq!(
+            reason_prefix(DecisionSource::Approval),
+            "⚠️ 高風險動作需要你同意"
+        );
         assert_eq!(reason_prefix(DecisionSource::Install), "📦 安裝申請");
-        assert_eq!(reason_prefix(DecisionSource::Autopilot), "🔁 自動規則已暫停");
+        assert_eq!(
+            reason_prefix(DecisionSource::Autopilot),
+            "🔁 自動規則已暫停"
+        );
     }
 
     // ── escalation level (W2-4) ────────────────────────────
@@ -860,12 +915,19 @@ mod tests {
         assert_eq!(notify_level(DecisionSource::Approval), NotifyLevel::Act);
         assert_eq!(notify_level(DecisionSource::Install), NotifyLevel::Act);
         assert_eq!(notify_level(DecisionSource::Kickoff), NotifyLevel::Confirm);
-        assert_eq!(notify_level(DecisionSource::Autopilot), NotifyLevel::Confirm);
+        assert_eq!(
+            notify_level(DecisionSource::Autopilot),
+            NotifyLevel::Confirm
+        );
     }
 
     #[test]
     fn l3_decision_sources_can_never_be_held_by_quiet_hours() {
-        for s in [DecisionSource::Goal, DecisionSource::Approval, DecisionSource::Install] {
+        for s in [
+            DecisionSource::Goal,
+            DecisionSource::Approval,
+            DecisionSource::Install,
+        ] {
             assert!(
                 !notify_level(s).is_suppressible(),
                 "{s:?} blocks work until a person answers; it must never be deferred"
@@ -885,8 +947,14 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for s in all {
             let t = notify_type(s);
-            assert!(t.starts_with("decision."), "stats buckets are namespaced: {t}");
-            assert!(seen.insert(t), "one bucket per source, so P4-5 is answerable per source: {t}");
+            assert!(
+                t.starts_with("decision."),
+                "stats buckets are namespaced: {t}"
+            );
+            assert!(
+                seen.insert(t),
+                "one bucket per source, so P4-5 is answerable per source: {t}"
+            );
         }
     }
 
@@ -908,8 +976,7 @@ mod tests {
             no_button_hint: "請至儀表板同意或拒絕。",
         };
         let http = reqwest::Client::new();
-        let outcome =
-            deliver_outcome(dir.path(), &http, "telegram", "tok", "555", &card).await;
+        let outcome = deliver_outcome(dir.path(), &http, "telegram", "tok", "555", &card).await;
         assert_eq!(outcome, DeliverOutcome::Deferred);
 
         let queued = crate::notify_governance::take_due(
@@ -923,7 +990,10 @@ mod tests {
         assert_eq!(n.decision_source.as_deref(), Some("kick"));
         assert_eq!(n.decision_id.as_deref(), Some("apv-123"));
         assert_eq!(n.text, "🚀 新任務要開工");
-        assert_eq!(n.link.as_deref(), Some("http://localhost:18789/inbox?item=apv-123"));
+        assert_eq!(
+            n.link.as_deref(),
+            Some("http://localhost:18789/inbox?item=apv-123")
+        );
         assert_eq!(n.no_button_hint.as_deref(), Some("請至儀表板同意或拒絕。"));
         assert_eq!(
             DecisionSource::from_token(n.decision_source.as_deref().unwrap()),
@@ -946,11 +1016,13 @@ mod tests {
         // against a bogus token, and that is fine — the assertion is that
         // nothing was queued).
         let _ = deliver_outcome(dir.path(), &http, "line", "tok", "U1", &card).await;
-        assert!(crate::notify_governance::take_due(
-            dir.path(),
-            chrono::Utc::now() + chrono::Duration::hours(2)
-        )
-        .is_empty());
+        assert!(
+            crate::notify_governance::take_due(
+                dir.path(),
+                chrono::Utc::now() + chrono::Duration::hours(2)
+            )
+            .is_empty()
+        );
     }
 
     // ── inbound routing ────────────────────────────────────
@@ -960,7 +1032,13 @@ mod tests {
         // Action rate must count decisions people actually settled, not
         // presses that bounced off a fail-closed store.
         let dir = tempfile::tempdir().unwrap();
-        let out = route_press(dir.path(), "telegram", "u1", "duduclaw:decide:apv:ok:missing").await;
+        let out = route_press(
+            dir.path(),
+            "telegram",
+            "u1",
+            "duduclaw:decide:apv:ok:missing",
+        )
+        .await;
         assert!(out.unwrap().is_err(), "a missing row must refuse");
         assert!(
             crate::notify_stats::stats(dir.path(), 30).is_empty(),
@@ -971,9 +1049,16 @@ mod tests {
     #[tokio::test]
     async fn route_press_ignores_non_decision_actions() {
         let dir = tempfile::tempdir().unwrap();
-        for data in ["garbage", "duduclaw:new_session", "duduclaw:voice_toggle", ""] {
+        for data in [
+            "garbage",
+            "duduclaw:new_session",
+            "duduclaw:voice_toggle",
+            "",
+        ] {
             assert!(
-                route_press(dir.path(), "telegram", "u1", data).await.is_none(),
+                route_press(dir.path(), "telegram", "u1", data)
+                    .await
+                    .is_none(),
                 "must not claim {data}"
             );
         }
@@ -992,7 +1077,10 @@ mod tests {
         ] {
             let out = route_press(dir.path(), "telegram", "u1", data).await;
             assert!(out.is_some(), "must claim {data}");
-            assert!(out.unwrap().is_err(), "a missing row must refuse, not succeed: {data}");
+            assert!(
+                out.unwrap().is_err(),
+                "a missing row must refuse, not succeed: {data}"
+            );
         }
     }
 }

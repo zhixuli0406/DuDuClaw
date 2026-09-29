@@ -29,7 +29,11 @@ pub struct RateLimitError {
 
 impl std::fmt::Display for RateLimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "Rate limited, retry after {} seconds", self.retry_after_secs)
+        write!(
+            f,
+            "Rate limited, retry after {} seconds",
+            self.retry_after_secs
+        )
     }
 }
 
@@ -149,10 +153,7 @@ mod tests {
 
         // 101st must be rejected
         let result = limiter.check(client, OpType::Read);
-        assert!(
-            result.is_err(),
-            "101st read request should be rate-limited"
-        );
+        assert!(result.is_err(), "101st read request should be rate-limited");
     }
 
     // ── Test 2: Write bucket allows 20 requests, blocks the 21st ─────────────
@@ -171,10 +172,7 @@ mod tests {
 
         // 21st must be rejected
         let result = limiter.check(client, OpType::Write);
-        assert!(
-            result.is_err(),
-            "21st write request should be rate-limited"
-        );
+        assert!(result.is_err(), "21st write request should be rate-limited");
     }
 
     // ── Test 3: Different clients are isolated ────────────────────────────────
@@ -224,7 +222,9 @@ mod tests {
     // ── Test 5: error Display is non-empty ────────────────────────────────────
     #[test]
     fn rate_limit_error_display_non_empty() {
-        let err = RateLimitError { retry_after_secs: 42 };
+        let err = RateLimitError {
+            retry_after_secs: 42,
+        };
         let msg = err.to_string();
         assert!(!msg.is_empty(), "Display should not be empty");
         assert!(
@@ -271,10 +271,7 @@ mod tests {
 
         // 61st must be rejected
         let result = limiter.check(client, OpType::HttpRequest);
-        assert!(
-            result.is_err(),
-            "61st HTTP request should be rate-limited"
-        );
+        assert!(result.is_err(), "61st HTTP request should be rate-limited");
         let err = result.unwrap_err();
         assert!(err.retry_after_secs > 0, "retry_after_secs must be > 0");
     }

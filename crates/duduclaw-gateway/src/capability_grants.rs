@@ -44,7 +44,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -777,7 +777,10 @@ mod tests {
             "[capabilities]\nscoped_tools = \"send_message\"\n",
         )
         .unwrap();
-        assert!(scoped_tools(&dir).is_empty(), "non-array ⇒ empty, not error");
+        assert!(
+            scoped_tools(&dir).is_empty(),
+            "non-array ⇒ empty, not error"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
 
         let dir2 = tmp_agent_dir();
@@ -796,8 +799,14 @@ mod tests {
     fn default_direction_grant_ttl_zero_means_default_not_immediate() {
         for (body, why) in [
             ("[capabilities]\ngrant_ttl_secs = 0\n", "0 ⇒ default"),
-            ("[capabilities]\ngrant_ttl_secs = -5\n", "negative ⇒ default"),
-            ("[capabilities]\ngrant_ttl_secs = \"600\"\n", "wrong type ⇒ default"),
+            (
+                "[capabilities]\ngrant_ttl_secs = -5\n",
+                "negative ⇒ default",
+            ),
+            (
+                "[capabilities]\ngrant_ttl_secs = \"600\"\n",
+                "wrong type ⇒ default",
+            ),
             ("", "absent ⇒ default"),
         ] {
             let dir = tmp_agent_dir();

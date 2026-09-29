@@ -1,22 +1,48 @@
 //! OpenAI-compatible HTTP backend — works with Exo, llamafile, vLLM, SGLang, etc.
+//!
+//! # O11 (2026-09-29): one compat client, not two
+//!
+//! This module used to carry its own reqwest client, its own request/response
+//! structs and its own SSE-less `chat/completions` call — a second
+//! implementation of what `duduclaw-llm::providers::openai_compat` already
+//! does, kept alive by one capability the shared provider lacked: per-token
+//! **logprob** capture, which the UCCI calibrated cascade needs.
+//!
+//! That capability now lives in the shared provider
+//! ([`OpenAiCompatProvider::complete_with_logprobs`]), so the HTTP half of this
+//! file is gone. What stays here is the part that is genuinely local-inference's
+//! own: the [`InferenceBackend`] contract (bookkeeping `load_model`, throughput
+//! accounting) and the **interpretation** of logprobs — mean logprob and the
+//! UCCI top-2 margin. The `ucci` dependency stays on this side of the seam on
+//! purpose: `duduclaw-llm` transports a signal, it does not score one.
+//!
+//! Three local-specific settings are carried across explicitly rather than
+//! inherited, because the shared provider's defaults are tuned for hosted APIs:
+//! a 300s request timeout (CPU generation regularly exceeds two minutes),
+//! verbatim model ids (a local server's `qwen/qwen3-4b` is a name, not a
+//! `provider/model` qualifier), and the `X-DuDuClaw-Prefix-Hash` header.
+//!
+//! ## Prefix Caching Compatibility
+//!
+//! SGLang: RadixAttention automatically caches KV for shared prefixes.
+//!   - Ensure system prompt is byte-identical across requests.
+//!   - No special configuration needed beyond --enable-prefix-caching.
+//! vLLM: Automatic Prefix Caching (APC) enabled via --enable-prefix-caching.
+//!   - System prompt must be byte-identical including whitespace.
+//! Both engines benefit from DuDuClaw's frozen SystemPromptSnapshot.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use duduclaw_llm::providers::{ChoiceLogprobs, OpenAiCompatProvider};
+use duduclaw_llm::{
+    ApiAuth, ChatMessage as LlmChatMessage, ChatRequest as LlmChatRequest, ContentPart, Role,
+    SystemBlock,
+};
 use tokio::sync::RwLock;
 
 use crate::backend::InferenceBackend;
 use crate::config::OpenAiCompatConfig;
 use crate::error::{InferenceError, Result};
 use crate::types::*;
-
-// ── Prefix Caching Compatibility ──────────────────────────────
-// SGLang: RadixAttention automatically caches KV for shared prefixes.
-//   - Ensure system prompt is byte-identical across requests.
-//   - No special configuration needed beyond --enable-prefix-caching.
-// vLLM: Automatic Prefix Caching (APC) enabled via --enable-prefix-caching.
-//   - System prompt must be byte-identical including whitespace.
-// Both engines benefit from DuDuClaw's frozen SystemPromptSnapshot.
-// ──────────────────────────────────────────────────────────────
 
 /// Custom header for monitoring prompt cache hit rates with SGLang/vLLM.
 ///
@@ -26,12 +52,19 @@ use crate::types::*;
 /// observability without affecting inference behavior.
 const PREFIX_HASH_HEADER: &str = "X-DuDuClaw-Prefix-Hash";
 
+/// Request timeout for a local completion. Deliberately far above the shared
+/// `duduclaw-llm` 120s singleton: CPU generation of a few hundred tokens on a
+/// small box regularly runs past two minutes, and a timeout there reads to the
+/// router as an unavailable backend.
+const LOCAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Backend that calls an OpenAI-compatible HTTP API.
 pub struct OpenAiCompatBackend {
     config: OpenAiCompatConfig,
-    client: reqwest::Client,
+    /// Probe client for `GET /models` (`is_available`). The completion path
+    /// runs through the shared provider below.
+    probe_client: reqwest::Client,
     loaded_model: RwLock<Option<ModelInfo>>,
-    chat_url: String,
     models_url: String,
     /// Resolved API key (decrypted from `api_key_enc` or plaintext `api_key`).
     /// Resolved once at construction — read-only / fail-soft. `None` means no
@@ -84,13 +117,12 @@ impl OpenAiCompatBackend {
     /// resolution can now reach a network-backed `secret://` reference
     /// instead of failing closed on it.
     pub async fn new_with_home(config: OpenAiCompatConfig, home_dir: &std::path::Path) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+        let probe_client = reqwest::Client::builder()
+            .timeout(LOCAL_REQUEST_TIMEOUT)
             .build()
             .unwrap_or_default();
 
         let base = config.base_url.trim_end_matches('/');
-        let chat_url = format!("{base}/chat/completions");
         let models_url = format!("{base}/models");
 
         let resolved_api_key = config.resolved_api_key(home_dir).await;
@@ -114,9 +146,8 @@ impl OpenAiCompatBackend {
 
         Self {
             config,
-            client,
+            probe_client,
             loaded_model: RwLock::new(loaded_model),
-            chat_url,
             models_url,
             resolved_api_key,
             prefix_hash: None,
@@ -132,82 +163,60 @@ impl OpenAiCompatBackend {
         self.prefix_hash = Some(hash.to_string());
         self
     }
-}
 
-// OpenAI API types (minimal subset)
-
-#[derive(Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f32>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    stop: Vec<String>,
-    /// Request per-token logprobs (supported by llama.cpp server, vLLM, SGLang).
-    /// Omitted entirely when not requested so legacy servers see an unchanged body.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    logprobs: Option<bool>,
-    /// JitRL Tier B injection point (arXiv:2601.18510, see [`crate::jitrl`]):
-    /// token id → additive logit bias, the standard OpenAI-compat `logit_bias`
-    /// field (supported by llama.cpp server, vLLM, SGLang). serde_json encodes
-    /// the integer keys as JSON object string keys, matching the API shape.
-    /// Omitted entirely when absent so legacy request bodies are unchanged.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    logit_bias: Option<std::collections::HashMap<u32, f32>>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-    usage: Option<ChatUsage>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatMessage,
-    /// Present when the request set `logprobs: true` and the server supports it.
-    #[serde(default)]
-    logprobs: Option<ChoiceLogprobs>,
-}
-
-#[derive(Deserialize)]
-struct ChoiceLogprobs {
-    #[serde(default)]
-    content: Option<Vec<TokenLogprob>>,
-}
-
-#[derive(Deserialize)]
-struct TokenLogprob {
-    logprob: f64,
+    /// Build the shared compat provider for this backend's endpoint.
+    ///
+    /// Constructed per call rather than stored: it is a handful of `String`s
+    /// plus a client handle (`reqwest::Client` is an `Arc` internally), and a
+    /// stored provider would need the same interior mutability the rest of
+    /// this struct avoids.
+    fn provider(&self) -> OpenAiCompatProvider {
+        let auth = ApiAuth {
+            api_key: self.resolved_api_key.clone().unwrap_or_default(),
+            base_url: Some(self.config.base_url.clone()),
+        };
+        let mut p = OpenAiCompatProvider::new("local", auth, self.config.base_url.clone())
+            // A local server's model id is a name, never a `provider/model`
+            // qualifier — see `with_verbatim_model_id`.
+            .with_verbatim_model_id()
+            .with_timeout(LOCAL_REQUEST_TIMEOUT);
+        if let Some(hash) = &self.prefix_hash {
+            p = p.with_header(PREFIX_HASH_HEADER, hash.as_str());
+        }
+        p
+    }
 }
 
 /// Mean per-token logprob of a choice, `None` when the server returned no
 /// logprobs (or an empty token list) — post-hoc confidence then stays off
 /// (fail-safe: identical behaviour to a server without logprob support).
-fn mean_logprob_of(choice: &ChatChoice) -> Option<f32> {
-    let tokens = choice.logprobs.as_ref()?.content.as_deref()?;
+fn mean_logprob_of(lp: &ChoiceLogprobs) -> Option<f32> {
+    if lp.tokens.is_empty() {
+        return None;
+    }
+    let sum: f64 = lp.tokens.iter().map(|t| t.logprob).sum();
+    Some((sum / lp.tokens.len() as f64) as f32)
+}
+
+/// UCCI top-2 margin uncertainty over the choice's content tokens.
+///
+/// `None` when any token is missing its candidate list (the signal is only
+/// meaningful over a complete sequence) or when dropping the reported stop
+/// token would leave nothing to measure.
+fn margin_uncertainty_of(lp: &ChoiceLogprobs, drop_stop_token: bool) -> Option<f64> {
+    let tokens = if drop_stop_token && lp.finish_reason.as_deref() == Some("stop") {
+        lp.tokens.get(..lp.tokens.len().checked_sub(1)?)?
+    } else {
+        &lp.tokens[..]
+    };
     if tokens.is_empty() {
         return None;
     }
-    let sum: f64 = tokens.iter().map(|t| t.logprob).sum();
-    Some((sum / tokens.len() as f64) as f32)
-}
-
-#[derive(Deserialize)]
-struct ChatUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
+    let candidates: Vec<Vec<f64>> = tokens
+        .iter()
+        .map(|token| token.top_logprobs.clone())
+        .collect::<Option<_>>()?;
+    ucci::signal::uncertainty_from_top_logprobs(&candidates).ok()
 }
 
 #[async_trait]
@@ -239,90 +248,65 @@ impl InferenceBackend for OpenAiCompatBackend {
     async fn generate(&self, request: &InferenceRequest) -> Result<InferenceResponse> {
         let start = std::time::Instant::now();
 
-        let mut messages = Vec::new();
+        let model = request.model_id.as_deref().unwrap_or(&self.config.model);
+
+        let mut chat = LlmChatRequest::new(model);
         if !request.system_prompt.is_empty() {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: request.system_prompt.clone(),
-            });
+            chat.system
+                .push(SystemBlock::uncached(&request.system_prompt));
         }
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: request.user_prompt.clone(),
+        chat.messages.push(LlmChatMessage {
+            role: Role::User,
+            parts: vec![ContentPart::Text(request.user_prompt.clone())],
         });
+        chat.max_tokens = request.params.max_tokens;
+        chat.temperature = Some(request.params.temperature);
+        chat.top_p = Some(request.params.top_p);
+        chat.stop = request.params.stop.clone();
+        chat.logprobs = request.params.capture_logprobs.then_some(true);
+        chat.top_logprobs = request.params.capture_top_logprobs.then_some(2);
 
-        let model = request
-            .model_id
-            .as_deref()
-            .unwrap_or(&self.config.model);
-
-        let body = ChatRequest {
-            model: model.to_string(),
-            messages,
-            max_tokens: Some(request.params.max_tokens),
-            temperature: Some(request.params.temperature),
-            top_p: Some(request.params.top_p),
-            stop: request.params.stop.clone(),
-            logprobs: request.params.capture_logprobs.then_some(true),
-            logit_bias: request.params.logit_bias.clone(),
-        };
-
-        let url = &self.chat_url;
-
-        let mut req = self.client.post(url).json(&body);
-        if let Some(ref key) = self.resolved_api_key {
-            req = req.bearer_auth(key);
-        }
-        if let Some(ref hash) = self.prefix_hash {
-            req = req.header(PREFIX_HASH_HEADER, hash.as_str());
-        }
-
-        let resp = req.send().await.map_err(|e| InferenceError::Http(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text: String = resp.text().await.unwrap_or_default().chars().take(200).collect();
-            return Err(InferenceError::Http(format!("HTTP {status}: {text}")));
-        }
-
-        let chat_resp: ChatResponse = resp
-            .json()
+        let (resp, logprobs) = self
+            .provider()
+            .complete_with_logprobs(&chat)
             .await
-            .map_err(|e| InferenceError::Http(format!("Failed to parse response: {e}")))?;
+            .map_err(|e| InferenceError::Http(e.to_string()))?;
 
-        let first_choice = chat_resp.choices.first();
-        let text = first_choice
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
-        let mean_logprob = first_choice.and_then(mean_logprob_of);
+        let text = resp.text();
+        let mean_logprob = logprobs.as_ref().and_then(mean_logprob_of);
+        let margin_uncertainty = logprobs
+            .as_ref()
+            .and_then(|lp| margin_uncertainty_of(lp, request.params.ucci_drop_stop_token));
 
         let elapsed = start.elapsed();
-        let usage = chat_resp.usage.unwrap_or(ChatUsage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-        });
+        // `NormalizedUsage` subtracts cache reads out of `input_tokens`; a
+        // local server reports neither, so adding them back is a no-op there
+        // and keeps the number honest if a caching proxy is in front.
+        let tokens_prompt = (resp.usage.input_tokens + resp.usage.cache_read_tokens) as u32;
+        let tokens_generated = resp.usage.output_tokens as u32;
 
         let tps = if elapsed.as_millis() > 0 {
-            usage.completion_tokens as f64 / elapsed.as_secs_f64()
+            tokens_generated as f64 / elapsed.as_secs_f64()
         } else {
             0.0
         };
 
         Ok(InferenceResponse {
             text,
-            tokens_generated: usage.completion_tokens,
-            tokens_prompt: usage.prompt_tokens,
+            tokens_generated,
+            tokens_prompt,
             generation_time_ms: elapsed.as_millis() as u64,
             tokens_per_second: tps,
             backend: BackendType::OpenAiCompat,
             model_id: model.to_string(),
             mean_logprob,
+            margin_uncertainty,
         })
     }
 
     async fn is_available(&self) -> bool {
         let url = &self.models_url;
-        let mut req = self.client.get(url);
+        let mut req = self.probe_client.get(url);
         if let Some(ref key) = self.resolved_api_key {
             req = req.bearer_auth(key);
         }
@@ -333,90 +317,101 @@ impl InferenceBackend for OpenAiCompatBackend {
 #[cfg(test)]
 mod logprob_tests {
     use super::*;
+    use duduclaw_llm::providers::TokenLogprob;
+
+    fn lp(tokens: Vec<(f64, Option<Vec<f64>>)>, finish: Option<&str>) -> ChoiceLogprobs {
+        ChoiceLogprobs {
+            tokens: tokens
+                .into_iter()
+                .map(|(logprob, top_logprobs)| TokenLogprob {
+                    logprob,
+                    top_logprobs,
+                })
+                .collect(),
+            finish_reason: finish.map(str::to_string),
+        }
+    }
 
     #[test]
     fn mean_logprob_parsed_from_openai_response() {
-        let json = r#"{
-            "choices": [{
-                "message": {"role": "assistant", "content": "hi"},
-                "logprobs": {"content": [
-                    {"token": "h", "logprob": -0.2},
-                    {"token": "i", "logprob": -0.4}
-                ]}
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 2}
-        }"#;
-        let resp: ChatResponse = serde_json::from_str(json).expect("parse");
-        let mean = mean_logprob_of(resp.choices.first().unwrap()).expect("mean");
+        let mean = mean_logprob_of(&lp(vec![(-0.2, None), (-0.4, None)], None)).expect("mean");
         assert!((mean - (-0.3)).abs() < 1e-6);
     }
 
     #[test]
+    fn top_two_logprobs_produce_ucci_margin_uncertainty() {
+        let signal = lp(
+            vec![
+                (
+                    -0.10536051565782628,
+                    Some(vec![-0.10536051565782628, -2.302585092994046]),
+                ),
+                (
+                    -0.6931471805599453,
+                    Some(vec![-0.6931471805599453, -1.3862943611198906]),
+                ),
+            ],
+            None,
+        );
+        let u = margin_uncertainty_of(&signal, false).unwrap();
+        assert!((u - 0.475).abs() < 1e-12);
+    }
+
+    #[test]
+    fn configured_stop_token_is_excluded_from_ucci_signal() {
+        let signal = lp(
+            vec![
+                (-0.1, Some(vec![-0.10536051565782628, -2.302585092994046])),
+                (-0.69, Some(vec![-0.6931471805599453, -1.3862943611198906])),
+            ],
+            Some("stop"),
+        );
+        let u = margin_uncertainty_of(&signal, true).unwrap();
+        assert!((u - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
     fn missing_logprobs_yields_none() {
-        // Server that ignores the logprobs field (fail-safe path).
-        let json = r#"{
-            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
-            "usage": null
-        }"#;
-        let resp: ChatResponse = serde_json::from_str(json).expect("parse");
-        assert!(mean_logprob_of(resp.choices.first().unwrap()).is_none());
+        // Server that ignores the logprobs field (fail-safe path): the shared
+        // provider hands back `None` and nothing downstream is scored.
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":null}"#,
+        )
+        .unwrap();
+        assert!(duduclaw_llm::providers::openai_compat::parse_logprobs(&body).is_none());
     }
 
     #[test]
     fn empty_logprob_content_yields_none() {
-        let json = r#"{
-            "choices": [{
-                "message": {"role": "assistant", "content": ""},
-                "logprobs": {"content": []}
-            }]
-        }"#;
-        let resp: ChatResponse = serde_json::from_str(json).expect("parse");
-        assert!(mean_logprob_of(resp.choices.first().unwrap()).is_none());
+        let signal = lp(vec![], None);
+        assert!(mean_logprob_of(&signal).is_none());
+        assert!(margin_uncertainty_of(&signal, false).is_none());
     }
 
+    /// O11 regression: a request that does not ask for logprobs must leave the
+    /// wire body exactly as a legacy server expects it (no `logprobs` key).
     #[test]
     fn logprobs_field_omitted_from_request_when_not_captured() {
-        let body = ChatRequest {
-            model: "m".into(),
-            messages: vec![],
-            max_tokens: Some(10),
-            temperature: Some(0.7),
-            top_p: Some(0.9),
-            stop: vec![],
-            logprobs: None,
-            logit_bias: None,
-        };
-        let json = serde_json::to_string(&body).unwrap();
-        assert!(!json.contains("logprobs"), "legacy request body must be unchanged: {json}");
+        let mut chat = LlmChatRequest::new("m");
+        chat.max_tokens = 10;
+        chat.temperature = Some(0.7);
+        chat.top_p = Some(0.9);
+        let json = serde_json::to_string(
+            &duduclaw_llm::providers::openai_compat::build_request_body(&chat, false),
+        )
+        .unwrap();
+        assert!(
+            !json.contains("logprobs"),
+            "legacy request body must be unchanged: {json}"
+        );
 
-        let body = ChatRequest { logprobs: Some(true), ..body };
-        let json = serde_json::to_string(&body).unwrap();
+        chat.logprobs = Some(true);
+        let json = serde_json::to_string(
+            &duduclaw_llm::providers::openai_compat::build_request_body(&chat, false),
+        )
+        .unwrap();
         assert!(json.contains("\"logprobs\":true"));
-    }
-
-    #[test]
-    fn logit_bias_omitted_when_absent_and_string_keyed_when_present() {
-        // JitRL disabled / no similar experience → field must not appear at
-        // all: legacy servers see a byte-identical body shape.
-        let body = ChatRequest {
-            model: "m".into(),
-            messages: vec![],
-            max_tokens: Some(10),
-            temperature: Some(0.7),
-            top_p: Some(0.9),
-            stop: vec![],
-            logprobs: None,
-            logit_bias: None,
-        };
-        let json = serde_json::to_string(&body).unwrap();
-        assert!(!json.contains("logit_bias"), "untouched request must carry no bias: {json}");
-
-        // JitRL enabled → OpenAI-style object with string keys.
-        let mut bias = std::collections::HashMap::new();
-        bias.insert(42u32, 1.5f32);
-        let body = ChatRequest { logit_bias: Some(bias), ..body };
-        let json = serde_json::to_string(&body).unwrap();
-        assert!(json.contains("\"logit_bias\":{\"42\":1.5}"), "got: {json}");
+        assert!(!json.contains("top_logprobs"));
     }
 }
 
@@ -445,7 +440,10 @@ mod loaded_model_tests {
     async fn constructor_reports_the_configured_model_as_loaded() {
         let home = tempfile::tempdir().unwrap();
         let backend = OpenAiCompatBackend::new_with_home(cfg("local"), home.path()).await;
-        let loaded = backend.loaded_model().await.expect("model reported as loaded");
+        let loaded = backend
+            .loaded_model()
+            .await
+            .expect("model reported as loaded");
         assert_eq!(loaded.id, "local");
         assert_eq!(loaded.path, "http://127.0.0.1:8080/v1");
         // Nothing is guessed about weights we cannot see.
@@ -467,5 +465,20 @@ mod loaded_model_tests {
         let backend = OpenAiCompatBackend::new_with_home(cfg("local"), home.path()).await;
         backend.unload_model().await.unwrap();
         assert!(backend.loaded_model().await.is_none());
+    }
+
+    /// O11: the local endpoint must reach the server under its own name even
+    /// when that name contains a slash (HuggingFace repo ids), and the chat
+    /// URL must still be `<base>/chat/completions`.
+    #[tokio::test]
+    async fn local_provider_keeps_slashed_model_ids_and_base_url() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = OpenAiCompatBackend::new_with_home(cfg("qwen/qwen3-4b"), home.path()).await;
+        let provider = backend.provider();
+        assert_eq!(provider.base_url(), "http://127.0.0.1:8080/v1");
+        let mut chat = LlmChatRequest::new("qwen/qwen3-4b");
+        chat.max_tokens = 8;
+        let body = duduclaw_llm::providers::openai_compat::build_request_body_with(&chat, false, true);
+        assert_eq!(body["model"], serde_json::json!("qwen/qwen3-4b"));
     }
 }

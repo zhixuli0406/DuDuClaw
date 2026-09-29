@@ -12,10 +12,14 @@ use std::path::Path;
 
 use duduclaw_memory::SqliteMemoryEngine;
 
-use super::entry::{PlaybookCategory, PlaybookMeta, PlaybookState, LEGACY_RULE_SOURCE_EVENT, PLAYBOOK_SOURCE_EVENT};
+use super::entry::{
+    LEGACY_RULE_SOURCE_EVENT, PLAYBOOK_SOURCE_EVENT, PlaybookCategory, PlaybookMeta, PlaybookState,
+};
 use super::signals::{self, TurnSignals};
 use super::store::CANDIDATE_SCAN_CAP;
-use crate::prediction::rule_lifecycle::{RuleStats, PROBATION_RULE_TAG, RETIRED_RULE_TAG, SHADOW_RULE_TAG};
+use crate::prediction::rule_lifecycle::{
+    PROBATION_RULE_TAG, RETIRED_RULE_TAG, RuleStats, SHADOW_RULE_TAG,
+};
 use crate::prediction::rule_staleness::SOURCE_STALE_RULE_TAG;
 
 /// Section header — deliberately dropped the old "(from past mistakes)"
@@ -39,8 +43,7 @@ pub const SOURCE_STALE_MARKER: &str = "（來源已更新，僅供參考）";
 /// this is the whole cost of making the loop explainable — no pipeline change,
 /// no extra call. Deliberately phrased as permission, not instruction: a rule
 /// citation on every turn would be noise.
-pub const SECTION_GUIDANCE: &str =
-    "（這些是你從過去經驗歸納出的法則。回答時可自然引用，例如「因為我學過：…」；\
+pub const SECTION_GUIDANCE: &str = "（這些是你從過去經驗歸納出的法則。回答時可自然引用，例如「因為我學過：…」；\
 使用者問「你為什麼這樣做？」時，請指出你實際依據的那一條。）";
 
 /// Prefix stamped on each rendered rule so the model can cite a specific one.
@@ -82,7 +85,10 @@ impl InjectionBudget {
     pub const DEFAULT_MAX_CHARS: usize = 1200;
 
     pub fn default_budget() -> Self {
-        Self { max_entries: Self::DEFAULT_MAX_ENTRIES, max_chars: Self::DEFAULT_MAX_CHARS }
+        Self {
+            max_entries: Self::DEFAULT_MAX_ENTRIES,
+            max_chars: Self::DEFAULT_MAX_CHARS,
+        }
     }
 
     /// Derive from `agent.toml [budget] max_input_tokens`
@@ -100,7 +106,10 @@ impl InjectionBudget {
             }
             _ => Self::DEFAULT_MAX_CHARS,
         };
-        Self { max_entries: Self::DEFAULT_MAX_ENTRIES, max_chars }
+        Self {
+            max_entries: Self::DEFAULT_MAX_ENTRIES,
+            max_chars,
+        }
     }
 }
 
@@ -118,7 +127,10 @@ pub async fn select_playbook(
     let mut unmatched: Vec<SelectedEntry> = Vec::new();
 
     for source_event in [PLAYBOOK_SOURCE_EVENT, LEGACY_RULE_SOURCE_EVENT] {
-        let rows = match engine.list_valid_by_source_event(agent_id, source_event, CANDIDATE_SCAN_CAP).await {
+        let rows = match engine
+            .list_valid_by_source_event(agent_id, source_event, CANDIDATE_SCAN_CAP)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(agent = %agent_id, source_event, "playbook: select_playbook list failed: {e}");
@@ -140,8 +152,9 @@ pub async fn select_playbook(
             {
                 continue;
             }
-            let meta = PlaybookMeta::from_metadata(&metadata)
-                .unwrap_or_else(|| PlaybookMeta::legacy_default(&mem_entry.tags, &mem_entry.content));
+            let meta = PlaybookMeta::from_metadata(&metadata).unwrap_or_else(|| {
+                PlaybookMeta::legacy_default(&mem_entry.tags, &mem_entry.content)
+            });
             if meta.state == PlaybookState::Stale {
                 // The ONE axis `meta.state` is authoritative for at
                 // selection time (see entry::PlaybookState doc) —
@@ -194,7 +207,10 @@ pub async fn select_playbook(
 /// the next one would exceed `max_chars`. Returns `(section_text,
 /// injected_ids)`; `None` when nothing was selected (matches the old
 /// `build_rules_section_blocking` "no active rules" contract).
-pub fn render_section(entries: &[SelectedEntry], budget: &InjectionBudget) -> Option<(String, Vec<String>)> {
+pub fn render_section(
+    entries: &[SelectedEntry],
+    budget: &InjectionBudget,
+) -> Option<(String, Vec<String>)> {
     let mut body_parts: Vec<String> = Vec::new();
     let mut ids: Vec<String> = Vec::new();
     // Header + newline + guidance line + newline (W3-2). Both are charged to
@@ -210,7 +226,12 @@ pub fn render_section(entries: &[SelectedEntry], budget: &InjectionBudget) -> Op
         // model sees the caveat inline (the entry is already downweighted to
         // last by the selection sort). Charged to the same char budget.
         let labeled = if e.source_stale {
-            format!("{}{} {}", rule_label(ids.len() + 1), e.content, SOURCE_STALE_MARKER)
+            format!(
+                "{}{} {}",
+                rule_label(ids.len() + 1),
+                e.content,
+                SOURCE_STALE_MARKER
+            )
         } else {
             format!("{}{}", rule_label(ids.len() + 1), e.content)
         };
@@ -293,7 +314,10 @@ pub async fn collect_armed_shadow(
     let mut seen = std::collections::HashSet::new();
     let mut out = ArmedShadow::default();
     for source_event in [PLAYBOOK_SOURCE_EVENT, LEGACY_RULE_SOURCE_EVENT] {
-        let rows = match engine.list_valid_by_source_event(agent_id, source_event, CANDIDATE_SCAN_CAP).await {
+        let rows = match engine
+            .list_valid_by_source_event(agent_id, source_event, CANDIDATE_SCAN_CAP)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(agent = %agent_id, source_event, "playbook: collect_armed_shadow list failed: {e}");
@@ -309,8 +333,9 @@ pub async fn collect_armed_shadow(
             if !is_shadow || is_retired {
                 continue;
             }
-            let meta = PlaybookMeta::from_metadata(&metadata)
-                .unwrap_or_else(|| PlaybookMeta::legacy_default(&mem_entry.tags, &mem_entry.content));
+            let meta = PlaybookMeta::from_metadata(&metadata).unwrap_or_else(|| {
+                PlaybookMeta::legacy_default(&mem_entry.tags, &mem_entry.content)
+            });
             if meta.state == PlaybookState::Stale {
                 continue;
             }
@@ -373,6 +398,7 @@ mod tests {
         let meta = PlaybookMeta {
             schema_version: crate::playbook::entry::PLAYBOOK_SCHEMA_VERSION,
             category: PlaybookCategory::Repair,
+            transferability: Default::default(),
             signals_match,
             strategy: Vec::new(),
             failure_history: Vec::new(),
@@ -403,7 +429,10 @@ mod tests {
         let mut blob = serde_json::json!({"rule_stats": {"helpful": net_helpful, "harmful": 0}});
         meta.merge_into(&mut blob);
         assert!(blob.get(PLAYBOOK_KEY).is_some());
-        let temporal = TemporalMeta { metadata: Some(blob), ..Default::default() };
+        let temporal = TemporalMeta {
+            metadata: Some(blob),
+            ..Default::default()
+        };
         engine.store_temporal(agent, entry, temporal).await.unwrap()
     }
 
@@ -412,21 +441,51 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-sel";
         // Higher net score, but no signal match this turn.
-        store_playbook_entry(&engine, agent, "generic high-score rule", vec!["channel:discord".to_string()], 10, false).await;
+        store_playbook_entry(
+            &engine,
+            agent,
+            "generic high-score rule",
+            vec!["channel:discord".to_string()],
+            10,
+            false,
+        )
+        .await;
         // Lower net score, but matches this turn's signal.
-        let matched_id = store_playbook_entry(&engine, agent, "specific refund rule", vec!["mistake:capability".to_string()], 1, false).await;
+        let matched_id = store_playbook_entry(
+            &engine,
+            agent,
+            "specific refund rule",
+            vec!["mistake:capability".to_string()],
+            1,
+            false,
+        )
+        .await;
 
         let turn = TurnSignals::new().with_mistake_category("capability");
         let selected = select_playbook(&engine, agent, &turn).await;
-        assert_eq!(selected[0].id, matched_id, "signal-matched entry ranks first regardless of net score");
+        assert_eq!(
+            selected[0].id, matched_id,
+            "signal-matched entry ranks first regardless of net score"
+        );
     }
 
     #[tokio::test]
     async fn retired_entries_are_excluded() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-sel-ret";
-        let id = store_playbook_entry(&engine, agent, "will be retired", vec!["*".to_string()], 1, false).await;
-        engine.set_importance_and_add_tag(agent, &id, 1.0, RETIRED_RULE_TAG).await.unwrap();
+        let id = store_playbook_entry(
+            &engine,
+            agent,
+            "will be retired",
+            vec!["*".to_string()],
+            1,
+            false,
+        )
+        .await;
+        engine
+            .set_importance_and_add_tag(agent, &id, 1.0, RETIRED_RULE_TAG)
+            .await
+            .unwrap();
 
         let turn = TurnSignals::new();
         let selected = select_playbook(&engine, agent, &turn).await;
@@ -437,7 +496,15 @@ mod tests {
     async fn stale_entries_are_excluded_from_selection() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-sel-stale";
-        let id = store_playbook_entry(&engine, agent, "stale rule", vec!["*".to_string()], 1, false).await;
+        let id = store_playbook_entry(
+            &engine,
+            agent,
+            "stale rule",
+            vec!["*".to_string()],
+            1,
+            false,
+        )
+        .await;
         let mut meta = engine.get_metadata(agent, &id).await.unwrap().unwrap();
         let mut m = PlaybookMeta::from_metadata(&meta).unwrap();
         m.state = PlaybookState::Stale;
@@ -452,8 +519,26 @@ mod tests {
     #[test]
     fn render_section_never_truncates_a_single_entry() {
         let entries = vec![
-            SelectedEntry { id: "1".into(), content: "a".repeat(50), category: PlaybookCategory::Repair, net: 5, success_streak: 0, probation: false, signal_matched: true, source_stale: false },
-            SelectedEntry { id: "2".into(), content: "b".repeat(50), category: PlaybookCategory::Repair, net: 4, success_streak: 0, probation: false, signal_matched: true, source_stale: false },
+            SelectedEntry {
+                id: "1".into(),
+                content: "a".repeat(50),
+                category: PlaybookCategory::Repair,
+                net: 5,
+                success_streak: 0,
+                probation: false,
+                signal_matched: true,
+                source_stale: false,
+            },
+            SelectedEntry {
+                id: "2".into(),
+                content: "b".repeat(50),
+                category: PlaybookCategory::Repair,
+                net: 4,
+                success_streak: 0,
+                probation: false,
+                signal_matched: true,
+                source_stale: false,
+            },
         ];
         // Prefix (header + W3-2 guidance line, both newline-terminated) plus
         // one labeled 50-char entry, with a little slack. A second entry
@@ -464,7 +549,11 @@ mod tests {
             max_chars: prefix_chars() + rule_label(1).chars().count() + 50 + 10,
         };
         let (section, ids) = render_section(&entries, &budget).unwrap();
-        assert_eq!(ids, vec!["1".to_string()], "second entry dropped whole, never truncated mid-content");
+        assert_eq!(
+            ids,
+            vec!["1".to_string()],
+            "second entry dropped whole, never truncated mid-content"
+        );
         assert!(section.contains(&"a".repeat(50)));
         assert!(!section.contains('b'));
     }
@@ -472,9 +561,21 @@ mod tests {
     #[test]
     fn render_section_respects_max_entries() {
         let entries: Vec<SelectedEntry> = (0..10)
-            .map(|i| SelectedEntry { id: i.to_string(), content: format!("entry {i}"), category: PlaybookCategory::Repair, net: 0, success_streak: 0, probation: false, signal_matched: false, source_stale: false })
+            .map(|i| SelectedEntry {
+                id: i.to_string(),
+                content: format!("entry {i}"),
+                category: PlaybookCategory::Repair,
+                net: 0,
+                success_streak: 0,
+                probation: false,
+                signal_matched: false,
+                source_stale: false,
+            })
             .collect();
-        let budget = InjectionBudget { max_entries: 3, max_chars: 100_000 };
+        let budget = InjectionBudget {
+            max_entries: 3,
+            max_chars: 100_000,
+        };
         let (_, ids) = render_section(&entries, &budget).unwrap();
         assert_eq!(ids.len(), 3);
     }
@@ -502,11 +603,17 @@ mod tests {
         // 30 chars + prefix + label, with slack — a byte-based budget would
         // have blown past this three times over.
         let max_chars = prefix_chars() + rule_label(1).chars().count() + 30 + 5;
-        let budget = InjectionBudget { max_entries: 10, max_chars };
+        let budget = InjectionBudget {
+            max_entries: 10,
+            max_chars,
+        };
         let (section, ids) = render_section(&entries, &budget).unwrap();
         assert_eq!(ids.len(), 1);
         assert!(section.chars().count() <= max_chars);
-        assert!(section.len() > max_chars, "content is multi-byte; a byte budget would differ");
+        assert!(
+            section.len() > max_chars,
+            "content is multi-byte; a byte budget would differ"
+        );
     }
 
     /// Chars consumed by everything that is not a rule: the header line plus
@@ -531,16 +638,25 @@ mod tests {
             .collect();
         let (section, ids) = render_section(&entries, &InjectionBudget::default_budget()).unwrap();
         assert!(section.starts_with(SECTION_HEADER));
-        assert!(section.contains(SECTION_GUIDANCE), "agent has no licence to cite: {section}");
+        assert!(
+            section.contains(SECTION_GUIDANCE),
+            "agent has no licence to cite: {section}"
+        );
         // Labels are 1-based and in the same order as the returned ids, so a
         // model citing 「法則 2」 points at `ids[1]`.
         assert_eq!(ids.len(), 3);
         for (i, _) in ids.iter().enumerate() {
-            assert!(section.contains(&format!("[法則 {}] rule body {i}", i + 1)), "{section}");
+            assert!(
+                section.contains(&format!("[法則 {}] rule body {i}", i + 1)),
+                "{section}"
+            );
         }
         // Internal vocabulary must not reach the prompt's user-visible copy.
         for internal in ["playbook", "shadow", "probation", "GVU"] {
-            assert!(!SECTION_GUIDANCE.contains(internal), "guidance leaks `{internal}`");
+            assert!(
+                !SECTION_GUIDANCE.contains(internal),
+                "guidance leaks `{internal}`"
+            );
         }
     }
 
@@ -549,14 +665,38 @@ mod tests {
     #[test]
     fn render_section_appends_marker_only_to_source_stale_entries() {
         let entries = vec![
-            SelectedEntry { id: "fresh".into(), content: "fresh rule".into(), category: PlaybookCategory::Repair, net: 5, success_streak: 0, probation: false, signal_matched: true, source_stale: false },
-            SelectedEntry { id: "stale".into(), content: "outdated rule".into(), category: PlaybookCategory::Repair, net: 4, success_streak: 0, probation: false, signal_matched: true, source_stale: true },
+            SelectedEntry {
+                id: "fresh".into(),
+                content: "fresh rule".into(),
+                category: PlaybookCategory::Repair,
+                net: 5,
+                success_streak: 0,
+                probation: false,
+                signal_matched: true,
+                source_stale: false,
+            },
+            SelectedEntry {
+                id: "stale".into(),
+                content: "outdated rule".into(),
+                category: PlaybookCategory::Repair,
+                net: 4,
+                success_streak: 0,
+                probation: false,
+                signal_matched: true,
+                source_stale: true,
+            },
         ];
         let (section, ids) = render_section(&entries, &InjectionBudget::default_budget()).unwrap();
         assert_eq!(ids, vec!["fresh".to_string(), "stale".to_string()]);
         // Marker present exactly once, on the stale rule only.
-        assert!(section.contains(&format!("outdated rule {SOURCE_STALE_MARKER}")), "{section}");
-        assert!(!section.contains(&format!("fresh rule {SOURCE_STALE_MARKER}")), "{section}");
+        assert!(
+            section.contains(&format!("outdated rule {SOURCE_STALE_MARKER}")),
+            "{section}"
+        );
+        assert!(
+            !section.contains(&format!("fresh rule {SOURCE_STALE_MARKER}")),
+            "{section}"
+        );
         assert_eq!(section.matches(SOURCE_STALE_MARKER).count(), 1);
     }
 
@@ -565,9 +705,28 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-g6-sel";
         // Stale rule with a HIGHER net score than the fresh one.
-        let stale = store_playbook_entry(&engine, agent, "stale high-score rule", vec!["*".to_string()], 10, false).await;
-        engine.set_importance_and_add_tag(agent, &stale, 8.0, SOURCE_STALE_RULE_TAG).await.unwrap();
-        let fresh = store_playbook_entry(&engine, agent, "fresh low-score rule", vec!["*".to_string()], 1, false).await;
+        let stale = store_playbook_entry(
+            &engine,
+            agent,
+            "stale high-score rule",
+            vec!["*".to_string()],
+            10,
+            false,
+        )
+        .await;
+        engine
+            .set_importance_and_add_tag(agent, &stale, 8.0, SOURCE_STALE_RULE_TAG)
+            .await
+            .unwrap();
+        let fresh = store_playbook_entry(
+            &engine,
+            agent,
+            "fresh low-score rule",
+            vec!["*".to_string()],
+            1,
+            false,
+        )
+        .await;
 
         let turn = TurnSignals::new();
         let selected = select_playbook(&engine, agent, &turn).await;
@@ -577,8 +736,20 @@ mod tests {
             vec![fresh.as_str(), stale.as_str()],
             "a source-stale rule sorts after a fresh one even with a higher net score"
         );
-        assert!(selected.iter().find(|e| e.id == stale).unwrap().source_stale);
-        assert!(!selected.iter().find(|e| e.id == fresh).unwrap().source_stale);
+        assert!(
+            selected
+                .iter()
+                .find(|e| e.id == stale)
+                .unwrap()
+                .source_stale
+        );
+        assert!(
+            !selected
+                .iter()
+                .find(|e| e.id == fresh)
+                .unwrap()
+                .source_stale
+        );
     }
 
     // ── collect_armed_shadow (v1.54 shadow-scoring debt closure) ──
@@ -599,6 +770,7 @@ mod tests {
         let meta = PlaybookMeta {
             schema_version: crate::playbook::entry::PLAYBOOK_SCHEMA_VERSION,
             category: PlaybookCategory::Repair,
+            transferability: Default::default(),
             signals_match,
             strategy: Vec::new(),
             failure_history: Vec::new(),
@@ -629,7 +801,10 @@ mod tests {
         let mut blob = serde_json::json!({"rule_stats": {"helpful": 1, "harmful": 0}});
         meta.merge_into(&mut blob);
         assert!(blob.get(PLAYBOOK_KEY).is_some());
-        let temporal = TemporalMeta { metadata: Some(blob), ..Default::default() };
+        let temporal = TemporalMeta {
+            metadata: Some(blob),
+            ..Default::default()
+        };
         engine.store_temporal(agent, entry, temporal).await.unwrap()
     }
 
@@ -640,39 +815,61 @@ mod tests {
 
         // Matching shadow candidates across BOTH source events.
         let armed_playbook = store_shadow_entry(
-            &engine, agent, PLAYBOOK_SOURCE_EVENT,
-            vec!["mistake:capability".to_string()], vec![],
+            &engine,
+            agent,
+            PLAYBOOK_SOURCE_EVENT,
+            vec!["mistake:capability".to_string()],
+            vec![],
         )
         .await;
         let armed_reflexion = store_shadow_entry(
-            &engine, agent, LEGACY_RULE_SOURCE_EVENT,
-            vec!["mistake:capability".to_string()], vec![],
+            &engine,
+            agent,
+            LEGACY_RULE_SOURCE_EVENT,
+            vec!["mistake:capability".to_string()],
+            vec![],
         )
         .await;
         // Active shadow but non-matching signal: counts toward family_k only.
         store_shadow_entry(
-            &engine, agent, LEGACY_RULE_SOURCE_EVENT,
-            vec!["channel:discord".to_string()], vec![],
+            &engine,
+            agent,
+            LEGACY_RULE_SOURCE_EVENT,
+            vec!["channel:discord".to_string()],
+            vec![],
         )
         .await;
         // Retired shadow: excluded from BOTH ids and family.
         store_shadow_entry(
-            &engine, agent, LEGACY_RULE_SOURCE_EVENT,
+            &engine,
+            agent,
+            LEGACY_RULE_SOURCE_EVENT,
             vec!["mistake:capability".to_string()],
             vec![RETIRED_RULE_TAG.to_string()],
         )
         .await;
         // Active NON-shadow entry: not part of the shadow family at all.
         store_playbook_entry(
-            &engine, agent, "active rule",
-            vec!["mistake:capability".to_string()], 3, false,
+            &engine,
+            agent,
+            "active rule",
+            vec!["mistake:capability".to_string()],
+            3,
+            false,
         )
         .await;
 
         let turn = TurnSignals::new().with_mistake_category("capability");
         let armed = collect_armed_shadow(&engine, agent, &turn).await;
-        assert_eq!(armed.family_k, 3, "family = every active shadow candidate, matched or not");
-        assert_eq!(armed.ids.len(), 2, "armed = signal-matched active shadow candidates only");
+        assert_eq!(
+            armed.family_k, 3,
+            "family = every active shadow candidate, matched or not"
+        );
+        assert_eq!(
+            armed.ids.len(),
+            2,
+            "armed = signal-matched active shadow candidates only"
+        );
         assert!(armed.ids.contains(&armed_playbook));
         assert!(armed.ids.contains(&armed_reflexion));
     }
@@ -686,15 +883,21 @@ mod tests {
         // shape — is unfalsifiable as a risk predictor: excluded from ids AND
         // family_k.
         let wildcard_only = store_shadow_entry(
-            &engine, agent, LEGACY_RULE_SOURCE_EVENT,
-            vec!["*".to_string()], vec![],
+            &engine,
+            agent,
+            LEGACY_RULE_SOURCE_EVENT,
+            vec!["*".to_string()],
+            vec![],
         )
         .await;
         // Mixed set: the wildcard is inert for arming; the discriminating
         // token governs. Counted in the family.
         let mixed = store_shadow_entry(
-            &engine, agent, PLAYBOOK_SOURCE_EVENT,
-            vec!["*".to_string(), "mistake:capability".to_string()], vec![],
+            &engine,
+            agent,
+            PLAYBOOK_SOURCE_EVENT,
+            vec!["*".to_string(), "mistake:capability".to_string()],
+            vec![],
         )
         .await;
 
@@ -703,7 +906,10 @@ mod tests {
         let unrelated = TurnSignals::new().with_channel("telegram");
         let armed = collect_armed_shadow(&engine, agent, &unrelated).await;
         assert_eq!(armed.family_k, 1, "only the mixed entry is trialable");
-        assert!(armed.ids.is_empty(), "wildcard must never arm a shadow candidate");
+        assert!(
+            armed.ids.is_empty(),
+            "wildcard must never arm a shadow candidate"
+        );
 
         // Turn WITH the discriminating token: the mixed entry arms; the
         // wildcard-only entry still doesn't exist as far as the trial goes.
@@ -724,8 +930,11 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-armed-stale";
         let id = store_shadow_entry(
-            &engine, agent, PLAYBOOK_SOURCE_EVENT,
-            vec!["mistake:capability".to_string()], vec![],
+            &engine,
+            agent,
+            PLAYBOOK_SOURCE_EVENT,
+            vec!["mistake:capability".to_string()],
+            vec![],
         )
         .await;
         let mut meta = engine.get_metadata(agent, &id).await.unwrap().unwrap();
@@ -736,7 +945,10 @@ mod tests {
 
         let turn = TurnSignals::new().with_mistake_category("capability");
         let armed = collect_armed_shadow(&engine, agent, &turn).await;
-        assert_eq!(armed.family_k, 0, "a superseded (Stale) shadow entry is not trialed");
+        assert_eq!(
+            armed.family_k, 0,
+            "a superseded (Stale) shadow entry is not trialed"
+        );
         assert!(armed.ids.is_empty());
     }
 

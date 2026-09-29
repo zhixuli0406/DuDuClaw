@@ -40,11 +40,17 @@ pub struct SystemBlock {
 
 impl SystemBlock {
     pub fn cached(text: impl Into<String>) -> Self {
-        Self { text: text.into(), cache: CacheHint::Explicit }
+        Self {
+            text: text.into(),
+            cache: CacheHint::Explicit,
+        }
     }
 
     pub fn uncached(text: impl Into<String>) -> Self {
-        Self { text: text.into(), cache: CacheHint::None }
+        Self {
+            text: text.into(),
+            cache: CacheHint::None,
+        }
     }
 }
 
@@ -99,11 +105,17 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, parts: vec![ContentPart::Text(text.into())] }
+        Self {
+            role: Role::User,
+            parts: vec![ContentPart::Text(text.into())],
+        }
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, parts: vec![ContentPart::Text(text.into())] }
+        Self {
+            role: Role::Assistant,
+            parts: vec![ContentPart::Text(text.into())],
+        }
     }
 }
 
@@ -179,6 +191,48 @@ pub struct ChatRequest {
     pub response_format: Option<serde_json::Value>,
     pub reasoning: ReasoningHint,
     pub temperature: Option<f32>,
+    /// P1/WP-3: per-call reasoning **effort** as a vendor-facing label
+    /// (`low`/`medium`/`high`/`xhigh`/`max` — the closed set of
+    /// `duduclaw_core::effort::Effort`, already clamped by the caller to what
+    /// the target provider accepts).
+    ///
+    /// Deliberately distinct from [`ChatRequest::reasoning`]: `ReasoningHint`
+    /// is DuDuClaw's own three-step *budget* abstraction (it becomes
+    /// Anthropic `thinking.budget_tokens` / Gemini `thinkingBudget`), whereas
+    /// this field is the vendors' native five-step *effort* control
+    /// (Anthropic `output_config.effort`, OpenAI `reasoning.effort`). Where a
+    /// provider takes both, effort wins — it is the explicit per-call
+    /// operator/role setting, the hint is a default.
+    ///
+    /// `None` (the default) ⇒ every provider's request body is byte-identical
+    /// to before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Nucleus-sampling cutoff. `None` (the default) ⇒ the key is absent from
+    /// every provider's request body, exactly as before this field existed.
+    ///
+    /// O11 (2026-09-29): added so the local-inference backend can express what
+    /// its own reqwest client used to send directly. Only the OpenAI-compat
+    /// provider maps it today (it is the surface local servers speak).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Stop sequences. Empty (the default) ⇒ key absent. Same O11 provenance
+    /// as [`ChatRequest::top_p`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+    /// Ask the server for per-token logprobs (OpenAI `logprobs`). `None` ⇒ key
+    /// absent, so a server that does not understand it sees an unchanged body.
+    ///
+    /// O11: this is what the UCCI calibrated-cascade router needs, and the
+    /// reason local inference had its own chat client. A provider that cannot
+    /// return logprobs simply yields `None` back — never an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    /// How many alternative candidates per token to report (OpenAI
+    /// `top_logprobs`). UCCI's top-2 margin signal needs `Some(2)`; `None` ⇒
+    /// key absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u8>,
 }
 
 impl ChatRequest {
@@ -193,7 +247,19 @@ impl ChatRequest {
             response_format: None,
             reasoning: ReasoningHint::Off,
             temperature: None,
+            reasoning_effort: None,
+            top_p: None,
+            stop: Vec::new(),
+            logprobs: None,
+            top_logprobs: None,
         }
+    }
+
+    /// Builder setter for [`ChatRequest::reasoning_effort`]. Pass the already
+    /// clamped `Effort::as_str()` label; `None` clears it.
+    pub fn with_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.reasoning_effort = effort.map(str::to_string);
+        self
     }
 
     /// CJK-aware input-token estimate (system + messages + tool schemas).
@@ -227,11 +293,9 @@ impl ChatRequest {
     /// The tool-schema half of [`Self::estimate_input_tokens`], on its own.
     ///
     /// Same formula, single definition — [`Self::estimate_input_tokens`] calls
-    /// this, so the two can never drift. Exists for the Code Mode Phase 0
-    /// measurement gate (`duduclaw-gateway::tool_loop_probe`), which needs the
-    /// numerator "how much of a request is just tool descriptions" separately
-    /// from the total. Same caveat as the parent: a CJK-aware heuristic, not a
-    /// provider tokenizer.
+    /// this, so the two can never drift. Isolates the numerator "how much of a
+    /// request is just tool descriptions" from the total. Same caveat as the
+    /// parent: a CJK-aware heuristic, not a provider tokenizer.
     pub fn estimate_tool_schema_tokens(&self) -> u64 {
         let mut total = 0u64;
         for tool in &self.tools {
@@ -302,8 +366,12 @@ impl NormalizedUsage {
         Self {
             input_tokens: self.input_tokens.saturating_add(other.input_tokens),
             output_tokens: self.output_tokens.saturating_add(other.output_tokens),
-            cache_read_tokens: self.cache_read_tokens.saturating_add(other.cache_read_tokens),
-            cache_write_tokens: self.cache_write_tokens.saturating_add(other.cache_write_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_add(other.cache_read_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_add(other.cache_write_tokens),
             reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
         }
     }
@@ -347,7 +415,9 @@ impl ChatResponse {
         self.parts
             .iter()
             .filter_map(|p| match p {
-                ContentPart::ToolCall { id, name, args } => Some((id.as_str(), name.as_str(), args)),
+                ContentPart::ToolCall { id, name, args } => {
+                    Some((id.as_str(), name.as_str(), args))
+                }
                 _ => None,
             })
             .collect()
@@ -360,8 +430,15 @@ impl ChatResponse {
 pub enum StreamEvent {
     TextDelta(String),
     ReasoningDelta(String),
-    ToolCallStart { index: usize, id: String, name: String },
-    ToolCallDelta { index: usize, args_fragment: String },
+    ToolCallStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        index: usize,
+        args_fragment: String,
+    },
     Done(ChatResponse),
 }
 

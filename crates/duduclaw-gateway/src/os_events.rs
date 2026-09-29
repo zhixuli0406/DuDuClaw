@@ -1208,7 +1208,10 @@ goal_acceptance = "月報含 {file_name} 的資料"
 
         // Blank acceptance counts as absent, not as an empty criterion.
         let dir = watch_dir("[os_watch]\ngoal_template = \"x\"\ngoal_acceptance = \"  \"\n");
-        assert_eq!(read_goal_template_config(dir.path()).unwrap().acceptance, None);
+        assert_eq!(
+            read_goal_template_config(dir.path()).unwrap().acceptance,
+            None
+        );
     }
 
     #[test]
@@ -1230,7 +1233,9 @@ goal_acceptance = "月報含 {file_name} 的資料"
         let dir = watch_dir("[os_watch]\npaths = [\"~/Downloads\"]\nsome_future_key = 3\n");
         let json = read_os_watch_json(dir.path());
         assert_eq!(
-            json.get("paths").and_then(|p| p.get(0)).and_then(|p| p.as_str()),
+            json.get("paths")
+                .and_then(|p| p.get(0))
+                .and_then(|p| p.as_str()),
             Some("~/Downloads"),
             "the form must see the unexpanded value the operator wrote"
         );

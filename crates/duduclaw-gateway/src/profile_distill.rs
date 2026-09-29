@@ -104,8 +104,21 @@ pub struct ProfileTraitCandidate {
 /// the match itself. Stripped repeatedly before marker matching so
 /// "你可以叫我老李" reduces to "叫我老李".
 const LEAD_INS: &[&str] = &[
-    "請", "麻煩", "拜託", "幫我", "記得", "可以", "能不能", "希望",
-    "你", "妳", "您", "另外", "還有", "然後", "那",
+    "請",
+    "麻煩",
+    "拜託",
+    "幫我",
+    "記得",
+    "可以",
+    "能不能",
+    "希望",
+    "你",
+    "妳",
+    "您",
+    "另外",
+    "還有",
+    "然後",
+    "那",
 ];
 
 /// Lead-ins that additionally mark the statement as a *standing* instruction
@@ -136,7 +149,14 @@ const NAME_MARKER_WEAK: &[&str] = &["叫我"];
 /// Tails that turn a bare "叫我 X" into a statement of preference rather than
 /// an instruction to fetch the user.
 const NAME_CONFIRM_SUFFIXES: &[&str] = &[
-    "就好了", "就可以了", "就行了", "就好", "就可以", "就行", "即可", "就對了",
+    "就好了",
+    "就可以了",
+    "就行了",
+    "就好",
+    "就可以",
+    "就行",
+    "即可",
+    "就對了",
 ];
 
 /// Positive preference verbs (clause-leading, first person).
@@ -144,8 +164,14 @@ const NAME_CONFIRM_SUFFIXES: &[&str] = &[
 /// Request verbs ("我要…", "我想要…", "我希望…", "I'd like…") are deliberately
 /// absent: they introduce a task for *this* turn far more often than a standing
 /// preference, and "我要查上週營收" must never become a profile fact.
-const PREF_POSITIVE_MARKERS: &[&str] =
-    &["我比較喜歡", "我最喜歡", "我喜歡", "我偏好", "我習慣", "我愛"];
+const PREF_POSITIVE_MARKERS: &[&str] = &[
+    "我比較喜歡",
+    "我最喜歡",
+    "我喜歡",
+    "我偏好",
+    "我習慣",
+    "我愛",
+];
 
 /// Negative preference verbs. Checked before the positive table so
 /// "我不喜歡…" can never be read as "我…". Mirrors the positive table's
@@ -160,16 +186,36 @@ const PREF_NEGATIVE_ASCII: &[&str] = &["i don't like ", "i dislike ", "i hate ",
 /// value also names the reply itself (or *is* just the style word) — otherwise
 /// "我喜歡簡潔的設計" would be mis-filed as a reply-style instruction.
 const STYLE_KEYWORDS: &[&str] = &[
-    "簡短", "簡潔", "精簡", "短一點", "短一些", "詳細", "仔細", "條列", "重點式",
-    "口語", "正式", "白話", "有條理",
+    "簡短",
+    "簡潔",
+    "精簡",
+    "短一點",
+    "短一些",
+    "詳細",
+    "仔細",
+    "條列",
+    "重點式",
+    "口語",
+    "正式",
+    "白話",
+    "有條理",
 ];
 
 const STYLE_KEYWORDS_ASCII: &[&str] = &["short", "brief", "concise", "detailed", "bullet"];
 
 /// Nouns that make a clause about *the reply* rather than about the world.
-const REPLY_NOUNS: &[&str] = &["回覆", "回答", "回應", "答覆", "回話", "說話", "講話", "訊息"];
+const REPLY_NOUNS: &[&str] = &[
+    "回覆", "回答", "回應", "答覆", "回話", "說話", "講話", "訊息",
+];
 
-const REPLY_NOUNS_ASCII: &[&str] = &["reply", "replies", "answer", "answers", "response", "responses"];
+const REPLY_NOUNS_ASCII: &[&str] = &[
+    "reply",
+    "replies",
+    "answer",
+    "answers",
+    "response",
+    "responses",
+];
 
 /// Standing language instructions: `(clause-leading marker, canonical value)`.
 const LANGUAGE_MARKERS: &[(&str, &str)] = &[
@@ -188,9 +234,26 @@ const LANGUAGE_MARKERS: &[(&str, &str)] = &[
 /// [`NAME_CONFIRM_SUFFIXES`] — the tail that *qualifies* a weak name match must
 /// also be removed from the value it qualifies ("叫我老李即可" → "老李").
 const TRAILING_FILLER: &[&str] = &[
-    "就好了", "就可以了", "就行了", "就對了", "就好", "就可以", "就行", "即可",
-    "比較好", "才好", "謝謝",
-    "吧", "喔", "唷", "囉", "啦", "哦", "呀", "的", "些",
+    "就好了",
+    "就可以了",
+    "就行了",
+    "就對了",
+    "就好",
+    "就可以",
+    "就行",
+    "即可",
+    "比較好",
+    "才好",
+    "謝謝",
+    "吧",
+    "喔",
+    "唷",
+    "囉",
+    "啦",
+    "哦",
+    "呀",
+    "的",
+    "些",
 ];
 
 /// Characters that turn a clause into a question — never a statement of
@@ -360,7 +423,19 @@ fn clauses(text: &str) -> Vec<&str> {
     text.split(|c: char| {
         matches!(
             c,
-            '\n' | '。' | '！' | '？' | '，' | '；' | '、' | '：' | '.' | '!' | '?' | ',' | ';' | ':'
+            '\n' | '。'
+                | '！'
+                | '？'
+                | '，'
+                | '；'
+                | '、'
+                | '：'
+                | '.'
+                | '!'
+                | '?'
+                | ','
+                | ';'
+                | ':'
         )
     })
     .map(str::trim)
@@ -414,7 +489,12 @@ pub fn extract_profile_traits(user_text: &str) -> Vec<ProfileTraitCandidate> {
                 .iter()
                 .find(|(marker, _)| head.starts_with(marker))
             {
-                push_unique(&mut out, PREDICATE_REPLY_LANGUAGE, canonical, MAX_VALUE_CHARS);
+                push_unique(
+                    &mut out,
+                    PREDICATE_REPLY_LANGUAGE,
+                    canonical,
+                    MAX_VALUE_CHARS,
+                );
                 continue;
             }
         }
@@ -495,7 +575,7 @@ const FREE_TEXT_PREDICATES: &[&str] = &[
 /// higher-value target than a one-off inbound message and gets the stricter
 /// bar. Returns the matched rule names on a hit.
 fn injection_rules_hit(value: &str) -> Option<Vec<String>> {
-    use duduclaw_security::input_guard::{scan_input, DEFAULT_BLOCK_THRESHOLD};
+    use duduclaw_security::input_guard::{DEFAULT_BLOCK_THRESHOLD, scan_input};
     let r = scan_input(value, DEFAULT_BLOCK_THRESHOLD);
     if r.matched_rules.is_empty() {
         None
@@ -584,12 +664,15 @@ pub async fn run_profile_distill(
     };
 
     let db = memory_db.to_path_buf();
+    let home = home_dir.to_path_buf();
     let agent = agent_id.to_string();
     let user = user_id.to_string();
     let result = tokio::task::spawn_blocking(move || {
         // rusqlite is !Send — the engine lives entirely inside this closure.
-        let mut engine =
-            SqliteMemoryEngine::new(&db).map_err(|e| format!("open memory engine: {e}"))?;
+        // H4: built through `memory_factory` so `[memory] novelty_gate` applies
+        // to profile-trait writes too.
+        let mut engine = crate::memory_factory::build_memory_engine(&db, &home)
+            .map_err(|e| format!("open memory engine: {e}"))?;
         engine.set_memory_quota_gb(quota_gb);
         let rt = tokio::runtime::Handle::current();
         Ok::<usize, String>(rt.block_on(store_profile_traits(&engine, &agent, &user, &traits)))
@@ -598,7 +681,11 @@ pub async fn run_profile_distill(
 
     match result {
         Ok(Ok(n)) if n > 0 => {
-            debug!(agent = agent_id, traits = n, "profile distill: traits recorded");
+            debug!(
+                agent = agent_id,
+                traits = n,
+                "profile distill: traits recorded"
+            );
             // WP6: "叫我老李就好" is exactly the kind of thing the user expects
             // to see land somewhere visible. Only when `n > 0` — a batch that
             // was entirely dropped by the injection scanner changed nothing.
@@ -615,7 +702,10 @@ pub async fn run_profile_distill(
         }
         Ok(Ok(_)) => {}
         Ok(Err(e)) => warn!(agent = agent_id, "profile distill: persist failed: {e}"),
-        Err(e) => warn!(agent = agent_id, "profile distill: spawn_blocking panicked: {e}"),
+        Err(e) => warn!(
+            agent = agent_id,
+            "profile distill: spawn_blocking panicked: {e}"
+        ),
     }
 }
 
@@ -746,7 +836,10 @@ mod tests {
 
     #[test]
     fn sender_marker_header_is_stripped() {
-        let text = format!("{}u123]\n以後請稱呼我老李。", crate::channel_reply::SENDER_PREFIX_OPEN);
+        let text = format!(
+            "{}u123]\n以後請稱呼我老李。",
+            crate::channel_reply::SENDER_PREFIX_OPEN
+        );
         assert_eq!(
             traits_of(&text),
             vec![(PREDICATE_PREFERRED_NAME.to_string(), "老李".to_string())]
@@ -795,11 +888,17 @@ mod tests {
     fn values_are_bounded_and_deduped() {
         let long = "我喜歡".to_string() + &"很".repeat(200);
         let got = extract_profile_traits(&long);
-        assert!(got.is_empty(), "over-long value is discarded, not truncated blindly");
+        assert!(
+            got.is_empty(),
+            "over-long value is discarded, not truncated blindly"
+        );
 
         // One trait per predicate per turn; first mention wins.
         let got = traits_of("我喜歡喝咖啡。我喜歡喝茶");
-        assert_eq!(got, vec![(PREDICATE_PREFERS.to_string(), "喝咖啡".to_string())]);
+        assert_eq!(
+            got,
+            vec![(PREDICATE_PREFERS.to_string(), "喝咖啡".to_string())]
+        );
     }
 
     #[test]
@@ -884,10 +983,12 @@ mod tests {
             0,
             "injection payload must not be persisted"
         );
-        assert!(duduclaw_memory::user_profile::profile_block(&engine, "a1", "u1")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            duduclaw_memory::user_profile::profile_block(&engine, "a1", "u1")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Same via the weak name marker, and a clean trait in the same batch
         // still lands (one poisoned clause must not suppress the rest).

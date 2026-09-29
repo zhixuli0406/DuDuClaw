@@ -40,6 +40,17 @@ mod tests;
 /// UI locale for display-name resolution.
 const UI_LOCALE: &str = "zh-TW";
 
+// ── Seams used by the unified `duduclaw pack` front door (T5/O2) ──
+//
+// `pack_cmd::install_pack` is the single entry point every pack install goes
+// through; it resolves + classifies a source and then hands roster-shaped
+// packs back to the pipeline below. These three re-exports are that handoff —
+// the pipeline itself is unchanged, which is what keeps "the installed result
+// is byte-identical to the old path" true rather than merely hoped for.
+pub(crate) use install::cmd_install as install_via_expert_pipeline;
+pub(crate) use install::resolve_source as resolve_pack_source;
+pub(crate) use detect::resolve_root as resolve_pack_root;
+
 #[derive(Subcommand)]
 pub enum ExpertCommands {
     /// Install an expert pack from a directory, `.zip`, or URL.
@@ -147,17 +158,37 @@ pub enum ExpertCommands {
 pub async fn run(cmd: ExpertCommands) -> Result<()> {
     let home = crate::duduclaw_home();
     match cmd {
+        // T5/O2: `expert install` is now an alias for the unified front door
+        // (`duduclaw pack install`). Roster-shaped packs come straight back to
+        // `install::cmd_install` below, so this path is byte-identical for
+        // every expert.toml / Claude-plugin / Agent-Skill source; what it
+        // gains is the one premium-tier gate and the preset route.
         ExpertCommands::Install {
             source,
             dry_run,
             rename,
             trust_hooks,
             attach_under,
-        } => install::cmd_install(&home, &source, dry_run, rename, trust_hooks, attach_under).await,
-        ExpertCommands::Pack { dir, out } => cmd_pack(&dir, out.as_deref()),
-        ExpertCommands::Publish { dir, archive_url, publisher } => {
-            cmd_publish(&dir, archive_url.as_deref(), publisher.as_deref())
+        } => {
+            crate::pack_cmd::install_pack(
+                &home,
+                &source,
+                crate::pack_cmd::InstallOptions {
+                    dry_run,
+                    rename,
+                    trust_hooks,
+                    attach_under,
+                    force: false,
+                },
+            )
+            .await
         }
+        ExpertCommands::Pack { dir, out } => cmd_pack(&dir, out.as_deref()),
+        ExpertCommands::Publish {
+            dir,
+            archive_url,
+            publisher,
+        } => cmd_publish(&dir, archive_url.as_deref(), publisher.as_deref()),
         ExpertCommands::List { json } => cmd_list(&home, json),
         ExpertCommands::Remove { slug } => cmd_remove(&home, &slug).await,
         ExpertCommands::Export { slug, format, out } => {
@@ -461,19 +492,22 @@ fn cfg_err(msg: String) -> DuDuClawError {
 
 // ─────────────────────────── pack / list / remove ───────────────────────────
 
-
 /// WP2.2 R2 — `expert publish`: pack + hash + emit the registry entry JSON.
 /// The zip itself is NOT uploaded anywhere (registry stores metadata only);
 /// the printed steps walk the publisher through release upload + PR.
 fn cmd_publish(dir: &Path, archive_url: Option<&str>, publisher: Option<&str>) -> Result<()> {
     let m = manifest::read(dir).map_err(cfg_err)?;
     let slug = m.expert.name.clone();
-    let version = if m.expert.version.is_empty() { "0.0.0".into() } else { m.expert.version.clone() };
+    let version = if m.expert.version.is_empty() {
+        "0.0.0".into()
+    } else {
+        m.expert.version.clone()
+    };
     let zip_path = PathBuf::from(format!("{slug}-{version}.zip"));
     cmd_pack(dir, Some(&zip_path))?;
 
-    let bytes = std::fs::read(&zip_path)
-        .map_err(|e| cfg_err(format!("讀取剛打包的 zip 失敗: {e}")))?;
+    let bytes =
+        std::fs::read(&zip_path).map_err(|e| cfg_err(format!("讀取剛打包的 zip 失敗: {e}")))?;
     let sha = registry::sha256_hex(&bytes);
 
     let has = |sub: &str| dir.join(sub).is_dir();
@@ -503,26 +537,41 @@ fn cmd_publish(dir: &Path, archive_url: Option<&str>, publisher: Option<&str>) -
         "eval_attached": has("evals"),
     });
     let entry_path = PathBuf::from(format!("{slug}.registry.json"));
-    std::fs::write(&entry_path, serde_json::to_string_pretty(&entry).unwrap_or_default())
-        .map_err(|e| cfg_err(format!("寫入 entry JSON 失敗: {e}")))?;
+    std::fs::write(
+        &entry_path,
+        serde_json::to_string_pretty(&entry).unwrap_or_default(),
+    )
+    .map_err(|e| cfg_err(format!("寫入 entry JSON 失敗: {e}")))?;
 
     // WP2.5: advisory quality tier — never blocks, tells the publisher
     // exactly what would raise it.
     let (tier, score_missing) = registry::compute_score(dir);
-    println!("\n  {} 品質分級：{}", style("★").yellow(), style(tier).bold());
+    println!(
+        "\n  {} 品質分級：{}",
+        style("★").yellow(),
+        style(tier).bold()
+    );
     for m in &score_missing {
         println!("    · 還差：{m}");
     }
 
-    println!("
-  {} {}", style("✓").green(), style("registry entry 已產出").bold());
+    println!(
+        "
+  {} {}",
+        style("✓").green(),
+        style("registry entry 已產出").bold()
+    );
     println!("    zip:   {}", zip_path.display());
     println!("    entry: {}", entry_path.display());
-    println!("
-  發佈三步：");
+    println!(
+        "
+  發佈三步："
+    );
     println!("  1. 把 zip 上傳到你的 GitHub Release，將 entry 的 archive_url 換成資產網址");
     if code_lane {
-        println!("  2. 此包含 hooks/skills（code lane）：需以 minisign 簽章 zip 並提供 minisig_url，");
+        println!(
+            "  2. 此包含 hooks/skills（code lane）：需以 minisign 簽章 zip 並提供 minisig_url，"
+        );
         println!("     且先在 registry 的 publishers/<你的帳號>/minisign.pub 註冊公鑰：");
         println!("       minisign -Sm {}", zip_path.display());
     } else {

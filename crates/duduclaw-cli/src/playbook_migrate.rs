@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 
 use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_gateway::gvu::soul_partition::{PartitionedSoul, SectionMutability};
-use duduclaw_gateway::playbook::{self, delta::PlaybookDelta, entry::EntryAssertions, gene::EvalCaseRef};
+use duduclaw_gateway::playbook::{
+    self, delta::PlaybookDelta, entry::EntryAssertions, gene::EvalCaseRef,
+};
 
 /// Flags for `duduclaw playbook migrate-soul`.
 pub struct MigrateOptions {
@@ -161,7 +163,11 @@ pub async fn cmd_migrate_soul(home: &Path, opts: MigrateOptions) -> Result<()> {
         return Ok(());
     }
 
-    println!("從 {} 抽出 {} 條候選規則:", soul_path.display(), rules.len());
+    println!(
+        "從 {} 抽出 {} 條候選規則:",
+        soul_path.display(),
+        rules.len()
+    );
     for (section, text) in &rules {
         println!("  [{section}] {text}");
     }
@@ -171,7 +177,11 @@ pub async fn cmd_migrate_soul(home: &Path, opts: MigrateOptions) -> Result<()> {
     }
 
     let draft = Draft {
-        source: format!("SOUL.md of agent `{}` (extracted {})", opts.agent, chrono::Utc::now().to_rfc3339()),
+        source: format!(
+            "SOUL.md of agent `{}` (extracted {})",
+            opts.agent,
+            chrono::Utc::now().to_rfc3339()
+        ),
         rule: rules
             .into_iter()
             .map(|(section, text)| DraftRule {
@@ -196,15 +206,22 @@ pub async fn cmd_migrate_soul(home: &Path, opts: MigrateOptions) -> Result<()> {
                   # 沒填會在 apply 時被驗證管線拒絕(G6 / WP2.8),屬預期行為。\n\n";
     std::fs::write(&draft_path, format!("{header}{body}"))
         .map_err(|e| DuDuClawError::Agent(format!("write draft: {e}")))?;
-    println!("草稿已寫入 {}(全部 apply=false,請人工審閱後執行 --apply)", draft_path.display());
+    println!(
+        "草稿已寫入 {}(全部 apply=false,請人工審閱後執行 --apply)",
+        draft_path.display()
+    );
     Ok(())
 }
 
 async fn apply_draft(home: &Path, agent: &str, draft_path: &Path) -> Result<()> {
-    let content = std::fs::read_to_string(draft_path)
-        .map_err(|e| DuDuClawError::Agent(format!("read {}: {e}(先跑一次不帶 --apply 產生草稿)", draft_path.display())))?;
-    let draft: Draft = toml::from_str(&content)
-        .map_err(|e| DuDuClawError::Agent(format!("parse draft: {e}")))?;
+    let content = std::fs::read_to_string(draft_path).map_err(|e| {
+        DuDuClawError::Agent(format!(
+            "read {}: {e}(先跑一次不帶 --apply 產生草稿)",
+            draft_path.display()
+        ))
+    })?;
+    let draft: Draft =
+        toml::from_str(&content).map_err(|e| DuDuClawError::Agent(format!("parse draft: {e}")))?;
 
     let selected: Vec<&DraftRule> = draft.rule.iter().filter(|r| r.apply).collect();
     if selected.is_empty() {
@@ -222,7 +239,11 @@ async fn apply_draft(home: &Path, agent: &str, draft_path: &Path) -> Result<()> 
             } else {
                 r.signals_match.clone()
             },
-            eval_cases: r.eval_cases.iter().map(|c| EvalCaseRef(c.clone())).collect(),
+            eval_cases: r
+                .eval_cases
+                .iter()
+                .map(|c| EvalCaseRef(c.clone()))
+                .collect(),
             assertions: EntryAssertions {
                 must_use_tools: r.must_use_tools.clone(),
                 must_not_use_tools: r.must_not_use_tools.clone(),
@@ -241,14 +262,20 @@ async fn apply_draft(home: &Path, agent: &str, draft_path: &Path) -> Result<()> 
         playbook::store::apply_deltas(&engine, agent, deltas, &[], &eval_root, chrono::Utc::now())
             .await;
 
-    println!("套用完成:accepted {},rejected {}", outcome.applied.len(), outcome.rejected.len());
+    println!(
+        "套用完成:accepted {},rejected {}",
+        outcome.applied.len(),
+        outcome.rejected.len()
+    );
     for (d, why) in &outcome.rejected {
         if let PlaybookDelta::Add { content, .. } = d {
             println!("  ✗ {}: {why}", duduclaw_core::truncate_chars(content, 40));
         }
     }
     if !outcome.rejected.is_empty() {
-        println!("被拒條目請修正草稿(補 eval_cases / 斷言)後重跑 --apply;已入庫的不會重複(dedup)。");
+        println!(
+            "被拒條目請修正草稿(補 eval_cases / 斷言)後重跑 --apply;已入庫的不會重複(dedup)。"
+        );
     }
     Ok(())
 }
@@ -263,7 +290,10 @@ mod tests {
     fn extract_skips_identity_dedups_and_drops_short_lines() {
         let rules = extract_rules(SOUL);
         let texts: Vec<&str> = rules.iter().map(|(_, t)| t.as_str()).collect();
-        assert!(!texts.iter().any(|t| t.contains("誠實")), "identity section must be skipped: {texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains("誠實")),
+            "identity section must be skipped: {texts:?}"
+        );
         assert_eq!(
             texts.iter().filter(|t| t.contains("確認需求")).count(),
             1,
@@ -271,7 +301,10 @@ mod tests {
         );
         assert!(!texts.iter().any(|t| *t == "短"), "too-short lines dropped");
         assert!(texts.iter().any(|t| t.contains("例外清單")));
-        assert!(texts.iter().any(|t| t.contains("簡短回覆")), "Observable section included");
+        assert!(
+            texts.iter().any(|t| t.contains("簡短回覆")),
+            "Observable section included"
+        );
     }
 
     #[test]

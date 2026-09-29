@@ -10,6 +10,23 @@
 #   (premium templates, evolution params, enterprise dashboard, priority patches).
 #   NEVER aspires to lock down the core — failed license = downgrade gracefully.
 #
+# TWO KINDS OF BOOLEAN IN THIS FILE (2026-09 — do not confuse them):
+#   1. Capability gates — a code path actually calls `FeatureGate::check()` on
+#      them and behaves differently. There are exactly three:
+#        premium_templates, white_label, industry_evolution_params
+#   2. Service commitments — what the subscription PROMISES a human will do
+#      (support channels, patch SLA, hosting form factor, resale rights). They
+#      have NO enforcement anywhere in the binary and must never grow one by
+#      accident, so `FeatureGate::check()` REFUSES them (returns false and
+#      logs); read them through `FeatureGate::service_commitment()` instead,
+#      which is display-only. These are:
+#        dashboard_enterprise, priority_security_patch, private_discord_support,
+#        odoo_integration_supported, redistribution, dedicated_engineer,
+#        cloud_only, self_host_only
+#      (`cloud_only` / `self_host_only` are also decided independently by
+#      `LicenseTier::is_cloud_only()` / `is_self_host_only()` in tier.rs; the
+#      keys here are documentation of the tier's delivery mode.)
+#
 # Two delivery modes:
 #   - cloud-hosted tiers (hobby/solo/studio/business)
 #     enforced by Cloud control-plane multi-tenancy (max_* limits enforced)
@@ -41,8 +58,6 @@ description = "Apache 2.0 — full core, no commercial modules"
 # Limits: 0 = unlimited
 max_agents = 0
 max_channels = 0
-max_local_models = 0
-max_messages_per_month = 0
 memory_quota_gb = 0
 
 # Commercial value-add modules (all locked at this tier)
@@ -51,7 +66,6 @@ industry_evolution_params = false   # commercial/evolution-params
 dashboard_enterprise = false        # commercial/dashboard-enterprise
 priority_security_patch = false     # 30-day delayed in OSS
 private_discord_support = false
-office_hour_hours_per_month = 0
 
 # Cloud-only features (always false for non-cloud tiers)
 cloud_only = false
@@ -71,8 +85,6 @@ trial_days = 14
 
 max_agents = 1
 max_channels = 1
-max_local_models = 0
-max_messages_per_month = 100
 memory_quota_gb = 0                 # share trial pool
 
 # No value-adds
@@ -93,8 +105,6 @@ cloud_only = true
 
 max_agents = 1
 max_channels = 2
-max_local_models = 0
-max_messages_per_month = 0          # unlimited (fair-use enforced upstream)
 memory_quota_gb = 0                 # tiny — shared pool
 
 # Basic features
@@ -114,8 +124,6 @@ cloud_only = true
 
 max_agents = 3
 max_channels = 5
-max_local_models = 0
-max_messages_per_month = 0
 memory_quota_gb = 1
 
 # Premium value-adds unlocked
@@ -135,8 +143,6 @@ cloud_only = true
 
 max_agents = 0                      # unlimited
 max_channels = 0
-max_local_models = 0
-max_messages_per_month = 0
 memory_quota_gb = 10
 
 # All cloud value-adds
@@ -146,7 +152,6 @@ dashboard_enterprise = true         # ✓
 priority_security_patch = true      # ✓
 odoo_integration_supported = true   # ✓ (Cloud-hosted Odoo bridge)
 private_discord_support = true      # ✓ (private support channel)
-office_hour_hours_per_month = 4     # ✓ 4 hours/month
 
 license_phone_home_interval_days = 7
 license_grace_period_days = 30
@@ -164,8 +169,6 @@ self_host_only = true
 
 max_agents = 0
 max_channels = 0
-max_local_models = 0
-max_messages_per_month = 0
 memory_quota_gb = 0
 
 # Full commercial value-add modules for the partner's own use…
@@ -174,7 +177,6 @@ industry_evolution_params = true    # ✓ tuned evolution / GVU params
 dashboard_enterprise = true         # ✓ audit export / ROI (own use)
 priority_security_patch = true      # ✓ immediate patches
 private_discord_support = true      # ✓ partner support channel
-office_hour_hours_per_month = 0
 odoo_integration_supported = true   # ✓
 
 # …but NOT resale rights — that is the OEM tier's paid differentiator.
@@ -197,8 +199,6 @@ self_host_only = true
 
 max_agents = 0
 max_channels = 0
-max_local_models = 0
-max_messages_per_month = 0
 memory_quota_gb = 0
 
 # Personal-tier value-adds: templates + priority patches + private support.
@@ -207,7 +207,6 @@ industry_evolution_params = false   # ✗ enterprise-only (Self-Host Pro)
 dashboard_enterprise = false        # ✗ enterprise-only (audit export / ROI)
 priority_security_patch = true      # ✓ immediate vs 30-day OSS delay
 private_discord_support = true      # ✓
-office_hour_hours_per_month = 0
 
 license_phone_home_interval_days = 7
 license_grace_period_days = 30
@@ -225,8 +224,6 @@ self_host_only = true
 # and would violate Apache 2.0 spirit; commercial value comes from the modules)
 max_agents = 0
 max_channels = 0
-max_local_models = 0
-max_messages_per_month = 0
 memory_quota_gb = 0
 
 # All commercial value-add modules unlocked
@@ -235,7 +232,6 @@ industry_evolution_params = true    # ✓
 dashboard_enterprise = true         # ✓ (audit log export, ROI report)
 priority_security_patch = true      # ✓ (immediate vs 30-day OSS delay)
 private_discord_support = true      # ✓
-office_hour_hours_per_month = 0     # not bundled; sold separately
 
 # Phone-home: 7-day interval, 30-day grace for offline use
 license_phone_home_interval_days = 7
@@ -250,8 +246,6 @@ self_host_only = true
 
 max_agents = 0
 max_channels = 0
-max_local_models = 0
-max_messages_per_month = 0
 memory_quota_gb = 0
 
 premium_templates = true

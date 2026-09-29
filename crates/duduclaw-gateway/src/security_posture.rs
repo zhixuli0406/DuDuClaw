@@ -62,14 +62,20 @@ fn has_plaintext_secret(cfg: &toml::Value) -> bool {
             toml::Value::Table(t) => t.iter().any(|(k, val)| {
                 let key_is_secret = {
                     let lk = k.to_lowercase();
-                    lk.contains("key") || lk.contains("token") || lk.contains("secret") || lk.contains("password")
+                    lk.contains("key")
+                        || lk.contains("token")
+                        || lk.contains("secret")
+                        || lk.contains("password")
                 };
                 if key_is_secret {
                     if let Some(s) = val.as_str() {
                         // Raw provider keys have recognizable prefixes; ciphertext
                         // does not. `enc`/base64-only values are fine.
-                        if s.starts_with("sk-") || s.starts_with("sk-ant-") || s.starts_with("ghp_")
-                            || s.starts_with("xoxb-") || s.starts_with("AKIA")
+                        if s.starts_with("sk-")
+                            || s.starts_with("sk-ant-")
+                            || s.starts_with("ghp_")
+                            || s.starts_with("xoxb-")
+                            || s.starts_with("AKIA")
                         {
                             return true;
                         }
@@ -448,7 +454,10 @@ pub fn compute_posture(home_dir: &Path) -> PostureReport {
         },
     });
 
-    let no_plaintext = cfg.as_ref().map(|c| !has_plaintext_secret(c)).unwrap_or(true);
+    let no_plaintext = cfg
+        .as_ref()
+        .map(|c| !has_plaintext_secret(c))
+        .unwrap_or(true);
     checks.push(PostureCheck {
         id: "no_plaintext_secrets",
         title: "No plaintext provider keys in config.toml",
@@ -487,10 +496,23 @@ pub fn compute_posture(home_dir: &Path) -> PostureReport {
         Severity::Info => 1,
     };
     let max_w: u32 = checks.iter().map(|c| weight(c.severity)).sum();
-    let got_w: u32 = checks.iter().filter(|c| c.passed).map(|c| weight(c.severity)).sum();
-    let score = if max_w == 0 { 100 } else { ((got_w * 100) / max_w) as u8 };
+    let got_w: u32 = checks
+        .iter()
+        .filter(|c| c.passed)
+        .map(|c| weight(c.severity))
+        .sum();
+    let score = if max_w == 0 {
+        100
+    } else {
+        ((got_w * 100) / max_w) as u8
+    };
 
-    PostureReport { checks, score, passed, total }
+    PostureReport {
+        checks,
+        score,
+        passed,
+        total,
+    }
 }
 
 #[cfg(test)]
@@ -501,9 +523,17 @@ mod tests {
     #[test]
     fn clean_home_scores_well() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[gateway]\nauto_update = true\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[gateway]\nauto_update = true\n",
+        )
+        .unwrap();
         let r = compute_posture(dir.path());
-        assert!(r.score >= 60, "architectural checks give a solid baseline: {}", r.score);
+        assert!(
+            r.score >= 60,
+            "architectural checks give a solid baseline: {}",
+            r.score
+        );
         assert_eq!(r.total, r.checks.len());
         // The 4 architectural checks always pass.
         assert!(r.passed >= 4);
@@ -518,7 +548,11 @@ mod tests {
         )
         .unwrap();
         let r = compute_posture(dir.path());
-        let check = r.checks.iter().find(|c| c.id == "no_plaintext_secrets").unwrap();
+        let check = r
+            .checks
+            .iter()
+            .find(|c| c.id == "no_plaintext_secrets")
+            .unwrap();
         assert!(!check.passed, "raw sk-ant- key must be flagged");
     }
 
@@ -532,7 +566,11 @@ mod tests {
         )
         .unwrap();
         let r = compute_posture(dir.path());
-        let check = r.checks.iter().find(|c| c.id == "no_plaintext_secrets").unwrap();
+        let check = r
+            .checks
+            .iter()
+            .find(|c| c.id == "no_plaintext_secrets")
+            .unwrap();
         assert!(check.passed, "ciphertext must NOT be flagged");
     }
 
@@ -541,9 +579,19 @@ mod tests {
         let dir = tempdir().unwrap();
         let ad = dir.path().join("agents").join("a");
         std::fs::create_dir_all(&ad).unwrap();
-        std::fs::write(ad.join("agent.toml"), "[budget]\nhard_stop = true\nmonthly_limit_cents = 100\n").unwrap();
+        std::fs::write(
+            ad.join("agent.toml"),
+            "[budget]\nhard_stop = true\nmonthly_limit_cents = 100\n",
+        )
+        .unwrap();
         let r = compute_posture(dir.path());
-        assert!(r.checks.iter().find(|c| c.id == "budget_hard_stop").unwrap().passed);
+        assert!(
+            r.checks
+                .iter()
+                .find(|c| c.id == "budget_hard_stop")
+                .unwrap()
+                .passed
+        );
     }
 
     // ── WP-K: find_plaintext_secrets / strip_twin_residue ──────────────────
@@ -645,10 +693,12 @@ mod tests {
     }
 
     fn at<'a>(entries: &'a [CredentialEntry], path: &str) -> &'a CredentialEntry {
-        entries
-            .iter()
-            .find(|e| e.path == path)
-            .unwrap_or_else(|| panic!("no entry at {path}; got {:?}", entries.iter().map(|e| &e.path).collect::<Vec<_>>()))
+        entries.iter().find(|e| e.path == path).unwrap_or_else(|| {
+            panic!(
+                "no entry at {path}; got {:?}",
+                entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+            )
+        })
     }
 
     #[test]
@@ -662,11 +712,26 @@ mod tests {
             teams_app_password = "secret://file//run/secrets/teams"
             wecom_secret = ""
         "#);
-        assert_eq!(at(&entries, "channels.telegram_bot_token").source, SourceKind::Inline);
-        assert_eq!(at(&entries, "channels.discord_bot_token").source, SourceKind::Env);
-        assert_eq!(at(&entries, "channels.slack_bot_token").source, SourceKind::Legacy);
-        assert_eq!(at(&entries, "channels.line_channel_token").source, SourceKind::Keychain);
-        assert_eq!(at(&entries, "channels.teams_app_password").source, SourceKind::File);
+        assert_eq!(
+            at(&entries, "channels.telegram_bot_token").source,
+            SourceKind::Inline
+        );
+        assert_eq!(
+            at(&entries, "channels.discord_bot_token").source,
+            SourceKind::Env
+        );
+        assert_eq!(
+            at(&entries, "channels.slack_bot_token").source,
+            SourceKind::Legacy
+        );
+        assert_eq!(
+            at(&entries, "channels.line_channel_token").source,
+            SourceKind::Keychain
+        );
+        assert_eq!(
+            at(&entries, "channels.teams_app_password").source,
+            SourceKind::File
+        );
         assert!(!at(&entries, "channels.wecom_secret").configured);
     }
 
@@ -697,7 +762,10 @@ mod tests {
             id = "a2"
             api_key = "secret://vault/anthropic"
         "#);
-        assert_eq!(at(&entries, "accounts[0].oauth_token").source, SourceKind::Inline);
+        assert_eq!(
+            at(&entries, "accounts[0].oauth_token").source,
+            SourceKind::Inline
+        );
         let a2 = at(&entries, "accounts[1].api_key");
         assert_eq!(a2.source, SourceKind::Vault);
         assert!(!a2.writable, "an external reference is not UI-writable");
@@ -773,9 +841,16 @@ mod tests {
         "#;
         let table: toml::Table = toml_str.parse().unwrap();
         let entries = credential_inventory(&table);
-        for f in find_plaintext_secrets(&table).iter().filter(|f| f.has_enc_twin) {
+        for f in find_plaintext_secrets(&table)
+            .iter()
+            .filter(|f| f.has_enc_twin)
+        {
             let e = at(&entries, &f.path);
-            assert!(e.residue, "{} must read as residue in the inventory", f.path);
+            assert!(
+                e.residue,
+                "{} must read as residue in the inventory",
+                f.path
+            );
         }
     }
 }

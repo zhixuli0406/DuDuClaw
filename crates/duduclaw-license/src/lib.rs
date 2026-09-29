@@ -41,7 +41,7 @@ pub use bundle::{
 pub use crl::SignedCrl;
 pub use error::{LicenseError, Result};
 pub use fingerprint::generate_fingerprint;
-pub use gate::FeatureGate;
+pub use gate::{FeatureGate, SERVICE_COMMITMENTS, is_service_commitment};
 pub use key::{verify_license, PublicKeyRegistry};
 pub use license::{License, CURRENT_SCHEMA_VERSION};
 pub use storage::{
@@ -73,8 +73,11 @@ mod integration_tests {
         // Sanity checks against the v2 manifest
         assert!(!gate.check(LicenseTier::OpenSource, "premium_templates"));
         assert!(gate.check(LicenseTier::Studio, "premium_templates"));
-        assert!(gate.check(LicenseTier::SelfHostPro, "dashboard_enterprise"));
-        assert!(gate.check(LicenseTier::Business, "odoo_integration_supported"));
         assert!(gate.check(LicenseTier::Oem, "white_label"));
+        // Service commitments are display-only — `check()` never gates on
+        // them, even where the manifest says `true`.
+        assert!(!gate.check(LicenseTier::SelfHostPro, "dashboard_enterprise"));
+        assert!(gate.service_commitment(LicenseTier::SelfHostPro, "dashboard_enterprise"));
+        assert!(gate.service_commitment(LicenseTier::Business, "odoo_integration_supported"));
     }
 }

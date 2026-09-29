@@ -264,7 +264,9 @@ pub async fn call_direct_api_attributed(
             role: role.clone(),
             content: content.clone(),
             cache_control: if cache_breakpoint_idx == Some(i) {
-                Some(CacheControl { control_type: "ephemeral".to_string() })
+                Some(CacheControl {
+                    control_type: "ephemeral".to_string(),
+                })
             } else {
                 None
             },
@@ -311,7 +313,11 @@ pub async fn call_direct_api_attributed(
                 status, err.error.error_type, err.error.message
             ));
         }
-        return Err(format!("Anthropic API error ({}): {}", status, truncate_bytes(&response_text, 200)));
+        return Err(format!(
+            "Anthropic API error ({}): {}",
+            status,
+            truncate_bytes(&response_text, 200)
+        ));
     }
 
     let resp: MessagesResponse = serde_json::from_str(&response_text)
@@ -533,12 +539,17 @@ pub async fn call_moa_model(
     })?;
 
     // Pre-resolve one client per member provider (rotator pool → env var).
-    let rotator = crate::claude_runner::get_rotator_cached(home_dir).await.ok();
+    let rotator = crate::claude_runner::get_rotator_cached(home_dir)
+        .await
+        .ok();
     let mut providers: std::collections::HashMap<String, Arc<dyn duduclaw_llm::ChatProvider>> =
         std::collections::HashMap::new();
     for provider_id in moa_member_providers(spec) {
         let key = match &rotator {
-            Some(r) => match r.select_for_provider(&provider_id).await.and_then(|env| env.raw_key)
+            Some(r) => match r
+                .select_for_provider(&provider_id)
+                .await
+                .and_then(|env| env.raw_key)
             {
                 Some(k) => Some(k),
                 None => duduclaw_llm::resolve_env_key(&provider_id),
@@ -576,6 +587,24 @@ pub async fn call_moa_model(
     }
     req.messages = build_moa_messages(conversation_history, user_message);
     req.max_tokens = 8192;
+    // P1/WP-3: the direct-API path's one `ChatRequest`. Effort comes from the
+    // calling agent's `agent.toml [model] effort` (derived from home + agent_id,
+    // the standard `<home>/agents/<id>` layout) so no caller signature changes.
+    // Each member provider maps it natively — Anthropic `output_config.effort`,
+    // OpenAI `reasoning.effort`, compat `reasoning_effort`. Unset ⇒ `None` and
+    // every member request body is byte-identical to before.
+    //
+    // Clamped against OpenAiCompat (the strictest ceiling among the member
+    // protocols) because a MoA ensemble fans out to heterogeneous providers and
+    // one member rejecting `xhigh`/`max` would degrade the whole ensemble.
+    if !agent_id.is_empty() {
+        let agent_dir = home_dir.join("agents").join(agent_id);
+        req.reasoning_effort = duduclaw_core::effort::read_agent_effort(&agent_dir).map(|e| {
+            e.clamp_for(duduclaw_core::types::RuntimeType::OpenAiCompat)
+                .as_str()
+                .to_string()
+        });
+    }
 
     // `complete_moa_model` borrows a `&dyn Fn` lookup across its awaits, which
     // makes its future non-Send — run it on a blocking thread via
@@ -707,7 +736,10 @@ mod tests {
     fn normalize_is_deterministic() {
         let input1 = "# Soul\nHello world  \n\n\n# Skills\nTranslate\n";
         let input2 = "# Soul\nHello world\n\n# Skills\nTranslate\n";
-        assert_eq!(normalize_system_prompt(input1), normalize_system_prompt(input2));
+        assert_eq!(
+            normalize_system_prompt(input1),
+            normalize_system_prompt(input2)
+        );
     }
 
     #[test]

@@ -107,7 +107,10 @@ pub struct AgentBindingStore {
 impl AgentBindingStore {
     /// In-memory only (tests).
     pub fn new() -> Self {
-        Self { state: Arc::new(RwLock::new(BindState::default())), persist_path: None }
+        Self {
+            state: Arc::new(RwLock::new(BindState::default())),
+            persist_path: None,
+        }
     }
 
     /// File-backed store shared across gateway subsystems / processes.
@@ -151,8 +154,16 @@ impl AgentBindingStore {
         ttl_minutes: i64,
         max_uses: u32,
     ) -> String {
-        let ttl = if ttl_minutes <= 0 { DEFAULT_TTL_MINUTES } else { ttl_minutes.min(MAX_TTL_MINUTES) };
-        let uses = if max_uses == 0 { DEFAULT_MAX_USES } else { max_uses.min(MAX_USES_LIMIT) };
+        let ttl = if ttl_minutes <= 0 {
+            DEFAULT_TTL_MINUTES
+        } else {
+            ttl_minutes.min(MAX_TTL_MINUTES)
+        };
+        let uses = if max_uses == 0 {
+            DEFAULT_MAX_USES
+        } else {
+            max_uses.min(MAX_USES_LIMIT)
+        };
 
         self.reload().await;
         // 128-bit random token, hex-encoded → matches Telegram's deep-link
@@ -175,7 +186,13 @@ impl AgentBindingStore {
             );
         }
         self.save().await;
-        info!(channel, agent_id, ttl_minutes = ttl, max_uses = uses, "bind token generated");
+        info!(
+            channel,
+            agent_id,
+            ttl_minutes = ttl,
+            max_uses = uses,
+            "bind token generated"
+        );
         token
     }
 
@@ -253,7 +270,10 @@ impl AgentBindingStore {
         self.reload().await;
         let removed = {
             let mut state = self.state.write().await;
-            state.bindings.get_mut(channel).is_some_and(|m| m.remove(user_id).is_some())
+            state
+                .bindings
+                .get_mut(channel)
+                .is_some_and(|m| m.remove(user_id).is_some())
         };
         if removed {
             self.save().await;
@@ -286,7 +306,10 @@ fn load_state(path: &std::path::Path) -> BindState {
             state
         }
         Err(_) => {
-            warn!(?path, "agent_binding state file is corrupt — starting empty");
+            warn!(
+                ?path,
+                "agent_binding state file is corrupt — starting empty"
+            );
             BindState::default()
         }
     }
@@ -301,7 +324,9 @@ mod tests {
     #[tokio::test]
     async fn test_round_trip_bind() {
         let store = AgentBindingStore::new();
-        let token = store.generate_bind_token("telegram", "sales-bot", 15, 1).await;
+        let token = store
+            .generate_bind_token("telegram", "sales-bot", 15, 1)
+            .await;
         // Before redeeming, the user is unbound.
         assert_eq!(store.resolve_bound_agent("telegram", "u123").await, None);
         // Redeem → bound.
@@ -318,8 +343,15 @@ mod tests {
     #[tokio::test]
     async fn test_token_single_use_by_default() {
         let store = AgentBindingStore::new();
-        let token = store.generate_bind_token("telegram", "agent-x", 15, 1).await;
-        assert!(store.redeem_bind_token("telegram", &token, "u1").await.is_ok());
+        let token = store
+            .generate_bind_token("telegram", "agent-x", 15, 1)
+            .await;
+        assert!(
+            store
+                .redeem_bind_token("telegram", &token, "u1")
+                .await
+                .is_ok()
+        );
         // Second redemption (even by a different user) is rejected — one-time.
         assert_eq!(
             store.redeem_bind_token("telegram", &token, "u2").await,
@@ -332,16 +364,36 @@ mod tests {
     #[tokio::test]
     async fn test_multi_use_token() {
         let store = AgentBindingStore::new();
-        let token = store.generate_bind_token("telegram", "team-bot", 15, 3).await;
-        assert!(store.redeem_bind_token("telegram", &token, "a").await.is_ok());
-        assert!(store.redeem_bind_token("telegram", &token, "b").await.is_ok());
-        assert!(store.redeem_bind_token("telegram", &token, "c").await.is_ok());
+        let token = store
+            .generate_bind_token("telegram", "team-bot", 15, 3)
+            .await;
+        assert!(
+            store
+                .redeem_bind_token("telegram", &token, "a")
+                .await
+                .is_ok()
+        );
+        assert!(
+            store
+                .redeem_bind_token("telegram", &token, "b")
+                .await
+                .is_ok()
+        );
+        assert!(
+            store
+                .redeem_bind_token("telegram", &token, "c")
+                .await
+                .is_ok()
+        );
         // 4th exceeds max_uses → rejected.
         assert_eq!(
             store.redeem_bind_token("telegram", &token, "d").await,
             Err(BindRedeemError::Invalid)
         );
-        assert_eq!(store.resolve_bound_agent("telegram", "a").await, Some("team-bot".to_string()));
+        assert_eq!(
+            store.resolve_bound_agent("telegram", "a").await,
+            Some("team-bot".to_string())
+        );
         assert_eq!(store.resolve_bound_agent("telegram", "d").await, None);
     }
 
@@ -375,7 +427,9 @@ mod tests {
     #[tokio::test]
     async fn test_channel_mismatch_rejected() {
         let store = AgentBindingStore::new();
-        let token = store.generate_bind_token("telegram", "agent-x", 15, 1).await;
+        let token = store
+            .generate_bind_token("telegram", "agent-x", 15, 1)
+            .await;
         // A telegram token must not bind a slack user.
         assert_eq!(
             store.redeem_bind_token("slack", &token, "u1").await,
@@ -387,24 +441,61 @@ mod tests {
     #[tokio::test]
     async fn test_multi_agent_isolation() {
         let store = AgentBindingStore::new();
-        let tok_x = store.generate_bind_token("telegram", "agent-x", 15, 1).await;
-        let tok_y = store.generate_bind_token("telegram", "agent-y", 15, 1).await;
-        assert!(store.redeem_bind_token("telegram", &tok_x, "userA").await.is_ok());
-        assert!(store.redeem_bind_token("telegram", &tok_y, "userB").await.is_ok());
+        let tok_x = store
+            .generate_bind_token("telegram", "agent-x", 15, 1)
+            .await;
+        let tok_y = store
+            .generate_bind_token("telegram", "agent-y", 15, 1)
+            .await;
+        assert!(
+            store
+                .redeem_bind_token("telegram", &tok_x, "userA")
+                .await
+                .is_ok()
+        );
+        assert!(
+            store
+                .redeem_bind_token("telegram", &tok_y, "userB")
+                .await
+                .is_ok()
+        );
         // Each user resolves to their own agent — no cross-talk.
-        assert_eq!(store.resolve_bound_agent("telegram", "userA").await, Some("agent-x".to_string()));
-        assert_eq!(store.resolve_bound_agent("telegram", "userB").await, Some("agent-y".to_string()));
+        assert_eq!(
+            store.resolve_bound_agent("telegram", "userA").await,
+            Some("agent-x".to_string())
+        );
+        assert_eq!(
+            store.resolve_bound_agent("telegram", "userB").await,
+            Some("agent-y".to_string())
+        );
     }
 
     #[tokio::test]
     async fn test_rebind_overwrites() {
         let store = AgentBindingStore::new();
-        let tok_x = store.generate_bind_token("telegram", "agent-x", 15, 1).await;
-        assert!(store.redeem_bind_token("telegram", &tok_x, "u1").await.is_ok());
-        let tok_y = store.generate_bind_token("telegram", "agent-y", 15, 1).await;
-        assert!(store.redeem_bind_token("telegram", &tok_y, "u1").await.is_ok());
+        let tok_x = store
+            .generate_bind_token("telegram", "agent-x", 15, 1)
+            .await;
+        assert!(
+            store
+                .redeem_bind_token("telegram", &tok_x, "u1")
+                .await
+                .is_ok()
+        );
+        let tok_y = store
+            .generate_bind_token("telegram", "agent-y", 15, 1)
+            .await;
+        assert!(
+            store
+                .redeem_bind_token("telegram", &tok_y, "u1")
+                .await
+                .is_ok()
+        );
         // Re-binding the same user replaces the target agent.
-        assert_eq!(store.resolve_bound_agent("telegram", "u1").await, Some("agent-y".to_string()));
+        assert_eq!(
+            store.resolve_bound_agent("telegram", "u1").await,
+            Some("agent-y".to_string())
+        );
     }
 
     #[tokio::test]
@@ -414,7 +505,9 @@ mod tests {
             store.redeem_bind_token("telegram", "", "u1").await,
             Err(BindRedeemError::Invalid)
         );
-        let token = store.generate_bind_token("telegram", "agent-x", 15, 1).await;
+        let token = store
+            .generate_bind_token("telegram", "agent-x", 15, 1)
+            .await;
         assert_eq!(
             store.redeem_bind_token("telegram", &token, "").await,
             Err(BindRedeemError::Invalid)
@@ -428,7 +521,9 @@ mod tests {
 
         // Dashboard side mints the token…
         let dashboard = AgentBindingStore::with_persistence(path.clone());
-        let token = dashboard.generate_bind_token("telegram", "sales-bot", 15, 1).await;
+        let token = dashboard
+            .generate_bind_token("telegram", "sales-bot", 15, 1)
+            .await;
 
         // …the gateway poll loop (a distinct instance) redeems it.
         let gateway = AgentBindingStore::with_persistence(path.clone());
@@ -463,8 +558,13 @@ mod tests {
     #[tokio::test]
     async fn test_unbind() {
         let store = AgentBindingStore::new();
-        let token = store.generate_bind_token("telegram", "agent-x", 15, 1).await;
-        store.redeem_bind_token("telegram", &token, "u1").await.unwrap();
+        let token = store
+            .generate_bind_token("telegram", "agent-x", 15, 1)
+            .await;
+        store
+            .redeem_bind_token("telegram", &token, "u1")
+            .await
+            .unwrap();
         assert!(store.unbind("telegram", "u1").await);
         assert_eq!(store.resolve_bound_agent("telegram", "u1").await, None);
         // Unbinding a non-existent binding is a no-op false.
@@ -475,7 +575,9 @@ mod tests {
     async fn test_max_uses_clamped() {
         let store = AgentBindingStore::new();
         // Request an absurd use count; it must be clamped to the hard limit.
-        let token = store.generate_bind_token("telegram", "agent-x", 15, 10_000).await;
+        let token = store
+            .generate_bind_token("telegram", "agent-x", 15, 10_000)
+            .await;
         let digest = sha256_hex(&token);
         let state = store.state.read().await;
         assert_eq!(state.tokens.get(&digest).unwrap().max_uses, MAX_USES_LIMIT);

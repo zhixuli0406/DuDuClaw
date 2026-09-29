@@ -361,7 +361,10 @@ pub fn load_team_manifest(premium_dir: &Path, industry: &str) -> Result<TeamMani
         }
     }
     if !premium_dir.join(&manifest.pack).join("SOUL.md").is_file() {
-        return Err(format!("front-desk pack not found on disk: {:?}", manifest.pack));
+        return Err(format!(
+            "front-desk pack not found on disk: {:?}",
+            manifest.pack
+        ));
     }
     Ok(manifest)
 }
@@ -469,8 +472,9 @@ fn patch_agent_toml(
     department: Option<&str>,
     enable_cross_agent: bool,
 ) -> Result<String, String> {
-    let mut doc: toml_edit::DocumentMut =
-        src.parse().map_err(|e| format!("template agent.toml invalid: {e}"))?;
+    let mut doc: toml_edit::DocumentMut = src
+        .parse()
+        .map_err(|e| format!("template agent.toml invalid: {e}"))?;
     let agent = doc
         .get_mut("agent")
         .and_then(|v| v.as_table_mut())
@@ -512,8 +516,9 @@ fn append_overlay_to_contract(src: &str, overlay: &[String]) -> Result<String, S
     if overlay.is_empty() {
         return Ok(src.to_string());
     }
-    let mut doc: toml_edit::DocumentMut =
-        src.parse().map_err(|e| format!("template CONTRACT.toml invalid: {e}"))?;
+    let mut doc: toml_edit::DocumentMut = src
+        .parse()
+        .map_err(|e| format!("template CONTRACT.toml invalid: {e}"))?;
     let arr = doc
         .get_mut("boundaries")
         .and_then(|v| v.as_table_mut())
@@ -569,7 +574,10 @@ fn team_department(manifest: &TeamManifest) -> Option<&str> {
 }
 
 /// Assemble the front-desk (team lead) role from the industry pack.
-fn assemble_front_desk(premium_dir: &Path, manifest: &TeamManifest) -> Result<AssembledRole, String> {
+fn assemble_front_desk(
+    premium_dir: &Path,
+    manifest: &TeamManifest,
+) -> Result<AssembledRole, String> {
     let pack_dir = premium_dir.join(&manifest.pack);
     let soul_md = read_kit_file(&pack_dir, "SOUL.md")?;
     let contract_toml = read_kit_file(&pack_dir, "CONTRACT.toml")?;
@@ -613,7 +621,11 @@ fn assemble_worker(
 
     let soul_md = append_overlay_to_soul(&soul_src, &spec.overlay);
     let contract_toml = append_overlay_to_contract(&contract_src, &spec.overlay)?;
-    let trigger = if spec.trigger.is_empty() { spec.name.clone() } else { spec.trigger.clone() };
+    let trigger = if spec.trigger.is_empty() {
+        spec.name.clone()
+    } else {
+        spec.trigger.clone()
+    };
     // WP21: every worker's `department` is the team's industry, not the
     // kit's functional label (`docs-admin` → 行政, etc.) and not a
     // team.toml worker-level override — see `team_department`. Same-
@@ -682,7 +694,15 @@ pub fn override_agent_identity(
     reports_to: Option<&str>,
     department: Option<&str>,
 ) -> Result<String, String> {
-    patch_agent_toml(src, name, display_name, trigger, reports_to, department, false)
+    patch_agent_toml(
+        src,
+        name,
+        display_name,
+        trigger,
+        reports_to,
+        department,
+        false,
+    )
 }
 
 /// Assemble a role by its stable id within a staged team.
@@ -701,7 +721,12 @@ pub fn assemble_role(
         .workers
         .iter()
         .find(|w| w.name == role_id)
-        .ok_or_else(|| format!("unknown role_id {role_id:?} for team {:?}", manifest.industry))?;
+        .ok_or_else(|| {
+            format!(
+                "unknown role_id {role_id:?} for team {:?}",
+                manifest.industry
+            )
+        })?;
     assemble_worker(premium_dir, manifest, spec)
 }
 
@@ -826,7 +851,12 @@ mod tests {
 
     #[test]
     fn safe_slug_accepts_known_premium_dirs() {
-        for s in ["ecommerce-pro", "clinic-pro", "realestate-pro", "education-pro"] {
+        for s in [
+            "ecommerce-pro",
+            "clinic-pro",
+            "realestate-pro",
+            "education-pro",
+        ] {
             assert!(is_safe_slug(s), "{s} should be a safe slug");
         }
     }
@@ -915,10 +945,8 @@ mod tests {
     }
 
     fn fixture_premium_dir(tag: &str) -> PathBuf {
-        let tmp = std::env::temp_dir().join(format!(
-            "dudu-team-fixture-{tag}-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("dudu-team-fixture-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
 
         // Industry pack (front desk source).
@@ -939,7 +967,11 @@ mod tests {
         // Shared worker kit.
         let kit = tmp.join("teams").join("_departments").join("docs-admin");
         std::fs::create_dir_all(&kit).unwrap();
-        std::fs::write(kit.join("SOUL.md"), "# 文件行政\n\n## Industry Overlay（部署時由 TEAM.md 填入）\n").unwrap();
+        std::fs::write(
+            kit.join("SOUL.md"),
+            "# 文件行政\n\n## Industry Overlay（部署時由 TEAM.md 填入）\n",
+        )
+        .unwrap();
         std::fs::write(
             kit.join("CONTRACT.toml"),
             "# kit comment\n[boundaries]\nmust_not = [\n    \"base rule（底線）\",\n]\nmust_always = [\n    \"x\",\n]\nmax_tool_calls_per_turn = 5\n",
@@ -955,7 +987,11 @@ mod tests {
         let ceo = tmp.join("teams").join("_roles").join("ceo");
         std::fs::create_dir_all(&ceo).unwrap();
         std::fs::write(ceo.join("SOUL.md"), "# 營運總管\n").unwrap();
-        std::fs::write(ceo.join("CONTRACT.toml"), "[boundaries]\nmust_not = []\nmust_always = []\n").unwrap();
+        std::fs::write(
+            ceo.join("CONTRACT.toml"),
+            "[boundaries]\nmust_not = []\nmust_always = []\n",
+        )
+        .unwrap();
         std::fs::write(
             ceo.join("agent.toml"),
             "[agent]\nname = \"ceo-assistant\"\ndisplay_name = \"營運總管\"\nrole = \"main\"\ntrigger = \"@營運總管\"\n",
@@ -1216,7 +1252,10 @@ mod eval_suite_install_tests {
         let dest = home.path().join("evals").join("my-lawyer");
         let case = std::fs::read_to_string(dest.join("c1.toml")).unwrap();
         assert!(case.contains("agent = \"my-lawyer\""), "{case}");
-        assert!(!case.contains("law-intake"), "old name fully replaced in the agent field: {case}");
+        assert!(
+            !case.contains("law-intake"),
+            "old name fully replaced in the agent field: {case}"
+        );
     }
 
     #[tokio::test]
@@ -1229,7 +1268,10 @@ mod eval_suite_install_tests {
             .await
             .unwrap();
         assert_eq!(n, None, "existing suite dir is skipped");
-        assert_eq!(std::fs::read_to_string(dest.join("customer.toml")).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("customer.toml")).unwrap(),
+            "keep"
+        );
     }
 
     #[tokio::test]

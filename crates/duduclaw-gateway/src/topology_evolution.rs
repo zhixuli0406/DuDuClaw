@@ -48,8 +48,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -59,7 +59,7 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::approval::{ApprovalBroker, ApprovalId, ApprovalStatus};
-use crate::dispatch_policy::{task_class, DispatchPolicy, DispatchPolicyKind, FixedHierarchy};
+use crate::dispatch_policy::{DispatchPolicy, DispatchPolicyKind, FixedHierarchy, task_class};
 use crate::events_store::EventBusStore;
 use crate::task_store::{ActivityRow, TaskRow, TaskStore};
 
@@ -413,7 +413,11 @@ where
 
 /// The active reroute target for `(task_class, from_agent)`, if any. Only an
 /// `active` override matches — a rolled_back / confirmed one reverts routing.
-pub fn lookup_active_reroute(home_dir: &Path, task_class: &str, from_agent: &str) -> Option<String> {
+pub fn lookup_active_reroute(
+    home_dir: &Path,
+    task_class: &str,
+    from_agent: &str,
+) -> Option<String> {
     load_file(home_dir).overrides.into_iter().find_map(|o| {
         if o.status == STATUS_ACTIVE && o.task_class == task_class && o.from_agent == from_agent {
             Some(o.to_agent)
@@ -710,7 +714,8 @@ impl TopologyEvolutionDriver {
                     .await;
                 }
                 SettleDecision::RollBack => {
-                    self.set_override_status(&ov, STATUS_ROLLED_BACK, false).await;
+                    self.set_override_status(&ov, STATUS_ROLLED_BACK, false)
+                        .await;
                     self.record(
                         ACT_ROLLED_BACK,
                         &ov.from_agent,
@@ -745,7 +750,11 @@ impl TopologyEvolutionDriver {
             .collect();
         for p in pending {
             let aid = ApprovalId::from(p.approval_id.clone());
-            let status = self.broker.poll(&aid).await.unwrap_or(ApprovalStatus::Denied);
+            let status = self
+                .broker
+                .poll(&aid)
+                .await
+                .unwrap_or(ApprovalStatus::Denied);
             match status {
                 ApprovalStatus::Pending => {}
                 ApprovalStatus::Approved => {
@@ -898,13 +907,8 @@ impl TopologyEvolutionDriver {
                 reject_rate: prop.baseline_reject_rate,
             };
             let _ = mutate_file(&self.home_dir, |doc| doc.proposals.push(record));
-            self.record(
-                ACT_PROPOSED,
-                &prop.from_agent,
-                &summary,
-                payload,
-            )
-            .await;
+            self.record(ACT_PROPOSED, &prop.from_agent, &summary, payload)
+                .await;
             info!(
                 class = %prop.task_class,
                 from = %prop.from_agent,
@@ -966,7 +970,13 @@ impl TopologyEvolutionDriver {
 
     /// Emit both an events.db row (autopilot bus / dashboard) and an Activity
     /// Feed row. Best-effort — a failure here never breaks the tick.
-    async fn record(&self, event_type: &str, agent_id: &str, summary: &str, payload: serde_json::Value) {
+    async fn record(
+        &self,
+        event_type: &str,
+        agent_id: &str,
+        summary: &str,
+        payload: serde_json::Value,
+    ) {
         if let Some(ev) = &self.events {
             let _ = ev.append(event_type, &payload.to_string()).await;
         }
@@ -1168,9 +1178,18 @@ mod tests {
     fn select_reroute_picks_best_sibling() {
         let mut metrics = BTreeMap::new();
         // alice: bad (0.8), bob: good (0.2), carol: middling (0.4) — same parent.
-        metrics.insert(("alice".to_string(), "billing".to_string()), metrics_cell(10, 8));
-        metrics.insert(("bob".to_string(), "billing".to_string()), metrics_cell(10, 2));
-        metrics.insert(("carol".to_string(), "billing".to_string()), metrics_cell(10, 4));
+        metrics.insert(
+            ("alice".to_string(), "billing".to_string()),
+            metrics_cell(10, 8),
+        );
+        metrics.insert(
+            ("bob".to_string(), "billing".to_string()),
+            metrics_cell(10, 2),
+        );
+        metrics.insert(
+            ("carol".to_string(), "billing".to_string()),
+            metrics_cell(10, 4),
+        );
         let mut parent = HashMap::new();
         parent.insert("alice".to_string(), Some("boss".to_string()));
         parent.insert("bob".to_string(), Some("boss".to_string()));
@@ -1187,8 +1206,14 @@ mod tests {
     fn select_reroute_no_qualified_sibling_yields_nothing() {
         // alice is bad, but her only sibling has too few samples.
         let mut metrics = BTreeMap::new();
-        metrics.insert(("alice".to_string(), "billing".to_string()), metrics_cell(10, 8));
-        metrics.insert(("bob".to_string(), "billing".to_string()), metrics_cell(2, 0)); // < min_samples
+        metrics.insert(
+            ("alice".to_string(), "billing".to_string()),
+            metrics_cell(10, 8),
+        );
+        metrics.insert(
+            ("bob".to_string(), "billing".to_string()),
+            metrics_cell(2, 0),
+        ); // < min_samples
         let mut parent = HashMap::new();
         parent.insert("alice".to_string(), Some("boss".to_string()));
         parent.insert("bob".to_string(), Some("boss".to_string()));
@@ -1196,8 +1221,14 @@ mod tests {
 
         // And a sibling in a DIFFERENT parent does not qualify either.
         let mut metrics2 = BTreeMap::new();
-        metrics2.insert(("alice".to_string(), "billing".to_string()), metrics_cell(10, 8));
-        metrics2.insert(("dan".to_string(), "billing".to_string()), metrics_cell(10, 1));
+        metrics2.insert(
+            ("alice".to_string(), "billing".to_string()),
+            metrics_cell(10, 8),
+        );
+        metrics2.insert(
+            ("dan".to_string(), "billing".to_string()),
+            metrics_cell(10, 1),
+        );
         let mut parent2 = HashMap::new();
         parent2.insert("alice".to_string(), Some("boss".to_string()));
         parent2.insert("dan".to_string(), Some("other".to_string()));
@@ -1208,8 +1239,14 @@ mod tests {
     fn select_reroute_respects_min_samples_and_threshold() {
         // Below threshold ⇒ no proposal even with a great sibling.
         let mut metrics = BTreeMap::new();
-        metrics.insert(("alice".to_string(), "billing".to_string()), metrics_cell(10, 5)); // 0.5 < 0.6
-        metrics.insert(("bob".to_string(), "billing".to_string()), metrics_cell(10, 0));
+        metrics.insert(
+            ("alice".to_string(), "billing".to_string()),
+            metrics_cell(10, 5),
+        ); // 0.5 < 0.6
+        metrics.insert(
+            ("bob".to_string(), "billing".to_string()),
+            metrics_cell(10, 0),
+        );
         let mut parent = HashMap::new();
         parent.insert("alice".to_string(), Some("boss".to_string()));
         parent.insert("bob".to_string(), Some("boss".to_string()));
@@ -1217,8 +1254,14 @@ mod tests {
 
         // Too few offender samples ⇒ no proposal.
         let mut metrics2 = BTreeMap::new();
-        metrics2.insert(("alice".to_string(), "billing".to_string()), metrics_cell(3, 3)); // < min
-        metrics2.insert(("bob".to_string(), "billing".to_string()), metrics_cell(10, 0));
+        metrics2.insert(
+            ("alice".to_string(), "billing".to_string()),
+            metrics_cell(3, 3),
+        ); // < min
+        metrics2.insert(
+            ("bob".to_string(), "billing".to_string()),
+            metrics_cell(10, 0),
+        );
         let parent2 = parent.clone();
         assert!(select_reroute(&metrics2, &parent2, &cfg()).is_empty());
     }
@@ -1399,7 +1442,10 @@ mod tests {
         let now = Utc::now();
         // Window elapsed, no target samples, not yet extended ⇒ Extend.
         let first = active_override(0.6, -1, false);
-        assert_eq!(settle_decision(&first, None, now, &cfg()), SettleDecision::Extend);
+        assert_eq!(
+            settle_decision(&first, None, now, &cfg()),
+            SettleDecision::Extend
+        );
         // Too-few samples also count as insufficient.
         let few = metrics_cell(2, 0);
         assert_eq!(
@@ -1408,10 +1454,16 @@ mod tests {
         );
         // Already extended + still insufficient ⇒ RollBack (conservative).
         let second = active_override(0.6, -1, true);
-        assert_eq!(settle_decision(&second, None, now, &cfg()), SettleDecision::RollBack);
+        assert_eq!(
+            settle_decision(&second, None, now, &cfg()),
+            SettleDecision::RollBack
+        );
         // Still in window with insufficient samples ⇒ Keep.
         let waiting = active_override(0.6, 12, false);
-        assert_eq!(settle_decision(&waiting, None, now, &cfg()), SettleDecision::Keep);
+        assert_eq!(
+            settle_decision(&waiting, None, now, &cfg()),
+            SettleDecision::Keep
+        );
     }
 
     // ── Driver end-to-end (propose → human approve → active override) ────────
@@ -1452,12 +1504,8 @@ mod tests {
         }
 
         let broker = Arc::new(ApprovalBroker::open(home).unwrap());
-        let driver = TopologyEvolutionDriver::new(
-            store.clone(),
-            home.to_path_buf(),
-            broker.clone(),
-            cfg(),
-        );
+        let driver =
+            TopologyEvolutionDriver::new(store.clone(), home.to_path_buf(), broker.clone(), cfg());
 
         // Tick 1: files exactly one reroute proposal through the human gate.
         driver.tick_once().await.unwrap();
@@ -1474,9 +1522,11 @@ mod tests {
         assert_eq!(broker.list_pending(None).await.unwrap().len(), 1);
 
         // Human approves through the broker (dashboard/channel path).
-        let approval_id =
-            ApprovalId::from(load_file(home).proposals[0].approval_id.clone());
-        broker.decide(&approval_id, true, "dashboard:tester").await.unwrap();
+        let approval_id = ApprovalId::from(load_file(home).proposals[0].approval_id.clone());
+        broker
+            .decide(&approval_id, true, "dashboard:tester")
+            .await
+            .unwrap();
 
         // Tick 3: poll picks up the approval → materializes an active override.
         driver.tick_once().await.unwrap();
@@ -1518,12 +1568,14 @@ mod tests {
             insert_sample(&store, &format!("b{i}"), "bob", "failed").await;
         }
 
-        let driver =
-            TopologyEvolutionDriver::new(store.clone(), home.to_path_buf(), broker, cfg());
+        let driver = TopologyEvolutionDriver::new(store.clone(), home.to_path_buf(), broker, cfg());
         driver.tick_once().await.unwrap();
 
         let doc = load_file(home);
-        assert_eq!(doc.overrides[0].status, STATUS_ROLLED_BACK, "regressed target rolls back");
+        assert_eq!(
+            doc.overrides[0].status, STATUS_ROLLED_BACK,
+            "regressed target rolls back"
+        );
         // Routing reverts — no active override remains.
         assert_eq!(lookup_active_reroute(home, "billing", "alice"), None);
     }

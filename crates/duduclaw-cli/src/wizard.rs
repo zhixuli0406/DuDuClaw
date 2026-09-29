@@ -84,10 +84,7 @@ const FEATURES: &[&str] = &[
 /// importing a data file. On confirmation, scaffolds a new agent directory
 /// from the matching template.
 pub async fn cmd_wizard(home: &Path) -> Result<()> {
-    println!(
-        "\n  {} DuDuClaw Agent Setup Wizard\n",
-        style("🐾").bold(),
-    );
+    println!("\n  {} DuDuClaw Agent Setup Wizard\n", style("🐾").bold(),);
 
     // 1. Select industry
     //
@@ -243,9 +240,10 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
     };
 
     if let Some(ref tpl_dir) = template_dir
-        && tpl_dir.exists() {
-            copy_template_files(tpl_dir, &agent_dir).await?;
-        }
+        && tpl_dir.exists()
+    {
+        copy_template_files(tpl_dir, &agent_dir).await?;
+    }
 
     // Ensure agent.toml exists even if no template was copied
     let agent_toml_path = agent_dir.join("agent.toml");
@@ -261,17 +259,11 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
         .await?;
     } else {
         // Generate a minimal agent.toml from scratch
-        let toml_content = generate_agent_toml(
-            &agent_name,
-            &company_name,
-            channel_name,
-            &selected_features,
-        );
+        let toml_content =
+            generate_agent_toml(&agent_name, &company_name, channel_name, &selected_features);
         tokio::fs::write(&agent_toml_path, toml_content)
             .await
-            .map_err(|e| {
-                DuDuClawError::Agent(format!("Failed to write agent.toml: {e}"))
-            })?;
+            .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
     }
 
     // WP22 T1 — record the authoritative org placement in `<home>/org.toml`.
@@ -301,9 +293,7 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
         let contract_content = generate_contract_toml();
         tokio::fs::write(&contract_path, contract_content)
             .await
-            .map_err(|e| {
-                DuDuClawError::Agent(format!("Failed to write CONTRACT.toml: {e}"))
-            })?;
+            .map_err(|e| DuDuClawError::Agent(format!("Failed to write CONTRACT.toml: {e}")))?;
     }
 
     // Ensure .mcp.json exists so the newly-created agent actually has the
@@ -326,8 +316,8 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
                 }
             }
         });
-        let mcp_content = serde_json::to_string_pretty(&mcp_json)
-            .unwrap_or_else(|_| "{}".to_string());
+        let mcp_content =
+            serde_json::to_string_pretty(&mcp_json).unwrap_or_else(|_| "{}".to_string());
         tokio::fs::write(&mcp_path, mcp_content)
             .await
             .map_err(|e| DuDuClawError::Agent(format!("Failed to write .mcp.json: {e}")))?;
@@ -336,7 +326,10 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
     // Install agent-file-guard PreToolUse hook for the new agent.
     {
         let bin = duduclaw_gateway::agent_hook_installer::resolve_duduclaw_bin();
-        if let Err(e) = duduclaw_gateway::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await {
+        if let Err(e) =
+            duduclaw_gateway::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin)
+                .await
+        {
             tracing::warn!(
                 agent = %agent_name,
                 error = %e,
@@ -389,9 +382,7 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
             let memory_db = home.join("memory").join(format!("{agent_name}.db"));
             if let Some(parent) = memory_db.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    DuDuClawError::Memory(format!(
-                        "Failed to create memory directory: {e}"
-                    ))
+                    DuDuClawError::Memory(format!("Failed to create memory directory: {e}"))
                 })?;
             }
 
@@ -400,21 +391,12 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
 
             let count = match format {
                 "csv" => {
-                    duduclaw_memory::import::import_csv(
-                        &engine,
-                        &agent_name,
-                        file,
-                        entry_type,
-                    )
-                    .await?
-                }
-                "json" => {
-                    duduclaw_memory::import::import_json(&engine, &agent_name, file)
+                    duduclaw_memory::import::import_csv(&engine, &agent_name, file, entry_type)
                         .await?
                 }
+                "json" => duduclaw_memory::import::import_json(&engine, &agent_name, file).await?,
                 "jsonl" => {
-                    duduclaw_memory::import::import_jsonl(&engine, &agent_name, file)
-                        .await?
+                    duduclaw_memory::import::import_jsonl(&engine, &agent_name, file).await?
                 }
                 _ => unreachable!(),
             };
@@ -507,19 +489,20 @@ fn find_templates_dir() -> PathBuf {
 
     // Next to executable
     if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent() {
-            let candidate = parent.join("templates");
+        && let Some(parent) = exe.parent()
+    {
+        let candidate = parent.join("templates");
+        if candidate.is_dir() {
+            return candidate;
+        }
+        // Development layout: exe is in target/debug or target/release
+        if let Some(pp) = parent.parent().and_then(|p| p.parent()) {
+            let candidate = pp.join("templates");
             if candidate.is_dir() {
                 return candidate;
             }
-            // Development layout: exe is in target/debug or target/release
-            if let Some(pp) = parent.parent().and_then(|p| p.parent()) {
-                let candidate = pp.join("templates");
-                if candidate.is_dir() {
-                    return candidate;
-                }
-            }
         }
+    }
 
     // Current working directory
     let cwd_templates = PathBuf::from("templates");
@@ -540,9 +523,11 @@ async fn copy_template_files(src: &Path, dst: &Path) -> Result<()> {
         ))
     })?;
 
-    while let Some(entry) = entries.next_entry().await.map_err(|e| {
-        DuDuClawError::Agent(format!("Failed to read template entry: {e}"))
-    })? {
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to read template entry: {e}")))?
+    {
         let src_path = entry.path();
         let file_name = entry.file_name();
         let name_str = file_name.to_string_lossy();
@@ -555,9 +540,10 @@ async fn copy_template_files(src: &Path, dst: &Path) -> Result<()> {
 
         let dst_path = dst.join(&file_name);
 
-        let ft = entry.file_type().await.map_err(|e| {
-            DuDuClawError::Agent(format!("Failed to get file type: {e}"))
-        })?;
+        let ft = entry
+            .file_type()
+            .await
+            .map_err(|e| DuDuClawError::Agent(format!("Failed to get file type: {e}")))?;
 
         if ft.is_dir() {
             tokio::fs::create_dir_all(&dst_path).await.map_err(|e| {
@@ -589,9 +575,9 @@ async fn patch_agent_toml(
     channel: &str,
     features: &[&str],
 ) -> Result<()> {
-    let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-        DuDuClawError::Agent(format!("Failed to read agent.toml: {e}"))
-    })?;
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to read agent.toml: {e}")))?;
 
     let mut doc: toml::Value = content.parse().map_err(|e: toml::de::Error| {
         DuDuClawError::Agent(format!("Failed to parse agent.toml: {e}"))
@@ -617,21 +603,21 @@ async fn patch_agent_toml(
 
     // Add features as a custom field for reference
     if !features.is_empty()
-        && let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut()) {
-            let feat_array: Vec<toml::Value> = features
-                .iter()
-                .map(|f| toml::Value::String(f.to_string()))
-                .collect();
-            agent_table.insert("features".into(), toml::Value::Array(feat_array));
-        }
+        && let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut())
+    {
+        let feat_array: Vec<toml::Value> = features
+            .iter()
+            .map(|f| toml::Value::String(f.to_string()))
+            .collect();
+        agent_table.insert("features".into(), toml::Value::Array(feat_array));
+    }
 
-    let serialized = toml::to_string_pretty(&doc).map_err(|e| {
-        DuDuClawError::Agent(format!("Failed to serialize agent.toml: {e}"))
-    })?;
+    let serialized = toml::to_string_pretty(&doc)
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to serialize agent.toml: {e}")))?;
 
-    tokio::fs::write(path, serialized).await.map_err(|e| {
-        DuDuClawError::Agent(format!("Failed to write agent.toml: {e}"))
-    })?;
+    tokio::fs::write(path, serialized)
+        .await
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
 
     Ok(())
 }
@@ -715,10 +701,9 @@ allowed_channels = [{channel_lower_toml}]
 [evolution]
 skill_auto_activate = true
 skill_security_scan = true
-gvu_enabled = false           # opt-in：預設關閉，避免板模產出的 agent 未經確認就自動改寫 SOUL.md（2026-08-06 WP0.1 修 R3）
+gvu_enabled = true            # 出廠即開 AEE（2026-09-29 K2）。演化目標是 playbook 經驗法則，SOUL.md 對 AI 員工唯讀；成本由 gvu_cooldown_minutes 與 Gate 節制。設 false 可完全關閉。
+strategy = "balanced"         # AEE 回合意圖配比：balanced / innovate / harden / repair_only
 max_silence_hours = 12.0
-max_gvu_generations = 3
-observation_period_hours = 24.0
 skill_token_budget = 2500
 max_active_skills = 5
 
@@ -856,8 +841,14 @@ malicious_key = "pwned"#;
         );
         // The display name should round-trip the literal (escaped) value.
         let dn = agent.get("display_name").and_then(|v| v.as_str()).unwrap();
-        assert!(dn.contains("Acme"), "display_name should retain the company text: {dn}");
-        assert!(dn.contains("malicious_key"), "the payload stays inside the string: {dn}");
+        assert!(
+            dn.contains("Acme"),
+            "display_name should retain the company text: {dn}"
+        );
+        assert!(
+            dn.contains("malicious_key"),
+            "the payload stays inside the string: {dn}"
+        );
     }
 
     #[test]
@@ -870,5 +861,33 @@ malicious_key = "pwned"#;
             agent.get("display_name").and_then(|v| v.as_str()),
             Some("Acme Co Assistant")
         );
+    }
+
+    /// K2 (2026-09-29): a scaffolded agent evolves from day one.
+    ///
+    /// The key must be written **explicitly** — an absent key still reads as
+    /// `false` at the runtime gate (`gvu::trigger::agent_gvu_enabled`), so
+    /// "the default is on" has to be visible in the file, not implied.
+    #[test]
+    fn generated_agent_toml_ships_evolution_enabled() {
+        let out = generate_agent_toml("acme", "Acme Co", "LINE", &[]);
+        let parsed: toml::Table = out.parse().expect("must be valid TOML");
+        let evo = parsed
+            .get("evolution")
+            .and_then(|v| v.as_table())
+            .expect("[evolution] section");
+        assert_eq!(
+            evo.get("gvu_enabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "factory default is ON since K2"
+        );
+        assert_eq!(
+            evo.get("strategy").and_then(|v| v.as_str()),
+            Some("balanced"),
+            "the AEE round-intent mix must be written explicitly too"
+        );
+        // S11: the two legacy SOUL-loop knobs are gone from the scaffold.
+        assert!(evo.get("max_gvu_generations").is_none());
+        assert!(evo.get("observation_period_hours").is_none());
     }
 }

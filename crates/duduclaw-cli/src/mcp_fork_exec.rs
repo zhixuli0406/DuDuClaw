@@ -26,7 +26,7 @@ use duduclaw_fork::{
     Pool, Result as ForkResult,
 };
 
-use crate::mcp_fork::{parse_merge_mode, ForkSettings};
+use crate::mcp_fork::{ForkSettings, parse_merge_mode};
 
 // ── Account selection abstraction ───────────────────────────────────────────
 
@@ -136,21 +136,34 @@ pub fn register_kill(branch_id: &str) -> std::sync::Arc<tokio::sync::Notify> {
 
 /// Drop a branch's kill switch once it has finished.
 pub fn unregister_kill(branch_id: &str) {
-    kill_registry().lock().expect("kill registry poisoned").remove(branch_id);
+    kill_registry()
+        .lock()
+        .expect("kill registry poisoned")
+        .remove(branch_id);
 }
 
 /// Request cancellation of a branch by id: sets the pre-spawn flag AND fires the
 /// kill switch if the branch is already running.
 pub fn request_cancel(branch_id: &str) {
-    cancel_set().lock().expect("cancel set poisoned").insert(branch_id.to_string());
-    if let Some(notify) = kill_registry().lock().expect("kill registry poisoned").get(branch_id) {
+    cancel_set()
+        .lock()
+        .expect("cancel set poisoned")
+        .insert(branch_id.to_string());
+    if let Some(notify) = kill_registry()
+        .lock()
+        .expect("kill registry poisoned")
+        .get(branch_id)
+    {
         notify.notify_waiters();
     }
 }
 
 /// Whether a branch was asked to cancel.
 pub fn is_cancelled(branch_id: &str) -> bool {
-    cancel_set().lock().expect("cancel set poisoned").contains(branch_id)
+    cancel_set()
+        .lock()
+        .expect("cancel set poisoned")
+        .contains(branch_id)
 }
 
 // ── Aggregate budget pre-emption (RFC-26 §4.2) ──────────────────────────────
@@ -169,8 +182,15 @@ fn budget_kill_set() -> &'static std::sync::Mutex<std::collections::HashSet<Stri
 /// Pre-empt a *running* branch for aggregate budget: tag the reason, then fire
 /// its kill switch so the in-flight subprocess is SIGKILLed mid-stream.
 pub fn request_budget_kill(branch_id: &str) {
-    budget_kill_set().lock().expect("budget kill set poisoned").insert(branch_id.to_string());
-    if let Some(notify) = kill_registry().lock().expect("kill registry poisoned").get(branch_id) {
+    budget_kill_set()
+        .lock()
+        .expect("budget kill set poisoned")
+        .insert(branch_id.to_string());
+    if let Some(notify) = kill_registry()
+        .lock()
+        .expect("kill registry poisoned")
+        .get(branch_id)
+    {
         notify.notify_waiters();
     }
 }
@@ -178,7 +198,10 @@ pub fn request_budget_kill(branch_id: &str) {
 /// Consume a branch's budget-kill tag, returning whether it was set. Removing it
 /// keeps the process-global set from growing and resets state for branch-id reuse.
 fn took_budget_kill(branch_id: &str) -> bool {
-    budget_kill_set().lock().expect("budget kill set poisoned").remove(branch_id)
+    budget_kill_set()
+        .lock()
+        .expect("budget kill set poisoned")
+        .remove(branch_id)
 }
 
 /// Pure streaming-budget decision for one cost update (RFC-26 §4.2). Factored out
@@ -266,7 +289,9 @@ impl<P: AccountProvider, S: CliSpawner> BranchExecutor for RotatingBranchExecuto
         };
 
         let full_prompt = match &inv.steering {
-            Some(s) if !s.trim().is_empty() => format!("{}\n\n## Strategy for this branch\n{}", inv.prompt, s),
+            Some(s) if !s.trim().is_empty() => {
+                format!("{}\n\n## Strategy for this branch\n{}", inv.prompt, s)
+            }
             _ => inv.prompt.clone(),
         };
 
@@ -302,7 +327,9 @@ impl<P: AccountProvider, S: CliSpawner> BranchExecutor for RotatingBranchExecuto
         };
 
         let cost_cents = (out.spent_usd * 100.0).round().max(0.0) as u64;
-        self.provider.report(&account.id, out.ok(), cost_cents).await;
+        self.provider
+            .report(&account.id, out.ok(), cost_cents)
+            .await;
 
         Ok(BranchResult {
             id: inv.branch_id,
@@ -321,7 +348,9 @@ fn fork_config(settings: &ForkSettings) -> ForkConfig {
     ForkConfig {
         max_branches: settings.max_branches,
         default_budget_usd: settings.default_budget_usd,
-        aggregate_budget_usd: settings.aggregate_budget_usd.max(settings.default_budget_usd),
+        aggregate_budget_usd: settings
+            .aggregate_budget_usd
+            .max(settings.default_budget_usd),
         merge_mode: parse_merge_mode(&settings.merge_mode),
         test_command: settings.test_command.clone(),
         test_timeout_s: settings.test_timeout_s,
@@ -355,7 +384,14 @@ pub async fn execute_fork<P, S, J>(
     S: CliSpawner + 'static,
     J: JudgeAgent + 'static,
 {
-    let ForkExecRequest { fork_id, prompt, branches, parent_workspace, settings, home_dir } = req;
+    let ForkExecRequest {
+        fork_id,
+        prompt,
+        branches,
+        parent_workspace,
+        settings,
+        home_dir,
+    } = req;
     let branch_count = branches.len();
     let store = match duduclaw_fork::ForkStore::open(crate::mcp_fork::fork_store_path(&home_dir)) {
         Ok(s) => s,
@@ -366,7 +402,9 @@ pub async fn execute_fork<P, S, J>(
     };
     let _ = store.set_all_branch_states(&fork_id, "running");
 
-    let aggregate = settings.aggregate_budget_usd.max(settings.default_budget_usd);
+    let aggregate = settings
+        .aggregate_budget_usd
+        .max(settings.default_budget_usd);
     let executor = Arc::new(RotatingBranchExecutor::new(provider, spawner, aggregate));
     let controller = match ForkController::new(fork_config(&settings), executor) {
         Ok(c) => c,
@@ -409,14 +447,24 @@ pub async fn execute_fork<P, S, J>(
             );
             FORK_METRICS.record_resolution(&resolution);
             // Mirror onto the dashboard Activity Feed (cross-process).
-            let agent_id = store.get_fork(&fork_id).ok().flatten().map(|f| f.agent_id).unwrap_or_default();
+            let agent_id = store
+                .get_fork(&fork_id)
+                .ok()
+                .flatten()
+                .map(|f| f.agent_id)
+                .unwrap_or_default();
             append_fork_activity(
                 &home_dir,
                 &agent_id,
                 &fork_id,
                 &format!(
                     "Fork resolved over {branch_count} branches: winner={}, promoted={}, spend=${:.4}",
-                    resolution.decision.winner.as_ref().map(|w| &w.0[..w.0.len().min(8)]).unwrap_or("none"),
+                    resolution
+                        .decision
+                        .winner
+                        .as_ref()
+                        .map(|w| &w.0[..w.0.len().min(8)])
+                        .unwrap_or("none"),
                     resolution.promoted,
                     resolution.aggregate_spent_usd
                 ),
@@ -444,7 +492,13 @@ pub async fn execute_fork<P, S, J>(
             // Any branch still 'running' in the store is marked failed.
             if let Ok(rows) = store.list_branches(&fork_id) {
                 for b in rows.iter().filter(|b| b.state == "running") {
-                    let _ = store.update_branch(&b.branch_id, "failed", b.spent_usd, &b.output, b.test_exit_code);
+                    let _ = store.update_branch(
+                        &b.branch_id,
+                        "failed",
+                        b.spent_usd,
+                        &b.output,
+                        b.test_exit_code,
+                    );
                 }
             }
         }
@@ -471,10 +525,10 @@ pub struct RotatorProvider(pub Arc<duduclaw_agent::account_rotator::AccountRotat
 #[async_trait]
 impl AccountProvider for RotatorProvider {
     async fn select(&self) -> Option<SelectedAccount> {
-        self.0
-            .select()
-            .await
-            .map(|e| SelectedAccount { id: e.id, env_vars: e.env_vars })
+        self.0.select().await.map(|e| SelectedAccount {
+            id: e.id,
+            env_vars: e.env_vars,
+        })
     }
     async fn report(&self, account_id: &str, ok: bool, cost_cents: u64) {
         if ok {
@@ -566,7 +620,11 @@ impl CliSpawner for ClaudeCliSpawner {
         let stdout = match child.stdout.take() {
             Some(s) => s,
             None => {
-                return CliRunOutput { output: "no stdout".into(), spent_usd: 0.0, outcome: SpawnOutcome::Failed };
+                return CliRunOutput {
+                    output: "no stdout".into(),
+                    spent_usd: 0.0,
+                    outcome: SpawnOutcome::Failed,
+                };
             }
         };
 
@@ -646,7 +704,10 @@ fn parse_stream_json_line(line: &str) -> Option<(Option<String>, Option<f64>)> {
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    let text = v.get("result").and_then(|r| r.as_str()).map(|s| s.to_string());
+    let text = v
+        .get("result")
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string());
     let cost = v.get("total_cost_usd").and_then(|c| c.as_f64());
     if text.is_none() && cost.is_none() {
         return None;
@@ -685,7 +746,8 @@ impl ForkMetrics {
     pub fn record_resolution(&self, resolution: &duduclaw_fork::ForkResolution) {
         use std::sync::atomic::Ordering::Relaxed;
         self.runs_total.fetch_add(1, Relaxed);
-        self.branches_total.fetch_add(resolution.results.len() as u64, Relaxed);
+        self.branches_total
+            .fetch_add(resolution.results.len() as u64, Relaxed);
         for r in &resolution.results {
             match r.state {
                 BranchState::Finished => self.branches_finished.fetch_add(1, Relaxed),
@@ -776,7 +838,10 @@ pub fn append_fork_history(home_dir: &Path, entry: &ForkHistoryEntry) {
     };
     let res = duduclaw_core::with_file_lock(&path, || {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         writeln!(f, "{line}")
     });
     if let Err(e) = res {
@@ -798,7 +863,10 @@ mod tests {
             if self.accounts == 0 {
                 None
             } else {
-                Some(SelectedAccount { id: "acct-1".into(), env_vars: HashMap::new() })
+                Some(SelectedAccount {
+                    id: "acct-1".into(),
+                    env_vars: HashMap::new(),
+                })
             }
         }
         async fn report(&self, _id: &str, _ok: bool, _cents: u64) {}
@@ -822,7 +890,11 @@ mod tests {
             CliRunOutput {
                 output: format!("answer: {prompt}"),
                 spent_usd: self.spent,
-                outcome: if self.ok { SpawnOutcome::Completed } else { SpawnOutcome::Failed },
+                outcome: if self.ok {
+                    SpawnOutcome::Completed
+                } else {
+                    SpawnOutcome::Failed
+                },
             }
         }
     }
@@ -845,7 +917,10 @@ mod tests {
     async fn happy_path_finishes_and_charges() {
         let exec = RotatingBranchExecutor::new(
             Arc::new(FakeProvider { accounts: 2 }),
-            Arc::new(FakeSpawner { spent: 0.1, ok: true }),
+            Arc::new(FakeSpawner {
+                spent: 0.1,
+                ok: true,
+            }),
             1.0,
         );
         let r = exec.run_branch(inv(0.5)).await.unwrap();
@@ -858,7 +933,10 @@ mod tests {
     async fn cancelled_branch_skips_execution() {
         let exec = RotatingBranchExecutor::new(
             Arc::new(FakeProvider { accounts: 1 }),
-            Arc::new(FakeSpawner { spent: 0.1, ok: true }),
+            Arc::new(FakeSpawner {
+                spent: 0.1,
+                ok: true,
+            }),
             1.0,
         );
         let invocation = inv(0.5);
@@ -878,7 +956,10 @@ mod tests {
     async fn no_account_fails_branch() {
         let exec = RotatingBranchExecutor::new(
             Arc::new(FakeProvider { accounts: 0 }),
-            Arc::new(FakeSpawner { spent: 0.1, ok: true }),
+            Arc::new(FakeSpawner {
+                spent: 0.1,
+                ok: true,
+            }),
             1.0,
         );
         let r = exec.run_branch(inv(0.5)).await.unwrap();
@@ -889,7 +970,10 @@ mod tests {
     async fn spawner_failure_marks_failed() {
         let exec = RotatingBranchExecutor::new(
             Arc::new(FakeProvider { accounts: 1 }),
-            Arc::new(FakeSpawner { spent: 0.0, ok: false }),
+            Arc::new(FakeSpawner {
+                spent: 0.0,
+                ok: false,
+            }),
             1.0,
         );
         let r = exec.run_branch(inv(0.5)).await.unwrap();
@@ -900,7 +984,10 @@ mod tests {
     async fn per_branch_budget_exceeded_is_budget_killed() {
         let exec = RotatingBranchExecutor::new(
             Arc::new(FakeProvider { accounts: 1 }),
-            Arc::new(FakeSpawner { spent: 0.9, ok: true }),
+            Arc::new(FakeSpawner {
+                spent: 0.9,
+                ok: true,
+            }),
             10.0,
         );
         // per-branch cap 0.5 < spend 0.9 ⇒ BudgetKilled
@@ -911,9 +998,10 @@ mod tests {
     #[test]
     fn parse_stream_json_line_extracts_text_and_cost() {
         // A result event carries both fields.
-        let (t, c) =
-            parse_stream_json_line("{\"type\":\"result\",\"result\":\"final answer\",\"total_cost_usd\":0.0234}")
-                .unwrap();
+        let (t, c) = parse_stream_json_line(
+            "{\"type\":\"result\",\"result\":\"final answer\",\"total_cost_usd\":0.0234}",
+        )
+        .unwrap();
         assert_eq!(t.as_deref(), Some("final answer"));
         assert!((c.unwrap() - 0.0234).abs() < 1e-9);
         // A cost-only progress event.
@@ -974,7 +1062,7 @@ mod tests {
 
     #[test]
     fn metrics_record_resolution_counts() {
-        use duduclaw_fork::{merge::MergeDecision, ForkResolution};
+        use duduclaw_fork::{ForkResolution, merge::MergeDecision};
         let metrics = ForkMetrics::default();
         let resolution = ForkResolution {
             results: vec![
@@ -1032,14 +1120,21 @@ mod tests {
     #[test]
     fn outcome_labels() {
         assert_eq!(branch_outcome_label(BranchState::Finished), "win_or_finish");
-        assert_eq!(branch_outcome_label(BranchState::BudgetKilled), "budget_killed");
+        assert_eq!(
+            branch_outcome_label(BranchState::BudgetKilled),
+            "budget_killed"
+        );
         assert_eq!(branch_outcome_label(BranchState::Failed), "failed");
     }
 
     // ── Cross-branch aggregate pre-emption (RFC-26 §4.2) ────────────────────
 
     fn ctx_with(id: &str, budget: f64, agg: Option<Arc<duduclaw_fork::LiveAggregate>>) -> SpawnCtx {
-        SpawnCtx { branch_id: id.into(), budget_usd: budget, aggregate: agg }
+        SpawnCtx {
+            branch_id: id.into(),
+            budget_usd: budget,
+            aggregate: agg,
+        }
     }
 
     #[test]
@@ -1084,7 +1179,10 @@ mod tests {
         assert_eq!(stream_budget_decision(&a, 0.7), StreamAction::Continue);
         // b(0.4) tips the total to 1.1 > 1.0; a is the priciest in-flight branch,
         // so the cheaper observer b pre-empts a (not itself).
-        assert_eq!(stream_budget_decision(&b, 0.4), StreamAction::PreemptOther("a".into()));
+        assert_eq!(
+            stream_budget_decision(&b, 0.4),
+            StreamAction::PreemptOther("a".into())
+        );
         // Once the pre-empted a finishes, b's continued spend fits under the cap.
         agg.finish("a");
         assert_eq!(stream_budget_decision(&b, 0.9), StreamAction::Continue);

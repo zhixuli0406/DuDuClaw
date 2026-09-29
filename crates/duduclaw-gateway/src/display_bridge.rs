@@ -67,7 +67,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Same literal `duduclaw-comp/src/shell_control/protocol.rs::
 /// SOCKET_FILE_NAME` uses — hand-duplicated for the same "don't depend on
@@ -131,9 +131,7 @@ async fn call_at(path: &Path, req: Value) -> Result<Value, String> {
     };
 
     if bytes_read == 0 || buf.trim().is_empty() {
-        return Err(
-            "連線已建立但未收到任何回應（連線在寫入回應前就被關閉）。".to_string(),
-        );
+        return Err("連線已建立但未收到任何回應（連線在寫入回應前就被關閉）。".to_string());
     }
     // Defense-in-depth: a well-behaved server never sends a line anywhere
     // near this size — same bound the server enforces on OUR request.
@@ -143,11 +141,18 @@ async fn call_at(path: &Path, req: Value) -> Result<Value, String> {
         ));
     }
 
-    let resp: Value = serde_json::from_str(buf.trim())
-        .map_err(|e| format!("shell socket 回應不是合法 JSON：{e}（原始內容：{}）", buf.trim()))?;
+    let resp: Value = serde_json::from_str(buf.trim()).map_err(|e| {
+        format!(
+            "shell socket 回應不是合法 JSON：{e}（原始內容：{}）",
+            buf.trim()
+        )
+    })?;
 
     if resp.get("ok").and_then(Value::as_bool) == Some(false) {
-        let err = resp.get("error").and_then(Value::as_str).unwrap_or("unknown_error");
+        let err = resp
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown_error");
         if err == "unauthorized" {
             return Err(
                 "shell socket 拒絕連線（unauthorized）——comp 尚未認得這個呼叫者的 uid。見 A7c 設計：\
@@ -202,7 +207,11 @@ pub async fn theme_set(theme: &str) -> Result<Value, String> {
 
 async fn outputs_get() -> Result<Vec<Value>, String> {
     let resp = call(json!({ "op": "get_outputs" })).await?;
-    Ok(resp.get("outputs").and_then(Value::as_array).cloned().unwrap_or_default())
+    Ok(resp
+        .get("outputs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
 }
 
 /// The primary (first non-shadow) output's name — comp's `get_outputs`
@@ -295,7 +304,10 @@ mod tests {
     /// `$XDG_RUNTIME_DIR`-based env-var plumbing `os_drive/display.rs`'s own
     /// equivalent test relies on (this module never reads that env var at
     /// all, so no cross-test env-lock is needed here).
-    async fn run_stub(path: &std::path::Path, respond: impl FnOnce(Value) -> Value + Send + 'static) {
+    async fn run_stub(
+        path: &std::path::Path,
+        respond: impl FnOnce(Value) -> Value + Send + 'static,
+    ) {
         let listener = UnixListener::bind(path).expect("bind stub socket");
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
@@ -314,14 +326,19 @@ mod tests {
     }
 
     fn temp_sock(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("duduclaw-display-bridge-test-{tag}-{}.sock", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "duduclaw-display-bridge-test-{tag}-{}.sock",
+            std::process::id()
+        ))
     }
 
     #[tokio::test]
     async fn missing_socket_is_an_honest_not_found_error_not_a_hang() {
         let path = temp_sock("missing");
         let _ = std::fs::remove_file(&path);
-        let err = call_at(&path, json!({ "op": "get_outputs" })).await.unwrap_err();
+        let err = call_at(&path, json!({ "op": "get_outputs" }))
+            .await
+            .unwrap_err();
         assert!(err.contains("不存在"), "unexpected: {err}");
     }
 
@@ -336,9 +353,12 @@ mod tests {
         })
         .await;
 
-        let resp = call_at(&path, json!({ "op": "set_cursor_size", "params": { "size": 48 } }))
-            .await
-            .expect("stub round trip must succeed");
+        let resp = call_at(
+            &path,
+            json!({ "op": "set_cursor_size", "params": { "size": 48 } }),
+        )
+        .await
+        .expect("stub round trip must succeed");
         assert_eq!(resp["cursor"]["size"], 48);
         let _ = std::fs::remove_file(&path);
     }
@@ -347,21 +367,37 @@ mod tests {
     async fn unauthorized_error_is_translated_with_a7c_specific_guidance() {
         let path = temp_sock("unauth");
         let _ = std::fs::remove_file(&path);
-        run_stub(&path, |_req| json!({ "ok": false, "error": "unauthorized" })).await;
+        run_stub(
+            &path,
+            |_req| json!({ "ok": false, "error": "unauthorized" }),
+        )
+        .await;
 
-        let err = call_at(&path, json!({ "op": "set_theme", "params": { "theme": "dark" } }))
-            .await
-            .unwrap_err();
-        assert!(err.contains("DUDUCLAW_SHELL_CONTROL_AGENT_UID"), "unexpected: {err}");
+        let err = call_at(
+            &path,
+            json!({ "op": "set_theme", "params": { "theme": "dark" } }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("DUDUCLAW_SHELL_CONTROL_AGENT_UID"),
+            "unexpected: {err}"
+        );
     }
 
     #[tokio::test]
     async fn forbidden_for_agent_error_is_translated_honestly() {
         let path = temp_sock("forbidden");
         let _ = std::fs::remove_file(&path);
-        run_stub(&path, |_req| json!({ "ok": false, "error": "forbidden_for_agent" })).await;
+        run_stub(
+            &path,
+            |_req| json!({ "ok": false, "error": "forbidden_for_agent" }),
+        )
+        .await;
 
-        let err = call_at(&path, json!({ "op": "list_windows" })).await.unwrap_err();
+        let err = call_at(&path, json!({ "op": "list_windows" }))
+            .await
+            .unwrap_err();
         assert!(err.contains("forbidden_for_agent"), "unexpected: {err}");
     }
 

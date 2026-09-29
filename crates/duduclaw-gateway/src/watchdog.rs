@@ -58,7 +58,9 @@ pub fn notify(state: &str) -> io::Result<()> {
 
 #[cfg(unix)]
 fn notify_to(state: &str, socket_path: Option<&str>) -> io::Result<()> {
-    let Some(path) = socket_path else { return Ok(()) };
+    let Some(path) = socket_path else {
+        return Ok(());
+    };
     if path.trim().is_empty() {
         return Ok(());
     }
@@ -90,7 +92,11 @@ pub fn notify_stopping() -> io::Result<()> {
 /// - `WATCHDOG_USEC` absent, zero, or unparseable → not supervised.
 /// - Otherwise → half the deadline, the standard "ping at 2x the required
 ///   rate" practice recommended by `sd_watchdog_enabled(3)`.
-fn watchdog_interval_from(usec: Option<&str>, pid: Option<&str>, my_pid: u32) -> Option<std::time::Duration> {
+fn watchdog_interval_from(
+    usec: Option<&str>,
+    pid: Option<&str>,
+    my_pid: u32,
+) -> Option<std::time::Duration> {
     if let Some(want_pid) = pid.and_then(|s| s.trim().parse::<u32>().ok())
         && want_pid != my_pid
     {
@@ -162,7 +168,10 @@ mod tests {
 
     #[test]
     fn pid_mismatch_means_not_supervised() {
-        assert_eq!(watchdog_interval_from(Some("20000000"), Some("999"), 100), None);
+        assert_eq!(
+            watchdog_interval_from(Some("20000000"), Some("999"), 100),
+            None
+        );
     }
 
     #[test]
@@ -186,13 +195,19 @@ mod tests {
         // No env manipulation needed — CI/dev hosts never have
         // NOTIFY_SOCKET set (that's exclusively a systemd Type=notify
         // thing), so this exercises the real no-op path deterministically.
-        assert!(std::env::var(NOTIFY_SOCKET_ENV).is_err(), "precondition: not running under systemd notify");
+        assert!(
+            std::env::var(NOTIFY_SOCKET_ENV).is_err(),
+            "precondition: not running under systemd notify"
+        );
         assert!(notify("READY=1").is_ok());
     }
 
     #[test]
     fn spawn_watchdog_pings_is_none_without_watchdog_usec() {
-        assert!(std::env::var(WATCHDOG_USEC_ENV).is_err(), "precondition: no watchdog configured");
+        assert!(
+            std::env::var(WATCHDOG_USEC_ENV).is_err(),
+            "precondition: no watchdog configured"
+        );
         assert!(spawn_watchdog_pings().is_none());
     }
 }

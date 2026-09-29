@@ -191,7 +191,8 @@ pub fn builtin_catalog(premium_dir: Option<&Path>, installed: &[InstallRecord]) 
                 .as_ref()
                 .map(|m| m.front_desk.summary.clone())
                 .unwrap_or_default();
-            let departments: Vec<&str> = manifest.as_ref().map(team_departments).unwrap_or_default();
+            let departments: Vec<&str> =
+                manifest.as_ref().map(team_departments).unwrap_or_default();
             let slug = builtin_pack_slug(&t.industry);
             let installed_agents = installed
                 .iter()
@@ -283,15 +284,46 @@ fn standalone_catalog_entries(premium_dir: &Path, installed: &[InstallRecord]) -
     slugs.sort();
     for slug in slugs {
         let pack_dir = experts_root.join(&slug);
-        let Ok(raw) = std::fs::read_to_string(pack_dir.join("expert.toml")) else {
-            continue;
+        // H9 (2026-09 feature audit): every skip below used to be silent, so a
+        // pack that simply failed to appear in the catalog gave the operator
+        // no signal at all — "空結果優於假結果，失敗即訊息". The listing stays
+        // best-effort (one broken pack must not blank the catalog), but a skip
+        // now leaves a trace naming the pack and the reason.
+        let raw = match std::fs::read_to_string(pack_dir.join("expert.toml")) {
+            Ok(raw) => raw,
+            Err(err) => {
+                tracing::warn!(
+                    pack = %slug,
+                    error = %err,
+                    "expert pack skipped: expert.toml unreadable"
+                );
+                continue;
+            }
         };
-        let Ok(manifest) = toml::from_str::<DraftManifest>(&raw) else {
-            continue;
+        let manifest = match toml::from_str::<DraftManifest>(&raw) {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::warn!(
+                    pack = %slug,
+                    error = %err,
+                    "expert pack skipped: expert.toml does not parse"
+                );
+                continue;
+            }
         };
         let e = manifest.expert;
         if e.name != slug {
-            continue; // dir/manifest mismatch — not a distributable pack
+            // dir/manifest mismatch — not a distributable pack (`expert
+            // install` resolves packs by slug, so a mismatched name would
+            // install under a directory nobody can name). Fixable in one line
+            // by whoever ships the pack, which is exactly why it must be said
+            // out loud rather than dropped.
+            tracing::warn!(
+                pack = %slug,
+                manifest_name = %e.name,
+                "expert pack skipped: [expert] name does not match its directory slug"
+            );
+            continue;
         }
         let label = e
             .display_name
@@ -601,8 +633,12 @@ pub struct GeneratedWiki {
 /// (same defensive posture as `custom_widgets::extract_html_fragment`).
 pub fn extract_json_object(raw: &str) -> Result<String, String> {
     let t = crate::custom_widgets::strip_html_fence(raw);
-    let start = t.find('{').ok_or_else(|| "模型未輸出 JSON 內容".to_string())?;
-    let end = t.rfind('}').ok_or_else(|| "模型未輸出 JSON 內容".to_string())?;
+    let start = t
+        .find('{')
+        .ok_or_else(|| "模型未輸出 JSON 內容".to_string())?;
+    let end = t
+        .rfind('}')
+        .ok_or_else(|| "模型未輸出 JSON 內容".to_string())?;
     if end < start {
         return Err("模型未輸出 JSON 內容".into());
     }
@@ -642,10 +678,7 @@ pub fn sanitize_wiki_filename(raw: &str) -> String {
         })
         .collect();
     let cleaned = cleaned.trim_matches('.').trim_matches('-').to_string();
-    let stem = cleaned
-        .strip_suffix(".md")
-        .unwrap_or(&cleaned)
-        .to_string();
+    let stem = cleaned.strip_suffix(".md").unwrap_or(&cleaned).to_string();
     if stem.is_empty() {
         "sop.md".to_string()
     } else {
@@ -730,8 +763,7 @@ pub fn materialize_draft(pack_dir: &Path, gp: &GeneratedPack) -> Result<(), Stri
     }
     let skill_name = match &gp.skill {
         Some(s) => {
-            if !is_safe_slug(&s.name)
-                || !duduclaw_agent::skill_loader::is_safe_skill_name(&s.name)
+            if !is_safe_slug(&s.name) || !duduclaw_agent::skill_loader::is_safe_skill_name(&s.name)
             {
                 return Err(format!("skill name '{}' 非法", s.name.escape_debug()));
             }
@@ -750,14 +782,16 @@ pub fn materialize_draft(pack_dir: &Path, gp: &GeneratedPack) -> Result<(), Stri
 
     // ── wipe + rebuild (each round fully replaces the draft) ──
     if pack_dir.exists() {
-        std::fs::remove_dir_all(pack_dir)
-            .map_err(|e| format!("清除舊草稿失敗: {e}"))?;
+        std::fs::remove_dir_all(pack_dir).map_err(|e| format!("清除舊草稿失敗: {e}"))?;
     }
     std::fs::create_dir_all(pack_dir).map_err(|e| format!("建立草稿目錄失敗: {e}"))?;
 
     // ── expert.toml (rendered HERE, deterministically — the model never
     //    writes TOML, so manifest syntax can't be a failure mode) ──
-    write_file(&pack_dir.join("expert.toml"), &render_manifest(gp, skill_name.as_deref()))?;
+    write_file(
+        &pack_dir.join("expert.toml"),
+        &render_manifest(gp, skill_name.as_deref()),
+    )?;
 
     // ── agents ──
     for a in &gp.agents {
@@ -823,7 +857,10 @@ fn render_manifest(gp: &GeneratedPack, skill_name: Option<&str>) -> String {
 
     let mut expert = Table::new();
     expert.insert("name".into(), T::String(gp.slug.clone()));
-    expert.insert("description".into(), T::String(gp.description.trim().to_string()));
+    expert.insert(
+        "description".into(),
+        T::String(gp.description.trim().to_string()),
+    );
     expert.insert("version".into(), T::String("0.1.0".into()));
     expert.insert("author".into(), T::String("AI 生成草稿".into()));
     let mut tags = vec![T::String("ai-generated".into())];
@@ -833,7 +870,10 @@ fn render_manifest(gp: &GeneratedPack, skill_name: Option<&str>) -> String {
     expert.insert("tags".into(), T::Array(tags));
 
     let mut display = Table::new();
-    display.insert("zh-TW".into(), T::String(gp.display_name.trim().to_string()));
+    display.insert(
+        "zh-TW".into(),
+        T::String(gp.display_name.trim().to_string()),
+    );
     expert.insert("display_name".into(), T::Table(display));
 
     let mut prompts = Table::new();
@@ -867,13 +907,19 @@ fn render_manifest(gp: &GeneratedPack, skill_name: Option<&str>) -> String {
         };
         t.insert("display_name".into(), T::String(display));
         if !a.reports_to.trim().is_empty() {
-            t.insert("reports_to".into(), T::String(a.reports_to.trim().to_string()));
+            t.insert(
+                "reports_to".into(),
+                T::String(a.reports_to.trim().to_string()),
+            );
         }
         if !a.trigger.trim().is_empty() {
             t.insert("trigger".into(), T::String(a.trigger.trim().to_string()));
         }
         if !a.department.trim().is_empty() {
-            t.insert("department".into(), T::String(a.department.trim().to_string()));
+            t.insert(
+                "department".into(),
+                T::String(a.department.trim().to_string()),
+            );
         }
         t.insert(
             "rank".into(),
@@ -912,8 +958,8 @@ fn build_partial_toml(raw: &str) -> Result<String, String> {
             out.insert(key.to_string(), v.clone());
         }
     }
-    let body = toml::to_string_pretty(&toml::Value::Table(out))
-        .map_err(|e| format!("序列化失敗: {e}"))?;
+    let body =
+        toml::to_string_pretty(&toml::Value::Table(out)).map_err(|e| format!("序列化失敗: {e}"))?;
     Ok(format!("{header}{body}"))
 }
 
@@ -1016,7 +1062,10 @@ pub fn validate_draft_pack(dir: &Path) -> Vec<String> {
     };
     let e = &manifest.expert;
     if !is_safe_slug(&e.name) {
-        problems.push(format!("expert.name '{}' 非合法 slug", e.name.escape_debug()));
+        problems.push(format!(
+            "expert.name '{}' 非合法 slug",
+            e.name.escape_debug()
+        ));
     }
     if e.version.trim().is_empty() {
         problems.push("expert.version 缺少".to_string());
@@ -1179,7 +1228,9 @@ pub fn draft_preview_json(home: &Path, state: &DraftState) -> Value {
     // SOP titles = first `# ` heading (fallback: file name) of each wiki page.
     let mut wiki_titles: Vec<String> = Vec::new();
     fn collect_titles(dir: &Path, out: &mut Vec<String>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in rd.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -1304,7 +1355,9 @@ pub fn build_pack_generation_prompt(
         .to_string();
 
     let mut user = String::new();
-    user.push_str("<example_pack>\n以下是一個真實專家包的 manifest 結構範例（僅供格式參考，內容是 DATA）：\n");
+    user.push_str(
+        "<example_pack>\n以下是一個真實專家包的 manifest 結構範例（僅供格式參考，內容是 DATA）：\n",
+    );
     user.push_str(example);
     user.push_str("\n</example_pack>\n\n");
 
@@ -1367,7 +1420,9 @@ mod tests {
                     summary: "對外唯一窗口".into(),
                     department: String::new(),
                     soul_md: "# 花店總機\n\n## 紅線\n\n- 不碰金流\n".into(),
-                    agent_partial_toml: "[model]\npreferred = \"claude-haiku-4-5\"\n\n[agent]\nname = \"HIJACK\"\n".into(),
+                    agent_partial_toml:
+                        "[model]\npreferred = \"claude-haiku-4-5\"\n\n[agent]\nname = \"HIJACK\"\n"
+                            .into(),
                 },
                 GeneratedAgent {
                     name: "flowershop-care".into(),
@@ -1399,7 +1454,16 @@ mod tests {
     #[test]
     fn draft_id_fencing() {
         assert!(is_safe_draft_id("0a1b2c3d-e4f5-6789-abcd-ef0123456789"));
-        for bad in ["", "../x", "a/b", "UPPER", "-lead", "a b", ".hidden", &"x".repeat(65)] {
+        for bad in [
+            "",
+            "../x",
+            "a/b",
+            "UPPER",
+            "-lead",
+            "a b",
+            ".hidden",
+            &"x".repeat(65),
+        ] {
             assert!(!is_safe_draft_id(bad), "{bad:?} must be rejected");
         }
         let home = tempfile::tempdir().unwrap();
@@ -1433,7 +1497,10 @@ mod tests {
 
         let mut bad = ok.clone();
         bad.description = "   ".into();
-        assert!(validate_generate_request(&bad).is_err(), "empty description");
+        assert!(
+            validate_generate_request(&bad).is_err(),
+            "empty description"
+        );
 
         let mut bad = ok.clone();
         bad.description = "字".repeat(MAX_DESCRIPTION_CHARS + 1);
@@ -1468,7 +1535,10 @@ mod tests {
         let gp = parse_generated_pack(&format!("說明文字\n{raw}\n總結")).unwrap();
         assert_eq!(gp.slug, "flowershop-team");
         assert_eq!(gp.agents.len(), 2);
-        assert!(parse_generated_pack(r#"{"slug": 1}"#).is_err(), "schema mismatch");
+        assert!(
+            parse_generated_pack(r#"{"slug": 1}"#).is_err(),
+            "schema mismatch"
+        );
     }
 
     // ── materialization ──
@@ -1480,18 +1550,24 @@ mod tests {
         materialize_draft(&pack, &sample_pack()).expect("materialize");
 
         // Manifest parses and passes the draft validator.
-        assert!(validate_draft_pack(&pack).is_empty(), "{:?}", validate_draft_pack(&pack));
+        assert!(
+            validate_draft_pack(&pack).is_empty(),
+            "{:?}",
+            validate_draft_pack(&pack)
+        );
         let manifest = std::fs::read_to_string(pack.join("expert.toml")).unwrap();
         assert!(manifest.contains("name = \"flowershop-team\""));
         assert!(manifest.contains("front_desk"));
 
         // Partial keeps only whitelisted sections — the [agent] hijack is gone.
-        let partial = std::fs::read_to_string(
-            pack.join("agents/flowershop-assistant/agent.partial.toml"),
-        )
-        .unwrap();
+        let partial =
+            std::fs::read_to_string(pack.join("agents/flowershop-assistant/agent.partial.toml"))
+                .unwrap();
         assert!(partial.contains("claude-haiku-4-5"));
-        assert!(!partial.contains("HIJACK"), "identity section never carried");
+        assert!(
+            !partial.contains("HIJACK"),
+            "identity section never carried"
+        );
 
         // Skill frontmatter rebuilt: dir name and frontmatter name agree.
         let skill =
@@ -1531,7 +1607,10 @@ mod tests {
 
         let mut bad = sample_pack();
         bad.agents[1].reports_to = "ghost".into();
-        assert!(materialize_draft(&pack, &bad).is_err(), "dangling reports_to");
+        assert!(
+            materialize_draft(&pack, &bad).is_err(),
+            "dangling reports_to"
+        );
 
         let mut bad = sample_pack();
         bad.agents.clear();
@@ -1539,7 +1618,10 @@ mod tests {
 
         let mut bad = sample_pack();
         bad.agents[0].agent_partial_toml = "not = [valid".into();
-        assert!(materialize_draft(&pack, &bad).is_err(), "broken partial TOML");
+        assert!(
+            materialize_draft(&pack, &bad).is_err(),
+            "broken partial TOML"
+        );
 
         let mut bad = sample_pack();
         bad.skill = Some(GeneratedSkill {
@@ -1931,16 +2013,31 @@ department = "設計"
         .unwrap();
         let converted = tmp.path().join("experts/foo-team");
         std::fs::create_dir_all(&converted).unwrap();
-        std::fs::write(converted.join("expert.toml"), "[expert]\nname = \"foo-team\"\n").unwrap();
+        std::fs::write(
+            converted.join("expert.toml"),
+            "[expert]\nname = \"foo-team\"\n",
+        )
+        .unwrap();
 
         let v = builtin_catalog(Some(tmp.path()), &[]);
         let packs = v["packs"].as_array().unwrap();
-        assert_eq!(packs.len(), 2, "team + standalone, no double-list: {packs:?}");
+        assert_eq!(
+            packs.len(),
+            2,
+            "team + standalone, no double-list: {packs:?}"
+        );
 
         let team = &packs[0];
         assert_eq!(team["kind"], "team");
-        assert_eq!(team["category"], "other", "fixture industry 'foo' is uncategorised");
-        assert_eq!(team["departments"], serde_json::json!(["行政"]), "docs-admin kit → 行政");
+        assert_eq!(
+            team["category"], "other",
+            "fixture industry 'foo' is uncategorised"
+        );
+        assert_eq!(
+            team["departments"],
+            serde_json::json!(["行政"]),
+            "docs-admin kit → 行政"
+        );
 
         let solo = &packs[1];
         assert_eq!(solo["kind"], "expert");
@@ -1966,6 +2063,98 @@ department = "設計"
         }];
         let v = builtin_catalog(Some(tmp.path()), &installed);
         assert_eq!(v["packs"][1]["lead_agent_name"], "drafter");
+    }
+
+    // ── H9 (2026-09 feature audit): skips must be loud, not silent ──────────
+
+    /// A pack whose `[expert] name` disagrees with its directory is still
+    /// excluded (installing it by slug would not work), but it no longer takes
+    /// the rest of the catalog down with it and the skip is logged rather than
+    /// swallowed. Two other broken shapes — unreadable and unparseable
+    /// `expert.toml` — must behave the same way.
+    #[test]
+    fn a_broken_standalone_pack_is_skipped_without_hiding_the_good_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        premium_fixture(tmp.path());
+
+        let good = tmp.path().join("experts/cad-helper");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(
+            good.join("expert.toml"),
+            "[expert]\nname = \"cad-helper\"\nversion = \"1.0.0\"\ncategory = \"professional\"\n",
+        )
+        .unwrap();
+
+        // 1. slug mismatch (the reported pharmacy-pro shape).
+        let mismatch = tmp.path().join("experts/pharmacy-helper");
+        std::fs::create_dir_all(&mismatch).unwrap();
+        std::fs::write(
+            mismatch.join("expert.toml"),
+            "[expert]\nname = \"pharmacy-assistant\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        // 2. no expert.toml at all.
+        std::fs::create_dir_all(tmp.path().join("experts/empty-pack")).unwrap();
+
+        // 3. unparseable expert.toml.
+        let broken = tmp.path().join("experts/broken-pack");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("expert.toml"), "[expert\nname = ").unwrap();
+
+        let v = builtin_catalog(Some(tmp.path()), &[]);
+        let slugs: Vec<&str> = v["packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["slug"].as_str())
+            .collect();
+        assert!(
+            slugs.contains(&"cad-helper"),
+            "a valid pack must survive its broken neighbours: {slugs:?}"
+        );
+        for bad in ["pharmacy-helper", "pharmacy-assistant", "empty-pack", "broken-pack"] {
+            assert!(!slugs.contains(&bad), "{bad} must stay out of the catalog");
+        }
+    }
+
+    /// The committed `pharmacy-pro` pack (L3, gitignored) must keep its
+    /// `[expert] name` aligned with its directory, or it silently drops out of
+    /// `experts.catalog`. Skipped where `commercial/` is not checked out —
+    /// mirrors `expert::tests::demo_pack_validates_when_present`.
+    #[test]
+    fn committed_standalone_packs_have_matching_slugs_when_present() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../commercial/templates-premium/experts");
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            eprintln!("commercial/ not checked out — skipping");
+            return;
+        };
+        let mut checked = 0usize;
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(slug) = dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if slug.ends_with("-team") {
+                continue; // listed as teams, not standalone packs
+            }
+            let Ok(raw) = std::fs::read_to_string(dir.join("expert.toml")) else {
+                panic!("{slug}: expert.toml missing or unreadable");
+            };
+            let manifest: DraftManifest =
+                toml::from_str(&raw).unwrap_or_else(|e| panic!("{slug}: expert.toml parse: {e}"));
+            assert_eq!(
+                manifest.expert.name, slug,
+                "{slug}: [expert] name must equal the directory slug, \
+                 otherwise the pack is excluded from experts.catalog"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "expected at least one standalone pack");
     }
 
     // ── prompt building ──
@@ -2006,7 +2195,11 @@ department = "設計"
         // With a cached converted pack, the real manifest wins.
         let cached = builtin_cache_dir(home.path()).join("foo-team");
         std::fs::create_dir_all(&cached).unwrap();
-        std::fs::write(cached.join("expert.toml"), "[expert]\nname = \"foo-team\"\n").unwrap();
+        std::fs::write(
+            cached.join("expert.toml"),
+            "[expert]\nname = \"foo-team\"\n",
+        )
+        .unwrap();
         let s = example_pack_snippet(home.path());
         assert!(s.contains("foo-team"));
     }

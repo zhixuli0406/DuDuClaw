@@ -58,14 +58,17 @@ struct RawVerdict {
 /// values — fail-closed, caller treats `Err` the same as a transport
 /// failure (`verify_error`, status stays `Candidate`).
 pub fn parse_verdict(raw: &str) -> Result<(Verdict, String), String> {
-    let slice = extract_json_object(raw).ok_or_else(|| "no JSON object found in adversarial response".to_string())?;
+    let slice = extract_json_object(raw)
+        .ok_or_else(|| "no JSON object found in adversarial response".to_string())?;
     let rv: RawVerdict =
         serde_json::from_str(slice).map_err(|e| format!("adversarial JSON parse failed: {e}"))?;
     let verdict = match rv.verdict.trim().to_ascii_lowercase().as_str() {
         "refuted" => Verdict::Refuted,
         "plausible" => Verdict::Plausible,
         other => {
-            return Err(format!("unknown verdict {other:?} (expected \"refuted\" or \"plausible\")"));
+            return Err(format!(
+                "unknown verdict {other:?} (expected \"refuted\" or \"plausible\")"
+            ));
         }
     };
     Ok((verdict, rv.reason))
@@ -96,7 +99,10 @@ Reply with ONLY a JSON object, no prose, no markdown fences: {{\"verdict\": \
         finding.severity.as_str(),
         escape_xml_tag(&finding.title, "claim"),
         finding.file,
-        finding.line.map(|l| l.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        finding
+            .line
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
         finding.file,
         escape_xml_tag(fresh_excerpt, "file_excerpt"),
     )
@@ -120,7 +126,10 @@ async fn review_one<C: LlmCaller>(repo_root: &Path, finding: &mut Finding, calle
             // even be re-read to check the claim against. No point spending
             // a call to ask an LLM to verify something unreadable.
             finding.status = FindingStatus::Refuted;
-            push_evidence(finding, format!("refuted (zero-LLM): referenced file could not be re-read from disk: {e}"));
+            push_evidence(
+                finding,
+                format!("refuted (zero-LLM): referenced file could not be re-read from disk: {e}"),
+            );
             return;
         }
     };
@@ -156,7 +165,11 @@ async fn review_one<C: LlmCaller>(repo_root: &Path, finding: &mut Finding, calle
 /// Run adversarial review over `findings`. Only `source_engine == "ai_audit"`
 /// rows are reviewed (mutated in place); anything else passes through
 /// untouched — see the module doc for why.
-pub async fn review_all<C: LlmCaller>(repo_root: &Path, findings: Vec<Finding>, caller: &C) -> Vec<Finding> {
+pub async fn review_all<C: LlmCaller>(
+    repo_root: &Path,
+    findings: Vec<Finding>,
+    caller: &C,
+) -> Vec<Finding> {
     let mut out = Vec::with_capacity(findings.len());
     for mut f in findings {
         if f.source_engine == AI_AUDIT_ENGINE {
@@ -245,7 +258,9 @@ mod tests {
             match guard.take() {
                 Some(Ok(s)) => Ok(s),
                 Some(Err(e)) => Err(duduclaw_fork::ForkError::Executor(e)),
-                None => Err(duduclaw_fork::ForkError::Executor("stub called twice".to_string())),
+                None => Err(duduclaw_fork::ForkError::Executor(
+                    "stub called twice".to_string(),
+                )),
             }
         }
     }
@@ -270,7 +285,11 @@ mod tests {
     async fn review_one_plausible_verdict_parks_needs_human() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/db.py"), "def query(sql): cursor.execute(sql)").unwrap();
+        std::fs::write(
+            dir.path().join("src/db.py"),
+            "def query(sql): cursor.execute(sql)",
+        )
+        .unwrap();
         let mut f = sample_finding();
         let caller = StubCaller(std::sync::Mutex::new(Some(Ok(
             r#"{"verdict":"plausible","reason":"raw execute confirmed"}"#.to_string(),
@@ -311,7 +330,9 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/db.py"), "def query(): pass").unwrap();
         let mut f = sample_finding();
-        let caller = StubCaller(std::sync::Mutex::new(Some(Ok("garbage, not json".to_string()))));
+        let caller = StubCaller(std::sync::Mutex::new(Some(Ok(
+            "garbage, not json".to_string()
+        ))));
         review_one(dir.path(), &mut f, &caller).await;
         assert_eq!(f.status, FindingStatus::Candidate);
         assert!(f.evidence.last().unwrap().detail.contains("verify_error"));

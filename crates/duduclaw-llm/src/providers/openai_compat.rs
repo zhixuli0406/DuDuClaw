@@ -16,12 +16,12 @@
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::error::{classify_http, classify_transport, snippet, LlmError};
+use crate::error::{LlmError, classify_http, classify_transport, snippet};
 use crate::http::{http_client, retry_after_of};
-use crate::provider::{split_model_id, ApiAuth, ChatProvider};
-use crate::sse::{drive_sse, sse_data, SseParser};
+use crate::provider::{ApiAuth, ChatProvider, split_model_id};
+use crate::sse::{SseParser, drive_sse, sse_data};
 use crate::types::{
     ChatRequest, ChatResponse, ContentPart, NormalizedUsage, Role, StopReason, StreamEvent,
     ToolChoice,
@@ -110,6 +110,13 @@ pub struct OpenAiCompatProvider {
     base_url: String,
     /// Extra headers (e.g. OpenRouter `HTTP-Referer` attribution).
     extra_headers: Vec<(String, String)>,
+    /// O11: send `ChatRequest::model` verbatim instead of stripping a
+    /// `provider/` qualifier. Off by default (hosted presets qualify their
+    /// ids); see [`OpenAiCompatProvider::with_verbatim_model_id`].
+    verbatim_model_id: bool,
+    /// O11: an owned client replacing the shared 120s singleton. `None` ⇒ the
+    /// singleton, i.e. byte-identical behavior for every pre-O11 caller.
+    client: Option<reqwest::Client>,
 }
 
 impl OpenAiCompatProvider {
@@ -127,7 +134,14 @@ impl OpenAiCompatProvider {
             .unwrap_or_else(|| default_base_url.into())
             .trim_end_matches('/')
             .to_string();
-        Self { id: id.into(), auth, base_url, extra_headers: Vec::new() }
+        Self {
+            id: id.into(),
+            auth,
+            base_url,
+            extra_headers: Vec::new(),
+            verbatim_model_id: false,
+            client: None,
+        }
     }
 
     /// Construct from a built-in preset. `None` for unknown preset names
@@ -142,6 +156,33 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Send [`ChatRequest::model`] to the server **verbatim**, without
+    /// stripping a leading `provider/` qualifier.
+    ///
+    /// O11: the hosted presets qualify their ids (`"deepseek/deepseek-v3.2"`)
+    /// and must be stripped, which is why [`split_model_id`] is the default.
+    /// A **local** server is the opposite case: llama.cpp / Ollama / vLLM
+    /// routinely serve HuggingFace repo ids that legitimately contain a slash
+    /// (`qwen/qwen3-4b`), and stripping the first segment would name a model
+    /// the server does not have. Local callers opt in here.
+    ///
+    /// [`split_model_id`]: crate::split_model_id
+    pub fn with_verbatim_model_id(mut self) -> Self {
+        self.verbatim_model_id = true;
+        self
+    }
+
+    /// Use an owned HTTP client with this request timeout instead of the
+    /// crate-shared 120s singleton.
+    ///
+    /// O11: local inference on CPU regularly runs a single completion past two
+    /// minutes, so the local-inference backend carried its own 300s client.
+    /// Callers that do not set this keep the singleton — unchanged behavior.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.client = reqwest::Client::builder().timeout(timeout).build().ok();
+        self
+    }
+
     fn chat_url(&self) -> String {
         format!("{}/chat/completions", self.base_url)
     }
@@ -151,8 +192,26 @@ impl OpenAiCompatProvider {
 // Request build (pure)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn build_request_body(req: &ChatRequest, stream: bool) -> Value {
-    let (_, bare_model) = split_model_id(&req.model);
+/// Build the chat/completions body for `req` (pure — no I/O).
+///
+/// `pub` so callers that embed this provider can assert on the exact wire
+/// body offline; `build_request_body_with` is the variant that also controls
+/// model-id qualifier stripping.
+pub fn build_request_body(req: &ChatRequest, stream: bool) -> Value {
+    build_request_body_with(req, stream, false)
+}
+
+/// `verbatim_model_id` — see [`OpenAiCompatProvider::with_verbatim_model_id`].
+pub fn build_request_body_with(
+    req: &ChatRequest,
+    stream: bool,
+    verbatim_model_id: bool,
+) -> Value {
+    let bare_model = if verbatim_model_id {
+        req.model.as_str()
+    } else {
+        split_model_id(&req.model).1
+    };
 
     let mut messages: Vec<Value> = Vec::new();
     let system_text = req
@@ -179,14 +238,19 @@ pub(crate) fn build_request_body(req: &ChatRequest, stream: bool) -> Value {
                             plain_text.push_str(t);
                             content_parts.push(json!({"type": "text", "text": t}));
                         }
-                        ContentPart::Image { media_type, data_base64 } => {
+                        ContentPart::Image {
+                            media_type,
+                            data_base64,
+                        } => {
                             has_image = true;
                             content_parts.push(json!({
                                 "type": "image_url",
                                 "image_url": {"url": format!("data:{media_type};base64,{data_base64}")}
                             }));
                         }
-                        ContentPart::ToolResult { call_id, content, .. } => {
+                        ContentPart::ToolResult {
+                            call_id, content, ..
+                        } => {
                             messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": call_id,
@@ -222,7 +286,11 @@ pub(crate) fn build_request_body(req: &ChatRequest, stream: bool) -> Value {
                     }
                 }
                 let mut m = json!({"role": "assistant"});
-                m["content"] = if text.is_empty() { Value::Null } else { json!(text) };
+                m["content"] = if text.is_empty() {
+                    Value::Null
+                } else {
+                    json!(text)
+                };
                 if !tool_calls.is_empty() {
                     m["tool_calls"] = Value::Array(tool_calls);
                 }
@@ -244,6 +312,28 @@ pub(crate) fn build_request_body(req: &ChatRequest, stream: bool) -> Value {
     }
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
+    }
+    // O11: sampling / stop / logprob knobs the local-inference backend used to
+    // send from its own client. Every one of them is absent when unset, so a
+    // pre-O11 request body is byte-identical.
+    if let Some(p) = req.top_p {
+        body["top_p"] = json!(p);
+    }
+    if !req.stop.is_empty() {
+        body["stop"] = json!(req.stop);
+    }
+    if let Some(l) = req.logprobs {
+        body["logprobs"] = json!(l);
+    }
+    if let Some(n) = req.top_logprobs {
+        body["top_logprobs"] = json!(n);
+    }
+    // P1/WP-3: `reasoning_effort` is the OpenAI **chat/completions** spelling
+    // (top-level scalar), which is what this compat surface speaks — unlike the
+    // Responses API's nested `reasoning: {effort}` in `openai.rs`. Presets that
+    // don't understand it ignore an unknown top-level key; `None` ⇒ absent.
+    if let Some(effort) = req.reasoning_effort.as_deref() {
+        body["reasoning_effort"] = json!(effort);
     }
     if !req.tools.is_empty() {
         body["tools"] = Value::Array(
@@ -320,6 +410,63 @@ fn parse_usage(u: &Value) -> NormalizedUsage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Logprobs (O11 — the capability local inference had its own client for)
+// ---------------------------------------------------------------------------
+
+/// One generated token's logprob, plus the alternatives the server reported.
+///
+/// Deliberately a thin, provider-shaped record rather than a scored signal:
+/// the *interpretation* (mean logprob, UCCI top-2 margin) belongs to the
+/// caller that owns the calibration model, not to the transport.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprob {
+    /// Logprob of the token that was actually emitted.
+    pub logprob: f64,
+    /// Logprobs of the top-N candidates at this position, when the request
+    /// asked for them ([`ChatRequest::top_logprobs`]) and the server obliged.
+    pub top_logprobs: Option<Vec<f64>>,
+}
+
+/// A choice's token-level logprobs, as returned for one completion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChoiceLogprobs {
+    pub tokens: Vec<TokenLogprob>,
+    /// The choice's `finish_reason` verbatim — UCCI needs to know whether the
+    /// last token was a reported stop token so it can exclude it.
+    pub finish_reason: Option<String>,
+}
+
+/// Extract `choices[0].logprobs` from a chat/completions body.
+///
+/// `None` when the server returned no logprobs (or an empty token list) —
+/// the fail-safe path, identical to a server without logprob support.
+pub fn parse_logprobs(body: &Value) -> Option<ChoiceLogprobs> {
+    let choice = body.pointer("/choices/0")?;
+    let content = choice.pointer("/logprobs/content")?.as_array()?;
+    if content.is_empty() {
+        return None;
+    }
+    let tokens = content
+        .iter()
+        .map(|t| TokenLogprob {
+            logprob: t.get("logprob").and_then(Value::as_f64).unwrap_or(0.0),
+            top_logprobs: t.get("top_logprobs").and_then(Value::as_array).map(|a| {
+                a.iter()
+                    .map(|c| c.get("logprob").and_then(Value::as_f64).unwrap_or(0.0))
+                    .collect()
+            }),
+        })
+        .collect();
+    Some(ChoiceLogprobs {
+        tokens,
+        finish_reason: choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
 pub(crate) fn parse_response(body: &Value, provider_id: &str) -> Result<ChatResponse, LlmError> {
     let choice = body
         .pointer("/choices/0")
@@ -336,18 +483,36 @@ pub(crate) fn parse_response(body: &Value, provider_id: &str) -> Result<ChatResp
         .and_then(Value::as_str)
         .unwrap_or_default();
     if !reasoning.is_empty() {
-        parts.push(ContentPart::Reasoning { text: reasoning.to_string(), signature: None });
+        parts.push(ContentPart::Reasoning {
+            text: reasoning.to_string(),
+            signature: None,
+        });
     }
     if let Some(text) = message.get("content").and_then(Value::as_str) {
         if !text.is_empty() {
             parts.push(ContentPart::Text(text.to_string()));
         }
     }
-    for tc in message.get("tool_calls").and_then(Value::as_array).unwrap_or(&Vec::new()) {
-        let raw_args = tc.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}");
+    for tc in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+    {
+        let raw_args = tc
+            .pointer("/function/arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
         parts.push(ContentPart::ToolCall {
-            id: tc.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
-            name: tc.pointer("/function/name").and_then(Value::as_str).unwrap_or_default().to_string(),
+            id: tc
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            name: tc
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             args: parse_string_args(raw_args),
         });
     }
@@ -356,7 +521,11 @@ pub(crate) fn parse_response(body: &Value, provider_id: &str) -> Result<ChatResp
         parts,
         stop: parse_finish_reason(choice.get("finish_reason").and_then(Value::as_str)),
         usage: body.get("usage").map(parse_usage).unwrap_or_default(),
-        model_used: body.get("model").and_then(Value::as_str).unwrap_or_default().to_string(),
+        model_used: body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         provider: provider_id.to_string(),
     })
 }
@@ -402,11 +571,15 @@ impl CompatSse {
         if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
             self.usage = parse_usage(u);
         }
-        let Some(choice) = chunk.pointer("/choices/0") else { return };
+        let Some(choice) = chunk.pointer("/choices/0") else {
+            return;
+        };
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish = Some(parse_finish_reason(Some(fr)));
         }
-        let Some(delta) = choice.get("delta") else { return };
+        let Some(delta) = choice.get("delta") else {
+            return;
+        };
 
         if let Some(t) = delta.get("content").and_then(Value::as_str) {
             if !t.is_empty() {
@@ -423,10 +596,15 @@ impl CompatSse {
             self.reasoning.push_str(r);
             out.push(StreamEvent::ReasoningDelta(r.to_string()));
         }
-        for tc in delta.get("tool_calls").and_then(Value::as_array).unwrap_or(&Vec::new()) {
+        for tc in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .unwrap_or(&Vec::new())
+        {
             let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             while self.tool_calls.len() <= index {
-                self.tool_calls.push((String::new(), String::new(), String::new()));
+                self.tool_calls
+                    .push((String::new(), String::new(), String::new()));
             }
             if let Some(id) = tc.get("id").and_then(Value::as_str) {
                 self.tool_calls[index].0 = id.to_string();
@@ -445,7 +623,10 @@ impl CompatSse {
             if let Some(frag) = tc.pointer("/function/arguments").and_then(Value::as_str) {
                 if !frag.is_empty() {
                     self.tool_calls[index].2.push_str(frag);
-                    out.push(StreamEvent::ToolCallDelta { index, args_fragment: frag.to_string() });
+                    out.push(StreamEvent::ToolCallDelta {
+                        index,
+                        args_fragment: frag.to_string(),
+                    });
                 }
             }
         }
@@ -483,7 +664,11 @@ impl SseParser for CompatSse {
             if name.is_empty() && raw_args.is_empty() {
                 continue;
             }
-            parts.push(ContentPart::ToolCall { id, name, args: parse_string_args(&raw_args) });
+            parts.push(ContentPart::ToolCall {
+                id,
+                name,
+                args: parse_string_args(&raw_args),
+            });
         }
         Ok(StreamEvent::Done(ChatResponse {
             parts,
@@ -501,8 +686,11 @@ impl SseParser for CompatSse {
 
 impl OpenAiCompatProvider {
     async fn send(&self, req: &ChatRequest, stream: bool) -> Result<reqwest::Response, LlmError> {
-        let body = build_request_body(req, stream);
-        let mut http = http_client()
+        let body = build_request_body_with(req, stream, self.verbatim_model_id);
+        let mut http = self
+            .client
+            .as_ref()
+            .unwrap_or_else(|| http_client())
             .post(self.chat_url())
             .header("content-type", "application/json");
         if !self.auth.api_key.is_empty() {
@@ -511,7 +699,11 @@ impl OpenAiCompatProvider {
         for (name, value) in &self.extra_headers {
             http = http.header(name, value);
         }
-        let response = http.json(&body).send().await.map_err(|e| classify_transport(&e))?;
+        let response = http
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| classify_transport(&e))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -520,6 +712,31 @@ impl OpenAiCompatProvider {
             return Err(classify_http(status.as_u16(), &text, retry_after));
         }
         Ok(response)
+    }
+
+    /// One-shot completion that **also** hands back the choice's token
+    /// logprobs, when the request asked for them and the server obliged.
+    ///
+    /// O11: this is the seam the local-inference backend needed and used to
+    /// justify a second reqwest client. The logprobs ride alongside
+    /// [`ChatResponse`] rather than inside it so the 40-odd existing
+    /// `ChatResponse` construction sites stay untouched — and so the
+    /// normalized response keeps meaning "what the model said", not "what the
+    /// sampler thought".
+    ///
+    /// Returns `(response, None)` for every server that returns no logprobs —
+    /// never an error. `complete()` is exactly this with the second element
+    /// dropped.
+    pub async fn complete_with_logprobs(
+        &self,
+        req: &ChatRequest,
+    ) -> Result<(ChatResponse, Option<ChoiceLogprobs>), LlmError> {
+        let response = self.send(req, false).await?;
+        let text = response.text().await.map_err(|e| classify_transport(&e))?;
+        let body: Value =
+            serde_json::from_str(&text).map_err(|e| LlmError::Parse(snippet(&e.to_string())))?;
+        let logprobs = parse_logprobs(&body);
+        Ok((parse_response(&body, &self.id)?, logprobs))
     }
 }
 
@@ -530,11 +747,7 @@ impl ChatProvider for OpenAiCompatProvider {
     }
 
     async fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        let response = self.send(req, false).await?;
-        let text = response.text().await.map_err(|e| classify_transport(&e))?;
-        let body: Value =
-            serde_json::from_str(&text).map_err(|e| LlmError::Parse(snippet(&e.to_string())))?;
-        parse_response(&body, &self.id)
+        self.complete_with_logprobs(req).await.map(|(r, _)| r)
     }
 
     /// Real SSE streaming (delta chunks).
@@ -560,14 +773,30 @@ mod tests {
     fn presets_ported_from_gateway_table() {
         // Names + env vars must stay aligned with the gateway runtime table.
         for (name, env, base) in [
-            ("deepseek", "DEEPSEEK_API_KEY", "https://api.deepseek.com/v1"),
+            (
+                "deepseek",
+                "DEEPSEEK_API_KEY",
+                "https://api.deepseek.com/v1",
+            ),
             ("minimax", "MINIMAX_API_KEY", "https://api.minimax.io/v1"),
             ("groq", "GROQ_API_KEY", "https://api.groq.com/openai/v1"),
-            ("together", "TOGETHER_API_KEY", "https://api.together.xyz/v1"),
+            (
+                "together",
+                "TOGETHER_API_KEY",
+                "https://api.together.xyz/v1",
+            ),
             ("mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1"),
-            ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1"),
+            (
+                "openrouter",
+                "OPENROUTER_API_KEY",
+                "https://openrouter.ai/api/v1",
+            ),
             ("xai", "XAI_API_KEY", "https://api.x.ai/v1"),
-            ("qwen", "DASHSCOPE_API_KEY", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            (
+                "qwen",
+                "DASHSCOPE_API_KEY",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
         ] {
             let p = preset(name).unwrap_or_else(|| panic!("missing preset {name}"));
             assert_eq!(p.env_key, env);
@@ -590,6 +819,20 @@ mod tests {
     }
 
     #[test]
+    fn build_reasoning_effort_is_a_top_level_key_and_absent_when_none() {
+        let plain = build_request_body(&ChatRequest::new("deepseek/deepseek-v3.2"), false);
+        assert!(plain.get("reasoning_effort").is_none(), "{plain}");
+
+        let mut req = ChatRequest::new("deepseek/deepseek-v3.2");
+        req.reasoning_effort = Some("medium".to_string());
+        let body = build_request_body(&req, false);
+        // chat/completions spelling: top-level scalar, NOT the Responses
+        // API's nested `reasoning: {effort}`.
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert!(body.get("reasoning").is_none(), "{body}");
+    }
+
+    #[test]
     fn build_system_message_and_plain_text_user() {
         let mut req = ChatRequest::new("deepseek/deepseek-v3.2");
         req.system = vec![SystemBlock::cached("rules"), SystemBlock::uncached("queue")];
@@ -598,7 +841,10 @@ mod tests {
         assert_eq!(body["model"], "deepseek-v3.2");
         assert_eq!(body["stream"], false);
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages[0], json!({"role": "system", "content": "rules\n\nqueue"}));
+        assert_eq!(
+            messages[0],
+            json!({"role": "system", "content": "rules\n\nqueue"})
+        );
         // Plain string content for text-only (max compatibility).
         assert_eq!(messages[1], json!({"role": "user", "content": "hi"}));
     }
@@ -627,7 +873,10 @@ mod tests {
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["content"], Value::Null);
-        assert_eq!(messages[1]["tool_calls"][0]["function"]["arguments"], r#"{"expr":"1+1"}"#);
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["arguments"],
+            r#"{"expr":"1+1"}"#
+        );
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["tool_call_id"], "call_1");
     }
@@ -645,7 +894,10 @@ mod tests {
             role: Role::User,
             parts: vec![
                 ContentPart::Text("look".into()),
-                ContentPart::Image { media_type: "image/png".into(), data_base64: "aGk=".into() },
+                ContentPart::Image {
+                    media_type: "image/png".into(),
+                    data_base64: "aGk=".into(),
+                },
             ],
         });
         let body = build_request_body(&req, true);
@@ -719,7 +971,9 @@ mod tests {
             "choices": [{"message": {"content": "4", "reasoning": "thinking..."}, "finish_reason": "stop"}]
         });
         let resp = parse_response(&body, "qwen").expect("parse");
-        assert!(matches!(&resp.parts[0], ContentPart::Reasoning { text, .. } if text == "thinking..."));
+        assert!(
+            matches!(&resp.parts[0], ContentPart::Reasoning { text, .. } if text == "thinking...")
+        );
     }
 
     #[test]
@@ -743,7 +997,10 @@ mod tests {
             let body = json!({"choices": [{"message": {"content": "x"}, "finish_reason": raw}]});
             assert_eq!(parse_response(&body, "p").unwrap().stop, expected);
         }
-        assert!(matches!(parse_response(&json!({"choices": []}), "p"), Err(LlmError::Parse(_))));
+        assert!(matches!(
+            parse_response(&json!({"choices": []}), "p"),
+            Err(LlmError::Parse(_))
+        ));
     }
 
     #[test]
@@ -762,7 +1019,9 @@ mod tests {
         assert!(p.finished());
         assert_eq!(out[0], StreamEvent::ReasoningDelta("think".into()));
         assert_eq!(out[1], StreamEvent::TextDelta("Hel".into()));
-        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else {
+            panic!()
+        };
         assert_eq!(resp.text(), "Hello");
         assert_eq!(resp.stop, StopReason::EndTurn);
         assert_eq!(resp.usage.input_tokens, 9);
@@ -784,10 +1043,92 @@ mod tests {
         ] {
             p.on_line(line, &mut out);
         }
-        assert!(matches!(&out[0], StreamEvent::ToolCallStart { id, name, index: 0 } if id == "call_3" && name == "calc"));
-        assert!(matches!(&out[1], StreamEvent::ToolCallDelta { args_fragment, .. } if args_fragment == "{\"a\":"));
-        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
+        assert!(
+            matches!(&out[0], StreamEvent::ToolCallStart { id, name, index: 0 } if id == "call_3" && name == "calc")
+        );
+        assert!(
+            matches!(&out[1], StreamEvent::ToolCallDelta { args_fragment, .. } if args_fragment == "{\"a\":")
+        );
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else {
+            panic!()
+        };
         assert_eq!(resp.stop, StopReason::ToolUse);
         assert_eq!(resp.tool_calls()[0].2, &json!({"a": 2}));
+    }
+
+    // ── O11: sampling / stop / logprob knobs + verbatim model id ─────────
+
+    /// A request that sets none of the O11 fields must serialize to the exact
+    /// same body as before they existed — the guard that absorbing the
+    /// local-inference client changed nothing for hosted compat providers.
+    #[test]
+    fn o11_fields_absent_when_unset() {
+        let req = ChatRequest::new("deepseek/deepseek-v3.2");
+        let body = build_request_body(&req, false);
+        for key in ["top_p", "stop", "logprobs", "top_logprobs"] {
+            assert!(
+                body.get(key).is_none(),
+                "{key} must be absent from a request that did not ask for it: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn o11_top_p_stop_and_logprobs_map_to_openai_keys() {
+        let mut req = ChatRequest::new("local-model");
+        req.top_p = Some(0.9);
+        req.stop = vec!["</s>".into(), "\n\n".into()];
+        req.logprobs = Some(true);
+        req.top_logprobs = Some(2);
+        let body = build_request_body(&req, false);
+        // `Value` widens f32→f64, so compare at f32 precision (the same
+        // widening `temperature` has always had on this surface).
+        assert_eq!(body["top_p"].as_f64().map(|v| v as f32), Some(0.9_f32));
+        assert_eq!(body["stop"], json!(["</s>", "\n\n"]));
+        assert_eq!(body["logprobs"], json!(true));
+        assert_eq!(body["top_logprobs"], json!(2));
+    }
+
+    /// A HuggingFace-style local model id contains a slash that is part of the
+    /// name, not a provider qualifier. Stripping it would name a model the
+    /// local server does not serve.
+    #[test]
+    fn o11_verbatim_model_id_keeps_the_slash() {
+        let req = ChatRequest::new("qwen/qwen3-4b");
+        assert_eq!(build_request_body(&req, false)["model"], json!("qwen3-4b"));
+        assert_eq!(
+            build_request_body_with(&req, false, true)["model"],
+            json!("qwen/qwen3-4b")
+        );
+    }
+
+    #[test]
+    fn o11_parse_logprobs_extracts_tokens_and_candidates() {
+        let body: Value = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ab"},"finish_reason":"stop",
+                "logprobs":{"content":[
+                    {"logprob":-0.1,"top_logprobs":[{"logprob":-0.1},{"logprob":-2.3}]},
+                    {"logprob":-0.7,"top_logprobs":[{"logprob":-0.7},{"logprob":-1.4}]}
+                ]}}]}"#,
+        )
+        .unwrap();
+        let lp = parse_logprobs(&body).expect("logprobs present");
+        assert_eq!(lp.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(lp.tokens.len(), 2);
+        assert_eq!(lp.tokens[0].logprob, -0.1);
+        assert_eq!(lp.tokens[1].top_logprobs.as_deref(), Some(&[-0.7, -1.4][..]));
+    }
+
+    /// A server that ignores `logprobs`, and one that returns an empty list,
+    /// must both read as "no signal" — never an error, never a fabricated 0.
+    #[test]
+    fn o11_parse_logprobs_is_none_when_absent_or_empty() {
+        let absent: Value =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":"hi"}}]}"#).unwrap();
+        assert!(parse_logprobs(&absent).is_none());
+        let empty: Value =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":""},"logprobs":{"content":[]}}]}"#)
+                .unwrap();
+        assert!(parse_logprobs(&empty).is_none());
     }
 }

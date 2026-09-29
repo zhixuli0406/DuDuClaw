@@ -205,7 +205,12 @@ pub fn yes_no_to_bool(s: &str) -> Option<bool> {
 
 async fn read_timedatectl() -> Option<String> {
     let output = tokio::process::Command::new("timedatectl")
-        .args(["show", "--property=Timezone", "--property=NTP", "--property=NTPSynchronized"])
+        .args([
+            "show",
+            "--property=Timezone",
+            "--property=NTP",
+            "--property=NTPSynchronized",
+        ])
         .output()
         .await
         .ok()?;
@@ -284,10 +289,16 @@ mod tests {
                      \n\
                      HOME_URL='https://duduclaw.example'\n";
         let map = parse_os_release(text);
-        assert_eq!(map.get("PRETTY_NAME").map(String::as_str), Some("DuDuClaw OS 0.1.0"));
+        assert_eq!(
+            map.get("PRETTY_NAME").map(String::as_str),
+            Some("DuDuClaw OS 0.1.0")
+        );
         assert_eq!(map.get("VERSION_ID").map(String::as_str), Some("0.1.0"));
         assert_eq!(map.get("ID").map(String::as_str), Some("duduclaw"));
-        assert_eq!(map.get("HOME_URL").map(String::as_str), Some("https://duduclaw.example"));
+        assert_eq!(
+            map.get("HOME_URL").map(String::as_str),
+            Some("https://duduclaw.example")
+        );
         assert!(!map.contains_key("a comment"));
     }
 
@@ -318,13 +329,19 @@ mod tests {
     fn derive_device_id_is_deterministic_and_16_lowercase_hex_chars() {
         let id = derive_device_id("abcd1234abcd1234abcd1234abcd1234");
         assert_eq!(id.len(), 16);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         assert_eq!(id, derive_device_id("abcd1234abcd1234abcd1234abcd1234"));
     }
 
     #[test]
     fn derive_device_id_differs_for_different_input() {
-        assert_ne!(derive_device_id("machine-id-a"), derive_device_id("machine-id-b"));
+        assert_ne!(
+            derive_device_id("machine-id-a"),
+            derive_device_id("machine-id-b")
+        );
     }
 
     #[test]

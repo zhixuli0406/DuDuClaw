@@ -247,7 +247,10 @@ pub fn plan_condition_command(payload: &str) -> (String, Vec<String>) {
     if !trimmed.is_empty() && Path::new(trimmed).is_file() {
         (trimmed.to_string(), Vec::new())
     } else {
-        ("bash".to_string(), vec!["-c".to_string(), payload.to_string()])
+        (
+            "bash".to_string(),
+            vec!["-c".to_string(), payload.to_string()],
+        )
     }
 }
 
@@ -266,7 +269,7 @@ async fn run_sandboxed(
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
     use duduclaw_core::types::SandboxLevel;
-    use duduclaw_sandbox::{platform_sandbox, Confinement, SandboxSpec};
+    use duduclaw_sandbox::{Confinement, SandboxSpec, platform_sandbox};
 
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
@@ -420,7 +423,11 @@ mod tests {
 
     #[test]
     fn trigger_kind_as_db_roundtrips() {
-        for kind in [TriggerKind::Time, TriggerKind::Condition, TriggerKind::OnExit] {
+        for kind in [
+            TriggerKind::Time,
+            TriggerKind::Condition,
+            TriggerKind::OnExit,
+        ] {
             assert_eq!(TriggerKind::from_db(kind.as_db()), kind);
             assert_eq!(TriggerKind::parse_strict(kind.as_db()), Some(kind));
         }
@@ -455,7 +462,8 @@ mod tests {
 
     #[test]
     fn parse_logs_then_json_on_last_line() {
-        let stdout = "checking upstream...\nfound 2 new items\n{\"fire\": true, \"message\": \"go\"}";
+        let stdout =
+            "checking upstream...\nfound 2 new items\n{\"fire\": true, \"message\": \"go\"}";
         let out = parse_condition_output(stdout).unwrap();
         assert!(out.fire);
         assert_eq!(out.message.as_deref(), Some("go"));
@@ -489,7 +497,8 @@ mod tests {
     #[test]
     fn parse_state_at_limit_is_accepted() {
         // A modestly sized state well under the cap round-trips.
-        let payload = r#"{"fire": true, "state": {"cursor": "2026-07-11T00:00:00Z", "seen": [1,2,3]}}"#;
+        let payload =
+            r#"{"fire": true, "state": {"cursor": "2026-07-11T00:00:00Z", "seen": [1,2,3]}}"#;
         let out = parse_condition_output(payload).unwrap();
         assert!(out.state.is_some());
         assert!(out.state.as_ref().unwrap().len() <= MAX_STATE_BYTES);
@@ -543,7 +552,10 @@ mod tests {
     fn plan_inline_uses_bash_dash_c() {
         let (prog, args) = plan_condition_command("echo '{\"fire\":true}'");
         assert_eq!(prog, "bash");
-        assert_eq!(args, vec!["-c".to_string(), "echo '{\"fire\":true}'".to_string()]);
+        assert_eq!(
+            args,
+            vec!["-c".to_string(), "echo '{\"fire\":true}'".to_string()]
+        );
     }
 
     #[test]

@@ -13,9 +13,16 @@ use super::diagnostician::SkillGap;
 ///
 /// This signal is consumed by the Meso reflection's external factors
 /// collector, feeding into the evolution engine's candidate_skills generation.
+///
+/// The discriminator key is `type` — the canonical `feedback.jsonl` field that
+/// [`crate::external_factors::submit_feedback`] writes and
+/// [`crate::external_factors`]'s collector reads. Until 2026-09 this module
+/// wrote `signal_type` instead, so every row it produced surfaced as
+/// `unknown` on the consuming side (H2). Readers still accept the legacy
+/// `signal_type` spelling for rows written before that fix.
 pub fn inject_skill_gap(gap: &SkillGap, home_dir: &Path, agent_id: &str) {
     let signal = serde_json::json!({
-        "signal_type": "skill_gap",
+        "type": "skill_gap",
         "agent_id": agent_id,
         "detail": format!(
             "Skill gap detected: '{}' — {}. Evidence: {}",

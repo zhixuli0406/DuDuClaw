@@ -36,7 +36,9 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use tracing::{debug, info, warn};
 
-use super::quality_scorer::{parse_events_from_dir, score_and_filter, ScoredTrajectory, ScorerConfig};
+use super::quality_scorer::{
+    ScoredTrajectory, ScorerConfig, parse_events_from_dir, score_and_filter,
+};
 use crate::evolution_events::schema::{AuditEvent, AuditEventType, Outcome};
 
 // ── Config ─────────────────────────────────────────────────────────────────────
@@ -62,7 +64,6 @@ pub struct PipelineConfig {
     pub dry_run: bool,
 
     // ── Phase 2 fields (required when dry_run = false) ────────────────────────
-
     /// Anthropic API key for Haiku 4.5 skill synthesis calls.
     ///
     /// Required when `dry_run = false`. When `None` in full mode, the pipeline
@@ -232,8 +233,7 @@ pub async fn run(config: &PipelineConfig) -> PipelineRun {
 
     // score_and_filter returns (top_slice, total_count) in one pass —
     // avoids a redundant second call to group_into_trajectories.
-    let (top_trajectories, total_trajectories) =
-        score_and_filter(&events, &config.scorer_config);
+    let (top_trajectories, total_trajectories) = score_and_filter(&events, &config.scorer_config);
 
     info!(
         total = total_trajectories,
@@ -262,8 +262,7 @@ pub async fn run(config: &PipelineConfig) -> PipelineRun {
         );
         0
     } else {
-        let (graduated, grad_errors) =
-            graduate_trajectories(&top_trajectories, config).await;
+        let (graduated, grad_errors) = graduate_trajectories(&top_trajectories, config).await;
         errors.extend(grad_errors);
         graduated
     };
@@ -312,7 +311,10 @@ async fn graduate_trajectories(
         Some(k) if !k.is_empty() => k.clone(),
         _ => {
             warn!("No API key configured — skipping Phase 2 graduation");
-            return (0, vec!["Phase 2 skipped: api_key not configured".to_string()]);
+            return (
+                0,
+                vec!["Phase 2 skipped: api_key not configured".to_string()],
+            );
         }
     };
 
@@ -437,10 +439,7 @@ async fn graduate_trajectories(
         // utility model. Claude keeps the Direct API path (cache_control on the
         // system prompt); any other provider routes through the registry
         // choke-point. Falls back to global config / Claude when unconfigured.
-        let agent_dir = config
-            .home_dir
-            .join("agents")
-            .join(&config.target_agent_id);
+        let agent_dir = config.home_dir.join("agents").join(&config.target_agent_id);
         let spec = crate::runtime_config::resolve_utility(&config.home_dir, Some(&agent_dir));
         let llm_result: Result<String, String> =
             if spec.provider == duduclaw_core::types::RuntimeType::Claude {
@@ -662,7 +661,10 @@ async fn fetch_episodic_evidence(
     let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
         Ok(e) => e,
         Err(e) => {
-            debug!(agent = agent_id, "episodic evidence: open memory.db failed: {e}");
+            debug!(
+                agent = agent_id,
+                "episodic evidence: open memory.db failed: {e}"
+            );
             return Vec::new();
         }
     };
@@ -829,7 +831,10 @@ mod tests {
         assert_eq!(run_result.total_events_parsed, 3);
         assert!(run_result.total_trajectories >= 1);
         assert!(!run_result.top_trajectories.is_empty());
-        assert_eq!(run_result.skills_graduated, 0, "Dry run must not graduate skills");
+        assert_eq!(
+            run_result.skills_graduated, 0,
+            "Dry run must not graduate skills"
+        );
         assert!(run_result.errors.is_empty());
     }
 
@@ -844,7 +849,10 @@ mod tests {
         };
 
         let run_result = run(&config).await;
-        assert!(!run_result.errors.is_empty(), "Invalid config must produce errors");
+        assert!(
+            !run_result.errors.is_empty(),
+            "Invalid config must produce errors"
+        );
         assert_eq!(run_result.total_events_parsed, 0);
     }
 
@@ -856,7 +864,10 @@ mod tests {
         assert_eq!(ev.event_type, AuditEventType::SkillGraduate);
         assert_eq!(ev.agent_id, "agent-001");
         assert_eq!(ev.skill_id.as_deref(), Some("python-patterns"));
-        assert_eq!(ev.trigger_signal.as_deref(), Some("rollout_to_skill_pipeline"));
+        assert_eq!(
+            ev.trigger_signal.as_deref(),
+            Some("rollout_to_skill_pipeline")
+        );
         assert_eq!(ev.outcome, Outcome::Success);
         assert!((ev.metadata["quality_score"].as_f64().unwrap() - 0.82).abs() < 1e-9);
         assert_eq!(ev.metadata["source_trajectories"].as_u64().unwrap(), 3);
@@ -878,7 +889,10 @@ mod tests {
             errors: Vec::new(),
         };
         let summary = run_result.summary();
-        assert!(summary.contains("DRY RUN"), "Summary must indicate dry run mode");
+        assert!(
+            summary.contains("DRY RUN"),
+            "Summary must indicate dry run mode"
+        );
         assert!(summary.contains("100"), "Summary must include event count");
     }
 
@@ -895,8 +909,14 @@ mod tests {
             errors: Vec::new(),
         };
         let summary = run_result.summary();
-        assert!(!summary.contains("DRY RUN"), "Non-dry-run must not show DRY RUN");
-        assert!(summary.contains("2 skills graduated"), "Must show graduated count");
+        assert!(
+            !summary.contains("DRY RUN"),
+            "Non-dry-run must not show DRY RUN"
+        );
+        assert!(
+            summary.contains("2 skills graduated"),
+            "Must show graduated count"
+        );
     }
 
     // ── fetch_episodic_evidence (P1) ──────────────────────────────────────────
@@ -907,7 +927,10 @@ mod tests {
         // A traversal-laden agent_id must short-circuit to empty without touching
         // the filesystem outside the home dir.
         let out = fetch_episodic_evidence(dir.path(), "../../etc", &[], 5).await;
-        assert!(out.is_empty(), "path-traversal agent_id must yield no evidence");
+        assert!(
+            out.is_empty(),
+            "path-traversal agent_id must yield no evidence"
+        );
     }
 
     #[tokio::test]
@@ -952,7 +975,11 @@ mod tests {
 
         // No skill_ids → fallback list_recent path → returns the episodic summary.
         let out = fetch_episodic_evidence(dir.path(), agent, &[], 5).await;
-        assert_eq!(out.len(), 1, "expected the seeded episodic summary; got {out:?}");
+        assert_eq!(
+            out.len(),
+            1,
+            "expected the seeded episodic summary; got {out:?}"
+        );
         assert!(out[0].contains("30-day policy"));
     }
 }

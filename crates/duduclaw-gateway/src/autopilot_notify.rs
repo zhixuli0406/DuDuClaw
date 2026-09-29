@@ -53,8 +53,8 @@ use tracing::info;
 use crate::autopilot_store::{AutopilotHistoryRow, AutopilotRuleRow, AutopilotStore};
 use crate::decision_action::{DecisionAct, DecisionSource};
 use crate::decision_notify::{
-    authorize_press, destination_matches_any, identity_system_active, mapped_role, refusal_text,
-    DecisionCard, PressAuth,
+    DecisionCard, PressAuth, authorize_press, destination_matches_any, identity_system_active,
+    mapped_role, refusal_text,
 };
 use crate::task_store::{ActivityRow, TaskStore};
 
@@ -109,8 +109,11 @@ fn find_agent_condition(v: &serde_json::Value, field: &str) -> Option<String> {
                     return Some(s.clone());
                 }
                 serde_json::Value::Array(arr) => {
-                    if let Some(first) =
-                        arr.iter().find_map(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty())
+                    if let Some(first) = arr
+                        .iter()
+                        .find_map(|x| x.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
                     {
                         return Some(first.to_string());
                     }
@@ -179,7 +182,11 @@ pub async fn notify_circuit_open(
         return;
     };
     let body = circuit_open_body(&rule.name, max_fires, cooldown_secs);
-    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Autopilot, &rule.id);
+    let link = crate::deep_link::deep_link(
+        home_dir,
+        crate::deep_link::DeepLinkKind::Autopilot,
+        &rule.id,
+    );
     const CIRCUIT_OPEN_NO_BUTTON_HINT: &str = "如需暫停此規則，請至儀表板的自動規則頁操作。";
     // W3-1 (D5): an "a rule tripped" card is a needs-to-know, not a
     // needs-to-know-*now* — deferred to the handback (buttons intact) rather
@@ -203,13 +210,6 @@ pub async fn notify_circuit_open(
     {
         return;
     }
-    let Some(token) = crate::goal_notify::channel_token(home_dir, &agent_id, &channel).await
-    else {
-        info!(rule = %rule.name, %channel, "autopilot-notify: no bot token — skipping circuit-open push");
-        return;
-    };
-
-    let http = reqwest::Client::new();
     let card = DecisionCard {
         source: DecisionSource::Autopilot,
         decision_id: &rule.id,
@@ -217,7 +217,15 @@ pub async fn notify_circuit_open(
         link: link.as_deref(),
         no_button_hint: CIRCUIT_OPEN_NO_BUTTON_HINT,
     };
-    crate::decision_notify::deliver(home_dir, &http, &channel, &token, &chat_id, &card).await;
+    // O5: shared push. `attempted == 0` is the "no bot token" case this
+    // function used to log itself — `notify_push` logs it with the same
+    // skip-and-return-quietly semantics.
+    crate::notify_push::push(
+        home_dir,
+        &card,
+        &crate::notify_push::NotifyDest::agent(&agent_id, channel, chat_id),
+    )
+    .await;
 }
 
 // ── Inbound ─────────────────────────────────────────────────────
@@ -265,7 +273,8 @@ pub(crate) async fn apply_pause(
     channel_user_id: &str,
     rule_id: &str,
 ) -> Result<String, String> {
-    let store = AutopilotStore::open(home_dir).map_err(|e| format!("開啟自動化規則資料庫失敗：{e}"))?;
+    let store =
+        AutopilotStore::open(home_dir).map_err(|e| format!("開啟自動化規則資料庫失敗：{e}"))?;
     let Some(rule) = store.get_rule(rule_id).await.map_err(|e| e.to_string())? else {
         return Err("找不到此規則（可能已被刪除）".into());
     };
@@ -281,14 +290,20 @@ pub(crate) async fn apply_pause(
     let auth = authorize_press(
         mapped_role(home_dir, channel, channel_user_id),
         identity_system_active(home_dir),
-        destination_matches_any(&delivered_targets(home_dir, &rule), channel, channel_user_id),
+        destination_matches_any(
+            &delivered_targets(home_dir, &rule),
+            channel,
+            channel_user_id,
+        ),
     );
     if auth != PressAuth::Allow {
         return Err(refusal_text(auth, "暫停規則"));
     }
 
     // ── apply ────────────────────────────────────────────────
-    store.update_rule(rule_id, &json!({ "enabled": false })).await?;
+    store
+        .update_rule(rule_id, &json!({ "enabled": false }))
+        .await?;
 
     let _ = store
         .append_history(&AutopilotHistoryRow {
@@ -318,7 +333,12 @@ pub(crate) async fn apply_pause(
     // Best-effort, detached card collapse — an edit is cosmetic and must not
     // delay or fail a decision that is already durable in `autopilot.db` by
     // this point (mirrors `goal_notify::spawn_goal_task_collapse`'s rationale).
-    spawn_pause_collapse(home_dir.to_path_buf(), rule.clone(), channel.to_string(), channel_user_id.to_string());
+    spawn_pause_collapse(
+        home_dir.to_path_buf(),
+        rule.clone(),
+        channel.to_string(),
+        channel_user_id.to_string(),
+    );
 
     Ok(format!("已暫停規則「{}」。", rule.name))
 }
@@ -333,10 +353,16 @@ fn spawn_pause_collapse(
     channel_user_id: String,
 ) {
     tokio::spawn(async move {
-        let Some(agent_id) = resolve_rule_target_agent(&rule) else { return };
+        let Some(agent_id) = resolve_rule_target_agent(&rule) else {
+            return;
+        };
         let http = reqwest::Client::new();
-        let decider = crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
-        let summary = format!("⚠️ 自動規則：{}", duduclaw_core::truncate_chars(&rule.name, 60));
+        let decider =
+            crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
+        let summary = format!(
+            "⚠️ 自動規則：{}",
+            duduclaw_core::truncate_chars(&rule.name, 60)
+        );
         let home = home_dir.clone();
         crate::decision_card::collapse_all(
             &home_dir,
@@ -404,7 +430,10 @@ mod tests {
 
     #[test]
     fn resolves_target_agent_from_delegate_action() {
-        let r = rule(json!({"type": "delegate", "target_agent": "bruno", "prompt": "p"}), json!(null));
+        let r = rule(
+            json!({"type": "delegate", "target_agent": "bruno", "prompt": "p"}),
+            json!(null),
+        );
         assert_eq!(resolve_rule_target_agent(&r), Some("bruno".to_string()));
     }
 
@@ -459,7 +488,10 @@ mod tests {
                 {"field": "task.assigned_to", "op": "in", "value": ["carol", "dave"]}
             ]}),
         );
-        assert_eq!(resolve_rule_target_agent(&nested), Some("carol".to_string()));
+        assert_eq!(
+            resolve_rule_target_agent(&nested),
+            Some("carol".to_string())
+        );
     }
 
     #[test]
@@ -486,13 +518,19 @@ mod tests {
 
     #[test]
     fn no_target_agent_when_nothing_resolves() {
-        let r = rule(json!({"type": "notify"}), json!({"field": "priority", "op": "eq", "value": "high"}));
+        let r = rule(
+            json!({"type": "notify"}),
+            json!({"field": "priority", "op": "eq", "value": "high"}),
+        );
         assert_eq!(resolve_rule_target_agent(&r), None);
     }
 
     #[test]
     fn blank_target_agent_is_treated_as_absent() {
-        let r = rule(json!({"type": "delegate", "target_agent": "   "}), json!(null));
+        let r = rule(
+            json!({"type": "delegate", "target_agent": "   "}),
+            json!(null),
+        );
         assert_eq!(resolve_rule_target_agent(&r), None);
     }
 
@@ -527,12 +565,26 @@ mod tests {
 
     #[test]
     fn pause_markup_covers_all_four_channels_and_has_none_otherwise() {
-        let expected = crate::decision_action::encode(DecisionSource::Autopilot, DecisionAct::Pause, "r1");
-        let markup = |ch: &str| crate::channel_format::decision_markup(ch, DecisionSource::Autopilot, "r1");
-        assert_eq!(markup("telegram").unwrap()["inline_keyboard"][0][0]["callback_data"], expected);
-        assert_eq!(markup("discord").unwrap()["components"][0]["custom_id"], expected);
-        assert_eq!(markup("slack").unwrap()["elements"][0]["action_id"], expected);
-        assert_eq!(markup("line").unwrap()["items"][0]["action"]["data"], expected);
+        let expected =
+            crate::decision_action::encode(DecisionSource::Autopilot, DecisionAct::Pause, "r1");
+        let markup =
+            |ch: &str| crate::channel_format::decision_markup(ch, DecisionSource::Autopilot, "r1");
+        assert_eq!(
+            markup("telegram").unwrap()["inline_keyboard"][0][0]["callback_data"],
+            expected
+        );
+        assert_eq!(
+            markup("discord").unwrap()["components"][0]["custom_id"],
+            expected
+        );
+        assert_eq!(
+            markup("slack").unwrap()["elements"][0]["action_id"],
+            expected
+        );
+        assert_eq!(
+            markup("line").unwrap()["items"][0]["action"]["data"],
+            expected
+        );
         assert!(markup("whatsapp").is_none());
     }
 
@@ -541,9 +593,16 @@ mod tests {
     #[tokio::test]
     async fn decide_from_channel_ignores_non_pause_actions() {
         let dir = tempfile::tempdir().unwrap();
-        for data in ["garbage", "duduclaw:approval_ok:a1", "duduclaw:goal_retry:t1", "duduclaw:autopilot_pause:"] {
+        for data in [
+            "garbage",
+            "duduclaw:approval_ok:a1",
+            "duduclaw:goal_retry:t1",
+            "duduclaw:autopilot_pause:",
+        ] {
             assert!(
-                decide_from_channel(dir.path(), "telegram", "u1", data).await.is_none(),
+                decide_from_channel(dir.path(), "telegram", "u1", data)
+                    .await
+                    .is_none(),
                 "should not claim {data}"
             );
         }
@@ -558,8 +617,10 @@ mod tests {
             name: "迴圈規則".into(),
             enabled: true,
             trigger_event: "task_created".into(),
-            conditions: json!({"all": [{"field": "agent_id", "op": "eq", "value": "bruno"}]}).to_string(),
-            action: json!({"type": "notify", "channel": "telegram", "chat_id": "1", "text": "hi"}).to_string(),
+            conditions: json!({"all": [{"field": "agent_id", "op": "eq", "value": "bruno"}]})
+                .to_string(),
+            action: json!({"type": "notify", "channel": "telegram", "chat_id": "1", "text": "hi"})
+                .to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
             last_triggered_at: None,
             trigger_count: 0,
@@ -570,13 +631,21 @@ mod tests {
 
         // No users.db, no agent [proactive] config at all ⇒ destination never
         // matches ⇒ solo-operator branch also refuses (no destination proof).
-        let out = decide_from_channel(dir.path(), "telegram", "555", &crate::decision_action::encode(DecisionSource::Autopilot, DecisionAct::Pause, "r-42"))
-            .await
-            .unwrap();
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "555",
+            &crate::decision_action::encode(DecisionSource::Autopilot, DecisionAct::Pause, "r-42"),
+        )
+        .await
+        .unwrap();
         assert!(out.is_err(), "no destination proof ⇒ must refuse: {out:?}");
 
         let after = store.get_rule("r-42").await.unwrap().unwrap();
-        assert!(after.enabled, "an unauthorized press must never disable the rule");
+        assert!(
+            after.enabled,
+            "an unauthorized press must never disable the rule"
+        );
     }
 
     #[tokio::test]
@@ -599,8 +668,10 @@ mod tests {
             name: "迴圈規則".into(),
             enabled: true,
             trigger_event: "task_created".into(),
-            conditions: json!({"all": [{"field": "agent_id", "op": "eq", "value": "bruno"}]}).to_string(),
-            action: json!({"type": "notify", "channel": "telegram", "chat_id": "1", "text": "hi"}).to_string(),
+            conditions: json!({"all": [{"field": "agent_id", "op": "eq", "value": "bruno"}]})
+                .to_string(),
+            action: json!({"type": "notify", "channel": "telegram", "chat_id": "1", "text": "hi"})
+                .to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
             last_triggered_at: None,
             trigger_count: 0,
@@ -620,7 +691,10 @@ mod tests {
         assert!(out.is_ok(), "expected pause to land: {out:?}");
 
         let after = store.get_rule("r-ok").await.unwrap().unwrap();
-        assert!(!after.enabled, "rule must be disabled after an authorized pause");
+        assert!(
+            !after.enabled,
+            "rule must be disabled after an authorized pause"
+        );
 
         let history = store.list_history(Some("r-ok"), 10).await.unwrap();
         assert!(
@@ -646,7 +720,8 @@ mod tests {
             name: "迴圈規則".into(),
             enabled: true,
             trigger_event: "task_created".into(),
-            conditions: json!({"all": [{"field": "agent_id", "op": "eq", "value": "bruno"}]}).to_string(),
+            conditions: json!({"all": [{"field": "agent_id", "op": "eq", "value": "bruno"}]})
+                .to_string(),
             action: json!({"type": "notify"}).to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
             last_triggered_at: None,
@@ -689,18 +764,28 @@ mod tests {
         };
         store.insert_rule(&row).await.unwrap();
 
-        let out = decide_from_channel(dir.path(), "telegram", "1", &crate::decision_action::encode(DecisionSource::Autopilot, DecisionAct::Pause, "r-7"))
-            .await
-            .unwrap();
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "1",
+            &crate::decision_action::encode(DecisionSource::Autopilot, DecisionAct::Pause, "r-7"),
+        )
+        .await
+        .unwrap();
         assert_eq!(out, Ok("規則「已暫停規則」已是暫停狀態。".to_string()));
     }
 
     #[tokio::test]
     async fn unknown_rule_id_is_reported_not_paused() {
         let dir = tempfile::tempdir().unwrap();
-        let out = decide_from_channel(dir.path(), "telegram", "1", "duduclaw:autopilot_pause:does-not-exist")
-            .await
-            .unwrap();
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "1",
+            "duduclaw:autopilot_pause:does-not-exist",
+        )
+        .await
+        .unwrap();
         assert!(out.is_err());
     }
 
@@ -711,7 +796,10 @@ mod tests {
 
     #[test]
     fn authorize_press_reused_from_approval_notify() {
-        assert_eq!(authorize_press(Some(UserRole::Admin), true, false), PressAuth::Allow);
+        assert_eq!(
+            authorize_press(Some(UserRole::Admin), true, false),
+            PressAuth::Allow
+        );
         assert_eq!(authorize_press(None, true, true), PressAuth::DenyUnknown);
         assert_eq!(authorize_press(None, false, true), PressAuth::Allow);
     }

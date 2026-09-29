@@ -35,20 +35,11 @@ pub struct InferenceConfig {
     /// OpenAI-compatible endpoint (for Exo, llamafile, vLLM, etc.)
     pub openai_compat: Option<OpenAiCompatConfig>,
 
-    /// mistral.rs specific settings
-    pub mistralrs: Option<MistralRsConfig>,
-
     /// Confidence router settings (three-tier routing)
     pub router: Option<RouterConfig>,
 
-    /// Exo P2P cluster settings
-    pub exo: Option<crate::exo_cluster::ExoConfig>,
-
     /// llamafile subprocess settings
     pub llamafile: Option<crate::llamafile::LlamafileConfig>,
-
-    /// MLX bridge settings (Apple Silicon evolution)
-    pub mlx: Option<crate::mlx_bridge::MlxConfig>,
 
     /// Voice / ASR / TTS settings
     pub voice: Option<VoiceConfig>,
@@ -63,18 +54,6 @@ pub struct InferenceConfig {
     /// max_history = 100
     /// ```
     pub embedding: Option<EmbeddingConfig>,
-
-    /// JitRL zero-gradient continual learning (arXiv:2601.18510) —
-    /// experimental, DEFAULT FALSE. See [`crate::jitrl`].
-    ///
-    /// ```toml
-    /// [jitrl]
-    /// enabled = false
-    /// max_bias = 2.0
-    /// top_k = 8
-    /// min_similarity = 0.3
-    /// ```
-    pub jitrl: Option<crate::jitrl::JitrlConfig>,
 }
 
 /// Embedding model configuration for the prediction engine.
@@ -186,14 +165,10 @@ impl Default for InferenceConfig {
             auto_load: false,
             max_memory_mb: 0,
             openai_compat: None,
-            mistralrs: None,
             router: None,
-            exo: None,
             llamafile: None,
-            mlx: None,
             voice: None,
             embedding: None,
-            jitrl: None,
         }
     }
 }
@@ -259,61 +234,6 @@ impl OpenAiCompatConfig {
     }
 }
 
-/// Configuration for mistral.rs backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MistralRsConfig {
-    /// ISQ quantization bits (2, 3, 4, 5, 6, 8, or null for native precision).
-    /// In-Situ Quantization: loads safetensors and quantizes on-the-fly.
-    pub isq_bits: Option<u8>,
-
-    /// Enable PagedAttention for KV-cache management.
-    pub paged_attention: bool,
-
-    /// Enable speculative decoding.
-    pub speculative: Option<SpeculativeConfig>,
-}
-
-impl Default for MistralRsConfig {
-    fn default() -> Self {
-        Self {
-            isq_bits: Some(4),
-            paged_attention: true,
-            speculative: None,
-        }
-    }
-}
-
-/// Speculative decoding configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpeculativeConfig {
-    /// Speculative decoding method: "draft" (EAGLE-style) or "self" (LayerSkip).
-    pub method: SpeculativeMethod,
-
-    /// Draft model path (for "draft" method).
-    /// Should be a small, fast model (e.g., 0.6B-1B params).
-    pub draft_model: Option<String>,
-
-    /// Number of speculative tokens to generate per step (default 5).
-    #[serde(default = "default_spec_tokens")]
-    pub num_tokens: u32,
-}
-
-/// Speculative decoding method.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SpeculativeMethod {
-    /// Use a separate draft model (EAGLE-2 style).
-    Draft,
-    /// Self-speculative: use early layers of the target model as draft.
-    #[serde(rename = "self")]
-    SelfSpec,
-}
-
-fn default_spec_tokens() -> u32 {
-    5
-}
-
 /// Confidence router configuration — routes queries to the best tier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -347,37 +267,41 @@ pub struct RouterConfig {
     #[serde(default)]
     pub fast_keywords: Vec<String>,
 
-    /// Enable post-hoc (cascade) confidence: after a local tier answers, the
-    /// mean token logprob is mapped through a logistic
-    /// `g = sigmoid(alpha * p̄ + beta)` into an acceptance score and
-    /// low-confidence answers escalate to the next tier instead of being
-    /// returned. Zero LLM cost — the logprob signal comes with the response.
-    ///
-    /// Honest status of the defaults: `alpha`/`beta` have NOT been fitted on
-    /// outcome labels. With alpha 4.0, beta -2.0 and threshold 0.5,
-    /// `g >= 0.5` holds exactly when `p̄ >= 0.5`, i.e. mean logprob
-    /// `>= ln 0.5 ≈ -0.69`, so the shipped gate is a fixed logprob cutoff in
-    /// logistic clothing. It only becomes a calibrated probability once the
-    /// map is fitted on `(p̄, outcome)` pairs (Platt, or isotonic regression
-    /// as UCCI does, which assumes only monotonicity; the threshold then
-    /// follows from the cost of escalating). No such fitting exists yet, and
-    /// the gateway does not persist `(p̄, g, accepted)` next to outcomes.
-    /// (Cascade Routing arXiv:2410.10347; UCCI arXiv:2605.18796)
+    /// UCCI router JSON for LocalFast -> LocalStrong (or Cloud API).
+    /// Relative paths resolve from the DuDuClaw home directory.
     #[serde(default)]
-    pub post_hoc_enabled: bool,
+    pub ucci_fast_router: Option<String>,
 
-    /// Logistic slope: g = sigmoid(alpha * p̄ + beta), p̄ = exp(mean logprob).
-    /// Unfitted default (see `post_hoc_enabled`).
-    #[serde(default = "default_post_hoc_alpha")]
-    pub post_hoc_alpha: f32,
+    /// UCCI router JSON for LocalStrong -> Cloud API.
+    /// Fit this transition on the strong model's own output labels.
+    #[serde(default)]
+    pub ucci_strong_router: Option<String>,
 
-    /// Logistic intercept. Unfitted default (see `post_hoc_enabled`).
-    #[serde(default = "default_post_hoc_beta")]
-    pub post_hoc_beta: f32,
+    /// Optional JSONL collection path for human review and offline fitting.
+    /// Contains prompts and generated answers; relative to DuDuClaw home.
+    #[serde(default)]
+    pub ucci_observations: Option<String>,
 
-    /// Acceptance threshold on g: below this the answer escalates.
-    #[serde(default = "default_post_hoc_accept_threshold")]
-    pub post_hoc_accept_threshold: f32,
+    /// Set for vLLM/llama.cpp servers that include the terminating stop token
+    /// in chat-completion logprobs. Use the same setting while collecting and serving.
+    #[serde(default)]
+    pub ucci_drop_stop_token: bool,
+
+    /// During observation collection, also run LocalStrong for LocalFast
+    /// answers that would otherwise return. The shadow answer is not shown.
+    #[serde(default)]
+    pub ucci_shadow_strong: bool,
+
+    /// Upper bound on concurrently in-flight `ucci_shadow_strong` background
+    /// generations. Each shadow reuses the same backend/model slot as the
+    /// next request's foreground generation, so an unbounded number of them
+    /// can pile up and race a live model switch. When the cap is already
+    /// saturated a new shadow is skipped (not queued, not blocking) rather
+    /// than spawned — the foreground reply is never delayed either way.
+    /// `0` is treated the same as `1` (never fully disables the shadow via
+    /// this knob; use `ucci_shadow_strong = false` for that).
+    #[serde(default = "default_ucci_shadow_max_inflight")]
+    pub ucci_shadow_max_inflight: usize,
 
     /// Allow the embedding host (gateway) to run its MCP tool loop against
     /// the local OpenAI-compatible endpoint. Absent (`None`) defaults to
@@ -390,16 +314,8 @@ pub struct RouterConfig {
     pub local_tools: Option<bool>,
 }
 
-fn default_post_hoc_alpha() -> f32 {
-    4.0
-}
-
-fn default_post_hoc_beta() -> f32 {
-    -2.0
-}
-
-fn default_post_hoc_accept_threshold() -> f32 {
-    0.5
+fn default_ucci_shadow_max_inflight() -> usize {
+    1
 }
 
 impl Default for RouterConfig {
@@ -447,12 +363,25 @@ impl Default for RouterConfig {
                 "轉換".to_string(),
                 "改寫".to_string(),
             ],
-            post_hoc_enabled: false,
-            post_hoc_alpha: default_post_hoc_alpha(),
-            post_hoc_beta: default_post_hoc_beta(),
-            post_hoc_accept_threshold: default_post_hoc_accept_threshold(),
+            ucci_fast_router: None,
+            ucci_strong_router: None,
+            ucci_observations: None,
+            ucci_drop_stop_token: false,
+            ucci_shadow_strong: false,
+            ucci_shadow_max_inflight: default_ucci_shadow_max_inflight(),
             local_tools: None,
         }
+    }
+}
+
+impl RouterConfig {
+    /// Effective `ucci_shadow_strong` concurrency cap: `0` (unset TOML key
+    /// parsed as a bare integer literal, or an explicit `0`) is clamped to
+    /// `1` rather than treated as "no limit" — a `Semaphore::new(0)` would
+    /// silently skip every shadow forever, which is a much easier
+    /// misconfiguration to make than to notice.
+    pub fn effective_ucci_shadow_max_inflight(&self) -> usize {
+        self.ucci_shadow_max_inflight.max(1)
     }
 }
 
@@ -533,17 +462,6 @@ impl InferenceConfig {
                 return Err(InferenceError::Config(
                     "router.fast_threshold must be > router.strong_threshold".to_string(),
                 ));
-            }
-        if let Some(ref router) = self.router
-            && router.post_hoc_enabled
-            && !(0.0..=1.0).contains(&router.post_hoc_accept_threshold) {
-                return Err(InferenceError::Config(
-                    "router.post_hoc_accept_threshold must be within [0.0, 1.0]".to_string(),
-                ));
-            }
-        if let Some(ref jitrl) = self.jitrl
-            && jitrl.enabled {
-                jitrl.validate()?;
             }
         Ok(())
     }
@@ -717,5 +635,38 @@ mod home_aware_defaults_tests {
             Path::new("/data/duduclaw"),
         );
         assert!(!cfg.enabled);
+    }
+}
+
+#[cfg(test)]
+mod ucci_shadow_max_inflight_tests {
+    use super::RouterConfig;
+
+    #[test]
+    fn defaults_to_one() {
+        let cfg = RouterConfig::default();
+        assert_eq!(cfg.ucci_shadow_max_inflight, 1);
+        assert_eq!(cfg.effective_ucci_shadow_max_inflight(), 1);
+    }
+
+    /// Regression: an explicit `ucci_shadow_max_inflight = 0` must NOT mean
+    /// "unbounded" — a `Semaphore::new(0)` built from a literal zero would
+    /// silently skip every shadow generation forever. `0` clamps to `1`.
+    #[test]
+    fn explicit_zero_clamps_to_one_not_unbounded() {
+        let cfg = RouterConfig {
+            ucci_shadow_max_inflight: 0,
+            ..RouterConfig::default()
+        };
+        assert_eq!(cfg.effective_ucci_shadow_max_inflight(), 1);
+    }
+
+    #[test]
+    fn an_explicit_cap_above_one_passes_through() {
+        let cfg = RouterConfig {
+            ucci_shadow_max_inflight: 3,
+            ..RouterConfig::default()
+        };
+        assert_eq!(cfg.effective_ucci_shadow_max_inflight(), 3);
     }
 }

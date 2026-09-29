@@ -54,7 +54,9 @@
 
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+
+use duduclaw_gateway::os_ops::{self, OsOpError};
 
 // ── Small local result helpers (mirrors mcp_recording.rs's rec_text/rec_error
 //    convention — each MCP submodule owns its own, not a shared import) ────
@@ -89,33 +91,37 @@ fn confirm_flag(args: &Value) -> bool {
     args.get("confirm").and_then(Value::as_bool) == Some(true)
 }
 
-/// Render a `device_ops::OpResult` the same shape the dashboard's
-/// `device_op_result_frame` uses (`success`/`stdout`/`stderr` on success;
-/// `DeviceOpError`'s own `Display` — "unsupported: …" / "io error: …" — on
-/// failure, byte-identical to the dashboard's error text).
-fn device_op_result_text(result: duduclaw_gateway::device_ops::OpResult) -> Value {
-    match result {
-        Ok(out) => os_ops_text(
-            &json!({ "success": out.success, "stdout": out.stdout, "stderr": out.stderr })
-                .to_string(),
-        ),
-        Err(e) => os_ops_error(&e.to_string()),
+/// O16: render an [`OsOpError`] as this surface's tool-result envelope.
+///
+/// `serialize_what` is the already-shipped prefix for the (unreachable)
+/// serialization arm — the one place the three `os_*` front doors word a
+/// failure differently, so it is supplied per call site rather than being
+/// flattened into the shared error type.
+fn os_ops_err(err: &OsOpError, serialize_what: &str) -> Value {
+    match err {
+        OsOpError::NotAppliance => not_appliance_error(),
+        OsOpError::ConfirmRequired => confirm_required_error(),
+        OsOpError::Serialize(detail) => {
+            os_ops_error(&format!("{serialize_what} serialize failed: {detail}"))
+        }
+        // The dashboard RPC renders these as a structured `error` object; an
+        // MCP tool result has no such slot, so the same JSON is carried as
+        // the error text — byte-identical to what this surface already sent.
+        OsOpError::Coded { code, message } => {
+            os_ops_error(&json!({ "code": code, "message": message }).to_string())
+        }
+        other => os_ops_error(&other.message()),
     }
 }
 
-/// Count agents by scanning `<home>/agents/*/agent.toml` directly — a fresh,
-/// honest recomputation of the same figure the live gateway's in-memory
-/// registry would report (the registry itself is populated by scanning this
-/// exact directory at startup), reachable without gateway IPC.
-fn count_configured_agents(home_dir: &Path) -> usize {
-    std::fs::read_dir(home_dir.join("agents"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.path().join("agent.toml").is_file())
-                .count()
-        })
-        .unwrap_or(0)
+/// O16: `Result<Value, OsOpError>` → tool-result envelope. Success carries
+/// the authority's canonical payload verbatim (`Value::to_string()`), the
+/// exact text every `os_*` tool already returned.
+fn os_ops_result(result: Result<Value, OsOpError>, serialize_what: &str) -> Value {
+    match result {
+        Ok(v) => os_ops_text(&v.to_string()),
+        Err(e) => os_ops_err(&e, serialize_what),
+    }
 }
 
 // ── Read-only tools (admin scope only; device.*-backed ones also require
@@ -127,11 +133,7 @@ pub(crate) async fn handle_os_device_status(home_dir: &Path) -> Value {
     if !duduclaw_core::is_appliance() {
         return not_appliance_error();
     }
-    let status = duduclaw_gateway::device::collect_status(home_dir);
-    match serde_json::to_value(&status) {
-        Ok(v) => os_ops_text(&v.to_string()),
-        Err(e) => os_ops_error(&format!("device status serialize failed: {e}")),
-    }
+    os_ops_result(os_ops::device_status(home_dir), "device status")
 }
 
 /// `os_network_info` → `device.network` (read path only — the RPC's
@@ -141,10 +143,10 @@ pub(crate) async fn handle_os_network_info() -> Value {
     if !duduclaw_core::is_appliance() {
         return not_appliance_error();
     }
-    match serde_json::to_value(duduclaw_gateway::device::collect_network()) {
-        Ok(v) => os_ops_text(&json!({ "interfaces": v }).to_string()),
-        Err(e) => os_ops_error(&format!("network interfaces serialize failed: {e}")),
-    }
+    os_ops_result(
+        os_ops::network_interfaces().map(|v| json!({ "interfaces": v })),
+        "network interfaces",
+    )
 }
 
 /// `os_wifi_status` → `network.status` (D4a's rich link/IP/connectivity
@@ -168,16 +170,10 @@ pub(crate) async fn handle_os_wifi_status() -> Value {
     if !duduclaw_core::is_appliance() {
         return not_appliance_error();
     }
-    match duduclaw_gateway::network::status().await {
-        Ok(status) => match serde_json::to_value(&status) {
-            Ok(v) => os_ops_text(&v.to_string()),
-            Err(e) => os_ops_error(&format!("wifi status serialize failed: {e}")),
-        },
-        // `network::status()` never constructs an `Err` today (see its own
-        // doc), but the `Result` return type is real — degrade honestly
-        // rather than unwrap.
-        Err(err) => os_ops_error(&duduclaw_gateway::network::error_to_json(&err).to_string()),
-    }
+    // `network::status()` never constructs an `Err` today (see its own doc),
+    // but the `Result` return type is real — degrade honestly rather than
+    // unwrap.
+    os_ops_result(os_ops::wifi_status().await, "wifi status")
 }
 
 /// `os_wifi_scan` → `network.wifi_scan`. `rescan` (optional, default `true`
@@ -198,10 +194,7 @@ pub(crate) async fn handle_os_wifi_scan(args: &Value) -> Value {
         return not_appliance_error();
     }
     let rescan = args.get("rescan").and_then(Value::as_bool).unwrap_or(true);
-    match duduclaw_gateway::network::wifi_scan(rescan).await {
-        Ok(result) => os_ops_text(&duduclaw_gateway::network::scan_result_to_json(&result).to_string()),
-        Err(err) => os_ops_error(&duduclaw_gateway::network::error_to_json(&err).to_string()),
-    }
+    os_ops_result(os_ops::wifi_scan(rescan).await, "wifi scan")
 }
 
 /// `os_wifi_connect` → `network.wifi_connect`, **structurally without a
@@ -231,49 +224,36 @@ pub(crate) async fn handle_os_wifi_connect(args: &Value, home_dir: &Path) -> Val
     if !confirm_flag(args) {
         return confirm_required_error();
     }
-    let ssid = match args.get("ssid").and_then(Value::as_str) {
-        Some(s) if !s.trim().is_empty() => s.to_string(),
-        _ => return os_ops_error("ssid 不可為空"),
-    };
+    let ssid = args
+        .get("ssid")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
 
-    let result = duduclaw_gateway::network::wifi_connect(&ssid, None).await;
-    audit_agent_wifi_event(home_dir, "wifi_connect", &ssid, &result);
-    match result {
-        Ok(()) => os_ops_text(&json!({ "state": "connected", "ssid": ssid }).to_string()),
-        Err(err) => os_ops_error(&duduclaw_gateway::network::error_to_json_with_ssid(&err, &ssid).to_string()),
-    }
-}
-
-/// Same audit shape as the dashboard's own `audit_wifi_event`
-/// (`{ssid, ok, code, source}`, no psk, no "was a psk even supplied" flag)
-/// but `source: "agent_mcp"` instead of `"dashboard"` — the audit trail can
-/// tell "an agent did this on a human's behalf" apart from "a human clicked
-/// it in Settings" without inventing a second schema. `home_dir` is threaded
-/// in by the caller rather than re-resolved here, matching every other
-/// `mcp_os_ops.rs` handler's convention (and keeping it consistent with a
-/// caller-supplied tempdir in tests).
-fn audit_agent_wifi_event(
-    home_dir: &Path,
-    event_type: &str,
-    ssid: &str,
-    result: &Result<(), duduclaw_gateway::network::WifiError>,
-) {
-    // Deliberately best-effort: an audit-write failure must never surface as
-    // a tool-call failure to the caller (the connect attempt itself already
-    // succeeded or failed on its own terms).
-    let (ok, code) = match result {
-        Ok(()) => (true, None),
-        Err(e) => (false, Some(e.code.code())),
-    };
-    duduclaw_security::audit::append_audit_event(
+    // O16: the connect effect and its one audit row live in
+    // `os_ops::wifi_connect`. `WifiAudit::Plain { source: "agent_mcp" }`
+    // keeps this surface's audit shape exactly as shipped — same
+    // `{ssid, ok, code, source}` row the dashboard writes, just labelled so
+    // the trail can tell "an agent did this on a human's behalf" apart from
+    // "a human clicked it in Settings", and written with
+    // `append_audit_event` (this is a separate process from the gateway, so
+    // the autopilot bus is unreachable from here).
+    match os_ops::wifi_connect(
         home_dir,
-        &duduclaw_security::audit::AuditEvent::new(
-            event_type,
-            ssid,
-            duduclaw_security::audit::Severity::Info,
-            json!({ "ssid": ssid, "ok": ok, "code": code, "source": "agent_mcp" }),
+        &ssid,
+        None,
+        os_ops::WifiAudit::Plain {
+            source: "agent_mcp",
+        },
+    )
+    .await
+    {
+        Ok(v) => os_ops_text(&v.to_string()),
+        Err(OsOpError::Wifi(err)) => os_ops_error(
+            &duduclaw_gateway::network::error_to_json_with_ssid(&err, &ssid).to_string(),
         ),
-    );
+        Err(e) => os_ops_err(&e, "wifi connect"),
+    }
 }
 
 /// `os_backup_list` → `device.backup_list`. Same two calls
@@ -284,12 +264,10 @@ pub(crate) async fn handle_os_backup_list(home_dir: &Path) -> Value {
     if !duduclaw_core::is_appliance() {
         return not_appliance_error();
     }
-    let dir = duduclaw_gateway::backup_schedule::backups_dir(home_dir);
-    let files = duduclaw_gateway::files_api::list_files(&dir);
-    match serde_json::to_value(&files) {
-        Ok(v) => os_ops_text(&json!({ "files": v }).to_string()),
-        Err(e) => os_ops_error(&format!("backup list serialize failed: {e}")),
-    }
+    os_ops_result(
+        os_ops::backup_list(home_dir).map(|v| json!({ "files": v })),
+        "backup list",
+    )
 }
 
 /// `os_system_status` — reduced, honestly-labelled counterpart to
@@ -303,7 +281,7 @@ pub(crate) async fn handle_os_backup_list(home_dir: &Path) -> Value {
 /// reported as a plain field, not a gate.
 pub(crate) async fn handle_os_system_status(home_dir: &Path) -> Value {
     let version = duduclaw_gateway::updater::current_version();
-    let agents_count = count_configured_agents(home_dir);
+    let agents_count = os_ops::count_configured_agents(home_dir);
     let is_appliance = duduclaw_core::is_appliance();
     // Edition profile: env-var override only (no `tier_key`) — the license
     // runtime tier lives in the live gateway process's in-memory cache and
@@ -318,14 +296,17 @@ pub(crate) async fn handle_os_system_status(home_dir: &Path) -> Value {
     // MCP tool already relies on (`handle_channel_status` in `mcp.rs`).
     // `None` (not `0`) when the gateway has never written a snapshot, so a
     // fresh/never-booted gateway is never misreported as "zero channels".
-    let channels_connected: Option<usize> = std::fs::read_to_string(home_dir.join("channel_status.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("channels").and_then(|c| c.as_object()).map(|m| {
-            m.values()
-                .filter(|s| s.get("connected").and_then(Value::as_bool) == Some(true))
-                .count()
-        }));
+    let channels_connected: Option<usize> =
+        std::fs::read_to_string(home_dir.join("channel_status.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| {
+                v.get("channels").and_then(|c| c.as_object()).map(|m| {
+                    m.values()
+                        .filter(|s| s.get("connected").and_then(Value::as_bool) == Some(true))
+                        .count()
+                })
+            });
 
     os_ops_text(
         &json!({
@@ -368,40 +349,18 @@ pub(crate) async fn handle_os_system_status(home_dir: &Path) -> Value {
 /// `os_operator::readonly_result_to_artifact`'s existing `update_status` card
 /// (which only reads `device`/`system`) is untouched.
 pub(crate) async fn handle_os_check_update(home_dir: &Path) -> Value {
-    let system = match duduclaw_gateway::updater::check_update().await {
-        Ok(info) => json!({
-            "available": info.available,
-            "current_version": info.current_version,
-            "latest_version": info.latest_version,
-            "release_notes": info.release_notes,
-            "published_at": info.published_at,
-            "install_method": info.install_method,
-            "containerized": duduclaw_gateway::updater::is_containerized(),
-        }),
-        Err(e) => json!({ "error": e }),
-    };
-    let (device, device_check) = if duduclaw_core::is_appliance() {
-        let device = match duduclaw_gateway::device_ops::select_device_ops()
-            .update_status()
-            .await
-        {
-            Ok(out) => json!({ "success": out.success, "stdout": out.stdout, "stderr": out.stderr }),
-            Err(e) => json!({ "error": e.to_string() }),
-        };
-        let device_check = match duduclaw_gateway::os_update::check_update(home_dir).await {
-            Ok(report) => json!({
-                "available": report.available,
-                "current_version": report.current_version,
-                "latest_version": report.latest_version,
-            }),
-            Err(e) => json!({ "error": { "code": e.code(), "message": e.user_message() } }),
-        };
-        (device, device_check)
-    } else {
-        let note = json!({ "note": "非 appliance 安裝，無 OS image 更新可查（僅限 appliance）。" });
-        (note.clone(), note)
-    };
-    os_ops_text(&json!({ "system": system, "device": device, "device_check": device_check }).to_string())
+    // O16: one implementation (`os_ops::check_update`), two named
+    // projections. This surface's is the verbose one; the operator CLI's
+    // `duduclaw os system update-check` asks for the brief one.
+    let report = os_ops::check_update(
+        home_dir,
+        os_ops::CheckUpdateOptions {
+            include_release_metadata: true,
+            not_appliance_note: "非 appliance 安裝，無 OS image 更新可查（僅限 appliance）。",
+        },
+    )
+    .await;
+    os_ops_text(&report.to_string())
 }
 
 /// `os_doctor_repair` — reduced counterpart to `system.doctor_repair`.
@@ -416,48 +375,28 @@ pub(crate) async fn handle_os_check_update(home_dir: &Path) -> Value {
 /// Full diagnostics remain available via the dashboard or `duduclaw doctor`.
 pub(crate) async fn handle_os_doctor_repair(home_dir: &Path) -> Value {
     let config_exists = home_dir.join("config.toml").exists();
-    let has_agents = count_configured_agents(home_dir) > 0;
+    let has_agents = os_ops::count_configured_agents(home_dir) > 0;
     let has_key = duduclaw_gateway::handlers::has_api_key_configured(home_dir).await;
     let mcp_report = duduclaw_gateway::doctor_probes::mcp_cold_start_probe(home_dir).await;
-    let (mcp_status, mcp_message) = duduclaw_gateway::doctor_probes::mcp_cold_start_status_and_message(
-        &mcp_report.outcome,
-        mcp_report.provision_error.as_deref(),
-    );
+    let (mcp_status, mcp_message) =
+        duduclaw_gateway::doctor_probes::mcp_cold_start_status_and_message(
+            &mcp_report.outcome,
+            mcp_report.provision_error.as_deref(),
+        );
 
-    let checks = vec![
-        json!({
-            "name": "config_file",
-            "status": if config_exists { "pass" } else { "fail" },
-            "message": if config_exists { "config.toml exists" } else { "config.toml not found" },
-        }),
-        json!({
-            "name": "agents",
-            "status": if has_agents { "pass" } else { "warn" },
-            "message": if has_agents { "Agents found" } else { "No agents found" },
-        }),
-        json!({
-            "name": "api_key",
-            "status": if has_key { "pass" } else { "warn" },
-            "message": if has_key { "ANTHROPIC_API_KEY is set" } else { "ANTHROPIC_API_KEY not set" },
-        }),
-        json!({ "name": "mcp_server", "status": mcp_status, "message": mcp_message }),
-    ];
-    let repair_hints: Vec<Value> = checks
-        .iter()
-        .filter(|c| c["status"] != "pass")
-        .map(|c| {
-            let name = c["name"].as_str().unwrap_or("unknown");
-            json!({ "check": name, "hint": duduclaw_gateway::handlers::doctor_repair_hint(name) })
-        })
-        .collect();
-    let pass = checks.iter().filter(|c| c["status"] == "pass").count();
-    let warn = checks.iter().filter(|c| c["status"] == "warn").count();
-    let fail = checks.iter().filter(|c| c["status"] == "fail").count();
+    // O16: the check rows, the summary and the repair-hint mapping come from
+    // `os_ops` — the same builders the dashboard's `system.doctor` /
+    // `system.doctor_repair` use. `include_can_repair: false` is this
+    // surface's (already-shipped) reduced projection.
+    let mut checks = os_ops::doctor_base_checks(config_exists, has_agents, has_key, false);
+    checks.push(os_ops::doctor_mcp_check(mcp_status, &mcp_message, false));
+    let repair_hints = os_ops::doctor_repair_hints(&checks);
+    let summary = os_ops::doctor_summary(&checks);
 
     os_ops_text(
         &json!({
             "checks": checks,
-            "summary": { "pass": pass, "warn": warn, "fail": fail },
+            "summary": summary,
             "repair_hints": repair_hints,
             "note": "省略 dashboard system.doctor 的 container_runtime/grok_cli 探測（非閘相關，需較重的子行程探測）。",
         })
@@ -475,17 +414,7 @@ pub(crate) async fn handle_os_backup_create(home_dir: &Path) -> Value {
     if !duduclaw_core::is_appliance() {
         return not_appliance_error();
     }
-    use duduclaw_gateway::handlers::DeviceBackupOutcome;
-    match duduclaw_gateway::handlers::create_device_backup_archive(home_dir).await {
-        DeviceBackupOutcome::Created { filename, stdout, stderr } => os_ops_text(
-            &json!({ "filename": filename, "stdout": stdout, "stderr": stderr }).to_string(),
-        ),
-        DeviceBackupOutcome::OpFailed(out) => os_ops_text(
-            &json!({ "success": false, "stdout": out.stdout, "stderr": out.stderr }).to_string(),
-        ),
-        DeviceBackupOutcome::OpError(e) => os_ops_error(&e.to_string()),
-        DeviceBackupOutcome::MoveFailed(msg) => os_ops_error(&msg),
-    }
+    os_ops_result(os_ops::backup_create(home_dir).await, "backup create")
 }
 
 /// `os_power` → `device.power`. Same admin + appliance + confirm gate as
@@ -499,13 +428,11 @@ pub(crate) async fn handle_os_power(args: &Value) -> Value {
     if !confirm_flag(args) {
         return confirm_required_error();
     }
-    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-    let result = match action {
-        "restart" => duduclaw_gateway::device_ops::select_device_ops().reboot().await,
-        "shutdown" => duduclaw_gateway::device_ops::select_device_ops().poweroff().await,
-        _ => return os_ops_error("action 必須是 \"restart\" 或 \"shutdown\""),
-    };
-    device_op_result_text(result)
+    let raw = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    match os_ops::PowerAction::parse(raw) {
+        Ok(action) => os_ops_result(os_ops::power(action).await, "power"),
+        Err(e) => os_ops_err(&e, "power"),
+    }
 }
 
 /// TTL for the `os_factory_reset` approval — mirrors `INSTALL_APPROVAL_TTL_SECONDS`
@@ -530,7 +457,11 @@ const FACTORY_RESET_APPROVAL_POLL: std::time::Duration = std::time::Duration::fr
 /// `crate::mcp::gate_install_approval` already uses for install-class tools
 /// — fail-closed on broker-unavailable / denial / expiry, identical
 /// semantics, not a re-derived approximation.
-pub(crate) async fn handle_os_factory_reset(args: &Value, home_dir: &Path, caller_client_id: &str) -> Value {
+pub(crate) async fn handle_os_factory_reset(
+    args: &Value,
+    home_dir: &Path,
+    caller_client_id: &str,
+) -> Value {
     if !duduclaw_core::is_appliance() {
         return not_appliance_error();
     }
@@ -542,15 +473,20 @@ pub(crate) async fn handle_os_factory_reset(args: &Value, home_dir: &Path, calle
     }
     // D4a-8: same optional `clear_network` (default `false` — keep saved
     // Wi-Fi credentials) as the dashboard `device.factory_reset` RPC.
-    let clear_network = args.get("clear_network").and_then(Value::as_bool).unwrap_or(false);
-    device_op_result_text(
-        duduclaw_gateway::device_ops::select_device_ops()
-            .factory_reset(home_dir, clear_network)
-            .await,
+    let clear_network = args
+        .get("clear_network")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    os_ops_result(
+        os_ops::factory_reset(home_dir, clear_network).await,
+        "factory reset",
     )
 }
 
-async fn require_factory_reset_approval(home_dir: &Path, caller_client_id: &str) -> Result<(), String> {
+async fn require_factory_reset_approval(
+    home_dir: &Path,
+    caller_client_id: &str,
+) -> Result<(), String> {
     use duduclaw_gateway::approval::ApprovalBroker;
 
     let broker = match ApprovalBroker::open(home_dir) {
@@ -580,7 +516,11 @@ async fn require_factory_reset_approval_via(
     broker: &duduclaw_gateway::approval::ApprovalBroker,
     caller_client_id: &str,
 ) -> Result<(), String> {
-    let agent_id = if caller_client_id.is_empty() { "unknown-agent" } else { caller_client_id };
+    let agent_id = if caller_client_id.is_empty() {
+        "unknown-agent"
+    } else {
+        caller_client_id
+    };
     match crate::mcp::run_install_approval(
         broker,
         agent_id,
@@ -641,7 +581,11 @@ async fn require_factory_reset_approval_via(
 /// never calls an MCP handler). See that function's doc comment for what
 /// gets written and why; see `update_report_reconcile.rs` (`duduclaw-
 /// gateway`) for who reads it back after the restart.
-pub(crate) async fn handle_os_apply_update(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+pub(crate) async fn handle_os_apply_update(
+    args: &Value,
+    home_dir: &Path,
+    default_agent: &str,
+) -> Value {
     let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
     match target {
         "device" => {
@@ -651,20 +595,12 @@ pub(crate) async fn handle_os_apply_update(args: &Value, home_dir: &Path, defaul
             if !confirm_flag(args) {
                 return confirm_required_error();
             }
-            match duduclaw_gateway::handlers::stage_and_apply_device_update(home_dir).await {
-                duduclaw_gateway::handlers::DeviceUpdateApplyOutcome::StageFailed(e) => {
-                    os_ops_error(&json!({ "code": e.code(), "message": e.user_message() }).to_string())
-                }
-                duduclaw_gateway::handlers::DeviceUpdateApplyOutcome::EspPrepareFailed(message) => {
-                    os_ops_error(&json!({ "code": "esp_prepare_failed", "message": message }).to_string())
-                }
-                duduclaw_gateway::handlers::DeviceUpdateApplyOutcome::SlotMismatch(message) => {
-                    os_ops_error(&json!({ "code": "slot_mismatch", "message": message }).to_string())
-                }
-                duduclaw_gateway::handlers::DeviceUpdateApplyOutcome::Applied(applied) => {
+            match os_ops::device_update_apply(home_dir).await {
+                Ok(payload) => {
                     record_pending_update_report(home_dir, default_agent, "device", None).await;
-                    device_op_result_text(applied)
+                    os_ops_text(&payload.to_string())
                 }
+                Err(e) => os_ops_err(&e, "update apply"),
             }
         }
         "system" => {
@@ -731,7 +667,15 @@ async fn record_pending_update_report(
     let agent = agent_id.to_string();
     let key = duduclaw_core::WORKING_STATE_KEY_PENDING_UPDATE_REPORT;
     let result = tokio::task::spawn_blocking(move || {
-        duduclaw_gateway::working_state::set_entry(&home, &agent, key, &value, &reason, Some(4.0), None)
+        duduclaw_gateway::working_state::set_entry(
+            &home,
+            &agent,
+            key,
+            &value,
+            &reason,
+            Some(4.0),
+            None,
+        )
     })
     .await;
     match result {
@@ -739,7 +683,9 @@ async fn record_pending_update_report(
         Ok(Err(e)) => {
             tracing::warn!(agent = agent_id, target, error = %e, "pending_update_report 寫入失敗（更新本身已成功，僅跨重啟回報這一步受影響）");
         }
-        Err(e) => tracing::warn!(agent = agent_id, target, error = %e, "pending_update_report 寫入 join 失敗"),
+        Err(e) => {
+            tracing::warn!(agent = agent_id, target, error = %e, "pending_update_report 寫入 join 失敗")
+        }
     }
 }
 
@@ -789,10 +735,22 @@ async fn apply_system_update(home_dir: &Path, default_agent: &str) -> Value {
     .await
     {
         Ok(res) => {
-            record_pending_update_report(home_dir, default_agent, "system", Some(&info.latest_version)).await;
+            record_pending_update_report(
+                home_dir,
+                default_agent,
+                "system",
+                Some(&info.latest_version),
+            )
+            .await;
             match serde_json::to_value(&res) {
-                Ok(v) => os_ops_text(&json!({ "applied": true, "version": info.latest_version, "result": v }).to_string()),
-                Err(e) => os_ops_text(&format!("更新已套用（version={}），但結果序列化失敗：{e}", info.latest_version)),
+                Ok(v) => os_ops_text(
+                    &json!({ "applied": true, "version": info.latest_version, "result": v })
+                        .to_string(),
+                ),
+                Err(e) => os_ops_text(&format!(
+                    "更新已套用（version={}），但結果序列化失敗：{e}",
+                    info.latest_version
+                )),
             }
         }
         Err(e) => os_ops_error(&format!("更新套用失敗：{e}")),
@@ -815,11 +773,7 @@ pub(crate) async fn handle_os_boot_assessment() -> Value {
     if !duduclaw_core::is_appliance() {
         return not_appliance_error();
     }
-    device_op_result_text(
-        duduclaw_gateway::device_ops::select_device_ops()
-            .boot_assessment_status()
-            .await,
-    )
+    os_ops_result(os_ops::boot_assessment().await, "boot assessment")
 }
 
 /// `os_update_rollback` → `device.update_rollback`. Same admin + appliance +
@@ -842,11 +796,7 @@ pub(crate) async fn handle_os_update_rollback(args: &Value) -> Value {
     if !confirm_flag(args) {
         return confirm_required_error();
     }
-    device_op_result_text(
-        duduclaw_gateway::device_ops::select_device_ops()
-            .update_rollback()
-            .await,
-    )
+    os_ops_result(os_ops::update_rollback().await, "update rollback")
 }
 
 // ── A7c: agent→display bridge — `os_display_get`/`os_display_set` ────────
@@ -872,10 +822,7 @@ pub(crate) async fn handle_os_display_get() -> Value {
     if !duduclaw_core::is_appliance() {
         return not_appliance_error();
     }
-    match duduclaw_gateway::display_bridge::display_get().await {
-        Ok(v) => os_ops_text(&v.to_string()),
-        Err(e) => os_ops_error(&e),
-    }
+    os_ops_result(os_ops::display_get().await, "display get")
 }
 
 pub(crate) async fn handle_os_display_set(args: &Value) -> Value {
@@ -883,15 +830,14 @@ pub(crate) async fn handle_os_display_set(args: &Value) -> Value {
         return not_appliance_error();
     }
     let Some(field) = args.get("field").and_then(Value::as_str) else {
-        return os_ops_error("缺少必要參數 field（合法值：cursor_size / cursor_source / theme / output_scale）。");
+        return os_ops_error(
+            "缺少必要參數 field（合法值：cursor_size / cursor_source / theme / output_scale）。",
+        );
     };
     let Some(value) = args.get("value").and_then(Value::as_str) else {
         return os_ops_error("缺少必要參數 value（字串）。");
     };
-    match duduclaw_gateway::display_bridge::display_set(field, value).await {
-        Ok(v) => os_ops_text(&v.to_string()),
-        Err(e) => os_ops_error(&e),
-    }
+    os_ops_result(os_ops::display_set(field, value).await, "display set")
 }
 
 // ── Y10-1: agent→audio bridge — `os_audio_get`/`os_audio_set` ────────────
@@ -911,10 +857,7 @@ pub(crate) async fn handle_os_audio_get() -> Value {
     if !duduclaw_core::is_appliance() {
         return not_appliance_error();
     }
-    match duduclaw_gateway::audio_bridge::audio_get().await {
-        Ok(v) => os_ops_text(&v.to_string()),
-        Err(e) => os_ops_error(&e),
-    }
+    os_ops_result(os_ops::audio_get().await, "audio get")
 }
 
 pub(crate) async fn handle_os_audio_set(args: &Value) -> Value {
@@ -927,10 +870,7 @@ pub(crate) async fn handle_os_audio_set(args: &Value) -> Value {
     let Some(value) = args.get("value").and_then(Value::as_str) else {
         return os_ops_error("缺少必要參數 value（字串）。");
     };
-    match duduclaw_gateway::audio_bridge::audio_set(field, value).await {
-        Ok(v) => os_ops_text(&v.to_string()),
-        Err(e) => os_ops_error(&e),
-    }
+    os_ops_result(os_ops::audio_set(field, value).await, "audio set")
 }
 
 #[cfg(test)]
@@ -947,7 +887,10 @@ mod tests {
     fn confirm_flag_only_accepts_literal_true() {
         assert!(!confirm_flag(&json!({})));
         assert!(!confirm_flag(&json!({"confirm": false})));
-        assert!(!confirm_flag(&json!({"confirm": "true"})), "a string \"true\" must not satisfy the gate");
+        assert!(
+            !confirm_flag(&json!({"confirm": "true"})),
+            "a string \"true\" must not satisfy the gate"
+        );
         assert!(confirm_flag(&json!({"confirm": true})));
     }
 
@@ -967,24 +910,85 @@ mod tests {
         assert!(text.contains("confirm"), "unexpected message: {text}");
     }
 
+    /// O16 regression: the former `device_op_result_text` renderer became
+    /// `os_ops_result` over `Result<Value, OsOpError>` when the effect moved
+    /// into `duduclaw_gateway::os_ops`. The assertions are unchanged — a
+    /// `device.*` op failure must STILL surface as `isError` carrying
+    /// `DeviceOpError`'s own `Display` text ("unsupported: …" / "io error:
+    /// …"), byte-identical to the dashboard's.
     #[test]
-    fn device_op_result_text_maps_success_and_error_variants() {
-        use duduclaw_gateway::device_ops::{DeviceOpError, OpOutput};
+    fn os_ops_result_maps_success_and_device_op_error_variants() {
+        use duduclaw_gateway::device_ops::DeviceOpError;
 
-        let ok = device_op_result_text(Ok(OpOutput {
-            success: true,
-            stdout: "done".to_string(),
-            stderr: String::new(),
-        }));
+        let ok = os_ops_result(
+            Ok(json!({ "success": true, "stdout": "done", "stderr": "" })),
+            "device op",
+        );
         assert_ne!(ok["isError"], true);
+        assert_eq!(
+            ok["content"][0]["text"].as_str().unwrap(),
+            json!({ "success": true, "stdout": "done", "stderr": "" }).to_string(),
+        );
 
-        let unsupported = device_op_result_text(Err(DeviceOpError::Unsupported("nope".to_string())));
+        let unsupported = os_ops_result(
+            Err(OsOpError::DeviceOp(DeviceOpError::Unsupported(
+                "nope".to_string(),
+            ))),
+            "device op",
+        );
         assert_eq!(unsupported["isError"], true);
-        assert!(unsupported["content"][0]["text"].as_str().unwrap().contains("unsupported"));
+        assert!(
+            unsupported["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported")
+        );
 
-        let io_err = device_op_result_text(Err(DeviceOpError::Io("disk full".to_string())));
+        let io_err = os_ops_result(
+            Err(OsOpError::DeviceOp(DeviceOpError::Io(
+                "disk full".to_string(),
+            ))),
+            "device op",
+        );
         assert_eq!(io_err["isError"], true);
-        assert!(io_err["content"][0]["text"].as_str().unwrap().contains("io error"));
+        assert!(
+            io_err["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("io error")
+        );
+    }
+
+    /// O16: the `not_appliance` / `confirm_required` gates keep their own
+    /// already-shipped MCP envelopes even when they arrive as an
+    /// [`OsOpError`] from the authority rather than from this file's
+    /// fast-fail checks.
+    #[test]
+    fn os_ops_err_reuses_this_surfaces_gate_envelopes() {
+        assert_eq!(
+            os_ops_err(&OsOpError::NotAppliance, "x"),
+            not_appliance_error()
+        );
+        assert_eq!(
+            os_ops_err(&OsOpError::ConfirmRequired, "x"),
+            confirm_required_error()
+        );
+        let serialize = os_ops_err(&OsOpError::Serialize("bad".into()), "device status");
+        assert_eq!(
+            serialize["content"][0]["text"].as_str().unwrap(),
+            "device status serialize failed: bad",
+        );
+        let coded = os_ops_err(
+            &OsOpError::Coded {
+                code: "slot_mismatch".into(),
+                message: "nope".into(),
+            },
+            "x",
+        );
+        assert_eq!(
+            coded["content"][0]["text"].as_str().unwrap(),
+            json!({ "code": "slot_mismatch", "message": "nope" }).to_string(),
+        );
     }
 
     #[test]
@@ -994,7 +998,7 @@ mod tests {
         std::fs::create_dir_all(agents.join("a")).unwrap();
         std::fs::write(agents.join("a").join("agent.toml"), "").unwrap();
         std::fs::create_dir_all(agents.join("b")).unwrap(); // no agent.toml — must not count
-        assert_eq!(count_configured_agents(home.path()), 1);
+        assert_eq!(os_ops::count_configured_agents(home.path()), 1);
     }
 
     // ── Appliance fail-closed gate ──────────────────────────────────────
@@ -1021,12 +1025,21 @@ mod tests {
             handle_os_network_info().await,
             handle_os_wifi_status().await,
             handle_os_wifi_scan(&json!({})).await,
-            handle_os_wifi_connect(&json!({"ssid": "DuDu-Office", "confirm": true}), home.path()).await,
+            handle_os_wifi_connect(
+                &json!({"ssid": "DuDu-Office", "confirm": true}),
+                home.path(),
+            )
+            .await,
             handle_os_backup_list(home.path()).await,
             handle_os_backup_create(home.path()).await,
             handle_os_power(&json!({"action": "restart", "confirm": true})).await,
             handle_os_factory_reset(&json!({"confirm": true}), home.path(), "sysop").await,
-            handle_os_apply_update(&json!({"target": "device", "confirm": true}), home.path(), "test-agent").await,
+            handle_os_apply_update(
+                &json!({"target": "device", "confirm": true}),
+                home.path(),
+                "test-agent",
+            )
+            .await,
             handle_os_boot_assessment().await,
             handle_os_update_rollback(&json!({"confirm": true})).await,
             handle_os_display_get().await,
@@ -1062,14 +1075,24 @@ mod tests {
         // first — the missing-field message is only reachable on a real
         // appliance. This still proves the gate is fail-closed even for a
         // malformed request.
-        assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+        assert!(
+            v["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("appliance")
+        );
     }
 
     #[tokio::test]
     async fn display_set_missing_value_is_refused() {
         let v = handle_os_display_set(&json!({"field": "theme"})).await;
         assert_eq!(v["isError"], true, "{v:?}");
-        assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+        assert!(
+            v["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("appliance")
+        );
     }
 
     // ── Y10-1: os_audio_get / os_audio_set ──────────────────────────────
@@ -1083,14 +1106,24 @@ mod tests {
     async fn audio_set_missing_field_is_refused() {
         let v = handle_os_audio_set(&json!({"value": "70"})).await;
         assert_eq!(v["isError"], true, "{v:?}");
-        assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+        assert!(
+            v["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("appliance")
+        );
     }
 
     #[tokio::test]
     async fn audio_set_missing_value_is_refused() {
         let v = handle_os_audio_set(&json!({"field": "volume"})).await;
         assert_eq!(v["isError"], true, "{v:?}");
-        assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+        assert!(
+            v["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("appliance")
+        );
     }
 
     /// `os_system_status` has NO appliance requirement (`system.status`
@@ -1127,7 +1160,12 @@ mod tests {
         let explicit_no_rescan = handle_os_wifi_scan(&json!({"rescan": false})).await;
         for v in [&default_rescan, &explicit_no_rescan] {
             assert_eq!(v["isError"], true, "{v:?}");
-            assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+            assert!(
+                v["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("appliance")
+            );
         }
     }
 
@@ -1149,15 +1187,24 @@ mod tests {
         assert_eq!(v["isError"], true);
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("appliance"));
-        assert!(!text.contains("should-be-ignored"), "a psk value must never round-trip into any response text");
+        assert!(
+            !text.contains("should-be-ignored"),
+            "a psk value must never round-trip into any response text"
+        );
     }
 
     #[tokio::test]
     async fn apply_update_rejects_unknown_or_missing_target() {
         let home = tmp_home();
-        let unknown = handle_os_apply_update(&json!({"target": "nonsense"}), home.path(), "test-agent").await;
+        let unknown =
+            handle_os_apply_update(&json!({"target": "nonsense"}), home.path(), "test-agent").await;
         assert_eq!(unknown["isError"], true);
-        assert!(unknown["content"][0]["text"].as_str().unwrap().contains("target"));
+        assert!(
+            unknown["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("target")
+        );
 
         let missing = handle_os_apply_update(&json!({}), home.path(), "test-agent").await;
         assert_eq!(missing["isError"], true);
@@ -1175,7 +1222,8 @@ mod tests {
     #[tokio::test]
     async fn apply_update_system_target_requires_confirm_before_any_network_call() {
         let home = tmp_home();
-        let v = handle_os_apply_update(&json!({"target": "system"}), home.path(), "test-agent").await;
+        let v =
+            handle_os_apply_update(&json!({"target": "system"}), home.path(), "test-agent").await;
         assert_eq!(v["isError"], true, "{v:?}");
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("confirm"), "unexpected message: {text}");
@@ -1187,9 +1235,19 @@ mod tests {
     #[tokio::test]
     async fn apply_update_device_target_appliance_gate_fires_even_with_confirm() {
         let home = tmp_home();
-        let v = handle_os_apply_update(&json!({"target": "device", "confirm": true}), home.path(), "test-agent").await;
+        let v = handle_os_apply_update(
+            &json!({"target": "device", "confirm": true}),
+            home.path(),
+            "test-agent",
+        )
+        .await;
         assert_eq!(v["isError"], true, "{v:?}");
-        assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+        assert!(
+            v["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("appliance")
+        );
     }
 
     // ── Y8-3 T1: cross-restart report handshake write ───────────────────
@@ -1275,13 +1333,23 @@ mod tests {
     async fn boot_assessment_and_update_rollback_are_appliance_gated() {
         let boot = handle_os_boot_assessment().await;
         assert_eq!(boot["isError"], true);
-        assert!(boot["content"][0]["text"].as_str().unwrap().contains("appliance"));
+        assert!(
+            boot["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("appliance")
+        );
 
         let rollback_no_confirm = handle_os_update_rollback(&json!({})).await;
         assert_eq!(rollback_no_confirm["isError"], true);
         // Off-appliance: the appliance gate fires first, same ordering as
         // `os_power`/`os_wifi_connect`/`os_apply_update`'s device branch.
-        assert!(rollback_no_confirm["content"][0]["text"].as_str().unwrap().contains("appliance"));
+        assert!(
+            rollback_no_confirm["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("appliance")
+        );
     }
 
     // ── ApprovalBroker gate for os_factory_reset ────────────────────────
@@ -1311,7 +1379,10 @@ mod tests {
             for _ in 0..200 {
                 if let Ok(pending) = decider.list_pending(Some("sysop")).await {
                     if let Some(rec) = pending.first() {
-                        decider.decide(&rec.id, true, "dashboard:admin").await.unwrap();
+                        decider
+                            .decide(&rec.id, true, "dashboard:admin")
+                            .await
+                            .unwrap();
                         return;
                     }
                 }
@@ -1330,7 +1401,10 @@ mod tests {
             for _ in 0..200 {
                 if let Ok(pending) = decider.list_pending(Some("sysop")).await {
                     if let Some(rec) = pending.first() {
-                        decider.decide(&rec.id, false, "dashboard:admin").await.unwrap();
+                        decider
+                            .decide(&rec.id, false, "dashboard:admin")
+                            .await
+                            .unwrap();
                         return;
                     }
                 }
@@ -1359,5 +1433,88 @@ mod tests {
             Err(msg) => assert!(msg.contains("拒絕"), "got: {msg}"),
             Ok(()) => panic!("broker-open failure must fail closed, not proceed"),
         }
+    }
+
+    // ── O16 golden: one authority, three front doors, one answer ────────
+    //
+    // This crate is the only place that can see all three renderings at
+    // once (it depends on `duduclaw-gateway`, which owns both `os_ops` and
+    // `WsFrame`). The point of the consolidation is that a caller gets the
+    // SAME JSON regardless of which door it came in by — these tests pin
+    // that, so a future "quick fix" applied to only one adapter fails here
+    // instead of silently forking the three surfaces again.
+
+    /// Render an authority payload the way the dashboard RPC does
+    /// (`handlers::os_op_frame`'s `Ok` arm) and hand back the payload JSON.
+    fn rpc_payload(value: Value) -> Value {
+        match duduclaw_gateway::protocol::WsFrame::ok_response("", value) {
+            duduclaw_gateway::protocol::WsFrame::Response { ok, payload, .. } => {
+                assert!(ok, "ok_response must be ok");
+                payload.expect("ok_response always carries a payload")
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    /// Render the way the operator CLI does (`os_drive`'s pretty-print) and
+    /// parse it back.
+    fn cli_payload(value: &Value) -> Value {
+        serde_json::from_str(&serde_json::to_string_pretty(value).unwrap()).unwrap()
+    }
+
+    /// Render the way an MCP tool result does and parse it back.
+    fn mcp_payload(value: Value) -> Value {
+        let envelope = os_ops_result(Ok(value), "golden");
+        assert_ne!(envelope["isError"], true, "{envelope:?}");
+        serde_json::from_str(envelope["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn one_authority_payload_is_equivalent_through_all_three_front_doors() {
+        // Shapes taken verbatim from what the authority actually returns:
+        // a `device_ops` result, the `{interfaces: …}` wrap, the
+        // `{files: …}` wrap, a Wi-Fi connect ack, and a combined update
+        // read's skeleton.
+        let samples = vec![
+            json!({ "success": false, "stdout": "", "stderr": "nope" }),
+            json!({ "interfaces": [{ "name": "eth0", "ipv4": "192.168.0.2" }] }),
+            json!({ "files": [] }),
+            json!({ "state": "connected", "ssid": "DuDu-辦公室" }),
+            json!({
+                "system": { "available": false, "current_version": "1.65.1" },
+                "device": { "note": "非 appliance 安裝，無 OS image 更新可查。" },
+                "device_check": { "note": "非 appliance 安裝，無 OS image 更新可查。" },
+            }),
+        ];
+        for payload in samples {
+            assert_eq!(mcp_payload(payload.clone()), payload, "MCP diverged");
+            assert_eq!(rpc_payload(payload.clone()), payload, "RPC diverged");
+            assert_eq!(cli_payload(&payload), payload, "CLI diverged");
+        }
+    }
+
+    /// The gates are the ONE thing that deliberately differs per front door
+    /// — but the copy a human reads must not. Both JSON doors render the
+    /// same zh-TW sentence for a refusal, and it is the constant the
+    /// authority owns.
+    #[test]
+    fn all_front_doors_share_one_refusal_copy() {
+        let mcp = not_appliance_error();
+        assert_eq!(
+            mcp["content"][0]["text"].as_str().unwrap(),
+            duduclaw_gateway::os_ops::NOT_APPLIANCE_MESSAGE,
+        );
+        assert_eq!(
+            confirm_required_error()["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+            duduclaw_gateway::os_ops::CONFIRM_REQUIRED_MESSAGE,
+        );
+        // The dashboard's structured refusal carries the same sentence plus
+        // its stable machine code.
+        assert_eq!(
+            duduclaw_gateway::os_ops::OsOpError::NotAppliance.code(),
+            Some(duduclaw_gateway::handlers::DEVICE_NOT_APPLIANCE_ERROR_CODE),
+        );
     }
 }

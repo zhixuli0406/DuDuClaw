@@ -108,7 +108,12 @@ pub struct IntentVerdict {
 
 impl IntentVerdict {
     fn excluded(rule: &'static str) -> Self {
-        Self { grade: IntentGrade::Chat, score: 0, signals: vec![rule], excluded_by: Some(rule) }
+        Self {
+            grade: IntentGrade::Chat,
+            score: 0,
+            signals: vec![rule],
+            excluded_by: Some(rule),
+        }
     }
 
     pub fn is_suggest(&self) -> bool {
@@ -143,16 +148,52 @@ const QUOTED_MAJORITY_PERCENT: usize = 60;
 /// 交辦動詞 (+40) — the platform's own delegation vocabulary; "幫我"/"麻煩你"
 /// are also how a `/goal` description typically opens.
 const DELEGATION_VERBS_CJK: &[&str] = &[
-    "幫我", "幫忙", "麻煩你", "麻煩幫", "請你", "請幫我", "協助我", "整理成",
-    "整理出", "產出", "寫一份", "寫個", "部署", "寄出", "彙整", "統整", "製作一份",
-    "生成一份", "建立一份", "撰寫一份", "規劃一下", "設計一份", "幫我做",
+    "幫我",
+    "幫忙",
+    "麻煩你",
+    "麻煩幫",
+    "請你",
+    "請幫我",
+    "協助我",
+    "整理成",
+    "整理出",
+    "產出",
+    "寫一份",
+    "寫個",
+    "部署",
+    "寄出",
+    "彙整",
+    "統整",
+    "製作一份",
+    "生成一份",
+    "建立一份",
+    "撰寫一份",
+    "規劃一下",
+    "設計一份",
+    "幫我做",
 ];
 const DELEGATION_VERBS_ASCII: &[&str] = &["please help", "could you", "can you please"];
 
 /// 交付物名詞 (+25).
 const DELIVERABLE_NOUNS_CJK: &[&str] = &[
-    "報告", "月報", "週報", "日報", "季報", "網站", "簡報", "清單", "報表",
-    "投影片", "文案", "草稿", "設計稿", "程式", "系統", "頁面", "表格", "文件",
+    "報告",
+    "月報",
+    "週報",
+    "日報",
+    "季報",
+    "網站",
+    "簡報",
+    "清單",
+    "報表",
+    "投影片",
+    "文案",
+    "草稿",
+    "設計稿",
+    "程式",
+    "系統",
+    "頁面",
+    "表格",
+    "文件",
 ];
 const DELIVERABLE_NOUNS_ASCII: &[&str] =
     &["pr", "report", "deck", "website", "spreadsheet", "slides"];
@@ -163,18 +204,42 @@ const MULTISTEP_MARKERS_CJK: &[&str] = &["然後", "接著", "完成後", "接�
 
 /// 時限表述 (+20) — checked together with [`has_numeric_deadline`].
 const DEADLINE_MARKERS_CJK: &[&str] = &[
-    "今天內", "今天前", "明天前", "這週內", "這週前", "下班前", "期限", "截止",
-    "小時內", "分鐘內",
+    "今天內",
+    "今天前",
+    "明天前",
+    "這週內",
+    "這週前",
+    "下班前",
+    "期限",
+    "截止",
+    "小時內",
+    "分鐘內",
 ];
 
 /// 閒聊／情緒標記 (-30).
 const CHITCHAT_MARKERS_CJK: &[&str] = &[
-    "哈哈", "謝謝", "感謝你", "辛苦了", "早安", "午安", "晚安", "加油", "太棒了", "笑死",
+    "哈哈",
+    "謝謝",
+    "感謝你",
+    "辛苦了",
+    "早安",
+    "午安",
+    "晚安",
+    "加油",
+    "太棒了",
+    "笑死",
 ];
 
 /// 對上一輪的簡短追問 (-20).
-const SHORT_FOLLOWUP_MARKERS_CJK: &[&str] =
-    &["好的", "好喔", "嗯嗯", "繼續就好", "再說一次", "了解了", "收到了"];
+const SHORT_FOLLOWUP_MARKERS_CJK: &[&str] = &[
+    "好的",
+    "好喔",
+    "嗯嗯",
+    "繼續就好",
+    "再說一次",
+    "了解了",
+    "收到了",
+];
 
 /// Grade a user turn. Zero LLM cost, fully deterministic, never panics on
 /// arbitrary UTF-8 (CJK/emoji-safe — every substring check below either uses
@@ -214,13 +279,17 @@ pub fn classify_goal_intent(text: &str, t_goal: i32, t_gray: i32) -> IntentVerdi
     let lower = trimmed.to_lowercase();
 
     if DELEGATION_VERBS_CJK.iter().any(|k| trimmed.contains(k))
-        || DELEGATION_VERBS_ASCII.iter().any(|k| word_contains_ci(&lower, k))
+        || DELEGATION_VERBS_ASCII
+            .iter()
+            .any(|k| word_contains_ci(&lower, k))
     {
         score += 40;
         signals.push("delegation_verb");
     }
     if DELIVERABLE_NOUNS_CJK.iter().any(|k| trimmed.contains(k))
-        || DELIVERABLE_NOUNS_ASCII.iter().any(|k| word_contains_ci(&lower, k))
+        || DELIVERABLE_NOUNS_ASCII
+            .iter()
+            .any(|k| word_contains_ci(&lower, k))
     {
         score += 25;
         signals.push("deliverable_noun");
@@ -248,7 +317,10 @@ pub fn classify_goal_intent(text: &str, t_goal: i32, t_gray: i32) -> IntentVerdi
         score -= 30;
         signals.push("chitchat_marker");
     }
-    if SHORT_FOLLOWUP_MARKERS_CJK.iter().any(|k| trimmed.contains(k)) {
+    if SHORT_FOLLOWUP_MARKERS_CJK
+        .iter()
+        .any(|k| trimmed.contains(k))
+    {
         score -= 20;
         signals.push("short_followup");
     }
@@ -261,17 +333,24 @@ pub fn classify_goal_intent(text: &str, t_goal: i32, t_gray: i32) -> IntentVerdi
         IntentGrade::Chat
     };
 
-    IntentVerdict { grade, score, signals, excluded_by: None }
+    IntentVerdict {
+        grade,
+        score,
+        signals,
+        excluded_by: None,
+    }
 }
 
 /// Prompt-injection pre-screen — same fail-closed convention as
 /// `knowledge_route::injection_rules_hit`: ANY matched rule excludes.
 fn injection_hit(text: &str) -> bool {
-    use duduclaw_security::input_guard::{scan_input, DEFAULT_BLOCK_THRESHOLD};
+    use duduclaw_security::input_guard::{DEFAULT_BLOCK_THRESHOLD, scan_input};
     if text.trim().is_empty() {
         return false;
     }
-    !scan_input(text, DEFAULT_BLOCK_THRESHOLD).matched_rules.is_empty()
+    !scan_input(text, DEFAULT_BLOCK_THRESHOLD)
+        .matched_rules
+        .is_empty()
 }
 
 /// "然後"/"接著"/… fire on their own; otherwise a "先…再…" split-token
@@ -315,8 +394,12 @@ fn has_numeric_deadline(text: &str) -> bool {
 fn is_quoted_majority(text: &str) -> bool {
     let open = crate::channel_format::QUOTED_OPEN_MARKER;
     let close = crate::channel_format::QUOTED_CLOSE_MARKER;
-    let Some(start) = text.find(open) else { return false };
-    let Some(close_rel) = text[start..].find(close) else { return false };
+    let Some(start) = text.find(open) else {
+        return false;
+    };
+    let Some(close_rel) = text[start..].find(close) else {
+        return false;
+    };
     let quoted_end = start + close_rel + close.len();
     let quoted_len = text[start..quoted_end].chars().count();
     let total_len = text.chars().count();
@@ -502,7 +585,13 @@ pub fn strip_goal_suggest_tag(reply: &str) -> (String, Option<String>) {
     if summary.is_empty() {
         return (stripped, None);
     }
-    (stripped, Some(duduclaw_core::truncate_chars(summary, GOAL_SUGGEST_SUMMARY_MAX_CHARS)))
+    (
+        stripped,
+        Some(duduclaw_core::truncate_chars(
+            summary,
+            GOAL_SUGGEST_SUMMARY_MAX_CHARS,
+        )),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -590,7 +679,11 @@ pub async fn precheck(
         }
     };
 
-    PrecheckResult { action, config, verdict }
+    PrecheckResult {
+        action,
+        config,
+        verdict,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -641,7 +734,8 @@ async fn run_l2a_screen(
     );
     let user = crate::autopilot_screen::build_screen_prompt(L2A_QUESTION, &context);
     let call = screener.infer(L2A_SYSTEM_PROMPT, &user);
-    let timeout = std::time::Duration::from_secs(crate::autopilot_screen::DEFAULT_SCREEN_TIMEOUT_SECS);
+    let timeout =
+        std::time::Duration::from_secs(crate::autopilot_screen::DEFAULT_SCREEN_TIMEOUT_SECS);
     let reply = match tokio::time::timeout(timeout, call).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(_)) | Err(_) => return None,
@@ -704,7 +798,9 @@ async fn resolve_gray_band_with_screener(
         Some(false) => ("chat", GoalIntentAction::None),
         None => ("unavailable", GoalIntentAction::GrayCandidate),
     };
-    crate::metrics::global_metrics().goal_intent_l2_event("local", label).await;
+    crate::metrics::global_metrics()
+        .goal_intent_l2_event("local", label)
+        .await;
     action
 }
 
@@ -712,8 +808,7 @@ async fn resolve_gray_band_with_screener(
 // Finalize — after the AI reply exists, append the menu (or not)
 // ═══════════════════════════════════════════════════════════════════════
 
-const CONFIRMATION_MENU: &str =
-    "\n\n———\n看起來你在交辦一件任務。回覆「1」立為目標任務／「2」想一想（先給計畫）／「3」繼續聊天。";
+const CONFIRMATION_MENU: &str = "\n\n———\n看起來你在交辦一件任務。回覆「1」立為目標任務／「2」想一想（先給計畫）／「3」繼續聊天。";
 
 fn append_confirmation_menu(reply: &str) -> String {
     format!("{reply}{CONFIRMATION_MENU}")
@@ -763,7 +858,11 @@ pub async fn finalize(
             crate::metrics::global_metrics()
                 .goal_intent_l2_event(
                     "reply_tag",
-                    if tag_summary.is_some() { "suggested" } else { "chat" },
+                    if tag_summary.is_some() {
+                        "suggested"
+                    } else {
+                        "chat"
+                    },
                 )
                 .await;
             match tag_summary {
@@ -777,11 +876,23 @@ pub async fn finalize(
     }
 }
 
-async fn surface_suggestion(ctx: &ReplyContext, session_id: &str, agent_id: &str, description: &str) {
+async fn surface_suggestion(
+    ctx: &ReplyContext,
+    session_id: &str,
+    agent_id: &str,
+    description: &str,
+) {
     commit_cooldown(session_id);
     commit_daily_cap(agent_id);
-    store_pending(session_id, agent_id, description, suggest_ttl_minutes_for(ctx, agent_id).await);
-    crate::metrics::global_metrics().goal_intent_event("suggested").await;
+    store_pending(
+        session_id,
+        agent_id,
+        description,
+        suggest_ttl_minutes_for(ctx, agent_id).await,
+    );
+    crate::metrics::global_metrics()
+        .goal_intent_event("suggested")
+        .await;
     post_activity(
         ctx,
         agent_id,
@@ -888,7 +999,10 @@ fn take_pending(session_id: &str) -> Option<PendingSuggest> {
 /// must degrade to.
 fn take_pending_by_nonce(nonce: &str) -> Option<(String, PendingSuggest)> {
     let mut store = pending_store().lock().unwrap_or_else(|e| e.into_inner());
-    let session_id = store.iter().find(|(_, p)| p.nonce == nonce).map(|(k, _)| k.clone())?;
+    let session_id = store
+        .iter()
+        .find(|(_, p)| p.nonce == nonce)
+        .map(|(k, _)| k.clone())?;
     store.remove(&session_id).map(|p| (session_id, p))
 }
 
@@ -951,7 +1065,9 @@ fn today_utc() -> String {
 fn daily_cap_reached(agent_id: &str, daily_cap: u32) -> bool {
     let today = today_utc();
     let mut store = daily_cap_store().lock().unwrap_or_else(|e| e.into_inner());
-    let entry = store.entry(agent_id.to_string()).or_insert_with(|| (today.clone(), 0));
+    let entry = store
+        .entry(agent_id.to_string())
+        .or_insert_with(|| (today.clone(), 0));
     if entry.0 != today {
         *entry = (today.clone(), 0);
     }
@@ -961,7 +1077,9 @@ fn daily_cap_reached(agent_id: &str, daily_cap: u32) -> bool {
 fn commit_daily_cap(agent_id: &str) {
     let today = today_utc();
     let mut store = daily_cap_store().lock().unwrap_or_else(|e| e.into_inner());
-    let entry = store.entry(agent_id.to_string()).or_insert_with(|| (today.clone(), 0));
+    let entry = store
+        .entry(agent_id.to_string())
+        .or_insert_with(|| (today.clone(), 0));
     if entry.0 != today {
         *entry = (today.clone(), 0);
     }
@@ -1082,7 +1200,11 @@ async fn settle_pending(
 /// (`goal_plan::generate_plan_first`) — callers on platforms with a short
 /// interaction-ack window (Discord) MUST defer their own ack before awaiting
 /// this; see `discord::handle_component_interaction`.
-pub async fn handle_gintent_button(ctx: &ReplyContext, choice: GIntentChoice, nonce: &str) -> String {
+pub async fn handle_gintent_button(
+    ctx: &ReplyContext,
+    choice: GIntentChoice,
+    nonce: &str,
+) -> String {
     let Some((session_id, pending)) = take_pending_by_nonce(nonce) else {
         return "⏰ 這個建議已經失效了（可能已被新訊息取代或逾時），如果還想立案請重新描述一次。"
             .to_string();
@@ -1152,7 +1274,9 @@ async fn record_outcome(
     pending: &PendingSuggest,
     task_id: Option<String>,
 ) {
-    crate::metrics::global_metrics().goal_intent_event(outcome).await;
+    crate::metrics::global_metrics()
+        .goal_intent_event(outcome)
+        .await;
     let label = match outcome {
         "accepted" => "使用者確認立為目標任務",
         "plan_first" => "使用者選擇「想一想」先給計畫",
@@ -1196,7 +1320,7 @@ async fn accept_as_goal(ctx: &ReplyContext, session_id: &str, pending: &PendingS
 /// plan-generation result to it. Split out from [`accept_as_plan_first`] so
 /// the field-wiring (title/description/baseline/source stamping) is
 /// unit-testable against a canned `plan_result` — the SAME split
-/// `goal_plan.rs` itself uses between `generate_plan_first_with` (tested)
+/// `goal_loop/plan.rs` itself uses between `generate_plan_first_with` (tested)
 /// and `generate_plan_first` (the concrete network-calling entry point,
 /// deliberately NOT unit-tested; see that function's own doc comment). This
 /// function never touches the network.
@@ -1310,11 +1434,16 @@ mod tests {
 
     #[test]
     fn multistep_and_deadline_signals_push_a_moderate_ask_to_suggest() {
-        let s = "先幫我整理這批發票資料做成報表，然後在今天內部署到內部網站，麻煩你先確認一下內容。";
+        let s =
+            "先幫我整理這批發票資料做成報表，然後在今天內部署到內部網站，麻煩你先確認一下內容。";
         let v = classify_goal_intent(s, T_GOAL_DEFAULT, T_GRAY_DEFAULT);
         assert!(v.signals.contains(&"multistep"), "{:?}", v.signals);
         assert!(v.signals.contains(&"deadline"), "{:?}", v.signals);
-        assert!(matches!(v.grade, IntentGrade::Suggest | IntentGrade::Gray), "score={}", v.score);
+        assert!(
+            matches!(v.grade, IntentGrade::Suggest | IntentGrade::Gray),
+            "score={}",
+            v.score
+        );
     }
 
     #[test]
@@ -1338,7 +1467,13 @@ mod tests {
         // chit-chat marker present — the L1 negative signal must decide.
         let s = "哈哈謝謝你，辛苦你了，改天再約吃飯聊聊近況吧！";
         let v = classify_goal_intent(s, T_GOAL_DEFAULT, T_GRAY_DEFAULT);
-        assert_eq!(v.grade, IntentGrade::Chat, "score={} {:?}", v.score, v.signals);
+        assert_eq!(
+            v.grade,
+            IntentGrade::Chat,
+            "score={} {:?}",
+            v.score,
+            v.signals
+        );
         assert!(v.signals.contains(&"chitchat_marker"));
     }
 
@@ -1346,7 +1481,13 @@ mod tests {
     fn negative_short_followup_scores_down_to_chat() {
         let s = "好的，收到了，這樣我大概了解了，晚點再看看情況如何。";
         let v = classify_goal_intent(s, T_GOAL_DEFAULT, T_GRAY_DEFAULT);
-        assert_eq!(v.grade, IntentGrade::Chat, "score={} {:?}", v.score, v.signals);
+        assert_eq!(
+            v.grade,
+            IntentGrade::Chat,
+            "score={} {:?}",
+            v.score,
+            v.signals
+        );
         assert!(v.signals.contains(&"short_followup"));
     }
 
@@ -1424,7 +1565,8 @@ mod tests {
 
     #[test]
     fn strip_tag_extracts_summary_and_removes_it_from_the_reply() {
-        let reply = "好的，我幫你整理一下步驟。\n<goal_suggest>整理客戶資料成月報並寄出</goal_suggest>";
+        let reply =
+            "好的，我幫你整理一下步驟。\n<goal_suggest>整理客戶資料成月報並寄出</goal_suggest>";
         let (stripped, summary) = strip_goal_suggest_tag(reply);
         assert!(!stripped.contains("goal_suggest"));
         assert_eq!(summary.as_deref(), Some("整理客戶資料成月報並寄出"));
@@ -1498,7 +1640,11 @@ mod tests {
     #[test]
     fn config_per_agent_overrides_global() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[goal_intent]\nt_goal = 80\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[goal_intent]\nt_goal = 80\n",
+        )
+        .unwrap();
         let agent_dir = dir.path().join("agents").join("a1");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(
@@ -1565,7 +1711,10 @@ mod tests {
         store_pending(&session, "agent-a", "first ask", 10);
         store_pending(&session, "agent-a", "second ask", 10);
         let p = take_pending(&session).expect("second ask should be pending");
-        assert_eq!(p.description, "second ask", "new suggestion overwrites the old one");
+        assert_eq!(
+            p.description, "second ask",
+            "new suggestion overwrites the old one"
+        );
         assert!(take_pending(&session).is_none(), "consumed exactly once");
     }
 
@@ -1600,7 +1749,11 @@ mod tests {
     #[tokio::test]
     async fn precheck_none_when_disabled() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[goal_intent]\nenabled = false\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[goal_intent]\nenabled = false\n",
+        )
+        .unwrap();
         let ctx = test_ctx(dir.path());
         let session = format!("test:{}", uuid::Uuid::new_v4());
         let r = precheck(
@@ -1645,7 +1798,12 @@ mod tests {
             "幫我把這批客戶資料整理成月報並寄出",
         )
         .await;
-        assert_eq!(r.action, GoalIntentAction::DirectSuggest, "score={}", r.verdict.score);
+        assert_eq!(
+            r.action,
+            GoalIntentAction::DirectSuggest,
+            "score={}",
+            r.verdict.score
+        );
     }
 
     #[tokio::test]
@@ -1663,7 +1821,10 @@ mod tests {
         )
         .await;
         assert!(reply.contains("回覆「1」立為目標任務"));
-        assert!(take_pending(&session).is_some(), "a pending suggestion must be stored");
+        assert!(
+            take_pending(&session).is_some(),
+            "a pending suggestion must be stored"
+        );
     }
 
     #[tokio::test]
@@ -1703,7 +1864,10 @@ mod tests {
         assert!(!reply.contains("goal_suggest"));
         assert!(reply.contains("回覆「1」立為目標任務"));
         let pending = take_pending(&session).expect("tag must promote to a pending suggestion");
-        assert_eq!(pending.description, "整理客戶資料成月報並寄出", "summary wins over raw text");
+        assert_eq!(
+            pending.description, "整理客戶資料成月報並寄出",
+            "summary wins over raw text"
+        );
     }
 
     #[tokio::test]
@@ -1734,7 +1898,10 @@ mod tests {
         store_pending(&session, "agent-a", "整理報表", 10);
         let r = intercept_pending_confirmation(&ctx, &session, "user-1", "今天天氣真好").await;
         assert!(r.is_none(), "must fall through to normal chat");
-        assert!(take_pending(&session).is_none(), "the stale suggestion is gone either way");
+        assert!(
+            take_pending(&session).is_none(),
+            "the stale suggestion is gone either way"
+        );
     }
 
     #[tokio::test]
@@ -1794,7 +1961,7 @@ mod tests {
     // concrete network-calling `goal_plan::generate_plan_first` — same as
     // `handlers::handle_tasks_goal_create`'s `plan_first` branch and
     // `UtilityPlanFirstCaller`, none of which this codebase unit-tests
-    // directly (see `goal_plan.rs`'s own doc comment on
+    // directly (see `goal_loop/plan.rs`'s own doc comment on
     // `UtilityPlanFirstCaller`: "the concrete network-calling caller is
     // exercised only by live/manual verification"). `build_plan_first_task`
     // is the pure split-out that carries all the field-wiring logic, tested
@@ -1817,7 +1984,10 @@ mod tests {
         );
         assert!(task.goal_mode);
         assert_eq!(task.assigned_to, "agent-a");
-        assert_eq!(task.status, "needs_human", "plan-first never opens straight to todo");
+        assert_eq!(
+            task.status, "needs_human",
+            "plan-first never opens straight to todo"
+        );
         assert_eq!(
             task.acceptance_criteria_baseline.as_deref(),
             Some("整理客戶資料成月報並寄出")
@@ -1864,7 +2034,11 @@ mod tests {
 
     #[test]
     fn gintent_action_round_trips_every_choice() {
-        for choice in [GIntentChoice::AcceptGoal, GIntentChoice::PlanFirst, GIntentChoice::DismissChat] {
+        for choice in [
+            GIntentChoice::AcceptGoal,
+            GIntentChoice::PlanFirst,
+            GIntentChoice::DismissChat,
+        ] {
             let wire = encode_gintent_action(choice, "abc-123");
             let (got_choice, got_nonce) = parse_gintent_action(&wire).expect("must decode");
             assert_eq!(got_choice, choice);
@@ -1880,9 +2054,9 @@ mod tests {
             "duduclaw:decide:goal:ok:x", // a foreign codec's shape
             "gintent:",
             "gintent:goal",
-            "gintent:goal:",       // empty nonce
-            "gintent:nope:x",      // unknown choice token
-            "gintent:GOAL:x",      // case-sensitive vocabulary
+            "gintent:goal:",  // empty nonce
+            "gintent:nope:x", // unknown choice token
+            "gintent:GOAL:x", // case-sensitive vocabulary
         ] {
             assert_eq!(parse_gintent_action(data), None, "must refuse {data:?}");
         }
@@ -1904,7 +2078,11 @@ mod tests {
         const TELEGRAM_CALLBACK_LIMIT: usize = 64;
         let uuid = uuid::Uuid::new_v4().to_string();
         assert_eq!(uuid.len(), 36);
-        for choice in [GIntentChoice::AcceptGoal, GIntentChoice::PlanFirst, GIntentChoice::DismissChat] {
+        for choice in [
+            GIntentChoice::AcceptGoal,
+            GIntentChoice::PlanFirst,
+            GIntentChoice::DismissChat,
+        ] {
             let wire = encode_gintent_action(choice, &uuid);
             assert!(
                 wire.len() <= TELEGRAM_CALLBACK_LIMIT,
@@ -1925,7 +2103,10 @@ mod tests {
         let (found_session, pending) = take_pending_by_nonce(&nonce).expect("must find the slot");
         assert_eq!(found_session, session);
         assert_eq!(pending.description, "整理報表");
-        assert!(take_pending_by_nonce(&nonce).is_none(), "consumed exactly once");
+        assert!(
+            take_pending_by_nonce(&nonce).is_none(),
+            "consumed exactly once"
+        );
     }
 
     #[test]
@@ -1951,17 +2132,25 @@ mod tests {
     #[test]
     fn pending_button_nonce_is_a_peek_not_a_consume() {
         let session = format!("test-nonce-peek-{}", uuid::Uuid::new_v4());
-        assert!(pending_button_nonce(&session).is_none(), "nothing pending yet");
+        assert!(
+            pending_button_nonce(&session).is_none(),
+            "nothing pending yet"
+        );
         store_pending(&session, "agent-a", "整理報表", 10);
         let n1 = pending_button_nonce(&session).unwrap();
         let n2 = pending_button_nonce(&session).unwrap();
         assert_eq!(n1, n2, "peeking must not consume or rotate the nonce");
-        assert!(take_pending(&session).is_some(), "the slot is still there for the real consumer");
+        assert!(
+            take_pending(&session).is_some(),
+            "the slot is still there for the real consumer"
+        );
     }
 
     #[test]
     fn reply_has_confirmation_menu_detects_only_the_real_menu() {
-        assert!(!reply_has_confirmation_menu("普通的回覆，沒有任何建議選單。"));
+        assert!(!reply_has_confirmation_menu(
+            "普通的回覆，沒有任何建議選單。"
+        ));
         let with_menu = append_confirmation_menu("好的，我來處理。");
         assert!(reply_has_confirmation_menu(&with_menu));
     }
@@ -2007,7 +2196,10 @@ mod tests {
         let nonce = pending_button_nonce(&session).unwrap();
         let reply = handle_gintent_button(&ctx, GIntentChoice::DismissChat, &nonce).await;
         assert_eq!(reply, "好，那我們繼續聊。");
-        assert!(take_pending(&session).is_none(), "the slot must be consumed");
+        assert!(
+            take_pending(&session).is_none(),
+            "the slot must be consumed"
+        );
     }
 
     #[tokio::test]
@@ -2065,10 +2257,22 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn run_l2a_screen_maps_yes_no_and_unavailable() {
-        assert_eq!(run_l2a_screen(&FixedL2aScreener(Ok("YES".into())), "幫我整理這批資料").await, Some(true));
-        assert_eq!(run_l2a_screen(&FixedL2aScreener(Ok("NO".into())), "今天天氣如何").await, Some(false));
-        assert_eq!(run_l2a_screen(&FixedL2aScreener(Err("no backend".into())), "x").await, None);
-        assert_eq!(run_l2a_screen(&FixedL2aScreener(Ok("maybe?".into())), "x").await, None);
+        assert_eq!(
+            run_l2a_screen(&FixedL2aScreener(Ok("YES".into())), "幫我整理這批資料").await,
+            Some(true)
+        );
+        assert_eq!(
+            run_l2a_screen(&FixedL2aScreener(Ok("NO".into())), "今天天氣如何").await,
+            Some(false)
+        );
+        assert_eq!(
+            run_l2a_screen(&FixedL2aScreener(Err("no backend".into())), "x").await,
+            None
+        );
+        assert_eq!(
+            run_l2a_screen(&FixedL2aScreener(Ok("maybe?".into())), "x").await,
+            None
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2077,7 +2281,10 @@ mod tests {
         #[async_trait::async_trait]
         impl crate::autopilot_screen::LocalScreener for RecordingL2aScreener {
             async fn infer(&self, system: &str, user: &str) -> Result<String, String> {
-                self.0.lock().unwrap().push((system.to_string(), user.to_string()));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((system.to_string(), user.to_string()));
                 Ok("YES".into())
             }
         }
@@ -2095,7 +2302,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn resolve_gray_band_with_screener_maps_verdicts_to_actions() {
-        let suggest = resolve_gray_band_with_screener(&FixedL2aScreener(Ok("YES".into())), "x").await;
+        let suggest =
+            resolve_gray_band_with_screener(&FixedL2aScreener(Ok("YES".into())), "x").await;
         assert_eq!(suggest, GoalIntentAction::DirectSuggest);
 
         let chat = resolve_gray_band_with_screener(&FixedL2aScreener(Ok("NO".into())), "x").await;

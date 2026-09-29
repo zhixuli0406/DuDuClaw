@@ -131,14 +131,21 @@ fn format_label(f: Format) -> &'static str {
 
 /// Resolve `source` to a directory containing the pack. Handles a plain
 /// directory, a local `.zip`, and an `http(s)` URL to a `.zip`.
-async fn resolve_source(source: &str, staging: &Path) -> Result<PathBuf> {
+///
+/// `pub(crate)` so the unified `duduclaw pack` front door
+/// ([`crate::pack_cmd::install_pack`]) resolves a source through this exact
+/// fenced path (zip-slip guard, size cap, registry sha256 + minisign,
+/// `github:` side-door warning) instead of growing a second resolver.
+pub(crate) async fn resolve_source(source: &str, staging: &Path) -> Result<PathBuf> {
     // WP2.5: BRAT-style side door — `github:user/repo[@branch]` installs the
     // repo's default-branch archive directly. Unregistered and unreviewed;
     // say so honestly, then let the normal fences (zip fence, content scan,
     // hook quarantine) do their job.
     if let Some(spec) = source.strip_prefix("github:") {
         let (url, label) = super::registry::github_archive_url(spec.trim())?;
-        println!("  ⚠ 側門安裝 {label}：未經 registry 驗證，來源風險自負（掃描與 hooks 隔離照常生效）");
+        println!(
+            "  ⚠ 側門安裝 {label}：未經 registry 驗證，來源風險自負（掃描與 hooks 隔離照常生效）"
+        );
         std::fs::create_dir_all(staging).map_err(|e| io_err(format!("建立暫存目錄失敗: {e}")))?;
         let zip_path = staging.join("download.zip");
         download_zip(&url, &zip_path).await?;
@@ -187,7 +194,6 @@ async fn resolve_source(source: &str, staging: &Path) -> Result<PathBuf> {
     safe_zip::extract_to(&path, &unpack)?;
     Ok(unpack)
 }
-
 
 /// GitHub source archives wrap everything in a `<repo>-<branch>/` top dir —
 /// when the extraction root has exactly one directory and no manifest of its
@@ -431,7 +437,10 @@ async fn install_one_agent(
     if ctx.dry_run {
         report.imported("agent", &final_id);
         if !agent.department.trim().is_empty() {
-            report.imported("agent-department", &format!("{final_id} → {}", agent.department.trim()));
+            report.imported(
+                "agent-department",
+                &format!("{final_id} → {}", agent.department.trim()),
+            );
         }
         // Report referenced skills in plan mode too.
         plan_agent_skills(pack_dir, agent, report);
@@ -472,14 +481,21 @@ async fn install_one_agent(
                 .join(duduclaw_core::DEPARTMENTS_NAMESPACE)
                 .join(department);
             if let Err(e) = std::fs::create_dir_all(&wiki_dir) {
-                report.warning("agent-department", &final_id, format!("部門 wiki 目錄建立失敗: {e}"));
+                report.warning(
+                    "agent-department",
+                    &final_id,
+                    format!("部門 wiki 目錄建立失敗: {e}"),
+                );
             }
             report.imported("agent-department", &format!("{final_id} → {department}"));
         } else {
             report.warning(
                 "agent-department",
                 &final_id,
-                format!("department '{}' 非合法部門名，略過", department.escape_debug()),
+                format!(
+                    "department '{}' 非合法部門名，略過",
+                    department.escape_debug()
+                ),
             );
         }
     }
@@ -517,7 +533,11 @@ async fn install_one_agent(
         &ctx.home.join("agents").join(&final_id).join("agent.toml"),
     ) {
         if let Err(e) = duduclaw_core::org_store::upsert(&ctx.home, &final_id, entry) {
-            report.warning("agent-department", &final_id, format!("組織資料寫入失敗: {e}"));
+            report.warning(
+                "agent-department",
+                &final_id,
+                format!("組織資料寫入失敗: {e}"),
+            );
         }
     }
 
@@ -877,31 +897,32 @@ mod frontmatter_direction_tests {
     #[test]
     fn default_direction_frontmatter_omits_what_it_cannot_read() {
         for body in [
-            "",                                       // empty file
-            "[agent]\nname = \"a\"\n",                // unrelated section only
-            "[model]\n",                              // section, no key
-            "[model]\npreferred = 42\n",              // wrong type
-            "model = \"scalar\"\n",                   // wrong-typed section
+            "",                                           // empty file
+            "[agent]\nname = \"a\"\n",                    // unrelated section only
+            "[model]\n",                                  // section, no key
+            "[model]\npreferred = 42\n",                  // wrong type
+            "model = \"scalar\"\n",                       // wrong-typed section
             "[capabilities]\nallowed_tools = \"Bash\"\n", // non-array
-            "not toml [[[",                           // malformed file
+            "not toml [[[",                               // malformed file
         ] {
             let (model, tools, disallowed) = fm(body);
             if body.contains("preferred = 42") || !body.contains("preferred") {
                 assert!(model.is_none(), "model omitted for {body:?}");
             }
             assert!(tools.is_empty(), "tools omitted for {body:?}");
-            assert!(disallowed.is_empty(), "disallowedTools omitted for {body:?}");
+            assert!(
+                disallowed.is_empty(),
+                "disallowedTools omitted for {body:?}"
+            );
         }
     }
 
     #[test]
     fn default_direction_frontmatter_filters_mixed_arrays_instead_of_dropping_them() {
-        let (model, tools, disallowed) = fm(
-            "[model]\npreferred = \"claude-sonnet-4-6\"\n\
+        let (model, tools, disallowed) = fm("[model]\npreferred = \"claude-sonnet-4-6\"\n\
              [capabilities]\n\
              allowed_tools = [\"Bash\", 7, \"Read\"]\n\
-             denied_tools = [\"WebFetch\"]\n",
-        );
+             denied_tools = [\"WebFetch\"]\n");
         assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(tools, vec!["Bash".to_string(), "Read".to_string()]);
         assert_eq!(disallowed, vec!["WebFetch".to_string()]);

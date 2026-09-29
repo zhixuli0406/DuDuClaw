@@ -20,7 +20,10 @@ use super::script::{ApiActionRequest, CodriveAction, CodriveScript};
 use super::tests::{api_action_step, plain_step, spawn_fake_comp, tempdir, write_codrive_config};
 
 fn api_req(action: &str, params: serde_json::Value) -> ApiActionRequest {
-    ApiActionRequest { action: action.to_string(), params }
+    ApiActionRequest {
+        action: action.to_string(),
+        params,
+    }
 }
 
 // ── hit: registry serves the step, comp never sees it ──────────────────
@@ -49,10 +52,17 @@ async fn registry_hit_step_executes_without_touching_comp() {
         .await
         .expect("run_script must finish");
 
-    assert_eq!(report.final_state, "completed", "detail: {:?}", report.detail);
+    assert_eq!(
+        report.final_state, "completed",
+        "detail: {:?}",
+        report.detail
+    );
     assert_eq!(report.steps.len(), 1);
     assert_eq!(report.steps[0].outcome, "api_action");
-    assert!(std::path::Path::new(&target).exists(), "the C-L2 side effect must be real");
+    assert!(
+        std::path::Path::new(&target).exists(),
+        "the C-L2 side effect must be real"
+    );
 
     let received = fake.received.lock().await;
     assert!(
@@ -87,11 +97,22 @@ async fn registry_miss_step_falls_back_and_injects_normally() {
         .await
         .expect("run_script must finish");
 
-    assert_eq!(report.final_state, "completed", "detail: {:?}", report.detail);
-    assert_eq!(report.steps[0].outcome, "applied", "a registry MISS must fall back to the ordinary C-L1 outcome");
+    assert_eq!(
+        report.final_state, "completed",
+        "detail: {:?}",
+        report.detail
+    );
+    assert_eq!(
+        report.steps[0].outcome, "applied",
+        "a registry MISS must fall back to the ordinary C-L1 outcome"
+    );
 
     let received = fake.received.lock().await;
-    assert_eq!(received.len(), 1, "the fallback coordinate action must still reach comp: {received:?}");
+    assert_eq!(
+        received.len(),
+        1,
+        "the fallback coordinate action must still reach comp: {received:?}"
+    );
     assert_eq!(received[0]["op"], "move");
     drop(received);
 
@@ -123,11 +144,22 @@ async fn registry_exec_failure_falls_back_and_injects_normally() {
         .await
         .expect("run_script must finish");
 
-    assert_eq!(report.final_state, "completed", "detail: {:?}", report.detail);
-    assert_eq!(report.steps[0].outcome, "applied", "an exec FAILURE must fall back to the ordinary C-L1 outcome");
+    assert_eq!(
+        report.final_state, "completed",
+        "detail: {:?}",
+        report.detail
+    );
+    assert_eq!(
+        report.steps[0].outcome, "applied",
+        "an exec FAILURE must fall back to the ordinary C-L1 outcome"
+    );
 
     let received = fake.received.lock().await;
-    assert_eq!(received.len(), 1, "the fallback coordinate action must still reach comp: {received:?}");
+    assert_eq!(
+        received.len(),
+        1,
+        "the fallback coordinate action must still reach comp: {received:?}"
+    );
     assert_eq!(received[0]["op"], "move");
     drop(received);
 
@@ -170,19 +202,35 @@ async fn consequential_api_action_step_still_waits_for_approval() {
 
     let broker = ApprovalBroker::open(&home).expect("open broker");
     let approval_id = wait_for_one_pending(&broker, Duration::from_secs(5)).await;
-    assert!(!std::path::Path::new(&target).exists(), "the C-L2 side effect must not happen before approval");
+    assert!(
+        !std::path::Path::new(&target).exists(),
+        "the C-L2 side effect must not happen before approval"
+    );
 
-    broker.decide(&approval_id, true, "test").await.expect("decide");
+    broker
+        .decide(&approval_id, true, "test")
+        .await
+        .expect("decide");
 
     let report = tokio::time::timeout(Duration::from_secs(10), handle)
         .await
         .expect("join")
         .expect("no panic");
-    assert_eq!(report.final_state, "completed", "detail: {:?}", report.detail);
+    assert_eq!(
+        report.final_state, "completed",
+        "detail: {:?}",
+        report.detail
+    );
     assert_eq!(report.steps[0].outcome, "api_action");
     assert!(report.steps[0].approval_id.is_some());
-    assert!(std::path::Path::new(&target).exists(), "the C-L2 side effect must happen after approval");
-    assert!(fake.received.lock().await.is_empty(), "an approved C-L2 hit still never touches comp");
+    assert!(
+        std::path::Path::new(&target).exists(),
+        "the C-L2 side effect must happen after approval"
+    );
+    assert!(
+        fake.received.lock().await.is_empty(),
+        "an approved C-L2 hit still never touches comp"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -197,7 +245,10 @@ async fn wait_for_one_pending(
         if let Some(rec) = pending.into_iter().next() {
             return rec.id;
         }
-        assert!(tokio::time::Instant::now() < deadline, "approval row never appeared");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "approval row never appeared"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -231,7 +282,8 @@ async fn plain_step_without_api_action_is_unaffected_by_the_registry() {
 }
 
 fn assert_registry_audit_row(home: &std::path::Path, expected_registry_outcome: &str) {
-    let rows = duduclaw_security::audit::read_tool_calls_since(home, "agent1", "2020-01-01T00:00:00Z");
+    let rows =
+        duduclaw_security::audit::read_tool_calls_since(home, "agent1", "2020-01-01T00:00:00Z");
     let hit = rows.iter().find(|r| {
         r.get("tool_name").and_then(|v| v.as_str()) == Some("codrive_run")
             && r.get("registry_outcome").and_then(|v| v.as_str()) == Some(expected_registry_outcome)

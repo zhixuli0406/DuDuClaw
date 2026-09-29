@@ -15,7 +15,9 @@ use crate::gvu::verifier::CanaryTest;
 use crate::gvu::verifier_measure::{CaseScore, MeasureScorer, NullScorer, ScoreRequest};
 use crate::playbook::entry::PlaybookCategory;
 
-use super::inner_loop::{parse_deltas, run_inner_loop, InnerLoopExit, InnerLoopInput, MAX_INNER_ROUNDS};
+use super::inner_loop::{
+    InnerLoopExit, InnerLoopInput, MAX_INNER_ROUNDS, parse_deltas, run_inner_loop,
+};
 use super::prompt::PromptContext;
 use super::snapshot::PlaybookSnapshot;
 
@@ -47,7 +49,10 @@ fn input<'a>(
     InnerLoopInput {
         agent_id: "agent-aee",
         base,
-        ctx: PromptContext { agent_id: "agent-aee".into(), ..Default::default() },
+        ctx: PromptContext {
+            agent_id: "agent-aee".into(),
+            ..Default::default()
+        },
         must_not,
         must_always: &[],
         canary_tests: canaries,
@@ -76,7 +81,11 @@ impl ScriptedLlm {
     fn call(&self, prompt: String) -> Result<String, String> {
         self.prompts.lock().unwrap().push(prompt);
         let i = self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.replies.get(i).cloned().unwrap_or_else(|| self.replies.last().unwrap().clone()))
+        Ok(self
+            .replies
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| self.replies.last().unwrap().clone()))
     }
 }
 
@@ -96,7 +105,11 @@ async fn inner_loop_never_exceeds_three_rounds() {
     let none: Vec<String> = Vec::new();
     let canaries: Vec<CanaryTest> = Vec::new();
     // Every round scores a failure, so the loop always wants another round.
-    let scorer = FailingScorer(vec![CaseScore { case: "s/c1".into(), score: 0.0, held_out: false }]);
+    let scorer = FailingScorer(vec![CaseScore {
+        case: "s/c1".into(),
+        score: 0.0,
+        held_out: false,
+    }]);
     // Distinct content each round so the "identical rejection" escalation
     // does not fire and mask the round cap.
     let llm = ScriptedLlm::new(&[
@@ -116,7 +129,10 @@ async fn inner_loop_never_exceeds_three_rounds() {
     .await;
 
     assert_eq!(out.rounds_used, MAX_INNER_ROUNDS);
-    assert_eq!(out.llm_calls, MAX_INNER_ROUNDS, "one generation call per round, no more");
+    assert_eq!(
+        out.llm_calls, MAX_INNER_ROUNDS,
+        "one generation call per round, no more"
+    );
     assert_eq!(out.exit, InnerLoopExit::RoundsExhausted);
     assert!(out.has_candidate());
 }
@@ -126,7 +142,11 @@ async fn a_clean_candidate_stops_after_one_round() {
     let root = eval_root();
     let none: Vec<String> = Vec::new();
     let canaries: Vec<CanaryTest> = Vec::new();
-    let scorer = FailingScorer(vec![CaseScore { case: "s/c1".into(), score: 1.0, held_out: false }]);
+    let scorer = FailingScorer(vec![CaseScore {
+        case: "s/c1".into(),
+        score: 1.0,
+        held_out: false,
+    }]);
     let llm = ScriptedLlm::new(&[GOOD_ADD]);
 
     let out = run_inner_loop(
@@ -140,7 +160,10 @@ async fn a_clean_candidate_stops_after_one_round() {
     .await;
 
     assert_eq!(out.exit, InnerLoopExit::Satisfied);
-    assert_eq!(out.llm_calls, 1, "a satisfied candidate must not pay for rounds 2 and 3");
+    assert_eq!(
+        out.llm_calls, 1,
+        "a satisfied candidate must not pay for rounds 2 and 3"
+    );
     assert_eq!(out.deltas.len(), 1);
 }
 
@@ -150,7 +173,9 @@ async fn inner_loop_leaves_no_sqlite_row_on_abandon() {
     // that can never succeed and prove the memory store is untouched.
     let engine = duduclaw_memory::SqliteMemoryEngine::in_memory().unwrap();
     let agent = "agent-abandon";
-    let before = crate::playbook::store::list_active(&engine, agent).await.len();
+    let before = crate::playbook::store::list_active(&engine, agent)
+        .await
+        .len();
 
     let root = eval_root();
     let none: Vec<String> = Vec::new();
@@ -180,8 +205,13 @@ async fn inner_loop_leaves_no_sqlite_row_on_abandon() {
         out.exit
     );
     assert!(!out.has_candidate());
-    let after = crate::playbook::store::list_active(&engine, agent).await.len();
-    assert_eq!(before, after, "the inner loop must not persist a single row");
+    let after = crate::playbook::store::list_active(&engine, agent)
+        .await
+        .len();
+    assert_eq!(
+        before, after,
+        "the inner loop must not persist a single row"
+    );
 }
 
 #[tokio::test]
@@ -200,7 +230,10 @@ async fn an_empty_delta_array_is_an_honest_answer_not_a_failure() {
     )
     .await;
     assert_eq!(out.exit, InnerLoopExit::NothingProposed);
-    assert_eq!(out.llm_calls, 1, "no point re-asking a model that correctly said 'nothing'");
+    assert_eq!(
+        out.llm_calls, 1,
+        "no point re-asking a model that correctly said 'nothing'"
+    );
 }
 
 #[tokio::test]
@@ -214,8 +247,14 @@ async fn generator_failure_is_infrastructure_not_a_quality_signal() {
         |_p| async { Err("rate limited".to_string()) },
     )
     .await;
-    assert!(matches!(out.exit, InnerLoopExit::GeneratorUnavailable { .. }));
-    assert!(out.gate_rejections.is_empty(), "an LLM outage must not be logged as a gate rejection");
+    assert!(matches!(
+        out.exit,
+        InnerLoopExit::GeneratorUnavailable { .. }
+    ));
+    assert!(
+        out.gate_rejections.is_empty(),
+        "an LLM outage must not be logged as a gate rejection"
+    );
 }
 
 #[tokio::test]
@@ -236,11 +275,17 @@ async fn two_identical_gate_rejections_escalate_to_human() {
     .await;
     match out.exit {
         InnerLoopExit::EscalateToHuman { ref reason } => {
-            assert!(reason.contains("twice"), "reason should name the repetition: {reason}")
+            assert!(
+                reason.contains("twice"),
+                "reason should name the repetition: {reason}"
+            )
         }
         other => panic!("expected escalation, got {other:?}"),
     }
-    assert!(out.llm_calls < MAX_INNER_ROUNDS, "escalation must save the remaining rounds");
+    assert!(
+        out.llm_calls < MAX_INNER_ROUNDS,
+        "escalation must save the remaining rounds"
+    );
 }
 
 #[tokio::test]
@@ -294,7 +339,10 @@ async fn already_escalated_streak_lets_the_round_run() {
         "round must run instead of re-escalating: {:?}",
         out.exit
     );
-    assert!(out.llm_calls > 0, "the generator must actually be consulted");
+    assert!(
+        out.llm_calls > 0,
+        "the generator must actually be consulted"
+    );
 }
 
 #[tokio::test]
@@ -323,11 +371,15 @@ async fn an_entry_may_not_link_a_holdout_case() {
     )
     .await;
 
-    assert!(!out.has_candidate(), "a held-out-linked entry must never become a candidate");
-    assert!(out
-        .rejected
-        .iter()
-        .any(|(_, reason)| reason.contains("held-out")));
+    assert!(
+        !out.has_candidate(),
+        "a held-out-linked entry must never become a candidate"
+    );
+    assert!(
+        out.rejected
+            .iter()
+            .any(|(_, reason)| reason.contains("held-out"))
+    );
 }
 
 #[tokio::test]
@@ -345,10 +397,11 @@ async fn optimize_round_rejects_adds() {
     })
     .await;
 
-    assert!(out
-        .rejected
-        .iter()
-        .any(|(_, reason)| reason.contains("optimize rounds may not add")));
+    assert!(
+        out.rejected
+            .iter()
+            .any(|(_, reason)| reason.contains("optimize rounds may not add"))
+    );
 }
 
 #[tokio::test]
@@ -373,7 +426,11 @@ async fn copied_example_eval_case_ref_is_rejected() {
     .await;
 
     assert!(!out.has_candidate());
-    assert!(out.rejected.iter().any(|(_, r)| r.contains("unknown eval case")));
+    assert!(
+        out.rejected
+            .iter()
+            .any(|(_, r)| r.contains("unknown eval case"))
+    );
 }
 
 #[tokio::test]
@@ -416,7 +473,7 @@ fn pending_notes_are_written_even_when_the_round_is_abandoned() {
     use super::merge_pending_notes;
     use super::snapshot::PendingFailureNote;
     use crate::playbook::delta::ExistingEntry;
-    use crate::playbook::entry::{PlaybookMeta, PlaybookState, PLAYBOOK_SCHEMA_VERSION};
+    use crate::playbook::entry::{PLAYBOOK_SCHEMA_VERSION, PlaybookMeta, PlaybookState};
     use crate::prediction::rule_lifecycle::RuleStats;
 
     let mut snap = PlaybookSnapshot::new(vec![ExistingEntry {
@@ -426,6 +483,7 @@ fn pending_notes_are_written_even_when_the_round_is_abandoned() {
             assertions: Default::default(),
             schema_version: PLAYBOOK_SCHEMA_VERSION,
             category: PlaybookCategory::Repair,
+            transferability: Default::default(),
             signals_match: vec!["mistake:factual".into()],
             strategy: Vec::new(),
             failure_history: Vec::new(),
@@ -444,7 +502,11 @@ fn pending_notes_are_written_even_when_the_round_is_abandoned() {
 
     let written = merge_pending_notes(
         &mut snap,
-        &[PendingFailureNote::new("e1", "G-Contract said no", "G-Contract")],
+        &[PendingFailureNote::new(
+            "e1",
+            "G-Contract said no",
+            "G-Contract",
+        )],
         now(),
     );
     assert_eq!(written, 1);

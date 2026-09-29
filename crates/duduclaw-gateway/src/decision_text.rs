@@ -97,9 +97,9 @@ pub async fn route_text_reply(
     text: &str,
 ) -> Option<Result<String, String>> {
     match resolve_action(home_dir, channel, chat_id, replied_message_id, text)? {
-        Ok(action) => {
-            Some(crate::decision_notify::dispatch(home_dir, channel, channel_user_id, &action).await)
-        }
+        Ok(action) => Some(
+            crate::decision_notify::dispatch(home_dir, channel, channel_user_id, &action).await,
+        ),
         Err(msg) => Some(Err(msg)),
     }
 }
@@ -130,7 +130,10 @@ mod tests {
             "apr-123",
             "telegram",
             "555",
-            &PushedMessage { edit_chat_id: "555".into(), message_id: "9001".into() },
+            &PushedMessage {
+                edit_chat_id: "555".into(),
+                message_id: "9001".into(),
+            },
         );
 
         // Right message + valid verb ⇒ action.
@@ -153,6 +156,15 @@ mod tests {
         // Wrong message id / non-card reply ⇒ None (flow to agent).
         assert!(resolve_action(dir.path(), "telegram", "555", "9999", "同意").is_none());
         // Plain sentence to the right card ⇒ None (flow to agent).
-        assert!(resolve_action(dir.path(), "telegram", "555", "9001", "同意這方向，但預算再談").is_none());
+        assert!(
+            resolve_action(
+                dir.path(),
+                "telegram",
+                "555",
+                "9001",
+                "同意這方向，但預算再談"
+            )
+            .is_none()
+        );
     }
 }

@@ -11,7 +11,7 @@ authors.workspace = true
 # Normalizes Anthropic Messages / OpenAI Responses / Gemini generateContent /
 # OpenAI-compatible chat-completions behind one `ChatProvider` trait, with a
 # vendored `ModelRegistry` (context windows, millicent pricing, capability
-# flags) and a cooldown-aware `FallbackRouter`.
+# flags).
 #
 # Absorbs the behavior of `duduclaw-gateway/src/direct_api.rs` (layered
 # cache breakpoints, "system_and_3" history breakpoint) and will eventually
@@ -53,6 +53,9 @@ futures-util = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

@@ -55,7 +55,8 @@ fn parse_env_handles_export_quotes_comments() {
 
 #[test]
 fn frontmatter_split_and_body() {
-    let doc = "---\nname: Alice\ntitle: Engineer\nreportsTo: bob\n---\nYou are Alice.\nBe precise.\n";
+    let doc =
+        "---\nname: Alice\ntitle: Engineer\nreportsTo: bob\n---\nYou are Alice.\nBe precise.\n";
     let (fm, body) = parse_frontmatter(doc);
     let fm = fm.expect("frontmatter parsed");
     assert_eq!(fm.get("name").and_then(|v| v.as_str()), Some("Alice"));
@@ -377,178 +378,6 @@ async fn json_output_matches_locked_contract() {
 }
 
 #[tokio::test]
-async fn agentcompanies_round_trip_preserves_identity_soul_skills_hierarchy() {
-    // G9: export a DuDuClaw team as an agentcompanies/v1 package, import it
-    // into a fresh home via `migrate-from paperclip`, and assert identity /
-    // soul / skills / reports_to hierarchy survive. Soul is byte-stable
-    // modulo one trailing newline (frontmatter body parsing normalizes it).
-    let tmp = tempfile::tempdir().unwrap();
-    let home_a = tmp.path().join("home-a");
-    std::fs::create_dir_all(&home_a).unwrap();
-
-    let boss_soul = "# Boss\n\nI am the boss. 我負責決策。\n";
-    let worker_soul = "# Worker\n\nI am the worker.\n";
-    crate::scaffold_agent_dir(
-        &home_a,
-        &crate::AgentScaffold {
-            name: "boss".into(),
-            display_name: "Boss".into(),
-            role: "main".into(),
-            reports_to: String::new(),
-            icon: "🐾".into(),
-            trigger: "@Boss".into(),
-            provider: duduclaw_core::types::RuntimeType::Claude,
-            model_preferred: None,
-            soul_body: Some(boss_soul.to_string()),
-        },
-    )
-    .await
-    .unwrap();
-    crate::scaffold_agent_dir(
-        &home_a,
-        &crate::AgentScaffold {
-            name: "worker".into(),
-            display_name: "Worker".into(),
-            role: "specialist".into(),
-            reports_to: "boss".into(),
-            icon: "🤖".into(),
-            trigger: "@Worker".into(),
-            provider: duduclaw_core::types::RuntimeType::Claude,
-            model_preferred: None,
-            soul_body: Some(worker_soul.to_string()),
-        },
-    )
-    .await
-    .unwrap();
-
-    // A skill owned by worker + a behavioral contract on boss.
-    let skill_dir = home_a.join("agents/worker/SKILLS/hello-skill");
-    std::fs::create_dir_all(&skill_dir).unwrap();
-    std::fs::write(
-        skill_dir.join("SKILL.md"),
-        "# Hello Skill\nFormats greetings nicely.\n",
-    )
-    .unwrap();
-    std::fs::write(
-        home_a.join("agents/boss/CONTRACT.toml"),
-        "[boundaries]\nmust_not = [\"leak secrets\"]\nmust_always = [\"answer in zh-TW\"]\n",
-    )
-    .unwrap();
-
-    // ── Export ──
-    let out = tmp.path().join("pkg");
-    let export_report = crate::export_to::export_package(&home_a, None, &out).unwrap();
-    assert_eq!(export_report.overall(), "COMPLETE");
-
-    // Deterministic: a second export is byte-identical file by file.
-    let out2 = tmp.path().join("pkg2");
-    crate::export_to::export_package(&home_a, None, &out2).unwrap();
-    for rel in [
-        "COMPANY.md",
-        "agents/boss/AGENTS.md",
-        "agents/boss/docs/contract.md",
-        "agents/worker/AGENTS.md",
-        "skills/hello-skill/SKILL.md",
-        ".paperclip.yaml",
-    ] {
-        assert_eq!(
-            std::fs::read(out.join(rel)).unwrap(),
-            std::fs::read(out2.join(rel)).unwrap(),
-            "{rel} must be deterministic across exports"
-        );
-    }
-
-    // Spec-conformant shape.
-    let worker_md = std::fs::read_to_string(out.join("agents/worker/AGENTS.md")).unwrap();
-    assert!(worker_md.contains("schema: agentcompanies/v1"));
-    assert!(worker_md.contains("kind: agent"));
-    assert!(worker_md.contains("slug: worker"));
-    assert!(worker_md.contains("reportsTo: boss"));
-    // Membership, not position. `scaffold_agent_dir` seeds the bundled skills
-    // (WP19 — every agent-creation path now does, so a migrated team starts
-    // with the same baseline capability as a hand-created one), and the
-    // exporter sorts the list, so `hello-skill` is no longer the first entry.
-    // Anchoring on both newlines keeps this from matching a longer name that
-    // merely starts with `hello-skill`.
-    assert!(
-        worker_md.contains("\n  - hello-skill\n"),
-        "the imported skill must survive the round trip: {worker_md}"
-    );
-    // Pin the seeding as deliberate: a migrated agent gets the bundled skills
-    // too, and the seed is idempotent — it must not have clobbered the
-    // imported `hello-skill` above.
-    let bundled = duduclaw_agent::builtin_skills::BUILTIN_SKILLS
-        .iter()
-        .map(|(n, _)| *n)
-        .chain(
-            duduclaw_agent::builtin_skills::BUILTIN_SKILL_FILES
-                .iter()
-                .map(|(n, _)| *n),
-        );
-    for name in bundled {
-        assert!(
-            worker_md.contains(&format!("\n  - {name}\n")),
-            "a scaffolded agent must also carry the bundled skill `{name}`: {worker_md}"
-        );
-    }
-    assert!(worker_md.ends_with(worker_soul));
-    let contract_doc =
-        std::fs::read_to_string(out.join("agents/boss/docs/contract.md")).unwrap();
-    assert!(contract_doc.contains("leak secrets"));
-    assert!(contract_doc.contains("answer in zh-TW"));
-
-    // ── Import into a fresh home ──
-    let home_b = tmp.path().join("home-b");
-    std::fs::create_dir_all(&home_b).unwrap();
-    let ctx = Ctx {
-        home: home_b.clone(),
-        platform: Platform::Paperclip,
-        apply: true,
-        rename: false,
-        agent: None,
-        redact: true,
-    };
-    let import_report = super::paperclip::migrate(&ctx, Some(out.clone())).await.unwrap();
-    assert!(
-        import_report
-            .items
-            .iter()
-            .any(|i| i.category == "agent" && matches!(i.status, Status::Imported)),
-        "agents must import: {:?}",
-        import_report.items
-    );
-
-    // Identity + hierarchy survived.
-    let worker_toml =
-        std::fs::read_to_string(home_b.join("agents/worker/agent.toml")).unwrap();
-    assert!(worker_toml.contains("display_name = \"Worker\""));
-    assert!(worker_toml.contains("reports_to = \"boss\""));
-    let boss_toml = std::fs::read_to_string(home_b.join("agents/boss/agent.toml")).unwrap();
-    assert!(boss_toml.contains("reports_to = \"\""));
-    // Role survives the round trip (exported `title` → canonical role).
-    assert!(boss_toml.contains("role = \"main\""));
-    assert!(worker_toml.contains("role = \"specialist\""));
-
-    // Soul byte-stable (modulo trailing newline normalization).
-    let soul_b = std::fs::read_to_string(home_b.join("agents/boss/SOUL.md")).unwrap();
-    assert_eq!(soul_b.trim_end_matches('\n'), boss_soul.trim_end_matches('\n'));
-    let soul_w = std::fs::read_to_string(home_b.join("agents/worker/SOUL.md")).unwrap();
-    assert_eq!(soul_w.trim_end_matches('\n'), worker_soul.trim_end_matches('\n'));
-
-    // Skill survived (and passed the injection scan).
-    let skill = std::fs::read_to_string(
-        home_b.join("agents/worker/SKILLS/hello-skill/SKILL.md"),
-    )
-    .unwrap();
-    assert!(skill.contains("Formats greetings nicely"));
-
-    // No secrets anywhere in the package (fixture is clean; the redaction
-    // path itself is covered in export_to unit tests).
-    let company = std::fs::read_to_string(out.join("COMPANY.md")).unwrap();
-    assert!(company.contains("## Excluded secrets"));
-}
-
-#[tokio::test]
 async fn paperclip_package_teams_projects_sidecar_covered() {
     // A fuller agentcompanies package: TEAM.md manager bridging, a task
     // nested under projects/<p>/tasks/<t>/, and .paperclip.yaml schedule
@@ -641,7 +470,9 @@ async fn paperclip_rejects_non_package_dir_fail_closed() {
         agent: None,
         redact: true,
     };
-    let err = super::paperclip::migrate(&ctx, Some(junk)).await.unwrap_err();
+    let err = super::paperclip::migrate(&ctx, Some(junk))
+        .await
+        .unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("agentcompanies"),
@@ -665,7 +496,14 @@ fn channel_conflict_not_overwritten() {
         "telegram_bot_token".into(),
         toml::Value::String("existing".into()),
     );
-    plan_channel_token(&ctx, &mut report, &mut channels, "telegram", "new-token", None);
+    plan_channel_token(
+        &ctx,
+        &mut report,
+        &mut channels,
+        "telegram",
+        "new-token",
+        None,
+    );
     // existing value must be untouched
     assert_eq!(
         channels.get("telegram_bot_token").and_then(|v| v.as_str()),

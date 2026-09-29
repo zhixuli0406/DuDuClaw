@@ -16,7 +16,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -599,7 +599,12 @@ fn seed_candidate_paths() -> Vec<PathBuf> {
         }
         // Conservative upward search for the macOS App bundle Resources dir.
         for ancestor in exe.ancestors().skip(1).take(4) {
-            candidates.push(ancestor.join("Contents").join("Resources").join(BUNDLE_FILENAME));
+            candidates.push(
+                ancestor
+                    .join("Contents")
+                    .join("Resources")
+                    .join(BUNDLE_FILENAME),
+            );
         }
     }
     candidates
@@ -760,9 +765,8 @@ pub fn validate_input(input: BrandingInput) -> Result<BrandingConfig, String> {
 /// `#rrggbbaa`) is rejected so the value can be interpolated into CSS safely.
 pub fn validate_accent_color(c: &str) -> Result<String, String> {
     let bytes = c.as_bytes();
-    let ok = bytes.len() == 7
-        && bytes[0] == b'#'
-        && bytes[1..].iter().all(|b| b.is_ascii_hexdigit());
+    let ok =
+        bytes.len() == 7 && bytes[0] == b'#' && bytes[1..].iter().all(|b| b.is_ascii_hexdigit());
     if !ok {
         return Err("主題色格式無效（須為 #rrggbb，例如 #f59e0b）".to_string());
     }
@@ -963,17 +967,25 @@ pub(crate) fn validate_image_data_uri(
     // up front rather than after a large decode allocation.
     let max_b64_len = max_decoded / 3 * 4 + 4;
     if b64.len() > max_b64_len {
-        return Err(format!("{label} 檔案過大（上限 {} KB）", max_decoded / 1024));
+        return Err(format!(
+            "{label} 檔案過大（上限 {} KB）",
+            max_decoded / 1024
+        ));
     }
 
     let bytes = BASE64
         .decode(b64)
         .map_err(|_| format!("{label} base64 解碼失敗"))?;
     if bytes.len() > max_decoded {
-        return Err(format!("{label} 檔案過大（上限 {} KB）", max_decoded / 1024));
+        return Err(format!(
+            "{label} 檔案過大（上限 {} KB）",
+            max_decoded / 1024
+        ));
     }
     if !magic_matches(&bytes, kind) {
-        return Err(format!("{label} 內容與宣告的格式不符（magic bytes 驗證失敗）"));
+        return Err(format!(
+            "{label} 內容與宣告的格式不符（magic bytes 驗證失敗）"
+        ));
     }
     Ok(ValidatedImage { bytes, kind })
 }
@@ -996,7 +1008,9 @@ fn magic_matches(bytes: &[u8], kind: ImageKind) -> bool {
 // `duduclaw_license::bundle` module so the cloud control-plane can sign bundles
 // that verify byte-identically here. Re-exported so existing call sites
 // (`crate::branding::sign_bundle`, `BUNDLE_KEY_ID`, …) are unchanged.
-pub use duduclaw_license::{sign_bundle, verify_bundle, BrandingBundle, BUNDLE_KEY_ID, BUNDLE_SCHEMA};
+pub use duduclaw_license::{
+    BUNDLE_KEY_ID, BUNDLE_SCHEMA, BrandingBundle, sign_bundle, verify_bundle,
+};
 
 // ── Effective product name (channel white-label, §10.6) ───────────────────
 
@@ -1219,7 +1233,10 @@ mod tests {
         let raw = r#"<a href="https://acme.example">acme</a>"#;
         let out = sanitize_about_html(raw).unwrap().unwrap();
         assert!(out.contains("https://acme.example"));
-        assert!(out.contains("rel=") && out.contains("nofollow"), "rel forced: {out}");
+        assert!(
+            out.contains("rel=") && out.contains("nofollow"),
+            "rel forced: {out}"
+        );
         assert!(out.contains("target=\"_blank\""), "target forced: {out}");
     }
 
@@ -1227,7 +1244,10 @@ mod tests {
     fn sanitize_allows_whitelisted_data_image_and_drops_svg() {
         let good = format!(r#"<img src="{}">"#, png_data_uri());
         let out = sanitize_about_html(&good).unwrap().unwrap();
-        assert!(out.contains("data:image/png;base64,"), "png data uri kept: {out}");
+        assert!(
+            out.contains("data:image/png;base64,"),
+            "png data uri kept: {out}"
+        );
 
         let svg = r#"<img src="data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=">"#;
         let out2 = sanitize_about_html(svg).unwrap().unwrap_or_default();
@@ -1423,8 +1443,14 @@ mod tests {
         let (cfg, src) = load_with_source_using(dir.path(), &registry);
         assert_eq!(src, SOURCE_LOCAL);
         let html = cfg.about_html.unwrap();
-        assert!(!html.contains("script"), "read-time sanitize strips script: {html}");
-        assert!(!html.contains("onclick"), "read-time sanitize strips handler: {html}");
+        assert!(
+            !html.contains("script"),
+            "read-time sanitize strips script: {html}"
+        );
+        assert!(
+            !html.contains("onclick"),
+            "read-time sanitize strips handler: {html}"
+        );
         // Invalid accent dropped on read (fail-safe).
         assert!(cfg.accent_color.is_none());
     }
@@ -1522,8 +1548,7 @@ mod tests {
         write_signed_bundle(&env_cand, &seed);
         write_signed_bundle(&exe_cand, &seed);
 
-        let outcome =
-            seed_bundle_using(home.path(), &registry, &[env_cand.clone(), exe_cand]);
+        let outcome = seed_bundle_using(home.path(), &registry, &[env_cand.clone(), exe_cand]);
         assert_eq!(outcome, SeedOutcome::Seeded { source: env_cand });
     }
 
@@ -1541,7 +1566,10 @@ mod tests {
     #[test]
     fn unlisted_field_is_system_only() {
         // Fail-closed: any field not explicitly promoted to Vendor is SystemOnly.
-        assert_eq!(field_level("some_future_field"), BrandingFieldLevel::SystemOnly);
+        assert_eq!(
+            field_level("some_future_field"),
+            BrandingFieldLevel::SystemOnly
+        );
         assert_eq!(field_level(""), BrandingFieldLevel::SystemOnly);
         // A real vendor field resolves as Vendor.
         assert_eq!(field_level("logo_data_uri"), BrandingFieldLevel::Vendor);
@@ -1632,7 +1660,10 @@ mod tests {
         let cust = BrandingEditScope::Customer(vec!["logo_data_uri".into()]);
         let mut v = disallowed_fields(&cust, &input);
         v.sort();
-        assert_eq!(v, vec!["about_html".to_string(), "product_name".to_string()]);
+        assert_eq!(
+            v,
+            vec!["about_html".to_string(), "product_name".to_string()]
+        );
         // Empty/omitted fields are not "present" → never a violation.
         let empty = BrandingInput {
             product_name: Some("   ".into()), // whitespace = not a real edit

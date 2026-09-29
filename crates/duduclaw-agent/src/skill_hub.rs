@@ -10,7 +10,14 @@
 //! | `github`    | GitHub Search API (existing indexer, unchanged)      | VERIFIED |
 //! | `clawhub`   | `GET https://clawhub.ai/api/v1/skills` (+ `/:slug`)  | VERIFIED — 200 JSON unauthenticated |
 //! | `lobehub`   | `GET https://chat-plugins.lobehub.com/index.json`    | VERIFIED — 200 JSON unauthenticated |
-//! | `skills-sh` | `https://skills.sh/api/v1/*`                         | UNVERIFIED — requires a Vercel OIDC bearer token (unauthenticated calls return 401 `authentication_required`); stub only, excluded from defaults |
+//! | `skills-sh` | `https://skills.sh/api/v1/*`                         | UNVERIFIED — requires a Vercel OIDC bearer token (unauthenticated calls return 401 `authentication_required`) |
+//!
+//! Correction (2026-09-29 feature audit, G8): this table used to say
+//! `skills-sh` was a "stub only, excluded from defaults". It is **in**
+//! [`DEFAULT_HUB_IDS`], so every aggregate search does query it. Because it
+//! answers 401 without a token, the honest outcome is that it contributes
+//! nothing and is reported through the same `[unreachable: <hub>: …]` path a
+//! timeout would use — not that it is skipped.
 //!
 //! Design rules:
 //! - **Per-hub 24h cache** at `<home>/skill_hub_cache/<hub>.json`, reusing the

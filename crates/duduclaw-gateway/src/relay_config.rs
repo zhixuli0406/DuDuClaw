@@ -90,7 +90,11 @@ impl RelayConfig {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        Self { enabled, url, device_name }
+        Self {
+            enabled,
+            url,
+            device_name,
+        }
     }
 
     fn defaults_for(is_appliance: bool) -> Self {
@@ -135,7 +139,9 @@ pub fn hook_ws_endpoint(base_url: &str, device_id: &str) -> Result<String, Strin
         .host_str()
         .ok_or_else(|| "relay url missing host".to_string())?;
     let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
-    Ok(format!("{ws_scheme}://{host}{port}/v1/device/ws?device_id={device_id}"))
+    Ok(format!(
+        "{ws_scheme}://{host}{port}/v1/device/ws?device_id={device_id}"
+    ))
 }
 
 /// Validate the configured relay base URL (`http`/`https` only; a
@@ -213,7 +219,10 @@ mod tests {
     #[test]
     fn explicit_enabled_false_wins_even_in_appliance_mode() {
         let cfg = parse("[relay]\nenabled = false\n", true);
-        assert!(!cfg.enabled, "explicit operator choice must not be overridden");
+        assert!(
+            !cfg.enabled,
+            "explicit operator choice must not be overridden"
+        );
         // url still defaults to the official one — only `enabled` was set.
         assert_eq!(cfg.url, OFFICIAL_RELAY_URL);
     }
@@ -252,7 +261,10 @@ mod tests {
             parse("[relay]\ndevice_name = \"  客廳主機  \"\n", false).device_name,
             Some("客廳主機".to_string())
         );
-        assert_eq!(parse("[relay]\ndevice_name = \"   \"\n", false).device_name, None);
+        assert_eq!(
+            parse("[relay]\ndevice_name = \"   \"\n", false).device_name,
+            None
+        );
     }
 
     // ── endpoint derivation ──────────────────────────────────────────
@@ -272,7 +284,10 @@ mod tests {
     #[test]
     fn hook_ws_endpoint_swaps_https_to_wss() {
         let url = hook_ws_endpoint("https://relay.example.com", "box-abc123").unwrap();
-        assert_eq!(url, "wss://relay.example.com/v1/device/ws?device_id=box-abc123");
+        assert_eq!(
+            url,
+            "wss://relay.example.com/v1/device/ws?device_id=box-abc123"
+        );
     }
 
     #[test]

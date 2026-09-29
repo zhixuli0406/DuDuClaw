@@ -4,12 +4,12 @@
 //! per connection — the client writes exactly one [`SysdRequest`] line,
 //! reads exactly one [`SysdResponse`] line, then closes. Call volume here
 //! is human-triggered (reboot/update/factory-reset), so there is no need
-//! for the connection-pooling / multiplexing machinery the `duduclaw-cli-worker`
+//! for the connection-pooling / multiplexing machinery the former `duduclaw-cli-worker`
 //! HTTP protocol uses.
 //!
 //! [`SysdRequest`] is a **closed enum**
 //! (`#[serde(tag = "verb", content = "params", deny_unknown_fields)]` —
-//! the same adjacently-tagged shape `duduclaw-cli-worker`'s protocol uses)
+//! the same adjacently-tagged shape that crate's protocol used)
 //! — the entire caller-reachable surface is thirteen fixed verbs, wire-encoded
 //! as `{"verb":"reboot"}` for a fieldless verb or
 //! `{"verb":"hostname","params":{"set":"..."}}` for a verb that carries
@@ -455,7 +455,8 @@ mod tests {
         // SAFETY: test-only env mutation, single-threaded within this
         // process's test but env is process-global — accept the same
         // best-effort caveat as other env-mutating tests in this workspace
-        // (see duduclaw-cli-worker's `expand_home_errors_when_home_unresolvable`).
+        // (the former duduclaw-cli-worker had the same test; that crate was
+        // removed in 2026-09 with the PTY pool).
         let saved = std::env::var_os(SOCKET_PATH_ENV);
         unsafe {
             std::env::set_var(SOCKET_PATH_ENV, "/tmp/custom-sysd.sock");

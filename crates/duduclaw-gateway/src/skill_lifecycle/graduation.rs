@@ -109,11 +109,8 @@ pub async fn graduate_to_global(
         .map_err(|e| format!("Failed to read skill {}: {e}", source.display()))?;
 
     // Add graduation metadata to frontmatter
-    let graduated_content = inject_graduation_metadata(
-        &content,
-        &candidate.source_agent_id,
-        candidate.lift,
-    );
+    let graduated_content =
+        inject_graduation_metadata(&content, &candidate.source_agent_id, candidate.lift);
 
     // Write to global skills directory
     tokio::fs::create_dir_all(global_skills_dir)

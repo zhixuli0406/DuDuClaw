@@ -187,6 +187,9 @@ mod tests {
         )
         .await;
         unsafe { std::env::remove_var(&var) };
-        assert!(out.is_empty(), "injected header must be dropped whole: {out:?}");
+        assert!(
+            out.is_empty(),
+            "injected header must be dropped whole: {out:?}"
+        );
     }
 }

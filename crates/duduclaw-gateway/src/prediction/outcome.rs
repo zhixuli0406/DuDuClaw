@@ -50,15 +50,9 @@ pub struct ConversationOutcome {
 
 impl ConversationOutcome {
     /// Extract outcome from session messages (zero LLM cost).
-    pub fn extract(
-        session_id: &str,
-        agent_id: &str,
-        messages: &[SessionMessage],
-    ) -> Self {
-        let user_msgs: Vec<&SessionMessage> = messages
-            .iter()
-            .filter(|m| m.role == "user")
-            .collect();
+    pub fn extract(session_id: &str, agent_id: &str, messages: &[SessionMessage]) -> Self {
+        let user_msgs: Vec<&SessionMessage> =
+            messages.iter().filter(|m| m.role == "user").collect();
 
         let all_user_text: String = user_msgs
             .iter()
@@ -97,7 +91,15 @@ fn detect_task_type(all_user_text: &str, messages: &[SessionMessage]) -> TaskTyp
     let has_code_block = messages.iter().any(|m| m.content.contains("```"));
 
     // Coding signals — use multi-word phrases to reduce false positives (review #5/#6)
-    let coding_keywords_en = ["source code", "function", "debug", "compile", "bug fix", "implement", "refactor"];
+    let coding_keywords_en = [
+        "source code",
+        "function",
+        "debug",
+        "compile",
+        "bug fix",
+        "implement",
+        "refactor",
+    ];
     let coding_keywords_zh = [
         "\u{5BEB}\u{7A0B}\u{5F0F}", // 寫程式 (write code)
         "\u{7A0B}\u{5F0F}\u{78BC}", // 程式碼 (source code)
@@ -106,8 +108,14 @@ fn detect_task_type(all_user_text: &str, messages: &[SessionMessage]) -> TaskTyp
         "\u{932F}\u{8AA4}",         // 錯誤 (error)
     ];
 
-    let coding_score: usize = coding_keywords_en.iter().filter(|kw| lower.contains(*kw)).count()
-        + coding_keywords_zh.iter().filter(|kw| lower.contains(*kw)).count()
+    let coding_score: usize = coding_keywords_en
+        .iter()
+        .filter(|kw| lower.contains(*kw))
+        .count()
+        + coding_keywords_zh
+            .iter()
+            .filter(|kw| lower.contains(*kw))
+            .count()
         + if has_code_block { 3 } else { 0 }; // code block is a strong signal
 
     if coding_score >= 2 {
@@ -124,8 +132,14 @@ fn detect_task_type(all_user_text: &str, messages: &[SessionMessage]) -> TaskTyp
         "\u{6D41}\u{7A0B}", // 流程
     ];
 
-    let planning_score: usize = planning_keywords_en.iter().filter(|kw| lower.contains(*kw)).count()
-        + planning_keywords_zh.iter().filter(|kw| lower.contains(*kw)).count();
+    let planning_score: usize = planning_keywords_en
+        .iter()
+        .filter(|kw| lower.contains(*kw))
+        .count()
+        + planning_keywords_zh
+            .iter()
+            .filter(|kw| lower.contains(*kw))
+            .count();
 
     if planning_score >= 2 {
         return TaskType::Planning;
@@ -164,16 +178,41 @@ fn detect_satisfaction(user_msgs: &[&SessionMessage]) -> SatisfactionSignal {
     }
 
     // Negative and positive keyword lists
-    let positive_en = ["thank", "thanks", "perfect", "great", "awesome", "excellent", "good job", "works", "nice"];
+    let positive_en = [
+        "thank",
+        "thanks",
+        "perfect",
+        "great",
+        "awesome",
+        "excellent",
+        "good job",
+        "works",
+        "nice",
+    ];
     let positive_zh = [
-        "\u{8B1D}\u{8B1D}", "\u{611F}\u{8B1D}", "\u{592A}\u{68D2}",
-        "\u{5F88}\u{597D}", "\u{8B9A}", "\u{5B8C}\u{7F8E}", "\u{53EF}\u{4EE5}",
+        "\u{8B1D}\u{8B1D}",
+        "\u{611F}\u{8B1D}",
+        "\u{592A}\u{68D2}",
+        "\u{5F88}\u{597D}",
+        "\u{8B9A}",
+        "\u{5B8C}\u{7F8E}",
+        "\u{53EF}\u{4EE5}",
     ];
     let positive_emoji = ["\u{1F44D}", "\u{2764}", "\u{1F389}"];
-    let negative_en = ["wrong", "bad", "terrible", "useless", "doesn't work", "not what i"];
+    let negative_en = [
+        "wrong",
+        "bad",
+        "terrible",
+        "useless",
+        "doesn't work",
+        "not what i",
+    ];
     let negative_zh = [
-        "\u{4E0D}\u{5C0D}", "\u{932F}\u{4E86}", "\u{6C92}\u{7528}",
-        "\u{592A}\u{7226}", "\u{4E0D}\u{884C}",
+        "\u{4E0D}\u{5C0D}",
+        "\u{932F}\u{4E86}",
+        "\u{6C92}\u{7528}",
+        "\u{592A}\u{7226}",
+        "\u{4E0D}\u{884C}",
     ];
     let negative_emoji = ["\u{1F44E}"];
 
@@ -216,16 +255,14 @@ fn detect_task_completion(
     // Completion signals
     let done_en = ["done", "works", "solved", "fixed", "got it", "that's it"];
     let done_zh = [
-        "\u{597D}\u{4E86}",     // 好了
-        "\u{641E}\u{5B9A}",     // 搞定
-        "\u{5B8C}\u{6210}",     // 完成
+        "\u{597D}\u{4E86}",         // 好了
+        "\u{641E}\u{5B9A}",         // 搞定
+        "\u{5B8C}\u{6210}",         // 完成
         "\u{6C92}\u{554F}\u{984C}", // 沒問題
         "\u{53EF}\u{4EE5}\u{4E86}", // 可以了
     ];
 
-    if done_en.iter().any(|kw| last.contains(kw))
-        || done_zh.iter().any(|kw| last.contains(kw))
-    {
+    if done_en.iter().any(|kw| last.contains(kw)) || done_zh.iter().any(|kw| last.contains(kw)) {
         return Some(true);
     }
 
@@ -245,11 +282,18 @@ fn detect_task_completion(
 /// Count correction patterns in user messages.
 /// Uses multi-word phrases to avoid false positives (review R2-5).
 fn count_corrections(user_msgs: &[&SessionMessage]) -> u32 {
-    let correction_en = ["that's wrong", "that is wrong", "incorrect", "try again", "not what i", "please redo"];
+    let correction_en = [
+        "that's wrong",
+        "that is wrong",
+        "incorrect",
+        "try again",
+        "not what i",
+        "please redo",
+    ];
     let correction_zh = [
-        "\u{932F}\u{4E86}",     // 錯了
-        "\u{4E0D}\u{5C0D}",     // 不對
-        "\u{91CD}\u{4F86}",     // 重來
+        "\u{932F}\u{4E86}", // 錯了
+        "\u{4E0D}\u{5C0D}", // 不對
+        "\u{91CD}\u{4F86}", // 重來
     ];
 
     let mut count = 0u32;
@@ -295,7 +339,10 @@ mod tests {
     fn test_task_type_coding() {
         let msgs = vec![
             make_msg("user", "幫我寫一個 Python function"),
-            make_msg("assistant", "好的，這是一個 function:\n```python\ndef foo(): pass\n```"),
+            make_msg(
+                "assistant",
+                "好的，這是一個 function:\n```python\ndef foo(): pass\n```",
+            ),
         ];
         let outcome = ConversationOutcome::extract("s1", "a1", &msgs);
         assert_eq!(outcome.task_type, TaskType::Coding);

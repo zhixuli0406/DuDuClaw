@@ -168,19 +168,15 @@ pub fn load_runtime_settings(agent_dir: &Path) -> RuntimeSettings {
 
 /// Read the agent's `[runtime]` section as a JSON object for `agents.inspect`.
 ///
-/// Emits ONLY keys actually present in `agent.toml` (`provider`, `fallback`,
-/// `pty_pool_enabled`, `worker_managed`) so the dashboard can distinguish
-/// "unset" from an explicit `false` — the PTY-pool OAuth default-enable logic
-/// materializes the toggle only when it was never written. A missing/malformed
-/// file or absent `[runtime]` table yields an empty object.
+/// Emits ONLY keys actually present in `agent.toml` (`provider`, `fallback`)
+/// so the dashboard can distinguish "unset" from an explicitly written value.
+/// A missing/malformed file or absent `[runtime]` table yields an empty
+/// object.
 pub fn read_runtime_json(agent_dir: &Path) -> serde_json::Value {
     // Every `RuntimeSection` field is `Option` precisely so this function can
-    // still tell "unset" from an explicit `false` — collapsing unset into a
-    // materialized default here would silently opt agents out of the PTY-pool
-    // default-enable migration, which only fires when the key was never
-    // written. The four keys are emitted individually (not via
-    // `serde_json::to_value`) to keep that contract explicit and to keep the
-    // two PTY timeout keys — which this form does not edit — out of the payload.
+    // still tell "unset" from an explicitly written value. Keys are emitted
+    // individually (not via `serde_json::to_value`) to keep that contract
+    // explicit and to keep fields this form does not edit out of the payload.
     let rt = read_sections(agent_dir).runtime;
     let mut obj = serde_json::Map::new();
     if let Some(s) = rt.provider {
@@ -188,12 +184,6 @@ pub fn read_runtime_json(agent_dir: &Path) -> serde_json::Value {
     }
     if let Some(s) = rt.fallback {
         obj.insert("fallback".into(), serde_json::Value::String(s));
-    }
-    if let Some(b) = rt.pty_pool_enabled {
-        obj.insert("pty_pool_enabled".into(), serde_json::Value::Bool(b));
-    }
-    if let Some(b) = rt.worker_managed {
-        obj.insert("worker_managed".into(), serde_json::Value::Bool(b));
     }
     serde_json::Value::Object(obj)
 }
@@ -227,6 +217,39 @@ pub fn model_matches_provider(model: &str, provider: RuntimeType) -> bool {
             .model_prefixes
             .iter()
             .any(|p| owner.model_prefixes.contains(p))
+}
+
+/// The model-id family a model id **confidently** belongs to, expressed as the
+/// owning runtime catalog id (`"claude"`, `"gemini"`, `"codex"`, …).
+///
+/// `None` for an id whose naming prefix no catalog entry claims — never a
+/// guess.
+pub fn model_family(model: &str) -> Option<&'static str> {
+    duduclaw_core::runtime_catalog::runtime_for_model(model).map(|s| s.id)
+}
+
+/// Do two model ids come from the same vendor family?
+///
+/// P0/WP-B (verifier decorrelation, arXiv:2607.13918): an acceptance judge
+/// drawn from the worker's own family inherits the worker's blind spots, so
+/// the goal-loop settle path warns (never rejects) when this returns `true`.
+///
+/// Deliberately conservative in the *quiet* direction: two ids are "same
+/// family" when they are literally the same id, or when both resolve to the
+/// same catalog family. An unrecognised id paired with a known one is never
+/// reported — a warning an operator cannot act on is worse than silence.
+pub fn same_model_family(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    match (model_family(a), model_family(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// Best-effort model-family → runtime mapping for the dashboard save-time
@@ -549,7 +572,10 @@ mod tests {
             "[runtime]\nprovider = \"gemini\"\nfallback = \"claude\"\n",
         );
         assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Gemini);
-        assert_eq!(agent_runtime_fallback(dir.path()), Some(RuntimeType::Claude));
+        assert_eq!(
+            agent_runtime_fallback(dir.path()),
+            Some(RuntimeType::Claude)
+        );
     }
 
     #[test]
@@ -909,29 +935,21 @@ mod tests {
         // Missing file → empty object.
         assert_eq!(read_runtime_json(dir.path()), serde_json::json!({}));
         // Present [runtime] but only some keys → only those keys emitted;
-        // absent keys (worker_managed) must stay absent so the frontend can
-        // distinguish "unset" from an explicit false.
+        // an absent key must stay absent so the frontend can distinguish
+        // "unset" from a written value.
+        write_agent_toml(dir.path(), "[runtime]\nprovider = \"claude\"\n");
+        assert_eq!(
+            read_runtime_json(dir.path()),
+            serde_json::json!({ "provider": "claude" })
+        );
+        // Both keys present → both emitted, correct types.
         write_agent_toml(
             dir.path(),
-            "[runtime]\nprovider = \"claude\"\npty_pool_enabled = false\n",
+            "[runtime]\nprovider = \"codex\"\nfallback = \"claude\"\n",
         );
         assert_eq!(
             read_runtime_json(dir.path()),
-            serde_json::json!({ "provider": "claude", "pty_pool_enabled": false })
-        );
-        // All four keys present → all emitted, correct types.
-        write_agent_toml(
-            dir.path(),
-            "[runtime]\nprovider = \"codex\"\nfallback = \"claude\"\npty_pool_enabled = true\nworker_managed = true\n",
-        );
-        assert_eq!(
-            read_runtime_json(dir.path()),
-            serde_json::json!({
-                "provider": "codex",
-                "fallback": "claude",
-                "pty_pool_enabled": true,
-                "worker_managed": true,
-            })
+            serde_json::json!({ "provider": "codex", "fallback": "claude" })
         );
         // Malformed toml → empty object (fail-safe).
         write_agent_toml(dir.path(), "not valid toml ===");
@@ -1016,24 +1034,14 @@ mod tests {
 
     #[test]
     fn default_direction_runtime_json_omits_unset_keys() {
-        // `read_runtime_json` must distinguish "never written" from an
-        // explicit `false`: the PTY-pool default-enable migration only fires
-        // on the former. Materializing a default here would silently opt
-        // agents out of it.
+        // `read_runtime_json` must distinguish "never written" from a written
+        // value; materializing a default here would make the dashboard show a
+        // setting the file does not actually carry.
         let dir = TempDir::new().unwrap();
         write_agent_toml(dir.path(), "[runtime]\nprovider = \"codex\"\n");
         let json = read_runtime_json(dir.path());
         assert_eq!(json.get("provider").and_then(|v| v.as_str()), Some("codex"));
-        assert!(json.get("pty_pool_enabled").is_none(), "unset must be absent");
-        assert!(json.get("worker_managed").is_none(), "unset must be absent");
-
-        write_agent_toml(dir.path(), "[runtime]\npty_pool_enabled = false\n");
-        let json = read_runtime_json(dir.path());
-        assert_eq!(
-            json.get("pty_pool_enabled").and_then(|v| v.as_bool()),
-            Some(false),
-            "explicit false must be present and false"
-        );
+        assert!(json.get("fallback").is_none(), "unset must be absent");
 
         // No `[runtime]` at all ⇒ empty object, not a defaults object.
         let empty = TempDir::new().unwrap();

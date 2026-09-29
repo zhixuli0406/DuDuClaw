@@ -216,10 +216,10 @@ fn copy_all_tables(conn: &mut Connection) -> Result<(usize, usize), String> {
 
 /// Ids present in `src.<table>` but not in `main.<table>`.
 fn pending_ids(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
-    let sql = format!(
-        "SELECT id FROM src.{table} WHERE id NOT IN (SELECT id FROM main.{table})"
-    );
-    let mut stmt = conn.prepare(&sql).map_err(|e| format!("{table} ids: {e}"))?;
+    let sql = format!("SELECT id FROM src.{table} WHERE id NOT IN (SELECT id FROM main.{table})");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("{table} ids: {e}"))?;
     let ids = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| format!("{table} ids: {e}"))?
@@ -270,9 +270,8 @@ fn insert_missing(conn: &Connection, table: &str, cols: &str) -> Result<(), Stri
 }
 
 fn table_exists(conn: &Connection, schema: &str, table: &str) -> Result<bool, String> {
-    let sql = format!(
-        "SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1"
-    );
+    let sql =
+        format!("SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1");
     conn.query_row(&sql, [table], |_| Ok(()))
         .map(|_| true)
         .or_else(|e| match e {
@@ -347,18 +346,33 @@ mod tests {
 
         {
             let eng = SqliteMemoryEngine::new(&stray).unwrap();
-            eng.store("trader", entry("trader", "Prediction deviation: expected 0.7"))
-                .await
-                .unwrap();
-            eng.store_fact("trader", "user prefers daily strategy briefings", "telegram", "c1", "s1")
-                .await
-                .unwrap();
+            eng.store(
+                "trader",
+                entry("trader", "Prediction deviation: expected 0.7"),
+            )
+            .await
+            .unwrap();
+            eng.store_fact(
+                "trader",
+                "user prefers daily strategy briefings",
+                "telegram",
+                "c1",
+                "s1",
+            )
+            .await
+            .unwrap();
         }
         {
             let eng = SqliteMemoryEngine::new(&shared).unwrap();
-            eng.store_fact("trader", "position: 36 shares of 00919", "telegram", "c1", "s2")
-                .await
-                .unwrap();
+            eng.store_fact(
+                "trader",
+                "position: 36 shares of 00919",
+                "telegram",
+                "c1",
+                "s2",
+            )
+            .await
+            .unwrap();
         }
 
         let outcome = merge_per_agent_memory_dbs(home.path());
@@ -372,19 +386,26 @@ mod tests {
         assert_eq!(count(&shared, "SELECT count(*) FROM memories"), 1);
         // Migrated rows are FTS-searchable in the shared db.
         assert_eq!(
-            count(&shared, "SELECT count(*) FROM key_facts_fts WHERE fact MATCH 'briefings'"),
+            count(
+                &shared,
+                "SELECT count(*) FROM key_facts_fts WHERE fact MATCH 'briefings'"
+            ),
             1
         );
         assert_eq!(
-            count(&shared, "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'deviation'"),
+            count(
+                &shared,
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'deviation'"
+            ),
             1
         );
         // Stray file archived; read resolution falls through to shared.
         assert!(!stray.exists());
-        let archived = std::fs::read_dir(&state_dir)
-            .unwrap()
-            .flatten()
-            .any(|e| e.file_name().to_string_lossy().starts_with("memory.db.merged-"));
+        let archived = std::fs::read_dir(&state_dir).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("memory.db.merged-")
+        });
         assert!(archived, "archive file missing");
     }
 
@@ -406,7 +427,10 @@ mod tests {
         assert_eq!(second.merged_files, 0);
         assert!(second.errors.is_empty());
         assert_eq!(
-            count(&home.path().join("memory.db"), "SELECT count(*) FROM memories"),
+            count(
+                &home.path().join("memory.db"),
+                "SELECT count(*) FROM memories"
+            ),
             1
         );
     }
@@ -440,7 +464,11 @@ mod tests {
         assert_eq!(outcome.memories_rows, 0, "colliding id must not copy");
         let content: String = Connection::open(&shared)
             .unwrap()
-            .query_row("SELECT content FROM memories WHERE id = 'fixed-id'", [], |r| r.get(0))
+            .query_row(
+                "SELECT content FROM memories WHERE id = 'fixed-id'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(content.starts_with("shared version"));
     }

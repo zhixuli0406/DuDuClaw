@@ -15,10 +15,8 @@ use duduclaw_core::types::{MemoryEntry, MemoryLayer};
 use duduclaw_memory::{SqliteMemoryEngine, TemporalMeta};
 
 use super::delta::{self, AppliedOp, ExistingEntry, MergeOutcome, PlaybookDelta, ValidationCtx};
-use super::entry::{
-    PlaybookMeta, PlaybookState, LEGACY_RULE_SOURCE_EVENT, PLAYBOOK_SOURCE_EVENT,
-};
-use crate::prediction::rule_lifecycle::{RuleStats, PROBATION_RULE_TAG, RETIRED_RULE_TAG};
+use super::entry::{LEGACY_RULE_SOURCE_EVENT, PLAYBOOK_SOURCE_EVENT, PlaybookMeta, PlaybookState};
+use crate::prediction::rule_lifecycle::{PROBATION_RULE_TAG, RETIRED_RULE_TAG, RuleStats};
 
 /// Candidate scan bound — mirrors `rule_lifecycle::CANDIDATE_SCAN_CAP` so
 /// both selection paths see the same window.
@@ -61,9 +59,12 @@ pub async fn list_active(
             let meta = match PlaybookMeta::from_metadata(&metadata) {
                 Some(m) => m,
                 None => {
-                    let upgraded = PlaybookMeta::legacy_default(&mem_entry.tags, &mem_entry.content);
+                    let upgraded =
+                        PlaybookMeta::legacy_default(&mem_entry.tags, &mem_entry.content);
                     upgraded.merge_into(&mut metadata);
-                    let _ = engine.update_metadata(agent_id, &mem_entry.id, &metadata).await;
+                    let _ = engine
+                        .update_metadata(agent_id, &mem_entry.id, &metadata)
+                        .await;
                     upgraded
                 }
             };
@@ -87,14 +88,54 @@ pub async fn apply_deltas(
     eval_cases_root: &Path,
     now: DateTime<Utc>,
 ) -> MergeOutcome {
+    apply_deltas_gated(
+        engine,
+        agent_id,
+        deltas,
+        must_not,
+        eval_cases_root,
+        now,
+        None,
+    )
+    .await
+}
+
+/// [`apply_deltas`] with X1 方案 2's optional causal-evidence gate.
+///
+/// `accepted_causes = None` — every caller except the AEE commit step, and the
+/// AEE itself while `config.toml [evolution] require_causal_evidence = false`
+/// (the default) — behaves **byte-identically** to [`apply_deltas`].
+///
+/// `Some(causes)` turns the gate on: an `Add` whose `signals_match` no
+/// human-accepted causal claim supports is stored carrying
+/// [`SHADOW_RULE_TAG`], which `playbook::select` already excludes from
+/// injection while the v1.54 held-out gate keeps scoring it. The entry is
+/// kept and measured, never injected and never silently dropped — "not yet
+/// evidenced" is a different state from "rejected".
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_deltas_gated(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    deltas: Vec<PlaybookDelta>,
+    must_not: &[String],
+    eval_cases_root: &Path,
+    now: DateTime<Utc>,
+    accepted_causes: Option<&[String]>,
+) -> MergeOutcome {
     let current = list_active(engine, agent_id).await;
     let existing_wildcard_count = current
         .iter()
-        .filter(|(_, meta, _)| matches!(meta.state, PlaybookState::Active | PlaybookState::Probation))
+        .filter(|(_, meta, _)| {
+            matches!(meta.state, PlaybookState::Active | PlaybookState::Probation)
+        })
         .filter(|(_, meta, _)| meta.signals_match.len() == 1 && meta.signals_match[0] == "*")
         .count();
 
-    let ctx = ValidationCtx { must_not, eval_cases_root, existing_wildcard_count };
+    let ctx = ValidationCtx {
+        must_not,
+        eval_cases_root,
+        existing_wildcard_count,
+    };
     let (ok_deltas, mut rejected) = delta::validate_all(deltas, &ctx);
 
     let existing_view: Vec<ExistingEntry> = current
@@ -112,13 +153,35 @@ pub async fn apply_deltas(
 
     for op in &outcome.applied {
         match op {
-            AppliedOp::Added { content, meta, stats, .. } => {
+            AppliedOp::Added {
+                content,
+                meta,
+                stats,
+                ..
+            } => {
+                // X1 方案 2 gate: an unsupported Add is born in shadow.
+                let mut tags = vec!["playbook".to_string(), PROBATION_RULE_TAG.to_string()];
+                if let Some(causes) = accepted_causes {
+                    let support = crate::causal_audit_ingest::causal_support_score(
+                        &meta.signals_match,
+                        causes,
+                    );
+                    if support.is_none_or(|s| s <= 0.0) {
+                        tracing::info!(
+                            agent = %agent_id,
+                            "playbook: Add has no accepted causal support — entering as a shadow candidate ([evolution] require_causal_evidence)"
+                        );
+                        tags.push(
+                            crate::prediction::rule_lifecycle::SHADOW_RULE_TAG.to_string(),
+                        );
+                    }
+                }
                 let entry = MemoryEntry {
                     id: uuid::Uuid::new_v4().to_string(),
                     agent_id: agent_id.to_string(),
                     content: content.clone(),
                     timestamp: now,
-                    tags: vec!["playbook".to_string(), PROBATION_RULE_TAG.to_string()],
+                    tags,
                     embedding: None,
                     layer: MemoryLayer::Semantic,
                     importance: NEW_ENTRY_IMPORTANCE,
@@ -190,6 +253,129 @@ mod tests {
         Utc::now()
     }
 
+    // ── X1 方案 2: [evolution] require_causal_evidence shadow gate ──────
+
+    /// One `Add` with a linked eval case, so the store accepts it.
+    fn gated_add(signal: &str) -> PlaybookDelta {
+        PlaybookDelta::Add {
+            assertions: crate::playbook::entry::EntryAssertions {
+                output_contains: vec!["ok".to_string()],
+                ..Default::default()
+            },
+            content: format!("entry for {signal}"),
+            category: PlaybookCategory::Repair,
+            signals_match: vec![signal.to_string()],
+            eval_cases: vec![EvalCaseRef("s/c".to_string())],
+            strategy: Vec::new(),
+            rationale: "x".to_string(),
+        }
+    }
+
+    /// Fresh in-memory engine + eval root + a distinct agent id per test.
+    fn fixture(agent: &'static str) -> (SqliteMemoryEngine, &'static str, tempfile::TempDir) {
+        (
+            SqliteMemoryEngine::in_memory().unwrap(),
+            agent,
+            temp_eval_root(),
+        )
+    }
+
+    async fn tags_of_only_entry(engine: &SqliteMemoryEngine, agent: &str) -> Vec<String> {
+        let active = list_active(engine, agent).await;
+        assert_eq!(active.len(), 1, "exactly one entry expected");
+        active[0].0.tags.clone()
+    }
+
+    #[tokio::test]
+    async fn causal_gate_off_is_byte_identical_to_the_ungated_path() {
+        let (engine, agent, evals) = fixture("gate-off");
+        let outcome = apply_deltas_gated(
+            &engine,
+            agent,
+            vec![gated_add("mistake:factual")],
+            &[],
+            evals.path(),
+            now(),
+            None,
+        )
+        .await;
+        assert_eq!(outcome.applied.len(), 1);
+        let tags = tags_of_only_entry(&engine, agent).await;
+        assert!(
+            !tags.iter().any(|t| t
+                == crate::prediction::rule_lifecycle::SHADOW_RULE_TAG),
+            "gate off must never add a shadow tag: {tags:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_add_enters_as_a_shadow_candidate_when_the_gate_is_on() {
+        let (engine, agent, evals) = fixture("gate-unsupported");
+        let outcome = apply_deltas_gated(
+            &engine,
+            agent,
+            vec![gated_add("mistake:factual")],
+            &[],
+            evals.path(),
+            now(),
+            Some(&["tool_error:db_select".to_string()]),
+        )
+        .await;
+        assert_eq!(
+            outcome.applied.len(),
+            1,
+            "the entry is kept and measured, never dropped"
+        );
+        let tags = tags_of_only_entry(&engine, agent).await;
+        assert!(
+            tags.iter()
+                .any(|t| t == crate::prediction::rule_lifecycle::SHADOW_RULE_TAG),
+            "an unsupported Add must enter shadow, not the injection pool: {tags:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supported_add_is_injected_normally_when_the_gate_is_on() {
+        let (engine, agent, evals) = fixture("gate-supported");
+        apply_deltas_gated(
+            &engine,
+            agent,
+            vec![gated_add("tool_error:db_select")],
+            &[],
+            evals.path(),
+            now(),
+            Some(&["tool_error:db_select".to_string()]),
+        )
+        .await;
+        let tags = tags_of_only_entry(&engine, agent).await;
+        assert!(
+            !tags.iter().any(|t| t
+                == crate::prediction::rule_lifecycle::SHADOW_RULE_TAG),
+            "an accepted-claim-backed Add must not be shadowed: {tags:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_accepted_list_shadows_everything_rather_than_waving_it_through() {
+        let (engine, agent, evals) = fixture("gate-empty");
+        apply_deltas_gated(
+            &engine,
+            agent,
+            vec![gated_add("tool_error:db_select")],
+            &[],
+            evals.path(),
+            now(),
+            Some(&[]),
+        )
+        .await;
+        let tags = tags_of_only_entry(&engine, agent).await;
+        assert!(
+            tags.iter()
+                .any(|t| t == crate::prediction::rule_lifecycle::SHADOW_RULE_TAG),
+            "gate ON with zero accepted claims must fail toward shadow: {tags:?}"
+        );
+    }
+
     #[tokio::test]
     async fn add_persists_and_is_independently_retirable() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
@@ -197,7 +383,10 @@ mod tests {
         let agent = "agent-store";
 
         let add_a = PlaybookDelta::Add {
-            assertions: crate::playbook::entry::EntryAssertions { output_contains: vec!["ok".to_string()], ..Default::default() },
+            assertions: crate::playbook::entry::EntryAssertions {
+                output_contains: vec!["ok".to_string()],
+                ..Default::default()
+            },
             content: "entry A content".to_string(),
             category: PlaybookCategory::Repair,
             signals_match: vec!["mistake:capability".to_string()],
@@ -206,7 +395,10 @@ mod tests {
             rationale: "x".to_string(),
         };
         let add_b = PlaybookDelta::Add {
-            assertions: crate::playbook::entry::EntryAssertions { output_contains: vec!["ok".to_string()], ..Default::default() },
+            assertions: crate::playbook::entry::EntryAssertions {
+                output_contains: vec!["ok".to_string()],
+                ..Default::default()
+            },
             content: "entry B content".to_string(),
             category: PlaybookCategory::Repair,
             signals_match: vec!["mistake:factual".to_string()],
@@ -214,12 +406,17 @@ mod tests {
             strategy: Vec::new(),
             rationale: "x".to_string(),
         };
-        let outcome = apply_deltas(&engine, agent, vec![add_a, add_b], &[], evals.path(), now()).await;
+        let outcome =
+            apply_deltas(&engine, agent, vec![add_a, add_b], &[], evals.path(), now()).await;
         assert_eq!(outcome.applied.len(), 2);
         assert!(outcome.rejected.is_empty());
 
         let active = list_active(&engine, agent).await;
-        assert_eq!(active.len(), 2, "collapse immunity: two independent entries stored, not one blob");
+        assert_eq!(
+            active.len(),
+            2,
+            "collapse immunity: two independent entries stored, not one blob"
+        );
 
         // Retiring one MUST NOT affect the other — independent retire.
         let target_id = active
@@ -229,7 +426,10 @@ mod tests {
             .0
             .id
             .clone();
-        let retire = PlaybookDelta::Retire { id: target_id.clone(), reason: "done".to_string() };
+        let retire = PlaybookDelta::Retire {
+            id: target_id.clone(),
+            reason: "done".to_string(),
+        };
         let outcome2 = apply_deltas(&engine, agent, vec![retire], &[], evals.path(), now()).await;
         assert_eq!(outcome2.applied.len(), 1);
 
@@ -239,8 +439,15 @@ mod tests {
         // by tag (that's select.rs's job), so we assert state directly.
         let (_, meta_a, _) = entry_a.expect("row still readable, now retired");
         assert_eq!(meta_a.state, PlaybookState::Retired);
-        let entry_b = remaining.iter().find(|(e, _, _)| e.content == "entry B content").unwrap();
-        assert_eq!(entry_b.1.state, PlaybookState::Probation, "unrelated entry untouched");
+        let entry_b = remaining
+            .iter()
+            .find(|(e, _, _)| e.content == "entry B content")
+            .unwrap();
+        assert_eq!(
+            entry_b.1.state,
+            PlaybookState::Probation,
+            "unrelated entry untouched"
+        );
     }
 
     #[tokio::test]
@@ -250,7 +457,10 @@ mod tests {
         let agent = "agent-g6";
 
         let bad_add = PlaybookDelta::Add {
-            assertions: crate::playbook::entry::EntryAssertions { output_contains: vec!["ok".to_string()], ..Default::default() },
+            assertions: crate::playbook::entry::EntryAssertions {
+                output_contains: vec!["ok".to_string()],
+                ..Default::default()
+            },
             content: "no case linked".to_string(),
             category: PlaybookCategory::Repair,
             signals_match: vec!["mistake:capability".to_string()],
@@ -280,7 +490,10 @@ mod tests {
         let agent = "agent-no-collapse";
 
         let add_a = PlaybookDelta::Add {
-            assertions: crate::playbook::entry::EntryAssertions { output_contains: vec!["ok".to_string()], ..Default::default() },
+            assertions: crate::playbook::entry::EntryAssertions {
+                output_contains: vec!["ok".to_string()],
+                ..Default::default()
+            },
             content: "entry A original".to_string(),
             category: PlaybookCategory::Repair,
             signals_match: vec!["mistake:capability".to_string()],
@@ -289,7 +502,10 @@ mod tests {
             rationale: "x".to_string(),
         };
         let add_b = PlaybookDelta::Add {
-            assertions: crate::playbook::entry::EntryAssertions { output_contains: vec!["ok".to_string()], ..Default::default() },
+            assertions: crate::playbook::entry::EntryAssertions {
+                output_contains: vec!["ok".to_string()],
+                ..Default::default()
+            },
             content: "entry B original".to_string(),
             category: PlaybookCategory::Repair,
             signals_match: vec!["mistake:factual".to_string()],
@@ -299,8 +515,20 @@ mod tests {
         };
         apply_deltas(&engine, agent, vec![add_a, add_b], &[], evals.path(), now()).await;
         let before = list_active(&engine, agent).await;
-        let id_a = before.iter().find(|(e, _, _)| e.content == "entry A original").unwrap().0.id.clone();
-        let id_b = before.iter().find(|(e, _, _)| e.content == "entry B original").unwrap().0.id.clone();
+        let id_a = before
+            .iter()
+            .find(|(e, _, _)| e.content == "entry A original")
+            .unwrap()
+            .0
+            .id
+            .clone();
+        let id_b = before
+            .iter()
+            .find(|(e, _, _)| e.content == "entry B original")
+            .unwrap()
+            .0
+            .id
+            .clone();
 
         let revise_a = PlaybookDelta::Revise {
             id: id_a.clone(),
@@ -315,8 +543,14 @@ mod tests {
         assert_eq!(entry_a.1.revision, 1);
 
         let entry_b = after.iter().find(|(e, _, _)| e.id == id_b).unwrap();
-        assert_eq!(entry_b.0.content, "entry B original", "unrelated entry's content untouched");
-        assert_eq!(entry_b.1.revision, 0, "unrelated entry's revision counter untouched");
+        assert_eq!(
+            entry_b.0.content, "entry B original",
+            "unrelated entry's content untouched"
+        );
+        assert_eq!(
+            entry_b.1.revision, 0,
+            "unrelated entry's revision counter untouched"
+        );
     }
 
     #[tokio::test]
@@ -330,7 +564,11 @@ mod tests {
             agent_id: agent.to_string(),
             content: "legacy consolidated rule".to_string(),
             timestamp: Utc::now(),
-            tags: vec!["reflexion".to_string(), "consolidated".to_string(), PROBATION_RULE_TAG.to_string()],
+            tags: vec![
+                "reflexion".to_string(),
+                "consolidated".to_string(),
+                PROBATION_RULE_TAG.to_string(),
+            ],
             embedding: None,
             layer: MemoryLayer::Semantic,
             importance: 8.0,
@@ -346,13 +584,27 @@ mod tests {
 
         let active = list_active(&engine, agent).await;
         let (_, meta, stats) = active.iter().find(|(e, _, _)| e.id == id).unwrap();
-        assert_eq!(meta.state, PlaybookState::Probation, "derived from PROBATION_RULE_TAG");
+        assert_eq!(
+            meta.state,
+            PlaybookState::Probation,
+            "derived from PROBATION_RULE_TAG"
+        );
         assert_eq!(meta.signals_match, vec!["*".to_string()]);
-        assert_eq!(*stats, RuleStats { helpful: 1, harmful: 0 }, "rule_stats sibling key preserved");
+        assert_eq!(
+            *stats,
+            RuleStats {
+                helpful: 1,
+                harmful: 0
+            },
+            "rule_stats sibling key preserved"
+        );
 
         // Second read must see the now-persisted schema_version = 1 blob
         // directly via `from_metadata` (no re-upgrade needed).
         let raw = engine.get_metadata(agent, &id).await.unwrap().unwrap();
-        assert_eq!(PlaybookMeta::raw_schema_version(&raw), Some(super::super::entry::PLAYBOOK_SCHEMA_VERSION));
+        assert_eq!(
+            PlaybookMeta::raw_schema_version(&raw),
+            Some(super::super::entry::PLAYBOOK_SCHEMA_VERSION)
+        );
     }
 }

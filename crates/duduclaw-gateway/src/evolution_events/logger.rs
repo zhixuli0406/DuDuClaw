@@ -26,7 +26,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Mutex;
 use tracing::error;
 
-use super::schema::{validate, AuditEvent};
+use super::schema::{AuditEvent, validate};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -57,7 +57,10 @@ pub fn resolve_default_dir() -> PathBuf {
         return PathBuf::from(dudu_home).join("evolution").join("events");
     }
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        return PathBuf::from(home).join(".duduclaw").join("evolution").join("events");
+        return PathBuf::from(home)
+            .join(".duduclaw")
+            .join("evolution")
+            .join("events");
     }
     PathBuf::from(LEGACY_FALLBACK_DIR)
 }
@@ -122,14 +125,16 @@ impl EvolutionEventLogger {
         tokio::fs::create_dir_all(&self.base_dir).await?;
         let marker = self.base_dir.join(".healthcheck");
         let payload = format!("ok {}\n", chrono::Utc::now().to_rfc3339());
-        tokio::fs::write(&marker, payload.as_bytes()).await.map_err(|e| {
-            tracing::error!(
-                target: "evolution_events",
-                base_dir = %self.base_dir.display(),
-                "Audit log self-test FAILED: {e}"
-            );
-            e
-        })?;
+        tokio::fs::write(&marker, payload.as_bytes())
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    target: "evolution_events",
+                    base_dir = %self.base_dir.display(),
+                    "Audit log self-test FAILED: {e}"
+                );
+                e
+            })?;
         tracing::info!(
             target: "evolution_events",
             base_dir = %self.base_dir.display(),
@@ -581,7 +586,10 @@ mod tests {
 
         // Rotated file (seq 1) must exist and also have one event.
         let path1 = logger.log_path(&today, 1);
-        assert!(path1.exists(), "seq-1 file YYYY-MM-DD-1.jsonl must be created on size rotation");
+        assert!(
+            path1.exists(),
+            "seq-1 file YYYY-MM-DD-1.jsonl must be created on size rotation"
+        );
         let content1 = tokio::fs::read_to_string(&path1).await.unwrap();
         assert_eq!(content1.lines().count(), 1, "seq-1 file must have 1 event");
         let v1: serde_json::Value = serde_json::from_str(content1.lines().next().unwrap()).unwrap();
@@ -630,8 +638,14 @@ mod tests {
         let meta = serde_json::json!({"reason": long_reason});
         let scrubbed = scrub_metadata(meta);
         let result = scrubbed["reason"].as_str().unwrap();
-        assert!(result.len() <= 210, "truncated reason must be short (≤200 chars + ellipsis)");
-        assert!(result.ends_with('…'), "truncated reason must end with ellipsis");
+        assert!(
+            result.len() <= 210,
+            "truncated reason must be short (≤200 chars + ellipsis)"
+        );
+        assert!(
+            result.ends_with('…'),
+            "truncated reason must end with ellipsis"
+        );
     }
 
     #[test]
@@ -783,15 +797,23 @@ mod tests {
         // these vars while we hold the guard.
         for (k, v) in vars {
             match v {
-                Some(val) => unsafe { std::env::set_var(k, val); },
-                None => unsafe { std::env::remove_var(k); },
+                Some(val) => unsafe {
+                    std::env::set_var(k, val);
+                },
+                None => unsafe {
+                    std::env::remove_var(k);
+                },
             }
         }
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         for (k, v) in saved {
             match v {
-                Some(val) => unsafe { std::env::set_var(&k, val); },
-                None => unsafe { std::env::remove_var(&k); },
+                Some(val) => unsafe {
+                    std::env::set_var(&k, val);
+                },
+                None => unsafe {
+                    std::env::remove_var(&k);
+                },
             }
         }
         if let Err(p) = unwind {
@@ -851,9 +873,15 @@ mod tests {
         let logger = make_logger(&target);
         logger.self_test().await.expect("self_test must succeed");
         let marker = target.join(".healthcheck");
-        assert!(marker.exists(), "healthcheck marker must exist at {marker:?}");
+        assert!(
+            marker.exists(),
+            "healthcheck marker must exist at {marker:?}"
+        );
         let body = tokio::fs::read_to_string(&marker).await.unwrap();
-        assert!(body.starts_with("ok "), "marker should start with 'ok ', got: {body}");
+        assert!(
+            body.starts_with("ok "),
+            "marker should start with 'ok ', got: {body}"
+        );
     }
 
     #[tokio::test]
@@ -865,6 +893,9 @@ mod tests {
         let bad = blocking_file.join("audit");
         let logger = make_logger(&bad);
         let result = logger.self_test().await;
-        assert!(result.is_err(), "self_test should fail when path is unwritable");
+        assert!(
+            result.is_err(),
+            "self_test should fail when path is unwritable"
+        );
     }
 }

@@ -179,7 +179,11 @@ fn scan_placeholders(text: &str) -> Vec<String> {
 /// `path` is used only for its extension and basename (for the message); the
 /// bytes to check are `data`, already read by the caller — this function
 /// does no filesystem I/O of its own.
-pub fn evaluate_bytes(path: &Path, data: &[u8], cfg: &OfficeGateConfig) -> Result<Vec<String>, String> {
+pub fn evaluate_bytes(
+    path: &Path,
+    data: &[u8],
+    cfg: &OfficeGateConfig,
+) -> Result<Vec<String>, String> {
     let display_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -366,8 +370,8 @@ mod tests {
     fn minimal_zip_bytes_with_content(content: &[u8]) -> Vec<u8> {
         use std::io::Write;
         let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let opts =
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         zw.start_file("test.txt", opts).unwrap();
         zw.write_all(content).unwrap();
         zw.finish().unwrap().into_inner()
@@ -412,11 +416,18 @@ mod tests {
     #[test]
     fn truncated_zip_container_rejected_despite_correct_magic() {
         let full = minimal_zip_bytes();
-        assert!(full.len() > 16, "fixture too small to truncate meaningfully");
+        assert!(
+            full.len() > 16,
+            "fixture too small to truncate meaningfully"
+        );
         let truncated = &full[..12]; // keeps the PK\x03\x04 header, drops the rest
         assert!(truncated.starts_with(ZIP_MAGIC));
-        let err = evaluate_bytes(Path::new("out.xlsx"), truncated, &OfficeGateConfig::default())
-            .expect_err("truncated zip container must be a hard failure");
+        let err = evaluate_bytes(
+            Path::new("out.xlsx"),
+            truncated,
+            &OfficeGateConfig::default(),
+        )
+        .expect_err("truncated zip container must be a hard failure");
         assert!(err.contains("損毀") || err.contains("截斷"), "{err}");
     }
 
@@ -424,8 +435,12 @@ mod tests {
     #[test]
     fn legit_minimal_docx_passes() {
         let data = minimal_zip_bytes();
-        let warnings = evaluate_bytes(Path::new("report.docx"), &data, &OfficeGateConfig::default())
-            .expect("a well-formed zip under .docx must pass");
+        let warnings = evaluate_bytes(
+            Path::new("report.docx"),
+            &data,
+            &OfficeGateConfig::default(),
+        )
+        .expect("a well-formed zip under .docx must pass");
         assert!(warnings.is_empty());
     }
 
@@ -458,8 +473,12 @@ mod tests {
     fn placeholder_scan_skips_non_text_extensions() {
         assert!(!TEXT_SCAN_EXTS.contains(&"docx"));
         let data = minimal_zip_bytes_with_content(b"TODO: this text is inside a docx zip entry");
-        let warnings = evaluate_bytes(Path::new("report.docx"), &data, &OfficeGateConfig::default())
-            .expect("a well-formed zip under .docx must still pass");
+        let warnings = evaluate_bytes(
+            Path::new("report.docx"),
+            &data,
+            &OfficeGateConfig::default(),
+        )
+        .expect("a well-formed zip under .docx must still pass");
         assert!(
             warnings.is_empty(),
             "docx must never be placeholder-scanned: {warnings:?}"
@@ -478,8 +497,7 @@ mod tests {
             delivery_gate_placeholder_block: false,
         };
         // Would be a hard failure (empty) if the gate were on.
-        let result =
-            run_delivery_gate(Path::new("out.docx"), &[], &agent_dir, &home, &cfg).await;
+        let result = run_delivery_gate(Path::new("out.docx"), &[], &agent_dir, &home, &cfg).await;
         assert!(result.is_ok(), "{result:?}");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -513,8 +531,12 @@ mod tests {
         // the zip-magic/container check (that would be a false rejection of
         // a genuinely valid legacy file).
         let ole_magic = [0xD0u8, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0, 0];
-        let warnings = evaluate_bytes(Path::new("legacy.doc"), &ole_magic, &OfficeGateConfig::default())
-            .expect("legacy OLE doc must not be rejected by the zip-shaped check");
+        let warnings = evaluate_bytes(
+            Path::new("legacy.doc"),
+            &ole_magic,
+            &OfficeGateConfig::default(),
+        )
+        .expect("legacy OLE doc must not be rejected by the zip-shaped check");
         assert!(warnings.is_empty());
     }
 

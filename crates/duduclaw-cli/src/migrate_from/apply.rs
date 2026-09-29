@@ -257,7 +257,12 @@ pub(super) fn plan_channel_token(
 
 /// Plan/apply the Anthropic API key into config.toml `[api]`.
 /// Only the encrypted field is written; an existing key is never overwritten.
-pub(super) fn plan_api_key(ctx: &Ctx, report: &mut Report, config: &mut toml::value::Table, key: &str) {
+pub(super) fn plan_api_key(
+    ctx: &Ctx,
+    report: &mut Report,
+    config: &mut toml::value::Table,
+    key: &str,
+) {
     if key.trim().is_empty() {
         return;
     }
@@ -393,7 +398,12 @@ pub(super) async fn scaffold_agent(
 
 /// Copy + install skill directories after running each SKILL.md through the
 /// prompt-injection scanner. A flagged skill is NOT installed (SKIPPED-security).
-pub(super) fn install_skills(ctx: &Ctx, report: &mut Report, agent_id: &str, skill_dirs: &[PathBuf]) {
+pub(super) fn install_skills(
+    ctx: &Ctx,
+    report: &mut Report,
+    agent_id: &str,
+    skill_dirs: &[PathBuf],
+) {
     for sd in skill_dirs {
         let name = sd
             .file_name()
@@ -457,7 +467,8 @@ pub(super) fn archive_raw(ctx: &Ctx, report: &mut Report, entries: &[(String, Pa
         let res = if src.is_dir() {
             copy_dir_recursive(src, &dest)
         } else {
-            std::fs::create_dir_all(ctx.raw_dir()).and_then(|_| std::fs::copy(src, &dest).map(|_| ()))
+            std::fs::create_dir_all(ctx.raw_dir())
+                .and_then(|_| std::fs::copy(src, &dest).map(|_| ()))
         };
         match res {
             Ok(()) => report.imported("raw", label),
@@ -517,7 +528,12 @@ pub(super) struct ImportedWikiPage {
 /// Identity/Core), `trust: 0.3` (same ceiling as the `import` memory origin),
 /// `author: "import"`. Injection-scanned first (fail-closed, same discipline
 /// as `store_import_memory`); dry-run only records the plan.
-pub(super) fn import_wiki_page(ctx: &Ctx, report: &mut Report, agent_id: &str, page: &ImportedWikiPage) {
+pub(super) fn import_wiki_page(
+    ctx: &Ctx,
+    report: &mut Report,
+    agent_id: &str,
+    page: &ImportedWikiPage,
+) {
     let scan = duduclaw_security::input_guard::scan_input(
         &page.body,
         duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,

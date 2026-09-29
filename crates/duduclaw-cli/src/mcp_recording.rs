@@ -330,7 +330,11 @@ pub(crate) async fn handle_browser_record_start(
     home_dir: &Path,
     agent: &str,
 ) -> Value {
-    let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let url = args
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return rec_error("browser_record_start 需要 http(s):// 開頭的 `url`。");
     }
@@ -473,8 +477,8 @@ async fn request_stop_and_wait(dir: &Path, meta: &RecordingMeta) -> Result<Value
     }
     reap_child(&meta.id);
     if done_path.exists() {
-        let raw = std::fs::read_to_string(&done_path)
-            .map_err(|e| format!("讀取 done.json 失敗：{e}"))?;
+        let raw =
+            std::fs::read_to_string(&done_path).map_err(|e| format!("讀取 done.json 失敗：{e}"))?;
         Ok(serde_json::from_str(&raw).unwrap_or(Value::Null))
     } else {
         Err("錄製程序未在時限內結束（已強制終止）。部分成品可能未寫出。".to_string())
@@ -531,9 +535,8 @@ pub(crate) async fn handle_browser_record_stop(args: &Value, home_dir: &Path) ->
     if har_path.is_file() {
         let size = std::fs::metadata(&har_path).map(|m| m.len()).unwrap_or(0);
         if size > MAX_HAR_BYTES {
-            redaction_note = format!(
-                "HAR：{size} bytes 超過 {MAX_HAR_BYTES} 上限，未脫敏——請勿直接分享此檔"
-            );
+            redaction_note =
+                format!("HAR：{size} bytes 超過 {MAX_HAR_BYTES} 上限，未脫敏——請勿直接分享此檔");
         } else {
             match std::fs::read_to_string(&har_path) {
                 Ok(raw) => match serde_json::from_str::<Value>(&raw) {
@@ -547,7 +550,10 @@ pub(crate) async fn handle_browser_record_stop(args: &Value, home_dir: &Path) ->
                                 set_owner_only(&har_path, false);
                                 redaction_note = format!(
                                     "HAR 已脫敏（headers {}、cookies {}、query {}、body 欄位 {} 處已替換為 <env:VAR>）",
-                                    summary.headers, summary.cookies, summary.query_params, summary.body_fields
+                                    summary.headers,
+                                    summary.cookies,
+                                    summary.query_params,
+                                    summary.body_fields
                                 );
                             }
                             Err(e) => {
@@ -831,11 +837,7 @@ pub async fn run_desktop_record_worker(dir: PathBuf, interval_ms: u64, max_secon
         },
     });
     let _ = std::fs::write(&done_path, done.to_string());
-    if reason == "screenshot_failed" {
-        1
-    } else {
-        0
-    }
+    if reason == "screenshot_failed" { 1 } else { 0 }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -847,7 +849,10 @@ mod tests {
     #[test]
     fn recording_id_roundtrip_valid() {
         let id = new_recording_id();
-        assert!(is_valid_recording_id(&id), "generated id must validate: {id}");
+        assert!(
+            is_valid_recording_id(&id),
+            "generated id must validate: {id}"
+        );
     }
 
     #[test]
@@ -950,14 +955,16 @@ mod tests {
         assert_ne!(stop["isError"], true, "stop failed: {stop}");
 
         let dir = recording_dir(tmp.path(), &id);
-        assert!(dir.join("trace.zip").is_file(), "trace.zip missing; log: {:?}; stop: {stop_text}",
-            std::fs::read_to_string(dir.join("driver.log")).unwrap_or_default());
+        assert!(
+            dir.join("trace.zip").is_file(),
+            "trace.zip missing; log: {:?}; stop: {stop_text}",
+            std::fs::read_to_string(dir.join("driver.log")).unwrap_or_default()
+        );
         assert!(dir.join("session.har").is_file(), "session.har missing");
         assert!(dir.join("actions.json").is_file(), "actions.json missing");
-        let har: Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("session.har")).unwrap(),
-        )
-        .unwrap();
+        let har: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("session.har")).unwrap())
+                .unwrap();
         assert!(har.get("log").is_some(), "HAR must parse with a log root");
         #[cfg(unix)]
         {
@@ -978,8 +985,7 @@ mod tests {
         let code = run_desktop_record_worker(dir.clone(), 200, 5).await;
         assert_eq!(code, 0);
         let done: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("done.json")).unwrap())
-                .unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.join("done.json")).unwrap()).unwrap();
         assert_eq!(done["reason"], "stop_signal");
     }
 }

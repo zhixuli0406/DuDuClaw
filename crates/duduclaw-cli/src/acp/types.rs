@@ -13,7 +13,10 @@ pub enum SessionUpdate {
     TextChunk { session_id: String, content: String },
     /// Session completed.
     #[serde(rename = "complete")]
-    Complete { session_id: String, final_message: String },
+    Complete {
+        session_id: String,
+        final_message: String,
+    },
     /// Error occurred.
     #[serde(rename = "error")]
     Error { session_id: String, message: String },

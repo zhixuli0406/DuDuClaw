@@ -68,9 +68,8 @@ allowed_channels = ["line", "telegram"]
 skill_auto_activate = true
 skill_security_scan = true
 gvu_enabled = true
+strategy = "balanced"
 max_silence_hours = 12.0
-max_gvu_generations = 3
-observation_period_hours = 24.0
 skill_token_budget = 2500
 max_active_skills = 5
 

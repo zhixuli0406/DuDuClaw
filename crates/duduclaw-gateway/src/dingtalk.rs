@@ -26,17 +26,17 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::{
+    Router,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     routing::post,
-    Router,
 };
 use base64::Engine;
 use duduclaw_core::truncate_bytes;
 use tracing::{info, warn};
 
-use crate::channel_reply::{build_reply_with_session, set_channel_connected, ReplyContext};
+use crate::channel_reply::{ReplyContext, build_guarded_reply_with_session, set_channel_connected};
 
 /// DingTalk message content cap is generous (~20000 chars for markdown);
 /// chunk well below for display comfort.
@@ -401,7 +401,8 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
         );
         {
             let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
-            let throttle = crate::channel_capabilities::progress_throttle_secs("dingtalk").unwrap_or(45);
+            let throttle =
+                crate::channel_capabilities::progress_throttle_secs("dingtalk").unwrap_or(45);
             if !is_todo && last.elapsed().as_secs() < throttle {
                 return;
             }
@@ -415,9 +416,21 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
         });
     });
 
-    let reply =
-        build_reply_with_session(&text, &state.ctx, &session_id, &sender, Some(on_progress)).await;
-    if reply.trim().is_empty() {
+    // `sender` falls back to a literal placeholder when the payload carries
+    // neither `senderStaffId` nor `senderId`; that placeholder stays in the
+    // log line, the chat-command identity and the audit trail, but it must
+    // never become the CCR principal — every unidentified sender would hash to
+    // one shared retrieval scope. `reply_principal_for_sender` yields "" there,
+    // which turns CCR off for the turn (fail-closed).
+    let guarded = build_guarded_reply_with_session(
+        &text,
+        &state.ctx,
+        &session_id,
+        crate::ccr_runtime::reply_principal_for_sender(&sender),
+        Some(on_progress),
+    )
+    .await;
+    if guarded.text.trim().is_empty() {
         warn!(conversation_id, "DingTalk: reply is empty — skipping send");
         return;
     }
@@ -429,7 +442,56 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
         );
         return;
     }
-    send_via_webhook(&state.http, &session_webhook, &reply, true).await;
+    send_via_webhook_guarded(&state.http, &session_webhook, &guarded.text, true, &guarded).await;
+}
+
+async fn send_via_webhook_guarded(
+    http: &reqwest::Client,
+    webhook: &str,
+    text: &str,
+    try_markdown: bool,
+    guarded: &crate::channel_reply::GuardedReply,
+) {
+    for chunk in crate::channel_format::split_text(text, DINGTALK_TEXT_CHUNK) {
+        if !guarded.still_valid().await {
+            send_via_webhook(
+                http,
+                webhook,
+                crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+                false,
+            )
+            .await;
+            return;
+        }
+        let mut delivered = false;
+        if try_markdown {
+            let body = serde_json::json!({
+                "msgtype": "markdown",
+                "markdown": { "title": markdown_title(&chunk), "text": chunk },
+            });
+            delivered = post_webhook(http, webhook, &body).await;
+        }
+        if !delivered {
+            if !guarded.still_valid().await {
+                send_via_webhook(
+                    http,
+                    webhook,
+                    crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+                    false,
+                )
+                .await;
+                return;
+            }
+            let body = serde_json::json!({
+                "msgtype": "text",
+                "text": { "content": chunk },
+            });
+            if !post_webhook(http, webhook, &body).await {
+                warn!("DingTalk webhook send failed — dropping remaining chunks");
+                return;
+            }
+        }
+    }
 }
 
 /// POST to a sessionWebhook. `try_markdown = true` sends msgtype `markdown`
@@ -677,10 +739,12 @@ mod tests {
         assert_eq!(payload["msgtype"], "text");
         assert_eq!(payload["text"]["content"], "幫我查一下訂單");
         assert_eq!(payload["senderStaffId"], "manager123");
-        assert!(payload["sessionWebhook"]
-            .as_str()
-            .unwrap()
-            .starts_with("https://"));
+        assert!(
+            payload["sessionWebhook"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://")
+        );
     }
 
     #[test]
@@ -722,7 +786,10 @@ mod tests {
             },
         );
         let mode = std::fs::metadata(&store).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "session store must be owner-only, got {mode:o}");
+        assert_eq!(
+            mode, 0o600,
+            "session store must be owner-only, got {mode:o}"
+        );
     }
 
     /// MED-A: sessionWebhook SSRF allowlist is anchored and fail-closed.
@@ -735,14 +802,72 @@ mod tests {
         assert!(is_allowed_session_webhook("https://api.dingtalk.com/x"));
         assert!(is_allowed_session_webhook("https://dingtalk.com/x"));
         // Anchored: suffix tricks and lookalike hosts are rejected.
-        assert!(!is_allowed_session_webhook("https://dingtalk.com.evil.net/x"));
+        assert!(!is_allowed_session_webhook(
+            "https://dingtalk.com.evil.net/x"
+        ));
         assert!(!is_allowed_session_webhook("https://evildingtalk.com/x"));
-        assert!(!is_allowed_session_webhook("https://oapi.dingtalk.com.attacker.io/r"));
+        assert!(!is_allowed_session_webhook(
+            "https://oapi.dingtalk.com.attacker.io/r"
+        ));
         // Plain HTTP, other hosts, garbage → reject (fail-closed).
-        assert!(!is_allowed_session_webhook("http://oapi.dingtalk.com/robot"));
-        assert!(!is_allowed_session_webhook("https://internal-service.local/admin"));
+        assert!(!is_allowed_session_webhook(
+            "http://oapi.dingtalk.com/robot"
+        ));
+        assert!(!is_allowed_session_webhook(
+            "https://internal-service.local/admin"
+        ));
         assert!(!is_allowed_session_webhook("https://127.0.0.1:8080/steal"));
         assert!(!is_allowed_session_webhook("not a url"));
         assert!(!is_allowed_session_webhook(""));
+    }
+}
+
+/// Regression guard for the anonymous-sender CCR leak: this adapter used to
+/// pass its `"unknown"` placeholder straight into the reply pipeline's
+/// `user_id`, so every sender the webhook could not identify hashed to the
+/// same `source_acl` and could retrieve the others' saved tool originals.
+#[cfg(test)]
+mod ccr_principal_tests {
+    use crate::ccr_runtime::source_scan::call_args_at;
+    use crate::ccr_runtime::{reply_principal_for_sender, source_acl_for_principal};
+
+    const SRC: &str = include_str!("dingtalk.rs");
+    const AGENT: &str = "agent-a";
+    const SESSION: &str = "dingtalk:cid-1";
+
+    /// Structural: every `build_guarded_reply_with_session` call in this file
+    /// must launder its principal. Checked over the real source because the
+    /// call site lives inside a long async webhook handler that cannot be
+    /// driven from a unit test.
+    #[test]
+    fn every_guarded_reply_call_launders_the_ccr_principal() {
+        let args = call_args_at(SRC, "build_guarded_reply_with_session(", 3);
+        assert!(
+            !args.is_empty(),
+            "no guarded-reply call found — did the call site move?"
+        );
+        for arg in args {
+            assert!(
+                arg.starts_with("crate::ccr_runtime::reply_principal_for_sender("),
+                "the CCR principal argument must be laundered, found `{arg}`"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unidentified_sender_disables_ccr_instead_of_sharing_one_scope() {
+        let anonymous = reply_principal_for_sender("unknown");
+        assert!(anonymous.is_empty());
+        assert!(
+            source_acl_for_principal(AGENT, SESSION, anonymous).is_none(),
+            "an unidentified sender must disable CCR, never pool into one scope"
+        );
+
+        let alice = reply_principal_for_sender("staff-alice");
+        let bob = reply_principal_for_sender("staff-bob");
+        assert_ne!(
+            source_acl_for_principal(AGENT, SESSION, alice).unwrap(),
+            source_acl_for_principal(AGENT, SESSION, bob).unwrap()
+        );
     }
 }

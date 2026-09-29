@@ -126,10 +126,17 @@ pub struct AutoPageRequest {
 /// What the write actually did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoPageOutcome {
-    Created { path: String },
-    Updated { path: String, revisions: usize },
+    Created {
+        path: String,
+    },
+    Updated {
+        path: String,
+        revisions: usize,
+    },
     /// Byte-identical content — nothing written, no quota consumed.
-    Unchanged { path: String },
+    Unchanged {
+        path: String,
+    },
 }
 
 impl AutoPageOutcome {
@@ -204,7 +211,9 @@ pub fn check_auto_scope(wiki_dir: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
             // The file is there but unreadable — treat like malformed.
-            return Err(format!(".scope.toml unreadable ({e}) — auto-filing stopped"));
+            return Err(format!(
+                ".scope.toml unreadable ({e}) — auto-filing stopped"
+            ));
         }
     };
 
@@ -221,11 +230,17 @@ pub fn check_auto_scope(wiki_dir: &Path) -> Result<(), String> {
         return Ok(()); // namespace unlisted → default agent_writable
     };
 
-    let mode = entry.get("mode").and_then(|v| v.as_str()).unwrap_or("agent_writable");
+    let mode = entry
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("agent_writable");
     match mode {
         "agent_writable" => Ok(()),
         "read_only" => {
-            let synced_from = entry.get("synced_from").and_then(|v| v.as_str()).unwrap_or("");
+            let synced_from = entry
+                .get("synced_from")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if synced_from == AUTO_DISTILL_CAPABILITY {
                 Ok(())
             } else {
@@ -236,7 +251,9 @@ pub fn check_auto_scope(wiki_dir: &Path) -> Result<(), String> {
         }
         // `operator_only`, `agent_allowlist` (an internal capability is not an
         // MCP agent id), and any unknown mode all deny — fail-closed.
-        other => Err(format!("namespace 'auto' mode '{other}' forbids auto-filing")),
+        other => Err(format!(
+            "namespace 'auto' mode '{other}' forbids auto-filing"
+        )),
     }
 }
 
@@ -341,7 +358,11 @@ fn render_content_part(req: &AutoPageRequest) -> String {
     body.push_str("\n> 來源：");
     body.push_str(&sanitize_inline(&req.source_label));
     body.push_str("\n\n## 摘要\n\n");
-    body.push_str(if summary.is_empty() { "（無摘要）" } else { &summary });
+    body.push_str(if summary.is_empty() {
+        "（無摘要）"
+    } else {
+        &summary
+    });
     body.push_str("\n\n## 原文\n\n");
     body.push_str(original);
     if truncated {
@@ -361,7 +382,11 @@ fn revision_line(now: DateTime<Utc>, source_label: &str, first: bool) -> String 
     format!(
         "- {} — {}（來源：{}）",
         now.format("%Y-%m-%d %H:%M"),
-        if first { "初次建檔" } else { "內容更新" },
+        if first {
+            "初次建檔"
+        } else {
+            "內容更新"
+        },
         sanitize_inline(source_label)
     )
 }
@@ -525,7 +550,10 @@ pub fn write_auto_page(
         .map_err(|e| AutoPageError::Write(e.to_string()))?;
 
     Ok(if existing.is_some() {
-        AutoPageOutcome::Updated { path, revisions: revision_count }
+        AutoPageOutcome::Updated {
+            path,
+            revisions: revision_count,
+        }
     } else {
         AutoPageOutcome::Created { path }
     })
@@ -674,8 +702,18 @@ mod tests {
         let store = store_in(&tmp);
         let out =
             write_auto_page(&store, tmp.path(), "agnes", &req("公司章程", "第一條 …")).unwrap();
-        assert_eq!(out, AutoPageOutcome::Created { path: "auto/charter/company-charter.md".into() });
-        assert!(store.wiki_dir().join("auto/charter/company-charter.md").exists());
+        assert_eq!(
+            out,
+            AutoPageOutcome::Created {
+                path: "auto/charter/company-charter.md".into()
+            }
+        );
+        assert!(
+            store
+                .wiki_dir()
+                .join("auto/charter/company-charter.md")
+                .exists()
+        );
     }
 
     #[test]
@@ -686,7 +724,10 @@ mod tests {
             let mut r = req("t", "body");
             r.slug = bad.to_string();
             let err = write_auto_page(&store, tmp.path(), "agnes", &r).unwrap_err();
-            assert!(matches!(err, AutoPageError::Invalid(_)), "slug {bad:?} → {err}");
+            assert!(
+                matches!(err, AutoPageError::Invalid(_)),
+                "slug {bad:?} → {err}"
+            );
         }
         // No stray files were created anywhere in the wiki tree.
         assert!(!store.wiki_dir().join("auto").exists());
@@ -785,7 +826,10 @@ mod tests {
         );
         let err = write_auto_page(&store, tmp.path(), "agnes", &r).unwrap_err();
         assert!(matches!(err, AutoPageError::Injection(_)), "got {err}");
-        assert!(!store.wiki_dir().join("auto").exists(), "nothing may be written");
+        assert!(
+            !store.wiki_dir().join("auto").exists(),
+            "nothing may be written"
+        );
     }
 
     #[test]
@@ -806,17 +850,15 @@ mod tests {
         let store = store_in(&tmp);
         let r = req("公司章程", "第一條 本公司依法設立。");
         write_auto_page(&store, tmp.path(), "agnes", &r).unwrap();
-        let before = std::fs::read_to_string(
-            store.wiki_dir().join("auto/charter/company-charter.md"),
-        )
-        .unwrap();
+        let before =
+            std::fs::read_to_string(store.wiki_dir().join("auto/charter/company-charter.md"))
+                .unwrap();
 
         let out = write_auto_page(&store, tmp.path(), "agnes", &r).unwrap();
         assert!(matches!(out, AutoPageOutcome::Unchanged { .. }));
-        let after = std::fs::read_to_string(
-            store.wiki_dir().join("auto/charter/company-charter.md"),
-        )
-        .unwrap();
+        let after =
+            std::fs::read_to_string(store.wiki_dir().join("auto/charter/company-charter.md"))
+                .unwrap();
         assert_eq!(before, after, "byte-identical — no updated: churn");
     }
 
@@ -824,18 +866,29 @@ mod tests {
     fn second_version_overwrites_same_file_and_logs_a_revision() {
         let tmp = TempDir::new().unwrap();
         let store = store_in(&tmp);
-        write_auto_page(&store, tmp.path(), "agnes", &req("公司章程", "第一條 舊版。")).unwrap();
+        write_auto_page(
+            &store,
+            tmp.path(),
+            "agnes",
+            &req("公司章程", "第一條 舊版。"),
+        )
+        .unwrap();
 
         let mut r2 = req("公司章程", "第一條 新版，修訂了盈餘分派規則。");
         r2.source_id = "conversation:telegram:99999".into();
         let out = write_auto_page(&store, tmp.path(), "agnes", &r2).unwrap();
-        assert_eq!(out, AutoPageOutcome::Updated {
-            path: "auto/charter/company-charter.md".into(),
-            revisions: 2,
-        });
+        assert_eq!(
+            out,
+            AutoPageOutcome::Updated {
+                path: "auto/charter/company-charter.md".into(),
+                revisions: 2,
+            }
+        );
 
         // Still exactly one file in auto/charter.
-        let n = std::fs::read_dir(store.wiki_dir().join("auto/charter")).unwrap().count();
+        let n = std::fs::read_dir(store.wiki_dir().join("auto/charter"))
+            .unwrap()
+            .count();
         assert_eq!(n, 1, "must not grow a second page");
 
         let page = store.read_page("auto/charter/company-charter.md").unwrap();
@@ -866,7 +919,11 @@ mod tests {
 
         // Re-serialise and re-parse: every marker must survive (§1.5 trap).
         let raw = serialize_page(&page);
-        std::fs::write(store.wiki_dir().join("auto/charter/company-charter.md"), &raw).unwrap();
+        std::fs::write(
+            store.wiki_dir().join("auto/charter/company-charter.md"),
+            &raw,
+        )
+        .unwrap();
         let again = store.read_page("auto/charter/company-charter.md").unwrap();
         assert_eq!(again.author, page.author);
         assert_eq!(again.tags, page.tags);
@@ -900,7 +957,10 @@ mod tests {
         let mut r = req("文件", "第 21 份");
         r.slug = "doc-overflow".into();
         let err = write_auto_page(&store, tmp.path(), "agnes", &r).unwrap_err();
-        assert!(matches!(err, AutoPageError::QuotaExceeded { .. }), "got {err}");
+        assert!(
+            matches!(err, AutoPageError::QuotaExceeded { .. }),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -928,7 +988,10 @@ mod tests {
             assert!(try_consume_quota(tmp.path(), "agnes", QuotaKind::L2Call));
         }
         assert!(!try_consume_quota(tmp.path(), "agnes", QuotaKind::L2Call));
-        assert!(try_consume_quota(tmp.path(), "agnes", QuotaKind::Page), "page quota untouched");
+        assert!(
+            try_consume_quota(tmp.path(), "agnes", QuotaKind::Page),
+            "page quota untouched"
+        );
     }
 
     // ── Curation-station operations ──────────────────────────────────────
@@ -1039,16 +1102,29 @@ mod tests {
             .unwrap();
 
         let inject = |q: &str| {
-            crate::ranked_wiki_injection::ranked_wiki_injection(&store, q, 6000, None, None, None, true)
+            crate::ranked_wiki_injection::ranked_wiki_injection(
+                &store, q, 6000, None, None, None, true,
+            )
         };
         let baseline = inject("公司章程");
-        assert!(baseline.contains("董事會維護"), "human pages must be injected");
+        assert!(
+            baseline.contains("董事會維護"),
+            "human pages must be injected"
+        );
 
         // Now file an auto page that matches the same query even harder.
-        let mut r = req("公司章程", "章程 章程 章程 第一條 本公司依法設立，章程如下。");
+        let mut r = req(
+            "公司章程",
+            "章程 章程 章程 第一條 本公司依法設立，章程如下。",
+        );
         r.summary = "章程摘要 AUTOPAGE-MARKER".into();
         write_auto_page(&store, tmp.path(), "agnes", &r).unwrap();
-        assert!(store.wiki_dir().join("auto/charter/company-charter.md").exists());
+        assert!(
+            store
+                .wiki_dir()
+                .join("auto/charter/company-charter.md")
+                .exists()
+        );
 
         let after = inject("公司章程");
         assert_eq!(baseline, after, "injection context must be byte-identical");

@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tracing::info;
 
-use crate::gvu::verifier_measure::{derived_holdout_band, CaseScore, MeasureVector, NoiseBand};
+use crate::gvu::verifier_measure::{CaseScore, MeasureVector, NoiseBand, derived_holdout_band};
 use crate::playbook::delta::PlaybookDelta;
 use crate::playbook::gene::EvalCaseRef;
 
@@ -39,7 +39,11 @@ pub enum EntryVerdict {
     /// Linked cases held or improved.
     Confirm { before: f64, after: f64 },
     /// Linked cases regressed beyond the band — retire THIS entry only.
-    Rollback { before: f64, after: f64, reason: String },
+    Rollback {
+        before: f64,
+        after: f64,
+        reason: String,
+    },
     /// No comparable linked case ran. Not a pass and not a failure: the
     /// entry is left exactly as it was and the gap is reported, because
     /// "we could not check" must never render as "checked and fine".
@@ -67,10 +71,16 @@ pub struct EntryObservation {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "verdict", rename_all = "snake_case")]
 pub enum SuiteVerdict {
-    Pass { before: f64, after: f64 },
+    Pass {
+        before: f64,
+        after: f64,
+    },
     /// The suite mean fell outside the band. Entry-level confirms do not
     /// survive this — the whole candidate is rolled back.
-    Regressed { before: f64, after: f64 },
+    Regressed {
+        before: f64,
+        after: f64,
+    },
     /// One side had no cases at all.
     Insufficient,
 }
@@ -92,7 +102,10 @@ pub struct CaseBands {
 impl CaseBands {
     /// Straight from the band the commit gate ran with.
     pub fn from_noise_band(b: &NoiseBand) -> Self {
-        Self { cases: b.cases, holdout: b.holdout }
+        Self {
+            cases: b.cases,
+            holdout: b.holdout,
+        }
     }
 
     /// A pending row written before WP-4E recorded only `cases`. Reconstruct
@@ -100,7 +113,10 @@ impl CaseBands {
     /// an in-flight observation window that spans the upgrade settles under
     /// the documented default rather than under a silently different rule.
     pub fn from_cases_only(cases: f64) -> Self {
-        Self { cases, holdout: derived_holdout_band(cases) }
+        Self {
+            cases,
+            holdout: derived_holdout_band(cases),
+        }
     }
 }
 
@@ -146,7 +162,10 @@ pub fn entry_verdict(
             reason: format!("linked cases regressed {b:.2} → {a:.2} (band {band:.2})"),
         }
     } else {
-        EntryVerdict::Confirm { before: b, after: a }
+        EntryVerdict::Confirm {
+            before: b,
+            after: a,
+        }
     }
 }
 
@@ -171,7 +190,10 @@ pub fn suite_verdict(
     };
     // Legacy fence, unchanged and first.
     if a < b - bands.cases {
-        return SuiteVerdict::Regressed { before: b, after: a };
+        return SuiteVerdict::Regressed {
+            before: b,
+            after: a,
+        };
     }
     // Sub-fences, in the same order `dimensions()` reports them.
     for (name, band, pair) in [
@@ -197,10 +219,16 @@ pub fn suite_verdict(
                 band,
                 "AEE settle: sub-fence tripped — the mixed suite mean alone would have passed"
             );
-            return SuiteVerdict::Regressed { before: sb, after: sa };
+            return SuiteVerdict::Regressed {
+                before: sb,
+                after: sa,
+            };
         }
     }
-    SuiteVerdict::Pass { before: b, after: a }
+    SuiteVerdict::Pass {
+        before: b,
+        after: a,
+    }
 }
 
 /// Evaluate every live entry in `snapshot` against the two score sets.
@@ -363,11 +391,17 @@ pub fn now() -> DateTime<Utc> {
 mod tests {
     use super::*;
     use crate::playbook::delta::ExistingEntry;
-    use crate::playbook::entry::{PlaybookCategory, PlaybookMeta, PlaybookState, PLAYBOOK_SCHEMA_VERSION};
+    use crate::playbook::entry::{
+        PLAYBOOK_SCHEMA_VERSION, PlaybookCategory, PlaybookMeta, PlaybookState,
+    };
     use crate::prediction::rule_lifecycle::RuleStats;
 
     fn cs(case: &str, score: f64) -> CaseScore {
-        CaseScore { case: case.to_string(), score, held_out: false }
+        CaseScore {
+            case: case.to_string(),
+            score,
+            held_out: false,
+        }
     }
 
     fn entry(id: &str, cases: &[&str], streak: u32) -> ExistingEntry {
@@ -378,10 +412,14 @@ mod tests {
                 assertions: Default::default(),
                 schema_version: PLAYBOOK_SCHEMA_VERSION,
                 category: PlaybookCategory::Repair,
+                transferability: Default::default(),
                 signals_match: vec!["mistake:factual".to_string()],
                 strategy: Vec::new(),
                 failure_history: Vec::new(),
-                eval_cases: cases.iter().map(|c| EvalCaseRef((*c).to_string())).collect(),
+                eval_cases: cases
+                    .iter()
+                    .map(|c| EvalCaseRef((*c).to_string()))
+                    .collect(),
                 applications: Vec::new(),
                 success_streak: streak,
                 state: PlaybookState::Active,
@@ -419,7 +457,10 @@ mod tests {
         let recorded_good = deltas.iter().any(|d| {
             matches!(d, PlaybookDelta::Record { id, outcome, .. } if id == "good" && outcome == "eval_pass")
         });
-        assert!(recorded_good, "the healthy neighbour is confirmed, not collaterally rolled back");
+        assert!(
+            recorded_good,
+            "the healthy neighbour is confirmed, not collaterally rolled back"
+        );
     }
 
     #[test]
@@ -435,12 +476,22 @@ mod tests {
         let linked = vec![EvalCaseRef("s/a".into()), EvalCaseRef("s/b".into())];
         // 1.0 → 0.5 across two cases is a 0.5 mean vs 1.0: outside a 0.05 band.
         assert!(matches!(
-            entry_verdict(&linked, &[cs("s/a", 1.0), cs("s/b", 1.0)], &[cs("s/a", 1.0), cs("s/b", 0.0)], 0.05),
+            entry_verdict(
+                &linked,
+                &[cs("s/a", 1.0), cs("s/b", 1.0)],
+                &[cs("s/a", 1.0), cs("s/b", 0.0)],
+                0.05
+            ),
             EntryVerdict::Rollback { .. }
         ));
         // …but with a band wide enough to cover it, it is a tie → confirm.
         assert!(matches!(
-            entry_verdict(&linked, &[cs("s/a", 1.0), cs("s/b", 1.0)], &[cs("s/a", 1.0), cs("s/b", 0.0)], 0.6),
+            entry_verdict(
+                &linked,
+                &[cs("s/a", 1.0), cs("s/b", 1.0)],
+                &[cs("s/a", 1.0), cs("s/b", 0.0)],
+                0.6
+            ),
             EntryVerdict::Confirm { .. }
         ));
     }
@@ -455,21 +506,34 @@ mod tests {
         let obs = observe_entries(&snap, &before, &after, 0.05);
         assert!(matches!(obs[0].verdict, EntryVerdict::Confirm { .. }));
 
-        let bv = MeasureVector { cases: before, ..Default::default() };
-        let av = MeasureVector { cases: after, ..Default::default() };
+        let bv = MeasureVector {
+            cases: before,
+            ..Default::default()
+        };
+        let av = MeasureVector {
+            cases: after,
+            ..Default::default()
+        };
         let suite = suite_verdict(&bv, &av, CaseBands::from_cases_only(0.05));
         assert!(matches!(suite, SuiteVerdict::Regressed { .. }));
 
         let (deltas, report) = finalise(&obs, &suite, "a");
         assert!(report.suite_regressed);
         assert_eq!(report.confirmed, 1, "the local confirm is still REPORTED…");
-        assert!(deltas.is_empty(), "…but not honoured — this is the over-fitting signature");
+        assert!(
+            deltas.is_empty(),
+            "…but not honoured — this is the over-fitting signature"
+        );
     }
 
     // ── WP-4E: the suite fence splits visible / held-out too ─────────────
 
     fn hs(case: &str, score: f64) -> CaseScore {
-        CaseScore { case: case.to_string(), score, held_out: true }
+        CaseScore {
+            case: case.to_string(),
+            score,
+            held_out: true,
+        }
     }
 
     /// The commit gate's masking scenario, replayed at settlement time.
@@ -478,22 +542,49 @@ mod tests {
         let bands = CaseBands::from_cases_only(0.05); // holdout = 0.025
         // 4 visible cases 0.5 → 1.0, 40 held-out cases 1.0 → 0.95.
         // Mixed mean is 42/44 on both sides: the legacy fence sees nothing.
-        let mut before: Vec<CaseScore> =
-            vec![cs("s/v0", 1.0), cs("s/v1", 1.0), cs("s/v2", 0.0), cs("s/v3", 0.0)];
-        let mut after: Vec<CaseScore> =
-            vec![cs("s/v0", 1.0), cs("s/v1", 1.0), cs("s/v2", 1.0), cs("s/v3", 1.0)];
+        let mut before: Vec<CaseScore> = vec![
+            cs("s/v0", 1.0),
+            cs("s/v1", 1.0),
+            cs("s/v2", 0.0),
+            cs("s/v3", 0.0),
+        ];
+        let mut after: Vec<CaseScore> = vec![
+            cs("s/v0", 1.0),
+            cs("s/v1", 1.0),
+            cs("s/v2", 1.0),
+            cs("s/v3", 1.0),
+        ];
         for i in 0..40 {
             before.push(hs(&format!("s/_holdout/h{i}"), 1.0));
-            after.push(hs(&format!("s/_holdout/h{i}"), if i < 2 { 0.0 } else { 1.0 }));
+            after.push(hs(
+                &format!("s/_holdout/h{i}"),
+                if i < 2 { 0.0 } else { 1.0 },
+            ));
         }
-        let bv = MeasureVector { cases: before.clone(), ..Default::default() };
-        let av = MeasureVector { cases: after.clone(), ..Default::default() };
-        assert_eq!(bv.cases_mean(), av.cases_mean(), "the mixed mean is unmoved");
+        let bv = MeasureVector {
+            cases: before.clone(),
+            ..Default::default()
+        };
+        let av = MeasureVector {
+            cases: after.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            bv.cases_mean(),
+            av.cases_mean(),
+            "the mixed mean is unmoved"
+        );
 
         // OLD behaviour: the same scores with the held-out flag cleared are
         // exactly what the single-mean fence used to compare — it passes.
         let clear = |v: &[CaseScore]| MeasureVector {
-            cases: v.iter().map(|c| CaseScore { held_out: false, ..c.clone() }).collect(),
+            cases: v
+                .iter()
+                .map(|c| CaseScore {
+                    held_out: false,
+                    ..c.clone()
+                })
+                .collect(),
             ..Default::default()
         };
         assert!(matches!(
@@ -504,9 +595,15 @@ mod tests {
         // NEW behaviour: the held-out fence trips and the whole candidate is
         // rolled back.
         match suite_verdict(&bv, &av, bands) {
-            SuiteVerdict::Regressed { before: b, after: a } => {
+            SuiteVerdict::Regressed {
+                before: b,
+                after: a,
+            } => {
                 assert_eq!(b, 1.0);
-                assert!((a - 0.95).abs() < 1e-9, "reports the held-out means, not the mixed ones");
+                assert!(
+                    (a - 0.95).abs() < 1e-9,
+                    "reports the held-out means, not the mixed ones"
+                );
             }
             other => panic!("expected a held-out regression, got {other:?}"),
         }
@@ -515,26 +612,60 @@ mod tests {
     #[test]
     fn settle_fence_is_unchanged_when_no_case_is_held_out() {
         let bands = CaseBands::from_cases_only(0.05);
-        let before = vec![cs("s/a", 1.0), cs("s/b", 1.0), cs("s/c", 1.0), cs("s/d", 1.0)];
+        let before = vec![
+            cs("s/a", 1.0),
+            cs("s/b", 1.0),
+            cs("s/c", 1.0),
+            cs("s/d", 1.0),
+        ];
         // A single failure out of four = 0.25 drop ⇒ regression, reported with
         // the mixed means exactly as before WP-4E.
-        let worse = vec![cs("s/a", 1.0), cs("s/b", 1.0), cs("s/c", 1.0), cs("s/d", 0.0)];
-        let bv = MeasureVector { cases: before.clone(), ..Default::default() };
+        let worse = vec![
+            cs("s/a", 1.0),
+            cs("s/b", 1.0),
+            cs("s/c", 1.0),
+            cs("s/d", 0.0),
+        ];
+        let bv = MeasureVector {
+            cases: before.clone(),
+            ..Default::default()
+        };
         assert_eq!(
-            suite_verdict(&bv, &MeasureVector { cases: worse, ..Default::default() }, bands),
-            SuiteVerdict::Regressed { before: 1.0, after: 0.75 }
+            suite_verdict(
+                &bv,
+                &MeasureVector {
+                    cases: worse,
+                    ..Default::default()
+                },
+                bands
+            ),
+            SuiteVerdict::Regressed {
+                before: 1.0,
+                after: 0.75
+            }
         );
         // Unchanged ⇒ Pass, still carrying the mixed means.
         assert_eq!(
             suite_verdict(&bv, &bv, bands),
-            SuiteVerdict::Pass { before: 1.0, after: 1.0 }
+            SuiteVerdict::Pass {
+                before: 1.0,
+                after: 1.0
+            }
         );
         // An improvement is never a regression.
         let poor = MeasureVector {
-            cases: vec![cs("s/a", 0.0), cs("s/b", 0.0), cs("s/c", 0.0), cs("s/d", 0.0)],
+            cases: vec![
+                cs("s/a", 0.0),
+                cs("s/b", 0.0),
+                cs("s/c", 0.0),
+                cs("s/d", 0.0),
+            ],
             ..Default::default()
         };
-        assert!(matches!(suite_verdict(&poor, &bv, bands), SuiteVerdict::Pass { .. }));
+        assert!(matches!(
+            suite_verdict(&poor, &bv, bands),
+            SuiteVerdict::Pass { .. }
+        ));
     }
 
     #[test]
@@ -550,7 +681,10 @@ mod tests {
             cases: vec![cs("s/a", 1.0), cs("s/b", 1.0), hs("s/_holdout/h", 1.0)],
             ..Default::default()
         };
-        assert!(matches!(suite_verdict(&before, &after, bands), SuiteVerdict::Pass { .. }));
+        assert!(matches!(
+            suite_verdict(&before, &after, bands),
+            SuiteVerdict::Pass { .. }
+        ));
         // …and an empty side is still Insufficient, not a silent pass.
         assert_eq!(
             suite_verdict(&MeasureVector::default(), &after, bands),
@@ -562,14 +696,24 @@ mod tests {
     fn settle_bands_come_from_the_commit_gate_not_a_second_policy() {
         // An explicit operator override, as `NoiseBand::from_agent_dir` would
         // have produced it.
-        let band = NoiseBand { cases: 0.08, holdout: 0.01, ..NoiseBand::default() };
+        let band = NoiseBand {
+            cases: 0.08,
+            holdout: 0.01,
+            ..NoiseBand::default()
+        };
         let from_gate = CaseBands::from_noise_band(&band);
         assert_eq!(from_gate.cases, 0.08);
-        assert_eq!(from_gate.holdout, 0.01, "an explicit override survives to settlement");
+        assert_eq!(
+            from_gate.holdout, 0.01,
+            "an explicit override survives to settlement"
+        );
         // A legacy row without the column derives, it does not guess.
         assert_eq!(
             CaseBands::from_cases_only(0.08),
-            CaseBands { cases: 0.08, holdout: 0.04 }
+            CaseBands {
+                cases: 0.08,
+                holdout: 0.04
+            }
         );
     }
 
@@ -588,7 +732,10 @@ mod tests {
         );
         for d in settlement_deltas(&obs) {
             assert!(
-                matches!(d, PlaybookDelta::Record { .. } | PlaybookDelta::Retire { .. }),
+                matches!(
+                    d,
+                    PlaybookDelta::Record { .. } | PlaybookDelta::Retire { .. }
+                ),
                 "settlement emitted an unexpected op: {d:?}"
             );
         }
@@ -596,7 +743,8 @@ mod tests {
 
     #[test]
     fn streaks_increment_on_confirm_and_reset_on_rollback() {
-        let mut snap = PlaybookSnapshot::new(vec![entry("good", &["s/g"], 4), entry("bad", &["s/b"], 4)]);
+        let mut snap =
+            PlaybookSnapshot::new(vec![entry("good", &["s/g"], 4), entry("bad", &["s/b"], 4)]);
         let obs = observe_entries(
             &snap,
             &[cs("s/g", 1.0), cs("s/b", 1.0)],

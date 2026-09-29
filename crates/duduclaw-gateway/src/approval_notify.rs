@@ -27,7 +27,7 @@
 //!   [`ApprovalBroker::request`] itself, so every action kind is covered by
 //!   construction rather than by remembering to call it at each site.
 //!   [`notify_reminder`] sends the ⅔-TTL "about to auto-deny" nudge. Both go
-//!   out through the shared [`crate::decision_notify::deliver`] path.
+//!   out through the shared [`crate::notify_push::push`] path.
 //! - **Inbound** [`apply_decision`] — reached from the unified router
 //!   ([`crate::decision_notify::route_press`]), authorized by the shared
 //!   matrix and applied via `ApprovalBroker::decide`.
@@ -37,13 +37,13 @@
 
 use std::path::Path;
 
-use tracing::info;
-
-use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord, ApprovalStatus, SimulationNarrative};
+use crate::approval::{
+    ApprovalBroker, ApprovalId, ApprovalRecord, ApprovalStatus, SimulationNarrative,
+};
 use crate::decision_action::{DecisionAct, DecisionSource};
 use crate::decision_notify::{
-    approver_links, authorize_press, destination_matches_any, identity_system_active, mapped_role,
-    origin_target, refusal_text, resolve_targets, DecisionCard, PressAuth,
+    DecisionCard, PressAuth, approver_links, authorize_press, destination_matches_any,
+    identity_system_active, mapped_role, origin_target, refusal_text, resolve_targets,
 };
 use crate::task_store::{ActivityRow, TaskStore};
 
@@ -71,6 +71,7 @@ pub(crate) fn zh_action_kind(kind: &str) -> &str {
         "induced_rule" => "新增自動化規則",
         "bus_task" => "執行委派任務",
         "browser_action" => "操作瀏覽器",
+        "support_pilot_review" => "檢視合成決策模擬",
         _ => "執行需要核可的動作",
     }
 }
@@ -133,7 +134,10 @@ pub(crate) fn approval_body(rec: &ApprovalRecord, reminder: bool) -> String {
         prefix = crate::decision_notify::reason_prefix(DecisionSource::Approval),
         agent = crate::goal_state::xml_escape(&rec.agent_id),
         kind = zh_action_kind(&rec.action_kind),
-        summary = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.summary, SUMMARY_MAX_CHARS)),
+        summary = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(
+            &rec.summary,
+            SUMMARY_MAX_CHARS
+        )),
         trajectory = crate::goal_state::xml_escape(&trajectory_line(rec)),
         deadline = deadline_phrase(rec),
         id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
@@ -180,12 +184,15 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
         return None;
     }
 
-    let http = reqwest::Client::new();
     let body = approval_body(rec, reminder);
     // A clickable deep link to the unified inbox — `None` when no dashboard
     // base URL is configured/derivable, in which case the rendered text stays
     // exactly as it reads without this feature.
-    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Approval, rec.id.as_str());
+    let link = crate::deep_link::deep_link(
+        home_dir,
+        crate::deep_link::DeepLinkKind::Approval,
+        rec.id.as_str(),
+    );
     let card = DecisionCard {
         source: DecisionSource::Approval,
         decision_id: rec.id.as_str(),
@@ -194,21 +201,19 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
         no_button_hint: "此通道無法顯示按鈕，請至儀表板的待辦決定頁同意或拒絕，\
                          或改用 Telegram／Slack／Discord／LINE 直接按按鈕。",
     };
-    let mut delivered: Option<(String, String)> = None;
-
-    for (channel, chat_id) in targets {
-        let Some(token) =
-            crate::goal_notify::channel_token(home_dir, &rec.agent_id, &channel).await
-        else {
-            info!(approval_id = %rec.id, %channel, "approval push: no bot token; skipping");
-            continue;
-        };
-        let ok = crate::decision_notify::deliver(home_dir, &http, &channel, &token, &chat_id, &card).await;
-        if ok && delivered.is_none() {
-            delivered = Some((channel, chat_id));
-        }
-    }
-    delivered
+    // O5: the token cascade + per-target deliver + first-success bookkeeping
+    // this function used to inline is `notify_push::push`. Which destinations
+    // (the chain above) and what the card says stay here.
+    crate::notify_push::push(
+        home_dir,
+        &card,
+        &crate::notify_push::NotifyDest::Agent {
+            agent_id: rec.agent_id.clone(),
+            targets,
+        },
+    )
+    .await
+    .delivered
 }
 
 // ── Inbound ─────────────────────────────────────────────────────
@@ -245,7 +250,16 @@ pub async fn decide_from_channel(
     if action.source != DecisionSource::Approval {
         return None;
     }
-    Some(apply_decision(home_dir, channel, channel_user_id, &action.id, action.approve()).await)
+    Some(
+        apply_decision(
+            home_dir,
+            channel,
+            channel_user_id,
+            &action.id,
+            action.approve(),
+        )
+        .await,
+    )
 }
 
 /// Apply an already-decoded approve/deny to `approvals.db`. Called by the
@@ -262,6 +276,12 @@ pub(crate) async fn apply_decision(
     let Some(rec) = broker.get(&id).await.map_err(|e| e.to_string())? else {
         return Err("找不到這筆核可（可能已過期並被清除）".into());
     };
+    let role = mapped_role(home_dir, channel, channel_user_id);
+    // A generic manager or destination-only channel press cannot inspect the
+    // admin-only Decision Lab. Check terminal rows before disclosing status.
+    if rec.action_kind == "support_pilot_review" && role != Some(duduclaw_auth::UserRole::Admin) {
+        return Err("此人工檢視需由可開啟 Decision Lab 的管理員決定。".into());
+    }
     if rec.status.is_terminal() {
         return Ok(match rec.status {
             ApprovalStatus::Approved => "這項要求先前已同意。".into(),
@@ -276,7 +296,7 @@ pub(crate) async fn apply_decision(
     // configured at all, only a press from the exact account the approval was
     // delivered to is honoured. Fail-closed everywhere else.
     let auth = authorize_press(
-        mapped_role(home_dir, channel, channel_user_id),
+        role,
         identity_system_active(home_dir),
         destination_matches_any(&delivered_targets(&rec), channel, channel_user_id),
     );
@@ -318,7 +338,13 @@ pub(crate) async fn apply_decision(
     // ("已拒絕"); the acknowledgement and the collapsed card take that verb
     // from the same place, so a person is told the same word twice.
     let card_verb = settled_verb_for(&rec, approve);
-    spawn_approval_collapse(home_dir.to_path_buf(), rec.clone(), channel.to_string(), channel_user_id.to_string(), card_verb);
+    spawn_approval_collapse(
+        home_dir.to_path_buf(),
+        rec.clone(),
+        channel.to_string(),
+        channel_user_id.to_string(),
+        card_verb,
+    );
 
     Ok(format!(
         "{} {}：{}",
@@ -336,7 +362,11 @@ fn settled_verb_for(rec: &ApprovalRecord, approve: bool) -> crate::decision_card
     } else {
         DecisionSource::Approval
     };
-    let act = if approve { DecisionAct::Approve } else { DecisionAct::Deny };
+    let act = if approve {
+        DecisionAct::Approve
+    } else {
+        DecisionAct::Deny
+    };
     crate::decision_notify::settled_verb(source, act)
 }
 
@@ -369,7 +399,8 @@ fn spawn_approval_collapse(
 ) {
     tokio::spawn(async move {
         let http = reqwest::Client::new();
-        let decider = crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
+        let decider =
+            crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
         let summary = approval_collapse_summary(&rec);
         let home = home_dir.clone();
         let agent = rec.agent_id.clone();
@@ -436,7 +467,94 @@ mod tests {
     use super::*;
     use crate::approval::ApprovalStatus;
     use chrono::Utc;
+    use duduclaw_auth::{UserDb, UserRole};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn synthetic_pilot_review_channel_decision_requires_verified_admin() {
+        let home = tempfile::tempdir().unwrap();
+        let users = UserDb::new(&home.path().join("users.db")).unwrap();
+        let manager = users
+            .create_user(
+                "manager@example.test",
+                "Manager",
+                "test-password",
+                UserRole::Manager,
+            )
+            .unwrap();
+        let admin = users
+            .create_user(
+                "admin@example.test",
+                "Admin",
+                "test-password",
+                UserRole::Admin,
+            )
+            .unwrap();
+        users
+            .bind_channel_identity(&manager.id, "telegram", "manager-dm", true)
+            .unwrap();
+        users
+            .bind_channel_identity(&admin.id, "telegram", "admin-dm", true)
+            .unwrap();
+        let broker = ApprovalBroker::open(home.path()).unwrap();
+        let approval = broker
+            .request(
+                "requester",
+                "support_pilot_review",
+                "Inspect a synthetic run",
+                json!({}),
+                3600,
+            )
+            .await
+            .unwrap();
+        assert!(
+            apply_decision(
+                home.path(),
+                "telegram",
+                "manager-dm",
+                approval.as_str(),
+                true
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            apply_decision(
+                home.path(),
+                "telegram",
+                "unknown-dm",
+                approval.as_str(),
+                true
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            broker.get(&approval).await.unwrap().unwrap().status,
+            ApprovalStatus::Pending
+        );
+        assert!(
+            apply_decision(home.path(), "telegram", "admin-dm", approval.as_str(), true)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            broker.get(&approval).await.unwrap().unwrap().status,
+            ApprovalStatus::Approved
+        );
+        assert!(
+            apply_decision(
+                home.path(),
+                "telegram",
+                "manager-dm",
+                approval.as_str(),
+                true,
+            )
+            .await
+            .is_err(),
+            "a non-admin must not read this review's terminal decision through a channel",
+        );
+    }
 
     fn rec(kind: &str) -> ApprovalRecord {
         ApprovalRecord {
@@ -468,14 +586,26 @@ mod tests {
 
     #[test]
     fn settled_verb_for_install_deny_reads_softer_than_generic_deny() {
-        assert_eq!(settled_verb_for(&rec("mcp_install"), false), crate::decision_card::DecisionVerb::DeclinedInstall);
-        assert_eq!(settled_verb_for(&rec("mcp_call"), false), crate::decision_card::DecisionVerb::Denied);
+        assert_eq!(
+            settled_verb_for(&rec("mcp_install"), false),
+            crate::decision_card::DecisionVerb::DeclinedInstall
+        );
+        assert_eq!(
+            settled_verb_for(&rec("mcp_call"), false),
+            crate::decision_card::DecisionVerb::Denied
+        );
     }
 
     #[test]
     fn settled_verb_for_approve_is_always_approved_regardless_of_kind() {
-        assert_eq!(settled_verb_for(&rec("mcp_install"), true), crate::decision_card::DecisionVerb::Approved);
-        assert_eq!(settled_verb_for(&rec("mcp_call"), true), crate::decision_card::DecisionVerb::Approved);
+        assert_eq!(
+            settled_verb_for(&rec("mcp_install"), true),
+            crate::decision_card::DecisionVerb::Approved
+        );
+        assert_eq!(
+            settled_verb_for(&rec("mcp_call"), true),
+            crate::decision_card::DecisionVerb::Approved
+        );
     }
 
     #[test]
@@ -652,7 +782,11 @@ mod tests {
             dir.path(),
             "telegram",
             "555",
-            &crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Approve, id.as_str()),
+            &crate::decision_action::encode(
+                DecisionSource::Approval,
+                DecisionAct::Approve,
+                id.as_str(),
+            ),
         )
         .await
         .unwrap();
@@ -678,7 +812,11 @@ mod tests {
             dir.path(),
             "telegram",
             "999",
-            &crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Approve, id.as_str()),
+            &crate::decision_action::encode(
+                DecisionSource::Approval,
+                DecisionAct::Approve,
+                id.as_str(),
+            ),
         )
         .await
         .unwrap();
@@ -699,7 +837,11 @@ mod tests {
             .await
             .unwrap();
 
-        let deny = crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Deny, id.as_str());
+        let deny = crate::decision_action::encode(
+            DecisionSource::Approval,
+            DecisionAct::Deny,
+            id.as_str(),
+        );
         let first = decide_from_channel(dir.path(), "telegram", "42", &deny)
             .await
             .unwrap();
@@ -724,7 +866,9 @@ mod tests {
             .request("sales-bot", "mcp_install", "安裝 skill", json!({}), 300)
             .await
             .unwrap();
-        disk.set_notify_target_for_test(&id, "telegram", "555").await.unwrap();
+        disk.set_notify_target_for_test(&id, "telegram", "555")
+            .await
+            .unwrap();
 
         let legacy = format!("duduclaw:approval_ok:{}", id.as_str());
         let out = decide_from_channel(dir.path(), "telegram", "555", &legacy)
@@ -743,12 +887,18 @@ mod tests {
             .request("a", "mcp_install", "安裝 skill", json!({}), 300)
             .await
             .unwrap();
-        disk.set_notify_target_for_test(&install, "telegram", "1").await.unwrap();
+        disk.set_notify_target_for_test(&install, "telegram", "1")
+            .await
+            .unwrap();
         let msg = decide_from_channel(
             dir.path(),
             "telegram",
             "1",
-            &crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Deny, install.as_str()),
+            &crate::decision_action::encode(
+                DecisionSource::Approval,
+                DecisionAct::Deny,
+                install.as_str(),
+            ),
         )
         .await
         .unwrap()
@@ -759,12 +909,18 @@ mod tests {
             .request("a", "mcp_call", "刪除資料", json!({}), 300)
             .await
             .unwrap();
-        disk.set_notify_target_for_test(&risky, "telegram", "1").await.unwrap();
+        disk.set_notify_target_for_test(&risky, "telegram", "1")
+            .await
+            .unwrap();
         let msg = decide_from_channel(
             dir.path(),
             "telegram",
             "1",
-            &crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Deny, risky.as_str()),
+            &crate::decision_action::encode(
+                DecisionSource::Approval,
+                DecisionAct::Deny,
+                risky.as_str(),
+            ),
         )
         .await
         .unwrap()

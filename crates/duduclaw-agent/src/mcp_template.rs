@@ -317,14 +317,22 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
     // its full env to MCP children, but writing the pairs into `.mcp.json`
     // keeps the agent dir working standalone (claude launched from a terminal
     // that lacks the gateway env). See `duduclaw_core::mcp_forward_env_vars`.
-    let forward_env = duduclaw_core::mcp_forward_env_vars();
+    let home_dir = derive_home_from_agent_dir(agent_dir);
+    let mut forward_env = duduclaw_core::mcp_forward_env_vars();
+    // This function also scaffolds members under a cloned eval home. An
+    // inherited DUDUCLAW_HOME can name the source instance, so the MCP child
+    // must always use the same derived home as its identity token.
+    forward_env.retain(|(name, _)| name != "DUDUCLAW_HOME");
+    forward_env.push((
+        "DUDUCLAW_HOME".to_string(),
+        home_dir.to_string_lossy().to_string(),
+    ));
 
     // Per-agent identity pair: id + (when enabled) its WP21 debt ⑧ token. The
     // home is derived from `<home>/agents/<id>` rather than `duduclaw_home()`
     // so a caller operating on an explicit agents root (tests, migrations,
     // a second instance) signs with that root's key, not the ambient one.
-    let identity_env =
-        duduclaw_core::agent_identity_env_vars(&derive_home_from_agent_dir(agent_dir), &agent_id);
+    let identity_env = duduclaw_core::agent_identity_env_vars(&home_dir, &agent_id);
 
     // Case 1: No .mcp.json exists → create with duduclaw server entry
     if !path.exists() {
@@ -855,6 +863,23 @@ mod tests {
         }
     }
 
+    /// Scoped `DUDUCLAW_HOME` override — the forward-set var that tells an
+    /// MCP child which home to serve. Same locking contract as
+    /// [`BinEnvOverride`].
+    struct HomeEnvOverride;
+    impl HomeEnvOverride {
+        fn set(path: &std::path::Path) -> Self {
+            // SAFETY: serialized via `BIN_ENV_LOCK` in each test.
+            unsafe { std::env::set_var("DUDUCLAW_HOME", path); }
+            Self
+        }
+    }
+    impl Drop for HomeEnvOverride {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("DUDUCLAW_HOME"); }
+        }
+    }
+
     /// Scoped `DUDUCLAW_MCP_API_KEY` override — the forward-set var whose
     /// value `ensure_duduclaw_absolute_path` must keep in sync inside
     /// `.mcp.json`. Same locking contract as [`BinEnvOverride`].
@@ -1154,6 +1179,50 @@ mod tests {
 
         // Idempotent once the fresh key is in place.
         assert!(!ensure_duduclaw_absolute_path(&agent_dir).unwrap());
+    }
+
+    /// An ephemeral / team-role-member scaffold (`<home>/agents/.ephemeral/<id>`)
+    /// gets a `.mcp.json` created from scratch, and that file is its ONLY route
+    /// to the duduclaw MCP server: the boot sweep walks `<home>/agents/*` and
+    /// never descends into `.ephemeral/`, and `spawn_env`'s allowlist strips
+    /// `DUDUCLAW_HOME` / `DUDUCLAW_PORT` from the spawned CLI's environment, so
+    /// the env block written here is the only place the child can learn them.
+    #[test]
+    fn mcp_json_created_for_ephemeral_layout_carries_home_and_eph_identity() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("isolated-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home_env = HomeEnvOverride::set(&tmp.path().join("source-home"));
+        let eph_id = "eph-agnes-r1-planner-9d9044";
+        let agent_dir = home.join("agents").join(".ephemeral").join(eph_id);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let key = duduclaw_core::ensure_identity_key(&home).unwrap();
+
+        assert!(
+            ensure_duduclaw_absolute_path(&agent_dir).unwrap(),
+            "a scaffold with no .mcp.json must get one created"
+        );
+
+        let path = agent_dir.join(".mcp.json");
+        assert!(path.is_file(), ".mcp.json must exist on disk");
+        let env = read_mcp_json(&path)["mcpServers"]["duduclaw"]["env"].clone();
+        assert_eq!(
+            env["DUDUCLAW_AGENT_ID"].as_str(),
+            Some(eph_id),
+            "the member must self-identify, not fall back to default_agent"
+        );
+        assert_eq!(
+            env["DUDUCLAW_HOME"].as_str(),
+            Some(home.to_string_lossy().as_ref()),
+            "the member's derived home must override an inherited source home"
+        );
+        // The `.ephemeral` segment must not shift the derived key root to
+        // `<home>/agents` — otherwise every minted token fails verification.
+        let token = env["DUDUCLAW_AGENT_TOKEN"].as_str().expect("token written");
+        assert!(duduclaw_core::verify_identity_token(&key, eph_id, token));
     }
 
     /// ...and with no key, the env block is byte-identical to pre-WP21.

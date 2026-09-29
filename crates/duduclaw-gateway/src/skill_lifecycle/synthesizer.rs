@@ -177,7 +177,10 @@ pub fn parse_synthesis_response(
         return Err("Synthesized skill has empty name".to_string());
     }
     if name.len() > 50 {
-        return Err(format!("Skill name too long: {} chars (max 50)", name.len()));
+        return Err(format!(
+            "Skill name too long: {} chars (max 50)",
+            name.len()
+        ));
     }
     if !is_kebab_case(&name) {
         return Err(format!("Skill name is not kebab-case: '{name}'"));
@@ -206,7 +209,10 @@ pub fn parse_synthesis_response(
         return Err("Synthesized skill has empty body".to_string());
     }
     if body.len() > 5000 {
-        return Err(format!("Skill body too large: {} chars (max 5000)", body.len()));
+        return Err(format!(
+            "Skill body too large: {} chars (max 5000)",
+            body.len()
+        ));
     }
 
     // Check for sensitive patterns
@@ -273,7 +279,9 @@ fn extract_markdown_block(response: &str) -> String {
 }
 
 /// Parse YAML frontmatter from skill content.
-fn parse_skill_frontmatter(content: &str) -> Result<(String, String, Vec<String>, String, String), String> {
+fn parse_skill_frontmatter(
+    content: &str,
+) -> Result<(String, String, Vec<String>, String, String), String> {
     let trimmed = content.trim();
 
     if !trimmed.starts_with("---") {
@@ -330,13 +338,16 @@ fn is_kebab_case(s: &str) -> bool {
 
 /// Check content for sensitive patterns. Returns error if found.
 fn check_no_sensitive_patterns(content: &str) -> Result<(), String> {
-    use super::sensitive_patterns::{SECRET_PATTERNS, PatternSeverity};
+    use super::sensitive_patterns::{PatternSeverity, SECRET_PATTERNS};
 
     let lower = content.to_lowercase();
     for sp in SECRET_PATTERNS {
         // Only block on Critical patterns; Warnings are acceptable in synthesis
         if sp.severity == PatternSeverity::Critical && lower.contains(sp.pattern) {
-            return Err(format!("Sensitive pattern detected: {} ('{}')", sp.description, sp.pattern));
+            return Err(format!(
+                "Sensitive pattern detected: {} ('{}')",
+                sp.description, sp.pattern
+            ));
         }
     }
     Ok(())
@@ -459,11 +470,7 @@ Some content here.
 "#;
 
         let trigger = make_trigger();
-        let result = parse_synthesis_response(
-            response,
-            &trigger,
-            &["menu-lookup".to_string()],
-        );
+        let result = parse_synthesis_response(response, &trigger, &["menu-lookup".to_string()]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().name, "menu-lookup-auto");
     }

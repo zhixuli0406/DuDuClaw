@@ -10,7 +10,8 @@
 //! so nothing needs write access to `/run`.
 //!
 //! Runs until SIGTERM/SIGINT, matching the shutdown convention
-//! `duduclaw-cli-worker`'s binary uses (see its `main.rs`).
+//! the former `duduclaw-cli-worker` binary used (that crate was removed in
+//! 2026-09 with the PTY pool; see git history at the v1.65 tag).
 
 use std::path::PathBuf;
 

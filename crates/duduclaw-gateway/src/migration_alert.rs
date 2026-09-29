@@ -137,8 +137,7 @@ async fn post_activity_event(home: &Path, failure: &MigrationFailure) -> Result<
         task_id: None,
         summary: format!(
             "資料遷移腳本「{}」執行失敗（exit code {exit_code_text}），開機流程未中斷但需要人工檢查（{}）。",
-            failure.script,
-            "duduclaw data-migrate --check"
+            failure.script, "duduclaw data-migrate --check"
         ),
         timestamp: chrono::Utc::now().to_rfc3339(),
         metadata: Some(
@@ -214,7 +213,8 @@ mod tests {
         check_and_notify(home.path()).await;
 
         assert_eq!(last_notified_failed_at(home.path()), Some(1_000_000));
-        let audit_content = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        let audit_content =
+            std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
         assert!(audit_content.contains("data_migration_failed"));
         assert!(audit_content.contains("0001-example.sh"));
 
@@ -243,7 +243,10 @@ mod tests {
             .iter()
             .filter(|r| r.event_type == "data_migration_failed")
             .count();
-        assert_eq!(count, 1, "must post exactly once across repeated boots: {rows:?}");
+        assert_eq!(
+            count, 1,
+            "must post exactly once across repeated boots: {rows:?}"
+        );
     }
 
     #[tokio::test]
@@ -252,13 +255,21 @@ mod tests {
         let path = data_migrations::failure_marker_path(home.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
-        std::fs::write(&path, serde_json::to_string(&sample_failure(3_000_000)).unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string(&sample_failure(3_000_000)).unwrap(),
+        )
+        .unwrap();
         check_and_notify(home.path()).await;
 
         // A later boot's migration run failed again — a DIFFERENT
         // failed_at_unix (even for the same script name) must be treated
         // as new and surfaced again, not swallowed by the old marker.
-        std::fs::write(&path, serde_json::to_string(&sample_failure(3_000_500)).unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string(&sample_failure(3_000_500)).unwrap(),
+        )
+        .unwrap();
         check_and_notify(home.path()).await;
 
         assert_eq!(last_notified_failed_at(home.path()), Some(3_000_500));
@@ -268,6 +279,9 @@ mod tests {
             .iter()
             .filter(|r| r.event_type == "data_migration_failed")
             .count();
-        assert_eq!(count, 2, "a genuinely new failure must be surfaced again: {rows:?}");
+        assert_eq!(
+            count, 2,
+            "a genuinely new failure must be surfaced again: {rows:?}"
+        );
     }
 }

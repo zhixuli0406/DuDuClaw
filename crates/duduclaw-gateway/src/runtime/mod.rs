@@ -34,7 +34,7 @@ pub struct RuntimeResponse {
 /// A single turn in conversation history.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConversationTurn {
-    pub role: String,    // "user" | "assistant"
+    pub role: String, // "user" | "assistant"
     pub content: String,
 }
 
@@ -78,18 +78,51 @@ pub struct RuntimeContext {
     ///
     /// [`AccountRotator`]: duduclaw_agent::account_rotator::AccountRotator
     pub account_pool: Vec<String>,
+    /// Per-call reasoning effort (`agent.toml [model] effort`, or a team role
+    /// spec's `effort`). P1/WP-3.
+    ///
+    /// Carried UNCLAMPED — each runtime clamps with
+    /// [`duduclaw_core::effort::Effort::clamp_for`] against its own ceiling
+    /// and translates it into its CLI's flag (`--effort`,
+    /// `-c model_reasoning_effort=`, `--reasoning-effort`). Runtimes with no
+    /// effort knob (gemini, the generic print-mode CLIs) log and ignore it.
+    /// `None` ⇒ every spawn argv is byte-identical to before this field
+    /// existed.
+    pub effort: Option<duduclaw_core::effort::Effort>,
+    /// May a failed primary runtime fail over to a runtime serving a
+    /// **different model family**? (P0/WP-B follow-up.)
+    ///
+    /// `true` (every pre-existing caller) keeps
+    /// [`crate::failover::FailoverManager::execute_with_failover`] exactly as
+    /// it was: any healthy fallback is tried, with a model substituted for it.
+    ///
+    /// `false` is for calls whose whole point is *which family answers* — the
+    /// decorrelated acceptance judge (`[dispatch] judge_provider`). A live test
+    /// caught the hole this closes: a hinted `codex`/`gpt-5.6-sol` judge failed
+    /// to spawn, failover substituted `claude-opus-4-6`, and the verdict came
+    /// back from the worker's own family with nothing in the logs saying so.
+    /// Same-family failover (another Claude tier) stays allowed — only the
+    /// cross-family hop is refused, and the caller then degrades explicitly
+    /// and audibly instead of being quietly re-routed.
+    pub allow_cross_family_failover: bool,
 }
 
 /// Streaming chunk from a runtime execution.
 #[derive(Debug, Clone)]
 pub enum RuntimeChunk {
     Text(String),
-    ToolUse { name: String, input: serde_json::Value },
+    ToolUse {
+        name: String,
+        input: serde_json::Value,
+    },
     /// `is_error` (T10, design §9): whether the paired tool call failed.
     /// Added alongside T10's codex/gemini producers — this variant had zero
     /// constructors anywhere in the repo before T10 (verified by grep), so
     /// adding a field here breaks no existing caller.
-    ToolResult { output: String, is_error: bool },
+    ToolResult {
+        output: String,
+        is_error: bool,
+    },
     Done(RuntimeResponse),
     Error(String),
 }
@@ -197,7 +230,8 @@ pub const NATIVE_EVENT_INPUT_MAX_CHARS: usize = duduclaw_security::audit::AUDIT_
 /// Char cap for [`NativeToolEvent::result_text`] — reuses the audit trail's
 /// own cap (`tool_calls.jsonl`'s `result_text` field), see
 /// [`NATIVE_EVENT_INPUT_MAX_CHARS`].
-pub const NATIVE_EVENT_RESULT_MAX_CHARS: usize = duduclaw_security::audit::AUDIT_RESULT_TEXT_MAX_CHARS;
+pub const NATIVE_EVENT_RESULT_MAX_CHARS: usize =
+    duduclaw_security::audit::AUDIT_RESULT_TEXT_MAX_CHARS;
 
 /// Mask + CJK-safe-truncate raw text before it is allowed to become a
 /// [`NativeToolEvent::input_text`]. The ONLY sanctioned way to populate that
@@ -276,6 +310,154 @@ pub fn extend_native_tool_events(events: Vec<NativeToolEvent>) {
     let _ = NATIVE_TOOL_COLLECTOR.try_with(|collector| {
         if let Ok(mut guard) = collector.lock() {
             guard.extend(events);
+        }
+    });
+}
+
+// ── Spawn-scope overrides + truthful runtime attribution ────────────────
+//
+// Team-as-Agent live round 3 (design `DESIGN-team-as-agent-2026-09.md` §4.3,
+// findings E2/E3) produced two defects these two task-locals close:
+//
+// * **E3** — a role member ran with cwd = its own throwaway scaffold, wrote
+//   its files there, and immediate GC deleted them; the verifier then
+//   correctly found "no tool activity supports file creation".
+// * **E2** — an executor member configured for codex silently failed over to
+//   Claude and `role_turns.jsonl` still recorded `runtime=codex … completed`.
+//   The ledger lied about which family did the work.
+//
+// Both are caller-scoped facts that must reach code far down the call chain
+// (`runtime/codex.rs`'s `--cd`, `failover.rs`'s substitution) through
+// intermediate signatures this work package must not churn
+// (`runtime_dispatch::AgentPrompt`, `RuntimeContext`, every runtime module's
+// `RuntimeResponse` literal). They use exactly the mechanism
+// [`NATIVE_TOOL_COLLECTOR`] above already established: a task-local set by the
+// dispatching scope, read with `try_with`, a complete no-op when absent.
+
+/// Spawn-shape overrides one caller imposes on whichever runtime answers.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnOverride {
+    /// Working directory the CLI subprocess must run in, when it has to
+    /// differ from [`RuntimeContext::agent_dir`].
+    ///
+    /// `agent_dir` stays the member's own scaffold (it is what defines the
+    /// member's identity and config); this is only the **cwd**. Today the one
+    /// caller is the team composer, which puts role members in the employee's
+    /// workspace so their files outlive the scaffold.
+    pub work_dir: Option<PathBuf>,
+}
+
+/// The `(runtime, model)` pair that ACTUALLY answered one call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeOutcome {
+    pub runtime: RuntimeType,
+    /// The model id handed to that runtime — the *substituted* one after a
+    /// failover, not the one originally requested.
+    pub model: String,
+}
+
+/// Attribution carried by a single composer dispatch into the existing cost
+/// recorder. The task id is the episode id; no global mutable role state.
+#[derive(Debug, Clone)]
+pub struct RoleCostAttribution {
+    pub role: &'static str,
+    pub episode_id: String,
+}
+
+tokio::task_local! {
+    /// Caller-imposed spawn overrides for this call — see [`SpawnOverride`].
+    /// Absent scope ⇒ every runtime builds a byte-identical argv.
+    pub static SPAWN_OVERRIDE: SpawnOverride;
+
+    /// Sink for the [`RuntimeOutcome`] of this call, when the caller needs to
+    /// record which runtime/model really answered. Absent scope ⇒ no-op.
+    pub static RUNTIME_OUTCOME: std::sync::Arc<std::sync::Mutex<Option<RuntimeOutcome>>>;
+
+    /// Usage observed on the answering leg of a team member's dispatch.
+    /// This is independent of the global cost ledger so a role turn can carry
+    /// its own measured tokens without inferring them from agent-level totals.
+    pub static ROLE_USAGE: std::sync::Arc<std::sync::Mutex<crate::role_turns::RoleTurnUsage>>;
+
+    pub static ROLE_COST_ATTRIBUTION: RoleCostAttribution;
+}
+
+/// The caller's cwd override for this spawn, if any. `None` outside a
+/// [`SPAWN_OVERRIDE`] scope — the universal case.
+pub fn spawn_work_dir_override() -> Option<PathBuf> {
+    SPAWN_OVERRIDE
+        .try_with(|o| o.work_dir.clone())
+        .ok()
+        .flatten()
+}
+
+/// The working root one CLI spawn must actually run in: the caller's
+/// [`SPAWN_OVERRIDE`] `work_dir` when it names a real directory, otherwise
+/// `agent_dir`.
+///
+/// Single resolution point for every runtime module, for two reasons found in
+/// the 2026-09-28 review:
+///
+/// * only `runtime/codex.rs` read the override at all — `gemini.rs`,
+///   `antigravity.rs` and `grok.rs` used `context.agent_dir` unconditionally,
+///   so a team role member on any of those three ran in its own throwaway
+///   scaffold and its files were deleted by the immediate GC at
+///   `finish_role_member` (design §4.3 E3, the exact defect the override was
+///   introduced to fix — it was simply never wired past codex);
+/// * the override was consumed without checking that it exists. A stale or
+///   mistyped path produced a spawn in a nonexistent cwd instead of falling
+///   back. `claude_runner.rs`'s dispatch path already validates with
+///   `is_dir()` + `warn!` + fallback; this is the same rule for the CLI
+///   runtimes, in one place so the four cannot drift apart again.
+///
+/// The override moves the **cwd only**. Identity (`DUDUCLAW_AGENT_ID`, the
+/// per-agent MCP env block, `agent_dir`-scoped config) is unaffected.
+pub fn resolve_spawn_work_dir(agent_dir: Option<&Path>, agent_id: &str) -> Option<PathBuf> {
+    match spawn_work_dir_override() {
+        Some(dir) if dir.is_dir() => Some(dir),
+        Some(dir) => {
+            tracing::warn!(
+                agent = %agent_id,
+                requested = %dir.display(),
+                "spawn work_dir override does not exist — falling back to the agent directory"
+            );
+            agent_dir.map(PathBuf::from)
+        }
+        None => agent_dir.map(PathBuf::from),
+    }
+}
+
+/// Best-effort record of which runtime/model actually answered. Last writer
+/// wins: a failover's fallback leg overwrites the primary's (failed) attempt,
+/// so the value left behind is always the one that produced the response.
+/// Missing scope / poisoned mutex ⇒ silent no-op (attribution telemetry must
+/// never fail a call that succeeded).
+pub fn record_runtime_outcome(runtime: RuntimeType, model: &str) {
+    let _ = RUNTIME_OUTCOME.try_with(|slot| {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(RuntimeOutcome {
+                runtime,
+                model: model.to_string(),
+            });
+        }
+    });
+}
+
+/// Fold ONE answering leg's token usage into this member stage's total.
+///
+/// Unlike [`record_runtime_outcome`] (where last-writer-wins is the right
+/// answer — the final leg is the one that produced the response), usage is
+/// **cumulative**: a failover's primary attempt and a tool loop's intermediate
+/// calls were all really paid for. Before 2026-09-28 this was `*guard = usage`,
+/// so `role_turns.jsonl` published only the last leg while `cost_telemetry`
+/// recorded every call — see [`crate::role_turns::RoleTurnUsage::accumulate`]
+/// for the per-dimension rules.
+///
+/// Missing scope / poisoned mutex ⇒ silent no-op, same as the outcome sink:
+/// telemetry must never fail a call that succeeded.
+pub fn record_role_usage(usage: crate::role_turns::RoleTurnUsage) {
+    let _ = ROLE_USAGE.try_with(|slot| {
+        if let Ok(mut guard) = slot.lock() {
+            guard.accumulate(usage);
         }
     });
 }
@@ -441,10 +623,7 @@ impl RuntimeRegistry {
 
     /// List all available runtime types.
     pub fn available(&self) -> Vec<(&RuntimeType, &str)> {
-        self.runtimes
-            .iter()
-            .map(|(t, r)| (t, r.name()))
-            .collect()
+        self.runtimes.iter().map(|(t, r)| (t, r.name())).collect()
     }
 }
 
@@ -537,6 +716,16 @@ pub fn load_agent_account_pool(agent_dir: &Path) -> Vec<String> {
 /// path — registering a PATH-relative command would break for CLI subprocesses
 /// launched without PATH inheritance.
 pub fn duduclaw_mcp_server_json(agent_id: &str) -> Option<serde_json::Value> {
+    duduclaw_mcp_server_json_for_home(agent_id, &duduclaw_core::duduclaw_home())
+}
+
+/// MCP definition for a runtime call whose home may be an isolated eval arm.
+/// The supplied home, rather than ambient process state, owns identity and
+/// task writes. Credentials still flow through the existing internal key path.
+pub fn duduclaw_mcp_server_json_for_home(
+    agent_id: &str,
+    home_dir: &Path,
+) -> Option<serde_json::Value> {
     let bin = duduclaw_core::resolve_duduclaw_bin();
     if !bin.is_absolute() {
         return None;
@@ -545,7 +734,7 @@ pub fn duduclaw_mcp_server_json(agent_id: &str) -> Option<serde_json::Value> {
     // Identity pair: `DUDUCLAW_AGENT_ID` plus, when `<home>/identity.key`
     // exists, the WP21 debt ⑧ `DUDUCLAW_AGENT_TOKEN` that proves DuDuClaw
     // issued that id. No key ⇒ id only, i.e. the pre-WP21 env block verbatim.
-    for (k, v) in duduclaw_core::agent_identity_env_vars_default(agent_id) {
+    for (k, v) in duduclaw_core::agent_identity_env_vars(home_dir, agent_id) {
         env.insert(k, serde_json::Value::String(v));
     }
     // Shared forward set (home/port/instance + MCP auth). CLIs like Grok spawn
@@ -555,6 +744,10 @@ pub fn duduclaw_mcp_server_json(agent_id: &str) -> Option<serde_json::Value> {
     for (k, v) in duduclaw_core::mcp_forward_env_vars() {
         env.insert(k, serde_json::Value::String(v));
     }
+    env.insert(
+        "DUDUCLAW_HOME".to_string(),
+        serde_json::Value::String(home_dir.to_string_lossy().to_string()),
+    );
     Some(serde_json::json!({
         "command": bin.to_string_lossy(),
         "args": ["mcp-server"],
@@ -577,7 +770,8 @@ pub fn format_history_as_prompt(history: &[ConversationTurn], current_message: &
     buf.push_str("<conversation_history>\n");
     for turn in history {
         // Escape closing tags in content to prevent XML structure corruption
-        let safe_content = turn.content
+        let safe_content = turn
+            .content
             .replace("</user>", "&lt;/user&gt;")
             .replace("</assistant>", "&lt;/assistant&gt;");
         buf.push('<');
@@ -614,7 +808,7 @@ pub(crate) fn apply_native_sandbox(
     runtime_name: &str,
 ) -> Result<(), String> {
     use duduclaw_core::types::sandbox_level_for;
-    use duduclaw_sandbox::{platform_sandbox, Confinement, SandboxSpec};
+    use duduclaw_sandbox::{Confinement, SandboxSpec, platform_sandbox};
 
     let want = caps.map(|c| c.native_sandbox).unwrap_or(false);
     if !want {
@@ -771,10 +965,16 @@ mod tests {
     // ── T10: native_tool_events_from_chunks ─────────────────────────────
 
     fn tool_use(name: &str) -> RuntimeChunk {
-        RuntimeChunk::ToolUse { name: name.to_string(), input: serde_json::json!({}) }
+        RuntimeChunk::ToolUse {
+            name: name.to_string(),
+            input: serde_json::json!({}),
+        }
     }
     fn tool_result(is_error: bool) -> RuntimeChunk {
-        RuntimeChunk::ToolResult { output: String::new(), is_error }
+        RuntimeChunk::ToolResult {
+            output: String::new(),
+            is_error,
+        }
     }
 
     #[test]
@@ -858,14 +1058,26 @@ mod tests {
         ];
         let events = native_tool_events_from_chunks(&chunks);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].result_text.as_deref(), Some("quarterly revenue: 1.2M"));
-        assert!(events[0].input_text.as_deref().unwrap().contains("cat report.md"));
+        assert_eq!(
+            events[0].result_text.as_deref(),
+            Some("quarterly revenue: 1.2M")
+        );
+        assert!(
+            events[0]
+                .input_text
+                .as_deref()
+                .unwrap()
+                .contains("cat report.md")
+        );
     }
 
     #[test]
     fn native_tool_events_from_chunks_masks_secrets_in_result_text() {
         let chunks = vec![
-            RuntimeChunk::ToolUse { name: "Bash".to_string(), input: serde_json::Value::Null },
+            RuntimeChunk::ToolUse {
+                name: "Bash".to_string(),
+                input: serde_json::Value::Null,
+            },
             RuntimeChunk::ToolResult {
                 output: "token: sk-ant-api03-verysecretvalue1234567890".to_string(),
                 is_error: false,
@@ -885,8 +1097,14 @@ mod tests {
         // producer that hasn't been upgraded to capture text yet must still
         // yield `None`, never a fabricated empty-string placeholder.
         let chunks = vec![
-            RuntimeChunk::ToolUse { name: "Bash".to_string(), input: serde_json::Value::Null },
-            RuntimeChunk::ToolResult { output: String::new(), is_error: false },
+            RuntimeChunk::ToolUse {
+                name: "Bash".to_string(),
+                input: serde_json::Value::Null,
+            },
+            RuntimeChunk::ToolResult {
+                output: String::new(),
+                is_error: false,
+            },
         ];
         let events = native_tool_events_from_chunks(&chunks);
         assert!(events[0].result_text.is_none());
@@ -929,8 +1147,7 @@ mod tests {
                 spec.id
             );
             assert!(
-                spec.headless.prompt_via_stdin()
-                    || args.iter().any(|a| a == "PROMPT"),
+                spec.headless.prompt_via_stdin() || args.iter().any(|a| a == "PROMPT"),
                 "`{}` neither takes the prompt as an argument nor on stdin",
                 spec.id
             );
@@ -1022,5 +1239,218 @@ mod tests {
         assert_eq!(def["args"][0], "mcp-server");
         assert_eq!(def["env"][duduclaw_core::ENV_AGENT_ID], "agnes");
         assert!(std::path::Path::new(def["command"].as_str().unwrap()).is_absolute());
+    }
+
+    #[test]
+    fn duduclaw_mcp_server_uses_explicit_eval_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("eval-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let key = duduclaw_core::ensure_identity_key(&home).unwrap();
+        let def = duduclaw_mcp_server_json_for_home("eph-test-r1-planner-123456", &home)
+            .expect("test binary resolves to an absolute path");
+        assert_eq!(def["env"]["DUDUCLAW_HOME"], home.to_string_lossy().as_ref());
+        let token = def["env"][duduclaw_core::ENV_AGENT_TOKEN]
+            .as_str()
+            .expect("identity token");
+        assert!(duduclaw_core::verify_identity_token(
+            &key,
+            "eph-test-r1-planner-123456",
+            token
+        ));
+    }
+
+    // ── Spawn overrides + truthful runtime attribution ──────────────────
+
+    #[tokio::test]
+    async fn spawn_work_dir_override_is_none_without_a_scope() {
+        assert!(spawn_work_dir_override().is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_work_dir_override_is_visible_inside_the_scope() {
+        let dir = PathBuf::from("/tmp/duduclaw-test/agents/agnes");
+        SPAWN_OVERRIDE
+            .scope(
+                SpawnOverride {
+                    work_dir: Some(dir.clone()),
+                },
+                async {
+                    assert_eq!(spawn_work_dir_override(), Some(dir.clone()));
+                },
+            )
+            .await;
+        // And it does not leak out.
+        assert!(spawn_work_dir_override().is_none());
+    }
+
+    /// Regression (2026-09-28 review): the override was consumed without
+    /// checking it exists, so a stale/mistyped `work_dir` produced a spawn in a
+    /// nonexistent cwd instead of falling back to the agent directory the way
+    /// `claude_runner.rs`'s dispatch path already did.
+    #[tokio::test]
+    async fn resolve_spawn_work_dir_falls_back_when_the_override_is_not_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        // A path that does not exist at all.
+        let missing = tmp.path().join("nope/never/created");
+        let got = SPAWN_OVERRIDE
+            .scope(
+                SpawnOverride {
+                    work_dir: Some(missing),
+                },
+                async { resolve_spawn_work_dir(Some(agent_dir.as_path()), "agnes") },
+            )
+            .await;
+        assert_eq!(got.as_deref(), Some(agent_dir.as_path()));
+
+        // A path that exists but is a FILE — `is_dir()`, not `exists()`.
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let got = SPAWN_OVERRIDE
+            .scope(
+                SpawnOverride {
+                    work_dir: Some(file),
+                },
+                async { resolve_spawn_work_dir(Some(agent_dir.as_path()), "agnes") },
+            )
+            .await;
+        assert_eq!(got.as_deref(), Some(agent_dir.as_path()));
+    }
+
+    /// Regression (2026-09-28 review): only `codex.rs` ever read
+    /// `SPAWN_OVERRIDE.work_dir`. `gemini.rs`, `antigravity.rs` and `grok.rs`
+    /// spawned in `context.agent_dir` unconditionally, so a team role member on
+    /// any of those three wrote into its own throwaway scaffold and the
+    /// immediate GC at `finish_role_member` deleted the work — design §4.3 E3,
+    /// re-opened on three of the four CLI runtimes.
+    ///
+    /// The behavioral half of this lock is the `resolve_spawn_work_dir` tests
+    /// above; this half checks the *wiring*, because the wiring lives inside
+    /// `execute()` where asserting it would mean spawning a real CLI. A
+    /// compile-time `include_str!` keeps it deterministic and I/O-free.
+    #[test]
+    fn every_cli_runtime_resolves_its_cwd_through_the_shared_override_helper() {
+        const CALL: &str =
+            "super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id)";
+        for (name, src) in [
+            ("codex.rs", include_str!("codex.rs")),
+            ("gemini.rs", include_str!("gemini.rs")),
+            ("antigravity.rs", include_str!("antigravity.rs")),
+            ("grok.rs", include_str!("grok.rs")),
+        ] {
+            assert!(
+                src.contains(CALL),
+                "{name} no longer resolves its working root through \
+                 resolve_spawn_work_dir — a role member's files will be GC'd"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_spawn_work_dir_honours_a_real_override_and_is_inert_without_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let got = SPAWN_OVERRIDE
+            .scope(
+                SpawnOverride {
+                    work_dir: Some(workspace.clone()),
+                },
+                async { resolve_spawn_work_dir(Some(agent_dir.as_path()), "agnes") },
+            )
+            .await;
+        assert_eq!(got.as_deref(), Some(workspace.as_path()));
+
+        // No scope ⇒ every runtime resolves exactly what it resolved before
+        // the override existed.
+        assert_eq!(
+            resolve_spawn_work_dir(Some(agent_dir.as_path()), "agnes").as_deref(),
+            Some(agent_dir.as_path())
+        );
+        assert!(resolve_spawn_work_dir(None, "agnes").is_none());
+    }
+
+    #[tokio::test]
+    async fn record_runtime_outcome_is_a_noop_without_a_scope() {
+        // Must not panic — attribution telemetry never fails a call.
+        record_runtime_outcome(RuntimeType::Claude, "claude-opus-4-6");
+    }
+
+    /// Regression (2026-09-28 review, `review_team.md` §3 "授權／證據"):
+    /// `record_role_usage` was last-writer-wins, so a member stage that ran an
+    /// openai-compat tool loop or a multi-leg `failover.rs` chain recorded only
+    /// its LAST leg in `role_turns.jsonl` while `cost_telemetry` recorded every
+    /// one — two ledgers disagreeing about the same stage, against
+    /// `RoleTurnRow::usage`'s own "one member stage" contract.
+    ///
+    /// NOTE: this test previously asserted the last-writer-wins behaviour
+    /// (`role_usage_is_scoped_to_one_member_and_last_answer_wins`). It encoded
+    /// the defect itself, so it is rewritten rather than kept.
+    #[tokio::test]
+    async fn role_usage_accumulates_every_leg_of_one_member_stage() {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::role_turns::RoleTurnUsage::default(),
+        ));
+        ROLE_USAGE
+            .scope(slot.clone(), async {
+                // Leg 1: the primary attempt reports no cache read at all.
+                record_role_usage(crate::role_turns::RoleTurnUsage {
+                    usage_input_tokens: Some(10),
+                    usage_output_tokens: Some(2),
+                    ..Default::default()
+                });
+                // Leg 2: the fallback answers, and its tokens are ALSO spent.
+                record_role_usage(crate::role_turns::RoleTurnUsage {
+                    usage_input_tokens: Some(20),
+                    usage_output_tokens: Some(3),
+                    usage_cache_read_tokens: Some(15),
+                    ..Default::default()
+                });
+                // An empty record is not a leg: a runtime that reported no
+                // usage must not inflate the leg count.
+                record_role_usage(crate::role_turns::RoleTurnUsage::default());
+            })
+            .await;
+        let got = *slot.lock().unwrap();
+        assert_eq!(got.usage_input_tokens, Some(30));
+        assert_eq!(got.usage_output_tokens, Some(5));
+        // A dimension only one leg measured keeps that leg's number — never
+        // `Some(0)` for the leg that reported nothing.
+        assert_eq!(got.usage_cache_read_tokens, Some(15));
+        // Two legs reported; the empty third did not.
+        assert_eq!(got.usage_legs, Some(2));
+
+        // Outside the scope it is still a silent no-op.
+        record_role_usage(crate::role_turns::RoleTurnUsage {
+            usage_input_tokens: Some(999),
+            ..Default::default()
+        });
+        assert_eq!(slot.lock().unwrap().usage_input_tokens, Some(30));
+    }
+
+    #[tokio::test]
+    async fn record_runtime_outcome_keeps_the_last_writer() {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        RUNTIME_OUTCOME
+            .scope(slot.clone(), async {
+                // Primary leg attempts codex…
+                record_runtime_outcome(RuntimeType::Codex, "gpt-5.6-sol");
+                // …fails, fallback leg answers as Claude on a substituted model.
+                record_runtime_outcome(RuntimeType::Claude, "claude-opus-4-6");
+            })
+            .await;
+        let got = slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("an outcome was recorded");
+        assert_eq!(got.runtime, RuntimeType::Claude);
+        assert_eq!(got.model, "claude-opus-4-6");
     }
 }

@@ -31,8 +31,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::Value;
 
 /// Tag key under which the encoded spec is stored in `TaskRow::tags`.
@@ -616,10 +616,12 @@ mod tests {
         let reply = r#"{"revenue": "not a number", "month": "2026-07"}"#;
         let check = spec.validate(reply, Path::new("."));
         assert!(!check.passed);
-        assert!(check
-            .defects
-            .iter()
-            .any(|d| d.contains("revenue") && d.contains("number")));
+        assert!(
+            check
+                .defects
+                .iter()
+                .any(|d| d.contains("revenue") && d.contains("number"))
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use duduclaw_core::error::{DuDuClawError, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -90,15 +90,22 @@ impl SessionManager {
 
         let mut pool = vec![Mutex::new(first)];
         for _ in 1..POOL_SIZE {
-            let conn = Connection::open(db_path)
-                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            let conn =
+                Connection::open(db_path).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
             // Enable WAL mode for better concurrent read performance
             let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
             pool.push(Mutex::new(conn));
         }
 
-        info!(?db_path, pool_size = POOL_SIZE, "Session manager initialized with connection pool");
-        Ok(Self { pool, db_path: db_path.to_path_buf() })
+        info!(
+            ?db_path,
+            pool_size = POOL_SIZE,
+            "Session manager initialized with connection pool"
+        );
+        Ok(Self {
+            pool,
+            db_path: db_path.to_path_buf(),
+        })
     }
 
     /// Acquire a connection from the pool.
@@ -154,7 +161,20 @@ impl SessionManager {
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_session
-                ON session_messages(session_id);",
+                ON session_messages(session_id);
+
+            CREATE TABLE IF NOT EXISTS session_ccr_references (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                user_message_id INTEGER NOT NULL,
+                ccr_id TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, user_message_id, ccr_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_ccr_references_session
+                ON session_ccr_references(session_id, id);",
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
@@ -178,10 +198,7 @@ impl SessionManager {
         // start NULL — pre-13 sessions keep their existing behaviour
         // because the consumer falls back to verbatim assembly when
         // `summary_of_prior` is NULL/empty.
-        let _ = conn.execute(
-            "ALTER TABLE sessions ADD COLUMN summary_of_prior TEXT",
-            [],
-        );
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN summary_of_prior TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE sessions ADD COLUMN summarized_through_turn INTEGER NOT NULL DEFAULT 0",
             [],
@@ -194,10 +211,7 @@ impl SessionManager {
         // WP5 T5.3: soft-delete. `archived_at` NULL = live; set = archived
         // (hidden from normal listings, still replayable / searchable). Real
         // deletion is `purge_session`.
-        let _ = conn.execute(
-            "ALTER TABLE sessions ADD COLUMN archived_at TEXT",
-            [],
-        );
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT", []);
 
         // G4 session portability (2026-07-11):
         // - `undone_at` on messages: /undo //rollback tombstone (NULL = live).
@@ -208,10 +222,7 @@ impl SessionManager {
         // - `checkpoint_message_id` on sessions: turn-id watermark recorded
         //   just before each user turn is appended (i.e. before every agent
         //   run); /rollback tombstones everything after it.
-        let _ = conn.execute(
-            "ALTER TABLE session_messages ADD COLUMN undone_at TEXT",
-            [],
-        );
+        let _ = conn.execute("ALTER TABLE session_messages ADD COLUMN undone_at TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE sessions ADD COLUMN lineage INTEGER NOT NULL DEFAULT 1",
             [],
@@ -320,6 +331,19 @@ impl SessionManager {
         content: &str,
         tokens: u32,
     ) -> Result<()> {
+        self.append_message_with_id(session_id, role, content, tokens)
+            .await
+            .map(|_| ())
+    }
+
+    /// Append a message and return its stable row ID for turn-bound artifacts.
+    pub async fn append_message_with_id(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        tokens: u32,
+    ) -> Result<i64> {
         let conn = self.acquire().await;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -345,6 +369,7 @@ impl SessionManager {
             params![session_id, role, content, tokens, now],
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let message_id = conn.last_insert_rowid();
 
         conn.execute(
             "UPDATE sessions SET total_tokens = total_tokens + ?1, last_active = ?2 WHERE id = ?3",
@@ -352,7 +377,109 @@ impl SessionManager {
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
+        Ok(message_id)
+    }
+
+    /// Store only structured provenance for tool originals already committed
+    /// to CCR. The source user turn is checked again when references are read,
+    /// so an undone turn cannot keep advertising its old handles.
+    pub async fn append_ccr_saved_results(
+        &self,
+        session_id: &str,
+        user_message_id: i64,
+        records: &[duduclaw_llm::CcrSavedResult],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let conn = self.acquire().await;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+        let active: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_messages WHERE id=?1 AND session_id=?2
+             AND role='user' AND hidden=0 AND undone_at IS NULL)",
+                params![user_message_id, session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        if !active
+            || records
+                .iter()
+                .any(|record| record.scope.session_id != session_id)
+        {
+            return Err(DuDuClawError::Gateway(
+                "CCR reference does not match an active user turn".into(),
+            ));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        for record in records {
+            let json =
+                serde_json::to_string(record).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO session_ccr_references
+                 (session_id, user_message_id, ccr_id, record_json, expires_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    session_id,
+                    user_message_id,
+                    record.id,
+                    json,
+                    record.expires_at,
+                    now
+                ],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        }
+        tx.execute(
+            "DELETE FROM session_ccr_references WHERE session_id=?1 AND (expires_at<=?2 OR id NOT IN (
+                SELECT id FROM session_ccr_references WHERE session_id=?1
+                ORDER BY id DESC LIMIT 100
+            ))",
+            params![session_id, chrono::Utc::now().timestamp()],
+        ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
         Ok(())
+    }
+
+    /// Recent references whose source user turn is still visible. CCR must
+    /// revalidate each record before any handle is shown to a model.
+    pub async fn get_ccr_saved_results(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<duduclaw_llm::CcrSavedResult>> {
+        let conn = self.acquire().await;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "DELETE FROM session_ccr_references WHERE session_id=?1 AND expires_at<=?2",
+            params![session_id, now],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT r.record_json FROM session_ccr_references r
+             JOIN session_messages m ON m.id=r.user_message_id AND m.session_id=r.session_id
+             WHERE r.session_id=?1 AND r.expires_at>?3
+             AND m.role='user' AND m.hidden=0 AND m.undone_at IS NULL
+             ORDER BY r.id DESC LIMIT ?2",
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![session_id, limit.clamp(1, 20) as i64, now], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            let json = row.map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            if let Ok(record) = serde_json::from_str::<duduclaw_llm::CcrSavedResult>(&json) {
+                results.push(record);
+            }
+        }
+        Ok(results)
     }
 
     /// Retrieve all messages for a session, ordered by timestamp.
@@ -413,9 +540,15 @@ impl SessionManager {
         let conn = self.acquire().await;
         let now = chrono::Utc::now().to_rfc3339();
 
-        let tx = conn.unchecked_transaction()
+        let tx = conn
+            .unchecked_transaction()
             .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
 
+        tx.execute(
+            "DELETE FROM session_ccr_references WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         tx.execute(
             "DELETE FROM session_messages WHERE session_id = ?1",
             params![session_id],
@@ -452,24 +585,21 @@ impl SessionManager {
     /// Uses a 10-second timeout to prevent long-running compression from starving the
     /// connection pool (SEC2-M25).
     pub async fn force_compress(&self, session_id: &str) -> Result<u32> {
-        let compress_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            async {
-                let tokens: u32 = {
-                    let conn = self.acquire().await;
-                    conn.query_row(
-                        "SELECT total_tokens FROM sessions WHERE id = ?1",
-                        params![session_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0)
-                };
+        let compress_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let tokens: u32 = {
+                let conn = self.acquire().await;
+                conn.query_row(
+                    "SELECT total_tokens FROM sessions WHERE id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0)
+            };
 
-                let summary = "[Session force-compressed — history cleared to free token budget]";
-                self.compress(session_id, summary).await?;
-                Ok::<u32, DuDuClawError>(tokens)
-            },
-        )
+            let summary = "[Session force-compressed — history cleared to free token budget]";
+            self.compress(session_id, summary).await?;
+            Ok::<u32, DuDuClawError>(tokens)
+        })
         .await;
 
         match compress_result {
@@ -520,9 +650,15 @@ impl SessionManager {
     /// the pre-WP5 `delete_session` behaviour, now behind an explicit name.
     pub async fn purge_session(&self, session_id: &str) -> Result<()> {
         let conn = self.acquire().await;
-        let tx = conn.unchecked_transaction()
+        let tx = conn
+            .unchecked_transaction()
             .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
 
+        tx.execute(
+            "DELETE FROM session_ccr_references WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         tx.execute(
             "DELETE FROM session_messages WHERE session_id = ?1",
             params![session_id],
@@ -535,11 +671,8 @@ impl SessionManager {
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
-        tx.execute(
-            "DELETE FROM sessions WHERE id = ?1",
-            params![session_id],
-        )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
         tx.commit()
             .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
@@ -621,6 +754,13 @@ impl SessionManager {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+        tx.execute(
+            "DELETE FROM session_ccr_references WHERE session_id IN (
+                 SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'
+             )",
+            params![contact, like],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         let messages = tx
             .execute(
                 "DELETE FROM session_messages WHERE session_id IN (
@@ -649,7 +789,8 @@ impl SessionManager {
     /// archived longer than `purge_after_days` (default 90). Returns the number
     /// newly archived (messages are preserved until purge).
     pub async fn cleanup_inactive(&self, max_age_hours: u64) -> Result<u64> {
-        self.cleanup_inactive_with_retention(max_age_hours, 90).await
+        self.cleanup_inactive_with_retention(max_age_hours, 90)
+            .await
     }
 
     /// Retention-aware variant of [`Self::cleanup_inactive`].
@@ -664,6 +805,12 @@ impl SessionManager {
         let purge_cutoff = (now - chrono::Duration::days(purge_after_days as i64)).to_rfc3339();
         let now_str = now.to_rfc3339();
 
+        conn.execute(
+            "DELETE FROM session_ccr_references WHERE expires_at<=?1",
+            params![now.timestamp()],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+
         // Step 1: archive inactive live sessions (soft).
         let archived = conn
             .execute(
@@ -674,6 +821,13 @@ impl SessionManager {
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
         // Step 2: purge sessions archived beyond the retention window.
+        conn.execute(
+            "DELETE FROM session_ccr_references WHERE session_id IN (
+                SELECT id FROM sessions WHERE archived_at IS NOT NULL AND archived_at < ?1
+            )",
+            params![purge_cutoff],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         conn.execute(
             "DELETE FROM session_messages WHERE session_id IN (
                 SELECT id FROM sessions WHERE archived_at IS NOT NULL AND archived_at < ?1
@@ -689,7 +843,10 @@ impl SessionManager {
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
         if archived > 0 || purged > 0 {
-            info!(archived, purged, max_age_hours, purge_after_days, "Session cleanup: archived + purged");
+            info!(
+                archived,
+                purged, max_age_hours, purge_after_days, "Session cleanup: archived + purged"
+            );
         }
         Ok(archived as u64)
     }
@@ -823,11 +980,25 @@ impl SessionManager {
 
     /// Fetch the first N turns of a session for summarization, in order
     /// (#13). Returns the rendered transcript ready for the prompt.
-    pub async fn read_first_n_turns_text(
+    pub async fn read_first_n_turns_text(&self, session_id: &str, n: u32) -> Result<String> {
+        let turns = self.read_first_n_turns(session_id, n).await?;
+        let mut out = String::new();
+        for (role, content) in turns {
+            out.push_str(&role);
+            out.push_str(": ");
+            out.push_str(&content);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// Bounded structured read for the background summarizer. Keeping turn
+    /// boundaries lets it protect exact sections within each message.
+    pub async fn read_first_n_turns(
         &self,
         session_id: &str,
         n: u32,
-    ) -> Result<String> {
+    ) -> Result<Vec<(String, String)>> {
         let conn = self.acquire().await;
         let mut stmt = conn
             .prepare(
@@ -844,14 +1015,8 @@ impl SessionManager {
                 Ok((role, content))
             })
             .map_err(|e| DuDuClawError::Gateway(format!("read_first_n query: {e}")))?;
-        let mut out = String::new();
-        for (role, content) in rows.flatten() {
-            out.push_str(&role);
-            out.push_str(": ");
-            out.push_str(&content);
-            out.push('\n');
-        }
-        Ok(out)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| DuDuClawError::Gateway(format!("read_first_n rows: {e}")))
     }
 
     /// Fetch the LAST N turns of a session, in chronological order. Used by
@@ -962,6 +1127,34 @@ impl SessionManager {
             .execute(
                 "UPDATE session_messages SET hidden = 1 WHERE id = ?1 AND session_id = ?2",
                 params![message_id, session_id],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        Ok(rows > 0)
+    }
+
+    /// Revoke an already-persisted message whose CCR source lease could not be
+    /// held through delivery.
+    ///
+    /// The row is both tombstoned (`undone_at`, so `get_messages` and every
+    /// dashboard view stop returning it) and rewritten to `replacement`, so no
+    /// source-derived wording survives the refusal on disk. The session's
+    /// `total_tokens` is deliberately left alone: it is an append-only cost
+    /// counter, not a context-size measure of the live rows.
+    ///
+    /// Returns `true` when a live row was actually rewritten.
+    pub async fn revoke_message(
+        &self,
+        session_id: &str,
+        message_id: i64,
+        replacement: &str,
+    ) -> Result<bool> {
+        let conn = self.acquire().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = conn
+            .execute(
+                "UPDATE session_messages SET content = ?1, undone_at = ?2
+                 WHERE id = ?3 AND session_id = ?4 AND undone_at IS NULL",
+                params![replacement, now, message_id, session_id],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         Ok(rows > 0)
@@ -1147,6 +1340,88 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[tokio::test]
+    async fn ccr_references_follow_source_turn_undo_and_compression() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("support:s1", "support").await.unwrap();
+        let user_id = mgr
+            .append_message_with_id("support:s1", "user", "What is the SLA?", 5)
+            .await
+            .unwrap();
+        let saved = duduclaw_llm::CcrSavedResult {
+            scope: duduclaw_llm::CcrScope {
+                tenant_id: "local".into(),
+                agent_id: "support".into(),
+                session_id: "support:s1".into(),
+                source_acl: "principal-a".into(),
+            },
+            source_tool: "support-mcp/search".into(),
+            source_call_id: "call-1".into(),
+            id: "handle-1".into(),
+            original_bytes: 9000,
+            expires_at: chrono::Utc::now().timestamp() + 1800,
+        };
+        mgr.append_ccr_saved_results("support:s1", user_id, &[saved.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            mgr.get_ccr_saved_results("support:s1", 5).await.unwrap(),
+            vec![saved.clone()]
+        );
+        assert_eq!(mgr.get_messages("support:s1").await.unwrap().len(), 1);
+
+        mgr.acquire()
+            .await
+            .execute(
+                "UPDATE session_messages SET undone_at=?1 WHERE id=?2",
+                params![chrono::Utc::now().to_rfc3339(), user_id],
+            )
+            .unwrap();
+        assert!(
+            mgr.get_ccr_saved_results("support:s1", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let next_id = mgr
+            .append_message_with_id("support:s1", "user", "Try again", 3)
+            .await
+            .unwrap();
+        let mut expired = saved.clone();
+        expired.id = "expired-handle".into();
+        expired.expires_at = chrono::Utc::now().timestamp() - 1;
+        mgr.append_ccr_saved_results("support:s1", next_id, &[expired])
+            .await
+            .unwrap();
+        assert!(
+            mgr.get_ccr_saved_results("support:s1", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        mgr.append_ccr_saved_results("support:s1", next_id, &[saved])
+            .await
+            .unwrap();
+        mgr.compress("support:s1", "summary").await.unwrap();
+        assert!(
+            mgr.get_ccr_saved_results("support:s1", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let count: i64 = mgr
+            .acquire()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM session_ccr_references WHERE session_id=?1",
+                params!["support:s1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    #[tokio::test]
     async fn wp5_soft_delete_archives_then_purge_removes() {
         let tmp = NamedTempFile::new().unwrap();
         let mgr = SessionManager::new(tmp.path()).unwrap();
@@ -1155,14 +1430,22 @@ mod tests {
 
         // delete = archive: messages survive, replayable.
         mgr.delete_session("s1").await.unwrap();
-        assert_eq!(mgr.get_messages("s1").await.unwrap().len(), 1, "archived session keeps messages");
+        assert_eq!(
+            mgr.get_messages("s1").await.unwrap().len(),
+            1,
+            "archived session keeps messages"
+        );
 
         // unarchive brings it back to live.
         mgr.unarchive_session("s1").await.unwrap();
 
         // purge = hard delete: messages gone.
         mgr.purge_session("s1").await.unwrap();
-        assert_eq!(mgr.get_messages("s1").await.unwrap().len(), 0, "purge removes messages");
+        assert_eq!(
+            mgr.get_messages("s1").await.unwrap().len(),
+            0,
+            "purge removes messages"
+        );
     }
 
     #[tokio::test]
@@ -1172,16 +1455,24 @@ mod tests {
 
         // Three sessions for the same agent; each user turn bumps last_active.
         // Append in s1 → s2 → s3 order so s3 is the most recently active.
-        for (sid, first) in [("s1", "第一個問題"), ("s2", "second question"), ("s3", "third")] {
+        for (sid, first) in [
+            ("s1", "第一個問題"),
+            ("s2", "second question"),
+            ("s3", "third"),
+        ] {
             mgr.get_or_create(sid, "agent-x").await.unwrap();
             mgr.append_message(sid, "user", first, 3).await.unwrap();
-            mgr.append_message(sid, "assistant", "reply", 3).await.unwrap();
+            mgr.append_message(sid, "assistant", "reply", 3)
+                .await
+                .unwrap();
             // Tiny gap so rfc3339 last_active timestamps are strictly ordered.
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         // A session for a DIFFERENT agent — must not leak into the scoped list.
         mgr.get_or_create("other", "agent-y").await.unwrap();
-        mgr.append_message("other", "user", "不該出現", 3).await.unwrap();
+        mgr.append_message("other", "user", "不該出現", 3)
+            .await
+            .unwrap();
 
         // Agent-scoped list: newest first, correct title (first user turn) and
         // turn_count (visible messages only).
@@ -1195,12 +1486,18 @@ mod tests {
         // LIMIT is honored AFTER ordering: the single row is the newest one.
         let limited = mgr.list_sessions(Some("agent-x"), 1).await.unwrap();
         assert_eq!(limited.len(), 1);
-        assert_eq!(limited[0].id, "s3", "LIMIT keeps the newest, not an arbitrary row");
+        assert_eq!(
+            limited[0].id, "s3",
+            "LIMIT keeps the newest, not an arbitrary row"
+        );
 
         // Unscoped list spans agents (admin path) and stays newest-first.
         let all = mgr.list_sessions(None, 10).await.unwrap();
         assert_eq!(all.len(), 4);
-        assert_eq!(all[0].id, "other", "the other-agent session was appended last");
+        assert_eq!(
+            all[0].id, "other",
+            "the other-agent session was appended last"
+        );
 
         // Archived sessions drop out of both listings.
         mgr.delete_session("s3").await.unwrap();
@@ -1220,12 +1517,21 @@ mod tests {
 
         // Replying to msg-777 resumes the mapped session.
         assert_eq!(
-            mgr.session_for_reply("telegram", "msg-777").await.unwrap().as_deref(),
+            mgr.session_for_reply("telegram", "msg-777")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("telegram:42:task-A")
         );
         // Unknown message / wrong channel ⇒ None (caller uses main session).
-        assert_eq!(mgr.session_for_reply("telegram", "nope").await.unwrap(), None);
-        assert_eq!(mgr.session_for_reply("slack", "msg-777").await.unwrap(), None);
+        assert_eq!(
+            mgr.session_for_reply("telegram", "nope").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            mgr.session_for_reply("slack", "msg-777").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1234,9 +1540,15 @@ mod tests {
         let mgr = SessionManager::new(tmp.path()).unwrap();
 
         // Create session and add messages
-        mgr.get_or_create("test-session", "test-agent").await.unwrap();
-        mgr.append_message("test-session", "user", "hello", 5).await.unwrap();
-        mgr.append_message("test-session", "assistant", "world", 5).await.unwrap();
+        mgr.get_or_create("test-session", "test-agent")
+            .await
+            .unwrap();
+        mgr.append_message("test-session", "user", "hello", 5)
+            .await
+            .unwrap();
+        mgr.append_message("test-session", "assistant", "world", 5)
+            .await
+            .unwrap();
 
         // Should have 2 visible messages
         let msgs = mgr.get_messages("test-session").await.unwrap();
@@ -1267,27 +1579,50 @@ mod tests {
 
         // A contact's base chat + a thread of it, plus an unrelated contact.
         mgr.get_or_create("telegram:12345", "a").await.unwrap();
-        mgr.append_message("telegram:12345", "user", "hi", 1).await.unwrap();
+        mgr.append_message("telegram:12345", "user", "hi", 1)
+            .await
+            .unwrap();
         mgr.get_or_create("telegram:12345:77", "a").await.unwrap();
-        mgr.append_message("telegram:12345:77", "user", "thread", 1).await.unwrap();
+        mgr.append_message("telegram:12345:77", "user", "thread", 1)
+            .await
+            .unwrap();
         mgr.get_or_create("telegram:99999", "a").await.unwrap();
-        mgr.append_message("telegram:99999", "user", "other", 1).await.unwrap();
+        mgr.append_message("telegram:99999", "user", "other", 1)
+            .await
+            .unwrap();
         // A prefix-collision guard: `telegram:123456` must NOT match `telegram:12345`.
         mgr.get_or_create("telegram:123456", "a").await.unwrap();
 
         let ids = mgr.sessions_for_contact("telegram:12345").await.unwrap();
-        assert_eq!(ids.len(), 2, "exact id + its thread, not the 99999 or 123456");
+        assert_eq!(
+            ids.len(),
+            2,
+            "exact id + its thread, not the 99999 or 123456"
+        );
 
-        let (sessions, messages) =
-            mgr.erase_sessions_for_contact("telegram:12345").await.unwrap();
+        let (sessions, messages) = mgr
+            .erase_sessions_for_contact("telegram:12345")
+            .await
+            .unwrap();
         assert_eq!(sessions, 2);
         assert_eq!(messages, 2);
 
         // The unrelated contacts survive.
         assert_eq!(mgr.get_messages("telegram:99999").await.unwrap().len(), 1);
-        assert!(mgr.sessions_for_contact("telegram:123456").await.unwrap().len() == 1);
+        assert!(
+            mgr.sessions_for_contact("telegram:123456")
+                .await
+                .unwrap()
+                .len()
+                == 1
+        );
         // The erased contact is gone.
-        assert!(mgr.sessions_for_contact("telegram:12345").await.unwrap().is_empty());
+        assert!(
+            mgr.sessions_for_contact("telegram:12345")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1295,7 +1630,9 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let mgr = SessionManager::new(tmp.path()).unwrap();
 
-        mgr.get_or_create("test-session", "test-agent").await.unwrap();
+        mgr.get_or_create("test-session", "test-agent")
+            .await
+            .unwrap();
         mgr.append_message("test-session", "tool", "search result: found 5 items", 10)
             .await
             .unwrap();
@@ -1322,7 +1659,9 @@ mod tests {
 
         mgr.get_or_create("s1", "agent").await.unwrap();
         mgr.append_message("s1", "user", "msg1", 5).await.unwrap();
-        mgr.append_message("s1", "assistant", "msg2", 5).await.unwrap();
+        mgr.append_message("s1", "assistant", "msg2", 5)
+            .await
+            .unwrap();
         mgr.append_message("s1", "user", "msg3", 5).await.unwrap();
 
         // Hide middle message
@@ -1345,7 +1684,12 @@ mod tests {
         assert!(pinned.is_empty());
 
         // Set pinned
-        mgr.set_pinned("pin-test", "- Goal: build two teams\n- Constraint: use Rust").await.unwrap();
+        mgr.set_pinned(
+            "pin-test",
+            "- Goal: build two teams\n- Constraint: use Rust",
+        )
+        .await
+        .unwrap();
         let pinned = mgr.get_pinned("pin-test").await.unwrap();
         assert!(pinned.contains("build two teams"));
         assert!(pinned.contains("use Rust"));
@@ -1364,12 +1708,20 @@ mod tests {
         mgr.get_or_create("compress-pin", "agent").await.unwrap();
 
         // Set pinned + add messages
-        mgr.set_pinned("compress-pin", "- Goal: deploy v2.0").await.unwrap();
-        mgr.append_message("compress-pin", "user", "hello", 5).await.unwrap();
-        mgr.append_message("compress-pin", "assistant", "world", 5).await.unwrap();
+        mgr.set_pinned("compress-pin", "- Goal: deploy v2.0")
+            .await
+            .unwrap();
+        mgr.append_message("compress-pin", "user", "hello", 5)
+            .await
+            .unwrap();
+        mgr.append_message("compress-pin", "assistant", "world", 5)
+            .await
+            .unwrap();
 
         // Compress — should delete messages but keep pinned
-        mgr.compress("compress-pin", "Summary: user said hello").await.unwrap();
+        mgr.compress("compress-pin", "Summary: user said hello")
+            .await
+            .unwrap();
 
         // Messages gone (replaced with summary)
         let msgs = mgr.get_messages("compress-pin").await.unwrap();
@@ -1400,14 +1752,22 @@ mod tests {
 
         // Agent "alice": two sessions, plus one belonging to another agent.
         mgr.get_or_create("webchat:s1", "alice").await.unwrap();
-        mgr.append_message("webchat:s1", "user", "第一個問題：怎麼部署", 6).await.unwrap();
-        mgr.append_message("webchat:s1", "assistant", "答覆", 2).await.unwrap();
+        mgr.append_message("webchat:s1", "user", "第一個問題：怎麼部署", 6)
+            .await
+            .unwrap();
+        mgr.append_message("webchat:s1", "assistant", "答覆", 2)
+            .await
+            .unwrap();
 
         mgr.get_or_create("webchat:s2", "alice").await.unwrap();
-        mgr.append_message("webchat:s2", "user", "second question about billing", 5).await.unwrap();
+        mgr.append_message("webchat:s2", "user", "second question about billing", 5)
+            .await
+            .unwrap();
 
         mgr.get_or_create("webchat:other", "bob").await.unwrap();
-        mgr.append_message("webchat:other", "user", "bob's private chat", 4).await.unwrap();
+        mgr.append_message("webchat:other", "user", "bob's private chat", 4)
+            .await
+            .unwrap();
 
         // Scoped list only returns alice's sessions, newest (s2) first.
         let list = mgr.list_sessions(Some("alice"), 50).await.unwrap();
@@ -1433,7 +1793,9 @@ mod tests {
         mgr.get_or_create("webchat:long", "alice").await.unwrap();
         // 200 CJK chars — longer than SESSION_TITLE_MAX_CHARS (80).
         let long: String = "測".repeat(200);
-        mgr.append_message("webchat:long", "user", &long, 100).await.unwrap();
+        mgr.append_message("webchat:long", "user", &long, 100)
+            .await
+            .unwrap();
 
         let list = mgr.list_sessions(Some("alice"), 50).await.unwrap();
         assert_eq!(list.len(), 1);
@@ -1448,9 +1810,13 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let mgr = SessionManager::new(tmp.path()).unwrap();
         mgr.get_or_create("webchat:live", "alice").await.unwrap();
-        mgr.append_message("webchat:live", "user", "live one", 2).await.unwrap();
+        mgr.append_message("webchat:live", "user", "live one", 2)
+            .await
+            .unwrap();
         mgr.get_or_create("webchat:gone", "alice").await.unwrap();
-        mgr.append_message("webchat:gone", "user", "archive me", 2).await.unwrap();
+        mgr.append_message("webchat:gone", "user", "archive me", 2)
+            .await
+            .unwrap();
 
         mgr.delete_session("webchat:gone").await.unwrap(); // soft delete = archive
 
@@ -1480,12 +1846,16 @@ mod tests {
 
         // Two distinct sessions for the same agent.
         mgr.get_or_create("webchat:old", "alice").await.unwrap();
-        mgr.append_message("webchat:old", "user", "old turn", 2).await.unwrap();
+        mgr.append_message("webchat:old", "user", "old turn", 2)
+            .await
+            .unwrap();
         mgr.get_or_create("webchat:new", "alice").await.unwrap();
 
         // Resuming "old" appends there, leaving "new" untouched — proving a
         // resume targets the requested session, not a fresh one.
-        mgr.append_message("webchat:old", "user", "resumed turn", 3).await.unwrap();
+        mgr.append_message("webchat:old", "user", "resumed turn", 3)
+            .await
+            .unwrap();
 
         let old_msgs = mgr.get_messages("webchat:old").await.unwrap();
         assert_eq!(old_msgs.len(), 2);

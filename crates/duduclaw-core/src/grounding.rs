@@ -71,6 +71,11 @@ pub const SELF_ECHO_TOOL_NAMES: &[&str] = &[
     "working_state_set",
     "working_state_clear",
     "working_state_handoff",
+    // A TaskPacket is the sending role's own findings/next_steps/objective
+    // written down; the tool's reply just confirms where it was filed. Letting
+    // it count as evidence would let a role "verify" its own handoff prose
+    // (P1/WP-5, design §3.4 engineering constraint 1).
+    "team_handoff",
 ];
 
 /// `true` when `name` (matched via [`tool_name_matches`], so an MCP-prefixed
@@ -397,6 +402,10 @@ mod tests {
         assert!(is_self_echo_tool("tasks_complete"));
         assert!(is_self_echo_tool("mcp__duduclaw__tasks_complete"));
         assert!(is_self_echo_tool("activity_post"));
+        assert!(is_self_echo_tool("working_state_handoff"));
+        // P1/WP-5: a packet echoes the sending role's own summary.
+        assert!(is_self_echo_tool("team_handoff"));
+        assert!(is_self_echo_tool("mcp__duduclaw__team_handoff"));
         assert!(!is_self_echo_tool("memory_search"));
         assert!(!is_self_echo_tool("tasks_list")); // read-only, not on the list
     }

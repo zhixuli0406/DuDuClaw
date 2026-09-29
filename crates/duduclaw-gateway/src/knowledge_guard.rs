@@ -233,8 +233,9 @@ mod tests {
             );
         }
         // 5th reaches the limit → quarantine.
-        assert!(check_and_record(dir.path(), &c, "agnes", "channel", "user:alice", 1)
-            .is_quarantine());
+        assert!(
+            check_and_record(dir.path(), &c, "agnes", "channel", "user:alice", 1).is_quarantine()
+        );
     }
 
     #[test]
@@ -244,7 +245,10 @@ mod tests {
         // A single batch of 5 same-subject facts is the k-doc poisoning case.
         let d = check_and_record(dir.path(), &c, "agnes", "channel", "user:alice", 5);
         assert!(d.is_quarantine());
-        if let KnowledgeGuardDecision::Quarantine { count_in_window, .. } = d {
+        if let KnowledgeGuardDecision::Quarantine {
+            count_in_window, ..
+        } = d
+        {
             assert_eq!(count_in_window, 5);
         }
     }
@@ -260,8 +264,9 @@ mod tests {
                 KnowledgeGuardDecision::Allow
             );
         }
-        assert!(check_and_record(dir.path(), &c, "agnes", "channel", "user:bob", 1)
-            .is_quarantine());
+        assert!(
+            check_and_record(dir.path(), &c, "agnes", "channel", "user:bob", 1).is_quarantine()
+        );
         assert_eq!(
             check_and_record(dir.path(), &c, "agnes", "channel", "user:alice", 1),
             KnowledgeGuardDecision::Allow
@@ -313,7 +318,9 @@ mod tests {
         let mut state = State::new();
         state.insert(
             bucket_key("agnes", "channel", "s"),
-            Bucket { events: vec![0, 0, 0, 0] },
+            Bucket {
+                events: vec![0, 0, 0, 0],
+            },
         );
         std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
 

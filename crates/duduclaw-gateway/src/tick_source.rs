@@ -933,26 +933,27 @@ pub(crate) async fn run_source(
     loop {
         tokio::time::sleep(interval).await;
 
-        let payloads = match crate::tick_source_poll::poll_once(&cfg, &home_dir, &mut state, interval).await {
-            Ok(p) => p,
-            Err(e) => {
-                state.failures += 1;
-                if state.failures == 1 || state.failures % FAILURE_LOG_EVERY == 0 {
-                    warn!(
-                        source = %cfg.id,
-                        kind = cfg.kind.as_str(),
-                        failures = state.failures,
-                        error = %e,
-                        "tick source fetch failed"
-                    );
+        let payloads =
+            match crate::tick_source_poll::poll_once(&cfg, &home_dir, &mut state, interval).await {
+                Ok(p) => p,
+                Err(e) => {
+                    state.failures += 1;
+                    if state.failures == 1 || state.failures % FAILURE_LOG_EVERY == 0 {
+                        warn!(
+                            source = %cfg.id,
+                            kind = cfg.kind.as_str(),
+                            failures = state.failures,
+                            error = %e,
+                            "tick source fetch failed"
+                        );
+                    }
+                    hub.record_drop(&cfg.id, DropReason::FetchError).await;
+                    crate::metrics::global_metrics()
+                        .tick_dropped(&cfg.id, DropReason::FetchError.as_str())
+                        .await;
+                    continue;
                 }
-                hub.record_drop(&cfg.id, DropReason::FetchError).await;
-                crate::metrics::global_metrics()
-                    .tick_dropped(&cfg.id, DropReason::FetchError.as_str())
-                    .await;
-                continue;
-            }
-        };
+            };
         if !payloads.is_empty() {
             state.failures = 0;
         }

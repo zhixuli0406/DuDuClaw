@@ -17,7 +17,9 @@ pub mod openai_compat;
 pub use anthropic::AnthropicProvider;
 pub use gemini::GeminiProvider;
 pub use openai::OpenAiProvider;
-pub use openai_compat::{preset, CompatPreset, OpenAiCompatProvider, COMPAT_PRESETS};
+pub use openai_compat::{
+    COMPAT_PRESETS, ChoiceLogprobs, CompatPreset, OpenAiCompatProvider, TokenLogprob, preset,
+};
 
 use crate::provider::{ApiAuth, ChatProvider};
 
@@ -37,9 +39,8 @@ pub fn build_provider(provider_id: &str, auth: ApiAuth) -> Option<Box<dyn ChatPr
         "anthropic" => Some(Box::new(AnthropicProvider::new(auth))),
         "openai" => Some(Box::new(OpenAiProvider::new(auth))),
         "gemini" | "google" => Some(Box::new(GeminiProvider::new(auth))),
-        other => {
-            OpenAiCompatProvider::from_preset(other, auth).map(|p| Box::new(p) as Box<dyn ChatProvider>)
-        }
+        other => OpenAiCompatProvider::from_preset(other, auth)
+            .map(|p| Box::new(p) as Box<dyn ChatProvider>),
     }
 }
 
@@ -53,10 +54,19 @@ mod build_provider_tests {
             build_provider("anthropic", ApiAuth::new("k")).unwrap().id(),
             "anthropic"
         );
-        assert_eq!(build_provider("openai", ApiAuth::new("k")).unwrap().id(), "openai");
-        assert_eq!(build_provider("gemini", ApiAuth::new("k")).unwrap().id(), "gemini");
+        assert_eq!(
+            build_provider("openai", ApiAuth::new("k")).unwrap().id(),
+            "openai"
+        );
+        assert_eq!(
+            build_provider("gemini", ApiAuth::new("k")).unwrap().id(),
+            "gemini"
+        );
         // Google alias maps to the Gemini provider.
-        assert_eq!(build_provider("google", ApiAuth::new("k")).unwrap().id(), "gemini");
+        assert_eq!(
+            build_provider("google", ApiAuth::new("k")).unwrap().id(),
+            "gemini"
+        );
     }
 
     #[test]

@@ -52,7 +52,7 @@ const DEFAULT_WAIT_PENDING_TIMEOUT: Duration = Duration::from_secs(3);
 /// `emit_*` calls are fire-and-forget: they never block the caller, which is
 /// exactly right for the long-running gateway (the process — and its Tokio
 /// `Runtime` — stays alive for the write's whole lifetime). It is **not**
-/// safe for a one-shot CLI command (`duduclaw evolution finalize` and
+/// safe for a one-shot CLI command (`duduclaw evolution` subcommands and
 /// similar): `#[tokio::main]` drops the `Runtime` as soon as `main()`
 /// returns, which can abort an in-flight `tokio::spawn`'d write mid
 /// `create_dir_all`/`open`. The aborted `spawn_blocking` join surfaces as
@@ -138,14 +138,12 @@ impl EvolutionEventEmitter {
     ///
     /// Call immediately after `security_scanner::scan_skill()` returns.
     /// `passed` maps to `Outcome::Success`; `!passed` maps to `Outcome::Failure`.
-    pub fn emit_security_scan(
-        &self,
-        agent_id: &str,
-        skill_id: &str,
-        passed: bool,
-        metadata: Json,
-    ) {
-        let outcome = if passed { Outcome::Success } else { Outcome::Failure };
+    pub fn emit_security_scan(&self, agent_id: &str, skill_id: &str, passed: bool, metadata: Json) {
+        let outcome = if passed {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
         self.spawn(
             AuditEvent::now(AuditEventType::SecurityScan, agent_id, outcome)
                 .with_skill_id(skill_id)
@@ -186,12 +184,7 @@ impl EvolutionEventEmitter {
     /// - `quality_score` (f64 in [0,1]) — composite quality score from the scorer
     /// - `source_trajectories` (u64) — number of trajectories that contributed
     /// - `pipeline_version` (str) — pipeline version tag, e.g. `"W19-P0"`
-    pub fn emit_skill_graduate(
-        &self,
-        agent_id: &str,
-        skill_id: &str,
-        metadata: Json,
-    ) {
+    pub fn emit_skill_graduate(&self, agent_id: &str, skill_id: &str, metadata: Json) {
         self.spawn(
             AuditEvent::now(AuditEventType::SkillGraduate, agent_id, Outcome::Success)
                 .with_skill_id(skill_id)
@@ -227,9 +220,13 @@ impl EvolutionEventEmitter {
         // TODO P1: wrap this call with a stagnation_detection threshold check.
         // e.g.:  if consecutive_triggers >= stagnation_cfg.trigger_threshold { ... }
         self.spawn(
-            AuditEvent::now(AuditEventType::SignalSuppressed, agent_id, Outcome::Suppressed)
-                .with_trigger_signal("stagnation_detection")
-                .with_metadata(metadata),
+            AuditEvent::now(
+                AuditEventType::SignalSuppressed,
+                agent_id,
+                Outcome::Suppressed,
+            )
+            .with_trigger_signal("stagnation_detection")
+            .with_metadata(metadata),
         );
     }
 
@@ -258,11 +255,7 @@ impl EvolutionEventEmitter {
     ///
     /// ## metadata fields
     /// `{"approval_request_id", "operation_type", "justification"}`
-    pub fn emit_governance_approval_requested(
-        &self,
-        agent_id: &str,
-        metadata: Json,
-    ) {
+    pub fn emit_governance_approval_requested(&self, agent_id: &str, metadata: Json) {
         self.spawn(
             AuditEvent::now(
                 AuditEventType::GovernanceApprovalRequested,
@@ -295,13 +288,12 @@ impl EvolutionEventEmitter {
     ///
     /// ## metadata fields
     /// `{"policy_id", "policy_type", "change_type": "create|update|delete"}`
-    pub fn emit_governance_policy_changed(
-        &self,
-        agent_id: &str,
-        success: bool,
-        metadata: Json,
-    ) {
-        let outcome = if success { Outcome::Success } else { Outcome::Failure };
+    pub fn emit_governance_policy_changed(&self, agent_id: &str, success: bool, metadata: Json) {
+        let outcome = if success {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
         self.spawn(
             AuditEvent::now(AuditEventType::GovernancePolicyChanged, agent_id, outcome)
                 .with_trigger_signal("policy_registry")
@@ -315,9 +307,13 @@ impl EvolutionEventEmitter {
     /// `{"policy_id", "agents_affected": N}`
     pub fn emit_governance_quota_reset(&self, agent_id: &str, metadata: Json) {
         self.spawn(
-            AuditEvent::now(AuditEventType::GovernanceQuotaReset, agent_id, Outcome::Success)
-                .with_trigger_signal("quota_manager")
-                .with_metadata(metadata),
+            AuditEvent::now(
+                AuditEventType::GovernanceQuotaReset,
+                agent_id,
+                Outcome::Success,
+            )
+            .with_trigger_signal("quota_manager")
+            .with_metadata(metadata),
         );
     }
 
@@ -327,13 +323,12 @@ impl EvolutionEventEmitter {
     ///
     /// ## metadata fields
     /// `{"attempt_number", "max_attempts", "delay_ms", "error_code"}`
-    pub fn emit_durability_retry_attempt(
-        &self,
-        agent_id: &str,
-        success: bool,
-        metadata: Json,
-    ) {
-        let outcome = if success { Outcome::Success } else { Outcome::Failure };
+    pub fn emit_durability_retry_attempt(&self, agent_id: &str, success: bool, metadata: Json) {
+        let outcome = if success {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
         self.spawn(
             AuditEvent::now(AuditEventType::DurabilityRetryAttempt, agent_id, outcome)
                 .with_trigger_signal("retry_engine")
@@ -347,9 +342,13 @@ impl EvolutionEventEmitter {
     /// `{"operation_type", "max_attempts", "dlq_id", "last_error"}`
     pub fn emit_durability_retry_exhausted(&self, agent_id: &str, metadata: Json) {
         self.spawn(
-            AuditEvent::now(AuditEventType::DurabilityRetryExhausted, agent_id, Outcome::Failure)
-                .with_trigger_signal("retry_engine")
-                .with_metadata(metadata),
+            AuditEvent::now(
+                AuditEventType::DurabilityRetryExhausted,
+                agent_id,
+                Outcome::Failure,
+            )
+            .with_trigger_signal("retry_engine")
+            .with_metadata(metadata),
         );
     }
 
@@ -389,13 +388,12 @@ impl EvolutionEventEmitter {
     ///
     /// ## metadata fields
     /// `{"checkpoint_id", "phase", "ttl_seconds"}`
-    pub fn emit_durability_checkpoint_saved(
-        &self,
-        agent_id: &str,
-        success: bool,
-        metadata: Json,
-    ) {
-        let outcome = if success { Outcome::Success } else { Outcome::Failure };
+    pub fn emit_durability_checkpoint_saved(&self, agent_id: &str, success: bool, metadata: Json) {
+        let outcome = if success {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
         self.spawn(
             AuditEvent::now(AuditEventType::DurabilityCheckpointSaved, agent_id, outcome)
                 .with_trigger_signal("checkpoint_manager")
@@ -407,13 +405,12 @@ impl EvolutionEventEmitter {
     ///
     /// ## metadata fields
     /// `{"dlq_id", "operation_type", "replayed_by"}`
-    pub fn emit_durability_dlq_replayed(
-        &self,
-        agent_id: &str,
-        success: bool,
-        metadata: Json,
-    ) {
-        let outcome = if success { Outcome::Success } else { Outcome::Failure };
+    pub fn emit_durability_dlq_replayed(&self, agent_id: &str, success: bool, metadata: Json) {
+        let outcome = if success {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
         self.spawn(
             AuditEvent::now(AuditEventType::DurabilityDlqReplayed, agent_id, outcome)
                 .with_trigger_signal("dead_letter_queue")
@@ -431,9 +428,13 @@ impl EvolutionEventEmitter {
     /// action.
     pub fn emit_proactive_quadrant(&self, agent_id: &str, metadata: Json) {
         self.spawn(
-            AuditEvent::now(AuditEventType::ProactiveQuadrant, agent_id, Outcome::Success)
-                .with_trigger_signal("proactive_gate_calibration")
-                .with_metadata(metadata),
+            AuditEvent::now(
+                AuditEventType::ProactiveQuadrant,
+                agent_id,
+                Outcome::Success,
+            )
+            .with_trigger_signal("proactive_gate_calibration")
+            .with_metadata(metadata),
         );
     }
 
@@ -773,7 +774,8 @@ mod tests {
         let lines = read_lines(tmp.path()).await;
         assert_eq!(lines.len(), 5, "all 5 events must be persisted");
 
-        let types: Vec<&str> = lines.iter()
+        let types: Vec<&str> = lines
+            .iter()
             .map(|ev| ev["event_type"].as_str().unwrap())
             .collect();
         assert!(types.contains(&"skill_activate"));
@@ -830,7 +832,11 @@ mod tests {
         sleep(Duration::from_millis(150)).await;
 
         let lines = read_lines(tmp.path()).await;
-        assert_eq!(lines.len(), N, "all {N} concurrent events must be persisted");
+        assert_eq!(
+            lines.len(),
+            N,
+            "all {N} concurrent events must be persisted"
+        );
         for line in &lines {
             // Every line must be valid JSON with correct event_type.
             assert_eq!(ev_type(line), "skill_activate");
@@ -887,8 +893,8 @@ mod tests {
 
     // ── B3: cold-directory race + wait_pending synchronisation ────────────────
 
-    /// Regression test for the "first `duduclaw evolution finalize` run
-    /// prints an ERROR" bug: emitting into a directory that does not exist
+    /// Regression test for the "first one-shot CLI run prints an ERROR"
+    /// bug: emitting into a directory that does not exist
     /// yet, then immediately (no `sleep` compensation) awaiting
     /// `wait_pending`, must leave the event durably written. Before the B3
     /// fix there was no way to synchronise on the detached `tokio::spawn`
@@ -902,24 +908,34 @@ mod tests {
         // Deliberately nested + not pre-created: this is the "first ever
         // run" shape, where `~/.duduclaw/evolution/events` doesn't exist.
         let cold_dir = tmp.path().join("brand-new-agent-home/evolution/events");
-        assert!(!cold_dir.exists(), "precondition: directory must not exist yet");
+        assert!(
+            !cold_dir.exists(),
+            "precondition: directory must not exist yet"
+        );
         let emitter = make_emitter(&cold_dir);
 
-        emitter.emit_skill_activate("agent-cold", "python-patterns", "prediction_error_diagnosis");
+        emitter.emit_skill_activate(
+            "agent-cold",
+            "python-patterns",
+            "prediction_error_diagnosis",
+        );
         // No `sleep()` here — `wait_pending` itself must be the
         // synchronisation point, not luck-based timing.
         emitter.wait_pending(Duration::from_secs(2)).await;
 
         let lines = read_lines(&cold_dir).await;
-        assert_eq!(lines.len(), 1, "cold-directory emit must be durably written after wait_pending");
+        assert_eq!(
+            lines.len(),
+            1,
+            "cold-directory emit must be durably written after wait_pending"
+        );
         assert_eq!(lines[0]["event_type"], "skill_activate");
         assert_eq!(lines[0]["agent_id"], "agent-cold");
     }
 
     /// Same as above but for multiple concurrent emits into a cold
-    /// directory — simulates `ObservationFinalizer::tick()` firing one
-    /// `emit_gvu_generation` per expired version before the one-shot CLI
-    /// returns.
+    /// directory — simulates a sweep firing one `emit_gvu_generation` per
+    /// settled round before the one-shot CLI returns.
     #[tokio::test]
     async fn test_wait_pending_flushes_multiple_cold_directory_emits() {
         let tmp = TempDir::new().unwrap();

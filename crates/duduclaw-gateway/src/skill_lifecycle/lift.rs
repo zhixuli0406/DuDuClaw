@@ -76,15 +76,17 @@ pub struct LiftTrackerStore {
 
 impl LiftTrackerStore {
     pub fn new() -> Self {
-        Self { trackers: HashMap::new() }
+        Self {
+            trackers: HashMap::new(),
+        }
     }
 
     /// Get or create a tracker for a skill.
     pub fn get_or_create(&mut self, agent_id: &str, skill_name: &str) -> &mut SkillLiftTracker {
         let key = (agent_id.to_string(), skill_name.to_string());
-        self.trackers.entry(key).or_insert_with(|| {
-            SkillLiftTracker::new(skill_name.to_string(), agent_id.to_string())
-        })
+        self.trackers
+            .entry(key)
+            .or_insert_with(|| SkillLiftTracker::new(skill_name.to_string(), agent_id.to_string()))
     }
 
     /// Get all trackers for an agent.

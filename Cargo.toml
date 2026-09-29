@@ -6,16 +6,11 @@ exclude = [
     # Desktop app shell (Tauri 2). Its own lockfile/target and heavy GUI deps;
     # built via `cargo tauri build` from src-tauri/, not the main workspace.
     "src-tauri",
-    # Phase 0a gpui native GUI spike. Its own lockfile/target; gpui is a git
-    # dependency on zed-industries/zed with heavy transitive deps (wgpu,
-    # font-kit, metal) that must never touch the gateway build.
-    "crates/duduclaw-native-gui",
-    # Shell-S0: DuDuClaw OS gpui shell app (same gpui git dep tree as
-    # duduclaw-native-gui; own detached workspace/lockfile).
-    "crates/duduclaw-shell",
-    # Shell-S0: smithay compositor spike. Linux-only deps (wayland-server,
-    # libinput, udev) that must never touch the mac gateway build.
-    "crates/duduclaw-comp",
+    # 2026-09-29 (S16): duduclaw-shell / duduclaw-comp / duduclaw-native-gui
+    # used to be listed here. They were always workspace-EXCLUDED detached
+    # crates with their own lockfiles — the root Cargo.lock never referenced
+    # them — so moving their sources to the DuDuClaw-OS repo's `crates/`
+    # changed nothing in this workspace.
 ]
 members = [
     "crates/duduclaw-core",
@@ -33,14 +28,12 @@ members = [
     "crates/duduclaw-identity",
     "crates/duduclaw-redaction",
     "crates/duduclaw-cli-runtime",
-    "crates/duduclaw-cli-worker",
     "crates/duduclaw-license",
     "crates/duduclaw-fork",
     "crates/duduclaw-llm",
     "crates/duduclaw-sandbox",
     "crates/duduclaw-os",
     "crates/duduclaw-pets",
-    "crates/duduclaw-docuseal-mcp",
     "crates/duduclaw-relay",
     "crates/duduclaw-sysd",
     "crates/duduclaw-db",
@@ -133,7 +126,6 @@ duduclaw-desktop = { path = "crates/duduclaw-desktop" }
 duduclaw-identity = { path = "crates/duduclaw-identity" }
 duduclaw-redaction = { path = "crates/duduclaw-redaction" }
 duduclaw-cli-runtime = { path = "crates/duduclaw-cli-runtime" }
-duduclaw-cli-worker = { path = "crates/duduclaw-cli-worker" }
 duduclaw-license = { path = "crates/duduclaw-license" }
 duduclaw-llm = { path = "crates/duduclaw-llm" }
 duduclaw-sandbox = { path = "crates/duduclaw-sandbox" }

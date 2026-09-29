@@ -563,17 +563,18 @@ mod tests {
         let rec = record("sales-team");
         write_record(home.path(), &rec).expect("write");
         // Path contract: <home>/experts/<slug>/install.json
-        assert!(home
-            .path()
-            .join("experts/sales-team/install.json")
-            .is_file());
+        assert!(
+            home.path()
+                .join("experts/sales-team/install.json")
+                .is_file()
+        );
         let rows = list_records(home.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].slug, "sales-team");
         assert_eq!(rows[0].kind, PackKind::Native);
         // kind serializes kebab-case — the same wire shape the CLI writes.
-        let raw = std::fs::read_to_string(home.path().join("experts/sales-team/install.json"))
-            .unwrap();
+        let raw =
+            std::fs::read_to_string(home.path().join("experts/sales-team/install.json")).unwrap();
         assert!(raw.contains("\"native\""), "kebab-case kind: {raw}");
     }
 
@@ -618,9 +619,15 @@ mod tests {
 
         assert!(!h.join("agents/pack-agent").exists(), "agent removed");
         assert!(!h.join("skills/pack-skill").exists(), "skill removed");
-        assert!(!h.join("shared/wiki/packs/demo/sop.md").exists(), "wiki removed");
+        assert!(
+            !h.join("shared/wiki/packs/demo/sop.md").exists(),
+            "wiki removed"
+        );
         // Empty namespace dirs pruned up to the wiki fence.
-        assert!(!h.join("shared/wiki/packs").exists(), "empty namespace pruned");
+        assert!(
+            !h.join("shared/wiki/packs").exists(),
+            "empty namespace pruned"
+        );
         assert!(h.join("shared/wiki").exists(), "wiki root survives");
         // The traversal path must NOT delete outside the fence.
         assert!(h.join("secret.txt").exists(), "escape fenced");
@@ -631,9 +638,11 @@ mod tests {
             "escape reported as skipped: {items:?}"
         );
         // Invalid agent id skipped, valid one removed.
-        assert!(items
-            .iter()
-            .any(|i| i.kind == "agent" && i.status == "skipped" && i.name == "Bad Agent!"));
+        assert!(
+            items
+                .iter()
+                .any(|i| i.kind == "agent" && i.status == "skipped" && i.name == "Bad Agent!")
+        );
         // Record dir gone ⇒ list is empty.
         assert!(list_records(h).is_empty());
     }
@@ -664,7 +673,10 @@ mod tests {
         .unwrap();
         let out = apply_hooks_decision(home.path(), "p").await.unwrap();
         assert_eq!(out, HooksApplyOutcome::Disabled);
-        assert!(!hooks_enabled_dir(home.path(), "p").exists(), "never promoted");
+        assert!(
+            !hooks_enabled_dir(home.path(), "p").exists(),
+            "never promoted"
+        );
     }
 
     #[tokio::test]
@@ -696,7 +708,13 @@ mod tests {
         // File an approval and approve it.
         let broker = ApprovalBroker::open(h).unwrap();
         let id = broker
-            .request("p", HOOKS_ACTION_KIND, "enable", serde_json::json!({}), 3600)
+            .request(
+                "p",
+                HOOKS_ACTION_KIND,
+                "enable",
+                serde_json::json!({}),
+                3600,
+            )
             .await
             .unwrap();
         broker.decide(&id, true, "tester").await.unwrap();
@@ -714,7 +732,10 @@ mod tests {
 
         let out = apply_hooks_decision(h, "p").await.unwrap();
         assert_eq!(out, HooksApplyOutcome::Enabled { files: 1 });
-        assert!(hooks_enabled_dir(h, "p").join("pre.sh").is_file(), "promoted");
+        assert!(
+            hooks_enabled_dir(h, "p").join("pre.sh").is_file(),
+            "promoted"
+        );
         assert_eq!(
             read_hooks_state(h, "p").unwrap().status,
             HooksStatus::Enabled
@@ -729,7 +750,13 @@ mod tests {
         std::fs::write(hooks_disabled_dir(h, "p").join("pre.sh"), "echo hi").unwrap();
         let broker = ApprovalBroker::open(h).unwrap();
         let id = broker
-            .request("p", HOOKS_ACTION_KIND, "enable", serde_json::json!({}), 3600)
+            .request(
+                "p",
+                HOOKS_ACTION_KIND,
+                "enable",
+                serde_json::json!({}),
+                3600,
+            )
             .await
             .unwrap();
         broker.decide(&id, false, "tester").await.unwrap();

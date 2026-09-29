@@ -1,5 +1,17 @@
 pub mod bench;
 pub mod code_map;
+pub mod causal;
+pub mod causal_alias;
+pub mod causal_extract;
+pub mod causal_eval;
+pub mod causal_model;
+pub mod causal_effect;
+pub mod causal_effect_eval;
+pub mod causal_identify;
+pub mod causal_negative_control;
+pub mod causal_revision;
+pub mod causal_memory;
+pub mod causal_wiki;
 pub mod decay;
 pub mod embedding;
 pub mod engine;
@@ -12,17 +24,16 @@ pub mod lifecycle;
 pub mod novelty_gate;
 pub mod origin;
 pub mod router;
-pub mod search;
 pub mod sensitivity;
 pub mod trust_store;
 pub mod user_code;
 pub mod user_profile;
 pub mod vector;
 pub mod wiki;
+pub mod wiki_fence;
 
 pub use bench::{graph_rank_bench, GraphBenchReport};
 pub use code_map::{CodeMap, CodeMapConfig, RankedFile, SymbolInfo, SymbolKind};
-pub use embedding::VectorIndex;
 pub use vector::{EmbeddingProvider, NgramHashEmbedder};
 pub use engine::{
     is_system_signal, DecisionResolveOutcome, DecisionView, KeyFact, SqliteMemoryEngine,
@@ -48,6 +59,9 @@ pub use user_profile::{
     consolidate_profile, profile_block, profile_traits, record_trait, ProfileTrait,
 };
 pub use wiki::{serialize_page, SourceType, WikiFts, WikiLayer, WikiPage, WikiStore};
+pub use wiki_fence::{
+    WikiDeliveryFence, WikiDeliveryLease, WikiFenceError, WikiMutationGuard, is_fence_busy,
+};
 
 // ── Night Engine (N3/N4 deterministic memory passes) ──
 pub mod night;

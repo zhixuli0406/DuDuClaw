@@ -44,7 +44,7 @@ use tracing::debug;
 use super::engine::ErrorCategory;
 use super::rule_gate::HeldOutStats;
 use super::rule_lifecycle::{
-    RuleStats, PROBATION_RULE_TAG, SHADOW_RULE_TAG, TASK_RULE_SOURCE_EVENT, TASK_RULE_TAG,
+    PROBATION_RULE_TAG, RuleStats, SHADOW_RULE_TAG, TASK_RULE_SOURCE_EVENT, TASK_RULE_TAG,
 };
 use super::task_forward::{GoalKind, TaskPredictionError};
 use super::task_forward_store::TaskForwardModelConfig;
@@ -97,10 +97,16 @@ pub fn synthesize_task_rule(error: &TaskPredictionError) -> String {
             .map(|c| format!("{c:?}").to_lowercase())
             .collect();
         if !missing.is_empty() {
-            clauses.push(format!("預期使用工具類別「{}」但本輪未使用", missing.join("、")));
+            clauses.push(format!(
+                "預期使用工具類別「{}」但本輪未使用",
+                missing.join("、")
+            ));
         }
         if !extra.is_empty() {
-            clauses.push(format!("額外使用了預期外的工具類別「{}」", extra.join("、")));
+            clauses.push(format!(
+                "額外使用了預期外的工具類別「{}」",
+                extra.join("、")
+            ));
         }
     }
 
@@ -175,7 +181,10 @@ pub async fn maybe_induce_task_rule(
     memory_db_path: &Path,
     error: &TaskPredictionError,
 ) -> Result<Option<String>, String> {
-    if !matches!(error.category, ErrorCategory::Significant | ErrorCategory::Critical) {
+    if !matches!(
+        error.category,
+        ErrorCategory::Significant | ErrorCategory::Critical
+    ) {
         return Ok(None);
     }
 
@@ -199,7 +208,10 @@ pub async fn maybe_induce_task_rule(
     let engine = crate::memory_factory::build_memory_engine(memory_db_path, home_dir)
         .map_err(|e| format!("open memory engine: {e}"))?;
 
-    if let Some(rejection) = engine.check_novelty(agent_id, MemoryLayer::Semantic, &rule).await {
+    if let Some(rejection) = engine
+        .check_novelty(agent_id, MemoryLayer::Semantic, &rule)
+        .await
+    {
         debug!(
             agent_id,
             matched_id = %rejection.matched_id,
@@ -256,8 +268,7 @@ pub async fn maybe_induce_task_rule(
     if held_out_gate_enabled {
         // Seed the prequential birth cursor so the shadow→promotion pass never
         // validates the rule against its own birth batch (train != test).
-        HeldOutStats::born(chrono::Utc::now().timestamp().max(0) as u64)
-            .merge_into(&mut metadata);
+        HeldOutStats::born(chrono::Utc::now().timestamp().max(0) as u64).merge_into(&mut metadata);
     }
 
     let meta = TemporalMeta {
@@ -289,9 +300,9 @@ mod tests {
     use super::*;
     use crate::prediction::metacognition::AdaptiveThresholds;
     use crate::prediction::task_forward::{
-        diff, ArtifactShape, DiffOutcome, ExpectedOutcome, GoalKind, ObservationFidelity,
+        ArtifactShape, DiffOutcome, ExpectedOutcome, GoalKind, ObservationFidelity,
         ObservedOutcome, PredictionSource, RoundPhase, TaskObservation, TaskPrediction,
-        TaskStateKey,
+        TaskStateKey, diff,
     };
     use crate::prediction::tool_class::ToolClass;
     use duduclaw_memory::SqliteMemoryEngine;
@@ -393,7 +404,10 @@ mod tests {
         obs.observed_outcome = ObservedOutcome::Rejected;
         let error = computed(pred, obs);
         let rule = synthesize_task_rule(&error);
-        assert!(rule.contains("預期結果為「accept」但實際為「rejected」"), "rule: {rule}");
+        assert!(
+            rule.contains("預期結果為「accept」但實際為「rejected」"),
+            "rule: {rule}"
+        );
     }
 
     #[test]
@@ -417,7 +431,10 @@ mod tests {
         obs.observed_calls = 999;
         let error = computed(pred, obs);
         let rule = synthesize_task_rule(&error);
-        assert!(rule.starts_with("agent agnes 在 goal_kind coding_simple(phase first)"), "rule: {rule}");
+        assert!(
+            rule.starts_with("agent agnes 在 goal_kind coding_simple(phase first)"),
+            "rule: {rule}"
+        );
     }
 
     // ── maybe_induce_task_rule: gating + write + B1 novelty ──
@@ -443,7 +460,10 @@ mod tests {
         obs.observed_tool_classes = BTreeSet::from([ToolClass::Exec, ToolClass::Net]);
         obs.observed_outcome = ObservedOutcome::Rejected; // forces high composite
         let error = computed(pred, obs);
-        assert!(matches!(error.category, ErrorCategory::Significant | ErrorCategory::Critical));
+        assert!(matches!(
+            error.category,
+            ErrorCategory::Significant | ErrorCategory::Critical
+        ));
 
         let id = maybe_induce_task_rule(&db_path, &error).await.unwrap();
         assert!(id.is_some());
@@ -480,14 +500,21 @@ mod tests {
         obs2.round = 2;
         let error2 = computed(pred2, obs2);
         let second = maybe_induce_task_rule(&db_path, &error2).await.unwrap();
-        assert!(second.is_none(), "B1 novelty gate must reject a near-duplicate induction");
+        assert!(
+            second.is_none(),
+            "B1 novelty gate must reject a near-duplicate induction"
+        );
 
         let engine = SqliteMemoryEngine::new(&db_path).unwrap();
         let rows = engine
             .list_valid_by_source_event("agnes", TASK_RULE_SOURCE_EVENT, 10)
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1, "only the first induction should have been written");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the first induction should have been written"
+        );
     }
 
     /// R2: `[memory] novelty_gate = false` in `<home_dir>/config.toml` must
@@ -502,7 +529,11 @@ mod tests {
     #[tokio::test]
     async fn induce_novelty_gate_disabled_in_config_lets_duplicate_through() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[memory]\nnovelty_gate = false\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[memory]\nnovelty_gate = false\n",
+        )
+        .unwrap();
         let db_path = dir.path().join("memory.db");
         let pred = base_prediction(key());
         let mut obs = base_observation(ObservationFidelity::Full);
@@ -520,7 +551,10 @@ mod tests {
         obs2.round = 2;
         let error2 = computed(pred2, obs2);
         let second = maybe_induce_task_rule(&db_path, &error2).await.unwrap();
-        assert!(second.is_some(), "novelty_gate=false must let a near-duplicate induction through");
+        assert!(
+            second.is_some(),
+            "novelty_gate=false must let a near-duplicate induction through"
+        );
 
         let engine = SqliteMemoryEngine::new(&db_path).unwrap();
         let rows = engine
@@ -555,7 +589,9 @@ mod tests {
         obs_artifact.observed_artifact = ArtifactShape::ExternalEffect;
         obs_artifact.observed_outcome = ObservedOutcome::Escalated;
         let error_artifact = computed(pred2, obs_artifact);
-        let second = maybe_induce_task_rule(&db_path, &error_artifact).await.unwrap();
+        let second = maybe_induce_task_rule(&db_path, &error_artifact)
+            .await
+            .unwrap();
         assert!(
             second.is_some(),
             "a genuinely different deviation for the same state_key must not be blocked \
@@ -568,7 +604,11 @@ mod tests {
             .list_valid_by_source_event("agnes", TASK_RULE_SOURCE_EVENT, 10)
             .await
             .unwrap();
-        assert_eq!(rows.len(), 2, "both distinct-deviation rules must remain valid");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both distinct-deviation rules must remain valid"
+        );
     }
 
     // ── v1.54: shadow birth under the held-out gate ──
@@ -587,22 +627,40 @@ mod tests {
         obs.observed_outcome = ObservedOutcome::Rejected;
         let error = computed(pred, obs);
 
-        let id = maybe_induce_task_rule(&db_path, &error).await.unwrap().unwrap();
+        let id = maybe_induce_task_rule(&db_path, &error)
+            .await
+            .unwrap()
+            .unwrap();
         let engine = SqliteMemoryEngine::new(&db_path).unwrap();
         let entry = engine.get_by_id("agnes", &id).await.unwrap().unwrap();
-        assert!(entry.tags.iter().any(|t| t == SHADOW_RULE_TAG), "born shadow under the gate");
-        assert!(entry.tags.iter().any(|t| t == PROBATION_RULE_TAG), "still on the Janus probation");
         assert!(
-            entry.tags.iter().any(|t| *t == goal_kind_tag(GoalKind::CodingSimple)),
+            entry.tags.iter().any(|t| t == SHADOW_RULE_TAG),
+            "born shadow under the gate"
+        );
+        assert!(
+            entry.tags.iter().any(|t| t == PROBATION_RULE_TAG),
+            "still on the Janus probation"
+        );
+        assert!(
+            entry
+                .tags
+                .iter()
+                .any(|t| *t == goal_kind_tag(GoalKind::CodingSimple)),
             "carries the goal_kind signal used for later shadow→promotion matching"
         );
         let meta = engine.get_metadata("agnes", &id).await.unwrap().unwrap();
         let held = HeldOutStats::from_metadata(&meta);
-        assert!(held.born_seq > 0, "gate-on birth seeds a born_seq for the prequential split");
+        assert!(
+            held.born_seq > 0,
+            "gate-on birth seeds a born_seq for the prequential split"
+        );
 
         // Shadow ⇒ excluded from injection until promoted.
         let sel = super::super::rule_lifecycle::select_task_rules(&engine, "agnes", 5).await;
-        assert!(sel.is_empty(), "a freshly born shadow rule is not injectable");
+        assert!(
+            sel.is_empty(),
+            "a freshly born shadow rule is not injectable"
+        );
     }
 
     #[tokio::test]
@@ -622,16 +680,26 @@ mod tests {
         obs.observed_outcome = ObservedOutcome::Rejected;
         let error = computed(pred, obs);
 
-        let id = maybe_induce_task_rule(&db_path, &error).await.unwrap().unwrap();
+        let id = maybe_induce_task_rule(&db_path, &error)
+            .await
+            .unwrap()
+            .unwrap();
         let engine = SqliteMemoryEngine::new(&db_path).unwrap();
         let entry = engine.get_by_id("agnes", &id).await.unwrap().unwrap();
-        assert!(!entry.tags.iter().any(|t| t == SHADOW_RULE_TAG), "gate off never mints a shadow tag");
+        assert!(
+            !entry.tags.iter().any(|t| t == SHADOW_RULE_TAG),
+            "gate off never mints a shadow tag"
+        );
         let meta = engine.get_metadata("agnes", &id).await.unwrap().unwrap();
         assert!(
             meta.get(HeldOutStats::METADATA_KEY).is_none(),
             "gate off must not seed a held-out record (byte-identical metadata shape)"
         );
         let sel = super::super::rule_lifecycle::select_task_rules(&engine, "agnes", 5).await;
-        assert_eq!(sel.len(), 1, "a non-shadow task rule is immediately injectable");
+        assert_eq!(
+            sel.len(),
+            1,
+            "a non-shadow task rule is immediately injectable"
+        );
     }
 }

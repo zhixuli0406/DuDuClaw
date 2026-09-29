@@ -177,7 +177,9 @@ impl PartitionedSoul {
             }
             if let Some(ref expected_hash) = original.integrity_hash {
                 // Find matching section in current
-                if let Some(current_section) = current.sections.iter().find(|s| s.name == original.name) {
+                if let Some(current_section) =
+                    current.sections.iter().find(|s| s.name == original.name)
+                {
                     let actual_hash = Self::compute_hash(&current_section.content);
                     if actual_hash != *expected_hash {
                         return Err(format!(
@@ -223,7 +225,11 @@ impl PartitionedSoul {
         for header in IDENTITY_HEADERS {
             if lower.starts_with(&header.to_lowercase()) {
                 let name = line[header.len()..].trim().to_string();
-                let name = if name.is_empty() { "identity".to_string() } else { name };
+                let name = if name.is_empty() {
+                    "identity".to_string()
+                } else {
+                    name
+                };
                 return Some((name, SectionMutability::Immutable));
             }
         }
@@ -231,7 +237,11 @@ impl PartitionedSoul {
         for header in BEHAVIOR_HEADERS {
             if lower.starts_with(&header.to_lowercase()) {
                 let name = line[header.len()..].trim().to_string();
-                let name = if name.is_empty() { "behaviors".to_string() } else { name };
+                let name = if name.is_empty() {
+                    "behaviors".to_string()
+                } else {
+                    name
+                };
                 return Some((name, SectionMutability::Evolvable));
             }
         }
@@ -239,7 +249,11 @@ impl PartitionedSoul {
         for header in OBSERVATION_HEADERS {
             if lower.starts_with(&header.to_lowercase()) {
                 let name = line[header.len()..].trim().to_string();
-                let name = if name.is_empty() { "observations".to_string() } else { name };
+                let name = if name.is_empty() {
+                    "observations".to_string()
+                } else {
+                    name
+                };
                 return Some((name, SectionMutability::Observable));
             }
         }
@@ -299,7 +313,9 @@ impl PartitionedSoul {
 
         // Check for language section (optional but recommended)
         let has_language = self.preamble.to_lowercase().contains("language")
-            || section_names.iter().any(|n| n.contains("language") || n.contains("語言"));
+            || section_names
+                .iter()
+                .any(|n| n.contains("language") || n.contains("語言"));
         if !has_language {
             issues.push(
                 "SoulSpec v0.5: recommend adding a ## Language section for multi-language agents"

@@ -35,9 +35,8 @@ const ENTERPRISE_METHODS: &[&str] = &[
     "departments.list",
     "departments.create",
     "departments.remove",
-    "governance.list",
-    "governance.upsert",
-    "governance.remove",
+    // `governance.*` removed 2026-09-29 (feature audit G2) — the Governance
+    // Layer had no enforcer, so the three RPCs and the page went with it.
     "distributor.status",
     "distributor.list",
     "distributor.add",

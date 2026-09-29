@@ -17,8 +17,8 @@
 
 use std::path::{Path, PathBuf};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
@@ -37,7 +37,10 @@ impl RelayDeviceIdentity {
     pub fn from_secret_bytes(secret: [u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(&secret);
         let device_id = derive_device_id(&signing_key.verifying_key());
-        Self { signing_key, device_id }
+        Self {
+            signing_key,
+            device_id,
+        }
     }
 
     /// Load the identity from `path`, generating (and persisting) it on
@@ -58,7 +61,10 @@ impl RelayDeviceIdentity {
                 let identity = generate_and_persist(path)?;
                 Ok((identity, true))
             }
-            Err(e) => Err(format!("讀取 relay 裝置私鑰失敗（{}）：{e}", path.display())),
+            Err(e) => Err(format!(
+                "讀取 relay 裝置私鑰失敗（{}）：{e}",
+                path.display()
+            )),
         }
     }
 
@@ -103,7 +109,10 @@ fn generate_and_persist(path: &Path) -> Result<RelayDeviceIdentity, String> {
     }
     write_key_owner_only(path, &signing_key.to_bytes())?;
     let device_id = derive_device_id(&signing_key.verifying_key());
-    Ok(RelayDeviceIdentity { signing_key, device_id })
+    Ok(RelayDeviceIdentity {
+        signing_key,
+        device_id,
+    })
 }
 
 /// Persist the raw private key so it is **never** briefly world/group-readable.

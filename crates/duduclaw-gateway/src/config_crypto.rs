@@ -51,7 +51,7 @@ fn secret_manager_config_from_table(table: &toml::Table) -> SecretManagerConfig 
 }
 
 /// Load the AES-256 keyfile from `~/.duduclaw/.keyfile`.
-/// Used by GVU encryption, the ObservationFinalizer CLI, and other internal
+/// Used by GVU encryption and other internal
 /// consumers that need to talk to the same VersionStore as the gateway.
 pub fn load_keyfile_public(home_dir: &Path) -> Option<[u8; 32]> {
     load_keyfile(home_dir)
@@ -152,7 +152,9 @@ pub(crate) fn decrypt_value(encrypted: &str, home_dir: &Path) -> Option<String> 
 ///
 /// Decrypt-side helpers stay read-only by design — see [`load_keyfile`].
 pub fn encrypt_value(plaintext: &str, home_dir: &Path) -> Option<String> {
-    if plaintext.is_empty() { return None; }
+    if plaintext.is_empty() {
+        return None;
+    }
     let key = load_or_create_keyfile(home_dir)?;
     let engine = duduclaw_security::crypto::CryptoEngine::new(&key).ok()?;
     engine.encrypt_string(plaintext).ok()
@@ -282,9 +284,11 @@ pub fn validate_channel_token(channel: &str, token: &str) -> Result<String, Stri
     if is_valid_telegram_token(&candidate) {
         Ok(candidate)
     } else {
-        Err("Telegram Bot Token 格式不正確。正確格式是「數字:英數字串」（例如 123456789:AAE...），\
+        Err(
+            "Telegram Bot Token 格式不正確。正確格式是「數字:英數字串」（例如 123456789:AAE...），\
              中間是半形冒號。請從 BotFather 的訊息完整複製後再貼上。"
-            .to_string())
+                .to_string(),
+        )
     }
 }
 
@@ -315,11 +319,7 @@ pub fn config_secret_ref(table: &toml::Table, section: &str, field_base: &str) -
 /// a `_enc` twin. The plaintext is inert for reads (the ciphertext wins) but it
 /// is still a live credential in the file, and until now nothing in the system
 /// could see it.
-pub fn describe_config_field(
-    table: &toml::Table,
-    section: &str,
-    field_base: &str,
-) -> SecretStatus {
+pub fn describe_config_field(table: &toml::Table, section: &str, field_base: &str) -> SecretStatus {
     config_secret_ref(table, section, field_base).describe()
 }
 
@@ -709,18 +709,21 @@ mod telegram_token_tests {
         // Only the FIRST hyphen is the separator; the rest belong to the secret.
         let secret = ["AAExample-", "Example", "Example", "Example-", "XYZ12"].concat();
         let broken = format!("7000000002-{secret}");
-        assert_eq!(repair_telegram_token(&broken), format!("7000000002:{secret}"));
+        assert_eq!(
+            repair_telegram_token(&broken),
+            format!("7000000002:{secret}")
+        );
     }
 
     #[test]
     fn non_token_hyphenated_values_are_never_touched() {
         let slack_token = ["xoxb", "-1234567890-", "abcdefghijklmnopqrst"].concat();
         for s in [
-            "2026-08-04".to_string(),                     // a date
-            "12345-abc".to_string(),                      // too-short secret
-            format!("abc-{}", tg_secret()),               // non-numeric bot id
-            format!("1234-{}", tg_secret()),              // bot id too short
-            slack_token,                                  // a Slack token
+            "2026-08-04".to_string(),        // a date
+            "12345-abc".to_string(),         // too-short secret
+            format!("abc-{}", tg_secret()),  // non-numeric bot id
+            format!("1234-{}", tg_secret()), // bot id too short
+            slack_token,                     // a Slack token
             String::new(),
         ] {
             assert!(
@@ -744,7 +747,10 @@ mod telegram_token_tests {
         assert!(is_valid_telegram_token(&good()));
         assert!(!is_valid_telegram_token(&broken()));
         assert!(!is_valid_telegram_token("123456789:short"));
-        assert!(!is_valid_telegram_token(&format!("abcdefg:{}", tg_secret())));
+        assert!(!is_valid_telegram_token(&format!(
+            "abcdefg:{}",
+            tg_secret()
+        )));
         assert!(!is_valid_telegram_token(""));
     }
 
@@ -775,7 +781,9 @@ mod telegram_token_tests {
     /// through untouched even under the `telegram` channel name.
     #[test]
     fn validation_is_a_no_op_for_non_telegram_channels() {
-        for channel in ["discord", "slack", "line", "whatsapp", "feishu", "wecom", "dingtalk"] {
+        for channel in [
+            "discord", "slack", "line", "whatsapp", "feishu", "wecom", "dingtalk",
+        ] {
             let odd = "9876543210-notATelegramTokenButLooksLikeOne1234";
             assert_eq!(
                 validate_channel_token(channel, odd).unwrap(),
@@ -789,10 +797,9 @@ mod telegram_token_tests {
     fn stored_broken_token_is_repaired_on_read() {
         // A config file that already contains the corrupted value (the customer's
         // situation) must yield a working token without a manual re-save.
-        let table: toml::Table =
-            format!("[channels]\ntelegram_bot_token = \"{}\"\n", broken())
-                .parse()
-                .unwrap();
+        let table: toml::Table = format!("[channels]\ntelegram_bot_token = \"{}\"\n", broken())
+            .parse()
+            .unwrap();
         let home = std::env::temp_dir().join("duduclaw-wp12-nonexistent");
         let got = decrypt_config_field(&table, "channels", "telegram_bot_token", &home);
         assert_eq!(got.map(|s| s.expose_owned()), Some(good()));
@@ -802,8 +809,9 @@ mod telegram_token_tests {
     fn read_repair_is_scoped_to_the_telegram_field() {
         // A Discord/LINE token that happens to look hyphenated must not be
         // rewritten — only `telegram_bot_token` goes through the repair.
-        let table: toml::Table =
-            format!("[channels]\ndiscord_bot_token = \"{}\"\n", broken()).parse().unwrap();
+        let table: toml::Table = format!("[channels]\ndiscord_bot_token = \"{}\"\n", broken())
+            .parse()
+            .unwrap();
         let home = std::env::temp_dir().join("duduclaw-wp12-nonexistent");
         let got = decrypt_config_field(&table, "channels", "discord_bot_token", &home);
         assert_eq!(got.map(|s| s.expose_owned()), Some(broken()));
@@ -817,8 +825,8 @@ mod tests {
     struct TempHome(std::path::PathBuf);
     impl TempHome {
         fn new() -> Self {
-            let p = std::env::temp_dir()
-                .join(format!("duduclaw-cfgcrypto-{}", uuid::Uuid::new_v4()));
+            let p =
+                std::env::temp_dir().join(format!("duduclaw-cfgcrypto-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
         }
@@ -839,21 +847,21 @@ mod tests {
 
     fn agent_toml(name: &str, reports_to: &str, discord_token: Option<&str>) -> String {
         let channels_block = match discord_token {
-            Some(tok) => format!(
-                "\n[channels.discord]\nbot_token = \"{tok}\"\n"
-            ),
+            Some(tok) => format!("\n[channels.discord]\nbot_token = \"{tok}\"\n"),
             None => String::new(),
         };
-        format!(
-            "[agent]\nname = \"{name}\"\nreports_to = \"{reports_to}\"\n{channels_block}"
-        )
+        format!("[agent]\nname = \"{name}\"\nreports_to = \"{reports_to}\"\n{channels_block}")
     }
 
     #[tokio::test]
     async fn resolves_own_token_when_present() {
         let home = TempHome::new();
-        home.write_agent("xianwen-pm", &agent_toml("xianwen-pm", "xianwen-tl", Some("own-token")));
-        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord").await;
+        home.write_agent(
+            "xianwen-pm",
+            &agent_toml("xianwen-pm", "xianwen-tl", Some("own-token")),
+        );
+        let tok =
+            resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord").await;
         assert_eq!(tok.map(|t| t.expose_owned()).as_deref(), Some("own-token"));
     }
 
@@ -863,8 +871,12 @@ mod tests {
         home.write_agent("xianwen-pm", &agent_toml("xianwen-pm", "xianwen-tl", None));
         home.write_agent("xianwen-tl", &agent_toml("xianwen-tl", "agnes", None));
         home.write_agent("agnes", &agent_toml("agnes", "", Some("agnes-bot-token")));
-        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord").await;
-        assert_eq!(tok.map(|t| t.expose_owned()).as_deref(), Some("agnes-bot-token"));
+        let tok =
+            resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord").await;
+        assert_eq!(
+            tok.map(|t| t.expose_owned()).as_deref(),
+            Some("agnes-bot-token")
+        );
     }
 
     #[tokio::test]
@@ -883,9 +895,13 @@ mod tests {
         // Cascade should return xianwen-tl's (the nearest ancestor).
         let home = TempHome::new();
         home.write_agent("xianwen-pm", &agent_toml("xianwen-pm", "xianwen-tl", None));
-        home.write_agent("xianwen-tl", &agent_toml("xianwen-tl", "agnes", Some("tl-token")));
+        home.write_agent(
+            "xianwen-tl",
+            &agent_toml("xianwen-tl", "agnes", Some("tl-token")),
+        );
         home.write_agent("agnes", &agent_toml("agnes", "", Some("agnes-token")));
-        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord").await;
+        let tok =
+            resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord").await;
         assert_eq!(tok.map(|t| t.expose_owned()).as_deref(), Some("tl-token"));
     }
 
@@ -928,7 +944,11 @@ mod tests {
                 .as_deref(),
             Some("tg-tok")
         );
-        assert!(resolve_agent_channel_token_via_reports_to(home.path(), "x", "discord").await.is_none());
+        assert!(
+            resolve_agent_channel_token_via_reports_to(home.path(), "x", "discord")
+                .await
+                .is_none()
+        );
     }
 
     // ─── MED-B: enc-only fields (no plaintext copy) stay readable ──
@@ -955,9 +975,8 @@ mod tests {
     fn empty_plaintext_marks_removed_even_with_stale_enc() {
         let home = TempHome::new();
         let enc = encrypt_value("stale-secret", home.path()).expect("encrypt");
-        let toml_src = format!(
-            "[channels]\nwecom_corp_secret = \"\"\nwecom_corp_secret_enc = \"{enc}\"\n"
-        );
+        let toml_src =
+            format!("[channels]\nwecom_corp_secret = \"\"\nwecom_corp_secret_enc = \"{enc}\"\n");
         let table: toml::Table = toml_src.parse().unwrap();
         assert_eq!(
             decrypt_config_field(&table, "channels", "wecom_corp_secret", home.path())
@@ -1031,8 +1050,8 @@ mod tests {
     fn load_or_create_creates_missing_parent_dir() {
         // If the entire DuDuClaw home dir is absent (very fresh install),
         // the helper must mkdir -p before writing the keyfile.
-        let parent = std::env::temp_dir()
-            .join(format!("duduclaw-keytest-{}", uuid::Uuid::new_v4()));
+        let parent =
+            std::env::temp_dir().join(format!("duduclaw-keytest-{}", uuid::Uuid::new_v4()));
         // parent does NOT yet exist.
         assert!(!parent.exists());
 
@@ -1061,8 +1080,7 @@ mod wp_h1_credentials_doctrine_tests {
     struct TempHome(std::path::PathBuf);
     impl TempHome {
         fn new() -> Self {
-            let p = std::env::temp_dir()
-                .join(format!("duduclaw-wph1-{}", uuid::Uuid::new_v4()));
+            let p = std::env::temp_dir().join(format!("duduclaw-wph1-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
         }
@@ -1117,10 +1135,11 @@ mod wp_h1_credentials_doctrine_tests {
     fn enc_beats_plaintext_and_undecryptable_enc_falls_back() {
         let home = TempHome::new();
         let enc = encrypt_value("winner", home.path()).unwrap();
-        let table: toml::Table =
-            format!("[channels]\ndiscord_bot_token = \"loser\"\ndiscord_bot_token_enc = \"{enc}\"\n")
-                .parse()
-                .unwrap();
+        let table: toml::Table = format!(
+            "[channels]\ndiscord_bot_token = \"loser\"\ndiscord_bot_token_enc = \"{enc}\"\n"
+        )
+        .parse()
+        .unwrap();
         assert_eq!(
             decrypt_config_field(&table, "channels", "discord_bot_token", home.path())
                 .map(|s| s.expose_owned()),
@@ -1144,9 +1163,13 @@ mod wp_h1_credentials_doctrine_tests {
     fn missing_section_and_missing_field_are_unset() {
         let home = TempHome::new();
         let table: toml::Table = "[other]\nx = 1\n".parse().unwrap();
-        assert!(decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none());
+        assert!(
+            decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none()
+        );
         let table: toml::Table = "[channels]\nother_token = \"v\"\n".parse().unwrap();
-        assert!(decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none());
+        assert!(
+            decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none()
+        );
     }
 
     // ─── Equivalence: async file path (incl. env backend) ───────
@@ -1208,8 +1231,9 @@ mod wp_h1_credentials_doctrine_tests {
         let sm_cfg = SecretManagerConfig::default();
 
         // (a) raw config table
-        let table: toml::Table =
-            format!("[channels]\ndiscord_bot_token = \"{reference}\"\n").parse().unwrap();
+        let table: toml::Table = format!("[channels]\ndiscord_bot_token = \"{reference}\"\n")
+            .parse()
+            .unwrap();
         let got = decrypt_config_field(&table, "channels", "discord_bot_token", home.path());
         assert!(got.is_none(), "config field leaked a secret:// literal");
 
@@ -1218,10 +1242,7 @@ mod wp_h1_credentials_doctrine_tests {
         assert!(got.is_none(), "agent token leaked a secret:// literal");
 
         // (c) per-agent channel token + reports_to cascade
-        home.write_agent(
-            "kid",
-            "[agent]\nname = \"kid\"\nreports_to = \"boss\"\n",
-        );
+        home.write_agent("kid", "[agent]\nname = \"kid\"\nreports_to = \"boss\"\n");
         home.write_agent(
             "boss",
             &format!(
@@ -1230,11 +1251,15 @@ mod wp_h1_credentials_doctrine_tests {
             ),
         );
         assert!(
-            read_agent_channel_token(home.path(), "boss", "discord", &sm_cfg).await.is_none(),
+            read_agent_channel_token(home.path(), "boss", "discord", &sm_cfg)
+                .await
+                .is_none(),
             "per-agent token leaked a secret:// literal"
         );
         assert!(
-            resolve_agent_channel_token_via_reports_to(home.path(), "kid", "discord").await.is_none(),
+            resolve_agent_channel_token_via_reports_to(home.path(), "kid", "discord")
+                .await
+                .is_none(),
             "reports_to cascade leaked a secret:// literal"
         );
     }
@@ -1249,14 +1274,15 @@ mod wp_h1_credentials_doctrine_tests {
         let reference = format!("secret://env/{var}");
         let sm_cfg = SecretManagerConfig::default();
 
-        let table: toml::Table =
-            format!("[channels]\ndiscord_bot_token = \"{reference}\"\n").parse().unwrap();
-        let from_config = decrypt_config_field(&table, "channels", "discord_bot_token", home.path())
-            .map(|s| s.expose_owned());
-        let from_agent =
-            resolve_agent_token(&None, &reference, home.path(), &sm_cfg)
-                .await
+        let table: toml::Table = format!("[channels]\ndiscord_bot_token = \"{reference}\"\n")
+            .parse()
+            .unwrap();
+        let from_config =
+            decrypt_config_field(&table, "channels", "discord_bot_token", home.path())
                 .map(|s| s.expose_owned());
+        let from_agent = resolve_agent_token(&None, &reference, home.path(), &sm_cfg)
+            .await
+            .map(|s| s.expose_owned());
 
         home.write_agent(
             "solo",
@@ -1282,10 +1308,20 @@ mod wp_h1_credentials_doctrine_tests {
     async fn empty_inputs_are_none_not_empty_strings() {
         let home = TempHome::new();
         let sm_cfg = SecretManagerConfig::default();
-        assert!(resolve_agent_token(&None, "", home.path(), &sm_cfg).await.is_none());
-        assert!(resolve_agent_token(&Some(String::new()), "", home.path(), &sm_cfg).await.is_none());
+        assert!(
+            resolve_agent_token(&None, "", home.path(), &sm_cfg)
+                .await
+                .is_none()
+        );
+        assert!(
+            resolve_agent_token(&Some(String::new()), "", home.path(), &sm_cfg)
+                .await
+                .is_none()
+        );
         let table: toml::Table = "[channels]\ndiscord_bot_token = \"\"\n".parse().unwrap();
-        assert!(decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none());
+        assert!(
+            decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none()
+        );
     }
 
     /// The typed `agent.toml` structs cannot express "present but blank", so an
@@ -1317,7 +1353,9 @@ mod wp_h1_credentials_doctrine_tests {
             format!("[channels]\ndiscord_bot_token = \"\"\ndiscord_bot_token_enc = \"{enc}\"\n")
                 .parse()
                 .unwrap();
-        assert!(decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none());
+        assert!(
+            decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none()
+        );
     }
 
     // ─── describe(): one dialect, and residue detection ─────────
@@ -1343,8 +1381,9 @@ mod wp_h1_credentials_doctrine_tests {
         assert!(!json.contains("leftover-plaintext") && !json.contains(&enc));
 
         // Clean encrypted-only field: no residue.
-        let table: toml::Table =
-            format!("[channels]\ndiscord_bot_token_enc = \"{enc}\"\n").parse().unwrap();
+        let table: toml::Table = format!("[channels]\ndiscord_bot_token_enc = \"{enc}\"\n")
+            .parse()
+            .unwrap();
         assert!(!describe_config_field(&table, "channels", "discord_bot_token").residue);
 
         // Unset field.
@@ -1353,8 +1392,9 @@ mod wp_h1_credentials_doctrine_tests {
         assert!(!st.configured && st.source == SourceKind::Unset);
 
         // External reference: configured, but not writable from the dashboard.
-        let table: toml::Table =
-            "[channels]\ndiscord_bot_token = \"secret://vault/dc\"\n".parse().unwrap();
+        let table: toml::Table = "[channels]\ndiscord_bot_token = \"secret://vault/dc\"\n"
+            .parse()
+            .unwrap();
         let st = describe_config_field(&table, "channels", "discord_bot_token");
         assert!(st.configured && !st.writable);
         assert_eq!(st.source, SourceKind::Vault);
@@ -1372,16 +1412,18 @@ mod wp_h1_credentials_doctrine_tests {
         let home = TempHome::new();
         let broken = "7000000001-AAExampleExampleExampleExampleXYZ12";
         let fixed = "7000000001:AAExampleExampleExampleExampleXYZ12";
-        let table: toml::Table =
-            format!("[channels]\ntelegram_bot_token = \"{broken}\"\n").parse().unwrap();
+        let table: toml::Table = format!("[channels]\ntelegram_bot_token = \"{broken}\"\n")
+            .parse()
+            .unwrap();
         assert_eq!(
             decrypt_config_field(&table, "channels", "telegram_bot_token", home.path())
                 .map(|s| s.expose_owned()),
             Some(fixed.to_string())
         );
         // …and only for the Telegram field.
-        let table: toml::Table =
-            format!("[channels]\ndiscord_bot_token = \"{broken}\"\n").parse().unwrap();
+        let table: toml::Table = format!("[channels]\ndiscord_bot_token = \"{broken}\"\n")
+            .parse()
+            .unwrap();
         assert_eq!(
             decrypt_config_field(&table, "channels", "discord_bot_token", home.path())
                 .map(|s| s.expose_owned()),

@@ -117,6 +117,10 @@ pub const KNOWN_EVENT_NAMES: &[&str] = &[
     // "prompt_injection, then no operator ack within 5m" is a legitimate
     // temporal pattern for a `sequence` rule.
     "security_event",
+    // G4: Odoo ERP changes (poller + webhook). Legal on both sides — "order
+    // confirmed, then no payment within 7 days" is exactly the shape this
+    // matcher exists for.
+    "odoo_event",
 ];
 
 /// Bounds on `within_secs` — floor rejects a degenerate always-false-window

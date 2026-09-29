@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -143,22 +143,89 @@ fn canvas_builder() -> ammonia::Builder<'static> {
 
     const TAGS: &[&str] = &[
         // Structure / sections
-        "div", "span", "p", "br", "hr", "section", "article", "header", "footer", "main",
-        "aside", "nav", "figure", "figcaption", "details", "summary", "blockquote",
+        "div",
+        "span",
+        "p",
+        "br",
+        "hr",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "main",
+        "aside",
+        "nav",
+        "figure",
+        "figcaption",
+        "details",
+        "summary",
+        "blockquote",
         // Headings
-        "h1", "h2", "h3", "h4", "h5", "h6",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
         // Lists
-        "ul", "ol", "li", "dl", "dt", "dd",
+        "ul",
+        "ol",
+        "li",
+        "dl",
+        "dt",
+        "dd",
         // Inline formatting
-        "strong", "em", "b", "i", "u", "s", "small", "sup", "sub", "mark", "abbr", "cite",
-        "q", "time", "wbr", "kbd", "samp", "var", "code", "pre",
+        "strong",
+        "em",
+        "b",
+        "i",
+        "u",
+        "s",
+        "small",
+        "sup",
+        "sub",
+        "mark",
+        "abbr",
+        "cite",
+        "q",
+        "time",
+        "wbr",
+        "kbd",
+        "samp",
+        "var",
+        "code",
+        "pre",
         // Links / media
-        "a", "img",
+        "a",
+        "img",
         // Tables
-        "table", "caption", "thead", "tbody", "tfoot", "tr", "th", "td", "colgroup", "col",
+        "table",
+        "caption",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "th",
+        "td",
+        "colgroup",
+        "col",
         // Inline SVG (static subset — no use/foreignObject/script/animate)
-        "svg", "g", "path", "circle", "ellipse", "rect", "line", "polyline", "polygon",
-        "text", "tspan", "defs", "linearGradient", "radialGradient", "stop", "desc",
+        "svg",
+        "g",
+        "path",
+        "circle",
+        "ellipse",
+        "rect",
+        "line",
+        "polyline",
+        "polygon",
+        "text",
+        "tspan",
+        "defs",
+        "linearGradient",
+        "radialGradient",
+        "stop",
+        "desc",
     ];
 
     // SVG presentation + geometry attributes are allowed generically: they are
@@ -169,22 +236,72 @@ fn canvas_builder() -> ammonia::Builder<'static> {
     // safer than silently dropping `viewBox`.
     const GENERIC_ATTRS: &[&str] = &[
         // HTML generics
-        "style", "class", "id", "title", "dir", "lang", "role",
+        "style",
+        "class",
+        "id",
+        "title",
+        "dir",
+        "lang",
+        "role",
         // SVG geometry
-        "d", "cx", "cy", "r", "rx", "ry", "x", "y", "x1", "y1", "x2", "y2", "dx", "dy",
-        "width", "height", "points", "offset", "transform", "viewbox", "viewBox",
-        "preserveaspectratio", "preserveAspectRatio", "pathlength", "pathLength", "xmlns",
+        "d",
+        "cx",
+        "cy",
+        "r",
+        "rx",
+        "ry",
+        "x",
+        "y",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "dx",
+        "dy",
+        "width",
+        "height",
+        "points",
+        "offset",
+        "transform",
+        "viewbox",
+        "viewBox",
+        "preserveaspectratio",
+        "preserveAspectRatio",
+        "pathlength",
+        "pathLength",
+        "xmlns",
         // SVG presentation
-        "fill", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin",
-        "stroke-dasharray", "stroke-dashoffset", "stroke-opacity", "fill-opacity",
-        "fill-rule", "opacity", "stop-color", "stop-opacity", "gradientunits",
-        "gradientUnits", "gradienttransform", "gradientTransform", "text-anchor",
-        "dominant-baseline", "font-size", "font-family", "font-weight", "vector-effect",
+        "fill",
+        "stroke",
+        "stroke-width",
+        "stroke-linecap",
+        "stroke-linejoin",
+        "stroke-dasharray",
+        "stroke-dashoffset",
+        "stroke-opacity",
+        "fill-opacity",
+        "fill-rule",
+        "opacity",
+        "stop-color",
+        "stop-opacity",
+        "gradientunits",
+        "gradientUnits",
+        "gradienttransform",
+        "gradientTransform",
+        "text-anchor",
+        "dominant-baseline",
+        "font-size",
+        "font-family",
+        "font-weight",
+        "vector-effect",
     ];
 
     let mut tag_attributes: HashMap<&str, HashSet<&str>> = HashMap::new();
     tag_attributes.insert("a", ["href"].into_iter().collect());
-    tag_attributes.insert("img", ["src", "alt", "width", "height"].into_iter().collect());
+    tag_attributes.insert(
+        "img",
+        ["src", "alt", "width", "height"].into_iter().collect(),
+    );
     tag_attributes.insert("th", ["colspan", "rowspan", "scope"].into_iter().collect());
     tag_attributes.insert("td", ["colspan", "rowspan"].into_iter().collect());
     tag_attributes.insert("ol", ["start", "type", "reversed"].into_iter().collect());
@@ -263,7 +380,10 @@ impl CanvasStore {
         if !existed {
             info!(?db_path, "CanvasStore initialized");
         }
-        Ok(Self { conn: tokio::sync::Mutex::new(conn), db_path })
+        Ok(Self {
+            conn: tokio::sync::Mutex::new(conn),
+            db_path,
+        })
     }
 
     fn init_schema(conn: &Connection) -> Result<(), String> {
@@ -356,11 +476,7 @@ impl CanvasStore {
 
     /// One specific retained version (agent-scoped so a caller can never read
     /// another agent's version by guessing seq numbers).
-    pub async fn get_version(
-        &self,
-        agent_id: &str,
-        seq: i64,
-    ) -> Result<Option<CanvasRow>, String> {
+    pub async fn get_version(&self, agent_id: &str, seq: i64) -> Result<Option<CanvasRow>, String> {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT seq, agent_id, title, html, updated_at FROM canvas
@@ -412,7 +528,9 @@ impl CanvasStore {
             .prepare("SELECT seq, agent_id FROM canvas WHERE seq > ?1 ORDER BY seq ASC")
             .map_err(|e| format!("prepare canvas versions_after: {e}"))?;
         let rows = stmt
-            .query_map(params![after_seq], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .query_map(params![after_seq], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(|e| format!("query canvas versions_after: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect canvas versions_after: {e}"))?;
@@ -514,7 +632,10 @@ mod tests {
         )
         .unwrap();
         assert!(!out.contains("<script"), "got: {out}");
-        assert!(!out.contains("alert(1)"), "script content must be removed, got: {out}");
+        assert!(
+            !out.contains("alert(1)"),
+            "script content must be removed, got: {out}"
+        );
         assert!(out.contains("<h1>報表</h1>"), "got: {out}");
         assert!(out.contains("<strong>NT$12,000</strong>"), "got: {out}");
     }
@@ -526,7 +647,10 @@ mod tests {
         )
         .unwrap();
         assert!(!out.contains("onerror"), "got: {out}");
-        assert!(out.contains(r#"src="https://example.com/a.png""#), "got: {out}");
+        assert!(
+            out.contains(r#"src="https://example.com/a.png""#),
+            "got: {out}"
+        );
         assert!(out.contains(r#"alt="chart""#), "got: {out}");
     }
 
@@ -549,9 +673,15 @@ mod tests {
         )
         .unwrap();
         for banned in ["<iframe", "<object", "<embed", "<form", "<input", "action="] {
-            assert!(!out.contains(banned), "{banned} must be stripped, got: {out}");
+            assert!(
+                !out.contains(banned),
+                "{banned} must be stripped, got: {out}"
+            );
         }
-        assert!(out.contains("<p>before</p>") && out.contains("<p>after</p>"), "got: {out}");
+        assert!(
+            out.contains("<p>before</p>") && out.contains("<p>after</p>"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -560,8 +690,14 @@ mod tests {
             r#"<div onclick="x()" onmouseover="y()" style="color:red" class="k">hi</div>"#,
         )
         .unwrap();
-        assert!(!out.contains("onclick") && !out.contains("onmouseover"), "got: {out}");
-        assert!(out.contains(r#"style="color:red""#), "style attr allowed, got: {out}");
+        assert!(
+            !out.contains("onclick") && !out.contains("onmouseover"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains(r#"style="color:red""#),
+            "style attr allowed, got: {out}"
+        );
         assert!(out.contains(r#"class="k""#), "got: {out}");
     }
 
@@ -572,7 +708,10 @@ mod tests {
                <svg viewBox="0 0 10 10" width="100"><rect x="1" y="1" width="8" height="8" fill="#f59e0b"/></svg>"##,
         )
         .unwrap();
-        assert!(out.contains("<table") && out.contains(r#"colspan="2""#), "got: {out}");
+        assert!(
+            out.contains("<table") && out.contains(r#"colspan="2""#),
+            "got: {out}"
+        );
         assert!(out.contains("<svg") && out.contains("<rect"), "got: {out}");
         assert!(out.contains(r##"fill="#f59e0b""##), "got: {out}");
     }
@@ -583,7 +722,10 @@ mod tests {
             r#"<svg><use href="https://evil/x.svg#p"/><foreignObject><body onload="x()"></body></foreignObject><circle cx="5" cy="5" r="4"/></svg>"#,
         )
         .unwrap();
-        assert!(!out.contains("<use") && !out.to_lowercase().contains("foreignobject"), "got: {out}");
+        assert!(
+            !out.contains("<use") && !out.to_lowercase().contains("foreignobject"),
+            "got: {out}"
+        );
         assert!(!out.contains("onload"), "got: {out}");
         assert!(out.contains("<circle"), "got: {out}");
     }
@@ -607,7 +749,10 @@ mod tests {
         )
         .unwrap();
         assert!(!out.contains("data:text/html"), "got: {out}");
-        assert!(!out.contains("/relative.png"), "relative URLs denied, got: {out}");
+        assert!(
+            !out.contains("/relative.png"),
+            "relative URLs denied, got: {out}"
+        );
     }
 
     #[test]
@@ -636,7 +781,10 @@ mod tests {
         let out =
             sanitize_canvas_html("<style>body{background:url(https://evil/x)}</style><p>ok</p>")
                 .unwrap();
-        assert!(!out.contains("<style") && !out.contains("background:url"), "got: {out}");
+        assert!(
+            !out.contains("<style") && !out.contains("background:url"),
+            "got: {out}"
+        );
         assert!(out.contains("<p>ok</p>"), "got: {out}");
     }
 
@@ -664,12 +812,24 @@ mod tests {
         let home = tmp_home();
         let store = CanvasStore::open(home.path()).unwrap();
         let row = store
-            .push("agnes", "t", "<p>ok</p><script>document.location='https://evil'</script>")
+            .push(
+                "agnes",
+                "t",
+                "<p>ok</p><script>document.location='https://evil'</script>",
+            )
             .await
             .unwrap();
-        assert!(!row.html.contains("script"), "stored html must be sanitized: {}", row.html);
+        assert!(
+            !row.html.contains("script"),
+            "stored html must be sanitized: {}",
+            row.html
+        );
         let cur = store.current("agnes").await.unwrap().unwrap();
-        assert!(!cur.html.contains("script"), "read-back must be sanitized: {}", cur.html);
+        assert!(
+            !cur.html.contains("script"),
+            "read-back must be sanitized: {}",
+            cur.html
+        );
     }
 
     #[tokio::test]
@@ -678,7 +838,10 @@ mod tests {
         let store = CanvasStore::open(home.path()).unwrap();
         let big = format!("<p>{}</p>", "x".repeat(MAX_CANVAS_BYTES + 1));
         assert!(store.push("agnes", "t", &big).await.is_err());
-        assert!(store.current("agnes").await.unwrap().is_none(), "fail-closed: no row stored");
+        assert!(
+            store.current("agnes").await.unwrap().is_none(),
+            "fail-closed: no row stored"
+        );
     }
 
     #[tokio::test]
@@ -686,7 +849,10 @@ mod tests {
         let home = tmp_home();
         let store = CanvasStore::open(home.path()).unwrap();
         for i in 0..(HISTORY_KEEP + 3) {
-            store.push("agnes", &format!("v{i}"), &format!("<p>v{i}</p>")).await.unwrap();
+            store
+                .push("agnes", &format!("v{i}"), &format!("<p>v{i}</p>"))
+                .await
+                .unwrap();
         }
         let hist = store.history("agnes").await.unwrap();
         assert_eq!(hist.len(), HISTORY_KEEP);
@@ -695,7 +861,13 @@ mod tests {
         assert_eq!(hist[hist.len() - 1].title, "v3");
         // Trimmed versions are really gone.
         let oldest_seq = hist[hist.len() - 1].seq;
-        assert!(store.get_version("agnes", oldest_seq - 1).await.unwrap().is_none());
+        assert!(
+            store
+                .get_version("agnes", oldest_seq - 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -744,7 +916,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let home = tmp_home();
         let _store = CanvasStore::open(home.path()).unwrap();
-        let mode = std::fs::metadata(home.path().join("canvas.db")).unwrap().permissions().mode()
+        let mode = std::fs::metadata(home.path().join("canvas.db"))
+            .unwrap()
+            .permissions()
+            .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "canvas.db must be owner-only, got {mode:o}");
     }

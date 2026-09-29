@@ -130,10 +130,7 @@ async fn test(home_dir: &Path, params: Value) -> WsFrame {
                 entry: entry.clone(),
             },
             None => {
-                return WsFrame::error_response(
-                    "",
-                    &unknown_source_message(&name, &loaded),
-                );
+                return WsFrame::error_response("", &unknown_source_message(&name, &loaded));
             }
         }
     };
@@ -307,7 +304,11 @@ async fn build_candidate(
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .or_else(|| existing.and_then(|t| t.get("driver")).and_then(|v| v.as_str()))
+        .or_else(|| {
+            existing
+                .and_then(|t| t.get("driver"))
+                .and_then(|v| v.as_str())
+        })
         .ok_or_else(|| "缺少 driver 參數（postgres / mysql / sqlite）".to_string())?;
     let driver = Driver::parse(driver_raw)
         .ok_or_else(|| format!("driver「{driver_raw}」不支援，只接受 postgres / mysql / sqlite"))?;
@@ -354,9 +355,7 @@ async fn build_candidate(
     match (secret_ref, literal_url) {
         (Some(reference), _) => {
             if !reference.starts_with("secret://") {
-                return Err(
-                    "url_secret_ref 必須是 secret://<backend>/<name> 形式的參照".into(),
-                );
+                return Err("url_secret_ref 必須是 secret://<backend>/<name> 形式的參照".into());
             }
             block.insert("url".into(), toml::Value::String(reference.to_string()));
         }
@@ -451,10 +450,11 @@ async fn build_candidate(
     );
 
     // ── caps ────────────────────────────────────────────────────────────
-    let max_rows = params
-        .get("max_rows")
-        .and_then(|v| v.as_i64())
-        .or_else(|| existing.and_then(|t| t.get("max_rows")).and_then(|v| v.as_integer()));
+    let max_rows = params.get("max_rows").and_then(|v| v.as_i64()).or_else(|| {
+        existing
+            .and_then(|t| t.get("max_rows"))
+            .and_then(|v| v.as_integer())
+    });
     block.insert(
         "max_rows".into(),
         toml::Value::Integer(clamp_max_rows(max_rows) as i64),
@@ -512,7 +512,9 @@ async fn probe(home_dir: &Path, candidate: &Candidate) -> Result<Vec<Value>, Str
     }
     let listed = src.list_tables().await;
     src.close().await;
-    listed.map(|t| tables_json(&t)).map_err(|e| scrub_db_error(&e))
+    listed
+        .map(|t| tables_json(&t))
+        .map_err(|e| scrub_db_error(&e))
 }
 
 fn tables_json(tables: &[duduclaw_db::TableInfo]) -> Vec<Value> {
@@ -543,9 +545,7 @@ async fn read_config_doc(path: &Path) -> Result<toml_edit::DocumentMut, String> 
         Ok(content) => content
             .parse::<toml_edit::DocumentMut>()
             .map_err(|e| format!("設定檔解析失敗，拒絕覆寫：{e}")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(toml_edit::DocumentMut::new())
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
         Err(e) => Err(format!("設定檔讀取失敗：{e}")),
     }
 }
@@ -774,7 +774,10 @@ mod tests {
         assert!(out.to_string().contains("\"success\":true"), "{out}");
         let text = config_text(dir.path());
         assert!(text.contains("url_enc"), "{text}");
-        assert!(!text.contains("hunter2"), "plaintext DSN must not hit disk: {text}");
+        assert!(
+            !text.contains("hunter2"),
+            "plaintext DSN must not hit disk: {text}"
+        );
     }
 
     #[tokio::test]
@@ -794,20 +797,44 @@ mod tests {
         assert!(out.to_string().contains("\"success\":true"), "{out}");
         let text = config_text(dir.path());
         assert!(text.contains("secret://vault/crm-dsn"), "{text}");
-        assert!(!text.contains("url_enc"), "a reference must not be encrypted: {text}");
+        assert!(
+            !text.contains("url_enc"),
+            "a reference must not be encrypted: {text}"
+        );
     }
 
     #[tokio::test]
     async fn upsert_rejects_bad_input() {
         let dir = tempfile::tempdir().unwrap();
         for (label, params) in [
-            ("bad name", json!({ "name": "Bad-Name", "driver": "sqlite", "url": "/tmp/x", "allowed_tables": ["t"] })),
-            ("unknown driver", json!({ "name": "a", "driver": "oracle", "url": "/tmp/x", "allowed_tables": ["t"] })),
-            ("no credential", json!({ "name": "a", "driver": "sqlite", "allowed_tables": ["t"] })),
-            ("empty allowlist", json!({ "name": "a", "driver": "sqlite", "url": "/tmp/x", "allowed_tables": [] })),
-            ("injection table", json!({ "name": "a", "driver": "sqlite", "url": "/tmp/x", "allowed_tables": ["t; DROP TABLE x"] })),
-            ("both url forms", json!({ "name": "a", "driver": "sqlite", "url": "/tmp/x", "url_secret_ref": "secret://env/X", "allowed_tables": ["t"] })),
-            ("bogus reference", json!({ "name": "a", "driver": "postgres", "url_secret_ref": "not-a-reference", "allowed_tables": ["t"] })),
+            (
+                "bad name",
+                json!({ "name": "Bad-Name", "driver": "sqlite", "url": "/tmp/x", "allowed_tables": ["t"] }),
+            ),
+            (
+                "unknown driver",
+                json!({ "name": "a", "driver": "oracle", "url": "/tmp/x", "allowed_tables": ["t"] }),
+            ),
+            (
+                "no credential",
+                json!({ "name": "a", "driver": "sqlite", "allowed_tables": ["t"] }),
+            ),
+            (
+                "empty allowlist",
+                json!({ "name": "a", "driver": "sqlite", "url": "/tmp/x", "allowed_tables": [] }),
+            ),
+            (
+                "injection table",
+                json!({ "name": "a", "driver": "sqlite", "url": "/tmp/x", "allowed_tables": ["t; DROP TABLE x"] }),
+            ),
+            (
+                "both url forms",
+                json!({ "name": "a", "driver": "sqlite", "url": "/tmp/x", "url_secret_ref": "secret://env/X", "allowed_tables": ["t"] }),
+            ),
+            (
+                "bogus reference",
+                json!({ "name": "a", "driver": "postgres", "url_secret_ref": "not-a-reference", "allowed_tables": ["t"] }),
+            ),
         ] {
             let out = upsert_ok(dir.path(), params).await;
             assert!(
@@ -910,7 +937,14 @@ mod tests {
             "[settings]\nfoo = 1\n\n[db_sources.a]\ndriver = \"sqlite\"\nurl = \"/tmp/a\"\nallowed_tables = [\"t\"]\n\n[db_sources.b]\ndriver = \"sqlite\"\nurl = \"/tmp/b\"\nallowed_tables = [\"t\"]\n",
         )
         .unwrap();
-        let out = frame_payload(&remove(&empty_registry(dir.path()), dir.path(), json!({ "name": "a" })).await);
+        let out = frame_payload(
+            &remove(
+                &empty_registry(dir.path()),
+                dir.path(),
+                json!({ "name": "a" }),
+            )
+            .await,
+        );
         assert!(out.to_string().contains("\"success\":true"), "{out}");
         let loaded = duduclaw_db::load_db_sources(dir.path()).await;
         assert_eq!(loaded.names(), vec!["b".to_string()]);
@@ -920,8 +954,14 @@ mod tests {
     #[tokio::test]
     async fn remove_reports_a_missing_source() {
         let dir = tempfile::tempdir().unwrap();
-        let out =
-            frame_payload(&remove(&empty_registry(dir.path()), dir.path(), json!({ "name": "nope" })).await);
+        let out = frame_payload(
+            &remove(
+                &empty_registry(dir.path()),
+                dir.path(),
+                json!({ "name": "nope" }),
+            )
+            .await,
+        );
         assert!(out.to_string().contains("不存在"), "{out}");
     }
 
@@ -946,7 +986,10 @@ mod tests {
         );
         assert!(out.to_string().contains("\"success\":true"), "{out}");
         assert!(out.to_string().contains("customers"), "{out}");
-        assert!(!dir.path().join("config.toml").exists(), "test must not write");
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "test must not write"
+        );
 
         // Stored mode, via db_sources.tables.
         upsert_ok(
@@ -1049,7 +1092,10 @@ mod tests {
             )
             .await,
         );
-        assert!(out.to_string().contains("Unknown db_sources method"), "{out}");
+        assert!(
+            out.to_string().contains("Unknown db_sources method"),
+            "{out}"
+        );
     }
 
     #[test]

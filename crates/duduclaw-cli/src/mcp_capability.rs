@@ -20,15 +20,15 @@
 // returned by negotiate_capabilities — so every response carries the standard DuDuClaw
 // headers (ADR-002 §3.1).
 
+use axum::Json;
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
 use crate::mcp_headers::{
-    build_capabilities_header, build_missing_capabilities_header, validate_client_capabilities,
-    API_VERSION,
+    API_VERSION, build_capabilities_header, build_missing_capabilities_header,
+    validate_client_capabilities,
 };
 
 // ── Header name constants ─────────────────────────────────────────────────────
@@ -100,10 +100,7 @@ pub async fn inject_capability_headers(request: Request<Body>, next: Next) -> Re
 /// (outer) can append standard DuDuClaw headers to the 422 response as well.
 pub async fn negotiate_capabilities(request: Request<Body>, next: Next) -> Response {
     // Clone the header value before consuming the request
-    let client_cap_header = request
-        .headers()
-        .get(HDR_CAPABILITIES)
-        .cloned();
+    let client_cap_header = request.headers().get(HDR_CAPABILITIES).cloned();
 
     match validate_client_capabilities(client_cap_header.as_ref()) {
         Ok(()) => {
@@ -125,8 +122,7 @@ pub async fn negotiate_capabilities(request: Request<Body>, next: Next) -> Respo
                 })).collect::<Vec<_>>(),
             });
 
-            let mut response =
-                (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
+            let mut response = (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
 
             // Attach x-duduclaw-missing-capabilities to the 422 response.
             // The standard x-duduclaw-version + x-duduclaw-capabilities headers will be
@@ -147,12 +143,12 @@ pub async fn negotiate_capabilities(request: Request<Body>, next: Next) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::middleware;
     use axum::response::IntoResponse;
     use axum::routing::get;
-    use axum::Router;
     use tower::ServiceExt; // provides Router::oneshot
 
     // ── Test router helpers ───────────────────────────────────────────────────
@@ -168,7 +164,7 @@ mod tests {
 
         Router::new()
             .route("/", get(ok_handler))
-            .layer(middleware::from_fn(negotiate_capabilities))   // inner
+            .layer(middleware::from_fn(negotiate_capabilities)) // inner
             .layer(middleware::from_fn(inject_capability_headers)) // outer
     }
 
@@ -192,28 +188,51 @@ mod tests {
     async fn response_always_has_version_header() {
         let resp = test_router().oneshot(get_root()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let version = resp.headers().get(HDR_VERSION).expect("x-duduclaw-version must be present");
+        let version = resp
+            .headers()
+            .get(HDR_VERSION)
+            .expect("x-duduclaw-version must be present");
         assert_eq!(version.to_str().unwrap(), "1.2");
     }
 
     #[tokio::test]
     async fn response_always_has_capabilities_header() {
         let resp = test_router().oneshot(get_root()).await.unwrap();
-        let caps = resp.headers().get(HDR_CAPABILITIES)
+        let caps = resp
+            .headers()
+            .get(HDR_CAPABILITIES)
             .expect("x-duduclaw-capabilities must be present");
         let caps_str = caps.to_str().unwrap();
-        assert!(caps_str.starts_with("memory/"), "memory must be first cap: {caps_str}");
+        assert!(
+            caps_str.starts_with("memory/"),
+            "memory must be first cap: {caps_str}"
+        );
     }
 
     #[tokio::test]
     async fn response_capabilities_header_reflects_registry() {
         let resp = test_router().oneshot(get_root()).await.unwrap();
         let caps = resp.headers()[HDR_CAPABILITIES].to_str().unwrap();
-        assert!(caps.contains("mcp/2"),    "mcp/2 must be in capabilities: {caps}");
-        assert!(caps.contains("wiki/1"),   "wiki/1 must be in capabilities: {caps}");
-        assert!(caps.contains("audit/2"),  "audit/2 must be in capabilities: {caps}");
-        assert!(!caps.contains("a2a/"),    "disabled a2a must not appear: {caps}");
-        assert!(!caps.contains("secret-manager/"), "disabled secret-manager must not appear: {caps}");
+        assert!(
+            caps.contains("mcp/2"),
+            "mcp/2 must be in capabilities: {caps}"
+        );
+        assert!(
+            caps.contains("wiki/1"),
+            "wiki/1 must be in capabilities: {caps}"
+        );
+        assert!(
+            caps.contains("audit/2"),
+            "audit/2 must be in capabilities: {caps}"
+        );
+        assert!(
+            !caps.contains("a2a/"),
+            "disabled a2a must not appear: {caps}"
+        );
+        assert!(
+            !caps.contains("secret-manager/"),
+            "disabled secret-manager must not appear: {caps}"
+        );
     }
 
     // ── negotiate_capabilities pass-through tests ─────────────────────────────
@@ -228,7 +247,10 @@ mod tests {
     #[tokio::test]
     async fn satisfied_capability_header_returns_200() {
         // mcp/2 and memory/3 are both enabled at the exact required versions
-        let resp = test_router().oneshot(get_with_caps("mcp/2,memory/3")).await.unwrap();
+        let resp = test_router()
+            .oneshot(get_with_caps("mcp/2,memory/3"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -251,7 +273,10 @@ mod tests {
     #[tokio::test]
     async fn version_too_high_returns_422() {
         // mcp is at /2; client requires /99 → 422
-        let resp = test_router().oneshot(get_with_caps("mcp/99")).await.unwrap();
+        let resp = test_router()
+            .oneshot(get_with_caps("mcp/99"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -269,8 +294,14 @@ mod tests {
             .get(HDR_MISSING_CAPABILITIES)
             .expect("x-duduclaw-missing-capabilities must be present on 422");
         let missing_str = missing_hdr.to_str().unwrap();
-        assert!(missing_str.contains("a2a/1"),           "a2a/1 must be in missing: {missing_str}");
-        assert!(missing_str.contains("secret-manager/1"), "secret-manager/1 must be in missing: {missing_str}");
+        assert!(
+            missing_str.contains("a2a/1"),
+            "a2a/1 must be in missing: {missing_str}"
+        );
+        assert!(
+            missing_str.contains("secret-manager/1"),
+            "secret-manager/1 must be in missing: {missing_str}"
+        );
     }
 
     #[tokio::test]
@@ -298,7 +329,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         let missing_str = resp.headers()[HDR_MISSING_CAPABILITIES].to_str().unwrap();
-        assert!(missing_str.contains("a2a/1"), "only a2a should be missing: {missing_str}");
-        assert!(!missing_str.contains("memory"), "satisfied memory must not appear in missing: {missing_str}");
+        assert!(
+            missing_str.contains("a2a/1"),
+            "only a2a should be missing: {missing_str}"
+        );
+        assert!(
+            !missing_str.contains("memory"),
+            "satisfied memory must not appear in missing: {missing_str}"
+        );
     }
 }

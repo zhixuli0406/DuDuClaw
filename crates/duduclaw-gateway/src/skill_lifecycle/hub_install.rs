@@ -314,9 +314,15 @@ mod tests {
             trust_floor: TrustTier::Active,
             source_verdict: Some("clean".into()),
         };
-        assert!(g.requires_sandbox_trial(), "community source ⇒ sandbox trial");
+        assert!(
+            g.requires_sandbox_trial(),
+            "community source ⇒ sandbox trial"
+        );
         g.trust_floor = TrustTier::Official;
-        assert!(!g.requires_sandbox_trial(), "official first-party ⇒ trusted");
+        assert!(
+            !g.requires_sandbox_trial(),
+            "official first-party ⇒ trusted"
+        );
     }
 
     // ── Fail-closed #3: unknown hub id denies ────────────────

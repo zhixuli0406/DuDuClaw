@@ -88,9 +88,17 @@ pub struct ConversationCoords<'a> {
 /// all) or an unrecognised channel string.
 pub fn conversation_link(channel: &str, coords: &ConversationCoords<'_>) -> Option<String> {
     match channel {
-        "telegram" => telegram_link(coords.telegram_bot_username, coords.chat_id, coords.message_id),
+        "telegram" => telegram_link(
+            coords.telegram_bot_username,
+            coords.chat_id,
+            coords.message_id,
+        ),
         "discord" => discord_link(coords.discord_guild_id, coords.chat_id, coords.message_id),
-        "slack" => slack_link(coords.slack_workspace_domain, coords.chat_id, coords.message_id),
+        "slack" => slack_link(
+            coords.slack_workspace_domain,
+            coords.chat_id,
+            coords.message_id,
+        ),
         "teams" => teams_link(
             coords.teams_group_id,
             Some(coords.chat_id),
@@ -117,7 +125,11 @@ pub fn conversation_link(channel: &str, coords: &ConversationCoords<'_>) -> Opti
 /// - **Plain basic group** (negative, not `-100`-prefixed): no permalink
 ///   mechanism exists at all (only supergroups/channels have the internal
 ///   numeric id space `t.me/c/` addresses) → `None`.
-pub fn telegram_link(bot_username: Option<&str>, chat_id: &str, message_id: Option<&str>) -> Option<String> {
+pub fn telegram_link(
+    bot_username: Option<&str>,
+    chat_id: &str,
+    message_id: Option<&str>,
+) -> Option<String> {
     let id: i64 = chat_id.trim().parse().ok()?;
     if id > 0 {
         let username = bot_username.map(str::trim).filter(|s| !s.is_empty())?;
@@ -139,14 +151,20 @@ pub fn telegram_link(bot_username: Option<&str>, chat_id: &str, message_id: Opti
 /// `None` in production until that's wired up). Falls back to a
 /// channel-level link (still lands the operator in the right conversation)
 /// when no message id is available.
-pub fn discord_link(guild_id: Option<&str>, channel_id: &str, message_id: Option<&str>) -> Option<String> {
+pub fn discord_link(
+    guild_id: Option<&str>,
+    channel_id: &str,
+    message_id: Option<&str>,
+) -> Option<String> {
     let guild = guild_id.map(str::trim).filter(|s| !s.is_empty())?;
     let channel = channel_id.trim();
     if channel.is_empty() {
         return None;
     }
     match message_id.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(msg) => Some(format!("https://discord.com/channels/{guild}/{channel}/{msg}")),
+        Some(msg) => Some(format!(
+            "https://discord.com/channels/{guild}/{channel}/{msg}"
+        )),
         None => Some(format!("https://discord.com/channels/{guild}/{channel}")),
     }
 }
@@ -158,7 +176,11 @@ pub fn discord_link(guild_id: Option<&str>, channel_id: &str, message_id: Option
 /// to a channel-level link when no message timestamp is available; a
 /// malformed (non-numeric-with-one-dot) `message_ts` also degrades to the
 /// channel-level link rather than emitting a broken permalink.
-pub fn slack_link(workspace_domain: Option<&str>, channel_id: &str, message_ts: Option<&str>) -> Option<String> {
+pub fn slack_link(
+    workspace_domain: Option<&str>,
+    channel_id: &str,
+    message_ts: Option<&str>,
+) -> Option<String> {
     let domain = workspace_domain.map(str::trim).filter(|s| !s.is_empty())?;
     let channel = channel_id.trim();
     if channel.is_empty() {
@@ -232,7 +254,9 @@ fn percent_encode_path_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(*b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -284,7 +308,11 @@ pub(crate) fn record_slack_workspace_domain(home_dir: &Path, domain: &str) {
 fn read_slack_workspace_domain(home_dir: &Path) -> Option<String> {
     let bytes = std::fs::read(slack_workspace_store_path(home_dir)).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value.get("domain").and_then(|v| v.as_str()).map(str::to_string).filter(|s| !s.is_empty())
+    value
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
 }
 
 // ── Telegram bot username: cached resolution ────────────────────────────
@@ -365,9 +393,16 @@ pub async fn resolve_conversation_link(
     } else {
         None
     };
-    let slack_workspace_domain =
-        if channel == "slack" { read_slack_workspace_domain(home_dir) } else { None };
-    let teams_ref = if channel == "teams" { crate::msteams::lookup_conversation_ref(home_dir, chat_id) } else { None };
+    let slack_workspace_domain = if channel == "slack" {
+        read_slack_workspace_domain(home_dir)
+    } else {
+        None
+    };
+    let teams_ref = if channel == "teams" {
+        crate::msteams::lookup_conversation_ref(home_dir, chat_id)
+    } else {
+        None
+    };
     let coords = ConversationCoords {
         chat_id,
         message_id,
@@ -375,8 +410,12 @@ pub async fn resolve_conversation_link(
         discord_guild_id,
         slack_workspace_domain: slack_workspace_domain.as_deref(),
         teams_group_id: teams_ref.as_ref().and_then(|r| r.teams_group_id.as_deref()),
-        teams_channel_name: teams_ref.as_ref().and_then(|r| r.teams_channel_name.as_deref()),
-        teams_tenant_id: teams_ref.as_ref().and_then(|r| r.teams_tenant_id.as_deref()),
+        teams_channel_name: teams_ref
+            .as_ref()
+            .and_then(|r| r.teams_channel_name.as_deref()),
+        teams_tenant_id: teams_ref
+            .as_ref()
+            .and_then(|r| r.teams_tenant_id.as_deref()),
     };
     conversation_link(channel, &coords)
 }
@@ -484,7 +523,12 @@ mod tests {
     // ── Teams ─────────────────────────────────────────────────
     #[test]
     fn teams_full_deep_link_with_tenant() {
-        let link = teams_link(Some("grp-1"), Some("19:abc@thread.tacv2"), Some("General"), Some("tenant-1"));
+        let link = teams_link(
+            Some("grp-1"),
+            Some("19:abc@thread.tacv2"),
+            Some("General"),
+            Some("tenant-1"),
+        );
         assert_eq!(
             link,
             Some(
@@ -497,14 +541,20 @@ mod tests {
     #[test]
     fn teams_without_tenant_omits_tenant_param() {
         let link = teams_link(Some("grp-1"), Some("chan-1"), Some("General"), None);
-        assert_eq!(link, Some("https://teams.microsoft.com/l/channel/chan-1/General?groupId=grp-1".to_string()));
+        assert_eq!(
+            link,
+            Some("https://teams.microsoft.com/l/channel/chan-1/General?groupId=grp-1".to_string())
+        );
     }
 
     #[test]
     fn teams_missing_group_id_is_none() {
         // No group id (channelData didn't carry one) must degrade to no
         // link, never a broken guess.
-        assert_eq!(teams_link(None, Some("chan-1"), Some("General"), None), None);
+        assert_eq!(
+            teams_link(None, Some("chan-1"), Some("General"), None),
+            None
+        );
     }
 
     #[test]
@@ -515,8 +565,14 @@ mod tests {
     // ── WhatsApp ──────────────────────────────────────────────
     #[test]
     fn whatsapp_valid_e164_digits() {
-        assert_eq!(whatsapp_link("+886912345678"), Some("https://wa.me/886912345678".to_string()));
-        assert_eq!(whatsapp_link("886912345678"), Some("https://wa.me/886912345678".to_string()));
+        assert_eq!(
+            whatsapp_link("+886912345678"),
+            Some("https://wa.me/886912345678".to_string())
+        );
+        assert_eq!(
+            whatsapp_link("886912345678"),
+            Some("https://wa.me/886912345678".to_string())
+        );
     }
 
     #[test]
@@ -534,27 +590,39 @@ mod tests {
             telegram_bot_username: Some("duduclaw_bot"),
             ..Default::default()
         };
-        assert_eq!(conversation_link("telegram", &coords), Some("https://t.me/duduclaw_bot".to_string()));
+        assert_eq!(
+            conversation_link("telegram", &coords),
+            Some("https://t.me/duduclaw_bot".to_string())
+        );
     }
 
     #[test]
     fn conversation_link_line_is_always_none() {
         // Confirmed capability gap (03b appendix): LINE has no edit/deep-link
         // mechanism at all — never show a button, never guess a link.
-        let coords = ConversationCoords { chat_id: "u1", ..Default::default() };
+        let coords = ConversationCoords {
+            chat_id: "u1",
+            ..Default::default()
+        };
         assert_eq!(conversation_link("line", &coords), None);
     }
 
     #[test]
     fn conversation_link_feishu_and_googlechat_are_none() {
-        let coords = ConversationCoords { chat_id: "c1", ..Default::default() };
+        let coords = ConversationCoords {
+            chat_id: "c1",
+            ..Default::default()
+        };
         assert_eq!(conversation_link("feishu", &coords), None);
         assert_eq!(conversation_link("googlechat", &coords), None);
     }
 
     #[test]
     fn conversation_link_unknown_channel_is_none() {
-        let coords = ConversationCoords { chat_id: "c1", ..Default::default() };
+        let coords = ConversationCoords {
+            chat_id: "c1",
+            ..Default::default()
+        };
         assert_eq!(conversation_link("carrier_pigeon", &coords), None);
     }
 
@@ -562,8 +630,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_conversation_link_blank_chat_id_is_none() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(resolve_conversation_link(dir.path(), "telegram", "", None, None).await, None);
-        assert_eq!(resolve_conversation_link(dir.path(), "", "123", None, None).await, None);
+        assert_eq!(
+            resolve_conversation_link(dir.path(), "telegram", "", None, None).await,
+            None
+        );
+        assert_eq!(
+            resolve_conversation_link(dir.path(), "", "123", None, None).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -571,7 +645,10 @@ mod tests {
         // No config.toml at all in this tempdir ⇒ no token ⇒ no username ⇒
         // no link. Must not panic, must not hang.
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(resolve_conversation_link(dir.path(), "telegram", "123456789", None, None).await, None);
+        assert_eq!(
+            resolve_conversation_link(dir.path(), "telegram", "123456789", None, None).await,
+            None
+        );
     }
 
     // ── W2-7: coordinate persistence → real URL, per platform ──
@@ -586,8 +663,13 @@ mod tests {
         crate::discord::record_channel_guild(dir.path(), "222", "111");
         let guild = crate::discord::guild_id_for_channel(dir.path(), "222");
         assert_eq!(guild.as_deref(), Some("111"));
-        let link = resolve_conversation_link(dir.path(), "discord", "222", Some("333"), guild.as_deref()).await;
-        assert_eq!(link, Some("https://discord.com/channels/111/222/333".to_string()));
+        let link =
+            resolve_conversation_link(dir.path(), "discord", "222", Some("333"), guild.as_deref())
+                .await;
+        assert_eq!(
+            link,
+            Some("https://discord.com/channels/111/222/333".to_string())
+        );
     }
 
     /// Discord: a channel this gateway has never seen a message from has no
@@ -598,7 +680,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let guild = crate::discord::guild_id_for_channel(dir.path(), "999");
         assert_eq!(guild, None);
-        let link = resolve_conversation_link(dir.path(), "discord", "999", None, guild.as_deref()).await;
+        let link =
+            resolve_conversation_link(dir.path(), "discord", "999", None, guild.as_deref()).await;
         assert_eq!(link, None);
     }
 
@@ -610,7 +693,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         record_slack_workspace_domain(dir.path(), "acme");
         let link = resolve_conversation_link(dir.path(), "slack", "C123", None, None).await;
-        assert_eq!(link, Some("https://acme.slack.com/archives/C123".to_string()));
+        assert_eq!(
+            link,
+            Some("https://acme.slack.com/archives/C123".to_string())
+        );
     }
 
     /// Slack: never connected in this home_dir ⇒ no persisted domain ⇒ `None`.
@@ -641,7 +727,11 @@ mod tests {
                 teams_tenant_id: Some("tenant-1".into()),
             },
         );
-        std::fs::write(dir.path().join("teams_conversations.json"), serde_json::to_vec(&store).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join("teams_conversations.json"),
+            serde_json::to_vec(&store).unwrap(),
+        )
+        .unwrap();
 
         let link = resolve_conversation_link(dir.path(), "teams", "conv-1", None, None).await;
         assert_eq!(
@@ -673,7 +763,11 @@ mod tests {
                 teams_tenant_id: None,
             },
         );
-        std::fs::write(dir.path().join("teams_conversations.json"), serde_json::to_vec(&store).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join("teams_conversations.json"),
+            serde_json::to_vec(&store).unwrap(),
+        )
+        .unwrap();
 
         let link = resolve_conversation_link(dir.path(), "teams", "conv-2", None, None).await;
         assert_eq!(link, None);

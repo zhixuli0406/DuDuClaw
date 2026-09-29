@@ -17,7 +17,7 @@ use duduclaw_core::types::{MemoryEntry, MemoryLayer};
 use duduclaw_memory::TemporalMeta;
 
 use crate::gvu::mistake_notebook::{
-    MistakeCategory, MistakeEntry, MistakeNotebook, MAX_UNRESOLVED_PER_AGENT,
+    MAX_UNRESOLVED_PER_AGENT, MistakeCategory, MistakeEntry, MistakeNotebook,
 };
 use crate::playbook::entry::{PlaybookCategory, PlaybookMeta, PlaybookState};
 use crate::prediction::rule_lifecycle::PROBATION_RULE_TAG;
@@ -97,7 +97,11 @@ pub fn promotion_counts(mistakes: &[MistakeEntry]) -> (usize, usize) {
 /// Normalize `what_went_wrong` for de-duplication: trim, lowercase, collapse
 /// internal whitespace runs to a single space.
 fn normalize_lesson(s: &str) -> String {
-    s.trim().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    s.trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Consolidate recurring mistakes of `category` into a semantic memory rule.
@@ -140,6 +144,27 @@ pub async fn maybe_consolidate(
         MAX_UNRESOLVED_PER_AGENT as usize,
     );
 
+    // P0/WP-C fault attribution (The Misattribution Gap, arXiv:2605.22842):
+    // a mistake whose failure was attributed to the grader, the environment
+    // or the harness — or whose fault side could not be established at all
+    // — is NOT evidence about the model's behavior, so it must never reach
+    // the ≥threshold consolidation count. Dropping it here (rather than in
+    // `query_unresolved_by_category`) keeps the notebook's read paths
+    // generic: F2a prompt injection and the GVU Generator still see every
+    // unresolved mistake, because "here is something that went wrong" is
+    // useful context regardless of whose fault it was; only *learning a
+    // durable rule from it* requires the model to actually be at fault.
+    // Pre-WP-C rows carry `counts_for_learning = true`, so a corpus written
+    // before this filter existed behaves byte-identically.
+    //
+    // Deliberately NOT mirrored into `count_unresolved_by_category`'s early
+    // exit above: that gate only decides whether it is worth reading rows at
+    // all, and over-counting there costs one query, never a false promotion.
+    let mistakes: Vec<MistakeEntry> = mistakes
+        .into_iter()
+        .filter(|m| m.counts_for_learning)
+        .collect();
+
     // Group by source_kind (WP2). Empty string ("" — unattributed / legacy
     // rows) is its own group rather than joining a named one, so it can
     // neither pad out `"decision_gap"`/`"task_failure"` counts nor be
@@ -152,7 +177,10 @@ pub async fn maybe_consolidate(
     for group in groups.into_values() {
         // Captured before the group is consumed by the evidence filter — used
         // by the G6 consolidation-failure telemetry below.
-        let source_kind = group.first().map(|m| m.source_kind.clone()).unwrap_or_default();
+        let source_kind = group
+            .first()
+            .map(|m| m.source_kind.clone())
+            .unwrap_or_default();
         let raw_len = group.len();
 
         // B2 (Honest Lying, arXiv:2605.29463): an unverified mistake — no
@@ -211,8 +239,15 @@ pub async fn maybe_consolidate(
             );
             continue;
         }
-        return consolidate_group(notebook, memory_db_path, home_dir, agent_id, category, verified)
-            .await;
+        return consolidate_group(
+            notebook,
+            memory_db_path,
+            home_dir,
+            agent_id,
+            category,
+            verified,
+        )
+        .await;
     }
 
     Ok(None)
@@ -252,7 +287,10 @@ async fn consolidate_group(
     let engine = crate::memory_factory::build_memory_engine(memory_db_path, home_dir)
         .map_err(|e| format!("open memory engine: {e}"))?;
 
-    if let Some(rejection) = engine.check_novelty(agent_id, MemoryLayer::Semantic, &rule).await {
+    if let Some(rejection) = engine
+        .check_novelty(agent_id, MemoryLayer::Semantic, &rule)
+        .await
+    {
         tracing::warn!(
             agent_id,
             category = category.as_str(),
@@ -263,7 +301,10 @@ async fn consolidate_group(
         );
         // G6/#7: surface the "why not merged" — the synthesized rule was a
         // near-duplicate of an already-known rule.
-        let source_kind = mistakes.first().map(|m| m.source_kind.as_str()).unwrap_or("");
+        let source_kind = mistakes
+            .first()
+            .map(|m| m.source_kind.as_str())
+            .unwrap_or("");
         crate::consolidation_failures::record_failure(
             home_dir,
             &crate::consolidation_failures::ConsolidationFailure::new(
@@ -341,13 +382,24 @@ async fn consolidate_group(
     // as the M-1 migration default for pre-existing rows — there is no
     // mechanism here that could name a specific eval case for an
     // automatically-synthesized rule.
-    let source_kind = mistakes.first().map(|m| m.source_kind.as_str()).unwrap_or("");
+    let source_kind = mistakes
+        .first()
+        .map(|m| m.source_kind.as_str())
+        .unwrap_or("");
     let playbook_meta = PlaybookMeta {
         schema_version: crate::playbook::entry::PLAYBOOK_SCHEMA_VERSION,
         category: PlaybookCategory::Repair,
+        transferability: Default::default(),
         signals_match: vec![
             format!("mistake:{}", category.as_str()),
-            format!("source_kind:{}", if source_kind.is_empty() { "unattributed" } else { source_kind }),
+            format!(
+                "source_kind:{}",
+                if source_kind.is_empty() {
+                    "unattributed"
+                } else {
+                    source_kind
+                }
+            ),
         ],
         strategy: Vec::new(),
         failure_history: Vec::new(),
@@ -386,8 +438,10 @@ async fn consolidate_group(
     // (`settle_injected_rules_held_out`) never validates the rule against its
     // own birth batch. No-op when the gate is off (byte-identical).
     if held_out_gate_enabled {
-        crate::prediction::rule_gate::HeldOutStats::born(chrono::Utc::now().timestamp().max(0) as u64)
-            .merge_into(&mut metadata_blob);
+        crate::prediction::rule_gate::HeldOutStats::born(
+            chrono::Utc::now().timestamp().max(0) as u64
+        )
+        .merge_into(&mut metadata_blob);
     }
 
     // Triple ties successive consolidations of the same category into a
@@ -445,7 +499,7 @@ fn synthesize_rule(category: MistakeCategory, mistakes: &[MistakeEntry]) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gvu::mistake_notebook::{build_mistake_entry, TrajectoryEvidence};
+    use crate::gvu::mistake_notebook::{TrajectoryEvidence, build_mistake_entry};
     use duduclaw_core::traits::MemoryEngine; // brings `search` into scope for assertions
     use duduclaw_memory::SqliteMemoryEngine;
     use tempfile::TempDir;
@@ -455,7 +509,13 @@ mod tests {
     /// once `n >= threshold`. B2 requires `.with_evidence(...)` here: without
     /// it every group is unverified and can never reach the threshold
     /// (covered separately by `unverified_mistakes_never_consolidate`).
-    fn record_n(nb: &MistakeNotebook, agent: &str, cat: MistakeCategory, n: usize, source_kind: &str) {
+    fn record_n(
+        nb: &MistakeNotebook,
+        agent: &str,
+        cat: MistakeCategory,
+        n: usize,
+        source_kind: &str,
+    ) {
         for i in 0..n {
             let e = build_mistake_entry(
                 agent,
@@ -511,11 +571,21 @@ mod tests {
         let mem_path = dir.path().join("memory.db");
         record_n(&nb, "agent-a", MistakeCategory::Capability, 2, "");
 
-        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-a", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-a",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
         assert!(r.is_none(), "2 < 3 must not consolidate");
-        assert_eq!(nb.count_unresolved_by_category("agent-a", MistakeCategory::Capability), 2);
+        assert_eq!(
+            nb.count_unresolved_by_category("agent-a", MistakeCategory::Capability),
+            2
+        );
     }
 
     #[tokio::test]
@@ -525,9 +595,16 @@ mod tests {
         let mem_path = dir.path().join("memory.db");
         record_n(&nb, "agent-b", MistakeCategory::Capability, 3, "");
 
-        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-b", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-b",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
         assert!(r.is_some(), "3 >= 3 must consolidate");
 
         // Source mistakes resolved → count drops to zero.
@@ -554,11 +631,17 @@ mod tests {
         let mem_path = dir.path().join("memory.db");
         record_n(&nb, "agent-d", MistakeCategory::Factual, 3, "");
 
-        let semantic_id =
-            maybe_consolidate(&nb, &mem_path, dir.path(), "agent-d", MistakeCategory::Factual, 3)
-                .await
-                .unwrap()
-                .expect("must consolidate");
+        let semantic_id = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-d",
+            MistakeCategory::Factual,
+            3,
+        )
+        .await
+        .unwrap()
+        .expect("must consolidate");
 
         let engine = SqliteMemoryEngine::new(&mem_path).unwrap();
         let meta = engine
@@ -572,13 +655,23 @@ mod tests {
             "F2b must seed helpful=1, harmful=0 (WP2 Janus trial-period seed)"
         );
         // Source-mistake provenance still stored alongside the counters.
-        assert!(meta["source_mistake_ids"].as_array().is_some_and(|a| a.len() == 3));
+        assert!(
+            meta["source_mistake_ids"]
+                .as_array()
+                .is_some_and(|a| a.len() == 3)
+        );
         // WP2 Janus: every freshly consolidated rule starts on probation.
-        let entry = engine.get_by_id("agent-d", &semantic_id).await.unwrap().unwrap();
-        assert!(entry
-            .tags
-            .iter()
-            .any(|t| t == crate::prediction::rule_lifecycle::PROBATION_RULE_TAG));
+        let entry = engine
+            .get_by_id("agent-d", &semantic_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            entry
+                .tags
+                .iter()
+                .any(|t| t == crate::prediction::rule_lifecycle::PROBATION_RULE_TAG)
+        );
     }
 
     #[tokio::test]
@@ -590,9 +683,16 @@ mod tests {
         record_n(&nb, "agent-c", MistakeCategory::Factual, 1, "");
 
         // Neither category reaches 3 → no consolidation.
-        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-c", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-c",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
         assert!(r.is_none());
     }
 
@@ -605,10 +705,20 @@ mod tests {
         let mem_path = dir.path().join("memory.db");
         record_same_session_n(&nb, "agent-corr", MistakeCategory::Capability, 3, "");
 
-        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-corr", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
-        assert!(r.is_none(), "same-session mistakes are correlated, not independent, evidence");
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-corr",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(
+            r.is_none(),
+            "same-session mistakes are correlated, not independent, evidence"
+        );
 
         // Left unresolved (NeedsMoreEvidence), not silently dropped — still
         // counted as unresolved so a genuinely independent 4th observation
@@ -630,10 +740,20 @@ mod tests {
         let mem_path = dir.path().join("memory.db");
         record_n(&nb, "agent-indep", MistakeCategory::Capability, 3, "");
 
-        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-indep", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
-        assert!(r.is_some(), "distinct sessions + distinct wording must promote");
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-indep",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(
+            r.is_some(),
+            "distinct sessions + distinct wording must promote"
+        );
         assert_eq!(
             nb.count_unresolved_by_category("agent-indep", MistakeCategory::Capability),
             0,
@@ -649,8 +769,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
         let mem_path = dir.path().join("memory.db");
-        record_n(&nb, "agent-split", MistakeCategory::Capability, 2, "decision_gap");
-        record_n(&nb, "agent-split", MistakeCategory::Capability, 2, "task_failure");
+        record_n(
+            &nb,
+            "agent-split",
+            MistakeCategory::Capability,
+            2,
+            "decision_gap",
+        );
+        record_n(
+            &nb,
+            "agent-split",
+            MistakeCategory::Capability,
+            2,
+            "task_failure",
+        );
 
         assert_eq!(
             nb.count_unresolved_by_category("agent-split", MistakeCategory::Capability),
@@ -658,9 +790,16 @@ mod tests {
             "total unresolved count spans both source_kind groups"
         );
 
-        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-split", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-split",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
         assert!(
             r.is_none(),
             "neither source_kind group individually reaches the threshold — must not pool"
@@ -696,14 +835,27 @@ mod tests {
                 None,
                 "",
             );
-            assert!(e.evidence.is_none(), "sanity: build_mistake_entry defaults to unverified");
+            assert!(
+                e.evidence.is_none(),
+                "sanity: build_mistake_entry defaults to unverified"
+            );
             nb.record(&e).unwrap();
         }
 
-        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-unverified", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
-        assert!(r.is_none(), "B2: unverified mistakes must never reach the consolidation threshold");
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-unverified",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(
+            r.is_none(),
+            "B2: unverified mistakes must never reach the consolidation threshold"
+        );
         assert_eq!(
             nb.count_unresolved_by_category("agent-unverified", MistakeCategory::Capability),
             3,
@@ -753,10 +905,20 @@ mod tests {
             "raw total spans both verified and unverified"
         );
 
-        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-mixed", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
-        assert!(r.is_none(), "only 2 of 5 entries are verified — below threshold 3");
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-mixed",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(
+            r.is_none(),
+            "only 2 of 5 entries are verified — below threshold 3"
+        );
         assert_eq!(
             nb.count_unresolved_by_category("agent-mixed", MistakeCategory::Capability),
             5,
@@ -775,9 +937,16 @@ mod tests {
 
         // Round 1: consolidates normally.
         record_n(&nb, "agent-dup", MistakeCategory::Capability, 3, "");
-        let r1 = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-dup", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
+        let r1 = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-dup",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
         assert!(r1.is_some(), "round 1 must consolidate");
 
         // Round 2: SAME wording (same `what_went_wrong` per index) as round
@@ -786,10 +955,20 @@ mod tests {
         // even though GovMem's independence bar (2 distinct sessions, 2
         // distinct wordings within round 2 itself) is satisfied on its own.
         record_n(&nb, "agent-dup", MistakeCategory::Capability, 3, "");
-        let r2 = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-dup", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
-        assert!(r2.is_none(), "B1 gate must reject a near-duplicate consolidated rule");
+        let r2 = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-dup",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(
+            r2.is_none(),
+            "B1 gate must reject a near-duplicate consolidated rule"
+        );
 
         // Round 2's source mistakes are left unresolved (conservative
         // posture, same as `Promotion::NeedsMoreEvidence`).
@@ -801,7 +980,10 @@ mod tests {
 
         // Exactly one semantic rule exists — the duplicate was never written.
         let check_engine = SqliteMemoryEngine::new(&mem_path).unwrap();
-        let results = check_engine.search("agent-dup", "Recurring", 10).await.unwrap();
+        let results = check_engine
+            .search("agent-dup", "Recurring", 10)
+            .await
+            .unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -824,7 +1006,11 @@ mod tests {
     #[tokio::test]
     async fn novelty_gate_disabled_in_config_lets_duplicate_consolidation_through() {
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[memory]\nnovelty_gate = false\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[memory]\nnovelty_gate = false\n",
+        )
+        .unwrap();
         let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
         let mem_path = dir.path().join("memory.db");
 
@@ -906,9 +1092,16 @@ mod tests {
         let mem_path = dir.path().join("memory.db");
 
         record_n(&nb, "agent-evolve", MistakeCategory::Capability, 3, "");
-        let r1 = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-evolve", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
+        let r1 = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-evolve",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
         assert!(r1.is_some());
 
         // A genuinely different set of lessons this time.
@@ -926,11 +1119,24 @@ mod tests {
             .with_evidence(TrajectoryEvidence::from_tool_error("fx-lookup", "timeout"));
             nb.record(&e).unwrap();
         }
-        let r2 = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-evolve", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
-        assert!(r2.is_some(), "a genuinely novel lesson must still consolidate");
-        assert_ne!(r1, r2, "the two consolidations produced different semantic ids");
+        let r2 = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-evolve",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(
+            r2.is_some(),
+            "a genuinely novel lesson must still consolidate"
+        );
+        assert_ne!(
+            r1, r2,
+            "the two consolidations produced different semantic ids"
+        );
     }
 
     // ── WP-P3: held-out rule gate wiring at consolidation ─────────────────
@@ -951,11 +1157,17 @@ mod tests {
         let mem_path = dir.path().join("memory.db");
         record_n(&nb, "agent-hog", MistakeCategory::Capability, 3, "");
 
-        let sid =
-            maybe_consolidate(&nb, &mem_path, dir.path(), "agent-hog", MistakeCategory::Capability, 3)
-                .await
-                .unwrap()
-                .expect("verified group must consolidate");
+        let sid = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-hog",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap()
+        .expect("verified group must consolidate");
 
         let engine = SqliteMemoryEngine::new(&mem_path).unwrap();
         let entry = engine.get_by_id("agent-hog", &sid).await.unwrap().unwrap();
@@ -966,7 +1178,11 @@ mod tests {
                 .any(|t| t == crate::prediction::rule_lifecycle::SHADOW_RULE_TAG),
             "an evidence-backed (Verified) consolidation must NOT be born as a shadow candidate"
         );
-        let meta = engine.get_metadata("agent-hog", &sid).await.unwrap().unwrap();
+        let meta = engine
+            .get_metadata("agent-hog", &sid)
+            .await
+            .unwrap()
+            .unwrap();
         let held = crate::prediction::rule_gate::HeldOutStats::from_metadata(&meta);
         assert!(
             held.born_seq > 0,
@@ -991,11 +1207,17 @@ mod tests {
         let mem_path = dir.path().join("memory.db");
         record_n(&nb, "agent-off", MistakeCategory::Capability, 3, "");
 
-        let sid =
-            maybe_consolidate(&nb, &mem_path, dir.path(), "agent-off", MistakeCategory::Capability, 3)
-                .await
-                .unwrap()
-                .expect("must consolidate");
+        let sid = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-off",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap()
+        .expect("must consolidate");
 
         let engine = SqliteMemoryEngine::new(&mem_path).unwrap();
         let entry = engine.get_by_id("agent-off", &sid).await.unwrap().unwrap();
@@ -1006,9 +1228,14 @@ mod tests {
                 .any(|t| t == crate::prediction::rule_lifecycle::SHADOW_RULE_TAG),
             "gate off must never mint a shadow tag"
         );
-        let meta = engine.get_metadata("agent-off", &sid).await.unwrap().unwrap();
+        let meta = engine
+            .get_metadata("agent-off", &sid)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
-            meta.get(crate::prediction::rule_gate::HeldOutStats::METADATA_KEY).is_none(),
+            meta.get(crate::prediction::rule_gate::HeldOutStats::METADATA_KEY)
+                .is_none(),
             "gate off must not seed a held-out record (byte-identical metadata shape)"
         );
     }
@@ -1017,7 +1244,7 @@ mod tests {
 
     #[tokio::test]
     async fn needs_more_evidence_records_a_consolidation_failure() {
-        use crate::consolidation_failures::{list_failures, FailureReason};
+        use crate::consolidation_failures::{FailureReason, list_failures};
 
         let dir = TempDir::new().unwrap();
         let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
@@ -1025,9 +1252,16 @@ mod tests {
         // 3 same-session verified mistakes → GovMem NeedsMoreEvidence.
         record_same_session_n(&nb, "agent-nme", MistakeCategory::Capability, 3, "");
 
-        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-nme", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-nme",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
         assert!(r.is_none());
 
         let fails = list_failures(dir.path(), Some("agent-nme"), 10);
@@ -1040,7 +1274,7 @@ mod tests {
 
     #[tokio::test]
     async fn insufficient_verified_evidence_is_recorded_when_raw_reaches_threshold() {
-        use crate::consolidation_failures::{list_failures, FailureReason};
+        use crate::consolidation_failures::{FailureReason, list_failures};
 
         let dir = TempDir::new().unwrap();
         let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
@@ -1049,23 +1283,42 @@ mod tests {
         // 2 verified + 3 unverified = raw 5 (>= threshold 3), verified 2 (< 3).
         for i in 0..2 {
             let e = build_mistake_entry(
-                "agent-ive", &format!("v-{i}"), MistakeCategory::Capability,
-                "u", "a", &format!("verified issue {i}"), None, "",
+                "agent-ive",
+                &format!("v-{i}"),
+                MistakeCategory::Capability,
+                "u",
+                "a",
+                &format!("verified issue {i}"),
+                None,
+                "",
             )
             .with_evidence(TrajectoryEvidence::from_tool_error("bash", "boom"));
             nb.record(&e).unwrap();
         }
         for i in 0..3 {
             let e = build_mistake_entry(
-                "agent-ive", &format!("u-{i}"), MistakeCategory::Capability,
-                "u", "a", &format!("unverified issue {i}"), None, "",
+                "agent-ive",
+                &format!("u-{i}"),
+                MistakeCategory::Capability,
+                "u",
+                "a",
+                &format!("unverified issue {i}"),
+                None,
+                "",
             );
             nb.record(&e).unwrap();
         }
 
-        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-ive", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-ive",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
         assert!(r.is_none());
 
         let fails = list_failures(dir.path(), Some("agent-ive"), 10);
@@ -1085,9 +1338,16 @@ mod tests {
         // Only 2 verified mistakes — normal accumulation, NOT a failure.
         record_n(&nb, "agent-acc", MistakeCategory::Capability, 2, "");
 
-        let r = maybe_consolidate(&nb, &mem_path, dir.path(), "agent-acc", MistakeCategory::Capability, 3)
-            .await
-            .unwrap();
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-acc",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
         assert!(r.is_none());
         assert!(
             list_failures(dir.path(), None, 10).is_empty(),
@@ -1097,7 +1357,7 @@ mod tests {
 
     #[tokio::test]
     async fn novelty_rejected_records_a_consolidation_failure() {
-        use crate::consolidation_failures::{list_failures, FailureReason};
+        use crate::consolidation_failures::{FailureReason, list_failures};
 
         let dir = TempDir::new().unwrap();
         let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
@@ -1105,18 +1365,36 @@ mod tests {
 
         // Round 1 consolidates cleanly (no failure).
         record_n(&nb, "agent-nov", MistakeCategory::Capability, 3, "");
-        assert!(maybe_consolidate(&nb, &mem_path, dir.path(), "agent-nov", MistakeCategory::Capability, 3)
+        assert!(
+            maybe_consolidate(
+                &nb,
+                &mem_path,
+                dir.path(),
+                "agent-nov",
+                MistakeCategory::Capability,
+                3
+            )
             .await
             .unwrap()
-            .is_some());
+            .is_some()
+        );
         assert!(list_failures(dir.path(), None, 10).is_empty());
 
         // Round 2: byte-identical synthesized rule → B1 novelty gate rejects.
         record_n(&nb, "agent-nov", MistakeCategory::Capability, 3, "");
-        assert!(maybe_consolidate(&nb, &mem_path, dir.path(), "agent-nov", MistakeCategory::Capability, 3)
+        assert!(
+            maybe_consolidate(
+                &nb,
+                &mem_path,
+                dir.path(),
+                "agent-nov",
+                MistakeCategory::Capability,
+                3
+            )
             .await
             .unwrap()
-            .is_none());
+            .is_none()
+        );
 
         let fails = list_failures(dir.path(), Some("agent-nov"), 10);
         assert_eq!(fails.len(), 1, "the B1 novelty rejection must be recorded");

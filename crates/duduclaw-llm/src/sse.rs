@@ -5,10 +5,10 @@
 
 use std::collections::VecDeque;
 
-use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
 
-use crate::error::{classify_transport, LlmError};
+use crate::error::{LlmError, classify_transport};
 use crate::types::StreamEvent;
 
 /// Assembles complete lines from arbitrary byte chunks.

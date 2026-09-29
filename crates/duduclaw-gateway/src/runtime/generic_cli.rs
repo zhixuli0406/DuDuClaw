@@ -36,7 +36,7 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
-use duduclaw_core::runtime_catalog::{OutputFormat, RuntimeSpec, PROMPT_PLACEHOLDER};
+use duduclaw_core::runtime_catalog::{OutputFormat, PROMPT_PLACEHOLDER, RuntimeSpec};
 
 use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 
@@ -105,15 +105,26 @@ pub enum GenericCliError {
 impl std::fmt::Display for GenericCliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AuthRequired { runtime, action, stderr_tail } => write!(
+            Self::AuthRequired {
+                runtime,
+                action,
+                stderr_tail,
+            } => write!(
                 f,
                 "{runtime} CLI is not logged in (authentication required): {action}. \
                  stderr tail: {stderr_tail}"
             ),
-            Self::NonZeroExit { runtime, code, stderr_tail } => {
+            Self::NonZeroExit {
+                runtime,
+                code,
+                stderr_tail,
+            } => {
                 write!(f, "{runtime} CLI exited with {code}: {stderr_tail}")
             }
-            Self::EmptyOutput { runtime, stderr_tail } => write!(
+            Self::EmptyOutput {
+                runtime,
+                stderr_tail,
+            } => write!(
                 f,
                 "Empty response from {runtime} CLI (exit 0); stderr tail: {stderr_tail}"
             ),
@@ -123,7 +134,11 @@ impl std::fmt::Display for GenericCliError {
             Self::Spawn { runtime, error } => {
                 write!(f, "spawn error: failed to start {runtime} CLI: {error}")
             }
-            Self::Unparseable { runtime, format, stdout_tail } => write!(
+            Self::Unparseable {
+                runtime,
+                format,
+                stdout_tail,
+            } => write!(
                 f,
                 "Empty response from {runtime} CLI: no assistant text in its {format} \
                  output; stdout tail: {stdout_tail}"
@@ -193,7 +208,10 @@ fn auth_action(spec: &RuntimeSpec) -> String {
         parts.push(format!("或設定有效的 {env}"));
     }
     if parts.is_empty() {
-        format!("請確認 {} 的憑證設定（{}）", spec.display_name, spec.vendor_url)
+        format!(
+            "請確認 {} 的憑證設定（{}）",
+            spec.display_name, spec.vendor_url
+        )
     } else {
         format!(
             "請在執行 gateway 的環境（若為 Docker 需進入容器）{}",
@@ -305,8 +323,16 @@ fn is_assistant_event(v: &Value) -> bool {
             // A recognised NON-assistant discriminator disqualifies it.
             if matches!(
                 k.as_str(),
-                "tool" | "tool_result" | "tool_use" | "user" | "system" | "meta"
-                    | "error" | "progress" | "thinking" | "reasoning"
+                "tool"
+                    | "tool_result"
+                    | "tool_use"
+                    | "user"
+                    | "system"
+                    | "meta"
+                    | "error"
+                    | "progress"
+                    | "thinking"
+                    | "reasoning"
             ) {
                 return false;
             }
@@ -460,7 +486,10 @@ impl GenericCliRuntime {
     /// Bind a spec to an explicit program path. Used by the fake-binary
     /// integration tests, and by any caller that already resolved the path.
     pub fn with_program(spec: &'static RuntimeSpec, program: impl Into<String>) -> Self {
-        Self { spec, program: program.into() }
+        Self {
+            spec,
+            program: program.into(),
+        }
     }
 
     pub fn spec(&self) -> &'static RuntimeSpec {
@@ -494,6 +523,20 @@ impl GenericCliRuntime {
             );
         }
 
+        // P1/WP-3: the generic print-mode CLIs (qwen / kimi / copilot / kiro /
+        // vibe / opencode) were never probed for an effort flag, so there is no
+        // verified flag to emit. Log and ignore — guessing a flag name would
+        // turn a working spawn into an "unexpected argument" failure, which is
+        // exactly the codex `--ask-for-approval` bug this round had to fix.
+        if let Some(effort) = context.effort {
+            tracing::debug!(
+                runtime = id,
+                agent = %context.agent_id,
+                effort = %effort,
+                "no verified reasoning-effort flag for this CLI — effort ignored for this spawn"
+            );
+        }
+
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&args);
 
@@ -505,8 +548,10 @@ impl GenericCliRuntime {
         // not the user's (launchd, systemd, Docker), and every one of these
         // CLIs looks for its credentials under `$HOME`. Reuse the probe the
         // grok runtime already proved out.
-        let user_home =
-            super::grok::resolve_user_home(&context.home_dir, std::env::var("HOME").ok().as_deref());
+        let user_home = super::grok::resolve_user_home(
+            &context.home_dir,
+            std::env::var("HOME").ok().as_deref(),
+        );
         for (k, v) in super::grok::build_home_env(&user_home, None) {
             cmd.env(k, v);
         }
@@ -571,8 +616,16 @@ impl GenericCliRuntime {
 
         // The hard, fail-closed confinement (opt-in). Must run last, right
         // before spawn, and its Err must abort the spawn.
-        super::apply_native_sandbox(&mut cmd, context.capabilities.as_ref(), context.agent_dir.as_deref(), id)
-            .map_err(|e| GenericCliError::Spawn { runtime: id, error: e })?;
+        super::apply_native_sandbox(
+            &mut cmd,
+            context.capabilities.as_ref(),
+            context.agent_dir.as_deref(),
+            id,
+        )
+        .map_err(|e| GenericCliError::Spawn {
+            runtime: id,
+            error: e,
+        })?;
 
         info!(
             runtime = id,
@@ -583,9 +636,10 @@ impl GenericCliRuntime {
             "generic print-mode runtime: spawning"
         );
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| GenericCliError::Spawn { runtime: id, error: e.to_string() })?;
+        let mut child = cmd.spawn().map_err(|e| GenericCliError::Spawn {
+            runtime: id,
+            error: e.to_string(),
+        })?;
 
         if stdin_prompt && let Some(mut sink) = child.stdin.take() {
             // Best effort: a CLI that closes stdin early (it already has the
@@ -599,11 +653,18 @@ impl GenericCliRuntime {
             child.wait_with_output(),
         )
         .await
-        .map_err(|_| GenericCliError::Timeout { runtime: id, secs: DEFAULT_TIMEOUT_SECS })?
-        .map_err(|e| GenericCliError::Spawn { runtime: id, error: e.to_string() })?;
+        .map_err(|_| GenericCliError::Timeout {
+            runtime: id,
+            secs: DEFAULT_TIMEOUT_SECS,
+        })?
+        .map_err(|e| GenericCliError::Spawn {
+            runtime: id,
+            error: e.to_string(),
+        })?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr_tail = duduclaw_core::truncate_bytes(stderr.trim(), STDERR_TAIL_BYTES).to_string();
+        let stderr_tail =
+            duduclaw_core::truncate_bytes(stderr.trim(), STDERR_TAIL_BYTES).to_string();
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         if !output.status.success() {
@@ -616,7 +677,11 @@ impl GenericCliRuntime {
                     stderr_tail,
                 });
             }
-            return Err(GenericCliError::NonZeroExit { runtime: id, code, stderr_tail });
+            return Err(GenericCliError::NonZeroExit {
+                runtime: id,
+                code,
+                stderr_tail,
+            });
         }
 
         // Exit 0 with nothing on stdout: check for an auth failure hiding
@@ -629,7 +694,10 @@ impl GenericCliRuntime {
                     stderr_tail,
                 });
             }
-            return Err(GenericCliError::EmptyOutput { runtime: id, stderr_tail });
+            return Err(GenericCliError::EmptyOutput {
+                runtime: id,
+                stderr_tail,
+            });
         }
 
         let Some(content) = parse_output(&stdout, self.spec.headless.output) else {
@@ -643,7 +711,8 @@ impl GenericCliRuntime {
             return Err(GenericCliError::Unparseable {
                 runtime: id,
                 format: self.spec.headless.output.as_str(),
-                stdout_tail: duduclaw_core::truncate_bytes(stdout.trim(), STDERR_TAIL_BYTES).to_string(),
+                stdout_tail: duduclaw_core::truncate_bytes(stdout.trim(), STDERR_TAIL_BYTES)
+                    .to_string(),
             });
         };
 
@@ -705,6 +774,8 @@ mod tests {
             conversation_history: Vec::new(),
             capabilities: None,
             account_pool: Vec::new(),
+            effort: None,
+            allow_cross_family_failover: true,
         }
     }
 
@@ -726,7 +797,10 @@ mod tests {
     fn build_args_substitutes_the_prompt_and_appends_the_model() {
         let spec = spec_for("copilot").unwrap();
         let args = build_args(spec, "HELLO", "gpt-5.4");
-        assert!(args.contains(&"HELLO".to_string()), "prompt substituted: {args:?}");
+        assert!(
+            args.contains(&"HELLO".to_string()),
+            "prompt substituted: {args:?}"
+        );
         assert!(
             !args.iter().any(|a| a == PROMPT_PLACEHOLDER),
             "placeholder must not survive: {args:?}"
@@ -751,7 +825,8 @@ mod tests {
         let p = build_prompt(&c, "--not-a-flag", "test");
         assert!(p.contains("<system_instructions>"));
         assert!(
-            p.trim_start_matches(|ch| ch != '-').starts_with("--not-a-flag"),
+            p.trim_start_matches(|ch| ch != '-')
+                .starts_with("--not-a-flag"),
             "leading dash is neutralised by a space, not stripped: {p}"
         );
     }
@@ -762,7 +837,10 @@ mod tests {
             (r#""bare string""#, "bare string"),
             (r#"{"result":"final"}"#, "final"),
             (r#"{"response":"r"}"#, "r"),
-            (r#"{"role":"assistant","content":"kimi shape"}"#, "kimi shape"),
+            (
+                r#"{"role":"assistant","content":"kimi shape"}"#,
+                "kimi shape",
+            ),
             (
                 r#"{"message":{"content":[{"type":"text","text":"anthropic shape"}]}}"#,
                 "anthropic shape",
@@ -771,11 +849,20 @@ mod tests {
                 r#"{"choices":[{"message":{"content":"openai shape"}}]}"#,
                 "openai shape",
             ),
-            (r#"[{"type":"assistant"},{"type":"result","result":"last wins"}]"#, "last wins"),
+            (
+                r#"[{"type":"assistant"},{"type":"result","result":"last wins"}]"#,
+                "last wins",
+            ),
             // OpenCode NDJSON event: the text hides under `.part.text`.
-            (r#"{"type":"text","part":{"text":"opencode shape"}}"#, "opencode shape"),
+            (
+                r#"{"type":"text","part":{"text":"opencode shape"}}"#,
+                "opencode shape",
+            ),
             // Cursor `--output-format json`: a single object with `.result`.
-            (r#"{"type":"result","result":"cursor shape","duration_ms":12}"#, "cursor shape"),
+            (
+                r#"{"type":"result","result":"cursor shape","duration_ms":12}"#,
+                "cursor shape",
+            ),
         ];
         for (json, want) in cases {
             let v: Value = serde_json::from_str(json).unwrap();
@@ -864,8 +951,11 @@ mod tests {
             Some("qwen")
         );
         assert_eq!(
-            parse_output("{\"role\":\"assistant\",\"content\":\"k\"}\n", OutputFormat::Jsonl)
-                .as_deref(),
+            parse_output(
+                "{\"role\":\"assistant\",\"content\":\"k\"}\n",
+                OutputFormat::Jsonl
+            )
+            .as_deref(),
             Some("k")
         );
         assert!(parse_output("", OutputFormat::Text).is_none());
@@ -874,7 +964,9 @@ mod tests {
 
     #[test]
     fn auth_failure_detection_does_not_fire_on_ordinary_prose() {
-        assert!(looks_like_auth_failure("Error: not logged in. Run `kimi login`."));
+        assert!(looks_like_auth_failure(
+            "Error: not logged in. Run `kimi login`."
+        ));
         assert!(looks_like_auth_failure("HTTP 401 Unauthorized"));
         assert!(!looks_like_auth_failure(
             "Here is how OAuth authentication works in your codebase."
@@ -895,19 +987,28 @@ mod tests {
         .to_lowercase();
         assert!(auth.contains("not logged in"), "{auth}");
 
-        let to = GenericCliError::Timeout { runtime: "kimi", secs: 300 }
-            .to_string()
-            .to_lowercase();
+        let to = GenericCliError::Timeout {
+            runtime: "kimi",
+            secs: 300,
+        }
+        .to_string()
+        .to_lowercase();
         assert!(to.contains("hard timeout"), "{to}");
 
-        let empty = GenericCliError::EmptyOutput { runtime: "kimi", stderr_tail: String::new() }
-            .to_string()
-            .to_lowercase();
+        let empty = GenericCliError::EmptyOutput {
+            runtime: "kimi",
+            stderr_tail: String::new(),
+        }
+        .to_string()
+        .to_lowercase();
         assert!(empty.contains("empty response"), "{empty}");
 
-        let spawn = GenericCliError::Spawn { runtime: "kimi", error: "x".into() }
-            .to_string()
-            .to_lowercase();
+        let spawn = GenericCliError::Spawn {
+            runtime: "kimi",
+            error: "x".into(),
+        }
+        .to_string()
+        .to_lowercase();
         assert!(spawn.contains("spawn error"), "{spawn}");
     }
 
@@ -930,7 +1031,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Copilot's `-s` mode: the answer is plain stdout, nothing else.
         let bin = fake_bin(dir.path(), "copilot", "echo 'the plain answer'");
-        let rt = GenericCliRuntime::with_program(spec_for("copilot").unwrap(), bin.to_string_lossy());
+        let rt =
+            GenericCliRuntime::with_program(spec_for("copilot").unwrap(), bin.to_string_lossy());
         assert!(rt.is_available().await);
         let resp = rt.execute("hi", &ctx(dir.path())).await.unwrap();
         assert_eq!(resp.content, "the plain answer");
@@ -984,7 +1086,13 @@ mod tests {
         let rt = GenericCliRuntime::with_program(spec_for("kimi").unwrap(), bin.to_string_lossy());
         let err = rt.run("hi", &ctx(dir.path())).await.unwrap_err();
         assert!(
-            matches!(err, GenericCliError::AuthRequired { runtime: "kimi", .. }),
+            matches!(
+                err,
+                GenericCliError::AuthRequired {
+                    runtime: "kimi",
+                    ..
+                }
+            ),
             "{err:?}"
         );
         let msg = err.to_string();
@@ -997,7 +1105,8 @@ mod tests {
     async fn non_zero_exit_without_auth_markers_is_a_plain_failure() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_bin(dir.path(), "copilot", "echo 'boom: disk full' >&2\nexit 3");
-        let rt = GenericCliRuntime::with_program(spec_for("copilot").unwrap(), bin.to_string_lossy());
+        let rt =
+            GenericCliRuntime::with_program(spec_for("copilot").unwrap(), bin.to_string_lossy());
         let err = rt.run("hi", &ctx(dir.path())).await.unwrap_err();
         assert!(
             matches!(err, GenericCliError::NonZeroExit { code: 3, .. }),
@@ -1010,9 +1119,13 @@ mod tests {
     async fn exit_zero_with_no_output_is_a_failure_not_an_empty_answer() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_bin(dir.path(), "copilot", "exit 0");
-        let rt = GenericCliRuntime::with_program(spec_for("copilot").unwrap(), bin.to_string_lossy());
+        let rt =
+            GenericCliRuntime::with_program(spec_for("copilot").unwrap(), bin.to_string_lossy());
         let err = rt.run("hi", &ctx(dir.path())).await.unwrap_err();
-        assert!(matches!(err, GenericCliError::EmptyOutput { .. }), "{err:?}");
+        assert!(
+            matches!(err, GenericCliError::EmptyOutput { .. }),
+            "{err:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1053,7 +1166,10 @@ mod tests {
         };
         assert!(STDIN_SPEC.headless.prompt_via_stdin());
         let rt = GenericCliRuntime::with_program(&STDIN_SPEC, "/bin/cat");
-        let resp = rt.execute("piped question", &ctx(dir.path())).await.unwrap();
+        let resp = rt
+            .execute("piped question", &ctx(dir.path()))
+            .await
+            .unwrap();
         assert!(
             resp.content.contains("piped question"),
             "cat echoes the payload it received on stdin: {}",
@@ -1084,7 +1200,10 @@ mod tests {
         std::fs::create_dir_all(&bindir).unwrap();
         fake_bin(&bindir, "copilot", "true");
         let found = duduclaw_core::which_runtime_in_home(home.path(), "copilot");
-        assert!(found.is_some(), "catalog-driven probe must find ~/.local/bin/copilot");
+        assert!(
+            found.is_some(),
+            "catalog-driven probe must find ~/.local/bin/copilot"
+        );
         assert!(found.unwrap().ends_with("/copilot"));
         // …and an id that isn't in the catalog resolves to nothing at all.
         assert!(duduclaw_core::which_runtime_in_home(home.path(), "not-a-runtime").is_none());

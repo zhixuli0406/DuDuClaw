@@ -4,9 +4,9 @@
 // `into_axum_response` with a JSON-RPC value and the transport layer handles
 // Content-Type, status codes, and Retry-After.
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::Value;
 
 // ── JSON-RPC code → HTTP status mapping ──────────────────────────────────────
@@ -50,14 +50,15 @@ pub fn into_axum_response(jsonrpc: Value) -> Response {
 
         if status == StatusCode::TOO_MANY_REQUESTS {
             // Extract retry_after from the error message if present.
-            let retry_after = extract_retry_after(
-                err.get("message").and_then(|m| m.as_str()).unwrap_or(""),
-            );
+            let retry_after =
+                extract_retry_after(err.get("message").and_then(|m| m.as_str()).unwrap_or(""));
             let mut response = (status, Json(jsonrpc)).into_response();
             if let Some(secs) = retry_after {
                 response.headers_mut().insert(
                     "Retry-After",
-                    secs.to_string().parse().unwrap_or_else(|_| "1".parse().unwrap()),
+                    secs.to_string()
+                        .parse()
+                        .unwrap_or_else(|_| "1".parse().unwrap()),
                 );
             }
             return response;
@@ -111,7 +112,10 @@ mod tests {
 
     #[test]
     fn test_map_to_http_status_500_default() {
-        assert_eq!(map_to_http_status(-32603), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            map_to_http_status(-32603),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         assert_eq!(map_to_http_status(0), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(map_to_http_status(9999), StatusCode::INTERNAL_SERVER_ERROR);
     }

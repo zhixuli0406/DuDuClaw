@@ -2,20 +2,21 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tokio::sync::{RwLock, Semaphore};
+use tracing::{debug, info, warn};
 
 use crate::backend::InferenceBackend;
 use crate::config::InferenceConfig;
 use crate::error::{InferenceError, Result};
 use crate::hardware::detect_hardware;
 use crate::manager::{InferenceManager, InferenceMode};
-use crate::mlx_bridge::MlxBridge;
 use crate::model_manager::ModelManager;
 use crate::openai_compat::OpenAiCompatBackend;
 use crate::router::{ConfidenceRouter, RoutingDecision, RoutingTier};
 use crate::types::*;
+use crate::ucci::{Observation, UcciCascade};
 
 /// The main inference engine — manages backends, models, routing, and multi-mode switching.
 pub struct InferenceEngine {
@@ -24,12 +25,29 @@ pub struct InferenceEngine {
     model_manager: Arc<ModelManager>,
     hardware: RwLock<Option<HardwareInfo>>,
     router: Option<ConfidenceRouter>,
+    ucci: Option<UcciCascade>,
+    /// In-flight `ucci_shadow_strong` background generations. The shadow is a
+    /// *collection* side effect, so it runs detached (the user-visible reply
+    /// no longer waits for a second model call) and its observation row may
+    /// land after the reply — `scripts/ucci_fit.py` reads the JSONL by
+    /// `request_id`, not by line order, and the append itself already holds
+    /// `duduclaw_core::with_file_lock`. Handles are kept only so
+    /// [`InferenceEngine::flush_shadow_observations`] can drain them before a
+    /// process exits; finished ones are pruned on every push.
+    shadow_tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Caps how many `ucci_shadow_strong` background generations may run at
+    /// once (`[router] ucci_shadow_max_inflight`, default 1). A background
+    /// shadow and the next request's foreground generation share the same
+    /// backend/model slot, so leaving this unbounded risked a model-switch
+    /// race once shadows were detached onto their own tasks. Acquired with
+    /// `try_acquire_owned` — never awaited — so a saturated cap skips the
+    /// spawn instead of blocking or queuing behind the foreground reply.
+    shadow_inflight: Arc<Semaphore>,
+    /// Count of shadow spawns skipped because `shadow_inflight` was
+    /// saturated. Telemetry only (also `debug!`-logged at the skip site);
+    /// no new persistence — this is an in-memory counter for this process.
+    shadow_skipped_inflight: Arc<AtomicU64>,
     manager: InferenceManager,
-    mlx: Option<MlxBridge>,
-    /// JitRL zero-gradient continual learning (arXiv:2601.18510, see
-    /// [`crate::jitrl`]). `None` unless `[jitrl] enabled = true` — the
-    /// disabled hot path carries zero JitRL code and requests are untouched.
-    jitrl: Option<crate::jitrl::JitrlEngine>,
     /// DuDuClaw home dir (`~/.duduclaw`), used to resolve encrypted config
     /// fields (e.g. `openai_compat.api_key_enc`) read-only at backend build.
     home_dir: std::path::PathBuf,
@@ -43,12 +61,17 @@ impl InferenceEngine {
         let model_manager = Arc::new(ModelManager::new(models_dir));
 
         let router = config.router.clone().map(ConfidenceRouter::new);
+        let ucci = config
+            .router
+            .as_ref()
+            .filter(|c| c.enabled)
+            .map(|c| UcciCascade::load(c, home_dir));
         let manager = InferenceManager::new(&config);
-        let mlx = config.mlx.clone().map(MlxBridge::new);
-        let jitrl = config
-            .jitrl
-            .clone()
-            .and_then(|c| crate::jitrl::JitrlEngine::new(c, home_dir));
+        let shadow_max_inflight = config
+            .router
+            .as_ref()
+            .map(|r| r.effective_ucci_shadow_max_inflight())
+            .unwrap_or(1);
 
         Self {
             config,
@@ -56,9 +79,11 @@ impl InferenceEngine {
             model_manager,
             hardware: RwLock::new(None),
             router,
+            ucci,
+            shadow_tasks: tokio::sync::Mutex::new(Vec::new()),
+            shadow_inflight: Arc::new(Semaphore::new(shadow_max_inflight)),
+            shadow_skipped_inflight: Arc::new(AtomicU64::new(0)),
             manager,
-            mlx,
-            jitrl,
             home_dir: home_dir.to_path_buf(),
         }
     }
@@ -106,7 +131,7 @@ impl InferenceEngine {
                 );
             }
 
-        // Initialize InferenceManager (Exo, llamafile)
+        // Initialize InferenceManager (llamafile)
         let mgr_mode = self.manager.init().await.unwrap_or(InferenceMode::CloudOnly);
         if mgr_mode != InferenceMode::CloudOnly {
             info!(mode = %mgr_mode, "InferenceManager active");
@@ -124,12 +149,6 @@ impl InferenceEngine {
                     Some(Arc::new(OpenAiCompatBackend::new_with_home(compat, &self.home_dir).await));
             }
         }
-
-        // Check MLX availability
-        if let Some(ref mlx) = self.mlx
-            && mlx.is_available().await {
-                info!("MLX bridge available for evolution reflections");
-            }
 
         // Auto-load default model if configured
         if self.config.auto_load
@@ -157,34 +176,21 @@ impl InferenceEngine {
         let backend_type = self.config.backend.unwrap_or(hw.recommended_backend);
 
         match backend_type {
-            BackendType::LlamaCpp => {
-                #[cfg(any(feature = "metal", feature = "cuda", feature = "vulkan"))]
-                {
-                    info!("Using llama.cpp backend");
-                    return Ok(Box::new(crate::llama_cpp::LlamaCppBackend::new()));
-                }
-                #[cfg(not(any(feature = "metal", feature = "cuda", feature = "vulkan")))]
-                {
-                    Err(InferenceError::BackendUnavailable {
-                        backend: "llama.cpp".to_string(),
-                        reason: "Build with --features metal, cuda, or vulkan to enable llama.cpp".to_string(),
-                    })
-                }
-            }
-            BackendType::MistralRs => {
-                #[cfg(feature = "mistralrs")]
-                {
-                    let mrs_config = self.config.mistralrs.clone().unwrap_or_default();
-                    info!(isq = ?mrs_config.isq_bits, paged_attn = mrs_config.paged_attention, "Using mistral.rs backend");
-                    return Ok(Box::new(crate::mistral_rs::MistralRsBackend::new(mrs_config)));
-                }
-                #[cfg(not(feature = "mistralrs"))]
-                {
-                    Err(InferenceError::BackendUnavailable {
-                        backend: "mistral.rs".to_string(),
-                        reason: "mistralrs feature not enabled at compile time. Build with --features mistralrs-metal or mistralrs-cuda".to_string(),
-                    })
-                }
+            // Removed 2026-09-29 (`wiki/reports/feature-audit-2026-09-29.md`
+            // T1-D3 / T3-S5): the in-process llama.cpp and mistral.rs backends
+            // were never compiled into a shipped binary (`release.sh` builds
+            // neither `metal`/`cuda`/`vulkan` nor `mistralrs`), and llama.cpp's
+            // `generate()` was a stub. The variants stay so an existing
+            // `inference.toml` carrying `backend = "llama_cpp"` still parses;
+            // they now fail with a message that names the replacement.
+            BackendType::LlamaCpp | BackendType::MistralRs => {
+                Err(InferenceError::BackendUnavailable {
+                    backend: backend_type.to_string(),
+                    reason: "in-process backend removed in 2026-09 — run a local \
+                             OpenAI-compatible server (llama-server / Ollama / vLLM) \
+                             and point [openai_compat] base_url at it"
+                        .to_string(),
+                })
             }
             BackendType::OpenAiCompat => Err(InferenceError::Config(
                 "OpenAI-compatible backend requires [openai_compat] config section".to_string(),
@@ -197,19 +203,24 @@ impl InferenceEngine {
     /// Returns `Ok(Some(response))` if handled locally,
     /// `Ok(None)` if the router decided to escalate to Cloud API.
     ///
-    /// **Calibrated cascade** (when `router.post_hoc_enabled`): after a local
-    /// tier answers, the mean token logprob is logistic-mapped into an acceptance
-    /// score `g`; a rejected answer escalates LocalFast → LocalStrong →
-    /// Cloud API instead of being returned. When post-hoc is disabled or the
-    /// backend returns no logprobs, behaviour is identical to the legacy path.
+    /// With a fitted UCCI router, use top-2 token margins to decide whether
+    /// to escalate LocalFast → LocalStrong → Cloud API. Without UCCI, the
+    /// optional legacy post-hoc logistic gate retains its previous behavior.
+    ///
+    /// Takes `&Arc<Self>` so the opt-in `ucci_shadow_strong` collection call
+    /// can be detached onto its own task instead of doubling the latency of
+    /// the reply it is only *observing*. Call
+    /// [`InferenceEngine::flush_shadow_observations`] before process exit to
+    /// drain whatever is still in flight.
     pub async fn route_and_generate(
-        &self,
+        self: &Arc<Self>,
         request: &InferenceRequest,
     ) -> Result<Option<InferenceResponse>> {
         let decision = self.route(&request.system_prompt, &request.user_prompt);
 
         let mut tier = decision.tier;
         let mut model_id = decision.model_id;
+        let request_id = uuid::Uuid::new_v4().to_string();
 
         loop {
             if tier == RoutingTier::CloudApi {
@@ -219,39 +230,106 @@ impl InferenceEngine {
 
             // Override model_id with the router's decision
             let mut routed_request = request.clone();
-            if self.post_hoc_enabled() {
+            let ucci_enabled = self
+                .ucci
+                .as_ref()
+                .is_some_and(|u| u.requested() || u.collecting());
+            if ucci_enabled {
                 routed_request.params.capture_logprobs = true;
+            }
+            if ucci_enabled {
+                // UCCI's token margin is defined for greedy generation.
+                routed_request.params.temperature = 0.0;
+                routed_request.params.capture_top_logprobs = true;
+                routed_request.params.ucci_drop_stop_token = self
+                    .router
+                    .as_ref()
+                    .is_some_and(|r| r.config().ucci_drop_stop_token);
             }
             if let Some(ref id) = model_id {
                 routed_request.model_id = Some(id.clone());
             }
             let response = self.generate(&routed_request).await?;
 
-            let Some(assessment) = self.assess_response(&response) else {
-                // Post-hoc disabled or no logprobs from the server — accept
-                // the answer exactly as before (fail-safe).
-                return Ok(Some(response));
-            };
-            if assessment.accepted {
-                info!(
-                    tier = %tier,
-                    p_bar = format!("{:.3}", assessment.p_bar),
-                    g = format!("{:.3}", assessment.g),
-                    "Post-hoc confidence accepted local answer"
-                );
+            if ucci_enabled {
+                let cascade = self.ucci.as_ref().expect("ucci_enabled implies cascade");
+                let route = response
+                    .margin_uncertainty
+                    .and_then(|u| cascade.router(tier).and_then(|router| router.route(u).ok()));
+                let escalated = route
+                    .as_ref()
+                    .map(|r| r.escalate)
+                    .or_else(|| cascade.stage_configured(tier).then_some(true));
+                cascade
+                    .observe(&Observation::from_response(
+                        &request_id,
+                        tier,
+                        &request.system_prompt,
+                        &request.user_prompt,
+                        &response,
+                        route.as_ref().map(|r| r.p_hat),
+                        escalated,
+                    ))
+                    .await;
+                if cascade.requested() {
+                    match route {
+                        // The two escalating arms fall through to the
+                        // tier-escalation block below.
+                        Some(route) if route.escalate => {
+                            info!(tier = %tier, u = ?response.margin_uncertainty,
+                            p_hat = route.p_hat, "UCCI escalated local answer");
+                        }
+                        Some(route) => {
+                            info!(tier = %tier, u = ?response.margin_uncertainty,
+                            p_hat = route.p_hat, "UCCI accepted local answer");
+                            self.spawn_strong_shadow(&request_id, tier, request).await;
+                            return Ok(Some(response));
+                        }
+                        None if cascade.stage_configured(tier) => {
+                            warn!(tier = %tier, "UCCI assessment unavailable; escalating local answer");
+                        }
+                        None => {
+                            self.spawn_strong_shadow(&request_id, tier, request).await;
+                            return Ok(Some(response));
+                        }
+                    }
+                } else {
+                    // Collection-only UCCI (`ucci_shadow_strong` / observation
+                    // gathering without a fitted router): observe, then accept
+                    // exactly as an ungated tier does.
+                    self.spawn_strong_shadow(&request_id, tier, request).await;
+                    return Ok(Some(response));
+                }
+            } else {
+                // No calibration gate is active for this tier, so there is
+                // nothing that could reject the answer — accept it. Until
+                // 2026-09-29 this was the `assess_response() == None` branch
+                // of the legacy post-hoc gate (`…feature-audit-2026-09-29.md`
+                // T3-S7); with that gate removed the fail-safe has to be
+                // stated explicitly, or an ungated tier would escalate every
+                // single answer.
+                self.spawn_strong_shadow(&request_id, tier, request).await;
                 return Ok(Some(response));
             }
 
             // Low confidence — escalate to the next tier.
-            let router = self.router.as_ref().expect("assess_response implies router");
+            let router = self
+                .router
+                .as_ref()
+                .expect("a routed tier implies a configured router");
             let next = router.next_tier(tier).unwrap_or(RoutingTier::CloudApi);
+            // Carry the margin UCCI actually decided on (`None` on a UCCI
+            // escalation forced by a missing top-2 signal — exactly the case
+            // worth spotting in a log).
             info!(
+                router = "ucci",
+                tier_from = %tier,
+                tier_to = %next,
+                margin = ?response.margin_uncertainty,
+                // Kept so existing log filters on `from`/`to` still match.
                 from = %tier,
                 to = %next,
-                p_bar = format!("{:.3}", assessment.p_bar),
-                g = format!("{:.3}", assessment.g),
-                threshold = router.config().post_hoc_accept_threshold,
-                "Post-hoc confidence below threshold, escalating"
+                "Confidence below threshold, escalating"
             );
             tier = next;
             model_id = match next {
@@ -261,27 +339,142 @@ impl InferenceEngine {
         }
     }
 
-    /// Post-hoc (cascade) confidence of a generated response: `(p̄, g, accepted)`
-    /// via [`crate::router::PostHocAssessment::as_tuple`]. Returns `None` when
-    /// no router is configured, post-hoc is disabled, or the backend returned
-    /// no logprobs — callers should then treat the answer as accepted.
-    ///
-    /// Intended for gateway calibration logging alongside outcomes. Status
-    /// 2026-09: the gateway has no caller — `(p̄, g, accepted)` is never
-    /// persisted next to an outcome label, so `post_hoc_alpha`/`beta` remain
-    /// unfitted defaults (a fixed `ln 0.5` mean-logprob cutoff). Not scheduled.
-    pub fn assess_response(
-        &self,
-        response: &InferenceResponse,
-    ) -> Option<crate::router::PostHocAssessment> {
-        self.router.as_ref()?.evaluate_post_hoc(response.mean_logprob)
+    /// Whether a fitted UCCI router was requested for either local tier.
+    pub fn ucci_requested(&self) -> bool {
+        self.ucci.as_ref().is_some_and(UcciCascade::requested)
     }
 
-    /// Whether post-hoc (cascade) confidence checking is active.
-    pub fn post_hoc_enabled(&self) -> bool {
-        self.router
+    /// Detach the opt-in `ucci_shadow_strong` collection call.
+    ///
+    /// Until 2026-09-28 this ran inline: every accepted Fast reply waited for
+    /// a full Strong generation before the user saw it, doubling latency for
+    /// a row that is only ever read offline by `scripts/ucci_fit.py`. The
+    /// eligibility checks stay on the caller's task (they are pure config
+    /// reads and cost nothing), so a disabled shadow spawns nothing at all;
+    /// only the generation and the JSONL append move to a background task.
+    ///
+    /// The observation row is therefore allowed to lag the reply. That is
+    /// safe for its one consumer — the fitter pairs rows by `request_id` and
+    /// does not care about file order — and the append already serializes
+    /// across processes through `duduclaw_core::with_file_lock`.
+    ///
+    /// Detaching the shadow (2026-09-28) removed the doubled-latency bug but
+    /// opened a new one: nothing capped how many background shadows could run
+    /// at once, so a burst of accepted Fast replies could pile up shadows
+    /// that race the *next* request's foreground generation for the same
+    /// backend/model slot. `shadow_inflight` bounds that (default 1 via
+    /// `[router] ucci_shadow_max_inflight`); a saturated cap skips the spawn
+    /// entirely rather than queuing or blocking — the foreground reply is
+    /// unaffected either way, it simply loses that one observation row.
+    async fn spawn_strong_shadow(
+        self: &Arc<Self>,
+        request_id: &str,
+        tier: RoutingTier,
+        request: &InferenceRequest,
+    ) {
+        if tier != RoutingTier::LocalFast {
+            return;
+        }
+        let eligible = self
+            .router
             .as_ref()
-            .is_some_and(|r| r.config().post_hoc_enabled)
+            .zip(self.ucci.as_ref())
+            .is_some_and(|(router, cascade)| {
+                router.config().ucci_shadow_strong
+                    && cascade.collecting()
+                    && router.config().strong_model.is_some()
+            });
+        if !eligible {
+            return;
+        }
+        let permit = match Arc::clone(&self.shadow_inflight).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.shadow_skipped_inflight.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    request_id,
+                    %tier,
+                    "UCCI shadow strong generation skipped: max inflight reached"
+                );
+                return;
+            }
+        };
+        let engine = Arc::clone(self);
+        let request_id = request_id.to_string();
+        let request = request.clone();
+        let handle = tokio::spawn(async move {
+            // Held until the shadow generation finishes (success, error, or
+            // panic-unwind) so the permit count always tracks reality.
+            let _permit = permit;
+            engine
+                .record_strong_shadow(&request_id, tier, &request)
+                .await;
+        });
+        let mut tasks = self.shadow_tasks.lock().await;
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
+    }
+
+    /// Await every in-flight `ucci_shadow_strong` observation.
+    ///
+    /// Call this on the way out of a process that may exit while a shadow is
+    /// still generating; without it the last row or two are simply lost (the
+    /// rest of the file is already durable — each row is appended under a
+    /// file lock as soon as its generation returns).
+    pub async fn flush_shadow_observations(&self) {
+        let pending: Vec<_> = std::mem::take(&mut *self.shadow_tasks.lock().await);
+        for task in pending {
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                warn!(%error, "UCCI shadow observation task panicked");
+            }
+        }
+    }
+
+    async fn record_strong_shadow(
+        &self,
+        request_id: &str,
+        tier: RoutingTier,
+        request: &InferenceRequest,
+    ) {
+        if tier != RoutingTier::LocalFast {
+            return;
+        }
+        let Some(router) = self.router.as_ref() else {
+            return;
+        };
+        let Some(cascade) = self.ucci.as_ref() else {
+            return;
+        };
+        if !router.config().ucci_shadow_strong || !cascade.collecting() {
+            return;
+        }
+        let Some(model_id) = router.config().strong_model.as_ref() else {
+            return;
+        };
+        let mut shadow = request.clone();
+        shadow.model_id = Some(model_id.clone());
+        shadow.params.temperature = 0.0;
+        shadow.params.capture_logprobs = true;
+        shadow.params.capture_top_logprobs = true;
+        shadow.params.ucci_drop_stop_token = router.config().ucci_drop_stop_token;
+        match self.generate(&shadow).await {
+            Ok(response) => {
+                cascade
+                    .observe(&Observation::from_response(
+                        request_id,
+                        RoutingTier::LocalStrong,
+                        &request.system_prompt,
+                        &request.user_prompt,
+                        &response,
+                        None,
+                        None,
+                    ))
+                    .await
+            }
+            Err(error) => warn!(%error, "UCCI LocalStrong shadow generation failed"),
+        }
     }
 
     /// Get the routing decision for a query (without generating).
@@ -293,14 +486,13 @@ impl InferenceEngine {
                 confidence: 0.5,
                 reason: "No router configured".to_string(),
                 model_id: self.config.default_model.clone(),
-                post_hoc: None,
             },
         }
     }
 
     /// Load a model by id or path.
     ///
-    /// For local backends (llama.cpp, mistral.rs) the id is resolved against
+    /// For in-process backends the id is resolved against
     /// `models_dir` and the resulting filesystem path is passed to the backend.
     /// For remote backends (OpenAI-compatible HTTP) the id is passed through
     /// unchanged because the model lives on a server — without this branch the
@@ -352,121 +544,7 @@ impl InferenceEngine {
             }
         }
 
-        // JitRL Tier B injection (arXiv:2601.18510, see `crate::jitrl`):
-        // when enabled and a stored experience is similar enough, clone the
-        // request and attach the clamped logit-bias map. Disabled (`jitrl` is
-        // `None`) skips this block entirely — the request passes through
-        // untouched and un-cloned.
-        if let Some(ref jitrl) = self.jitrl {
-            let model_id = self.jitrl_model_key(request.model_id.as_deref()).await;
-            if let Some(model_id) = model_id
-                && let Some(bias) = jitrl.prepare_bias(&request.user_prompt, &model_id) {
-                    let mut biased = request.clone();
-                    biased.params.logit_bias = Some(bias);
-                    return backend.generate(&biased).await;
-                }
-        }
-
         backend.generate(request).await
-    }
-
-    /// Canonical JitRL model key — ONE resolution chain shared by the
-    /// retrieval side ([`Self::generate`]) and the record side
-    /// ([`Self::jitrl_record_feedback`]): explicit request model →
-    /// `ModelManager`'s loaded id → backend-reported loaded model.
-    ///
-    /// HIGH-D (2026-07): record used to key by `endpoint.model` (the compat
-    /// server's *configured* model name) while retrieval keyed by
-    /// `request.model_id` / the loaded id — when those strings differed,
-    /// every recorded reward was unretrievable (vocabulary isolation filters
-    /// on exact `model_id` equality).
-    async fn jitrl_model_key(&self, request_model: Option<&str>) -> Option<String> {
-        if let Some(id) = request_model {
-            if !id.is_empty() {
-                return Some(id.to_string());
-            }
-        }
-        if let Some(id) = self.model_manager.loaded_model_id().await {
-            return Some(id);
-        }
-        if let Ok(backend) = self.get_backend().await {
-            if let Some(m) = backend.loaded_model().await {
-                return Some(m.id);
-            }
-        }
-        None
-    }
-
-    /// Record explicit JitRL feedback for a `(prompt, response)` pair
-    /// (reward in `[-1, 1]`, positive = reinforce, negative = suppress).
-    ///
-    /// v1 tokenizes the response through the active OpenAI-compatible
-    /// server's `/tokenize` endpoint so the stored token ids belong to the
-    /// serving model's vocabulary. Errors honestly when JitRL is disabled or
-    /// no compat endpoint is active — feedback is never fabricated.
-    pub async fn jitrl_record_feedback(
-        &self,
-        prompt: &str,
-        response: &str,
-        reward: f32,
-    ) -> Result<usize> {
-        // Disabled check FIRST: "jitrl is disabled" must win over "no
-        // tokenizer endpoint" for an honest error message.
-        if self.jitrl.is_none() {
-            return Err(InferenceError::Config(
-                "jitrl is disabled — set [jitrl] enabled = true in inference.toml".to_string(),
-            ));
-        }
-        let endpoint =
-            self.compat_endpoint()
-                .await
-                .ok_or_else(|| InferenceError::BackendUnavailable {
-                    backend: "jitrl-tokenizer".to_string(),
-                    reason: "no OpenAI-compatible endpoint active — JitRL v1 needs the \
-                             server's /tokenize to map the response onto the model's \
-                             token ids"
-                        .to_string(),
-                })?;
-        let tokenizer = crate::jitrl::HttpTokenizer::new(
-            &endpoint.base_url,
-            &endpoint.model,
-            endpoint.api_key.clone(),
-        );
-        // HIGH-D key unification: store under the SAME key retrieval will use
-        // (loaded model id first); the endpoint's configured model name is
-        // only the last resort when nothing is loaded.
-        let model_key = self
-            .jitrl_model_key(None)
-            .await
-            .unwrap_or_else(|| endpoint.model.clone());
-        self.jitrl_record_feedback_with(&tokenizer, prompt, response, reward, &model_key)
-            .await
-    }
-
-    /// Tokenizer-injected core of [`Self::jitrl_record_feedback`] — split out
-    /// so tests can prove the record→retrieve key roundtrip without an HTTP
-    /// `/tokenize` endpoint.
-    async fn jitrl_record_feedback_with(
-        &self,
-        tokenizer: &dyn crate::jitrl::JitrlTokenizer,
-        prompt: &str,
-        response: &str,
-        reward: f32,
-        model_key: &str,
-    ) -> Result<usize> {
-        let Some(ref jitrl) = self.jitrl else {
-            return Err(InferenceError::Config(
-                "jitrl is disabled — set [jitrl] enabled = true in inference.toml".to_string(),
-            ));
-        };
-        jitrl
-            .record_feedback(tokenizer, prompt, response, reward, model_key)
-            .await
-    }
-
-    /// Whether JitRL is enabled and active.
-    pub fn jitrl_enabled(&self) -> bool {
-        self.jitrl.is_some()
     }
 
     /// Generate text with a simple prompt (convenience method).
@@ -580,17 +658,9 @@ impl InferenceEngine {
         &self.manager
     }
 
-    /// Get the current inference mode (Exo / llamafile / direct / cloud).
+    /// Get the current inference mode (llamafile / direct / cloud).
     pub async fn current_mode(&self) -> InferenceMode {
         self.manager.current_mode().await
-    }
-
-    /// Check if MLX bridge is available for evolution.
-    pub async fn mlx_available(&self) -> bool {
-        match &self.mlx {
-            Some(m) => m.is_available().await,
-            None => false,
-        }
     }
 
     #[cfg(test)]
@@ -719,22 +789,43 @@ mod tests {
     struct CascadeStub {
         /// model id → mean_logprob returned by generate()
         logprobs: std::collections::HashMap<String, Option<f32>>,
+        margins: std::collections::HashMap<String, f64>,
         calls: std::sync::Mutex<Vec<String>>,
         capture_flags: std::sync::Mutex<Vec<bool>>,
         loaded: RwLock<Option<ModelInfo>>,
+        /// model id → gate a `generate()` for that model waits on, and which
+        /// is only recorded in `calls` once released. Lets a test prove that
+        /// a caller did *not* wait for a particular model's generation.
+        gate: Option<(String, Arc<tokio::sync::Notify>)>,
+        /// Number of gated `generate()` calls currently parked on `gate`,
+        /// incremented before the wait and decremented after. Lets a test
+        /// prove two shadow generations are genuinely concurrent (both
+        /// parked at once) rather than merely both eventually completing one
+        /// after the other.
+        gate_waiting: std::sync::atomic::AtomicUsize,
     }
 
     impl CascadeStub {
         fn new(logprobs: &[(&str, Option<f32>)]) -> Self {
             Self {
-                logprobs: logprobs
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), *v))
-                    .collect(),
+                logprobs: logprobs.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+                margins: std::collections::HashMap::new(),
                 calls: std::sync::Mutex::new(Vec::new()),
                 capture_flags: std::sync::Mutex::new(Vec::new()),
                 loaded: RwLock::new(None),
+                gate: None,
+                gate_waiting: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        fn with_margins(mut self, margins: &[(&str, f64)]) -> Self {
+            self.margins = margins.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+            self
+        }
+
+        fn blocking_on(mut self, model_id: &str, gate: Arc<tokio::sync::Notify>) -> Self {
+            self.gate = Some((model_id.to_string(), gate));
+            self
         }
 
         fn stub_info(id: &str) -> ModelInfo {
@@ -784,12 +875,20 @@ mod tests {
 
         async fn generate(&self, request: &InferenceRequest) -> Result<InferenceResponse> {
             let model = request.model_id.clone().unwrap_or_default();
+            if let Some((gated, gate)) = self.gate.as_ref()
+                && *gated == model
+            {
+                self.gate_waiting.fetch_add(1, Ordering::SeqCst);
+                gate.notified().await;
+                self.gate_waiting.fetch_sub(1, Ordering::SeqCst);
+            }
             self.calls.lock().unwrap().push(model.clone());
             self.capture_flags
                 .lock()
                 .unwrap()
                 .push(request.params.capture_logprobs);
             let mean_logprob = self.logprobs.get(&model).copied().flatten();
+            let margin_uncertainty = self.margins.get(&model).copied();
             Ok(InferenceResponse {
                 text: format!("answer from {model}"),
                 tokens_generated: 2,
@@ -799,6 +898,7 @@ mod tests {
                 backend: BackendType::OpenAiCompat,
                 model_id: model,
                 mean_logprob,
+                margin_uncertainty,
             })
         }
 
@@ -808,9 +908,8 @@ mod tests {
     }
 
     /// Build an engine with a [router] section written to inference.toml.
-    async fn cascade_engine(tmp: &TempDir, post_hoc_enabled: bool) -> InferenceEngine {
-        let toml = format!(
-            r#"
+    async fn cascade_engine(tmp: &TempDir) -> Arc<InferenceEngine> {
+        let toml = r#"
 enabled = true
 
 [router]
@@ -819,13 +918,11 @@ fast_threshold = 0.7
 strong_threshold = 0.35
 fast_model = "fast-model"
 strong_model = "strong-model"
-post_hoc_enabled = {post_hoc_enabled}
-"#
-        );
+"#;
         tokio::fs::write(tmp.path().join("inference.toml"), toml)
             .await
             .expect("write inference.toml");
-        InferenceEngine::new(tmp.path()).await
+        Arc::new(InferenceEngine::new(tmp.path()).await)
     }
 
     /// A prompt that the ex-ante router sends to LocalFast ("hello" keyword).
@@ -838,86 +935,18 @@ post_hoc_enabled = {post_hoc_enabled}
         }
     }
 
+    /// Regression (2026-09-29, `wiki/reports/feature-audit-2026-09-29.md`
+    /// T3-S7): removing the legacy post-hoc gate must NOT turn an ungated
+    /// tier into an always-escalating one. With no UCCI router file and no
+    /// post-hoc gate, the first local answer is returned as-is and the
+    /// backend is called exactly once — the same behaviour
+    /// `post_hoc_enabled = false` produced before the gate was deleted.
     #[tokio::test]
-    async fn cascade_low_confidence_escalates_fast_to_strong() {
+    async fn no_calibration_gate_accepts_the_first_local_answer() {
         let tmp = TempDir::new().expect("tempdir");
-        let engine = cascade_engine(&tmp, true).await;
-        // fast tier answers with very low p̄ → rejected; strong tier is confident.
-        let backend = Arc::new(CascadeStub::new(&[
-            ("fast-model", Some(-4.0)),
-            ("strong-model", Some(-0.05)),
-        ]));
-        engine.set_backend_for_test(backend.clone()).await;
-
-        let response = engine
-            .route_and_generate(&fast_request())
-            .await
-            .expect("generate ok")
-            .expect("answered locally");
-
-        assert_eq!(response.model_id, "strong-model");
-        assert_eq!(
-            *backend.calls.lock().unwrap(),
-            vec!["fast-model".to_string(), "strong-model".to_string()]
-        );
-        // Post-hoc mode must request logprobs from the backend.
-        assert!(backend.capture_flags.lock().unwrap().iter().all(|&f| f));
-        // Calibration inputs are exposed for logging.
-        let (p_bar, g, accepted) = engine
-            .assess_response(&response)
-            .expect("assessment")
-            .as_tuple();
-        assert!(accepted);
-        assert!(p_bar > 0.9);
-        assert!(g >= 0.5);
-    }
-
-    #[tokio::test]
-    async fn cascade_strong_low_confidence_signals_cloud_escalation() {
-        let tmp = TempDir::new().expect("tempdir");
-        let engine = cascade_engine(&tmp, true).await;
-        // Both local tiers answer with low confidence → Ok(None) cloud signal.
-        let backend = Arc::new(CascadeStub::new(&[
-            ("fast-model", Some(-4.0)),
-            ("strong-model", Some(-4.0)),
-        ]));
-        engine.set_backend_for_test(backend.clone()).await;
-
-        let out = engine
-            .route_and_generate(&fast_request())
-            .await
-            .expect("generate ok");
-
-        assert!(out.is_none(), "low-confidence strong answer must escalate to cloud");
-        assert_eq!(
-            *backend.calls.lock().unwrap(),
-            vec!["fast-model".to_string(), "strong-model".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn cascade_high_confidence_accepts_first_answer() {
-        let tmp = TempDir::new().expect("tempdir");
-        let engine = cascade_engine(&tmp, true).await;
-        let backend = Arc::new(CascadeStub::new(&[("fast-model", Some(-0.05))]));
-        engine.set_backend_for_test(backend.clone()).await;
-
-        let response = engine
-            .route_and_generate(&fast_request())
-            .await
-            .expect("generate ok")
-            .expect("answered locally");
-
-        assert_eq!(response.model_id, "fast-model");
-        assert_eq!(backend.calls.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn cascade_disabled_behaves_like_legacy_router() {
-        // Regression guard: post_hoc_enabled = false → the (low-confidence)
-        // first answer is returned exactly as before, no logprobs requested.
-        let tmp = TempDir::new().expect("tempdir");
-        let engine = cascade_engine(&tmp, false).await;
+        let engine = cascade_engine(&tmp).await;
+        // A very low mean logprob: under the old gate this would have been
+        // rejected, and with no gate at all it must still be accepted.
         let backend = Arc::new(CascadeStub::new(&[("fast-model", Some(-4.0))]));
         engine.set_backend_for_test(backend.clone()).await;
 
@@ -925,289 +954,421 @@ post_hoc_enabled = {post_hoc_enabled}
             .route_and_generate(&fast_request())
             .await
             .expect("generate ok")
-            .expect("answered locally");
+            .expect("an ungated tier must answer locally, not escalate");
 
         assert_eq!(response.model_id, "fast-model");
-        assert_eq!(backend.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            backend.calls.lock().unwrap().as_slice(),
+            &["fast-model"],
+            "no second tier may be called when nothing rejected the answer"
+        );
         assert!(
             backend.capture_flags.lock().unwrap().iter().all(|&f| !f),
-            "legacy path must not request logprobs"
+            "an ungated tier must not request logprobs"
         );
-        assert!(engine.assess_response(&response).is_none());
     }
 
     #[tokio::test]
-    async fn cascade_without_logprobs_is_fail_safe() {
-        // Post-hoc enabled but the server returns no logprobs → accept the
-        // answer as today (no escalation, no error).
-        let tmp = TempDir::new().expect("tempdir");
-        let engine = cascade_engine(&tmp, true).await;
-        let backend = Arc::new(CascadeStub::new(&[("fast-model", None)]));
+    async fn ucci_routes_both_local_tiers_and_logs_review_rows() {
+        use ucci::{
+            Router,
+            calibration::IsotonicCalibrator,
+            policy::{CostModel, Costs},
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let map = IsotonicCalibrator::fit(&[0.0, 1.0], &[0.0, 1.0]).unwrap();
+        let costs = Costs::new(1.0, 3.0, CostModel::Sequential).unwrap();
+        Router::new(map.clone(), 0.5, costs)
+            .unwrap()
+            .save(tmp.path().join("fast.json"))
+            .unwrap();
+        Router::new(map, 0.5, costs)
+            .unwrap()
+            .save(tmp.path().join("strong.json"))
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("inference.toml"),
+            r#"
+enabled = true
+[router]
+enabled = true
+fast_threshold = 0.7
+strong_threshold = 0.35
+fast_model = "fast-model"
+strong_model = "strong-model"
+ucci_fast_router = "fast.json"
+ucci_strong_router = "strong.json"
+ucci_observations = "observations.jsonl"
+"#,
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(InferenceEngine::new(tmp.path()).await);
+        let backend = Arc::new(
+            CascadeStub::new(&[]).with_margins(&[("fast-model", 0.9), ("strong-model", 0.8)]),
+        );
+        engine.set_backend_for_test(backend.clone()).await;
+        assert!(
+            engine
+                .route_and_generate(&fast_request())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            backend.calls.lock().unwrap().as_slice(),
+            &["fast-model", "strong-model"]
+        );
+        let rows = tokio::fs::read_to_string(tmp.path().join("observations.jsonl"))
+            .await
+            .unwrap();
+        let records: Vec<serde_json::Value> = rows
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["stage"], "local_fast");
+        assert_eq!(records[0]["u"], 0.9);
+        assert_eq!(records[0]["escalated"], true);
+        assert_eq!(records[0]["label_source"], serde_json::Value::Null);
+        assert_eq!(records[0]["request_id"], records[1]["request_id"]);
+    }
+
+    #[tokio::test]
+    async fn ucci_collection_can_shadow_strong_without_changing_fast_reply() {
+        let tmp = TempDir::new().unwrap();
+        tokio::fs::write(
+            tmp.path().join("inference.toml"),
+            r#"
+enabled = true
+[router]
+enabled = true
+fast_model = "fast-model"
+strong_model = "strong-model"
+ucci_observations = "observations.jsonl"
+ucci_shadow_strong = true
+"#,
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(InferenceEngine::new(tmp.path()).await);
+        let backend = Arc::new(
+            CascadeStub::new(&[]).with_margins(&[("fast-model", 0.2), ("strong-model", 0.1)]),
+        );
+        engine.set_backend_for_test(backend.clone()).await;
+        let result = engine
+            .route_and_generate(&fast_request())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.model_id, "fast-model");
+        // The shadow now runs detached, so its call and its row are only
+        // guaranteed once the engine has been flushed. Everything after the
+        // flush is exactly what this test asserted while it ran inline.
+        engine.flush_shadow_observations().await;
+        assert_eq!(
+            backend.calls.lock().unwrap().as_slice(),
+            &["fast-model", "strong-model"]
+        );
+        let rows = tokio::fs::read_to_string(tmp.path().join("observations.jsonl"))
+            .await
+            .unwrap();
+        assert_eq!(rows.lines().count(), 2);
+    }
+
+    /// Regression: `ucci_shadow_strong` ran its Strong generation inline, so
+    /// every accepted Fast reply paid for a second model call before the user
+    /// saw anything — a collection side effect charging the reply path. The
+    /// reply must now return without waiting for it.
+    #[tokio::test]
+    async fn ucci_shadow_strong_does_not_block_the_fast_reply() {
+        let tmp = TempDir::new().unwrap();
+        tokio::fs::write(
+            tmp.path().join("inference.toml"),
+            r#"
+enabled = true
+[router]
+enabled = true
+fast_model = "fast-model"
+strong_model = "strong-model"
+ucci_observations = "observations.jsonl"
+ucci_shadow_strong = true
+"#,
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(InferenceEngine::new(tmp.path()).await);
+        // The Strong model is held until the test releases it; if the reply
+        // waited for the shadow, `route_and_generate` could not return.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(
+            CascadeStub::new(&[])
+                .with_margins(&[("fast-model", 0.2), ("strong-model", 0.1)])
+                .blocking_on("strong-model", release.clone()),
+        );
         engine.set_backend_for_test(backend.clone()).await;
 
-        let response = engine
+        // Bounded so the pre-fix inline shadow fails this test instead of
+        // hanging the suite: the gate is not released until after the
+        // assertions below.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.route_and_generate(&fast_request()),
+        )
+        .await
+        .expect("the reply must not wait for the shadow generation")
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result.model_id, "fast-model");
+        assert_eq!(
+            backend.calls.lock().unwrap().as_slice(),
+            &["fast-model"],
+            "the reply must not wait for the shadow generation"
+        );
+        release.notify_one();
+        engine.flush_shadow_observations().await;
+        assert_eq!(
+            backend.calls.lock().unwrap().as_slice(),
+            &["fast-model", "strong-model"],
+            "the shadow must still run, just not inline"
+        );
+        let rows = tokio::fs::read_to_string(tmp.path().join("observations.jsonl"))
+            .await
+            .unwrap();
+        assert_eq!(rows.lines().count(), 2);
+    }
+
+    /// The flush must be a no-op when nothing was ever spawned: a disabled
+    /// shadow spawns no task at all, so a shutdown hook cannot hang on it.
+    #[tokio::test]
+    async fn flush_shadow_observations_is_a_no_op_without_shadow_collection() {
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = cascade_engine(&tmp).await;
+        let backend = Arc::new(CascadeStub::new(&[("fast-model", Some(-0.05))]));
+        engine.set_backend_for_test(backend.clone()).await;
+        engine
             .route_and_generate(&fast_request())
             .await
             .expect("generate ok")
             .expect("answered locally");
-
-        assert_eq!(response.model_id, "fast-model");
-        assert_eq!(backend.calls.lock().unwrap().len(), 1);
-        assert!(engine.assess_response(&response).is_none());
+        engine.flush_shadow_observations().await;
+        assert_eq!(backend.calls.lock().unwrap().as_slice(), &["fast-model"]);
     }
 
-    // ── JitRL (arXiv:2601.18510) engine-wiring tests ────────────────────
-
-    /// Stub backend that records the `logit_bias` carried by every request.
-    /// It ignores the bias when generating — which also proves that a backend
-    /// without a bias surface passes through unaffected.
-    struct BiasCaptureStub {
-        biases: std::sync::Mutex<Vec<Option<std::collections::HashMap<u32, f32>>>>,
-        loaded: RwLock<Option<ModelInfo>>,
-    }
-
-    impl BiasCaptureStub {
-        fn new() -> Self {
-            Self {
-                biases: std::sync::Mutex::new(Vec::new()),
-                loaded: RwLock::new(None),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl InferenceBackend for BiasCaptureStub {
-        fn name(&self) -> &str {
-            "bias-capture-stub"
-        }
-
-        fn requires_local_file(&self) -> bool {
-            false
-        }
-
-        async fn load_model(
-            &self,
-            model_path: &str,
-            _params: &GenerationParams,
-        ) -> Result<ModelInfo> {
-            let info = CascadeStub::stub_info(model_path);
-            *self.loaded.write().await = Some(info.clone());
-            Ok(info)
-        }
-
-        async fn unload_model(&self) -> Result<()> {
-            *self.loaded.write().await = None;
-            Ok(())
-        }
-
-        async fn loaded_model(&self) -> Option<ModelInfo> {
-            self.loaded.read().await.clone()
-        }
-
-        async fn generate(&self, request: &InferenceRequest) -> Result<InferenceResponse> {
-            self.biases
-                .lock()
-                .unwrap()
-                .push(request.params.logit_bias.clone());
-            Ok(InferenceResponse {
-                text: "ok".to_string(),
-                tokens_generated: 1,
-                tokens_prompt: 1,
-                generation_time_ms: 1,
-                tokens_per_second: 0.0,
-                backend: BackendType::OpenAiCompat,
-                model_id: request.model_id.clone().unwrap_or_default(),
-                mean_logprob: None,
-            })
-        }
-
-        async fn is_available(&self) -> bool {
-            true
-        }
-    }
-
-    fn jitrl_request(prompt: &str) -> InferenceRequest {
-        InferenceRequest {
-            system_prompt: String::new(),
-            user_prompt: prompt.to_string(),
-            params: GenerationParams::default(),
-            model_id: Some("jitrl-model".to_string()),
-        }
-    }
-
-    /// Seed one positive experience for `jitrl-model` into the store file
-    /// that `JitrlEngine` will read from `home`.
-    fn seed_experience(home: &std::path::Path, prompt: &str) {
-        let store =
-            crate::jitrl::ExperienceStore::new(home.join("jitrl_experience.jsonl"), 100);
-        store
-            .append(&crate::jitrl::ExperienceRecord {
-                id: "seed".to_string(),
-                model_id: "jitrl-model".to_string(),
-                sketch: crate::jitrl::fingerprint::shingle_sketch(prompt),
-                token_weights: [(42u32, 1.0f32)].into_iter().collect(),
-                reward: 1.0,
-                created_at: chrono::Utc::now().timestamp(),
-            })
-            .expect("seed experience");
-    }
-
+    /// Regression: `spawn_strong_shadow` used to spawn an unbounded number of
+    /// background shadow generations — a burst of accepted Fast replies could
+    /// pile up shadows racing the *next* request's foreground generation for
+    /// the same backend/model slot. With the default cap of 1, a second
+    /// shadow attempted while the first is still in flight must be skipped
+    /// (not queued, not blocking) and the skip must be counted; the
+    /// foreground reply for the second request must not wait for it either.
     #[tokio::test]
-    async fn jitrl_disabled_leaves_request_untouched() {
-        // No [jitrl] section at all — even with a seeded store file present,
-        // the request must pass through with no logit_bias (byte-identical).
-        let tmp = TempDir::new().expect("tempdir");
-        seed_experience(tmp.path(), "please summarize this quarterly report");
-        let engine = InferenceEngine::new(tmp.path()).await;
-        assert!(!engine.jitrl_enabled());
-        let backend = Arc::new(BiasCaptureStub::new());
-        engine.set_backend_for_test(backend.clone()).await;
-
-        engine
-            .generate(&jitrl_request("please summarize this quarterly report"))
-            .await
-            .expect("generate ok");
-
-        let biases = backend.biases.lock().unwrap();
-        assert_eq!(biases.len(), 1);
-        assert!(biases[0].is_none(), "disabled JitRL must not touch the request");
-    }
-
-    async fn jitrl_engine(tmp: &TempDir) -> InferenceEngine {
+    async fn ucci_shadow_max_inflight_default_skips_a_second_concurrent_shadow() {
+        let tmp = TempDir::new().unwrap();
         tokio::fs::write(
             tmp.path().join("inference.toml"),
-            "enabled = true\n\n[jitrl]\nenabled = true\n",
+            r#"
+enabled = true
+[router]
+enabled = true
+fast_model = "fast-model"
+strong_model = "strong-model"
+ucci_observations = "observations.jsonl"
+ucci_shadow_strong = true
+"#,
         )
         .await
-        .expect("write inference.toml");
-        InferenceEngine::new(tmp.path()).await
-    }
-
-    #[tokio::test]
-    async fn jitrl_enabled_injects_bias_for_similar_prompt() {
-        let tmp = TempDir::new().expect("tempdir");
-        seed_experience(tmp.path(), "please summarize this quarterly report");
-        let engine = jitrl_engine(&tmp).await;
-        assert!(engine.jitrl_enabled());
-        let backend = Arc::new(BiasCaptureStub::new());
+        .unwrap();
+        let engine = Arc::new(InferenceEngine::new(tmp.path()).await);
+        // Held until released below so the first shadow's permit stays taken
+        // across the second `route_and_generate` call.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(
+            CascadeStub::new(&[])
+                .with_margins(&[("fast-model", 0.2), ("strong-model", 0.1)])
+                .blocking_on("strong-model", release.clone()),
+        );
         engine.set_backend_for_test(backend.clone()).await;
 
-        // The backend ignores the bias — response still succeeds, proving a
-        // bias-less backend is transparently unaffected.
-        let resp = engine
-            .generate(&jitrl_request("please summarize this quarterly report for me"))
-            .await
-            .expect("generate ok");
-        assert_eq!(resp.text, "ok");
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.route_and_generate(&fast_request()),
+        )
+        .await
+        .expect("first reply must not wait for its own shadow")
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.model_id, "fast-model");
 
-        let biases = backend.biases.lock().unwrap();
-        assert_eq!(biases.len(), 1);
-        let bias = biases[0].as_ref().expect("similar prompt must carry bias");
-        let b = bias.get(&42).copied().expect("seeded token biased");
-        assert!(b > 0.0 && b <= 2.0, "clamped positive bias, got {b}");
+        // The first shadow's `try_acquire_owned` runs synchronously inside
+        // `spawn_strong_shadow` before it ever spawns — by the time
+        // `route_and_generate` above returned, the sole permit is already
+        // held, so this second call deterministically observes it saturated.
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.route_and_generate(&fast_request()),
+        )
+        .await
+        .expect("second reply must not wait for the (skipped) shadow")
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.model_id, "fast-model");
+
+        assert_eq!(
+            backend.calls.lock().unwrap().as_slice(),
+            &["fast-model", "fast-model"],
+            "no strong-model call yet: the first shadow is still gated, the second was skipped"
+        );
+        assert_eq!(
+            engine.shadow_skipped_inflight.load(Ordering::Relaxed),
+            1,
+            "the second shadow attempt must be counted as skipped"
+        );
+
+        release.notify_one();
+        engine.flush_shadow_observations().await;
+
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().filter(|c| c.as_str() == "strong-model").count(),
+            1,
+            "only the first request's shadow may have run"
+        );
+        drop(calls);
+
+        let rows = tokio::fs::read_to_string(tmp.path().join("observations.jsonl"))
+            .await
+            .unwrap();
+        // 2 local_fast rows (one per accepted reply) + 1 local_strong row
+        // (only the first request's shadow completed).
+        assert_eq!(rows.lines().count(), 3);
     }
 
+    /// Companion to the default-cap test: raising `ucci_shadow_max_inflight`
+    /// to 2 must let two shadow generations run genuinely concurrently
+    /// (both parked on the blocking gate at once), with nothing skipped.
     #[tokio::test]
-    async fn jitrl_enabled_skips_bias_for_dissimilar_prompt() {
-        let tmp = TempDir::new().expect("tempdir");
-        seed_experience(tmp.path(), "please summarize this quarterly report");
-        let engine = jitrl_engine(&tmp).await;
-        let backend = Arc::new(BiasCaptureStub::new());
+    async fn ucci_shadow_max_inflight_configured_allows_two_concurrent_shadows() {
+        let tmp = TempDir::new().unwrap();
+        tokio::fs::write(
+            tmp.path().join("inference.toml"),
+            r#"
+enabled = true
+[router]
+enabled = true
+fast_model = "fast-model"
+strong_model = "strong-model"
+ucci_observations = "observations.jsonl"
+ucci_shadow_strong = true
+ucci_shadow_max_inflight = 2
+"#,
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(InferenceEngine::new(tmp.path()).await);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(
+            CascadeStub::new(&[])
+                .with_margins(&[("fast-model", 0.2), ("strong-model", 0.1)])
+                .blocking_on("strong-model", release.clone()),
+        );
         engine.set_backend_for_test(backend.clone()).await;
 
         engine
-            .generate(&jitrl_request("write a haiku about mountains in winter"))
+            .route_and_generate(&fast_request())
             .await
-            .expect("generate ok");
+            .unwrap()
+            .unwrap();
+        engine
+            .route_and_generate(&fast_request())
+            .await
+            .unwrap()
+            .unwrap();
 
-        let biases = backend.biases.lock().unwrap();
-        assert!(biases[0].is_none(), "no similar experience → untouched request");
-    }
-
-    /// Deterministic mock tokenizer: one token per whitespace-separated word,
-    /// id = word char count (vocabulary-free — test only).
-    struct WordLenTokenizer;
-
-    #[async_trait]
-    impl crate::jitrl::JitrlTokenizer for WordLenTokenizer {
-        async fn encode(&self, text: &str) -> Result<Vec<u32>> {
-            Ok(text
-                .split_whitespace()
-                .map(|w| w.chars().count() as u32)
-                .collect())
+        // Poll (bounded) until both shadows are genuinely parked at once —
+        // proves the cap actually allows 2 concurrent generations, not just
+        // 2 eventually-sequential ones.
+        let mut both_waiting = false;
+        for _ in 0..200 {
+            if backend.gate_waiting.load(Ordering::SeqCst) == 2 {
+                both_waiting = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        assert!(
+            both_waiting,
+            "both shadows must be concurrently in flight under a cap of 2"
+        );
+        assert_eq!(
+            engine.shadow_skipped_inflight.load(Ordering::Relaxed),
+            0,
+            "neither shadow should be skipped under a cap of 2"
+        );
+
+        release.notify_one();
+        release.notify_one();
+        engine.flush_shadow_observations().await;
+
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().filter(|c| c.as_str() == "fast-model").count(),
+            2
+        );
+        assert_eq!(
+            calls.iter().filter(|c| c.as_str() == "strong-model").count(),
+            2,
+            "both shadows must have run to completion"
+        );
+        drop(calls);
+
+        let rows = tokio::fs::read_to_string(tmp.path().join("observations.jsonl"))
+            .await
+            .unwrap();
+        assert_eq!(rows.lines().count(), 4);
     }
 
     #[tokio::test]
-    async fn jitrl_record_and_retrieve_share_one_model_key() {
-        // HIGH-D regression: record keyed by `endpoint.model` while retrieval
-        // keyed by `request.model_id`/loaded id — a recorded reward was
-        // unretrievable whenever the strings differed. Both sides now resolve
-        // through `jitrl_model_key`; this proves the roundtrip end-to-end.
-        let tmp = TempDir::new().expect("tempdir");
-        let engine = jitrl_engine(&tmp).await;
-        assert!(engine.jitrl_enabled());
-        let backend = Arc::new(BiasCaptureStub::new());
+    async fn configured_ucci_gate_escalates_when_top_two_signal_is_missing() {
+        use ucci::{
+            Router,
+            calibration::IsotonicCalibrator,
+            policy::{CostModel, Costs},
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let map = IsotonicCalibrator::fit(&[0.0, 1.0], &[0.0, 1.0]).unwrap();
+        Router::new(
+            map,
+            0.5,
+            Costs::new(1.0, 3.0, CostModel::Sequential).unwrap(),
+        )
+        .unwrap()
+        .save(tmp.path().join("fast.json"))
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("inference.toml"),
+            r#"
+enabled = true
+[router]
+enabled = true
+fast_model = "fast-model"
+strong_model = "strong-model"
+ucci_fast_router = "fast.json"
+"#,
+        )
+        .await
+        .unwrap();
+        let engine = Arc::new(InferenceEngine::new(tmp.path()).await);
+        let backend = Arc::new(CascadeStub::new(&[]));
         engine.set_backend_for_test(backend.clone()).await;
-
-        // Load "jitrl-model" so the canonical key resolves from the manager
-        // (the same source `generate` consults).
-        engine
-            .load_model("jitrl-model")
+        let result = engine
+            .route_and_generate(&fast_request())
             .await
-            .expect("stub load ok");
-
-        // Record through the same resolution the public entry point uses
-        // (jitrl_model_key(None) — no request model), tokenizer injected.
-        let key = engine
-            .jitrl_model_key(None)
-            .await
-            .expect("a loaded model must yield a key");
-        assert_eq!(key, "jitrl-model");
-        let n = engine
-            .jitrl_record_feedback_with(
-                &WordLenTokenizer,
-                "please summarize this quarterly report",
-                "revenue grew twelve percent",
-                1.0,
-                &key,
-            )
-            .await
-            .expect("record ok");
-        assert!(n > 0);
-
-        // Retrieval on a similar prompt for the SAME model must see the bias.
-        engine
-            .generate(&jitrl_request("please summarize this quarterly report for me"))
-            .await
-            .expect("generate ok");
-        let biases = backend.biases.lock().unwrap();
-        let bias = biases
-            .last()
-            .and_then(|b| b.as_ref())
-            .expect("recorded reward must be retrievable under the unified key");
-        assert!(bias.values().all(|v| *v > 0.0), "positive reinforcement expected");
-    }
-
-    #[tokio::test]
-    async fn jitrl_feedback_errors_honestly_without_tokenizer_endpoint() {
-        // JitRL enabled but no OpenAI-compat endpoint → record_feedback must
-        // fail loudly (token ids cannot be fabricated), not degrade silently.
-        let tmp = TempDir::new().expect("tempdir");
-        let engine = jitrl_engine(&tmp).await;
-        let err = engine
-            .jitrl_record_feedback("prompt", "response", 1.0)
-            .await
-            .expect_err("no tokenizer endpoint must be an error");
-        assert!(matches!(err, InferenceError::BackendUnavailable { .. }));
-
-        // And when JitRL itself is disabled, the error says so.
-        let tmp2 = TempDir::new().expect("tempdir");
-        let engine2 = InferenceEngine::new(tmp2.path()).await;
-        let err2 = engine2
-            .jitrl_record_feedback("prompt", "response", 1.0)
-            .await
-            .expect_err("disabled jitrl must error");
-        assert!(matches!(err2, InferenceError::Config(_)));
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.model_id, "strong-model");
     }
 }

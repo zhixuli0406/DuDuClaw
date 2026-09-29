@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::Digest;
 
 use crate::mcp_auth::{AuthError, Principal, Scope, parse_scopes};
@@ -203,7 +203,15 @@ fn lookup_refresh_token(home: &Path, token: &str) -> Result<RefreshTokenMeta, Au
                 let issued_ts: i64 = row.get(4)?;
                 let expires_ts: i64 = row.get(5)?;
                 let revoked_ts: Option<i64> = row.get(6)?;
-                Ok((jti, client_id, scopes_csv, is_external, issued_ts, expires_ts, revoked_ts))
+                Ok((
+                    jti,
+                    client_id,
+                    scopes_csv,
+                    is_external,
+                    issued_ts,
+                    expires_ts,
+                    revoked_ts,
+                ))
             },
         )
         .optional()
@@ -213,10 +221,10 @@ fn lookup_refresh_token(home: &Path, token: &str) -> Result<RefreshTokenMeta, Au
         row.ok_or(AuthError::UnknownKey)?;
 
     let scopes = parse_scopes(&scopes_csv).unwrap_or_default();
-    let issued_at = DateTime::<Utc>::from_timestamp(issued_ts, 0)
-        .ok_or(AuthError::InvalidFormat)?;
-    let expires_at = DateTime::<Utc>::from_timestamp(expires_ts, 0)
-        .ok_or(AuthError::InvalidFormat)?;
+    let issued_at =
+        DateTime::<Utc>::from_timestamp(issued_ts, 0).ok_or(AuthError::InvalidFormat)?;
+    let expires_at =
+        DateTime::<Utc>::from_timestamp(expires_ts, 0).ok_or(AuthError::InvalidFormat)?;
     let revoked_at = revoked_ts.and_then(|t| DateTime::<Utc>::from_timestamp(t, 0));
 
     Ok(RefreshTokenMeta {
@@ -235,10 +243,7 @@ fn lookup_refresh_token(home: &Path, token: &str) -> Result<RefreshTokenMeta, Au
 ///
 /// Mirrors `mcp_auth::authenticate_with_key`'s error model so callers don't
 /// need to special-case credential type.
-pub fn authenticate_with_refresh_token(
-    token: &str,
-    home: &Path,
-) -> Result<Principal, AuthError> {
+pub fn authenticate_with_refresh_token(token: &str, home: &Path) -> Result<Principal, AuthError> {
     if !is_refresh_token_format(token) {
         return Err(AuthError::InvalidFormat);
     }
@@ -291,7 +296,15 @@ pub fn list_tokens(home: &Path) -> rusqlite::Result<Vec<RefreshTokenMeta>> {
         let issued_ts: i64 = row.get(4)?;
         let expires_ts: i64 = row.get(5)?;
         let revoked_ts: Option<i64> = row.get(6)?;
-        Ok((jti, client_id, scopes_csv, is_external, issued_ts, expires_ts, revoked_ts))
+        Ok((
+            jti,
+            client_id,
+            scopes_csv,
+            is_external,
+            issued_ts,
+            expires_ts,
+            revoked_ts,
+        ))
     })?;
     let mut out = Vec::new();
     for row in rows {
@@ -348,10 +361,8 @@ mod tests {
     fn invalid_format_rejected() {
         let dir = TempDir::new().unwrap();
         // Legacy short format must NOT be treated as a refresh token.
-        let result = authenticate_with_refresh_token(
-            "ddc_dev_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
-            dir.path(),
-        );
+        let result =
+            authenticate_with_refresh_token("ddc_dev_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4", dir.path());
         assert_eq!(result.unwrap_err(), AuthError::InvalidFormat);
     }
 

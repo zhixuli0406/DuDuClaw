@@ -84,7 +84,11 @@ impl LocalChatProvider {
             let auth = ApiAuth::new(ep.api_key.unwrap_or_default());
             let provider = OpenAiCompatProvider::new(LOCAL_PROVIDER_ID, auth, ep.base_url);
             return Some((
-                Self { inner: Inner::Compat(provider), model: ep.model, tools_capable },
+                Self {
+                    inner: Inner::Compat(provider),
+                    model: ep.model,
+                    tools_capable,
+                },
                 tools_capable,
             ));
         }
@@ -92,7 +96,11 @@ impl LocalChatProvider {
         if engine.is_available().await {
             let model = engine.config().default_model.clone().unwrap_or_default();
             return Some((
-                Self { inner: Inner::Engine(engine.clone()), model, tools_capable: false },
+                Self {
+                    inner: Inner::Engine(engine.clone()),
+                    model,
+                    tools_capable: false,
+                },
                 false,
             ));
         }
@@ -275,7 +283,9 @@ fn fit_request_to_context(
     n_ctx: u64,
 ) -> FittedRequest {
     let est = crate::prompt_compression::estimate_tokens;
-    let budget = n_ctx.saturating_sub(LOCAL_CTX_RESERVE_TOKENS).saturating_sub(est(prompt));
+    let budget = n_ctx
+        .saturating_sub(LOCAL_CTX_RESERVE_TOKENS)
+        .saturating_sub(est(prompt));
     let system_tokens = est(system_prompt);
     let tools_total: u64 = tools.iter().map(tool_tokens).sum();
     if system_tokens + tools_total <= budget {
@@ -313,7 +323,10 @@ fn fit_request_to_context(
         let total_chars = system_prompt.chars().count();
         let keep_chars = ((total_chars as f64) * ratio).floor() as usize;
         let head: String = system_prompt.chars().take(keep_chars).collect();
-        (format!("{}{}", head.trim_end(), LOCAL_CTX_TRIM_MARKER), total_chars - keep_chars)
+        (
+            format!("{}{}", head.trim_end(), LOCAL_CTX_TRIM_MARKER),
+            total_chars - keep_chars,
+        )
     };
     FittedRequest {
         system_prompt: system_prompt_out,
@@ -328,12 +341,22 @@ fn fit_request_to_context(
 /// not expose one — the request is then sent untrimmed, as before.
 async fn probe_context_window(provider: &LocalChatProvider) -> Option<u64> {
     let base = provider.compat_base_url()?;
-    let root = base.trim_end_matches('/').trim_end_matches("/v1").to_string();
+    let root = base
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .to_string();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()?;
-    let v: serde_json::Value = client.get(format!("{root}/props")).send().await.ok()?.json().await.ok()?;
+    let v: serde_json::Value = client
+        .get(format!("{root}/props"))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
     let n_ctx = v
         .get("default_generation_settings")
         .and_then(|d| d.get("n_ctx"))
@@ -341,7 +364,6 @@ async fn probe_context_window(provider: &LocalChatProvider) -> Option<u64> {
         .filter(|n| *n >= 512)?;
     Some(n_ctx)
 }
-
 
 /// Run the MCP tool loop against the local OpenAI-compat endpoint.
 ///
@@ -423,28 +445,35 @@ pub(crate) async fn try_local_tool_loop(
     // abstains (passthrough). Wrapping the registry keeps `run_tool_loop`
     // untouched.
     let empty_policy: Vec<duduclaw_core::types::ToolPolicy> = Vec::new();
-    let policy = capabilities.map(|c| c.policy.as_slice()).unwrap_or(&empty_policy);
+    let policy = capabilities
+        .map(|c| c.policy.as_slice())
+        .unwrap_or(&empty_policy);
     let guarded = duduclaw_llm::PolicyExecutor::new(&registry, policy, agent_id);
 
-    // WP-6E: Code Mode Phase 0 measurement gate
-    // (`commercial/docs/DESIGN-code-mode-2026-08.md` §8.1) — beneficiary #3 of
-    // the design's §2 list. Pure observation; forwards requests/responses
-    // verbatim and only counts.
-    let probe = crate::tool_loop_probe::ToolLoopProbe::new(&provider);
-    let loop_result = duduclaw_llm::run_tool_loop(
-        &probe,
+    let interceptor = match crate::redaction_proxy::try_build_interceptor(
+        &duduclaw_core::duduclaw_home(),
+        agent_id,
+        &crate::redaction_proxy::current_session_id(),
+    ) {
+        Ok(i) => i.map(|i| i as Arc<dyn duduclaw_llm::ToolInterceptor>),
+        Err(e) => {
+            warn!(agent = %agent_id, error = %e, "local tool loop disabled: redaction failed to initialize");
+            return None;
+        }
+    };
+    let loop_result = duduclaw_llm::run_tool_loop_with_provenance_and_ccr(
+        &provider,
         req,
         &guarded,
         duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
+        duduclaw_llm::ProvenanceConfig::default(),
+        interceptor,
+        crate::ccr_runtime::for_agent(&duduclaw_core::duduclaw_home(), agent_id),
     )
     .await;
-    probe.finish_and_record(
-        agent_id,
-        crate::tool_loop_probe::ProbePath::LocalInference,
-        &model,
-    );
     match loop_result {
-        Ok(resp) => {
+        Ok(outcome) => {
+            let resp = outcome.response;
             let text = resp.text();
             if text.trim().is_empty() {
                 warn!(
@@ -454,6 +483,15 @@ pub(crate) async fn try_local_tool_loop(
                 );
                 None
             } else {
+                if !crate::ccr_runtime::capture_delivery_guards(outcome.ccr_delivery_guards).await {
+                    warn!(agent = %agent_id, "local CCR delivery guard could not be retained");
+                    return Some(crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT.to_string());
+                }
+                crate::ccr_runtime::capture_saved_results(outcome.ccr_saved_results);
+                if engine.ucci_requested() {
+                    warn!(agent = %agent_id,
+                        "MCP tool-loop answer bypassed UCCI calibration; tool-loop outcomes need a separate fit");
+                }
                 info!(
                     agent = %agent_id,
                     model = %resp.model_used,
@@ -479,7 +517,7 @@ pub(crate) async fn try_local_tool_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_request_to_context, LOCAL_CTX_RESERVE_TOKENS, LOCAL_CTX_TRIM_MARKER};
+    use super::{LOCAL_CTX_RESERVE_TOKENS, LOCAL_CTX_TRIM_MARKER, fit_request_to_context};
     use duduclaw_llm::ToolDef;
 
     fn tool(name: &str, desc_len: usize) -> ToolDef {
@@ -503,7 +541,9 @@ mod tests {
     #[test]
     fn fit_drops_tools_in_order_but_always_keeps_tasks_tools() {
         // ~1000 tokens per tool × 20 tools ≫ an 8192 window.
-        let mut tools: Vec<ToolDef> = (0..18).map(|i| tool(&format!("tool_{i:02}"), 4000)).collect();
+        let mut tools: Vec<ToolDef> = (0..18)
+            .map(|i| tool(&format!("tool_{i:02}"), 4000))
+            .collect();
         tools.push(tool("tasks_claim", 4000));
         tools.push(tool("tasks_complete", 4000));
         let fit = fit_request_to_context("sys", "prompt", tools, 8192);
@@ -512,8 +552,13 @@ mod tests {
         assert!(names.contains(&"tasks_claim"), "{names:?}");
         assert!(names.contains(&"tasks_complete"), "{names:?}");
         // Earlier tools are preferred over later ones.
-        let first_dropped = (0..18).find(|i| !names.contains(&format!("tool_{i:02}").as_str())).unwrap();
-        assert!((first_dropped..18).all(|i| !names.contains(&format!("tool_{i:02}").as_str())), "{names:?}");
+        let first_dropped = (0..18)
+            .find(|i| !names.contains(&format!("tool_{i:02}").as_str()))
+            .unwrap();
+        assert!(
+            (first_dropped..18).all(|i| !names.contains(&format!("tool_{i:02}").as_str())),
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -531,7 +576,12 @@ mod tests {
     fn fit_never_leaves_the_prompt_itself_without_room() {
         // The user prompt alone eats most of the window: tools and system go.
         let prompt = "p".repeat(20_000); // ≈ 5000 tokens
-        let fit = fit_request_to_context("system text here", &prompt, vec![tool("read_file", 400)], 6000);
+        let fit = fit_request_to_context(
+            "system text here",
+            &prompt,
+            vec![tool("read_file", 400)],
+            6000,
+        );
         assert_eq!(fit.tools.len(), 0);
         assert!(fit.system_prompt.is_empty() || fit.system_prompt.ends_with(LOCAL_CTX_TRIM_MARKER));
     }
@@ -544,12 +594,16 @@ mod tests {
     fn tools_capability_requires_compat_endpoint_and_gate() {
         // (has_compat_endpoint, local_tools_enabled) → tools_capable
         for (compat, gate, expected) in [
-            (true, true, true),    // compat URL + gate on → tools
-            (true, false, false),  // operator disabled local_tools
-            (false, true, false),  // in-process backend never tool-capable
+            (true, true, true),   // compat URL + gate on → tools
+            (true, false, false), // operator disabled local_tools
+            (false, true, false), // in-process backend never tool-capable
             (false, false, false),
         ] {
-            assert_eq!(tools_capability(compat, gate), expected, "({compat}, {gate})");
+            assert_eq!(
+                tools_capability(compat, gate),
+                expected,
+                "({compat}, {gate})"
+            );
         }
     }
 
@@ -575,7 +629,10 @@ mod tests {
         req.messages.push(ChatMessage::user("follow-up"));
         let (system, user) = flatten_chat_request(&req);
         assert_eq!(system, "");
-        assert_eq!(user, "User: question\n\nAssistant: answer\n\nUser: follow-up");
+        assert_eq!(
+            user,
+            "User: question\n\nAssistant: answer\n\nUser: follow-up"
+        );
     }
 
     #[test]
@@ -640,7 +697,10 @@ model = "qwen3-8b"
         let (provider, tools_capable) = LocalChatProvider::from_engine(&engine)
             .await
             .expect("compat endpoint present");
-        assert!(tools_capable, "local_tools defaults to enabled for compat backends");
+        assert!(
+            tools_capable,
+            "local_tools defaults to enabled for compat backends"
+        );
         assert!(provider.supports_tools());
         assert_eq!(provider.model(), "qwen3-8b");
         assert_eq!(provider.id(), "local");
@@ -665,7 +725,10 @@ local_tools = false
         let (provider, tools_capable) = LocalChatProvider::from_engine(&engine)
             .await
             .expect("compat endpoint present");
-        assert!(!tools_capable, "[router] local_tools = false must disable the tool loop");
+        assert!(
+            !tools_capable,
+            "[router] local_tools = false must disable the tool loop"
+        );
         assert!(!provider.supports_tools());
         // Delegation still uses the compat client for bare completions.
         assert!(matches!(provider.inner, Inner::Compat(_)));

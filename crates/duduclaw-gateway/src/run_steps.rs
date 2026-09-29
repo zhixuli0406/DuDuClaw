@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use tracing::debug;
 
 /// Event kinds persisted by this store. `runs.get` renders these
@@ -116,8 +116,7 @@ impl RunStepStore {
     /// Open (or create) `<home>/run_steps.db`.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         let db_path = home_dir.join("run_steps.db");
-        let conn =
-            Connection::open(&db_path).map_err(|e| format!("open run_steps store: {e}"))?;
+        let conn = Connection::open(&db_path).map_err(|e| format!("open run_steps store: {e}"))?;
         Self::init_schema(&conn)?;
         // Owner-only, like the sibling session/key stores (0600). Best-effort
         // on non-unix (no mode bits there).
@@ -297,8 +296,16 @@ impl RunStepStore {
                   step_count, task_id, round)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
-                    agent_id, source, started_at, ended_at, status, preview_in, preview_out,
-                    steps.len() as i64, task_id, round
+                    agent_id,
+                    source,
+                    started_at,
+                    ended_at,
+                    status,
+                    preview_in,
+                    preview_out,
+                    steps.len() as i64,
+                    task_id,
+                    round
                 ],
             )
             .map_err(|e| format!("insert dispatch run: {e}"))?;
@@ -311,7 +318,14 @@ impl RunStepStore {
             } else {
                 format!("{tool_name} ❌")
             };
-            self.append_best_effort(agent_id, &session_key, KIND_TOOL_STEP, &label, "", seq as i64);
+            self.append_best_effort(
+                agent_id,
+                &session_key,
+                KIND_TOOL_STEP,
+                &label,
+                "",
+                seq as i64,
+            );
         }
         Ok(run_id)
     }
@@ -516,8 +530,16 @@ pub fn shared_store(home_dir: &Path) -> Option<Arc<RunStepStore>> {
 /// human-facing breadcrumbs, so over-masking a value is always safer than
 /// persisting a credential.
 const SECRETISH_KEYS: &[&str] = &[
-    "token", "secret", "passwd", "password", "api_key", "apikey", "authorization", "bearer",
-    "credential", "private_key",
+    "token",
+    "secret",
+    "passwd",
+    "password",
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer",
+    "credential",
+    "private_key",
 ];
 
 /// Mask values that follow secret-ish key indicators in an arbitrary
@@ -630,7 +652,12 @@ mod tests {
         let for_task = store.list_dispatch_runs_for_task("abc-123", 10).unwrap();
         assert_eq!(for_task.len(), 1);
         assert_eq!(for_task[0].round, Some(2));
-        assert!(store.list_dispatch_runs_for_task("other", 10).unwrap().is_empty());
+        assert!(
+            store
+                .list_dispatch_runs_for_task("other", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -655,8 +682,14 @@ mod tests {
         // Another agent's run — the agent filter must exclude it.
         store
             .record_dispatch_run(
-                "observer", "dispatch", "2026-08-13T02:00:00+00:00",
-                "2026-08-13T02:01:00+00:00", "error", "in", "boom", &[],
+                "observer",
+                "dispatch",
+                "2026-08-13T02:00:00+00:00",
+                "2026-08-13T02:01:00+00:00",
+                "error",
+                "in",
+                "boom",
+                &[],
             )
             .unwrap();
 
@@ -673,7 +706,9 @@ mod tests {
         assert!(store.get_dispatch_run(9999).unwrap().is_none());
 
         // Steps land under the run's session key, failures marked.
-        let rows = store.recent_for_session(&format!("dispatch:{run_id}"), 10).unwrap();
+        let rows = store
+            .recent_for_session(&format!("dispatch:{run_id}"), 10)
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].label, "mcp__masterlink__quote");
         assert!(rows[1].label.contains('❌'));
@@ -683,10 +718,24 @@ mod tests {
     fn roundtrip_append_and_read_back() {
         let store = RunStepStore::open_in_memory().unwrap();
         store
-            .append("bruno", "telegram:1", KIND_TOOL_STEP, "Read", "src/lib.rs", 1)
+            .append(
+                "bruno",
+                "telegram:1",
+                KIND_TOOL_STEP,
+                "Read",
+                "src/lib.rs",
+                1,
+            )
             .unwrap();
         store
-            .append("bruno", "telegram:1", KIND_TODO_UPDATE, "1/3", "📋 任務進度(1/3 完成)", 2)
+            .append(
+                "bruno",
+                "telegram:1",
+                KIND_TODO_UPDATE,
+                "1/3",
+                "📋 任務進度(1/3 完成)",
+                2,
+            )
             .unwrap();
         // A different session — must not leak into telegram:1 reads.
         store
@@ -736,21 +785,31 @@ mod tests {
                 .append("also-busy", "s:3", KIND_TOOL_STEP, "T", "p", i as i64)
                 .unwrap();
         }
-        store.append("quiet", "s:2", KIND_TOOL_STEP, "T", "p", 1).unwrap();
+        store
+            .append("quiet", "s:2", KIND_TOOL_STEP, "T", "p", 1)
+            .unwrap();
         store.prune("busy").unwrap();
         // Both over-cap agents capped by one prune; quiet agent untouched.
         assert_eq!(store.row_count(), PER_AGENT_ROW_CAP * 2 + 1);
         // Newest rows survive: the highest seq must still be present.
         let rows = store.recent_for_session("s:1", PER_AGENT_ROW_CAP).unwrap();
-        assert_eq!(rows.last().unwrap().seq, (PER_AGENT_ROW_CAP + 50 - 1) as i64);
+        assert_eq!(
+            rows.last().unwrap().seq,
+            (PER_AGENT_ROW_CAP + 50 - 1) as i64
+        );
         let rows3 = store.recent_for_session("s:3", PER_AGENT_ROW_CAP).unwrap();
-        assert_eq!(rows3.last().unwrap().seq, (PER_AGENT_ROW_CAP + 30 - 1) as i64);
+        assert_eq!(
+            rows3.last().unwrap().seq,
+            (PER_AGENT_ROW_CAP + 30 - 1) as i64
+        );
     }
 
     #[test]
     fn prune_drops_rows_older_than_retention() {
         let store = RunStepStore::open_in_memory().unwrap();
-        store.append("a", "s:1", KIND_TOOL_STEP, "New", "p", 1).unwrap();
+        store
+            .append("a", "s:1", KIND_TOOL_STEP, "New", "p", 1)
+            .unwrap();
         // Backdate one row past the retention window (test-only direct SQL).
         let old_ts = (chrono::Utc::now() - chrono::Duration::days(RETENTION_DAYS + 1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -781,15 +840,25 @@ mod tests {
         // Must not panic and must not propagate the error.
         store.append_best_effort("a", "s:1", KIND_TOOL_STEP, "Read", "x", 1);
         // The strict variant does report it.
-        assert!(store.append("a", "s:1", KIND_TOOL_STEP, "Read", "x", 2).is_err());
+        assert!(
+            store
+                .append("a", "s:1", KIND_TOOL_STEP, "Read", "x", 2)
+                .is_err()
+        );
     }
 
     #[test]
     fn recent_tool_step_meta_filters_kind_and_agent() {
         let store = RunStepStore::open_in_memory().unwrap();
-        store.append("a", "s:1", KIND_TOOL_STEP, "Read", "", 1).unwrap();
-        store.append("a", "s:1", KIND_TODO_UPDATE, "1/2", "", 2).unwrap();
-        store.append("b", "s:2", KIND_TOOL_STEP, "Bash", "", 1).unwrap();
+        store
+            .append("a", "s:1", KIND_TOOL_STEP, "Read", "", 1)
+            .unwrap();
+        store
+            .append("a", "s:1", KIND_TODO_UPDATE, "1/2", "", 2)
+            .unwrap();
+        store
+            .append("b", "s:2", KIND_TOOL_STEP, "Bash", "", 1)
+            .unwrap();
         assert_eq!(store.recent_tool_step_meta("", 100).unwrap().len(), 2);
         let only_a = store.recent_tool_step_meta("a", 100).unwrap();
         assert_eq!(only_a.len(), 1);
@@ -802,8 +871,14 @@ mod tests {
             mask_secretish("curl -H \"Authorization: Bearer sk-abc123\" https://x"),
             "curl -H \"Authorization: Bearer [REDACTED]\" https://x"
         );
-        assert_eq!(mask_secretish("api_key=sk-live-99 --verbose"), "api_key=[REDACTED] --verbose");
-        assert_eq!(mask_secretish("export TOKEN=abc"), "export TOKEN=[REDACTED]");
+        assert_eq!(
+            mask_secretish("api_key=sk-live-99 --verbose"),
+            "api_key=[REDACTED] --verbose"
+        );
+        assert_eq!(
+            mask_secretish("export TOKEN=abc"),
+            "export TOKEN=[REDACTED]"
+        );
         // Plain paths / CJK labels pass through untouched.
         assert_eq!(mask_secretish("src/lib.rs"), "src/lib.rs");
         assert_eq!(mask_secretish("正在讀取 檔案.md"), "正在讀取 檔案.md");

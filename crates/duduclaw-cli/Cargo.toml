@@ -53,6 +53,9 @@ toml = { workspace = true }
 json5 = "0.4"
 serde_yaml = "0.9"
 urlencoding = "2"
+# `ccr-compare-run --base-url`: host/userinfo checks must parse the URL, never
+# prefix-match it. Already in the tree via duduclaw-gateway, so no new crate.
+url = "2"
 dialoguer = { version = "0.11", features = ["password"] }
 console = "0.15"
 dirs = "6"
@@ -84,9 +87,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # so the version that was reviewed is the version that ships.
 csv = "1"
 calamine = { version = "=0.36.1", default-features = false, features = ["dates"] }
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { workspace = true }
 # W20-P1: HTTP integration test support
 tower = { version = "0.5", features = ["util"] }
@@ -105,3 +108,11 @@ dashboard = ["duduclaw-gateway/dashboard"]
 # feature (see duduclaw-gateway/src/otel.rs). Default OFF: without it the
 # gateway's `otel::try_init_layer` is a no-op stub and no otel deps compile.
 otel = ["duduclaw-gateway/otel"]
+# `duduclaw compat` — the OS-only app-compatibility subcommand family
+# (`compat list`, `compat windows-vm …`). DuDuClaw OS's shell spawns
+# `duduclaw compat windows-vm app` to launch a Windows RemoteApp, so the code
+# must stay; the platform binary does not compile it. The OS recipe
+# (`meta-duduclaw/recipes-duduclaw/duduclaw-cli/*.bb`) enables it with
+# `--features app-compat`; main-repo CI keeps one `cargo check` on it so the
+# OS-only surface cannot bit-rot.
+app-compat = ["duduclaw-core/app-compat"]

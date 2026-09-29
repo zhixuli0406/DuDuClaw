@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::gvu::trigger::{maybe_run_gvu, TriggerSource};
+use crate::gvu::trigger::{TriggerSource, maybe_run_gvu};
 use crate::prediction::engine::{ErrorCategory, PredictionEngine};
 use crate::prediction::subagent_prediction::GvuTriggerCtx;
 
@@ -244,8 +244,7 @@ mod tests {
         let engine = make_engine(&tmp);
         let cooldown = SilenceBreakerCooldown::default_4h();
 
-        let fired =
-            fire_forced_reflection(&cooldown, &engine, "agent-q", 13.0, Utc::now()).await;
+        let fired = fire_forced_reflection(&cooldown, &engine, "agent-q", 13.0, Utc::now()).await;
         assert!(fired, "first fire should succeed");
 
         // The write is non-blocking; give the spawned task a moment to flush.

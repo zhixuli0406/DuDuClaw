@@ -53,10 +53,7 @@ impl ExtractionResult {
 /// - `## Section` headings → concept pages
 /// - Proper nouns and entity patterns → entity pages
 /// - Full skill → source summary with `internalized_from` metadata
-pub fn extract_heuristic(
-    skill: &CompressedSkill,
-    agent_id: &str,
-) -> ExtractionResult {
+pub fn extract_heuristic(skill: &CompressedSkill, agent_id: &str) -> ExtractionResult {
     let now = Utc::now();
     let date_str = now.to_rfc3339();
     let skill_tag = sanitize_for_path(&skill.name);
@@ -113,7 +110,10 @@ pub fn extract_heuristic(
             page_path,
             action: WikiAction::Create,
             content: Some(content),
-            rationale: format!("Extracted from skill '{}' section '{}'", skill.name, section.heading),
+            rationale: format!(
+                "Extracted from skill '{}' section '{}'",
+                skill.name, section.heading
+            ),
             related_pages: vec![format!("sources/skill-{}.md", skill_tag)],
             target: WikiTarget::default(),
         });
@@ -151,7 +151,10 @@ pub fn extract_heuristic(
             page_path: entity_path,
             action: WikiAction::Create,
             content: Some(content),
-            rationale: format!("Entity '{}' extracted from skill '{}'", entity_name, skill.name),
+            rationale: format!(
+                "Entity '{}' extracted from skill '{}'",
+                entity_name, skill.name
+            ),
             related_pages: vec![format!("sources/skill-{}.md", skill_tag)],
             target: WikiTarget::default(),
         });
@@ -160,7 +163,11 @@ pub fn extract_heuristic(
     // Source summary — always created
     let concept_links: Vec<String> = concepts.iter().map(|c| c.page_path.clone()).collect();
     let entity_links: Vec<String> = entities.iter().map(|e| e.page_path.clone()).collect();
-    let all_related: Vec<String> = concept_links.iter().chain(entity_links.iter()).cloned().collect();
+    let all_related: Vec<String> = concept_links
+        .iter()
+        .chain(entity_links.iter())
+        .cloned()
+        .collect();
     let related_str = if all_related.is_empty() {
         "[]".to_string()
     } else {
@@ -227,11 +234,7 @@ pub fn is_already_extracted(skill_name: &str, wiki_dir: &Path) -> bool {
 /// Run extraction and apply proposals to the wiki.
 ///
 /// Wraps in `spawn_blocking` to avoid blocking async runtime with flock.
-pub async fn extract_and_apply(
-    skill: &CompressedSkill,
-    agent_id: &str,
-    home_dir: &Path,
-) {
+pub async fn extract_and_apply(skill: &CompressedSkill, agent_id: &str, home_dir: &Path) {
     let wiki_dir = home_dir.join("agents").join(agent_id).join("wiki");
 
     let result = extract_heuristic(skill, agent_id);
@@ -267,26 +270,37 @@ pub async fn extract_and_apply(
         }
 
         // Atomic sentinel: O_EXCL guarantees only one caller succeeds
-        let sentinel = wiki_dir_owned.join("sources").join(format!(".extracting-{}", skill_tag));
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&sentinel) {
+        let sentinel = wiki_dir_owned
+            .join("sources")
+            .join(format!(".extracting-{}", skill_tag));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sentinel)
+        {
             Ok(_) => {} // We won the race — proceed
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err("already_extracted".to_string());
             }
             Err(_) => {
                 // Check if the actual source page exists (fallback for filesystem issues)
-                let source_page = wiki_dir_owned.join("sources").join(format!("skill-{}.md", skill_tag));
+                let source_page = wiki_dir_owned
+                    .join("sources")
+                    .join(format!("skill-{}.md", skill_tag));
                 if source_page.exists() {
                     return Err("already_extracted".to_string());
                 }
             }
         }
 
-        let result = store.apply_proposals(&proposals_owned).map_err(|e| e.to_string());
+        let result = store
+            .apply_proposals(&proposals_owned)
+            .map_err(|e| e.to_string());
         // Clean up sentinel regardless of outcome
         let _ = std::fs::remove_file(&sentinel);
         result
-    }).await;
+    })
+    .await;
 
     match result {
         Ok(Ok(count)) => {
@@ -300,7 +314,9 @@ pub async fn extract_and_apply(
         Ok(Err(ref e)) if e == "already_extracted" => {
             debug!(agent = %agent_owned, skill = %skill_name, "Skill already extracted to wiki, skipping");
         }
-        Ok(Err(e)) => warn!(agent = %agent_owned, skill = %skill_name, "Extraction apply failed: {e}"),
+        Ok(Err(e)) => {
+            warn!(agent = %agent_owned, skill = %skill_name, "Extraction apply failed: {e}")
+        }
         Err(e) => warn!(agent = %agent_owned, skill = %skill_name, "Extraction panicked: {e}"),
     }
 }
@@ -432,7 +448,11 @@ fn extract_entities_from_skill(content: &str) -> Vec<(String, String)> {
                 if entity.len() >= 2
                     && entity.len() <= 40
                     && !entity.contains('\n')
-                    && entity.chars().next().map(|c| c.is_uppercase() || (c as u32) >= 0x4E00).unwrap_or(false)
+                    && entity
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase() || (c as u32) >= 0x4E00)
+                        .unwrap_or(false)
                     && seen.insert(entity.to_lowercase())
                 {
                     // Get surrounding context
@@ -454,16 +474,16 @@ fn extract_entities_from_skill(content: &str) -> Vec<(String, String)> {
 /// Extract topic tags from content by identifying repeated keywords.
 fn extract_tags_from_content(content: &str) -> Vec<String> {
     let lower = content.to_lowercase();
-    let mut word_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut word_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     let stopwords = [
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "can", "to", "of", "in", "for", "on", "with",
-        "at", "by", "from", "as", "into", "through", "during", "before", "after",
-        "and", "but", "or", "not", "this", "that", "these", "those", "it", "its",
-        "use", "used", "when", "if", "then", "also", "all", "each", "such",
-        "per", "any", "both", "must", "their", "they", "you", "your", "our", "we",
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "to", "of",
+        "in", "for", "on", "with", "at", "by", "from", "as", "into", "through", "during", "before",
+        "after", "and", "but", "or", "not", "this", "that", "these", "those", "it", "its", "use",
+        "used", "when", "if", "then", "also", "all", "each", "such", "per", "any", "both", "must",
+        "their", "they", "you", "your", "our", "we",
     ];
 
     for word in lower.split_whitespace() {
@@ -484,7 +504,8 @@ fn extract_tags_from_content(content: &str) -> Vec<String> {
 /// Only preserves ASCII alphanumeric and CJK Unified Ideographs (Basic + Extension A).
 /// Truncates to 80 chars to stay under filesystem filename limits.
 fn sanitize_for_path(s: &str) -> String {
-    let result: String = s.chars()
+    let result: String = s
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' {
                 c.to_ascii_lowercase()
@@ -515,12 +536,22 @@ fn sanitize_for_path(s: &str) -> String {
 /// Strips newlines/carriage returns and wraps in double quotes if special chars present.
 fn yaml_quote(s: &str) -> String {
     let clean: String = s.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-    if clean.contains(':') || clean.contains('#') || clean.contains('[')
-        || clean.contains(']') || clean.contains('{') || clean.contains('}')
-        || clean.contains('\'') || clean.contains('"')
-        || clean.contains('|') || clean.contains('>')
-        || clean.contains('*') || clean.contains('&') || clean.contains('!')
-        || clean.contains('%') || clean.contains('@') || clean.contains(',')
+    if clean.contains(':')
+        || clean.contains('#')
+        || clean.contains('[')
+        || clean.contains(']')
+        || clean.contains('{')
+        || clean.contains('}')
+        || clean.contains('\'')
+        || clean.contains('"')
+        || clean.contains('|')
+        || clean.contains('>')
+        || clean.contains('*')
+        || clean.contains('&')
+        || clean.contains('!')
+        || clean.contains('%')
+        || clean.contains('@')
+        || clean.contains(',')
     {
         let escaped = clean.replace('\\', "\\\\").replace('"', "\\\"");
         format!("\"{}\"", escaped)
@@ -560,7 +591,8 @@ When the customer is upset:
 1. Acknowledge their feelings
 2. Apologize sincerely
 3. Offer a solution or escalate to **Manager On Duty**
-"#.to_string(),
+"#
+            .to_string(),
             tokens_layer0: 5,
             tokens_layer1: 30,
             tokens_layer2: 200,
@@ -573,7 +605,10 @@ When the customer is upset:
         let result = extract_heuristic(&skill, "agnes");
 
         assert_eq!(result.skill_name, "customer-service");
-        assert!(result.concepts.len() >= 2, "Should extract at least Greeting Protocol and Return Policy");
+        assert!(
+            result.concepts.len() >= 2,
+            "Should extract at least Greeting Protocol and Return Policy"
+        );
 
         let concept_paths: Vec<_> = result.concepts.iter().map(|c| &c.page_path).collect();
         assert!(concept_paths.iter().any(|p| p.contains("greeting")));
@@ -585,7 +620,9 @@ When the customer is upset:
         let skill = sample_skill();
         let result = extract_heuristic(&skill, "agnes");
 
-        let entity_names: Vec<_> = result.entities.iter()
+        let entity_names: Vec<_> = result
+            .entities
+            .iter()
             .filter_map(|e| e.content.as_ref())
             .filter(|c| c.contains("Electronics") || c.contains("Manager"))
             .collect();
@@ -597,7 +634,12 @@ When the customer is upset:
         let skill = sample_skill();
         let result = extract_heuristic(&skill, "agnes");
 
-        assert!(result.source_summary.page_path.starts_with("sources/skill-"));
+        assert!(
+            result
+                .source_summary
+                .page_path
+                .starts_with("sources/skill-")
+        );
         let content = result.source_summary.content.as_ref().unwrap();
         assert!(content.contains("internalized_from: customer-service"));
         assert!(content.contains("maturity: draft"));
@@ -677,7 +719,8 @@ When the customer is upset:
         std::fs::write(
             wiki_dir.join("sources/skill-test-skill.md"),
             "---\ntitle: test\n---\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(is_already_extracted("test-skill", &wiki_dir));
         assert!(!is_already_extracted("other-skill", &wiki_dir));

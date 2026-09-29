@@ -208,8 +208,7 @@ mod tests {
 
     #[test]
     fn read_max_input_tokens_returns_none_when_file_missing() {
-        let tmp = std::env::temp_dir()
-            .join(format!("prompt-audit-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("prompt-audit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         assert_eq!(read_max_input_tokens(&tmp), None);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -217,8 +216,7 @@ mod tests {
 
     #[test]
     fn read_max_input_tokens_reads_budget_section() {
-        let tmp = std::env::temp_dir()
-            .join(format!("prompt-audit-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("prompt-audit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(
             tmp.join("agent.toml"),
@@ -231,14 +229,9 @@ mod tests {
 
     #[test]
     fn read_max_input_tokens_returns_none_for_negative_value() {
-        let tmp = std::env::temp_dir()
-            .join(format!("prompt-audit-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("prompt-audit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(
-            tmp.join("agent.toml"),
-            "[budget]\nmax_input_tokens = -1\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.join("agent.toml"), "[budget]\nmax_input_tokens = -1\n").unwrap();
         // u64::try_from on negative i64 returns Err, so we treat it as
         // "no useful config" rather than crashing.
         assert_eq!(read_max_input_tokens(&tmp), None);
@@ -247,14 +240,9 @@ mod tests {
 
     #[test]
     fn read_max_input_tokens_returns_none_when_section_missing() {
-        let tmp = std::env::temp_dir()
-            .join(format!("prompt-audit-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("prompt-audit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(
-            tmp.join("agent.toml"),
-            "[agent]\nname = \"test\"\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.join("agent.toml"), "[agent]\nname = \"test\"\n").unwrap();
         assert_eq!(read_max_input_tokens(&tmp), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -304,7 +292,10 @@ mod tests {
         // Worst case: one skill bigger than the cap.
         let skills = vec![("huge".to_string(), "y".repeat(50_000))];
         let (out, footer) = budgeted_legacy_skills(&skills, 1_000);
-        assert!(out.is_empty(), "oversized skill must be skipped, not truncated mid-content");
+        assert!(
+            out.is_empty(),
+            "oversized skill must be skipped, not truncated mid-content"
+        );
         assert!(footer.is_some());
     }
 

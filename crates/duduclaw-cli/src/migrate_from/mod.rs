@@ -123,7 +123,8 @@ pub async fn run(
     // paperclip --source gate above, rather than silently no-op-ing.
     if plat == Platform::ClaudeCode && agent.as_deref().map(str::trim).unwrap_or("").is_empty() {
         return Err(DuDuClawError::Config(
-            "claude-code 轉移需要 --agent <id> 指定匯入目標 agent（不會自動建立新 agent）".to_string(),
+            "claude-code 轉移需要 --agent <id> 指定匯入目標 agent（不會自動建立新 agent）"
+                .to_string(),
         ));
     }
 

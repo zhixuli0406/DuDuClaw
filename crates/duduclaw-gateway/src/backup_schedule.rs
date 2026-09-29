@@ -143,10 +143,16 @@ impl BackupScheduleConfig {
 
 /// Has `interval_hours` elapsed since `last_backup_at`? `None` (never run
 /// yet) is always due.
-pub fn is_due(interval_hours: u32, last_backup_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+pub fn is_due(
+    interval_hours: u32,
+    last_backup_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
     match last_backup_at {
         None => true,
-        Some(last) => now.signed_duration_since(last) >= chrono::Duration::hours(interval_hours as i64),
+        Some(last) => {
+            now.signed_duration_since(last) >= chrono::Duration::hours(interval_hours as i64)
+        }
     }
 }
 
@@ -154,7 +160,10 @@ pub fn is_due(interval_hours: u32, last_backup_at: Option<DateTime<Utc>>, now: D
 /// exceed `retention_count` and should be deleted — the `retention_count`
 /// most recent are always kept. Pure: callers pass an already-listed
 /// snapshot, so this is unit-testable without a real filesystem.
-pub fn files_to_prune(mut entries: Vec<(String, DateTime<Utc>)>, retention_count: u32) -> Vec<String> {
+pub fn files_to_prune(
+    mut entries: Vec<(String, DateTime<Utc>)>,
+    retention_count: u32,
+) -> Vec<String> {
     let keep = retention_count.max(1) as usize;
     if entries.len() <= keep {
         return Vec::new();
@@ -163,7 +172,11 @@ pub fn files_to_prune(mut entries: Vec<(String, DateTime<Utc>)>, retention_count
     // between runs (matters for the "which N survive" test to be
     // deterministic).
     entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
-    entries.split_off(keep).into_iter().map(|(name, _)| name).collect()
+    entries
+        .split_off(keep)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// tar `--exclude` patterns for a SCHEDULED backup run. Pure — a fixed set
@@ -203,8 +216,14 @@ pub fn schedule_backup_excludes(home_dir: &Path) -> Vec<String> {
     let mut out = Vec::with_capacity(4);
     if let Some(base) = base {
         out.push(format!("./{base}/{BACKUPS_DIRNAME}"));
-        out.push(format!("./{base}/{}", crate::backup_restore::RESTORE_STAGING_DIRNAME));
-        out.push(format!("./{base}/{}*", crate::backup_restore::RESTORE_BACKUP_PREFIX));
+        out.push(format!(
+            "./{base}/{}",
+            crate::backup_restore::RESTORE_STAGING_DIRNAME
+        ));
+        out.push(format!(
+            "./{base}/{}*",
+            crate::backup_restore::RESTORE_BACKUP_PREFIX
+        ));
     }
     out.push(STAGING_BASENAME_GLOB.to_string());
     out
@@ -234,7 +253,10 @@ fn read_last_backup_at(home_dir: &Path) -> Option<DateTime<Utc>> {
 /// must never block or fail the backup that already succeeded.
 fn write_last_backup_at(home_dir: &Path, at: DateTime<Utc>) {
     let path = state_path(home_dir);
-    let body = serde_json::to_string_pretty(&ScheduleState { last_backup_at: Some(at) }).unwrap_or_default();
+    let body = serde_json::to_string_pretty(&ScheduleState {
+        last_backup_at: Some(at),
+    })
+    .unwrap_or_default();
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, body.as_bytes()).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
@@ -250,7 +272,10 @@ pub enum BackupTickOutcome {
     /// Enabled, but `interval_hours` has not elapsed since the last run.
     NotDue,
     /// A backup was created and rotation ran.
-    Ran { filename: String, pruned: Vec<String> },
+    Ran {
+        filename: String,
+        pruned: Vec<String>,
+    },
     /// The backup attempt failed. The caller (metrics/log) is responsible
     /// for surfacing this — the scheduler itself never propagates it.
     Failed(String),
@@ -286,7 +311,11 @@ impl BackupScheduler {
             Ok((filename, pruned)) => {
                 write_last_backup_at(&self.home_dir, now);
                 crate::metrics::global_metrics().backup_schedule_ok();
-                info!(filename, pruned = pruned.len(), "backup-schedule: 已建立排程備份");
+                info!(
+                    filename,
+                    pruned = pruned.len(),
+                    "backup-schedule: 已建立排程備份"
+                );
                 BackupTickOutcome::Ran { filename, pruned }
             }
             Err(e) => {
@@ -303,19 +332,28 @@ impl BackupScheduler {
         now: DateTime<Utc>,
     ) -> Result<(String, Vec<String>), String> {
         let home = self.home_dir.clone();
-        let source_dir = home.parent().map(Path::to_path_buf).unwrap_or_else(|| home.clone());
+        let source_dir = home
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.clone());
         let dest_dir = backups_dir(&home);
         tokio::fs::create_dir_all(&dest_dir)
             .await
             .map_err(|e| format!("建立備份目錄失敗: {e}"))?;
 
-        let filename = format!("{BACKUP_PREFIX}{}{BACKUP_SUFFIX}", now.format("%Y%m%dT%H%M%SZ"));
+        let filename = format!(
+            "{BACKUP_PREFIX}{}{BACKUP_SUFFIX}",
+            now.format("%Y%m%dT%H%M%SZ")
+        );
         // The staging name carries a uuid, not just the second-precision
         // timestamp: two independent `duduclaw-schedule-` runs (this
         // scheduler + a concurrent test in the same process, or — in
         // principle — two gateways sharing an OS temp dir) landing in the
         // same wall-clock second must never collide on one path.
-        let staging = std::env::temp_dir().join(format!("duduclaw-schedule-{}-{filename}", uuid::Uuid::new_v4()));
+        let staging = std::env::temp_dir().join(format!(
+            "duduclaw-schedule-{}-{filename}",
+            uuid::Uuid::new_v4()
+        ));
 
         let excludes = schedule_backup_excludes(&home);
         let result = tar_backup_excluding(&source_dir, &staging, &excludes).await;
@@ -379,7 +417,9 @@ fn list_backup_files(dir: &Path) -> Vec<(String, DateTime<Utc>)> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        let Ok(modified) = meta.modified() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         out.push((name, DateTime::<Utc>::from(modified)));
     }
     out
@@ -436,12 +476,18 @@ mod tests {
     #[test]
     fn missing_file_or_section_is_the_default() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(BackupScheduleConfig::from_home(dir.path()), BackupScheduleConfig::default());
+        assert_eq!(
+            BackupScheduleConfig::from_home(dir.path()),
+            BackupScheduleConfig::default()
+        );
         assert_eq!(
             BackupScheduleConfig::from_toml_str("[general]\nname = \"x\"\n"),
             BackupScheduleConfig::default()
         );
-        assert_eq!(BackupScheduleConfig::from_toml_str("not [ toml"), BackupScheduleConfig::default());
+        assert_eq!(
+            BackupScheduleConfig::from_toml_str("not [ toml"),
+            BackupScheduleConfig::default()
+        );
     }
 
     #[test]
@@ -468,7 +514,10 @@ mod tests {
         let cfg = BackupScheduleConfig::from_toml_str(
             "[backup]\nschedule_enabled = true\ninterval_hours = \"soon\"\n",
         );
-        assert!(cfg.enabled, "a bad interval must not silently disable the feature");
+        assert!(
+            cfg.enabled,
+            "a bad interval must not silently disable the feature"
+        );
         assert_eq!(cfg.interval_hours, 24);
     }
 
@@ -526,7 +575,11 @@ mod tests {
     #[test]
     fn equal_mtimes_break_ties_deterministically() {
         let same = t(1);
-        let entries = vec![("b".to_string(), same), ("a".to_string(), same), ("c".to_string(), same)];
+        let entries = vec![
+            ("b".to_string(), same),
+            ("a".to_string(), same),
+            ("c".to_string(), same),
+        ];
         // retention 1 ⇒ keep exactly one, deterministically (name-sorted
         // descending as the tie-break), not a different survivor every run.
         let pruned1 = files_to_prune(entries.clone(), 1);
@@ -540,7 +593,11 @@ mod tests {
     #[tokio::test]
     async fn tick_is_a_noop_when_disabled() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[backup]\nschedule_enabled = false\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[backup]\nschedule_enabled = false\n",
+        )
+        .unwrap();
         let sched = BackupScheduler::new(dir.path().to_path_buf());
         assert_eq!(sched.tick().await, BackupTickOutcome::Disabled);
         assert!(!backups_dir(dir.path()).exists());
@@ -562,7 +619,11 @@ mod tests {
     #[tokio::test]
     async fn tick_creates_a_backup_and_records_state_when_due() {
         let (_root, home) = scoped_home();
-        std::fs::write(home.join("config.toml"), "[backup]\nschedule_enabled = true\ninterval_hours = 24\nretention_count = 7\n").unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[backup]\nschedule_enabled = true\ninterval_hours = 24\nretention_count = 7\n",
+        )
+        .unwrap();
 
         let sched = BackupScheduler::new(home.clone());
         let outcome = sched.tick().await;
@@ -606,7 +667,11 @@ mod tests {
             other => panic!("expected Ran, got {other:?}"),
         }
         let remaining: Vec<_> = std::fs::read_dir(&backups).unwrap().collect();
-        assert_eq!(remaining.len(), 2, "retention_count=2 must leave exactly 2 files");
+        assert_eq!(
+            remaining.len(),
+            2,
+            "retention_count=2 must leave exactly 2 files"
+        );
     }
 
     // ── schedule_backup_excludes / compounding-archive fix ──────────
@@ -615,10 +680,22 @@ mod tests {
     fn schedule_backup_excludes_covers_backups_staging_and_preserved_dirs() {
         let home = Path::new("/data/duduclaw");
         let excludes = schedule_backup_excludes(home);
-        assert!(excludes.contains(&"./duduclaw/backups".to_string()), "{excludes:?}");
-        assert!(excludes.contains(&"./duduclaw/restore-staging".to_string()), "{excludes:?}");
-        assert!(excludes.contains(&"./duduclaw/restore-backup-*".to_string()), "{excludes:?}");
-        assert!(excludes.iter().any(|p| p == STAGING_BASENAME_GLOB), "{excludes:?}");
+        assert!(
+            excludes.contains(&"./duduclaw/backups".to_string()),
+            "{excludes:?}"
+        );
+        assert!(
+            excludes.contains(&"./duduclaw/restore-staging".to_string()),
+            "{excludes:?}"
+        );
+        assert!(
+            excludes.contains(&"./duduclaw/restore-backup-*".to_string()),
+            "{excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|p| p == STAGING_BASENAME_GLOB),
+            "{excludes:?}"
+        );
     }
 
     #[test]
@@ -651,7 +728,11 @@ mod tests {
     #[tokio::test]
     async fn second_scheduled_round_does_not_pack_the_first_rounds_backup_file() {
         let (_root, home) = scoped_home();
-        std::fs::write(home.join("config.toml"), "[backup]\nschedule_enabled = true\n").unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[backup]\nschedule_enabled = true\n",
+        )
+        .unwrap();
         // A real sibling file so the archive isn't trivially empty.
         std::fs::write(home.join("agent.toml"), b"[agent]\nname=\"kiki\"\n").unwrap();
 
@@ -666,7 +747,10 @@ mod tests {
             .run_backup_and_rotate(&cfg, Utc::now() + chrono::Duration::seconds(1))
             .await
             .unwrap();
-        assert_ne!(filename1, filename2, "the two runs must produce distinct filenames");
+        assert_ne!(
+            filename1, filename2,
+            "the two runs must produce distinct filenames"
+        );
 
         let entries2 = list_tar_gz_entries(&backups_dir(&home).join(&filename2));
 
@@ -683,7 +767,10 @@ mod tests {
         let staging = crate::backup_restore::staging_dir(&home);
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("leftover.txt"), b"x").unwrap();
-        let preserved = home.join(format!("{}20260101T000000Z", crate::backup_restore::RESTORE_BACKUP_PREFIX));
+        let preserved = home.join(format!(
+            "{}20260101T000000Z",
+            crate::backup_restore::RESTORE_BACKUP_PREFIX
+        ));
         std::fs::create_dir_all(&preserved).unwrap();
         std::fs::write(preserved.join("old-config.toml"), b"x").unwrap();
 
@@ -693,15 +780,22 @@ mod tests {
             .unwrap();
         let entries3 = list_tar_gz_entries(&backups_dir(&home).join(&filename3));
         assert!(
-            !entries3.iter().any(|e| e.contains("restore-staging") || e.contains("leftover.txt")),
+            !entries3
+                .iter()
+                .any(|e| e.contains("restore-staging") || e.contains("leftover.txt")),
             "restore-staging must be excluded: {entries3:?}"
         );
         assert!(
-            !entries3.iter().any(|e| e.contains("restore-backup-") || e.contains("old-config.toml")),
+            !entries3
+                .iter()
+                .any(|e| e.contains("restore-backup-") || e.contains("old-config.toml")),
             "a preserved restore-backup-* dir must be excluded: {entries3:?}"
         );
         // The ordinary sibling file must still be there — exclusion is
         // targeted, not a blanket "pack nothing" regression.
-        assert!(entries3.iter().any(|e| e.contains("agent.toml")), "{entries3:?}");
+        assert!(
+            entries3.iter().any(|e| e.contains("agent.toml")),
+            "{entries3:?}"
+        );
     }
 }

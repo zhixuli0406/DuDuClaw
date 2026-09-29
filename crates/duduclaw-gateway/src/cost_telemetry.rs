@@ -11,7 +11,7 @@
 //! Reference: <https://cablate.com/articles/reverse-engineer-claude-agent-sdk-hidden-token-cost/>
 
 use duduclaw_llm::{ModelRegistry, NormalizedUsage};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
@@ -319,6 +319,53 @@ pub struct UserCostSummary {
     pub total_cost_millicents: u64,
 }
 
+/// One per-model cost aggregate row (WP-A2).
+///
+/// Answers "which model is the money going to?", which no existing rollup
+/// could: every aggregation was by agent / user / day, even though
+/// `token_usage` has carried a `model` column since the schema's first
+/// version. Rows with an empty `model` (pre-model-column history, and CLI
+/// paths that never reported one) bucket under `"(unknown)"` — never guessed.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelCostRow {
+    pub model: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    /// Summed stored per-row cost, in the legacy telemetry unit (cents — see
+    /// [`TokenUsage::estimated_cost_millicents`]'s unit note). Same column and
+    /// therefore the same pricing path as every sibling rollup: cost is
+    /// computed ONCE per row at record time by [`cost_for`], never re-derived
+    /// here.
+    pub cost_millicents: u64,
+    /// `cost_millicents / 100.0` — a pure unit conversion of the field above,
+    /// exposed because the dashboard and MCP consumers want dollars and
+    /// should not each re-implement the (misnamed) cents scale.
+    pub cost_usd: f64,
+    /// Unweighted mean of the per-request `cache_efficiency` column, matching
+    /// [`CostSummary::avg_cache_efficiency`] and the `cache_health` thresholds
+    /// derived from it. Deliberately NOT a token-weighted ratio — the sibling
+    /// rollups use the plain average and a second dialect would make the two
+    /// views disagree for the same window.
+    pub cache_efficiency: f64,
+}
+
+/// Measured spend for one team role and answering model. Legacy rows whose
+/// role was never recorded are deliberately absent from this view.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoleCostRow {
+    pub role: String,
+    pub model: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_millicents: u64,
+    pub cost_usd: f64,
+}
+
 /// One per-agent per-day row of the O4 `multi_vs_single` report.
 #[derive(Debug, Clone, Serialize)]
 pub struct MultiVsSingleRow {
@@ -349,8 +396,7 @@ pub struct MultiVsSingleReport {
 
 /// The honest-attribution disclaimer embedded in every `multi_vs_single`
 /// report (arXiv:2604.02460).
-pub const MULTI_VS_SINGLE_GRANULARITY_NOTE: &str =
-    "granularity = per-agent per-day (dispatch vs chat request_type); true per-episode \
+pub const MULTI_VS_SINGLE_GRANULARITY_NOTE: &str = "granularity = per-agent per-day (dispatch vs chat request_type); true per-episode \
      linkage is not derivable from token_usage rows (no message/turn id recorded). \
      Reference: arXiv:2604.02460 — at equal token budgets a single agent often beats \
      multi-agent systems; delegate only parallelizable independent work.";
@@ -380,8 +426,7 @@ pub fn render_delegation_advisory(dispatch_cost: u64, direct_cost: u64, hours: u
 /// the agent a window to either self-correct or stay flagged through
 /// follow-up turns; longer would risk sticking the flag past the
 /// problem.
-pub const COST_PRESSURE_TTL: std::time::Duration =
-    std::time::Duration::from_secs(3600);
+pub const COST_PRESSURE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Persistent cost telemetry engine backed by SQLite.
 ///
@@ -401,8 +446,7 @@ pub struct CostTelemetry {
 impl CostTelemetry {
     /// Open (or create) the telemetry database and initialize the schema.
     pub fn new(db_path: &Path) -> Result<Self, String> {
-        let conn =
-            Connection::open(db_path).map_err(|e| format!("open telemetry db: {e}"))?;
+        let conn = Connection::open(db_path).map_err(|e| format!("open telemetry db: {e}"))?;
 
         Self::init_schema(&conn)?;
 
@@ -410,9 +454,7 @@ impl CostTelemetry {
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: db_path.to_path_buf(),
-            cost_pressure_flags: std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            ),
+            cost_pressure_flags: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -470,12 +512,14 @@ impl CostTelemetry {
         )
         .map_err(|e| format!("init telemetry schema: {e}"))?;
 
-        // WP6 additive migration: per-user / per-channel attribution columns.
+        // WP6 per-user/channel and team-stage per-role/task attribution.
         // Idempotent — an "duplicate column name" error on an already-migrated
         // DB is expected and ignored (same pattern as the memory crate).
         for stmt in [
             "ALTER TABLE token_usage ADD COLUMN user_id TEXT",
             "ALTER TABLE token_usage ADD COLUMN channel TEXT",
+            "ALTER TABLE token_usage ADD COLUMN role TEXT",
+            "ALTER TABLE token_usage ADD COLUMN episode_id TEXT",
         ] {
             if let Err(e) = conn.execute(stmt, []) {
                 let msg = e.to_string();
@@ -486,7 +530,9 @@ impl CostTelemetry {
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_token_usage_user_time
-                ON token_usage(user_id, created_at);",
+                ON token_usage(user_id, created_at);
+             CREATE INDEX IF NOT EXISTS idx_token_usage_episode_role
+                ON token_usage(episode_id, role, created_at);",
         )
         .map_err(|e| format!("token_usage user index: {e}"))?;
 
@@ -533,8 +579,22 @@ impl CostTelemetry {
         model: &str,
         usage: &TokenUsage,
     ) {
-        self.record_attributed(agent_id, request_type, model, usage, None, None)
-            .await;
+        let attribution = crate::runtime::ROLE_COST_ATTRIBUTION
+            .try_with(Clone::clone)
+            .ok();
+        self.record_with_role(
+            agent_id,
+            request_type,
+            model,
+            usage,
+            None,
+            None,
+            false,
+            "",
+            attribution.as_ref().map(|a| a.role),
+            attribution.as_ref().map(|a| a.episode_id.as_str()),
+        )
+        .await;
     }
 
     /// Record a single API call's token usage, attributing it to a specific end
@@ -550,7 +610,14 @@ impl CostTelemetry {
         channel: Option<&str>,
     ) {
         self.record_attributed_with_compression(
-            agent_id, request_type, model, usage, user_id, channel, false, "",
+            agent_id,
+            request_type,
+            model,
+            usage,
+            user_id,
+            channel,
+            false,
+            "",
         )
         .await;
     }
@@ -574,6 +641,62 @@ impl CostTelemetry {
         channel: Option<&str>,
         compressed: bool,
         stages: &str,
+    ) {
+        self.record_with_role(
+            agent_id,
+            request_type,
+            model,
+            usage,
+            user_id,
+            channel,
+            compressed,
+            stages,
+            None,
+            None,
+        )
+        .await;
+    }
+
+    /// Record measured usage for one team stage. `episode_id` is the task id;
+    /// callers must supply a canonical role and the answering model, never a
+    /// configured-but-unobserved model. Legacy rows retain NULL attribution.
+    pub async fn record_team_role(
+        &self,
+        agent_id: &str,
+        request_type: RequestType,
+        role: &str,
+        episode_id: &str,
+        model: &str,
+        usage: &TokenUsage,
+    ) {
+        self.record_with_role(
+            agent_id,
+            request_type,
+            model,
+            usage,
+            None,
+            None,
+            false,
+            "",
+            Some(role),
+            Some(episode_id),
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_with_role(
+        &self,
+        agent_id: &str,
+        request_type: RequestType,
+        model: &str,
+        usage: &TokenUsage,
+        user_id: Option<&str>,
+        channel: Option<&str>,
+        compressed: bool,
+        stages: &str,
+        role: Option<&str>,
+        episode_id: Option<&str>,
     ) {
         let now = chrono::Utc::now().to_rfc3339();
         let efficiency = usage.cache_efficiency();
@@ -604,8 +727,8 @@ impl CostTelemetry {
              (agent_id, request_type, model, input_tokens, cache_read_tokens,
               cache_creation_tokens, output_tokens, cache_efficiency, cost_millicents,
               cache_hit_rate, cache_savings_millicents, created_at, user_id, channel,
-              compressed, compression_stages)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              compressed, compression_stages, role, episode_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 agent_id,
                 request_type.as_str(),
@@ -623,6 +746,8 @@ impl CostTelemetry {
                 channel,
                 compressed as i64,
                 stages,
+                role,
+                episode_id,
             ],
         );
         drop(conn);
@@ -637,10 +762,7 @@ impl CostTelemetry {
         // is the cache-break signature the paper describes — compression
         // likely rewrote content inside the cached prefix, forcing a full
         // rebuild instead of the incremental cache-read it expected.
-        if compressed
-            && efficiency < 0.1
-            && prev_efficiency.is_some_and(|prev| prev > 0.5)
-        {
+        if compressed && efficiency < 0.1 && prev_efficiency.is_some_and(|prev| prev > 0.5) {
             warn!(
                 agent_id,
                 stages,
@@ -913,6 +1035,138 @@ impl CostTelemetry {
         Ok(out)
     }
 
+    /// Per-model cost rollup (WP-A2) — "which model is the spend going to?".
+    ///
+    /// `agent_id`: `Some` narrows to one agent (raw `token_usage.agent_id`, no
+    /// ephemeral folding — this view answers a model question, not an org
+    /// question), `None` aggregates every agent.
+    /// `since_unix`: inclusive lower bound as a Unix timestamp (seconds).
+    /// Values that cannot be represented as a UTC instant are treated as the
+    /// epoch, i.e. "all history", rather than silently returning nothing.
+    ///
+    /// Sorted by cost descending. Cost is the summed stored `cost_millicents`
+    /// column, exactly like [`Self::summary_global`] / [`Self::summary_by_agent`]
+    /// / [`Self::all_agents_summary`] — there is no second pricing path.
+    pub async fn summary_by_model(
+        &self,
+        agent_id: Option<&str>,
+        since_unix: i64,
+    ) -> Result<Vec<ModelCostRow>, String> {
+        // `created_at` is stored as RFC3339 UTC text, so the cutoff has to be
+        // the same shape for the lexicographic `>=` comparison every sibling
+        // query relies on.
+        let cutoff = chrono::DateTime::from_timestamp(since_unix, 0)
+            .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+            .to_rfc3339();
+        let conn = self.conn.lock().await;
+
+        // Two literal statements rather than a `WHERE (?2 IS NULL OR ...)`
+        // trick so the `(agent_id, created_at)` index is usable in the narrowed
+        // case and the SQL of each path is readable on its own.
+        let sql = if agent_id.is_some() {
+            "SELECT
+                CASE WHEN model IS NULL OR TRIM(model) = '' THEN '(unknown)' ELSE model END AS m,
+                COUNT(*),
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0),
+                COALESCE(SUM(cache_creation_tokens), 0),
+                COALESCE(SUM(cost_millicents), 0),
+                COALESCE(AVG(cache_efficiency), 0.0)
+             FROM token_usage
+             WHERE created_at >= ?1 AND agent_id = ?2
+             GROUP BY m
+             ORDER BY SUM(cost_millicents) DESC, m ASC"
+        } else {
+            "SELECT
+                CASE WHEN model IS NULL OR TRIM(model) = '' THEN '(unknown)' ELSE model END AS m,
+                COUNT(*),
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0),
+                COALESCE(SUM(cache_creation_tokens), 0),
+                COALESCE(SUM(cost_millicents), 0),
+                COALESCE(AVG(cache_efficiency), 0.0)
+             FROM token_usage
+             WHERE created_at >= ?1
+             GROUP BY m
+             ORDER BY SUM(cost_millicents) DESC, m ASC"
+        };
+
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| format!("summary_by_model prepare: {e}"))?;
+
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ModelCostRow> {
+            let cost_millicents = safe_u64(row.get::<_, i64>(6)?);
+            Ok(ModelCostRow {
+                model: row.get(0)?,
+                requests: safe_u64(row.get::<_, i64>(1)?),
+                input_tokens: safe_u64(row.get::<_, i64>(2)?),
+                output_tokens: safe_u64(row.get::<_, i64>(3)?),
+                cache_read_tokens: safe_u64(row.get::<_, i64>(4)?),
+                cache_creation_tokens: safe_u64(row.get::<_, i64>(5)?),
+                cost_millicents,
+                cost_usd: cost_millicents as f64 / 100.0,
+                cache_efficiency: row.get(7)?,
+            })
+        };
+
+        let rows = match agent_id {
+            Some(a) => stmt.query_map(params![cutoff, a], map_row),
+            None => stmt.query_map(params![cutoff], map_row),
+        }
+        .map_err(|e| format!("summary_by_model query: {e}"))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| format!("summary_by_model row: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// Per-role spend from measured team-stage rows. `episode_id` narrows to
+    /// one task when supplied; NULL role rows are never assigned by guesswork.
+    pub async fn summary_by_role(
+        &self,
+        episode_id: Option<&str>,
+        since_unix: i64,
+    ) -> Result<Vec<RoleCostRow>, String> {
+        let cutoff = chrono::DateTime::from_timestamp(since_unix, 0)
+            .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+            .to_rfc3339();
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT role, model, COUNT(*), COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cost_millicents), 0)
+             FROM token_usage
+             WHERE created_at >= ?1 AND role IS NOT NULL AND role != ''
+               AND (?2 IS NULL OR episode_id = ?2)
+             GROUP BY role, model
+             ORDER BY SUM(cost_millicents) DESC, role, model",
+            )
+            .map_err(|e| format!("summary_by_role prepare: {e}"))?;
+        let rows = stmt
+            .query_map(params![cutoff, episode_id], |row| {
+                let cost_millicents = safe_u64(row.get::<_, i64>(6)?);
+                Ok(RoleCostRow {
+                    role: row.get(0)?,
+                    model: row.get(1)?,
+                    requests: safe_u64(row.get::<_, i64>(2)?),
+                    input_tokens: safe_u64(row.get::<_, i64>(3)?),
+                    output_tokens: safe_u64(row.get::<_, i64>(4)?),
+                    cache_read_tokens: safe_u64(row.get::<_, i64>(5)?),
+                    cost_millicents,
+                    cost_usd: cost_millicents as f64 / 100.0,
+                })
+            })
+            .map_err(|e| format!("summary_by_role query: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("summary_by_role row: {e}"))
+    }
+
     /// Recent cost records (for debugging / dashboard).
     pub async fn recent_records(&self, limit: u32) -> Result<Vec<CostRecord>, String> {
         let conn = self.conn.lock().await;
@@ -966,6 +1220,27 @@ impl CostTelemetry {
         agent_id: &str,
         days: u64,
     ) -> Result<Vec<u64>, String> {
+        Ok(self
+            .daily_cost_series(agent_id, days)
+            .await?
+            .into_iter()
+            .map(|(_day, cents)| cents)
+            .collect())
+    }
+
+    /// Same series as [`daily_cost_millicents`](Self::daily_cost_millicents)
+    /// but **labelled** with each day's `YYYY-MM-DD` key, oldest first.
+    ///
+    /// The labels matter to burn-rate anomaly detection (D12): the baseline is
+    /// "the days before today", and since days with no spend are omitted, the
+    /// last element is only today's spend when the agent actually spent
+    /// something today. Reading the last element blind would treat an old
+    /// quiet day as "today" and could flag an agent that spent nothing.
+    pub async fn daily_cost_series(
+        &self,
+        agent_id: &str,
+        days: u64,
+    ) -> Result<Vec<(String, u64)>, String> {
         let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
         let conn = self.conn.lock().await;
         let mut stmt = conn
@@ -980,7 +1255,7 @@ impl CostTelemetry {
             .map_err(|e| format!("daily_cost prepare: {e}"))?;
         let rows = stmt
             .query_map(params![agent_id, cutoff], |row| {
-                Ok(safe_u64(row.get::<_, i64>(1)?))
+                Ok((row.get::<_, String>(0)?, safe_u64(row.get::<_, i64>(1)?)))
             })
             .map_err(|e| format!("daily_cost query: {e}"))?;
         let mut out = Vec::new();
@@ -1096,8 +1371,7 @@ impl CostTelemetry {
 
     /// Clean up records older than `days` days.
     pub async fn cleanup_old_records(&self, days: u64) -> Result<u64, String> {
-        let cutoff =
-            (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
         let conn = self.conn.lock().await;
 
         let deleted = conn
@@ -1295,8 +1569,9 @@ fn spawn_cache_attribution_event_write(telemetry_db: &Path, top: Vec<(String, St
 /// Stored in-memory (not persisted) — resets on restart. Agents with cache
 /// efficiency < 30% over the last hour are automatically routed to local inference
 /// when possible.
-static ADAPTIVE_OVERRIDES: std::sync::OnceLock<tokio::sync::RwLock<std::collections::HashSet<String>>> =
-    std::sync::OnceLock::new();
+static ADAPTIVE_OVERRIDES: std::sync::OnceLock<
+    tokio::sync::RwLock<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
 
 fn overrides_set() -> &'static tokio::sync::RwLock<std::collections::HashSet<String>> {
     ADAPTIVE_OVERRIDES.get_or_init(|| tokio::sync::RwLock::new(std::collections::HashSet::new()))
@@ -1344,7 +1619,8 @@ pub async fn adaptive_routing_check(home_dir: &std::path::Path) {
             if overrides.insert(agent.agent_id.clone()) {
                 changes.push(format!(
                     "{}: cache_eff={:.0}% → prefer_local ON",
-                    agent.agent_id, eff * 100.0
+                    agent.agent_id,
+                    eff * 100.0
                 ));
             }
         } else if eff > 0.7 {
@@ -1352,7 +1628,8 @@ pub async fn adaptive_routing_check(home_dir: &std::path::Path) {
             if overrides.remove(&agent.agent_id) {
                 changes.push(format!(
                     "{}: cache_eff={:.0}% → prefer_local OFF (cache healthy)",
-                    agent.agent_id, eff * 100.0
+                    agent.agent_id,
+                    eff * 100.0
                 ));
             }
         }
@@ -1381,7 +1658,10 @@ pub async fn adaptive_routing_check(home_dir: &std::path::Path) {
     let mut attribution = crate::direct_api::cache_attribution_snapshot();
     attribution.sort_by(|a, b| b.2.cmp(&a.2)); // count desc
     for (scope, cause, count) in attribution.iter().take(10) {
-        info!(scope, cause, count, "cache attribution: top invalidation cause");
+        info!(
+            scope,
+            cause, count, "cache attribution: top invalidation cause"
+        );
     }
     if !attribution.is_empty() {
         spawn_cache_attribution_event_write(&telemetry.db_path, attribution);
@@ -1541,7 +1821,12 @@ mod tests {
 
         // Record
         telemetry
-            .record("agent_alpha", RequestType::Chat, "claude-sonnet-4-6", &usage)
+            .record(
+                "agent_alpha",
+                RequestType::Chat,
+                "claude-sonnet-4-6",
+                &usage,
+            )
             .await;
 
         // Query global summary
@@ -1577,13 +1862,34 @@ mod tests {
         };
         // Two users on Telegram + one unattributed (system) record.
         telemetry
-            .record_attributed("agnes", RequestType::Chat, "claude-sonnet-4-6", &usage, Some("u-alice"), Some("telegram:1"))
+            .record_attributed(
+                "agnes",
+                RequestType::Chat,
+                "claude-sonnet-4-6",
+                &usage,
+                Some("u-alice"),
+                Some("telegram:1"),
+            )
             .await;
         telemetry
-            .record_attributed("agnes", RequestType::Chat, "claude-sonnet-4-6", &usage, Some("u-alice"), Some("telegram:1"))
+            .record_attributed(
+                "agnes",
+                RequestType::Chat,
+                "claude-sonnet-4-6",
+                &usage,
+                Some("u-alice"),
+                Some("telegram:1"),
+            )
             .await;
         telemetry
-            .record_attributed("agnes", RequestType::Chat, "claude-sonnet-4-6", &usage, Some("u-bob"), Some("telegram:2"))
+            .record_attributed(
+                "agnes",
+                RequestType::Chat,
+                "claude-sonnet-4-6",
+                &usage,
+                Some("u-bob"),
+                Some("telegram:2"),
+            )
             .await;
         telemetry
             .record("agnes", RequestType::Evolution, "claude-sonnet-4-6", &usage) // no user
@@ -1607,8 +1913,14 @@ mod tests {
         drop(_t1);
         let t2 = CostTelemetry::new(&path).unwrap();
         // And a plain record still works post-migration.
-        let usage = TokenUsage { input_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 1 };
-        t2.record("a", RequestType::Chat, "claude-sonnet-4-6", &usage).await;
+        let usage = TokenUsage {
+            input_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 1,
+        };
+        t2.record("a", RequestType::Chat, "claude-sonnet-4-6", &usage)
+            .await;
         assert_eq!(t2.summary_global(1).await.unwrap().total_requests, 1);
     }
 
@@ -1624,8 +1936,14 @@ mod tests {
         let _t1 = CostTelemetry::new(&path).unwrap();
         drop(_t1);
         let t2 = CostTelemetry::new(&path).unwrap();
-        let usage = TokenUsage { input_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 1 };
-        t2.record("a", RequestType::Chat, "claude-sonnet-4-6", &usage).await;
+        let usage = TokenUsage {
+            input_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 1,
+        };
+        t2.record("a", RequestType::Chat, "claude-sonnet-4-6", &usage)
+            .await;
         let records = t2.recent_records(1).await.unwrap();
         assert!(!records[0].compressed);
         assert_eq!(records[0].compression_stages, "");
@@ -1657,7 +1975,10 @@ mod tests {
         let records = telemetry.recent_records(1).await.unwrap();
         assert_eq!(records.len(), 1);
         assert!(records[0].compressed);
-        assert_eq!(records[0].compression_stages, "turn_trim,drop_oldest_tool_echoes");
+        assert_eq!(
+            records[0].compression_stages,
+            "turn_trim,drop_oldest_tool_echoes"
+        );
     }
 
     #[tokio::test]
@@ -1666,9 +1987,21 @@ mod tests {
         // exactly as before — compressed=false, stages="".
         let dir = tempfile::tempdir().unwrap();
         let telemetry = CostTelemetry::new(&dir.path().join("wp5b.db")).unwrap();
-        let usage = TokenUsage { input_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 1 };
+        let usage = TokenUsage {
+            input_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 1,
+        };
         telemetry
-            .record_attributed("agent_y", RequestType::Chat, "claude-sonnet-4-6", &usage, None, None)
+            .record_attributed(
+                "agent_y",
+                RequestType::Chat,
+                "claude-sonnet-4-6",
+                &usage,
+                None,
+                None,
+            )
             .await;
         let records = telemetry.recent_records(1).await.unwrap();
         assert!(!records[0].compressed);
@@ -1698,7 +2031,14 @@ mod tests {
         };
         telemetry
             .record_attributed_with_compression(
-                "agent_break", RequestType::Chat, "claude-sonnet-4-6", &healthy, None, None, false, "",
+                "agent_break",
+                RequestType::Chat,
+                "claude-sonnet-4-6",
+                &healthy,
+                None,
+                None,
+                false,
+                "",
             )
             .await;
 
@@ -1712,14 +2052,25 @@ mod tests {
         };
         telemetry
             .record_attributed_with_compression(
-                "agent_break", RequestType::Chat, "claude-sonnet-4-6", &cratered, None, None, true, "turn_trim",
+                "agent_break",
+                RequestType::Chat,
+                "claude-sonnet-4-6",
+                &cratered,
+                None,
+                None,
+                true,
+                "turn_trim",
             )
             .await;
 
         let after = crate::metrics::global_metrics()
             .prompt_compression_cache_break_suspect_total
             .load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(after, before + 1, "cache-break suspect counter should increment exactly once");
+        assert_eq!(
+            after,
+            before + 1,
+            "cache-break suspect counter should increment exactly once"
+        );
     }
 
     #[tokio::test]
@@ -1739,7 +2090,14 @@ mod tests {
         };
         telemetry
             .record_attributed_with_compression(
-                "agent_no_break", RequestType::Chat, "claude-sonnet-4-6", &healthy, None, None, false, "",
+                "agent_no_break",
+                RequestType::Chat,
+                "claude-sonnet-4-6",
+                &healthy,
+                None,
+                None,
+                false,
+                "",
             )
             .await;
         let cratered = TokenUsage {
@@ -1752,7 +2110,14 @@ mod tests {
         // gate must not fire because compression didn't happen.
         telemetry
             .record_attributed_with_compression(
-                "agent_no_break", RequestType::Chat, "claude-sonnet-4-6", &cratered, None, None, false, "",
+                "agent_no_break",
+                RequestType::Chat,
+                "claude-sonnet-4-6",
+                &cratered,
+                None,
+                None,
+                false,
+                "",
             )
             .await;
 
@@ -1771,10 +2136,10 @@ mod tests {
     #[test]
     fn cost_for_known_anthropic_matches_legacy_sub_cliff() {
         let usage = TokenUsage {
-            input_tokens: 100_000,       // $0.30 → 30
-            cache_read_tokens: 50_000,   // $0.015 → 1.5
+            input_tokens: 100_000,         // $0.30 → 30
+            cache_read_tokens: 50_000,     // $0.015 → 1.5
             cache_creation_tokens: 10_000, // $0.0375 → 3.75
-            output_tokens: 100_000,      // $1.50 → 150
+            output_tokens: 100_000,        // $1.50 → 150
         };
         // total_input = 160K < 200K cliff on both paths.
         let legacy = usage.estimated_cost_millicents();
@@ -1784,7 +2149,10 @@ mod tests {
         // Registry totals in true millicents then converts: 185_250 → 185.
         assert_eq!(registry, 185);
         // Same scale, within per-component rounding slack.
-        assert!(legacy.abs_diff(registry) <= 2, "legacy={legacy} registry={registry}");
+        assert!(
+            legacy.abs_diff(registry) <= 2,
+            "legacy={legacy} registry={registry}"
+        );
 
         // Exact equality on a fixture where per-component rounding is clean.
         let clean = TokenUsage {
@@ -1793,7 +2161,10 @@ mod tests {
             cache_creation_tokens: 0,
             output_tokens: 100_000,
         };
-        assert_eq!(cost_for("claude-sonnet-5", &clean), clean.estimated_cost_millicents());
+        assert_eq!(
+            cost_for("claude-sonnet-5", &clean),
+            clean.estimated_cost_millicents()
+        );
         assert_eq!(cost_for("claude-sonnet-5", &clean), 180);
     }
 
@@ -1802,7 +2173,7 @@ mod tests {
     #[test]
     fn cost_for_deepseek_prices_at_deepseek_rates() {
         let usage = TokenUsage {
-            input_tokens: 100_000,  // $0.23/MTok → 2_300 true mc
+            input_tokens: 100_000, // $0.23/MTok → 2_300 true mc
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             output_tokens: 100_000, // $0.34/MTok → 3_400 true mc
@@ -1831,7 +2202,10 @@ mod tests {
             usage.estimated_cost_millicents()
         );
         // Above-cliff legacy doubling must survive the fallback too.
-        let big = TokenUsage { input_tokens: 300_000, ..Default::default() };
+        let big = TokenUsage {
+            input_tokens: 300_000,
+            ..Default::default()
+        };
         assert_eq!(
             cost_for("totally-unknown-model", &big),
             big.estimated_cost_millicents()
@@ -1841,8 +2215,14 @@ mod tests {
     /// Cliff threshold derives from the registry when the model is known.
     #[test]
     fn near_price_cliff_uses_registry_threshold() {
-        let big = TokenUsage { input_tokens: 185_000, ..Default::default() };
-        let small = TokenUsage { input_tokens: 170_000, ..Default::default() };
+        let big = TokenUsage {
+            input_tokens: 185_000,
+            ..Default::default()
+        };
+        let small = TokenUsage {
+            input_tokens: 170_000,
+            ..Default::default()
+        };
         // Anthropic 200K cliff → warn above 180K.
         assert!(near_price_cliff_for("claude-sonnet-5", &big));
         assert!(!near_price_cliff_for("claude-sonnet-5", &small));
@@ -1955,8 +2335,10 @@ mod tests {
         const MODEL: &str = "o4-test-unknown-model"; // legacy pricing: 180/row
 
         // worker: 2 delegated rows; boss: 1 direct row; 1 cron row (excluded).
-        t.record("worker", RequestType::Dispatch, MODEL, &usage).await;
-        t.record("worker", RequestType::Dispatch, MODEL, &usage).await;
+        t.record("worker", RequestType::Dispatch, MODEL, &usage)
+            .await;
+        t.record("worker", RequestType::Dispatch, MODEL, &usage)
+            .await;
         t.record("boss", RequestType::Chat, MODEL, &usage).await;
         t.record("boss", RequestType::Cron, MODEL, &usage).await;
 
@@ -1966,8 +2348,11 @@ mod tests {
         assert_eq!(report.total_direct_requests, 1);
         assert_eq!(report.total_direct_cost_millicents, 180);
         // Cron traffic must not leak into either bucket.
-        let boss_rows: Vec<_> =
-            report.rows.iter().filter(|r| r.agent_id == "boss").collect();
+        let boss_rows: Vec<_> = report
+            .rows
+            .iter()
+            .filter(|r| r.agent_id == "boss")
+            .collect();
         assert_eq!(boss_rows.len(), 1);
         assert_eq!(boss_rows[0].direct_requests, 1);
         assert_eq!(boss_rows[0].dispatch_requests, 0);
@@ -1994,10 +2379,13 @@ mod tests {
         const MODEL: &str = "o4-test-unknown-model"; // legacy pricing: 180/row
 
         // 2 mapped eph dispatch rows, 1 parent chat row, 1 unmapped eph row.
-        t.record("eph-1234abcd", RequestType::Dispatch, MODEL, &usage).await;
-        t.record("eph-1234abcd", RequestType::Dispatch, MODEL, &usage).await;
+        t.record("eph-1234abcd", RequestType::Dispatch, MODEL, &usage)
+            .await;
+        t.record("eph-1234abcd", RequestType::Dispatch, MODEL, &usage)
+            .await;
         t.record("boss", RequestType::Chat, MODEL, &usage).await;
-        t.record("eph-deadbeef", RequestType::Chat, MODEL, &usage).await;
+        t.record("eph-deadbeef", RequestType::Chat, MODEL, &usage)
+            .await;
         record_ephemeral_parent_at(&db, "eph-1234abcd", "boss").unwrap();
         // Re-recording the same mapping is an idempotent upsert.
         record_ephemeral_parent_at(&db, "eph-1234abcd", "boss").unwrap();
@@ -2080,11 +2468,272 @@ mod tests {
             output_tokens: 500,
         };
         telemetry
-            .record("normal-agent", RequestType::Chat, "claude-sonnet-4-6", &usage)
+            .record(
+                "normal-agent",
+                RequestType::Chat,
+                "claude-sonnet-4-6",
+                &usage,
+            )
             .await;
 
         // total_input = 55_000 → well below the 180K threshold. Flag
         // must stay clear.
         assert!(!telemetry.is_under_cost_pressure("normal-agent"));
+    }
+
+    // ── WP-A2: per-model cost rollup ────────────────────────────────────
+    //
+    // `token_usage` has carried a `model` column since the first schema, but
+    // every rollup grouped by agent / user / day — "which model is the money
+    // going to?" was unanswerable without reading raw rows.
+
+    /// Shared fixture: two models under two agents, with deliberately
+    /// different token shapes so the per-model split is observable.
+    async fn model_rollup_fixture(db: &Path) -> CostTelemetry {
+        let telemetry = CostTelemetry::new(db).unwrap();
+        // Opus: expensive, no cache.
+        telemetry
+            .record(
+                "alpha",
+                RequestType::Chat,
+                "claude-opus-4-6",
+                &TokenUsage {
+                    input_tokens: 10_000,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 2_000,
+                    output_tokens: 3_000,
+                },
+            )
+            .await;
+        // Haiku: two calls, cache-heavy, cheap.
+        for _ in 0..2 {
+            telemetry
+                .record(
+                    "alpha",
+                    RequestType::Chat,
+                    "claude-haiku-4-5",
+                    &TokenUsage {
+                        input_tokens: 1_000,
+                        cache_read_tokens: 9_000,
+                        cache_creation_tokens: 0,
+                        output_tokens: 100,
+                    },
+                )
+                .await;
+        }
+        // A different agent, so the `agent_id` filter has something to exclude.
+        telemetry
+            .record(
+                "beta",
+                RequestType::Chat,
+                "claude-haiku-4-5",
+                &TokenUsage {
+                    input_tokens: 500,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    output_tokens: 50,
+                },
+            )
+            .await;
+        telemetry
+    }
+
+    #[tokio::test]
+    async fn summary_by_model_groups_and_sorts_by_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = model_rollup_fixture(&dir.path().join("bm.db")).await;
+
+        let rows = telemetry.summary_by_model(None, 0).await.unwrap();
+        assert_eq!(rows.len(), 2, "two distinct models: {rows:?}");
+
+        // Sorted by cost DESC — opus (10k input + 3k output) outspends three
+        // small haiku calls.
+        assert_eq!(rows[0].model, "claude-opus-4-6");
+        assert_eq!(rows[1].model, "claude-haiku-4-5");
+        assert!(rows[0].cost_millicents >= rows[1].cost_millicents);
+
+        assert_eq!(rows[0].requests, 1);
+        assert_eq!(rows[0].input_tokens, 10_000);
+        assert_eq!(rows[0].output_tokens, 3_000);
+        assert_eq!(rows[0].cache_creation_tokens, 2_000);
+        assert_eq!(rows[0].cache_read_tokens, 0);
+
+        // Haiku: 2 alpha calls + 1 beta call summed across agents.
+        assert_eq!(rows[1].requests, 3);
+        assert_eq!(rows[1].input_tokens, 1_000 * 2 + 500);
+        assert_eq!(rows[1].cache_read_tokens, 9_000 * 2);
+        assert_eq!(rows[1].output_tokens, 100 * 2 + 50);
+    }
+
+    #[tokio::test]
+    async fn team_role_spend_is_task_scoped_and_legacy_rows_stay_unattributed() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("role_cost.db")).unwrap();
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        telemetry
+            .record("worker", RequestType::Chat, "gpt-5.5", &usage)
+            .await;
+        telemetry
+            .record_team_role(
+                "worker",
+                RequestType::Dispatch,
+                "executor",
+                "task-a",
+                "gpt-5.5",
+                &usage,
+            )
+            .await;
+        telemetry
+            .record_team_role(
+                "worker",
+                RequestType::Dispatch,
+                "planner",
+                "task-b",
+                "gpt-5.5",
+                &usage,
+            )
+            .await;
+        let a = telemetry.summary_by_role(Some("task-a"), 0).await.unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].role, "executor");
+        assert_eq!(a[0].requests, 1);
+        let all = telemetry.summary_by_role(None, 0).await.unwrap();
+        assert_eq!(all.len(), 2, "legacy NULL-role row must not be guessed");
+    }
+
+    #[tokio::test]
+    async fn ordinary_record_in_composer_scope_carries_role_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("scope_cost.db")).unwrap();
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        crate::runtime::ROLE_COST_ATTRIBUTION
+            .scope(
+                crate::runtime::RoleCostAttribution {
+                    role: "planner",
+                    episode_id: "task-p".to_string(),
+                },
+                telemetry.record("eph-member", RequestType::Dispatch, "gpt-5.5", &usage),
+            )
+            .await;
+        let rows = telemetry.summary_by_role(Some("task-p"), 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].role, "planner");
+        assert_eq!(rows[0].requests, 1);
+    }
+
+    #[tokio::test]
+    async fn summary_by_model_filters_by_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = model_rollup_fixture(&dir.path().join("bm_agent.db")).await;
+
+        let rows = telemetry.summary_by_model(Some("beta"), 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "claude-haiku-4-5");
+        assert_eq!(rows[0].requests, 1, "beta made exactly one call");
+        assert_eq!(rows[0].input_tokens, 500);
+
+        // An agent with no rows is an empty vec, not an error.
+        assert!(
+            telemetry
+                .summary_by_model(Some("nobody"), 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_by_model_cost_matches_the_single_pricing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("bm_cost.db")).unwrap();
+        let usage = TokenUsage {
+            input_tokens: 20_000,
+            cache_read_tokens: 5_000,
+            cache_creation_tokens: 1_000,
+            output_tokens: 4_000,
+        };
+        telemetry
+            .record("alpha", RequestType::Chat, "claude-sonnet-4-6", &usage)
+            .await;
+
+        let rows = telemetry.summary_by_model(None, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        // No second pricing path: the rollup must equal `cost_for`, the same
+        // function `record` used to write the row.
+        assert_eq!(
+            rows[0].cost_millicents,
+            cost_for("claude-sonnet-4-6", &usage),
+            "per-model rollup re-derived cost instead of summing the stored column"
+        );
+        // `cost_usd` is a pure unit conversion of that same number.
+        assert!(
+            (rows[0].cost_usd - rows[0].cost_millicents as f64 / 100.0).abs() < f64::EPSILON,
+            "cost_usd drifted from cost_millicents"
+        );
+        // Global summary and the per-model rollup must agree for the window.
+        let global = telemetry.summary_global(1).await.unwrap();
+        assert_eq!(global.total_cost_millicents, rows[0].cost_millicents);
+    }
+
+    #[tokio::test]
+    async fn summary_by_model_buckets_blank_model_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("bm_unknown.db")).unwrap();
+        telemetry
+            .record(
+                "alpha",
+                RequestType::Chat,
+                "", // pre-model-column history / CLI paths that report nothing
+                &TokenUsage {
+                    input_tokens: 100,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    output_tokens: 10,
+                },
+            )
+            .await;
+        let rows = telemetry.summary_by_model(None, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].model, "(unknown)",
+            "blank model must never be guessed"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_by_model_honors_the_since_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = model_rollup_fixture(&dir.path().join("bm_since.db")).await;
+
+        // A cutoff in the future excludes everything (honest empty, not an error).
+        let future = chrono::Utc::now().timestamp() + 3_600;
+        assert!(
+            telemetry
+                .summary_by_model(None, future)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // An hour ago includes everything just recorded.
+        let hour_ago = chrono::Utc::now().timestamp() - 3_600;
+        assert_eq!(
+            telemetry
+                .summary_by_model(None, hour_ago)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

@@ -44,8 +44,7 @@ use crate::mcp_rate_limit::OpType;
 
 /// Protocol revisions this endpoint accepts in the `MCP-Protocol-Version`
 /// header and negotiates in `initialize`. Newest first.
-pub(crate) const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
-    &["2025-06-18", "2025-03-26", "2024-11-05"];
+pub(crate) const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// The newest revision we implement — offered whenever the client asks for a
 /// version we don't know (spec: server answers with its latest supported).
@@ -96,7 +95,11 @@ fn normalize_origin_entry(raw: &str) -> Option<String> {
         }
     }
     let cleaned = trimmed[start..].trim_end_matches('/').trim();
-    if cleaned.is_empty() { None } else { Some(cleaned.to_string()) }
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
 }
 
 /// Spec MUST: validate `Origin` when present. Absent header = non-browser
@@ -118,13 +121,21 @@ fn origin_ok(headers: &HeaderMap, home_dir: &std::path::Path) -> bool {
 /// `GET /mcp` — this server has no server-initiated stream; the spec's
 /// prescribed answer is 405.
 pub(crate) async fn mcp_get_handler() -> Response {
-    (StatusCode::METHOD_NOT_ALLOWED, "server-initiated streams are not supported").into_response()
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        "server-initiated streams are not supported",
+    )
+        .into_response()
 }
 
 /// `DELETE /mcp` — stateless server, no sessions to terminate; spec allows
 /// answering 405.
 pub(crate) async fn mcp_delete_handler() -> Response {
-    (StatusCode::METHOD_NOT_ALLOWED, "sessions are not used by this server").into_response()
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        "sessions are not used by this server",
+    )
+        .into_response()
 }
 
 /// `POST /mcp` — the Streamable HTTP message endpoint.
@@ -140,7 +151,10 @@ pub(crate) async fn mcp_post_handler(
 
     // 2. Protocol-version header gate: unknown value ⇒ 400 (spec); absent ⇒
     //    treat as an older revision and proceed.
-    if let Some(ver) = headers.get("MCP-Protocol-Version").and_then(|v| v.to_str().ok()) {
+    if let Some(ver) = headers
+        .get("MCP-Protocol-Version")
+        .and_then(|v| v.to_str().ok())
+    {
         if !SUPPORTED_PROTOCOL_VERSIONS.contains(&ver) {
             return (
                 StatusCode::BAD_REQUEST,
@@ -166,8 +180,7 @@ pub(crate) async fn mcp_post_handler(
             Ok(p) => p,
             Err(mut r) => {
                 if r.status() == StatusCode::UNAUTHORIZED {
-                    if let Ok(v) =
-                        crate::mcp_oauth_server::www_authenticate_value(&headers).parse()
+                    if let Ok(v) = crate::mcp_oauth_server::www_authenticate_value(&headers).parse()
                     {
                         r.headers_mut().insert("WWW-Authenticate", v);
                     }
@@ -191,7 +204,11 @@ pub(crate) async fn mcp_post_handler(
         // 2025-06-18 removed JSON-RPC batching; a stateless server rejects it.
         return (
             StatusCode::BAD_REQUEST,
-            Json(jsonrpc_error(&Value::Null, -32600, "JSON-RPC batching is not supported")),
+            Json(jsonrpc_error(
+                &Value::Null,
+                -32600,
+                "JSON-RPC batching is not supported",
+            )),
         )
             .into_response();
     }
@@ -226,11 +243,21 @@ pub(crate) async fn mcp_post_handler(
     let jsonrpc = match method {
         "initialize" => handle_initialize(&id, &params),
         "ping" => jsonrpc_response(&id, json!({})),
-        "tools/list" => crate::mcp::handle_tools_list(&id, &principal, &state.home_dir),
+        "tools/list" => {
+            crate::mcp::handle_tools_list_for_agent(
+                &id,
+                &principal,
+                &state.home_dir,
+                &state.dispatcher.default_agent,
+            )
+            .await
+        }
         "tools/call" => {
             // Same per-key rate gate as the legacy call route.
-            if let Err(e) =
-                state.dispatcher.rate_limiter.check(&principal.client_id, OpType::HttpRequest)
+            if let Err(e) = state
+                .dispatcher
+                .rate_limiter
+                .check(&principal.client_id, OpType::HttpRequest)
             {
                 let mut resp = (
                     StatusCode::OK,
@@ -255,7 +282,9 @@ pub(crate) async fn mcp_post_handler(
             }
             match tokio::time::timeout(
                 state.call_timeout,
-                state.dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id),
+                state
+                    .dispatcher
+                    .dispatch_tool_call(&principal, &ns_ctx, &params, &id),
             )
             .await
             {
@@ -276,7 +305,10 @@ pub(crate) async fn mcp_post_handler(
 /// decides whether to continue). Capabilities are honest — tools only, no
 /// listChanged notifications (stateless transport has no server push).
 fn handle_initialize(id: &Value, params: &Value) -> Value {
-    let requested = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("");
+    let requested = params
+        .get("protocolVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let negotiated = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
         requested
     } else {
@@ -313,8 +345,14 @@ mod tests {
 
     #[test]
     fn origin_entries_normalize_and_loopback_always_allowed() {
-        assert_eq!(normalize_origin_entry(" https://Example.com/ "), Some("Example.com".into()));
-        assert_eq!(normalize_origin_entry("chrome-ext-id"), Some("chrome-ext-id".into()));
+        assert_eq!(
+            normalize_origin_entry(" https://Example.com/ "),
+            Some("Example.com".into())
+        );
+        assert_eq!(
+            normalize_origin_entry("chrome-ext-id"),
+            Some("chrome-ext-id".into())
+        );
         assert_eq!(normalize_origin_entry("  "), None);
 
         let dir = tempfile::tempdir().unwrap();

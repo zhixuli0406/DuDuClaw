@@ -18,10 +18,19 @@
 
 use std::path::{Path, PathBuf};
 
+use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 use crate::channel_sender::ChannelSender;
 use crate::media::{self, MAX_FILE_SIZE};
+
+pub type DeliveryCheck<'a> = dyn Fn() -> bool + Send + Sync + 'a;
+
+fn delivery_valid(check: Option<&DeliveryCheck<'_>>) -> bool {
+    check.is_none_or(|valid| valid())
+}
+
+const SOURCE_CHANGED: &str = "source changed during document delivery";
 
 // ── WP1.2: attachment extension → skill routing ─────────────────
 
@@ -166,31 +175,72 @@ pub async fn process_deliverables(
     home_dir: &Path,
     sender: &dyn ChannelSender,
 ) -> String {
+    process_deliverables_checked(reply, agent_dir, home_dir, sender, None).await
+}
+
+/// The guarded path checks again after every awaited staging step and before
+/// each outbound document call. Legacy callers pass no check and keep their
+/// existing delivery behavior.
+pub async fn process_deliverables_checked(
+    reply: &str,
+    agent_dir: &Path,
+    home_dir: &Path,
+    sender: &dyn ChannelSender,
+    check: Option<&DeliveryCheck<'_>>,
+) -> String {
+    if !delivery_valid(check) {
+        return crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT.to_string();
+    }
     let (cleaned, paths) = parse_deliverables(reply);
     if paths.is_empty() {
         return reply.to_string();
     }
 
     let mut notes: Vec<String> = Vec::new();
+    let mut owned_archives: Vec<PathBuf> = Vec::new();
     for raw in &paths {
-        if let Err(e) = deliver_one(
+        if !delivery_valid(check) {
+            rollback_owned_archives(&owned_archives).await;
+            return crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT.to_string();
+        }
+        match deliver_one(
             raw,
             agent_dir,
             home_dir,
             sender,
             crate::artifacts::ArtifactOrigin::Declared,
+            check,
         )
         .await
         {
-            warn!(path = %raw, error = %e, "📎DELIVER: delivery failed — degrading to text");
-            notes.push(format!("⚠️ 檔案傳送失敗，已生成於 {raw}（{e}）"));
+            Ok(Some(path)) => owned_archives.push(path),
+            Ok(None) => {}
+            Err(e) => {
+                if !delivery_valid(check) {
+                    rollback_owned_archives(&owned_archives).await;
+                    return crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT.to_string();
+                }
+                warn!(path = %raw, error = %e, "📎DELIVER: delivery failed — degrading to text");
+                notes.push(format!("⚠️ 檔案傳送失敗，已生成於 {raw}（{e}）"));
+            }
         }
+    }
+
+    if !delivery_valid(check) {
+        rollback_owned_archives(&owned_archives).await;
+        return crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT.to_string();
     }
 
     match (cleaned.is_empty(), notes.is_empty()) {
         (_, true) => cleaned,
         (true, false) => notes.join("\n"),
         (false, false) => format!("{cleaned}\n\n{}", notes.join("\n")),
+    }
+}
+
+async fn rollback_owned_archives(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = tokio::fs::remove_file(path).await;
     }
 }
 
@@ -216,6 +266,21 @@ pub struct StagedDeliverable {
     /// True when a downloadable copy exists under `attachments/` (either the
     /// archive copy succeeded, or the file already lived there).
     pub archived: bool,
+    /// Only a guarded staging path owns this freshly created copy. Existing
+    /// attachments are never removed by a revocation check.
+    new_archive_path: Option<PathBuf>,
+}
+
+impl StagedDeliverable {
+    pub fn owned_archive_path(&self) -> Option<&Path> {
+        self.new_archive_path.as_deref()
+    }
+
+    pub async fn rollback_new_archive(&self) {
+        if let Some(path) = &self.new_archive_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
 }
 
 pub async fn stage_deliverable(
@@ -225,11 +290,65 @@ pub async fn stage_deliverable(
     origin: crate::artifacts::ArtifactOrigin,
     channel: Option<&str>,
 ) -> Result<StagedDeliverable, String> {
+    stage_deliverable_checked(raw, agent_dir, home_dir, origin, channel, None).await
+}
+
+/// A guarded archive uses a create-new UUID path so an invalidated delivery
+/// can remove only its own copy; a pre-existing attachment is never deleted.
+async fn save_guarded_archive(
+    agent_dir: &Path,
+    data: &[u8],
+    filename: &str,
+) -> Result<PathBuf, String> {
+    let dir = agent_dir.join("attachments");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("Failed to create attachments dir: {e}"))?;
+    let safe_name: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = dir.join(format!("{}_{}", uuid::Uuid::new_v4(), safe_name));
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&path)
+        .await
+        .map_err(|e| format!("Failed to create attachment: {e}"))?;
+    if let Err(error) = file.write_all(data).await {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(format!("Failed to write attachment: {error}"));
+    }
+    Ok(path)
+}
+
+pub async fn stage_deliverable_checked(
+    raw: &str,
+    agent_dir: &Path,
+    home_dir: &Path,
+    origin: crate::artifacts::ArtifactOrigin,
+    channel: Option<&str>,
+    check: Option<&DeliveryCheck<'_>>,
+) -> Result<StagedDeliverable, String> {
+    if !delivery_valid(check) {
+        return Err(SOURCE_CHANGED.into());
+    }
     let path = validate_deliver_path(raw, agent_dir, home_dir)?;
 
     let meta = tokio::fs::metadata(&path)
         .await
         .map_err(|e| format!("stat failed: {e}"))?;
+    if !delivery_valid(check) {
+        return Err(SOURCE_CHANGED.into());
+    }
     if meta.len() > MAX_FILE_SIZE {
         return Err(format!(
             "file too large: {} bytes (max {MAX_FILE_SIZE})",
@@ -240,6 +359,9 @@ pub async fn stage_deliverable(
     let data = tokio::fs::read(&path)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
+    if !delivery_valid(check) {
+        return Err(SOURCE_CHANGED.into());
+    }
 
     // WP-4H: zero-LLM delivery gate. Hard failures (empty / magic mismatch /
     // corrupt zip container) reject the whole delivery here — before
@@ -249,6 +371,9 @@ pub async fn stage_deliverable(
     let office_gate_cfg = crate::artifact_gate::OfficeGateConfig::from_home(home_dir);
     crate::artifact_gate::run_delivery_gate(&path, &data, agent_dir, home_dir, &office_gate_cfg)
         .await?;
+    if !delivery_valid(check) {
+        return Err(SOURCE_CHANGED.into());
+    }
 
     let filename = path
         .file_name()
@@ -266,6 +391,8 @@ pub async fn stage_deliverable(
     // be canonicalized too (macOS: /var vs /private/var).
     let attach_base = std::fs::canonicalize(agent_dir.join("attachments"))
         .unwrap_or_else(|_| agent_dir.join("attachments"));
+    let mut new_archive_path = None;
+    let mut archive_to_record = None;
     let archived = if path.starts_with(&attach_base) {
         // A file already living in `attachments/` keeps whatever provenance it
         // was first recorded with (an inbound upload the agent is handing back
@@ -276,15 +403,23 @@ pub async fn stage_deliverable(
         // I-2b: archive WITHOUT the inbound-upload provenance the shared
         // helper stamps, then record this hand-over's real origin (declared /
         // swept) plus the channel it went out on and where it was produced.
-        match media::save_attachment_in_base_untracked(agent_dir, &data, &filename).await {
+        let saved = if check.is_some() {
+            save_guarded_archive(agent_dir, &data, &filename).await
+        } else {
+            media::save_attachment_in_base_untracked(agent_dir, &data, &filename).await
+        };
+        match saved {
             Ok(saved) => {
-                crate::artifacts::record_saved(
-                    agent_dir,
-                    &saved,
-                    &filename,
-                    data.len() as u64,
-                    &crate::artifacts::SaveContext::delivered(origin, channel, &path),
-                );
+                if check.is_some() {
+                    new_archive_path = Some(saved.clone());
+                }
+                if !delivery_valid(check) {
+                    if let Some(path) = &new_archive_path {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    return Err(SOURCE_CHANGED.into());
+                }
+                archive_to_record = Some(saved);
                 true
             }
             Err(e) => {
@@ -294,11 +429,37 @@ pub async fn stage_deliverable(
         }
     };
 
+    if !delivery_valid(check) {
+        if let Some(path) = &new_archive_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        return Err(SOURCE_CHANGED.into());
+    }
+    if let Some(saved) = archive_to_record {
+        crate::artifacts::record_saved(
+            agent_dir,
+            &saved,
+            &filename,
+            data.len() as u64,
+            &crate::artifacts::SaveContext::delivered(origin, channel, &path),
+        );
+    }
+    // The provenance ledger is append-only. If this cross-thread check loses
+    // a race immediately after the row append, remove the new downloadable
+    // copy; the stale content-free ledger row cannot authorize a download.
+    if !delivery_valid(check) {
+        if let Some(path) = &new_archive_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        return Err(SOURCE_CHANGED.into());
+    }
+
     Ok(StagedDeliverable {
         data,
         filename,
         mime,
         archived,
+        new_archive_path,
     })
 }
 
@@ -308,13 +469,41 @@ async fn deliver_one(
     home_dir: &Path,
     sender: &dyn ChannelSender,
     origin: crate::artifacts::ArtifactOrigin,
-) -> Result<(), String> {
-    let staged =
-        stage_deliverable(raw, agent_dir, home_dir, origin, Some(sender.channel_type())).await?;
-    sender
+    check: Option<&DeliveryCheck<'_>>,
+) -> Result<Option<PathBuf>, String> {
+    if !delivery_valid(check) {
+        return Err(SOURCE_CHANGED.into());
+    }
+    let staged = stage_deliverable_checked(
+        raw,
+        agent_dir,
+        home_dir,
+        origin,
+        Some(sender.channel_type()),
+        check,
+    )
+    .await?;
+    send_staged_document(staged, sender, check).await
+}
+
+async fn send_staged_document(
+    staged: StagedDeliverable,
+    sender: &dyn ChannelSender,
+    check: Option<&DeliveryCheck<'_>>,
+) -> Result<Option<PathBuf>, String> {
+    if !delivery_valid(check) {
+        staged.rollback_new_archive().await;
+        return Err(SOURCE_CHANGED.into());
+    }
+    let result = sender
         .send_document(&staged.data, &staged.filename, staged.mime)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    if !delivery_valid(check) {
+        staged.rollback_new_archive().await;
+        return Err(SOURCE_CHANGED.into());
+    }
+    result.map(|_| staged.new_archive_path)
 }
 
 // ── WP1.3 hardening: undeclared-deliverable sweep ───────────────
@@ -347,8 +536,19 @@ const SWEEP_MAX_FILES: usize = 3;
 pub fn reply_mentions_document(reply: &str) -> bool {
     let lower = reply.to_lowercase();
     const KEYWORDS: &[&str] = &[
-        ".docx", ".xlsx", ".pptx", ".pdf", ".csv", "word", "excel", "powerpoint", "檔案", "文件",
-        "簡報", "報表", "試算表",
+        ".docx",
+        ".xlsx",
+        ".pptx",
+        ".pdf",
+        ".csv",
+        "word",
+        "excel",
+        "powerpoint",
+        "檔案",
+        "文件",
+        "簡報",
+        "報表",
+        "試算表",
     ];
     KEYWORDS.iter().any(|k| lower.contains(k))
 }
@@ -379,9 +579,7 @@ fn already_archived(agent_dir: &Path, filename: &str, size: u64) -> bool {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let suffix_match = name
-            .split_once('_')
-            .is_some_and(|(_, rest)| rest == safe);
+        let suffix_match = name.split_once('_').is_some_and(|(_, rest)| rest == safe);
         if suffix_match && entry.metadata().is_ok_and(|m| m.len() == size) {
             return true;
         }
@@ -432,7 +630,9 @@ fn sweep_candidates(agent_dir: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
-            let Ok(modified) = meta.modified() else { continue };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
             let recent = now
                 .duration_since(modified)
                 .map(|age| age.as_secs() <= SWEEP_WINDOW_SECS)
@@ -444,7 +644,11 @@ fn sweep_candidates(agent_dir: &Path) -> Vec<PathBuf> {
         }
     }
     found.sort_by(|a, b| b.0.cmp(&a.0));
-    found.into_iter().take(SWEEP_MAX_FILES).map(|(_, p)| p).collect()
+    found
+        .into_iter()
+        .take(SWEEP_MAX_FILES)
+        .map(|(_, p)| p)
+        .collect()
 }
 
 /// Deliver + archive recently-produced office files the agent forgot to
@@ -456,9 +660,26 @@ pub async fn sweep_undeclared_deliverables(
     home_dir: &Path,
     sender: &dyn ChannelSender,
 ) -> usize {
+    sweep_undeclared_deliverables_checked(agent_dir, home_dir, sender, None).await
+}
+
+pub async fn sweep_undeclared_deliverables_checked(
+    agent_dir: &Path,
+    home_dir: &Path,
+    sender: &dyn ChannelSender,
+    check: Option<&DeliveryCheck<'_>>,
+) -> usize {
+    if !delivery_valid(check) {
+        return 0;
+    }
     let candidates = sweep_candidates(agent_dir);
     let mut sent = 0usize;
+    let mut owned_archives: Vec<PathBuf> = Vec::new();
     for path in candidates {
+        if !delivery_valid(check) {
+            rollback_owned_archives(&owned_archives).await;
+            return 0;
+        }
         let raw = path.to_string_lossy();
         match deliver_one(
             &raw,
@@ -466,19 +687,32 @@ pub async fn sweep_undeclared_deliverables(
             home_dir,
             sender,
             crate::artifacts::ArtifactOrigin::Swept,
+            check,
         )
         .await
         {
-            Ok(()) => {
+            Ok(owned) => {
+                if let Some(owned) = owned {
+                    owned_archives.push(owned);
+                }
                 tracing::info!(path = %path.display(), "deliver sweep: sent undeclared produced file");
                 sent += 1;
             }
             Err(e) => {
                 warn!(path = %path.display(), error = %e, "deliver sweep: send failed — skipped");
+                if !delivery_valid(check) {
+                    rollback_owned_archives(&owned_archives).await;
+                    return 0;
+                }
             }
         }
     }
-    sent
+    if delivery_valid(check) {
+        sent
+    } else {
+        rollback_owned_archives(&owned_archives).await;
+        0
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -666,9 +900,90 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(archived.len(), 1, "expected one archived copy: {archived:?}");
+        assert_eq!(
+            archived.len(),
+            1,
+            "expected one archived copy: {archived:?}"
+        );
         assert!(archived[0].ends_with("summary.xlsx"), "{archived:?}");
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn guarded_stage_to_send_revocation_suppresses_document_and_owned_archive() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let home = std::env::temp_dir().join(format!("dd-guarded-doc-{}", uuid::Uuid::new_v4()));
+        let agent_dir = home.join("agents").join("a");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let source = agent_dir.join("report.xlsx");
+        std::fs::write(&source, minimal_zip_bytes()).unwrap();
+        let docs = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender {
+            docs: docs.clone(),
+            texts: Arc::new(Mutex::new(Vec::new())),
+            fail_docs: false,
+        };
+        let valid = AtomicBool::new(true);
+        let check = || valid.load(Ordering::SeqCst);
+        let staged = stage_deliverable_checked(
+            source.to_str().unwrap(),
+            &agent_dir,
+            &home,
+            crate::artifacts::ArtifactOrigin::Declared,
+            Some("recording"),
+            Some(&check),
+        )
+        .await
+        .unwrap();
+        let owned = staged
+            .new_archive_path
+            .clone()
+            .expect("new guarded archive");
+        assert!(owned.is_file());
+
+        // The guard flips after the awaited staging call but before the
+        // channel sender. No copied document may enter send_document.
+        valid.store(false, Ordering::SeqCst);
+        assert!(
+            send_staged_document(staged, &sender, Some(&check))
+                .await
+                .is_err()
+        );
+        assert!(docs.lock().unwrap().is_empty());
+        assert!(!owned.exists(), "only the new guarded copy is rolled back");
+        assert!(source.exists(), "the original is never removed");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn guarded_markerless_sweep_stops_before_document_send() {
+        let home = std::env::temp_dir().join(format!("dd-guarded-sweep-{}", uuid::Uuid::new_v4()));
+        let agent_dir = home.join("agents").join("a");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("report.xlsx"), minimal_zip_bytes()).unwrap();
+        let archive_dir = agent_dir.join("attachments");
+        let check = || {
+            std::fs::read_dir(&archive_dir)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true)
+        };
+        let docs = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender {
+            docs: docs.clone(),
+            texts: Arc::new(Mutex::new(Vec::new())),
+            fail_docs: false,
+        };
+        assert_eq!(
+            sweep_undeclared_deliverables_checked(&agent_dir, &home, &sender, Some(&check)).await,
+            0
+        );
+        assert!(docs.lock().unwrap().is_empty());
+        assert!(
+            std::fs::read_dir(&archive_dir).unwrap().next().is_none(),
+            "failed guarded sweep must remove its newly staged copy"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -843,7 +1158,9 @@ mod tests {
         // already exists — a previous turn delivered it.
         std::fs::write(agent_dir.join("report.docx"), b"same-bytes").unwrap();
         std::fs::write(
-            agent_dir.join("attachments").join("1785000000000_report.docx"),
+            agent_dir
+                .join("attachments")
+                .join("1785000000000_report.docx"),
             b"same-bytes",
         )
         .unwrap();
@@ -923,7 +1240,11 @@ mod tests {
         let home = std::env::temp_dir().join(format!("dd-gate-off-e2e-{}", uuid::Uuid::new_v4()));
         let agent_dir = home.join("agents").join("a");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(&home.join("config.toml"), "[office]\ndelivery_gate = false\n").unwrap();
+        std::fs::write(
+            &home.join("config.toml"),
+            "[office]\ndelivery_gate = false\n",
+        )
+        .unwrap();
         let file = agent_dir.join("empty.docx");
         std::fs::write(&file, b"").unwrap();
 
@@ -937,7 +1258,11 @@ mod tests {
         let reply = format!("已完成。\n📎DELIVER:{}", file.to_str().unwrap());
         let out = process_deliverables(&reply, &agent_dir, &home, &sender).await;
 
-        assert_eq!(docs.lock().unwrap().len(), 1, "gate off must let even a broken file through");
+        assert_eq!(
+            docs.lock().unwrap().len(),
+            1,
+            "gate off must let even a broken file through"
+        );
         assert_eq!(out, "已完成。");
 
         let _ = std::fs::remove_dir_all(&home);

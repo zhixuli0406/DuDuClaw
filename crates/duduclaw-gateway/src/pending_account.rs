@@ -141,7 +141,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(dir.path());
         let pending_path = dir.path().join(PENDING_ACCOUNT_FILE);
-        std::fs::write(&pending_path, r#"{"password":"correct-horse-battery-staple"}"#).unwrap();
+        std::fs::write(
+            &pending_path,
+            r#"{"password":"correct-horse-battery-staple"}"#,
+        )
+        .unwrap();
 
         land_pending_account(&db, dir.path());
 

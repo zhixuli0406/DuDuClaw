@@ -33,7 +33,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -116,7 +116,10 @@ impl InstallRequest {
 
     /// Non-empty requester department (trimmed), if any.
     fn dept(&self) -> Option<&str> {
-        self.requester_department.as_deref().map(|d| d.trim()).filter(|d| !d.is_empty())
+        self.requester_department
+            .as_deref()
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty())
     }
 
     /// Whether a manager in `manager_department` may sign this request's
@@ -226,13 +229,19 @@ impl InstallRequestStore {
         let db_path = home_dir.join("install_requests.db");
         let conn = Connection::open(&db_path).map_err(|e| format!("open install requests: {e}"))?;
         Self::init_schema(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), db_path: Some(db_path) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            db_path: Some(db_path),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| format!("open in-memory: {e}"))?;
         Self::init_schema(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), db_path: None })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            db_path: None,
+        })
     }
 
     fn init_schema(conn: &Connection) -> Result<(), String> {
@@ -288,8 +297,14 @@ impl InstallRequestStore {
         ttl_seconds: i64,
     ) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let ttl = if ttl_seconds > 0 { ttl_seconds } else { DEFAULT_INSTALL_TTL_SECONDS };
-        let dept = requester_department.map(|d| d.trim()).filter(|d| !d.is_empty());
+        let ttl = if ttl_seconds > 0 {
+            ttl_seconds
+        } else {
+            DEFAULT_INSTALL_TTL_SECONDS
+        };
+        let dept = requester_department
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty());
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO install_requests
@@ -344,7 +359,10 @@ impl InstallRequestStore {
     }
 
     /// A single requester's own requests (any status), newest first.
-    pub async fn list_for_requester(&self, requester_id: &str) -> Result<Vec<InstallRequest>, String> {
+    pub async fn list_for_requester(
+        &self,
+        requester_id: &str,
+    ) -> Result<Vec<InstallRequest>, String> {
         let _ = self.expire_stale().await;
         let conn = self.conn.lock().await;
         let mut stmt = conn
@@ -378,7 +396,10 @@ impl InstallRequestStore {
     ) -> Result<DecideOutcome, String> {
         // Opportunistic expiry so a decision can't land on a stale request.
         let _ = self.expire_stale().await;
-        let req = self.get(id).await?.ok_or_else(|| format!("install request {id} not found"))?;
+        let req = self
+            .get(id)
+            .await?
+            .ok_or_else(|| format!("install request {id} not found"))?;
         if req.status.is_terminal() {
             return Err(format!("此申請已{}，無法再次處理", zh_status(req.status)));
         }
@@ -404,7 +425,10 @@ impl InstallRequestStore {
         match decider_role {
             "admin" => {
                 // Admin covers both gates in one action.
-                let manager_by = req.manager_by.clone().or_else(|| Some(decider_id.to_string()));
+                let manager_by = req
+                    .manager_by
+                    .clone()
+                    .or_else(|| Some(decider_id.to_string()));
                 let manager_at = req.manager_at.clone().or_else(|| Some(now.clone()));
                 let n = conn
                     .execute(
@@ -449,7 +473,12 @@ impl InstallRequestStore {
     }
 
     /// Record the result of executing the install for an approved request.
-    pub async fn mark_executed(&self, id: &str, ok: bool, error: Option<&str>) -> Result<(), String> {
+    pub async fn mark_executed(
+        &self,
+        id: &str,
+        ok: bool,
+        error: Option<&str>,
+    ) -> Result<(), String> {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE install_requests SET executed=?1, execute_error=?2 WHERE id=?3",
@@ -549,8 +578,17 @@ mod tests {
     async fn make_dept(store: &InstallRequestStore, role: &str, dept: Option<&str>) -> String {
         store
             .create(
-                "skill", "test-skill", "does a thing", "u-1", "u1@x", role, dept,
-                "Low", &json!([]), &json!({"scope":"global"}), 3600,
+                "skill",
+                "test-skill",
+                "does a thing",
+                "u-1",
+                "u1@x",
+                role,
+                dept,
+                "Low",
+                &json!([]),
+                &json!({"scope":"global"}),
+                3600,
             )
             .await
             .unwrap()
@@ -561,13 +599,19 @@ mod tests {
         let s = store();
         let id = make(&s, "employee").await;
         // manager clears stage 1 → awaits admin (NOT executable yet)
-        let o = s.decide(&id, "mgr-1", "manager", None, true, "").await.unwrap();
+        let o = s
+            .decide(&id, "mgr-1", "manager", None, true, "")
+            .await
+            .unwrap();
         assert_eq!(o, DecideOutcome::AdvancedToAdmin);
         let r = s.get(&id).await.unwrap().unwrap();
         assert_eq!(r.status, RequestStatus::Pending);
         assert_eq!(r.stage(), "awaiting_admin");
         // admin clears stage 2 → ready
-        let o = s.decide(&id, "adm-1", "admin", None, true, "").await.unwrap();
+        let o = s
+            .decide(&id, "adm-1", "admin", None, true, "")
+            .await
+            .unwrap();
         assert_eq!(o, DecideOutcome::ReadyToExecute);
         let r = s.get(&id).await.unwrap().unwrap();
         assert_eq!(r.status, RequestStatus::Approved);
@@ -580,9 +624,16 @@ mod tests {
         let s = store();
         let id = make(&s, "manager").await;
         // another manager cannot approve a manager's request
-        assert!(s.decide(&id, "mgr-2", "manager", None, true, "").await.is_err());
+        assert!(
+            s.decide(&id, "mgr-2", "manager", None, true, "")
+                .await
+                .is_err()
+        );
         // admin approves → ready
-        let o = s.decide(&id, "adm-1", "admin", None, true, "").await.unwrap();
+        let o = s
+            .decide(&id, "adm-1", "admin", None, true, "")
+            .await
+            .unwrap();
         assert_eq!(o, DecideOutcome::ReadyToExecute);
     }
 
@@ -591,7 +642,10 @@ mod tests {
         let s = store();
         let id = make(&s, "employee").await;
         // admin approving an un-manager-signed employee request completes it
-        let o = s.decide(&id, "adm-1", "admin", None, true, "").await.unwrap();
+        let o = s
+            .decide(&id, "adm-1", "admin", None, true, "")
+            .await
+            .unwrap();
         assert_eq!(o, DecideOutcome::ReadyToExecute);
         let r = s.get(&id).await.unwrap().unwrap();
         assert_eq!(r.status, RequestStatus::Approved);
@@ -604,22 +658,35 @@ mod tests {
     async fn manager_double_sign_rejected() {
         let s = store();
         let id = make(&s, "employee").await;
-        s.decide(&id, "mgr-1", "manager", None, true, "").await.unwrap();
+        s.decide(&id, "mgr-1", "manager", None, true, "")
+            .await
+            .unwrap();
         // second manager sign on the already-manager-signed request is refused
-        assert!(s.decide(&id, "mgr-2", "manager", None, true, "").await.is_err());
+        assert!(
+            s.decide(&id, "mgr-2", "manager", None, true, "")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn deny_is_terminal() {
         let s = store();
         let id = make(&s, "employee").await;
-        let o = s.decide(&id, "mgr-1", "manager", None, false, "not needed").await.unwrap();
+        let o = s
+            .decide(&id, "mgr-1", "manager", None, false, "not needed")
+            .await
+            .unwrap();
         assert_eq!(o, DecideOutcome::Denied);
         let r = s.get(&id).await.unwrap().unwrap();
         assert_eq!(r.status, RequestStatus::Denied);
         assert_eq!(r.decided_reason.as_deref(), Some("not needed"));
         // no further decisions accepted
-        assert!(s.decide(&id, "adm-1", "admin", None, true, "").await.is_err());
+        assert!(
+            s.decide(&id, "adm-1", "admin", None, true, "")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -638,7 +705,11 @@ mod tests {
         assert_eq!(n, 1);
         let r = s.get("old").await.unwrap().unwrap();
         assert_eq!(r.status, RequestStatus::Expired);
-        assert!(s.decide("old", "adm-1", "admin", None, true, "").await.is_err());
+        assert!(
+            s.decide("old", "adm-1", "admin", None, true, "")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -648,7 +719,9 @@ mod tests {
         let _id2 = make(&s, "manager").await;
         assert_eq!(s.list_pending().await.unwrap().len(), 2);
         assert_eq!(s.list_for_requester("u-1").await.unwrap().len(), 2);
-        s.decide(&id1, "adm-1", "admin", None, true, "").await.unwrap();
+        s.decide(&id1, "adm-1", "admin", None, true, "")
+            .await
+            .unwrap();
         assert_eq!(s.list_pending().await.unwrap().len(), 1);
     }
 
@@ -658,11 +731,22 @@ mod tests {
         // employee in "sales" — only a sales manager may clear the manager gate
         let id = make_dept(&s, "employee", Some("sales")).await;
         // wrong-department manager is refused
-        assert!(s.decide(&id, "m-eng", "manager", Some("eng"), true, "").await.is_err());
+        assert!(
+            s.decide(&id, "m-eng", "manager", Some("eng"), true, "")
+                .await
+                .is_err()
+        );
         // manager with no department is refused (not anyone's dept manager)
-        assert!(s.decide(&id, "m-none", "manager", None, true, "").await.is_err());
+        assert!(
+            s.decide(&id, "m-none", "manager", None, true, "")
+                .await
+                .is_err()
+        );
         // same-department manager (case-insensitive) succeeds
-        let o = s.decide(&id, "m-sales", "manager", Some("Sales"), true, "").await.unwrap();
+        let o = s
+            .decide(&id, "m-sales", "manager", Some("Sales"), true, "")
+            .await
+            .unwrap();
         assert_eq!(o, DecideOutcome::AdvancedToAdmin);
     }
 
@@ -671,7 +755,10 @@ mod tests {
         let s = store();
         let id = make_dept(&s, "employee", None).await;
         // request without a department can be signed by any manager
-        let o = s.decide(&id, "m-any", "manager", Some("whatever"), true, "").await.unwrap();
+        let o = s
+            .decide(&id, "m-any", "manager", Some("whatever"), true, "")
+            .await
+            .unwrap();
         assert_eq!(o, DecideOutcome::AdvancedToAdmin);
     }
 

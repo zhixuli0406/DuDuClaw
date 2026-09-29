@@ -23,20 +23,13 @@ pub enum EvolutionAction {
     None,
 
     /// Store an observation as episodic memory (no LLM). System 1.5.
-    StoreEpisodic {
-        content: String,
-        importance: f64,
-    },
+    StoreEpisodic { content: String, importance: f64 },
 
     /// Trigger a deep LLM reflection (Meso-level). System 2.
-    TriggerReflection {
-        context: String,
-    },
+    TriggerReflection { context: String },
 
     /// Trigger emergency evolution — immediate GVU loop. System 2+.
-    TriggerEmergencyEvolution {
-        context: String,
-    },
+    TriggerEmergencyEvolution { context: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +161,10 @@ impl ExplorationState {
     /// Uses a simple hash-based approach for reproducibility.
     /// NOTE: call `record_route()` first to ensure epsilon decay is correct.
     pub fn should_explore(&mut self) -> bool {
-        self.rng_counter = self.rng_counter.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.rng_counter = self
+            .rng_counter
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let random_val = (self.rng_counter >> 33) as f64 / (u32::MAX as f64);
         random_val < self.epsilon()
     }
@@ -201,7 +197,9 @@ pub const EXPLORATION_MARKER: &str = "## Epistemic Foraging";
 /// security convention #2) so a user message quoting the phrase cannot make
 /// an ordinary error round look like exploration.
 pub fn context_is_exploration(context: &str) -> bool {
-    context.lines().any(|l| l.trim_start().starts_with(EXPLORATION_MARKER))
+    context
+        .lines()
+        .any(|l| l.trim_start().starts_with(EXPLORATION_MARKER))
 }
 
 /// Check if the current context warrants skill extraction alongside evolution.
@@ -270,7 +268,10 @@ pub fn route(
             let content = format_moderate_telemetry(error);
             // Importance scales with composite error (range 4.0 - 10.0; ~5.2-7.0 for default Moderate thresholds)
             let importance = 4.0 + error.composite_error * 6.0;
-            EvolutionAction::StoreEpisodic { content, importance }
+            EvolutionAction::StoreEpisodic {
+                content,
+                importance,
+            }
         }
 
         ErrorCategory::Significant => {
@@ -311,12 +312,27 @@ fn format_moderate_telemetry(error: &PredictionError) -> String {
         error.prediction.expected_satisfaction - error.delta_satisfaction,
         error.delta_satisfaction,
         error.topic_surprise,
-        if error.unexpected_correction { "yes" } else { "no" },
-        if error.unexpected_follow_up { "yes" } else { "no" },
+        if error.unexpected_correction {
+            "yes"
+        } else {
+            "no"
+        },
+        if error.unexpected_follow_up {
+            "yes"
+        } else {
+            "no"
+        },
     );
 
     if !error.actual.extracted_topics.is_empty() {
-        let topics = error.actual.extracted_topics.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+        let topics = error
+            .actual
+            .extracted_topics
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
         content.push_str(&format!(" Topics: {topics}."));
     }
 

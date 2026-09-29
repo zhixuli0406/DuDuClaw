@@ -31,11 +31,7 @@ mod rl_tests {
         turns.push(RLTurn {
             role: TurnRole::AgentAction,
             content: "agent response".to_string(),
-            tool_calls: if tool_calls > 0 {
-                Some(tools)
-            } else {
-                None
-            },
+            tool_calls: if tool_calls > 0 { Some(tools) } else { None },
             token_count: agent_tokens,
             is_agent_generated: true,
         });
@@ -105,8 +101,13 @@ mod rl_tests {
             ("system".to_string(), "system msg".to_string()),
         ];
 
-        let traj =
-            TrajectoryExporter::build_trajectory("sess_12345678", "agent1", "model1", &messages, 1.0);
+        let traj = TrajectoryExporter::build_trajectory(
+            "sess_12345678",
+            "agent1",
+            "model1",
+            &messages,
+            1.0,
+        );
 
         assert_eq!(traj.turns[0].role, TurnRole::UserMessage);
         assert_eq!(traj.turns[1].role, TurnRole::AgentAction);
@@ -122,8 +123,13 @@ mod rl_tests {
             ("tool".to_string(), "result".to_string()),
         ];
 
-        let traj =
-            TrajectoryExporter::build_trajectory("sess_12345678", "agent1", "model1", &messages, 0.5);
+        let traj = TrajectoryExporter::build_trajectory(
+            "sess_12345678",
+            "agent1",
+            "model1",
+            &messages,
+            0.5,
+        );
 
         assert!(!traj.turns[0].is_agent_generated); // user
         assert!(traj.turns[1].is_agent_generated); // assistant
@@ -139,8 +145,13 @@ mod rl_tests {
             ("assistant".to_string(), "let me look".to_string()),
             ("tool".to_string(), "{\"results\": [1,2,3]}".to_string()),
         ];
-        let traj =
-            TrajectoryExporter::build_trajectory("sess_12345678", "agent1", "model1", &messages, 1.0);
+        let traj = TrajectoryExporter::build_trajectory(
+            "sess_12345678",
+            "agent1",
+            "model1",
+            &messages,
+            1.0,
+        );
 
         assert_eq!(
             traj.total_tool_calls(),
@@ -160,10 +171,18 @@ mod rl_tests {
             ("assistant".to_string(), content.to_string()),
             ("tool".to_string(), "matched 2 files".to_string()),
         ];
-        let traj =
-            TrajectoryExporter::build_trajectory("sess_abcdef00", "agent1", "model1", &messages, 1.0);
+        let traj = TrajectoryExporter::build_trajectory(
+            "sess_abcdef00",
+            "agent1",
+            "model1",
+            &messages,
+            1.0,
+        );
 
-        let calls = traj.turns[0].tool_calls.as_ref().expect("tool_calls present");
+        let calls = traj.turns[0]
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls present");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "grep");
     }
@@ -176,10 +195,19 @@ mod rl_tests {
             ("assistant".to_string(), "run it".to_string()),
             ("tool".to_string(), "Error: command failed".to_string()),
         ];
-        let traj =
-            TrajectoryExporter::build_trajectory("sess_12345678", "agent1", "model1", &messages, 1.0);
+        let traj = TrajectoryExporter::build_trajectory(
+            "sess_12345678",
+            "agent1",
+            "model1",
+            &messages,
+            1.0,
+        );
         assert_eq!(traj.total_tool_calls(), 1);
-        assert_eq!(traj.successful_tool_calls(), 0, "error result → not successful");
+        assert_eq!(
+            traj.successful_tool_calls(),
+            0,
+            "error result → not successful"
+        );
     }
 
     /// D3: a plain agent turn with no following tool result has no tool calls
@@ -190,8 +218,13 @@ mod rl_tests {
             ("user".to_string(), "hi".to_string()),
             ("assistant".to_string(), "hello!".to_string()),
         ];
-        let traj =
-            TrajectoryExporter::build_trajectory("sess_12345678", "agent1", "model1", &messages, 1.0);
+        let traj = TrajectoryExporter::build_trajectory(
+            "sess_12345678",
+            "agent1",
+            "model1",
+            &messages,
+            1.0,
+        );
         assert!(traj.turns[1].tool_calls.is_none());
         assert_eq!(traj.total_tool_calls(), 0);
     }
@@ -207,8 +240,7 @@ mod rl_tests {
 
         // Multi-byte ID where byte 8 lands inside a CJK char (would panic with a
         // raw byte slice). "會話" is 3 bytes per char.
-        let t2 =
-            TrajectoryExporter::build_trajectory("會話會話會話", "a", "m", &messages, 1.0);
+        let t2 = TrajectoryExporter::build_trajectory("會話會話會話", "a", "m", &messages, 1.0);
         // 8 chars requested, only 6 available → no panic, prefix is the 6 chars.
         assert!(t2.trajectory_id.starts_with("traj_"));
     }

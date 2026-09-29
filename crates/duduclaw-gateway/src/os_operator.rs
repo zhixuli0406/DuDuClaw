@@ -74,7 +74,7 @@
 //! `channel_reply.rs`'s `spawn_claude_cli_with_env` for where that capture
 //! happens, gated on the same `system_operator` capability).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::os_intent::{OsIntentCategory, OsIntentResult, OsTool};
 use crate::runtime::NativeToolEvent;
@@ -123,7 +123,10 @@ pub fn decide(result: &OsIntentResult) -> OperatorAction {
             if result.needs_confirm || result.needs_approval {
                 return OperatorAction::ShortCircuit(render_pending(tool, result));
             }
-            OperatorAction::Guide { tool, hint: render_guide_hint(tool, result) }
+            OperatorAction::Guide {
+                tool,
+                hint: render_guide_hint(tool, result),
+            }
         }
     }
 }
@@ -292,8 +295,12 @@ pub fn marker_to_artifact(marker: &Value) -> Option<Value> {
 /// path above (never auto-executed) or have no O-3 result-card shape at all;
 /// a tool outside this list is never turned into an artifact by this path,
 /// full stop.
-const READONLY_RESULT_TOOLS: &[&str] =
-    &["os_device_status", "os_check_update", "os_backup_list", "os_network_info"];
+const READONLY_RESULT_TOOLS: &[&str] = &[
+    "os_device_status",
+    "os_check_update",
+    "os_backup_list",
+    "os_network_info",
+];
 
 /// Match a Claude-CLI-reported tool name against [`READONLY_RESULT_TOOLS`].
 /// An MCP-served tool is reported qualified (`mcp__duduclaw__os_device_status`);
@@ -316,8 +323,14 @@ fn readonly_result_tool_name(reported_name: &str) -> Option<&'static str> {
 /// a card, so it must never be treated as "valid" on its own.
 fn system_half_is_valid(system: &Value) -> bool {
     system.get("available").and_then(Value::as_bool).is_some()
-        && system.get("current_version").and_then(Value::as_str).is_some()
-        && system.get("latest_version").and_then(Value::as_str).is_some()
+        && system
+            .get("current_version")
+            .and_then(Value::as_str)
+            .is_some()
+        && system
+            .get("latest_version")
+            .and_then(Value::as_str)
+            .is_some()
 }
 
 /// Map one read-only `os_*` tool's own structured result JSON (parsed from
@@ -402,7 +415,9 @@ fn readonly_result_to_artifact(bare_tool: &str, result_json: &Value) -> Option<V
             }
 
             let mut payload = json!({ "action": "check" });
-            let obj = payload.as_object_mut().expect("json!({..}) is always an object");
+            let obj = payload
+                .as_object_mut()
+                .expect("json!({..}) is always an object");
             if let Some(result) = device_result {
                 obj.insert("result".to_string(), result);
             }
@@ -602,7 +617,10 @@ mod tests {
     }
 
     fn goal_task() -> OsIntentResult {
-        OsIntentResult { category: OsIntentCategory::GoalTask, ..chat() }
+        OsIntentResult {
+            category: OsIntentCategory::GoalTask,
+            ..chat()
+        }
     }
 
     fn rejected(reason: &str) -> OsIntentResult {
@@ -755,7 +773,10 @@ mod tests {
         match decide(&system_op_ready_non_destructive()) {
             OperatorAction::Guide { tool, hint } => {
                 assert_eq!(tool, OsTool::DeviceStatus);
-                assert!(hint.contains("os_device_status"), "hint must name the tool: {hint}");
+                assert!(
+                    hint.contains("os_device_status"),
+                    "hint must name the tool: {hint}"
+                );
             }
             other => panic!("expected Guide, got {other:?}"),
         }
@@ -785,7 +806,10 @@ mod tests {
     fn strip_pending_tag_is_fail_open_on_unterminated_tag() {
         let text = format!("reply {PENDING_TAG_OPEN}not closed");
         let (stripped, marker) = strip_system_operator_pending_tag(&text);
-        assert_eq!(stripped, text, "unterminated tag must leave the reply untouched");
+        assert_eq!(
+            stripped, text,
+            "unterminated tag must leave the reply untouched"
+        );
         assert!(marker.is_none());
     }
 
@@ -905,9 +929,15 @@ mod tests {
     fn pipeline_os_power_produces_stripped_text_and_confirm_action_artifact() {
         let reply = render_pending(OsTool::Power, &system_op_ready_confirm());
         let (stripped, marker) = strip_system_operator_pending_tag(&reply);
-        assert!(!stripped.contains(PENDING_TAG_OPEN), "tag must never reach any channel");
+        assert!(
+            !stripped.contains(PENDING_TAG_OPEN),
+            "tag must never reach any channel"
+        );
         assert!(!stripped.contains(PENDING_TAG_CLOSE));
-        let artifact = marker.as_ref().and_then(marker_to_artifact).expect("artifact expected");
+        let artifact = marker
+            .as_ref()
+            .and_then(marker_to_artifact)
+            .expect("artifact expected");
         assert_eq!(artifact["type"], "confirm_action");
         assert_eq!(artifact["payload"]["action"], "restart");
     }
@@ -916,8 +946,14 @@ mod tests {
     fn pipeline_os_factory_reset_produces_stripped_text_and_confirm_action_artifact() {
         let reply = render_pending(OsTool::FactoryReset, &system_op_ready_approval());
         let (stripped, marker) = strip_system_operator_pending_tag(&reply);
-        assert!(!stripped.contains(PENDING_TAG_OPEN), "tag must never reach any channel");
-        let artifact = marker.as_ref().and_then(marker_to_artifact).expect("artifact expected");
+        assert!(
+            !stripped.contains(PENDING_TAG_OPEN),
+            "tag must never reach any channel"
+        );
+        let artifact = marker
+            .as_ref()
+            .and_then(marker_to_artifact)
+            .expect("artifact expected");
         assert_eq!(artifact["type"], "confirm_action");
         assert_eq!(artifact["payload"]["action"], "factory_reset");
     }
@@ -929,9 +965,15 @@ mod tests {
         result.params = json!({ "target": "device" });
         let reply = render_pending(OsTool::ApplyUpdate, &result);
         let (stripped, marker) = strip_system_operator_pending_tag(&reply);
-        assert!(!stripped.contains(PENDING_TAG_OPEN), "tag must never reach any channel");
+        assert!(
+            !stripped.contains(PENDING_TAG_OPEN),
+            "tag must never reach any channel"
+        );
         assert!(!stripped.contains(PENDING_TAG_CLOSE));
-        let artifact = marker.as_ref().and_then(marker_to_artifact).expect("artifact expected");
+        let artifact = marker
+            .as_ref()
+            .and_then(marker_to_artifact)
+            .expect("artifact expected");
         assert_eq!(artifact["type"], "update_confirm");
         assert_eq!(artifact["payload"]["target"], "device");
     }
@@ -964,7 +1006,10 @@ mod tests {
             readonly_result_tool_name("mcp__duduclaw__os_device_status"),
             Some("os_device_status")
         );
-        assert_eq!(readonly_result_tool_name("os_device_status"), Some("os_device_status"));
+        assert_eq!(
+            readonly_result_tool_name("os_device_status"),
+            Some("os_device_status")
+        );
     }
 
     #[test]
@@ -984,7 +1029,8 @@ mod tests {
 
     #[test]
     fn device_status_maps_result_through_unchanged() {
-        let result = json!({ "cpu_cores": 8, "ram": { "total_mb": 16000 }, "network_interfaces": [] });
+        let result =
+            json!({ "cpu_cores": 8, "ram": { "total_mb": 16000 }, "network_interfaces": [] });
         let artifact = readonly_result_to_artifact("os_device_status", &result).unwrap();
         assert_eq!(artifact["type"], "device_status");
         assert_eq!(artifact["payload"], result);
@@ -992,7 +1038,8 @@ mod tests {
 
     #[test]
     fn network_info_maps_result_through_unchanged() {
-        let result = json!({ "interfaces": [{ "name": "eth0", "is_up": true, "addresses": ["10.0.0.2"] }] });
+        let result =
+            json!({ "interfaces": [{ "name": "eth0", "is_up": true, "addresses": ["10.0.0.2"] }] });
         let artifact = readonly_result_to_artifact("os_network_info", &result).unwrap();
         assert_eq!(artifact["type"], "network_info");
         assert_eq!(artifact["payload"], result);
@@ -1292,7 +1339,12 @@ mod tests {
 
     #[test]
     fn wifi_password_request_never_fires_on_other_error_codes() {
-        for code in ["out_of_range", "not_found", "backend_unavailable", "no_adapter"] {
+        for code in [
+            "out_of_range",
+            "not_found",
+            "backend_unavailable",
+            "no_adapter",
+        ] {
             let events = vec![native_ev_with_input(
                 "mcp__duduclaw__os_wifi_connect",
                 false,

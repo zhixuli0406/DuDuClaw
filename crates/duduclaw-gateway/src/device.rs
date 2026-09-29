@@ -116,7 +116,11 @@ fn parse_loadavg(text: &str) -> Option<LoadAverage> {
     let load1 = parts.next()?.parse::<f64>().ok()?;
     let load5 = parts.next()?.parse::<f64>().ok()?;
     let load15 = parts.next()?.parse::<f64>().ok()?;
-    Some(LoadAverage { load1, load5, load15 })
+    Some(LoadAverage {
+        load1,
+        load5,
+        load15,
+    })
 }
 
 fn read_load_average() -> Option<LoadAverage> {
@@ -165,7 +169,12 @@ fn read_temperature_c() -> Option<f64> {
 /// `used_mb` is total-minus-free (not total-minus-available — matches `df`
 /// without the `-P`/reserved-block distinction, a reasonable simplification
 /// for a dashboard glance).
-fn disk_usage_from_blocks(block_size: u64, blocks: u64, blocks_free: u64, blocks_available: u64) -> DiskUsage {
+fn disk_usage_from_blocks(
+    block_size: u64,
+    blocks: u64,
+    blocks_free: u64,
+    blocks_available: u64,
+) -> DiskUsage {
     const MB: u64 = 1024 * 1024;
     let total_mb = blocks.saturating_mul(block_size) / MB;
     let free_mb = blocks_free.saturating_mul(block_size) / MB;
@@ -245,7 +254,11 @@ fn read_network_interfaces() -> Vec<NetworkInterface> {
                     .map(|v4| v4.ip().to_string())
                     .or_else(|| addr.as_sockaddr_in6().map(|v6| v6.ip().to_string()))
             });
-            RawIfaceAddr { name: a.interface_name, is_up, ip }
+            RawIfaceAddr {
+                name: a.interface_name,
+                is_up,
+                ip,
+            }
         })
         .collect();
     group_interfaces(raw)
@@ -265,7 +278,9 @@ fn read_network_interfaces() -> Vec<NetworkInterface> {
 /// subdirectory), so this doesn't need to separately resolve `/data`.
 pub fn collect_status(home_dir: &Path) -> DeviceStatus {
     DeviceStatus {
-        cpu_cores: std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1),
+        cpu_cores: std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1),
         load_average: read_load_average(),
         ram: read_mem_info(),
         disk: read_disk_usage(home_dir),
@@ -332,7 +347,14 @@ mod tests {
     #[test]
     fn loadavg_parses_first_three_fields() {
         let la = parse_loadavg("0.10 0.25 0.30 1/234 5678\n").unwrap();
-        assert_eq!(la, LoadAverage { load1: 0.10, load5: 0.25, load15: 0.30 });
+        assert_eq!(
+            la,
+            LoadAverage {
+                load1: 0.10,
+                load5: 0.25,
+                load15: 0.30
+            }
+        );
     }
 
     #[test]
@@ -381,7 +403,10 @@ mod tests {
         // cross-Unix (not Linux-only), so this genuinely exercises the
         // syscall path on the macOS dev/CI host too, not just Linux.
         let usage = read_disk_usage(Path::new("/"));
-        assert!(usage.is_some(), "statvfs(\"/\") should succeed on any Unix host");
+        assert!(
+            usage.is_some(),
+            "statvfs(\"/\") should succeed on any Unix host"
+        );
     }
 
     // ── network interfaces (pure grouping) ──────────────────────────
@@ -389,10 +414,26 @@ mod tests {
     #[test]
     fn group_interfaces_dedups_and_collects_addresses() {
         let raw = vec![
-            RawIfaceAddr { name: "eth0".into(), is_up: true, ip: Some("192.168.1.5".into()) },
-            RawIfaceAddr { name: "eth0".into(), is_up: true, ip: Some("fe80::1".into()) },
-            RawIfaceAddr { name: "eth0".into(), is_up: true, ip: Some("192.168.1.5".into()) }, // dup
-            RawIfaceAddr { name: "lo".into(), is_up: true, ip: Some("127.0.0.1".into()) },
+            RawIfaceAddr {
+                name: "eth0".into(),
+                is_up: true,
+                ip: Some("192.168.1.5".into()),
+            },
+            RawIfaceAddr {
+                name: "eth0".into(),
+                is_up: true,
+                ip: Some("fe80::1".into()),
+            },
+            RawIfaceAddr {
+                name: "eth0".into(),
+                is_up: true,
+                ip: Some("192.168.1.5".into()),
+            }, // dup
+            RawIfaceAddr {
+                name: "lo".into(),
+                is_up: true,
+                ip: Some("127.0.0.1".into()),
+            },
         ];
         let grouped = group_interfaces(raw);
         assert_eq!(grouped.len(), 2);
@@ -405,7 +446,11 @@ mod tests {
     fn group_interfaces_keeps_interface_with_no_ip() {
         // e.g. a link-layer-only row (AF_PACKET) — interface still shows up,
         // just with an empty address list, rather than being dropped.
-        let raw = vec![RawIfaceAddr { name: "eth1".into(), is_up: false, ip: None }];
+        let raw = vec![RawIfaceAddr {
+            name: "eth1".into(),
+            is_up: false,
+            ip: None,
+        }];
         let grouped = group_interfaces(raw);
         assert_eq!(grouped.len(), 1);
         assert!(grouped[0].addresses.is_empty());
@@ -425,10 +470,16 @@ mod tests {
 
     #[test]
     fn network_write_request_detects_any_write_key() {
-        assert!(is_network_write_request(&serde_json::json!({"static_ip": "10.0.0.5"})));
-        assert!(is_network_write_request(&serde_json::json!({"gateway": null})));
+        assert!(is_network_write_request(
+            &serde_json::json!({"static_ip": "10.0.0.5"})
+        ));
+        assert!(is_network_write_request(
+            &serde_json::json!({"gateway": null})
+        ));
         assert!(!is_network_write_request(&serde_json::json!({})));
-        assert!(!is_network_write_request(&serde_json::json!({"unrelated": 1})));
+        assert!(!is_network_write_request(
+            &serde_json::json!({"unrelated": 1})
+        ));
     }
 
     // ── collect_status orchestration smoke test ─────────────────────

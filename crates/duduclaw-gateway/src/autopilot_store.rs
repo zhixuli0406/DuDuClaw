@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::info;
@@ -183,7 +183,11 @@ impl AutopilotStore {
         Ok(())
     }
 
-    pub async fn update_rule(&self, id: &str, fields: &serde_json::Value) -> Result<Option<AutopilotRuleRow>, String> {
+    pub async fn update_rule(
+        &self,
+        id: &str,
+        fields: &serde_json::Value,
+    ) -> Result<Option<AutopilotRuleRow>, String> {
         let has_changes = {
             let conn = self.conn.lock().await;
             let mut sets: Vec<String> = Vec::new();
@@ -245,8 +249,10 @@ impl AutopilotStore {
                     sets.join(", "),
                     binds.len()
                 );
-                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                    binds.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+                let params_ref: Vec<&dyn rusqlite::types::ToSql> = binds
+                    .iter()
+                    .map(|s| s as &dyn rusqlite::types::ToSql)
+                    .collect();
                 conn.execute(&sql, params_ref.as_slice())
                     .map_err(|e| format!("update rule: {e}"))?;
                 true
@@ -261,13 +267,20 @@ impl AutopilotStore {
             .execute("DELETE FROM autopilot_rules WHERE id = ?1", params![id])
             .map_err(|e| format!("remove rule: {e}"))?;
         // Also clean up history
-        let _ = conn.execute("DELETE FROM autopilot_history WHERE rule_id = ?1", params![id]);
+        let _ = conn.execute(
+            "DELETE FROM autopilot_history WHERE rule_id = ?1",
+            params![id],
+        );
         Ok(count > 0)
     }
 
     // ── History ─────────────────────────────────────────────
 
-    pub async fn list_history(&self, rule_id: Option<&str>, limit: i64) -> Result<Vec<AutopilotHistoryRow>, String> {
+    pub async fn list_history(
+        &self,
+        rule_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<AutopilotHistoryRow>, String> {
         let conn = self.conn.lock().await;
         let (sql, bind_val): (String, Option<String>) = match rule_id {
             Some(rid) => (
@@ -288,7 +301,9 @@ impl AutopilotStore {
             ),
         };
 
-        let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare history: {e}"))?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("prepare history: {e}"))?;
         let rows = if let Some(ref rid) = bind_val {
             stmt.query_map(params![rid], row_to_history)
         } else {
@@ -305,7 +320,14 @@ impl AutopilotStore {
         conn.execute(
             "INSERT INTO autopilot_history (id, rule_id, rule_name, triggered_at, result, details)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![row.id, row.rule_id, row.rule_name, row.triggered_at, row.result, row.details],
+            params![
+                row.id,
+                row.rule_id,
+                row.rule_name,
+                row.triggered_at,
+                row.result,
+                row.details
+            ],
         )
         .map_err(|e| format!("append history: {e}"))?;
 

@@ -40,7 +40,7 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::warn;
 
 use duduclaw_core::types::MemoryEntry;
@@ -67,8 +67,11 @@ pub const SOURCE_STALENESS_KEY: &str = "source_staleness";
 /// and task-layer rules alike. `LEGACY_RULE_SOURCE_EVENT` == [`RULE_SOURCE_EVENT`]
 /// (both `"reflexion_consolidation"`), so only these three distinct strings
 /// are needed.
-const RULE_SOURCE_EVENTS: [&str; 3] =
-    [RULE_SOURCE_EVENT, PLAYBOOK_SOURCE_EVENT, TASK_RULE_SOURCE_EVENT];
+const RULE_SOURCE_EVENTS: [&str; 3] = [
+    RULE_SOURCE_EVENT,
+    PLAYBOOK_SOURCE_EVENT,
+    TASK_RULE_SOURCE_EVENT,
+];
 
 /// Persisted detail of why a rule is source-stale.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,7 +142,11 @@ pub fn source_facts_from_metadata(metadata: &Value) -> Vec<String> {
     metadata
         .get(SOURCE_FACTS_KEY)
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -188,7 +195,10 @@ async fn mark_if_stale(
     };
     let mut new_metadata = metadata.clone();
     detail.merge_into(&mut new_metadata);
-    if let Err(e) = engine.update_metadata(agent_id, &entry.id, &new_metadata).await {
+    if let Err(e) = engine
+        .update_metadata(agent_id, &entry.id, &new_metadata)
+        .await
+    {
         warn!(agent = %agent_id, rule = %entry.id, "rule staleness: write metadata failed: {e}");
         return None;
     }
@@ -232,7 +242,10 @@ pub async fn refresh_rule_source_staleness(
             if entry.tags.iter().any(|t| t == RETIRED_RULE_TAG) {
                 continue;
             }
-            if mark_if_stale(engine, agent_id, &entry, &metadata).await.is_some() {
+            if mark_if_stale(engine, agent_id, &entry, &metadata)
+                .await
+                .is_some()
+            {
                 stale.push(entry.id);
             }
         }
@@ -321,7 +334,10 @@ mod tests {
             last_accessed: None,
             source_event: "test_fact".to_string(),
         };
-        engine.store_temporal(agent, entry, fact_meta(subject, predicate, object)).await.unwrap()
+        engine
+            .store_temporal(agent, entry, fact_meta(subject, predicate, object))
+            .await
+            .unwrap()
     }
 
     /// Store a consolidated rule with an optional recorded `source_facts` list.
@@ -348,7 +364,10 @@ mod tests {
         };
         // NOTE: no (subject, predicate) triple — a consolidated rule must not
         // itself enter the F1 supersession chain via this test path.
-        let meta = TemporalMeta { metadata: Some(metadata), ..Default::default() };
+        let meta = TemporalMeta {
+            metadata: Some(metadata),
+            ..Default::default()
+        };
         engine.store_temporal(agent, entry, meta).await.unwrap()
     }
 
@@ -356,11 +375,17 @@ mod tests {
     fn record_source_facts_empty_is_noop_and_dedups() {
         let mut m = json!({ "rule_stats": { "helpful": 1 } });
         record_source_facts(&mut m, &[]);
-        assert!(m.get(SOURCE_FACTS_KEY).is_none(), "empty input must not write the key (fail-open)");
+        assert!(
+            m.get(SOURCE_FACTS_KEY).is_none(),
+            "empty input must not write the key (fail-open)"
+        );
         assert!(source_facts_from_metadata(&m).is_empty());
 
         record_source_facts(&mut m, &["a".into(), "a".into(), " ".into(), "b".into()]);
-        assert_eq!(source_facts_from_metadata(&m), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            source_facts_from_metadata(&m),
+            vec!["a".to_string(), "b".to_string()]
+        );
         // Sibling key preserved.
         assert_eq!(m["rule_stats"]["helpful"], 1);
     }
@@ -372,17 +397,31 @@ mod tests {
 
         // Source fact the rule depends on.
         let fact = store_fact(&engine, agent, "price is 100", "product:price", "is", "100").await;
-        let rule = store_rule(&engine, agent, "when asked price, answer 100", &[fact.clone()]).await;
+        let rule = store_rule(
+            &engine,
+            agent,
+            "when asked price, answer 100",
+            &[fact.clone()],
+        )
+        .await;
 
         // Not stale yet — source is still valid.
-        assert!(refresh_rule_source_staleness(&engine, agent).await.is_empty());
+        assert!(
+            refresh_rule_source_staleness(&engine, agent)
+                .await
+                .is_empty()
+        );
         assert!(list_source_stale_rules(&engine, agent).await.is_empty());
 
         // Supersede the source fact.
         store_fact(&engine, agent, "price is 120", "product:price", "is", "120").await;
 
         let stale = refresh_rule_source_staleness(&engine, agent).await;
-        assert_eq!(stale, vec![rule.clone()], "rule whose source was superseded is flagged");
+        assert_eq!(
+            stale,
+            vec![rule.clone()],
+            "rule whose source was superseded is flagged"
+        );
 
         // Tag + detail persisted; query returns it.
         let entry = engine.get_by_id(agent, &rule).await.unwrap().unwrap();
@@ -404,10 +443,16 @@ mod tests {
         // A totally unrelated fact gets superseded in the same agent.
         let f = store_fact(&engine, agent, "v1", "k", "is", "1").await;
         store_fact(&engine, agent, "v2", "k", "is", "2").await;
-        assert_eq!(engine.superseded_fact_ids(agent, &[f]).await.unwrap().len(), 1);
+        assert_eq!(
+            engine.superseded_fact_ids(agent, &[f]).await.unwrap().len(),
+            1
+        );
 
         let stale = refresh_rule_source_staleness(&engine, agent).await;
-        assert!(stale.is_empty(), "a rule with no recorded source facts must never be flagged stale");
+        assert!(
+            stale.is_empty(),
+            "a rule with no recorded source facts must never be flagged stale"
+        );
         let entry = engine.get_by_id(agent, &rule).await.unwrap().unwrap();
         assert!(!is_source_stale(&entry.tags));
     }
@@ -436,7 +481,14 @@ mod tests {
         refresh_rule_source_staleness(&engine, agent).await;
         refresh_rule_source_staleness(&engine, agent).await; // second pass
         let entry = engine.get_by_id(agent, &rule).await.unwrap().unwrap();
-        let count = entry.tags.iter().filter(|t| *t == SOURCE_STALE_RULE_TAG).count();
-        assert_eq!(count, 1, "the stale tag must not be duplicated across passes");
+        let count = entry
+            .tags
+            .iter()
+            .filter(|t| *t == SOURCE_STALE_RULE_TAG)
+            .count();
+        assert_eq!(
+            count, 1,
+            "the stale tag must not be duplicated across passes"
+        );
     }
 }

@@ -321,7 +321,10 @@ mod tests {
     #[test]
     fn human_prompt_string_content_classified() {
         let v = json!({"type": "user", "message": {"content": "幫我修這個 bug"}});
-        assert_eq!(classify_line(&v), LineKind::Human("幫我修這個 bug".to_string()));
+        assert_eq!(
+            classify_line(&v),
+            LineKind::Human("幫我修這個 bug".to_string())
+        );
     }
 
     #[test]
@@ -333,7 +336,10 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "x", "content": "raw tool output noise"}
             ]}
         });
-        assert_eq!(classify_line(&v), LineKind::Human("看看這個結果".to_string()));
+        assert_eq!(
+            classify_line(&v),
+            LineKind::Human("看看這個結果".to_string())
+        );
     }
 
     #[test]
@@ -360,7 +366,8 @@ mod tests {
     fn user_meta_and_compact_summary_are_noise() {
         let meta = json!({"type": "user", "isMeta": true, "message": {"content": "meta text"}});
         assert_eq!(classify_line(&meta), LineKind::Noise);
-        let compact = json!({"type": "user", "isCompactSummary": true, "message": {"content": "compact"}});
+        let compact =
+            json!({"type": "user", "isCompactSummary": true, "message": {"content": "compact"}});
         assert_eq!(classify_line(&compact), LineKind::Noise);
     }
 
@@ -374,7 +381,10 @@ mod tests {
                 {"type": "text", "text": "已經修好了。"}
             ]}
         });
-        assert_eq!(classify_line(&v), LineKind::Assistant("已經修好了。".to_string()));
+        assert_eq!(
+            classify_line(&v),
+            LineKind::Assistant("已經修好了。".to_string())
+        );
     }
 
     #[test]
@@ -386,7 +396,10 @@ mod tests {
                 {"type": "text", "text": "第二段"}
             ]}
         });
-        assert_eq!(classify_line(&v), LineKind::Assistant("第一段\n\n第二段".to_string()));
+        assert_eq!(
+            classify_line(&v),
+            LineKind::Assistant("第一段\n\n第二段".to_string())
+        );
     }
 
     #[test]
@@ -403,7 +416,10 @@ mod tests {
     #[test]
     fn ai_title_extracted() {
         let v = json!({"type": "ai-title", "aiTitle": "修復逐字稿匯入", "sessionId": "s1"});
-        assert_eq!(classify_line(&v), LineKind::AiTitle("修復逐字稿匯入".to_string()));
+        assert_eq!(
+            classify_line(&v),
+            LineKind::AiTitle("修復逐字稿匯入".to_string())
+        );
     }
 
     #[test]
@@ -464,7 +480,10 @@ mod tests {
         // in its own counter.
         assert_eq!(extract.noise_lines, 2);
         assert_eq!(extract.unparsed_lines, 1);
-        assert_eq!(extract.last_timestamp.as_deref(), Some("2026-08-01T00:00:05Z"));
+        assert_eq!(
+            extract.last_timestamp.as_deref(),
+            Some("2026-08-01T00:00:05Z")
+        );
         assert!(!extract.truncated);
     }
 
@@ -474,7 +493,9 @@ mod tests {
         let path = tmp.path().join("big.jsonl");
         let mut buf = String::new();
         for i in 0..(MAX_TURNS_PER_SESSION + 5) {
-            buf.push_str(&json!({"type": "user", "message": {"content": format!("prompt {i}")}}).to_string());
+            buf.push_str(
+                &json!({"type": "user", "message": {"content": format!("prompt {i}")}}).to_string(),
+            );
             buf.push('\n');
         }
         std::fs::write(&path, buf).unwrap();
@@ -489,7 +510,8 @@ mod tests {
         let path = tmp.path().join("huge.jsonl");
         let huge_text = "x".repeat(MAX_LINE_BYTES + 10);
         let huge_line = json!({"type": "user", "message": {"content": huge_text}}).to_string();
-        let normal_line = json!({"type": "user", "message": {"content": "normal prompt"}}).to_string();
+        let normal_line =
+            json!({"type": "user", "message": {"content": "normal prompt"}}).to_string();
         std::fs::write(&path, format!("{huge_line}\n{normal_line}\n")).unwrap();
         let extract = extract_session(&path).unwrap();
         assert_eq!(extract.oversized_lines, 1);

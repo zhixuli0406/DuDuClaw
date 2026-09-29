@@ -61,7 +61,10 @@ impl EvolutionStrategy {
     /// typed section so this lenient mapping (and its `warn!`) keeps running
     /// instead of a strict serde enum turning a typo into total agent loss.
     pub fn from_agent_dir(agent_dir: &Path) -> Self {
-        let Some(s) = duduclaw_core::agent_toml::load(agent_dir).evolution.strategy else {
+        let Some(s) = duduclaw_core::agent_toml::load(agent_dir)
+            .evolution
+            .strategy
+        else {
             return Self::default();
         };
         let s = s.as_str();
@@ -303,14 +306,14 @@ mod tests {
     #[test]
     fn default_direction_strategy_falls_back_to_balanced_never_errors() {
         for body in [
-            "",                                     // empty file
-            "[evolution]\n",                        // section, no key
-            "[evolution]\ngvu_enabled = true\n",    // sibling key only
+            "",                                      // empty file
+            "[evolution]\n",                         // section, no key
+            "[evolution]\ngvu_enabled = true\n",     // sibling key only
             "[evolution]\nstrategy = \"hardern\"\n", // typo ⇒ warn + balanced
-            "[evolution]\nstrategy = \"\"\n",       // blank
-            "[evolution]\nstrategy = 42\n",         // wrong type
-            "evolution = \"scalar\"\n",             // wrong-typed section
-            "not toml [[[",                         // malformed file
+            "[evolution]\nstrategy = \"\"\n",        // blank
+            "[evolution]\nstrategy = 42\n",          // wrong type
+            "evolution = \"scalar\"\n",              // wrong-typed section
+            "not toml [[[",                          // malformed file
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("agent.toml"), body).unwrap();
@@ -342,7 +345,11 @@ mod tests {
     }
 
     fn rich() -> RoundMaterial {
-        RoundMaterial { unresolved_mistakes: 1, low_streak_entries: 1, active_entries: 0 }
+        RoundMaterial {
+            unresolved_mistakes: 1,
+            low_streak_entries: 1,
+            active_entries: 0,
+        }
     }
 
     #[test]
@@ -363,7 +370,11 @@ mod tests {
                 IntentDecision::Skip(r) => panic!("unexpected skip: {:?}", r),
             }
         }
-        assert_eq!(counts, (50, 30, 20), "balanced must be exactly 5:3:2 over 100 rounds");
+        assert_eq!(
+            counts,
+            (50, 30, 20),
+            "balanced must be exactly 5:3:2 over 100 rounds"
+        );
     }
 
     #[test]
@@ -387,33 +398,65 @@ mod tests {
 
     #[test]
     fn repair_only_with_no_material_skips_not_fabricates() {
-        let barren = RoundMaterial { unresolved_mistakes: 0, low_streak_entries: 9, active_entries: 0 };
+        let barren = RoundMaterial {
+            unresolved_mistakes: 0,
+            low_streak_entries: 9,
+            active_entries: 0,
+        };
         assert_eq!(
-            decide_intent(EvolutionStrategy::RepairOnly, AeeTrigger::ForcedReflection, 7, barren),
+            decide_intent(
+                EvolutionStrategy::RepairOnly,
+                AeeTrigger::ForcedReflection,
+                7,
+                barren
+            ),
             IntentDecision::Skip(SkipReason::NoRepairMaterial)
         );
     }
 
     #[test]
     fn mistake_backlog_outranks_the_mix_but_not_an_innovate_agent() {
-        let backlog = RoundMaterial { unresolved_mistakes: 5, low_streak_entries: 1, active_entries: 0 };
+        let backlog = RoundMaterial {
+            unresolved_mistakes: 5,
+            low_streak_entries: 1,
+            active_entries: 0,
+        };
         // Slot 9 would be Innovate under balanced — the backlog wins.
         assert_eq!(
-            decide_intent(EvolutionStrategy::Balanced, AeeTrigger::ForcedReflection, 9, backlog),
+            decide_intent(
+                EvolutionStrategy::Balanced,
+                AeeTrigger::ForcedReflection,
+                9,
+                backlog
+            ),
             IntentDecision::Run(RoundIntent::Repair)
         );
         // …but an explicitly innovation-biased agent keeps exploring.
         assert_eq!(
-            decide_intent(EvolutionStrategy::Innovate, AeeTrigger::ForcedReflection, 9, backlog),
+            decide_intent(
+                EvolutionStrategy::Innovate,
+                AeeTrigger::ForcedReflection,
+                9,
+                backlog
+            ),
             IntentDecision::Run(RoundIntent::Innovate)
         );
     }
 
     #[test]
     fn stagnation_forces_innovate_avo_p8() {
-        let backlog = RoundMaterial { unresolved_mistakes: 0, low_streak_entries: 4, active_entries: 0 };
+        let backlog = RoundMaterial {
+            unresolved_mistakes: 0,
+            low_streak_entries: 4,
+            active_entries: 0,
+        };
         assert_eq!(
-            decide_intent(EvolutionStrategy::Harden, AeeTrigger::Stagnation, 0, backlog),
+            decide_intent(
+                EvolutionStrategy::Harden,
+                AeeTrigger::Stagnation,
+                0,
+                backlog
+            ),
             IntentDecision::Run(RoundIntent::Innovate),
             "when stuck, change direction — do not keep sanding the same spot"
         );
@@ -432,15 +475,33 @@ mod tests {
     #[test]
     fn degradation_chain_repair_to_optimize_to_innovate_to_skip() {
         // No mistakes → Repair degrades to Optimize.
-        let m1 = RoundMaterial { unresolved_mistakes: 0, low_streak_entries: 2, active_entries: 0 };
+        let m1 = RoundMaterial {
+            unresolved_mistakes: 0,
+            low_streak_entries: 2,
+            active_entries: 0,
+        };
         assert_eq!(
-            decide_intent(EvolutionStrategy::Balanced, AeeTrigger::ForcedReflection, 0, m1),
+            decide_intent(
+                EvolutionStrategy::Balanced,
+                AeeTrigger::ForcedReflection,
+                0,
+                m1
+            ),
             IntentDecision::Run(RoundIntent::Optimize)
         );
         // …and no low-streak entries either → Innovate.
-        let m2 = RoundMaterial { unresolved_mistakes: 0, low_streak_entries: 0, active_entries: 0 };
+        let m2 = RoundMaterial {
+            unresolved_mistakes: 0,
+            low_streak_entries: 0,
+            active_entries: 0,
+        };
         assert_eq!(
-            decide_intent(EvolutionStrategy::Balanced, AeeTrigger::ForcedReflection, 0, m2),
+            decide_intent(
+                EvolutionStrategy::Balanced,
+                AeeTrigger::ForcedReflection,
+                0,
+                m2
+            ),
             IntentDecision::Run(RoundIntent::Innovate)
         );
         // …and the playbook is full → skip, honestly recorded.
@@ -450,7 +511,12 @@ mod tests {
             active_entries: crate::playbook::PLAYBOOK_MAX_ENTRIES,
         };
         assert_eq!(
-            decide_intent(EvolutionStrategy::Balanced, AeeTrigger::ForcedReflection, 0, m3),
+            decide_intent(
+                EvolutionStrategy::Balanced,
+                AeeTrigger::ForcedReflection,
+                0,
+                m3
+            ),
             IntentDecision::Skip(SkipReason::PlaybookAtCapacity)
         );
     }
@@ -458,14 +524,31 @@ mod tests {
     #[test]
     fn strategy_reads_agent_toml_and_falls_back_loudly() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("agent.toml"), "[evolution]\nstrategy = \"harden\"\n").unwrap();
-        assert_eq!(EvolutionStrategy::from_agent_dir(dir.path()), EvolutionStrategy::Harden);
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[evolution]\nstrategy = \"harden\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            EvolutionStrategy::from_agent_dir(dir.path()),
+            EvolutionStrategy::Harden
+        );
 
-        std::fs::write(dir.path().join("agent.toml"), "[evolution]\nstrategy = \"hardn\"\n").unwrap();
-        assert_eq!(EvolutionStrategy::from_agent_dir(dir.path()), EvolutionStrategy::Balanced);
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[evolution]\nstrategy = \"hardn\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            EvolutionStrategy::from_agent_dir(dir.path()),
+            EvolutionStrategy::Balanced
+        );
 
         let empty = tempfile::tempdir().unwrap();
-        assert_eq!(EvolutionStrategy::from_agent_dir(empty.path()), EvolutionStrategy::Balanced);
+        assert_eq!(
+            EvolutionStrategy::from_agent_dir(empty.path()),
+            EvolutionStrategy::Balanced
+        );
     }
 
     #[test]

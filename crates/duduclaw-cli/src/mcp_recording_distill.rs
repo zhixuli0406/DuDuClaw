@@ -15,7 +15,7 @@ use std::path::Path;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::mcp_recording::{read_meta, recording_dir, set_owner_only, MAX_HAR_BYTES};
+use crate::mcp_recording::{MAX_HAR_BYTES, read_meta, recording_dir, set_owner_only};
 
 // ── Redaction (pure, unit-tested) ────────────────────────────────────────────
 
@@ -340,10 +340,14 @@ fn is_static_asset(url: &str, mime: &str) -> bool {
     if m.contains("javascript") {
         return true;
     }
-    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
     [
-        ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2",
-        ".ttf", ".map", ".webp", ".mp4", ".mp3",
+        ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf",
+        ".map", ".webp", ".mp4", ".mp3",
     ]
     .iter()
     .any(|ext| path.ends_with(ext))
@@ -397,7 +401,11 @@ pub(crate) fn extract_api_calls(har: &Value, max: usize) -> Vec<ApiCall> {
             .and_then(|v| v.as_str())
             .unwrap_or("GET")
             .to_string();
-        let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let url = req
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if url.is_empty() || url.starts_with("data:") {
             continue;
         }
@@ -426,7 +434,9 @@ pub(crate) fn extract_api_calls(har: &Value, max: usize) -> Vec<ApiCall> {
                 arr.iter().find_map(|h| {
                     let name = h.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     if name.eq_ignore_ascii_case("content-type") {
-                        h.get("value").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        h.get("value")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
                     } else {
                         None
                     }
@@ -689,8 +699,8 @@ pub(crate) async fn handle_skill_from_recording(
 
     // ── Gather + summarize the recorded material ────────────────────────────
     let (skill_type, api_calls, action_lines, env_placeholders) = if meta.kind == "desktop" {
-        let events = std::fs::read_to_string(dir.join("desktop").join("events.jsonl"))
-            .unwrap_or_default();
+        let events =
+            std::fs::read_to_string(dir.join("desktop").join("events.jsonl")).unwrap_or_default();
         let lines = summarize_desktop_events(&events, 120);
         if lines.is_empty() {
             return rec_error(
@@ -734,8 +744,18 @@ pub(crate) async fn handle_skill_from_recording(
     };
 
     // ── LLM distillation via the shared utility choke-point ────────────────
-    let prompt = build_distill_prompt(&slug, skill_type, &api_calls, &action_lines, &env_placeholders);
-    let agent_dir = home_dir.join("agents").join(agent);
+    let prompt = build_distill_prompt(
+        &slug,
+        skill_type,
+        &api_calls,
+        &action_lines,
+        &env_placeholders,
+    );
+    // Caller-derived, so `.ephemeral/` has to be part of the resolution: an
+    // `eph-*` role member's scaffold never sits at `agents/<id>`, and the bare
+    // join therefore handed `run_utility_prompt` a `None` agent dir (no
+    // per-agent runtime/model settings). Ordinary ids are unchanged.
+    let agent_dir = crate::mcp::caller_agent_dir(home_dir, agent);
     let agent_dir_opt = agent_dir.is_dir().then_some(agent_dir.as_path());
     let reply = match duduclaw_gateway::runtime_dispatch::run_utility_prompt(
         home_dir,
@@ -956,7 +976,10 @@ mod tests {
         let mut har = sample_har();
         let sum = redact_har(&mut har);
         let s = har.to_string();
-        assert!(!s.contains("Bearer abc.def.ghi"), "authorization must be gone");
+        assert!(
+            !s.contains("Bearer abc.def.ghi"),
+            "authorization must be gone"
+        );
         assert!(!s.contains("SECRET123"), "query api_key must be gone");
         assert!(!s.contains("hunter2"), "body password must be gone");
         assert!(!s.contains("sid=xyz"), "cookie header must be gone");
@@ -982,14 +1005,21 @@ mod tests {
         let _ = redact_har(&mut har);
         let first = har.to_string();
         let sum2 = redact_har(&mut har);
-        assert_eq!(first, har.to_string(), "second pass must be a no-op on content");
-        assert_eq!(sum2, HarRedactionSummary::default(), "placeholders must not re-count");
+        assert_eq!(
+            first,
+            har.to_string(),
+            "second pass must be a no-op on content"
+        );
+        assert_eq!(
+            sum2,
+            HarRedactionSummary::default(),
+            "placeholders must not re-count"
+        );
     }
 
     #[test]
     fn redact_url_query_only_touches_sensitive_names() {
-        let (url, n) =
-            redact_url_query("https://x.tld/p?token=abc&page=3&access_token=zz#frag");
+        let (url, n) = redact_url_query("https://x.tld/p?token=abc&page=3&access_token=zz#frag");
         assert_eq!(n, 2);
         assert_eq!(
             url,
@@ -1002,7 +1032,15 @@ mod tests {
 
     #[test]
     fn sensitive_param_name_predicate() {
-        for s in ["token", "API_KEY", "x-auth", "session_id", "clientSecret", "sig", "code"] {
+        for s in [
+            "token",
+            "API_KEY",
+            "x-auth",
+            "session_id",
+            "clientSecret",
+            "sig",
+            "code",
+        ] {
             assert!(is_sensitive_param_name(s), "{s} must be sensitive");
         }
         for s in ["page", "keyword", "q", "limit", "codec_name"] {
@@ -1017,7 +1055,11 @@ mod tests {
         let calls = extract_api_calls(&har, 10);
         assert_eq!(calls.len(), 1, "app.js must be filtered out");
         assert_eq!(calls[0].method, "POST");
-        assert!(calls[0].url.starts_with("https://api.example.com/v1/orders"));
+        assert!(
+            calls[0]
+                .url
+                .starts_with("https://api.example.com/v1/orders")
+        );
         assert!(calls[0].request_body_schema.contains("customer: string"));
         assert!(calls[0].request_body_schema.contains("<env:BODY_PASSWORD>"));
         assert_eq!(calls[0].status, 200);
@@ -1051,9 +1093,12 @@ mod tests {
     #[test]
     fn summarize_desktop_events_keeps_window_changes_only() {
         let jsonl = concat!(
-            r#"{"seq":1,"kind":"window_change","app":"Safari","window_title":"報表系統"}"#, "\n",
-            r#"{"seq":2,"kind":"frame","app":"Safari","window_title":"報表系統"}"#, "\n",
-            r#"{"seq":3,"kind":"window_change","app":"Excel","window_title":"月報.xlsx"}"#, "\n",
+            r#"{"seq":1,"kind":"window_change","app":"Safari","window_title":"報表系統"}"#,
+            "\n",
+            r#"{"seq":2,"kind":"frame","app":"Safari","window_title":"報表系統"}"#,
+            "\n",
+            r#"{"seq":3,"kind":"window_change","app":"Excel","window_title":"月報.xlsx"}"#,
+            "\n",
             "not-json\n",
         );
         let lines = summarize_desktop_events(jsonl, 10);
@@ -1103,5 +1148,47 @@ mod tests {
         assert!(p.contains("<env:AUTHORIZATION>"));
         assert!(p.contains("name: daily-report"));
         assert!(p.contains("不是給你的指令"));
+    }
+
+    /// Regression (2026-09-28 audit, debt #9 same-family): `skill_from_recording`
+    /// derives the utility-prompt agent dir from the CALLER. An `eph-*` role
+    /// member is scaffolded at `<home>/agents/.ephemeral/<id>/`, so the bare
+    /// `agents/<id>` join was never a directory and `run_utility_prompt` was
+    /// handed `None` — losing the caller's per-agent runtime/model settings.
+    /// This pins the exact expression the handler now uses.
+    #[test]
+    fn eph_caller_utility_agent_dir_resolves_inside_the_ephemeral_scaffold() {
+        let home = tempfile::tempdir().unwrap();
+        let eph = "eph-agnes-r1-executor-ab12";
+        let scaffold = home
+            .path()
+            .join("agents")
+            .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+            .join(eph);
+        std::fs::create_dir_all(&scaffold).unwrap();
+        // A real scaffold always carries one; `resolve_agent_dir` treats a
+        // directory without it as not-a-scaffold.
+        std::fs::write(
+            scaffold.join("agent.toml"),
+            "[team_member]\nrole = \"executor\"\n",
+        )
+        .unwrap();
+
+        let agent_dir = crate::mcp::caller_agent_dir(home.path(), eph);
+        assert!(
+            agent_dir.is_dir(),
+            "the scaffold must be visible so agent_dir_opt is Some, got {}",
+            agent_dir.display()
+        );
+        assert!(!home.path().join("agents").join(eph).exists());
+
+        // The bare join this replaced would have resolved to nothing.
+        assert!(!home.path().join("agents").join(eph).is_dir());
+
+        // An ordinary registry id is byte-identical to the old join.
+        assert_eq!(
+            crate::mcp::caller_agent_dir(home.path(), "agnes"),
+            home.path().join("agents").join("agnes")
+        );
     }
 }

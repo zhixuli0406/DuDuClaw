@@ -355,7 +355,10 @@ pub fn parse_manifest(text: &str) -> Result<Vec<ManifestEntry>, String> {
         // of the filename.
         let name = rest.strip_prefix('*').unwrap_or(rest);
         if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!("manifest line {}: not a SHA-256 digest", lineno + 1));
+            return Err(format!(
+                "manifest line {}: not a SHA-256 digest",
+                lineno + 1
+            ));
         }
         if !is_safe_basename(name) {
             return Err(format!(
@@ -440,10 +443,7 @@ pub struct ReleaseFiles {
 /// roots for this arch, two canonical UKIs, two slot-B UKIs, mismatched
 /// versions) is refused, because guessing which one was meant is exactly how
 /// a machine ends up with a kernel from one build and a root from another.
-pub fn select_release_files(
-    entries: &[ManifestEntry],
-    arch: &str,
-) -> Result<ReleaseFiles, String> {
+pub fn select_release_files(entries: &[ManifestEntry], arch: &str) -> Result<ReleaseFiles, String> {
     let root_suffix = format!(".root-{arch}.raw");
     // VER-V: checked BEFORE `root_suffix` below for the same reason
     // `UKI_SLOT_B_SUFFIX` is checked before the generic `.efi` match —
@@ -532,7 +532,7 @@ pub fn select_release_files(
         n => {
             return Err(format!(
                 "the release contains {n} verity hash trees for {arch}"
-            ))
+            ));
         }
     };
     let verity_roothash = match verity_roothashes.len() {
@@ -550,7 +550,7 @@ pub fn select_release_files(
         n => {
             return Err(format!(
                 "the release contains {n} verity roothash companions for {arch}"
-            ))
+            ));
         }
     };
     // VER-V: a hash tree without its signed roothash companion (or vice
@@ -800,8 +800,7 @@ pub fn pick_destination_slot(
 
 /// Read `/dev/disk/by-partlabel/`, resolving every symlink to its device.
 fn read_slot_entries(dir: &Path) -> Result<Vec<SlotEntry>, String> {
-    let rd = std::fs::read_dir(dir)
-        .map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
     let mut out = Vec::new();
     for entry in rd.flatten() {
         let label = entry.file_name().to_string_lossy().into_owned();
@@ -818,8 +817,7 @@ fn read_slot_entries(dir: &Path) -> Result<Vec<SlotEntry>, String> {
 
 /// PARTUUID of `device`, via the world-readable `/dev/disk/by-partuuid` tree.
 fn partuuid_of(dir: &Path, device: &Path) -> Result<String, String> {
-    let rd = std::fs::read_dir(dir)
-        .map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
     for entry in rd.flatten() {
         let Ok(target) = std::fs::canonicalize(entry.path()) else {
             continue;
@@ -950,7 +948,9 @@ async fn fetch_small(source: &Source, name: &str, max: u64) -> Result<Fetched, S
                 .await
                 .map_err(|e| StageError::Network(format!("{name}: {e}")))?;
             if bytes.len() as u64 > max {
-                return Err(StageError::Rejected(format!("{name} is over its size ceiling")));
+                return Err(StageError::Rejected(format!(
+                    "{name} is over its size ceiling"
+                )));
             }
             Ok(Fetched {
                 bytes: bytes.to_vec(),
@@ -971,7 +971,9 @@ async fn fetch_small(source: &Source, name: &str, max: u64) -> Result<Fetched, S
                 }
             })?;
             if meta.len() > max {
-                return Err(StageError::Rejected(format!("{name} is over its size ceiling")));
+                return Err(StageError::Rejected(format!(
+                    "{name} is over its size ceiling"
+                )));
             }
             let bytes = tokio::fs::read(&path)
                 .await
@@ -1475,7 +1477,9 @@ pub async fn stage_update_with(
         .map_err(|e| StageError::Io(format!("cannot re-read the staged kernel image: {e}")))?;
     let slot_b_bytes = match &uki_slot_b_tmp {
         Some(tmp) => Some(std::fs::read(tmp).map_err(|e| {
-            StageError::Io(format!("cannot re-read the staged slot-B kernel image: {e}"))
+            StageError::Io(format!(
+                "cannot re-read the staged slot-B kernel image: {e}"
+            ))
         })?),
         None => None,
     };
@@ -1557,8 +1561,8 @@ const SLOT_CONFIRM_TIMEOUT_SECS: u64 = 30;
 
 pub async fn confirm_installed_slot(report: &StageReport) -> Result<(), String> {
     let want_label = format!("{SLOT_LABEL_PREFIX}{}", report.version);
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(SLOT_CONFIRM_TIMEOUT_SECS);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(SLOT_CONFIRM_TIMEOUT_SECS);
     let mut last = format!("no partition is labelled {want_label} after the install");
 
     loop {
@@ -1581,14 +1585,14 @@ pub async fn confirm_installed_slot(report: &StageReport) -> Result<(), String> 
                     // by-partlabel, so this too can simply be early.
                     Err(e) => last = e,
                 },
-                None => {
-                    last = format!("no partition is labelled {want_label} after the install")
-                }
+                None => last = format!("no partition is labelled {want_label} after the install"),
             },
             Err(e) => last = e,
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("{last} (waited {SLOT_CONFIRM_TIMEOUT_SECS}s for udev)"));
+            return Err(format!(
+                "{last} (waited {SLOT_CONFIRM_TIMEOUT_SECS}s for udev)"
+            ));
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
@@ -1607,7 +1611,10 @@ pub fn cleanup_staged(report: &StageReport) {
     }
     for path in paths {
         if let Err(e) = std::fs::remove_file(path) {
-            warn!("[os_update] could not remove staged {}: {e}", path.display());
+            warn!(
+                "[os_update] could not remove staged {}: {e}",
+                path.display()
+            );
         }
     }
 }
@@ -1701,7 +1708,10 @@ mod tests {
         ] {
             assert!(parse_manifest(&bad).is_err(), "must reject {bad:?}");
         }
-        assert!(parse_manifest("").is_err(), "an empty manifest is not a release");
+        assert!(
+            parse_manifest("").is_err(),
+            "an empty manifest is not a release"
+        );
     }
 
     #[test]
@@ -2004,7 +2014,10 @@ mod tests {
         let slot_b = uki_bound_to(BIND_SLOT_B);
         let (bytes, template) =
             bind_uki_to_slot(canonical.clone(), Some(slot_b), BIND_SLOT_A).unwrap();
-        assert_eq!(bytes, canonical, "must stage the canonical candidate's own bytes");
+        assert_eq!(
+            bytes, canonical,
+            "must stage the canonical candidate's own bytes"
+        );
         assert_eq!(template, BIND_SLOT_A);
         // Selection never mutates either candidate's cmdline.
         assert_eq!(
@@ -2284,7 +2297,9 @@ mod tests {
         let src = Source::Dir(release.path().to_path_buf());
 
         let dest = staging.path().join(name);
-        let n = fetch_payload(&src, &good, &dest, MAX_ROOT_BYTES).await.unwrap();
+        let n = fetch_payload(&src, &good, &dest, MAX_ROOT_BYTES)
+            .await
+            .unwrap();
         assert_eq!(n, 1024);
         assert_eq!(std::fs::read(&dest).unwrap(), payload);
 
@@ -2387,10 +2402,11 @@ mod tests {
 
         assert!(dir.path().join("duduclaw-os_0.2.0.root-arm64.raw").exists());
         assert!(dir.path().join("duduclaw-os_0.2.0.efi").exists());
-        assert!(dir
-            .path()
-            .join("duduclaw-os_0.2.0.verity-arm64.raw")
-            .exists());
+        assert!(
+            dir.path()
+                .join("duduclaw-os_0.2.0.verity-arm64.raw")
+                .exists()
+        );
         assert!(!dir.path().join("duduclaw-os_0.1.0.root-arm64.raw").exists());
         assert!(!dir.path().join("duduclaw-os_0.1.0.efi").exists());
         assert!(

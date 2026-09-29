@@ -9,8 +9,9 @@
 //! A7c's display group had to fix a boundary INSIDE the compositor
 //! (`shell_control::listener::classify_peer`'s new `PeerAuthority::Agent`
 //! tier) because cursor/theme/output-scale are compositor-owned state, only
-//! reachable through comp's own socket. Audio is not: `crates/duduclaw-shell/
-//! src/audio/wpctl.rs`'s own module doc establishes that PipeWire has no
+//! reachable through comp's own socket. Audio is not: the shell's
+//! `crates/duduclaw-shell/src/audio/wpctl.rs` (DuDuClaw-OS repo since
+//! 2026-09-29) establishes in its own module doc that PipeWire has no
 //! D-Bus surface and no relationship to Wayland — the shell's own volume
 //! slider already talks to the `wpctl` CLI as a bare subprocess, entirely
 //! independent of `duduclaw-comp`'s `shell_control` socket (which has no
@@ -82,7 +83,7 @@
 //! theme/output-scale: reversible, low-risk appearance-adjacent preferences,
 //! not destructive machine operations. No `ApprovalBroker` gate.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Same fixed path `display_bridge::KIOSK_RUNTIME_DIR` uses — see this
 /// module's doc for why audio needs the identical fallback. Duplicated
@@ -154,7 +155,10 @@ async fn run_wpctl_bin_with_env(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-async fn run_wpctl_with_env(args: &[&str], xdg_runtime_override: Option<&str>) -> Result<String, String> {
+async fn run_wpctl_with_env(
+    args: &[&str],
+    xdg_runtime_override: Option<&str>,
+) -> Result<String, String> {
     run_wpctl_bin_with_env(WPCTL_BIN, args, xdg_runtime_override).await
 }
 
@@ -202,7 +206,10 @@ where
 
 async fn run_wpctl(args: &[&str]) -> Result<String, String> {
     let ambient = run_wpctl_with_env(args, None).await;
-    two_tier(ambient, || run_wpctl_with_env(args, Some(KIOSK_RUNTIME_DIR))).await
+    two_tier(ambient, || {
+        run_wpctl_with_env(args, Some(KIOSK_RUNTIME_DIR))
+    })
+    .await
 }
 
 // ── Pure output parsing (ported from `duduclaw-shell::audio::wpctl` — same
@@ -275,11 +282,16 @@ fn parse_sinks(raw: &str) -> Vec<AudioOutput> {
 }
 
 fn is_category_line(line: &str) -> bool {
-    line.chars().next().is_some_and(|c| !c.is_whitespace() && !is_gutter_char(c))
+    line.chars()
+        .next()
+        .is_some_and(|c| !c.is_whitespace() && !is_gutter_char(c))
 }
 
 fn is_gutter_char(c: char) -> bool {
-    matches!(c, '│' | '├' | '└' | '┌' | '┐' | '┘' | '┤' | '┬' | '┴' | '┼' | '─')
+    matches!(
+        c,
+        '│' | '├' | '└' | '┌' | '┐' | '┘' | '┤' | '┬' | '┴' | '┼' | '─'
+    )
 }
 
 fn strip_tree_gutter(line: &str) -> &str {
@@ -305,7 +317,11 @@ fn parse_sink_entry(content: &str) -> Option<AudioOutput> {
         return None;
     }
 
-    Some(AudioOutput { id, name: name.to_string(), is_default })
+    Some(AudioOutput {
+        id,
+        name: name.to_string(),
+        is_default,
+    })
 }
 
 // ── Granular ops (mirror `duduclaw-shell::audio::AudioBackend`'s verbs) ────
@@ -442,9 +458,10 @@ mod tests {
     /// FALLBACK's error, not the primary's, when both fail.
     #[tokio::test]
     async fn both_failing_surfaces_the_fallbacks_error_not_the_primarys() {
-        let result = two_tier(Err("ambient: wrong XDG_RUNTIME_DIR".to_string()), || async {
-            Err("fixed path: pipewire unreachable".to_string())
-        })
+        let result = two_tier(
+            Err("ambient: wrong XDG_RUNTIME_DIR".to_string()),
+            || async { Err("fixed path: pipewire unreachable".to_string()) },
+        )
         .await;
         let err = result.unwrap_err();
         assert!(err.contains("pipewire unreachable"), "unexpected: {err}");
@@ -459,9 +476,13 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn a_missing_binary_is_an_honest_spawn_error_not_a_panic() {
-        let err = run_wpctl_bin_with_env("duduclaw-definitely-not-a-real-binary-xyz", &["status"], None)
-            .await
-            .unwrap_err();
+        let err = run_wpctl_bin_with_env(
+            "duduclaw-definitely-not-a-real-binary-xyz",
+            &["status"],
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("failed to spawn"), "unexpected: {err}");
     }
 
@@ -470,14 +491,18 @@ mod tests {
     async fn a_nonzero_exit_is_captured_as_an_error_with_the_exit_code() {
         // `false` always exits 1 and prints nothing — a real, deterministic
         // stand-in for "wpctl ran but the daemon refused the request".
-        let err = run_wpctl_bin_with_env("false", &["status"], None).await.unwrap_err();
+        let err = run_wpctl_bin_with_env("false", &["status"], None)
+            .await
+            .unwrap_err();
         assert!(err.contains("exited with"), "unexpected: {err}");
     }
 
     #[tokio::test]
     #[cfg(unix)]
     async fn a_successful_run_returns_captured_stdout() {
-        let out = run_wpctl_bin_with_env("echo", &["hello-audio-bridge"], None).await.unwrap();
+        let out = run_wpctl_bin_with_env("echo", &["hello-audio-bridge"], None)
+            .await
+            .unwrap();
         assert!(out.contains("hello-audio-bridge"), "unexpected: {out:?}");
     }
 
@@ -486,7 +511,9 @@ mod tests {
     async fn the_xdg_runtime_dir_override_is_actually_passed_to_the_child() {
         // `env` (coreutils) prints the child's own environment — proves the
         // override reaches the subprocess rather than being silently dropped.
-        let out = run_wpctl_bin_with_env("env", &[], Some("/run/duduclaw-kiosk")).await.unwrap();
+        let out = run_wpctl_bin_with_env("env", &[], Some("/run/duduclaw-kiosk"))
+            .await
+            .unwrap();
         assert!(
             out.contains("XDG_RUNTIME_DIR=/run/duduclaw-kiosk"),
             "unexpected env dump: {out:?}"
@@ -558,14 +585,35 @@ Settings
     #[test]
     fn parses_the_sinks_section_of_a_real_status_capture() {
         let sinks = parse_sinks(STATUS_SAMPLE);
-        assert_eq!(sinks.len(), 2, "exactly the two Sinks rows, not Sources/Devices/Settings");
-        assert_eq!(sinks[0], AudioOutput { id: 50, name: "Built-in Audio Analog Stereo".to_string(), is_default: true });
-        assert_eq!(sinks[1], AudioOutput { id: 53, name: "HDMI / DisplayPort".to_string(), is_default: false });
+        assert_eq!(
+            sinks.len(),
+            2,
+            "exactly the two Sinks rows, not Sources/Devices/Settings"
+        );
+        assert_eq!(
+            sinks[0],
+            AudioOutput {
+                id: 50,
+                name: "Built-in Audio Analog Stereo".to_string(),
+                is_default: true
+            }
+        );
+        assert_eq!(
+            sinks[1],
+            AudioOutput {
+                id: 53,
+                name: "HDMI / DisplayPort".to_string(),
+                is_default: false
+            }
+        );
     }
 
     #[test]
     fn sources_are_never_reported_as_outputs() {
-        assert!(parse_sinks(STATUS_SAMPLE).iter().all(|d| d.id != 52), "id 52 is a SOURCE, not an output");
+        assert!(
+            parse_sinks(STATUS_SAMPLE).iter().all(|d| d.id != 52),
+            "id 52 is a SOURCE, not an output"
+        );
     }
 
     #[test]

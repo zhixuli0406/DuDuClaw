@@ -77,8 +77,9 @@ fn spawn_decider(home: PathBuf, approve: bool) -> tokio::task::JoinHandle<String
 }
 
 fn live_env() -> (PathBuf, PathBuf) {
-    let sock = std::env::var("DUDUCLAW_CODRIVE_LIVE_SOCK")
-        .expect("set DUDUCLAW_CODRIVE_LIVE_SOCK to the host-side bridge socket (see module playbook)");
+    let sock = std::env::var("DUDUCLAW_CODRIVE_LIVE_SOCK").expect(
+        "set DUDUCLAW_CODRIVE_LIVE_SOCK to the host-side bridge socket (see module playbook)",
+    );
     let token = std::env::var("DUDUCLAW_CODRIVE_LIVE_TOKEN")
         .expect("set DUDUCLAW_CODRIVE_LIVE_TOKEN to the copied token file (see module playbook)");
     (PathBuf::from(sock), PathBuf::from(token))
@@ -99,7 +100,14 @@ fn live_home(label: &str, sock: &std::path::Path, token: &std::path::Path) -> Pa
 }
 
 fn step(narration: &str, action: CodriveAction) -> CodriveStep {
-    CodriveStep { narration: narration.to_string(), highlight: None, action, consequential: None, api_action: None, locate: None }
+    CodriveStep {
+        narration: narration.to_string(),
+        highlight: None,
+        action,
+        consequential: None,
+        api_action: None,
+        locate: None,
+    }
 }
 
 /// One sequential test (not two) on purpose: comp accepts a single
@@ -120,17 +128,33 @@ async fn live_bridge_approve_then_deny_round() {
         steps: vec![
             CodriveStep {
                 narration: "點擊終端機輸入區".to_string(),
-                highlight: Some(CodriveHighlight { x: 150.0, y: 100.0, w: 300.0, h: 100.0 }),
-                action: CodriveAction::Click { x: 200.0, y: 150.0, btn: super::client::CodriveButton::Left },
+                highlight: Some(CodriveHighlight {
+                    x: 150.0,
+                    y: 100.0,
+                    w: 300.0,
+                    h: 100.0,
+                }),
+                action: CodriveAction::Click {
+                    x: 200.0,
+                    y: 150.0,
+                    btn: super::client::CodriveButton::Left,
+                },
                 consequential: None,
                 api_action: None,
                 locate: None,
             },
-            step("輸入建檔指令", CodriveAction::Text { s: "echo cd1live > /tmp/cd1-live.txt".to_string() }),
+            step(
+                "輸入建檔指令",
+                CodriveAction::Text {
+                    s: "echo cd1live > /tmp/cd1-live.txt".to_string(),
+                },
+            ),
             CodriveStep {
                 narration: "送出指令".to_string(),
                 highlight: None,
-                action: CodriveAction::KeyName { name: "enter".to_string() },
+                action: CodriveAction::KeyName {
+                    name: "enter".to_string(),
+                },
                 consequential: Some(CodriveConsequential {
                     class: ConsequentialClass::Submit,
                     description: "在共享桌面的終端機執行已輸入的指令".to_string(),
@@ -144,11 +168,22 @@ async fn live_bridge_approve_then_deny_round() {
     };
     let report = run_script(&home, "live-test-agent", script).await;
     let decided_id = decider.await.expect("decider task panicked");
-    println!("approve-path report: {}", serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap());
-    assert_eq!(report.final_state, "completed", "approve path must complete: {:?}", report.detail);
+    println!(
+        "approve-path report: {}",
+        serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap()
+    );
+    assert_eq!(
+        report.final_state, "completed",
+        "approve path must complete: {:?}",
+        report.detail
+    );
     let enter_step = &report.steps[2];
     assert_eq!(enter_step.outcome, "applied");
-    assert_eq!(enter_step.approval_id.as_deref(), Some(decided_id.as_str()), "the applied consequential step must carry the approval the decider granted");
+    assert_eq!(
+        enter_step.approval_id.as_deref(),
+        Some(decided_id.as_str()),
+        "the applied consequential step must carry the approval the decider granted"
+    );
 
     // ── Deny path: the typed command sits un-submitted; the denied Enter is
     // never sent, so /tmp/cd1-deny.txt must never exist in the container. ──
@@ -158,11 +193,18 @@ async fn live_bridge_approve_then_deny_round() {
         target_app: "foot".to_string(),
         task_summary: "在終端機建立標記檔（live 活測·拒絕路徑）".to_string(),
         steps: vec![
-            step("輸入建檔指令", CodriveAction::Text { s: "echo cd1deny > /tmp/cd1-deny.txt".to_string() }),
+            step(
+                "輸入建檔指令",
+                CodriveAction::Text {
+                    s: "echo cd1deny > /tmp/cd1-deny.txt".to_string(),
+                },
+            ),
             CodriveStep {
                 narration: "送出指令".to_string(),
                 highlight: None,
-                action: CodriveAction::KeyName { name: "enter".to_string() },
+                action: CodriveAction::KeyName {
+                    name: "enter".to_string(),
+                },
                 consequential: Some(CodriveConsequential {
                     class: ConsequentialClass::Submit,
                     description: "在共享桌面的終端機執行已輸入的指令".to_string(),
@@ -175,9 +217,20 @@ async fn live_bridge_approve_then_deny_round() {
     };
     let report = run_script(&home, "live-test-agent", script).await;
     let decided_id = decider.await.expect("decider task panicked");
-    println!("deny-path report: {}", serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap());
-    assert_eq!(report.final_state, "aborted_approval_denied", "deny path must abort: {:?}", report.detail);
-    assert_eq!(report.steps.len(), 2, "the script must stop at the denied step");
+    println!(
+        "deny-path report: {}",
+        serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap()
+    );
+    assert_eq!(
+        report.final_state, "aborted_approval_denied",
+        "deny path must abort: {:?}",
+        report.detail
+    );
+    assert_eq!(
+        report.steps.len(),
+        2,
+        "the script must stop at the denied step"
+    );
     let enter_step = &report.steps[1];
     assert_eq!(enter_step.outcome, "denied");
     assert_eq!(enter_step.approval_id.as_deref(), Some(decided_id.as_str()));
@@ -218,7 +271,11 @@ async fn live_bridge_real_human_freeze_and_resume() {
             CodriveStep {
                 narration: "點擊終端機輸入區".to_string(),
                 highlight: None,
-                action: CodriveAction::Click { x: 200.0, y: 150.0, btn: super::client::CodriveButton::Left },
+                action: CodriveAction::Click {
+                    x: 200.0,
+                    y: 150.0,
+                    btn: super::client::CodriveButton::Left,
+                },
                 consequential: None,
                 api_action: None,
                 locate: None,
@@ -229,15 +286,24 @@ async fn live_bridge_real_human_freeze_and_resume() {
             ),
             step(
                 "輸入驗證指令（預期先被凍結，真人 Super+Enter 交還後重發）",
-                CodriveAction::Text { s: "echo cd2vmfreeze123 > /tmp/cd2-freeze-proof.txt\n".to_string() },
+                CodriveAction::Text {
+                    s: "echo cd2vmfreeze123 > /tmp/cd2-freeze-proof.txt\n".to_string(),
+                },
             ),
         ],
         watch_mode: false,
     };
 
     let report = run_script(&home, "live-test-agent", script).await;
-    println!("freeze/resume report: {}", serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap());
-    assert_eq!(report.final_state, "completed", "freeze/resume round must complete: {:?}", report.detail);
+    println!(
+        "freeze/resume report: {}",
+        serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap()
+    );
+    assert_eq!(
+        report.final_state, "completed",
+        "freeze/resume round must complete: {:?}",
+        report.detail
+    );
     assert_eq!(report.steps.len(), 3);
     assert_eq!(
         report.steps[2].outcome, "dropped_frozen_reapplied",
@@ -319,10 +385,12 @@ async fn live_bridge_cd4c_atspi_locate_click_save_writes_file() {
     let (sock, token) = live_env();
     let home = live_home("cd4c-atspi", &sock, &token);
 
-    let proof_path = std::env::var("CD4C_PROOF_PATH").unwrap_or_else(|_| "/tmp/cd4c-atspi-proof.txt".to_string());
+    let proof_path = std::env::var("CD4C_PROOF_PATH")
+        .unwrap_or_else(|_| "/tmp/cd4c-atspi-proof.txt".to_string());
     let _ = std::fs::remove_file(&proof_path); // start from a clean slate — a stale proof file must not fake a PASS
 
-    let target_app = std::env::var("CD4C_TARGET_APP").unwrap_or_else(|_| "cd4c-gtk-probe".to_string());
+    let target_app =
+        std::env::var("CD4C_TARGET_APP").unwrap_or_else(|_| "cd4c-gtk-probe".to_string());
 
     let script = CodriveScript {
         target_app: target_app.clone(),
@@ -330,24 +398,40 @@ async fn live_bridge_cd4c_atspi_locate_click_save_writes_file() {
         steps: vec![CodriveStep {
             narration: "AT-SPI 定位並點擊 Save 鈕".to_string(),
             highlight: None,
-            action: CodriveAction::Click { x: 1.0, y: 1.0, btn: super::client::CodriveButton::Left },
+            action: CodriveAction::Click {
+                x: 1.0,
+                y: 1.0,
+                btn: super::client::CodriveButton::Left,
+            },
             consequential: None,
             api_action: None,
-            locate: Some(LocateRequest { role: "button".to_string(), name: "Save".to_string() }),
+            locate: Some(LocateRequest {
+                role: "button".to_string(),
+                name: "Save".to_string(),
+            }),
         }],
         watch_mode: false,
     };
 
     let report = run_script(&home, "live-test-agent", script).await;
-    println!("cd4c atspi-locate report: {}", serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap());
-    assert_eq!(report.final_state, "completed", "locate+click round must complete: {:?}", report.detail);
+    println!(
+        "cd4c atspi-locate report: {}",
+        serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap()
+    );
+    assert_eq!(
+        report.final_state, "completed",
+        "locate+click round must complete: {:?}",
+        report.detail
+    );
     assert_eq!(report.steps[0].outcome, "applied");
 
     // Audit-log ground truth: the step must have actually gone through
     // AT-SPI (`locate_outcome":"located"`), not silently fallen back.
-    let audit = std::fs::read_to_string(home.join("tool_calls.jsonl")).expect("tool_calls.jsonl must exist after a run");
+    let audit = std::fs::read_to_string(home.join("tool_calls.jsonl"))
+        .expect("tool_calls.jsonl must exist after a run");
     assert!(
-        audit.contains("\"locate_outcome\":\"located\"") || audit.contains("\"locate_outcome\": \"located\""),
+        audit.contains("\"locate_outcome\":\"located\"")
+            || audit.contains("\"locate_outcome\": \"located\""),
         "audit log must show a real AT-SPI locate hit, not a fallback — audit:\n{audit}"
     );
 
@@ -359,9 +443,13 @@ async fn live_bridge_cd4c_atspi_locate_click_save_writes_file() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let proof = std::fs::read_to_string(&proof_path)
-        .unwrap_or_else(|e| panic!("proof file {proof_path} was not written by the injected click: {e}"));
-    assert!(proof.starts_with("cd4c-saved-by-atspi-click"), "unexpected proof file content: {proof}");
+    let proof = std::fs::read_to_string(&proof_path).unwrap_or_else(|e| {
+        panic!("proof file {proof_path} was not written by the injected click: {e}")
+    });
+    assert!(
+        proof.starts_with("cd4c-saved-by-atspi-click"),
+        "unexpected proof file content: {proof}"
+    );
 }
 
 /// CD-4a C-L2 real machine round, NetworkManager half: system-bus DBus call
@@ -388,18 +476,33 @@ async fn live_bridge_cd4c_c_l2_networkmanager_real_dispatch() {
             highlight: None,
             action: CodriveAction::Wait { ms: 1 },
             consequential: None,
-            api_action: Some(ApiActionRequest { action: "state".to_string(), params: serde_json::Value::Null }),
+            api_action: Some(ApiActionRequest {
+                action: "state".to_string(),
+                params: serde_json::Value::Null,
+            }),
             locate: None,
         }],
         watch_mode: false,
     };
     let report = run_script(&home, "live-test-agent", script).await;
-    println!("cd4c C-L2 networkmanager report: {}", serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap());
-    assert_eq!(report.final_state, "completed", "networkmanager api_action round must complete: {:?}", report.detail);
-    assert_eq!(report.steps[0].outcome, "api_action", "must be served by the C-L2 registry, not fall back to C-L1");
-    let audit = std::fs::read_to_string(home.join("tool_calls.jsonl")).expect("tool_calls.jsonl must exist after a run");
+    println!(
+        "cd4c C-L2 networkmanager report: {}",
+        serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap()
+    );
+    assert_eq!(
+        report.final_state, "completed",
+        "networkmanager api_action round must complete: {:?}",
+        report.detail
+    );
+    assert_eq!(
+        report.steps[0].outcome, "api_action",
+        "must be served by the C-L2 registry, not fall back to C-L1"
+    );
+    let audit = std::fs::read_to_string(home.join("tool_calls.jsonl"))
+        .expect("tool_calls.jsonl must exist after a run");
     assert!(
-        audit.contains("\"registry_outcome\":\"executed\"") || audit.contains("\"registry_outcome\": \"executed\""),
+        audit.contains("\"registry_outcome\":\"executed\"")
+            || audit.contains("\"registry_outcome\": \"executed\""),
         "audit log must show a real DBus exec against the real system bus — audit:\n{audit}"
     );
 }
@@ -454,22 +557,39 @@ async fn live_bridge_cd4c_c_l2_chromium_real_dispatch() {
             highlight: None,
             action: CodriveAction::Wait { ms: 1 },
             consequential: None,
-            api_action: Some(ApiActionRequest { action: "open_window".to_string(), params: serde_json::Value::Null }),
+            api_action: Some(ApiActionRequest {
+                action: "open_window".to_string(),
+                params: serde_json::Value::Null,
+            }),
             locate: None,
         }],
         watch_mode: false,
     };
     let report = run_script(&home, "live-test-agent", script).await;
-    println!("cd4c C-L2 chromium report: {}", serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap());
-    assert_eq!(report.final_state, "completed", "detail: {:?}", report.detail);
+    println!(
+        "cd4c C-L2 chromium report: {}",
+        serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap()
+    );
+    assert_eq!(
+        report.final_state, "completed",
+        "detail: {:?}",
+        report.detail
+    );
     assert_eq!(
         report.steps[0].outcome, "api_action",
         "post-WP-B1 a real Chromium launch is a genuine C-L2 hit — an \"applied\" outcome here means it degraded to the C-L1 coordinate path again: {:?}",
         report.detail
     );
-    let audit = std::fs::read_to_string(home.join("tool_calls.jsonl")).expect("tool_calls.jsonl must exist after a run");
-    assert!(!audit.contains("Missing X server"), "the --ozone-platform=wayland fix must prevent the X11/XWayland error — audit:\n{audit}");
-    assert!(!audit.contains("XDG_RUNTIME_DIR is invalid"), "the env-passthrough fix must prevent this error — audit:\n{audit}");
+    let audit = std::fs::read_to_string(home.join("tool_calls.jsonl"))
+        .expect("tool_calls.jsonl must exist after a run");
+    assert!(
+        !audit.contains("Missing X server"),
+        "the --ozone-platform=wayland fix must prevent the X11/XWayland error — audit:\n{audit}"
+    );
+    assert!(
+        !audit.contains("XDG_RUNTIME_DIR is invalid"),
+        "the env-passthrough fix must prevent this error — audit:\n{audit}"
+    );
     assert!(
         !audit.contains("timed out after 10s"),
         "EXEC_TIMEOUT must never be reached by a detached launcher action — seeing it means the Chromium entries lost their WaitMode::Detach — audit:\n{audit}"
@@ -479,7 +599,8 @@ async fn live_bridge_cd4c_c_l2_chromium_real_dispatch() {
         "a working launch must no longer degrade to C-L1 — audit:\n{audit}"
     );
     assert!(
-        audit.contains("\"registry_outcome\":\"executed\"") || audit.contains("\"registry_outcome\": \"executed\""),
+        audit.contains("\"registry_outcome\":\"executed\"")
+            || audit.contains("\"registry_outcome\": \"executed\""),
         "the audit trail must record a real C-L2 execution — audit:\n{audit}"
     );
     assert!(
@@ -515,7 +636,8 @@ async fn live_bridge_cd4c_c_l2_chromium_real_dispatch() {
 async fn live_bridge_cd4c_mixed_ladder_one_script() {
     let (sock, token) = live_env();
     let home = live_home("cd4c-ladder", &sock, &token);
-    let target_app = std::env::var("CD4C_TARGET_APP").unwrap_or_else(|_| "cd4c-gtk-probe".to_string());
+    let target_app =
+        std::env::var("CD4C_TARGET_APP").unwrap_or_else(|_| "cd4c-gtk-probe".to_string());
 
     let script = CodriveScript {
         target_app: target_app.clone(),
@@ -550,30 +672,56 @@ async fn live_bridge_cd4c_mixed_ladder_one_script() {
             CodriveStep {
                 narration: "C-L3：AT-SPI 定位 Close 鈕並點擊".to_string(),
                 highlight: None,
-                action: CodriveAction::Click { x: 1.0, y: 1.0, btn: super::client::CodriveButton::Left },
+                action: CodriveAction::Click {
+                    x: 1.0,
+                    y: 1.0,
+                    btn: super::client::CodriveButton::Left,
+                },
                 consequential: None,
                 api_action: None,
-                locate: Some(LocateRequest { role: "button".to_string(), name: "Close".to_string() }),
+                locate: Some(LocateRequest {
+                    role: "button".to_string(),
+                    name: "Close".to_string(),
+                }),
             },
         ],
         watch_mode: false,
     };
 
     let report = run_script(&home, "live-test-agent", script).await;
-    println!("cd4c mixed-ladder report: {}", serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap());
-    assert_eq!(report.final_state, "completed", "mixed-ladder round must complete: {:?}", report.detail);
+    println!(
+        "cd4c mixed-ladder report: {}",
+        serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap()
+    );
+    assert_eq!(
+        report.final_state, "completed",
+        "mixed-ladder round must complete: {:?}",
+        report.detail
+    );
     assert_eq!(report.steps.len(), 3);
-    assert_eq!(report.steps[0].outcome, "applied", "step 0 (C-L1) must be a plain comp-applied move");
-    assert_eq!(report.steps[1].outcome, "applied", "step 1 (C-L2 miss) must fall through to a plain comp-applied Wait, not error out");
-    assert_eq!(report.steps[2].outcome, "applied", "step 2 (C-L3) still reports applied — locate resolves coords, comp still does the click");
+    assert_eq!(
+        report.steps[0].outcome, "applied",
+        "step 0 (C-L1) must be a plain comp-applied move"
+    );
+    assert_eq!(
+        report.steps[1].outcome, "applied",
+        "step 1 (C-L2 miss) must fall through to a plain comp-applied Wait, not error out"
+    );
+    assert_eq!(
+        report.steps[2].outcome, "applied",
+        "step 2 (C-L3) still reports applied — locate resolves coords, comp still does the click"
+    );
 
-    let audit = std::fs::read_to_string(home.join("tool_calls.jsonl")).expect("tool_calls.jsonl must exist after a run");
+    let audit = std::fs::read_to_string(home.join("tool_calls.jsonl"))
+        .expect("tool_calls.jsonl must exist after a run");
     assert!(
-        audit.contains("\"registry_outcome\":\"registry_miss_fallback\"") || audit.contains("\"registry_outcome\": \"registry_miss_fallback\""),
+        audit.contains("\"registry_outcome\":\"registry_miss_fallback\"")
+            || audit.contains("\"registry_outcome\": \"registry_miss_fallback\""),
         "step 1 must show an honest C-L2 registry MISS in the audit trail (see module doc — cd4c-gtk-probe was never meant to be registered) — audit:\n{audit}"
     );
     assert!(
-        audit.contains("\"locate_outcome\":\"located\"") || audit.contains("\"locate_outcome\": \"located\""),
+        audit.contains("\"locate_outcome\":\"located\"")
+            || audit.contains("\"locate_outcome\": \"located\""),
         "step 2 must show a real C-L3 AT-SPI locate hit in the audit trail — audit:\n{audit}"
     );
 }

@@ -161,10 +161,7 @@ fn parse_failure_line(line: &str) -> Option<ChannelFailure> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let reason = v
-        .get("reason")
-        .and_then(|r| r.as_str())
-        .map(str::to_string);
+    let reason = v.get("reason").and_then(|r| r.as_str()).map(str::to_string);
     Some(ChannelFailure {
         channel: channel.to_string(),
         event: event.to_string(),
@@ -228,7 +225,10 @@ fn counts_in_window(
 /// Most recent failure record for `channel` within `failures` (used to pull
 /// an `agent` hint / `reason` for the alert — best-effort context, never a
 /// gate).
-fn latest_for_channel<'a>(failures: &'a [ChannelFailure], channel: &str) -> Option<&'a ChannelFailure> {
+fn latest_for_channel<'a>(
+    failures: &'a [ChannelFailure],
+    channel: &str,
+) -> Option<&'a ChannelFailure> {
     failures
         .iter()
         .filter(|f| f.channel == channel)
@@ -240,7 +240,8 @@ fn latest_for_channel<'a>(failures: &'a [ChannelFailure], channel: &str) -> Opti
 /// degrade silently to no link when the dashboard base URL isn't
 /// resolvable" convention.
 fn alert_body(channel_label: &str, count: usize, link: Option<&str>) -> String {
-    let mut body = format!("⚠️ {channel_label} 可以連上，但送不出訊息（10 分鐘內失敗 {count} 次）。");
+    let mut body =
+        format!("⚠️ {channel_label} 可以連上，但送不出訊息（10 分鐘內失敗 {count} 次）。");
     if let Some(url) = link {
         body.push_str(&format!("\n👉 {url}"));
     }
@@ -307,11 +308,14 @@ async fn deliver_alert(
     let http = reqwest::Client::new();
     let agent_id = agent_hint.unwrap_or("");
     for (channel, chat_id) in targets {
-        let Some(token) = crate::goal_notify::channel_token(home_dir, agent_id, &channel).await else {
+        let Some(token) = crate::goal_notify::channel_token(home_dir, agent_id, &channel).await
+        else {
             debug!(%channel, "channel-alert: no bot token for candidate destination; trying next");
             continue;
         };
-        if crate::goal_notify::send_plain_text(home_dir, &http, &channel, &token, &chat_id, body).await {
+        if crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, body)
+            .await
+        {
             return Some(channel);
         }
     }
@@ -402,10 +406,17 @@ impl ChannelAlertMonitor {
     /// `gvu::stagnation::StagnationMonitor::maybe_alert`, which does not
     /// retry a `SendFailed` push either).
     async fn raise_alert(&self, channel: &str, count: usize, failures: &[ChannelFailure]) {
-        warn!(channel, count, "channel-alert: send failures crossed threshold");
+        warn!(
+            channel,
+            count, "channel-alert: send failures crossed threshold"
+        );
 
         let latest = latest_for_channel(failures, channel);
-        let link = crate::deep_link::deep_link(&self.home_dir, crate::deep_link::DeepLinkKind::Channels, "");
+        let link = crate::deep_link::deep_link(
+            &self.home_dir,
+            crate::deep_link::DeepLinkKind::Channels,
+            "",
+        );
         let body = alert_body(channel_label(channel), count, link.as_deref());
         let agent_hint = latest.and_then(|f| f.agent.as_deref());
 
@@ -427,8 +438,13 @@ impl ChannelAlertMonitor {
             );
         }
 
-        self.post_activity(channel, count, delivered.as_deref(), latest.and_then(|f| f.reason.as_deref()))
-            .await;
+        self.post_activity(
+            channel,
+            count,
+            delivered.as_deref(),
+            latest.and_then(|f| f.reason.as_deref()),
+        )
+        .await;
     }
 
     /// Record that a channel stopped failing: one `channel_recovered` row in
@@ -482,7 +498,13 @@ impl ChannelAlertMonitor {
     /// Best-effort Activity Feed append (telemetry, never control flow — a
     /// store-open/write failure is logged and swallowed, mirroring every
     /// other notify module in this crate).
-    async fn post_activity(&self, channel: &str, count: usize, delivered_to: Option<&str>, reason: Option<&str>) {
+    async fn post_activity(
+        &self,
+        channel: &str,
+        count: usize,
+        delivered_to: Option<&str>,
+        reason: Option<&str>,
+    ) {
         let store = match TaskStore::open(&self.home_dir) {
             Ok(s) => s,
             Err(e) => {
@@ -560,7 +582,8 @@ mod tests {
 
     #[test]
     fn rejects_records_without_a_channel_field() {
-        let line = r#"{"event":"telegram_send_failed","agent":"a","timestamp":"2026-08-11T10:00:00Z"}"#;
+        let line =
+            r#"{"event":"telegram_send_failed","agent":"a","timestamp":"2026-08-11T10:00:00Z"}"#;
         assert_eq!(parse_failure_line(line), None);
     }
 
@@ -645,12 +668,19 @@ mod tests {
     #[test]
     fn alert_body_matches_the_expected_shape() {
         let body = alert_body("Telegram", 3, None);
-        assert_eq!(body, "⚠️ Telegram 可以連上，但送不出訊息（10 分鐘內失敗 3 次）。");
+        assert_eq!(
+            body,
+            "⚠️ Telegram 可以連上，但送不出訊息（10 分鐘內失敗 3 次）。"
+        );
     }
 
     #[test]
     fn alert_body_appends_link_when_resolvable() {
-        let body = alert_body("Telegram", 5, Some("http://localhost:18789/manage/channels"));
+        let body = alert_body(
+            "Telegram",
+            5,
+            Some("http://localhost:18789/manage/channels"),
+        );
         assert!(body.contains("👉 http://localhost:18789/manage/channels"));
         assert!(body.starts_with("⚠️ Telegram"));
     }
@@ -775,7 +805,10 @@ mod tests {
             .list_activity(None, Some("channel_send_failure_alert"), 10, 0)
             .await
             .unwrap();
-        assert_eq!(total, 1, "exactly one Activity Feed row across two ticks of the same streak: {rows:?}");
+        assert_eq!(
+            total, 1,
+            "exactly one Activity Feed row across two ticks of the same streak: {rows:?}"
+        );
     }
 
     #[tokio::test]
@@ -827,7 +860,10 @@ mod tests {
             .list_activity(None, Some("channel_send_failure_alert"), 10, 0)
             .await
             .unwrap();
-        assert_eq!(total, 2, "one row for the first streak, one for the relapse");
+        assert_eq!(
+            total, 2,
+            "one row for the first streak, one for the relapse"
+        );
     }
 
     #[tokio::test]
@@ -848,7 +884,10 @@ mod tests {
         // Age the failures out of the window ⇒ recovery.
         write_failures(
             dir.path(),
-            &[failure_line("telegram", now - chrono::Duration::minutes(30))],
+            &[failure_line(
+                "telegram",
+                now - chrono::Duration::minutes(30),
+            )],
         );
         let _ = monitor.tick().await;
 
@@ -883,7 +922,10 @@ mod tests {
         write_failures(dir.path(), &[failure_line("telegram", now)]);
         let monitor = ChannelAlertMonitor::new(dir.path().to_path_buf());
         let _ = monitor.tick().await;
-        write_failures(dir.path(), &[failure_line("telegram", now - chrono::Duration::hours(1))]);
+        write_failures(
+            dir.path(),
+            &[failure_line("telegram", now - chrono::Duration::hours(1))],
+        );
         let _ = monitor.tick().await;
 
         let body = std::fs::read_to_string(dir.path().join("channel_failures.jsonl")).unwrap();

@@ -147,7 +147,11 @@ pub fn channel_editable(channel: &str) -> bool {
 /// `(channel, channel_user_id)`, for attribution in [`result_line`]. `None`
 /// when `users.db` does not exist, the channel identity is unverified/
 /// unmapped, or the mapped user has no display name — never fabricated.
-pub fn resolve_decider_name(home_dir: &Path, channel: &str, channel_user_id: &str) -> Option<String> {
+pub fn resolve_decider_name(
+    home_dir: &Path,
+    channel: &str,
+    channel_user_id: &str,
+) -> Option<String> {
     let path = home_dir.join("users.db");
     if !path.exists() {
         return None;
@@ -210,12 +214,10 @@ pub(crate) async fn edit_channel_message(
                 // the field, leaving the spent buttons clickable.
                 "reply_markup": { "inline_keyboard": [] },
             });
-            let resp = http
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| crate::secret_redact::redact_secrets(&e.to_string()).into_owned())?;
+            let resp =
+                http.post(&url).json(&body).send().await.map_err(|e| {
+                    crate::secret_redact::redact_secrets(&e.to_string()).into_owned()
+                })?;
             if !resp.status().is_success() {
                 return Err(format!("telegram editMessageText HTTP {}", resp.status()));
             }
@@ -243,13 +245,17 @@ pub(crate) async fn edit_channel_message(
             if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
                 return Err(format!(
                     "slack chat.update: {}",
-                    data.get("error").and_then(|v| v.as_str()).unwrap_or("unknown")
+                    data.get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
                 ));
             }
             Ok(())
         }
         "discord" => {
-            let url = format!("https://discord.com/api/v10/channels/{edit_chat_id}/messages/{message_id}");
+            let url = format!(
+                "https://discord.com/api/v10/channels/{edit_chat_id}/messages/{message_id}"
+            );
             let body = json!({ "content": text, "components": [] });
             let resp = http
                 .patch(&url)
@@ -347,7 +353,8 @@ pub(crate) async fn collapse_all<F, Fut>(
         return;
     };
     let line = result_line(verb, decider);
-    let _ = crate::goal_notify::send_plain_text(home_dir, http, channel, &token, chat_id, &line).await;
+    let _ =
+        crate::channel_sender::send_plain_text(home_dir, http, channel, &token, chat_id, &line).await;
 }
 
 #[cfg(test)]
@@ -356,9 +363,18 @@ mod tests {
 
     #[test]
     fn from_goal_decision_maps_known_and_rejects_unknown() {
-        assert_eq!(DecisionVerb::from_goal_decision("retry"), Some(DecisionVerb::Retried));
-        assert_eq!(DecisionVerb::from_goal_decision("done"), Some(DecisionVerb::MarkedDone));
-        assert_eq!(DecisionVerb::from_goal_decision("abort"), Some(DecisionVerb::Abandoned));
+        assert_eq!(
+            DecisionVerb::from_goal_decision("retry"),
+            Some(DecisionVerb::Retried)
+        );
+        assert_eq!(
+            DecisionVerb::from_goal_decision("done"),
+            Some(DecisionVerb::MarkedDone)
+        );
+        assert_eq!(
+            DecisionVerb::from_goal_decision("abort"),
+            Some(DecisionVerb::Abandoned)
+        );
         assert_eq!(DecisionVerb::from_goal_decision("garbage"), None);
     }
 
@@ -405,7 +421,11 @@ mod tests {
 
     #[test]
     fn collapse_body_joins_summary_and_result() {
-        let body = collapse_body("🐾 目標任務：整理客戶月報", DecisionVerb::MarkedDone, Some("Alice"));
+        let body = collapse_body(
+            "🐾 目標任務：整理客戶月報",
+            DecisionVerb::MarkedDone,
+            Some("Alice"),
+        );
         let lines: Vec<&str> = body.split("\n\n").collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "🐾 目標任務：整理客戶月報");
@@ -468,7 +488,10 @@ mod tests {
             "g1",
             "telegram",
             "555",
-            &PushedMessage { edit_chat_id: "555".into(), message_id: "m1".into() },
+            &PushedMessage {
+                edit_chat_id: "555".into(),
+                message_id: "m1".into(),
+            },
         );
         collapse_all(
             dir.path(),

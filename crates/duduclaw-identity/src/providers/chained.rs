@@ -318,4 +318,138 @@ mod tests {
         let chained = ChainedProvider::new(cache, upstream);
         assert_eq!(chained.name(), "chained");
     }
+
+    // ── G5 (2026-09 feature audit) ──────────────────────────────────────────
+    // Three properties the module doc promises but nothing pinned down before
+    // `ChainedProvider` reached the live resolve paths (channel `<sender>`
+    // block + `identity_resolve` MCP tool).
+
+    /// Counting variant of [`FakeProvider`]: proves a call did NOT happen,
+    /// which `cache_hit_short_circuits_upstream` could only imply indirectly
+    /// (by having the upstream error).
+    struct CountingProvider {
+        inner: FakeProvider,
+        calls: Mutex<usize>,
+    }
+
+    impl CountingProvider {
+        fn new(name: &str) -> Self {
+            Self {
+                inner: FakeProvider::new(name),
+                calls: Mutex::new(0),
+            }
+        }
+        fn with_person(self, p: ResolvedPerson) -> Self {
+            Self {
+                inner: self.inner.with_person(p),
+                calls: self.calls,
+            }
+        }
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl IdentityProvider for CountingProvider {
+        async fn resolve_by_channel(
+            &self,
+            channel: ChannelKind,
+            external_id: &str,
+        ) -> Result<Option<ResolvedPerson>, IdentityError> {
+            *self.calls.lock().unwrap() += 1;
+            self.inner.resolve_by_channel(channel, external_id).await
+        }
+
+        async fn lookup_project_members(
+            &self,
+            project_id: &str,
+        ) -> Result<Vec<ResolvedPerson>, IdentityError> {
+            *self.calls.lock().unwrap() += 1;
+            self.inner.lookup_project_members(project_id).await
+        }
+
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_hit_never_touches_the_upstream_at_all() {
+        // Stronger than `cache_hit_short_circuits_upstream`: the upstream is
+        // not merely tolerant of being skipped, it is never called. This is
+        // what keeps a Notion round-trip off every single channel turn.
+        let cache = Arc::new(FakeProvider::new("cache").with_person(ruby()));
+        let upstream = Arc::new(CountingProvider::new("upstream").with_person(ruby()));
+        let chained = ChainedProvider::new(cache, upstream.clone());
+        let resolved = chained
+            .resolve_by_channel(ChannelKind::Discord, "1234567890")
+            .await
+            .unwrap()
+            .expect("cache should hit");
+        assert_eq!(resolved.person_id, "person_2f9");
+        assert_eq!(upstream.calls(), 0, "a cache hit must not call upstream");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_upstream_error_kind_degrades_to_no_resolve() {
+        // The degradation contract must not depend on WHICH error the upstream
+        // produced — a malformed Notion payload has to be as survivable as a
+        // 503, because `build_sender_block` turns `Ok(None)` into "unknown
+        // sender" and an `Err` into a logged warning it cannot act on.
+        for err in [
+            IdentityError::unreachable("notion", "503"),
+            IdentityError::Malformed {
+                provider: "notion".into(),
+                reason: "unexpected property type".into(),
+            },
+            IdentityError::Unsupported {
+                provider: "notion".into(),
+                operation: "resolve_by_channel".into(),
+            },
+            IdentityError::Internal {
+                provider: "notion".into(),
+                reason: "panic in worker".into(),
+            },
+        ] {
+            let cache = Arc::new(FakeProvider::new("cache"));
+            let upstream = Arc::new(FakeProvider::new("upstream").fail_with(err));
+            let chained = ChainedProvider::new(cache, upstream);
+            let resolved = chained
+                .resolve_by_channel(ChannelKind::Discord, "1234567890")
+                .await;
+            assert!(
+                matches!(resolved, Ok(None)),
+                "upstream failure must degrade to Ok(None), got {resolved:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_upstream_hit_is_not_written_back_into_the_cache() {
+        // Documents the deliberate no-write-back semantics stated in this
+        // module's header: `ChainedProvider` is a read path only, so the same
+        // external id resolved twice hits the upstream twice. Write-back, if
+        // it is ever wanted, belongs to a sync process (or the upstream
+        // provider itself) — not to this combinator, which has no write
+        // surface on `IdentityProvider` to use.
+        let cache = Arc::new(CountingProvider::new("cache")); // empty
+        let upstream = Arc::new(CountingProvider::new("upstream").with_person(ruby()));
+        let chained = ChainedProvider::new(cache.clone(), upstream.clone());
+
+        for _ in 0..2 {
+            let resolved = chained
+                .resolve_by_channel(ChannelKind::Discord, "1234567890")
+                .await
+                .unwrap()
+                .expect("upstream should hit");
+            assert_eq!(resolved.person_id, "person_2f9");
+        }
+        assert_eq!(cache.calls(), 2, "cache is consulted on every resolve");
+        assert_eq!(
+            upstream.calls(),
+            2,
+            "no write-back: the second resolve still reaches upstream"
+        );
+    }
 }

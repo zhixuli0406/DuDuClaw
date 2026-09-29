@@ -256,7 +256,11 @@ exit 0
         // `suite` field was overwritten with the captured argv dump for
         // this test only — assert the flags/values landed on argv.
         assert!(report.suite.contains("--replay"), "argv: {}", report.suite);
-        assert!(report.suite.contains("--no-judge"), "argv: {}", report.suite);
+        assert!(
+            report.suite.contains("--no-judge"),
+            "argv: {}",
+            report.suite
+        );
         assert!(report.suite.contains("--case"), "argv: {}", report.suite);
         assert!(report.suite.contains("a,b"), "argv: {}", report.suite);
         assert!(report.suite.contains("p0-ceo"), "argv: {}", report.suite);
@@ -277,7 +281,10 @@ exit 0
             err.to_string().contains("produced no report"),
             "unexpected error: {err}"
         );
-        assert!(err.to_string().contains("boom"), "stderr tail should surface: {err}");
+        assert!(
+            err.to_string().contains("boom"),
+            "stderr tail should surface: {err}"
+        );
     }
 
     #[cfg(unix)]
@@ -300,7 +307,10 @@ exit 1
         let runner = EvalRunner::new(bin, dir.path().to_path_buf());
 
         let err = runner.run_replay("p0-ceo", None).await.unwrap_err();
-        assert!(err.to_string().contains("cannot parse eval report"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("cannot parse eval report"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -311,7 +321,10 @@ exit 1
             dir.path().to_path_buf(),
         );
         let err = runner.run_replay("p0-ceo", None).await.unwrap_err();
-        assert!(err.to_string().contains("spawn duduclaw eval failed"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("spawn duduclaw eval failed"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(unix)]
@@ -323,6 +336,9 @@ exit 1
         let runner =
             EvalRunner::new(bin, dir.path().to_path_buf()).with_timeout(Duration::from_millis(50));
         let err = runner.run_replay("p0-ceo", None).await.unwrap_err();
-        assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
     }
 }

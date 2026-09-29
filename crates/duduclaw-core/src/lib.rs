@@ -3,10 +3,17 @@ pub mod agent_rename;
 pub mod agent_toml;
 pub mod appliance;
 pub mod autostart;
+// S15 (2026-09-29): OS-only. Only DuDuClaw OS ships `compat.d` and the shell
+// that launches its runners, so the platform binary leaves this out. Turned on
+// by `duduclaw-cli`'s `app-compat` feature, which the OS recipe passes.
+#[cfg(feature = "app-compat")]
 pub mod compat_runners;
 pub mod concurrency_gate;
 pub mod config;
 pub mod cron_tz;
+// H10 (2026-09 feature audit): the RFC-23 §14.4 data-file guard's decision
+// half, shared by `duduclaw hook data-file-guard` and the gateway installer.
+pub mod data_file_guard;
 pub mod data_migrations;
 pub mod delegation_policy;
 pub mod department;
@@ -22,8 +29,10 @@ pub mod mcp_scopes;
 pub mod org;
 pub mod org_field_guard;
 pub mod org_store;
+pub mod pack;
 pub mod platform;
 pub mod preset;
+pub mod protected_section;
 pub mod provider_env;
 pub mod relay_protocol;
 pub mod runtime_catalog;
@@ -32,6 +41,8 @@ pub mod sensitivity;
 pub mod spawn_admission;
 pub mod spawn_env;
 pub mod takeover_state;
+pub mod task_packet;
+pub mod team_gate;
 pub mod text_utils;
 pub mod tool_catalog;
 pub mod toml_merge;
@@ -69,6 +80,7 @@ pub use department::{
 };
 pub use dispatch_guard::{
     check_and_record as dispatch_guard_check, DispatchGuardConfig, DispatchGuardDecision,
+    DEFAULT_ROLE_TEAM_MAX_IN_WINDOW, PATH_KIND_ROLE_TEAM,
 };
 pub use error::{DuDuClawError, Result};
 pub use fs_lock::with_file_lock;
@@ -88,8 +100,8 @@ pub use match_utils::{is_valid_discord_snowflake, is_valid_egress_host, origin_h
 pub use org_field_guard::{
     check_bash_protected_write, check_caller_scope, check_identity_surface_write,
     check_own_soul_write, check_protected_toml_write, classify_identity_surface,
-    classify_protected_toml, HookCaller, ProtectedSurface, ProtectedTomlKind, AGENT_ORG_FIELDS,
-    CONFIG_PROTECTED_SECTIONS,
+    classify_protected_toml, HookCaller, ProtectedSurface, ProtectedTomlKind,
+    AGENT_CAPABILITY_SECTION, AGENT_ORG_FIELDS, CONFIG_PROTECTED_SECTIONS,
 };
 pub use org_store::{
     OrgDrift, OrgEntry, OrgStore, OrgSyncChange, ORG_SEEDED_FILE, ORG_STORE_FILE, ORG_STORE_SCHEMA,
@@ -100,13 +112,18 @@ pub use provider_env::{
 };
 pub use secaudit_config::SecauditConfig;
 pub use sensitivity::{is_private_session, perception_source_sensitivity, Sensitivity};
+// `try_admit_role_member` is `#[deprecated]` (no production caller, superseded
+// by `ephemeral::admit_role_member`); re-exported so the deprecation is visible
+// at the workspace-facing name too, hence the allow on the whole tree.
+#[allow(deprecated)]
 pub use spawn_admission::{
     clamp_min_one as spawn_admission_clamp_min_one, dequeue_next as spawn_admission_dequeue_next,
     enqueue as spawn_admission_enqueue, invalidate_owner as spawn_admission_invalidate_owner,
     queue_depth as spawn_admission_queue_depth, sweep_expired as spawn_admission_sweep_expired,
+    role_team_capacity_check, try_admit_role_member,
     AdmissionConfig as SpawnAdmissionConfig, AdmissionMode as SpawnAdmissionMode,
     DequeueResult as SpawnDequeueResult, EnqueueOutcome as SpawnEnqueueOutcome,
-    QueuedSpawn,
+    QueuedSpawn, RoleMemberAdmission, ROLE_TEAM_ADMISSION_CLASS,
 };
 pub use spawn_env::{
     agent_cli_spawn_env_pairs, agent_cli_spawn_env_pairs_for, apply_agent_cli_env_allowlist,
@@ -254,11 +271,13 @@ pub const ENV_TRUST_SESSION_ID: &str = "DUDUCLAW_SESSION_ID";
 /// Written by the gateway at each Claude-CLI spawn site, but ONLY when
 /// redaction is actually active for that spawn
 /// (`redaction_proxy::data_file_guard_env_for_spawn`); read by the
-/// `data-file-guard.sh` PreToolUse hook installed in each agent's
-/// `.claude/hooks/`. Absent ⇒ the hook exits 0 immediately, which is the
-/// pre-§14.4 behavior. Named here rather than as a literal in two crates
-/// because the writer (gateway) and the reader (the shell script, plus
-/// `spawn_env`'s allowlist in this crate) must never drift apart.
+/// `duduclaw hook data-file-guard` PreToolUse hook registered in each agent's
+/// `.claude/settings.json` (a Rust subcommand since H10 — it was a shell
+/// script, which silently did nothing on Windows). Absent ⇒ the hook exits 0
+/// immediately, which is the pre-§14.4 behavior. Named here rather than as a
+/// literal in two crates because the writer (gateway) and the readers
+/// ([`crate::data_file_guard`] plus `spawn_env`'s allowlist in this crate)
+/// must never drift apart.
 pub const ENV_DATA_FILE_GUARD: &str = "DUDUCLAW_DATA_FILE_GUARD";
 
 /// `working_state` key used for the agent-body update vertical slice's
@@ -1322,3 +1341,13 @@ mod mcp_forward_env_tests {
         );
     }
 }
+
+// P1/WP-3 (effort plumbing): per-call reasoning effort — appended last to keep
+// this module list conflict-free with concurrent edits above.
+pub mod effort;
+
+// Team-as-Agent P2: the static role→model capability matrix persisted as
+// `role_model_matrix.toml` (written by `duduclaw eval --matrix`, read by the
+// team composer in P5). Appended last to stay conflict-free with the module
+// list above.
+pub mod role_model_matrix;

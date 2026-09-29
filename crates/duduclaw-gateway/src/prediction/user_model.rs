@@ -24,7 +24,11 @@ pub struct RunningStats {
 
 impl Default for RunningStats {
     fn default() -> Self {
-        Self { count: 0, mean: 0.0, m2: 0.0 }
+        Self {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+        }
     }
 }
 
@@ -88,7 +92,10 @@ impl Default for LanguageStats {
 impl LanguageStats {
     /// Record a detected language from a conversation.
     pub fn update(&mut self, detected_lang: &str) {
-        *self.distribution.entry(detected_lang.to_string()).or_insert(0) += 1;
+        *self
+            .distribution
+            .entry(detected_lang.to_string())
+            .or_insert(0) += 1;
         self.total += 1;
 
         // Recalculate primary language
@@ -141,7 +148,6 @@ pub struct UserModel {
     pub last_updated: DateTime<Utc>,
 
     // ── Proactive need prediction (Phase D) ─────────────────────
-
     /// Predicted next conversation topic (most frequent recent topic).
     #[serde(default)]
     pub predicted_next_topic: Option<String>,
@@ -164,7 +170,6 @@ pub struct UserModel {
     pub proactive_dismissed: u32,
 
     // ── Embedding-based topic tracking (Hardening 2025-Q2) ────
-
     /// Rolling window of conversation embedding vectors with timestamps.
     /// Each entry: (embedding, unix_timestamp_secs).
     /// Used for semantic topic_surprise computation via cosine similarity.
@@ -223,7 +228,8 @@ impl UserModel {
 
     /// Update from conversation metrics extracted after a completed conversation.
     pub fn update_from_metrics(&mut self, metrics: &super::metrics::ConversationMetrics) {
-        self.preferred_response_length.push(metrics.avg_assistant_response_length);
+        self.preferred_response_length
+            .push(metrics.avg_assistant_response_length);
 
         // Follow-up rate: ratio of follow-up messages to total exchanges
         let exchanges = metrics.assistant_message_count.max(1) as f64;
@@ -237,12 +243,17 @@ impl UserModel {
 
         // Update topic distribution with extracted keywords (capped at 200 entries)
         for keyword in &metrics.extracted_topics {
-            *self.topic_distribution.entry(keyword.clone()).or_insert(0.0) += 1.0;
+            *self
+                .topic_distribution
+                .entry(keyword.clone())
+                .or_insert(0.0) += 1.0;
         }
         // Evict lowest-frequency topics when cap exceeded (audit #2: unbounded growth)
         const TOPIC_CAP: usize = 200;
         while self.topic_distribution.len() > TOPIC_CAP {
-            if let Some(min_key) = self.topic_distribution.iter()
+            if let Some(min_key) = self
+                .topic_distribution
+                .iter()
                 .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(k, _)| k.clone())
             {
@@ -266,7 +277,9 @@ impl UserModel {
         // Update historical bigrams for vocabulary_novelty fallback.
         // Uses insertion-order VecDeque for FIFO eviction when cap is reached.
         if !metrics.user_text.is_empty() {
-            let chars: Vec<char> = metrics.user_text.chars()
+            let chars: Vec<char> = metrics
+                .user_text
+                .chars()
                 .filter(|c| !c.is_whitespace())
                 .collect();
             for w in chars.windows(2) {

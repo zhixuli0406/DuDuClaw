@@ -153,6 +153,8 @@ mod tests {
     #[test]
     fn line_guard_matches_only_frame_lines() {
         assert!(line_is_rate_limit_frame(FRAME));
-        assert!(!line_is_rate_limit_frame(r#"{"type":"result","result":"PONG"}"#));
+        assert!(!line_is_rate_limit_frame(
+            r#"{"type":"result","result":"PONG"}"#
+        ));
     }
 }

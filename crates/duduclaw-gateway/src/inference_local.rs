@@ -286,7 +286,12 @@ pub async fn download(id: &str, home_dir: &Path) -> Result<serde_json::Value, St
     let e = entry(id).ok_or_else(|| format!("查無此模型代號：{id}"))?;
     let job_id =
         crate::local_models::install(e.hf_repo, e.file, Vec::new(), e.size_bytes, home_dir).await?;
-    info!(model = e.id, repo = e.hf_repo, job_id, "local model download started");
+    info!(
+        model = e.id,
+        repo = e.hf_repo,
+        job_id,
+        "local model download started"
+    );
     Ok(serde_json::json!({
         "job_id": job_id,
         "id": e.id,
@@ -401,7 +406,10 @@ pub async fn serve(
     write_atomic(&path, &body).await?;
 
     let (restarted, detail) = restart_unit().await;
-    info!(model = model_file, ctx, restarted, "local model service configured");
+    info!(
+        model = model_file,
+        ctx, restarted, "local model service configured"
+    );
     Ok(serde_json::json!({
         "model_file": model_file,
         "model_path": model_path.display().to_string(),
@@ -597,7 +605,12 @@ mod tests {
         for e in CATALOG {
             assert!(safe_model_file(e.file), "{} has an unsafe filename", e.id);
             // `local_models::install` rejects anything else.
-            assert_eq!(e.hf_repo.split('/').count(), 2, "{} repo is not owner/name", e.id);
+            assert_eq!(
+                e.hf_repo.split('/').count(),
+                2,
+                "{} repo is not owner/name",
+                e.id
+            );
             assert!(e.size_bytes > 0, "{} has no size", e.id);
             assert!(!e.recommended_for.is_empty(), "{} has no use case", e.id);
         }
@@ -707,7 +720,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Never downloaded: refuse rather than write an env file pointing
         // at nothing.
-        let err = serve("Qwen3-4B-Q4_K_M.gguf", None, dir.path()).await.unwrap_err();
+        let err = serve("Qwen3-4B-Q4_K_M.gguf", None, dir.path())
+            .await
+            .unwrap_err();
         assert!(err.contains("請先下載"), "{err}");
         assert!(!env_path(dir.path()).exists());
         // Traversal is refused before the existence check.
@@ -741,7 +756,10 @@ mod tests {
         let models = dir.path().join("models");
         std::fs::create_dir_all(&models).unwrap();
         std::fs::write(models.join("a.gguf"), b"gguf").unwrap();
-        assert_eq!(serve("a.gguf", Some(1), dir.path()).await.unwrap()["ctx"], 512);
+        assert_eq!(
+            serve("a.gguf", Some(1), dir.path()).await.unwrap()["ctx"],
+            512
+        );
         assert_eq!(
             serve("a.gguf", Some(9_999_999), dir.path()).await.unwrap()["ctx"],
             131_072

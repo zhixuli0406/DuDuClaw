@@ -72,7 +72,10 @@ fn constant_time_eq_str(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn sha256_hex(input: &str) -> String {
@@ -221,7 +224,10 @@ impl AccessController {
 
             // Hard limit: 15 total failed attempts across all generated codes
             if prev_cumulative >= 15 {
-                warn!(user_id, "Pairing code generation blocked — too many cumulative attempts");
+                warn!(
+                    user_id,
+                    "Pairing code generation blocked — too many cumulative attempts"
+                );
                 return None;
             }
 
@@ -344,9 +350,15 @@ fn load_state(path: &std::path::Path) -> PersistState {
         return state;
     }
     if let Ok(approved) = serde_json::from_str::<Vec<String>>(&data) {
-        return PersistState { approved, pending: HashMap::new() };
+        return PersistState {
+            approved,
+            pending: HashMap::new(),
+        };
     }
-    warn!(?path, "access_control state file is corrupt — starting empty");
+    warn!(
+        ?path,
+        "access_control state file is corrupt — starting empty"
+    );
     PersistState::default()
 }
 
@@ -381,7 +393,8 @@ mod tests {
         let allowed = vec!["user1".to_string()];
         let blocked = vec!["user1".to_string()];
         assert_eq!(
-            ctrl.check_access("user1", Some(&allowed), &blocked, false).await,
+            ctrl.check_access("user1", Some(&allowed), &blocked, false)
+                .await,
             AccessDecision::Blocked
         );
     }
@@ -410,14 +423,20 @@ mod tests {
         let ctrl = AccessController::new();
 
         // Generate code
-        let code = ctrl.generate_pairing_code("user1").await.expect("code should be generated");
+        let code = ctrl
+            .generate_pairing_code("user1")
+            .await
+            .expect("code should be generated");
         assert_eq!(code.len(), 6);
 
         // Verify with wrong code fails
         assert!(!ctrl.verify_pairing_code("user1", "000000").await);
 
         // Re-generate (failed attempts carry over; only success consumes)
-        let code = ctrl.generate_pairing_code("user1").await.expect("code should be generated");
+        let code = ctrl
+            .generate_pairing_code("user1")
+            .await
+            .expect("code should be generated");
 
         // Verify with correct code succeeds
         assert!(ctrl.verify_pairing_code("user1", &code).await);
@@ -462,7 +481,10 @@ mod tests {
             assert!(!ctrl.verify_pairing_code("user1", "000000").await);
         }
         // Old code is locked now; regenerate and verify successfully.
-        let fresh = ctrl.generate_pairing_code("user1").await.expect("regeneration allowed under cumulative cap");
+        let fresh = ctrl
+            .generate_pairing_code("user1")
+            .await
+            .expect("regeneration allowed under cumulative cap");
         assert!(ctrl.verify_pairing_code("user1", &fresh).await);
     }
 
@@ -481,7 +503,8 @@ mod tests {
         // user_id blocked but session approved → still Blocked.
         ctrl.approve_user("telegram:123").await;
         assert_eq!(
-            ctrl.check_access_dual("user1", "telegram:123", None, &blocked, true).await,
+            ctrl.check_access_dual("user1", "telegram:123", None, &blocked, true)
+                .await,
             AccessDecision::Blocked
         );
     }
@@ -491,7 +514,8 @@ mod tests {
         let ctrl = AccessController::new();
         ctrl.approve_user("slack:group:C1").await;
         assert_eq!(
-            ctrl.check_access_dual("U999", "slack:group:C1", None, &[], true).await,
+            ctrl.check_access_dual("U999", "slack:group:C1", None, &[], true)
+                .await,
             AccessDecision::Allowed
         );
     }
@@ -505,7 +529,12 @@ mod tests {
             ctrl.approve_user("user-persist").await;
         }
         let ctrl2 = AccessController::with_persistence(path);
-        assert!(ctrl2.runtime_approved_users().await.contains(&"user-persist".to_string()));
+        assert!(
+            ctrl2
+                .runtime_approved_users()
+                .await
+                .contains(&"user-persist".to_string())
+        );
     }
 
     #[tokio::test]
@@ -516,7 +545,10 @@ mod tests {
         let path = dir.path().join("access_control.json");
 
         let mcp_side = AccessController::with_persistence(path.clone());
-        let code = mcp_side.generate_pairing_code("tg-777").await.expect("generated");
+        let code = mcp_side
+            .generate_pairing_code("tg-777")
+            .await
+            .expect("generated");
 
         let gateway_side = AccessController::with_persistence(path);
         assert!(gateway_side.verify_pairing_code("tg-777", &code).await);

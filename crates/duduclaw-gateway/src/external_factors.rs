@@ -77,7 +77,10 @@ impl ExternalContext {
         if !self.security_events.is_empty() {
             let mut lines = vec!["## Security Events".to_string()];
             for evt in &self.security_events {
-                lines.push(format!("[{}] {}: {}", evt.severity, evt.event_type, evt.summary));
+                lines.push(format!(
+                    "[{}] {}: {}",
+                    evt.severity, evt.event_type, evt.summary
+                ));
             }
             sections.push(lines.join("\n"));
         }
@@ -109,7 +112,10 @@ impl ExternalContext {
             for peer in &self.peer_signals {
                 lines.push(format!(
                     "{} ({}): {} tasks, {:.0}% success",
-                    peer.agent_id, peer.role, peer.tasks_completed, peer.success_rate * 100.0
+                    peer.agent_id,
+                    peer.role,
+                    peer.tasks_completed,
+                    peer.success_rate * 100.0
                 ));
             }
             sections.push(lines.join("\n"));
@@ -192,7 +198,10 @@ pub async fn collect_external_factors(
     }
 
     if ctx.has_content() {
-        info!(agent = agent_id, "External factors collected for reflection");
+        info!(
+            agent = agent_id,
+            "External factors collected for reflection"
+        );
     }
 
     ctx
@@ -241,12 +250,26 @@ async fn collect_user_feedback(home_dir: &Path, agent_id: &str) -> Vec<FeedbackS
                     .is_some_and(|t| t > since.as_str())
         })
         .map(|v| FeedbackSignal {
-            signal_type: v["type"].as_str().unwrap_or("unknown").to_string(),
+            signal_type: feedback_signal_kind(&v).to_string(),
             channel: v["channel"].as_str().unwrap_or("").to_string(),
             detail: v["detail"].as_str().unwrap_or("").to_string(),
             timestamp: v["timestamp"].as_str().unwrap_or("").to_string(),
         })
         .collect()
+}
+
+/// The discriminator of one `feedback.jsonl` row.
+///
+/// `type` is canonical (what [`submit_feedback`] writes). `signal_type` is the
+/// legacy spelling that `skill_lifecycle::gap` and the synthesis trigger used
+/// until 2026-09 — rows written before that fix are still on disk, so both
+/// spellings are accepted here rather than silently degrading to `unknown`
+/// (H2). Same fallback order `handlers.rs`'s Activity-Feed reader already uses.
+pub(crate) fn feedback_signal_kind(v: &serde_json::Value) -> &str {
+    v.get("type")
+        .or_else(|| v.get("signal_type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("unknown")
 }
 
 /// Collect security events from the audit log.
@@ -310,10 +333,18 @@ async fn collect_peer_signals(home_dir: &Path, self_agent_id: &str) -> Vec<PeerS
     let mut peers = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if !path.is_dir() { continue; }
+        if !path.is_dir() {
+            continue;
+        }
 
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        if name == self_agent_id || name.starts_with('_') { continue; }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if name == self_agent_id || name.starts_with('_') {
+            continue;
+        }
 
         let toml_path = path.join("agent.toml");
         if let Ok(content) = tokio::fs::read_to_string(&toml_path).await {
@@ -354,7 +385,11 @@ pub async fn submit_feedback(
 
     tokio::task::spawn_blocking(move || {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = writeln!(f, "{line}");
         }
     })

@@ -104,10 +104,22 @@ pub struct SynthesisTrigger {
 pub struct GapAccumulator {
     /// (agent_id, normalized_topic) → gap record.
     gaps: HashMap<(String, String), GapRecord>,
-    /// Number of gap occurrences required to trigger synthesis.
+    /// Default number of gap occurrences required to trigger synthesis, used
+    /// when the agent has no per-agent override registered.
     synthesis_threshold: u32,
-    /// Cooldown period after successful synthesis (prevent re-triggering same topic).
+    /// Default cooldown period after successful synthesis (prevent
+    /// re-triggering the same topic).
     cooldown_hours: u64,
+    /// H3 (2026-09-29): per-agent `[evolution] skill_synthesis_threshold` /
+    /// `skill_synthesis_cooldown_hours`.
+    ///
+    /// Same shape as `SkillActivationController::agent_max` and for the same
+    /// reason: this accumulator is a process-wide singleton on
+    /// `ChannelContext` while the knobs are per-agent. Callers register the
+    /// agent's configured pair via [`Self::set_agent_limits`]; an agent with
+    /// no entry keeps the constructor defaults, which is the pre-H3 behavior
+    /// byte-for-byte.
+    agent_limits: HashMap<String, (u32, u64)>,
     /// Last successful synthesis time per (agent_id, topic).
     last_synthesis: HashMap<(String, String), DateTime<Utc>>,
     /// Topics currently being synthesized (prevents re-triggering during async synthesis).
@@ -120,9 +132,28 @@ impl GapAccumulator {
             gaps: HashMap::new(),
             synthesis_threshold,
             cooldown_hours,
+            agent_limits: HashMap::new(),
             last_synthesis: HashMap::new(),
             pending: std::collections::HashSet::new(),
         }
+    }
+
+    /// Register this agent's configured synthesis threshold + cooldown.
+    ///
+    /// A `0` threshold is clamped to 1 — "fire after zero observations" is a
+    /// config typo, not an intent. A `0` cooldown is left alone: "no
+    /// cooldown" is a legitimate (if expensive) choice.
+    pub fn set_agent_limits(&mut self, agent_id: &str, threshold: u32, cooldown_hours: u64) {
+        self.agent_limits
+            .insert(agent_id.to_string(), (threshold.max(1), cooldown_hours));
+    }
+
+    /// The effective (threshold, cooldown_hours) pair for one agent.
+    pub fn limits_for(&self, agent_id: &str) -> (u32, u64) {
+        self.agent_limits
+            .get(agent_id)
+            .copied()
+            .unwrap_or((self.synthesis_threshold, self.cooldown_hours))
     }
 
     /// Record a skill gap occurrence. Returns a `SynthesisTrigger` if the
@@ -135,6 +166,7 @@ impl GapAccumulator {
     ) -> Option<SynthesisTrigger> {
         let normalized = normalize_topic(&gap.suggested_name);
         let key = (agent_id.to_string(), normalized.clone());
+        let (threshold, cooldown_hours) = self.limits_for(agent_id);
 
         // Skip if synthesis is already pending for this topic
         if self.pending.contains(&key) {
@@ -145,11 +177,11 @@ impl GapAccumulator {
         // Check cooldown from last successful synthesis
         if let Some(last) = self.last_synthesis.get(&key) {
             let elapsed = Utc::now().signed_duration_since(*last);
-            if elapsed.num_hours() < self.cooldown_hours as i64 {
+            if elapsed.num_hours() < cooldown_hours as i64 {
                 debug!(
                     agent = agent_id,
                     topic = %normalized,
-                    cooldown_remaining_h = self.cooldown_hours as i64 - elapsed.num_hours(),
+                    cooldown_remaining_h = cooldown_hours as i64 - elapsed.num_hours(),
                     "Gap recording skipped — synthesis cooldown active"
                 );
                 return None;
@@ -164,20 +196,22 @@ impl GapAccumulator {
                 e.get_mut().push_evidence(evidence_str, composite_error);
                 e.into_mut()
             }
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(GapRecord::new(normalized.clone(), evidence_str, composite_error))
-            }
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(GapRecord::new(
+                normalized.clone(),
+                evidence_str,
+                composite_error,
+            )),
         };
 
         debug!(
             agent = agent_id,
             topic = %normalized,
             count = record.count,
-            threshold = self.synthesis_threshold,
+            threshold,
             "Gap recorded"
         );
 
-        if record.count >= self.synthesis_threshold {
+        if record.count >= threshold {
             let trigger = SynthesisTrigger {
                 agent_id: agent_id.to_string(),
                 topic: normalized.clone(),
@@ -384,5 +418,52 @@ mod tests {
         let snap = acc.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].2, 2);
+    }
+}
+
+#[cfg(test)]
+mod h3_per_agent_limit_tests {
+    use super::*;
+
+    fn gap(name: &str) -> SkillGap {
+        SkillGap {
+            suggested_name: name.to_string(),
+            suggested_description: format!("Gap for {name}"),
+            evidence: vec!["e".to_string()],
+        }
+    }
+
+    /// Regression (H3, 2026-09-29): `[evolution] skill_synthesis_threshold`
+    /// used to be hard-coded as `GapAccumulator::new(3, 24)` in
+    /// `channel_reply`, so the dashboard's value never took effect. A
+    /// registered threshold of 2 must fire one observation earlier than the
+    /// constructor default of 3.
+    #[test]
+    fn registered_agent_threshold_changes_when_the_trigger_fires() {
+        let mut acc = GapAccumulator::new(3, 24);
+        acc.set_agent_limits("agent-fast", 2, 24);
+        assert_eq!(acc.limits_for("agent-fast"), (2, 24));
+        assert_eq!(acc.limits_for("agent-default"), (3, 24));
+
+        let g = gap("topic-a");
+        assert!(acc.record_gap("agent-fast", &g, 0.5).is_none());
+        assert!(
+            acc.record_gap("agent-fast", &g, 0.6).is_some(),
+            "threshold 2 must fire on the second observation"
+        );
+
+        // The unregistered agent still needs three.
+        let g2 = gap("topic-b");
+        assert!(acc.record_gap("agent-default", &g2, 0.5).is_none());
+        assert!(acc.record_gap("agent-default", &g2, 0.6).is_none());
+        assert!(acc.record_gap("agent-default", &g2, 0.7).is_some());
+    }
+
+    /// A zero threshold would fire on zero evidence — clamped.
+    #[test]
+    fn zero_threshold_is_clamped_to_one() {
+        let mut acc = GapAccumulator::new(3, 24);
+        acc.set_agent_limits("agent-zero", 0, 0);
+        assert_eq!(acc.limits_for("agent-zero"), (1, 0));
     }
 }

@@ -36,13 +36,12 @@
 
 use std::path::Path;
 
-use serde_json::json;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::decision_action::{DecisionAct, DecisionSource};
 use crate::decision_notify::{
-    authorize_press, destination_matches_any, identity_system_active, mapped_role, refusal_text,
-    DecisionCard, PressAuth,
+    DecisionCard, PressAuth, authorize_press, destination_matches_any, identity_system_active,
+    mapped_role, refusal_text,
 };
 use crate::notify_governance::NotifyLevel;
 use crate::task_store::{ActivityRow, TaskRow, TaskStore};
@@ -97,21 +96,27 @@ pub(crate) fn agent_notify_target(home_dir: &Path, agent_id: &str) -> Option<(St
 /// dedicated constructors, ignoring the token) or `decision_notify::
 /// deliver_now` (no button codec exists for any of the four, so it degrades
 /// to the same plain-text path).
-pub(crate) async fn channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> Option<String> {
+pub(crate) async fn channel_token(
+    home_dir: &Path,
+    agent_id: &str,
+    channel: &str,
+) -> Option<String> {
     if crate::channel_sender::sender_self_configures(channel) {
         let marker = crate::channel_sender::self_config_marker_field(channel)?;
-        let present = crate::config_crypto::read_encrypted_config_field(home_dir, "channels", marker)
-            .await
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
+        let present =
+            crate::config_crypto::read_encrypted_config_field(home_dir, "channels", marker)
+                .await
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
         return present.then(String::new);
     }
 
     // WP-H1: the cascade returns `None` for "not configured" — the resolver
     // has no empty-string state left to re-check.
-    if let Some(tok) =
-        crate::config_crypto::resolve_agent_channel_token_via_reports_to(home_dir, agent_id, channel)
-            .await
+    if let Some(tok) = crate::config_crypto::resolve_agent_channel_token_via_reports_to(
+        home_dir, agent_id, channel,
+    )
+    .await
     {
         return Some(tok.expose_owned());
     }
@@ -206,7 +211,7 @@ pub async fn notify_agent_plain(
         return NotifyOutcome::NoTarget;
     };
     let http = reqwest::Client::new();
-    if send_plain_text(home_dir, &http, &channel, &token, &chat_id, text).await {
+    if crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, text).await {
         crate::notify_stats::record_push(home_dir, notify_type, level, None);
         NotifyOutcome::Sent
     } else {
@@ -260,6 +265,9 @@ pub enum GoalProgress {
     /// A work message was enqueued for iteration `iter` of `cap`. `retry` marks
     /// a stall re-dispatch that carried prior feedback.
     Dispatched { iter: u32, cap: u32, retry: bool },
+    /// A team round started. The estimate is the configured progress interval
+    /// times its three required stages, not a measured completion deadline.
+    TeamDispatched { minutes: i64 },
     /// The agent produced a result; the acceptance judge is reviewing it.
     Reviewing,
     /// Iteration `iter`/`cap` failed acceptance; the loop is retrying with the
@@ -380,6 +388,9 @@ fn progress_body(task: &TaskRow, progress: &GoalProgress) -> String {
             let verb = if *retry { "重試" } else { "開始執行" };
             format!("🐾 目標 #{short} {verb}（第 {iter}/{cap} 輪）：{title}")
         }
+        GoalProgress::TeamDispatched { minutes } => {
+            format!("🐾 目標 #{short} 已交給團隊，預計 {minutes} 分鐘回報：{title}")
+        }
         GoalProgress::Reviewing => {
             format!("🔍 目標 #{short} 已產出結果，驗收中…")
         }
@@ -460,7 +471,7 @@ pub async fn notify_goal_progress(
         return NotifyOutcome::NoTarget;
     };
     let http = reqwest::Client::new();
-    if send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await {
+    if crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await {
         NotifyOutcome::Sent
     } else {
         NotifyOutcome::SendFailed
@@ -491,9 +502,7 @@ fn needs_human_body(task: &TaskRow, trajectory: Option<&str>, channel: &str) -> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("(未提供原因)");
-    let trajectory_block = trajectory
-        .map(|t| format!("\n{t}\n"))
-        .unwrap_or_default();
+    let trajectory_block = trajectory.map(|t| format!("\n{t}\n")).unwrap_or_default();
     let choices = if channel == "line" {
         format!("請選擇：重試 / 標記完成。\n{LINE_SECONDARY_ACTIONS_HINT}")
     } else {
@@ -516,8 +525,8 @@ fn needs_human_body(task: &TaskRow, trajectory: Option<&str>, channel: &str) -> 
         // the reason line below can be several sentences of judge/evaluator
         // prose, so this is what a person actually triages on. Unclassified
         // and legacy rows read as 「需要人工確認」 (never a guessed class).
-        pause = crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref())
-            .label_zh(),
+        pause =
+            crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref()).label_zh(),
         reason = duduclaw_core::truncate_chars(reason, 300),
         id = task.id,
     )
@@ -609,7 +618,10 @@ fn build_trajectory_prompt(goal: &str, feedback: Option<&str>, reference: Option
     if let Some(fb) = feedback {
         prompt.push_str(&format!(
             "<judge_feedback>\n{}\n</judge_feedback>\n",
-            crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(fb, TRAJECTORY_FEEDBACK_MAX_CHARS))
+            crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(
+                fb,
+                TRAJECTORY_FEEDBACK_MAX_CHARS
+            ))
         ));
     }
     if let Some(r) = reference {
@@ -638,11 +650,7 @@ const TRAJECTORY_LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// (the crate does not enable tokio's `test-util` feature, so a
 /// `start_paused` virtual-clock test isn't available; a real-but-short
 /// duration keeps the test fast without depending on host auth state).
-async fn with_llm_timeout<F>(
-    task_id: &str,
-    duration: std::time::Duration,
-    fut: F,
-) -> Option<String>
+async fn with_llm_timeout<F>(task_id: &str, duration: std::time::Duration, fut: F) -> Option<String>
 where
     F: std::future::Future<Output = Result<String, String>>,
 {
@@ -731,11 +739,16 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
             return out;
         }
     }
-    let Some(token) = channel_token(home_dir, &task.assigned_to, &channel).await else {
+    // Probe the token before paying for the trajectory LLM call below: a
+    // destination with no reachable bot is `NoTarget`, not a send failure,
+    // and rendering a card for it would be wasted spend.
+    if channel_token(home_dir, &task.assigned_to, &channel)
+        .await
+        .is_none()
+    {
         info!(task = %task.id, %channel, "goal-notify: no bot token; skipping push");
         return NotifyOutcome::NoTarget;
-    };
-    let http = reqwest::Client::new();
+    }
     let trajectory = build_needs_human_trajectory(home_dir, task).await;
     let body = needs_human_body(task, trajectory.as_deref(), &channel);
     // A clickable deep link straight to this task's detail page — the
@@ -743,7 +756,8 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
     // when no dashboard base URL is configured/derivable — the message text
     // then stays exactly as it was before this feature (never
     // emit a dangling/empty link).
-    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
+    let link =
+        crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
     let card = DecisionCard {
         source: DecisionSource::Goal,
         decision_id: &task.id,
@@ -751,9 +765,39 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
         link: link.as_deref(),
         no_button_hint: NEEDS_HUMAN_NO_BUTTON_HINT,
     };
-    match crate::decision_notify::deliver_outcome(home_dir, &http, &channel, &token, &chat_id, &card)
-        .await
-    {
+    push_goal_card(
+        home_dir,
+        &card,
+        &task.assigned_to,
+        channel,
+        chat_id,
+    )
+    .await
+}
+
+/// O5: the shared push, mapped onto this module's three-state outcome.
+///
+/// `attempted == 0` means the token vanished between the pre-render probe and
+/// the send — reported as `NoTarget` for the same reason the probe does: the
+/// goal loop retries a `SendFailed`, and retrying a destination with no bot
+/// would spin.
+async fn push_goal_card(
+    home_dir: &Path,
+    card: &crate::notify_push::NotifyCard<'_>,
+    agent_id: &str,
+    channel: String,
+    chat_id: String,
+) -> NotifyOutcome {
+    let receipt = crate::notify_push::push(
+        home_dir,
+        card,
+        &crate::notify_push::NotifyDest::agent(agent_id, channel, chat_id),
+    )
+    .await;
+    if receipt.attempted == 0 {
+        return NotifyOutcome::NoTarget;
+    }
+    match receipt.outcome {
         crate::decision_notify::DeliverOutcome::Sent => NotifyOutcome::Sent,
         crate::decision_notify::DeliverOutcome::Deferred => NotifyOutcome::Deferred,
         crate::decision_notify::DeliverOutcome::Failed => NotifyOutcome::SendFailed,
@@ -783,8 +827,8 @@ pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &
         // H11: same classification line as the buttoned card — an Observer
         // agent's human never gets to decide, so the one notice they DO get
         // must say what kind of stop this was.
-        pause = crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref())
-            .label_zh(),
+        pause =
+            crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref()).label_zh(),
         reason = duduclaw_core::truncate_chars(reason, 300),
         id = task.id,
     );
@@ -806,7 +850,7 @@ pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &
         return false;
     };
     let http = reqwest::Client::new();
-    send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await
+    crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await
 }
 
 /// Render the zh-TW kickoff approval body. `trajectory` is the optional D2
@@ -814,9 +858,7 @@ pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &
 /// above the "請選擇" line, same placement convention as
 /// [`needs_human_body`].
 fn kickoff_body(summary: &str, trajectory: Option<&str>) -> String {
-    let trajectory_block = trajectory
-        .map(|t| format!("\n{t}\n"))
-        .unwrap_or_default();
+    let trajectory_block = trajectory.map(|t| format!("\n{t}\n")).unwrap_or_default();
     format!(
         "{prefix}\n\
          🚀 自主目標啟動前需要您的核准\n\
@@ -836,7 +878,11 @@ fn kickoff_body(summary: &str, trajectory: Option<&str>) -> String {
 /// authored) text interpolated into an XML-delimited block, so both are
 /// `xml_escape`d; `reference` is `render_grounding_block`'s own
 /// already-safe output and is passed through unescaped.
-fn build_kickoff_trajectory_prompt(goal: &str, criteria: Option<&str>, reference: Option<&str>) -> String {
+fn build_kickoff_trajectory_prompt(
+    goal: &str,
+    criteria: Option<&str>,
+    reference: Option<&str>,
+) -> String {
     let mut prompt = format!(
         "你是自主目標任務的執行預測員。以下是一個尚未開始、正等待人工核准啟動的目標任務。\n\
          請預測「如果人工核准開始執行，接下來最可能發生的 3 個步驟」，用終端使用者看得懂的話，\
@@ -849,7 +895,10 @@ fn build_kickoff_trajectory_prompt(goal: &str, criteria: Option<&str>, reference
     if let Some(c) = criteria {
         prompt.push_str(&format!(
             "<acceptance_criteria>\n{}\n</acceptance_criteria>\n",
-            crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(c, TRAJECTORY_FEEDBACK_MAX_CHARS))
+            crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(
+                c,
+                TRAJECTORY_FEEDBACK_MAX_CHARS
+            ))
         ));
     }
     if let Some(r) = reference {
@@ -941,17 +990,23 @@ pub async fn notify_goal_kickoff(
         info!(agent = %agent_id, "goal-notify: no notify destination for kickoff; skipping");
         return NotifyOutcome::NoTarget;
     };
-    let Some(token) = channel_token(home_dir, agent_id, &channel).await else {
+    // Same pre-render probe as `notify_goal_needs_human`: the kickoff
+    // trajectory below is an LLM call, and a destination with no bot token
+    // must not pay for it.
+    if channel_token(home_dir, agent_id, &channel).await.is_none() {
         return NotifyOutcome::NoTarget;
-    };
+    }
     let trajectory = build_kickoff_trajectory(home_dir, approval_id).await;
     let body = kickoff_body(summary, trajectory.as_deref());
-    let http = reqwest::Client::new();
     // Kickoff is gated through the shared `ApprovalBroker`, so the
     // object the link should land on is the unified inbox, same as
     // `approval_notify`/`install_notify` — not `/tasks/<id>` (the task hasn't
     // started yet and this function only has `approval_id`, not the task row).
-    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Approval, approval_id);
+    let link = crate::deep_link::deep_link(
+        home_dir,
+        crate::deep_link::DeepLinkKind::Approval,
+        approval_id,
+    );
     let card = DecisionCard {
         source: DecisionSource::Kickoff,
         decision_id: approval_id,
@@ -959,221 +1014,7 @@ pub async fn notify_goal_kickoff(
         link: link.as_deref(),
         no_button_hint: "此通道無法顯示按鈕，請至儀表板的待辦決定頁同意或拒絕。",
     };
-    match crate::decision_notify::deliver_outcome(home_dir, &http, &channel, &token, &chat_id, &card)
-        .await
-    {
-        crate::decision_notify::DeliverOutcome::Sent => NotifyOutcome::Sent,
-        crate::decision_notify::DeliverOutcome::Deferred => NotifyOutcome::Deferred,
-        crate::decision_notify::DeliverOutcome::Failed => NotifyOutcome::SendFailed,
-    }
-}
-
-/// Send a message carrying inline buttons on one of the four button-capable
-/// channels. `markup` is the platform-native structure from
-/// [`crate::channel_format::decision_markup`].
-///
-/// `pub(crate)`: also the button sender for `approval_notify` (WP20) and
-/// `install_notify`, which push their own button shapes to the same four
-/// channels — one tested implementation of the Discord DM-open dance / Slack
-/// block shape / LINE push envelope rather than three copies.
-///
-/// Returns the pushed message's identity ([`crate::decision_card::PushedMessage`])
-/// when the platform's response makes one available — `None` on LINE (no
-/// stable editable message id, and LINE cannot edit messages regardless, see
-/// `decision_card`) or when the response body doesn't parse as expected
-/// (never treated as a send failure — capturing the id is a best-effort
-/// extra, not required for delivery). Callers persist it via
-/// `decision_message_store::record_card_message` so a later decide can edit
-/// this exact card in place.
-pub(crate) async fn send_with_markup(
-    http: &reqwest::Client,
-    channel: &str,
-    token: &str,
-    chat_id: &str,
-    text: &str,
-    markup: serde_json::Value,
-) -> Result<Option<crate::decision_card::PushedMessage>, String> {
-    match channel {
-        "telegram" => {
-            let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-            let body = json!({ "chat_id": chat_id, "text": text, "reply_markup": markup });
-            let resp = http
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-                // WP12: reqwest's Display embeds the URL, which carries the bot token.
-                .map_err(|e| crate::secret_redact::redact_secrets(&e.to_string()).into_owned())?;
-            if !resp.status().is_success() {
-                return Err(format!("telegram HTTP {}", resp.status()));
-            }
-            let data: serde_json::Value = resp.json().await.unwrap_or_default();
-            let mid = data.get("result").and_then(|r| r.get("message_id")).and_then(|v| v.as_i64());
-            Ok(mid.map(|m| crate::decision_card::PushedMessage {
-                edit_chat_id: chat_id.to_string(),
-                message_id: m.to_string(),
-            }))
-        }
-        "slack" => {
-            let body = json!({
-                "channel": chat_id,
-                "text": text,
-                "blocks": [
-                    { "type": "section", "text": { "type": "mrkdwn", "text": text } },
-                    markup,
-                ],
-            });
-            let resp = http
-                .post("https://slack.com/api/chat.postMessage")
-                .bearer_auth(token)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                return Err(format!(
-                    "slack chat.postMessage: {}",
-                    data.get("error").and_then(|v| v.as_str()).unwrap_or("unknown")
-                ));
-            }
-            let ts = data.get("ts").and_then(|v| v.as_str()).map(str::to_string);
-            Ok(ts.map(|t| crate::decision_card::PushedMessage {
-                edit_chat_id: chat_id.to_string(),
-                message_id: t,
-            }))
-        }
-        "discord" => {
-            // The linked id is the USER id — open (or reuse) the bot↔user DM
-            // channel first; fall back to treating it as a channel id.
-            let dm_channel = match http
-                .post("https://discord.com/api/v10/users/@me/channels")
-                .header("Authorization", format!("Bot {token}"))
-                .json(&json!({ "recipient_id": chat_id }))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
-                    .unwrap_or_else(|| chat_id.to_string()),
-                _ => chat_id.to_string(),
-            };
-            let url = format!("https://discord.com/api/v10/channels/{dm_channel}/messages");
-            // W1-5: `decision_markup` returns EITHER one action-row object
-            // (every source but goal) or an array of them (goal's
-            // primary+secondary two-row layout, `discord_goal_buttons`) — an
-            // array is already shaped as Discord's `components` list, an
-            // object needs wrapping in one.
-            let components = if markup.is_array() { markup } else { json!([markup]) };
-            let body = json!({ "content": text, "components": components });
-            let resp = http
-                .post(&url)
-                .header("Authorization", format!("Bot {token}"))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("discord HTTP {}", resp.status()));
-            }
-            let data: serde_json::Value = resp.json().await.unwrap_or_default();
-            let mid = data.get("id").and_then(|v| v.as_str()).map(str::to_string);
-            Ok(mid.map(|m| crate::decision_card::PushedMessage {
-                edit_chat_id: dm_channel.clone(),
-                message_id: m,
-            }))
-        }
-        "line" => {
-            let body = json!({
-                "to": chat_id,
-                "messages": [{ "type": "text", "text": text, "quickReply": markup }],
-            });
-            let resp = http
-                .post("https://api.line.me/v2/bot/message/push")
-                .bearer_auth(token)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("line HTTP {}", resp.status()));
-            }
-            // LINE messages are not editable (`channel_editable` excludes it,
-            // so collapse never tries), but the sent message id IS worth
-            // recording: quoting the card in a reply carries
-            // `quotedMessageId`, which is how text-reply decisions (WP1.6)
-            // find their card.
-            let data: serde_json::Value = resp.json().await.unwrap_or_default();
-            let mid = data
-                .get("sentMessages")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .and_then(|m| m.get("id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            Ok(mid.map(|m| crate::decision_card::PushedMessage {
-                edit_chat_id: chat_id.to_string(),
-                message_id: m,
-            }))
-        }
-        other => Err(format!("channel {other} has no button sender")),
-    }
-}
-
-/// Send plain text to a channel via the shared sender factory. Returns whether
-/// delivery succeeded. Best-effort (logs, never panics).
-///
-/// `pub(crate)`: also reused by `skill_gap_digest` (WP2.6 P1) for its daily
-/// recommendation push.
-///
-/// `channel_sender::create_sender`'s generic factory has no branch for
-/// `googlechat`/`teams` (their credentials live in global/home-dir config,
-/// not on a `ChannelTarget`) and falls through to `NullSender`, whose
-/// `send_text` always returns `Ok(())` — a message that was never sent looks
-/// identical to one that was. Dispatch those two through their dedicated
-/// constructors instead, mirroring `handlers.rs::send_channel_test_message`
-/// (the same factory-gap fix, already shipped for the `channels.test`
-/// button). `token` is unused on those two branches — `GoogleChatSender` /
-/// `TeamsSender` resolve their own credentials from `home_dir`.
-pub(crate) async fn send_plain_text(
-    home_dir: &Path,
-    http: &reqwest::Client,
-    channel: &str,
-    token: &str,
-    chat_id: &str,
-    text: &str,
-) -> bool {
-    let sender: Box<dyn crate::channel_sender::ChannelSender> = match channel {
-        "googlechat" => crate::channel_sender::create_googlechat_sender(
-            home_dir.to_path_buf(),
-            chat_id.to_string(),
-            String::new(),
-        ),
-        "teams" => crate::channel_sender::create_teams_sender(
-            home_dir.to_path_buf(),
-            chat_id.to_string(),
-            String::new(),
-        ),
-        _ => {
-            let target = crate::channel_sender::ChannelTarget {
-                channel_type: channel.to_string(),
-                chat_id: chat_id.to_string(),
-                token: token.to_string(),
-                extra_id: None,
-            };
-            crate::channel_sender::create_sender(&target, http.clone())
-        }
-    };
-    match sender.send_text(text).await {
-        Ok(()) => true,
-        Err(e) => {
-            warn!(%channel, error = %e, "goal-notify: plain send failed");
-            false
-        }
-    }
+    push_goal_card(home_dir, &card, agent_id, channel, chat_id).await
 }
 
 /// The destinations a goal decision's card was pushed to — the assigned
@@ -1183,7 +1024,9 @@ pub(crate) async fn send_plain_text(
 /// column, and the `[proactive]` destination changing between push and press
 /// is vanishingly rare. `autopilot_notify` resolves its own the same way.
 fn delivered_targets(home_dir: &Path, agent_id: &str) -> Vec<(String, String)> {
-    agent_notify_target(home_dir, agent_id).into_iter().collect()
+    agent_notify_target(home_dir, agent_id)
+        .into_iter()
+        .collect()
 }
 
 /// Authorize a press against the goal card's delivery destination, or return
@@ -1198,7 +1041,11 @@ fn authorize_goal_press(
     let auth = authorize_press(
         mapped_role(home_dir, channel, channel_user_id),
         identity_system_active(home_dir),
-        destination_matches_any(&delivered_targets(home_dir, agent_id), channel, channel_user_id),
+        destination_matches_any(
+            &delivered_targets(home_dir, agent_id),
+            channel,
+            channel_user_id,
+        ),
     );
     if auth == PressAuth::Allow {
         Ok(())
@@ -1225,7 +1072,14 @@ pub async fn decide_from_channel(
             apply_needs_human(home_dir, channel, channel_user_id, &action.id, action.act).await
         }
         DecisionSource::Kickoff => {
-            apply_kickoff(home_dir, channel, channel_user_id, &action.id, action.approve()).await
+            apply_kickoff(
+                home_dir,
+                channel,
+                channel_user_id,
+                &action.id,
+                action.approve(),
+            )
+            .await
         }
         _ => return None,
     })
@@ -1252,7 +1106,13 @@ pub(crate) async fn apply_needs_human(
     // The same authorization matrix as every other decision source. Until
     // this gate existed, anyone who could see the card could retry, close or
     // abandon someone else's autonomous task.
-    authorize_goal_press(home_dir, &task.assigned_to, channel, channel_user_id, "決定這件事")?;
+    authorize_goal_press(
+        home_dir,
+        &task.assigned_to,
+        channel,
+        channel_user_id,
+        "決定這件事",
+    )?;
 
     // W1-5: "take over" claims the task by hand rather than resolving it out
     // of needs_human — it stays `needs_human` (already outside
@@ -1414,7 +1274,11 @@ pub(crate) async fn apply_needs_human_from_dashboard(
         DecisionAct::Done => "goal_loop.human_decision.done",
         _ => "goal_loop.human_decision.abort",
     };
-    let summary = format!("人工{}目標任務「{}」（來自儀表板）", verb.label(), task.title);
+    let summary = format!(
+        "人工{}目標任務「{}」（來自儀表板）",
+        verb.label(),
+        task.title
+    );
     append_activity(&store, event, &task.assigned_to, Some(task_id), &summary).await;
     spawn_dashboard_collapse(
         home_dir.to_path_buf(),
@@ -1487,8 +1351,12 @@ fn spawn_goal_task_collapse(
             return;
         };
         let http = reqwest::Client::new();
-        let decider = crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
-        let summary = format!("🐾 目標任務：{}", duduclaw_core::truncate_chars(&task_title, 60));
+        let decider =
+            crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
+        let summary = format!(
+            "🐾 目標任務：{}",
+            duduclaw_core::truncate_chars(&task_title, 60)
+        );
         let home = home_dir.clone();
         let agent = agent_id.clone();
         crate::decision_card::collapse_all(
@@ -1531,7 +1399,10 @@ pub(crate) fn spawn_dashboard_collapse(
             return;
         };
         let http = reqwest::Client::new();
-        let summary = format!("🐾 目標任務：{}", duduclaw_core::truncate_chars(&task_title, 60));
+        let summary = format!(
+            "🐾 目標任務：{}",
+            duduclaw_core::truncate_chars(&task_title, 60)
+        );
         let home = home_dir.clone();
         let agent = agent_id.clone();
         crate::decision_card::collapse_all(
@@ -1571,8 +1442,16 @@ pub(crate) async fn apply_kickoff(
     // Read the row BEFORE deciding: the agent it belongs to is what the
     // authorization matrix needs, and a press that turns out to be
     // unauthorized must leave the approval untouched.
-    let record = broker.get(&id).await.ok().flatten();
-    let agent = record.as_ref().map(|r| r.agent_id.clone()).unwrap_or_default();
+    let record = broker
+        .get(&id)
+        .await?
+        .ok_or_else(|| "找不到這筆核可（可能已過期並被清除）".to_string())?;
+    // The wire source is caller-controlled. A kickoff-form press must never
+    // decide a different ApprovalBroker kind through goal delivery authority.
+    if record.action_kind != "goal_kickoff" {
+        return Err("此核可不是自主目標啟動審批。".into());
+    }
+    let agent = record.agent_id.clone();
     if agent.is_empty() {
         return Err("找不到這筆核可（可能已過期並被清除）".into());
     }
@@ -1580,14 +1459,22 @@ pub(crate) async fn apply_kickoff(
 
     let card_verb = crate::decision_notify::settled_verb(
         DecisionSource::Kickoff,
-        if approve { DecisionAct::Approve } else { DecisionAct::Deny },
+        if approve {
+            DecisionAct::Approve
+        } else {
+            DecisionAct::Deny
+        },
     );
     let decided_by = format!("channel:{channel}:{channel_user_id}");
     broker.decide(&id, approve, &decided_by).await?;
 
     // Record on the Activity Feed against the approval's agent, best-effort.
     if let Ok(store) = TaskStore::open(home_dir) {
-        let verb = if approve { "同意啟動" } else { "拒絕啟動" };
+        let verb = if approve {
+            "同意啟動"
+        } else {
+            "拒絕啟動"
+        };
         append_activity(
             &store,
             "goal_loop.kickoff_decision",
@@ -1601,8 +1488,8 @@ pub(crate) async fn apply_kickoff(
     // Best-effort, detached card collapse — see `spawn_goal_task_collapse`'s
     // doc comment for why this is never awaited by the caller.
     let task_id = record
-        .as_ref()
-        .and_then(|r| r.payload.get("task_id"))
+        .payload
+        .get("task_id")
         .and_then(|v| v.as_str())
         .map(str::to_string);
     spawn_kickoff_collapse(
@@ -1640,12 +1527,16 @@ fn spawn_kickoff_collapse(
             return;
         };
         let http = reqwest::Client::new();
-        let decider = crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
+        let decider =
+            crate::decision_card::resolve_decider_name(&home_dir, &channel, &channel_user_id);
         let mut summary = "🚀 自主目標啟動核准".to_string();
         if let Some(tid) = &task_id {
             if let Ok(store) = TaskStore::open(&home_dir) {
                 if let Ok(Some(t)) = store.get_task(tid).await {
-                    summary = format!("🚀 目標啟動核准：{}", duduclaw_core::truncate_chars(&t.title, 60));
+                    summary = format!(
+                        "🚀 目標啟動核准：{}",
+                        duduclaw_core::truncate_chars(&t.title, 60)
+                    );
                 }
             }
         }
@@ -1695,6 +1586,7 @@ async fn append_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn notify_outcome_is_final_only_for_sent_and_no_target() {
@@ -1750,9 +1642,10 @@ mod tests {
         assert_eq!(got.result_summary, None);
         assert_eq!(got.judge_feedback.as_deref(), Some("改用月報格式"));
         let acts = store.list_activity_for_task("g1", 10).await.unwrap();
-        assert!(acts
-            .iter()
-            .any(|a| a.event_type == "goal_loop.human_decision.retry"));
+        assert!(
+            acts.iter()
+                .any(|a| a.event_type == "goal_loop.human_decision.retry")
+        );
 
         // Second decision on an already-resolved task: polite no-op message,
         // no state change (fail-closed WHERE status='needs_human').
@@ -1767,7 +1660,10 @@ mod tests {
         .await
         .unwrap();
         assert!(msg2.contains("已被處理過"));
-        assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "pending");
+        assert_eq!(
+            store.get_task("g1").await.unwrap().unwrap().status,
+            "pending"
+        );
     }
 
     #[tokio::test]
@@ -1793,9 +1689,10 @@ mod tests {
         assert_eq!(got.status, "needs_human", "takeover parks, never resolves");
         assert_eq!(got.claimed_by.as_deref(), Some("dashboard:u9"));
         let acts = store.list_activity_for_task("g2", 10).await.unwrap();
-        assert!(acts
-            .iter()
-            .any(|a| a.event_type == "goal_loop.human_decision.takeover"));
+        assert!(
+            acts.iter()
+                .any(|a| a.event_type == "goal_loop.human_decision.takeover")
+        );
     }
 
     /// I-3a: the dashboard "接著做" action reopens a `done` goal task with a
@@ -1812,17 +1709,24 @@ mod tests {
         t.completed_at = Some("2026-08-01T00:00:00Z".into());
         store.insert_task(&t).await.unwrap();
 
-        let msg = apply_continue_from_dashboard(dir.path(), "dashboard:u1", "g3", "請補寄一份給李總")
-            .await
-            .unwrap();
+        let msg =
+            apply_continue_from_dashboard(dir.path(), "dashboard:u1", "g3", "請補寄一份給李總")
+                .await
+                .unwrap();
         assert!(!msg.is_empty());
         let got = store.get_task("g3").await.unwrap().unwrap();
         assert_eq!(got.status, "pending");
-        assert!(got.judge_feedback.as_deref().unwrap().contains("請補寄一份給李總"));
+        assert!(
+            got.judge_feedback
+                .as_deref()
+                .unwrap()
+                .contains("請補寄一份給李總")
+        );
         let acts = store.list_activity_for_task("g3", 10).await.unwrap();
-        assert!(acts
-            .iter()
-            .any(|a| a.event_type == "goal_loop.human_decision.continue"));
+        assert!(
+            acts.iter()
+                .any(|a| a.event_type == "goal_loop.human_decision.continue")
+        );
     }
 
     /// A second continue press after the task already left the terminal
@@ -1843,7 +1747,10 @@ mod tests {
         let msg2 = apply_continue_from_dashboard(dir.path(), "dashboard:u1", "g4", "再加一句")
             .await
             .unwrap();
-        assert!(msg2.contains("不允許接著做") || msg2.contains("已被他人變更"), "got: {msg2}");
+        assert!(
+            msg2.contains("不允許接著做") || msg2.contains("已被他人變更"),
+            "got: {msg2}"
+        );
         // The second call's message must not have overwritten the first.
         let got = store.get_task("g4").await.unwrap().unwrap();
         assert!(got.judge_feedback.as_deref().unwrap().contains("先這樣"));
@@ -1888,10 +1795,19 @@ mod tests {
         let mut t = mk_task("abcdef0123456789");
         let dispatched = progress_body(
             &t,
-            &GoalProgress::Dispatched { iter: 1, cap: 8, retry: false },
+            &GoalProgress::Dispatched {
+                iter: 1,
+                cap: 8,
+                retry: false,
+            },
         );
         assert!(dispatched.contains("#abcdef01"), "short id (8 chars)");
         assert!(dispatched.contains("第 1/8 輪"));
+        let team = progress_body(&t, &GoalProgress::TeamDispatched { minutes: 30 });
+        assert!(team.contains("已交給團隊，預計 30 分鐘回報"));
+        for internal in ["planner", "executor", "slot", "tier"] {
+            assert!(!team.contains(internal));
+        }
 
         let rejected = {
             t.judge_feedback = Some("缺少營收圖表".into());
@@ -1914,7 +1830,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("agent.toml"),
-            format!("[proactive]\nnotify_channel = \"{channel}\"\nnotify_chat_id = \"{chat_id}\"\n"),
+            format!(
+                "[proactive]\nnotify_channel = \"{channel}\"\nnotify_chat_id = \"{chat_id}\"\n"
+            ),
         )
         .unwrap();
     }
@@ -1938,9 +1856,11 @@ mod tests {
     #[tokio::test]
     async fn decide_from_channel_ignores_non_goal_actions() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(decide_from_channel(dir.path(), "telegram", "u1", "garbage")
-            .await
-            .is_none());
+        assert!(
+            decide_from_channel(dir.path(), "telegram", "u1", "garbage")
+                .await
+                .is_none()
+        );
         assert!(
             decide_from_channel(dir.path(), "telegram", "u1", "duduclaw:install_approve:x")
                 .await
@@ -1964,7 +1884,10 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_ok(), "retry ack: {out:?}");
-        assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "pending");
+        assert_eq!(
+            store.get_task("g1").await.unwrap().unwrap().status,
+            "pending"
+        );
 
         // A second press is a no-op (already left needs_human) — fail-closed.
         let again = decide_from_channel(dir.path(), "telegram", "555", &action)
@@ -1988,7 +1911,10 @@ mod tests {
         .await
         .unwrap();
         assert!(out.is_ok());
-        assert_eq!(store.get_task("g2").await.unwrap().unwrap().status, "cancelled");
+        assert_eq!(
+            store.get_task("g2").await.unwrap().unwrap().status,
+            "cancelled"
+        );
     }
 
     // ── W1-5: take over (D6 Submit/Take over) ───────────────────────────
@@ -1999,7 +1925,8 @@ mod tests {
         seed_notify_target(dir.path(), "alice", "telegram", "555");
         let store = seed_needs_human_task(dir.path(), "g8", "alice").await;
 
-        let action = crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Takeover, "g8");
+        let action =
+            crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Takeover, "g8");
         let out = decide_from_channel(dir.path(), "telegram", "555", &action)
             .await
             .unwrap();
@@ -2020,15 +1947,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed_notify_target(dir.path(), "alice", "telegram", "555");
         let store = seed_needs_human_task(dir.path(), "g9", "alice").await;
-        let action = crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Takeover, "g9");
+        let action =
+            crate::decision_action::encode(DecisionSource::Goal, DecisionAct::Takeover, "g9");
 
         for _ in 0..2 {
             let out = decide_from_channel(dir.path(), "telegram", "555", &action)
                 .await
                 .unwrap();
-            assert!(out.is_ok(), "repeated takeover must stay a no-op success: {out:?}");
+            assert!(
+                out.is_ok(),
+                "repeated takeover must stay a no-op success: {out:?}"
+            );
         }
-        assert_eq!(store.get_task("g9").await.unwrap().unwrap().status, "needs_human");
+        assert_eq!(
+            store.get_task("g9").await.unwrap().unwrap().status,
+            "needs_human"
+        );
     }
 
     #[tokio::test]
@@ -2045,10 +1979,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.is_err(), "an unrelated account must not take over someone else's task: {out:?}");
+        assert!(
+            out.is_err(),
+            "an unrelated account must not take over someone else's task: {out:?}"
+        );
         let t = store.get_task("g10").await.unwrap().unwrap();
         assert_eq!(t.status, "needs_human");
-        assert!(t.claimed_by.is_none(), "a refused press must not claim the task");
+        assert!(
+            t.claimed_by.is_none(),
+            "a refused press must not claim the task"
+        );
     }
 
     #[tokio::test]
@@ -2068,7 +2008,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.is_ok(), "a settled task's takeover press must ack, not error: {out:?}");
+        assert!(
+            out.is_ok(),
+            "a settled task's takeover press must ack, not error: {out:?}"
+        );
         assert!(out.unwrap().contains("已不在待人工決定狀態"));
         assert_eq!(store.get_task("g11").await.unwrap().unwrap().status, "done");
     }
@@ -2104,9 +2047,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.is_err(), "an unrelated account must not decide: {out:?}");
+        assert!(
+            out.is_err(),
+            "an unrelated account must not decide: {out:?}"
+        );
         // Fail-closed: the task is untouched.
-        assert_eq!(store.get_task("g4").await.unwrap().unwrap().status, "needs_human");
+        assert_eq!(
+            store.get_task("g4").await.unwrap().unwrap().status,
+            "needs_human"
+        );
     }
 
     #[tokio::test]
@@ -2126,7 +2075,10 @@ mod tests {
         .await
         .unwrap();
         assert!(out.is_err(), "no destination proof ⇒ must refuse: {out:?}");
-        assert_eq!(store.get_task("g5").await.unwrap().unwrap().status, "needs_human");
+        assert_eq!(
+            store.get_task("g5").await.unwrap().unwrap().status,
+            "needs_human"
+        );
     }
 
     #[tokio::test]
@@ -2140,11 +2092,18 @@ mod tests {
             dir.path(),
             "telegram",
             "999",
-            &crate::decision_action::encode(DecisionSource::Kickoff, DecisionAct::Approve, &approval_id),
+            &crate::decision_action::encode(
+                DecisionSource::Kickoff,
+                DecisionAct::Approve,
+                &approval_id,
+            ),
         )
         .await
         .unwrap();
-        assert!(out.is_err(), "an unrelated account must not start a goal: {out:?}");
+        assert!(
+            out.is_err(),
+            "an unrelated account must not start a goal: {out:?}"
+        );
 
         let broker = crate::approval::ApprovalBroker::open(dir.path()).unwrap();
         let id = crate::approval::ApprovalId::from(approval_id.clone());
@@ -2166,7 +2125,11 @@ mod tests {
             dir.path(),
             "telegram",
             "555",
-            &crate::decision_action::encode(DecisionSource::Kickoff, DecisionAct::Approve, &approval_id),
+            &crate::decision_action::encode(
+                DecisionSource::Kickoff,
+                DecisionAct::Approve,
+                &approval_id,
+            ),
         )
         .await
         .unwrap()
@@ -2175,7 +2138,47 @@ mod tests {
 
         let broker = crate::approval::ApprovalBroker::open(dir.path()).unwrap();
         let id = crate::approval::ApprovalId::from(approval_id);
-        assert_eq!(broker.poll(&id).await.unwrap(), crate::approval::ApprovalStatus::Approved);
+        assert_eq!(
+            broker.poll(&id).await.unwrap(),
+            crate::approval::ApprovalStatus::Approved
+        );
+    }
+
+    #[tokio::test]
+    async fn kickoff_form_cannot_decide_a_synthetic_pilot_review() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_notify_target(dir.path(), "alice", "telegram", "555");
+        let broker = crate::approval::ApprovalBroker::open(dir.path()).unwrap();
+        let id = broker
+            .request(
+                "alice",
+                "support_pilot_review",
+                "Inspect one synthetic run",
+                json!({ "replay_hash": "exact-run" }),
+                3600,
+            )
+            .await
+            .unwrap();
+        let out = decide_from_channel(
+            dir.path(),
+            "telegram",
+            "555",
+            &crate::decision_action::encode(
+                DecisionSource::Kickoff,
+                DecisionAct::Approve,
+                id.as_str(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.is_err(),
+            "a kickoff-form press must reject a foreign approval: {out:?}"
+        );
+        assert_eq!(
+            broker.poll(&id).await.unwrap(),
+            crate::approval::ApprovalStatus::Pending
+        );
     }
 
     #[tokio::test]
@@ -2242,7 +2245,10 @@ mod tests {
         let report = progress_body(&t, &GoalProgress::NoProgressReport { minutes: 37 });
         assert!(report.contains("37 分鐘"), "{report}");
         assert!(report.contains("未回報進度"), "{report}");
-        assert!(report.contains("仍在執行中"), "a report must not read as a failure: {report}");
+        assert!(
+            report.contains("仍在執行中"),
+            "a report must not read as a failure: {report}"
+        );
     }
 
     #[test]
@@ -2274,7 +2280,10 @@ mod tests {
         assert!(body.contains(traj));
         let traj_pos = body.find("若核准，接下來預計").unwrap();
         let choices_pos = body.find("請選擇：重試").unwrap();
-        assert!(traj_pos < choices_pos, "trajectory must render above the choice line (buttons)");
+        assert!(
+            traj_pos < choices_pos,
+            "trajectory must render above the choice line (buttons)"
+        );
     }
 
     #[test]
@@ -2306,15 +2315,16 @@ mod tests {
         // `steps` present but all-blank entries.
         assert_eq!(render_trajectory_reply(r#"{"steps": ["  ", ""]}"#), None);
         // `steps` is not an array.
-        assert_eq!(render_trajectory_reply(r#"{"steps": "not-an-array"}"#), None);
+        assert_eq!(
+            render_trajectory_reply(r#"{"steps": "not-an-array"}"#),
+            None
+        );
     }
 
     #[test]
     fn render_trajectory_reply_caps_step_count_and_length() {
         let long_step = "步".repeat(500);
-        let raw = format!(
-            r#"{{"steps": ["{long_step}", "s2", "s3", "s4 should be dropped"]}}"#
-        );
+        let raw = format!(r#"{{"steps": ["{long_step}", "s2", "s3", "s4 should be dropped"]}}"#);
         let out = render_trajectory_reply(&raw).unwrap();
         // Only 3 steps kept (TRAJECTORY_MAX_STEPS).
         assert!(!out.contains("s4 should be dropped"));
@@ -2375,7 +2385,10 @@ mod tests {
         assert!(body.contains(traj));
         let traj_pos = body.find("若核准，接下來預計").unwrap();
         let choices_pos = body.find("請選擇：開始").unwrap();
-        assert!(traj_pos < choices_pos, "trajectory must render above the approve/deny choice line");
+        assert!(
+            traj_pos < choices_pos,
+            "trajectory must render above the approve/deny choice line"
+        );
     }
 
     /// Build an on-disk `ApprovalBroker` + `TaskStore` pair sharing `dir`, the
@@ -2467,11 +2480,8 @@ mod tests {
 
     #[test]
     fn build_kickoff_trajectory_prompt_passthrough_reference_unescaped() {
-        let prompt = build_kickoff_trajectory_prompt(
-            "g",
-            None,
-            Some("<reference>already safe</reference>"),
-        );
+        let prompt =
+            build_kickoff_trajectory_prompt("g", None, Some("<reference>already safe</reference>"));
         assert!(prompt.contains("<reference>already safe</reference>"));
     }
 
@@ -2504,7 +2514,8 @@ mod tests {
     fn build_trajectory_prompt_passthrough_reference_unescaped() {
         // `reference` is `render_grounding_block`'s own already-safe output
         // (approval.rs, out of scope) — must not be double-escaped here.
-        let prompt = build_trajectory_prompt("g", None, Some("<reference>already safe</reference>"));
+        let prompt =
+            build_trajectory_prompt("g", None, Some("<reference>already safe</reference>"));
         assert!(prompt.contains("<reference>already safe</reference>"));
     }
 
@@ -2529,22 +2540,18 @@ mod tests {
 
     #[tokio::test]
     async fn with_llm_timeout_passes_through_ok_result() {
-        let out = with_llm_timeout(
-            "t1",
-            std::time::Duration::from_secs(5),
-            async { Ok("hello".to_string()) },
-        )
+        let out = with_llm_timeout("t1", std::time::Duration::from_secs(5), async {
+            Ok("hello".to_string())
+        })
         .await;
         assert_eq!(out, Some("hello".to_string()));
     }
 
     #[tokio::test]
     async fn with_llm_timeout_degrades_on_inner_error() {
-        let out = with_llm_timeout(
-            "t1",
-            std::time::Duration::from_secs(5),
-            async { Err("boom".to_string()) },
-        )
+        let out = with_llm_timeout("t1", std::time::Duration::from_secs(5), async {
+            Err("boom".to_string())
+        })
         .await;
         assert_eq!(out, None);
     }
@@ -2580,7 +2587,10 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, NotifyOutcome::Deferred);
-        assert!(outcome.is_final(), "a queued notice must not be retried into a duplicate");
+        assert!(
+            outcome.is_final(),
+            "a queued notice must not be retried into a duplicate"
+        );
 
         // It is in the queue, addressed correctly, and carries its body.
         let queued = crate::notify_governance::take_due(
@@ -2618,11 +2628,13 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, NotifyOutcome::NoTarget);
-        assert!(crate::notify_governance::take_due(
-            dir.path(),
-            chrono::Utc::now() + chrono::Duration::hours(2)
-        )
-        .is_empty());
+        assert!(
+            crate::notify_governance::take_due(
+                dir.path(),
+                chrono::Utc::now() + chrono::Duration::hours(2)
+            )
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2630,8 +2642,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed_notify_target(dir.path(), "kiki", "telegram", "555");
         // No token ⇒ NoTarget, but crucially never Deferred.
-        let outcome =
-            notify_agent_plain(dir.path(), "kiki", NotifyLevel::Fyi, "evolution.consolidate", "x").await;
+        let outcome = notify_agent_plain(
+            dir.path(),
+            "kiki",
+            NotifyLevel::Fyi,
+            "evolution.consolidate",
+            "x",
+        )
+        .await;
         assert_eq!(outcome, NotifyOutcome::NoTarget);
     }
 
@@ -2720,7 +2738,11 @@ mod tests {
             "[channels]\ngooglechat_service_account_json = \"marker-only\"\n",
         )
         .unwrap();
-        assert!(channel_token(dir.path(), "alice", "googlechat").await.is_some());
+        assert!(
+            channel_token(dir.path(), "alice", "googlechat")
+                .await
+                .is_some()
+        );
     }
 
     /// End-to-end through `notify_agent_plain` (same `channel_token` +
@@ -2747,8 +2769,14 @@ mod tests {
         )
         .unwrap();
 
-        let outcome =
-            notify_agent_plain(home, "alice", NotifyLevel::Fyi, "evolution.consolidate", "測試").await;
+        let outcome = notify_agent_plain(
+            home,
+            "alice",
+            NotifyLevel::Fyi,
+            "evolution.consolidate",
+            "測試",
+        )
+        .await;
         assert_eq!(
             outcome,
             NotifyOutcome::SendFailed,
@@ -2771,8 +2799,14 @@ mod tests {
         )
         .unwrap();
 
-        let outcome =
-            notify_agent_plain(home, "bob", NotifyLevel::Fyi, "evolution.consolidate", "測試").await;
+        let outcome = notify_agent_plain(
+            home,
+            "bob",
+            NotifyLevel::Fyi,
+            "evolution.consolidate",
+            "測試",
+        )
+        .await;
         assert_eq!(
             outcome,
             NotifyOutcome::SendFailed,
@@ -2788,8 +2822,14 @@ mod tests {
         let home = dir.path();
         seed_notify_target(home, "alice", "googlechat", "spaces/AAAA");
         // No config.toml at all.
-        let outcome =
-            notify_agent_plain(home, "alice", NotifyLevel::Fyi, "evolution.consolidate", "測試").await;
+        let outcome = notify_agent_plain(
+            home,
+            "alice",
+            NotifyLevel::Fyi,
+            "evolution.consolidate",
+            "測試",
+        )
+        .await;
         assert_eq!(outcome, NotifyOutcome::NoTarget);
     }
 
@@ -2836,7 +2876,11 @@ mod tests {
         let out = notify_goal_progress(
             home,
             &task,
-            GoalProgress::Dispatched { iter: 1, cap: 8, retry: false },
+            GoalProgress::Dispatched {
+                iter: 1,
+                cap: 8,
+                retry: false,
+            },
         )
         .await;
         assert_eq!(out, NotifyOutcome::Deferred);
@@ -2845,9 +2889,10 @@ mod tests {
         let now = chrono::Utc::now();
         assert!(crate::notify_governance::take_due(home, now).is_empty());
         // … and everything is due once the human hands back.
-        let after = now + chrono::Duration::minutes(
-            duduclaw_core::takeover_state::DEFAULT_DURATION_MINUTES + 1,
-        );
+        let after = now
+            + chrono::Duration::minutes(
+                duduclaw_core::takeover_state::DEFAULT_DURATION_MINUTES + 1,
+            );
         let due = crate::notify_governance::take_due(home, after);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].chat_id, "12345");
@@ -2866,11 +2911,13 @@ mod tests {
             notify_goal_progress(home, &task, GoalProgress::Reviewing).await,
             NotifyOutcome::NoTarget
         );
-        assert!(crate::notify_governance::take_due(
-            home,
-            chrono::Utc::now() + chrono::Duration::days(1)
-        )
-        .is_empty());
+        assert!(
+            crate::notify_governance::take_due(
+                home,
+                chrono::Utc::now() + chrono::Duration::days(1)
+            )
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2890,7 +2937,10 @@ mod tests {
         let mut task = goal_task_from("12345");
         task.status = "needs_human".into();
         task.judge_feedback = Some("卡住了".into());
-        assert_eq!(notify_goal_needs_human(home, &task).await, NotifyOutcome::Deferred);
+        assert_eq!(
+            notify_goal_needs_human(home, &task).await,
+            NotifyOutcome::Deferred
+        );
 
         let due = crate::notify_governance::take_due(
             home,

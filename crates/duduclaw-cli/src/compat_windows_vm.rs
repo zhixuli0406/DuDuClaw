@@ -1,16 +1,17 @@
 //! `duduclaw compat windows-vm` — CP-2/B3: self-packaged Windows VM +
 //! RemoteApp bootstrap CLI (design §2.3 路 B). See
 //! `commercial/docs/DESIGN-app-compat-layer-2026-08.md` §2.3/§5 CP-2,
-//! `commercial/docs/TODO-compat-cp2-2026-08.md`'s B3 row, and
-//! `docs/guides/app-compat.md`.
+//! `commercial/docs/TODO-compat-cp2-2026-08.md`'s B3 row, and the
+//! DuDuClaw-OS repo's `docs/guides/app-compat.md` (moved there 2026-09-29
+//! together with the shell crates; this module is OS-only and lives behind
+//! the `app-compat` cargo feature).
 //!
 //! CP-2 wave-2 (2026-08-30) added `app-add`/`app-remove`/`app-list`: a
 //! small operator-maintained registry (`<DUDUCLAW_HOME>/windows-vm/
 //! apps.toml`, see this file's own "RemoteApp registry" section below) so a
 //! pinned Windows executable appears as an ordinary tile in
 //! `duduclaw-shell`'s Launcher — the "一鍵出現在圖形介面的啟動器" integration
-//! `docs/guides/app-compat.md`'s "已知限制" section used to list as future
-//! work.
+//! the app-compat guide's "已知限制" section used to list as future work.
 //!
 //! Wraps `dockur/windows` (a Docker-Compose-driven Windows-in-a-container
 //! VM, <https://github.com/dockur/windows>, image `ghcr.io/dockur/windows`)
@@ -143,7 +144,9 @@ pub fn validate_vm_ram_gb(ram_gb: u64) -> std::result::Result<(), String> {
 /// Hard floor for the VM's own `--disk` (design §2.3: "磁碟 32GB 起").
 pub fn validate_vm_disk_gb(disk_gb: u64) -> std::result::Result<(), String> {
     if disk_gb < VM_DISK_FLOOR_GB {
-        Err(format!("--disk {disk_gb} 低於下限 {VM_DISK_FLOOR_GB}GB（設計文件：磁碟 {VM_DISK_FLOOR_GB}GB 起）。"))
+        Err(format!(
+            "--disk {disk_gb} 低於下限 {VM_DISK_FLOOR_GB}GB（設計文件：磁碟 {VM_DISK_FLOOR_GB}GB 起）。"
+        ))
     } else {
         Ok(())
     }
@@ -481,7 +484,9 @@ pub fn sanitize_exe(exe: &str) -> std::result::Result<String, String> {
     }
     let len = trimmed.chars().count();
     if len > MAX_EXE_LEN {
-        return Err(format!("執行檔路徑過長（{len} 字元，上限 {MAX_EXE_LEN}，即 Windows 的 MAX_PATH）"));
+        return Err(format!(
+            "執行檔路徑過長（{len} 字元，上限 {MAX_EXE_LEN}，即 Windows 的 MAX_PATH）"
+        ));
     }
     Ok(trimmed.to_string())
 }
@@ -498,7 +503,9 @@ pub fn sanitize_display_name(name: &str) -> std::result::Result<String, String> 
     }
     let len = trimmed.chars().count();
     if len > MAX_DISPLAY_NAME_LEN {
-        return Err(format!("顯示名稱過長（{len} 字元，上限 {MAX_DISPLAY_NAME_LEN}）"));
+        return Err(format!(
+            "顯示名稱過長（{len} 字元，上限 {MAX_DISPLAY_NAME_LEN}）"
+        ));
     }
     Ok(trimmed.to_string())
 }
@@ -516,7 +523,9 @@ pub fn read_apps_registry(path: &Path) -> std::result::Result<Vec<RemoteAppEntry
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("讀取 {} 失敗：{e}", path.display())),
     };
-    toml::from_str::<RemoteAppsFile>(&content).map(|f| f.apps).map_err(|e| format!("解析 {}（TOML 格式錯誤）：{e}", path.display()))
+    toml::from_str::<RemoteAppsFile>(&content)
+        .map(|f| f.apps)
+        .map_err(|e| format!("解析 {}（TOML 格式錯誤）：{e}", path.display()))
 }
 
 /// Encodes `value` as a TOML basic (double-quoted) string, ALWAYS — never
@@ -625,8 +634,12 @@ pub async fn cmd_compat_windows_vm_app_add(exe: String, name: String) -> Result<
     let mut entries = read_apps_registry(&path).map_err(DuDuClawError::Config)?;
     let existed = entries.iter().any(|e| e.exe == exe);
     entries.retain(|e| e.exe != exe);
-    entries.push(RemoteAppEntry { name: name.clone(), exe: exe.clone() });
-    write_apps_registry_0644(&path, &entries).map_err(|e| DuDuClawError::Config(format!("寫入 {} 失敗：{e}", path.display())))?;
+    entries.push(RemoteAppEntry {
+        name: name.clone(),
+        exe: exe.clone(),
+    });
+    write_apps_registry_0644(&path, &entries)
+        .map_err(|e| DuDuClawError::Config(format!("寫入 {} 失敗：{e}", path.display())))?;
     if existed {
         println!("✓ 已更新：{exe} → 「{name}」（原有項目的顯示名稱已覆蓋）");
     } else {
@@ -651,7 +664,8 @@ pub async fn cmd_compat_windows_vm_app_remove(exe: String) -> Result<()> {
             "找不到 {exe}——目前啟動器沒有這個項目（用 `duduclaw compat windows-vm app-list` 查看目前清單）。"
         )));
     }
-    write_apps_registry_0644(&path, &entries).map_err(|e| DuDuClawError::Config(format!("寫入 {} 失敗：{e}", path.display())))?;
+    write_apps_registry_0644(&path, &entries)
+        .map_err(|e| DuDuClawError::Config(format!("寫入 {} 失敗：{e}", path.display())))?;
     println!("✓ 已從啟動器移除：{exe}");
     Ok(())
 }
@@ -662,10 +676,16 @@ pub async fn cmd_compat_windows_vm_app_list() -> Result<()> {
     let path = apps_toml_path(&home);
     let entries = read_apps_registry(&path).map_err(DuDuClawError::Config)?;
     if entries.is_empty() {
-        println!("目前沒有釘選任何 Windows 應用程式。用 `duduclaw compat windows-vm app-add <執行檔> --name <顯示名>` 加入一個。");
+        println!(
+            "目前沒有釘選任何 Windows 應用程式。用 `duduclaw compat windows-vm app-add <執行檔> --name <顯示名>` 加入一個。"
+        );
         return Ok(());
     }
-    println!("已釘選 {} 個 Windows 應用程式（{}）：", entries.len(), path.display());
+    println!(
+        "已釘選 {} 個 Windows 應用程式（{}）：",
+        entries.len(),
+        path.display()
+    );
     for entry in &entries {
         println!("  • {} — {}", entry.name, entry.exe);
     }
@@ -782,7 +802,9 @@ pub async fn cmd_compat_windows_vm_setup(
             .read_line(&mut answer)
             .map_err(|e| DuDuClawError::Config(format!("讀取輸入失敗：{e}")))?;
         if answer.trim() != LICENSE_CONFIRM_PHRASE {
-            return Err(DuDuClawError::Config("未確認授權責任揭露，已取消設定。".to_string()));
+            return Err(DuDuClawError::Config(
+                "未確認授權責任揭露，已取消設定。".to_string(),
+            ));
         }
     }
     println!("{}", style("✓ 授權責任揭露已確認").green());
@@ -793,8 +815,12 @@ pub async fn cmd_compat_windows_vm_setup(
     let home = crate::duduclaw_home();
     let vm_dir = windows_vm_dir(&home);
     let storage_dir = vm_dir.join("storage");
-    std::fs::create_dir_all(&storage_dir)
-        .map_err(|e| DuDuClawError::Config(format!("建立資料目錄失敗（{}）：{e}", storage_dir.display())))?;
+    std::fs::create_dir_all(&storage_dir).map_err(|e| {
+        DuDuClawError::Config(format!(
+            "建立資料目錄失敗（{}）：{e}",
+            storage_dir.display()
+        ))
+    })?;
     let compose_file = compose_path(&home);
     let params = WindowsVmComposeParams {
         version: version.clone(),
@@ -804,14 +830,20 @@ pub async fn cmd_compat_windows_vm_setup(
         storage_dir: storage_dir.to_string_lossy().to_string(),
     };
     let compose_yaml = render_windows_vm_compose(&params);
-    write_compose_file_0600(&compose_file, &compose_yaml)
-        .map_err(|e| DuDuClawError::Config(format!("寫入 compose 設定失敗（{}）：{e}", compose_file.display())))?;
+    write_compose_file_0600(&compose_file, &compose_yaml).map_err(|e| {
+        DuDuClawError::Config(format!(
+            "寫入 compose 設定失敗（{}）：{e}",
+            compose_file.display()
+        ))
+    })?;
     println!("✓ 已產生 compose 設定：{}", compose_file.display());
     println!();
 
     // ⑤ Start the container. Errors are relayed verbatim (design/TODO's
     // "錯誤誠實轉述") rather than paraphrased.
-    println!("啟動容器中……（首次啟動會由容器自行下載 Windows 安裝映像，依網路與版本可能需要相當長時間）");
+    println!(
+        "啟動容器中……（首次啟動會由容器自行下載 Windows 安裝映像，依網路與版本可能需要相當長時間）"
+    );
     let output = tokio::process::Command::new("docker")
         .arg("compose")
         .arg("-f")
@@ -841,7 +873,9 @@ pub async fn cmd_compat_windows_vm_setup(
          Windows（VERSION={version}）——這是容器自己觸發的下載，不是 DuDuClaw 內建的映像）。"
     );
     println!("  • `duduclaw compat windows-vm status` 查看容器狀態。");
-    println!("  • 安裝完成後，`duduclaw compat windows-vm app <程式路徑>` 以無縫視窗啟動一個 Windows 應用程式。");
+    println!(
+        "  • 安裝完成後，`duduclaw compat windows-vm app <程式路徑>` 以無縫視窗啟動一個 Windows 應用程式。"
+    );
     println!(
         "  • 初始帳密：{VM_DEFAULT_USERNAME} / {VM_DEFAULT_PASSWORD}（dockur/windows 預設值，建議進 Windows 後自行更改）。"
     );
@@ -896,35 +930,53 @@ pub async fn cmd_compat_windows_vm_status() -> Result<()> {
 /// Requires an X11-capable display — RAIL/RemoteApp is an X11-client
 /// feature of FreeRDP 3 (`xfreerdp3` links against `libX11` in this
 /// image's `PACKAGECONFIG[x11]` build), so it must run inside the kiosk
-/// session's XWayland (see `docs/guides/app-compat.md`'s VM section and
+/// session's XWayland (see the DuDuClaw-OS repo's
+/// `docs/guides/app-compat.md` VM section and
 /// CP-1's own XWayland landing note), the same prerequisite Bottles/Wine
 /// already depends on.
 pub async fn cmd_compat_windows_vm_app(exe: String, display_name: Option<String>) -> Result<()> {
     let home = crate::duduclaw_home();
     let compose_file = compose_path(&home);
     if !compose_file.is_file() {
-        return Err(DuDuClawError::Config("尚未設定 Windows VM——先執行 `duduclaw compat windows-vm setup`。".to_string()));
+        return Err(DuDuClawError::Config(
+            "尚未設定 Windows VM——先執行 `duduclaw compat windows-vm setup`。".to_string(),
+        ));
     }
 
     let binary = resolve_xfreerdp_binary();
-    let args = build_xfreerdp_remoteapp_args(&exe, display_name.as_deref(), "127.0.0.1:3389", VM_DEFAULT_USERNAME);
+    let args = build_xfreerdp_remoteapp_args(
+        &exe,
+        display_name.as_deref(),
+        "127.0.0.1:3389",
+        VM_DEFAULT_USERNAME,
+    );
 
-    println!("以無縫視窗啟動：{exe}（透過 {binary}——需在 X11/XWayland 環境下執行，見 docs/guides/app-compat.md）");
+    println!(
+        "以無縫視窗啟動：{exe}（透過 {binary}——需在 X11/XWayland 環境下執行，見 DuDuClaw-OS 的 docs/guides/app-compat.md）"
+    );
 
     let mut child = tokio::process::Command::new(binary)
         .args(&args)
         .stdin(Stdio::piped())
         .spawn()
-        .map_err(|e| DuDuClawError::Container(format!("啟動 {binary} 失敗：{e}（是否已安裝？見 `duduclaw compat list`）")))?;
+        .map_err(|e| {
+            DuDuClawError::Container(format!(
+                "啟動 {binary} 失敗：{e}（是否已安裝？見 `duduclaw compat list`）"
+            ))
+        })?;
 
     // `/from-stdin:force` reads the RDP password from our stdin pipe —
     // never argv, so it never appears in `ps`/`/proc/<pid>/cmdline`.
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(format!("{VM_DEFAULT_PASSWORD}\n").as_bytes()).await;
+        let _ = stdin
+            .write_all(format!("{VM_DEFAULT_PASSWORD}\n").as_bytes())
+            .await;
     }
 
-    let status =
-        child.wait().await.map_err(|e| DuDuClawError::Container(format!("{binary} 執行錯誤：{e}")))?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| DuDuClawError::Container(format!("{binary} 執行錯誤：{e}")))?;
     if !status.success() {
         return Err(DuDuClawError::Container(format!(
             "{binary} 結束（{status}）——RDP 連線可能失敗，或 Windows VM 尚未完成安裝／尚未啟動。"
@@ -983,7 +1035,10 @@ mod tests {
 
     #[test]
     fn read_host_ram_gb_missing_file_is_none() {
-        assert_eq!(read_host_ram_gb(Path::new("/definitely/does/not/exist/meminfo")), None);
+        assert_eq!(
+            read_host_ram_gb(Path::new("/definitely/does/not/exist/meminfo")),
+            None
+        );
     }
 
     #[test]
@@ -1024,7 +1079,10 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let prev = std::env::var_os(DUDUCLAW_COMPAT_KVM_DEVICE_ENV);
         unsafe { std::env::set_var(DUDUCLAW_COMPAT_KVM_DEVICE_ENV, "/tmp/not-a-real-kvm-device") };
-        assert_eq!(kvm_device_path(), PathBuf::from("/tmp/not-a-real-kvm-device"));
+        assert_eq!(
+            kvm_device_path(),
+            PathBuf::from("/tmp/not-a-real-kvm-device")
+        );
         unsafe {
             match &prev {
                 Some(v) => std::env::set_var(DUDUCLAW_COMPAT_KVM_DEVICE_ENV, v),
@@ -1039,16 +1097,25 @@ mod tests {
     fn license_disclosure_carries_all_three_mandated_elements() {
         let text = LICENSE_DISCLOSURE_ZH_TW;
         // 1. must自備 Windows 11 Pro 以上授權
-        assert!(text.contains("Windows 11 Pro"), "element 1 (Windows 11 Pro+) missing");
+        assert!(
+            text.contains("Windows 11 Pro"),
+            "element 1 (Windows 11 Pro+) missing"
+        );
         assert!(text.contains("自備"), "element 1 (自備) missing");
         // 2. Home 版不支援 RemoteApp 是 WinApps 明文硬要求
         assert!(text.contains("Home"), "element 2 (Home) missing");
         assert!(text.contains("RemoteApp"), "element 2 (RemoteApp) missing");
-        assert!(text.contains("WinApps"), "element 2 (WinApps attribution) missing");
+        assert!(
+            text.contains("WinApps"),
+            "element 2 (WinApps attribution) missing"
+        );
         // 3. OEM 授權通常不含虛擬化權利是 Microsoft 原文
         assert!(text.contains("OEM"), "element 3 (OEM) missing");
         assert!(text.contains("虛擬化"), "element 3 (虛擬化權利) missing");
-        assert!(text.contains("Microsoft"), "element 3 (Microsoft attribution) missing");
+        assert!(
+            text.contains("Microsoft"),
+            "element 3 (Microsoft attribution) missing"
+        );
     }
 
     #[test]
@@ -1115,7 +1182,10 @@ mod tests {
             "127.0.0.1:8006:8006",
             "127.0.0.1:3389:3389/tcp",
         ] {
-            assert!(yaml.contains(needle), "compose YAML missing expected fragment: {needle:?}\n{yaml}");
+            assert!(
+                yaml.contains(needle),
+                "compose YAML missing expected fragment: {needle:?}\n{yaml}"
+            );
         }
         // Never bind to every interface — this is the whole point of the
         // loopback-only departure from upstream's example.
@@ -1151,20 +1221,41 @@ mod tests {
         // the "trims surrounding whitespace" assertion below pins that.
         assert!(sanitize_exe("win\nword.exe").is_err());
         assert!(sanitize_exe("win\rword.exe").is_err());
-        assert_eq!(sanitize_exe("winword.exe\n"), Ok("winword.exe".to_string()), "an edge newline is trimmed, not rejected");
+        assert_eq!(
+            sanitize_exe("winword.exe\n"),
+            Ok("winword.exe".to_string()),
+            "an edge newline is trimmed, not rejected"
+        );
         assert!(sanitize_exe(&"x".repeat(MAX_EXE_LEN + 1)).is_err());
-        assert_eq!(sanitize_exe(&"x".repeat(MAX_EXE_LEN)), Ok("x".repeat(MAX_EXE_LEN)));
-        assert_eq!(sanitize_exe("  winword.exe  "), Ok("winword.exe".to_string()), "trims surrounding whitespace");
-        assert_eq!(sanitize_exe(r"C:\Program Files\Office\winword.exe"), Ok(r"C:\Program Files\Office\winword.exe".to_string()));
+        assert_eq!(
+            sanitize_exe(&"x".repeat(MAX_EXE_LEN)),
+            Ok("x".repeat(MAX_EXE_LEN))
+        );
+        assert_eq!(
+            sanitize_exe("  winword.exe  "),
+            Ok("winword.exe".to_string()),
+            "trims surrounding whitespace"
+        );
+        assert_eq!(
+            sanitize_exe(r"C:\Program Files\Office\winword.exe"),
+            Ok(r"C:\Program Files\Office\winword.exe".to_string())
+        );
     }
 
     #[test]
     fn sanitize_display_name_rejects_empty_cr_lf_and_over_length() {
         assert!(sanitize_display_name("").is_err());
-        assert!(sanitize_display_name("Wo\nrd").is_err(), "embedded LF — see sanitize_exe's test for the edge-vs-embedded contract");
+        assert!(
+            sanitize_display_name("Wo\nrd").is_err(),
+            "embedded LF — see sanitize_exe's test for the edge-vs-embedded contract"
+        );
         assert!(sanitize_display_name(&"字".repeat(MAX_DISPLAY_NAME_LEN + 1)).is_err());
         assert_eq!(sanitize_display_name("  Word  "), Ok("Word".to_string()));
-        assert_eq!(sanitize_display_name("記帳軟體"), Ok("記帳軟體".to_string()), "CJK names are accepted verbatim");
+        assert_eq!(
+            sanitize_display_name("記帳軟體"),
+            Ok("記帳軟體".to_string()),
+            "CJK names are accepted verbatim"
+        );
     }
 
     #[test]
@@ -1179,7 +1270,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("apps.toml");
         std::fs::write(&path, "this is not [ valid toml").unwrap();
-        assert!(read_apps_registry(&path).is_err(), "a broken file must never be indistinguishable from an empty one");
+        assert!(
+            read_apps_registry(&path).is_err(),
+            "a broken file must never be indistinguishable from an empty one"
+        );
     }
 
     // ── toml_basic_string / render_apps_toml: the actual bug this section's
@@ -1193,25 +1287,54 @@ mod tests {
         // crate's pinned `toml = "0.8"`, 2026-08-30) — which is every real
         // Windows path — and `apps/windows_vm.rs`'s hand-rolled reader on
         // the other end only understands double-quoted basic strings.
-        assert_eq!(toml_basic_string(r"C:\Program Files\Office\winword.exe"), r#""C:\\Program Files\\Office\\winword.exe""#);
-        assert!(!toml_basic_string(r"C:\a").starts_with('\''), "must never fall back to a literal (single-quoted) string");
+        assert_eq!(
+            toml_basic_string(r"C:\Program Files\Office\winword.exe"),
+            r#""C:\\Program Files\\Office\\winword.exe""#
+        );
+        assert!(
+            !toml_basic_string(r"C:\a").starts_with('\''),
+            "must never fall back to a literal (single-quoted) string"
+        );
     }
 
     #[test]
     fn toml_basic_string_escapes_quotes_backslashes_and_control_characters() {
         assert_eq!(toml_basic_string("plain"), "\"plain\"");
         assert_eq!(toml_basic_string("Say \"Hi\""), "\"Say \\\"Hi\\\"\"");
-        assert_eq!(toml_basic_string("It's"), "\"It's\"", "an apostrophe needs no escaping in a basic string");
-        assert_eq!(toml_basic_string("Both \" and ' here"), "\"Both \\\" and ' here\"", "must stay ONE double-quoted line, never the pretty-printer's triple-quote form");
+        assert_eq!(
+            toml_basic_string("It's"),
+            "\"It's\"",
+            "an apostrophe needs no escaping in a basic string"
+        );
+        assert_eq!(
+            toml_basic_string("Both \" and ' here"),
+            "\"Both \\\" and ' here\"",
+            "must stay ONE double-quoted line, never the pretty-printer's triple-quote form"
+        );
         assert_eq!(toml_basic_string("Tab\tHere"), "\"Tab\\tHere\"");
-        assert_eq!(toml_basic_string("記帳軟體"), "\"記帳軟體\"", "CJK is never escaped");
+        assert_eq!(
+            toml_basic_string("記帳軟體"),
+            "\"記帳軟體\"",
+            "CJK is never escaped"
+        );
     }
 
     #[test]
     fn render_apps_toml_produces_the_exact_shape_the_shell_side_parser_expects() {
-        let entries =
-            vec![RemoteAppEntry { name: "Word".to_string(), exe: "winword.exe".to_string() }, RemoteAppEntry { name: "Excel".to_string(), exe: "excel.exe".to_string() }];
-        assert_eq!(render_apps_toml(&entries), "[[apps]]\nname = \"Word\"\nexe = \"winword.exe\"\n\n[[apps]]\nname = \"Excel\"\nexe = \"excel.exe\"\n\n");
+        let entries = vec![
+            RemoteAppEntry {
+                name: "Word".to_string(),
+                exe: "winword.exe".to_string(),
+            },
+            RemoteAppEntry {
+                name: "Excel".to_string(),
+                exe: "excel.exe".to_string(),
+            },
+        ];
+        assert_eq!(
+            render_apps_toml(&entries),
+            "[[apps]]\nname = \"Word\"\nexe = \"winword.exe\"\n\n[[apps]]\nname = \"Excel\"\nexe = \"excel.exe\"\n\n"
+        );
     }
 
     #[test]
@@ -1224,12 +1347,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("windows-vm").join("apps.toml");
         let entries = vec![
-            RemoteAppEntry { name: "Word".to_string(), exe: r"C:\Program Files\Office\winword.exe".to_string() },
-            RemoteAppEntry { name: "記帳軟體".to_string(), exe: "ledger.exe".to_string() },
+            RemoteAppEntry {
+                name: "Word".to_string(),
+                exe: r"C:\Program Files\Office\winword.exe".to_string(),
+            },
+            RemoteAppEntry {
+                name: "記帳軟體".to_string(),
+                exe: "ledger.exe".to_string(),
+            },
             // The exact case that broke `toml::to_string_pretty` (triple-
             // quoted multi-line form) — must still round-trip through
             // `toml::from_str` on THIS side of the contract.
-            RemoteAppEntry { name: "Both \" and ' here".to_string(), exe: "a.exe".to_string() },
+            RemoteAppEntry {
+                name: "Both \" and ' here".to_string(),
+                exe: "a.exe".to_string(),
+            },
         ];
         write_apps_registry_0644(&path, &entries).unwrap();
         assert_eq!(read_apps_registry(&path).unwrap(), entries);
@@ -1241,8 +1373,14 @@ mod tests {
         // starting with `'` right after `=`), which must never appear.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains(r#"exe = "C:\\Program Files\\Office\\winword.exe""#));
-        assert!(!raw.contains("= '"), "must never use a single-quoted (literal) TOML string as a value delimiter");
-        assert!(!raw.contains(r#"""""#), "must never use a triple-quoted (multi-line) TOML string");
+        assert!(
+            !raw.contains("= '"),
+            "must never use a single-quoted (literal) TOML string as a value delimiter"
+        );
+        assert!(
+            !raw.contains(r#"""""#),
+            "must never use a triple-quoted (multi-line) TOML string"
+        );
     }
 
     #[test]
@@ -1253,10 +1391,20 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let vm_dir = dir.path().join("windows-vm");
             let path = vm_dir.join("apps.toml");
-            write_apps_registry_0644(&path, &[RemoteAppEntry { name: "Word".to_string(), exe: "winword.exe".to_string() }]).unwrap();
+            write_apps_registry_0644(
+                &path,
+                &[RemoteAppEntry {
+                    name: "Word".to_string(),
+                    exe: "winword.exe".to_string(),
+                }],
+            )
+            .unwrap();
             let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             let dir_mode = std::fs::metadata(&vm_dir).unwrap().permissions().mode() & 0o777;
-            assert_eq!(file_mode, 0o644, "must be cross-user readable — see this section's header comment");
+            assert_eq!(
+                file_mode, 0o644,
+                "must be cross-user readable — see this section's header comment"
+            );
             assert_eq!(dir_mode, 0o755);
         }
     }
@@ -1264,7 +1412,10 @@ mod tests {
     #[test]
     fn apps_toml_lives_under_the_windows_vm_directory_next_to_compose_yaml() {
         let home = Path::new("/home/duduclaw/.duduclaw");
-        assert_eq!(apps_toml_path_with(home, None), home.join("windows-vm").join("apps.toml"));
+        assert_eq!(
+            apps_toml_path_with(home, None),
+            home.join("windows-vm").join("apps.toml")
+        );
         // An EMPTY override is "unset", not "the current directory".
         assert_eq!(
             apps_toml_path_with(home, Some(std::ffi::OsStr::new(""))),
@@ -1280,8 +1431,14 @@ mod tests {
         // follow: it is `0600` and nobody but this CLI reads it.
         let home = Path::new("/data/duduclaw");
         let over = std::ffi::OsStr::new("/data/system/windows-vm");
-        assert_eq!(apps_toml_path_with(home, Some(over)), PathBuf::from("/data/system/windows-vm/apps.toml"));
-        assert_eq!(compose_path(home), PathBuf::from("/data/duduclaw/windows-vm/compose.yaml"));
+        assert_eq!(
+            apps_toml_path_with(home, Some(over)),
+            PathBuf::from("/data/system/windows-vm/apps.toml")
+        );
+        assert_eq!(
+            compose_path(home),
+            PathBuf::from("/data/duduclaw/windows-vm/compose.yaml")
+        );
     }
 
     #[tokio::test]
@@ -1295,9 +1452,11 @@ mod tests {
         let prev = std::env::var_os("DUDUCLAW_HOME");
         unsafe { std::env::set_var("DUDUCLAW_HOME", dir.path()) };
 
-        let add_result = cmd_compat_windows_vm_app_add("winword.exe".to_string(), "Word".to_string()).await;
+        let add_result =
+            cmd_compat_windows_vm_app_add("winword.exe".to_string(), "Word".to_string()).await;
         let entries_after_add = read_apps_registry(&apps_toml_path(&crate::duduclaw_home()));
-        let remove_missing_result = cmd_compat_windows_vm_app_remove("does-not-exist.exe".to_string()).await;
+        let remove_missing_result =
+            cmd_compat_windows_vm_app_remove("does-not-exist.exe".to_string()).await;
         let remove_result = cmd_compat_windows_vm_app_remove("winword.exe".to_string()).await;
         let entries_after_remove = read_apps_registry(&apps_toml_path(&crate::duduclaw_home()));
 
@@ -1309,8 +1468,17 @@ mod tests {
         }
 
         assert!(add_result.is_ok());
-        assert_eq!(entries_after_add, Ok(vec![RemoteAppEntry { name: "Word".to_string(), exe: "winword.exe".to_string() }]));
-        assert!(remove_missing_result.is_err(), "removing an exe that was never added must be an honest error");
+        assert_eq!(
+            entries_after_add,
+            Ok(vec![RemoteAppEntry {
+                name: "Word".to_string(),
+                exe: "winword.exe".to_string()
+            }])
+        );
+        assert!(
+            remove_missing_result.is_err(),
+            "removing an exe that was never added must be an honest error"
+        );
         assert!(remove_result.is_ok());
         assert_eq!(entries_after_remove, Ok(Vec::new()));
     }
@@ -1322,7 +1490,8 @@ mod tests {
         let prev = std::env::var_os("DUDUCLAW_HOME");
         unsafe { std::env::set_var("DUDUCLAW_HOME", dir.path()) };
 
-        let _ = cmd_compat_windows_vm_app_add("winword.exe".to_string(), "Word (old)".to_string()).await;
+        let _ = cmd_compat_windows_vm_app_add("winword.exe".to_string(), "Word (old)".to_string())
+            .await;
         let _ = cmd_compat_windows_vm_app_add("winword.exe".to_string(), "Word".to_string()).await;
         let entries = read_apps_registry(&apps_toml_path(&crate::duduclaw_home()));
 
@@ -1333,7 +1502,14 @@ mod tests {
             }
         }
 
-        assert_eq!(entries, Ok(vec![RemoteAppEntry { name: "Word".to_string(), exe: "winword.exe".to_string() }]), "the second app-add must replace, not append");
+        assert_eq!(
+            entries,
+            Ok(vec![RemoteAppEntry {
+                name: "Word".to_string(),
+                exe: "winword.exe".to_string()
+            }]),
+            "the second app-add must replace, not append"
+        );
     }
 
     #[tokio::test]
@@ -1343,7 +1519,8 @@ mod tests {
         let prev = std::env::var_os("DUDUCLAW_HOME");
         unsafe { std::env::set_var("DUDUCLAW_HOME", dir.path()) };
 
-        let result = cmd_compat_windows_vm_app_add("win\nword.exe".to_string(), "Word".to_string()).await;
+        let result =
+            cmd_compat_windows_vm_app_add("win\nword.exe".to_string(), "Word".to_string()).await;
         let path_exists = apps_toml_path(&crate::duduclaw_home()).exists();
 
         unsafe {
@@ -1354,7 +1531,10 @@ mod tests {
         }
 
         assert!(result.is_err());
-        assert!(!path_exists, "a rejected exe must never reach the registry file at all");
+        assert!(
+            !path_exists,
+            "a rejected exe must never reach the registry file at all"
+        );
     }
 
     // ── xfreerdp RemoteApp argv building ─────────────────────────────
@@ -1364,7 +1544,10 @@ mod tests {
         let args = build_xfreerdp_remoteapp_args("winword.exe", None, "127.0.0.1:3389", "Docker");
         for arg in &args {
             assert!(!arg.contains("admin"), "password leaked into argv: {arg:?}");
-            assert!(!arg.starts_with("/p:"), "must never use /p: (argv-visible password)");
+            assert!(
+                !arg.starts_with("/p:"),
+                "must never use /p: (argv-visible password)"
+            );
         }
         assert!(args.contains(&"/from-stdin:force".to_string()));
         assert!(args.iter().any(|a| a == "/v:127.0.0.1:3389"));
@@ -1374,13 +1557,18 @@ mod tests {
 
     #[test]
     fn build_xfreerdp_remoteapp_args_with_display_name() {
-        let args = build_xfreerdp_remoteapp_args("winword.exe", Some("Word"), "127.0.0.1:3389", "Docker");
-        assert!(args.iter().any(|a| a == "/app:program:winword.exe,name:Word"));
+        let args =
+            build_xfreerdp_remoteapp_args("winword.exe", Some("Word"), "127.0.0.1:3389", "Docker");
+        assert!(
+            args.iter()
+                .any(|a| a == "/app:program:winword.exe,name:Word")
+        );
     }
 
     #[test]
     fn build_xfreerdp_remoteapp_args_sanitizes_comma_in_display_name() {
-        let args = build_xfreerdp_remoteapp_args("app.exe", Some("A, B"), "127.0.0.1:3389", "Docker");
+        let args =
+            build_xfreerdp_remoteapp_args("app.exe", Some("A, B"), "127.0.0.1:3389", "Docker");
         let app_flag = args.iter().find(|a| a.starts_with("/app:")).unwrap();
         // The sanitized name must not introduce a new comma-separated
         // sub-field FreeRDP would misparse.
@@ -1392,7 +1580,10 @@ mod tests {
 
     #[test]
     fn resolve_xfreerdp_binary_prefers_versioned_name_when_present() {
-        assert_eq!(resolve_xfreerdp_binary_with(|tool| tool == "xfreerdp3"), "xfreerdp3");
+        assert_eq!(
+            resolve_xfreerdp_binary_with(|tool| tool == "xfreerdp3"),
+            "xfreerdp3"
+        );
     }
 
     #[test]

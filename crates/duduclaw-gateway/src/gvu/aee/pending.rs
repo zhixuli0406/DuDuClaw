@@ -2,7 +2,7 @@
 //! observation sweep that later judges it.
 //!
 //! The legacy SOUL path parks an `observing` row in `soul_versions` and
-//! `ObservationFinalizer` closes it. AEE writes no `SoulVersion` at all (its
+//! `gvu::aee::sweeper` closes it. AEE writes no SOUL version at all (its
 //! artefact is a set of playbook entries), so it needs its own one-row-per-
 //! agent queue: "these entry ids went live at T, here are the case scores the
 //! champion had *before* they did, come back after the window and compare".
@@ -20,7 +20,7 @@
 //! rule, not the primary guard.)
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use tracing::warn;
 
 use crate::gvu::verifier_measure::CaseScore;
@@ -53,7 +53,10 @@ impl PendingSettlement {
     /// The tolerances the settlement fence must use.
     pub fn case_bands(&self) -> crate::gvu::aee::settle::CaseBands {
         match self.band_holdout {
-            Some(h) => crate::gvu::aee::settle::CaseBands { cases: self.band_cases, holdout: h },
+            Some(h) => crate::gvu::aee::settle::CaseBands {
+                cases: self.band_cases,
+                holdout: h,
+            },
             None => crate::gvu::aee::settle::CaseBands::from_cases_only(self.band_cases),
         }
     }
@@ -66,7 +69,9 @@ pub struct PendingSettlementStore {
 
 impl PendingSettlementStore {
     pub fn new(db_path: &std::path::Path) -> Self {
-        let store = Self { db_path: db_path.to_path_buf() };
+        let store = Self {
+            db_path: db_path.to_path_buf(),
+        };
         if let Err(e) = store.init() {
             warn!(db = %db_path.display(), "aee_pending_settlement: table init failed: {e}");
         }
@@ -218,7 +223,11 @@ mod tests {
     use super::*;
 
     fn cs(case: &str, score: f64) -> CaseScore {
-        CaseScore { case: case.into(), score, held_out: false }
+        CaseScore {
+            case: case.into(),
+            score,
+            held_out: false,
+        }
     }
 
     fn sample(agent: &str, settle_after: DateTime<Utc>) -> PendingSettlement {
@@ -281,7 +290,11 @@ mod tests {
         store.put(&p).unwrap();
         let got = store.get("a3").unwrap();
         assert_eq!(got.band_holdout, Some(0.01));
-        assert_eq!(got.case_bands().holdout, 0.01, "an override is not re-derived");
+        assert_eq!(
+            got.case_bands().holdout,
+            0.01,
+            "an override is not re-derived"
+        );
 
         // Simulate a pre-migration row: the column is NULL.
         {
@@ -295,7 +308,11 @@ mod tests {
         let legacy = store.get("a3").unwrap();
         assert_eq!(legacy.band_holdout, None);
         assert_eq!(legacy.case_bands().cases, 0.08);
-        assert_eq!(legacy.case_bands().holdout, 0.04, "derived, not defaulted to zero or to cases");
+        assert_eq!(
+            legacy.case_bands().holdout,
+            0.04,
+            "derived, not defaulted to zero or to cases"
+        );
     }
 
     /// The `ALTER TABLE` migration must be idempotent — `new()` runs on every

@@ -1,4 +1,4 @@
-"""DuDuClaw Python SDK — evolution vetter, channel bridges, and Claude Code SDK integration"""
+"""DuDuClaw Python SDK — MCP server helpers, capability-based agent routing, and the evolution vetter"""
 
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 

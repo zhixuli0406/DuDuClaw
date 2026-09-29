@@ -37,11 +37,11 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{
-    backend_is_remote, io_err, job_dir, jobs_root, new_id, require_data_leaves_device_ack,
-    validate_id, FinetuneError, Result,
+    FinetuneError, Result, backend_is_remote, io_err, job_dir, jobs_root, new_id,
+    require_data_leaves_device_ack, validate_id,
 };
 
 /// Together AI's documented API root (OpenAPI `servers[0]`, verified
@@ -216,16 +216,22 @@ impl JobConfig {
             return Err(FinetuneError::BadRequest("epochs 需在 0.01–100".into()));
         }
         if !(1e-7..=1e-2).contains(&self.learning_rate) {
-            return Err(FinetuneError::BadRequest("learning_rate 需在 1e-7–1e-2".into()));
+            return Err(FinetuneError::BadRequest(
+                "learning_rate 需在 1e-7–1e-2".into(),
+            ));
         }
         if !(128..=131_072).contains(&self.cutoff_len) {
-            return Err(FinetuneError::BadRequest("cutoff_len 需在 128–131072".into()));
+            return Err(FinetuneError::BadRequest(
+                "cutoff_len 需在 128–131072".into(),
+            ));
         }
         if !(1..=64).contains(&self.per_device_batch_size) {
             return Err(FinetuneError::BadRequest("batch size 需在 1–64".into()));
         }
         if !(1..=256).contains(&self.gradient_accumulation_steps) {
-            return Err(FinetuneError::BadRequest("gradient accumulation 需在 1–256".into()));
+            return Err(FinetuneError::BadRequest(
+                "gradient accumulation 需在 1–256".into(),
+            ));
         }
         Ok(())
     }
@@ -282,7 +288,10 @@ impl RemoteGpuConfig {
             // so join with '/' explicitly — `Path::join` would use the local
             // OS separator and hand a Windows host's `\` to the GPU box.
             Some(p) if !p.as_os_str().is_empty() && self.python.contains('/') => {
-                format!("{}/llamafactory-cli", p.display().to_string().trim_end_matches('/'))
+                format!(
+                    "{}/llamafactory-cli",
+                    p.display().to_string().trim_end_matches('/')
+                )
             }
             _ => "llamafactory-cli".to_string(),
         }
@@ -557,7 +566,8 @@ impl FinetuneBackend for DryRunBackend {
         .map_err(|e| io_err(&plan_path, e))?;
 
         rec.state = "planned".into();
-        rec.detail = Some("乾跑完成：設定有效，已產生 train.yaml 與 plan.json。沒有進行訓練。".into());
+        rec.detail =
+            Some("乾跑完成：設定有效，已產生 train.yaml 與 plan.json。沒有進行訓練。".into());
         rec.artifacts = vec![
             artifact(&paths.job_dir.join("train.yaml")),
             artifact(&plan_path),
@@ -698,7 +708,11 @@ pub fn parse_remote_status(stdout: &str) -> RemoteStatus {
     if log.len() > LOG_TAIL_LINES {
         log = log.split_off(log.len() - LOG_TAIL_LINES);
     }
-    RemoteStatus { alive, adapter, log_tail: log }
+    RemoteStatus {
+        alive,
+        adapter,
+        log_tail: log,
+    }
 }
 
 async fn run(program: &str, args: &[String]) -> Result<(bool, String, String)> {
@@ -732,7 +746,9 @@ impl FinetuneBackend for RemoteGpuSshBackend {
     fn validate(&self, cfg: &JobConfig) -> Result<()> {
         cfg.validate()?;
         let r = cfg.remote.as_ref().ok_or_else(|| {
-            FinetuneError::BadRequest("remote_gpu_ssh 需要 remote{host,user,key_path,workdir,python}".into())
+            FinetuneError::BadRequest(
+                "remote_gpu_ssh 需要 remote{host,user,key_path,workdir,python}".into(),
+            )
         })?;
         r.validate()?;
         if !Path::new(&r.key_path).exists() {
@@ -767,9 +783,16 @@ impl FinetuneBackend for RemoteGpuSshBackend {
         write_yaml(&paths.job_dir, &yaml)?;
 
         // 1. remote dirs
-        let (ok, _o, e) = ssh_exec(r, &format!("mkdir -p {remote_dir}/data {remote_dir}/output")).await?;
+        let (ok, _o, e) = ssh_exec(
+            r,
+            &format!("mkdir -p {remote_dir}/data {remote_dir}/output"),
+        )
+        .await?;
         if !ok {
-            return Err(FinetuneError::Backend(format!("建立遠端目錄失敗：{}", e.trim())));
+            return Err(FinetuneError::Backend(format!(
+                "建立遠端目錄失敗：{}",
+                e.trim()
+            )));
         }
 
         // 2. dataset + generated YAML up
@@ -787,7 +810,10 @@ impl FinetuneBackend for RemoteGpuSshBackend {
         )
         .await?;
         if !ok {
-            return Err(FinetuneError::Backend(format!("上傳資料集失敗：{}", e.trim())));
+            return Err(FinetuneError::Backend(format!(
+                "上傳資料集失敗：{}",
+                e.trim()
+            )));
         }
         let (ok, _o, e) = run(
             "rsync",
@@ -801,13 +827,19 @@ impl FinetuneBackend for RemoteGpuSshBackend {
         )
         .await?;
         if !ok {
-            return Err(FinetuneError::Backend(format!("上傳訓練設定失敗：{}", e.trim())));
+            return Err(FinetuneError::Backend(format!(
+                "上傳訓練設定失敗：{}",
+                e.trim()
+            )));
         }
 
         // 3. launch
         let (ok, out, e) = ssh_exec(r, &remote_launch_script(cfg, r)).await?;
         if !ok {
-            return Err(FinetuneError::Backend(format!("啟動訓練失敗：{}", e.trim())));
+            return Err(FinetuneError::Backend(format!(
+                "啟動訓練失敗：{}",
+                e.trim()
+            )));
         }
         let pid = out
             .lines()
@@ -847,7 +879,10 @@ impl FinetuneBackend for RemoteGpuSshBackend {
         if st.adapter {
             // Optional GGUF conversion, then fetch.
             if let Some(script) = remote_convert_script(cfg, r) {
-                let (_ok, cout, _e) = ssh_exec(r, &script).await.unwrap_or((false, String::new(), String::new()));
+                let (_ok, cout, _e) =
+                    ssh_exec(r, &script)
+                        .await
+                        .unwrap_or((false, String::new(), String::new()));
                 if cout.contains("DUDUCLAW_GGUF=yes") {
                     rec.detail = Some("訓練完成，遠端已轉出 GGUF。".into());
                 } else if cout.contains("DUDUCLAW_CONVERT=absent") {
@@ -977,7 +1012,11 @@ fn msg(role: &str, content: &str) -> Value {
 
 fn sft_line_to_together(v: &Value) -> Option<Value> {
     let mut messages = Vec::new();
-    if let Some(sys) = v.get("system").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+    if let Some(sys) = v
+        .get("system")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
         messages.push(msg("system", sys));
     }
     if let Some(convs) = v.get("conversations").and_then(Value::as_array) {
@@ -994,7 +1033,12 @@ fn sft_line_to_together(v: &Value) -> Option<Value> {
         }
     } else {
         // Alpaca
-        for pair in v.get("history").and_then(Value::as_array).into_iter().flatten() {
+        for pair in v
+            .get("history")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let q = pair.get(0).and_then(Value::as_str)?;
             let a = pair.get(1).and_then(Value::as_str)?;
             messages.push(msg("user", q));
@@ -1017,19 +1061,30 @@ fn sft_line_to_together(v: &Value) -> Option<Value> {
 }
 
 fn dpo_line_to_together(v: &Value) -> Option<Value> {
-    let (prompt, chosen, rejected) = if let Some(convs) = v.get("conversations").and_then(Value::as_array) {
-        (
-            convs.first()?.get("value").and_then(Value::as_str)?.to_string(),
-            v.get("chosen")?.get("value").and_then(Value::as_str)?.to_string(),
-            v.get("rejected")?.get("value").and_then(Value::as_str)?.to_string(),
-        )
-    } else {
-        (
-            v.get("instruction").and_then(Value::as_str)?.to_string(),
-            v.get("chosen").and_then(Value::as_str)?.to_string(),
-            v.get("rejected").and_then(Value::as_str)?.to_string(),
-        )
-    };
+    let (prompt, chosen, rejected) =
+        if let Some(convs) = v.get("conversations").and_then(Value::as_array) {
+            (
+                convs
+                    .first()?
+                    .get("value")
+                    .and_then(Value::as_str)?
+                    .to_string(),
+                v.get("chosen")?
+                    .get("value")
+                    .and_then(Value::as_str)?
+                    .to_string(),
+                v.get("rejected")?
+                    .get("value")
+                    .and_then(Value::as_str)?
+                    .to_string(),
+            )
+        } else {
+            (
+                v.get("instruction").and_then(Value::as_str)?.to_string(),
+                v.get("chosen").and_then(Value::as_str)?.to_string(),
+                v.get("rejected").and_then(Value::as_str)?.to_string(),
+            )
+        };
     Some(json!({
         "input": { "messages": [ msg("user", &prompt) ] },
         "preferred_output": [ msg("assistant", &chosen) ],
@@ -1059,7 +1114,10 @@ pub fn together_create_body(cfg: &JobConfig, training_file_id: &str) -> Value {
             TrainMethod::Dpo => json!({ "method": "dpo", "dpo_beta": 0.1 }),
         },
     });
-    if let Some(suffix) = t.and_then(|t| t.suffix.as_deref()).filter(|s| !s.trim().is_empty()) {
+    if let Some(suffix) = t
+        .and_then(|t| t.suffix.as_deref())
+        .filter(|s| !s.trim().is_empty())
+    {
         // API maxLength is 64.
         let s: String = suffix.chars().take(64).collect();
         body["suffix"] = json!(s);
@@ -1099,9 +1157,10 @@ impl FinetuneBackend for TogetherBackend {
 
     fn validate(&self, cfg: &JobConfig) -> Result<()> {
         cfg.validate()?;
-        let t = cfg.together.as_ref().ok_or_else(|| {
-            FinetuneError::BadRequest("together 後端需要 together{model}".into())
-        })?;
+        let t = cfg
+            .together
+            .as_ref()
+            .ok_or_else(|| FinetuneError::BadRequest("together 後端需要 together{model}".into()))?;
         if t.model.trim().is_empty() {
             return Err(FinetuneError::BadRequest("together.model 不可空白".into()));
         }
@@ -1111,11 +1170,12 @@ impl FinetuneBackend for TogetherBackend {
     async fn start(&self, cfg: &JobConfig, paths: &JobPaths, rec: &mut JobRecord) -> Result<()> {
         let key = together_key()?;
         let source = paths.dataset_dir.join(cfg.method.source_file());
-        let body = std::fs::read_to_string(&source)
-            .map_err(|_| FinetuneError::BadRequest(format!(
+        let body = std::fs::read_to_string(&source).map_err(|_| {
+            FinetuneError::BadRequest(format!(
                 "{} 不存在，先建構資料集再送訓練",
                 cfg.method.source_file()
-            )))?;
+            ))
+        })?;
         let converted = to_together_jsonl(&body, cfg.method)?;
         // Keep exactly what we uploaded, so "what did it train on" is
         // answerable after the fact.
@@ -1163,7 +1223,10 @@ impl FinetuneBackend for TogetherBackend {
             .and_then(Value::as_str)
             .ok_or_else(|| FinetuneError::Backend("Together 回應沒有 job id".into()))?
             .to_string();
-        let status = created.get("status").and_then(Value::as_str).unwrap_or("pending");
+        let status = created
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
         rec.remote_ref = Some(job_id.clone());
         rec.state = map_together_status(status).to_string();
         rec.detail = Some(format!(
@@ -1196,7 +1259,10 @@ impl FinetuneBackend for TogetherBackend {
         // Pass the provider's own estimate through untouched; never turn it
         // into a percentage we did not measure.
         if v.get("progress").and_then(|p| p.get("estimate_available")) == Some(&json!(true)) {
-            if let Some(sec) = v["progress"].get("seconds_remaining").and_then(Value::as_i64) {
+            if let Some(sec) = v["progress"]
+                .get("seconds_remaining")
+                .and_then(Value::as_i64)
+            {
                 rec.log_tail = vec![format!("Together 估計剩餘 {sec} 秒")];
             }
         }
@@ -1249,7 +1315,9 @@ async fn json_or_error(resp: reqwest::Response, what: &str) -> Result<Value> {
         .chars()
         .take(400)
         .collect::<String>();
-    Err(FinetuneError::Backend(format!("{what} 失敗（HTTP {status}）：{msg}")))
+    Err(FinetuneError::Backend(format!(
+        "{what} 失敗（HTTP {status}）：{msg}"
+    )))
 }
 
 // ─────────────────────────── RPC surface ───────────────────────────
@@ -1290,10 +1358,7 @@ pub fn list(home: &Path) -> Result<Vec<JobRecord>> {
 pub async fn create(home: &Path, mut cfg: JobConfig, acknowledged: bool) -> Result<JobRecord> {
     let backend = backend_for(&cfg.backend)?;
     if backend.is_remote() {
-        require_data_leaves_device_ack(
-            acknowledged,
-            &format!("送到「{}」訓練", cfg.backend),
-        )?;
+        require_data_leaves_device_ack(acknowledged, &format!("送到「{}」訓練", cfg.backend))?;
     }
     if cfg.id.is_empty() {
         cfg.id = new_id("job");
@@ -1434,7 +1499,10 @@ mod tests {
     fn method_selects_the_matching_dataset_file() {
         assert_eq!(TrainMethod::Sft.source_file(), "train.jsonl");
         assert_eq!(TrainMethod::Dpo.source_file(), "preference.jsonl");
-        assert_eq!(TrainMethod::from_str_loose("DPO").unwrap(), TrainMethod::Dpo);
+        assert_eq!(
+            TrainMethod::from_str_loose("DPO").unwrap(),
+            TrainMethod::Dpo
+        );
         assert!(TrainMethod::from_str_loose("ppo").is_err());
     }
 
@@ -1444,14 +1512,70 @@ mod tests {
     fn config_validation_rejects_out_of_range_knobs() {
         let base = cfg("dry_run", TrainMethod::Sft);
         assert!(base.validate().is_ok());
-        assert!(JobConfig { lora_rank: 0, ..base.clone() }.validate().is_err());
-        assert!(JobConfig { lora_rank: 1000, ..base.clone() }.validate().is_err());
-        assert!(JobConfig { epochs: 0.0, ..base.clone() }.validate().is_err());
-        assert!(JobConfig { learning_rate: 1.0, ..base.clone() }.validate().is_err());
-        assert!(JobConfig { cutoff_len: 8, ..base.clone() }.validate().is_err());
-        assert!(JobConfig { per_device_batch_size: 0, ..base.clone() }.validate().is_err());
-        assert!(JobConfig { base_model: "  ".into(), ..base.clone() }.validate().is_err());
-        assert!(JobConfig { dataset_id: "../x".into(), ..base }.validate().is_err());
+        assert!(
+            JobConfig {
+                lora_rank: 0,
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JobConfig {
+                lora_rank: 1000,
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JobConfig {
+                epochs: 0.0,
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JobConfig {
+                learning_rate: 1.0,
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JobConfig {
+                cutoff_len: 8,
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JobConfig {
+                per_device_batch_size: 0,
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JobConfig {
+                base_model: "  ".into(),
+                ..base.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            JobConfig {
+                dataset_id: "../x".into(),
+                ..base
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -1473,16 +1597,40 @@ mod tests {
             "-oProxyCommand=x",
             "",
         ] {
-            assert!(validate_shell_safe("f", bad).is_err(), "should reject {bad:?}");
+            assert!(
+                validate_shell_safe("f", bad).is_err(),
+                "should reject {bad:?}"
+            );
         }
     }
 
     #[test]
     fn remote_config_requires_absolute_workdir_and_clean_fields() {
         assert!(remote().validate().is_ok());
-        assert!(RemoteGpuConfig { workdir: "relative/dir".into(), ..remote() }.validate().is_err());
-        assert!(RemoteGpuConfig { host: "h; rm -rf /".into(), ..remote() }.validate().is_err());
-        assert!(RemoteGpuConfig { user: "$(whoami)".into(), ..remote() }.validate().is_err());
+        assert!(
+            RemoteGpuConfig {
+                workdir: "relative/dir".into(),
+                ..remote()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RemoteGpuConfig {
+                host: "h; rm -rf /".into(),
+                ..remote()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RemoteGpuConfig {
+                user: "$(whoami)".into(),
+                ..remote()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -1491,14 +1639,20 @@ mod tests {
             remote().llamafactory_cli(),
             "/opt/llamafactory/venv/bin/llamafactory-cli"
         );
-        let bare = RemoteGpuConfig { python: "python3".into(), ..remote() };
+        let bare = RemoteGpuConfig {
+            python: "python3".into(),
+            ..remote()
+        };
         assert_eq!(bare.llamafactory_cli(), "llamafactory-cli");
     }
 
     #[test]
     fn ssh_argv_forces_batch_mode_so_a_prompt_cannot_hang_the_gateway() {
         let a = remote().ssh_argv();
-        assert!(a.windows(2).any(|w| w[0] == "-o" && w[1] == "BatchMode=yes"));
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "BatchMode=yes")
+        );
         assert_eq!(a.last().unwrap(), "trainer@gpu.example.com");
         assert!(remote().rsync_transport().contains("BatchMode=yes"));
     }
@@ -1518,7 +1672,10 @@ mod tests {
         assert!(conv.contains("/opt/llama.cpp/convert_lora_to_gguf.py"));
         assert!(conv.contains("DUDUCLAW_GGUF"));
         // No llama.cpp configured → no conversion attempted at all.
-        let no_llama = RemoteGpuConfig { llama_cpp_dir: None, ..remote() };
+        let no_llama = RemoteGpuConfig {
+            llama_cpp_dir: None,
+            ..remote()
+        };
         assert!(remote_convert_script(&c, &no_llama).is_none());
     }
 
@@ -1530,7 +1687,9 @@ mod tests {
         assert!(st.alive && !st.adapter);
         assert_eq!(st.log_tail, vec!["{'loss': 1.2}", "{'loss': 0.9}"]);
 
-        let done = parse_remote_status("DUDUCLAW_ALIVE=no\nDUDUCLAW_ADAPTER=yes\nDUDUCLAW_LOG_BEGIN\ndone\n");
+        let done = parse_remote_status(
+            "DUDUCLAW_ALIVE=no\nDUDUCLAW_ADAPTER=yes\nDUDUCLAW_LOG_BEGIN\ndone\n",
+        );
         assert!(!done.alive && done.adapter);
 
         // Garbage never reads as "finished successfully".
@@ -1538,7 +1697,8 @@ mod tests {
         assert!(!junk.alive && !junk.adapter && junk.log_tail.is_empty());
 
         // A log line that happens to contain a marker word is still log text.
-        let spoof = parse_remote_status("DUDUCLAW_ALIVE=no\nDUDUCLAW_LOG_BEGIN\nDUDUCLAW_ADAPTER=yes\n");
+        let spoof =
+            parse_remote_status("DUDUCLAW_ALIVE=no\nDUDUCLAW_LOG_BEGIN\nDUDUCLAW_ADAPTER=yes\n");
         assert!(!spoof.adapter);
     }
 
@@ -1552,7 +1712,10 @@ mod tests {
             suffix: Some("duduclaw".into()),
         });
         let b = together_create_body(&c, "file-abc");
-        assert_eq!(b["model"], "meta-llama/Meta-Llama-3.1-8B-Instruct-Reference");
+        assert_eq!(
+            b["model"],
+            "meta-llama/Meta-Llama-3.1-8B-Instruct-Reference"
+        );
         assert_eq!(b["training_file"], "file-abc");
         assert_eq!(b["n_epochs"], 3);
         assert_eq!(b["suffix"], "duduclaw");
@@ -1575,7 +1738,10 @@ mod tests {
     #[test]
     fn together_suffix_is_capped_at_the_documented_64_chars() {
         let mut c = cfg("together", TrainMethod::Sft);
-        c.together = Some(TogetherConfig { model: "m".into(), suffix: Some("x".repeat(200)) });
+        c.together = Some(TogetherConfig {
+            model: "m".into(),
+            suffix: Some("x".repeat(200)),
+        });
         let b = together_create_body(&c, "f");
         assert_eq!(b["suffix"].as_str().unwrap().chars().count(), 64);
     }
@@ -1609,7 +1775,8 @@ mod tests {
         assert_eq!(m[1]["role"], "user");
         assert_eq!(m[2]["role"], "assistant");
 
-        let al = r#"{"instruction":"對帳","input":"八月","output":"完成","history":[["前問","前答"]]}"#;
+        let al =
+            r#"{"instruction":"對帳","input":"八月","output":"完成","history":[["前問","前答"]]}"#;
         let out = to_together_jsonl(al, TrainMethod::Sft).unwrap();
         let v: Value = serde_json::from_str(out.trim()).unwrap();
         let m = v["messages"].as_array().unwrap();
@@ -1686,7 +1853,10 @@ mod tests {
         let mut c = cfg("together", TrainMethod::Sft);
         c.id = String::new();
         c.dataset_id = ds;
-        c.together = Some(TogetherConfig { model: "m".into(), suffix: None });
+        c.together = Some(TogetherConfig {
+            model: "m".into(),
+            suffix: None,
+        });
         let err = create(home.path(), c, false).await.unwrap_err();
         assert_eq!(err.code(), "data_leaves_device_not_acknowledged");
     }
@@ -1710,7 +1880,12 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join("plan.json")).unwrap()).unwrap();
         assert_eq!(plan["trained"], false);
         assert_eq!(plan["dataset_rows"], 1);
-        assert!(plan["command"].as_str().unwrap().contains("llamafactory-cli train train.yaml"));
+        assert!(
+            plan["command"]
+                .as_str()
+                .unwrap()
+                .contains("llamafactory-cli train train.yaml")
+        );
 
         // Polling a dry run never invents a finished state.
         let after = status(home.path(), &rec.id).await.unwrap();
@@ -1755,15 +1930,24 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn status_and_cancel_report_not_found_for_unknown_jobs() {
         let home = tempfile::tempdir().unwrap();
-        assert_eq!(status(home.path(), "job-nope").await.unwrap_err().code(), "not_found");
-        assert_eq!(cancel(home.path(), "job-nope").await.unwrap_err().code(), "not_found");
+        assert_eq!(
+            status(home.path(), "job-nope").await.unwrap_err().code(),
+            "not_found"
+        );
+        assert_eq!(
+            cancel(home.path(), "job-nope").await.unwrap_err().code(),
+            "not_found"
+        );
         assert!(list(home.path()).unwrap().is_empty());
     }
 
     #[test]
     fn backend_registry_is_closed() {
         assert_eq!(backend_for("dry_run").unwrap().id(), "dry_run");
-        assert_eq!(backend_for("remote_gpu_ssh").unwrap().id(), "remote_gpu_ssh");
+        assert_eq!(
+            backend_for("remote_gpu_ssh").unwrap().id(),
+            "remote_gpu_ssh"
+        );
         assert_eq!(backend_for("together").unwrap().id(), "together");
         assert!(backend_for("unsloth_cloud").is_err());
         // Only dry_run keeps data on the box.

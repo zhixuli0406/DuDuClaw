@@ -73,13 +73,13 @@ const TAIL_MAX_CHARS: usize = 120;
 /// Glyphs the CLI TUI uses to lead a notice / status line. Their presence is
 /// evidence (a); they are also where an inline notice is cut from a content
 /// line.
-const NOTICE_LEAD_GLYPHS: &[char] =
-    &['⚠', '⏵', '⏸', '⏭', '⎿', '✳', '✶', '✻', '✽', '●', '·', '⏺'];
+const NOTICE_LEAD_GLYPHS: &[char] = &['⚠', '⏵', '⏸', '⏭', '⎿', '✳', '✶', '✻', '✽', '●', '·', '⏺'];
 
 /// Sentence-ending punctuation. A line that ends with one of these reads as
 /// prose, so rule (c) refuses to treat it as a status footer.
-const SENTENCE_ENDINGS: &[char] =
-    &['.', '!', '?', ':', ';', ',', '。', '！', '？', '：', '；', '、', '」', '）', ')'];
+const SENTENCE_ENDINGS: &[char] = &[
+    '.', '!', '?', ':', ';', ',', '。', '！', '？', '：', '；', '、', '」', '）', ')',
+];
 
 /// One recognisable class of internal message.
 ///
@@ -106,7 +106,13 @@ const fn p(
     glued_proof: &'static [&'static str],
     strict: bool,
 ) -> NoisePattern {
-    NoisePattern { id, all_of, any_of, glued_proof, strict }
+    NoisePattern {
+        id,
+        all_of,
+        any_of,
+        glued_proof,
+        strict,
+    }
 }
 
 /// Pattern classes, not literal sentences — each is meant to catch a whole
@@ -116,8 +122,18 @@ const PATTERNS: &[NoisePattern] = &[
     p(
         "transcript_persistence",
         &["transcript"],
-        &["savingisoff", "savingison", "notbeingsaved", "keepfuturetranscripts", "willnotbesaved"],
-        &["transcriptsavingisoff", "transcriptssavingisoff", "keepfuturetranscripts"],
+        &[
+            "savingisoff",
+            "savingison",
+            "notbeingsaved",
+            "keepfuturetranscripts",
+            "willnotbesaved",
+        ],
+        &[
+            "transcriptsavingisoff",
+            "transcriptssavingisoff",
+            "keepfuturetranscripts",
+        ],
         true,
     ),
     p(
@@ -147,7 +163,12 @@ const PATTERNS: &[NoisePattern] = &[
     p(
         "paste_marker",
         &[],
-        &["pasteagaintoexpand", "ctrl+rtoexpand", "pastedtext#", "pastedcontent#"],
+        &[
+            "pasteagaintoexpand",
+            "ctrl+rtoexpand",
+            "pastedtext#",
+            "pastedcontent#",
+        ],
         &["pasteagaintoexpand", "ctrl+rtoexpand", "pastedtext#"],
         true,
     ),
@@ -155,10 +176,21 @@ const PATTERNS: &[NoisePattern] = &[
         "mode_footer",
         &["modeon"],
         &["shift+tabtocycle", "⏵", "⏸", "⏭", "ⅱ"],
-        &["modeon(shift+tabtocycle)", "automodeon", "manualmodeon", "acceptedistmodeon"],
+        &[
+            "modeon(shift+tabtocycle)",
+            "automodeon",
+            "manualmodeon",
+            "acceptedistmodeon",
+        ],
         false,
     ),
-    p("permission_footer", &["bypasspermissions"], &[], &["bypasspermissionsmodeon"], true),
+    p(
+        "permission_footer",
+        &["bypasspermissions"],
+        &[],
+        &["bypasspermissionsmodeon"],
+        true,
+    ),
     // Spinner lines also carry "esc to interrupt", so they must be classified
     // BEFORE `interrupt_hint` to be reported as what they are. Both are noise;
     // ordering only affects the reported id. The ellipsis is part of the marker
@@ -166,7 +198,14 @@ const PATTERNS: &[NoisePattern] = &[
     p(
         "spinner_word",
         &[],
-        &["thinking…", "pondering…", "inferring…", "recombobulating…", "cookedfor", "esctointerrupt)"],
+        &[
+            "thinking…",
+            "pondering…",
+            "inferring…",
+            "recombobulating…",
+            "cookedfor",
+            "esctointerrupt)",
+        ],
         &["thinking…", "pondering…", "inferring…", "recombobulating…"],
         true,
     ),
@@ -174,21 +213,44 @@ const PATTERNS: &[NoisePattern] = &[
     p(
         "interrupt_hint",
         &[],
-        &["esctointerrupt", "ctrl+ctoexit", "ctrl+gtoeditinvim", "?forshortcuts", "←foragents"],
-        &["esctointerrupt", "ctrl+gtoeditinvim", "?forshortcuts", "←foragents", "ctrl+ctoexit"],
+        &[
+            "esctointerrupt",
+            "ctrl+ctoexit",
+            "ctrl+gtoeditinvim",
+            "?forshortcuts",
+            "←foragents",
+        ],
+        &[
+            "esctointerrupt",
+            "ctrl+gtoeditinvim",
+            "?forshortcuts",
+            "←foragents",
+            "ctrl+ctoexit",
+        ],
         true,
     ),
     p(
         "mcp_notice",
         &["mcpserver"],
-        &["needsauthentication", "needsauth", "failedtoconnect", "failed·", "run/mcp"],
+        &[
+            "needsauthentication",
+            "needsauth",
+            "failedtoconnect",
+            "failed·",
+            "run/mcp",
+        ],
         &["mcpserverneedsauthentication", "mcpserverfailed"],
         true,
     ),
     p(
         "release_banner",
         &[],
-        &["run/inittocreate", "/release-notesformore", "whatsnewinclaudecode", "what'snewinclaudecode"],
+        &[
+            "run/inittocreate",
+            "/release-notesformore",
+            "whatsnewinclaudecode",
+            "what'snewinclaudecode",
+        ],
         &["run/inittocreate", "/release-notesformore"],
         true,
     ),
@@ -196,22 +258,49 @@ const PATTERNS: &[NoisePattern] = &[
     p(
         "update_notice",
         &[],
-        &["newversionavailable", "updateavailable", "npmi-g@anthropic-ai", "npmi-gdudu", "npmi-gclaude"],
+        &[
+            "newversionavailable",
+            "updateavailable",
+            "npmi-g@anthropic-ai",
+            "npmi-gdudu",
+            "npmi-gclaude",
+        ],
         &["newversionavailable", "updateavailable"],
         true,
     ),
     p(
         "usage_limit_notice",
         &[],
-        &["creditbalancetoolow", "approachingusagelimit", "usagelimitreached", "limitwillresetat"],
-        &["creditbalancetoolow", "approachingusagelimit", "usagelimitreached"],
+        &[
+            "creditbalancetoolow",
+            "approachingusagelimit",
+            "usagelimitreached",
+            "limitwillresetat",
+        ],
+        &[
+            "creditbalancetoolow",
+            "approachingusagelimit",
+            "usagelimitreached",
+        ],
         true,
     ),
-    p("limit_reached_notice", &["limitreached"], &[], &["limitreached·", "5-hourlimitreached"], true),
+    p(
+        "limit_reached_notice",
+        &["limitreached"],
+        &[],
+        &["limitreached·", "5-hourlimitreached"],
+        true,
+    ),
     p(
         "context_compaction",
         &[],
-        &["run/compact", "auto-compact", "autocompact", "contextlowrun/compact", "compactingconversation"],
+        &[
+            "run/compact",
+            "auto-compact",
+            "autocompact",
+            "contextlowrun/compact",
+            "compactingconversation",
+        ],
         &["run/compact", "auto-compact", "contextlowrun/compact"],
         true,
     ),
@@ -235,11 +324,25 @@ const PATTERNS: &[NoisePattern] = &[
     p(
         "gemini_notice",
         &[],
-        &["gemini.mdfile", "datacollectionisdisabled", "tipsforgettingstarted"],
-        &["gemini.mdfile", "datacollectionisdisabled", "tipsforgettingstarted"],
+        &[
+            "gemini.mdfile",
+            "datacollectionisdisabled",
+            "tipsforgettingstarted",
+        ],
+        &[
+            "gemini.mdfile",
+            "datacollectionisdisabled",
+            "tipsforgettingstarted",
+        ],
         true,
     ),
-    p("sandbox_footer", &["nosandbox"], &[], &["(nosandbox)", "nosandbox·"], true),
+    p(
+        "sandbox_footer",
+        &["nosandbox"],
+        &[],
+        &["(nosandbox)", "nosandbox·"],
+        true,
+    ),
     p(
         "trust_dialog",
         &[],
@@ -308,7 +411,9 @@ fn is_trailing_status(line: &str, lines_from_end: usize) -> bool {
     if t.chars().count() > TAIL_MAX_CHARS {
         return false;
     }
-    !t.chars().last().is_some_and(|c| SENTENCE_ENDINGS.contains(&c))
+    !t.chars()
+        .last()
+        .is_some_and(|c| SENTENCE_ENDINGS.contains(&c))
 }
 
 /// Hard vetoes: never delete a span carrying East-Asian script, and never
@@ -345,7 +450,11 @@ pub struct NoiseVerdict {
 
 impl NoiseVerdict {
     fn unchanged(text: &str) -> Self {
-        Self { text: text.to_string(), removed: Vec::new(), kept_suspicious: Vec::new() }
+        Self {
+            text: text.to_string(),
+            removed: Vec::new(),
+            kept_suspicious: Vec::new(),
+        }
     }
 }
 
@@ -360,14 +469,51 @@ pub fn strip_cli_noise(text: &str) -> NoiseVerdict {
     // Cheap bail-out: no pattern can match without at least one of these.
     let lower = text.to_lowercase();
     const TRIPWIRES: &[&str] = &[
-        "transcript", "claude_code_", "codex_sandbox", "gemini_cli_", "paste", "mode on",
-        "modeon", "bypass permissions", "bypasspermissions", "interrupt", "shortcuts",
-        "mcp server", "mcpserver", "release-notes", "for agents", "foragents", "vim",
-        "version available", "versionavailable", "npm i -g", "npmi-g", "limit", "credit balance",
-        "creditbalance", "compact", "total cost", "totalcost", "thinking…", "pondering…",
-        "inferring…", "recombobulating", "ctrl+c", "stdin", "gemini.md", "sandbox",
-        "data collection", "datacollection", "getting started", "gettingstarted",
-        "trust the files", "trustthefiles", "cooked for", "cookedfor", "what's new", "whatsnew",
+        "transcript",
+        "claude_code_",
+        "codex_sandbox",
+        "gemini_cli_",
+        "paste",
+        "mode on",
+        "modeon",
+        "bypass permissions",
+        "bypasspermissions",
+        "interrupt",
+        "shortcuts",
+        "mcp server",
+        "mcpserver",
+        "release-notes",
+        "for agents",
+        "foragents",
+        "vim",
+        "version available",
+        "versionavailable",
+        "npm i -g",
+        "npmi-g",
+        "limit",
+        "credit balance",
+        "creditbalance",
+        "compact",
+        "total cost",
+        "totalcost",
+        "thinking…",
+        "pondering…",
+        "inferring…",
+        "recombobulating",
+        "ctrl+c",
+        "stdin",
+        "gemini.md",
+        "sandbox",
+        "data collection",
+        "datacollection",
+        "getting started",
+        "gettingstarted",
+        "trust the files",
+        "trustthefiles",
+        "cooked for",
+        "cookedfor",
+        "what's new",
+        "whatsnew",
         "/init",
     ];
     if !TRIPWIRES.iter().any(|t| lower.contains(t)) {
@@ -408,7 +554,9 @@ pub fn strip_cli_noise(text: &str) -> NoiseVerdict {
                     continue;
                 }
                 let suffix = &line[byte_idx..];
-                let Some(spat) = classify(suffix) else { continue };
+                let Some(spat) = classify(suffix) else {
+                    continue;
+                };
                 if !passes_hard_vetoes(suffix) {
                     continue;
                 }
@@ -438,7 +586,11 @@ pub fn strip_cli_noise(text: &str) -> NoiseVerdict {
                  terminal chrome — reply kept verbatim"
             );
         }
-        return NoiseVerdict { text: text.to_string(), removed, kept_suspicious: kept };
+        return NoiseVerdict {
+            text: text.to_string(),
+            removed,
+            kept_suspicious: kept,
+        };
     }
 
     let cleaned = collapse_blank_runs(&out_lines);
@@ -448,10 +600,18 @@ pub fn strip_cli_noise(text: &str) -> NoiseVerdict {
             patterns = ?removed,
             "cli_noise: filtering would empty the reply — returning original text unchanged"
         );
-        return NoiseVerdict { text: text.to_string(), removed: Vec::new(), kept_suspicious: removed };
+        return NoiseVerdict {
+            text: text.to_string(),
+            removed: Vec::new(),
+            kept_suspicious: removed,
+        };
     }
     warn!(patterns = ?removed, "cli_noise: stripped AI-runtime internal message(s) from outgoing reply");
-    NoiseVerdict { text: cleaned, removed, kept_suspicious: kept }
+    NoiseVerdict {
+        text: cleaned,
+        removed,
+        kept_suspicious: kept,
+    }
 }
 
 /// Join kept lines, collapsing runs of blank lines left behind by removals and
@@ -479,14 +639,12 @@ mod tests {
 
     /// Byte-for-byte excerpt of a live `claude` 2.1.220 PTY capture taken on
     /// 2026-08-04 (ANSI already stripped) — the spaced render form.
-    const LIVE_TRANSCRIPT_NOTICE: &str =
-        "⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart \
+    const LIVE_TRANSCRIPT_NOTICE: &str = "⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart \
          with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 to keep future transcripts";
     /// The same notice as it reached the customer: the TUI's diff-repaint
     /// expresses horizontal spacing with cursor-move escapes, so once those are
     /// stripped the ASCII spaces are gone.
-    const FIELD_TRANSCRIPT_NOTICE: &str =
-        "⚠Transcriptssavingisoff—inheritedCLAUDE_CODE_CHILD_SESSIONmarker·restartwithCLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1tokeepfuturetranscripts";
+    const FIELD_TRANSCRIPT_NOTICE: &str = "⚠Transcriptssavingisoff—inheritedCLAUDE_CODE_CHILD_SESSIONmarker·restartwithCLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1tokeepfuturetranscripts";
 
     // ── Positive: the real field noise must still be caught ─────────────
 
@@ -495,7 +653,10 @@ mod tests {
         for notice in [LIVE_TRANSCRIPT_NOTICE, FIELD_TRANSCRIPT_NOTICE] {
             let input = format!("好的，我幫你查到三筆資料。\n{notice}");
             let v = strip_cli_noise(&input);
-            assert_eq!(v.text, "好的，我幫你查到三筆資料。", "notice not removed: {notice}");
+            assert_eq!(
+                v.text, "好的，我幫你查到三筆資料。",
+                "notice not removed: {notice}"
+            );
             assert!(!v.removed.is_empty());
         }
     }
@@ -524,7 +685,8 @@ mod tests {
 
     #[test]
     fn removes_the_space_stripped_field_forms() {
-        let input = "完成了。\n⏵⏵manualmodeon(shift+tabtocycle)\npasteagaintoexpand\nesctointerrupt";
+        let input =
+            "完成了。\n⏵⏵manualmodeon(shift+tabtocycle)\npasteagaintoexpand\nesctointerrupt";
         let v = strip_cli_noise(input);
         assert_eq!(v.text, "完成了。");
         assert_eq!(v.removed.len(), 3);
@@ -571,11 +733,26 @@ mod tests {
     #[test]
     fn removes_p2_notice_classes() {
         let cases: &[(&str, &str)] = &[
-            ("update_notice", "⚠ New version available · run npm i -g @anthropic-ai/claude-code"),
-            ("usage_limit_notice", "⚠ Approaching usage limit · resets at 3pm"),
-            ("limit_reached_notice", "⚠ 5-hour limit reached · try again later"),
-            ("context_compaction", "⚠ Context low · Run /compact to compact the conversation"),
-            ("cost_summary", "· Total cost (USD): $0.42 · Total duration (API): 1m 3s"),
+            (
+                "update_notice",
+                "⚠ New version available · run npm i -g @anthropic-ai/claude-code",
+            ),
+            (
+                "usage_limit_notice",
+                "⚠ Approaching usage limit · resets at 3pm",
+            ),
+            (
+                "limit_reached_notice",
+                "⚠ 5-hour limit reached · try again later",
+            ),
+            (
+                "context_compaction",
+                "⚠ Context low · Run /compact to compact the conversation",
+            ),
+            (
+                "cost_summary",
+                "· Total cost (USD): $0.42 · Total duration (API): 1m 3s",
+            ),
             ("spinner_word", "✻ Thinking… (12s · esc to interrupt)"),
             ("codex_notice", "· To exit press Ctrl+C"),
             ("gemini_notice", "· Using: 1 GEMINI.md file · no sandbox"),
@@ -584,7 +761,10 @@ mod tests {
         for (id, notice) in cases {
             let input = format!("這是給使用者的答案。\n{notice}");
             let v = strip_cli_noise(&input);
-            assert_eq!(v.text, "這是給使用者的答案。", "{id} not removed from {notice:?}");
+            assert_eq!(
+                v.text, "這是給使用者的答案。",
+                "{id} not removed from {notice:?}"
+            );
             assert!(v.removed.contains(id), "{id} expected, got {:?}", v.removed);
         }
     }
@@ -676,7 +856,10 @@ mod tests {
         let v = strip_cli_noise(text);
         assert_eq!(v.text, text);
         assert!(v.removed.is_empty());
-        assert!(!v.kept_suspicious.is_empty(), "should still be reported as suspicious");
+        assert!(
+            !v.kept_suspicious.is_empty(),
+            "should still be reported as suspicious"
+        );
     }
 
     /// The multi-line version of the old single-line test: real answers that

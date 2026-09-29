@@ -264,11 +264,7 @@ pub fn tier_model(
     let pick = match tier {
         ModelTier::Cheap => {
             let u = utility.trim();
-            if u.is_empty() {
-                preferred
-            } else {
-                u
-            }
+            if u.is_empty() { preferred } else { u }
         }
         ModelTier::Standard => standard
             .map(str::trim)
@@ -653,7 +649,10 @@ mod tests {
             "util-m",
             false, // resolved runtime provider is not Claude
         );
-        assert_eq!(m, "gemini-2.5-pro", "non-Claude runtime keeps its own model");
+        assert_eq!(
+            m, "gemini-2.5-pro",
+            "non-Claude runtime keeps its own model"
+        );
     }
 
     #[test]

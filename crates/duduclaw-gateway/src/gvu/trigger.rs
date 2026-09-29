@@ -26,7 +26,6 @@ use tracing::{info, warn};
 
 use crate::gvu::loop_::{GvuLoop, GvuOutcome};
 use crate::gvu::mistake_notebook::MistakeNotebook;
-use crate::gvu::version_store::VersionMetrics;
 use crate::prediction::engine::{ErrorCategory, PredictionEngine};
 use crate::prediction::metacognition::MetaCognition;
 
@@ -205,7 +204,6 @@ where
     }
 
     let contract = duduclaw_agent::contract::load_contract(agent_dir);
-    let pre_metrics = VersionMetrics::default();
 
     let trigger_context =
         build_trigger_context(agent_id, composite_error, category, source, extra_context);
@@ -223,18 +221,14 @@ where
         .map(|nb| nb.query_by_agent(agent_id, 5))
         .unwrap_or_default();
 
-    let meta_snapshot = prediction_engine.metacognition.lock().await.clone();
-
     let outcome = gvu
         .run_with_context(
             agent_id,
             agent_dir,
             &trigger_context,
-            pre_metrics,
             &contract.boundaries.must_not,
             &contract.boundaries.must_always,
             call_llm,
-            Some(&meta_snapshot),
             relevant_mistakes,
         )
         .await;
@@ -285,16 +279,9 @@ async fn record_outcome_to_metacognition(
     agent_id: &str,
 ) {
     match outcome {
-        GvuOutcome::Applied(version) => {
-            info!(
-                agent = agent_id,
-                version = %version.version_id,
-                "GVU applied SOUL.md change"
-            );
-            let mut meta = metacog.lock().await;
-            meta.record_outcome(category, true);
-        }
-        GvuOutcome::PlaybookEvolved { applied, verdict, .. } => {
+        GvuOutcome::PlaybookEvolved {
+            applied, verdict, ..
+        } => {
             info!(
                 agent = agent_id,
                 applied,
@@ -314,51 +301,24 @@ async fn record_outcome_to_metacognition(
             meta.record_outcome(category, false);
         }
         GvuOutcome::Skipped { reason } => {
-            // INFO not debug: when a trigger fires but the loop short-circuits
-            // (e.g. the agent is mid-observation from a previous applied
-            // version), we want operators to see WHY without enabling debug.
-            // Observed 2026-05-10 14:26Z: duduclaw-tl trigger fired, GVU loop
-            // returned Skipped because the 5/10 00:07Z applied version was
-            // still observing — but the log went silent at the default INFO
-            // filter, leaving "trigger fired … then nothing" with no clue.
+            // INFO not debug: when a trigger fires but the loop
+            // short-circuits (e.g. an AEE settlement window is still open),
+            // we want operators to see WHY without enabling debug. Observed
+            // 2026-05-10 14:26Z: duduclaw-tl trigger fired, the loop returned
+            // Skipped, but the log went silent at the default INFO filter,
+            // leaving "trigger fired … then nothing" with no clue.
             info!(agent = agent_id, %reason, "GVU skipped");
-            // Don't penalise the metacognition window for "observation
-            // already in progress" / "loop already running" / "cooldown
-            // active" (WP0.3) — those are legitimate throttling/concurrency
-            // guards, not failed reflections.
-            if !reason.contains("observation")
+            // Don't penalise the metacognition window for "settlement window
+            // active" / "loop already running" / "cooldown active" (WP0.3) —
+            // those are legitimate throttling/concurrency guards, not failed
+            // reflections.
+            if !reason.contains("settlement")
                 && !reason.contains("already running")
                 && !reason.contains("cooldown")
             {
                 let mut meta = metacog.lock().await;
                 meta.record_outcome(category, false);
             }
-        }
-        GvuOutcome::Deferred {
-            retry_count,
-            retry_after_hours,
-            ..
-        } => {
-            info!(
-                agent = agent_id,
-                retry_count,
-                retry_after_hours,
-                "GVU deferred — will retry with accumulated gradients"
-            );
-            // Retry path will record the eventual outcome.
-        }
-        GvuOutcome::TimedOut {
-            elapsed,
-            generations_completed,
-            ..
-        } => {
-            warn!(
-                agent = agent_id,
-                elapsed_secs = elapsed.as_secs(),
-                generations_completed,
-                "GVU timed out — wall-clock budget exceeded"
-            );
-            // Inconclusive — don't move the metacognition window.
         }
     }
 }

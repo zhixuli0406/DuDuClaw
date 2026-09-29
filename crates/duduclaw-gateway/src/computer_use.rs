@@ -156,12 +156,7 @@ pub fn mask_screenshot_regions(
     let mut buf = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut buf);
     encoder
-        .write_image(
-            img.as_raw(),
-            img_w,
-            img_h,
-            image::ExtendedColorType::Rgba8,
-        )
+        .write_image(img.as_raw(), img_w, img_h, image::ExtendedColorType::Rgba8)
         .map_err(|e| ComputerUseError::ParseError(format!("PNG encode failed: {e}")))?;
 
     // Encode to base64
@@ -174,8 +169,25 @@ pub fn mask_screenshot_regions(
 fn is_safe_css_selector(selector: &str) -> bool {
     selector.chars().all(|c| {
         c.is_ascii_alphanumeric()
-            || matches!(c, '-' | '_' | '.' | '#' | '[' | ']' | '=' | '"' | ' '
-                | ',' | '*' | '>' | '+' | '~' | ':' | '(' | ')')
+            || matches!(
+                c,
+                '-' | '_'
+                    | '.'
+                    | '#'
+                    | '['
+                    | ']'
+                    | '='
+                    | '"'
+                    | ' '
+                    | ','
+                    | '*'
+                    | '>'
+                    | '+'
+                    | '~'
+                    | ':'
+                    | '('
+                    | ')'
+            )
     })
 }
 
@@ -191,10 +203,14 @@ pub async fn detect_sensitive_regions(
     // Validate container name to prevent argument injection
     if container_name.is_empty()
         || container_name.len() > 128
-        || !container_name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || !container_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         || container_name.starts_with('-')
     {
-        return Err(ComputerUseError::ApiError(format!("invalid container name: {container_name}")));
+        return Err(ComputerUseError::ApiError(format!(
+            "invalid container name: {container_name}"
+        )));
     }
     if patterns.is_empty() {
         return Ok(Vec::new());
@@ -216,8 +232,7 @@ pub async fn detect_sensitive_regions(
     // remaining special characters (e.g. double-quotes) are properly escaped
     // and cannot break out of the JavaScript string context.
     let combined = safe_patterns.join(", ");
-    let selector_json = serde_json::to_string(&combined)
-        .unwrap_or_else(|_| "\"\"".to_string());
+    let selector_json = serde_json::to_string(&combined).unwrap_or_else(|_| "\"\"".to_string());
     let js = format!(
         r#"JSON.stringify(
             Array.from(document.querySelectorAll({selector_json}))
@@ -265,7 +280,10 @@ pub async fn detect_sensitive_regions(
     })?;
 
     if !regions.is_empty() {
-        tracing::info!(count = regions.len(), "Detected sensitive regions in screenshot");
+        tracing::info!(
+            count = regions.len(),
+            "Detected sensitive regions in screenshot"
+        );
     }
 
     Ok(regions)
@@ -617,7 +635,8 @@ mod tests {
 
     #[test]
     fn tool_definition_structure() {
-        let session = ComputerUseSession::new("test-key".into(), "claude-sonnet-4-20250514".into(), None);
+        let session =
+            ComputerUseSession::new("test-key".into(), "claude-sonnet-4-20250514".into(), None);
         let def = session.build_tool_definition();
 
         assert_eq!(def["type"], "computer_20251124");
@@ -628,14 +647,8 @@ mod tests {
 
     #[test]
     fn tool_definition_custom_size() {
-        let session = ComputerUseSession::with_config(
-            "key".into(),
-            "model".into(),
-            1920,
-            1080,
-            100,
-            None,
-        );
+        let session =
+            ComputerUseSession::with_config("key".into(), "model".into(), 1920, 1080, 100, None);
         let def = session.build_tool_definition();
         assert_eq!(def["display_width_px"], 1920);
         assert_eq!(def["display_height_px"], 1080);
@@ -713,14 +726,8 @@ mod tests {
 
     #[test]
     fn max_actions_enforced() {
-        let mut session = ComputerUseSession::with_config(
-            "key".into(),
-            "model".into(),
-            1280,
-            800,
-            2,
-            None,
-        );
+        let mut session =
+            ComputerUseSession::with_config("key".into(), "model".into(), 1280, 800, 2, None);
         // Simulate having taken the max number of actions
         session.actions_taken = 2;
 
@@ -754,8 +761,13 @@ mod tests {
 
         let result = session.parse_response(&response).unwrap();
         assert_eq!(result.actions.len(), 1);
-        assert!(matches!(&result.actions[0], ComputerAction::LeftClick { coordinate } if *coordinate == [500, 300]));
-        assert_eq!(result.text_response.as_deref(), Some("I see a button. Let me click it."));
+        assert!(
+            matches!(&result.actions[0], ComputerAction::LeftClick { coordinate } if *coordinate == [500, 300])
+        );
+        assert_eq!(
+            result.text_response.as_deref(),
+            Some("I see a button. Let me click it.")
+        );
         assert_eq!(result.input_tokens, 1500);
         assert_eq!(result.output_tokens, 42);
         assert_eq!(session.actions_taken(), 1);
@@ -867,8 +879,14 @@ mod tests {
             .decode(&masked)
             .unwrap();
         let masked_img = image::load_from_memory(&masked_bytes).unwrap().to_rgba8();
-        assert_eq!(masked_img.get_pixel(0, 0), &image::Rgba([255, 255, 255, 255]));
-        assert_eq!(masked_img.get_pixel(3, 3), &image::Rgba([255, 255, 255, 255]));
+        assert_eq!(
+            masked_img.get_pixel(0, 0),
+            &image::Rgba([255, 255, 255, 255])
+        );
+        assert_eq!(
+            masked_img.get_pixel(3, 3),
+            &image::Rgba([255, 255, 255, 255])
+        );
     }
 
     #[test]
@@ -884,12 +902,18 @@ mod tests {
             .unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
 
-        let masked = mask_screenshot_regions(&b64, &[[2, 2, u32::MAX, u32::MAX]], [0, 0, 0]).unwrap();
-        let masked_bytes = base64::engine::general_purpose::STANDARD.decode(&masked).unwrap();
+        let masked =
+            mask_screenshot_regions(&b64, &[[2, 2, u32::MAX, u32::MAX]], [0, 0, 0]).unwrap();
+        let masked_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&masked)
+            .unwrap();
         let masked_img = image::load_from_memory(&masked_bytes).unwrap().to_rgba8();
         // (3,3) inside the clamped region → black; (0,0) untouched → white.
         assert_eq!(masked_img.get_pixel(3, 3), &image::Rgba([0, 0, 0, 255]));
-        assert_eq!(masked_img.get_pixel(0, 0), &image::Rgba([255, 255, 255, 255]));
+        assert_eq!(
+            masked_img.get_pixel(0, 0),
+            &image::Rgba([255, 255, 255, 255])
+        );
     }
 
     #[test]

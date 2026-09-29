@@ -228,6 +228,873 @@ fn default_utility_model() -> String {
 /// Matches the `agents.create` scaffold default so display and execution agree.
 pub const DEFAULT_PREFERRED_MODEL: &str = "claude-sonnet-4-6";
 
+// ═══════════════════════════════════════════════════════════════════════
+// `[team]` — Team-as-Agent role composition (P1/WP-1)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Design: `commercial/docs/DESIGN-team-as-agent-2026-09.md` §1, §3.1, §3.11.
+//
+// An **employee** stays the only user-visible unit (agent directory, SOUL.md,
+// channels, memory, playbook — unchanged). A **team** is a role grouping
+// *inside* one employee: `planner` / `executor` / `verifier` / `utility`,
+// each bound to its own `{runtime, model, effort}`.
+//
+// Three properties of this schema are load-bearing and are enforced by
+// [`validate_team`], not by convention:
+//
+// 1. **`(role, runtime, model)` is a triple, never a bare model name.**
+//    Goose's Lead/Worker shipped role configs that stored only the model
+//    name; a `qwen-*` lead was then executed by the Claude backend
+//    (goose#10731). Here a model whose family does not belong to its
+//    declared runtime is a hard [`TeamConfigError::ModelRuntimeMismatch`] —
+//    the platform never guesses a provider for a model id it cannot place.
+// 2. **The verifier's model family must differ from the executor's**
+//    (decision C, arXiv:2607.13918 — decorrelation is the lever, adding
+//    another same-family judge is not). Same family ⇒ refuse to form the
+//    team, do not warn-and-continue.
+// 3. **Default Solo — decided by the gate, not by the switch.** Since v1.66
+//    `enabled` defaults to `true` and the gate ([`crate::team_gate`])
+//    defaults to `auto`; a team is formed per task, never per boot. The
+//    ordinary task still runs Solo because the gate needs three of its four
+//    signals, and an unconfigured `[team.roles]` still runs Solo because
+//    [`cascade_unbound_roles`] gives executor and verifier the same employee
+//    model, which the decorrelation rule refuses.
+//
+// Cascade: a role field missing in `agent.toml [team]` falls back to the same
+// field of `config.toml [team]` ([`TeamConfig::merge`]), and a role that
+// resolves to nothing at all falls back — in the *caller* — to the employee's
+// `[model] preferred`. That last hop is deliberately outside this module: it
+// needs the employee's `AgentConfig`, which this validation layer does not
+// take.
+
+/// One of the four fixed roles inside an employee's team.
+///
+/// Distinct from [`AgentRole`], which is an *employee's* org role
+/// (`main` / `specialist` / `worker` / …). The two never mix: an employee has
+/// exactly one [`AgentRole`] and, when a team is formed for a task, up to four
+/// [`Role`] slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Decomposition and planning.
+    Planner,
+    /// Does the work. May be fanned out (see [`TeamConfig::executor_fanout`]).
+    Executor,
+    /// Independent acceptance. Must not share the executor's model family.
+    Verifier,
+    /// Summarisation / classification / chores. Does not occupy a spawn slot.
+    Utility,
+}
+
+impl Role {
+    /// Every role, in pipeline order. Iteration order of validation and of
+    /// the `[team.roles.*]` table is this order, so error reporting is
+    /// deterministic.
+    pub const ALL: &'static [Role] =
+        &[Role::Planner, Role::Executor, Role::Verifier, Role::Utility];
+
+    /// Canonical lowercase identifier — the `[team.roles.<id>]` key, the
+    /// `role_turns.jsonl` field value, and the inverse of
+    /// [`std::str::FromStr::from_str`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Planner => "planner",
+            Role::Executor => "executor",
+            Role::Verifier => "verifier",
+            Role::Utility => "utility",
+        }
+    }
+
+    /// Comma-separated list of every valid role id, for error messages.
+    pub fn valid_values_help() -> &'static str {
+        "planner, executor, verifier, utility"
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = String;
+
+    /// Exact (case-insensitive, trimmed) match only. Unlike [`AgentRole`],
+    /// this enum has **no aliases**: the four ids are new surface with no
+    /// legacy spellings to accept, and a silently-accepted near-miss here
+    /// would route a turn to the wrong role.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "planner" => Ok(Role::Planner),
+            "executor" => Ok(Role::Executor),
+            "verifier" => Ok(Role::Verifier),
+            "utility" => Ok(Role::Utility),
+            other => Err(format!(
+                "unknown team role `{other}` (expected one of: {})",
+                Role::valid_values_help()
+            )),
+        }
+    }
+}
+
+// `Effort` is NOT defined here. The per-call reasoning-effort enum, its
+// per-runtime ceiling/clamp and its verified CLI flag mapping live in
+// [`crate::effort`] (P1/WP-3) — one crate must not carry two spellings of the
+// same knob, and that module is the one that knows which runtimes accept
+// which levels. This layer keeps `[team.roles.*] effort` as a raw string
+// (see [`RoleSpec::effort`]) and parses it through
+// [`crate::effort::Effort`] in [`validate_team`].
+//
+// Note on Gemini: its CLI has no effort flag at all. That is deliberately
+// NOT a config error here — refusing the key would make the same `[team]`
+// non-portable across runtimes for no safety gain. The spawn layer
+// (WP-3, via `Effort::is_supported_by`) is where it becomes a no-op.
+
+/// How the decomposability gate ([`crate::team_gate`]) behaves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamGateMode {
+    /// Run the L0/L1 rules (design §3.2). The only mode intended for
+    /// production.
+    #[default]
+    Auto,
+    /// Never form a team. The kill switch.
+    AlwaysSolo,
+    /// Always form a team — **testing only**: it bypasses every hard
+    /// exclusion, including the irreversible-tool one.
+    AlwaysTeam,
+}
+
+impl TeamGateMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TeamGateMode::Auto => "auto",
+            TeamGateMode::AlwaysSolo => "always_solo",
+            TeamGateMode::AlwaysTeam => "always_team",
+        }
+    }
+
+    pub fn valid_values_help() -> &'static str {
+        "auto, always_solo, always_team"
+    }
+}
+
+impl std::fmt::Display for TeamGateMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TeamGateMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(TeamGateMode::Auto),
+            "always_solo" | "always-solo" => Ok(TeamGateMode::AlwaysSolo),
+            "always_team" | "always-team" => Ok(TeamGateMode::AlwaysTeam),
+            other => Err(format!(
+                "unknown team gate mode `{other}` (expected one of: {})",
+                TeamGateMode::valid_values_help()
+            )),
+        }
+    }
+}
+
+/// One `[team.roles.<role>]` table, exactly as written.
+///
+/// Every field is `Option` so the global → per-employee cascade is
+/// **field-wise**: an employee that overrides only `effort` keeps the global
+/// `runtime` / `model`. Collapsing an absent key into a default here would
+/// make "unset" indistinguishable from "explicitly the default", and the
+/// merge would then overwrite the global value with a phantom one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct RoleSpec {
+    /// Runtime id (or catalog alias, e.g. `agy`). Raw `String` — the
+    /// allowlist and canonicalisation happen in [`validate_team`], which can
+    /// report *which role* was wrong; a strict serde enum here would fail the
+    /// whole `agent.toml` and take the employee out of the registry.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// Model id within that runtime's family.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning effort. Raw `String` for the same reason as `runtime`;
+    /// parsed into [`Effort`] by [`validate_team`].
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl RoleSpec {
+    /// True when the role declares nothing at all — the caller then cascades
+    /// to the employee's `[model] preferred`.
+    pub fn is_empty(&self) -> bool {
+        self.runtime.is_none() && self.model.is_none() && self.effort.is_none()
+    }
+
+    /// Field-wise override: every `Some` in `over` wins, every `None` keeps
+    /// `self`.
+    pub fn merged_with(&self, over: &RoleSpec) -> RoleSpec {
+        RoleSpec {
+            runtime: over.runtime.clone().or_else(|| self.runtime.clone()),
+            model: over.model.clone().or_else(|| self.model.clone()),
+            effort: over.effort.clone().or_else(|| self.effort.clone()),
+        }
+    }
+}
+
+/// The `[team.roles]` table — the four fixed slots.
+///
+/// A struct, not a map: the role set is closed, so an unknown
+/// `[team.roles.reviewer]` table is ignored exactly like any other unknown
+/// key rather than silently creating a fifth role nothing dispatches to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct TeamRoles {
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    #[serde(skip_serializing_if = "RoleSpec::is_empty")]
+    pub planner: RoleSpec,
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    #[serde(skip_serializing_if = "RoleSpec::is_empty")]
+    pub executor: RoleSpec,
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    #[serde(skip_serializing_if = "RoleSpec::is_empty")]
+    pub verifier: RoleSpec,
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    #[serde(skip_serializing_if = "RoleSpec::is_empty")]
+    pub utility: RoleSpec,
+}
+
+impl TeamRoles {
+    pub fn get(&self, role: Role) -> &RoleSpec {
+        match role {
+            Role::Planner => &self.planner,
+            Role::Executor => &self.executor,
+            Role::Verifier => &self.verifier,
+            Role::Utility => &self.utility,
+        }
+    }
+
+    pub fn get_mut(&mut self, role: Role) -> &mut RoleSpec {
+        match role {
+            Role::Planner => &mut self.planner,
+            Role::Executor => &mut self.executor,
+            Role::Verifier => &mut self.verifier,
+            Role::Utility => &mut self.utility,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        Role::ALL.iter().all(|r| self.get(*r).is_empty())
+    }
+}
+
+/// Default for [`TeamConfig::executor_fanout`] when unset.
+pub const TEAM_EXECUTOR_FANOUT_DEFAULT: u8 = 1;
+/// Hard ceiling for [`TeamConfig::executor_fanout`] (design §3.1). Copies
+/// above this buy nothing measurable and multiply cost linearly.
+pub const TEAM_EXECUTOR_FANOUT_MAX: u8 = 3;
+
+/// `config.toml [team]` (global defaults) and `agent.toml [team]`
+/// (per-employee overrides) — the same shape on both sides.
+///
+/// The three scalars are `Option` for the same reason [`RoleSpec`]'s fields
+/// are: [`TeamConfig::merge`] is field-wise, so "unset" and "explicitly
+/// false" must stay distinguishable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct TeamConfig {
+    /// Master switch. Unset ⇒ `true` since v1.66 — the decomposability gate,
+    /// not this flag, is what keeps an ordinary task Solo.
+    ///
+    /// It used to default to `false`, which made teams doubly off (a flag AND
+    /// a gate that leans Solo) and meant nothing ever exercised the path. The
+    /// switch now says "teams may form", and [`crate::team_gate::decide`]
+    /// still answers Solo for everything that does not clear its four
+    /// signals. An explicit `enabled = false` remains a real kill switch, and
+    /// a deployment that never wrote `[team.roles]` still runs Solo because
+    /// its executor and verifier cascade onto the employee's own model and
+    /// therefore share a family (see [`cascade_unbound_roles`]).
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// How many executor copies work the same sub-task. Unset ⇒
+    /// [`TEAM_EXECUTOR_FANOUT_DEFAULT`]; out of range ⇒ clamped into
+    /// `1..=`[`TEAM_EXECUTOR_FANOUT_MAX`] with a note, never rejected (a
+    /// fanout typo must not cost an operator their whole team).
+    ///
+    /// Stored as `i64`, the TOML integer width, so the clamp can *see* the
+    /// out-of-range value it is correcting.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor_fanout: Option<i64>,
+    /// `auto` / `always_solo` / `always_team`. Raw `String`; an unrecognised
+    /// value degrades to [`TeamGateMode::Auto`] with a note (same convention
+    /// as `[goal_loop] resume_on_restart` and `[goal_intent] mode`).
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
+    /// `[team.roles.*]`.
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    #[serde(skip_serializing_if = "TeamRoles::is_empty")]
+    pub roles: TeamRoles,
+}
+
+impl TeamConfig {
+    /// True when nothing was written — lets [`AgentConfig`] skip serializing
+    /// the whole section so an absent `[team]` stays absent on rewrite.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Resolved master switch. Unset ⇒ `true` (see [`TeamConfig::enabled`]).
+    ///
+    /// "Enabled" only means *a team may be considered*. Three independent
+    /// things still have to hold before one forms: the spec must validate
+    /// (executor and verifier must exist and must not share a model family),
+    /// the decomposability gate must say Team, and the spawn budget must be
+    /// able to pay for a minimal round.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// Parse a `[team]` **table** value (i.e. the value of the `team` key),
+    /// tolerantly: a non-table, or any wrong-typed key inside it, degrades to
+    /// that field's default rather than failing.
+    ///
+    /// Takes `toml::Value` rather than text because the gateway already holds
+    /// a parsed `config.toml` document.
+    pub fn from_toml_value(value: &toml::Value) -> TeamConfig {
+        value.clone().try_into().unwrap_or_default()
+    }
+
+    /// Parse the `[team]` section out of a whole `config.toml` document
+    /// value. Missing section ⇒ all-defaults.
+    pub fn from_config_toml(document: &toml::Value) -> TeamConfig {
+        match document.get("team") {
+            Some(v) => TeamConfig::from_toml_value(v),
+            None => TeamConfig::default(),
+        }
+    }
+
+    /// Field-wise cascade: `config.toml [team]` (`global`) underneath,
+    /// `agent.toml [team]` (`agent`) on top. Every `Some` in `agent` wins;
+    /// every `None` keeps the global value. Role tables merge per field
+    /// ([`RoleSpec::merged_with`]), so overriding one role's `effort` does
+    /// not erase the global `runtime`/`model` for that role.
+    pub fn merge(global: &TeamConfig, agent: &TeamConfig) -> TeamConfig {
+        let mut roles = TeamRoles::default();
+        for role in Role::ALL {
+            *roles.get_mut(*role) = global.roles.get(*role).merged_with(agent.roles.get(*role));
+        }
+        TeamConfig {
+            enabled: agent.enabled.or(global.enabled),
+            executor_fanout: agent.executor_fanout.or(global.executor_fanout),
+            gate: agent.gate.clone().or_else(|| global.gate.clone()),
+            roles,
+        }
+    }
+}
+
+/// Fill the two **required** roles from the employee's own
+/// `[runtime] provider` / `[model] preferred` when `[team.roles]` left them
+/// unbound, and report which ones were filled.
+///
+/// # Why this exists
+///
+/// [`validate_team`] requires an executor *and* a verifier: a team without
+/// both is not a smaller team, it is Solo with extra steps. Before
+/// `[team] enabled` defaulted to `true` that was the end of it — an
+/// unconfigured `[team]` was simply disabled, so the missing halves never
+/// came up. With the default flipped, "the operator wrote no roles" is the
+/// normal case, and refusing it as a hard error would put a refusal row on
+/// every goal task of every deployment.
+///
+/// So an unbound executor / verifier now inherits the employee's own brain,
+/// which is exactly the cascade hop [`RoleSpec`] already documents for
+/// planner and utility ("otherwise, for a role that named neither a runtime
+/// nor a model, the employee's own `[model] preferred`"). The consequence is
+/// deliberate and is the safety property the default-on flip rests on: two
+/// roles cascading onto the same employee model share a model family, so
+/// [`validate_team`] answers [`TeamConfigError::VerifierSameFamily`] and the
+/// caller runs Solo. Turning teams on without naming a second vendor cannot
+/// silently buy a correlated verifier.
+///
+/// **Planner and utility are deliberately not filled.** Their unbound state
+/// already means "cascade to the employee's model" at spawn time, and
+/// materialising it here would flip `ResolvedTeam::planner` from `None` to
+/// `Some` — which is what decides whether a round runs a 規劃 stage at all.
+/// A cascade must not add a stage nobody configured.
+///
+/// Pure and I/O-free: the caller reads `agent.toml` and passes the two
+/// strings in. Empty / whitespace-only values count as absent.
+pub fn cascade_unbound_roles(
+    config: &TeamConfig,
+    employee_runtime: Option<&str>,
+    employee_model: Option<&str>,
+) -> (TeamConfig, Vec<Role>) {
+    let clean = |s: Option<&str>| -> Option<String> {
+        s.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let runtime = clean(employee_runtime);
+    let model = clean(employee_model);
+    let mut out = config.clone();
+    let mut cascaded = Vec::new();
+    if runtime.is_none() && model.is_none() {
+        return (out, cascaded);
+    }
+    // Only the two roles `validate_team` requires. See the doc comment.
+    //
+    // "Unbound" is `runtime.is_none() && model.is_none()` rather than
+    // `RoleSpec::is_empty()`: a role that declared only an `effort` is just as
+    // unbound, and its effort is a real preference that must survive the
+    // cascade rather than being the reason it does not happen.
+    for role in [Role::Executor, Role::Verifier] {
+        let spec = out.roles.get_mut(role);
+        if spec.runtime.is_some() || spec.model.is_some() {
+            continue;
+        }
+        spec.runtime = runtime.clone();
+        spec.model = model.clone();
+        cascaded.push(role);
+    }
+    (out, cascaded)
+}
+
+/// Runtimes that may back a team role in the first batch (decision D).
+///
+/// Every one of these already registers the DuDuClaw MCP server natively, so
+/// a role running on it gets the full tool surface. The remaining catalog
+/// entries (`qwen`, `kimi`, `copilot`, `cursor`, `kiro`, `vibe`, `opencode`,
+/// `openai_compat`) are **not** allowed yet — not because they cannot answer,
+/// but because a role that silently loses its tools produces confident
+/// tool-free narration, which the verifier cannot distinguish from work.
+pub const TEAM_ROLE_RUNTIME_ALLOWLIST: &[&str] =
+    &["claude", "codex", "gemini", "antigravity", "grok"];
+
+/// `"low, medium, high, xhigh, max"` — built from [`crate::effort::Effort::ALL`]
+/// so a new level never has to be remembered in an error message here.
+fn effort_values_help() -> String {
+    crate::effort::Effort::ALL
+        .iter()
+        .map(|e| e.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A non-fatal observation made while resolving a [`TeamConfig`].
+///
+/// Returned inside [`ResolvedTeam`] rather than logged: this crate is
+/// I/O-free and the caller owns both the log and the audit sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamNote {
+    /// `executor_fanout` was outside `1..=`[`TEAM_EXECUTOR_FANOUT_MAX`].
+    ExecutorFanoutClamped { requested: i64, applied: u8 },
+    /// `gate` held a value that is not a [`TeamGateMode`]; `auto` was used.
+    UnknownGateMode { value: String },
+    /// A role declared `effort` but neither `runtime` nor `model`, so it has
+    /// no slot of its own and cascades to the employee's `[model] preferred`
+    /// — which carries the employee's effort, not this one. The key is
+    /// therefore inert. Surfaced rather than dropped: a config whose only
+    /// written key does nothing is exactly the kind of thing an operator
+    /// must be told about.
+    EffortWithoutRoleBinding {
+        role: Role,
+        effort: crate::effort::Effort,
+    },
+}
+
+impl TeamNote {
+    /// Stable token for audit rows. Never derived from `Debug`.
+    pub fn code(&self) -> &'static str {
+        match self {
+            TeamNote::ExecutorFanoutClamped { .. } => "executor_fanout_clamped",
+            TeamNote::UnknownGateMode { .. } => "unknown_gate_mode",
+            TeamNote::EffortWithoutRoleBinding { .. } => "effort_without_role_binding",
+        }
+    }
+}
+
+impl std::fmt::Display for TeamNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TeamNote::ExecutorFanoutClamped { requested, applied } => write!(
+                f,
+                "executor_fanout {requested} is out of range 1..={TEAM_EXECUTOR_FANOUT_MAX}; using {applied}"
+            ),
+            TeamNote::UnknownGateMode { value } => write!(
+                f,
+                "unknown gate mode `{value}`; using auto (expected one of: {})",
+                TeamGateMode::valid_values_help()
+            ),
+            TeamNote::EffortWithoutRoleBinding { role, effort } => write!(
+                f,
+                "[team.roles.{role}] effort `{effort}` is ignored: the role declares neither \
+                 runtime nor model, so it cascades to the employee's own model"
+            ),
+        }
+    }
+}
+
+/// Why a [`TeamConfig`] cannot form a team. Closed enum — every variant
+/// carries a stable [`TeamConfigError::code`] for the audit log.
+///
+/// Every variant is a **refusal**, not a downgrade: the caller's correct
+/// response is to run the task Solo and surface the reason, never to form a
+/// partial team.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamConfigError {
+    /// The role's runtime is not in [`TEAM_ROLE_RUNTIME_ALLOWLIST`] (or is
+    /// not a runtime id at all).
+    RuntimeNotAllowed { role: Role, runtime: String },
+    /// The model does not belong to the declared runtime's family — or its
+    /// family is unknown to the catalog and no runtime was declared, so there
+    /// is nothing to bind it to. Never guessed (goose#10731).
+    ModelRuntimeMismatch {
+        role: Role,
+        runtime: Option<String>,
+        model: String,
+    },
+    /// Verifier and executor share a model family. Decision C: refuse to form
+    /// the team (arXiv:2607.13918 — decorrelation is the whole mechanism).
+    VerifierSameFamily { family: String },
+    /// `effort` is not one of [`Effort::ALL`].
+    InvalidEffort { role: Role, effort: String },
+    /// A role that must resolve (executor, verifier) declared neither a
+    /// runtime nor a model.
+    Incomplete { role: Role },
+}
+
+impl TeamConfigError {
+    /// Stable snake_case token for `role_turns.jsonl` / audit rows. Fixed
+    /// strings, never `format!("{:?}", …).to_lowercase()` — that idiom has
+    /// already produced one silently-wrong column in this workspace
+    /// (`McpOnly` → `"mcponly"`).
+    pub fn code(&self) -> &'static str {
+        match self {
+            TeamConfigError::RuntimeNotAllowed { .. } => "runtime_not_allowed",
+            TeamConfigError::ModelRuntimeMismatch { .. } => "model_runtime_mismatch",
+            TeamConfigError::VerifierSameFamily { .. } => "verifier_same_family",
+            TeamConfigError::InvalidEffort { .. } => "invalid_effort",
+            TeamConfigError::Incomplete { .. } => "team_incomplete",
+        }
+    }
+
+    /// The role the error is about, when it is about one.
+    pub fn role(&self) -> Option<Role> {
+        match self {
+            TeamConfigError::RuntimeNotAllowed { role, .. }
+            | TeamConfigError::ModelRuntimeMismatch { role, .. }
+            | TeamConfigError::InvalidEffort { role, .. }
+            | TeamConfigError::Incomplete { role } => Some(*role),
+            TeamConfigError::VerifierSameFamily { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TeamConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TeamConfigError::RuntimeNotAllowed { role, runtime } => write!(
+                f,
+                "[team.roles.{role}] runtime `{runtime}` cannot back a team role (allowed: {})",
+                TEAM_ROLE_RUNTIME_ALLOWLIST.join(", ")
+            ),
+            TeamConfigError::ModelRuntimeMismatch {
+                role,
+                runtime,
+                model,
+            } => match runtime {
+                Some(rt) => write!(
+                    f,
+                    "[team.roles.{role}] model `{model}` does not belong to runtime `{rt}`"
+                ),
+                None => write!(
+                    f,
+                    "[team.roles.{role}] model `{model}` belongs to no known runtime family; \
+                     declare `runtime` explicitly"
+                ),
+            },
+            TeamConfigError::VerifierSameFamily { family } => write!(
+                f,
+                "verifier and executor both run model family `{family}`; a team needs an \
+                 independent verifier family"
+            ),
+            TeamConfigError::InvalidEffort { role, effort } => write!(
+                f,
+                "[team.roles.{role}] effort `{effort}` is invalid (expected one of: {})",
+                effort_values_help()
+            ),
+            TeamConfigError::Incomplete { role } => write!(
+                f,
+                "[team.roles.{role}] must declare a runtime or a model to form a team"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TeamConfigError {}
+
+/// One role slot after validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRole {
+    pub role: Role,
+    /// Canonical catalog id (an alias such as `agy` is resolved to
+    /// `antigravity`).
+    pub runtime: &'static str,
+    /// `None` ⇒ the caller cascades to the employee's `[model] preferred`.
+    pub model: Option<String>,
+    pub effort: Option<crate::effort::Effort>,
+    /// Model-family key used by the verifier/executor decorrelation rule.
+    /// See [`team_model_family`].
+    pub family: &'static str,
+}
+
+/// A [`TeamConfig`] that passed [`validate_team`].
+///
+/// `planner` / `utility` may be `None` (the caller cascades those to the
+/// employee's own model); `executor` and `verifier` are always `Some` — a
+/// team without both never gets here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTeam {
+    pub enabled: bool,
+    pub gate: TeamGateMode,
+    pub executor_fanout: u8,
+    pub planner: Option<ResolvedRole>,
+    pub executor: ResolvedRole,
+    pub verifier: ResolvedRole,
+    pub utility: Option<ResolvedRole>,
+    /// Non-fatal observations (clamps, unknown enum values) for the caller to
+    /// log or audit.
+    pub notes: Vec<TeamNote>,
+}
+
+impl ResolvedTeam {
+    pub fn role(&self, role: Role) -> Option<&ResolvedRole> {
+        match role {
+            Role::Planner => self.planner.as_ref(),
+            Role::Executor => Some(&self.executor),
+            Role::Verifier => Some(&self.verifier),
+            Role::Utility => self.utility.as_ref(),
+        }
+    }
+}
+
+/// The model-family key a `(runtime, model)` pair belongs to, for the
+/// verifier ≠ executor rule.
+///
+/// Derived from [`crate::runtime_catalog`], never hard-coded:
+///
+/// * with a model, the family is whichever catalog entry claims that model's
+///   prefix (`runtime_for_model`);
+/// * without a model, the family is whichever catalog entry claims the
+///   runtime's *own* first declared prefix.
+///
+/// The second rule is what makes `antigravity` and `gemini` collapse onto one
+/// family, which is correct and load-bearing: both serve `gemini-*` models,
+/// so pairing them as executor and verifier would buy zero decorrelation
+/// while looking, in the config, like two different vendors.
+///
+/// Falls back to the runtime id for a runtime that claims no family at all
+/// (none of the allowlisted five do today; this keeps the function total).
+pub fn team_model_family(
+    runtime: &'static crate::runtime_catalog::RuntimeSpec,
+    model: Option<&str>,
+) -> &'static str {
+    if let Some(m) = model {
+        if let Some(spec) = crate::runtime_catalog::runtime_for_model(m) {
+            return spec.id;
+        }
+    }
+    match runtime.model_prefixes.first() {
+        Some(prefix) => crate::runtime_catalog::runtime_for_model(prefix)
+            .map(|s| s.id)
+            .unwrap_or(runtime.id),
+        None => runtime.id,
+    }
+}
+
+/// Validate a merged [`TeamConfig`] and resolve it into a [`ResolvedTeam`].
+///
+/// Validation is **independent of `enabled`**: an operator editing a disabled
+/// team still deserves to see that its spec is broken. Callers gate on
+/// [`TeamConfig::is_enabled`] before forming a team; an all-empty config is
+/// [`TeamConfigError::Incomplete`] by construction, which is the honest
+/// answer to "can this config form a team?".
+///
+/// Roles are checked in [`Role::ALL`] order, so the first error a caller sees
+/// is deterministic for a given config.
+pub fn validate_team(config: &TeamConfig) -> Result<ResolvedTeam, TeamConfigError> {
+    let mut notes = Vec::new();
+
+    let gate = match config.gate.as_deref().map(str::trim) {
+        None | Some("") => TeamGateMode::Auto,
+        Some(raw) => raw.parse::<TeamGateMode>().unwrap_or_else(|_| {
+            notes.push(TeamNote::UnknownGateMode {
+                value: raw.to_string(),
+            });
+            TeamGateMode::Auto
+        }),
+    };
+
+    let executor_fanout = match config.executor_fanout {
+        None => TEAM_EXECUTOR_FANOUT_DEFAULT,
+        Some(raw) => {
+            let clamped = raw.clamp(1, TEAM_EXECUTOR_FANOUT_MAX as i64) as u8;
+            if i64::from(clamped) != raw {
+                notes.push(TeamNote::ExecutorFanoutClamped {
+                    requested: raw,
+                    applied: clamped,
+                });
+            }
+            clamped
+        }
+    };
+
+    // Resolved in `Role::ALL` order so the first error is deterministic.
+    let planner = resolve_role(Role::Planner, &config.roles.planner, &mut notes)?;
+    let executor = resolve_role(Role::Executor, &config.roles.executor, &mut notes)?;
+    let verifier = resolve_role(Role::Verifier, &config.roles.verifier, &mut notes)?;
+    let utility = resolve_role(Role::Utility, &config.roles.utility, &mut notes)?;
+
+    // Executor and verifier must both exist — a team is a pipeline, and a
+    // missing half is not a smaller team, it is Solo with extra steps.
+    let executor = executor.ok_or(TeamConfigError::Incomplete {
+        role: Role::Executor,
+    })?;
+    let verifier = verifier.ok_or(TeamConfigError::Incomplete {
+        role: Role::Verifier,
+    })?;
+
+    if executor.family == verifier.family {
+        return Err(TeamConfigError::VerifierSameFamily {
+            family: executor.family.to_string(),
+        });
+    }
+
+    Ok(ResolvedTeam {
+        enabled: config.is_enabled(),
+        gate,
+        executor_fanout,
+        planner,
+        executor,
+        verifier,
+        utility,
+        notes,
+    })
+}
+
+/// Resolve one role. `Ok(None)` ⇒ the role declared nothing bindable (the
+/// caller cascades to `[model] preferred`); that is allowed for planner and
+/// utility and rejected later for executor and verifier.
+fn resolve_role(
+    role: Role,
+    spec: &RoleSpec,
+    notes: &mut Vec<TeamNote>,
+) -> Result<Option<ResolvedRole>, TeamConfigError> {
+    let runtime_raw = spec
+        .runtime
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let model_raw = spec
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let effort_raw = spec
+        .effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    // Effort is validated even on an otherwise-empty role: a typo'd effort on
+    // a role that cascades its model is still a typo, and staying silent
+    // about it would ship a config whose only visible key does nothing.
+    let effort = match effort_raw {
+        Some(raw) => Some(raw.parse::<crate::effort::Effort>().map_err(|_| {
+            TeamConfigError::InvalidEffort {
+                role,
+                effort: raw.to_string(),
+            }
+        })?),
+        None => None,
+    };
+
+    let runtime_spec = match runtime_raw {
+        Some(raw) => {
+            let spec = crate::runtime_catalog::spec_for(raw)
+                .filter(|s| TEAM_ROLE_RUNTIME_ALLOWLIST.contains(&s.id))
+                .ok_or_else(|| TeamConfigError::RuntimeNotAllowed {
+                    role,
+                    runtime: raw.to_string(),
+                })?;
+            Some(spec)
+        }
+        None => None,
+    };
+
+    let (runtime_spec, model) = match (runtime_spec, model_raw) {
+        // Neither declared — nothing to bind.
+        (None, None) => {
+            if let Some(effort) = effort {
+                notes.push(TeamNote::EffortWithoutRoleBinding { role, effort });
+            }
+            return Ok(None);
+        }
+        // Model only: bind it to whichever runtime owns its family. A family
+        // the catalog does not know is a hard error, never a guess.
+        (None, Some(model)) => {
+            let inferred = crate::runtime_catalog::runtime_for_model(model)
+                .filter(|s| TEAM_ROLE_RUNTIME_ALLOWLIST.contains(&s.id))
+                .ok_or_else(|| TeamConfigError::ModelRuntimeMismatch {
+                    role,
+                    runtime: None,
+                    model: model.to_string(),
+                })?;
+            (inferred, Some(model.to_string()))
+        }
+        // Runtime only: the caller cascades the model.
+        (Some(rt), None) => (rt, None),
+        // Both: the model's family must be one this runtime serves.
+        //
+        // Checked against the runtime's OWN declared prefixes rather than
+        // `runtime_for_model(model).id == rt.id`, because catalog order
+        // breaks the `gemini` prefix tie in favour of the Gemini CLI — so the
+        // strict identity check would reject the perfectly legal
+        // `runtime = "antigravity", model = "gemini-3.7-flash"`.
+        (Some(rt), Some(model)) => {
+            let lower = model.to_ascii_lowercase();
+            let bare = lower.rsplit('/').next().unwrap_or(&lower).to_string();
+            let serves = rt.model_prefixes.iter().any(|p| bare.starts_with(*p));
+            if !serves {
+                return Err(TeamConfigError::ModelRuntimeMismatch {
+                    role,
+                    runtime: Some(rt.id.to_string()),
+                    model: model.to_string(),
+                });
+            }
+            (rt, Some(model.to_string()))
+        }
+    };
+
+    let family = team_model_family(runtime_spec, model.as_deref());
+    Ok(Some(ResolvedRole {
+        role,
+        runtime: runtime_spec.id,
+        model,
+        effort,
+        family,
+    }))
+}
+
 /// Declare [`RuntimeType`]'s variants and their catalog ids in ONE place.
 ///
 /// The macro exists so a variant, its serde wire value, its `as_str()`
@@ -599,20 +1466,6 @@ pub struct ContainerConfig {
     /// Allow network access inside the sandbox (default: false = offline).
     #[serde(default)]
     pub network_access: bool,
-    /// Run agent tasks in an isolated git worktree (L0 lightweight isolation).
-    /// Cheaper than container sandbox — creates a separate working directory
-    /// so concurrent agents don't step on each other's files.
-    #[serde(default)]
-    pub worktree_enabled: bool,
-    /// Automatically merge worktree branch back after successful task completion.
-    #[serde(default = "default_true")]
-    pub worktree_auto_merge: bool,
-    /// Remove worktree after task completion (or after merge).
-    #[serde(default = "default_true")]
-    pub worktree_cleanup_on_exit: bool,
-    /// Non-git-tracked files to copy into the worktree (e.g. `.env`, `.env.local`).
-    #[serde(default)]
-    pub worktree_copy_files: Vec<String>,
     /// Command + args to run inside the container (empty = use the image default).
     ///
     /// HC5: the PTC container path sets this to the user-script invocation so the
@@ -1382,14 +2235,6 @@ pub struct EvolutionConfig {
     #[serde(default = "default_max_silence_hours")]
     pub max_silence_hours: f64,
 
-    /// Maximum GVU generation attempts per evolution cycle (default 3).
-    #[serde(default = "default_max_gvu_generations")]
-    pub max_gvu_generations: u32,
-
-    /// Observation period in hours after a SOUL.md change (default 24).
-    #[serde(default = "default_observation_period_hours")]
-    pub observation_period_hours: f64,
-
     // ── Skill lifecycle ──
     /// Token budget for skills in system prompt (default 2500).
     #[serde(default = "default_skill_token_budget")]
@@ -1400,61 +2245,45 @@ pub struct EvolutionConfig {
     pub max_active_skills: usize,
 
     // ── Skill auto-synthesis (P0) ──
+    //
+    // H3 (2026-09-29): eight sibling keys in this block
+    // (`skill_graduation_enabled`, `skill_recommendation_enabled`,
+    // `skill_recommendation_threshold`, `curiosity_enabled`,
+    // `curiosity_threshold`, `curiosity_max_daily`,
+    // `skill_behavior_monitor_enabled`, `skill_behavior_drift_threshold`)
+    // were REMOVED: the dashboard validated and wrote them, this struct typed
+    // them, and the gateway had ZERO readers — a setting that is written,
+    // displayed, and never takes effect is worse than no setting at all.
+    // Unknown keys left behind in an existing `agent.toml` still deserialize
+    // (this struct is not `deny_unknown_fields`), they simply do nothing,
+    // which is what they already did.
+    //
+    // Every key that remains below has a named reader.
     /// Enable automatic skill synthesis from episodic memory when repeated
-    /// domain gaps are detected.
+    /// domain gaps are detected. Read by
+    /// `gateway::skill_lifecycle::synthesis_runner`.
     #[serde(default)]
     pub skill_synthesis_enabled: bool,
 
-    /// Number of repeated gap detections required before triggering synthesis.
+    /// Number of repeated gap detections required before a synthesis signal
+    /// fires. Read per agent by `gateway::channel_reply` → `GapAccumulator`.
     #[serde(default = "default_skill_synthesis_threshold")]
     pub skill_synthesis_threshold: u32,
 
-    /// Cooldown hours after synthesizing a skill for the same topic.
+    /// Cooldown hours after a synthesis signal for the same topic. Read per
+    /// agent by `gateway::channel_reply` → `GapAccumulator`.
     #[serde(default = "default_skill_synthesis_cooldown_hours")]
     pub skill_synthesis_cooldown_hours: u64,
 
     /// TTL (in conversations) for sandboxed trial skills before evaluation.
+    /// Read by `gateway::skill_lifecycle::synthesis_runner`.
     #[serde(default = "default_skill_trial_ttl")]
     pub skill_trial_ttl: u32,
 
-    // ── Cross-agent skill migration (P2) ──
-    /// Enable automatic skill graduation to global scope when lift is proven.
-    #[serde(default)]
-    pub skill_graduation_enabled: bool,
-
-    /// Minimum lift required for skill graduation.
+    /// Minimum lift required for skill graduation. Read per agent by
+    /// `gateway::channel_reply` → `GraduationCriteria`.
     #[serde(default = "default_skill_graduation_min_lift")]
     pub skill_graduation_min_lift: f64,
-
-    /// Enable cross-agent skill recommendations for new agents.
-    #[serde(default)]
-    pub skill_recommendation_enabled: bool,
-
-    /// Minimum combined score for auto-activating recommended skills.
-    #[serde(default = "default_skill_recommendation_threshold")]
-    pub skill_recommendation_threshold: f64,
-
-    // ── Curiosity-driven exploration (P4) ──
-    /// Enable curiosity-driven proactive exploration of underexplored domains.
-    #[serde(default)]
-    pub curiosity_enabled: bool,
-
-    /// Curiosity score threshold for triggering exploration.
-    #[serde(default = "default_curiosity_threshold")]
-    pub curiosity_threshold: f64,
-
-    /// Maximum exploration actions per day (cost control).
-    #[serde(default = "default_curiosity_max_daily")]
-    pub curiosity_max_daily: u32,
-
-    // ── Behavior monitoring (P1) ──
-    /// Enable behavioral drift detection after skill activation.
-    #[serde(default)]
-    pub skill_behavior_monitor_enabled: bool,
-
-    /// Drift magnitude threshold for flagging anomalous behavior (0.0–1.0).
-    #[serde(default = "default_skill_behavior_drift_threshold")]
-    pub skill_behavior_drift_threshold: f64,
 
     // ── Stagnation detection (P0 config, P1 suppress action) ──
     /// Configuration for the signal-stagnation detector.
@@ -1475,13 +2304,6 @@ pub struct EvolutionConfig {
     //
     // Each is `skip_serializing_if`-guarded: a config that never wrote the key
     // still never gets it written back, so the on-disk shape is unchanged.
-    /// Escape hatch back to the legacy SOUL.md GVU write path (D1). Missing ⇒
-    /// `None` ⇒ `false` ⇒ AEE, the default and the path that cannot write
-    /// SOUL.md at all. Read by `gateway::gvu::loop_`.
-    #[serde(default, deserialize_with = "crate::lenient::opt")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub legacy_soul_evolution: Option<bool>,
-
     /// AEE round-intent strategy (`balanced` / `innovate` / `harden` /
     /// `repair_only`). Stored raw: an unrecognised value must `warn!` and fall
     /// back to `balanced` at the accessor, which a strict serde enum here
@@ -1566,32 +2388,18 @@ impl Default for EvolutionConfig {
             gvu_enabled: false,
             cognitive_memory: true,
             max_silence_hours: 12.0,
-            max_gvu_generations: 3,
-            observation_period_hours: 24.0,
             skill_token_budget: 2500,
             max_active_skills: 5,
-            // Skill auto-synthesis
+            // Skill lifecycle knobs with live readers (H3)
             skill_synthesis_enabled: false,
             skill_synthesis_threshold: 3,
-            skill_synthesis_cooldown_hours: 24,
             skill_trial_ttl: 20,
-            // Cross-agent migration
-            skill_graduation_enabled: false,
+            skill_synthesis_cooldown_hours: 24,
             skill_graduation_min_lift: 0.1,
-            skill_recommendation_enabled: false,
-            skill_recommendation_threshold: 0.3,
-            // Curiosity
-            curiosity_enabled: false,
-            curiosity_threshold: 0.6,
-            curiosity_max_daily: 3,
-            // Behavior monitoring
-            skill_behavior_monitor_enabled: false,
-            skill_behavior_drift_threshold: 0.3,
             // Stagnation detection
             stagnation_detection: StagnationDetectionConfig::default(),
             // R2 2nd pass: absent by default so the on-disk shape is
             // unchanged; each accessor owns its own missing-key direction.
-            legacy_soul_evolution: None,
             strategy: None,
             aee_settle_hours: None,
             noise_band: NoiseBandSection::default(),
@@ -1605,13 +2413,7 @@ impl EvolutionConfig {
     /// when it is `false` this returns `false` even if every sub-toggle is on.
     pub fn is_any_evolution_enabled(&self) -> bool {
         self.enabled
-            && (self.gvu_enabled
-                || self.skill_synthesis_enabled
-                || self.skill_graduation_enabled
-                || self.skill_recommendation_enabled
-                || self.curiosity_enabled
-                || self.skill_auto_activate
-                || self.skill_behavior_monitor_enabled)
+            && (self.gvu_enabled || self.skill_auto_activate || self.skill_synthesis_enabled)
     }
 
     /// Whether the cognitive memory layer is active. **Always `true`** since
@@ -1672,14 +2474,6 @@ fn default_max_silence_hours() -> f64 {
     12.0
 }
 
-fn default_max_gvu_generations() -> u32 {
-    3
-}
-
-fn default_observation_period_hours() -> f64 {
-    24.0
-}
-
 fn default_skill_token_budget() -> u32 {
     2500
 }
@@ -1692,32 +2486,16 @@ fn default_skill_synthesis_threshold() -> u32 {
     3
 }
 
-fn default_skill_synthesis_cooldown_hours() -> u64 {
-    24
-}
-
 fn default_skill_trial_ttl() -> u32 {
     20
 }
 
+fn default_skill_synthesis_cooldown_hours() -> u64 {
+    24
+}
+
 fn default_skill_graduation_min_lift() -> f64 {
     0.1
-}
-
-fn default_skill_recommendation_threshold() -> f64 {
-    0.3
-}
-
-fn default_curiosity_threshold() -> f64 {
-    0.6
-}
-
-fn default_curiosity_max_daily() -> u32 {
-    3
-}
-
-fn default_skill_behavior_drift_threshold() -> f64 {
-    0.3
 }
 
 // ── Stagnation detection defaults ─────────────────────────────────────────────
@@ -2136,10 +2914,12 @@ pub struct TelegramChannelConfig {
 
 /// Per-agent LINE channel settings.
 ///
-/// Backward compatible with the single-OA layout: the top-level
-/// `channel_token`/`channel_secret` fields still work. WP7 adds
-/// `[[channels.line.accounts]]` so one gateway can host several LINE Official
-/// Accounts (DuduCloud B2C), each bound to an agent with its own credit rate.
+/// Single Official Account per agent. The WP7 multi-OA layout
+/// (`[[channels.line.accounts]]` + credit metering) was removed in 2026-09: the
+/// per-account routing and the deduction gate were never wired, so the config
+/// keys promised a behavior that did not exist. A stale `accounts` array in an
+/// existing `config.toml` is ignored (this struct has no `deny_unknown_fields`),
+/// never an error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 #[derive(Default)]
@@ -2148,47 +2928,6 @@ pub struct LineChannelConfig {
     pub channel_token_enc: Option<String>,
     pub channel_secret: String,
     pub channel_secret_enc: Option<String>,
-    /// WP7 multi-OA. When non-empty, each entry is an independent Official
-    /// Account. When empty, the top-level single-OA fields are used (legacy).
-    #[serde(default)]
-    pub accounts: Vec<LineAccount>,
-}
-
-/// One LINE Official Account in a multi-OA deployment (WP7).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default, rename_all = "snake_case")]
-pub struct LineAccount {
-    /// Operator-facing label; also the credit-account namespace key.
-    pub name: String,
-    pub channel_token: String,
-    pub channel_token_enc: Option<String>,
-    pub channel_secret: String,
-    pub channel_secret_enc: Option<String>,
-    /// Agent this OA's conversations route to.
-    pub agent_id: String,
-    /// Points charged per 1K output tokens for credit metering. 0 ⇒ metering off.
-    #[serde(default)]
-    pub credit_rate: f64,
-}
-
-impl LineChannelConfig {
-    /// Resolve the effective account list. When `accounts` is empty, synthesize
-    /// a single `"default"` account from the legacy top-level fields so old
-    /// configs behave byte-identically.
-    pub fn resolve_accounts(&self) -> Vec<LineAccount> {
-        if !self.accounts.is_empty() {
-            return self.accounts.clone();
-        }
-        vec![LineAccount {
-            name: "default".to_string(),
-            channel_token: self.channel_token.clone(),
-            channel_token_enc: self.channel_token_enc.clone(),
-            channel_secret: self.channel_secret.clone(),
-            channel_secret_enc: self.channel_secret_enc.clone(),
-            agent_id: String::new(),
-            credit_rate: 0.0,
-        }]
-    }
 }
 
 /// Per-agent Slack channel settings.
@@ -2367,24 +3106,6 @@ pub struct RuntimeSection {
     #[serde(deserialize_with = "crate::lenient::opt")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
-    /// Missing ⇒ `None`, which the runtime router reads as `FreshSpawn`.
-    #[serde(deserialize_with = "crate::lenient::opt")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pty_pool_enabled: Option<bool>,
-    /// Missing ⇒ `None` (out-of-process worker not managed).
-    #[serde(deserialize_with = "crate::lenient::opt")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_managed: Option<bool>,
-    /// PTY interactive-REPL hard deadline, seconds. Read by `pty_runtime`
-    /// (not migrated this round); typed here so `agent_update` stops dropping
-    /// it. Missing / non-positive ⇒ the caller's constant.
-    #[serde(deserialize_with = "crate::lenient::opt")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pty_interactive_timeout_secs: Option<i64>,
-    /// PTY interactive-REPL idle timeout, seconds. Same status as above.
-    #[serde(deserialize_with = "crate::lenient::opt")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pty_idle_timeout_secs: Option<i64>,
     /// Minimal-context spawn optimization (WP-7A). When applied, the spawned
     /// official CLI drops the operator's *user*-global settings and memory
     /// (`--setting-sources project,local` — keeps the agent's own
@@ -2648,6 +3369,13 @@ pub struct AgentConfig {
     /// `[fork]` — see [`ForkSection`].
     #[serde(default, skip_serializing_if = "ForkSection::is_default")]
     pub fork: ForkSection,
+    /// `[team]` — per-employee role composition overrides (Team-as-Agent
+    /// P1/WP-1). Absent ⇒ the employee inherits `config.toml [team]`
+    /// wholesale; see [`TeamConfig::merge`]. Typed here (rather than read
+    /// only through [`crate::agent_toml::AgentTomlSections`]) so the
+    /// `agent_update` round-trip cannot drop the section.
+    #[serde(default, skip_serializing_if = "TeamConfig::is_default")]
+    pub team: TeamConfig,
 }
 
 /// How the system prompt is assembled.
@@ -2973,8 +3701,15 @@ impl ProactiveConfig {
 ///   coverage/preservation/faithfulness gate before it is written (rollback on
 ///   failure).
 ///
-/// Disabled by default — opt in per agent via `agent.toml [night_engine]`, or
-/// set a global default in `config.toml [night_engine]`.
+/// Disabled by default — opt in per agent via `agent.toml [night_engine]`.
+///
+/// This comment used to claim a `config.toml [night_engine]` global default
+/// existed as well. It does not: `night_engine::spawn_night_engine` reads only
+/// `LoadedAgent.config.night_engine`, and `AgentRegistry::load` overlays
+/// nothing global onto an agent's config. The one global knob for this feature
+/// is `config.toml [night] llm_enabled`, which gates the LLM-backed sub-passes
+/// (N1/N2) and is read by `gateway::night_llm::night_llm_enabled`.
+/// Corrected 2026-09-29 while writing `docs/features/58-night-engine.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct NightEngineConfig {
@@ -3497,12 +4232,7 @@ mod tests {
         let mut cfg = EvolutionConfig::default();
         cfg.enabled = true;
         cfg.gvu_enabled = false;
-        cfg.skill_synthesis_enabled = false;
-        cfg.skill_graduation_enabled = false;
-        cfg.skill_recommendation_enabled = false;
-        cfg.curiosity_enabled = false;
         cfg.skill_auto_activate = false;
-        cfg.skill_behavior_monitor_enabled = false;
         assert!(!cfg.is_any_evolution_enabled());
         cfg.gvu_enabled = true;
         assert!(cfg.is_any_evolution_enabled());
@@ -3815,5 +4545,894 @@ mod tests {
             serde_json::to_string(&EditionProfile::Personal).unwrap(),
             "\"personal\""
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // `[team]` — Team-as-Agent schema, cascade and validation (P1/WP-1)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// The spec from the design doc §3.1, verbatim.
+    const TEAM_TOML: &str = r#"
+enabled = true
+executor_fanout = 2
+gate = "auto"
+
+[roles.planner]
+runtime = "claude"
+model = "claude-fable-5-1"
+effort = "high"
+
+[roles.executor]
+runtime = "codex"
+model = "gpt-5.5"
+effort = "medium"
+
+[roles.verifier]
+runtime = "gemini"
+model = "gemini-3.7-flash"
+effort = "low"
+
+[roles.utility]
+runtime = "claude"
+model = "claude-haiku-4-5"
+"#;
+
+    fn team(toml_body: &str) -> TeamConfig {
+        TeamConfig::from_toml_value(&toml_body.parse::<toml::Value>().expect("valid toml"))
+    }
+
+    // ── enums ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn team_role_tokens_and_parsing() {
+        assert_eq!(Role::ALL.len(), 4);
+        for r in Role::ALL {
+            assert_eq!(r.as_str().parse::<Role>().unwrap(), *r);
+            assert_eq!(r.to_string(), r.as_str());
+            let json = serde_json::to_string(r).unwrap();
+            assert_eq!(json, format!("\"{}\"", r.as_str()));
+            assert_eq!(serde_json::from_str::<Role>(&json).unwrap(), *r);
+        }
+        assert_eq!("  EXECUTOR ".parse::<Role>().unwrap(), Role::Executor);
+        // No aliases: a near-miss must not silently route to a role.
+        assert!("exec".parse::<Role>().is_err());
+        assert!("plan".parse::<Role>().is_err());
+        assert!("facade".parse::<Role>().is_err());
+    }
+
+    /// `[team]` does not own the effort enum — [`crate::effort`] does. This
+    /// only pins the contract `validate_team` depends on.
+    #[test]
+    fn effort_parsing_comes_from_the_shared_effort_module() {
+        use crate::effort::Effort;
+        for e in Effort::ALL {
+            assert_eq!(e.as_str().parse::<Effort>().unwrap(), *e);
+        }
+        assert_eq!("HIGH".parse::<Effort>().unwrap(), Effort::High);
+        assert!("ultra".parse::<Effort>().is_err());
+        assert!("".parse::<Effort>().is_err());
+        assert_eq!(effort_values_help(), "low, medium, high, xhigh, max");
+    }
+
+    #[test]
+    fn team_gate_mode_tokens_and_parsing() {
+        assert_eq!(TeamGateMode::default(), TeamGateMode::Auto);
+        for m in [
+            TeamGateMode::Auto,
+            TeamGateMode::AlwaysSolo,
+            TeamGateMode::AlwaysTeam,
+        ] {
+            assert_eq!(m.as_str().parse::<TeamGateMode>().unwrap(), m);
+            assert_eq!(
+                serde_json::to_string(&m).unwrap(),
+                format!("\"{}\"", m.as_str())
+            );
+        }
+        assert_eq!(
+            "always-solo".parse::<TeamGateMode>().unwrap(),
+            TeamGateMode::AlwaysSolo
+        );
+        assert!("sometimes".parse::<TeamGateMode>().is_err());
+    }
+
+    // ── parsing ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn team_section_parses_the_design_document_shape() {
+        let c = team(TEAM_TOML);
+        assert_eq!(c.enabled, Some(true));
+        assert_eq!(c.executor_fanout, Some(2));
+        assert_eq!(c.gate.as_deref(), Some("auto"));
+        assert_eq!(c.roles.planner.runtime.as_deref(), Some("claude"));
+        assert_eq!(c.roles.planner.model.as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(c.roles.planner.effort.as_deref(), Some("high"));
+        assert_eq!(c.roles.executor.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(c.roles.verifier.runtime.as_deref(), Some("gemini"));
+        assert_eq!(c.roles.utility.model.as_deref(), Some("claude-haiku-4-5"));
+        assert!(c.roles.utility.effort.is_none());
+    }
+
+    #[test]
+    fn team_section_is_lenient_like_every_other_agent_toml_section() {
+        // Wrong-typed keys degrade to their defaults; nothing fails.
+        let c = team(
+            r#"
+enabled = "yes"
+executor_fanout = "two"
+gate = 7
+roles = "nope"
+"#,
+        );
+        assert_eq!(c, TeamConfig::default());
+        assert!(c.is_default());
+
+        // A wrong-typed role table degrades to an empty role, keeping its
+        // siblings.
+        let c = team(
+            r#"
+[roles]
+planner = "claude"
+[roles.executor]
+runtime = "codex"
+"#,
+        );
+        assert!(c.roles.planner.is_empty());
+        assert_eq!(c.roles.executor.runtime.as_deref(), Some("codex"));
+
+        // An unknown fifth role is ignored, not invented.
+        let c = team(
+            r#"
+[roles.reviewer]
+runtime = "claude"
+"#,
+        );
+        assert!(c.roles.is_empty());
+    }
+
+    #[test]
+    fn team_config_from_a_whole_config_document() {
+        let doc: toml::Value = r#"
+[server]
+port = 8080
+
+[team]
+enabled = true
+[team.roles.executor]
+runtime = "codex"
+"#
+        .parse()
+        .unwrap();
+        let c = TeamConfig::from_config_toml(&doc);
+        assert_eq!(c.enabled, Some(true));
+        assert_eq!(c.roles.executor.runtime.as_deref(), Some("codex"));
+
+        // Missing section ⇒ all defaults, not an error.
+        let doc: toml::Value = "[server]\nport = 1\n".parse().unwrap();
+        assert!(TeamConfig::from_config_toml(&doc).is_default());
+    }
+
+    // ── cascade ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_is_field_wise_in_both_directions() {
+        let global = team(TEAM_TOML);
+        // The employee overrides ONE key of ONE role.
+        let agent = team(
+            r#"
+[roles.executor]
+effort = "high"
+"#,
+        );
+        let merged = TeamConfig::merge(&global, &agent);
+        // The overridden field wins…
+        assert_eq!(merged.roles.executor.effort.as_deref(), Some("high"));
+        // …and the rest of that role survives, which is the whole point.
+        assert_eq!(merged.roles.executor.runtime.as_deref(), Some("codex"));
+        assert_eq!(merged.roles.executor.model.as_deref(), Some("gpt-5.5"));
+        // Untouched roles and scalars come through unchanged.
+        assert_eq!(merged.roles.verifier, global.roles.verifier);
+        assert_eq!(merged.enabled, Some(true));
+        assert_eq!(merged.executor_fanout, Some(2));
+    }
+
+    #[test]
+    fn merge_keeps_explicit_false_distinct_from_unset() {
+        let global = TeamConfig {
+            enabled: Some(true),
+            ..TeamConfig::default()
+        };
+        // Unset on the employee ⇒ inherit `true`.
+        assert_eq!(
+            TeamConfig::merge(&global, &TeamConfig::default()).enabled,
+            Some(true)
+        );
+        // Explicit `false` ⇒ the employee opts out.
+        let off = TeamConfig {
+            enabled: Some(false),
+            ..TeamConfig::default()
+        };
+        assert_eq!(TeamConfig::merge(&global, &off).enabled, Some(false));
+        assert!(!TeamConfig::merge(&global, &off).is_enabled());
+        // Nothing set anywhere ⇒ the switch is on since v1.66. What keeps an
+        // unconfigured deployment Solo is `cascade_unbound_roles` plus the
+        // gate, not this flag — see `default_on_unconfigured_team_cannot_form`.
+        assert!(TeamConfig::default().is_enabled());
+    }
+
+    /// X2: the master switch defaults **on**, and an explicit `false` is still
+    /// a real kill switch that survives a `true` global.
+    #[test]
+    fn team_enabled_defaults_to_true_and_explicit_false_still_wins() {
+        assert_eq!(TeamConfig::default().enabled, None, "unset stays unset");
+        assert!(TeamConfig::default().is_enabled());
+        let off = TeamConfig {
+            enabled: Some(false),
+            ..TeamConfig::default()
+        };
+        assert!(!off.is_enabled());
+        let global_on = TeamConfig {
+            enabled: Some(true),
+            ..TeamConfig::default()
+        };
+        assert!(
+            !TeamConfig::merge(&global_on, &off).is_enabled(),
+            "an employee's explicit opt-out must beat a global opt-in"
+        );
+    }
+
+    /// X2 safety condition: with the switch on by default and no
+    /// `[team.roles]`, the cascade hands executor and verifier the *same*
+    /// employee model, so the decorrelation rule refuses the spec and the
+    /// caller runs Solo. Nothing about that is an error.
+    #[test]
+    fn default_on_unconfigured_team_cannot_form() {
+        let empty = TeamConfig::default();
+        assert!(empty.is_enabled(), "precondition: the switch is on");
+        let (cascaded_cfg, cascaded) =
+            cascade_unbound_roles(&empty, Some("claude"), Some("claude-sonnet-4-6"));
+        assert_eq!(cascaded, vec![Role::Executor, Role::Verifier]);
+        assert_eq!(
+            validate_team(&cascaded_cfg).unwrap_err(),
+            TeamConfigError::VerifierSameFamily {
+                family: "claude".to_string()
+            },
+            "two roles on one employee model must not pass as a decorrelated team"
+        );
+    }
+
+    /// The employee declaring nothing bindable leaves the roles unbound, and
+    /// the spec is `Incomplete` — still Solo, still not a partial team.
+    #[test]
+    fn cascade_with_no_employee_brain_leaves_the_spec_incomplete() {
+        let (cfg, cascaded) = cascade_unbound_roles(&TeamConfig::default(), None, Some("   "));
+        assert!(cascaded.is_empty());
+        assert_eq!(cfg, TeamConfig::default());
+        assert_eq!(
+            validate_team(&cfg).unwrap_err(),
+            TeamConfigError::Incomplete {
+                role: Role::Executor
+            }
+        );
+    }
+
+    /// A half-configured team is the case the cascade exists for: the operator
+    /// pinned an executor, the verifier cascades onto the employee's own
+    /// model, the families differ, and a real team forms.
+    #[test]
+    fn cascade_completes_a_half_configured_team() {
+        let c = team(
+            r#"
+[roles.executor]
+runtime = "codex"
+model = "gpt-5.5"
+"#,
+        );
+        let (cfg, cascaded) = cascade_unbound_roles(&c, Some("claude"), Some("claude-sonnet-4-6"));
+        assert_eq!(cascaded, vec![Role::Verifier], "only the unbound role moves");
+        let r = validate_team(&cfg).expect("codex executor + claude verifier decorrelates");
+        assert_eq!(r.executor.runtime, "codex");
+        assert_eq!(r.verifier.runtime, "claude");
+        assert_eq!(r.verifier.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_ne!(r.executor.family, r.verifier.family);
+        assert!(
+            r.planner.is_none() && r.utility.is_none(),
+            "the cascade must not materialise a 規劃 stage nobody configured"
+        );
+    }
+
+    /// A role that declared only an `effort` is still unbound — and its effort
+    /// survives the cascade rather than being the reason it is skipped.
+    #[test]
+    fn cascade_fills_an_effort_only_role_and_keeps_the_effort() {
+        let c = team(
+            r#"
+[roles.executor]
+effort = "high"
+[roles.verifier]
+runtime = "gemini"
+"#,
+        );
+        let (cfg, cascaded) = cascade_unbound_roles(&c, Some("claude"), Some("claude-sonnet-4-6"));
+        assert_eq!(cascaded, vec![Role::Executor]);
+        assert_eq!(cfg.roles.executor.effort.as_deref(), Some("high"));
+        let r = validate_team(&cfg).expect("claude executor + gemini verifier decorrelates");
+        assert_eq!(r.executor.effort, Some(crate::effort::Effort::High));
+    }
+
+    /// An explicitly bound role is never rewritten by the cascade.
+    #[test]
+    fn cascade_never_overwrites_a_bound_role() {
+        let c = team(
+            r#"
+[roles.executor]
+runtime = "codex"
+model = "gpt-5.5"
+[roles.verifier]
+runtime = "gemini"
+model = "gemini-3-pro-preview"
+"#,
+        );
+        let (cfg, cascaded) = cascade_unbound_roles(&c, Some("claude"), Some("claude-opus-5"));
+        assert!(cascaded.is_empty());
+        assert_eq!(cfg, c, "a fully bound spec must pass through byte-identical");
+    }
+
+    // ── validation: happy paths ─────────────────────────────────────────
+
+    #[test]
+    fn validate_team_resolves_the_design_document_spec() {
+        use crate::effort::Effort;
+        let resolved = validate_team(&team(TEAM_TOML)).expect("the documented spec is valid");
+        assert!(resolved.enabled);
+        assert_eq!(resolved.gate, TeamGateMode::Auto);
+        assert_eq!(resolved.executor_fanout, 2);
+        assert!(resolved.notes.is_empty());
+
+        let planner = resolved.planner.as_ref().unwrap();
+        assert_eq!(planner.runtime, "claude");
+        assert_eq!(planner.family, "claude");
+        assert_eq!(planner.effort, Some(Effort::High));
+
+        assert_eq!(resolved.executor.runtime, "codex");
+        assert_eq!(resolved.executor.family, "codex");
+        assert_eq!(resolved.executor.effort, Some(Effort::Medium));
+
+        assert_eq!(resolved.verifier.runtime, "gemini");
+        assert_eq!(resolved.verifier.family, "gemini");
+
+        let utility = resolved.utility.as_ref().unwrap();
+        assert_eq!(utility.model.as_deref(), Some("claude-haiku-4-5"));
+        assert!(utility.effort.is_none());
+
+        // The accessor agrees with the fields.
+        assert_eq!(resolved.role(Role::Executor).unwrap().runtime, "codex");
+        assert_eq!(resolved.role(Role::Planner).unwrap().runtime, "claude");
+    }
+
+    #[test]
+    fn planner_and_utility_may_cascade_to_the_employees_own_model() {
+        let c = team(
+            r#"
+[roles.executor]
+runtime = "codex"
+model = "gpt-5.5"
+[roles.verifier]
+runtime = "gemini"
+"#,
+        );
+        let r = validate_team(&c).unwrap();
+        assert!(r.planner.is_none(), "planner cascades to [model] preferred");
+        assert!(r.utility.is_none());
+        // A verifier with only a runtime still resolves; its model cascades.
+        assert_eq!(r.verifier.runtime, "gemini");
+        assert!(r.verifier.model.is_none());
+        assert_eq!(r.verifier.family, "gemini");
+    }
+
+    #[test]
+    fn a_runtime_alias_canonicalises() {
+        let c = team(
+            r#"
+[roles.executor]
+runtime = "claude"
+model = "claude-sonnet-4-6"
+[roles.verifier]
+runtime = "agy"
+"#,
+        );
+        let r = validate_team(&c).unwrap();
+        assert_eq!(r.verifier.runtime, "antigravity");
+    }
+
+    #[test]
+    fn a_model_without_a_runtime_binds_through_the_catalog_not_a_guess() {
+        let c = team(
+            r#"
+[roles.executor]
+model = "gpt-5.5"
+[roles.verifier]
+model = "claude-sonnet-4-6"
+"#,
+        );
+        let r = validate_team(&c).unwrap();
+        assert_eq!(r.executor.runtime, "codex");
+        assert_eq!(r.verifier.runtime, "claude");
+
+        // …but a family the catalog does not know is refused outright.
+        let c = team(
+            r#"
+[roles.executor]
+model = "deepseek-v3.2"
+[roles.verifier]
+runtime = "gemini"
+"#,
+        );
+        assert_eq!(
+            validate_team(&c).unwrap_err(),
+            TeamConfigError::ModelRuntimeMismatch {
+                role: Role::Executor,
+                runtime: None,
+                model: "deepseek-v3.2".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn antigravity_may_declare_a_gemini_model_despite_the_catalog_tie() {
+        // `runtime_for_model("gemini-…")` resolves to the Gemini CLI because
+        // catalog order breaks the tie — so a strict identity check would
+        // reject this perfectly legal pairing.
+        let c = team(
+            r#"
+[roles.executor]
+runtime = "claude"
+model = "claude-sonnet-4-6"
+[roles.verifier]
+runtime = "antigravity"
+model = "gemini-3.1-pro"
+"#,
+        );
+        let r = validate_team(&c).unwrap();
+        assert_eq!(r.verifier.runtime, "antigravity");
+        // …and its FAMILY still collapses onto gemini, which is what the
+        // decorrelation rule must see.
+        assert_eq!(r.verifier.family, "gemini");
+    }
+
+    // ── validation: refusals ────────────────────────────────────────────
+
+    #[test]
+    fn a_runtime_outside_the_first_batch_allowlist_is_refused() {
+        for runtime in ["qwen", "openai_compat", "copilot", "cursor", "notarealcli"] {
+            let c = team(&format!(
+                r#"
+[roles.executor]
+runtime = "{runtime}"
+[roles.verifier]
+runtime = "gemini"
+"#
+            ));
+            assert_eq!(
+                validate_team(&c).unwrap_err(),
+                TeamConfigError::RuntimeNotAllowed {
+                    role: Role::Executor,
+                    runtime: runtime.to_string(),
+                },
+                "{runtime} must not back a team role"
+            );
+        }
+        // The allowlist is exactly decision D.
+        assert_eq!(
+            TEAM_ROLE_RUNTIME_ALLOWLIST,
+            &["claude", "codex", "gemini", "antigravity", "grok"]
+        );
+    }
+
+    #[test]
+    fn a_model_from_another_family_is_refused_never_re_routed() {
+        // goose#10731: a role model string not bound to its provider sent
+        // `qwen-*` to the Claude backend.
+        let c = team(
+            r#"
+[roles.executor]
+runtime = "claude"
+model = "gpt-5.5"
+[roles.verifier]
+runtime = "gemini"
+"#,
+        );
+        assert_eq!(
+            validate_team(&c).unwrap_err(),
+            TeamConfigError::ModelRuntimeMismatch {
+                role: Role::Executor,
+                runtime: Some("claude".to_string()),
+                model: "gpt-5.5".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_verifier_sharing_the_executors_family_refuses_to_form_a_team() {
+        // Decision C: refuse, do not warn — decorrelation is the entire
+        // mechanism (arXiv:2607.13918).
+        let same_family = [
+            // literally the same runtime
+            (
+                "claude",
+                "claude-sonnet-4-6",
+                "claude",
+                "claude-haiku-4-5",
+                "claude",
+            ),
+            // two runtimes, one family: antigravity also serves gemini-*
+            (
+                "gemini",
+                "gemini-3.7-flash",
+                "antigravity",
+                "gemini-3.1-pro",
+                "gemini",
+            ),
+        ];
+        for (e_rt, e_model, v_rt, v_model, family) in same_family {
+            let c = team(&format!(
+                r#"
+[roles.executor]
+runtime = "{e_rt}"
+model = "{e_model}"
+[roles.verifier]
+runtime = "{v_rt}"
+model = "{v_model}"
+"#
+            ));
+            assert_eq!(
+                validate_team(&c).unwrap_err(),
+                TeamConfigError::VerifierSameFamily {
+                    family: family.to_string(),
+                },
+                "{e_rt}/{v_rt}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_executor_or_verifier_that_resolves_to_nothing_is_incomplete() {
+        // Nothing at all.
+        assert_eq!(
+            validate_team(&TeamConfig::default()).unwrap_err(),
+            TeamConfigError::Incomplete {
+                role: Role::Executor
+            }
+        );
+        // Executor present, verifier missing.
+        let c = team(
+            r#"
+[roles.executor]
+runtime = "codex"
+"#,
+        );
+        assert_eq!(
+            validate_team(&c).unwrap_err(),
+            TeamConfigError::Incomplete {
+                role: Role::Verifier
+            }
+        );
+        // A blank string is not a declaration.
+        let c = team(
+            r#"
+[roles.executor]
+runtime = "   "
+model = ""
+[roles.verifier]
+runtime = "gemini"
+"#,
+        );
+        assert_eq!(
+            validate_team(&c).unwrap_err(),
+            TeamConfigError::Incomplete {
+                role: Role::Executor
+            }
+        );
+    }
+
+    #[test]
+    fn an_invalid_effort_is_refused_on_any_role() {
+        let base = team(
+            r#"
+[roles.executor]
+runtime = "codex"
+model = "gpt-5.5"
+[roles.verifier]
+runtime = "gemini"
+"#,
+        );
+        validate_team(&base).expect("the base spec is valid before the effort typo");
+        for role in Role::ALL {
+            let mut c = base.clone();
+            c.roles.get_mut(*role).effort = Some("ultra".to_string());
+            let err = validate_team(&c).unwrap_err();
+            assert_eq!(err.code(), "invalid_effort", "{role}: {err}");
+            assert_eq!(err.role(), Some(*role));
+        }
+    }
+
+    #[test]
+    fn validation_is_independent_of_the_enabled_switch() {
+        // An operator editing a disabled team still gets told it is broken.
+        let c = team(
+            r#"
+enabled = false
+[roles.executor]
+runtime = "claude"
+[roles.verifier]
+runtime = "claude"
+"#,
+        );
+        assert_eq!(
+            validate_team(&c).unwrap_err().code(),
+            "verifier_same_family"
+        );
+
+        let c = team(
+            r#"
+enabled = false
+[roles.executor]
+runtime = "codex"
+[roles.verifier]
+runtime = "gemini"
+"#,
+        );
+        let r = validate_team(&c).unwrap();
+        assert!(!r.enabled, "a valid spec can still be switched off");
+    }
+
+    // ── notes (non-fatal) ───────────────────────────────────────────────
+
+    #[test]
+    fn executor_fanout_is_clamped_with_a_note_never_rejected() {
+        let base = r#"
+[roles.executor]
+runtime = "codex"
+[roles.verifier]
+runtime = "gemini"
+"#;
+        for (written, applied) in [(0i64, 1u8), (-4, 1), (1, 1), (3, 3), (9, 3), (999, 3)] {
+            let c = team(&format!("executor_fanout = {written}\n{base}"));
+            let r = validate_team(&c).unwrap();
+            assert_eq!(r.executor_fanout, applied, "fanout {written}");
+            let clamped = r
+                .notes
+                .iter()
+                .any(|n| n.code() == "executor_fanout_clamped");
+            assert_eq!(
+                clamped,
+                i64::from(applied) != written,
+                "a note iff the value was corrected (fanout {written})"
+            );
+        }
+        // Unset ⇒ the default, no note.
+        let r = validate_team(&team(base)).unwrap();
+        assert_eq!(r.executor_fanout, TEAM_EXECUTOR_FANOUT_DEFAULT);
+        assert!(r.notes.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_gate_mode_degrades_to_auto_with_a_note() {
+        let c = team(
+            r#"
+gate = "always-team-ish"
+[roles.executor]
+runtime = "codex"
+[roles.verifier]
+runtime = "gemini"
+"#,
+        );
+        let r = validate_team(&c).unwrap();
+        assert_eq!(r.gate, TeamGateMode::Auto);
+        assert_eq!(
+            r.notes,
+            vec![TeamNote::UnknownGateMode {
+                value: "always-team-ish".to_string()
+            }]
+        );
+        assert!(!r.notes[0].to_string().is_empty());
+
+        // A known mode carries no note.
+        let c = team(
+            r#"
+gate = "always_solo"
+[roles.executor]
+runtime = "codex"
+[roles.verifier]
+runtime = "gemini"
+"#,
+        );
+        let r = validate_team(&c).unwrap();
+        assert_eq!(r.gate, TeamGateMode::AlwaysSolo);
+        assert!(r.notes.is_empty());
+    }
+
+    #[test]
+    fn an_effort_on_an_unbound_role_is_reported_not_silently_dropped() {
+        use crate::effort::Effort;
+        let c = team(
+            r#"
+[roles.planner]
+effort = "high"
+[roles.executor]
+runtime = "codex"
+[roles.verifier]
+runtime = "gemini"
+"#,
+        );
+        let r = validate_team(&c).unwrap();
+        assert!(r.planner.is_none());
+        assert_eq!(
+            r.notes,
+            vec![TeamNote::EffortWithoutRoleBinding {
+                role: Role::Planner,
+                effort: Effort::High,
+            }]
+        );
+    }
+
+    // ── audit surface ───────────────────────────────────────────────────
+
+    #[test]
+    fn team_error_and_note_codes_are_unique_and_stable() {
+        use crate::effort::Effort;
+        let errors = [
+            TeamConfigError::RuntimeNotAllowed {
+                role: Role::Planner,
+                runtime: "x".into(),
+            },
+            TeamConfigError::ModelRuntimeMismatch {
+                role: Role::Planner,
+                runtime: None,
+                model: "x".into(),
+            },
+            TeamConfigError::VerifierSameFamily { family: "x".into() },
+            TeamConfigError::InvalidEffort {
+                role: Role::Planner,
+                effort: "x".into(),
+            },
+            TeamConfigError::Incomplete {
+                role: Role::Planner,
+            },
+        ];
+        let mut codes: Vec<&str> = errors.iter().map(|e| e.code()).collect();
+        let n = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), n);
+        assert_eq!(
+            codes,
+            vec![
+                "invalid_effort",
+                "model_runtime_mismatch",
+                "runtime_not_allowed",
+                "team_incomplete",
+                "verifier_same_family",
+            ]
+        );
+        for e in &errors {
+            assert!(!e.to_string().is_empty());
+        }
+
+        let notes = [
+            TeamNote::ExecutorFanoutClamped {
+                requested: 9,
+                applied: 3,
+            },
+            TeamNote::UnknownGateMode { value: "x".into() },
+            TeamNote::EffortWithoutRoleBinding {
+                role: Role::Utility,
+                effort: Effort::Low,
+            },
+        ];
+        let mut ncodes: Vec<&str> = notes.iter().map(|n| n.code()).collect();
+        let n = ncodes.len();
+        ncodes.sort_unstable();
+        ncodes.dedup();
+        assert_eq!(ncodes.len(), n);
+    }
+
+    // ── agent.toml round-trip ───────────────────────────────────────────
+
+    #[test]
+    fn agent_config_round_trips_the_team_section_and_keeps_absence_absent() {
+        // An `agent.toml` with no `[team]` must serialize back without one —
+        // otherwise `agent_update` rewrites every agent file on first touch.
+        let base = r#"
+[agent]
+name = "a"
+display_name = "A"
+role = "specialist"
+status = "active"
+trigger = ""
+reports_to = ""
+icon = ""
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = []
+
+[container]
+timeout_ms = 60000
+max_concurrent = 1
+readonly_project = true
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 500
+warn_threshold_percent = 80
+hard_stop = false
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = []
+
+[evolution]
+skill_auto_activate = false
+skill_security_scan = true
+gvu_enabled = false
+max_silence_hours = 168.0
+skill_token_budget = 500
+max_active_skills = 2
+"#;
+        let cfg: AgentConfig = toml::from_str(base).expect("base parses");
+        assert!(cfg.team.is_default());
+        let out = toml::to_string(&cfg).unwrap();
+        assert!(!out.contains("[team]"), "absent stays absent:\n{out}");
+
+        // …and a written `[team]` survives the round-trip instead of being
+        // silently dropped.
+        let with_team = format!(
+            "{base}\n[team]\nenabled = true\nexecutor_fanout = 2\n\
+             [team.roles.executor]\nruntime = \"codex\"\nmodel = \"gpt-5.5\"\n\
+             [team.roles.verifier]\nruntime = \"gemini\"\n"
+        );
+        let cfg: AgentConfig = toml::from_str(&with_team).expect("parses with [team]");
+        assert_eq!(cfg.team.enabled, Some(true));
+        let out = toml::to_string(&cfg).unwrap();
+        let back: AgentConfig = toml::from_str(&out).expect("re-parses");
+        assert_eq!(back.team, cfg.team);
+        assert_eq!(validate_team(&back.team).unwrap().executor.runtime, "codex");
+    }
+
+    /// Regression (H1, 2026-09): the WP7 `[[channels.line.accounts]]` multi-OA
+    /// block and its `credit_rate` key were removed together with the credit
+    /// ledger. An existing `config.toml` that still carries them must keep
+    /// parsing (unknown keys are ignored, never a hard error), and the legacy
+    /// single-OA fields must survive untouched.
+    #[test]
+    fn line_channel_config_ignores_removed_multi_oa_accounts_block() {
+        let legacy = r#"
+channel_token = "legacy-token"
+channel_secret = "legacy-secret"
+
+[[accounts]]
+name = "acme-support"
+channel_token = "acme-token"
+channel_secret = "acme-secret"
+agent_id = "acme-agent"
+credit_rate = 2.0
+"#;
+        let cfg: LineChannelConfig = toml::from_str(legacy).expect("legacy accounts block parses");
+        assert_eq!(cfg.channel_token, "legacy-token");
+        assert_eq!(cfg.channel_secret, "legacy-secret");
+        // Round-trips without re-emitting the removed block.
+        let out = toml::to_string(&cfg).unwrap();
+        assert!(!out.contains("accounts"), "re-serialized: {out}");
+        assert!(!out.contains("credit_rate"), "re-serialized: {out}");
     }
 }

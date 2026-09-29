@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::channel_reply::{ReplyContext, build_reply_with_session, set_channel_connected};
+use crate::channel_reply::{ReplyContext, build_guarded_reply_with_session, set_channel_connected};
 
 const FEISHU_API: &str = "https://open.feishu.cn/open-apis";
 
@@ -113,7 +113,10 @@ impl FeishuState {
 
         let token = resp.tenant_access_token.ok_or("No token returned")?;
         *self.token.write().await = (token.clone(), std::time::Instant::now());
-        info!("Feishu tenant_access_token refreshed (expires in {}s)", resp.expire.unwrap_or(7200));
+        info!(
+            "Feishu tenant_access_token refreshed (expires in {}s)",
+            resp.expire.unwrap_or(7200)
+        );
         Ok(token)
     }
 }
@@ -123,13 +126,12 @@ impl FeishuState {
 /// Create the Feishu webhook router.
 ///
 /// Returns `None` if Feishu is not configured.
-pub async fn start_feishu_webhook(
-    home_dir: &Path,
-    ctx: Arc<ReplyContext>,
-) -> Option<Router> {
+pub async fn start_feishu_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -> Option<Router> {
     let app_id = read_feishu_config(home_dir, "feishu_app_id").await?;
     let app_secret = read_feishu_config(home_dir, "feishu_app_secret").await?;
-    let verification_token = read_feishu_config(home_dir, "feishu_verification_token").await.unwrap_or_default();
+    let verification_token = read_feishu_config(home_dir, "feishu_verification_token")
+        .await
+        .unwrap_or_default();
 
     if app_id.is_empty() || app_secret.is_empty() {
         return None;
@@ -163,11 +165,25 @@ pub async fn start_feishu_webhook(
     // Pre-fetch token
     match state.get_token().await {
         Ok(_) => {
-            set_channel_connected(&state.ctx.channel_status, "feishu", true, None, Some(&state.ctx.event_tx)).await;
+            set_channel_connected(
+                &state.ctx.channel_status,
+                "feishu",
+                true,
+                None,
+                Some(&state.ctx.event_tx),
+            )
+            .await;
         }
         Err(e) => {
             warn!("Feishu token error: {e}");
-            set_channel_connected(&state.ctx.channel_status, "feishu", false, Some(e), Some(&state.ctx.event_tx)).await;
+            set_channel_connected(
+                &state.ctx.channel_status,
+                "feishu",
+                false,
+                Some(e),
+                Some(&state.ctx.event_tx),
+            )
+            .await;
         }
     }
 
@@ -192,18 +208,22 @@ async fn handle_webhook(
     // time — mirrors `line.rs`'s per-request resolve. Fail-closed: if it has
     // since been unset, reject rather than fall back to whatever was
     // configured at startup.
-    let verification_token = match read_feishu_config(&state.ctx.home_dir, "feishu_verification_token").await {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            warn!("Feishu webhook: verification_token not configured — rejecting request");
-            return (StatusCode::UNAUTHORIZED, "not configured").into_response();
-        }
-    };
+    let verification_token =
+        match read_feishu_config(&state.ctx.home_dir, "feishu_verification_token").await {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                warn!("Feishu webhook: verification_token not configured — rejecting request");
+                return (StatusCode::UNAUTHORIZED, "not configured").into_response();
+            }
+        };
 
     // M3: when Feishu signs the request (X-Lark-Signature present), verify the
     // signature against the raw body BEFORE parsing. This authenticates the
     // request cryptographically rather than relying only on the in-body token.
-    if let Some(sig) = headers.get("X-Lark-Signature").and_then(|v| v.to_str().ok()) {
+    if let Some(sig) = headers
+        .get("X-Lark-Signature")
+        .and_then(|v| v.to_str().ok())
+    {
         let timestamp = headers
             .get("X-Lark-Request-Timestamp")
             .and_then(|v| v.to_str().ok())
@@ -283,7 +303,10 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
         None => return,
     };
 
-    let msg_type = message.get("message_type").and_then(|v| v.as_str()).unwrap_or("");
+    let msg_type = message
+        .get("message_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     // WP1.3: also accept file / image messages (downloaded below).
     if !matches!(msg_type, "text" | "file" | "image") {
         return;
@@ -291,9 +314,11 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
 
     // Parse content JSON. text: {"text":"hi"}; file: {"file_key","file_name"};
     // image: {"image_key"}.
-    let content_str = message.get("content").and_then(|v| v.as_str()).unwrap_or("{}");
-    let content_val =
-        serde_json::from_str::<serde_json::Value>(content_str).unwrap_or_default();
+    let content_str = message
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("{}");
+    let content_val = serde_json::from_str::<serde_json::Value>(content_str).unwrap_or_default();
     let raw_text = content_val
         .get("text")
         .and_then(|t| t.as_str())
@@ -301,8 +326,14 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
         .to_string();
     let text = strip_feishu_mentions(&raw_text);
 
-    let chat_id = message.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
-    let msg_id = message.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
+    let chat_id = message
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let msg_id = message
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let sender = event
         .get("sender")
         .and_then(|s| s.get("sender_id"))
@@ -326,12 +357,16 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
                 .unwrap_or(default_name);
             match download_feishu_resource(state, msg_id, file_key, res_type).await {
                 Ok(bytes) => {
-                    let attach_base = crate::channel_reply::resolve_attachment_base(
-                        state.ctx.as_ref(), None,
-                    ).await;
-                    match crate::media::save_attachment_in_base(&attach_base, &bytes, filename).await {
+                    let attach_base =
+                        crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), None)
+                            .await;
+                    match crate::media::save_attachment_in_base(&attach_base, &bytes, filename)
+                        .await
+                    {
                         Ok(path) => attachment_lines.push(crate::media::format_attachment_ref(
-                            &crate::media::MediaType::File, filename, &path,
+                            &crate::media::MediaType::File,
+                            filename,
+                            &path,
                         )),
                         Err(e) => warn!("Feishu: failed to save attachment {filename}: {e}"),
                     }
@@ -366,7 +401,12 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
                     .unwrap_or_default()
             };
             let reply = crate::chat_commands::handle_command(
-                &cmd, &state.ctx, &session_id, &agent_id, true, sender,
+                &cmd,
+                &state.ctx,
+                &session_id,
+                &agent_id,
+                true,
+                sender,
             )
             .await;
             if !reply.trim().is_empty() {
@@ -396,10 +436,14 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
         ) {
             return;
         }
-        let is_todo = matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. });
+        let is_todo = matches!(
+            event,
+            crate::channel_reply::ProgressEvent::TodoUpdate { .. }
+        );
         {
             let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
-            let throttle = crate::channel_capabilities::progress_throttle_secs("feishu").unwrap_or(45);
+            let throttle =
+                crate::channel_capabilities::progress_throttle_secs("feishu").unwrap_or(45);
             if !is_todo && last.elapsed().as_secs() < throttle {
                 return;
             }
@@ -414,7 +458,29 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     });
 
     let session_id = format!("feishu:{chat_id}");
-    let reply = build_reply_with_session(&input_text, &state.ctx, &session_id, sender, Some(on_progress)).await;
+    // `sender` falls back to a literal placeholder when the event carries no
+    // `open_id`; that placeholder stays in the log line, the chat-command
+    // identity and the audit trail, but it must never become the CCR
+    // principal — every anonymous sender would hash to one shared retrieval
+    // scope. `reply_principal_for_sender` yields "" there, which turns CCR off
+    // for the turn (fail-closed).
+    let guarded = build_guarded_reply_with_session(
+        &input_text,
+        &state.ctx,
+        &session_id,
+        crate::ccr_runtime::reply_principal_for_sender(sender),
+        Some(on_progress),
+    )
+    .await;
+    if !guarded.still_valid().await {
+        send_message(
+            state,
+            chat_id,
+            crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+        )
+        .await;
+        return;
+    }
 
     // WP1.3: 📎DELIVER: outbound — upload generated files via the Feishu file
     // API, strip the marker. Uses the tenant token for the sender.
@@ -425,16 +491,31 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
                 chat_id: chat_id.to_string(),
                 http: state.http.clone(),
             };
-            crate::channel_reply::deliver_documents_for_reply(
-                state.ctx.as_ref(), None, reply, &doc_sender,
-            ).await
+            crate::channel_reply::deliver_documents_for_reply_guarded(
+                state.ctx.as_ref(),
+                None,
+                guarded.text.clone(),
+                &doc_sender,
+                Some(&guarded),
+            )
+            .await
         }
         Err(e) => {
             // Token unavailable — strip markers so the raw marker never leaks.
             warn!(chat_id, "Feishu: token unavailable for DELIVER: {e}");
-            crate::office_docs::parse_deliverables(&reply).0
+            crate::office_docs::parse_deliverables(&guarded.text).0
         }
     };
+
+    if !guarded.still_valid().await {
+        send_message(
+            state,
+            chat_id,
+            crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+        )
+        .await;
+        return;
+    }
 
     // Guard: don't send empty replies
     if reply.trim().is_empty() {
@@ -448,6 +529,15 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     // notification when possible.
     let sent_as_card = if reply.len() <= FEISHU_CARD_BYTE_CAP {
         let card = build_feishu_card(&reply).to_string();
+        if !guarded.still_valid().await {
+            send_message(
+                state,
+                chat_id,
+                crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+            )
+            .await;
+            return;
+        }
         if !msg_id.is_empty() {
             send_feishu_payload(state, FeishuTarget::Reply(msg_id), "interactive", &card).await
         } else {
@@ -458,6 +548,15 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     };
 
     if !sent_as_card {
+        if !guarded.still_valid().await {
+            send_message(
+                state,
+                chat_id,
+                crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+            )
+            .await;
+            return;
+        }
         if !msg_id.is_empty() {
             reply_message(state, msg_id, &reply).await;
         } else {
@@ -485,9 +584,8 @@ async fn download_feishu_resource(
     res_type: &str,
 ) -> Result<Vec<u8>, String> {
     let token = state.get_token().await?;
-    let url = format!(
-        "{FEISHU_API}/im/v1/messages/{message_id}/resources/{file_key}?type={res_type}"
-    );
+    let url =
+        format!("{FEISHU_API}/im/v1/messages/{message_id}/resources/{file_key}?type={res_type}");
     crate::media::download_url(
         &state.http,
         &url,
@@ -540,7 +638,10 @@ async fn send_feishu_payload(
         Ok(resp) => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            warn!("Feishu card send failed ({status}): {}", truncate_bytes(&text, 200));
+            warn!(
+                "Feishu card send failed ({status}): {}",
+                truncate_bytes(&text, 200)
+            );
             false
         }
         Err(e) => {
@@ -584,7 +685,9 @@ async fn send_message(state: &FeishuState, chat_id: &str, text: &str) {
 
     match state
         .http
-        .post(format!("{FEISHU_API}/im/v1/messages?receive_id_type=chat_id"))
+        .post(format!(
+            "{FEISHU_API}/im/v1/messages?receive_id_type=chat_id"
+        ))
         .header("Authorization", format!("Bearer {token}"))
         .json(&body)
         .send()
@@ -593,7 +696,10 @@ async fn send_message(state: &FeishuState, chat_id: &str, text: &str) {
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            error!("Feishu send failed ({status}): {}", truncate_bytes(&text, 200));
+            error!(
+                "Feishu send failed ({status}): {}",
+                truncate_bytes(&text, 200)
+            );
         }
         Err(e) => error!("Feishu send error: {e}"),
         _ => {}
@@ -627,7 +733,10 @@ async fn reply_message(state: &FeishuState, message_id: &str, text: &str) {
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            error!("Feishu reply failed ({status}): {}", truncate_bytes(&text, 200));
+            error!(
+                "Feishu reply failed ({status}): {}",
+                truncate_bytes(&text, 200)
+            );
         }
         Err(e) => error!("Feishu reply error: {e}"),
         _ => {}
@@ -642,7 +751,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Verify a Feishu event-subscription signature.
@@ -694,7 +806,10 @@ mod tests {
         // M26: U+3000 (ideographic space, 3 bytes) after the mention must not
         // panic on a mid-char slice. Also exercise CJK content around it.
         assert_eq!(strip_feishu_mentions("@_user_1\u{3000}你好"), "你好");
-        assert_eq!(strip_feishu_mentions("早安 @_user_9\u{3000}世界"), "早安 世界");
+        assert_eq!(
+            strip_feishu_mentions("早安 @_user_9\u{3000}世界"),
+            "早安 世界"
+        );
         // Mention immediately followed by CJK with no whitespace at all.
         let only = strip_feishu_mentions("@_user_5你好嗎");
         assert!(only.is_empty() || only == "你好嗎" || only.starts_with('@') == false);
@@ -713,7 +828,13 @@ mod tests {
 
         assert!(verify_feishu_signature(ts, nonce, token, body, &expected));
         assert!(!verify_feishu_signature(ts, nonce, token, body, "deadbeef"));
-        assert!(!verify_feishu_signature(ts, nonce, "wrong-token", body, &expected));
+        assert!(!verify_feishu_signature(
+            ts,
+            nonce,
+            "wrong-token",
+            body,
+            &expected
+        ));
     }
 
     #[test]
@@ -727,8 +848,61 @@ mod tests {
     fn test_parse_message_event() {
         let json = r#"{"header":{"event_type":"im.message.receive_v1"},"event":{"message":{"message_type":"text","content":"{\"text\":\"hello\"}","chat_id":"oc_abc123"},"sender":{"sender_id":{"open_id":"ou_xyz"}}}}"#;
         let event: FeishuEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.header.as_ref().unwrap().event_type, "im.message.receive_v1");
+        assert_eq!(
+            event.header.as_ref().unwrap().event_type,
+            "im.message.receive_v1"
+        );
         let msg = event.event.as_ref().unwrap().get("message").unwrap();
         assert_eq!(msg.get("chat_id").unwrap().as_str().unwrap(), "oc_abc123");
+    }
+}
+
+/// Regression guard for the anonymous-sender CCR leak: this adapter used to
+/// pass its `"unknown"` placeholder straight into the reply pipeline's
+/// `user_id`, so every sender the webhook could not identify hashed to the
+/// same `source_acl` and could retrieve the others' saved tool originals.
+#[cfg(test)]
+mod ccr_principal_tests {
+    use crate::ccr_runtime::source_scan::call_args_at;
+    use crate::ccr_runtime::{reply_principal_for_sender, source_acl_for_principal};
+
+    const SRC: &str = include_str!("feishu.rs");
+    const AGENT: &str = "agent-a";
+    const SESSION: &str = "feishu:oc_abc123";
+
+    /// Structural: every `build_guarded_reply_with_session` call in this file
+    /// must launder its principal. Checked over the real source because the
+    /// call site lives inside a long async webhook handler that cannot be
+    /// driven from a unit test.
+    #[test]
+    fn every_guarded_reply_call_launders_the_ccr_principal() {
+        let args = call_args_at(SRC, "build_guarded_reply_with_session(", 3);
+        assert!(
+            !args.is_empty(),
+            "no guarded-reply call found — did the call site move?"
+        );
+        for arg in args {
+            assert!(
+                arg.starts_with("crate::ccr_runtime::reply_principal_for_sender("),
+                "the CCR principal argument must be laundered, found `{arg}`"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unidentified_sender_disables_ccr_instead_of_sharing_one_scope() {
+        let anonymous = reply_principal_for_sender("unknown");
+        assert!(anonymous.is_empty());
+        assert!(
+            source_acl_for_principal(AGENT, SESSION, anonymous).is_none(),
+            "an unidentified sender must disable CCR, never pool into one scope"
+        );
+
+        let alice = reply_principal_for_sender("ou_alice");
+        let bob = reply_principal_for_sender("ou_bob");
+        assert_ne!(
+            source_acl_for_principal(AGENT, SESSION, alice).unwrap(),
+            source_acl_for_principal(AGENT, SESSION, bob).unwrap()
+        );
     }
 }

@@ -44,7 +44,10 @@ pub struct ApiAuth {
 
 impl ApiAuth {
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self { api_key: api_key.into(), base_url: None }
+        Self {
+            api_key: api_key.into(),
+            base_url: None,
+        }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {

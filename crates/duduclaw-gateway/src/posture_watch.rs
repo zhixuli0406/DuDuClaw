@@ -8,9 +8,11 @@
 //! `PostureTracker` (escalate-fast / decay-slow) and a pure audit-log reader
 //! (`posture_from_audit`) — but as of the 2026-09 audit neither had a single
 //! production caller. `PostureTracker::observe` was exercised only by its
-//! own unit tests, and `os_reconcile::escalation_floor_from_report` (the one
-//! other place a posture value is computed) has zero call sites outside its
-//! own file. Posture transitions had nowhere to go.
+//! own unit tests. (The other place a posture value used to be computed,
+//! `os_reconcile::escalation_floor_from_report`, had zero call sites outside
+//! its own file and was removed on 2026-09-29 —
+//! `wiki/reports/feature-audit-2026-09-29.md` T1-D10.) Posture transitions had
+//! nowhere to go.
 //!
 //! This module is the missing caller: a lightweight poll loop, independent
 //! of whether the autopilot engine is enabled (this is a core safety
@@ -73,7 +75,7 @@ use tracing::info;
 use duduclaw_security::audit::Severity;
 use duduclaw_security::failsafe::{FailsafeLevel, FailsafeManager};
 use duduclaw_security::security_posture::{
-    PostureThresholds, PostureTracker, SecurityPosture, DEFAULT_WINDOW_SECONDS,
+    DEFAULT_WINDOW_SECONDS, PostureThresholds, PostureTracker, SecurityPosture,
 };
 
 /// Platform-wide failsafe scope — matches the `"__global__"` convention

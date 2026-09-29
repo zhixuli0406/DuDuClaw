@@ -196,7 +196,9 @@ fn select_pages(
     let mut kept: Vec<RankedPage> = Vec::new();
     let mut remaining = max_chars;
     for &idx in &ranking {
-        let Some(page) = candidates.get(idx) else { continue };
+        let Some(page) = candidates.get(idx) else {
+            continue;
+        };
         let needed = page.body.len() + 2; // +2 newline pair
         if needed > remaining {
             continue;
@@ -212,10 +214,14 @@ fn select_pages(
 /// Rendering is deterministic from `pages`, so cache hits re-render the
 /// identical bytes while still recording this turn's citations.
 fn render_and_cite(pages: &[RankedPage], citation: Option<CitationContext<'_>>) -> String {
-    let kept_identity: Vec<&RankedPage> =
-        pages.iter().filter(|p| p.layer == WikiLayer::Identity).collect();
-    let kept_core: Vec<&RankedPage> =
-        pages.iter().filter(|p| p.layer == WikiLayer::Core).collect();
+    let kept_identity: Vec<&RankedPage> = pages
+        .iter()
+        .filter(|p| p.layer == WikiLayer::Identity)
+        .collect();
+    let kept_core: Vec<&RankedPage> = pages
+        .iter()
+        .filter(|p| p.layer == WikiLayer::Core)
+        .collect();
 
     let mut output = String::new();
     if !kept_identity.is_empty() {
@@ -282,9 +288,7 @@ fn load_memory_owned_namespaces(wiki_root: &Path) -> HashSet<String> {
     };
     namespaces
         .iter()
-        .filter(|(_, v)| {
-            v.get("knowledge_owner").and_then(|o| o.as_str()) == Some("memory")
-        })
+        .filter(|(_, v)| v.get("knowledge_owner").and_then(|o| o.as_str()) == Some("memory"))
         .map(|(ns, _)| ns.clone())
         .collect()
 }

@@ -22,8 +22,9 @@
 //!
 //! - **Chromium** (`Cli`): `open_window` / `open_url` — CLI-launch only.
 //!   Deliberately does NOT touch the DevTools Protocol — that surface
-//!   already belongs to this platform's separate browser L1-L5 ladder
-//!   (`browser_router.rs`); duplicating it here would be the same
+//!   already belongs to this platform's separate browser tools
+//!   (`web_fetch_cached` / `web_extract` / the `computer_*` MCP tools, plus
+//!   an optional Playwright MCP server); duplicating it here would be the same
 //!   capability implemented twice, not a new one (see DESIGN §3.2's own
 //!   "已核定界線" note this module's WP brief carries forward).
 //! - **NetworkManager** (`DBus`): `connectivity` / `state` — both
@@ -206,7 +207,10 @@ pub enum Exec {
     /// program — see [`WaitMode`]; it is a required field (no `Default`)
     /// so adding a registry entry forces an explicit answer instead of
     /// silently inheriting a mode that may be wrong for it.
-    Cli { argv_template: &'static [&'static str], wait: WaitMode },
+    Cli {
+        argv_template: &'static [&'static str],
+        wait: WaitMode,
+    },
     /// Call a D-Bus method with zero arguments and decode its reply per
     /// `reply`. Linux-only ([`execute_dbus`] is `cfg(target_os = "linux")`;
     /// every other target's [`dispatch`] treats every `DBus` action as an
@@ -344,15 +348,24 @@ const CHROMIUM: AppEntry = AppEntry {
             params_schema: &[],
             exec: Exec::Cli {
                 argv_template: &["chromium", "--ozone-platform=wayland", "--new-window"],
-                wait: WaitMode::Detach { liveness_ms: DETACH_LIVENESS_MS },
+                wait: WaitMode::Detach {
+                    liveness_ms: DETACH_LIVENESS_MS,
+                },
             },
         },
         ActionEntry {
             name: "open_url",
             params_schema: &["url"],
             exec: Exec::Cli {
-                argv_template: &["chromium", "--ozone-platform=wayland", "--new-window", "{url}"],
-                wait: WaitMode::Detach { liveness_ms: DETACH_LIVENESS_MS },
+                argv_template: &[
+                    "chromium",
+                    "--ozone-platform=wayland",
+                    "--new-window",
+                    "{url}",
+                ],
+                wait: WaitMode::Detach {
+                    liveness_ms: DETACH_LIVENESS_MS,
+                },
             },
         },
     ],
@@ -431,7 +444,10 @@ const TEST_FIXTURE: AppEntry = AppEntry {
         // touching_comp`) assert the touched file EXISTS the instant
         // `dispatch` returns, which is only guaranteed because this action
         // waits for `touch` to exit.
-        exec: Exec::Cli { argv_template: &["/usr/bin/touch", "{path}"], wait: WaitMode::ForExit },
+        exec: Exec::Cli {
+            argv_template: &["/usr/bin/touch", "{path}"],
+            wait: WaitMode::ForExit,
+        },
     }],
 };
 
@@ -456,15 +472,27 @@ pub async fn dispatch(target_app: &str, req: &ApiActionRequest) -> DispatchOutco
 /// Core dispatch, parameterized over the registry so it's directly
 /// unit-testable with a small ad-hoc `AppEntry` slice (see `tests_registry.rs`)
 /// independent of whichever apps happen to be in [`APP_REGISTRY`].
-async fn dispatch_in(registry: &[AppEntry], target_app: &str, req: &ApiActionRequest) -> DispatchOutcome {
+async fn dispatch_in(
+    registry: &[AppEntry],
+    target_app: &str,
+    req: &ApiActionRequest,
+) -> DispatchOutcome {
     let Some(action) = find_action(registry, target_app, &req.action) else {
         return DispatchOutcome::Miss;
     };
     let result = match action.exec {
-        Exec::Cli { argv_template, wait } => execute_cli(argv_template, wait, &req.params).await,
-        Exec::DBus { bus, destination, path, iface, method, reply } => {
-            execute_dbus(bus, destination, path, iface, method, reply).await
-        }
+        Exec::Cli {
+            argv_template,
+            wait,
+        } => execute_cli(argv_template, wait, &req.params).await,
+        Exec::DBus {
+            bus,
+            destination,
+            path,
+            iface,
+            method,
+            reply,
+        } => execute_dbus(bus, destination, path, iface, method, reply).await,
     };
     match result {
         Ok(detail) => DispatchOutcome::Executed { detail },
@@ -472,10 +500,17 @@ async fn dispatch_in(registry: &[AppEntry], target_app: &str, req: &ApiActionReq
     }
 }
 
-fn find_action<'a>(registry: &'a [AppEntry], target_app: &str, action_name: &str) -> Option<&'a ActionEntry> {
+fn find_action<'a>(
+    registry: &'a [AppEntry],
+    target_app: &str,
+    action_name: &str,
+) -> Option<&'a ActionEntry> {
     let app = registry.iter().find(|app| {
         duduclaw_core::word_contains_ci(target_app, app.app_id)
-            || app.aliases.iter().any(|alias| duduclaw_core::word_contains_ci(target_app, alias))
+            || app
+                .aliases
+                .iter()
+                .any(|alias| duduclaw_core::word_contains_ci(target_app, alias))
     })?;
     app.actions.iter().find(|a| a.name == action_name)
 }
@@ -572,8 +607,12 @@ async fn execute_cli(
                 .map_err(|e| format!("spawn failed for '{program}': {e}"))?;
 
             if !output.status.success() {
-                let stderr_tail = duduclaw_core::truncate_chars(&String::from_utf8_lossy(&output.stderr), 200);
-                return Err(format!("'{program}' exited with {}: {stderr_tail}", output.status));
+                let stderr_tail =
+                    duduclaw_core::truncate_chars(&String::from_utf8_lossy(&output.stderr), 200);
+                return Err(format!(
+                    "'{program}' exited with {}: {stderr_tail}",
+                    output.status
+                ));
             }
             Ok(format!("cli exec ok: {program} exited {}", output.status))
         }
@@ -588,7 +627,9 @@ async fn execute_cli(
             cmd.stderr(std::process::Stdio::piped());
             cmd.kill_on_drop(false);
 
-            let mut child = cmd.spawn().map_err(|e| format!("spawn failed for '{program}': {e}"))?;
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| format!("spawn failed for '{program}': {e}"))?;
             let pid = child.id();
             // Spawned BEFORE the grace sleep, not after: the child is
             // already writing, and a pipe left unread even for the grace
@@ -596,7 +637,10 @@ async fn execute_cli(
             // (the success path does) detaches the task rather than
             // aborting it, so the draining outlives this call exactly as
             // the child does.
-            let stderr_drain = child.stderr.take().map(|pipe| tokio::spawn(drain_stderr_bounded(pipe)));
+            let stderr_drain = child
+                .stderr
+                .take()
+                .map(|pipe| tokio::spawn(drain_stderr_bounded(pipe)));
 
             tokio::time::sleep(Duration::from_millis(liveness_ms)).await;
 
@@ -639,7 +683,9 @@ async fn execute_cli(
                 // honest failure rather than a claimed success.
                 Err(e) => {
                     reap_detached(child, &program);
-                    Err(format!("'{program}' launched but its status could not be polled: {e}"))
+                    Err(format!(
+                        "'{program}' launched but its status could not be polled: {e}"
+                    ))
                 }
             }
         }
@@ -709,8 +755,12 @@ fn reap_detached(mut child: tokio::process::Child, program: &str) {
     let program = program.to_string();
     tokio::spawn(async move {
         match child.wait().await {
-            Ok(status) => tracing::debug!(program = %program, status = %status, "codrive C-L2 detached child exited"),
-            Err(e) => tracing::debug!(program = %program, error = %e, "codrive C-L2 detached child wait failed"),
+            Ok(status) => {
+                tracing::debug!(program = %program, status = %status, "codrive C-L2 detached child exited")
+            }
+            Err(e) => {
+                tracing::debug!(program = %program, error = %e, "codrive C-L2 detached child wait failed")
+            }
         }
     });
 }
@@ -769,7 +819,10 @@ mod tests {
     use super::*;
 
     fn req(action: &str, params: Value) -> ApiActionRequest {
-        ApiActionRequest { action: action.to_string(), params }
+        ApiActionRequest {
+            action: action.to_string(),
+            params,
+        }
     }
 
     // ── find_action / aliasing ──────────────────────────────────────────
@@ -783,7 +836,10 @@ mod tests {
     #[test]
     fn finds_by_alias_whole_word() {
         let entry = find_action(APP_REGISTRY, "chrome", "open_window");
-        assert!(entry.is_some(), "the 'chrome' alias must resolve to the chromium entry");
+        assert!(
+            entry.is_some(),
+            "the 'chrome' alias must resolve to the chromium entry"
+        );
     }
 
     #[test]
@@ -807,7 +863,10 @@ mod tests {
     fn networkmanager_read_only_actions_present() {
         assert!(find_action(APP_REGISTRY, "networkmanager", "connectivity").is_some());
         assert!(find_action(APP_REGISTRY, "networkmanager", "state").is_some());
-        assert!(find_action(APP_REGISTRY, "nm", "state").is_some(), "the 'nm' alias must resolve");
+        assert!(
+            find_action(APP_REGISTRY, "nm", "state").is_some(),
+            "the 'nm' alias must resolve"
+        );
     }
 
     // ── registry contents: the actual argv + WaitMode, pinned ────────────
@@ -825,7 +884,10 @@ mod tests {
         let entry = find_action(APP_REGISTRY, target_app, action)
             .unwrap_or_else(|| panic!("{target_app}/{action} must be registered"));
         match entry.exec {
-            Exec::Cli { argv_template, wait } => (argv_template, wait),
+            Exec::Cli {
+                argv_template,
+                wait,
+            } => (argv_template, wait),
             _ => panic!("{target_app}/{action} must be a Cli action"),
         }
     }
@@ -849,10 +911,23 @@ mod tests {
     #[test]
     fn chromium_open_url_argv_and_wait_mode_are_pinned() {
         let (argv, wait) = cli_exec_of("chromium", "open_url");
-        assert_eq!(argv, ["chromium", "--ozone-platform=wayland", "--new-window", "{url}"].as_slice());
+        assert_eq!(
+            argv,
+            [
+                "chromium",
+                "--ozone-platform=wayland",
+                "--new-window",
+                "{url}"
+            ]
+            .as_slice()
+        );
         assert!(matches!(wait, WaitMode::Detach { .. }), "{wait:?}");
         let entry = find_action(APP_REGISTRY, "chromium", "open_url").unwrap();
-        assert_eq!(entry.params_schema, ["url"].as_slice(), "the {{url}} placeholder and the schema must agree");
+        assert_eq!(
+            entry.params_schema,
+            ["url"].as_slice(),
+            "the {{url}} placeholder and the schema must agree"
+        );
     }
 
     #[test]
@@ -863,8 +938,14 @@ mod tests {
         for action in ["open_window", "open_url"] {
             match cli_exec_of("chromium", action).1 {
                 WaitMode::Detach { liveness_ms } => {
-                    assert!(liveness_ms >= 100, "{action}: grace too short to observe an early exit");
-                    assert!(liveness_ms <= 3000, "{action}: grace is pure added latency on the success path");
+                    assert!(
+                        liveness_ms >= 100,
+                        "{action}: grace too short to observe an early exit"
+                    );
+                    assert!(
+                        liveness_ms <= 3000,
+                        "{action}: grace is pure added latency on the success path"
+                    );
                 }
                 other => panic!("{action}: expected Detach, got {other:?}"),
             }
@@ -879,9 +960,16 @@ mod tests {
         for action in ["connectivity", "state"] {
             let entry = find_action(APP_REGISTRY, "networkmanager", action).unwrap();
             match entry.exec {
-                Exec::DBus { destination, method, .. } => {
+                Exec::DBus {
+                    destination,
+                    method,
+                    ..
+                } => {
                     assert_eq!(destination, "org.freedesktop.NetworkManager");
-                    assert!(entry.params_schema.is_empty(), "{action} is a zero-arg read-only query");
+                    assert!(
+                        entry.params_schema.is_empty(),
+                        "{action} is a zero-arg read-only query"
+                    );
                     assert!(!method.is_empty());
                 }
                 _ => panic!("{action} must stay a DBus action"),
@@ -904,7 +992,10 @@ mod tests {
             &serde_json::json!({"url": "https://example.com"}),
         )
         .unwrap();
-        assert_eq!(argv, vec!["chromium", "--new-window", "https://example.com"]);
+        assert_eq!(
+            argv,
+            vec!["chromium", "--new-window", "https://example.com"]
+        );
     }
 
     #[test]
@@ -938,7 +1029,8 @@ mod tests {
     #[test]
     fn render_argv_oversized_param_rejected() {
         let big = "a".repeat(MAX_PARAM_CHARS + 1);
-        let err = render_argv(&["chromium", "{url}"], &serde_json::json!({"url": big})).unwrap_err();
+        let err =
+            render_argv(&["chromium", "{url}"], &serde_json::json!({"url": big})).unwrap_err();
         assert!(err.contains("exceeds"));
     }
 
@@ -946,13 +1038,23 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_miss_for_unregistered_app() {
-        let outcome = dispatch_in(APP_REGISTRY, "totally-unknown-app", &req("anything", Value::Null)).await;
+        let outcome = dispatch_in(
+            APP_REGISTRY,
+            "totally-unknown-app",
+            &req("anything", Value::Null),
+        )
+        .await;
         assert!(matches!(outcome, DispatchOutcome::Miss));
     }
 
     #[tokio::test]
     async fn dispatch_miss_for_unregistered_action() {
-        let outcome = dispatch_in(APP_REGISTRY, "chromium", &req("does_not_exist", Value::Null)).await;
+        let outcome = dispatch_in(
+            APP_REGISTRY,
+            "chromium",
+            &req("does_not_exist", Value::Null),
+        )
+        .await;
         assert!(matches!(outcome, DispatchOutcome::Miss));
     }
 
@@ -961,7 +1063,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_cli_hit_executes_for_real_and_touches_the_file() {
-        let dir = std::env::temp_dir().join(format!("codrive-registry-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("codrive-registry-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("touched").to_string_lossy().to_string();
         assert!(!std::path::Path::new(&target).exists());
@@ -973,16 +1076,30 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(outcome, DispatchOutcome::Executed { .. }), "{outcome:?}");
-        assert!(std::path::Path::new(&target).exists(), "the touch side effect must be real, not simulated");
+        assert!(
+            matches!(outcome, DispatchOutcome::Executed { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            std::path::Path::new(&target).exists(),
+            "the touch side effect must be real, not simulated"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_cli_missing_param_is_failed_not_panic() {
-        let outcome = dispatch_in(APP_REGISTRY, "codrive-test-fixture", &req("touch_file", Value::Null)).await;
-        assert!(matches!(outcome, DispatchOutcome::Failed { .. }), "{outcome:?}");
+        let outcome = dispatch_in(
+            APP_REGISTRY,
+            "codrive-test-fixture",
+            &req("touch_file", Value::Null),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DispatchOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1008,8 +1125,16 @@ mod tests {
                 },
             }],
         };
-        let outcome = dispatch_in(&[FIXTURE], "definitely-nonexistent-app", &req("noop", Value::Null)).await;
-        assert!(matches!(outcome, DispatchOutcome::Failed { .. }), "{outcome:?}");
+        let outcome = dispatch_in(
+            &[FIXTURE],
+            "definitely-nonexistent-app",
+            &req("noop", Value::Null),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DispatchOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
     }
 
     // ── dispatch_in — WaitMode::Detach behavior (unix) ───────────────────
@@ -1042,7 +1167,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn detach_returns_long_before_the_child_exits() {
-        let dir = std::env::temp_dir().join(format!("codrive-detach-fast-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("codrive-detach-fast-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("marker").to_string_lossy().to_string();
 
@@ -1061,7 +1187,10 @@ mod tests {
                     detail.contains("still running"),
                     "a live detached child's audit detail must say so, never claim it exited: {detail}"
                 );
-                assert!(!detail.contains("exited"), "must not claim an exit that never happened: {detail}");
+                assert!(
+                    !detail.contains("exited"),
+                    "must not claim an exit that never happened: {detail}"
+                );
             }
             other => panic!("a long-running detached child must be Executed, got {other:?}"),
         }
@@ -1069,7 +1198,10 @@ mod tests {
         // wait-for-exit semantics this call could not have returned in
         // under 2s (and the real chromium entries could not have returned
         // in under EXEC_TIMEOUT at all).
-        assert!(elapsed < Duration::from_secs(1), "detach must not wait for exit (took {elapsed:?})");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "detach must not wait for exit (took {elapsed:?})"
+        );
         assert!(
             !std::path::Path::new(&target).exists(),
             "sanity: the child must still be mid-sleep when dispatch returns"
@@ -1083,7 +1215,8 @@ mod tests {
         // The regression this pins: `kill_on_drop(true)` on the detach path
         // would kill the child the moment the `Child` handle dropped — i.e.
         // right after reporting success — so the marker would never appear.
-        let dir = std::env::temp_dir().join(format!("codrive-detach-alive-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("codrive-detach-alive-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("marker").to_string_lossy().to_string();
 
@@ -1093,7 +1226,10 @@ mod tests {
             &req("late_touch", serde_json::json!({"path": target.clone()})),
         )
         .await;
-        assert!(matches!(outcome, DispatchOutcome::Executed { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, DispatchOutcome::Executed { .. }),
+            "{outcome:?}"
+        );
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while !std::path::Path::new(&target).exists() {
@@ -1125,10 +1261,18 @@ mod tests {
                 },
             }],
         };
-        let outcome = dispatch_in(&[FIXTURE], "codrive-detach-instafail", &req("die", Value::Null)).await;
+        let outcome = dispatch_in(
+            &[FIXTURE],
+            "codrive-detach-instafail",
+            &req("die", Value::Null),
+        )
+        .await;
         match outcome {
             DispatchOutcome::Failed { detail } => {
-                assert!(detail.contains("launch grace"), "detail should name the grace window: {detail}");
+                assert!(
+                    detail.contains("launch grace"),
+                    "detail should name the grace window: {detail}"
+                );
             }
             other => panic!("an instantly-failing detached child must be Failed, got {other:?}"),
         }
@@ -1153,11 +1297,19 @@ mod tests {
                 },
             }],
         };
-        let outcome = dispatch_in(&[FIXTURE], "codrive-detach-handoff", &req("handoff", Value::Null)).await;
+        let outcome = dispatch_in(
+            &[FIXTURE],
+            "codrive-detach-handoff",
+            &req("handoff", Value::Null),
+        )
+        .await;
         match outcome {
             DispatchOutcome::Executed { detail } => {
                 assert!(detail.contains("exited"), "{detail}");
-                assert!(!detail.contains("still running"), "must not claim a process that is gone: {detail}");
+                assert!(
+                    !detail.contains("still running"),
+                    "must not claim a process that is gone: {detail}"
+                );
             }
             other => panic!("a clean early exit must be Executed, got {other:?}"),
         }
@@ -1177,12 +1329,21 @@ mod tests {
                 name: "die_loudly",
                 params_schema: &[],
                 exec: Exec::Cli {
-                    argv_template: &["/bin/sh", "-c", "echo codrive-stderr-marker-7f3a 1>&2; exit 4"],
+                    argv_template: &[
+                        "/bin/sh",
+                        "-c",
+                        "echo codrive-stderr-marker-7f3a 1>&2; exit 4",
+                    ],
                     wait: WaitMode::Detach { liveness_ms: 400 },
                 },
             }],
         };
-        let outcome = dispatch_in(&[FIXTURE], "codrive-detach-noisy-fail", &req("die_loudly", Value::Null)).await;
+        let outcome = dispatch_in(
+            &[FIXTURE],
+            "codrive-detach-noisy-fail",
+            &req("die_loudly", Value::Null),
+        )
+        .await;
         match outcome {
             DispatchOutcome::Failed { detail } => {
                 assert!(
@@ -1223,7 +1384,12 @@ mod tests {
             }],
         };
         let started = std::time::Instant::now();
-        let outcome = dispatch_in(&[FIXTURE], "codrive-detach-firehose", &req("flood_then_die", Value::Null)).await;
+        let outcome = dispatch_in(
+            &[FIXTURE],
+            "codrive-detach-firehose",
+            &req("flood_then_die", Value::Null),
+        )
+        .await;
         let elapsed = started.elapsed();
 
         match outcome {
@@ -1232,12 +1398,24 @@ mod tests {
                 // reaches the audit row — and the marker printed LAST is
                 // past the retained head, which is the documented
                 // head-not-tail trade-off, not a bug.
-                assert!(detail.chars().count() < 600, "the detail must stay bounded: {} chars", detail.chars().count());
-                assert!(detail.contains("codrive-flood-"), "the retained head must survive: {detail}");
+                assert!(
+                    detail.chars().count() < 600,
+                    "the detail must stay bounded: {} chars",
+                    detail.chars().count()
+                );
+                assert!(
+                    detail.contains("codrive-flood-"),
+                    "the retained head must survive: {detail}"
+                );
             }
-            other => panic!("a flooding child must still exit and be judged by its status, got {other:?}"),
+            other => panic!(
+                "a flooding child must still exit and be judged by its status, got {other:?}"
+            ),
         }
-        assert!(elapsed < Duration::from_secs(8), "draining must not stall the dispatch (took {elapsed:?})");
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "draining must not stall the dispatch (took {elapsed:?})"
+        );
     }
 
     #[cfg(unix)]
@@ -1255,8 +1433,16 @@ mod tests {
                 },
             }],
         };
-        let outcome = dispatch_in(&[FIXTURE], "codrive-detach-missing-binary", &req("noop", Value::Null)).await;
-        assert!(matches!(outcome, DispatchOutcome::Failed { .. }), "{outcome:?}");
+        let outcome = dispatch_in(
+            &[FIXTURE],
+            "codrive-detach-missing-binary",
+            &req("noop", Value::Null),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DispatchOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
     }
 
     // ── DBus exec, non-Linux honest refusal ─────────────────────────────
@@ -1267,7 +1453,10 @@ mod tests {
         let outcome = dispatch_in(APP_REGISTRY, "networkmanager", &req("state", Value::Null)).await;
         match outcome {
             DispatchOutcome::Failed { detail } => {
-                assert!(detail.contains("Linux"), "detail should explain the platform gap: {detail}");
+                assert!(
+                    detail.contains("Linux"),
+                    "detail should explain the platform gap: {detail}"
+                );
             }
             other => panic!("expected Failed on non-Linux, got {other:?}"),
         }

@@ -175,7 +175,9 @@ pub async fn build_provider_from_config(
                 .filter(|s| !s.is_empty())
                 .unwrap_or(DEFAULT_STT_MODEL)
                 .to_string();
-            Ok(Some(Box::new(OpenAiCompatStt::new(base_url, api_key, model))))
+            Ok(Some(Box::new(OpenAiCompatStt::new(
+                base_url, api_key, model,
+            ))))
         }
         SttProviderKind::Command => {
             let command = voice
@@ -362,7 +364,9 @@ impl SttProvider for CommandStt {
         let ext = filename
             .rsplit('.')
             .next()
-            .filter(|e| !e.is_empty() && e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+            .filter(|e| {
+                !e.is_empty() && e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric())
+            })
             .unwrap_or("webm");
         let tmp = std::env::temp_dir().join(format!(
             "duduclaw-stt-{}.{}",
@@ -390,16 +394,16 @@ impl CommandStt {
 
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            tokio::process::Command::new(&prog)
-                .args(&args)
-                .output(),
+            tokio::process::Command::new(&prog).args(&args).output(),
         )
         .await
         .map_err(|_| "STT command timeout (120s)".to_string())?;
 
         let output = output.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                format!("STT command not found: '{prog}'. Check [voice] stt_command in config.toml.")
+                format!(
+                    "STT command not found: '{prog}'. Check [voice] stt_command in config.toml."
+                )
             } else {
                 format!("STT command spawn failed: {e}")
             }
@@ -467,13 +471,9 @@ mod tests {
     #[test]
     fn build_command_args_substitutes_placeholder() {
         let (prog, args) =
-            build_command_args("whisper-cli -m model.bin -f {audio} --txt", "/tmp/x.webm")
-                .unwrap();
+            build_command_args("whisper-cli -m model.bin -f {audio} --txt", "/tmp/x.webm").unwrap();
         assert_eq!(prog, "whisper-cli");
-        assert_eq!(
-            args,
-            vec!["-m", "model.bin", "-f", "/tmp/x.webm", "--txt"]
-        );
+        assert_eq!(args, vec!["-m", "model.bin", "-f", "/tmp/x.webm", "--txt"]);
     }
 
     #[test]
@@ -544,7 +544,10 @@ mod tests {
         )
         .unwrap();
         let got = build_provider_from_config(&home).await.unwrap();
-        assert_eq!(got.map(|p| p.name().to_string()), Some("openai_compat".to_string()));
+        assert_eq!(
+            got.map(|p| p.name().to_string()),
+            Some("openai_compat".to_string())
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -568,15 +571,16 @@ mod tests {
         )
         .unwrap();
         let got = build_provider_from_config(&home).await.unwrap();
-        assert_eq!(got.map(|p| p.name().to_string()), Some("command".to_string()));
+        assert_eq!(
+            got.map(|p| p.name().to_string()),
+            Some("command".to_string())
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]
     async fn command_stt_missing_binary_is_clear_error() {
-        let provider = CommandStt::new(
-            "duduclaw-nonexistent-stt-binary-xyz {audio}".to_string(),
-        );
+        let provider = CommandStt::new("duduclaw-nonexistent-stt-binary-xyz {audio}".to_string());
         let err = provider
             .transcribe(b"fake audio bytes", "voice.webm", None)
             .await

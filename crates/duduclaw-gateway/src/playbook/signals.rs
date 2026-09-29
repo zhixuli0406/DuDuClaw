@@ -44,7 +44,11 @@ impl TurnSignals {
     /// input (unattributed/legacy `MistakeEntry.source_kind`) maps to the
     /// literal `unattributed` value per §1.3's value domain.
     pub fn with_source_kind(mut self, kind: &str) -> Self {
-        let v = if kind.is_empty() { "unattributed" } else { kind };
+        let v = if kind.is_empty() {
+            "unattributed"
+        } else {
+            kind
+        };
         self.insert(format!("source_kind:{v}"));
         self
     }
@@ -189,8 +193,13 @@ mod tests {
     fn discriminating_signal_detection_ignores_wildcard() {
         assert!(!has_discriminating_signal(&[]));
         assert!(!has_discriminating_signal(&["*".to_string()]));
-        assert!(has_discriminating_signal(&["*".to_string(), "kw:refund".to_string()]));
-        assert!(has_discriminating_signal(&["mistake:capability".to_string()]));
+        assert!(has_discriminating_signal(&[
+            "*".to_string(),
+            "kw:refund".to_string()
+        ]));
+        assert!(has_discriminating_signal(&[
+            "mistake:capability".to_string()
+        ]));
     }
 
     #[test]
@@ -258,9 +267,8 @@ mod tests {
 
     #[test]
     fn turn_keywords_are_uncapped_unlike_entry_authoring_cap() {
-        let turn = TurnSignals::new().with_keywords_from_message(
-            "alpha beta gamma delta epsilon zeta eta theta",
-        );
+        let turn = TurnSignals::new()
+            .with_keywords_from_message("alpha beta gamma delta epsilon zeta eta theta");
         // Every qualifying ASCII word (len>3) should be present, well beyond
         // the entry-authoring cap of 3.
         assert!(turn.contains("kw:alpha"));

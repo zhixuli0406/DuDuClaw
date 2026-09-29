@@ -73,7 +73,7 @@ use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_redaction::EgressDecision;
 
 use crate::mcp_redaction::{
-    decide_tool_args_with, egress_deny_response, redact_tool_result_with, McpRedactionLayer,
+    McpRedactionLayer, decide_tool_args_with, egress_deny_response, redact_tool_result_with,
 };
 
 /// Env var carrying the upstream server's `.mcp.json` `env` map, JSON-encoded.
@@ -328,7 +328,10 @@ pub async fn run_proxy_io(
                 let ns = namespaced_tool(server, &tool);
                 let decided = decide_args(layer, &ns, &args);
                 match decided {
-                    ArgDecision::Deny { reason, tokens_seen } => {
+                    ArgDecision::Deny {
+                        reason,
+                        tokens_seen,
+                    } => {
                         // Answer here; the call NEVER reaches upstream.
                         let resp = egress_deny_response(&id, &ns, &reason, tokens_seen);
                         let _ = tx.send(resp.to_string());
@@ -367,7 +370,10 @@ pub async fn run_proxy_io(
 enum ArgDecision {
     /// Forward; `Some(args)` when the tokens were restored to real values.
     Forward(Option<Value>),
-    Deny { reason: String, tokens_seen: usize },
+    Deny {
+        reason: String,
+        tokens_seen: usize,
+    },
 }
 
 fn decide_args(layer: &McpRedactionLayer, ns_tool: &str, args: &Value) -> ArgDecision {
@@ -510,7 +516,9 @@ pub async fn run_mcp_proxy(
     cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|e| {
-        DuDuClawError::Gateway(format!("mcp-proxy: failed to spawn upstream '{command}': {e}"))
+        DuDuClawError::Gateway(format!(
+            "mcp-proxy: failed to spawn upstream '{command}': {e}"
+        ))
     })?;
     let upstream_in = child
         .stdin
@@ -573,21 +581,19 @@ mod tests {
         // Everything else forwards untouched.
         assert!(tool_call_of(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).is_none());
         assert!(tool_call_of(&json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).is_none());
-        assert!(tool_call_of(
-            &json!({"jsonrpc":"2.0","method":"notifications/initialized"})
-        )
-        .is_none());
+        assert!(
+            tool_call_of(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none()
+        );
         // A tools/call with no id is a notification — nothing to answer.
-        assert!(tool_call_of(
-            &json!({"jsonrpc":"2.0","method":"tools/call","params":{"name":"x"}})
-        )
-        .is_none());
+        assert!(
+            tool_call_of(&json!({"jsonrpc":"2.0","method":"tools/call","params":{"name":"x"}}))
+                .is_none()
+        );
     }
 
     #[test]
     fn tools_call_without_arguments_yields_an_empty_object() {
-        let call =
-            json!({"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"name":"ping"}});
+        let call = json!({"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"name":"ping"}});
         let (_, _, args) = tool_call_of(&call).unwrap();
         assert_eq!(args, json!({}));
     }
@@ -671,12 +677,18 @@ mod tests {
     fn upstream_env_strips_duduclaw_internals_and_applies_the_declared_map() {
         let inherited = vec![
             ("PATH".to_string(), "/usr/bin".to_string()),
-            ("DUDUCLAW_MCP_API_KEY".to_string(), "ddc_dev_secret".to_string()),
+            (
+                "DUDUCLAW_MCP_API_KEY".to_string(),
+                "ddc_dev_secret".to_string(),
+            ),
             ("DUDUCLAW_AGENT_TOKEN".to_string(), "mac".to_string()),
             (PROXY_UPSTREAM_ENV_VAR.to_string(), "{}".to_string()),
             ("PGPASSWORD".to_string(), "inherited".to_string()),
         ];
-        let out = upstream_env(inherited, Some(r#"{"PGPASSWORD":"declared","PGHOST":"db"}"#));
+        let out = upstream_env(
+            inherited,
+            Some(r#"{"PGPASSWORD":"declared","PGHOST":"db"}"#),
+        );
         let map: HashMap<_, _> = out.into_iter().collect();
 
         assert_eq!(map.get("PATH").map(String::as_str), Some("/usr/bin"));
@@ -834,9 +846,15 @@ mod tests {
         assert_eq!(replies.len(), 1);
         let out: Value = serde_json::from_str(&replies[0]).unwrap();
         let text = out["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(!text.contains("王小明"), "structured rule must fire: {text}");
+        assert!(
+            !text.contains("王小明"),
+            "structured rule must fire: {text}"
+        );
         assert!(text.contains("<REDACT:DB_FIELD:"), "{text}");
-        assert!(!text.contains("wang@example.com"), "general profile: {text}");
+        assert!(
+            !text.contains("wang@example.com"),
+            "general profile: {text}"
+        );
         assert!(text.contains("<REDACT:EMAIL:"), "{text}");
         // The envelope survives (§3.4 root-node protection).
         assert_eq!(out["result"]["content"][0]["type"], json!("text"));

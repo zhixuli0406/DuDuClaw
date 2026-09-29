@@ -2,15 +2,11 @@ pub mod action_claim_verifier;
 pub mod audit;
 pub mod audit_chain;
 pub mod circuit_breaker;
-pub mod credential_proxy;
 pub mod crypto;
 pub mod failsafe;
-pub mod filter_chain;
 pub mod input_guard;
 pub mod keyfile;
 pub mod killswitch;
-pub mod mount_guard;
-pub mod os_reconcile;
 pub mod perception;
 pub mod policy_kernel;
 pub mod rate_limiter;
@@ -21,7 +17,6 @@ pub mod secret_ref;
 pub mod soul_guard;
 pub mod soul_scanner;
 pub mod stability_index;
-pub mod template_sanitizer;
 pub mod unicode_normalizer;
 
 #[cfg(test)]

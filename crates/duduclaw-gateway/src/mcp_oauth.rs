@@ -71,7 +71,10 @@ pub fn gateway_port(home: &Path) -> u16 {
 /// nothing on it and no OAuth flow could complete — the callback never fired,
 /// no token was ever stored, and the dashboard sat on "not connected".
 pub fn redirect_uri(home: &Path) -> String {
-    format!("http://localhost:{}/api/mcp/oauth/callback", gateway_port(home))
+    format!(
+        "http://localhost:{}/api/mcp/oauth/callback",
+        gateway_port(home)
+    )
 }
 
 pub fn builtin_providers(redirect_uri: &str) -> Vec<McpOAuthConfig> {
@@ -333,9 +336,10 @@ pub async fn exchange_code(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let expires_at = body.get("expires_in").and_then(|v| v.as_i64()).map(|secs| {
-        chrono::Utc::now() + chrono::Duration::seconds(secs)
-    });
+    let expires_at = body
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs));
 
     let scopes = config.scopes.clone();
 
@@ -398,9 +402,10 @@ pub async fn refresh_token(
         .map(|s| s.to_string())
         .or_else(|| Some(refresh_tok.to_string()));
 
-    let expires_at = body.get("expires_in").and_then(|v| v.as_i64()).map(|secs| {
-        chrono::Utc::now() + chrono::Duration::seconds(secs)
-    });
+    let expires_at = body
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs));
 
     info!(provider = %config.provider_id, "OAuth token refresh successful");
 
@@ -489,8 +494,7 @@ pub fn save_tokens(home_dir: &Path, tokens: &[McpOAuthToken]) -> Result<(), Stri
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, &json)
         .map_err(|e| format!("Failed to write temp token file: {e}"))?;
-    std::fs::rename(&tmp_path, &path)
-        .map_err(|e| format!("Failed to rename token file: {e}"))?;
+    std::fs::rename(&tmp_path, &path).map_err(|e| format!("Failed to rename token file: {e}"))?;
 
     Ok(())
 }
@@ -498,9 +502,9 @@ pub fn save_tokens(home_dir: &Path, tokens: &[McpOAuthToken]) -> Result<(), Stri
 /// Get a valid (non-expired) token for a specific provider.
 pub fn get_token(home_dir: &Path, provider_id: &str) -> Option<McpOAuthToken> {
     let tokens = load_tokens(home_dir);
-    tokens.into_iter().find(|t| {
-        t.provider_id == provider_id && !is_expired(t)
-    })
+    tokens
+        .into_iter()
+        .find(|t| t.provider_id == provider_id && !is_expired(t))
 }
 
 /// Get the stored token for a provider **regardless of expiry**.
@@ -647,10 +651,7 @@ pub fn get_client_config(home_dir: &Path, provider_id: &str) -> Option<McpOAuthC
 }
 
 /// Upsert a client config: replace existing for the same provider, or append.
-pub fn upsert_client_config(
-    home_dir: &Path,
-    config: McpOAuthClientConfig,
-) -> Result<(), String> {
+pub fn upsert_client_config(home_dir: &Path, config: McpOAuthClientConfig) -> Result<(), String> {
     let mut configs = load_client_configs(home_dir);
     configs.retain(|c| c.provider_id != config.provider_id);
     configs.push(config);
@@ -681,7 +682,8 @@ mod redirect_uri_tests {
     use super::*;
 
     fn tmp_home() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("ddc-mcpoauth-redirect-{}", uuid::Uuid::new_v4()));
+        let p =
+            std::env::temp_dir().join(format!("ddc-mcpoauth-redirect-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -701,7 +703,11 @@ mod redirect_uri_tests {
             return;
         }
         let home = tmp_home();
-        assert_eq!(gateway_port(&home), 18789, "must match the CLI's `duduclaw run` default");
+        assert_eq!(
+            gateway_port(&home),
+            18789,
+            "must match the CLI's `duduclaw run` default"
+        );
         assert_eq!(
             redirect_uri(&home),
             "http://localhost:18789/api/mcp/oauth/callback",
@@ -782,15 +788,24 @@ mod xc1_token_encryption_tests {
 
         // On-disk JSON must NOT contain the cleartext secrets.
         let raw = std::fs::read_to_string(home.join(TOKEN_FILE)).unwrap();
-        assert!(!raw.contains("gho_super_secret_value"), "access token leaked: {raw}");
-        assert!(!raw.contains("ghr_refresh_secret"), "refresh token leaked: {raw}");
+        assert!(
+            !raw.contains("gho_super_secret_value"),
+            "access token leaked: {raw}"
+        );
+        assert!(
+            !raw.contains("ghr_refresh_secret"),
+            "refresh token leaked: {raw}"
+        );
         assert!(raw.contains(ENC_PREFIX), "expected enc prefix in {raw}");
 
         // load_tokens decrypts back to cleartext.
         let loaded = load_tokens(&home);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].access_token, "gho_super_secret_value");
-        assert_eq!(loaded[0].refresh_token.as_deref(), Some("ghr_refresh_secret"));
+        assert_eq!(
+            loaded[0].refresh_token.as_deref(),
+            Some("ghr_refresh_secret")
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -933,10 +948,18 @@ mod xc1_token_encryption_tests {
         );
         let req = build_exchange_request(&c, "gh_code", "verifier");
         assert!(!req.basic_auth);
-        assert!(req.accept_json, "GitHub needs Accept: application/json to get JSON");
+        assert!(
+            req.accept_json,
+            "GitHub needs Accept: application/json to get JSON"
+        );
         match req.body {
             ExchangeBody::Form(params) => {
-                let get = |k: &str| params.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.as_str());
+                let get = |k: &str| {
+                    params
+                        .iter()
+                        .find(|(pk, _)| pk == k)
+                        .map(|(_, v)| v.as_str())
+                };
                 assert_eq!(get("grant_type"), Some("authorization_code"));
                 assert_eq!(get("code"), Some("gh_code"));
                 assert_eq!(get("client_id"), Some("cid"));
@@ -974,9 +997,15 @@ mod saved_credential_display_tests {
         // the whole thing instead.
         assert_eq!(mask_secret_tail("abc"), "••••");
         assert_eq!(mask_secret_tail("elevenchars"), "••••");
-        assert_eq!(mask_secret_tail(&["GOCSPX", "-abcdef1234"].concat()), "••••1234");
+        assert_eq!(
+            mask_secret_tail(&["GOCSPX", "-abcdef1234"].concat()),
+            "••••1234"
+        );
         // CJK / multi-byte values must not panic or slice mid-character.
-        assert_eq!(mask_secret_tail("金鑰的內容就是這幾個中文字"), "••••個中文字");
+        assert_eq!(
+            mask_secret_tail("金鑰的內容就是這幾個中文字"),
+            "••••個中文字"
+        );
     }
 
     #[test]

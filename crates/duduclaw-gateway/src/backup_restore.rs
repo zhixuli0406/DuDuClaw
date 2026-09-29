@@ -136,10 +136,23 @@ pub enum RestoreViolation {
     /// The gzip/tar stream could not be parsed.
     Malformed,
     /// A traversal / absolute-path / symlink / hardlink / special-file entry.
-    UnsafeEntry { path: String, reason: &'static str },
-    TooManyEntries { count: u64, max: u32 },
-    EntryTooLarge { entry: String, bytes: u64, max: u64 },
-    TotalTooLarge { bytes: u64, max: u64 },
+    UnsafeEntry {
+        path: String,
+        reason: &'static str,
+    },
+    TooManyEntries {
+        count: u64,
+        max: u32,
+    },
+    EntryTooLarge {
+        entry: String,
+        bytes: u64,
+        max: u64,
+    },
+    TotalTooLarge {
+        bytes: u64,
+        max: u64,
+    },
     Io(String),
 }
 
@@ -151,10 +164,16 @@ impl std::fmt::Display for RestoreViolation {
             Self::Malformed => write!(f, "備份檔壓縮結構損毀，無法解析"),
             Self::UnsafeEntry { path, reason } => {
                 let name = duduclaw_core::truncate_bytes(path, 120);
-                write!(f, "備份檔內含不安全的項目「{name}」（{reason}），已拒絕還原")
+                write!(
+                    f,
+                    "備份檔內含不安全的項目「{name}」（{reason}），已拒絕還原"
+                )
             }
             Self::TooManyEntries { count, max } => {
-                write!(f, "備份檔內含 {count} 個項目，超過安全上限 {max} 個，已拒絕還原")
+                write!(
+                    f,
+                    "備份檔內含 {count} 個項目，超過安全上限 {max} 個，已拒絕還原"
+                )
             }
             Self::EntryTooLarge { entry, bytes, max } => {
                 let name = duduclaw_core::truncate_bytes(entry, 120);
@@ -221,7 +240,9 @@ pub fn extract_tar_gz_safely(
 ) -> Result<RestoreExtractReport, RestoreViolation> {
     let mut f = std::fs::File::open(archive_path).map_err(|_| RestoreViolation::Unreadable)?;
     let mut magic = [0u8; 2];
-    let n = f.read(&mut magic).map_err(|_| RestoreViolation::Unreadable)?;
+    let n = f
+        .read(&mut magic)
+        .map_err(|_| RestoreViolation::Unreadable)?;
     if n < 2 || magic != [0x1f, 0x8b] {
         return Err(RestoreViolation::NotTarGz);
     }
@@ -256,34 +277,62 @@ fn extract_inner(
         let mut entry = entry.map_err(|_| RestoreViolation::Malformed)?;
         count += 1;
         if count > limits.max_entries as u64 {
-            return Err(RestoreViolation::TooManyEntries { count, max: limits.max_entries });
+            return Err(RestoreViolation::TooManyEntries {
+                count,
+                max: limits.max_entries,
+            });
         }
 
         let entry_type = entry.header().entry_type();
-        let raw_path = entry.path().map_err(|_| RestoreViolation::Malformed)?.into_owned();
+        let raw_path = entry
+            .path()
+            .map_err(|_| RestoreViolation::Malformed)?
+            .into_owned();
         let path_str = raw_path.to_string_lossy().to_string();
 
         if entry_type.is_symlink() || entry_type.is_hard_link() {
-            return Err(RestoreViolation::UnsafeEntry { path: path_str, reason: "symlink_or_hardlink" });
+            return Err(RestoreViolation::UnsafeEntry {
+                path: path_str,
+                reason: "symlink_or_hardlink",
+            });
         }
-        if !matches!(entry_type, tar::EntryType::Regular | tar::EntryType::Directory) {
-            return Err(RestoreViolation::UnsafeEntry { path: path_str, reason: "special_file" });
+        if !matches!(
+            entry_type,
+            tar::EntryType::Regular | tar::EntryType::Directory
+        ) {
+            return Err(RestoreViolation::UnsafeEntry {
+                path: path_str,
+                reason: "special_file",
+            });
         }
         if raw_path.is_absolute()
-            || raw_path
-                .components()
-                .any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+            || raw_path.components().any(|c| {
+                matches!(
+                    c,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
         {
-            return Err(RestoreViolation::UnsafeEntry { path: path_str, reason: "path_traversal" });
+            return Err(RestoreViolation::UnsafeEntry {
+                path: path_str,
+                reason: "path_traversal",
+            });
         }
 
         let size = entry.header().size().unwrap_or(0);
         if size > limits.max_entry_bytes {
-            return Err(RestoreViolation::EntryTooLarge { entry: path_str, bytes: size, max: limits.max_entry_bytes });
+            return Err(RestoreViolation::EntryTooLarge {
+                entry: path_str,
+                bytes: size,
+                max: limits.max_entry_bytes,
+            });
         }
         total = total.saturating_add(size);
         if total > limits.max_total_bytes {
-            return Err(RestoreViolation::TotalTooLarge { bytes: total, max: limits.max_total_bytes });
+            return Err(RestoreViolation::TotalTooLarge {
+                bytes: total,
+                max: limits.max_total_bytes,
+            });
         }
 
         let dest_path = dest_dir.join(&raw_path);
@@ -295,12 +344,17 @@ fn extract_inner(
         if let Some(parent) = dest_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| RestoreViolation::Io(e.to_string()))?;
         }
-        let mut out = std::fs::File::create(&dest_path).map_err(|e| RestoreViolation::Io(e.to_string()))?;
+        let mut out =
+            std::fs::File::create(&dest_path).map_err(|e| RestoreViolation::Io(e.to_string()))?;
         std::io::copy(&mut entry, &mut out).map_err(|e| RestoreViolation::Io(e.to_string()))?;
         files_written += 1;
     }
 
-    Ok(RestoreExtractReport { files_written, dirs_created, total_bytes: total })
+    Ok(RestoreExtractReport {
+        files_written,
+        dirs_created,
+        total_bytes: total,
+    })
 }
 
 // ── Upload staging ────────────────────────────────────────────────────
@@ -371,7 +425,9 @@ pub fn staged_upload_path(home: &Path, client_name: &str) -> PathBuf {
 /// refused.
 pub fn is_within_upload_dir(home: &Path, path: &Path) -> bool {
     let dir = upload_dir(home);
-    let (Ok(canon_dir), Ok(canon_path)) = (std::fs::canonicalize(&dir), std::fs::canonicalize(path)) else {
+    let (Ok(canon_dir), Ok(canon_path)) =
+        (std::fs::canonicalize(&dir), std::fs::canonicalize(path))
+    else {
         return false;
     };
     canon_path.starts_with(&canon_dir)
@@ -536,7 +592,9 @@ pub fn perform_pending_restore_swap(
     }
 
     let mut swapped = 0usize;
-    for entry in std::fs::read_dir(&restore_root).map_err(|e| RestoreSwapError::Io(e.to_string()))? {
+    for entry in
+        std::fs::read_dir(&restore_root).map_err(|e| RestoreSwapError::Io(e.to_string()))?
+    {
         let entry = entry.map_err(|e| RestoreSwapError::Io(e.to_string()))?;
         let dest = home_dir.join(entry.file_name());
         std::fs::rename(entry.path(), &dest).map_err(|e| RestoreSwapError::Io(e.to_string()))?;
@@ -548,7 +606,10 @@ pub fn perform_pending_restore_swap(
         warn!(error = %e, "backup-restore: 換入完成但清除標記檔失敗（下次開機會偵測到殘留 staging 為空而略過，不會重複換入）");
     }
 
-    Ok(Some(RestoreSwapReport { preserved_dir, entries_swapped: swapped }))
+    Ok(Some(RestoreSwapReport {
+        preserved_dir,
+        entries_swapped: swapped,
+    }))
 }
 
 #[cfg(test)]
@@ -561,7 +622,10 @@ mod tests {
     #[test]
     fn limits_default_when_absent() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(RestoreLimits::from_home(dir.path()), RestoreLimits::default());
+        assert_eq!(
+            RestoreLimits::from_home(dir.path()),
+            RestoreLimits::default()
+        );
     }
 
     #[test]
@@ -608,7 +672,11 @@ mod tests {
     /// name/linkname fields is what a real malicious (non-Rust-authored)
     /// archive looks like on the wire, so this is a faithful attack fixture,
     /// not a workaround.
-    fn tar_gz_with_raw_header(name_bytes: &[u8], entry_type: tar::EntryType, link_bytes: Option<&[u8]>) -> Vec<u8> {
+    fn tar_gz_with_raw_header(
+        name_bytes: &[u8],
+        entry_type: tar::EntryType,
+        link_bytes: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
         header.set_size(0);
@@ -642,13 +710,19 @@ mod tests {
         let archive = write_archive(
             tmp.path(),
             "backup.tar.gz",
-            &build_tar_gz(&[("duduclaw/config.toml", b"[general]\n"), ("duduclaw/agents/.keep", b"")]),
+            &build_tar_gz(&[
+                ("duduclaw/config.toml", b"[general]\n"),
+                ("duduclaw/agents/.keep", b""),
+            ]),
         );
         let dest = tmp.path().join("staging");
         let report = extract_tar_gz_safely(&archive, &dest, &RestoreLimits::default()).unwrap();
         assert_eq!(report.files_written, 2);
         assert!(dest.join("duduclaw/config.toml").is_file());
-        assert_eq!(std::fs::read(dest.join("duduclaw/config.toml")).unwrap(), b"[general]\n");
+        assert_eq!(
+            std::fs::read(dest.join("duduclaw/config.toml")).unwrap(),
+            b"[general]\n"
+        );
     }
 
     #[test]
@@ -668,7 +742,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("staging");
         assert_eq!(
-            extract_tar_gz_safely(&tmp.path().join("nope.tar.gz"), &dest, &RestoreLimits::default()),
+            extract_tar_gz_safely(
+                &tmp.path().join("nope.tar.gz"),
+                &dest,
+                &RestoreLimits::default()
+            ),
             Err(RestoreViolation::Unreadable)
         );
     }
@@ -680,7 +758,16 @@ mod tests {
         let archive = write_archive(tmp.path(), "evil.tar.gz", &bytes);
         let dest = tmp.path().join("staging");
         let err = extract_tar_gz_safely(&archive, &dest, &RestoreLimits::default()).unwrap_err();
-        assert!(matches!(err, RestoreViolation::UnsafeEntry { reason: "path_traversal", .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                RestoreViolation::UnsafeEntry {
+                    reason: "path_traversal",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(!dest.exists());
     }
 
@@ -693,7 +780,16 @@ mod tests {
         let archive = write_archive(tmp.path(), "evil2.tar.gz", &bytes);
         let dest = tmp.path().join("staging");
         let err = extract_tar_gz_safely(&archive, &dest, &RestoreLimits::default()).unwrap_err();
-        assert!(matches!(err, RestoreViolation::UnsafeEntry { reason: "path_traversal", .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                RestoreViolation::UnsafeEntry {
+                    reason: "path_traversal",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -704,7 +800,13 @@ mod tests {
         let dest = tmp.path().join("staging");
         let err = extract_tar_gz_safely(&archive, &dest, &RestoreLimits::default()).unwrap_err();
         assert!(
-            matches!(err, RestoreViolation::UnsafeEntry { reason: "symlink_or_hardlink", .. }),
+            matches!(
+                err,
+                RestoreViolation::UnsafeEntry {
+                    reason: "symlink_or_hardlink",
+                    ..
+                }
+            ),
             "{err:?}"
         );
     }
@@ -718,9 +820,15 @@ mod tests {
             &build_tar_gz(&[("duduclaw/big.bin", &vec![0u8; 4096])]),
         );
         let dest = tmp.path().join("staging");
-        let limits = RestoreLimits { max_entry_bytes: 1024, ..Default::default() };
+        let limits = RestoreLimits {
+            max_entry_bytes: 1024,
+            ..Default::default()
+        };
         let err = extract_tar_gz_safely(&archive, &dest, &limits).unwrap_err();
-        assert!(matches!(err, RestoreViolation::EntryTooLarge { .. }), "{err:?}");
+        assert!(
+            matches!(err, RestoreViolation::EntryTooLarge { .. }),
+            "{err:?}"
+        );
         assert!(!dest.exists());
     }
 
@@ -738,21 +846,36 @@ mod tests {
         let dest = tmp.path().join("staging");
         // Each entry individually clears the per-entry cap; together they
         // blow the cumulative budget.
-        let limits = RestoreLimits { max_entry_bytes: 1000, max_total_bytes: 1000, ..Default::default() };
+        let limits = RestoreLimits {
+            max_entry_bytes: 1000,
+            max_total_bytes: 1000,
+            ..Default::default()
+        };
         let err = extract_tar_gz_safely(&archive, &dest, &limits).unwrap_err();
-        assert!(matches!(err, RestoreViolation::TotalTooLarge { .. }), "{err:?}");
+        assert!(
+            matches!(err, RestoreViolation::TotalTooLarge { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn rejects_too_many_entries() {
         let tmp = tempfile::tempdir().unwrap();
-        let files: Vec<(String, &[u8])> = (0..10).map(|i| (format!("duduclaw/f{i}.txt"), b"x".as_slice())).collect();
+        let files: Vec<(String, &[u8])> = (0..10)
+            .map(|i| (format!("duduclaw/f{i}.txt"), b"x".as_slice()))
+            .collect();
         let refs: Vec<(&str, &[u8])> = files.iter().map(|(n, c)| (n.as_str(), *c)).collect();
         let archive = write_archive(tmp.path(), "many.tar.gz", &build_tar_gz(&refs));
         let dest = tmp.path().join("staging");
-        let limits = RestoreLimits { max_entries: 5, ..Default::default() };
+        let limits = RestoreLimits {
+            max_entries: 5,
+            ..Default::default()
+        };
         let err = extract_tar_gz_safely(&archive, &dest, &limits).unwrap_err();
-        assert!(matches!(err, RestoreViolation::TooManyEntries { max: 5, .. }), "{err:?}");
+        assert!(
+            matches!(err, RestoreViolation::TooManyEntries { max: 5, .. }),
+            "{err:?}"
+        );
     }
 
     // ── upload staging ────────────────────────────────────────────
@@ -800,7 +923,10 @@ mod tests {
     fn marker_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(read_marker(tmp.path()).is_none());
-        let marker = RestoreMarker { staged_at: Utc::now(), source_filename: "old-device.tar.gz".into() };
+        let marker = RestoreMarker {
+            staged_at: Utc::now(),
+            source_filename: "old-device.tar.gz".into(),
+        };
         write_marker(tmp.path(), &marker).unwrap();
         let read = read_marker(tmp.path()).unwrap();
         assert_eq!(read.source_filename, "old-device.tar.gz");
@@ -844,7 +970,10 @@ mod tests {
     #[test]
     fn no_marker_is_a_cheap_noop() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(perform_pending_restore_swap(tmp.path(), "20260101T000000Z"), Ok(None));
+        assert_eq!(
+            perform_pending_restore_swap(tmp.path(), "20260101T000000Z"),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -852,13 +981,26 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         std::fs::write(home.join("config.toml"), b"[general]\n").unwrap();
-        write_marker(home, &RestoreMarker { staged_at: Utc::now(), source_filename: "x.tar.gz".into() }).unwrap();
+        write_marker(
+            home,
+            &RestoreMarker {
+                staged_at: Utc::now(),
+                source_filename: "x.tar.gz".into(),
+            },
+        )
+        .unwrap();
         // No staging dir at all (interrupted upload).
 
         let result = perform_pending_restore_swap(home, "20260101T000000Z");
         assert_eq!(result, Err(RestoreSwapError::StagingMissingOrEmpty));
-        assert!(read_marker(home).is_none(), "marker must be cleared so boot does not loop forever");
-        assert!(home.join("config.toml").is_file(), "existing data must be untouched");
+        assert!(
+            read_marker(home).is_none(),
+            "marker must be cleared so boot does not loop forever"
+        );
+        assert!(
+            home.join("config.toml").is_file(),
+            "existing data must be untouched"
+        );
         assert!(!home.join("restore-backup-20260101T000000Z").exists());
     }
 
@@ -880,19 +1022,43 @@ mod tests {
         std::fs::create_dir_all(nested.join("agents/miki")).unwrap();
         std::fs::write(nested.join("agents/miki/SOUL.md"), b"new-soul").unwrap();
 
-        write_marker(home, &RestoreMarker { staged_at: Utc::now(), source_filename: "old-device.tar.gz".into() }).unwrap();
+        write_marker(
+            home,
+            &RestoreMarker {
+                staged_at: Utc::now(),
+                source_filename: "old-device.tar.gz".into(),
+            },
+        )
+        .unwrap();
 
-        let report = perform_pending_restore_swap(home, "20260101T000000Z").unwrap().unwrap();
-        assert_eq!(report.preserved_dir, home.join("restore-backup-20260101T000000Z"));
+        let report = perform_pending_restore_swap(home, "20260101T000000Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report.preserved_dir,
+            home.join("restore-backup-20260101T000000Z")
+        );
 
         // New data is now live.
-        assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), b"new-config");
-        assert_eq!(std::fs::read(home.join("agents/miki/SOUL.md")).unwrap(), b"new-soul");
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            b"new-config"
+        );
+        assert_eq!(
+            std::fs::read(home.join("agents/miki/SOUL.md")).unwrap(),
+            b"new-soul"
+        );
 
         // Old data preserved, never deleted.
         let preserved = home.join("restore-backup-20260101T000000Z");
-        assert_eq!(std::fs::read(preserved.join("config.toml")).unwrap(), b"old-config");
-        assert_eq!(std::fs::read(preserved.join("agents/kiki/SOUL.md")).unwrap(), b"old-soul");
+        assert_eq!(
+            std::fs::read(preserved.join("config.toml")).unwrap(),
+            b"old-config"
+        );
+        assert_eq!(
+            std::fs::read(preserved.join("agents/kiki/SOUL.md")).unwrap(),
+            b"old-soul"
+        );
 
         // Staging and marker are gone.
         assert!(!staging.exists());
@@ -909,7 +1075,14 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("config.toml"), b"new").unwrap();
 
-        write_marker(home, &RestoreMarker { staged_at: Utc::now(), source_filename: "x.tar.gz".into() }).unwrap();
+        write_marker(
+            home,
+            &RestoreMarker {
+                staged_at: Utc::now(),
+                source_filename: "x.tar.gz".into(),
+            },
+        )
+        .unwrap();
         perform_pending_restore_swap(home, "ts1").unwrap();
         assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), b"new");
     }
@@ -922,7 +1095,14 @@ mod tests {
         let staging = staging_dir(home);
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("config.toml"), b"new").unwrap();
-        write_marker(home, &RestoreMarker { staged_at: Utc::now(), source_filename: "x.tar.gz".into() }).unwrap();
+        write_marker(
+            home,
+            &RestoreMarker {
+                staged_at: Utc::now(),
+                source_filename: "x.tar.gz".into(),
+            },
+        )
+        .unwrap();
 
         assert!(perform_pending_restore_swap(home, "ts1").unwrap().is_some());
         // Marker is gone now — a second call must be a pure no-op, never

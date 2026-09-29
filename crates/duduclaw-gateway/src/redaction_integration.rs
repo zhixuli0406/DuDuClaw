@@ -210,7 +210,10 @@ mod tests {
 
     #[test]
     fn missing_config_is_disabled_not_poisoned() {
-        assert!(matches!(classify_redaction_boot(None), BootOutcome::Disabled));
+        assert!(matches!(
+            classify_redaction_boot(None),
+            BootOutcome::Disabled
+        ));
     }
 
     #[test]

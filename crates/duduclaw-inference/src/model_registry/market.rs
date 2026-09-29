@@ -7,8 +7,9 @@
 //! against a publisher-whitelisted HF sweep, computes a tri-state hardware
 //! fit per quant (green/comfortable · yellow/tight · red/too-big), and
 //! flags MoE models whose experts can be offloaded
-//! (`llama-cpp-2 add_cpu_moe_override` — the turbo-fieldfare lesson: MoE
-//! routed experts don't need to live in fast memory).
+//! (llama.cpp's `--cpu-moe` — the turbo-fieldfare lesson: MoE routed experts
+//! don't need to live in fast memory; the flag belongs to whatever local
+//! OpenAI-compatible server the user runs, not to this crate).
 //!
 //! Design doc: commercial/docs/DESIGN-local-model-marketplace-2026-08-13.md
 //! (HF API surface live-verified 2026-08-13). Fail-open everywhere: HF
@@ -672,7 +673,7 @@ mod tests {
             ram_total_mb: ram_mb,
             ram_available_mb: ram_mb,
             cpu_cores: 8,
-            recommended_backend: crate::types::BackendType::LlamaCpp,
+            recommended_backend: crate::types::BackendType::OpenAiCompat,
             recommended_max_model_gb: 8.0,
         }
     }

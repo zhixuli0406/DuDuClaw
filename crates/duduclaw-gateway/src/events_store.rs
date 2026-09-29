@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -69,8 +69,7 @@ impl EventBusStore {
     /// Open (or create) the event bus at `<home>/events.db`.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         let db_path = home_dir.join("events.db");
-        let conn =
-            Connection::open(&db_path).map_err(|e| format!("open event bus: {e}"))?;
+        let conn = Connection::open(&db_path).map_err(|e| format!("open event bus: {e}"))?;
         Self::init_schema(&conn)?;
         Self::migrate_add_source_column(&conn)?;
         info!(?db_path, "EventBusStore initialized");
@@ -261,10 +260,7 @@ mod tests {
     use super::*;
 
     fn fresh_home() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "duduclaw-eventbus-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let p = std::env::temp_dir().join(format!("duduclaw-eventbus-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -273,8 +269,14 @@ mod tests {
     async fn append_then_fetch_since_0_returns_all() {
         let home = fresh_home();
         let store = EventBusStore::open(&home).unwrap();
-        store.append("task.created", r#"{"id":"t1"}"#).await.unwrap();
-        store.append("task.updated", r#"{"id":"t1"}"#).await.unwrap();
+        store
+            .append("task.created", r#"{"id":"t1"}"#)
+            .await
+            .unwrap();
+        store
+            .append("task.updated", r#"{"id":"t1"}"#)
+            .await
+            .unwrap();
 
         let rows = store.fetch_since(0, 100).await.unwrap();
         assert_eq!(rows.len(), 2);

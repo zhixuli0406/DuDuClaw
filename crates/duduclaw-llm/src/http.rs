@@ -38,7 +38,10 @@ mod tests {
         assert_eq!(retry_after_of(&h), Some(Duration::from_secs(30)));
 
         let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"));
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
         assert_eq!(retry_after_of(&h), None);
 
         assert_eq!(retry_after_of(&HeaderMap::new()), None);

@@ -5,6 +5,8 @@ pub mod edition;
 pub mod events;
 pub mod models;
 pub mod rpc;
+/// X1 方案 4 — Odoo Helpdesk / Project as a decision-twin support queue.
+pub mod support_export;
 
 pub use agent_config::{AgentOdooConfig, OdooConfigResolver};
 pub use config::OdooConfig;

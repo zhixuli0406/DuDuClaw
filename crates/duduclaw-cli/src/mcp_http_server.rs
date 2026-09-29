@@ -26,11 +26,11 @@ use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tracing::info;
 
-use crate::mcp_auth::{authenticate_with_key, Principal};
+use crate::mcp_auth::{Principal, authenticate_with_key};
 use crate::mcp_capability::{inject_capability_headers, negotiate_capabilities};
 use crate::mcp_dispatch::McpDispatcher;
 use crate::mcp_http_errors::into_axum_response;
-use crate::mcp_namespace::{resolve, NamespaceContext};
+use crate::mcp_namespace::{NamespaceContext, resolve};
 use crate::mcp_rate_limit::OpType;
 use crate::mcp_sse_store::SseEventStore;
 
@@ -237,9 +237,18 @@ fn build_router_with_state(cfg: &HttpServerConfig, state: HttpState) -> Router {
             "/.well-known/oauth-authorization-server",
             get(crate::mcp_oauth_server::authorization_server_metadata),
         )
-        .route("/oauth/register", post(crate::mcp_oauth_server::register_handler))
-        .route("/oauth/authorize", get(crate::mcp_oauth_server::authorize_handler))
-        .route("/oauth/decision", post(crate::mcp_oauth_server::decision_handler))
+        .route(
+            "/oauth/register",
+            post(crate::mcp_oauth_server::register_handler),
+        )
+        .route(
+            "/oauth/authorize",
+            get(crate::mcp_oauth_server::authorize_handler),
+        )
+        .route(
+            "/oauth/decision",
+            post(crate::mcp_oauth_server::decision_handler),
+        )
         .route("/oauth/token", post(crate::mcp_oauth_server::token_handler))
         .route("/mcp/v1/call", post(call_handler))
         // WP2.12: wearable-transcript ingest (vendor-webhook-friendly shape).
@@ -257,7 +266,7 @@ fn build_router_with_state(cfg: &HttpServerConfig, state: HttpState) -> Router {
     //   inner: negotiate_capabilities   — validates client's x-duduclaw-capabilities header
     router
         .with_state(state)
-        .layer(middleware::from_fn(negotiate_capabilities))   // inner
+        .layer(middleware::from_fn(negotiate_capabilities)) // inner
         .layer(middleware::from_fn(inject_capability_headers)) // outer
 }
 
@@ -320,7 +329,9 @@ async fn call_handler(
     // Validate JSON-RPC
     if body.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
         return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
-            &id, -32600, "jsonrpc field must be '2.0'",
+            &id,
+            -32600,
+            "jsonrpc field must be '2.0'",
         ));
     }
     let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -333,15 +344,25 @@ async fn call_handler(
     }
 
     // ── HTTP rate gate: 60 req/min per API key ────────────────────────────────
-    if let Err(e) = state.dispatcher.rate_limiter.check(&principal.client_id, OpType::HttpRequest) {
+    if let Err(e) = state
+        .dispatcher
+        .rate_limiter
+        .check(&principal.client_id, OpType::HttpRequest)
+    {
         let mut resp = into_axum_response(crate::mcp_dispatch::jsonrpc_error(
             &id,
             -32029,
-            &format!("HTTP rate limit exceeded, retry after {} seconds", e.retry_after_secs),
+            &format!(
+                "HTTP rate limit exceeded, retry after {} seconds",
+                e.retry_after_secs
+            ),
         ));
         resp.headers_mut().insert(
             "Retry-After",
-            e.retry_after_secs.to_string().parse().unwrap_or_else(|_| "1".parse().unwrap()),
+            e.retry_after_secs
+                .to_string()
+                .parse()
+                .unwrap_or_else(|_| "1".parse().unwrap()),
         );
         return resp;
     }
@@ -351,13 +372,17 @@ async fn call_handler(
     // Dispatch with timeout
     let jsonrpc = match tokio::time::timeout(
         state.call_timeout,
-        state.dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id),
+        state
+            .dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id),
     )
     .await
     {
         Ok(result) => result,
         Err(_) => crate::mcp_dispatch::jsonrpc_error(
-            &id, -32603, "Request timed out (30s limit exceeded)",
+            &id,
+            -32603,
+            "Request timed out (30s limit exceeded)",
         ),
     };
 
@@ -381,7 +406,11 @@ async fn ingest_transcript_handler(
         Ok(p) => p,
         Err(r) => return r,
     };
-    if let Err(e) = state.dispatcher.rate_limiter.check(&principal.client_id, OpType::HttpRequest) {
+    if let Err(e) = state
+        .dispatcher
+        .rate_limiter
+        .check(&principal.client_id, OpType::HttpRequest)
+    {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
@@ -418,7 +447,9 @@ async fn ingest_transcript_handler(
     });
     let jsonrpc = match tokio::time::timeout(
         state.call_timeout,
-        state.dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &Value::Null),
+        state
+            .dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &Value::Null),
     )
     .await
     {
@@ -432,8 +463,16 @@ async fn ingest_transcript_handler(
         }
     };
     let ok = jsonrpc.get("error").is_none();
-    let status = if ok { StatusCode::OK } else { StatusCode::UNPROCESSABLE_ENTITY };
-    (status, Json(serde_json::json!({ "stored": ok, "detail": jsonrpc }))).into_response()
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    (
+        status,
+        Json(serde_json::json!({ "stored": ok, "detail": jsonrpc })),
+    )
+        .into_response()
 }
 
 /// Lenient transcript extraction across wearable-vendor payload shapes.
@@ -471,11 +510,18 @@ mod ingest_tests {
     #[test]
     fn transcript_extraction_covers_vendor_shapes() {
         let flat = serde_json::json!({ "text": " 今天客戶說要改單 " });
-        assert_eq!(extract_transcript_text(&flat).as_deref(), Some("今天客戶說要改單"));
-        let omi = serde_json::json!({ "segments": [ {"text": "a"}, {"text": " b "}, {"speaker": "x"} ] });
+        assert_eq!(
+            extract_transcript_text(&flat).as_deref(),
+            Some("今天客戶說要改單")
+        );
+        let omi =
+            serde_json::json!({ "segments": [ {"text": "a"}, {"text": " b "}, {"speaker": "x"} ] });
         assert_eq!(extract_transcript_text(&omi).as_deref(), Some("a b"));
         let plaud = serde_json::json!({ "summary": "重點：週五交貨" });
-        assert_eq!(extract_transcript_text(&plaud).as_deref(), Some("重點：週五交貨"));
+        assert_eq!(
+            extract_transcript_text(&plaud).as_deref(),
+            Some("重點：週五交貨")
+        );
         assert!(extract_transcript_text(&serde_json::json!({})).is_none());
         assert!(extract_transcript_text(&serde_json::json!({ "text": "  " })).is_none());
     }
@@ -515,15 +561,25 @@ async fn stream_handler(
         };
 
     // HP2: rate-gate the SSE endpoint just like the JSON-RPC endpoints.
-    if let Err(e) = state.dispatcher.rate_limiter.check(&principal.client_id, OpType::HttpRequest) {
+    if let Err(e) = state
+        .dispatcher
+        .rate_limiter
+        .check(&principal.client_id, OpType::HttpRequest)
+    {
         let mut resp = into_axum_response(crate::mcp_dispatch::jsonrpc_error(
             &Value::Null,
             -32029,
-            &format!("HTTP rate limit exceeded, retry after {} seconds", e.retry_after_secs),
+            &format!(
+                "HTTP rate limit exceeded, retry after {} seconds",
+                e.retry_after_secs
+            ),
         ));
         resp.headers_mut().insert(
             "Retry-After",
-            e.retry_after_secs.to_string().parse().unwrap_or_else(|_| "1".parse().unwrap()),
+            e.retry_after_secs
+                .to_string()
+                .parse()
+                .unwrap_or_else(|_| "1".parse().unwrap()),
         );
         return resp;
     }
@@ -549,17 +605,16 @@ async fn stream_handler(
 
     // Convert broadcast receiver to a Stream of SSE Events. The `guard` is moved
     // into the closure so it lives as long as the stream and runs on drop.
-    let bcast_stream =
-        tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |msg| {
-            let _ = &guard; // keep guard alive for the stream's lifetime
-            let conn_id = conn_id_clone.clone();
-            match msg {
-                Ok(data) => Some(Ok::<Event, std::convert::Infallible>(
-                    Event::default().id(conn_id).data(data),
-                )),
-                Err(_) => None, // lagged or closed
-            }
-        });
+    let bcast_stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |msg| {
+        let _ = &guard; // keep guard alive for the stream's lifetime
+        let conn_id = conn_id_clone.clone();
+        match msg {
+            Ok(data) => Some(Ok::<Event, std::convert::Infallible>(
+                Event::default().id(conn_id).data(data),
+            )),
+            Err(_) => None, // lagged or closed
+        }
+    });
 
     // First event: "connected"
     let connected_data = serde_json::json!({
@@ -576,7 +631,11 @@ async fn stream_handler(
     let combined = initial.chain(bcast_stream);
 
     Sse::new(combined)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)).text("heartbeat"))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("heartbeat"),
+        )
         .into_response()
 }
 
@@ -602,11 +661,18 @@ async fn stream_call_handler(
     let params = body.get("params").cloned().unwrap_or(Value::Null);
 
     // HTTP rate gate
-    if let Err(e) = state.dispatcher.rate_limiter.check(&principal.client_id, OpType::HttpRequest) {
+    if let Err(e) = state
+        .dispatcher
+        .rate_limiter
+        .check(&principal.client_id, OpType::HttpRequest)
+    {
         return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
             &id,
             -32029,
-            &format!("HTTP rate limit exceeded, retry after {} seconds", e.retry_after_secs),
+            &format!(
+                "HTTP rate limit exceeded, retry after {} seconds",
+                e.retry_after_secs
+            ),
         ));
     }
 
@@ -628,12 +694,16 @@ async fn stream_call_handler(
         "tool": params.get("name").and_then(|v| v.as_str()).unwrap_or("unknown"),
         "conn_id": conn_id,
     });
-    state.sse_store.push_event(&conn_id, "tool_progress", &progress.to_string());
+    state
+        .sse_store
+        .push_event(&conn_id, "tool_progress", &progress.to_string());
 
     // Dispatch tool call
     let jsonrpc = tokio::time::timeout(
         state.call_timeout,
-        state.dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id),
+        state
+            .dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &id),
     )
     .await
     .unwrap_or_else(|_| {
@@ -641,7 +711,9 @@ async fn stream_call_handler(
     });
 
     // Push result to SSE stream
-    state.sse_store.push_event(&conn_id, "tool_result", &jsonrpc.to_string());
+    state
+        .sse_store
+        .push_event(&conn_id, "tool_result", &jsonrpc.to_string());
 
     (
         StatusCode::ACCEPTED,
@@ -685,9 +757,8 @@ pub mod tests {
         let home_dir = std::env::temp_dir().join("duduclaw_http_server_test");
         let _ = std::fs::create_dir_all(&home_dir);
         let http = reqwest::Client::new();
-        let memory = Arc::new(
-            duduclaw_memory::SqliteMemoryEngine::in_memory().expect("in-memory db"),
-        );
+        let memory =
+            Arc::new(duduclaw_memory::SqliteMemoryEngine::in_memory().expect("in-memory db"));
         let odoo = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
         McpDispatcher::new(
             home_dir,
@@ -708,7 +779,10 @@ pub mod tests {
 
     /// Shorthand: GET /healthz with no extra headers.
     fn healthz_request() -> Request<Body> {
-        Request::builder().uri("/healthz").body(Body::empty()).unwrap()
+        Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap()
     }
 
     /// Shorthand: GET /healthz with x-duduclaw-capabilities header.
@@ -763,7 +837,9 @@ pub mod tests {
         let cfg = test_config();
         let router = build_router(&cfg, make_test_dispatcher());
         let resp = router.oneshot(healthz_request()).await.unwrap();
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["status"], "ok", "healthz body must contain status: ok");
     }
@@ -792,7 +868,10 @@ pub mod tests {
             .get(HDR_CAPABILITIES)
             .expect("x-duduclaw-capabilities must be injected by middleware");
         let caps_str = caps.to_str().unwrap();
-        assert!(caps_str.starts_with("memory/"), "memory must be first cap: {caps_str}");
+        assert!(
+            caps_str.starts_with("memory/"),
+            "memory must be first cap: {caps_str}"
+        );
     }
 
     #[tokio::test]
@@ -801,9 +880,18 @@ pub mod tests {
         let router = build_router(&cfg, make_test_dispatcher());
         let resp = router.oneshot(healthz_request()).await.unwrap();
         let caps_str = resp.headers()[HDR_CAPABILITIES].to_str().unwrap();
-        assert!(caps_str.contains("mcp/2"),    "mcp/2 must be listed: {caps_str}");
-        assert!(caps_str.contains("audit/2"),  "audit/2 must be listed: {caps_str}");
-        assert!(!caps_str.contains("a2a/"),    "disabled a2a must be absent: {caps_str}");
+        assert!(
+            caps_str.contains("mcp/2"),
+            "mcp/2 must be listed: {caps_str}"
+        );
+        assert!(
+            caps_str.contains("audit/2"),
+            "audit/2 must be listed: {caps_str}"
+        );
+        assert!(
+            !caps_str.contains("a2a/"),
+            "disabled a2a must be absent: {caps_str}"
+        );
     }
 
     // ── Capability negotiation through the full router ────────────────────────
@@ -812,7 +900,10 @@ pub mod tests {
     async fn healthz_with_satisfied_capability_returns_200() {
         let cfg = test_config();
         let router = build_router(&cfg, make_test_dispatcher());
-        let resp = router.oneshot(healthz_with_caps("memory/3,mcp/2")).await.unwrap();
+        let resp = router
+            .oneshot(healthz_with_caps("memory/3,mcp/2"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -829,14 +920,20 @@ pub mod tests {
     async fn healthz_422_includes_missing_capabilities_header() {
         let cfg = test_config();
         let router = build_router(&cfg, make_test_dispatcher());
-        let resp = router.oneshot(healthz_with_caps("a2a/1,secret-manager/1")).await.unwrap();
+        let resp = router
+            .oneshot(healthz_with_caps("a2a/1,secret-manager/1"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let missing = resp
             .headers()
             .get(HDR_MISSING_CAPABILITIES)
             .expect("422 must include x-duduclaw-missing-capabilities");
         let missing_str = missing.to_str().unwrap();
-        assert!(missing_str.contains("a2a/1"), "a2a must be listed as missing: {missing_str}");
+        assert!(
+            missing_str.contains("a2a/1"),
+            "a2a must be listed as missing: {missing_str}"
+        );
     }
 
     #[tokio::test]
@@ -867,7 +964,9 @@ pub mod tests {
             .method("POST")
             .uri("/mcp/v1/call")
             .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#,
+            ))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -916,7 +1015,9 @@ pub mod tests {
             .uri("/mcp/v1/call")
             .header("Authorization", "Basic dXNlcjpwYXNz")
             .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#,
+            ))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(
@@ -936,7 +1037,9 @@ pub mod tests {
             .uri("/mcp/v1/call")
             .header("Authorization", "Bearer ")
             .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#,
+            ))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(
@@ -956,7 +1059,9 @@ pub mod tests {
             .uri("/mcp/v1/call")
             .header("Authorization", "Bearer invalid-key-that-does-not-exist")
             .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#,
+            ))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(
@@ -992,7 +1097,9 @@ pub mod tests {
             .method("POST")
             .uri("/mcp/v1/stream/call?conn_id=test-conn")
             .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#,
+            ))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(
@@ -1011,7 +1118,9 @@ pub mod tests {
             .method("POST")
             .uri("/mcp/v1/stream/call?conn_id=test-conn")
             .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#,
+            ))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(

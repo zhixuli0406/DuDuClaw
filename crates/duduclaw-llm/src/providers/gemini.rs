@@ -15,12 +15,12 @@
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::error::{classify_http, classify_transport, snippet, LlmError};
+use crate::error::{LlmError, classify_http, classify_transport, snippet};
 use crate::http::{http_client, retry_after_of};
-use crate::provider::{split_model_id, ApiAuth, ChatProvider};
-use crate::sse::{drive_sse, sse_data, SseParser};
+use crate::provider::{ApiAuth, ChatProvider, split_model_id};
+use crate::sse::{SseParser, drive_sse, sse_data};
 use crate::types::{
     ChatRequest, ChatResponse, ContentPart, NormalizedUsage, ReasoningHint, Role, StopReason,
     StreamEvent, ToolChoice,
@@ -39,13 +39,19 @@ impl GeminiProvider {
 
     fn generate_url(&self, model: &str) -> String {
         let base = self.auth.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
-        format!("{}/models/{model}:generateContent", base.trim_end_matches('/'))
+        format!(
+            "{}/models/{model}:generateContent",
+            base.trim_end_matches('/')
+        )
     }
 
     fn stream_url(&self, model: &str) -> String {
         let base = self.auth.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
         // `?alt=sse` switches the chunked-JSON stream to line-based SSE.
-        format!("{}/models/{model}:streamGenerateContent?alt=sse", base.trim_end_matches('/'))
+        format!(
+            "{}/models/{model}:streamGenerateContent?alt=sse",
+            base.trim_end_matches('/')
+        )
     }
 }
 
@@ -78,7 +84,10 @@ pub(crate) fn build_request_body(req: &ChatRequest) -> Value {
             for part in &msg.parts {
                 match part {
                     ContentPart::Text(t) => parts.push(json!({"text": t})),
-                    ContentPart::Image { media_type, data_base64 } => parts.push(json!({
+                    ContentPart::Image {
+                        media_type,
+                        data_base64,
+                    } => parts.push(json!({
                         "inlineData": {"mimeType": media_type, "data": data_base64}
                     })),
                     ContentPart::ToolCall { name, args, .. } => {
@@ -88,7 +97,11 @@ pub(crate) fn build_request_body(req: &ChatRequest) -> Value {
                         }
                         parts.push(p);
                     }
-                    ContentPart::ToolResult { call_id, content, is_error } => {
+                    ContentPart::ToolResult {
+                        call_id,
+                        content,
+                        is_error,
+                    } => {
                         // Gemini has no call ids — `call_id` carries the
                         // function NAME (set by our own parse_response).
                         let response = if *is_error {
@@ -132,6 +145,19 @@ pub(crate) fn build_request_body(req: &ChatRequest) -> Value {
             generation_config["thinkingConfig"] = json!({"thinkingBudget": budget});
         }
     }
+    // P1/WP-3: per-call effort. `thinkingConfig` as the container is verified
+    // (it is what `thinkingBudget` above already uses and ships today), but the
+    // `thinkingLevel` SIBLING KEY IS **[unverified]** — two WebFetches against
+    // ai.google.dev (2026-09-24) returned truncated GenerationConfig references
+    // that never named it, and the CLI probe recorded the settings page as 404
+    // (`research/multi-model-routing-2026-09/17-P0-cli-flag-probe.md` §1/§2).
+    // The Interactions API spells it `generation_config.thinking_level`, so the
+    // camelCase generateContent twin is an inference, not a citation. Gated
+    // behind `Some` so an unset effort can never send a key Gemini may reject;
+    // re-verify against the live API before relying on it.
+    if let Some(effort) = req.reasoning_effort.as_deref() {
+        generation_config["thinkingConfig"]["thinkingLevel"] = json!(effort);
+    }
     if let Some(schema) = &req.response_format {
         generation_config["responseMimeType"] = json!("application/json");
         generation_config["responseSchema"] = schema.clone();
@@ -169,8 +195,15 @@ pub(crate) fn build_request_body(req: &ChatRequest) -> Value {
 
 pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
     // Prompt-level block (no candidates at all).
-    if let Some(reason) = body.pointer("/promptFeedback/blockReason").and_then(Value::as_str) {
-        if body.get("candidates").and_then(Value::as_array).map_or(true, |c| c.is_empty()) {
+    if let Some(reason) = body
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+    {
+        if body
+            .get("candidates")
+            .and_then(Value::as_array)
+            .map_or(true, |c| c.is_empty())
+        {
             return Err(LlmError::ContentFilter).map_err(|e| {
                 tracing::debug!(block_reason = reason, "gemini prompt blocked");
                 e
@@ -189,15 +222,25 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
         .and_then(Value::as_array)
         .unwrap_or(&Vec::new())
     {
-        let signature = part.get("thoughtSignature").and_then(Value::as_str).map(String::from);
+        let signature = part
+            .get("thoughtSignature")
+            .and_then(Value::as_str)
+            .map(String::from);
         if let Some(fc) = part.get("functionCall") {
             has_tool_call = true;
-            let name = fc.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+            let name = fc
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             // Preserve a functionCall-attached signature as an empty
             // Reasoning carrier directly before the ToolCall (round-trips
             // through build_request_body — see module docs).
             if let Some(sig) = signature {
-                parts.push(ContentPart::Reasoning { text: String::new(), signature: Some(sig) });
+                parts.push(ContentPart::Reasoning {
+                    text: String::new(),
+                    signature: Some(sig),
+                });
             }
             parts.push(ContentPart::ToolCall {
                 // Gemini has no call ids; use the function name.
@@ -206,8 +249,15 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
                 args: fc.get("args").cloned().unwrap_or(json!({})),
             });
         } else if let Some(text) = part.get("text").and_then(Value::as_str) {
-            if part.get("thought").and_then(Value::as_bool).unwrap_or(false) {
-                parts.push(ContentPart::Reasoning { text: text.to_string(), signature });
+            if part
+                .get("thought")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                parts.push(ContentPart::Reasoning {
+                    text: text.to_string(),
+                    signature,
+                });
             } else {
                 parts.push(ContentPart::Text(text.to_string()));
             }
@@ -219,7 +269,10 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
         Some(raw) => map_finish_reason(raw).unwrap_or_else(|| natural_stop(has_tool_call)),
     };
 
-    let usage = body.get("usageMetadata").map(parse_usage).unwrap_or_default();
+    let usage = body
+        .get("usageMetadata")
+        .map(parse_usage)
+        .unwrap_or_default();
 
     Ok(ChatResponse {
         parts,
@@ -302,9 +355,14 @@ impl GeminiSse {
             self.usage = parse_usage(u);
         }
         // Prompt-level block with no candidates → content-filter error.
-        if let Some(reason) = chunk.pointer("/promptFeedback/blockReason").and_then(Value::as_str) {
-            let no_candidates =
-                chunk.get("candidates").and_then(Value::as_array).map_or(true, |c| c.is_empty());
+        if let Some(reason) = chunk
+            .pointer("/promptFeedback/blockReason")
+            .and_then(Value::as_str)
+        {
+            let no_candidates = chunk
+                .get("candidates")
+                .and_then(Value::as_array)
+                .map_or(true, |c| c.is_empty());
             if no_candidates {
                 tracing::debug!(block_reason = reason, "gemini stream prompt blocked");
                 self.error = Some(LlmError::ContentFilter);
@@ -312,21 +370,32 @@ impl GeminiSse {
                 return;
             }
         }
-        let Some(candidate) = chunk.pointer("/candidates/0") else { return };
+        let Some(candidate) = chunk.pointer("/candidates/0") else {
+            return;
+        };
         for part in candidate
             .pointer("/content/parts")
             .and_then(Value::as_array)
             .unwrap_or(&Vec::new())
         {
-            let signature = part.get("thoughtSignature").and_then(Value::as_str).map(String::from);
+            let signature = part
+                .get("thoughtSignature")
+                .and_then(Value::as_str)
+                .map(String::from);
             if let Some(fc) = part.get("functionCall") {
-                let name = fc.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                let name = fc
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 let args = fc.get("args").cloned().unwrap_or(json!({}));
                 // Preserve a functionCall-attached signature as an empty
                 // Reasoning carrier before the ToolCall (see module docs).
                 if let Some(sig) = signature {
-                    self.parts
-                        .push(ContentPart::Reasoning { text: String::new(), signature: Some(sig) });
+                    self.parts.push(ContentPart::Reasoning {
+                        text: String::new(),
+                        signature: Some(sig),
+                    });
                 }
                 let index = self.tool_count;
                 self.tool_count += 1;
@@ -336,10 +405,21 @@ impl GeminiSse {
                     name: name.clone(),
                 });
                 // Gemini sends whole args → emit as a single fragment.
-                out.push(StreamEvent::ToolCallDelta { index, args_fragment: args.to_string() });
-                self.parts.push(ContentPart::ToolCall { id: name.clone(), name, args });
+                out.push(StreamEvent::ToolCallDelta {
+                    index,
+                    args_fragment: args.to_string(),
+                });
+                self.parts.push(ContentPart::ToolCall {
+                    id: name.clone(),
+                    name,
+                    args,
+                });
             } else if let Some(text) = part.get("text").and_then(Value::as_str) {
-                if part.get("thought").and_then(Value::as_bool).unwrap_or(false) {
+                if part
+                    .get("thought")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
                     out.push(StreamEvent::ReasoningDelta(text.to_string()));
                     self.push_reasoning(text, signature);
                 } else {
@@ -365,13 +445,20 @@ impl GeminiSse {
 
     /// Append a thought-text delta, merging into the trailing `Reasoning` part.
     fn push_reasoning(&mut self, t: &str, signature: Option<String>) {
-        if let Some(ContentPart::Reasoning { text, signature: sig }) = self.parts.last_mut() {
+        if let Some(ContentPart::Reasoning {
+            text,
+            signature: sig,
+        }) = self.parts.last_mut()
+        {
             text.push_str(t);
             if signature.is_some() {
                 *sig = signature;
             }
         } else {
-            self.parts.push(ContentPart::Reasoning { text: t.to_string(), signature });
+            self.parts.push(ContentPart::Reasoning {
+                text: t.to_string(),
+                signature,
+            });
         }
     }
 }
@@ -400,7 +487,10 @@ impl SseParser for GeminiSse {
         if let Some(e) = self.error.take() {
             return Err(e);
         }
-        let has_tool = self.parts.iter().any(|p| matches!(p, ContentPart::ToolCall { .. }));
+        let has_tool = self
+            .parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::ToolCall { .. }));
         let stop = self.stop.take().unwrap_or_else(|| natural_stop(has_tool));
         Ok(StreamEvent::Done(ChatResponse {
             parts: std::mem::take(&mut self.parts),
@@ -482,13 +572,46 @@ mod tests {
     use crate::types::{ChatMessage, SystemBlock, ToolDef};
 
     #[test]
+    fn build_reasoning_effort_maps_to_thinking_level_and_is_absent_when_none() {
+        let plain = build_request_body(&ChatRequest::new("gemini-2.5-flash"));
+        assert!(
+            plain["generationConfig"].get("thinkingConfig").is_none(),
+            "{plain}"
+        );
+
+        let mut req = ChatRequest::new("gemini-2.5-flash");
+        req.reasoning_effort = Some("high".to_string());
+        let body = build_request_body(&req);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+
+        // Effort and the budget hint coexist: they are different knobs and
+        // neither clobbers the other's key inside thinkingConfig.
+        req.reasoning = ReasoningHint::Low;
+        let both = build_request_body(&req);
+        assert_eq!(
+            both["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+        assert_eq!(
+            both["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            ReasoningHint::Low.budget_tokens().unwrap()
+        );
+    }
+
+    #[test]
     fn build_system_instruction_and_roles() {
         let mut req = ChatRequest::new("gemini/gemini-3.1-pro");
         req.system = vec![SystemBlock::cached("rules"), SystemBlock::uncached("queue")];
         req.messages.push(ChatMessage::user("hi"));
         req.messages.push(ChatMessage::assistant("hello"));
         let body = build_request_body(&req);
-        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "rules\n\nqueue");
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "rules\n\nqueue"
+        );
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["contents"][1]["role"], "model");
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 4096);
@@ -513,7 +636,10 @@ mod tests {
         ] {
             req.tool_choice = choice;
             let body = build_request_body(&req);
-            assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "lookup");
+            assert_eq!(
+                body["tools"][0]["functionDeclarations"][0]["name"],
+                "lookup"
+            );
             assert_eq!(body["toolConfig"]["functionCallingConfig"], expected_mode);
         }
     }
@@ -536,7 +662,10 @@ mod tests {
 
         let mut req = ChatRequest::new("gemini/gemini-3.1-pro");
         req.messages.push(ChatMessage::user("find x"));
-        req.messages.push(ChatMessage { role: Role::Assistant, parts: parsed.parts });
+        req.messages.push(ChatMessage {
+            role: Role::Assistant,
+            parts: parsed.parts,
+        });
         req.messages.push(ChatMessage {
             role: Role::User,
             parts: vec![ContentPart::ToolResult {
@@ -547,7 +676,11 @@ mod tests {
         });
         let body = build_request_body(&req);
         let model_parts = body["contents"][1]["parts"].as_array().unwrap();
-        assert_eq!(model_parts.len(), 1, "empty Reasoning carrier merges into functionCall part");
+        assert_eq!(
+            model_parts.len(),
+            1,
+            "empty Reasoning carrier merges into functionCall part"
+        );
         assert_eq!(model_parts[0]["functionCall"]["name"], "search");
         assert_eq!(model_parts[0]["thoughtSignature"], "OPAQUE_SIG_TOKEN==");
         // functionResponse uses the function name (call_id carrier).
@@ -581,12 +714,24 @@ mod tests {
         req.response_format = Some(json!({"type": "object"}));
         req.messages.push(ChatMessage {
             role: Role::User,
-            parts: vec![ContentPart::Image { media_type: "image/jpeg".into(), data_base64: "aGk=".into() }],
+            parts: vec![ContentPart::Image {
+                media_type: "image/jpeg".into(),
+                data_base64: "aGk=".into(),
+            }],
         });
         let body = build_request_body(&req);
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 2048);
-        assert_eq!(body["generationConfig"]["responseMimeType"], "application/json");
-        assert_eq!(body["generationConfig"]["responseSchema"], json!({"type": "object"}));
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            2048
+        );
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            body["generationConfig"]["responseSchema"],
+            json!({"type": "object"})
+        );
         let img = &body["contents"][0]["parts"][0]["inlineData"];
         assert_eq!(img["mimeType"], "image/jpeg");
         assert_eq!(img["data"], "aGk=");
@@ -612,7 +757,9 @@ mod tests {
         });
         let resp = parse_response(&body).expect("parse");
         assert_eq!(resp.text(), "The answer is 4.");
-        assert!(matches!(&resp.parts[0], ContentPart::Reasoning { text, .. } if text == "planning"));
+        assert!(
+            matches!(&resp.parts[0], ContentPart::Reasoning { text, .. } if text == "planning")
+        );
         assert_eq!(resp.stop, StopReason::EndTurn);
         // promptTokenCount includes cached tokens → input = 1000 - 600.
         assert_eq!(resp.usage.input_tokens, 400);
@@ -658,7 +805,10 @@ mod tests {
 
     #[test]
     fn parse_missing_candidates_is_parse_error() {
-        assert!(matches!(parse_response(&json!({})), Err(LlmError::Parse(_))));
+        assert!(matches!(
+            parse_response(&json!({})),
+            Err(LlmError::Parse(_))
+        ));
     }
 
     // ── SSE streaming (streamGenerateContent?alt=sse chunks) ──
@@ -677,7 +827,9 @@ mod tests {
         assert!(p.finished());
         assert_eq!(out[0], StreamEvent::TextDelta("Hel".into()));
         assert_eq!(out[1], StreamEvent::TextDelta("lo".into()));
-        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else {
+            panic!()
+        };
         // Consecutive text deltas merge into one Text part.
         assert_eq!(resp.text(), "Hello");
         assert_eq!(resp.stop, StopReason::EndTurn);
@@ -697,9 +849,15 @@ mod tests {
             &mut out,
         );
         assert!(p.finished());
-        assert!(matches!(&out[0], StreamEvent::ToolCallStart { id, name, .. } if id == "search" && name == "search"));
-        assert!(matches!(&out[1], StreamEvent::ToolCallDelta { args_fragment, .. } if args_fragment.contains("\"q\"")));
-        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
+        assert!(
+            matches!(&out[0], StreamEvent::ToolCallStart { id, name, .. } if id == "search" && name == "search")
+        );
+        assert!(
+            matches!(&out[1], StreamEvent::ToolCallDelta { args_fragment, .. } if args_fragment.contains("\"q\""))
+        );
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else {
+            panic!()
+        };
         assert_eq!(resp.stop, StopReason::ToolUse);
         // Signature carrier precedes the ToolCall (round-trips via build_request_body).
         assert!(matches!(&resp.parts[0],
@@ -718,8 +876,12 @@ mod tests {
         );
         assert_eq!(out[0], StreamEvent::ReasoningDelta("planning".into()));
         assert_eq!(out[1], StreamEvent::TextDelta("answer".into()));
-        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
-        assert!(matches!(&resp.parts[0], ContentPart::Reasoning { text, .. } if text == "planning"));
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else {
+            panic!()
+        };
+        assert!(
+            matches!(&resp.parts[0], ContentPart::Reasoning { text, .. } if text == "planning")
+        );
         assert_eq!(resp.text(), "answer");
     }
 
@@ -732,14 +894,19 @@ mod tests {
             r#"data: {"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}"#,
             &mut out,
         );
-        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else {
+            panic!()
+        };
         assert_eq!(resp.stop, StopReason::MaxTokens);
         assert_eq!(resp.text(), "partial");
 
         // Prompt-level block with no candidates → content-filter error.
         let mut p = GeminiSse::default();
         let mut out = Vec::new();
-        p.on_line(r#"data: {"promptFeedback":{"blockReason":"SAFETY"}}"#, &mut out);
+        p.on_line(
+            r#"data: {"promptFeedback":{"blockReason":"SAFETY"}}"#,
+            &mut out,
+        );
         assert!(p.finished());
         assert_eq!(p.finalize(), Err(LlmError::ContentFilter));
     }

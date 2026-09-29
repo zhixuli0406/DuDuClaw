@@ -321,6 +321,9 @@ lookback_days = 999
     fn blank_target_agent_is_none() {
         let raw = "[skill_synthesis]\nauto_run = true\ntarget_agent = \"   \"\n";
         let cfg = SynthesisScheduleConfig::from_config_str(raw);
-        assert!(cfg.target_agent.is_none(), "whitespace target_agent must be None");
+        assert!(
+            cfg.target_agent.is_none(),
+            "whitespace target_agent must be None"
+        );
     }
 }

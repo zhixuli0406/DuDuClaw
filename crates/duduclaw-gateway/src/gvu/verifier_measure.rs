@@ -74,13 +74,30 @@ pub struct MeasureVector {
     /// TRUE when a CONTRACT `must_not` was hit — the whole vector is zeroed.
     #[serde(default)]
     pub hard_zero: bool,
+    /// X1 方案 2 — fraction of the candidate's `signals_match` tokens backed
+    /// by a **human-accepted** audit-derived causal claim.
+    ///
+    /// `None` means "not measured" (no accepted claim exists for this agent
+    /// yet), which is emphatically not the same as a measured `0.0`. It is
+    /// **telemetry only**: deliberately absent from [`dimensions`], so it can
+    /// neither veto nor promote a commit — a correlation transcribed from the
+    /// audit trail and blessed by one reviewer is not a quality measurement,
+    /// and letting it move the commit gate would be exactly the
+    /// "screened ⇒ promoted" slide the three specs forbid. The enforcement
+    /// knob is `[evolution] require_causal_evidence`, which routes an
+    /// unsupported entry to shadow at write time instead.
+    #[serde(default)]
+    pub causal_support: Option<f64>,
 }
 
 impl MeasureVector {
     /// CONTRACT `must_not` hit ⇒ every dimension is 0. Not "low score" —
     /// zero, and flagged, so nothing downstream can average it away.
     pub fn zeroed() -> Self {
-        Self { hard_zero: true, ..Default::default() }
+        Self {
+            hard_zero: true,
+            ..Default::default()
+        }
     }
 
     /// Mean of the case dimension. `None` when no case ran.
@@ -136,7 +153,10 @@ impl MeasureVector {
     /// Per-case scores keyed by case ref — the WP2.5 entry-level verdict
     /// needs to look a specific entry's linked cases up.
     pub fn case_map(&self) -> BTreeMap<&str, f64> {
-        self.cases.iter().map(|c| (c.case.as_str(), c.score)).collect()
+        self.cases
+            .iter()
+            .map(|c| (c.case.as_str(), c.score))
+            .collect()
     }
 }
 
@@ -265,7 +285,10 @@ pub fn relevance_score(content: &str, mistake_descriptions: &[String]) -> f64 {
             .filter(|w| w.chars().count() > 4)
             .filter(|w| !stop_words.contains(&w.to_lowercase().as_str()))
             .collect();
-        let hits = keywords.iter().filter(|kw| lower.contains(&kw.to_lowercase())).count();
+        let hits = keywords
+            .iter()
+            .filter(|kw| lower.contains(&kw.to_lowercase()))
+            .count();
         if hits >= 2 {
             return true;
         }
@@ -278,11 +301,7 @@ pub fn relevance_score(content: &str, mistake_descriptions: &[String]) -> f64 {
         // agents.
         super::verifier::keyword_overlap_pub(&lower, &m.to_lowercase()) > 0.15
     });
-    if addresses_any {
-        1.0
-    } else {
-        0.0
-    }
+    if addresses_any { 1.0 } else { 0.0 }
 }
 
 /// Everything [`measure`] needs. Owned strings so the caller can assemble it
@@ -301,6 +320,11 @@ pub struct MeasureInput {
     pub judge: Option<JudgeResult>,
     /// Post-shadow `must_not` hit observed downstream of the Gates.
     pub post_hoc_must_not_hit: bool,
+    /// X1 方案 2 — the candidate entries' `signals_match` tokens, flattened.
+    pub signals_match: Vec<String>,
+    /// X1 方案 2 — cause tokens of this agent's human-accepted audit-derived
+    /// causal claims. Empty ⇒ `causal_support` is `None` (not measured).
+    pub accepted_causal_causes: Vec<String>,
 }
 
 /// Result of measuring, plus the honest degradation flags.
@@ -354,9 +378,17 @@ pub async fn measure(
         novelty: novelty_score(&joined, &input.rolled_back_summaries),
         relevance: relevance_score(&joined, &input.mistake_descriptions),
         hard_zero: false,
+        causal_support: crate::causal_audit_ingest::causal_support_score(
+            &input.signals_match,
+            &input.accepted_causal_causes,
+        ),
     };
 
-    MeasureOutcome { vector, case_dimension_available: available, scorer_error }
+    MeasureOutcome {
+        vector,
+        case_dimension_available: available,
+        scorer_error,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +530,11 @@ pub enum CommitVerdict {
     /// with the §2.4.3 anti-drift companions attached.
     Matches,
     /// At least one dimension is `< champion - band`.
-    Regresses { dimension: String, champion: f64, candidate: f64 },
+    Regresses {
+        dimension: String,
+        champion: f64,
+        candidate: f64,
+    },
     /// `hard_zero`, or no dimension was comparable at all.
     Invalid { reason: String },
 }
@@ -578,6 +614,9 @@ fn dimensions(v: &MeasureVector) -> BTreeMap<&'static str, f64> {
     m.insert("anti_sycophancy", v.anti_sycophancy);
     m.insert("novelty", v.novelty);
     m.insert("relevance", v.relevance);
+    // `causal_support` is DELIBERATELY not inserted — see its field doc on
+    // `MeasureVector`. Adding it here would give an audit transcription
+    // veto/promotion power over the commit gate.
     m
 }
 
@@ -600,7 +639,9 @@ pub fn commit_verdict(
     }
     let cand = dimensions(candidate);
     if cand.is_empty() {
-        return CommitVerdict::Invalid { reason: "no comparable dimension".to_string() };
+        return CommitVerdict::Invalid {
+            reason: "no comparable dimension".to_string(),
+        };
     }
     let Some(champ_vec) = champion else {
         // Bootstrap: nothing to beat yet.
@@ -709,7 +750,11 @@ pub fn anti_drift(verdict: &CommitVerdict, state: AntiDriftState) -> AntiDriftDe
                 }
             }
         }
-        CommitVerdict::Regresses { dimension, champion, candidate } => AntiDriftDecision {
+        CommitVerdict::Regresses {
+            dimension,
+            champion,
+            candidate,
+        } => AntiDriftDecision {
             commit: false,
             next_consecutive_matches: state.consecutive_matches,
             force_observation_window: false,
@@ -768,7 +813,10 @@ mod tests {
         }
 
         let empty = tempfile::tempdir().unwrap();
-        assert_eq!(NoiseBand::from_agent_dir(empty.path()), NoiseBand::default());
+        assert_eq!(
+            NoiseBand::from_agent_dir(empty.path()),
+            NoiseBand::default()
+        );
     }
 
     #[test]
@@ -780,9 +828,7 @@ mod tests {
         assert_eq!(band, NoiseBand::default(), "integer literals stay ignored");
 
         // A real float is honoured (and clamped).
-        let dir = band_dir(
-            "[evolution.noise_band]\ncases = 0.02\njudge = -1.0\nnovelty = 0.5\n",
-        );
+        let dir = band_dir("[evolution.noise_band]\ncases = 0.02\njudge = -1.0\nnovelty = 0.5\n");
         let band = NoiseBand::from_agent_dir(dir.path());
         assert_eq!(band.cases, 0.02);
         assert_eq!(band.judge, 0.0, "negatives clamp to 0");
@@ -813,13 +859,18 @@ mod tests {
         MeasureVector {
             cases: cases
                 .iter()
-                .map(|(c, s)| CaseScore { case: (*c).to_string(), score: *s, held_out: false })
+                .map(|(c, s)| CaseScore {
+                    case: (*c).to_string(),
+                    score: *s,
+                    held_out: false,
+                })
                 .collect(),
             judge,
             anti_sycophancy: 1.0,
             novelty: 1.0,
             relevance: 1.0,
             hard_zero: false,
+            causal_support: None,
         }
     }
 
@@ -848,9 +899,14 @@ mod tests {
         let candidate = vec_with(Some(0.3), &[]);
         // Not Invalid — the judge has no veto.
         let verdict = commit_verdict(&candidate, Some(&champion), &band);
-        assert!(matches!(verdict, CommitVerdict::Regresses { ref dimension, .. } if dimension == "judge"));
+        assert!(
+            matches!(verdict, CommitVerdict::Regresses { ref dimension, .. } if dimension == "judge")
+        );
         // …but with no champion (bootstrap) the same low score commits.
-        assert_eq!(commit_verdict(&candidate, None, &band), CommitVerdict::Improves);
+        assert_eq!(
+            commit_verdict(&candidate, None, &band),
+            CommitVerdict::Improves
+        );
     }
 
     #[test]
@@ -872,10 +928,18 @@ mod tests {
     fn candidate_gaming_judge_but_failing_held_out_is_rejected() {
         let band = NoiseBand::default();
         let mut champion = vec_with(Some(0.60), &[("s/a", 1.0)]);
-        champion.cases.push(CaseScore { case: "s/_holdout/h".into(), score: 1.0, held_out: true });
+        champion.cases.push(CaseScore {
+            case: "s/_holdout/h".into(),
+            score: 1.0,
+            held_out: true,
+        });
         // Candidate flatters the judge (0.95) but breaks the held-out case.
         let mut candidate = vec_with(Some(0.95), &[("s/a", 1.0)]);
-        candidate.cases.push(CaseScore { case: "s/_holdout/h".into(), score: 0.0, held_out: true });
+        candidate.cases.push(CaseScore {
+            case: "s/_holdout/h".into(),
+            score: 0.0,
+            held_out: true,
+        });
         assert!(matches!(
             commit_verdict(&candidate, Some(&champion), &band),
             CommitVerdict::Regresses { ref dimension, .. } if dimension == "cases"
@@ -889,7 +953,11 @@ mod tests {
         let mut cases: Vec<CaseScore> = visible
             .iter()
             .enumerate()
-            .map(|(i, s)| CaseScore { case: format!("s/v{i}"), score: *s, held_out: false })
+            .map(|(i, s)| CaseScore {
+                case: format!("s/v{i}"),
+                score: *s,
+                held_out: false,
+            })
             .collect();
         cases.extend(holdout.iter().enumerate().map(|(i, s)| CaseScore {
             case: format!("s/_holdout/h{i}"),
@@ -903,6 +971,7 @@ mod tests {
             novelty: 1.0,
             relevance: 1.0,
             hard_zero: false,
+            causal_support: None,
         }
     }
 
@@ -948,7 +1017,11 @@ mod tests {
 
         // NEW behaviour: the held-out fence catches it.
         match commit_verdict(&candidate, Some(&champion), &band) {
-            CommitVerdict::Regresses { dimension, champion: h, candidate: c } => {
+            CommitVerdict::Regresses {
+                dimension,
+                champion: h,
+                candidate: c,
+            } => {
                 assert_eq!(dimension, DIM_CASES_HOLDOUT);
                 assert_eq!(h, 1.0);
                 assert!((c - 0.95).abs() < 1e-9);
@@ -968,7 +1041,11 @@ mod tests {
         let candidate = split_vec(Some(0.7), &[1.0, 1.0, 1.0, 1.0], &cand_holdout);
         assert!(candidate.cases_mean() > champion.cases_mean());
         assert_eq!(
-            commit_verdict(&as_legacy_mixed(&candidate), Some(&as_legacy_mixed(&champion)), &band),
+            commit_verdict(
+                &as_legacy_mixed(&candidate),
+                Some(&as_legacy_mixed(&champion)),
+                &band
+            ),
             CommitVerdict::Improves
         );
         assert!(matches!(
@@ -1025,9 +1102,15 @@ mod tests {
         );
         // Tie / improvement classification is untouched.
         let same = split_vec(Some(0.7), &[1.0, 1.0, 0.0, 0.0], &[]);
-        assert_eq!(commit_verdict(&same, Some(&champion), &band), CommitVerdict::Matches);
+        assert_eq!(
+            commit_verdict(&same, Some(&champion), &band),
+            CommitVerdict::Matches
+        );
         let better = split_vec(Some(0.7), &[1.0, 1.0, 1.0, 0.0], &[]);
-        assert_eq!(commit_verdict(&better, Some(&champion), &band), CommitVerdict::Improves);
+        assert_eq!(
+            commit_verdict(&better, Some(&champion), &band),
+            CommitVerdict::Improves
+        );
         // …and it matches the legacy single-dimension computation row for row.
         for cand in [&worse, &same, &better] {
             assert_eq!(
@@ -1051,7 +1134,10 @@ mod tests {
         let champion = split_vec(Some(0.7), &[1.0, 1.0, 1.0, 1.0], &[0.0; 4]);
         let candidate = split_vec(Some(0.7), &[1.0, 1.0, 1.0, 1.0], &[1.0; 4]);
         // The mixed mean rose too, so this one legitimately improves…
-        assert_eq!(commit_verdict(&candidate, Some(&champion), &band), CommitVerdict::Improves);
+        assert_eq!(
+            commit_verdict(&candidate, Some(&champion), &band),
+            CommitVerdict::Improves
+        );
 
         // …but a held-out-only gain that leaves the mixed mean inside its band
         // stays a tie: 4 held-out cases 0.0 → 1.0 moves the mixed mean by
@@ -1118,7 +1204,10 @@ mod tests {
         let champion = vec_with(Some(0.9), &[("s/a", 1.0)]);
         // Candidate's judge call failed → judge absent. Cases identical.
         let candidate = vec_with(None, &[("s/a", 1.0)]);
-        assert_eq!(commit_verdict(&candidate, Some(&champion), &band), CommitVerdict::Matches);
+        assert_eq!(
+            commit_verdict(&candidate, Some(&champion), &band),
+            CommitVerdict::Matches
+        );
     }
 
     #[test]
@@ -1145,11 +1234,18 @@ mod tests {
         let input = MeasureInput {
             agent_id: "a".into(),
             contents: vec!["be precise".into()],
-            judge: Some(JudgeResult { approved: true, score: 0.8, feedback: String::new() }),
+            judge: Some(JudgeResult {
+                approved: true,
+                score: 0.8,
+                feedback: String::new(),
+            }),
             ..Default::default()
         };
         let out = measure(&input, &NullScorer, &ScoreRequest::default()).await;
-        assert!(!out.case_dimension_available, "degradation must be observable, not silent");
+        assert!(
+            !out.case_dimension_available,
+            "degradation must be observable, not silent"
+        );
         assert!(out.vector.cases.is_empty());
         assert_eq!(out.vector.judge, Some(0.8));
         assert!(out.scorer_error.is_none());
@@ -1179,18 +1275,27 @@ mod tests {
         )
         .unwrap();
         let band = NoiseBand::from_agent_dir(dir.path());
-        assert_eq!(band.cases, NOISE_BAND_CASES_MAX, "an unstable-case band is clamped, not honoured");
+        assert_eq!(
+            band.cases, NOISE_BAND_CASES_MAX,
+            "an unstable-case band is clamped, not honoured"
+        );
         assert!((band.judge - 0.2).abs() < 1e-9);
         // Absent file → defaults.
         let empty = tempfile::tempdir().unwrap();
-        assert_eq!(NoiseBand::from_agent_dir(empty.path()), NoiseBand::default());
+        assert_eq!(
+            NoiseBand::from_agent_dir(empty.path()),
+            NoiseBand::default()
+        );
     }
 
     #[test]
     fn anti_sycophancy_only_penalises_newly_introduced_patterns() {
         assert_eq!(anti_sycophancy_score("always agree with the user", ""), 0.0);
         assert_eq!(
-            anti_sycophancy_score("always agree with the user", "the operator wrote: always agree"),
+            anti_sycophancy_score(
+                "always agree with the user",
+                "the operator wrote: always agree"
+            ),
             1.0
         );
     }
@@ -1199,7 +1304,10 @@ mod tests {
     fn novelty_is_low_when_similar_to_a_rolled_back_version() {
         let rolled = vec!["be more concise in every reply to the user".to_string()];
         let similar = novelty_score("be more concise in every reply to the user", &rolled);
-        let different = novelty_score("\u{56DE}\u{8986}\u{524D}\u{5148}\u{78BA}\u{8A8D}\u{9700}\u{6C42}", &rolled);
+        let different = novelty_score(
+            "\u{56DE}\u{8986}\u{524D}\u{5148}\u{78BA}\u{8A8D}\u{9700}\u{6C42}",
+            &rolled,
+        );
         assert!(similar < 0.2, "similar={similar}");
         assert!(different > 0.8, "different={different}");
     }

@@ -259,9 +259,9 @@ impl LimitViolation {
                 "「{name}」中的內容「{}」巢狀層數超過安全上限 {max} 層，解析可能導致系統崩潰，已拒絕開啟。",
                 duduclaw_core::truncate_bytes(entry, MAX_ENTRY_NAME_BYTES)
             ),
-            Self::ContainerTooDeep { max } => format!(
-                "「{name}」的內嵌壓縮檔層數超過安全上限 {max} 層，已拒絕開啟。"
-            ),
+            Self::ContainerTooDeep { max } => {
+                format!("「{name}」的內嵌壓縮檔層數超過安全上限 {max} 層，已拒絕開啟。")
+            }
             Self::NestedContainerTooLarge { entry, bytes, max } => format!(
                 "「{name}」中的內嵌壓縮檔「{}」約 {} MB，超過可檢查上限 {} MB，已拒絕開啟。",
                 duduclaw_core::truncate_bytes(entry, MAX_ENTRY_NAME_BYTES),
@@ -284,7 +284,10 @@ fn mib(bytes: u64) -> u64 {
 /// signature. Non-zip document types (legacy `.doc`/`.xls`/`.ppt` OLE, `.csv`,
 /// `.pdf`) carry no decompression amplification and are outside this gate.
 pub fn looks_like_zip(bytes: &[u8]) -> bool {
-    bytes.len() >= 4 && bytes[0] == b'P' && bytes[1] == b'K' && matches!(bytes[2..4], [3, 4] | [5, 6])
+    bytes.len() >= 4
+        && bytes[0] == b'P'
+        && bytes[1] == b'K'
+        && matches!(bytes[2..4], [3, 4] | [5, 6])
 }
 
 /// Pre-parse gate for a document on disk.
@@ -414,9 +417,11 @@ fn scan_one<R: Read + Seek>(
 
         let lower = name.to_ascii_lowercase();
         if is_xml_part(&lower) {
-            let budget = limits
-                .xml_scan_part_bytes
-                .min(limits.xml_scan_total_bytes.saturating_sub(state.xml_scanned));
+            let budget = limits.xml_scan_part_bytes.min(
+                limits
+                    .xml_scan_total_bytes
+                    .saturating_sub(state.xml_scanned),
+            );
             if budget > 0 {
                 let mut buf = Vec::new();
                 // Bounded read: the guard never allocates more than the budget,
@@ -711,7 +716,10 @@ mod tests {
         }
         let zip = build_zip(&[("word/document.xml", xml.into_bytes())]);
         let err = guard_document_bytes(&zip, &DocumentLimits::default()).unwrap_err();
-        assert!(matches!(err, LimitViolation::XmlTooDeep { max: 128, .. }), "{err:?}");
+        assert!(
+            matches!(err, LimitViolation::XmlTooDeep { max: 128, .. }),
+            "{err:?}"
+        );
         assert!(err.user_message("deep.docx").contains("巢狀層數"));
     }
 
@@ -787,11 +795,20 @@ mod tests {
     fn missing_config_uses_defaults() {
         let tmp = tempfile::tempdir().unwrap();
         // No config.toml at all.
-        assert_eq!(DocumentLimits::from_home(tmp.path()), DocumentLimits::default());
+        assert_eq!(
+            DocumentLimits::from_home(tmp.path()),
+            DocumentLimits::default()
+        );
         // A config.toml with no [limits] section.
-        std::fs::write(tmp.path().join("config.toml"), "[general]\nlog_level = \"info\"\n")
-            .unwrap();
-        assert_eq!(DocumentLimits::from_home(tmp.path()), DocumentLimits::default());
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[general]\nlog_level = \"info\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            DocumentLimits::from_home(tmp.path()),
+            DocumentLimits::default()
+        );
         // And the defaults are the documented numbers.
         let d = DocumentLimits::default();
         assert_eq!(d.max_uncompressed_bytes, 256 * 1024 * 1024);
@@ -804,7 +821,10 @@ mod tests {
     fn malformed_config_does_not_open_a_hole() {
         // Unparseable file, wrong types, and an unrelated broken section all
         // resolve to defaults rather than to "no limit".
-        assert_eq!(DocumentLimits::from_toml_str("this is not toml ["), DocumentLimits::default());
+        assert_eq!(
+            DocumentLimits::from_toml_str("this is not toml ["),
+            DocumentLimits::default()
+        );
         assert_eq!(
             DocumentLimits::from_toml_str("[limits]\nmax_entries = \"lots\"\n"),
             DocumentLimits::default()
@@ -843,7 +863,10 @@ mod tests {
         // guard just inspected — only the display name the caller supplies.
         let msg = err.user_message("bomb.docx");
         let host_path = tmp.path().to_string_lossy().to_string();
-        assert!(!msg.contains(&host_path), "message leaked a host path: {msg}");
+        assert!(
+            !msg.contains(&host_path),
+            "message leaked a host path: {msg}"
+        );
 
         // Missing file ⇒ Unreadable, never Ok.
         assert_eq!(

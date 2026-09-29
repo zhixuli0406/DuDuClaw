@@ -49,13 +49,9 @@ impl TrajectoryExporter {
                 // signal. We extract tool calls from the agent turn's content
                 // (the next "tool" message, if any, supplies the result/outcome).
                 let tool_calls = if is_agent {
-                    let next = messages.get(i + 1).and_then(|(r, c)| {
-                        if r == "tool" {
-                            Some(c.as_str())
-                        } else {
-                            None
-                        }
-                    });
+                    let next = messages
+                        .get(i + 1)
+                        .and_then(|(r, c)| if r == "tool" { Some(c.as_str()) } else { None });
                     extract_tool_calls(content, next)
                 } else {
                     None
@@ -159,7 +155,10 @@ pub struct ExportStats {
 ///
 /// Returns `None` when no tool call can be inferred, so non-tool turns stay
 /// `tool_calls: None` (preserving loss-masking semantics).
-fn extract_tool_calls(content: &str, next_tool_result: Option<&str>) -> Option<Vec<ToolCallRecord>> {
+fn extract_tool_calls(
+    content: &str,
+    next_tool_result: Option<&str>,
+) -> Option<Vec<ToolCallRecord>> {
     // Success heuristic: a tool result that does not look like an error.
     let result_value = next_tool_result.map(|r| serde_json::json!(r));
     let success = next_tool_result.map_or(true, |r| !looks_like_error(r));

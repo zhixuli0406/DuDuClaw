@@ -329,10 +329,8 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 
 /// Strip leading separators/space from option content.
 fn strip_leading_sep(s: &str) -> &str {
-    s.trim_start_matches([
-        '：', ':', '.', '、', ')', '-', '—', '·', ' ', '\t', '　',
-    ])
-    .trim()
+    s.trim_start_matches(['：', ':', '.', '、', ')', '-', '—', '·', ' ', '\t', '　'])
+        .trim()
 }
 
 // ── P1.2 Persistence ────────────────────────────────────────────────────────
@@ -502,7 +500,15 @@ pub fn detect_decision_reference(
 /// alphanumeric label, or one of the explicit "用方案"/"選方案" verbs is present.
 pub fn mentions_decision_reference(user_text: &str) -> bool {
     let hay = user_text.to_lowercase();
-    for verb in ["用方案", "選方案", "照方案", "用選項", "選選項", "用第", "選第"] {
+    for verb in [
+        "用方案",
+        "選方案",
+        "照方案",
+        "用選項",
+        "選選項",
+        "用第",
+        "選第",
+    ] {
         if hay.contains(verb) {
             return true;
         }
@@ -1016,9 +1022,19 @@ mod tests {
         }
 
         // No longer open; status reflects the choice.
-        assert!(engine.list_open_decisions("agnes", 5).await.unwrap().is_empty());
+        assert!(
+            engine
+                .list_open_decisions("agnes", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
-            engine.decision_status("agnes", &id).await.unwrap().as_deref(),
+            engine
+                .decision_status("agnes", &id)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("resolved:C")
         );
         // The choice is recorded as a searchable long-lived fact.
@@ -1042,7 +1058,10 @@ mod tests {
 
         // Unknown decision id → NotFound, nothing written.
         assert!(matches!(
-            engine.resolve_decision("agnes", "deadbeef", "A").await.unwrap(),
+            engine
+                .resolve_decision("agnes", "deadbeef", "A")
+                .await
+                .unwrap(),
             DecisionResolveOutcome::NotFound
         ));
         // Unknown option key → UnknownKey, nothing written.
@@ -1056,7 +1075,10 @@ mod tests {
             DecisionResolveOutcome::NotFound
         ));
         // Still open after the failed attempts.
-        assert_eq!(engine.list_open_decisions("agnes", 5).await.unwrap().len(), 1);
+        assert_eq!(
+            engine.list_open_decisions("agnes", 5).await.unwrap().len(),
+            1
+        );
 
         // Resolve, then a second resolve is rejected as AlreadyResolved.
         engine.resolve_decision("agnes", &id, "A").await.unwrap();
@@ -1072,7 +1094,10 @@ mod tests {
         duduclaw_memory::DecisionView {
             id: id.to_string(),
             question: "Q".into(),
-            options: keys.iter().map(|k| (k.to_string(), format!("c{k}"))).collect(),
+            options: keys
+                .iter()
+                .map(|k| (k.to_string(), format!("c{k}")))
+                .collect(),
             created_at: None,
         }
     }
@@ -1112,7 +1137,10 @@ mod tests {
     fn reference_none_when_no_choice_context() {
         let open = vec![view("d1", &["A", "B", "C"])];
         // Bare letters in prose must NOT match (no choice anchor).
-        assert_eq!(detect_decision_reference("A car drove by, basically", &open), None);
+        assert_eq!(
+            detect_decision_reference("A car drove by, basically", &open),
+            None
+        );
         assert_eq!(detect_decision_reference("沒什麼想法", &open), None);
     }
 
@@ -1123,7 +1151,10 @@ mod tests {
         assert_eq!(detect_decision_reference("用方案 C", &open), None);
         // Two distinct keys referenced → ambiguous → None.
         let open2 = vec![view("d1", &["A", "B"])];
-        assert_eq!(detect_decision_reference("方案 A 還是 方案 B?", &open2), None);
+        assert_eq!(
+            detect_decision_reference("方案 A 還是 方案 B?", &open2),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1134,7 +1165,11 @@ mod tests {
         // Build a 10-day-old open decision directly (backdated valid_from).
         let old = chrono::Utc::now() - chrono::Duration::days(10);
         let subject = decision_subject("old1");
-        for (pred, obj) in [("question", "舊決策"), ("option:A", "一"), ("status", "open")] {
+        for (pred, obj) in [
+            ("question", "舊決策"),
+            ("option:A", "一"),
+            ("status", "open"),
+        ] {
             let mut entry = MemoryEntry {
                 id: uuid::Uuid::new_v4().to_string(),
                 agent_id: "agnes".into(),
@@ -1177,7 +1212,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(engine.list_open_decisions("agnes", 10).await.unwrap().len(), 2);
+        assert_eq!(
+            engine.list_open_decisions("agnes", 10).await.unwrap().len(),
+            2
+        );
 
         // TTL 7 days: the 10-day-old decision expires, the fresh one stays.
         let n = engine.expire_stale_decisions("agnes", 7).await.unwrap();
@@ -1260,8 +1298,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(engine.dismiss_decision("agnes", &id).await.unwrap(), "existed");
-        assert!(engine.list_open_decisions("agnes", 5).await.unwrap().is_empty());
+        assert!(
+            engine.dismiss_decision("agnes", &id).await.unwrap(),
+            "existed"
+        );
+        assert!(
+            engine
+                .list_open_decisions("agnes", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // Dismissing again / unknown id → false (nothing closed).
         assert!(!engine.dismiss_decision("agnes", &id).await.unwrap());
         assert!(!engine.dismiss_decision("agnes", "nope").await.unwrap());

@@ -163,7 +163,10 @@ pub(super) fn parse_sidecar_routines(yaml: &str) -> Vec<SidecarRoutine> {
     };
     let mut out: Vec<SidecarRoutine> = Vec::new();
     for (k, spec) in routines {
-        let Some(name) = k.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        let Some(name) = k
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
         else {
             continue;
         };
@@ -289,7 +292,7 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
     if !is_package {
         return Err(duduclaw_core::error::DuDuClawError::Config(format!(
             "'{}' 不是有效的 agentcompanies 套件目錄（缺 COMPANY.md 與 agents/ teams/ projects/ tasks/ skills/ 任一標記）。\
-             請指向 `paperclipai company export` 的輸出目錄，或 `duduclaw export --format agentcompanies` 產生的套件。",
+             請指向 `paperclipai company export` 的輸出目錄。",
             src.display()
         )));
     }
@@ -753,7 +756,8 @@ mod tests {
 
     #[test]
     fn parse_agent_card_prefers_spec_slug() {
-        let doc = "---\nschema: agentcompanies/v1\nkind: agent\nslug: xiao-mei\nname: 小美\n---\nbody\n";
+        let doc =
+            "---\nschema: agentcompanies/v1\nkind: agent\nslug: xiao-mei\nname: 小美\n---\nbody\n";
         let card = parse_agent_card(doc);
         assert_eq!(card.slug.as_deref(), Some("xiao-mei"));
         assert_eq!(card.name, "小美");
@@ -825,7 +829,10 @@ routines:
         assert_eq!(routines[0].task.as_deref(), Some("Review the sprint board"));
         assert_eq!(routines[0].agent.as_deref(), Some("boss"));
         assert_eq!(routines[1].name, "no-task");
-        assert!(routines[1].task.is_none(), "no prompt → task None (PARTIAL)");
+        assert!(
+            routines[1].task.is_none(),
+            "no prompt → task None (PARTIAL)"
+        );
         // Malformed YAML → empty, never a panic.
         assert!(parse_sidecar_routines(":::not yaml:::").is_empty());
     }

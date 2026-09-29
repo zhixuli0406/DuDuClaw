@@ -209,7 +209,14 @@ impl ConversationMetrics {
         messages: &[SessionMessage],
         response_time_ms: u64,
     ) -> Self {
-        Self::extract_with_culture(session_id, agent_id, user_id, messages, response_time_ms, None)
+        Self::extract_with_culture(
+            session_id,
+            agent_id,
+            user_id,
+            messages,
+            response_time_ms,
+            None,
+        )
     }
 
     /// Extract with explicit cultural context.
@@ -222,8 +229,10 @@ impl ConversationMetrics {
         cultural_context: Option<&CulturalContext>,
     ) -> Self {
         let culture = cultural_context.cloned().unwrap_or_default();
-        let user_msgs: Vec<&SessionMessage> = messages.iter().filter(|m| m.role == "user").collect();
-        let asst_msgs: Vec<&SessionMessage> = messages.iter().filter(|m| m.role == "assistant").collect();
+        let user_msgs: Vec<&SessionMessage> =
+            messages.iter().filter(|m| m.role == "user").collect();
+        let asst_msgs: Vec<&SessionMessage> =
+            messages.iter().filter(|m| m.role == "assistant").collect();
 
         let user_message_count = user_msgs.len() as u32;
         let assistant_message_count = asst_msgs.len() as u32;
@@ -247,7 +256,11 @@ impl ConversationMetrics {
         let user_corrections = feedback_details.raw_correction_count;
 
         // Detect language
-        let all_user_text: String = user_msgs.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join(" ");
+        let all_user_text: String = user_msgs
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         let detected_language = detect_language(&all_user_text);
 
         // Extract top keywords
@@ -284,10 +297,7 @@ impl ConversationMetrics {
 fn count_follow_ups_cultural(messages: &[SessionMessage], culture: &CulturalContext) -> u32 {
     let mut count = 0u32;
     for window in messages.windows(3) {
-        if window[0].role == "user"
-            && window[1].role == "assistant"
-            && window[2].role == "user"
-        {
+        if window[0].role == "user" && window[1].role == "assistant" && window[2].role == "user" {
             let next_user = &window[2].content;
             let char_count = next_user.chars().count();
             let question_type = detect_question_type(next_user);
@@ -308,10 +318,7 @@ fn count_follow_ups_cultural(messages: &[SessionMessage], culture: &CulturalCont
             } else {
                 // Low-context: short or question = follow-up
                 // Use chars().count() for consistency (len() returns bytes, not characters)
-                if char_count < 50
-                    || next_user.contains('?')
-                    || next_user.contains('\u{FF1F}')
-                {
+                if char_count < 50 || next_user.contains('?') || next_user.contains('\u{FF1F}') {
                     count += 1;
                 }
             }
@@ -325,46 +332,35 @@ fn count_follow_ups_cultural(messages: &[SessionMessage], culture: &CulturalCont
 /// Replaces binary `count_corrections` with a severity-weighted system.
 /// Based on EMNLP 2025 "User Feedback in Human-LLM Dialogues" taxonomy:
 /// ExplicitCorrection > AwareWithoutFix > Rephrasing > Clarification
-fn classify_feedback(
-    user_msgs: &[&SessionMessage],
-    culture: &CulturalContext,
-) -> FeedbackDetail {
+fn classify_feedback(user_msgs: &[&SessionMessage], culture: &CulturalContext) -> FeedbackDetail {
     let mut severity_counts: HashMap<String, u32> = HashMap::new();
     let mut weighted_score = 0.0_f64;
     let mut raw_count = 0u32;
 
     // Clarification indicators — user is clarifying their OWN intent
     let clarification_suffixes_zh = [
-        "\u{6211}\u{7684}\u{610F}\u{601D}",     // 我的意思
-        "\u{6211}\u{662F}\u{8AAA}",               // 我是說
-        "\u{6211}\u{60F3}\u{8981}",               // 我想要
+        "\u{6211}\u{7684}\u{610F}\u{601D}",         // 我的意思
+        "\u{6211}\u{662F}\u{8AAA}",                 // 我是說
+        "\u{6211}\u{60F3}\u{8981}",                 // 我想要
         "\u{6211}\u{60F3}\u{8AAA}\u{7684}\u{662F}", // 我想說的是
         "\u{6211}\u{7684}\u{610F}\u{601D}\u{662F}", // 我的意思是
     ];
 
     // Explicit correction indicators — user says agent is wrong
     let explicit_correction_zh = [
-        "\u{932F}\u{4E86}",     // 錯了
-        "\u{4E0D}\u{5C0D}",     // 不對
-        "\u{91CD}\u{4F86}",     // 重來
-        "\u{4FEE}\u{6539}",     // 修改
+        "\u{932F}\u{4E86}", // 錯了
+        "\u{4E0D}\u{5C0D}", // 不對
+        "\u{91CD}\u{4F86}", // 重來
+        "\u{4FEE}\u{6539}", // 修改
     ];
-    let explicit_correction_en = [
-        "that's wrong",
-        "incorrect",
-        "please fix",
-        "try again",
-    ];
+    let explicit_correction_en = ["that's wrong", "incorrect", "please fix", "try again"];
 
     // Negation that could be either correction or clarification
     let ambiguous_negation_zh = [
-        "\u{4E0D}\u{662F}",     // 不是
-        "\u{4E0D}\u{8981}",     // 不要
+        "\u{4E0D}\u{662F}", // 不是
+        "\u{4E0D}\u{8981}", // 不要
     ];
-    let ambiguous_negation_en = [
-        "not what i",
-        "no, ",
-    ];
+    let ambiguous_negation_en = ["not what i", "no, "];
 
     // Indirect disagreement (high-context cultures).
     //
@@ -373,14 +369,14 @@ fn classify_feedback(
     // Only multi-word phrases that strongly imply disagreement are included.
     // (CHI 2024: indirect signals must be contextually disambiguated)
     let indirect_disagreement_zh = [
-        "\u{4E0D}\u{4E00}\u{5B9A}\u{662F}",             // 不一定是 (not necessarily)
-        "\u{6709}\u{6C92}\u{6709}\u{5176}\u{4ED6}",     // 有沒有其他 (are there others)
-        "\u{9084}\u{6709}\u{5225}\u{7684}\u{55CE}",     // 還有別的嗎 (anything else?)
+        "\u{4E0D}\u{4E00}\u{5B9A}\u{662F}", // 不一定是 (not necessarily)
+        "\u{6709}\u{6C92}\u{6709}\u{5176}\u{4ED6}", // 有沒有其他 (are there others)
+        "\u{9084}\u{6709}\u{5225}\u{7684}\u{55CE}", // 還有別的嗎 (anything else?)
         "\u{9084}\u{6709}\u{5176}\u{4ED6}\u{65B9}\u{6CD5}", // 還有其他方法 (other methods?)
-        "\u{4F46}\u{6211}\u{89BA}\u{5F97}",               // 但我覺得 (but I think)
-        "\u{4E0D}\u{904E}\u{6211}\u{8A8D}\u{70BA}",     // 不過我認為 (however I believe)
-        "\u{53EF}\u{80FD}\u{4E0D}\u{592A}",               // 可能不太 (maybe not quite)
-        "\u{6216}\u{8A31}\u{4E0D}\u{662F}",               // 或許不是 (perhaps not)
+        "\u{4F46}\u{6211}\u{89BA}\u{5F97}", // 但我覺得 (but I think)
+        "\u{4E0D}\u{904E}\u{6211}\u{8A8D}\u{70BA}", // 不過我認為 (however I believe)
+        "\u{53EF}\u{80FD}\u{4E0D}\u{592A}", // 可能不太 (maybe not quite)
+        "\u{6216}\u{8A31}\u{4E0D}\u{662F}", // 或許不是 (perhaps not)
     ];
 
     for (i, msg) in user_msgs.iter().enumerate() {
@@ -391,9 +387,10 @@ fn classify_feedback(
         let is_clarification = {
             let has_negation = ambiguous_negation_zh.iter().any(|p| lower.contains(p))
                 || ambiguous_negation_en.iter().any(|p| lower.contains(p));
-            let has_clarification_suffix = clarification_suffixes_zh.iter().any(|p| lower.contains(p))
-                || lower.contains("i mean")
-                || lower.contains("what i meant");
+            let has_clarification_suffix =
+                clarification_suffixes_zh.iter().any(|p| lower.contains(p))
+                    || lower.contains("i mean")
+                    || lower.contains("what i meant");
             has_negation && has_clarification_suffix
         };
 
@@ -484,8 +481,7 @@ fn char_bigram_jaccard(a: &str, b: &str) -> f64 {
         return 0.0;
     }
 
-    let all_keys: std::collections::HashSet<&String> =
-        a_bg.keys().chain(b_bg.keys()).collect();
+    let all_keys: std::collections::HashSet<&String> = a_bg.keys().chain(b_bg.keys()).collect();
 
     let mut intersection = 0u32;
     let mut union = 0u32;
@@ -496,7 +492,11 @@ fn char_bigram_jaccard(a: &str, b: &str) -> f64 {
         union += ca.max(cb);
     }
 
-    if union == 0 { 0.0 } else { intersection as f64 / union as f64 }
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
 }
 
 /// Simple language detection based on CJK character ratio.
@@ -553,19 +553,21 @@ pub fn extract_keywords(text: &str, top_k: usize) -> Vec<String> {
 
     // Collect ASCII words
     let stopwords = [
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "can", "shall", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "as", "into", "through", "during",
-        "it", "its", "this", "that", "these", "those", "i", "you", "he", "she",
-        "we", "they", "me", "him", "her", "us", "them", "my", "your", "his",
-        "and", "or", "but", "not", "if", "then", "else", "so", "just", "also",
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "shall",
+        "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through",
+        "during", "it", "its", "this", "that", "these", "those", "i", "you", "he", "she", "we",
+        "they", "me", "him", "her", "us", "them", "my", "your", "his", "and", "or", "but", "not",
+        "if", "then", "else", "so", "just", "also",
     ];
 
     for word in text.split_whitespace() {
         let cleaned: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
         let lower = cleaned.to_lowercase();
-        if lower.len() >= 2 && !stopwords.contains(&lower.as_str()) && lower.chars().all(|c| c.is_ascii_alphabetic()) {
+        if lower.len() >= 2
+            && !stopwords.contains(&lower.as_str())
+            && lower.chars().all(|c| c.is_ascii_alphabetic())
+        {
             *freq.entry(lower).or_insert(0) += 1;
         }
     }

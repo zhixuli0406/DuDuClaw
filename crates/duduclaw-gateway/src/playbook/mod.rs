@@ -43,17 +43,20 @@ pub mod sweep;
 #[cfg(test)]
 mod tests;
 
-pub use delta::{merge, validate_all, validate_delta, AppliedOp, MergeNote, MergeOutcome, PlaybookDelta, ValidationCtx};
-pub use entry::{
-    Application, FailureNote, PlaybookCategory, PlaybookMeta, PlaybookState,
-    LEGACY_RULE_SOURCE_EVENT, PLAYBOOK_KEY, PLAYBOOK_MAX_ENTRIES, PLAYBOOK_SCHEMA_VERSION,
-    PLAYBOOK_SOURCE_EVENT, SIGNALS_MAX, WILDCARD_QUOTA,
+pub use delta::{
+    AppliedOp, MergeNote, MergeOutcome, PlaybookDelta, ValidationCtx, merge, validate_all,
+    validate_delta,
 };
-pub use gene::{from_gene, to_gene, EvalCaseRef};
-pub use humanize::{humanize, HumanizedRule, RuleEvidence};
+pub use entry::{
+    Application, FailureNote, LEGACY_RULE_SOURCE_EVENT, PLAYBOOK_KEY, PLAYBOOK_MAX_ENTRIES,
+    PLAYBOOK_SCHEMA_VERSION, PLAYBOOK_SOURCE_EVENT, PlaybookCategory, PlaybookMeta, PlaybookState,
+    SIGNALS_MAX, WILDCARD_QUOTA,
+};
+pub use gene::{EvalCaseRef, from_gene, to_gene};
+pub use humanize::{HumanizedRule, RuleEvidence, humanize};
 pub use select::{
-    build_playbook_section_blocking, collect_armed_shadow, collect_armed_shadow_blocking,
-    render_section, select_playbook, ArmedShadow, InjectionBudget, SelectedEntry,
+    ArmedShadow, InjectionBudget, SelectedEntry, build_playbook_section_blocking,
+    collect_armed_shadow, collect_armed_shadow_blocking, render_section, select_playbook,
 };
 pub use signals::TurnSignals;
 pub use store::{apply_deltas, list_active};

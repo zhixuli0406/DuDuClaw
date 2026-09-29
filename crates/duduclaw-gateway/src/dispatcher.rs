@@ -13,11 +13,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::claude_runner::{call_claude_for_agent_with_type};
+use crate::claude_runner::call_claude_for_agent_with_type;
 use duduclaw_agent::registry::AgentRegistry;
 use duduclaw_container::sandbox;
 
-use duduclaw_core::{MAX_DELEGATION_DEPTH, ENV_DELEGATION_DEPTH, ENV_DELEGATION_ORIGIN, ENV_DELEGATION_SENDER, ENV_HOP_DEPTH, is_valid_discord_snowflake, truncate_bytes};
+use duduclaw_core::{
+    ENV_DELEGATION_DEPTH, ENV_DELEGATION_ORIGIN, ENV_DELEGATION_SENDER, ENV_HOP_DEPTH,
+    MAX_DELEGATION_DEPTH, is_valid_discord_snowflake, truncate_bytes,
+};
 
 /// Message envelope stored in `bus_queue.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,8 +87,12 @@ pub fn start_agent_dispatcher(
     start_agent_dispatcher_with_crypto(home_dir, registry, None, None, None, None)
 }
 
-/// Start the dispatcher with optional encryption key for deferred GVU (review #30)
-/// and optional SQLite message queue (Phase 3 Hybrid TaskPipeline).
+/// Start the dispatcher with an optional encryption key and an optional
+/// SQLite message queue (Phase 3 Hybrid TaskPipeline).
+///
+/// `encryption_key` is retained in the signature for callers that still pass
+/// the home keyfile; its only consumer used to be the deferred-GVU retry
+/// poller, removed with the legacy SOUL path in S11 (2026-09-29).
 ///
 /// `prediction_engine` (BUG-5 fix): when supplied, every successful sub-agent
 /// dispatch records a synthetic prediction cycle so sub-agents accumulate
@@ -156,10 +163,6 @@ pub fn start_agent_dispatcher_with_crypto(
                 }
             }
 
-            // Deferred GVU polling every 60 ticks (~5 min)
-            if tick % 60 == 0 {
-                poll_deferred_gvu(&home_dir, encryption_key.as_ref()).await;
-            }
             // Clean up orphaned delegation callbacks every 720 ticks (~1 hour)
             if tick % 720 == 0 {
                 cleanup_stale_delegation_callbacks(&home_dir).await;
@@ -206,7 +209,10 @@ async fn poll_and_dispatch_sqlite(
         return Ok(());
     }
 
-    info!(count = messages.len(), "SQLite queue: dispatching pending messages");
+    info!(
+        count = messages.len(),
+        "SQLite queue: dispatching pending messages"
+    );
 
     for msg in messages {
         // ACK immediately to prevent double-pickup
@@ -260,8 +266,13 @@ async fn poll_and_dispatch_sqlite(
         // work items (which have no callback of their own; see the
         // fallback in `build_typing_guard_for_sqlite_message`).
         let typing_guard = build_typing_guard_for_sqlite_message(
-            home_dir, &msg.id, msg.origin_agent.as_deref(), &msg.target, &msg.payload,
-        ).await;
+            home_dir,
+            &msg.id,
+            msg.origin_agent.as_deref(),
+            &msg.target,
+            &msg.payload,
+        )
+        .await;
 
         let dispatch_fut =
             dispatch_to_agent(home_dir, registry, &msg.target, &msg.payload, &delegation);
@@ -271,8 +282,8 @@ async fn poll_and_dispatch_sqlite(
         // — populated by the MCP `send_to_agent` tool from env vars.
         let dispatch_fut = duduclaw_memory::feedback::CURRENT_SESSION_ID
             .scope(msg.session_id.clone(), dispatch_fut);
-        let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
-            .scope(msg.turn_id.clone(), dispatch_fut);
+        let dispatch_fut =
+            duduclaw_memory::feedback::CURRENT_TURN_ID.scope(msg.turn_id.clone(), dispatch_fut);
 
         // WP-A4/A5/T10: only goal-loop dispatches get a native-tool
         // collector scoped — the design's A3 forward model only observes
@@ -282,20 +293,30 @@ async fn poll_and_dispatch_sqlite(
         // `build_typing_guard_for_sqlite_message` above already parses for
         // its own (unrelated) purpose.
         let goal_loop_ref = extract_goal_loop_task_id_and_round(&msg.payload);
-        let native_collector = goal_loop_ref
-            .map(|_| Arc::new(std::sync::Mutex::new(Vec::<crate::runtime::NativeToolEvent>::new())));
+        let native_collector = goal_loop_ref.map(|_| {
+            Arc::new(std::sync::Mutex::new(
+                Vec::<crate::runtime::NativeToolEvent>::new(),
+            ))
+        });
 
         let result = match (native_collector.clone(), msg.reply_channel.clone()) {
             (Some(collector), Some(rc)) if !rc.is_empty() => {
                 crate::runtime::NATIVE_TOOL_COLLECTOR
-                    .scope(collector, crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut))
+                    .scope(
+                        collector,
+                        crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut),
+                    )
                     .await
             }
             (Some(collector), _) => {
-                crate::runtime::NATIVE_TOOL_COLLECTOR.scope(collector, dispatch_fut).await
+                crate::runtime::NATIVE_TOOL_COLLECTOR
+                    .scope(collector, dispatch_fut)
+                    .await
             }
             (None, Some(rc)) if !rc.is_empty() => {
-                crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut).await
+                crate::claude_runner::REPLY_CHANNEL
+                    .scope(rc, dispatch_fut)
+                    .await
             }
             (None, _) => dispatch_fut.await,
         };
@@ -343,7 +364,11 @@ async fn poll_and_dispatch_sqlite(
             // only point where native (non-MCP) tool evidence exists for a
             // goal-loop round. Best-effort, same contract as the bridge.
             crate::task_changes::record_round_changes(
-                home_dir, task_id, &msg.target, round, &events,
+                home_dir,
+                task_id,
+                &msg.target,
+                round,
+                &events,
             );
             crate::prediction::task_observe::record_native_evidence(task_id, round, events);
         }
@@ -445,103 +470,6 @@ async fn sweep_stale_messages(
         }
     }
     Ok(())
-}
-
-/// Poll deferred GVU entries from evolution.db and write bus messages for retry.
-///
-/// Runs every ~5 min from the dispatcher loop. Checks all agents for pending
-/// deferred GVU tasks whose retry_after has elapsed.
-async fn poll_deferred_gvu(home_dir: &Path, encryption_key: Option<&[u8; 32]>) {
-    let db_path = home_dir.join("evolution.db");
-    if !db_path.exists() {
-        return;
-    }
-
-    let vs = crate::gvu::version_store::VersionStore::with_crypto(&db_path, encryption_key);
-
-    // Get all agent IDs that have pending deferrals by scanning the table
-    // (VersionStore::get_pending_deferred requires an agent_id, so we do a broader check)
-    let conn = match rusqlite::Connection::open(&db_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let agent_ids: Vec<String> = conn
-        .prepare("SELECT DISTINCT agent_id FROM deferred_gvu WHERE status = 'pending' AND retry_after <= ?1")
-        .ok()
-        .and_then(|mut stmt| {
-            stmt.query_map(
-                rusqlite::params![chrono::Utc::now().to_rfc3339()],
-                |row| row.get(0),
-            )
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
-
-    drop(conn);
-
-    for agent_id in &agent_ids {
-        let pending = vs.get_pending_deferred(agent_id);
-        for deferred in &pending {
-            info!(
-                agent = %agent_id,
-                deferred_id = %deferred.id,
-                retry_count = deferred.retry_count,
-                gradients = deferred.gradients.len(),
-                "Deferred GVU ready for retry — injecting bus message"
-            );
-
-            let trigger = format!(
-                "## Deferred GVU Retry (attempt {})\n\
-                 Accumulated {} gradients from previous failed attempts.\n\
-                 Previous feedback:\n{}",
-                deferred.retry_count,
-                deferred.gradients.len(),
-                deferred.gradients.iter()
-                    .map(|g| format!("- [{}] {}", g.source_layer, g.critique))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
-
-            // Write bus message FIRST, then mark completed (review issue #33).
-            // If bus write fails, the deferral stays pending and will be retried.
-            let queue_path = home_dir.join("bus_queue.jsonl");
-            let msg = serde_json::json!({
-                "type": "agent_message",
-                "message_id": uuid::Uuid::new_v4().to_string(),
-                "agent_id": agent_id,
-                "payload": trigger,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-                "delegation_depth": 0,
-                "origin_agent": "__deferred_gvu__",
-                "sender_agent": "__deferred_gvu__",
-            });
-            let bus_written = if let Ok(line) = serde_json::to_string(&msg) {
-                match append_line(&queue_path, &line).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        warn!(agent = %agent_id, "Failed to write deferred GVU bus message: {e} — will retry next poll");
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-
-            // Only mark completed if bus message was written successfully
-            if bus_written {
-                if let Err(e) = vs.mark_deferred_completed(&deferred.id) {
-                    warn!(
-                        agent = %agent_id,
-                        deferred_id = %deferred.id,
-                        error = %e,
-                        "Failed to mark deferred GVU as completed — may re-process"
-                    );
-                }
-            }
-        }
-    }
 }
 
 /// Read the queue, extract pending `agent_message` entries, process them,
@@ -723,7 +651,10 @@ async fn poll_and_dispatch(
     // (we batch within a single poll cycle which is 5 seconds).
     let to_dispatch = coalesce_messages(to_dispatch);
 
-    info!(count = to_dispatch.len(), "Dispatching agent messages (after coalescing)");
+    info!(
+        count = to_dispatch.len(),
+        "Dispatching agent messages (after coalescing)"
+    );
 
     // Rewrite the queue without the messages we're about to process.
     // Uses write→rename for atomicity — prevents data loss if process crashes mid-write.
@@ -795,7 +726,11 @@ async fn poll_and_dispatch(
 
     let mut handles = Vec::new();
     for msg in to_dispatch {
-        let permit = semaphore.clone().acquire_owned().await.map_err(|e| e.to_string())?;
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| e.to_string())?;
         let home = home.clone();
         let reg = reg.clone();
         let queue = queue.clone();
@@ -1100,7 +1035,7 @@ impl DelegationEnv {
     }
 }
 
-/// Dispatch a task to an agent — L0 worktree → L1 sandbox → direct call.
+/// Dispatch a task to an agent — L1 sandbox → direct call.
 async fn dispatch_to_agent(
     home_dir: &std::path::Path,
     registry: &Arc<RwLock<AgentRegistry>>,
@@ -1124,7 +1059,7 @@ async fn dispatch_to_agent(
             .await;
     }
     // Read isolation flags from agent config.
-    let (use_sandbox, use_worktree, worktree_cfg) = {
+    let use_sandbox = {
         let reg = registry.read().await;
         let agent = if agent_id == "default" {
             reg.main_agent()
@@ -1132,17 +1067,8 @@ async fn dispatch_to_agent(
             reg.get(agent_id)
         };
         match agent {
-            Some(a) => (
-                a.config.container.sandbox_enabled,
-                a.config.container.worktree_enabled,
-                WorktreeCfg {
-                    auto_merge: a.config.container.worktree_auto_merge,
-                    cleanup: a.config.container.worktree_cleanup_on_exit,
-                    copy_files: a.config.container.worktree_copy_files.clone(),
-                    agent_dir: a.dir.clone(),
-                },
-            ),
-            None => (false, false, WorktreeCfg::default()),
+            Some(a) => a.config.container.sandbox_enabled,
+            None => false,
         }
     };
 
@@ -1151,162 +1077,23 @@ async fn dispatch_to_agent(
     let env_map = delegation.to_env_map();
 
     let env_map_clone = env_map.clone();
-    crate::claude_runner::DELEGATION_ENV.scope(env_map, async {
-        if use_worktree {
-            info!(agent = agent_id, "Dispatching via worktree (L0)");
-            dispatch_in_worktree(home_dir, registry, agent_id, prompt, &worktree_cfg).await
-        } else if use_sandbox && sandbox::is_sandbox_available().await {
-            info!(agent = agent_id, "Dispatching via sandbox (L1)");
-            dispatch_sandboxed(home_dir, registry, agent_id, prompt, &env_map_clone).await
-        } else {
-            call_claude_for_agent_with_type(
-                home_dir, registry, agent_id, prompt,
-                crate::cost_telemetry::RequestType::Dispatch,
-            ).await
-        }
-    }).await
-}
-
-/// Per-agent worktree configuration snapshot (avoids holding registry lock).
-#[derive(Debug, Clone, Default)]
-struct WorktreeCfg {
-    auto_merge: bool,
-    cleanup: bool,
-    copy_files: Vec<String>,
-    agent_dir: PathBuf,
-}
-
-/// Execute a task in an isolated git worktree (L0 isolation).
-///
-/// Flow: create worktree → copy env files → call Claude CLI → inspect result
-///       → snap decision (merge / cleanup / keep) → return response.
-async fn dispatch_in_worktree(
-    home_dir: &Path,
-    registry: &Arc<RwLock<AgentRegistry>>,
-    agent_id: &str,
-    prompt: &str,
-    cfg: &WorktreeCfg,
-) -> Result<String, String> {
-    let manager = crate::worktree::WorktreeManager::new(home_dir);
-
-    // Use the agent directory as repo root (it should be a git repo or
-    // inside one). Fall back to the agent dir itself.
-    let repo_root = find_git_root(&cfg.agent_dir).await.unwrap_or_else(|| cfg.agent_dir.clone());
-
-    // Create worktree.
-    let wt = manager.create(&repo_root, agent_id).await?;
-    info!(
-        agent = agent_id,
-        branch = %wt.branch,
-        path = %wt.path.display(),
-        "Worktree created for task"
-    );
-
-    // Copy environment files.
-    if let Err(e) = manager.copy_env_files(&cfg.agent_dir, &wt.path, &cfg.copy_files).await {
-        warn!(agent = agent_id, err = %e, "Failed to copy env files to worktree");
-    }
-
-    // Call Claude CLI with worktree as working directory.
-    // We use WORKTREE_PATH task-local to communicate the override to claude_runner.
-    let result = crate::claude_runner::WORKTREE_PATH.scope(
-        Some(wt.path.clone()),
-        call_claude_for_agent_with_type(
-            home_dir, registry, agent_id, prompt,
-            crate::cost_telemetry::RequestType::Dispatch,
-        ),
-    ).await;
-
-    // Snap: inspect and decide what to do with the worktree.
-    let response_text = result.unwrap_or_else(|e| format!("Error: {e}"));
-
-    if cfg.auto_merge || cfg.cleanup {
-        let status = manager.inspect_worktree(&wt.path, &repo_root).await;
-        // HC6: pass `auto_merge` so commits are merged into the target branch
-        // only with explicit consent. With cleanup-on-exit but no auto-merge,
-        // the snap downgrades to a non-merging cleanup.
-        let action = crate::worktree::determine_snap_action(&status, cfg.auto_merge);
-
-        let target_branch = get_main_branch(&repo_root).await;
-        match manager.execute_snap(&action, &repo_root, &wt.path, &wt.branch, &target_branch).await {
-            Ok(outcome) => {
-                info!(agent = agent_id, ?outcome, "Worktree snap completed");
+    crate::claude_runner::DELEGATION_ENV
+        .scope(env_map, async {
+            if use_sandbox && sandbox::is_sandbox_available().await {
+                info!(agent = agent_id, "Dispatching via sandbox (L1)");
+                dispatch_sandboxed(home_dir, registry, agent_id, prompt, &env_map_clone).await
+            } else {
+                call_claude_for_agent_with_type(
+                    home_dir,
+                    registry,
+                    agent_id,
+                    prompt,
+                    crate::cost_telemetry::RequestType::Dispatch,
+                )
+                .await
             }
-            Err(e) => {
-                warn!(agent = agent_id, err = %e, "Worktree snap failed — keeping worktree");
-            }
-        }
-    } else {
-        info!(
-            agent = agent_id,
-            path = %wt.path.display(),
-            branch = %wt.branch,
-            "Worktree kept (auto_merge and cleanup both disabled) — run cleanup_stale to reclaim"
-        );
-    }
-
-    Ok(response_text)
-}
-
-/// Find the git repository root using `git rev-parse --show-toplevel`.
-///
-/// Uses git itself instead of manually walking directories, which avoids
-/// TOCTOU races with `.git` existence checks and handles gitdir files.
-async fn find_git_root(start: &Path) -> Option<PathBuf> {
-    let output = tokio::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(start)
-        .output()
+        })
         .await
-        .ok()?;
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    None
-}
-
-/// Detect the main/master/default branch of the repo.
-///
-/// Validates output to only contain safe branch name characters.
-async fn get_main_branch(repo_root: &Path) -> String {
-    let is_safe_branch = |s: &str| -> bool {
-        !s.is_empty()
-            && !s.starts_with('-')
-            && !s.contains("..")
-            && s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.')
-    };
-
-    // Try symbolic-ref for the default branch.
-    let output = tokio::process::Command::new("git")
-        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
-        .current_dir(repo_root)
-        .output()
-        .await;
-    if let Ok(o) = output {
-        if o.status.success() {
-            let s = String::from_utf8_lossy(&o.stdout);
-            if let Some(branch) = s.trim().strip_prefix("refs/remotes/origin/") {
-                if is_safe_branch(branch) {
-                    return branch.to_string();
-                }
-            }
-        }
-    }
-    // Fallback: check if "main" or "master" exists.
-    for candidate in &["main", "master"] {
-        let check = tokio::process::Command::new("git")
-            .args(["rev-parse", "--verify", candidate])
-            .current_dir(repo_root)
-            .output()
-            .await;
-        if check.map(|o| o.status.success()).unwrap_or(false) {
-            return candidate.to_string();
-        }
-    }
-    "main".to_string()
 }
 
 /// Execute a task inside a sandboxed Docker container.
@@ -1416,10 +1203,7 @@ async fn dispatch_sandboxed(
 ///
 /// A TaskSpec is picked up if its `status` is `Planned`. It is immediately
 /// marked `Running` to prevent double-pickup by concurrent poll cycles.
-async fn poll_pending_taskspecs(
-    home_dir: &Path,
-    registry: &Arc<RwLock<AgentRegistry>>,
-) {
+async fn poll_pending_taskspecs(home_dir: &Path, registry: &Arc<RwLock<AgentRegistry>>) {
     let agents_dir = home_dir.join("agents");
     let entries = match std::fs::read_dir(&agents_dir) {
         Ok(e) => e,
@@ -1617,30 +1401,39 @@ pub async fn dispatch_taskspec(
             sender: spec.agent_id.clone(),
             hop_depth: 0,
         };
-        let result = dispatch_to_agent(home_dir, registry, &target_agent, &prompt, &delegation).await;
+        let result =
+            dispatch_to_agent(home_dir, registry, &target_agent, &prompt, &delegation).await;
 
         match result {
             Ok(output) => {
                 // Verify with Auto criteria
                 let criteria_results = verify_step_auto(&spec.steps[step_index], &output);
-                let all_passed = criteria_results.is_empty() || criteria_results.iter().all(|r| r.passed);
+                let all_passed =
+                    criteria_results.is_empty() || criteria_results.iter().all(|r| r.passed);
 
                 if all_passed {
-                    spec.mark_passed(step_index, StepResult {
-                        output: output.clone(),
-                        artifacts: Vec::new(),
-                        criteria_results,
-                        self_confidence: None,
-                        completed_at: Utc::now(),
-                    });
+                    spec.mark_passed(
+                        step_index,
+                        StepResult {
+                            output: output.clone(),
+                            artifacts: Vec::new(),
+                            criteria_results,
+                            self_confidence: None,
+                            completed_at: Utc::now(),
+                        },
+                    );
                     info!(task = %spec.task_id, step = step_index, "Step passed");
                 } else {
-                    let failed_criteria: Vec<String> = criteria_results.iter()
+                    let failed_criteria: Vec<String> = criteria_results
+                        .iter()
                         .filter(|r| !r.passed)
                         .map(|r| r.description.clone())
                         .collect();
                     let error_msg = format!("Criteria not met: {}", failed_criteria.join(", "));
-                    handle_step_failure(spec, step_index, &error_msg, home_dir, registry, agent_dir).await?;
+                    handle_step_failure(
+                        spec, step_index, &error_msg, home_dir, registry, agent_dir,
+                    )
+                    .await?;
                 }
             }
             Err(e) => {
@@ -1652,7 +1445,8 @@ pub async fn dispatch_taskspec(
     }
 
     // Final save
-    spec.save(agent_dir).map_err(|e| format!("Final save: {e}"))?;
+    spec.save(agent_dir)
+        .map_err(|e| format!("Final save: {e}"))?;
 
     info!(
         task = %spec.task_id,
@@ -1680,7 +1474,11 @@ async fn handle_step_failure(
     spec.save(agent_dir).ok();
 
     match action {
-        FailureAction::Retry { step_index, attempt, error } => {
+        FailureAction::Retry {
+            step_index,
+            attempt,
+            error,
+        } => {
             // Exponential backoff: 5s, 10s, 20s (review issue #31)
             let delay_secs = 5u64 * (1 << attempt.min(3));
             info!(
@@ -1708,7 +1506,10 @@ async fn handle_step_failure(
                 "The original plan for '{}' failed at step {}. Error: {}\n\n\
                  Completed steps so far:\n{}\n\n\
                  Please provide a new plan for the remaining work.",
-                spec.goal, failed_step, error, spec.completed_steps_briefing(),
+                spec.goal,
+                failed_step,
+                error,
+                spec.completed_steps_briefing(),
             );
 
             let delegation = DelegationEnv {
@@ -1718,8 +1519,13 @@ async fn handle_step_failure(
                 hop_depth: 0,
             };
             let planner_response = dispatch_to_agent(
-                home_dir, registry, &spec.agent_id, &replan_prompt, &delegation,
-            ).await?;
+                home_dir,
+                registry,
+                &spec.agent_id,
+                &replan_prompt,
+                &delegation,
+            )
+            .await?;
 
             match parse_planner_response(&planner_response) {
                 Ok(new_steps) => {
@@ -1793,7 +1599,10 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
 
             let mut coalesced_payload = coalesced_payload;
             if coalesced_payload.len() > 200_000 {
-                warn!(size = coalesced_payload.len(), "Coalesced payload too large, truncating");
+                warn!(
+                    size = coalesced_payload.len(),
+                    "Coalesced payload too large, truncating"
+                );
                 coalesced_payload.truncate(200_000);
             }
 
@@ -1813,7 +1622,8 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
 
             // Collect message_ids from non-first messages so their delegation
             // callbacks can also be consumed when the coalesced response arrives.
-            let extra_ids: Vec<String> = chunk.iter().skip(1).map(|m| m.message_id.clone()).collect();
+            let extra_ids: Vec<String> =
+                chunk.iter().skip(1).map(|m| m.message_id.clone()).collect();
 
             result.push(BusMessage {
                 msg_type: "agent_message".to_string(),
@@ -1932,7 +1742,10 @@ async fn reconcile_orphan_responses(home_dir: &Path) {
         return;
     }
 
-    info!(count = orphans.len(), "Scanning for orphan delegation responses");
+    info!(
+        count = orphans.len(),
+        "Scanning for orphan delegation responses"
+    );
     for (in_reply_to, payload, sender) in orphans {
         // forward_delegation_response deletes the callback row atomically;
         // if no row exists we silently skip.
@@ -1953,8 +1766,10 @@ async fn cleanup_stale_delegation_callbacks(home_dir: &Path) {
         conn.execute(
             "DELETE FROM delegation_callbacks WHERE created_at < ?1",
             rusqlite::params![cutoff],
-        ).ok()
-    }).await;
+        )
+        .ok()
+    })
+    .await;
     if let Ok(Some(count)) = result {
         if count > 0 {
             info!(removed = count, "Cleaned up stale delegation callbacks");
@@ -2204,7 +2019,9 @@ pub async fn reforward_message(
 fn parse_reply_channel(rc: &str) -> Result<(String, String, Option<String>), String> {
     let parts: Vec<&str> = rc.splitn(3, ':').collect();
     if parts.len() < 2 {
-        return Err(format!("malformed reply_channel '{rc}': expected <type>:<id>[:<thread>]"));
+        return Err(format!(
+            "malformed reply_channel '{rc}': expected <type>:<id>[:<thread>]"
+        ));
     }
     let ch_type = parts[0].to_string();
     // Special marker `<type>:thread:<id>` (e.g. `discord:thread:123`)
@@ -2303,10 +2120,15 @@ async fn forward_delegation_response(
                     row.get::<_, i32>(5)?,
                 ))
             },
-        ).ok()
-    }).await.ok().flatten();
+        )
+        .ok()
+    })
+    .await
+    .ok()
+    .flatten();
 
-    let Some((_, callback_agent_id, channel_type, channel_id, thread_id, retry_count)) = callback else {
+    let Some((_, callback_agent_id, channel_type, channel_id, thread_id, retry_count)) = callback
+    else {
         // No callback registered — this is the legitimate case for purely
         // internal delegations (cron/reminder/heartbeat), but it is ALSO
         // what happened pre-v1.8.16 when a nested sub-agent's reply was
@@ -2349,10 +2171,17 @@ async fn forward_delegation_response(
     );
 
     match forward_to_channel(
-        home_dir, &channel_type, &channel_id, thread_id.as_deref(),
-        response_text, responder_agent, &callback_agent_id,
+        home_dir,
+        &channel_type,
+        &channel_id,
+        thread_id.as_deref(),
+        response_text,
+        responder_agent,
+        &callback_agent_id,
         chain_root.as_deref(),
-    ).await {
+    )
+    .await
+    {
         Ok(()) => {
             // v1.8.17 Fix 2 (Option A): forward succeeded — also persist the
             // sub-agent's reply into the PARENT agent's session history so
@@ -2375,7 +2204,8 @@ async fn forward_delegation_response(
                 chain_root.as_deref(),
                 responder_agent,
                 response_text,
-            ).await;
+            )
+            .await;
         }
         Err(e) => {
             let next_retry = retry_count + 1;
@@ -2567,8 +2397,8 @@ async fn append_subagent_reply_to_parent_session(
     let responder_for_log = responder_agent.to_string();
 
     let result = tokio::task::spawn_blocking(move || -> Result<Option<(String, bool)>, String> {
-        let conn = rusqlite::Connection::open(&db_path)
-            .map_err(|e| format!("open sessions.db: {e}"))?;
+        let conn =
+            rusqlite::Connection::open(&db_path).map_err(|e| format!("open sessions.db: {e}"))?;
         let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -2576,11 +2406,13 @@ async fn append_subagent_reply_to_parent_session(
         // owner matches either the direct parent OR the chain root.
         // Direct match wins if both are available for the same session.
         for sid in &candidates {
-            let existing: Option<String> = conn.query_row(
-                "SELECT agent_id FROM sessions WHERE id = ?1",
-                rusqlite::params![sid],
-                |row| row.get(0),
-            ).ok();
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT agent_id FROM sessions WHERE id = ?1",
+                    rusqlite::params![sid],
+                    |row| row.get(0),
+                )
+                .ok();
 
             let Some(owner) = existing else { continue };
 
@@ -2604,19 +2436,22 @@ async fn append_subagent_reply_to_parent_session(
                 "INSERT INTO session_messages (session_id, role, content, tokens, timestamp) \
                  VALUES (?1, 'assistant', ?2, ?3, ?4)",
                 rusqlite::params![sid, content, tokens, now],
-            ).map_err(|e| format!("insert session_messages: {e}"))?;
+            )
+            .map_err(|e| format!("insert session_messages: {e}"))?;
 
             conn.execute(
                 "UPDATE sessions SET total_tokens = total_tokens + ?1, last_active = ?2 \
                  WHERE id = ?3",
                 rusqlite::params![tokens, now, sid],
-            ).map_err(|e| format!("update sessions: {e}"))?;
+            )
+            .map_err(|e| format!("update sessions: {e}"))?;
 
             return Ok(Some((sid.clone(), is_relayed)));
         }
 
         Ok(None)
-    }).await;
+    })
+    .await;
 
     match result {
         Ok(Ok(Some((sid, is_relayed)))) => {
@@ -2724,7 +2559,8 @@ fn sanitize_for_channel(text: &str) -> String {
                 let mut result = line.to_string();
                 for prefix in &["/Users/", "/home/"] {
                     while let Some(start) = result.find(prefix) {
-                        let end = result[start..].find(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == ')')
+                        let end = result[start..]
+                            .find(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == ')')
                             .map(|e| start + e)
                             .unwrap_or(result.len());
                         result.replace_range(start..end, "[path]");
@@ -2752,21 +2588,29 @@ fn validate_channel_id(channel_type: &str, id: &str) -> Result<(), String> {
     let valid = match channel_type {
         "googlechat" => {
             id.starts_with("spaces/")
-                && id.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_')
+                && id
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_')
         }
-        "teams" => id.chars().all(|c| {
-            c.is_alphanumeric() || matches!(c, ':' | '@' | ';' | '=' | '-' | '_' | '.')
-        }),
-        _ => id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.'),
+        "teams" => id
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, ':' | '@' | ';' | '=' | '-' | '_' | '.')),
+        _ => id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.'),
     };
     if !valid {
-        return Err(format!("channel_id contains invalid characters for {channel_type}: {id}"));
+        return Err(format!(
+            "channel_id contains invalid characters for {channel_type}: {id}"
+        ));
     }
     // Discord snowflakes: 17-20 digit numbers (WP-4C — unified with the
     // duduclaw-core validator; only this check's implementation changed,
     // the rest of `validate_channel_id` is untouched).
     if channel_type == "discord" && !is_valid_discord_snowflake(id) {
-        return Err(format!("Discord channel_id must be numeric snowflake, got: {id}"));
+        return Err(format!(
+            "Discord channel_id must be numeric snowflake, got: {id}"
+        ));
     }
     // Telegram chat_id: signed integer (can be negative for groups)
     if channel_type == "telegram" && id.parse::<i64>().is_err() {
@@ -2881,9 +2725,15 @@ async fn forward_to_channel(
     match channel_type {
         "telegram" => {
             let token = resolve_forward_token(
-                home_dir, originating_agent, chain_root_agent, "telegram",
-                &config, "telegram_bot_token_enc", "telegram_bot_token",
-            ).await;
+                home_dir,
+                originating_agent,
+                chain_root_agent,
+                "telegram",
+                &config,
+                "telegram_bot_token_enc",
+                "telegram_bot_token",
+            )
+            .await;
             if token.is_empty() {
                 return Err("telegram_bot_token not configured".into());
             }
@@ -2899,8 +2749,14 @@ async fn forward_to_channel(
                         payload["message_thread_id"] = serde_json::json!(tid_num);
                     }
                 }
-                let resp = http.post(&url).json(&payload).send().await
-                    .map_err(|e| format!("telegram send chunk {}/{}: {}", i + 1, total, crate::secret_redact::redact_secrets(&e.to_string())))?;
+                let resp = http.post(&url).json(&payload).send().await.map_err(|e| {
+                    format!(
+                        "telegram send chunk {}/{}: {}",
+                        i + 1,
+                        total,
+                        crate::secret_redact::redact_secrets(&e.to_string())
+                    )
+                })?;
                 if !resp.status().is_success() {
                     // Retry without parse_mode in case Markdown causes issues on this chunk.
                     // A failure here (network error or non-2xx) MUST propagate as Err —
@@ -2914,40 +2770,65 @@ async fn forward_to_channel(
                         "chat_id": channel_id,
                         "text": body,
                     });
-                    let fallback_resp = http.post(&url).json(&fallback_payload).send().await
-                        .map_err(|e| format!("telegram fallback send chunk {}/{}: {e}", i + 1, total))?;
+                    let fallback_resp = http
+                        .post(&url)
+                        .json(&fallback_payload)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            format!("telegram fallback send chunk {}/{}: {e}", i + 1, total)
+                        })?;
                     if !fallback_resp.status().is_success() {
                         return Err(format!(
                             "Telegram API returned {} on chunk {}/{} (markdown and plain-text attempts both failed)",
-                            fallback_resp.status(), i + 1, total
+                            fallback_resp.status(),
+                            i + 1,
+                            total
                         ));
                     }
                 }
-                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+                if i + 1 < total {
+                    tokio::time::sleep(chunk_gap).await;
+                }
             }
         }
         "line" => {
             let token = resolve_forward_token(
-                home_dir, originating_agent, chain_root_agent, "line",
-                &config, "line_channel_token_enc", "line_channel_token",
-            ).await;
+                home_dir,
+                originating_agent,
+                chain_root_agent,
+                "line",
+                &config,
+                "line_channel_token_enc",
+                "line_channel_token",
+            )
+            .await;
             if token.is_empty() {
                 return Err("line_channel_token not configured".into());
             }
             let url = "https://api.line.me/v2/bot/message/push";
             for (i, body) in chunks.iter().enumerate() {
-                let resp = http.post(url)
+                let resp = http
+                    .post(url)
                     .header("Authorization", format!("Bearer {}", token))
                     .json(&serde_json::json!({
                         "to": channel_id,
                         "messages": [{"type": "text", "text": body}]
                     }))
-                    .send().await
+                    .send()
+                    .await
                     .map_err(|e| format!("line send chunk {}/{}: {e}", i + 1, total))?;
                 if !resp.status().is_success() {
-                    return Err(format!("LINE API returned {} on chunk {}/{}", resp.status(), i + 1, total));
+                    return Err(format!(
+                        "LINE API returned {} on chunk {}/{}",
+                        resp.status(),
+                        i + 1,
+                        total
+                    ));
                 }
-                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+                if i + 1 < total {
+                    tokio::time::sleep(chunk_gap).await;
+                }
             }
         }
         "discord" => {
@@ -2963,55 +2844,91 @@ async fn forward_to_channel(
             // the chain root (e.g. agnes) so only her bot can post into
             // it; inheriting her token here prevents the 401 loop.
             let token = resolve_forward_token(
-                home_dir, originating_agent, chain_root_agent, "discord",
-                &config, "discord_bot_token_enc", "discord_bot_token",
-            ).await;
+                home_dir,
+                originating_agent,
+                chain_root_agent,
+                "discord",
+                &config,
+                "discord_bot_token_enc",
+                "discord_bot_token",
+            )
+            .await;
             if token.is_empty() {
                 return Err("discord_bot_token not configured".into());
             }
             let target_channel = thread_id.unwrap_or(channel_id);
-            let url = format!("https://discord.com/api/v10/channels/{}/messages", target_channel);
+            let url = format!(
+                "https://discord.com/api/v10/channels/{}/messages",
+                target_channel
+            );
             for (i, body) in chunks.iter().enumerate() {
-                let resp = http.post(&url)
+                let resp = http
+                    .post(&url)
                     .header("Authorization", format!("Bot {}", token))
                     .json(&serde_json::json!({ "content": body }))
-                    .send().await
+                    .send()
+                    .await
                     .map_err(|e| format!("discord send chunk {}/{}: {e}", i + 1, total))?;
                 if !resp.status().is_success() {
-                    return Err(format!("Discord API returned {} on chunk {}/{}", resp.status(), i + 1, total));
+                    return Err(format!(
+                        "Discord API returned {} on chunk {}/{}",
+                        resp.status(),
+                        i + 1,
+                        total
+                    ));
                 }
-                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+                if i + 1 < total {
+                    tokio::time::sleep(chunk_gap).await;
+                }
             }
         }
         "slack" => {
             let token = resolve_forward_token(
-                home_dir, originating_agent, chain_root_agent, "slack",
-                &config, "slack_bot_token_enc", "slack_bot_token",
-            ).await;
+                home_dir,
+                originating_agent,
+                chain_root_agent,
+                "slack",
+                &config,
+                "slack_bot_token_enc",
+                "slack_bot_token",
+            )
+            .await;
             if token.is_empty() {
                 return Err("slack_bot_token not configured".into());
             }
             let url = "https://slack.com/api/chat.postMessage";
             for (i, body) in chunks.iter().enumerate() {
-                let resp = http.post(url)
+                let resp = http
+                    .post(url)
                     .header("Authorization", format!("Bearer {}", token))
                     .json(&serde_json::json!({
                         "channel": channel_id,
                         "text": body,
                         "thread_ts": thread_id,
                     }))
-                    .send().await
+                    .send()
+                    .await
                     .map_err(|e| format!("slack send chunk {}/{}: {e}", i + 1, total))?;
                 if !resp.status().is_success() {
-                    return Err(format!("Slack API returned {} on chunk {}/{}", resp.status(), i + 1, total));
+                    return Err(format!(
+                        "Slack API returned {} on chunk {}/{}",
+                        resp.status(),
+                        i + 1,
+                        total
+                    ));
                 }
-                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+                if i + 1 < total {
+                    tokio::time::sleep(chunk_gap).await;
+                }
             }
         }
         "whatsapp" => {
             let config_table = config.as_table().ok_or("config.toml is not a table")?;
             let token = crate::config_crypto::decrypt_config_field_async(
-                config_table, "channels", "whatsapp_access_token", home_dir,
+                config_table,
+                "channels",
+                "whatsapp_access_token",
+                home_dir,
             )
             .await
             .map(|s| s.expose_owned())
@@ -3023,12 +2940,15 @@ async fn forward_to_channel(
                 .unwrap_or("")
                 .to_string();
             if token.is_empty() || phone_id.is_empty() {
-                return Err("whatsapp_access_token / whatsapp_phone_number_id not configured".into());
+                return Err(
+                    "whatsapp_access_token / whatsapp_phone_number_id not configured".into(),
+                );
             }
             let url = format!("https://graph.facebook.com/v20.0/{phone_id}/messages");
             for (i, body) in chunks.iter().enumerate() {
                 let text = crate::markdown_render::to_whatsapp_text(body);
-                let resp = http.post(&url)
+                let resp = http
+                    .post(&url)
                     .bearer_auth(&token)
                     .json(&serde_json::json!({
                         "messaging_product": "whatsapp",
@@ -3036,24 +2956,38 @@ async fn forward_to_channel(
                         "type": "text",
                         "text": { "body": text }
                     }))
-                    .send().await
+                    .send()
+                    .await
                     .map_err(|e| format!("whatsapp send chunk {}/{}: {e}", i + 1, total))?;
                 if !resp.status().is_success() {
-                    return Err(format!("WhatsApp API returned {} on chunk {}/{}", resp.status(), i + 1, total));
+                    return Err(format!(
+                        "WhatsApp API returned {} on chunk {}/{}",
+                        resp.status(),
+                        i + 1,
+                        total
+                    ));
                 }
-                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+                if i + 1 < total {
+                    tokio::time::sleep(chunk_gap).await;
+                }
             }
         }
         "feishu" => {
             let config_table = config.as_table().ok_or("config.toml is not a table")?;
             let app_id = crate::config_crypto::decrypt_config_field_async(
-                config_table, "channels", "feishu_app_id", home_dir,
+                config_table,
+                "channels",
+                "feishu_app_id",
+                home_dir,
             )
             .await
             .map(|s| s.expose_owned())
             .unwrap_or_default();
             let app_secret = crate::config_crypto::decrypt_config_field_async(
-                config_table, "channels", "feishu_app_secret", home_dir,
+                config_table,
+                "channels",
+                "feishu_app_secret",
+                home_dir,
             )
             .await
             .map(|s| s.expose_owned())
@@ -3066,9 +3000,12 @@ async fn forward_to_channel(
             let token_resp = http
                 .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
                 .json(&serde_json::json!({ "app_id": app_id, "app_secret": app_secret }))
-                .send().await
+                .send()
+                .await
                 .map_err(|e| format!("feishu token: {e}"))?;
-            let token_body: serde_json::Value = token_resp.json().await
+            let token_body: serde_json::Value = token_resp
+                .json()
+                .await
                 .map_err(|e| format!("feishu token parse: {e}"))?;
             let token = token_body
                 .get("tenant_access_token")
@@ -3085,12 +3022,20 @@ async fn forward_to_channel(
                         "msg_type": "text",
                         "content": content,
                     }))
-                    .send().await
+                    .send()
+                    .await
                     .map_err(|e| format!("feishu send chunk {}/{}: {e}", i + 1, total))?;
                 if !resp.status().is_success() {
-                    return Err(format!("Feishu API returned {} on chunk {}/{}", resp.status(), i + 1, total));
+                    return Err(format!(
+                        "Feishu API returned {} on chunk {}/{}",
+                        resp.status(),
+                        i + 1,
+                        total
+                    ));
                 }
-                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+                if i + 1 < total {
+                    tokio::time::sleep(chunk_gap).await;
+                }
             }
         }
         "googlechat" => {
@@ -3098,7 +3043,9 @@ async fn forward_to_channel(
                 crate::googlechat::send_text_to_space(home_dir, channel_id, body)
                     .await
                     .map_err(|e| format!("googlechat send chunk {}/{}: {e}", i + 1, total))?;
-                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+                if i + 1 < total {
+                    tokio::time::sleep(chunk_gap).await;
+                }
             }
         }
         "teams" => {
@@ -3106,7 +3053,9 @@ async fn forward_to_channel(
                 crate::msteams::send_text_to_conversation(home_dir, channel_id, body)
                     .await
                     .map_err(|e| format!("teams send chunk {}/{}: {e}", i + 1, total))?;
-                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+                if i + 1 < total {
+                    tokio::time::sleep(chunk_gap).await;
+                }
             }
         }
         "wecom" => {
@@ -3116,7 +3065,9 @@ async fn forward_to_channel(
                 crate::wecom::send_text_via_config(home_dir, channel_id, body)
                     .await
                     .map_err(|e| format!("wecom send chunk {}/{}: {e}", i + 1, total))?;
-                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+                if i + 1 < total {
+                    tokio::time::sleep(chunk_gap).await;
+                }
             }
         }
         "dingtalk" => {
@@ -3126,7 +3077,9 @@ async fn forward_to_channel(
                 crate::dingtalk::send_text_to_conversation(home_dir, channel_id, body)
                     .await
                     .map_err(|e| format!("dingtalk send chunk {}/{}: {e}", i + 1, total))?;
-                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+                if i + 1 < total {
+                    tokio::time::sleep(chunk_gap).await;
+                }
             }
         }
         other => {
@@ -3185,7 +3138,9 @@ async fn resolve_forward_token(
         home_dir,
         callback_agent_id,
         channel,
-    ).await {
+    )
+    .await
+    {
         return tok.expose_owned();
     }
     // 3: origin_agent + its reports_to cascade (covers the case where
@@ -3193,7 +3148,9 @@ async fn resolve_forward_token(
     if let Some(root) = origin_agent.filter(|s| !s.is_empty() && *s != callback_agent_id) {
         if let Some(tok) = crate::config_crypto::resolve_agent_channel_token_via_reports_to(
             home_dir, root, channel,
-        ).await {
+        )
+        .await
+        {
             return tok.expose_owned();
         }
     }
@@ -3234,7 +3191,12 @@ fn lookup_origin_agent(home_dir: &Path, message_id: &str) -> Option<String> {
 /// global channel token that is itself a network-backed `secret://` reference
 /// resolves instead of failing closed (the caller already parsed `config`, so
 /// this reuses it rather than re-reading `config.toml`).
-async fn get_config_token(config: &toml::Value, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
+async fn get_config_token(
+    config: &toml::Value,
+    enc_key: &str,
+    plain_key: &str,
+    home_dir: &Path,
+) -> String {
     debug_assert_eq!(
         enc_key,
         format!("{plain_key}_enc"),
@@ -3344,7 +3306,12 @@ async fn lookup_task_source_channel(home_dir: &Path, task_id: &str) -> Option<(S
         conn.query_row(
             "SELECT source_channel, source_chat_id FROM tasks WHERE id = ?1",
             rusqlite::params![id],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
         )
         .ok()
     })
@@ -3359,7 +3326,9 @@ async fn lookup_task_source_channel(home_dir: &Path, task_id: &str) -> Option<(S
 
 /// Read + parse `config.toml`. Shared by the typing-guard resolvers below.
 async fn read_config_toml(home_dir: &Path) -> Option<toml::Value> {
-    let config_str = tokio::fs::read_to_string(home_dir.join("config.toml")).await.ok()?;
+    let config_str = tokio::fs::read_to_string(home_dir.join("config.toml"))
+        .await
+        .ok()?;
     config_str.parse().ok()
 }
 
@@ -3385,15 +3354,27 @@ async fn build_typing_guard_for_message(
     }
     let config = read_config_toml(home_dir).await?;
     let token = resolve_forward_token(
-        home_dir, &callback_agent, origin_agent, "telegram",
-        &config, "telegram_bot_token_enc", "telegram_bot_token",
-    ).await;
+        home_dir,
+        &callback_agent,
+        origin_agent,
+        "telegram",
+        &config,
+        "telegram_bot_token_enc",
+        "telegram_bot_token",
+    )
+    .await;
     let guard = crate::channel_typing::typing_guard_for(
-        forward_http().clone(), "telegram", &channel_id, thread_id.as_deref(), &token,
+        forward_http().clone(),
+        "telegram",
+        &channel_id,
+        thread_id.as_deref(),
+        &token,
     );
     if guard.is_none() {
         tracing::debug!(
-            message_id, channel_id, has_token = !token.is_empty(),
+            message_id,
+            channel_id,
+            has_token = !token.is_empty(),
             "typing guard: could not start telegram indicator for dispatched message"
         );
     }
@@ -3429,11 +3410,21 @@ async fn build_typing_guard_for_sqlite_message(
     }
     let config = read_config_toml(home_dir).await?;
     let token = resolve_forward_token(
-        home_dir, assigned_agent, None, "telegram",
-        &config, "telegram_bot_token_enc", "telegram_bot_token",
-    ).await;
+        home_dir,
+        assigned_agent,
+        None,
+        "telegram",
+        &config,
+        "telegram_bot_token_enc",
+        "telegram_bot_token",
+    )
+    .await;
     crate::channel_typing::typing_guard_for(
-        forward_http().clone(), "telegram", &source_chat_id, None, &token,
+        forward_http().clone(),
+        "telegram",
+        &source_chat_id,
+        None,
+        &token,
     )
 }
 
@@ -3452,9 +3443,15 @@ mod tests {
              ⏵⏵ auto mode on (shift+tab to cycle)";
         let out = prepare_channel_text(input);
         assert!(out.contains("任務完成，共處理 3 筆。"));
-        assert!(!out.contains("CLAUDE_CODE_CHILD_SESSION"), "runtime chrome survived: {out}");
+        assert!(
+            !out.contains("CLAUDE_CODE_CHILD_SESSION"),
+            "runtime chrome survived: {out}"
+        );
         assert!(!out.contains("auto mode on"), "mode footer survived: {out}");
-        assert!(!out.contains("DUDUCLAW_SYSTEM"), "internal marker survived: {out}");
+        assert!(
+            !out.contains("DUDUCLAW_SYSTEM"),
+            "internal marker survived: {out}"
+        );
     }
 
     /// Same path, negative case: an ordinary answer that merely discusses the
@@ -3513,7 +3510,9 @@ mod tests {
         let registry = Arc::new(RwLock::new(AgentRegistry::new(home.join("agents"))));
         // Returns without spawning anything: a denied message never reaches
         // `to_dispatch`, so no Claude CLI process is started.
-        poll_and_dispatch(&home, &registry, None, None).await.unwrap();
+        poll_and_dispatch(&home, &registry, None, None)
+            .await
+            .unwrap();
 
         let content = std::fs::read_to_string(&queue_path).unwrap();
         let lines: Vec<serde_json::Value> = content
@@ -3521,7 +3520,11 @@ mod tests {
             .filter(|l| !l.trim().is_empty())
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(lines.len(), 1, "expected exactly the denial response: {content}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly the denial response: {content}"
+        );
         let resp = &lines[0];
         assert_eq!(resp["type"], "agent_response");
         assert_eq!(resp["in_reply_to"], "forged-1");
@@ -3529,11 +3532,20 @@ mod tests {
         // WP21 collateral fix: the requester-facing notice is now the short
         // human sentence (no "委派遭拒" / config.toml / reports_to jargon) —
         // the full explanation stays in the audit record below.
-        assert!(payload.contains("這項委派未執行"), "zh-TW notice missing: {payload}");
+        assert!(
+            payload.contains("這項委派未執行"),
+            "zh-TW notice missing: {payload}"
+        );
         assert!(payload.contains("sales_rep") && payload.contains("mkt_rep"));
-        assert!(!payload.contains("config.toml"), "internal jargon leaked: {payload}");
+        assert!(
+            !payload.contains("config.toml"),
+            "internal jargon leaked: {payload}"
+        );
         // The original task is gone — a denial is terminal, not a retry loop.
-        assert!(!content.contains("\"agent_message\""), "task survived: {content}");
+        assert!(
+            !content.contains("\"agent_message\""),
+            "task survived: {content}"
+        );
 
         let audit = std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap();
         let event: serde_json::Value = serde_json::from_str(audit.lines().next().unwrap()).unwrap();
@@ -3542,7 +3554,9 @@ mod tests {
         assert_eq!(event["details"]["reason"], "different_department");
 
         // Second poll: nothing left to gate, so no second denial is emitted.
-        poll_and_dispatch(&home, &registry, None, None).await.unwrap();
+        poll_and_dispatch(&home, &registry, None, None)
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(home.join("security_audit.jsonl"))
                 .unwrap()
@@ -3617,7 +3631,10 @@ mod tests {
         // WP21 collateral fix: task-status write-back is the short human
         // notice, not the internal-jargon-laden `message_zh()` text.
         assert!(err.contains("這項委派未執行"), "{err}");
-        assert!(!err.contains("config.toml"), "internal jargon leaked: {err}");
+        assert!(
+            !err.contains("config.toml"),
+            "internal jargon leaked: {err}"
+        );
         assert_eq!(spec.status, TaskStatus::Failed);
         assert_eq!(spec.steps[0].status, StepStatus::Failed);
         // Terminal, not a retry ladder — the relation will not change by waiting.
@@ -3720,7 +3737,9 @@ mod tests {
         let sm = SessionManager::new(&db_path).unwrap();
         sm.get_or_create(session_id, parent_agent).await.unwrap();
         // Seed a user turn so the parent's history isn't empty.
-        sm.append_message(session_id, "user", "parent turn", 5).await.unwrap();
+        sm.append_message(session_id, "user", "parent turn", 5)
+            .await
+            .unwrap();
         (tmp, home)
     }
 
@@ -3737,12 +3756,17 @@ mod tests {
             None,
             "duduclaw-tl",
             "方案 A / B / C — which do you prefer?",
-        ).await;
+        )
+        .await;
 
         // Re-open the session store and verify the turn landed.
         let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
         let msgs = sm.get_messages("telegram:42").await.unwrap();
-        assert_eq!(msgs.len(), 2, "expected user turn + appended assistant turn");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "expected user turn + appended assistant turn"
+        );
         assert_eq!(msgs[1].role, "assistant");
         assert!(msgs[1].content.contains("方案 A / B / C"));
         assert!(msgs[1].tokens > 0, "tokens should be estimated > 0");
@@ -3761,7 +3785,8 @@ mod tests {
             None,
             "duduclaw-tl",
             "Here are three options.",
-        ).await;
+        )
+        .await;
 
         let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
         let msgs = sm.get_messages("telegram:99").await.unwrap();
@@ -3820,7 +3845,8 @@ mod tests {
             None,
             "duduclaw-tl",
             "reply text",
-        ).await;
+        )
+        .await;
         // Reaching this line == test passes.
     }
 
@@ -3840,7 +3866,8 @@ mod tests {
             None,
             "duduclaw-tl",
             "reply",
-        ).await;
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3858,7 +3885,8 @@ mod tests {
             None,
             "duduclaw-tl",
             "thread reply",
-        ).await;
+        )
+        .await;
 
         let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
         let msgs = sm.get_messages("discord:thread:9876").await.unwrap();
@@ -3877,11 +3905,12 @@ mod tests {
             "telegram",
             "100",
             None,
-            "agnes",  // ← expected parent, but session belongs to other_agent
-            None,     // no chain root provided
+            "agnes", // ← expected parent, but session belongs to other_agent
+            None,    // no chain root provided
             "duduclaw-tl",
             "should not be appended",
-        ).await;
+        )
+        .await;
 
         let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
         let msgs = sm.get_messages("telegram:100").await.unwrap();
@@ -3910,19 +3939,25 @@ mod tests {
             "discord",
             "555",
             None,
-            "duduclaw-tl",           // parent agent (callback.agent_id) — no session
-            Some("agnes"),           // chain root (message.origin_agent) — has session
+            "duduclaw-tl", // parent agent (callback.agent_id) — no session
+            Some("agnes"), // chain root (message.origin_agent) — has session
             "duduclaw-eng-agent",
             "Engineer report: infrastructure ready",
-        ).await;
+        )
+        .await;
 
         let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
         let msgs = sm.get_messages("discord:thread:555").await.unwrap();
-        assert_eq!(msgs.len(), 2, "engineer reply should land in agnes's session");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "engineer reply should land in agnes's session"
+        );
         assert_eq!(msgs[1].role, "assistant");
         assert!(
             msgs[1].content.contains("Engineer report"),
-            "content preserved: {}", msgs[1].content
+            "content preserved: {}",
+            msgs[1].content
         );
     }
 
@@ -3943,12 +3978,17 @@ mod tests {
             Some("agnes"),
             "duduclaw-eng-infra",
             "infra topology finalised",
-        ).await;
+        )
+        .await;
 
         let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
         let content = sm
-            .get_messages("discord:thread:42").await.unwrap()
-            .pop().unwrap().content;
+            .get_messages("discord:thread:42")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .content;
         assert!(
             content.contains("agent=\"duduclaw-eng-infra\""),
             "responder must be in `agent=...`: {content}"
@@ -3972,16 +4012,21 @@ mod tests {
             "discord",
             "1",
             None,
-            "agnes",          // parent_agent_id == session owner → direct path
-            Some("agnes"),    // chain_root == parent (self-loop)
+            "agnes",       // parent_agent_id == session owner → direct path
+            Some("agnes"), // chain_root == parent (self-loop)
             "duduclaw-tl",
             "dispatch ack",
-        ).await;
+        )
+        .await;
 
         let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
         let content = sm
-            .get_messages("discord:thread:1").await.unwrap()
-            .pop().unwrap().content;
+            .get_messages("discord:thread:1")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .content;
         assert!(content.contains("<subagent_reply agent=\"duduclaw-tl\">"));
         assert!(
             !content.contains("via="),
@@ -4000,16 +4045,18 @@ mod tests {
             "telegram",
             "200",
             None,
-            "duduclaw-tl",       // parent — no session match
-            Some("agnes"),       // chain root — no session match either
+            "duduclaw-tl", // parent — no session match
+            Some("agnes"), // chain root — no session match either
             "duduclaw-eng-agent",
             "leaked content",
-        ).await;
+        )
+        .await;
 
         let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
         let msgs = sm.get_messages("telegram:200").await.unwrap();
         assert_eq!(
-            msgs.len(), 1,
+            msgs.len(),
+            1,
             "third-agent's session must stay untouched (cross-agent bleed guard)"
         );
         assert_eq!(msgs[0].role, "user");
@@ -4128,13 +4175,21 @@ bot_token = "{token}"
         write_agent_with_channel_token(tmp.path(), "duduclaw-tl", "discord", "TL_OWN_TOKEN");
         write_agent_with_channel_token(tmp.path(), "agnes", "discord", "AGNES_TOKEN");
         write_global_config(tmp.path(), "discord_bot_token", "GLOBAL_STALE");
-        let config: toml::Value =
-            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap().parse().unwrap();
+        let config: toml::Value = std::fs::read_to_string(tmp.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
 
         let token = resolve_forward_token(
-            tmp.path(), "duduclaw-tl", Some("agnes"), "discord",
-            &config, "discord_bot_token_enc", "discord_bot_token",
-        ).await;
+            tmp.path(),
+            "duduclaw-tl",
+            Some("agnes"),
+            "discord",
+            &config,
+            "discord_bot_token_enc",
+            "discord_bot_token",
+        )
+        .await;
         assert_eq!(token, "TL_OWN_TOKEN");
     }
 
@@ -4147,13 +4202,21 @@ bot_token = "{token}"
         write_agent_with_channel_token(tmp.path(), "agnes", "discord", "AGNES_TOKEN");
         // Intentionally no duduclaw-tl/agent.toml at all.
         write_global_config(tmp.path(), "discord_bot_token", "GLOBAL_STALE_401");
-        let config: toml::Value =
-            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap().parse().unwrap();
+        let config: toml::Value = std::fs::read_to_string(tmp.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
 
         let token = resolve_forward_token(
-            tmp.path(), "duduclaw-tl", Some("agnes"), "discord",
-            &config, "discord_bot_token_enc", "discord_bot_token",
-        ).await;
+            tmp.path(),
+            "duduclaw-tl",
+            Some("agnes"),
+            "discord",
+            &config,
+            "discord_bot_token_enc",
+            "discord_bot_token",
+        )
+        .await;
         assert_eq!(
             token, "AGNES_TOKEN",
             "Nested sub-agent forward should inherit chain-root's per-agent token, \
@@ -4166,13 +4229,21 @@ bot_token = "{token}"
         let tmp = tempfile::tempdir().unwrap();
         // Neither agent has a [channels.discord] block.
         write_global_config(tmp.path(), "discord_bot_token", "GLOBAL_ONLY");
-        let config: toml::Value =
-            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap().parse().unwrap();
+        let config: toml::Value = std::fs::read_to_string(tmp.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
 
         let token = resolve_forward_token(
-            tmp.path(), "duduclaw-tl", Some("agnes"), "discord",
-            &config, "discord_bot_token_enc", "discord_bot_token",
-        ).await;
+            tmp.path(),
+            "duduclaw-tl",
+            Some("agnes"),
+            "discord",
+            &config,
+            "discord_bot_token_enc",
+            "discord_bot_token",
+        )
+        .await;
         assert_eq!(token, "GLOBAL_ONLY");
     }
 
@@ -4183,13 +4254,21 @@ bot_token = "{token}"
         // chain-root tier and go straight to global.
         let tmp = tempfile::tempdir().unwrap();
         write_global_config(tmp.path(), "discord_bot_token", "GLOBAL_TOKEN");
-        let config: toml::Value =
-            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap().parse().unwrap();
+        let config: toml::Value = std::fs::read_to_string(tmp.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
 
         let token = resolve_forward_token(
-            tmp.path(), "agnes", Some("agnes"), "discord",
-            &config, "discord_bot_token_enc", "discord_bot_token",
-        ).await;
+            tmp.path(),
+            "agnes",
+            Some("agnes"),
+            "discord",
+            &config,
+            "discord_bot_token_enc",
+            "discord_bot_token",
+        )
+        .await;
         assert_eq!(token, "GLOBAL_TOKEN");
     }
 
@@ -4200,13 +4279,21 @@ bot_token = "{token}"
         // (no root hop) → global.
         let tmp = tempfile::tempdir().unwrap();
         write_global_config(tmp.path(), "discord_bot_token", "GLOBAL_TOKEN");
-        let config: toml::Value =
-            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap().parse().unwrap();
+        let config: toml::Value = std::fs::read_to_string(tmp.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
 
         let token = resolve_forward_token(
-            tmp.path(), "duduclaw-tl", None, "discord",
-            &config, "discord_bot_token_enc", "discord_bot_token",
-        ).await;
+            tmp.path(),
+            "duduclaw-tl",
+            None,
+            "discord",
+            &config,
+            "discord_bot_token_enc",
+            "discord_bot_token",
+        )
+        .await;
         assert_eq!(token, "GLOBAL_TOKEN");
     }
 
@@ -4229,10 +4316,14 @@ bot_token = "{token}"
             VALUES ('m1','duduclaw-tl','duduclaw-marketing','hi','2026-04-21T12:34:25','agnes');
             INSERT INTO message_queue (id, sender, target, payload, created_at)
             VALUES ('m2','duduclaw-tl','duduclaw-marketing','hi','2026-04-21T12:34:25');",
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
-        assert_eq!(lookup_origin_agent(tmp.path(), "m1").as_deref(), Some("agnes"));
+        assert_eq!(
+            lookup_origin_agent(tmp.path(), "m1").as_deref(),
+            Some("agnes")
+        );
         assert_eq!(lookup_origin_agent(tmp.path(), "m2"), None);
         assert_eq!(lookup_origin_agent(tmp.path(), "nonexistent"), None);
     }
@@ -4308,14 +4399,16 @@ bot_token = "{token}"
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );",
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO message_queue (id, sender, target, payload, status, \
              response, created_at, completed_at, reply_channel, origin_agent) \
              VALUES (?1, ?2, ?3, 'payload', 'done', ?4, '2026-04-21T12:34:25', \
              '2026-04-21T12:35:48', ?5, ?2)",
             rusqlite::params![id, sender, target, response, reply_channel],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -4323,7 +4416,14 @@ bot_token = "{token}"
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         let mid = "peek-test-1";
-        setup_done_message(home, mid, "duduclaw-tl", "duduclaw-marketing", "the report", None);
+        setup_done_message(
+            home,
+            mid,
+            "duduclaw-tl",
+            "duduclaw-marketing",
+            "the report",
+            None,
+        );
 
         let conn = rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
         conn.execute(
@@ -4333,20 +4433,30 @@ bot_token = "{token}"
         ).unwrap();
         drop(conn);
 
-        let peeked = peek_callback(home, mid).await.expect("callback row present");
-        assert_eq!(peeked, (
-            "duduclaw-marketing".to_string(),
-            "telegram".to_string(),
-            "12345".to_string(),
-            Some("7".to_string()),
-        ));
+        let peeked = peek_callback(home, mid)
+            .await
+            .expect("callback row present");
+        assert_eq!(
+            peeked,
+            (
+                "duduclaw-marketing".to_string(),
+                "telegram".to_string(),
+                "12345".to_string(),
+                Some("7".to_string()),
+            )
+        );
 
         // Unlike `forward_delegation_response`'s DELETE RETURNING, the row
         // must still be there — `forward_delegation_response` still needs
         // to consume it later once the response is ready.
-        let count: i64 = rusqlite::Connection::open(home.join("message_queue.db")).unwrap()
-            .query_row("SELECT COUNT(*) FROM delegation_callbacks WHERE message_id=?1",
-                rusqlite::params![mid], |r| r.get(0)).unwrap();
+        let count: i64 = rusqlite::Connection::open(home.join("message_queue.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM delegation_callbacks WHERE message_id=?1",
+                rusqlite::params![mid],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1, "peek_callback must not consume the row");
 
         // A message with no registered callback yields None (expected for
@@ -4360,13 +4470,19 @@ bot_token = "{token}"
         assert_eq!(extract_goal_loop_task_id(payload), Some("abc-123"));
 
         // Non-goal-loop payloads (plain send_to_agent messages) yield None.
-        assert_eq!(extract_goal_loop_task_id("just a normal delegation payload"), None);
+        assert_eq!(
+            extract_goal_loop_task_id("just a normal delegation payload"),
+            None
+        );
     }
 
     #[test]
     fn extract_goal_loop_task_id_and_round_parses_both() {
         let payload = "[goal-loop task_id=abc-123 iter=2] 你有一個自主目標任務要推進:\n...";
-        assert_eq!(extract_goal_loop_task_id_and_round(payload), Some(("abc-123", 2)));
+        assert_eq!(
+            extract_goal_loop_task_id_and_round(payload),
+            Some(("abc-123", 2))
+        );
     }
 
     #[test]
@@ -4425,10 +4541,18 @@ bot_token = "{token}"
         row2.source_channel = None;
         row2.source_chat_id = None;
         store.insert_task(&row2).await.expect("insert task");
-        assert!(lookup_task_source_channel(home, "plain-task-1").await.is_none());
+        assert!(
+            lookup_task_source_channel(home, "plain-task-1")
+                .await
+                .is_none()
+        );
 
         // Unknown task id yields None.
-        assert!(lookup_task_source_channel(home, "no-such-task").await.is_none());
+        assert!(
+            lookup_task_source_channel(home, "no-such-task")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4436,7 +4560,14 @@ bot_token = "{token}"
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         let mid = "78fbcfc8-735b-4053-9ee0-a03543fd904f";
-        setup_done_message(home, mid, "duduclaw-tl", "duduclaw-marketing", "the report", None);
+        setup_done_message(
+            home,
+            mid,
+            "duduclaw-tl",
+            "duduclaw-marketing",
+            "the report",
+            None,
+        );
 
         // A live callback exists (the dispatcher re-inserted it after the
         // HTTP POST got 401). Dry-run should surface it without mutating
@@ -4451,7 +4582,12 @@ bot_token = "{token}"
 
         let outcome = reforward_message(home, mid, true).await.expect("dry-run");
         match outcome {
-            ReforwardOutcome::DryRun { channel_type, channel_id, thread_id, has_existing_callback } => {
+            ReforwardOutcome::DryRun {
+                channel_type,
+                channel_id,
+                thread_id,
+                has_existing_callback,
+            } => {
                 assert_eq!(channel_type, "discord");
                 assert_eq!(channel_id, "1496095418805780591");
                 assert_eq!(thread_id, None);
@@ -4461,9 +4597,14 @@ bot_token = "{token}"
         }
 
         // Dry-run must NOT have consumed the callback.
-        let count: i64 = rusqlite::Connection::open(home.join("message_queue.db")).unwrap()
-            .query_row("SELECT COUNT(*) FROM delegation_callbacks WHERE message_id=?1",
-                rusqlite::params![mid], |r| r.get(0)).unwrap();
+        let count: i64 = rusqlite::Connection::open(home.join("message_queue.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM delegation_callbacks WHERE message_id=?1",
+                rusqlite::params![mid],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1, "dry-run must not touch delegation_callbacks");
     }
 
@@ -4477,13 +4618,22 @@ bot_token = "{token}"
         let home = tmp.path();
         let mid = "m1";
         setup_done_message(
-            home, mid, "duduclaw-tl", "duduclaw-marketing", "the report",
+            home,
+            mid,
+            "duduclaw-tl",
+            "duduclaw-marketing",
+            "the report",
             Some("discord:thread:1496095418805780591"),
         );
 
         let outcome = reforward_message(home, mid, true).await.expect("dry-run");
         match outcome {
-            ReforwardOutcome::DryRun { channel_type, channel_id, has_existing_callback, .. } => {
+            ReforwardOutcome::DryRun {
+                channel_type,
+                channel_id,
+                has_existing_callback,
+                ..
+            } => {
                 assert_eq!(channel_type, "discord");
                 assert_eq!(channel_id, "1496095418805780591");
                 assert!(!has_existing_callback);
@@ -4510,12 +4660,14 @@ bot_token = "{token}"
                 created_at TEXT NOT NULL, acked_at TEXT, completed_at TEXT,
                 reply_channel TEXT
             );",
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO message_queue (id, sender, target, payload, status, created_at) \
              VALUES (?1, 'a', 'b', 'p', 'pending', '2026-01-01T00:00:00Z')",
             rusqlite::params![mid],
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
         let err = reforward_message(home, mid, true).await.unwrap_err();
@@ -4526,7 +4678,9 @@ bot_token = "{token}"
     async fn reforward_rejects_missing_message() {
         let tmp = tempfile::tempdir().unwrap();
         setup_done_message(tmp.path(), "exists", "a", "b", "hi", None);
-        let err = reforward_message(tmp.path(), "does-not-exist", true).await.unwrap_err();
+        let err = reforward_message(tmp.path(), "does-not-exist", true)
+            .await
+            .unwrap_err();
         assert!(err.contains("No message with id"), "got: {err}");
     }
 
@@ -4545,7 +4699,10 @@ bot_token = "{token}"
         let tmp = tempfile::tempdir().unwrap();
         setup_done_message(tmp.path(), "m1", "a", "b", "ok", None);
         let err = reforward_message(tmp.path(), "m1", true).await.unwrap_err();
-        assert!(err.contains("Cannot determine where to forward"), "got: {err}");
+        assert!(
+            err.contains("Cannot determine where to forward"),
+            "got: {err}"
+        );
     }
 
     // ── WP-OS: proactive_notification consumption ──
@@ -4609,7 +4766,14 @@ bot_token = "{token}"
         // Control: with no config.toml the forward fails loudly, proving the
         // test actually reaches the send path.
         let control = forward_to_channel(
-            dir.path(), "telegram", "12345", None, "回報", "bob", "alice", None,
+            dir.path(),
+            "telegram",
+            "12345",
+            None,
+            "回報",
+            "bob",
+            "alice",
+            None,
         )
         .await;
         assert!(control.is_err(), "control: unconfigured forward must error");
@@ -4617,7 +4781,14 @@ bot_token = "{token}"
         begin_takeover(dir.path(), "telegram", "12345");
         assert!(
             forward_to_channel(
-                dir.path(), "telegram", "12345", None, "回報", "bob", "alice", None,
+                dir.path(),
+                "telegram",
+                "12345",
+                None,
+                "回報",
+                "bob",
+                "alice",
+                None,
             )
             .await
             .is_ok(),
@@ -4631,11 +4802,20 @@ bot_token = "{token}"
         // Holding the parent chat also holds forwards addressed at a thread
         // inside it — the safe direction is silence.
         begin_takeover(dir.path(), "telegram", "12345");
-        assert!(forward_to_channel(
-            dir.path(), "telegram", "12345", Some("77"), "回報", "bob", "alice", None,
-        )
-        .await
-        .is_ok());
+        assert!(
+            forward_to_channel(
+                dir.path(),
+                "telegram",
+                "12345",
+                Some("77"),
+                "回報",
+                "bob",
+                "alice",
+                None,
+            )
+            .await
+            .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -4644,7 +4824,14 @@ bot_token = "{token}"
         begin_takeover(dir.path(), "telegram", "12345");
         assert!(
             forward_to_channel(
-                dir.path(), "telegram", "99999", None, "回報", "bob", "alice", None,
+                dir.path(),
+                "telegram",
+                "99999",
+                None,
+                "回報",
+                "bob",
+                "alice",
+                None,
             )
             .await
             .is_err(),

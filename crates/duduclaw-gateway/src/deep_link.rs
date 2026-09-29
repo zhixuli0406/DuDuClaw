@@ -148,7 +148,10 @@ mod tests {
     #[test]
     fn base_url_falls_back_to_localhost_port() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[gateway]\nbind = \"127.0.0.1\"\nport = 18789\n");
+        write_config(
+            dir.path(),
+            "[gateway]\nbind = \"127.0.0.1\"\nport = 18789\n",
+        );
         assert_eq!(
             dashboard_base_url(dir.path()),
             Some("http://localhost:18789".to_string())

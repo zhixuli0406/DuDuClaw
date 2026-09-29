@@ -72,10 +72,7 @@ impl AuthManager {
         let mut bytes = [0u8; 32];
         rng.fill(&mut bytes).expect("RNG should not fail");
 
-        let b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &bytes,
-        );
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
         (
             b64,
             Challenge {
@@ -94,29 +91,26 @@ impl AuthManager {
     /// Returns `Ok(())` on success; an error on any failure (invalid key,
     /// bad signature, or expired challenge).
     pub fn verify_ed25519(&self, signature_b64: &str, challenge: &Challenge) -> Result<()> {
-        let pubkey_bytes = self.ed25519_pubkey.as_ref().ok_or_else(|| {
-            DuDuClawError::Security("Ed25519 not configured".to_owned())
-        })?;
+        let pubkey_bytes = self
+            .ed25519_pubkey
+            .as_ref()
+            .ok_or_else(|| DuDuClawError::Security("Ed25519 not configured".to_owned()))?;
 
         // Reject expired challenges
         if challenge.created_at.elapsed() > CHALLENGE_TTL {
             return Err(DuDuClawError::Security("challenge expired".to_owned()));
         }
 
-        let sig_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            signature_b64,
-        )
-        .map_err(|e| DuDuClawError::Security(format!("bad signature base64: {e}")))?;
+        let sig_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature_b64)
+                .map_err(|e| DuDuClawError::Security(format!("bad signature base64: {e}")))?;
 
-        let pubkey = ring::signature::UnparsedPublicKey::new(
-            &ring::signature::ED25519,
-            pubkey_bytes,
-        );
+        let pubkey =
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, pubkey_bytes);
 
-        pubkey
-            .verify(&challenge.bytes, &sig_bytes)
-            .map_err(|_| DuDuClawError::Security("Ed25519 signature verification failed".to_owned()))
+        pubkey.verify(&challenge.bytes, &sig_bytes).map_err(|_| {
+            DuDuClawError::Security("Ed25519 signature verification failed".to_owned())
+        })
     }
 
     /// Validate a provided bearer token against the configured token.

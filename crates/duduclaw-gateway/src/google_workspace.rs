@@ -17,7 +17,7 @@
 //!   `agent.toml [capabilities] approval_required_tools`.
 
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Duration;
 
@@ -61,7 +61,18 @@ pub fn integration_enabled(home_dir: &Path) -> bool {
 /// rather than a silent overwrite. Returns Ok(true) when the file changed,
 /// Ok(false) when the flag was already on.
 pub fn enable_integration(home_dir: &Path) -> std::io::Result<bool> {
-    if integration_enabled(home_dir) {
+    set_integration_enabled(home_dir, true)
+}
+
+/// Set `config.toml [integrations] google_workspace` to `enabled`.
+///
+/// G6 (2026-09 feature audit): the dashboard needs both directions — the
+/// Google page now renders an explicit enable/disable switch instead of
+/// leaving the master gate to a hand-edited config file, which was how a
+/// fully-configured credential could still 403 every tool call.
+/// `Ok(true)` when the file changed, `Ok(false)` when it already said that.
+pub fn set_integration_enabled(home_dir: &Path, enabled: bool) -> std::io::Result<bool> {
+    if integration_enabled(home_dir) == enabled {
         return Ok(false);
     }
     let path = home_dir.join("config.toml");
@@ -86,7 +97,7 @@ pub fn enable_integration(home_dir: &Path) -> std::io::Result<bool> {
                 "[integrations] exists but is not a table",
             )
         })?
-        .insert("google_workspace", toml_edit::value(true));
+        .insert("google_workspace", toml_edit::value(enabled));
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, doc.to_string())?;
     std::fs::rename(&tmp, &path)?;
@@ -593,7 +604,7 @@ pub async fn get_valid_google_token(home_dir: &Path) -> Result<String, GoogleAut
         None => {
             return Err(GoogleAuthError::NotConnected {
                 vault: home_dir.join(mcp_oauth::TOKEN_FILE),
-            })
+            });
         }
     };
 
@@ -623,8 +634,7 @@ pub async fn get_valid_google_token(home_dir: &Path) -> Result<String, GoogleAut
         refreshed.scopes = existing.scopes.clone();
     }
     let access = refreshed.access_token.clone();
-    mcp_oauth::upsert_token(home_dir, refreshed)
-        .map_err(GoogleAuthError::RefreshFailed)?;
+    mcp_oauth::upsert_token(home_dir, refreshed).map_err(GoogleAuthError::RefreshFailed)?;
     Ok(access)
 }
 
@@ -1105,8 +1115,14 @@ pub async fn sheets_append(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        updated_rows: updates.get("updatedRows").and_then(|v| v.as_u64()).unwrap_or(0),
-        updated_cells: updates.get("updatedCells").and_then(|v| v.as_u64()).unwrap_or(0),
+        updated_rows: updates
+            .get("updatedRows")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        updated_cells: updates
+            .get("updatedCells")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
     })
 }
 
@@ -1459,7 +1475,9 @@ pub async fn docs_read(token: &str, document_id: &str) -> Result<DocsReadResult,
 
     let mut text = String::new();
     collect_doc_text(
-        resp.get("body").and_then(|b| b.get("content")).unwrap_or(&Value::Null),
+        resp.get("body")
+            .and_then(|b| b.get("content"))
+            .unwrap_or(&Value::Null),
         &mut text,
     );
     let (text, truncated) = truncate_text(&text, DOC_TEXT_MAX_CHARS);
@@ -1637,7 +1655,9 @@ pub fn extract_drive_file_id(input: &str) -> String {
 /// Walk a Docs `body.content[]` array, appending paragraph text in order.
 /// Recurses into table cells so tabular content is not silently dropped.
 fn collect_doc_text(content: &Value, out: &mut String) {
-    let Some(arr) = content.as_array() else { return };
+    let Some(arr) = content.as_array() else {
+        return;
+    };
     for el in arr {
         if let Some(paragraph) = el.get("paragraph") {
             if let Some(elements) = paragraph.get("elements").and_then(|v| v.as_array()) {
@@ -1675,7 +1695,9 @@ fn collect_doc_text(content: &Value, out: &mut String) {
 /// Walk a Slides `pageElements[]` array, appending shape/table text. Recurses
 /// into groups (`elementGroup.children`) so grouped shapes are included.
 fn collect_slide_text(page_elements: &Value, out: &mut String) {
-    let Some(arr) = page_elements.as_array() else { return };
+    let Some(arr) = page_elements.as_array() else {
+        return;
+    };
     for el in arr {
         if let Some(text) = el.get("shape").and_then(|s| s.get("text")) {
             append_slide_text_elements(text, out);
@@ -1724,7 +1746,10 @@ fn append_slide_text_elements(text: &Value, out: &mut String) {
 
 /// Read a string field, defaulting to empty.
 fn str_field(v: &Value, key: &str) -> String {
-    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Extract a form id from a full Google Forms URL, or pass a bare id through.
@@ -1943,7 +1968,11 @@ fn decode_b64url(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE
         .decode(s)
         .ok()
-        .or_else(|| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).ok())
+        .or_else(|| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(s)
+                .ok()
+        })
 }
 
 /// Case-insensitive header lookup over a Gmail `headers` array.
@@ -1951,7 +1980,9 @@ fn header_value(headers: &Value, name: &str) -> Option<String> {
     headers.as_array()?.iter().find_map(|h| {
         let hn = h.get("name").and_then(|n| n.as_str())?;
         if hn.eq_ignore_ascii_case(name) {
-            h.get("value").and_then(|v| v.as_str()).map(|s| s.to_string())
+            h.get("value")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
         } else {
             None
         }
@@ -2059,9 +2090,14 @@ fn extract_meet_link(event: &Value) -> Option<String> {
         .and_then(|e| e.as_array())
         .and_then(|eps| {
             eps.iter().find_map(|ep| {
-                let kind = ep.get("entryPointType").and_then(|v| v.as_str()).unwrap_or("");
+                let kind = ep
+                    .get("entryPointType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if kind == "video" {
-                    ep.get("uri").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    ep.get("uri")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     None
                 }
@@ -2071,7 +2107,11 @@ fn extract_meet_link(event: &Value) -> Option<String> {
 
 fn parse_calendar_event(item: &Value) -> CalendarEvent {
     CalendarEvent {
-        id: item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        id: item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         summary: item
             .get("summary")
             .and_then(|v| v.as_str())
@@ -2135,7 +2175,10 @@ fn scope_guidance(api_error_body: &str) -> String {
 
 /// Extract a string field from a bridge response, defaulting to empty.
 fn bs(v: &Value, key: &str) -> String {
-    v.get(key).and_then(|x| x.as_str()).unwrap_or_default().to_string()
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Extract a u64 field from a bridge response, defaulting to 0.
@@ -2145,7 +2188,10 @@ fn bu(v: &Value, key: &str) -> u64 {
 
 /// Map a bridge failure onto the shared API-error type.
 fn bridge_err(e: google_apps_script::BridgeError) -> GoogleApiError {
-    GoogleApiError::Api { status: 502, message: e.to_string() }
+    GoogleApiError::Api {
+        status: 502,
+        message: e.to_string(),
+    }
 }
 
 /// Search mail through whichever backend is configured.
@@ -2183,7 +2229,10 @@ pub async fn gmail_search_via(
                         .collect()
                 })
                 .unwrap_or_default();
-            Ok(GmailSearchResult { count: messages.len(), messages })
+            Ok(GmailSearchResult {
+                count: messages.len(),
+                messages,
+            })
         }
     }
 }
@@ -2208,7 +2257,10 @@ pub async fn gmail_read_via(
                 .and_then(|a| a.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .map(|a| GmailAttachment { filename: bs(a, "name"), size: bu(a, "size") })
+                        .map(|a| GmailAttachment {
+                            filename: bs(a, "name"),
+                            size: bu(a, "size"),
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -2224,7 +2276,10 @@ pub async fn gmail_read_via(
                 // the body is the honest equivalent rather than a fabricated one.
                 snippet: duduclaw_core::truncate_chars(body.lines().next().unwrap_or(""), 200),
                 body,
-                body_truncated: v.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false),
+                body_truncated: v
+                    .get("truncated")
+                    .and_then(|t| t.as_bool())
+                    .unwrap_or(false),
                 attachments,
             })
         }
@@ -2240,9 +2295,7 @@ pub async fn gmail_create_draft_via(
     cc: Option<&str>,
 ) -> Result<GmailDraftResult, GoogleApiError> {
     match backend {
-        GoogleBackend::Direct(token) => {
-            gmail_create_draft(token, to, subject, body_text, cc).await
-        }
+        GoogleBackend::Direct(token) => gmail_create_draft(token, to, subject, body_text, cc).await,
         GoogleBackend::AppsScript(cfg) => {
             // The shipped bridge script takes no cc field. Rather than silently
             // dropping a recipient the user asked for, refuse.
@@ -2310,7 +2363,10 @@ pub async fn calendar_list_events_via(
                         .collect()
                 })
                 .unwrap_or_default();
-            Ok(CalendarEventsResult { count: events.len(), events })
+            Ok(CalendarEventsResult {
+                count: events.len(),
+                events,
+            })
         }
     }
 }
@@ -2425,9 +2481,7 @@ pub async fn sheets_append_via(
     values: Vec<String>,
 ) -> Result<SheetsAppendResult, GoogleApiError> {
     match backend {
-        GoogleBackend::Direct(token) => {
-            sheets_append(token, spreadsheet_id, range, values).await
-        }
+        GoogleBackend::Direct(token) => sheets_append(token, spreadsheet_id, range, values).await,
         GoogleBackend::AppsScript(cfg) => {
             let cells = values.len() as u64;
             let v = google_apps_script::call(
@@ -2439,7 +2493,11 @@ pub async fn sheets_append_via(
             .map_err(bridge_err)?;
             let row = bu(&v, "row");
             Ok(SheetsAppendResult {
-                updated_range: if row > 0 { format!("row {row}") } else { range.to_string() },
+                updated_range: if row > 0 {
+                    format!("row {row}")
+                } else {
+                    range.to_string()
+                },
                 updated_rows: 1,
                 updated_cells: cells,
             })
@@ -2456,7 +2514,11 @@ fn days_until(time_max: Option<&str>) -> Option<u32> {
     let now = chrono::Utc::now();
     let delta = target.with_timezone(&chrono::Utc) - now;
     let days = delta.num_days();
-    if days <= 0 { Some(1) } else { Some(days.min(365) as u32) }
+    if days <= 0 {
+        Some(1)
+    } else {
+        Some(days.min(365) as u32)
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -2485,10 +2547,10 @@ mod tests {
         assert!(enc.ends_with("?="));
         // Round-trip the base64 payload back to the original bytes.
         use base64::Engine;
-        let inner = enc
-            .trim_start_matches("=?UTF-8?B?")
-            .trim_end_matches("?=");
-        let decoded = base64::engine::general_purpose::STANDARD.decode(inner).unwrap();
+        let inner = enc.trim_start_matches("=?UTF-8?B?").trim_end_matches("?=");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(inner)
+            .unwrap();
         assert_eq!(String::from_utf8(decoded).unwrap(), "測試主旨");
     }
 
@@ -2554,8 +2616,14 @@ mod tests {
             {"name": "From", "value": "alice@example.com"},
             {"name": "subject", "value": "Hi there"},
         ]);
-        assert_eq!(header_value(&headers, "from").as_deref(), Some("alice@example.com"));
-        assert_eq!(header_value(&headers, "Subject").as_deref(), Some("Hi there"));
+        assert_eq!(
+            header_value(&headers, "from").as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            header_value(&headers, "Subject").as_deref(),
+            Some("Hi there")
+        );
         assert_eq!(header_value(&headers, "Cc"), None);
     }
 
@@ -2647,7 +2715,8 @@ mod tests {
 
     #[test]
     fn scope_guidance_lists_required_scopes() {
-        let body = r#"{"error":{"code":403,"message":"Request had insufficient authentication scopes."}}"#;
+        let body =
+            r#"{"error":{"code":403,"message":"Request had insufficient authentication scopes."}}"#;
         let g = scope_guidance(body);
         assert!(g.contains("gmail.compose"));
         assert!(g.contains("calendar.events"));
@@ -2795,7 +2864,10 @@ mod tests {
 
         // Missing lastSubmittedTime falls back to createTime.
         let r2 = json!({"responseId": "r2", "createTime": "2026-07-01T00:00:00Z"});
-        assert_eq!(parse_form_response(&r2).submitted_at, "2026-07-01T00:00:00Z");
+        assert_eq!(
+            parse_form_response(&r2).submitted_at,
+            "2026-07-01T00:00:00Z"
+        );
     }
 
     // ── Tasks helpers ──
@@ -2873,7 +2945,9 @@ mod tests {
             "1DocId"
         );
         assert_eq!(
-            extract_drive_file_id("https://docs.google.com/presentation/d/1DeckId/edit?usp=sharing"),
+            extract_drive_file_id(
+                "https://docs.google.com/presentation/d/1DeckId/edit?usp=sharing"
+            ),
             "1DeckId"
         );
         assert_eq!(
@@ -2954,7 +3028,9 @@ mod tests {
         assert!(REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/drive.readonly"));
         assert!(!REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/drive.file"));
         assert!(!REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/drive"));
-        assert!(REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/presentations.readonly"));
+        assert!(
+            REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/presentations.readonly")
+        );
         assert!(!REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/presentations"));
         assert!(REQUIRED_SCOPES.contains(&"https://www.googleapis.com/auth/documents"));
     }
@@ -2965,16 +3041,28 @@ mod tests {
         // No config.toml at all → closed.
         assert!(!integration_enabled(dir.path()));
         // Config without the section → closed.
-        std::fs::write(dir.path().join("config.toml"), "[general]\nlog_level = \"info\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[general]\nlog_level = \"info\"\n",
+        )
+        .unwrap();
         assert!(!integration_enabled(dir.path()));
         // Explicit false → closed.
-        std::fs::write(dir.path().join("config.toml"), "[integrations]\ngoogle_workspace = false\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[integrations]\ngoogle_workspace = false\n",
+        )
+        .unwrap();
         assert!(!integration_enabled(dir.path()));
         // Malformed toml → closed (fail closed).
         std::fs::write(dir.path().join("config.toml"), "[integrations\n???").unwrap();
         assert!(!integration_enabled(dir.path()));
         // Explicit true → open.
-        std::fs::write(dir.path().join("config.toml"), "[integrations]\ngoogle_workspace = true\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[integrations]\ngoogle_workspace = true\n",
+        )
+        .unwrap();
         assert!(integration_enabled(dir.path()));
     }
 }

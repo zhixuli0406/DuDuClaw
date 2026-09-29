@@ -226,7 +226,10 @@ pub fn render(stats: &DigestStats, link: Option<&str>) -> Option<String> {
         }
     }
     if stats.cost_millicents > 0 {
-        lines.push(format!("・花費 {}", format_millicents(stats.cost_millicents)));
+        lines.push(format!(
+            "・花費 {}",
+            format_millicents(stats.cost_millicents)
+        ));
     }
     if stats.channel_alerts > 0 {
         lines.push(format!("・通道異常告警 {} 次", stats.channel_alerts));
@@ -295,7 +298,10 @@ pub async fn collect(home_dir: &Path, since: DateTime<Utc>, now: DateTime<Utc>) 
         if let Ok(parked) = store.tasks_in_status("needs_human").await {
             stats.pending_decisions += parked.len();
         }
-        match store.list_activity(None, None, ACTIVITY_SCAN_LIMIT, 0).await {
+        match store
+            .list_activity(None, None, ACTIVITY_SCAN_LIMIT, 0)
+            .await
+        {
             Ok((rows, _)) => {
                 for r in &rows {
                     if !in_window(Some(&r.timestamp), since, now) {
@@ -573,8 +579,14 @@ mod tests {
     fn missing_file_or_section_is_the_default() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(DigestConfig::from_home(dir.path()), DigestConfig::default());
-        assert_eq!(DigestConfig::from_toml_str("[general]\nname = \"x\"\n"), DigestConfig::default());
-        assert_eq!(DigestConfig::from_toml_str("not [ toml"), DigestConfig::default());
+        assert_eq!(
+            DigestConfig::from_toml_str("[general]\nname = \"x\"\n"),
+            DigestConfig::default()
+        );
+        assert_eq!(
+            DigestConfig::from_toml_str("not [ toml"),
+            DigestConfig::default()
+        );
     }
 
     #[test]
@@ -588,8 +600,13 @@ mod tests {
 
     #[test]
     fn a_malformed_time_falls_back_to_the_default_rather_than_disabling() {
-        let cfg = DigestConfig::from_toml_str("[notify]\ndaily_digest = true\ndaily_digest_at = \"早上\"\n");
-        assert!(cfg.enabled, "a bad time must not silently disable the feature");
+        let cfg = DigestConfig::from_toml_str(
+            "[notify]\ndaily_digest = true\ndaily_digest_at = \"早上\"\n",
+        );
+        assert!(
+            cfg.enabled,
+            "a bad time must not silently disable the feature"
+        );
         assert_eq!(cfg.at, NaiveTime::from_hms_opt(9, 0, 0).unwrap());
     }
 
@@ -617,11 +634,26 @@ mod tests {
     #[test]
     fn any_single_non_zero_counter_makes_it_worth_sending() {
         for stats in [
-            DigestStats { tasks_done: 1, ..Default::default() },
-            DigestStats { pending_decisions: 1, ..Default::default() },
-            DigestStats { learning_events: 1, ..Default::default() },
-            DigestStats { cost_millicents: 1, ..Default::default() },
-            DigestStats { channel_alerts: 1, ..Default::default() },
+            DigestStats {
+                tasks_done: 1,
+                ..Default::default()
+            },
+            DigestStats {
+                pending_decisions: 1,
+                ..Default::default()
+            },
+            DigestStats {
+                learning_events: 1,
+                ..Default::default()
+            },
+            DigestStats {
+                cost_millicents: 1,
+                ..Default::default()
+            },
+            DigestStats {
+                channel_alerts: 1,
+                ..Default::default()
+            },
         ] {
             assert!(!stats.is_empty());
             assert!(render(&stats, None).is_some());
@@ -649,13 +681,19 @@ mod tests {
             !body.contains("試行結果"),
             "no trial settled ⇒ no breakdown line: {body}"
         );
-        assert!(!body.contains("待你決定"), "zero counters must not appear: {body}");
+        assert!(
+            !body.contains("待你決定"),
+            "zero counters must not appear: {body}"
+        );
         assert!(!body.contains("花費"));
     }
 
     #[test]
     fn render_appends_the_deep_link_when_there_is_one() {
-        let stats = DigestStats { tasks_done: 1, ..Default::default() };
+        let stats = DigestStats {
+            tasks_done: 1,
+            ..Default::default()
+        };
         let body = render(&stats, Some("http://localhost:18789/tasks")).unwrap();
         assert!(body.ends_with("👉 http://localhost:18789/tasks"));
         // No link ⇒ text reads exactly as it would without the feature.
@@ -673,7 +711,10 @@ mod tests {
         };
         let body = render(&stats, None).unwrap();
         assert!(body.contains("學習事件 5 則"), "{body}");
-        assert!(body.contains("經驗法則試行結果：採用 2 條、回退 1 條、證據不足 1 條"), "{body}");
+        assert!(
+            body.contains("經驗法則試行結果：採用 2 條、回退 1 條、證據不足 1 條"),
+            "{body}"
+        );
         // §C.9 wording only — no internal artifact names in a user-facing push.
         for internal in ["playbook", "shadow", "probation", "GVU", "SOUL"] {
             assert!(!body.contains(internal), "leaked `{internal}`: {body}");
@@ -682,10 +723,17 @@ mod tests {
 
     #[test]
     fn trial_breakdown_omits_the_outcomes_that_did_not_happen() {
-        let stats = DigestStats { learning_events: 3, rules_adopted: 1, ..Default::default() };
+        let stats = DigestStats {
+            learning_events: 3,
+            rules_adopted: 1,
+            ..Default::default()
+        };
         let body = render(&stats, None).unwrap();
         assert!(body.contains("試行結果：採用 1 條"), "{body}");
-        assert!(!body.contains("回退"), "a zero must not read as a failure report: {body}");
+        assert!(
+            !body.contains("回退"),
+            "a zero must not read as a failure report: {body}"
+        );
         assert!(!body.contains("證據不足"), "{body}");
     }
 
@@ -693,7 +741,10 @@ mod tests {
     fn trial_counters_alone_never_make_an_otherwise_empty_day_worth_sending() {
         // They are a strict subset of `learning_events`; counting them again
         // in `is_empty` would let one event make the day non-empty twice.
-        let stats = DigestStats { rules_adopted: 2, ..Default::default() };
+        let stats = DigestStats {
+            rules_adopted: 2,
+            ..Default::default()
+        };
         assert!(stats.is_empty(), "{stats:?}");
         assert_eq!(render(&stats, None), None);
     }
@@ -715,7 +766,10 @@ mod tests {
         assert_eq!(format_millicents(100_000), "US$1.00");
         assert_eq!(format_millicents(250_000), "US$2.50");
         assert_eq!(format_millicents(500), "< US$0.01");
-        let stats = DigestStats { cost_millicents: 123_456, ..Default::default() };
+        let stats = DigestStats {
+            cost_millicents: 123_456,
+            ..Default::default()
+        };
         assert!(render(&stats, None).unwrap().contains("US$1.23"));
     }
 
@@ -733,8 +787,17 @@ mod tests {
         ] {
             assert!(is_learning_event(t), "{t} should count as a learning event");
         }
-        for t in ["task_created", "autopilot_triggered", CHANNEL_ALERT_EVENT, "", "os_file"] {
-            assert!(!is_learning_event(t), "{t} should NOT count as a learning event");
+        for t in [
+            "task_created",
+            "autopilot_triggered",
+            CHANNEL_ALERT_EVENT,
+            "",
+            "os_file",
+        ] {
+            assert!(
+                !is_learning_event(t),
+                "{t} should NOT count as a learning event"
+            );
         }
     }
 
@@ -766,7 +829,10 @@ mod tests {
     fn claim_today_is_a_compare_and_set() {
         let dir = tempfile::tempdir().unwrap();
         assert!(claim_today(dir.path(), "2026-08-11"));
-        assert!(!claim_today(dir.path(), "2026-08-11"), "a second claim must lose");
+        assert!(
+            !claim_today(dir.path(), "2026-08-11"),
+            "a second claim must lose"
+        );
         assert!(claim_today(dir.path(), "2026-08-12"));
         assert_eq!(read_last_sent(dir.path()), "2026-08-12");
     }
@@ -782,7 +848,11 @@ mod tests {
     #[tokio::test]
     async fn scheduler_does_nothing_when_disabled() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[notify]\ndaily_digest = false\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[notify]\ndaily_digest = false\n",
+        )
+        .unwrap();
         let sched = DailyDigestScheduler::new(dir.path().to_path_buf());
         assert_eq!(sched.tick().await, None);
         // Disabled must not even claim the day.
@@ -799,7 +869,11 @@ mod tests {
         .unwrap();
         let sched = DailyDigestScheduler::new(dir.path().to_path_buf());
         assert_eq!(sched.tick().await, None, "nothing happened ⇒ nothing sent");
-        assert_ne!(read_last_sent(dir.path()), "", "the day is claimed so it stops re-evaluating");
+        assert_ne!(
+            read_last_sent(dir.path()),
+            "",
+            "the day is claimed so it stops re-evaluating"
+        );
     }
 
     #[tokio::test]
@@ -819,10 +893,19 @@ mod tests {
         // One of each outcome, plus an undifferentiated learning event and a
         // stale row outside the window.
         for (i, (ev, ts)) in [
-            ("gvu_observation_confirmed", now - chrono::Duration::hours(1)),
+            (
+                "gvu_observation_confirmed",
+                now - chrono::Duration::hours(1),
+            ),
             ("playbook_rules_updated", now - chrono::Duration::hours(2)),
-            ("gvu_observation_rolled_back", now - chrono::Duration::hours(3)),
-            ("gvu_observation_expired_no_data", now - chrono::Duration::hours(4)),
+            (
+                "gvu_observation_rolled_back",
+                now - chrono::Duration::hours(3),
+            ),
+            (
+                "gvu_observation_expired_no_data",
+                now - chrono::Duration::hours(4),
+            ),
             ("gvu_consolidated", now - chrono::Duration::hours(5)),
             ("gvu_observation_confirmed", now - chrono::Duration::days(3)),
         ]
@@ -844,8 +927,14 @@ mod tests {
         }
 
         let stats = collect(dir.path(), now - chrono::Duration::hours(24), now).await;
-        assert_eq!(stats.learning_events, 5, "the 3-day-old row is out of window");
-        assert_eq!(stats.rules_adopted, 2, "confirmed observation + committed rules");
+        assert_eq!(
+            stats.learning_events, 5,
+            "the 3-day-old row is out of window"
+        );
+        assert_eq!(
+            stats.rules_adopted, 2,
+            "confirmed observation + committed rules"
+        );
         assert_eq!(stats.rules_reverted, 1);
         assert_eq!(stats.rules_no_evidence, 1);
         // The breakdown never exceeds the total it decomposes.
@@ -854,7 +943,10 @@ mod tests {
                 <= stats.learning_events
         );
         let body = render(&stats, None).unwrap();
-        assert!(body.contains("採用 2 條、回退 1 條、證據不足 1 條"), "{body}");
+        assert!(
+            body.contains("採用 2 條、回退 1 條、證據不足 1 條"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
@@ -914,7 +1006,15 @@ mod tests {
         let since = now - chrono::Duration::hours(24);
         assert!(!in_window(None, since, now));
         assert!(!in_window(Some("not-a-date"), since, now));
-        assert!(in_window(Some(&(now - chrono::Duration::hours(1)).to_rfc3339()), since, now));
-        assert!(!in_window(Some(&(now - chrono::Duration::days(2)).to_rfc3339()), since, now));
+        assert!(in_window(
+            Some(&(now - chrono::Duration::hours(1)).to_rfc3339()),
+            since,
+            now
+        ));
+        assert!(!in_window(
+            Some(&(now - chrono::Duration::days(2)).to_rfc3339()),
+            since,
+            now
+        ));
     }
 }

@@ -86,12 +86,18 @@ impl RpcConnInfo {
     /// caller is code inside the gateway, not an anonymous peer). `peer:
     /// None` deliberately fails the loopback condition.
     pub fn internal() -> Self {
-        Self { peer: None, pre_auth: false }
+        Self {
+            peer: None,
+            pre_auth: false,
+        }
     }
 
     /// A real WebSocket connection.
     pub fn from_ws(peer: SocketAddr, pre_auth: bool) -> Self {
-        Self { peer: Some(peer), pre_auth }
+        Self {
+            peer: Some(peer),
+            pre_auth,
+        }
     }
 
     /// Did this call arrive from the machine itself? `None` peer ⇒ `false`.
@@ -396,7 +402,9 @@ mod tests {
         assert!(ip_is_loopback(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         // ::ffff:127.0.0.1 — what a dual-stack listener reports for an
         // ordinary IPv4 loopback client.
-        assert!(ip_is_loopback(IpAddr::V6("::ffff:127.0.0.1".parse().unwrap())));
+        assert!(ip_is_loopback(IpAddr::V6(
+            "::ffff:127.0.0.1".parse().unwrap()
+        )));
     }
 
     #[test]
@@ -406,7 +414,9 @@ mod tests {
         assert!(!ip_is_loopback(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!ip_is_loopback(IpAddr::V6("fe80::1".parse().unwrap())));
         // The mapped form of a NON-loopback v4 address must stay refused.
-        assert!(!ip_is_loopback(IpAddr::V6("::ffff:192.168.1.10".parse().unwrap())));
+        assert!(!ip_is_loopback(IpAddr::V6(
+            "::ffff:192.168.1.10".parse().unwrap()
+        )));
     }
 
     #[test]
@@ -510,14 +520,26 @@ mod tests {
 
     #[test]
     fn non_appliance_is_refused_even_when_everything_else_is_perfect() {
-        assert_eq!(evaluate(false, true, "reboot"), Err(PowerLocalDenial::NotAppliance));
-        assert_eq!(evaluate(false, true, "shutdown"), Err(PowerLocalDenial::NotAppliance));
+        assert_eq!(
+            evaluate(false, true, "reboot"),
+            Err(PowerLocalDenial::NotAppliance)
+        );
+        assert_eq!(
+            evaluate(false, true, "shutdown"),
+            Err(PowerLocalDenial::NotAppliance)
+        );
     }
 
     #[test]
     fn non_loopback_is_refused_on_a_real_appliance() {
-        assert_eq!(evaluate(true, false, "reboot"), Err(PowerLocalDenial::NotLocal));
-        assert_eq!(evaluate(true, false, "shutdown"), Err(PowerLocalDenial::NotLocal));
+        assert_eq!(
+            evaluate(true, false, "reboot"),
+            Err(PowerLocalDenial::NotLocal)
+        );
+        assert_eq!(
+            evaluate(true, false, "shutdown"),
+            Err(PowerLocalDenial::NotLocal)
+        );
     }
 
     #[test]
@@ -536,9 +558,18 @@ mod tests {
     /// it would also have failed.
     #[test]
     fn gate_order_is_appliance_then_loopback_then_action() {
-        assert_eq!(evaluate(false, false, "nonsense"), Err(PowerLocalDenial::NotAppliance));
-        assert_eq!(evaluate(true, false, "nonsense"), Err(PowerLocalDenial::NotLocal));
-        assert_eq!(evaluate(true, true, "nonsense"), Err(PowerLocalDenial::UnknownAction));
+        assert_eq!(
+            evaluate(false, false, "nonsense"),
+            Err(PowerLocalDenial::NotAppliance)
+        );
+        assert_eq!(
+            evaluate(true, false, "nonsense"),
+            Err(PowerLocalDenial::NotLocal)
+        );
+        assert_eq!(
+            evaluate(true, true, "nonsense"),
+            Err(PowerLocalDenial::UnknownAction)
+        );
     }
 
     // ── denial vocabulary ────────────────────────────────────────────
@@ -552,7 +583,15 @@ mod tests {
             PowerLocalDenial::RateLimited,
         ];
         let codes: Vec<_> = all.iter().map(|d| d.code()).collect();
-        assert_eq!(codes, ["not_appliance", "not_local", "invalid_action", "rate_limited"]);
+        assert_eq!(
+            codes,
+            [
+                "not_appliance",
+                "not_local",
+                "invalid_action",
+                "rate_limited"
+            ]
+        );
         let mut sorted = codes.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -580,7 +619,10 @@ mod tests {
                 "systemctl",
                 "WsFrame",
             ] {
-                assert!(!msg.contains(leak), "internal term {leak:?} leaked into: {msg}");
+                assert!(
+                    !msg.contains(leak),
+                    "internal term {leak:?} leaked into: {msg}"
+                );
             }
         }
     }
@@ -600,7 +642,11 @@ mod tests {
         let limiter = RateLimiter::new(POWER_LOCAL_MAX_PER_WINDOW, POWER_LOCAL_WINDOW);
         let conn = RpcConnInfo::from_ws(sock(IpAddr::V4(Ipv4Addr::LOCALHOST)), true);
         for i in 0..POWER_LOCAL_MAX_PER_WINDOW {
-            assert_eq!(check_rate_limit(&limiter, &conn).await, Ok(()), "request {i}");
+            assert_eq!(
+                check_rate_limit(&limiter, &conn).await,
+                Ok(()),
+                "request {i}"
+            );
         }
         assert_eq!(
             check_rate_limit(&limiter, &conn).await,
@@ -615,7 +661,10 @@ mod tests {
         let b = RpcConnInfo::from_ws(sock(IpAddr::V6(Ipv6Addr::LOCALHOST)), true);
         assert_eq!(check_rate_limit(&limiter, &a).await, Ok(()));
         assert_eq!(check_rate_limit(&limiter, &b).await, Ok(()));
-        assert_eq!(check_rate_limit(&limiter, &a).await, Err(PowerLocalDenial::RateLimited));
+        assert_eq!(
+            check_rate_limit(&limiter, &a).await,
+            Err(PowerLocalDenial::RateLimited)
+        );
     }
 
     // ── execution reaches the real device_ops verbs (mocked) ─────────
@@ -653,7 +702,10 @@ mod tests {
     async fn device_layer_failure_is_propagated_not_swallowed() {
         let ops = MockDeviceOps::default();
         let result = run_power_action(&ops, PowerAction::Reboot).await;
-        assert!(matches!(result, Err(DeviceOpError::Unsupported(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(DeviceOpError::Unsupported(_))),
+            "{result:?}"
+        );
     }
 
     // ── audit rows ───────────────────────────────────────────────────

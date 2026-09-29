@@ -205,7 +205,10 @@ impl SiemSink {
         if let Some((name, value)) = &self.auth_header {
             req = req.header(name.as_str(), value.as_str());
         }
-        let resp = req.send().await.map_err(|e| format!("SIEM POST failed: {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("SIEM POST failed: {e}"))?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             return Err(format!("SIEM sink returned HTTP {status}"));
@@ -230,12 +233,16 @@ mod tests {
         write(
             home,
             "tool_calls.jsonl",
-            &[r#"{"timestamp":"2026-07-08T10:00:00Z","agent_id":"alice","tool_name":"memory_search","success":true}"#],
+            &[
+                r#"{"timestamp":"2026-07-08T10:00:00Z","agent_id":"alice","tool_name":"memory_search","success":true}"#,
+            ],
         );
         write(
             home,
             "budget_events.jsonl",
-            &[r#"{"ts":"2026-07-08T09:00:00Z","agent_id":"bob","event":"budget_breaker_open","scope":"daily"}"#],
+            &[
+                r#"{"ts":"2026-07-08T09:00:00Z","agent_id":"bob","event":"budget_breaker_open","scope":"daily"}"#,
+            ],
         );
         let recs = collect_records(home, None);
         assert_eq!(recs.len(), 2);
@@ -264,14 +271,21 @@ mod tests {
         let agents: Vec<_> = recs.iter().filter_map(|r| r.agent_id.clone()).collect();
         assert!(agents.contains(&"new".to_string()));
         assert!(agents.contains(&"keep".to_string()), "no-ts record kept");
-        assert!(!agents.contains(&"old".to_string()), "older record filtered");
+        assert!(
+            !agents.contains(&"old".to_string()),
+            "older record filtered"
+        );
     }
 
     #[test]
     fn malformed_lines_skipped_missing_file_empty() {
         let dir = tempdir().unwrap();
         let home = dir.path();
-        write(home, "tool_calls.jsonl", &["not json", "", r#"{"ts":"x","a":1}"#]);
+        write(
+            home,
+            "tool_calls.jsonl",
+            &["not json", "", r#"{"ts":"x","a":1}"#],
+        );
         let recs = read_source(home, "tool_calls.jsonl", "tool_calls", None);
         assert_eq!(recs.len(), 1, "only the valid JSON line survives");
         // Missing file → empty, no panic.

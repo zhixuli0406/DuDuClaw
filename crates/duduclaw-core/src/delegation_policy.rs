@@ -27,9 +27,11 @@
 //!
 //! ## What this module is *not*
 //!
-//! It is not a rate limiter (`dispatch_guard`), not a tool-permission gate
-//! (`capability_grants`), and not permission attenuation (`delegation_scope`).
-//! Those three are orthogonal and stay where they are. Ranks (`org::OrgRank`)
+//! It is not a rate limiter (`dispatch_guard`) and not a tool-permission gate
+//! (`capability_grants`). Those two are orthogonal and stay where they are.
+//! (A third neighbour, the never-wired `delegation_scope` permission-attenuation
+//! module, was removed on 2026-09-29 — see
+//! `wiki/reports/feature-audit-2026-09-29.md` T1-D11.) Ranks (`org::OrgRank`)
 //! deliberately play no part: the `reports_to` tree remains the only authority
 //! on hierarchy (see `org.rs` — rank is derived, never authoritative).
 //!

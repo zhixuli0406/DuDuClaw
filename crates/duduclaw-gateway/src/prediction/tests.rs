@@ -123,7 +123,7 @@ mod user_model_tests {
 
 #[cfg(test)]
 mod metrics_tests {
-    use crate::prediction::metrics::{extract_keywords, ConversationMetrics};
+    use crate::prediction::metrics::{ConversationMetrics, extract_keywords};
     use crate::session::SessionMessage;
 
     fn msg(role: &str, content: &str) -> SessionMessage {
@@ -154,7 +154,7 @@ mod metrics_tests {
         let messages = vec![
             msg("user", "explain X"),
             msg("assistant", "X is blah blah blah blah blah blah"),
-            msg("user", "what?"),  // short follow-up
+            msg("user", "what?"), // short follow-up
         ];
         let m = ConversationMetrics::extract("s1", "a1", "u1", &messages, 0);
         assert_eq!(m.user_follow_ups, 1);
@@ -163,7 +163,10 @@ mod metrics_tests {
     #[test]
     fn correction_detection() {
         let messages = vec![
-            msg("user", "\u{4e0d}\u{662f}\u{ff0c}\u{6211}\u{8981}\u{7684}\u{4e0d}\u{662f}\u{9019}\u{500b}"), // 不是，我要的不是這個
+            msg(
+                "user",
+                "\u{4e0d}\u{662f}\u{ff0c}\u{6211}\u{8981}\u{7684}\u{4e0d}\u{662f}\u{9019}\u{500b}",
+            ), // 不是，我要的不是這個
             msg("assistant", "sorry"),
         ];
         let m = ConversationMetrics::extract("s1", "a1", "u1", &messages, 0);
@@ -180,14 +183,20 @@ mod metrics_tests {
     #[test]
     fn keyword_extraction_cjk() {
         // 機器學習很有趣
-        let keywords = extract_keywords("\u{6a5f}\u{5668}\u{5b78}\u{7fd2}\u{5f88}\u{6709}\u{8da3}", 3);
+        let keywords = extract_keywords(
+            "\u{6a5f}\u{5668}\u{5b78}\u{7fd2}\u{5f88}\u{6709}\u{8da3}",
+            3,
+        );
         assert!(!keywords.is_empty());
     }
 
     #[test]
     fn language_detection() {
         let messages = vec![
-            msg("user", "\u{4f60}\u{597d}\u{ff0c}\u{8acb}\u{554f}\u{9019}\u{662f}\u{4ec0}\u{9ebc}"), // 你好，請問這是什麼
+            msg(
+                "user",
+                "\u{4f60}\u{597d}\u{ff0c}\u{8acb}\u{554f}\u{9019}\u{662f}\u{4ec0}\u{9ebc}",
+            ), // 你好，請問這是什麼
             msg("assistant", "response"),
         ];
         let m = ConversationMetrics::extract("s1", "a1", "u1", &messages, 0);
@@ -199,7 +208,7 @@ mod metrics_tests {
 mod router_tests {
     use crate::prediction::engine::{ErrorCategory, Prediction, PredictionError};
     use crate::prediction::metrics::ConversationMetrics;
-    use crate::prediction::router::{route, ConsistencyTracker, EvolutionAction, ExplorationState};
+    use crate::prediction::router::{ConsistencyTracker, EvolutionAction, ExplorationState, route};
     use chrono::Utc;
 
     fn make_error(composite: f64, category: ErrorCategory) -> PredictionError {
@@ -260,7 +269,10 @@ mod router_tests {
         let error = make_error(0.1, ErrorCategory::Negligible);
         let mut exploration = no_exploration();
         let consistency = ConsistencyTracker::new(50);
-        assert!(matches!(route(&error, 0, &mut exploration, &consistency), EvolutionAction::None));
+        assert!(matches!(
+            route(&error, 0, &mut exploration, &consistency),
+            EvolutionAction::None
+        ));
     }
 
     #[test]
@@ -268,7 +280,10 @@ mod router_tests {
         let error = make_error(0.35, ErrorCategory::Moderate);
         let mut exploration = no_exploration();
         let consistency = ConsistencyTracker::new(50);
-        assert!(matches!(route(&error, 0, &mut exploration, &consistency), EvolutionAction::StoreEpisodic { .. }));
+        assert!(matches!(
+            route(&error, 0, &mut exploration, &consistency),
+            EvolutionAction::StoreEpisodic { .. }
+        ));
     }
 
     /// `make_error`'s default `extracted_topics: vec![]` — the pre-fix
@@ -279,13 +294,17 @@ mod router_tests {
         let error = make_error(0.35, ErrorCategory::Moderate);
         let mut exploration = no_exploration();
         let consistency = ConsistencyTracker::new(50);
-        let EvolutionAction::StoreEpisodic { content, .. } = route(&error, 0, &mut exploration, &consistency) else {
+        let EvolutionAction::StoreEpisodic { content, .. } =
+            route(&error, 0, &mut exploration, &consistency)
+        else {
             panic!("expected StoreEpisodic");
         };
         assert!(!content.contains("Topics:"));
         assert!(!content.contains("Expected topic:"));
-        assert!(content.starts_with("Prediction deviation: expected satisfaction 0.70, inferred 0.70 (delta 0.00). \
-             Topic surprise: 0.00. Corrections: no. Follow-ups: no."));
+        assert!(content.starts_with(
+            "Prediction deviation: expected satisfaction 0.70, inferred 0.70 (delta 0.00). \
+             Topic surprise: 0.00. Corrections: no. Follow-ups: no."
+        ));
     }
 
     /// With extracted topics present, the stored content must carry them so
@@ -293,11 +312,17 @@ mod router_tests {
     #[test]
     fn moderate_with_topics_appends_topics_section() {
         let mut error = make_error(0.35, ErrorCategory::Moderate);
-        error.actual.extracted_topics =
-            vec!["報價".to_string(), "合約".to_string(), "交期".to_string(), "extra".to_string()];
+        error.actual.extracted_topics = vec![
+            "報價".to_string(),
+            "合約".to_string(),
+            "交期".to_string(),
+            "extra".to_string(),
+        ];
         let mut exploration = no_exploration();
         let consistency = ConsistencyTracker::new(50);
-        let EvolutionAction::StoreEpisodic { content, .. } = route(&error, 0, &mut exploration, &consistency) else {
+        let EvolutionAction::StoreEpisodic { content, .. } =
+            route(&error, 0, &mut exploration, &consistency)
+        else {
             panic!("expected StoreEpisodic");
         };
         // Capped at 3 topics, comma-separated, trailing period.
@@ -314,7 +339,9 @@ mod router_tests {
         error.actual.extracted_topics = vec!["報價".to_string()];
         let mut exploration = no_exploration();
         let consistency = ConsistencyTracker::new(50);
-        let EvolutionAction::StoreEpisodic { content, .. } = route(&error, 0, &mut exploration, &consistency) else {
+        let EvolutionAction::StoreEpisodic { content, .. } =
+            route(&error, 0, &mut exploration, &consistency)
+        else {
             panic!("expected StoreEpisodic");
         };
         assert!(content.contains("Expected topic: 退貨."));
@@ -325,8 +352,9 @@ mod router_tests {
         error2.prediction.expected_topic = Some("報價".to_string());
         error2.actual.extracted_topics = vec!["報價".to_string()];
         let mut exploration2 = no_exploration();
-        let EvolutionAction::StoreEpisodic { content: content2, .. } =
-            route(&error2, 0, &mut exploration2, &consistency)
+        let EvolutionAction::StoreEpisodic {
+            content: content2, ..
+        } = route(&error2, 0, &mut exploration2, &consistency)
         else {
             panic!("expected StoreEpisodic");
         };
@@ -338,7 +366,10 @@ mod router_tests {
         let error = make_error(0.6, ErrorCategory::Significant);
         let mut exploration = no_exploration();
         let consistency = ConsistencyTracker::new(50);
-        assert!(matches!(route(&error, 0, &mut exploration, &consistency), EvolutionAction::TriggerReflection { .. }));
+        assert!(matches!(
+            route(&error, 0, &mut exploration, &consistency),
+            EvolutionAction::TriggerReflection { .. }
+        ));
     }
 
     #[test]
@@ -346,7 +377,10 @@ mod router_tests {
         let error = make_error(0.6, ErrorCategory::Significant);
         let mut exploration = no_exploration();
         let consistency = ConsistencyTracker::new(50);
-        assert!(matches!(route(&error, 3, &mut exploration, &consistency), EvolutionAction::TriggerEmergencyEvolution { .. }));
+        assert!(matches!(
+            route(&error, 3, &mut exploration, &consistency),
+            EvolutionAction::TriggerEmergencyEvolution { .. }
+        ));
     }
 
     #[test]
@@ -354,13 +388,16 @@ mod router_tests {
         let error = make_error(0.9, ErrorCategory::Critical);
         let mut exploration = no_exploration();
         let consistency = ConsistencyTracker::new(50);
-        assert!(matches!(route(&error, 0, &mut exploration, &consistency), EvolutionAction::TriggerEmergencyEvolution { .. }));
+        assert!(matches!(
+            route(&error, 0, &mut exploration, &consistency),
+            EvolutionAction::TriggerEmergencyEvolution { .. }
+        ));
     }
 }
 
 #[cfg(test)]
 mod metacognition_tests {
-    use crate::prediction::engine::{ErrorCategory, PredictionError, Prediction};
+    use crate::prediction::engine::{ErrorCategory, Prediction, PredictionError};
     use crate::prediction::metacognition::{AdaptiveThresholds, MetaCognition};
     use crate::prediction::metrics::ConversationMetrics;
     use chrono::Utc;
@@ -401,13 +438,23 @@ mod metacognition_tests {
                 timestamp: Utc::now(),
             },
             actual: ConversationMetrics {
-                session_id: "s".into(), user_id: "u".into(), agent_id: "a".into(),
-                message_count: 2, user_message_count: 1, assistant_message_count: 1,
-                avg_assistant_response_length: 100.0, total_tokens: 50, response_time_ms: 0,
-                user_follow_ups: 0, user_corrections: 0,
+                session_id: "s".into(),
+                user_id: "u".into(),
+                agent_id: "a".into(),
+                message_count: 2,
+                user_message_count: 1,
+                assistant_message_count: 1,
+                avg_assistant_response_length: 100.0,
+                total_tokens: 50,
+                response_time_ms: 0,
+                user_follow_ups: 0,
+                user_corrections: 0,
                 feedback_details: Default::default(),
-                detected_language: "en".into(), extracted_topics: vec![],
-                ended_naturally: true, feedback_signal: None, timestamp: Utc::now(),
+                detected_language: "en".into(),
+                extracted_topics: vec![],
+                ended_naturally: true,
+                feedback_signal: None,
+                timestamp: Utc::now(),
                 user_text: String::new(),
             },
         }
@@ -476,8 +523,13 @@ mod metacognition_tests {
         mc.persist(&path);
         let loaded = MetaCognition::load(&path).unwrap();
 
-        assert!((loaded.thresholds.negligible_upper - mc.thresholds.negligible_upper).abs() < f64::EPSILON);
-        assert!((loaded.thresholds.moderate_upper - mc.thresholds.moderate_upper).abs() < f64::EPSILON);
+        assert!(
+            (loaded.thresholds.negligible_upper - mc.thresholds.negligible_upper).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (loaded.thresholds.moderate_upper - mc.thresholds.moderate_upper).abs() < f64::EPSILON
+        );
         assert_eq!(loaded.evaluation_interval, mc.evaluation_interval);
     }
 }

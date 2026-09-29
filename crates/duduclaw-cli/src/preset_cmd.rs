@@ -75,7 +75,11 @@ pub fn cmd_preset_list() -> Result<()> {
     for id in ids {
         match preset::load_preset(&home, &id) {
             Ok(p) => {
-                let label = if p.meta.label.trim().is_empty() { "（無標籤）".to_string() } else { p.meta.label };
+                let label = if p.meta.label.trim().is_empty() {
+                    "（無標籤）".to_string()
+                } else {
+                    p.meta.label
+                };
                 println!("  • {id} v{}　{label}", p.meta.version);
             }
             Err(e) => println!("  • {id}　{}", style(format!("⚠️ 無法解析（{e}）")).red()),
@@ -87,7 +91,8 @@ pub fn cmd_preset_list() -> Result<()> {
 /// `duduclaw preset show <id>` — one preset's metadata + resolved config.
 pub fn cmd_preset_show(id: &str) -> Result<()> {
     let home = crate::duduclaw_home();
-    let p = preset::load_preset(&home, id).map_err(|e| DuDuClawError::Agent(preset_error_zh(&e)))?;
+    let p =
+        preset::load_preset(&home, id).map_err(|e| DuDuClawError::Agent(preset_error_zh(&e)))?;
     println!("職務組合：{id}");
     println!("  版本：v{}", p.meta.version);
     println!("  標籤：{}", p.meta.label);
@@ -110,7 +115,9 @@ pub fn cmd_preset_show(id: &str) -> Result<()> {
 /// `duduclaw preset bind --agent <id> --preset <ref> [--reason <text>]`.
 pub async fn cmd_preset_bind(agent: &str, preset_ref: &str, reason: &str) -> Result<()> {
     if let Some(claimed) = crate::agent_session_identity() {
-        return Err(DuDuClawError::Agent(refuse_preset_write_in_agent_session(&claimed)));
+        return Err(DuDuClawError::Agent(refuse_preset_write_in_agent_session(
+            &claimed,
+        )));
     }
     let home = crate::duduclaw_home();
     let dir = agent_dir_or_err(&home, agent)?;
@@ -168,7 +175,9 @@ pub async fn cmd_preset_bind(agent: &str, preset_ref: &str, reason: &str) -> Res
 /// `duduclaw preset unbind --agent <id> [--reason <text>]`.
 pub async fn cmd_preset_unbind(agent: &str, reason: &str) -> Result<()> {
     if let Some(claimed) = crate::agent_session_identity() {
-        return Err(DuDuClawError::Agent(refuse_preset_write_in_agent_session(&claimed)));
+        return Err(DuDuClawError::Agent(refuse_preset_write_in_agent_session(
+            &claimed,
+        )));
     }
     let home = crate::duduclaw_home();
     let dir = agent_dir_or_err(&home, agent)?;
@@ -215,7 +224,13 @@ pub fn cmd_preset_status(agent: &str) -> Result<()> {
 
     match resolution {
         PresetResolution::Unbound => println!("「{agent}」目前沒有套用任何職務組合。"),
-        PresetResolution::Applied { preset_id, version, label, changed_fields, .. } => {
+        PresetResolution::Applied {
+            preset_id,
+            version,
+            label,
+            changed_fields,
+            ..
+        } => {
             println!("「{agent}」目前套用：{preset_id} v{version}（{label}）");
             if changed_fields.is_empty() {
                 println!("  沒有任何欄位被本機 agent.toml 覆寫。");
@@ -223,7 +238,11 @@ pub fn cmd_preset_status(agent: &str) -> Result<()> {
                 println!("  已覆寫欄位：{}", changed_fields.join(", "));
             }
         }
-        PresetResolution::Unresolved { preset_id, version, reason } => {
+        PresetResolution::Unresolved {
+            preset_id,
+            version,
+            reason,
+        } => {
             println!(
                 "{} 「{agent}」綁定了「{preset_id}」v{version}，但目前無法套用：{reason}",
                 style("⚠️").yellow()
@@ -271,7 +290,9 @@ pub fn cmd_preset_install_builtin(force: bool) -> Result<()> {
                     if !entry.path().is_dir() {
                         continue;
                     }
-                    let Some(id) = entry.file_name().to_str().map(str::to_string) else { continue };
+                    let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+                        continue;
+                    };
                     let src_file = entry.path().join(preset::PRESET_FILE);
                     if !src_file.is_file() {
                         continue;
@@ -282,8 +303,9 @@ pub fn cmd_preset_install_builtin(force: bool) -> Result<()> {
                         skipped.push(id);
                         continue;
                     }
-                    std::fs::create_dir_all(&dest_dir)
-                        .map_err(|e| DuDuClawError::Agent(format!("建立 {} 失敗：{e}", dest_dir.display())))?;
+                    std::fs::create_dir_all(&dest_dir).map_err(|e| {
+                        DuDuClawError::Agent(format!("建立 {} 失敗：{e}", dest_dir.display()))
+                    })?;
                     std::fs::copy(&src_file, &dest_file)
                         .map_err(|e| DuDuClawError::Agent(format!("複製 {id} 失敗：{e}")))?;
                     installed.push(id);
@@ -293,7 +315,12 @@ pub fn cmd_preset_install_builtin(force: bool) -> Result<()> {
     }
 
     if !installed.is_empty() {
-        println!("{} 已安裝 {} 個內建職務組合：{}", style("✓").green().bold(), installed.len(), installed.join(", "));
+        println!(
+            "{} 已安裝 {} 個內建職務組合：{}",
+            style("✓").green().bold(),
+            installed.len(),
+            installed.join(", ")
+        );
     }
     if !skipped.is_empty() {
         println!(
@@ -316,7 +343,9 @@ pub fn cmd_preset_install_builtin(force: bool) -> Result<()> {
 }
 
 fn actor() -> String {
-    std::env::var("USER").map(|u| format!("cli:{u}")).unwrap_or_else(|_| "cli:operator".to_string())
+    std::env::var("USER")
+        .map(|u| format!("cli:{u}"))
+        .unwrap_or_else(|_| "cli:operator".to_string())
 }
 
 /// zh-TW refusal shown when a preset-binding write is attempted from inside
@@ -347,9 +376,18 @@ fn write_preset_mirror(agent_dir: &Path, binding: &preset::PresetBinding) -> std
         .parse::<toml::Table>()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let mut preset_tbl = toml::value::Table::new();
-    preset_tbl.insert("ref".to_string(), toml::Value::String(binding.preset_id.clone()));
-    preset_tbl.insert("version".to_string(), toml::Value::String(binding.version.clone()));
-    preset_tbl.insert("bound_at".to_string(), toml::Value::String(binding.bound_at.clone()));
+    preset_tbl.insert(
+        "ref".to_string(),
+        toml::Value::String(binding.preset_id.clone()),
+    );
+    preset_tbl.insert(
+        "version".to_string(),
+        toml::Value::String(binding.version.clone()),
+    );
+    preset_tbl.insert(
+        "bound_at".to_string(),
+        toml::Value::String(binding.bound_at.clone()),
+    );
     table.insert("preset".to_string(), toml::Value::Table(preset_tbl));
     write_agent_toml_atomic(&path, &table)
 }
@@ -399,18 +437,36 @@ mod tests {
     #[test]
     fn write_preset_mirror_adds_a_read_only_block_without_touching_other_sections() {
         let tmp = tempfile::tempdir().unwrap();
-        write_agent(tmp.path(), "[agent]\nname = \"clinic-sales\"\ndisplay_name = \"x\"\n");
+        write_agent(
+            tmp.path(),
+            "[agent]\nname = \"clinic-sales\"\ndisplay_name = \"x\"\n",
+        );
 
         write_preset_mirror(tmp.path(), &sample_binding()).unwrap();
 
-        let table: toml::value::Table =
-            std::fs::read_to_string(tmp.path().join("agent.toml")).unwrap().parse().unwrap();
-        let mirror = table.get("preset").and_then(|v| v.as_table()).expect("[preset] must exist");
-        assert_eq!(mirror.get("ref").and_then(|v| v.as_str()), Some("sales-followup"));
-        assert_eq!(mirror.get("version").and_then(|v| v.as_str()), Some("1.0.0"));
+        let table: toml::value::Table = std::fs::read_to_string(tmp.path().join("agent.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mirror = table
+            .get("preset")
+            .and_then(|v| v.as_table())
+            .expect("[preset] must exist");
+        assert_eq!(
+            mirror.get("ref").and_then(|v| v.as_str()),
+            Some("sales-followup")
+        );
+        assert_eq!(
+            mirror.get("version").and_then(|v| v.as_str()),
+            Some("1.0.0")
+        );
         // The [agent] section the write didn't touch must survive.
         assert_eq!(
-            table.get("agent").and_then(|v| v.as_table()).and_then(|t| t.get("name")).and_then(|v| v.as_str()),
+            table
+                .get("agent")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("name"))
+                .and_then(|v| v.as_str()),
             Some("clinic-sales")
         );
     }
@@ -422,8 +478,10 @@ mod tests {
         write_preset_mirror(tmp.path(), &sample_binding()).unwrap();
 
         clear_preset_mirror(tmp.path()).unwrap();
-        let table: toml::value::Table =
-            std::fs::read_to_string(tmp.path().join("agent.toml")).unwrap().parse().unwrap();
+        let table: toml::value::Table = std::fs::read_to_string(tmp.path().join("agent.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
         assert!(!table.contains_key("preset"));
 
         // Calling again (nothing to clear) must not error.

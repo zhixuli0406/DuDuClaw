@@ -140,7 +140,10 @@ impl DailyCircuitBreaker {
     pub fn record_spend(&mut self, agent: &str, now: DateTime<Utc>, millicents: u64) {
         let list = self.spends.entry(agent.to_string()).or_default();
         Self::prune_spends(list, now);
-        list.push(SpendEvent { at: now, millicents });
+        list.push(SpendEvent {
+            at: now,
+            millicents,
+        });
     }
 
     /// Load persisted state from `path`. A missing, unreadable, or corrupt
@@ -705,7 +708,10 @@ pub fn spawn_night_engine(
                 continue;
             }
 
-            let memory = match SqliteMemoryEngine::new(&memory_db) {
+            // H4: built through `memory_factory` so the N3/N4 consolidation
+            // writes go through `[memory] novelty_gate` like every other
+            // gateway-internal writer.
+            let memory = match crate::memory_factory::build_memory_engine(&memory_db, &home_dir) {
                 Ok(m) => m,
                 Err(err) => {
                     warn!(error = %err, "night engine: cannot open memory.db, skipping cycle");
@@ -919,7 +925,9 @@ mod tests {
         let home = dir.path().to_path_buf();
         std::fs::write(home.join("night_breaker.json"), "garbage \u{1F980} bytes").unwrap();
         let mem = SqliteMemoryEngine::in_memory().unwrap();
-        mem.store("a", ep("a", "corrupt file context")).await.unwrap();
+        mem.store("a", ep("a", "corrupt file context"))
+            .await
+            .unwrap();
         let cfg = NightEngineConfig {
             enabled: true,
             ..Default::default()
@@ -929,7 +937,10 @@ mod tests {
         let out = engine
             .maybe_run("a", &cfg, None, Utc::now(), &mem, None)
             .await;
-        assert!(out.is_some(), "corrupt breaker file must not block or crash");
+        assert!(
+            out.is_some(),
+            "corrupt breaker file must not block or crash"
+        );
     }
 
     // ── budget ──
@@ -1175,15 +1186,10 @@ mod tests {
         engine
             .record_daily_spend("a", now, daily_spend_cap_millicents(&cfg) - 1_000)
             .await;
-        let report = engine
-            .run_pass("a", &cfg, now, &mem, Some(&MockLlm))
-            .await;
+        let report = engine.run_pass("a", &cfg, now, &mem, Some(&MockLlm)).await;
         assert!(!report.sleep_cached && !report.prefetch_cached);
         assert!(
-            report
-                .notes
-                .iter()
-                .any(|n| n.contains("daily spend cap")),
+            report.notes.iter().any(|n| n.contains("daily spend cap")),
             "spend-cap skip must be noted: {report:?}"
         );
         assert_eq!(report.spent_cents, 0, "no call → no pass spend");

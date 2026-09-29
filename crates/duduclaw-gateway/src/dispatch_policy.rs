@@ -37,6 +37,18 @@ pub enum DispatchPolicyKind {
     RoundRobin,
     /// LLM picks from the roster, fail-closed to `FixedHierarchy`.
     LlmSelect,
+    /// Team-as-Agent (P1/WP-4): selection still yields the **employee**, and
+    /// the composer ([`crate::team_composer`]) splits that employee's round
+    /// into planner / executor(s) / verifier members inside it.
+    ///
+    /// Why selection is unchanged: a team is a grouping *inside* one employee
+    /// (design §1), so `tasks.list`, `assigned_to`, board assignment, channel
+    /// binding and cost attribution all keep meaning exactly what they mean
+    /// today. A policy that returned three ids here would leak internal roles
+    /// into every user-facing surface — which is the exact mistake
+    /// `research/.../10-codebase-team-as-agent-infra.md` §3.1 lists as the
+    /// first of three things that break when roles are modelled as agents.
+    RoleTeam,
 }
 
 impl DispatchPolicyKind {
@@ -45,6 +57,7 @@ impl DispatchPolicyKind {
             DispatchPolicyKind::FixedHierarchy => "fixed_hierarchy",
             DispatchPolicyKind::RoundRobin => "round_robin",
             DispatchPolicyKind::LlmSelect => "llm_select",
+            DispatchPolicyKind::RoleTeam => "role_team",
         }
     }
 
@@ -55,6 +68,7 @@ impl DispatchPolicyKind {
             "fixed_hierarchy" | "fixed" | "" => DispatchPolicyKind::FixedHierarchy,
             "round_robin" | "roundrobin" => DispatchPolicyKind::RoundRobin,
             "llm_select" | "llmselect" | "llm" => DispatchPolicyKind::LlmSelect,
+            "role_team" | "roleteam" | "team" => DispatchPolicyKind::RoleTeam,
             _ => DispatchPolicyKind::FixedHierarchy,
         }
     }
@@ -100,11 +114,7 @@ impl DispatchPolicyKind {
 /// task carries any (comma-separated `tags`), else the priority. Deterministic
 /// and cheap — no external lookups.
 pub fn task_class(task: &TaskRow) -> String {
-    let first_tag = task
-        .tags
-        .split(',')
-        .map(str::trim)
-        .find(|t| !t.is_empty());
+    let first_tag = task.tags.split(',').map(str::trim).find(|t| !t.is_empty());
     match first_tag {
         Some(tag) => tag.to_string(),
         None => task.priority.clone(),
@@ -278,6 +288,30 @@ impl<C: duduclaw_fork::judge::LlmCaller> DispatchPolicy for LlmSelect<C> {
     }
 }
 
+/// Team-as-Agent selection (P1/WP-4).
+///
+/// Yields the same employee id [`FixedHierarchy`] would — deliberately. The
+/// team lives *inside* that employee: `crate::team_composer` splits the
+/// employee's round into planner / executor(s) / verifier members, so
+/// `tasks.list`, board assignment and cost attribution keep their present
+/// meaning. Selecting a role member here would put `eph-…` ids into every
+/// user-facing task surface.
+///
+/// The kind therefore exists for two reasons and no third: it makes "this
+/// deployment composes teams" legible in logs and telemetry, and it gives the
+/// goal-loop driver a name to branch on that is not "read the config again".
+pub struct RoleTeam;
+
+#[async_trait]
+impl DispatchPolicy for RoleTeam {
+    fn kind(&self) -> DispatchPolicyKind {
+        DispatchPolicyKind::RoleTeam
+    }
+    async fn select(&self, task: &TaskRow, roster: &[String]) -> Option<String> {
+        FixedHierarchy.select(task, roster).await
+    }
+}
+
 /// Production [`duduclaw_fork::judge::LlmCaller`] for `LlmSelect`, routed through
 /// the same provider-agnostic utility choke-point the acceptance judge uses
 /// ([`crate::runtime_dispatch::run_utility_prompt`]) — honors the configured
@@ -315,9 +349,9 @@ pub fn build_policy(home_dir: &Path) -> Option<Arc<dyn DispatchPolicy>> {
             // the pre-D4 path.
             if crate::topology_evolution::enabled(home_dir) {
                 debug!("dispatch policy: fixed_hierarchy + D5 active-override lookup");
-                Some(Arc::new(crate::topology_evolution::HierarchyWithOverride::new(
-                    home_dir.to_path_buf(),
-                )))
+                Some(Arc::new(
+                    crate::topology_evolution::HierarchyWithOverride::new(home_dir.to_path_buf()),
+                ))
             } else {
                 debug!("dispatch policy: fixed_hierarchy (default — assigned_to unchanged)");
                 None
@@ -327,6 +361,12 @@ pub fn build_policy(home_dir: &Path) -> Option<Arc<dyn DispatchPolicy>> {
         DispatchPolicyKind::LlmSelect => Some(Arc::new(LlmSelect::new(UtilitySelectCaller {
             home_dir: home_dir.to_path_buf(),
         }))),
+        DispatchPolicyKind::RoleTeam => {
+            debug!(
+                "dispatch policy: role_team (selection yields the employee; roles run inside it)"
+            );
+            Some(Arc::new(RoleTeam))
+        }
     }
 }
 
@@ -369,6 +409,48 @@ mod tests {
         assert_eq!(
             DispatchPolicyKind::from_config_str(""),
             DispatchPolicyKind::FixedHierarchy
+        );
+    }
+
+    #[test]
+    fn role_team_is_the_fourth_kind_with_its_own_token() {
+        for raw in ["role_team", "roleTeam", "  TEAM "] {
+            assert_eq!(
+                DispatchPolicyKind::from_config_str(raw),
+                DispatchPolicyKind::RoleTeam,
+                "{raw:?}"
+            );
+        }
+        assert_eq!(DispatchPolicyKind::RoleTeam.as_str(), "role_team");
+        // Every kind's token is distinct — these land in logs and telemetry.
+        let tokens = [
+            DispatchPolicyKind::FixedHierarchy.as_str(),
+            DispatchPolicyKind::RoundRobin.as_str(),
+            DispatchPolicyKind::LlmSelect.as_str(),
+            DispatchPolicyKind::RoleTeam.as_str(),
+        ];
+        let mut sorted = tokens.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), tokens.len());
+    }
+
+    #[tokio::test]
+    async fn role_team_selection_still_yields_the_employee() {
+        let t = task_with("t1", "agnes", "", "medium");
+        let chosen = RoleTeam.select(&t, &["agnes".into(), "bob".into()]).await;
+        assert_eq!(
+            chosen.as_deref(),
+            Some("agnes"),
+            "a team is a grouping inside one employee — selection must not leak role members"
+        );
+        // Unassigned behaves exactly like FixedHierarchy: no opinion.
+        let unassigned = task_with("t2", "", "", "medium");
+        assert!(
+            RoleTeam
+                .select(&unassigned, &["agnes".into()])
+                .await
+                .is_none()
         );
     }
 
@@ -436,7 +518,10 @@ mod tests {
     #[test]
     fn parse_selected_agent_is_fail_closed() {
         let roster = vec!["eng-a".to_string(), "eng-b".to_string()];
-        assert_eq!(parse_selected_agent("eng-b", &roster).as_deref(), Some("eng-b"));
+        assert_eq!(
+            parse_selected_agent("eng-b", &roster).as_deref(),
+            Some("eng-b")
+        );
         // Quoted / punctuated reply still matches.
         assert_eq!(
             parse_selected_agent("\"eng-a\".", &roster).as_deref(),

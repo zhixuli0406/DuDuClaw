@@ -1,7 +1,7 @@
 // auth_device.rs — OAuth 2.0 Device Authorization Grant (RFC 8628) login for
 // subscription seats, plus the proxy-side seat forwarding for those seats.
 //
-// `duduclaw auth device --provider copilot|qwen` runs the device flow, prints
+// `duduclaw auth device --provider copilot` runs the device flow, prints
 // the user code + verification URL, polls until the user authorizes, then
 // stores the resulting seat credential (AES-256-GCM encrypted, same pattern as
 // every other stored token) into `config.toml [[accounts]]` as an OAuth
@@ -10,30 +10,26 @@
 // upstream token and forwards requests to the provider's chat/completions API.
 //
 // G2 — subscription OAuth breadth. Competitor Hermes consumes Claude Max /
-// ChatGPT Codex / GitHub Copilot / Qwen subscriptions and re-exports them via a
-// local proxy; this closes the Copilot + Qwen seats.
+// ChatGPT Codex / GitHub Copilot subscriptions and re-exports them via a local
+// proxy; this closes the Copilot seat.
 //
 // Verified endpoints (first-hand sources cited inline):
 //   - GitHub device flow: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow
 //   - Copilot token mint + editor headers + public client id `Iv1.b507a08c87ecfe98`:
 //     ericc-ch/copilot-api `src/lib/api-config.ts` + `src/services/github/*`
-//   - Qwen device flow endpoints + client id: QwenLM/qwen-code
-//     `packages/core/src/qwen/qwenOAuth2.ts`
 //
-// Qwen NOTE (honest status): Qwen's free OAuth tier was discontinued 2026-04-15
-// and the flow was removed from the qwen-code auth dialog. The endpoints below
-// are transcribed from the qwen-code source (first-hand) but CANNOT be
-// live-verified against a working subscription. The seam is complete and the
-// Copilot path is fully live-testable; Qwen forwarding is PENDING-LIVE.
+// A Qwen Portal seat used to live here too. Qwen discontinued its free OAuth
+// tier on 2026-04-15 and removed the flow from the qwen-code auth dialog, so
+// the branch could never be live-verified; it was removed in 2026-09. Copilot
+// is the only device-flow seat.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::Mutex;
-use tracing::warn;
 
 use duduclaw_core::error::{DuDuClawError, Result};
 
@@ -42,7 +38,7 @@ use duduclaw_core::error::{DuDuClawError, Result};
 /// Static configuration for one provider's device-authorization flow.
 #[derive(Debug, Clone)]
 pub struct DeviceFlowConfig {
-    /// Provider id stored on the account (`"github"` for Copilot, `"qwen"`).
+    /// Provider id stored on the account (`"github"` for Copilot).
     pub provider_id: &'static str,
     /// Human-facing display name.
     pub display: &'static str,
@@ -54,10 +50,6 @@ pub struct DeviceFlowConfig {
     pub default_client_id: &'static str,
     /// Requested scope (space-delimited).
     pub scope: &'static str,
-    /// Whether the flow uses PKCE (RFC 7636).
-    pub uses_pkce: bool,
-    /// `false` marks a PENDING-LIVE / unverified flow (warned at runtime).
-    pub verified: bool,
 }
 
 /// GitHub Copilot device flow.
@@ -74,21 +66,6 @@ pub const COPILOT: DeviceFlowConfig = DeviceFlowConfig {
     token_url: "https://github.com/login/oauth/access_token",
     default_client_id: "Iv1.b507a08c87ecfe98",
     scope: "read:user",
-    uses_pkce: false,
-    verified: true,
-};
-
-/// Qwen Portal device flow. Endpoints + client id from QwenLM/qwen-code
-/// `packages/core/src/qwen/qwenOAuth2.ts`. PENDING-LIVE (see module note).
-pub const QWEN: DeviceFlowConfig = DeviceFlowConfig {
-    provider_id: "qwen",
-    display: "Qwen Portal",
-    device_code_url: "https://chat.qwen.ai/api/v1/oauth2/device/code",
-    token_url: "https://chat.qwen.ai/api/v1/oauth2/token",
-    default_client_id: "f0304373b74a44d2b584a3fb70ca9e56",
-    scope: "openid profile email model.completion",
-    uses_pkce: true,
-    verified: false,
 };
 
 /// Copilot chat/completions upstream (OpenAI-compatible). Source:
@@ -97,11 +74,10 @@ pub const COPILOT_API_BASE: &str = "https://api.githubcopilot.com";
 /// GitHub REST API base — used for the Copilot token exchange.
 pub const GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// Resolve a CLI `--provider` value (`copilot`/`github`, `qwen`) to its config.
+/// Resolve a CLI `--provider` value (`copilot`/`github`) to its config.
 pub fn config_for(provider: &str) -> Option<DeviceFlowConfig> {
     match provider.to_ascii_lowercase().as_str() {
         "copilot" | "github" => Some(COPILOT),
-        "qwen" | "qwen-portal" => Some(QWEN),
         _ => None,
     }
 }
@@ -148,7 +124,11 @@ pub fn parse_device_code(v: &Value) -> std::result::Result<DeviceCode, String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     let expires_in = v.get("expires_in").and_then(|x| x.as_u64()).unwrap_or(900);
-    let interval = v.get("interval").and_then(|x| x.as_u64()).unwrap_or(5).max(1);
+    let interval = v
+        .get("interval")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(5)
+        .max(1);
     Ok(DeviceCode {
         device_code,
         user_code,
@@ -203,22 +183,6 @@ pub fn bump_interval(current: u64) -> u64 {
     current.saturating_add(5)
 }
 
-// ── PKCE (RFC 7636) ──────────────────────────────────────────────────────────
-
-/// Generate a `(code_verifier, code_challenge)` pair using the S256 method.
-///
-/// The verifier is 32 random bytes base64url-encoded (no padding); the
-/// challenge is the base64url SHA-256 of the verifier's ASCII bytes.
-pub fn generate_pkce() -> (String, String) {
-    use rand::Rng;
-    use sha2::{Digest, Sha256};
-    let raw: [u8; 32] = rand::thread_rng().r#gen();
-    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
-    let digest = Sha256::digest(verifier.as_bytes());
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-    (verifier, challenge)
-}
-
 // ── Token masking (never log a raw token) ────────────────────────────────────
 
 /// Mask a token for logs: keep the first 4 chars, replace the rest with `*`
@@ -242,24 +206,8 @@ pub fn mask_token(token: &str) -> String {
 ///
 /// - **Copilot** persists the long-lived GitHub OAuth `access_token` as a plain
 ///   string. The proxy exchanges it on-demand for a short-lived Copilot token.
-/// - **Qwen** persists a JSON bundle (`access_token` + `refresh_token` +
-///   `resource_url` + `expires_at`) because the Qwen access token is itself
-///   short-lived and refreshed via the refresh token.
-pub fn seat_credential_from_token_response(cfg: &DeviceFlowConfig, tok: &Value) -> String {
-    if cfg.provider_id == "qwen" {
-        // Persist the whole bundle so the proxy can refresh.
-        let expires_at = tok
-            .get("expires_in")
-            .and_then(|x| x.as_u64())
-            .map(|secs| now_unix().saturating_add(secs));
-        json!({
-            "access_token": tok.get("access_token").and_then(|x| x.as_str()).unwrap_or(""),
-            "refresh_token": tok.get("refresh_token").and_then(|x| x.as_str()).unwrap_or(""),
-            "resource_url": tok.get("resource_url").and_then(|x| x.as_str()).unwrap_or(""),
-            "expires_at": expires_at,
-        })
-        .to_string()
-    } else {
+pub fn seat_credential_from_token_response(_cfg: &DeviceFlowConfig, tok: &Value) -> String {
+    {
         // Copilot: the raw GitHub OAuth token.
         tok.get("access_token")
             .and_then(|x| x.as_str())
@@ -363,7 +311,7 @@ fn resolve_client_id(cfg: &DeviceFlowConfig, cli: Option<&str>, config: &toml::T
 pub async fn run(provider: &str, cli_client_id: Option<String>, home: &Path) -> Result<()> {
     let cfg = config_for(provider).ok_or_else(|| {
         DuDuClawError::Config(format!(
-            "未知的 provider `{provider}`（支援：copilot、qwen）"
+            "未知的 provider `{provider}`（支援：copilot）"
         ))
     })?;
 
@@ -374,38 +322,16 @@ pub async fn run(provider: &str, cli_client_id: Option<String>, home: &Path) -> 
         .unwrap_or_default();
     let client_id = resolve_client_id(&cfg, cli_client_id.as_deref(), &config);
 
-    if !cfg.verified {
-        warn!(
-            provider = cfg.provider_id,
-            "此 provider 的 device flow 為 PENDING-LIVE（端點取自開源實作，未經實機驗證）"
-        );
-        println!(
-            "⚠ {} 的裝置授權流程為 PENDING-LIVE：端點取自 qwen-code 原始碼，Qwen 免費 OAuth 已於 2026-04-15 停用，可能無法完成登入。",
-            cfg.display
-        );
-    }
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| DuDuClawError::Gateway(format!("HTTP client 建立失敗：{e}")))?;
 
-    // PKCE (Qwen only).
-    let pkce = if cfg.uses_pkce {
-        Some(generate_pkce())
-    } else {
-        None
-    };
-
     // 1. Request a device code.
-    let mut form: Vec<(&str, String)> = vec![
+    let form: Vec<(&str, String)> = vec![
         ("client_id", client_id.clone()),
         ("scope", cfg.scope.to_string()),
     ];
-    if let Some((_, challenge)) = &pkce {
-        form.push(("code_challenge", challenge.clone()));
-        form.push(("code_challenge_method", "S256".to_string()));
-    }
     let resp = client
         .post(cfg.device_code_url)
         .header("Accept", "application/json")
@@ -445,7 +371,7 @@ pub async fn run(provider: &str, cli_client_id: Option<String>, home: &Path) -> 
         }
         tokio::time::sleep(Duration::from_secs(interval)).await;
 
-        let mut poll_form: Vec<(&str, String)> = vec![
+        let poll_form: Vec<(&str, String)> = vec![
             ("client_id", client_id.clone()),
             ("device_code", dc.device_code.clone()),
             (
@@ -453,9 +379,6 @@ pub async fn run(provider: &str, cli_client_id: Option<String>, home: &Path) -> 
                 "urn:ietf:params:oauth:grant-type:device_code".to_string(),
             ),
         ];
-        if let Some((verifier, _)) = &pkce {
-            poll_form.push(("code_verifier", verifier.clone()));
-        }
         let presp = client
             .post(cfg.token_url)
             .header("Accept", "application/json")
@@ -472,10 +395,10 @@ pub async fn run(provider: &str, cli_client_id: Option<String>, home: &Path) -> 
             }
             PollOutcome::Authorized(t) => break t,
             PollOutcome::Denied => {
-                return Err(DuDuClawError::Gateway("使用者拒絕了授權請求".to_string()))
+                return Err(DuDuClawError::Gateway("使用者拒絕了授權請求".to_string()));
             }
             PollOutcome::Expired => {
-                return Err(DuDuClawError::Gateway("裝置代碼已逾期".to_string()))
+                return Err(DuDuClawError::Gateway("裝置代碼已逾期".to_string()));
             }
             PollOutcome::Error(e) => return Err(DuDuClawError::Gateway(e)),
         }
@@ -495,12 +418,7 @@ pub async fn run(provider: &str, cli_client_id: Option<String>, home: &Path) -> 
         "\n✓ {} 座位已儲存（帳號 id `{}`，憑證加密於 config.toml）",
         cfg.display, id
     );
-    println!(
-        "  現在啟動 proxy 即可轉發此座位： duduclaw proxy --bind 127.0.0.1:8788"
-    );
-    if !cfg.verified {
-        println!("  （提醒：Qwen 轉發為 PENDING-LIVE，尚未實機驗證）");
-    }
+    println!("  現在啟動 proxy 即可轉發此座位： duduclaw proxy --bind 127.0.0.1:8788");
     Ok(())
 }
 
@@ -644,7 +562,6 @@ pub fn seat_model_ids(provider_id: &str) -> &'static [&'static str] {
             "claude-sonnet-4",
             "gemini-2.0-flash-001",
         ],
-        "qwen" => &["qwen3-coder-plus", "qwen3-coder-flash", "qwen-max-latest"],
         _ => &[],
     }
 }
@@ -654,21 +571,13 @@ pub fn seat_model_ids(provider_id: &str) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn config_for_aliases() {
         assert_eq!(config_for("copilot").unwrap().provider_id, "github");
         assert_eq!(config_for("github").unwrap().provider_id, "github");
-        assert_eq!(config_for("qwen").unwrap().provider_id, "qwen");
         assert!(config_for("bogus").is_none());
-    }
-
-    #[test]
-    fn copilot_is_verified_qwen_is_pending() {
-        assert!(COPILOT.verified);
-        assert!(!QWEN.verified, "Qwen must be flagged PENDING-LIVE");
-        assert!(QWEN.uses_pkce);
-        assert!(!COPILOT.uses_pkce);
     }
 
     #[test]
@@ -691,16 +600,16 @@ mod tests {
         let v = json!({
             "device_code": "dc",
             "user_code": "uc",
-            "verification_url": "https://chat.qwen.ai/authorize",
-            "verification_uri_complete": "https://chat.qwen.ai/authorize?code=uc",
+            "verification_url": "https://example.test/authorize",
+            "verification_uri_complete": "https://example.test/authorize?code=uc",
             "interval": 8,
             "expires_in": 600
         });
         let dc = parse_device_code(&v).unwrap();
-        assert_eq!(dc.verification_uri, "https://chat.qwen.ai/authorize");
+        assert_eq!(dc.verification_uri, "https://example.test/authorize");
         assert_eq!(
             dc.verification_uri_complete.as_deref(),
-            Some("https://chat.qwen.ai/authorize?code=uc")
+            Some("https://example.test/authorize?code=uc")
         );
         assert_eq!(dc.interval, 8);
     }
@@ -708,7 +617,9 @@ mod tests {
     #[test]
     fn parse_device_code_missing_required_fields_errors() {
         assert!(parse_device_code(&json!({ "user_code": "x", "verification_uri": "y" })).is_err());
-        assert!(parse_device_code(&json!({ "device_code": "x", "verification_uri": "y" })).is_err());
+        assert!(
+            parse_device_code(&json!({ "device_code": "x", "verification_uri": "y" })).is_err()
+        );
         assert!(parse_device_code(&json!({ "device_code": "x", "user_code": "y" })).is_err());
     }
 
@@ -758,18 +669,6 @@ mod tests {
     }
 
     #[test]
-    fn pkce_challenge_is_deterministic_sha256_of_verifier() {
-        use sha2::{Digest, Sha256};
-        let (verifier, challenge) = generate_pkce();
-        // Recompute the challenge from the verifier and compare.
-        let expect =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        assert_eq!(challenge, expect);
-        // base64url no-pad: no '+', '/', or '=' characters.
-        assert!(!challenge.contains('+') && !challenge.contains('/') && !challenge.contains('='));
-    }
-
-    #[test]
     fn mask_token_keeps_prefix_only() {
         assert_eq!(mask_token(""), "");
         assert_eq!(mask_token("abcd"), "****");
@@ -785,22 +684,6 @@ mod tests {
             seat_credential_from_token_response(&COPILOT, &tok),
             "gho_abc"
         );
-    }
-
-    #[test]
-    fn qwen_seat_credential_is_json_bundle() {
-        let tok = json!({
-            "access_token": "qw_access",
-            "refresh_token": "qw_refresh",
-            "resource_url": "https://portal.qwen.ai/v1",
-            "expires_in": 3600
-        });
-        let bundle = seat_credential_from_token_response(&QWEN, &tok);
-        let parsed: Value = serde_json::from_str(&bundle).unwrap();
-        assert_eq!(parsed["access_token"], "qw_access");
-        assert_eq!(parsed["refresh_token"], "qw_refresh");
-        assert_eq!(parsed["resource_url"], "https://portal.qwen.ai/v1");
-        assert!(parsed["expires_at"].as_u64().is_some());
     }
 
     #[test]
@@ -824,7 +707,6 @@ mod tests {
     #[test]
     fn seat_model_ids_only_for_known_providers() {
         assert!(!seat_model_ids("github").is_empty());
-        assert!(!seat_model_ids("qwen").is_empty());
         assert!(seat_model_ids("anthropic").is_empty());
     }
 

@@ -16,9 +16,9 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use duduclaw_core::error::{DuDuClawError, Result};
-use flate2::write::GzEncoder;
-use flate2::read::GzDecoder;
 use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 
 /// Top-level directory names skipped during export (heavy or ephemeral).
 const EXCLUDE_DIRS: &[&str] = &["models", "logs", "target"];
@@ -43,7 +43,10 @@ fn io_err(ctx: &str, e: impl std::fmt::Display) -> DuDuClawError {
 /// number of top-level entries written.
 pub fn export_home(home: &Path, out: &Path) -> Result<usize> {
     if !home.is_dir() {
-        return Err(io_err("export", format!("home dir not found: {}", home.display())));
+        return Err(io_err(
+            "export",
+            format!("home dir not found: {}", home.display()),
+        ));
     }
     let file = File::create(out).map_err(|e| io_err("export create", e))?;
     let enc = GzEncoder::new(file, Compression::default());
@@ -59,7 +62,9 @@ pub fn export_home(home: &Path, out: &Path) -> Result<usize> {
             continue;
         }
         let path = entry.path();
-        let ft = entry.file_type().map_err(|e| io_err("export file_type", e))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| io_err("export file_type", e))?;
         if ft.is_dir() {
             builder
                 .append_dir_all(&name, &path)
@@ -73,7 +78,9 @@ pub fn export_home(home: &Path, out: &Path) -> Result<usize> {
         }
         count += 1;
     }
-    let enc = builder.into_inner().map_err(|e| io_err("export finish tar", e))?;
+    let enc = builder
+        .into_inner()
+        .map_err(|e| io_err("export finish tar", e))?;
     enc.finish().map_err(|e| io_err("export finish gz", e))?;
     Ok(count)
 }
@@ -89,7 +96,10 @@ pub fn export_home(home: &Path, out: &Path) -> Result<usize> {
 /// `..` path traversal).
 pub fn import_archive(archive: &Path, home: &Path, force: bool) -> Result<()> {
     if !archive.is_file() {
-        return Err(io_err("import", format!("archive not found: {}", archive.display())));
+        return Err(io_err(
+            "import",
+            format!("archive not found: {}", archive.display()),
+        ));
     }
     let existing_agents = home.join("agents");
     if existing_agents.exists() {
@@ -128,11 +138,8 @@ mod tests {
 
     fn unique_tmp(tag: &str) -> PathBuf {
         // Avoid extra dev-deps: derive a per-process unique dir. No Date needed.
-        let base = std::env::temp_dir().join(format!(
-            "dudu_portability_{}_{}",
-            std::process::id(),
-            tag
-        ));
+        let base =
+            std::env::temp_dir().join(format!("dudu_portability_{}_{}", std::process::id(), tag));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         base
@@ -165,7 +172,10 @@ mod tests {
         // included content
         write(&home1.join("agents/alice/SOUL.md"), "i am alice");
         write(&home1.join("config.toml"), "k = 1");
-        write(&home1.join("license.json"), "{\"tier\":\"personal_pro_self_host\"}");
+        write(
+            &home1.join("license.json"),
+            "{\"tier\":\"personal_pro_self_host\"}",
+        );
         // excluded content
         write(&home1.join("models/big.gguf"), "HUGE");
         write(&home1.join("logs/run.log"), "noise");
@@ -180,8 +190,14 @@ mod tests {
         let home2 = root.join("home2");
         import_archive(&archive, &home2, false).unwrap();
 
-        assert_eq!(fs::read_to_string(home2.join("agents/alice/SOUL.md")).unwrap(), "i am alice");
-        assert_eq!(fs::read_to_string(home2.join("config.toml")).unwrap(), "k = 1");
+        assert_eq!(
+            fs::read_to_string(home2.join("agents/alice/SOUL.md")).unwrap(),
+            "i am alice"
+        );
+        assert_eq!(
+            fs::read_to_string(home2.join("config.toml")).unwrap(),
+            "k = 1"
+        );
         assert!(home2.join("license.json").is_file());
         // excluded entries did NOT travel
         assert!(!home2.join("models").exists());
@@ -205,7 +221,10 @@ mod tests {
         // without force → refuses
         assert!(import_archive(&archive, &target, false).is_err());
         // existing data untouched
-        assert_eq!(fs::read_to_string(target.join("agents/existing/SOUL.md")).unwrap(), "OLD");
+        assert_eq!(
+            fs::read_to_string(target.join("agents/existing/SOUL.md")).unwrap(),
+            "OLD"
+        );
 
         // with force → existing agents preserved under agents.pre-import, new imported
         import_archive(&archive, &target, true).unwrap();
@@ -213,7 +232,10 @@ mod tests {
             fs::read_to_string(target.join("agents.pre-import/existing/SOUL.md")).unwrap(),
             "OLD"
         );
-        assert_eq!(fs::read_to_string(target.join("agents/a/SOUL.md")).unwrap(), "new");
+        assert_eq!(
+            fs::read_to_string(target.join("agents/a/SOUL.md")).unwrap(),
+            "new"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

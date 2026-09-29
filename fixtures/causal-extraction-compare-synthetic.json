@@ -1,0 +1,176 @@
+{
+  "version": "causal-extraction-compare-v2",
+  "cutoff_unix": 200,
+  "cases": [
+    {
+      "id": "train-rule",
+      "occurred_at": 100,
+      "source_lineage_id": "training-rule",
+      "question": "What changes next-day support backlog?",
+      "source_text": "Synthetic rule: more tickets increase backlog.",
+      "gold": [
+        {
+          "cause_variable": "daily_arrivals",
+          "effect_variable": "next_day_backlog",
+          "lag_min_seconds": 0,
+          "lag_max_seconds": 86400,
+          "modality": "asserted",
+          "stance": "supports",
+          "span_start": 0,
+          "span_end": 46,
+          "excerpt": "Synthetic rule: more tickets increase backlog.",
+          "speaker_id": "synthetic-rule",
+          "context": {
+            "synthetic": true
+          }
+        }
+      ],
+      "responses": [
+        {
+          "model_id": "synthetic_candidate_a",
+          "response_json": "{\"claims\": []}"
+        },
+        {
+          "model_id": "synthetic_candidate_b",
+          "response_json": "{\"claims\": []}"
+        }
+      ],
+      "source_family_id": "training-rule"
+    },
+    {
+      "id": "held-arrivals",
+      "occurred_at": 201,
+      "source_lineage_id": "arrival-thread",
+      "question": "What changes next-day support backlog?",
+      "source_text": "Synthetic rule: more arrivals increase next-day backlog.",
+      "gold": [
+        {
+          "cause_variable": "daily_arrivals",
+          "effect_variable": "next_day_backlog",
+          "lag_min_seconds": 0,
+          "lag_max_seconds": 86400,
+          "modality": "asserted",
+          "stance": "supports",
+          "span_start": 0,
+          "span_end": 56,
+          "excerpt": "Synthetic rule: more arrivals increase next-day backlog.",
+          "speaker_id": "synthetic-rule",
+          "context": {
+            "synthetic": true
+          }
+        }
+      ],
+      "reviewed_edges": [
+        {
+          "cause_variable": "daily_arrivals",
+          "effect_variable": "next_day_backlog",
+          "lag_min_seconds": 0,
+          "lag_max_seconds": 86400,
+          "modality": "asserted",
+          "accepted": true
+        }
+      ],
+      "responses": [
+        {
+          "model_id": "synthetic_candidate_a",
+          "response_json": "{\"claims\": [{\"cause_variable\": \"daily_arrivals\", \"effect_variable\": \"next_day_backlog\", \"lag_min_seconds\": 0, \"lag_max_seconds\": 86400, \"modality\": \"asserted\", \"stance\": \"supports\", \"span_start\": 0, \"span_end\": 56, \"excerpt\": \"Synthetic rule: more arrivals increase next-day backlog.\", \"speaker_id\": \"synthetic-rule\", \"context\": {\"synthetic\": true}}]}"
+        },
+        {
+          "model_id": "synthetic_candidate_b",
+          "response_json": "{\"claims\": [{\"cause_variable\": \"daily_arrivals\", \"effect_variable\": \"next_day_backlog\", \"lag_min_seconds\": 0, \"lag_max_seconds\": 86400, \"modality\": \"asserted\", \"stance\": \"supports\", \"span_start\": 0, \"span_end\": 56, \"excerpt\": \"Synthetic rule: more arrivals increase next-day backlog.\", \"speaker_id\": \"synthetic-rule\", \"context\": {\"synthetic\": true}}]}"
+        }
+      ],
+      "source_family_id": "arrival-thread"
+    },
+    {
+      "id": "held-staff",
+      "occurred_at": 202,
+      "source_lineage_id": "staff-thread",
+      "question": "What changes next-day support backlog?",
+      "source_text": "Synthetic note: adding staff may reduce next-day backlog.",
+      "gold": [
+        {
+          "cause_variable": "staffed_agents",
+          "effect_variable": "next_day_backlog",
+          "lag_min_seconds": 0,
+          "lag_max_seconds": 86400,
+          "modality": "speculated",
+          "stance": "supports",
+          "span_start": 0,
+          "span_end": 57,
+          "excerpt": "Synthetic note: adding staff may reduce next-day backlog.",
+          "speaker_id": "synthetic-rule",
+          "context": {
+            "synthetic": true
+          }
+        }
+      ],
+      "reviewed_edges": [
+        {
+          "cause_variable": "staffed_agents",
+          "effect_variable": "next_day_backlog",
+          "lag_min_seconds": 0,
+          "lag_max_seconds": 86400,
+          "modality": "speculated",
+          "accepted": false
+        }
+      ],
+      "responses": [
+        {
+          "model_id": "synthetic_candidate_a",
+          "response_json": "{\"claims\": [{\"cause_variable\": \"staffed_agents\", \"effect_variable\": \"next_day_backlog\", \"lag_min_seconds\": 0, \"lag_max_seconds\": 86400, \"modality\": \"asserted\", \"stance\": \"supports\", \"span_start\": 0, \"span_end\": 57, \"excerpt\": \"Synthetic note: adding staff may reduce next-day backlog.\", \"speaker_id\": \"synthetic-rule\", \"context\": {\"synthetic\": true}}]}"
+        },
+        {
+          "model_id": "synthetic_candidate_b",
+          "response_json": "{\"claims\":[{\"cause_variable\":\"staffed_agents\",\"effect_variable\":\"next_day_backlog\",\"lag_min_seconds\":0,\"lag_max_seconds\":86400,\"modality\":\"speculated\",\"stance\":\"supports\",\"span_start\":0,\"span_end\":57,\"excerpt\":\"Synthetic note: adding staff may reduce next-day backlog.\",\"speaker_id\":\"synthetic-rule\",\"context\":{\"synthetic\":true}}]}"
+        }
+      ],
+      "source_family_id": "staff-thread"
+    },
+    {
+      "id": "held-overtime",
+      "occurred_at": 203,
+      "source_lineage_id": "overtime-thread",
+      "question": "What changes next-day support backlog?",
+      "source_text": "Synthetic note: overtime did not reduce backlog.",
+      "gold": [
+        {
+          "cause_variable": "overtime_hours",
+          "effect_variable": "next_day_backlog",
+          "lag_min_seconds": 0,
+          "lag_max_seconds": 86400,
+          "modality": "negated",
+          "stance": "opposes",
+          "span_start": 0,
+          "span_end": 48,
+          "excerpt": "Synthetic note: overtime did not reduce backlog.",
+          "speaker_id": "synthetic-rule",
+          "context": {
+            "synthetic": true
+          }
+        }
+      ],
+      "reviewed_edges": [
+        {
+          "cause_variable": "overtime_hours",
+          "effect_variable": "next_day_backlog",
+          "lag_min_seconds": 0,
+          "lag_max_seconds": 86400,
+          "modality": "negated",
+          "accepted": false
+        }
+      ],
+      "responses": [
+        {
+          "model_id": "synthetic_candidate_a",
+          "response_json": "Malformed model response"
+        },
+        {
+          "model_id": "synthetic_candidate_b",
+          "response_json": "{\"claims\":[{\"cause_variable\":\"overtime_hours\",\"effect_variable\":\"next_day_backlog\",\"lag_min_seconds\":0,\"lag_max_seconds\":86400,\"modality\":\"negated\",\"stance\":\"opposes\",\"span_start\":0,\"span_end\":48,\"excerpt\":\"Synthetic note: overtime did not reduce backlog.\",\"speaker_id\":\"synthetic-rule\",\"context\":{\"synthetic\":true}}]}"
+        }
+      ],
+      "source_family_id": "overtime-thread"
+    }
+  ]
+}

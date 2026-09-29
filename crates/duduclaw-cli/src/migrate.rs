@@ -79,10 +79,7 @@ pub async fn migrate(home_dir: &Path) -> Result<()> {
         tokio::fs::write(&settings_path, &settings_content)
             .await
             .map_err(|e| {
-                DuDuClawError::Config(format!(
-                    "Failed to write {}: {e}",
-                    settings_path.display()
-                ))
+                DuDuClawError::Config(format!("Failed to write {}: {e}", settings_path.display()))
             })?;
 
         // Generate CLAUDE.md
@@ -103,10 +100,7 @@ pub async fn migrate(home_dir: &Path) -> Result<()> {
         tokio::fs::write(&claude_md_path, &claude_md_content)
             .await
             .map_err(|e| {
-                DuDuClawError::Config(format!(
-                    "Failed to write {}: {e}",
-                    claude_md_path.display()
-                ))
+                DuDuClawError::Config(format!("Failed to write {}: {e}", claude_md_path.display()))
             })?;
 
         // Generate .mcp.json — use absolute path so Claude CLI subprocesses

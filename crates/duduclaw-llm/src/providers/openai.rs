@@ -14,12 +14,12 @@
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::error::{classify_http, classify_transport, snippet, LlmError};
+use crate::error::{LlmError, classify_http, classify_transport, snippet};
 use crate::http::{http_client, retry_after_of};
-use crate::provider::{buffered_stream, split_model_id, ApiAuth, ChatProvider};
-use crate::sse::{drive_sse, sse_data, SseParser};
+use crate::provider::{ApiAuth, ChatProvider, buffered_stream, split_model_id};
+use crate::sse::{SseParser, drive_sse, sse_data};
 use crate::types::{
     ChatRequest, ChatResponse, ContentPart, NormalizedUsage, ReasoningHint, Role, StopReason,
     StreamEvent, ToolChoice,
@@ -86,7 +86,10 @@ pub(crate) fn build_request_body(req: &ChatRequest) -> Value {
         for part in &msg.parts {
             match part {
                 ContentPart::Text(t) => content.push(json!({"type": content_type, "text": t})),
-                ContentPart::Image { media_type, data_base64 } => content.push(json!({
+                ContentPart::Image {
+                    media_type,
+                    data_base64,
+                } => content.push(json!({
                     "type": "input_image",
                     "image_url": format!("data:{media_type};base64,{data_base64}"),
                 })),
@@ -100,7 +103,11 @@ pub(crate) fn build_request_body(req: &ChatRequest) -> Value {
                         "arguments": args.to_string(),
                     }));
                 }
-                ContentPart::ToolResult { call_id, content: result, .. } => {
+                ContentPart::ToolResult {
+                    call_id,
+                    content: result,
+                    ..
+                } => {
                     flush(&mut content, &mut input);
                     input.push(json!({
                         "type": "function_call_output",
@@ -154,6 +161,13 @@ pub(crate) fn build_request_body(req: &ChatRequest) -> Value {
             body["reasoning"] = json!({"effort": effort});
         }
     }
+    // P1/WP-3: an explicit per-call effort overrides the coarser
+    // `ReasoningHint` above — same JSON key (`reasoning.effort`, the Responses
+    // API shape already used here), but the five-step vendor scale rather than
+    // the hint's three. `None` ⇒ untouched.
+    if let Some(effort) = req.reasoning_effort.as_deref() {
+        body["reasoning"] = json!({"effort": effort});
+    }
     if let Some(schema) = &req.response_format {
         body["text"] = json!({
             "format": {"type": "json_schema", "name": "response", "schema": schema}
@@ -177,10 +191,17 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
     for item in output {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
-                for c in item.get("content").and_then(Value::as_array).unwrap_or(&Vec::new()) {
+                for c in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&Vec::new())
+                {
                     match c.get("type").and_then(Value::as_str) {
                         Some("output_text") => parts.push(ContentPart::Text(
-                            c.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
+                            c.get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
                         )),
                         Some("refusal") => refused = true,
                         _ => {}
@@ -188,7 +209,10 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
                 }
             }
             Some("function_call") => {
-                let raw_args = item.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                let raw_args = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
                 parts.push(ContentPart::ToolCall {
                     id: item
                         .get("call_id")
@@ -196,7 +220,11 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
-                    name: item.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    name: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                     // STRING arguments → always parsed internally.
                     args: serde_json::from_str(raw_args)
                         .unwrap_or_else(|_| Value::String(raw_args.to_string())),
@@ -214,7 +242,10 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
                     })
                     .unwrap_or_default();
                 if !summary.is_empty() {
-                    parts.push(ContentPart::Reasoning { text: summary, signature: None });
+                    parts.push(ContentPart::Reasoning {
+                        text: summary,
+                        signature: None,
+                    });
                 }
             }
             _ => {}
@@ -224,13 +255,19 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
     let stop = if refused {
         StopReason::Refusal
     } else if body.get("status").and_then(Value::as_str) == Some("incomplete") {
-        match body.pointer("/incomplete_details/reason").and_then(Value::as_str) {
+        match body
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+        {
             Some("max_output_tokens") => StopReason::MaxTokens,
             Some("content_filter") => StopReason::ContentFilter,
             Some(other) => StopReason::Other(other.to_string()),
             None => StopReason::Other("incomplete".to_string()),
         }
-    } else if parts.iter().any(|p| matches!(p, ContentPart::ToolCall { .. })) {
+    } else if parts
+        .iter()
+        .any(|p| matches!(p, ContentPart::ToolCall { .. }))
+    {
         StopReason::ToolUse
     } else {
         StopReason::EndTurn
@@ -242,7 +279,11 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
         parts,
         stop,
         usage,
-        model_used: body.get("model").and_then(Value::as_str).unwrap_or_default().to_string(),
+        model_used: body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         provider: "openai".to_string(),
     })
 }
@@ -329,11 +370,17 @@ impl OpenAiResponsesSse {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    let name =
-                        item.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     // Seed with any inline arguments already present on the item.
-                    let seed =
-                        item.get("arguments").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let seed = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     self.index_map.insert(index, self.tool_calls.len());
                     self.tool_calls.push((id.clone(), name.clone(), seed));
                     out.push(StreamEvent::ToolCallStart { index, id, name });
@@ -355,9 +402,10 @@ impl OpenAiResponsesSse {
             Some("response.function_call_arguments.done") => {
                 // Authoritative final arguments string (fallback build only).
                 let index = ev.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                if let (Some(&pos), Some(args)) =
-                    (self.index_map.get(&index), ev.get("arguments").and_then(Value::as_str))
-                {
+                if let (Some(&pos), Some(args)) = (
+                    self.index_map.get(&index),
+                    ev.get("arguments").and_then(Value::as_str),
+                ) {
                     self.tool_calls[pos].2 = args.to_string();
                 }
             }
@@ -370,7 +418,10 @@ impl OpenAiResponsesSse {
                     .pointer("/response/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("response failed");
-                self.error = Some(LlmError::Http { status: 0, body_snippet: snippet(msg) });
+                self.error = Some(LlmError::Http {
+                    status: 0,
+                    body_snippet: snippet(msg),
+                });
                 self.finished = true;
             }
             Some("error") => {
@@ -379,7 +430,10 @@ impl OpenAiResponsesSse {
                     .or_else(|| ev.pointer("/error/message"))
                     .and_then(Value::as_str)
                     .unwrap_or("stream error");
-                self.error = Some(LlmError::Http { status: 0, body_snippet: snippet(msg) });
+                self.error = Some(LlmError::Http {
+                    status: 0,
+                    body_snippet: snippet(msg),
+                });
                 self.finished = true;
             }
             // reasoning summary / raw reasoning text deltas.
@@ -413,11 +467,20 @@ impl OpenAiResponsesSse {
                 continue;
             }
             has_tool = true;
-            let args = serde_json::from_str(&raw)
-                .unwrap_or_else(|_| if raw.is_empty() { json!({}) } else { Value::String(raw) });
+            let args = serde_json::from_str(&raw).unwrap_or_else(|_| {
+                if raw.is_empty() {
+                    json!({})
+                } else {
+                    Value::String(raw)
+                }
+            });
             parts.push(ContentPart::ToolCall { id, name, args });
         }
-        let stop = if has_tool { StopReason::ToolUse } else { StopReason::EndTurn };
+        let stop = if has_tool {
+            StopReason::ToolUse
+        } else {
+            StopReason::EndTurn
+        };
         ChatResponse {
             parts,
             stop,
@@ -528,9 +591,26 @@ mod tests {
     use crate::types::{ChatMessage, SystemBlock, ToolDef};
 
     #[test]
+    fn build_reasoning_effort_overrides_the_hint_and_is_absent_when_none() {
+        let plain = build_request_body(&ChatRequest::new("gpt-5"));
+        assert!(plain.get("reasoning").is_none(), "{plain}");
+
+        let mut req = ChatRequest::new("gpt-5");
+        req.reasoning_effort = Some("max".to_string());
+        assert_eq!(build_request_body(&req)["reasoning"]["effort"], "max");
+
+        // An explicit per-call effort wins over the coarser ReasoningHint.
+        req.reasoning = ReasoningHint::Low;
+        assert_eq!(build_request_body(&req)["reasoning"]["effort"], "max");
+    }
+
+    #[test]
     fn build_uses_instructions_and_input_items() {
         let mut req = ChatRequest::new("openai/gpt-5.4");
-        req.system = vec![SystemBlock::cached("be helpful"), SystemBlock::uncached("queue")];
+        req.system = vec![
+            SystemBlock::cached("be helpful"),
+            SystemBlock::uncached("queue"),
+        ];
         req.messages.push(ChatMessage::user("hi"));
         req.messages.push(ChatMessage::assistant("hello"));
         let body = build_request_body(&req);
@@ -595,7 +675,10 @@ mod tests {
 
         req.tool_choice = ToolChoice::Tool("search".into());
         let body = build_request_body(&req);
-        assert_eq!(body["tool_choice"], json!({"type": "function", "name": "search"}));
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "function", "name": "search"})
+        );
     }
 
     #[test]
@@ -603,11 +686,17 @@ mod tests {
         let mut req = ChatRequest::new("openai/gpt-5.4");
         req.messages.push(ChatMessage {
             role: Role::User,
-            parts: vec![ContentPart::Image { media_type: "image/png".into(), data_base64: "aGk=".into() }],
+            parts: vec![ContentPart::Image {
+                media_type: "image/png".into(),
+                data_base64: "aGk=".into(),
+            }],
         });
         let body = build_request_body(&req);
         assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
-        assert_eq!(body["input"][0]["content"][0]["image_url"], "data:image/png;base64,aGk=");
+        assert_eq!(
+            body["input"][0]["content"][0]["image_url"],
+            "data:image/png;base64,aGk="
+        );
     }
 
     #[test]
@@ -686,7 +775,10 @@ mod tests {
 
     #[test]
     fn parse_missing_output_is_parse_error() {
-        assert!(matches!(parse_response(&json!({"id": "resp_1"})), Err(LlmError::Parse(_))));
+        assert!(matches!(
+            parse_response(&json!({"id": "resp_1"})),
+            Err(LlmError::Parse(_))
+        ));
     }
 
     // ── SSE streaming (Responses semantic events) ──
@@ -711,11 +803,17 @@ mod tests {
         // Delta events observed in order.
         assert_eq!(out[0], StreamEvent::TextDelta("Hel".into()));
         assert_eq!(out[1], StreamEvent::TextDelta("lo".into()));
-        assert!(matches!(&out[2], StreamEvent::ToolCallStart { index: 1, id, name } if id == "call_9" && name == "calc"));
-        assert!(matches!(&out[3], StreamEvent::ToolCallDelta { index: 1, args_fragment } if args_fragment == "{\"a\":"));
+        assert!(
+            matches!(&out[2], StreamEvent::ToolCallStart { index: 1, id, name } if id == "call_9" && name == "calc")
+        );
+        assert!(
+            matches!(&out[3], StreamEvent::ToolCallDelta { index: 1, args_fragment } if args_fragment == "{\"a\":")
+        );
 
         // Terminal object re-parsed via parse_response → identical mapping.
-        let StreamEvent::Done(resp) = p.finalize().expect("done") else { panic!("expected Done") };
+        let StreamEvent::Done(resp) = p.finalize().expect("done") else {
+            panic!("expected Done")
+        };
         assert_eq!(resp.text(), "Hello");
         assert_eq!(resp.stop, StopReason::ToolUse);
         assert_eq!(resp.tool_calls()[0].0, "call_9");
@@ -742,11 +840,15 @@ mod tests {
         assert_eq!(out[0], StreamEvent::ReasoningDelta("thinking".into()));
         assert_eq!(out[1], StreamEvent::TextDelta("Hi".into()));
         // No response.completed → fallback build from accumulators.
-        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else {
+            panic!()
+        };
         assert_eq!(resp.text(), "Hi");
         assert_eq!(resp.stop, StopReason::EndTurn);
         assert_eq!(resp.model_used, "gpt-5.5");
-        assert!(matches!(&resp.parts[0], ContentPart::Reasoning { text, .. } if text == "thinking"));
+        assert!(
+            matches!(&resp.parts[0], ContentPart::Reasoning { text, .. } if text == "thinking")
+        );
     }
 
     #[test]

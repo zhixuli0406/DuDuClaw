@@ -27,11 +27,7 @@ pub struct QuotaExceededError {
 
 impl std::fmt::Display for QuotaExceededError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Daily write quota exceeded ({} records/day)",
-            self.limit
-        )
+        write!(f, "Daily write quota exceeded ({} records/day)", self.limit)
     }
 }
 
@@ -77,9 +73,7 @@ impl DailyQuota {
         let today: NaiveDate = chrono::Utc::now().date_naive();
         let mut map = self.state.lock().expect("DailyQuota lock poisoned");
 
-        let entry = map
-            .entry(client_id.to_string())
-            .or_insert((today, 0));
+        let entry = map.entry(client_id.to_string()).or_insert((today, 0));
 
         // Reset if a new UTC day has started.
         if entry.0 != today {
@@ -146,7 +140,10 @@ mod tests {
         q.check_and_increment("c").unwrap();
         q.check_and_increment("c").unwrap();
         let remaining = q.check_and_increment("c").expect("3rd of 3 should succeed");
-        assert_eq!(remaining, 0, "no quota should remain after reaching the limit");
+        assert_eq!(
+            remaining, 0,
+            "no quota should remain after reaching the limit"
+        );
     }
 
     // ── Test 4: write beyond limit returns QuotaExceededError ─────────────────
@@ -201,7 +198,10 @@ mod tests {
     // ── Test 8: QuotaExceededError Display contains the limit ─────────────────
     #[test]
     fn error_display_mentions_limit() {
-        let err = QuotaExceededError { limit: 1_000, count: 1_000 };
+        let err = QuotaExceededError {
+            limit: 1_000,
+            count: 1_000,
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("1000"),

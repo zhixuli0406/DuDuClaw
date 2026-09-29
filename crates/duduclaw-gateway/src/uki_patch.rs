@@ -326,9 +326,7 @@ pub fn verify_root_partuuid(data: &[u8], want: &str) -> Result<String, String> {
     let span = cmdline_span(data)?;
     let got = root_partuuid(&span.text)?;
     if !got.eq_ignore_ascii_case(want) {
-        return Err(format!(
-            "UKI is bound to {got}, expected {want}"
-        ));
+        return Err(format!("UKI is bound to {got}, expected {want}"));
     }
     Ok(got)
 }
@@ -504,7 +502,10 @@ mod tests {
     fn verify_rejects_a_uki_bound_to_a_different_slot() {
         let uki = synth_uki(&sample_cmdline(SLOT_A));
         let err = verify_root_partuuid(&uki, SLOT_B).unwrap_err();
-        assert!(err.contains(SLOT_A), "error should name the actual value: {err}");
+        assert!(
+            err.contains(SLOT_A),
+            "error should name the actual value: {err}"
+        );
     }
 
     #[test]
@@ -520,7 +521,10 @@ mod tests {
     fn verify_refuses_a_non_uuid_target() {
         let uki = synth_uki(&sample_cmdline(SLOT_A));
         for bad in ["", "not-a-uuid", "/dev/sda2 root=/dev/sda3 init=/bin/sh  "] {
-            assert!(verify_root_partuuid(&uki, bad).is_err(), "must refuse {bad:?}");
+            assert!(
+                verify_root_partuuid(&uki, bad).is_err(),
+                "must refuse {bad:?}"
+            );
         }
     }
 

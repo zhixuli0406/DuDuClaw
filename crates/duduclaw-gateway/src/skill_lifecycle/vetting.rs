@@ -84,9 +84,7 @@ pub fn vet_synthesized_skill(skill: &SynthesizedSkill) -> VettingResult {
     findings.extend(check_name_format(&skill.name));
 
     // Any Critical or Error → rejected
-    let has_blocking = findings
-        .iter()
-        .any(|f| f.severity >= Severity::Error);
+    let has_blocking = findings.iter().any(|f| f.severity >= Severity::Error);
 
     if has_blocking {
         warn!(
@@ -111,7 +109,7 @@ pub fn vet_synthesized_skill(skill: &SynthesizedSkill) -> VettingResult {
 
 /// Check content for patterns that may indicate secrets or API keys.
 pub fn check_secret_patterns(content: &str) -> Vec<VettingFinding> {
-    use super::sensitive_patterns::{SECRET_PATTERNS, PatternSeverity};
+    use super::sensitive_patterns::{PatternSeverity, SECRET_PATTERNS};
 
     let mut findings = Vec::new();
     let lower = content.to_lowercase();
@@ -218,7 +216,9 @@ fn check_size(content: &str) -> Vec<VettingFinding> {
         let trimmed = line.trim();
         if trimmed.len() > 1000
             && trimmed.is_ascii()
-            && trimmed.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=')
+            && trimmed
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=')
         {
             findings.push(VettingFinding {
                 category: FindingCategory::SizeAnomaly,
@@ -306,7 +306,8 @@ mod tests {
             tags: vec!["customer-service".to_string()],
             content: "# Return Policy\n\n- 30-day window\n- Receipt required\n".to_string(),
             frontmatter: "---\nname: return-policy\n---".to_string(),
-            full_markdown: "---\nname: return-policy\n---\n\n# Return Policy\n\n- 30-day window\n".to_string(),
+            full_markdown: "---\nname: return-policy\n---\n\n# Return Policy\n\n- 30-day window\n"
+                .to_string(),
             rationale: "Auto-synthesized".to_string(),
         }
     }
@@ -325,7 +326,11 @@ mod tests {
         let result = vet_synthesized_skill(&skill);
         assert!(!result.is_approved());
         if let VettingResult::Rejected(findings) = result {
-            assert!(findings.iter().any(|f| f.category == FindingCategory::SecretLeak));
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.category == FindingCategory::SecretLeak)
+            );
         }
     }
 
@@ -336,18 +341,27 @@ mod tests {
         let result = vet_synthesized_skill(&skill);
         assert!(!result.is_approved());
         if let VettingResult::Rejected(findings) = result {
-            assert!(findings.iter().any(|f| f.category == FindingCategory::PromptInjection));
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.category == FindingCategory::PromptInjection)
+            );
         }
     }
 
     #[test]
     fn test_code_execution_rejected() {
         let mut skill = make_clean_skill();
-        skill.content = "Run this: import subprocess\nsubprocess.run(['rm', '-rf', '/'])".to_string();
+        skill.content =
+            "Run this: import subprocess\nsubprocess.run(['rm', '-rf', '/'])".to_string();
         let result = vet_synthesized_skill(&skill);
         assert!(!result.is_approved());
         if let VettingResult::Rejected(findings) = result {
-            assert!(findings.iter().any(|f| f.category == FindingCategory::CodeExecution));
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.category == FindingCategory::CodeExecution)
+            );
         }
     }
 

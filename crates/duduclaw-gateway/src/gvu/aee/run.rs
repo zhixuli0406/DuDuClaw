@@ -37,26 +37,26 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use duduclaw_memory::SqliteMemoryEngine;
 use tracing::{debug, info, warn};
 
-use crate::gvu::champion::{snapshot_hash, Champion, ChampionStore};
+use crate::gvu::champion::{Champion, ChampionStore, snapshot_hash};
 use crate::gvu::mistake_notebook::MistakeEntry;
-use crate::gvu::stagnation::{stagnation_snapshot, GvuStagnationConfig};
+use crate::gvu::stagnation::{GvuStagnationConfig, stagnation_snapshot};
 use crate::gvu::text_gradient::TextGradient;
 use crate::gvu::verifier::{self, JudgeResult};
 use crate::gvu::verifier_measure::{
-    anti_drift, commit_verdict, measure, AntiDriftState, MeasureInput, MeasureScorer,
-    MeasureVector, NoiseBand, ScoreRequest,
+    AntiDriftState, MeasureInput, MeasureScorer, MeasureVector, NoiseBand, ScoreRequest,
+    anti_drift, commit_verdict, measure,
 };
 use crate::gvu::version_store::{ExperimentLogEntry, VersionStore};
 use crate::playbook::delta::PlaybookDelta;
-use crate::playbook::entry::{FailureNote, PlaybookMeta, FAILURE_HISTORY_CAP};
+use crate::playbook::entry::{FAILURE_HISTORY_CAP, FailureNote, PlaybookMeta};
 
-use super::eval_scorer::{resolve_eval_suites_root, EvalMeasureScorer};
-use super::inner_loop::{run_inner_loop, InnerLoopExit, InnerLoopInput};
-use super::intent::{decide_intent, AeeTrigger, EvolutionStrategy, IntentDecision, RoundMaterial};
+use super::AeeRoundRecord;
+use super::eval_scorer::{EvalMeasureScorer, resolve_eval_suites_root};
+use super::inner_loop::{InnerLoopExit, InnerLoopInput, run_inner_loop};
+use super::intent::{AeeTrigger, EvolutionStrategy, IntentDecision, RoundMaterial, decide_intent};
 use super::pending::{PendingSettlement, PendingSettlementStore};
 use super::prompt::PromptContext;
-use super::snapshot::{PlaybookSnapshot, LOW_STREAK_THRESHOLD};
-use super::AeeRoundRecord;
+use super::snapshot::{LOW_STREAK_THRESHOLD, PlaybookSnapshot};
 
 /// How long a committed AEE round is observed before its entries are settled.
 /// Mirrors the SOUL observation window's 24 h default.
@@ -90,7 +90,10 @@ pub enum AeeVerdict {
     },
     /// The round ran but nothing was committed (gate/commit-gate rejection,
     /// nothing proposed, no viable candidate).
-    NotCommitted { reason: String, gradient: TextGradient },
+    NotCommitted {
+        reason: String,
+        gradient: TextGradient,
+    },
     /// The round never started (cooldown-style precondition, no material,
     /// missing infrastructure).
     Skipped { reason: String },
@@ -105,7 +108,12 @@ pub struct AeeRoundResult {
 
 impl AeeRoundResult {
     fn skipped(record: AeeRoundRecord, reason: impl Into<String>) -> Self {
-        Self { record, verdict: AeeVerdict::Skipped { reason: reason.into() } }
+        Self {
+            record,
+            verdict: AeeVerdict::Skipped {
+                reason: reason.into(),
+            },
+        }
     }
 }
 
@@ -238,7 +246,11 @@ where
         .map(|e| e.id.clone())
         .collect();
     let material = RoundMaterial {
-        unresolved_mistakes: input.relevant_mistakes.iter().filter(|m| !m.resolved).count(),
+        unresolved_mistakes: input
+            .relevant_mistakes
+            .iter()
+            .filter(|m| !m.resolved)
+            .count(),
         low_streak_entries: low_streak_ids.len(),
         active_entries: base.active_count(),
     };
@@ -246,8 +258,7 @@ where
     let intent = match decide_intent(strategy, trigger, round_seq, material) {
         IntentDecision::Run(i) => i,
         IntentDecision::Skip(reason) => {
-            let record =
-                AeeRoundRecord::skipped(agent_id, strategy, trigger, round_seq, &reason);
+            let record = AeeRoundRecord::skipped(agent_id, strategy, trigger, round_seq, &reason);
             vs.record_experiment(&ExperimentLogEntry::new(
                 agent_id,
                 0,
@@ -278,15 +289,28 @@ where
         case_dimension_available: false,
         // WP-6A / A2 — read-only harness-knob snapshot, carried into
         // telemetry only. See `crate::gvu::knob_snapshot` module docs.
-        knobs: Some(crate::gvu::knob_snapshot::capture(&input.home_dir, input.agent_dir)),
+        knobs: Some(crate::gvu::knob_snapshot::capture(
+            &input.home_dir,
+            input.agent_dir,
+        )),
     };
 
     // ── Measure inputs shared by the bootstrap and the candidate ───────────
-    let rolled_back_summaries: Vec<String> = vs
-        .get_history(agent_id, 20)
-        .into_iter()
-        .filter(|v| matches!(v.status, crate::gvu::version_store::VersionStatus::RolledBack))
-        .map(|v| v.soul_summary)
+    //
+    // S11 (2026-09-29): the `novelty` dimension's "content that was already
+    // tried and reverted" corpus used to be the rolled-back **SOUL.md**
+    // version summaries. The legacy SOUL path is gone and nothing writes
+    // those rows any more, so that corpus would be permanently empty and the
+    // dimension permanently 1.0. The playbook's own failure history is the
+    // live equivalent — the same semantic ("this was tried here and it did
+    // not work"), recorded per entry by the inner loop and by entry-level
+    // rollback.
+    let rolled_back_summaries: Vec<String> = base
+        .entries
+        .iter()
+        .flat_map(|e| e.meta.failure_history.iter())
+        .map(|n| n.what.clone())
+        .take(20)
         .collect();
     let mistake_descriptions: Vec<String> = input
         .relevant_mistakes
@@ -330,6 +354,11 @@ where
                 mistake_descriptions: mistake_descriptions.clone(),
                 judge: None,
                 post_hoc_must_not_hit: false,
+                // The baseline is the *champion re-measure*: it carries no
+                // candidate signals, so its causal dimension is absent by
+                // construction rather than zero.
+                signals_match: Vec::new(),
+                accepted_causal_causes: Vec::new(),
             },
             scorer,
             &ScoreRequest {
@@ -390,9 +419,12 @@ where
         inner_round: 0,
         must_not: input.must_not.to_vec(),
         must_always: input.must_always.to_vec(),
-        versions: vs.get_history(agent_id, 5),
         experiments: vs.get_experiment_summary(agent_id),
-        telemetry: Some(crate::gvu::telemetry::telemetry_summary(&input.home_dir, agent_id, 30)),
+        telemetry: Some(crate::gvu::telemetry::telemetry_summary(
+            &input.home_dir,
+            agent_id,
+            30,
+        )),
         champion_headline: champion.as_ref().map(|c| c.measure.headline()),
         stagnation: stagnation.clone(),
         mistakes: input.relevant_mistakes.to_vec(),
@@ -507,6 +539,12 @@ where
     // ── §2.3 full Measure of the candidate ────────────────────────────────
     let contents = candidate_contents(&inner.deltas);
     let judge = judge_candidate(agent_id, &contents, input.must_not, &call_llm).await;
+    // X1 方案 2 telemetry dimension. Read unconditionally (it is one cheap
+    // SQLite read and it is what the dashboard card and the `aee_round`
+    // snapshot show); `causal_support` stays `None` while the agent has no
+    // accepted claims, and it never enters the commit gate either way.
+    let accepted_causal_causes =
+        crate::causal_audit_ingest::accepted_cause_tokens(&input.home_dir, 200);
     let measured = measure(
         &MeasureInput {
             agent_id: agent_id.to_string(),
@@ -516,6 +554,8 @@ where
             mistake_descriptions,
             judge,
             post_hoc_must_not_hit: false,
+            signals_match: candidate_signals(&inner.deltas),
+            accepted_causal_causes,
         },
         scorer,
         &ScoreRequest {
@@ -531,7 +571,11 @@ where
     record.case_dimension_available = measured.case_dimension_available;
 
     // ── §2.4 commit gate ──────────────────────────────────────────────────
-    let verdict = commit_verdict(&measured.vector, champion.as_ref().map(|c| &c.measure), &band);
+    let verdict = commit_verdict(
+        &measured.vector,
+        champion.as_ref().map(|c| &c.measure),
+        &band,
+    );
     let decision = anti_drift(
         &verdict,
         champion.as_ref().map(|c| c.anti_drift).unwrap_or_default(),
@@ -575,13 +619,20 @@ where
     }
 
     // ── Commit ────────────────────────────────────────────────────────────
-    let merge = crate::playbook::store::apply_deltas(
+    // X1 方案 2: with `[evolution] require_causal_evidence = true` an Add that
+    // no human-accepted causal claim supports is committed as a shadow
+    // candidate rather than into the injection pool. Off (the default) ⇒
+    // `None` ⇒ byte-identical to the plain `apply_deltas` call this replaced.
+    let accepted_causes = crate::causal_audit_ingest::require_causal_evidence(&input.home_dir)
+        .then(|| crate::causal_audit_ingest::accepted_cause_tokens(&input.home_dir, 200));
+    let merge = crate::playbook::store::apply_deltas_gated(
         &engine,
         agent_id,
         inner.deltas.clone(),
         input.must_not,
         &suites_root,
         input.now,
+        accepted_causes.as_deref(),
     )
     .await;
     record.deltas_applied = merge.applied.len();
@@ -623,7 +674,9 @@ where
         snapshot_hash: snapshot_hash(&after.dedup_keys()),
         measure: measured.vector.clone(),
         established_at: input.now,
-        anti_drift: AntiDriftState { consecutive_matches: decision.next_consecutive_matches },
+        anti_drift: AntiDriftState {
+            consecutive_matches: decision.next_consecutive_matches,
+        },
         round_seq,
         holdout_rotation_due: decision.holdout_rotation_due
             || champion.as_ref().is_some_and(|c| c.holdout_rotation_due),
@@ -702,7 +755,12 @@ fn live_contents(snapshot: &PlaybookSnapshot) -> Vec<String> {
     snapshot
         .entries
         .iter()
-        .filter(|e| matches!(e.meta.state, PlaybookState::Active | PlaybookState::Probation))
+        .filter(|e| {
+            matches!(
+                e.meta.state,
+                PlaybookState::Active | PlaybookState::Probation
+            )
+        })
         .map(|e| e.content.clone())
         .collect()
 }
@@ -719,9 +777,28 @@ fn candidate_contents(deltas: &[PlaybookDelta]) -> Vec<String> {
         .collect()
 }
 
+/// X1 方案 2 — every `signals_match` token the round's `Add` deltas declare,
+/// deduplicated. Only `Add` carries signals; a Revise/Link/Record/Retire
+/// operates on an entry whose signals are already stored.
+fn candidate_signals(deltas: &[PlaybookDelta]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for d in deltas {
+        if let PlaybookDelta::Add { signals_match, .. } = d {
+            for token in signals_match {
+                if !out.contains(token) {
+                    out.push(token.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 fn delta_content(d: &PlaybookDelta) -> String {
     match d {
-        PlaybookDelta::Add { content, .. } | PlaybookDelta::Revise { content, .. } => content.clone(),
+        PlaybookDelta::Add { content, .. } | PlaybookDelta::Revise { content, .. } => {
+            content.clone()
+        }
         PlaybookDelta::Link { id, .. }
         | PlaybookDelta::Record { id, .. }
         | PlaybookDelta::Retire { id, .. } => id.clone(),
@@ -740,7 +817,11 @@ fn committed_entry_ids(
     for op in &merge.applied {
         match op {
             AppliedOp::Added { dedup_key, .. } => {
-                if let Some(e) = after.entries.iter().find(|e| &e.meta.dedup_key == dedup_key) {
+                if let Some(e) = after
+                    .entries
+                    .iter()
+                    .find(|e| &e.meta.dedup_key == dedup_key)
+                {
                     ids.push(e.id.clone());
                 }
             }
@@ -944,8 +1025,14 @@ pub async fn settle_pending(
 
     let observations = super::settle::observe_entries(&snapshot, &p.before, &after, p.band_cases);
     let suite = super::settle::suite_verdict(
-        &MeasureVector { cases: p.before.clone(), ..Default::default() },
-        &MeasureVector { cases: after.clone(), ..Default::default() },
+        &MeasureVector {
+            cases: p.before.clone(),
+            ..Default::default()
+        },
+        &MeasureVector {
+            cases: after.clone(),
+            ..Default::default()
+        },
         p.case_bands(),
     );
     let (deltas, report) = super::settle::finalise(&observations, &suite, agent_id);
@@ -983,7 +1070,7 @@ pub async fn settle_pending(
 /// refactor.
 #[cfg(test)]
 mod settle_hours_tests {
-    use super::{settle_hours, AEE_SETTLE_HOURS_DEFAULT};
+    use super::{AEE_SETTLE_HOURS_DEFAULT, settle_hours};
 
     fn dir_with(body: &str) -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().unwrap();
@@ -994,14 +1081,14 @@ mod settle_hours_tests {
     #[test]
     fn default_direction_settle_hours_falls_back_on_anything_unusable() {
         for body in [
-            "",                                            // empty file
-            "[evolution]\n",                               // section, no key
-            "[evolution]\naee_settle_hours = 0\n",         // non-positive
-            "[evolution]\naee_settle_hours = -1.0\n",      // negative
-            "[evolution]\naee_settle_hours = \"24\"\n",    // wrong type
-            "[evolution]\naee_settle_hours = true\n",      // wrong type
-            "evolution = \"scalar\"\n",                    // wrong-typed section
-            "not toml [[[",                                // malformed file
+            "",                                         // empty file
+            "[evolution]\n",                            // section, no key
+            "[evolution]\naee_settle_hours = 0\n",      // non-positive
+            "[evolution]\naee_settle_hours = -1.0\n",   // negative
+            "[evolution]\naee_settle_hours = \"24\"\n", // wrong type
+            "[evolution]\naee_settle_hours = true\n",   // wrong type
+            "evolution = \"scalar\"\n",                 // wrong-typed section
+            "not toml [[[",                             // malformed file
         ] {
             let dir = dir_with(body);
             assert_eq!(

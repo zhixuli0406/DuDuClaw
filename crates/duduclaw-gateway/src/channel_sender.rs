@@ -21,9 +21,11 @@
 //! not via a Dashboard.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use async_trait::async_trait;
 use base64::Engine;
+use serde_json::json;
 use tokio::sync::{Mutex, oneshot};
 use tracing::warn;
 
@@ -116,9 +118,8 @@ fn require_feishu_code_zero(body: &str) -> Result<(), ChannelSendError> {
 /// here keyed by the user/chat ID. When the channel handler receives the user's
 /// reply (「確認」「好」「yes」or 「取消」「no」), it calls `resolve_confirmation()`
 /// which sends the result through the oneshot.
-static CONFIRMATION_REGISTRY: std::sync::OnceLock<
-    Mutex<HashMap<String, oneshot::Sender<bool>>>,
-> = std::sync::OnceLock::new();
+static CONFIRMATION_REGISTRY: std::sync::OnceLock<Mutex<HashMap<String, oneshot::Sender<bool>>>> =
+    std::sync::OnceLock::new();
 
 fn confirmation_registry() -> &'static Mutex<HashMap<String, oneshot::Sender<bool>>> {
     CONFIRMATION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -147,12 +148,7 @@ pub async fn wait_for_confirmation(
         reg.insert(user_id.to_string(), tx);
     }
 
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        rx,
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
         Ok(Ok(confirmed)) => Ok(confirmed),
         Ok(Err(_)) => {
             // Sender dropped — treat as declined
@@ -208,9 +204,18 @@ fn is_confirmation_reply(text: &str) -> bool {
     let t = text.trim().to_lowercase();
     matches!(
         t.as_str(),
-        "yes" | "y" | "ok" | "sure" | "confirm"
-            | "好" | "確認" | "繼續" | "可以" | "對"
-            | "はい" | "うん"
+        "yes"
+            | "y"
+            | "ok"
+            | "sure"
+            | "confirm"
+            | "好"
+            | "確認"
+            | "繼續"
+            | "可以"
+            | "對"
+            | "はい"
+            | "うん"
     )
 }
 
@@ -219,9 +224,18 @@ fn is_denial_reply(text: &str) -> bool {
     let t = text.trim().to_lowercase();
     matches!(
         t.as_str(),
-        "no" | "n" | "cancel" | "stop" | "nope" | "abort"
-            | "取消" | "否" | "不" | "不要" | "停"
-            | "いいえ" | "やめて"
+        "no" | "n"
+            | "cancel"
+            | "stop"
+            | "nope"
+            | "abort"
+            | "取消"
+            | "否"
+            | "不"
+            | "不要"
+            | "停"
+            | "いいえ"
+            | "やめて"
     )
 }
 
@@ -387,7 +401,7 @@ pub fn create_sender(target: &ChannelTarget, http: reqwest::Client) -> Box<dyn C
         // for those two channels got a NullSender whose `send_text` always
         // returns `Ok(())`, i.e. a message that was never sent looked
         // identical to one that was (handlers.rs::send_channel_test_message
-        // and goal_notify.rs::send_plain_text each grew a dedicated
+        // and this module's own `send_plain_text` each grew a dedicated
         // workaround to route around this gap via `create_googlechat_sender`
         // / `create_teams_sender` directly — this arm closes it for every
         // other caller of the generic factory, e.g. cron_scheduler.rs).
@@ -411,7 +425,9 @@ pub fn create_sender(target: &ChannelTarget, http: reqwest::Client) -> Box<dyn C
             user_id: target.extra_id.clone().unwrap_or_default(),
         }),
         "webchat" => {
-            warn!("WebChat sender created via generic factory — use create_webchat_sender() with event_tx for full functionality");
+            warn!(
+                "WebChat sender created via generic factory — use create_webchat_sender() with event_tx for full functionality"
+            );
             Box::new(WebChatSender {
                 session_id: target.chat_id.clone(),
                 event_tx: None,
@@ -420,6 +436,236 @@ pub fn create_sender(target: &ChannelTarget, http: reqwest::Client) -> Box<dyn C
         _ => {
             warn!(channel = %target.channel_type, "Unknown channel type, using NullSender");
             Box::new(NullSender)
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Decision-card transports (O5)
+//
+// The two send primitives every notification source shares. They used to live
+// in `goal_notify.rs`, which made every other notifier import the goal module
+// to reach them; the capability is a channel transport, so it lives with the
+// channel transports. `channel_capabilities::interactive_buttons` mirrors
+// exactly the set of channels `send_with_markup` has an arm for.
+// ---------------------------------------------------------------------------
+
+/// Send a message carrying inline buttons on one of the four button-capable
+/// channels. `markup` is the platform-native structure from
+/// [`crate::channel_format::decision_markup`].
+///
+/// O5 (2026-09-29): moved here from `goal_notify.rs`. It was never
+/// goal-specific — `decision_notify`, `approval_notify` and `install_notify`
+/// all reached into the goal module for it. One tested implementation of the
+/// Discord DM-open dance / Slack block shape / LINE push envelope lives with
+/// the other channel transports; `notify_push::push` is the only production
+/// caller path.
+///
+/// Returns the pushed message's identity ([`crate::decision_card::PushedMessage`])
+/// when the platform's response makes one available — `None` on LINE (no
+/// stable editable message id, and LINE cannot edit messages regardless, see
+/// `decision_card`) or when the response body doesn't parse as expected
+/// (never treated as a send failure — capturing the id is a best-effort
+/// extra, not required for delivery). Callers persist it via
+/// `decision_message_store::record_card_message` so a later decide can edit
+/// this exact card in place.
+pub(crate) async fn send_with_markup(
+    http: &reqwest::Client,
+    channel: &str,
+    token: &str,
+    chat_id: &str,
+    text: &str,
+    markup: serde_json::Value,
+) -> Result<Option<crate::decision_card::PushedMessage>, String> {
+    match channel {
+        "telegram" => {
+            let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+            let body = json!({ "chat_id": chat_id, "text": text, "reply_markup": markup });
+            let resp = http
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                // WP12: reqwest's Display embeds the URL, which carries the bot token.
+                .map_err(|e| crate::secret_redact::redact_secrets(&e.to_string()).into_owned())?;
+            if !resp.status().is_success() {
+                return Err(format!("telegram HTTP {}", resp.status()));
+            }
+            let data: serde_json::Value = resp.json().await.unwrap_or_default();
+            let mid = data
+                .get("result")
+                .and_then(|r| r.get("message_id"))
+                .and_then(|v| v.as_i64());
+            Ok(mid.map(|m| crate::decision_card::PushedMessage {
+                edit_chat_id: chat_id.to_string(),
+                message_id: m.to_string(),
+            }))
+        }
+        "slack" => {
+            let body = json!({
+                "channel": chat_id,
+                "text": text,
+                "blocks": [
+                    { "type": "section", "text": { "type": "mrkdwn", "text": text } },
+                    markup,
+                ],
+            });
+            let resp = http
+                .post("https://slack.com/api/chat.postMessage")
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                return Err(format!(
+                    "slack chat.postMessage: {}",
+                    data.get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                ));
+            }
+            let ts = data.get("ts").and_then(|v| v.as_str()).map(str::to_string);
+            Ok(ts.map(|t| crate::decision_card::PushedMessage {
+                edit_chat_id: chat_id.to_string(),
+                message_id: t,
+            }))
+        }
+        "discord" => {
+            // The linked id is the USER id — open (or reuse) the bot↔user DM
+            // channel first; fall back to treating it as a channel id.
+            let dm_channel = match http
+                .post("https://discord.com/api/v10/users/@me/channels")
+                .header("Authorization", format!("Bot {token}"))
+                .json(&json!({ "recipient_id": chat_id }))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| chat_id.to_string()),
+                _ => chat_id.to_string(),
+            };
+            let url = format!("https://discord.com/api/v10/channels/{dm_channel}/messages");
+            // W1-5: `decision_markup` returns EITHER one action-row object
+            // (every source but goal) or an array of them (goal's
+            // primary+secondary two-row layout, `discord_goal_buttons`) — an
+            // array is already shaped as Discord's `components` list, an
+            // object needs wrapping in one.
+            let components = if markup.is_array() {
+                markup
+            } else {
+                json!([markup])
+            };
+            let body = json!({ "content": text, "components": components });
+            let resp = http
+                .post(&url)
+                .header("Authorization", format!("Bot {token}"))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("discord HTTP {}", resp.status()));
+            }
+            let data: serde_json::Value = resp.json().await.unwrap_or_default();
+            let mid = data.get("id").and_then(|v| v.as_str()).map(str::to_string);
+            Ok(mid.map(|m| crate::decision_card::PushedMessage {
+                edit_chat_id: dm_channel.clone(),
+                message_id: m,
+            }))
+        }
+        "line" => {
+            let body = json!({
+                "to": chat_id,
+                "messages": [{ "type": "text", "text": text, "quickReply": markup }],
+            });
+            let resp = http
+                .post("https://api.line.me/v2/bot/message/push")
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("line HTTP {}", resp.status()));
+            }
+            // LINE messages are not editable (`channel_editable` excludes it,
+            // so collapse never tries), but the sent message id IS worth
+            // recording: quoting the card in a reply carries
+            // `quotedMessageId`, which is how text-reply decisions (WP1.6)
+            // find their card.
+            let data: serde_json::Value = resp.json().await.unwrap_or_default();
+            let mid = data
+                .get("sentMessages")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|m| m.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Ok(mid.map(|m| crate::decision_card::PushedMessage {
+                edit_chat_id: chat_id.to_string(),
+                message_id: m,
+            }))
+        }
+        other => Err(format!("channel {other} has no button sender")),
+    }
+}
+
+/// Send plain text to a channel via the shared sender factory. Returns whether
+/// delivery succeeded. Best-effort (logs, never panics).
+///
+/// O5: moved here from `goal_notify.rs` alongside [`send_with_markup`] — six
+/// modules outside the goal loop were already calling it.
+///
+/// `channel_sender::create_sender`'s generic factory has no branch for
+/// `googlechat`/`teams` (their credentials live in global/home-dir config,
+/// not on a `ChannelTarget`) and falls through to `NullSender`, whose
+/// `send_text` always returns `Ok(())` — a message that was never sent looks
+/// identical to one that was. Dispatch those two through their dedicated
+/// constructors instead, mirroring `handlers.rs::send_channel_test_message`
+/// (the same factory-gap fix, already shipped for the `channels.test`
+/// button). `token` is unused on those two branches — `GoogleChatSender` /
+/// `TeamsSender` resolve their own credentials from `home_dir`.
+pub(crate) async fn send_plain_text(
+    home_dir: &Path,
+    http: &reqwest::Client,
+    channel: &str,
+    token: &str,
+    chat_id: &str,
+    text: &str,
+) -> bool {
+    let sender: Box<dyn ChannelSender> = match channel {
+        "googlechat" => create_googlechat_sender(
+            home_dir.to_path_buf(),
+            chat_id.to_string(),
+            String::new(),
+        ),
+        "teams" => create_teams_sender(
+            home_dir.to_path_buf(),
+            chat_id.to_string(),
+            String::new(),
+        ),
+        _ => {
+            let target = ChannelTarget {
+                channel_type: channel.to_string(),
+                chat_id: chat_id.to_string(),
+                token: token.to_string(),
+                extra_id: None,
+            };
+            create_sender(&target, http.clone())
+        }
+    };
+    match sender.send_text(text).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(%channel, error = %e, "channel-sender: plain send failed");
+            false
         }
     }
 }
@@ -510,7 +756,9 @@ pub async fn resolve_channel_target(
         .await
         .unwrap_or_default();
         if token.is_empty() || phone_id.is_empty() {
-            return Err("whatsapp_access_token / whatsapp_phone_number_id not configured".to_string());
+            return Err(
+                "whatsapp_access_token / whatsapp_phone_number_id not configured".to_string(),
+            );
         }
         return Ok(ChannelTarget {
             channel_type: channel.to_string(),
@@ -521,10 +769,13 @@ pub async fn resolve_channel_target(
     }
 
     if channel == "feishu" {
-        let app_id =
-            crate::config_crypto::read_encrypted_config_field(home_dir, "channels", "feishu_app_id")
-                .await
-                .unwrap_or_default();
+        let app_id = crate::config_crypto::read_encrypted_config_field(
+            home_dir,
+            "channels",
+            "feishu_app_id",
+        )
+        .await
+        .unwrap_or_default();
         let app_secret = crate::config_crypto::read_encrypted_config_field(
             home_dir,
             "channels",
@@ -566,7 +817,9 @@ pub async fn resolve_channel_target(
     // telegram / line / discord / slack — single `<channel>_bot_token`
     // field, per `otp_delivery::token_field`'s canonical mapping.
     if channel == "discord" && !is_valid_discord_chat_id(chat_id) {
-        return Err(format!("Invalid Discord channel ID: '{chat_id}' (must be numeric)"));
+        return Err(format!(
+            "Invalid Discord channel ID: '{chat_id}' (must be numeric)"
+        ));
     }
     let field = crate::otp_delivery::token_field(channel)
         .ok_or_else(|| format!("Unknown channel: {channel}"))?;
@@ -599,7 +852,8 @@ pub struct TelegramSender {
 impl ChannelSender for TelegramSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
-        let resp = self.http
+        let resp = self
+            .http
             .post(&url)
             .json(&serde_json::json!({
                 "chat_id": self.chat_id,
@@ -608,7 +862,12 @@ impl ChannelSender for TelegramSender {
             }))
             .send()
             .await
-            .map_err(|e| ChannelSendError(format!("Telegram sendMessage: {}", crate::secret_redact::redact_secrets(&e.to_string()))))?;
+            .map_err(|e| {
+                ChannelSendError(format!(
+                    "Telegram sendMessage: {}",
+                    crate::secret_redact::redact_secrets(&e.to_string())
+                ))
+            })?;
         require_api_success("Telegram", resp).await?;
         Ok(())
     }
@@ -628,14 +887,25 @@ impl ChannelSender for TelegramSender {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| ChannelSendError(format!("Telegram sendPhoto: {}", crate::secret_redact::redact_secrets(&e.to_string()))))?;
+            .map_err(|e| {
+                ChannelSendError(format!(
+                    "Telegram sendPhoto: {}",
+                    crate::secret_redact::redact_secrets(&e.to_string())
+                ))
+            })?;
         Ok(())
     }
 
     async fn send_document(
-        &self, data: &[u8], filename: &str, mime: &str,
+        &self,
+        data: &[u8],
+        filename: &str,
+        mime: &str,
     ) -> Result<(), ChannelSendError> {
-        let url = format!("https://api.telegram.org/bot{}/sendDocument", self.bot_token);
+        let url = format!(
+            "https://api.telegram.org/bot{}/sendDocument",
+            self.bot_token
+        );
         let part = reqwest::multipart::Part::bytes(data.to_vec())
             .file_name(filename.to_string())
             .mime_str(mime)
@@ -648,19 +918,32 @@ impl ChannelSender for TelegramSender {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| ChannelSendError(format!("Telegram sendDocument: {}", crate::secret_redact::redact_secrets(&e.to_string()))))?;
+            .map_err(|e| {
+                ChannelSendError(format!(
+                    "Telegram sendDocument: {}",
+                    crate::secret_redact::redact_secrets(&e.to_string())
+                ))
+            })?;
         Ok(())
     }
 
     async fn request_confirmation(
-        &self, prompt: &str, screenshot: Option<&[u8]>, _timeout_secs: u64,
+        &self,
+        prompt: &str,
+        screenshot: Option<&[u8]>,
+        _timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
-        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
-        else { self.send_text(prompt).await?; }
+        if let Some(png) = screenshot {
+            self.send_photo(png, prompt).await?;
+        } else {
+            self.send_text(prompt).await?;
+        }
         wait_for_confirmation(&self.chat_id, _timeout_secs).await
     }
 
-    fn channel_type(&self) -> &'static str { "telegram" }
+    fn channel_type(&self) -> &'static str {
+        "telegram"
+    }
 }
 
 // ===========================================================================
@@ -677,7 +960,8 @@ pub struct LineSender {
 #[async_trait]
 impl ChannelSender for LineSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
-        let resp = self.http
+        let resp = self
+            .http
             .post("https://api.line.me/v2/bot/message/push")
             .bearer_auth(&self.access_token)
             .json(&serde_json::json!({
@@ -694,7 +978,8 @@ impl ChannelSender for LineSender {
     async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
         // LINE Blob Upload API: upload image content → get message content for sending
         // Step 1: Request upload endpoint
-        let req_resp = self.http
+        let req_resp = self
+            .http
             .post("https://api-data.line.me/v2/bot/message/content/upload")
             .bearer_auth(&self.access_token)
             .header("Content-Type", "image/png")
@@ -740,12 +1025,18 @@ impl ChannelSender for LineSender {
         }
 
         // Fallback: Blob upload not available — send text notification
-        let msg = format!("{caption}\n(📸 截圖已擷取，共 {} KB — 需設定 LINE Blob Upload API 才能顯示圖片)", png_data.len() / 1024);
+        let msg = format!(
+            "{caption}\n(📸 截圖已擷取，共 {} KB — 需設定 LINE Blob Upload API 才能顯示圖片)",
+            png_data.len() / 1024
+        );
         self.send_text(&msg).await
     }
 
     async fn request_confirmation(
-        &self, prompt: &str, screenshot: Option<&[u8]>, timeout_secs: u64,
+        &self,
+        prompt: &str,
+        screenshot: Option<&[u8]>,
+        timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
         // Send a Confirm Template message via LINE
         let confirm_msg = serde_json::json!({
@@ -780,7 +1071,9 @@ impl ChannelSender for LineSender {
         wait_for_confirmation(&self.user_id, timeout_secs).await
     }
 
-    fn channel_type(&self) -> &'static str { "line" }
+    fn channel_type(&self) -> &'static str {
+        "line"
+    }
 }
 
 // ===========================================================================
@@ -799,8 +1092,12 @@ pub struct DiscordSender {
 #[async_trait]
 impl ChannelSender for DiscordSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
-        let url = format!("https://discord.com/api/v10/channels/{}/messages", self.channel_id);
-        let resp = self.http
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages",
+            self.channel_id
+        );
+        let resp = self
+            .http
             .post(&url)
             .header("Authorization", format!("Bot {}", self.bot_token))
             .json(&serde_json::json!({"content": text}))
@@ -812,7 +1109,10 @@ impl ChannelSender for DiscordSender {
     }
 
     async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
-        let url = format!("https://discord.com/api/v10/channels/{}/messages", self.channel_id);
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages",
+            self.channel_id
+        );
         let file_part = reqwest::multipart::Part::bytes(png_data.to_vec())
             .file_name("screenshot.png")
             .mime_str("image/png")
@@ -835,9 +1135,15 @@ impl ChannelSender for DiscordSender {
     }
 
     async fn send_document(
-        &self, data: &[u8], filename: &str, mime: &str,
+        &self,
+        data: &[u8],
+        filename: &str,
+        mime: &str,
     ) -> Result<(), ChannelSendError> {
-        let url = format!("https://discord.com/api/v10/channels/{}/messages", self.channel_id);
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages",
+            self.channel_id
+        );
         let file_part = reqwest::multipart::Part::bytes(data.to_vec())
             .file_name(filename.to_string())
             .mime_str(mime)
@@ -860,16 +1166,28 @@ impl ChannelSender for DiscordSender {
     }
 
     async fn request_confirmation(
-        &self, prompt: &str, screenshot: Option<&[u8]>, _timeout_secs: u64,
+        &self,
+        prompt: &str,
+        screenshot: Option<&[u8]>,
+        _timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
-        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
-        else { self.send_text(prompt).await?; }
+        if let Some(png) = screenshot {
+            self.send_photo(png, prompt).await?;
+        } else {
+            self.send_text(prompt).await?;
+        }
         // SEC: Use user_id (not channel_id) to prevent other channel members from approving
-        let confirm_key = if self.user_id.is_empty() { &self.channel_id } else { &self.user_id };
+        let confirm_key = if self.user_id.is_empty() {
+            &self.channel_id
+        } else {
+            &self.user_id
+        };
         wait_for_confirmation(confirm_key, _timeout_secs).await
     }
 
-    fn channel_type(&self) -> &'static str { "discord" }
+    fn channel_type(&self) -> &'static str {
+        "discord"
+    }
 }
 
 // ===========================================================================
@@ -888,7 +1206,8 @@ pub struct SlackSender {
 #[async_trait]
 impl ChannelSender for SlackSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
-        let resp = self.http
+        let resp = self
+            .http
             .post("https://slack.com/api/chat.postMessage")
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .json(&serde_json::json!({
@@ -906,7 +1225,8 @@ impl ChannelSender for SlackSender {
     async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
         // Slack files.uploadV2: get upload URL → PUT file → complete upload
         // Step 1: Get upload URL
-        let get_url_resp = self.http
+        let get_url_resp = self
+            .http
             .post("https://slack.com/api/files.getUploadURLExternal")
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .json(&serde_json::json!({
@@ -961,10 +1281,14 @@ impl ChannelSender for SlackSender {
     }
 
     async fn send_document(
-        &self, data: &[u8], filename: &str, _mime: &str,
+        &self,
+        data: &[u8],
+        filename: &str,
+        _mime: &str,
     ) -> Result<(), ChannelSendError> {
         // Slack files.uploadV2: getUploadURLExternal → PUT bytes → completeUploadExternal.
-        let get_url_resp = self.http
+        let get_url_resp = self
+            .http
             .post("https://slack.com/api/files.getUploadURLExternal")
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .json(&serde_json::json!({ "filename": filename, "length": data.len() }))
@@ -1007,16 +1331,28 @@ impl ChannelSender for SlackSender {
     }
 
     async fn request_confirmation(
-        &self, prompt: &str, screenshot: Option<&[u8]>, _timeout_secs: u64,
+        &self,
+        prompt: &str,
+        screenshot: Option<&[u8]>,
+        _timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
-        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
-        else { self.send_text(prompt).await?; }
+        if let Some(png) = screenshot {
+            self.send_photo(png, prompt).await?;
+        } else {
+            self.send_text(prompt).await?;
+        }
         // SEC: Use user_id when available to prevent other channel members from approving
-        let confirm_key = if self.user_id.is_empty() { &self.channel_id } else { &self.user_id };
+        let confirm_key = if self.user_id.is_empty() {
+            &self.channel_id
+        } else {
+            &self.user_id
+        };
         wait_for_confirmation(confirm_key, _timeout_secs).await
     }
 
-    fn channel_type(&self) -> &'static str { "slack" }
+    fn channel_type(&self) -> &'static str {
+        "slack"
+    }
 }
 
 // ===========================================================================
@@ -1038,7 +1374,8 @@ impl ChannelSender for WhatsAppSender {
             "https://graph.facebook.com/v20.0/{}/messages",
             self.phone_number_id
         );
-        let resp = self.http
+        let resp = self
+            .http
             .post(&url)
             .bearer_auth(&self.access_token)
             .json(&serde_json::json!({
@@ -1069,7 +1406,8 @@ impl ChannelSender for WhatsAppSender {
             .text("type", "image/png")
             .part("file", file_part);
 
-        let upload_resp = self.http
+        let upload_resp = self
+            .http
             .post(&upload_url)
             .bearer_auth(&self.access_token)
             .multipart(form)
@@ -1111,7 +1449,10 @@ impl ChannelSender for WhatsAppSender {
     }
 
     async fn send_document(
-        &self, data: &[u8], filename: &str, mime: &str,
+        &self,
+        data: &[u8],
+        filename: &str,
+        mime: &str,
     ) -> Result<(), ChannelSendError> {
         // Step 1: upload media (type = actual document MIME).
         let upload_url = format!(
@@ -1126,7 +1467,8 @@ impl ChannelSender for WhatsAppSender {
             .text("messaging_product", "whatsapp")
             .text("type", mime.to_string())
             .part("file", file_part);
-        let upload_resp = self.http
+        let upload_resp = self
+            .http
             .post(&upload_url)
             .bearer_auth(&self.access_token)
             .multipart(form)
@@ -1161,14 +1503,22 @@ impl ChannelSender for WhatsAppSender {
     }
 
     async fn request_confirmation(
-        &self, prompt: &str, screenshot: Option<&[u8]>, _timeout_secs: u64,
+        &self,
+        prompt: &str,
+        screenshot: Option<&[u8]>,
+        _timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
-        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
-        else { self.send_text(prompt).await?; }
+        if let Some(png) = screenshot {
+            self.send_photo(png, prompt).await?;
+        } else {
+            self.send_text(prompt).await?;
+        }
         wait_for_confirmation(&self.to, _timeout_secs).await
     }
 
-    fn channel_type(&self) -> &'static str { "whatsapp" }
+    fn channel_type(&self) -> &'static str {
+        "whatsapp"
+    }
 }
 
 // ===========================================================================
@@ -1185,7 +1535,8 @@ pub struct FeishuSender {
 #[async_trait]
 impl ChannelSender for FeishuSender {
     async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
-        let resp = self.http
+        let resp = self
+            .http
             .post("https://open.feishu.cn/open-apis/im/v1/messages")
             .bearer_auth(&self.access_token)
             .query(&[("receive_id_type", "chat_id")])
@@ -1212,7 +1563,8 @@ impl ChannelSender for FeishuSender {
             .text("image_type", "message")
             .part("image", file_part);
 
-        let upload_resp = self.http
+        let upload_resp = self
+            .http
             .post("https://open.feishu.cn/open-apis/im/v1/images")
             .bearer_auth(&self.access_token)
             .multipart(form)
@@ -1252,11 +1604,19 @@ impl ChannelSender for FeishuSender {
     }
 
     async fn send_document(
-        &self, data: &[u8], filename: &str, _mime: &str,
+        &self,
+        data: &[u8],
+        filename: &str,
+        _mime: &str,
     ) -> Result<(), ChannelSendError> {
         // Step 1: upload file (Feishu file_type — map the well-known ones, else
         // "stream" for a generic binary). Office docs use their native types.
-        let file_type = match filename.rsplit('.').next().map(|s| s.to_ascii_lowercase()).as_deref() {
+        let file_type = match filename
+            .rsplit('.')
+            .next()
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
             Some("pdf") => "pdf",
             Some("doc") | Some("docx") => "doc",
             Some("xls") | Some("xlsx") => "xls",
@@ -1272,7 +1632,8 @@ impl ChannelSender for FeishuSender {
             .text("file_type", file_type)
             .text("file_name", filename.to_string())
             .part("file", file_part);
-        let upload_resp = self.http
+        let upload_resp = self
+            .http
             .post("https://open.feishu.cn/open-apis/im/v1/files")
             .bearer_auth(&self.access_token)
             .multipart(form)
@@ -1303,14 +1664,22 @@ impl ChannelSender for FeishuSender {
     }
 
     async fn request_confirmation(
-        &self, prompt: &str, screenshot: Option<&[u8]>, _timeout_secs: u64,
+        &self,
+        prompt: &str,
+        screenshot: Option<&[u8]>,
+        _timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
-        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
-        else { self.send_text(prompt).await?; }
+        if let Some(png) = screenshot {
+            self.send_photo(png, prompt).await?;
+        } else {
+            self.send_text(prompt).await?;
+        }
         wait_for_confirmation(&self.chat_id, _timeout_secs).await
     }
 
-    fn channel_type(&self) -> &'static str { "feishu" }
+    fn channel_type(&self) -> &'static str {
+        "feishu"
+    }
 }
 
 // ===========================================================================
@@ -1335,7 +1704,11 @@ pub fn create_googlechat_sender(
     space: String,
     user_id: String,
 ) -> Box<dyn ChannelSender> {
-    Box::new(GoogleChatSender { home_dir, space, user_id })
+    Box::new(GoogleChatSender {
+        home_dir,
+        space,
+        user_id,
+    })
 }
 
 #[async_trait]
@@ -1362,15 +1735,27 @@ impl ChannelSender for GoogleChatSender {
     }
 
     async fn request_confirmation(
-        &self, prompt: &str, screenshot: Option<&[u8]>, timeout_secs: u64,
+        &self,
+        prompt: &str,
+        screenshot: Option<&[u8]>,
+        timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
-        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
-        else { self.send_text(prompt).await?; }
-        let key = if self.user_id.is_empty() { &self.space } else { &self.user_id };
+        if let Some(png) = screenshot {
+            self.send_photo(png, prompt).await?;
+        } else {
+            self.send_text(prompt).await?;
+        }
+        let key = if self.user_id.is_empty() {
+            &self.space
+        } else {
+            &self.user_id
+        };
         wait_for_confirmation(key, timeout_secs).await
     }
 
-    fn channel_type(&self) -> &'static str { "googlechat" }
+    fn channel_type(&self) -> &'static str {
+        "googlechat"
+    }
 }
 
 // ===========================================================================
@@ -1393,7 +1778,11 @@ pub fn create_teams_sender(
     conversation_id: String,
     user_id: String,
 ) -> Box<dyn ChannelSender> {
-    Box::new(TeamsSender { home_dir, conversation_id, user_id })
+    Box::new(TeamsSender {
+        home_dir,
+        conversation_id,
+        user_id,
+    })
 }
 
 #[async_trait]
@@ -1418,15 +1807,27 @@ impl ChannelSender for TeamsSender {
     }
 
     async fn request_confirmation(
-        &self, prompt: &str, screenshot: Option<&[u8]>, timeout_secs: u64,
+        &self,
+        prompt: &str,
+        screenshot: Option<&[u8]>,
+        timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
-        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
-        else { self.send_text(prompt).await?; }
-        let key = if self.user_id.is_empty() { &self.conversation_id } else { &self.user_id };
+        if let Some(png) = screenshot {
+            self.send_photo(png, prompt).await?;
+        } else {
+            self.send_text(prompt).await?;
+        }
+        let key = if self.user_id.is_empty() {
+            &self.conversation_id
+        } else {
+            &self.user_id
+        };
         wait_for_confirmation(key, timeout_secs).await
     }
 
-    fn channel_type(&self) -> &'static str { "teams" }
+    fn channel_type(&self) -> &'static str {
+        "teams"
+    }
 }
 
 // ===========================================================================
@@ -1467,14 +1868,22 @@ impl ChannelSender for WeComSender {
     }
 
     async fn request_confirmation(
-        &self, prompt: &str, screenshot: Option<&[u8]>, timeout_secs: u64,
+        &self,
+        prompt: &str,
+        screenshot: Option<&[u8]>,
+        timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
-        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
-        else { self.send_text(prompt).await?; }
+        if let Some(png) = screenshot {
+            self.send_photo(png, prompt).await?;
+        } else {
+            self.send_text(prompt).await?;
+        }
         wait_for_confirmation(&self.touser, timeout_secs).await
     }
 
-    fn channel_type(&self) -> &'static str { "wecom" }
+    fn channel_type(&self) -> &'static str {
+        "wecom"
+    }
 }
 
 // ===========================================================================
@@ -1498,7 +1907,11 @@ pub fn create_dingtalk_sender(
     conversation_id: String,
     user_id: String,
 ) -> Box<dyn ChannelSender> {
-    Box::new(DingTalkSender { home_dir, conversation_id, user_id })
+    Box::new(DingTalkSender {
+        home_dir,
+        conversation_id,
+        user_id,
+    })
 }
 
 #[async_trait]
@@ -1525,15 +1938,27 @@ impl ChannelSender for DingTalkSender {
     }
 
     async fn request_confirmation(
-        &self, prompt: &str, screenshot: Option<&[u8]>, timeout_secs: u64,
+        &self,
+        prompt: &str,
+        screenshot: Option<&[u8]>,
+        timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
-        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
-        else { self.send_text(prompt).await?; }
-        let key = if self.user_id.is_empty() { &self.conversation_id } else { &self.user_id };
+        if let Some(png) = screenshot {
+            self.send_photo(png, prompt).await?;
+        } else {
+            self.send_text(prompt).await?;
+        }
+        let key = if self.user_id.is_empty() {
+            &self.conversation_id
+        } else {
+            &self.user_id
+        };
         wait_for_confirmation(key, timeout_secs).await
     }
 
-    fn channel_type(&self) -> &'static str { "dingtalk" }
+    fn channel_type(&self) -> &'static str {
+        "dingtalk"
+    }
 }
 
 // ===========================================================================
@@ -1596,7 +2021,10 @@ impl ChannelSender for WebChatSender {
     }
 
     async fn send_document(
-        &self, data: &[u8], filename: &str, mime: &str,
+        &self,
+        data: &[u8],
+        filename: &str,
+        mime: &str,
     ) -> Result<(), ChannelSendError> {
         let b64 = base64::engine::general_purpose::STANDARD.encode(data);
         let msg = serde_json::json!({
@@ -1613,14 +2041,22 @@ impl ChannelSender for WebChatSender {
     }
 
     async fn request_confirmation(
-        &self, prompt: &str, screenshot: Option<&[u8]>, _timeout_secs: u64,
+        &self,
+        prompt: &str,
+        screenshot: Option<&[u8]>,
+        _timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
-        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
-        else { self.send_text(prompt).await?; }
+        if let Some(png) = screenshot {
+            self.send_photo(png, prompt).await?;
+        } else {
+            self.send_text(prompt).await?;
+        }
         wait_for_confirmation(&self.session_id, _timeout_secs).await
     }
 
-    fn channel_type(&self) -> &'static str { "webchat" }
+    fn channel_type(&self) -> &'static str {
+        "webchat"
+    }
 }
 
 // ===========================================================================
@@ -1636,15 +2072,24 @@ pub struct NullSender;
 
 #[async_trait]
 impl ChannelSender for NullSender {
-    async fn send_text(&self, _text: &str) -> Result<(), ChannelSendError> { Ok(()) }
-    async fn send_photo(&self, _png_data: &[u8], _caption: &str) -> Result<(), ChannelSendError> { Ok(()) }
+    async fn send_text(&self, _text: &str) -> Result<(), ChannelSendError> {
+        Ok(())
+    }
+    async fn send_photo(&self, _png_data: &[u8], _caption: &str) -> Result<(), ChannelSendError> {
+        Ok(())
+    }
     async fn request_confirmation(
-        &self, _prompt: &str, _screenshot: Option<&[u8]>, _timeout_secs: u64,
+        &self,
+        _prompt: &str,
+        _screenshot: Option<&[u8]>,
+        _timeout_secs: u64,
     ) -> Result<bool, ChannelSendError> {
         // Deny-by-default: no real channel means no one to confirm
         Ok(false)
     }
-    fn channel_type(&self) -> &'static str { "null" }
+    fn channel_type(&self) -> &'static str {
+        "null"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1681,11 +2126,16 @@ mod tests {
             Ok(())
         }
         async fn request_confirmation(
-            &self, _p: &str, _s: Option<&[u8]>, _t: u64,
+            &self,
+            _p: &str,
+            _s: Option<&[u8]>,
+            _t: u64,
         ) -> Result<bool, ChannelSendError> {
             Ok(false)
         }
-        fn channel_type(&self) -> &'static str { "textonly" }
+        fn channel_type(&self) -> &'static str {
+            "textonly"
+        }
     }
 
     #[tokio::test]
@@ -1820,10 +2270,16 @@ mod tests {
     #[tokio::test]
     async fn googlechat_sender_send_text_fails_clearly_when_not_configured() {
         let home = tempfile::tempdir().unwrap();
-        let sender =
-            create_googlechat_sender(home.path().to_path_buf(), "spaces/AAAA".into(), String::new());
+        let sender = create_googlechat_sender(
+            home.path().to_path_buf(),
+            "spaces/AAAA".into(),
+            String::new(),
+        );
         let err = sender.send_text("hi").await.unwrap_err();
-        assert!(!err.0.is_empty(), "expected a non-empty, explicit error message");
+        assert!(
+            !err.0.is_empty(),
+            "expected a non-empty, explicit error message"
+        );
     }
 
     /// Same "explicit failure, not silent success" behavior for Teams.
@@ -1836,7 +2292,10 @@ mod tests {
             String::new(),
         );
         let err = sender.send_text("hi").await.unwrap_err();
-        assert!(!err.0.is_empty(), "expected a non-empty, explicit error message");
+        assert!(
+            !err.0.is_empty(),
+            "expected a non-empty, explicit error message"
+        );
     }
 
     /// Cron/OTP token-resolution parity: wecom/dingtalk/googlechat/teams
@@ -1858,20 +2317,39 @@ mod tests {
         assert!(sender_self_configures("googlechat"));
         assert!(sender_self_configures("teams"));
         for ch in [
-            "telegram", "line", "discord", "slack", "whatsapp", "feishu", "webchat", "",
+            "telegram",
+            "line",
+            "discord",
+            "slack",
+            "whatsapp",
+            "feishu",
+            "webchat",
+            "",
             // anchored matching: no substring surprises
-            "wecom2", "xdingtalk", "xgooglechat", "teams2",
+            "wecom2",
+            "xdingtalk",
+            "xgooglechat",
+            "teams2",
         ] {
-            assert!(!sender_self_configures(ch), "{ch} must not be self-configuring");
+            assert!(
+                !sender_self_configures(ch),
+                "{ch} must not be self-configuring"
+            );
         }
 
         assert_eq!(self_config_marker_field("wecom"), Some("wecom_corp_secret"));
-        assert_eq!(self_config_marker_field("dingtalk"), Some("dingtalk_app_secret"));
+        assert_eq!(
+            self_config_marker_field("dingtalk"),
+            Some("dingtalk_app_secret")
+        );
         assert_eq!(
             self_config_marker_field("googlechat"),
             Some("googlechat_service_account_json")
         );
-        assert_eq!(self_config_marker_field("teams"), Some("teams_app_password"));
+        assert_eq!(
+            self_config_marker_field("teams"),
+            Some("teams_app_password")
+        );
         assert_eq!(self_config_marker_field("telegram"), None);
     }
 
@@ -1996,8 +2474,8 @@ mod tests {
 
     #[test]
     fn slack_ok_false_is_rejected_with_the_platform_error() {
-        let err = super::require_slack_ok(r#"{"ok":false,"error":"channel_not_found"}"#)
-            .unwrap_err();
+        let err =
+            super::require_slack_ok(r#"{"ok":false,"error":"channel_not_found"}"#).unwrap_err();
         assert!(err.0.contains("channel_not_found"), "{}", err.0);
     }
 
@@ -2017,7 +2495,11 @@ mod tests {
     fn feishu_nonzero_code_is_rejected_with_the_platform_error() {
         let err = super::require_feishu_code_zero(r#"{"code":230002,"msg":"chat not found"}"#)
             .unwrap_err();
-        assert!(err.0.contains("230002") && err.0.contains("chat not found"), "{}", err.0);
+        assert!(
+            err.0.contains("230002") && err.0.contains("chat not found"),
+            "{}",
+            err.0
+        );
     }
 
     #[test]

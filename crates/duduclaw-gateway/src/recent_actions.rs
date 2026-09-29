@@ -44,7 +44,10 @@ pub struct RecentActionsConfig {
 
 impl Default for RecentActionsConfig {
     fn default() -> Self {
-        Self { enabled: true, count: 10 }
+        Self {
+            enabled: true,
+            count: 10,
+        }
     }
 }
 
@@ -159,7 +162,10 @@ fn read_recent_rows(home_dir: &Path, agent_id: &str, max: usize) -> Vec<ActionRo
 /// raw prefix when the timestamp doesn't parse.
 fn display_time(ts: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(ts) {
-        Ok(dt) => dt.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string(),
+        Ok(dt) => dt
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string(),
         Err(_) => truncate_bytes(ts, 16).to_string(),
     }
 }
@@ -186,7 +192,11 @@ fn render_lines(rows: &[ActionRow]) -> Vec<String> {
         let mark = if row.success { "✅" } else { "❌" };
         let summary = truncate_bytes(&row.summary, LINE_SUMMARY_MAX_BYTES);
         let mut line = if summary.is_empty() {
-            format!("- [{}] {} {mark}", display_time(&row.timestamp), row.tool_name)
+            format!(
+                "- [{}] {} {mark}",
+                display_time(&row.timestamp),
+                row.tool_name
+            )
         } else {
             format!(
                 "- [{}] {} {mark} {summary}",
@@ -270,7 +280,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_log(
             dir.path(),
-            &[row_json(&recent_ts(5), "other-agent", "tasks_create", true, "x")],
+            &[row_json(
+                &recent_ts(5),
+                "other-agent",
+                "tasks_create",
+                true,
+                "x",
+            )],
         );
         assert!(build_recent_actions_section(dir.path(), "trader").is_none());
     }
@@ -281,8 +297,20 @@ mod tests {
         write_log(
             dir.path(),
             &[
-                row_json(&recent_ts(10), "trader", "execute_trade", false, "2317 8股 @264（被風控攔截）"),
-                row_json(&recent_ts(5), "trader", "tasks_complete", true, "盤前計畫完成"),
+                row_json(
+                    &recent_ts(10),
+                    "trader",
+                    "execute_trade",
+                    false,
+                    "2317 8股 @264（被風控攔截）",
+                ),
+                row_json(
+                    &recent_ts(5),
+                    "trader",
+                    "tasks_complete",
+                    true,
+                    "盤前計畫完成",
+                ),
             ],
         );
         let section = build_recent_actions_section(dir.path(), "trader").unwrap();
@@ -298,7 +326,10 @@ mod tests {
     fn stale_rows_outside_lookback_are_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let old = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
-        write_log(dir.path(), &[row_json(&old, "trader", "execute_trade", true, "old")]);
+        write_log(
+            dir.path(),
+            &[row_json(&old, "trader", "execute_trade", true, "old")],
+        );
         assert!(build_recent_actions_section(dir.path(), "trader").is_none());
     }
 
@@ -306,7 +337,15 @@ mod tests {
     fn consecutive_duplicates_collapse() {
         let dir = tempfile::tempdir().unwrap();
         let lines: Vec<String> = (0..3)
-            .map(|i| row_json(&recent_ts(10 - i), "trader", "web_fetch_cached", true, "poll"))
+            .map(|i| {
+                row_json(
+                    &recent_ts(10 - i),
+                    "trader",
+                    "web_fetch_cached",
+                    true,
+                    "poll",
+                )
+            })
             .collect();
         write_log(dir.path(), &lines);
         let section = build_recent_actions_section(dir.path(), "trader").unwrap();
@@ -318,7 +357,15 @@ mod tests {
     fn count_cap_keeps_most_recent() {
         let dir = tempfile::tempdir().unwrap();
         let lines: Vec<String> = (0..20)
-            .map(|i| row_json(&recent_ts(60 - i), "trader", "tool", true, &format!("call-{i}")))
+            .map(|i| {
+                row_json(
+                    &recent_ts(60 - i),
+                    "trader",
+                    "tool",
+                    true,
+                    &format!("call-{i}"),
+                )
+            })
             .collect();
         write_log(dir.path(), &lines);
         let section = build_recent_actions_section(dir.path(), "trader").unwrap();
@@ -335,7 +382,10 @@ mod tests {
             "[memory]\nrecent_actions_enabled = false\n",
         )
         .unwrap();
-        write_log(dir.path(), &[row_json(&recent_ts(5), "trader", "tool", true, "x")]);
+        write_log(
+            dir.path(),
+            &[row_json(&recent_ts(5), "trader", "tool", true, "x")],
+        );
         assert!(build_recent_actions_section(dir.path(), "trader").is_none());
     }
 
@@ -343,7 +393,10 @@ mod tests {
     fn cjk_summary_truncates_on_char_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let long = "鴻海台積電聯發科".repeat(30);
-        write_log(dir.path(), &[row_json(&recent_ts(5), "trader", "tool", true, &long)]);
+        write_log(
+            dir.path(),
+            &[row_json(&recent_ts(5), "trader", "tool", true, &long)],
+        );
         // Must not panic on a mid-char byte budget.
         let section = build_recent_actions_section(dir.path(), "trader").unwrap();
         assert!(section.contains("鴻海"));

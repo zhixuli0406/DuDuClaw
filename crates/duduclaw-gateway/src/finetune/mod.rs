@@ -98,9 +98,9 @@ impl FinetuneError {
             Self::NotFound(m) => format!("找不到：{m}"),
             Self::Io(m) => format!("讀寫失敗：{m}"),
             Self::Backend(m) => format!("訓練後端回報失敗：{m}"),
-            Self::UnverifiedBackend(m) => format!(
-                "這個訓練後端的介面尚未經過實地查證，預設關閉：{m}"
-            ),
+            Self::UnverifiedBackend(m) => {
+                format!("這個訓練後端的介面尚未經過實地查證，預設關閉：{m}")
+            }
         }
     }
 }
@@ -195,7 +195,9 @@ pub fn require_data_leaves_device_ack(acknowledged: bool, what: &str) -> Result<
     if acknowledged {
         Ok(())
     } else {
-        Err(FinetuneError::NotAcknowledged { what: what.to_string() })
+        Err(FinetuneError::NotAcknowledged {
+            what: what.to_string(),
+        })
     }
 }
 
@@ -256,7 +258,10 @@ mod tests {
             dataset_dir(home, "ds1").unwrap(),
             Path::new("/data/duduclaw/finetune/datasets/ds1")
         );
-        assert_eq!(job_dir(home, "j1").unwrap(), Path::new("/data/duduclaw/finetune/jobs/j1"));
+        assert_eq!(
+            job_dir(home, "j1").unwrap(),
+            Path::new("/data/duduclaw/finetune/jobs/j1")
+        );
         // Must match `local_models::installed`'s `home_dir.join("models")`.
         assert_eq!(models_dir(home), Path::new("/data/duduclaw/models"));
         assert!(dataset_dir(home, "../escape").is_err());

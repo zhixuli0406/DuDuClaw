@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use tokio::sync::RwLock;
 
 /// JWKS cache TTL (Microsoft guidance: refresh at least every 24h).
@@ -62,7 +62,11 @@ async fn rsa_components_for_kid(
     }
     let doc: serde_json::Value = resp.json().await.map_err(|e| format!("JWKS parse: {e}"))?;
     let mut keys: HashMap<String, (String, String)> = HashMap::new();
-    for key in doc.get("keys").and_then(|k| k.as_array()).unwrap_or(&vec![]) {
+    for key in doc
+        .get("keys")
+        .and_then(|k| k.as_array())
+        .unwrap_or(&vec![])
+    {
         let (Some(kid), Some(n), Some(e)) = (
             key.get("kid").and_then(|v| v.as_str()),
             key.get("n").and_then(|v| v.as_str()),
@@ -79,7 +83,10 @@ async fn rsa_components_for_kid(
     let found = keys.get(kid).cloned();
     jwks_cache().write().await.insert(
         jwks_url.to_string(),
-        CachedJwks { keys, fetched_at: Instant::now() },
+        CachedJwks {
+            keys,
+            fetched_at: Instant::now(),
+        },
     );
     found.ok_or_else(|| format!("kid {kid} not found in JWKS"))
 }
@@ -120,7 +127,10 @@ pub async fn verify_rs256(
 
 /// Extract the Bearer token from an Authorization header value.
 pub fn bearer_token(auth_header: &str) -> Option<&str> {
-    auth_header.strip_prefix("Bearer ").map(str::trim).filter(|t| !t.is_empty())
+    auth_header
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
-use duduclaw_license::{storage, License, PublicKeyRegistry};
+use duduclaw_license::{License, PublicKeyRegistry, storage};
 use tracing::{info, warn};
 
 /// Env var naming the seed-candidate license file (the compose pack sets it to

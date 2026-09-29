@@ -19,7 +19,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::playbook::delta::{merge, ExistingEntry, MergeOutcome, PlaybookDelta};
+use crate::playbook::delta::{ExistingEntry, MergeOutcome, PlaybookDelta, merge};
 use crate::playbook::entry::{PlaybookMeta, PlaybookState};
 use crate::playbook::gene::EvalCaseRef;
 
@@ -61,7 +61,10 @@ impl PlaybookSnapshot {
     /// Active + probation count — what [`crate::playbook::PLAYBOOK_MAX_ENTRIES`]
     /// caps and what `G-Capacity` measures.
     pub fn active_count(&self) -> usize {
-        self.entries.iter().filter(|e| Self::is_live(&e.meta)).count()
+        self.entries
+            .iter()
+            .filter(|e| Self::is_live(&e.meta))
+            .count()
     }
 
     /// Entries whose `success_streak` is below `threshold` — the raw material
@@ -161,7 +164,12 @@ impl PlaybookSnapshot {
         use crate::playbook::delta::AppliedOp;
         for op in &outcome.applied {
             match op {
-                AppliedOp::Added { dedup_key, content, meta, stats } => {
+                AppliedOp::Added {
+                    dedup_key,
+                    content,
+                    meta,
+                    stats,
+                } => {
                     // `merge` uses the dedup key as the within-batch identity
                     // for a not-yet-persisted entry; the shadow does the same
                     // so a follow-up delta in a LATER inner round can address
@@ -228,7 +236,9 @@ pub fn deterministic_sample(pool: &[EvalCaseRef], round_seq: u64, max: usize) ->
     let start = (round_seq as usize) % pool.len();
     let mut sorted: Vec<EvalCaseRef> = pool.to_vec();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    (0..take).map(|i| sorted[(start + i) % sorted.len()].clone()).collect()
+    (0..take)
+        .map(|i| sorted[(start + i) % sorted.len()].clone())
+        .collect()
 }
 
 /// The inner loop's sampling budget: at most this many extra cases beyond the
@@ -246,10 +256,16 @@ pub fn now() -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::entry::{PlaybookCategory, PLAYBOOK_SCHEMA_VERSION};
+    use crate::playbook::entry::{PLAYBOOK_SCHEMA_VERSION, PlaybookCategory};
     use crate::prediction::rule_lifecycle::RuleStats;
 
-    fn entry(id: &str, content: &str, state: PlaybookState, streak: u32, cases: &[&str]) -> ExistingEntry {
+    fn entry(
+        id: &str,
+        content: &str,
+        state: PlaybookState,
+        streak: u32,
+        cases: &[&str],
+    ) -> ExistingEntry {
         ExistingEntry {
             id: id.to_string(),
             content: content.to_string(),
@@ -257,10 +273,14 @@ mod tests {
                 assertions: Default::default(),
                 schema_version: PLAYBOOK_SCHEMA_VERSION,
                 category: PlaybookCategory::Repair,
+                transferability: Default::default(),
                 signals_match: vec!["mistake:factual".to_string()],
                 strategy: Vec::new(),
                 failure_history: Vec::new(),
-                eval_cases: cases.iter().map(|c| EvalCaseRef((*c).to_string())).collect(),
+                eval_cases: cases
+                    .iter()
+                    .map(|c| EvalCaseRef((*c).to_string()))
+                    .collect(),
                 applications: Vec::new(),
                 success_streak: streak,
                 state,
@@ -280,7 +300,13 @@ mod tests {
 
     #[test]
     fn shadow_apply_never_mutates_the_original() {
-        let snap = PlaybookSnapshot::new(vec![entry("e1", "old text", PlaybookState::Active, 3, &["s/a"])]);
+        let snap = PlaybookSnapshot::new(vec![entry(
+            "e1",
+            "old text",
+            PlaybookState::Active,
+            3,
+            &["s/a"],
+        )]);
         let (next, outcome) = snap.shadow_apply(
             vec![PlaybookDelta::Revise {
                 id: "e1".into(),
@@ -290,7 +316,10 @@ mod tests {
             t(),
         );
         assert_eq!(outcome.applied.len(), 1);
-        assert_eq!(snap.entries[0].content, "old text", "source snapshot is untouched");
+        assert_eq!(
+            snap.entries[0].content, "old text",
+            "source snapshot is untouched"
+        );
         assert_eq!(next.entries[0].content, "new text");
         assert_eq!(next.entries[0].meta.state, PlaybookState::Probation);
         assert_eq!(next.entries[0].meta.success_streak, 0);
@@ -305,16 +334,27 @@ mod tests {
             entry("d", "d", PlaybookState::Retired, 0, &["s/d"]),
         ]);
         assert_eq!(snap.active_count(), 2);
-        assert_eq!(snap.linked_cases().len(), 2, "stale/retired entries contribute no cases");
+        assert_eq!(
+            snap.linked_cases().len(),
+            2,
+            "stale/retired entries contribute no cases"
+        );
     }
 
     #[test]
     fn cases_touched_by_covers_both_the_delta_and_the_target_entry() {
-        let snap = PlaybookSnapshot::new(vec![entry("e1", "x", PlaybookState::Active, 0, &["s/own"])]);
+        let snap =
+            PlaybookSnapshot::new(vec![entry("e1", "x", PlaybookState::Active, 0, &["s/own"])]);
         let touched = snap.cases_touched_by(&[
-            PlaybookDelta::Link { id: "e1".into(), eval_cases: vec![EvalCaseRef("s/extra".into())] },
+            PlaybookDelta::Link {
+                id: "e1".into(),
+                eval_cases: vec![EvalCaseRef("s/extra".into())],
+            },
             PlaybookDelta::Add {
-                assertions: crate::playbook::entry::EntryAssertions { output_contains: vec!["ok".to_string()], ..Default::default() },
+                assertions: crate::playbook::entry::EntryAssertions {
+                    output_contains: vec!["ok".to_string()],
+                    ..Default::default()
+                },
                 content: "y".into(),
                 category: PlaybookCategory::Innovate,
                 signals_match: vec!["*".into()],
@@ -329,8 +369,9 @@ mod tests {
 
     #[test]
     fn deterministic_sample_is_reproducible_for_the_same_round() {
-        let pool: Vec<EvalCaseRef> =
-            (0..12).map(|i| EvalCaseRef(format!("s/case{i:02}"))).collect();
+        let pool: Vec<EvalCaseRef> = (0..12)
+            .map(|i| EvalCaseRef(format!("s/case{i:02}")))
+            .collect();
         let a = deterministic_sample(&pool, 7, INNER_LOOP_SAMPLE_MAX);
         let b = deterministic_sample(&pool, 7, INNER_LOOP_SAMPLE_MAX);
         assert_eq!(a, b, "same round_seq must pick the same subset");
@@ -347,7 +388,10 @@ mod tests {
     fn added_entry_is_addressable_by_a_later_inner_round() {
         let snap = PlaybookSnapshot::default();
         let add = PlaybookDelta::Add {
-            assertions: crate::playbook::entry::EntryAssertions { output_contains: vec!["ok".to_string()], ..Default::default() },
+            assertions: crate::playbook::entry::EntryAssertions {
+                output_contains: vec!["ok".to_string()],
+                ..Default::default()
+            },
             content: "confirm before deleting".into(),
             category: PlaybookCategory::Repair,
             signals_match: vec!["mistake:capability".into()],
@@ -366,7 +410,11 @@ mod tests {
             }],
             t(),
         );
-        assert_eq!(outcome2.applied.len(), 1, "round 2 can address what round 1 added");
+        assert_eq!(
+            outcome2.applied.len(),
+            1,
+            "round 2 can address what round 1 added"
+        );
         assert_eq!(round2.entries[0].content, "confirm twice before deleting");
     }
 

@@ -58,8 +58,8 @@
 //! `cwd`, ~22K baseline cache-creation tokens from the CLI's own tool schemas,
 //! no CLAUDE.md auto-discovery cost). [`validate_captured_token`] is that call.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -177,7 +177,11 @@ impl SetupTokenSlot {
 /// killing any prior one first — that single-concurrency policy lives in the
 /// RPC handler, not here, since it needs the server's lock).
 pub fn spawn_session(session_id: String) -> Result<SetupTokenSlot, AuthError> {
-    let session = AuthSession::spawn(session_id.clone(), RuntimeType::Claude, std::collections::HashMap::new())?;
+    let session = AuthSession::spawn(
+        session_id.clone(),
+        RuntimeType::Claude,
+        std::collections::HashMap::new(),
+    )?;
 
     // TTL sweep: guarantees the PTY child is reaped even if the dashboard
     // never calls back in (closed tab, network drop). Idempotent — killing an
@@ -417,7 +421,10 @@ mod tests {
         for code in all {
             let s = code.as_str();
             assert!(!s.is_empty());
-            assert!(s.chars().all(|c| c.is_ascii_lowercase() || c == '_'), "{s} not snake_case");
+            assert!(
+                s.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{s} not snake_case"
+            );
             assert!(seen.insert(s), "duplicate error code string: {s}");
         }
     }
@@ -432,7 +439,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "live: runs real `claude setup-token`; needs claude installed"]
     async fn live_spawn_session_and_wait_for_auth_url() {
-        let slot = spawn_session("live-wizard-test".to_string()).expect("spawn setup-token session");
+        let slot =
+            spawn_session("live-wizard-test".to_string()).expect("spawn setup-token session");
         assert!(!slot.is_expired());
         assert!(slot.expires_in_seconds() > 0);
 
@@ -442,7 +450,10 @@ mod tests {
         let url = url.expect("expected an auth_url to be captured within the wait window");
         assert!(url.starts_with("https://"), "url = {url}");
         assert!(url.contains("claude.com"), "url = {url}");
-        assert!(url.contains("code_challenge="), "expected a PKCE-shaped consent URL: {url}");
+        assert!(
+            url.contains("code_challenge="),
+            "expected a PKCE-shaped consent URL: {url}"
+        );
     }
 
     /// LIVE: proves `validate_captured_token` performs a REAL API round-trip
@@ -466,6 +477,9 @@ mod tests {
             "expected a 401-classified or generic validation-failure message, got: {err}"
         );
         // The fake token itself must never appear in the error message.
-        assert!(!err.contains(fake_token), "error message must not echo the token: {err}");
+        assert!(
+            !err.contains(fake_token),
+            "error message must not echo the token: {err}"
+        );
     }
 }

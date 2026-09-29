@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::identity::{resolve_run_identity, RunIdentityError};
+use super::identity::{RunIdentityError, resolve_run_identity};
 
 fn tempdir(label: &str) -> PathBuf {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -43,7 +43,10 @@ fn no_override_is_refused_when_caller_itself_has_codrive_disabled() {
 
     let err = resolve_run_identity(&home, "caller-agent", None)
         .expect_err("a caller with codrive disabled must be refused");
-    assert_eq!(err, RunIdentityError::CapabilityMissing("caller-agent".to_string()));
+    assert_eq!(
+        err,
+        RunIdentityError::CapabilityMissing("caller-agent".to_string())
+    );
 }
 
 /// The load-bearing regression test: an `agent` override must be gated on
@@ -58,7 +61,10 @@ fn override_to_a_codrive_disabled_agent_is_refused_even_when_caller_is_enabled()
 
     let err = resolve_run_identity(&home, "caller-agent", Some("target-agent"))
         .expect_err("an override naming a codrive-disabled agent must be refused");
-    assert_eq!(err, RunIdentityError::CapabilityMissing("target-agent".to_string()));
+    assert_eq!(
+        err,
+        RunIdentityError::CapabilityMissing("target-agent".to_string())
+    );
 }
 
 /// The mirror case: an override to an agent that DOES have codrive enabled
@@ -84,7 +90,10 @@ fn missing_agent_toml_fails_closed_as_capability_missing() {
     // ::load's own Err(_) => AgentTomlSections::default() fallback means
     // this must resolve to codrive = false, not panic or silently pass.
     let err = resolve_run_identity(&home, "ghost-agent", None).expect_err("must fail closed");
-    assert_eq!(err, RunIdentityError::CapabilityMissing("ghost-agent".to_string()));
+    assert_eq!(
+        err,
+        RunIdentityError::CapabilityMissing("ghost-agent".to_string())
+    );
 }
 
 #[test]

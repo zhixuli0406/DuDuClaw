@@ -61,7 +61,10 @@ fn probe_interface(name: &str) -> WiredProbe {
     let arphrd_type = std::fs::read_to_string(format!("/sys/class/net/{name}/type"))
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok());
-    WiredProbe { has_wireless_dir, arphrd_type }
+    WiredProbe {
+        has_wireless_dir,
+        arphrd_type,
+    }
 }
 
 /// Detect "the" wired interface for a status glance — the first candidate
@@ -263,9 +266,15 @@ impl WiredConfigErrorCode {
 /// InvalidAddress`] — this appliance's static-IP support is IPv4-only this
 /// round.
 pub fn parse_ipv4_cidr(s: &str) -> Result<(Ipv4Addr, u8), WiredConfigErrorCode> {
-    let (addr_part, prefix_part) = s.split_once('/').ok_or(WiredConfigErrorCode::InvalidAddress)?;
-    let addr: Ipv4Addr = addr_part.parse().map_err(|_| WiredConfigErrorCode::InvalidAddress)?;
-    let prefix: u8 = prefix_part.parse().map_err(|_| WiredConfigErrorCode::InvalidAddress)?;
+    let (addr_part, prefix_part) = s
+        .split_once('/')
+        .ok_or(WiredConfigErrorCode::InvalidAddress)?;
+    let addr: Ipv4Addr = addr_part
+        .parse()
+        .map_err(|_| WiredConfigErrorCode::InvalidAddress)?;
+    let prefix: u8 = prefix_part
+        .parse()
+        .map_err(|_| WiredConfigErrorCode::InvalidAddress)?;
     if !(1..=32).contains(&prefix) {
         return Err(WiredConfigErrorCode::InvalidAddress);
     }
@@ -276,7 +285,8 @@ pub fn parse_ipv4_cidr(s: &str) -> Result<(Ipv4Addr, u8), WiredConfigErrorCode> 
 /// refusal as [`parse_ipv4_cidr`] for anything else (including a
 /// syntactically valid IPv6 address).
 pub fn parse_ipv4_gateway(s: &str) -> Result<Ipv4Addr, WiredConfigErrorCode> {
-    s.parse::<Ipv4Addr>().map_err(|_| WiredConfigErrorCode::InvalidAddress)
+    s.parse::<Ipv4Addr>()
+        .map_err(|_| WiredConfigErrorCode::InvalidAddress)
 }
 
 /// `<=3` entries, each a parseable [`IpAddr`] — v4 OR v6 (DNS resolvers are
@@ -287,7 +297,9 @@ pub fn validate_dns_list(dns: &[String]) -> Result<(), WiredConfigErrorCode> {
         return Err(WiredConfigErrorCode::InvalidDns);
     }
     for entry in dns {
-        entry.parse::<IpAddr>().map_err(|_| WiredConfigErrorCode::InvalidDns)?;
+        entry
+            .parse::<IpAddr>()
+            .map_err(|_| WiredConfigErrorCode::InvalidDns)?;
     }
     Ok(())
 }
@@ -355,9 +367,14 @@ pub fn collect_wired_status(home_dir: &Path) -> WiredStatus {
                 .map(|i| i.is_up)
         })
         .unwrap_or(false);
-    let addresses = interface.as_deref().map(read_cidr_addresses).unwrap_or_default();
+    let addresses = interface
+        .as_deref()
+        .map(read_cidr_addresses)
+        .unwrap_or_default();
     let ip = crate::network::ipinfo::collect(interface.as_deref());
-    let configured = load_wired_config(home_dir).as_ref().map(ConfiguredDesired::from);
+    let configured = load_wired_config(home_dir)
+        .as_ref()
+        .map(ConfiguredDesired::from);
     WiredStatus {
         interface,
         link_up,
@@ -399,7 +416,13 @@ pub async fn reapply_wired_config_on_boot(home_dir: &Path) {
         return;
     };
     match ops
-        .network_wired_config(&cfg.interface, &cfg.mode, cfg.address.as_deref(), cfg.gateway.as_deref(), &cfg.dns)
+        .network_wired_config(
+            &cfg.interface,
+            &cfg.mode,
+            cfg.address.as_deref(),
+            cfg.gateway.as_deref(),
+            &cfg.dns,
+        )
         .await
     {
         Ok(out) if out.success => {
@@ -426,26 +449,71 @@ mod tests {
 
     #[test]
     fn is_wired_requires_no_wireless_dir_and_arphrd_ether() {
-        assert!(is_wired(&WiredProbe { has_wireless_dir: false, arphrd_type: Some(1) }));
-        assert!(!is_wired(&WiredProbe { has_wireless_dir: true, arphrd_type: Some(1) }));
-        assert!(!is_wired(&WiredProbe { has_wireless_dir: false, arphrd_type: Some(801) })); // wlan ARPHRD_IEEE80211
-        assert!(!is_wired(&WiredProbe { has_wireless_dir: false, arphrd_type: None }));
+        assert!(is_wired(&WiredProbe {
+            has_wireless_dir: false,
+            arphrd_type: Some(1)
+        }));
+        assert!(!is_wired(&WiredProbe {
+            has_wireless_dir: true,
+            arphrd_type: Some(1)
+        }));
+        assert!(!is_wired(&WiredProbe {
+            has_wireless_dir: false,
+            arphrd_type: Some(801)
+        })); // wlan ARPHRD_IEEE80211
+        assert!(!is_wired(&WiredProbe {
+            has_wireless_dir: false,
+            arphrd_type: None
+        }));
     }
 
     #[test]
     fn select_wired_interface_picks_first_match_in_order() {
         let candidates = vec![
-            ("wlan0".to_string(), WiredProbe { has_wireless_dir: true, arphrd_type: Some(1) }),
-            ("docker0".to_string(), WiredProbe { has_wireless_dir: false, arphrd_type: Some(772) }),
-            ("enp1s0".to_string(), WiredProbe { has_wireless_dir: false, arphrd_type: Some(1) }),
-            ("eth1".to_string(), WiredProbe { has_wireless_dir: false, arphrd_type: Some(1) }),
+            (
+                "wlan0".to_string(),
+                WiredProbe {
+                    has_wireless_dir: true,
+                    arphrd_type: Some(1),
+                },
+            ),
+            (
+                "docker0".to_string(),
+                WiredProbe {
+                    has_wireless_dir: false,
+                    arphrd_type: Some(772),
+                },
+            ),
+            (
+                "enp1s0".to_string(),
+                WiredProbe {
+                    has_wireless_dir: false,
+                    arphrd_type: Some(1),
+                },
+            ),
+            (
+                "eth1".to_string(),
+                WiredProbe {
+                    has_wireless_dir: false,
+                    arphrd_type: Some(1),
+                },
+            ),
         ];
-        assert_eq!(select_wired_interface(&candidates).as_deref(), Some("enp1s0"));
+        assert_eq!(
+            select_wired_interface(&candidates).as_deref(),
+            Some("enp1s0")
+        );
     }
 
     #[test]
     fn select_wired_interface_none_when_nothing_matches() {
-        let candidates = vec![("wlan0".to_string(), WiredProbe { has_wireless_dir: true, arphrd_type: Some(1) })];
+        let candidates = vec![(
+            "wlan0".to_string(),
+            WiredProbe {
+                has_wireless_dir: true,
+                arphrd_type: Some(1),
+            },
+        )];
         assert_eq!(select_wired_interface(&candidates), None);
         assert_eq!(select_wired_interface(&[]), None);
     }
@@ -461,10 +529,22 @@ mod tests {
 
     #[test]
     fn netmask_to_prefix_len_examples() {
-        assert_eq!(netmask_to_prefix_len(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0))), 24);
-        assert_eq!(netmask_to_prefix_len(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255))), 32);
-        assert_eq!(netmask_to_prefix_len(IpAddr::V4(Ipv4Addr::new(255, 255, 0, 0))), 16);
-        assert_eq!(netmask_to_prefix_len(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))), 0);
+        assert_eq!(
+            netmask_to_prefix_len(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0))),
+            24
+        );
+        assert_eq!(
+            netmask_to_prefix_len(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255))),
+            32
+        );
+        assert_eq!(
+            netmask_to_prefix_len(IpAddr::V4(Ipv4Addr::new(255, 255, 0, 0))),
+            16
+        );
+        assert_eq!(
+            netmask_to_prefix_len(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
+            0
+        );
     }
 
     #[test]
@@ -537,31 +617,67 @@ mod tests {
     fn validate_mode_closed_set() {
         assert!(validate_mode("dhcp").is_ok());
         assert!(validate_mode("static").is_ok());
-        assert_eq!(validate_mode("bogus"), Err(WiredConfigErrorCode::InvalidMode));
+        assert_eq!(
+            validate_mode("bogus"),
+            Err(WiredConfigErrorCode::InvalidMode)
+        );
         assert_eq!(validate_mode(""), Err(WiredConfigErrorCode::InvalidMode));
     }
 
     #[test]
     fn parse_ipv4_cidr_accepts_valid_and_rejects_bad_shapes() {
-        assert_eq!(parse_ipv4_cidr("192.168.1.50/24"), Ok((Ipv4Addr::new(192, 168, 1, 50), 24)));
-        assert_eq!(parse_ipv4_cidr("10.0.0.1/1"), Ok((Ipv4Addr::new(10, 0, 0, 1), 1)));
-        assert_eq!(parse_ipv4_cidr("10.0.0.1/32"), Ok((Ipv4Addr::new(10, 0, 0, 1), 32)));
-        assert_eq!(parse_ipv4_cidr("10.0.0.1/0"), Err(WiredConfigErrorCode::InvalidAddress));
-        assert_eq!(parse_ipv4_cidr("10.0.0.1/33"), Err(WiredConfigErrorCode::InvalidAddress));
-        assert_eq!(parse_ipv4_cidr("10.0.0.1"), Err(WiredConfigErrorCode::InvalidAddress));
-        assert_eq!(parse_ipv4_cidr("not-an-ip/24"), Err(WiredConfigErrorCode::InvalidAddress));
+        assert_eq!(
+            parse_ipv4_cidr("192.168.1.50/24"),
+            Ok((Ipv4Addr::new(192, 168, 1, 50), 24))
+        );
+        assert_eq!(
+            parse_ipv4_cidr("10.0.0.1/1"),
+            Ok((Ipv4Addr::new(10, 0, 0, 1), 1))
+        );
+        assert_eq!(
+            parse_ipv4_cidr("10.0.0.1/32"),
+            Ok((Ipv4Addr::new(10, 0, 0, 1), 32))
+        );
+        assert_eq!(
+            parse_ipv4_cidr("10.0.0.1/0"),
+            Err(WiredConfigErrorCode::InvalidAddress)
+        );
+        assert_eq!(
+            parse_ipv4_cidr("10.0.0.1/33"),
+            Err(WiredConfigErrorCode::InvalidAddress)
+        );
+        assert_eq!(
+            parse_ipv4_cidr("10.0.0.1"),
+            Err(WiredConfigErrorCode::InvalidAddress)
+        );
+        assert_eq!(
+            parse_ipv4_cidr("not-an-ip/24"),
+            Err(WiredConfigErrorCode::InvalidAddress)
+        );
     }
 
     #[test]
     fn parse_ipv4_cidr_rejects_ipv6() {
-        assert_eq!(parse_ipv4_cidr("2001:db8::1/64"), Err(WiredConfigErrorCode::InvalidAddress));
+        assert_eq!(
+            parse_ipv4_cidr("2001:db8::1/64"),
+            Err(WiredConfigErrorCode::InvalidAddress)
+        );
     }
 
     #[test]
     fn parse_ipv4_gateway_accepts_v4_rejects_v6_and_garbage() {
-        assert_eq!(parse_ipv4_gateway("192.168.1.1"), Ok(Ipv4Addr::new(192, 168, 1, 1)));
-        assert_eq!(parse_ipv4_gateway("2001:db8::1"), Err(WiredConfigErrorCode::InvalidAddress));
-        assert_eq!(parse_ipv4_gateway("not-an-ip"), Err(WiredConfigErrorCode::InvalidAddress));
+        assert_eq!(
+            parse_ipv4_gateway("192.168.1.1"),
+            Ok(Ipv4Addr::new(192, 168, 1, 1))
+        );
+        assert_eq!(
+            parse_ipv4_gateway("2001:db8::1"),
+            Err(WiredConfigErrorCode::InvalidAddress)
+        );
+        assert_eq!(
+            parse_ipv4_gateway("not-an-ip"),
+            Err(WiredConfigErrorCode::InvalidAddress)
+        );
     }
 
     #[test]
@@ -584,7 +700,10 @@ mod tests {
             ]),
             Err(WiredConfigErrorCode::InvalidDns)
         );
-        assert_eq!(validate_dns_list(&["not-an-ip".to_string()]), Err(WiredConfigErrorCode::InvalidDns));
+        assert_eq!(
+            validate_dns_list(&["not-an-ip".to_string()]),
+            Err(WiredConfigErrorCode::InvalidDns)
+        );
     }
 
     #[test]
@@ -598,7 +717,9 @@ mod tests {
             validate_wired_config_request("static", None, None, &[]),
             Err(WiredConfigErrorCode::InvalidAddress)
         );
-        assert!(validate_wired_config_request("static", Some("192.168.1.50/24"), None, &[]).is_ok());
+        assert!(
+            validate_wired_config_request("static", Some("192.168.1.50/24"), None, &[]).is_ok()
+        );
     }
 
     #[test]
@@ -627,9 +748,15 @@ mod tests {
     fn error_codes_are_stable_strings() {
         assert_eq!(WiredConfigErrorCode::NoInterface.code(), "no_interface");
         assert_eq!(WiredConfigErrorCode::InvalidMode.code(), "invalid_mode");
-        assert_eq!(WiredConfigErrorCode::InvalidAddress.code(), "invalid_address");
+        assert_eq!(
+            WiredConfigErrorCode::InvalidAddress.code(),
+            "invalid_address"
+        );
         assert_eq!(WiredConfigErrorCode::InvalidDns.code(), "invalid_dns");
-        assert_eq!(WiredConfigErrorCode::BackendUnavailable.code(), "backend_unavailable");
+        assert_eq!(
+            WiredConfigErrorCode::BackendUnavailable.code(),
+            "backend_unavailable"
+        );
         assert_eq!(WiredConfigErrorCode::ApplyFailed.code(), "apply_failed");
     }
 
@@ -649,7 +776,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         save_wired_config(dir.path(), &sample_config()).unwrap();
         let status = collect_wired_status(dir.path());
-        assert_eq!(status.configured.as_ref().map(|c| c.mode.as_str()), Some("static"));
+        assert_eq!(
+            status.configured.as_ref().map(|c| c.mode.as_str()),
+            Some("static")
+        );
     }
 
     // ── reapply_wired_config_on_boot ──────────────────────────────────────

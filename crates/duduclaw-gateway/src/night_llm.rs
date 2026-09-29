@@ -187,6 +187,7 @@ impl NightLlm for RotatedNightLlm {
             None,        // session_id — single-shot, no multi-turn session
             &[],         // conversation_history — prompts are self-contained
             &[],         // account_pool — system-level utility call, no agent pool
+            None,        // P1/WP-3 effort: resolved from the agent dir in the callee
         )
         .await
         {
@@ -337,9 +338,20 @@ mod tests {
         assert!(!allowed.is_empty(), "allowlist mode must be engaged");
         assert_eq!(allowed, vec!["duduclaw_night_no_tools".to_string()]);
         // Write/exec tools are unavailable both via the allowlist and the deny.
-        assert!(!caps.write_tools_allowed(), "night must not have write tools");
+        assert!(
+            !caps.write_tools_allowed(),
+            "night must not have write tools"
+        );
         let denied = caps.disallowed_tools();
-        for t in ["Bash", "Write", "Edit", "WebFetch", "WebSearch", "Task", "computer"] {
+        for t in [
+            "Bash",
+            "Write",
+            "Edit",
+            "WebFetch",
+            "WebSearch",
+            "Task",
+            "computer",
+        ] {
             assert!(
                 denied.iter().any(|d| d == t),
                 "{t} must be in the night denylist: {denied:?}"

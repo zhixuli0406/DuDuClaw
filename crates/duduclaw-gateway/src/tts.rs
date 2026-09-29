@@ -63,9 +63,9 @@ impl MiniMaxTts {
         let cjk_count = text.chars().filter(|c| *c > '\u{2E80}').count();
         let total = text.chars().count().max(1);
         if cjk_count as f64 / total as f64 > 0.3 {
-            "Cute_Girl"  // Chinese voice
+            "Cute_Girl" // Chinese voice
         } else {
-            "English_Female_1"  // English voice
+            "English_Female_1" // English voice
         }
     }
 }
@@ -81,7 +81,7 @@ struct T2aRequest {
 
 #[derive(Debug, Deserialize)]
 struct T2aResponse {
-    audio_file: Option<String>,  // base64-encoded audio
+    audio_file: Option<String>, // base64-encoded audio
     #[serde(default)]
     base_resp: Option<T2aBaseResp>,
 }
@@ -127,7 +127,10 @@ impl TtsProvider for MiniMaxTts {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(format!("MiniMax TTS error ({status}): {}", truncate_bytes(&text, 300)));
+            return Err(format!(
+                "MiniMax TTS error ({status}): {}",
+                truncate_bytes(&text, 300)
+            ));
         }
 
         let resp: T2aResponse = response
@@ -158,7 +161,8 @@ impl TtsProvider for MiniMaxTts {
 
 // ── edge-tts (Microsoft Edge TTS, free) ─────────────────────────
 
-const EDGE_TTS_URL: &str = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1";
+const EDGE_TTS_URL: &str =
+    "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1";
 const EDGE_TTS_TRUSTED_CLIENT_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 
 /// Microsoft Edge TTS provider — free, high-quality Neural TTS.
@@ -220,8 +224,8 @@ impl TtsProvider for EdgeTtsProvider {
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>, String> {
-        use tokio_tungstenite::tungstenite::Message;
         use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
 
         let voice_name = if voice.is_empty() {
             self.detect_voice(text)
@@ -229,7 +233,11 @@ impl TtsProvider for EdgeTtsProvider {
             voice
         };
 
-        info!(voice = voice_name, text_len = text.len(), "edge-tts: synthesizing");
+        info!(
+            voice = voice_name,
+            text_len = text.len(),
+            "edge-tts: synthesizing"
+        );
 
         let request_id = uuid::Uuid::new_v4().as_simple().to_string();
         let url = format!(
@@ -252,7 +260,9 @@ impl TtsProvider for EdgeTtsProvider {
             "X-Timestamp:{}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{{\"context\":{{\"synthesis\":{{\"audio\":{{\"metadataoptions\":{{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"}},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}}}}}",
             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
         );
-        write.send(Message::Text(config_msg.into())).await
+        write
+            .send(Message::Text(config_msg.into()))
+            .await
             .map_err(|e| format!("edge-tts config send failed: {e}"))?;
 
         // Send SSML message
@@ -263,7 +273,9 @@ impl TtsProvider for EdgeTtsProvider {
             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
             ssml
         );
-        write.send(Message::Text(ssml_msg.into())).await
+        write
+            .send(Message::Text(ssml_msg.into()))
+            .await
             .map_err(|e| format!("edge-tts SSML send failed: {e}"))?;
 
         // Collect audio chunks with 30s timeout
@@ -274,7 +286,9 @@ impl TtsProvider for EdgeTtsProvider {
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(Message::Binary(data)) => {
-                        if let Some(pos) = data.windows(header_tag.len()).position(|w| w == header_tag) {
+                        if let Some(pos) =
+                            data.windows(header_tag.len()).position(|w| w == header_tag)
+                        {
                             let audio_start = pos + header_tag.len();
                             if audio_start < data.len() {
                                 audio_data.extend_from_slice(&data[audio_start..]);
@@ -321,12 +335,17 @@ impl Drop for OpenAiTtsProvider {
 
 impl OpenAiTtsProvider {
     pub fn new(api_key: String) -> Self {
-        Self { api_key, model: "tts-1".into() }
+        Self {
+            api_key,
+            model: "tts-1".into(),
+        }
     }
 
     pub fn from_env() -> Option<Self> {
         let key = std::env::var("OPENAI_API_KEY").ok()?;
-        if key.is_empty() { return None; }
+        if key.is_empty() {
+            return None;
+        }
         Some(Self::new(key))
     }
 
@@ -338,16 +357,26 @@ impl OpenAiTtsProvider {
     fn detect_voice(text: &str) -> &'static str {
         let cjk_count = text.chars().filter(|c| *c > '\u{2E80}').count();
         let total = text.chars().count().max(1);
-        if cjk_count as f64 / total as f64 > 0.3 { "nova" } else { "alloy" }
+        if cjk_count as f64 / total as f64 > 0.3 {
+            "nova"
+        } else {
+            "alloy"
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl TtsProvider for OpenAiTtsProvider {
-    fn name(&self) -> &str { "openai-tts" }
+    fn name(&self) -> &str {
+        "openai-tts"
+    }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>, String> {
-        let voice_name = if voice.is_empty() { Self::detect_voice(text) } else { voice };
+        let voice_name = if voice.is_empty() {
+            Self::detect_voice(text)
+        } else {
+            voice
+        };
         info!(voice = voice_name, model = %self.model, "OpenAI TTS: synthesizing");
 
         let body = serde_json::json!({
@@ -368,10 +397,16 @@ impl TtsProvider for OpenAiTtsProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("OpenAI TTS error ({status}): {}", truncate_bytes(&text, 200)));
+            return Err(format!(
+                "OpenAI TTS error ({status}): {}",
+                truncate_bytes(&text, 200)
+            ));
         }
 
-        let audio = resp.bytes().await.map_err(|e| format!("OpenAI TTS read: {e}"))?;
+        let audio = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("OpenAI TTS read: {e}"))?;
         info!(bytes = audio.len(), "OpenAI TTS: synthesis complete");
         Ok(audio.to_vec())
     }
@@ -399,36 +434,51 @@ impl PiperTtsProvider {
                 return Err(format!("Unsafe path: {path}"));
             }
         }
-        Ok(Self { model_path, config_path })
+        Ok(Self {
+            model_path,
+            config_path,
+        })
     }
 
     /// Auto-detect from models directory.
     pub fn from_models_dir(models_dir: &std::path::Path) -> Option<Self> {
         let piper_dir = models_dir.join("piper");
         // Look for any .onnx file
-        let model = std::fs::read_dir(&piper_dir).ok()?
+        let model = std::fs::read_dir(&piper_dir)
+            .ok()?
             .filter_map(|e| e.ok())
             .find(|e| e.path().extension().is_some_and(|ext| ext == "onnx"))?
             .path();
         let config = model.with_extension("onnx.json");
-        if !config.exists() { return None; }
+        if !config.exists() {
+            return None;
+        }
         Self::new(
             model.to_string_lossy().into(),
             config.to_string_lossy().into(),
-        ).ok()
+        )
+        .ok()
     }
 }
 
 #[async_trait::async_trait]
 impl TtsProvider for PiperTtsProvider {
-    fn name(&self) -> &str { "piper" }
+    fn name(&self) -> &str {
+        "piper"
+    }
 
     async fn synthesize(&self, text: &str, _voice: &str) -> Result<Vec<u8>, String> {
         info!(model = %self.model_path, text_len = text.len(), "Piper TTS: synthesizing");
 
         // Use piper subprocess (cross-platform, no Rust binding needed)
         let mut child = tokio::process::Command::new("piper")
-            .args(["--model", &self.model_path, "--config", &self.config_path, "--output-raw"])
+            .args([
+                "--model",
+                &self.model_path,
+                "--config",
+                &self.config_path,
+                "--output-raw",
+            ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -438,31 +488,33 @@ impl TtsProvider for PiperTtsProvider {
         // Write text to stdin then close it (piper reads from stdin)
         {
             use tokio::io::AsyncWriteExt;
-            let mut stdin = child.stdin.take()
+            let mut stdin = child
+                .stdin
+                .take()
                 .ok_or_else(|| "Piper stdin unavailable".to_string())?;
-            stdin.write_all(text.as_bytes()).await
+            stdin
+                .write_all(text.as_bytes())
+                .await
                 .map_err(|e| format!("Piper stdin write: {e}"))?;
             // stdin dropped here → EOF to piper
         }
 
         // Wait with timeout; kill child on timeout to prevent zombie processes
         // Note: child.kill() requires &mut, so we keep ownership outside the timeout.
-        let wait_result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            async {
-                use tokio::io::AsyncReadExt;
-                let mut stdout_data = Vec::new();
-                let mut stderr_data = Vec::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    let _ = stdout.read_to_end(&mut stdout_data).await;
-                }
-                if let Some(mut stderr) = child.stderr.take() {
-                    let _ = stderr.read_to_end(&mut stderr_data).await;
-                }
-                let status = child.wait().await;
-                (status, stdout_data, stderr_data)
-            },
-        ).await;
+        let wait_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            use tokio::io::AsyncReadExt;
+            let mut stdout_data = Vec::new();
+            let mut stderr_data = Vec::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                let _ = stdout.read_to_end(&mut stdout_data).await;
+            }
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_end(&mut stderr_data).await;
+            }
+            let status = child.wait().await;
+            (status, stdout_data, stderr_data)
+        })
+        .await;
 
         let (status, stdout_data, stderr_data) = match wait_result {
             Ok((status, stdout, stderr)) => (status, stdout, stderr),
@@ -528,11 +580,16 @@ pub struct TtsRouter {
 
 impl TtsRouter {
     pub fn new() -> Self {
-        Self { providers: Vec::new() }
+        Self {
+            providers: Vec::new(),
+        }
     }
 
     pub fn add_provider(mut self, provider: Box<dyn TtsProvider>) -> Self {
-        info!(provider = provider.name(), "TTS Router: registered provider");
+        info!(
+            provider = provider.name(),
+            "TTS Router: registered provider"
+        );
         self.providers.push(provider);
         self
     }
@@ -584,18 +641,27 @@ impl TtsRouter {
 
 #[async_trait::async_trait]
 impl TtsProvider for TtsRouter {
-    fn name(&self) -> &str { "tts-router" }
+    fn name(&self) -> &str {
+        "tts-router"
+    }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>, String> {
         let mut last_err = None;
         for provider in &self.providers {
             match provider.synthesize(text, voice).await {
                 Ok(audio) if !audio.is_empty() => {
-                    info!(provider = provider.name(), bytes = audio.len(), "TTS: synthesis succeeded");
+                    info!(
+                        provider = provider.name(),
+                        bytes = audio.len(),
+                        "TTS: synthesis succeeded"
+                    );
                     return Ok(audio);
                 }
                 Ok(_) => {
-                    tracing::warn!(provider = provider.name(), "TTS: returned empty audio, trying next");
+                    tracing::warn!(
+                        provider = provider.name(),
+                        "TTS: returned empty audio, trying next"
+                    );
                     last_err = Some("Empty audio".to_string());
                 }
                 Err(e) => {
@@ -616,17 +682,26 @@ mod tests {
 
     #[test]
     fn test_detect_voice_chinese() {
-        assert_eq!(MiniMaxTts::detect_voice("你好世界，今天天氣怎麼樣？"), "Cute_Girl");
+        assert_eq!(
+            MiniMaxTts::detect_voice("你好世界，今天天氣怎麼樣？"),
+            "Cute_Girl"
+        );
     }
 
     #[test]
     fn test_detect_voice_english() {
-        assert_eq!(MiniMaxTts::detect_voice("Hello world, how are you?"), "English_Female_1");
+        assert_eq!(
+            MiniMaxTts::detect_voice("Hello world, how are you?"),
+            "English_Female_1"
+        );
     }
 
     #[test]
     fn test_detect_voice_mixed() {
         // Less than 30% CJK → English
-        assert_eq!(MiniMaxTts::detect_voice("Hello 你好 world test data"), "English_Female_1");
+        assert_eq!(
+            MiniMaxTts::detect_voice("Hello 你好 world test data"),
+            "English_Female_1"
+        );
     }
 }

@@ -51,7 +51,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Wall-clock cap for one install run. `npm install -g` on a cold cache over a
 /// slow link is the worst case; past this the child is killed and the UI gets a
@@ -169,7 +169,10 @@ pub struct Actor {
 
 impl Actor {
     pub fn new(user_id: impl Into<String>, email: impl Into<String>) -> Self {
-        Self { user_id: user_id.into(), email: email.into() }
+        Self {
+            user_id: user_id.into(),
+            email: email.into(),
+        }
     }
 }
 
@@ -199,7 +202,10 @@ impl StartOutcome {
     /// JSON payload for the `runtime.install` response.
     pub fn to_payload(&self, spec: &InstallSpec) -> Value {
         match self {
-            Self::Started { session_id, command } => json!({
+            Self::Started {
+                session_id,
+                command,
+            } => json!({
                 "started": true,
                 "provider": spec.id,
                 "session_id": session_id,
@@ -207,7 +213,11 @@ impl StartOutcome {
                 "docs_url": spec.vendor_url,
                 "timeout_secs": INSTALL_TIMEOUT.as_secs(),
             }),
-            Self::Declined { reason, command, prerequisite } => json!({
+            Self::Declined {
+                reason,
+                command,
+                prerequisite,
+            } => json!({
                 "started": false,
                 "provider": spec.id,
                 "reason": reason,
@@ -251,7 +261,7 @@ fn emit(tx: &Option<tokio::sync::broadcast::Sender<String>>, event: &str, payloa
 async fn terminate_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
-        use nix::sys::signal::{killpg, Signal};
+        use nix::sys::signal::{Signal, killpg};
         use nix::unistd::Pid;
         if let Some(pid) = child.id() {
             // ESRCH just means the group is already gone (the child exited
@@ -310,7 +320,11 @@ pub async fn start_install(
     }
 
     if let Some(reason) = decline_reason(spec, cfg!(windows)) {
-        return StartOutcome::Declined { reason, command, prerequisite: None };
+        return StartOutcome::Declined {
+            reason,
+            command,
+            prerequisite: None,
+        };
     }
 
     // Build the child. `program`/`args` are derived from the compile-time
@@ -353,7 +367,11 @@ pub async fn start_install(
         | InstallChannel::Binary { .. }
         | InstallChannel::PythonTool { .. } => {
             let reason = decline_reason(spec, cfg!(windows)).unwrap_or("unsupported_channel");
-            return StartOutcome::Declined { reason, command, prerequisite: None };
+            return StartOutcome::Declined {
+                reason,
+                command,
+                prerequisite: None,
+            };
         }
     };
 
@@ -547,7 +565,10 @@ pub async fn start_install(
         );
     });
 
-    StartOutcome::Started { session_id, command }
+    StartOutcome::Started {
+        session_id,
+        command,
+    }
 }
 
 /// Append one audit row attributed to the requesting admin. The email rides in
@@ -602,7 +623,10 @@ mod tests {
         for (provider, expected) in cases {
             let spec = spec_for(provider).unwrap_or_else(|| panic!("{provider} must be mapped"));
             assert_eq!(command_display(spec), expected, "{provider}");
-            assert!(spec.vendor_url.starts_with("https://"), "{provider} docs url");
+            assert!(
+                spec.vendor_url.starts_with("https://"),
+                "{provider} docs url"
+            );
         }
     }
 
@@ -620,8 +644,8 @@ mod tests {
     #[test]
     fn every_catalog_cli_resolves_to_an_install_recipe() {
         for spec in duduclaw_core::runtime_catalog::cli_specs() {
-            let got = spec_for(spec.id)
-                .unwrap_or_else(|| panic!("`{}` has no install recipe", spec.id));
+            let got =
+                spec_for(spec.id).unwrap_or_else(|| panic!("`{}` has no install recipe", spec.id));
             assert_eq!(got.id, spec.id);
             assert!(!command_display(got).is_empty(), "{} command", spec.id);
             assert!(
@@ -711,9 +735,9 @@ mod tests {
             // "claude" while being different bytes. The ASCII-only gate is what
             // stops them; without it the only thing between a lookalike and the
             // table would be byte equality, which is easy to regress.
-            "сlaude",  // U+0441 CYRILLIC SMALL LETTER ES
-            "clａude", // U+FF41 FULLWIDTH LATIN SMALL LETTER A
-            "claudе",  // U+0435 CYRILLIC SMALL LETTER IE
+            "сlaude",       // U+0441 CYRILLIC SMALL LETTER ES
+            "clａude",      // U+FF41 FULLWIDTH LATIN SMALL LETTER A
+            "claudе",       // U+0435 CYRILLIC SMALL LETTER IE
             "ｃｌａｕｄｅ", // fully fullwidth
         ] {
             assert!(

@@ -72,7 +72,9 @@ pub fn select_layers(
     // Active skills always get Layer 2
     for (idx, _) in ranked {
         let skill = &skills[*idx];
-        if active_skills.contains(&skill.name) && layer2.len() < config.max_layer2 + active_skills.len() {
+        if active_skills.contains(&skill.name)
+            && layer2.len() < config.max_layer2 + active_skills.len()
+        {
             layer2.push(*idx);
         }
     }
@@ -110,10 +112,12 @@ fn extract_keywords_set(text: &str) -> HashSet<String> {
 
     // ASCII words (skip stopwords)
     let stopwords: HashSet<&str> = [
-        "the", "a", "an", "is", "are", "was", "be", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "it", "this", "that", "i", "you",
-        "and", "or", "but", "not", "if", "so", "do", "can", "will",
-    ].into_iter().collect();
+        "the", "a", "an", "is", "are", "was", "be", "to", "of", "in", "for", "on", "with", "at",
+        "by", "from", "it", "this", "that", "i", "you", "and", "or", "but", "not", "if", "so",
+        "do", "can", "will",
+    ]
+    .into_iter()
+    .collect();
 
     for word in lower.split_whitespace() {
         let cleaned: String = word.chars().filter(|c| c.is_alphanumeric()).collect();

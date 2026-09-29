@@ -47,22 +47,45 @@ pub enum CodriveButtonState {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum CodriveCmd {
-    Auth { token: String },
-    Move { x: f64, y: f64 },
-    Button { btn: CodriveButton, state: CodriveButtonState },
-    Text { s: String },
-    KeyName { name: String, state: CodriveButtonState },
-    Highlight { x: f64, y: f64, w: f64, h: f64, ms: u32 },
+    Auth {
+        token: String,
+    },
+    Move {
+        x: f64,
+        y: f64,
+    },
+    Button {
+        btn: CodriveButton,
+        state: CodriveButtonState,
+    },
+    Text {
+        s: String,
+    },
+    KeyName {
+        name: String,
+        state: CodriveButtonState,
+    },
+    Highlight {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        ms: u32,
+    },
     Status,
     Resume,
     /// CD-3 (DESIGN §5's "接手/交還＋watch mode" row): agent-initiated
     /// hand-off to the human — comp freezes the seat AND disables the
     /// shadow-bypass exception (see comp's `codrive/takeover.rs`). Ends the
     /// same way any freeze ends, via the human's Super+Enter.
-    TakeOver { reason: String },
+    TakeOver {
+        reason: String,
+    },
     /// CD-3: toggles idle-based auto-pause supervision for the rest of this
     /// session (comp's `codrive/watch.rs`).
-    Watch { enable: bool },
+    Watch {
+        enable: bool,
+    },
     /// WP-CD4b-fix (B3): READ-ONLY query for where a client's *visible*
     /// window sits in comp's global logical coordinate space — the missing
     /// half of AT-SPI's `CoordType::Window` offsets (see
@@ -204,7 +227,11 @@ pub struct CodriveEvent {
 #[derive(Debug, Error)]
 pub enum CodriveClientError {
     #[error("could not connect to comp socket at {path}: {source}")]
-    Connect { path: String, #[source] source: std::io::Error },
+    Connect {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("comp auth failed: {0}")]
     Auth(String),
     #[error("comp transport error: {0}")]
@@ -228,8 +255,8 @@ pub enum CodriveClientError {
 #[cfg(unix)]
 mod unix_impl {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::net::UnixStream;
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
     use super::*;
 
@@ -279,10 +306,14 @@ mod unix_impl {
                 last_handover_reason: None,
             };
             let ack = client
-                .write_and_read_ack(&CodriveCmd::Auth { token: token.to_string() })
+                .write_and_read_ack(&CodriveCmd::Auth {
+                    token: token.to_string(),
+                })
                 .await?;
             if !ack.ok || ack.authenticated != Some(true) {
-                return Err(CodriveClientError::Auth(ack.error.unwrap_or_else(|| "auth_failed".to_string())));
+                return Err(CodriveClientError::Auth(
+                    ack.error.unwrap_or_else(|| "auth_failed".to_string()),
+                ));
             }
             Ok(client)
         }
@@ -349,7 +380,10 @@ mod unix_impl {
             self.last_handover_reason = reason.cloned();
         }
 
-        async fn write_and_read_ack(&mut self, cmd: &CodriveCmd) -> Result<CodriveAck, CodriveClientError> {
+        async fn write_and_read_ack(
+            &mut self,
+            cmd: &CodriveCmd,
+        ) -> Result<CodriveAck, CodriveClientError> {
             let mut line = serde_json::to_string(cmd)
                 .map_err(|e| CodriveClientError::Decode(format!("encode command: {e}")))?;
             line.push('\n');
@@ -453,19 +487,30 @@ mod tests {
 
     #[test]
     fn wire_shape_auth() {
-        let cmd = CodriveCmd::Auth { token: "deadbeef".into() };
-        assert_eq!(serde_json::to_value(&cmd).unwrap(), serde_json::json!({"op": "auth", "token": "deadbeef"}));
+        let cmd = CodriveCmd::Auth {
+            token: "deadbeef".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&cmd).unwrap(),
+            serde_json::json!({"op": "auth", "token": "deadbeef"})
+        );
     }
 
     #[test]
     fn wire_shape_move() {
         let cmd = CodriveCmd::Move { x: 10.5, y: 20.0 };
-        assert_eq!(serde_json::to_value(&cmd).unwrap(), serde_json::json!({"op": "move", "x": 10.5, "y": 20.0}));
+        assert_eq!(
+            serde_json::to_value(&cmd).unwrap(),
+            serde_json::json!({"op": "move", "x": 10.5, "y": 20.0})
+        );
     }
 
     #[test]
     fn wire_shape_button() {
-        let cmd = CodriveCmd::Button { btn: CodriveButton::Left, state: CodriveButtonState::Press };
+        let cmd = CodriveCmd::Button {
+            btn: CodriveButton::Left,
+            state: CodriveButtonState::Press,
+        };
         assert_eq!(
             serde_json::to_value(&cmd).unwrap(),
             serde_json::json!({"op": "button", "btn": "left", "state": "press"})
@@ -474,13 +519,21 @@ mod tests {
 
     #[test]
     fn wire_shape_text() {
-        let cmd = CodriveCmd::Text { s: "echo done".into() };
-        assert_eq!(serde_json::to_value(&cmd).unwrap(), serde_json::json!({"op": "text", "s": "echo done"}));
+        let cmd = CodriveCmd::Text {
+            s: "echo done".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&cmd).unwrap(),
+            serde_json::json!({"op": "text", "s": "echo done"})
+        );
     }
 
     #[test]
     fn wire_shape_key_name() {
-        let cmd = CodriveCmd::KeyName { name: "enter".into(), state: CodriveButtonState::Release };
+        let cmd = CodriveCmd::KeyName {
+            name: "enter".into(),
+            state: CodriveButtonState::Release,
+        };
         assert_eq!(
             serde_json::to_value(&cmd).unwrap(),
             serde_json::json!({"op": "key_name", "name": "enter", "state": "release"})
@@ -489,7 +542,13 @@ mod tests {
 
     #[test]
     fn wire_shape_highlight() {
-        let cmd = CodriveCmd::Highlight { x: 10.0, y: 10.0, w: 200.0, h: 80.0, ms: 200 };
+        let cmd = CodriveCmd::Highlight {
+            x: 10.0,
+            y: 10.0,
+            w: 200.0,
+            h: 80.0,
+            ms: 200,
+        };
         assert_eq!(
             serde_json::to_value(&cmd).unwrap(),
             serde_json::json!({"op": "highlight", "x": 10.0, "y": 10.0, "w": 200.0, "h": 80.0, "ms": 200})
@@ -498,13 +557,21 @@ mod tests {
 
     #[test]
     fn wire_shape_status_and_resume() {
-        assert_eq!(serde_json::to_value(&CodriveCmd::Status).unwrap(), serde_json::json!({"op": "status"}));
-        assert_eq!(serde_json::to_value(&CodriveCmd::Resume).unwrap(), serde_json::json!({"op": "resume"}));
+        assert_eq!(
+            serde_json::to_value(&CodriveCmd::Status).unwrap(),
+            serde_json::json!({"op": "status"})
+        );
+        assert_eq!(
+            serde_json::to_value(&CodriveCmd::Resume).unwrap(),
+            serde_json::json!({"op": "resume"})
+        );
     }
 
     #[test]
     fn wire_shape_take_over() {
-        let cmd = CodriveCmd::TakeOver { reason: "login page needs a human".into() };
+        let cmd = CodriveCmd::TakeOver {
+            reason: "login page needs a human".into(),
+        };
         assert_eq!(
             serde_json::to_value(&cmd).unwrap(),
             serde_json::json!({"op": "take_over", "reason": "login page needs a human"})
@@ -527,19 +594,22 @@ mod tests {
 
     #[test]
     fn ack_auth_success_and_failure() {
-        let ok: CodriveAck = serde_json::from_value(serde_json::json!({"ok": true, "authenticated": true})).unwrap();
+        let ok: CodriveAck =
+            serde_json::from_value(serde_json::json!({"ok": true, "authenticated": true})).unwrap();
         assert!(ok.ok);
         assert_eq!(ok.authenticated, Some(true));
 
         let fail: CodriveAck =
-            serde_json::from_value(serde_json::json!({"ok": false, "error": "auth_failed"})).unwrap();
+            serde_json::from_value(serde_json::json!({"ok": false, "error": "auth_failed"}))
+                .unwrap();
         assert!(!fail.ok);
         assert_eq!(fail.error.as_deref(), Some("auth_failed"));
     }
 
     #[test]
     fn ack_injection_success_and_frozen_drop() {
-        let ok: CodriveAck = serde_json::from_value(serde_json::json!({"ok": true, "frozen": false})).unwrap();
+        let ok: CodriveAck =
+            serde_json::from_value(serde_json::json!({"ok": true, "frozen": false})).unwrap();
         assert!(ok.ok);
         assert_eq!(ok.frozen, Some(false));
 
@@ -554,12 +624,17 @@ mod tests {
 
     #[test]
     fn ack_status() {
-        let ack: CodriveAck =
-            serde_json::from_value(serde_json::json!({"ok": true, "frozen": true, "terminated": false})).unwrap();
+        let ack: CodriveAck = serde_json::from_value(
+            serde_json::json!({"ok": true, "frozen": true, "terminated": false}),
+        )
+        .unwrap();
         assert!(ack.ok);
         assert_eq!(ack.frozen, Some(true));
         assert_eq!(ack.terminated, Some(false));
-        assert_eq!(ack.takeover, None, "an ack from before CD-3 (no takeover field) must parse fine");
+        assert_eq!(
+            ack.takeover, None,
+            "an ack from before CD-3 (no takeover field) must parse fine"
+        );
     }
 
     #[test]
@@ -587,7 +662,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(ack.mode, Some(CodriveDrivingMode::Human));
-        assert_eq!(ack.handover_reason, None, "an explicit null is None, not a variant");
+        assert_eq!(
+            ack.handover_reason, None,
+            "an explicit null is None, not a variant"
+        );
         assert_eq!(ack.shadow, Some(false));
         assert_eq!(ack.watch_active, Some(false));
         assert_eq!(ack.watch_paused, Some(false));
@@ -626,9 +704,10 @@ mod tests {
     /// into `None`s, never a hard error.
     #[test]
     fn pre_a2_status_ack_leaves_every_new_field_none() {
-        let ack: CodriveAck =
-            serde_json::from_value(serde_json::json!({"ok": true, "frozen": true, "terminated": false}))
-                .unwrap();
+        let ack: CodriveAck = serde_json::from_value(
+            serde_json::json!({"ok": true, "frozen": true, "terminated": false}),
+        )
+        .unwrap();
         assert_eq!(ack.mode, None);
         assert_eq!(ack.handover_reason, None);
         assert_eq!(ack.shadow, None);
@@ -677,7 +756,8 @@ mod tests {
     #[test]
     fn legacy_events_still_parse_and_carry_no_mode() {
         for name in ["frozen", "resumed", "emergency_stop"] {
-            let ev: CodriveEvent = serde_json::from_value(serde_json::json!({"event": name})).unwrap();
+            let ev: CodriveEvent =
+                serde_json::from_value(serde_json::json!({"event": name})).unwrap();
             assert_eq!(ev.event, name);
             assert_eq!(ev.mode, None);
             assert_eq!(ev.reason, None);
@@ -689,12 +769,15 @@ mod tests {
 
     #[test]
     fn ack_resume_and_session_terminated() {
-        let resume: CodriveAck =
-            serde_json::from_value(serde_json::json!({"ok": false, "error": "resume_is_human_only"})).unwrap();
+        let resume: CodriveAck = serde_json::from_value(
+            serde_json::json!({"ok": false, "error": "resume_is_human_only"}),
+        )
+        .unwrap();
         assert_eq!(resume.error.as_deref(), Some("resume_is_human_only"));
 
         let terminated: CodriveAck =
-            serde_json::from_value(serde_json::json!({"ok": false, "error": "session_terminated"})).unwrap();
+            serde_json::from_value(serde_json::json!({"ok": false, "error": "session_terminated"}))
+                .unwrap();
         assert_eq!(terminated.error.as_deref(), Some("session_terminated"));
     }
 
@@ -702,14 +785,20 @@ mod tests {
 
     #[test]
     fn wire_shape_window_geometry_omits_absent_fields() {
-        let pid_only = CodriveCmd::WindowGeometry { app_id: None, pid: Some(1234) };
+        let pid_only = CodriveCmd::WindowGeometry {
+            app_id: None,
+            pid: Some(1234),
+        };
         assert_eq!(
             serde_json::to_value(&pid_only).unwrap(),
             serde_json::json!({"op": "window_geometry", "pid": 1234}),
             "an absent app_id must not be serialized as an explicit null"
         );
 
-        let both = CodriveCmd::WindowGeometry { app_id: Some("foot-A".into()), pid: Some(7) };
+        let both = CodriveCmd::WindowGeometry {
+            app_id: Some("foot-A".into()),
+            pid: Some(7),
+        };
         assert_eq!(
             serde_json::to_value(&both).unwrap(),
             serde_json::json!({"op": "window_geometry", "app_id": "foot-A", "pid": 7})
@@ -729,20 +818,25 @@ mod tests {
         }))
         .unwrap();
         let w = ack.window.expect("window object must parse");
-        assert_eq!((w.origin_x, w.origin_y, w.width, w.height), (10, 20, 800, 600));
+        assert_eq!(
+            (w.origin_x, w.origin_y, w.width, w.height),
+            (10, 20, 800, 600)
+        );
         assert_eq!(w.matched_via.as_deref(), Some("pid"));
     }
 
     #[test]
     fn ack_window_geometry_refusals_parse() {
         let not_found: CodriveAck =
-            serde_json::from_value(serde_json::json!({"ok": false, "error": "window_not_found"})).unwrap();
+            serde_json::from_value(serde_json::json!({"ok": false, "error": "window_not_found"}))
+                .unwrap();
         assert!(not_found.window.is_none());
         assert_eq!(not_found.error.as_deref(), Some("window_not_found"));
 
-        let ambiguous: CodriveAck =
-            serde_json::from_value(serde_json::json!({"ok": false, "error": "ambiguous_window", "candidates": 3}))
-                .unwrap();
+        let ambiguous: CodriveAck = serde_json::from_value(
+            serde_json::json!({"ok": false, "error": "ambiguous_window", "candidates": 3}),
+        )
+        .unwrap();
         assert_eq!(ambiguous.candidates, Some(3));
     }
 
@@ -751,7 +845,8 @@ mod tests {
     /// (see `atspi_locate::frame_from_ack`), rather than reading zeros.
     #[test]
     fn ack_from_a_comp_without_the_op_leaves_window_none() {
-        let ack: CodriveAck = serde_json::from_value(serde_json::json!({"ok": true, "frozen": false})).unwrap();
+        let ack: CodriveAck =
+            serde_json::from_value(serde_json::json!({"ok": true, "frozen": false})).unwrap();
         assert!(ack.window.is_none());
         assert!(ack.ok);
     }
@@ -764,13 +859,17 @@ mod tests {
             "ok": true,
             "window": {"origin_x": 10, "origin_y": 20, "width": 800}
         }));
-        assert!(res.is_err(), "a window object missing `height` must not deserialize");
+        assert!(
+            res.is_err(),
+            "a window object missing `height` must not deserialize"
+        );
     }
 
     #[test]
     fn event_shapes() {
         for name in ["frozen", "resumed", "emergency_stop"] {
-            let ev: CodriveEvent = serde_json::from_value(serde_json::json!({"event": name})).unwrap();
+            let ev: CodriveEvent =
+                serde_json::from_value(serde_json::json!({"event": name})).unwrap();
             assert_eq!(ev.event, name);
         }
     }

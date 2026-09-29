@@ -30,12 +30,11 @@
 //!
 //! # Second hook: `data-file-guard` (RFC-23 §14.4)
 //!
-//! The same installer also drops a shell script into
-//! `<agent_dir>/.claude/hooks/data-file-guard.sh` and registers it as a
+//! The same installer also registers `duduclaw hook data-file-guard` as a
 //! PreToolUse hook for `Read` and `Bash`. Where `agent-file-guard` protects
 //! DuDuClaw's own structure files, this one protects the *customer's* data:
 //! `Read`/`Bash` are built-in tools, so a CSV read through them never passes
-//! the MCP redaction choke point. The script is inert unless the gateway sets
+//! the MCP redaction choke point. The hook is inert unless the gateway sets
 //! `DUDUCLAW_DATA_FILE_GUARD` at spawn time, which it only does when redaction
 //! is actually active for that agent — so an install on a gateway with
 //! redaction off changes no behavior at all.
@@ -45,16 +44,17 @@
 //! per-entry, so a user's own hooks and the other tagged entry are never
 //! disturbed.
 //!
-//! Unlike `agent-file-guard` (a Rust subcommand, cross-platform by design),
-//! the data-file guard is a POSIX shell script and is therefore inert on a
-//! Windows host with no bash on PATH — the hook command fails and Claude Code
-//! treats that as allow. Recorded here rather than left to be discovered: a
-//! Windows deployment gets its protection from the MCP tool surface alone
-//! until this is ported to `duduclaw hook data-file-guard`.
+//! **H10 (2026-09 feature audit)**: this used to be a POSIX shell script
+//! dropped at `<agent_dir>/.claude/hooks/data-file-guard.sh`, which was inert
+//! on a Windows host with no bash on PATH — the hook command failed and Claude
+//! Code treats a non-2 exit as allow, so the guard was missing exactly where
+//! nobody would notice. It is now the same kind of Rust subcommand
+//! `agent-file-guard` has always been, and the installer deletes any leftover
+//! script on upgrade so a stale copy cannot be mistaken for the live guard.
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 /// Tag embedded in the hook descriptor so we can find + update our own
@@ -67,12 +67,9 @@ const HOOK_ID: &str = "agent-file-guard";
 /// Sentinel for the RFC-23 §14.4 data-file guard entry.
 const DATA_FILE_HOOK_ID: &str = "data-file-guard";
 
-/// Filename the guard script is installed under, inside `.claude/hooks/`.
-const DATA_FILE_HOOK_SCRIPT: &str = "data-file-guard.sh";
-
-/// The guard script itself, compiled into the binary so a fresh install has
-/// nothing to fetch and a redeploy cannot leave a stale copy behind.
-const DATA_FILE_HOOK_SOURCE: &str = include_str!("../hooks/data-file-guard.sh");
+/// The pre-H10 shell script's filename, kept only so an upgrade can delete
+/// the leftover file. Nothing writes it any more.
+const LEGACY_DATA_FILE_HOOK_SCRIPT: &str = "data-file-guard.sh";
 
 /// Ensure `<agent_dir>/.claude/settings.json` contains the agent-file-guard
 /// PreToolUse hook pointing at `duduclaw_bin`.
@@ -135,33 +132,15 @@ pub async fn ensure_agent_hook_settings(
         .and_then(|n| n.to_str())
         .unwrap_or_default();
 
-    // RFC-23 §14.4 — drop the data-file guard script next to the settings
-    // file. Best-effort: a write failure means the entry below would point at
-    // a missing script, so the registration is skipped too rather than left
-    // dangling (a hook whose command does not exist is a per-tool-call error
-    // in the agent's transcript, which is worse than no hook).
-    let script_path = agent_dir
-        .join(".claude")
-        .join("hooks")
-        .join(DATA_FILE_HOOK_SCRIPT);
-    let script_ready = match install_data_file_guard_script(&script_path).await {
-        Ok(()) => true,
-        Err(e) => {
-            warn!(
-                path = %script_path.display(),
-                error = %e,
-                "Failed to install data-file-guard script — the hook will not be registered"
-            );
-            false
-        }
-    };
+    // H10 — remove the pre-H10 shell script if this agent still carries one.
+    // It is no longer referenced by any hook entry, and leaving it on disk
+    // invites someone to "fix" the guard by editing a file that does nothing.
+    remove_legacy_data_file_guard_script(agent_dir).await;
 
     // Merge our hook descriptors into hooks.PreToolUse. Both run: a `false`
     // from either only means "already up to date".
     let mut updated = merge_agent_file_guard_hook(&mut root, duduclaw_bin, agent_id);
-    if script_ready {
-        updated |= merge_data_file_guard_hook(&mut root, &script_path);
-    }
+    updated |= merge_data_file_guard_hook(&mut root, duduclaw_bin);
     if !updated {
         debug!(path = %settings_path.display(), "Hooks already up to date");
         return Ok(());
@@ -172,8 +151,7 @@ pub async fn ensure_agent_hook_settings(
         tokio::fs::create_dir_all(parent).await?;
     }
     let tmp = settings_path.with_extension("json.tmp");
-    let pretty = serde_json::to_string_pretty(&root)
-        .unwrap_or_else(|_| "{}".to_string());
+    let pretty = serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string());
     tokio::fs::write(&tmp, pretty).await?;
     tokio::fs::rename(&tmp, &settings_path).await?;
 
@@ -185,31 +163,30 @@ pub async fn ensure_agent_hook_settings(
     Ok(())
 }
 
-/// Write the guard script to `path`, creating `.claude/hooks/` as needed.
+/// Delete a leftover pre-H10 `data-file-guard.sh` (and the now-empty
+/// `.claude/hooks/` directory, if we emptied it).
 ///
-/// Idempotent by content: an unchanged script is not rewritten, so the
-/// installer running on every spawn does not churn the file's mtime. On Unix
-/// the script is made executable — Claude Code runs a hook command through the
-/// shell, and `bash script.sh` would work without the bit, but the installed
-/// command names the script directly so the bit is load-bearing.
-async fn install_data_file_guard_script(path: &Path) -> std::io::Result<()> {
-    if let Ok(existing) = tokio::fs::read_to_string(path).await
-        && existing == DATA_FILE_HOOK_SOURCE
-    {
-        return Ok(());
+/// Best-effort and silent on absence — the overwhelmingly common case is a
+/// fresh agent that never had one.
+async fn remove_legacy_data_file_guard_script(agent_dir: &Path) {
+    let hooks_dir = agent_dir.join(".claude").join("hooks");
+    let script = hooks_dir.join(LEGACY_DATA_FILE_HOOK_SCRIPT);
+    if tokio::fs::try_exists(&script).await.unwrap_or(false) {
+        match tokio::fs::remove_file(&script).await {
+            Ok(()) => debug!(
+                path = %script.display(),
+                "Removed the legacy data-file-guard shell script (superseded by `duduclaw hook data-file-guard`)"
+            ),
+            Err(e) => warn!(
+                path = %script.display(),
+                error = %e,
+                "Could not remove the legacy data-file-guard script — it is unused, but should be deleted by hand"
+            ),
+        }
     }
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp = path.with_extension("sh.tmp");
-    tokio::fs::write(&tmp, DATA_FILE_HOOK_SOURCE).await?;
-    tokio::fs::rename(&tmp, path).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).await?;
-    }
-    Ok(())
+    // Only succeeds when the directory is empty, which is exactly the
+    // condition under which removing it is safe.
+    let _ = tokio::fs::remove_dir(&hooks_dir).await;
 }
 
 /// Merge the RFC-23 §14.4 data-file-guard descriptor into
@@ -217,8 +194,9 @@ async fn install_data_file_guard_script(path: &Path) -> std::io::Result<()> {
 ///
 /// Structurally identical to [`merge_agent_file_guard_hook`] but keyed on its
 /// own [`DATA_FILE_HOOK_ID`], so the two entries coexist and each upgrades
-/// independently.
-fn merge_data_file_guard_hook(root: &mut Value, script_path: &Path) -> bool {
+/// independently. Since H10 both point at the same `duduclaw` binary — the
+/// difference is only which subcommand runs.
+fn merge_data_file_guard_hook(root: &mut Value, duduclaw_bin: &Path) -> bool {
     let Some(arr) = pre_tool_use_array(root) else {
         return false;
     };
@@ -230,7 +208,7 @@ fn merge_data_file_guard_hook(root: &mut Value, script_path: &Path) -> bool {
         "matcher": "Read|Bash",
         "hooks": [{
             "type": "command",
-            "command": format!("bash \"{}\"", script_path.display()),
+            "command": format!("\"{}\" hook data-file-guard", duduclaw_bin.display()),
         }]
     });
     for item in arr.iter_mut() {
@@ -298,11 +276,7 @@ fn merge_agent_file_guard_hook(root: &mut Value, duduclaw_bin: &Path, agent_id: 
         return false;
     };
     for item in arr.iter_mut() {
-        if item
-            .get(HOOK_TAG)
-            .and_then(|v| v.as_str())
-            == Some(HOOK_ID)
-        {
+        if item.get(HOOK_TAG).and_then(|v| v.as_str()) == Some(HOOK_ID) {
             if item == &desired_entry {
                 return false; // already up to date
             }
@@ -369,7 +343,9 @@ mod tests {
     async fn creates_settings_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp.path().join("myagent");
-        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
 
         let settings: Value = serde_json::from_str(
             &std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap(),
@@ -418,7 +394,9 @@ mod tests {
         )
         .unwrap();
 
-        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
 
         let settings: Value = serde_json::from_str(
             &std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap(),
@@ -440,10 +418,14 @@ mod tests {
     async fn is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp.path().join("myagent");
-        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
         let first = std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap();
 
-        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
         let second = std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap();
 
         assert_eq!(first, second, "second run must not mutate the file");
@@ -488,7 +470,9 @@ mod tests {
         .unwrap();
 
         // Must not panic, must not overwrite with `{}`.
-        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
 
         let content = std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap();
         assert_eq!(content.trim(), "[1, 2, 3]", "corrupt file left untouched");
@@ -499,14 +483,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp.path().join("myagent");
         std::fs::create_dir_all(agent_dir.join(".claude")).unwrap();
-        std::fs::write(
-            agent_dir.join(".claude/settings.json"),
-            "{ not valid json",
-        )
-        .unwrap();
+        std::fs::write(agent_dir.join(".claude/settings.json"), "{ not valid json").unwrap();
 
         // Must not panic.
-        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
 
         let content = std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap();
         assert_eq!(content, "{ not valid json", "invalid file left untouched");
@@ -565,7 +547,9 @@ mod tests {
         )
         .unwrap();
 
-        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
 
         let settings: Value = serde_json::from_str(
             &std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap(),
@@ -582,15 +566,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installed_hook_command_carries_the_agent_flag_and_the_settings_file_is_a_protected_surface(
-    ) {
+    async fn installed_hook_command_carries_the_agent_flag_and_the_settings_file_is_a_protected_surface()
+     {
         // Integration assertion tying WP22 T2's two halves together: the
         // installed command self-identifies, AND the file that carries it
         // cannot be rewritten by the agent it names (frozen outright by
         // `ProtectedSurface::HookSettings`).
         let home = tempfile::tempdir().unwrap();
         let agent_dir = home.path().join("agents").join("sales-rep");
-        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
 
         let settings_path = agent_dir.join(".claude/settings.json");
         let settings: Value =
@@ -606,24 +592,15 @@ mod tests {
         );
     }
 
-    // ── RFC-23 §14.4 data-file guard ────────────────────────────────────────
+    // ── RFC-23 §14.4 data-file guard (H10: Rust subcommand, not a script) ───
 
     #[tokio::test]
-    async fn installs_the_data_file_guard_script_and_registers_it() {
+    async fn registers_the_data_file_guard_as_a_rust_subcommand() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp.path().join("myagent");
-        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
-
-        let script = agent_dir.join(".claude/hooks/data-file-guard.sh");
-        assert!(script.is_file(), "guard script must be installed");
-        let body = std::fs::read_to_string(&script).unwrap();
-        assert_eq!(body, DATA_FILE_HOOK_SOURCE);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&script).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o755, "script must be executable");
-        }
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
 
         let settings: Value = serde_json::from_str(
             &std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap(),
@@ -636,142 +613,69 @@ mod tests {
             .expect("data-file-guard entry");
         assert_eq!(entry["matcher"], "Read|Bash");
         let cmd = entry["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("data-file-guard.sh"), "command: {cmd}");
-        assert!(cmd.starts_with("bash \""), "command must be quoted: {cmd}");
+        assert!(
+            cmd.contains("hook data-file-guard"),
+            "must invoke the Rust subcommand: {cmd}"
+        );
+        assert!(
+            !cmd.contains("bash "),
+            "H10 regression: no shell wrapper may remain (Windows has no bash): {cmd}"
+        );
+        assert!(cmd.starts_with('"'), "binary path must be quoted: {cmd}");
+
+        // No script is written any more.
+        assert!(
+            !agent_dir.join(".claude/hooks/data-file-guard.sh").exists(),
+            "the shell script must not be installed"
+        );
     }
 
     #[tokio::test]
-    async fn data_file_guard_install_is_idempotent() {
+    async fn upgrade_deletes_a_leftover_shell_script() {
+        // An agent installed before H10 still has the script on disk. Leaving
+        // it there invites someone to "fix" the guard by editing a file that
+        // is no longer referenced by anything.
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp.path().join("myagent");
-        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
-        let script = agent_dir.join(".claude/hooks/data-file-guard.sh");
-        let before = std::fs::metadata(&script).unwrap().modified().unwrap();
+        let hooks_dir = agent_dir.join(".claude/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let stale = hooks_dir.join("data-file-guard.sh");
+        std::fs::write(&stale, "#!/usr/bin/env bash\nexit 0\n").unwrap();
 
-        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
-        let after = std::fs::metadata(&script).unwrap().modified().unwrap();
-        assert_eq!(before, after, "unchanged script must not be rewritten");
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
+        assert!(!stale.exists(), "stale script must be removed on upgrade");
     }
 
-    // ── The script's own behaviour, exercised by running it ──────────────────
-
-    #[cfg(unix)]
-    fn run_guard(mode: &str, payload: &str) -> (i32, String) {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
+    #[tokio::test]
+    async fn data_file_guard_registration_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let script = tmp.path().join("data-file-guard.sh");
-        std::fs::write(&script, DATA_FILE_HOOK_SOURCE).unwrap();
+        let agent_dir = tmp.path().join("myagent");
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
+        let settings_path = agent_dir.join(".claude/settings.json");
+        let before = std::fs::read_to_string(&settings_path).unwrap();
 
-        let mut child = Command::new("bash")
-            .arg(&script)
-            .env("DUDUCLAW_DATA_FILE_GUARD", mode)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("bash must be available");
-        // The script may exit without ever reading stdin (`off`/unset mode
-        // returns before the `cat`), so the write can race the child's exit
-        // and fail with EPIPE on a loaded runner. That is the behaviour under
-        // test, not a harness failure — tolerate exactly BrokenPipe.
-        match child.stdin.as_mut().unwrap().write_all(payload.as_bytes()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(e) => panic!("writing hook payload to stdin: {e}"),
-        }
-        let out = child.wait_with_output().unwrap();
-        (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
+        ensure_agent_hook_settings(&agent_dir, &fake_bin())
+            .await
+            .unwrap();
+        let after = std::fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(before, after, "a second install must change nothing");
+
+        let settings: Value = serde_json::from_str(&after).unwrap();
+        let arr = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            arr.iter()
+                .filter(|e| e[HOOK_TAG] == DATA_FILE_HOOK_ID)
+                .count(),
+            1,
+            "exactly one tagged entry, never a duplicate"
+        );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn guard_blocks_reading_a_data_file_and_allows_a_markdown_one() {
-        let (code, stderr) = run_guard(
-            "on",
-            r#"{"tool_name":"Read","tool_input":{"file_path":"/w/customers.csv"}}"#,
-        );
-        assert_eq!(code, 2, "Read of a .csv must be blocked");
-        assert!(stderr.contains("csv_read"), "stderr: {stderr}");
-        assert!(stderr.contains("去識別化"), "stderr: {stderr}");
-
-        let (code, _) = run_guard(
-            "on",
-            r#"{"tool_name":"Read","tool_input":{"file_path":"/w/notes.md"}}"#,
-        );
-        assert_eq!(code, 0, "Read of a .md must be allowed");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guard_blocks_a_bash_command_naming_a_data_file() {
-        let (code, _) = run_guard(
-            "on",
-            r#"{"tool_name":"Bash","tool_input":{"command":"head customers.csv"}}"#,
-        );
-        assert_eq!(code, 2);
-
-        let (code, _) = run_guard(
-            "on",
-            r#"{"tool_name":"Bash","tool_input":{"command":"echo hello world"}}"#,
-        );
-        assert_eq!(code, 0, "an unrelated command must pass");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guard_read_only_mode_leaves_bash_alone() {
-        let (code, _) = run_guard(
-            "read_only",
-            r#"{"tool_name":"Bash","tool_input":{"command":"head customers.csv"}}"#,
-        );
-        assert_eq!(code, 0, "read_only must not gate Bash");
-
-        let (code, _) = run_guard(
-            "read_only",
-            r#"{"tool_name":"Read","tool_input":{"file_path":"/w/a.xlsx"}}"#,
-        );
-        assert_eq!(code, 2, "read_only still gates Read");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guard_is_inert_when_off_or_unset() {
-        for mode in ["off", "", "nonsense"] {
-            let (code, _) = run_guard(
-                mode,
-                r#"{"tool_name":"Read","tool_input":{"file_path":"/w/customers.csv"}}"#,
-            );
-            assert_eq!(code, 0, "mode {mode:?} must allow");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guard_covers_every_spreadsheet_extension_including_cjk_names() {
-        for ext in ["csv", "tsv", "xlsx", "xlsm", "xls", "ods", "XLSX"] {
-            let payload = format!(
-                r#"{{"tool_name":"Read","tool_input":{{"file_path":"/w/客戶清單.{ext}"}}}}"#
-            );
-            let (code, _) = run_guard("on", &payload);
-            assert_eq!(code, 2, "extension {ext} must be blocked");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guard_fails_open_on_a_malformed_envelope_or_another_tool() {
-        let (code, _) = run_guard("on", "this is not json");
-        assert_eq!(code, 0, "a malformed envelope must not brick the agent");
-
-        let (code, _) = run_guard(
-            "on",
-            r#"{"tool_name":"Write","tool_input":{"file_path":"/w/out.csv"}}"#,
-        );
-        assert_eq!(code, 0, "Write is outside this guard's remit");
-    }
+    // The guard's own behaviour (modes, extensions, CJK names, fail-open on a
+    // malformed envelope) lives with the decision function it now shares with
+    // the CLI subcommand: `duduclaw_core::data_file_guard`.
 }

@@ -54,7 +54,7 @@ pub struct ReliabilitySummary {
     /// Fraction of all events in the window that are `llm_fallback_triggered` events.
     ///
     /// Returns `0.0` when no events are present.
-    /// NOTE (W20): Full data requires `llm_fallback.rs` to emit to EvolutionEventLogger
+    /// NOTE (W20): Full data requires `failover::model` to emit to EvolutionEventLogger
     /// (planned for Phase 2). Until then, this field reflects only fallback events
     /// already captured in the evolution-events audit trail.
     pub fallback_trigger_rate: f64,
@@ -177,9 +177,9 @@ mod tests {
     #[test]
     fn consistency_three_types_varied() {
         let rows = vec![
-            ("type_a".to_string(), 4, 4),  // 1.0
-            ("type_b".to_string(), 4, 2),  // 0.5
-            ("type_c".to_string(), 4, 0),  // 0.0
+            ("type_a".to_string(), 4, 4), // 1.0
+            ("type_b".to_string(), 4, 2), // 0.5
+            ("type_c".to_string(), 4, 0), // 0.0
         ];
         let expected = (1.0_f64 + 0.5 + 0.0) / 3.0;
         assert!((consistency_from_rows(&rows) - expected).abs() < EPS);

@@ -33,15 +33,51 @@ pub struct CapabilityEntry {
 /// Header output follows ADR-002 §4.1 sort rule:
 ///   `memory` always first, remaining capabilities in lexicographic order.
 pub const CAPABILITY_REGISTRY: &[CapabilityEntry] = &[
-    CapabilityEntry { name: "a2a",            major_version: 1, enabled: false }, // W21 — A2A Bridge (pending enablement)
-    CapabilityEntry { name: "audit",          major_version: 2, enabled: true  }, // W20-P1
-    CapabilityEntry { name: "governance",     major_version: 1, enabled: true  }, // W19-P1
-    CapabilityEntry { name: "memory",         major_version: 3, enabled: true  }, // core — always first in header
-    CapabilityEntry { name: "mcp",            major_version: 2, enabled: true  }, // W20 HTTP/SSE Phase 2
-    CapabilityEntry { name: "secret-manager", major_version: 1, enabled: false }, // W22 P0 — pending
-    CapabilityEntry { name: "signed-card",    major_version: 1, enabled: false }, // W22 P1 — pending
-    CapabilityEntry { name: "skill",          major_version: 1, enabled: true  },
-    CapabilityEntry { name: "wiki",           major_version: 1, enabled: true  },
+    CapabilityEntry {
+        name: "a2a",
+        major_version: 1,
+        enabled: false,
+    }, // W21 — A2A Bridge (pending enablement)
+    CapabilityEntry {
+        name: "audit",
+        major_version: 2,
+        enabled: true,
+    }, // W20-P1
+    CapabilityEntry {
+        name: "governance",
+        major_version: 1,
+        enabled: true,
+    }, // W19-P1
+    CapabilityEntry {
+        name: "memory",
+        major_version: 3,
+        enabled: true,
+    }, // core — always first in header
+    CapabilityEntry {
+        name: "mcp",
+        major_version: 2,
+        enabled: true,
+    }, // W20 HTTP/SSE Phase 2
+    CapabilityEntry {
+        name: "secret-manager",
+        major_version: 1,
+        enabled: false,
+    }, // W22 P0 — pending
+    CapabilityEntry {
+        name: "signed-card",
+        major_version: 1,
+        enabled: false,
+    }, // W22 P1 — pending
+    CapabilityEntry {
+        name: "skill",
+        major_version: 1,
+        enabled: true,
+    },
+    CapabilityEntry {
+        name: "wiki",
+        major_version: 1,
+        enabled: true,
+    },
 ];
 
 /// The HTTP API compatibility version — independent from DuDuClaw SemVer (ADR-002 §4.3).
@@ -268,9 +304,18 @@ mod tests {
     fn header_only_enabled_capabilities_included() {
         let header = build_capabilities_header();
         // Disabled capabilities must NOT appear in the outbound header
-        assert!(!header.contains("a2a/"), "disabled 'a2a' must not appear: {header}");
-        assert!(!header.contains("secret-manager/"), "disabled 'secret-manager' must not appear: {header}");
-        assert!(!header.contains("signed-card/"), "disabled 'signed-card' must not appear: {header}");
+        assert!(
+            !header.contains("a2a/"),
+            "disabled 'a2a' must not appear: {header}"
+        );
+        assert!(
+            !header.contains("secret-manager/"),
+            "disabled 'secret-manager' must not appear: {header}"
+        );
+        assert!(
+            !header.contains("signed-card/"),
+            "disabled 'signed-card' must not appear: {header}"
+        );
     }
 
     #[test]
@@ -279,14 +324,21 @@ mod tests {
         let parts: Vec<&str> = header.split(',').collect();
         assert!(parts.len() > 1, "should have more than memory alone");
         // First must be memory
-        assert!(parts[0].starts_with("memory/"), "first entry must be memory/");
+        assert!(
+            parts[0].starts_with("memory/"),
+            "first entry must be memory/"
+        );
         // Rest must be in lexicographic order by name
-        let rest_names: Vec<&str> = parts[1..].iter()
+        let rest_names: Vec<&str> = parts[1..]
+            .iter()
             .map(|s| s.split('/').next().unwrap_or(""))
             .collect();
         let mut sorted = rest_names.clone();
         sorted.sort();
-        assert_eq!(rest_names, sorted, "non-memory capabilities must be lexicographically ordered");
+        assert_eq!(
+            rest_names, sorted,
+            "non-memory capabilities must be lexicographically ordered"
+        );
     }
 
     #[test]
@@ -297,7 +349,10 @@ mod tests {
             let name = iter.next().expect("name segment missing");
             let ver = iter.next().expect("version segment missing");
             assert!(!name.is_empty(), "empty name in entry '{part}'");
-            assert!(ver.parse::<u32>().is_ok(), "non-numeric version in entry '{part}'");
+            assert!(
+                ver.parse::<u32>().is_ok(),
+                "non-numeric version in entry '{part}'"
+            );
         }
     }
 
@@ -318,23 +373,49 @@ mod tests {
     fn header_empty_when_all_disabled() {
         // Use build_capabilities_header_from with an all-disabled registry
         let all_disabled = &[
-            CapabilityEntry { name: "memory", major_version: 3, enabled: false },
-            CapabilityEntry { name: "mcp",    major_version: 2, enabled: false },
+            CapabilityEntry {
+                name: "memory",
+                major_version: 3,
+                enabled: false,
+            },
+            CapabilityEntry {
+                name: "mcp",
+                major_version: 2,
+                enabled: false,
+            },
         ];
         let header = build_capabilities_header_from(all_disabled);
-        assert_eq!(header, "", "all-disabled registry must produce empty header");
+        assert_eq!(
+            header, "",
+            "all-disabled registry must produce empty header"
+        );
     }
 
     #[test]
     fn header_memory_disabled_omits_it_and_keeps_alpha_order() {
         // memory disabled → no memory first; remaining caps are still alpha sorted
         let registry = &[
-            CapabilityEntry { name: "memory", major_version: 3, enabled: false },
-            CapabilityEntry { name: "wiki",   major_version: 1, enabled: true },
-            CapabilityEntry { name: "audit",  major_version: 2, enabled: true },
+            CapabilityEntry {
+                name: "memory",
+                major_version: 3,
+                enabled: false,
+            },
+            CapabilityEntry {
+                name: "wiki",
+                major_version: 1,
+                enabled: true,
+            },
+            CapabilityEntry {
+                name: "audit",
+                major_version: 2,
+                enabled: true,
+            },
         ];
         let header = build_capabilities_header_from(registry);
-        assert_eq!(header, "audit/2,wiki/1", "without memory, remaining caps must be alpha sorted");
+        assert_eq!(
+            header, "audit/2,wiki/1",
+            "without memory, remaining caps must be alpha sorted"
+        );
     }
 
     // ── parse_capabilities tests ──────────────────────────────────────────────
@@ -406,14 +487,20 @@ mod tests {
     fn validate_permissive_when_no_header() {
         // No x-duduclaw-capabilities in request → always pass through
         let result = validate_client_capabilities(None);
-        assert!(result.is_ok(), "permissive mode: absent header must always succeed");
+        assert!(
+            result.is_ok(),
+            "permissive mode: absent header must always succeed"
+        );
     }
 
     #[test]
     fn validate_empty_header_value_is_permissive() {
         let hv = HeaderValue::from_static("");
         let result = validate_client_capabilities(Some(&hv));
-        assert!(result.is_ok(), "empty header value must be treated as no requirement");
+        assert!(
+            result.is_ok(),
+            "empty header value must be treated as no requirement"
+        );
     }
 
     #[test]
@@ -421,7 +508,10 @@ mod tests {
         // mcp/2 and memory/3 are both enabled at exactly the required versions
         let hv = HeaderValue::from_static("mcp/2,memory/3");
         let result = validate_client_capabilities(Some(&hv));
-        assert!(result.is_ok(), "all requested capabilities should be satisfied");
+        assert!(
+            result.is_ok(),
+            "all requested capabilities should be satisfied"
+        );
     }
 
     #[test]
@@ -430,7 +520,10 @@ mod tests {
         let err = validate_client_capabilities(Some(&hv)).unwrap_err();
         assert_eq!(err.missing.len(), 1);
         assert_eq!(err.missing[0].capability, "unknown-feature");
-        assert_eq!(err.missing[0].server_version, None, "unknown cap has no server version");
+        assert_eq!(
+            err.missing[0].server_version, None,
+            "unknown cap has no server version"
+        );
     }
 
     #[test]
@@ -440,7 +533,10 @@ mod tests {
         let err = validate_client_capabilities(Some(&hv)).unwrap_err();
         assert_eq!(err.missing.len(), 1);
         assert_eq!(err.missing[0].capability, "a2a");
-        assert_eq!(err.missing[0].server_version, None, "disabled cap → server_version None");
+        assert_eq!(
+            err.missing[0].server_version, None,
+            "disabled cap → server_version None"
+        );
     }
 
     #[test]
@@ -451,7 +547,11 @@ mod tests {
         assert_eq!(err.missing.len(), 1);
         assert_eq!(err.missing[0].capability, "mcp");
         assert_eq!(err.missing[0].required_version, 3);
-        assert_eq!(err.missing[0].server_version, Some(2), "server version should be reported");
+        assert_eq!(
+            err.missing[0].server_version,
+            Some(2),
+            "server version should be reported"
+        );
     }
 
     #[test]
@@ -459,7 +559,11 @@ mod tests {
         // memory/3 is satisfied, secret-manager/1 is disabled
         let hv = HeaderValue::from_static("memory/3,secret-manager/1");
         let err = validate_client_capabilities(Some(&hv)).unwrap_err();
-        assert_eq!(err.missing.len(), 1, "only one capability should be missing");
+        assert_eq!(
+            err.missing.len(),
+            1,
+            "only one capability should be missing"
+        );
         assert_eq!(err.missing[0].capability, "secret-manager");
     }
 
@@ -468,7 +572,11 @@ mod tests {
         // a2a and secret-manager are both disabled
         let hv = HeaderValue::from_static("a2a/1,secret-manager/1");
         let err = validate_client_capabilities(Some(&hv)).unwrap_err();
-        assert_eq!(err.missing.len(), 2, "both missing capabilities must be reported");
+        assert_eq!(
+            err.missing.len(),
+            2,
+            "both missing capabilities must be reported"
+        );
     }
 
     #[test]
@@ -477,7 +585,10 @@ mod tests {
         // rejected (fail-closed), NOT silently allowed.
         let hv = HeaderValue::from_static("badformat");
         let result = validate_client_capabilities(Some(&hv));
-        assert!(result.is_err(), "malformed header must be rejected (fail-closed)");
+        assert!(
+            result.is_err(),
+            "malformed header must be rejected (fail-closed)"
+        );
     }
 
     // ── build_missing_capabilities_header tests ───────────────────────────────
@@ -511,17 +622,21 @@ mod tests {
     #[test]
     fn mismatch_display_shows_capability_names() {
         let err = CapabilityMismatchError {
-            missing: vec![
-                MissingCapability {
-                    capability: "a2a".to_string(),
-                    required_version: 1,
-                    server_version: None,
-                },
-            ],
+            missing: vec![MissingCapability {
+                capability: "a2a".to_string(),
+                required_version: 1,
+                server_version: None,
+            }],
         };
         let display = err.to_string();
-        assert!(display.contains("a2a"), "display must mention missing capability name");
-        assert!(display.contains("not available"), "must describe absent capability");
+        assert!(
+            display.contains("a2a"),
+            "display must mention missing capability name"
+        );
+        assert!(
+            display.contains("not available"),
+            "must describe absent capability"
+        );
     }
 
     /// Covers Display impl's `Some(sv)` branch: "required vX, server vY" format
@@ -535,8 +650,14 @@ mod tests {
             }],
         };
         let display = err.to_string();
-        assert!(display.contains("mcp"), "display must mention capability name");
-        assert!(display.contains("required v99"), "must show required version");
+        assert!(
+            display.contains("mcp"),
+            "display must mention capability name"
+        );
+        assert!(
+            display.contains("required v99"),
+            "must show required version"
+        );
         assert!(display.contains("server v2"), "must show server version");
     }
 
@@ -559,8 +680,14 @@ mod tests {
         };
         let display = err.to_string();
         assert!(display.contains("a2a"), "first capability must appear");
-        assert!(display.contains("secret-manager"), "second capability must appear");
+        assert!(
+            display.contains("secret-manager"),
+            "second capability must appear"
+        );
         // The comma separator between multiple entries
-        assert!(display.contains(", "), "multiple entries must be comma-separated");
+        assert!(
+            display.contains(", "),
+            "multiple entries must be comma-separated"
+        );
     }
 }

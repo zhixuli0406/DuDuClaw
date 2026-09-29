@@ -244,7 +244,11 @@ impl TaskSpec {
             self.updated_at = Utc::now();
 
             // Check if all steps are done
-            if self.steps.iter().all(|s| s.status == StepStatus::Passed || s.status == StepStatus::Skipped) {
+            if self
+                .steps
+                .iter()
+                .all(|s| s.status == StepStatus::Passed || s.status == StepStatus::Skipped)
+            {
                 self.status = TaskStatus::Completed;
             }
         }
@@ -304,30 +308,44 @@ impl TaskSpec {
         self.updated_at = Utc::now();
 
         // Keep completed steps
-        let completed: Vec<Step> = self.steps.iter()
+        let completed: Vec<Step> = self
+            .steps
+            .iter()
             .filter(|s| s.status == StepStatus::Passed)
             .cloned()
             .collect();
 
         // Build old_id → new_id mapping for depends_on remapping (review R2-6).
         let offset = completed.len();
-        let id_map: std::collections::HashMap<u8, u8> = new_remaining_steps.iter().enumerate()
+        let id_map: std::collections::HashMap<u8, u8> = new_remaining_steps
+            .iter()
+            .enumerate()
             .map(|(i, s)| (s.id, (offset + i).min(u8::MAX as usize) as u8))
             .collect();
 
-        let renumbered: Vec<Step> = new_remaining_steps.into_iter().enumerate().map(|(i, mut s)| {
-            s.id = (offset + i).min(u8::MAX as usize) as u8;
-            // Remap depends_on: new-batch references use the id_map,
-            // references to completed steps stay as-is (they already have correct ids).
-            s.depends_on = s.depends_on.iter().map(|dep| {
-                *id_map.get(dep).unwrap_or(dep)
-            }).collect();
-            s
-        }).collect();
+        let renumbered: Vec<Step> = new_remaining_steps
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut s)| {
+                s.id = (offset + i).min(u8::MAX as usize) as u8;
+                // Remap depends_on: new-batch references use the id_map,
+                // references to completed steps stay as-is (they already have correct ids).
+                s.depends_on = s
+                    .depends_on
+                    .iter()
+                    .map(|dep| *id_map.get(dep).unwrap_or(dep))
+                    .collect();
+                s
+            })
+            .collect();
 
         self.steps = completed;
         self.steps.extend(renumbered);
-        self.current_step = self.steps.iter().position(|s| s.status == StepStatus::Pending).unwrap_or(0);
+        self.current_step = self
+            .steps
+            .iter()
+            .position(|s| s.status == StepStatus::Pending)
+            .unwrap_or(0);
 
         info!(
             task = %self.task_id,
@@ -339,7 +357,9 @@ impl TaskSpec {
 
     /// Build a briefing string summarizing completed steps for context injection.
     pub fn completed_steps_briefing(&self) -> String {
-        let completed: Vec<String> = self.steps.iter()
+        let completed: Vec<String> = self
+            .steps
+            .iter()
             .filter(|s| s.status == StepStatus::Passed)
             .filter_map(|s| {
                 s.result.as_ref().map(|r| {
@@ -357,20 +377,31 @@ impl TaskSpec {
     }
 
     /// Build a DelegationEnvelope for a specific step.
-    pub fn delegation_for_step(&self, step_index: usize) -> Option<crate::delegation::DelegationEnvelope> {
+    pub fn delegation_for_step(
+        &self,
+        step_index: usize,
+    ) -> Option<crate::delegation::DelegationEnvelope> {
         let step = self.steps.get(step_index)?;
 
-        let criteria_text: Vec<String> = step.acceptance_criteria.iter()
+        let criteria_text: Vec<String> = step
+            .acceptance_criteria
+            .iter()
             .map(|c| format!("[{:?}] {}", c.method, c.description))
             .collect();
 
-        let task_chain: Vec<crate::delegation::TaskChainEntry> = self.steps.iter()
+        let task_chain: Vec<crate::delegation::TaskChainEntry> = self
+            .steps
+            .iter()
             .filter(|s| s.status == StepStatus::Passed)
             .filter_map(|s| {
                 s.result.as_ref().map(|r| {
                     let summary: String = r.output.chars().take(300).collect();
                     crate::delegation::TaskChainEntry {
-                        agent_id: if s.agent.is_empty() { self.agent_id.clone() } else { s.agent.clone() },
+                        agent_id: if s.agent.is_empty() {
+                            self.agent_id.clone()
+                        } else {
+                            s.agent.clone()
+                        },
                         status: "completed".to_string(),
                         summary,
                     }
@@ -398,7 +429,10 @@ impl TaskSpec {
 
     /// Check if the task is complete (all steps passed or task failed/cancelled).
     pub fn is_terminal(&self) -> bool {
-        matches!(self.status, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled)
+        matches!(
+            self.status,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        )
     }
 }
 
@@ -412,14 +446,9 @@ pub enum FailureAction {
         error: String,
     },
     /// Replan remaining steps (failed step + subsequent).
-    Replan {
-        failed_step: usize,
-        error: String,
-    },
+    Replan { failed_step: usize, error: String },
     /// Abandon the task entirely.
-    Abandon {
-        reason: String,
-    },
+    Abandon { reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +477,10 @@ impl TaskSpec {
     /// `task_id` is sanitized to prevent path traversal (review issue #13).
     pub fn load(agent_dir: &Path, task_id: &str) -> Result<Self, String> {
         // Sanitize: only allow alphanumeric + hyphens (UUID format)
-        if !task_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        if !task_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
             return Err(format!("Invalid task_id: contains disallowed characters"));
         }
         let path = agent_dir.join("tasks").join(format!("{task_id}.json"));
@@ -504,35 +536,59 @@ pub fn estimate_complexity(prompt: &str) -> TaskComplexity {
     let char_count = prompt.chars().count();
 
     // Step indicators
-    let step_keywords_en = ["first", "then", "next", "after that", "finally", "step 1", "step 2", "phase"];
+    let step_keywords_en = [
+        "first",
+        "then",
+        "next",
+        "after that",
+        "finally",
+        "step 1",
+        "step 2",
+        "phase",
+    ];
     let step_keywords_zh = [
-        "\u{6B65}\u{9A5F}",     // 步驟
-        "\u{63A5}\u{8457}",     // 接著
-        "\u{7136}\u{5F8C}",     // 然後
-        "\u{6700}\u{5F8C}",     // 最後
-        "\u{9996}\u{5148}",     // 首先
+        "\u{6B65}\u{9A5F}",         // 步驟
+        "\u{63A5}\u{8457}",         // 接著
+        "\u{7136}\u{5F8C}",         // 然後
+        "\u{6700}\u{5F8C}",         // 最後
+        "\u{9996}\u{5148}",         // 首先
         "\u{7B2C}\u{4E00}\u{6B65}", // 第一步
     ];
 
-    let step_count: usize = step_keywords_en.iter().filter(|kw| lower.contains(*kw)).count()
-        + step_keywords_zh.iter().filter(|kw| lower.contains(*kw)).count();
+    let step_count: usize = step_keywords_en
+        .iter()
+        .filter(|kw| lower.contains(*kw))
+        .count()
+        + step_keywords_zh
+            .iter()
+            .filter(|kw| lower.contains(*kw))
+            .count();
 
     // Cross-domain indicators
     let cross_domain_en = ["and also", "in addition", "separately", "plus"];
     let cross_domain_zh = [
-        "\u{53E6}\u{5916}",     // 另外
-        "\u{800C}\u{4E14}",     // 而且
-        "\u{9084}\u{8981}",     // 還要
-        "\u{540C}\u{6642}",     // 同時
+        "\u{53E6}\u{5916}", // 另外
+        "\u{800C}\u{4E14}", // 而且
+        "\u{9084}\u{8981}", // 還要
+        "\u{540C}\u{6642}", // 同時
     ];
 
-    let cross_domain: usize = cross_domain_en.iter().filter(|kw| lower.contains(*kw)).count()
-        + cross_domain_zh.iter().filter(|kw| lower.contains(*kw)).count();
+    let cross_domain: usize = cross_domain_en
+        .iter()
+        .filter(|kw| lower.contains(*kw))
+        .count()
+        + cross_domain_zh
+            .iter()
+            .filter(|kw| lower.contains(*kw))
+            .count();
 
     // Numbered list detection
     let has_numbered_list = lower.contains("1.") && lower.contains("2.");
 
-    if step_count >= 3 || (step_count >= 2 && cross_domain >= 1) || (has_numbered_list && char_count > 500) {
+    if step_count >= 3
+        || (step_count >= 2 && cross_domain >= 1)
+        || (has_numbered_list && char_count > 500)
+    {
         TaskComplexity::Complex
     } else if step_count >= 1 || char_count > 300 || cross_domain >= 1 {
         TaskComplexity::Medium
@@ -595,42 +651,60 @@ pub fn parse_planner_response(response: &str) -> Result<Vec<Step>, String> {
         return Err("No JSON array found in planner response".to_string());
     };
 
-    let raw: Vec<serde_json::Value> = serde_json::from_str(json_str)
-        .map_err(|e| format!("JSON parse error: {e}"))?;
+    let raw: Vec<serde_json::Value> =
+        serde_json::from_str(json_str).map_err(|e| format!("JSON parse error: {e}"))?;
 
     let steps: Vec<Step> = raw
         .into_iter()
         .enumerate()
         .map(|(i, val)| {
-            let description = val.get("description")
+            let description = val
+                .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("(no description)")
                 .to_string();
 
-            let agent = val.get("agent")
+            let agent = val
+                .get("agent")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
 
-            let depends_on: Vec<u8> = val.get("depends_on")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
-                .unwrap_or_default();
-
-            let acceptance_criteria: Vec<Criterion> = val.get("acceptance_criteria")
+            let depends_on: Vec<u8> = val
+                .get("depends_on")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
-                    arr.iter().map(|c| {
-                        let desc = c.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let method_str = c.get("method").and_then(|v| v.as_str()).unwrap_or("auto");
-                        let method = match method_str {
-                            "sandbox" => VerificationMethod::Sandbox,
-                            "llm_judge" => VerificationMethod::LlmJudge,
-                            "manual" => VerificationMethod::Manual,
-                            _ => VerificationMethod::Auto,
-                        };
-                        Criterion { description: desc, method }
-                    }).collect()
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as u8))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let acceptance_criteria: Vec<Criterion> = val
+                .get("acceptance_criteria")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|c| {
+                            let desc = c
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let method_str =
+                                c.get("method").and_then(|v| v.as_str()).unwrap_or("auto");
+                            let method = match method_str {
+                                "sandbox" => VerificationMethod::Sandbox,
+                                "llm_judge" => VerificationMethod::LlmJudge,
+                                "manual" => VerificationMethod::Manual,
+                                _ => VerificationMethod::Auto,
+                            };
+                            Criterion {
+                                description: desc,
+                                method,
+                            }
+                        })
+                        .collect()
                 })
                 .unwrap_or_default();
 
@@ -685,7 +759,9 @@ pub fn build_step_prompt(spec: &TaskSpec, step_index: usize) -> Option<String> {
 
     // Acceptance criteria
     if !step.acceptance_criteria.is_empty() {
-        let criteria: Vec<String> = step.acceptance_criteria.iter()
+        let criteria: Vec<String> = step
+            .acceptance_criteria
+            .iter()
             .map(|c| format!("- {}", c.description))
             .collect();
         sections.push(format!("## Acceptance Criteria\n{}", criteria.join("\n")));
@@ -784,9 +860,10 @@ mod tests {
                 description: "Write the auth module".to_string(),
                 agent: "coder".to_string(),
                 depends_on: vec![],
-                acceptance_criteria: vec![
-                    Criterion { description: "Auth endpoint exists".to_string(), method: VerificationMethod::Auto },
-                ],
+                acceptance_criteria: vec![Criterion {
+                    description: "Auth endpoint exists".to_string(),
+                    method: VerificationMethod::Auto,
+                }],
                 status: StepStatus::Pending,
                 result: None,
                 retry_count: 0,
@@ -829,13 +906,16 @@ mod tests {
         spec.mark_running(0);
         assert_eq!(spec.steps[0].status, StepStatus::Running);
 
-        spec.mark_passed(0, StepResult {
-            output: "Auth module done".to_string(),
-            artifacts: vec![],
-            criteria_results: vec![],
-            self_confidence: Some(0.9),
-            completed_at: Utc::now(),
-        });
+        spec.mark_passed(
+            0,
+            StepResult {
+                output: "Auth module done".to_string(),
+                artifacts: vec![],
+                criteria_results: vec![],
+                self_confidence: Some(0.9),
+                completed_at: Utc::now(),
+            },
+        );
         assert_eq!(spec.steps[0].status, StepStatus::Passed);
 
         // Now step 1 should be ready (depends on 0 which is passed)
@@ -850,7 +930,14 @@ mod tests {
         spec.mark_running(0);
 
         let action = spec.mark_failed(0, "Compile error");
-        assert!(matches!(action, FailureAction::Retry { step_index: 0, attempt: 1, .. }));
+        assert!(matches!(
+            action,
+            FailureAction::Retry {
+                step_index: 0,
+                attempt: 1,
+                ..
+            }
+        ));
         assert_eq!(spec.steps[0].status, StepStatus::Pending); // reset for retry
     }
 
@@ -881,27 +968,28 @@ mod tests {
         let mut spec = TaskSpec::new("orch", "Build auth", sample_steps());
         // Complete step 0
         spec.mark_running(0);
-        spec.mark_passed(0, StepResult {
-            output: "done".to_string(),
-            artifacts: vec![],
-            criteria_results: vec![],
-            self_confidence: None,
-            completed_at: Utc::now(),
-        });
+        spec.mark_passed(
+            0,
+            StepResult {
+                output: "done".to_string(),
+                artifacts: vec![],
+                criteria_results: vec![],
+                self_confidence: None,
+                completed_at: Utc::now(),
+            },
+        );
 
         // Replan remaining
-        spec.replan(vec![
-            Step {
-                id: 0, // will be renumbered
-                description: "New approach for tests".to_string(),
-                agent: "coder".to_string(),
-                depends_on: vec![],
-                acceptance_criteria: vec![],
-                status: StepStatus::Pending,
-                result: None,
-                retry_count: 0,
-            },
-        ]);
+        spec.replan(vec![Step {
+            id: 0, // will be renumbered
+            description: "New approach for tests".to_string(),
+            agent: "coder".to_string(),
+            depends_on: vec![],
+            acceptance_criteria: vec![],
+            status: StepStatus::Pending,
+            result: None,
+            retry_count: 0,
+        }]);
 
         assert_eq!(spec.replan_count, 1);
         assert_eq!(spec.steps.len(), 2); // 1 completed + 1 new
@@ -912,9 +1000,14 @@ mod tests {
     #[test]
     fn test_estimate_complexity() {
         assert_eq!(estimate_complexity("Fix this bug"), TaskComplexity::Simple);
-        assert_eq!(estimate_complexity("First write the auth module, then add tests"), TaskComplexity::Medium);
         assert_eq!(
-            estimate_complexity("Step 1: design the schema. Step 2: implement the API. Step 3: write tests. Finally deploy."),
+            estimate_complexity("First write the auth module, then add tests"),
+            TaskComplexity::Medium
+        );
+        assert_eq!(
+            estimate_complexity(
+                "Step 1: design the schema. Step 2: implement the API. Step 3: write tests. Finally deploy."
+            ),
             TaskComplexity::Complex
         );
     }
@@ -932,20 +1025,26 @@ mod tests {
         assert_eq!(steps[0].description, "Write auth");
         assert_eq!(steps[0].agent, "coder");
         assert_eq!(steps[1].depends_on, vec![0]);
-        assert!(matches!(steps[0].acceptance_criteria[0].method, VerificationMethod::Sandbox));
+        assert!(matches!(
+            steps[0].acceptance_criteria[0].method,
+            VerificationMethod::Sandbox
+        ));
     }
 
     #[test]
     fn test_delegation_for_step() {
         let mut spec = TaskSpec::new("orch", "Build auth", sample_steps());
         spec.mark_running(0);
-        spec.mark_passed(0, StepResult {
-            output: "Auth done".to_string(),
-            artifacts: vec![],
-            criteria_results: vec![],
-            self_confidence: None,
-            completed_at: Utc::now(),
-        });
+        spec.mark_passed(
+            0,
+            StepResult {
+                output: "Auth done".to_string(),
+                artifacts: vec![],
+                criteria_results: vec![],
+                self_confidence: None,
+                completed_at: Utc::now(),
+            },
+        );
 
         let envelope = spec.delegation_for_step(1).unwrap();
         assert!(envelope.task.contains("Write tests"));

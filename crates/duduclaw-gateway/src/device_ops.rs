@@ -285,7 +285,9 @@ pub struct SysdDeviceOps {
 
 impl Default for SysdDeviceOps {
     fn default() -> Self {
-        Self { client: duduclaw_sysd::SysdClient::from_env() }
+        Self {
+            client: duduclaw_sysd::SysdClient::from_env(),
+        }
     }
 }
 
@@ -301,7 +303,13 @@ impl SysdDeviceOps {
     /// reachable, testable caller in this crate today rather than sitting
     /// completely unused.
     pub async fn set_hostname(&self, name: &str) -> OpResult {
-        sysd_call(&self.client, duduclaw_sysd::SysdRequest::Hostname { set: name.to_string() }).await
+        sysd_call(
+            &self.client,
+            duduclaw_sysd::SysdRequest::Hostname {
+                set: name.to_string(),
+            },
+        )
+        .await
     }
 
     /// System-settings app: `device.timedate_set`'s `timezone` half. Not
@@ -311,7 +319,9 @@ impl SysdDeviceOps {
     pub async fn set_timezone(&self, timezone: &str) -> OpResult {
         sysd_call(
             &self.client,
-            duduclaw_sysd::SysdRequest::SetTimezone { timezone: timezone.to_string() },
+            duduclaw_sysd::SysdRequest::SetTimezone {
+                timezone: timezone.to_string(),
+            },
         )
         .await
     }
@@ -391,9 +401,16 @@ impl SysdDeviceOps {
 /// Translate a `duduclaw-sysd` call into the same [`OpResult`] shape every
 /// other `DeviceOps` impl returns, so callers (handlers.rs) don't need to
 /// know which backend answered.
-async fn sysd_call(client: &duduclaw_sysd::SysdClient, req: duduclaw_sysd::SysdRequest) -> OpResult {
+async fn sysd_call(
+    client: &duduclaw_sysd::SysdClient,
+    req: duduclaw_sysd::SysdRequest,
+) -> OpResult {
     match client.call(&req).await {
-        Ok(out) => Ok(OpOutput { success: out.success, stdout: out.stdout, stderr: out.stderr }),
+        Ok(out) => Ok(OpOutput {
+            success: out.success,
+            stdout: out.stdout,
+            stderr: out.stderr,
+        }),
         Err(e) => Err(DeviceOpError::Unsupported(e.to_string())),
     }
 }
@@ -421,7 +438,11 @@ impl DeviceOps for SysdDeviceOps {
     }
 
     async fn boot_assessment_status(&self) -> OpResult {
-        sysd_call(&self.client, duduclaw_sysd::SysdRequest::BootAssessmentStatus).await
+        sysd_call(
+            &self.client,
+            duduclaw_sysd::SysdRequest::BootAssessmentStatus,
+        )
+        .await
     }
 
     async fn factory_reset(&self, home_dir: &Path, clear_network: bool) -> OpResult {
@@ -445,7 +466,11 @@ impl DeviceOps for SysdDeviceOps {
             // to reboot while leaving saved Wi-Fi credentials in place —
             // an operator who explicitly asked for them to be cleared must
             // never be told "done" when they were not.
-            sysd_call(&self.client, duduclaw_sysd::SysdRequest::ClearNetworkCredentials).await?;
+            sysd_call(
+                &self.client,
+                duduclaw_sysd::SysdRequest::ClearNetworkCredentials,
+            )
+            .await?;
         }
         sysd_call(&self.client, duduclaw_sysd::SysdRequest::FactoryReset).await
     }
@@ -570,7 +595,10 @@ pub mod mock {
             take_or_default(&self.update_apply_result, "update_apply")
         }
         async fn update_rollback(&self) -> OpResult {
-            self.calls.lock().unwrap().push("update_rollback".to_string());
+            self.calls
+                .lock()
+                .unwrap()
+                .push("update_rollback".to_string());
             take_or_default(&self.update_rollback_result, "update_rollback")
         }
         async fn boot_assessment_status(&self) -> OpResult {
@@ -578,7 +606,10 @@ pub mod mock {
                 .lock()
                 .unwrap()
                 .push("boot_assessment_status".to_string());
-            take_or_default(&self.boot_assessment_status_result, "boot_assessment_status")
+            take_or_default(
+                &self.boot_assessment_status_result,
+                "boot_assessment_status",
+            )
         }
         async fn factory_reset(&self, _home_dir: &Path, clear_network: bool) -> OpResult {
             self.calls
@@ -605,7 +636,11 @@ mod tests {
         {
             use std::os::unix::process::ExitStatusExt;
             let status = std::process::ExitStatus::from_raw(0);
-            let out = Output { status, stdout: b"hello".to_vec(), stderr: b"".to_vec() };
+            let out = Output {
+                status,
+                stdout: b"hello".to_vec(),
+                stderr: b"".to_vec(),
+            };
             let op = OpOutput::from_process_output(out);
             assert!(op.success);
             assert_eq!(op.stdout, "hello");
@@ -619,7 +654,11 @@ mod tests {
         {
             use std::os::unix::process::ExitStatusExt;
             let status = std::process::ExitStatus::from_raw(256); // exit code 1
-            let out = Output { status, stdout: b"".to_vec(), stderr: b"boom".to_vec() };
+            let out = Output {
+                status,
+                stdout: b"".to_vec(),
+                stderr: b"boom".to_vec(),
+            };
             let op = OpOutput::from_process_output(out);
             assert!(!op.success);
             assert_eq!(op.stderr, "boom");
@@ -713,7 +752,11 @@ mod tests {
                     })
                     .await;
                 });
-                TestServer { socket_path, shutdown_tx: Some(tx), handle: Some(handle) }
+                TestServer {
+                    socket_path,
+                    shutdown_tx: Some(tx),
+                    handle: Some(handle),
+                }
             }
 
             fn device_ops(&self) -> SysdDeviceOps {
@@ -779,7 +822,10 @@ mod tests {
             // The wipe must have happened regardless of whether the
             // downstream `systemctl` calls exist on this host.
             let remaining: Vec<_> = std::fs::read_dir(home.path()).unwrap().collect();
-            assert!(remaining.is_empty(), "home dir must be wiped: {remaining:?}");
+            assert!(
+                remaining.is_empty(),
+                "home dir must be wiped: {remaining:?}"
+            );
             match result {
                 Ok(_) => {}
                 Err(DeviceOpError::Unsupported(msg)) => {
@@ -826,9 +872,9 @@ mod tests {
         /// regardless — only the privileged half is unreachable here.
         #[tokio::test]
         async fn factory_reset_with_clear_network_fails_closed_when_socket_unreachable() {
-            let ops = SysdDeviceOps::new(duduclaw_sysd::SysdClient::new(
-                std::path::PathBuf::from("/tmp/duduclaw-sysd-test-no-such-socket.sock"),
-            ));
+            let ops = SysdDeviceOps::new(duduclaw_sysd::SysdClient::new(std::path::PathBuf::from(
+                "/tmp/duduclaw-sysd-test-no-such-socket.sock",
+            )));
 
             let home = tempfile::tempdir().unwrap();
             std::fs::write(home.path().join("leftover.txt"), b"x").unwrap();
@@ -980,7 +1026,10 @@ mod tests {
             let result = ops.reboot().await;
             match result {
                 Err(DeviceOpError::Unsupported(msg)) => {
-                    assert!(msg.contains("unauthorized"), "expected unauthorized, got: {msg}");
+                    assert!(
+                        msg.contains("unauthorized"),
+                        "expected unauthorized, got: {msg}"
+                    );
                 }
                 other => panic!("expected an Unsupported(unauthorized) error, got {other:?}"),
             }
@@ -1004,16 +1053,19 @@ mod tests {
             // `update_rollback_surfaces_a_missing_socket_honestly` below —
             // leaving it here would have kept passing while asserting the
             // opposite of what the code does.
-            let ops = SysdDeviceOps::new(duduclaw_sysd::SysdClient::new(
-                std::path::PathBuf::from("/tmp/duduclaw-sysd-test-no-such-socket.sock"),
-            ));
+            let ops = SysdDeviceOps::new(duduclaw_sysd::SysdClient::new(std::path::PathBuf::from(
+                "/tmp/duduclaw-sysd-test-no-such-socket.sock",
+            )));
 
             let src = tempfile::tempdir().unwrap();
             std::fs::write(src.path().join("a.txt"), b"hi").unwrap();
             let dest = tempfile::tempdir().unwrap();
             let dest_path = dest.path().join("out.tar.gz");
             let backup = ops.backup_create(src.path(), &dest_path).await;
-            assert!(backup.is_ok(), "backup_create must not require the sysd socket: {backup:?}");
+            assert!(
+                backup.is_ok(),
+                "backup_create must not require the sysd socket: {backup:?}"
+            );
         }
 
         #[tokio::test]
@@ -1021,9 +1073,9 @@ mod tests {
             // With no sysd reachable, the appliance path must report a
             // structured `Unsupported` — never panic, and never fall back to
             // pretending a rollback happened.
-            let ops = SysdDeviceOps::new(duduclaw_sysd::SysdClient::new(
-                std::path::PathBuf::from("/tmp/duduclaw-sysd-test-no-such-socket.sock"),
-            ));
+            let ops = SysdDeviceOps::new(duduclaw_sysd::SysdClient::new(std::path::PathBuf::from(
+                "/tmp/duduclaw-sysd-test-no-such-socket.sock",
+            )));
             assert!(matches!(
                 ops.update_rollback().await,
                 Err(DeviceOpError::Unsupported(_))

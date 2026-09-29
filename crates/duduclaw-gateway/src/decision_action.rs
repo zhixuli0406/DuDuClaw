@@ -157,7 +157,10 @@ impl DecisionAct {
     pub fn valid_for(self, source: DecisionSource) -> bool {
         match source {
             DecisionSource::Goal => {
-                matches!(self, Self::Retry | Self::Done | Self::Abort | Self::Takeover)
+                matches!(
+                    self,
+                    Self::Retry | Self::Done | Self::Abort | Self::Takeover
+                )
             }
             DecisionSource::Kickoff | DecisionSource::Approval | DecisionSource::Install => {
                 matches!(self, Self::Approve | Self::Deny)
@@ -222,7 +225,11 @@ fn parse_unified(data: &str) -> Option<DecisionAction> {
     if !act.valid_for(source) {
         return None;
     }
-    Some(DecisionAction { source, act, id: id.to_string() })
+    Some(DecisionAction {
+        source,
+        act,
+        id: id.to_string(),
+    })
 }
 
 /// The pre-unification encodings, kept parseable so cards already sitting in
@@ -230,23 +237,67 @@ fn parse_unified(data: &str) -> Option<DecisionAction> {
 /// here — the five prefixes are mutually exclusive.
 fn parse_legacy(data: &str) -> Option<DecisionAction> {
     const LEGACY: &[(&str, DecisionSource, DecisionAct)] = &[
-        ("duduclaw:install_approve:", DecisionSource::Install, DecisionAct::Approve),
-        ("duduclaw:install_deny:", DecisionSource::Install, DecisionAct::Deny),
-        ("duduclaw:goal_retry:", DecisionSource::Goal, DecisionAct::Retry),
-        ("duduclaw:goal_done:", DecisionSource::Goal, DecisionAct::Done),
-        ("duduclaw:goal_abort:", DecisionSource::Goal, DecisionAct::Abort),
-        ("duduclaw:goal_kickoff_ok:", DecisionSource::Kickoff, DecisionAct::Approve),
-        ("duduclaw:goal_kickoff_no:", DecisionSource::Kickoff, DecisionAct::Deny),
-        ("duduclaw:approval_ok:", DecisionSource::Approval, DecisionAct::Approve),
-        ("duduclaw:approval_no:", DecisionSource::Approval, DecisionAct::Deny),
-        ("duduclaw:autopilot_pause:", DecisionSource::Autopilot, DecisionAct::Pause),
+        (
+            "duduclaw:install_approve:",
+            DecisionSource::Install,
+            DecisionAct::Approve,
+        ),
+        (
+            "duduclaw:install_deny:",
+            DecisionSource::Install,
+            DecisionAct::Deny,
+        ),
+        (
+            "duduclaw:goal_retry:",
+            DecisionSource::Goal,
+            DecisionAct::Retry,
+        ),
+        (
+            "duduclaw:goal_done:",
+            DecisionSource::Goal,
+            DecisionAct::Done,
+        ),
+        (
+            "duduclaw:goal_abort:",
+            DecisionSource::Goal,
+            DecisionAct::Abort,
+        ),
+        (
+            "duduclaw:goal_kickoff_ok:",
+            DecisionSource::Kickoff,
+            DecisionAct::Approve,
+        ),
+        (
+            "duduclaw:goal_kickoff_no:",
+            DecisionSource::Kickoff,
+            DecisionAct::Deny,
+        ),
+        (
+            "duduclaw:approval_ok:",
+            DecisionSource::Approval,
+            DecisionAct::Approve,
+        ),
+        (
+            "duduclaw:approval_no:",
+            DecisionSource::Approval,
+            DecisionAct::Deny,
+        ),
+        (
+            "duduclaw:autopilot_pause:",
+            DecisionSource::Autopilot,
+            DecisionAct::Pause,
+        ),
     ];
     for (prefix, source, act) in LEGACY {
         if let Some(id) = data.strip_prefix(prefix) {
             if id.is_empty() {
                 return None;
             }
-            return Some(DecisionAction { source: *source, act: *act, id: id.to_string() });
+            return Some(DecisionAction {
+                source: *source,
+                act: *act,
+                id: id.to_string(),
+            });
         }
     }
     None
@@ -294,15 +345,47 @@ mod tests {
         // A goal task cannot be "paused"; an autopilot rule cannot be
         // "retried". Encoding them is possible (the builders never do), but
         // decoding must refuse.
-        assert_eq!(parse(&encode(DecisionSource::Goal, DecisionAct::Pause, "x")), None);
-        assert_eq!(parse(&encode(DecisionSource::Autopilot, DecisionAct::Retry, "x")), None);
-        assert_eq!(parse(&encode(DecisionSource::Approval, DecisionAct::Done, "x")), None);
-        assert_eq!(parse(&encode(DecisionSource::Install, DecisionAct::Abort, "x")), None);
+        assert_eq!(
+            parse(&encode(DecisionSource::Goal, DecisionAct::Pause, "x")),
+            None
+        );
+        assert_eq!(
+            parse(&encode(DecisionSource::Autopilot, DecisionAct::Retry, "x")),
+            None
+        );
+        assert_eq!(
+            parse(&encode(DecisionSource::Approval, DecisionAct::Done, "x")),
+            None
+        );
+        assert_eq!(
+            parse(&encode(DecisionSource::Install, DecisionAct::Abort, "x")),
+            None
+        );
         // W1-5: "take over" only makes sense for a goal-loop needs_human task.
-        assert_eq!(parse(&encode(DecisionSource::Kickoff, DecisionAct::Takeover, "x")), None);
-        assert_eq!(parse(&encode(DecisionSource::Approval, DecisionAct::Takeover, "x")), None);
-        assert_eq!(parse(&encode(DecisionSource::Install, DecisionAct::Takeover, "x")), None);
-        assert_eq!(parse(&encode(DecisionSource::Autopilot, DecisionAct::Takeover, "x")), None);
+        assert_eq!(
+            parse(&encode(DecisionSource::Kickoff, DecisionAct::Takeover, "x")),
+            None
+        );
+        assert_eq!(
+            parse(&encode(
+                DecisionSource::Approval,
+                DecisionAct::Takeover,
+                "x"
+            )),
+            None
+        );
+        assert_eq!(
+            parse(&encode(DecisionSource::Install, DecisionAct::Takeover, "x")),
+            None
+        );
+        assert_eq!(
+            parse(&encode(
+                DecisionSource::Autopilot,
+                DecisionAct::Takeover,
+                "x"
+            )),
+            None
+        );
     }
 
     #[test]
@@ -324,12 +407,12 @@ mod tests {
             "duduclaw:new_session",
             "duduclaw:decide:",
             "duduclaw:decide:apv",
-            "duduclaw:decide:apv:ok",     // no id separator
-            "duduclaw:decide:apv:ok:",    // empty id
-            "duduclaw:decide:nope:ok:x",  // unknown source
+            "duduclaw:decide:apv:ok",      // no id separator
+            "duduclaw:decide:apv:ok:",     // empty id
+            "duduclaw:decide:nope:ok:x",   // unknown source
             "duduclaw:decide:apv:maybe:x", // unknown verb
-            "duduclaw:decide:APV:ok:x",   // case-sensitive vocabulary
-            "decide:apv:ok:x",            // missing namespace
+            "duduclaw:decide:APV:ok:x",    // case-sensitive vocabulary
+            "decide:apv:ok:x",             // missing namespace
         ] {
             assert_eq!(parse(data), None, "must refuse {data:?}");
         }
@@ -349,11 +432,19 @@ mod tests {
     fn legacy_install_encoding_still_parses() {
         assert_eq!(
             parse("duduclaw:install_approve:r-1"),
-            Some(DecisionAction { source: DecisionSource::Install, act: DecisionAct::Approve, id: "r-1".into() })
+            Some(DecisionAction {
+                source: DecisionSource::Install,
+                act: DecisionAct::Approve,
+                id: "r-1".into()
+            })
         );
         assert_eq!(
             parse("duduclaw:install_deny:r-1"),
-            Some(DecisionAction { source: DecisionSource::Install, act: DecisionAct::Deny, id: "r-1".into() })
+            Some(DecisionAction {
+                source: DecisionSource::Install,
+                act: DecisionAct::Deny,
+                id: "r-1".into()
+            })
         );
     }
 
@@ -361,15 +452,27 @@ mod tests {
     fn legacy_goal_encoding_still_parses() {
         assert_eq!(
             parse("duduclaw:goal_retry:t-1"),
-            Some(DecisionAction { source: DecisionSource::Goal, act: DecisionAct::Retry, id: "t-1".into() })
+            Some(DecisionAction {
+                source: DecisionSource::Goal,
+                act: DecisionAct::Retry,
+                id: "t-1".into()
+            })
         );
         assert_eq!(
             parse("duduclaw:goal_done:t-1"),
-            Some(DecisionAction { source: DecisionSource::Goal, act: DecisionAct::Done, id: "t-1".into() })
+            Some(DecisionAction {
+                source: DecisionSource::Goal,
+                act: DecisionAct::Done,
+                id: "t-1".into()
+            })
         );
         assert_eq!(
             parse("duduclaw:goal_abort:t-1"),
-            Some(DecisionAction { source: DecisionSource::Goal, act: DecisionAct::Abort, id: "t-1".into() })
+            Some(DecisionAction {
+                source: DecisionSource::Goal,
+                act: DecisionAct::Abort,
+                id: "t-1".into()
+            })
         );
     }
 
@@ -377,11 +480,19 @@ mod tests {
     fn legacy_kickoff_encoding_still_parses() {
         assert_eq!(
             parse("duduclaw:goal_kickoff_ok:ap-9"),
-            Some(DecisionAction { source: DecisionSource::Kickoff, act: DecisionAct::Approve, id: "ap-9".into() })
+            Some(DecisionAction {
+                source: DecisionSource::Kickoff,
+                act: DecisionAct::Approve,
+                id: "ap-9".into()
+            })
         );
         assert_eq!(
             parse("duduclaw:goal_kickoff_no:ap-9"),
-            Some(DecisionAction { source: DecisionSource::Kickoff, act: DecisionAct::Deny, id: "ap-9".into() })
+            Some(DecisionAction {
+                source: DecisionSource::Kickoff,
+                act: DecisionAct::Deny,
+                id: "ap-9".into()
+            })
         );
     }
 
@@ -389,11 +500,19 @@ mod tests {
     fn legacy_broker_encoding_still_parses() {
         assert_eq!(
             parse("duduclaw:approval_ok:ap-1"),
-            Some(DecisionAction { source: DecisionSource::Approval, act: DecisionAct::Approve, id: "ap-1".into() })
+            Some(DecisionAction {
+                source: DecisionSource::Approval,
+                act: DecisionAct::Approve,
+                id: "ap-1".into()
+            })
         );
         assert_eq!(
             parse("duduclaw:approval_no:ap-1"),
-            Some(DecisionAction { source: DecisionSource::Approval, act: DecisionAct::Deny, id: "ap-1".into() })
+            Some(DecisionAction {
+                source: DecisionSource::Approval,
+                act: DecisionAct::Deny,
+                id: "ap-1".into()
+            })
         );
     }
 
@@ -401,21 +520,49 @@ mod tests {
     fn legacy_autopilot_encoding_still_parses() {
         assert_eq!(
             parse("duduclaw:autopilot_pause:r-1"),
-            Some(DecisionAction { source: DecisionSource::Autopilot, act: DecisionAct::Pause, id: "r-1".into() })
+            Some(DecisionAction {
+                source: DecisionSource::Autopilot,
+                act: DecisionAct::Pause,
+                id: "r-1".into()
+            })
         );
     }
 
     #[test]
     fn legacy_and_unified_encodings_decode_identically() {
         let pairs = [
-            ("duduclaw:install_approve:x", DecisionSource::Install, DecisionAct::Approve),
-            ("duduclaw:goal_abort:x", DecisionSource::Goal, DecisionAct::Abort),
-            ("duduclaw:goal_kickoff_no:x", DecisionSource::Kickoff, DecisionAct::Deny),
-            ("duduclaw:approval_ok:x", DecisionSource::Approval, DecisionAct::Approve),
-            ("duduclaw:autopilot_pause:x", DecisionSource::Autopilot, DecisionAct::Pause),
+            (
+                "duduclaw:install_approve:x",
+                DecisionSource::Install,
+                DecisionAct::Approve,
+            ),
+            (
+                "duduclaw:goal_abort:x",
+                DecisionSource::Goal,
+                DecisionAct::Abort,
+            ),
+            (
+                "duduclaw:goal_kickoff_no:x",
+                DecisionSource::Kickoff,
+                DecisionAct::Deny,
+            ),
+            (
+                "duduclaw:approval_ok:x",
+                DecisionSource::Approval,
+                DecisionAct::Approve,
+            ),
+            (
+                "duduclaw:autopilot_pause:x",
+                DecisionSource::Autopilot,
+                DecisionAct::Pause,
+            ),
         ];
         for (legacy, source, act) in pairs {
-            assert_eq!(parse(legacy), parse(&encode(source, act, "x")), "legacy {legacy} must be equivalent");
+            assert_eq!(
+                parse(legacy),
+                parse(&encode(source, act, "x")),
+                "legacy {legacy} must be equivalent"
+            );
         }
     }
 
@@ -473,8 +620,16 @@ mod tests {
 
     #[test]
     fn approve_helper_matches_the_act() {
-        let a = DecisionAction { source: DecisionSource::Approval, act: DecisionAct::Approve, id: "x".into() };
-        let d = DecisionAction { source: DecisionSource::Approval, act: DecisionAct::Deny, id: "x".into() };
+        let a = DecisionAction {
+            source: DecisionSource::Approval,
+            act: DecisionAct::Approve,
+            id: "x".into(),
+        };
+        let d = DecisionAction {
+            source: DecisionSource::Approval,
+            act: DecisionAct::Deny,
+            id: "x".into(),
+        };
         assert!(a.approve());
         assert!(!d.approve());
     }

@@ -223,7 +223,11 @@ pub fn record_action(home_dir: &Path, notify_type: &str, ref_id: &str) {
 /// Rows outside `[since, now]` are ignored. An action is matched to its push
 /// by `ref`, so an action whose push has aged out of the window does not
 /// produce a >100% rate.
-pub fn aggregate(events: &[NotifyEvent], since: DateTime<Utc>, now: DateTime<Utc>) -> Vec<NotifyTypeStat> {
+pub fn aggregate(
+    events: &[NotifyEvent],
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Vec<NotifyTypeStat> {
     // type → set of pushed refs, count of pushes, count of un-referenced pushes
     let mut pushed: HashMap<String, u64> = HashMap::new();
     let mut pushed_refs: HashMap<String, HashSet<String>> = HashMap::new();
@@ -238,12 +242,18 @@ pub fn aggregate(events: &[NotifyEvent], since: DateTime<Utc>, now: DateTime<Utc
             "push" => {
                 *pushed.entry(e.notify_type.clone()).or_insert(0) += 1;
                 if let Some(r) = &e.ref_id {
-                    pushed_refs.entry(e.notify_type.clone()).or_default().insert(r.clone());
+                    pushed_refs
+                        .entry(e.notify_type.clone())
+                        .or_default()
+                        .insert(r.clone());
                 }
             }
             "action" => {
                 if let Some(r) = &e.ref_id {
-                    acted_refs.entry(e.notify_type.clone()).or_default().insert(r.clone());
+                    acted_refs
+                        .entry(e.notify_type.clone())
+                        .or_default()
+                        .insert(r.clone());
                 }
             }
             _ => {}
@@ -378,17 +388,26 @@ mod tests {
         let (since, now) = window();
         let events = vec![
             // Push is 40 days old — outside the window.
-            push("decision.goal", Some("old"), now - chrono::Duration::days(40)),
+            push(
+                "decision.goal",
+                Some("old"),
+                now - chrono::Duration::days(40),
+            ),
             action("decision.goal", "old", now - chrono::Duration::hours(1)),
         ];
-        assert!(aggregate(&events, since, now).is_empty(), "no in-window push ⇒ no row");
+        assert!(
+            aggregate(&events, since, now).is_empty(),
+            "no in-window push ⇒ no row"
+        );
     }
 
     #[test]
     fn un_actionable_pushes_are_counted_but_never_flagged_broken() {
         let (since, now) = window();
         let t = now - chrono::Duration::hours(1);
-        let events: Vec<_> = (0..50).map(|_| push("evolution.stagnation", None, t)).collect();
+        let events: Vec<_> = (0..50)
+            .map(|_| push("evolution.stagnation", None, t))
+            .collect();
         let stats = aggregate(&events, since, now);
         assert_eq!(stats[0].pushed, 50);
         assert_eq!(stats[0].actionable, 0);
@@ -428,7 +447,10 @@ mod tests {
             events.push(action("decision.kickoff", &format!("k{i}"), t));
         }
         let stats = aggregate(&events, since, now);
-        assert!(!stats[0].broken, "the rule is 'less than 50%', not 'at most'");
+        assert!(
+            !stats[0].broken,
+            "the rule is 'less than 50%', not 'at most'"
+        );
     }
 
     #[test]
@@ -489,18 +511,34 @@ mod tests {
     #[test]
     fn recorded_events_come_back_out_of_the_store() {
         let dir = tempfile::tempdir().unwrap();
-        record_push(dir.path(), "decision.approval", NotifyLevel::Act, Some("apv-1"));
-        record_push(dir.path(), "decision.approval", NotifyLevel::Act, Some("apv-2"));
+        record_push(
+            dir.path(),
+            "decision.approval",
+            NotifyLevel::Act,
+            Some("apv-1"),
+        );
+        record_push(
+            dir.path(),
+            "decision.approval",
+            NotifyLevel::Act,
+            Some("apv-2"),
+        );
         record_action(dir.path(), "decision.approval", "apv-1");
         record_push(dir.path(), "evolution.stagnation", NotifyLevel::Fyi, None);
 
         let stats = stats(dir.path(), 30);
-        let approval = stats.iter().find(|s| s.notify_type == "decision.approval").unwrap();
+        let approval = stats
+            .iter()
+            .find(|s| s.notify_type == "decision.approval")
+            .unwrap();
         assert_eq!(approval.pushed, 2);
         assert_eq!(approval.acted, 1);
         assert!((approval.action_rate - 0.5).abs() < 1e-9);
 
-        let stagnation = stats.iter().find(|s| s.notify_type == "evolution.stagnation").unwrap();
+        let stagnation = stats
+            .iter()
+            .find(|s| s.notify_type == "evolution.stagnation")
+            .unwrap();
         assert_eq!(stagnation.pushed, 1);
         assert_eq!(stagnation.actionable, 0);
     }

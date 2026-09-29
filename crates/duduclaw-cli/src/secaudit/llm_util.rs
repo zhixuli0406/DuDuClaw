@@ -178,7 +178,10 @@ mod tests {
 
     #[test]
     fn escape_xml_tag_is_a_no_op_on_benign_content() {
-        assert_eq!(escape_xml_tag("just code, no tags here", "file_content"), "just code, no tags here");
+        assert_eq!(
+            escape_xml_tag("just code, no tags here", "file_content"),
+            "just code, no tags here"
+        );
     }
 
     // ── strip_json_fences ────────────────────────────────────────────

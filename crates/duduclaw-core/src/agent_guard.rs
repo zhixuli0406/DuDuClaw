@@ -53,6 +53,25 @@ pub enum GuardDecision {
         /// Human-readable `field：「before」→「after」` entries.
         changed: Vec<String>,
     },
+    /// Team-as-Agent review P1: the write would change `[capabilities]` in a
+    /// canonical `agent.toml` — the permission envelope every tool gate reads
+    /// (`allowed_tools` / `denied_tools`, the `computer_use` /
+    /// `browser_via_bash` / `os_native` / `git_credentials` master switches,
+    /// `db_sources`, the approval / irreversible / scoped tool lists,
+    /// `autonomy_level`, `wiki_visible_to`).
+    ///
+    /// Distinct from [`Self::BlockedOrgFieldChange`] only in the message: the
+    /// org fields answer "who may command whom", these answer "what may this
+    /// employee do at all". A role member of a team runs with the employee's
+    /// workspace as its cwd, so the file-guard hook reads it as the employee
+    /// itself — which made this file the one place a cheap third-party model
+    /// could widen the very envelope that is supposed to contain it.
+    BlockedProtectedField {
+        file_name: String,
+        attempted_path: PathBuf,
+        /// Human-readable `capabilities.<key>：「before」→「after」` entries.
+        changed: Vec<String>,
+    },
     /// WP21 欠帳 ②: the write would change a protected section of
     /// `<home>/config.toml` (`[delegation]` / `[acp]`) — the policy and trust
     /// switches the delegation gate itself consults.
@@ -158,6 +177,15 @@ impl GuardDecision {
                 attempted_path.display(),
                 changed.join("；")
             )),
+            Self::BlockedProtectedField { attempted_path, changed, .. } => Some(format!(
+                "已封鎖：權限設定（agent.toml 的 [capabilities] 段）不可直接修改，請透過 agent_update 或儀表板調整。\n\
+                 檔案：{}\n\
+                 偵測到的變更：{}\n\
+                 原因：這一段定義了這位 AI 員工能用哪些工具、能不能操作電腦／瀏覽器／資料庫，\
+                 允許執行中的程序自行改寫等同自助提權。",
+                attempted_path.display(),
+                changed.join("；")
+            )),
             Self::BlockedProtectedSection { attempted_path, changed, .. } => Some(format!(
                 "已封鎖：委派設定（config.toml 的 [delegation] / [acp] 段）不可直接修改，請透過儀表板或由管理者調整。\n\
                  檔案：{}\n\
@@ -175,8 +203,8 @@ impl GuardDecision {
             )),
             Self::BlockedBashProtectedWrite { file_name, verb } => Some(format!(
                 "已封鎖：偵測到可能改寫 {} 的 shell 指令（含 `{}`）。\n\
-                 組織欄位（name/reports_to/department）、委派設定與身分設定不可直接修改，\
-                 請透過 agent_update 或儀表板調整。",
+                 組織欄位（name/reports_to/department）、權限設定（[capabilities]）、\
+                 委派設定與身分設定不可直接修改，請透過 agent_update 或儀表板調整。",
                 file_name, verb
             )),
             Self::BlockedIdentitySurface { file_name, attempted_path, reason } => Some(format!(

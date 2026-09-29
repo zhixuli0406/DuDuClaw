@@ -394,8 +394,8 @@ pub fn set_entry(
     ttl_hours: Option<f64>,
     expected_value: Option<&str>,
 ) -> Result<MutateOutcome, String> {
-    let state_dir =
-        resolve_state_dir(home_dir, agent_id).ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+    let state_dir = resolve_state_dir(home_dir, agent_id)
+        .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
     validate_key(key)?;
     let (value, v_trunc) = normalize_field(value, VALUE_CHAR_CAP);
     if value.is_empty() {
@@ -488,8 +488,8 @@ pub fn clear_entry(
     key: &str,
     reason: &str,
 ) -> Result<MutateOutcome, String> {
-    let state_dir =
-        resolve_state_dir(home_dir, agent_id).ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+    let state_dir = resolve_state_dir(home_dir, agent_id)
+        .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
     validate_key(key)?;
     let (reason, r_trunc) = normalize_field(reason, REASON_CHAR_CAP);
     if reason.is_empty() {
@@ -551,46 +551,55 @@ pub fn set_handoff(
     evidence: Option<&str>,
     blocker: Option<&str>,
 ) -> Result<MutateOutcome, String> {
-    let state_dir =
-        resolve_state_dir(home_dir, agent_id).ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+    let state_dir = resolve_state_dir(home_dir, agent_id)
+        .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
 
-    let structured = status.is_some() || next_steps.is_some() || evidence.is_some() || blocker.is_some();
+    let structured =
+        status.is_some() || next_steps.is_some() || evidence.is_some() || blocker.is_some();
 
-    let (note_out, status_out, next_steps_out, evidence_out, blocker_out, truncated) = if !structured {
-        let (note, truncated) = normalize_field(note, HANDOFF_CHAR_CAP);
-        if note.is_empty() {
-            return Err("note 不可為空".to_string());
-        }
-        (note, None, None, None, None, truncated)
-    } else {
-        let status = status.ok_or_else(|| {
-            "提供 next_steps / evidence / blocker 時必須同時指定 status \
+    let (note_out, status_out, next_steps_out, evidence_out, blocker_out, truncated) =
+        if !structured {
+            let (note, truncated) = normalize_field(note, HANDOFF_CHAR_CAP);
+            if note.is_empty() {
+                return Err("note 不可為空".to_string());
+            }
+            (note, None, None, None, None, truncated)
+        } else {
+            let status = status.ok_or_else(|| {
+                "提供 next_steps / evidence / blocker 時必須同時指定 status \
              （continue/complete/blocked），否則無法判斷這些欄位的語意角色"
-                .to_string()
-        })?;
-        // Reject-not-truncate on the RAW, pre-flatten input — see
-        // `check_handoff_byte_budget` doc comment for why.
-        let raw_total = note.len()
-            + next_steps.unwrap_or("").len()
-            + evidence.unwrap_or("").len()
-            + blocker.unwrap_or("").len();
-        check_handoff_byte_budget(home_dir, raw_total)?;
+                    .to_string()
+            })?;
+            // Reject-not-truncate on the RAW, pre-flatten input — see
+            // `check_handoff_byte_budget` doc comment for why.
+            let raw_total = note.len()
+                + next_steps.unwrap_or("").len()
+                + evidence.unwrap_or("").len()
+                + blocker.unwrap_or("").len();
+            check_handoff_byte_budget(home_dir, raw_total)?;
 
-        let note_flat = one_line(note);
-        if note_flat.is_empty() {
-            return Err("note 不可為空".to_string());
-        }
-        let next_steps_flat = next_steps.map(one_line).filter(|s| !s.is_empty());
-        let evidence_flat = evidence.map(one_line).filter(|s| !s.is_empty());
-        let blocker_flat = blocker.map(one_line).filter(|s| !s.is_empty());
-        validate_handoff_status(
-            status,
-            next_steps_flat.as_deref(),
-            evidence_flat.as_deref(),
-            blocker_flat.as_deref(),
-        )?;
-        (note_flat, Some(status), next_steps_flat, evidence_flat, blocker_flat, false)
-    };
+            let note_flat = one_line(note);
+            if note_flat.is_empty() {
+                return Err("note 不可為空".to_string());
+            }
+            let next_steps_flat = next_steps.map(one_line).filter(|s| !s.is_empty());
+            let evidence_flat = evidence.map(one_line).filter(|s| !s.is_empty());
+            let blocker_flat = blocker.map(one_line).filter(|s| !s.is_empty());
+            validate_handoff_status(
+                status,
+                next_steps_flat.as_deref(),
+                evidence_flat.as_deref(),
+                blocker_flat.as_deref(),
+            )?;
+            (
+                note_flat,
+                Some(status),
+                next_steps_flat,
+                evidence_flat,
+                blocker_flat,
+                false,
+            )
+        };
 
     with_file_lock(&state_file(&state_dir), || {
         let mut state = load(&state_dir);
@@ -622,7 +631,11 @@ pub fn set_handoff(
                 "version": state.version,
             }),
         );
-        Ok(Ok(MutateOutcome { version: state.version, superseded: prev, truncated }))
+        Ok(Ok(MutateOutcome {
+            version: state.version,
+            superseded: prev,
+            truncated,
+        }))
     })
     .map_err(|e| format!("working state 寫入失敗：{e}"))?
 }
@@ -643,15 +656,23 @@ pub fn get_entry(home_dir: &Path, agent_id: &str, key: &str) -> Option<StateEntr
     let state_dir = resolve_state_dir(home_dir, agent_id)?;
     let state = load(&state_dir);
     let now = now_rfc3339();
-    state.states.get(key).filter(|e| !is_expired(e, &now)).cloned()
+    state
+        .states
+        .get(key)
+        .filter(|e| !is_expired(e, &now))
+        .cloned()
 }
 
 /// Full read for the `working_state_get` MCP tool: current state (expired
 /// entries flagged, not hidden — the read tool is the debugging surface)
 /// plus the most recent history records.
-pub fn read_full(home_dir: &Path, agent_id: &str, history_limit: usize) -> Result<serde_json::Value, String> {
-    let state_dir =
-        resolve_state_dir(home_dir, agent_id).ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+pub fn read_full(
+    home_dir: &Path,
+    agent_id: &str,
+    history_limit: usize,
+) -> Result<serde_json::Value, String> {
+    let state_dir = resolve_state_dir(home_dir, agent_id)
+        .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
     let state = load(&state_dir);
     let now = now_rfc3339();
     let states: serde_json::Map<String, serde_json::Value> = state
@@ -660,7 +681,10 @@ pub fn read_full(home_dir: &Path, agent_id: &str, history_limit: usize) -> Resul
         .map(|(k, e)| {
             let mut v = serde_json::to_value(e).unwrap_or_else(|_| serde_json::json!({}));
             if let Some(obj) = v.as_object_mut() {
-                obj.insert("expired".into(), serde_json::Value::Bool(is_expired(e, &now)));
+                obj.insert(
+                    "expired".into(),
+                    serde_json::Value::Bool(is_expired(e, &now)),
+                );
             }
             (k.clone(), v)
         })
@@ -697,8 +721,10 @@ fn read_history_tail(state_dir: &Path, limit: usize) -> Vec<serde_json::Value> {
     } else {
         &text[..]
     };
-    let mut rows: Vec<serde_json::Value> =
-        text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let mut rows: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
     if rows.len() > limit {
         rows.drain(..rows.len() - limit);
     }
@@ -708,7 +734,10 @@ fn read_history_tail(state_dir: &Path, limit: usize) -> Vec<serde_json::Value> {
 /// Local-time display ("MM-DD HH:MM") for injected lines.
 fn display_time(ts: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(ts) {
-        Ok(dt) => dt.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string(),
+        Ok(dt) => dt
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string(),
         Err(_) => truncate_chars(ts, 16),
     }
 }
@@ -729,8 +758,11 @@ pub fn build_working_state_section(home_dir: &Path, agent_id: &str) -> Option<St
     // Expired entries are pruned from the AUTHORITY view (a stale intraday
     // stop-loss must not be tomorrow's authority) — the file keeps them for
     // `working_state_get` / history inspection.
-    let mut live: Vec<(&String, &StateEntry)> =
-        state.states.iter().filter(|(_, e)| !is_expired(e, &now)).collect();
+    let mut live: Vec<(&String, &StateEntry)> = state
+        .states
+        .iter()
+        .filter(|(_, e)| !is_expired(e, &now))
+        .collect();
     let handoff = state.handoff.as_ref();
     if live.is_empty() && handoff.is_none() {
         return None;
@@ -756,7 +788,11 @@ pub fn build_working_state_section(home_dir: &Path, agent_id: &str) -> Option<St
         ));
     }
     let handoff_line = handoff.map(|h| {
-        let base = format!("交接註記（{} 留）：{}", display_time(&h.updated_at), one_line(&h.note));
+        let base = format!(
+            "交接註記（{} 留）：{}",
+            display_time(&h.updated_at),
+            one_line(&h.note)
+        );
         // H8: when the handoff carries a structured Ralph-style report,
         // surface status/next_steps/evidence/blocker too — otherwise they'd
         // be persisted but invisible to the very next wake-up they exist
@@ -798,7 +834,9 @@ pub fn build_working_state_section(home_dir: &Path, agent_id: &str) -> Option<St
 
     let mut body: Vec<String> = lines.into_iter().map(|(_, l)| l).collect();
     if omitted > 0 {
-        body.push(format!("（其餘 {omitted} 項已省略，用 working_state_get 查全量）"));
+        body.push(format!(
+            "（其餘 {omitted} 項已省略，用 working_state_get 查全量）"
+        ));
     }
     if let Some(l) = handoff_line {
         body.push(l);
@@ -830,15 +868,29 @@ mod tests {
     #[test]
     fn set_creates_then_supersedes_with_history() {
         let home = mk_home("trader");
-        let out =
-            set_entry(home.path(), "trader", "stop_loss.2317", "262", "跌破即出場", None, None)
-                .unwrap();
+        let out = set_entry(
+            home.path(),
+            "trader",
+            "stop_loss.2317",
+            "262",
+            "跌破即出場",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(out.version, 1);
         assert!(out.superseded.is_none());
 
-        let out2 =
-            set_entry(home.path(), "trader", "stop_loss.2317", "257", "收盤覆盤下修", None, None)
-                .unwrap();
+        let out2 = set_entry(
+            home.path(),
+            "trader",
+            "stop_loss.2317",
+            "257",
+            "收盤覆盤下修",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(out2.version, 2);
         assert_eq!(out2.superseded.as_deref(), Some("262"));
 
@@ -852,8 +904,16 @@ mod tests {
     #[test]
     fn clear_removes_and_records_reason() {
         let home = mk_home("trader");
-        set_entry(home.path(), "trader", "position_cap", "96%", "留手續費緩衝", None, None)
-            .unwrap();
+        set_entry(
+            home.path(),
+            "trader",
+            "position_cap",
+            "96%",
+            "留手續費緩衝",
+            None,
+            None,
+        )
+        .unwrap();
         let out = clear_entry(home.path(), "trader", "position_cap", "已清倉").unwrap();
         assert_eq!(out.superseded.as_deref(), Some("96%"));
         assert!(clear_entry(home.path(), "trader", "position_cap", "再刪一次").is_err());
@@ -865,7 +925,16 @@ mod tests {
     #[test]
     fn cas_mismatch_refuses_and_reports_current() {
         let home = mk_home("trader");
-        set_entry(home.path(), "trader", "stop_loss.2317", "262", "盤前設定", None, None).unwrap();
+        set_entry(
+            home.path(),
+            "trader",
+            "stop_loss.2317",
+            "262",
+            "盤前設定",
+            None,
+            None,
+        )
+        .unwrap();
         let err = set_entry(
             home.path(),
             "trader",
@@ -905,7 +974,16 @@ mod tests {
     fn expired_entries_leave_the_authority_section_but_stay_readable() {
         let home = mk_home("trader");
         set_entry(home.path(), "trader", "keep", "1", "r", None, None).unwrap();
-        set_entry(home.path(), "trader", "day_rule", "262", "今日停損", Some(0.01), None).unwrap();
+        set_entry(
+            home.path(),
+            "trader",
+            "day_rule",
+            "262",
+            "今日停損",
+            Some(0.01),
+            None,
+        )
+        .unwrap();
         // Force expiry by rewriting the stored expires_at into the past.
         let state_dir = home.path().join("agents/trader/state");
         let mut st = load(&state_dir);
@@ -925,8 +1003,16 @@ mod tests {
     #[test]
     fn get_entry_returns_live_value() {
         let home = mk_home("trader");
-        set_entry(home.path(), "trader", "pending_update_report", "{\"target\":\"system\"}", "r", Some(4.0), None)
-            .unwrap();
+        set_entry(
+            home.path(),
+            "trader",
+            "pending_update_report",
+            "{\"target\":\"system\"}",
+            "r",
+            Some(4.0),
+            None,
+        )
+        .unwrap();
         let entry = get_entry(home.path(), "trader", "pending_update_report").unwrap();
         assert_eq!(entry.value, "{\"target\":\"system\"}");
     }
@@ -934,7 +1020,16 @@ mod tests {
     #[test]
     fn get_entry_hides_expired_value_same_as_missing() {
         let home = mk_home("trader");
-        set_entry(home.path(), "trader", "day_rule", "262", "今日", Some(0.01), None).unwrap();
+        set_entry(
+            home.path(),
+            "trader",
+            "day_rule",
+            "262",
+            "今日",
+            Some(0.01),
+            None,
+        )
+        .unwrap();
         let state_dir = home.path().join("agents/trader/state");
         let mut st = load(&state_dir);
         st.states.get_mut("day_rule").unwrap().expires_at =
@@ -953,15 +1048,32 @@ mod tests {
     #[test]
     fn expired_entry_does_not_satisfy_cas() {
         let home = mk_home("trader");
-        set_entry(home.path(), "trader", "day_rule", "262", "今日", Some(0.01), None).unwrap();
+        set_entry(
+            home.path(),
+            "trader",
+            "day_rule",
+            "262",
+            "今日",
+            Some(0.01),
+            None,
+        )
+        .unwrap();
         let state_dir = home.path().join("agents/trader/state");
         let mut st = load(&state_dir);
         st.states.get_mut("day_rule").unwrap().expires_at =
             Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
         persist(&state_dir, &st).unwrap();
         // CAS against the expired value must refuse — it is history now.
-        let err = set_entry(home.path(), "trader", "day_rule", "257", "r", None, Some("262"))
-            .unwrap_err();
+        let err = set_entry(
+            home.path(),
+            "trader",
+            "day_rule",
+            "257",
+            "r",
+            None,
+            Some("262"),
+        )
+        .unwrap_err();
         assert!(err.contains("無此鍵"));
     }
 
@@ -979,7 +1091,16 @@ mod tests {
     fn key_cap_refuses_with_key_list() {
         let home = mk_home("trader");
         for i in 0..MAX_KEYS {
-            set_entry(home.path(), "trader", &format!("k{i}"), "v", "r", None, None).unwrap();
+            set_entry(
+                home.path(),
+                "trader",
+                &format!("k{i}"),
+                "v",
+                "r",
+                None,
+                None,
+            )
+            .unwrap();
         }
         let err = set_entry(home.path(), "trader", "overflow", "v", "r", None, None).unwrap_err();
         assert!(err.contains("上限"));
@@ -1016,9 +1137,26 @@ mod tests {
     #[test]
     fn handoff_overwrites_and_renders() {
         let home = mk_home("trader");
-        set_handoff(home.path(), "trader", "帳務已核對\n盤中巡檢中", None, None, None, None).unwrap();
-        let out =
-            set_handoff(home.path(), "trader", "收盤，明日看 257", None, None, None, None).unwrap();
+        set_handoff(
+            home.path(),
+            "trader",
+            "帳務已核對\n盤中巡檢中",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let out = set_handoff(
+            home.path(),
+            "trader",
+            "收盤，明日看 257",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(out.superseded.as_deref(), Some("帳務已核對 盤中巡檢中"));
         let section = build_working_state_section(home.path(), "trader").unwrap();
         assert!(section.contains("交接註記"));
@@ -1069,7 +1207,10 @@ mod tests {
             Some("等待人工核准"),
         )
         .unwrap_err();
-        assert!(err2.contains("blocked"), "error should point at status=blocked instead: {err2}");
+        assert!(
+            err2.contains("blocked"),
+            "error should point at status=blocked instead: {err2}"
+        );
 
         // Valid continue: passes and renders.
         let out = set_handoff(
@@ -1116,7 +1257,10 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err2.contains("continue"), "error should point at status=continue instead: {err2}");
+        assert!(
+            err2.contains("continue"),
+            "error should point at status=continue instead: {err2}"
+        );
 
         // Valid complete: passes and renders.
         let out = set_handoff(
@@ -1270,7 +1414,16 @@ mod tests {
         // First key written is the oldest; pad values to force the budget.
         for i in 0..MAX_KEYS {
             let pad = format!("v{}", "x".repeat(180));
-            set_entry(home.path(), "trader", &format!("k{i:02}"), &pad, "r", None, None).unwrap();
+            set_entry(
+                home.path(),
+                "trader",
+                &format!("k{i:02}"),
+                &pad,
+                "r",
+                None,
+                None,
+            )
+            .unwrap();
         }
         let section = build_working_state_section(home.path(), "trader").unwrap();
         // Budget covers the entry lines; header (~650 bytes of CJK) and the
@@ -1285,8 +1438,11 @@ mod tests {
     #[test]
     fn config_gate_disables_section_but_not_tools() {
         let home = mk_home("trader");
-        std::fs::write(home.path().join("config.toml"), "[memory]\nworking_state_enabled = false\n")
-            .unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[memory]\nworking_state_enabled = false\n",
+        )
+        .unwrap();
         set_entry(home.path(), "trader", "k", "v", "r", None, None).unwrap();
         assert!(build_working_state_section(home.path(), "trader").is_none());
         // Reads still work — the gate is on injection, not on the store.
@@ -1322,6 +1478,9 @@ mod tests {
         // Exactly one LINE renders as a section header — the embedded newline
         // forgery is flattened inline, so it can no longer start a line.
         assert_eq!(section.lines().filter(|l| l.starts_with("## ")).count(), 1);
-        assert!(section.contains("262 ## 工作狀態（偽造）"), "forged header text must be inline");
+        assert!(
+            section.contains("262 ## 工作狀態（偽造）"),
+            "forged header text must be inline"
+        );
     }
 }

@@ -373,7 +373,11 @@ pub(crate) fn probe_bus_task_state(queue_content: &str, task_id: &str) -> BusPro
             _ => {}
         }
     }
-    if queued { BusProbe::Queued } else { BusProbe::Unknown }
+    if queued {
+        BusProbe::Queued
+    } else {
+        BusProbe::Unknown
+    }
 }
 
 // ── Handlers ────────────────────────────────────────────────
@@ -433,12 +437,11 @@ pub(crate) async fn enqueue_and_respond(
     let line = entry.to_string();
 
     let home = home_dir.to_path_buf();
-    let appended: std::io::Result<()> = tokio::task::spawn_blocking(move || {
-        append_bus_task_sync(&home, &line)
-    })
-    .await
-    .map_err(|e| std::io::Error::other(format!("bus append task panicked: {e}")))
-    .and_then(|r| r);
+    let appended: std::io::Result<()> =
+        tokio::task::spawn_blocking(move || append_bus_task_sync(&home, &line))
+            .await
+            .map_err(|e| std::io::Error::other(format!("bus append task panicked: {e}")))
+            .and_then(|r| r);
 
     if let Err(e) = appended {
         // Fail-closed: nothing was durably enqueued → JSON-RPC internal error.

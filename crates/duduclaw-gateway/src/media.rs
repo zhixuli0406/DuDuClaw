@@ -64,8 +64,7 @@ pub fn detect_mime(data: &[u8]) -> String {
 /// Resize an image to fit within MAX_IMAGE_DIM, maintaining aspect ratio.
 /// Returns JPEG bytes at 85% quality.
 pub fn resize_image(data: &[u8], max_dim: u32) -> Result<Vec<u8>, String> {
-    let img = image::load_from_memory(data)
-        .map_err(|e| format!("Failed to decode image: {e}"))?;
+    let img = image::load_from_memory(data).map_err(|e| format!("Failed to decode image: {e}"))?;
 
     let (w, h) = (img.width(), img.height());
     let max_side = w.max(h);
@@ -187,7 +186,13 @@ pub async fn save_attachment_in_base_untracked(
     // Sanitize filename: keep only safe characters
     let safe_name: String = filename
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -216,18 +221,26 @@ fn record_ext_gap_signal(base_dir: &std::path::Path, filename: &str) {
     let Some(agent_id) = base_dir.file_name().and_then(|n| n.to_str()) else {
         return;
     };
-    let Some(parent) = base_dir.parent() else { return };
+    let Some(parent) = base_dir.parent() else {
+        return;
+    };
     if parent.file_name().and_then(|n| n.to_str()) != Some("agents") {
         return; // shared-home fallback — no agent to attribute the gap to.
     }
-    let Some(home_dir) = parent.parent() else { return };
+    let Some(home_dir) = parent.parent() else {
+        return;
+    };
     let _ = duduclaw_agent::skill_ext_gap::record_attachment(home_dir, agent_id, filename);
 }
 
 /// Format an attachment reference for inclusion in message text sent to the agent.
 ///
 /// Returns a markdown-style line like `[📎 photo.jpg (image)](file:///path/to/file)`.
-pub fn format_attachment_ref(media_type: &MediaType, filename: &str, path: &std::path::Path) -> String {
+pub fn format_attachment_ref(
+    media_type: &MediaType,
+    filename: &str,
+    path: &std::path::Path,
+) -> String {
     let emoji = match media_type {
         MediaType::Image => "🖼️",
         MediaType::Audio => "🎵",
@@ -241,7 +254,10 @@ pub fn format_attachment_ref(media_type: &MediaType, filename: &str, path: &std:
         MediaType::File => "file",
     };
     let hint = data_file_tool_hint(filename);
-    format!("[{emoji} {filename} ({type_label})]({}){hint}", path.display())
+    format!(
+        "[{emoji} {filename} ({type_label})]({}){hint}",
+        path.display()
+    )
 }
 
 /// Extensions whose content must reach the model through an MCP tool, never
@@ -250,8 +266,9 @@ pub fn format_attachment_ref(media_type: &MediaType, filename: &str, path: &std:
 /// `data-file-guard` hook actively refuses the built-in one — so an
 /// attachment reference that did not say which tool to use would hand the
 /// model a path it is about to be blocked from opening.
-const DATA_FILE_HINT_EXTENSIONS: &[&str] =
-    &["csv", "tsv", "xlsx", "xlsm", "xls", "ods", "txt", "md", "json"];
+const DATA_FILE_HINT_EXTENSIONS: &[&str] = &[
+    "csv", "tsv", "xlsx", "xlsm", "xls", "ods", "txt", "md", "json",
+];
 
 /// The sentence appended to an attachment reference for a readable data file.
 /// Empty for every other extension, so those references stay byte-identical.
@@ -284,7 +301,10 @@ pub async fn download_url(
     if let Some((key, value)) = auth_header {
         req = req.header(key, value);
     }
-    let resp = req.send().await.map_err(|e| format!("Download failed: {e}"))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {e}"))?;
 
     if let Some(len) = resp.content_length() {
         if len > max_bytes as u64 {
@@ -292,9 +312,15 @@ pub async fn download_url(
         }
     }
 
-    let bytes = resp.bytes().await.map_err(|e| format!("Download bytes: {e}"))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Download bytes: {e}"))?;
     if bytes.len() > max_bytes {
-        return Err(format!("File too large: {} bytes (max {max_bytes})", bytes.len()));
+        return Err(format!(
+            "File too large: {} bytes (max {max_bytes})",
+            bytes.len()
+        ));
     }
     Ok(bytes.to_vec())
 }
@@ -360,13 +386,9 @@ pub fn mime_from_extension(ext: &str) -> &'static str {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "pdf" => "application/pdf",
-        "docx" => {
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        }
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "pptx" => {
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-        }
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "doc" => "application/msword",
         "xls" => "application/vnd.ms-excel",
         "ppt" => "application/vnd.ms-powerpoint",
@@ -418,7 +440,10 @@ mod tests {
 
     #[test]
     fn test_detect_mime_unknown() {
-        assert_eq!(detect_mime(&[0x00, 0x00, 0x00, 0x00]), "application/octet-stream");
+        assert_eq!(
+            detect_mime(&[0x00, 0x00, 0x00, 0x00]),
+            "application/octet-stream"
+        );
     }
 
     #[test]
@@ -493,11 +518,18 @@ mod tests {
     #[test]
     fn attachment_ref_hint_covers_every_readable_extension_case_insensitively() {
         for name in [
-            "a.csv", "a.tsv", "a.XLSX", "a.xlsm", "a.xls", "a.ods", "a.txt", "notes.MD",
-            "data.json", "客戶清單.xlsx",
+            "a.csv",
+            "a.tsv",
+            "a.XLSX",
+            "a.xlsm",
+            "a.xls",
+            "a.ods",
+            "a.txt",
+            "notes.MD",
+            "data.json",
+            "客戶清單.xlsx",
         ] {
-            let line =
-                format_attachment_ref(&MediaType::File, name, std::path::Path::new("/a"));
+            let line = format_attachment_ref(&MediaType::File, name, std::path::Path::new("/a"));
             assert!(line.contains("csv_read"), "{name} should be hinted: {line}");
         }
     }
@@ -534,7 +566,13 @@ mod tests {
             .unwrap();
         assert!(path.is_file());
         assert!(path.starts_with(tmp.join("attachments")));
-        assert!(path.file_name().unwrap().to_str().unwrap().ends_with("_report.xlsx"));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("_report.xlsx")
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

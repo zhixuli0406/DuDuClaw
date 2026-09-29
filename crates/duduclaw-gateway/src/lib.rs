@@ -41,6 +41,12 @@ pub mod device;
 // ── System-settings app: `device.about` / `device.timedate*` data ─────────
 pub mod device_about;
 pub mod device_ops;
+// ── O16: the single authority behind every `os_*` device/system capability.
+// The MCP tools (`duduclaw-cli::mcp_os_ops`), the operator CLI leaves
+// (`duduclaw-cli::os_drive`) and the dashboard `device.*`/`network.*` RPCs
+// are all thin adapters over this module — gate, parse, render, nothing
+// more. See its module doc for what is deliberately NOT consolidated. ─────
+pub mod os_ops;
 pub mod os_update;
 pub mod pre_update_backup;
 // ── A7c: agent→display gateway bridge (comp's shell_control display group,
@@ -59,68 +65,76 @@ pub mod power_local;
 // ── WP-G1: scheduled backups + device-migration restore ──────────────────
 pub mod backup_restore;
 pub mod backup_schedule;
-pub mod watchdog;
+pub(crate) mod causal_ccr_outbox;
 pub mod channel_alerts;
 pub mod channel_capabilities;
 pub mod channel_format;
 pub mod channel_reply;
-pub mod rate_limit_watch;
-pub mod markdown_render;
-pub mod channel_typing;
-pub mod webhook_jwt;
-pub mod googlechat;
-pub mod msteams;
-pub mod wecom;
-pub mod dingtalk;
-pub mod extension;
 pub mod channel_settings;
-pub mod google_apps_script;
-pub mod google_service_account;
-pub mod google_workspace;
-pub mod notion_workspace;
-pub mod github_workspace;
-pub mod config_crypto;
-pub mod consolidation_failures;
+pub mod channel_typing;
 pub mod claude_runner;
+pub mod config_crypto;
+pub mod connector_lifecycle;
+pub mod consolidation_failures;
 pub mod cost_telemetry;
-pub mod doctor_probes;
-pub mod mcp_external;
-pub mod mcp_internal_key;
 pub mod decision_action;
 pub mod decision_capture;
 pub mod decision_card;
+pub mod decision_gate;
 pub mod decision_message_store;
 pub mod decision_notify;
+pub mod dingtalk;
+pub mod doctor_probes;
+pub mod extension;
+pub mod github_workspace;
+pub mod google_apps_script;
+pub mod google_service_account;
+pub mod google_workspace;
+pub mod googlechat;
+pub mod markdown_render;
+pub mod mcp_external;
+pub mod mcp_internal_key;
+pub mod msteams;
+pub mod notion_workspace;
+pub mod rate_limit_watch;
+pub(crate) mod synthetic_connector_adapter;
+pub mod watchdog;
+pub mod webhook_jwt;
+pub mod wecom;
 // WP1.6 (ecosystem): text-reply decisions — replying to a decision card with
 // a bare verb counts as a button press (wrist/watch clients have no buttons).
 pub mod decision_text;
 // W2-4 notification governance: the gate every outbound notification passes
 // through (levels + quiet hours + deferred queue), its action-rate telemetry,
 // and the scheduled daily digest.
-pub mod notify_digest;
-pub mod notify_governance;
-pub mod notify_stats;
-pub mod cron_scheduler;
-pub mod cron_store;
-pub mod cron_templates;
-pub mod license_runtime;
-pub mod takeover;
-pub mod task_store;
-pub mod partner_store;
-pub mod departments;
-pub mod premium_templates;
-pub mod branding;
-pub mod distributor_store;
-pub mod license_serve;
-pub mod license_seed;
-pub mod autopilot_store;
 pub mod autopilot_engine;
 pub mod autopilot_notify;
 pub mod autopilot_screen;
-pub mod security_autopilot;
-pub mod posture_watch;
-pub mod security_rules_seed;
+pub mod autopilot_store;
+pub mod branding;
 pub mod cep_matcher;
+pub mod cron_scheduler;
+pub mod cron_store;
+pub mod cron_templates;
+pub mod departments;
+pub mod distributor_store;
+pub mod license_runtime;
+pub mod license_seed;
+pub mod license_serve;
+pub mod notify_digest;
+pub mod notify_governance;
+// O5 — `push(card, dest)`: the single outbound entry the four notification
+// modules (goal / approval / install / autopilot) share. Authorization and
+// card rendering deliberately stay with them.
+pub(crate) mod notify_push;
+pub mod notify_stats;
+pub mod partner_store;
+pub mod posture_watch;
+pub mod premium_templates;
+pub mod security_autopilot;
+pub mod security_rules_seed;
+pub mod takeover;
+pub mod task_store;
 pub mod tick_config;
 pub mod tick_headers;
 pub mod tick_source;
@@ -129,158 +143,195 @@ pub mod tick_source_ws;
 // WP-E2: box-side relay client (crates/duduclaw-relay's WebSocket
 // counterpart) — reuses tick_source_ws's reconnect-backoff shape, hence the
 // grouping alongside the resident-sensing modules above.
-pub mod relay_client;
-pub mod relay_config;
-pub mod relay_device;
-pub mod rule_induction;
 pub mod approval;
 pub mod approval_notify;
-pub mod codrive;
-pub mod channel_link;
-pub mod deep_link;
-pub(crate) mod local_session;
-pub mod miniapp;
-pub mod expert_admin;
-pub mod expert_generate;
-pub mod capability;
-pub mod capability_grants;
-pub mod maintenance;
-pub mod growth;
-pub mod custom_skills;
-pub mod custom_widgets;
 pub mod audit_export;
 pub mod budget;
+pub mod canvas;
+pub mod capability;
+pub mod capability_grants;
+pub mod channel_link;
+pub mod cli_auth;
+pub mod cli_noise;
+pub mod codrive;
 pub mod cost_anomaly;
-pub mod guardrail;
-pub mod redteam;
-pub mod mast;
-pub mod foresight;
-pub mod security_posture;
-pub mod secaudit_reports;
-pub mod events_store;
+pub mod custom_skills;
+pub mod custom_widgets;
 pub mod dashboard_feedback;
 pub mod dashboard_navigate;
-pub mod os_events;
-pub mod os_frontmost;
-pub mod interruptibility;
-pub mod proactive_gate;
-pub mod proactive_feedback;
-pub mod footprint_distill;
-pub mod profile_distill;
-pub mod persona_induction;
-pub mod situation_classifier;
-pub mod canvas;
-pub mod direct_api;
+pub mod db_source_grants; // §13.7 WP-A: per-agent [capabilities] db_sources grants
+pub mod db_sources_rpc; // §13.7 WP-D: operator RPCs for [db_sources.*]
+pub mod deep_link;
 pub mod delegation;
 /// WP21 C1 — delegation gate on the bus-consumption path (`dispatcher.rs`).
 pub mod delegation_gate;
 pub mod delegation_router;
+pub mod direct_api;
 pub mod discord;
 pub mod discord_voice;
+pub mod dispatcher;
 /// WP-4G — resource ceilings applied to inbound office / compressed documents
 /// before any parser (LibreOffice, the bundled Python skills) is handed them.
 pub mod document_limits;
 pub mod email;
-pub mod dispatcher;
 pub mod ephemeral;
-pub mod message_queue;
+pub mod events_store;
+pub mod expert_admin;
+pub mod expert_generate;
 pub mod external_factors;
-pub mod cli_auth;
-pub mod setup_token_wizard;
-pub mod cli_noise;
-pub mod db_sources_rpc;        // §13.7 WP-D: operator RPCs for [db_sources.*]
-pub mod db_source_grants;      // §13.7 WP-A: per-agent [capabilities] db_sources grants
+pub mod footprint_distill;
+pub mod foresight;
+pub mod growth;
+pub mod guardrail;
 pub mod handlers;
+// G5 (2026-09 feature audit) — one `config.toml [identity]` → provider
+// builder shared by the dashboard RPC, the channel `<sender>` block, and the
+// `identity_resolve` MCP tool (the latter two used to hard-code wiki-cache).
+pub mod identity_provider;
+pub mod interruptibility;
 pub mod knowledge_guard;
+pub(crate) mod local_session;
+pub mod maintenance;
+pub mod mast;
 pub mod memory_factory;
 pub mod memory_migrate;
+pub mod message_queue;
+pub mod miniapp;
+// G4 (2026-09 feature audit) — Odoo ERP change bridge: `/webhook/odoo` +
+// background poller → autopilot bus. Both transports default OFF.
+pub mod odoo_events;
+pub mod os_events;
+pub mod os_frontmost;
+pub mod persona_induction;
+pub mod proactive_feedback;
+pub mod proactive_gate;
+pub mod profile_distill;
+pub mod redteam;
+pub mod relay_client;
+pub mod relay_config;
+pub mod relay_device;
+pub mod rule_induction;
+pub mod secaudit_reports;
+pub mod security_posture;
+pub mod setup_token_wizard;
+pub mod situation_classifier;
 // WP5c — conversation → knowledge-base semantic routing.
-pub mod knowledge_route;
 pub mod auto_wiki_page;
-pub mod line;
-pub mod local_llm;
+pub mod builtin_skills_seed_migration;
+/// X1 方案 2 — the tool-call audit trail as the causal graph's first real source.
+pub mod causal_audit_ingest;
+pub mod causal_extraction_runner;
+mod causal_mcp_source;
+pub mod ccr_dashboard;
+pub mod ccr_replay;
+pub mod ccr_runtime;
+pub mod channel_sender;
+pub mod chat_commands;
+pub mod computer_use;
+pub mod computer_use_orchestrator;
+pub mod decision_brief;
+pub mod decision_calibration;
+pub mod decision_dashboard;
+pub mod decision_empirical;
+pub mod decision_event;
+pub mod decision_forecast_dashboard;
+pub mod decision_ingest;
+pub mod decision_model_candidate;
+pub mod decision_model_candidate_dashboard;
+pub mod decision_model_review;
+pub mod decision_odoo_export;
+pub mod decision_operator_import;
+pub mod decision_outcome_calibration;
+pub mod decision_outcome_dashboard;
+pub mod decision_policy;
+pub mod decision_sensitivity;
+pub mod decision_shadow_dashboard;
+pub mod decision_shadow_screen;
+pub mod decision_sim;
+pub mod decision_sla_shadow_dashboard;
+pub mod decision_sla_shadow_screen;
+pub mod decision_store;
+pub mod decision_synthetic;
+pub mod decision_task_board_export;
+pub mod decision_task_board_shadow;
+pub mod defensive_prompt;
+// Three failover layers under one tree: `failover::model` (model-level
+// timeout/overload fallback, formerly the top-level `llm_fallback` module)
+// alongside `FailoverManager` (runtime-level). See the module header.
+pub mod failover;
+pub mod fault_attribution;
+pub mod feishu;
+pub mod files_api;
+pub mod governance;
+pub mod gvu;
 pub mod install_notify;
 pub mod install_requests;
-pub(crate) mod pending_account;
-pub(crate) mod pending_network;
-pub mod mcp_oauth;
-pub mod mcp_scan;
+pub mod knowledge_route;
+pub mod lifecycle_flush;
+pub mod line;
+pub mod local_llm;
+pub mod log;
 pub mod mail;
 pub mod mail_worker;
+pub mod mcp_oauth;
+pub mod mcp_scan;
+pub mod mdns;
 pub mod media;
+pub mod metrics;
 pub mod model_capabilities;
 pub mod office_docs;
-pub mod tts;
-pub mod stt;
-pub mod lifecycle_flush;
-pub mod log;
-pub mod metrics;
 pub mod otel;
-pub mod failover;
-pub mod gvu;
+pub mod otp_delivery;
+pub(crate) mod pending_account;
+pub(crate) mod pending_network;
 pub mod playbook;
 pub mod prediction;
-pub mod reflexion;
-pub mod run_steps;
-pub mod runtime;
-pub mod runtime_config;
-pub mod runtime_dispatch;
 pub mod prompt_audit;
 pub mod prompt_compression;
 pub mod prompt_identity;
 pub mod prompt_minimal;
 pub mod protocol;
-pub mod builtin_skills_seed_migration;
-pub mod pty_default_migration;
 pub mod pty_runtime;
-pub mod files_api;
-pub mod search_index;
+pub mod ranked_wiki_injection;
+pub mod reflexion;
+pub mod relevance_ranker;
+pub mod reminder_scheduler;
+pub mod risk_detector;
+pub mod run_steps;
+pub mod runtime;
+pub mod runtime_config;
+pub mod runtime_dispatch;
 pub mod runtime_install;
 pub mod runtime_models;
-pub mod runtime_status;
-pub mod worker_supervisor;
-pub mod ranked_wiki_injection;
-pub mod relevance_ranker;
-pub mod session_summarizer;
-pub mod session_summarizer_task;
-pub mod session_titler_task;
-pub mod credit;
-pub mod delegation_scope;
-pub mod governance;
-pub mod workforce_private;
-pub mod skill_approval;
-pub mod skill_gap_digest;
-pub mod skill_lifecycle;
-pub mod mdns;
+pub mod screenshot_audit;
+pub mod search_index;
+/// Credential redaction for operator-visible channel diagnostics (WP12).
+pub mod secret_redact;
 pub mod server;
 pub mod session;
 pub mod session_portability;
+pub mod session_summarizer;
+pub mod session_summarizer_task;
+pub mod session_titler_task;
+pub mod skill_approval;
+pub mod skill_gap_digest;
+pub mod skill_lifecycle;
+pub mod slack;
+pub mod stt;
 pub mod task_spec;
 pub mod telegram;
-pub mod slack;
-pub mod channel_sender;
-pub mod otp_delivery;
-pub mod chat_commands;
-pub mod computer_use;
-pub mod computer_use_orchestrator;
-pub mod browser_router;
-pub mod screenshot_audit;
-/// Credential redaction for operator-visible channel diagnostics (WP12).
-pub mod secret_redact;
-pub mod risk_detector;
-pub mod defensive_prompt;
+pub mod tts;
 pub mod uki_patch;
 pub mod updater;
-pub mod webchat;
-pub mod webhook;
 pub mod web_extract;
 pub mod web_fetch;
+pub mod webchat;
 pub mod whatsapp;
-pub mod feishu;
-pub mod reminder_scheduler;
 pub mod wiki_ingest;
+mod wiki_mcp_source;
 pub mod wiki_trust_federation;
-pub mod worktree;
+pub mod workforce_private;
+pub mod xml_fence;
 
 // ── Hermes-learnings modules (Phase 3, 4, 6) ──
 pub mod rl;
@@ -289,9 +340,6 @@ pub mod skill_extraction;
 // ── Sprint N P0: EvolutionEvents JSONL audit log ──
 pub mod evolution_events;
 pub mod skill_synthesis_pipeline;
-
-// ── LLM fallback helpers (timeout / rate-limit → lighter model) ──
-pub mod llm_fallback;
 
 // ── Dashboard-authored redaction rules + imported rule packs (§13) ──
 pub mod redaction_custom_rules;
@@ -306,7 +354,7 @@ pub mod redaction_integration;
 pub mod redaction_proxy;
 
 pub use extension::{GatewayExtension, NullExtension};
-pub use server::{start_gateway, GatewayConfig};
+pub use server::{GatewayConfig, start_gateway};
 
 /// Process-wide HTTP client shared by channel integrations that reconnect in
 /// a loop (e.g. Slack Socket Mode) — reuses connection pools instead of
@@ -336,8 +384,6 @@ pub mod night_llm;
 // evidence block) and `prediction::task_observe` (A3 observation layer).
 pub mod recent_actions;
 pub mod tool_activity;
-/// Code Mode Phase 0 measurement gate (WP-H2 / WP-6E) — pure observation.
-pub mod tool_loop_probe;
 
 // WP-F (P2-c): durable per-task file-change evidence behind the dashboard's
 // needs_human 「變更」tab — persisted from the same native-tool collector,
@@ -398,33 +444,20 @@ pub mod update_report_reconcile;
 //        tasks, enforces iteration/wall-clock/concurrency caps, and re-dispatches
 //        judge-rejected tasks with feedback ──
 pub mod goal_loop;
-// ── A1: structured <state> block (StateAct arXiv:2410.02810) round-tripped
-//        through the goal loop's dispatch prompt + agent self-report ──
-pub mod goal_state;
-// ── A2: (state_hash, action) visit graph (Graph-Based Exploration
-//        arXiv:2512.24156) — structural loop detection, replaces the old
-//        two-round identical-feedback oscillation guard ──
-pub mod goal_visit_graph;
-// ── H4 (WP-B): stagnation gap fingerprinting — extracts path:line citations
-//        + key tokens from judge rejection feedback and normalizes them so a
-//        reworded-but-same gap collapses to the same fingerprint, instead of
-//        the byte-identical text comparison `StateBlock::hash_input` alone
-//        would otherwise perform ──
-pub mod goal_gap_fingerprint;
-// ── WP-4F: deterministic "best round" picker for budget-exhausted
-//        `needs_human` escalations — attaches the closest-to-done round's
-//        excerpt + gap list instead of an empty-handed pause note ──
-pub mod goal_budget_best_round;
-// ── H5 (WP-B): premature-stop ("bail") regex panel — zh+en anchored
-//        patterns compared against the last non-empty paragraph of an
-//        agent's completion text ──
-pub mod goal_bail_detect;
-// ── H10: tool-call streak advisory (deepseek-harness §2.16
-//        repeat-tool-reminder) — detects a long run of identical
-//        (tool, masked-params) calls within one round's evidence and
-//        surfaces an escalating [3, 5, 8] zh-TW advisory hint into the
-//        NEXT dispatch round's <state> block. Advisory only, zero LLM cost ──
-pub mod goal_tool_streak;
+// ── Audit O8 (2026-09-29): the eight single-purpose goal-loop modules that
+//        used to live at the crate root were merged into three siblings under
+//        `goal_loop/` — `signals` (A1 gap fingerprint / A2 visit graph / H10
+//        tool streak / H5 bail detect), `state` (A1 <state> block / H11 pause
+//        reason / WP-4F best round), and `plan` (D4 decomposition + plan-first).
+//        The aliases below keep the old `crate::goal_*` / `crate::pause_reason`
+//        paths compiling for one release; new code should use the
+//        `goal_loop::{signals, state, plan}` paths directly. ──
+pub use goal_loop::signals as goal_bail_detect;
+pub use goal_loop::signals as goal_gap_fingerprint;
+pub use goal_loop::signals as goal_tool_streak;
+pub use goal_loop::signals as goal_visit_graph;
+pub use goal_loop::state as goal_budget_best_round;
+pub use goal_loop::state as goal_state;
 // ── D4: pluggable dispatch policy (agent selection = data) + LLMCompiler-style
 //        goal decomposition (planner → dependency DAG) ──
 pub mod dispatch_policy;
@@ -433,9 +466,15 @@ pub mod dispatch_policy;
 //        mav | evaluator_only | external | human_only; every failure path
 //        falls back to `mav`, the strongest verifier ──
 pub mod judge_mode;
+// ── Audit O8 alias — see the `goal_loop` block above ──
+pub use goal_loop::plan as goal_plan;
+// ── Audit T5/O4 (2026-09-29): the single place an autonomous goal is created.
+//        Shared by the dashboard `tasks.goal_create` RPC and the MCP
+//        `tasks_create kind="goal"` entry so the H9-G contract freeze and the
+//        I-1c plan-first parking can never drift between the two rails ──
+pub mod goal_create_core;
 // ── D5: semi-automatic topology evolution (edge optimization, human-gated) ──
 pub mod topology_evolution;
-pub mod goal_plan;
 // ── WP2.4: structured outcome acceptance — deterministic (zero-LLM) validation
 //         of a goal's ```json / files:<glob> contract before the MAV judge ──
 pub mod outcome_spec;
@@ -443,8 +482,8 @@ pub mod outcome_spec;
 pub mod goal_notify;
 // ── H11: closed classification of WHY a goal task parked `needs_human`
 //        (grok-build §2.3 eight-state machine, adapted — a reason column, not
-//        a new task status) ──
-pub mod pause_reason;
+//        a new task status). Audit O8 alias — lives in `goal_loop::state` ──
+pub use goal_loop::state as pause_reason;
 // ── WP2.2: gateway-side subprocess driver for `duduclaw eval --replay`
 //         (B1 cli↔gateway dependency-direction boundary) ──
 pub mod eval_runner;
@@ -471,3 +510,9 @@ pub mod os_intent;
 //        itself; only shapes the turn (short-circuit reply or a guiding
 //        hint) — execution stays behind the O-0 tools' own unchanged gates ──
 pub mod os_operator;
+
+/// `role_turns.jsonl` — per-role-member attribution rows.
+pub mod role_turns;
+/// Team-as-Agent (P1/WP-4): per-task team spec freeze, the decomposability
+/// gate, and the planner → executor(s) → verifier round.
+pub mod team_composer;

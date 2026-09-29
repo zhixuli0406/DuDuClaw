@@ -80,7 +80,10 @@ pub fn init(tx: broadcast::Sender<String>) {
 /// `dashboard_feedback::emit`'s "best-effort, never fatal" contract).
 pub fn push_dashboard_navigate(path: &str) {
     if !is_safe_relative_path(path) {
-        warn!(path, "push_dashboard_navigate: rejected a non-relative/unsafe path");
+        warn!(
+            path,
+            "push_dashboard_navigate: rejected a non-relative/unsafe path"
+        );
         return;
     }
     let Some(tx) = DASHBOARD_EVENT_TX.get() else {
@@ -116,9 +119,18 @@ mod tests {
         assert!(is_safe_relative_path("/inbox?item=ap-abc123"));
         assert!(!is_safe_relative_path(""));
         assert!(!is_safe_relative_path("inbox"), "must have a leading slash");
-        assert!(!is_safe_relative_path("//evil.com"), "protocol-relative must be rejected");
-        assert!(!is_safe_relative_path("/a\nb"), "control chars must be rejected");
-        assert!(!is_safe_relative_path(&format!("/{}", "a".repeat(600))), "must be length-bounded");
+        assert!(
+            !is_safe_relative_path("//evil.com"),
+            "protocol-relative must be rejected"
+        );
+        assert!(
+            !is_safe_relative_path("/a\nb"),
+            "control chars must be rejected"
+        );
+        assert!(
+            !is_safe_relative_path(&format!("/{}", "a".repeat(600))),
+            "must be length-bounded"
+        );
     }
 
     /// The only test in the crate that touches [`DASHBOARD_EVENT_TX`] — the
@@ -143,9 +155,15 @@ mod tests {
         assert_eq!(parsed["payload"]["path"], "/inbox?item=ap-1");
 
         push_dashboard_navigate("//evil.com");
-        assert!(rx.try_recv().is_err(), "protocol-relative path must not be forwarded");
+        assert!(
+            rx.try_recv().is_err(),
+            "protocol-relative path must not be forwarded"
+        );
 
         push_dashboard_navigate("no-leading-slash");
-        assert!(rx.try_recv().is_err(), "non-relative path must not be forwarded");
+        assert!(
+            rx.try_recv().is_err(),
+            "non-relative path must not be forwarded"
+        );
     }
 }

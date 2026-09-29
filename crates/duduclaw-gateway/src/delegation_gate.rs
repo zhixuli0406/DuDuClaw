@@ -522,8 +522,12 @@ mod tests {
         );
         // The real relations still work — this is a redirect of authority, not
         // a lockout.
-        assert!(allows_dispatch(&gate(home, Some("sales_rep"), "sales_rep2").await));
-        assert!(allows_dispatch(&gate(home, Some("sales_lead"), "sales_rep").await));
+        assert!(allows_dispatch(
+            &gate(home, Some("sales_rep"), "sales_rep2").await
+        ));
+        assert!(allows_dispatch(
+            &gate(home, Some("sales_lead"), "sales_rep").await
+        ));
     }
 
     /// The fallback half: agents with no store record keep resolving from
@@ -538,8 +542,12 @@ mod tests {
         for stray in ["mkt_lead", "mkt_rep"] {
             duduclaw_core::org_store::remove(home, stray).unwrap();
         }
-        assert!(allows_dispatch(&gate(home, Some("mkt_lead"), "mkt_rep").await));
-        assert!(!allows_dispatch(&gate(home, Some("mkt_rep"), "sales_rep").await));
+        assert!(allows_dispatch(
+            &gate(home, Some("mkt_lead"), "mkt_rep").await
+        ));
+        assert!(!allows_dispatch(
+            &gate(home, Some("mkt_rep"), "sales_rep").await
+        ));
     }
 
     #[tokio::test]
@@ -583,8 +591,17 @@ mod tests {
             notice.contains("sales_rep") && notice.contains("mkt_rep"),
             "notice should still name both parties: {notice}"
         );
-        assert!(notice.contains("委派權限"), "should point at the dashboard tab: {notice}");
-        for leaked_term in ["config.toml", "reports_to", "agent.toml", "policy", "委派遭拒"] {
+        assert!(
+            notice.contains("委派權限"),
+            "should point at the dashboard tab: {notice}"
+        );
+        for leaked_term in [
+            "config.toml",
+            "reports_to",
+            "agent.toml",
+            "policy",
+            "委派遭拒",
+        ] {
             assert!(
                 !notice.contains(leaked_term),
                 "user-facing notice must not leak internal term '{leaked_term}': {notice}"

@@ -94,7 +94,8 @@ pub fn rank_modules(
 ) -> Vec<ModuleTarget> {
     let hotspot_by_file: HashMap<&str, &HotspotFile> =
         hotspots.iter().map(|h| (h.file.as_str(), h)).collect();
-    let entry_set: std::collections::HashSet<&str> = entry_points.iter().map(|s| s.as_str()).collect();
+    let entry_set: std::collections::HashSet<&str> =
+        entry_points.iter().map(|s| s.as_str()).collect();
 
     struct Acc {
         score: u64,
@@ -103,12 +104,16 @@ pub fn rank_modules(
     let mut modules: HashMap<String, Acc> = HashMap::new();
     for f in all_files {
         let key = module_key(f);
-        let entry = modules.entry(key).or_insert(Acc { score: 0, files: Vec::new() });
+        let entry = modules.entry(key).or_insert(Acc {
+            score: 0,
+            files: Vec::new(),
+        });
         let is_entry = entry_set.contains(f.as_str());
         let hotspot = hotspot_by_file.get(f.as_str());
         let security_touches = hotspot.map(|h| h.security_touches).unwrap_or(0) as u64;
         let total_touches = hotspot.map(|h| h.total_touches).unwrap_or(0) as u64;
-        let file_weight = security_touches * 1000 + total_touches * 10 + if is_entry { 500 } else { 0 };
+        let file_weight =
+            security_touches * 1000 + total_touches * 10 + if is_entry { 500 } else { 0 };
         entry.score += security_touches * 100 + total_touches + if is_entry { 50 } else { 0 } + 1;
         entry.files.push((f.clone(), file_weight));
     }
@@ -125,7 +130,11 @@ pub fn rank_modules(
             }
         })
         .collect();
-    ranked.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.module_path.cmp(&b.module_path)));
+    ranked.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.module_path.cmp(&b.module_path))
+    });
     ranked.truncate(max_modules);
     ranked
 }
@@ -136,7 +145,10 @@ pub fn rank_modules(
 /// filesystem. The first file is always included (capped at the full budget
 /// if it alone exceeds it) so a non-empty module is never audited with zero
 /// files.
-pub fn plan_file_budget(files_with_len: &[(String, u64)], budget_bytes: usize) -> Vec<(String, usize)> {
+pub fn plan_file_budget(
+    files_with_len: &[(String, u64)],
+    budget_bytes: usize,
+) -> Vec<(String, usize)> {
     let mut out = Vec::new();
     let mut remaining = budget_bytes;
     for (i, (path, len)) in files_with_len.iter().enumerate() {
@@ -221,8 +233,10 @@ pub struct RawCandidate {
 /// via `#[serde(default)]` rather than dropping the whole batch, matching
 /// this codebase's scanner-normalizer convention (see `scanners/semgrep.rs`).
 pub fn parse_ai_candidates(raw: &str) -> Result<Vec<RawCandidate>, String> {
-    let slice = extract_json_array(raw).ok_or_else(|| "no JSON array found in ai_audit response".to_string())?;
-    serde_json::from_str::<Vec<RawCandidate>>(slice).map_err(|e| format!("ai_audit JSON parse failed: {e}"))
+    let slice = extract_json_array(raw)
+        .ok_or_else(|| "no JSON array found in ai_audit response".to_string())?;
+    serde_json::from_str::<Vec<RawCandidate>>(slice)
+        .map_err(|e| format!("ai_audit JSON parse failed: {e}"))
 }
 
 /// Map the LLM's free-text `kind` into the fixed `FindingKind` bucket.
@@ -233,7 +247,10 @@ fn map_ai_kind(raw: &str) -> FindingKind {
     let lower = raw.to_ascii_lowercase();
     if lower.contains("secret") || lower.contains("credential") || lower.contains("hardcoded_key") {
         FindingKind::Secret
-    } else if lower.contains("depend") || lower.contains("cve") || lower.contains("vulnerable_package") {
+    } else if lower.contains("depend")
+        || lower.contains("cve")
+        || lower.contains("vulnerable_package")
+    {
         FindingKind::DependencyVulnerability
     } else {
         FindingKind::Other
@@ -242,11 +259,18 @@ fn map_ai_kind(raw: &str) -> FindingKind {
 
 // ── orchestration ────────────────────────────────────────────────────
 
-fn build_module_prompt(repo_root: &Path, module: &ModuleTarget) -> Option<(String, Vec<(String, String)>)> {
+fn build_module_prompt(
+    repo_root: &Path,
+    module: &ModuleTarget,
+) -> Option<(String, Vec<(String, String)>)> {
     let lens: Vec<(String, u64)> = module
         .files
         .iter()
-        .filter_map(|f| std::fs::metadata(repo_root.join(f)).ok().map(|m| (f.clone(), m.len())))
+        .filter_map(|f| {
+            std::fs::metadata(repo_root.join(f))
+                .ok()
+                .map(|m| (f.clone(), m.len()))
+        })
         .collect();
     if lens.is_empty() {
         return None;
@@ -300,7 +324,8 @@ pub async fn run_ai_audit<C: LlmCaller>(
 ) -> AiAuditOutcome {
     if modules.is_empty() {
         return AiAuditOutcome::Unavailable {
-            reason: "no candidate modules found (empty repo, or no readable files under it)".to_string(),
+            reason: "no candidate modules found (empty repo, or no readable files under it)"
+                .to_string(),
         };
     }
 
@@ -371,7 +396,10 @@ pub async fn run_ai_audit<C: LlmCaller>(
                 });
             }
             Ok(raw_candidates) => {
-                let file_map: HashMap<&str, &str> = files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+                let file_map: HashMap<&str, &str> = files
+                    .iter()
+                    .map(|(p, c)| (p.as_str(), c.as_str()))
+                    .collect();
                 let mut count = 0usize;
                 for rc in raw_candidates.into_iter().take(MAX_CANDIDATES_PER_MODULE) {
                     if rc.file.trim().is_empty() {
@@ -381,8 +409,10 @@ pub async fn run_ai_audit<C: LlmCaller>(
                     let snippet = extract_context_window(content, rc.line, 2);
                     let severity = rc.severity.parse::<Severity>().unwrap_or(Severity::Medium);
                     let kind = map_ai_kind(&rc.kind);
-                    let reasoning = duduclaw_core::truncate_bytes(&rc.reasoning, EVIDENCE_DETAIL_MAX_BYTES);
-                    let trigger = duduclaw_core::truncate_bytes(&rc.trigger_path, EVIDENCE_DETAIL_MAX_BYTES);
+                    let reasoning =
+                        duduclaw_core::truncate_bytes(&rc.reasoning, EVIDENCE_DETAIL_MAX_BYTES);
+                    let trigger =
+                        duduclaw_core::truncate_bytes(&rc.trigger_path, EVIDENCE_DETAIL_MAX_BYTES);
                     let detail = format!("reasoning: {reasoning}\ntrigger_path: {trigger}");
                     let evidence = vec![EvidenceItem {
                         kind: EvidenceKind::AiAnalysis,
@@ -423,7 +453,10 @@ pub async fn run_ai_audit<C: LlmCaller>(
         }
     }
 
-    AiAuditOutcome::Ran { engine_runs, findings }
+    AiAuditOutcome::Ran {
+        engine_runs,
+        findings,
+    }
 }
 
 #[cfg(test)]
@@ -434,7 +467,10 @@ mod tests {
 
     #[test]
     fn module_key_groups_by_first_two_components() {
-        assert_eq!(module_key("crates/duduclaw-gateway/src/lib.rs"), "crates/duduclaw-gateway");
+        assert_eq!(
+            module_key("crates/duduclaw-gateway/src/lib.rs"),
+            "crates/duduclaw-gateway"
+        );
         assert_eq!(module_key("src/main.rs"), "src");
         assert_eq!(module_key("main.rs"), ".");
     }
@@ -505,7 +541,11 @@ mod tests {
 
     #[test]
     fn plan_file_budget_stops_once_exhausted_but_always_keeps_the_first_file() {
-        let files = vec![("a".to_string(), 90u64), ("b".to_string(), 90u64), ("c".to_string(), 90u64)];
+        let files = vec![
+            ("a".to_string(), 90u64),
+            ("b".to_string(), 90u64),
+            ("c".to_string(), 90u64),
+        ];
         let plan = plan_file_budget(&files, 100);
         // First file always included in full (or capped to the whole budget);
         // budget then exhausted so later files are dropped entirely.
@@ -557,7 +597,10 @@ mod tests {
     fn map_ai_kind_buckets_known_categories() {
         assert_eq!(map_ai_kind("secret_exposure"), FindingKind::Secret);
         assert_eq!(map_ai_kind("hardcoded credential"), FindingKind::Secret);
-        assert_eq!(map_ai_kind("vulnerable_dependency"), FindingKind::DependencyVulnerability);
+        assert_eq!(
+            map_ai_kind("vulnerable_dependency"),
+            FindingKind::DependencyVulnerability
+        );
         assert_eq!(map_ai_kind("sql_injection"), FindingKind::Other);
         assert_eq!(map_ai_kind(""), FindingKind::Other);
     }
@@ -578,7 +621,10 @@ mod tests {
 
     #[test]
     fn build_ai_audit_prompt_includes_module_path_and_json_schema_hint() {
-        let prompt = build_ai_audit_prompt("crates/foo", &[("crates/foo/lib.rs".to_string(), "fn x(){}".to_string())]);
+        let prompt = build_ai_audit_prompt(
+            "crates/foo",
+            &[("crates/foo/lib.rs".to_string(), "fn x(){}".to_string())],
+        );
         assert!(prompt.contains("crates/foo"));
         assert!(prompt.contains("\"trigger_path\""));
     }
@@ -594,7 +640,9 @@ mod tests {
         async fn complete(&self, _prompt: &str) -> duduclaw_fork::Result<String> {
             let mut replies = self.replies.lock().unwrap();
             if replies.is_empty() {
-                return Err(duduclaw_fork::ForkError::Executor("no more stub replies".to_string()));
+                return Err(duduclaw_fork::ForkError::Executor(
+                    "no more stub replies".to_string(),
+                ));
             }
             match replies.remove(0) {
                 Ok(s) => Ok(s),
@@ -661,14 +709,19 @@ mod tests {
         };
         let outcome = run_ai_audit(dir.path(), &modules, &caller).await;
         match outcome {
-            AiAuditOutcome::Ran { engine_runs, findings } => {
+            AiAuditOutcome::Ran {
+                engine_runs,
+                findings,
+            } => {
                 assert_eq!(engine_runs.len(), 1);
                 assert_eq!(engine_runs[0].findings_count, 1);
                 assert_eq!(findings.len(), 1);
                 assert_eq!(findings[0].source_engine, AI_AUDIT_ENGINE);
                 assert_eq!(findings[0].severity, Severity::Critical);
             }
-            AiAuditOutcome::Unavailable { reason } => panic!("expected Ran, got Unavailable: {reason}"),
+            AiAuditOutcome::Unavailable { reason } => {
+                panic!("expected Ran, got Unavailable: {reason}")
+            }
         }
     }
 
@@ -676,20 +729,42 @@ mod tests {
     async fn run_ai_audit_continues_past_a_later_modules_transport_failure() {
         let dir = tmp_repo_with_files(&[("a/main.rs", "fn a(){}"), ("b/main.rs", "fn b(){}")]);
         let modules = vec![
-            ModuleTarget { module_path: "a".to_string(), score: 2, files: vec!["a/main.rs".to_string()] },
-            ModuleTarget { module_path: "b".to_string(), score: 1, files: vec!["b/main.rs".to_string()] },
+            ModuleTarget {
+                module_path: "a".to_string(),
+                score: 2,
+                files: vec!["a/main.rs".to_string()],
+            },
+            ModuleTarget {
+                module_path: "b".to_string(),
+                score: 1,
+                files: vec!["b/main.rs".to_string()],
+            },
         ];
         let caller = StubCaller {
-            replies: std::sync::Mutex::new(vec![Ok("[]".to_string()), Err("transient".to_string())]),
+            replies: std::sync::Mutex::new(vec![
+                Ok("[]".to_string()),
+                Err("transient".to_string()),
+            ]),
         };
         let outcome = run_ai_audit(dir.path(), &modules, &caller).await;
         match outcome {
-            AiAuditOutcome::Ran { engine_runs, findings } => {
+            AiAuditOutcome::Ran {
+                engine_runs,
+                findings,
+            } => {
                 assert_eq!(engine_runs.len(), 2);
                 assert!(findings.is_empty());
-                assert!(engine_runs[1].parse_error.as_ref().unwrap().contains("transient"));
+                assert!(
+                    engine_runs[1]
+                        .parse_error
+                        .as_ref()
+                        .unwrap()
+                        .contains("transient")
+                );
             }
-            AiAuditOutcome::Unavailable { reason } => panic!("expected Ran, got Unavailable: {reason}"),
+            AiAuditOutcome::Unavailable { reason } => {
+                panic!("expected Ran, got Unavailable: {reason}")
+            }
         }
     }
 
@@ -706,11 +781,16 @@ mod tests {
         };
         let outcome = run_ai_audit(dir.path(), &modules, &caller).await;
         match outcome {
-            AiAuditOutcome::Ran { engine_runs, findings } => {
+            AiAuditOutcome::Ran {
+                engine_runs,
+                findings,
+            } => {
                 assert!(findings.is_empty());
                 assert!(engine_runs[0].parse_error.is_some());
             }
-            AiAuditOutcome::Unavailable { reason } => panic!("expected Ran, got Unavailable: {reason}"),
+            AiAuditOutcome::Unavailable { reason } => {
+                panic!("expected Ran, got Unavailable: {reason}")
+            }
         }
     }
 
@@ -734,7 +814,9 @@ mod tests {
             AiAuditOutcome::Ran { findings, .. } => {
                 assert_eq!(findings.len(), MAX_CANDIDATES_PER_MODULE);
             }
-            AiAuditOutcome::Unavailable { reason } => panic!("expected Ran, got Unavailable: {reason}"),
+            AiAuditOutcome::Unavailable { reason } => {
+                panic!("expected Ran, got Unavailable: {reason}")
+            }
         }
     }
 }

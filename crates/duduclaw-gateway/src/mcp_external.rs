@@ -170,16 +170,16 @@ pub async fn resolve_secret_refs(
     servers: Vec<ExternalMcpServer>,
     home_dir: &Path,
 ) -> Vec<ExternalMcpServer> {
-    use duduclaw_security::secret_manager::{resolve_secret_reference, SecretManagerConfig};
+    use duduclaw_security::secret_manager::{SecretManagerConfig, resolve_secret_reference};
 
     let needs_secret = |s: &ExternalMcpServer| {
         s.env.iter().any(|(_, v)| v.starts_with("secret://"))
             || s.headers.iter().any(|(_, v)| v.starts_with("secret://"))
-            || s.bearer_token.as_deref().is_some_and(|v| v.starts_with("secret://"))
+            || s.bearer_token
+                .as_deref()
+                .is_some_and(|v| v.starts_with("secret://"))
     };
-    let needs_oauth = |s: &ExternalMcpServer| {
-        s.bearer_token.as_deref() == Some(OAUTH_GOOGLE_REF)
-    };
+    let needs_oauth = |s: &ExternalMcpServer| s.bearer_token.as_deref() == Some(OAUTH_GOOGLE_REF);
 
     // Fast path: nothing to resolve ⇒ don't even read config.toml.
     if !servers.iter().any(|s| needs_secret(s) || needs_oauth(s)) {
@@ -208,11 +208,7 @@ pub async fn resolve_secret_refs(
 
     let mut out = Vec::with_capacity(servers.len());
     'server: for mut server in servers {
-        for (key, val) in server
-            .env
-            .iter_mut()
-            .chain(server.headers.iter_mut())
-        {
+        for (key, val) in server.env.iter_mut().chain(server.headers.iter_mut()) {
             if val.starts_with("secret://") {
                 match resolve_secret_reference(val, &sm_cfg, home_dir).await {
                     Some(resolved) => *val = resolved,
@@ -487,12 +483,12 @@ mod tests {
     #[test]
     fn default_direction_absent_or_malformed_mounts_nothing() {
         for body in [
-            "",                            // empty file
-            "[agent]\nname = \"a\"\n",     // no [mcp]
-            "[mcp]\n",                     // section, no external
-            "mcp = \"scalar\"\n",          // wrong-typed section
+            "",                             // empty file
+            "[agent]\nname = \"a\"\n",      // no [mcp]
+            "[mcp]\n",                      // section, no external
+            "mcp = \"scalar\"\n",           // wrong-typed section
             "[mcp]\nexternal = \"nope\"\n", // wrong-typed array
-            "not toml [[[",                // malformed file
+            "not toml [[[",                 // malformed file
         ] {
             assert!(parse(body).is_empty(), "for {body:?}");
         }
@@ -540,7 +536,10 @@ mod tests {
         // A mixed array is filtered, not rejected — the historical behavior.
         let mixed = parse(&format!("{base}allowed_tools = [\"a\", 7, \"b\"]\n"));
         assert_eq!(mixed.len(), 1, "mixed array must not skip the server");
-        assert_eq!(mixed[0].filter.allowed, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            mixed[0].filter.allowed,
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]
@@ -556,7 +555,10 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(
             servers[0].env,
-            vec![("A".to_string(), "1".to_string()), ("C".to_string(), "3".to_string())]
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("C".to_string(), "3".to_string())
+            ]
         );
 
         // A wrong-typed `env` as a whole ⇒ no env, still mounted.
@@ -587,10 +589,16 @@ env = { PLANE_BASE_URL = "https://plane.example.com" }
         assert_eq!(sv.name, "plane");
         assert_eq!(sv.command, "npx");
         assert_eq!(sv.args, vec!["-y", "plane-mcp"]);
-        assert_eq!(sv.env, vec![("PLANE_BASE_URL".into(), "https://plane.example.com".into())]);
+        assert_eq!(
+            sv.env,
+            vec![("PLANE_BASE_URL".into(), "https://plane.example.com".into())]
+        );
         assert!(sv.filter.permits("plane_list_issues"));
         assert!(!sv.filter.permits("plane_delete_issue"));
-        assert!(!sv.filter.permits("plane_other"), "allowlist is deny-by-default");
+        assert!(
+            !sv.filter.permits("plane_other"),
+            "allowlist is deny-by-default"
+        );
     }
 
     #[test]
@@ -619,7 +627,10 @@ name = "needsauth"
 command = "x"
 env = { TOKEN = "env://DUDUCLAW_TEST_DEFINITELY_UNSET_VAR_XYZ" }
 "#;
-        assert!(parse(s).is_empty(), "unresolved credential ⇒ server skipped");
+        assert!(
+            parse(s).is_empty(),
+            "unresolved credential ⇒ server skipped"
+        );
     }
 
     #[test]
@@ -632,7 +643,10 @@ env = { BASE = "literal-value" }
 "#;
         let servers = parse(s);
         assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].env, vec![("BASE".into(), "literal-value".into())]);
+        assert_eq!(
+            servers[0].env,
+            vec![("BASE".into(), "literal-value".into())]
+        );
     }
 
     #[test]
@@ -645,7 +659,10 @@ name = "typo"
 command = "x"
 allowed_tools = "just_one"
 "#;
-        assert!(parse(s).is_empty(), "malformed allowlist ⇒ server skipped (fail-closed)");
+        assert!(
+            parse(s).is_empty(),
+            "malformed allowlist ⇒ server skipped (fail-closed)"
+        );
 
         // denied_tools as a wrong type likewise skips the server.
         let s2 = r#"
@@ -698,18 +715,27 @@ preset = "google:sheets"
         let servers = parse(s);
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].name, "google:gmail", "preset labels the entry");
-        assert_eq!(servers[0].url.as_deref(), Some("https://gmailmcp.googleapis.com/mcp/v1"));
+        assert_eq!(
+            servers[0].url.as_deref(),
+            Some("https://gmailmcp.googleapis.com/mcp/v1")
+        );
         // Bearer defaults to the connected Google account (resolved async).
         assert_eq!(servers[0].bearer_token.as_deref(), Some("oauth://google"));
         assert!(servers[0].filter.permits("search_threads"));
-        assert_eq!(servers[1].url.as_deref(), Some("https://sheetsmcp.googleapis.com/mcp/v1"));
+        assert_eq!(
+            servers[1].url.as_deref(),
+            Some("https://sheetsmcp.googleapis.com/mcp/v1")
+        );
     }
 
     #[test]
     fn all_known_presets_resolve() {
         for p in known_presets() {
             let (url, bearer) = resolve_preset(&p).unwrap_or_else(|| panic!("{p} unresolved"));
-            assert!(url.starts_with("https://") && url.ends_with("/mcp/v1"), "{p}: {url}");
+            assert!(
+                url.starts_with("https://") && url.ends_with("/mcp/v1"),
+                "{p}: {url}"
+            );
             assert_eq!(bearer, "oauth://google");
         }
         // Forms/Tasks have no official Google MCP server — native tools serve
@@ -763,7 +789,10 @@ allowed_tools = ["search_threads"]
         let servers = parse(s);
         assert_eq!(servers.len(), 1);
         let sv = &servers[0];
-        assert_eq!(sv.url.as_deref(), Some("https://gmailmcp.googleapis.com/mcp/v1"));
+        assert_eq!(
+            sv.url.as_deref(),
+            Some("https://gmailmcp.googleapis.com/mcp/v1")
+        );
         assert!(sv.command.is_empty());
         assert_eq!(sv.bearer_token.as_deref(), Some("literal-token"));
         assert_eq!(sv.headers, vec![("X-Extra".into(), "plain".into())]);
@@ -814,7 +843,10 @@ bearer_token = "oauth://google"
 "#;
         let servers = parse(s);
         assert_eq!(servers.len(), 2);
-        assert_eq!(servers[0].bearer_token.as_deref(), Some("secret://vault/tok"));
+        assert_eq!(
+            servers[0].bearer_token.as_deref(),
+            Some("secret://vault/tok")
+        );
         assert_eq!(servers[1].bearer_token.as_deref(), Some("oauth://google"));
     }
 
@@ -831,7 +863,10 @@ bearer_token = "oauth://google"
         let servers = parse(s);
         assert_eq!(servers.len(), 1);
         let out = resolve_secret_refs(servers, Path::new("/nonexistent-home")).await;
-        assert!(out.is_empty(), "unresolvable oauth://google ⇒ server dropped");
+        assert!(
+            out.is_empty(),
+            "unresolvable oauth://google ⇒ server dropped"
+        );
     }
 
     #[tokio::test]

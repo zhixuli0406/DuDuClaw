@@ -144,11 +144,24 @@ pub struct CodriveHighlight {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CodriveAction {
-    Move { x: f64, y: f64 },
-    Click { x: f64, y: f64, btn: CodriveButton },
-    Text { s: String },
-    KeyName { name: String },
-    Wait { ms: u32 },
+    Move {
+        x: f64,
+        y: f64,
+    },
+    Click {
+        x: f64,
+        y: f64,
+        btn: CodriveButton,
+    },
+    Text {
+        s: String,
+    },
+    KeyName {
+        name: String,
+    },
+    Wait {
+        ms: u32,
+    },
     /// CD-3 (DESIGN §3.1 "agent 出 take_over 動作 → 同上（主動交棒）", task
     /// brief item 1 "script step 可宣告 take_over（例如登入步）"): this
     /// step's whole "action" is handing the desktop to the human — see
@@ -157,7 +170,9 @@ pub enum CodriveAction {
     /// gated by `consequential`/ApprovalBroker — a take_over step neither
     /// needs nor gets an approval row, same invariant credential-class
     /// auto-conversion already had).
-    TakeOver { reason: String },
+    TakeOver {
+        reason: String,
+    },
 }
 
 /// Closed enum of consequential-step classes. `Credential` is CD-3's
@@ -228,9 +243,13 @@ impl CodriveScript {
             match &mut step.action {
                 CodriveAction::Wait { ms } => *ms = (*ms).min(MAX_WAIT_MS),
                 CodriveAction::TakeOver { reason } => {
-                    *reason = duduclaw_core::truncate_chars(reason.trim(), MAX_TAKE_OVER_REASON_CHARS);
+                    *reason =
+                        duduclaw_core::truncate_chars(reason.trim(), MAX_TAKE_OVER_REASON_CHARS);
                 }
-                CodriveAction::Move { .. } | CodriveAction::Click { .. } | CodriveAction::Text { .. } | CodriveAction::KeyName { .. } => {}
+                CodriveAction::Move { .. }
+                | CodriveAction::Click { .. }
+                | CodriveAction::Text { .. }
+                | CodriveAction::KeyName { .. } => {}
             }
             if let Some(c) = &mut step.consequential {
                 c.description = duduclaw_core::truncate_chars(
@@ -239,7 +258,8 @@ impl CodriveScript {
                 );
             }
             if let Some(api) = &mut step.api_action {
-                api.action = duduclaw_core::truncate_chars(api.action.trim(), MAX_API_ACTION_NAME_CHARS);
+                api.action =
+                    duduclaw_core::truncate_chars(api.action.trim(), MAX_API_ACTION_NAME_CHARS);
             }
             if let Some(loc) = &mut step.locate {
                 loc.role = duduclaw_core::truncate_chars(loc.role.trim(), MAX_LOCATE_ROLE_CHARS);
@@ -316,7 +336,13 @@ mod tests {
         });
         let s = s.sanitize().unwrap();
         assert_eq!(
-            s.steps[0].api_action.as_ref().unwrap().action.chars().count(),
+            s.steps[0]
+                .api_action
+                .as_ref()
+                .unwrap()
+                .action
+                .chars()
+                .count(),
             MAX_API_ACTION_NAME_CHARS
         );
     }

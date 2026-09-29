@@ -48,12 +48,17 @@ impl AgentRuntime for ClaudeRuntime {
             // G1: agent's `[model] account_pool` — narrows the rotator
             // candidate set (fail-open; empty ⇒ full set).
             &context.account_pool,
+            // P1/WP-3: the multi-runtime choke-point's resolved effort (a team
+            // role spec, else the agent's `agent.toml [model] effort`). This is
+            // how effort reaches Claude through `run_agent_prompt`; `None` here
+            // still falls back to the agent dir inside the callee.
+            context.effort,
         )
         .await?;
 
         Ok(RuntimeResponse {
             content: result,
-            input_tokens: 0,  // Token counting happens at the telemetry layer
+            input_tokens: 0, // Token counting happens at the telemetry layer
             output_tokens: 0,
             cache_read_tokens: 0,
             model_used: context.model.clone(),

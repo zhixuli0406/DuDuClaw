@@ -17,7 +17,7 @@ pub struct UserContext {
     /// user normally — see `server.rs::authenticate_jwt` — rather than
     /// refusing the handshake outright, which previously left the frontend
     /// stuck on an unexplained connecting spinner
-    /// (`docs/todo/TODO-bootstrap-admin-ws-deadlock.md`). The single RPC
+    /// (`wiki/reports/resolved-todos/TODO-bootstrap-admin-ws-deadlock.md`). The single RPC
     /// dispatch chokepoint (`MethodHandler::dispatch`) reads this flag and
     /// restricts the caller to a small self-service allowlist
     /// (`users.change_password` chief among them) until it clears.

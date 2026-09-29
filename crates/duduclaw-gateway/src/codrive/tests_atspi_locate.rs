@@ -24,7 +24,10 @@ use super::script::{CodriveAction, CodriveScript, LocateRequest};
 use super::tests::{locate_step, plain_step, spawn_fake_comp, tempdir, write_codrive_config};
 
 fn loc_req(role: &str, name: &str) -> LocateRequest {
-    LocateRequest { role: role.to_string(), name: name.to_string() }
+    LocateRequest {
+        role: role.to_string(),
+        name: name.to_string(),
+    }
 }
 
 // ── miss/failed: unchanged C-L1 injection ───────────────────────────────
@@ -40,7 +43,11 @@ async fn locate_miss_or_failed_falls_back_and_injects_normally() {
         task_summary: "C-L3 locate miss/failed".into(),
         steps: vec![locate_step(
             "點擊儲存按鈕",
-            CodriveAction::Click { x: 42.0, y: 43.0, btn: super::client::CodriveButton::Left },
+            CodriveAction::Click {
+                x: 42.0,
+                y: 43.0,
+                btn: super::client::CodriveButton::Left,
+            },
             loc_req("button", "儲存"),
         )],
         watch_mode: false,
@@ -49,13 +56,24 @@ async fn locate_miss_or_failed_falls_back_and_injects_normally() {
         .await
         .expect("run_script must finish");
 
-    assert_eq!(report.final_state, "completed", "detail: {:?}", report.detail);
-    assert_eq!(report.steps[0].outcome, "applied", "a locate MISS/FAILED must fall back to the ordinary C-L1 outcome");
+    assert_eq!(
+        report.final_state, "completed",
+        "detail: {:?}",
+        report.detail
+    );
+    assert_eq!(
+        report.steps[0].outcome, "applied",
+        "a locate MISS/FAILED must fall back to the ordinary C-L1 outcome"
+    );
 
     // The fallback must carry the step's ORIGINAL literal coordinates —
     // not something a partially-applied locate mutated in place.
     let received = fake.received.lock().await;
-    assert_eq!(received.len(), 3, "click = move + press + release: {received:?}");
+    assert_eq!(
+        received.len(),
+        3,
+        "click = move + press + release: {received:?}"
+    );
     assert_eq!(received[0]["op"], "move");
     assert_eq!(received[0]["x"], 42.0);
     assert_eq!(received[0]["y"], 43.0);
@@ -76,41 +94,74 @@ async fn consequential_locate_step_still_waits_for_approval() {
 
     let mut step = locate_step(
         "點擊送出按鈕（需審批）",
-        CodriveAction::Click { x: 7.0, y: 8.0, btn: super::client::CodriveButton::Left },
+        CodriveAction::Click {
+            x: 7.0,
+            y: 8.0,
+            btn: super::client::CodriveButton::Left,
+        },
         loc_req("button", "送出"),
     );
-    step.consequential =
-        Some(super::script::CodriveConsequential { class: super::script::ConsequentialClass::Submit, description: "送出表單".to_string() });
+    step.consequential = Some(super::script::CodriveConsequential {
+        class: super::script::ConsequentialClass::Submit,
+        description: "送出表單".to_string(),
+    });
 
-    let script = CodriveScript { target_app: "codrive-test-fixture".into(), task_summary: "C-L3 + approval".into(), steps: vec![step], watch_mode: false };
+    let script = CodriveScript {
+        target_app: "codrive-test-fixture".into(),
+        task_summary: "C-L3 + approval".into(),
+        steps: vec![step],
+        watch_mode: false,
+    };
 
     let home2 = home.clone();
     let handle = tokio::spawn(async move { run_script(&home2, "agent1", script).await });
 
     let broker = ApprovalBroker::open(&home).expect("open broker");
     let approval_id = wait_for_one_pending(&broker, Duration::from_secs(5)).await;
-    assert!(fake.received.lock().await.is_empty(), "nothing must reach comp before approval");
+    assert!(
+        fake.received.lock().await.is_empty(),
+        "nothing must reach comp before approval"
+    );
 
-    broker.decide(&approval_id, true, "test").await.expect("decide");
+    broker
+        .decide(&approval_id, true, "test")
+        .await
+        .expect("decide");
 
-    let report = tokio::time::timeout(Duration::from_secs(15), handle).await.expect("join").expect("no panic");
-    assert_eq!(report.final_state, "completed", "detail: {:?}", report.detail);
+    let report = tokio::time::timeout(Duration::from_secs(15), handle)
+        .await
+        .expect("join")
+        .expect("no panic");
+    assert_eq!(
+        report.final_state, "completed",
+        "detail: {:?}",
+        report.detail
+    );
     assert_eq!(report.steps[0].outcome, "applied");
     assert!(report.steps[0].approval_id.is_some());
 
     let received = fake.received.lock().await;
-    assert!(!received.is_empty(), "the fallback coordinate action must reach comp after approval");
+    assert!(
+        !received.is_empty(),
+        "the fallback coordinate action must reach comp after approval"
+    );
     assert_eq!(received[0]["op"], "move");
 }
 
-async fn wait_for_one_pending(broker: &crate::approval::ApprovalBroker, timeout: Duration) -> crate::approval::ApprovalId {
+async fn wait_for_one_pending(
+    broker: &crate::approval::ApprovalBroker,
+    timeout: Duration,
+) -> crate::approval::ApprovalId {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let pending = broker.list_pending(None).await.expect("list_pending");
         if let Some(rec) = pending.into_iter().next() {
             return rec.id;
         }
-        assert!(tokio::time::Instant::now() < deadline, "approval row never appeared");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "approval row never appeared"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -143,12 +194,16 @@ async fn plain_step_without_locate_is_unaffected() {
 }
 
 fn assert_locate_audit_row(home: &std::path::Path, expected_any_of: &[&str]) {
-    let rows = duduclaw_security::audit::read_tool_calls_since(home, "agent1", "2020-01-01T00:00:00Z");
+    let rows =
+        duduclaw_security::audit::read_tool_calls_since(home, "agent1", "2020-01-01T00:00:00Z");
     let hit = rows.iter().find(|r| {
         r.get("tool_name").and_then(|v| v.as_str()) == Some("codrive_run")
             && r.get("locate_outcome")
                 .and_then(|v| v.as_str())
                 .is_some_and(|v| expected_any_of.contains(&v))
     });
-    assert!(hit.is_some(), "expected a tool_calls.jsonl row with locate_outcome in {expected_any_of:?}, got: {rows:?}");
+    assert!(
+        hit.is_some(),
+        "expected a tool_calls.jsonl row with locate_outcome in {expected_any_of:?}, got: {rows:?}"
+    );
 }

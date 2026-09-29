@@ -87,13 +87,14 @@ pub fn list_departments(
 ) -> Vec<DepartmentInfo> {
     let mut by_name: BTreeMap<String, DepartmentInfo> = BTreeMap::new();
     let mut entry = |name: &str, map: &mut BTreeMap<String, DepartmentInfo>| {
-        map.entry(name.to_string()).or_insert_with(|| DepartmentInfo {
-            name: name.to_string(),
-            agent_count: 0,
-            members: Vec::new(),
-            wiki_pages: 0,
-            skills: 0,
-        });
+        map.entry(name.to_string())
+            .or_insert_with(|| DepartmentInfo {
+                name: name.to_string(),
+                agent_count: 0,
+                members: Vec::new(),
+                wiki_pages: 0,
+                skills: 0,
+            });
     };
 
     for (dept, member) in agent_departments {
@@ -132,9 +133,7 @@ pub fn create_department(
     existing: &[DepartmentInfo],
 ) -> Result<(), String> {
     if !duduclaw_core::is_valid_department(name) {
-        return Err(
-            "部門名稱只能使用英數字、'-'、'_'（1–64 字元，將用於檔案路徑）".to_string(),
-        );
+        return Err("部門名稱只能使用英數字、'-'、'_'（1–64 字元，將用於檔案路徑）".to_string());
     }
     if existing.iter().any(|d| d.name == name) {
         return Err(format!("部門「{name}」已存在"));
@@ -169,7 +168,10 @@ pub fn remove_department(
             info.wiki_pages, info.skills,
         ));
     }
-    for root in [wiki_departments_root(home_dir), skills_departments_root(home_dir)] {
+    for root in [
+        wiki_departments_root(home_dir),
+        skills_departments_root(home_dir),
+    ] {
         let dir = root.join(name);
         if dir.exists() {
             std::fs::remove_dir_all(&dir).map_err(|e| format!("刪除部門目錄失敗：{e}"))?;
@@ -191,7 +193,9 @@ mod tests {
         let home = tmp_home();
         std::fs::create_dir_all(wiki_departments_root(home.path()).join("sales")).unwrap();
         std::fs::write(
-            wiki_departments_root(home.path()).join("sales").join("sop.md"),
+            wiki_departments_root(home.path())
+                .join("sales")
+                .join("sop.md"),
             "x",
         )
         .unwrap();
@@ -236,7 +240,9 @@ mod tests {
         let home = tmp_home();
         create_department(home.path(), "sales", &[]).unwrap();
         std::fs::write(
-            wiki_departments_root(home.path()).join("sales").join("sop.md"),
+            wiki_departments_root(home.path())
+                .join("sales")
+                .join("sop.md"),
             "x",
         )
         .unwrap();
@@ -248,15 +254,23 @@ mod tests {
             wiki_pages: 1,
             skills: 0,
         };
-        assert!(remove_department(home.path(), "sales", &with_member, true)
-            .unwrap_err()
-            .contains("AI 員工"));
+        assert!(
+            remove_department(home.path(), "sales", &with_member, true)
+                .unwrap_err()
+                .contains("AI 員工")
+        );
 
-        let no_member = DepartmentInfo { agent_count: 0, members: vec![], ..with_member };
+        let no_member = DepartmentInfo {
+            agent_count: 0,
+            members: vec![],
+            ..with_member
+        };
         // Content present, no force ⇒ refuse; force ⇒ removed.
-        assert!(remove_department(home.path(), "sales", &no_member, false)
-            .unwrap_err()
-            .contains("force"));
+        assert!(
+            remove_department(home.path(), "sales", &no_member, false)
+                .unwrap_err()
+                .contains("force")
+        );
         remove_department(home.path(), "sales", &no_member, true).unwrap();
         assert!(!wiki_departments_root(home.path()).join("sales").exists());
     }

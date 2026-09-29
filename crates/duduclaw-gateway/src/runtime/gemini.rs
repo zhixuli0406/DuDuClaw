@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use duduclaw_core::types::{sandbox_level_for, CapabilitiesConfig, SandboxLevel};
+use duduclaw_core::types::{CapabilitiesConfig, SandboxLevel, sandbox_level_for};
 
 use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 
@@ -208,7 +208,11 @@ fn parse_gemini_stdout(stdout: &str) -> (String, u64, u64, Vec<super::RuntimeChu
                         .and_then(|s| s.as_str())
                         .map(|s| !s.eq_ignore_ascii_case("success"))
                         .unwrap_or(false)
-                        || event.extra.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || event
+                            .extra
+                            .get("is_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
                         || event.extra.get("error").is_some();
                     // R1: `output` is the field the cheat sheet documents for
                     // this event; `content` tolerated as a plausible alternate
@@ -309,7 +313,9 @@ impl AgentRuntime for GeminiRuntime {
         // settings from cwd, which we set to the agent dir below). Idempotent
         // merge; warn-not-fatal — registration failing must not block the reply.
         if let Some(ref dir) = context.agent_dir {
-            if let Err(e) = Self::ensure_duduclaw_mcp_config(dir, &context.agent_id).await {
+            if let Err(e) =
+                Self::ensure_duduclaw_mcp_config(dir, &context.agent_id, &context.home_dir).await
+            {
                 warn!(
                     runtime = "gemini",
                     agent = %context.agent_id,
@@ -320,10 +326,23 @@ impl AgentRuntime for GeminiRuntime {
         }
 
         let mut cmd = tokio::process::Command::new(&self.gemini_path);
-        cmd.arg("-p")
-            .arg("--output-format")
-            .arg("stream-json");
+        cmd.arg("-p").arg("--output-format").arg("stream-json");
         cmd.args(approval_args(caps));
+
+        // P1/WP-3: Gemini CLI has NO effort/thinking flag — the published
+        // 25-flag CLI reference lists none, and the local probe
+        // (`research/multi-model-routing-2026-09/17-P0-cli-flag-probe.md` §2/§6)
+        // confirmed 查無. Log at debug and carry on rather than inventing a flag
+        // that would make the spawn fail; the agent still runs, just at the
+        // provider default depth.
+        if let Some(effort) = context.effort {
+            tracing::debug!(
+                runtime = "gemini",
+                agent = %context.agent_id,
+                effort = %effort,
+                "Gemini CLI exposes no reasoning-effort flag — effort ignored for this spawn"
+            );
+        }
 
         // Pass system prompt via GEMINI_SYSTEM_MD env var (temp file).
         // Gemini CLI has no --system-instruction flag.
@@ -356,8 +375,17 @@ impl AgentRuntime for GeminiRuntime {
             cmd.arg("-m").arg(&context.model);
         }
 
-        // Set working directory
-        if let Some(ref dir) = context.agent_dir {
+        // Working root. Normally the agent's own directory; a caller may
+        // override it via `super::SPAWN_OVERRIDE` (today: the team composer,
+        // putting a role member in the employee's workspace so its files
+        // outlive the throwaway scaffold — design §4.3 E3). Until the
+        // 2026-09-28 review this runtime ignored the override entirely, so a
+        // gemini role member wrote into its own scaffold and the immediate GC
+        // deleted the work. Identity is NOT affected: the MCP settings written
+        // above stay keyed to `agent_dir`.
+        let work_root: Option<std::path::PathBuf> =
+            super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
+        if let Some(ref dir) = work_root {
             cmd.current_dir(dir);
         }
 
@@ -375,7 +403,11 @@ impl AgentRuntime for GeminiRuntime {
 
         // Native OS sandbox (opt-in). Layered on top of the CLI approval/sandbox
         // flags; fail-closed if required but unavailable.
-        super::apply_native_sandbox(&mut cmd, caps, context.agent_dir.as_deref(), "gemini")?;
+        // Scoped to the working root, so an overridden cwd is the directory
+        // that gets write access (a sandbox scoped to the scaffold would forbid
+        // exactly the writes the override exists to allow) — same rule as
+        // `runtime/codex.rs`.
+        super::apply_native_sandbox(&mut cmd, caps, work_root.as_deref(), "gemini")?;
 
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -477,7 +509,8 @@ impl GeminiRuntime {
         } else {
             dirs::home_dir()
                 .ok_or("No home dir")?
-                .join(".gemini").join("settings.json")
+                .join(".gemini")
+                .join("settings.json")
         };
         let existing = tokio::fs::read_to_string(&settings_path)
             .await
@@ -495,7 +528,9 @@ impl GeminiRuntime {
         if !mcp.is_object() {
             *mcp = serde_json::json!({});
         }
-        let map = mcp.as_object_mut().expect("mcpServers normalized to object");
+        let map = mcp
+            .as_object_mut()
+            .expect("mcpServers normalized to object");
         let mut changed = false;
         for (name, def) in servers {
             if map.get(name) != Some(def) {
@@ -507,7 +542,9 @@ impl GeminiRuntime {
             return Ok(false);
         }
         if let Some(parent) = settings_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         tokio::fs::write(
             &settings_path,
@@ -527,8 +564,9 @@ impl GeminiRuntime {
     pub async fn ensure_duduclaw_mcp_config(
         agent_dir: &std::path::Path,
         agent_id: &str,
+        home_dir: &std::path::Path,
     ) -> Result<bool, String> {
-        let Some(def) = super::duduclaw_mcp_server_json(agent_id) else {
+        let Some(def) = super::duduclaw_mcp_server_json_for_home(agent_id, home_dir) else {
             return Err("duduclaw binary did not resolve to an absolute path".to_string());
         };
         let mut servers = std::collections::HashMap::new();
@@ -557,7 +595,10 @@ mod tests {
         let line = r#"{"type":"message","role":"assistant","content":"Thinking..."}"#;
         let event: GeminiEvent = serde_json::from_str(line).unwrap();
         assert_eq!(event.event_type, "message");
-        assert_eq!(event.extra.get("role").unwrap().as_str().unwrap(), "assistant");
+        assert_eq!(
+            event.extra.get("role").unwrap().as_str().unwrap(),
+            "assistant"
+        );
     }
 
     // ── T10: parse_gemini_stdout → RuntimeChunk → NativeToolEvent ───────
@@ -574,7 +615,10 @@ mod tests {
         );
         let (_, _, _, chunks) = parse_gemini_stdout(stdout);
         assert_eq!(chunks.len(), 2);
-        assert!(matches!(chunks[0], super::super::RuntimeChunk::ToolUse { .. }));
+        assert!(matches!(
+            chunks[0],
+            super::super::RuntimeChunk::ToolUse { .. }
+        ));
         match &chunks[1] {
             super::super::RuntimeChunk::ToolResult { is_error, .. } => assert!(!is_error),
             other => panic!("expected ToolResult, got {other:?}"),
@@ -695,8 +739,17 @@ mod tests {
         let (_, _, _, chunks) = parse_gemini_stdout(stdout);
         let events = super::super::native_tool_events_from_chunks(&chunks);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].result_text.as_deref(), Some("quarterly revenue: 1.2M"));
-        assert!(events[0].input_text.as_deref().unwrap().contains("cat report.md"));
+        assert_eq!(
+            events[0].result_text.as_deref(),
+            Some("quarterly revenue: 1.2M")
+        );
+        assert!(
+            events[0]
+                .input_text
+                .as_deref()
+                .unwrap()
+                .contains("cat report.md")
+        );
     }
 
     #[test]
@@ -803,13 +856,17 @@ mod tests {
                 "env": { "DUDUCLAW_AGENT_ID": "agnes" },
             }),
         );
-        assert!(GeminiRuntime::write_mcp_config(Some(dir.path()), &servers)
-            .await
-            .unwrap());
+        assert!(
+            GeminiRuntime::write_mcp_config(Some(dir.path()), &servers)
+                .await
+                .unwrap()
+        );
         // Second call: entry already matches → no write.
-        assert!(!GeminiRuntime::write_mcp_config(Some(dir.path()), &servers)
-            .await
-            .unwrap());
+        assert!(
+            !GeminiRuntime::write_mcp_config(Some(dir.path()), &servers)
+                .await
+                .unwrap()
+        );
 
         let got: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();

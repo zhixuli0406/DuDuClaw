@@ -60,7 +60,8 @@ pub fn slug_ok(s: &str) -> bool {
     let b = s.as_bytes();
     (2..=64).contains(&b.len())
         && b[0].is_ascii_lowercase() | b[0].is_ascii_digit()
-        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
 pub fn code_lane(e: &RegistryEntry) -> bool {
@@ -92,7 +93,6 @@ pub fn verify_minisig(data: &[u8], sig_text: &str, pub_file: &str) -> Result<()>
         .map_err(|e| cfg(format!("簽章驗證失敗——拒絕安裝：{e}")))
 }
 
-
 /// WP2.5 — BRAT-style side door: `github:user/repo[@branch]` → the repo's
 /// source-archive zip URL. Unregistered, unreviewed — the caller prints the
 /// self-responsibility warning; the normal install pipeline (zip fence,
@@ -107,13 +107,22 @@ pub fn github_archive_url(spec: &str) -> Result<(String, String)> {
     let ok_seg = |s: &str| {
         !s.is_empty()
             && s.len() <= 100
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            && s != "." && s != ".."
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            && s != "."
+            && s != ".."
     };
     let Some((user, repo)) = repo_part.split_once('/') else {
-        return Err(cfg(format!("github: 來源格式應為 user/repo[@branch]：{spec}")));
+        return Err(cfg(format!(
+            "github: 來源格式應為 user/repo[@branch]：{spec}"
+        )));
     };
-    if !ok_seg(user) || !ok_seg(repo) || !branch.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')) {
+    if !ok_seg(user)
+        || !ok_seg(repo)
+        || !branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    {
         return Err(cfg(format!("github: 來源含不合法字元：{spec}")));
     }
     Ok((
@@ -152,7 +161,11 @@ pub fn compute_score(dir: &std::path::Path) -> (&'static str, Vec<String>) {
             }
         }
     }
-    check(has_boundary, "boundary", "SOUL 缺「邊界」段（安裝者最看重的一段）");
+    check(
+        has_boundary,
+        "boundary",
+        "SOUL 缺「邊界」段（安裝者最看重的一段）",
+    );
 
     let raw = std::fs::read_to_string(dir.join("expert.toml")).unwrap_or_default();
     check(
@@ -160,15 +173,29 @@ pub fn compute_score(dir: &std::path::Path) -> (&'static str, Vec<String>) {
         "requires",
         "未宣告 requires（env/bins 前置條件）",
     );
-    check(dir.join("evals").is_dir(), "evals", "未附 eval 案例（附了直接升一級）");
+    check(
+        dir.join("evals").is_dir(),
+        "evals",
+        "未附 eval 案例（附了直接升一級）",
+    );
     check(
         dir.join("README.md").is_file() || dir.join("CHANGELOG.md").is_file(),
         "docs",
         "缺 README/CHANGELOG（版本沿革）",
     );
-    check(dir.join("wiki").is_dir(), "wiki", "無 wiki 知識頁（SOP/參考資料）");
+    check(
+        dir.join("wiki").is_dir(),
+        "wiki",
+        "無 wiki 知識頁（SOP/參考資料）",
+    );
 
-    let tier = if points >= 5 { "Gold" } else if points >= 3 { "Silver" } else { "Bronze" };
+    let tier = if points >= 5 {
+        "Gold"
+    } else if points >= 3 {
+        "Silver"
+    } else {
+        "Bronze"
+    };
     (tier, missing)
 }
 
@@ -188,7 +215,10 @@ pub async fn fetch_small(url: &str, cap: usize, what: &str) -> Result<Vec<u8>> {
     if !resp.status().is_success() {
         return Err(cfg(format!("{what} 下載失敗 HTTP {}", resp.status())));
     }
-    let bytes = resp.bytes().await.map_err(|e| cfg(format!("{what} 讀取失敗：{e}")))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| cfg(format!("{what} 讀取失敗：{e}")))?;
     if bytes.len() > cap {
         return Err(cfg(format!("{what} 過大（{} > {cap} bytes）", bytes.len())));
     }
@@ -202,11 +232,19 @@ pub async fn fetch_verified_archive(slug: &str) -> Result<(RegistryEntry, Vec<u8
         return Err(cfg(format!("registry slug 不合法：{slug}")));
     }
     let base = registry_base();
-    let entry_bytes = fetch_small(&format!("{base}/index/{slug}.json"), 64 * 1024, "registry entry").await?;
+    let entry_bytes = fetch_small(
+        &format!("{base}/index/{slug}.json"),
+        64 * 1024,
+        "registry entry",
+    )
+    .await?;
     let entry: RegistryEntry = serde_json::from_slice(&entry_bytes)
         .map_err(|e| cfg(format!("registry entry 解析失敗：{e}")))?;
     if entry.slug != slug {
-        return Err(cfg(format!("registry entry slug 不符（{} ≠ {slug}）", entry.slug)));
+        return Err(cfg(format!(
+            "registry entry slug 不符（{} ≠ {slug}）",
+            entry.slug
+        )));
     }
     if !entry.archive_url.starts_with("https://") {
         return Err(cfg("registry entry 的 archive_url 必須是 https".to_string()));
@@ -232,17 +270,19 @@ pub async fn fetch_verified_archive(slug: &str) -> Result<(RegistryEntry, Vec<u8
 
     // 2) Authenticity: code lane must verify the publisher's signature.
     if code_lane(&entry) {
-        let sig_url = entry
-            .minisig_url
-            .as_deref()
-            .ok_or_else(|| cfg("此包含 hooks/skills（code lane）但 entry 缺 minisig_url——拒絕安裝"))?;
+        let sig_url = entry.minisig_url.as_deref().ok_or_else(|| {
+            cfg("此包含 hooks/skills（code lane）但 entry 缺 minisig_url——拒絕安裝")
+        })?;
         let sig_text = String::from_utf8(fetch_small(sig_url, 4 * 1024, "minisig 簽章").await?)
             .map_err(|_| cfg("minisig 簽章不是合法 UTF-8"))?;
         let key_url = format!("{base}/publishers/{}/minisign.pub", entry.publisher);
         let pub_file = String::from_utf8(fetch_small(&key_url, 4 * 1024, "publisher 公鑰").await?)
             .map_err(|_| cfg("publisher 公鑰不是合法 UTF-8"))?;
         verify_minisig(&archive, &sig_text, &pub_file)?;
-        println!("🔏 code lane 簽章驗證通過（publisher: {}）", entry.publisher);
+        println!(
+            "🔏 code lane 簽章驗證通過（publisher: {}）",
+            entry.publisher
+        );
     }
 
     Ok((entry, archive))
@@ -285,37 +325,51 @@ mod tests {
         assert!(pubkey_base64_from_file("").is_err());
     }
 
-
     #[test]
     fn github_side_door_url_shapes() {
         let (url, label) = github_archive_url("alice/my-pack").unwrap();
-        assert_eq!(url, "https://github.com/alice/my-pack/archive/refs/heads/main.zip");
+        assert_eq!(
+            url,
+            "https://github.com/alice/my-pack/archive/refs/heads/main.zip"
+        );
         assert_eq!(label, "alice/my-pack@main");
         let (url2, _) = github_archive_url("alice/my-pack@dev").unwrap();
         assert!(url2.ends_with("/refs/heads/dev.zip"));
         assert!(github_archive_url("no-slash").is_err());
         assert!(github_archive_url("../evil/x").is_err());
-        assert!(github_archive_url("a/b@").map(|(u, _)| u.ends_with("main.zip")).unwrap_or(false));
+        assert!(
+            github_archive_url("a/b@")
+                .map(|(u, _)| u.ends_with("main.zip"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
-    fn score_tiers_are_deterministic(){
+    fn score_tiers_are_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         // Bare dir ⇒ Bronze with a full missing list.
         let (tier, missing) = compute_score(dir.path());
         assert_eq!(tier, "Bronze");
         assert!(missing.len() >= 4);
         // Manifest + boundary + requires ⇒ Silver.
-        std::fs::write(dir.path().join("expert.toml"), "[expert]
+        std::fs::write(
+            dir.path().join("expert.toml"),
+            "[expert]
 name='x'
 [expert.requires]
 env=[]
-").unwrap();
+",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.path().join("agents/a")).unwrap();
-        std::fs::write(dir.path().join("agents/a/soul.md"), "# A
+        std::fs::write(
+            dir.path().join("agents/a/soul.md"),
+            "# A
 ## 邊界
 只是測試
-").unwrap();
+",
+        )
+        .unwrap();
         let (tier2, _) = compute_score(dir.path());
         assert_eq!(tier2, "Silver");
         // + evals + README + wiki ⇒ Gold.

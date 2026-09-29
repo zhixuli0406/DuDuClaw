@@ -436,12 +436,20 @@ while IFS='|' read -r kind file; do
                 }
                 { print }
             ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
-            # A workspace-EXCLUDED crate (duduclaw-shell / duduclaw-native-gui /
-            # duduclaw-comp -- see the root Cargo.toml `[workspace] exclude`
-            # list) carries its OWN standalone Cargo.lock with a self-
-            # referential `[[package]] name = "<crate>" version = "..."`
-            # entry (workspace-member crates don't -- they resolve through
+            # A workspace-EXCLUDED crate (see the root Cargo.toml
+            # `[workspace] exclude` list) carries its OWN standalone
+            # Cargo.lock with a self-referential
+            # `[[package]] name = "<crate>" version = "..."` entry
+            # (workspace-member crates don't -- they resolve through
             # the ONE root Cargo.lock, already staged separately below).
+            #
+            # 2026-09-29 (S16): the three crates this was written for
+            # (duduclaw-shell / duduclaw-native-gui / duduclaw-comp) now live
+            # in the DuDuClaw-OS repo's `crates/`, so `crates/*/Cargo.lock`
+            # currently matches nothing here and the block below is a no-op.
+            # It is kept, not deleted: the mechanism is generic and the next
+            # excluded crate under `crates/` gets it for free. The historical
+            # account below is why it exists at all.
             # This script bumps the crate's Cargo.toml above but, until this
             # fix, never touched that sibling Cargo.lock -- `cargo build
             # --locked` (what cargo.bbclass runs for duduclaw-comp's Yocto

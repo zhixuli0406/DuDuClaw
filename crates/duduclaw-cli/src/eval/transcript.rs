@@ -154,9 +154,7 @@ pub fn parse_stream_json(stdout: &str) -> Result<EvalTranscript, String> {
                 {
                     t.last_stop_reason = Some(sr.to_string());
                 }
-                let Some(content) = event
-                    .pointer("/message/content")
-                    .and_then(|c| c.as_array())
+                let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array())
                 else {
                     continue;
                 };
@@ -179,10 +177,7 @@ pub fn parse_stream_json(stdout: &str) -> Result<EvalTranscript, String> {
                                 .get("input")
                                 .cloned()
                                 .unwrap_or(serde_json::Value::Null);
-                            let id = block
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
+                            let id = block.get("id").and_then(|v| v.as_str()).map(String::from);
                             let idx = t.tool_uses.len();
                             open.push((id.clone().unwrap_or_default(), idx));
                             t.tool_uses.push(ToolInvocation {
@@ -198,9 +193,7 @@ pub fn parse_stream_json(stdout: &str) -> Result<EvalTranscript, String> {
                 }
             }
             Some("user") => {
-                let Some(content) = event
-                    .pointer("/message/content")
-                    .and_then(|c| c.as_array())
+                let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array())
                 else {
                     continue;
                 };
@@ -362,7 +355,10 @@ mod tests {
         let t = parse_stream_json(&stdout).unwrap();
         assert_eq!(t.tool_uses.len(), 1);
         assert_eq!(t.tool_uses[0].id.as_deref(), Some("tu_1"));
-        assert_eq!(t.tool_uses[0].result_text.as_deref(), Some("policy: 30 days"));
+        assert_eq!(
+            t.tool_uses[0].result_text.as_deref(),
+            Some("policy: 30 days")
+        );
         assert!(!t.tool_uses[0].is_error);
     }
 
@@ -371,7 +367,9 @@ mod tests {
         // Mirrors the shipped `greeting-replay.transcript.jsonl` fixture:
         // neither block carries an id.
         let stdout = [
-            assistant("{\"type\":\"tool_use\",\"name\":\"mcp__duduclaw__tasks_create\",\"input\":{}}"),
+            assistant(
+                "{\"type\":\"tool_use\",\"name\":\"mcp__duduclaw__tasks_create\",\"input\":{}}",
+            ),
             user_tool_result("{\"type\":\"tool_result\",\"content\":\"task created: #42\"}"),
         ]
         .join("\n");
@@ -469,7 +467,9 @@ mod tests {
         assert_eq!(t.last_result_subtype.as_deref(), Some("error_max_turns"));
 
         let rate_limited = "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You've hit your session limit\"}";
-        assert!(parse_stream_json(rate_limited).is_err(), "infra errors must stay hard");
+        assert!(
+            parse_stream_json(rate_limited).is_err(),
+            "infra errors must stay hard"
+        );
     }
-
 }

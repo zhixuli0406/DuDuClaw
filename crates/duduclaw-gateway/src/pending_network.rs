@@ -228,7 +228,10 @@ mod tests {
 
     #[test]
     fn malformed_json_is_rejected() {
-        assert_eq!(evaluate_pending_network("{ not json"), Err(Discard::Malformed));
+        assert_eq!(
+            evaluate_pending_network("{ not json"),
+            Err(Discard::Malformed)
+        );
     }
 
     #[test]
@@ -260,10 +263,7 @@ mod tests {
         let ssid = "咖啡廳無線網路測試站";
         assert_eq!(ssid.len(), 30);
         let raw = serde_json::json!({ "ssid": ssid, "psk": null }).to_string();
-        assert_eq!(
-            evaluate_pending_network(&raw),
-            Ok((ssid.to_string(), None))
-        );
+        assert_eq!(evaluate_pending_network(&raw), Ok((ssid.to_string(), None)));
     }
 
     #[test]
@@ -274,8 +274,7 @@ mod tests {
 
     #[test]
     fn psk_over_maximum_is_rejected() {
-        let raw =
-            serde_json::json!({ "ssid": "HomeWifi", "psk": "a".repeat(64) }).to_string();
+        let raw = serde_json::json!({ "ssid": "HomeWifi", "psk": "a".repeat(64) }).to_string();
         assert_eq!(evaluate_pending_network(&raw), Err(Discard::PskInvalid));
     }
 

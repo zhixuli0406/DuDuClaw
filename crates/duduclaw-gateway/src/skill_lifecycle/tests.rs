@@ -6,7 +6,11 @@ mod compression_tests {
 
     #[test]
     fn compress_with_description() {
-        let c = CompressedSkill::compress("rust_expert", "Use idiomatic Rust patterns.", Some("Rust programming expertise"));
+        let c = CompressedSkill::compress(
+            "rust_expert",
+            "Use idiomatic Rust patterns.",
+            Some("Rust programming expertise"),
+        );
         assert_eq!(c.name, "rust_expert");
         assert_eq!(c.tag, "rust_expert");
         assert_eq!(c.summary, "Rust programming expertise");
@@ -75,11 +79,15 @@ mod relevance_tests {
 
     #[test]
     fn rank_cjk_message() {
-        let skills = vec![
-            make_skill("zh_tone", "\u{7e41}\u{9ad4}\u{4e2d}\u{6587}\u{56de}\u{8986}\u{98a8}\u{683c}"),
-        ];
+        let skills = vec![make_skill(
+            "zh_tone",
+            "\u{7e41}\u{9ad4}\u{4e2d}\u{6587}\u{56de}\u{8986}\u{98a8}\u{683c}",
+        )];
         // 繁體中文回覆
-        let ranked = rank_skills("\u{8acb}\u{7528}\u{7e41}\u{9ad4}\u{4e2d}\u{6587}\u{56de}\u{7b54}", &skills);
+        let ranked = rank_skills(
+            "\u{8acb}\u{7528}\u{7e41}\u{9ad4}\u{4e2d}\u{6587}\u{56de}\u{7b54}",
+            &skills,
+        );
         assert!(!ranked.is_empty());
     }
 
@@ -108,7 +116,12 @@ mod diagnostician_tests {
     use crate::skill_lifecycle::diagnostician::*;
     use chrono::Utc;
 
-    fn make_error(composite: f64, corrections: u32, follow_ups: u32, topics: Vec<String>) -> PredictionError {
+    fn make_error(
+        composite: f64,
+        corrections: u32,
+        follow_ups: u32,
+        topics: Vec<String>,
+    ) -> PredictionError {
         PredictionError {
             delta_satisfaction: 0.2,
             topic_surprise: if topics.is_empty() { 0.0 } else { 0.6 },
@@ -125,13 +138,23 @@ mod diagnostician_tests {
                 timestamp: Utc::now(),
             },
             actual: ConversationMetrics {
-                session_id: "s".into(), user_id: "u".into(), agent_id: "a".into(),
-                message_count: 4, user_message_count: 2, assistant_message_count: 2,
-                avg_assistant_response_length: 200.0, total_tokens: 100, response_time_ms: 0,
-                user_follow_ups: follow_ups, user_corrections: corrections,
+                session_id: "s".into(),
+                user_id: "u".into(),
+                agent_id: "a".into(),
+                message_count: 4,
+                user_message_count: 2,
+                assistant_message_count: 2,
+                avg_assistant_response_length: 200.0,
+                total_tokens: 100,
+                response_time_ms: 0,
+                user_follow_ups: follow_ups,
+                user_corrections: corrections,
                 feedback_details: Default::default(),
-                detected_language: "en".into(), extracted_topics: topics,
-                ended_naturally: true, feedback_signal: None, timestamp: Utc::now(),
+                detected_language: "en".into(),
+                extracted_topics: topics,
+                ended_naturally: true,
+                feedback_signal: None,
+                timestamp: Utc::now(),
                 user_text: String::new(),
             },
         }
@@ -145,7 +168,11 @@ mod diagnostician_tests {
 
     #[test]
     fn correction_with_matching_skill_suggests_it() {
-        let skills = vec![CompressedSkill::compress("precision", "accurate precise exact correct", None)];
+        let skills = vec![CompressedSkill::compress(
+            "precision",
+            "accurate precise exact correct",
+            None,
+        )];
         let error = make_error(0.4, 1, 0, vec!["precise".into()]);
         let diag = diagnose(&error, &skills).unwrap();
         assert!(!diag.suggested_skills.is_empty());
@@ -219,8 +246,12 @@ mod activation_tests {
         assert!(active.contains("skill_c"));
         assert_eq!(active.len(), 2);
         // evicted must be Some (capacity was full) and must NOT be skill_c itself.
-        let evicted_name = evicted.expect("activate must return the evicted skill when at capacity");
-        assert_ne!(evicted_name, "skill_c", "the newly activated skill must not report itself as evicted");
+        let evicted_name =
+            evicted.expect("activate must return the evicted skill when at capacity");
+        assert_ne!(
+            evicted_name, "skill_c",
+            "the newly activated skill must not report itself as evicted"
+        );
     }
 
     /// Verify activate() returns Some(evicted_skill) carrying the correct name,
@@ -260,7 +291,10 @@ mod activation_tests {
         );
         // After eviction, skill_a must no longer be active.
         let active = ctrl.get_active("agent2");
-        assert!(!active.contains("skill_a"), "evicted skill must be deactivated");
+        assert!(
+            !active.contains("skill_a"),
+            "evicted skill must be deactivated"
+        );
         assert!(active.contains("skill_b"), "skill_b must remain active");
         assert!(active.contains("skill_c"), "skill_c must be newly active");
     }
@@ -270,7 +304,10 @@ mod activation_tests {
     fn activate_returns_none_when_no_eviction() {
         let mut ctrl = SkillActivationController::new(5);
         let evicted = ctrl.activate("agent1", "skill_a", 0.5);
-        assert!(evicted.is_none(), "no eviction needed when under max_active");
+        assert!(
+            evicted.is_none(),
+            "no eviction needed when under max_active"
+        );
     }
 
     /// Verify activate() returns None for a skill that is already active.
@@ -280,7 +317,10 @@ mod activation_tests {
         ctrl.activate("agent1", "skill_a", 0.5);
         // Activating the same skill again must not trigger eviction.
         let evicted = ctrl.activate("agent1", "skill_a", 0.4);
-        assert!(evicted.is_none(), "re-activating an already active skill must not evict");
+        assert!(
+            evicted.is_none(),
+            "re-activating an already active skill must not evict"
+        );
     }
 }
 
@@ -292,7 +332,7 @@ mod lift_tests {
     fn lift_positive_when_skill_helps() {
         let mut tracker = SkillLiftTracker::new("s1".into(), "a1".into());
         for _ in 0..15 {
-            tracker.record_with(0.1);    // low error with skill
+            tracker.record_with(0.1); // low error with skill
             tracker.record_without(0.4); // high error without
         }
         assert!(tracker.lift() > 0.0);
@@ -317,7 +357,6 @@ mod lift_tests {
 
 #[cfg(test)]
 mod distillation_tests {
-    use crate::skill_lifecycle::compression::CompressedSkill;
     use crate::skill_lifecycle::distillation::*;
     use crate::skill_lifecycle::lift::SkillLiftTracker;
 
@@ -355,19 +394,5 @@ mod distillation_tests {
         let candidates = scan_for_distillation("a1", &[&t1, &t2]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].skill_name, "mature");
-    }
-
-    #[test]
-    fn build_distillation_input_has_xml_tags() {
-        let skill = CompressedSkill::compress("s1", "skill content", None);
-        let mut tracker = SkillLiftTracker::new("s1".into(), "a1".into());
-        tracker.load_count = 60;
-        for _ in 0..15 { tracker.record_with(0.1); tracker.record_without(0.4); }
-        let candidate = DistillationCandidate::from_tracker(&tracker);
-
-        let input = build_distillation_input(&skill, &candidate, "current soul", None);
-        assert!(input.trigger_context.contains("<skill_to_distill>"));
-        assert!(input.trigger_context.contains("</skill_to_distill>"));
-        assert!(input.trigger_context.contains("2-5"));
     }
 }

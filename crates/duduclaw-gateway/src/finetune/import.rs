@@ -24,9 +24,9 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{io_err, models_dir, FinetuneError, Result};
+use super::{FinetuneError, Result, io_err, models_dir};
 
 /// Extensions we will place in the models directory.
 const ALLOWED_EXTENSIONS: &[&str] = &["gguf", "safetensors", "bin"];
@@ -154,7 +154,10 @@ mod tests {
             "a\\b.gguf",
             ".hidden.gguf",
         ] {
-            assert!(validate_artifact_name(bad).is_err(), "should reject {bad:?}");
+            assert!(
+                validate_artifact_name(bad).is_err(),
+                "should reject {bad:?}"
+            );
         }
     }
 
@@ -169,7 +172,10 @@ mod tests {
                 .unwrap(),
             "m.gguf"
         );
-        assert_eq!(artifact_filename("  https://x/y/z.gguf  ").unwrap(), "z.gguf");
+        assert_eq!(
+            artifact_filename("  https://x/y/z.gguf  ").unwrap(),
+            "z.gguf"
+        );
         assert!(artifact_filename("").is_err());
         assert!(artifact_filename("https://example.com/evil.sh").is_err());
         // Traversal in a URL path still ends at a rejected basename.
@@ -205,15 +211,24 @@ mod tests {
     async fn import_refuses_missing_files_plaintext_http_and_wrong_types() {
         let home = tempfile::tempdir().unwrap();
         assert_eq!(
-            import(home.path(), "/no/such/file.gguf").await.unwrap_err().code(),
+            import(home.path(), "/no/such/file.gguf")
+                .await
+                .unwrap_err()
+                .code(),
             "not_found"
         );
         assert_eq!(
-            import(home.path(), "http://example.com/m.gguf").await.unwrap_err().code(),
+            import(home.path(), "http://example.com/m.gguf")
+                .await
+                .unwrap_err()
+                .code(),
             "bad_request"
         );
         assert_eq!(
-            import(home.path(), "/tmp/README.md").await.unwrap_err().code(),
+            import(home.path(), "/tmp/README.md")
+                .await
+                .unwrap_err()
+                .code(),
             "bad_request"
         );
     }
@@ -226,7 +241,10 @@ mod tests {
         let f = models.join("already.gguf");
         std::fs::write(&f, b"bytes").unwrap();
         assert_eq!(
-            import(home.path(), f.to_str().unwrap()).await.unwrap_err().code(),
+            import(home.path(), f.to_str().unwrap())
+                .await
+                .unwrap_err()
+                .code(),
             "bad_request"
         );
         // The original is intact — a self-copy must never zero the file.

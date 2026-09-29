@@ -18,7 +18,7 @@
 //!   `agent.toml [capabilities] approval_required_tools`.
 
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Duration;
 
@@ -26,6 +26,77 @@ use crate::mcp_oauth;
 
 /// Provider id in the `mcp_oauth` vault.
 pub const GITHUB_PROVIDER: &str = "github";
+
+/// Feature gate for the whole GitHub integration (the 5 MCP tools + their
+/// visibility in `tools/list`), mirroring
+/// [`crate::google_workspace::integration_enabled`].
+///
+/// H8 (2026-09 feature audit): GitHub was the one native-REST integration with
+/// **no** gate — a token in the OAuth vault was treated as "available to every
+/// agent", while the structurally identical Google path is deny-by-default.
+/// That asymmetry meant an operator who connected GitHub once for themselves
+/// silently handed `github_issue_comment` (a **publicly visible** write) to
+/// every agent on the box. Missing / unreadable config reads as disabled
+/// (fail closed), and connecting through the dashboard flips it on — the same
+/// "connecting IS the opt-in" rule Google follows, so nobody has to learn a
+/// new switch.
+pub fn integration_enabled(home_dir: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(home_dir.join("config.toml")) else {
+        return false;
+    };
+    let Ok(table) = raw.parse::<toml::Table>() else {
+        return false;
+    };
+    table
+        .get("integrations")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("github"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Flip `config.toml [integrations] github = true` in place.
+///
+/// Same contract (and the same `toml_edit` round-trip, so operator comments
+/// survive) as [`crate::google_workspace::enable_integration`]: `Ok(true)`
+/// when the file changed, `Ok(false)` when it was already on, and an error
+/// rather than a silent overwrite on malformed TOML.
+pub fn enable_integration(home_dir: &Path) -> std::io::Result<bool> {
+    if integration_enabled(home_dir) {
+        return Ok(false);
+    }
+    let path = home_dir.join("config.toml");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let mut doc: toml_edit::DocumentMut = raw.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("config.toml is not valid TOML, refusing to rewrite it: {e}"),
+        )
+    })?;
+    doc.as_table_mut()
+        .entry("integrations")
+        .or_insert(toml_edit::table())
+        .as_table_mut()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "[integrations] exists but is not a table",
+            )
+        })?
+        .insert("github", toml_edit::value(true));
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(true)
+}
+
+/// The message an agent sees when it calls a GitHub tool while the gate is
+/// closed. Mirrors the Google refusal so both read the same way.
+pub const INTEGRATION_DISABLED_MESSAGE: &str = "GitHub 整合尚未啟用。請操作者在 dashboard 的 整合 → 工具伺服器 頁面完成 GitHub 連線（會自動啟用），或手動在 config.toml 加上 [integrations] github = true。";
 
 const GITHUB_BASE: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
@@ -90,7 +161,10 @@ pub enum GithubApiError {
     NotFound(String),
     /// 429 / secondary rate limit after one retry.
     RateLimited,
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for GithubApiError {
@@ -328,7 +402,10 @@ async fn github_request(
                 }
             }
             404 => GithubApiError::NotFound(msg),
-            _ => GithubApiError::Api { status: code, message: msg },
+            _ => GithubApiError::Api {
+                status: code,
+                message: msg,
+            },
         });
     }
 }
@@ -352,7 +429,10 @@ pub async fn github_search_issues(
     )
     .await?;
 
-    let total = resp.get("total_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let total = resp
+        .get("total_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let items: Vec<IssueHit> = resp
         .get("items")
         .and_then(|i| i.as_array())
@@ -411,8 +491,16 @@ pub async fn github_issue_read(
     Ok(IssueReadResult {
         repo: format!("{owner}/{repo}"),
         number,
-        title: issue.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        state: issue.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        title: issue
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        state: issue
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         author: issue
             .get("user")
             .and_then(|u| u.get("login"))
@@ -420,8 +508,16 @@ pub async fn github_issue_read(
             .unwrap_or("")
             .to_string(),
         is_pr: issue.get("pull_request").is_some(),
-        updated: issue.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        url: issue.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        updated: issue
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        url: issue
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         body,
         body_truncated,
         comment_count,
@@ -451,7 +547,10 @@ pub async fn github_pr_read(
     let body_raw = pr.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let body = duduclaw_core::truncate_chars(body_raw, BODY_MAX_CHARS);
     let body_truncated = body.chars().count() < body_raw.chars().count();
-    let changed_files = pr.get("changed_files").and_then(|v| v.as_u64()).unwrap_or(0);
+    let changed_files = pr
+        .get("changed_files")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     let files_json = github_request(
         token,
@@ -472,20 +571,46 @@ pub async fn github_pr_read(
     Ok(PrReadResult {
         repo: format!("{owner}/{repo}"),
         number,
-        title: pr.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        state: pr.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        title: pr
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        state: pr
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         author: pr
             .get("user")
             .and_then(|u| u.get("login"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        base: pr.get("base").and_then(|b| b.get("ref")).and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        head: pr.get("head").and_then(|b| b.get("ref")).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        base: pr
+            .get("base")
+            .and_then(|b| b.get("ref"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        head: pr
+            .get("head")
+            .and_then(|b| b.get("ref"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         merged: pr.get("merged").and_then(|v| v.as_bool()).unwrap_or(false),
         mergeable: pr.get("mergeable").and_then(|v| v.as_bool()),
-        updated: pr.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        url: pr.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        updated: pr
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        url: pr
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         body,
         body_truncated,
         changed_files,
@@ -522,7 +647,11 @@ pub async fn github_issue_comment(
 
     Ok(CommentResult {
         id: resp.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
-        url: resp.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        url: resp
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
     })
 }
 
@@ -550,11 +679,27 @@ fn parse_issue_hit(item: &Value) -> IssueHit {
     IssueHit {
         repo: repo_from_repository_url(repo_url),
         number: item.get("number").and_then(|v| v.as_u64()).unwrap_or(0),
-        title: item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        state: item.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        title: item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        state: item
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         is_pr: item.get("pull_request").is_some(),
-        updated: item.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        url: item.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        updated: item
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        url: item
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
     }
 }
 
@@ -567,15 +712,27 @@ fn parse_comment(c: &Value) -> IssueComment {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        created: c.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        created: c
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         body: duduclaw_core::truncate_chars(body_raw, BODY_MAX_CHARS),
     }
 }
 
 fn parse_pr_file(f: &Value) -> PrFile {
     PrFile {
-        filename: f.get("filename").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        status: f.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        filename: f
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        status: f
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         additions: f.get("additions").and_then(|v| v.as_u64()).unwrap_or(0),
         deletions: f.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0),
     }
@@ -585,7 +742,11 @@ fn parse_pr_file(f: &Value) -> PrFile {
 fn extract_api_message(body: &str) -> String {
     serde_json::from_str::<Value>(body)
         .ok()
-        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| body.to_string())
 }
 
@@ -669,5 +830,78 @@ mod tests {
         let body = r#"{"message":"Not Found","documentation_url":"https://docs.github.com"}"#;
         assert_eq!(extract_api_message(body), "Not Found");
         assert_eq!(extract_api_message("boom"), "boom");
+    }
+
+    // ── H8: the deny-by-default gate, aligned with Google ────────────────────
+
+    #[test]
+    fn integration_is_disabled_without_config_and_on_malformed_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            !integration_enabled(tmp.path()),
+            "no config.toml ⇒ fail closed"
+        );
+
+        std::fs::write(tmp.path().join("config.toml"), "[integrations\nbroken").unwrap();
+        assert!(
+            !integration_enabled(tmp.path()),
+            "unparseable config ⇒ fail closed, never open"
+        );
+
+        std::fs::write(tmp.path().join("config.toml"), "[integrations]\n").unwrap();
+        assert!(!integration_enabled(tmp.path()), "absent key ⇒ off");
+
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[integrations]\ngithub = \"yes\"\n",
+        )
+        .unwrap();
+        assert!(
+            !integration_enabled(tmp.path()),
+            "non-boolean value ⇒ off, not truthy"
+        );
+
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[integrations]\ngithub = true\n",
+        )
+        .unwrap();
+        assert!(integration_enabled(tmp.path()));
+    }
+
+    #[test]
+    fn enable_integration_is_idempotent_and_keeps_operator_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep me\n[integrations]\ngoogle_workspace = true\n",
+        )
+        .unwrap();
+
+        assert!(enable_integration(tmp.path()).unwrap(), "first call writes");
+        assert!(
+            !enable_integration(tmp.path()).unwrap(),
+            "second call is a no-op"
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# keep me"), "comments must survive: {raw}");
+        assert!(raw.contains("google_workspace = true"), "raw: {raw}");
+        assert!(integration_enabled(tmp.path()));
+    }
+
+    #[test]
+    fn enable_integration_creates_a_missing_config_but_refuses_a_broken_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(enable_integration(tmp.path()).unwrap());
+        assert!(integration_enabled(tmp.path()));
+
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join("config.toml"), "[integrations\nbroken").unwrap();
+        assert!(
+            enable_integration(broken.path()).is_err(),
+            "malformed TOML must error, never be silently overwritten"
+        );
     }
 }

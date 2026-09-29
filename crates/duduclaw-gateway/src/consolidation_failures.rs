@@ -116,7 +116,10 @@ pub fn record_failure(home_dir: &Path, failure: &ConsolidationFailure) {
     };
     let res = duduclaw_core::with_file_lock(&path, || {
         {
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
             writeln!(f, "{line}")?;
         }
         // Bounded retention: if the file grew past MAX_RECORDS lines, keep the
@@ -225,7 +228,13 @@ mod tests {
         std::fs::write(&path, "not json\n{\"garbage\":true}\n").unwrap();
         record_failure(
             dir.path(),
-            &ConsolidationFailure::new("z", "capability", "", FailureReason::NoveltyRejected, serde_json::json!({})),
+            &ConsolidationFailure::new(
+                "z",
+                "capability",
+                "",
+                FailureReason::NoveltyRejected,
+                serde_json::json!({}),
+            ),
         );
         // Only the one valid record survives the parse filter.
         let got = list_failures(dir.path(), None, 10);

@@ -27,7 +27,7 @@ pub mod semgrep;
 
 use std::path::Path;
 
-use exec::{run_capped, RunLimits};
+use exec::{RunLimits, run_capped};
 
 use crate::secaudit::schema::{EngineMissing, EngineRun, Finding};
 
@@ -40,10 +40,28 @@ pub async fn run_all(repo_root: &Path) -> (Vec<EngineRun>, Vec<EngineMissing>, V
     let mut engines_missing = Vec::new();
     let mut findings = Vec::new();
 
-    run_semgrep(repo_root, &mut engines_run, &mut engines_missing, &mut findings).await;
-    run_gitleaks(repo_root, &mut engines_run, &mut engines_missing, &mut findings).await;
+    run_semgrep(
+        repo_root,
+        &mut engines_run,
+        &mut engines_missing,
+        &mut findings,
+    )
+    .await;
+    run_gitleaks(
+        repo_root,
+        &mut engines_run,
+        &mut engines_missing,
+        &mut findings,
+    )
+    .await;
     run_osv_scanner(&mut engines_missing);
-    run_cargo_audit(repo_root, &mut engines_run, &mut engines_missing, &mut findings).await;
+    run_cargo_audit(
+        repo_root,
+        &mut engines_run,
+        &mut engines_missing,
+        &mut findings,
+    )
+    .await;
 
     (engines_run, engines_missing, findings)
 }
@@ -164,7 +182,13 @@ async fn run_semgrep(
         &RunLimits::default(),
     )
     .await;
-    record_stdout_scanner(semgrep::ENGINE_NAME, outcome, semgrep::parse, engines_run, findings);
+    record_stdout_scanner(
+        semgrep::ENGINE_NAME,
+        outcome,
+        semgrep::parse,
+        engines_run,
+        findings,
+    );
     // `rules_file` drops here, cleaning up the temp ruleset file.
 }
 
@@ -266,9 +290,8 @@ async fn run_gitleaks(
             meta.len(),
             exec::DEFAULT_MAX_OUTPUT_BYTES
         )),
-        Ok(_) => {
-            std::fs::read_to_string(&report_path).map_err(|e| format!("could not read gitleaks report file: {e}"))
-        }
+        Ok(_) => std::fs::read_to_string(&report_path)
+            .map_err(|e| format!("could not read gitleaks report file: {e}")),
     };
     let _ = std::fs::remove_file(&report_path);
 
@@ -388,7 +411,13 @@ async fn run_cargo_audit(
         &RunLimits::default(),
     )
     .await;
-    record_stdout_scanner(cargo_audit::ENGINE_NAME, outcome, cargo_audit::parse, engines_run, findings);
+    record_stdout_scanner(
+        cargo_audit::ENGINE_NAME,
+        outcome,
+        cargo_audit::parse,
+        engines_run,
+        findings,
+    );
 }
 
 #[cfg(test)]
@@ -472,7 +501,13 @@ mod tests {
         );
         assert_eq!(engines_run.len(), 1);
         assert_eq!(engines_run[0].findings_count, 0);
-        assert!(engines_run[0].parse_error.as_ref().unwrap().contains("bad shape"));
+        assert!(
+            engines_run[0]
+                .parse_error
+                .as_ref()
+                .unwrap()
+                .contains("bad shape")
+        );
         assert!(findings.is_empty());
     }
 
@@ -489,8 +524,20 @@ mod tests {
             timed_out: false,
             spawn_error: Some("no such file".to_string()),
         };
-        record_stdout_scanner("fake-engine", outcome, |_| Ok(vec![]), &mut engines_run, &mut findings);
-        assert!(engines_run[0].parse_error.as_ref().unwrap().contains("no such file"));
+        record_stdout_scanner(
+            "fake-engine",
+            outcome,
+            |_| Ok(vec![]),
+            &mut engines_run,
+            &mut findings,
+        );
+        assert!(
+            engines_run[0]
+                .parse_error
+                .as_ref()
+                .unwrap()
+                .contains("no such file")
+        );
     }
 
     #[test]
@@ -510,7 +557,13 @@ mod tests {
         );
         assert_eq!(engines_run.len(), 1);
         assert_eq!(engines_run[0].findings_count, 0);
-        assert!(engines_run[0].parse_error.as_ref().unwrap().contains("truncated"));
+        assert!(
+            engines_run[0]
+                .parse_error
+                .as_ref()
+                .unwrap()
+                .contains("truncated")
+        );
         assert!(findings.is_empty());
     }
 
@@ -527,7 +580,13 @@ mod tests {
             timed_out: true,
             spawn_error: None,
         };
-        record_stdout_scanner("fake-engine", outcome, |_| Ok(vec![]), &mut engines_run, &mut findings);
+        record_stdout_scanner(
+            "fake-engine",
+            outcome,
+            |_| Ok(vec![]),
+            &mut engines_run,
+            &mut findings,
+        );
         assert!(engines_run[0].timed_out);
         assert!(engines_run[0].parse_error.is_some());
     }

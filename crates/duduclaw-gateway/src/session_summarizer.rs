@@ -87,10 +87,14 @@ impl Default for SummarizeParams {
 /// What the policy decided for one candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SummarizeDecision {
-    Skip { reason: SkipReason },
+    Skip {
+        reason: SkipReason,
+    },
     /// Summarize all turns up to (and including) this turn number.
     /// The session retains turns AFTER this verbatim in `messages`.
-    SummarizeUpTo { turn: u32 },
+    SummarizeUpTo {
+        turn: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,10 +198,7 @@ mod tests {
         }
     }
 
-    fn pick(
-        out: &[(String, SummarizeDecision)],
-        id: &str,
-    ) -> SummarizeDecision {
+    fn pick(out: &[(String, SummarizeDecision)], id: &str) -> SummarizeDecision {
         out.iter()
             .find(|(s, _)| s == id)
             .map(|(_, d)| d.clone())

@@ -51,6 +51,42 @@ pub struct ToolCatalogEntry {
     pub category: &'static str,
     /// `mcp` for DuDuClaw MCP tools, `claude` for native Claude Code tools.
     pub kind: &'static str,
+    /// T5 (feature audit 2026-09-29): this tool name is a **deprecated alias**
+    /// for a merged entry point. It is still listed and still callable — MCP's
+    /// `tools/list` is the declaration surface, so hiding a tool makes it
+    /// *uncallable*, which is the opposite of what a deprecation window is for
+    /// — but the dashboard should not offer it as a new choice, and its
+    /// description carries a `[deprecated → …]` prefix. Removal target
+    /// v1.68.0; the full old→new table is `docs/guides/deprecations.md`.
+    pub deprecated: bool,
+}
+
+/// MCP tool names that are deprecated aliases of a merged entry point
+/// (T5/O3 · O4 · O13, feature audit 2026-09-29). Removal target: **v1.68.0**.
+///
+/// Kept as a separate list rather than a fifth tuple column so adding or
+/// retiring a deprecation is a one-line diff instead of a 245-row rewrite.
+pub const DEPRECATED_MCP_TOOLS: &[&str] = &[
+    // O3 — merged into `wiki_*` with `scope = "shared"`.
+    "shared_wiki_ls",
+    "shared_wiki_read",
+    "shared_wiki_write",
+    "shared_wiki_search",
+    "shared_wiki_stats",
+    "shared_wiki_lint",
+    // O4 — merged into `tasks_create` (`schedule`). `create_task` is NOT here:
+    // it submits an explicit multi-step `steps` plan to the TaskSpec
+    // dispatcher, which `tasks_create` has no parameter for — deprecating it
+    // would promise a replacement that does not exist.
+    "schedule_task",
+    // O13 — merged into `skill_search` with `source = "bank"`.
+    "skill_bank_search",
+];
+
+/// Is this MCP tool name a deprecated alias? Exact match, never a prefix or
+/// substring test (coding convention 2).
+pub fn is_deprecated_tool(name: &str) -> bool {
+    DEPRECATED_MCP_TOOLS.contains(&name)
 }
 
 /// Static table of DuDuClaw MCP tools: `(name, description, scope, category)`.
@@ -127,6 +163,15 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "working_state_handoff",
         "Overwrite the next-wake handoff note",
         "memory:write",
+        "memory",
+    ),
+    (
+        "team_handoff",
+        "File a TaskPacket for the next role in the team",
+        // Internal-only scope (2026-09-28): the packet directory is shared
+        // across tasks, so this tool must never be reachable by an external
+        // MCP key even though the other `memory` tools are `memory:write`.
+        "team:handoff",
         "memory",
     ),
     (
@@ -912,12 +957,6 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "inference",
     ),
     (
-        "jitrl_feedback",
-        "Record local-inference feedback",
-        "admin",
-        "inference",
-    ),
-    (
         "cost_multi_vs_single",
         "Multi- vs single-agent cost comparison",
         "admin",
@@ -1380,7 +1419,6 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "admin",
         "system",
     ),
-    ("log_mood", "Log user mood", "admin", "system"),
     (
         "session_restore_context",
         "Search archived session messages",
@@ -1421,6 +1459,7 @@ pub fn builtin_tool_catalog() -> Vec<ToolCatalogEntry> {
             scope,
             category,
             kind: "mcp",
+            deprecated: is_deprecated_tool(name),
         });
     }
     for &(name, description) in CLAUDE_TOOLS {
@@ -1431,9 +1470,88 @@ pub fn builtin_tool_catalog() -> Vec<ToolCatalogEntry> {
             scope: "",
             category: "claude",
             kind: "claude",
+            deprecated: false,
         });
     }
     out
+}
+
+// ── LLM-loop tools (not MCP) ─────────────────────────────────────────────
+
+/// The two reversible-context-retrieval tool names, exposed as constants so
+/// producer and consumer compare against the same string.
+pub const CCR_RETRIEVE_TOOL: &str = "duduclaw_ccr_retrieve";
+/// See [`CCR_RETRIEVE_TOOL`].
+pub const CCR_FIND_TOOL: &str = "duduclaw_ccr_find";
+
+/// A tool the **direct-API tool loop** injects into a `ChatRequest`, as opposed
+/// to one the MCP server dispatches.
+///
+/// Deliberately a separate shape from [`ToolCatalogEntry`]: these tools carry a
+/// real JSON Schema (the MCP table's every parameter is a bare string), they
+/// have no `mcp_auth` scope because no MCP dispatch gate ever sees them, and
+/// they must not show up in the dashboard capability picker — an operator
+/// cannot grant or deny them, the CCR runtime's own scope binding decides
+/// access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmToolSchema {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: serde_json::Value,
+}
+
+/// The CCR tool schemas — **the single registration authority** (O7).
+///
+/// These used to be two `ToolDef` literals inlined in
+/// `duduclaw_llm::tool_loop::loop_run`, a second registration face living far
+/// from every other tool definition in the project: nothing linked it to the
+/// catalog, nothing held it to the description budget, and a caller wanting the
+/// schema had to copy it. They live here instead, in the crate both
+/// `duduclaw-llm` (the tool loop that injects them) and `duduclaw-cli` (the
+/// `ccr run` harness and the registration-drift tests) can reach.
+///
+/// Descriptions are held to the same 200-byte O7 budget as the MCP table; the
+/// full behaviour is documented in `docs/spec/reversible-context-ccr.md`.
+pub fn ccr_tool_schemas() -> Vec<LlmToolSchema> {
+    vec![
+        LlmToolSchema {
+            name: CCR_RETRIEVE_TOOL,
+            description: "Retrieve an authorized, original tool-result fragment by CCR ID. \
+                          Use query to find a specific passage; results are bounded.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "query": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 65536}
+                },
+                "required": ["id"]
+            }),
+        },
+        LlmToolSchema {
+            name: CCR_FIND_TOOL,
+            // The byte range stays in the prose on purpose: it is a runtime
+            // rule, not a schema keyword. `minLength`/`maxLength` would be
+            // counted in UTF-16 code units by a provider's validator and would
+            // reject valid CJK queries, so the model is told the rule instead
+            // (pinned by `tool_loop::tests::cases_loop`).
+            description: "Find up to five CCR handles from earlier turns in this session. \
+                          Query is 3–128 UTF-8 bytes. A hit says whether the phrase matched \
+                          exactly; a lexical hit must be retrieved by id and offset.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "3–128 UTF-8 bytes; the runtime enforces the byte limit"
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 5}
+                },
+                "required": ["query"]
+            }),
+        },
+    ]
 }
 
 /// Strip an optional `(qualifier)` suffix and an optional `mcp__<server>__`
@@ -1562,6 +1680,85 @@ mod tests {
                 e.name
             );
             assert!(!e.scope.is_empty(), "MCP tool {} must have a scope", e.name);
+        }
+    }
+
+    /// T5 regression: every name on the deprecation list must still BE in the
+    /// catalog. A deprecated tool that quietly vanished from the catalog would
+    /// disappear from the dashboard picker a release early, which is exactly
+    /// the silent removal the two-minor-version window exists to prevent.
+    #[test]
+    fn deprecated_aliases_are_still_catalogued_and_flagged() {
+        let catalog = builtin_tool_catalog();
+        for name in DEPRECATED_MCP_TOOLS {
+            let entry = catalog
+                .iter()
+                .find(|e| e.name == *name)
+                .unwrap_or_else(|| panic!("deprecated alias {name} must stay in the catalog"));
+            assert!(entry.deprecated, "{name} must be flagged deprecated");
+            assert_eq!(entry.kind, "mcp");
+        }
+    }
+
+    /// …and the merged entry points they point at must NOT be flagged.
+    #[test]
+    fn merged_entry_points_are_not_flagged_deprecated() {
+        let catalog = builtin_tool_catalog();
+        for name in ["wiki_ls", "wiki_read", "wiki_write", "wiki_search", "tasks_create", "skill_search"] {
+            let entry = catalog
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} must be in the catalog"));
+            assert!(
+                !entry.deprecated,
+                "{name} is a merged entry point, not an alias"
+            );
+        }
+        assert!(!is_deprecated_tool("wiki_write"));
+        // Exact match only — a prefix must not read as the deprecated name.
+        assert!(is_deprecated_tool("shared_wiki_write"));
+        assert!(!is_deprecated_tool("shared_wiki_write_v2"));
+    }
+
+    // ── O7: CCR is a registration face, not an MCP tool ──────────────────
+
+    /// The schemas must be usable as-is: a name, non-empty prose within the
+    /// same 200-byte budget the MCP table carries, and a real object schema.
+    #[test]
+    fn ccr_tool_schemas_are_well_formed_and_within_the_description_budget() {
+        let schemas = ccr_tool_schemas();
+        assert_eq!(schemas.len(), 2);
+        for s in &schemas {
+            assert!(!s.name.is_empty());
+            assert!(!s.description.is_empty());
+            assert!(
+                s.description.len() <= 200,
+                "{} description is {} bytes, over the 200-byte O7 budget",
+                s.name,
+                s.description.len()
+            );
+            assert_eq!(s.input_schema["type"], "object");
+            assert!(s.input_schema["properties"].is_object());
+            assert!(s.input_schema["required"].is_array());
+        }
+        let names: Vec<_> = schemas.iter().map(|s| s.name).collect();
+        assert!(names.contains(&CCR_RETRIEVE_TOOL));
+        assert!(names.contains(&CCR_FIND_TOOL));
+    }
+
+    /// CCR tools are injected by the direct-API tool loop and are NOT
+    /// dispatched by the MCP server, so they must never leak into the MCP
+    /// catalog — where they would demand an `mcp_auth` scope arm, appear in
+    /// the dashboard capability picker, and be advertised by `tools/list` as
+    /// something the MCP dispatcher could run. They cannot.
+    #[test]
+    fn ccr_tools_are_not_in_the_mcp_catalog() {
+        let catalog = builtin_tool_catalog();
+        for name in [CCR_RETRIEVE_TOOL, CCR_FIND_TOOL] {
+            assert!(
+                !catalog.iter().any(|e| e.name == name),
+                "{name} must not be in the MCP/Claude capability catalog"
+            );
         }
     }
 }

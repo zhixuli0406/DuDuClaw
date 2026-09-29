@@ -34,7 +34,13 @@ fn slugify(rule: &str, idx: usize) -> String {
     let mut s: String = rule
         .chars()
         .take(24)
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     while s.contains("--") {
         s = s.replace("--", "-");
@@ -147,12 +153,22 @@ mod tests {
     #[tokio::test]
     async fn scaffolds_drafts_outside_the_live_suites_root() {
         let home = home_with_soul();
-        cmd_eval_scaffold(home.path(), ScaffoldOptions { agent: "my-bot".into(), force: false })
-            .await
-            .unwrap();
+        cmd_eval_scaffold(
+            home.path(),
+            ScaffoldOptions {
+                agent: "my-bot".into(),
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
         let drafts = home.path().join("evals-drafts").join("my-bot");
         let files: Vec<_> = std::fs::read_dir(&drafts).unwrap().flatten().collect();
-        assert_eq!(files.len(), 2, "one draft per behaviour rule, identity skipped");
+        assert_eq!(
+            files.len(),
+            2,
+            "one draft per behaviour rule, identity skipped"
+        );
         // Live suites root untouched — a draft can never run by accident.
         assert!(!home.path().join("evals").join("my-bot").exists());
         let body = std::fs::read_to_string(files[0].path()).unwrap();
@@ -166,10 +182,18 @@ mod tests {
     #[tokio::test]
     async fn rerun_never_clobbers_edited_drafts_without_force() {
         let home = home_with_soul();
-        let opts = || ScaffoldOptions { agent: "my-bot".into(), force: false };
+        let opts = || ScaffoldOptions {
+            agent: "my-bot".into(),
+            force: false,
+        };
         cmd_eval_scaffold(home.path(), opts()).await.unwrap();
         let drafts = home.path().join("evals-drafts").join("my-bot");
-        let first = std::fs::read_dir(&drafts).unwrap().flatten().next().unwrap().path();
+        let first = std::fs::read_dir(&drafts)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .path();
         std::fs::write(&first, "operator edits").unwrap();
         cmd_eval_scaffold(home.path(), opts()).await.unwrap();
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "operator edits");

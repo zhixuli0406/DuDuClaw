@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use regex::Regex;
 use tokio::sync::broadcast;
 
@@ -168,7 +168,8 @@ fn looks_like_auth_regex() -> &'static Regex {
 }
 
 fn tidy_url(url: &str) -> String {
-    url.trim_end_matches(|c: char| ".,;:)]}>'\"|".contains(c)).to_string()
+    url.trim_end_matches(|c: char| ".,;:)]}>'\"|".contains(c))
+        .to_string()
 }
 
 /// Extract the sign-in URL a CLI login command printed, or `None` when the
@@ -211,7 +212,11 @@ pub fn extract_auth_url(raw: &str) -> Option<String> {
         .filter(|u| !not_a_destination_regex().is_match(u))
         .cloned()
         .collect();
-    let pool: Vec<String> = if plausible.is_empty() { urls } else { plausible };
+    let pool: Vec<String> = if plausible.is_empty() {
+        urls
+    } else {
+        plausible
+    };
 
     let with_query: Vec<String> = pool.iter().filter(|u| u.contains('?')).cloned().collect();
 
@@ -243,7 +248,10 @@ fn redact_for_log(s: &str) -> String {
     let mut out = s.to_string();
     while let Some(i) = out.find("sk-ant") {
         let tail = &out[i + 6..];
-        let n = tail.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').count();
+        let n = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .count();
         out.replace_range(i..i + 6 + n, "<redacted-token>");
     }
     out
@@ -300,7 +308,13 @@ fn auth_markers(runtime: RuntimeType) -> (Vec<String>, Vec<String>) {
         // those and leave the dashboard spinning forever after a valid
         // paste-back.
         RuntimeType::Claude => (
-            v(&["success", "authenticated", "logged in", "saved", "you can now"]),
+            v(&[
+                "success",
+                "authenticated",
+                "logged in",
+                "saved",
+                "you can now",
+            ]),
             v(&[
                 "authentication failed",
                 "login failed",
@@ -475,7 +489,10 @@ fn normalize_for_match(s: &str) -> String {
 pub fn scan_outcome(tail: &str, spec: &CliAuthSpec) -> Option<AuthStatus> {
     let hay = normalize_for_match(tail);
     let norm = |m: &str| -> String {
-        m.chars().filter(|c| !c.is_whitespace()).flat_map(|c| c.to_lowercase()).collect()
+        m.chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
     };
     if spec.failure_markers.iter().any(|m| hay.contains(&norm(m))) {
         return Some(AuthStatus::Failed);
@@ -551,7 +568,12 @@ impl AuthSession {
         // reassembled for the "open this link" button in the dashboard. 600 cols
         // keeps the URL on a single line so the frontend can extract it cleanly.
         let pair = pty_system
-            .openpty(PtySize { rows: 40, cols: 600, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: 40,
+                cols: 600,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|e| AuthError::Pty(e.to_string()))?;
 
         let mut cmd = CommandBuilder::new(&program);
@@ -652,7 +674,14 @@ impl AuthSession {
                             // tail end so the live transcript is inspectable from the
                             // gateway log when a login gets stuck.
                             let snap = normalize_for_match(&String::from_utf8_lossy(chunk));
-                            let snap: String = snap.chars().rev().take(160).collect::<Vec<_>>().into_iter().rev().collect();
+                            let snap: String = snap
+                                .chars()
+                                .rev()
+                                .take(160)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect();
                             tracing::info!(target: "cli_auth", session = %log_id, bytes = n, snap = %redact_for_log(&snap), "pty output");
                             if status.load(Ordering::Relaxed) == ST_RUNNING {
                                 if let Some(o) = scan_outcome(&tail, &spec) {
@@ -744,7 +773,10 @@ mod tests {
         ] {
             let spec = spec_for(rt).unwrap_or_else(|| panic!("{rt:?} must have a login spec"));
             assert!(!spec.login_args.is_empty(), "{rt:?} login_args empty");
-            assert!(!spec.success_markers.is_empty(), "{rt:?} no success markers");
+            assert!(
+                !spec.success_markers.is_empty(),
+                "{rt:?} no success markers"
+            );
             assert!(!spec.hint.is_empty());
         }
         assert!(spec_for(RuntimeType::OpenAiCompat).is_none());
@@ -766,8 +798,14 @@ mod tests {
     #[test]
     fn scan_outcome_detects_success_and_failure() {
         let spec = spec_for(RuntimeType::Claude).unwrap();
-        assert_eq!(scan_outcome("…you can now use claude", &spec), Some(AuthStatus::Succeeded));
-        assert_eq!(scan_outcome("error: invalid code", &spec), Some(AuthStatus::Failed));
+        assert_eq!(
+            scan_outcome("…you can now use claude", &spec),
+            Some(AuthStatus::Succeeded)
+        );
+        assert_eq!(
+            scan_outcome("error: invalid code", &spec),
+            Some(AuthStatus::Failed)
+        );
         assert_eq!(scan_outcome("visit https://… to authorize", &spec), None);
     }
 
@@ -778,7 +816,8 @@ mod tests {
         // still flag it (regression: pre-normalization this matched nothing and
         // the dashboard span on "進行中" forever).
         let spec = spec_for(RuntimeType::Claude).unwrap();
-        let tui_invalid = "OAuth error: \u{1b}[31mInvalid\u{1b}[2G\u{1b}[Kcode\u{1b}[0m. Press Enter to try.";
+        let tui_invalid =
+            "OAuth error: \u{1b}[31mInvalid\u{1b}[2G\u{1b}[Kcode\u{1b}[0m. Press Enter to try.";
         assert_eq!(scan_outcome(tui_invalid, &spec), Some(AuthStatus::Failed));
         let tui_ok = "Login \u{1b}[32msuccess\u{1b}[0mful! Token \u{1b}[1msaved\u{1b}[0m.";
         assert_eq!(scan_outcome(tui_ok, &spec), Some(AuthStatus::Succeeded));
@@ -920,7 +959,10 @@ mod tests {
             Some(AuthStatus::Failed)
         );
         assert_eq!(
-            scan_outcome("Authorization denied. The user rejected the request.", &spec),
+            scan_outcome(
+                "Authorization denied. The user rejected the request.",
+                &spec
+            ),
             Some(AuthStatus::Failed)
         );
         assert_eq!(
@@ -933,7 +975,10 @@ mod tests {
     fn grok_scan_outcome_failure_wins_over_success() {
         let spec = spec_for(RuntimeType::Grok).unwrap();
         assert_eq!(
-            scan_outcome("Signed in as x@example.com, but then device code expired", &spec),
+            scan_outcome(
+                "Signed in as x@example.com, but then device code expired",
+                &spec
+            ),
             Some(AuthStatus::Failed)
         );
     }
@@ -974,7 +1019,10 @@ mod tests {
             RuntimeType::Vibe,
             RuntimeType::OpenAiCompat,
         ] {
-            assert!(!runtimes.contains(&excluded), "{excluded:?} must be excluded");
+            assert!(
+                !runtimes.contains(&excluded),
+                "{excluded:?} must be excluded"
+            );
         }
         for s in &statuses {
             assert!(s.store.starts_with("~/."), "display path: {}", s.store);
@@ -1023,7 +1071,11 @@ mod tests {
             assert!(spec_for(rt).is_some(), "{rt:?} must be loginable");
         }
         // API-key-only runtimes must NOT pretend to have a login.
-        for rt in [RuntimeType::Qwen, RuntimeType::Vibe, RuntimeType::OpenAiCompat] {
+        for rt in [
+            RuntimeType::Qwen,
+            RuntimeType::Vibe,
+            RuntimeType::OpenAiCompat,
+        ] {
             assert!(spec_for(rt).is_none(), "{rt:?} is API-key only");
             assert!(
                 rt.spec().auth.api_key_env.is_some() || rt == RuntimeType::OpenAiCompat,
@@ -1090,8 +1142,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "live: runs real `claude setup-token`; needs claude installed"]
     async fn live_claude_login_streams_output() {
-        let session = AuthSession::spawn("live-test".to_string(), RuntimeType::Claude, HashMap::new())
-            .expect("spawn claude setup-token");
+        let session =
+            AuthSession::spawn("live-test".to_string(), RuntimeType::Claude, HashMap::new())
+                .expect("spawn claude setup-token");
         let program = session.program.clone();
         let mut rx = session.subscribe();
         let mut captured = String::new();
@@ -1102,7 +1155,10 @@ mod tests {
                     captured.push_str(&String::from_utf8_lossy(&bytes));
                     // Stop only on an actual auth link / explicit paste prompt.
                     let low = captured.to_lowercase();
-                    if low.contains("http://") || low.contains("https://") || low.contains("authorize") {
+                    if low.contains("http://")
+                        || low.contains("https://")
+                        || low.contains("authorize")
+                    {
                         break;
                     }
                 }
@@ -1120,7 +1176,9 @@ mod tests {
                     // skip CSI/escape sequence until a letter terminator
                     while let Some(&n) = chars.peek() {
                         chars.next();
-                        if n.is_ascii_alphabetic() || n == '~' { break; }
+                        if n.is_ascii_alphabetic() || n == '~' {
+                            break;
+                        }
                     }
                 } else if c == '\u{7}' || c == '\r' {
                     // drop bell / carriage return

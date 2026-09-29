@@ -170,8 +170,11 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
             let evidence = vec![EvidenceItem {
                 kind: EvidenceKind::StaticHit,
                 source: ENGINE_NAME.to_string(),
-                detail: duduclaw_core::truncate_bytes(&extra.message, crate::secaudit::schema::SNIPPET_MAX_BYTES)
-                    .to_string(),
+                detail: duduclaw_core::truncate_bytes(
+                    &extra.message,
+                    crate::secaudit::schema::SNIPPET_MAX_BYTES,
+                )
+                .to_string(),
                 recorded_at: chrono::Utc::now().to_rfc3339(),
             }];
             Finding::candidate(
@@ -275,7 +278,9 @@ mod tests {
         // rule schema (that needs a live semgrep run, out of scope here).
         let parsed: serde_yaml::Value = serde_yaml::from_str(BUNDLED_RULES_YAML)
             .expect("bundled semgrep ruleset must be valid YAML");
-        let rules = parsed.get("rules").expect("must have a top-level `rules` key");
+        let rules = parsed
+            .get("rules")
+            .expect("must have a top-level `rules` key");
         assert!(rules.as_sequence().is_some_and(|s| !s.is_empty()));
     }
 

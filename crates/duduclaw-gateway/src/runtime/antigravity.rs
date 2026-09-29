@@ -28,16 +28,17 @@
 //!     create a default `~/.gemini/antigravity-cli/scratch/` workspace).
 //!   - `--print-timeout` bounds print-mode wait (CLI default 5m). We set it
 //!     explicitly and keep the wrapper timeout a notch higher as a backstop.
-//!   - There is **no** `--output-format`/JSON surface and **no** `--system`
-//!     flag, so we capture plain stdout text (token stats are unavailable → 0)
-//!     and embed the system prompt + history *inside the prompt argument*,
+//!   - v1.2.10 exposes `--output-format stream-json` with final usage and
+//!     `step_update` tool events. There is no `--system` flag, so we embed
+//!     the system prompt + history *inside the prompt argument*,
 //!     guaranteeing the model receives them. The 64KB system-prompt cap keeps
 //!     the argv well under ARG_MAX.
 
 use async_trait::async_trait;
+use serde_json::Value;
 use tracing::info;
 
-use duduclaw_core::types::{sandbox_level_for, CapabilitiesConfig, SandboxLevel};
+use duduclaw_core::types::{CapabilitiesConfig, SandboxLevel, sandbox_level_for};
 
 use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 
@@ -60,6 +61,194 @@ fn sandbox_args(caps: Option<&CapabilitiesConfig>) -> Vec<String> {
         SandboxLevel::FullAccess => vec!["--dangerously-skip-permissions".to_string()],
         SandboxLevel::ReadOnly | SandboxLevel::WorkspaceWrite => vec!["--sandbox".to_string()],
     }
+}
+
+/// `--effort <low|medium|high>` for one invocation (P1/WP-3).
+///
+/// Verified on agy 1.2.10 (`--help`): "Reasoning effort for the current CLI
+/// session (low|medium|high)". There is no xhigh/max, so
+/// `Effort::clamp_for` folds those down to `high` rather than sending a value
+/// agy would reject. `None` ⇒ empty.
+fn effort_args(effort: Option<duduclaw_core::effort::Effort>, model: &str) -> Vec<String> {
+    // agy 1.2.10 refuses gemini-3.7-flash without an explicit effort, even
+    // though --effort is optional in --help. A matrix cell has no per-role
+    // config to supply one, so use the production-like medium default for
+    // this model family. Keep every other model's old argv unchanged.
+    let effort = effort.or_else(|| {
+        model
+            .starts_with("gemini-3.7-")
+            .then_some(duduclaw_core::effort::Effort::Medium)
+    });
+    match effort {
+        Some(e) => vec![
+            "--effort".to_string(),
+            e.clamp_for(duduclaw_core::types::RuntimeType::Antigravity)
+                .as_str()
+                .to_string(),
+        ],
+        None => Vec::new(),
+    }
+}
+
+/// One decoded `agy --output-format stream-json` run.
+#[derive(Debug, Default)]
+struct ParsedStream {
+    content: String,
+    /// `(input, output, cache_read)` — `None` when the stream carried no
+    /// usable usage block. Deliberately an `Option` rather than three zeros:
+    /// "agy did not report usage" and "agy reported zero tokens" are different
+    /// facts, and the cost ledger must not be fed an invented number.
+    usage: Option<(u64, u64, u64)>,
+    tools: Vec<super::NativeToolEvent>,
+    /// Set when the strict 1.2.10 shape was not found and this parse fell back.
+    /// Logged once by the caller; never hidden.
+    degraded: Option<&'static str>,
+}
+
+/// Decode the observed agy 1.2.10 NDJSON stream. Only terminal tool states
+/// are evidence: ACTIVE is an attempted call, not proof that it ran. Unknown
+/// shapes are ignored.
+///
+/// **Degradation (2026-09-28 review, decided).** This parser used to be strict
+/// all the way down: a single unparseable line, a missing `result` event, a
+/// missing `response` field, or a `usage` block short one integer turned the
+/// whole run into `Err` — and because `execute()` propagates that, an agy that
+/// had *already answered* was reported as a failed spawn and the whole role
+/// member was lost. Six independent hard failures for one CLI whose output
+/// shape is pinned to the single version this was written against.
+///
+/// Now: shape mismatches degrade, facts do not.
+/// * an unparseable line is skipped (it is one line of NDJSON, not the run);
+/// * no `result` event, or a `result` with no `response`, falls back to the
+///   last non-empty line as the answer;
+/// * a missing or partial `usage` block yields `usage: None` — the answer is
+///   kept, the tokens are reported as unknown rather than as zero;
+/// * an *explicit* non-`SUCCESS` `status` is still a hard error. That is agy
+///   telling us the run failed, not a shape we failed to recognise — the one
+///   case where refusing is the honest answer. An ABSENT `status` is a shape
+///   question and degrades like the rest.
+fn parse_stream_output(raw: &str) -> Result<ParsedStream, String> {
+    let mut result: Option<Value> = None;
+    let mut tools = std::collections::BTreeMap::<u64, super::NativeToolEvent>::new();
+    let mut unparseable_lines = 0usize;
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            unparseable_lines += 1;
+            continue;
+        };
+        match event.get("event").and_then(Value::as_str) {
+            Some("result") => result = event.get("result").cloned(),
+            Some("step_update") => {
+                let Some(step) = event.get("step_update") else {
+                    continue;
+                };
+                if step.get("step_type").and_then(Value::as_str) != Some("tool") {
+                    continue;
+                }
+                let Some(index) = step.get("step_index").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let Some(state) = step.get("state").and_then(Value::as_str) else {
+                    continue;
+                };
+                if state != "DONE" && state != "ERROR" {
+                    continue;
+                }
+                let Some(name) = step.get("tool_name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let info = step.get("tool_info");
+                let input_text = info
+                    .and_then(|i| i.get("parameters"))
+                    .and_then(super::native_event_input_text_from_value);
+                let result_text = info
+                    .and_then(|i| i.get("error").or_else(|| i.get("result")))
+                    .and_then(|v| serde_json::to_string(v).ok())
+                    .and_then(|s| super::native_event_result_text(&s));
+                tools.insert(
+                    index,
+                    super::NativeToolEvent {
+                        tool_name: name.to_string(),
+                        success: state == "DONE",
+                        result_text,
+                        input_text,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    let tools: Vec<super::NativeToolEvent> = tools.into_values().collect();
+
+    // The one hard failure that survives: agy explicitly said the run failed.
+    if let Some(status) = result
+        .as_ref()
+        .and_then(|r| r.get("status"))
+        .and_then(Value::as_str)
+    {
+        if status != "SUCCESS" {
+            return Err(format!("Antigravity result status was {status}, not SUCCESS"));
+        }
+    }
+
+    let response = result
+        .as_ref()
+        .and_then(|r| r.get("response"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let usage = result.as_ref().and_then(|r| r.get("usage")).and_then(|u| {
+        // Both counters or neither: a half-populated block is not a usage
+        // report, and pairing a real input count with a fabricated zero output
+        // count would feed the cost ledger a lie.
+        let input = u.get("input_tokens").and_then(Value::as_u64)?;
+        let output = u.get("output_tokens").and_then(Value::as_u64)?;
+        let cache = u
+            .get("cache_read_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        Some((input, output, cache))
+    });
+
+    let (content, mut degraded) = match response {
+        Some(c) => (c, None),
+        None => {
+            // Last non-empty line as the answer — the same last-resort the
+            // codex runtime already uses. Refusing here would throw away a
+            // reply agy did produce.
+            let last = raw
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .next_back()
+                .unwrap_or_default()
+                .to_string();
+            if last.is_empty() {
+                return Err(
+                    "Antigravity stream carried neither a result response nor any output"
+                        .to_string(),
+                );
+            }
+            (
+                last,
+                Some("no result/response event — fell back to the last stream line"),
+            )
+        }
+    };
+    if degraded.is_none() && usage.is_none() {
+        degraded = Some("result carried no usable usage block — tokens reported as unknown");
+    }
+    if degraded.is_none() && unparseable_lines > 0 {
+        degraded = Some("some stream lines were not valid JSON and were skipped");
+    }
+
+    Ok(ParsedStream {
+        content,
+        usage,
+        tools,
+        degraded,
+    })
 }
 
 /// Hard backstop on the whole subprocess. Kept a notch above `PRINT_TIMEOUT`
@@ -129,8 +318,7 @@ fn ensure_workspace_trusted(dir: &std::path::Path) -> std::io::Result<()> {
         .into_owned();
 
     duduclaw_core::with_file_lock(&settings_path, || {
-        let existing =
-            std::fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
+        let existing = std::fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
         let mut settings: serde_json::Value =
             serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}));
         let mut list: Vec<serde_json::Value> = settings
@@ -177,7 +365,8 @@ fn build_prompt(context: &RuntimeContext, user_prompt: &str) -> String {
         with_history
     } else {
         // Escape closing tag in the system prompt to keep the XML frame intact.
-        let safe_system = system_prompt.replace("</system_instructions>", "&lt;/system_instructions&gt;");
+        let safe_system =
+            system_prompt.replace("</system_instructions>", "&lt;/system_instructions&gt;");
         format!("<system_instructions>\n{safe_system}\n</system_instructions>\n\n{with_history}")
     }
 }
@@ -214,7 +403,9 @@ impl AgentRuntime for AntigravityRuntime {
         // antigravity settings before spawning. Idempotent merge;
         // warn-not-fatal — registration failing must not block the reply.
         if let Some(ref dir) = context.agent_dir {
-            if let Err(e) = Self::ensure_duduclaw_mcp_config(dir, &context.agent_id).await {
+            if let Err(e) =
+                Self::ensure_duduclaw_mcp_config(dir, &context.agent_id, &context.home_dir).await
+            {
                 tracing::warn!(
                     runtime = "antigravity",
                     agent = %context.agent_id,
@@ -242,24 +433,45 @@ impl AgentRuntime for AntigravityRuntime {
             cmd.arg(a);
         }
         cmd.arg("--print-timeout").arg(PRINT_TIMEOUT);
+        cmd.arg("--output-format").arg("stream-json");
+
+        // P1/WP-3: per-call reasoning effort. Verified on agy 1.2.10 —
+        // `--effort   Reasoning effort for the current CLI session (low|medium|high)`.
+        // No xhigh/max exists here, so `clamp_for` folds both down to `high`.
+        // `None` ⇒ flag absent, argv byte-identical to before.
+        for a in effort_args(context.effort, &context.model) {
+            cmd.arg(a);
+        }
 
         // Set model if specified (agy uses `--model`, not `-m`).
         if !context.model.is_empty() {
             cmd.arg("--model").arg(&context.model);
         }
 
-        // Point agy at the agent home as its workspace so it does not silently
+        // Point agy at the working root as its workspace so it does not silently
         // spin up a default `~/.gemini/antigravity-cli/scratch/` project.
+        //
+        // Working root: normally the agent's own directory, but a caller may
+        // override the cwd via `super::SPAWN_OVERRIDE` (today: the team
+        // composer, putting a role member in the employee's workspace so its
+        // files outlive the throwaway scaffold — design §4.3 E3). Until the
+        // 2026-09-28 review this runtime ignored the override, so an agy role
+        // member's work was deleted by the immediate GC. Identity is NOT
+        // affected: the MCP settings written above stay keyed to `agent_dir`.
         //
         // CRITICAL: agy shows an *interactive* "trust this workspace?" prompt for
         // any dir not in `trustedWorkspaces`. In a headless subprocess (no TTY)
         // that prompt blocks forever — `--dangerously-skip-permissions` only
         // auto-approves *tool* calls, not workspace trust. So we pre-seed the
-        // agent dir into agy's settings before spawning. Best-effort: a failure
-        // here just risks the prompt, it must not abort the call.
-        if let Some(ref dir) = context.agent_dir {
+        // working root (the dir agy actually opens) into agy's settings before
+        // spawning. Best-effort: a failure here just risks the prompt, it must
+        // not abort the call.
+        let work_root: Option<std::path::PathBuf> =
+            super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
+        if let Some(ref dir) = work_root {
             let d = dir.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || ensure_workspace_trusted(&d)).await {
+            if let Err(e) = tokio::task::spawn_blocking(move || ensure_workspace_trusted(&d)).await
+            {
                 tracing::warn!(agent = %context.agent_id, error = %e, "ensure_workspace_trusted join failed");
             }
             cmd.arg("--add-dir").arg(dir);
@@ -281,10 +493,12 @@ impl AgentRuntime for AntigravityRuntime {
         // Native OS sandbox (opt-in). agy has no CLI sandbox flags, so this OS
         // floor is the only enforceable confinement on this runtime; fail-closed
         // if required but unavailable.
+        // Scoped to the working root so an overridden cwd is the directory that
+        // gets write access — same rule as `runtime/codex.rs`.
         super::apply_native_sandbox(
             &mut cmd,
             context.capabilities.as_ref(),
-            context.agent_dir.as_deref(),
+            work_root.as_deref(),
             "antigravity",
         )?;
 
@@ -305,7 +519,28 @@ impl AgentRuntime for AntigravityRuntime {
             ));
         }
 
-        let content = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let parsed = parse_stream_output(&raw)?;
+        if let Some(reason) = parsed.degraded {
+            tracing::warn!(
+                runtime = "antigravity",
+                agent = %context.agent_id,
+                reason = %reason,
+                "agy stream did not match the 1.2.10 shape — degraded parse (the reply is \
+                 kept; usage may be reported as zero)"
+            );
+        }
+        let ParsedStream {
+            content,
+            usage,
+            tools: native_events,
+            ..
+        } = parsed;
+        // Unknown usage is carried as zeros because `RuntimeResponse` has no
+        // "unknown" representation; the `warn!` above is what distinguishes it
+        // from a genuine zero-token run.
+        let (input_tokens, output_tokens, cache_read_tokens) = usage.unwrap_or((0, 0, 0));
+        super::extend_native_tool_events(native_events);
 
         // Empty stdout with exit 0 is a FAILURE: an Ok("") would be silently
         // dropped by every channel and poison the session with an empty
@@ -318,19 +553,11 @@ impl AgentRuntime for AntigravityRuntime {
             ));
         }
 
-        // agy's print mode exposes no usage stats (no JSON surface), so we
-        // estimate with the gateway's shared CJK-aware heuristic. These feed
-        // CostTelemetry as approximations — the input estimate is the payload we
-        // sent (excludes agy's own injected context) and the output the captured
-        // text. If agy ever ships a structured/JSON mode, replace with real counts.
-        let input_tokens = crate::prompt_compression::estimate_tokens(&payload);
-        let output_tokens = crate::prompt_compression::estimate_tokens(&content);
-
         Ok(RuntimeResponse {
             content,
             input_tokens,
             output_tokens,
-            cache_read_tokens: 0,
+            cache_read_tokens,
             model_used: context.model.clone(),
             runtime_name: "antigravity".to_string(),
         })
@@ -380,7 +607,9 @@ impl AntigravityRuntime {
         servers: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bool, String> {
         let settings_path = if let Some(dir) = agent_dir {
-            dir.join(".gemini").join("antigravity-cli").join("settings.json")
+            dir.join(".gemini")
+                .join("antigravity-cli")
+                .join("settings.json")
         } else {
             dirs::home_dir()
                 .ok_or("No home dir")?
@@ -404,7 +633,9 @@ impl AntigravityRuntime {
         if !mcp.is_object() {
             *mcp = serde_json::json!({});
         }
-        let map = mcp.as_object_mut().expect("mcpServers normalized to object");
+        let map = mcp
+            .as_object_mut()
+            .expect("mcpServers normalized to object");
         let mut changed = false;
         for (name, def) in servers {
             if map.get(name) != Some(def) {
@@ -416,7 +647,9 @@ impl AntigravityRuntime {
             return Ok(false);
         }
         if let Some(parent) = settings_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         tokio::fs::write(
             &settings_path,
@@ -436,8 +669,9 @@ impl AntigravityRuntime {
     pub async fn ensure_duduclaw_mcp_config(
         agent_dir: &std::path::Path,
         agent_id: &str,
+        home_dir: &std::path::Path,
     ) -> Result<bool, String> {
-        let Some(def) = super::duduclaw_mcp_server_json(agent_id) else {
+        let Some(def) = super::duduclaw_mcp_server_json_for_home(agent_id, home_dir) else {
             return Err("duduclaw binary did not resolve to an absolute path".to_string());
         };
         let mut servers = std::collections::HashMap::new();
@@ -451,6 +685,95 @@ impl AntigravityRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_result_reports_measured_usage_and_terminal_tool_event() {
+        let raw = concat!(
+            "{\"event\":\"step_update\",\"step_update\":{\"step_index\":2,\"step_type\":\"tool\",\"state\":\"ACTIVE\",\"tool_name\":\"run_command\"}}\n",
+            "{\"event\":\"step_update\",\"step_update\":{\"step_index\":2,\"step_type\":\"tool\",\"state\":\"ERROR\",\"tool_name\":\"run_command\",\"tool_info\":{\"parameters\":{\"CommandLine\":\"pwd\"},\"error\":{\"type\":\"TOOL_ERROR\"}}}}\n",
+            "{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"PING\\n\",\"usage\":{\"input_tokens\":42,\"output_tokens\":7,\"cache_read_tokens\":3}}}\n"
+        );
+        let parsed = parse_stream_output(raw).unwrap();
+        assert_eq!(parsed.content, "PING");
+        assert_eq!(parsed.usage, Some((42, 7, 3)));
+        assert!(
+            parsed.degraded.is_none(),
+            "the exact 1.2.10 shape must not report a degrade: {:?}",
+            parsed.degraded
+        );
+        let events = &parsed.tools;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "run_command");
+        assert!(!events[0].success);
+        assert!(events[0].input_text.as_deref().unwrap().contains("pwd"));
+    }
+
+    // ── 2026-09-28 review: the strict parser had no degradation path ─────────
+
+    /// Regression: a stream with no `result` event used to be a hard `Err`,
+    /// which `execute()` propagated as a failed spawn — throwing away an answer
+    /// agy had already produced just because the framing was not the one shape
+    /// this parser was written against.
+    #[test]
+    fn a_stream_without_a_result_event_degrades_to_the_last_line_instead_of_failing() {
+        let raw = concat!(
+            "{\"event\":\"init\"}\n",
+            "The answer is 42.\n"
+        );
+        let parsed = parse_stream_output(raw).expect("an unknown shape must not fail the spawn");
+        assert_eq!(parsed.content, "The answer is 42.");
+        assert_eq!(
+            parsed.usage, None,
+            "usage must be absent, never invented as zero-with-no-warning"
+        );
+        assert!(parsed.degraded.is_some(), "the degrade must be reported");
+    }
+
+    /// Regression: a complete answer with a `usage` block short one integer
+    /// used to lose the whole run. The answer is the valuable part; the token
+    /// counts are telemetry.
+    #[test]
+    fn a_result_with_incomplete_usage_keeps_the_answer_and_reports_unknown_tokens() {
+        let raw = "{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{\"input_tokens\":42}}}\n";
+        let parsed = parse_stream_output(raw).unwrap();
+        assert_eq!(parsed.content, "done");
+        assert_eq!(parsed.usage, None);
+        assert!(parsed.degraded.is_some());
+
+        // No usage block at all: same rule.
+        let raw = "{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"done\"}}\n";
+        let parsed = parse_stream_output(raw).unwrap();
+        assert_eq!(parsed.content, "done");
+        assert_eq!(parsed.usage, None);
+    }
+
+    /// One malformed NDJSON line is one line, not the run.
+    #[test]
+    fn an_unparseable_line_is_skipped_not_fatal() {
+        let raw = concat!(
+            "not json at all\n",
+            "{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"ok\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+        );
+        let parsed = parse_stream_output(raw).unwrap();
+        assert_eq!(parsed.content, "ok");
+        assert_eq!(parsed.usage, Some((1, 2, 0)));
+    }
+
+    /// The one hard failure that survives the degradation: agy explicitly
+    /// saying the run failed is a fact, not a shape we failed to recognise.
+    #[test]
+    fn an_explicit_non_success_status_is_still_an_error() {
+        let raw = "{\"event\":\"result\",\"result\":{\"status\":\"FAILED\",\"response\":\"partial\"}}\n";
+        let err = parse_stream_output(raw).unwrap_err();
+        assert!(err.contains("FAILED"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_stream_is_still_an_error() {
+        // Nothing to salvage ⇒ an honest failure, never `Ok("")`.
+        assert!(parse_stream_output("").is_err());
+        assert!(parse_stream_output("   \n\n").is_err());
+    }
     use crate::runtime::ConversationTurn;
 
     fn ctx(system: &str, model: &str) -> RuntimeContext {
@@ -465,12 +788,19 @@ mod tests {
             conversation_history: vec![],
             capabilities: None,
             account_pool: vec![],
+            effort: None,
+            allow_cross_family_failover: true,
         }
     }
 
     // ── P0-3: capability-derived sandbox/permission flags ─────────────────────
 
-    fn caps(computer_use: bool, browser_via_bash: bool, allowed: &[&str], denied: &[&str]) -> CapabilitiesConfig {
+    fn caps(
+        computer_use: bool,
+        browser_via_bash: bool,
+        allowed: &[&str],
+        denied: &[&str],
+    ) -> CapabilitiesConfig {
         CapabilitiesConfig {
             computer_use,
             browser_via_bash,
@@ -478,6 +808,35 @@ mod tests {
             denied_tools: denied.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn effort_args_clamp_to_high_and_are_empty_when_none() {
+        use duduclaw_core::effort::Effort;
+        // None ⇒ byte-identical argv.
+        assert!(effort_args(None, "older-model").is_empty());
+        assert_eq!(
+            effort_args(None, "gemini-3.7-flash"),
+            vec!["--effort", "medium"]
+        );
+        assert_eq!(
+            effort_args(Some(Effort::Low), "gemini-3.7-flash"),
+            vec!["--effort", "low"]
+        );
+        assert_eq!(
+            effort_args(Some(Effort::High), "older-model"),
+            vec!["--effort", "high"]
+        );
+        // agy 1.2.10 accepts only low|medium|high — xhigh/max must clamp, not
+        // be forwarded as a value the CLI would reject.
+        assert_eq!(
+            effort_args(Some(Effort::XHigh), "older-model"),
+            vec!["--effort", "high"]
+        );
+        assert_eq!(
+            effort_args(Some(Effort::Max), "older-model"),
+            vec!["--effort", "high"]
+        );
     }
 
     #[test]
@@ -501,7 +860,10 @@ mod tests {
     #[test]
     fn sandbox_args_full_access_is_skip_permissions_only() {
         let c = caps(true, false, &[], &[]);
-        assert_eq!(sandbox_args(Some(&c)), vec!["--dangerously-skip-permissions"]);
+        assert_eq!(
+            sandbox_args(Some(&c)),
+            vec!["--dangerously-skip-permissions"]
+        );
     }
 
     #[test]
@@ -542,7 +904,10 @@ mod tests {
     fn build_prompt_neutralizes_leading_dash() {
         let c = ctx("", "");
         let out = build_prompt(&c, "--help me");
-        assert!(out.starts_with(' '), "leading dash must be neutralized: {out:?}");
+        assert!(
+            out.starts_with(' '),
+            "leading dash must be neutralized: {out:?}"
+        );
     }
 
     #[test]
@@ -580,7 +945,10 @@ mod tests {
             return;
         }
         let rt = AntigravityRuntime::new();
-        assert!(rt.is_available().await, "agy not found on PATH/~/.local/bin");
+        assert!(
+            rt.is_available().await,
+            "agy not found on PATH/~/.local/bin"
+        );
 
         let dir = std::env::temp_dir().join("duduclaw-agy-e2e");
         let _ = std::fs::create_dir_all(&dir);
@@ -595,6 +963,8 @@ mod tests {
             conversation_history: vec![],
             capabilities: None,
             account_pool: vec![],
+            effort: None,
+            allow_cross_family_failover: true,
         };
         let resp = rt
             .execute("Reply with exactly: PONG", &c)

@@ -88,7 +88,10 @@ pub struct BridgeConfig {
 impl BridgeConfig {
     /// Redacted debug view for logs — proves configuration without leaking it.
     pub fn describe(&self) -> String {
-        format!("apps-script bridge at {} (secret set)", host_of(&self.url).unwrap_or_default())
+        format!(
+            "apps-script bridge at {} (secret set)",
+            host_of(&self.url).unwrap_or_default()
+        )
     }
 }
 
@@ -101,7 +104,9 @@ pub enum BridgeError {
     MissingSecret,
     #[error("Apps Script bridge request failed: {0}")]
     RequestFailed(String),
-    #[error("Apps Script bridge returned a non-JSON response (is the deployment set to \"Anyone\" access?)")]
+    #[error(
+        "Apps Script bridge returned a non-JSON response (is the deployment set to \"Anyone\" access?)"
+    )]
     MalformedResponse,
     /// The script itself reported a problem — `unauthorized` means the secret in
     /// `config.toml` and the `SECRET` in the deployed script disagree.
@@ -204,7 +209,10 @@ pub async fn config_for_home(home_dir: &Path) -> Result<Option<BridgeConfig>, Br
 
 /// Host of a URL, lowercased. `None` when the URL does not parse.
 fn host_of(url: &str) -> Option<String> {
-    url::Url::parse(url).ok()?.host_str().map(|h| h.to_ascii_lowercase())
+    url::Url::parse(url)
+        .ok()?
+        .host_str()
+        .map(|h| h.to_ascii_lowercase())
 }
 
 /// Validate a bridge URL: https, an allow-listed host (exact match), and the
@@ -248,7 +256,11 @@ pub async fn call(
     // re-checked against the allow-list so a spoofed redirect can never pull
     // the request off Google's infrastructure.
     let policy = reqwest::redirect::Policy::custom(|attempt| {
-        let host = attempt.url().host_str().unwrap_or_default().to_ascii_lowercase();
+        let host = attempt
+            .url()
+            .host_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         if attempt.previous().len() > 5 {
             attempt.stop()
         } else if ALLOWED_HOSTS.iter().any(|h| *h == host) {
@@ -275,7 +287,9 @@ pub async fn call(
         .await
         // A transport error can render the request URL; it carries no secret
         // (that lives in the body), but keep it short regardless.
-        .map_err(|e| BridgeError::RequestFailed(duduclaw_core::truncate_chars(&e.to_string(), 200)))?;
+        .map_err(|e| {
+            BridgeError::RequestFailed(duduclaw_core::truncate_chars(&e.to_string(), 200))
+        })?;
 
     let text = resp
         .text()
@@ -299,7 +313,9 @@ pub fn parse_response(body: &str) -> Result<Value, BridgeError> {
         } else {
             err
         };
-        return Err(BridgeError::Script(duduclaw_core::truncate_chars(hint, 300)));
+        return Err(BridgeError::Script(duduclaw_core::truncate_chars(
+            hint, 300,
+        )));
     }
     Ok(v)
 }
@@ -328,7 +344,10 @@ mod tests {
             "https://evil.test/script.google.com/exec",
             "https://notscript.google.com/macros/s/x/exec",
         ] {
-            assert!(matches!(validate_url(bad), Err(BridgeError::InvalidUrl)), "accepted {bad}");
+            assert!(
+                matches!(validate_url(bad), Err(BridgeError::InvalidUrl)),
+                "accepted {bad}"
+            );
         }
     }
 
@@ -353,7 +372,10 @@ mod tests {
 
     #[test]
     fn parse_config_absent_section_is_none() {
-        assert_eq!(parse_config("[general]\nlog_level=\"info\"\n", plain).unwrap(), None);
+        assert_eq!(
+            parse_config("[general]\nlog_level=\"info\"\n", plain).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -373,14 +395,21 @@ mod tests {
 
     #[test]
     fn parse_config_rejects_a_bad_url_instead_of_disabling_silently() {
-        let toml = "[integrations.google_apps_script]\nurl = \"https://evil.test/exec\"\nsecret = \"s\"\n";
-        assert!(matches!(parse_config(toml, plain), Err(BridgeError::InvalidUrl)));
+        let toml =
+            "[integrations.google_apps_script]\nurl = \"https://evil.test/exec\"\nsecret = \"s\"\n";
+        assert!(matches!(
+            parse_config(toml, plain),
+            Err(BridgeError::InvalidUrl)
+        ));
     }
 
     #[test]
     fn parse_config_requires_a_secret() {
         let toml = format!("[integrations.google_apps_script]\nurl = \"{GOOD_URL}\"\n");
-        assert!(matches!(parse_config(&toml, plain), Err(BridgeError::MissingSecret)));
+        assert!(matches!(
+            parse_config(&toml, plain),
+            Err(BridgeError::MissingSecret)
+        ));
     }
 
     /// WP-H1 P1 — the dialect-6 bug. Before the `SecretRef` rewrite the stored
@@ -480,7 +509,10 @@ mod tests {
     fn action_wire_names_match_the_deployed_script() {
         // These strings are the contract with duduclaw-bridge.gs's switch.
         assert_eq!(BridgeAction::GmailSearch.as_str(), "gmail_search");
-        assert_eq!(BridgeAction::CalendarCreateEvent.as_str(), "calendar_create_event");
+        assert_eq!(
+            BridgeAction::CalendarCreateEvent.as_str(),
+            "calendar_create_event"
+        );
         assert_eq!(BridgeAction::SheetsAppend.as_str(), "sheets_append");
         assert_eq!(BridgeAction::Status.as_str(), "status");
     }

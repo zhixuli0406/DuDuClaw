@@ -31,7 +31,10 @@ async fn explicit_take_over_step_completes_and_skips_approval() {
         target_app: "chrome".into(),
         task_summary: "登入頁面".into(),
         steps: vec![
-            plain_step("點擊使用者名稱欄位", CodriveAction::Move { x: 10.0, y: 10.0 }),
+            plain_step(
+                "點擊使用者名稱欄位",
+                CodriveAction::Move { x: 10.0, y: 10.0 },
+            ),
             take_over_step("交給人類輸入帳密"),
             plain_step("送出後等待", CodriveAction::Wait { ms: 10 }),
         ],
@@ -41,18 +44,35 @@ async fn explicit_take_over_step_completes_and_skips_approval() {
         .await
         .expect("run_script must finish");
 
-    assert_eq!(report.final_state, "completed", "detail: {:?}", report.detail);
+    assert_eq!(
+        report.final_state, "completed",
+        "detail: {:?}",
+        report.detail
+    );
     assert_eq!(report.steps.len(), 3);
     assert_eq!(report.steps[0].outcome, "applied");
     assert_eq!(report.steps[1].outcome, "taken_over");
     assert_eq!(report.steps[1].approval_id, None);
-    assert_eq!(report.steps[2].outcome, "applied", "the script must continue past the take_over step");
+    assert_eq!(
+        report.steps[2].outcome, "applied",
+        "the script must continue past the take_over step"
+    );
 
     let received = fake.received.lock().await;
-    assert!(received.iter().any(|v| v["op"] == "take_over" && v["reason"] == "交給人類輸入帳密"));
+    assert!(
+        received
+            .iter()
+            .any(|v| v["op"] == "take_over" && v["reason"] == "交給人類輸入帳密")
+    );
 
     let broker = ApprovalBroker::open(&home).expect("open broker");
-    assert!(broker.list_pending(None).await.expect("list_pending").is_empty());
+    assert!(
+        broker
+            .list_pending(None)
+            .await
+            .expect("list_pending")
+            .is_empty()
+    );
 }
 
 /// A take_over step whose hand-off never gets resumed within the whole-
@@ -111,7 +131,10 @@ async fn take_over_step_waits_for_simulated_human_resume() {
     assert_eq!(report.final_state, "completed");
     assert_eq!(report.steps[0].outcome, "taken_over");
     let received = fake.received.lock().await;
-    assert!(received.iter().any(|v| v["op"] == "status"), "must have polled status while waiting for hand-back");
+    assert!(
+        received.iter().any(|v| v["op"] == "status"),
+        "must have polled status while waiting for hand-back"
+    );
 }
 
 /// CD-3 item 3: `watch_mode: true` sends `{"op":"watch","enable":true}`
@@ -134,7 +157,11 @@ async fn watch_mode_true_enables_watch_before_the_first_step() {
 
     assert_eq!(report.final_state, "completed");
     let received = fake.received.lock().await;
-    assert_eq!(received.len(), 2, "expected exactly [watch, move]: {received:?}");
+    assert_eq!(
+        received.len(),
+        2,
+        "expected exactly [watch, move]: {received:?}"
+    );
     assert_eq!(received[0]["op"], "watch");
     assert_eq!(received[0]["enable"], true);
     assert_eq!(received[1]["op"], "move");
@@ -160,7 +187,10 @@ async fn watch_mode_false_sends_no_watch_op() {
 
     assert_eq!(report.final_state, "completed");
     let received = fake.received.lock().await;
-    assert!(!received.iter().any(|v| v["op"] == "watch"), "watch_mode:false must never send a watch op: {received:?}");
+    assert!(
+        !received.iter().any(|v| v["op"] == "watch"),
+        "watch_mode:false must never send a watch op: {received:?}"
+    );
 }
 
 /// Test-local constructor for a `CodriveStep` whose action is the explicit
@@ -169,7 +199,9 @@ fn take_over_step(reason: &str) -> super::script::CodriveStep {
     super::script::CodriveStep {
         narration: format!("take_over: {reason}"),
         highlight: None,
-        action: CodriveAction::TakeOver { reason: reason.to_string() },
+        action: CodriveAction::TakeOver {
+            reason: reason.to_string(),
+        },
         consequential: None,
         api_action: None,
         locate: None,

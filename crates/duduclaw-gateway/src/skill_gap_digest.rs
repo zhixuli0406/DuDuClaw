@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use duduclaw_agent::skill_ext_gap::{aggregate_gaps_for_agent, AggregatedExtGap, ExtGapRecord};
+use duduclaw_agent::skill_ext_gap::{AggregatedExtGap, ExtGapRecord, aggregate_gaps_for_agent};
 use tracing::{debug, info, warn};
 
 /// Aggregation window: only records seen in the last 24 h count.

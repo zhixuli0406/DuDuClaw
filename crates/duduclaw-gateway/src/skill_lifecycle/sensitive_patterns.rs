@@ -24,26 +24,102 @@ pub struct SensitivePattern {
 
 /// Secret/credential patterns. All patterns are lowercase for case-insensitive matching.
 pub const SECRET_PATTERNS: &[SensitivePattern] = &[
-    SensitivePattern { pattern: "sk-ant-", description: "Anthropic API key", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "sk-proj-", description: "OpenAI project key", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "api_key=", description: "API key assignment", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "password=", description: "Password assignment", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "anthropic_api_key", description: "Anthropic env var", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "openai_api_key", description: "OpenAI env var", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "ghp_", description: "GitHub personal access token", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "gho_", description: "GitHub OAuth token", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "github_pat_", description: "GitHub fine-grained PAT", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "xoxb-", description: "Slack bot token", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "xoxp-", description: "Slack user token", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "akia", description: "AWS access key ID", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "sk_test_", description: "Stripe test key", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "sk_live_", description: "Stripe live key", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "-----begin", description: "PEM private key", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "glpat-", description: "GitLab PAT", severity: PatternSeverity::Critical },
-    SensitivePattern { pattern: "aiza", description: "Google API key", severity: PatternSeverity::Critical },
+    SensitivePattern {
+        pattern: "sk-ant-",
+        description: "Anthropic API key",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "sk-proj-",
+        description: "OpenAI project key",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "api_key=",
+        description: "API key assignment",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "password=",
+        description: "Password assignment",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "anthropic_api_key",
+        description: "Anthropic env var",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "openai_api_key",
+        description: "OpenAI env var",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "ghp_",
+        description: "GitHub personal access token",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "gho_",
+        description: "GitHub OAuth token",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "github_pat_",
+        description: "GitHub fine-grained PAT",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "xoxb-",
+        description: "Slack bot token",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "xoxp-",
+        description: "Slack user token",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "akia",
+        description: "AWS access key ID",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "sk_test_",
+        description: "Stripe test key",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "sk_live_",
+        description: "Stripe live key",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "-----begin",
+        description: "PEM private key",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "glpat-",
+        description: "GitLab PAT",
+        severity: PatternSeverity::Critical,
+    },
+    SensitivePattern {
+        pattern: "aiza",
+        description: "Google API key",
+        severity: PatternSeverity::Critical,
+    },
     // Short/ambiguous patterns: Warning only (may match normal text)
-    SensitivePattern { pattern: "eyj", description: "JWT token (base64 header)", severity: PatternSeverity::Warning },
-    SensitivePattern { pattern: "sg.", description: "SendGrid API key (verify manually)", severity: PatternSeverity::Warning },
+    SensitivePattern {
+        pattern: "eyj",
+        description: "JWT token (base64 header)",
+        severity: PatternSeverity::Warning,
+    },
+    SensitivePattern {
+        pattern: "sg.",
+        description: "SendGrid API key (verify manually)",
+        severity: PatternSeverity::Warning,
+    },
 ];
 
 /// Prompt injection patterns. All patterns are lowercase.

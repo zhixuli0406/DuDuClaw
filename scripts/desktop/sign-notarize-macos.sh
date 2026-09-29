@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # macOS codesign + notarize + staple for a DuDuClaw .app/.dmg (TODO §D4.1).
-# Shared by both desktop shells — the Tauri app (src-tauri) and the
-# native-gui app (crates/duduclaw-native-gui, WP-C-M01); pass a different
-# entitlements file for the latter (see usage below).
+# Signs whatever .app/.dmg it is handed; the entitlements file is a
+# parameter, so it is not tied to any one shell. In this repo the caller is
+# the Tauri app (src-tauri) — see docs/guides/desktop-release.md. The
+# DuDuClaw-OS repo keeps its own copy of this script for the gpui native-gui
+# app, whose sources moved there on 2026-09-29.
 #
 # Requires (inject via CI secrets, never commit):
 #   APPLE_SIGNING_IDENTITY   e.g. "Developer ID Application: Acme (TEAMID)"
@@ -14,9 +16,7 @@
 #
 #   entitlements-path defaults to src-tauri/entitlements.plist (the
 #   original, production-verified path) — existing callers are unaffected.
-#   Pass an alternate file (e.g.
-#   crates/duduclaw-native-gui/entitlements.plist) to sign a
-#   differently-scoped app.
+#   Pass an alternate file to sign a differently-scoped app.
 #
 # `xcrun notarytool submit --help` documents ZIP / DMG / PKG as the only
 # accepted upload shapes — a raw .app directory is rejected outright. When

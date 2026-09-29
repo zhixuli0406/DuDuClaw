@@ -31,18 +31,18 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
-use axum::Router;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use duduclaw_core::truncate_bytes;
 
-use crate::channel_reply::{build_reply_with_session, set_channel_connected, ReplyContext};
+use crate::channel_reply::{ReplyContext, build_guarded_reply_with_session, set_channel_connected};
 
 const CHAT_API: &str = "https://chat.googleapis.com/v1";
 const CHAT_ISSUER: &str = "chat@system.gserviceaccount.com";
@@ -198,7 +198,10 @@ impl GoogleChatCreds {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("token status {status}: {}", truncate_bytes(&body, 200)));
+            return Err(format!(
+                "token status {status}: {}",
+                truncate_bytes(&body, 200)
+            ));
         }
         let body: serde_json::Value = resp.json().await.map_err(|e| format!("token parse: {e}"))?;
         let token = body
@@ -213,16 +216,15 @@ impl GoogleChatCreds {
 
 /// Read config and build the Google Chat webhook router. Returns `None`
 /// when the channel isn't configured.
-pub async fn start_googlechat_webhook(
-    home_dir: &Path,
-    ctx: Arc<ReplyContext>,
-) -> Option<Router> {
+pub async fn start_googlechat_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -> Option<Router> {
     let project_number = read_config(home_dir, "googlechat_project_number").await?;
     if project_number.trim().is_empty() {
         return None;
     }
     let Some(creds) = GoogleChatCreds::from_config(home_dir).await else {
-        error!("Google Chat: googlechat_service_account_json missing or not a valid service-account key");
+        error!(
+            "Google Chat: googlechat_service_account_json missing or not a valid service-account key"
+        );
         return None;
     };
     // project_number above (checked non-empty) is used only to decide
@@ -239,11 +241,25 @@ pub async fn start_googlechat_webhook(
     match state.creds.get_token().await {
         Ok(_) => {
             info!("✅ Google Chat webhook ready at /webhook/googlechat");
-            set_channel_connected(&ctx.channel_status, "googlechat", true, None, Some(&ctx.event_tx)).await;
+            set_channel_connected(
+                &ctx.channel_status,
+                "googlechat",
+                true,
+                None,
+                Some(&ctx.event_tx),
+            )
+            .await;
         }
         Err(e) => {
             warn!("Google Chat: service-account auth failed (webhook still mounted): {e}");
-            set_channel_connected(&ctx.channel_status, "googlechat", false, Some(e), Some(&ctx.event_tx)).await;
+            set_channel_connected(
+                &ctx.channel_status,
+                "googlechat",
+                false,
+                Some(e),
+                Some(&ctx.event_tx),
+            )
+            .await;
         }
     }
 
@@ -274,8 +290,7 @@ async fn webhook_handler(
     };
     // WP-8A: re-read fresh for this request instead of trusting a value
     // captured at task-spawn time. Fail-closed if it has since been unset.
-    let project_number = match read_config(&state.ctx.home_dir, "googlechat_project_number").await
-    {
+    let project_number = match read_config(&state.ctx.home_dir, "googlechat_project_number").await {
         Some(p) if !p.trim().is_empty() => p,
         _ => {
             warn!("Google Chat webhook: project_number not configured — rejecting request");
@@ -313,9 +328,13 @@ async fn webhook_handler(
             (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response()
         }
         "ADDED_TO_SPACE" => {
-            let space = event.pointer("/space/displayName").and_then(|v| v.as_str()).unwrap_or("(unknown)");
+            let space = event
+                .pointer("/space/displayName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
             info!("Google Chat: added to space {space}");
-            let product = crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
+            let product =
+                crate::branding::effective_product_name(&duduclaw_core::platform::duduclaw_home());
             (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({
@@ -452,7 +471,9 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
             .unwrap_or_else(std::time::Instant::now),
     ));
     let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
-        let Some(name) = progress_name.clone() else { return };
+        let Some(name) = progress_name.clone() else {
+            return;
+        };
         // Step / ModelInfo events are dashboard-only signals — never rendered
         // as channel text (would be an empty message).
         if matches!(
@@ -462,7 +483,10 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         ) {
             return;
         }
-        let is_todo = matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. });
+        let is_todo = matches!(
+            event,
+            crate::channel_reply::ProgressEvent::TodoUpdate { .. }
+        );
         {
             let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
             let throttle =
@@ -485,20 +509,58 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         if let Some(cmd) = crate::chat_commands::parse_command(&text, None) {
             let agent_id = {
                 let reg = state.ctx.registry.read().await;
-                reg.main_agent().map(|a| a.config.agent.name.clone()).unwrap_or_default()
+                reg.main_agent()
+                    .map(|a| a.config.agent.name.clone())
+                    .unwrap_or_default()
             };
             let reply = crate::chat_commands::handle_command(
-                &cmd, &state.ctx, &session_id, &agent_id, true, &sender_id,
+                &cmd,
+                &state.ctx,
+                &session_id,
+                &agent_id,
+                true,
+                &sender_id,
             )
             .await;
-            deliver_reply(&state.creds, &space, thread.as_deref(), placeholder.as_deref(), &reply).await;
+            deliver_reply(
+                &state.creds,
+                &space,
+                thread.as_deref(),
+                placeholder.as_deref(),
+                &reply,
+                None,
+            )
+            .await;
             return;
         }
     }
 
-    let reply =
-        build_reply_with_session(&input_text, &state.ctx, &session_id, &sender_id, Some(on_progress))
-            .await;
+    // `sender_id` falls back to a literal placeholder when the message has no
+    // `sender.name`; it keeps that value everywhere it is an addressing or
+    // logging key (the document sender, the audit trail), but it must never
+    // become the CCR principal — every unidentified sender would hash to one
+    // shared retrieval scope. `reply_principal_for_sender` yields "" there,
+    // which turns CCR off for the turn (fail-closed).
+    let guarded = build_guarded_reply_with_session(
+        &input_text,
+        &state.ctx,
+        &session_id,
+        crate::ccr_runtime::reply_principal_for_sender(&sender_id),
+        Some(on_progress),
+    )
+    .await;
+    if !guarded.still_valid().await {
+        deliver_reply(
+            &state.creds,
+            &space,
+            thread.as_deref(),
+            placeholder.as_deref(),
+            crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+            None,
+        )
+        .await;
+        return;
+    }
 
     // WP1.3: 📎DELIVER: — Google Chat attachment upload is not wired, so the
     // sender's default `send_document` degrades to a text notice (→ dashboard
@@ -509,9 +571,14 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
             space.clone(),
             sender_id.clone(),
         );
-        crate::channel_reply::deliver_documents_for_reply(
-            state.ctx.as_ref(), None, reply, doc_sender.as_ref(),
-        ).await
+        crate::channel_reply::deliver_documents_for_reply_guarded(
+            state.ctx.as_ref(),
+            None,
+            guarded.text.clone(),
+            doc_sender.as_ref(),
+            Some(&guarded),
+        )
+        .await
     };
 
     if reply.trim().is_empty() {
@@ -522,7 +589,15 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         return;
     }
 
-    deliver_reply(&state.creds, &space, thread.as_deref(), placeholder.as_deref(), &reply).await;
+    deliver_reply(
+        &state.creds,
+        &space,
+        thread.as_deref(),
+        placeholder.as_deref(),
+        &reply,
+        Some(&guarded),
+    )
+    .await;
 }
 
 /// Deliver the final reply: first chunk replaces the placeholder (PATCH),
@@ -533,16 +608,29 @@ async fn deliver_reply(
     thread: Option<&str>,
     placeholder: Option<&str>,
     reply_markdown: &str,
+    guarded: Option<&crate::channel_reply::GuardedReply>,
 ) {
     let formatted = crate::markdown_render::to_googlechat_text(reply_markdown);
     let chunks = crate::channel_format::split_text(&formatted, GCHAT_TEXT_CHUNK);
-    let mut chunks = chunks.iter();
-
-    if let (Some(name), Some(first)) = (placeholder, chunks.next()) {
-        update_message(creds, name, first).await;
-    }
-    for chunk in chunks {
-        create_message(creds, space, thread, chunk).await;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if crate::channel_reply::guard_lost(guarded).await {
+            let refusal = crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT;
+            if index == 0
+                && let Some(name) = placeholder
+            {
+                update_message(creds, name, refusal).await;
+            } else {
+                create_message(creds, space, thread, refusal).await;
+            }
+            return;
+        }
+        if index == 0
+            && let Some(name) = placeholder
+        {
+            update_message(creds, name, chunk).await;
+        } else {
+            create_message(creds, space, thread, chunk).await;
+        }
     }
 }
 
@@ -585,16 +673,28 @@ async fn create_message(
         body["thread"] = serde_json::json!({ "name": th });
         url.push_str("?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD");
     }
-    match creds.http.post(&url).bearer_auth(&token).json(&body).send().await {
-        Ok(resp) if resp.status().is_success() => resp
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())),
+    match creds
+        .http
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            resp.json::<serde_json::Value>().await.ok().and_then(|v| {
+                v.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+        }
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!("Google Chat send failed ({status}): {}", truncate_bytes(&body, 200));
+            error!(
+                "Google Chat send failed ({status}): {}",
+                truncate_bytes(&body, 200)
+            );
             None
         }
         Err(e) => {
@@ -635,7 +735,10 @@ impl GchatAttachment {
         if !name.is_empty() {
             return name.to_string();
         }
-        format!("file.{}", crate::media::extension_from_mime(&self.content_type))
+        format!(
+            "file.{}",
+            crate::media::extension_from_mime(&self.content_type)
+        )
     }
 }
 
@@ -675,13 +778,21 @@ fn parse_gchat_attachments(message: &serde_json::Value) -> Vec<GchatAttachment> 
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             let reference = if let Some(rn) = uploaded {
-                GchatAttachmentRef::Uploaded { resource_name: rn.to_string() }
+                GchatAttachmentRef::Uploaded {
+                    resource_name: rn.to_string(),
+                }
             } else if let Some(id) = drive {
-                GchatAttachmentRef::Drive { file_id: id.to_string() }
+                GchatAttachmentRef::Drive {
+                    file_id: id.to_string(),
+                }
             } else {
                 return None;
             };
-            Some(GchatAttachment { filename, content_type, reference })
+            Some(GchatAttachment {
+                filename,
+                content_type,
+                reference,
+            })
         })
         .collect()
 }
@@ -699,10 +810,7 @@ fn media_download_url(resource_name: &str) -> String {
 /// Download an uploaded attachment's bytes via the Chat media API using the
 /// service-account token. Size-capped at `media::MAX_FILE_SIZE`; the URL goes
 /// through the shared SSRF-validated downloader.
-async fn download_media(
-    creds: &GoogleChatCreds,
-    resource_name: &str,
-) -> Result<Vec<u8>, String> {
+async fn download_media(creds: &GoogleChatCreds, resource_name: &str) -> Result<Vec<u8>, String> {
     let token = creds.get_token().await?;
     let url = media_download_url(resource_name);
     let bearer = format!("Bearer {token}");
@@ -726,11 +834,21 @@ async fn update_message(creds: &GoogleChatCreds, message_name: &str, text: &str)
     };
     let url = format!("{CHAT_API}/{message_name}?updateMask=text");
     let body = serde_json::json!({ "text": text });
-    match creds.http.patch(&url).bearer_auth(&token).json(&body).send().await {
+    match creds
+        .http
+        .patch(&url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            warn!("Google Chat update failed ({status}): {}", truncate_bytes(&body, 200));
+            warn!(
+                "Google Chat update failed ({status}): {}",
+                truncate_bytes(&body, 200)
+            );
         }
         Err(e) => warn!("Google Chat update error: {e}"),
         _ => {}
@@ -781,7 +899,9 @@ mod tests {
         assert_eq!(atts[0].content_type, "application/octet-stream");
         assert_eq!(
             atts[0].reference,
-            GchatAttachmentRef::Drive { file_id: "drive-id-123".into() }
+            GchatAttachmentRef::Drive {
+                file_id: "drive-id-123".into()
+            }
         );
     }
 
@@ -832,19 +952,25 @@ mod tests {
         let named = GchatAttachment {
             filename: "photo.jpg".into(),
             content_type: "image/jpeg".into(),
-            reference: GchatAttachmentRef::Uploaded { resource_name: "r".into() },
+            reference: GchatAttachmentRef::Uploaded {
+                resource_name: "r".into(),
+            },
         };
         assert_eq!(named.effective_filename(), "photo.jpg");
         let nameless = GchatAttachment {
             filename: "".into(),
             content_type: "image/png".into(),
-            reference: GchatAttachmentRef::Uploaded { resource_name: "r".into() },
+            reference: GchatAttachmentRef::Uploaded {
+                resource_name: "r".into(),
+            },
         };
         assert_eq!(nameless.effective_filename(), "file.png");
         let unknown = GchatAttachment {
             filename: "  ".into(),
             content_type: "application/x-mystery".into(),
-            reference: GchatAttachmentRef::Drive { file_id: "d".into() },
+            reference: GchatAttachmentRef::Drive {
+                file_id: "d".into(),
+            },
         };
         assert_eq!(unknown.effective_filename(), "file.bin");
     }
@@ -905,8 +1031,13 @@ mod tests {
         .await
         .unwrap();
 
-        let creds1 = GoogleChatCreds::from_config(home).await.expect("configured");
-        assert_eq!(creds1.client_email, "bot@my-project.iam.gserviceaccount.com");
+        let creds1 = GoogleChatCreds::from_config(home)
+            .await
+            .expect("configured");
+        assert_eq!(
+            creds1.client_email,
+            "bot@my-project.iam.gserviceaccount.com"
+        );
 
         // Rotate to a different service account.
         let rotated_json = TEST_SA_JSON.replace("bot@my-project", "rotated-bot@my-project");
@@ -918,10 +1049,62 @@ mod tests {
         .await
         .unwrap();
 
-        let creds2 = GoogleChatCreds::from_config(home).await.expect("still configured");
+        let creds2 = GoogleChatCreds::from_config(home)
+            .await
+            .expect("still configured");
         assert_eq!(
             creds2.client_email, "rotated-bot@my-project.iam.gserviceaccount.com",
             "a fresh from_config must see the rotated key, not a cached first read"
+        );
+    }
+}
+
+/// Regression guard for the anonymous-sender CCR leak: this adapter used to
+/// pass its `"unknown"` placeholder straight into the reply pipeline's
+/// `user_id`, so every sender the webhook could not identify hashed to the
+/// same `source_acl` and could retrieve the others' saved tool originals.
+#[cfg(test)]
+mod ccr_principal_tests {
+    use crate::ccr_runtime::source_scan::call_args_at;
+    use crate::ccr_runtime::{reply_principal_for_sender, source_acl_for_principal};
+
+    const SRC: &str = include_str!("googlechat.rs");
+    const AGENT: &str = "agent-a";
+    const SESSION: &str = "googlechat:spaces/AAA";
+
+    /// Structural: every `build_guarded_reply_with_session` call in this file
+    /// must launder its principal. Checked over the real source because the
+    /// call site lives inside a long async webhook handler that cannot be
+    /// driven from a unit test.
+    #[test]
+    fn every_guarded_reply_call_launders_the_ccr_principal() {
+        let args = call_args_at(SRC, "build_guarded_reply_with_session(", 3);
+        assert!(
+            !args.is_empty(),
+            "no guarded-reply call found — did the call site move?"
+        );
+        for arg in args {
+            assert!(
+                arg.starts_with("crate::ccr_runtime::reply_principal_for_sender("),
+                "the CCR principal argument must be laundered, found `{arg}`"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unidentified_sender_disables_ccr_instead_of_sharing_one_scope() {
+        let anonymous = reply_principal_for_sender("unknown");
+        assert!(anonymous.is_empty());
+        assert!(
+            source_acl_for_principal(AGENT, SESSION, anonymous).is_none(),
+            "an unidentified sender must disable CCR, never pool into one scope"
+        );
+
+        let alice = reply_principal_for_sender("users/alice");
+        let bob = reply_principal_for_sender("users/bob");
+        assert_ne!(
+            source_acl_for_principal(AGENT, SESSION, alice).unwrap(),
+            source_acl_for_principal(AGENT, SESSION, bob).unwrap()
         );
     }
 }

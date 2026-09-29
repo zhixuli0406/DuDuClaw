@@ -83,7 +83,12 @@ impl RunOutcome {
 /// [`RunOutcome`] instead of an `Err`, since a scanner being unavailable or
 /// misbehaving is an expected, reportable outcome for `secaudit`, not an
 /// infra failure of the command itself.
-pub async fn run_capped(program: &str, args: &[&str], cwd: &Path, limits: &RunLimits) -> RunOutcome {
+pub async fn run_capped(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    limits: &RunLimits,
+) -> RunOutcome {
     let start = Instant::now();
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
@@ -100,11 +105,21 @@ pub async fn run_capped(program: &str, args: &[&str], cwd: &Path, limits: &RunLi
 
     let mut stdout = match child.stdout.take() {
         Some(s) => s,
-        None => return RunOutcome::spawn_failed("child had no stdout pipe".to_string(), start.elapsed()),
+        None => {
+            return RunOutcome::spawn_failed(
+                "child had no stdout pipe".to_string(),
+                start.elapsed(),
+            );
+        }
     };
     let mut stderr = match child.stderr.take() {
         Some(s) => s,
-        None => return RunOutcome::spawn_failed("child had no stderr pipe".to_string(), start.elapsed()),
+        None => {
+            return RunOutcome::spawn_failed(
+                "child had no stderr pipe".to_string(),
+                start.elapsed(),
+            );
+        }
     };
     let max = limits.max_output_bytes;
 
@@ -218,13 +233,7 @@ mod tests {
             timeout: DEFAULT_TIMEOUT,
             max_output_bytes: 10,
         };
-        let outcome = run_capped(
-            "sh",
-            &["-c", "printf '%050d' 0"],
-            Path::new("."),
-            &limits,
-        )
-        .await;
+        let outcome = run_capped("sh", &["-c", "printf '%050d' 0"], Path::new("."), &limits).await;
         assert_eq!(outcome.stdout.len(), 10);
         assert!(outcome.stdout_truncated);
     }

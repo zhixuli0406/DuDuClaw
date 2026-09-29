@@ -176,8 +176,8 @@ fn parse_case_fields(
 /// lines and `#` comment lines skipped). Fail-closed: any malformed case,
 /// duplicate id, or unknown `expected` value fails the whole load.
 pub fn load_bank(path: &std::path::Path) -> Result<Vec<BankCase>, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("read bank {}: {e}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("read bank {}: {e}", path.display()))?;
     let is_toml = path
         .extension()
         .and_then(|e| e.to_str())
@@ -230,8 +230,8 @@ pub fn parse_bank_jsonl(raw: &str) -> Result<Vec<BankCase>, String> {
             continue;
         }
         let ctx = format!("line {}", i + 1);
-        let v: serde_json::Value = serde_json::from_str(trimmed)
-            .map_err(|e| format!("{ctx}: bank JSONL parse: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(|e| format!("{ctx}: bank JSONL parse: {e}"))?;
         let get = |k: &str| v.get(k).and_then(|x| x.as_str());
         out.push(parse_case_fields(
             get("id"),
@@ -321,7 +321,11 @@ mod tests {
     fn skips_empty_rules() {
         let rules = vec!["".to_string(), "   ".to_string(), "ok rule".to_string()];
         let attacks = generate_attacks(&rules);
-        assert_eq!(attacks.len(), VARIANTS_PER_RULE, "only the one real rule expands");
+        assert_eq!(
+            attacks.len(),
+            VARIANTS_PER_RULE,
+            "only the one real rule expands"
+        );
     }
 
     #[test]
@@ -377,18 +381,26 @@ expected = "allowed"
 
     #[test]
     fn bank_load_fails_on_missing_fields() {
-        assert!(parse_bank_jsonl(r#"{"category":"c","payload":"p","expected":"blocked"}"#)
-            .unwrap_err()
-            .contains("id"));
-        assert!(parse_bank_jsonl(r#"{"id":"x","payload":"p","expected":"blocked"}"#)
-            .unwrap_err()
-            .contains("category"));
-        assert!(parse_bank_jsonl(r#"{"id":"x","category":"c","expected":"blocked"}"#)
-            .unwrap_err()
-            .contains("payload"));
-        assert!(parse_bank_jsonl(r#"{"id":"x","category":"c","payload":"p"}"#)
-            .unwrap_err()
-            .contains("expected"));
+        assert!(
+            parse_bank_jsonl(r#"{"category":"c","payload":"p","expected":"blocked"}"#)
+                .unwrap_err()
+                .contains("id")
+        );
+        assert!(
+            parse_bank_jsonl(r#"{"id":"x","payload":"p","expected":"blocked"}"#)
+                .unwrap_err()
+                .contains("category")
+        );
+        assert!(
+            parse_bank_jsonl(r#"{"id":"x","category":"c","expected":"blocked"}"#)
+                .unwrap_err()
+                .contains("payload")
+        );
+        assert!(
+            parse_bank_jsonl(r#"{"id":"x","category":"c","payload":"p"}"#)
+                .unwrap_err()
+                .contains("expected")
+        );
     }
 
     #[test]
@@ -460,12 +472,19 @@ expected = "allowed"
         let bank = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../templates/redteam/starter-bank.jsonl");
         let cases = load_bank(&bank).expect("starter bank loads");
-        assert!(cases.len() >= 20, "expected >=20 cases, got {}", cases.len());
+        assert!(
+            cases.len() >= 20,
+            "expected >=20 cases, got {}",
+            cases.len()
+        );
         let benign = cases
             .iter()
             .filter(|c| c.expected == BankExpectation::Allowed)
             .count();
-        assert!(benign >= 5, "expected >=5 over-defense probes, got {benign}");
+        assert!(
+            benign >= 5,
+            "expected >=5 over-defense probes, got {benign}"
+        );
         let attacks = cases.len() - benign;
         assert!(attacks >= 15, "expected >=15 attack cases, got {attacks}");
     }

@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tracing::{debug, warn};
 
 use duduclaw_llm::{InterceptDecision, ToolInterceptor};
@@ -201,9 +201,7 @@ fn is_already_proxied(def: &Value, exe: &str) -> bool {
 /// refuses to start is the fail-closed outcome — better than silently
 /// shipping unredacted rows.
 pub fn redaction_active_for_spawn(home_dir: &Path) -> bool {
-    use crate::redaction_integration::{
-        cli_flag_from_env, force_disable_active, BootOutcome,
-    };
+    use crate::redaction_integration::{BootOutcome, cli_flag_from_env, force_disable_active};
     use duduclaw_redaction::{CliFlag, EnvSetting};
 
     if force_disable_active(home_dir) {
@@ -390,7 +388,11 @@ pub struct RedactionToolInterceptor {
 
 impl RedactionToolInterceptor {
     pub fn new(manager: Arc<RedactionManager>, agent_id: String, session_id: String) -> Self {
-        Self { manager, agent_id, session_id }
+        Self {
+            manager,
+            agent_id,
+            session_id,
+        }
     }
 }
 
@@ -414,7 +416,10 @@ impl ToolInterceptor for RedactionToolInterceptor {
         ) {
             Ok(EgressDecision::Allow { args, .. }) => InterceptDecision::Allow(args),
             Ok(EgressDecision::Passthrough(args)) => InterceptDecision::Allow(args),
-            Ok(EgressDecision::Deny { reason, tokens_seen }) => InterceptDecision::Deny(format!(
+            Ok(EgressDecision::Deny {
+                reason,
+                tokens_seen,
+            }) => InterceptDecision::Deny(format!(
                 "egress denied for '{name}': {reason} (tokens_seen={tokens_seen})"
             )),
             // I5 fail-closed: an evaluation error denies, never passes through.
@@ -441,7 +446,10 @@ impl ToolInterceptor for RedactionToolInterceptor {
                 return;
             }
         };
-        let ctx = duduclaw_redaction::ToolContext { tool_name: &name, args: Some(args) };
+        let ctx = duduclaw_redaction::ToolContext {
+            tool_name: &name,
+            args: Some(args),
+        };
         if let Err(e) = pipeline.redact_value(result, &ctx) {
             warn!(
                 tool = %name, agent = %self.agent_id, error = %e,
@@ -458,8 +466,9 @@ impl ToolInterceptor for RedactionToolInterceptor {
 /// turn does not re-open the vault and recompile every rule. Same shape as
 /// `duduclaw_cli::mcp_auth::KeyRegistryCache`: a changed `config.toml` mtime
 /// forces a rebuild, so `redaction.update` is observed on the next turn.
-static MANAGER_CACHE: OnceLock<Mutex<Option<(PathBuf, Option<SystemTime>, Arc<RedactionManager>)>>> =
-    OnceLock::new();
+static MANAGER_CACHE: OnceLock<
+    Mutex<Option<(PathBuf, Option<SystemTime>, Arc<RedactionManager>)>>,
+> = OnceLock::new();
 
 /// The turn's channel session id — what the vault keys tokens on, so the
 /// reply path's `restore_for_channel` can later find them. Falls back to the
@@ -515,10 +524,10 @@ fn resolve_manager(home_dir: &Path) -> Result<Arc<RedactionManager>, String> {
     let rcfg = match crate::redaction_integration::classify_redaction_boot(Some(&raw)) {
         crate::redaction_integration::BootOutcome::Enabled(cfg) => *cfg,
         crate::redaction_integration::BootOutcome::Disabled => {
-            return Err("redaction became disabled between the gate and the build".to_string())
+            return Err("redaction became disabled between the gate and the build".to_string());
         }
         crate::redaction_integration::BootOutcome::Poisoned(reason) => {
-            return Err(format!("redaction config is poisoned: {reason}"))
+            return Err(format!("redaction config is poisoned: {reason}"));
         }
     };
     let manager = crate::redaction_integration::build_manager_from_home(home_dir, rcfg)
@@ -571,7 +580,11 @@ mod redaction_data_file_guard_tests {
         let loud = home_with("[redaction]\ndata_file_guard = \"  READ_ONLY \"\n");
         assert_eq!(data_file_guard_mode(loud.path()), "read_only");
         let typo = home_with("[redaction]\ndata_file_guard = \"readonly\"\n");
-        assert_eq!(data_file_guard_mode(typo.path()), "on", "typo must fail safe");
+        assert_eq!(
+            data_file_guard_mode(typo.path()),
+            "on",
+            "typo must fail safe"
+        );
     }
 
     #[test]
@@ -655,7 +668,8 @@ mod mcp_config_proxy_tests {
 
     #[test]
     fn instance_scoped_duduclaw_keys_are_also_skipped() {
-        let cfg = json!({"mcpServers": {"duduclaw-staging": {"command": "/x", "args": ["mcp-server"]}}});
+        let cfg =
+            json!({"mcpServers": {"duduclaw-staging": {"command": "/x", "args": ["mcp-server"]}}});
         assert_eq!(rewrite_mcp_config_for_proxy(&cfg, &exe()), cfg);
     }
 
@@ -758,8 +772,7 @@ mod mcp_config_proxy_tests {
         std::fs::write(&path, sample().to_string()).unwrap();
 
         let temp = write_proxy_mcp_config(&path, &exe()).expect("there is something to proxy");
-        let body: Value =
-            serde_json::from_str(&std::fs::read_to_string(&temp).unwrap()).unwrap();
+        let body: Value = serde_json::from_str(&std::fs::read_to_string(&temp).unwrap()).unwrap();
         assert_eq!(body["mcpServers"]["crm_pg"]["args"][0], json!("mcp-proxy"));
         // The original on disk is never modified.
         let original: Value =
@@ -817,7 +830,10 @@ mod mcp_config_proxy_tests {
 
     #[test]
     fn qualified_names_fall_back_to_the_bare_tool() {
-        assert_eq!(qualified_tool_name("crm_pg", "pg_select"), "crm_pg.pg_select");
+        assert_eq!(
+            qualified_tool_name("crm_pg", "pg_select"),
+            "crm_pg.pg_select"
+        );
         assert_eq!(qualified_tool_name("", "memory_search"), "memory_search");
     }
 }
@@ -825,9 +841,7 @@ mod mcp_config_proxy_tests {
 #[cfg(test)]
 mod interceptor_tests {
     use super::*;
-    use duduclaw_redaction::{
-        ManagerPaths, RedactionConfig, RestoreScope, RuleKind, RuleSpec,
-    };
+    use duduclaw_redaction::{ManagerPaths, RedactionConfig, RestoreScope, RuleKind, RuleSpec};
 
     fn manager(home: &Path) -> Arc<RedactionManager> {
         let mut cfg = RedactionConfig::default();
@@ -864,12 +878,20 @@ mod interceptor_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let icept = interceptor(tmp.path());
         let mut result = json!({"rows": [{"id": 3, "name": "王小明", "email": "w@example.com"}]});
-        icept.after_call("crm_pg", "pg_select", &json!({"table": "customers"}), &mut result);
+        icept.after_call(
+            "crm_pg",
+            "pg_select",
+            &json!({"table": "customers"}),
+            &mut result,
+        );
 
         let rendered = result.to_string();
         assert!(!rendered.contains("王小明"), "{rendered}");
         assert!(rendered.contains("<REDACT:DB_FIELD:"), "{rendered}");
-        assert!(!rendered.contains("w@example.com"), "general profile: {rendered}");
+        assert!(
+            !rendered.contains("w@example.com"),
+            "general profile: {rendered}"
+        );
         assert_eq!(result["rows"][0]["id"], json!(3), "id survives");
     }
 

@@ -208,9 +208,16 @@ pub(crate) async fn run_websocket_source(
 
     loop {
         let started = Instant::now();
-        let outcome =
-            stream_websocket(&cfg, &home_dir, &url, &mut state, &tx, &hub, events_bus.as_ref())
-                .await;
+        let outcome = stream_websocket(
+            &cfg,
+            &home_dir,
+            &url,
+            &mut state,
+            &tx,
+            &hub,
+            events_bus.as_ref(),
+        )
+        .await;
         let session = started.elapsed();
         let mut recycled = false;
 
@@ -390,8 +397,8 @@ async fn stream_websocket(
         WS_CONNECT_TIMEOUT,
         connect_source(cfg, home_dir, url, &mut state.dns),
     )
-        .await
-        .map_err(|_| format!("connect timed out after {}s", WS_CONNECT_TIMEOUT.as_secs()))??;
+    .await
+    .map_err(|_| format!("connect timed out after {}s", WS_CONNECT_TIMEOUT.as_secs()))??;
 
     let (mut write, mut read) = stream.split();
 
@@ -734,7 +741,13 @@ mod tests {
         cfg.idle_timeout_secs = 1;
         let hub = Arc::new(TickHub::new());
         let (tx, _rx) = broadcast::channel(16);
-        let source = tokio::spawn(run_source(cfg, Arc::new(std::env::temp_dir()), tx, hub.clone(), None));
+        let source = tokio::spawn(run_source(
+            cfg,
+            Arc::new(std::env::temp_dir()),
+            tx,
+            hub.clone(),
+            None,
+        ));
 
         let redialled = wait_until(Duration::from_secs(15), || {
             accepts.load(std::sync::atomic::Ordering::SeqCst) >= 2
@@ -782,7 +795,13 @@ mod tests {
         // make "did a ping arrive" depend on reconnect timing.
         let hub = Arc::new(TickHub::new());
         let (tx, _rx) = broadcast::channel(16);
-        let source = tokio::spawn(run_source(cfg, Arc::new(std::env::temp_dir()), tx, hub, None));
+        let source = tokio::spawn(run_source(
+            cfg,
+            Arc::new(std::env::temp_dir()),
+            tx,
+            hub,
+            None,
+        ));
 
         let pinged = tokio::time::timeout(Duration::from_secs(15), ping_rx).await;
         assert!(pinged.is_ok(), "no client ping reached the server");
@@ -828,7 +847,13 @@ mod tests {
         cfg.json_fields = pointers(&[("p", "/p")]);
         let hub = Arc::new(TickHub::new());
         let (tx, _rx) = broadcast::channel(64);
-        let source = tokio::spawn(run_source(cfg, Arc::new(std::env::temp_dir()), tx, hub.clone(), None));
+        let source = tokio::spawn(run_source(
+            cfg,
+            Arc::new(std::env::temp_dir()),
+            tx,
+            hub.clone(),
+            None,
+        ));
 
         // Long enough to cross the 2 s idle deadline twice over if the clock
         // were not being reset by the incoming frames.
@@ -890,7 +915,13 @@ mod tests {
         ]);
         let hub = Arc::new(TickHub::new());
         let (tx, _rx) = broadcast::channel(16);
-        let source = tokio::spawn(run_source(cfg, Arc::new(std::env::temp_dir()), tx, hub, None));
+        let source = tokio::spawn(run_source(
+            cfg,
+            Arc::new(std::env::temp_dir()),
+            tx,
+            hub,
+            None,
+        ));
 
         let seen = tokio::time::timeout(Duration::from_secs(15), seen_rx)
             .await
@@ -963,7 +994,13 @@ mod tests {
             baseline_max_age_secs: crate::tick_config::DEFAULT_BASELINE_MAX_AGE_SECS,
             dns_ttl_secs: 0,
         };
-        let source = tokio::spawn(run_source(cfg, Arc::new(std::env::temp_dir()), tx, hub.clone(), None));
+        let source = tokio::spawn(run_source(
+            cfg,
+            Arc::new(std::env::temp_dir()),
+            tx,
+            hub.clone(),
+            None,
+        ));
 
         // Wait for both text frames to have made it through the pipeline.
         let settled = tokio::time::timeout(Duration::from_secs(10), async {

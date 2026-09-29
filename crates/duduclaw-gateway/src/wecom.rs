@@ -32,11 +32,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::{
+    Router,
     body::Bytes,
     extract::{Query, State},
     http::StatusCode,
     routing::get,
-    Router,
 };
 use base64::Engine;
 use duduclaw_core::truncate_bytes;
@@ -44,7 +44,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::channel_reply::{build_reply_with_session, set_channel_connected, ReplyContext};
+use crate::channel_reply::{ReplyContext, build_guarded_reply_with_session, set_channel_connected};
 
 const WECOM_API: &str = "https://qyapi.weixin.qq.com/cgi-bin";
 
@@ -151,8 +151,8 @@ pub(crate) fn verify_wecom_signature(
 /// Raw AES-256-CBC decrypt (IV = key[0..16]). Input must be a non-empty
 /// multiple of the 16-byte block size. PKCS#7 unpadding (1..=32) applied.
 fn aes256_cbc_decrypt(key: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
-    use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
     use aes::Aes256;
+    use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
 
     if data.is_empty() || data.len() % 16 != 0 {
         return None;
@@ -187,8 +187,8 @@ fn aes256_cbc_decrypt(key: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
 /// round-trip tests; also the building block for future passive replies.
 #[cfg(test)]
 fn aes256_cbc_encrypt(key: &[u8; 32], plain: &[u8]) -> Vec<u8> {
-    use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use aes::Aes256;
+    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 
     let pad = 32 - (plain.len() % 32);
     let mut buf = Vec::with_capacity(plain.len() + pad);
@@ -636,7 +636,7 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
             )
             .await;
             if !reply.trim().is_empty() {
-                send_text(state, &from_user, &reply).await;
+                send_text(state, &from_user, &reply, None).await;
             }
             return;
         }
@@ -666,7 +666,8 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
         );
         {
             let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
-            let throttle = crate::channel_capabilities::progress_throttle_secs("wecom").unwrap_or(45);
+            let throttle =
+                crate::channel_capabilities::progress_throttle_secs("wecom").unwrap_or(45);
             if !is_todo && last.elapsed().as_secs() < throttle {
                 return;
             }
@@ -676,11 +677,11 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
         let st = progress_state.clone();
         let user = progress_user.clone();
         tokio::spawn(async move {
-            send_text(&st, &user, &msg_text).await;
+            send_text(&st, &user, &msg_text, None).await;
         });
     });
 
-    let reply = build_reply_with_session(
+    let guarded = build_guarded_reply_with_session(
         &text,
         &state.ctx,
         &session_id,
@@ -688,25 +689,63 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
         Some(on_progress),
     )
     .await;
-    if reply.trim().is_empty() {
+    if guarded.text.trim().is_empty() {
         warn!(from_user, "WeCom: reply is empty — skipping send");
         return;
     }
 
     // Rich reply: msgtype markdown (WeCom client renders a markdown subset);
     // fall back to plain text per chunk on rejection.
-    for chunk in crate::channel_format::split_text(&reply, WECOM_TEXT_CHUNK) {
-        let sent_md = send_wecom_msg(state, &from_user, "markdown", &chunk).await;
+    for chunk in crate::channel_format::split_text(&guarded.text, WECOM_TEXT_CHUNK) {
+        if !guarded.still_valid().await {
+            send_text(
+                state,
+                &from_user,
+                crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+                None,
+            )
+            .await;
+            return;
+        }
+        let sent_md = send_wecom_msg(state, &from_user, "markdown", &chunk, Some(&guarded)).await;
         if !sent_md {
-            send_text(state, &from_user, &chunk).await;
+            if !guarded.still_valid().await {
+                send_text(
+                    state,
+                    &from_user,
+                    crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+                    None,
+                )
+                .await;
+                return;
+            }
+            send_text(state, &from_user, &chunk, Some(&guarded)).await;
+            if !guarded.still_valid().await {
+                send_text(
+                    state,
+                    &from_user,
+                    crate::channel_reply::CCR_DELIVERY_REFUSED_TEXT,
+                    None,
+                )
+                .await;
+                return;
+            }
         }
     }
 }
 
 /// Send a text message (chunk-safe helper for progress / fallback paths).
-async fn send_text(state: &Arc<WeComState>, touser: &str, text: &str) {
+async fn send_text(
+    state: &Arc<WeComState>,
+    touser: &str,
+    text: &str,
+    guarded: Option<&crate::channel_reply::GuardedReply>,
+) {
     for chunk in crate::channel_format::split_text(text, WECOM_TEXT_CHUNK) {
-        if !send_wecom_msg(state, touser, "text", &chunk).await {
+        if crate::channel_reply::guard_lost(guarded).await {
+            return;
+        }
+        if !send_wecom_msg(state, touser, "text", &chunk, guarded).await {
             error!("WeCom send failed (touser: {touser})");
             return;
         }
@@ -720,6 +759,7 @@ async fn send_wecom_msg(
     touser: &str,
     msgtype: &str,
     content: &str,
+    guarded: Option<&crate::channel_reply::GuardedReply>,
 ) -> bool {
     // WP-8A: re-read fresh rather than a value captured at task-spawn time.
     let agent_id = read_wecom_config(&state.ctx.home_dir, "wecom_agent_id")
@@ -733,6 +773,9 @@ async fn send_wecom_msg(
                 return false;
             }
         };
+        if crate::channel_reply::guard_lost(guarded).await {
+            return false;
+        }
         let mut body = serde_json::json!({
             "touser": touser,
             "msgtype": msgtype,
@@ -1087,7 +1130,9 @@ mod tests {
     // ── WP-8A / credentials doctrine P2: resolve_wecom_creds ────────────
 
     async fn write_config(home: &Path, body: &str) {
-        tokio::fs::write(home.join("config.toml"), body).await.unwrap();
+        tokio::fs::write(home.join("config.toml"), body)
+            .await
+            .unwrap();
     }
 
     const FULL_CREDS_TOML: &str = concat!(
@@ -1129,14 +1174,20 @@ mod tests {
             "[channels]\nwecom_corp_id = \"C\"\nwecom_callback_token = \"T\"\nwecom_encoding_aes_key = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP0\"\n",
         )
         .await;
-        assert!(resolve_wecom_creds(home).await.is_none(), "missing corp_secret");
+        assert!(
+            resolve_wecom_creds(home).await.is_none(),
+            "missing corp_secret"
+        );
 
         write_config(
             home,
             "[channels]\nwecom_corp_id = \"C\"\nwecom_corp_secret = \"S\"\nwecom_encoding_aes_key = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP0\"\n",
         )
         .await;
-        assert!(resolve_wecom_creds(home).await.is_none(), "missing callback_token");
+        assert!(
+            resolve_wecom_creds(home).await.is_none(),
+            "missing callback_token"
+        );
 
         write_config(
             home,

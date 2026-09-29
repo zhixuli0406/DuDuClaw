@@ -9,7 +9,7 @@
 //!   default text-notice fallback (`channel_sender.rs`) — silently, with no
 //!   log line distinguishing "degraded on purpose" from "nobody noticed".
 //! - interactive buttons: `channel_format::decision_markup`'s `_ => None`
-//!   arm and `goal_notify::send_with_markup`'s `other => Err(..)` arm —
+//!   arm and `channel_sender::send_with_markup`'s `other => Err(..)` arm —
 //!   two independent `match` statements that happen to agree today.
 //! - message edit-in-place: `decision_card::channel_editable` (a 3-channel
 //!   allowlist for decision-card collapse) vs. five *different* hand-rolled
@@ -55,7 +55,7 @@ pub enum Capability {
     /// real media API; `false` ⇒ it always degrades to a text notice.
     PhotoUpload,
     /// Inline decision buttons (`channel_format::decision_markup` /
-    /// `goal_notify::send_with_markup` have a real arm for this channel).
+    /// `channel_sender::send_with_markup` have a real arm for this channel).
     InteractiveButtons,
     /// The progress task board (📋) is delivered as an in-place update —
     /// either a real message-edit REST call, or (WebChat) a live
@@ -120,7 +120,7 @@ const DEFAULT_PROGRESS_THROTTLE_SECS: u64 = 30;
 /// - file_upload / photo_upload: `channel_sender.rs` — presence of a
 ///   `send_document`/`send_photo` override vs. the trait defaults.
 /// - interactive_buttons: `channel_format.rs:679` `decision_markup` +
-///   `goal_notify.rs:996` `send_with_markup` (both cover exactly
+///   `channel_sender.rs` `send_with_markup` (both cover exactly
 ///   telegram/discord/slack/line, confirmed to agree).
 /// - edit_in_place: union of `decision_card.rs:142` `channel_editable`
 ///   (telegram/slack/discord) and the progress-board edit loops in
@@ -364,8 +364,17 @@ mod tests {
     use super::*;
 
     const ALL_CHANNELS: &[&str] = &[
-        "telegram", "line", "discord", "slack", "whatsapp", "feishu", "googlechat", "teams",
-        "wecom", "dingtalk", "webchat",
+        "telegram",
+        "line",
+        "discord",
+        "slack",
+        "whatsapp",
+        "feishu",
+        "googlechat",
+        "teams",
+        "wecom",
+        "dingtalk",
+        "webchat",
     ];
 
     #[test]
@@ -407,11 +416,19 @@ mod tests {
     // -- file_upload: matches ChannelSender::send_document override presence --
     #[test]
     fn file_upload_matches_send_document_overrides() {
-        for ch in ["telegram", "discord", "slack", "whatsapp", "feishu", "webchat"] {
-            assert!(supports(ch, Capability::FileUpload), "{ch} should support file_upload");
+        for ch in [
+            "telegram", "discord", "slack", "whatsapp", "feishu", "webchat",
+        ] {
+            assert!(
+                supports(ch, Capability::FileUpload),
+                "{ch} should support file_upload"
+            );
         }
         for ch in ["line", "googlechat", "teams", "wecom", "dingtalk"] {
-            assert!(!supports(ch, Capability::FileUpload), "{ch} should NOT support file_upload");
+            assert!(
+                !supports(ch, Capability::FileUpload),
+                "{ch} should NOT support file_upload"
+            );
         }
     }
 
@@ -421,10 +438,16 @@ mod tests {
         for ch in [
             "telegram", "line", "discord", "slack", "whatsapp", "feishu", "wecom", "webchat",
         ] {
-            assert!(supports(ch, Capability::PhotoUpload), "{ch} should support photo_upload");
+            assert!(
+                supports(ch, Capability::PhotoUpload),
+                "{ch} should support photo_upload"
+            );
         }
         for ch in ["googlechat", "teams", "dingtalk"] {
-            assert!(!supports(ch, Capability::PhotoUpload), "{ch} should NOT support photo_upload");
+            assert!(
+                !supports(ch, Capability::PhotoUpload),
+                "{ch} should NOT support photo_upload"
+            );
         }
     }
 
@@ -432,12 +455,24 @@ mod tests {
     #[test]
     fn interactive_buttons_matches_decision_markup_coverage() {
         for ch in ["telegram", "discord", "slack", "line"] {
-            assert!(supports(ch, Capability::InteractiveButtons), "{ch} should support buttons");
+            assert!(
+                supports(ch, Capability::InteractiveButtons),
+                "{ch} should support buttons"
+            );
         }
         for ch in [
-            "whatsapp", "feishu", "googlechat", "teams", "wecom", "dingtalk", "webchat",
+            "whatsapp",
+            "feishu",
+            "googlechat",
+            "teams",
+            "wecom",
+            "dingtalk",
+            "webchat",
         ] {
-            assert!(!supports(ch, Capability::InteractiveButtons), "{ch} should NOT support buttons");
+            assert!(
+                !supports(ch, Capability::InteractiveButtons),
+                "{ch} should NOT support buttons"
+            );
         }
     }
 
@@ -464,10 +499,16 @@ mod tests {
     #[test]
     fn typing_indicator_matches_channel_typing_doc_table() {
         for ch in ["telegram", "discord", "line", "whatsapp", "slack", "teams"] {
-            assert!(supports(ch, Capability::TypingIndicator), "{ch} should support typing");
+            assert!(
+                supports(ch, Capability::TypingIndicator),
+                "{ch} should support typing"
+            );
         }
         for ch in ["feishu", "googlechat", "wecom", "dingtalk", "webchat"] {
-            assert!(!supports(ch, Capability::TypingIndicator), "{ch} should NOT support typing");
+            assert!(
+                !supports(ch, Capability::TypingIndicator),
+                "{ch} should NOT support typing"
+            );
         }
     }
 
@@ -478,7 +519,11 @@ mod tests {
             if c.channel == "line" {
                 assert!(!c.native_markdown, "line should be plain-text only");
             } else {
-                assert!(c.native_markdown, "{} should support some native markdown", c.channel);
+                assert!(
+                    c.native_markdown,
+                    "{} should support some native markdown",
+                    c.channel
+                );
             }
         }
     }
@@ -487,10 +532,23 @@ mod tests {
     #[test]
     fn quoted_context_matches_documented_five_channels() {
         for ch in ["telegram", "discord", "slack", "teams", "whatsapp"] {
-            assert!(supports(ch, Capability::QuotedContext), "{ch} should carry quoted context");
+            assert!(
+                supports(ch, Capability::QuotedContext),
+                "{ch} should carry quoted context"
+            );
         }
-        for ch in ["line", "feishu", "googlechat", "wecom", "dingtalk", "webchat"] {
-            assert!(!supports(ch, Capability::QuotedContext), "{ch} should NOT carry quoted context");
+        for ch in [
+            "line",
+            "feishu",
+            "googlechat",
+            "wecom",
+            "dingtalk",
+            "webchat",
+        ] {
+            assert!(
+                !supports(ch, Capability::QuotedContext),
+                "{ch} should NOT carry quoted context"
+            );
         }
     }
 
@@ -513,7 +571,11 @@ mod tests {
             ("webchat", None),
         ];
         for (ch, want) in expect {
-            assert_eq!(progress_throttle_secs(ch), *want, "throttle mismatch for {ch}");
+            assert_eq!(
+                progress_throttle_secs(ch),
+                *want,
+                "throttle mismatch for {ch}"
+            );
         }
     }
 

@@ -20,8 +20,8 @@ use super::config::CodriveConfig;
 use super::driver::ticker;
 use super::registry::{self, DispatchOutcome};
 use super::script::{
-    ApiActionRequest, CodriveAction, CodriveConsequential, CodriveHighlight, CodriveStep, ConsequentialClass,
-    LocateRequest,
+    ApiActionRequest, CodriveAction, CodriveConsequential, CodriveHighlight, CodriveStep,
+    ConsequentialClass, LocateRequest,
 };
 
 /// The tool name stamped on every audit row this module writes — matches
@@ -94,12 +94,19 @@ pub(super) async fn run_one_step(
     // sense) and never reaches `send_step_actions` (the credential text, if
     // any, is never sent to comp at all — only the hand-off is).
     if let Some(reason) = take_over_reason(step) {
-        return run_take_over_step(client, home_dir, agent_id, session_id, reason, started, deadline).await;
+        return run_take_over_step(
+            client, home_dir, agent_id, session_id, reason, started, deadline,
+        )
+        .await;
     }
 
     let approval_id = match &step.consequential {
         None => None,
-        Some(cons) => match gate_consequential(broker, home_dir, agent_id, target_app, index, step, cons, cfg).await {
+        Some(cons) => match gate_consequential(
+            broker, home_dir, agent_id, target_app, index, step, cons, cfg,
+        )
+        .await
+        {
             Ok(id) => Some(id),
             Err(abort) => return Err(abort),
         },
@@ -115,7 +122,12 @@ pub(super) async fn run_one_step(
     // the same regardless of which mechanism ends up carrying it out.
     if let Some(req) = &step.api_action {
         if try_registry_action(home_dir, agent_id, target_app, req).await {
-            return Ok(StepSuccess { approval_id, reapplied: false, taken_over: false, via_api_action: true });
+            return Ok(StepSuccess {
+                approval_id,
+                reapplied: false,
+                taken_over: false,
+                via_api_action: true,
+            });
         }
     }
 
@@ -139,19 +151,48 @@ pub(super) async fn run_one_step(
     // session to comp — the exact bug CD-0 §9 fixed.
     let mut effective_action = step.action.clone();
     if let Some(req) = &step.locate {
-        try_atspi_locate(client, home_dir, agent_id, target_app, req, &mut effective_action).await;
+        try_atspi_locate(
+            client,
+            home_dir,
+            agent_id,
+            target_app,
+            req,
+            &mut effective_action,
+        )
+        .await;
     }
 
     let mut reapplied = false;
     loop {
         match send_step_actions(client, &step.highlight, &effective_action).await {
-            Ok(()) => return Ok(StepSuccess { approval_id, reapplied, taken_over: false, via_api_action: false }),
+            Ok(()) => {
+                return Ok(StepSuccess {
+                    approval_id,
+                    reapplied,
+                    taken_over: false,
+                    via_api_action: false,
+                });
+            }
             Err(CodriveClientError::Frozen) => {
-                ticker(home_dir, agent_id, "codrive_step", session_id, "已被人類輸入凍結，等待交還（Super+Enter）").await;
+                ticker(
+                    home_dir,
+                    agent_id,
+                    "codrive_step",
+                    session_id,
+                    "已被人類輸入凍結，等待交還（Super+Enter）",
+                )
+                .await;
                 match wait_for_resume(client, started, deadline).await {
                     Ok(()) => {
                         reapplied = true;
-                        ticker(home_dir, agent_id, "codrive_step", session_id, "已交還，繼續執行").await;
+                        ticker(
+                            home_dir,
+                            agent_id,
+                            "codrive_step",
+                            session_id,
+                            "已交還，繼續執行",
+                        )
+                        .await;
                     }
                     Err(WaitAbort::Timeout) => {
                         return Err(StepAbort {
@@ -205,7 +246,13 @@ fn take_over_reason(step: &CodriveStep) -> Option<String> {
     step.consequential
         .as_ref()
         .filter(|c| c.class == ConsequentialClass::Credential)
-        .map(|c| if c.description.trim().is_empty() { step.narration.clone() } else { c.description.clone() })
+        .map(|c| {
+            if c.description.trim().is_empty() {
+                step.narration.clone()
+            } else {
+                c.description.clone()
+            }
+        })
 }
 
 /// Executes a take_over step: sends `{"op":"take_over","reason":…}`, waits
@@ -223,7 +270,14 @@ async fn run_take_over_step(
     started: Instant,
     deadline: Duration,
 ) -> Result<StepSuccess, StepAbort> {
-    ticker(home_dir, agent_id, "codrive_step", session_id, &format!("已交棒給人類接手：{reason}")).await;
+    ticker(
+        home_dir,
+        agent_id,
+        "codrive_step",
+        session_id,
+        &format!("已交棒給人類接手：{reason}"),
+    )
+    .await;
 
     match client.send(&CodriveCmd::TakeOver { reason }).await {
         Ok(_) => {}
@@ -232,7 +286,14 @@ async fn run_take_over_step(
             // happens for `take_over` — see `takeover.rs`'s module doc) —
             // still handled, not `unreachable!`, per this crate's own
             // "never trust an upstream invariant alone" convention.
-            ticker(home_dir, agent_id, "codrive_step", session_id, "接手指令送出時已被凍結，等待交還").await;
+            ticker(
+                home_dir,
+                agent_id,
+                "codrive_step",
+                session_id,
+                "接手指令送出時已被凍結，等待交還",
+            )
+            .await;
         }
         Err(CodriveClientError::Terminated) => {
             return Err(StepAbort {
@@ -254,8 +315,20 @@ async fn run_take_over_step(
 
     match wait_for_resume(client, started, deadline).await {
         Ok(()) => {
-            ticker(home_dir, agent_id, "codrive_step", session_id, "已交還，繼續執行下一步").await;
-            Ok(StepSuccess { approval_id: None, reapplied: false, taken_over: true, via_api_action: false })
+            ticker(
+                home_dir,
+                agent_id,
+                "codrive_step",
+                session_id,
+                "已交還，繼續執行下一步",
+            )
+            .await;
+            Ok(StepSuccess {
+                approval_id: None,
+                reapplied: false,
+                taken_over: true,
+                via_api_action: false,
+            })
         }
         Err(WaitAbort::Timeout) => Err(StepAbort {
             step_outcome: "aborted",
@@ -290,16 +363,36 @@ async fn gate_consequential(
 ) -> Result<String, StepAbort> {
     let Some(broker) = broker else {
         let detail = "審批系統無法建立審核請求，已拒絕（fail-closed）".to_string();
-        duduclaw_security::audit::append_tool_call_denied(home_dir, agent_id, TOOL_NAME, "codrive_action_denied", &detail, None);
-        return Err(StepAbort { step_outcome: "denied", final_state: "aborted_approval_denied", detail, approval_id: None });
+        duduclaw_security::audit::append_tool_call_denied(
+            home_dir,
+            agent_id,
+            TOOL_NAME,
+            "codrive_action_denied",
+            &detail,
+            None,
+        );
+        return Err(StepAbort {
+            step_outcome: "denied",
+            final_state: "aborted_approval_denied",
+            detail,
+            approval_id: None,
+        });
     };
 
     let simulation = SimulationNarrative {
         world_state_change: cons.description.clone(),
-        risk_points: vec![format!("目標應用：{target_app}"), format!("動作類別：{}", cons.class.as_str())],
+        risk_points: vec![
+            format!("目標應用：{target_app}"),
+            format!("動作類別：{}", cons.class.as_str()),
+        ],
     }
     .to_json();
-    let summary = format!("共駕請求核准：{}（{}）—— {}", step.narration, cons.class.as_str(), cons.description);
+    let summary = format!(
+        "共駕請求核准：{}（{}）—— {}",
+        step.narration,
+        cons.class.as_str(),
+        cons.description
+    );
     let payload = json!({
         "target_app": target_app,
         "step_index": index,
@@ -308,14 +401,33 @@ async fn gate_consequential(
     });
 
     let id = match broker
-        .request_with_simulation(agent_id, "codrive_action", &summary, payload, cfg.approval_ttl_secs, simulation)
+        .request_with_simulation(
+            agent_id,
+            "codrive_action",
+            &summary,
+            payload,
+            cfg.approval_ttl_secs,
+            simulation,
+        )
         .await
     {
         Ok(id) => id,
         Err(e) => {
             let detail = format!("建立審批請求失敗，已拒絕（fail-closed）：{e}");
-            duduclaw_security::audit::append_tool_call_denied(home_dir, agent_id, TOOL_NAME, "codrive_action_denied", &detail, None);
-            return Err(StepAbort { step_outcome: "denied", final_state: "aborted_approval_denied", detail, approval_id: None });
+            duduclaw_security::audit::append_tool_call_denied(
+                home_dir,
+                agent_id,
+                TOOL_NAME,
+                "codrive_action_denied",
+                &detail,
+                None,
+            );
+            return Err(StepAbort {
+                step_outcome: "denied",
+                final_state: "aborted_approval_denied",
+                detail,
+                approval_id: None,
+            });
         }
     };
     let approval_id = Some(id.to_string());
@@ -324,23 +436,71 @@ async fn gate_consequential(
         Ok(ApprovalStatus::Approved) => Ok(id.to_string()),
         Ok(ApprovalStatus::Denied) => {
             let detail = format!("審批已拒絕（審核編號 {id}）");
-            duduclaw_security::audit::append_tool_call_denied(home_dir, agent_id, TOOL_NAME, "codrive_action_denied", &detail, None);
-            Err(StepAbort { step_outcome: "denied", final_state: "aborted_approval_denied", detail, approval_id })
+            duduclaw_security::audit::append_tool_call_denied(
+                home_dir,
+                agent_id,
+                TOOL_NAME,
+                "codrive_action_denied",
+                &detail,
+                None,
+            );
+            Err(StepAbort {
+                step_outcome: "denied",
+                final_state: "aborted_approval_denied",
+                detail,
+                approval_id,
+            })
         }
         Ok(ApprovalStatus::Expired) => {
             let detail = format!("審批逾時未核可，已自動拒絕（審核編號 {id}）");
-            duduclaw_security::audit::append_tool_call_denied(home_dir, agent_id, TOOL_NAME, "codrive_action_denied", &detail, None);
-            Err(StepAbort { step_outcome: "denied", final_state: "aborted_approval_expired", detail, approval_id })
+            duduclaw_security::audit::append_tool_call_denied(
+                home_dir,
+                agent_id,
+                TOOL_NAME,
+                "codrive_action_denied",
+                &detail,
+                None,
+            );
+            Err(StepAbort {
+                step_outcome: "denied",
+                final_state: "aborted_approval_expired",
+                detail,
+                approval_id,
+            })
         }
         Ok(ApprovalStatus::Pending) => {
             let detail = format!("審批狀態異常（仍為待審），已拒絕（審核編號 {id}）");
-            duduclaw_security::audit::append_tool_call_denied(home_dir, agent_id, TOOL_NAME, "codrive_action_denied", &detail, None);
-            Err(StepAbort { step_outcome: "denied", final_state: "aborted_approval_denied", detail, approval_id })
+            duduclaw_security::audit::append_tool_call_denied(
+                home_dir,
+                agent_id,
+                TOOL_NAME,
+                "codrive_action_denied",
+                &detail,
+                None,
+            );
+            Err(StepAbort {
+                step_outcome: "denied",
+                final_state: "aborted_approval_denied",
+                detail,
+                approval_id,
+            })
         }
         Err(e) => {
             let detail = format!("等待審批決定時發生錯誤，已拒絕（fail-closed）：{e}");
-            duduclaw_security::audit::append_tool_call_denied(home_dir, agent_id, TOOL_NAME, "codrive_action_denied", &detail, None);
-            Err(StepAbort { step_outcome: "denied", final_state: "aborted_approval_denied", detail, approval_id })
+            duduclaw_security::audit::append_tool_call_denied(
+                home_dir,
+                agent_id,
+                TOOL_NAME,
+                "codrive_action_denied",
+                &detail,
+                None,
+            );
+            Err(StepAbort {
+                step_outcome: "denied",
+                final_state: "aborted_approval_denied",
+                detail,
+                approval_id,
+            })
         }
     }
 }
@@ -357,14 +517,22 @@ async fn gate_consequential(
 /// by that field rather than three separate audit calls, so a reader
 /// scanning `tool_calls.jsonl` for one `codrive_run` step sees exactly one
 /// C-L2 row instead of reconstructing it from a sequence.
-async fn try_registry_action(home_dir: &Path, agent_id: &str, target_app: &str, req: &ApiActionRequest) -> bool {
+async fn try_registry_action(
+    home_dir: &Path,
+    agent_id: &str,
+    target_app: &str,
+    req: &ApiActionRequest,
+) -> bool {
     let outcome = registry::dispatch(target_app, req).await;
     let (registry_outcome, success, detail) = match &outcome {
         DispatchOutcome::Executed { detail } => ("executed", true, detail.clone()),
         DispatchOutcome::Miss => (
             "registry_miss_fallback",
             false,
-            format!("no C-L2 registry entry for app={target_app:?} action={:?} — falling back to C-L1", req.action),
+            format!(
+                "no C-L2 registry entry for app={target_app:?} action={:?} — falling back to C-L1",
+                req.action
+            ),
         ),
         DispatchOutcome::Failed { detail } => ("exec_failed_fallback", false, detail.clone()),
     };
@@ -415,7 +583,9 @@ async fn try_atspi_locate(
 ) {
     let outcome = atspi_locate::locate(client, target_app, req).await;
     let (locate_outcome, success, detail, resolved) = match &outcome {
-        LocateOutcome::Located { x, y, detail } => ("located", true, detail.clone(), Some((*x, *y))),
+        LocateOutcome::Located { x, y, detail } => {
+            ("located", true, detail.clone(), Some((*x, *y)))
+        }
         LocateOutcome::Miss => (
             "locate_miss_fallback",
             false,
@@ -433,7 +603,10 @@ async fn try_atspi_locate(
                 *ax = x;
                 *ay = y;
             }
-            CodriveAction::Text { .. } | CodriveAction::KeyName { .. } | CodriveAction::Wait { .. } | CodriveAction::TakeOver { .. } => {}
+            CodriveAction::Text { .. }
+            | CodriveAction::KeyName { .. }
+            | CodriveAction::Wait { .. }
+            | CodriveAction::TakeOver { .. } => {}
         }
     }
     let params_summary = format!(
@@ -469,7 +642,15 @@ async fn send_step_actions(
     action: &CodriveAction,
 ) -> Result<(), CodriveClientError> {
     if let Some(h) = highlight {
-        client.send(&CodriveCmd::Highlight { x: h.x, y: h.y, w: h.w, h: h.h, ms: HIGHLIGHT_DISPLAY_MS }).await?;
+        client
+            .send(&CodriveCmd::Highlight {
+                x: h.x,
+                y: h.y,
+                w: h.w,
+                h: h.h,
+                ms: HIGHLIGHT_DISPLAY_MS,
+            })
+            .await?;
         tokio::time::sleep(PRE_CLICK_HIGHLIGHT_DELAY).await;
     }
     match action {
@@ -478,15 +659,35 @@ async fn send_step_actions(
         }
         CodriveAction::Click { x, y, btn } => {
             client.send(&CodriveCmd::Move { x: *x, y: *y }).await?;
-            client.send(&CodriveCmd::Button { btn: *btn, state: CodriveButtonState::Press }).await?;
-            client.send(&CodriveCmd::Button { btn: *btn, state: CodriveButtonState::Release }).await?;
+            client
+                .send(&CodriveCmd::Button {
+                    btn: *btn,
+                    state: CodriveButtonState::Press,
+                })
+                .await?;
+            client
+                .send(&CodriveCmd::Button {
+                    btn: *btn,
+                    state: CodriveButtonState::Release,
+                })
+                .await?;
         }
         CodriveAction::Text { s } => {
             client.send(&CodriveCmd::Text { s: s.clone() }).await?;
         }
         CodriveAction::KeyName { name } => {
-            client.send(&CodriveCmd::KeyName { name: name.clone(), state: CodriveButtonState::Press }).await?;
-            client.send(&CodriveCmd::KeyName { name: name.clone(), state: CodriveButtonState::Release }).await?;
+            client
+                .send(&CodriveCmd::KeyName {
+                    name: name.clone(),
+                    state: CodriveButtonState::Press,
+                })
+                .await?;
+            client
+                .send(&CodriveCmd::KeyName {
+                    name: name.clone(),
+                    state: CodriveButtonState::Release,
+                })
+                .await?;
         }
         CodriveAction::Wait { ms } => {
             tokio::time::sleep(Duration::from_millis(u64::from(*ms))).await;
@@ -498,7 +699,9 @@ async fn send_step_actions(
             // (not `unreachable!`) so a future change fails safe instead of
             // panicking, matching comp's own `handle_agent_inject` arms for
             // its socket-thread-only ops.
-            tracing::warn!("codrive: a TakeOver action reached send_step_actions unexpectedly — no-op (see step::take_over_reason)");
+            tracing::warn!(
+                "codrive: a TakeOver action reached send_step_actions unexpectedly — no-op (see step::take_over_reason)"
+            );
         }
     }
     Ok(())
@@ -508,7 +711,11 @@ async fn send_step_actions(
 /// resumed (design §3.1: "「交還」是明確動作", never inferred from
 /// silence), an emergency stop is observed, or the whole-script `deadline`
 /// elapses.
-async fn wait_for_resume(client: &mut CodriveClient, started: Instant, deadline: Duration) -> Result<(), WaitAbort> {
+async fn wait_for_resume(
+    client: &mut CodriveClient,
+    started: Instant,
+    deadline: Duration,
+) -> Result<(), WaitAbort> {
     loop {
         if started.elapsed() >= deadline {
             return Err(WaitAbort::Timeout);
@@ -516,7 +723,11 @@ async fn wait_for_resume(client: &mut CodriveClient, started: Instant, deadline:
         tokio::time::sleep(FROZEN_POLL_INTERVAL).await;
         match client.send(&CodriveCmd::Status).await {
             Ok(ack) => {
-                if client.drain_events().iter().any(|e| e.event == "emergency_stop") {
+                if client
+                    .drain_events()
+                    .iter()
+                    .any(|e| e.event == "emergency_stop")
+                {
                     return Err(WaitAbort::EmergencyStop);
                 }
                 if ack.terminated == Some(true) {

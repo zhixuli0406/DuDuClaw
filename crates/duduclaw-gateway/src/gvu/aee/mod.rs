@@ -46,26 +46,30 @@ pub mod prompt;
 pub mod run;
 pub mod settle;
 pub mod snapshot;
+pub mod sweeper;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_wiring;
 
-pub use eval_scorer::{resolve_eval_suites_root, EvalMeasureScorer};
-pub use inner_loop::{run_inner_loop, InnerLoopExit, InnerLoopInput, InnerLoopOutcome, MAX_INNER_ROUNDS};
-pub use pending::{PendingSettlement, PendingSettlementStore};
-pub use run::{run_aee_round, settle_pending, AeeRoundInput, AeeRoundResult, AeeVerdict};
-pub use intent::{
-    decide_intent, AeeTrigger, EvolutionStrategy, IntentDecision, RoundIntent, RoundMaterial,
-    SkipReason,
+pub use eval_scorer::{EvalMeasureScorer, resolve_eval_suites_root};
+pub use inner_loop::{
+    InnerLoopExit, InnerLoopInput, InnerLoopOutcome, MAX_INNER_ROUNDS, run_inner_loop,
 };
-pub use prompt::{assemble, is_holdout, reject_holdout_links, PromptContext};
+pub use intent::{
+    AeeTrigger, EvolutionStrategy, IntentDecision, RoundIntent, RoundMaterial, SkipReason,
+    decide_intent,
+};
+pub use pending::{PendingSettlement, PendingSettlementStore};
+pub use prompt::{PromptContext, assemble, is_holdout, reject_holdout_links};
+pub use run::{AeeRoundInput, AeeRoundResult, AeeVerdict, run_aee_round, settle_pending};
 pub use settle::{
-    entry_verdict, finalise, observe_entries, settlement_deltas, suite_verdict, CaseBands,
-    EntryVerdict, SettleReport, SuiteVerdict,
+    CaseBands, EntryVerdict, SettleReport, SuiteVerdict, entry_verdict, finalise, observe_entries,
+    settlement_deltas, suite_verdict,
 };
 pub use snapshot::{PendingFailureNote, PlaybookSnapshot};
+pub use sweeper::{run_settlement_sweeper, sweep_due_settlements};
 
 use serde::Serialize;
 
@@ -165,7 +169,7 @@ pub fn merge_pending_notes(
     notes: &[PendingFailureNote],
     now: chrono::DateTime<chrono::Utc>,
 ) -> usize {
-    use crate::playbook::entry::{FailureNote, FAILURE_HISTORY_CAP};
+    use crate::playbook::entry::{FAILURE_HISTORY_CAP, FailureNote};
     let mut written = 0;
     for note in notes {
         if note.target.is_empty() {

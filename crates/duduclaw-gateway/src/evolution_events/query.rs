@@ -31,7 +31,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde_json::Value as Json;
 use tracing::{info, warn};
 
@@ -58,13 +58,8 @@ pub const MAX_OFFSET: i64 = 1_000_000;
 /// Prevents future SQL-injection vectors if a caller ever passes user-controlled
 /// data as a column name (INFRA-SEC-H1 fix).  Every column referenced in
 /// `eq_filter!` or `cmp_filter!` macros **must** appear in this list.
-pub const ALLOWED_FILTER_COLS: &[&str] = &[
-    "agent_id",
-    "event_type",
-    "outcome",
-    "skill_id",
-    "timestamp",
-];
+pub const ALLOWED_FILTER_COLS: &[&str] =
+    &["agent_id", "event_type", "outcome", "skill_id", "timestamp"];
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -81,7 +76,10 @@ impl std::fmt::Display for AuditQueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AuditQueryError::InvalidColumn(col) => {
-                write!(f, "invalid filter column {col:?}: not in ALLOWED_FILTER_COLS allowlist")
+                write!(
+                    f,
+                    "invalid filter column {col:?}: not in ALLOWED_FILTER_COLS allowlist"
+                )
             }
         }
     }
@@ -157,8 +155,7 @@ impl AuditEventIndex {
         events_dir: impl Into<PathBuf>,
     ) -> Result<Self, String> {
         let db_path = home_dir.join("audit_index.db");
-        let conn =
-            Connection::open(&db_path).map_err(|e| format!("open audit index DB: {e}"))?;
+        let conn = Connection::open(&db_path).map_err(|e| format!("open audit index DB: {e}"))?;
         Self::init_schema(&conn)?;
         info!(?db_path, "AuditEventIndex initialised");
         Ok(Self {
@@ -301,7 +298,9 @@ impl AuditEventIndex {
                     Err(e) => {
                         // Transient INSERT failure: do NOT advance the cursor past
                         // this line. Stop committing so it is retried next sync.
-                        warn!("sync_from_files: INSERT failed in {filename}: {e}; retaining cursor for retry");
+                        warn!(
+                            "sync_from_files: INSERT failed in {filename}: {e}; retaining cursor for retry"
+                        );
                         break;
                     }
                 }
@@ -346,13 +345,17 @@ impl AuditEventIndex {
         // Build a shared WHERE clause + param list from the filter.
         // build_filter_clause validates every column name against ALLOWED_FILTER_COLS
         // (INFRA-SEC-H1) — propagate any InvalidColumn error as a String.
-        let FilterClause { where_sql, params: filter_params } =
-            build_filter_clause(&filter).map_err(|e| e.to_string())?;
+        let FilterClause {
+            where_sql,
+            params: filter_params,
+        } = build_filter_clause(&filter).map_err(|e| e.to_string())?;
 
         // ── COUNT query ───────────────────────────────────────────────────────
         let count_sql = format!("SELECT COUNT(*) FROM audit_index {where_sql}");
-        let count_refs: Vec<&dyn rusqlite::ToSql> =
-            filter_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let count_refs: Vec<&dyn rusqlite::ToSql> = filter_params
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
         let total: i64 = conn
             .query_row(&count_sql, count_refs.as_slice(), |r| r.get(0))
             .map_err(|e| format!("audit query count: {e}"))?;
@@ -377,8 +380,10 @@ impl AuditEventIndex {
         // Build a unified &[&dyn ToSql] that mixes Vec<String> filter params
         // (positions 1..=N) with i64 limit/offset (positions N+1, N+2).
         // The lifetime-safe approach: collect refs from two separate owned vecs.
-        let filter_refs: Vec<&dyn rusqlite::ToSql> =
-            filter_params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let filter_refs: Vec<&dyn rusqlite::ToSql> = filter_params
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
         let page_refs: Vec<&dyn rusqlite::ToSql> = filter_refs
             .iter()
             .copied()
@@ -395,14 +400,14 @@ impl AuditEventIndex {
         let events: Vec<AuditEvent> = stmt
             .query_map(page_refs.as_slice(), |row| {
                 Ok(RawRow {
-                    timestamp:      row.get(0)?,
+                    timestamp: row.get(0)?,
                     event_type_str: row.get(1)?,
-                    agent_id:       row.get(2)?,
-                    skill_id:       row.get(3)?,
-                    generation:     row.get(4)?,
-                    outcome_str:    row.get(5)?,
+                    agent_id: row.get(2)?,
+                    skill_id: row.get(3)?,
+                    generation: row.get(4)?,
+                    outcome_str: row.get(5)?,
                     trigger_signal: row.get(6)?,
-                    metadata_str:   row.get(7)?,
+                    metadata_str: row.get(7)?,
                 })
             })
             .map_err(|e| format!("audit query execute: {e}"))?
@@ -433,7 +438,7 @@ impl AuditEventIndex {
                 return Err(format!(
                     "collect_jsonl_files: read {:?}: {e}",
                     self.events_dir
-                ))
+                ));
             }
         };
 
@@ -462,14 +467,14 @@ impl AuditEventIndex {
 /// All values are stored as `String` / `Option<String>` so the closure
 /// has no lifetime dependencies on anything outside it.
 struct RawRow {
-    timestamp:      String,
+    timestamp: String,
     event_type_str: String,
-    agent_id:       String,
-    skill_id:       Option<String>,
-    generation:     Option<i64>,
-    outcome_str:    String,
+    agent_id: String,
+    skill_id: Option<String>,
+    generation: Option<i64>,
+    outcome_str: String,
     trigger_signal: Option<String>,
-    metadata_str:   String,
+    metadata_str: String,
 }
 
 /// Convert a [`RawRow`] back to an [`AuditEvent`].
@@ -477,15 +482,18 @@ struct RawRow {
 /// Returns `None` if `event_type` or `outcome` fails to deserialise (should
 /// never happen in a well-formed index; degraded gracefully via `warn`).
 fn raw_to_audit_event(raw: RawRow) -> Option<AuditEvent> {
-    let event_type =
-        serde_json::from_value(serde_json::Value::String(raw.event_type_str.clone()))
-            .map_err(|e| warn!("audit query: unknown event_type '{}': {e}", raw.event_type_str))
-            .ok()?;
+    let event_type = serde_json::from_value(serde_json::Value::String(raw.event_type_str.clone()))
+        .map_err(|e| {
+            warn!(
+                "audit query: unknown event_type '{}': {e}",
+                raw.event_type_str
+            )
+        })
+        .ok()?;
 
-    let outcome =
-        serde_json::from_value(serde_json::Value::String(raw.outcome_str.clone()))
-            .map_err(|e| warn!("audit query: unknown outcome '{}': {e}", raw.outcome_str))
-            .ok()?;
+    let outcome = serde_json::from_value(serde_json::Value::String(raw.outcome_str.clone()))
+        .map_err(|e| warn!("audit query: unknown outcome '{}': {e}", raw.outcome_str))
+        .ok()?;
 
     let metadata: Json =
         serde_json::from_str(&raw.metadata_str).unwrap_or(Json::Object(Default::default()));
@@ -508,7 +516,7 @@ fn raw_to_audit_event(raw: RawRow) -> Option<AuditEvent> {
 #[derive(Debug)]
 struct FilterClause {
     where_sql: String,
-    params:    Vec<String>,
+    params: Vec<String>,
 }
 
 /// Returns `col` unchanged if it is in [`ALLOWED_FILTER_COLS`], or an
@@ -555,12 +563,12 @@ fn build_filter_clause(filter: &AuditQueryFilter) -> Result<FilterClause, AuditQ
         };
     }
 
-    eq_filter!("agent_id",   filter.agent_id);
+    eq_filter!("agent_id", filter.agent_id);
     eq_filter!("event_type", filter.event_type);
-    eq_filter!("outcome",    filter.outcome);
-    eq_filter!("skill_id",   filter.skill_id);
+    eq_filter!("outcome", filter.outcome);
+    eq_filter!("skill_id", filter.skill_id);
     cmp_filter!("timestamp", ">=", filter.since);
-    cmp_filter!("timestamp", "<",  filter.until);
+    cmp_filter!("timestamp", "<", filter.until);
 
     Ok(FilterClause {
         where_sql: if clauses.is_empty() {
@@ -599,8 +607,7 @@ impl AuditEventIndex {
         use chrono::Utc;
 
         let since = Utc::now()
-            - chrono::Duration::try_days(window_days as i64)
-                .unwrap_or(chrono::Duration::zero());
+            - chrono::Duration::try_days(window_days as i64).unwrap_or(chrono::Duration::zero());
         let since_str = since.to_rfc3339();
         let generated_at = Utc::now().to_rfc3339();
 
@@ -672,7 +679,10 @@ impl AuditEventIndex {
                 ))
             })
             .map_err(|e| format!("consistency query execute: {e}"))?
-            .filter_map(|r| r.map_err(|e| tracing::warn!("consistency row error: {e}")).ok())
+            .filter_map(|r| {
+                r.map_err(|e| tracing::warn!("consistency row error: {e}"))
+                    .ok()
+            })
             .collect()
         };
 
@@ -736,15 +746,20 @@ mod tests {
     }
 
     fn sample_violation(agent: &str) -> AuditEvent {
-        AuditEvent::now(AuditEventType::GovernanceViolation, agent, Outcome::Blocked)
-            .with_metadata(serde_json::json!({
+        AuditEvent::now(AuditEventType::GovernanceViolation, agent, Outcome::Blocked).with_metadata(
+            serde_json::json!({
                 "policy_id": "default-rate-mcp",
                 "policy_type": "rate",
-            }))
+            }),
+        )
     }
 
     fn sample_retry(agent: &str) -> AuditEvent {
-        AuditEvent::now(AuditEventType::DurabilityRetryAttempt, agent, Outcome::Failure)
+        AuditEvent::now(
+            AuditEventType::DurabilityRetryAttempt,
+            agent,
+            Outcome::Failure,
+        )
     }
 
     fn open_index(home: &TempDir, events: &TempDir) -> AuditEventIndex {
@@ -783,11 +798,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn sync_missing_events_dir_returns_zero() {
         let home = TempDir::new().unwrap();
-        let idx = AuditEventIndex::open_with_events_dir(
-            home.path(),
-            home.path().join("nonexistent"),
-        )
-        .unwrap();
+        let idx =
+            AuditEventIndex::open_with_events_dir(home.path(), home.path().join("nonexistent"))
+                .unwrap();
         let n = idx.sync_from_files().await.unwrap();
         assert_eq!(n, 0);
     }
@@ -798,10 +811,7 @@ mod tests {
         write_jsonl(
             events.path(),
             "2026-04-29.jsonl",
-            &[
-                sample_activate("agent-a"),
-                sample_violation("agent-b"),
-            ],
+            &[sample_activate("agent-a"), sample_violation("agent-b")],
         );
         let idx = open_index(&home, &events);
         let n = idx.sync_from_files().await.unwrap();
@@ -814,10 +824,13 @@ mod tests {
         write_jsonl(events.path(), "2026-04-29.jsonl", &[sample_activate("a")]);
         let idx = open_index(&home, &events);
 
-        let first  = idx.sync_from_files().await.unwrap();
+        let first = idx.sync_from_files().await.unwrap();
         let second = idx.sync_from_files().await.unwrap();
         assert_eq!(first, 1);
-        assert_eq!(second, 0, "second sync must not re-insert already-indexed rows");
+        assert_eq!(
+            second, 0,
+            "second sync must not re-insert already-indexed rows"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -839,7 +852,11 @@ mod tests {
     async fn sync_handles_multiple_jsonl_files() {
         let (home, events) = fresh_dirs();
         write_jsonl(events.path(), "2026-04-27.jsonl", &[sample_activate("x")]);
-        write_jsonl(events.path(), "2026-04-28.jsonl", &[sample_activate("y"), sample_retry("z")]);
+        write_jsonl(
+            events.path(),
+            "2026-04-28.jsonl",
+            &[sample_activate("y"), sample_retry("z")],
+        );
         let idx = open_index(&home, &events);
         let n = idx.sync_from_files().await.unwrap();
         assert_eq!(n, 3);
@@ -967,7 +984,11 @@ mod tests {
         write_jsonl(
             events.path(),
             "2026-04-29.jsonl",
-            &[sample_activate("a"), sample_violation("b"), sample_retry("c")],
+            &[
+                sample_activate("a"),
+                sample_violation("b"),
+                sample_retry("c"),
+            ],
         );
         let idx = open_index(&home, &events);
         idx.sync_from_files().await.unwrap();
@@ -1033,10 +1054,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.total, 2);
-        assert!(result
-            .events
-            .iter()
-            .all(|e| e.event_type == AuditEventType::GovernanceViolation));
+        assert!(
+            result
+                .events
+                .iter()
+                .all(|e| e.event_type == AuditEventType::GovernanceViolation)
+        );
     }
 
     // ── query — outcome filter ────────────────────────────────────────────────
@@ -1048,9 +1071,9 @@ mod tests {
             events.path(),
             "2026-04-29.jsonl",
             &[
-                sample_activate("a"),    // success
-                sample_violation("b"),   // blocked
-                sample_retry("c"),       // failure
+                sample_activate("a"),  // success
+                sample_violation("b"), // blocked
+                sample_retry("c"),     // failure
             ],
         );
         let idx = open_index(&home, &events);
@@ -1073,14 +1096,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn query_filter_by_skill_id() {
         let (home, events) = fresh_dirs();
-        let ev_with_skill =
-            AuditEvent::now(AuditEventType::SkillActivate, "a", Outcome::Success)
-                .with_skill_id("python-patterns");
-        let ev_other_skill =
-            AuditEvent::now(AuditEventType::SkillActivate, "a", Outcome::Success)
-                .with_skill_id("golang-patterns");
-        let ev_no_skill =
-            AuditEvent::now(AuditEventType::SecurityScan, "a", Outcome::Success);
+        let ev_with_skill = AuditEvent::now(AuditEventType::SkillActivate, "a", Outcome::Success)
+            .with_skill_id("python-patterns");
+        let ev_other_skill = AuditEvent::now(AuditEventType::SkillActivate, "a", Outcome::Success)
+            .with_skill_id("golang-patterns");
+        let ev_no_skill = AuditEvent::now(AuditEventType::SecurityScan, "a", Outcome::Success);
 
         write_jsonl(
             events.path(),
@@ -1099,7 +1119,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.total, 1);
-        assert_eq!(result.events[0].skill_id.as_deref(), Some("python-patterns"));
+        assert_eq!(
+            result.events[0].skill_id.as_deref(),
+            Some("python-patterns")
+        );
     }
 
     // ── query — time range filters ────────────────────────────────────────────
@@ -1284,9 +1307,9 @@ mod tests {
             events.path(),
             "2026-04-29.jsonl",
             &[
-                sample_activate("agent-x"),      // activate + agent-x
-                sample_violation("agent-x"),     // violation + agent-x
-                sample_activate("agent-y"),      // activate + agent-y
+                sample_activate("agent-x"),  // activate + agent-x
+                sample_violation("agent-x"), // violation + agent-x
+                sample_activate("agent-y"),  // activate + agent-y
             ],
         );
         let idx = open_index(&home, &events);
@@ -1294,7 +1317,7 @@ mod tests {
 
         let result = idx
             .query(AuditQueryFilter {
-                agent_id:   Some("agent-x".into()),
+                agent_id: Some("agent-x".into()),
                 event_type: Some("skill_activate".into()),
                 ..Default::default()
             })
@@ -1365,7 +1388,11 @@ mod tests {
 
         let result = idx.query(AuditQueryFilter::default()).await.unwrap();
         let agents: Vec<&str> = result.events.iter().map(|e| e.agent_id.as_str()).collect();
-        assert_eq!(agents, vec!["a", "b", "c"], "results must be sorted by timestamp ASC");
+        assert_eq!(
+            agents,
+            vec!["a", "b", "c"],
+            "results must be sorted by timestamp ASC"
+        );
     }
 
     // ── validate_col / allowlist (INFRA-SEC-H1) ───────────────────────────────
@@ -1388,7 +1415,7 @@ mod tests {
             "injected_col",
             "1=1",
             "",
-            "AGENT_ID",  // case-sensitive: uppercase must be rejected
+            "AGENT_ID", // case-sensitive: uppercase must be rejected
             "agent_id )",
         ];
         for col in &bad_cols {
@@ -1408,12 +1435,12 @@ mod tests {
     fn build_filter_clause_succeeds_for_all_filter_fields() {
         // All six filter fields use allowlisted columns — must return Ok.
         let filter = AuditQueryFilter {
-            agent_id:   Some("agent-x".into()),
+            agent_id: Some("agent-x".into()),
             event_type: Some("skill_activate".into()),
-            outcome:    Some("success".into()),
-            skill_id:   Some("python-patterns".into()),
-            since:      Some("2026-01-01T00:00:00Z".into()),
-            until:      Some("2026-12-31T23:59:59Z".into()),
+            outcome: Some("success".into()),
+            skill_id: Some("python-patterns".into()),
+            since: Some("2026-01-01T00:00:00Z".into()),
+            until: Some("2026-12-31T23:59:59Z".into()),
             ..Default::default()
         };
         let result = build_filter_clause(&filter);
@@ -1429,7 +1456,10 @@ mod tests {
     #[test]
     fn build_filter_clause_empty_filter_produces_empty_where() {
         let fc = build_filter_clause(&AuditQueryFilter::default()).unwrap();
-        assert!(fc.where_sql.is_empty(), "empty filter must produce no WHERE clause");
+        assert!(
+            fc.where_sql.is_empty(),
+            "empty filter must produce no WHERE clause"
+        );
         assert!(fc.params.is_empty());
     }
 
@@ -1441,9 +1471,13 @@ mod tests {
 
         // Write via the real EvolutionEventLogger.
         let logger = Arc::new(EvolutionEventLogger::new(events.path()));
-        let ev = AuditEvent::now(AuditEventType::SkillGraduate, "agent-roundtrip", Outcome::Success)
-            .with_skill_id("my-graduated-skill")
-            .with_metadata(serde_json::json!({"quality_score": 0.91}));
+        let ev = AuditEvent::now(
+            AuditEventType::SkillGraduate,
+            "agent-roundtrip",
+            Outcome::Success,
+        )
+        .with_skill_id("my-graduated-skill")
+        .with_metadata(serde_json::json!({"quality_score": 0.91}));
         logger.log(ev).await;
         logger.flush().await.unwrap();
 
@@ -1511,14 +1545,33 @@ mod tests {
         let idx = open_index(&home, &events);
         idx.sync_from_files().await.unwrap();
 
-        let s = idx.compute_reliability_summary("agent-ok", 7).await.unwrap();
+        let s = idx
+            .compute_reliability_summary("agent-ok", 7)
+            .await
+            .unwrap();
         assert_eq!(s.agent_id, "agent-ok");
         assert_eq!(s.window_days, 7);
         assert_eq!(s.total_events, 5);
-        assert!((s.task_success_rate - 1.0).abs() < 1e-9, "tsr={}", s.task_success_rate);
-        assert!((s.consistency_score - 1.0).abs() < 1e-9, "cs={}", s.consistency_score);
-        assert!((s.skill_adoption_rate - 1.0).abs() < 1e-9, "sar={}", s.skill_adoption_rate);
-        assert!((s.fallback_trigger_rate - 0.0).abs() < 1e-9, "ftr={}", s.fallback_trigger_rate);
+        assert!(
+            (s.task_success_rate - 1.0).abs() < 1e-9,
+            "tsr={}",
+            s.task_success_rate
+        );
+        assert!(
+            (s.consistency_score - 1.0).abs() < 1e-9,
+            "cs={}",
+            s.consistency_score
+        );
+        assert!(
+            (s.skill_adoption_rate - 1.0).abs() < 1e-9,
+            "sar={}",
+            s.skill_adoption_rate
+        );
+        assert!(
+            (s.fallback_trigger_rate - 0.0).abs() < 1e-9,
+            "ftr={}",
+            s.fallback_trigger_rate
+        );
     }
 
     /// No events for agent → all defaults apply
@@ -1563,9 +1616,17 @@ mod tests {
             .unwrap();
         assert_eq!(s.total_events, 6);
         // 4/6 ≈ 0.6667
-        assert!((s.task_success_rate - 4.0 / 6.0).abs() < 1e-6, "tsr={}", s.task_success_rate);
+        assert!(
+            (s.task_success_rate - 4.0 / 6.0).abs() < 1e-6,
+            "tsr={}",
+            s.task_success_rate
+        );
         // single event type: consistency = 4/6
-        assert!((s.consistency_score - 4.0 / 6.0).abs() < 1e-6, "cs={}", s.consistency_score);
+        assert!(
+            (s.consistency_score - 4.0 / 6.0).abs() < 1e-6,
+            "cs={}",
+            s.consistency_score
+        );
     }
 
     /// Skill adoption rate: 3/10 events are skill_activate
@@ -1590,7 +1651,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.total_events, 10);
-        assert!((s.skill_adoption_rate - 0.3).abs() < 1e-9, "sar={}", s.skill_adoption_rate);
+        assert!(
+            (s.skill_adoption_rate - 0.3).abs() < 1e-9,
+            "sar={}",
+            s.skill_adoption_rate
+        );
     }
 
     /// M36: governance / durability events must NOT dilute the skill / fallback
@@ -1612,7 +1677,11 @@ mod tests {
             lines.push(jsonl_line("agent-m36", "governance_violation", "blocked"));
         }
         for _ in 0..50 {
-            lines.push(jsonl_line("agent-m36", "durability_retry_attempt", "failure"));
+            lines.push(jsonl_line(
+                "agent-m36",
+                "durability_retry_attempt",
+                "failure",
+            ));
         }
         let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
         write_raw_jsonl(events.path(), "2026-05-01.jsonl", &refs);
@@ -1687,7 +1756,11 @@ mod tests {
             .unwrap();
         // gvu events were indexed (8), fallback inserted manually (2) → total = 10
         assert_eq!(s.total_events, 10, "total={}", s.total_events);
-        assert!((s.fallback_trigger_rate - 0.2).abs() < 1e-9, "ftr={}", s.fallback_trigger_rate);
+        assert!(
+            (s.fallback_trigger_rate - 0.2).abs() < 1e-9,
+            "ftr={}",
+            s.fallback_trigger_rate
+        );
     }
 
     /// Window filtering: events outside window_days are excluded
@@ -1728,16 +1801,28 @@ mod tests {
             .compute_reliability_summary("agent-window", 7)
             .await
             .unwrap();
-        assert_eq!(s7.total_events, 1, "7-day window should include only 1 event");
-        assert!((s7.task_success_rate - 1.0).abs() < 1e-9, "recent event is success");
+        assert_eq!(
+            s7.total_events, 1,
+            "7-day window should include only 1 event"
+        );
+        assert!(
+            (s7.task_success_rate - 1.0).abs() < 1e-9,
+            "recent event is success"
+        );
 
         // 60-day window: both events count
         let s60 = idx
             .compute_reliability_summary("agent-window", 60)
             .await
             .unwrap();
-        assert_eq!(s60.total_events, 2, "60-day window should include both events");
-        assert!((s60.task_success_rate - 0.5).abs() < 1e-9, "1 success + 1 failure = 0.5");
+        assert_eq!(
+            s60.total_events, 2,
+            "60-day window should include both events"
+        );
+        assert!(
+            (s60.task_success_rate - 0.5).abs() < 1e-9,
+            "1 success + 1 failure = 0.5"
+        );
     }
 
     /// Agent isolation: other agents' events must not pollute results
@@ -1779,10 +1864,16 @@ mod tests {
         let sb = idx.compute_reliability_summary("agent-b", 7).await.unwrap();
 
         assert_eq!(sa.total_events, 5);
-        assert!((sa.task_success_rate - 0.0).abs() < 1e-9, "agent-a all failure");
+        assert!(
+            (sa.task_success_rate - 0.0).abs() < 1e-9,
+            "agent-a all failure"
+        );
 
         assert_eq!(sb.total_events, 5);
-        assert!((sb.task_success_rate - 1.0).abs() < 1e-9, "agent-b all success");
+        assert!(
+            (sb.task_success_rate - 1.0).abs() < 1e-9,
+            "agent-b all success"
+        );
     }
 
     /// Consistency score with multiple event types
@@ -1821,7 +1912,10 @@ mod tests {
             }
         }
 
-        let s = idx.compute_reliability_summary("agent-cs", 7).await.unwrap();
+        let s = idx
+            .compute_reliability_summary("agent-cs", 7)
+            .await
+            .unwrap();
         assert_eq!(s.total_events, 20);
         // consistency = avg(1.0, 0.5) = 0.75
         assert!(

@@ -124,10 +124,8 @@ async fn reply_ctx(state: &ServerState) -> std::result::Result<Arc<ReplyContext>
                 .map_err(|e| format!("agent registry scan failed: {e}"))?;
             let registry = Arc::new(tokio::sync::RwLock::new(registry));
             let sessions = Arc::new(
-                duduclaw_gateway::session::SessionManager::new(
-                    &state.home_dir.join("sessions.db"),
-                )
-                .map_err(|e| format!("session store init failed: {e}"))?,
+                duduclaw_gateway::session::SessionManager::new(&state.home_dir.join("sessions.db"))
+                    .map_err(|e| format!("session store init failed: {e}"))?,
             );
             let status: ChannelStatusMap =
                 Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
@@ -236,7 +234,10 @@ fn handle_initialize(state: &ServerState, id: &Value, params: &Value) -> Value {
 }
 
 async fn handle_authenticate(state: &ServerState, id: &Value, params: &Value) -> Value {
-    let method_id = params.get("methodId").and_then(|v| v.as_str()).unwrap_or("");
+    let method_id = params
+        .get("methodId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if method_id != AUTH_METHOD_ID {
         return jsonrpc_error(id, -32602, &format!("Unknown auth method: {method_id}"));
     }
@@ -253,7 +254,11 @@ async fn handle_session_new(state: &ServerState, id: &Value, params: &Value) -> 
     if params.get("cwd").and_then(|v| v.as_str()).is_none() {
         return jsonrpc_error(id, -32602, "Missing required parameter: cwd");
     }
-    if params.get("mcpServers").and_then(|v| v.as_array()).is_none() {
+    if params
+        .get("mcpServers")
+        .and_then(|v| v.as_array())
+        .is_none()
+    {
         return jsonrpc_error(id, -32602, "Missing required parameter: mcpServers");
     }
     let agent = match resolve_ready_agent(&state.home_dir).await {
@@ -267,7 +272,11 @@ async fn handle_session_new(state: &ServerState, id: &Value, params: &Value) -> 
     let session_id = format!("sess_{}", uuid::Uuid::new_v4().simple());
     state.sessions.lock().await.insert(
         session_id.clone(),
-        SessionEntry { agent, cancel: None, in_flight: false },
+        SessionEntry {
+            agent,
+            cancel: None,
+            in_flight: false,
+        },
     );
     jsonrpc_response(id, json!({ "sessionId": session_id }))
 }
@@ -305,8 +314,10 @@ async fn run_prompt_turn(
         Box::new(move |event: ProgressEvent| match event {
             ProgressEvent::Step(step) => match step.phase {
                 StepPhase::Start => {
-                    let call_id =
-                        format!("call_{}", seq_state.tool_call_seq.fetch_add(1, Ordering::SeqCst));
+                    let call_id = format!(
+                        "call_{}",
+                        seq_state.tool_call_seq.fetch_add(1, Ordering::SeqCst)
+                    );
                     if let Ok(mut s) = stack.lock() {
                         s.push(call_id.clone());
                     }
@@ -366,6 +377,13 @@ async fn run_prompt_turn(
     // dashboard's session views.
     let gateway_session = format!("acp:{session_id}#agent:{agent}");
 
+    // `build_reply_for_agent` is the legacy string-only builder: it has nowhere
+    // to retain a CCR source lease through this JSON-RPC send, so a reply built
+    // from protected source data is withheld and replaced with
+    // `CCR_LEASE_UNSUPPORTED_TEXT` — which says the transport cannot hold a
+    // lease, NOT that the source changed (retrying here always fails the same
+    // way, so the old "the source changed … please try again" wording sent ACP
+    // clients into a pointless retry loop).
     let reply_fut = build_reply_for_agent(
         &text,
         &ctx,
@@ -414,10 +432,18 @@ async fn handle_session_prompt(
     params: &Value,
 ) -> Option<Value> {
     let Some(session_id) = params.get("sessionId").and_then(|v| v.as_str()) else {
-        return Some(jsonrpc_error(id, -32602, "Missing required parameter: sessionId"));
+        return Some(jsonrpc_error(
+            id,
+            -32602,
+            "Missing required parameter: sessionId",
+        ));
     };
     let Some(prompt) = params.get("prompt").and_then(|v| v.as_array()) else {
-        return Some(jsonrpc_error(id, -32602, "Missing required parameter: prompt"));
+        return Some(jsonrpc_error(
+            id,
+            -32602,
+            "Missing required parameter: prompt",
+        ));
     };
     let text = extract_prompt_text(prompt);
     if text.is_empty() {
@@ -432,7 +458,11 @@ async fn handle_session_prompt(
     let agent = {
         let mut sessions = state.sessions.lock().await;
         let Some(entry) = sessions.get_mut(session_id) else {
-            return Some(jsonrpc_error(id, -32602, &format!("Unknown sessionId: {session_id}")));
+            return Some(jsonrpc_error(
+                id,
+                -32602,
+                &format!("Unknown sessionId: {session_id}"),
+            ));
         };
         if entry.in_flight {
             return Some(jsonrpc_error(
@@ -491,7 +521,9 @@ pub async fn run_acp_client_protocol(home_dir: &Path) -> Result<()> {
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         while let Some(msg) = out_rx.recv().await {
-            let Ok(mut line) = serde_json::to_string(&msg) else { continue };
+            let Ok(mut line) = serde_json::to_string(&msg) else {
+                continue;
+            };
             line.push('\n');
             if stdout.write_all(line.as_bytes()).await.is_err() {
                 break;
@@ -559,7 +591,11 @@ pub async fn run_acp_client_protocol(home_dir: &Path) -> Result<()> {
             "authenticate" => Some(handle_authenticate(&state, &id, &params).await),
             "session/new" => Some(handle_session_new(&state, &id, &params).await),
             "session/prompt" => handle_session_prompt(&state, &out_tx, &id, &params).await,
-            _ => Some(jsonrpc_error(&id, -32601, &format!("Method not found: {method}"))),
+            _ => Some(jsonrpc_error(
+                &id,
+                -32601,
+                &format!("Method not found: {method}"),
+            )),
         };
         if let Some(response) = response {
             let _ = out_tx.send(response);
@@ -661,7 +697,10 @@ mod tests {
         );
         assert_eq!(n["method"], "session/update");
         assert_eq!(n["params"]["sessionId"], "sess_x");
-        assert_eq!(n["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(
+            n["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
         assert!(n.get("id").is_none(), "notifications carry no id");
     }
 }

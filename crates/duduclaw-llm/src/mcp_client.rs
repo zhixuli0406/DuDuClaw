@@ -41,17 +41,19 @@
 //! [`parse_tools_list_response`], [`parse_tool_call_result`]) are pure and
 //! unit-tested without spawning a process.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use crate::ccr::{CcrScope, CcrSourceArtifact};
 use crate::tool_loop::{ToolExecutor, ToolOutcome};
 use crate::types::ToolDef;
 
@@ -165,11 +167,7 @@ pub fn build_tools_list_request(id: i64) -> Value {
 
 /// The `tools/call` request frame.
 pub fn build_tools_call_request(id: i64, name: &str, args: Value) -> Value {
-    make_request(
-        id,
-        "tools/call",
-        json!({ "name": name, "arguments": args }),
-    )
+    make_request(id, "tools/call", json!({ "name": name, "arguments": args }))
 }
 
 /// Extract a JSON-RPC `error` member into [`McpError::Rpc`], if present.
@@ -216,7 +214,11 @@ pub fn parse_tools_list_response(frame: &Value) -> Result<Vec<McpToolDef>, McpEr
             .get("inputSchema")
             .cloned()
             .unwrap_or_else(|| json!({ "type": "object" }));
-        out.push(McpToolDef { name, description, input_schema });
+        out.push(McpToolDef {
+            name,
+            description,
+            input_schema,
+        });
     }
     Ok(out)
 }
@@ -367,7 +369,10 @@ impl McpClient {
         headers: &[(String, String)],
         timeout: Duration,
     ) -> Result<Self, McpError> {
-        if !url.starts_with("https://") && !url.starts_with("http://127.0.0.1") && !url.starts_with("http://localhost") {
+        if !url.starts_with("https://")
+            && !url.starts_with("http://127.0.0.1")
+            && !url.starts_with("http://localhost")
+        {
             return Err(McpError::Spawn(format!(
                 "MCP HTTP endpoint must be https:// (or localhost for dev): {url}"
             )));
@@ -527,9 +532,7 @@ impl McpClient {
                 .get("mcp-session-id")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            if let (Some(sid), McpTransport::Http { session_id, .. }) =
-                (sid, &mut self.transport)
-            {
+            if let (Some(sid), McpTransport::Http { session_id, .. }) = (sid, &mut self.transport) {
                 *session_id = Some(sid);
             }
         }
@@ -545,10 +548,7 @@ impl McpClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| McpError::Io(e.to_string()))?;
+        let body = resp.text().await.map_err(|e| McpError::Io(e.to_string()))?;
 
         if !status.is_success() {
             let snippet: String = body.chars().take(300).collect();
@@ -598,7 +598,10 @@ impl McpClient {
         let mut req = http
             .post(url.as_str())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
             .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
         for (k, v) in headers {
             req = req.header(k.as_str(), v.as_str());
@@ -672,6 +675,39 @@ pub struct ToolRegistry {
     /// [`ToolExecutor::server_of`] answers `None`. Only used to give a
     /// [`crate::ToolInterceptor`] the RFC-23 `<server>.<tool>` namespace.
     server_names: Vec<String>,
+    /// Explicitly registered connector authorities, keyed by the resolved
+    /// first-wins route. Tool output, including MCP result metadata, cannot
+    /// register a verifier or supply an ACL/version by itself.
+    source_verifiers: HashMap<String, VerifiedMcpRoute>,
+    source_attestation_required: HashSet<String>,
+    ccr_disabled_tools: HashSet<String>,
+}
+
+struct VerifiedMcpRoute {
+    scope: CcrScope,
+    verifier: Arc<dyn McpSourceVerifier>,
+}
+
+/// Independently checked source identity and the latest permitted retention
+/// deadline. Neither field is read from MCP output metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedMcpSource {
+    pub artifact: CcrSourceArtifact,
+    pub retention_at: i64,
+}
+
+/// Application-owned authority for one exact MCP route. Implementations
+/// must read a source independently of the MCP response, check the caller's
+/// scope and compare the entire content that CCR would save. A source ID in
+/// model arguments is only a selector, never proof of access or provenance.
+#[async_trait]
+pub trait McpSourceVerifier: Send + Sync {
+    async fn verify(
+        &self,
+        scope: &CcrScope,
+        args: &Value,
+        content: &str,
+    ) -> Result<VerifiedMcpSource, String>;
 }
 
 /// Per-server tool visibility filter for mounted MCP servers.
@@ -720,7 +756,15 @@ impl ToolRegistry {
         }
         let (routes, defs) = build_routes_filtered(&per_client, &filters);
         let clients = clients.into_iter().map(Mutex::new).collect();
-        Ok(Self { clients, routes, defs, server_names: Vec::new() })
+        Ok(Self {
+            clients,
+            routes,
+            defs,
+            server_names: Vec::new(),
+            source_verifiers: HashMap::new(),
+            source_attestation_required: HashSet::new(),
+            ccr_disabled_tools: HashSet::new(),
+        })
     }
 
     /// Like [`from_clients_filtered`](Self::from_clients_filtered) but records
@@ -744,6 +788,126 @@ impl ToolRegistry {
     pub fn server_for_tool(&self, tool: &str) -> Option<&str> {
         let idx = *self.routes.get(tool)?;
         self.server_names.get(idx).map(String::as_str)
+    }
+
+    /// Require independent source attestation on one exact registry-owned
+    /// server/tool route. A failed attestation withholds that result from the
+    /// model and retires any prior CCR handle for the call. Unregistered MCP routes retain
+    /// their existing scoped, unbound CCR behavior. The model cannot invoke
+    /// this registration method.
+    pub fn register_source_verifier(
+        &mut self,
+        scope: CcrScope,
+        server: &str,
+        tool: &str,
+        verifier: Arc<dyn McpSourceVerifier>,
+    ) -> Result<(), McpError> {
+        if server.trim().is_empty()
+            || tool.trim().is_empty()
+            || self.server_for_tool(tool) != Some(server)
+            || self.source_verifiers.contains_key(tool)
+        {
+            return Err(McpError::Parse(
+                "verified source route does not match a unique registered MCP route".into(),
+            ));
+        }
+        self.source_verifiers
+            .insert(tool.into(), VerifiedMcpRoute { scope, verifier });
+        self.source_attestation_required.insert(tool.into());
+        Ok(())
+    }
+
+    /// A declared trusted route must not deliver raw MCP bytes if its
+    /// verifier cannot be registered. This is separate from disabling CCR on
+    /// an ordinary route whose source authority was never declared.
+    pub fn require_source_attestation_for_tool(&mut self, tool: &str) {
+        if self.routes.contains_key(tool) {
+            self.source_attestation_required.insert(tool.to_owned());
+        }
+    }
+
+    /// A malformed trusted-source declaration may not reveal which tool was
+    /// intended. In that case every mounted route needs a verifier before it
+    /// can deliver bytes to the model.
+    pub fn require_source_attestation_for_all_tools(&mut self) {
+        self.source_attestation_required
+            .extend(self.routes.keys().cloned());
+    }
+
+    /// Keep normal MCP tool execution while preventing a misconfigured
+    /// trusted-source route from silently falling back to unbound CCR.
+    pub fn disable_ccr_for_tool(&mut self, tool: &str) {
+        if self.routes.contains_key(tool) {
+            self.ccr_disabled_tools.insert(tool.to_owned());
+        }
+    }
+
+    pub fn disable_ccr_for_all_tools(&mut self) {
+        self.ccr_disabled_tools.extend(self.routes.keys().cloned());
+    }
+
+    async fn outcome_from_result(
+        &self,
+        name: &str,
+        args: &Value,
+        result: ToolCallResult,
+    ) -> ToolOutcome {
+        if let Some(route) = self.source_verifiers.get(name) {
+            // A trusted route must not pass unverified bytes through the
+            // ordinary tool-result path, including upstream error bodies.
+            if result.is_error {
+                return ToolOutcome::error("Trusted MCP source failed; result withheld")
+                    .without_ccr();
+            }
+            return match route
+                .verifier
+                .verify(&route.scope, args, &result.content)
+                .await
+            {
+                Ok(source) => {
+                    let outcome = ToolOutcome::ok(result.content)
+                        .with_source_artifact(source.artifact)
+                        .with_source_retention_at(source.retention_at);
+                    if self.ccr_disabled_tools.contains(name) {
+                        outcome.without_ccr()
+                    } else {
+                        outcome
+                    }
+                }
+                Err(reason) => {
+                    warn!(tool = %name, reason = %reason, "MCP source attestation refused");
+                    ToolOutcome::error("Trusted MCP source could not be verified; result withheld")
+                        .without_ccr()
+                }
+            };
+        }
+        if self.source_attestation_required.contains(name) {
+            return ToolOutcome::error("Trusted MCP source verifier unavailable; result withheld")
+                .without_ccr();
+        }
+        if result.is_error {
+            return ToolOutcome::error(result.content);
+        }
+        if self.ccr_disabled_tools.contains(name) {
+            return ToolOutcome::ok(result.content).without_ccr();
+        }
+        ToolOutcome::ok(result.content)
+    }
+
+    fn outcome_from_error(&self, name: &str, error: McpError) -> Result<ToolOutcome, String> {
+        if self.source_attestation_required.contains(name)
+            || self.source_verifiers.contains_key(name)
+        {
+            // JSON-RPC error messages are controlled by the source server
+            // and may echo source bytes. A trusted route has no verified
+            // content on this path, so retire its old call and reveal no
+            // server diagnostic to the model.
+            warn!(tool = %name, "trusted MCP route failed");
+            return Ok(
+                ToolOutcome::error("Trusted MCP source failed; result withheld").without_ccr(),
+            );
+        }
+        Err(error.to_string())
     }
 
     /// Tool definitions to seed [`ChatRequest::tools`](crate::ChatRequest).
@@ -808,6 +972,26 @@ impl ToolExecutor for ToolRegistry {
         self.server_for_tool(tool).map(str::to_string)
     }
 
+    async fn verify_ccr_source(
+        &self,
+        name: &str,
+        args: &Value,
+        content: &str,
+        artifact: &CcrSourceArtifact,
+        retention_at: Option<i64>,
+    ) -> bool {
+        let Some(route) = self.source_verifiers.get(name) else {
+            return false;
+        };
+        route
+            .verifier
+            .verify(&route.scope, args, content)
+            .await
+            .is_ok_and(|current| {
+                current.artifact == *artifact && retention_at == Some(current.retention_at)
+            })
+    }
+
     async fn call(&self, name: &str, args: Value) -> Result<ToolOutcome, String> {
         // Fail-closed: an unrouted name is a dispatch error the loop turns
         // into an is_error tool result.
@@ -815,10 +999,20 @@ impl ToolExecutor for ToolRegistry {
             .routes
             .get(name)
             .ok_or_else(|| format!("unknown tool: {name}"))?;
+        if self.source_attestation_required.contains(name)
+            && !self.source_verifiers.contains_key(name)
+        {
+            return Ok(ToolOutcome::error(
+                "Trusted MCP source verifier unavailable; result withheld",
+            )
+            .without_ccr());
+        }
         let mut client = self.clients[idx].lock().await;
-        match client.call_tool(name, args).await {
-            Ok(r) => Ok(ToolOutcome { content: r.content, is_error: r.is_error }),
-            Err(e) => Err(e.to_string()),
+        let result = client.call_tool(name, args.clone()).await;
+        drop(client);
+        match result {
+            Ok(r) => Ok(self.outcome_from_result(name, &args, r).await),
+            Err(e) => self.outcome_from_error(name, e),
         }
     }
 }
@@ -893,16 +1087,280 @@ mod tests {
     }
 
     #[test]
+    fn model_or_mcp_metadata_cannot_become_verified_source_identity() {
+        let frame = json!({
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "unverified body",
+                    "_meta": {"connector": "causal", "version": "v1"}
+                }],
+                "_meta": {
+                    "sourceArtifact": {
+                        "connector": "causal",
+                        "artifact_id": "source-1",
+                        "version": "v1",
+                        "acl_revision": "admin"
+                    }
+                }
+            }
+        });
+        let parsed = parse_tool_call_result(&frame).unwrap();
+        assert_eq!(parsed.content, "unverified body");
+        assert!(!parsed.is_error);
+        // ToolCallResult has no artifact field. A bound outcome requires an
+        // application-registered verifier; arbitrary MCP _meta is ignored.
+    }
+
+    struct ExactVerifier;
+
+    #[async_trait]
+    impl McpSourceVerifier for ExactVerifier {
+        async fn verify(
+            &self,
+            scope: &CcrScope,
+            args: &Value,
+            content: &str,
+        ) -> Result<VerifiedMcpSource, String> {
+            if scope.source_acl != "principal"
+                || args["artifact_id"] != "source-1"
+                || content != "exact"
+            {
+                return Err("unverified".into());
+            }
+            Ok(VerifiedMcpSource {
+                artifact: CcrSourceArtifact {
+                    connector: "causal".into(),
+                    artifact_id: "source-1".into(),
+                    version: "v1".into(),
+                    acl_revision: "acl".into(),
+                },
+                retention_at: 42,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_route_requires_exact_registry_owner_and_rechecks_bytes() {
+        // A pure registry shell is enough to exercise route registration
+        // without starting an MCP process; actual network calls use the same
+        // route table built by from_clients_named.
+        let mut registry = ToolRegistry {
+            clients: Vec::new(),
+            routes: HashMap::from([("get_source".into(), 0)]),
+            defs: Vec::new(),
+            server_names: vec!["causal-mcp".into()],
+            source_verifiers: HashMap::new(),
+            source_attestation_required: HashSet::new(),
+            ccr_disabled_tools: HashSet::new(),
+        };
+        let scope = CcrScope {
+            tenant_id: "local".into(),
+            agent_id: "agent".into(),
+            session_id: "session".into(),
+            source_acl: "principal".into(),
+        };
+        assert!(
+            registry
+                .register_source_verifier(
+                    scope.clone(),
+                    "spoofed-server",
+                    "get_source",
+                    Arc::new(ExactVerifier),
+                )
+                .is_err()
+        );
+        registry
+            .register_source_verifier(scope, "causal-mcp", "get_source", Arc::new(ExactVerifier))
+            .unwrap();
+        assert!(
+            registry
+                .register_source_verifier(
+                    CcrScope {
+                        tenant_id: "local".into(),
+                        agent_id: "agent".into(),
+                        session_id: "session".into(),
+                        source_acl: "principal".into(),
+                    },
+                    "causal-mcp",
+                    "get_source",
+                    Arc::new(ExactVerifier),
+                )
+                .is_err()
+        );
+        let source = CcrSourceArtifact {
+            connector: "causal".into(),
+            artifact_id: "source-1".into(),
+            version: "v1".into(),
+            acl_revision: "acl".into(),
+        };
+        let args = json!({"artifact_id": "source-1"});
+        assert!(
+            registry
+                .verify_ccr_source("get_source", &args, "exact", &source, Some(42))
+                .await
+        );
+        assert!(
+            !registry
+                .verify_ccr_source("get_source", &args, "different", &source, Some(42))
+                .await
+        );
+        assert!(
+            !registry
+                .verify_ccr_source("get_source", &args, "exact", &source, Some(43))
+                .await
+        );
+        let verified = registry
+            .outcome_from_result(
+                "get_source",
+                &args,
+                ToolCallResult {
+                    content: "exact".into(),
+                    is_error: false,
+                },
+            )
+            .await;
+        assert_eq!(verified.source_artifact, Some(source.clone()));
+        assert_eq!(verified.source_retention_at, Some(42));
+        assert!(verified.ccr_eligible);
+        let mismatched = registry
+            .outcome_from_result(
+                "get_source",
+                &args,
+                ToolCallResult {
+                    content: "different".into(),
+                    is_error: false,
+                },
+            )
+            .await;
+        assert_eq!(
+            mismatched.content,
+            "Trusted MCP source could not be verified; result withheld"
+        );
+        assert!(mismatched.is_error);
+        assert!(mismatched.source_artifact.is_none());
+        assert!(!mismatched.ccr_eligible);
+        assert!(mismatched.ccr_revoke_call);
+        let upstream_error = registry
+            .outcome_from_result(
+                "get_source",
+                &args,
+                ToolCallResult {
+                    content: "sensitive source text in upstream error".into(),
+                    is_error: true,
+                },
+            )
+            .await;
+        assert_eq!(
+            upstream_error.content,
+            "Trusted MCP source failed; result withheld"
+        );
+        assert!(upstream_error.is_error);
+        assert!(upstream_error.ccr_revoke_call);
+        registry.disable_ccr_for_tool("get_source");
+        let disabled = registry
+            .outcome_from_result(
+                "get_source",
+                &args,
+                ToolCallResult {
+                    content: "exact".into(),
+                    is_error: false,
+                },
+            )
+            .await;
+        assert!(!disabled.ccr_eligible);
+        assert_eq!(disabled.source_artifact, Some(source));
+        assert!(disabled.ccr_revoke_call);
+        let disabled_mismatch = registry
+            .outcome_from_result(
+                "get_source",
+                &args,
+                ToolCallResult {
+                    content: "different".into(),
+                    is_error: false,
+                },
+            )
+            .await;
+        assert!(disabled_mismatch.is_error);
+        assert!(!disabled_mismatch.content.contains("different"));
+        let rpc_failure = registry
+            .outcome_from_error(
+                "get_source",
+                McpError::Rpc {
+                    code: -32000,
+                    message: "sensitive source text in RPC error".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            rpc_failure.content,
+            "Trusted MCP source failed; result withheld"
+        );
+        assert!(rpc_failure.is_error);
+        assert!(rpc_failure.ccr_revoke_call);
+        assert!(!rpc_failure.ccr_eligible);
+        registry.ccr_disabled_tools.clear();
+        registry.source_verifiers.clear();
+        let missing_verifier = registry
+            .outcome_from_result(
+                "get_source",
+                &args,
+                ToolCallResult {
+                    content: "sensitive source without a verifier".into(),
+                    is_error: false,
+                },
+            )
+            .await;
+        assert!(missing_verifier.is_error);
+        assert!(missing_verifier.ccr_revoke_call);
+        assert!(!missing_verifier.content.contains("sensitive source"));
+        registry.source_attestation_required.clear();
+        assert!(
+            registry
+                .outcome_from_error(
+                    "get_source",
+                    McpError::Rpc {
+                        code: -32000,
+                        message: "ordinary MCP diagnostic".into(),
+                    },
+                )
+                .unwrap_err()
+                .contains("ordinary MCP diagnostic")
+        );
+        let generic = registry
+            .outcome_from_result(
+                "get_source",
+                &args,
+                ToolCallResult {
+                    content: "generic result".into(),
+                    is_error: false,
+                },
+            )
+            .await;
+        assert!(generic.ccr_eligible);
+        assert!(generic.source_artifact.is_none());
+    }
+
+    #[test]
     fn parse_tools_list_rpc_error_propagates() {
         let frame = json!({ "id": 1, "error": { "code": -32601, "message": "method not found" } });
         let err = parse_tools_list_response(&frame).unwrap_err();
-        assert_eq!(err, McpError::Rpc { code: -32601, message: "method not found".into() });
+        assert_eq!(
+            err,
+            McpError::Rpc {
+                code: -32601,
+                message: "method not found".into()
+            }
+        );
     }
 
     #[test]
     fn parse_tools_list_missing_array_is_parse_error() {
         let frame = json!({ "result": {} });
-        assert!(matches!(parse_tools_list_response(&frame), Err(McpError::Parse(_))));
+        assert!(matches!(
+            parse_tools_list_response(&frame),
+            Err(McpError::Parse(_))
+        ));
     }
 
     #[test]
@@ -952,19 +1410,41 @@ mod tests {
     fn parse_tool_call_rpc_error_propagates() {
         let frame = json!({ "id": 6, "error": { "code": -32000, "message": "server error" } });
         let err = parse_tool_call_result(&frame).unwrap_err();
-        assert_eq!(err, McpError::Rpc { code: -32000, message: "server error".into() });
+        assert_eq!(
+            err,
+            McpError::Rpc {
+                code: -32000,
+                message: "server error".into()
+            }
+        );
     }
 
     #[test]
     fn build_routes_first_wins_on_collision() {
         let client_a = vec![
-            McpToolDef { name: "search".into(), description: "A search".into(), input_schema: json!({}) },
-            McpToolDef { name: "fetch".into(), description: "A fetch".into(), input_schema: json!({}) },
+            McpToolDef {
+                name: "search".into(),
+                description: "A search".into(),
+                input_schema: json!({}),
+            },
+            McpToolDef {
+                name: "fetch".into(),
+                description: "A fetch".into(),
+                input_schema: json!({}),
+            },
         ];
         let client_b = vec![
             // Collides with client_a's "search" — must be ignored.
-            McpToolDef { name: "search".into(), description: "B search".into(), input_schema: json!({}) },
-            McpToolDef { name: "write".into(), description: "B write".into(), input_schema: json!({}) },
+            McpToolDef {
+                name: "search".into(),
+                description: "B search".into(),
+                input_schema: json!({}),
+            },
+            McpToolDef {
+                name: "write".into(),
+                description: "B write".into(),
+                input_schema: json!({}),
+            },
         ];
         let (routes, defs) = build_routes_filtered(&[client_a, client_b], &[]);
 
@@ -999,29 +1479,48 @@ mod tests {
         assert!(f.permits("read"));
         assert!(!f.permits("write"), "explicit deny beats allow");
         // Empty allowlist + only denylist: permissive except denied.
-        let f2 = ToolFilter { allowed: vec![], denied: vec!["danger".into()] };
+        let f2 = ToolFilter {
+            allowed: vec![],
+            denied: vec!["danger".into()],
+        };
         assert!(f2.permits("anything"));
         assert!(!f2.permits("danger"));
     }
 
     #[test]
     fn build_routes_filtered_applies_per_client_filter() {
-        let internal = vec![
-            McpToolDef { name: "memory_search".into(), description: "".into(), input_schema: json!({}) },
-        ];
+        let internal = vec![McpToolDef {
+            name: "memory_search".into(),
+            description: "".into(),
+            input_schema: json!({}),
+        }];
         let external = vec![
-            McpToolDef { name: "crm_list".into(), description: "".into(), input_schema: json!({}) },
-            McpToolDef { name: "crm_delete".into(), description: "".into(), input_schema: json!({}) },
+            McpToolDef {
+                name: "crm_list".into(),
+                description: "".into(),
+                input_schema: json!({}),
+            },
+            McpToolDef {
+                name: "crm_delete".into(),
+                description: "".into(),
+                input_schema: json!({}),
+            },
         ];
         // Internal server: permissive. External server: allowlist crm_list only.
         let filters = vec![
             ToolFilter::default(),
-            ToolFilter { allowed: vec!["crm_list".into()], denied: vec![] },
+            ToolFilter {
+                allowed: vec!["crm_list".into()],
+                denied: vec![],
+            },
         ];
         let (routes, defs) = build_routes_filtered(&[internal, external], &filters);
         assert!(routes.contains_key("memory_search"));
         assert!(routes.contains_key("crm_list"));
-        assert!(!routes.contains_key("crm_delete"), "filtered external tool absent");
+        assert!(
+            !routes.contains_key("crm_delete"),
+            "filtered external tool absent"
+        );
         assert_eq!(defs.len(), 2);
     }
 }
@@ -1032,7 +1531,8 @@ mod http_transport_tests {
 
     #[test]
     fn sse_extract_matching_frame() {
-        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
         let v = sse_extract_response(body, 7).expect("frame found");
         assert_eq!(v["result"]["ok"], serde_json::Value::Bool(true));
     }
@@ -1052,14 +1552,10 @@ mod http_transport_tests {
 
     #[tokio::test]
     async fn connect_http_rejects_plain_http_non_localhost() {
-        let err = McpClient::connect_http(
-            "http://example.com/mcp",
-            &[],
-            Duration::from_secs(1),
-        )
-        .await
-        .err()
-        .expect("plain-http non-localhost must be rejected");
+        let err = McpClient::connect_http("http://example.com/mcp", &[], Duration::from_secs(1))
+            .await
+            .err()
+            .expect("plain-http non-localhost must be rejected");
         assert!(matches!(err, McpError::Spawn(_)));
     }
 
@@ -1075,7 +1571,9 @@ mod http_transport_tests {
 
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 tokio::spawn(async move {
                     // Read until headers end, then honor content-length.
                     let mut buf = Vec::new();
@@ -1083,7 +1581,9 @@ mod http_transport_tests {
                     let body_start;
                     loop {
                         let n = sock.read(&mut tmp).await.unwrap_or(0);
-                        if n == 0 { return; }
+                        if n == 0 {
+                            return;
+                        }
                         buf.extend_from_slice(&tmp[..n]);
                         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                             body_start = pos + 4;
@@ -1101,7 +1601,9 @@ mod http_transport_tests {
                         .unwrap_or(0);
                     while buf.len() < body_start + content_length {
                         let n = sock.read(&mut tmp).await.unwrap_or(0);
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         buf.extend_from_slice(&tmp[..n]);
                     }
                     let body = String::from_utf8_lossy(&buf[body_start..]).to_string();
@@ -1135,7 +1637,8 @@ mod http_transport_tests {
                     let body = payload.map(|p| p.to_string()).unwrap_or_default();
                     let resp = format!(
                         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(), body
+                        body.len(),
+                        body
                     );
                     let _ = sock.write_all(resp.as_bytes()).await;
                     let _ = sock.shutdown().await;

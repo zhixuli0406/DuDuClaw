@@ -72,10 +72,7 @@ fn mask_display(original: &str) -> String {
 /// the built-in `general` profile so the tool is useful on a fresh install.
 /// `user_input` is forced to `on` so file rows are actually scanned regardless
 /// of the deployment's channel policy.
-fn build_verify_manager(
-    home: &Path,
-    profile: Option<&str>,
-) -> Result<Arc<RedactionManager>> {
+fn build_verify_manager(home: &Path, profile: Option<&str>) -> Result<Arc<RedactionManager>> {
     // A config we cannot parse must NOT silently become "no config" here: the
     // fallback is the built-in `general` profile, so the report would evidence
     // a rule set the deployment does not actually run — the most misleading
@@ -161,9 +158,7 @@ pub async fn run(
     };
 
     if is_json_file(&file) {
-        return run_json(
-            &home, &file, &content, profile, &agent_id, out, tool, &args,
-        );
+        return run_json(&home, &file, &content, profile, &agent_id, out, tool, &args);
     }
     if tool.is_some() || !args.is_empty() {
         return Err(DuDuClawError::Config(
@@ -304,9 +299,8 @@ fn run_json(
     tool: Option<String>,
     args: &[String],
 ) -> Result<()> {
-    let parsed: Value = serde_json::from_str(content).map_err(|e| {
-        DuDuClawError::Config(format!("{} is not valid JSON: {e}", file.display()))
-    })?;
+    let parsed: Value = serde_json::from_str(content)
+        .map_err(|e| DuDuClawError::Config(format!("{} is not valid JSON: {e}", file.display())))?;
 
     let tool_name = tool.unwrap_or_else(|| DEFAULT_JSON_TOOL.to_string());
     let arg_value = parse_args(args)?;
@@ -455,7 +449,10 @@ fn render_json_report(
 
     let _ = writeln!(s, "## 命中明細");
     let _ = writeln!(s);
-    let _ = writeln!(s, "| 位置（JSON pointer） | 遮罩後 | 規則 | 類別 | Token | 可還原 |");
+    let _ = writeln!(
+        s,
+        "| 位置（JSON pointer） | 遮罩後 | 規則 | 類別 | Token | 可還原 |"
+    );
     let _ = writeln!(s, "|---|---|---|---|---|---|");
     for h in hits {
         let rev = if h.reversible { "✅" } else { "❌" };
@@ -503,13 +500,19 @@ fn render_report(
     let _ = writeln!(s, "- 檔案：`{}`", file.display());
     let _ = writeln!(s, "- Agent：`{agent_id}`");
     let _ = writeln!(s, "- 生效規則數：{rule_count}");
-    let _ = writeln!(s, "- 掃描行數：{scanned_lines}（其中 {pass_through_lines} 行無敏感資料）");
+    let _ = writeln!(
+        s,
+        "- 掃描行數：{scanned_lines}（其中 {pass_through_lines} 行無敏感資料）"
+    );
     let _ = writeln!(s, "- 命中數：{}", hits.len());
     let _ = writeln!(s, "- 耗時：{elapsed_ms} ms");
     let _ = writeln!(s);
 
     if hits.is_empty() {
-        let _ = writeln!(s, "> 沒有命中任何規則。若預期應有命中，請確認 profile 與規則設定。");
+        let _ = writeln!(
+            s,
+            "> 沒有命中任何規則。若預期應有命中，請確認 profile 與規則設定。"
+        );
         return s;
     }
 
@@ -610,5 +613,4 @@ mod tests {
         assert!(parse_args(&["noequals".into()]).is_err());
         assert!(parse_args(&["=value".into()]).is_err());
     }
-
 }

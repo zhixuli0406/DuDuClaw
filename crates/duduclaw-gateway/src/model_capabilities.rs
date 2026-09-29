@@ -75,7 +75,10 @@ mod tests {
 
     #[test]
     fn claude_runtime_with_local_gguf_has_no_vision() {
-        assert!(!supports_vision(RuntimeType::Claude, "qwen2.5-7b-instruct-q4_k_m.gguf"));
+        assert!(!supports_vision(
+            RuntimeType::Claude,
+            "qwen2.5-7b-instruct-q4_k_m.gguf"
+        ));
         assert!(!supports_vision(RuntimeType::Claude, ""));
     }
 

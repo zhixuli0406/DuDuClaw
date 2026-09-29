@@ -49,7 +49,13 @@ impl Default for OdooConfig {
             username: String::new(),
             api_key_enc: String::new(),
             password_enc: String::new(),
-            poll_enabled: true,
+            // G4 (2026-09 feature audit): default OFF. This used to be `true`,
+            // which was harmless only because nothing consumed it — the
+            // polling task did not exist. Now that it does, an unset key must
+            // not start a background loop against the operator's ERP; "未設定
+            // 不得預設開". `odoo.configure` already defaults an absent
+            // `poll_enabled` param to `false`, so the two now agree.
+            poll_enabled: false,
             poll_interval_seconds: 60,
             poll_models: vec![
                 "crm.lead".to_string(),
@@ -128,6 +134,16 @@ api_key_enc = "encrypted_key_here"
         let table = toml::Table::new();
         let config = OdooConfig::from_toml(&table);
         assert!(!config.is_configured());
+    }
+
+    #[test]
+    fn polling_and_webhook_default_off() {
+        // Regression (G4): an unset `[odoo] poll_enabled` must not start the
+        // background poller. Before the poller existed this default was `true`
+        // and nothing noticed.
+        let config = OdooConfig::default();
+        assert!(!config.poll_enabled);
+        assert!(!config.webhook_enabled);
     }
 
     #[test]

@@ -135,7 +135,13 @@ impl McpRedactionLayer {
     /// layer's env-derived agent / session (see [`Self::redact_tool_result`]
     /// for why the two paths share one implementation).
     pub fn decide_tool_args(&self, tool_name: &str, args: &Value) -> EgressDecision {
-        decide_tool_args_with(&self.manager, tool_name, args, &self.agent_id, &self.session_id)
+        decide_tool_args_with(
+            &self.manager,
+            tool_name,
+            args,
+            &self.agent_id,
+            &self.session_id,
+        )
     }
 
     /// Quick scan: does any string in this Value contain a token-shaped
@@ -189,7 +195,8 @@ pub fn decide_tool_args_with(
     agent_id: &str,
     session_id: &str,
 ) -> EgressDecision {
-    let caller = duduclaw_redaction::Caller::agent(agent_id.to_string(), redaction_scopes_from_env());
+    let caller =
+        duduclaw_redaction::Caller::agent(agent_id.to_string(), redaction_scopes_from_env());
     manager
         .decide_tool_call(tool_name, args, agent_id, Some(session_id), &caller)
         .unwrap_or_else(|e| {
@@ -334,7 +341,10 @@ mod tests {
             Some(&right),
         );
         assert!(
-            value[0]["name"].as_str().unwrap().starts_with("<REDACT:DB_FIELD:"),
+            value[0]["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("<REDACT:DB_FIELD:"),
             "args must reach match_args: {value}"
         );
         assert_eq!(value[0]["id"], serde_json::json!(7));
@@ -506,7 +516,10 @@ profiles = ["ai_pii"]
             dirs.model_dir,
             tmp.path().join("models").join("privacy-filter")
         );
-        assert_eq!(dirs.ort_lib_root, tmp.path().join("lib").join("onnxruntime"));
+        assert_eq!(
+            dirs.ort_lib_root,
+            tmp.path().join("lib").join("onnxruntime")
+        );
     }
 
     #[test]
@@ -549,12 +562,7 @@ category = "PERSON"
 
     #[test]
     fn deny_response_has_expected_shape() {
-        let r = egress_deny_response(
-            &serde_json::json!(7),
-            "web_fetch",
-            "not whitelisted",
-            2,
-        );
+        let r = egress_deny_response(&serde_json::json!(7), "web_fetch", "not whitelisted", 2);
         assert_eq!(r["error"]["code"], -32007);
         assert_eq!(r["error"]["data"]["tool"], "web_fetch");
         assert_eq!(r["error"]["data"]["tokens_seen"], 2);

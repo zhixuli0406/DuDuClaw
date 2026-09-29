@@ -100,9 +100,16 @@ async fn native_install_list_remove_roundtrip() {
     build_native_pack(pack.path());
 
     // ── install ──
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
-        .await
-        .expect("install should succeed");
+    cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        false,
+        None,
+    )
+    .await
+    .expect("install should succeed");
 
     let agents = home.path().join("agents");
     assert!(agents.join("front").join("agent.toml").is_file());
@@ -154,7 +161,15 @@ async fn native_install_list_remove_roundtrip() {
     );
 
     // Re-install must be refused (idempotency guard).
-    let dup = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None).await;
+    let dup = cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        false,
+        None,
+    )
+    .await;
     assert!(dup.is_err(), "duplicate install should be refused");
 
     // ── export (reverse .mcp.json flow: aggregate, strip duduclaw) ──
@@ -201,9 +216,16 @@ async fn dry_run_writes_nothing() {
     let pack = TempTree::new("pack");
     build_native_pack(pack.path());
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), true, false, false, None)
-        .await
-        .expect("dry-run should succeed");
+    cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        true,
+        false,
+        false,
+        None,
+    )
+    .await
+    .expect("dry-run should succeed");
 
     assert!(!home.path().join("agents/front").exists());
     assert!(list_records(home.path()).is_empty());
@@ -228,9 +250,16 @@ async fn claude_plugin_import_maps_agents() {
     // A hook must be imported DISABLED, never wired.
     write(&pack.path().join("hooks/pre.sh"), "#!/bin/sh\necho hi\n");
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
-        .await
-        .expect("plugin import should succeed");
+    cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        false,
+        None,
+    )
+    .await
+    .expect("plugin import should succeed");
 
     let agent_toml =
         std::fs::read_to_string(home.path().join("agents/researcher/agent.toml")).unwrap();
@@ -263,9 +292,16 @@ async fn single_skill_import() {
         &pack.path().join("SKILL.md"),
         "---\nname: translate\ndescription: Translate between languages\n---\n\nTranslate the input faithfully.\n",
     );
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
-        .await
-        .expect("skill import should succeed");
+    cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        false,
+        None,
+    )
+    .await
+    .expect("skill import should succeed");
     assert!(home.path().join("skills/translate/SKILL.md").is_file());
     assert_eq!(list_records(home.path())[0].kind, PackKind::Skill);
 }
@@ -275,7 +311,15 @@ async fn unrecognised_format_is_rejected() {
     let home = TempTree::new("home");
     let pack = TempTree::new("junk");
     write(&pack.path().join("random.txt"), "nothing recognisable");
-    let res = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None).await;
+    let res = cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        false,
+        None,
+    )
+    .await;
     assert!(res.is_err(), "unrecognised layout must be rejected");
     assert!(!home.path().join("agents").exists());
 }
@@ -290,7 +334,15 @@ async fn injection_laden_persona_is_blocked() {
     );
     // The scan blocks the only asset → nothing installed, and no record is
     // written (fail-closed).
-    let _ = cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None).await;
+    let _ = cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        false,
+        None,
+    )
+    .await;
     assert!(!home.path().join("skills/evil").exists());
 }
 
@@ -319,14 +371,23 @@ async fn hooks_without_trust_are_pending_and_fail_closed() {
     let pack = TempTree::new("hookpack");
     build_hook_pack(pack.path(), "hooky");
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
-        .await
-        .expect("install should succeed");
+    cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        false,
+        None,
+    )
+    .await
+    .expect("install should succeed");
 
     // Quarantined, NOT enabled (fail-closed).
-    assert!(hooks::disabled_dir(home.path(), "hooky")
-        .join("pre-tool.sh")
-        .is_file());
+    assert!(
+        hooks::disabled_dir(home.path(), "hooky")
+            .join("pre-tool.sh")
+            .is_file()
+    );
     assert!(!hooks::enabled_dir(home.path(), "hooky").exists());
 
     // State machine: pending_approval with a filed approval id.
@@ -356,16 +417,28 @@ async fn trust_hooks_flag_enables_immediately() {
     let pack = TempTree::new("hookpack");
     build_hook_pack(pack.path(), "trusty");
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, true, None)
-        .await
-        .expect("install should succeed");
+    cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        true,
+        None,
+    )
+    .await
+    .expect("install should succeed");
 
     let state = hooks::read_state(home.path(), "trusty").expect("state written");
     assert_eq!(state.status, HooksStatus::Enabled);
-    assert!(state.approval_id.is_none(), "explicit grant, no approval filed");
-    assert!(hooks::enabled_dir(home.path(), "trusty")
-        .join("pre-tool.sh")
-        .is_file());
+    assert!(
+        state.approval_id.is_none(),
+        "explicit grant, no approval filed"
+    );
+    assert!(
+        hooks::enabled_dir(home.path(), "trusty")
+            .join("pre-tool.sh")
+            .is_file()
+    );
     // No pending approval left behind.
     let broker = duduclaw_gateway::approval::ApprovalBroker::open(home.path()).unwrap();
     assert!(broker.list_pending(None).await.unwrap().is_empty());
@@ -378,9 +451,16 @@ async fn approved_hooks_enable_via_hooks_cmd() {
     let pack = TempTree::new("hookpack");
     build_hook_pack(pack.path(), "approved");
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
-        .await
-        .unwrap();
+    cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
     let state = hooks::read_state(home.path(), "approved").unwrap();
     let id = duduclaw_gateway::approval::ApprovalId::from(state.approval_id.clone().unwrap());
 
@@ -392,9 +472,11 @@ async fn approved_hooks_enable_via_hooks_cmd() {
 
     let state = hooks::read_state(home.path(), "approved").unwrap();
     assert_eq!(state.status, HooksStatus::Enabled);
-    assert!(hooks::enabled_dir(home.path(), "approved")
-        .join("pre-tool.sh")
-        .is_file());
+    assert!(
+        hooks::enabled_dir(home.path(), "approved")
+            .join("pre-tool.sh")
+            .is_file()
+    );
 }
 
 #[tokio::test]
@@ -404,9 +486,16 @@ async fn denied_hooks_stay_disabled_via_hooks_cmd() {
     let pack = TempTree::new("hookpack");
     build_hook_pack(pack.path(), "denied");
 
-    cmd_install(home.path(), pack.path().to_str().unwrap(), false, false, false, None)
-        .await
-        .unwrap();
+    cmd_install(
+        home.path(),
+        pack.path().to_str().unwrap(),
+        false,
+        false,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
     let state = hooks::read_state(home.path(), "denied").unwrap();
     let id = duduclaw_gateway::approval::ApprovalId::from(state.approval_id.clone().unwrap());
 
@@ -416,15 +505,21 @@ async fn denied_hooks_stay_disabled_via_hooks_cmd() {
     hooks::cmd_hooks(home.path(), "denied").await.unwrap();
 
     let state = hooks::read_state(home.path(), "denied").unwrap();
-    assert_eq!(state.status, HooksStatus::Disabled, "deny keeps hooks disabled");
+    assert_eq!(
+        state.status,
+        HooksStatus::Disabled,
+        "deny keeps hooks disabled"
+    );
     assert!(
         !hooks::enabled_dir(home.path(), "denied").exists(),
         "denied hooks never reach the enabled dir (fail-closed)"
     );
     // Quarantine copy is retained for audit / later re-grant.
-    assert!(hooks::disabled_dir(home.path(), "denied")
-        .join("pre-tool.sh")
-        .is_file());
+    assert!(
+        hooks::disabled_dir(home.path(), "denied")
+            .join("pre-tool.sh")
+            .is_file()
+    );
 }
 
 /// The committed demo pack (L3, gitignored) validates cleanly when present.
@@ -474,8 +569,14 @@ department = "財務"
 rank = "staff"
 "#,
     );
-    write(&pack.path().join("agents/lead/soul.md"), "# 主管\n\n對外窗口。\n");
-    write(&pack.path().join("agents/clerk/soul.md"), "# 帳務\n\n請款行政。\n");
+    write(
+        &pack.path().join("agents/lead/soul.md"),
+        "# 主管\n\n對外窗口。\n",
+    );
+    write(
+        &pack.path().join("agents/clerk/soul.md"),
+        "# 帳務\n\n請款行政。\n",
+    );
 
     // Unknown attach target ⇒ fail-closed, nothing installed.
     let bad = cmd_install(
@@ -488,11 +589,17 @@ rank = "staff"
     )
     .await;
     assert!(bad.is_err(), "unknown --attach-under must abort");
-    assert!(!home.path().join("agents/lead").exists(), "must not half-install");
+    assert!(
+        !home.path().join("agents/lead").exists(),
+        "must not half-install"
+    );
 
     // Existing supervisor ⇒ root re-parents under it.
     let boss_dir = home.path().join("agents/boss");
-    write(&boss_dir.join("agent.toml"), "[agent]\nname = \"boss\"\nrole = \"main\"\n");
+    write(
+        &boss_dir.join("agent.toml"),
+        "[agent]\nname = \"boss\"\nrole = \"main\"\n",
+    );
     cmd_install(
         home.path(),
         pack.path().to_str().unwrap(),
@@ -504,8 +611,7 @@ rank = "staff"
     .await
     .expect("install with attach_under should succeed");
 
-    let lead_toml =
-        std::fs::read_to_string(home.path().join("agents/lead/agent.toml")).unwrap();
+    let lead_toml = std::fs::read_to_string(home.path().join("agents/lead/agent.toml")).unwrap();
     assert!(
         lead_toml.contains("reports_to = \"boss\""),
         "pack root attaches under the chosen supervisor: {lead_toml}"
@@ -520,8 +626,7 @@ rank = "staff"
         duduclaw_core::types::AgentRole::TeamLeader,
         "front_desk normalizes to the canonical team-leader role"
     );
-    let clerk_toml =
-        std::fs::read_to_string(home.path().join("agents/clerk/agent.toml")).unwrap();
+    let clerk_toml = std::fs::read_to_string(home.path().join("agents/clerk/agent.toml")).unwrap();
     assert!(
         clerk_toml.contains("reports_to = \"lead\""),
         "in-pack hierarchy untouched"

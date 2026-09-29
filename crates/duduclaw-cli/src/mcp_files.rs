@@ -155,7 +155,9 @@ pub fn vet_path(raw: &str, home_dir: &Path, agent_id: &str) -> Result<PathBuf, S
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
-        return Err(format!("路徑「{raw}」含有 `..`，不接受相對上層路徑，請改用完整路徑。"));
+        return Err(format!(
+            "路徑「{raw}」含有 `..`，不接受相對上層路徑，請改用完整路徑。"
+        ));
     }
 
     let roots = allowed_roots(home_dir, agent_id);
@@ -200,9 +202,7 @@ fn file_len(path: &Path) -> u64 {
 }
 
 fn too_large(raw: &str, len: u64, cap: u64) -> String {
-    format!(
-        "檔案「{raw}」為 {len} bytes，超過此工具的上限 {cap} bytes，拒絕讀取。"
-    )
+    format!("檔案「{raw}」為 {len} bytes，超過此工具的上限 {cap} bytes，拒絕讀取。")
 }
 
 // ── Argument parsing ────────────────────────────────────────────────────────
@@ -369,15 +369,7 @@ pub fn handle_file_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> V
         "text": text,
         "truncated": truncated,
     });
-    audit(
-        home_dir,
-        agent_id,
-        "file_read",
-        &path,
-        &table,
-        None,
-        true,
-    );
+    audit(home_dir, agent_id, "file_read", &path, &table, None, true);
     files_json(&payload)
 }
 
@@ -387,9 +379,7 @@ fn structured_extension(path: &Path) -> Option<String> {
         .extension()
         .and_then(|e| e.to_str())?
         .to_ascii_lowercase();
-    STRUCTURED_EXTENSIONS
-        .contains(&ext.as_str())
-        .then_some(ext)
+    STRUCTURED_EXTENSIONS.contains(&ext.as_str()).then_some(ext)
 }
 
 /// Read at most `max_bytes` from `path` without materializing the whole file.
@@ -449,9 +439,7 @@ pub fn handle_csv_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> Va
     if has_header {
         match records.next() {
             Some(Ok(rec)) => {
-                columns = normalize_columns(
-                    &rec.iter().map(str::to_string).collect::<Vec<_>>(),
-                );
+                columns = normalize_columns(&rec.iter().map(str::to_string).collect::<Vec<_>>());
             }
             Some(Err(e)) => {
                 return files_error(&format!("解析「{raw_path}」的表頭失敗：{e}"));
@@ -469,7 +457,12 @@ pub fn handle_csv_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> Va
     for record in records {
         let record = match record {
             Ok(r) => r,
-            Err(e) => return files_error(&format!("解析「{raw_path}」第 {} 列失敗：{e}", skipped + rows.len() + 1)),
+            Err(e) => {
+                return files_error(&format!(
+                    "解析「{raw_path}」第 {} 列失敗：{e}",
+                    skipped + rows.len() + 1
+                ));
+            }
         };
         if skipped < offset {
             skipped += 1;
@@ -604,12 +597,7 @@ pub fn handle_xlsx_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> V
             );
         }
     };
-    let columns = normalize_columns(
-        &header
-            .iter()
-            .map(cell_to_header_string)
-            .collect::<Vec<_>>(),
-    );
+    let columns = normalize_columns(&header.iter().map(cell_to_header_string).collect::<Vec<_>>());
 
     let mut rows: Vec<Value> = Vec::new();
     let mut truncated = false;
@@ -998,12 +986,7 @@ mod tests {
 
     #[test]
     fn duplicate_and_blank_headers_never_collide() {
-        let cols = normalize_columns(&[
-            "name".into(),
-            "".into(),
-            "name".into(),
-            "  ".into(),
-        ]);
+        let cols = normalize_columns(&["name".into(), "".into(), "name".into(), "  ".into()]);
         assert_eq!(cols.len(), 4);
         let unique: std::collections::HashSet<_> = cols.iter().collect();
         assert_eq!(unique.len(), 4, "columns must be unique: {cols:?}");

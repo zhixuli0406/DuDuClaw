@@ -1366,7 +1366,9 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            found.iter().any(|f| f.id == state.key_fact_id.clone().unwrap()),
+            found
+                .iter()
+                .any(|f| f.id == state.key_fact_id.clone().unwrap()),
             "the induced rule's key_facts row must be findable via search_facts (the gate's real retrieval path)"
         );
     }

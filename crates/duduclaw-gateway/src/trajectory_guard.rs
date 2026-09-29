@@ -670,12 +670,21 @@ mod tests {
     #[test]
     fn session_ids_resolve_to_their_platform() {
         assert_eq!(channel_from_session_id("telegram:12345"), Some("telegram"));
-        assert_eq!(channel_from_session_id("telegram:12345:678"), Some("telegram"));
-        assert_eq!(channel_from_session_id("discord:thread:999"), Some("discord"));
+        assert_eq!(
+            channel_from_session_id("telegram:12345:678"),
+            Some("telegram")
+        );
+        assert_eq!(
+            channel_from_session_id("discord:thread:999"),
+            Some("discord")
+        );
         assert_eq!(channel_from_session_id("line:U9"), Some("line"));
         assert_eq!(channel_from_session_id("slack:C1"), Some("slack"));
         assert_eq!(channel_from_session_id("teams:conv"), Some("teams"));
-        assert_eq!(channel_from_session_id("googlechat:spaces/AAA"), Some("googlechat"));
+        assert_eq!(
+            channel_from_session_id("googlechat:spaces/AAA"),
+            Some("googlechat")
+        );
         // WebChat's composed id shares the prefix rule.
         assert_eq!(
             channel_from_session_id("webchat:conn-1#agent:kiki#conv:nonce"),
@@ -688,7 +697,16 @@ mod tests {
     fn non_channel_sessions_have_no_platform() {
         // Internal sessions belong to no platform; omitting the field is the
         // honest answer, and it is the shape every pre-W2-4 consumer handles.
-        for s in ["default", "cron:job-1", "bus:task-9", "heartbeat", "", "   ", ":", "dashboard:alice"] {
+        for s in [
+            "default",
+            "cron:job-1",
+            "bus:task-9",
+            "heartbeat",
+            "",
+            "   ",
+            ":",
+            "dashboard:alice",
+        ] {
             assert_eq!(channel_from_session_id(s), None, "must not attribute {s:?}");
         }
     }
@@ -1177,12 +1195,13 @@ mod tests {
     #[test]
     fn guard_cost_observe_trips() {
         let mut g = TrajectoryGuard::new(TrajectoryGuardConfig::default());
-        assert!(g
-            .observe_cost(CostSample {
+        assert!(
+            g.observe_cost(CostSample {
                 ts_ms: 0,
                 cumulative: 0
             })
-            .is_empty());
+            .is_empty()
+        );
         let sigs = g.observe_cost(CostSample {
             ts_ms: 60_000,
             cumulative: 120_000,

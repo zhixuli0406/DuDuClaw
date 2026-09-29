@@ -27,9 +27,8 @@ use std::time::Duration as StdDuration;
 
 use chrono::Utc;
 use duduclaw_license::{
+    EMBEDDED_FEATURES_TOML, FeatureGate, License, LicenseError, LicenseTier, PublicKeyRegistry,
     crl::SignedCrl, generate_fingerprint, load_default, save_default, storage,
-    FeatureGate, License, LicenseError, LicenseTier, PublicKeyRegistry,
-    EMBEDDED_FEATURES_TOML,
 };
 use serde_json::json;
 use tokio::sync::RwLock;
@@ -374,13 +373,20 @@ impl LicenseRuntime {
         // writing anything — the post-save re-validation would reject it
         // anyway, but with an error that hides the actionable reason.
         let is_self_host = is_self_host_deployment();
-        if license.validate_tier_deployment_binding(is_self_host).is_err() {
+        if license
+            .validate_tier_deployment_binding(is_self_host)
+            .is_err()
+        {
             return Err(format!(
                 "授權方案「{}」與本機部署型態不符：本機是{}部署。\
                  自架機器請簽發 self-host-pro / personal-pro-self-host / partner / oem；\
                  雲端託管才使用 solo / studio / business",
                 license.tier,
-                if is_self_host { "自架（self-host）" } else { "雲端（cloud）" },
+                if is_self_host {
+                    "自架（self-host）"
+                } else {
+                    "雲端（cloud）"
+                },
             ));
         }
         save_default(&license).map_err(|e| format!("寫入授權檔失敗：{e}"))?;
@@ -444,7 +450,10 @@ pub async fn redeem_partner_code(
     if code.is_empty() {
         return Err("兌換碼不可為空".to_string());
     }
-    let endpoint = format!("{}/v1/partner/redeem", rt.control_url().trim_end_matches('/'));
+    let endpoint = format!(
+        "{}/v1/partner/redeem",
+        rt.control_url().trim_end_matches('/')
+    );
     let client = reqwest::Client::builder()
         .timeout(StdDuration::from_secs(20))
         .build()
@@ -465,7 +474,11 @@ pub async fn redeem_partner_code(
         let text = resp.text().await.unwrap_or_default();
         let msg = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
-            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+            .and_then(|v| {
+                v.get("message")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| text.chars().take(200).collect());
         return Err(format!("授權伺服器回應 HTTP {status}：{msg}"));
     }
@@ -516,7 +529,11 @@ impl LicenseSnapshot {
         let current_fp = cached_fingerprint();
         Self {
             tier,
-            mode: if installed { "commercial" } else { "opensource" },
+            mode: if installed {
+                "commercial"
+            } else {
+                "opensource"
+            },
             installed,
             customer_id: license.map(|l| l.customer_id.clone()),
             subscription_id: license.map(|l| l.subscription_id.clone()),
@@ -621,10 +638,7 @@ fn count_embedded_issuer_keys() -> usize {
 
 // ── Bootstrap helpers ─────────────────────────────────────────
 
-async fn load_and_validate(
-    registry: &PublicKeyRegistry,
-    gate: &FeatureGate,
-) -> Option<License> {
+async fn load_and_validate(registry: &PublicKeyRegistry, gate: &FeatureGate) -> Option<License> {
     let license = match load_default() {
         Ok(l) => l,
         Err(LicenseError::FileNotFound(_)) => {
@@ -826,10 +840,8 @@ pub async fn agent_cap_message_from_disk(
 ) -> Option<String> {
     let runtime = LicenseRuntime::bootstrap(home_dir.to_path_buf(), production_registry()).await;
     let snapshot = runtime.snapshot().await;
-    let edition = duduclaw_core::EditionProfile::resolve_from_env(
-        None,
-        Some(snapshot.tier.as_toml_key()),
-    );
+    let edition =
+        duduclaw_core::EditionProfile::resolve_from_env(None, Some(snapshot.tier.as_toml_key()));
 
     if edition.is_personal() {
         let cap = duduclaw_core::EditionProfile::personal_max_agents();
@@ -987,8 +999,7 @@ impl LicenseRuntime {
                     grace,
                 )?;
 
-                save_default(&new_license)
-                    .map_err(|e| PhoneHomeError::Save(e.to_string()))?;
+                save_default(&new_license).map_err(|e| PhoneHomeError::Save(e.to_string()))?;
                 {
                     let mut inner = self.state.write().await;
                     inner.license = Some(new_license);
@@ -1097,14 +1108,12 @@ fn accept_refreshed_license(
     phone_home_days: i64,
     grace_days: i64,
 ) -> Result<(), PhoneHomeError> {
-    registry.verify(new_license).map_err(|e| {
-        PhoneHomeError::Rejected(format!("invalid signature: {e}"))
-    })?;
+    registry
+        .verify(new_license)
+        .map_err(|e| PhoneHomeError::Rejected(format!("invalid signature: {e}")))?;
     new_license
         .validate(current_fp, phone_home_days, grace_days)
-        .map_err(|e| {
-            PhoneHomeError::Rejected(format!("expiry/fingerprint/grace: {e}"))
-        })
+        .map_err(|e| PhoneHomeError::Rejected(format!("expiry/fingerprint/grace: {e}")))
 }
 
 // ── CRL loop ──────────────────────────────────────────────────
@@ -1141,10 +1150,7 @@ impl LicenseRuntime {
             }
         };
 
-        let endpoint = format!(
-            "{}/v1/license/crl",
-            self.control_url.trim_end_matches('/')
-        );
+        let endpoint = format!("{}/v1/license/crl", self.control_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(PHONE_HOME_TIMEOUT)
             .build()
@@ -1159,9 +1165,7 @@ impl LicenseRuntime {
             .map_err(|e| PhoneHomeError::Parse(e.to_string()))?;
 
         if let Err(e) = crl.verify(&self.registry) {
-            return Err(PhoneHomeError::Parse(format!(
-                "CRL signature invalid: {e}"
-            )));
+            return Err(PhoneHomeError::Parse(format!("CRL signature invalid: {e}")));
         }
 
         // HS13/D5: a valid signature is not enough — a signed-but-old CRL can be
@@ -1181,9 +1185,7 @@ impl LicenseRuntime {
 
         {
             let inner = self.state.read().await;
-            if let Err(reason) =
-                check_crl_monotonic(crl.generated_at, inner.last_seen_crl_at)
-            {
+            if let Err(reason) = check_crl_monotonic(crl.generated_at, inner.last_seen_crl_at) {
                 return Err(PhoneHomeError::Parse(reason));
             }
         }
@@ -1207,7 +1209,10 @@ impl LicenseRuntime {
             warn!(subscription_id = %subscription_id, "CRL lists our subscription as revoked — downgrading to OpenSource");
             self.downgrade_to_opensource("crl_revoked").await;
         } else {
-            debug!(revoked_count = crl.revoked.len(), "CRL fetched; subscription not revoked");
+            debug!(
+                revoked_count = crl.revoked.len(),
+                "CRL fetched; subscription not revoked"
+            );
         }
         Ok(())
     }
@@ -1382,14 +1387,8 @@ mod tests {
     #[test]
     fn registry_parses_two_keys() {
         let r = build_registry_from_pairs(&[
-            (
-                "DUDUCLAW_LICENSE_PUBKEY_V1",
-                "00".repeat(32).as_str(),
-            ),
-            (
-                "DUDUCLAW_LICENSE_PUBKEY_V2",
-                "ff".repeat(32).as_str(),
-            ),
+            ("DUDUCLAW_LICENSE_PUBKEY_V1", "00".repeat(32).as_str()),
+            ("DUDUCLAW_LICENSE_PUBKEY_V2", "ff".repeat(32).as_str()),
             ("UNRELATED_VAR", "foo"),
         ]);
         assert!(r.get("v1").is_some());
@@ -1403,10 +1402,7 @@ mod tests {
             ("DUDUCLAW_LICENSE_PUBKEY_BAD_HEX", "not-hex"),
             ("DUDUCLAW_LICENSE_PUBKEY_WRONG_LEN", "deadbeef"),
             ("DUDUCLAW_LICENSE_PUBKEY_", "00".repeat(32).as_str()),
-            (
-                "DUDUCLAW_LICENSE_PUBKEY_OK",
-                "11".repeat(32).as_str(),
-            ),
+            ("DUDUCLAW_LICENSE_PUBKEY_OK", "11".repeat(32).as_str()),
         ]);
         assert!(r.get("bad_hex").is_none());
         assert!(r.get("wrong_len").is_none());
@@ -1472,10 +1468,8 @@ mod tests {
     fn gen_issuer_keypair() -> (ring::signature::Ed25519KeyPair, Vec<u8>) {
         use ring::signature::KeyPair as _;
         let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
-            .expect("generate pkcs8");
-        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
-            .expect("from pkcs8");
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).expect("generate pkcs8");
+        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("from pkcs8");
         let pubkey = kp.public_key().as_ref().to_vec();
         (kp, pubkey)
     }
@@ -1504,7 +1498,10 @@ mod tests {
         sign_license(&mut lic, &kp);
 
         let res = accept_refreshed_license(&registry, &lic, &fp, 7, 14);
-        assert!(res.is_ok(), "valid signed+current license must be accepted: {res:?}");
+        assert!(
+            res.is_ok(),
+            "valid signed+current license must be accepted: {res:?}"
+        );
     }
 
     #[test]
@@ -1539,7 +1536,10 @@ mod tests {
         sign_license(&mut lic, &kp);
 
         let res = accept_refreshed_license(&registry, &lic, &current_fp, 7, 14);
-        assert!(res.is_err(), "license bound to another machine must be rejected");
+        assert!(
+            res.is_err(),
+            "license bound to another machine must be rejected"
+        );
     }
 
     #[test]
@@ -1554,7 +1554,10 @@ mod tests {
         sign_license(&mut lic, &kp);
 
         let res = accept_refreshed_license(&registry, &lic, &fp, 7, 14);
-        assert!(res.is_err(), "license signed by an untrusted key must be rejected");
+        assert!(
+            res.is_err(),
+            "license signed by an untrusted key must be rejected"
+        );
     }
 
     #[test]
@@ -1647,8 +1650,7 @@ mod tests {
         if PROD_ISSUER_PUBKEY_HEX.is_empty() {
             return; // v2 pending — env-only, fail-safe.
         }
-        let bytes = hex::decode(PROD_ISSUER_PUBKEY_HEX)
-            .expect("baked pubkey must be valid hex");
+        let bytes = hex::decode(PROD_ISSUER_PUBKEY_HEX).expect("baked pubkey must be valid hex");
         assert_eq!(bytes.len(), 32, "Ed25519 public key must be 32 bytes");
     }
 

@@ -1,38 +1,24 @@
-//! Cross-platform PTY-pool runtime for orchestrating CLI-based AI agents.
+//! Cross-platform PTY invocation for CLI-based AI agents.
 //!
-//! Design lineage:
-//! - [`dorkitude/maude`](https://github.com/dorkitude/maude) — tmux-backed long-lived Claude TUI
-//!   sessions (Unix only).
-//! - [`runtorque/torque`](https://github.com/runtorque/torque) — PTY supervisor over Unix Domain
-//!   Sockets (Unix only).
+//! Spawns a CLI (`claude`, `codex`, …) under a real pseudo-terminal so it sees
+//! a TTY on every platform, via [`portable-pty`] (ConPTY on Windows 10 1809+,
+//! openpty on Unix), then drains its stdout to EOF.
 //!
-//! This crate reimplements the same idea (long-lived CLI sessions reused across many
-//! requests) on top of [`portable-pty`], which abstracts the OS PTY layer (ConPTY on
-//! Windows 10 1809+, openpty on Unix). Response framing uses an in-band sentinel
-//! protocol — no scrollback scraping, no sidecar.
-//!
-//! See `commercial/docs/TODO-cli-pty-pool-worker.md` for the full design rationale.
+//! History: this crate used to also host a long-lived **PTY session pool**
+//! (sentinel-framed interactive REPL sessions, an eviction policy, a restart
+//! supervisor, and an out-of-process worker). That was built as standby for
+//! Anthropic's 2026-06-15 programmatic-usage split, which was paused on the
+//! day and never re-activated; the pool also shared one REPL across an agent's
+//! conversations, which leaked context between them. It was removed in
+//! 2026-09 — see `docs/features/27-pty-pool-runtime.md`. What remains is the
+//! one-shot invocation the gateway actually uses.
 
-pub mod envelope;
+pub mod ansi;
 pub mod error;
 pub mod oneshot;
-pub mod platform;
-pub mod progress;
 pub mod pty;
-pub mod session;
 
-// Phase 2+ surfaces (stubs added later)
-pub mod pool;
-pub mod supervisor;
-
-pub use envelope::{
-    Envelope, Frame, INTERACTIVE_SENTINEL, REQ_END, REQ_START, RSP_END, RSP_START, ResponseFormat,
-    extract_payload_with_chrome_filter, frame_request, parse_frame, strip_ansi,
-};
-pub use error::{PoolError, PtyError, RuntimeError, SessionError};
+pub use ansi::strip_ansi;
+pub use error::{PtyError, RuntimeError};
 pub use oneshot::{OneshotInvocation, OneshotOutput, oneshot_pty_invoke};
-pub use pool::{AgentKey, PoolConfig, PooledSession, PtyPool};
-pub use progress::ProgressSignature;
 pub use pty::{PtyCommand, PtyHandle, PtySystemKind, spawn_pty};
-pub use session::{CliKind, InvokeTimeout, PtySession, SpawnOpts};
-pub use supervisor::{RestartPolicy, Supervisor};

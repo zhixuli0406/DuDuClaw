@@ -47,7 +47,7 @@ use std::sync::Arc;
 use futures_util::stream::{BoxStream, StreamExt};
 
 use crate::error::LlmError;
-use crate::provider::{split_model_id, ChatProvider};
+use crate::provider::{ChatProvider, split_model_id};
 use crate::registry::ModelRegistry;
 use crate::types::{
     ChatMessage, ChatRequest, ChatResponse, ContentPart, NormalizedUsage, StreamEvent, SystemBlock,

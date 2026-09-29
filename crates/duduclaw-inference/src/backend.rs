@@ -7,7 +7,7 @@ use crate::types::{GenerationParams, InferenceRequest, InferenceResponse, ModelI
 
 /// Unified interface for all inference backends.
 ///
-/// Implementations: LlamaCppBackend, OpenAiCompatBackend, (future) MistralRsBackend
+/// Implementation: `OpenAiCompatBackend` (llama-server / Ollama / vLLM / …).
 #[async_trait]
 pub trait InferenceBackend: Send + Sync {
     /// Human-readable backend name (e.g., "llama.cpp (Metal)")

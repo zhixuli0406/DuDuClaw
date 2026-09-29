@@ -103,7 +103,13 @@ pub struct TransitionOutcome {
 /// `TaskStateKey::canonical()`'s string form.
 fn sha8(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect::<String>().chars().take(8).collect()
+    digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        .chars()
+        .take(8)
+        .collect()
 }
 
 /// WP-B2 gate: `fidelity == None` rounds are never written as transition
@@ -294,7 +300,11 @@ pub async fn read_transitions_for_state(
     // Over-fetch a bit before filtering by state_key client-side, since the
     // source_event alone spans every state_key for this agent.
     let raw = engine
-        .list_valid_by_source_event(agent_id, TRANSITION_SOURCE_EVENT, limit.saturating_mul(4).max(limit))
+        .list_valid_by_source_event(
+            agent_id,
+            TRANSITION_SOURCE_EVENT,
+            limit.saturating_mul(4).max(limit),
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -309,7 +319,10 @@ pub async fn read_transitions_for_state(
         if meta.state_key != state_key {
             continue;
         }
-        out.push(TransitionSample { memory_id: entry.id, meta });
+        out.push(TransitionSample {
+            memory_id: entry.id,
+            meta,
+        });
         if out.len() >= limit {
             break;
         }
@@ -320,15 +333,19 @@ pub async fn read_transitions_for_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prediction::task_forward::{
-        ArtifactShape, ExpectedOutcome, ObservationFidelity, ObservedOutcome, PredictionSource,
-        RoundPhase, TaskObservation, TaskPrediction, TaskStateKey, GoalKind,
-    };
     use crate::prediction::metacognition::AdaptiveThresholds;
+    use crate::prediction::task_forward::{
+        ArtifactShape, ExpectedOutcome, GoalKind, ObservationFidelity, ObservedOutcome,
+        PredictionSource, RoundPhase, TaskObservation, TaskPrediction, TaskStateKey,
+    };
     use crate::prediction::tool_class::ToolClass;
     use std::collections::BTreeSet;
 
-    fn sample_error(task_id: &str, round: u32, fidelity: ObservationFidelity) -> TaskPredictionError {
+    fn sample_error(
+        task_id: &str,
+        round: u32,
+        fidelity: ObservationFidelity,
+    ) -> TaskPredictionError {
         let state_key = TaskStateKey {
             agent_id: "agnes".to_string(),
             goal_kind: GoalKind::CodingSimple,
@@ -362,7 +379,11 @@ mod tests {
             window: ("2026-08-06T00:00:00Z".into(), "2026-08-06T00:10:00Z".into()),
             runtime: "claude".into(),
         };
-        match crate::prediction::task_forward::diff(prediction, observation, &AdaptiveThresholds::default()) {
+        match crate::prediction::task_forward::diff(
+            prediction,
+            observation,
+            &AdaptiveThresholds::default(),
+        ) {
             crate::prediction::task_forward::DiffOutcome::Computed(e) => e,
             crate::prediction::task_forward::DiffOutcome::Unobservable { .. } => {
                 panic!("test fixture must be observable")
@@ -372,8 +393,16 @@ mod tests {
 
     #[test]
     fn should_write_transition_rejects_none_fidelity_only() {
-        assert!(should_write_transition(&sample_error("t1", 1, ObservationFidelity::Full)));
-        assert!(should_write_transition(&sample_error("t1", 1, ObservationFidelity::McpOnly)));
+        assert!(should_write_transition(&sample_error(
+            "t1",
+            1,
+            ObservationFidelity::Full
+        )));
+        assert!(should_write_transition(&sample_error(
+            "t1",
+            1,
+            ObservationFidelity::McpOnly
+        )));
         // Building a None-fidelity TaskPredictionError isn't possible via
         // `diff()` (it returns `Unobservable` instead) — should_write_transition's
         // None branch exists defensively for any future direct constructor;
@@ -384,7 +413,10 @@ mod tests {
     fn build_transition_write_leaves_subject_predicate_object_none() {
         let error = sample_error("t1", 1, ObservationFidelity::McpOnly);
         let (_, meta) = build_transition_write("agnes", &error, None, false).unwrap();
-        assert!(meta.subject.is_none(), "subject must stay None — see module docs trap warning");
+        assert!(
+            meta.subject.is_none(),
+            "subject must stay None — see module docs trap warning"
+        );
         assert!(meta.predicate.is_none());
         assert!(meta.object.is_none());
     }
@@ -396,7 +428,13 @@ mod tests {
             build_transition_write("agnes", &error, Some("looked fine"), false).unwrap();
         assert!(entry.content.chars().count() <= CONTENT_CHAR_CAP);
         let transition: TransitionMeta = serde_json::from_value(
-            temporal_meta.metadata.as_ref().unwrap().get("transition").unwrap().clone(),
+            temporal_meta
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("transition")
+                .unwrap()
+                .clone(),
         )
         .unwrap();
         assert_eq!(transition.fidelity, "mcp_only");
@@ -411,7 +449,13 @@ mod tests {
         let error = sample_error("t1", 1, ObservationFidelity::McpOnly);
         let (_, temporal_meta) = build_transition_write("agnes", &error, None, false).unwrap();
         let transition: TransitionMeta = serde_json::from_value(
-            temporal_meta.metadata.as_ref().unwrap().get("transition").unwrap().clone(),
+            temporal_meta
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("transition")
+                .unwrap()
+                .clone(),
         )
         .unwrap();
         assert!(transition.outcome.confidence.is_none());
@@ -423,13 +467,24 @@ mod tests {
         let error = sample_error("t1", 1, ObservationFidelity::Full);
         let (_, temporal_meta) = build_transition_write("agnes", &error, None, true).unwrap();
         let transition: TransitionMeta = serde_json::from_value(
-            temporal_meta.metadata.as_ref().unwrap().get("transition").unwrap().clone(),
+            temporal_meta
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("transition")
+                .unwrap()
+                .clone(),
         )
         .unwrap();
-        assert_eq!(transition.outcome.confidence, Some(error.prediction.confidence));
+        assert_eq!(
+            transition.outcome.confidence,
+            Some(error.prediction.confidence)
+        );
         assert_eq!(
             transition.outcome.calibration_score,
-            Some(crate::prediction::task_forward::calibration_brier_score(&error))
+            Some(crate::prediction::task_forward::calibration_brier_score(
+                &error
+            ))
         );
     }
 
@@ -470,8 +525,12 @@ mod tests {
             "fixture sanity: both samples must share a state_key for this regression to be meaningful"
         );
 
-        let id1 = write_transition(&engine, "agnes", &error1, None, false).await.unwrap();
-        let id2 = write_transition(&engine, "agnes", &error2, None, false).await.unwrap();
+        let id1 = write_transition(&engine, "agnes", &error1, None, false)
+            .await
+            .unwrap();
+        let id2 = write_transition(&engine, "agnes", &error2, None, false)
+            .await
+            .unwrap();
         assert!(id1.is_some());
         assert!(id2.is_some());
         assert_ne!(id1, id2);
@@ -510,11 +569,15 @@ mod tests {
         let engine = SqliteMemoryEngine::new(&db_path).unwrap();
 
         let error_a = sample_error("task-a", 1, ObservationFidelity::McpOnly);
-        write_transition(&engine, "agnes", &error_a, None, false).await.unwrap();
+        write_transition(&engine, "agnes", &error_a, None, false)
+            .await
+            .unwrap();
 
         // A different agent's transitions must not leak in.
         let error_b = sample_error("task-b", 1, ObservationFidelity::McpOnly);
-        write_transition(&engine, "other-agent", &error_b, None, false).await.unwrap();
+        write_transition(&engine, "other-agent", &error_b, None, false)
+            .await
+            .unwrap();
 
         let state_key = error_a.prediction.state_key.canonical();
         let samples = read_transitions_for_state(&engine, "agnes", &state_key, 10)

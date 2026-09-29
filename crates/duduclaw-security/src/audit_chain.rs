@@ -89,7 +89,7 @@ pub fn genesis_hash() -> String {
 }
 
 /// SHA-256 hex digest of `data`, lower-case — same convention as
-/// `soul_guard::sha256_hex` / `template_sanitizer`'s local helpers (`ring`,
+/// `soul_guard::sha256_hex`'s local helper (`ring`,
 /// not `sha2`+`hex`, so this module adds zero new dependencies).
 fn sha256_hex(data: &[u8]) -> String {
     let d = digest::digest(&digest::SHA256, data);

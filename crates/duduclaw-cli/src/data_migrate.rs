@@ -90,7 +90,11 @@ fn cmd_pending(migrations_dir: &std::path::Path, marker_dir: &std::path::Path, j
     } else {
         println!("{} pending /data migration(s):", pending.len());
         for script in &pending {
-            println!("  {}  ({})", script.name, format_timestamp(script.timestamp));
+            println!(
+                "  {}  ({})",
+                script.name,
+                format_timestamp(script.timestamp)
+            );
         }
         println!("\nRun `duduclaw data-migrate --run` to apply them.");
     }
@@ -170,10 +174,7 @@ fn report_human(report: &RunReport) {
         println!("applied {} ({} ms)", record.name, record.duration_ms);
     }
     if let Some(failure) = &report.failure {
-        eprintln!(
-            "FAILED {} (exit {:?})",
-            failure.script, failure.exit_code
-        );
+        eprintln!("FAILED {} (exit {:?})", failure.script, failure.exit_code);
         eprintln!("--- output tail ---");
         eprintln!("{}", failure.output_tail);
         eprintln!("-------------------");

@@ -14,12 +14,12 @@
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::error::{classify_http, classify_transport, snippet, LlmError};
+use crate::error::{LlmError, classify_http, classify_transport, snippet};
 use crate::http::{http_client, retry_after_of};
-use crate::provider::{split_model_id, ApiAuth, ChatProvider};
-use crate::sse::{drive_sse, sse_data, SseParser};
+use crate::provider::{ApiAuth, ChatProvider, split_model_id};
+use crate::sse::{SseParser, drive_sse, sse_data};
 use crate::types::{
     CacheHint, ChatRequest, ChatResponse, ContentPart, NormalizedUsage, ReasoningHint, Role,
     StopReason, StreamEvent, ToolChoice,
@@ -58,14 +58,21 @@ fn cache_control() -> Value {
 fn part_to_block(part: &ContentPart) -> Value {
     match part {
         ContentPart::Text(t) => json!({"type": "text", "text": t}),
-        ContentPart::Image { media_type, data_base64 } => json!({
+        ContentPart::Image {
+            media_type,
+            data_base64,
+        } => json!({
             "type": "image",
             "source": {"type": "base64", "media_type": media_type, "data": data_base64}
         }),
         ContentPart::ToolCall { id, name, args } => json!({
             "type": "tool_use", "id": id, "name": name, "input": args
         }),
-        ContentPart::ToolResult { call_id, content, is_error } => json!({
+        ContentPart::ToolResult {
+            call_id,
+            content,
+            is_error,
+        } => json!({
             "type": "tool_result", "tool_use_id": call_id, "content": content, "is_error": is_error
         }),
         // Thinking replay: the signature must round-trip verbatim for
@@ -159,6 +166,14 @@ pub(crate) fn build_request_body(req: &ChatRequest, stream: bool) -> Value {
             body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
         }
     }
+    // P1/WP-3: native per-call effort. `output_config.effort` is GA on the
+    // Messages API (no beta header) and takes low|medium|high|xhigh|max —
+    // verified against the bundled `claude-api` skill reference, 2026-09-24.
+    // Note it sits INSIDE `output_config`, not at the top level. `None` ⇒ this
+    // key is absent and the body is byte-identical to before.
+    if let Some(effort) = req.reasoning_effort.as_deref() {
+        body["output_config"]["effort"] = json!(effort);
+    }
     if let Some(schema) = &req.response_format {
         // Structured outputs (output_format, GA on the Messages API).
         body["output_format"] = json!({"type": "json_schema", "schema": schema});
@@ -203,17 +218,35 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
     for block in content {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
-                let text = block.get("text").and_then(Value::as_str).unwrap_or_default();
+                let text = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 parts.push(ContentPart::Text(text.to_string()));
             }
             Some("tool_use") => parts.push(ContentPart::ToolCall {
-                id: block.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
-                name: block.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                id: block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                name: block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
                 args: block.get("input").cloned().unwrap_or(Value::Null),
             }),
             Some("thinking") => parts.push(ContentPart::Reasoning {
-                text: block.get("thinking").and_then(Value::as_str).unwrap_or_default().to_string(),
-                signature: block.get("signature").and_then(Value::as_str).map(String::from),
+                text: block
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                signature: block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .map(String::from),
             }),
             // redacted_thinking and unknown block types are skipped.
             _ => {}
@@ -224,7 +257,11 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
         parts,
         stop: parse_stop_reason(body.get("stop_reason").and_then(Value::as_str)),
         usage: body.get("usage").map(parse_usage).unwrap_or_default(),
-        model_used: body.get("model").and_then(Value::as_str).unwrap_or_default().to_string(),
+        model_used: body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         provider: "anthropic".to_string(),
     })
 }
@@ -263,20 +300,30 @@ impl AnthropicSse {
                 let block = ev.get("content_block").cloned().unwrap_or(Value::Null);
                 match block.get("type").and_then(Value::as_str) {
                     Some("tool_use") => {
-                        let id = block.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-                        let name = block.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                        let id = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let name = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
                         self.parts.push(ContentPart::ToolCall {
                             id: id.clone(),
                             name: name.clone(),
                             args: Value::Null,
                         });
-                        self.tool_args_buf.insert(index, (self.parts.len() - 1, String::new()));
+                        self.tool_args_buf
+                            .insert(index, (self.parts.len() - 1, String::new()));
                         out.push(StreamEvent::ToolCallStart { index, id, name });
                     }
                     Some("text") => self.parts.push(ContentPart::Text(String::new())),
-                    Some("thinking") => {
-                        self.parts.push(ContentPart::Reasoning { text: String::new(), signature: None })
-                    }
+                    Some("thinking") => self.parts.push(ContentPart::Reasoning {
+                        text: String::new(),
+                        signature: None,
+                    }),
                     _ => {}
                 }
             }
@@ -285,29 +332,46 @@ impl AnthropicSse {
                 let delta = ev.get("delta").cloned().unwrap_or(Value::Null);
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => {
-                        let t = delta.get("text").and_then(Value::as_str).unwrap_or_default();
+                        let t = delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         if let Some(ContentPart::Text(buf)) = self.parts.last_mut() {
                             buf.push_str(t);
                         }
                         out.push(StreamEvent::TextDelta(t.to_string()));
                     }
                     Some("thinking_delta") => {
-                        let t = delta.get("thinking").and_then(Value::as_str).unwrap_or_default();
+                        let t = delta
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         if let Some(ContentPart::Reasoning { text, .. }) = self.parts.last_mut() {
                             text.push_str(t);
                         }
                         out.push(StreamEvent::ReasoningDelta(t.to_string()));
                     }
                     Some("input_json_delta") => {
-                        let frag = delta.get("partial_json").and_then(Value::as_str).unwrap_or_default();
+                        let frag = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         if let Some((_, buf)) = self.tool_args_buf.get_mut(&index) {
                             buf.push_str(frag);
                         }
-                        out.push(StreamEvent::ToolCallDelta { index, args_fragment: frag.to_string() });
+                        out.push(StreamEvent::ToolCallDelta {
+                            index,
+                            args_fragment: frag.to_string(),
+                        });
                     }
                     Some("signature_delta") => {
-                        let sig = delta.get("signature").and_then(Value::as_str).unwrap_or_default();
-                        if let Some(ContentPart::Reasoning { signature, .. }) = self.parts.last_mut() {
+                        let sig = delta
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if let Some(ContentPart::Reasoning { signature, .. }) =
+                            self.parts.last_mut()
+                        {
                             match signature {
                                 Some(s) => s.push_str(sig),
                                 None => *signature = Some(sig.to_string()),
@@ -321,8 +385,13 @@ impl AnthropicSse {
                 let index = ev.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                 if let Some((part_idx, buf)) = self.tool_args_buf.remove(&index) {
                     if let Some(ContentPart::ToolCall { args, .. }) = self.parts.get_mut(part_idx) {
-                        *args = serde_json::from_str(&buf)
-                            .unwrap_or_else(|_| if buf.is_empty() { json!({}) } else { Value::String(buf) });
+                        *args = serde_json::from_str(&buf).unwrap_or_else(|_| {
+                            if buf.is_empty() {
+                                json!({})
+                            } else {
+                                Value::String(buf)
+                            }
+                        });
                     }
                 }
             }
@@ -339,8 +408,14 @@ impl AnthropicSse {
             }
             Some("message_stop") => self.finished = true,
             Some("error") => {
-                let msg = ev.pointer("/error/message").and_then(Value::as_str).unwrap_or("stream error");
-                self.error = Some(LlmError::Http { status: 0, body_snippet: snippet(msg) });
+                let msg = ev
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stream error");
+                self.error = Some(LlmError::Http {
+                    status: 0,
+                    body_snippet: snippet(msg),
+                });
                 self.finished = true;
             }
             _ => {}
@@ -449,6 +524,22 @@ mod tests {
     }
 
     #[test]
+    fn build_reasoning_effort_maps_to_output_config_and_is_absent_when_none() {
+        // None ⇒ key absent (byte-identical to the pre-effort body).
+        let plain = build_request_body(&ChatRequest::new("claude-opus-5"), false);
+        assert!(plain.get("output_config").is_none(), "{plain}");
+
+        let mut req = ChatRequest::new("claude-opus-5");
+        req.reasoning_effort = Some("xhigh".to_string());
+        let body = build_request_body(&req, false);
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        // Effort must NOT leak to the top level — it lives inside output_config.
+        assert!(body.get("effort").is_none(), "{body}");
+        // And it must not disturb the rest of the body.
+        assert_eq!(body["model"], "claude-opus-5");
+    }
+
+    #[test]
     fn build_strips_provider_prefix_and_sets_max_tokens() {
         let body = build_request_body(&ChatRequest::new("anthropic/claude-sonnet-5"), false);
         assert_eq!(body["model"], "claude-sonnet-5");
@@ -464,7 +555,10 @@ mod tests {
         let mut req = ChatRequest::new("anthropic/claude-sonnet-5");
         req.system = vec![
             SystemBlock::cached("soul"),
-            SystemBlock { text: "auto".into(), cache: CacheHint::Auto },
+            SystemBlock {
+                text: "auto".into(),
+                cache: CacheHint::Auto,
+            },
             SystemBlock::cached("wiki"),
             SystemBlock::cached("skills"),
             SystemBlock::cached("extra-beyond-budget"),
@@ -473,7 +567,10 @@ mod tests {
         let body = build_request_body(&req, false);
         let system = body["system"].as_array().unwrap();
         assert_eq!(system.len(), 6);
-        let has_cc: Vec<bool> = system.iter().map(|b| b.get("cache_control").is_some()).collect();
+        let has_cc: Vec<bool> = system
+            .iter()
+            .map(|b| b.get("cache_control").is_some())
+            .collect();
         // Explicit #1, #3, #4 get breakpoints; Auto ignored; 4th Explicit
         // exceeds MAX_SYSTEM_CACHE_BREAKPOINTS; uncached suffix stays uncached.
         assert_eq!(has_cc, vec![true, false, true, true, false, false]);
@@ -488,7 +585,11 @@ mod tests {
             .iter()
             .enumerate()
             .filter(|(_, m)| {
-                m["content"].as_array().unwrap().iter().any(|b| b.get("cache_control").is_some())
+                m["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|b| b.get("cache_control").is_some())
             })
             .map(|(i, _)| i)
             .collect();
@@ -517,13 +618,19 @@ mod tests {
             role: Role::User,
             parts: vec![
                 ContentPart::Text("what is this?".into()),
-                ContentPart::Image { media_type: "image/png".into(), data_base64: "aGk=".into() },
+                ContentPart::Image {
+                    media_type: "image/png".into(),
+                    data_base64: "aGk=".into(),
+                },
             ],
         });
         let body = build_request_body(&req, false);
         assert_eq!(body["tools"][0]["name"], "search");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
-        assert_eq!(body["tool_choice"], json!({"type": "tool", "name": "search"}));
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "tool", "name": "search"})
+        );
         let blocks = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(blocks[1]["type"], "image");
         assert_eq!(blocks[1]["source"]["media_type"], "image/png");
@@ -533,13 +640,26 @@ mod tests {
     #[test]
     fn build_tool_choice_variants() {
         let mut req = ChatRequest::new("anthropic/m");
-        req.tools.push(ToolDef { name: "t".into(), description: String::new(), input_schema: json!({}) });
+        req.tools.push(ToolDef {
+            name: "t".into(),
+            description: String::new(),
+            input_schema: json!({}),
+        });
         req.tool_choice = ToolChoice::Required;
-        assert_eq!(build_request_body(&req, false)["tool_choice"], json!({"type": "any"}));
+        assert_eq!(
+            build_request_body(&req, false)["tool_choice"],
+            json!({"type": "any"})
+        );
         req.tool_choice = ToolChoice::None;
-        assert_eq!(build_request_body(&req, false)["tool_choice"], json!({"type": "none"}));
+        assert_eq!(
+            build_request_body(&req, false)["tool_choice"],
+            json!({"type": "none"})
+        );
         req.tool_choice = ToolChoice::Auto;
-        assert_eq!(build_request_body(&req, false)["tool_choice"], json!({"type": "auto"}));
+        assert_eq!(
+            build_request_body(&req, false)["tool_choice"],
+            json!({"type": "auto"})
+        );
     }
 
     #[test]
@@ -549,13 +669,24 @@ mod tests {
         req.messages.push(ChatMessage {
             role: Role::Assistant,
             parts: vec![
-                ContentPart::Reasoning { text: "let me think".into(), signature: Some("sig123".into()) },
-                ContentPart::ToolCall { id: "tu_1".into(), name: "run".into(), args: json!({"x": 1}) },
+                ContentPart::Reasoning {
+                    text: "let me think".into(),
+                    signature: Some("sig123".into()),
+                },
+                ContentPart::ToolCall {
+                    id: "tu_1".into(),
+                    name: "run".into(),
+                    args: json!({"x": 1}),
+                },
             ],
         });
         req.messages.push(ChatMessage {
             role: Role::User,
-            parts: vec![ContentPart::ToolResult { call_id: "tu_1".into(), content: "done".into(), is_error: false }],
+            parts: vec![ContentPart::ToolResult {
+                call_id: "tu_1".into(),
+                content: "done".into(),
+                is_error: false,
+            }],
         });
         let body = build_request_body(&req, false);
         let asst = body["messages"][1]["content"].as_array().unwrap();
@@ -576,7 +707,10 @@ mod tests {
         req.reasoning = ReasoningHint::Medium;
         req.response_format = Some(json!({"type": "object"}));
         let body = build_request_body(&req, false);
-        assert_eq!(body["thinking"], json!({"type": "enabled", "budget_tokens": 8192}));
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 8192})
+        );
         assert_eq!(body["output_format"]["type"], "json_schema");
         // Off → field absent.
         let body = build_request_body(&ChatRequest::new("anthropic/m"), false);
@@ -626,7 +760,10 @@ mod tests {
 
     #[test]
     fn parse_missing_content_is_parse_error() {
-        assert!(matches!(parse_response(&json!({"id": "x"})), Err(LlmError::Parse(_))));
+        assert!(matches!(
+            parse_response(&json!({"id": "x"})),
+            Err(LlmError::Parse(_))
+        ));
     }
 
     #[test]
@@ -653,11 +790,17 @@ mod tests {
         // Delta events observed in order.
         assert_eq!(out[0], StreamEvent::TextDelta("Hel".into()));
         assert_eq!(out[1], StreamEvent::TextDelta("lo".into()));
-        assert!(matches!(&out[2], StreamEvent::ToolCallStart { id, name, .. } if id == "tu_9" && name == "calc"));
-        assert!(matches!(&out[3], StreamEvent::ToolCallDelta { args_fragment, .. } if args_fragment == "{\"a\":"));
+        assert!(
+            matches!(&out[2], StreamEvent::ToolCallStart { id, name, .. } if id == "tu_9" && name == "calc")
+        );
+        assert!(
+            matches!(&out[3], StreamEvent::ToolCallDelta { args_fragment, .. } if args_fragment == "{\"a\":")
+        );
 
         let done = p.finalize().expect("done");
-        let StreamEvent::Done(resp) = done else { panic!("expected Done") };
+        let StreamEvent::Done(resp) = done else {
+            panic!("expected Done")
+        };
         assert_eq!(resp.text(), "Hello");
         assert_eq!(resp.stop, StopReason::ToolUse);
         assert_eq!(resp.tool_calls()[0].2, &json!({"a": 1}));
@@ -680,7 +823,9 @@ mod tests {
             p.on_line(line, &mut out);
         }
         assert_eq!(out[0], StreamEvent::ReasoningDelta("step 1".into()));
-        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else {
+            panic!()
+        };
         assert!(matches!(&resp.parts[0],
             ContentPart::Reasoning { text, signature } if text == "step 1" && signature.as_deref() == Some("sigX")));
     }
@@ -689,7 +834,10 @@ mod tests {
     fn sse_error_event_surfaces_as_error() {
         let mut p = AnthropicSse::default();
         let mut out = Vec::new();
-        p.on_line(r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#, &mut out);
+        p.on_line(
+            r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            &mut out,
+        );
         assert!(p.finished());
         assert!(p.finalize().is_err());
     }

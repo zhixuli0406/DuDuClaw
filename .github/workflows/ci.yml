@@ -52,6 +52,32 @@ jobs:
         run: cargo build --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
       - name: Build gateway (no dashboard)
         run: cargo build -p duduclaw-gateway --no-default-features
+      # H7: `otel.rs` (883 LOC) sits behind a default-off cargo feature that no
+      # build in this repo had ever turned on, so its `gen_ai.*` span code could
+      # rot unnoticed. One cheap `cargo check` keeps it compiling. Deliberately
+      # `check`, not `test`: with no collector attached there is nothing to
+      # assert at runtime, and the failure mode being guarded is "it no longer
+      # compiles". `--no-default-features` matches the gateway build directly
+      # above so the two share a warm cache.
+      #
+      # Runs on every OS leg. Until 2026-09-29 the five optional otel
+      # dependencies sat under `[target.'cfg(target_os = "linux")'.dependencies]`, so
+      # `--features otel` could not compile on macOS or Windows at all (H7 in
+      # the feature audit moved them into the plain `[dependencies]` table;
+      # verified locally on aarch64-apple-darwin the same day).
+      - name: Check gateway with OpenTelemetry feature
+        run: cargo check -p duduclaw-gateway --no-default-features --features otel
+      # S16 (2026-09-29): the `duduclaw compat` family is OS-only — DuDuClaw
+      # OS's shell spawns `duduclaw compat windows-vm app`, no platform install
+      # does — so it moved behind the default-off `app-compat` feature and NO
+      # platform build compiles it. Unlike the otel check above this one
+      # TESTS, not just checks: the feature gates 48 unit tests (11 in
+      # duduclaw-core `compat_runners`, 37 in duduclaw-cli `compat_*`) that
+      # would otherwise never run anywhere but an OS bake.
+      - name: Test cli with app-compat feature (OS-only surface)
+        run: |
+          cargo test -p duduclaw-core --lib --features app-compat -- compat_runners
+          cargo test -p duduclaw-cli --lib --features app-compat -- compat
       - name: Test (no dashboard)
         run: cargo test --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
       - name: Test gateway

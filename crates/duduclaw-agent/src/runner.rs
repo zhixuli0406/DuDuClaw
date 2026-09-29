@@ -456,10 +456,10 @@ async fn call_claude_streaming(
         cmd.args(["--disallowedTools", &denied.join(",")]);
     }
 
-    // Signal bash-gate.sh to allow browser automation commands
-    if capabilities.browser_via_bash {
-        cmd.env("DUDUCLAW_BROWSER_VIA_BASH", "1");
-    }
+    // NOTE: `capabilities.browser_via_bash` injects no env flag. The
+    // `bash-gate.sh` allowlist that read `DUDUCLAW_BROWSER_VIA_BASH` was
+    // removed in `ba015a48`; the capability still gates tools through
+    // `disallowed_tools()` above.
 
     // System prompt via tempfile (avoids OS arg-length limits)
     let _prompt_guard = if !system_prompt.is_empty() {

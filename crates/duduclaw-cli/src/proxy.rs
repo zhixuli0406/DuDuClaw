@@ -28,15 +28,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 
-use duduclaw_agent::account_rotator::{create_from_config, AccountRotator, AuthMethod};
+use duduclaw_agent::account_rotator::{AccountRotator, AuthMethod, create_from_config};
 use duduclaw_llm::providers::build_provider;
 use duduclaw_llm::{
-    split_model_id, ApiAuth, ChatMessage, ChatRequest, ChatResponse, ContentPart, LlmError,
-    ModelRegistry, Role, StopReason, StreamEvent, SystemBlock,
+    ApiAuth, ChatMessage, ChatRequest, ChatResponse, ContentPart, LlmError, ModelRegistry, Role,
+    StopReason, StreamEvent, SystemBlock, split_model_id,
 };
 
 use crate::auth_device::{self, CopilotTokenCache};
@@ -72,12 +72,16 @@ fn extract_text_content(content: &Value) -> String {
 
 /// Whether the client asked for a streamed response.
 pub fn wants_stream(body: &Value) -> bool {
-    body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false)
+    body.get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// The `model` field, if present and non-empty.
 pub fn request_model(body: &Value) -> Option<&str> {
-    body.get("model").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+    body.get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
 }
 
 /// Convert an OpenAI chat-completions body into a normalized [`ChatRequest`],
@@ -188,7 +192,8 @@ pub fn chat_response_to_openai(
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
     }
-    let prompt = resp.usage.input_tokens + resp.usage.cache_read_tokens + resp.usage.cache_write_tokens;
+    let prompt =
+        resp.usage.input_tokens + resp.usage.cache_read_tokens + resp.usage.cache_write_tokens;
     let completion = resp.usage.output_tokens + resp.usage.reasoning_tokens;
     json!({
         "id": id,
@@ -224,12 +229,7 @@ pub fn stream_text_chunk(delta: &str, model_echo: &str, id: &str, created: i64) 
 }
 
 /// The terminal streaming chunk carrying any tool calls + the finish reason.
-pub fn stream_finish_chunk(
-    resp: &ChatResponse,
-    model_echo: &str,
-    id: &str,
-    created: i64,
-) -> Value {
+pub fn stream_finish_chunk(resp: &ChatResponse, model_echo: &str, id: &str, created: i64) -> Value {
     let mut delta = json!({});
     let tool_calls = tool_calls_json(resp);
     if !tool_calls.is_empty() {
@@ -270,8 +270,13 @@ pub fn models_list_json(registry: &ModelRegistry, created: i64) -> Value {
 /// The compare is length-safe and constant-time (`subtle::ConstantTimeEq`),
 /// never short-circuiting on the first differing byte.
 pub fn check_proxy_auth(auth_header: Option<&str>, expected: &str) -> bool {
-    let Some(header) = auth_header else { return false };
-    let token = match header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")) {
+    let Some(header) = auth_header else {
+        return false;
+    };
+    let token = match header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+    {
         Some(t) => t.trim(),
         None => return false,
     };
@@ -349,22 +354,30 @@ async fn on_upstream_error(
     match err {
         LlmError::RateLimited { .. } => {
             rotator.on_rate_limited(account_id).await;
-            (StatusCode::TOO_MANY_REQUESTS, "上游供應商限流（rate limited），已冷卻此帳號".to_string())
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "上游供應商限流（rate limited），已冷卻此帳號".to_string(),
+            )
         }
         LlmError::Billing => {
             rotator.on_billing_exhausted(account_id).await;
-            (StatusCode::TOO_MANY_REQUESTS, "上游帳號額度用盡（billing），已標記 24h 冷卻".to_string())
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "上游帳號額度用盡（billing），已標記 24h 冷卻".to_string(),
+            )
         }
         LlmError::Auth => {
             rotator.on_error(account_id).await;
-            (StatusCode::BAD_GATEWAY, "上游驗證失敗（金鑰無效或過期）".to_string())
+            (
+                StatusCode::BAD_GATEWAY,
+                "上游驗證失敗（金鑰無效或過期）".to_string(),
+            )
         }
-        LlmError::ContextWindowExceeded => {
-            (StatusCode::BAD_REQUEST, "請求超出模型上下文視窗".to_string())
-        }
-        LlmError::InvalidRequest(m) => {
-            (StatusCode::BAD_REQUEST, format!("請求格式錯誤：{m}"))
-        }
+        LlmError::ContextWindowExceeded => (
+            StatusCode::BAD_REQUEST,
+            "請求超出模型上下文視窗".to_string(),
+        ),
+        LlmError::InvalidRequest(m) => (StatusCode::BAD_REQUEST, format!("請求格式錯誤：{m}")),
         other => {
             rotator.on_error(account_id).await;
             (StatusCode::BAD_GATEWAY, format!("上游轉發失敗：{other}"))
@@ -502,7 +515,11 @@ async fn completions_handler(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &format!(
                     "provider `{provider}` 座位缺少憑證（請先執行 `duduclaw auth device --provider {}`）",
-                    if provider == "github" { "copilot" } else { "qwen" }
+                    if provider == "github" {
+                        "copilot"
+                    } else {
+                        "qwen"
+                    }
                 ),
             );
         };
@@ -562,8 +579,9 @@ async fn completions_handler(
             let m = m1.clone();
             let id = id1.clone();
             let events: Vec<Result<Event, std::convert::Infallible>> = match item {
-                Ok(StreamEvent::TextDelta(t)) => vec![Ok(Event::default()
-                    .data(stream_text_chunk(&t, &m, &id, created).to_string()))],
+                Ok(StreamEvent::TextDelta(t)) => vec![Ok(
+                    Event::default().data(stream_text_chunk(&t, &m, &id, created).to_string())
+                )],
                 Ok(StreamEvent::Done(resp)) => {
                     let mut evs = Vec::new();
                     if buffered {
@@ -670,7 +688,11 @@ pub fn merge_refreshed_qwen_bundle(
         tok.get(field)
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .or_else(|| old.get(field).and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+            .or_else(|| {
+                old.get(field)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            })
             .unwrap_or("")
             .to_string()
     };
@@ -686,10 +708,23 @@ pub fn merge_refreshed_qwen_bundle(
     }))
 }
 
+/// Qwen Portal token endpoint + public client id, transcribed from
+/// QwenLM/qwen-code `packages/core/src/qwen/qwenOAuth2.ts`.
+///
+/// These used to live in `auth_device` next to a `--provider qwen` device
+/// flow. Qwen discontinued its free OAuth tier on 2026-04-15 and that login
+/// flow was removed in 2026-09, so **no new Qwen seat can be created**. The
+/// constants stay here because an install that logged in before then may
+/// still hold a stored seat, and its access token has to be refreshable for
+/// the proxy to keep forwarding. Refresh is likewise unverifiable against a
+/// live subscription.
+const QWEN_TOKEN_URL: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
+const QWEN_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
+
 /// POST the refresh-token grant to `token_url` and merge the response into a
 /// new seat bundle. One retry on any failure, then fail-closed (Err). The
 /// URL is a parameter so tests can point it at a local mock server; the
-/// production caller passes [`auth_device::QWEN`]'s `token_url` + client id.
+/// production caller passes [`QWEN_TOKEN_URL`] + [`QWEN_CLIENT_ID`].
 pub async fn refresh_qwen_bundle_at(
     http: &reqwest::Client,
     token_url: &str,
@@ -756,7 +791,10 @@ async fn persist_qwen_seat_credential(
                 if t.get("id").and_then(|v| v.as_str()) == Some(account_id) {
                     // Encrypted-only: never persist the plaintext credential.
                     t.remove("oauth_token");
-                    t.insert("oauth_token_enc".into(), toml::Value::String(encrypted.clone()));
+                    t.insert(
+                        "oauth_token_enc".into(),
+                        toml::Value::String(encrypted.clone()),
+                    );
                     found = true;
                 }
             }
@@ -766,8 +804,8 @@ async fn persist_qwen_seat_credential(
         return Err(format!("config.toml 中找不到帳號 `{account_id}`"));
     }
 
-    let serialized = toml::to_string_pretty(&table)
-        .map_err(|e| format!("config.toml 序列化失敗：{e}"))?;
+    let serialized =
+        toml::to_string_pretty(&table).map_err(|e| format!("config.toml 序列化失敗：{e}"))?;
     let tmp = config_path.with_extension("toml.tmp");
     tokio::fs::write(&tmp, serialized)
         .await
@@ -826,8 +864,8 @@ async fn forward_seat(
             if qwen_bundle_expired(&bundle, now_unix()) {
                 match refresh_qwen_bundle_at(
                     &st.http,
-                    auth_device::QWEN.token_url,
-                    auth_device::QWEN.default_client_id,
+                    QWEN_TOKEN_URL,
+                    QWEN_CLIENT_ID,
                     &bundle,
                 )
                 .await
@@ -848,7 +886,7 @@ async fn forward_seat(
                         return err_json(
                             StatusCode::SERVICE_UNAVAILABLE,
                             &format!(
-                                "Qwen seat token 已過期且刷新失敗：{e}。請重新登入：`duduclaw auth device --provider qwen`"
+                                "Qwen seat token 已過期且刷新失敗：{e}。Qwen 已於 2026-04-15 停止免費 OAuth，此座位無法重新登入。"
                             ),
                         );
                     }
@@ -912,8 +950,7 @@ async fn forward_seat(
     };
 
     let status = resp.status();
-    let axum_status =
-        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let axum_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
     if !status.is_success() {
         // Record the failure on the rotator; classify auth/limit for cooldown.
@@ -941,9 +978,7 @@ async fn forward_seat(
     } else {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
-            Err(e) => {
-                return err_json(StatusCode::BAD_GATEWAY, &format!("讀取座位回應失敗：{e}"))
-            }
+            Err(e) => return err_json(StatusCode::BAD_GATEWAY, &format!("讀取座位回應失敗：{e}")),
         };
         Response::builder()
             .status(axum_status)
@@ -1046,7 +1081,9 @@ pub async fn run(
         default_provider = %default_provider,
         "DuDuClaw 本地 proxy 啟動（OpenAI-compat endpoint）"
     );
-    println!("DuDuClaw proxy listening on http://{bind_addr}  (accounts={loaded}, default_provider={default_provider})");
+    println!(
+        "DuDuClaw proxy listening on http://{bind_addr}  (accounts={loaded}, default_provider={default_provider})"
+    );
     println!("  POST http://{bind_addr}/v1/chat/completions");
     println!("  GET  http://{bind_addr}/v1/models");
 
@@ -1139,7 +1176,11 @@ mod tests {
         let req = openai_to_chat_request(&body, "m").unwrap();
         assert_eq!(req.messages.len(), 2);
         match &req.messages[1].parts[0] {
-            ContentPart::ToolResult { call_id, content, is_error } => {
+            ContentPart::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
                 assert_eq!(call_id, "call_1");
                 assert_eq!(content, "42");
                 assert!(!is_error);
@@ -1199,7 +1240,10 @@ mod tests {
         let resp = sample_response();
         let fin = stream_finish_chunk(&resp, "gpt-4o", "id1", 1);
         assert_eq!(fin["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(fin["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "search");
+        assert_eq!(
+            fin["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "search"
+        );
     }
 
     #[test]
@@ -1286,12 +1330,12 @@ mod tests {
         // A live github seat → github-tagged models appear, qwen does not.
         let with_github = seat_models_json(&["github"], 1);
         assert!(!with_github.is_empty());
-        assert!(with_github
-            .iter()
-            .all(|m| m["id"].as_str().unwrap().starts_with("github/")));
-        assert!(with_github
-            .iter()
-            .all(|m| m["owned_by"] == "github"));
+        assert!(
+            with_github
+                .iter()
+                .all(|m| m["id"].as_str().unwrap().starts_with("github/"))
+        );
+        assert!(with_github.iter().all(|m| m["owned_by"] == "github"));
     }
 
     #[test]
@@ -1340,9 +1384,11 @@ mod tests {
         // …while a different client is blocked only by the global backstop
         // (already drained by the attacker's 60 accepted requests) — its
         // per-client bucket is untouched.
-        assert!(limiter
-            .check(&proxy_client_bucket_key(&friend.ip()), OpType::HttpRequest)
-            .is_ok());
+        assert!(
+            limiter
+                .check(&proxy_client_bucket_key(&friend.ip()), OpType::HttpRequest)
+                .is_ok()
+        );
         assert!(
             rate_limited(&limiter, &friend).is_some(),
             "global total-cap backstop still applies across clients"
@@ -1364,11 +1410,20 @@ mod tests {
     fn qwen_expiry_detection_with_skew_and_legacy_bundles() {
         let now = 1_000_000u64;
         // Fresh token (expires well past the skew window) → not expired.
-        assert!(!qwen_bundle_expired(&qwen_bundle("a", "r", Some(now + 3600)), now));
+        assert!(!qwen_bundle_expired(
+            &qwen_bundle("a", "r", Some(now + 3600)),
+            now
+        ));
         // Hard-expired → expired.
-        assert!(qwen_bundle_expired(&qwen_bundle("a", "r", Some(now - 1)), now));
+        assert!(qwen_bundle_expired(
+            &qwen_bundle("a", "r", Some(now - 1)),
+            now
+        ));
         // Inside the 60s skew window → refresh proactively.
-        assert!(qwen_bundle_expired(&qwen_bundle("a", "r", Some(now + 30)), now));
+        assert!(qwen_bundle_expired(
+            &qwen_bundle("a", "r", Some(now + 30)),
+            now
+        ));
         // Legacy bundle without expires_at → treated as valid (old behavior).
         assert!(!qwen_bundle_expired(&json!({"access_token":"a"}), now));
         assert!(!qwen_bundle_expired(&Value::Null, now));
@@ -1391,7 +1446,10 @@ mod tests {
         let nb = merge_refreshed_qwen_bundle(&old, &tok, 1000).unwrap();
         assert_eq!(nb["access_token"], "new-at");
         assert_eq!(nb["refresh_token"], "new-rt");
-        assert_eq!(nb["resource_url"], "portal.qwen.ai", "resource_url falls back to old");
+        assert_eq!(
+            nb["resource_url"], "portal.qwen.ai",
+            "resource_url falls back to old"
+        );
         assert_eq!(nb["expires_at"], 1600);
         // No refresh_token in response → keep the old one (no rotation).
         let tok2 = json!({ "access_token": "at2", "expires_in": 60 });
@@ -1444,10 +1502,16 @@ mod tests {
         .await;
         let http = reqwest::Client::new();
         let old = qwen_bundle("stale-at", "old-rt", Some(1));
-        let nb = refresh_qwen_bundle_at(&http, &url, "cid", &old).await.unwrap();
+        let nb = refresh_qwen_bundle_at(&http, &url, "cid", &old)
+            .await
+            .unwrap();
         assert_eq!(nb["access_token"], "fresh-at");
         assert_eq!(nb["refresh_token"], "fresh-rt");
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "no retry on success");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no retry on success"
+        );
     }
 
     #[tokio::test]
@@ -1459,8 +1523,13 @@ mod tests {
         .await;
         let http = reqwest::Client::new();
         let old = qwen_bundle("stale-at", "old-rt", Some(1));
-        let err = refresh_qwen_bundle_at(&http, &url, "cid", &old).await.unwrap_err();
-        assert!(err.contains("server_error"), "error carries upstream reason: {err}");
+        let err = refresh_qwen_bundle_at(&http, &url, "cid", &old)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("server_error"),
+            "error carries upstream reason: {err}"
+        );
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -1499,13 +1568,24 @@ oauth_token = "PLAINTEXT-LEGACY"
         let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
         let table: toml::Table = raw.parse().unwrap();
         let acc = table["accounts"].as_array().unwrap()[0].as_table().unwrap();
-        assert!(acc.contains_key("oauth_token_enc"), "rotated token stored encrypted");
-        assert!(!acc.contains_key("oauth_token"), "plaintext legacy copy removed");
-        assert!(!raw.contains("new"), "credential must not appear in plaintext");
+        assert!(
+            acc.contains_key("oauth_token_enc"),
+            "rotated token stored encrypted"
+        );
+        assert!(
+            !acc.contains_key("oauth_token"),
+            "plaintext legacy copy removed"
+        );
+        assert!(
+            !raw.contains("new"),
+            "credential must not appear in plaintext"
+        );
 
         // Unknown account id → explicit error (fail-closed, no silent no-op).
         assert!(
-            persist_qwen_seat_credential(home.path(), "nope", "{}").await.is_err()
+            persist_qwen_seat_credential(home.path(), "nope", "{}")
+                .await
+                .is_err()
         );
     }
 

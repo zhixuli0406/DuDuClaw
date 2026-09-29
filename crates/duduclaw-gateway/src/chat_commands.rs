@@ -188,9 +188,17 @@ fn strip_any_prefix<'a>(seg: &'a str, prefixes: &[&str]) -> Option<&'a str> {
 /// else ⇒ `None` (caller fails closed to usage).
 fn parse_duration_hours(v: &str) -> Option<f64> {
     let v = v.trim();
-    let (num, mult) = if let Some(n) = v.strip_suffix("小時").or_else(|| v.strip_suffix('h')).or_else(|| v.strip_suffix('H')) {
+    let (num, mult) = if let Some(n) = v
+        .strip_suffix("小時")
+        .or_else(|| v.strip_suffix('h'))
+        .or_else(|| v.strip_suffix('H'))
+    {
         (n, 1.0)
-    } else if let Some(n) = v.strip_suffix('天').or_else(|| v.strip_suffix('d')).or_else(|| v.strip_suffix('D')) {
+    } else if let Some(n) = v
+        .strip_suffix('天')
+        .or_else(|| v.strip_suffix('d'))
+        .or_else(|| v.strip_suffix('D'))
+    {
         (n, 24.0)
     } else {
         (v, 1.0)
@@ -364,9 +372,12 @@ pub fn parse_command(
             let tail = args.map(str::trim).unwrap_or("");
             let mut words = tail.split_whitespace();
             let off = match words.next() {
-                Some(w) if w.eq_ignore_ascii_case("off") => {
-                    Some(words.next().and_then(|n| n.parse::<u32>().ok()).unwrap_or(0))
-                }
+                Some(w) if w.eq_ignore_ascii_case("off") => Some(
+                    words
+                        .next()
+                        .and_then(|n| n.parse::<u32>().ok())
+                        .unwrap_or(0),
+                ),
                 _ => None,
             };
             Some(ChatCommand::Rules {
@@ -655,14 +666,18 @@ async fn handle_model(ctx: &ReplyContext, agent_id: &str, new_model: Option<&str
                         // The rescan is what makes the change take effect now;
                         // say so plainly when it did not land rather than
                         // reporting a success the next turn will contradict.
-                        Ok(true) => format!("✅ 已切換模型：`{current}` → `{name}`，下一則訊息就會生效。"),
+                        Ok(true) => {
+                            format!("✅ 已切換模型：`{current}` → `{name}`，下一則訊息就會生效。")
+                        }
                         Ok(false) => format!(
                             "⚠️ 已寫入設定（`{current}` → `{name}`），但熱重載失敗，要重啟 gateway 才會生效。"
                         ),
                         Err(e) => format!("⚠️ 切換失敗：{e}"),
                     }
                 }
-                None => format!("🤖 目前模型：`{current}`\n輸入 `/model <名稱>` 可切換（僅限管理員）。"),
+                None => {
+                    format!("🤖 目前模型：`{current}`\n輸入 `/model <名稱>` 可切換（僅限管理員）。")
+                }
             }
         }
         None => "⚠️ No agent found.".to_string(),
@@ -784,12 +799,14 @@ async fn handle_handoff(
 
 /// `/undo [N]` — tombstone the last N turn pairs (default 1, max 20).
 async fn handle_undo(ctx: &ReplyContext, session_id: &str, n: u32) -> String {
-    use crate::session_portability::{UndoDecision, UNDO_MAX_PAIRS};
+    use crate::session_portability::{UNDO_MAX_PAIRS, UndoDecision};
     if n == 0 || n > UNDO_MAX_PAIRS {
         return format!("❌ 次數必須介於 1 到 {UNDO_MAX_PAIRS} 之間。用法：/undo [次數]");
     }
     match ctx.session_manager.undo_last_turns(session_id, n).await {
-        Ok(UndoDecision::Undone { pairs, messages, .. }) => {
+        Ok(UndoDecision::Undone {
+            pairs, messages, ..
+        }) => {
             format!("↩️ 已撤銷最近 {pairs} 輪對話（共 {messages} 則訊息）。")
         }
         Ok(UndoDecision::NothingToUndo) => "目前沒有可撤銷的對話。".to_string(),
@@ -1034,8 +1051,7 @@ pub(crate) async fn handle_goal_create(
             (chrono::Utc::now() + chrono::Duration::seconds((h * 3600.0) as i64)).to_rfc3339(),
         );
     }
-    task.risk_boundary =
-        risk_boundary.map(|b| duduclaw_core::truncate_chars(b, 2000));
+    task.risk_boundary = risk_boundary.map(|b| duduclaw_core::truncate_chars(b, 2000));
     // WP2.4: ride the structured outcome spec on the existing comma-separated
     // tags field (base64url, comma-free) — no schema change. `text` specs and
     // the no-spec case leave tags untouched (behaviour unchanged).
@@ -1066,9 +1082,12 @@ pub(crate) async fn handle_goal_create(
     // branch exactly (same two functions, same field semantics).
     if plan_first {
         let criteria_for_plan = task.acceptance_criteria.as_deref().unwrap_or("");
-        let plan_result =
-            crate::goal_plan::generate_plan_first(&ctx.home_dir, &task.description, criteria_for_plan)
-                .await;
+        let plan_result = crate::goal_plan::generate_plan_first(
+            &ctx.home_dir,
+            &task.description,
+            criteria_for_plan,
+        )
+        .await;
         if let Err(e) = &plan_result {
             warn!(
                 agent = %agent_id,
@@ -1152,7 +1171,7 @@ async fn try_decompose_goal(
     channel: &str,
     chat_id: &str,
 ) -> Option<String> {
-    use crate::goal_plan::{plan_is_dag, plan_to_tasks, GoalDecomposer};
+    use crate::goal_plan::{GoalDecomposer, plan_is_dag, plan_to_tasks};
 
     let decomposer =
         crate::goal_plan::LlmGoalDecomposer::new(crate::goal_plan::UtilityDecomposeCaller {
@@ -1764,7 +1783,10 @@ mod tests {
 
         // Goal contract v2: duration + boundary segments, position-independent.
         assert_eq!(
-            parse_command("/goal 做月報 || 時限:36h || 邊界:不得寄給客戶草稿 || 含營收圖表", None),
+            parse_command(
+                "/goal 做月報 || 時限:36h || 邊界:不得寄給客戶草稿 || 含營收圖表",
+                None
+            ),
             Some(ChatCommand::Goal(GoalCommand::Create {
                 description: "做月報".to_string(),
                 acceptance_criteria: Some("含營收圖表".to_string()),
@@ -1776,7 +1798,10 @@ mod tests {
         );
         // Days multiply ×24; ASCII `duration:`/`risk:` spellings accepted.
         assert_eq!(
-            parse_command("/goal 做月報 || duration:2天 || risk:no external email", None),
+            parse_command(
+                "/goal 做月報 || duration:2天 || risk:no external email",
+                None
+            ),
             Some(ChatCommand::Goal(GoalCommand::Create {
                 description: "做月報".to_string(),
                 acceptance_criteria: None,
@@ -1839,7 +1864,10 @@ mod tests {
         );
         // Co-exists with duration/boundary segments too.
         assert_eq!(
-            parse_command("/goal 做月報 || 時限:36h || 想一想 || 邊界:不得寄給客戶草稿", None),
+            parse_command(
+                "/goal 做月報 || 時限:36h || 想一想 || 邊界:不得寄給客戶草稿",
+                None
+            ),
             Some(ChatCommand::Goal(GoalCommand::Create {
                 description: "做月報".to_string(),
                 acceptance_criteria: None,
@@ -2048,7 +2076,10 @@ fn render_rules_message(lines: &[RuleLine], total_in_effect: usize, all: bool) -
         let mut tail = if used == 0 {
             "還沒有實際使用紀錄".to_string()
         } else {
-            format!("用過 {used} 次，{} 次有幫助、{} 次幫倒忙", l.helpful, l.harmful)
+            format!(
+                "用過 {used} 次，{} 次有幫助、{} 次幫倒忙",
+                l.helpful, l.harmful
+            )
         };
         if l.streak > 0 {
             tail.push_str(&format!("；連續 {} 次沒出問題", l.streak));
@@ -2128,10 +2159,22 @@ async fn ranked_rule_lines(
     }
 
     prepared.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    let limit = if all { RULES_FULL_LIMIT } else { RULES_SUMMARY_LIMIT };
+    let limit = if all {
+        RULES_FULL_LIMIT
+    } else {
+        RULES_SUMMARY_LIMIT
+    };
     let total = prepared.len();
-    let entries = prepared.into_iter().take(limit).map(|(_, _, id, l)| (id, l)).collect();
-    RankedRules { entries, in_effect, total }
+    let entries = prepared
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, id, l)| (id, l))
+        .collect();
+    RankedRules {
+        entries,
+        in_effect,
+        total,
+    }
 }
 
 async fn handle_rules(ctx: &ReplyContext, agent_id: &str, all: bool) -> String {
@@ -2141,7 +2184,8 @@ async fn handle_rules(ctx: &ReplyContext, agent_id: &str, all: bool) -> String {
     if !db_path.exists() {
         return "📘 這位 AI 員工還沒有累積任何經驗法則。".to_string();
     }
-    let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
+    // H4: single construction point (`[memory] novelty_gate` + `w_vec`).
+    let engine = match crate::memory_factory::build_memory_engine(&db_path, &ctx.home_dir) {
         Ok(e) => e,
         Err(e) => {
             warn!(agent = agent_id, error = %e, "/rules: failed to open memory db");
@@ -2155,7 +2199,10 @@ async fn handle_rules(ctx: &ReplyContext, agent_id: &str, all: bool) -> String {
 
     let mut msg = render_rules_message(&lines, ranked.in_effect, all);
     if all && ranked.total > shown {
-        msg.push_str(&format!("\n（另有 {} 條未列出，完整清單請看儀表板。）", ranked.total - shown));
+        msg.push_str(&format!(
+            "\n（另有 {} 條未列出，完整清單請看儀表板。）",
+            ranked.total - shown
+        ));
     }
     msg
 }
@@ -2197,7 +2244,8 @@ async fn handle_rules_off(
         return "⚠️ 這個對話無法使用此指令。".to_string();
     };
     if crate::takeover::manager_display_name(home, &channel, channel_user_id).is_none() {
-        return "⚠️ 您沒有停用經驗法則的權限，請先於儀表板以此通道帳號完成管理員／主管綁定。".to_string();
+        return "⚠️ 您沒有停用經驗法則的權限，請先於儀表板以此通道帳號完成管理員／主管綁定。"
+            .to_string();
     }
 
     let Some(db_path) = ctx.memory_db_path.clone() else {
@@ -2206,7 +2254,8 @@ async fn handle_rules_off(
     if !db_path.exists() {
         return "📘 這位 AI 員工還沒有累積任何經驗法則。".to_string();
     }
-    let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
+    // H4: single construction point (`[memory] novelty_gate` + `w_vec`).
+    let engine = match crate::memory_factory::build_memory_engine(&db_path, &ctx.home_dir) {
         Ok(e) => e,
         Err(e) => {
             warn!(agent = agent_id, error = %e, "/rules off: failed to open memory db");
@@ -2295,13 +2344,34 @@ mod rules_command_tests {
 
     #[test]
     fn parses_bare_and_all_forms() {
-        assert_eq!(parse_command("/rules", None), Some(ChatCommand::Rules { all: false, off: None }));
-        assert_eq!(parse_command("/rules all", None), Some(ChatCommand::Rules { all: true, off: None }));
-        assert_eq!(parse_command("/RULES ALL", None), Some(ChatCommand::Rules { all: true, off: None }));
+        assert_eq!(
+            parse_command("/rules", None),
+            Some(ChatCommand::Rules {
+                all: false,
+                off: None
+            })
+        );
+        assert_eq!(
+            parse_command("/rules all", None),
+            Some(ChatCommand::Rules {
+                all: true,
+                off: None
+            })
+        );
+        assert_eq!(
+            parse_command("/RULES ALL", None),
+            Some(ChatCommand::Rules {
+                all: true,
+                off: None
+            })
+        );
         // A mistyped tail degrades to the summary rather than erroring out.
         assert_eq!(
             parse_command("/rules everything", None),
-            Some(ChatCommand::Rules { all: false, off: None })
+            Some(ChatCommand::Rules {
+                all: false,
+                off: None
+            })
         );
     }
 
@@ -2309,16 +2379,25 @@ mod rules_command_tests {
     fn parses_off_forms() {
         assert_eq!(
             parse_command("/rules off 3", None),
-            Some(ChatCommand::Rules { all: false, off: Some(3) })
+            Some(ChatCommand::Rules {
+                all: false,
+                off: Some(3)
+            })
         );
         assert_eq!(
             parse_command("/rules OFF 12", None),
-            Some(ChatCommand::Rules { all: false, off: Some(12) })
+            Some(ChatCommand::Rules {
+                all: false,
+                off: Some(12)
+            })
         );
         // Extra whitespace tolerated.
         assert_eq!(
             parse_command("/rules   off   3  ", None),
-            Some(ChatCommand::Rules { all: false, off: Some(3) })
+            Some(ChatCommand::Rules {
+                all: false,
+                off: Some(3)
+            })
         );
     }
 
@@ -2328,10 +2407,19 @@ mod rules_command_tests {
         // a deliberately out-of-range 0) rather than falling back to the
         // bare/all summary — a person who typed `/rules off` deserves
         // "which number?", not a listing that looks like `off` vanished.
-        assert_eq!(parse_command("/rules off", None), Some(ChatCommand::Rules { all: false, off: Some(0) }));
+        assert_eq!(
+            parse_command("/rules off", None),
+            Some(ChatCommand::Rules {
+                all: false,
+                off: Some(0)
+            })
+        );
         assert_eq!(
             parse_command("/rules off abc", None),
-            Some(ChatCommand::Rules { all: false, off: Some(0) })
+            Some(ChatCommand::Rules {
+                all: false,
+                off: Some(0)
+            })
         );
     }
 
@@ -2343,9 +2431,27 @@ mod rules_command_tests {
         // inside `handle_rules_off`), so it must stay `false` here too —
         // otherwise a channel with no admin_users configured at all would
         // refuse the command before ever reaching the real gate.
-        assert!(!ChatCommand::Rules { all: false, off: None }.requires_admin());
-        assert!(!ChatCommand::Rules { all: true, off: None }.requires_admin());
-        assert!(!ChatCommand::Rules { all: false, off: Some(1) }.requires_admin());
+        assert!(
+            !ChatCommand::Rules {
+                all: false,
+                off: None
+            }
+            .requires_admin()
+        );
+        assert!(
+            !ChatCommand::Rules {
+                all: true,
+                off: None
+            }
+            .requires_admin()
+        );
+        assert!(
+            !ChatCommand::Rules {
+                all: false,
+                off: Some(1)
+            }
+            .requires_admin()
+        );
     }
 
     #[test]
@@ -2360,7 +2466,13 @@ mod rules_command_tests {
     #[test]
     fn summary_numbers_rules_and_reports_the_in_effect_total() {
         let lines = vec![
-            line("生效中", "當提到「訂單」時，我會先查資料庫再回覆。", 4, 0, 4),
+            line(
+                "生效中",
+                "當提到「訂單」時，我會先查資料庫再回覆。",
+                4,
+                0,
+                4,
+            ),
             line("試用中", "當明顯出錯時，我會先說明原因。", 1, 0, 1),
         ];
         let msg = render_rules_message(&lines, 5, false);
@@ -2381,15 +2493,32 @@ mod rules_command_tests {
     #[test]
     fn channel_copy_never_leaks_internal_vocabulary() {
         let msg = render_rules_message(
-            &[line("觀察中（尚未生效）", "當踩到安全界線時，我會先徵求同意。", 0, 0, 0)],
+            &[line(
+                "觀察中（尚未生效）",
+                "當踩到安全界線時，我會先徵求同意。",
+                0,
+                0,
+                0,
+            )],
             0,
             true,
         );
-        for internal in ["playbook", "Playbook", "shadow", "probation", "GVU", "AEE", "SOUL"] {
+        for internal in [
+            "playbook",
+            "Playbook",
+            "shadow",
+            "probation",
+            "GVU",
+            "AEE",
+            "SOUL",
+        ] {
             assert!(!msg.contains(internal), "leaked `{internal}`: {msg}");
         }
         // And the empty states too.
-        for msg in [render_rules_message(&[], 0, false), render_rules_message(&[], 0, true)] {
+        for msg in [
+            render_rules_message(&[], 0, false),
+            render_rules_message(&[], 0, true),
+        ] {
             for internal in ["playbook", "shadow", "probation", "GVU"] {
                 assert!(!msg.contains(internal), "leaked `{internal}`: {msg}");
             }
@@ -2443,7 +2572,10 @@ mod rules_command_tests {
         let agent = "agent-rules-off";
         let now = chrono::Utc::now();
 
-        let deltas = vec![rule_add_delta("rule about refunds"), rule_add_delta("rule about discord")];
+        let deltas = vec![
+            rule_add_delta("rule about refunds"),
+            rule_add_delta("rule about discord"),
+        ];
         let outcome =
             crate::playbook::apply_deltas(&engine, agent, deltas, &[], evals.path(), now).await;
         assert_eq!(outcome.applied.len(), 2, "{outcome:?}");
@@ -2468,15 +2600,24 @@ mod rules_command_tests {
 
         let before = ranked_rule_lines(&engine, agent, true).await;
         assert_eq!(before.entries.len(), 2);
-        let (target_id, _) = resolve_rule_ordinal(&before.entries, 2).expect("ordinal 2 must resolve");
+        let (target_id, _) =
+            resolve_rule_ordinal(&before.entries, 2).expect("ordinal 2 must resolve");
 
-        let retire = crate::playbook::PlaybookDelta::Retire { id: target_id.clone(), reason: "test".into() };
+        let retire = crate::playbook::PlaybookDelta::Retire {
+            id: target_id.clone(),
+            reason: "test".into(),
+        };
         let outcome =
-            crate::playbook::apply_deltas(&engine, agent, vec![retire], &[], evals.path(), now).await;
+            crate::playbook::apply_deltas(&engine, agent, vec![retire], &[], evals.path(), now)
+                .await;
         assert!(outcome.rejected.is_empty(), "{outcome:?}");
 
         let after = ranked_rule_lines(&engine, agent, true).await;
-        assert_eq!(after.entries.len(), 1, "only the resolved id should be gone");
+        assert_eq!(
+            after.entries.len(),
+            1,
+            "only the resolved id should be gone"
+        );
         assert!(
             after.entries.iter().all(|(id, _)| id != target_id),
             "the retired id must not resurface"
@@ -2528,9 +2669,18 @@ mod takeover_command_tests {
     fn takeover_never_silently_ignores_a_malformed_tail() {
         // Anything unparseable falls back to Status, which prints usage —
         // a person who typed a command must never get silence.
-        assert_eq!(parse_takeover("/takeover wat"), Some(TakeoverCommand::Status));
-        assert_eq!(parse_takeover("/takeover -5"), Some(TakeoverCommand::Status));
-        assert_eq!(parse_takeover("/takeover +0m"), Some(TakeoverCommand::Status));
+        assert_eq!(
+            parse_takeover("/takeover wat"),
+            Some(TakeoverCommand::Status)
+        );
+        assert_eq!(
+            parse_takeover("/takeover -5"),
+            Some(TakeoverCommand::Status)
+        );
+        assert_eq!(
+            parse_takeover("/takeover +0m"),
+            Some(TakeoverCommand::Status)
+        );
     }
 
     #[test]
@@ -2656,7 +2806,10 @@ mod goal_contract_tests {
             .unwrap();
         assert_eq!(tasks.len(), 1, "{tasks:?}");
         let task = &tasks[0];
-        assert_eq!(task.acceptance_criteria.as_deref(), Some("含營收圖表並寄出"));
+        assert_eq!(
+            task.acceptance_criteria.as_deref(),
+            Some("含營收圖表並寄出")
+        );
         assert_eq!(
             task.acceptance_criteria_baseline.as_deref(),
             Some("含營收圖表並寄出"),

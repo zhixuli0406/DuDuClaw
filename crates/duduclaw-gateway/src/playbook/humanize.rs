@@ -30,7 +30,7 @@ use duduclaw_core::truncate_chars;
 
 use super::entry::{PlaybookCategory, PlaybookMeta, PlaybookState};
 use crate::prediction::rule_lifecycle::{
-    RuleStats, PROBATION_RULE_TAG, RETIRED_RULE_TAG, SHADOW_RULE_TAG,
+    PROBATION_RULE_TAG, RETIRED_RULE_TAG, RuleStats, SHADOW_RULE_TAG,
 };
 
 /// Marker appended to a fallback rendering so the reader knows they are
@@ -227,7 +227,11 @@ pub fn describe_signals(signals: &[String]) -> String {
         }
     }
     if concrete.is_empty() {
-        return if wildcard { "任何任務".to_string() } else { String::new() };
+        return if wildcard {
+            "任何任務".to_string()
+        } else {
+            String::new()
+        };
     }
     let elided = concrete.len() > CONDITION_MAX_FRAGMENTS;
     concrete.truncate(CONDITION_MAX_FRAGMENTS);
@@ -242,14 +246,28 @@ pub fn describe_signals(signals: &[String]) -> String {
 /// Leading fillers stripped from a derived action so the template does not
 /// produce 「我會 我會…」. Longest-first; only stripped when something is left.
 const ACTION_LEAD_STRIP: &[&str] = &[
-    "我必須要", "我應該要", "我必須", "我應該", "應該要", "我會要", "必須要", "我就會", "我會", "應該",
-    "必須", "就要", "則要", "就會", "則會",
+    "我必須要",
+    "我應該要",
+    "我必須",
+    "我應該",
+    "應該要",
+    "我會要",
+    "必須要",
+    "我就會",
+    "我會",
+    "應該",
+    "必須",
+    "就要",
+    "則要",
+    "就會",
+    "則會",
 ];
 
 /// Markers that end an embedded condition clause inside `content`. Rules are
 /// commonly authored as 「當…時,先…」 — splitting there avoids emitting a
 /// doubled condition (「當 X 時,我會當 X 時先 Y」).
-const CONDITION_END_MARKERS: &[&str] = &["時，", "時,", "時：", "時:", "時、", "時應", "時要", "時就"];
+const CONDITION_END_MARKERS: &[&str] =
+    &["時，", "時,", "時：", "時:", "時、", "時應", "時要", "時就"];
 
 /// Sentence terminators used to take only the first clause of `content`.
 const SENTENCE_ENDS: &[char] = &['。', '！', '!', '？', '?', '\n', '；', ';'];
@@ -357,7 +375,9 @@ pub fn describe_why(evidence: &RuleEvidence, category: PlaybookCategory) -> Stri
     if evidence.applications > 0 || evidence.helpful > 0 || evidence.harmful > 0 {
         parts.push(format!(
             "實際用過 {} 次，其中 {} 次有幫助、{} 次反而幫倒忙",
-            evidence.applications.max((evidence.helpful + evidence.harmful) as usize),
+            evidence
+                .applications
+                .max((evidence.helpful + evidence.harmful) as usize),
             evidence.helpful,
             evidence.harmful
         ));
@@ -397,9 +417,7 @@ pub fn humanize(
 
     let action = derive_action(trimmed_content, &meta.strategy);
     let (sentence, action, fallback) = match action {
-        Some(a) if !condition.is_empty() => {
-            (format!("當{condition}時，我會{a}。"), a, false)
-        }
+        Some(a) if !condition.is_empty() => (format!("當{condition}時，我會{a}。"), a, false),
         Some(a) => (format!("任何情況下，我都會{a}。"), a, false),
         None => {
             let raw = if trimmed_content.is_empty() {
@@ -519,13 +537,19 @@ mod tests {
 
     #[test]
     fn single_strategy_step_has_no_ordering_prefix() {
-        assert_eq!(derive_action("x", &["直接回報給管理員".into()]).unwrap(), "直接回報給管理員");
+        assert_eq!(
+            derive_action("x", &["直接回報給管理員".into()]).unwrap(),
+            "直接回報給管理員"
+        );
     }
 
     #[test]
     fn content_embedded_condition_clause_is_dropped_to_avoid_doubling() {
-        let a = derive_action("當使用者詢問訂單狀態時，先查詢資料庫再回覆。其他情況照舊。", &[])
-            .unwrap();
+        let a = derive_action(
+            "當使用者詢問訂單狀態時，先查詢資料庫再回覆。其他情況照舊。",
+            &[],
+        )
+        .unwrap();
         assert_eq!(a, "先查詢資料庫再回覆");
         assert!(!a.contains("當使用者"));
     }
@@ -545,14 +569,26 @@ mod tests {
     fn a_modal_verb_marker_is_consumed_so_the_template_reads_naturally() {
         // 「時應」/「時要」/「時就」 carry the modal the 「我會」 template is
         // about to supply; keeping it would yield 「我會應先確認」.
-        assert_eq!(derive_action("遇到不確定的事時應先確認再回答。", &[]).unwrap(), "先確認再回答");
-        assert_eq!(derive_action("被追問細節時要如實說明。", &[]).unwrap(), "如實說明");
+        assert_eq!(
+            derive_action("遇到不確定的事時應先確認再回答。", &[]).unwrap(),
+            "先確認再回答"
+        );
+        assert_eq!(
+            derive_action("被追問細節時要如實說明。", &[]).unwrap(),
+            "如實說明"
+        );
     }
 
     #[test]
     fn action_lead_fillers_are_stripped_so_the_template_never_doubles_the_verb() {
-        assert_eq!(derive_action("我會主動確認需求", &[]).unwrap(), "主動確認需求");
-        assert_eq!(derive_action("應該要先問清楚再動手", &[]).unwrap(), "先問清楚再動手");
+        assert_eq!(
+            derive_action("我會主動確認需求", &[]).unwrap(),
+            "主動確認需求"
+        );
+        assert_eq!(
+            derive_action("應該要先問清楚再動手", &[]).unwrap(),
+            "先問清楚再動手"
+        );
     }
 
     #[test]
@@ -575,7 +611,10 @@ mod tests {
 
     #[test]
     fn each_category_assembles_a_full_sentence() {
-        let stats = RuleStats { helpful: 2, harmful: 0 };
+        let stats = RuleStats {
+            helpful: 2,
+            harmful: 0,
+        };
         for (cat, key) in [
             (PlaybookCategory::Repair, "repair"),
             (PlaybookCategory::Optimize, "optimize"),
@@ -644,7 +683,10 @@ mod tests {
             status_of(PlaybookState::Stale, &[]),
             ("dormant", "很久沒用到，已收起來")
         );
-        assert_eq!(status_of(PlaybookState::Retired, &[]), ("retired", "已淘汰"));
+        assert_eq!(
+            status_of(PlaybookState::Retired, &[]),
+            ("retired", "已淘汰")
+        );
         // Retired beats shadow beats probation.
         assert_eq!(
             status_of(
@@ -678,13 +720,29 @@ mod tests {
         let h = humanize(
             "動手前先徵求同意。",
             &meta,
-            &RuleStats { helpful: 3, harmful: 1 },
+            &RuleStats {
+                helpful: 3,
+                harmful: 1,
+            },
             &[SHADOW_RULE_TAG.to_string()],
         );
-        let all = format!("{} {} {} {} {}", h.sentence, h.condition, h.action, h.purpose, h.why);
+        let all = format!(
+            "{} {} {} {} {}",
+            h.sentence, h.condition, h.action, h.purpose, h.why
+        );
         for internal in [
-            "playbook", "Playbook", "shadow", "Shadow", "probation", "Probation", "GVU", "gvu",
-            "AEE", "held-out", "eval_case", "signals_match",
+            "playbook",
+            "Playbook",
+            "shadow",
+            "Shadow",
+            "probation",
+            "Probation",
+            "GVU",
+            "gvu",
+            "AEE",
+            "held-out",
+            "eval_case",
+            "signals_match",
         ] {
             assert!(!all.contains(internal), "leaked `{internal}` in: {all}");
         }
@@ -713,7 +771,15 @@ mod tests {
                 ctx: None,
             })
             .collect();
-        let h = humanize("先問再答。", &meta, &RuleStats { helpful: 3, harmful: 1 }, &[]);
+        let h = humanize(
+            "先問再答。",
+            &meta,
+            &RuleStats {
+                helpful: 3,
+                harmful: 1,
+            },
+            &[],
+        );
         assert!(h.why.contains("1 個驗收案例"), "{}", h.why);
         assert!(h.why.contains("4 次沒出問題"), "{}", h.why);
         assert_eq!(h.evidence.applications, 3);
@@ -728,7 +794,10 @@ mod tests {
             &[],
             PlaybookState::Active,
         );
-        let stats = RuleStats { helpful: 1, harmful: 0 };
+        let stats = RuleStats {
+            helpful: 1,
+            harmful: 0,
+        };
         let a = humanize("查完再回。", &meta, &stats, &[]);
         let b = humanize("查完再回。", &meta, &stats, &[]);
         assert_eq!(a, b);

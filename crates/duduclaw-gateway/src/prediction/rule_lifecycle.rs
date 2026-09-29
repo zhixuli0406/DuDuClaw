@@ -36,7 +36,7 @@ use tracing::{info, warn};
 use duduclaw_memory::SqliteMemoryEngine;
 
 use super::engine::ErrorCategory;
-use super::rule_gate::{evaluate_rule_gate, GateDecision, HeldOutStats, DEFAULT_BASELINE_HIT_RATE};
+use super::rule_gate::{DEFAULT_BASELINE_HIT_RATE, GateDecision, HeldOutStats, evaluate_rule_gate};
 
 /// `source_event` written by `reflexion::maybe_consolidate` (F2b).
 pub const RULE_SOURCE_EVENT: &str = "reflexion_consolidation";
@@ -110,7 +110,10 @@ pub struct RuleStats {
 impl RuleStats {
     /// Counters for a freshly consolidated rule (ExpeL initial importance = 2).
     pub fn initial() -> Self {
-        Self { helpful: INITIAL_HELPFUL, harmful: 0 }
+        Self {
+            helpful: INITIAL_HELPFUL,
+            harmful: 0,
+        }
     }
 
     /// Signed net score used for injection ranking.
@@ -230,7 +233,10 @@ async fn select_rules_by_source_event(
             // WP-P3: shadow candidates are scored out-of-sample but never
             // injected. No-op when the held-out gate is off (no rule carries
             // the tag then) — byte-identical to the pre-WP3 retired-only filter.
-            !entry.tags.iter().any(|t| t == RETIRED_RULE_TAG || t == SHADOW_RULE_TAG)
+            !entry
+                .tags
+                .iter()
+                .any(|t| t == RETIRED_RULE_TAG || t == SHADOW_RULE_TAG)
         })
         .map(|(entry, metadata)| InjectedRule {
             net: RuleStats::from_metadata(&metadata).net(),
@@ -274,7 +280,11 @@ pub fn build_rules_section_blocking(
             // G6: annotate a source-stale rule inline (it is already
             // downweighted to last by the selection sort above).
             if r.source_stale {
-                format!("{} {}", r.content, crate::playbook::select::SOURCE_STALE_MARKER)
+                format!(
+                    "{} {}",
+                    r.content,
+                    crate::playbook::select::SOURCE_STALE_MARKER
+                )
             } else {
                 r.content.clone()
             }
@@ -304,8 +314,10 @@ pub async fn settle_injected_rules(
     rule_ids: &[String],
     category: ErrorCategory,
 ) -> Vec<String> {
-    let is_harmful_event =
-        matches!(category, ErrorCategory::Significant | ErrorCategory::Critical);
+    let is_harmful_event = matches!(
+        category,
+        ErrorCategory::Significant | ErrorCategory::Critical
+    );
     let mut retired = Vec::new();
     for id in rule_ids {
         // Rule may have been superseded/deleted between injection and
@@ -412,7 +424,10 @@ pub async fn settle_injected_rules_held_out(
     baseline_hit_rate: f64,
     now_seq: u64,
 ) -> Vec<String> {
-    let is_hit = matches!(category, ErrorCategory::Negligible | ErrorCategory::Moderate);
+    let is_hit = matches!(
+        category,
+        ErrorCategory::Negligible | ErrorCategory::Moderate
+    );
     let mut retired = Vec::new();
     for id in rule_ids {
         let mut metadata = match engine.get_metadata(agent_id, id).await {
@@ -519,7 +534,10 @@ pub async fn settle_injected_rules_held_out(
 /// scored on whether the predicted risk materialized. Pure — deterministic
 /// mapping, no LLM, no I/O.
 pub fn score_shadow_candidate(category: ErrorCategory) -> bool {
-    matches!(category, ErrorCategory::Significant | ErrorCategory::Critical)
+    matches!(
+        category,
+        ErrorCategory::Significant | ErrorCategory::Critical
+    )
 }
 
 /// Fold one out-of-sample observation into a shadow candidate's
@@ -624,7 +642,15 @@ pub async fn score_shadow_candidates_for_task(
             continue;
         }
         score_one_shadow_candidate(
-            engine, agent_id, &id, metadata, category, k, baseline_hit_rate, now_seq, &mut out,
+            engine,
+            agent_id,
+            &id,
+            metadata,
+            category,
+            k,
+            baseline_hit_rate,
+            now_seq,
+            &mut out,
         )
         .await;
     }
@@ -744,7 +770,15 @@ pub async fn score_shadow_candidates_by_ids(
             }
         };
         score_one_shadow_candidate(
-            engine, agent_id, id, metadata, category, k, baseline_hit_rate, now_seq, &mut out,
+            engine,
+            agent_id,
+            id,
+            metadata,
+            category,
+            k,
+            baseline_hit_rate,
+            now_seq,
+            &mut out,
         )
         .await;
     }
@@ -957,16 +991,40 @@ mod tests {
         let ids = vec![id.clone()];
 
         settle_injected_rules(&engine, agent, &ids, ErrorCategory::Negligible).await;
-        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 2, harmful: 0 });
+        assert_eq!(
+            read_stats(&engine, agent, &id).await,
+            RuleStats {
+                helpful: 2,
+                harmful: 0
+            }
+        );
 
         settle_injected_rules(&engine, agent, &ids, ErrorCategory::Moderate).await;
-        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 3, harmful: 0 });
+        assert_eq!(
+            read_stats(&engine, agent, &id).await,
+            RuleStats {
+                helpful: 3,
+                harmful: 0
+            }
+        );
 
         settle_injected_rules(&engine, agent, &ids, ErrorCategory::Significant).await;
-        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 3, harmful: 1 });
+        assert_eq!(
+            read_stats(&engine, agent, &id).await,
+            RuleStats {
+                helpful: 3,
+                harmful: 1
+            }
+        );
 
         settle_injected_rules(&engine, agent, &ids, ErrorCategory::Critical).await;
-        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 3, harmful: 2 });
+        assert_eq!(
+            read_stats(&engine, agent, &id).await,
+            RuleStats {
+                helpful: 3,
+                harmful: 2
+            }
+        );
 
         // Sibling metadata keys survive the counter round-trips.
         let meta = engine.get_metadata(agent, &id).await.unwrap().unwrap();
@@ -982,8 +1040,7 @@ mod tests {
         let id = store_rule(&engine, agent, "rule B", RuleStats::initial(), 0, false).await;
         let ids = vec![id.clone()];
 
-        let retired =
-            settle_injected_rules(&engine, agent, &ids, ErrorCategory::Critical).await;
+        let retired = settle_injected_rules(&engine, agent, &ids, ErrorCategory::Critical).await;
         assert_eq!(
             retired,
             vec![id.clone()],
@@ -996,22 +1053,53 @@ mod tests {
         assert!(entry.importance < 2.0, "importance demoted on retirement");
 
         // F2a selection now excludes it.
-        assert!(select_rules(&engine, agent, INJECTION_LIMIT).await.is_empty());
+        assert!(
+            select_rules(&engine, agent, INJECTION_LIMIT)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn selection_orders_by_net_score_and_caps_at_limit() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-rank";
-        let low =
-            store_rule(&engine, agent, "low", RuleStats { helpful: 3, harmful: 2 }, 10, false)
-                .await;
-        let high =
-            store_rule(&engine, agent, "high", RuleStats { helpful: 7, harmful: 2 }, 20, false)
-                .await;
-        let mid =
-            store_rule(&engine, agent, "mid", RuleStats { helpful: 5, harmful: 2 }, 30, false)
-                .await;
+        let low = store_rule(
+            &engine,
+            agent,
+            "low",
+            RuleStats {
+                helpful: 3,
+                harmful: 2,
+            },
+            10,
+            false,
+        )
+        .await;
+        let high = store_rule(
+            &engine,
+            agent,
+            "high",
+            RuleStats {
+                helpful: 7,
+                harmful: 2,
+            },
+            20,
+            false,
+        )
+        .await;
+        let mid = store_rule(
+            &engine,
+            agent,
+            "mid",
+            RuleStats {
+                helpful: 5,
+                harmful: 2,
+            },
+            30,
+            false,
+        )
+        .await;
 
         let all = select_rules(&engine, agent, INJECTION_LIMIT).await;
         let got: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
@@ -1025,11 +1113,27 @@ mod tests {
         // WP2: at an equal net score, a probation rule sorts after a
         // graduated (non-probation) one.
         let grad_tie = store_rule(
-            &engine, agent, "graduated-tie", RuleStats { helpful: 5, harmful: 0 }, 5, false,
+            &engine,
+            agent,
+            "graduated-tie",
+            RuleStats {
+                helpful: 5,
+                harmful: 0,
+            },
+            5,
+            false,
         )
         .await;
         let probation_tie = store_rule(
-            &engine, agent, "probation-tie", RuleStats { helpful: 5, harmful: 0 }, 1, true,
+            &engine,
+            agent,
+            "probation-tie",
+            RuleStats {
+                helpful: 5,
+                harmful: 0,
+            },
+            1,
+            true,
         )
         .await;
         let all2 = select_rules(&engine, agent, 10).await;
@@ -1047,8 +1151,15 @@ mod tests {
     async fn settlement_skips_unknown_and_foreign_ids() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-own";
-        let foreign =
-            store_rule(&engine, "other-agent", "theirs", RuleStats::initial(), 0, false).await;
+        let foreign = store_rule(
+            &engine,
+            "other-agent",
+            "theirs",
+            RuleStats::initial(),
+            0,
+            false,
+        )
+        .await;
 
         let retired = settle_injected_rules(
             &engine,
@@ -1078,9 +1189,18 @@ mod tests {
         // probation rule on its first harmful outcome regardless of banked
         // credit.
         settle_injected_rules(&engine, agent, &ids, ErrorCategory::Negligible).await;
-        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 2, harmful: 0 });
+        assert_eq!(
+            read_stats(&engine, agent, &id).await,
+            RuleStats {
+                helpful: 2,
+                harmful: 0
+            }
+        );
         let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
-        assert!(entry.tags.iter().any(|t| t == PROBATION_RULE_TAG), "still on probation");
+        assert!(
+            entry.tags.iter().any(|t| t == PROBATION_RULE_TAG),
+            "still on probation"
+        );
 
         let retired = settle_injected_rules(&engine, agent, &ids, ErrorCategory::Significant).await;
         assert_eq!(
@@ -1092,7 +1212,11 @@ mod tests {
         let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
         assert!(entry.tags.iter().any(|t| t == RETIRED_RULE_TAG));
         assert!(entry.importance < 2.0, "importance demoted on retirement");
-        assert!(select_rules(&engine, agent, INJECTION_LIMIT).await.is_empty());
+        assert!(
+            select_rules(&engine, agent, INJECTION_LIMIT)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1106,11 +1230,23 @@ mod tests {
         // strikes) reach PROBATION_GRADUATE_HELPFUL = 3.
         settle_injected_rules(&engine, agent, &ids, ErrorCategory::Negligible).await;
         let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
-        assert!(entry.tags.iter().any(|t| t == PROBATION_RULE_TAG), "not yet graduated");
+        assert!(
+            entry.tags.iter().any(|t| t == PROBATION_RULE_TAG),
+            "not yet graduated"
+        );
 
         let retired = settle_injected_rules(&engine, agent, &ids, ErrorCategory::Moderate).await;
-        assert!(retired.is_empty(), "graduation must not be reported as retirement");
-        assert_eq!(read_stats(&engine, agent, &id).await, RuleStats { helpful: 3, harmful: 0 });
+        assert!(
+            retired.is_empty(),
+            "graduation must not be reported as retirement"
+        );
+        assert_eq!(
+            read_stats(&engine, agent, &id).await,
+            RuleStats {
+                helpful: 3,
+                harmful: 0
+            }
+        );
 
         let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
         assert!(
@@ -1135,7 +1271,15 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-a4-isolation";
 
-        let dialogue_id = store_rule(&engine, agent, "dialogue rule", RuleStats::initial(), 0, true).await;
+        let dialogue_id = store_rule(
+            &engine,
+            agent,
+            "dialogue rule",
+            RuleStats::initial(),
+            0,
+            true,
+        )
+        .await;
         let task_id = store_rule_with_source(
             &engine,
             agent,
@@ -1160,13 +1304,27 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-a4-rank";
         let low = store_rule_with_source(
-            &engine, agent, "low", RuleStats { helpful: 3, harmful: 2 },
-            TASK_RULE_SOURCE_EVENT, vec![TASK_RULE_TAG.to_string()],
+            &engine,
+            agent,
+            "low",
+            RuleStats {
+                helpful: 3,
+                harmful: 2,
+            },
+            TASK_RULE_SOURCE_EVENT,
+            vec![TASK_RULE_TAG.to_string()],
         )
         .await;
         let high = store_rule_with_source(
-            &engine, agent, "high", RuleStats { helpful: 7, harmful: 2 },
-            TASK_RULE_SOURCE_EVENT, vec![TASK_RULE_TAG.to_string()],
+            &engine,
+            agent,
+            "high",
+            RuleStats {
+                helpful: 7,
+                harmful: 2,
+            },
+            TASK_RULE_SOURCE_EVENT,
+            vec![TASK_RULE_TAG.to_string()],
         )
         .await;
 
@@ -1181,7 +1339,8 @@ mod tests {
         settle_injected_rules(&engine, agent, &[high.clone()], ErrorCategory::Critical).await;
         settle_injected_rules(&engine, agent, &[high.clone()], ErrorCategory::Critical).await;
         settle_injected_rules(&engine, agent, &[high.clone()], ErrorCategory::Critical).await;
-        let retired = settle_injected_rules(&engine, agent, &[high.clone()], ErrorCategory::Critical).await;
+        let retired =
+            settle_injected_rules(&engine, agent, &[high.clone()], ErrorCategory::Critical).await;
         assert_eq!(retired, vec![high.clone()]);
         let after = select_task_rules(&engine, agent, INJECTION_LIMIT).await;
         assert_eq!(after.len(), 1);
@@ -1194,16 +1353,28 @@ mod tests {
     async fn select_excludes_shadow_tagged_rules() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-shadow-select";
-        let normal =
-            store_rule(&engine, agent, "normal", RuleStats { helpful: 5, harmful: 0 }, 0, false)
-                .await;
+        let normal = store_rule(
+            &engine,
+            agent,
+            "normal",
+            RuleStats {
+                helpful: 5,
+                harmful: 0,
+            },
+            0,
+            false,
+        )
+        .await;
         // A shadow-tagged rule with an even higher net score must still be
         // excluded — shadow candidates are scored, never injected.
         let shadow = store_rule_with_source(
             &engine,
             agent,
             "shadow",
-            RuleStats { helpful: 9, harmful: 0 },
+            RuleStats {
+                helpful: 9,
+                harmful: 0,
+            },
             RULE_SOURCE_EVENT,
             vec![SHADOW_RULE_TAG.to_string()],
         )
@@ -1211,7 +1382,10 @@ mod tests {
 
         let selected = select_rules(&engine, agent, INJECTION_LIMIT).await;
         let ids: Vec<&str> = selected.iter().map(|r| r.id.as_str()).collect();
-        assert!(ids.contains(&normal.as_str()), "non-shadow rule is selectable");
+        assert!(
+            ids.contains(&normal.as_str()),
+            "non-shadow rule is selectable"
+        );
         assert!(
             !ids.contains(&shadow.as_str()),
             "shadow-tagged rule must be excluded even with a higher net score"
@@ -1231,7 +1405,13 @@ mod tests {
         // injectable (no shadow tag).
         for _ in 0..20 {
             settle_injected_rules_held_out(
-                &engine, agent, &ids, ErrorCategory::Negligible, 1, 0.5, now,
+                &engine,
+                agent,
+                &ids,
+                ErrorCategory::Negligible,
+                1,
+                0.5,
+                now,
             )
             .await;
         }
@@ -1241,9 +1421,8 @@ mod tests {
             "a strong out-of-sample record stays injectable (Inject)"
         );
         // The held-out counters are populated from the numeric outcomes.
-        let held = HeldOutStats::from_metadata(
-            &engine.get_metadata(agent, &id).await.unwrap().unwrap(),
-        );
+        let held =
+            HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
         assert_eq!(held.oos_hits, 20);
         assert_eq!(held.oos_misses, 0);
 
@@ -1251,7 +1430,13 @@ mod tests {
         // shadow-tagged (stop injecting) but NOT retired (row + history kept).
         for _ in 0..8 {
             settle_injected_rules_held_out(
-                &engine, agent, &ids, ErrorCategory::Critical, 1, 0.5, now,
+                &engine,
+                agent,
+                &ids,
+                ErrorCategory::Critical,
+                1,
+                0.5,
+                now,
             )
             .await;
         }
@@ -1267,13 +1452,24 @@ mod tests {
 
         // Once demoted the rule is excluded from injection selection.
         let ok = store_rule(
-            &engine, agent, "rule OK", RuleStats { helpful: 5, harmful: 0 }, 0, false,
+            &engine,
+            agent,
+            "rule OK",
+            RuleStats {
+                helpful: 5,
+                harmful: 0,
+            },
+            0,
+            false,
         )
         .await;
         let selected = select_rules(&engine, agent, INJECTION_LIMIT).await;
         let sel: Vec<&str> = selected.iter().map(|r| r.id.as_str()).collect();
         assert!(sel.contains(&ok.as_str()));
-        assert!(!sel.contains(&id.as_str()), "demoted (shadow) rule is not injected");
+        assert!(
+            !sel.contains(&id.as_str()),
+            "demoted (shadow) rule is not injected"
+        );
     }
 
     #[tokio::test]
@@ -1286,11 +1482,25 @@ mod tests {
 
         // 1 hit + 15 misses: even the optimistic Wilson upper bound falls
         // below baseline → the candidate is spent → retire.
-        settle_injected_rules_held_out(&engine, agent, &ids, ErrorCategory::Negligible, 1, 0.5, now)
-            .await;
+        settle_injected_rules_held_out(
+            &engine,
+            agent,
+            &ids,
+            ErrorCategory::Negligible,
+            1,
+            0.5,
+            now,
+        )
+        .await;
         for _ in 0..15 {
             settle_injected_rules_held_out(
-                &engine, agent, &ids, ErrorCategory::Critical, 1, 0.5, now,
+                &engine,
+                agent,
+                &ids,
+                ErrorCategory::Critical,
+                1,
+                0.5,
+                now,
             )
             .await;
         }
@@ -1324,23 +1534,40 @@ mod tests {
 
         // Settle with now_seq == born_seq → not counted.
         settle_injected_rules_held_out(
-            &engine, agent, &[id.clone()], ErrorCategory::Negligible, 1, 0.5, 500,
+            &engine,
+            agent,
+            &[id.clone()],
+            ErrorCategory::Negligible,
+            1,
+            0.5,
+            500,
         )
         .await;
-        let held = HeldOutStats::from_metadata(
-            &engine.get_metadata(agent, &id).await.unwrap().unwrap(),
+        let held =
+            HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
+        assert_eq!(
+            held.total(),
+            0,
+            "birth-batch observation (now_seq <= born_seq) must not count"
         );
-        assert_eq!(held.total(), 0, "birth-batch observation (now_seq <= born_seq) must not count");
 
         // A later observation IS counted.
         settle_injected_rules_held_out(
-            &engine, agent, &[id.clone()], ErrorCategory::Negligible, 1, 0.5, 501,
+            &engine,
+            agent,
+            &[id.clone()],
+            ErrorCategory::Negligible,
+            1,
+            0.5,
+            501,
         )
         .await;
-        let held = HeldOutStats::from_metadata(
-            &engine.get_metadata(agent, &id).await.unwrap().unwrap(),
+        let held =
+            HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
+        assert_eq!(
+            held.oos_hits, 1,
+            "an out-of-sample observation (now_seq > born_seq) counts"
         );
-        assert_eq!(held.oos_hits, 1, "an out-of-sample observation (now_seq > born_seq) counts");
     }
 
     // ── v1.54: shadow → promotion prequential scoring pass ────────────────
@@ -1412,8 +1639,15 @@ mod tests {
         // trigger keeps correctly flagging risk → its Wilson lower bound clears
         // the baseline and it is promoted out of shadow.
         for _ in 0..10 {
-            score_shadow_candidates_for_task(&engine, agent, tag, ErrorCategory::Critical, 0.3, 200)
-                .await;
+            score_shadow_candidates_for_task(
+                &engine,
+                agent,
+                tag,
+                ErrorCategory::Critical,
+                0.3,
+                200,
+            )
+            .await;
         }
 
         let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
@@ -1427,7 +1661,10 @@ mod tests {
         );
         // Now selectable for injection.
         let sel = select_task_rules(&engine, agent, TASK_RULE_INJECTION_LIMIT).await;
-        assert!(sel.iter().any(|r| r.id == id), "promoted rule becomes injectable");
+        assert!(
+            sel.iter().any(|r| r.id == id),
+            "promoted rule becomes injectable"
+        );
     }
 
     #[tokio::test]
@@ -1446,13 +1683,24 @@ mod tests {
         }
         for _ in 0..5 {
             score_shadow_candidates_for_task(
-                &engine, agent, tag, ErrorCategory::Negligible, 0.5, 10,
+                &engine,
+                agent,
+                tag,
+                ErrorCategory::Negligible,
+                0.5,
+                10,
             )
             .await;
         }
         let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
-        assert!(entry.tags.iter().any(|t| t == SHADOW_RULE_TAG), "still shadow");
-        assert!(!entry.tags.iter().any(|t| t == RETIRED_RULE_TAG), "not retired");
+        assert!(
+            entry.tags.iter().any(|t| t == SHADOW_RULE_TAG),
+            "still shadow"
+        );
+        assert!(
+            !entry.tags.iter().any(|t| t == RETIRED_RULE_TAG),
+            "not retired"
+        );
     }
 
     #[tokio::test]
@@ -1466,7 +1714,12 @@ mod tests {
         // even the optimistic upper bound falls below baseline → retire.
         for _ in 0..16 {
             score_shadow_candidates_for_task(
-                &engine, agent, tag, ErrorCategory::Negligible, 0.5, 10,
+                &engine,
+                agent,
+                tag,
+                ErrorCategory::Negligible,
+                0.5,
+                10,
             )
             .await;
         }
@@ -1490,14 +1743,21 @@ mod tests {
             .await;
         let held =
             HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
-        assert_eq!(held.total(), 0, "birth-batch settle (now_seq <= born_seq) must not count");
+        assert_eq!(
+            held.total(),
+            0,
+            "birth-batch settle (now_seq <= born_seq) must not count"
+        );
 
         // A strictly later settle IS counted.
         score_shadow_candidates_for_task(&engine, agent, tag, ErrorCategory::Critical, 0.3, 501)
             .await;
         let held =
             HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
-        assert_eq!(held.oos_hits, 1, "an out-of-sample settle (now_seq > born_seq) counts");
+        assert_eq!(
+            held.oos_hits, 1,
+            "an out-of-sample settle (now_seq > born_seq) counts"
+        );
     }
 
     #[tokio::test]
@@ -1584,7 +1844,13 @@ mod tests {
         // Wilson lower bound clears the baseline → promoted out of shadow.
         for _ in 0..10 {
             score_shadow_candidates_by_ids(
-                &engine, agent, &armed, 1, ErrorCategory::Critical, 0.3, 200,
+                &engine,
+                agent,
+                &armed,
+                1,
+                ErrorCategory::Critical,
+                0.3,
+                200,
             )
             .await;
         }
@@ -1595,7 +1861,10 @@ mod tests {
         );
         // Promoted dialogue rules become selectable on the F2a path.
         let sel = select_rules(&engine, agent, INJECTION_LIMIT).await;
-        assert!(sel.iter().any(|r| r.id == id), "promoted rule becomes injectable");
+        assert!(
+            sel.iter().any(|r| r.id == id),
+            "promoted rule becomes injectable"
+        );
     }
 
     #[tokio::test]
@@ -1609,7 +1878,13 @@ mod tests {
         // optimistic upper bound falls below baseline → retire.
         for _ in 0..16 {
             score_shadow_candidates_by_ids(
-                &engine, agent, &armed, 1, ErrorCategory::Negligible, 0.5, 10,
+                &engine,
+                agent,
+                &armed,
+                1,
+                ErrorCategory::Negligible,
+                0.5,
+                10,
             )
             .await;
         }
@@ -1630,20 +1905,44 @@ mod tests {
 
         // now_seq == born_seq → birth batch, not counted (train != test).
         let out = score_shadow_candidates_by_ids(
-            &engine, agent, &armed, 1, ErrorCategory::Critical, 0.3, 500,
+            &engine,
+            agent,
+            &armed,
+            1,
+            ErrorCategory::Critical,
+            0.3,
+            500,
         )
         .await;
-        assert_eq!(out.scored, 1, "the candidate is still visited (gate evaluated)");
+        assert_eq!(
+            out.scored, 1,
+            "the candidate is still visited (gate evaluated)"
+        );
         let held =
             HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
-        assert_eq!(held.total(), 0, "birth-batch settle (now_seq <= born_seq) must not count");
+        assert_eq!(
+            held.total(),
+            0,
+            "birth-batch settle (now_seq <= born_seq) must not count"
+        );
 
         // A strictly later settle IS counted.
-        score_shadow_candidates_by_ids(&engine, agent, &armed, 1, ErrorCategory::Critical, 0.3, 501)
-            .await;
+        score_shadow_candidates_by_ids(
+            &engine,
+            agent,
+            &armed,
+            1,
+            ErrorCategory::Critical,
+            0.3,
+            501,
+        )
+        .await;
         let held =
             HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
-        assert_eq!(held.oos_hits, 1, "an out-of-sample settle (now_seq > born_seq) counts");
+        assert_eq!(
+            held.oos_hits, 1,
+            "an out-of-sample settle (now_seq > born_seq) counts"
+        );
     }
 
     #[tokio::test]
@@ -1653,7 +1952,10 @@ mod tests {
         // Armed as shadow, then promoted by a concurrent settle before this
         // one lands → the stale armed id must be skipped untouched.
         let promoted = store_shadow_dialogue_rule(&engine, agent, HeldOutStats::born(0)).await;
-        engine.remove_tag(agent, &promoted, SHADOW_RULE_TAG).await.unwrap();
+        engine
+            .remove_tag(agent, &promoted, SHADOW_RULE_TAG)
+            .await
+            .unwrap();
         // Armed, then retired concurrently → also skipped.
         let retired = store_shadow_dialogue_rule(&engine, agent, HeldOutStats::born(0)).await;
         engine
@@ -1676,7 +1978,11 @@ mod tests {
             let held = HeldOutStats::from_metadata(
                 &engine.get_metadata(agent, id).await.unwrap().unwrap(),
             );
-            assert_eq!(held.total(), 0, "no out-of-sample record written for a stale armed id");
+            assert_eq!(
+                held.total(),
+                0,
+                "no out-of-sample record written for a stale armed id"
+            );
         }
     }
 
@@ -1688,9 +1994,13 @@ mod tests {
         // situation.
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "agent-shadow-nomatch";
-        let id =
-            store_shadow_task_rule(&engine, agent, "goal_kind:coding_simple", HeldOutStats::born(0))
-                .await;
+        let id = store_shadow_task_rule(
+            &engine,
+            agent,
+            "goal_kind:coding_simple",
+            HeldOutStats::born(0),
+        )
+        .await;
 
         let out = score_shadow_candidates_for_task(
             &engine,
@@ -1705,8 +2015,15 @@ mod tests {
 
         let held =
             HeldOutStats::from_metadata(&engine.get_metadata(agent, &id).await.unwrap().unwrap());
-        assert_eq!(held.total(), 0, "no out-of-sample record written for a non-match");
+        assert_eq!(
+            held.total(),
+            0,
+            "no out-of-sample record written for a non-match"
+        );
         let entry = engine.get_by_id(agent, &id).await.unwrap().unwrap();
-        assert!(entry.tags.iter().any(|t| t == SHADOW_RULE_TAG), "still shadow, untouched");
+        assert!(
+            entry.tags.iter().any(|t| t == SHADOW_RULE_TAG),
+            "still shadow, untouched"
+        );
     }
 }

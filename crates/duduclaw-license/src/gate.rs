@@ -57,13 +57,64 @@ impl FeatureGate {
             toml::from_str(content).map_err(|e| LicenseError::ParseError(e.to_string()))?;
         Ok(Self { tiers: table })
     }
+}
 
-    /// Check if a boolean feature is available at the given tier.
+/// Booleans in `features.toml` that describe what the subscription PROMISES a
+/// human will do — a support channel, a patch SLA, the hosting form factor,
+/// resale rights — rather than anything the binary enforces.
+///
+/// None of them has ever had a `check()` call site, yet they are shaped
+/// exactly like the three real capability gates, which invites a future
+/// author to "gate" on one and ship a feature that silently does nothing.
+/// [`FeatureGate::check`] therefore refuses them outright; read them through
+/// [`FeatureGate::service_commitment`], which is display-only by name.
+pub const SERVICE_COMMITMENTS: &[&str] = &[
+    "dashboard_enterprise",
+    "priority_security_patch",
+    "private_discord_support",
+    "odoo_integration_supported",
+    "redistribution",
+    "dedicated_engineer",
+    "cloud_only",
+    "self_host_only",
+];
+
+/// True when `feature` names a service commitment rather than a capability
+/// gate (see [`SERVICE_COMMITMENTS`]). Exact match — no prefix/substring
+/// checks (project convention #2).
+pub fn is_service_commitment(feature: &str) -> bool {
+    SERVICE_COMMITMENTS.iter().any(|f| *f == feature)
+}
+
+impl FeatureGate {
+    /// Check if a **capability gate** is available at the given tier.
     ///
     /// Feature lookup walks the inheritance chain from the requested tier
     /// down to its base, returning the first explicit definition found.
     /// Undefined features return `false`.
+    ///
+    /// A [`SERVICE_COMMITMENTS`] name is refused (always `false`) no matter
+    /// what `features.toml` says: those describe a human promise, not a code
+    /// path, so gating on one would ship a switch that does nothing. Use
+    /// [`Self::service_commitment`] to display them.
     pub fn check(&self, tier: LicenseTier, feature: &str) -> bool {
+        if is_service_commitment(feature) {
+            return false;
+        }
+        self.lookup_bool(tier, feature)
+    }
+
+    /// Read a [`SERVICE_COMMITMENTS`] value for **display only** (e.g.
+    /// `duduclaw license status`). Returns `false` for anything that is not a
+    /// service commitment — use [`Self::check`] for capability gates.
+    pub fn service_commitment(&self, tier: LicenseTier, feature: &str) -> bool {
+        if !is_service_commitment(feature) {
+            return false;
+        }
+        self.lookup_bool(tier, feature)
+    }
+
+    fn lookup_bool(&self, tier: LicenseTier, feature: &str) -> bool {
         for tier_key in Self::inheritance_chain(tier) {
             if let Some(section) = self.tiers.get(*tier_key) {
                 if let Some(value) = section.get(feature) {
@@ -95,17 +146,6 @@ impl FeatureGate {
     /// `0` means unlimited.
     pub fn max_channels(&self, tier: LicenseTier) -> usize {
         self.get_integer(tier, "max_channels")
-    }
-
-    /// Return the maximum number of local models for a given tier.
-    /// `0` means unlimited.
-    pub fn max_local_models(&self, tier: LicenseTier) -> usize {
-        self.get_integer(tier, "max_local_models")
-    }
-
-    /// Return the monthly message cap. `0` means unlimited.
-    pub fn max_messages_per_month(&self, tier: LicenseTier) -> usize {
-        self.get_integer(tier, "max_messages_per_month")
     }
 
     /// Return the memory storage quota in gigabytes. `0` means unlimited.
@@ -141,11 +181,6 @@ impl FeatureGate {
     /// `0` disables the grace-period check (license never expires for offline reasons).
     pub fn grace_period_days(&self, tier: LicenseTier) -> i64 {
         self.get_integer(tier, "license_grace_period_days") as i64
-    }
-
-    /// Return the included office-hour allocation per month.
-    pub fn office_hour_hours_per_month(&self, tier: LicenseTier) -> usize {
-        self.get_integer(tier, "office_hour_hours_per_month")
     }
 
     /// Helper to read an integer field from a tier section,
@@ -194,7 +229,6 @@ mod tests {
 [opensource]
 max_channels = 0
 max_agents = 0
-max_local_models = 0
 memory_quota_gb = 0
 premium_templates = false
 industry_evolution_params = false
@@ -207,7 +241,6 @@ license_grace_period_days = 0
 cloud_only = true
 max_agents = 1
 max_channels = 1
-max_messages_per_month = 100
 
 [solo]
 cloud_only = true
@@ -252,6 +285,41 @@ license_grace_period_days = 60
         FeatureGate::from_str(TEST_TOML).unwrap()
     }
 
+    // --- Service commitments vs capability gates ---
+
+    /// D17 regression: the eight zero-behaviour booleans must NOT be
+    /// answerable through the gating predicate, no matter what the TOML says.
+    /// `dashboard_enterprise = true` for `self_host_pro` in the fixture below
+    /// is exactly the shape that used to read like a working gate.
+    #[test]
+    fn check_refuses_service_commitments_even_when_true() {
+        let g = gate();
+        for f in SERVICE_COMMITMENTS {
+            assert!(
+                !g.check(LicenseTier::SelfHostPro, f),
+                "`{f}` is a service commitment — check() must not gate on it"
+            );
+            assert!(!g.check(LicenseTier::Oem, f), "`{f}` must stay ungated");
+        }
+        // ...while the display-only reader still reports the real value.
+        assert!(g.service_commitment(LicenseTier::SelfHostPro, "dashboard_enterprise"));
+        assert!(g.service_commitment(LicenseTier::Oem, "redistribution"));
+        assert!(!g.service_commitment(LicenseTier::OpenSource, "dashboard_enterprise"));
+    }
+
+    /// The three real capability gates keep working through `check()`, and
+    /// `service_commitment()` refuses them (so the two readers can't be
+    /// swapped by accident).
+    #[test]
+    fn capability_gates_stay_on_check_only() {
+        let g = gate();
+        assert!(g.check(LicenseTier::Studio, "premium_templates"));
+        assert!(g.check(LicenseTier::Oem, "white_label"));
+        assert!(!g.check(LicenseTier::OpenSource, "premium_templates"));
+        assert!(!g.service_commitment(LicenseTier::Studio, "premium_templates"));
+        assert!(!g.service_commitment(LicenseTier::Oem, "white_label"));
+    }
+
     // --- Limits ---
 
     #[test]
@@ -267,15 +335,13 @@ license_grace_period_days = 60
         let g = gate();
         assert_eq!(g.max_agents(LicenseTier::Hobby), 1);
         assert_eq!(g.max_channels(LicenseTier::Hobby), 1);
-        assert_eq!(g.max_messages_per_month(LicenseTier::Hobby), 100);
     }
 
     #[test]
     fn solo_inherits_hobby_when_unspecified() {
         let g = gate();
-        // Solo doesn't define max_messages_per_month — inherits from Hobby
-        assert_eq!(g.max_messages_per_month(LicenseTier::Solo), 100);
-        // Solo defines its own max_agents
+        // Solo doesn't define max_channels-free fields — inherits from Hobby
+        // through the chain; Solo defines its own max_agents.
         assert_eq!(g.max_agents(LicenseTier::Solo), 1);
         assert_eq!(g.max_channels(LicenseTier::Solo), 2);
     }
@@ -285,8 +351,6 @@ license_grace_period_days = 60
         let g = gate();
         assert_eq!(g.max_agents(LicenseTier::Studio), 3);
         assert_eq!(g.memory_quota_gb(LicenseTier::Studio), 1);
-        // Inherited from Hobby through Solo
-        assert_eq!(g.max_messages_per_month(LicenseTier::Studio), 100);
     }
 
     #[test]
@@ -351,10 +415,12 @@ license_grace_period_days = 60
     #[test]
     fn self_host_pro_does_not_inherit_cloud() {
         let g = gate();
-        // cloud_only is true in Hobby but should NOT propagate to SelfHostPro
-        assert!(!g.check(LicenseTier::SelfHostPro, "cloud_only"));
-        // self_host_only IS set in SelfHostPro
-        assert!(g.check(LicenseTier::SelfHostPro, "self_host_only"));
+        // `cloud_only` / `self_host_only` are service commitments (delivery
+        // mode), so they are read through `service_commitment()` — `check()`
+        // refuses them by design. `cloud_only` is true in Hobby and must NOT
+        // propagate to SelfHostPro.
+        assert!(!g.service_commitment(LicenseTier::SelfHostPro, "cloud_only"));
+        assert!(g.service_commitment(LicenseTier::SelfHostPro, "self_host_only"));
     }
 
     #[test]
@@ -362,11 +428,13 @@ license_grace_period_days = 60
         let g = gate();
         assert!(g.check(LicenseTier::Oem, "premium_templates"));
         assert!(g.check(LicenseTier::Oem, "industry_evolution_params"));
-        assert!(g.check(LicenseTier::Oem, "dashboard_enterprise"));
-        assert!(g.check(LicenseTier::Oem, "self_host_only"));
-        // OEM-specific
+        // OEM-specific capability gate.
         assert!(g.check(LicenseTier::Oem, "white_label"));
-        assert!(g.check(LicenseTier::Oem, "redistribution"));
+        // Service commitments inherit through the same chain, read through
+        // the display-only reader.
+        assert!(g.service_commitment(LicenseTier::Oem, "dashboard_enterprise"));
+        assert!(g.service_commitment(LicenseTier::Oem, "self_host_only"));
+        assert!(g.service_commitment(LicenseTier::Oem, "redistribution"));
     }
 
     // --- Feature gating ---
@@ -376,7 +444,7 @@ license_grace_period_days = 60
         let g = gate();
         assert!(!g.check(LicenseTier::OpenSource, "premium_templates"));
         assert!(!g.check(LicenseTier::OpenSource, "industry_evolution_params"));
-        assert!(!g.check(LicenseTier::OpenSource, "dashboard_enterprise"));
+        assert!(!g.service_commitment(LicenseTier::OpenSource, "dashboard_enterprise"));
     }
 
     #[test]
@@ -384,7 +452,7 @@ license_grace_period_days = 60
         let g = gate();
         assert!(g.check(LicenseTier::Studio, "premium_templates"));
         assert!(!g.check(LicenseTier::Studio, "industry_evolution_params"));
-        assert!(!g.check(LicenseTier::Studio, "dashboard_enterprise"));
+        assert!(!g.service_commitment(LicenseTier::Studio, "dashboard_enterprise"));
     }
 
     #[test]
@@ -392,8 +460,8 @@ license_grace_period_days = 60
         let g = gate();
         assert!(g.check(LicenseTier::Business, "premium_templates"));
         assert!(g.check(LicenseTier::Business, "industry_evolution_params"));
-        assert!(g.check(LicenseTier::Business, "dashboard_enterprise"));
-        assert!(g.check(LicenseTier::Business, "odoo_integration_supported"));
+        assert!(g.service_commitment(LicenseTier::Business, "dashboard_enterprise"));
+        assert!(g.service_commitment(LicenseTier::Business, "odoo_integration_supported"));
     }
 
     #[test]
@@ -401,8 +469,8 @@ license_grace_period_days = 60
         let g = gate();
         assert!(g.check(LicenseTier::SelfHostPro, "premium_templates"));
         assert!(g.check(LicenseTier::SelfHostPro, "industry_evolution_params"));
-        assert!(g.check(LicenseTier::SelfHostPro, "dashboard_enterprise"));
-        assert!(g.check(LicenseTier::SelfHostPro, "priority_security_patch"));
+        assert!(g.service_commitment(LicenseTier::SelfHostPro, "dashboard_enterprise"));
+        assert!(g.service_commitment(LicenseTier::SelfHostPro, "priority_security_patch"));
     }
 
     #[test]
@@ -502,8 +570,8 @@ license_grace_period_days = 60
         // Sanity checks
         assert!(!gate.check(LicenseTier::OpenSource, "premium_templates"));
         assert!(gate.check(LicenseTier::Studio, "premium_templates"));
-        assert!(gate.check(LicenseTier::SelfHostPro, "dashboard_enterprise"));
         assert!(gate.check(LicenseTier::Oem, "white_label"));
+        assert!(gate.service_commitment(LicenseTier::SelfHostPro, "dashboard_enterprise"));
 
         // Phone-home defaults
         assert_eq!(gate.phone_home_interval_days(LicenseTier::SelfHostPro), 7);

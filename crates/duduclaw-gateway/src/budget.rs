@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::cost_telemetry::{get_telemetry, init_telemetry, CostTelemetry};
+use crate::cost_telemetry::{CostTelemetry, get_telemetry, init_telemetry};
 
 /// Hours in the rolling monthly window.
 const MONTHLY_WINDOW_HOURS: u64 = 24 * 30;
@@ -94,7 +94,11 @@ impl BudgetVerdict {
                 spent_cents,
                 cap_cents,
             } => {
-                let window = if *scope == "daily" { "今日" } else { "本月" };
+                let window = if *scope == "daily" {
+                    "今日"
+                } else {
+                    "本月"
+                };
                 format!(
                     "⚠️ 已停工（花費達上限）。我目前因為花費達到上限暫停工作，已通知管理員。\
                      （{window}已使用 US${:.2} / 上限 US${:.2}，額度會在時間窗滑動後自動恢復）",
@@ -209,7 +213,13 @@ pub async fn evaluate_budget(
                 cap_cents: limits.daily_cap_cents,
             };
         }
-        warn_if_approaching(agent_id, "daily", spent, limits.daily_cap_cents, limits.warn_threshold_percent);
+        warn_if_approaching(
+            agent_id,
+            "daily",
+            spent,
+            limits.daily_cap_cents,
+            limits.warn_threshold_percent,
+        );
     }
     if limits.monthly_limit_cents > 0 {
         let spent = spent_cents(tel, agent_id, MONTHLY_WINDOW_HOURS).await;
@@ -220,7 +230,13 @@ pub async fn evaluate_budget(
                 cap_cents: limits.monthly_limit_cents,
             };
         }
-        warn_if_approaching(agent_id, "monthly", spent, limits.monthly_limit_cents, limits.warn_threshold_percent);
+        warn_if_approaching(
+            agent_id,
+            "monthly",
+            spent,
+            limits.monthly_limit_cents,
+            limits.warn_threshold_percent,
+        );
     }
     BudgetVerdict::Allow
 }
@@ -257,6 +273,14 @@ pub async fn check_agent_budget(
     if agent_id.is_empty() {
         return BudgetVerdict::Allow;
     }
+    // D12 (2026-09 feature audit): relative burn-rate check, deliberately
+    // BEFORE the `is_inert` short-circuit below. Fixed caps and burn-rate
+    // anomalies answer different questions, and an agent with no cap
+    // configured is exactly the one whose runaway spend nothing else would
+    // notice. Self-throttled to one query per agent per hour and to one alert
+    // per agent per UTC day; warns, never blocks (see `cost_anomaly`).
+    crate::cost_anomaly::maybe_scan(home_dir, agent_dir, agent_id).await;
+
     let limits = load_budget_limits(agent_dir);
     if limits.is_inert() {
         return BudgetVerdict::Allow;
@@ -324,9 +348,10 @@ async fn notify_breaker_transition(
         return; // already alerted on this state (or was never open) — stay quiet
     }
     let name = agent_display_name(agent_dir, agent_id);
-    let link = crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Billing, agent_id)
-        .map(|url| format!("\n👉 {url}"))
-        .unwrap_or_default();
+    let link =
+        crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Billing, agent_id)
+            .map(|url| format!("\n👉 {url}"))
+            .unwrap_or_default();
     let text = if is_open {
         format!("⚠️ {name} 已停工：花費達上限。{link}")
     } else {
@@ -344,7 +369,11 @@ async fn notify_breaker_transition(
         crate::goal_notify::notify_agent_plain(home_dir, agent_id, level, "budget.breaker", &text)
             .await;
     if matches!(outcome, crate::goal_notify::NotifyOutcome::SendFailed) {
-        tracing::debug!(agent_id, is_open, "budget: breaker-transition push failed (non-fatal)");
+        tracing::debug!(
+            agent_id,
+            is_open,
+            "budget: breaker-transition push failed (non-fatal)"
+        );
     }
 }
 
@@ -391,7 +420,7 @@ fn read_breaker_states(path: &Path) -> HashMap<String, String> {
 /// The `[agent]` section is `Option` on the view precisely so a missing table
 /// still short-circuits to `agent_id` here rather than silently reading an
 /// all-empty one.
-fn agent_display_name(agent_dir: Option<&Path>, agent_id: &str) -> String {
+pub(crate) fn agent_display_name(agent_dir: Option<&Path>, agent_id: &str) -> String {
     let Some(dir) = agent_dir else {
         return agent_id.to_string();
     };
@@ -402,12 +431,7 @@ fn agent_display_name(agent_dir: Option<&Path>, agent_id: &str) -> String {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            a.name
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })
+        .or_else(|| a.name.as_deref().map(str::trim).filter(|s| !s.is_empty()))
         .unwrap_or(agent_id)
         .to_string()
 }
@@ -433,7 +457,11 @@ fn append_budget_event(
     let path = home_dir.join("budget_events.jsonl");
     let _ = duduclaw_core::with_file_lock(&path, || {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = writeln!(f, "{line}");
         }
         Ok::<(), std::io::Error>(())
@@ -480,11 +508,11 @@ mod tests {
     #[test]
     fn default_direction_budget_absent_or_unreadable_is_no_cap() {
         for body in [
-            "",                              // empty file
-            "[agent]\nname = \"a\"\n",       // no [budget]
-            "[budget]\n",                    // section, no keys
-            "budget = 1\n",                  // scalar where a table was expected
-            "not toml [[[",                  // malformed file
+            "",                        // empty file
+            "[agent]\nname = \"a\"\n", // no [budget]
+            "[budget]\n",              // section, no keys
+            "budget = 1\n",            // scalar where a table was expected
+            "not toml [[[",            // malformed file
         ] {
             let dir = budget_dir(body);
             let l = load_budget_limits(Some(dir.path()));
@@ -497,7 +525,10 @@ mod tests {
         // No agent dir at all, and a dir with no file — same direction.
         assert_eq!(load_budget_limits(None).monthly_limit_cents, 0);
         let empty = tempdir().unwrap();
-        assert_eq!(load_budget_limits(Some(empty.path())).monthly_limit_cents, 0);
+        assert_eq!(
+            load_budget_limits(Some(empty.path())).monthly_limit_cents,
+            0
+        );
     }
 
     #[test]
@@ -513,7 +544,10 @@ mod tests {
              hard_stop = \"yes\"\n",
         );
         let l = load_budget_limits(Some(dir.path()));
-        assert_eq!(l.monthly_limit_cents, 0, "a string is not coerced to a number");
+        assert_eq!(
+            l.monthly_limit_cents, 0,
+            "a string is not coerced to a number"
+        );
         assert_eq!(l.daily_cap_cents, 0);
         assert_eq!(l.warn_threshold_percent, 0);
         assert!(!l.hard_stop, "a non-bool, non-int hard_stop is false");
@@ -532,9 +566,7 @@ mod tests {
         assert_eq!(l.daily_cap_cents, 0, "negative clamps to 0");
         assert_eq!(l.warn_threshold_percent, 100, "capped at 100");
 
-        let floats = budget_dir(
-            "[budget]\nmonthly_limit_cents = 100.0\ndaily_cap_cents = 49.6\n",
-        );
+        let floats = budget_dir("[budget]\nmonthly_limit_cents = 100.0\ndaily_cap_cents = 49.6\n");
         let l = load_budget_limits(Some(floats.path()));
         assert_eq!(l.monthly_limit_cents, 100, "the `100.0` typo still works");
         assert_eq!(l.daily_cap_cents, 50, "floats round, not truncate");
@@ -545,13 +577,17 @@ mod tests {
         for (body, want) in [
             ("[budget]\nhard_stop = true\n", true),
             ("[budget]\nhard_stop = false\n", false),
-            ("[budget]\nhard_stop = 1\n", true),   // tolerated with a warn
-            ("[budget]\nhard_stop = 0\n", false),  // tolerated with a warn
+            ("[budget]\nhard_stop = 1\n", true), // tolerated with a warn
+            ("[budget]\nhard_stop = 0\n", false), // tolerated with a warn
             ("[budget]\nhard_stop = \"1\"\n", false), // NOT coerced
             ("[budget]\n", false),
         ] {
             let dir = budget_dir(body);
-            assert_eq!(load_budget_limits(Some(dir.path())).hard_stop, want, "for {body:?}");
+            assert_eq!(
+                load_budget_limits(Some(dir.path())).hard_stop,
+                want,
+                "for {body:?}"
+            );
         }
     }
 
@@ -562,11 +598,11 @@ mod tests {
         // an all-empty one and reporting a blank name.
         for body in [
             "",
-            "[budget]\nhard_stop = true\n",         // no [agent] table at all
-            "agent = \"scalar\"\n",                 // wrong-typed section
-            "[agent]\n",                            // table, no keys
-            "[agent]\ndisplay_name = \"  \"\n",     // blank ⇒ falls through
-            "[agent]\ndisplay_name = 42\n",         // wrong type
+            "[budget]\nhard_stop = true\n", // no [agent] table at all
+            "agent = \"scalar\"\n",         // wrong-typed section
+            "[agent]\n",                    // table, no keys
+            "[agent]\ndisplay_name = \"  \"\n", // blank ⇒ falls through
+            "[agent]\ndisplay_name = 42\n", // wrong type
             "not toml [[[",
         ] {
             let dir = budget_dir(body);
@@ -704,9 +740,15 @@ mod tests {
             cap_cents: 100,
         };
         let m = v.user_message();
-        assert!(m.contains("已停工"), "must use the platform's external state wording: {m}");
+        assert!(
+            m.contains("已停工"),
+            "must use the platform's external state wording: {m}"
+        );
         assert!(m.contains("花費達上限"));
-        assert!(m.contains("已通知管理員"), "must truthfully tell the user the admin was alerted: {m}");
+        assert!(
+            m.contains("已通知管理員"),
+            "must truthfully tell the user the admin was alerted: {m}"
+        );
     }
 
     // ── record_breaker_transition: the admin-push de-dup ─────────────────
@@ -789,11 +831,21 @@ mod tests {
     #[test]
     fn display_name_falls_back_to_name_then_agent_id() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("agent.toml"), "[agent]\nname = \"assistant\"\n").unwrap();
-        assert_eq!(agent_display_name(Some(dir.path()), "assistant"), "assistant");
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[agent]\nname = \"assistant\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            agent_display_name(Some(dir.path()), "assistant"),
+            "assistant"
+        );
 
         let empty_dir = tempdir().unwrap();
-        assert_eq!(agent_display_name(Some(empty_dir.path()), "fallback-id"), "fallback-id");
+        assert_eq!(
+            agent_display_name(Some(empty_dir.path()), "fallback-id"),
+            "fallback-id"
+        );
         assert_eq!(agent_display_name(None, "no-dir-id"), "no-dir-id");
     }
 }

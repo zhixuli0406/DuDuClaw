@@ -74,7 +74,14 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
         .map(|e| {
             let redacted = redact_match(&e.r#match, &e.secret);
             let title = if e.description.is_empty() {
-                format!("Potential secret ({})", if e.rule_id.is_empty() { "unknown rule" } else { &e.rule_id })
+                format!(
+                    "Potential secret ({})",
+                    if e.rule_id.is_empty() {
+                        "unknown rule"
+                    } else {
+                        &e.rule_id
+                    }
+                )
             } else {
                 e.description.clone()
             };
@@ -82,7 +89,14 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
                 kind: EvidenceKind::StaticHit,
                 source: ENGINE_NAME.to_string(),
                 detail: duduclaw_core::truncate_bytes(
-                    &format!("gitleaks rule {}", if e.rule_id.is_empty() { "(unknown)" } else { &e.rule_id }),
+                    &format!(
+                        "gitleaks rule {}",
+                        if e.rule_id.is_empty() {
+                            "(unknown)"
+                        } else {
+                            &e.rule_id
+                        }
+                    ),
                     crate::secaudit::schema::SNIPPET_MAX_BYTES,
                 )
                 .to_string(),
@@ -96,7 +110,11 @@ pub fn parse(raw: &str) -> Result<Vec<Finding>, String> {
                 e.file,
                 e.start_line,
                 &redacted,
-                if e.rule_id.is_empty() { "unknown".to_string() } else { e.rule_id },
+                if e.rule_id.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    e.rule_id
+                },
                 evidence,
             )
         })

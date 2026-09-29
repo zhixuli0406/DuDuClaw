@@ -297,6 +297,103 @@ fn default_baseline_max_age_secs() -> u64 {
     DEFAULT_BASELINE_MAX_AGE_SECS
 }
 
+// ── O15: named knob bundles ──────────────────────────────────────────────────
+
+/// A named bundle of defaults for the resident-sensing knobs (audit O15).
+///
+/// The 2026-09 feature audit flagged the knob count here — DNS TTL, idle
+/// watchdog, client ping, baseline lifetime, rate cap, `persist_every_n`, and
+/// the screener's fail-open policy — as past what a non-expert operator can
+/// reason about. A preset gives the two answers most installs actually want:
+///
+/// - **`conservative`** — a quiet, fail-closed posture: fewer events per
+///   minute, a short delta baseline (a stale baseline can never manufacture a
+///   giant fictional move), and a screener that **suppresses** the action when
+///   the local model cannot answer.
+/// - **`aggressive`** — a high-throughput posture: a generous rate cap, a long
+///   baseline lifetime, and the historical fail-open screener.
+///
+/// # Precedence
+///
+/// A preset only fills in keys the operator did **not** write. An explicit
+/// `max_events_per_minute` / `baseline_max_age_secs` on a source, or an
+/// explicit `on_unavailable` on a rule's `action.screen`, always wins — the
+/// preset is a default provider, never an override. With no `preset` key at
+/// all, every default is exactly what it was before this existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickPreset {
+    /// Quiet + fail-closed.
+    Conservative,
+    /// High-throughput + fail-open (the historical defaults, widened).
+    Aggressive,
+}
+
+impl TickPreset {
+    /// Parse the `[tick] preset` wire value. Unknown values are rejected (the
+    /// caller warns and behaves as if no preset were set — never guesses).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "conservative" => Some(Self::Conservative),
+            "aggressive" => Some(Self::Aggressive),
+            _ => None,
+        }
+    }
+
+    /// Wire value, for config round-tripping and the dashboard card.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Conservative => "conservative",
+            Self::Aggressive => "aggressive",
+        }
+    }
+
+    /// Default per-source emission cap when the source omits it.
+    pub fn max_events_per_minute(self) -> u32 {
+        match self {
+            Self::Conservative => 30,
+            Self::Aggressive => 600,
+        }
+    }
+
+    /// Default per-field delta-baseline lifetime when the source omits it.
+    pub fn baseline_max_age_secs(self) -> u64 {
+        match self {
+            // 15 minutes — short enough that a feed which went quiet cannot
+            // come back and report a day's move as one tick's delta.
+            Self::Conservative => 900,
+            // 6 hours — a slow feed keeps its baseline across a trading lull.
+            Self::Aggressive => 21_600,
+        }
+    }
+
+    /// Default screener policy when a rule's `action.screen` omits
+    /// `on_unavailable`. Mirrors
+    /// [`crate::autopilot_screen::OnUnavailable`]'s wire values.
+    pub fn screen_on_unavailable(self) -> &'static str {
+        match self {
+            Self::Conservative => "drop",
+            Self::Aggressive => "pass",
+        }
+    }
+
+    /// Read just `[tick] preset` from `<home>/config.toml`.
+    ///
+    /// Deliberately cheap (no source parsing, no validation) so the autopilot
+    /// engine can resolve the screener default without loading the whole
+    /// section. Absent file / section / key, or an unknown value, all give
+    /// `None` = "no preset", which is byte-identical to the pre-O15 defaults.
+    pub fn from_home(home_dir: &Path) -> Option<Self> {
+        let content = std::fs::read_to_string(home_dir.join("config.toml")).ok()?;
+        let table = content.parse::<toml::Table>().ok()?;
+        let raw = table
+            .get("tick")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("preset"))
+            .and_then(|v| v.as_str())?;
+        Self::parse(raw)
+    }
+}
+
 /// The `[tick]` section. `enabled = false` by default — with it unset, no
 /// source task is ever spawned and nothing about the gateway changes.
 #[derive(Debug, Clone, PartialEq)]
@@ -312,6 +409,9 @@ pub struct TickConfig {
     /// its resolver, not of one feed. Copied onto every source by
     /// [`Self::from_section`].
     pub dns_ttl_secs: u64,
+    /// O15 — the named knob bundle in effect, if any. `None` (the default)
+    /// means every per-source default is exactly the pre-O15 constant.
+    pub preset: Option<TickPreset>,
     /// Only entries that parsed AND validated. Invalid entries were warned
     /// about and dropped at load time.
     pub sources: Vec<TickSourceConfig>,
@@ -323,6 +423,7 @@ impl Default for TickConfig {
             enabled: false,
             allow_command_sources: false,
             dns_ttl_secs: DEFAULT_DNS_TTL_SECS,
+            preset: None,
             sources: Vec::new(),
         }
     }
@@ -374,6 +475,21 @@ impl TickConfig {
             .and_then(|v| v.as_integer())
             .and_then(|n| u64::try_from(n).ok())
             .unwrap_or(DEFAULT_DNS_TTL_SECS);
+        // O15 — an unknown value is warned about and ignored (no preset), never
+        // guessed at. `preset` absent ⇒ every default below is the pre-O15 one.
+        let preset = match section.get("preset").and_then(|v| v.as_str()) {
+            None => None,
+            Some(raw) => {
+                let parsed = TickPreset::parse(raw);
+                if parsed.is_none() {
+                    warn!(
+                        preset = %raw,
+                        "[tick] unknown preset — ignored; must be 'conservative' or 'aggressive'"
+                    );
+                }
+                parsed
+            }
+        };
 
         let mut sources: Vec<TickSourceConfig> = Vec::new();
         if let Some(arr) = section.get("sources").and_then(|v| v.as_array()) {
@@ -389,6 +505,13 @@ impl TickConfig {
                         continue;
                     }
                 };
+                // O15 — fill ONLY the keys this entry did not write. Presence
+                // is read from the raw TOML table, because serde has already
+                // substituted its own default by the time `raw` exists: the
+                // parsed value cannot tell "operator wrote 120" from "nobody
+                // wrote anything". Applied before `validate_source` so the
+                // clamps and advisory warnings still see the effective value.
+                let raw = apply_preset(raw, preset, item.as_table());
                 let id = raw.id.clone();
                 if sources.iter().any(|s| s.id == id) {
                     warn!(
@@ -414,6 +537,7 @@ impl TickConfig {
             enabled,
             allow_command_sources,
             dns_ttl_secs,
+            preset,
             sources,
         }
     }
@@ -425,6 +549,39 @@ impl TickConfig {
             return Vec::new();
         }
         self.sources.iter().filter(|s| s.enabled).collect()
+    }
+}
+
+/// O15 — apply a [`TickPreset`]'s defaults to the keys `raw_table` did not
+/// declare. Returns a **new** value (project immutability convention).
+///
+/// `preset == None`, or a source that spelled every affected key out, both
+/// return a value byte-identical to the input. `raw_table == None` (an array
+/// entry that is somehow not a table — it would have failed to deserialize
+/// anyway) is treated as "declared nothing", which is the conservative read:
+/// worst case the preset supplies a default that serde would have supplied.
+fn apply_preset(
+    raw: TickSourceConfig,
+    preset: Option<TickPreset>,
+    raw_table: Option<&toml::Table>,
+) -> TickSourceConfig {
+    let Some(preset) = preset else {
+        return raw;
+    };
+    let declared = |key: &str| raw_table.is_some_and(|t| t.contains_key(key));
+
+    TickSourceConfig {
+        max_events_per_minute: if declared("max_events_per_minute") {
+            raw.max_events_per_minute
+        } else {
+            preset.max_events_per_minute()
+        },
+        baseline_max_age_secs: if declared("baseline_max_age_secs") {
+            raw.baseline_max_age_secs
+        } else {
+            preset.baseline_max_age_secs()
+        },
+        ..raw
     }
 }
 
@@ -2021,6 +2178,7 @@ mod tests {
             enabled: true,
             allow_command_sources: false,
             dns_ttl_secs: DEFAULT_DNS_TTL_SECS,
+            preset: None,
             sources: vec![s],
         };
         assert!(!format!("{cfg:?}").contains("sk-live"));
@@ -2073,5 +2231,120 @@ mod tests {
             "#,
         );
         assert!(per_source_off.active_sources().is_empty());
+    }
+
+    // ── O15: `[tick] preset` ─────────────────────────────────────────────
+
+    /// Baseline: with no `preset` key, every per-source default is exactly
+    /// the pre-O15 constant. This is the "byte-identical when unset" contract.
+    #[test]
+    fn no_preset_keeps_historical_defaults() {
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            [[tick.sources]]
+            id = "a"
+            kind = "http_poll"
+            url = "https://example.com/quote"
+            "#,
+        );
+        assert_eq!(s.max_events_per_minute, DEFAULT_MAX_EVENTS_PER_MINUTE);
+        assert_eq!(s.baseline_max_age_secs, DEFAULT_BASELINE_MAX_AGE_SECS);
+        assert_eq!(parse("[tick]\nenabled = true\n").preset, None);
+    }
+
+    /// `conservative` lowers the rate cap and shortens the delta baseline for
+    /// a source that declared neither.
+    #[test]
+    fn conservative_preset_fills_undeclared_keys() {
+        let body = r#"
+            [tick]
+            enabled = true
+            preset = "conservative"
+            [[tick.sources]]
+            id = "a"
+            kind = "http_poll"
+            url = "https://example.com/quote"
+            "#;
+        assert_eq!(parse(body).preset, Some(TickPreset::Conservative));
+        let s = source(body);
+        assert_eq!(s.max_events_per_minute, 30);
+        assert_eq!(s.baseline_max_age_secs, 900);
+    }
+
+    /// `aggressive` raises both.
+    #[test]
+    fn aggressive_preset_fills_undeclared_keys() {
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            preset = "aggressive"
+            [[tick.sources]]
+            id = "a"
+            kind = "http_poll"
+            url = "https://example.com/quote"
+            "#,
+        );
+        assert_eq!(s.max_events_per_minute, 600);
+        assert_eq!(s.baseline_max_age_secs, 21_600);
+    }
+
+    /// The contract that makes a preset safe: an explicitly written key always
+    /// wins, including when its value happens to equal the historical default
+    /// (the case a "compare against the default" implementation gets wrong).
+    #[test]
+    fn explicit_keys_always_beat_the_preset() {
+        let s = source(
+            r#"
+            [tick]
+            enabled = true
+            preset = "conservative"
+            [[tick.sources]]
+            id = "a"
+            kind = "http_poll"
+            url = "https://example.com/quote"
+            max_events_per_minute = 120
+            baseline_max_age_secs = 3600
+            "#,
+        );
+        assert_eq!(
+            s.max_events_per_minute, 120,
+            "an explicit value equal to the old default must not be overwritten"
+        );
+        assert_eq!(s.baseline_max_age_secs, 3600);
+    }
+
+    /// An unknown preset is ignored (warned about), never guessed at — the
+    /// install keeps the historical defaults rather than silently picking one.
+    #[test]
+    fn unknown_preset_is_ignored_not_guessed() {
+        let body = r#"
+            [tick]
+            enabled = true
+            preset = "paranoid"
+            [[tick.sources]]
+            id = "a"
+            kind = "http_poll"
+            url = "https://example.com/quote"
+            "#;
+        assert_eq!(parse(body).preset, None);
+        let s = source(body);
+        assert_eq!(s.max_events_per_minute, DEFAULT_MAX_EVENTS_PER_MINUTE);
+        assert_eq!(s.baseline_max_age_secs, DEFAULT_BASELINE_MAX_AGE_SECS);
+    }
+
+    /// Preset values still go through `validate_source`'s clamps, and the
+    /// wire strings round-trip.
+    #[test]
+    fn preset_values_are_valid_and_round_trip() {
+        for p in [TickPreset::Conservative, TickPreset::Aggressive] {
+            assert_eq!(TickPreset::parse(p.as_str()), Some(p));
+            assert!(p.max_events_per_minute() >= 1, "a 0 cap would mute a source");
+            assert!(p.baseline_max_age_secs() >= BASELINE_AGE_WARN_BELOW_SECS);
+        }
+        assert_eq!(TickPreset::Conservative.screen_on_unavailable(), "drop");
+        assert_eq!(TickPreset::Aggressive.screen_on_unavailable(), "pass");
     }
 }

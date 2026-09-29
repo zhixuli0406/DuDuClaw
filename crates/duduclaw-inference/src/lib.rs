@@ -1,20 +1,17 @@
 //! Local LLM inference engine for DuDuClaw.
 //!
-//! Provides a unified `InferenceBackend` trait with pluggable backends:
-//! - **llama.cpp** (via `llama-cpp-2` crate): Metal / CUDA / Vulkan / CPU
-//! - **mistral.rs** (via `mistralrs-core`): Rust-native, ISQ, PagedAttention, Speculative Decoding
-//! - **OpenAI-compatible HTTP** (for Exo, llamafile, vLLM, etc.)
+//! Provides a unified `InferenceBackend` trait. The one shipped backend is
+//! **OpenAI-compatible HTTP** (llama-server, Ollama, vLLM, SGLang, llamafile…).
+//! The in-process llama.cpp / mistral.rs / MLX backends were removed on
+//! 2026-09-29 (`wiki/reports/feature-audit-2026-09-29.md` T1-D2/D3, T3-S5):
+//! none of them was ever compiled into a shipped binary.
 //!
 //! Multi-mode inference with automatic failover:
-//!   Exo Cluster → llamafile → Direct Backend → OpenAI-compat → Cloud API
+//!   llamafile → Direct Backend → OpenAI-compat → Cloud API
 //!
 //! The **ConfidenceRouter** routes queries to the best tier:
-//!   LocalFast (small model) → LocalStrong (large model) → Cloud API
-//!
-//! **MLX Bridge** enables local evolution reflections on Apple Silicon.
-//!
-//! **Compression** module provides three strategies:
-//!   Meta-Token (lossless) / LLMLingua-2 (lossy) / StreamingLLM (KV-cache)
+//!   LocalFast (small model) → LocalStrong (large model) → Cloud API,
+//!   with [`ucci`] as the one calibrated escalation gate.
 
 pub mod adapter;
 pub mod appliance;
@@ -22,21 +19,15 @@ pub mod backend;
 pub mod config;
 pub mod engine;
 pub mod error;
-pub mod exo_cluster;
 pub mod hardware;
-pub mod jitrl;
-#[cfg(any(feature = "metal", feature = "cuda", feature = "vulkan"))]
-pub mod llama_cpp;
 pub mod llamafile;
 pub mod manager;
-#[cfg(feature = "mistralrs")]
-pub mod mistral_rs;
-pub mod mlx_bridge;
 pub mod model_manager;
 pub mod model_registry;
 pub mod openai_compat;
 pub mod router;
 pub mod types;
+pub mod ucci;
 pub mod util;
 pub mod embedding;
 pub mod whisper;

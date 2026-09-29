@@ -151,15 +151,22 @@ fn summarize_row(file: String, mtime: String, raw: &[u8]) -> ReportListRow {
                 file,
                 mtime,
                 repo: v.get("repo").and_then(Value::as_str).map(str::to_string),
-                started_at: v.get("started_at").and_then(Value::as_str).map(str::to_string),
+                started_at: v
+                    .get("started_at")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 profile_mode: v
                     .get("profile")
                     .and_then(|p| p.get("mode"))
                     .and_then(Value::as_str)
                     .map(str::to_string),
-                total_findings: summary.and_then(|s| s.get("total_findings")).and_then(Value::as_u64),
+                total_findings: summary
+                    .and_then(|s| s.get("total_findings"))
+                    .and_then(Value::as_u64),
                 by_severity: summary.and_then(|s| s.get("by_severity")).cloned(),
-                engines_run_count: summary.and_then(|s| s.get("engines_run_count")).and_then(Value::as_u64),
+                engines_run_count: summary
+                    .and_then(|s| s.get("engines_run_count"))
+                    .and_then(Value::as_u64),
                 engines_missing_count: summary
                     .and_then(|s| s.get("engines_missing_count"))
                     .and_then(Value::as_u64),
@@ -260,7 +267,10 @@ pub fn set_finding_status(
     with_file_lock(&path, || {
         let raw = std::fs::read(&path)?;
         let mut doc: Value = serde_json::from_slice(&raw).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("報告 JSON 格式錯誤：{e}"))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("報告 JSON 格式錯誤：{e}"),
+            )
         })?;
 
         let Some(findings) = doc.get_mut("findings").and_then(Value::as_array_mut) else {
@@ -401,10 +411,16 @@ mod tests {
         home.write_report("20260818T000000Z.json", "{ not valid json");
         let rows = list_reports(&home.0);
         assert_eq!(rows.len(), 2);
-        let broken = rows.iter().find(|r| r.file == "20260818T000000Z.json").unwrap();
+        let broken = rows
+            .iter()
+            .find(|r| r.file == "20260818T000000Z.json")
+            .unwrap();
         assert!(broken.parse_error.is_some());
         assert!(broken.repo.is_none());
-        let ok = rows.iter().find(|r| r.file == "20260817T000000Z.json").unwrap();
+        let ok = rows
+            .iter()
+            .find(|r| r.file == "20260817T000000Z.json")
+            .unwrap();
         assert!(ok.parse_error.is_none());
     }
 

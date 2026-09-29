@@ -620,7 +620,7 @@ mod tests {
         assert_eq!(dynamic_threshold(3, 0.25), 4); // round(0.5)=1... 0.25*2=0.5→1
         assert_eq!(dynamic_threshold(3, 0.5), 4); // 0.5*2=1.0
         assert_eq!(dynamic_threshold(3, 1.0), 5); // +2
-                                                  // Clamps at MAX_SCORE.
+        // Clamps at MAX_SCORE.
         assert_eq!(dynamic_threshold(5, 1.0), 5);
         // Clamps at MIN_SCORE.
         assert_eq!(dynamic_threshold(1, 0.0), 1);

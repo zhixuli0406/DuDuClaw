@@ -1,14 +1,23 @@
-//! Version store — OPRO-style historical tracking for SOUL.md versions.
+//! Evolution experiment store (`<home>/evolution.db`).
 //!
-//! Each SOUL.md change is recorded with before/after performance metrics,
-//! enabling the Generator to learn from history (which directions improved,
-//! which were rolled back).
+//! **S11 (2026-09-29): the SOUL.md version history this module was built for
+//! is gone.** With the legacy SOUL rewrite path removed nothing creates,
+//! observes, rolls back or consolidates a `SoulVersion` any more, so the
+//! `soul_versions` / `evolution_proposals` / `deferred_gvu` /
+//! `gvu_low_data_alerts` / `gvu_consolidations` tables and every accessor
+//! over them were removed with it. Existing rows are left on disk untouched
+//! — dropping a user's history is not this change's business — they simply
+//! have no reader.
+//!
+//! What remains is the **experiment log** (`gvu_experiment_log`): the unified
+//! per-round outcome record AEE writes and `gvu::stagnation` /
+//! `gvu::telemetry` read.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -16,112 +25,14 @@ static VERSION_STORE_NO_CRYPTO_WARNED: AtomicBool = AtomicBool::new(false);
 
 use duduclaw_security::crypto::CryptoEngine;
 
-/// SHA-256 hex digest of arbitrary bytes — shared by the rollback integrity path.
-fn sha256_hex(bytes: &[u8]) -> String {
-    use ring::digest;
-    let d = digest::digest(&digest::SHA256, bytes);
-    d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Performance metrics measured over a time period.
+/// Persistent store for the evolution experiment log.
 ///
-/// Used as both pre_metrics (baseline) and post_metrics (after change).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct VersionMetrics {
-    /// Ratio of positive feedback signals (0.0 - 1.0).
-    pub positive_feedback_ratio: f64,
-    /// Average prediction error during the period.
-    pub avg_prediction_error: f64,
-    /// Average user correction rate.
-    pub user_correction_rate: f64,
-    /// Number of contract violations.
-    pub contract_violations: u32,
-    /// Total conversations in the measurement period.
-    pub conversations_count: u32,
-    /// WP0.4 (R5): whether `feedback.jsonl` existed when this metric was
-    /// computed. `positive_feedback_ratio` is `0.0` both when feedback was
-    /// genuinely all-negative AND when the file simply doesn't exist (common
-    /// on low-traffic installs) — those two cases must not be conflated.
-    /// `#[serde(default)]` so pre-WP0.4 rows deserialize as `false`
-    /// (unknown/unavailable) rather than silently claiming measured data.
-    #[serde(default)]
-    pub feedback_available: bool,
-}
-
-/// Lifecycle status of a SOUL.md version.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VersionStatus {
-    /// Currently active and being observed.
-    Observing,
-    /// Observation passed — this version is confirmed.
-    Confirmed,
-    /// Observation failed — this version was rolled back.
-    RolledBack,
-    /// WP0.4 (R5): the observation window ran past the hard no-data ceiling
-    /// (default 14 days) without ever collecting enough conversations to
-    /// judge the outcome. SOUL.md content is left as-is (no evidence either
-    /// way — a low-traffic install should not be punished), but this status
-    /// is deliberately NOT `Confirmed`: it must never count toward
-    /// "confirmed" statistics, and dashboard/CLI surfaces should render it
-    /// as "unverified", not "passed".
-    ExpiredNoData,
-}
-
-impl VersionStatus {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Observing => "observing",
-            Self::Confirmed => "confirmed",
-            Self::RolledBack => "rolled_back",
-            Self::ExpiredNoData => "expired_no_data",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "confirmed" => Self::Confirmed,
-            "rolled_back" => Self::RolledBack,
-            "expired_no_data" => Self::ExpiredNoData,
-            _ => Self::Observing,
-        }
-    }
-}
-
-/// A versioned SOUL.md snapshot with associated metrics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SoulVersion {
-    pub version_id: String,
-    pub agent_id: String,
-    /// SHA-256 hash of the SOUL.md content.
-    pub soul_hash: String,
-    /// Summary of this version's SOUL.md (first 200 chars).
-    pub soul_summary: String,
-    /// When this version was applied.
-    pub applied_at: DateTime<Utc>,
-    /// When the observation period ends.
-    pub observation_end: DateTime<Utc>,
-    /// Current lifecycle status.
-    pub status: VersionStatus,
-    /// Performance metrics measured before this version was applied.
-    pub pre_metrics: VersionMetrics,
-    /// Performance metrics measured after the observation period.
-    pub post_metrics: Option<VersionMetrics>,
-    /// ID of the proposal that created this version.
-    pub proposal_id: String,
-    /// Reverse diff to undo this change.
-    pub rollback_diff: String,
-    /// SHA-256 hex digest of the plaintext rollback_diff for integrity verification.
-    #[serde(default)]
-    pub rollback_diff_hash: Option<String>,
-}
-
-/// Persistent store for SOUL.md version history.
-///
-/// When a `CryptoEngine` is provided, `rollback_diff` (which contains full SOUL.md
-/// content) is encrypted at rest using AES-256-GCM. Without crypto, it's stored as plaintext.
+/// The `crypto` field is retained because `with_crypto` is the constructor
+/// every caller uses (the keyfile is loaded once at boot and threaded
+/// through); no column it writes today is encrypted.
 pub struct VersionStore {
     db_path: PathBuf,
+    #[allow(dead_code)]
     crypto: Option<CryptoEngine>,
 }
 
@@ -149,66 +60,15 @@ impl VersionStore {
             }
         }
         let crypto = key_bytes.and_then(|k| CryptoEngine::new(k).ok());
-        Self { db_path: db_path.to_path_buf(), crypto }
+        Self {
+            db_path: db_path.to_path_buf(),
+            crypto,
+        }
     }
 
     fn init_tables(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS soul_versions (
-                version_id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                soul_hash TEXT NOT NULL,
-                soul_summary TEXT NOT NULL,
-                applied_at TEXT NOT NULL,
-                observation_end TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'observing',
-                pre_metrics_json TEXT NOT NULL,
-                post_metrics_json TEXT,
-                proposal_id TEXT NOT NULL,
-                rollback_diff TEXT NOT NULL,
-                rollback_diff_hash TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_versions_agent
-                ON soul_versions(agent_id);
-            CREATE INDEX IF NOT EXISTS idx_versions_status
-                ON soul_versions(status);
-
-            CREATE TABLE IF NOT EXISTS evolution_proposals (
-                id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                proposal_type TEXT NOT NULL,
-                content TEXT NOT NULL,
-                rationale TEXT NOT NULL,
-                generation INTEGER DEFAULT 1,
-                status TEXT NOT NULL DEFAULT 'generating',
-                trigger_context TEXT,
-                created_at TEXT NOT NULL,
-                resolved_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_proposals_agent
-                ON evolution_proposals(agent_id);
-            CREATE INDEX IF NOT EXISTS idx_proposals_status
-                ON evolution_proposals(status);
-
-            CREATE TABLE IF NOT EXISTS deferred_gvu (
-                id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                gradients_json TEXT NOT NULL,
-                retry_after TEXT NOT NULL,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending'
-            );
-            CREATE INDEX IF NOT EXISTS idx_deferred_agent
-                ON deferred_gvu(agent_id, status);
-
-            CREATE TABLE IF NOT EXISTS gvu_low_data_alerts (
-                version_id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                sent_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS gvu_experiment_log (
+            "CREATE TABLE IF NOT EXISTS gvu_experiment_log (
                 id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
@@ -219,31 +79,9 @@ impl VersionStore {
                 description TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_experiment_agent_time
-                ON gvu_experiment_log(agent_id, timestamp DESC);
-
-            CREATE TABLE IF NOT EXISTS gvu_consolidations (
-                id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                attempted_at TEXT NOT NULL,
-                outcome TEXT NOT NULL,
-                from_bytes INTEGER NOT NULL,
-                to_bytes INTEGER,
-                detail TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_consolidations_agent
-                ON gvu_consolidations(agent_id, attempted_at DESC);"
-        ).map_err(|e| e.to_string())?;
-
-        // Idempotent migration: add rollback_diff_hash to pre-existing DBs.
-        // `CREATE TABLE IF NOT EXISTS` does not alter an already-created table,
-        // so older databases won't have this column. Ignore the "duplicate
-        // column" error that fires once the column already exists.
-        if let Err(e) = conn.execute("ALTER TABLE soul_versions ADD COLUMN rollback_diff_hash TEXT", []) {
-            let msg = e.to_string();
-            if !msg.contains("duplicate column") {
-                warn!("Failed to migrate soul_versions.rollback_diff_hash: {msg}");
-            }
-        }
+                ON gvu_experiment_log(agent_id, timestamp DESC);",
+        )
+        .map_err(|e| e.to_string())?;
 
         Ok(())
     }
@@ -260,345 +98,11 @@ impl VersionStore {
         Ok(conn)
     }
 
-    /// Record a new SOUL version.
-    /// rollback_diff is encrypted at rest if a CryptoEngine is configured.
-    pub fn record_version(&self, version: &SoulVersion) -> Result<(), String> {
-        let conn = self.open()?;
-        let pre_json = serde_json::to_string(&version.pre_metrics).map_err(|e| e.to_string())?;
-        let post_json = version.post_metrics.as_ref().and_then(|m| serde_json::to_string(m).ok());
-        let encrypted_rollback = self.encrypt_rollback(&version.rollback_diff);
 
-        conn.execute(
-            "INSERT OR REPLACE INTO soul_versions
-             (version_id, agent_id, soul_hash, soul_summary, applied_at, observation_end,
-              status, pre_metrics_json, post_metrics_json, proposal_id, rollback_diff,
-              rollback_diff_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                version.version_id,
-                version.agent_id,
-                version.soul_hash,
-                version.soul_summary,
-                version.applied_at.to_rfc3339(),
-                version.observation_end.to_rfc3339(),
-                version.status.as_str(),
-                pre_json,
-                post_json,
-                version.proposal_id,
-                encrypted_rollback,
-                version.rollback_diff_hash,
-            ],
-        ).map_err(|e| e.to_string())?;
-
-        info!(version = %version.version_id, agent = %version.agent_id, "Soul version recorded");
-        Ok(())
-    }
-
-    /// Get the currently observing version for an agent (if any).
-    pub fn get_observing_version(&self, agent_id: &str) -> Option<SoulVersion> {
-        let conn = self.open().ok()?;
-        self.query_single(
-            &conn,
-            "SELECT * FROM soul_versions WHERE agent_id = ?1 AND status = 'observing' ORDER BY applied_at DESC LIMIT 1",
-            params![agent_id],
-        )
-    }
-
-    /// Get all versions past their observation end time that are still observing.
-    pub fn get_expired_observations(&self) -> Vec<SoulVersion> {
-        let conn = match self.open() {
-            Ok(c) => c,
-            Err(_) => return vec![],
-        };
-        let now = Utc::now().to_rfc3339();
-        self.query_many(
-            &conn,
-            "SELECT * FROM soul_versions WHERE status = 'observing' AND observation_end < ?1",
-            params![now],
-        )
-    }
-
-    /// Get version history for an agent (newest first), used by Generator for OPRO context.
-    pub fn get_history(&self, agent_id: &str, limit: usize) -> Vec<SoulVersion> {
-        let conn = match self.open() {
-            Ok(c) => c,
-            Err(_) => return vec![],
-        };
-        self.query_many(
-            &conn,
-            "SELECT * FROM soul_versions WHERE agent_id = ?1 ORDER BY applied_at DESC LIMIT ?2",
-            params![agent_id, limit],
-        )
-    }
-
-    /// Mark a version as confirmed.
-    pub fn mark_confirmed(&self, version_id: &str, post_metrics: &VersionMetrics) -> Result<(), String> {
-        let conn = self.open()?;
-        let json = serde_json::to_string(post_metrics).map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE soul_versions SET status = 'confirmed', post_metrics_json = ?1 WHERE version_id = ?2",
-            params![json, version_id],
-        ).map_err(|e| e.to_string())?;
-        info!(version = version_id, "Soul version confirmed");
-        Ok(())
-    }
-
-    /// Mark a version as rolled back.
-    pub fn mark_rolled_back(&self, version_id: &str, reason: &str) -> Result<(), String> {
-        let conn = self.open()?;
-        conn.execute(
-            "UPDATE soul_versions SET status = 'rolled_back' WHERE version_id = ?1",
-            params![version_id],
-        ).map_err(|e| e.to_string())?;
-        info!(version = version_id, reason, "Soul version rolled back");
-        Ok(())
-    }
-
-    /// WP0.4 (R5): mark a version `expired_no_data` — the observation window
-    /// ran past the hard no-data ceiling without ever collecting enough
-    /// traffic to judge. Deliberately distinct from `mark_confirmed`: this
-    /// status is never treated as "passed" by anything reading `status`.
-    /// SOUL.md content is untouched (no rollback — no evidence either way).
-    pub fn mark_expired_no_data(&self, version_id: &str, post_metrics: &VersionMetrics) -> Result<(), String> {
-        let conn = self.open()?;
-        let json = serde_json::to_string(post_metrics).map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE soul_versions SET status = 'expired_no_data', post_metrics_json = ?1 WHERE version_id = ?2",
-            params![json, version_id],
-        ).map_err(|e| e.to_string())?;
-        info!(
-            version = version_id,
-            "Soul version expired without sufficient observation data — marked unverified (NOT confirmed)"
-        );
-        Ok(())
-    }
-
-    /// WP0.4: has a one-time "insufficient observation data" alert already
-    /// been sent for this version? Backs the not-repeated requirement on the
-    /// soft warn-threshold alert in `ObservationFinalizer`.
-    pub fn low_data_alert_sent(&self, version_id: &str) -> bool {
-        let conn = match self.open() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        conn.query_row(
-            "SELECT 1 FROM gvu_low_data_alerts WHERE version_id = ?1",
-            params![version_id],
-            |_| Ok(()),
-        )
-        .is_ok()
-    }
-
-    /// WP0.4: record that the one-time "insufficient observation data" alert
-    /// has been sent for this version. Idempotent (`INSERT OR IGNORE`).
-    pub fn mark_low_data_alert_sent(&self, version_id: &str, agent_id: &str) -> Result<(), String> {
-        let conn = self.open()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO gvu_low_data_alerts (version_id, agent_id, sent_at) VALUES (?1, ?2, ?3)",
-            params![version_id, agent_id, Utc::now().to_rfc3339()],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
 
     // ── Crypto helpers ─────────────────────────────────────────
 
-    /// Encrypt rollback_diff if crypto is available, otherwise return as-is.
-    fn encrypt_rollback(&self, plaintext: &str) -> String {
-        match &self.crypto {
-            Some(engine) => engine.encrypt_string(plaintext).unwrap_or_else(|e| {
-                warn!("Failed to encrypt rollback_diff: {e} — storing as plaintext");
-                plaintext.to_string()
-            }),
-            None => plaintext.to_string(),
-        }
-    }
 
-    /// Decrypt rollback_diff if crypto is available.
-    ///
-    /// On decryption failure we fall back to treating `stored` as
-    /// pre-encryption plaintext **only when its hash matches the recorded
-    /// `rollback_diff_hash`** — otherwise the bytes are corrupt or tampered
-    /// and returning them as a "rollback" would silently write garbage into
-    /// SOUL.md. In that case this returns an error so the row is dropped
-    /// instead of surfaced as a usable version.
-    fn decrypt_rollback(&self, stored: &str, expected_hash: Option<&str>) -> Result<String, String> {
-        match &self.crypto {
-            Some(engine) => match engine.decrypt_string(stored) {
-                Ok(plain) => Ok(plain),
-                Err(e) => {
-                    // Accept legacy plaintext only if it matches the integrity hash.
-                    if let Some(expected) = expected_hash {
-                        if sha256_hex(stored.as_bytes()) == expected {
-                            return Ok(stored.to_string());
-                        }
-                    }
-                    Err(format!(
-                        "Failed to decrypt rollback_diff and plaintext fallback failed integrity check: {e}"
-                    ))
-                }
-            },
-            None => Ok(stored.to_string()),
-        }
-    }
-
-    // ── Query helpers ─────────────────────────────────────────
-
-    fn query_single(&self, conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Option<SoulVersion> {
-        let mut v = conn.query_row(sql, params, |row| Self::row_to_version(row)).ok()?;
-        match self.decrypt_rollback(&v.rollback_diff, v.rollback_diff_hash.as_deref()) {
-            Ok(plain) => { v.rollback_diff = plain; Some(v) }
-            Err(e) => {
-                warn!(version = %v.version_id, "Dropping soul version with undecryptable rollback_diff: {e}");
-                None
-            }
-        }
-    }
-
-    fn query_many(&self, conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Vec<SoulVersion> {
-        let mut stmt = match conn.prepare(sql) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        let rows = match stmt.query_map(params, |row| Self::row_to_version(row)) {
-            Ok(r) => r,
-            Err(_) => return vec![],
-        };
-        rows.filter_map(|r| r.ok())
-            .filter_map(|mut v| {
-                match self.decrypt_rollback(&v.rollback_diff, v.rollback_diff_hash.as_deref()) {
-                    Ok(plain) => { v.rollback_diff = plain; Some(v) }
-                    Err(e) => {
-                        warn!(version = %v.version_id, "Dropping soul version with undecryptable rollback_diff: {e}");
-                        None
-                    }
-                }
-            })
-            .collect()
-    }
-
-    fn row_to_version(row: &rusqlite::Row) -> rusqlite::Result<SoulVersion> {
-        let applied_str: String = row.get("applied_at")?;
-        let obs_str: String = row.get("observation_end")?;
-        let status_str: String = row.get("status")?;
-        let pre_json: String = row.get("pre_metrics_json")?;
-        let post_json: Option<String> = row.get("post_metrics_json")?;
-
-        Ok(SoulVersion {
-            version_id: row.get("version_id")?,
-            agent_id: row.get("agent_id")?,
-            soul_hash: row.get("soul_hash")?,
-            soul_summary: row.get("soul_summary")?,
-            applied_at: DateTime::parse_from_rfc3339(&applied_str)
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
-            observation_end: DateTime::parse_from_rfc3339(&obs_str)
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
-            status: VersionStatus::from_str(&status_str),
-            pre_metrics: serde_json::from_str(&pre_json).unwrap_or_default(),
-            post_metrics: post_json.and_then(|j| serde_json::from_str(&j).ok()),
-            proposal_id: row.get("proposal_id")?,
-            rollback_diff: row.get("rollback_diff")?,
-            // NULL for legacy rows written before this column existed —
-            // execute_rollback skips the integrity check in that case.
-            rollback_diff_hash: row.get("rollback_diff_hash").ok().flatten(),
-        })
-    }
-
-    // ── WP0.2: consolidation attempts (frequency lock + audit) ──────────
-
-    /// When this agent last *attempted* a SOUL.md consolidation, successful or
-    /// not.
-    ///
-    /// Deliberately "attempted", not "succeeded": consolidation is a whole-file
-    /// LLM rewrite, by far the most expensive call the GVU stack makes. If the
-    /// budget only counted successes, an agent whose consolidations keep failing
-    /// the collapse guard would pay for one on every single trigger — the exact
-    /// runaway-spend shape WP0.3's cooldown exists to prevent, just with a
-    /// bigger price tag.
-    pub fn last_consolidation_at(&self, agent_id: &str) -> Option<DateTime<Utc>> {
-        let conn = self.open().ok()?;
-        let raw: String = conn
-            .query_row(
-                "SELECT MAX(attempted_at) FROM gvu_consolidations WHERE agent_id = ?1",
-                params![agent_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .ok()
-            .flatten()?;
-        DateTime::parse_from_rfc3339(&raw)
-            .ok()
-            .map(|d| d.with_timezone(&Utc))
-    }
-
-    /// Open a consolidation audit row. Returns its id, or `None` if the write
-    /// failed — the caller MUST treat `None` as "do not proceed", since an
-    /// unrecorded attempt would not consume the frequency budget and could loop.
-    pub fn record_consolidation_attempt(&self, agent_id: &str, from_bytes: usize) -> Option<String> {
-        let conn = self.open().ok()?;
-        let id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO gvu_consolidations
-             (id, agent_id, attempted_at, outcome, from_bytes, to_bytes, detail)
-             VALUES (?1, ?2, ?3, 'attempted', ?4, NULL, NULL)",
-            params![id, agent_id, Utc::now().to_rfc3339(), from_bytes as i64],
-        )
-        .ok()?;
-        Some(id)
-    }
-
-    /// Close a consolidation audit row with its outcome (`applied`, `rejected`,
-    /// `generation_failed`, …). Best-effort: a lost audit row must not undo an
-    /// already-applied consolidation.
-    pub fn finish_consolidation(
-        &self,
-        id: &str,
-        outcome: &str,
-        to_bytes: Option<usize>,
-        detail: &str,
-    ) {
-        let Ok(conn) = self.open() else { return };
-        if let Err(e) = conn.execute(
-            "UPDATE gvu_consolidations SET outcome = ?2, to_bytes = ?3, detail = ?4 WHERE id = ?1",
-            params![
-                id,
-                outcome,
-                to_bytes.map(|b| b as i64),
-                duduclaw_core::truncate_bytes(detail, 1000),
-            ],
-        ) {
-            warn!("Failed to close consolidation audit row: {e}");
-        }
-    }
-
-    /// Consolidation history for an agent, newest first (dashboard / audit).
-    pub fn consolidation_history(&self, agent_id: &str, limit: usize) -> Vec<ConsolidationRecord> {
-        let Ok(conn) = self.open() else {
-            return Vec::new();
-        };
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT id, agent_id, attempted_at, outcome, from_bytes, to_bytes, detail
-             FROM gvu_consolidations WHERE agent_id = ?1
-             ORDER BY attempted_at DESC, rowid DESC LIMIT ?2",
-        ) else {
-            return Vec::new();
-        };
-        stmt.query_map(params![agent_id, limit], |row| {
-            Ok(ConsolidationRecord {
-                id: row.get(0)?,
-                agent_id: row.get(1)?,
-                attempted_at: row.get(2)?,
-                outcome: row.get(3)?,
-                from_bytes: row.get::<_, i64>(4)? as usize,
-                to_bytes: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
-                detail: row.get(6)?,
-            })
-        })
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-    }
 
     // ── GVU Experiment Log ──────────────────────────────────
 
@@ -737,93 +241,6 @@ impl VersionStore {
         summary
     }
 
-    // ── Deferred GVU management (Phase 1.4) ─────────────────
-
-    /// Store a deferred GVU attempt for later retry.
-    pub fn store_deferred(
-        &self,
-        agent_id: &str,
-        gradients: &[super::text_gradient::TextGradient],
-        retry_after_hours: f64,
-        retry_count: u32,
-    ) -> Result<String, String> {
-        let conn = self.open()?;
-        let id = uuid::Uuid::new_v4().to_string();
-        let gradients_json = serde_json::to_string(gradients).map_err(|e| e.to_string())?;
-        let retry_after = chrono::Utc::now()
-            + chrono::Duration::seconds((retry_after_hours * 3600.0) as i64);
-
-        conn.execute(
-            "INSERT INTO deferred_gvu (id, agent_id, gradients_json, retry_after, retry_count, created_at, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
-            params![
-                id,
-                agent_id,
-                gradients_json,
-                retry_after.to_rfc3339(),
-                retry_count,
-                chrono::Utc::now().to_rfc3339(),
-            ],
-        )
-        .map_err(|e| format!("Store deferred: {e}"))?;
-
-        Ok(id)
-    }
-
-    /// Get pending deferred GVU attempts that are ready for retry.
-    pub fn get_pending_deferred(
-        &self,
-        agent_id: &str,
-    ) -> Vec<DeferredGvu> {
-        let conn = match self.open() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-
-        let mut stmt = match conn.prepare(
-            "SELECT id, agent_id, gradients_json, retry_after, retry_count
-             FROM deferred_gvu
-             WHERE agent_id = ?1 AND status = 'pending' AND retry_after <= ?2
-             ORDER BY created_at ASC",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-
-        let now = chrono::Utc::now().to_rfc3339();
-        stmt.query_map(params![agent_id, now], |row| {
-            let gradients_json: String = row.get(2)?;
-            Ok(DeferredGvu {
-                id: row.get(0)?,
-                agent_id: row.get(1)?,
-                gradients: serde_json::from_str(&gradients_json).unwrap_or_default(),
-                retry_count: row.get(4)?,
-            })
-        })
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-    }
-
-    /// Mark a deferred GVU as completed (either retried or abandoned).
-    pub fn mark_deferred_completed(&self, id: &str) -> Result<(), String> {
-        let conn = self.open()?;
-        conn.execute(
-            "UPDATE deferred_gvu SET status = 'completed' WHERE id = ?1",
-            params![id],
-        )
-        .map_err(|e| format!("Mark deferred completed: {e}"))?;
-        Ok(())
-    }
-}
-
-/// A pending deferred GVU retry.
-#[derive(Debug, Clone)]
-pub struct DeferredGvu {
-    pub id: String,
-    pub agent_id: String,
-    pub gradients: Vec<super::text_gradient::TextGradient>,
-    pub retry_count: u32,
 }
 
 // ── GVU Experiment Log (autoresearch-inspired) ────────────────────────────
@@ -851,22 +268,6 @@ pub struct ExperimentLogEntry {
     pub outcome: String,
     /// Human-readable description of what happened.
     pub description: String,
-}
-
-/// One WP0.2 consolidation attempt (audit / dashboard row).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConsolidationRecord {
-    pub id: String,
-    pub agent_id: String,
-    /// RFC-3339 timestamp, kept as a string — this is a display/audit record,
-    /// not an input to any decision (the frequency lock reads
-    /// [`VersionStore::last_consolidation_at`] instead).
-    pub attempted_at: String,
-    /// `attempted` → `applied` / `rejected` / `generation_failed` / …
-    pub outcome: String,
-    pub from_bytes: usize,
-    pub to_bytes: Option<usize>,
-    pub detail: Option<String>,
 }
 
 impl ExperimentLogEntry {
@@ -910,75 +311,54 @@ pub struct ExperimentSummary {
 mod tests {
     use super::*;
 
-    fn sample_version(rollback: &str) -> SoulVersion {
-        let hash = sha256_hex(rollback.as_bytes());
-        SoulVersion {
-            version_id: uuid::Uuid::new_v4().to_string(),
-            agent_id: "agent-a".to_string(),
-            soul_hash: "deadbeef".to_string(),
-            soul_summary: "summary".to_string(),
-            applied_at: Utc::now(),
-            observation_end: Utc::now(),
-            status: VersionStatus::Observing,
-            pre_metrics: VersionMetrics::default(),
-            post_metrics: None,
-            proposal_id: "prop-1".to_string(),
-            rollback_diff: rollback.to_string(),
-            rollback_diff_hash: Some(hash),
-        }
-    }
-
+    /// Regression (S11, 2026-09-29): the store must bootstrap and round-trip
+    /// the experiment log on a database that has none of the removed SOUL
+    /// tables — the only schema this file still owns.
     #[test]
-    fn test_rollback_diff_hash_persisted_and_read_back() {
-        // HC10/D7: the integrity hash must survive a record → read round-trip
-        // so that execute_rollback's `if let Some(...)` check actually runs.
+    fn experiment_log_round_trips_on_a_fresh_db() {
         let tmp = std::env::temp_dir().join(format!("dudu_vs_{}.db", uuid::Uuid::new_v4()));
         let store = VersionStore::new(&tmp);
-        let v = sample_version("original SOUL.md content");
-        store.record_version(&v).unwrap();
-
-        let read = store.get_observing_version("agent-a").expect("version present");
-        assert_eq!(read.rollback_diff, "original SOUL.md content");
-        assert_eq!(
-            read.rollback_diff_hash.as_deref(),
-            v.rollback_diff_hash.as_deref(),
-            "rollback_diff_hash must be persisted, not hard-coded None"
-        );
-
+        store.record_experiment(&ExperimentLogEntry::new(
+            "agent-a",
+            1,
+            3,
+            std::time::Duration::from_secs(2),
+            "applied",
+            "committed one delta",
+        ));
+        let rows = store.get_experiments("agent-a", 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "applied");
+        let summary = store.get_experiment_summary("agent-a");
+        assert_eq!(summary.total_experiments, 1);
+        assert_eq!(summary.applied_count, 1);
         let _ = std::fs::remove_file(&tmp);
     }
 
+    /// Regression (S11): opening an *existing* `evolution.db` that still
+    /// carries the removed legacy tables must not fail — users upgrading in
+    /// place keep their file, they just lose the readers.
     #[test]
-    fn test_decrypt_rollback_rejects_corrupt_ciphertext() {
-        // With crypto enabled, ciphertext that fails to decrypt and whose
-        // plaintext form does not match the integrity hash must error out
-        // rather than silently returning the garbage bytes.
-        let key = [7u8; 32];
+    fn opens_a_db_that_still_has_legacy_soul_tables() {
         let tmp = std::env::temp_dir().join(format!("dudu_vs_{}.db", uuid::Uuid::new_v4()));
-        let store = VersionStore::with_crypto(&tmp, Some(&key));
-
-        let expected_hash = sha256_hex(b"real plaintext rollback");
-        let err = store
-            .decrypt_rollback("not-valid-ciphertext", Some(&expected_hash))
-            .unwrap_err();
-        assert!(err.contains("integrity check") || err.contains("decrypt"));
-
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn test_decrypt_rollback_accepts_legacy_plaintext_matching_hash() {
-        // Pre-encryption plaintext rows are still accepted when the stored
-        // hash matches — this preserves backward compatibility.
-        let key = [9u8; 32];
-        let tmp = std::env::temp_dir().join(format!("dudu_vs_{}.db", uuid::Uuid::new_v4()));
-        let store = VersionStore::with_crypto(&tmp, Some(&key));
-
-        let plaintext = "legacy plaintext rollback";
-        let hash = sha256_hex(plaintext.as_bytes());
-        let got = store.decrypt_rollback(plaintext, Some(&hash)).unwrap();
-        assert_eq!(got, plaintext);
-
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE soul_versions (version_id TEXT PRIMARY KEY, agent_id TEXT);
+                 CREATE TABLE gvu_consolidations (id TEXT PRIMARY KEY, agent_id TEXT);",
+            )
+            .unwrap();
+        }
+        let store = VersionStore::new(&tmp);
+        store.record_experiment(&ExperimentLogEntry::new(
+            "agent-b",
+            0,
+            3,
+            std::time::Duration::from_secs(1),
+            "skipped",
+            "cooldown",
+        ));
+        assert_eq!(store.get_experiments("agent-b", 5).len(), 1);
         let _ = std::fs::remove_file(&tmp);
     }
 }

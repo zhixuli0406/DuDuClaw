@@ -10,8 +10,8 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use duduclaw_fork::judge::LlmCaller;
 use duduclaw_fork::ForkError;
+use duduclaw_fork::judge::LlmCaller;
 
 /// Judge verdict for a single case output.
 #[derive(Debug, serde::Serialize)]
@@ -94,9 +94,9 @@ impl LlmCaller for GatewayJudgeCaller {
     async fn complete(&self, prompt: &str) -> duduclaw_fork::Result<String> {
         duduclaw_gateway::runtime_dispatch::run_utility_prompt(
             &self.home_dir,
-            None,          // agent-less: resolve the global utility runtime
-            "eval-judge",  // attribution id for telemetry
-            "",            // judge instructions live in the prompt itself
+            None,         // agent-less: resolve the global utility runtime
+            "eval-judge", // attribution id for telemetry
+            "",           // judge instructions live in the prompt itself
             prompt,
             duduclaw_gateway::runtime_dispatch::UTILITY_MAX_TOKENS,
         )
@@ -169,7 +169,9 @@ mod tests {
     #[tokio::test]
     async fn judge_output_end_to_end_via_stub() {
         let caller = StubCaller("{\"score\": 0.75, \"rationale\": \"mostly\"}".into());
-        let v = judge_output(&caller, "rubric", "prompt", "answer").await.unwrap();
+        let v = judge_output(&caller, "rubric", "prompt", "answer")
+            .await
+            .unwrap();
         assert!((v.score - 0.75).abs() < 1e-9);
     }
 

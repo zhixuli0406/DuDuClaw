@@ -257,7 +257,12 @@ fn parse_otlp_headers_toml(telemetry_table: &toml::Value) -> BTreeMap<String, St
             eprintln!("[duduclaw] [telemetry] otlp_headers.{key}: value must be a string; skipped");
             continue;
         };
-        insert_otlp_header(&mut headers, key, value, "config.toml [telemetry] otlp_headers");
+        insert_otlp_header(
+            &mut headers,
+            key,
+            value,
+            "config.toml [telemetry] otlp_headers",
+        );
     }
     headers
 }
@@ -269,7 +274,11 @@ fn parse_otlp_headers_toml(telemetry_table: &toml::Value) -> BTreeMap<String, St
 /// Invalid pairs are skipped with a warning, never a panic.
 pub fn parse_otlp_headers_env(raw: &str) -> BTreeMap<String, String> {
     let mut headers = BTreeMap::new();
-    for pair in raw.split_terminator(',').map(str::trim).filter(|p| !p.is_empty()) {
+    for pair in raw
+        .split_terminator(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         let Some((key, value)) = pair.split_once('=') else {
             eprintln!("[duduclaw] OTEL_EXPORTER_OTLP_HEADERS: entry without '='; skipped");
             continue;
@@ -282,7 +291,12 @@ pub fn parse_otlp_headers_env(raw: &str) -> BTreeMap<String, String> {
 
 /// Shared validate-then-insert step for both header sources. Warns and skips
 /// on invalid key/value; on success stores the normalized (lowercase) key.
-fn insert_otlp_header(headers: &mut BTreeMap<String, String>, key: &str, value: &str, source: &str) {
+fn insert_otlp_header(
+    headers: &mut BTreeMap<String, String>,
+    key: &str,
+    value: &str,
+    source: &str,
+) {
     let Some(key) = normalize_otlp_header_key(key) else {
         eprintln!(
             "[duduclaw] {source}: header key {key:?} is not a valid gRPC metadata key \
@@ -365,7 +379,13 @@ pub fn invoke_agent_span(agent_name: &str, model: &str, provider: &str) -> traci
 /// Record token usage onto an [`invoke_agent_span`]. `input`/`output` are the
 /// standard GenAI usage attributes; `cache_read`/`reasoning` are extra
 /// namespaced attributes. Recording a field on a disabled span is a no-op.
-pub fn record_usage(span: &tracing::Span, input: u64, output: u64, cache_read: u64, reasoning: u64) {
+pub fn record_usage(
+    span: &tracing::Span,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    reasoning: u64,
+) {
     span.record(attrs::USAGE_INPUT_TOKENS, input);
     span.record(attrs::USAGE_OUTPUT_TOKENS, output);
     span.record(attrs::USAGE_CACHE_READ_INPUT_TOKENS, cache_read);
@@ -439,8 +459,8 @@ mod exporter {
     pub fn install(cfg: &TelemetryConfig) -> Result<OtelGuard, Box<dyn std::error::Error>> {
         use opentelemetry_otlp::WithExportConfig; // brings `.with_endpoint` into scope
         use opentelemetry_otlp::WithTonicConfig; // brings `.with_metadata` into scope
-        use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
         use opentelemetry_sdk::Resource;
+        use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 
         // Idempotent: a second install (start_gateway after entry_point) must
         // not stack a second batch pipeline over the first.
@@ -466,7 +486,10 @@ mod exporter {
         for (key, value) in &cfg.otlp_headers {
             let parsed_key =
                 tonic::metadata::MetadataKey::<tonic::metadata::Ascii>::from_bytes(key.as_bytes());
-            match (parsed_key, value.parse::<tonic::metadata::MetadataValue<_>>()) {
+            match (
+                parsed_key,
+                value.parse::<tonic::metadata::MetadataValue<_>>(),
+            ) {
                 (Ok(k), Ok(v)) => {
                     metadata.insert(k, v);
                 }
@@ -551,7 +574,10 @@ pub fn init(home_dir: &Path) -> Option<OtelGuard> {
             // the "[duduclaw] effective log level" stderr pattern instead.
             eprintln!(
                 "[duduclaw] OpenTelemetry OTLP GenAI tracing enabled → {} (service {}, sample {}, {} auth header(s))",
-                cfg.otlp_endpoint, cfg.service_name, cfg.sample_ratio, cfg.otlp_headers.len()
+                cfg.otlp_endpoint,
+                cfg.service_name,
+                cfg.sample_ratio,
+                cfg.otlp_headers.len()
             );
             Some(guard)
         }
@@ -612,13 +638,17 @@ mod tests {
 
     #[test]
     fn parse_endpoint_present_installs_with_defaults() {
-        let cfg = TelemetryConfig::parse("[telemetry]\notlp_endpoint = \"http://127.0.0.1:4317\"\n")
-            .expect("endpoint present ⇒ install");
+        let cfg =
+            TelemetryConfig::parse("[telemetry]\notlp_endpoint = \"http://127.0.0.1:4317\"\n")
+                .expect("endpoint present ⇒ install");
         assert_eq!(cfg.otlp_endpoint, "http://127.0.0.1:4317");
         assert_eq!(cfg.otlp_protocol, OtlpProtocol::Grpc);
         assert_eq!(cfg.service_name, "duduclaw");
         assert_eq!(cfg.sample_ratio, 1.0);
-        assert!(cfg.otlp_headers.is_empty(), "absent otlp_headers ⇒ empty map");
+        assert!(
+            cfg.otlp_headers.is_empty(),
+            "absent otlp_headers ⇒ empty map"
+        );
     }
 
     #[test]
@@ -671,7 +701,10 @@ mod tests {
         assert_eq!(OtlpProtocol::parse("GRPC"), OtlpProtocol::Grpc);
         assert_eq!(OtlpProtocol::parse("nonsense"), OtlpProtocol::Grpc);
         assert_eq!(OtlpProtocol::parse("http"), OtlpProtocol::HttpProtobuf);
-        assert_eq!(OtlpProtocol::parse("http/protobuf"), OtlpProtocol::HttpProtobuf);
+        assert_eq!(
+            OtlpProtocol::parse("http/protobuf"),
+            OtlpProtocol::HttpProtobuf
+        );
     }
 
     /// Pins the GenAI attribute keys. If the OTel semconv (still "Development")
@@ -690,7 +723,10 @@ mod tests {
             attrs::USAGE_CACHE_READ_INPUT_TOKENS,
             "gen_ai.usage.cache_read_input_tokens"
         );
-        assert_eq!(attrs::USAGE_REASONING_TOKENS, "gen_ai.usage.reasoning_tokens");
+        assert_eq!(
+            attrs::USAGE_REASONING_TOKENS,
+            "gen_ai.usage.reasoning_tokens"
+        );
         assert_eq!(attrs::TOOL_OUTCOME, "gen_ai.tool.outcome");
         assert_eq!(attrs::ERROR_TYPE, "error.type");
         assert_eq!(attrs::OP_INVOKE_AGENT, "invoke_agent");
@@ -710,7 +746,10 @@ mod tests {
             cfg.otlp_headers.get("authorization").map(String::as_str),
             Some("Basic cGstbGY6c2stbGY=")
         );
-        assert_eq!(cfg.otlp_headers.get("x-api-key").map(String::as_str), Some("yyy"));
+        assert_eq!(
+            cfg.otlp_headers.get("x-api-key").map(String::as_str),
+            Some("yyy")
+        );
         assert_eq!(cfg.otlp_headers.len(), 2);
     }
 
@@ -744,7 +783,10 @@ mod tests {
     fn env_headers_parse_and_percent_decode() {
         let h = parse_otlp_headers_env("Authorization=Basic%20cGs=,x-api-key = yyy ,");
         // Percent-encoded space decoded (Langfuse/Grafana docs use %20).
-        assert_eq!(h.get("authorization").map(String::as_str), Some("Basic cGs="));
+        assert_eq!(
+            h.get("authorization").map(String::as_str),
+            Some("Basic cGs=")
+        );
         assert_eq!(h.get("x-api-key").map(String::as_str), Some("yyy"));
         assert_eq!(h.len(), 2);
 
@@ -759,7 +801,10 @@ mod tests {
 
         // Value keeps everything after the FIRST '=' (base64 padding safe).
         let h = parse_otlp_headers_env("authorization=Basic dGVzdA==");
-        assert_eq!(h.get("authorization").map(String::as_str), Some("Basic dGVzdA=="));
+        assert_eq!(
+            h.get("authorization").map(String::as_str),
+            Some("Basic dGVzdA==")
+        );
     }
 
     #[test]
@@ -770,7 +815,10 @@ mod tests {
 
         // Env wins per-key; config-only keys survive.
         let merged = merge_otlp_headers(&config, Some("Authorization=from-env,x-new=n"));
-        assert_eq!(merged.get("authorization").map(String::as_str), Some("from-env"));
+        assert_eq!(
+            merged.get("authorization").map(String::as_str),
+            Some("from-env")
+        );
         assert_eq!(merged.get("x-keep").map(String::as_str), Some("kept"));
         assert_eq!(merged.get("x-new").map(String::as_str), Some("n"));
         assert_eq!(merged.len(), 3);
@@ -782,9 +830,18 @@ mod tests {
     #[test]
     fn header_key_normalization_and_skip_rules() {
         // Uppercase is normalized, not rejected.
-        assert_eq!(normalize_otlp_header_key("Authorization").as_deref(), Some("authorization"));
-        assert_eq!(normalize_otlp_header_key("  X-API-Key "), Some("x-api-key".to_string()));
-        assert_eq!(normalize_otlp_header_key("a1_b.c-d").as_deref(), Some("a1_b.c-d"));
+        assert_eq!(
+            normalize_otlp_header_key("Authorization").as_deref(),
+            Some("authorization")
+        );
+        assert_eq!(
+            normalize_otlp_header_key("  X-API-Key "),
+            Some("x-api-key".to_string())
+        );
+        assert_eq!(
+            normalize_otlp_header_key("a1_b.c-d").as_deref(),
+            Some("a1_b.c-d")
+        );
         // Empty / whitespace-only ⇒ skip.
         assert_eq!(normalize_otlp_header_key(""), None);
         assert_eq!(normalize_otlp_header_key("   "), None);

@@ -67,8 +67,10 @@ struct RawPocResponse {
 /// degrade to empty strings via `#[serde(default)]` (an empty `script` is
 /// itself handled by the caller as "not demonstrable").
 pub fn parse_poc_response(raw: &str) -> Result<(String, String, String), String> {
-    let slice = extract_json_object(raw).ok_or_else(|| "no JSON object found in poc response".to_string())?;
-    let rv: RawPocResponse = serde_json::from_str(slice).map_err(|e| format!("poc JSON parse failed: {e}"))?;
+    let slice = extract_json_object(raw)
+        .ok_or_else(|| "no JSON object found in poc response".to_string())?;
+    let rv: RawPocResponse =
+        serde_json::from_str(slice).map_err(|e| format!("poc JSON parse failed: {e}"))?;
     Ok((rv.language.trim().to_ascii_lowercase(), rv.script, rv.note))
 }
 
@@ -97,7 +99,10 @@ Reply with ONLY a JSON object, no prose, no markdown fences: {{\"language\": \
         finding.severity.as_str(),
         escape_xml_tag(&finding.title, "claim"),
         finding.file,
-        finding.line.map(|l| l.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        finding
+            .line
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
         finding.file,
         escape_xml_tag(fresh_excerpt, "file_excerpt"),
     )
@@ -107,7 +112,10 @@ fn push_evidence(finding: &mut Finding, kind: EvidenceKind, tag: &str, detail: &
     finding.evidence.push(EvidenceItem {
         kind,
         source: "poc".to_string(),
-        detail: format!("{tag}: {}", duduclaw_core::truncate_bytes(detail, POC_EVIDENCE_MAX_BYTES)),
+        detail: format!(
+            "{tag}: {}",
+            duduclaw_core::truncate_bytes(detail, POC_EVIDENCE_MAX_BYTES)
+        ),
         recorded_at: chrono::Utc::now().to_rfc3339(),
     });
 }
@@ -116,7 +124,12 @@ fn push_evidence(finding: &mut Finding, kind: EvidenceKind, tag: &str, detail: &
 /// no-op (zero evidence added, zero LLM/sandbox cost) unless ALL of:
 /// `poc_flag`, `severity >= High`, `status == NeedsHuman`, and it originated
 /// from ai_audit.
-pub async fn maybe_run_poc<C: LlmCaller>(repo_root: &Path, finding: &mut Finding, caller: &C, poc_flag: bool) {
+pub async fn maybe_run_poc<C: LlmCaller>(
+    repo_root: &Path,
+    finding: &mut Finding,
+    caller: &C,
+    poc_flag: bool,
+) {
     if !poc_flag
         || finding.severity < Severity::High
         || finding.status != FindingStatus::NeedsHuman
@@ -129,7 +142,12 @@ pub async fn maybe_run_poc<C: LlmCaller>(repo_root: &Path, finding: &mut Finding
     let excerpt = match std::fs::read_to_string(&abs) {
         Ok(content) => extract_context_window(&content, finding.line, CONTEXT_LINES),
         Err(e) => {
-            push_evidence(finding, EvidenceKind::PocSkipped, "poc_skipped", &format!("referenced file unreadable: {e}"));
+            push_evidence(
+                finding,
+                EvidenceKind::PocSkipped,
+                "poc_skipped",
+                &format!("referenced file unreadable: {e}"),
+            );
             return;
         }
     };
@@ -138,7 +156,12 @@ pub async fn maybe_run_poc<C: LlmCaller>(repo_root: &Path, finding: &mut Finding
     let raw = match caller.complete(&prompt).await {
         Ok(r) => r,
         Err(e) => {
-            push_evidence(finding, EvidenceKind::PocSkipped, "poc_generation_failed", &format!("llm call failed: {e}"));
+            push_evidence(
+                finding,
+                EvidenceKind::PocSkipped,
+                "poc_generation_failed",
+                &format!("llm call failed: {e}"),
+            );
             return;
         }
     };
@@ -155,7 +178,12 @@ pub async fn maybe_run_poc<C: LlmCaller>(repo_root: &Path, finding: &mut Finding
         }
     };
     if language == "none" || script.trim().is_empty() {
-        push_evidence(finding, EvidenceKind::PocSkipped, "poc_not_demonstrable", &note);
+        push_evidence(
+            finding,
+            EvidenceKind::PocSkipped,
+            "poc_not_demonstrable",
+            &note,
+        );
         return;
     }
     if language != "python" && language != "bash" {
@@ -185,7 +213,12 @@ pub async fn maybe_run_poc<C: LlmCaller>(repo_root: &Path, finding: &mut Finding
             });
         }
         Err(e) => {
-            push_evidence(finding, EvidenceKind::PocSkipped, "poc_skipped", &format!("sandbox unavailable: {e}"));
+            push_evidence(
+                finding,
+                EvidenceKind::PocSkipped,
+                "poc_skipped",
+                &format!("sandbox unavailable: {e}"),
+            );
         }
     }
 }
@@ -203,8 +236,8 @@ pub async fn maybe_run_poc<C: LlmCaller>(repo_root: &Path, finding: &mut Finding
 /// a stub `LlmCaller`) carry the tested behavior up to the point this
 /// function would be called.
 async fn execute_in_sandbox(script: &str, language: &str) -> Result<(i64, String), String> {
-    let runtime =
-        duduclaw_container::RuntimeBackend::detect().map_err(|e| format!("no container runtime detected: {e}"))?;
+    let runtime = duduclaw_container::RuntimeBackend::detect()
+        .map_err(|e| format!("no container runtime detected: {e}"))?;
     let health = runtime
         .health_check()
         .await
@@ -213,15 +246,22 @@ async fn execute_in_sandbox(script: &str, language: &str) -> Result<(i64, String
         return Err(format!("container runtime unhealthy: {}", health.message));
     }
 
-    let tmp_dir = std::env::temp_dir().join(format!("duduclaw-secaudit-poc-{}", uuid::Uuid::new_v4()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("duduclaw-secaudit-poc-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("cannot create temp workspace: {e}"))?;
 
     let (script_filename, cmd) = match language {
         "python" => (
             "poc.py",
-            vec![duduclaw_core::platform::python3_command().to_string(), "/workspace/poc.py".to_string()],
+            vec![
+                duduclaw_core::platform::python3_command().to_string(),
+                "/workspace/poc.py".to_string(),
+            ],
         ),
-        "bash" => ("poc.sh", vec!["bash".to_string(), "/workspace/poc.sh".to_string()]),
+        "bash" => (
+            "poc.sh",
+            vec!["bash".to_string(), "/workspace/poc.sh".to_string()],
+        ),
         other => {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(format!("unsupported PoC language {other:?}"));
@@ -243,10 +283,6 @@ async fn execute_in_sandbox(script: &str, language: &str) -> Result<(i64, String
         }],
         sandbox_enabled: true,
         network_access: false,
-        worktree_enabled: false,
-        worktree_auto_merge: true,
-        worktree_cleanup_on_exit: true,
-        worktree_copy_files: vec![],
         cmd,
         env: vec![],
     };
@@ -414,7 +450,9 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/x.py"), "def f(): pass").unwrap();
         let mut f = plausible_high_finding();
-        let caller = StubCaller(r#"{"language":"none","script":"","note":"needs a live server"}"#.to_string());
+        let caller = StubCaller(
+            r#"{"language":"none","script":"","note":"needs a live server"}"#.to_string(),
+        );
         maybe_run_poc(dir.path(), &mut f, &caller, true).await;
         assert_eq!(f.evidence.len(), 1);
         assert_eq!(f.evidence[0].kind, EvidenceKind::PocSkipped);
@@ -428,7 +466,9 @@ mod tests {
         #[async_trait::async_trait]
         impl LlmCaller for FailingCaller {
             async fn complete(&self, _prompt: &str) -> duduclaw_fork::Result<String> {
-                Err(duduclaw_fork::ForkError::Executor("no CLI available".to_string()))
+                Err(duduclaw_fork::ForkError::Executor(
+                    "no CLI available".to_string(),
+                ))
             }
         }
         let dir = tempfile::tempdir().unwrap();

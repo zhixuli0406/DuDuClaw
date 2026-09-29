@@ -237,7 +237,12 @@ impl SkillExtractor {
                 let preview: String = t.content.chars().take(50).collect();
                 format!("auto:{}", sanitize_skill_name(&preview))
             })
-            .unwrap_or_else(|| format!("auto:skill-{}", &trajectory.session_key[..8.min(trajectory.session_key.len())]));
+            .unwrap_or_else(|| {
+                format!(
+                    "auto:skill-{}",
+                    &trajectory.session_key[..8.min(trajectory.session_key.len())]
+                )
+            });
 
         // Generate description from assistant turns
         let description = trajectory
@@ -277,9 +282,7 @@ pub struct SkillCache {
 
 impl SkillCache {
     pub fn new() -> Self {
-        Self {
-            skills: Vec::new(),
-        }
+        Self { skills: Vec::new() }
     }
 
     /// Add a skill to the bank.
@@ -322,7 +325,7 @@ impl SkillCache {
                 confidence REAL NOT NULL DEFAULT 0.5,
                 source_session TEXT,
                 extracted_at TEXT NOT NULL
-            );"
+            );",
         )
         .map_err(|e| format!("Failed to init schema: {e}"))?;
 
@@ -378,16 +381,12 @@ impl SkillCache {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     description: row.get(2)?,
-                    tools_used: serde_json::from_str(&row.get::<_, String>(3)?)
-                        .unwrap_or_default(),
+                    tools_used: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
                     confidence: row.get(4)?,
-                    source_session: row.get::<_, Option<String>>(5)?
-                        .unwrap_or_default(),
-                    extracted_at: chrono::DateTime::parse_from_rfc3339(
-                        &row.get::<_, String>(6)?,
-                    )
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now()),
+                    source_session: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    extracted_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now()),
                 })
             })
             .map_err(|e| format!("Read failed: {e}"))?
@@ -431,7 +430,11 @@ mod tests {
         );
 
         let trajectory = recorder
-            .finalize("sess-1", TrajectoryOutcome::Success, Some(Sentiment::Positive))
+            .finalize(
+                "sess-1",
+                TrajectoryOutcome::Success,
+                Some(Sentiment::Positive),
+            )
             .unwrap();
         assert_eq!(trajectory.turns.len(), 2);
         assert_eq!(trajectory.outcome, TrajectoryOutcome::Success);

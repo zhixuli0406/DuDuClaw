@@ -44,6 +44,29 @@ use duduclaw_core::types::sandbox_level_for;
 
 use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 
+tokio::task_local! {
+    static EVAL_SANDBOX_OFF: bool;
+}
+
+/// Scope an explicit sandbox-off request to one live eval round. This task-local
+/// value cannot change gateway requests or another concurrent evaluation.
+pub async fn with_eval_sandbox_off<F: std::future::Future>(future: F) -> F::Output {
+    EVAL_SANDBOX_OFF.scope(true, future).await
+}
+
+fn sandbox_profile(
+    caps: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) -> Option<&'static str> {
+    if EVAL_SANDBOX_OFF.try_with(|off| *off).unwrap_or(false) {
+        return Some("off");
+    }
+    match sandbox_level_for(caps) {
+        duduclaw_core::types::SandboxLevel::ReadOnly => Some(SANDBOX_PROFILE_RO),
+        duduclaw_core::types::SandboxLevel::WorkspaceWrite => Some(SANDBOX_PROFILE_WW),
+        duduclaw_core::types::SandboxLevel::FullAccess => None,
+    }
+}
+
 /// Hard backstop on the whole subprocess.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
@@ -172,6 +195,26 @@ pub fn looks_like_grok_auth_failure(stderr: &str) -> bool {
 /// "authentication" so the gateway's `classify_cli_failure` lands
 /// `FailureReason::AuthFailed` (→ the "認證失效" user message), plus a zh-TW
 /// operator action so remote debugging is one step.
+/// `--reasoning-effort <level>` for one invocation (P1/WP-3).
+///
+/// Verified on grok 1.0.41 (`--help`): `--reasoning-effort <EFFORT>  Reasoning
+/// effort for reasoning models  [aliases: --effort]`. The accepted VALUE SET is
+/// **not enumerated** by `--help`, so `Effort::clamp_for` caps Grok at `high`
+/// (the trio every vendor accepts) instead of gambling on `xhigh`/`max`. Raise
+/// the ceiling in `effort.rs` once the values are probed against a live run.
+/// `None` ⇒ empty.
+fn effort_args(effort: Option<duduclaw_core::effort::Effort>) -> Vec<String> {
+    match effort {
+        Some(e) => vec![
+            "--reasoning-effort".to_string(),
+            e.clamp_for(duduclaw_core::types::RuntimeType::Grok)
+                .as_str()
+                .to_string(),
+        ],
+        None => Vec::new(),
+    }
+}
+
 fn grok_auth_error(stderr_tail: &str) -> String {
     format!(
         "Grok CLI authentication failure (not logged in / 憑證失效): \
@@ -285,7 +328,9 @@ impl AgentRuntime for GrokRuntime {
         // TOML) but per-agent project-local discovery is the one residual — so we
         // ALSO forward the agent identity via spawn env below. Warn-not-fatal.
         if let Some(ref dir) = context.agent_dir {
-            if let Err(e) = Self::ensure_duduclaw_mcp_config(dir, &context.agent_id).await {
+            if let Err(e) =
+                Self::ensure_duduclaw_mcp_config(dir, &context.agent_id, &context.home_dir).await
+            {
                 warn!(
                     runtime = "grok",
                     agent = %context.agent_id,
@@ -317,6 +362,14 @@ impl AgentRuntime for GrokRuntime {
             args.push("--model".to_string());
             args.push(context.model.clone());
         }
+
+        // P1/WP-3: per-call reasoning effort. Verified on grok 1.0.41
+        // (`--help`): `--reasoning-effort <EFFORT>  Reasoning effort for
+        // reasoning models  [aliases: --effort]`. The canonical long form is
+        // used. `--help` does NOT enumerate the accepted values, so
+        // `clamp_for` caps Grok at `high` — the universally-accepted trio —
+        // rather than risking a rejected `xhigh`/`max`. `None` ⇒ flag absent.
+        args.extend(effort_args(context.effort));
 
         // Tool confinement — verified `--tools` / `--disallowed-tools` flags. This
         // is an ADDITIVE best-effort layer on top of the hard `native_sandbox`
@@ -357,16 +410,9 @@ impl AgentRuntime for GrokRuntime {
         // by `ensure_sandbox_profiles` extend the built-ins with the duduclaw
         // state dir writable (its own MCP scope gates + [capabilities] policy
         // remain the access control there). Live-verified working end-to-end.
-        match sandbox_level_for(caps) {
-            duduclaw_core::types::SandboxLevel::ReadOnly => {
-                args.push("--sandbox".to_string());
-                args.push(SANDBOX_PROFILE_RO.to_string());
-            }
-            duduclaw_core::types::SandboxLevel::WorkspaceWrite => {
-                args.push("--sandbox".to_string());
-                args.push(SANDBOX_PROFILE_WW.to_string());
-            }
-            duduclaw_core::types::SandboxLevel::FullAccess => {}
+        if let Some(profile) = sandbox_profile(caps) {
+            args.push("--sandbox".to_string());
+            args.push(profile.to_string());
         }
         args.push("--permission-mode".to_string());
         args.push("bypassPermissions".to_string());
@@ -401,7 +447,57 @@ impl AgentRuntime for GrokRuntime {
         cmd.args(&args);
 
         // Working directory (also the root Grok walks for AGENTS.md / project config).
-        if let Some(ref dir) = context.agent_dir {
+        //
+        // A caller may override the cwd via `super::SPAWN_OVERRIDE` (today: the
+        // team composer, putting a role member in the employee's workspace so
+        // its files outlive the throwaway scaffold — design §4.3 E3). Until the
+        // 2026-09-28 review this runtime ignored the override, so a grok role
+        // member's work was deleted by the immediate GC.
+        //
+        // Grok is the one runtime where moving the cwd moves more than the cwd:
+        // both `.grok/config.toml` (the duduclaw MCP registration) and
+        // `.grok/sandbox.toml` (the `duduclaw-ww` / `duduclaw-ro` profile names
+        // the `--sandbox` flag above refers to) are resolved from the cwd, not
+        // from `agent_dir`. So an overridden root gets its own copy of both —
+        // written just above for `agent_dir`, and here for the new root —
+        // otherwise the member would spawn with zero MCP tools and an
+        // unresolvable sandbox profile name. Identity still travels
+        // independently through the spawn env below.
+        let work_root: Option<std::path::PathBuf> =
+            super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
+        let cwd_overridden = work_root.is_some() && work_root != context.agent_dir;
+        if cwd_overridden {
+            if let Some(ref root) = work_root {
+                // KNOWN LIMITATION, stated rather than discovered later: these
+                // two files are keyed by directory, not by member, so two grok
+                // role members sharing one workspace overwrite each other's
+                // declared `env` block. The command/args halves are identical
+                // between members, and the per-process identity below is what
+                // the MCP child actually authenticates with, so the blast
+                // radius is the declared block only.
+                if let Err(e) =
+                    Self::ensure_duduclaw_mcp_config(root, &context.agent_id, &context.home_dir)
+                        .await
+                {
+                    warn!(
+                        runtime = "grok",
+                        agent = %context.agent_id,
+                        error = %e,
+                        "failed to write grok MCP config in the overridden work root — \
+                         the member may run without duduclaw tools"
+                    );
+                }
+                if let Err(e) = Self::ensure_sandbox_profiles(root, &context.home_dir).await {
+                    warn!(
+                        runtime = "grok",
+                        agent = %context.agent_id,
+                        error = %e,
+                        "failed to write grok sandbox profiles in the overridden work root"
+                    );
+                }
+            }
+        }
+        if let Some(ref dir) = work_root {
             cmd.current_dir(dir);
         }
 
@@ -418,12 +514,16 @@ impl AgentRuntime for GrokRuntime {
         // Identity pair, not just the id: an MCP child that inherits this env
         // instead of the declared block must still be able to prove its claim
         // under `[delegation] require_identity_token = true`.
-        for (k, v) in duduclaw_core::agent_identity_env_vars_default(&context.agent_id) {
+        for (k, v) in duduclaw_core::agent_identity_env_vars(&context.home_dir, &context.agent_id) {
             cmd.env(k, v);
         }
         for (k, v) in duduclaw_core::mcp_forward_env_vars() {
             cmd.env(k, v);
         }
+        // RuntimeContext is authoritative for isolated eval arms. The process
+        // env can still name the source home, whose MCP auth/task state must
+        // never receive a role member's calls.
+        cmd.env("DUDUCLAW_HOME", &context.home_dir);
 
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -431,7 +531,9 @@ impl AgentRuntime for GrokRuntime {
         // Native OS sandbox (opt-in). The hard, fail-closed confinement on this
         // runtime; fail-closed if required but unavailable.
         let native_sandbox_active = caps.map(|c| c.native_sandbox).unwrap_or(false);
-        super::apply_native_sandbox(&mut cmd, caps, context.agent_dir.as_deref(), "grok")?;
+        // Scoped to the working root so an overridden cwd is the directory that
+        // gets write access — same rule as `runtime/codex.rs`.
+        super::apply_native_sandbox(&mut cmd, caps, work_root.as_deref(), "grok")?;
 
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -492,7 +594,10 @@ impl AgentRuntime for GrokRuntime {
             let retry_disabled =
                 crate::pty_runtime::is_pty_retry_disabled() || native_sandbox_active;
             if should_pty_retry_empty(true, true, is_auth, retry_disabled) {
-                match self.pty_retry(&args, &home_env, &api_key, context).await {
+                match self
+                    .pty_retry(&args, &home_env, &api_key, context, work_root.as_deref())
+                    .await
+                {
                     Ok(text) if !text.trim().is_empty() => {
                         info!(
                             runtime = "grok",
@@ -606,6 +711,11 @@ impl GrokRuntime {
         home_env: &[(String, String)],
         api_key: &str,
         context: &RuntimeContext,
+        // The cwd the primary spawn actually used — the `SPAWN_OVERRIDE` work
+        // root when a caller imposed one, else `agent_dir`. Passed in rather
+        // than re-derived so the retry can never land in a different directory
+        // than the attempt it is retrying.
+        work_root: Option<&std::path::Path>,
     ) -> Result<String, String> {
         let mut env: std::collections::HashMap<String, String> = home_env.iter().cloned().collect();
         if !api_key.is_empty() {
@@ -626,7 +736,7 @@ impl GrokRuntime {
             self.grok_path.clone(),
             args.to_vec(),
             env,
-            context.agent_dir.clone(),
+            work_root.map(std::path::Path::to_path_buf),
             std::time::Duration::from_secs(PTY_RETRY_TIMEOUT_SECS),
             // WP-8B (credentials doctrine P3) added the `clear_env` param to
             // `invoke_oneshot`; this call site is outside that WP's reviewed
@@ -657,7 +767,10 @@ fn salvage_pty_stdout(raw_stdout: &str, args: &[String]) -> Result<String, Strin
     let stripped = duduclaw_cli_runtime::strip_ansi(raw_stdout);
     // The prompt is the longest argument by construction (`-p <prompt>` with
     // history + system text embedded); anything ≥200 chars can't be a flag.
-    let prompt_arg = args.iter().filter(|a| a.chars().count() >= 200).max_by_key(|a| a.len());
+    let prompt_arg = args
+        .iter()
+        .filter(|a| a.chars().count() >= 200)
+        .max_by_key(|a| a.len());
     let mut answer: &str = &stripped;
     if let Some(p) = prompt_arg {
         // CJK-safe tail needle: last ~48 chars of the prompt as rendered.
@@ -758,7 +871,7 @@ impl GrokRuntime {
     /// an `env` table carrying `DUDUCLAW_AGENT_ID` (+ forwarded home/port/
     /// instance). Returns `None` when the binary can't be resolved to an absolute
     /// path (relative paths aren't safe to persist).
-    fn duduclaw_server_toml(agent_id: &str) -> Option<toml::Value> {
+    fn duduclaw_server_toml(agent_id: &str, home_dir: &Path) -> Option<toml::Value> {
         let bin = duduclaw_core::resolve_duduclaw_bin();
         if !bin.is_absolute() {
             return None;
@@ -766,7 +879,7 @@ impl GrokRuntime {
         let mut env = toml::map::Map::new();
         // Identity pair: id + (when `<home>/identity.key` exists) the WP21
         // debt ⑧ `DUDUCLAW_AGENT_TOKEN` proving DuDuClaw issued that id.
-        for (k, v) in duduclaw_core::agent_identity_env_vars_default(agent_id) {
+        for (k, v) in duduclaw_core::agent_identity_env_vars(home_dir, agent_id) {
             env.insert(k, toml::Value::String(v));
         }
         // Shared forward set (home/port/instance + MCP auth). Grok spawns MCP
@@ -777,6 +890,10 @@ impl GrokRuntime {
         for (k, v) in duduclaw_core::mcp_forward_env_vars() {
             env.insert(k, toml::Value::String(v));
         }
+        env.insert(
+            "DUDUCLAW_HOME".to_string(),
+            toml::Value::String(home_dir.to_string_lossy().to_string()),
+        );
         let mut table = toml::map::Map::new();
         table.insert(
             "command".to_string(),
@@ -862,8 +979,9 @@ impl GrokRuntime {
     pub async fn ensure_duduclaw_mcp_config(
         agent_dir: &std::path::Path,
         agent_id: &str,
+        home_dir: &Path,
     ) -> Result<bool, String> {
-        let Some(def) = Self::duduclaw_server_toml(agent_id) else {
+        let Some(def) = Self::duduclaw_server_toml(agent_id, home_dir) else {
             return Err("duduclaw binary did not resolve to an absolute path".to_string());
         };
         let mut servers = std::collections::HashMap::new();
@@ -877,6 +995,52 @@ impl GrokRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn eval_sandbox_off_is_scoped_to_its_task() {
+        let caps = duduclaw_core::types::CapabilitiesConfig {
+            allowed_tools: vec!["Read".into()],
+            ..Default::default()
+        };
+        assert_eq!(sandbox_profile(Some(&caps)), Some(SANDBOX_PROFILE_RO));
+        with_eval_sandbox_off(async {
+            assert_eq!(sandbox_profile(Some(&caps)), Some("off"));
+            let child_caps = caps.clone();
+            assert_eq!(
+                tokio::spawn(async move { sandbox_profile(Some(&child_caps)) })
+                    .await
+                    .unwrap(),
+                Some(SANDBOX_PROFILE_RO)
+            );
+        })
+        .await;
+        assert_eq!(sandbox_profile(Some(&caps)), Some(SANDBOX_PROFILE_RO));
+    }
+
+    /// P1/WP-3 — grok spells effort `--reasoning-effort` (alias `--effort`).
+    /// `--help` on 1.0.41 does NOT enumerate the accepted values, so the
+    /// ceiling is deliberately `high`; forwarding `xhigh`/`max` could be
+    /// rejected and take the spawn down with it.
+    #[test]
+    fn effort_args_use_reasoning_effort_and_clamp_to_high() {
+        use duduclaw_core::effort::Effort;
+        assert!(effort_args(None).is_empty());
+        assert_eq!(
+            effort_args(Some(Effort::Medium)),
+            vec!["--reasoning-effort", "medium"]
+        );
+        assert_eq!(
+            effort_args(Some(Effort::Max)),
+            vec!["--reasoning-effort", "high"]
+        );
+        // The long canonical form, never the bare alias.
+        assert!(
+            !effort_args(Some(Effort::Low))
+                .iter()
+                .any(|a| a == "--effort")
+        );
+    }
+
     use crate::runtime::ConversationTurn;
 
     fn ctx(system: &str, model: &str) -> RuntimeContext {
@@ -891,6 +1055,8 @@ mod tests {
             conversation_history: vec![],
             capabilities: None,
             account_pool: vec![],
+            effort: None,
+            allow_cross_family_failover: true,
         }
     }
 
@@ -1135,13 +1301,17 @@ mod tests {
         duduclaw.insert("env".to_string(), toml::Value::Table(env));
         servers.insert("duduclaw".to_string(), toml::Value::Table(duduclaw));
 
-        assert!(GrokRuntime::write_mcp_config(dir.path(), &servers)
-            .await
-            .unwrap());
+        assert!(
+            GrokRuntime::write_mcp_config(dir.path(), &servers)
+                .await
+                .unwrap()
+        );
         // Second call: entry already matches → no write.
-        assert!(!GrokRuntime::write_mcp_config(dir.path(), &servers)
-            .await
-            .unwrap());
+        assert!(
+            !GrokRuntime::write_mcp_config(dir.path(), &servers)
+                .await
+                .unwrap()
+        );
 
         let got: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -1166,8 +1336,16 @@ mod tests {
 
     #[test]
     fn salvage_cuts_rendered_prompt_and_keeps_answer() {
-        let prompt = format!("<conversation_history>{}</conversation_history>\n\n以上只是紀錄。\n<current_message>\nhi\n</current_message>", "x".repeat(300));
-        let args = vec!["-p".to_string(), prompt.clone(), "--model".to_string(), "grok-4.5".to_string()];
+        let prompt = format!(
+            "<conversation_history>{}</conversation_history>\n\n以上只是紀錄。\n<current_message>\nhi\n</current_message>",
+            "x".repeat(300)
+        );
+        let args = vec![
+            "-p".to_string(),
+            prompt.clone(),
+            "--model".to_string(),
+            "grok-4.5".to_string(),
+        ];
         // A TTY renders the prompt, then the model's reply follows.
         let raw = format!("banner\n{prompt}\n你好！我是 DuDu，需要幫忙嗎？\n");
         let out = salvage_pty_stdout(&raw, &args).expect("salvaged");
@@ -1176,7 +1354,10 @@ mod tests {
 
     #[test]
     fn salvage_refuses_when_only_prompt_echo_remains() {
-        let prompt = format!("<conversation_history>{}</conversation_history> tail-marker-abcdef", "y".repeat(300));
+        let prompt = format!(
+            "<conversation_history>{}</conversation_history> tail-marker-abcdef",
+            "y".repeat(300)
+        );
         let args = vec!["-p".to_string(), prompt.clone()];
         // Nothing after the rendered prompt → honest error, never a leak.
         let raw = format!("ui chrome\n{prompt}\n   \n");

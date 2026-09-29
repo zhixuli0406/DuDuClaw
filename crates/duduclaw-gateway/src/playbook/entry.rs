@@ -76,6 +76,21 @@ pub enum PlaybookCategory {
     Explore,
 }
 
+/// Whether a playbook entry can be considered for another model in the same
+/// role. This is provenance, not permission to inject across models: the
+/// selector must also establish a matching role scope and fresh evidence.
+/// Legacy entries default to model-bound guidance so migration never widens
+/// their reach silently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transferability {
+    /// Factual or operational constraint, eligible for cross-model review.
+    FactConstraint,
+    /// Model-specific prompting or strategy; requires new evidence on a new model.
+    #[default]
+    ModelGuidance,
+}
+
 impl PlaybookCategory {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -257,13 +272,21 @@ impl EntryAssertions {
         // A token in both the positive and negative list can never be
         // satisfied — reject the contradiction at write time.
         for t in &self.must_use_tools {
-            if self.must_not_use_tools.iter().any(|n| n.eq_ignore_ascii_case(t)) {
-                return Err(format!("tool `{t}` is in both must_use_tools and must_not_use_tools"));
+            if self
+                .must_not_use_tools
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(t))
+            {
+                return Err(format!(
+                    "tool `{t}` is in both must_use_tools and must_not_use_tools"
+                ));
             }
         }
         for t in &self.output_contains {
             if self.output_not_contains.iter().any(|n| n == t) {
-                return Err(format!("`{t}` is in both output_contains and output_not_contains"));
+                return Err(format!(
+                    "`{t}` is in both output_contains and output_not_contains"
+                ));
             }
         }
         Ok(())
@@ -280,6 +303,10 @@ pub struct PlaybookMeta {
 
     /// Gene category (GEP G1).
     pub category: PlaybookCategory,
+
+    /// Conservative until scope and cross-model validation are wired end to end.
+    #[serde(default)]
+    pub transferability: Transferability,
 
     /// Trigger signals (GEP G3). OR semantics: the entry is "signal-matched"
     /// when ANY token matches the turn's signal set. Sorted + deduped on
@@ -406,6 +433,7 @@ impl PlaybookMeta {
         Self {
             schema_version: PLAYBOOK_SCHEMA_VERSION,
             category,
+            transferability: Transferability::default(),
             signals_match: vec!["*".to_string()],
             strategy: Vec::new(),
             failure_history: Vec::new(),
@@ -427,6 +455,18 @@ impl PlaybookMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_transferability_is_model_bound() {
+        let mut metadata = serde_json::json!({});
+        PlaybookMeta::legacy_default(&[], "Use the recorded source").merge_into(&mut metadata);
+        metadata[PLAYBOOK_KEY]
+            .as_object_mut()
+            .unwrap()
+            .remove("transferability");
+        let parsed = PlaybookMeta::from_metadata(&metadata).unwrap();
+        assert_eq!(parsed.transferability, Transferability::ModelGuidance);
+    }
 
     #[test]
     fn category_round_trips_through_as_str() {
