@@ -85,7 +85,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # supports linux amd64/arm64 (glibc); it drops the binary in $HOME/.local/bin,
 # which we relocate to /usr/local/bin so every user (incl. `duduclaw`) resolves
 # it on PATH — matching `duduclaw-core::which_agy`.
-RUN curl -fsSL https://antigravity.google/cli/install.sh | bash && \
+#
+# Fetched to a file and validated before it runs: on 2026-09-29 the endpoint
+# briefly served a non-script body and `curl | bash` died with a bash syntax
+# error — after five hours of QEMU arm64 compilation. Five attempts with
+# backoff, a shebang check, and a loud failure message replace the pipe.
+RUN set -eu; \
+    for attempt in 1 2 3 4 5; do \
+      if curl -fsSL --retry 3 -o /tmp/agy-install.sh https://antigravity.google/cli/install.sh \
+         && head -c 2 /tmp/agy-install.sh | grep -q '^#!'; then break; fi; \
+      echo "antigravity install script fetch/validation failed (attempt $attempt/5)" >&2; \
+      if [ "$attempt" = 5 ]; then echo "ERROR: https://antigravity.google/cli/install.sh did not return a shell script" >&2; head -c 300 /tmp/agy-install.sh >&2 || true; exit 1; fi; \
+      sleep $((attempt * 20)); \
+    done && \
+    bash /tmp/agy-install.sh && rm -f /tmp/agy-install.sh && \
     install -m 0755 "$HOME/.local/bin/agy" /usr/local/bin/agy && \
     agy --version
 
