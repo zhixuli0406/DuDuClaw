@@ -2565,7 +2565,12 @@ pub(crate) fn workspace_relative_display(workspace: &Path, resolved: &Path, raw:
         .canonicalize()
         .unwrap_or_else(|_| resolved.to_path_buf());
     match rs.strip_prefix(&ws) {
-        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
+        // Receipts are a cross-platform contract: the planner declared
+        // `notes/a.md`, and the verifier prompt, evidence rows and the
+        // receipt key must read the same on every OS. `Path::strip_prefix`
+        // yields backslashes on Windows, so normalise the DISPLAY string
+        // only (I/O keeps using the resolved `Path`).
+        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().replace('\\', "/"),
         _ => raw.to_string(),
     }
 }

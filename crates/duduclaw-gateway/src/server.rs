@@ -16363,6 +16363,15 @@ mod shutdown_sequence_tests {
 
     const SRC: &str = include_str!("server.rs");
 
+    /// `include_str!` hands back the bytes as checked out — with CRLF line
+    /// endings on a Windows runner that has `core.autocrlf` on — so any
+    /// pattern that spans a line break must search a normalised copy
+    /// (2026-09-29: `shadow_flush_is_bounded_and_warn_only` failed only on
+    /// the Windows CI leg for exactly this reason).
+    fn src() -> String {
+        SRC.replace("\r\n", "\n")
+    }
+
     const PREDICTION_FLUSH: &str = "bounded_step(\"prediction engine flush\"";
     const SHADOW_FLUSH: &str = "crate::claude_runner::flush_inference_shadow_observations()";
     // The flush chain hands over to axum's connection drain by firing this
@@ -16379,13 +16388,13 @@ mod shutdown_sequence_tests {
     /// let the process exit while a calibration row is still being written.
     #[test]
     fn shadow_flush_is_sequenced_between_prediction_flush_and_drain_handover() {
-        let prediction = SRC
+        let prediction = src()
             .find(PREDICTION_FLUSH)
             .expect("the prediction-engine flush step must still exist");
-        let shadow = SRC
+        let shadow = src()
             .find(SHADOW_FLUSH)
             .expect("the UCCI shadow flush must be wired into graceful shutdown");
-        let handover = SRC
+        let handover = src()
             .find(DRAIN_HANDOVER)
             .expect("the flush chain must still hand over to the connection drain");
         assert!(
@@ -16402,9 +16411,9 @@ mod shutdown_sequence_tests {
     /// allowed to hold the process open through a restart.
     #[test]
     fn shadow_flush_is_bounded_and_warn_only() {
-        let step = SRC
+        let step = src()
             .find("bounded_step(\n            \"UCCI shadow observation flush\",\n            5,")
-            .or_else(|| SRC.find("bounded_step(\"UCCI shadow observation flush\", 5,"));
+            .or_else(|| src().find("bounded_step(\"UCCI shadow observation flush\", 5,"));
         assert!(
             step.is_some(),
             "the shadow flush must go through `bounded_step` with a 5s bound"
