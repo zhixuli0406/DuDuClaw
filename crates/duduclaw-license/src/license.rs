@@ -229,6 +229,54 @@ impl License {
         Ok(())
     }
 
+    /// Like [`Self::validate`], but tries a list of acceptable fingerprints in
+    /// order and reports which one matched.
+    ///
+    /// This is the v1.66.1 compatibility seam: `candidates[0]` is the machine's
+    /// current (strong) fingerprint and the rest reproduce what older DuDuClaw
+    /// builds computed on the same machine — see
+    /// [`crate::fingerprint::fingerprint_candidates`]. A license bound to a
+    /// legacy value keeps working (`legacy = true`, caller should tell the
+    /// operator to re-issue) instead of silently downgrading to OpenSource.
+    ///
+    /// Only [`LicenseError::InvalidFingerprint`] advances to the next
+    /// candidate — every other failure (expiry, grace period, unsupported
+    /// schema) is returned immediately, because trying another fingerprint
+    /// cannot change the outcome and swallowing it would hide the real reason.
+    ///
+    /// An empty `candidates` slice validates against the empty fingerprint,
+    /// which is exactly the unbound-OEM path [`Self::validate`] already
+    /// implements (and fails closed for every other tier).
+    pub fn validate_any(
+        &self,
+        candidates: &[String],
+        phone_home_interval: i64,
+        grace_period: i64,
+    ) -> Result<crate::fingerprint::FingerprintMatch, LicenseError> {
+        if candidates.is_empty() {
+            self.validate("", phone_home_interval, grace_period)?;
+            return Ok(crate::fingerprint::FingerprintMatch {
+                fingerprint: String::new(),
+                legacy: false,
+            });
+        }
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            match self.validate(candidate, phone_home_interval, grace_period) {
+                Ok(()) => {
+                    return Ok(crate::fingerprint::FingerprintMatch {
+                        fingerprint: candidate.clone(),
+                        legacy: index > 0,
+                    });
+                }
+                Err(LicenseError::InvalidFingerprint) => continue,
+                Err(other) => return Err(other),
+            }
+        }
+
+        Err(LicenseError::InvalidFingerprint)
+    }
+
     /// Validate the tier ↔ deployment-mode binding (M51 fix).
     ///
     /// A cloud-only tier (Hobby/Solo/Studio/Business) must never be honoured on
@@ -816,6 +864,75 @@ mod tests {
         let license = make_license(LicenseTier::Oem, 365, 1);
         assert!(license.validate("abc123", 7, 30).is_ok());
         let err = license.validate("wrong-fp", 7, 30).unwrap_err();
+        assert!(matches!(err, LicenseError::InvalidFingerprint));
+    }
+
+    // ── v1.66.1: multi-candidate fingerprint validation ─────────────
+
+    #[test]
+    fn validate_any_matches_the_strong_fingerprint_first() {
+        let license = make_license(LicenseTier::SelfHostPro, 30, 3);
+        let candidates = vec!["abc123".to_string(), "legacy-fp".to_string()];
+        let m = license.validate_any(&candidates, 7, 30).unwrap();
+        assert_eq!(m.fingerprint, "abc123");
+        assert!(!m.legacy, "a strong match must not be flagged legacy");
+    }
+
+    #[test]
+    fn validate_any_falls_back_to_a_legacy_candidate() {
+        let license = make_license(LicenseTier::SelfHostPro, 30, 3);
+        // The machine's strong fingerprint changed (macOS 26 upgrade); the
+        // installed license is still bound to the old placeholder-MAC value.
+        let candidates = vec!["strong-fp".to_string(), "abc123".to_string()];
+        let m = license.validate_any(&candidates, 7, 30).unwrap();
+        assert_eq!(m.fingerprint, "abc123");
+        assert!(m.legacy, "a compatibility match must be flagged legacy");
+    }
+
+    #[test]
+    fn validate_any_rejects_when_no_candidate_matches() {
+        let license = make_license(LicenseTier::Solo, 30, 0);
+        let candidates = vec!["nope-1".to_string(), "nope-2".to_string()];
+        let err = license.validate_any(&candidates, 7, 30).unwrap_err();
+        assert!(matches!(err, LicenseError::InvalidFingerprint));
+    }
+
+    #[test]
+    fn validate_any_does_not_swallow_non_fingerprint_errors() {
+        // An expired license must report Expired, not InvalidFingerprint —
+        // otherwise the operator chases the wrong problem.
+        let license = make_license(LicenseTier::SelfHostPro, -1, 0);
+        let candidates = vec!["abc123".to_string(), "legacy-fp".to_string()];
+        let err = license.validate_any(&candidates, 7, 30).unwrap_err();
+        assert!(matches!(err, LicenseError::Expired), "got {err:?}");
+
+        let stale = make_license(LicenseTier::SelfHostPro, 30, 45);
+        let err = stale.validate_any(&candidates, 7, 30).unwrap_err();
+        assert!(
+            matches!(err, LicenseError::GracePeriodExceeded(d) if d == 45),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_any_preserves_unbound_oem_behaviour() {
+        // Unbound OEM: an empty license fingerprint passes against anything,
+        // including an empty candidate list.
+        let mut license = make_license(LicenseTier::Oem, 365, 1);
+        license.machine_fingerprint = String::new();
+        let m = license
+            .validate_any(&["whatever".to_string()], 7, 30)
+            .unwrap();
+        assert_eq!(m.fingerprint, "whatever");
+        assert!(!m.legacy);
+        assert!(license.validate_any(&[], 7, 30).is_ok());
+
+        // … and a non-OEM tier still fails closed on an empty fingerprint.
+        let mut bound = make_license(LicenseTier::Solo, 365, 1);
+        bound.machine_fingerprint = String::new();
+        let err = bound
+            .validate_any(&["whatever".to_string()], 7, 30)
+            .unwrap_err();
         assert!(matches!(err, LicenseError::InvalidFingerprint));
     }
 

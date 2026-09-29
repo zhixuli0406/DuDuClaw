@@ -37,11 +37,22 @@ impl MethodHandler {
     /// contains the Ed25519 signature).
     /// `license.fingerprint` — this machine's fingerprint, shown in the
     /// dashboard upgrade card so the operator can have a license issued.
+    ///
+    /// `fingerprint` is deliberately the **strong** value — identical to what
+    /// `duduclaw license fingerprint` prints — because this RPC exists to get a
+    /// *new* license issued, and issuing against a legacy placeholder-MAC value
+    /// would perpetuate the weak binding this card is meant to fix. `effective`
+    /// reports what the currently-installed license is actually bound to, and
+    /// `legacy_binding` flags the "still accepted, please re-issue" state.
     pub(crate) async fn handle_license_fingerprint(&self) -> WsFrame {
+        let strong = crate::license_runtime::strong_fingerprint();
+        let effective = crate::license_runtime::cached_fingerprint();
         WsFrame::ok_response(
             "",
             json!({
-                "fingerprint": duduclaw_license::generate_fingerprint(),
+                "fingerprint": strong,
+                "effective": effective,
+                "legacy_binding": effective != strong,
             }),
         )
     }

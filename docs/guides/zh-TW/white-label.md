@@ -33,6 +33,16 @@
 
 2. 新增一個經銷商，然後點**簽發金鑰**：貼上經銷商用 `duduclaw license fingerprint` 拿到的機器指紋，選一個授權期限（預設 365 天），複製產生出來的 blob。經銷商拿到後用 `duduclaw license activate <blob>` 啟用。
 
+   **指紋要用 1.66.1（含）以後的版本取得。**
+   - **macOS**：1.66.1 起改以 `IOPlatformUUID` 綁定硬體。macOS 26（Darwin 27）對一般未授權行程遮蔽所有介面的 MAC（一律回報 `02:00:00:00:00:00`），挑介面救不回來，所以換了識別來源。**既有 macOS 安裝的指紋都會因此改變**。
+   - **Linux／Windows**：指紋沒有變動。挑選邏輯只是多跳過全零／佔位／multicast 位址；原本第一個介面就有效的主機，算出來的值與 1.66.0 完全相同。
+
+   **換機或升級之後**：在新機（或升級後的機器）跑 `duduclaw license fingerprint`，把新指紋回報給簽發方重簽；或直接跑 `duduclaw license rebind`（打控制平面 `/v1/license/rebind`，由它重簽）。舊指紋簽出的授權**仍然有效**（相容判定），gateway 只會在 log 留一則 WARN 建議重簽；`duduclaw license status` 的 `Fingerprint binding:` 那行會顯示 `strong` 或 `legacy (re-issue recommended)`。想看這台機器接受哪些指紋，跑 `duduclaw license fingerprint --all`——第一行永遠是強指紋（腳本照抓第一行即可），其餘是相容值。
+
+   若 `fingerprint`／`status` 警告「No hardware identity is readable」，代表這台機器既沒有平台 UUID 也沒有可用網卡位址（容器或受限環境），指紋只綁主機名稱——仍可穩定發卡，但不提供硬體層級的防複製。
+
+   **換機或升級 OS 之後**：在新機（或升級後的機器）跑 `duduclaw license fingerprint`，把新指紋回報給簽發方重簽一次即可。舊指紋簽出的授權在 1.66.1 上**仍然有效**（相容判定），gateway 只會在 log 留一則 WARN 建議重簽；`duduclaw license status` 的 `Fingerprint binding:` 那行會顯示 `strong` 或 `legacy (re-issue recommended)`。想看這台機器接受哪些指紋，跑 `duduclaw license fingerprint --all`——第一行永遠是強指紋（腳本照抓第一行即可），其餘是相容值。
+
    每一份簽發出來的授權都會先拿二進位檔內建的 v2 公鑰自我驗證過一次才會記錄下來，金鑰對不上會立刻明顯報錯。
 
 3. **撤銷**會在本機帳本（`distributor.db`）裡把該金鑰標記為已撤銷，並寫進安全稽核 log。要讓已經啟用的實例知道，得靠下面說的 phone-home 更新與簽章過的 CRL，UI 會誠實標示這個時間差，不會假裝撤銷是即時生效的。

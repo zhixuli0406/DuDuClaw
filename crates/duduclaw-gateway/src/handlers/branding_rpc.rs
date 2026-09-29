@@ -216,7 +216,10 @@ impl MethodHandler {
                 );
             }
         };
-        let machine_fingerprint = duduclaw_license::generate_fingerprint();
+        // The *effective* fingerprint — the one the installed license is bound
+        // to — so a still-accepted legacy binding keeps matching the
+        // control-plane row (v1.66.1).
+        let machine_fingerprint = crate::license_runtime::cached_fingerprint();
         let (branding, _source) = crate::branding::load_with_source(&self.home_dir);
         let branding_v = serde_json::to_value(&branding).unwrap_or_else(|_| json!({}));
 

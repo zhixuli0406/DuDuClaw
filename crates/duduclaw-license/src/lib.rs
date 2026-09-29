@@ -40,7 +40,10 @@ pub use bundle::{
 };
 pub use crl::SignedCrl;
 pub use error::{LicenseError, Result};
-pub use fingerprint::generate_fingerprint;
+pub use fingerprint::{
+    FingerprintMatch, fingerprint_candidates, fingerprint_is_hostname_only, generate_fingerprint,
+    select_primary_mac,
+};
 pub use gate::{FeatureGate, SERVICE_COMMITMENTS, is_service_commitment};
 pub use key::{verify_license, PublicKeyRegistry};
 pub use license::{License, CURRENT_SCHEMA_VERSION};

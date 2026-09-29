@@ -64,6 +64,44 @@ machine-bound OEM license keys.
    Every issued license is self-verified against the binary's baked v2 public
    key before it is recorded — a mismatched key pair fails loudly.
 
+   **Take the fingerprint from 1.66.1 or later.**
+
+   - **macOS**: since 1.66.1 the fingerprint binds to `IOPlatformUUID`. macOS 26
+     (Darwin 27) hides every interface's MAC from ordinary non-entitled
+     processes (all of them read as `02:00:00:00:00:00`), so selecting a better
+     interface cannot help and the identifier itself changed. **Every existing
+     macOS install's fingerprint therefore changes.**
+   - **Linux / Windows**: the fingerprint is unchanged. Selection only skips
+     all-zero, placeholder, and multicast addresses; a host whose first
+     interface was already usable computes exactly the 1.66.0 value.
+
+   **Moving machines, or after an upgrade**: run
+   `duduclaw license fingerprint` on the new (or upgraded) machine and have the
+   key re-issued against that value, or run `duduclaw license rebind` (which
+   calls the control plane's `/v1/license/rebind` to re-sign). A license issued
+   against an older fingerprint **keeps working** — the gateway accepts the
+   legacy binding and logs a WARN recommending a re-issue.
+   `duduclaw license status` shows a `Fingerprint binding:` line reading either
+   `strong` or `legacy (re-issue recommended)`. To see every fingerprint this
+   machine accepts, run `duduclaw license fingerprint --all`; line 1 is always
+   the strong fingerprint, so scripts can keep reading the first line.
+
+   If `fingerprint` / `status` warn that no hardware identity is readable, the
+   machine has neither a platform UUID nor a usable NIC address (a container or
+   restricted environment) and the fingerprint binds to the hostname alone. It
+   is still stable and fine to issue against — it just provides no
+   hardware-level copy protection.
+
+   **Moving machines, or after an OS upgrade**: run
+   `duduclaw license fingerprint` on the new (or upgraded) machine and have the
+   key re-issued against that value. A license issued against an older
+   fingerprint **keeps working** on 1.66.1 — the gateway accepts the legacy
+   binding and logs a WARN recommending a re-issue. `duduclaw license status`
+   shows a `Fingerprint binding:` line reading either `strong` or
+   `legacy (re-issue recommended)`. To see every fingerprint this machine
+   accepts, run `duduclaw license fingerprint --all`; line 1 is always the
+   strong fingerprint, so scripts can keep reading the first line.
+
 3. **Revoke** marks the key revoked in the local ledger (`distributor.db`) and
    is written to the security audit log. Propagation to an already-activated
    instance happens through the phone-home refresh and the signed CRL described

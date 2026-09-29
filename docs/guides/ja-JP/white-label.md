@@ -33,6 +33,16 @@ DuDuClawは、ライセンスを受けたリセラーがdashboardをリブラン
 
 2. 販売代理店を追加し、**キーを発行**：リセラーが `duduclaw license fingerprint` で取得したマシンフィンガープリントを貼り付け、期間を選び（デフォルト365日）、生成されたblobをコピーします。リセラーは `duduclaw license activate <blob>` でこれを有効化します。
 
+   **フィンガープリントは 1.66.1 以降で取得してください。**
+   - **macOS**：1.66.1 から `IOPlatformUUID` でハードウェアに紐づけます。macOS 26（Darwin 27）は権限のない通常プロセスに対し全インターフェースの MAC を `02:00:00:00:00:00` として隠すため、インターフェースの選択では解決できず、識別子そのものを変更しました。**既存の macOS 環境のフィンガープリントはすべて変わります。**
+   - **Linux／Windows**：フィンガープリントは変わりません。選択ロジックが全ゼロ・プレースホルダ・マルチキャストを除外するだけで、最初のインターフェースが既に有効だったホストの値は 1.66.0 と完全に同一です。
+
+   **マシン移行やアップグレード後**：新しいマシンで `duduclaw license fingerprint` を実行してその値で再発行を依頼するか、`duduclaw license rebind`（コントロールプレーンの `/v1/license/rebind` を呼び出して再署名）を実行します。旧フィンガープリントで発行されたライセンスは**引き続き有効**です（互換判定）。gateway はログに再発行を勧める WARN を残すだけです。`duduclaw license status` の `Fingerprint binding:` 行に `strong` または `legacy (re-issue recommended)` が表示されます。受け付けるフィンガープリント一覧は `duduclaw license fingerprint --all` で確認できます（1行目は常に強いフィンガープリント）。
+
+   `fingerprint`／`status` が「No hardware identity is readable」と警告する場合、そのマシンにはプラットフォーム UUID も使用可能な NIC アドレスも存在せず（コンテナや制限環境）、フィンガープリントはホスト名のみに紐づきます。発行には使えますが、ハードウェアレベルのコピー防止にはなりません。
+
+   **マシン移行や OS アップグレード後**：新しいマシンで `duduclaw license fingerprint` を実行し、その値で再発行を依頼してください。旧フィンガープリントで発行されたライセンスは 1.66.1 でも**引き続き有効**です（互換判定）。gateway はログに再発行を勧める WARN を残すだけです。`duduclaw license status` の `Fingerprint binding:` 行に `strong` または `legacy (re-issue recommended)` が表示されます。このマシンが受け付けるフィンガープリント一覧は `duduclaw license fingerprint --all` で確認できます（1行目は常に強いフィンガープリントなので、スクリプトは1行目を読めば十分です）。
+
    発行される各ライセンスは、記録される前にバイナリへ焼き込まれたv2公開鍵に対して自己検証されます。鍵ペアが一致しない場合は明確にエラーとなります。
 
 3. **失効**は、ローカル台帳（`distributor.db`）内でそのキーを失効済みとしてマークし、セキュリティ監査ログにも記録します。すでに有効化済みのインスタンスへの伝播は、後述するphone-home更新と署名済みCRLを通じて行われます。UIはこの時間差を正直に示し、即時失効であるかのように装いません。

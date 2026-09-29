@@ -28,7 +28,8 @@ use std::time::Duration as StdDuration;
 use chrono::Utc;
 use duduclaw_license::{
     EMBEDDED_FEATURES_TOML, FeatureGate, License, LicenseError, LicenseTier, PublicKeyRegistry,
-    crl::SignedCrl, generate_fingerprint, load_default, save_default, storage,
+    crl::SignedCrl, fingerprint_candidates, fingerprint_is_hostname_only, generate_fingerprint,
+    load_default, save_default, storage,
 };
 use serde_json::json;
 use tokio::sync::RwLock;
@@ -37,16 +38,93 @@ use tracing::{debug, info, warn};
 /// Default fall-back when `DUDUCLAW_CONTROL_URL` is unset.
 const DEFAULT_CONTROL_URL: &str = "https://api.duduclaw.dudustudio.monster";
 
-/// L7: process-wide cache for the machine fingerprint. `generate_fingerprint`
-/// enumerates the hostname + MAC addresses on every call, which is wasteful on
-/// hot paths like `LicenseSnapshot::from_state` (one dashboard poll per second).
-/// The fingerprint is host-stable for the lifetime of the process, so we compute
-/// it once and reuse it.
-static FINGERPRINT_CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// L7: process-wide cache for this machine's **strong** fingerprint.
+/// `generate_fingerprint` enumerates the hostname + MAC addresses on every
+/// call, which is wasteful on hot paths like `LicenseSnapshot::from_state` (one
+/// dashboard poll per second). The fingerprint is host-stable for the lifetime
+/// of the process, so we compute it once and reuse it.
+static STRONG_FINGERPRINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Return the cached machine fingerprint, computing it on first use.
-fn cached_fingerprint() -> &'static str {
-    FINGERPRINT_CACHE.get_or_init(generate_fingerprint)
+/// Same, for the full candidate list (strong + v1.66.1 legacy compatibility).
+static FINGERPRINT_CANDIDATES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The fingerprint that actually identifies this machine to the control-plane:
+/// the candidate the installed license validated against. Falls back to the
+/// strong fingerprint when no license is installed or none matched, so a fresh
+/// issuance always binds to the strong value.
+///
+/// Deliberately a `RwLock`, not a `OnceLock`: the effective value is only known
+/// after `load_and_validate` runs, and a `OnceLock` read that happened to fire
+/// first would pin the wrong value for the process lifetime.
+static FINGERPRINT_CACHE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// One-shot guard so the "re-issue recommended" warning is logged once per
+/// process rather than on every phone-home / dashboard poll.
+static LEGACY_BINDING_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// This machine's strong fingerprint — what `duduclaw license fingerprint`
+/// prints and the only value a *new* license should be issued against.
+pub(crate) fn strong_fingerprint() -> &'static str {
+    STRONG_FINGERPRINT.get_or_init(|| {
+        if fingerprint_is_hostname_only() {
+            // Reported, not silent: neither a platform UUID nor a usable MAC
+            // could be read, so the fingerprint has no hardware component at
+            // all. A weak binding must never be mistaken for a strong one.
+            warn!(
+                "no hardware identity readable on this host (no platform UUID, no \
+                 usable MAC address) — the machine fingerprint binds to the hostname \
+                 alone and provides no hardware binding"
+            );
+        }
+        generate_fingerprint()
+    })
+}
+
+/// Every fingerprint this machine may legitimately present, strongest first.
+fn cached_candidates() -> &'static [String] {
+    FINGERPRINT_CANDIDATES.get_or_init(fingerprint_candidates)
+}
+
+/// Return the effective machine fingerprint (see [`FINGERPRINT_CACHE`]).
+pub(crate) fn cached_fingerprint() -> String {
+    FINGERPRINT_CACHE
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| strong_fingerprint().to_string())
+}
+
+/// Record which candidate the installed license validated against.
+fn set_effective_fingerprint(fingerprint: &str) {
+    if let Ok(mut guard) = FINGERPRINT_CACHE.write() {
+        *guard = Some(fingerprint.to_string());
+    }
+}
+
+/// Reset the effective fingerprint to the strong value (no license, or the
+/// installed one did not validate).
+fn clear_effective_fingerprint() {
+    if let Ok(mut guard) = FINGERPRINT_CACHE.write() {
+        *guard = None;
+    }
+}
+
+/// Tell the operator — once — that the active license is bound to a
+/// pre-v1.66.1 fingerprint. The binding stays accepted; only the *next*
+/// issuance should use the strong value.
+fn warn_legacy_binding_once() {
+    if !LEGACY_BINDING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn!(
+            strong_fingerprint = %strong_fingerprint(),
+            "license is bound to a legacy fingerprint (issued before this machine's \
+             identity source changed — on macOS, before v1.66.1 bound to the platform \
+             UUID instead of a placeholder MAC). The binding stays accepted; re-issue \
+             when convenient with `duduclaw license rebind` (which calls the control \
+             plane's /v1/license/rebind) or by re-signing against \
+             `duduclaw license fingerprint`"
+        );
+    }
 }
 
 /// Env-var prefix for trusted issuer public keys.
@@ -359,12 +437,27 @@ impl LicenseRuntime {
         self.registry
             .verify(&license)
             .map_err(|e| format!("授權簽章驗證失敗：{e}"))?;
-        let current_fp = generate_fingerprint();
-        if !license.is_valid_for_machine(&current_fp) {
-            return Err(format!(
-                "授權綁定的機器指紋與本機不符（本機指紋：{current_fp}）。\
-                 若是從舊機器搬移，請在本機執行 `duduclaw license rebind`"
-            ));
+        // v1.66.1: accept the strong fingerprint OR any legacy-compatible one,
+        // so a key issued before the macOS-26 MAC-selection fix still installs.
+        let candidates = cached_candidates();
+        let matched = candidates
+            .iter()
+            .find(|c| license.is_valid_for_machine(c))
+            .cloned();
+        match matched {
+            Some(fp) => {
+                if fp != *strong_fingerprint() {
+                    warn_legacy_binding_once();
+                }
+                set_effective_fingerprint(&fp);
+            }
+            None => {
+                let strong = strong_fingerprint();
+                return Err(format!(
+                    "授權綁定的機器指紋與本機不符（本機指紋：{strong}）。\
+                     若是從舊機器搬移，請在本機執行 `duduclaw license rebind`"
+                ));
+            }
         }
         if license.is_expired() {
             return Err(format!("授權已於 {} 過期", license.expires_at));
@@ -460,7 +553,7 @@ pub async fn redeem_partner_code(
         .map_err(|e| format!("建立 HTTP client 失敗：{e}"))?;
     let body = json!({
         "code": code,
-        "machine_fingerprint": generate_fingerprint(),
+        "machine_fingerprint": cached_fingerprint(),
         "email": email,
     });
     let resp = client
@@ -526,6 +619,9 @@ impl LicenseSnapshot {
     fn from_state(license: Option<&License>, tier: LicenseTier) -> Self {
         let installed = license.is_some();
         // L7: reuse the cached fingerprint instead of re-enumerating host MACs.
+        // This is the *effective* fingerprint (the candidate the active license
+        // validated against), so a still-accepted legacy binding reports a
+        // match rather than a scary false mismatch in the dashboard.
         let current_fp = cached_fingerprint();
         Self {
             tier,
@@ -541,7 +637,7 @@ impl LicenseSnapshot {
             days_until_expiry: license.map(|l| l.days_until_expiry()),
             last_phone_home: license.map(|l| l.last_phone_home),
             days_since_phone_home: license.map(|l| l.days_since_phone_home()),
-            fingerprint_match: license.map(|l| l.is_valid_for_machine(current_fp)),
+            fingerprint_match: license.map(|l| l.is_valid_for_machine(&current_fp)),
             branding_editable: license.and_then(|l| l.branding_editable.clone()),
             max_agents: license.and_then(|l| l.max_agents),
             nfr: license.is_some_and(|l| l.nfr),
@@ -668,12 +764,14 @@ async fn load_and_validate(registry: &PublicKeyRegistry, gate: &FeatureGate) -> 
         return None;
     }
 
-    let current_fp = generate_fingerprint();
     let phone_home = gate.phone_home_interval_days(license.tier);
     let grace = gate.grace_period_days(license.tier);
 
-    match license.validate(&current_fp, phone_home, grace) {
-        Ok(()) => {
+    // v1.66.1: try the strong fingerprint first, then the pre-1.66.1
+    // compatibility values. A license bound to the old placeholder-MAC
+    // fingerprint keeps working — it just gets a "re-issue" warning.
+    match license.validate_any(cached_candidates(), phone_home, grace) {
+        Ok(matched) => {
             // M51: enforce tier ↔ deployment-mode binding. A cloud-only tier
             // (Solo/Studio/…) must not be honoured on a self-host binary, and a
             // self-host-only tier (Partner/PersonalProSelfHost/SelfHostPro/Oem)
@@ -686,19 +784,28 @@ async fn load_and_validate(registry: &PublicKeyRegistry, gate: &FeatureGate) -> 
                     deployment = if is_self_host { "self_host" } else { "cloud" },
                     "license tier does not match deployment mode; running in OpenSource mode"
                 );
+                clear_effective_fingerprint();
                 return None;
             }
+            if matched.legacy {
+                warn_legacy_binding_once();
+            }
+            set_effective_fingerprint(&matched.fingerprint);
             Some(license)
         }
         Err(LicenseError::Expired) => {
             warn!("installed license is expired; running in OpenSource mode");
+            clear_effective_fingerprint();
             None
         }
         Err(LicenseError::InvalidFingerprint) => {
             warn!(
+                strong_fingerprint = %strong_fingerprint(),
                 "installed license is bound to a different machine \
-                 (license fingerprint != current machine); running in OpenSource mode"
+                 (license fingerprint matches neither the current nor any legacy \
+                 fingerprint of this machine); running in OpenSource mode"
             );
+            clear_effective_fingerprint();
             None
         }
         Err(LicenseError::GracePeriodExceeded(days)) => {
@@ -706,10 +813,12 @@ async fn load_and_validate(registry: &PublicKeyRegistry, gate: &FeatureGate) -> 
                 days,
                 "license grace period exceeded — phone home overdue; running in OpenSource mode"
             );
+            clear_effective_fingerprint();
             None
         }
         Err(e) => {
             warn!(error = %e, "license validation failed; running in OpenSource mode");
+            clear_effective_fingerprint();
             None
         }
     }
@@ -988,16 +1097,19 @@ impl LicenseRuntime {
                 // an expired or other-machine license. `accept_refreshed_license`
                 // composes signature-trust + `validate()` so the acceptance
                 // decision is pure and unit-testable.
-                let current_fp = generate_fingerprint();
                 let phone_home = self.gate.phone_home_interval_days(new_license.tier);
                 let grace = self.gate.grace_period_days(new_license.tier);
-                accept_refreshed_license(
+                let matched = accept_refreshed_license(
                     &self.registry,
                     &new_license,
-                    &current_fp,
+                    cached_candidates(),
                     phone_home,
                     grace,
                 )?;
+                if matched.legacy {
+                    warn_legacy_binding_once();
+                }
+                set_effective_fingerprint(&matched.fingerprint);
 
                 save_default(&new_license).map_err(|e| PhoneHomeError::Save(e.to_string()))?;
                 {
@@ -1104,15 +1216,15 @@ fn response_nonce_ok(sent: &str, body: &serde_json::Value) -> bool {
 fn accept_refreshed_license(
     registry: &PublicKeyRegistry,
     new_license: &License,
-    current_fp: &str,
+    candidates: &[String],
     phone_home_days: i64,
     grace_days: i64,
-) -> Result<(), PhoneHomeError> {
+) -> Result<duduclaw_license::FingerprintMatch, PhoneHomeError> {
     registry
         .verify(new_license)
         .map_err(|e| PhoneHomeError::Rejected(format!("invalid signature: {e}")))?;
     new_license
-        .validate(current_fp, phone_home_days, grace_days)
+        .validate_any(candidates, phone_home_days, grace_days)
         .map_err(|e| PhoneHomeError::Rejected(format!("expiry/fingerprint/grace: {e}")))
 }
 
@@ -1333,11 +1445,10 @@ mod tests {
         if registry.verify(&license).is_err() {
             return None;
         }
-        let fp = generate_fingerprint();
         let ph = gate.phone_home_interval_days(license.tier);
         let gp = gate.grace_period_days(license.tier);
-        match license.validate(&fp, ph, gp) {
-            Ok(()) => Some(license),
+        match license.validate_any(cached_candidates(), ph, gp) {
+            Ok(_) => Some(license),
             Err(_) => None,
         }
     }
@@ -1497,11 +1608,55 @@ mod tests {
         let mut lic = valid_license_for(&fp);
         sign_license(&mut lic, &kp);
 
-        let res = accept_refreshed_license(&registry, &lic, &fp, 7, 14);
+        let res = accept_refreshed_license(&registry, &lic, std::slice::from_ref(&fp), 7, 14);
         assert!(
             res.is_ok(),
             "valid signed+current license must be accepted: {res:?}"
         );
+        assert!(!res.unwrap().legacy, "strong match must not be flagged legacy");
+    }
+
+    #[test]
+    fn accept_refreshed_license_accepts_a_legacy_candidate() {
+        // v1.66.1: a license issued against the pre-fix (placeholder-MAC)
+        // fingerprint must keep validating — flagged legacy, never rejected.
+        let (kp, pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+        let legacy_fp = "1743ebb5466bcad6c206e7e42371f45d".to_string();
+
+        let mut lic = valid_license_for(&legacy_fp);
+        sign_license(&mut lic, &kp);
+
+        // Literal candidates, not this machine's real ones: a sandboxed test
+        // runner can mask MACs, which would make strong == legacy and silently
+        // stop exercising the fallback.
+        let candidates = vec!["strong-fp-of-this-machine".to_string(), legacy_fp.clone()];
+        let matched = accept_refreshed_license(&registry, &lic, &candidates, 7, 14)
+            .expect("legacy-bound license must still be accepted");
+        assert!(matched.legacy, "a compatibility match must be flagged legacy");
+        assert_eq!(matched.fingerprint, legacy_fp);
+    }
+
+    #[test]
+    fn effective_fingerprint_defaults_to_strong_and_records_legacy_matches() {
+        // The effective fingerprint is what phone-home / redeem / branding send.
+        // It must fall back to the strong value whenever nothing matched, and
+        // carry the legacy value while a legacy-bound license is active.
+        clear_effective_fingerprint();
+        assert_eq!(cached_fingerprint(), strong_fingerprint());
+
+        set_effective_fingerprint("1743ebb5466bcad6c206e7e42371f45d");
+        assert_eq!(cached_fingerprint(), "1743ebb5466bcad6c206e7e42371f45d");
+
+        clear_effective_fingerprint();
+        assert_eq!(cached_fingerprint(), strong_fingerprint());
+    }
+
+    #[test]
+    fn candidate_list_leads_with_the_strong_fingerprint() {
+        let candidates = cached_candidates();
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0], strong_fingerprint());
     }
 
     #[test]
@@ -1521,7 +1676,7 @@ mod tests {
         );
         sign_license(&mut lic, &kp);
 
-        let res = accept_refreshed_license(&registry, &lic, &fp, 7, 14);
+        let res = accept_refreshed_license(&registry, &lic, std::slice::from_ref(&fp), 7, 14);
         assert!(res.is_err(), "expired license must be rejected");
     }
 
@@ -1535,7 +1690,7 @@ mod tests {
         let mut lic = valid_license_for("some-other-machine-fingerprint");
         sign_license(&mut lic, &kp);
 
-        let res = accept_refreshed_license(&registry, &lic, &current_fp, 7, 14);
+        let res = accept_refreshed_license(&registry, &lic, std::slice::from_ref(&current_fp), 7, 14);
         assert!(
             res.is_err(),
             "license bound to another machine must be rejected"
@@ -1553,7 +1708,7 @@ mod tests {
         let mut lic = valid_license_for(&fp);
         sign_license(&mut lic, &kp);
 
-        let res = accept_refreshed_license(&registry, &lic, &fp, 7, 14);
+        let res = accept_refreshed_license(&registry, &lic, std::slice::from_ref(&fp), 7, 14);
         assert!(
             res.is_err(),
             "license signed by an untrusted key must be rejected"
