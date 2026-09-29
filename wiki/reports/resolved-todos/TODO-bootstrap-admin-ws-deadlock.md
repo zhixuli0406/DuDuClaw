@@ -1,5 +1,13 @@
 # TODO — Bootstrap admin cannot reach the dashboard on a containerised install
 
+> 📦 **ARCHIVED 2026-09-29** (feature audit G8). This file still said
+> "confirmed, not started", but the fix landed in commit `bc14b96e`
+> (`must_change_password` moved to an RPC-level restriction plus a forced
+> password-change redirect) — see `MUST_CHANGE_PASSWORD_ERROR_CODE` and the
+> regression tests in `handlers.rs` / `server.rs`. A TODO that is silently
+> already fixed is the worst kind of stale doc: it sends the next person
+> looking for work that does not exist.
+
 **Owner:** — &nbsp; **Status:** confirmed, not started
 **Last updated:** 2026-08-16 &nbsp; **Severity:** 🟠 HIGH (blocks first login on a whole deployment class)
 

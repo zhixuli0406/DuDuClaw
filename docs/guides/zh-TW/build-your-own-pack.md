@@ -41,25 +41,52 @@ display_name = "小幫手"
 
 `agents/helper/soul.md` 寫 persona。身份／職責／邊界三段是好起點；邊界寫得越清楚，安裝者越敢用。
 
+### 或者直接寫新的 `pack.toml`
+
+上面的 `expert.toml` 是舊格式，支援到 **v1.68.0**。新包可以改宣告 `pack.toml`——團隊包、單人產業板模、職務組合共用的同一份 schema：
+
+```toml
+[pack]
+schema  = 1
+id      = "my-first-pack"
+kind    = "team"        # "preset" | "team" | "template"
+tier    = "free"
+version = "0.1.0"
+label   = "友善小幫手"
+description = "示範包"
+
+[[pack.agents]]
+name = "helper"
+role = "main"
+display_name = "小幫手"
+```
+
+目錄裡其他東西（persona、技能、知識頁）都不用改。已經有舊格式的包？`duduclaw pack inspect <dir> --emit-canonical` 會印出對應的 `pack.toml` 讓你審過再存檔——它不會覆寫你的檔案。
+
 ## 2. 本機測試迴路
 
 ```bash
+# 先看 DuDuClaw 怎麼讀你這包（還沒裝任何東西）
+duduclaw pack inspect ./my-first-pack
+
 # 驗證 + 安裝（目錄直接裝）
-duduclaw expert install ./my-first-pack
+duduclaw pack install ./my-first-pack
 
 # 看裝了什麼
-duduclaw expert list
+duduclaw pack list
 
-# 打包成可分享的 zip
+# 打包成可分享的 zip（製作端動詞留在 `expert` 之下）
 duduclaw expert pack ./my-first-pack
 
 # 對方安裝（本機 zip 或 URL 皆可）
-duduclaw expert install ./my-first-pack-0.1.0.zip
-duduclaw expert install https://example.com/my-first-pack-0.1.0.zip
+duduclaw pack install ./my-first-pack-0.1.0.zip
+duduclaw pack install https://example.com/my-first-pack-0.1.0.zip
 
 # 收乾淨（移除 pack 的員工、隨包技能與 wiki 頁）
 duduclaw expert remove my-first-pack
 ```
+
+`duduclaw expert install`／`expert list` 仍然可用，就是前兩行的別名——同一段程式、同樣的輸出。
 
 安裝端的防護是內建的：zip-slip 圍欄、50MB 上限、內容掃描；**hooks 一律先裝進隔離區**（`hooks-disabled/`），要操作者明確信任才啟用。寫包時別假設 hooks 會自動生效。
 

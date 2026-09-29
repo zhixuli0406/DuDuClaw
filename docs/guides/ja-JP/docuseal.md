@@ -1,65 +1,32 @@
 # DocuSeal——文書署名ワークフロー
 
-[DocuSeal](https://github.com/docusealco/docuseal)はオープンソースのDocuSign代替(クラウドまたはセルフホスト)です。DuDuClawは`duduclaw-docuseal-mcp`を提供します——オープンソースのMCP stdioラッパーで、エージェントが「契約書生成→署名依頼送信→ステータス確認→署名済みファイル取得」という一連の流れを実行できます。
+[DocuSeal](https://github.com/docusealco/docuseal)はオープンソースのDocuSign代替(クラウドまたはセルフホスト)です。DuDuClawはDocuSeal**公式のMCPサーバー**を`[[mcp.external]]`でマウントして接続します——DuDuClaw側のラッパーは介在しません。
 
-## 2つの経路、どちらを選ぶか
+> **2026-09の変更。** DuDuClawはかつてファーストパーティのstdioラッパーcrate(`duduclaw-docuseal-mcp`、10ツール)を同梱していました。`scripts/release.sh`でビルドされたことが一度もなく、利用者が自分で`cargo build`する必要があり、またDocuSealは2026-03に公式MCPサーバーを提供しています。このラッパーは削除されました。以下の公式サーバーを使ってください。
 
-| 経路 | 適用 | 認証 |
-|---|---|---|
-| **`duduclaw-docuseal-mcp`(本ラッパー)** | クラウド(api.docuseal.com / .eu)**と**セルフホストの両方に対応。ツール面がより充実(アーカイブ、再送信、prefill更新、署名済みファイルURL) | `X-Auth-Token` APIキー |
-| **DocuSeal公式内蔵MCP**(2026-03以降) | セルフホストのみ。5つのツール(search/load/create template、send、search documents) | インスタンスのSettings → MCP Serverで生成されるBearerトークン、`url = "https://<host>/mcp"`を[MCP Bridge](../mcp-bridge.md)経由で直接マウント |
+## 公式サーバーのマウント
 
-## ラッパーの10個のツール
-
-`docuseal_list_templates`、`docuseal_get_template`、
-`docuseal_create_template_from_pdf`(base64またはURL。PDF内に
-`{{フィールド;role=Signer1;type=signature}}`形式のtext tagsを入れると
-自動でフィールドが配置される)、
-`docuseal_create_submission`(署名依頼を送信し、各署名者の署名リンク
-`embed_src`を返す)、
-`docuseal_get_submission`(ステータス+イベント+`audit_log_url`)、
-`docuseal_list_submissions`、`docuseal_archive_submission`、
-`docuseal_get_submission_documents`(完了後の署名済みファイルのダウンロードURL)、
-`docuseal_resend_submitter_email`、`docuseal_update_submitter`(prefill/連絡先更新)。
-
-## 設定
-
-環境変数:
-
-| 変数 | 説明 |
-|---|---|
-| `DOCUSEAL_API_KEY` | 必須。クラウドは<https://console.docuseal.com/api>で取得、セルフホストはインスタンスのAPI設定で取得 |
-| `DOCUSEAL_BASE_URL` | 任意。デフォルトは`https://api.docuseal.com`。EUクラウドは`https://api.docuseal.eu`、セルフホストは`https://<host>/api` |
-
-`agent.toml`でのマウント(stdio):
+DocuSealセルフホストのMCPエンドポイントは`https://<host>/mcp`です。インスタンスの**Settings → MCP Server**でbearerトークンを生成し、[MCP Bridge](../mcp-bridge.md)経由でマウントします:
 
 ```toml
 [[mcp.external]]
 name = "docuseal"
-command = "duduclaw-docuseal-mcp"
-env = { DOCUSEAL_API_KEY = "secret://local/docuseal_api_key" }
-# self-hosted の場合は追加: DOCUSEAL_BASE_URL = "https://sign.example.com/api"
+url = "https://sign.example.com/mcp"
+headers = { Authorization = "Bearer secret://local/docuseal_mcp_token" }
 allowed_tools = [
-  "docuseal_list_templates", "docuseal_get_template",
-  "docuseal_create_submission", "docuseal_get_submission",
-  "docuseal_get_submission_documents", "docuseal_resend_submitter_email",
+  "search_templates", "load_template", "create_template",
+  "send_document", "search_documents",
 ]
 ```
 
-送信/アーカイブは対外的かつ半不可逆なアクションです——`docuseal_create_submission`と`docuseal_archive_submission`を`[capabilities] approval_required_tools`に入れ、HITL承認を通すことを推奨します。
+署名依頼の送信は外向きで半不可逆な操作です——送信ツールを`[capabilities] approval_required_tools`に入れてHITL承認を通すことを検討してください。
 
-## 署名完了→自動通知(webhook)
+## 公式サーバーの守備範囲
 
-DocuSealのwebhookはUIでのみ設定可能で(クラウド:Console → Webhooks、セルフホスト:Settings → Webhooks)、APIから代わりに設定することはできません。`form.completed` / `submission.completed`を自動化のエントリポイントに向けておけば、autopilotルールで「完了したらチャネルに通知/タスクを作成」を連携できます。ペイロードの外殻は`{"event_type", "timestamp", "data"}`。署名検証ヘッダーは`X-Docuseal-Signature`(`<unix_ts>.<hex_hmac>`、HMAC-SHA256を`<ts>.<raw_body>`に対して計算、許容誤差±300秒)。
+5つのツール: テンプレート検索、テンプレート読み込み、テンプレート作成、文書送信、文書検索。**セルフホスト専用**です——クラウドテナント(`api.docuseal.com` / `.eu`)にMCPエンドポイントはありません。
 
-## ローカル検証
+DocuSealクラウドを使っている場合、あるいはより広いREST面(アーカイブ、再送信、prefill更新、署名済みファイルのダウンロードURL)が必要な場合は、`X-Auth-Token`ヘッダーを付けて[DocuSeal REST API](https://www.docuseal.com/docs/api)を直接呼んでください——自作の小さなMCPサーバー経由でも、エージェントのHTTPツール経由でも構いません。
 
-```sh
-cargo build -p duduclaw-docuseal-mcp
-printf '%s\n%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-  | DOCUSEAL_API_KEY=test ./target/debug/duduclaw-docuseal-mcp
-```
+## 署名完了 → 自動通知(webhook)
 
-2行目の応答は10個の`docuseal_*`ツールを列挙するはずです。実際のAPI呼び出し(`tools/call`)には有効なキーが必要です。HTTP層のエラーはサーバーをクラッシュさせず、`isError: true`としてエージェントに返されます。
+DocuSealのwebhookはUIでしか設定できません(クラウド: Console → Webhooks、セルフホスト: Settings → Webhooks)——APIでは設定できません。`form.completed` / `submission.completed`を自動化の入口に向ければ、「完了時にチャンネルへ通知/タスクを作成」というautopilotルールに繋げられます。ペイロードの外枠は`{"event_type", "timestamp", "data"}`、署名ヘッダーは`X-Docuseal-Signature`(`<unix_ts>.<hex_hmac>`、`<ts>.<raw_body>`に対するHMAC-SHA256、±300秒の許容)です。

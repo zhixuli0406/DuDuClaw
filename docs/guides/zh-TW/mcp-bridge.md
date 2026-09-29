@@ -197,9 +197,9 @@ allowed_tools = ["wc_list_products", "wc_get_order", "wc_list_orders"]
 ```
 **請走 WordPress MCP Adapter 的 OAuth 2.1，舊版 `X-MCP-API-Key` 已在 2026-06-23 廢止。** 準備：WP MCP Adapter 外掛，加上一個 OAuth client。
 
-### DocuSeal（尚無伺服器，需要自建 `duduclaw-docuseal-mcp`）
+### DocuSeal（官方 MCP server，self-hosted）
 
-DocuSeal 目前還沒有現成的 MCP server；可行的路是自己刻一支小的（REST + webhook：生成 → 寄送 → webhook 完成通知），掛在這裡使用，之後再回饋上游。追蹤於 IMPL-PLAN §D，工作量估 M。
+DocuSeal self-hosted 在 `https://<host>/mcp` 有自己的 MCP 端點，用 Settings → MCP Server 產生的 bearer token 掛載即可。cloud 租戶沒有 MCP 端點，那邊走 REST API。見 [docuseal.md](docuseal.md)。
 
 ### Monica（個人 PRM，走輕量 MCP 或 IdentityProvider）
 

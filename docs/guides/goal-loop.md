@@ -145,11 +145,13 @@ enabled = true          # Enable the autonomous dispatch engine (includes the go
 policy = "fixed_hierarchy"  # Dispatch policy (which AI employee picks up a task). See "Dispatch policy" below. Default fixed_hierarchy
 grounding_precheck_enabled = true  # Grounding precheck before acceptance (see "Grounding precheck"). Default true
 two_stage_judge = true  # Run a cheap first-stage evaluation before acceptance (see "Two-stage acceptance judging"). Default true
-judge = "mav"           # Who makes the acceptance call (see "Swapping the acceptance judge"). mav / evaluator_only / external / human_only. Default mav
+judge = "mav"           # Who makes the acceptance call (see "Swapping the acceptance judge"). mav / external (evaluator_only / human_only are deprecated, removed in v1.68.0). Default mav
+judge_provider = "gemini"            # Optional: run the judge on another runtime (see "Running the judge on a different model"). Unset ⇒ the default utility runtime
+judge_model = "gemini-3-pro-preview" # Optional: judge model id within that runtime. Unset ⇒ the default utility model
 admission = "queue"     # What happens when ephemeral spawns hit the concurrency cap, "queue" or "fail". Default queue (see "Ephemeral spawn admission queueing" below)
 
-[task_forward_model]    # Task-level forward model (see the section of the same name). Off entirely by default
-enabled = false
+[task_forward_model]    # Task-level forward model (see the section of the same name). On by default since v1.54
+enabled = true
 
 [goal_loop]
 iteration_cap = 5        # Hard dispatch cap for hard goals; escalates to a human past this. Default 5
@@ -195,8 +197,109 @@ The expected payoff is greatest for "multi-source lookup" style goals; an indepe
 | `fixed_hierarchy` | **Default**. Dispatches to the task's existing `assigned_to`, unchanged. Zero LLM cost, fully deterministic. |
 | `round_robin` | Rotates through the roster by "task category" (the first tag if any, otherwise priority). State lives in memory only, resetting on restart. |
 | `llm_select` | An LLM picks the best-fitting AI employee from the roster via a tool call. **Fails closed**: if the output isn't on the roster, or parsing/the LLM call fails, it always falls back to the `fixed_hierarchy` result, never dispatching to a made-up AI employee. No model name is hardcoded; it uses whatever utility runtime is configured. |
+| `role_team` | Selection still yields the **AI employee**, exactly as `fixed_hierarchy` does. The roles live *inside* that employee — see "Team rounds" below. The setting exists so "this deployment composes teams" is visible in logs and telemetry; it does not change who a task is assigned to. |
 
 Roster = the AI employee directories under `<home>/agents/`. When the roster is empty, both `round_robin` and `llm_select` fall back to the original assignment (never orphaning a task). A reassignment writes back to the task's `assigned_to`, so heartbeat pulls and the activity log stay consistent.
+
+---
+
+## Team rounds (Team-as-Agent)
+
+An AI employee can work a goal round as a small team inside itself: **規劃 → 執行 → 審核**, each role on its own vendor's model. Since v1.66 `[team] enabled` defaults to **`true`** — but what actually forms a team is naming a second vendor under `[team.roles]`, not the flag. Write no roles and the executor and verifier both cascade onto the employee's own model, share a model family, and the decorrelation rule refuses the spec: the task runs Solo, quietly, with no audit row. See [56-team-as-agent.md](../features/56-team-as-agent.md) for the full picture; this section is what it means for the goal loop specifically.
+
+> The whole path — planner, executors, verifier and the `team_handoff` tool that carries packets between them — has landed and has been driven through a live round the judge accepted; that is one integration result, not a measured win over Solo. Configure `[team.roles]` only on a deployment you are watching. `enabled = false` (fleet-wide or per employee) and `gate = "always_solo"` are both one-line reverts.
+
+### What you see
+
+Nothing new in the conversation. The employee answers with one voice, progress arrives on the same board, and a task that needs you still carries one of the six pause classes. Under the hood the round runs as three stages instead of one wake-up message, and only the executor's final product reaches the acceptance judge — which is the **same** two-stage evaluator and three-aspect panel as always. A team changes who does the work, not who decides it is done.
+
+Two new reasons a team task can land in your lap:
+
+| Pause | What happened |
+|---|---|
+| 需要決策 (`blocked_needs_decision`) | The planning stage handed back no sub-tasks. Rather than guessing a breakdown from its prose, the loop asks you whether the goal is actually splittable — or whether it should just run as a single employee. |
+| 預算用盡 (`budget_exhausted`) | The task ran out of role-member spawns **after spending some**. It hands over the best round it managed, same as any other budget escalation. A task whose budget could never have paid for even one degraded round runs Solo instead — being parked over work that never started would be a worse answer than doing it the ordinary way. |
+
+### The gate
+
+Before each round, a zero-LLM rule set decides Solo or Team. It leans Solo on purpose: a signal it cannot measure never fires, and three of four signals must fire to form a team. A live channel turn, a plan still awaiting your approval, or fewer than three rounds of budget left are all hard Solo.
+
+Land on exactly two signals and the loop runs the planning stage once — a call the task needed anyway — then re-decides using what the plan actually broke the work into. Four or more genuinely independent sub-tasks forms the team; fewer falls back to the ordinary single-employee round, with the plan kept on disk.
+
+Every verdict is written to the audit log as `team_gate_decision` with the signals that fired, so a deployment's Solo/Team split is measurable rather than anecdotal.
+
+### The spec is frozen per task
+
+The team a task runs with is decided once, at creation, and stored on the task. Later changes to `[team]` affect the *next* task. A spec that fails validation — most often a verifier sharing the executor's model family — forms no team at all: the task runs Solo and there is no partial team.
+
+Whether that refusal is loud depends on who asked for the team. An operator who wrote `enabled = true`, or who configured roles that then fail validation, gets the refusal audited as `team_refused` with the role and the reason. A deployment that never touched `[team]` at all gets a `debug!` line and nothing in the audit log — that refusal is the default state of every install since the v1.66 flip, and stamping a row on every goal task everywhere is how a real refusal stops being findable.
+
+A role whose `model` is unset can also be filled from a measured capability matrix (`role_model_matrix.toml` in `<DUDUCLAW_HOME>`, written by `duduclaw eval --matrix`) before it falls through to the employee's `[model] preferred`. Only `resolved` cells on the role's own runtime count, ties select nothing, and an explicitly configured model always wins.
+
+### Budget and degrade chain
+
+```toml
+# config.toml
+[dispatch.team_budget]
+max_spawns_per_task = 12                 # 4 roles x 3 rounds; clamped to a floor of 3
+max_turns_per_role  = 3
+degrade_order = ["utility", "verifier_second_pass", "executor_replica"]
+```
+
+One round is charged for `planner? + executors + verifier + repair?` — the verifier is a utility call rather than a scaffold, but it writes its own ledger row and the budget counts exactly the rows that carry a member id, so it costs a slot like every other stage. The floor of 3 is planner + executor + verifier.
+
+As the spawn budget shrinks, capabilities are surrendered in that order — 合成 first, then the verifier's one repair pass, then fan-out collapses to a single executor — before the task escalates as `budget_exhausted`. An unrecognised entry is dropped with a warning; a completely unusable list keeps the default chain.
+
+Before its first team round the loop also checks, once, that `[dispatch] ephemeral_max_active` can hold the concurrent role members this configuration can need (`max_concurrent × iteration_cap × roles` — 45 against a default of 32) and warns with the number to raise. Nothing is enforced: past the ceiling, role spawns queue and can expire, which would otherwise surface much later as a round mysteriously missing its verifier.
+
+Role-member spawns run on their own circuit-breaker bucket and budget (`[dispatch_guard] role_team_max_in_window`, default 60), so a composing team can never trip the breaker that guards an employee's own sub-agent spawns.
+
+### Evidence on a team round: the employee **and** its members
+
+Everything downstream of a round — the team's own verifier, the grounding precheck, and the MAV panel's `<tool_activity>` digest — reads the tool-call audit trail for the task's claim→review window. On a Solo round that trail belongs to one agent id. On a team round it does not: the work is done by ephemeral role members under **their own** ids, and the employee's own window may hold nothing but the bookkeeping call that opened the round.
+
+Read that way, a team round looks exactly like a task that claimed to do work and did nothing — which is what happened in live round 3, where the verifier and the settle evaluator both rejected honest work with "no tool activity supports file creation". So the evidence set for a team round is the **employee ∪ that round's role members**, taken from `role_turns.jsonl`, on both paths:
+
+- the team verifier's `<tool_activity>` block, and
+- the settle path's grounding precheck plus the judge digest.
+
+Duplicate ids are collapsed, and a task with no role members adds no ids — a Solo task sees byte-identical evidence to before. The time window is unchanged, so members from other rounds contribute nothing even when the round-number lookup falls back to the whole task (the loop's in-flight iteration counter and the settle path's revision counter are separate and can diverge across a gateway restart).
+
+Role members also work in the **employee's** workspace rather than in their own throwaway scaffold, so files a member writes are still there when the verifier asks about them. Roles that write files are limited to claude and codex today; see [56-team-as-agent.md](../features/56-team-as-agent.md#a-member-runs-in-the-employees-workspace-not-in-its-own-scaffold).
+
+Union-ing the ids was necessary but not sufficient. Two further evidence sources landed after live round 8, both shared by the team verifier and the settle path so neither ever judges on a different account of the round:
+
+- **Native tool work is persisted.** A member that works through native tools (a codex `shell`, a Claude `Write`) makes no MCP call, so before this its work left nothing in the audit trail at all — round 8 rejected three files that demonstrably existed. Each native tool event is now written as a `tool_calls.jsonl` row under the member's id, carrying the masked call input and result text plus `source = "native"` and the runtime/model that produced it. Self-echo tools keep their output suppressed, exactly as the MCP writer does, so a role can never ground a claim on its own echoed packet.
+- **`<artifact_receipts>`** — every `artifacts[].path` a packet declares is stat'd and hashed against the employee's workspace, and the result (`<path> <bytes>B sha256=<hex> exists|missing|mismatch`) becomes both a prompt block and an `artifact_receipt` audit row. A declared-but-absent hash is filled in from the bytes; a declared hash that **disagrees** is kept as declared and recorded as `mismatch` with a `team_packet_artifact_mismatch` event, so a swap stays visible rather than being quietly corrected. Only `exists` counts as confirmation.
+
+A task that declares no artefacts adds no block, and a Solo round with no native-tool members sees exactly what it saw before.
+
+### Audit and per-role records
+
+| Event | Meaning |
+|---|---|
+| `team_gate_decision` | Solo / Team / grey band, with the signals that fired |
+| `team_refused` | An enabled spec failed validation; the task runs Solo |
+| `team_round_started` | A three-stage round began, with the roles and any degrade steps |
+| `team_member_spawned` | One role member was created (role, runtime, model) |
+| `team_stage_failed` | A stage did not produce what the next one needs, or could not run at all — carries `role`, `runtime`, `model` and the error |
+| `team_handoff` | A role filed a packet (leg, round, size, audience, file) |
+| `team_packet_skipped` | A packet file was unreadable, mislabelled or invalid and was ignored |
+| `team_packet_artifact_refused` | A packet declared an artifact path resolving outside the employee's workspace |
+| `team_packet_fidelity_corrected` | A packet's self-declared evidence grade disagreed with what was observed, and was overwritten |
+
+### Where the packets live
+
+Each stage hands over by calling `team_handoff`, which derives the file path rather than taking one:
+
+```
+~/.duduclaw/team_packets/<task_id>/r<round>/planner-to-executor.json
+~/.duduclaw/team_packets/<task_id>/r<round>/planner-to-executor.01.json   … up to .99
+```
+
+A planner that breaks a goal into four sub-tasks writes four packets on the same leg, so a **new** packet takes the next numbered slot while re-filing the **same** `packet_id` overwrites its own file (a retry after a timeout does not duplicate the sub-task). The next stage reads those slots back in numeric order — canonical file first, then `.01`, `.02`, … A packet whose own `from_role` / `to_role` / task / round disagree with the file it sits in, or that fails validation, is skipped and audited as `team_packet_skipped`; one bad file does not cost the stage the rest of its packets.
+
+Each stage also appends a row to `<home>/role_turns.jsonl` — role, runtime, model, effort, the packet it produced, the evidence grade of its observations, how it ended. Same permissions, locking and rotation as `tool_calls.jsonl`.
 
 ---
 
@@ -263,7 +366,7 @@ When the AI employee reports completion and a task enters review, before the acc
 
 ---
 
-## Task forward model (v1.53, default off)
+## Task forward model (v1.53; default on since v1.54)
 
 When enabled, before each dispatch the goal loop "predicts" how the run will likely go, based on statistics from past tasks of the same kind (whether it'll fail, roughly which tool categories it'll use). After execution, it compares the prediction against the actual observation and records it as a transition, so the system builds up a task-level world model of "what tends to happen when doing this kind of thing." Works across every runtime (claude / codex / gemini / openai-compat):
 
@@ -276,7 +379,7 @@ When enabled, before each dispatch the goal loop "predicts" how the run will lik
 ```toml
 # config.toml
 [task_forward_model]
-enabled = false   # off by default; enabling it activates the full predict-act-verify pipeline
+enabled = true    # on by default since v1.54; set false to switch the whole predict-act-verify pipeline off
 ```
 
 ---
@@ -300,11 +403,64 @@ After the AI employee reports completion and a task enters `review`, it doesn't 
 | Value | Who decides | When to use |
 |---|---|---|
 | `mav` (default) | First-stage evaluator → three-aspect MAV judge panel | The general case |
-| `evaluator_only` | Only the first-stage evaluator runs; `candidate_complete` passes directly | Cost savings. **Noticeably weaker verification**: a single tool-free call is the only gate, with no judge-panel review — a passing verdict self-labels as low-cost mode |
 | `external` | Your own program (`judge_command`) | Wiring in your own CI, a rules engine, or a second model as judge |
-| `human_only` | No machine verdict; every `review` task escalates to `needs_human` | High-risk deployments that require human eyes on every delivery |
+| `evaluator_only` | Only the first-stage evaluator runs; `candidate_complete` passes directly | **Deprecated, removed in v1.68.0.** Use `mav`: `two_stage_judge` already runs the cheap evaluator first and only pays for the panel on a completion candidate |
+| `human_only` | No machine verdict; every `review` task escalates to `needs_human` | **Deprecated, removed in v1.68.0.** Use `mav` plus per-agent `[capabilities] autonomy_level` / `approval_required_tools` |
 
-A bad value doesn't quietly take effect: the gateway warns and falls back to `mav` (the strictest of the four options). This setting is re-read on every verdict, and just like `two_stage_judge`, changes take effect immediately without a restart.
+All four values still parse, so a deployment already on a deprecated mode keeps behaving exactly as configured — it logs one warning per process, and a write through the dashboard records a `judge_mode_deprecated` audit event. The dashboard offers only `mav` and `external`, but shows a saved deprecated value (labelled 已棄用) rather than silently switching it. See [deprecations.md](deprecations.md).
+
+A bad value doesn't quietly take effect: the gateway warns and falls back to `mav` (the strictest option). This setting is re-read on every verdict, and just like `two_stage_judge`, changes take effect immediately without a restart.
+
+### Running the judge on a different model
+
+A judge drawn from the same model family as the worker tends to forgive exactly the mistakes that family makes — it shares the worker's blind spots, so a second opinion from the same vendor is worth less than it looks (arXiv:2607.13918). Two optional keys move the acceptance judge, and the cheap first-stage evaluator with it, onto a different runtime and model:
+
+```toml
+[dispatch]
+judge_provider = "gemini"              # A runtime id: claude, codex, gemini, grok, openai_compat, …
+judge_model = "gemini-3-pro-preview"   # Model id within that runtime
+```
+
+Both are optional and independent. Unset, the judge keeps using the ordinary utility model (`[runtime] utility_provider` / `utility_model`) — which is exactly the behavior every existing deployment already has, so leaving these out changes nothing.
+
+**Scope: global only.** There is no per-agent version of these keys. Every AI employee's work is judged by the same configured judge.
+
+What happens when the setting can't be honoured — in all three cases the judge falls back to the default utility model and keeps working, because a routing preference must never stall a verdict:
+
+| Situation | Behavior |
+|---|---|
+| `judge_model` names another vendor's model but `judge_provider` is unset | **Refused, not guessed.** Setting only `judge_model = "gemini-…"` while the judge runtime resolves to Claude is a configuration error, not an instruction to infer the runtime. The override is dropped before anything is spawned (so it costs nothing) and the drop is written to `security_audit.jsonl` as `judge_seam_degraded`. Name the runtime too and it works. |
+| `judge_provider` is not a runtime id this build knows | The **whole** override is dropped with a warning naming the valid ids. A typo never silently sends the judge to a different backend. |
+| `judge_provider`'s CLI or backend isn't installed on this host | Detected before spawning; the override is dropped and audited the same way. |
+| The judge runtime was available, was used, and then **failed while running** (bad arguments, auth failure, crash) | The judge is re-run once on the default utility model, and the failure is audited as `judge_seam_degraded` with `reason: "hinted_runtime_failed"` plus the provider, model, underlying error, and the fallback model that ended up judging. Crucially, the failed judge is **not** rescued by ordinary cross-runtime failover: a call routed to another family runs with cross-family failover disabled, so it can never be silently answered by the worker's own family. Same-family failover (one Claude tier to another) still works normally. |
+
+Two audit events make the setting's actual effect visible instead of assumed, both written to `security_audit.jsonl`:
+
+- `model_routed` — the override took effect and moved the judge off the worker's own model. Carries `{slot: "judge", from: <worker model>, to: <judge model>, provider, reason: "dispatch.judge_model"}`.
+- `judge_same_family` — worker and judge turned out to share a model family, so you are not actually getting a decorrelated second opinion. This is a **warning, never a rejection**: the verdict still happens normally. Logged once per (AI employee, judge model) pair per gateway run, so a long goal loop produces one line, not one per round.
+
+Like `judge` itself, both keys are re-read on every verdict — no gateway restart.
+
+#### Structured output for a judge that needs it
+
+Claude follows "reply with ONLY a JSON object". Codex does not reliably, and live round 8 of the team work is what proved it costs a verdict: with `judge_provider = "codex"` both the first-stage evaluator and the MAV panel answered in prose, and both parsers refused it fail-closed ("evaluator reply has no string `decision` field"). The parsers were right — auto-accepting garbage is the one thing a judge parser must never do — but a judge that structurally cannot be parsed is a seam that does not work.
+
+So each adjudication stage now publishes the JSON schema **its own parser** requires, and a runtime that can enforce a reply shape does:
+
+| Stage | Schema |
+|---|---|
+| First-stage evaluator | `{decision: "continue"｜"candidate_complete"｜"blocked", evidence, next_step}` (`blocker_key` declarable, not required — the parser refuses it on a non-blocked decision) |
+| MAV panel | one `{pass, reason}` object per active aspect, all required; the aspect set follows the goal's difficulty exactly as the prompt and parser do |
+
+Today `codex` is the only runtime wired to it: the schema is written to a temp file and passed as `codex exec --output-schema <FILE>`. Every other runtime logs the request at `debug` and ignores it. **A schema is a preference, never a precondition** — nothing fails because a backend cannot constrain its output, and if the schema file cannot be staged the call runs without the flag rather than not running at all. There is no configuration key: the schemas are derived from the parsers' contracts, so a parser change and a schema change move together.
+
+#### Judge effort
+
+The judge hint can also carry a reasoning **effort**, alongside the provider and model. Internally `UtilityModelHint` has three independent halves — `provider`, `model`, `effort` — so a caller may move the judge to another vendor, change how hard it thinks, or both.
+
+Effort is deliberately **not** part of the hint's "is this empty" check: emptiness there means "resolves to the same `(provider, model)` spec", which is what the model-family validation is about. Effort changes how hard the model thinks, not which model answers.
+
+There is **no `[dispatch] judge_effort` key yet** — the config-file half of this is a deliberate follow-up. Today an unset judge effort falls back to the answering agent's own `agent.toml [model] effort` (see [Effort](../features/13-multi-runtime.md#effort) for the per-runtime flag mapping and clamp table), which for most setups is the behavior you want: the judge thinks as hard as the agent it is judging.
 
 ### External judge (`external`)
 

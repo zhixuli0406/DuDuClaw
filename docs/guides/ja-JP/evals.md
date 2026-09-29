@@ -216,7 +216,7 @@ v1.53 以降、この配線は稼働しており、しかも**エントリー単
 - AEE の Measure ステップは、subprocess として（runtime-agnostic に、決して in-process ではなく）`duduclaw eval … --replay --report` を実行して候補を採点し、その JSON レポートを読み取ります。
 - 1 ラウンドが commit された後、各エントリーは `aee_settle_hours` の経過後に**自分自身がリンクしている case** に基づいて個別に確定（確認／ロールバック）します。退行が起きても、原因となったそのエントリーだけがロールバックされます。
 
-レガシーの SOUL.md パス（`[evolution] legacy_soul_evolution = true` でオプトイン）は、引き続きファイル全体を対象にした 24 時間の観察期間（`ObservationFinalizer` / `duduclaw evolution finalize`）を使用します。その事後指標は `prediction.db` と `feedback.jsonl` から得られ、この eval の配線には接続されていません。
+ファイル全体を対象にしたレガシー SOUL.md パスの 24 時間観察期間（`ObservationFinalizer` / `duduclaw evolution finalize`）は 2026-09-29（S11）に削除されました。現在残る唯一の観察ウィンドウは、エントリが自分にリンクされた eval case に対して個別に確定するものです。
 
 ---
 

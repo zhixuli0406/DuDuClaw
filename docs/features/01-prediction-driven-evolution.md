@@ -161,35 +161,7 @@ Future predictions check the notebook:
           similar situations (be more cautious)
 ```
 
-The notebook feeds into both the prediction engine (improving future predictions) and the GVU loop (the L2.5 MistakeRegression verification layer checks new personality versions against known failure patterns).
-
----
-
-## Deferred GVU: Patient Evolution
-
-Not every significant prediction error needs immediate action. The **Deferred GVU** mechanism accumulates gradient signals before triggering a full evolution cycle:
-
-```
-Significant error detected
-     |
-     v
-Is the gradient buffer full enough?
-     |
-  +--+--+
-  |     |
- Yes    No
-  |     |
-  v     v
-Fire    Accumulate gradient
-GVU    (defer for later)
-now        |
-           v
-        Max 3 deferrals across 72 hours
-        → 9-21 effective iterations
-           spread over days
-```
-
-This prevents the evolution engine from reacting to every bump in the road. Instead, it waits until enough evidence accumulates to justify a meaningful change — resulting in more stable, higher-quality evolution.
+The notebook feeds into both the prediction engine (improving future predictions) and the evolution loop (unresolved mistakes are the evidence a repair round is built from).
 
 ---
 
@@ -198,12 +170,10 @@ This prevents the evolution engine from reacting to every bump in the road. Inst
 - **GVU Loop**: The prediction engine is the *gatekeeper* for GVU. It decides when GVU fires and with what urgency.
 - **MistakeNotebook**: Cross-loop memory that prevents the same mistakes from recurring.
 - **ConversationOutcome**: Zero-cost conversation classification that provides the "observed reality" for prediction comparison.
-- **SOUL.md Versioning**: When GVU produces a new SOUL.md version, the prediction engine's accuracy is part of the 24-hour observation metrics.
 - **CostTelemetry**: The engine's hit/miss ratio is tracked and visible in the dashboard, helping operators understand how much the engine is saving.
-- **Deferred GVU**: Gradient accumulation ensures evolution is patient and evidence-based.
 
 ---
 
 ## The Takeaway
 
-The prediction-driven engine answers a fundamental question: *"Does this conversation require the agent to grow?"* Most of the time, the answer is no — and the system is smart enough to recognize that without asking an LLM. When growth *is* needed, it can be patient (Deferred GVU) or urgent (emergency loop), and it never forgets its past mistakes (MistakeNotebook).
+The prediction-driven engine answers a fundamental question: *"Does this conversation require the agent to grow?"* Most of the time, the answer is no — and the system is smart enough to recognize that without asking an LLM. When growth *is* needed, it hands the evolution loop the evidence to work from, and it never forgets its past mistakes (MistakeNotebook).

@@ -44,7 +44,7 @@
 | 成果物 provenance + 納品安全(v1.60) | `artifacts.jsonl` 5 種 origin の provenance 台帳(declared/swept/uploaded/produced/unknown;exact/inferred の帰属表示、時間窓による推測は絶対にしない);goal 受け入れ時に成果物コピーを `attachments/` へアーカイブ(canonicalize 封じ込め、20MB/100MB 上限);📎DELIVER 前の LLM ゼロ納品ゲート(ゼロバイト/magic 不一致/zip 破損はハード失敗);`[limits]` DocumentLimits が下流 3 パーサーを防御;エキスパートパック解凍の「ヘッダ虚偽申告」バイパスを修正 |
 | 認証情報 P1 + secret 参照の収斂(v1.60) | `secret://keychain` と `secret://file` のローカル backend、tick ソース headers の `secret://` 対応、認証情報インベントリカード + `doctor --fix-residue`;`SecretRef`/`Secret` 型が手作り復号 7 方言を収斂——`secret://` 参照リテラルが本物の認証情報として vendor API へ送られる漏洩を修正;WhatsApp webhook 署名検証を fail-closed 化;ActionGuard 判定は 21 トークンの閉じた列挙 findings のみを受領(攻撃者制御テキストは構造的に判定プロンプトへ到達不能);MCP キーのローテーション即時反映、`denied_tools`/`allowed_tools` を MCP ディスパッチゲートでも強制 |
 | 10 チャネル通知統一(v1.60) | autopilot `notify`、MCP `send_message`、リマインダーがすべて共有 `create_sender` ファクトリ経由の 10 チャネル対応に(WebChat は誠実に拒否)——一度も配信されたことのなかった autopilot Slack 通知の生きた bug と Google Chat / Teams の静かなスキップ欠陥を修正 |
-| 進化計測の強化(v1.60) | AEE コミットゲートを visible / held-out の 2 次元に分離(fence-only:拒否のみ可能で昇格には使えない);チャンピオン bootstrap を同形計測に;`duduclaw evolution clear-holdout-rotation` オペレーター出口;ラウンドごとに 14 ノブのスナップショットを `aee_round` イベントへ;Code Mode Phase 0 計測ゲート(`duduclaw cost tool-loop`、4 基準の PROCEED/REJECT/INSUFFICIENT_DATA) |
+| 進化計測の強化(v1.60) | AEE コミットゲートを visible / held-out の 2 次元に分離(fence-only:拒否のみ可能で昇格には使えない);チャンピオン bootstrap を同形計測に;`duduclaw evolution clear-holdout-rotation` オペレーター出口;ラウンドごとに 14 ノブのスナップショットを `aee_round` イベントへ |
 | cron 曜日規約の修正(v1.61、**BREAKING**) | 数値曜日フィールドをパース時に Unix crontab 規約(0/7=日曜、1-5=月〜金)から `cron` crate の Quartz 序数へ変換、スケジューラ/heartbeat/MCP 検証/ダッシュボードが同一 normaliser を共有——従来 `* * 1-5` は日曜〜木曜に発火していた(日曜のゴースト発火 + 金曜の静かなスキップ);意図的に Quartz 規約で書かれたスケジュールはアップグレード後 1 日ずれる |
 | `duduclaw migrate-from claude-code`(v1.61) | Claude Code の memory shard(→ semantic + SPO 時間記憶)、CLAUDE.md(→ エージェント wiki の context 層、注入予算を消費しない)、セッション書き起こし(ノイズ除去で人間 prompt + assistant 最終返信のみ——実測で有効シグナルは約 1.5%)の一方向インポート;すべて `origin=import`(trust ≤ 0.7)、DATA 扱い、redaction デフォルト on、インジェクションスキャン通過、skill は fail-closed のセキュリティスキャン;`--apply` なしでは何も書き込まない |
 | チャネル能力テーブル(v1.61) | `channel_capabilities.rs` が 11 チャネル × 7 能力(ファイル/写真アップロード、対話ボタン、その場編集、typing、ネイティブ markdown、引用返信)+ 進捗スロットル秒数の単一権威;未対応の能力は静かな no-op から構造化ログへ |
@@ -58,7 +58,7 @@
 |------|------|
 | 進化システム v3:AEE + playbook | デフォルトの進化対象を「SOUL.md の全面書き換え」から遺伝子形 playbook 行動ルールへ変更——Gate/Measure 分離、champion + matches-or-improves コミットゲート、エントリ単位の観察ウィンドウ;SOUL.md はエージェントに対して読み取り専用([38-aee-playbook-evolution.md](../38-aee-playbook-evolution.md)) |
 | E1 エントリアサーション + 反 reward-hacking 監査 | 新規ルールは機械検証可能なアサーション必須。録画済み transcript に対し LLM ゼロで再生検証(`G-Assertions`);コミット前に評価問題の丸写し / 恒真表現 / 失敗隠蔽を決定論的にスクリーニング |
-| タスク層フォワードモデル | goal loop 上の predict-act-verify 世界モデル:4 段階退化の統計予測(コールドスタート LLM ゼロ)、観察証拠の忠実度分級(ネイティブツールイベント / 監査ログのみ / なし)、`<state>` ブロック + (状態, 行動) 訪問グラフによる振動検出、決定論的タスクルール帰納;`[task_forward_model]`、デフォルト off |
+| タスク層フォワードモデル | goal loop 上の predict-act-verify 世界モデル:4 段階退化の統計予測(コールドスタート LLM ゼロ)、観察証拠の忠実度分級(ネイティブツールイベント / 監査ログのみ / なし)、`<state>` ブロック + (状態, 行動) 訪問グラフによる振動検出、決定論的タスクルール帰納;`[task_forward_model]`、v1.54 以降デフォルト on |
 | ディスパッチ証拠グラウンディング事前チェック | 受け入れ判定の前に LLM ゼロの証拠チェック——最終回答は実在する非エラーのツール結果と重なる必要がある;自己エコー除外リスト + 入力重複控除で自己証明を防止;`[dispatch] grounding_precheck_enabled`、デフォルト on |
 | メモリ新規性ゲート | 意味層のほぼ重複した書き込みを書き込み時に拒否しテレメトリ記録(0.92 文字 n-gram cosine)——偽サプライズの蓄積防止;時間的置換・再確認パスは除外;`[memory] novelty_gate`、デフォルト on |
 | 証拠必須のリフレクション | MistakeNotebook エントリはプログラム抽出の `TrajectoryEvidence` を保持;証拠のない自己申告ミスはルール統合に参加しない |
@@ -70,7 +70,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| 統一 LLM プロバイダーレイヤー(`duduclaw-llm`) | 4 つのネイティブプロトコル(Anthropic / OpenAI Responses / Gemini / OpenAI-compat、8 プリセット)を 1 つの正規化された request/stream 形状で扱う。`ModelRegistry` 価格表 + `FallbackRouter` クールダウン。stdio MCP クライアント + プロバイダー非依存のツールループにより API モードのエージェントも全ツールサーフェスを獲得 |
+| 統一 LLM プロバイダーレイヤー(`duduclaw-llm`) | 4 つのネイティブプロトコル(Anthropic / OpenAI Responses / Gemini / OpenAI-compat、8 プリセット)を 1 つの正規化された request/stream 形状で扱う。`ModelRegistry` 価格表。stdio MCP クライアント + プロバイダー非依存のツールループにより API モードのエージェントも全ツールサーフェスを獲得 |
 | エージェント行動 eval(`duduclaw eval`) | エージェントごとのゴールデンタスク回帰:決定論的な tool-call/regex/grounded アサーション + 任意の LLM judge。live / replay の 2 モード、CI をゲートする exit code |
 | HITL ApprovalBroker | MCP ツール / autopilot / bus タスクを横断する単一の割り込み/承認プリミティブ。SQLite ベース、TTL 期限切れ = DENY(フェイルクローズ) |
 | OpenTelemetry GenAI トレーシング | opt-in の `gen_ai.*` span、OTLP で Langfuse/Grafana/Jaeger/Datadog へエクスポート可能。オフ時はオーバーヘッドゼロ |
@@ -179,12 +179,13 @@
 
 > **進化システム v3（2026-08-06）**:デフォルトの進化対象は「`SOUL.md` の
 > 全面書き換え」から **playbook**（小粒度で個別に退役可能な遺伝子形ルール;
-> `SOUL.md` はデフォルトでエージェントに読み取り専用）へ移行しました。
-> 下表の GVU² 系の行（デュアルループ / 4+2 層検証 / SOUL.md バージョン管理）
-> は**非デフォルトの legacy パス**（`agent.toml [evolution]
-> legacy_soul_evolution = true`）の説明です。現行デフォルト（AEE、
-> Gate/Measure 分離、champion + matches-or-improves、エントリ単位観察
-> ウィンドウ）は [38-aee-playbook-evolution.md](../38-aee-playbook-evolution.md)
+> `SOUL.md` はエージェントに読み取り専用）へ移行し、さらに 2026-09-29
+> （S11）に legacy の SOUL 書き換え経路を**完全に削除**しました——
+> `[evolution] legacy_soul_evolution` 非常口、`SOUL.md` バージョン管理、
+> 24 時間観察ウィンドウ、自動ロールバック、サイズ上限の consolidate 書き換え、
+> deferred GVU 再試行、`duduclaw evolution finalize` CLI をすべて削除。
+> `[evolution] gvu_enabled` は出荷時 `true` になりました。現行（そして唯一の）
+> エンジンは [38-aee-playbook-evolution.md](../38-aee-playbook-evolution.md)
 > と [evolution-engine.md](../../architecture/evolution-engine.md) 第 12 章を参照。
 
 | 機能 | 説明 |
@@ -193,13 +194,8 @@
 | デュアルプロセスルーター | System 1（ルール）/ System 2（LLM リフレクション） |
 | AEE（v3 デフォルト） | Agentic Evolution Engine — Generator 内ループ（≤3 ラウンド）→ Gate（決定論的・拒否権あり）/ Measure（スコア・拒否権なし）分離 → champion + matches-or-improves コミットゲート → エントリごとにリンクされた eval case に対して confirm/rollback |
 | Playbook（v3 デフォルト） | 遺伝子形行動ルール（category/signals_match/eval_cases/success_streak）、既存 rule_lifecycle ストアの拡張、0.92 cosine 重複排除、容量 + 失効/アーカイブライフサイクル |
-| GVU² デュアルループ（legacy） | 外側ループ（Behavioral GVU — SOUL.md 書き換え）+ 内側ループ（Task GVU — 即時再試行）;`legacy_soul_evolution = true` でオプトイン |
-| 4+2 層検証（legacy） | L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety |
 | MistakeNotebook | ループ間エラー記憶 — 失敗パターン記録、退行防止;エントリは決定論的 `TrajectoryEvidence`（どのツール/アサーションが失敗したか）を保持し、証拠のない自己申告診断はリフレクション統合に参加しない（v3） |
-| SOUL.md バージョン管理（legacy） | 24h 観察期間 + アトミックロールバック + SHA-256 フィンガープリント — legacy GVU パスに適用;SOUL.md サイズ上限デッドロックはガード付き consolidate 書き換えで解除され、エージェントが凍結しなくなった（v3 Phase 0） |
 | MetaCognition | 100 予測毎に誤差閾値を自己校正、対称的な引き上げ規則を追加し閾値の一方向ドリフトを解消（v3 Phase 0） |
-| Adaptive Depth | MetaCognition 駆動の GVU 反復深度（3-7 ラウンド） |
-| Deferred GVU（legacy） | 勾配累積 + 遅延再試行（最大 3 deferral、72h、9-21 実効ラウンド） |
 | 停滞検出器（v3） | 30 分毎に `evolution.db` の連続拒否 / D 日間ゼロ適用 / 拒否理由反復シグナルをスキャンし、Activity Feed + ダッシュボードへ通知 |
 | ConversationOutcome | LLM ゼロの会話結果検出、zh-TW + en |
 | Agent-as-Evaluator | 独立 Evaluator Agent（Haiku コスト管理）による対抗的検証 |
@@ -235,14 +231,10 @@
 
 | 機能 | 説明 |
 |------|------|
-| llama.cpp | Metal/CUDA/Vulkan/CPU（`llama-cpp-2` crate） |
-| mistral.rs | Rust ネイティブ、ISQ、PagedAttention、Speculative Decoding |
-| OpenAI 互換 HTTP | Exo/llamafile/vLLM/SGLang |
+| OpenAI 互換 HTTP | 唯一出荷されているバックエンド——llama-server／Ollama／vLLM／SGLang／llamafile。プロセス内の llama.cpp・mistral.rs・MLX の 3 バックエンドは 2026-09 に削除（リリースバイナリで一度もコンパイルされていなかった） |
 | 信頼度ルーター | LocalFast / LocalStrong / CloudAPI 3 層 + CJK-aware トークン推定 |
-| InferenceManager | マルチモード自動切替：Exo P2P → llamafile → Direct → OpenAI-compat → Cloud API |
+| InferenceManager | マルチモード自動切替：llamafile → Direct → OpenAI-compat → Cloud API |
 | llamafile マネージャ | サブプロセスライフサイクル、6 OS でゼロインストール |
-| Exo P2P クラスタ | 分散推論、235B+ モデルを複数マシンで実行 |
-| MLX Bridge | Apple Silicon の `mlx_lm` + LoRA ローカルリフレクション |
 | モデル管理 | `model_search`（HuggingFace）/ `model_download`（resume + mirror）/ `model_recommend`（ハードウェア認識） |
 
 ## 圧縮エンジン
@@ -270,14 +262,15 @@
 
 | 機能 | 説明 |
 |------|------|
-| 3 段階防御 | 決定論的ブラックリスト（<50ms）/ 難読化検出（YELLOW+）/ Haiku AI 判定（RED のみ） |
-| 脅威レベル状態機械 | GREEN → YELLOW → RED 自動エスカレート、24h 無イベントで -1 |
+| `agent-file-guard` PreToolUse フック | `duduclaw hook agent-file-guard`（Rust サブコマンド、matcher `Write\|Edit\|MultiEdit\|Bash`、`agent_hook_installer` がエージェント毎に導入）——正規ツリー外のエージェント構造ファイル、自分の SOUL.md への書き込み、他エージェントへの書き込みをブロック |
+| `org_field_guard` | 同じフック内のフィールド単位の凍結：`[agent] reports_to`／`department`／`name`、`[capabilities]` テーブル全体、`config.toml [delegation]`／`[acp]`。パース不能・書き込み意図の再構成不能はいずれも fail-closed |
+| `data-file-guard` PreToolUse フック | `duduclaw hook data-file-guard`（RFC-23 §14.4、H10 2026-09 から Rust サブコマンド、matcher `Read\|Bash`）。匿名化が有効なときだけ武装。サンドボックスではなく `Bash` のファイル名ヒューリスティック |
 | Ed25519 認証 | チャレンジレスポンス WebSocket 認証 |
 | AES-256-GCM | API キーの保存時暗号化、per-agent 隔離 |
-| Prompt Injection スキャナ | 6 ルールカテゴリ + XML 区切りタグ保護 |
+| Prompt Injection スキャナ | `input_guard` — 7 ルールカテゴリ、ブロック閾値 60、NFKC 正規化、英語＋zh-TW パターン、XML 区切りタグ保護 |
 | SOUL.md ドリフト検出 | SHA-256 フィンガープリント比較 |
 | CONTRACT.toml | 行動境界 + `duduclaw test` レッドチーム CLI（9 シナリオ）；全ランタイムの system prompt へ自動注入 |
-| RBAC | 役割ベースアクセス制御マトリクス |
+| RBAC マトリクス（読み取り専用ビュー）| セキュリティページがエージェント毎のツール／ウェブ／承認マトリクスを `agent.toml [capabilities]` から描画します。`duduclaw-security::rbac` モジュールは削除済み（呼び出し元ゼロ）で、編集可能な真実の源は各エージェントの capability envelope です |
 | 統一監査ログ | `audit.unified_log` が `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` を統合 |
 | JSONL 監査ログ | 非同期書込、Rust `AuditEvent` スキーマ互換 |
 | Unicode 正規化 | NFKC で同形異字攻撃を検出 |
@@ -336,10 +329,11 @@
 
 | 機能 | 説明 |
 |------|------|
-| 5 層ルーター | API Fetch / 静的スクレイプ / ヘッドレス Playwright / サンドボックスコンテナ / Computer Use |
-| 能力ゲーティング | `agent.toml [capabilities]` はデフォルト拒否 |
-| Browserbase | クラウドブラウザ（L5 代替） |
-| bash-gate.sh | Layer 1.5 allowlist（`DUDUCLAW_BROWSER_VIA_BASH=1` 必須） |
+| L1 `web_fetch_cached` | SSRF ゲート付き・ディスクキャッシュ付き HTTP GET（本文は 6 万文字で切り詰め） |
+| L2 `web_extract` | 同じ取得経路＋CSS セレクタ抽出（`text`／`html`／`json`） |
+| L3 ヘッドレス（任意・外部） | Playwright または Browserbase をエージェント毎の `.mcp.json` に MCP サーバーとして登録。バイナリには含まれず、L2 からのフォールバックもなし |
+| L5 Computer Use | 7 つの `computer_*` MCP ツールが `computer_use_orchestrator` 経由でコンテナの仮想ディスプレイを駆動 |
+| 能力ゲーティング | `agent.toml [capabilities]` はデフォルト拒否（`computer_use`／`browser_via_bash`／`allowed_tools`／`denied_tools`）。`denied_tools` は `--disallowedTools` と MCP ディスパッチゲートの両方で強制 |
 
 ## コンテナサンドボックス
 
@@ -357,7 +351,6 @@
 | ReminderScheduler | 一度限りのリマインダー（相対 `5m`/`2h`/`1d` または ISO 8601）、`direct` / `agent_callback` モード |
 | HeartbeatScheduler | エージェント毎統一スケジューリング — バスポーリング + GVU サイレンスブレイカー + cron |
 | スケジューラレベルのタスクボードプル（v1.9.3）| `poll_assigned_tasks` を `HeartbeatScheduler::run` tick へ移動 — 30s 毎に全エージェントレジストリを走査（`enabled=false` をスキップしない）；1 時間 LIKE-marker クールダウンでスタンピード防止 |
-| `duduclaw evolution finalize` CLI（v1.9.1）| 既に終了しているはずの SOUL.md 観察ウィンドウのワンショット回収；`--dry-run` / `--agent` フィルタ；30 分 `ObservationFinalizer` バックグラウンドタスクのバックストップ |
 
 ## タスクボードと Activity Feed
 
@@ -384,10 +377,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| Durability フレームワーク（`duduclaw-durability`、v1.9.4）| 5 つの柱 — `idempotency`（key ベース重複排除）、`retry`（指数バックオフ + jitter）、`circuit_breaker`（3 状態 + `probe_inflight` 計上）、`checkpoint`（再開可能タスク進捗）、`dlq`（デッドレターキュー）。gateway LLM フォールバック + 永続 cron で使用 |
-| ガバナンス層（`duduclaw-governance`、v1.9.4）| `PolicyRegistry` — YAML ロード + ホットリロード + agent 優先マージ + フェイルセーフ（不正ポリシーはスキップ、不正 YAML で panic しない）。4 種の `PolicyType` — Rate / Permission / Quota / Lifecycle |
-| クォータマネージャ | agent 毎 / ポリシー毎の soft + hard クォータ強制；`error_codes.rs` がガバナンスエラー（QUOTA_EXCEEDED / POLICY_DENIED / ...）を標準化。デフォルトセットは `policies/global.yaml`（例：`default-rate-mcp` 200/min）|
-| LLM フォールバックチェーン（`gateway/llm_fallback.rs`、v1.9.4）| プライマリの timeout/503/429/overloaded がフォールバックモデルへ自動切替；純関数 `is_llm_fallback_error` / `should_attempt_model_fallback` をユニットテスト；hard-deadline アームが `Err("hard timeout")` を返しフォールバックを確実に発動 |
+| LLM フォールバックチェーン（`gateway/failover.rs::model`、v1.9.4）| 3層フェイルオーバー（アカウント → モデル → ランタイム、2026-09-29 に統合）の第2層：プライマリの timeout/503/429/overloaded がより軽いフォールバックモデルへ自動切替；純関数 `is_llm_fallback_error` / `should_attempt_model_fallback` をユニットテストし、ディスパッチ経路は `FailoverManager::model_fallback_for` という単一の判断を呼ぶ；hard-deadline アームが `Err("hard timeout")` を返しフォールバックを確実に発動 |
 | Evolution Events システム（v1.9.4）| 30+ イベントスキーマ（`schema.rs`）、非同期 batch+retry emitter（`emitter.rs`）、クエリインターフェース（`query.rs`）、信頼性保証（`reliability.rs`）；HTTP エンドポイントを Web `ReliabilityPage` に表示 |
 
 ## アイデンティティとアクセス
@@ -407,17 +397,12 @@
 | AI Judge | 並行ブランチをスコアリングし最良の継続を選択 |
 | 予算制御 | `budget.rs` が fork fan-out / コストを制限 |
 
-## CLI ランタイム（PTY Pool）
+## CLI ランタイム（ワンショットPTY）
 
 | 機能 | 説明 |
 |------|------|
-| クロスプラットフォーム PTY Pool（`duduclaw-cli-runtime`、v1.15.0）| 本物のインタラクティブ `claude` REPL を駆動（Win 10 1809+ は ConPTY、Unix は `portable-pty` 経由 openpty）、sentinel-framed in-band レスポンスプロトコル — Anthropic が OAuth サブスク口座向けに `claude -p` をブロックした問題に対応。デフォルトオフ、per-agent オプトイン `[runtime] pty_pool_enabled = true` |
-| Worker Supervisor（`duduclaw-cli-worker`）| `[runtime] worker_managed = true` でゲートされる out-of-process worker サブプロセス；SIGTERM/SIGKILL を gateway の優雅シャットダウンに連動 |
-| `pty_runtime.rs` アダプタ | `RuntimeMode::{FreshSpawn, PtyPool}` per-agent ルーティング、`acquire_and_invoke` サーフェス；OAuth → インタラクティブ REPL、API-key → `oneshot_pty_invoke + claude -p` |
-| Claude 固定の解除（v1.24.0）| `CliKind::Antigravity` を追加；`which_codex` / `which_gemini` / `which_agy` の探索（`which_claude` と並列）；`resolve_program` + worker `spawn_session_default` が 4 つの CliKind すべてを解決（`None`/reject なし）；`cli_kind_for_provider()` が `[runtime] provider` から PtyPool の種別を導出し、ハードコードされた 2 箇所の `CliKind::Claude` を置き換え。対話型 REPL は設計上 Claude 専用のまま（非 Claude プロバイダはワンショット `runtime_dispatch` 経路）|
-| Runtime ステータスエンドポイント | `GET /api/runtime/status` loopback 限定 JSON（Phase 8.5）|
-| 可観測性 | `pty_pool_*` Prometheus カウンタ（acquires / cache-hit / spawn / eviction / invoke outcomes / duration histogram）、`worker_health_misses_total`、`worker_restarts_total`、`pty_pool_managed_worker_active` ゲージ |
-| 優雅なフォールバック | 全 PTY パスはエラー時にレガシー `tokio::process::Command + claude -p` へフォールバック — worker 欠如 / pool 不健全 / spawn 失敗は回復可能 |
+| ワンショットPTY呼び出し（`duduclaw-cli-runtime`）| 本物の疑似端末の下でCLIをspawnし（Win 10 1809+はConPTY、Unixは`portable-pty`経由openpty）、stdoutをEOFまで読み切る。stdoutがただのパイプだと実行を拒むCLI向け。利用者はGrokランタイムとCLIログイン補助フロー。`clear_env`はgatewayのベンダーAPIキーを子プロセスから遮断し、`deadline`は絶対的なwall-clock上限。[27-pty-pool-runtime](27-pty-pool-runtime.md)参照 |
+| PTYセッションプール —— **2026-09に削除** | 長寿命のsentinel-framed `claude` REPLプール、`duduclaw-cli-worker`サブプロセス＋supervisor、`RuntimeMode::PtyPool`、`GET /api/runtime/status`、`pty_pool_*` / `worker_*`メトリクス、`[runtime] pty_pool_enabled` / `worker_managed`キーをすべて削除。理由: 備えていたAnthropicのプログラマティック利用分割は2026-06-15に停止されたまま再開されず、またプールのセッションには会話の次元がなく（会話間コンテキスト漏れ）、安全に有効化できなかった |
 
 ## MCP HTTP/SSE トランスポート（W20）
 
@@ -460,7 +445,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| 23 ページ | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
+| ルート | `web/src/App.tsx` に約 74 のリダイレクトでないルート（加えて旧ブックマーク維持用のレガシーリダイレクト別名が約 30）。4 つのシェル：ワークスペース（`/`、`/chat`、`/tasks`、`/goals`、`/inbox`、`/files`、`/mail`、`/timeline`、`/foresight`、`/gallery`、`/canvas` …）、エージェント（`/agents`、`/agents/:id/:tab`、`/agents/new`、`/experts`、`/org`、`/presets`）、`/manage/*`（チャネル、ログ、請求、メンバー、部門、ディストリビューター、推論、ローカルモデル、ファインチューン、信頼性、セキュリティ監査、Wiki 信頼 …）、`/app/system/*`（設定、セキュリティ、アカウント、ライセンス、因果、Decision Lab、CCR …）、加えて単独ページ（`/login`、`/welcome`、`/webchat`、`/console`、`/mascot-overlay`、`/pet-studio`、`/world`、`/launcher`）。サイドバーに何が出るかは `web/src/components/layout/nav-model.ts` が真実の源 |
 | 技術スタック | React 19 + TypeScript + Tailwind CSS 4 + Base UI + CVA |
 | DuDuClaw デザインシステム（mds）| 共有 `web/src/components/mds/` コンポーネントライブラリ（OKLCH トークン、4 層サーフェス、3 段シャドウ、Inter／Geist Mono）+ `nav-model.ts` のグループ化サイドバー（個人／作業／会社／設定）+ `web/DESIGN.md` 仕様；全ページを共有プリミティブで構築、en/ja/zh i18n 同期 |
 | リアルタイムログストリーミング | BroadcastLayer tracing → WebSocket push |

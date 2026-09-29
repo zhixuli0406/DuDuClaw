@@ -17,6 +17,8 @@
 | **§1 step 2** `identity_resolve` MCP tool + `IdentityRead` scope | ✅ Landed | `53e19a8` |
 | **§1 step 3** `NotionIdentityProvider` + `ChainedProvider` | ✅ Landed | (this branch) |
 | **§1 step 4** `<sender>` block auto-injection into channel reply | ✅ Landed | `5c0b116` |
+| **§1 step 4b** `<sender>` block + `identity_resolve` honour `[identity] provider` | ✅ Landed 2026-09 (G5 feature audit) — both used to hard-code `WikiCacheIdentityProvider`; they now share `duduclaw_gateway::identity_provider::build_identity_provider` with the dashboard RPC |
+| **§1** `identity_list_project_members` / `identity_invalidate_cache` MCP tools | ❌ 未落地 / not implemented, not scheduled — see the §1 tool table below |
 | **§1 step 5** SOUL.md template generator update | ⚠️ Recharacterised — no template generator exists in the codebase (the `create_agent` MCP tool writes the operator-supplied `soul:` parameter verbatim). Operator guidance is now in `docs/RFC-21-operator-guide.md`. |
 | **§2** Per-agent Odoo isolation (`OdooConnectorPool`, `agent.toml [odoo]`, `Scope::Odoo*`, `allowed_models`/`actions`, audit attribution) | ✅ Landed | (this branch) |
 
@@ -206,8 +208,14 @@ through that source — with the shared wiki demoted to a transparent cache.
     | Tool | Scope | Behaviour |
     |---|---|---|
     | `identity_resolve` | `identity:read` | `{channel, external_id}` → `ResolvedPerson` JSON, or `null` |
-    | `identity_list_project_members` | `identity:read` | `{project_id}` → `[ResolvedPerson]` |
-    | `identity_invalidate_cache` | `identity:write` | Manually invalidate one or all entries |
+    | `identity_list_project_members` | `identity:read` | `{project_id}` → `[ResolvedPerson]` — **未落地 / not implemented** (2026-09 audit) |
+    | `identity_invalidate_cache` | `identity:write` | Manually invalidate one or all entries — **未落地 / not implemented** (2026-09 audit) |
+
+    Only `identity_resolve` exists. `lookup_project_members` is live on the
+    `IdentityProvider` trait and used by `ChainedProvider`, but no MCP tool
+    exposes it; cache invalidation is done by editing the wiki files, and no
+    tool triggers it. Neither is scheduled — recorded here rather than left as
+    a promise the code never kept.
 
     `Scope` enum extended:
     [crates/duduclaw-cli/src/mcp_auth.rs:14-22](crates/duduclaw-cli/src/mcp_auth.rs#L14-L22)

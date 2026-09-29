@@ -39,6 +39,29 @@ Notification created (NotifyLevel required, no default)
     - caps: 500 entries max, older than 36 hours dropped (warn log)
 ```
 
+### Implementation: one push entry
+
+There are four kinds of decision card — a goal parked `needs_human`, a pending approval, an install sign-off, a tripped autopilot breaker — and each has its own module that knows how to word it and where it belongs. Everything *after* that is now one function, `notify_push::push(card, dest)`:
+
+```
+goal_notify   ─┐
+approval_notify ┤
+install_notify  ├──> notify_push::push(card, dest)
+autopilot_notify┘            |
+                             v
+                   resolve the bot token for dest
+                             |
+                             v
+                   decision_notify::deliver_outcome  (levels + quiet hours, above)
+                             |
+                             v
+                   channel_sender::send_with_markup / send_plain_text
+```
+
+`dest` picks the token dialect, which is the part that used to be copied wrong: a card addressed to an **agent** uses that agent's own `[channels.<ch>]` token with the `reports_to` cascade behind it, while a card addressed to a **linked dashboard user** uses the deployment's DM bot tokens and tries each until one reaches the person.
+
+Two things deliberately stayed with the four modules rather than moving into the shared entry: **what the card says** (the domain knows that), and **who may press its buttons** (`decision_notify::authorize_press` plus each module's own delivery record). A push is an outbound side effect and must never be able to widen who can decide.
+
 ### The four-level escalation ladder
 
 Every push point must declare its level (`NotifyLevel`) in code, and there is no default — adding a new push outlet forces you to answer "is this worth waking someone up for?"

@@ -44,7 +44,7 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 | Multi-LLM failover | Manual restart | 4 rotation strategies + cross-provider failover |
 | Context survives switching LLMs | Lost | Preserved |
 | Conversation memory and knowledge base | Single session | SQLite temporal memory + layered wiki, auto-injected |
-| Tools shared across LLMs | Rewrite per vendor | Write 200+ MCP tools once, use on all 5 backends |
+| Tools shared across LLMs | Rewrite per vendor | Write 243 MCP tools once, use on all 5 backends |
 | Guardrails / audit / secret management | Build it yourself | Policy kernel + OS sandbox + AES-256-GCM built in |
 | A whole box to hand to a customer | Install Linux yourself, manage updates and tamper resistance yourself | DuDuClaw OS image: A/B update with rollback + read-only root, plug in and go; a desktop shared by a person and the AI without getting in each other's way |
 
@@ -62,15 +62,17 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 5 backends, auto-detected, configured per agent
   ├─ Session Memory — native --resume + temporal memory + key facts + layered wiki
-  ├─ MCP Server — 200+ tools (channels, memory, agents, skills, tasks, wiki, ERP)
+  ├─ MCP Server — 243 tools (channels, memory, agents, skills, tasks, wiki, ERP)
   ├─ Evolution Engine — GVU² dual-loop evolution + prediction-driven + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS sandbox + redaction vault
-  ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX
+  ├─ Inference Engine — OpenAI-compatible local server (llama-server / Ollama / vLLM) / llamafile
   ├─ Account Rotator — OAuth + API key rotation, budgets, health checks
   └─ Web Dashboard — React 19 SPA (32 pages), embedded via rust-embed
 ```
 
 The Rust workspace is 20 crates: the `duduclaw-core` foundation, the `duduclaw-gateway` service layer, the `duduclaw-llm` unified API layer, `duduclaw-inference` for local models, `duduclaw-memory` for cognitive memory, `duduclaw-security`, and more. Full design in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Experimental calibrated local routing uses Varun Kotte's [UCCI (arXiv:2605.18796)](https://arxiv.org/abs/2605.18796). See [UCCI calibrated cascade](docs/features/57-ucci-calibrated-cascade.md) for configuration and data preparation.
 
 The same gateway + dashboard also ships as a whole machine: [DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) is a Yocto-built appliance image. Its Yocto layer and release pipeline live in their own repo and vendor this repo's Rust workspace as a trimmed snapshot; see the Install section below.
 
@@ -171,12 +173,12 @@ duduclaw service install   # start on boot (launchd / systemd)
 | Channels | 11 channels (Telegram / LINE / Discord + voice / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards | [docs/features](docs/features/README.md) |
 | Multi-runtime | Claude / Codex / Gemini / Antigravity / OpenAI-compat, auto-detected, per-agent config, context survives backend switches | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Unified LLM API layer | `duduclaw-llm` covers 4 native protocols (Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat) with one normalized request, plus 8 OpenAI-compat presets (DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen), a pricing registry, and cross-provider fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP server | 200+ tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports, with only 7 whitelisted tools exposed externally | [docs/api](docs/api/README.md) |
+| MCP server | 243 tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports, with only 7 whitelisted tools exposed externally | [docs/api](docs/api/README.md) |
 | Memory | SQLite temporal memory (fact supersession chains), HippoRAG-lite knowledge-graph retrieval (Personalized PageRank), Ebbinghaus forgetting-curve archival, cross-agent shared wiki | [docs/features](docs/features/README.md) |
 | Self-evolution | GVU² dual loop + prediction-driven (about 90% of conversations cost zero LLM calls), SOUL.md versioning with 24h observation and auto-rollback, MistakeNotebook cross-turn memory | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | Security | PolicyKernel reference monitor (zero-LLM, fail-closed), macOS Seatbelt / Linux Landlock native sandbox, Docker / Apple Container / WSL2 container sandbox, secret redaction vault, CONTRACT.toml behavioral contracts + red-team CLI | [SECURITY.md](SECURITY.md) |
 | Accounts and cost | OAuth + API key rotation (4 strategies), rate-limit and billing cooldowns, cost telemetry with cache-efficiency analytics, cross-platform PTY pool driving OAuth subscription accounts | [docs/features](docs/features/README.md) |
-| Local inference | llama.cpp (Metal/CUDA/Vulkan), mistral.rs, Exo P2P, llamafile, MLX, with three-tier confidence routing; built-in Whisper speech recognition and vector embeddings | [docs/features](docs/features/README.md) |
+| Local inference | Any OpenAI-compatible local server (llama-server / Ollama / vLLM / SGLang) or llamafile, with three-tier confidence routing; built-in Whisper speech recognition and vector embeddings | [docs/features](docs/features/README.md) |
 | Fine-tuning | Build SFT / DPO datasets (ShareGPT / Alpaca) from this machine's conversations, task results and approval decisions, train them on your own GPU host (SSH + LLaMA-Factory) or Together's cloud, then import the GGUF / LoRA back into the local models directory. No local training — integrated graphics cannot train — and data leaving the machine requires an explicit acknowledgement | [docs/features/53](docs/features/54-finetune.md) |
 | Live forking | RFC-26: fork an in-progress task into N competing branches, each in a copy-on-write isolate, with an AI judge picking the winner to merge (off by default) | [docs/rfc](docs/rfc) |
 | Auto-update | One click from the dashboard or unattended (`auto_update = true`); SHA-256 + Ed25519 verification, in-place restart, open tabs reload themselves | [deployment-guide.md](docs/guides/deployment-guide.md) |
@@ -247,7 +249,7 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 | Language | Rust | TypeScript | Rust | Python |
 | Channels | 11 | 25+ | 8 | 0 (API) |
 | Multi-runtime | 5 backends | single | single | multi-LLM |
-| MCP server | 200+ tools | no | no | no |
+| MCP server | 243 tools | no | no | no |
 | Self-evolution engine | GVU² dual loop | no | no | no |
 | Local inference | 5 backends + confidence routing | no | no | no |
 | Behavioral contracts | CONTRACT.toml + red team | no | WASM sandbox | no |
@@ -263,7 +265,7 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 - [docs/guides/development-guide.md](docs/guides/development-guide.md): dev environment and agent development
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md): writing custom MCP tools
 - [docs/spec](docs/spec/soul-md-spec.md): SOUL.md and CONTRACT.toml format specs
-- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md): the DuDuClaw OS appliance; [52-desktop-edition.md](docs/features/52-desktop-edition.md): the desktop edition, one machine shared by a person and the AI; hardware requirements in [hardware-requirements.md](docs/guides/hardware-requirements.md), app compatibility in [app-compat.md](docs/guides/app-compat.md); image build and releases in the [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo
+- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md): the DuDuClaw OS appliance; [52-desktop-edition.md](docs/features/52-desktop-edition.md): the desktop edition, one machine shared by a person and the AI; hardware requirements in [hardware-requirements.md](docs/guides/hardware-requirements.md); app compatibility, image build and releases all live in the [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo (see its `docs/guides/app-compat.md`)
 - [CHANGELOG.md](CHANGELOG.md): version history
 
 <a id="license"></a>

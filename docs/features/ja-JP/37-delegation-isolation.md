@@ -189,7 +189,7 @@ allow = [
 カバーしない範囲（設計上の既知の境界であり、バグではない）：
 
 - **旧形式タスク**：1.52 では送信者フィールドがまったくないキュータスクは引き続き通過させ、warning を 1 件記録するだけ（アップグレード時にキューに残っている仕事を全部潰さないため）。次のバージョンで拒否に変わる。
-- **設定ファイルレベルの変更**：v1.52 以降、PreToolUse hook が機微な組織データフィールドを凍結——agent は Write/Edit/Bash ツールを通じて `agent.toml` の `name` / `reports_to` / `department`、`config.toml` の `[delegation]` / `[acp]` セクション、`.mcp.json` の身分ブロック、`.claude/settings.json`、`identity.key` を書き換えられない。これらの設定変更はダッシュボードまたは `agent_update` MCP ツールという、審査済みの正式な経路を通す必要がある。社員をまたぐファイル変更（例：他人の SOUL.md の変更）も拒否される。非 Claude runtime（codex/gemini など）は workspace-write サンドボックス下で `~/.duduclaw/` ディレクトリに書き込めず、サンドボックス層の防衛線となる。FullAccess サンドボックスのみが例外で、これはオペレーターが明示的に選択した極端な権限である。
+- **設定ファイルレベルの変更**：v1.52 以降、PreToolUse hook が機微な組織データフィールドを凍結——agent は Write/Edit/Bash ツールを通じて `agent.toml` の `name` / `reports_to` / `department`、`[capabilities]` セクション全体（Team-as-Agent レビュー後に追加）、`config.toml` の `[delegation]` / `[acp]` セクション、`.mcp.json` の身分ブロック、`.claude/settings.json`、`identity.key` を書き換えられない。これらの設定変更はダッシュボードまたは `agent_update` MCP ツールという、審査済みの正式な経路を通す必要がある。社員をまたぐファイル変更（例：他人の SOUL.md の変更）も拒否される。非 Claude runtime（codex/gemini など）は workspace-write サンドボックス下で `~/.duduclaw/` ディレクトリに書き込めず、サンドボックス層の防衛線となる。FullAccess サンドボックスのみが例外で、これはオペレーターが明示的に選択した極端な権限である。
 - **システムと人間が起点の操作**：ダッシュボード、webhook、スケジュール、自動化ルールはもともとオペレーターの意志であり、一律に許可される。
 
 ### 可視範囲のフィルタリング
@@ -250,6 +250,7 @@ Agent がファイルツール（Write/Edit/Bash）を通じて行う変更は P
 | ファイル | フィールド / セクション | 理由 |
 |----------|------------------------|------|
 | `agent.toml` | `[agent]` の `name`, `reports_to`, `department` | これらの変更は組織図の変更に等しく、セルフサービス権限昇格の穴 |
+| `agent.toml` | `[capabilities]` セクション全体 | これは権限エンベロープ（`allowed_tools`／`denied_tools`、`computer_use`／`browser_via_bash`／`os_native`／`git_credentials` の各スイッチ、`db_sources`、承認／不可逆／task-scoped ツール一覧、`autonomy_level`、`wiki_visible_to`）。チームのロールメンバーは社員のワークスペースを cwd として動くため hook は社員本人と判定する——安価なサードパーティモデルが「自分を閉じ込めているはずのエンベロープ」を広げられる唯一の場所だった。比較は両側のキーの和集合をたどるので、将来のリリースで追加される権限キーも同時に凍結される |
 | `config.toml` | `[delegation]`, `[acp]` セクション全体 | ポリシー設定はチーム全体の安全に関わり、勝手に変更できない |
 | `.mcp.json` | `DUDUCLAW_AGENT_ID`, `DUDUCLAW_AGENT_TOKEN` | 身分トークン。変更は他人へのなりすましに等しい |
 | `.claude/settings.json` | ファイル全体 | 権限リストなどの機微な設定はダッシュボードが一元管理 |
@@ -260,6 +261,7 @@ Agent がファイルツール（Write/Edit/Bash）を通じて行う変更は P
 これらの設定を変更する必要があるとき：
 
 - **`name`、`reports_to`、`department` の変更** → ダッシュボード「AI 社員 → 詳細 → 編集」、または MCP `agent_update` ツール
+- **権限の調整やツールの追加** → ダッシュボード「AI 社員 → 詳細設定」、MCP `agent_update` ツール、またはオペレーターが通常のエディタで `agent.toml [capabilities]` を編集。いずれもこの hook を通らない（hook が見えるのは Claude Code 自身の Write／Edit／Bash 呼び出しだけ）ため、社員（およびそのチームロールメンバー）はセッション内からこの経路を取れない
 - **権限の調整やツールの追加** → ダッシュボード「AI 社員 → 高度な設定」、または `agent.toml [capabilities]` を編集して手動指定（ファイルツールを通さない）
 - **委任ポリシーやホワイトリストの変更** → ダッシュボード「高度な設定 → 委任権限」、または `config.toml [delegation]` を直接編集して gateway を再起動
 - **MCP server の追加** → `.mcp.json` の `tools` 配列を編集（身分ブロックは触らない）、ダッシュボード「高度な設定 → MCP サーバー」で手動追加

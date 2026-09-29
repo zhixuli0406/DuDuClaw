@@ -39,6 +39,29 @@ DuDuClaw 的 AI 員工會主動找你：任務卡關、預算用完、高風險�
     - 上限：最多 500 則、超過 36 小時丟棄（寫 warn 日誌）
 ```
 
+### 實作架構：單一推播入口
+
+決定卡有四種——目標停在 `needs_human`、待核可事項、安裝簽核、自動規則斷路器跳閘——各自有一個模組知道該怎麼措辭、該送到哪裡。措辭與目的地決定之後的每一步，現在都收斂成一個函式 `notify_push::push(card, dest)`：
+
+```
+goal_notify    ─┐
+approval_notify ┤
+install_notify  ├──> notify_push::push(card, dest)
+autopilot_notify┘            |
+                             v
+                    依 dest 解析該通道的 bot token
+                             |
+                             v
+                    decision_notify::deliver_outcome（等級與勿擾時段，見上節）
+                             |
+                             v
+                    channel_sender::send_with_markup / send_plain_text
+```
+
+`dest` 決定用哪一套 token，而這正是以前四份實作各自寫錯的地方：卡片送給**AI 員工**時，用的是該員工自己的 `[channels.<ch>]` token，背後還有 `reports_to` 往上繼承；卡片送給**儀表板上的真人**時，用的是部署層的私訊 bot token，並逐一嘗試到其中一支真的能觸及這個人為止。
+
+有兩件事刻意留在原本的四個模組、沒有搬進共用入口：**卡片內容**（只有各自的領域知道該怎麼寫），以及**誰有權按下按鈕**（`decision_notify::authorize_press` 加上各模組自己的送達紀錄）。推播是對外的副作用，絕不該有機會放寬誰能做決定。
+
 ### 四級階梯（escalation ladder）
 
 每個推播點都必須在程式碼裡標明級別（`NotifyLevel`），沒有預設值。新增一個推播出口時，你被強迫回答「這件事值不值得吵醒人」。

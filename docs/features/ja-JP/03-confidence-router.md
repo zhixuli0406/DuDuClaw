@@ -67,54 +67,41 @@ CJK（中国語・日本語・韓国語）ユーザーにとって微妙です�
 
 ---
 
-## マルチバックエンド推論エンジン
+## ルーターの背後にある推論エンジン
 
-ルーターの背後には、単一インターフェースで複数のバックエンドをサポートする統合推論エンジンがあります：
+どんなモデルがあり、どう選び、どう入れるかは **[53-local-models.md](53-local-models.md)** が担当します。ここではルーターが知っておくべきことだけを扱います。
 
-### バックエンドオプション
+### 出荷されているバックエンドは1つ
 
-**llama.cpp** — C++の主力エンジン。クロスプラットフォームのハードウェアアクセラレーション対応：
-- Apple Metal（macOS）
-- NVIDIA CUDA（Linux/Windows）
-- Vulkan（クロスプラットフォームGPU）
-- CPUフォールバック（任意のプラットフォーム）
+**OpenAI互換HTTP** が、実際に出荷されている唯一の `InferenceBackend` 実装です。OpenAI chat-completions API を話すものなら何にでも接続できます：llama-server、Ollama、llamafile 単一バイナリサーバー、vLLM、SGLang。設定は `inference.toml [openai_compat]` です。
 
-**mistral.rs** — Rustネイティブエンジン。高度な機能：
-- ISQ（In-Situ Quantization）：前処理なしでモデルをオンザフライ量子化
-- PagedAttention：長いコンテキストの効率的なメモリ管理
-- Speculative Decoding：小型モデルでトークンをドラフトし、メインモデルで検証
+このページがかつて列挙していたインプロセスのバックエンドは、2026-09-29 に削除されました（`wiki/reports/feature-audit-2026-09-29.md` T1-D2/D3、T3-S4/S5）：
 
-**OpenAI互換HTTP** — OpenAI chat completions APIに対応する任意のサーバーに接続：
-- Exo分散クラスター
-- llamafile単一バイナリサーバー
-- vLLM、SGLangなどのサービングフレームワーク
+- **llama.cpp**（`llama-cpp-2`）— リリースビルドは `metal`／`cuda`／`vulkan` feature を一度もコンパイルしておらず、`generate()` は "not yet fully implemented" を返すスタブでした。
+- **mistral.rs**（`mistralrs-core`、ISQ／PagedAttention／Speculative Decoding）— 同様に、出荷バイナリに組み込まれたことがありません。
+- **MLX bridge**（`mlx_lm` Python サブプロセス）— 呼び出し元ゼロ。ここで説明されていた「API 呼び出し不要のローカルリフレクション」経路はコード上に存在しませんでした。
+- **Exo 分散クラスター** — リポジトリのどこにも設定例がなく、ユーザーからは到達不能でした。`[openai_compat] base_url` を Exo のエンドポイントに向ければ同じクラスターに届きます。
 
-**MLX Bridge** — Apple Siliconユーザー向けに、`mlx_lm` を呼び出すPythonサブプロセス：
-- API呼び出し不要のローカルリフレクション
-- エージェントのパーソナリティをファインチューニングするLoRAアダプター対応
-- リフレクションをローカルで実行することでAPIトークンを節約
+`BackendType::LlamaCpp` と `MistralRs` は既存の `inference.toml` が読めるようパース可能な値として残していますが、選択すると `openai_compat` を案内する `BackendUnavailable` が返ります。
 
-### InferenceManagerステートマシン
+### InferenceManager ステートマシン
 
-システムは一つのバックエンドを選んで固定するわけではありません。InferenceManagerが自動フェイルオーバー付きの優先チェーンを維持します：
+マネージャーは自動フェイルオーバー付きの優先チェーンを維持します：
 
 ```
-優先1：Exo P2Pクラスター（複数マシンのGPUメモリをプール——235B+モデル実行可能）
-     |
-     v  （利用不可またはアンヘルシー？）
-優先2：llamafile（単一バイナリ、ゼロインストール）
+優先1：llamafile（単一バイナリ、ゼロインストール）
      |
      v  （利用不可？）
-優先3：直接バックエンド（llama.cppまたはmistral.rsをインプロセスでロード）
+優先2：直接バックエンド（インプロセスの `InferenceBackend`。今日出荷されているものは無し）
      |
      v  （ローカルGPUなし / モデルが大きすぎ？）
-優先4：OpenAI互換サーバー（外部vLLM、SGLangなど）
+優先3：OpenAI互換サーバー（llama-server、Ollama、vLLM、SGLang …）
      |
      v  （外部サーバー利用不可？）
-優先5：Cloud API（Claude——最終手段、常に利用可能）
+優先4：Cloud API（Claude——最終手段、常に利用可能）
 ```
 
-各バックエンドは定期的にヘルスチェックされます。バックエンドがアンヘルシーになった場合（クラッシュ、メモリ不足、エラー返却）、マネージャーは自動的に次の階層にフォールダウンします。バックエンドが回復すると、昇格して戻ります。
+各階層は定期的にヘルスチェックされます。アンヘルシーになった場合（クラッシュ、メモリ不足、エラー返却）、マネージャーは自動的に次の階層へ落ち、回復すれば昇格して戻ります。
 
 ---
 
@@ -180,7 +167,7 @@ llamafileは実行中か？
 | `inference_status` | ロード中のモデル、ハードウェア、メモリ使用量、バックエンド種別 |
 | `hardware_info` | GPU自動検出、VRAM、RAM、推奨設定 |
 | `route_query` | 実際に生成せずルーティング判断をプレビュー |
-| `inference_mode` | 現在のモード（exo-cluster / llamafile / direct / cloud-only） |
+| `inference_mode` | 現在のモード（llamafile / direct / openai-compat / cloud-only） |
 | `model_search` | RAM条件でフィルタしてHuggingFace＋厳選リポジトリを検索 |
 | `model_download` | `~/.duduclaw/models/` へダウンロード（レジューム＋ミラーフォールバック対応） |
 | `model_recommend` | ハードウェアに応じたモデル提案 |

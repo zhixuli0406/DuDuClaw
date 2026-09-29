@@ -4,9 +4,22 @@
 [[accounts]]
 id = "main"
 type = "api_key"
-# api_key_encrypted = "enc:aes256:..."  # Set via `duduclaw onboard`
+# The key field is written encrypted by `duduclaw onboard`. Accepted names are
+# `anthropic_api_key_enc` then `api_key_enc` (ciphertext), falling back to
+# `anthropic_api_key` / `api_key` in plaintext, which logs a warning.
+# api_key_enc = "<AES-256-GCM ciphertext>"
 monthly_budget_cents = 5000
 priority = 1
+# label = ""                 # Name shown in the dashboard
+# provider = "anthropic"     # LLM vendor id
+#
+# An OAuth subscription account instead of an API key:
+# [[accounts]]
+# id = "team-seat"
+# type = "oauth"
+# profile = "default"        # Credential directory name
+# priority = 5               # Lower number wins; oauth defaults to 5, api_key to 10
+# monthly_budget_cents = 0   # Forced to 0 for oauth — a subscription has no per-token bill
 
 [rotation]
 strategy = "priority"  # round_robin | least_cost | failover | priority
@@ -18,20 +31,293 @@ bind = "127.0.0.1"
 port = 18789
 # auto_update = true  # Pro default: true (auto-download + install + restart)
                        # CE default: false (notify only). Override with env DUDUCLAW_AUTO_UPDATE.
+# allowed_origins = []       # Extra dashboard origins; empty means loopback only
+# auth_token_enc = "<ciphertext>"  # Dashboard admin token; written encrypted
 
-[logging]
-level = "info"  # trace | debug | info | warn | error
-format = "pretty"  # pretty | json
+# Log level is NOT under `[logging]`. It used to be documented here, and
+# nothing ever read it — the dashboard reported success while the level never
+# changed (fixed 2026-09-06). The live key is `[general] log_level` below, or
+# the RUST_LOG environment variable, which wins over both.
+
+# ═══════════════════════════════════════════════════════════════════════
+# EVERY SECTION BELOW IS COMMENTED OUT AND SHOWS ITS BUILT-IN DEFAULT.
+# Copying this file verbatim changes nothing — uncomment only what you
+# want to override. Sections are ordered roughly by how often they get
+# touched: everyday settings first, specialist ones further down.
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Everyday basics ─────────────────────────────────────────
+# Which AI employee answers when none is named, how loud the log is, what
+# language replies default to.
+# [general]
+# default_agent = "dudu"       # Agent id used when a request names none
+# log_level = "warn"           # Fallback when RUST_LOG is unset
+# default_language = "zh-TW"   # Unset ⇒ follow the language the user wrote in
+# inference_mode = "hybrid"    # local | claude | hybrid — whether local models run at all
+# name = "DuDuClaw"            # Device name broadcast over mDNS on the LAN
+
+# ── Autonomous goal loop ────────────────────────────────────
+# The outer loop behind `/goal`: dispatch → judge → redispatch until done or
+# escalated. Full reference: docs/features/34-goal-loop.md, docs/guides/goal-loop.md
+# [goal_loop]
+# iteration_cap = 5            # Dispatches a complex goal gets before needs_human
+# iteration_cap_simple = 3     # Same cap for goals graded simple
+# soft_cap = 3                 # Marks diminishing returns; does not block
+# wall_clock_hours = 24        # Total elapsed-time budget per goal
+# max_concurrent = 3           # Goal tasks in flight at once
+# tick_secs = 30               # Driver poll interval
+# stalled_secs = 600           # Claimed but silent this long ⇒ redispatchable
+# progress_report_minutes = 10 # Notify (never intervene) after this much silence; 0 disables
+# resume_on_restart = "pause"  # pause | auto — what happens to in-flight goals after a restart
+# tool_streak_advisory = true  # Inject an advisory after 3/5/8 identical consecutive tool calls
+# planner_enabled = false      # Let an LLM decompose the goal into dependent sub-tasks first
+
+# ── Goal risk boundary ──────────────────────────────────────
+# Injected into every dispatch round of a goal that did not declare its own
+# `risk_boundary`. Empty or malformed falls back to the five-line built-in.
+# [goal_defaults]
+# baseline_boundary = "- 遵循當地法規。\n- 資安紅線：不得外洩秘密或憑證。"
+
+# ── Casual-request → goal detection ─────────────────────────
+# Turns "順便幫我處理一下 X" in a chat message into a goal-task SUGGESTION.
+# It never creates a task on its own. docs/features/48-goal-intent-router.md
+# [goal_intent]
+# enabled = true
+# mode = "auto"                # auto | local | reply_tag | off
+# t_goal = 65                  # Score at or above this suggests immediately
+# t_gray = 30                  # Scores in [t_gray, t_goal) go to grey-band arbitration
+# cooldown_minutes = 30        # Minimum gap between two suggestions
+# daily_cap = 20               # Suggestions per day
+# suggest_ttl_minutes = 10     # How long a suggestion menu stays valid
+
+# ── Memory engine ───────────────────────────────────────────
+# Write-time deduplication, the cross-invocation action feed, and the
+# cross-wake working state. docs/features/44-working-state.md
+# [memory]
+# novelty_gate = true                     # Reject near-duplicate semantic writes
+# recent_actions_enabled = true           # Inject the agent's own recent audited actions
+# recent_actions_count = 10               # How many to inject (capped at 50)
+# working_state_enabled = true            # Inject the authoritative working-state block
+# working_state_handoff_max_bytes = 16384 # Oversized handoffs are refused whole, never truncated
+# graph_embed_seed = false                # Add a graph-embedding seed signal to retrieval ranking
+# graph_embed_seed_top_k = 5              # Seeds taken from the top k hits
+#
+# Per-agent counterpart, a DIFFERENT key set:
+#   # agents/<id>/agent.toml
+#   [memory]
+#   decision_ttl_days = 7
+
+# ── Channel bot credentials ─────────────────────────────────
+# Flat `<platform>_<field>[_enc]` keys for the eleven channels
+# (telegram / line / discord / slack / whatsapp / feishu / googlechat /
+# teams / wecom / dingtalk / webchat). Written by the dashboard, normally
+# not hand-edited — the `_enc` variants are AES-256-GCM ciphertext.
+# A per-agent bot goes in that agent's `agent.toml [channels.<platform>]`
+# instead, which IS a nested table. docs/guides/channels-googlechat-teams.md
+# [channels]
+# discord_bot_token_enc = "<ciphertext>"
+# telegram_bot_token_enc = "<ciphertext>"
+# line_channel_token_enc = "<ciphertext>"
+# line_channel_secret_enc = "<ciphertext>"
+
+# ── Notification governance ─────────────────────────────────
+# docs/features/40-notification-governance.md
+# [notify]
+# daily_digest = false         # Daily summary notification; opt-in on purpose
+# daily_digest_at = "09:00"    # Local time HH:MM
+# quiet_hours = ""             # Global fallback "HH:MM-HH:MM"; empty ⇒ no quiet hours
+
+# ── De-identification (redaction) ───────────────────────────
+# Masks personal data on its way to a model, with a vault that authorised
+# callers can restore from. Full reference: docs/features/55-data-sources.md
+# [redaction]
+# enabled = false              # Master switch for this layer
+# profiles = []                # Rule sets to merge, e.g. ["general", "taiwan_strict", "ai_pii"]
+# vault_ttl_hours = 168        # Lifetime of a newly minted vault token (7 days)
+# purge_after_expire_days = 30 # How long an expired token is kept before permanent deletion
+# fail_mode = "closed"         # Only "closed" is accepted; "open" is a config error
+# data_file_guard = "on"       # on | read_only | off — PreToolUse guard over local data files
+#
+# [redaction.sources]
+# user_input = "off"           # off | on | selective | inherit
+# tool_results = "on"
+# system_prompt = "selective"
+# sub_agent = "inherit"
+# cron_context = "on"
+#
+# [redaction.ner]              # On-device AI detection (the `ai_pii` profile)
+# threads = 4                  # ONNX Runtime thread count
+# idle_unload_minutes = 10     # Unload the model after this long idle; 0 keeps it resident
+# min_chars = 24               # Deployment-level default for a rule's min_chars
+# max_chars = 32000            # Deployment-level default for a rule's max_chars
+# cache_entries = 256          # Scan-result cache size
+#
+# `[redaction.tool_egress]`, `[redaction.rules.<id>]` and
+# `[redaction.data_sources.<name>]` are maps; the dashboard writes them.
+
+# ── Local data files ────────────────────────────────────────
+# Extra directories `file_read` / `csv_read` / `xlsx_read` may open, on top
+# of the agent's own directory and `<home>/attachments`. Absolute paths only.
+# [files]
+# allowed_roots = []
+
+# ── Agent mailbox ───────────────────────────────────────────
+# Inbound mail can wake an agent; outbound always goes through the approval
+# broker. docs/features/47-agent-mail.md
+# [mail]
+# enabled = false              # Master switch; the MCP tools refuse while off
+# gmail_enabled = false        # Poll a connected Gmail account
+# gmail_query = "in:inbox is:unread newer_than:1d"
+# dropfolder_enabled = true    # Watch <home>/mail/inbound/*.eml
+# poll_interval_secs = 120     # Minimum 30
+# default_agent = ""           # Owning agent for arriving mail
+# auto_trigger = false         # Arrival wakes the agent; injection-flagged mail never does
+# allowed_senders = []         # Empty means no sender restriction
+# allowed_recipients = []      # Empty means no recipient restriction
+# max_body_chars = 4000        # Body length cap; hard ceiling 20000
+# outbound_ttl_secs = 86400    # How long an outbound draft waits for approval
+
+# ── Scheduled device backups ────────────────────────────────
+# [backup]
+# schedule_enabled = false             # Timed backup master switch
+# interval_hours = 24                  # Gap between backups; 0 means "use the default"
+# retention_count = 7                  # Backups kept
+# max_restore_total_bytes = 8589934592 # 8 GiB ceiling on an uploaded restore archive
+# max_restore_entry_bytes = 2147483648 # 2 GiB ceiling per file inside it
+# max_restore_entries = 200000         # File-count ceiling
+
+# ── Dashboard ───────────────────────────────────────────────
+# [dashboard]
+# local_auto_login = true      # Personal-edition auto-login on the local machine
+#                              # (this key wins over the same key under [gateway])
+# public_url = ""              # Base URL used in channel deep links; empty uses
+#                              # http://localhost:<[gateway] port>
+
+# ── Reversible tool-result context (experimental) ──────────
+# Disabled until per-task cost/quality evaluation is complete. When enabled,
+# the native tool loop stores post-redaction originals locally before showing
+# compressed previews, and exposes duduclaw_ccr_retrieve within that scope.
+# Gateway turns additionally need an explicit channel user and session; utility
+# turns without that identity do not enable CCR.
+# [ccr]
+# enabled = false
+# ttl_seconds = 1800
+# max_entries = 1000
+# min_compress_bytes = 4096
+# builtin_sources = true  # Also route DuDuClaw's own high-output read-only MCP
+#                         # tools (db_select / db_query / csv_read / xlsx_read /
+#                         # file_read / web_fetch_cached / web_extract /
+#                         # shared_wiki_read / wiki_read / memory_search /
+#                         # memory_fetch_batch). Inert while `enabled = false`,
+#                         # and a result under min_compress_bytes is untouched
+#                         # either way. Set false to route only the entries
+#                         # listed below. See
+#                         # wiki/reports/ccr-real-measurement-2026-09-29.md
+# [[ccr.allowed_sources]]
+# server = "support-mcp"  # trusted MCP registry server name
+# tool = "search_tickets" # exact tool name; add one table per allowed route
+
+# ── Admin-triggered causal candidate extraction (experimental) ──────────
+# Disabled by default. Enabling sends the exact scoped source text to the
+# specified provider using its standard API-key environment variable.
+# Only the listed tenant/ACL pairs may leave this gateway. Extracted claims
+# remain candidates until a human reviews them.
+# [causal_extraction]
+# enabled = false
+# provider = "anthropic" # anthropic | openai | gemini
+# model = "claude-sonnet-4-5"
+# allowed_scopes = [{ tenant_id = "demo", acl = "pilot" }]
+
+# ── Audit trail → causal evidence graph (zero LLM, local only) ──────────
+# When a goal task settles as rejected / needs_human, the deterministic fault
+# rule token plus that round's own tool_calls.jsonl rows are written as a
+# source artifact with ONE candidate claim against them. Nothing leaves the
+# machine and no model is called — it is a transcription, and the claim stays
+# a candidate until a human accepts it on /app/system/causal.
+# Capped at 50 claims per agent per UTC day and deduplicated on
+# (agent, cause, effect, day).
+# [causal]
+# audit_ingest = true
+
+# ── Per-agent reasoning effort (P1/WP-3) ────────────────────
+# Lives in the AGENT's own `agent.toml`, not here — effort is a per-agent (and,
+# once teams ship, a per-role) setting, so there is no global default key.
+#
+#   # <home>/agents/<id>/agent.toml
+#   [model]
+#   preferred = "claude-opus-5"
+#   effort    = "high"     # low | medium | high | xhigh | max
+#
+# Unset ⇒ every spawn is byte-identical to before: no flag is passed and the
+# provider's own default depth applies.
+#
+# The value is CLAMPED per runtime, because the CLIs do not accept the same set
+# (probed 2026-09-24):
+#
+#   claude 2.1.258   --effort <v>                        low medium high xhigh max
+#   codex 0.156.1    -c model_reasoning_effort=<v>       low medium high xhigh
+#   antigravity 1.2.10  --effort <v>                     low medium high
+#   grok 1.0.41      --reasoning-effort <v>              low medium high  (values
+#                                                        undocumented — capped
+#                                                        conservatively)
+#   gemini           (no flag exists — logged and ignored)
+#
+# So `effort = "max"` on a codex agent runs at `xhigh`, and on an antigravity or
+# grok agent at `high`. It is never dropped silently and never sent as a value
+# the CLI would reject.
+#
+# COST + CACHE: raising effort raises token spend, and changing it
+# mid-conversation invalidates the prompt cache on most models — pick a value and
+# leave it, rather than tuning it turn by turn.
 
 # ── Evolution Engine ────────────────────────────────────────
-# Per-agent overrides go in agent.toml [evolution]; these are global defaults.
+# IMPORTANT (corrected 2026-09-29): the evolution knobs are **per-agent**, and
+# this file is NOT where they live. `gvu_enabled`, `max_silence_hours`,
+# `skill_token_budget`, `max_active_skills`, `strategy`, `aee_settle_hours`
+# and the rest are read from each employee's own
+# `agents/<id>/agent.toml [evolution]` — nothing has ever read them from here,
+# so writing them below this line does nothing:
+#
+#   # agents/<id>/agent.toml
+#   [evolution]
+#   enabled = true                          # Master switch for that employee
+#   gvu_enabled = true                      # AEE playbook evolution — ON by factory default
+#   strategy = "balanced"                   # balanced / innovate / harden / repair_only
+#   gvu_cooldown_minutes = 60               # Minimum gap between rounds (cost control)
+#   aee_settle_hours = 24.0                 # Observation window before an entry settles
+#   max_silence_hours = 12.0                # Silence-breaker threshold
+#   skill_token_budget = 2500               # Token budget for skills in the system prompt
+#   max_active_skills = 5                   # Concurrent active skills
+#   skill_synthesis_threshold = 3           # Repeated domain gaps before a synthesis signal
+#   skill_synthesis_cooldown_hours = 24     # Cooldown after a gap fires
+#   skill_graduation_min_lift = 0.15        # Minimum measured lift before graduation
+#
+# Global `config.toml [evolution]` has exactly four keys, all read here:
 # [evolution]
-# gvu_enabled = true                        # Enable GVU (Generator-Verifier-Updater) loop
-# max_silence_hours = 12.0                  # Silence breaker threshold
-# max_gvu_generations = 3                   # Max attempts per GVU cycle (adaptive up to 7)
-# observation_period_hours = 24.0           # SOUL.md observation window before confirm/rollback
-# skill_token_budget = 2500                 # Max tokens for skills in system prompt
-# max_active_skills = 5                     # Max concurrent active skills per agent
+# fault_attribution = true                  # See the section directly below
+# eval_suites_root = "<home>/evals"         # AEE eval corpus root; DUDUCLAW_EVAL_SUITES_ROOT overrides
+# eval_binary = ""                          # Path to the `duduclaw` binary the AEE shells out to
+# require_causal_evidence = false           # X1 方案 2. When true, a playbook entry
+#                                           # whose signals no HUMAN-ACCEPTED causal
+#                                           # claim supports is committed as a shadow
+#                                           # candidate (stored and scored, never
+#                                           # injected) instead of entering the
+#                                           # injection pool. Needs [causal]
+#                                           # audit_ingest and a reviewer working
+#                                           # through /app/system/causal, so leave it
+#                                           # off until that queue is being worked.
+#
+# Switch reference: docs/guides/evolution-switches.md
+
+# ── Fault attribution (P0/WP-C) ─────────────────────────────
+# Before a failed round is turned into learning signal, decide WHOSE fault it
+# was: the model, the harness, the environment, the grader — or unknown. Only
+# a model-attributed failure feeds the playbook credit assignment, the shadow
+# rule scoring, and the reflexion (F2b) consolidation; every other side is
+# recorded as "no evidence" instead of blamed on the model. Global default,
+# read at settle time (no restart needed). Set to false to restore the
+# pre-1.66 behavior, in which every failed round was attributed to the model.
+# fault_attribution = true
 
 # ── Skill Auto-Synthesis (Voyager-inspired) ─────────────────
 # skill_synthesis_enabled = false           # Enable auto-synthesis from episodic memory
@@ -67,3 +353,564 @@ format = "pretty"  # pretty | json
 # evolution_toggle MCP params:
 #   stagnation_enabled, stagnation_window_seconds,
 #   stagnation_trigger_threshold, stagnation_action
+
+# ── Dispatch / acceptance judge ──────────────────────────────
+# Full reference: docs/guides/goal-loop.md
+#
+# [dispatch]
+# enabled = true             # Background dispatch engine + goal-loop driver (on since v1.59)
+# policy = "fixed_hierarchy" # fixed_hierarchy | round_robin | llm_select | role_team
+# judge = "mav"              # mav (default) | evaluator_only | external | human_only
+# judge_command = []         # argv of the external judge; required when judge = "external"
+# judge_timeout_secs = 120   # External-judge timeout, clamped to [1, 3600]
+# two_stage_judge = true     # Run the cheap first-stage evaluator before the MAV panel
+# grounding_precheck_enabled = true  # Zero-LLM evidence check before the acceptance judge
+# grounding_min_overlap_chars = 6    # Minimum shared span, counted CJK-safely
+# admission = "queue"        # queue (durable FIFO) | fail (pre-H19 hard reject)
+# queue_max_depth = 64       # Admission-queue depth per class
+# queue_item_ttl_secs = 600  # Queued ticket lifetime
+# ephemeral_max_active = 32  # Live transient sub-agent scaffolds allowed
+# personal_max_concurrent = 2        # Personal edition only; 0 means no cap
+# concurrency_lease_ttl_secs = 1800  # Crash-recovery TTL for a concurrency lease
+#
+# Verifier decorrelation (arXiv:2607.13918): a judge from the worker's own
+# model family forgives exactly what the worker got wrong. These two keys run
+# the acceptance judge (and the cheap first-stage evaluator) on a DIFFERENT
+# (runtime, model) than the worker. Global only — there is no per-agent
+# override. Both are optional; unset ⇒ the judge uses the ordinary utility
+# model ([runtime] utility_provider / utility_model), exactly as before.
+#
+# judge_provider = "gemini"              # A runtime id: claude | codex | gemini | …
+# judge_model = "gemini-3-pro-preview"   # Model id within that runtime
+#
+# Rules:
+#   * Set judge_provider whenever judge_model comes from another vendor
+#     family. A cross-family judge_model with no judge_provider is REFUSED
+#     (fail-closed) rather than guessed at — the judge then falls back to the
+#     default utility model and the drop is audited (judge_seam_degraded).
+#   * An unknown judge_provider id drops the whole override (warn, no
+#     substitution) — the judge never silently runs on a different backend.
+#   * A judge_provider whose CLI/backend isn't installed on this host also
+#     degrades to the default utility model: a routing preference can never
+#     stall an adjudication.
+#   * Read per verdict, so changes take effect with no gateway restart.
+#   * security_audit.jsonl records `model_routed` when the override moves the
+#     judge off the worker's model, and `judge_same_family` (warn-once per
+#     agent + judge model) when it does not actually decorrelate.
+
+# ── Team as employee (Team-as-Agent, P1/WP-4) ────────────────
+# One AI employee can internally split a goal round into up to four roles —
+# planner / executor / verifier / utility — each bound to its own
+# (runtime, model, effort). This global block sets the fleet-wide default;
+# an agent's own `agent.toml [team]` overrides it field-by-field (an unset
+# field falls through to this block, then to that agent's `[model] preferred`
+# for runtime/model and to no override for effort).
+#
+# Enabled by default since v1.66 — but a team still only forms when three
+# separate things agree, so an install that never writes this section behaves
+# exactly as it did before:
+#   1. The spec must validate. With no [team.roles] below, the executor and
+#      verifier both cascade onto the employee's own runtime/model, share a
+#      model family, and the decorrelation rule refuses the spec. Naming a
+#      second vendor is what turns teams on in practice.
+#   2. The gate must say Team. `auto` needs 3 of its 4 signals; an ordinary
+#      task gets Solo.
+#   3. [dispatch.team_budget] below must afford a minimal round; a task that
+#      cannot pay for one on its first round runs Solo.
+# `enabled = false` remains a real kill switch (it also beats a global `true`).
+#
+# [team]
+# enabled = true             # Master switch. false = never form a team for this fleet/agent
+# executor_fanout = 1        # Executor copies working the same sub-task (1-3, clamped)
+# gate = "auto"              # auto | always_solo | always_team — decomposability gate
+#
+# [team.roles.planner]
+# runtime = "claude"
+# model = "claude-opus-5"
+# effort = "high"
+#
+# [team.roles.executor]
+# runtime = "claude"
+# model = "claude-sonnet-4-6"
+#
+# [team.roles.verifier]
+# runtime = "gemini"          # Must not share the executor's model family (hard rule)
+# model = "gemini-3-pro-preview"
+#
+# [team.roles.utility]
+# runtime = "claude"
+# model = "claude-haiku-4-5"
+#
+# Every key above is optional and independently overridable per role; a role
+# left out entirely cascades to the employee's own runtime / `[model]
+# preferred`. Leaving BOTH executor and verifier out is what keeps an
+# unconfigured install Solo — they would then be the same model, which is not
+# an independent verifier.
+#
+# If `duduclaw eval --matrix` has written a role_model_matrix.toml into
+# <DUDUCLAW_HOME>, the composer reads it as a prior for a role whose `model`
+# is left unset: a resolved winning model on that role's own runtime is
+# preferred over the employee's `[model] preferred`. `unresolved` cells and
+# ties are ignored, and a model written above always wins over a measurement.
+
+# ── Team spawn budget (Team-as-Agent P1/WP-4) ────────────────
+# What one goal task may spend on role members, and what it gives up first
+# when it runs short. Only read when a task actually forms a team; absent or
+# malformed ⇒ the defaults shown.
+#
+# [dispatch.team_budget]
+# max_spawns_per_task = 12   # Role-member spawns one task may pay for in total (4 roles × 3 rounds).
+#                            # One round costs planner? + executors + verifier + repair?; clamped to a floor of 3.
+# max_turns_per_role = 3     # Turns one role gets inside a round (below 2 forbids the repair turn)
+# degrade_order = ["utility", "verifier_second_pass", "executor_replica"]  # Cheapest capability surrendered first
+#
+# degrade_order takes those three step names in any order; an unrecognised
+# entry is warned about and ignored, and an entirely unusable list keeps the
+# default chain rather than degrading nothing.
+
+# ── Runaway guard: dispatch rate limiting ────────────────────
+# A rolling-window circuit breaker per (path kind, AI employee). It bounds how
+# often a feedback path may re-generate work, so a loop is stopped where the
+# feedback is produced rather than by an outer iteration count.
+#
+# [dispatch_guard]
+# window_secs = 60              # Rolling window length
+# max_in_window = 20            # Budget for every path except role_team
+# role_team_max_in_window = 60  # Budget for team role-member spawns
+# cooldown_secs = 60            # How long the breaker stays open after tripping
+# max_hop_depth = 5             # Cascade hop ceiling for agent→agent delegation
+#
+# Why role_team has its own budget (Team-as-Agent P1/WP-2): forming a team
+# spawns one member per role per round. The default goal-loop shape — 3 roles ×
+# 5 rounds × 3 concurrent tasks — is already 9 spawns inside one 60 s window for
+# a single task and ~30 with three in flight, which is over max_in_window = 20
+# on arithmetic alone. Sharing one budget would make a correctly-configured team
+# look like a runaway. The bucket key is (path kind, employee), so role-member
+# spawns and an employee's own spawn_ephemeral calls never consume each other's
+# budget either. Both remain bounds: exceed role_team_max_in_window and the
+# breaker still opens.
+#
+# Related capacity key, in the [dispatch] section above:
+#
+#   ephemeral_max_active = 32   # Live transient sub-agent scaffolds allowed
+#
+# With teams enabled this needs to be at least
+# (goal_loop max_concurrent) × (goal_loop iteration_cap) × (number of roles) —
+# 45 for the defaults above. Over the cap, role spawns go to the durable
+# admission queue (queue_max_depth / queue_item_ttl_secs) and, if capacity never
+# frees inside the TTL, expire — a round then quietly runs short of a role, which
+# is much harder to diagnose after the fact than a warning at startup, so the
+# team path checks this arithmetic and reports it rather than staying silent.
+
+# ═══════════════════════════════════════════════════════════════════════
+# Specialist settings. Everything below is off, empty, or already correct
+# for a normal install — reach for it when you have a specific reason.
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Delegation authority ────────────────────────────────────
+# Who may hand work to whom. The `reports_to` tree is the authority; this
+# section only chooses how wide the lateral permission is.
+# docs/features/37-delegation-isolation.md
+# [delegation]
+# policy = "department"        # department (default) | hierarchy | open
+# allow = []                   # Explicit cross-team pairs, e.g. [["sales-bot", "ops-bot"]]
+# require_identity_token = false  # Demand a signed caller identity on every delegation
+# confidence_routing = false      # Route sub-delegations to a cheaper model tier by difficulty
+
+# ── Inter-agent protocol entry (A2A / ACP) ──────────────────
+# `trusted = true` puts the ACP client on the system-sender list, which is
+# system-level delegation scope. Leave it off unless you own that endpoint.
+# [acp]
+# trusted = false
+
+# ── MCP API keys ────────────────────────────────────────────
+# Written by the gateway when it mints a key; the table name IS the key, so
+# never paste a real one into a file you share. docs/guides/remote-mcp.md
+# [mcp_keys."mcpk_replace_with_the_real_key"]
+# client_id = "dudu"           # Which agent or external client this key belongs to
+# is_external = false          # True for keys handed to something DuDuClaw did not spawn
+# created_at = "2026-09-01T00:00:00Z"
+# scopes = ["memory:read", "memory:write", "messaging:send"]
+
+# ── Global API key (last-resort fallback) ───────────────────
+# Used when the account pool is empty. `duduclaw onboard` writes the
+# encrypted form; the plaintext key is accepted with a warning.
+# [api]
+# anthropic_api_key_enc = "<ciphertext>"
+
+# ── Utility model routing ───────────────────────────────────
+# Which backend runs DuDuClaw's own background chores (session summaries,
+# knowledge ingest, the cheap first-stage evaluator).
+# docs/features/13-multi-runtime.md
+# [runtime]
+# utility_provider = "claude"
+# utility_model = "claude-haiku-4-5"
+
+# ── OpenTelemetry export ────────────────────────────────────
+# Off until an endpoint is set; with none, the tracing layer costs nothing.
+# docs/guides/observability.md
+# [telemetry]
+# otlp_endpoint = "http://127.0.0.1:4317"  # Setting this is what turns export on
+# otlp_protocol = "grpc"       # grpc | http/protobuf (http currently warns and uses grpc)
+# service_name = "duduclaw"
+# sample_ratio = 1.0           # Head sampling, clamped to [0.0, 1.0]
+# otlp_headers = {}            # Extra gRPC metadata, e.g. an authorization header
+
+# ── Task forward model + calibration ────────────────────────
+# Predict-act-verify on the goal loop, proper scoring of those predictions,
+# and the held-out gate that decides whether a self-learned rule may be used.
+# ON by default since v1.54. docs/features/39-calibrated-forward-model.md
+# [task_forward_model]
+# enabled = true               # Master switch; false makes both hot-path hooks no-ops
+# calibration_enabled = true   # Brier/RPS scoring + Murphy decomposition
+# held_out_gate_enabled = true # Evidence-less rules start as shadow candidates
+# rule_induction = true        # Deterministic task-rule induction from repeated transitions
+# cold_start_llm = false       # Reserved; a cold bucket still costs zero LLM calls
+# min_samples = 3              # Parsed for forward compatibility; not yet load-bearing
+# mature_n = 10                # Parsed for forward compatibility; not yet load-bearing
+
+# ── Resident sensing (external data streams) ────────────────
+# Polls or subscribes to an outside feed and turns each observation into an
+# autopilot event. Off entirely by default. docs/features/41-resident-sensing.md
+# [tick]
+# enabled = false
+# allow_command_sources = false  # `command` sources need this extra grant as well
+# dns_ttl_secs = 60              # How long a vetted public address set is reused
+# preset = "conservative"        # conservative | aggressive — fills in the per-source
+#                                # knobs you did NOT write (rate cap, baseline shelf
+#                                # life) and the screener's on_unavailable default.
+#                                # Anything you spell out below always wins. Unset =
+#                                # the historical defaults shown in this block.
+#
+# [[tick.sources]]
+# id = "example-quote"         # ^[a-z0-9][a-z0-9-]{0,63}$ — also the ring-buffer key
+# kind = "http_poll"           # http_poll | websocket | command | file_tail
+# enabled = true
+# url = "https://example.invalid/quote"
+# interval_secs = 10           # Poll period; for websocket, the reconnect backoff start
+# json_fields = { price = "/data/price" }  # field name → RFC 6901 JSON Pointer
+# emit_unchanged = false       # Emit even when nothing changed
+# max_events_per_minute = 120  # Over-budget observations are dropped and counted
+# persist_every_n = 0          # 0 never writes to events.db; N stores every Nth for audit
+# baseline_max_age_secs = 3600 # Shelf life of a delta baseline; 0 never expires
+# headers = {}                 # Up to 8; values are never logged or serialised back
+# ping_interval_secs = 30      # websocket only; 0 disables the client ping
+# idle_timeout_secs = 300      # websocket only; 0 disables the idle watchdog
+
+# ── Skill auto-synthesis pipeline ───────────────────────────
+# Mines repeated capability gaps out of episodic memory and drafts a skill.
+# [skill_synthesis]
+# auto_run = false             # Master switch for the scheduler
+# dry_run = true               # Score and log only; never write to the skill bank
+# interval_hours = 24          # Gap between runs, minimum 1
+# lookback_days = 1            # How far back each run scans, maximum 30
+# target_agent = ""            # Owning agent; empty falls back to [general] default_agent
+
+# ── Odoo ERP bridge ─────────────────────────────────────────
+# Per-agent credentials override this block in `agent.toml [odoo]`.
+# docs/rfc/RFC-21-operator-guide.md
+# [odoo]
+# url = ""                     # Empty counts as "not configured"
+# db = ""
+# protocol = "jsonrpc"
+# auth_method = "api_key"
+# username = ""
+# api_key_enc = ""             # Written encrypted by the dashboard
+# poll_enabled = false         # Background change poller (off since the 2026-09 audit)
+# poll_interval_seconds = 60
+# poll_models = ["crm.lead", "sale.order"]
+# webhook_enabled = false      # Accept pushes from Odoo
+# webhook_secret_enc = ""
+# features_crm = true
+# features_sale = true
+# features_inventory = true
+# features_accounting = true
+# features_project = false
+# features_hr = false
+# unblock_models = []          # Global exemptions from the built-in safety block list
+
+# ── Native integrations (Google Workspace / GitHub) ─────────
+# Both default to false: a stored OAuth token means "an operator connected
+# this service", not "every agent may act as them". Connecting from the
+# dashboard flips the matching flag on for you.
+# The two google sub-tables are the alternatives to running your own OAuth
+# client. docs/guides/google-workspace-integration.md · docs/guides/github.md
+# [integrations]
+# google_workspace = false
+# github = false               # Gates the 5 github_* tools (off since the 2026-09 audit)
+#
+# [integrations.google_service_account]
+# key_file = "/path/to/service-account.json"
+# subject = "someone@example.com"   # The Workspace user to impersonate
+#
+# [integrations.google_apps_script]
+# url = "https://script.google.com/macros/s/.../exec"
+# secret = "secret://keychain/apps-script"   # Plaintext, ciphertext, or a secret:// reference
+
+# ── Speech to text ──────────────────────────────────────────
+# Unset ⇒ the endpoint answers 501 rather than guessing a provider.
+# Text-to-speech lives in `inference.toml [voice]`, not here.
+# docs/features/14-voice-pipeline.md
+# [voice]
+# stt_provider = "openai_compat"   # openai_compat | command
+# stt_base_url = "https://api.openai.com/v1"
+# stt_api_key_enc = "<ciphertext>"
+# stt_model = "whisper-1"
+# stt_command = "whisper-cli -f {audio}"   # Used when stt_provider = "command"
+
+# ── Telegram Mini App ───────────────────────────────────────
+# The "view details" button on an approval card. Every route 404s while off.
+# docs/features/43-telegram-miniapp.md
+# [miniapp]
+# enabled = false
+
+# ── Local Anthropic-compatible proxy ────────────────────────
+# `duduclaw proxy run` fronts the account pool. Unset ⇒ a one-off key is
+# generated and printed at startup, and dies with the process.
+# [proxy]
+# key = ""
+
+# ── Tool-call provenance policy ─────────────────────────────
+# Treats channel input as tainted and checks provenance before the named
+# tools run, so unreviewed outside text cannot drive a high-risk call.
+# [provenance]
+# policy = "off"               # off | warn | enforce; an unknown value is treated as off
+# sensitive_tools = []         # e.g. ["send_to_agent", "shared_wiki_write"]
+
+# ── Decision Lab kill switch ────────────────────────────────
+# The decision-twin line is exploratory: its own spec says so, and it has
+# not run against real operator data. It stays mounted by default; set this
+# to false and every `/api/decision/*` route answers 404 after a restart.
+# Sunset review 2026-12-31 — docs/todo/TODO-reversible-context-causal-simulation.md
+# [decision]
+# enabled = true
+#
+# ── Task board as a real pilot source (X1 方案 1) ──────────
+# Off by default. When on, the gateway exports the last `task_board_horizon_days`
+# complete UTC days of `tasks.db` as a pilot and feeds it to the SAME operator
+# import path a manual upload uses, every `task_board_shadow_every_hours`.
+# Honest limits, repeated in every receipt: `staffing[].agents` is the agent's
+# `agent.toml [heartbeat] max_concurrent_runs` (a static proxy, not a measured
+# roster) and the staffing cost axis is 0 (the board has no payroll).
+# docs/spec/support-decision-twin.md — "First real data source".
+# task_board_shadow = false
+# task_board_shadow_every_hours = 24
+# task_board_retention_days = 90   # how long the exported ticket bytes are kept
+# task_board_horizon_days = 14     # 14 is the SLA holdout's own floor
+# task_board_queue = "all"         # an agent id, or "all" for the whole board
+
+# ── Belief loop ─────────────────────────────────────────────
+# Structured, settled predictions about the outside world.
+# docs/features/46-belief-loop.md
+# [belief]
+# flat_band_pct = 0.3          # Moves inside this percentage band count as "flat"
+# tick_subject_map = {}        # tick field name → belief subject, when the zXXXX→XXXX
+#                              # naming convention does not apply
+
+# ── Document / archive limits ───────────────────────────────
+# Applied before any office or archive parser sees an attachment. `0` means
+# "use the default", never "unlimited" — this floor cannot be switched off.
+# [limits]
+# max_uncompressed_bytes = 268435456  # 256 MiB total after decompression
+# max_entries = 4096                  # Entries inside one archive
+# max_compression_ratio = 100         # Per-entry compression ratio ceiling
+# max_xml_depth = 128                 # XML nesting depth
+# xml_scan_part_bytes = 8388608       # 8 MiB per XML part
+# xml_scan_total_bytes = 67108864     # 64 MiB across the document
+
+# ── Human takeover ──────────────────────────────────────────
+# A human manager speaking in a thread silences the AI for a while.
+# docs/features/42-human-takeover.md
+# [takeover]
+# enabled = false
+# duration_minutes = 60        # Silence window after a manager speaks
+# max_duration_minutes = 720   # Hard ceiling on a /takeover extension
+
+# ── Daily skill-gap digest ──────────────────────────────────
+# One notification a day summarising the capabilities agents reached for and
+# did not have. (An agent's own `agent.toml [skills] recommended` is a
+# different, unrelated key.)
+# [skills]
+# gap_digest_enabled = false
+
+# ── Skill curator ───────────────────────────────────────────
+# Periodic sweep for stale / archived / restartable skills, with its own
+# internal 24h guard.
+# [skill_curator]
+# enabled = true
+
+# ── Autopilot rule induction (programming by demonstration) ──
+# Watches for a repeated manual pattern and PROPOSES an autopilot rule.
+# Approval is always human. Unrelated to `[task_forward_model] rule_induction`.
+# [rule_induction]
+# enabled = false
+# lookback_days = 7            # How far back events.db is scanned
+# min_occurrences = 5          # Repeats needed before a proposal
+# correlation_window_secs = 600  # How soon a reaction still counts as a response
+# max_candidates_per_agent_per_day = 2
+# approval_ttl_secs = 86400    # An expired approval request counts as a refusal
+
+# ── Trajectory guard ────────────────────────────────────────
+# Zero-LLM anomaly detection over a running agent's tool trajectory. It
+# observes by default; `intervene` is what lets it act.
+# [trajectory_guard]
+# enabled = true
+# intervene = false            # Allow it to trip the existing circuit breaker
+# repeat_window = 8            # Window of recent tool invocations examined
+# repeat_threshold = 4         # Identical (tool, input) count that trips it
+# max_depth = 6                # Nesting depth of unfinished tool calls
+# cost_baseline_per_min = 5000.0
+# cost_slope_multiplier = 5.0  # Observed slope over this multiple of baseline trips
+# stall_window = 12
+# stall_min_steps = 8
+# stall_readonly_ratio = 0.85  # Read-only share that reads as a stall
+
+# ── Foresight (early failure warning) ───────────────────────
+# Scores the first stretch of a run for repeat rate, tool-error density,
+# spend slope and todo stagnation. Warns; never intervenes.
+# [foresight]
+# enabled = true
+# prefix_steps = 20            # Tool invocations/results observed
+# warning_threshold = 45.0
+# critical_threshold = 75.0    # Also written to events.db for autopilot
+# cost_baseline_per_min = 5000.0
+# history_window_hours = 24    # Recent-failure lookback that biases the thresholds
+# history_bias_per_failure = 2.0
+# history_bias_max = 10.0
+
+# ── Topology evolution ──────────────────────────────────────
+# Proposes reassigning a task class to a better-performing sibling agent,
+# from evidence. Always human-approved. docs/guides/topology-evolution.md
+# [topology_evolution]
+# enabled = false
+# lookback_days = 14
+# min_samples = 5              # Samples needed per (agent, task class)
+# reject_rate_threshold = 0.6  # Rejection rate that justifies a proposal
+# observe_hours = 24           # Post-approval observation; auto-rollback if no better
+# proposal_cooldown_days = 7
+# tick_secs = 3600
+# approval_ttl_secs = 86400
+
+# ── Knowledge flood guard ───────────────────────────────────
+# Quarantines a burst of same-subject facts from one source for review.
+# docs/features/20-memory-intelligence.md
+# [knowledge_guard]
+# enabled = true
+# window_secs = 3600
+# max_per_subject = 5          # Facts per subject per window before quarantine
+
+# ── Task board ──────────────────────────────────────────────
+# [task_board]
+# review_wip_limit = 10        # Amber warning on the review column past this
+
+# ── Embedded web chat widget ────────────────────────────────
+# Anonymous visitors on a public page. Fail-closed: without a long enough
+# key the widget refuses every connection.
+# [webchat]
+# public_widget = false
+# widget_key = ""              # At least 16 characters
+
+# ── Identity resolution ─────────────────────────────────────
+# Where the `<sender>` block and `identity_resolve` look people up.
+# Any missing required field silently falls back to the wiki cache.
+# docs/rfc/RFC-21-operator-guide.md
+# [identity]
+# provider = "wiki_cache"      # wiki_cache | notion | chained
+#
+# [identity.notion]
+# database_id = ""
+# api_key_enc = ""
+# refresh_seconds = 900
+#
+# [identity.notion.field_map]
+# name = "Name"
+# roles = "Roles"
+# projects = "Projects"
+# emails = "Email"
+# projects_kind = "multi_select"   # multi_select | relation
+
+# ── Secret manager ──────────────────────────────────────────
+# Backend behind `secret://<backend>/<name>` references.
+# docs/guides/mcp-bridge.md
+# [secret_manager]
+# backend = "local"            # local | vault | env
+# vault_addr = ""
+# vault_token_enc = ""
+# vault_mount = "secret"
+# onepassword_host = ""
+# onepassword_token_enc = ""
+# onepassword_vault = ""
+# infisical_addr = "https://app.infisical.com"
+# infisical_token_enc = ""
+# infisical_project_id = ""
+# infisical_environment = "prod"
+
+# ── Code security audit ─────────────────────────────────────
+# One of the few things here that is ON by default.
+# docs/features/49-code-security-audit.md
+# [secaudit]
+# scheduled_scan = true
+# scan_paths = []              # Empty lets the OS scheduler decide the scope
+# profile = "quick"            # quick | deep
+# rules_dir = ""               # Extra semgrep rules; empty uses the built-ins
+
+# ── Office delivery gate ────────────────────────────────────
+# Structural check on a generated document before it is delivered.
+# [office]
+# delivery_gate = true
+# delivery_gate_placeholder_block = false  # Escalate leftover placeholders from warn to block
+
+# ── Co-drive (shared desktop control) ───────────────────────
+# [codrive]
+# socket_path = ""             # Empty uses $XDG_RUNTIME_DIR/duduclaw-codrive.sock
+# token_path = ""              # Empty uses the matching .token next to it
+# connect_timeout_secs = 5
+# approval_ttl_secs = 3600     # Approval request lifetime for a high-risk step
+# max_session_secs = 600       # Wall-clock ceiling for one script
+# plan_approval = false        # Approve the whole script up front
+
+# ── LAN gateway discovery (mDNS) ────────────────────────────
+# The advertised name comes from `[general] name`, not from here.
+# docs/guides/deployment-guide.md
+# [server]
+# mdns_advertise = false       # DUDUCLAW_MDNS_ADVERTISE overrides this
+# tls = false                  # TXT-record hint only; the gateway itself serves HTTP
+
+# ── Cloud relay (appliance) ─────────────────────────────────
+# Lets a device behind NAT be found and reached. Appliance images default
+# this on; every other install defaults it off.
+# [relay]
+# enabled = false
+# url = ""                     # Appliance default: https://relay.duduclaw.io
+# device_name = ""             # Shown on the relay's find page
+
+# ── DuDuClaw OS image updates (appliance only) ──────────────
+# The A/B firmware channel — unrelated to `[gateway] auto_update`, which
+# updates the DuDuClaw software itself.
+# [os_update]
+# source_url = ""              # Empty means no update source is configured
+# staging_dir = ""             # Empty uses <home>/updates
+
+# ── Night engine: LLM permission (global half) ──────────────
+# The idle-hours background pass has TWO switches and needs both. This one is
+# the operator's budget decision: may the LLM-backed sub-passes (N1 sleep-time
+# compute, N2 proactive prefetch) make real model calls at all? The per-agent
+# half lives in agents/<id>/agent.toml [night_engine] and decides which
+# employees run a pass and what their spend caps are.
+# Absent, false, or a non-bool value all mean disabled — this knob can only
+# ever turn the feature ON. The deterministic sub-passes (N3 schema induction,
+# N4 recurrence-gated consolidation) never call a model and are unaffected.
+# docs/features/58-night-engine.md
+# [night]
+# llm_enabled = false          # Default. N1/N2 no-op with a log line while off
+
+# ── Sections that live somewhere else ───────────────────────
+# Do not put these in this file; they are read from another one:
+#   [container]     agents/<id>/agent.toml — sandbox timeout, mounts, network
+#   [os_watch]      agents/<id>/agent.toml — filesystem paths that agent watches
+#   [night_engine]  agents/<id>/agent.toml — that agent's idle-hours background passes
+#   [capabilities]  agents/<id>/agent.toml — tool allow/deny, autonomy level, grants
+#   [model]         agents/<id>/agent.toml — that agent's model, effort, account pool
+#   [router]        inference.toml — local-inference cascade routing
+#   [voice] TTS     inference.toml — text-to-speech; only STT lives in this file
+#   [branding]      ~/.duduclaw/branding.json, written by the dashboard only

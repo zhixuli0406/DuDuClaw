@@ -44,7 +44,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | 多 LLM 容錯切換 | 手動重啟 | 4 種輪替策略 + 跨供應商 failover |
 | 換 LLM 時保留上下文 | 遺失 | 完整保留 |
 | 對話記憶與知識庫 | 單次 session | SQLite 時態記憶 + 分層 wiki + 自動注入 |
-| 工具跨 LLM 共用 | 每家重寫 | 200+ MCP 工具寫一次,五種後端共用 |
+| 工具跨 LLM 共用 | 每家重寫 | 243 個 MCP 工具寫一次,五種後端共用 |
 | 安全邊界 / 稽核 / 密鑰管理 | 自己造 | 政策核心 + OS 沙箱 + AES-256-GCM 內建 |
 | 交給客戶的整台值班機 | 自己裝 Linux,更新與防竄改自己管 | DuDuClaw OS 映像:A/B 更新回滾 + 唯讀 root,插電即用;人機共用桌面,不影響日常使用 |
 
@@ -62,15 +62,17 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 5 種後端自動偵測,per-agent 設定
   ├─ Session Memory — 原生 --resume + 時態記憶 + key-fact 累積 + 分層 wiki
-  ├─ MCP Server — 200+ 工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
+  ├─ MCP Server — 243 個工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
   ├─ Evolution Engine — 預測驅動 + AEE playbook 進化(v3 預設) + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS 沙箱 + redaction vault
-  ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX
+  ├─ Inference Engine — OpenAI 相容本地伺服器(llama-server / Ollama / vLLM)/ llamafile
   ├─ Account Rotator — 多 OAuth + API Key 輪替、預算追蹤、健康檢查
   └─ Web Dashboard — React 19 SPA(32 頁),rust-embed 嵌入 binary
 ```
 
 Rust workspace 由 20 個 crate 組成:核心地基 `duduclaw-core`、服務層 `duduclaw-gateway`、統一 API 層 `duduclaw-llm`、本地推論 `duduclaw-inference`、認知記憶 `duduclaw-memory`、安全層 `duduclaw-security` 等。完整設計見 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
+本地模型的實驗性校準路由參考 Varun Kotte 的 [UCCI（arXiv:2605.18796）](https://arxiv.org/abs/2605.18796)；設定與資料準備見 [UCCI calibrated cascade](docs/features/57-ucci-calibrated-cascade.md)。
 
 同一套 gateway + dashboard 還有一種出貨形態:整台機器。[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) 是以 Yocto 建出的值班機映像,Yocto 層與映像產線放在獨立 repo,把本 repo 的 Rust workspace 以剪枝快照 vendor 進去;見下方安裝一節。
 
@@ -171,12 +173,12 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | 通訊通道 | 11 通道(Telegram / LINE / Discord + 語音 / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat),per-agent bot、熱啟停、平台原生排版、輸入中指示、長任務進度看板 | [docs/features](docs/features/README.md) |
 | Multi-Runtime | Claude / Codex / Gemini / Antigravity / OpenAI-compat 五後端,自動偵測、per-agent 設定、換後端保留上下文 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 統一 LLM API 層 | `duduclaw-llm` 用一套正規化請求覆蓋 4 種原生協定(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat),內建 8 個 OpenAI-compat preset(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 計價 registry + 跨供應商 fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP Server | 200+ 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport,對外只暴露 7 個白名單工具 | [docs/api](docs/api/README.md) |
+| MCP Server | 243 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport,對外只暴露 7 個白名單工具 | [docs/api](docs/api/README.md) |
 | 記憶系統 | SQLite 時態記憶(事實取代鏈)、HippoRAG-lite 知識圖譜檢索(Personalized PageRank)、Ebbinghaus 遺忘曲線自動封存、跨 agent 共享 wiki | [docs/features](docs/features/README.md) |
 | 自我進化 | 預測驅動(約 90% 對話零 LLM 成本)、AEE playbook 進化(v3 預設,SOUL.md 對 agent 唯讀,行為規則獨立驗證 + 條目級觀察窗回滾)、MistakeNotebook 跨回合記憶;GVU² SOUL.md 整份改寫降為選配逃生門 | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | 安全 | PolicyKernel reference monitor(零 LLM、fail-closed)、macOS Seatbelt / Linux Landlock 原生沙箱、Docker / Apple Container / WSL2 容器沙箱、secret redaction vault、CONTRACT.toml 行為契約 + 紅隊測試 | [SECURITY.md](SECURITY.md) |
 | 帳號與成本 | 多 OAuth + API Key 輪替(4 策略)、rate-limit / 帳單冷卻、成本遙測與快取效率分析、跨平台 PTY pool 驅動 OAuth 訂閱帳號 | [docs/features](docs/features/README.md) |
-| 本地推論 | llama.cpp(Metal/CUDA/Vulkan)/ mistral.rs / Exo P2P / llamafile / MLX,三層信心路由自動分流;內建 Whisper 語音辨識與向量嵌入 | [docs/features](docs/features/README.md) |
+| 本地推論 | 指向任一 OpenAI 相容本地伺服器(llama-server / Ollama / vLLM / SGLang)或 llamafile,三層信心路由自動分流;內建 Whisper 語音辨識與向量嵌入 | [docs/features](docs/features/README.md) |
 | 微調與後訓練 | 從本機對話、任務結果與審批決定建構 SFT / DPO 資料集(ShareGPT / Alpaca),送到自有 GPU 主機(SSH + LLaMA-Factory)或 Together 雲端訓練,GGUF / LoRA 匯回本地模型目錄;本機不做訓練(內顯跑不動),資料離機需明確確認 | [docs/features/53](docs/features/54-finetune.md) |
 | Live Forking | RFC-26:把進行中的任務分叉成 N 個競爭分支,各自 copy-on-write 隔離、AI judge 選勝者合併(預設關閉) | [docs/rfc](docs/rfc) |
 | 自動更新 | Dashboard 一鍵更新或背景自動更新(`auto_update = true`),SHA-256 + Ed25519 雙重驗證後原地重啟,前台分頁自動重載 | [deployment-guide.md](docs/guides/deployment-guide.md) |
@@ -247,7 +249,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | 語言 | Rust | TypeScript | Rust | Python |
 | 通道 | 11 | 25+ | 8 | 0(API)|
 | Multi-Runtime | 5 後端 | 單一 | 單一 | 多 LLM |
-| MCP Server | 200+ 工具 | 無 | 無 | 無 |
+| MCP Server | 243 個工具 | 無 | 無 | 無 |
 | 自我進化引擎 | GVU² 雙迴圈 | 無 | 無 | 無 |
 | 本地推論 | 5 後端 + 信心路由 | 無 | 無 | 無 |
 | 行為契約 | CONTRACT.toml + 紅隊 | 無 | WASM 沙箱 | 無 |
@@ -263,7 +265,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開發環境與 agent 開發
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):自訂 MCP 工具教學
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md 與 CONTRACT.toml 格式規範
-- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS 值班機(產品說明);[52-desktop-edition.md](docs/features/52-desktop-edition.md):桌面版,人機共用一台機器;硬體需求見 [hardware-requirements.md](docs/guides/hardware-requirements.md)、app 相容層見 [app-compat.md](docs/guides/app-compat.md);映像建置與發布在 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo
+- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS 值班機(產品說明);[52-desktop-edition.md](docs/features/52-desktop-edition.md):桌面版,人機共用一台機器;硬體需求見 [hardware-requirements.md](docs/guides/hardware-requirements.md);app 相容層、映像建置與發布都在 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo(相容層說明見該 repo 的 `docs/guides/app-compat.md`)
 - [CHANGELOG.md](CHANGELOG.md):版本變更紀錄
 
 <a id="license"></a>

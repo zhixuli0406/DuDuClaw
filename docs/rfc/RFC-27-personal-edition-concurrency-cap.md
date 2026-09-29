@@ -13,7 +13,7 @@ The 2026-07-16 decision (recorded in `commercial/docs/edition-split-moat-strateg
 
 Those two constraints collide only if the limit is placed on *agent count*. They do **not** collide on *resource concurrency*: capping how many goal dispatches run **simultaneously** limits resource use, never capability. A single owner rarely fires two autonomous goals at once; a team running a board of goals hits it immediately. This is the same shape as the one edition quota that already exists — `os_native_agent_quota()` returns `Some(1)` for Personal, `None` for Enterprise — "鎖 quota 不鎖能力" applied to a different resource.
 
-**What is missing today:** there is no cross-process count of simultaneously in-flight goal dispatches. The goal loop has an in-process `max_concurrent = 3` spawn-storm guard (§4), but it is (a) per-gateway-process, (b) edition-blind, and (c) a resource ceiling that applies identically to everyone. `features.toml` carries a `max_messages_per_month` field with **zero readers**. This RFC builds the missing counter.
+**What is missing today:** there is no cross-process count of simultaneously in-flight goal dispatches. The goal loop has an in-process `max_concurrent = 3` spawn-storm guard (§4), but it is (a) per-gateway-process, (b) edition-blind, and (c) a resource ceiling that applies identically to everyone. (`features.toml` used to carry a `max_messages_per_month` field with **zero readers**; it was deleted in 2026-09 along with `max_local_models` and `office_hour_hours_per_month`, all three unread.) This RFC builds the missing counter.
 
 ### 1.1 Non-goals
 

@@ -201,7 +201,11 @@ Report candidate duplicates:
 └── shared/wiki/            ← cross-agent SOPs, policies, product specs
 ```
 
-可視性は各ページの`wiki_visible_to` capabilityで制御されます——デフォルトはエージェント専用ですが、ページは共有に昇格したり、チームに制限したりできます。MCPツール：`shared_wiki_ls`、`shared_wiki_read`、`shared_wiki_write`、`shared_wiki_search`、`shared_wiki_delete`、`shared_wiki_stats`、`wiki_share`。
+可視性は各ページの`wiki_visible_to` capabilityで制御されます——デフォルトはエージェント専用ですが、ページは共有に昇格したり、チームに制限したりできます。
+
+**ツールは一式、wiki は二つ。** `wiki_ls` / `wiki_read` / `wiki_write` / `wiki_search` / `wiki_stats` / `wiki_lint` はいずれも `scope` パラメータを取ります。`"agent"`（既定 — 自分の wiki、挙動は変わりません）か `"shared"`（エージェント横断の共有 wiki）です。`wiki_share` は自分の wiki のページを共有 wiki へコピーし、`shared_wiki_delete` はエージェントローカル側に削除入口を意図的に持たないため名前をそのまま残しています。
+
+6 つの `shared_wiki_*` の綴り（`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`）は非推奨エイリアスとして引き続き使え、まったく同じハンドラに到達します。v1.68.0 で削除されます。[非推奨となった名称](../../guides/ja-JP/deprecations.md)を参照。
 
 ### ネームスペースSoTポリシー（`.scope.toml`）
 

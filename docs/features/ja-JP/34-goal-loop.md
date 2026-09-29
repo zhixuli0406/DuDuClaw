@@ -93,6 +93,19 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 | `approver` | **デフォルト。** キックオフゲートなし。人間に相談するのは`needs_human`のときだけです。 |
 | `observer` | 完全自律。`needs_human`は通知はしますが、待ちません。 |
 
+## 内部モジュール構成
+
+ドライバとそのヘルパーは `crates/duduclaw-gateway/src/goal_loop/` にまとまっています。
+
+| モジュール | 内容 |
+|---|---|
+| `goal_loop.rs` | `GoalLoopDriver` 本体——外側のループそのもの。 |
+| `goal_loop/signals.rs` | ラウンド出力を読む、LLMコストゼロの4つの抽出器:gapフィンガープリント(H4)、`(state, action)`訪問グラフ(A2)、1ラウンド内のツール連打アドバイザリ(H10)、早期打ち切り正規表現パネル(H5)。 |
+| `goal_loop/state.rs` | 構造化`<state>`ブロック(A1)、`needs_human`のクローズドな一時停止理由分類(H11)、予算枯渇時の「ベストラウンド」選択器(WP-4F)。 |
+| `goal_loop/plan.rs` | ゴール分解と「想一想」プランファーストのプランナー。 |
+
+2026-09以前は、これらはクレート直下の8つの独立モジュール(`goal_state`、`goal_visit_graph`、`goal_gap_fingerprint`、`goal_budget_best_round`、`goal_bail_detect`、`goal_tool_streak`、`goal_plan`、`pause_reason`)でした。2026-09の機能棚卸し(O8)で役割ごとに統合しています。従来の`crate::goal_*`／`crate::pause_reason`パスは1リリースのあいだre-exportとして残り、挙動・configキー・テストはいずれも変わっていません。
+
 ## ActionGuard:3値の不可逆性
 
 その上に、ツール呼び出しごとに重ねられます(`approval.rs`、Magentic-UIのActionGuardに倣ったもの):

@@ -42,7 +42,7 @@ unloggable-into.
 | Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token` (paste-back) | `~/.claude/.credentials.json` |
 | OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login` (localhost callback) | `~/.codex/auth.json` |
 | Gemini CLI | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login` (localhost callback) | `~/.gemini/oauth_creds.json` |
-| Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | text | `agy login` (localhost callback) | — |
+| Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json (v1.2.10) | Google OAuth | — |
 | Grok Build | `grok` | `x.ai/cli/install.sh` (manual) | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
 | Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | none (API key only) | `~/.qwen/.env` |
 | Kimi Code | `kimi` | npm `@moonshot-ai/kimi-code` | `-p <prompt> --output-format stream-json` | jsonl | `kimi login` (device code) | `~/.kimi-code/credentials/` |
@@ -204,6 +204,76 @@ This means a single DuDuClaw installation can orchestrate agents across multiple
 
 ---
 
+## Effort
+
+Modern reasoning models take a **depth** dial separate from the model choice: how hard to think on this one call. Every vendor spells it differently, and they do not accept the same values. DuDuClaw makes it one setting and translates.
+
+Set it on the agent:
+
+```toml
+# <home>/agents/<id>/agent.toml
+[model]
+preferred = "claude-opus-5"
+effort    = "high"          # low | medium | high | xhigh | max
+```
+
+Unset is the default, and it means *no flag is passed at all* — the spawn is byte-identical to a DuDuClaw without this feature, and the provider's own default depth applies.
+
+### Per-runtime flag mapping
+
+Probed against the installed binaries on 2026-09-24 (`research/multi-model-routing-2026-09/17-P0-cli-flag-probe.md` §4 + §6) — not inferred from docs:
+
+| Runtime | Version probed | How effort is expressed | Values the CLI accepts |
+|---|---|---|---|
+| `claude` | 2.1.258 | `--effort <v>` | `low` `medium` `high` `xhigh` `max` |
+| `codex` | 0.156.1 | `-c model_reasoning_effort=<v>` (config override, no dedicated flag) | `low` `medium` `high` `xhigh` |
+| `antigravity` (`agy`) | 1.2.10 | `--effort <v>` | `low` `medium` `high` |
+| `grok` | 1.0.41 | `--reasoning-effort <v>` (alias `--effort`) | *not enumerated by `--help`* |
+| `gemini` | — | **no flag exists** — logged at debug and ignored | — |
+| `openai_compat` | — | `reasoning_effort` in the request body | `low` `medium` `high` |
+
+### The clamp table
+
+Because the accepted sets differ, your setting is clamped **down** to what the target runtime will take. It is never dropped silently, and never sent as a value the CLI would reject:
+
+| You set | claude | codex | antigravity | grok | openai_compat | gemini |
+|---|---|---|---|---|---|---|
+| `low` | `low` | `low` | `low` | `low` | `low` | — |
+| `medium` | `medium` | `medium` | `medium` | `medium` | `medium` | — |
+| `high` | `high` | `high` | `high` | `high` | `high` | — |
+| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** | **`high`** | — |
+| `max` | `max` | **`xhigh`** | **`high`** | **`high`** | **`high`** | — |
+
+Grok is capped at `high` deliberately: its `--help` names the flag but does not list the values, so forwarding `xhigh`/`max` risks an "unexpected value" that takes the whole spawn down. `openai_compat` is capped for the same reason across its eight heterogeneous presets. Both ceilings live in one place (`duduclaw-core/src/effort.rs`) and can be raised once the values are confirmed against a live run.
+
+### Direct-API mapping
+
+The API-level path (`duduclaw-llm`) carries the same value into each vendor's native field:
+
+| Protocol | Field |
+|---|---|
+| Anthropic Messages | `output_config.effort` (GA, no beta header) |
+| OpenAI Responses | `reasoning.effort` |
+| OpenAI-compat chat/completions | `reasoning_effort` (top-level) |
+| Gemini `generateContent` | `generationConfig.thinkingConfig.thinkingLevel` — **unverified**, see below |
+
+> The Gemini key is the one mapping that is **not** confirmed. `thinkingConfig` as the container is verified (it is what the existing `thinkingBudget` uses and ships today), but the `thinkingLevel` sibling key could not be confirmed: two fetches of ai.google.dev returned truncated `GenerationConfig` references that never named it, and the Interactions API spells it `generation_config.thinking_level`, so the camelCase `generateContent` twin is an inference. It is gated behind the field being set, so an unset effort can never send it. Re-verify before relying on it.
+
+### Cost and cache
+
+Two things to know before you turn this up:
+
+- **Effort costs tokens.** It is the first quality-trading lever after the free wins (caching, prompt hygiene), and the top of the range earns its price only on genuinely hard work. Coding and long-horizon agentic tasks respond strongly; chat, classification, and high-volume routes often do fine at `low`.
+- **Changing effort mid-conversation invalidates the prompt cache** on most models — effort participates in the cached prefix. Pick a value per agent and leave it; do not tune it turn by turn.
+
+The one place effort is deliberately *not* agent-driven is the lightweight extraction path (session compression, GVU, wiki ingest), which is pinned to `medium`. Mechanical extraction should not get more expensive because a conversational agent was turned up to `max`.
+
+### PTY pool
+
+*(Removed 2026-09.)* Effort used to be part of the PTY pool's **session cache key**, so two calls wanting different efforts got two separate pooled sessions. The pool is gone; every spawn now carries its own `--effort` flag.
+
+---
+
 ## Cross-Provider Failover
 
 When a backend becomes unavailable (rate-limited, down, or erroring), the **FailoverManager** automatically switches to the next available backend:
@@ -252,6 +322,167 @@ Different providers have different pricing. The `LeastCost` rotation strategy ca
 ---
 
 ## Interaction with Other Systems
+
+### Codex non-interactive approvals (2026-09)
+
+Codex 0.156.x gates every MCP tool call behind an approval request; with
+`approval_policy=never` that request is auto-rejected, and neither
+`mcp_servers.<id>.default_tools_approval_mode` nor `projects.<cwd>.trust_level`
+changes it. `--approve-for-me` (automatic review) is the supported
+non-interactive escape hatch, and it is mutually exclusive with `-s/--sandbox`.
+Agent directories are not git repositories, so `--skip-git-repo-check` is
+always passed and stdin is closed.
+
+**One flag set per capability level** (changed 2026-09-28 — read the ReadOnly
+row before restricting an agent):
+
+| `[capabilities]` level | Codex flags | What the agent can do |
+|---|---|---|
+| ReadOnly (no write tools granted, or all denied) | `-s read-only -c approval_policy=never` | Reads and reasons. Writes are **genuinely blocked**. **Every MCP tool call is auto-rejected**, so the agent has no duduclaw tools for that run. One `warn!` per spawn says so. |
+| WorkspaceWrite (the default) | `--approve-for-me -c approval_policy=never -c sandbox_mode="workspace-write"` | Writes inside the workspace; full duduclaw MCP tool surface. |
+| FullAccess (explicit `computer_use = true`) | `--dangerously-bypass-approvals-and-sandbox` | No confinement. Explicit operator grant only. |
+
+Until 2026-09-28 ReadOnly also used `--approve-for-me` plus
+`-c sandbox_mode="read-only"`. That **failed open**: `--approve-for-me` runs its
+automatic review in a workspace-write sandbox, so the read-only declaration was
+advisory and a capability-restricted agent could still write files. It now
+carries the enforcing flag instead, and the MCP tool surface is the price. If
+you need an agent to keep its tools, grant it WorkspaceWrite — ReadOnly on Codex
+means "may not change anything", tools included.
+
+### Codex MCP credentials: `env_vars` on 0.157+, `argv` fallback below (2026-09-28)
+
+A Codex spawn registers the duduclaw MCP server through per-invocation `-c`
+config overrides, and two of the values that registration carries are secrets:
+`DUDUCLAW_MCP_API_KEY` and `DUDUCLAW_AGENT_TOKEN`.
+
+**Why the credential cannot just live in the environment.** Live-probed
+2026-09-28 and confirmed against the Codex source: Codex `env_clear()`s every
+stdio MCP server child and re-adds only an 11-name default allowlist (`HOME`,
+`PATH`, `SHELL`, `USER`, `LOGNAME`, `TERM`, `TMPDIR`, `TZ`, `LANG`, `LC_ALL`,
+`__CF_USER_TEXT_ENCODING`) plus whatever the config declares. The gateway's own
+process environment does not reach the MCP server, so `Command::env()` alone
+delivers nothing — the config channel is the only channel.
+
+**What DuDuClaw does now.** The config channel has two shapes, and the shape is
+chosen per Codex binary from the version that binary reports:
+
+| Codex version | Credential shape | Visible in `ps` |
+|---|---|---|
+| **≥ 0.157.0** | `-c mcp_servers.duduclaw.env_vars=["DUDUCLAW_MCP_API_KEY", "DUDUCLAW_AGENT_TOKEN"]`, with the values set on the Codex **process** environment, from which Codex copies them into the MCP child | variable **names** only |
+| **< 0.157.0**, or version unreadable | `-c mcp_servers.duduclaw.env.<K>="<value>"` (the previous behavior) | the credential **values** |
+
+Non-credential entries (`DUDUCLAW_HOME`, `DUDUCLAW_PORT`, `DUDUCLAW_AGENT_ID`,
+`DUDUCLAW_INSTANCE`) keep the `env.<K>="<value>"` form on both paths — they are
+not secrets, and keeping them in the config table means registration still works
+if the process environment is ever scrubbed. "Credential" is decided by an exact
+name suffix: `_API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD` (ASCII
+case-insensitive), the same shape convention `duduclaw-core`'s spawn-env
+allowlist enforces.
+
+**Why it is gated rather than unconditional.** `env_vars` is verified working on
+`codex-cli 0.157.1`, but the minimum version that accepts the key is
+unconfirmed, and `RawMcpServerConfig` carries `deny_unknown_fields` — on a Codex
+old enough not to know it, the run would either die at config parse (every spawn
+lost) or silently drop the credential (the agent loses every duduclaw tool with
+no error). So the gateway runs `codex --version` once per binary path per
+process, parses `codex-cli X.Y.Z`, and treats anything below `0.157.0`,
+unparseable, or unprobeable (spawn failure, non-zero exit, 5s timeout) as "no
+support" — falling back to the old `argv` shape with one `warn!`. A failed probe
+can never fail a spawn.
+
+**If you are on the fallback path** (older Codex, shared or multi-tenant host),
+the exposure is real: command-line arguments are readable by any process on the
+same host (`ps -ww`, `/proc/<pid>/cmdline`). Upgrade the Codex CLI to 0.157.1 or
+later and the credentials leave `argv` with no configuration change.
+
+**Mitigations on both paths.** The set of env keys that may reach `argv` is
+locked by tests to the known `DUDUCLAW_*` block, so a new secret cannot join it
+silently; every key is validated to be a bare TOML key before interpolation
+(including the names inside the `env_vars` array); and every value is
+TOML-quoted.
+
+### The working-directory override reaches every CLI backend (2026-09-28)
+
+A caller can ask for one spawn to run somewhere other than the agent's own
+directory. The only caller today is the team composer, which puts a role member
+in the employee's workspace so the files the member writes survive the
+throwaway scaffold being garbage-collected the moment the member finishes.
+
+Until 2026-09-28 only the Codex backend honoured that request. Gemini,
+Antigravity and Grok spawned in the agent directory regardless, so a role member
+on any of those three did its work in a directory that was deleted seconds
+later. All four now resolve the working root through one shared helper, which
+also checks the requested path is a real directory and otherwise warns and falls
+back to the agent directory rather than spawning into nowhere. The native OS
+sandbox is scoped to the same root, so an overridden root is the one that gets
+write access.
+
+The override moves the **working directory only**. Agent identity — the MCP
+server registration, the agent id the tools authenticate with, the agent's own
+configuration — stays with the agent directory.
+
+Two backend-specific consequences, stated rather than left to be discovered:
+
+- **Antigravity** pre-trusts the working root (`agy` shows an interactive
+  "trust this workspace?" prompt that would hang a headless run) and passes it
+  as `--add-dir`.
+- **Grok** resolves both its MCP registration (`.grok/config.toml`) and its
+  sandbox profile names (`.grok/sandbox.toml`) from the working directory, not
+  from the agent directory. An overridden root therefore gets its own copy of
+  both, or the member would spawn with no tools and an unresolvable sandbox
+  profile. Known limitation: those two files are keyed by directory, so two Grok
+  role members sharing one workspace overwrite each other's declared env block.
+  The command/args halves are identical between members and the per-process
+  identity is what the MCP child actually authenticates with, so the blast
+  radius is the declared block only.
+
+### Antigravity stream parsing degrades instead of failing (2026-09-28)
+
+The `agy --output-format stream-json` decoder used to be strict in six
+independent places: one unparseable line, a missing `result` event, a missing
+`response` field, or a `usage` block short one integer turned the whole run into
+an error — and an `agy` that had *already answered* was reported as a failed
+spawn, losing the role member with it.
+
+Shape mismatches now degrade; facts do not. An unparseable line is skipped. A
+missing result falls back to the last non-empty stream line as the answer. A
+missing or partial usage block yields unknown tokens rather than an invented
+zero. Each degrade logs one `warn!` naming what was missing. The one case that
+still fails hard is an explicit non-`SUCCESS` status — that is `agy` telling us
+the run failed, not a shape we failed to recognise.
+
+### Which model the fallback runtime receives (2026-09)
+
+Failing over to another runtime never forwards the original model id blindly
+(a Codex agent's `gpt-5.4` must not be handed to the Claude CLI). The
+FailoverManager resolves the fallback model in four ordered branches and
+refuses to spawn when none applies:
+
+1. the first `agent.toml [model] fallbacks` entry whose family confidently
+   belongs to the fallback runtime (qualified ids such as `openai/gpt-5.4` are
+   unqualified with the same `split_model_id` dialect the Direct-API chain uses);
+2. the original model, when it already belongs to the fallback runtime;
+3. the runtime's catalog default (`fallback_models[0]`, the same list the
+   dashboard offers when live discovery fails);
+4. otherwise the attempt is recorded as a failure with
+   `no model configured for fallback runtime <name>` — no spawn.
+
+Every substitution logs `agent / from_runtime / to_runtime / from_model /
+to_model` at `warn` level.
+
+**Judge and evaluator calls opt out of cross-family failover entirely**
+(corrected 2026-09-28). When an operator names a judge runtime or model
+(`[dispatch] judge_provider` / `judge_model`), the point of the call is *which
+family answers* — so a failed judge spawn is never rescued by substituting
+another family's model; the caller degrades explicitly and audibly instead. The
+opt-out used to trigger only when the judge hint *moved* the provider away from
+the resolved default, which quietly re-enabled substitution whenever the judge
+family and the default utility family happened to be the same (both `codex`, for
+instance — exactly where a decorrelated-judge setup ends up once Codex is also
+made the default utility runtime). Naming a family is now a request for that
+family whether or not it is also the default. Un-hinted utility calls keep
+failover unchanged.
 
 - **Account Rotator**: Manages credentials across all providers, with cross-provider failover.
 - **Confidence Router**: Sits below the runtime layer — decides local vs. cloud. The runtime layer decides *which* cloud.

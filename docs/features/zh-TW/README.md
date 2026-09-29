@@ -11,32 +11,27 @@
 | # | 文章 | 一句話摘要 |
 |---|------|-----------|
 | 1 | [預測驅動演化引擎](01-prediction-driven-evolution.md) | 90% 的對話以零 LLM 成本完成演化 |
-| 2 | [GVU² 雙迴圈自我博弈](02-gvu-self-play-loop.md) | 雙迴圈演化 + 4+2 層驗證 |
 | 3 | [信心路由器與本地推論引擎](03-confidence-router.md) | 智慧模型選擇，節省 80% 以上 API 費用 |
 | 4 | [檔案式 IPC 訊息匯流排](04-file-based-ipc.md) | 結構化跨 Agent 委派 + TaskSpec 工作流 |
-| 5 | [三階段漸進式安全防禦](05-security-defense.md) | 分層威脅過濾，成本降至最低 |
-| 6 | [SOUL.md 版本控制與回滾](06-soul-versioning.md) | 原子化人格更新與自動回滾機制 |
+| 5 | [安全防線](05-security-defense.md) | 四道現役守衛各跑在哪裡，以及它們都擋不住什麼 |
 | 7 | [多帳號輪替與跨供應商容錯](07-account-rotation.md) | 跨 Claude/Codex/Gemini 的認證資料智慧排程 |
-| 8 | [5 層瀏覽器自動化路由](08-browser-automation.md) | 逐層遞增的資源調度策略 |
+| 8 | [瀏覽器自動化與 Computer Use](08-browser-automation.md) | 三組由 agent 自行選擇的 MCP 工具，沒有自動路由器 |
 | 9 | [行為契約與紅隊測試](09-behavioral-contracts.md) | 可機器執行的 Agent 行為邊界 |
 | 10 | [認知記憶系統](10-cognitive-memory.md) | 仿人腦記憶設計，具備遺忘曲線 |
-| 11 | [Token 壓縮三刀流](11-token-compression.md) | 三種策略，以更少的 Token 承載更多內容 |
+| 11 | [Prompt 預算強制](11-token-compression.md) | 估算 prompt、走三個階段，不然就拒絕 |
 | 12 | [產業模板與 Odoo ERP 橋接](12-industry-templates.md) | 開箱即用的商業智慧 |
 | 13 | [Multi-Runtime Agent 執行](13-multi-runtime.md) | Claude / Codex / Gemini / OpenAI-compat 統一後端 |
-| 14 | [語音管線](14-voice-pipeline.md) | ASR / TTS / VAD / LiveKit — 本地優先語音智慧 |
+| 14 | [語音管線](14-voice-pipeline.md) | 兩條分開接線的 STT／TTS 路徑：fail-closed 的 HTTP 端點與寫死供應商的 Telegram handler |
 | 15 | [Skill 生命週期引擎](15-skill-lifecycle.md) | 7 階段自動化技能萃取與管理 |
 | 16 | [Session 記憶堆疊](16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |
 | 17 | [Wiki 知識分層](17-wiki-knowledge-layer.md) | L0-L3 四層信任加權知識，自動注入系統 prompt |
-| 18 | [Git Worktree L0 隔離](18-worktree-isolation.md) | 每任務獨立工作區，原子合併 |
 | 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | stdio JSON-RPC 2.0，Zed/JetBrains/Neovim 整合 |
 | 20 | [記憶智能](20-memory-intelligence.md) | 時序事實 + Reflexion 迴圈 + 批次擷取（v1.19.0） |
-| 21 | [治理層](21-governance-layer.md) | 政策註冊表 + 每 Agent 配額（duduclaw-governance） |
-| 22 | [持久化框架](22-durability-framework.md) | 冪等 / 重試 / 斷路器 / 檢查點 / DLQ |
 | 23 | [Autopilot 規則引擎](23-autopilot-engine.md) | 事件驅動自動化 + 斷路器 |
 | 24 | [任務看板與活動動態](24-task-board.md) | Agent 即隊友的任務管理 |
 | 25 | [身分解析](25-identity-resolution.md) | WikiCache / Notion / Chained 供應器（RFC-21 §1） |
 | 26 | [MCP HTTP/SSE 傳輸](26-mcp-http-sse.md) | Bearer 認證 REST + SSE 端點（W20） |
-| 27 | [跨平台 PTY Pool + Worker](27-pty-pool-runtime.md) | 驅動互動式 `claude` REPL（v1.15.0） |
+| 27 | [一次性 PTY 呼叫](27-pty-pool-runtime.md) | 給需要真終端機的 CLI 一個 PTY；連線池已於 2026-09 移除 |
 | 28 | [即時執行分支（Live Forking）](28-live-forking.md) | 並行分支 + AI 評審（duduclaw-fork, RFC-26） |
 | 29 | [演化事件](29-evolution-events.md) | 黑盒紀錄器，批次 + 重試遞送 |
 | 30 | [自訂儀表板小工具](30-custom-widgets.md) | AI 引導或原始 HTML 的儀表板卡片，沙箱內執行 |
@@ -65,6 +60,8 @@
 | 53 | [裝置上的本地模型](53-local-models.md) | 六個查證過的 GGUF，一鍵下載、一鍵啟用；預設 hybrid，速度誠實不灌水 |
 | 54 | [微調與後訓練](54-finetune.md) | 資料在這裡整理、訓練到別的 GPU 上跑、GGUF／LoRA 再收回來——這台機器不做訓練 |
 | 55 | [資料來源與原生資料庫連接器](55-data-sources.md) | 任何 `db_field` 規則都能指向的登錄表，讓客戶自接的外部 MCP server 也去識別化的 proxy，以及第一方的唯讀 PostgreSQL／MySQL／SQLite 連接器 |
+| 58 | [夜間引擎](58-night-engine.md) | 閒置時段的記憶整理：四個子階段（兩個確定性、兩個走輔助模型）、每 pass 花費上限與每日斷路器，兩道各自獨立的開關預設全關 |
+| 59 | [本機 proxy](59-local-proxy.md) | `duduclaw proxy`——OpenAI 相容的 localhost 端點，讓 Aider／Cline／Codex 借用帳號池；強制 Bearer、預設綁 loopback，並誠實揭露訂閱制 OAuth 席次無法轉發 |
 
 ---
 

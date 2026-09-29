@@ -71,6 +71,12 @@ Telegram/LINE/Discord/Slack，卻不想撥一台筆電專門給它用，也不�
 - **危險區**：恢復原廠設定（需要打字輸入「RESET」確認，不能只按一個按
   鈕）、重新啟動、關機，各自都有自己的確認關卡。
 
+這頁上的每一項也都有另外兩個入口：AI 員工可以當成工具呼叫，操作者也可以
+在機器自己的終端機下指令。三條路走的是同一份實作
+（`crates/duduclaw-gateway/src/os_ops.rs`），所以答案不會因為你從哪個門
+進來而不同；只有權限檢查不一樣，因為每個門認人的方式本來就不同。細節見
+[33-os-native-perception.md](33-os-native-perception.md)。
+
 ## 版本與桌面
 
 DuDuClaw OS 的每一份映像開機後都會進入 DuDuClaw 自己的桌面：一套自有的

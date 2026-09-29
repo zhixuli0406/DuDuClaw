@@ -65,6 +65,41 @@ templates/{industry}/
 
 ---
 
+## 一種包格式
+
+產業模板、專家包（一整支團隊）、職務組合（preset），是同一件事的三種形狀：一份宣告，產出已經配置好的 AI 員工。現在它們共用同一份 manifest schema 與同一個指令。
+
+`pack.toml` 用 `kind` 說明自己是哪一種：
+
+```toml
+[pack]
+schema  = 1
+id      = "clinic-team"
+kind    = "team"        # "preset" = 一份職務設定｜"team" = 一支團隊｜"template" = 單人產業板模
+tier    = "free"        # "free" | "premium"
+version = "1.0.0"
+label   = "醫美／牙醫診所"
+description = "一位前台加五位部門同事"
+
+[[pack.agents]]
+name = "clinic-assistant"
+role = "front_desk"
+```
+
+一個指令讀得懂、也裝得起全部三種：
+
+```bash
+duduclaw pack list                 # 已安裝的包、本機職務組合、內建目錄裡可裝的東西
+duduclaw pack inspect ./my-team    # 正規化後的樣子，並說明這份檔案是哪一代格式
+duduclaw pack install ./my-team    # 依 kind 分流；付費內容只在一處檢查授權
+```
+
+`kind` 決定安裝路線：職務組合寫進職務組合庫（`presets/<id>/preset.toml`，再用 `duduclaw preset bind` 綁到某位員工），團隊包與產業板模走 [features/32](32-expert-packs.md) 描述的完整安全管線。`tier` 是唯一的付費判定：以前有四段程式各自從目錄路徑推「這是不是付費內容」，現在包自己帶著 tier，只有一個判斷式讀它。
+
+**三種舊格式到 v1.68.0 都還能用。** `expert.toml`、`team.toml`、`preset.toml` 原樣讀取，磁碟上一個字都不改——付費內容樹裡的法規條文是逐字人審過的，不交給機器轉檔。`duduclaw expert install` 與 `duduclaw preset` 維持為同一條程式路徑的別名。想看舊檔在新 schema 下長什麼樣，跑 `duduclaw pack inspect <dir> --emit-canonical`：它只印出來，不寫檔。
+
+---
+
 ## Odoo ERP 橋接
 
 ### 問題
@@ -115,7 +150,12 @@ Odoo 有兩個版本：社區版（CE，開源）和企業版（EE，付費）�
 
 ### 事件同步
 
-除了執行操作，橋接還可監聽 Odoo 中的事件：
+除了執行操作，橋接還可監聽 Odoo 中的事件。兩條管道餵進同一條自動化匯流排，**兩條都預設關閉**，要自己打開：
+
+| 管道 | 開關 | 運作方式 |
+|---|---|---|
+| 輪詢 | `config.toml [odoo] poll_enabled`（預設 `false`） | 每隔 `poll_interval_seconds`（60–86400，預設 60）向 Odoo 查詢 `poll_models` 裡 `write_date` 在上一輪之後變動的記錄。 |
+| Webhook | `config.toml [odoo] webhook_enabled`（預設 `false`） | Odoo 的 automated action 帶著 `[odoo] webhook_secret` 的共用密鑰 POST 到 `POST /webhook/odoo`。 |
 
 ```
 Odoo 事件發生：
@@ -124,17 +164,25 @@ Odoo 事件發生：
   - 發票逾期
      |
      v
-事件輪詢捕捉到變更
+輪詢捕捉到變更  或  Odoo 打到 /webhook/odoo
      |
      v
-Agent 收到通知
+一則 `odoo_event` 進入自動化匯流排
      |
      v
-Agent 可採取行動：
+由你的自動化規則決定怎麼辦：
   - 通知銷售團隊新潛客
-  - 更新客戶的訂單狀態
+  - 把後續追蹤派給某個 AI 員工
   - 為逾期發票發送付款提醒
 ```
+
+規則寫法跟其他觸發事件一樣，觸發事件名稱是 `odoo_event`。除了 `event_type`／`model`／`record_id`，記錄的頂層純量欄位也會直接攤平上來，所以條件可以直接寫 `{"field": "state", "op": "eq", "value": "sale"}`。
+
+這個端點對外可達，所以行為刻意保守：
+
+- `webhook_enabled` 關著時整條路由回 **404**——預設安裝不會洩漏這個端點存在。
+- 密鑰缺漏或不符回 **401**；**密鑰設成空字串也一律拒絕**，半套設定寧可什麼都不收。
+- 輪詢要同時滿足三件事才會啟動：`poll_enabled` 打開、Odoo 連線已設定、`poll_models` 至少有一個合法模型名稱。缺任一項就完全不會起背景工作。
 
 這將 Agent 從被動的工具使用者轉變為主動的商業參與者。
 

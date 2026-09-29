@@ -145,11 +145,11 @@ enabled = true          # 自律ディスパッチエンジン（goal loop ド�
 policy = "fixed_hierarchy"  # ディスパッチポリシー（どの AI従業員がタスクを引き受けるか）。後述「ディスパッチポリシー」を参照。デフォルト fixed_hierarchy
 grounding_precheck_enabled = true  # 検収前のグラウンディング事前チェック（「グラウンディング事前チェック」を参照）。デフォルト true
 two_stage_judge = true  # 検収前に安価な一次評価を実行するか（「二段階検収判定」を参照）。デフォルト true
-judge = "mav"           # 誰が検収を判定するか（「検収ジャッジの差し替え」を参照）。mav / evaluator_only / external / human_only。デフォルト mav
+judge = "mav"           # 誰が検収を判定するか（「検収ジャッジの差し替え」を参照）。mav / external（evaluator_only / human_only は非推奨、v1.68.0 で削除）。デフォルト mav
 admission = "queue"     # エフェメラルな子エージェント（ephemeral spawn）が並行数上限に達したときの扱い、"queue" または "fail"。デフォルト queue（後述「エフェメラル spawn の受け入れキュー」を参照）
 
-[task_forward_model]    # タスク層のフォワードモデル（同名セクションを参照）。デフォルトは全体オフ
-enabled = false
+[task_forward_model]    # タスク層のフォワードモデル（同名セクションを参照）。v1.54 以降デフォルトでオン
+enabled = true
 
 [goal_loop]
 iteration_cap = 5        # 難しいゴールのディスパッチ回数のハード上限。超えると人的対応へ。デフォルト 5
@@ -263,7 +263,7 @@ AI従業員が完了を報告しタスクが検収に入ると、検収ジャッ
 
 ---
 
-## タスク層のフォワードモデル（task forward model、v1.53、デフォルトオフ）
+## タスク層のフォワードモデル（task forward model、v1.53。v1.54 以降デフォルトオン）
 
 有効にすると、goal loop は各ディスパッチの前に、過去の同種タスクの統計に基づいて「今回はおおよそどうなりそうか」（失敗しそうか、どのツールカテゴリを使いそうか）を予測します。実行後は予測と実際の観測を比較して遷移として記録し、システムは「この種のことをするとどうなりがちか」というタスク層の世界モデルを蓄積していきます。すべてのランタイム（claude / codex / gemini / openai-compat）で共通です。
 
@@ -276,7 +276,7 @@ AI従業員が完了を報告しタスクが検収に入ると、検収ジャッ
 ```toml
 # config.toml
 [task_forward_model]
-enabled = false   # デフォルトオフ。有効にすると predict-act-verify のパイプライン全体が働きます
+enabled = true    # v1.54 以降デフォルトオン。false にすると predict-act-verify のパイプライン全体が停止します
 ```
 
 ---
@@ -300,11 +300,13 @@ AI従業員が完了を報告しタスクが `review` に入った後、毎回�
 | 値 | 誰が判定するか | 使いどころ |
 |---|---|---|
 | `mav`（デフォルト） | 一次評価器 → 3方向 MAV ジャッジパネル | 一般的なケース |
-| `evaluator_only` | 一次評価器のみを実行し、`candidate_complete` は直接合格とする | コスト削減用。**検証強度は明確に弱くなります**：ツールなしの単発呼び出しだけが関門で、ジャッジパネルによる複査はありません。合格フィードバックには低コストモードである旨が自己ラベル付けされます |
 | `external` | あなた自身のプログラム（`judge_command`） | 自前の CI、ルールエンジン、あるいは2つ目のモデルをジャッジとして組み込みたい場合 |
-| `human_only` | 機械による判定はなく、すべての `review` タスクが `needs_human` へ | すべての納品に人の目を必要とする高リスクなデプロイ |
+| `evaluator_only` | 一次評価器のみを実行し、`candidate_complete` は直接合格とする | **非推奨、v1.68.0 で削除。** `mav` を使ってください。`two_stage_judge` がすでに安価な評価器を先に走らせ、完了候補のときだけパネルの費用を払います |
+| `human_only` | 機械による判定はなく、すべての `review` タスクが `needs_human` へ | **非推奨、v1.68.0 で削除。** `mav` とエージェント単位の `[capabilities] autonomy_level` / `approval_required_tools` を使ってください |
 
-不正な値が静かに有効になることはありません。gateway が警告を出し `mav`（4つの選択肢の中で最も厳しいもの）にフォールバックします。この設定は判定のたびに再読み込みされ、`two_stage_judge` と同様、変更は再起動なしで即座に反映されます。
+4つの値はすべて引き続き解析されるため、非推奨モードで運用中の環境は設定どおりに動作します。プロセスごとに警告を1回記録し、ダッシュボード経由で書き込まれた場合は `judge_mode_deprecated` の監査イベントも残ります。ダッシュボードは `mav` と `external` だけを提示しますが、保存済みの非推奨値はラベル付きで表示し、黙って切り替えることはありません。[deprecations.md](deprecations.md) を参照。
+
+不正な値が静かに有効になることはありません。gateway が警告を出し `mav`（最も厳しいもの）にフォールバックします。この設定は判定のたびに再読み込みされ、`two_stage_judge` と同様、変更は再起動なしで即座に反映されます。
 
 ### 外部ジャッジ（`external`）
 

@@ -29,7 +29,7 @@ DuDuClawのDockerイメージは `container/Dockerfile.server` で構築され�
 - `duduclaw` メインプログラム（Rust製、dashboard込み）
 - `@anthropic-ai/claude-code`、`@openai/codex`、`@google/gemini-cli`（`npm i -g` でインストール）
 - `docker.io` CLI（ホストのDocker daemonを呼び出してagent sandboxを作成するために使用）
-- （任意）Python 3.12：高度なローカル推論（MLX / LLMLingua-2、`mlx_lm` / `llmlingua` が必要）にのみ必要。Skillのセキュリティスキャンとchannel返信はすでにRustネイティブ実装で、Pythonには依存しません
+- （任意）Python 3.12：LLMLingua-2 のプロンプト圧縮（`llmlingua` が必要）にのみ必要。Skillのセキュリティスキャンとchannel返信はすでにRustネイティブ実装で、Pythonには依存しません
 
 ---
 
@@ -541,7 +541,7 @@ docker compose exec duduclaw bash
 
 # 単発コマンドの実行
 docker compose exec duduclaw duduclaw agent list
-docker compose exec duduclaw duduclaw cost summary
+docker compose exec duduclaw duduclaw doctor
 
 # Log
 docker compose logs -f duduclaw

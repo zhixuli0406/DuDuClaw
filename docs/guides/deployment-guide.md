@@ -389,13 +389,22 @@ scrape_configs:
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `duduclaw_requests_total` | Counter | Total requests by agent, channel, runtime, status |
-| `duduclaw_tokens_total` | Counter | Total tokens by agent, type (input/output/cache_read) |
-| `duduclaw_request_duration_seconds` | Histogram | Request latency by agent, runtime |
-| `duduclaw_active_sessions` | Gauge | Currently active sessions |
-| `duduclaw_channel_connected` | Gauge | Channel connection status (1/0) |
 | `duduclaw_failover_total` | Counter | Provider failover events |
-| `duduclaw_budget_remaining_cents` | Gauge | Remaining budget per account |
+| `duduclaw_goal_loop_bail_pattern_total` | Counter | Goal-loop early-bail phrases, by pattern |
+| `duduclaw_tick_events_total` / `_dropped_total` | Counter | Resident-sensing observations and drops, by source |
+| `duduclaw_prompt_compression_runs_total` | Counter | Prompt-compression stage runs, by stage |
+| `duduclaw_relay_frames_total` | Counter | Relay WebSocket frames, by channel and outcome |
+
+> **Removed in 2026-09.** `duduclaw_requests_total`, `duduclaw_tokens_total`,
+> `duduclaw_request_duration_seconds`, `duduclaw_active_sessions`,
+> `duduclaw_channel_connected` and `duduclaw_budget_remaining_cents` were
+> rendered on every scrape but never incremented by any production code path —
+> a Grafana panel built on them showed a flat zero, not an idle system. They
+> were deleted rather than left as decoration. Per-request token and cost data
+> lives in the cost-telemetry SQLite store (`cost_summary` / `cost_agents` /
+> `cost_recent` MCP tools and the dashboard's cost page); channel connection
+> state is on the dashboard's Channels page. The `pty_pool_*` and `worker_*`
+> families went with the PTY pool in the same release.
 
 ### Grafana dashboard
 
@@ -406,11 +415,10 @@ Import the following JSON into Grafana (Dashboards > Import):
   "dashboard": {
     "title": "DuDuClaw",
     "panels": [
-      {"title": "Requests/min", "type": "stat", "targets": [{"expr": "rate(duduclaw_requests_total[5m])*60"}]},
-      {"title": "Token Usage", "type": "timeseries", "targets": [{"expr": "rate(duduclaw_tokens_total[5m])*60"}]},
-      {"title": "Response Time p95", "type": "stat", "targets": [{"expr": "histogram_quantile(0.95, rate(duduclaw_request_duration_seconds_bucket[5m]))"}]},
-      {"title": "Channels", "type": "table", "targets": [{"expr": "duduclaw_channel_connected"}]},
-      {"title": "Budget", "type": "bargauge", "targets": [{"expr": "duduclaw_budget_remaining_cents"}]}
+      {"title": "Failovers/min", "type": "stat", "targets": [{"expr": "rate(duduclaw_failover_total[5m])*60"}]},
+      {"title": "Sensing events", "type": "timeseries", "targets": [{"expr": "rate(duduclaw_tick_events_total[5m])*60"}]},
+      {"title": "Sensing drops", "type": "timeseries", "targets": [{"expr": "rate(duduclaw_tick_dropped_total[5m])*60"}]},
+      {"title": "Relay frames", "type": "table", "targets": [{"expr": "duduclaw_relay_frames_total"}]}
     ]
   }
 }

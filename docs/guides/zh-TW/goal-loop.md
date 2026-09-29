@@ -145,11 +145,11 @@ enabled = true          # 啟用自主派工引擎（含 goal loop 驅動器）�
 policy = "fixed_hierarchy"  # 派工策略（選哪個 AI 員工接任務）。見下方「派工策略」。預設 fixed_hierarchy
 grounding_precheck_enabled = true  # 驗收前的證據落地預檢（見「證據落地預檢」）。預設 true
 two_stage_judge = true  # 驗收前先跑便宜的第一階段評估（見「兩段式驗收裁決」）。預設 true
-judge = "mav"           # 由誰做驗收裁決（見「換掉驗收判官」）。mav / evaluator_only / external / human_only。預設 mav
+judge = "mav"           # 由誰做驗收裁決（見「換掉驗收判官」）。mav / external（evaluator_only / human_only 已棄用，v1.68.0 移除）。預設 mav
 admission = "queue"     # 子代理（ephemeral spawn）撞並發上限時的處置，"queue" 或 "fail"。預設 queue（見下方「ephemeral spawn 准入排隊」）
 
-[task_forward_model]    # 任務層前瞻模型（見同名章節）。預設整組關閉
-enabled = false
+[task_forward_model]    # 任務層前瞻模型（見同名章節）。v1.54 起預設開啟
+enabled = true
 
 [goal_loop]
 iteration_cap = 5        # 困難目標的硬性派工上限，超過 → 轉人工。預設 5
@@ -269,7 +269,7 @@ AI 員工回報完成、任務進入驗收時，在呼叫驗收判官之前會�
 
 ---
 
-## 任務層前瞻模型（task forward model，v1.53，預設關閉）
+## 任務層前瞻模型（task forward model，v1.53；v1.54 起預設開啟）
 
 開啟後，goal loop 在每次派工前會依過往同類任務的統計先「預測」這次執行
 大概會如何（會不會失敗、大概動用哪些工具類別），執行結束後把預測與實際
@@ -292,7 +292,7 @@ AI 員工回報完成、任務進入驗收時，在呼叫驗收判官之前會�
 ```toml
 # config.toml
 [task_forward_model]
-enabled = false   # 預設關閉；開啟後整套 predict-act-verify 生效
+enabled = true    # v1.54 起預設開啟；設成 false 可整套 predict-act-verify 關掉
 ```
 
 ---
@@ -316,11 +316,13 @@ AI 員工回報完成、任務進入 `review` 之後，不是每次都直接燒�
 | 值 | 誰來裁決 | 適用情境 |
 |---|---|---|
 | `mav`（預設） | 第一階段評估器 → MAV 三面向判官團 | 一般情況 |
-| `evaluator_only` | 只跑第一階段評估器，`candidate_complete` 直接判過 | 省成本。**驗收強度明顯較弱**：只有一次無工具的便宜呼叫在把關，沒有判官團複核，通過的回饋會自我標註為低成本模式 |
 | `external` | 你自己的程式（`judge_command`） | 想接自家 CI、規則引擎、或第二個模型當判官 |
-| `human_only` | 沒有機器裁決，每個 `review` 任務都轉 `needs_human` | 高風險部署，要求每次交付都經人眼 |
+| `evaluator_only` | 只跑第一階段評估器，`candidate_complete` 直接判過 | **已棄用，v1.68.0 移除。** 改用 `mav`：`two_stage_judge` 本來就先跑便宜的評估器，只有完成候選才付判官團的錢 |
+| `human_only` | 沒有機器裁決，每個 `review` 任務都轉 `needs_human` | **已棄用，v1.68.0 移除。** 改用 `mav` ＋ 每 agent 的 `[capabilities] autonomy_level` / `approval_required_tools` |
 
-寫錯值不會靜默生效：gateway 會警告並回退 `mav`（四個選項裡驗收最嚴的一個）。這個設定每次裁決時重讀，跟 `two_stage_judge` 一樣改完即生效，不必重啟。
+四個值仍然全部解析得到，已經設定棄用模式的部署行為完全不變——只會每個行程記一次警告；若該值是從儀表板寫入的，另記一筆 `judge_mode_deprecated` 審計事件。儀表板只提供 `mav` 與 `external`，但已存的舊值會照樣顯示（標「已棄用」），不會被偷偷換掉。詳見 [deprecations.md](deprecations.md)。
+
+寫錯值不會靜默生效：gateway 會警告並回退 `mav`（驗收最嚴的一個）。這個設定每次裁決時重讀，跟 `two_stage_judge` 一樣改完即生效，不必重啟。
 
 ### 外部判官（`external`）
 

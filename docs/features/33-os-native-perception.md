@@ -81,3 +81,28 @@ Authoring an OS rule used to require knowing event names and condition JSON by h
 | Proactive gate | `[proactive] enabled = true` | off |
 
 Edition gating is a **quota lock, not a capability lock**: Personal edition allows exactly one OS-native agent; paid tiers are uncapped. No feature is removed or degraded on any edition — only the number of seats that may sense the OS at once.
+
+## Implementation
+
+Two different families share the `os_*` prefix, and they live in different
+places.
+
+The **sensing** half on this page — filesystem watching, frontmost polling,
+the footprint distiller, the proactive gate — is per-agent, event-driven
+machinery owned by `duduclaw-gateway`'s `os_events.rs` / `os_frontmost.rs` /
+`proactive_gate.rs`, plus the `duduclaw-os` crate for the platform calls.
+There is exactly one front door (the `os_watch_status` MCP tool and the OS
+page's `os.*` RPCs), so nothing is duplicated.
+
+The **device and system operations** half — status, network and Wi-Fi,
+backups, power, factory reset, OS-image update check/apply/rollback,
+display and audio — is reachable through three front doors: the `os_*` MCP
+tools an agent calls, the `duduclaw os <group> <verb>` operator CLI, and the
+dashboard's `device.*` / `network.*` RPCs. Since the 2026-09 consolidation
+those three are thin adapters over a single authority,
+`crates/duduclaw-gateway/src/os_ops.rs`: one function per capability, which
+performs the effect and returns the canonical payload. Each front door keeps
+only its own permission gate (the MCP `os:native` / admin scope, the RPC's
+admin + appliance-only checks, the CLI's operator-terminal identity), its own
+request parsing, and its own response rendering. Adding or changing a
+capability is one edit there, not three.

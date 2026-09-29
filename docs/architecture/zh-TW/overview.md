@@ -43,15 +43,13 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 
 ### 演化
 - **預測驅動引擎**：Active Inference + Dual Process Theory，約 90% 對話零 LLM 成本。可忽略／中等誤差 → 零成本；顯著誤差 → 觸發 GVU 反思；嚴重誤差 → 觸發緊急 GVU 迴圈。
-- **MetaCognition**：每 100 次預測自我校準誤差閾值一次；驅動 Adaptive Depth（3-7 輪 GVU）。
-- **GVU² 自我博弈迴圈**（Generator→Verifier→Updater）：TextGrad 回饋，4+2 層驗證（L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety）。**自 Evolution v3 起為非預設的 legacy 路徑**（`agent.toml [evolution] legacy_soul_evolution = true`）— 詳見下方 AEE。
-- **Deferred GVU**：梯度累積 + 延遲重試（最多延後 3 次、72 小時區間、相當於 9-21 次有效輪次）。
+- **MetaCognition**：每 100 次預測自我校準誤差閾值一次。
 - **MistakeNotebook**：跨迴圈的錯誤記憶，防止退化；條目現在帶有決定性的 `TrajectoryEvidence`（哪個工具／斷言失敗），使反思整併不再輕信未經查證的自陳診斷（Evolution v3）。
-- **SOUL.md 版本控制**：24 小時觀察期 + 自動回滾，寫入採原子操作（暫存檔 + rename）並附 SHA-256 指紋。此機制適用於上方的 legacy GVU 路徑；**自 Evolution v3 起 `SOUL.md` 對 Agent 預設為唯讀**（僅操作者／dashboard 可寫入）。
-- **AEE（Agentic Evolution Engine，v3 預設路徑）**：預設的演化目標已從 `SOUL.md` 換成 **playbook**：由一組體積小、可個別淘汰、基因狀結構的條目組成（category／signals／關聯 eval case），透過 Gate（決定性、保留否決權）與 Measure（計分、無否決權）的分離、champion + 持平或優於才提交（matches-or-improves）的提交閘，以及條目層級（而非整份檔案）的觀察期來演化。詳見 `evolution-engine.md` 第十二章與 `../../features/zh-TW/38-aee-playbook-evolution.md`。
+- **`SOUL.md` 對 Agent 唯讀**（Evolution v3 WP1.1，只有操作者／dashboard 可寫入）。舊的 Generator→Verifier→Updater 改寫路徑、`SOUL.md` 版本控制、24 小時觀察期與自動回滾已於 **2026-09-29（S11）移除**：既然沒有任何機制能代 Agent 寫這個檔案，它們守護的路徑本身早已不存在。
+- **AEE（Agentic Evolution Engine，唯一的演化引擎）**：演化目標不是 `SOUL.md` 而是 **playbook**：由一組體積小、可個別淘汰、基因狀結構的條目組成（category／signals／關聯 eval case），透過 Gate（決定性、保留否決權）與 Measure（計分、無否決權）的分離、champion + 持平或優於才提交（matches-or-improves）的提交閘，以及條目層級（而非整份檔案）的觀察期來演化。詳見 `evolution-engine.md` 第十二章與 `../../features/zh-TW/38-aee-playbook-evolution.md`。
 - **Agent-as-Evaluator**：獨立的 Evaluator Agent（以 Haiku 控制成本），進行對抗式驗證並輸出結構化 JSON 判定。
 - **ConversationOutcome**：零 LLM 成本的對話結果偵測（TaskType / Satisfaction / Completion），支援 zh-TW + en 雙語。
-- **外部因子**：使用者回饋、安全事件、通道指標、Odoo 商業情境、同儕 Agent 訊號，皆會餵入預測引擎與 GVU 反思。
+- **外部因子**：使用者回饋、安全事件、通道指標、Odoo 商業情境、同儕 Agent 訊號，皆會餵入預測引擎與演化回合。
 
 ### Wiki 知識層（v1.8.9）
 - **四層架構**（受 Vault-for-LLM 啟發）：L0 Identity / L1 Core / L2 Context / L3 Deep。
@@ -82,10 +80,8 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 ### 本機推理
 - **統一 `InferenceBackend` trait**（`duduclaw-inference` crate）：llama.cpp（Metal/CUDA/Vulkan/CPU）、mistral.rs（ISQ + PagedAttention + Speculative Decoding）、OpenAI 相容 HTTP（Exo/llamafile/vLLM/SGLang）。
 - **Confidence Router**：LocalFast / LocalStrong / CloudAPI 三層路由，具備 CJK 感知的 token 估算。
-- **InferenceManager**：自動切換的狀態機：Exo P2P → llamafile → Direct backend → OpenAI-compat → Cloud API。
-- **Exo P2P 叢集**（`exo_cluster.rs`）：分散式推理，可跨機器運行 235B+ 參數模型。
+- **InferenceManager**：自動切換的狀態機：llamafile → Direct backend → OpenAI-compat → Cloud API。
 - **llamafile manager**：子行程生命週期管理、健康監測、在 localhost 提供 OpenAI 相容 API。
-- **MLX bridge**：在 Apple Silicon 上以 Python 子行程呼叫 `mlx_lm`，用於本機反思 + LoRA。
 - **MCP 工具**：`model_list`、`model_load`、`model_unload`、`inference_status`、`hardware_info`、`route_query`、`inference_mode`、`llamafile_start/stop/list`、`compress_text`、`decompress_text`。
 
 ### Token 壓縮
@@ -103,17 +99,16 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 - **ONNX Embedding**：BERT WordPiece tokenizer + ONNX Runtime 向量嵌入。
 
 ### 安全性
-- **Claude Code 安全 hooks**（`.claude/hooks/`）：三階段漸進式防禦，分別是 Layer 1 決定性黑名單（<50ms）、Layer 2 混淆／外洩偵測（YELLOW 以上觸發）、Layer 3 Haiku AI 判斷（僅 RED 觸發）。
-- **威脅等級狀態機**：GREEN → YELLOW → RED，自動升級／降級（24 小時無事件 → 降 1 級）。
-- **SOUL.md 漂移偵測**（SHA-256 指紋）。
-- **Prompt injection 掃描器**（6 類規則 + XML 分隔符保護）。
+- **Claude Code PreToolUse hooks**（由 `agent_hook_installer` 逐 agent 裝進 `<agent_dir>/.claude/settings.json`）：`duduclaw hook agent-file-guard`（Rust 子命令，matcher `Write|Edit|MultiEdit|Bash`——擋正規樹外的 agent 結構檔、擋寫自己的 SOUL.md、擋跨 agent 寫入，並含 `org_field_guard` 對 `reports_to`／`department`／`name`／`[capabilities]`／`[delegation]`／`[acp]` 的欄位級凍結）與 `duduclaw hook data-file-guard`（RFC-23 §14.4，matcher `Read|Bash`，只有去識別化生效時才武裝；本質是 `Bash` 檔名啟發式而非沙箱——H10 2026-09 已取代原本在 Windows 上失效的 shell 腳本）。2026-04 的三階段 shell 腳本防禦與其 GREEN／YELLOW／RED 威脅等級狀態機已於 `ba015a48` 移除，詳見 [`docs/features/zh-TW/05-security-defense.md`](../../features/zh-TW/05-security-defense.md)。
+- **SOUL.md 漂移偵測**（SHA-256 指紋，`.soul_history/` 保留最多 10 個版本備份）。
+- **Prompt injection 掃描器**（`input_guard`，7 類規則，阻擋門檻 60，先 NFKC 正規化，英文＋zh-TW 樣式，XML 分隔符保護）。
 - **機密外洩掃描器**— 20+ 種樣式（Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/資料庫連線字串）。
 - **CONTRACT.toml**— `must_not` / `must_always` 邊界規則，自動注入 system prompt；`duduclaw test` 紅隊測試 CLI（內建 9 種情境）。
 - **統一多來源稽核日誌**：`audit.unified_log` 把 `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` 整併成統一格式（timestamp / source / event_type / agent_id / severity / summary / details），並在 Logs 頁提供篩選 chip。
 - **AES-256-GCM** 靜態加密— 逐 Agent 金鑰隔離。
 - **Ed25519 challenge-response** WebSocket 驗證。
 - **容器沙箱**（Docker / Apple Container / WSL2）— `--network=none`、tmpfs、唯讀 rootfs、512MB 上限。
-- **瀏覽器自動化**（五層自動路由）：L1 API Fetch → L2 Static Scrape → L3 Headless → L4 Sandbox Container → L5 Computer Use。透過 `CapabilitiesConfig` 預設拒絕；`bash-gate.sh` 作為 Layer 1.5，白名單放行 Playwright/Puppeteer。
+- **瀏覽器自動化與 Computer Use**——三組由 agent 自行選擇的 MCP 工具，沒有自動路由器：L1 `web_fetch_cached`（經 SSRF 閘、帶快取的 HTTP）、L2 `web_extract`（CSS 選擇器爬取）、L5 七個 `computer_*` 工具經 `computer_use_orchestrator` 驅動容器虛擬顯示器。L3 headless 是可選的 per-agent Playwright／Browserbase MCP server（`.mcp.json`）。透過 `CapabilitiesConfig`（`computer_use`／`browser_via_bash`／`allowed_tools`／`denied_tools`）預設拒絕。死碼 `browser_router.rs` 的五層路由器與它的「L4 Sandbox Browser」層級已於 2026-09 移除。
 - **CJK 安全位元組切片**：`duduclaw_core::truncate_bytes` / `truncate_chars` 取代了 31 處不安全的 `s[..s.len().min(N)]` 寫法（修正 v1.8.11 的多位元組 codepoint panic）。
 
 ### 帳號與成本
@@ -157,7 +152,7 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
   - `checkpoint.rs`：可續跑的任務進度。
   - `dlq.rs`：給終局失敗訊息用的 Dead Letter Queue。
 - **`duduclaw-governance` crate**（W19-P1 M1-A）— `PolicyRegistry`（YAML + 熱重載 + 逐 Agent 優先序合併 + fail-safe + 並行 upsert 安全）、四種 `PolicyType`（Rate / Permission / Quota / Lifecycle）、`quota_manager.rs`（逐 Agent／逐政策的軟性與硬性配額）、`error_codes.rs`（QUOTA_EXCEEDED / POLICY_DENIED / ...）、審批工作流 + 稽核日誌。預設政策集在 `policies/global.yaml`。
-- **LLM fallback 鏈**（`gateway/llm_fallback.rs`）— 主模型逾時／503／429／overloaded 時自動切換到備援模型。`is_llm_fallback_error` / `should_attempt_model_fallback` 是有單元測試的純函式。以 `char_indices` 確保 UTF-8 安全截斷。
+- **LLM fallback 鏈**（`gateway/failover.rs` 的 `failover::model`）— 三層備援（帳號 → 模型 → runtime，2026-09-29 起同屬一個模組樹）的第二層：主模型逾時／503／429／overloaded 時自動切換到較輕的備援模型，帳務錯誤一律不觸發。`is_llm_fallback_error` / `should_attempt_model_fallback` 是有單元測試的純函式，派工路徑一律呼叫合併後的 `FailoverManager::model_fallback_for`。以 `char_indices` 確保 UTF-8 安全截斷。
 - **Evolution Events 系統**（`gateway/evolution_events/`）— 30+ 種事件 schema、非同步批次 + 重試發射器、查詢介面、可靠性保證。以 HTTP endpoint 暴露在 gateway 上，並顯示於 Web 的 `ReliabilityPage`。
 
 ### 記憶評測（v1.9.4 / W21）

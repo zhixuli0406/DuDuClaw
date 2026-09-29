@@ -88,6 +88,7 @@ The master switch is off by default. One example of each of the four source kind
 enabled = false                 # master switch, off by default; existing installs are untouched until enabled
 allow_command_sources = false   # global gate for command sources, fail-closed
 dns_ttl_secs = 60               # seconds a DNS answer that passed the private-network check may be reused; 0 = re-resolve every time
+# preset = "conservative"       # optional; fills in the knobs you did not write (see “Two presets instead of seven knobs” below)
 
 # ── http_poll: GET a URL on a timer ──────────────────────────
 [[tick.sources]]
@@ -146,6 +147,39 @@ Field names in `id` / `json_fields` have reserved words: they cannot be `event` 
 (those three prefixes belong to the D2 auto-derived fields below). A source that
 violates this is disabled at config-load time with a `warn` entry — it never
 drags down the whole gateway boot, and every other legal source keeps running.
+
+### Two presets instead of seven knobs
+
+Between the rate cap, the DNS TTL, the idle watchdog, the client ping, the
+baseline shelf life, `persist_every_n` and the screener's fail-open policy,
+this section asks an operator to hold more numbers in their head than most
+installs need. `preset` answers the two questions most people actually have:
+
+```toml
+[tick]
+preset = "conservative"   # or "aggressive"; omit the key for the historical defaults
+```
+
+| | `conservative` | `aggressive` | no preset (default) |
+|---|---|---|---|
+| `max_events_per_minute` | 30 | 600 | 120 |
+| `baseline_max_age_secs` | 900 (15 min) | 21600 (6 h) | 3600 (1 h) |
+| `action.screen.on_unavailable` | `drop` (fail-closed) | `pass` | `pass` |
+
+Two rules make this safe to turn on:
+
+- **A preset only fills keys you did not write.** An explicit
+  `max_events_per_minute` on a source, or an explicit `on_unavailable` on a
+  rule's `action.screen`, always wins — including when the value you wrote
+  happens to equal the old default.
+- **Omitting `preset` changes nothing.** Every default stays exactly what it
+  was, byte for byte. An unrecognised value is logged and ignored rather than
+  guessed at.
+
+`conservative` is the one to pick if the screener's fail-open default worried
+you: when the local model cannot answer, the action is suppressed instead of
+dispatched. The dashboard's 即時監控來源 card shows which preset is active
+(read-only — `config.toml` owns the setting).
 
 ### Six things to know about the websocket source
 

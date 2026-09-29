@@ -31,15 +31,25 @@ enabled = true   # master kill-switch (default: true)
 
 | トグル | デフォルト | 制御対象 |
 |---|---|---|
-| `gvu_enabled` | `false` | GVU generator→verifier→updaterループ（SOUL.mdの書き換え） |
+| `gvu_enabled` | **出荷時から `true`**（下記参照） | AEE playbook 進化ループ |
+| `strategy` | `"balanced"` | AEE のラウンド意図配分：`balanced` / `innovate` / `harden` / `repair_only` |
 | `skill_synthesis_enabled` | `false` | 繰り返し発生するドメインギャップから新しいスキルを合成する |
-| `skill_graduation_enabled` | `false` | 実績のあるスキルをグローバルスコープに昇格させる |
-| `skill_recommendation_enabled` | `false` | 新規エージェントに推奨スキルを自動有効化する |
-| `curiosity_enabled` | `false` | 活用されていない領域を能動的に探索する |
 | `skill_auto_activate` | `false` | 会話の途中で提案されたスキルを有効化する |
-| `skill_behavior_monitor_enabled` | `false` | 有効化後の行動ドリフト検知 |
 
-**`gvu_enabled`のデフォルトは`false`です（フェイルクローズなオプトイン、2026-08-06に変更。詳細は`TODO-evolution-v3-2026-08.md`のWP0.1を参照）。** `agent.toml`を書き出すすべてのscaffold／テンプレートは、値が`false`であっても明示的にこのキーを書き込みます。これにより、トグルは常に見える状態になり、「存在しないキーが黙って『オフ』を意味する」ことがありません。エージェントをオプトインさせるには`gvu_enabled = true`を設定してください。
+**`gvu_enabled` は 2026-09-29（K2）から出荷時 `true` です。** それを安全にした変更が2つあります。第一に、エンジンはもう `SOUL.md` を書き換えません——レガシー経路は同日（S11）に削除され、進化する対象は playbook（少なくとも1つの eval ケースに紐づいた、独立して引退可能な小さな行動ルール）になりました。`SOUL.md` はエージェントに対して読み取り専用のままです。第二に、1ラウンドのコストは両側から抑えられています：`gvu_cooldown_minutes` がラウンドの開始間隔を制限し、LLM コストゼロの Gate が judge 呼び出しを支払う前に見込みのない候補を却下します。
+
+値はすべての scaffold が明示的に書き込むため、トグルは `agent.toml` 上で常に見えます。既存の `agent.toml` は現状の値を保ちます（キーが無ければ `false` と読まれ、ランタイム側のフェイルクローズなゲートは変わっていません）。オプトアウトするには `gvu_enabled = false` を設定してください。
+
+同日（H3）、3つのスキル系ノブが実際に効くようになりました——それまではダッシュボードが書き込むだけで、読み手がいませんでした：
+
+| ノブ | デフォルト | 制御対象 |
+|---|---|---|
+| `max_active_skills` | `5` | 同時に有効なスキル数の上限（超過時は最も成績の悪いものを退避） |
+| `skill_synthesis_threshold` | `3` | 合成シグナルが発火するまでのドメインギャップ反復回数 |
+| `skill_synthesis_cooldown_hours` | `24` | 同一トピックで発火した後の静穏期間 |
+| `skill_graduation_min_lift` | `0.1` | 卒業候補になるための最小実測リフト |
+
+同族の8キー（`skill_graduation_enabled`、`skill_recommendation_enabled`、`skill_recommendation_threshold`、`curiosity_enabled`、`curiosity_threshold`、`curiosity_max_daily`、`skill_behavior_monitor_enabled`、`skill_behavior_drift_threshold`）は読み手が皆無だったため削除しました。既存の `agent.toml` に残っていても無害で、無視されます——それは元々の実際の挙動そのものです。
 
 ### GVUクールダウン
 
@@ -52,20 +62,11 @@ gvu_cooldown_minutes = 60   # default 60; 0 disables the cooldown
 
 クールダウンはトリガーがゲートを通過した瞬間からカウントを開始します（サイクル終了時ではありません）。結果（applied／abandoned／deferred／timed_out／skipped）にかかわらず適用されます。スロットリングの対象は成功した呼び出しだけでなく、*試行された*LLM呼び出しのコストだからです。状態はメモリ上にあり、gatewayの再起動でリセットされます。
 
-### どちらのエンジンが動くか：AEE（デフォルト）かレガシーSOUL経路か
+### どのエンジンが動くか：AEE のみ
 
-`gvu_enabled = true`のとき、実際に動作する進化エンジンは**AEE**（Agentic Evolution Engine）です。AEEはエージェントの*playbook*、つまり少なくとも1つのevalケースに紐づいた、独立して引退可能な小さな行動ルール群を進化させます。`SOUL.md`を書き換えることは一切ありません。ペルソナファイルの所有権はオペレーターにあります。
+`gvu_enabled = true`のとき、動作する進化エンジンは**AEE**（Agentic Evolution Engine）です。AEEはエージェントの*playbook*、つまり少なくとも1つのevalケースに紐づいた、独立して引退可能な小さな行動ルール群を進化させます。`SOUL.md`を書き換えることは一切ありません。ペルソナファイルの所有権はオペレーターにあります。
 
-`SOUL.md`を書き換えていた従来のGenerator→Verifier→Updaterサイクルは、エスケープハッチとして引き続き利用できます。
-
-```toml
-[evolution]
-legacy_soul_evolution = true   # default false → AEE
-```
-
-`agent.toml`が欠落または不正な形式の場合は`false`（AEE）になります。これは本ページの他のキーとは意図的に逆方向のフェイルセーフです。なぜならAEEは`SOUL.md`を書き込むことがそもそも*できない*経路であり、設定ファイルのタイプミスがその書き込み面を黙って再び開いてしまってはならないからです。
-
-両エンジンで共有される要素が2つあります。上記のクールダウンと、`SOUL.md`サイズ上限の統合ブレーカーです（上限を超えたペルソナファイルは、どちらのエンジンが動いていてもエージェントのプロンプトを凍結させます）。
+**2026-09-29（S11）に削除：`legacy_soul_evolution` エスケープハッチと、その背後にあった `SOUL.md` 全文書き換えの Generator→Verifier→Updater サイクル**、あわせて `SOUL.md` のバージョン管理、24時間の観察ウィンドウ、自動ロールバック、サイズ上限の統合ブレーカー、`duduclaw evolution finalize` CLI も削除しました。`SOUL.md` は Evolution v3（WP1.1）以降エージェントに対して読み取り専用であり、これらが守っていた書き込み経路自体がすでに存在しませんでした。既存の `agent.toml` に `legacy_soul_evolution = true` が残っていても無視され、そのエージェントは他と同じく AEE 経路を通ります。
 
 AEEのラウンドがコミットされた後、追加されたエントリは判定が確定する前に観察されます。
 
@@ -164,9 +165,9 @@ duduclaw agent unfreeze <agent-id>
 マスタースイッチの要点は、切り替えた後に何も進化していないことを証明できる点にあります。確認方法：
 
 1. エージェントに`[evolution] enabled = false`を設定する。
-2. `prediction.db`（`evolution_events` / `gvu_experiment_log`）を観察する。新しいGVU行が現れないはずです。
-3. `SOUL.md`のSHA-256フィンガープリントが変化しないはずです。
-4. 観察期間が開かれないはずです（バージョンストアに保留中のバージョンがない）。
+2. `evolution.db`（`gvu_experiment_log`）と`prediction.db`（`evolution_events`）を観察する。新しい行が現れないはずです。
+3. `SOUL.md`は変化しないはずです——もっとも2026-09-29以降、プラットフォームにはエージェントに代わってそれを書く経路自体がありません。
+4. 確定観察ウィンドウが開かれないはずです（`aee_pending_settlement` に保留行がない）。
 
 これは本プロジェクトがこの機能に対して実行している自動検証と対応しています。
 
@@ -180,7 +181,7 @@ duduclaw agent unfreeze <agent-id>
 | `config.toml [dispatch] grounding_precheck_enabled` | `true` | [goal-loop.md](../goal-loop.md) — 承認判定の前にLLMコストゼロで証拠をチェックする |
 | `config.toml [dispatch] two_stage_judge` | `true` | [goal-loop.md](../goal-loop.md) — MAV承認パネルの前に低コストな第一段階の評価器を挟む |
 | `config.toml [goal_loop] resume_on_restart` | `"pause"` | [goal-loop.md](../goal-loop.md) — gateway再起動時に進行中のゴールタスクを`needs_human`にエスカレーションする。代わりに再開させるには`"auto"`を設定。ダッシュボード：設定 → 自動化 |
-| `config.toml [task_forward_model] enabled` | `false` | [goal-loop.md](../goal-loop.md) — タスクレベルの予測・実行・検証のワールドモデル |
+| `config.toml [task_forward_model] enabled` | `true`（v1.54 以降） | [goal-loop.md](../goal-loop.md) — タスクレベルの予測・実行・検証のワールドモデル。無効にするには `false` を設定 |
 | `config.toml [goal_loop] progress_report_minutes` | `10` | [goal-loop.md](../goal-loop.md) — クレーム済みのゴールタスクがこの分数だけ進捗シグナルを示していないとき通知する（介入はしない）。`0`で無効化 |
 | `config.toml [goal_loop] tool_streak_advisory` | `true` | [goal-loop.md](../goal-loop.md) — 1ラウンド内で同一ツール呼び出しが3/5/8回連続したとき、段階的に強まるアドバイザリを注入する。LLMコストゼロで、決してブロックしない |
 | `config.toml [dispatch] admission` | `"queue"` | [goal-loop.md](../goal-loop.md) — 容量超過の一時的なサブエージェント生成は即座に失敗する代わりに永続的なFIFOキューに入る。pre-H19の即時拒否挙動に戻すには`"fail"`を設定 |

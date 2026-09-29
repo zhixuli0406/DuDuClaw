@@ -1,0 +1,99 @@
+# DuDuClaw Orchestrator Agent Example (Phase 2 GVU²)
+# Role: Task planner and delegation coordinator
+#
+# MANUAL COPY ONLY — nothing in the binary reads this directory. Unlike the
+# `templates/` subtrees (which are `include_str!`-compiled or deployed by the
+# wizard), this is a reference example you copy by hand:
+#   cp -r docs/examples/orchestrator/ ~/.duduclaw/agents/<your-orchestrator>/
+
+[agent]
+name = "orchestrator"
+display_name = "Task Orchestrator"
+role = "coordinator"
+status = "active"
+trigger = ""
+reports_to = ""  # Root agent — no supervisor
+icon = "git-branch"
+
+# Optional: choose the AI runtime backend (default: claude).
+# Providers: "claude" | "codex" | "gemini" | "antigravity" | "openai_compat".
+# "antigravity" drives Google's `agy` CLI (the 2026-06-18 successor to the
+# personal Gemini CLI; install to ~/.local/bin/agy, key via ANTIGRAVITY_API_KEY).
+# See docs/todo/TODO-antigravity-cli-migration.md.
+# [runtime]
+# provider = "antigravity"
+# fallback = "claude"
+
+[model]
+preferred = "claude-sonnet-4-6"  # Planning needs mid-tier reasoning
+fallback = "claude-haiku-4-5"
+account_pool = []  # empty = every rotator account; list account ids/labels to restrict this agent
+api_mode = "cli"
+
+[model.local]
+model = ""
+backend = "llama_cpp"
+context_length = 8192
+gpu_layers = -1
+prefer_local = false  # Planning is too complex for local
+use_router = true
+
+[container]
+timeout_ms = 120000   # 2 min — orchestration can take longer
+max_concurrent = 2
+readonly_project = true
+sandbox_enabled = false  # Orchestrator doesn't execute code
+network_access = false
+
+[heartbeat]
+enabled = true
+interval_seconds = 300   # Check every 5 min for pending tasks
+max_concurrent_runs = 1
+# `cron` is evaluated in `cron_timezone` when set, otherwise UTC.
+# Empty cron falls back to interval_seconds.
+cron = ""
+# IANA timezone for `cron`. Empty = UTC (legacy behaviour pre-v1.8.23).
+# Example: cron_timezone = "Asia/Taipei"  →  cron "0 9 * * *" fires at 09:00 Taipei.
+cron_timezone = ""
+
+[budget]
+monthly_limit_cents = 3000
+warn_threshold_percent = 80
+hard_stop = false
+
+[permissions]
+can_create_agents = true    # Can spawn worker agents
+can_send_cross_agent = true # Must delegate to workers
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = true
+allowed_channels = []       # No direct channel access — bus only
+
+[evolution]
+skill_auto_activate = true
+skill_security_scan = true
+gvu_enabled = true           # Orchestrator evolves its planning strategy
+strategy = "balanced"
+max_silence_hours = 24.0
+skill_token_budget = 1500
+max_active_skills = 3
+
+[evolution.external_factors]
+user_feedback = true
+security_events = false
+channel_metrics = false
+business_context = true     # Task outcomes matter
+peer_signals = true         # Worker performance feeds back
+
+[capabilities]
+computer_use = false
+browser_via_bash = false
+allowed_tools = []
+denied_tools = []
+
+# WP2.6 §4 — curated skills an orchestrator/team-lead agent typically wants.
+[skills]
+recommended = [
+    "anthropic-skills:skill-creator",  # author new team skills
+    "clawhub:pro-code-reviewer",       # review delegated engineering work
+]

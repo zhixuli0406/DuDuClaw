@@ -26,7 +26,7 @@ The final image ships with:
 - The `duduclaw` main binary (Rust, includes the dashboard)
 - `@anthropic-ai/claude-code`, `@openai/codex`, `@google/gemini-cli` (installed via `npm i -g`)
 - The `docker.io` CLI (used to call the host Docker daemon to create agent sandboxes)
-- (Optional) Python 3.12: only needed for advanced local inference (MLX / LLMLingua-2, requires `mlx_lm` / `llmlingua`); skill security scanning and channel replies are already Rust-native and no longer depend on Python
+- (Optional) Python 3.12: only needed for the LLMLingua-2 prompt compressor (requires `llmlingua`); skill security scanning and channel replies are already Rust-native and no longer depend on Python
 
 ---
 
@@ -516,7 +516,7 @@ docker compose exec duduclaw bash
 
 # Run a one-off command
 docker compose exec duduclaw duduclaw agent list
-docker compose exec duduclaw duduclaw cost summary
+docker compose exec duduclaw duduclaw doctor
 
 # Logs
 docker compose logs -f duduclaw

@@ -201,7 +201,11 @@ Beyond per-agent wikis, there's a shared wiki at `~/.duduclaw/shared/wiki/` for 
 └── shared/wiki/            ← cross-agent SOPs, policies, product specs
 ```
 
-Visibility is controlled via the `wiki_visible_to` capability on each page — default is agent-private, but pages can be promoted to shared or restricted to a team. MCP tools: `shared_wiki_ls`, `shared_wiki_read`, `shared_wiki_write`, `shared_wiki_search`, `shared_wiki_delete`, `shared_wiki_stats`, `wiki_share`.
+Visibility is controlled via the `wiki_visible_to` capability on each page — default is agent-private, but pages can be promoted to shared or restricted to a team.
+
+**One tool set, two wikis.** `wiki_ls` / `wiki_read` / `wiki_write` / `wiki_search` / `wiki_stats` / `wiki_lint` all take a `scope` parameter: `"agent"` (the default — your own wiki, unchanged) or `"shared"` (the cross-agent wiki). `wiki_share` copies a page from your wiki into the shared one, and `shared_wiki_delete` keeps its own name because there is deliberately no agent-local delete.
+
+The six `shared_wiki_*` spellings (`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`) still work as deprecated aliases and land on exactly the same handlers; they are removed in v1.68.0. See [deprecations](../guides/deprecations.md).
 
 ### Namespace SoT Policy (`.scope.toml`)
 

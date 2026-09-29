@@ -54,7 +54,9 @@ them.
 - **Apps** — Chromium, LibreOffice and Steam preloaded offline as Flatpaks;
   Windows desktop apps through Bottles, full Windows through a KVM virtual
   machine + RDP, Android apps through Waydroid. What is and is not promised
-  is spelled out in [the app compatibility guide](../guides/app-compat.md).
+  is spelled out in the app compatibility guide, which lives in the
+  [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo at
+  `docs/guides/app-compat.md` (moved there 2026-09-29).
 
 ## How sharing works without getting in your way
 

@@ -1,218 +1,105 @@
-# Three-Phase Security Defense
+# Security Defense
 
-> Layered threat filtering — 90% of attacks stopped at zero cost.
-
----
-
-## The Metaphor: Airport Security Screening
-
-When you go through airport security, not everyone gets the same treatment:
-
-1. **The metal detector** — everyone walks through. It catches obvious threats instantly. Zero human effort.
-2. **The X-ray machine** — your bags are scanned. An operator glances at the screen. Only flagged bags get a second look.
-3. **The private screening room** — only for passengers who triggered multiple alerts. A thorough manual inspection.
-
-DuDuClaw's security defense works exactly like this: three layers of progressively more expensive checks, where the vast majority of threats are caught before reaching the expensive layers.
+> Four live guards, where each one runs, and what none of them covers.
 
 ---
 
-## How It Works
+## A note on history
 
-### Layer 1: Deterministic Blacklist
+Until 2026-09 this page described a three-phase shell-script defense: a deterministic blacklist, an obfuscation/exfiltration scanner, and a Haiku AI judgment layer, all living in `.claude/hooks/` and orchestrated by a GREEN/YELLOW/RED threat-level state machine.
 
-The first line of defense is a simple, fast pattern matcher. It blocks known-dangerous operations instantly:
+Those scripts were deleted in commit `ba015a48` when `.claude/` was taken out of the public repository, and `.claude/` is gitignored today. Nothing in the shipped binary reads them. There is no threat-level state machine.
 
-```
-Incoming tool call or command
-     |
-     v
-Match against blacklist patterns:
-  - Destructive shell commands
-  - Direct access to sensitive files
-  - Known injection patterns
-     |
-  +--+--+
-  |     |
-Match   No match
-  |     |
-  v     v
-BLOCK   Pass to Layer 2
-```
-
-This layer runs in microseconds. No network calls, no model invocations, no ambiguity. If the pattern matches, it's blocked. Period.
-
-The blacklist covers the most common attack vectors: commands that delete data, commands that exfiltrate environment variables, and patterns that attempt to bypass file permissions.
-
-### Layer 2: Obfuscation & Exfiltration Detection
-
-Attackers who know about Layer 1 will try to work around it — encoding commands in Base64, splitting dangerous strings across multiple operations, or gradually building up a payload.
-
-Layer 2 activates when the threat level is elevated (YELLOW or higher):
-
-```
-Tool call passed Layer 1
-     |
-     v
-Current threat level >= YELLOW?
-     |
-  +--+--+
-  |     |
- Yes    No --> Pass through (Layer 2 skipped)
-  |
-  v
-Scan for obfuscation patterns:
-  - Base64-encoded command fragments
-  - Environment variable references in unusual contexts
-  - URLs that match known exfiltration endpoints
-  - Encoded characters that reassemble into dangerous commands
-     |
-  +--+--+
-  |     |
-Found   Clean
-  |     |
-  v     v
-BLOCK   Pass to Layer 3 (if RED)
-```
-
-This layer is still rule-based — no LLM call — but the rules are more sophisticated. It looks for *intent to circumvent* rather than direct dangerous commands.
-
-### Layer 3: AI Judgment
-
-The most expensive layer. Only activated at threat level RED (confirmed attack behavior):
-
-```
-Tool call passed Layers 1 and 2
-     |
-     v
-Current threat level == RED?
-     |
-  +--+--+
-  |     |
- Yes    No --> Pass through
-  |
-  v
-Send context to lightweight LLM:
-  "Given this sequence of tool calls and their context,
-   is this a legitimate operation or an attack attempt?"
-     |
-  +--+--+
-  |     |
-Attack  Legitimate
-  |     |
-  v     v
-BLOCK   Allow
-```
-
-This layer catches attacks that are semantically dangerous but syntactically innocent — things that look normal individually but form a malicious pattern when considered together.
-
-### The Threat Level State Machine
-
-The three layers are orchestrated by a threat level system:
-
-```
-GREEN (Normal)
-  |
-  | Suspicious pattern detected
-  v
-YELLOW (Elevated)
-  |
-  | Confirmed attack indicators
-  v
-RED (Active Threat)
-  |
-  | No incidents for observation period
-  v
-YELLOW --> GREEN (gradual de-escalation)
-```
-
-Key behaviors:
-- **Escalation is fast**: A single confirmed attack indicator jumps from GREEN to YELLOW immediately.
-- **De-escalation is slow**: The system waits for a quiet observation period before stepping down. This prevents attackers from triggering a block, waiting briefly, then trying again.
-- **Layer activation follows level**: At GREEN, only Layer 1 runs. At YELLOW, Layers 1+2. At RED, all three layers.
+What is actually in the product is smaller and easier to reason about: **two PreToolUse hooks** — both Rust subcommands — that the gateway installs into every agent directory, **one input scanner** on the message path, and **one field-level freeze** over the files that decide who may command whom.
 
 ---
 
-## The Non-Invasive Architecture
+## Guard 1 — `agent-file-guard` (PreToolUse, Rust)
 
-A critical design decision: **none of this modifies Claude Code itself**.
+`duduclaw hook agent-file-guard` is a real subcommand rather than a shell script, so it behaves identically on macOS, Linux and Windows. The gateway registers it in `<agent_dir>/.claude/settings.json` with the matcher `Write|Edit|MultiEdit|Bash` and re-registers it on every boot (`agent_hook_installer`), merging into whatever else the operator has configured instead of clobbering it.
 
-The entire security system is implemented as shell scripts in the `.claude/hooks/` directory. These hooks are a standard extension mechanism provided by Claude Code — they run before or after specific tool calls, receiving the tool's parameters and returning allow/deny decisions.
+It exits 2 — which Claude Code reads as "block this tool call" — when:
 
-```
-Claude Code calls a tool
-     |
-     v
-Hook system intercepts (PreToolUse)
-     |
-     v
-Security scripts run the 3-layer check
-     |
-  +--+--+
-  |     |
-Allow   Deny
-  |     |
-  v     v
-Tool    Tool call
-runs    blocked with
-        explanation
-```
+- an agent writes an **agent-structure file** (`agent.toml`, `SOUL.md`, `CLAUDE.md`, `.mcp.json`, …) outside the canonical `<home>/agents/<name>/` tree. Scaffolding a new agent has to go through the `create_agent` MCP tool, which carries the delegation-authorization gate;
+- an agent writes **its own `SOUL.md`**, even in the right place. Personality is operator-managed. The one exception is an agent that has explicitly opted in with `agent.toml [permissions] can_modify_own_soul = true`, and even then only for itself;
+- an agent touches **another agent's** files at all.
 
-This means:
-- DuDuClaw security works with any Claude Code version
-- No forking, patching, or monkey-patching required
-- The security layer can be updated independently of Claude Code
+## Guard 2 — `data-file-guard` (PreToolUse, Rust, RFC-23 §14.4)
 
----
+Guard 1 protects DuDuClaw's own structure files. This one protects the customer's data.
 
-## Specialized Protections
+`Read` and `Bash` are built-in Claude Code tools, so `cat customers.csv` never passes the MCP redaction choke point that `file_read` / `csv_read` / `xlsx_read` go through. The installer registers `duduclaw hook data-file-guard` for the matcher `Read|Bash`; the decision logic lives in `duduclaw_core::data_file_guard`, shared by the CLI subcommand and the gateway's installer tests. Same contract as Guard 1: exit 0 allows, exit 2 plus stderr blocks, and the stderr is shown to the model.
 
-Beyond the three layers, the hook system provides targeted protections:
+It stays inert unless the gateway sets `DUDUCLAW_DATA_FILE_GUARD` at spawn time, which it does only when redaction is actually active for that agent. A deployment with redaction off behaves exactly as it did before the guard existed.
 
-**Personality File Protection** — The agent's identity file is protected from unauthorized reads and writes. Only the evolution engine (running under a specific environment flag) can modify it.
+Until H10 (2026-09) this was a POSIX shell script at `<agent_dir>/.claude/hooks/data-file-guard.sh`, and it was **inert on a Windows host with no bash on `PATH`** — the hook command failed, and Claude Code reads a non-2 exit (including "command not found") as *allow*, so the guard went missing exactly where nobody would notice. The installer now deletes any leftover script on upgrade, so a stale copy cannot be mistaken for the live guard.
 
-**Secret Scanner** — All file writes are scanned for patterns that look like API keys, passwords, tokens, or other credentials. If found, the write is blocked and an alert is raised.
+**Stated limitation.** The `Bash` check matches filenames. A command that builds its path dynamically (`python -c "open(chr(99)+…)"`) walks straight past it. The real protection is the MCP tool surface; this guard lowers the odds of the model taking the ungated route. It is a heuristic, not a sandbox.
 
-**Audit Logger** — Every tool call (allowed or denied) is recorded in an append-only log file. This provides a complete forensic trail for incident investigation.
+## Guard 3 — `input_guard` (prompt-injection scanner, Rust library)
 
-**Configuration Guard** — Critical configuration files are monitored for unauthorized changes. If a configuration file is modified outside of approved channels, the system alerts.
+`duduclaw_security::input_guard::scan_input` scores text 0–100 across **seven rule categories** and blocks at or above `DEFAULT_BLOCK_THRESHOLD` (60):
 
-**Unicode Normalization** — All input is NFKC-normalized before processing to detect homograph attacks (e.g., using Cyrillic characters that look like Latin letters). This prevents visual-spoofing bypass attempts.
+| Rule | Weight | Instant block |
+|---|---|---|
+| `instruction_override` | 40 | yes |
+| `role_hijack` | 35 | yes |
+| `tool_abuse` | 30 | yes |
+| `data_exfiltration` | 25 | yes |
+| `system_prompt_extraction` | 30 | no |
+| `encoding_bypass` | 25 | no |
+| `termination_manipulation` | 30 | no |
 
-**Action Claim Verifier** — Validates cryptographic signatures on tool execution claims, ensuring that claimed tool results actually came from the expected tool.
+Patterns cover English and zh-TW, since the platform's primary language is Traditional Chinese. Text is NFKC-normalized first (`unicode_normalizer`), so homograph and invisible-character tricks cannot slip past a pattern.
 
-**RBAC (Role-Based Access Control)** — A role-based access control matrix governs what each user/agent can do. Different roles (admin, operator, viewer) have different permission sets, enforced at the API layer.
+`termination_manipulation` (LoopTrap, arXiv:2605.05846) is deliberately not an instant block: weight 30 sits below the threshold, so a single match warns and audits rather than blocking, which keeps ordinary "please continue" requests working.
 
----
+Call sites: the MCP dispatch front door (`scan_input_with_audit`), `duduclaw migrate-from` imports, expert-pack installation, and skill vetting — anywhere untrusted text crosses into an agent's context.
 
-## Why This Matters
+## Guard 4 — `org_field_guard` (organizational authority freeze)
 
-### Cost Efficiency
+The A2A delegation predicate (`delegation_policy::can_delegate`) decides who may command whom by reading `[agent] reports_to` / `department` / `name` from `agent.toml`, plus `[delegation]` and `[acp]` from `config.toml`. Both are plain files, so an agent holding `Edit` could rewrite its own `reports_to` to point at a victim and then claim the "subordinate → ancestor" rule. The judged party owned the evidence.
 
-By reserving AI judgment for the rarest cases (RED level only), the security system adds near-zero cost to normal operations. Most threats are caught by the microsecond-fast Layer 1 blacklist.
+`org_field_guard` runs inside the same `agent-file-guard` hook and compares the reconstructed *post-write* content field by field against what is on disk. A change to a protected field or section is denied. The `[capabilities]` table is frozen as a whole table rather than as a key list, so a capability key added in a later release is protected the day it lands instead of the day someone remembers to extend a list.
 
-### Defense in Depth
+Fail-closed by construction: unparseable new content, unparseable existing content, and an unreconstructable write intent all deny. A file that does not exist yet is allowed, because creation goes through `create_agent` and its own gate.
 
-No single layer is responsible for all security. An attacker who bypasses Layer 1 (obfuscation) still faces Layer 2 (pattern analysis). An attacker who bypasses Layer 2 still faces Layer 3 (semantic AI judgment).
-
-### Minimal False Positives
-
-Layer 1's blacklist is intentionally conservative — it only blocks things that are *definitely* dangerous. Ambiguous cases are left to the higher layers, which have more context to make accurate decisions.
-
-### Auditability
-
-The JSONL audit log means every security decision is recorded and reviewable. When a security incident occurs (or a false positive is reported), operators can reconstruct exactly what happened, what was blocked, and why.
+Legitimate changes keep every route they had: the MCP `agent_update` tool and the dashboard `agents.update` RPC, neither of which passes through the hook.
 
 ---
 
-## Interaction with Other Systems
+## Supporting layers
 
-- **CONTRACT.toml**: The behavioral contract defines *what* the agent must not do. The security hooks enforce *how* that's implemented at the tool-call level.
-- **Evolution Engine**: The security layer protects the personality file from unauthorized modification, ensuring only the GVU pipeline can evolve the agent.
-- **Dashboard**: Threat level and recent security events are visible in the web interface.
-- **Audit System**: Integrates with the broader JSONL audit trail for compliance.
+**MCP authorization gate** — every MCP tool is enumerated in a scope table; a tool that is not listed defaults to requiring Admin scope. Scope, per-agent capability grants and `denied_tools` are each enforced at the dispatcher front door, and every refusal is audited with an `error_class`.
+
+**SOUL.md drift detection** — `soul_guard` fingerprints each `SOUL.md` with SHA-256 at startup and on every heartbeat tick, keeps up to 10 versioned backups in `.soul_history/`, and reports drift alongside an Agent Stability Index.
+
+**Audit trail** — `tool_calls.jsonl` records every tool call with masked `result_text` / `input_text` (three-pass secret masking, mask before truncate), `0600` permissions, hash-chained lines, and rotation at 16 MB. `security_audit.jsonl` carries security events separately. The same log is the evidence source the grounding precheck and the acceptance judge read, so weakening it weakens verification too.
+
+**Per-agent key isolation** — MCP API keys, channel tokens and connector credentials are per-agent and resolved through `secret_ref`, so one agent's leak is not a platform leak.
 
 ---
 
-## The Takeaway
+## What these guards do not cover
 
-Security doesn't have to be expensive. By layering cheap deterministic checks before expensive AI judgment, DuDuClaw catches the vast majority of threats at near-zero cost — while keeping AI judgment available for the truly ambiguous cases.
+Saying this plainly is part of the defense.
+
+- **The hooks see Claude Code's own tool calls, not MCP tool calls.** MCP has its own gate (scopes, grants, `denied_tools`); the hooks are the second lock, on the built-in `Write` / `Edit` / `Read` / `Bash` surface.
+- **`data-file-guard` is a heuristic.** It matches filenames in a `Bash` command line; a dynamically-built path defeats it. (It is no longer inert on Windows — H10 made it a Rust subcommand.)
+- **There is no threat-level state machine.** `~/.duduclaw/threat_level` survives as an operator-controlled kill switch that the computer-use orchestrator polls (`RED` stops the run, `YELLOW` pauses it), but nothing inside the workspace writes it. Absent or unreadable means `GREEN`.
+- *(Removed 2026-09.)* This section used to note that the PTY session pool sat outside the redaction rewrite. That pool no longer exists — every Claude spawn is a per-call spawn, which is exactly what the rewrite hooks into.
+
+---
+
+## Interaction with other systems
+
+- **CONTRACT.toml** defines what an agent must never do, and `duduclaw test` red-teams it. The guards enforce at the tool-call level.
+- **Evolution engine** — because `SOUL.md` is read-only to agents, the evolving artifact is the playbook. See [38-aee-playbook-evolution.md](38-aee-playbook-evolution.md).
+- **Redaction and data sources** — see [55-data-sources.md](55-data-sources.md) for the pipeline `data-file-guard` complements.
+- **Delegation isolation** — see [37-delegation-isolation.md](37-delegation-isolation.md) for the predicate `org_field_guard` protects.
+
+---
+
+## The takeaway
+
+Four guards with stated failure modes beat a three-layer story with no code behind it. When a defense is removed the documentation has to go with it: a page describing a shell script that does not exist is worse than no page, because it makes an operator stop looking.

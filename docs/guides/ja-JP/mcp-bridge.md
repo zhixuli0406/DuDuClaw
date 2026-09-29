@@ -196,9 +196,9 @@ allowed_tools = ["wc_list_products", "wc_get_order", "wc_list_orders"]
 ```
 **WordPress MCP AdapterのOAuth 2.1を使ってください。旧来の `X-MCP-API-Key` は2026-06-23に非推奨となりました。** 用意するもの：WP MCP Adapterプラグインと、OAuthクライアント。
 
-### DocuSeal（サーバー未提供 — `duduclaw-docuseal-mcp` を自作）
+### DocuSeal（公式MCPサーバー、セルフホスト）
 
-DocuSeal向けのMCPサーバーはまだ存在しません。REST＋webhook（生成 → 送信 → webhook完了通知）の小さなサーバーを自作してここにマウントし、その後上流にコントリビュートするのが現実的な道筋です。IMPL-PLAN §Dで工数M（中規模）として追跡されています。
+DocuSealのセルフホスト版は`https://<host>/mcp`に自前のMCPエンドポイントを持ちます。Settings → MCP Serverで発行したbearerトークンでマウントしてください。クラウドテナントにMCPエンドポイントはないため、そちらはREST APIを使います。[docuseal.md](docuseal.md)を参照。
 
 ### Monica（個人向けPRM — 薄いMCPかIdentityProviderで対応）
 

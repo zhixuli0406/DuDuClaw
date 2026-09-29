@@ -1,236 +1,107 @@
-# Token Compression Triad
+# Prompt Budget Enforcement
 
-> Three strategies to fit more into less — lossless, lossy, and streaming.
-
----
-
-## The Metaphor: Three Ways to Pack a Suitcase
-
-You're traveling with a fixed-size suitcase (the LLM's context window). You have more stuff than fits. Three strategies:
-
-1. **Vacuum bags** — Compress everything without losing anything. The clothes come out wrinkled but intact. You can unpack perfectly.
-2. **Leave non-essentials behind** — Only pack what you'll actually wear. You lose some items, but the important ones are there.
-3. **Ship ahead and cycle** — Send a box ahead with rarely-needed items. Keep a rolling set of daily wear in your suitcase. Swap as needed.
-
-DuDuClaw offers all three strategies, each suited to different scenarios.
+> One pipeline on the reply path: estimate the prompt, and if it is over budget, walk three stages from least to most lossy — or refuse.
 
 ---
 
-## Strategy 1: Meta-Token Compression (Lossless)
+## A note on history
 
-### How It Works
+This page used to describe a "compression triad": Meta-Token/LTSC (lossless pattern substitution), an LLMLingua-2 bridge (lossy token pruning), and StreamingLLM (KV-cache eviction), each exposed as its own MCP tool.
 
-Meta-Token compression finds repeated patterns in the text and replaces them with shorter symbols — similar to how a zip file works, but designed for token sequences.
+That compressor was **removed from `duduclaw-inference` in v1.33**. It was reachable only through manual MCP tools, nothing on the reply path called it, and it duplicated the pipeline described below. Its two leftover dashboard config sections (`[llmlingua]`, `[streaming_llm]` in `inference.toml`, still accepted by `inference.update`) were removed in 2026-09 — they were writing keys nothing read.
 
-```
-Original text (simplified example):
-  {"type":"message","role":"user","content":"Hello"}
-  {"type":"message","role":"assistant","content":"Hi"}
-  {"type":"message","role":"user","content":"How are you?"}
-
-The pattern {"type":"message","role":" appears 3 times.
-     |
-     v
-Create a substitution:
-  T1 = {"type":"message","role":"
-
-Compressed text:
-  T1user","content":"Hello"}
-  T1assistant","content":"Hi"}
-  T1user","content":"How are you?"}
-
-Substitution table:
-  T1 → {"type":"message","role":"
-```
-
-The algorithm scans the entire input, identifies the most frequently repeated subsequences, and replaces them with meta-tokens. This is applied iteratively — the output of one pass may contain new repetitions that a second pass can compress further.
-
-### Performance Characteristics
-
-- **Compression ratio**: 27-47% reduction in token count
-- **Best for**: Structured, repetitive content (JSON, code, templates, conversation logs)
-- **Worst for**: Highly varied natural language with no repetition
-- **Reversibility**: 100% lossless — decompression produces the exact original
-- **Speed**: Fast (no LLM calls, pure pattern matching)
-
-### When to Use It
-
-This strategy shines when sending structured data to the LLM:
-- Long conversation histories (the message envelope format repeats)
-- Code with boilerplate (import statements, class declarations)
-- API responses with repetitive structure
-- Templates with shared headers/footers
+What exists now is narrower and always on the hot path: `crates/duduclaw-gateway/src/prompt_compression.rs`.
 
 ---
 
-## Strategy 2: LLMLingua-2 (Lossy)
+## The problem it closes
 
-### How It Works
-
-LLMLingua-2 is a different philosophy: instead of compressing the *format*, it compresses the *content* by removing tokens that don't carry much meaning.
-
-```
-Original text:
-  "The user then proceeded to ask about the specific details
-   of how the billing system handles edge cases related to
-   international currency conversion in the accounting module."
-
-Token importance scoring:
-  "The user [low] then [low] proceeded [low] to ask about
-   the [low] specific details of [low] how the billing system
-   handles edge cases related to international currency
-   conversion in [low] the accounting module."
-     |
-     v
-After removing low-importance tokens:
-  "user ask specific details billing system handles edge cases
-   international currency conversion accounting module."
-```
-
-The importance scoring is done by a lightweight model that evaluates how much each token contributes to the overall meaning. Tokens that are purely structural (articles, prepositions, filler words) score low. Tokens that carry semantic content (nouns, verbs, domain terms) score high.
-
-### Performance Characteristics
-
-- **Compression ratio**: 2-5x reduction
-- **Best for**: Natural language, conversation history, verbose explanations
-- **Worst for**: Code, structured data (where every token matters)
-- **Reversibility**: NOT reversible — information is lost
-- **Speed**: Moderate (requires a lightweight model evaluation)
-
-### When to Use It
-
-This strategy is ideal for compressing old conversation history:
-- The agent needs context from 50 previous messages, but they're too long to fit
-- Summary would lose nuance; lossy compression preserves more detail than summarization
-- The exact wording doesn't matter, but the semantic content does
+Before this pipeline, the 200K price cliff was diagnosed *after* the request was sent: `cost_telemetry::record` raised a `cost_pressure` event, the operator got a warning, and the next request still went out unchanged. Budget enforcement closes the loop at the request boundary.
 
 ---
 
-## Strategy 3: StreamingLLM (KV-Cache Management)
+## Opting in
 
-### How It Works
+Enforcement is per agent, and **off unless configured**:
 
-This isn't compression of the *text* — it's management of the model's *internal memory* (the KV-cache). The idea comes from the observation that LLMs have two types of important positions:
-
-1. **Attention sinks**: The first few tokens in a conversation. LLMs disproportionately attend to these regardless of content. They serve as "anchors" for the attention mechanism.
-2. **Recent context**: The most recent tokens, which contain the immediately relevant information.
-
-Everything in between tends to receive less attention and contributes less to response quality.
-
-```
-Full conversation (10,000 tokens):
-  [Token 1-4]  [Token 5-8000]  [Token 8001-10000]
-  ^              ^                ^
-  Attention      Middle section   Recent context
-  sinks          (less attended)  (highly relevant)
-     |
-     v
-StreamingLLM KV-cache:
-  [Token 1-4]  +  [Token 8001-10000]
-  ^                ^
-  Preserved        Preserved
-  sinks            recent window
-
-Middle section evicted from cache.
+```toml
+[budget]
+max_input_tokens = 150000       # 0 or absent ⇒ enforcement disabled
+cache_guard_min_eff = 0.5       # see "The cache guard" below
+cache_guard_max_overshoot = 0.15
 ```
 
-The sliding window moves forward as new tokens arrive:
-
-```
-Time 1: [Sinks] + [Tokens 8001-10000]
-Time 2: [Sinks] + [Tokens 8501-10500]  (window slides)
-Time 3: [Sinks] + [Tokens 9001-11000]  (window slides)
-```
-
-### Performance Characteristics
-
-- **Compression effect**: Enables theoretically infinite conversation length
-- **Best for**: Very long conversations that would exceed the context window
-- **Worst for**: Conversations where middle context is critical
-- **Reversibility**: N/A (manages cache, not text)
-- **Speed**: Very fast (just cache eviction policy)
-
-### When to Use It
-
-This strategy is for conversations that would otherwise be impossible:
-- Multi-hour customer support sessions
-- Ongoing project discussions spanning days
-- Always-on monitoring agents that never "restart"
+`prompt_audit::read_max_input_tokens` reads the first key; a missing file, unparseable TOML or an absent key means 0, which means the pipeline is never entered. That is deliberately the opposite convention from the cache guard, which defaults *on*.
 
 ---
 
-## Combining Strategies
+## Token estimation
 
-The three strategies aren't mutually exclusive. They can be layered:
+`estimate_tokens` is a CJK-aware heuristic, not a tokenizer: **1.306 tokens per CJK codepoint, 1 token per 3.6 characters otherwise**. Those constants came from a 2026-08 local-corpus calibration that replaced a uniform "1.5 characters per token" guess, which was underestimating real usage by roughly 22% on a Traditional Chinese workload.
 
-```
-Long conversation with structured data
-     |
-     v
-Step 1: Meta-Token compress the structured parts
-  (JSON messages, code blocks → 27-47% smaller)
-     |
-     v
-Step 2: LLMLingua-2 compress old conversation history
-  (Verbose exchanges from hours ago → 2-5x smaller)
-     |
-     v
-Step 3: StreamingLLM manages the remaining context
-  (Keep sinks + recent window, evict the rest)
-     |
-     v
-Result: A conversation that would have consumed 200K tokens
-        now fits comfortably in 50K
-```
-
-### Selection Logic
-
-The system can automatically choose the appropriate strategy based on content type:
-
-```
-Content type analysis:
-     |
-     +---> Structured (JSON, code, templates)
-     |       → Meta-Token (lossless, best for repetitive structure)
-     |
-     +---> Natural language (chat history, explanations)
-     |       → LLMLingua-2 (lossy, best for verbose text)
-     |
-     +---> Active conversation (ongoing, growing)
-             → StreamingLLM (cache management, prevents overflow)
-```
+`estimate_request_tokens` sums the system prompt, the history and the pending user message.
 
 ---
 
-## Why This Matters
+## The three stages
 
-### Direct Cost Savings
+Stages are pure functions over `(system, history, user)`. Each either returns a smaller version or `None` ("I can't help further"), and the caller walks them in order until the estimate fits.
 
-In the LLM world, tokens are money. A 40% reduction in input tokens means a 40% reduction in API cost for that request. Over thousands of daily requests, this adds up to significant savings.
+**1. `turn_trim`** — per-turn tail trim. A turn longer than 800 characters keeps its first 300 and last 200 characters with a `[trimmed N chars]` marker in between; character-level slicing, so CJK never splits mid-codepoint. Under cost pressure the threshold drops from 800 to 200. Short replies lose nothing.
 
-### Larger Effective Context
+**2. `drop_oldest_tool_echoes`** — strips old tool content, marking its bytes unavailable when that history path has no durable retrieval handle. Tool echoes are the cheapest thing to lose: the result is usually already reflected in the assistant turn that followed it.
 
-By compressing input, the agent can consider more information within the same context window. A 100K context window effectively becomes 150K-200K when compression is applied. This means better responses because the agent has access to more relevant context.
+**3. `bisect_and_summarize`** — the async stage. After the pure stages fail, the gateway summarizes only the *unprotected* older turns and rechecks the budget. `partition_turns_for_summary` decides the split.
 
-### Infinite Conversations
+If the pipeline still cannot fit the request, it does **not** silently send an over-budget prompt: it returns `BudgetExceeded` and emits a `budget_exceeded` event.
 
-StreamingLLM removes the hard ceiling on conversation length. Without it, conversations that exceed the context window must be summarized or truncated, losing information. With it, the conversation can continue indefinitely while maintaining coherence.
+### Never-trim sections
 
-### Composable Architecture
-
-Each strategy is an independent module accessible via MCP tools. Operators and agents can invoke them individually or in combination, depending on the specific scenario.
+`split_never_trim_sections` / `is_never_trim_header` / `never_trim_tokens` carve out system-prompt sections that no stage may touch — identity, the working-state authority block, and the safety boundaries. A budget can be missed; those sections cannot be quietly dropped to meet it.
 
 ---
 
-## Interaction with Other Systems
+## The cache guard
 
-- **Session Manager**: Applies compression before storing long conversations.
-- **Confidence Router**: Compressed prompts consume fewer tokens, affecting routing decisions.
-- **CostTelemetry**: Tracks compression ratios and the resulting cost savings.
-- **Memory System**: Old episodic memories may be compressed before archival.
+Compression is not free when the prompt cache is healthy. Rewriting even a small tail of the history changes the bytes the cache is keyed on, which forces a full cache-prefix rebuild — and arXiv:2607.12161 measures that rebuild as ~87% of the overhead in that regime. In other words, the tokens you save can cost more than they save.
+
+`should_skip_for_cache` is the deterministic gate `maybe_compress_history` consults *before* entering the pipeline at all:
+
+| Condition | Default | Effect |
+|---|---|---|
+| trailing cache efficiency | > 50% (`cache_guard_min_eff`) | and… |
+| budget overshoot | < 15% (`cache_guard_max_overshoot`) | …skip compression entirely |
+
+Unlike `max_input_tokens`, this guard is **enabled by default** — a missing file or absent key falls back to the paper's thresholds. Only an explicit `cache_guard_min_eff = 0` turns it off. It is a safety optimization that should protect agents without per-agent opt-in.
+
+`CompressionInfo` (`compressed` / `compression_stages`) is threaded from `maybe_compress_history` down to the eventual `cost_telemetry` record, several async frames later, through a task-local.
 
 ---
 
-## The Takeaway
+## What is deliberately not here
 
-Context windows are finite; conversations are not. The compression triad gives DuDuClaw three complementary tools to bridge this gap: Meta-Token preserves everything (structure), LLMLingua-2 preserves what matters (semantics), and StreamingLLM preserves what's needed now (recency). Together, they turn a hard limitation into a manageable trade-off.
+Stated so nobody re-adds it by accident:
+
+- **An LLMLingua-2 bridge.** Python subprocess startup latency makes it a poor fit for per-request synchronous compression. If it comes back it belongs in the async summarizer, not the hot path.
+- **Meta-token / LTSC substitution.** It costs decode time on the agent side, so it would have to be an explicit opt-in knob. Deferred, not scheduled.
+- **KV-cache eviction (StreamingLLM).** DuDuClaw drives CLIs and vendor APIs; it does not own the model's KV-cache.
+
+---
+
+## Where the tokens actually went
+
+The largest single reduction in this area was not compression at all. `[runtime] minimal_context` (default on) narrows each CLI spawn's `--tools` list and passes `--setting-sources project,local`, taking measured fixed overhead from 35,892 to 10,974 tokens per spawn — about 69%. The remaining fixed cost is DuDuClaw's own MCP tool schemas.
+
+---
+
+## Interaction with other systems
+
+- **Session memory stack** — compression summaries are injected into the system prompt, never as conversation turns. See [16-session-memory-stack.md](16-session-memory-stack.md).
+- **CostTelemetry** — records `compressed` / `compression_stages` per request, and `cache_attribution_snapshot()` reports which cached block keeps breaking the prefix.
+- **Direct API** — layered `cache_control` breakpoints split the system prompt via `CACHE_SPLIT_MARKER`, which is what makes the cache guard's efficiency number meaningful.
+
+---
+
+## The takeaway
+
+The honest version of this page is one pipeline, three stages, two config keys and an explicit refusal path. The triad it replaced was three impressive strategies that nothing on the reply path ever called.

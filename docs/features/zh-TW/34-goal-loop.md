@@ -91,6 +91,19 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 | `approver` | **預設。** 沒有開工閘;只在 `needs_human` 時諮詢人類。 |
 | `observer` | 完全自主;`needs_human` 只通知,不等待。 |
 
+## 內部模組
+
+驅動器與它的輔助模組都放在 `crates/duduclaw-gateway/src/goal_loop/`:
+
+| 模組 | 內容 |
+|---|---|
+| `goal_loop.rs` | `GoalLoopDriver` 本體,也就是外層迴圈。 |
+| `goal_loop/signals.rs` | 四個零 LLM 成本的回合訊號抽取器:gap 指紋(H4)、`(state, action)` 造訪圖(A2)、單輪內工具連擊提示(H10)、提前收工正則面板(H5)。 |
+| `goal_loop/state.rs` | 結構化 `<state>` 區塊(A1)、`needs_human` 的封閉暫停原因分類(H11)、預算耗盡時的「最佳輪」挑選器(WP-4F)。 |
+| `goal_loop/plan.rs` | 目標拆解與「想一想」計畫模式的規劃器。 |
+
+2026-09 之前這些是 crate 根目錄下的八個獨立模組(`goal_state`、`goal_visit_graph`、`goal_gap_fingerprint`、`goal_budget_best_round`、`goal_bail_detect`、`goal_tool_streak`、`goal_plan`、`pause_reason`)。2026-09 功能盤點(O8)依職責把它們併起來;舊的 `crate::goal_*` / `crate::pause_reason` 路徑以 re-export 形式再保留一個版本,行為、config 鍵、測試都沒有變動。
+
 ## ActionGuard:三值不可逆性
 
 再往上疊一層,按工具呼叫生效(`approval.rs`,承 Magentic-UI 的 ActionGuard):

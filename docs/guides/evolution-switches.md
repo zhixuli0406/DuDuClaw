@@ -24,7 +24,7 @@ Concretely, when `enabled = false`:
 
 | Path | What stops |
 |---|---|
-| GVU self-play loop | No `SOUL.md` proposals, no observation windows opened |
+| Evolution loop (AEE) | No playbook rounds run, no settlement windows opened |
 | Heartbeat silence-breaker | Does **not** fire a forced reflection after silence |
 | Channel prediction path | Skill diagnose/activate/synthesis/graduation and the GVU trigger are skipped |
 | Sub-agent dispatch reflection | `maybe_run_gvu` short-circuits |
@@ -40,19 +40,42 @@ Under the master switch, each capability has its own flag. With the master on,
 
 | Toggle | Default | Controls |
 |---|---|---|
-| `gvu_enabled` | `false` | GVU generator→verifier→updater loop (SOUL.md rewrites) |
+| `gvu_enabled` | **`true` from the factory** (see below) | The AEE playbook evolution loop |
+| `strategy` | `"balanced"` | AEE round-intent mix: `balanced` / `innovate` / `harden` / `repair_only` |
 | `skill_synthesis_enabled` | `false` | Synthesising new skills from repeated domain gaps |
-| `skill_graduation_enabled` | `false` | Promoting a proven skill to global scope |
-| `skill_recommendation_enabled` | `false` | Auto-activating recommended skills for new agents |
-| `curiosity_enabled` | `false` | Proactive exploration of underused domains |
 | `skill_auto_activate` | `false` | Activating suggested skills mid-conversation |
-| `skill_behavior_monitor_enabled` | `false` | Behavioural-drift detection after activation |
 
-**`gvu_enabled` defaults to `false` (fail-closed opt-in, changed 2026-08-06 —
-see `TODO-evolution-v3-2026-08.md` WP0.1).** Every scaffold/template that
-writes `agent.toml` writes the key explicitly, even when `false`, so the
-toggle is always visible rather than an absent key that silently means "off".
-Set `gvu_enabled = true` to opt an agent in.
+**`gvu_enabled` ships `true` since 2026-09-29 (K2).** Two things changed to
+make that safe. First, the engine no longer rewrites `SOUL.md` — the legacy
+path was removed (S11), so what evolves is the playbook: small,
+independently-retirable behaviour rules, each linked to at least one eval case,
+each settled against that case after an observation window. `SOUL.md` stays
+read-only for the agent. Second, the cost of a round is bounded on both sides:
+`gvu_cooldown_minutes` throttles how often a round may start, and the
+zero-LLM Gate rejects a doomed candidate *before* any judge call is paid for.
+
+The value is still written explicitly by every scaffold, so the toggle is
+visible in `agent.toml` rather than an absent key. An agent whose
+`agent.toml` predates this change keeps whatever it already has (a missing key
+still reads as `false` — the runtime gate is unchanged and fail-closed).
+Set `gvu_enabled = false` to opt an agent out.
+
+Three per-agent skill-lifecycle knobs became live on the same date (H3) —
+before it they were written by the dashboard and read by nobody:
+
+| Knob | Default | Controls |
+|---|---|---|
+| `max_active_skills` | `5` | Concurrent active skills before the weakest is evicted |
+| `skill_synthesis_threshold` | `3` | Repeated domain-gap observations before a synthesis signal fires |
+| `skill_synthesis_cooldown_hours` | `24` | Quiet period after a synthesis signal on the same topic |
+| `skill_graduation_min_lift` | `0.1` | Minimum measured lift before a skill is a graduation candidate |
+
+Eight sibling keys (`skill_graduation_enabled`, `skill_recommendation_enabled`,
+`skill_recommendation_threshold`, `curiosity_enabled`, `curiosity_threshold`,
+`curiosity_max_daily`, `skill_behavior_monitor_enabled`,
+`skill_behavior_drift_threshold`) were removed instead — they had no reader at
+all. Leaving one in an existing `agent.toml` is harmless; it is ignored, which
+is exactly what it already was.
 
 ### GVU cooldown
 
@@ -68,33 +91,40 @@ gvu_cooldown_minutes = 60   # default 60; 0 disables the cooldown
 
 The cooldown starts counting the moment a trigger is let through the gate
 (not when the cycle finishes), and applies regardless of the outcome
-(applied/abandoned/deferred/timed_out/skipped) — the cost being throttled is
+(applied/abandoned/skipped) — the cost being throttled is
 LLM calls *attempted*, not just calls that succeeded. State is in-memory and
 resets on gateway restart.
 
-### Which engine runs: AEE (default) or the legacy SOUL path
+### Fault attribution (`config.toml [evolution] fault_attribution`, default `true`)
 
-When `gvu_enabled = true`, the evolution engine that actually runs is **AEE**
-(the Agentic Evolution Engine). AEE evolves the agent's *playbook* — small,
-independently retirable behaviour rules, each linked to at least one eval case
-— and never writes `SOUL.md`. The persona file is operator-owned.
+Before a rejected goal-loop round is allowed to count against injected playbook
+rules (`harmful` increments, shadow-candidate scoring, F2b consolidation
+sources), the gateway classifies the round's fault side with a deterministic,
+zero-LLM rule chain (`crates/duduclaw-gateway/src/fault_attribution.rs`):
+`grader` (judge contradicted deterministic grounding evidence), `environment`
+(rate limit / billing / timeout / spawn failure), `harness` (reply claims tool
+use but no native tool event was observed, or a capability gate blocked the
+call), `unknown` (no observation fidelity), else `model`. Only `model` rounds
+feed the learning loop; every excluded round writes a `fault_attributed` audit
+event so the exclusion is visible. Set `fault_attribution = false` to restore
+the pre-2026-09 behaviour byte-for-byte. Basis: arXiv:2605.22842 (attribution
+systems blamed the model in 64/64 failures) and arXiv:2607.28802.
 
-The historical Generator→Verifier→Updater cycle that rewrote `SOUL.md` is still
-available as an escape hatch:
+### Which engine runs: AEE, and only AEE
 
-```toml
-[evolution]
-legacy_soul_evolution = true   # default false → AEE
-```
+When `gvu_enabled = true`, the engine that runs is **AEE** (the Agentic
+Evolution Engine). AEE evolves the agent's *playbook* — small, independently
+retirable behaviour rules, each linked to at least one eval case — and never
+writes `SOUL.md`. The persona file is operator-owned.
 
-A missing or malformed `agent.toml` yields `false` (AEE) — deliberately the
-opposite fail-safe direction from the other keys on this page, because AEE is
-the path that *cannot* write `SOUL.md` at all, and a config typo must not
-silently re-open that write surface.
-
-Two things stay shared by both engines: the cooldown above, and the `SOUL.md`
-size-cap consolidation breaker (an over-cap persona file freezes the agent's
-prompt no matter which engine is driving).
+**Removed 2026-09-29 (S11): the `legacy_soul_evolution` escape hatch and the
+whole Generator→Verifier→Updater `SOUL.md` rewrite cycle behind it**, together
+with `SOUL.md` versioning, the 24-hour observation window, automatic rollback,
+the cap-deadlock consolidation breaker, and the `duduclaw evolution finalize`
+CLI. `SOUL.md` had already been read-only for agents since Evolution v3
+(WP1.1), so the write path those mechanisms guarded no longer existed. A
+`legacy_soul_evolution = true` still sitting in an `agent.toml` is ignored —
+the agent takes the AEE path like every other.
 
 After a committed AEE round, the entries it added are observed before their
 verdict is settled:
@@ -232,10 +262,11 @@ The point of the master switch is that you can prove nothing evolves after you
 flip it. To check:
 
 1. Set `[evolution] enabled = false` on the agent.
-2. Watch `prediction.db` (`evolution_events` / `gvu_experiment_log`): no new GVU
-   rows should appear.
-3. `SOUL.md`'s SHA-256 fingerprint should not change.
-4. No observation window should open (no pending version in the version store).
+2. Watch `evolution.db` (`gvu_experiment_log`) and `prediction.db`
+   (`evolution_events`): no new rows should appear.
+3. `SOUL.md` should not change — though as of 2026-09-29 nothing in the
+   platform can write it on an agent's behalf anyway.
+4. No settlement window should open (no pending row in `aee_pending_settlement`).
 
 This mirrors the automated verification the project runs for this feature.
 
@@ -249,7 +280,7 @@ Not evolution toggles, but part of the same learn-and-verify surface:
 | `config.toml [dispatch] grounding_precheck_enabled` | `true` | [goal-loop.md](./goal-loop.md) — zero-LLM evidence check before the acceptance judge |
 | `config.toml [dispatch] two_stage_judge` | `true` | [goal-loop.md](./goal-loop.md) — cheap first-stage evaluator before the MAV acceptance panel |
 | `config.toml [goal_loop] resume_on_restart` | `"pause"` | [goal-loop.md](./goal-loop.md) — escalates in-flight goal tasks to `needs_human` on gateway restart; set `"auto"` to resume them instead. Dashboard: Settings → Automation |
-| `config.toml [task_forward_model] enabled` | `false` | [goal-loop.md](./goal-loop.md) — task-level predict-act-verify world model |
+| `config.toml [task_forward_model] enabled` | `true` (since v1.54) | [goal-loop.md](./goal-loop.md) — task-level predict-act-verify world model; set `false` to opt out |
 | `config.toml [goal_loop] progress_report_minutes` | `10` | [goal-loop.md](./goal-loop.md) — notifies (never intervenes) when a claimed goal task has shown no progress signal for this many minutes; `0` disables |
 | `config.toml [goal_loop] tool_streak_advisory` | `true` | [goal-loop.md](./goal-loop.md) — injects an escalating advisory hint after 3/5/8 identical consecutive tool calls in one round; zero LLM cost, never blocks |
 | `config.toml [dispatch] admission` | `"queue"` | [goal-loop.md](./goal-loop.md) — over-capacity ephemeral sub-agent spawns durably FIFO-queue instead of failing immediately; set `"fail"` for the pre-H19 hard-reject behavior |

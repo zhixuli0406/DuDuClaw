@@ -45,8 +45,10 @@ Windows 與 Android 應用程式；同時 DuDuClaw gateway 與它的 AI 員工�
   XWayland 讓 X11 應用程式也能跑。
 - **應用程式**：Chromium、LibreOffice 和 Steam 預先以 Flatpak 形式離線裝
   好；Windows 桌面應用程式走 Bottles，完整 Windows 走 KVM 虛擬機 + RDP，
-  Android 應用程式走 Waydroid。哪些有承諾、哪些沒有，寫在
-  [應用程式相容性指南](../../guides/zh-TW/app-compat.md)裡。
+  Android 應用程式走 Waydroid。哪些有承諾、哪些沒有，寫在應用程式相容性
+  指南裡——該文件自 2026-09-29 起放在
+  [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo 的
+  `docs/guides/zh-TW/app-compat.md`。
 
 ## 共用如何不打擾你
 

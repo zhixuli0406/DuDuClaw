@@ -44,7 +44,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | マルチ LLM フェイルオーバー | 手動再起動 | 4 種のローテーション戦略 + クロスプロバイダ failover |
 | LLM 切替時のコンテキスト | 消失 | 完全保持 |
 | 会話メモリと知識ベース | 単発セッション | SQLite 時系列メモリ + 階層 wiki を自動注入 |
-| ツールの LLM 間共有 | ベンダーごとに書き直し | 200+ MCP ツールを一度書けば 5 バックエンドで共用 |
+| ツールの LLM 間共有 | ベンダーごとに書き直し | 243 MCP ツールを一度書けば 5 バックエンドで共用 |
 | ガードレール / 監査 / 秘密情報管理 | 自作 | ポリシーカーネル + OS サンドボックス + AES-256-GCM 内蔵 |
 | 顧客に渡す一台まるごとの専用機 | Linux を自分で入れ、更新と改ざん対策も自前 | DuDuClaw OS イメージ:A/B アップデートとロールバック + 読み取り専用ルート、電源を入れるだけ;人と AI がデスクトップを共用しても日常利用の邪魔をしない |
 
@@ -62,10 +62,10 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 5 バックエンド自動検出、エージェントごとに設定
   ├─ Session Memory — ネイティブ --resume + 時系列メモリ + key facts + 階層 wiki
-  ├─ MCP Server — 200+ ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
+  ├─ MCP Server — 243 ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
   ├─ Evolution Engine — GVU² 二重ループ進化 + 予測駆動 + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS サンドボックス + redaction vault
-  ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX
+  ├─ Inference Engine — OpenAI 互換ローカルサーバー(llama-server / Ollama / vLLM)/ llamafile
   ├─ Account Rotator — OAuth + API キーのローテーション、予算追跡、ヘルスチェック
   └─ Web Dashboard — React 19 SPA(32 ページ)、rust-embed でバイナリに内蔵
 ```
@@ -171,12 +171,12 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 | チャネル | 11 チャネル(Telegram / LINE / Discord + 音声 / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat)、エージェントごとの bot、ホット起動/停止、プラットフォーム最適レンダリング、入力中インジケータ、長時間タスクの進捗ボード | [docs/features](docs/features/README.md) |
 | マルチランタイム | Claude / Codex / Gemini / Antigravity / OpenAI-compat、自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 統一 LLM API 層 | `duduclaw-llm` が 4 つのネイティブプロトコル(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat)を単一の正規化リクエストでカバー。8 つの OpenAI-compat プリセット(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 価格レジストリ + クロスプロバイダ fallback を内蔵 | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP サーバー | 200+ ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート、外部には 7 ツールのみ公開 | [docs/api](docs/api/README.md) |
+| MCP サーバー | 243 ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート、外部には 7 ツールのみ公開 | [docs/api](docs/api/README.md) |
 | メモリ | SQLite 時系列メモリ(事実の置換チェーン)、HippoRAG-lite 知識グラフ検索(Personalized PageRank)、エビングハウス忘却曲線によるアーカイブ、エージェント横断の共有 wiki | [docs/features](docs/features/README.md) |
 | 自己進化 | GVU² 二重ループ + 予測駆動(会話の約 90% は LLM コストゼロ)、SOUL.md バージョン管理 + 24 時間観察期間つき自動ロールバック、MistakeNotebook のターン横断メモリ | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | セキュリティ | PolicyKernel reference monitor(LLM 不使用、fail-closed)、macOS Seatbelt / Linux Landlock ネイティブサンドボックス、Docker / Apple Container / WSL2 コンテナサンドボックス、secret redaction vault、CONTRACT.toml 行動契約 + レッドチーム CLI | [SECURITY.md](SECURITY.md) |
 | アカウントとコスト | OAuth + API キーのローテーション(4 戦略)、レート制限 / 課金クールダウン、キャッシュ効率分析つきコストテレメトリ、OAuth サブスクリプションアカウントを駆動するクロスプラットフォーム PTY プール | [docs/features](docs/features/README.md) |
-| ローカル推論 | llama.cpp(Metal/CUDA/Vulkan)/ mistral.rs / Exo P2P / llamafile / MLX、3 段階の信頼度ルーティング。Whisper 音声認識とベクトル埋め込みも内蔵 | [docs/features](docs/features/README.md) |
+| ローカル推論 | OpenAI 互換のローカルサーバー(llama-server / Ollama / vLLM / SGLang)または llamafile、3 段階の信頼度ルーティング。Whisper 音声認識とベクトル埋め込みも内蔵 | [docs/features](docs/features/README.md) |
 | ファインチューニング | この機械の会話・仕事の成果・承認判断から SFT / DPO データセット(ShareGPT / Alpaca)を構築し、自前の GPU 機(SSH + LLaMA-Factory)または Together のクラウドで学習、GGUF / LoRA をローカルモデルディレクトリへ取り込み。ローカル学習は行わず(内蔵グラフィックスでは不可)、データが機械を出るときは明示的な同意が必要 | [docs/features/53](docs/features/54-finetune.md) |
 | Live Forking | RFC-26:進行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write 隔離、AI ジャッジが勝者を選んでマージ(デフォルト無効) | [docs/rfc](docs/rfc) |
 | 自動アップデート | ダッシュボードからワンクリック、または無人更新(`auto_update = true`)。SHA-256 + Ed25519 の二重検証後にその場で再起動、開いているタブは自動リロード | [deployment-guide.md](docs/guides/deployment-guide.md) |
@@ -247,7 +247,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | 言語 | Rust | TypeScript | Rust | Python |
 | チャネル | 11 | 25+ | 8 | 0(API)|
 | マルチランタイム | 5 バックエンド | 単一 | 単一 | マルチ LLM |
-| MCP サーバー | 200+ ツール | なし | なし | なし |
+| MCP サーバー | 243 ツール | なし | なし | なし |
 | 自己進化エンジン | GVU² 二重ループ | なし | なし | なし |
 | ローカル推論 | 5 バックエンド + 信頼度ルーティング | なし | なし | なし |
 | 行動契約 | CONTRACT.toml + レッドチーム | なし | WASM サンドボックス | なし |
@@ -263,7 +263,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開発環境とエージェント開発
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):カスタム MCP ツールの作り方
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md / CONTRACT.toml フォーマット仕様
-- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS アプライアンス(製品概要);[52-desktop-edition.md](docs/features/52-desktop-edition.md):デスクトップ版、人と AI で一台を共有;ハードウェア要件は [hardware-requirements.md](docs/guides/hardware-requirements.md)、アプリ互換は [app-compat.md](docs/guides/app-compat.md);イメージのビルドとリリースは [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) リポジトリ
+- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS アプライアンス(製品概要);[52-desktop-edition.md](docs/features/52-desktop-edition.md):デスクトップ版、人と AI で一台を共有;ハードウェア要件は [hardware-requirements.md](docs/guides/hardware-requirements.md);アプリ互換・イメージのビルド・リリースはいずれも [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) リポジトリ(互換層は同リポジトリの `docs/guides/app-compat.md`)
 - [CHANGELOG.md](CHANGELOG.md):バージョン履歴
 
 <a id="license"></a>

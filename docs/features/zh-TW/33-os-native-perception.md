@@ -81,3 +81,21 @@ check due? → quiet hours? skip → rate limit? skip
 | 主動閘 | `[proactive] enabled = true` | 關 |
 
 版本分級是**配額鎖,不是能力鎖**:個人版恰好允許一個 OS 原生 agent;付費層無上限。任何版本都不移除、不降級任何功能,只限制同時能感知 OS 的席位數。
+
+## 實作
+
+共用 `os_*` 前綴的其實是兩組不同的東西,落在不同地方。
+
+本頁講的**感知**那半邊——檔案監看、前景輪詢、footprint 萃取、主動閘——
+是 per-agent 的事件machinery,實作在 `duduclaw-gateway` 的 `os_events.rs` /
+`os_frontmost.rs` / `proactive_gate.rs`,平台呼叫走 `duduclaw-os` crate。
+它只有一個前門(`os_watch_status` MCP 工具與 OS 頁的 `os.*` RPC),沒有重複。
+
+**裝置與系統操作**那半邊——狀態、網路與 Wi-Fi、備份、電源、原廠重置、
+OS image 的更新檢查/套用/回滾、顯示與音訊——有三個前門:agent 呼叫的 `os_*`
+MCP 工具、操作者用的 `duduclaw os <群組> <動詞>` CLI,以及儀表板的 `device.*` /
+`network.*` RPC。2026-09 收斂之後,這三個前門都只是薄轉接,單一權威是
+`crates/duduclaw-gateway/src/os_ops.rs`:一個能力一個函式,負責執行效果並回傳
+正規 payload。每個前門只保留自己的權限閘(MCP 的 `os:native`/admin scope、
+RPC 的 admin＋僅限裝置版判定、CLI 的操作者終端身分)、自己的請求解析與自己的
+回應渲染。新增或修改一個能力是改一處,不是三處。

@@ -4,18 +4,18 @@
 > 日期：2026-03-29（v3 增補：2026-08-06）
 > 狀態：Production — 197 tests passing（v2.0 基準）；v3 AEE 見第十二章
 
-**讀本文前先看這段（v3 現況）**：本文第四章描述的「GVU 直接改寫 SOUL.md」流程，
-自 v3（2026-08-06）起是**非預設的逃生門路徑**（`agent.toml [evolution]
-legacy_soul_evolution = true` 才會啟用）。**預設路徑改為 AEE**：SOUL.md 對
-agent 轉為唯讀（人格層仍是業界共識，只是不再靠 LLM 整份改寫），進化的落地
-目的地換成第十二章的 playbook 條目模型。第四、七、八、九章的 GVU 敘述
-（4 層驗證、24h 觀察期、append-only 寫入）在 `legacy_soul_evolution = true`
-時仍原封不動有效，並額外套用本次止血修復（cap 死鎖解除、觀察窗品質閘、
-判官順序修正、每 agent cooldown、停滯偵測、閾值對稱回升）；AEE 路徑另見
-第十二章，兩者共用的止血修復以底線標出。設計全文：
+**讀本文前先看這段（S11 現況，2026-09-29）**：本文第四章描述的「GVU 直接改寫
+SOUL.md」流程，以及支撐它的一切（`agent.toml [evolution] legacy_soul_evolution`
+逃生門、`SOUL.md` 版本化、24 小時觀察期、自動回滾、超額 consolidate 重寫、
+deferred GVU 重試、`duduclaw evolution finalize` CLI）**已從程式碼移除**。
+`SOUL.md` 自 v3（2026-08-06）起對 agent 唯讀，那時這些機制守護的寫入路徑就
+已經不存在了。**第四、七、八、九章保留為歷史紀錄**：它們說明引擎過去怎麼
+運作、每一道防線為什麼被建起來，仍是理解第十二章設計壓力最快的路徑——但
+裡面沒有任何一行還是活的程式碼。實際運行的引擎是 AEE（第十二章），而
+`[evolution] gvu_enabled` 現在出廠即為 `true`。設計全文：
 `commercial/docs/DESIGN-evolution-v3-aee.md`；規劃與根因鑑識：
 `commercial/docs/TODO-evolution-v3-2026-08.md`；使用者視角導覽：
-`docs/features/38-aee-playbook-evolution.md`；開關細節：
+`docs/features/zh-TW/38-aee-playbook-evolution.md`；開關細節：
 `docs/guides/evolution-switches.md`。
 
 ---
@@ -883,10 +883,10 @@ peer_signals = false               # Peer Agent 信號
 
 ### 12.0 一句話定位
 
-第四章的 GVU 迴圈本身沒有廢棄，Generator→Verifier→Updater 三步框架保留，
-只是**迴圈操作的對象換了**：從整份 `SOUL.md` 改成 playbook 條目。
-`legacy_soul_evolution = true` 時第四章原封不動生效；預設（`false`）時，
-第四章的 Generator/Verifier/Updater 三個角色由本章的 `gvu/aee/` 子模組接手。
+Generator→Verifier→Updater 三步框架這個*形狀*沒有變，變的是**迴圈操作的
+對象**：從整份 `SOUL.md` 改成 playbook 條目，三個角色由本章的 `gvu/aee/`
+子模組承擔。第四章自己的實作已於 2026-09-29（S11）移除——它是歷史，不是
+可以切回去的選項。
 
 ### 12.1 為何從 SOUL.md 轉向 playbook（診斷結論）
 
@@ -1053,9 +1053,8 @@ confirm/rollback 由它自己連結的 eval case 裁定，觀察時長
 ```toml
 # agent.toml
 [evolution]
-gvu_enabled = false            # opt-in，涵蓋 AEE 與 legacy 兩條路徑
+gvu_enabled = true             # 2026-09-29（K2）起出廠預設
 gvu_cooldown_minutes = 60      # 每 agent、涵蓋所有觸發路徑
-legacy_soul_evolution = false  # true → 走第四章的舊 SOUL.md 路徑
 aee_settle_hours = 24          # AEE 條目觀察窗，上限 30 天
 strategy = "balanced"          # balanced | innovate | harden | repair_only
 

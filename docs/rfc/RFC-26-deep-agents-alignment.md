@@ -34,7 +34,7 @@ This RFC does two things:
 
 ## 2. Design principles (carried from DuDuClaw conventions)
 
-- **Default off, per-agent opt-in** via `agent.toml` — same posture as the PTY pool (`[runtime] pty_pool_enabled`).
+- **Default off, per-agent opt-in** via `agent.toml`.
 - **Reuse, don't rebuild**: forking sits on `AccountRotator` (N accounts → N parallel runs without rate-limit collision), the container sandbox (`duduclaw-container` — Apple Container gives native copy-on-write), and GVU's `build_judge_prompt` / `parse_judge_response` (the LLM judge already exists).
 - **Fail closed**: a missing judge, an unparseable verdict, or a sandbox spawn failure falls back to `manual` merge (surface branches to the operator), never silently auto-picks.
 - **No raw byte slicing / unanchored contains / unlocked appends** — per the 2026-06 security conventions; branch logs go through `truncate_bytes` + `with_file_lock`.

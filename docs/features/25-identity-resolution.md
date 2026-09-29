@@ -180,6 +180,22 @@ identity_resolve { channel, external_id }
 
 The scope gate follows DuDuClaw's "security gates fail closed" convention — a key without `Scope::IdentityRead` is denied, never silently allowed through.
 
+`identity_resolve` is the **only** identity tool that exists. RFC-21 §1 also
+sketched `identity_list_project_members` and `identity_invalidate_cache`;
+neither was implemented and neither is scheduled. `lookup_project_members` is
+live on the provider trait (and used by `ChainedProvider`), but no MCP tool
+exposes it, and cache invalidation happens by editing the wiki files — there is
+no tool to trigger it.
+
+### Which provider actually answers
+
+All three call sites — this MCP tool, the `<sender>` block below, and the
+dashboard's `identity.resolve` RPC — go through one shared builder that reads
+`config.toml [identity] provider`. Until the 2026-09 feature audit the first
+two hard-coded the wiki cache, so an operator who configured Notion saw the
+dashboard resolve through it while every agent still read only the local cache.
+They now agree.
+
 ---
 
 ## The `<sender>` Block: Identity as Data

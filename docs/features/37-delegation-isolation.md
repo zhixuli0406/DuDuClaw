@@ -189,7 +189,7 @@ Covered: every route by which AI employees delegate to each other through platfo
 Not covered (known boundaries by design, not bugs):
 
 - **Legacy-format tasks**: 1.52 still lets queued tasks with no sender field at all pass, logging only a warning (to avoid wiping out work still queued during an upgrade). The next version switches to rejection.
-- **Config-file-level changes**: since v1.52 a PreToolUse hook freezes the sensitive org data fields — an agent cannot rewrite `agent.toml`'s `name` / `reports_to` / `department`, the `[delegation]` / `[acp]` sections of `config.toml`, the `.mcp.json` identity block, `.claude/settings.json`, or `identity.key` through the Write/Edit/Bash tools. Changing these settings must go through the dashboard or the `agent_update` MCP tool — the vetted official channels. Cross-employee file edits (e.g. modifying someone else's SOUL.md) are also rejected. Non-Claude runtimes (codex/gemini etc.) cannot write to the `~/.duduclaw/` directory under the workspace-write sandbox, adding a sandbox-level line of defense. Only the FullAccess sandbox is exempt — an extreme permission the operator chooses explicitly.
+- **Config-file-level changes**: since v1.52 a PreToolUse hook freezes the sensitive org data fields — an agent cannot rewrite `agent.toml`'s `name` / `reports_to` / `department`, its whole `[capabilities]` permission envelope (added after the Team-as-Agent review), the `[delegation]` / `[acp]` sections of `config.toml`, the `.mcp.json` identity block, `.claude/settings.json`, or `identity.key` through the Write/Edit/Bash tools. Changing these settings must go through the dashboard or the `agent_update` MCP tool — the vetted official channels. Cross-employee file edits (e.g. modifying someone else's SOUL.md) are also rejected. Non-Claude runtimes (codex/gemini etc.) cannot write to the `~/.duduclaw/` directory under the workspace-write sandbox, adding a sandbox-level line of defense. Only the FullAccess sandbox is exempt — an extreme permission the operator chooses explicitly.
 - **System- and human-initiated operations**: dashboard, webhooks, schedules, and automation rules are the operator's will to begin with, and always pass.
 
 ### Visibility filtering
@@ -250,6 +250,7 @@ Agent changes made through file tools (Write/Edit/Bash) are intercepted by the P
 | File | Fields / sections | Reason |
 |------|-------------------|--------|
 | `agent.toml` | `name`, `reports_to`, `department` in `[agent]` | Changing these rewrites the org chart — a self-service escalation hole |
+| `agent.toml` | The entire `[capabilities]` section | This is the permission envelope (`allowed_tools` / `denied_tools`, the `computer_use` / `browser_via_bash` / `os_native` / `git_credentials` switches, `db_sources`, the approval / irreversible / scoped tool lists, `autonomy_level`, `wiki_visible_to`). A team role member runs with the employee's workspace as its cwd, so the hook reads it as the employee itself — which made this file the one place a cheap third-party model could widen the very envelope meant to contain it. Every key in the section is compared, including ones added in later releases |
 | `config.toml` | Entire `[delegation]`, `[acp]` sections | Policy settings affect the whole team's safety and cannot be changed casually |
 | `.mcp.json` | `DUDUCLAW_AGENT_ID`, `DUDUCLAW_AGENT_TOKEN` | Identity tokens; changing them means impersonating someone else |
 | `.claude/settings.json` | Whole file | Permission lists and other sensitive settings are managed centrally by the dashboard |
@@ -260,7 +261,7 @@ Agent changes made through file tools (Write/Edit/Bash) are intercepted by the P
 When these settings need to change:
 
 - **`name`, `reports_to`, `department`** → dashboard "AI employees → details → edit", or the MCP `agent_update` tool
-- **Adjusting permissions or adding tools** → dashboard "AI employees → advanced settings", or edit `agent.toml [capabilities]` and specify by hand (not through file tools)
+- **Adjusting permissions or adding tools** → dashboard "AI employees → advanced settings", the MCP `agent_update` tool, or an operator editing `agent.toml [capabilities]` in a normal editor. Neither route passes through this hook — the hook only sees Claude Code's own Write / Edit / Bash tool calls, so an employee (or one of its team role members) cannot take this route from inside a session
 - **Delegation policy or white-list** → dashboard "Advanced settings → Delegation permissions", or edit `config.toml [delegation]` directly and restart the gateway
 - **Adding an MCP server** → edit the `tools` array in `.mcp.json` (leave the identity block alone), or add manually via dashboard "Advanced settings → MCP servers"
 

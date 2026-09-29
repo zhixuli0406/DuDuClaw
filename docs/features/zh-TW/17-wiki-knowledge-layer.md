@@ -201,7 +201,11 @@ Report candidate duplicates:
 └── shared/wiki/            ← cross-agent SOPs, policies, product specs
 ```
 
-可見性透過每個頁面上的 `wiki_visible_to` capability 控制：預設為 agent 私有，但頁面可以提升為共享，或限制給某個團隊。MCP 工具：`shared_wiki_ls`、`shared_wiki_read`、`shared_wiki_write`、`shared_wiki_search`、`shared_wiki_delete`、`shared_wiki_stats`、`wiki_share`。
+可見性透過每個頁面上的 `wiki_visible_to` capability 控制：預設為 agent 私有，但頁面可以提升為共享，或限制給某個團隊。
+
+**一套工具，兩個 wiki。** `wiki_ls` / `wiki_read` / `wiki_write` / `wiki_search` / `wiki_stats` / `wiki_lint` 都吃一個 `scope` 參數：`"agent"`（預設，就是你自己的 wiki，行為不變）或 `"shared"`（跨 agent 的共享 wiki）。`wiki_share` 把你 wiki 裡的頁面複製進共享 wiki；`shared_wiki_delete` 保留原名，因為 agent-local 那側刻意沒有刪除入口。
+
+六個 `shared_wiki_*` 寫法（`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`）仍可使用，屬棄用別名，落在完全相同的 handler 上，v1.68.0 移除。見[已棄用名稱](../../guides/zh-TW/deprecations.md)。
 
 ### 命名空間 SoT 政策（`.scope.toml`）
 

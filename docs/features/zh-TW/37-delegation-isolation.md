@@ -189,7 +189,7 @@ allow = [
 管不到（設計上的已知邊界，不是 bug）：
 
 - **舊格式任務**：1.52 版對完全沒有發送者欄位的隊列任務仍然放行，只記一筆 warning（避免升級時把還在排隊的工作全部打掉）。下一版改為拒絕。
-- **設定檔層級的改動**：從 v1.52 起，PreToolUse hook 凍結了敏感的組織資料欄位：agent 無法透過 Write/Edit/Bash 工具改寫 `agent.toml` 的 `name` / `reports_to` / `department`、`config.toml` 的 `[delegation]` / `[acp]` 段、`.mcp.json` 身分區塊、`.claude/settings.json` 或 `identity.key`。更改這些設定必須走儀表板或 `agent_update` MCP 工具，由經過審驗的正式管道進行。跨員工檔案修改（例如改別人的 SOUL.md）亦被拒絕。非 Claude runtime（codex/gemini 等）在 workspace-write 沙箱下無法寫入 `~/.duduclaw/` 目錄，提供沙箱層防線。只有 FullAccess 沙箱例外，屬操作者顯式選擇的極端權限。
+- **設定檔層級的改動**：從 v1.52 起，PreToolUse hook 凍結了敏感的組織資料欄位：agent 無法透過 Write/Edit/Bash 工具改寫 `agent.toml` 的 `name` / `reports_to` / `department`、整段 `[capabilities]` 權限範圍（Team-as-Agent 審查後加入）、`config.toml` 的 `[delegation]` / `[acp]` 段、`.mcp.json` 身分區塊、`.claude/settings.json` 或 `identity.key`。更改這些設定必須走儀表板或 `agent_update` MCP 工具，由經過審驗的正式管道進行。跨員工檔案修改（例如改別人的 SOUL.md）亦被拒絕。非 Claude runtime（codex/gemini 等）在 workspace-write 沙箱下無法寫入 `~/.duduclaw/` 目錄，提供沙箱層防線。只有 FullAccess 沙箱例外，屬操作者顯式選擇的極端權限。
 - **系統與人類發起的操作**：儀表板、webhook、排程、自動化規則本來就是操作者的意志，一律放行。
 
 ### 可見範圍過濾
@@ -250,6 +250,7 @@ Agent 經檔案工具（Write/Edit/Bash）的變更會被 PreToolUse hook 攔截
 | 檔案 | 欄位 / 區塊 | 原因 |
 |------|-----------|------|
 | `agent.toml` | `[agent]` 的 `name`, `reports_to`, `department` | 改這些等於改組織圖，自助提權漏洞 |
+| `agent.toml` | 整段 `[capabilities]` | 這是權限範圍（`allowed_tools`／`denied_tools`、`computer_use`／`browser_via_bash`／`os_native`／`git_credentials` 四個開關、`db_sources`、審批／不可逆／task-scoped 工具清單、`autonomy_level`、`wiki_visible_to`）。團隊角色成員以員工工作區為 cwd 執行，hook 因此把它判成員工本人——這裡曾是便宜的第三方模型唯一能放寬「約束自己那份 envelope」的地方。比對走兩邊鍵的聯集，之後版本新增的權限鍵也一併凍結 |
 | `config.toml` | `[delegation]`, `[acp]` 全段 | 政策設定涉及全團隊安全，不能隨意改 |
 | `.mcp.json` | `DUDUCLAW_AGENT_ID`, `DUDUCLAW_AGENT_TOKEN` | 身分令牌，改掉等於冒充別人 |
 | `.claude/settings.json` | 整個檔案 | 權限清單等敏感設定統一由儀表板管理 |
@@ -260,6 +261,7 @@ Agent 經檔案工具（Write/Edit/Bash）的變更會被 PreToolUse hook 攔截
 需要改這些設定時：
 
 - **修改 `name`、`reports_to`、`department`** → 儀表板「AI 員工 → 詳情 → 編輯」，或用 MCP `agent_update` 工具
+- **調整權限或新增工具** → 儀表板「AI 員工 → 進階設定」、MCP `agent_update` 工具，或由操作者用一般編輯器改 `agent.toml [capabilities]`。這三條都不經這個 hook（hook 只看得到 Claude Code 自己的 Write／Edit／Bash 呼叫），所以員工（含它的團隊角色成員）無法從 session 內走這條路
 - **調整權限或新增工具** → 儀表板「AI 員工 → 進階設定」，或編輯 `agent.toml [capabilities]` 再手動指定（不走檔案工具）
 - **改委派政策或白名單** → 儀表板「進階設定 → 委派權限」，或直接編輯 `config.toml [delegation]` 再重啟 gateway
 - **新增 MCP server** → 編輯 `.mcp.json` 的 `tools` 陣列（不要改身分區塊），儀表板「進階設定 → MCP 伺服器」手動新增

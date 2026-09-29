@@ -29,7 +29,7 @@ DuDuClaw 的 Docker 映像建置於 `container/Dockerfile.server`，採三階段
 - `duduclaw` 主程式（Rust，含 dashboard）
 - `@anthropic-ai/claude-code`、`@openai/codex`、`@google/gemini-cli`（透過 `npm i -g`）
 - `docker.io` CLI（用於呼叫宿主機 Docker daemon 建立 agent sandbox）
-- （選用）Python 3.12：僅進階本地推論（MLX / LLMLingua-2，需 `mlx_lm` / `llmlingua`）才需要；Skill 安全掃描與通道回覆已是 Rust-native，不再依賴 Python
+- （選用）Python 3.12：僅 LLMLingua-2 提示壓縮器（需 `llmlingua`）才需要；Skill 安全掃描與通道回覆已是 Rust-native，不再依賴 Python
 
 ---
 
@@ -543,7 +543,7 @@ docker compose exec duduclaw bash
 
 # 跑一次性指令
 docker compose exec duduclaw duduclaw agent list
-docker compose exec duduclaw duduclaw cost summary
+docker compose exec duduclaw duduclaw doctor
 
 # Log
 docker compose logs -f duduclaw

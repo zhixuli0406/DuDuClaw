@@ -180,6 +180,12 @@ identity_resolve { channel, external_id }
 
 這道 scope 閘門遵循 DuDuClaw「安全閘門 fail closed」的慣例，沒有 `Scope::IdentityRead` 的金鑰會被拒絕，絕不悄悄放行。
 
+身分相關的 MCP 工具**只有** `identity_resolve` 這一個。RFC-21 §1 另外提過 `identity_list_project_members` 與 `identity_invalidate_cache`：兩個都**未落地**，也沒有排程。`lookup_project_members` 在 provider trait 上是活的（`ChainedProvider` 有用），但沒有任何 MCP 工具把它暴露出去；快取失效則是直接改 wiki 檔案，沒有對應的工具可以觸發。
+
+### 實際回答的是哪個 provider
+
+三個呼叫點——這個 MCP 工具、下面的 `<sender>` 區塊、儀表板的 `identity.resolve` RPC——都走同一個讀 `config.toml [identity] provider` 的共用建構器。2026-09 功能盤點之前，前兩者是硬編死在 wiki 快取上的，所以設定了 Notion 的 operator 會看到儀表板真的走 Notion，但每個 AI 員工其實只讀得到本地快取。現在三者一致。
+
 ---
 
 ## `<sender>` 區塊：把身分當成資料

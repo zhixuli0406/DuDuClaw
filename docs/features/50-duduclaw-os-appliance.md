@@ -91,6 +91,14 @@ something misleading.
   confirm, not just clicking a button), restart, and shutdown, each behind
   its own confirmation.
 
+Everything on this page is also reachable two other ways — an AI employee
+can ask for it as a tool, and an operator can run it from the box's own
+terminal. All three go through one implementation
+(`crates/duduclaw-gateway/src/os_ops.rs`), so an answer never depends on
+which door you came in by; only the permission check differs, because each
+door has a different way of knowing who is asking. See
+[33-os-native-perception.md](33-os-native-perception.md) for the details.
+
 ## Editions and the Desktop
 
 Every DuDuClaw OS image boots into DuDuClaw's own desktop — a compositor and

@@ -65,59 +65,45 @@ The router accounts for this difference when estimating query complexity. Withou
 
 ---
 
-## The Multi-Backend Inference Engine
+## The inference engine behind the router
 
-Behind the router sits a unified inference engine that supports multiple backends through a single interface:
+For what models are available, how to pick one and how to install it, read **[53-local-models.md](53-local-models.md)** — that page owns the backend story now. This section covers only what the router needs to know.
 
-### Backend Options
+### One shipped backend
 
-**llama.cpp** — The C++ workhorse. Supports hardware acceleration across:
-- Apple Metal (macOS)
-- NVIDIA CUDA (Linux/Windows)
-- Vulkan (cross-platform GPU)
-- CPU fallback (any platform)
+**OpenAI-compatible HTTP** is the only `InferenceBackend` implementation that ships. It talks to anything speaking the OpenAI chat-completions API: llama-server, Ollama, llamafile single-binary servers, vLLM, SGLang. Configure it under `inference.toml [openai_compat]`.
 
-**mistral.rs** — A Rust-native engine with advanced features:
-- ISQ (In-Situ Quantization): Quantize models on-the-fly without pre-processing
-- PagedAttention: Efficient memory management for longer contexts
-- Speculative Decoding: Use a small model to draft tokens, verified by the main model
+The in-process backends this page used to list were removed on 2026-09-29 (`wiki/reports/feature-audit-2026-09-29.md` T1-D2/D3, T3-S4/S5):
 
-**OpenAI-compatible HTTP** — Connects to any server that speaks the OpenAI chat completions API:
-- Exo distributed clusters
-- llamafile single-binary servers
-- vLLM, SGLang, and other serving frameworks
+- **llama.cpp** (`llama-cpp-2`) — the release build never compiled the `metal`/`cuda`/`vulkan` features, and its `generate()` was a stub returning "not yet fully implemented".
+- **mistral.rs** (`mistralrs-core`, ISQ / PagedAttention / speculative decoding) — same: never compiled into a shipped binary.
+- **MLX bridge** (`mlx_lm` Python subprocess) — zero call sites. The "local reflections without API calls" path this page described never existed in code.
+- **Exo distributed clusters** — no example config anywhere in the repo made the mode unreachable for users; pointing `[openai_compat] base_url` at an Exo endpoint reaches the same cluster.
 
-**MLX Bridge** — For Apple Silicon users, a Python subprocess calling `mlx_lm`:
-- Local reflections without API calls
-- LoRA adapter support for agent personality fine-tuning
-- Saves API tokens by running reflections locally
+`BackendType::LlamaCpp` and `MistralRs` remain parseable config values so an existing `inference.toml` still loads, but selecting one returns `BackendUnavailable` with a message naming `openai_compat`.
 
-### The InferenceManager State Machine
+### The InferenceManager state machine
 
-The system doesn't just pick one backend and stick with it. The InferenceManager maintains a priority chain with automatic failover:
+The manager keeps a priority chain with automatic failover:
 
 ```
-Priority 1: Exo P2P Cluster
-  (Multiple machines pooling GPU memory — can run 235B+ models)
-     |
-     v  (unavailable or unhealthy?)
-Priority 2: llamafile
+Priority 1: llamafile
   (Single-binary server, zero installation)
      |
      v  (unavailable?)
-Priority 3: Direct Backend
-  (llama.cpp or mistral.rs loaded in-process)
+Priority 2: Direct Backend
+  (an in-process `InferenceBackend`; none ships today)
      |
      v  (no local GPU / model too large?)
-Priority 4: OpenAI-compatible Server
-  (External vLLM, SGLang, etc.)
+Priority 3: OpenAI-compatible Server
+  (llama-server, Ollama, vLLM, SGLang, …)
      |
      v  (no external server available?)
-Priority 5: Cloud API
+Priority 4: Cloud API
   (Claude API — the last resort, always available)
 ```
 
-Each backend has periodic health checks. If a backend becomes unhealthy (crashes, runs out of memory, returns errors), the manager automatically falls to the next tier. When the backend recovers, it's promoted back.
+Each tier has periodic health checks. When one becomes unhealthy (crashes, runs out of memory, returns errors), the manager falls to the next. When it recovers, it is promoted back.
 
 ---
 
@@ -183,7 +169,7 @@ The inference engine is fully manageable through MCP tools:
 | `inference_status` | Loaded model, hardware, memory usage, backend type |
 | `hardware_info` | GPU auto-detect, VRAM, RAM, recommendations |
 | `route_query` | Preview routing decision without generation |
-| `inference_mode` | Current mode (exo-cluster/llamafile/direct/cloud-only) |
+| `inference_mode` | Current mode (llamafile/direct/openai-compat/cloud-only) |
 | `model_search` | Search HuggingFace + curated repos with RAM filtering |
 | `model_download` | Download to `~/.duduclaw/models/` with resume + mirror fallback |
 | `model_recommend` | Hardware-aware model suggestions |

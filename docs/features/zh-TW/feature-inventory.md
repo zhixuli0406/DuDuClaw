@@ -44,7 +44,7 @@
 | 產物 provenance + 交付安全(v1.60) | `artifacts.jsonl` 五種 origin 的 provenance ledger(declared/swept/uploaded/produced/unknown,exact/inferred 歸屬標示,絕不用時間窗猜方向);goal 驗收通過時封存產物副本進 `attachments/`(canonicalize 圈定、20MB/100MB 上限);📎DELIVER 前的零 LLM 交付閘(零位元組/magic 不符/zip 損壞硬失敗);`[limits]` DocumentLimits 守三個下游 office/zip 解析器;修補專家包解壓 header 謊報繞過 |
 | 憑證 P1 + secret 參照收斂(v1.60) | `secret://keychain` 與 `secret://file` 本機 backend、tick 來源 headers 支援 `secret://`、憑證來源總表卡 + `doctor --fix-residue`;`SecretRef`/`Secret` 型別收斂七套手刻解密方言:修掉 `secret://` 參照字面值被當真憑證送給 vendor API 的洩漏;WhatsApp webhook 驗簽改 fail-closed;ActionGuard 判官改吃 21 項封閉列舉 findings(攻擊者可控文字結構上進不了判官 prompt);MCP key 輪替即時生效、`denied_tools`/`allowed_tools` 補上 MCP 分派總門強制 |
 | 十通道通知統一(v1.60) | autopilot `notify`、MCP `send_message`、提醒全部改走共用 `create_sender` 工廠,十通道全通(WebChat 誠實拒絕);修復 autopilot slack 通知從未送出過的活 bug 與 Google Chat / Teams 靜默跳過缺陷 |
-| 進化量測硬化(v1.60) | AEE 提交閘拆 visible / held-out 兩維(fence-only:只否決不晉升);冠軍 bootstrap 改同形量測;`duduclaw evolution clear-holdout-rotation` 操作者出口;每輪 14 個旋鈕快照進 `aee_round` 事件;Code Mode Phase 0 量測閘(`duduclaw cost tool-loop`,四判準 PROCEED/REJECT/INSUFFICIENT_DATA) |
+| 進化量測硬化(v1.60) | AEE 提交閘拆 visible / held-out 兩維(fence-only:只否決不晉升);冠軍 bootstrap 改同形量測;`duduclaw evolution clear-holdout-rotation` 操作者出口;每輪 14 個旋鈕快照進 `aee_round` 事件 |
 | cron 星期慣例修正(v1.61,**BREAKING**) | 數字星期欄在解析時從 Unix crontab 慣例(0/7=週日、1-5=週一到五)轉譯成 `cron` crate 的 Quartz 序數,排程器/heartbeat/MCP 驗證/儀表板共用同一份 normaliser:先前 `* * 1-5` 實際排的是週日到週四(週日幽靈觸發 + 週五整天靜默跳過);刻意照 Quartz 寫的排程升級後會位移一天 |
 | `duduclaw migrate-from claude-code`(v1.61) | 單向匯入 Claude Code 的 memory shard(→ semantic + SPO 時間記憶)、CLAUDE.md(→ agent wiki context 層,不佔注入預算)與對話逐字稿(噪音濾除只留人類 prompt + assistant 最終回覆,實測有效訊號僅約 1.5%);一律 `origin=import`(trust ≤ 0.7)、當 DATA、redaction 預設開、過注入掃描、skill 過安全掃描 fail-closed;需人工 `--apply` 才真正寫入 |
 | 通道能力表(v1.61) | `channel_capabilities.rs` 單一權威表:11 通道 × 7 能力(檔案/照片上傳、互動按鈕、edit-in-place、typing、原生 markdown、引用回覆)+ 進度節流秒數;不支援的能力從靜默 no-op 改為留下結構化 log |
@@ -58,7 +58,7 @@
 |------|------|
 | 進化系統 v3:AEE + playbook | 預設進化標的從「整份改寫 SOUL.md」改為基因形 playbook 行為規則:Gate/Measure 閘門分離、champion + matches-or-improves 提交閘、條目級觀察窗;SOUL.md 對 agent 唯讀([38-aee-playbook-evolution.md](../38-aee-playbook-evolution.md)) |
 | E1 條目斷言 + 反 reward-hacking 稽核 | 每條新規則必附可機器檢查的斷言,對錄製 transcript 做零 LLM 重放(`G-Assertions`);提案提交前確定性篩查題庫題面洩漏 / 恆真空話 / 失敗抑制 |
-| 任務層前瞻模型 | goal loop 上的 predict-act-verify 世界模型:四階退化統計預測(冷啟動零 LLM)、觀察證據保真度分級(原生工具事件 / 只有稽核日誌 / 無)、`<state>` 狀態區塊 + (狀態,行動) 訪問圖震盪偵測、確定性任務規則歸納;`[task_forward_model]`,預設關 |
+| 任務層前瞻模型 | goal loop 上的 predict-act-verify 世界模型:四階退化統計預測(冷啟動零 LLM)、觀察證據保真度分級(原生工具事件 / 只有稽核日誌 / 無)、`<state>` 狀態區塊 + (狀態,行動) 訪問圖震盪偵測、確定性任務規則歸納;`[task_forward_model]`,v1.54 起預設開 |
 | 派工證據落地預檢 | 驗收判官之前的零 LLM 證據檢查:最終回覆必須與真實的非錯誤工具結果重疊;自我回音排除名單 + 輸入重疊扣除,防自我證明;`[dispatch] grounding_precheck_enabled`,預設開 |
 | 記憶新穎度閘門 | 語意層近重複寫入在落地前被擋下並記遙測(0.92 字元 n-gram cosine),防假驚訝累積;時間取代/再確認路徑豁免;`[memory] novelty_gate`,預設開 |
 | 有證據才歸納的反思 | MistakeNotebook 條目附程式化抽取的 `TrajectoryEvidence`;查無證據的自述錯誤不再參與規則歸納 |
@@ -70,7 +70,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| 統一 LLM provider 層(`duduclaw-llm`) | 一套正規化的 request/stream 形狀,涵蓋四種原生協議(Anthropic / OpenAI Responses / Gemini / OpenAI-compat,8 個 preset);`ModelRegistry` 定價 + `FallbackRouter` 冷卻;stdio MCP client + provider 無關的 tool loop,讓 API 模式 agent 取得完整工具面 |
+| 統一 LLM provider 層(`duduclaw-llm`) | 一套正規化的 request/stream 形狀,涵蓋四種原生協議(Anthropic / OpenAI Responses / Gemini / OpenAI-compat,8 個 preset);`ModelRegistry` 定價;stdio MCP client + provider 無關的 tool loop,讓 API 模式 agent 取得完整工具面 |
 | Agent 行為評測(`duduclaw eval`) | 每 agent 的 golden-task 回歸:確定性 tool-call/regex/grounded 斷言 + 可選 LLM 判官;live 與 replay 兩種模式,exit code 可作 CI 閘 |
 | HITL ApprovalBroker | 橫跨 MCP 工具 / autopilot / bus 任務的單一中斷/審批原語;SQLite 落地,TTL 過期 = DENY(fail-closed) |
 | OpenTelemetry GenAI 追蹤 | opt-in 的 `gen_ai.*` span,可經 OTLP 匯出至 Langfuse/Grafana/Jaeger/Datadog;關閉時零開銷 |
@@ -177,12 +177,13 @@
 
 ## 演化系統
 
-> **進化系統 v3（2026-08-06）**：預設進化標的從「整份改寫 `SOUL.md`」改為
-> **playbook**（小顆粒、可個別退休的基因形規則；`SOUL.md` 預設對 agent
-> 唯讀）。下表的 GVU²（雙迴圈 / 4+2 層驗證 / SOUL.md 版本控制）現在描述的
-> 是**非預設的 legacy 路徑**（`agent.toml [evolution] legacy_soul_evolution
-> = true`）。現行預設（AEE、Gate/Measure 分離、champion +
-> matches-or-improves、條目級觀察窗）見
+> **進化系統 v3（2026-08-06）→ S11（2026-09-29）**：進化標的從「整份改寫
+> `SOUL.md`」改為 **playbook**（小顆粒、可個別退休的基因形規則；`SOUL.md`
+> 對 agent 唯讀），並於 2026-09-29 **直接移除** legacy SOUL 改寫路徑——
+> `[evolution] legacy_soul_evolution` 逃生門、`SOUL.md` 版本化、24 小時觀察
+> 期、自動回滾、超額 consolidate 重寫、deferred GVU 重試與
+> `duduclaw evolution finalize` CLI 全部一併移除。`[evolution] gvu_enabled`
+> 現在出廠即為 `true`。現行（也是唯一）引擎見
 > [38-aee-playbook-evolution.md](../38-aee-playbook-evolution.md) 與
 > [evolution-engine.md](../../architecture/evolution-engine.md) 第十二章。
 
@@ -192,13 +193,8 @@
 | 雙系統路由器 | System 1（規則）/ System 2（LLM 反思）|
 | AEE（v3 預設） | Agentic Evolution Engine — Generator 內迴圈（≤3 輪）→ Gate（確定性、有否決權）/ Measure（分數、無否決權）分離 → champion + matches-or-improves 提交閘 → 條目對自己連結的 eval case 各自 confirm/rollback |
 | Playbook（v3 預設） | 基因形行為規則（category/signals_match/eval_cases/success_streak），擴建自既有 rule_lifecycle 儲存，0.92 cosine 去重，容量 + 過期/封存生命週期 |
-| GVU² 雙迴圈（legacy） | 外迴圈（Behavioral GVU — SOUL.md 改寫）+ 內迴圈（Task GVU — 即時重試）；經 `legacy_soul_evolution = true` 選入 |
-| 4+2 層驗證（legacy） | L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety |
 | MistakeNotebook | 跨迴圈錯誤記憶 — 記錄失敗模式、防止退化；條目現在附確定性 `TrajectoryEvidence`（哪個工具/斷言失敗），查無證據的自述診斷不再參與反思歸納（v3） |
-| SOUL.md 版本控制（legacy） | 24h 觀察期 + 原子回滾 + SHA-256 指紋 — 適用 legacy GVU 路徑；SOUL.md 超上限死鎖現在經受控 consolidate 重寫解除，不再凍住 agent（v3 Phase 0） |
 | MetaCognition | 每 100 次預測自動校準誤差閾值，新增對稱回升規則，閾值不再單向漂移（v3 Phase 0） |
-| Adaptive Depth | MetaCognition 驅動 GVU 迭代深度（3-7 輪）|
-| Deferred GVU（legacy） | gradient 累積 + 延遲重試（最多 3 次 deferral、72h 跨度、9-21 輪有效迭代）|
 | 停滯偵測器（v3） | 每 30 分鐘掃描 `evolution.db` 的連續拒絕 / 連續 D 天零 apply / 重複拒絕原因訊號，發到 Activity Feed + 儀表板 |
 | ConversationOutcome | 零 LLM 對話結果偵測（TaskType / Satisfaction / Completion），zh-TW + en |
 | Agent-as-Evaluator | 獨立 Evaluator Agent（Haiku 成本控制）進行對抗式驗證 |
@@ -234,14 +230,10 @@
 
 | 功能 | 說明 |
 |------|------|
-| llama.cpp | Metal/CUDA/Vulkan/CPU（透過 `llama-cpp-2` crate）|
-| mistral.rs | Rust 原生，ISQ、PagedAttention、Speculative Decoding |
-| OpenAI 相容 HTTP | Exo/llamafile/vLLM/SGLang |
+| OpenAI 相容 HTTP | 唯一出貨的 backend——llama-server／Ollama／vLLM／SGLang／llamafile。行程內的 llama.cpp、mistral.rs、MLX 三個 backend 已於 2026-09 移除（release binary 從未編譯過它們）|
 | 信心路由器 | LocalFast / LocalStrong / CloudAPI 三層路由 + CJK-aware token 估算 |
-| InferenceManager | 多模式自動切換：Exo P2P → llamafile → Direct → OpenAI-compat → Cloud API |
+| InferenceManager | 多模式自動切換：llamafile → Direct → OpenAI-compat → Cloud API |
 | llamafile 管理 | 子程序生命週期、零安裝跨 6 OS |
-| Exo P2P 叢集 | 分散式推論，235B+ 模型跨機器、cluster discovery、endpoint failover |
-| MLX Bridge | Apple Silicon `mlx_lm` + LoRA 本地反思 |
 | 模型管理 | `model_search`（HuggingFace）/ `model_download`（resume + mirror）/ `model_recommend`（硬體感知）|
 
 ## 壓縮引擎
@@ -269,14 +261,15 @@
 
 | 功能 | 說明 |
 |------|------|
-| 3 階段防禦 | 確定性黑名單（<50ms）/ 混淆偵測（YELLOW+）/ Haiku AI 判讀（RED only）|
-| 威脅等級狀態機 | GREEN → YELLOW → RED 自動升降級，24h 無事件降一級 |
+| `agent-file-guard` PreToolUse hook | `duduclaw hook agent-file-guard`（Rust 子命令，matcher `Write\|Edit\|MultiEdit\|Bash`，由 `agent_hook_installer` 逐 agent 安裝）——擋正規樹外的 agent 結構檔、擋寫自己的 SOUL.md、擋跨 agent 寫入 |
+| `org_field_guard` | 同一個 hook 內的欄位級凍結：`[agent] reports_to`／`department`／`name`、整張 `[capabilities]` 表，以及 `config.toml [delegation]`／`[acp]`；內容無法解析或寫入意圖無法重建一律 fail-closed |
+| `data-file-guard` PreToolUse hook | `duduclaw hook data-file-guard`（RFC-23 §14.4，H10 2026-09 起為 Rust 子命令，matcher `Read\|Bash`），只有去識別化生效時才武裝；本質是 `Bash` 檔名啟發式，不是沙箱 |
 | Ed25519 認證 | 挑戰-回應式 WebSocket 認證 |
 | AES-256-GCM | API 金鑰靜態加密、per-agent 隔離 |
-| Prompt Injection 掃描 | 6 規則類別 + XML 分隔標籤保護 |
+| Prompt Injection 掃描 | `input_guard`——7 類規則、阻擋門檻 60、先 NFKC 正規化、英文＋zh-TW 樣式、XML 分隔標籤保護 |
 | SOUL.md 漂移偵測 | SHA-256 指紋比對 |
 | CONTRACT.toml | 行為邊界 + `duduclaw test` 紅隊測試（9 場景）；自動注入所有 runtime 的 system prompt |
-| RBAC | 角色存取控制矩陣 |
+| RBAC 矩陣（唯讀檢視）| 安全頁把每個 agent 的工具／網路／審批矩陣渲染出來，資料源是 `agent.toml [capabilities]`。`duduclaw-security::rbac` 模組已移除（零呼叫端），可編輯的權威來源就是各 agent 的 capability envelope |
 | 統一多源審計日誌 | `audit.unified_log` 合併 `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` |
 | JSONL 審計日誌 | async 寫入，格式相容 Rust `AuditEvent` schema |
 | Unicode 正規化 | NFKC 偵測同形字攻擊 |
@@ -335,10 +328,11 @@
 
 | 功能 | 說明 |
 |------|------|
-| 5 層路由 | API Fetch / 靜態爬取 / 無頭 Playwright / 沙盒容器 / Computer Use |
-| 能力閘門 | `agent.toml [capabilities]` 預設拒絕 |
-| Browserbase | 雲端瀏覽器（L5 替代）|
-| bash-gate.sh | Layer 1.5 allowlist（需 `DUDUCLAW_BROWSER_VIA_BASH=1`）|
+| L1 `web_fetch_cached` | 經 SSRF 閘、帶磁碟快取的 HTTP GET（body 截斷在 6 萬字元）|
+| L2 `web_extract` | 同一條抓取路徑＋CSS 選擇器擷取（`text`／`html`／`json`）|
+| L3 headless（可選，外部）| 在該 agent 的 `.mcp.json` 註冊 Playwright 或 Browserbase MCP server；不在 binary 內，L2 也不會自動降級過去 |
+| L5 Computer Use | 七個 `computer_*` MCP 工具，經 `computer_use_orchestrator` 驅動容器虛擬顯示器 |
+| 能力閘門 | `agent.toml [capabilities]` 預設拒絕（`computer_use`／`browser_via_bash`／`allowed_tools`／`denied_tools`）；`denied_tools` 同時以 `--disallowedTools` 與 MCP 分派總門兩處強制 |
 
 ## 容器沙盒
 
@@ -356,7 +350,6 @@
 | ReminderScheduler | 一次性提醒（相對 `5m`/`2h`/`1d` 或 ISO 8601），`direct` / `agent_callback` 兩種模式 |
 | HeartbeatScheduler | 每 Agent 統一排程 — bus polling + GVU 沉默喚醒 + cron |
 | 排程器級任務板拉取（v1.9.3）| `poll_assigned_tasks` 移入 `HeartbeatScheduler::run` tick — 每 30s 掃描整個 agent registry（不再略過 `enabled=false` 的 agent）；1 小時 LIKE-marker 冷卻防止 stampede |
-| `duduclaw evolution finalize` CLI（v1.9.1）| 一次性回收應已結束的 SOUL.md 觀察窗；`--dry-run` / `--agent` 篩選；作為 30 分鐘 `ObservationFinalizer` 背景任務的後備 |
 
 ## 任務板與 Activity Feed
 
@@ -383,10 +376,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| Durability 框架（`duduclaw-durability`，v1.9.4）| 五大支柱 — `idempotency`（key 去重）、`retry`（指數退避 + jitter）、`circuit_breaker`（三態 + `probe_inflight` 計數）、`checkpoint`（可恢復任務進度）、`dlq`（死信佇列）。用於 gateway LLM fallback + 持久化 cron |
-| 治理層（`duduclaw-governance`，v1.9.4）| `PolicyRegistry` 支援 YAML 載入 + 熱重載 + agent 優先合併 + fail-safe（非法政策略過、malformed YAML 不 panic）。四種 `PolicyType` — Rate / Permission / Quota / Lifecycle |
-| 配額管理 | 每 agent / 每政策 soft + hard 配額強制；`error_codes.rs` 標準化治理錯誤（QUOTA_EXCEEDED / POLICY_DENIED / ...）。預設集於 `policies/global.yaml`（如 `default-rate-mcp` 200/min）|
-| LLM Fallback 鏈（`gateway/llm_fallback.rs`，v1.9.4）| 主模型 timeout/503/429/overloaded 自動切換 fallback；純函數 `is_llm_fallback_error` / `should_attempt_model_fallback` 有單元測試；hard-deadline arm 回傳 `Err("hard timeout")` 確保 fallback 可靠觸發 |
+| LLM Fallback 鏈（`gateway/failover.rs::model`，v1.9.4）| 三層備援的第二層（帳號 → 模型 → runtime，2026-09-29 收斂）：主模型 timeout/503/429/overloaded 自動切換到較輕的 fallback 模型；純函數 `is_llm_fallback_error` / `should_attempt_model_fallback` 有單元測試，派工路徑統一呼叫 `FailoverManager::model_fallback_for` 取得決策；hard-deadline arm 回傳 `Err("hard timeout")` 確保 fallback 可靠觸發 |
 | Evolution Events 系統（v1.9.4）| 30+ 事件 schema（`schema.rs`）、async batch+retry emitter（`emitter.rs`）、查詢介面（`query.rs`）、可靠性保證（`reliability.rs`）；HTTP 端點呈現於 Web `ReliabilityPage` |
 
 ## 身分與存取
@@ -406,17 +396,12 @@
 | AI Judge | 為並行分支評分以挑選最佳延續 |
 | 預算控制 | `budget.rs` 限制 fork fan-out / 成本 |
 
-## CLI Runtime（PTY Pool）
+## CLI Runtime（一次性 PTY）
 
 | 功能 | 說明 |
 |------|------|
-| 跨平台 PTY Pool（`duduclaw-cli-runtime`，v1.15.0）| 驅動真正的互動式 `claude` REPL（Win 10 1809+ 用 ConPTY、Unix 經 `portable-pty` 用 openpty），以 sentinel-framed in-band 回應協定 — 因應 Anthropic 對 OAuth 訂閱帳號封鎖 `claude -p`。預設關閉，per-agent 開啟 `[runtime] pty_pool_enabled = true` |
-| Worker Supervisor（`duduclaw-cli-worker`）| 受 `[runtime] worker_managed = true` 閘控的跨程序 worker 子程序；SIGTERM/SIGKILL 接入 gateway 優雅關機序列 |
-| `pty_runtime.rs` 轉接器 | `RuntimeMode::{FreshSpawn, PtyPool}` per-agent 路由，`acquire_and_invoke` 介面；OAuth → 互動式 REPL，API-key → `oneshot_pty_invoke + claude -p` |
-| 解除 Claude 綁定（v1.24.0）| 新增 `CliKind::Antigravity`；`which_codex` / `which_gemini` / `which_agy` 探測（與 `which_claude` 並列）；`resolve_program` + worker `spawn_session_default` 四種 CliKind 全接（不再回 `None`/reject）；`cli_kind_for_provider()` 依 `[runtime] provider` 推導 PtyPool 種別，取代兩處寫死的 `CliKind::Claude`。互動式 REPL 刻意維持 Claude-only（非 Claude provider 走 oneshot `runtime_dispatch`）|
-| Runtime 狀態端點 | `GET /api/runtime/status` 僅 loopback JSON（Phase 8.5）|
-| 可觀測性 | `pty_pool_*` Prometheus 計數器（acquires / cache-hit / spawn / eviction / invoke outcomes / duration histogram）、`worker_health_misses_total`、`worker_restarts_total`、`pty_pool_managed_worker_active` gauge |
-| 優雅 fallback | 所有 PTY 路徑出錯時退回舊版 `tokio::process::Command + claude -p` — worker 缺失 / pool 不健康 / spawn 失敗皆可恢復 |
+| 一次性 PTY 呼叫（`duduclaw-cli-runtime`）| 在真正的偽終端下 spawn CLI（Win 10 1809+ 用 ConPTY、Unix 經 `portable-pty` 用 openpty）並把 stdout 讀到 EOF，服務那些 stdout 接到 pipe 就拒跑的 CLI。使用者：Grok runtime 與 CLI 登入輔助流程。`clear_env` 把 gateway 的廠商 API 金鑰擋在子行程外；`deadline` 是絕對 wall-clock 上限。見 [27-pty-pool-runtime](27-pty-pool-runtime.md) |
+| PTY session 連線池 —— **2026-09 移除** | 長駐的 sentinel-framed `claude` REPL 連線池、`duduclaw-cli-worker` 子行程＋supervisor、`RuntimeMode::PtyPool`、`GET /api/runtime/status`、`pty_pool_*` / `worker_*` 指標與 `[runtime] pty_pool_enabled` / `worker_managed` 鍵全部移除。理由：它所保的 Anthropic 程式化用量拆分於 2026-06-15 暫停後從未恢復，而連線池的 session 沒有對話維度（跨對話 context 洩漏），本來就無法安全啟用 |
 
 ## MCP HTTP/SSE 傳輸（W20）
 
@@ -459,7 +444,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| 23 頁面 | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
+| 路由 | `web/src/App.tsx` 內約 74 條非轉址路由（另有約 30 條 legacy 轉址別名，讓舊書籤繼續可用）。四個殼：工作區（`/`、`/chat`、`/tasks`、`/goals`、`/inbox`、`/files`、`/mail`、`/timeline`、`/foresight`、`/gallery`、`/canvas`…）、AI 員工（`/agents`、`/agents/:id/:tab`、`/agents/new`、`/experts`、`/org`、`/presets`）、`/manage/*`（通道、日誌、帳務、成員、部門、經銷商、推理、本地模型、微調、可靠性、安全稽核、知識庫信任…）、`/app/system/*`（設定、安全、帳號、授權、因果、決策實驗室、CCR…），以及獨立頁（`/login`、`/welcome`、`/webchat`、`/console`、`/mascot-overlay`、`/pet-studio`、`/world`、`/launcher`）。側邊欄顯示什麼以 `web/src/components/layout/nav-model.ts` 為準 |
 | 技術棧 | React 19 + TypeScript + Tailwind CSS 4 + Base UI + CVA |
 | DuDuClaw 設計系統（mds）| 共用 `web/src/components/mds/` 元件庫（OKLCH token、四層表面、三層陰影、Inter／Geist Mono）+ `nav-model.ts` 分組側邊欄（個人／工作／公司／設定）+ `web/DESIGN.md` 設計規範；全頁面以共用元件建構，en/ja/zh i18n 同步 |
 | 即時日誌串流 | BroadcastLayer tracing → WebSocket |

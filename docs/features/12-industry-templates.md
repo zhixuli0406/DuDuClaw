@@ -78,6 +78,41 @@ Step 5: Let evolution take over
 
 ---
 
+## One Pack Format
+
+An industry template, an expert pack (a whole team), and a job preset are three shapes of one idea: a declaration that produces pre-configured AI employees. They now share a single manifest schema and a single command.
+
+`pack.toml` says which shape it is:
+
+```toml
+[pack]
+schema  = 1
+id      = "clinic-team"
+kind    = "team"        # "preset" = one job config | "team" = a roster | "template" = one industry persona
+tier    = "free"        # "free" | "premium"
+version = "1.0.0"
+label   = "Aesthetic / dental clinic"
+description = "A front desk plus five department workers"
+
+[[pack.agents]]
+name = "clinic-assistant"
+role = "front_desk"
+```
+
+One command reads and installs every shape:
+
+```bash
+duduclaw pack list                 # installed packs, local presets, and what the catalog offers
+duduclaw pack inspect ./my-team    # normalized view, including which dialect it was read from
+duduclaw pack install ./my-team    # routes by kind; premium content checks the licence in one place
+```
+
+`kind` decides the route — a preset lands in the preset store (`presets/<id>/preset.toml`, bound to an employee with `duduclaw preset bind`), a team or industry pack goes through the full expert-pack security pipeline described in [features/32](32-expert-packs.md). `tier` is the only premium decision left: four separate code paths used to re-derive "is this paid content" from a directory path, and now a pack carries its own tier and one predicate reads it.
+
+**The three older manifest dialects keep working until v1.68.0.** `expert.toml`, `team.toml` and `preset.toml` are read verbatim — nothing on disk is rewritten, and the premium content tree (whose compliance rules are reviewed line by line by a human) is never machine-converted. `duduclaw expert install` and `duduclaw preset` remain aliases over the same code path. To see what your legacy file looks like under the new schema, run `duduclaw pack inspect <dir> --emit-canonical`; it prints, it does not write.
+
+---
+
 ## The Odoo ERP Bridge
 
 ### The Problem
@@ -159,7 +194,14 @@ No configuration needed — the bridge probes the Odoo instance and adapts autom
 
 ### Event Synchronization
 
-Beyond executing operations, the bridge can also listen for events in Odoo:
+Beyond executing operations, the bridge can also listen for events in Odoo. Two
+transports feed the same automation bus, and **both are off until you turn them
+on**:
+
+| Transport | Switch | How it works |
+|---|---|---|
+| Polling | `config.toml [odoo] poll_enabled` (default `false`) | Every `poll_interval_seconds` (60–86400, default 60) the gateway asks Odoo for records in `poll_models` whose `write_date` moved since the last cycle. |
+| Webhook | `config.toml [odoo] webhook_enabled` (default `false`) | An Odoo automated action posts to `POST /webhook/odoo` with the shared secret from `[odoo] webhook_secret`. |
 
 ```
 Odoo event occurs:
@@ -168,17 +210,32 @@ Odoo event occurs:
   - Invoice overdue
      |
      v
-Event polling picks up the change
+Polling picks up the change  OR  Odoo posts to /webhook/odoo
      |
      v
-Agent receives notification
+An `odoo_event` lands on the automation bus
      |
      v
-Agent can take action:
+Your autopilot rules decide what happens:
   - Notify the sales team about the new lead
-  - Update the customer about their order
+  - Delegate a follow-up task to an agent
   - Send a payment reminder for the overdue invoice
 ```
+
+Write rules against `odoo_event` the same way you would against any other
+trigger. Alongside `event_type` / `model` / `record_id`, each record's
+top-level scalar fields are available directly, so a condition reads
+`{"field": "state", "op": "eq", "value": "sale"}` with no extra plumbing.
+
+Security notes, because this endpoint is reachable from outside:
+
+- While `webhook_enabled` is off the route returns **404** — a stock install
+  gives away nothing, not even that the endpoint exists.
+- A missing or wrong secret is **401**. So is an *empty* configured secret: a
+  half-finished setup refuses everything rather than accepting anything.
+- Polling needs `poll_enabled`, a configured Odoo connection, and at least one
+  valid model name in `poll_models`. Missing any of the three means no task is
+  started at all.
 
 This turns the agent from a passive tool-user into a proactive business participant that reacts to real-world events.
 

@@ -75,6 +75,25 @@ repositories.
 The client credentials are persisted (secret encrypted at rest) so
 re-authorizing later does not require re-entering the secret.
 
+## The master switch
+
+The five tools sit behind `config.toml [integrations] github`, which defaults
+to **false**. Until it is on, the tools do not appear in any agent's tool list
+and a call to one is refused with a message pointing back at this page — the
+same deny-by-default posture the Google Workspace integration has always had.
+
+Connecting from the dashboard flips it on for you; there is nothing extra to
+do. To turn the integration off again without deleting the stored token, set:
+
+```toml
+[integrations]
+github = false
+```
+
+Why it exists: a token in the OAuth vault says *an operator connected GitHub*,
+not *every agent on this box may post public comments as me*. Before the
+2026-09 feature audit those were the same thing.
+
 ## About the token
 
 A classic GitHub OAuth App token has **no expiry** (`expires_at` is empty — the

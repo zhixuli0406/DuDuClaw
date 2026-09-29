@@ -367,13 +367,20 @@ scrape_configs:
 
 | 指標 | 型別 | 說明 |
 |--------|------|-------------|
-| `duduclaw_requests_total` | Counter | 依 agent、通道、runtime、狀態分類的總請求數 |
-| `duduclaw_tokens_total` | Counter | 依 agent、類型（input/output/cache_read）分類的總 token 數 |
-| `duduclaw_request_duration_seconds` | Histogram | 依 agent、runtime 分類的請求延遲 |
-| `duduclaw_active_sessions` | Gauge | 目前活躍中的 session 數 |
-| `duduclaw_channel_connected` | Gauge | 通道連線狀態（1/0） |
 | `duduclaw_failover_total` | Counter | Provider failover 事件次數 |
-| `duduclaw_budget_remaining_cents` | Gauge | 各帳號剩餘預算 |
+| `duduclaw_goal_loop_bail_pattern_total` | Counter | goal loop 提前收工語句，依 pattern 分類 |
+| `duduclaw_tick_events_total` / `_dropped_total` | Counter | 常駐感知的觀測與丟棄數，依來源分類 |
+| `duduclaw_prompt_compression_runs_total` | Counter | prompt 壓縮階段執行次數，依階段分類 |
+| `duduclaw_relay_frames_total` | Counter | relay WebSocket 訊框，依通道與結果分類 |
+
+> **2026-09 移除。** `duduclaw_requests_total`、`duduclaw_tokens_total`、
+> `duduclaw_request_duration_seconds`、`duduclaw_active_sessions`、
+> `duduclaw_channel_connected`、`duduclaw_budget_remaining_cents` 這六條每次
+> scrape 都會渲染，但生產程式碼從來沒有遞增過——建在它們上面的 Grafana panel
+> 顯示的是恆為零，不是系統閒置。與其留著當裝飾，直接刪除。逐請求的 token 與
+> 成本資料在 cost telemetry 的 SQLite（`cost_summary` / `cost_agents` /
+> `cost_recent` MCP 工具與儀表板的成本頁）；通道連線狀態在儀表板的通道頁。
+> `pty_pool_*` 與 `worker_*` 兩族隨 PTY 連線池在同一版移除。
 
 ### Grafana 儀表板
 
@@ -384,11 +391,10 @@ scrape_configs:
   "dashboard": {
     "title": "DuDuClaw",
     "panels": [
-      {"title": "Requests/min", "type": "stat", "targets": [{"expr": "rate(duduclaw_requests_total[5m])*60"}]},
-      {"title": "Token Usage", "type": "timeseries", "targets": [{"expr": "rate(duduclaw_tokens_total[5m])*60"}]},
-      {"title": "Response Time p95", "type": "stat", "targets": [{"expr": "histogram_quantile(0.95, rate(duduclaw_request_duration_seconds_bucket[5m]))"}]},
-      {"title": "Channels", "type": "table", "targets": [{"expr": "duduclaw_channel_connected"}]},
-      {"title": "Budget", "type": "bargauge", "targets": [{"expr": "duduclaw_budget_remaining_cents"}]}
+      {"title": "Failovers/min", "type": "stat", "targets": [{"expr": "rate(duduclaw_failover_total[5m])*60"}]},
+      {"title": "Sensing events", "type": "timeseries", "targets": [{"expr": "rate(duduclaw_tick_events_total[5m])*60"}]},
+      {"title": "Sensing drops", "type": "timeseries", "targets": [{"expr": "rate(duduclaw_tick_dropped_total[5m])*60"}]},
+      {"title": "Relay frames", "type": "table", "targets": [{"expr": "duduclaw_relay_frames_total"}]}
     ]
   }
 }

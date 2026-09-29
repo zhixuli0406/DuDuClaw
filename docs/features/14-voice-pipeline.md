@@ -1,224 +1,93 @@
 # Voice Pipeline
 
-> Local-first speech intelligence — ASR, TTS, VAD, and real-time voice rooms.
+> Speech in, speech out — two paths that do not yet share a config, and four components this page used to claim that have no code.
 
 ---
 
-## The Metaphor: A Simultaneous Interpreter's Toolkit
+## A note on history
 
-A professional simultaneous interpreter needs three things:
+Until 2026-09 this page described a four-component local-first pipeline: SenseVoice ONNX + Deepgram ASR, Silero VAD, `symphonia` audio decoding, and LiveKit multi-agent voice rooms.
 
-1. **Ears** — to hear and understand the speaker (ASR: speech-to-text)
-2. **Voice** — to speak the translation clearly (TTS: text-to-speech)
-3. **Judgment** — to know when the speaker is talking vs. pausing (VAD: voice activity detection)
+A repo-wide grep for `sensevoice`, `deepgram`, `silero`, `symphonia` and `livekit` returns **no code and no dependency** — only a comment in `.cargo/audit.toml` that names `livekit-api` as the justification for a RUSTSEC exemption, for a crate `Cargo.lock` does not contain. None of those four ever shipped.
 
-And for conference interpreting, they need a **booth** — a controlled environment where multiple interpreters can work on different language pairs simultaneously (LiveKit voice rooms).
-
-DuDuClaw's voice pipeline provides all four components, with a strong preference for local processing — your voice data stays on your machine unless you explicitly route it to the cloud.
+What follows is what actually exists.
 
 ---
 
-## How It Works
+## Two paths, two configurations
 
-### ASR (Automatic Speech Recognition)
+The most important thing to know: **the HTTP voice endpoints and the Telegram voice handler are wired separately, and the `[voice]` settings only reach one of them.**
 
-Four providers, ordered by privacy and cost:
+### Path 1 — the HTTP endpoints (dashboard, WebChat)
 
-| Provider | Location | Speed | Languages | Cost |
-|----------|----------|-------|-----------|------|
-| **SenseVoice (ONNX)** | Local | Fast | CJK + multilingual | Free |
-| **Whisper.cpp** | Local | Moderate | 99 languages | Free |
-| **OpenAI Whisper API** | Cloud | Fast | 57 languages | Pay-per-minute |
-| **Deepgram** | Cloud | Very fast | 36 languages | Pay-per-minute |
+| Endpoint | Auth | Behavior |
+|---|---|---|
+| `POST /api/stt` | Bearer JWT | 10 MiB body cap. Resolves the provider from `config.toml [voice]` **before** touching the body, and returns **501 fail-closed** when none is configured — it never guesses or fabricates a transcript |
+| `POST /api/tts` | Bearer JWT | Routes through `TtsRouter::auto_detect` over the four TTS providers |
+| `GET`/`POST /api/voice/config` | Bearer JWT | Read/write the `[voice]` STT settings |
 
-The system selects the provider based on configuration in `inference.toml`:
+**STT providers** (`stt.rs`, two implementations):
+
+- `OpenAiCompatStt` — `POST {base_url}/audio/transcriptions`, multipart with a bearer key. OpenAI Whisper and Groq Whisper both speak this shape.
+- `CommandStt` — a local subprocess template (e.g. `whisper-cli`); the audio is written to a scratch temp file, the command is run, and the transcript is read from stdout.
 
 ```toml
-[inference.voice]
-asr_provider = "auto"    # auto / sensevoice / whisper-local / whisper-api / deepgram
-asr_language = "zh"      # Hint for language detection
+[voice]
+stt_provider  = "openai_compat"   # or "command"; unset ⇒ /api/stt returns 501
+stt_base_url  = "https://api.openai.com/v1"
+stt_api_key   = "sk-..."          # or stt_api_key_enc (AES-256-GCM)
+stt_model     = "whisper-1"
+stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --no-prints"
 ```
 
-When set to `auto`, the system prefers local providers:
+**TTS providers** (`tts.rs`, four implementations behind one `TtsProvider` trait):
 
-```
-Voice message received (OGG Opus / MP3 / WAV)
-     |
-     v
-Audio decode (symphonia: OGG/MP3/AAC/WAV/FLAC → PCM)
-     |
-     v
-SenseVoice ONNX available?
-  +--+--+
-  |     |
- Yes    No → Whisper.cpp available?
-  |          +--+--+
-  |          |     |
-  |         Yes    No → Fall to cloud API
-  |          |
-  v          v
-Local ASR → transcription text
-```
+| Provider | Location | Notes |
+|---|---|---|
+| `PiperTtsProvider` | Local | ONNX voices from the models directory |
+| `EdgeTtsProvider` | Cloud | Free, no API key |
+| `MiniMaxTts` | Cloud | T2A v2; picks a CJK or Latin voice by analyzing the text |
+| `OpenAiTtsProvider` | Cloud | Pay per character |
 
-**Telegram integration**: When a user sends a voice message, the bot automatically downloads the OGG Opus file, decodes it to PCM, transcribes it, and processes the text as if the user had typed it. The response can optionally be sent back as a voice message (via TTS).
+`TtsRouter` dispatches across them under one of three strategies: `LocalFirst` (local → edge → MiniMax → OpenAI), `EdgeOnly`, or `CloudBest`.
 
-### TTS (Text-to-Speech)
+### Path 2 — Telegram voice messages
 
-Four providers, each with different strengths:
+A voice or audio message triggers `transcribe_voice`: the bot calls `getFile`, validates the returned `file_path` against traversal (`..`, absolute paths, NUL, non-allowlisted characters), downloads with a size cap checked both on `content_length` and on the actual bytes, and transcribes.
 
-| Provider | Location | Quality | Languages | Cost |
-|----------|----------|---------|-----------|------|
-| **Piper (ONNX)** | Local | Good | 30+ languages | Free |
-| **MiniMax T2A** | Cloud | Excellent | CJK + Latin (auto-detect) | Pay-per-character |
-| **Edge TTS** | Cloud | Good | 400+ voices | Free |
-| **OpenAI TTS** | Cloud | Excellent | Multilingual | Pay-per-character |
+**It then calls `duduclaw_inference::whisper::transcribe(bytes, Some("zh"), WhisperMode::Api)` — the provider and the language are hardcoded.** Voice replies (toggled per chat with `/voice`) construct `EdgeTtsProvider` directly, also hardcoded, with a text fallback when the audio upload fails.
 
-The MiniMax T2A provider includes **automatic language detection**: it analyzes the text content to determine if it's CJK (Chinese/Japanese/Korean) or Latin-script, and selects the appropriate voice model accordingly.
-
-```toml
-[inference.voice]
-tts_provider = "auto"    # auto / piper / minimax / edge-tts / openai-tts
-tts_voice = ""           # Empty = auto-detect from text language
-voice_reply_enabled = false  # Set true to enable voice responses
-```
-
-### VAD (Voice Activity Detection)
-
-**Silero VAD** (ONNX) runs locally to detect when a user is speaking vs. silent. This is critical for:
-
-- **Discord voice channels**: Knowing when to start/stop recording
-- **LiveKit voice rooms**: Managing turn-taking in multi-agent conversations
-- **Streaming ASR**: Segmenting continuous audio into individual utterances
-
-```
-Continuous audio stream
-     |
-     v
-Silero VAD (local ONNX model)
-     |
-     v
-Speech detected? 
-  +--+--+
-  |     |
- Yes    No
-  |     |
-  v     v
-Start  Stop
-recording  recording
-  |
-  v
-Send segment to ASR
-```
-
-### Audio Decoding
-
-Before any speech processing, audio files need to be decoded to raw PCM. The `symphonia` crate handles this with support for:
-
-- **OGG Opus** — Telegram voice messages
-- **MP3** — Common audio format
-- **AAC** — iPhone voice memos
-- **WAV** — Uncompressed audio
-- **FLAC** — Lossless compressed audio
-
-All formats are decoded to a uniform 16kHz mono PCM stream for ASR processing.
+So `inference.toml [voice] asr_provider` / `asr_language` / `tts_provider` / `tts_voice` — written and validated by the dashboard against `auto | whisper-api | whisper-local` and `auto | edge-tts | minimax | openai-tts | piper` — **do not currently affect the Telegram path**. Changing them in the UI changes nothing for a Telegram voice message. This is a known gap, stated here rather than left for an operator to discover.
 
 ---
 
-## Real-Time Voice: Discord & LiveKit
+## Local Whisper
 
-### Discord Voice Channels
-
-DuDuClaw integrates with Discord voice channels via **Songbird** (Rust Discord voice library):
-
-```
-User joins Discord voice channel
-     |
-     v
-Bot joins the same channel (Songbird)
-     |
-     v
-VAD detects speech → ASR transcribes
-     |
-     v
-Agent processes transcription
-     |
-     v
-TTS generates audio response
-     |
-     v
-Bot plays audio in voice channel
-```
-
-This enables natural voice conversations in Discord — the agent listens, understands, and speaks back.
-
-### LiveKit Voice Rooms
-
-For multi-agent voice collaboration, DuDuClaw supports **LiveKit** WebRTC voice rooms:
-
-```
-LiveKit voice room
-  ├── Agent A (customer support)
-  ├── Agent B (technical specialist)
-  ├── Agent C (translator)
-  └── Human user
-     |
-     v
-Each agent independently:
-  - Listens via VAD + ASR
-  - Processes through its own runtime
-  - Responds via TTS
-  - Manages turn-taking
-```
-
-LiveKit rooms enable scenarios like:
-- **Handoff conversations**: Customer support agent escalates to a specialist, who joins the same room
-- **Multilingual meetings**: A translator agent bridges language gaps in real-time
-- **Collaborative debugging**: Multiple specialized agents discuss a problem together
+`duduclaw-inference::whisper` carries two modes: `Api` (OpenAI Whisper API) and `Local { model_path }` (whisper.cpp through `whisper-rs`). The local mode sits behind the **non-default `whisper` Cargo feature** — the crate's `default` is `["cpu"]` — so a stock release binary has the API mode only.
 
 ---
 
-## ONNX Embedding
+## Discord voice
 
-The voice pipeline shares infrastructure with the **embedding engine** — both use ONNX Runtime for local model execution. The embedding component provides:
-
-- **BERT WordPiece tokenizer** for text tokenization
-- **ONNX Runtime** for vector embedding generation
-- Support for models like `bge-small-zh` and `qwen3-embedding-0.6b`
-
-These embeddings power the memory system's semantic search (see [Cognitive Memory](10-cognitive-memory.md)).
+`discord_voice.rs` wraps **Songbird** behind the **non-default `discord-voice` Cargo feature**; the gateway's `default` is `["dashboard", "desktop"]`, so a stock build does not include it. There is no VAD and no ASR wiring behind it today — joining a channel and playing audio is what the module covers.
 
 ---
 
-## Why This Matters
+## ONNX embedding
 
-### Privacy
-
-Local ASR and TTS mean voice data never leaves the machine. For healthcare, legal, or compliance-sensitive contexts, this is non-negotiable.
-
-### Cost
-
-Cloud ASR/TTS services charge per minute/character. Local models (SenseVoice, Piper) are free after the initial download. For high-volume voice interactions, the savings are substantial.
-
-### Latency
-
-Local models eliminate network round-trips. A voice message can be transcribed in milliseconds on a modern GPU, compared to seconds for a cloud API call.
-
-### Natural Interaction
-
-Voice transforms the agent from a text-based tool into a conversational partner. Users can interact while driving, cooking, or walking — no typing required.
+The `onnx` feature of `duduclaw-inference` enables `OnnxEmbeddingProvider` (ONNX Runtime + a WordPiece tokenizer) for models such as `bge-small-zh`. It is not a voice component — it is shared infrastructure for the memory system's semantic search (see [10-cognitive-memory.md](10-cognitive-memory.md)) — and it is **not** in the crate's default features either.
 
 ---
 
-## Interaction with Other Systems
+## Interaction with other systems
 
-- **Channel Integration**: Telegram voice messages auto-transcribe; Discord voice channels for real-time voice.
-- **Multi-Runtime**: Transcribed voice is processed by whichever runtime the agent is configured to use.
-- **Memory System**: Voice interactions are stored as episodic memories (transcription + metadata).
-- **Confidence Router**: Voice queries are routed like any other query — simple greetings go local, complex questions go to cloud.
-- **Inference Engine**: Shares ONNX Runtime infrastructure for efficient local model execution.
+- **Channels** — Telegram auto-transcribes voice and audio messages; `/voice` toggles spoken replies per chat. No other channel has a voice path.
+- **Multi-runtime** — a transcript is ordinary text: whichever runtime the agent uses handles it.
+- **Memory** — voice turns are stored as ordinary episodic memories (transcript plus metadata).
+- **Redaction** — a transcript entering through `/api/stt` is text like any other and passes the same MCP-side redaction rules; the Telegram path feeds the transcript into the normal reply path.
 
 ---
 
-## The Takeaway
+## The takeaway
 
-Voice is the most natural human interface. DuDuClaw's voice pipeline makes it accessible without sacrificing privacy or breaking the budget — local-first ASR and TTS handle the common cases for free, cloud providers handle the edge cases, and LiveKit enables the future of multi-agent voice collaboration.
+Voice works in two places, and the honest version says so: a fail-closed HTTP pair that the dashboard configures, and a Telegram handler with its provider hardcoded. Naming the second one is more useful than a diagram of a VAD that was never written.

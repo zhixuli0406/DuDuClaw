@@ -47,7 +47,7 @@
 | Artifact provenance + delivery safety (v1.60) | `artifacts.jsonl` five-origin provenance ledger (declared / swept / uploaded / produced / unknown; exact-vs-inferred attribution, never guessed from time windows); goal artifacts archived into `attachments/` on accept (canonicalize containment, 20MB/100MB caps); zero-LLM delivery gate before 📎DELIVER (zero-byte / magic-mismatch / corrupt-zip hard-fail); `[limits]` DocumentLimits guarding the three downstream office/zip parsers; expert-pack zip "header lie" bypass fixed |
 | Credentials P1 + secret-reference unification (v1.60) | `secret://keychain` and `secret://file` local backends, tick-source `secret://` headers, credential inventory card + `doctor --fix-residue`; `SecretRef`/`Secret` types converge seven hand-rolled decrypt dialects that could send `secret://` reference literals to vendor APIs as real credentials; WhatsApp webhook signature now fail-closed; ActionGuard judge fed a closed 21-token finding enum (attacker-controlled text structurally can't reach the judge prompt); MCP key rotation live-reloads and `denied_tools`/`allowed_tools` enforced at the MCP dispatch gate |
 | Ten-channel notification unification (v1.60) | autopilot `notify`, MCP `send_message`, and reminders all route through the shared `create_sender` factory covering ten channels (WebChat honestly refuses) — fixing autopilot Slack notifications that had never been delivered and Google Chat / Teams silent-skip defects |
-| Evolution measurement hardening (v1.60) | AEE commit gate splits visible vs held-out eval dimensions (fence-only: they veto but never promote); champion bootstrap made same-form; `duduclaw evolution clear-holdout-rotation` operator exit; per-round snapshots of 14 harness knobs into `aee_round` events; Code Mode Phase 0 measurement gate (`duduclaw cost tool-loop`, four-criteria PROCEED/REJECT/INSUFFICIENT_DATA verdict) |
+| Evolution measurement hardening (v1.60) | AEE commit gate splits visible vs held-out eval dimensions (fence-only: they veto but never promote); champion bootstrap made same-form; `duduclaw evolution clear-holdout-rotation` operator exit; per-round snapshots of 14 harness knobs into `aee_round` events |
 | Cron day-of-week convention fix (v1.61, **BREAKING**) | Numeric day-of-week normalized at parse time from Unix crontab convention (0/7=Sunday, 1-5=Mon–Fri) to the `cron` crate's Quartz ordinals, with scheduler / heartbeat / MCP validation / dashboard sharing one normaliser — previously `* * 1-5` fired Sunday–Thursday (Sunday ghost runs + silent Friday skips); schedules deliberately written Quartz-style shift by one day after upgrade |
 | `duduclaw migrate-from claude-code` (v1.61) | One-way import of Claude Code memory shards (→ semantic + SPO temporal memory), CLAUDE.md (→ agent wiki context layer, zero injection budget), and session transcripts (noise-filtered to human prompts + assistant final replies — measured ~1.5% of transcript bytes are signal); everything lands as `origin=import` (trust ≤ 0.7), treated as DATA, redacted by default, injection-scanned, skills security-scanned fail-closed; nothing writes without `--apply` |
 | Channel capability table (v1.61) | `channel_capabilities.rs` single authority for 11 channels × 7 capabilities (file/photo upload, interactive buttons, edit-in-place, typing, native markdown, quoted replies) + progress throttle seconds; unsupported capabilities now leave a structured log instead of a silent no-op |
@@ -61,7 +61,7 @@
 |---------|-------------|
 | Evolution v3: AEE + playbook | Default evolution target moved from SOUL.md rewrites to gene-shaped playbook rules — Gate/Measure split, champion + matches-or-improves commit gate, entry-level observation windows; SOUL.md is read-only for agents ([38-aee-playbook-evolution.md](38-aee-playbook-evolution.md)) |
 | E1 entry assertions + anti-reward-hacking audit | Every new playbook rule carries machine-checkable assertions replayed zero-LLM against recorded transcripts (`G-Assertions`); deterministic screening of candidate rules for eval-prompt leakage / tautology / failure-suppression before commit |
-| Task-level forward model | Predict-act-verify world model on the goal loop: 4-tier statistical prediction (zero LLM on cold start), fidelity-graded observation (native tool events / audit-only / none), `<state>` block + `(state, action)` visit-graph oscillation detection, deterministic task-rule induction; `[task_forward_model]`, default off |
+| Task-level forward model | Predict-act-verify world model on the goal loop: 4-tier statistical prediction (zero LLM on cold start), fidelity-graded observation (native tool events / audit-only / none), `<state>` block + `(state, action)` visit-graph oscillation detection, deterministic task-rule induction; `[task_forward_model]`, default on since v1.54 |
 | Grounded dispatch precheck | Zero-LLM evidence check before the acceptance judge — the final answer must overlap a real non-error tool result; self-echo deny-list + input-overlap subtraction defeat self-certification; `[dispatch] grounding_precheck_enabled`, default on |
 | Memory novelty gate | Near-duplicate semantic-layer memory writes rejected with telemetry (0.92 char n-gram cosine) — anti fake-surprise; temporal supersession/reaffirmation exempt; `[memory] novelty_gate`, default on |
 | Verified-only reflexion | MistakeNotebook entries carry programmatic `TrajectoryEvidence`; evidence-less self-reported mistakes no longer consolidate into learned rules |
@@ -73,7 +73,7 @@
 
 | Feature | Description |
 |---------|-------------|
-| Unified LLM provider layer (`duduclaw-llm`) | One normalized request/stream shape over four native protocols (Anthropic / OpenAI Responses / Gemini / OpenAI-compat, 8 presets); `ModelRegistry` pricing + `FallbackRouter` cooldowns; stdio MCP client + provider-agnostic tool loop so API-mode agents get the full tool surface |
+| Unified LLM provider layer (`duduclaw-llm`) | One normalized request/stream shape over four native protocols (Anthropic / OpenAI Responses / Gemini / OpenAI-compat, 8 presets); `ModelRegistry` pricing; stdio MCP client + provider-agnostic tool loop so API-mode agents get the full tool surface |
 | Agent behavioral evals (`duduclaw eval`) | Golden-task regression per agent: deterministic tool-call/regex/grounded assertions + optional LLM judge; live and replay modes, CI-gating exit code |
 | HITL ApprovalBroker | One interrupt/approval primitive across MCP tools / autopilot / bus tasks; SQLite-backed, TTL expiry = DENY (fail-closed) |
 | OpenTelemetry GenAI tracing | Opt-in `gen_ai.*` spans, OTLP-exportable to Langfuse/Grafana/Jaeger/Datadog; zero overhead when off |
@@ -182,16 +182,17 @@
 
 ## Evolution System
 
-> **Evolution v3 (2026-08-06)**: the default evolution target moved from
-> rewriting `SOUL.md` to the **playbook** (small, independently-retirable
-> gene-shaped rules; `SOUL.md` is read-only for agents by default). The GVU²
-> rows below (Dual-Loop / 4+2 Layer Verification / SOUL.md Versioning) now
-> describe the **non-default legacy path** (`agent.toml [evolution]
-> legacy_soul_evolution = true`). See
-> [38-aee-playbook-evolution.md](38-aee-playbook-evolution.md) and
+> **Evolution v3 (2026-08-06) → S11 (2026-09-29)**: the evolution target moved
+> from rewriting `SOUL.md` to the **playbook** (small, independently-retirable
+> gene-shaped rules; `SOUL.md` is read-only for agents), and on 2026-09-29 the
+> legacy SOUL rewrite path was **removed outright** — the
+> `[evolution] legacy_soul_evolution` escape hatch, `SOUL.md` versioning, the
+> 24-hour observation window, automatic rollback, the cap-deadlock consolidate
+> rewrite, deferred-GVU retry and the `duduclaw evolution finalize` CLI all
+> went with it. `[evolution] gvu_enabled` now ships `true` from the factory.
+> See [38-aee-playbook-evolution.md](38-aee-playbook-evolution.md) and
 > [evolution-engine.md](../architecture/evolution-engine.md) ch.12 for the
-> current default (AEE, Gate/Measure split, champion + matches-or-improves,
-> entry-level observation windows).
+> current (and only) engine.
 
 | Feature | Description |
 |---------|-------------|
@@ -199,13 +200,8 @@
 | Dual Process Router | System 1 (rules) / System 2 (LLM reflection) |
 | AEE (v3 default) | Agentic Evolution Engine — Generator inner loop (≤3 rounds) → Gate (deterministic, veto) / Measure (scored, no veto) split → champion + matches-or-improves commit gate → entry-level accept/rollback against linked eval cases |
 | Playbook (v3 default) | Gene-shaped behavior rules (category/signals_match/eval_cases/success_streak), extends the existing rule_lifecycle store, 0.92-cosine dedup, capacity + stale/archive lifecycle |
-| GVU² Dual-Loop (legacy) | Outer loop (Behavioral GVU — SOUL.md rewrite) + Inner loop (Task GVU — instant retry); opt-in via `legacy_soul_evolution = true` |
-| 4+2 Layer Verification (legacy) | L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety |
 | MistakeNotebook | Cross-loop error memory — records failure patterns, prevents regression; entries now carry deterministic `TrajectoryEvidence` (which tool/assertion failed) so unverified self-reported diagnosis no longer feeds reflection consolidation (v3) |
-| SOUL.md Versioning (legacy) | 24h observation period, atomic rollback, SHA-256 fingerprint — applies to the legacy GVU path; SOUL.md cap-deadlock now breaks via a guarded consolidate rewrite instead of freezing the agent (v3 Phase 0) |
 | MetaCognition | Self-calibrating error thresholds every 100 predictions, now with a symmetric raise-back rule so thresholds don't drift one-directionally (v3 Phase 0) |
-| Adaptive Depth | MetaCognition-driven GVU iteration count (3-7 rounds based on history) |
-| Deferred GVU (legacy) | Gradient accumulation + delayed retry (max 3 deferrals, 72h span, 9-21 effective rounds) |
 | Stagnation Detector (v3) | Scans `evolution.db` every 30 min for consecutive-rejected / D-days-zero-apply / repeated-rejection-reason signals, posts to Activity Feed + dashboard |
 | ConversationOutcome | Zero-LLM conversation result detection (TaskType / Satisfaction / Completion), zh-TW + en |
 | Agent-as-Evaluator | Independent Evaluator Agent (Haiku cost control) for adversarial verification, structured JSON verdict |
@@ -241,14 +237,10 @@
 
 | Feature | Description |
 |---------|-------------|
-| llama.cpp | Metal/CUDA/Vulkan/CPU via `llama-cpp-2` crate |
-| mistral.rs | Rust-native, ISQ on-the-fly quantization, PagedAttention, Speculative Decoding |
-| OpenAI-compatible HTTP | Exo/llamafile/vLLM/SGLang |
+| OpenAI-compatible HTTP | The one shipped backend — llama-server / Ollama / vLLM / SGLang / llamafile. The in-process llama.cpp, mistral.rs and MLX backends were removed in 2026-09 (they were never compiled into a release binary) |
 | Confidence Router | LocalFast / LocalStrong / CloudAPI three-tier routing, CJK-aware token estimation |
-| InferenceManager | Multi-mode auto-switching: Exo P2P → llamafile → Direct → OpenAI-compat → Cloud API |
+| InferenceManager | Multi-mode auto-switching: llamafile → Direct → OpenAI-compat → Cloud API |
 | llamafile Manager | Subprocess lifecycle, zero-install portable inference across 6 OS |
-| Exo P2P Cluster | Distributed inference, 235B+ models across machines, cluster discovery, endpoint failover |
-| MLX Bridge | Apple Silicon local reflections via `mlx_lm` + LoRA adapter support |
 | Model Management | `model_search` (HuggingFace), `model_download` (resume + mirror), `model_recommend` (hardware-aware) |
 
 ## Compression Engine
@@ -276,14 +268,15 @@
 
 | Feature | Description |
 |---------|-------------|
-| 3-Phase Defense | Deterministic blacklist (<50ms) / obfuscation detection (YELLOW+) / AI judgment (RED only) |
-| Threat Level State Machine | GREEN → YELLOW → RED auto-escalation, 24h no-event auto-demotion |
+| `agent-file-guard` PreToolUse hook | `duduclaw hook agent-file-guard` (Rust subcommand, matcher `Write\|Edit\|MultiEdit\|Bash`, installed per agent by `agent_hook_installer`) — blocks agent-structure files outside the canonical tree, own-SOUL.md writes, cross-agent writes |
+| `org_field_guard` | Field-level freeze inside the same hook: `[agent] reports_to`/`department`/`name`, the whole `[capabilities]` table, and `config.toml [delegation]`/`[acp]` — fail-closed on unparseable or unreconstructable writes |
+| `data-file-guard` PreToolUse hook | `duduclaw hook data-file-guard` (RFC-23 §14.4, Rust subcommand since H10 2026-09, matcher `Read\|Bash`), armed only when redaction is active; a `Bash` filename heuristic, not a sandbox |
 | Ed25519 Auth | Challenge-response WebSocket authentication |
 | AES-256-GCM | API key encryption at rest, per-agent key isolation |
-| Prompt Injection Scanner | 6 rule categories + XML delimiter protection |
+| Prompt Injection Scanner | `input_guard` — 7 rule categories, block threshold 60, NFKC-normalized, en + zh-TW patterns, XML delimiter protection |
 | SOUL.md Drift Detection | SHA-256 fingerprint comparison |
 | CONTRACT.toml | Behavioral boundaries + `duduclaw test` red-team CLI (9 built-in scenarios); auto-injected into system prompt for all runtimes |
-| RBAC | Role-based access control matrix |
+| RBAC matrix (read-only view) | The Security page renders a per-agent tool/web/approval matrix derived from `agent.toml [capabilities]`. The `duduclaw-security::rbac` module was removed (zero callers); the editable source of truth is each agent's capability envelope |
 | Unified Audit Log | `audit.unified_log` merges `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` — Logs page source filter + severity dropdown |
 | JSONL Audit Log | Full tool call recording, async write |
 | Unicode Normalization | NFKC normalization to detect homograph attacks |
@@ -342,10 +335,11 @@
 
 | Feature | Description |
 |---------|-------------|
-| 5-Layer Router | API Fetch / Static Scrape / Headless Playwright / Sandbox Container / Computer Use |
-| Capability Gating | `agent.toml [capabilities]` deny-by-default |
-| Browserbase | Cloud browser alternative for L5 |
-| bash-gate.sh | Layer 1.5 allowlist for Playwright/Puppeteer (requires `DUDUCLAW_BROWSER_VIA_BASH=1`) |
+| L1 `web_fetch_cached` | SSRF-gated, disk-cached HTTP GET (body truncated at 60k chars) |
+| L2 `web_extract` | Same fetch path + CSS-selector extraction (`text` / `html` / `json`) |
+| L3 headless (optional, external) | Playwright or Browserbase registered as a per-agent MCP server in `.mcp.json`; not part of the binary, no fallback into it |
+| L5 Computer Use | Seven `computer_*` MCP tools driving a container virtual display via `computer_use_orchestrator` |
+| Capability Gating | `agent.toml [capabilities]` deny-by-default (`computer_use` / `browser_via_bash` / `allowed_tools` / `denied_tools`); `denied_tools` enforced both as `--disallowedTools` and at the MCP dispatch gate |
 
 ## Container Sandbox
 
@@ -363,7 +357,6 @@
 | ReminderScheduler | One-shot reminders (relative `5m`/`2h`/`1d` or ISO 8601), `direct` or `agent_callback` mode |
 | HeartbeatScheduler | Per-agent unified scheduling — bus polling + GVU silence breaker + cron |
 | Scheduler-Level Task-Board Pull (v1.9.3) | `poll_assigned_tasks` moved into `HeartbeatScheduler::run` tick — scans entire agent registry every 30s (no longer skips `enabled=false` agents); 1-hour LIKE-marker cooldown prevents stampedes |
-| `duduclaw evolution finalize` CLI (v1.9.1) | One-shot recovery for SOUL.md observation windows that should already have closed; `--dry-run` / `--agent` filters; backstop for the 30-min `ObservationFinalizer` background task |
 
 ## Task Board & Activity Feed
 
@@ -390,10 +383,7 @@
 
 | Feature | Description |
 |---------|-------------|
-| Durability Framework (`duduclaw-durability`, v1.9.4) | Five pillars — `idempotency` (key-based dedup), `retry` (exponential backoff + jitter), `circuit_breaker` (three-state with `probe_inflight` accounting), `checkpoint` (resumable task progress), `dlq` (Dead Letter Queue). Used by gateway LLM fallback + durable cron |
-| Governance Layer (`duduclaw-governance`, v1.9.4) | `PolicyRegistry` with YAML loading + hot reload + agent-priority merge + fail-safe (illegal policies skipped, malformed YAML doesn't panic). Four `PolicyType`s — Rate / Permission / Quota / Lifecycle |
-| Quota Manager | Per-agent / per-policy soft + hard quota enforcement; `error_codes.rs` standardizes governance errors (QUOTA_EXCEEDED / POLICY_DENIED / ...). Default set in `policies/global.yaml` (e.g. `default-rate-mcp` 200/min) |
-| LLM Fallback Chain (`gateway/llm_fallback.rs`, v1.9.4) | Primary timeout/503/429/overloaded auto-switches to fallback model; pure `is_llm_fallback_error` / `should_attempt_model_fallback` unit-tested; hard-deadline arm returns `Err("hard timeout")` so fallback triggers reliably |
+| LLM Fallback Chain (`gateway/failover.rs::model`, v1.9.4) | Layer 2 of the three-layer failover stack (account → model → runtime, consolidated 2026-09-29): primary timeout/503/429/overloaded auto-switches to the lighter fallback model; pure `is_llm_fallback_error` / `should_attempt_model_fallback` unit-tested, with `FailoverManager::model_fallback_for` as the single decision the dispatch paths call; hard-deadline arm returns `Err("hard timeout")` so fallback triggers reliably |
 | Evolution Events System (v1.9.4) | 30+ event schema (`schema.rs`), async batch+retry emitter (`emitter.rs`), query interface (`query.rs`), reliability guarantees (`reliability.rs`); HTTP endpoints surfaced in Web `ReliabilityPage` |
 
 ## Identity & Access
@@ -413,17 +403,12 @@
 | AI Judge | Scores parallel branches to select the best continuation |
 | Budget Control | `budget.rs` caps fork fan-out / cost |
 
-## CLI Runtime (PTY Pool)
+## CLI Runtime (one-shot PTY)
 
 | Feature | Description |
 |---------|-------------|
-| Cross-Platform PTY Pool (`duduclaw-cli-runtime`, v1.15.0) | Drives the real interactive `claude` REPL (ConPTY on Win 10 1809+, openpty on Unix via `portable-pty`) with sentinel-framed in-band response protocol — a **standby** for if Anthropic re-activates the programmatic-usage split that would block `claude -p` for OAuth-subscription accounts (the 2026-06-15 change was paused; `-p` still works). **Default off**, per-agent opt-in `[runtime] pty_pool_enabled = true`. Known limitation: pool sessions have no conversation dimension (cross-conversation context bleed) — the default `FreshSpawn` `-p` path is unaffected. See [27-pty-pool-runtime](27-pty-pool-runtime.md) |
-| Worker Supervisor (`duduclaw-cli-worker`) | Out-of-process worker subprocess gated by `[runtime] worker_managed = true`; SIGTERM/SIGKILL sequenced into gateway graceful shutdown |
-| `pty_runtime.rs` Adapter | `RuntimeMode::{FreshSpawn, PtyPool}` per-agent routing, `acquire_and_invoke` surface; OAuth → interactive REPL, API-key → `oneshot_pty_invoke + claude -p` |
-| Unbound from Claude (v1.24.0) | `CliKind::Antigravity` added; `which_codex` / `which_gemini` / `which_agy` discovery (alongside `which_claude`); `resolve_program` + worker `spawn_session_default` resolve all four CliKinds (no more `None`/reject); `cli_kind_for_provider()` derives the PtyPool kind from `[runtime] provider`, replacing the two hardcoded `CliKind::Claude` acquire sites. Interactive REPL stays Claude-only by design (non-Claude providers route to the oneshot `runtime_dispatch` path) |
-| Runtime Status Endpoint | `GET /api/runtime/status` loopback-only JSON (Phase 8.5) |
-| Observability | `pty_pool_*` Prometheus counters (acquires / cache-hit / spawn / eviction / invoke outcomes / duration histogram), `worker_health_misses_total`, `worker_restarts_total`, `pty_pool_managed_worker_active` gauge |
-| Graceful Fallback | All PTY paths fall back to legacy `tokio::process::Command + claude -p` on error — missing worker / unhealthy pool / spawn failure is recoverable |
+| One-shot PTY invocation (`duduclaw-cli-runtime`) | Spawns a CLI under a real pseudo-terminal (ConPTY on Win 10 1809+, openpty on Unix via `portable-pty`) and drains stdout to EOF, for CLIs that refuse to run when stdout is a plain pipe. Used by the Grok runtime and the CLI-login helper. `clear_env` keeps the gateway's vendor API keys out of the child; `deadline` is an absolute wall-clock cap. See [27-pty-pool-runtime](27-pty-pool-runtime.md) |
+| PTY session pool — **removed 2026-09** | The long-lived sentinel-framed `claude` REPL pool, the `duduclaw-cli-worker` subprocess + supervisor, `RuntimeMode::PtyPool`, `GET /api/runtime/status`, the `pty_pool_*` / `worker_*` metrics and the `[runtime] pty_pool_enabled` / `worker_managed` keys were all removed. Reason: the Anthropic programmatic-usage split it insured against was paused on 2026-06-15 and never resumed, and pool sessions had no conversation dimension (cross-conversation context bleed), so it could not be enabled safely |
 
 ## MCP HTTP/SSE Transport (W20)
 
@@ -466,7 +451,7 @@
 
 | Feature | Description |
 |---------|-------------|
-| 23 Pages | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
+| Routes | ~74 non-redirect route paths in `web/src/App.tsx` (plus ~30 legacy redirect aliases that keep old bookmarks working). Four shells: workspace (`/`, `/chat`, `/tasks`, `/goals`, `/inbox`, `/files`, `/mail`, `/timeline`, `/foresight`, `/gallery`, `/canvas`, …), agents (`/agents`, `/agents/:id/:tab`, `/agents/new`, `/experts`, `/org`, `/presets`), `/manage/*` (channels, logs, billing, users, departments, distributors, inference, local-models, finetune, reliability, secaudit, wiki-trust, …), `/app/system/*` (settings, security, accounts, license, causal, decision-lab, ccr, …), plus standalone pages (`/login`, `/welcome`, `/webchat`, `/console`, `/mascot-overlay`, `/pet-studio`, `/world`, `/launcher`). `web/src/components/layout/nav-model.ts` is the source of truth for what appears in the sidebar |
 | Tech Stack | React 19 + TypeScript + Tailwind CSS 4 + Base UI + CVA |
 | DuDuClaw Design System (mds) | Shared `web/src/components/mds/` component library (OKLCH tokens, four-layer surfaces, three-tier shadows, Inter / Geist Mono) + `nav-model.ts` grouped sidebar (personal / work / company / settings) + `web/DESIGN.md` spec; every page built on the shared primitives with synchronized en/ja/zh i18n |
 | Real-time Log Streaming | BroadcastLayer tracing → WebSocket push |

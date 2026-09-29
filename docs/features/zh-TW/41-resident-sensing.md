@@ -74,6 +74,7 @@ delegate 喚醒雲端 AI 員工（提示詞可附上最近觀測窗口）
 enabled = false                 # 總開關，預設關；沒開就完全不影響現有安裝
 allow_command_sources = false   # command 來源的全域閘門，fail-closed
 dns_ttl_secs = 60               # 已通過內網檢查的 DNS 解析結果可重用幾秒；0 = 每次都重新解析
+# preset = "conservative"       # 選填；補齊你沒寫的旋鈕，見下方「兩個 preset，取代七個旋鈕」
 
 # ── http_poll：定時 GET 一個網址 ──────────────────────────
 [[tick.sources]]
@@ -131,6 +132,34 @@ persist_every_n = 0
 也不能以 `prev_`／`delta_`／`pct_` 開頭（這三個前綴是下面 D2 自動衍生欄位專用）。
 違規的來源會在讀取設定時被停用並記一筆 `warn`，不會拖垮整個 gateway 開機，
 其他合法來源照常運作。
+
+### 兩個 preset，取代七個旋鈕
+
+速率上限、DNS TTL、閒置看門狗、client ping、baseline 壽命、`persist_every_n`，
+再加上初篩層的 fail-open 政策——這一節要操作者記的數字，比多數安裝真正用得到的多。
+`preset` 直接回答大部分人實際會問的兩個問題：
+
+```toml
+[tick]
+preset = "conservative"   # 或 "aggressive"；不寫這個鍵就維持原本的預設值
+```
+
+| | `conservative` | `aggressive` | 不設 preset（預設） |
+|---|---|---|---|
+| `max_events_per_minute` | 30 | 600 | 120 |
+| `baseline_max_age_secs` | 900（15 分） | 21600（6 小時） | 3600（1 小時） |
+| `action.screen.on_unavailable` | `drop`（fail-closed） | `pass` | `pass` |
+
+兩條規則讓它可以安心打開：
+
+- **preset 只補你沒寫的鍵。** 來源上明寫的 `max_events_per_minute`、規則
+  `action.screen` 上明寫的 `on_unavailable`，永遠優先——即使你寫的值剛好等於舊的預設值。
+- **不寫 `preset` 就什麼都不變。** 所有預設值逐位相同。值打錯會記一筆 log 然後忽略，
+  不會替你猜一個。
+
+如果你原本就擔心初篩層 fail-open 的預設，選 `conservative`：地端模型答不出來時，
+動作會被攔下來而不是照樣派出去。儀表板的「即時監控來源」卡片會顯示目前生效的 preset
+（唯讀，設定由 `config.toml` 擁有）。
 
 ### websocket 來源要知道的六件事
 

@@ -71,6 +71,19 @@ repo
 Client 憑證會被保存下來（secret 靜態加密儲存），之後要重新授權不需要再
 輸入一次 secret。
 
+## 總開關
+
+這五個工具受 `config.toml [integrations] github` 控制，**預設關閉**。沒打開之前，工具不會出現在任何 AI 員工的工具清單裡，呼叫也會被拒絕並附上指回本頁的訊息——跟 Google Workspace 整合一直以來的 deny-by-default posture 一致。
+
+從儀表板完成連線時會自動幫你打開，不必多做什麼。若要在保留 token 的情況下關掉整合：
+
+```toml
+[integrations]
+github = false
+```
+
+為什麼需要這道閘：OAuth 保險庫裡有 token 只代表「操作者連過 GitHub」，不代表「這台機器上每個 AI 員工都可以用我的身分公開留言」。2026-09 功能盤點之前，這兩件事被當成同一件事。
+
 ## 關於 Token
 
 傳統 GitHub OAuth App 的 token **不會過期**（`expires_at` 是空值，這是正

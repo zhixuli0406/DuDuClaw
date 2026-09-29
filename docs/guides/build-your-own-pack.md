@@ -41,25 +41,52 @@ display_name = "Helper"
 
 Write the persona in `agents/helper/soul.md`. Identity / responsibilities / boundaries is a good starting structure — the clearer the boundaries, the more confidently people will install it.
 
+### Or write the canonical `pack.toml`
+
+`expert.toml` above is the legacy dialect — fully supported until **v1.68.0**. New packs can instead declare a `pack.toml`, the one schema shared by teams, single-persona industry packs and job presets:
+
+```toml
+[pack]
+schema  = 1
+id      = "my-first-pack"
+kind    = "team"        # "preset" | "team" | "template"
+tier    = "free"
+version = "0.1.0"
+label   = "A friendly little helper"
+description = "Demo pack"
+
+[[pack.agents]]
+name = "helper"
+role = "main"
+display_name = "Helper"
+```
+
+Everything else in the directory (personas, skills, wiki pages) is unchanged. Have a legacy pack already? `duduclaw pack inspect <dir> --emit-canonical` prints the equivalent `pack.toml` for you to review and save — it never writes over your files.
+
 ## 2. Local test loop
 
 ```bash
+# Read it back the way DuDuClaw sees it, before installing anything
+duduclaw pack inspect ./my-first-pack
+
 # Validate + install (installs directly from a directory)
-duduclaw expert install ./my-first-pack
+duduclaw pack install ./my-first-pack
 
 # See what got installed
-duduclaw expert list
+duduclaw pack list
 
-# Package it into a shareable zip
+# Package it into a shareable zip (authoring verbs stay under `expert`)
 duduclaw expert pack ./my-first-pack
 
 # Others install it (local zip or URL both work)
-duduclaw expert install ./my-first-pack-0.1.0.zip
-duduclaw expert install https://example.com/my-first-pack-0.1.0.zip
+duduclaw pack install ./my-first-pack-0.1.0.zip
+duduclaw pack install https://example.com/my-first-pack-0.1.0.zip
 
 # Clean up (removes the pack's employees, bundled skills, and wiki pages)
 duduclaw expert remove my-first-pack
 ```
+
+`duduclaw expert install` / `expert list` still work and are aliases of the first two — same code path, same output.
 
 Install-side protections are built in: a zip-slip fence, a 50MB cap, content scanning. **Hooks always install disabled** into a quarantine directory (`hooks-disabled/`) and need an explicit operator trust decision before they run. Don't assume hooks will just work when you write a pack.
 

@@ -180,6 +180,12 @@ identity_resolve { channel, external_id }
 
 このscopeゲートはDuDuClawの「セキュリティゲートはfail closed」の慣例に従います——`Scope::IdentityRead`を持たないキーは拒否され、決して黙って通されません。
 
+アイデンティティ関連のMCPツールは `identity_resolve` **のみ**です。RFC-21 §1 では `identity_list_project_members` と `identity_invalidate_cache` にも触れていますが、**どちらも未実装**で、実装予定もありません。`lookup_project_members` はprovider traitとしては生きています（`ChainedProvider` が使用）が、MCPツールとしては公開されていません。キャッシュの無効化はwikiファイルを直接編集する形で行い、それを起動するツールはありません。
+
+### 実際に応答するprovider
+
+3つの呼び出し箇所——このMCPツール、下記の `<sender>` ブロック、ダッシュボードの `identity.resolve` RPC——はすべて `config.toml [identity] provider` を読む共通ビルダーを通ります。2026-09の機能棚卸し以前、前者2つはwikiキャッシュにハードコードされていたため、Notionを設定したoperatorはダッシュボードがNotion経由で解決するのを見ながら、実際のAgentはローカルキャッシュしか読んでいませんでした。現在は3者が一致します。
+
 ---
 
 ## `<sender>`ブロック：データとしてのアイデンティティ

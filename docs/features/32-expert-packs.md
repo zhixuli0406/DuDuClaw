@@ -21,6 +21,22 @@ Each roster entry carries `name`, `role`, `reports_to` (in-pack supervisor), `de
 
 Two foreign formats install through the same command: a Claude Code plugin (`.claude-plugin/plugin.json`) and a single Agent Skill (`SKILL.md`). Format detection is fail-closed — an unrecognised layout is rejected with a listing of what was found, never half-imported.
 
+## One Format, One Front Door
+
+An expert pack, a premium team playbook and a job preset used to be three manifest dialects with three install verbs. They are now one schema (`pack.toml`) behind one command:
+
+```bash
+duduclaw pack list                 # installed packs, local presets, what the catalog offers
+duduclaw pack inspect <src>        # normalized view + which dialect it was read from
+duduclaw pack install <src>        # routes by `kind`; premium content checks the licence once
+```
+
+`[pack] kind` chooses the route — `preset` (one job configuration, no identity), `team` (a roster, what an expert pack has always been), or `template` (a single industry persona). `[pack] tier` is the single premium decision: instead of four code paths each guessing "is this paid content" from a directory path, a pack carries its tier and one predicate reads it. A tier that cannot be read counts as premium — an unreadable field must never unlock paid content.
+
+`duduclaw expert install` is an alias for `pack install` and behaves identically; the authoring verbs (`pack`, `publish`, `export`, `convert-teams`, `hooks`, `remove`) stay under `duduclaw expert`. The dashboard's one-click install and `experts.install` reach the same code, because both already drive the CLI.
+
+**`expert.toml`, `team.toml` and `preset.toml` keep working until v1.68.0.** Nothing on disk is rewritten. `duduclaw pack inspect <dir> --emit-canonical` prints the `pack.toml` a legacy pack corresponds to so you can review and migrate it deliberately, rather than having a machine rewrite content you are responsible for.
+
 ## The Install Pipeline
 
 Every install, including one-click dashboard installs and LLM-generated drafts, runs the same sequence:

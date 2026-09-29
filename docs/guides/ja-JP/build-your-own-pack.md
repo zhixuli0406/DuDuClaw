@@ -41,25 +41,52 @@ display_name = "ヘルパー"
 
 `agents/helper/soul.md`にペルソナを書きます。アイデンティティ/責務/境界の3段構成が良い出発点です——境界が明確であるほど、インストールする側は安心して使えます。
 
+### あるいは新しい`pack.toml`を書く
+
+上の`expert.toml`は旧方言で、**v1.68.0**まで完全にサポートされます。新しいパックは代わりに`pack.toml`を宣言できます——チームパック、単体業種パック、ジョブプリセットが共有する1つのスキーマです:
+
+```toml
+[pack]
+schema  = 1
+id      = "my-first-pack"
+kind    = "team"        # "preset" | "team" | "template"
+tier    = "free"
+version = "0.1.0"
+label   = "フレンドリーな小さな助手"
+description = "デモパック"
+
+[[pack.agents]]
+name = "helper"
+role = "main"
+display_name = "ヘルパー"
+```
+
+ディレクトリ内のそれ以外(ペルソナ、スキル、wikiページ)は変更不要です。すでに旧フォーマットのパックがありますか? `duduclaw pack inspect <dir> --emit-canonical`が対応する`pack.toml`を表示するので、レビューして保存できます——あなたのファイルを上書きすることはありません。
+
 ## 2. ローカルテストループ
 
 ```bash
+# インストール前に、DuDuClawがこのパックをどう読むかを確認
+duduclaw pack inspect ./my-first-pack
+
 # 検証 + インストール(ディレクトリから直接インストール)
-duduclaw expert install ./my-first-pack
+duduclaw pack install ./my-first-pack
 
 # 何がインストールされたか確認
-duduclaw expert list
+duduclaw pack list
 
-# 共有可能なzipにパッケージング
+# 共有可能なzipにパッケージング(制作側の動詞は`expert`配下に残ります)
 duduclaw expert pack ./my-first-pack
 
 # 相手がインストール(ローカルzipでもURLでも可)
-duduclaw expert install ./my-first-pack-0.1.0.zip
-duduclaw expert install https://example.com/my-first-pack-0.1.0.zip
+duduclaw pack install ./my-first-pack-0.1.0.zip
+duduclaw pack install https://example.com/my-first-pack-0.1.0.zip
 
 # きれいに削除(パックの社員、同梱スキル、wikiページを削除)
 duduclaw expert remove my-first-pack
 ```
+
+`duduclaw expert install` / `expert list`も引き続き使えます——上の2行のエイリアスで、同じコードパス、同じ出力です。
 
 インストール側の防御は組み込み済みです:zip-slipフェンス、50MB上限、コンテンツスキャン。**フックは常に隔離ディレクトリ(`hooks-disabled/`)に無効化された状態でインストール**され、オペレーターが明示的に信頼を許可するまで有効化されません。パックを書くときは、フックが自動的に有効になると想定しないでください。
 

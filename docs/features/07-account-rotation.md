@@ -268,6 +268,20 @@ Retryable error? (timeout, temporary server error)
   → Short cooldown, retry soon
 ```
 
+### Three layers, one question
+
+"Who takes over when this attempt fails?" gets asked at three different scopes, and the answer used to live in three modules whose boundary was maintained only by comments. Two of them now sit side by side in `failover.rs`:
+
+| Layer | The question | Triggered by |
+|-------|--------------|--------------|
+| 1. Account | Same model, a different credential? | rate limit / billing / auth failure on one account |
+| 2. Model | Same runtime, a **lighter model**? | hard timeout, HTTP 503, 429, "overloaded" |
+| 3. Runtime | A different **provider CLI** entirely? | the primary runtime returned a retryable error |
+
+They compose bottom-up. The account rotator exhausts its pool first; only then does layer 2 ask whether a lighter model on the same runtime would get through (`FailoverManager::model_fallback_for`, the decision every dispatch path consults); and only the runtime dispatcher reaches layer 3. Layer 2 never fires on a billing error — a cheaper model does not fix a depleted balance, and retrying would spend a second call for nothing.
+
+A fourth mechanism, a candidate-filtering router in the LLM crate, was removed in the 2026-09 audit: it had never been wired to a call site.
+
 ### Channel Failure Tracking
 
 When a channel reply fails (the user-facing path), the system records structured failure data:

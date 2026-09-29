@@ -243,11 +243,11 @@ allowed_tools = ["wc_list_products", "wc_get_order", "wc_list_orders"]
 **Use OAuth 2.1 via the WordPress MCP Adapter — the legacy `X-MCP-API-Key` was
 deprecated 2026-06-23.** Provision: the WP MCP Adapter plugin + an OAuth client.
 
-### DocuSeal (no server exists — build `duduclaw-docuseal-mcp`)
+### DocuSeal (official MCP server, self-hosted)
 
-No MCP server ships for DocuSeal yet; the path is to build a small one (REST +
-webhook: generate → send → webhook-complete) and mount it here, then contribute
-it upstream. Tracked in IMPL-PLAN §D as effort M.
+DocuSeal self-hosted exposes its own MCP endpoint at `https://<host>/mcp` —
+mount it with a bearer token from Settings → MCP Server. Cloud tenants have no
+MCP endpoint; use the REST API there. See [docuseal.md](docuseal.md).
 
 ### Monica (personal PRM — thin MCP or IdentityProvider)
 

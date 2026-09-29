@@ -9,7 +9,7 @@
 
 `SOUL.md` is the authoritative identity document for a DuDuClaw agent. It defines personality, responsibilities, and behavioral guidelines in freeform Markdown.
 
-**Since Evolution v3 (2026-08-06), this file is read-only for the agent itself.** The Evolution Engine's default path (AEE) never writes `SOUL.md` — learning lands in the playbook instead (see `docs/architecture/evolution-engine.md` ch.12, `docs/features/38-aee-playbook-evolution.md`). `SOUL.md` is edited only by the operator/dashboard, or by GVU's legacy self-play cycles when an agent opts in via `agent.toml [evolution] legacy_soul_evolution = true` — the rest of this spec still applies verbatim to that legacy path.
+**Since Evolution v3 (2026-08-06), this file is read-only for the agent itself, and since 2026-09-29 (S11) nothing in the platform can write it on an agent's behalf at all.** The Evolution Engine (AEE) never writes `SOUL.md` — learning lands in the playbook instead (see `docs/architecture/evolution-engine.md` ch.12, `docs/features/38-aee-playbook-evolution.md`). The legacy GVU self-play cycle that used to rewrite this file, and its `[evolution] legacy_soul_evolution` opt-in, were removed. `SOUL.md` is edited only by the operator/dashboard.
 
 ## File Location
 

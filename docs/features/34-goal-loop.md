@@ -91,6 +91,19 @@ Each agent's leash length is one dial: `agent.toml [capabilities] autonomy_level
 | `approver` | **Default.** No kickoff gate; humans are only consulted at `needs_human`. |
 | `observer` | Fully autonomous; `needs_human` notifies but does not wait. |
 
+## Internal Layout
+
+The driver and its helpers live together under `crates/duduclaw-gateway/src/goal_loop/`:
+
+| Module | What it holds |
+|---|---|
+| `goal_loop.rs` | `GoalLoopDriver` — the outer loop itself. |
+| `goal_loop/signals.rs` | The four zero-LLM extractors that read a round's output: gap fingerprint (H4), the `(state, action)` visit graph (A2), the in-round tool-call streak advisory (H10), and the premature-stop regex panel (H5). |
+| `goal_loop/state.rs` | The structured `<state>` block (A1), the closed `needs_human` pause-reason classification (H11), and the budget-exhausted "best round" picker (WP-4F). |
+| `goal_loop/plan.rs` | Goal decomposition and the plan-first ("想一想") planner. |
+
+Before 2026-09 these were eight separate crate-root modules (`goal_state`, `goal_visit_graph`, `goal_gap_fingerprint`, `goal_budget_best_round`, `goal_bail_detect`, `goal_tool_streak`, `goal_plan`, `pause_reason`). The 2026-09 feature audit (O8) merged them by role; every old `crate::goal_*` / `crate::pause_reason` path stays available as a re-export for one release, and no behavior, config key, or test changed.
+
 ## ActionGuard: Three-Valued Irreversibility
 
 Layered on top, per tool call (`approval.rs`, after Magentic-UI's ActionGuard):

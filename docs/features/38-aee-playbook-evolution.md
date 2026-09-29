@@ -25,7 +25,8 @@ Three months of production data showed the old mechanism often "broke without an
 1. **You edit SOUL.md; agents cannot edit their own.** To adjust an agent's personality, tone, or responsibility boundaries, use the dashboard ("agents → details → edit") or edit the file directly, same as before. The difference is that an agent will no longer quietly rewrite its own persona file in the middle of the night.
 2. **The playbook (behavioral rules) is the new learning container, replacing whole-persona rewrites.** Each rule is small, has its own category (fix a mistake / refine an existing approach / explore a new one), records which situations should trigger it, links at least one verification test case, and accumulates helpful/harmful scores. Rules that perform poorly retire automatically — they never pile up into a giant document nobody dares to touch.
 3. **Verification became fine-grained.** The old flow was: rewrite the whole persona file, observe for 24 hours, confirm or roll back the whole thing. Now each rule is verified on its own and kept or dropped on its own — when one rule performs poorly, only that rule is rolled back, without dragging down the other good lessons.
-4. **The old mechanism was kept as an escape hatch, off by default.** If you have a specific reason to keep the old whole-file SOUL.md rewrite behavior, set `[evolution] legacy_soul_evolution = true` in that agent's `agent.toml`. Agents on that path give up the new mechanism's protections (layered verification, finer rollback, stagnation alerts).
+4. **The old mechanism is gone (2026-09-29).** The whole-file `SOUL.md` rewrite path, its `[evolution] legacy_soul_evolution` escape hatch, `SOUL.md` versioning, the 24-hour observation window, automatic rollback and the `duduclaw evolution finalize` command were all removed. `SOUL.md` had already been read-only for agents since v3, so the write path those mechanisms guarded no longer existed. A `legacy_soul_evolution = true` left in an old `agent.toml` is ignored.
+5. **New agents learn from day one.** Since the same date, `[evolution] gvu_enabled` ships `true` — a freshly created AI employee accumulates experience rules without anyone turning anything on. Cost stays bounded by `gvu_cooldown_minutes` (how often a round may start) and by the zero-LLM Gate, which rejects a doomed candidate before any judge call is paid for. Set `gvu_enabled = false` on an agent that should stay frozen.
 
 ---
 
@@ -165,12 +166,54 @@ Before a learning proposal enters verification, it passes a zero-LLM cheat check
 
 ---
 
+## Fault attribution: whose failure was it?
+
+A learning loop that only ever sees "this round failed" has one place to put the blame, and it puts it on the model every time. That is the wrong answer more often than it sounds: a round can fail because the reviewer got it wrong, because the rate limit hit, because the binary was missing, or because a tool the employee tried to use was blocked by its own permission settings. Learn from those and you get a rule that "fixes" behavior which was never broken.
+
+So before a failed round becomes learning signal, DuDuClaw decides whose failure it was, from evidence, with no extra model call. Five possible answers, and only one of them teaches anything:
+
+| Attributed to | What it looks like | Effect on learning |
+|---|---|---|
+| The AI employee | An ordinary failed round with nothing else wrong | Normal — this is the only case that feeds learning |
+| The reviewer | The zero-cost evidence check and the reviewer disagree: the answer is backed by a real tool result yet was rejected, or it was accepted while a hard evidence check failed | Excluded |
+| The environment | Usage limit, billing, timeout, missing program, launch failure, no accounts available | Excluded |
+| The scaffolding | The reply says it used tools but no tool activity was captured, or a permission gate blocked a tool call during the round | Excluded |
+| Unknown | Nothing about the round was observable | Excluded |
+
+"Excluded" means exactly that: the round is treated as **no evidence** — the rules that were in play are neither penalised nor rewarded. It is deliberately not re-scored as a success, since that would credit rules for a round they never influenced. Every exclusion is written to the audit trail as a `fault_attributed` entry naming the side and the rule that fired, so you can see which rounds were held back and why.
+
+The same label travels with recorded mistakes: a mistake attributed to anything but the AI employee no longer counts toward the "three of the same kind" threshold that consolidates mistakes into a durable rule. Mistakes recorded before this shipped keep their old meaning and still count.
+
+It is on by default. To go back to blaming every failure on the model, put this in `~/.duduclaw/config.toml`:
+
+```toml
+[evolution]
+fault_attribution = false
+```
+
+Background: *The Misattribution Gap* (arXiv:2605.22842) found an attribution system blaming the model in 64 of 64 failures whose real cause lay elsewhere; *Model or Harness?* (arXiv:2607.28802) is where the "decide the side from a fixed list, at write time, and say Unknown when you cannot tell" rule comes from.
+
+---
+
 ## What is not done yet
 
 This is a staged rebuild. The items below are planned and did not ship in this release; they will be announced separately:
 
 - Turning each learning event into a falsifiable hypothesis, so the observation window waits for a concrete answer instead of vaguely watching statistics
 - Periodic semantic deduplication of accumulated rules (today's dedup only catches near-verbatim repeats; it cannot yet see that five rules are really saying the same thing — an overlap that takes understanding to spot)
+
+---
+
+## Causal support (2026-09-29, telemetry only)
+
+Every candidate rule now carries one extra number: **how many of its trigger signals are backed by a causal claim a human has actually accepted**. The claims come from the audit trail — when a task is rejected or escalated, DuDuClaw records "this tool error was present when this kind of task failed" as a candidate for review, with zero model calls and nothing leaving the machine. Accepting one on the causal review page is what turns it into support.
+
+Two things this number deliberately does **not** do:
+
+- It never decides whether a rule is committed. A transcribed co-occurrence that one reviewer waved through is not a quality measurement, so the commit gate is blind to it in both directions. It is shown on the rule card and recorded in the round snapshot, and that is all.
+- With no accepted claims at all, it reads "not measured" rather than zero. An agent nobody has reviewed claims for is not an agent whose rules are unsupported.
+
+If you do want it to bite, `config.toml [evolution] require_causal_evidence = true` makes an unsupported new rule enter as a **shadow candidate**: stored and scored, but never injected into a prompt until its evidence arrives. The rule is kept, not thrown away — "not yet evidenced" is a different thing from "wrong". Off by default, and off means the write path is unchanged.
 
 ---
 

@@ -215,7 +215,7 @@ Eval 是演化引擎內部驗證器的**獨立**對照組：
 - AEE 的 Measure 步驟會用 subprocess 方式（runtime-agnostic，絕不 in-process）跑 `duduclaw eval … --replay --report` 來為候選打分，再讀取 JSON 報告。
 - 一輪改動 commit 之後，每個條目會在 `aee_settle_hours` 之後各自結算（確認／回滾），依據的是**它自己連結的那個 case**：一旦退步，只會回滾造成問題的那一個條目。
 
-舊版 SOUL.md 路徑（透過 `[evolution] legacy_soul_evolution = true` 選擇加入）仍然使用整份檔案的 24 小時觀察期（`ObservationFinalizer` / `duduclaw evolution finalize`），它的後續指標來自 `prediction.db` + `feedback.jsonl`，不接這條 eval 線。
+舊版 SOUL.md 路徑那套整份檔案的 24 小時觀察期（`ObservationFinalizer` / `duduclaw evolution finalize`）已於 2026-09-29（S11）移除。現在唯一的觀察窗是條目對自己連結的 eval case 各自定案。
 
 ---
 

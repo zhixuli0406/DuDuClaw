@@ -1,6 +1,7 @@
 # DuDuClaw — 已知問題與待修復清單（已歸檔）
 
 > **狀態：已歸檔** — 以下所有 25 項問題均已在 v0.5.0–v0.5.1 (Phase 1–6) 中修復。
+> **2026-09-29 註記**：本檔引用的 `python/duduclaw/sdk/chat.py`、`sdk/health.py`、`channels/base.py`（C-6／H-8／H-9）已於 2026-09-29 功能盤點（S12 Python 縮編）移除，歷史紀錄保留原文不改。
 > 當前版本：v0.6.0 — 活躍任務追蹤見 [Phase2-TODO.md](Phase2-TODO.md)
 >
 > 原始記錄日期：2026-03-16

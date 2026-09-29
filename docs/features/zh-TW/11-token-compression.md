@@ -1,139 +1,107 @@
-# Token 壓縮三刀流
+# Prompt 預算強制
 
-> 三種策略，以更少的 Token 承載更多內容：無損、有損、串流。
-
----
-
-## 比喻：三種打包行李的方式
-
-你帶著一個固定大小的行李箱（LLM 的 context window）出門旅行。你的東西比裝得下的多。三種策略：
-
-1. **真空壓縮袋** — 不丟任何東西，全壓進去。衣服拿出來有皺摺但完好。可以完美解壓。
-2. **只帶必需品** — 只裝你真正會穿的。丟了一些東西，但重要的都在。
-3. **寄送 + 輪替** — 把不常需要的東西先寄到目的地。行李箱裡保持每日換洗的滾動庫存。需要時交換。
-
-DuDuClaw 提供這三種策略，各自適用於不同場景。
+> 回覆路徑上的一條管線：估算 prompt，超過預算就依「最不失真 → 最激進」走三個階段，走不完就拒絕。
 
 ---
 
-## 策略 1：Meta-Token 壓縮（無損）
+## 歷史說明
 
-Meta-Token 壓縮找出文字中重複出現的模式，用較短的符號取代（類似 zip 檔案的原理，但為 token 序列設計）。
+本頁原本描述的是「壓縮三刀流」：Meta-Token／LTSC（無損模式取代）、LLMLingua-2 橋接（有損 token 剪枝）、StreamingLLM（KV-cache 驅逐），各自掛一個 MCP 工具。
 
-演算法掃描整個輸入，辨識出最常重複的子序列，用 meta-token 取代。這是迭代進行的——第一輪的輸出可能產生新的重複，第二輪可以進一步壓縮。
+那套壓縮器**已於 v1.33 從 `duduclaw-inference` 移除**。它只能靠手動 MCP 工具觸及，回覆路徑上沒有任何一處會呼叫它，而且與下面這條管線功能重疊。它留下的兩個儀表板設定區段（`inference.toml` 的 `[llmlingua]`、`[streaming_llm]`，`inference.update` 仍照單全收）已於 2026-09 一併移除——那只是在寫沒人會讀的鍵。
 
-- **壓縮率**：27-47% 的 token 數量縮減
-- **最適合**：結構化、重複性內容（JSON、程式碼、模板、對話日誌）
-- **最不適合**：高度多樣的自然語言
-- **可逆性**：100% 無損，解壓產生完全一致的原始內容
-- **速度**：快速（無 LLM 呼叫，純模式比對）
+現在存在的東西更窄，但一直在熱路徑上：`crates/duduclaw-gateway/src/prompt_compression.rs`。
 
 ---
 
-## 策略 2：LLMLingua-2（有損）
+## 它補上的洞
 
-LLMLingua-2 的哲學不同：它保留原始*格式*，透過移除不太有意義的 token 來壓縮*內容*。
-
-重要性評分由輕量模型完成，評估每個 token 對整體意義的貢獻。純結構性的 token（冠詞、介系詞、填充詞）得分低。承載語意內容的 token（名詞、動詞、領域術語）得分高。
-
-- **壓縮率**：2-5x 縮減
-- **最適合**：自然語言、對話歷史、冗長解釋
-- **最不適合**：程式碼、結構化資料（每個 token 都有意義）
-- **可逆性**：不可逆，資訊會遺失
-- **速度**：中等（需要輕量模型評估）
+在這條管線之前，200K 價格懸崖是**事後**才被診斷出來的：`cost_telemetry::record` 拋一個 `cost_pressure` 事件，操作者收到警告，但下一個請求照樣原樣送出。預算強制把這個迴圈在請求邊界上閉合。
 
 ---
 
-## 策略 3：StreamingLLM（KV-Cache 管理）
+## 怎麼啟用
 
-這項策略管理的是模型的*內部記憶*（KV-cache），不是單純壓縮*文字*本身。此概念來自一個觀察：LLM 有兩種重要的位置：
+強制是 per-agent 的，而且**沒設就不啟用**：
 
-1. **Attention sinks**：對話中最開頭的幾個 token。不論內容為何，LLM 都會不成比例地關注它們。它們充當注意力機制的「錨點」。
-2. **近期上下文**：最近的 token，包含即時相關的資訊。
-
-中間的所有東西往往接收較少注意力，對回應品質的貢獻較小。
-
-```
-完整對話（10,000 tokens）：
-  [Token 1-4]  [Token 5-8000]  [Token 8001-10000]
-  ^              ^                ^
-  Attention      中間段落          近期上下文
-  sinks         （較少被關注）      （高度相關）
-     |
-     v
-StreamingLLM KV-cache：
-  [Token 1-4]  +  [Token 8001-10000]
-  ^                ^
-  保留的            保留的
-  sinks            近期窗口
-
-中間段落從快取中驅逐。
+```toml
+[budget]
+max_input_tokens = 150000       # 0 或缺鍵 ⇒ 不啟用強制
+cache_guard_min_eff = 0.5       # 見下方「快取守衛」
+cache_guard_max_overshoot = 0.15
 ```
 
-- **壓縮效果**：理論上可實現無限長度的對話
-- **最適合**：超過 context window 的超長對話
-- **最不適合**：中間上下文至關重要的對話
-- **速度**：非常快（只是快取驅逐策略）
+`prompt_audit::read_max_input_tokens` 讀第一個鍵；檔案不存在、TOML 壞掉、鍵不存在，三者都回 0，也就是永遠不進管線。這刻意與快取守衛的慣例相反——守衛預設**開**。
 
 ---
 
-## 組合策略
+## Token 估算
 
-三種策略不互斥，可以分層使用：
+`estimate_tokens` 是 CJK 感知的啟發式，不是 tokenizer：**CJK 每個 codepoint 1.306 token，其餘每 3.6 字元 1 token**。這兩個常數來自 2026-08 的本機語料校準，取代了原本「每 token 1.5 字元」的統一猜測——後者在繁體中文負載上低估了約 22%。
 
-```
-帶有結構化資料的長對話
-     |
-     v
-步驟 1：Meta-Token 壓縮結構化部分
-  （JSON 訊息、程式碼區塊 → 27-47% 更小）
-     |
-     v
-步驟 2：LLMLingua-2 壓縮舊對話歷史
-  （幾小時前的冗長交流 → 2-5x 更小）
-     |
-     v
-步驟 3：StreamingLLM 管理剩餘上下文
-  （保留 sinks + 近期窗口，驅逐其餘）
-     |
-     v
-結果：原本要消耗 200K token 的對話
-      現在舒適地塞進 50K
-```
-
-系統可根據內容類型自動選擇適當策略：結構化資料用 Meta-Token，自然語言用 LLMLingua-2，活躍對話用 StreamingLLM。
+`estimate_request_tokens` 把 system prompt、歷史與待送的使用者訊息加總。
 
 ---
 
-## 這為什麼重要
+## 三個階段
 
-### 直接成本節省
+每個階段都是 `(system, history, user)` 上的純函式，要嘛回傳更小的版本，要嘛回 `None`（「我幫不上更多忙」）；呼叫端依序走，直到估算值符合預算。
 
-在 LLM 世界裡，token 就是金錢。輸入 token 減少 40% 意味著該請求的 API 成本降低 40%。每日數千請求累積起來，節省相當可觀。
+**1. `turn_trim`** — 逐輪尾端裁剪。超過 800 字元的輪次保留前 300 與後 200 字元，中間放 `[trimmed N chars]` 標記；以字元層級切片，CJK 不會從 codepoint 中間斷開。處於成本壓力時門檻從 800 降到 200。短回覆什麼都不會失去。
 
-### 更大的有效上下文
+**2. `drop_oldest_tool_echoes`** — 剝除舊的工具內容；若該歷史路徑沒有可靠的取回把柄，就把那段位元組標記為不可用。工具回聲是最便宜的損失：結果通常已經反映在它後面那一輪助理回覆裡。
 
-透過壓縮輸入，Agent 可在相同的 context window 內考慮更多資訊。100K 的 context window 套用壓縮後，有效變成 150K-200K。Agent 有更多相關上下文可用，回應品質因此提升。
+**3. `bisect_and_summarize`** — 非同步階段。純函式階段都失敗後，gateway 只摘要**未受保護**的較舊輪次，再重新檢查預算。切分點由 `partition_turns_for_summary` 決定。
 
-### 無限對話
+如果管線仍然塞不下，它**不會**默默送出超預算的 prompt：回傳 `BudgetExceeded` 並發出 `budget_exceeded` 事件。
 
-StreamingLLM 移除了對話長度的硬性上限。沒有它，超過 context window 的對話必須被摘要或截斷，導致資訊遺失。有了它，對話可以無限延續同時保持連貫。
+### never-trim 區段
 
-### 可組合架構
+`split_never_trim_sections`／`is_never_trim_header`／`never_trim_tokens` 圈出任何階段都不得碰的 system prompt 區段——身分、工作狀態權威區塊、安全邊界。預算可以沒達成，這些區段不能為了達成預算而被悄悄丟掉。
 
-每種策略是一個獨立模組，可透過 MCP 工具存取。營運人員和 Agent 可根據具體場景個別或組合調用它們。
+---
+
+## 快取守衛
+
+在 prompt 快取健康時，壓縮並不免費。哪怕只改寫歷史的一小段尾巴，也會改變快取所依據的位元組，強迫整個 cache prefix 重建——arXiv:2607.12161 量到這個重建佔該情境開銷的約 87%。換句話說，省下的 token 可能比付出的還少。
+
+`should_skip_for_cache` 是 `maybe_compress_history` 在**進入管線之前**就會查的決定性閘：
+
+| 條件 | 預設 | 效果 |
+|---|---|---|
+| 近期快取效率 | > 50%（`cache_guard_min_eff`）| 且… |
+| 預算超出幅度 | < 15%（`cache_guard_max_overshoot`）| …完全跳過壓縮 |
+
+與 `max_input_tokens` 不同，這道守衛**預設開啟**——檔案不存在或缺鍵都退回論文的門檻值，只有顯式寫 `cache_guard_min_eff = 0` 才關掉。它是一項該預設保護 agent 的安全最佳化，不該要求逐 agent opt-in。
+
+`CompressionInfo`（`compressed`／`compression_stages`）透過 task-local 從 `maybe_compress_history` 一路帶到好幾個 async frame 之後的 `cost_telemetry` 紀錄點。
+
+---
+
+## 刻意不做的事
+
+寫出來，免得有人哪天又加回去：
+
+- **LLMLingua-2 橋接**：Python 子行程啟動延遲讓它不適合逐請求的同步壓縮。真要回來，位置是非同步摘要器，不是熱路徑。
+- **Meta-token／LTSC 取代**：它在 agent 端要付解碼時間，所以只能是顯式 opt-in 的旋鈕。延後，未排程。
+- **KV-cache 驅逐（StreamingLLM）**：DuDuClaw 驅動的是 CLI 與廠商 API，它並不擁有模型的 KV-cache。
+
+---
+
+## token 實際上省在哪裡
+
+這個領域最大的一次縮減其實不是壓縮。`[runtime] minimal_context`（預設開）收窄每次 CLI spawn 的 `--tools` 清單並帶上 `--setting-sources project,local`，實測固定開銷從每次 spawn 35,892 降到 10,974 token，約 69%。剩下最大的固定成本是 DuDuClaw 自己的 MCP 工具 schema。
 
 ---
 
 ## 與其他系統的互動
 
-- **Session Manager**：在儲存長對話前套用壓縮。
-- **信心路由器**：壓縮後的 prompt 消耗較少 token，影響路由決策。
-- **CostTelemetry**：追蹤壓縮率及其帶來的成本節省。
-- **記憶系統**：舊的情節記憶在歸檔前可能被壓縮。
+- **Session 記憶堆疊** — 壓縮摘要注入 system prompt，絕不當成對話輪次，見 [16-session-memory-stack.md](16-session-memory-stack.md)。
+- **CostTelemetry** — 逐請求記錄 `compressed`／`compression_stages`；`cache_attribution_snapshot()` 回報是哪一個快取區塊一直在打斷 prefix。
+- **Direct API** — 分層 `cache_control` 斷點以 `CACHE_SPLIT_MARKER` 切分 system prompt，那正是快取守衛的效率數字之所以有意義的原因。
 
 ---
 
 ## 總結
 
-Context window 有限；對話沒有。壓縮三刀流給 DuDuClaw 三個互補的工具來彌合這個差距：Meta-Token 保留所有內容（結構），LLMLingua-2 保留重要的（語意），StreamingLLM 保留現在需要的（時效性）。三者合力，將硬性限制轉化為可管理的權衡。
+這一頁的誠實版本是：一條管線、三個階段、兩個設定鍵，外加一條顯式的拒絕路徑。它取代的三刀流，是三套聽起來很厲害、但回覆路徑上從來沒被呼叫過的策略。

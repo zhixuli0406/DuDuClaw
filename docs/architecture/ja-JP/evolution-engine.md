@@ -4,7 +4,7 @@
 > 日付：2026-03-29（v3追補：2026-08-06）
 > ステータス：Production — 197 tests passing（v2.0基準）；v3 AEEは第12章を参照
 
-**本稿を読む前にご確認ください（v3の現状）**：第4章で説明する「GVUがSOUL.mdを直接書き換える」フローは、v3（2026-08-06）以降**非デフォルトのエスケープハッチ経路**になりました（`agent.toml [evolution] legacy_soul_evolution = true` を設定した場合のみ有効）。**デフォルト経路はAEEに変わりました**：SOUL.mdはagentに対して読み取り専用になり（ペルソナ層自体は依然として業界のコンセンサスですが、LLMによる全文書き換えはもう行いません）、進化の着地先は第12章で説明するplaybookエントリモデルに変わります。第4・7・8・9章のGVUに関する記述（4層検証、24時間観察期間、append-only書き込み）は `legacy_soul_evolution = true` の場合はそのまま有効で、今回の応急処置（capデッドロック解除、観察窓の品質ゲート、判官順序の修正、agentごとのcooldown、停滞検知、しきい値の対称的な回復）も追加で適用されます。AEE経路は第12章で別途説明し、両経路で共有する応急処置には下線を付けています。設計全文：`commercial/docs/DESIGN-evolution-v3-aee.md`；計画と根本原因の鑑識：`commercial/docs/TODO-evolution-v3-2026-08.md`；ユーザー向けの解説：`docs/features/38-aee-playbook-evolution.md`；スイッチの詳細：`docs/guides/evolution-switches.md`。
+**本稿を読む前にご確認ください（S11の現況、2026-09-29）**：第4章で説明する「GVUがSOUL.mdを直接書き換える」フローと、それを支えていたすべて（`agent.toml [evolution] legacy_soul_evolution` 非常口、`SOUL.md` バージョン管理、24時間の観察ウィンドウ、自動ロールバック、サイズ上限のconsolidate書き換え、deferred GVU再試行、`duduclaw evolution finalize` CLI）は**コードベースから削除されました**。`SOUL.md` はv3（2026-08-06）でエージェントに対して読み取り専用になっており、その時点でこれらが守っていた書き込み経路はすでに存在していませんでした。**第4・7・8・9章は履歴として残します**：エンジンが以前どう動いていたか、各ガードがなぜ建てられたかを説明しており、第12章の設計圧力を理解する最短経路であることは変わりません——ただし、そこに生きたコードは1行もありません。実際に動くエンジンはAEE（第12章）で、`[evolution] gvu_enabled` は出荷時 `true` になりました。設計全文：`commercial/docs/DESIGN-evolution-v3-aee.md`；計画と根本原因の鑑識：`commercial/docs/TODO-evolution-v3-2026-08.md`；ユーザー向けの解説：`docs/features/ja-JP/38-aee-playbook-evolution.md`；スイッチの詳細：`docs/guides/ja-JP/evolution-switches.md`。
 
 ---
 
@@ -871,7 +871,7 @@ peer_signals = false               # Peer Agentシグナル
 
 ### 12.0 一言でいうと
 
-第4章のGVUループそのものが廃止されたわけではない——Generator→Verifier→Updaterの3ステップの枠組みはそのまま残っている。変わったのは**ループが操作する対象**で、`SOUL.md` 全体からplaybookエントリに変わった。`legacy_soul_evolution = true` のときは第4章がそのまま有効に働く；デフォルト（`false`）のときは、第4章のGenerator/Verifier/Updaterの3つの役割を、本章の `gvu/aee/` サブモジュールが引き継ぐ。
+Generator→Verifier→Updaterの3ステップという*形*は第4章から変わっていない。変わったのは**ループが操作する対象**で、`SOUL.md` 全体からplaybookエントリになり、3つの役割は本章の `gvu/aee/` サブモジュールが担う。第4章の実装そのものは2026-09-29（S11）に削除された——履歴であって、切り替えて戻せる選択肢ではない。
 
 ### 12.1 なぜSOUL.mdからplaybookへ移行したのか（診断結果）
 
@@ -1046,9 +1046,8 @@ active/probationエントリの `dedup_key` をソートしたもののSHA-256�
 ```toml
 # agent.toml
 [evolution]
-gvu_enabled = false            # Opt-in、AEEとlegacyの両経路をカバー
+gvu_enabled = true             # 2026-09-29（K2）以降の出荷時デフォルト
 gvu_cooldown_minutes = 60      # agentごと、すべてのトリガー経路をカバー
-legacy_soul_evolution = false  # true → 第4章の旧SOUL.md経路を使用
 aee_settle_hours = 24          # AEEエントリの観察窓、上限30日
 strategy = "balanced"          # balanced | innovate | harden | repair_only
 

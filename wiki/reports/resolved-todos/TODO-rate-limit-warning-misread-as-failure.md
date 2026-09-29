@@ -1,5 +1,10 @@
 # TODO — A quota *warning* is counted as a failed call
 
+> 📦 **ARCHIVED 2026-09-29** (feature audit G8). Resolved 2026-08-17; moved out of `docs/todo/`
+> because a resolved item left in the public TODO index reads as open work.
+> The one piece that was still open when it was filed — the dashboard card —
+> is tracked wherever dashboard work is tracked, not here.
+
 **Owner:** — &nbsp; **Status:** ✅ fixed 2026-08-17 (server-side; dashboard card still open)
 **Last updated:** 2026-08-17 &nbsp; **Severity:** 🟡 MEDIUM (wastes quota retrying calls that already succeeded)
 

@@ -1,217 +1,105 @@
-# 三階段漸進式安全防禦
+# 安全防線
 
-> 分層威脅過濾：90% 的攻擊以零成本攔截。
-
----
-
-## 比喻：機場安檢的三道關卡
-
-過機場安檢時，不是每個人都受到相同的對待：
-
-1. **金屬探測門**：所有人都要走過。瞬間攔截明顯威脅，零人力投入。
-2. **X 光機**：行李被掃描，操作員掃一眼螢幕，只有被標記的行李才會二次檢查。
-3. **私人安檢室**：只有觸發多重警報的旅客才需要，接受徹底的人工檢查。
-
-DuDuClaw 的安全防禦完全依照此模式運作：三層逐步加重的檢查，絕大多數威脅在到達昂貴層級之前就被攔截。
+> 四道現役守衛、各自跑在哪裡，以及它們都擋不住什麼。
 
 ---
 
-## 運作方式
+## 歷史說明
 
-### Layer 1：確定性黑名單
+2026-09 之前，本頁描述的是一套三階段 shell 腳本防禦：確定性黑名單、混淆／外洩掃描器、Haiku AI 判讀，全部放在 `.claude/hooks/`，由 GREEN／YELLOW／RED 威脅等級狀態機協調。
 
-第一道防線是簡單、快速的模式比對器。已知危險操作被立即阻擋：
+那批腳本已在 commit `ba015a48`（把 `.claude/` 移出公開 repo）時刪除，`.claude/` 現在整個被 gitignore。出貨的 binary 沒有任何一處會讀它們，威脅等級狀態機也不存在。
 
-```
-傳入的工具呼叫或指令
-     |
-     v
-比對黑名單模式：
-  - 破壞性 shell 指令
-  - 直接存取敏感檔案
-  - 已知注入模式
-     |
-  +--+--+
-  |     |
-符合    不符合
-  |     |
-  v     v
-阻擋   傳遞到 Layer 2
-```
-
-此層在微秒內執行。沒有網路呼叫、沒有模型調用、沒有模糊地帶。模式符合就阻擋，沒有例外。
-
-黑名單涵蓋最常見的攻擊向量：刪除資料的指令、擷取環境變數的指令、企圖繞過檔案權限的模式。
-
-### Layer 2：混淆與資料外洩偵測
-
-知道 Layer 1 存在的攻擊者會嘗試繞過，將指令編碼為 Base64、將危險字串分散在多個操作中、或逐步建構有效載荷。
-
-Layer 2 在威脅等級升高（YELLOW 或以上）時啟動：
-
-```
-工具呼叫通過 Layer 1
-     |
-     v
-目前威脅等級 >= YELLOW？
-     |
-  +--+--+
-  |     |
- 是     否 --> 直接通過（Layer 2 跳過）
-  |
-  v
-掃描混淆模式：
-  - Base64 編碼的指令片段
-  - 異常上下文中的環境變數引用
-  - 符合已知資料外洩端點的 URL
-  - 重新組合後形成危險指令的編碼字元
-     |
-  +--+--+
-  |     |
-發現    乾淨
-  |     |
-  v     v
-阻擋   傳遞到 Layer 3（若為 RED）
-```
-
-此層仍然是規則式的（沒有 LLM 呼叫），但規則更精密。它尋找的是*繞過意圖*而非直接的危險指令。
-
-### Layer 3：AI 判讀
-
-最昂貴的一層。只在威脅等級 RED（已確認攻擊行為）時啟動：
-
-```
-工具呼叫通過 Layer 1 和 2
-     |
-     v
-目前威脅等級 == RED？
-     |
-  +--+--+
-  |     |
- 是     否 --> 直接通過
-  |
-  v
-將上下文送交輕量 LLM：
-  「根據這一系列工具呼叫及其上下文，
-   這是合法操作還是攻擊企圖？」
-     |
-  +--+--+
-  |     |
-攻擊    合法
-  |     |
-  v     v
-阻擋   放行
-```
-
-此層攔截在語意上危險但語法上無辜的攻擊。這些事物個別看來正常，但結合起來形成惡意模式。
-
-### 威脅等級狀態機
-
-三層由威脅等級系統協調運作：
-
-```
-GREEN（正常）
-  |
-  | 偵測到可疑模式
-  v
-YELLOW（警戒）
-  |
-  | 確認攻擊指標
-  v
-RED（實際威脅）
-  |
-  | 觀察期內無事件
-  v
-YELLOW --> GREEN（逐步降級）
-```
-
-關鍵行為：
-- **升級迅速**：單一確認的攻擊指標立即從 GREEN 跳到 YELLOW。
-- **降級緩慢**：系統等待平靜的觀察期才降級。這防止攻擊者觸發封鎖、短暫等待、然後再次嘗試。
-- **層級隨等級啟動**：GREEN 時只跑 Layer 1。YELLOW 時跑 Layer 1+2。RED 時三層全開。
+產品裡真正存在的東西更小、也更好推理：gateway 裝進每個 agent 目錄的**兩個 PreToolUse hook**（兩個都是 Rust 子命令）、訊息路徑上的**一個輸入掃描器**，以及對「誰能命令誰」那組檔案的**一道欄位級凍結**。
 
 ---
 
-## 無侵入式架構
+## 守衛 1 — `agent-file-guard`（PreToolUse，Rust）
 
-一項關鍵設計決策：**以上所有功能都不修改 Claude Code 本身**。
+`duduclaw hook agent-file-guard` 是真正的子命令而不是 shell 腳本，所以 macOS／Linux／Windows 行為一致。Gateway 以 matcher `Write|Edit|MultiEdit|Bash` 把它註冊進 `<agent_dir>/.claude/settings.json`，每次開機重新註冊（`agent_hook_installer`），並且是合併進操作者既有設定，不是整份覆寫。
 
-整個安全系統以 `.claude/hooks/` 目錄中的 shell 腳本實作。這些 hook 是 Claude Code 提供的標準擴展機制，在特定工具呼叫前後執行，接收工具參數並回傳允許/拒絕決定。
+以下情況它會 exit 2（Claude Code 讀成「擋掉這次工具呼叫」）：
 
-```
-Claude Code 呼叫一個工具
-     |
-     v
-Hook 系統攔截（PreToolUse）
-     |
-     v
-安全腳本執行 3 層檢查
-     |
-  +--+--+
-  |     |
-允許   拒絕
-  |     |
-  v     v
-工具   工具呼叫被
-執行   阻擋並附帶說明
-```
+- Agent 把 **agent 結構檔**（`agent.toml`、`SOUL.md`、`CLAUDE.md`、`.mcp.json`…）寫到正規的 `<home>/agents/<name>/` 樹之外。開新 agent 只能走 `create_agent` MCP 工具，那條路帶著委派授權閘；
+- Agent 寫**自己的 `SOUL.md`**，即使位置正確也擋。人格由操作者管理；唯一例外是該 agent 在 `agent.toml [permissions] can_modify_own_soul = true` 明確開啟，而且也只能改自己的；
+- Agent 動**別的 agent** 的檔案，一律擋。
 
-這代表：
-- DuDuClaw 安全機制適用於任何 Claude Code 版本
-- 不需要 fork、patch 或 monkey-patching
-- 安全層可獨立於 Claude Code 進行更新
+## 守衛 2 — `data-file-guard`（PreToolUse，Rust，RFC-23 §14.4）
+
+守衛 1 保護 DuDuClaw 自己的結構檔，這一道保護的是客戶的資料。
+
+`Read` 與 `Bash` 是 Claude Code 內建工具，所以 `cat customers.csv` 永遠不會經過 `file_read`／`csv_read`／`xlsx_read` 必經的 MCP 去識別化收斂點。安裝器把 `duduclaw hook data-file-guard` 註冊到 matcher `Read|Bash`；判斷邏輯放在 `duduclaw_core::data_file_guard`，由 CLI 子命令與 gateway 安裝器測試共用。契約與守衛 1 相同：exit 0 放行、exit 2 加 stderr 阻擋，stderr 會顯示給模型看。
+
+除非 gateway 在 spawn 時設 `DUDUCLAW_DATA_FILE_GUARD`，否則它完全不作用；而 gateway 只在該 agent 的去識別化真的生效時才會設。去識別化關閉的部署，行為與這道守衛存在之前逐位相同。
+
+H10（2026-09）之前，這是放在 `<agent_dir>/.claude/hooks/data-file-guard.sh` 的 POSIX shell 腳本，而且在 `PATH` 上沒有 bash 的 Windows 主機上**完全不作用**——hook 指令執行失敗，而 Claude Code 把非 2 的結束碼（包含「command not found」）當成*放行*，守門就在最沒人會發現的地方消失。安裝器現在會在升級時刪掉殘留的舊腳本，避免有人把它誤認成現役守衛。
+
+**明講限制**：`Bash` 那道檢查比對的是檔名。動態組路徑的指令（`python -c "open(chr(99)+…)"`）照樣走得過去。真正的保護是 MCP 工具面，這道守衛只是降低模型走上未設防路徑的機率。它是啟發式，不是沙箱。
+
+## 守衛 3 — `input_guard`（提示注入掃描器，Rust 函式庫）
+
+`duduclaw_security::input_guard::scan_input` 以**七類規則**對文字評 0–100 分，達到或超過 `DEFAULT_BLOCK_THRESHOLD`（60）就擋：
+
+| 規則 | 權重 | 單條即擋 |
+|---|---|---|
+| `instruction_override` | 40 | 是 |
+| `role_hijack` | 35 | 是 |
+| `tool_abuse` | 30 | 是 |
+| `data_exfiltration` | 25 | 是 |
+| `system_prompt_extraction` | 30 | 否 |
+| `encoding_bypass` | 25 | 否 |
+| `termination_manipulation` | 30 | 否 |
+
+平台主要語言是繁體中文，所以樣式同時涵蓋英文與 zh-TW。文字先做 NFKC 正規化（`unicode_normalizer`），同形異義字與隱形字元的花招因此躲不過樣式比對。
+
+`termination_manipulation`（LoopTrap，arXiv:2605.05846）刻意不設成單條即擋：權重 30 低於門檻，單次命中只警告並留稽核，不阻斷——這樣一般的「請繼續」不會被誤殺。
+
+呼叫端：MCP 分派總門（`scan_input_with_audit`）、`duduclaw migrate-from` 匯入、expert pack 安裝、skill 審查——任何未信任文字要進入 agent context 的地方。
+
+## 守衛 4 — `org_field_guard`（組織權威凍結）
+
+A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[agent] reports_to`／`department`／`name` 與 `config.toml` 的 `[delegation]`、`[acp]` 決定誰能命令誰。這兩個都是普通檔案：一個手上有 `Edit` 的 agent 可以把自己的 `reports_to` 改指向受害者，再宣稱「下屬 → 上級」那條規則。被審判的一方握有證據。
+
+`org_field_guard` 跑在同一個 `agent-file-guard` hook 裡，把重建出來的**寫入後內容**逐欄位與磁碟上的現況比對，受保護欄位或區段有變動就拒絕。`[capabilities]` 是**整張表**凍結而不是列一份鍵名清單——這樣未來版本新增的 capability 鍵，落地當天就受保護，而不是等誰想起來去補清單。
+
+依建構方式 fail-closed：新內容無法解析、既有內容無法解析、寫入意圖無法重建，三者全部拒絕。檔案還不存在則放行，因為建立走的是 `create_agent`，那裡有自己的閘。
+
+合法變更的既有路徑全部保留：MCP `agent_update` 工具與儀表板 `agents.update` RPC，兩者都不經過這個 hook。
 
 ---
 
-## 專門保護
+## 支撐層
 
-除了三層之外，hook 系統還提供針對性保護：
+**MCP 授權閘** — 每個 MCP 工具都在 scope 表裡逐項列舉；沒被列的工具預設需要 Admin scope。Scope、per-agent capability 授權、`denied_tools` 三者各自在分派總門強制，每次拒絕都帶 `error_class` 落稽核。
 
-**人格檔案保護** — Agent 的身份檔案受到保護，防止未經授權的讀取和寫入。只有演化引擎（在特定環境旗標下運行）才能修改它。
+**SOUL.md 漂移偵測** — `soul_guard` 在開機與每次 heartbeat tick 以 SHA-256 對每份 `SOUL.md` 取指紋，在 `.soul_history/` 保留最多 10 個版本備份，並連同 Agent Stability Index 一起回報漂移。
 
-**機密掃描器** — 所有檔案寫入都會被掃描，檢查是否包含看起來像 API 金鑰、密碼、token 或其他認證資料的模式。若發現，寫入被阻擋並發出警報。
+**稽核軌跡** — `tool_calls.jsonl` 記錄每次工具呼叫，`result_text`／`input_text` 都經遮罩（三輪秘密遮罩，先遮再截斷），權限 `0600`，行與行之間雜湊串接，16 MB 輪替。`security_audit.jsonl` 另外承載安全事件。這份 log 同時是 grounding precheck 與驗收判官讀的證據來源，弱化它等於弱化驗證。
 
-**審計記錄器** — 每次工具呼叫（允許或拒絕）都記錄在 append-only 日誌檔案中。這提供完整的鑑識軌跡供事件調查使用。
-
-**設定守衛** — 關鍵設定檔被監控以防未經授權的變更。如果設定檔在核准通道之外被修改，系統會發出警報。
-
-**Unicode 正規化** — 所有輸入在處理前都會做 NFKC 正規化，以偵測同形異義字攻擊（例如用看起來像拉丁字母的西里爾字元）。這能防止視覺偽裝式的繞過嘗試。
-
-**Action Claim Verifier** — 驗證工具執行宣稱上的加密簽章，確保宣稱的工具結果真的來自預期的工具。
-
-**RBAC（角色型存取控制）** — 一套角色型存取控制矩陣規範每個使用者/Agent 能做什麼。不同角色（admin、operator、viewer）有不同的權限集合，在 API 層強制執行。
+**每 agent 金鑰隔離** — MCP API key、通道 token、連接器憑證都是 per-agent，經 `secret_ref` 解析，所以單一 agent 外洩不等於平台外洩。
 
 ---
 
-## 這為什麼重要
+## 這些守衛擋不住什麼
 
-### 成本效率
+明講這一節本身就是防線的一部分。
 
-將 AI 判讀保留給最罕見的情況（僅限 RED 等級），安全系統在正常操作中增加的成本接近零。大多數威脅被微秒級的 Layer 1 黑名單攔截。
-
-### 縱深防禦
-
-沒有單一層級負責所有安全。繞過 Layer 1（混淆）的攻擊者仍面對 Layer 2（模式分析）。繞過 Layer 2 的攻擊者仍面對 Layer 3（語意 AI 判讀）。
-
-### 最少誤報
-
-Layer 1 的黑名單故意保守；它只阻擋*確定*危險的事物。模糊的情況留給更高層級處理，這些層級有更多上下文做出準確判斷。
-
-### 可審計性
-
-JSONL 審計日誌意味著每個安全決策都被記錄並可供檢閱。當安全事件發生（或誤報被回報）時，營運人員可以精確重建發生了什麼、什麼被阻擋、以及為什麼。
+- **Hook 看得到的是 Claude Code 自己的工具呼叫，不是 MCP 工具呼叫。** MCP 有自己的閘（scope、授權、`denied_tools`）；hook 是內建 `Write`／`Edit`／`Read`／`Bash` 那面的第二道鎖。
+- **`data-file-guard` 是啟發式。** 它比對 `Bash` 指令列裡的檔名，動態組出來的路徑就繞得過去。（它已不再在 Windows 上失效——H10 已把它改成 Rust 子命令。）
+- **沒有威脅等級狀態機。** `~/.duduclaw/threat_level` 還在，作為 computer use 協調器會輪詢的操作者 kill switch（`RED` 中止、`YELLOW` 暫停），但工作區內已沒有任何東西會寫它。檔案不存在或讀不到就視為 `GREEN`。
+- *（2026-09 移除。）* 本節原本註明 PTY session pool 不在去識別化改寫的涵蓋範圍內。該連線池已不存在——每次 Claude spawn 都是單次 spawn，正好就是改寫掛鉤的地方。
 
 ---
 
 ## 與其他系統的互動
 
-- **CONTRACT.toml**：行為契約定義 Agent *不得*做什麼。安全 hook 在工具呼叫層級強制執行*如何*實施。
-- **演化引擎**：安全層保護人格檔案免受未經授權的修改，確保只有 GVU 管線能演化 Agent。
-- **儀表板**：威脅等級和近期安全事件可在 Web 介面中查看。
-- **審計系統**：與更廣泛的 JSONL 審計紀錄整合，支援合規需求。
+- **CONTRACT.toml** 定義 agent 絕不能做什麼，`duduclaw test` 對它紅隊；守衛負責工具呼叫層級的強制。
+- **演化引擎** — 因為 `SOUL.md` 對 agent 唯讀，會演化的產物是 playbook，見 [38-aee-playbook-evolution.md](38-aee-playbook-evolution.md)。
+- **去識別化與資料來源** — `data-file-guard` 補的是哪條管線，見 [55-data-sources.md](55-data-sources.md)。
+- **委派隔離** — `org_field_guard` 保護的是哪個判定，見 [37-delegation-isolation.md](37-delegation-isolation.md)。
 
 ---
 
 ## 總結
 
-安全不一定很貴。透過在昂貴的 AI 判讀之前分層便宜的確定性檢查，DuDuClaw 以接近零的成本攔截絕大多數威脅，同時為真正模糊的情況保留 AI 判讀能力。
+四道各自明講失效模式的守衛，勝過一個底下已經沒有程式碼的三層故事。防線被移除時，文件必須跟著移除：一頁描述著不存在的 shell 腳本的文件比沒有文件更糟，因為它會讓操作者停止繼續找。

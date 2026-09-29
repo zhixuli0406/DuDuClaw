@@ -65,54 +65,41 @@ DuDuClaw 的信心路由器就是 LLM 查詢的差旅審核員，評估每個查
 
 ---
 
-## 多後端推論引擎
+## 路由器背後的推論引擎
 
-路由器背後是一個透過單一介面支援多個後端的統一推論引擎：
+有哪些模型、怎麼挑、怎麼裝，請看 **[53-local-models.md](53-local-models.md)**——後端這條線現在歸那一頁。這一節只講路由器需要知道的部分。
 
-### 後端選項
+### 只有一個出貨的後端
 
-**llama.cpp** — C++ 主力引擎。支援跨平台硬體加速：
-- Apple Metal（macOS）
-- NVIDIA CUDA（Linux/Windows）
-- Vulkan（跨平台 GPU）
-- CPU 降級（任何平台）
+**OpenAI 相容 HTTP** 是唯一有出貨的 `InferenceBackend` 實作。它可以對接任何講 OpenAI chat-completions API 的服務：llama-server、Ollama、llamafile 單檔伺服器、vLLM、SGLang。設定寫在 `inference.toml [openai_compat]`。
 
-**mistral.rs** — Rust 原生引擎，具備進階功能：
-- ISQ（原位量化）：無需預處理即可即時量化模型
-- PagedAttention：長上下文的高效記憶體管理
-- Speculative Decoding：用小模型草擬 token，由主模型驗證
+本頁原本列出的那些程序內後端，已於 2026-09-29 移除（`wiki/reports/feature-audit-2026-09-29.md` T1-D2/D3、T3-S4/S5）：
 
-**OpenAI 相容 HTTP** — 連接任何使用 OpenAI chat completions API 的伺服器：
-- Exo 分散式叢集
-- llamafile 單檔案伺服器
-- vLLM、SGLang 等推論框架
+- **llama.cpp**（`llama-cpp-2`）——release build 從來沒有編進 `metal`／`cuda`／`vulkan` feature，而且它的 `generate()` 是個回傳「not yet fully implemented」的 stub。
+- **mistral.rs**（`mistralrs-core`，ISQ／PagedAttention／Speculative Decoding）——同樣從未編進任何出貨 binary。
+- **MLX bridge**（`mlx_lm` Python 子行程）——零呼叫端。本頁描述的「不需 API 呼叫的本地反思」路徑在程式碼裡從來不存在。
+- **Exo 分散式叢集**——repo 裡沒有任何範例設定，使用者實際上碰不到；把 `[openai_compat] base_url` 指向 Exo 端點就能連到同一個叢集。
 
-**MLX Bridge** — 給 Apple Silicon 使用者的 Python 子行程，呼叫 `mlx_lm`：
-- 不需 API 呼叫的本地反思
-- 支援 LoRA adapter，可微調 Agent 人格
-- 反思在本地跑，省下 API token
+`BackendType::LlamaCpp` 與 `MistralRs` 保留成可解析的設定值，讓舊的 `inference.toml` 仍能載入，但選到它們會回 `BackendUnavailable`，訊息指向 `openai_compat`。
 
 ### InferenceManager 狀態機
 
-系統不會只選擇一個後端就固定不動。InferenceManager 維護一個帶自動容錯的優先鏈：
+管理器維護一條帶自動容錯的優先鏈：
 
 ```
-優先 1：Exo P2P 叢集（多機器匯集 GPU 記憶體——可執行 235B+ 模型）
-     |
-     v  （不可用或不健康？）
-優先 2：llamafile（單檔案零安裝）
+優先 1：llamafile（單檔案零安裝）
      |
      v  （不可用？）
-優先 3：Direct Backend（llama.cpp 或 mistral.rs 程序內載入）
+優先 2：Direct Backend（程序內的 `InferenceBackend`；今天一個都沒出貨）
      |
      v  （無本地 GPU / 模型太大？）
-優先 4：OpenAI 相容伺服器（外部 vLLM、SGLang 等）
+優先 3：OpenAI 相容伺服器（llama-server、Ollama、vLLM、SGLang…）
      |
      v  （無外部伺服器可用？）
-優先 5：Cloud API（Claude——最後防線，永遠可用）
+優先 4：Cloud API（Claude——最後防線，永遠可用）
 ```
 
-每個後端有定期健康檢查。當後端變得不健康（當機、記憶體不足、回傳錯誤），管理器自動降級到下一層。後端恢復時，自動升回。
+每一層有定期健康檢查。當某層變得不健康（當機、記憶體不足、回傳錯誤），管理器自動降級到下一層；恢復時自動升回。
 
 ---
 
@@ -178,7 +165,7 @@ llamafile 正在執行嗎？
 | `inference_status` | 目前載入的模型、硬體、記憶體用量、後端類型 |
 | `hardware_info` | GPU 自動偵測、VRAM、RAM、建議設定 |
 | `route_query` | 預覽路由決策而不實際生成 |
-| `inference_mode` | 目前模式（exo-cluster / llamafile / direct / cloud-only） |
+| `inference_mode` | 目前模式（llamafile / direct / openai-compat / cloud-only） |
 | `model_search` | 依 RAM 條件搜尋 HuggingFace + 精選模型庫 |
 | `model_download` | 下載到 `~/.duduclaw/models/`，支援斷點續傳與 mirror 容錯 |
 | `model_recommend` | 依硬體條件建議適合的模型 |

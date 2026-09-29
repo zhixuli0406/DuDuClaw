@@ -66,7 +66,7 @@ category = "DB_FIELD"
 **目前還沒涵蓋的部分:**
 
 - **HTTP/SSE 型 MCP server。**這種 server 沒有子行程可以包,所以改寫邏輯直接放過它們,只留一行警告日誌,它們的工具結果照樣未遮蔽地送進模型。
-- **PTY session pool**(`[runtime] pty_pool_enabled`,預設關,文件上標為備援路徑)。一個 pooled 的互動 REPL session 存活時間跨越多次呼叫,不是單次 spawn,這個改寫機制依附的「每次 spawn 一份暫存 `--mcp-config`」沒有地方可以掛;需要改成 session 自己持有的改寫,而不是每次呼叫各自持有,目前還沒做。上面的一般 spawn 與 one-shot PTY 不受影響。
+- *(已不再是缺口:PTY session pool 已於 2026-09 移除,現在每次 Claude spawn 都是改寫機制本來就掛得上的單次 spawn。)*
 - **codex／gemini／antigravity。**這幾個 runtime 自己的 MCP 註冊完全還沒接上 proxy。
 
 ---
@@ -168,9 +168,11 @@ category = "DB_FIELD"
 
 ### 資料檔守門
 
-`[redaction] data_file_guard = "on" | "read_only" | "off"`,預設 `on`,只在發起呼叫的那個 agent 去識別化真的生效時才作用。它是一個 PreToolUse hook(`data-file-guard.sh`,隨既有安全 hook 一起安裝),讀 `DUDUCLAW_DATA_FILE_GUARD` 這個環境變數,由 gateway 在 spawn 時設定,不是 agent 自己讀得到或改得了的設定值。`on` 擋內建 `Read` 讀 `.csv/.tsv/.xlsx/.xlsm/.xls/.ods` 路徑,也擋指令文字裡含這些副檔名檔名的 `Bash`;`read_only` 只擋 `Read`;`off` 什麼都不擋。擋下時回傳的拒絕訊息是「此檔案受去識別化保護,請改用 csv_read／xlsx_read／file_read」。
+`[redaction] data_file_guard = "on" | "read_only" | "off"`,預設 `on`,只在發起呼叫的那個 agent 去識別化真的生效時才作用。它是一個 PreToolUse hook(`duduclaw hook data-file-guard`,隨既有安全 hook 一起註冊),讀 `DUDUCLAW_DATA_FILE_GUARD` 這個環境變數,由 gateway 在 spawn 時設定,不是 agent 自己讀得到或改得了的設定值。`on` 擋內建 `Read` 讀 `.csv/.tsv/.xlsx/.xlsm/.xls/.ods` 路徑,也擋指令文字裡含這些副檔名檔名的 `Bash`;`read_only` 只擋 `Read`;`off` 什麼都不擋。擋下時回傳的拒絕訊息是「此檔案受去識別化保護,請改用 csv_read／xlsx_read／file_read」。
 
-兩個限制老實講清楚,不含糊帶過。`Bash` 那道檢查是檔名啟發式判斷,一條動態組出路徑的指令(`python -c "open(chr(99)+...)"`)直接繞過去。這個 hook 又是一支 shell script,跟它的姊妹 `agent-file-guard`(刻意寫成 Rust 子指令好讓它能在 Windows 上跑)不同,在沒有 `bash` 在 `PATH` 上的 Windows 主機,這個 hook 指令本身會執行失敗,Claude Code 把非 2 的結束碼當放行,守門在那裡就等於不存在。這兩個缺口不會列為待修 bug。PreToolUse hook 這種機制本來就只能做到這樣:降低模型不小心走上未遮蔽路徑的機率。真正的保護面是 MCP 工具本身,一條綁定 `duduclaw_files` 的規則只有在值進了 `$.rows[*]` 以後才看得到,守門上游有沒有擋下什麼都不影響這一點。
+一個限制老實講清楚,不含糊帶過:`Bash` 那道檢查是檔名啟發式判斷,一條動態組出路徑的指令(`python -c "open(chr(99)+...)"`)直接繞過去。這不是待修 bug,而是 PreToolUse hook 這種機制本來就只能做到這樣:降低模型不小心走上未遮蔽路徑的機率。
+
+另一個限制已經補掉了。這個 hook 原本是一支 shell script,在沒有 `bash` 在 `PATH` 上的 Windows 主機,hook 指令本身會執行失敗,Claude Code 把非 2 的結束碼當放行——守門就在最沒人會發現的地方消失。2026-09 功能盤點把它改寫成 Rust 子指令(跟姊妹 `agent-file-guard` 一樣),binary 跑得到的平台它就跑得到。改版前安裝的 agent 不受影響:下次 spawn 時 installer 會換掉 hook 設定,並把殘留的 `.claude/hooks/data-file-guard.sh` 刪掉。真正的保護面是 MCP 工具本身,一條綁定 `duduclaw_files` 的規則只有在值進了 `$.rows[*]` 以後才看得到,守門上游有沒有擋下什麼都不影響這一點。
 
 ### 附件提示
 
@@ -503,12 +505,13 @@ priority = 30
 
 ## 邊界
 
-- **還有四個缺口,誠實列出。**HTTP/SSE 型 MCP server(沒有子行程可包,留警告日誌)。PTY session pool(`[runtime] pty_pool_enabled`,預設關,文件標為備援路徑),需要 session 自己持有改寫,而不是這個功能現在做的每次呼叫各自持有,目前還沒做。codex／gemini／antigravity 這幾個 runtime,自己的 MCP 註冊完全沒接上 proxy。以及本機推論的工具迴圈(`local_llm.rs`),本機模型的工具呼叫,proxy 與 `ToolInterceptor` 都碰不到。通道回覆(一般 spawn 與 one-shot PTY)與派工／cron／心跳／goal-loop 輪次都已涵蓋;以上四項還沒有。
+- **還有三個缺口,誠實列出。**HTTP/SSE 型 MCP server(沒有子行程可包,留警告日誌)。codex／gemini／antigravity 這幾個 runtime,自己的 MCP 註冊完全沒接上 proxy。以及本機推論的工具迴圈(`local_llm.rs`),本機模型的工具呼叫,proxy 與 `ToolInterceptor` 都碰不到。通道回覆(一般 spawn 與 one-shot PTY)與派工／cron／心跳／goal-loop 輪次都已涵蓋;以上三項還沒有。(第四個缺口 PTY session pool 隨著該連線池於 2026-09 移除而消失。)
 - **登錄表描述的是形狀,不是語意。**`record_paths` 或 `table_arg` 打錯字不會讓某個欄位悄悄少一層保護,寫錯的項目要嘛直接載入失敗(fail-closed),要嘛什麼都命不中,而後者「試跑」會如實顯示零命中。
 - **`db_query` 只在 operator 明確寫下 `allowed_tables = ["*"]` 的來源上才存在。**沒有針對自由 SQL 的半調子或盡力而為的白名單檢查,設計上是整支工具直接拒用,不會假裝有在過濾。
 - **連線池是每次呼叫現開,不快取。**對一個 agent 一輪只會呼叫幾次的工具來說,這是對的取捨,而且代表憑證輪替或改設定會立刻生效,不用重啟 gateway。
-- **資料檔守門是提醒,不是沙箱。**`Bash` 那道檢查是檔名啟發式判斷,一條動態組出路徑的指令(`python -c "open(chr(99)+...)"`)直接繞過去;在沒有 `bash` 在 `PATH` 上的 Windows 主機,這個 hook 本身就是一支 shell script,不會執行,守門等於不存在。兩個限制都不是後來才發現的,hook 自己的原始碼裡寫得清清楚楚。真正讓地端檔案的欄位值留在去識別化範圍內的,是 MCP 工具本身(`file_read`／`csv_read`／`xlsx_read`),不是前面那道守門。
-- **db_sources 授權立即生效,但有一個例外。**MCP 派發節流點每次呼叫都重讀 `agent.toml`,一輪新對話馬上看得到工具,因為每一輪都是全新 spawn 的 CLI 行程;唯一的例外是預設關閉的 `[runtime] pty_pool_enabled` pooled REPL,那個 session 要等被回收重開才會看到新的授權清單。
+- **AI 偵測會漏,這是量出來的,不是修辭。**zh-TW 整體召回率約 80%、人名約 72%,換到長得跟我們完全不像的語料上只會更差。樣式規則集請一直開著,把 `ai_pii` 當成疊在它們之上的第二層,絕不要當成「開了就合規」的那個東西。它載入時還要吃掉約 1.1–1.7 GB 記憶體、每句 60–160 毫秒,而且在 Intel 版 macOS 上根本不存在。
+- **資料檔守門是提醒,不是沙箱。**`Bash` 那道檢查是檔名啟發式判斷,一條動態組出路徑的指令(`python -c "open(chr(99)+...)"`)直接繞過去。這個限制不是後來才發現的,守門自己的原始碼裡寫得清清楚楚。(旁邊那個 Windows 漏洞——shell script 在沒有 `bash` 時靜默失效——已在 2026-09 盤點改寫成 Rust 子指令補掉。)真正讓地端檔案的欄位值留在去識別化範圍內的,是 MCP 工具本身(`file_read`／`csv_read`／`xlsx_read`),不是前面那道守門。
+- **db_sources 授權立即生效。**MCP 派發節流點每次呼叫都重讀 `agent.toml`,一輪新對話馬上看得到工具,因為每一輪都是全新 spawn 的 CLI 行程。(唯一的例外原本是 pooled REPL——要等 session 回收才刷新工具清單;該連線池已於 2026-09 移除。)
 - **`db_sources_remove` 刻意不對照設定檔驗證。**`db_sources`／`db_sources_add` 都要求 id 在 `config.toml [db_sources.<id>]` 裡存在,`db_sources_remove` 不用,這樣即使來源已經被刪掉,agent 手上那份過時的授權還是撤得掉。
 
 ---

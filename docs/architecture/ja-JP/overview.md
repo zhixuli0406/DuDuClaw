@@ -43,15 +43,13 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 
 ### 進化
 - **予測駆動エンジン**：Active Inference + Dual Process Theory、約90%の会話でLLMコストゼロ。無視できる/中程度の誤差 → コストゼロ、有意な誤差 → GVUリフレクションを起動、重大な誤差 → 緊急GVUループを起動。
-- **MetaCognition**：100回の予測ごとに誤差閾値を自己校正、Adaptive Depth（GVU 3〜7ラウンド）を駆動。
-- **GVU²自己対戦ループ**（Generator→Verifier→Updater）：TextGradフィードバック、4+2層の検証（L1-Format / L2-Metrics / L2.5-MistakeRegression / L3-LLMJudge / L3.5-SandboxCanary / L4-Safety）。**Evolution v3以降は非デフォルトのlegacyパス**（`agent.toml [evolution] legacy_soul_evolution = true`）— 詳細は後述のAEEを参照。
-- **Deferred GVU**：勾配の蓄積＋遅延リトライ（最大3回延期、72時間の範囲、実効9〜21ラウンドに相当）。
+- **MetaCognition**：100回の予測ごとに誤差閾値を自己校正。
 - **MistakeNotebook**：ループを横断するエラー記憶で退行を防止。エントリには決定的な `TrajectoryEvidence`（どのツール/アサーションが失敗したか）が付与され、リフレクションの統合が未検証の自己申告診断を鵜呑みにしなくなりました（Evolution v3）。
-- **SOUL.mdバージョン管理**：24時間の観察期間＋自動ロールバック、書き込みはアトミック（一時ファイル＋rename）でSHA-256フィンガープリント付き。この仕組みは上記のlegacy GVUパスに適用されます。**Evolution v3以降 `SOUL.md` はエージェントに対してデフォルトで読み取り専用**です（オペレーター/ダッシュボードのみ書き込み可）。
-- **AEE（Agentic Evolution Engine、v3のデフォルト）**：デフォルトの進化対象は `SOUL.md` から**playbook**へと変わりました。カテゴリ／シグナル／eval caseに紐づく、小さく個別に廃止可能な遺伝子状のエントリの集合で、Gate（決定的、拒否権を保持）とMeasure（スコアリング、拒否権なし）の分離、champion＋現状維持か改善のみ許可するコミットゲート（matches-or-improves）、そしてファイル全体ではなくエントリ単位の観察期間を通じて進化します。詳細は `evolution-engine.md` 第12章と `../../features/ja-JP/38-aee-playbook-evolution.md` を参照。
+- **`SOUL.md` はエージェントに対して読み取り専用**です（Evolution v3 WP1.1、オペレーター/ダッシュボードのみ書き込み可）。旧来のGenerator→Verifier→Updater書き換え経路、`SOUL.md`バージョン管理、24時間の観察ウィンドウ、自動ロールバックは **2026-09-29（S11）に削除**されました：エージェントに代わってこのファイルを書ける経路がもう存在しない以上、それらが守っていた対象自体がありません。
+- **AEE（Agentic Evolution Engine、唯一の進化エンジン）**：進化の対象は `SOUL.md` ではなく**playbook**です。カテゴリ／シグナル／eval caseに紐づく、小さく個別に廃止可能な遺伝子状のエントリの集合で、Gate（決定的、拒否権を保持）とMeasure（スコアリング、拒否権なし）の分離、champion＋現状維持か改善のみ許可するコミットゲート（matches-or-improves）、そしてファイル全体ではなくエントリ単位の観察期間を通じて進化します。詳細は `evolution-engine.md` 第12章と `../../features/ja-JP/38-aee-playbook-evolution.md` を参照。
 - **Agent-as-Evaluator**：独立したEvaluator Agent（コスト管理のためHaikuを使用）が、構造化されたJSON判定によるアドバーサリアル検証を行います。
 - **ConversationOutcome**：LLMコストゼロで会話結果を検出（TaskType / Satisfaction / Completion）、zh-TW + en の両言語に対応。
-- **外部要因**：ユーザーフィードバック、セキュリティイベント、チャネル指標、Odooのビジネスコンテキスト、他エージェントからのシグナルが予測エンジンとGVUリフレクションに反映されます。
+- **外部要因**：ユーザーフィードバック、セキュリティイベント、チャネル指標、Odooのビジネスコンテキスト、他エージェントからのシグナルが予測エンジンと進化ラウンドに反映されます。
 
 ### Wikiナレッジレイヤー（v1.8.9）
 - **4層アーキテクチャ**（Vault-for-LLMに着想）：L0 Identity / L1 Core / L2 Context / L3 Deep。
@@ -82,10 +80,8 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 ### ローカル推論
 - **統一 `InferenceBackend` トレイト**（`duduclaw-inference` crate）：llama.cpp（Metal/CUDA/Vulkan/CPU）、mistral.rs（ISQ + PagedAttention + Speculative Decoding）、OpenAI互換HTTP（Exo/llamafile/vLLM/SGLang）。
 - **Confidence Router**：LocalFast / LocalStrong / CloudAPIの3段階ルーティング、CJKを考慮したトークン推定。
-- **InferenceManager**：自動切り替えのステートマシン——Exo P2P → llamafile → Direct backend → OpenAI-compat → Cloud API。
-- **Exo P2Pクラスター**（`exo_cluster.rs`）：分散推論、複数マシンをまたいで235B超のモデルを実行可能。
+- **InferenceManager**：自動切り替えのステートマシン——llamafile → Direct backend → OpenAI-compat → Cloud API。
 - **llamafile manager**：サブプロセスのライフサイクル管理、ヘルスモニタリング、localhostでOpenAI互換APIを提供。
-- **MLX bridge**：Apple Silicon上でPythonサブプロセスから `mlx_lm` を呼び出し、ローカルリフレクション + LoRAに利用。
 - **MCPツール**：`model_list`、`model_load`、`model_unload`、`inference_status`、`hardware_info`、`route_query`、`inference_mode`、`llamafile_start/stop/list`、`compress_text`、`decompress_text`。
 
 ### トークン圧縮
@@ -103,17 +99,16 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 - **ONNX Embedding**：BERT WordPieceトークナイザー + ONNX Runtimeベクトル埋め込み。
 
 ### セキュリティ
-- **Claude Codeセキュリティhooks**（`.claude/hooks/`）：3段階の漸進的防御——Layer 1 決定的ブラックリスト（<50ms）、Layer 2 難読化/情報流出検出（YELLOW以上）、Layer 3 HaikuによるAI判断（RED時のみ）。
-- **脅威レベルステートマシン**：GREEN → YELLOW → RED、自動エスカレーション/降格（24時間イベントなしで1段階降格）。
-- **SOUL.mdドリフト検出**（SHA-256フィンガープリント）。
-- **Prompt injectionスキャナー**（6種類のルールカテゴリ + XML区切り文字による保護）。
+- **Claude Code PreToolUse hooks**（`agent_hook_installer` がエージェントごとに `<agent_dir>/.claude/settings.json` へ導入）：`duduclaw hook agent-file-guard`（Rust サブコマンド、matcher `Write|Edit|MultiEdit|Bash`——正規ツリー外のエージェント構造ファイル、自分の SOUL.md への書き込み、他エージェントへの書き込みをブロックし、`reports_to` / `department` / `name` / `[capabilities]` / `[delegation]` / `[acp]` に対する `org_field_guard` のフィールド単位凍結を含む）と `duduclaw hook data-file-guard`（RFC-23 §14.4、matcher `Read|Bash`、匿名化が有効なときだけ武装。サンドボックスではなく `Bash` のファイル名ヒューリスティック——H10 2026-09 が Windows で無効だったシェルスクリプトを置き換え）。2026-04 の3段階シェルスクリプト防御と GREEN/YELLOW/RED の脅威レベルステートマシンは `ba015a48` で削除済み——[`docs/features/ja-JP/05-security-defense.md`](../../features/ja-JP/05-security-defense.md) を参照。
+- **SOUL.mdドリフト検出**（SHA-256フィンガープリント、`.soul_history/` に最大10世代のバックアップ）。
+- **Prompt injectionスキャナー**（`input_guard`、7種類のルールカテゴリ、ブロック閾値60、NFKC正規化、英語＋zh-TW パターン、XML区切り文字による保護）。
 - **機密情報漏洩スキャナー**— 20種類以上のパターン（Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URL）。
 - **CONTRACT.toml**— `must_not` / `must_always` の境界ルール、system promptに自動注入。`duduclaw test` レッドチームCLI（組み込み9シナリオ）。
 - **統一マルチソース監査ログ**：`audit.unified_log` が `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` を共通のエンベロープ（timestamp / source / event_type / agent_id / severity / summary / details）にマージし、Logsページのフィルターチップで絞り込めます。
 - 保存時は**AES-256-GCM**— エージェントごとに鍵を分離。
 - **Ed25519 challenge-response** によるWebSocket認証。
 - **コンテナサンドボックス**（Docker / Apple Container / WSL2）— `--network=none`、tmpfs、読み取り専用rootfs、512MB上限。
-- **ブラウザ自動化**（5層自動ルーティング）：L1 API Fetch → L2 Static Scrape → L3 Headless → L4 Sandbox Container → L5 Computer Use。`CapabilitiesConfig` によりデフォルト拒否。`bash-gate.sh` がLayer 1.5としてPlaywright/Puppeteerをホワイトリスト許可。
+- **ブラウザ自動化と Computer Use**——エージェントが選ぶ3グループの MCP ツール、自動ルーターなし：L1 `web_fetch_cached`（SSRF ゲート付きキャッシュ HTTP）、L2 `web_extract`（CSS セレクタスクレイプ）、L5 は `computer_use_orchestrator` がコンテナの仮想ディスプレイを駆動する7つの `computer_*` ツール。L3 ヘッドレスはエージェントごとの任意の Playwright/Browserbase MCP サーバー（`.mcp.json`）。`CapabilitiesConfig`（`computer_use` / `browser_via_bash` / `allowed_tools` / `denied_tools`）によりデフォルト拒否。死コードだった `browser_router.rs` の5層ルーターとその「L4 Sandbox Browser」層は 2026-09 に削除。
 - **CJK安全なバイトスライス**：`duduclaw_core::truncate_bytes` / `truncate_chars` が31箇所の安全でない `s[..s.len().min(N)]` を置き換え（v1.8.11のマルチバイトコードポイントpanicを修正）。
 
 ### アカウントとコスト
@@ -157,7 +152,7 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
   - `checkpoint.rs`：再開可能なタスク進捗。
   - `dlq.rs`：最終的に失敗したメッセージ用のDead Letter Queue。
 - **`duduclaw-governance` crate**（W19-P1 M1-A）— `PolicyRegistry`（YAML + ホットリロード + エージェント優先度マージ + fail-safe + 並行upsertの安全性）、4種類の `PolicyType`（Rate / Permission / Quota / Lifecycle）、`quota_manager.rs`（エージェントごと/ポリシーごとのソフト・ハードクォータ）、`error_codes.rs`（QUOTA_EXCEEDED / POLICY_DENIED / ...）、承認ワークフロー + 監査ログ。デフォルトのポリシーセットは `policies/global.yaml`。
-- **LLM fallbackチェーン**（`gateway/llm_fallback.rs`）— プライマリのタイムアウト/503/429/overloadedで自動的にフォールバックモデルへ切り替え。`is_llm_fallback_error` / `should_attempt_model_fallback` はユニットテスト付きの純粋関数です。`char_indices` によるUTF-8安全な切り詰め。
+- **LLM fallbackチェーン**（`gateway/failover.rs` の `failover::model`）— 3層フェイルオーバー（アカウント → モデル → ランタイム、2026-09-29 より同一モジュールツリー）の第2層：プライマリのタイムアウト/503/429/overloadedで、より軽いフォールバックモデルへ自動的に切り替えます（課金エラーでは発動しません）。`is_llm_fallback_error` / `should_attempt_model_fallback` はユニットテスト付きの純粋関数で、ディスパッチ経路は統合された `FailoverManager::model_fallback_for` を呼びます。`char_indices` によるUTF-8安全な切り詰め。
 - **Evolution Eventsシステム**（`gateway/evolution_events/`）— 30種類以上のイベントスキーマ、非同期バッチ+リトライのエミッター、クエリインターフェース、信頼性の保証。gateway上でHTTPエンドポイントとして公開され、Webの `ReliabilityPage` に表示されます。
 
 ### メモリ評価（v1.9.4 / W21）

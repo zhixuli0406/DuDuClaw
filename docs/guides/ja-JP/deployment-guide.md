@@ -399,13 +399,22 @@ scrape_configs:
 
 | メトリクス | 種類 | 説明 |
 |--------|------|-------------|
-| `duduclaw_requests_total` | Counter | エージェント・チャネル・runtime・ステータス別の総リクエスト数 |
-| `duduclaw_tokens_total` | Counter | エージェント・種類（input/output/cache_read）別の総トークン数 |
-| `duduclaw_request_duration_seconds` | Histogram | エージェント・runtime 別のリクエストレイテンシ |
-| `duduclaw_active_sessions` | Gauge | 現在アクティブなセッション数 |
-| `duduclaw_channel_connected` | Gauge | チャネルの接続状態（1/0） |
 | `duduclaw_failover_total` | Counter | プロバイダーフェイルオーバーの発生回数 |
-| `duduclaw_budget_remaining_cents` | Gauge | アカウントごとの残予算 |
+| `duduclaw_goal_loop_bail_pattern_total` | Counter | goal loop の早期切り上げ表現、パターン別 |
+| `duduclaw_tick_events_total` / `_dropped_total` | Counter | 常駐センシングの観測数と破棄数、ソース別 |
+| `duduclaw_prompt_compression_runs_total` | Counter | プロンプト圧縮ステージの実行回数、ステージ別 |
+| `duduclaw_relay_frames_total` | Counter | relay WebSocket フレーム、チャネルと結果別 |
+
+> **2026-09に削除。** `duduclaw_requests_total`、`duduclaw_tokens_total`、
+> `duduclaw_request_duration_seconds`、`duduclaw_active_sessions`、
+> `duduclaw_channel_connected`、`duduclaw_budget_remaining_cents` の6系列は
+> スクレイプのたびに描画されていましたが、本番コードから一度もインクリメント
+> されていませんでした——これらの上に作ったGrafanaパネルはアイドルではなく
+> 恒久的なゼロを表示します。飾りとして残すのではなく削除しました。リクエスト
+> 単位のトークンとコストはcost telemetryのSQLite（`cost_summary` /
+> `cost_agents` / `cost_recent` MCPツールとダッシュボードのコストページ）に、
+> チャネル接続状態はダッシュボードのチャネルページにあります。`pty_pool_*`と
+> `worker_*`の2系列は同じリリースでPTYプールとともに削除されました。
 
 ### Grafana ダッシュボード
 
@@ -416,11 +425,10 @@ scrape_configs:
   "dashboard": {
     "title": "DuDuClaw",
     "panels": [
-      {"title": "Requests/min", "type": "stat", "targets": [{"expr": "rate(duduclaw_requests_total[5m])*60"}]},
-      {"title": "Token Usage", "type": "timeseries", "targets": [{"expr": "rate(duduclaw_tokens_total[5m])*60"}]},
-      {"title": "Response Time p95", "type": "stat", "targets": [{"expr": "histogram_quantile(0.95, rate(duduclaw_request_duration_seconds_bucket[5m]))"}]},
-      {"title": "Channels", "type": "table", "targets": [{"expr": "duduclaw_channel_connected"}]},
-      {"title": "Budget", "type": "bargauge", "targets": [{"expr": "duduclaw_budget_remaining_cents"}]}
+      {"title": "Failovers/min", "type": "stat", "targets": [{"expr": "rate(duduclaw_failover_total[5m])*60"}]},
+      {"title": "Sensing events", "type": "timeseries", "targets": [{"expr": "rate(duduclaw_tick_events_total[5m])*60"}]},
+      {"title": "Sensing drops", "type": "timeseries", "targets": [{"expr": "rate(duduclaw_tick_dropped_total[5m])*60"}]},
+      {"title": "Relay frames", "type": "table", "targets": [{"expr": "duduclaw_relay_frames_total"}]}
     ]
   }
 }

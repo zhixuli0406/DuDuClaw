@@ -59,9 +59,10 @@
 - **アプリ**——Chromium、LibreOffice、SteamはFlatpakとしてあらかじめオ
   フラインでインストール済みです。Windowsデスクトップアプリは
   Bottles経由、フルのWindowsはKVM仮想マシン+RDP経由、Androidアプリは
-  Waydroid経由です。何が保証されていて何が保証されていないかは
-  [アプリ互換性ガイド](../../guides/ja-JP/app-compat.md)に明記されて
-  います。
+  Waydroid経由です。何が保証されていて何が保証されていないかはアプリ
+  互換性ガイドに明記されています。このガイドは2026-09-29から
+  [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS)リポジトリの
+  `docs/guides/ja-JP/app-compat.md`にあります。
 
 ## 邪魔をせずに共有する仕組み
 

@@ -21,6 +21,22 @@
 
 兩種外來格式走同一個指令安裝:Claude Code plugin(`.claude-plugin/plugin.json`)與單一 Agent Skill(`SKILL.md`)。格式偵測 fail-closed,認不出的佈局會被拒絕並列出實際找到的內容,絕不半吊子匯入。
 
+## 一種格式,一個入口
+
+專家包、付費團隊劇本、職務組合(preset)以前是三種 manifest 方言配三個安裝動詞。現在是一份 schema(`pack.toml`)配一個指令:
+
+```bash
+duduclaw pack list                 # 已安裝的包、本機職務組合、內建目錄裡可裝的東西
+duduclaw pack inspect <src>        # 正規化後的樣子,並說明這份檔案是哪一代格式
+duduclaw pack install <src>        # 依 kind 分流;付費內容只在一處檢查授權
+```
+
+`[pack] kind` 決定路線:`preset`(一份職務設定,不帶身分)、`team`(名冊,也就是專家包一直以來的樣子)、`template`(單人產業板模)。`[pack] tier` 是唯一的付費判定——以前有四段程式各自從目錄路徑猜「這是不是付費內容」,現在包自己帶著 tier,只有一個判斷式讀它。讀不出來的 tier 一律當成付費:一個看不懂的欄位絕不該解鎖付費內容。
+
+`duduclaw expert install` 是 `pack install` 的別名,行為完全相同;製作端動詞(`pack`、`publish`、`export`、`convert-teams`、`hooks`、`remove`)仍留在 `duduclaw expert` 之下。儀表板的一鍵安裝與 `experts.install` 走到的是同一段程式,因為它們本來就是驅動 CLI。
+
+**`expert.toml`、`team.toml`、`preset.toml` 到 v1.68.0 都還能用。** 磁碟上一個字都不改。`duduclaw pack inspect <dir> --emit-canonical` 會印出舊包對應的 `pack.toml`,讓你自己審過再遷移——而不是讓機器去改寫由你負責的內容。
+
 ## 安裝管線
 
 每次安裝(包括儀表板一鍵安裝與 LLM 生成的草稿)都跑同一套流程:

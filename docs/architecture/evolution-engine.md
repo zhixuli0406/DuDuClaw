@@ -4,7 +4,7 @@
 > Date: 2026-03-29 (v3 addendum: 2026-08-06)
 > Status: Production — 197 tests passing (v2.0 baseline); see chapter 12 for v3 AEE
 
-**Read this before the rest of the document (v3 status)**: the "GVU rewrites SOUL.md directly" flow described in chapter 4 has been a **non-default escape-hatch path** since v3 (2026-08-06) — it only activates when `agent.toml [evolution] legacy_soul_evolution = true` is set. **The default path is now AEE**: SOUL.md becomes read-only for the agent (the persona layer is still industry consensus, it just no longer gets rewritten wholesale by an LLM), and the destination for evolution is the playbook entry model described in chapter 12. The GVU narrative in chapters 4, 7, 8, and 9 (4-layer verification, 24h observation period, append-only writes) still applies unchanged when `legacy_soul_evolution = true`, plus this round's stop-the-bleeding fixes (cap deadlock release, observation-window quality gate, judge ordering fix, per-agent cooldown, stagnation detection, symmetric threshold recovery). The AEE path is covered separately in chapter 12; fixes shared by both paths are underlined. Full design: `commercial/docs/DESIGN-evolution-v3-aee.md`; planning and root-cause forensics: `commercial/docs/TODO-evolution-v3-2026-08.md`; user-facing walkthrough: `docs/features/38-aee-playbook-evolution.md`; switch details: `docs/guides/evolution-switches.md`.
+**Read this before the rest of the document (S11 status, 2026-09-29)**: the "GVU rewrites SOUL.md directly" flow described in chapter 4 — and everything that supported it (the `agent.toml [evolution] legacy_soul_evolution` escape hatch, `SOUL.md` versioning, the 24-hour observation window, automatic rollback, the cap-deadlock consolidate rewrite, deferred-GVU retry, the `duduclaw evolution finalize` CLI) — has been **removed from the codebase**. `SOUL.md` became read-only for agents in v3 (2026-08-06), so by then those mechanisms were already guarding a write path that no longer existed. **Chapters 4, 7, 8 and 9 are retained as history**: they describe how the engine used to work and why each guard was built, which is still the fastest way to understand the design pressure behind chapter 12 — but nothing in them is live code any more. The engine that runs is AEE (chapter 12), and `[evolution] gvu_enabled` now ships `true` from the factory. Full design: `commercial/docs/DESIGN-evolution-v3-aee.md`; planning and root-cause forensics: `commercial/docs/TODO-evolution-v3-2026-08.md`; user-facing walkthrough: `docs/features/38-aee-playbook-evolution.md`; switch details: `docs/guides/evolution-switches.md`.
 
 ---
 
@@ -871,7 +871,7 @@ peer_signals = false               # Peer agent signals
 
 ### 12.0 One-sentence framing
 
-The GVU loop from chapter 4 hasn't been deprecated — the Generator→Verifier→Updater three-step framework is unchanged. What changed is the object the loop operates on: instead of the whole `SOUL.md`, it's now playbook entries. When `legacy_soul_evolution = true`, chapter 4 applies exactly as written. By default (`false`), the Generator/Verifier/Updater roles from chapter 4 are taken over by this chapter's `gvu/aee/` submodule.
+The Generator→Verifier→Updater three-step framework from chapter 4 is unchanged as a *shape*. What changed is the object the loop operates on: instead of the whole `SOUL.md`, it is playbook entries, and the three roles are carried by this chapter's `gvu/aee/` submodule. Chapter 4's own implementation was removed on 2026-09-29 (S11) — it is history, not an alternative you can switch back to.
 
 ### 12.1 Why the shift from SOUL.md to playbook (diagnostic findings)
 
@@ -1035,9 +1035,8 @@ see §12.5.2):
 ```toml
 # agent.toml
 [evolution]
-gvu_enabled = false            # Opt-in, covers both the AEE and legacy paths
+gvu_enabled = true             # Factory default since 2026-09-29 (K2)
 gvu_cooldown_minutes = 60      # Per agent, covers all trigger paths
-legacy_soul_evolution = false  # true → use chapter 4's legacy SOUL.md path
 aee_settle_hours = 24          # AEE entry observation window, capped at 30 days
 strategy = "balanced"          # balanced | innovate | harden | repair_only
 

@@ -1,5 +1,9 @@
 # TODO — The spawn-env allowlist silently breaks anything that relied on inheritance
 
+> 📦 **ARCHIVED 2026-09-29** (feature audit G8). Resolved 2026-08-17 (plus the
+> Windows `SystemRoot` follow-up in `015b4af1`); moved out of `docs/todo/`
+> because a resolved item left in the public TODO index reads as open work.
+
 **Owner:** — &nbsp; **Status:** ✅ fixed 2026-08-17 (see below; proposed fix 1 narrowed)
 **Last updated:** 2026-08-17 &nbsp; **Severity:** 🔴 CRITICAL (one instance put a real-money agent on a simulated broker)
 
