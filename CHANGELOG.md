@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.66.1] - 2026-09-29 — hotfix：macOS 26 機器指紋改綁 IOPlatformUUID×舊指紋相容放行
+
 ### Fixed
 - **macOS 26 起一般行程讀不到任何 MAC，機器指紋退化成只綁 hostname**：指紋的硬體分量一直取「第一個非 loopback 介面的 MAC」。macOS 26（Darwin 27）對未授權行程遮蔽**所有**介面的 MAC——2026-09-29 實測：`/sbin/ifconfig`（Apple 簽章）看得到 `en0 = d0:11:e5:db:58:67`，但 binary／`node`／裸 `getifaddrs` 探針拿到的每個介面都是 `02:00:00:00:00:00`——指紋因此塌成「只綁主機名稱」，同 OS 版本的每台 Mac 共用同一個硬體分量。1.66.1 起 **macOS 改以 `IOPlatformUUID` 綁定硬體**（`ioreg -rd1 -c IOPlatformExpertDevice`，一般行程讀得到；絕對路徑、stdout 上限 64 KiB、2 秒逾時，任何失敗退回 MAC 路徑）；**Linux／Windows 的指紋一個位元都沒變**——MAC 分量維持 `mac_address` 的 `Display` 大寫格式，原本第一個介面就有效的主機算出來與 1.66.0 逐位相同。
 - **升級／換 OS 不再讓既有授權整批失效**：指紋現在附帶一份**相容候選清單**（`[平台 UUID, 過濾後 MAC, 舊碼會取到的原始 MAC（含 `02:00:…` 佔位值）, hostname::00:00:00:00:00:00]`，去重）。以舊指紋簽出的 license 照樣通過驗證，gateway 只在開機留一則 WARN 建議重簽（`duduclaw license rebind`，即控制平面 `/v1/license/rebind`），不降級成 OpenSource。`duduclaw license status` 多一行 `Fingerprint binding: strong | legacy (re-issue recommended)`；`duduclaw license fingerprint` 維持只印強指紋（客戶回報／新簽發用），新增 `--all` 列出本機接受的全部候選（第一行仍是強指紋，腳本照抓第一行）。
