@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+- **CE Docker image 改為每架構原生 runner 建置**（`.github/workflows/docker-image.yml`）：amd64 在 `ubuntu-latest`、arm64 在 `ubuntu-24.04-arm` 各自以 digest 推送，再由 merge job 用 `docker buildx imagetools create` 合成多架構 manifest 並打 `<tag>`／`latest`。先前單一 job 在 amd64 runner 以 QEMU 模擬 arm64 要 5–5.5 小時，貼近 GitHub 6 小時 job 上限（v1.66.0 5h41m、v1.66.1 首次 5h15m）。
+- **Dockerfile 的 CLI 工具層拆成獨立 stage**（`container/Dockerfile.server`，企業 image Dockerfile 同步）：apt／Node 22／npm CLI（claude、codex、gemini）／agy／grok 的安裝移到 `cli-tools` stage，runtime stage `FROM cli-tools` 再疊 Rust binary。BuildKit 會讓它與 Rust 編譯並行，第三方安裝腳本壞掉會在幾分鐘內失敗，而不是等數小時編譯結束才死在最後一步（v1.66.1 首次 image 建置就是這樣失敗的）；`docker build --target cli-tools` 可單獨煙霧測試工具層。
+
 ## [1.66.1] - 2026-09-29 — hotfix：macOS 26 機器指紋改綁 IOPlatformUUID×舊指紋相容放行
 
 ### Fixed

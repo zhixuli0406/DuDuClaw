@@ -51,18 +51,13 @@ RUN if [ -n "$CARGO_JOBS" ]; then export CARGO_BUILD_JOBS="$CARGO_JOBS"; fi && \
     --features duduclaw-gateway/dashboard \
     -p duduclaw-cli -p duduclaw-gateway $EXTRA_PACKAGES
 
-# Stage 3: Production image
-FROM python:3.12-slim
-
-# Create non-root user
-RUN groupadd -r duduclaw && useradd -r -g duduclaw -u 1000 duduclaw
-
-# Copy built Rust binary
-COPY --from=rust-builder /build/target/release/duduclaw /usr/local/bin/
-
-# Copy Python extensions (pure Python parts)
-COPY python/ /opt/duduclaw/python/
-ENV PYTHONPATH=/opt/duduclaw
+# Stage 3a: CLI tooling — everything the runtime needs that does NOT depend on
+# the Rust build. Its own stage so BuildKit schedules it in parallel with
+# `rust-builder` (they share no inputs): a broken third-party installer
+# (agy / grok / nodesource) now fails the build within minutes instead of
+# after a multi-hour compile, and `docker build --target cli-tools` gives a
+# five-minute smoke test of the whole tooling layer (2026-09-29 decision).
+FROM python:3.12-slim AS cli-tools
 
 # Install Python dependencies
 RUN pip install --no-cache-dir anthropic==0.50.0
@@ -129,6 +124,23 @@ RUN set -eu; \
     bash /tmp/grok-install.sh && rm -f /tmp/grok-install.sh && \
     install -m 0755 "$HOME/.grok/bin/grok" /usr/local/bin/grok && \
     grok --version
+
+
+# Stage 3b: runtime — the tooling layer plus the freshly built binaries.
+# `FROM cli-tools` (rather than copying binaries across) keeps node/npm/agy/
+# grok exactly as their installers laid them out; only the Rust artifacts
+# and the pure-Python extensions land on top.
+FROM cli-tools AS runtime
+
+# Create non-root user
+RUN groupadd -r duduclaw && useradd -r -g duduclaw -u 1000 duduclaw
+
+# Copy built Rust binary
+COPY --from=rust-builder /build/target/release/duduclaw /usr/local/bin/
+
+# Copy Python extensions (pure Python parts)
+COPY python/ /opt/duduclaw/python/
+ENV PYTHONPATH=/opt/duduclaw
 
 # Copy entrypoint
 COPY container/server-entrypoint.sh /entrypoint.sh
