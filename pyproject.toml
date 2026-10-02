@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "duduclaw"
-version = "1.66.1"
+version = "1.67.0"
 description = "Open-source AI Agent platform unifying Claude / Codex / Gemini CLIs. Multi-LLM routing, 243 MCP tools, 11 messaging channels."
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
