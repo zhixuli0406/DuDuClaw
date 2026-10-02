@@ -85,6 +85,7 @@ import {
 } from './defaults';
 import { ToolPolicyEditor, MountTable, KvTable, EnvTable } from './editors';
 import { RowText, RowNumber, RowSwitch, RowSelect, FieldBlock } from './form-rows';
+import { isDeprecatedRuntime } from '@/lib/deprecated-runtimes';
 import { buildDbSourceCapabilityRows, toggleDbSourceCapability } from './dbSourceCapability';
 
 /**
@@ -501,6 +502,8 @@ export function EditAgentPage() {
         sticker_intensity_threshold: agent.sticker?.intensity_threshold ?? 0.7,
         sticker_cooldown_messages: agent.sticker?.cooldown_messages ?? 5,
         sticker_expressiveness: (agent.sticker?.expressiveness ?? 'moderate') as 'minimal' | 'moderate' | 'expressive',
+        sandbox_enabled: agent.sandbox_enabled ?? false,
+        network_access: agent.network_access ?? false,
       });
       setSaveError(null);
       setSaveStatus('idle');
@@ -945,6 +948,13 @@ export function EditAgentPage() {
               { provider: res.runtime_provider_aligned },
             ),
           );
+        } else if (res?.runtime_provider_align_skipped) {
+          // Deprecated runtime: the gateway left the provider alone, so the
+          // employee may still be on a runtime that cannot run the model.
+          toast.info(
+            intl.formatMessage({ id: 'agents.edit.runtimeAlignSkipped' }),
+            { durationMs: 12000 },
+          );
         }
       }
       // CON — a dirty contract writes through its own RPC (in addition to the
@@ -1060,10 +1070,17 @@ export function EditAgentPage() {
     { value: 'auto', label: intl.formatMessage({ id: 'agents.apiMode.auto' }), raw: 'auto' },
   ];
   const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));
-  const fallbackProviderOptions: SelectOption[] = [
+  // A saved deprecated runtime (e.g. gemini) is no longer offered, but stays
+  // visible and labelled so the current value is shown and can be kept.
+  const withSavedDeprecated = (opts: SelectOption[], saved: string | undefined): SelectOption[] =>
+    saved && isDeprecatedRuntime(saved) && !opts.some((o) => o.value === saved)
+      ? [...opts, { value: saved, label: `${intl.formatMessage({ id: `agents.runtime.provider.${saved}` })} (${intl.formatMessage({ id: 'common.deprecated' })})`, raw: saved }]
+      : opts;
+  const providerPickerOptions = withSavedDeprecated(providerOptions, runtime.provider);
+  const fallbackProviderOptions: SelectOption[] = withSavedDeprecated([
     { value: '', label: intl.formatMessage({ id: 'agents.runtime.fallback.none' }), raw: '' },
     ...providerOptions,
-  ];
+  ], runtime.fallback);
   const localBackendOptions: SelectOption[] = [
     { value: 'openai_compat', label: intl.formatMessage({ id: 'agents.backend.openaiCompat' }), raw: 'openai_compat' },
   ];
@@ -1072,10 +1089,15 @@ export function EditAgentPage() {
     { value: 'moderate', label: intl.formatMessage({ id: 'agents.edit.stickerModerate' }), raw: 'moderate' },
     { value: 'expressive', label: intl.formatMessage({ id: 'agents.edit.stickerExpressive' }), raw: 'expressive' },
   ];
+  // 'native' mode was removed: it is never offered as a new choice, but a saved
+  // value stays visible and labelled (so the operator sees why computer use
+  // does not start) and is kept until they pick another mode.
   const computerUseModeOptions: SelectOption[] = [
     { value: 'container', label: intl.formatMessage({ id: 'agents.cap.mode.container' }), raw: 'container' },
-    { value: 'native', label: intl.formatMessage({ id: 'agents.cap.mode.native' }), raw: 'native' },
     { value: 'auto', label: intl.formatMessage({ id: 'agents.cap.mode.auto' }), raw: 'auto' },
+    ...(caps.computer_use_mode === 'native'
+      ? [{ value: 'native', label: intl.formatMessage({ id: 'agents.cap.mode.native' }), raw: 'native' }]
+      : []),
   ];
   // Notify-target channels — the four 1:1-DM-capable channels the gateway's
   // push senders support (goal-loop buttons + skill digest).
@@ -1375,7 +1397,7 @@ export function EditAgentPage() {
               <RowSwitch label={t('agents.cap.codrive')} description={t('agents.cap.codrive.help')} checked={caps.codrive} onChange={guardDanger(t('agents.cap.codrive'), (v) => updateCap('codrive', v), 'agents.edit.dangerConfirm.codrive')} />
             </SettingsCard>
             {caps.computer_use_mode === 'native' && (
-              <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.nativeWarning')}</p>
+              <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.nativeRemoved')}</p>
             )}
             {caps.system_operator && (
               <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.systemOperatorWarning')}</p>
@@ -1571,7 +1593,7 @@ export function EditAgentPage() {
 
           <SettingsSection title={t('agentForm.brain.section.engine')} description={t('agentForm.brain.section.engine.desc')}>
             <SettingsCard>
-              <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerOptions} />
+              <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerPickerOptions} />
               <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
             </SettingsCard>
           </SettingsSection>
@@ -1614,6 +1636,9 @@ export function EditAgentPage() {
               </SettingsRow>
               <RowNumber label={t('agents.edit.maxConcurrent')} description={t('agents.edit.maxConcurrent.help')} value={form.max_concurrent ?? 1} min={1} max={10} onChange={(v) => updateField('max_concurrent', v)} />
             </SettingsCard>
+            {(form.sandbox_enabled ?? false) && !(form.network_access ?? false) && (
+              <p role="alert" className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.edit.sandbox.needsNetwork')}</p>
+            )}
             <FieldBlock label={t('agents.container.cmd')} description={t('agents.container.cmd.hint')}>
               <ChipEditor values={ctAdv.cmd} onChange={(v) => updateCtAdv('cmd', v)} placeholder="bash" addLabel={t('common.add')} />
             </FieldBlock>

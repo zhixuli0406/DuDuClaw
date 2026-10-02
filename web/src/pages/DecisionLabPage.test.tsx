@@ -342,8 +342,17 @@ function ReviewNavigationHarness() {
   return <><button type="button" onClick={() => navigate('/app/system/decision-lab')}>Leave review link</button><DecisionLabPage /></>;
 }
 
+async function pasteFixture(user: ReturnType<typeof userEvent.setup>, input: HTMLElement, value: string) {
+  // Pasting IDs and timestamps still exercises focus, input and onChange, but
+  // avoids hundreds of whole-workflow renders for fixture setup. A timeout
+  // does not cancel an async test body, which can otherwise spill into the
+  // next test's DOM and mocks under full-suite contention.
+  await user.click(input);
+  await user.paste(value);
+}
+
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.resetAllMocks();
   vi.mocked(decisionApi.overview).mockResolvedValue(overview);
   vi.mocked(decisionApi.catalog).mockResolvedValue(catalog);
   vi.mocked(decisionApi.scrubTicketSources).mockResolvedValue({ scrubbed: 2, overview: { ...overview,
@@ -434,16 +443,16 @@ describe('DecisionLabPage', () => {
   it('runs the scoped aggregate shadow stages with exact decimal errors and a human inspection receipt', async () => {
     const user = userEvent.setup();
     renderWithProviders(<DecisionLabPage />);
-    await user.type(screen.getByRole('textbox', { name: 'Organization ID' }), 'tenant-a');
-    await user.type(screen.getByRole('textbox', { name: 'Access scope' }), 'private');
+    await pasteFixture(user, screen.getByRole('textbox', { name: 'Organization ID' }), 'tenant-a');
+    await pasteFixture(user, screen.getByRole('textbox', { name: 'Access scope' }), 'private');
     await user.click(screen.getByRole('button', { name: 'Load overview' }));
     const panel = await screen.findByLabelText('Aggregate shadow forecast workflow');
     const policyStage = within(panel).getByLabelText('1. Register or load policy');
-    await user.type(within(policyStage).getByRole('textbox', { name: 'Policy ID' }), shadowPolicy.id);
-    await user.type(within(policyStage).getByRole('textbox', { name: 'Shadow source lineage' }), shadowPolicy.source_lineage);
-    await user.type(within(policyStage).getByRole('textbox', { name: 'Queue ID' }), shadowPolicy.queue_id);
-    await user.type(within(policyStage).getByRole('textbox', { name: 'Effective from (UTC)' }), shadowPolicy.effective_from_utc);
-    await user.type(within(policyStage).getByRole('textbox', { name: 'Effective until (UTC)' }), shadowPolicy.effective_until_utc);
+    await pasteFixture(user, within(policyStage).getByRole('textbox', { name: 'Policy ID' }), shadowPolicy.id);
+    await pasteFixture(user, within(policyStage).getByRole('textbox', { name: 'Shadow source lineage' }), shadowPolicy.source_lineage);
+    await pasteFixture(user, within(policyStage).getByRole('textbox', { name: 'Queue ID' }), shadowPolicy.queue_id);
+    await pasteFixture(user, within(policyStage).getByRole('textbox', { name: 'Effective from (UTC)' }), shadowPolicy.effective_from_utc);
+    await pasteFixture(user, within(policyStage).getByRole('textbox', { name: 'Effective until (UTC)' }), shadowPolicy.effective_until_utc);
     await user.click(within(policyStage).getByRole('button', { name: 'Create' }));
     expect(await within(policyStage).findByLabelText('Loaded shadow policy')).toHaveTextContent(shadowPolicy.id);
     expect(decisionApi.createShadowPolicy).toHaveBeenCalledWith(expect.objectContaining({
@@ -452,15 +461,15 @@ describe('DecisionLabPage', () => {
     }));
 
     const forecastStage = within(panel).getByLabelText('2. Commit prospective forecast');
-    await user.type(within(forecastStage).getByRole('textbox', { name: 'Forecast ID' }), shadowForecast.id);
-    await user.type(within(forecastStage).getByRole('textbox', { name: 'Target day (UTC midnight)' }), shadowForecast.target_day_utc);
+    await pasteFixture(user, within(forecastStage).getByRole('textbox', { name: 'Forecast ID' }), shadowForecast.id);
+    await pasteFixture(user, within(forecastStage).getByRole('textbox', { name: 'Target day (UTC midnight)' }), shadowForecast.target_day_utc);
     await user.clear(within(forecastStage).getByRole('textbox', { name: 'Known opening backlog' }));
-    await user.type(within(forecastStage).getByRole('textbox', { name: 'Known opening backlog' }), '10');
+    await pasteFixture(user, within(forecastStage).getByRole('textbox', { name: 'Known opening backlog' }), '10');
     await user.clear(within(forecastStage).getByRole('textbox', { name: 'Planned agents' }));
-    await user.type(within(forecastStage).getByRole('textbox', { name: 'Planned agents' }), '2');
+    await pasteFixture(user, within(forecastStage).getByRole('textbox', { name: 'Planned agents' }), '2');
     fireEvent.change(within(forecastStage).getByRole('textbox', { name: 'Prior-only training source JSON (or source record ID)' }),
       { target: { value: JSON.stringify({ queue_id: 'queue-1', observed_days: [{ arrivals: 10, backlog_end: 12 }] }) } });
-    await user.type(within(forecastStage).getByRole('textbox', { name: 'training Source retention until (UTC)' }),
+    await pasteFixture(user, within(forecastStage).getByRole('textbox', { name: 'training Source retention until (UTC)' }),
       '2099-01-01T00:00:00Z');
     await user.click(within(forecastStage).getByRole('button', { name: 'Create' }));
     const forecastLoaded = await within(forecastStage).findByLabelText('Loaded forecast');
@@ -473,10 +482,10 @@ describe('DecisionLabPage', () => {
       .toHaveValue('');
 
     const scoreStage = within(panel).getByLabelText('3. Score observed day');
-    await user.type(within(scoreStage).getByRole('textbox', { name: 'Score ID' }), shadowScore.id);
+    await pasteFixture(user, within(scoreStage).getByRole('textbox', { name: 'Score ID' }), shadowScore.id);
     fireEvent.change(within(scoreStage).getByRole('textbox', { name: 'Target-day observation source JSON (or source record ID)' }),
       { target: { value: JSON.stringify({ queue_id: 'queue-1', observed_days: [{ arrivals: 11, backlog_end: 13 }] }) } });
-    await user.type(within(scoreStage).getByRole('textbox', { name: 'observation Source retention until (UTC)' }),
+    await pasteFixture(user, within(scoreStage).getByRole('textbox', { name: 'observation Source retention until (UTC)' }),
       '2099-01-01T00:00:00Z');
     await user.click(within(scoreStage).getByRole('button', { name: 'Create' }));
     expect(await within(scoreStage).findByLabelText('Loaded score')).toHaveTextContent('9,007,199,254,740,993');
@@ -499,7 +508,7 @@ describe('DecisionLabPage', () => {
       .toHaveValue(shadowScreenSaved.replay_hash);
 
     const reviewStage = within(panel).getByLabelText('6. Human inspection receipt');
-    await user.type(within(reviewStage).getByRole('textbox', { name: 'Inspection summary' }), 'Check synthetic aggregate evidence');
+    await pasteFixture(user, within(reviewStage).getByRole('textbox', { name: 'Inspection summary' }), 'Check synthetic aggregate evidence');
     await user.click(within(reviewStage).getByRole('button', { name: 'Request inspection' }));
     expect(await within(reviewStage).findByLabelText('Inspection status')).toHaveTextContent('pending');
     await user.click(within(reviewStage).getByRole('button', { name: 'Check shadow inspection' }));

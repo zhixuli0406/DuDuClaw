@@ -4,6 +4,7 @@ import { IntlProvider } from 'react-intl';
 import { BrowserRouter } from 'react-router';
 import { App } from './App';
 import { ToastProvider } from './components/Toast';
+import { AppErrorBoundary } from './components/layout/AppErrorBoundary';
 import { messages, useLocaleStore } from './i18n';
 import { applyTheme, useThemeStore } from './stores/theme-store';
 import { setTimeAgoNowLabel } from './lib/format';
@@ -28,11 +29,15 @@ function Root() {
     // toast viewport has to live inside the intl context or it throws
     // "Could not find required `intl` object" the first time a toast renders.
     <IntlProvider locale={locale} messages={messages[locale]} defaultLocale="zh-TW">
-      <ToastProvider>
-        <BrowserRouter>
-          <App />
-        </BrowserRouter>
-      </ToastProvider>
+      {/* Root safety net: a crash in the layout chrome shows a reload
+          message instead of a blank tab (RouteErrorBoundary covers pages). */}
+      <AppErrorBoundary>
+        <ToastProvider>
+          <BrowserRouter>
+            <App />
+          </BrowserRouter>
+        </ToastProvider>
+      </AppErrorBoundary>
     </IntlProvider>
   );
 }

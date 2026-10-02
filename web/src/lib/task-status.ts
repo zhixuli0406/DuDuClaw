@@ -50,11 +50,31 @@ export function toStatusKey(status: TaskStatus): TaskStatusKey {
     case 'review':
       return 'in_review';
     case 'pending':
+    // Discovery waiting states read as "not started" (L2 round 4).
+    case 'pending_approval':
+    case 'queued':
       return 'todo';
     default:
-      return status as TaskStatusKey;
+      // Total on purpose: the server can add a status before the UI knows it.
+      // Passing an unknown string through used to reach `StatusIcon` as an
+      // undefined component and blank the whole dashboard (React #130).
+      return KNOWN_STATUS_KEYS.has(status as string) ? (status as TaskStatusKey) : 'todo';
   }
 }
+
+/** Every key `StatusIcon` can draw — anything else falls back to `todo`. */
+const KNOWN_STATUS_KEYS: ReadonlySet<string> = new Set<TaskStatusKey>([
+  'backlog',
+  'todo',
+  'in_progress',
+  'in_review',
+  'revising',
+  'done',
+  'blocked',
+  'needs_human',
+  'failed',
+  'cancelled',
+]);
 
 /**
  * UI status key → backend status, or `null` when the key is forward-looking

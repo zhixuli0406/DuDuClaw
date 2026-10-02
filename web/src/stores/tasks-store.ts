@@ -24,6 +24,11 @@ interface TasksStore {
    * pre-flattened to `String(e)` here.
    */
   readonly error: unknown;
+  /** L2: the last task list came back partial (some bound agents failed) —
+   *  rows that arrived are kept; cleared by the next fully successful load. */
+  readonly tasksPartialError: unknown;
+  /** Same signal for the activity feed. */
+  readonly activitiesPartialError: unknown;
   clearError: () => void;
   readonly filterAgent: string | null;
   readonly filterPriority: TaskPriority | null;
@@ -71,6 +76,10 @@ export function mergeComment(
 }
 
 export const useTasksStore = create<TasksStore>((set, get) => {
+  // Latest-request-wins: fan-out made un-scoped lists slower, so an older
+  // response must never overwrite a newer one (rows and partial flag alike).
+  let tasksSeq = 0;
+  let activitiesSeq = 0;
   // Subscribe to real-time task updates
   client.subscribe('task.updated', (payload) => {
     const data = payload as TaskInfo;
@@ -112,16 +121,22 @@ export const useTasksStore = create<TasksStore>((set, get) => {
     comments: {},
     loading: false,
     error: null,
+    tasksPartialError: null,
+    activitiesPartialError: null,
     filterAgent: null,
     filterPriority: null,
 
     fetchTasks: async (filters) => {
+      const seq = ++tasksSeq;
       set({ loading: true, error: null });
       try {
         const result = await api.tasks.list(filters);
-        set({ tasks: result?.tasks ?? [], loading: false });
+        if (seq !== tasksSeq) return; // a newer fetch owns the state now
+        set({ tasks: result?.tasks ?? [], loading: false, tasksPartialError: result?.partial_error ?? null });
       } catch (e) {
-        set({ error: e, loading: false });
+        if (seq !== tasksSeq) return;
+        // A total failure is not "partial": drop any stale partial flag.
+        set({ error: e, loading: false, tasksPartialError: null });
       }
     },
 
@@ -191,11 +206,14 @@ export const useTasksStore = create<TasksStore>((set, get) => {
     setFilterPriority: (priority) => set({ filterPriority: priority }),
 
     fetchActivities: async (params) => {
+      const seq = ++activitiesSeq;
       try {
         const result = await api.activity.list(params);
-        set({ activities: result?.events ?? [] });
+        if (seq !== activitiesSeq) return;
+        set({ activities: result?.events ?? [], activitiesPartialError: result?.partial_error ?? null });
       } catch (e) {
-        set({ error: e });
+        if (seq !== activitiesSeq) return;
+        set({ error: e, activitiesPartialError: null });
       }
     },
 

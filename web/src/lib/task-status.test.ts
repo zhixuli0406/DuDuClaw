@@ -54,3 +54,25 @@ describe('task-status mapping layer', () => {
     expect(sample.every((s) => toBackendStatus(s) === s)).toBe(true);
   });
 });
+
+describe('toStatusKey is total (L2 round 4 — discovery statuses crashed Home)', () => {
+  it('maps the discovery waiting states onto the "not started" glyph', () => {
+    expect(toStatusKey('pending_approval')).toBe('todo');
+    expect(toStatusKey('queued')).toBe('todo');
+  });
+  it('maps any status it does not recognise to a safe key, never passes it through', () => {
+    expect(toStatusKey('some_future_state' as never)).toBe('todo');
+    expect(toStatusKey('' as never)).toBe('todo');
+  });
+  it('never makes the new statuses writable', () => {
+    expect(BACKEND_STATUSES).not.toContain('pending_approval');
+    expect(BACKEND_STATUSES).not.toContain('queued');
+  });
+});
+
+describe('toStatusKey tolerates null / undefined at runtime (L2 round 7)', () => {
+  it('maps both to the safe key', () => {
+    expect(toStatusKey(null as never)).toBe('todo');
+    expect(toStatusKey(undefined as never)).toBe('todo');
+  });
+});

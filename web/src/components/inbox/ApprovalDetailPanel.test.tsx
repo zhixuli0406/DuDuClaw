@@ -250,3 +250,93 @@ describe('<ApprovalDetailPanel> TTL countdown', () => {
     expect(screen.getByText(/auto-rejected/)).toBeInTheDocument();
   });
 });
+
+// ── L7: Discovery approvals get a label + a plain-language spec summary ──
+import zhTW from '@/i18n/zh-TW.json';
+import jaJP from '@/i18n/ja-JP.json';
+import { parseDiscoveryApproval } from './discovery-approval-payload';
+
+const DISCOVERY_PAYLOAD = {
+  task_id: 't-1',
+  run_id: 'r-1',
+  creator_id: 'user:0000',
+  request: {
+    spec: {
+      approved_root_id: 'root-1',
+      evaluator: 'parser_score',
+      runtime: 'claude',
+      model: 'claude-haiku-4-5',
+      branch_count: 2,
+      refine_count: 1,
+      max_parallelism: 1,
+      direction: 'max',
+      budget: { max_agent_calls: 2, max_usd: 0.5, max_wall_secs: 300, max_rounds: 1 },
+    },
+    scorer_hash: 'abc',
+    policy_id: 'baseline-parallel-refine',
+  },
+};
+
+function discoveryApproval(payload: unknown): ApprovalItem {
+  return genericApproval({ kind: 'discovery', summary: 'Discovery run on root-1', payload });
+}
+
+describe('<ApprovalDetailPanel> discovery (L7)', () => {
+  it('shows the discovery label and a readable spec summary', () => {
+    renderWithProviders(
+      <ApprovalDetailPanel approval={discoveryApproval(DISCOVERY_PAYLOAD)} onApprove={vi.fn()} onReject={vi.fn()} />,
+    );
+    expect(screen.getByText('Start a code discovery run')).toBeInTheDocument();
+    expect(screen.queryByText("Perform an action that hasn't been categorized")).toBeNull();
+    // Runtime ids render as product names; the raw id stays out of the card.
+    expect(screen.getByText('Claude')).toBeInTheDocument();
+    expect(screen.queryByText('claude')).toBeNull();
+    expect(screen.getByText('claude-haiku-4-5')).toBeInTheDocument();
+    expect(screen.getByText('parser_score')).toBeInTheDocument();
+    expect(screen.getByText('Refinements per branch')).toBeInTheDocument();
+    expect(screen.getByText('US$0.5')).toBeInTheDocument();
+    expect(screen.getByText('5 min')).toBeInTheDocument();
+    // nodes per round = branches × (refinements + 1) = 2 × 2
+    expect(screen.getByText(/Up to 4 candidates per round/)).toBeInTheDocument();
+    // The raw spot-check expander stays.
+    expect(screen.getByRole('button', { name: /Spot-check full details/ })).toBeInTheDocument();
+  });
+
+  it('renders payload strings as text, never markup', () => {
+    const evil = structuredClone(DISCOVERY_PAYLOAD);
+    evil.request.spec.model = '<img src=x onerror=alert(1)>';
+    const { container } = renderWithProviders(
+      <ApprovalDetailPanel approval={discoveryApproval(evil)} onApprove={vi.fn()} onReject={vi.fn()} />,
+    );
+    expect(screen.getByText('<img src=x onerror=alert(1)>')).toBeInTheDocument();
+    expect(container.querySelector('img[src="x"]')).toBeNull();
+  });
+
+  it('survives a malformed payload (label stays, generic rendering, no crash)', () => {
+    for (const bad of [null, 'oops', 42, { request: 'x' }, { request: { spec: { runtime: 7, budget: 'n' } } }]) {
+      const { unmount } = renderWithProviders(
+        <ApprovalDetailPanel approval={discoveryApproval(bad)} onApprove={vi.fn()} onReject={vi.fn()} />,
+      );
+      expect(screen.getByText('Start a code discovery run')).toBeInTheDocument();
+      expect(screen.queryByText('Refinements per branch')).toBeNull();
+      unmount();
+    }
+  });
+
+  it('parser drops wrong-typed fields and keeps the valid ones', () => {
+    const parsed = parseDiscoveryApproval({
+      request: { spec: { runtime: 'codex', model: 5, branch_count: -1, refine_count: 2, budget: { max_usd: 'x', max_rounds: 3 } } },
+    });
+    expect(parsed).toEqual({ runtime: 'codex', refineCount: 2, maxRounds: 3 });
+    expect(parseDiscoveryApproval({ request: { spec: {} } })).toBeNull();
+  });
+
+  it('every new discovery key exists in all three locales', () => {
+    const keys = Object.keys(en).filter((k) => k.startsWith('approval.discovery.') || k.endsWith('kind.discovery'));
+    expect(keys.length).toBeGreaterThan(5);
+    for (const k of keys) {
+      expect(zhTW).toHaveProperty([k]);
+      expect(jaJP).toHaveProperty([k]);
+    }
+  });
+});

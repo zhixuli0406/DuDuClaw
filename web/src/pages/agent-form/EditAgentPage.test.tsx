@@ -8,6 +8,7 @@ import { mockWsClient } from '@/test/mocks';
 import { SidebarProvider } from '@/components/mds';
 import { EditAgentPage } from './EditAgentPage';
 import { useAgentsStore } from '@/stores/agents-store';
+import { toast } from '@/lib/toast';
 
 // Keep the live model registry out of the smoke test — the ModelSelect only
 // needs a stable, empty list here.
@@ -193,6 +194,21 @@ describe('EditAgentPage', () => {
     );
   });
 
+  it('warns that sandboxed tasks are refused only when sandbox is on and network is off', async () => {
+    const user = userEvent.setup();
+    renderAt('/agents/my-bot/edit?tab=brain');
+
+    const sandboxSwitch = await screen.findByRole('switch', { name: 'Sandbox Isolation' });
+    const hint = en['agents.edit.sandbox.needsNetwork'];
+    expect(screen.queryByText(hint)).not.toBeInTheDocument();
+
+    await user.click(sandboxSwitch);
+    expect(await screen.findByText(hint)).toBeInTheDocument();
+
+    await user.click(sandboxSwitch);
+    await waitFor(() => expect(screen.queryByText(hint)).not.toBeInTheDocument());
+  });
+
   // Same P05 correction as AgentDetailPage: a failed inspect is a failure, not
   // evidence that the staff member doesn't exist.
   it('reports a failed inspect as a retryable error, not as "not found"', async () => {
@@ -278,6 +294,162 @@ describe('EditAgentPage', () => {
   // spawned CLI subprocess the operator's own SSH/GPG identity, so the
   // dashboard switch must go through the same danger-confirm gate as
   // computer_use / browser_via_bash / recording, default unchecked.
+  // Gemini CLI runtime deprecation: no longer offered, but a saved value stays
+  // visible and labelled; Antigravity is offered instead.
+  describe('runtime pickers — Gemini CLI deprecation', () => {
+    it('offers Antigravity and not Gemini when the saved provider is claude', async () => {
+      const user = userEvent.setup();
+      renderAt('/agents/my-bot/edit?tab=brain');
+
+      await user.click(await screen.findByRole('combobox', { name: 'AI Backend (Provider)' }));
+      expect(await screen.findByRole('option', { name: 'Antigravity (Google)' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /Gemini/ })).not.toBeInTheDocument();
+    });
+
+    it('keeps a saved gemini provider visible, labelled deprecated', async () => {
+      const user = userEvent.setup();
+      mockWsClient.call.mockResolvedValue({ ...DETAIL, runtime: { provider: 'gemini', fallback: '' } });
+      renderAt('/agents/my-bot/edit?tab=brain');
+
+      const picker = await screen.findByRole('combobox', { name: 'AI Backend (Provider)' });
+      await waitFor(() => {
+        expect(picker).toHaveTextContent('Gemini (deprecated)');
+      });
+      await user.click(picker);
+      expect(await screen.findByRole('option', { name: 'Gemini (deprecated)' })).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: 'Antigravity (Google)' })).toBeInTheDocument();
+    });
+
+    it('keeps a saved gemini fallback visible, labelled deprecated', async () => {
+      const user = userEvent.setup();
+      mockWsClient.call.mockResolvedValue({ ...DETAIL, runtime: { provider: 'claude', fallback: 'gemini' } });
+      renderAt('/agents/my-bot/edit?tab=brain');
+
+      const picker = await screen.findByRole('combobox', { name: 'Fallback Backend' });
+      await waitFor(() => {
+        expect(picker).toHaveTextContent('Gemini (deprecated)');
+      });
+      await user.click(picker);
+      expect(await screen.findByRole('option', { name: 'Gemini (deprecated)' })).toBeInTheDocument();
+    });
+  });
+
+  describe('save-time runtime auto-align feedback', () => {
+    async function saveWith(res: unknown) {
+      const user = userEvent.setup();
+      const updateAgent = vi.fn().mockResolvedValue(res);
+      useAgentsStore.setState({ updateAgent } as never);
+      renderAt('/agents/my-bot/edit');
+      const nameInput = await screen.findByDisplayValue('My Bot');
+      await user.clear(nameInput);
+      await user.type(nameInput, 'Renamed Bot');
+      await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
+      // let the post-save handler run
+      await waitFor(() => expect(updateAgent).toHaveReturned());
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    it('warns when the gateway skipped auto-align for a deprecated runtime', async () => {
+      const info = vi.spyOn(toast, 'info').mockImplementation(() => {});
+      await saveWith({ success: true, runtime_provider_align_skipped: 'deprecated_runtime' });
+      expect(info).toHaveBeenCalledWith(
+        en['agents.edit.runtimeAlignSkipped'],
+        expect.anything(),
+      );
+      info.mockRestore();
+    });
+
+    it('stays silent when the response carries no skip marker', async () => {
+      const info = vi.spyOn(toast, 'info').mockImplementation(() => {});
+      await saveWith({ success: true, runtime_provider_align_skipped: null });
+      expect(info).not.toHaveBeenCalled();
+      info.mockRestore();
+    });
+  });
+
+  describe('saved gemini provider survives an unrelated runtime edit', () => {
+    it('still sends provider "gemini" when only the fallback changes, and labels it deprecated', async () => {
+      const user = userEvent.setup();
+      const updateAgent = vi.fn().mockResolvedValue(undefined);
+      useAgentsStore.setState({ updateAgent } as never);
+      mockWsClient.call.mockResolvedValue({ ...DETAIL, runtime: { provider: 'gemini', fallback: '' } });
+      renderAt('/agents/my-bot/edit?tab=brain');
+
+      const provider = await screen.findByRole('combobox', { name: 'AI Backend (Provider)' });
+      await waitFor(() => expect(provider).toHaveTextContent('Gemini (deprecated)'));
+
+      await user.click(await screen.findByRole('combobox', { name: 'Fallback Backend' }));
+      await user.click(await screen.findByRole('option', { name: 'Antigravity (Google)' }));
+
+      await waitFor(
+        () => {
+          expect(updateAgent).toHaveBeenCalledWith(
+            'my-bot',
+            expect.objectContaining({
+              runtime: expect.objectContaining({ provider: 'gemini', fallback: 'antigravity' }),
+            }),
+          );
+        },
+        { timeout: 3000 },
+      );
+      expect(screen.getByRole('combobox', { name: 'AI Backend (Provider)' })).toHaveTextContent('Gemini (deprecated)');
+    });
+  });
+
+  describe('computer-use mode — native removed', () => {
+    const openModePicker = async () => {
+      const picker = await screen.findByRole('combobox', { name: 'Computer Use Mode' });
+      return picker;
+    };
+
+    it('does not offer native as a new choice', async () => {
+      const user = userEvent.setup();
+      renderAt('/agents/my-bot/edit?tab=tools');
+
+      await user.click(await openModePicker());
+      expect(await screen.findByRole('option', { name: 'Container-isolated' })).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: 'Auto' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /Direct on this machine/ })).not.toBeInTheDocument();
+      expect(screen.queryByText(/has been removed/)).not.toBeInTheDocument();
+    });
+
+    it('keeps a saved native value visible, labelled removed, with the notice', async () => {
+      mockWsClient.call.mockResolvedValue({ ...DETAIL, capabilities: { computer_use_mode: 'native' } });
+      renderAt('/agents/my-bot/edit?tab=tools');
+
+      const picker = await openModePicker();
+      await waitFor(() => expect(picker).toHaveTextContent('Direct on this machine (removed)'));
+      expect(screen.getByText(/has been removed\. Computer operation will not start/)).toBeInTheDocument();
+    });
+
+    it('does not replace a saved native value when an unrelated capability is saved', async () => {
+      const user = userEvent.setup();
+      const updateAgent = vi.fn().mockResolvedValue(undefined);
+      useAgentsStore.setState({ updateAgent } as never);
+      mockWsClient.call.mockResolvedValue({ ...DETAIL, capabilities: { computer_use_mode: 'native' } });
+      renderAt('/agents/my-bot/edit?tab=tools');
+
+      const picker = await openModePicker();
+      await waitFor(() => expect(picker).toHaveTextContent('Direct on this machine (removed)'));
+
+      await user.click(screen.getByRole('switch', { name: 'Allow Git/GPG credentials' }));
+      await user.click(await screen.findByRole('button', { name: 'Confirm' }));
+
+      await waitFor(
+        () => {
+          expect(updateAgent).toHaveBeenCalledWith(
+            'my-bot',
+            expect.objectContaining({
+              capabilities: expect.objectContaining({ git_credentials: true, computer_use_mode: 'native' }),
+            }),
+          );
+        },
+        { timeout: 3000 },
+      );
+      expect(screen.getByRole('combobox', { name: 'Computer Use Mode' })).toHaveTextContent('Direct on this machine (removed)');
+    });
+  });
+
   describe('git_credentials danger-zone switch', () => {
     it('renders unchecked by default and only writes true after danger confirmation', async () => {
       const user = userEvent.setup();

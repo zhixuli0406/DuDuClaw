@@ -52,7 +52,9 @@ const BACKENDS: ReadonlyArray<BackendDef> = [
   { id: 'otherCli', icon: Terminal },
 ] as const;
 
-const OTHER_CLIS: ReadonlyArray<OtherCli> = ['codex', 'gemini', 'antigravity'] as const;
+// Gemini CLI is deprecated (replaced by Antigravity): `OtherCli` keeps the
+// id for callers that still pass it, but the wizard no longer offers it.
+const OTHER_CLIS: ReadonlyArray<OtherCli> = ['codex', 'antigravity'] as const;
 
 const DEFAULT_LOCAL_MODEL = 'qwen3-8b-q4_k_m';
 const TOTAL_STEPS = 4;
@@ -120,7 +122,7 @@ interface WizardState {
 
 const INITIAL: WizardState = {
   backend: null,
-  otherCli: 'gemini',
+  otherCli: 'antigravity',
   apiKey: '',
   apiBudget: '50',
   baseUrl: '',
@@ -443,7 +445,7 @@ export function WelcomePage() {
       case 'local':
         return undefined;
       case 'otherCli':
-        return detect.codex || detect.gemini || detect.antigravity;
+        return detect.codex || detect.antigravity;
     }
   };
 
@@ -871,9 +873,7 @@ export function WelcomePage() {
                       const installed = detect
                         ? cli === 'codex'
                           ? detect.codex
-                          : cli === 'gemini'
-                            ? detect.gemini
-                            : detect.antigravity
+                          : detect.antigravity
                         : undefined;
                       const selected = state.otherCli === cli;
                       return (

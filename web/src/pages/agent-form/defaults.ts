@@ -26,7 +26,7 @@ export const TEMPLATE_KIND_ORDER: Record<TemplateRoleSummary['kind'], number> = 
 export type MainTab = 'general' | 'advanced';
 export type AdvGroup = 'run' | 'access' | 'integration' | 'evo';
 
-export const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = ['claude', 'codex', 'gemini', 'grok', 'openai_compat'];
+export const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = ['claude', 'codex', 'antigravity', 'grok', 'openai_compat'];
 
 export const AGENT_ROLES: ReadonlyArray<string> = ['main', 'specialist', 'worker', 'developer', 'qa', 'planner'];
 

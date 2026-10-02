@@ -163,12 +163,12 @@ describe('<WelcomePage> runtime setup (WP2 / D16)', () => {
 
   it('surfaces sign-in for the picked "other CLI" too', async () => {
     const user = userEvent.setup();
-    mockDetect({ gemini: true });
+    mockDetect({ codex: true });
     vi.mocked(api.accounts.cliCredentials).mockResolvedValue({
       credentials: [
         {
-          runtime: 'gemini',
-          store: '~/.gemini/oauth_creds.json',
+          runtime: 'codex',
+          store: '~/.codex/auth.json',
           installed: true,
           present: false,
           modified_at: null,
@@ -178,9 +178,21 @@ describe('<WelcomePage> runtime setup (WP2 / D16)', () => {
     renderWithProviders(<WelcomePage />);
     await gotoBackendStep(user);
 
-    // 'gemini' is the wizard's default pick among the other CLIs.
     await user.click(await screen.findByRole('button', { name: /i use a different ai tool/i }));
+    await user.click(await screen.findByRole('button', { name: /^codex/i }));
     expect(await screen.findByRole('button', { name: /sign in now/i })).toBeInTheDocument();
+  });
+
+  it("'antigravity' is the wizard's default other-CLI pick and Gemini is not offered", async () => {
+    const user = userEvent.setup();
+    mockDetect();
+    renderWithProviders(<WelcomePage />);
+    await gotoBackendStep(user);
+
+    await user.click(await screen.findByRole('button', { name: /i use a different ai tool/i }));
+    expect(await screen.findByRole('button', { name: /^antigravity/i })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: /^codex/i })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.queryByRole('button', { name: /gemini/i })).not.toBeInTheDocument();
   });
 
   it('degrades quietly when detection fails (no crash, no false prompts)', async () => {

@@ -164,7 +164,8 @@ const DOCTOR_STATUS_CLASS: Record<OsDoctorStatus, string> = {
 
 function DoctorRow({ check }: { check: OsDoctorCheck }) {
   const intl = useIntl();
-  const Icon = DOCTOR_STATUS_ICON[check.status];
+  // Unknown server status → neutral glyph, never an undefined component.
+  const Icon = DOCTOR_STATUS_ICON[check.status] ?? CircleSlash;
   return (
     <div className="flex items-start gap-3 rounded-lg border border-surface-border px-3 py-2.5">
       <Icon className={cn('mt-0.5 size-4 shrink-0', DOCTOR_STATUS_CLASS[check.status])} />

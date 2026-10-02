@@ -29,6 +29,9 @@ interface PlansStore {
    * a pre-flattened `err.message` here is what let raw strings reach the UI.
    */
   readonly error: unknown;
+  /** L2: the last plan list came back partial (some bound agents failed) —
+   *  plans that arrived are kept; cleared by the next fully successful load. */
+  readonly partialError: unknown;
   clearError: () => void;
   fetchPlans: (filters?: { agent_id?: string; status?: PlanStatus }) => Promise<void>;
   fetchPlan: (planId: string) => Promise<void>;
@@ -47,6 +50,8 @@ interface PlansStore {
 }
 
 export const usePlansStore = create<PlansStore>((set, get) => {
+  // Latest-request-wins (see tasks-store): drop out-of-order responses.
+  let plansSeq = 0;
   // Co-edit signal: an agent tick / another tab's edit refreshes the panel.
   client.subscribe('plan.updated', (payload) => {
     const data = payload as { plan_id?: string };
@@ -63,16 +68,20 @@ export const usePlansStore = create<PlansStore>((set, get) => {
     steps: {},
     loading: false,
     error: null,
+    partialError: null,
 
     clearError: () => set({ error: null }),
 
     fetchPlans: async (filters) => {
+      const seq = ++plansSeq;
       set({ loading: true });
       try {
-        const { plans } = await api.plans.list(filters);
-        set({ plans, loading: false, error: null });
+        const { plans, partial_error } = await api.plans.list(filters);
+        if (seq !== plansSeq) return; // a newer fetch owns the state now
+        set({ plans, loading: false, error: null, partialError: partial_error ?? null });
       } catch (e) {
-        set({ loading: false, error: e });
+        if (seq !== plansSeq) return;
+        set({ loading: false, error: e, partialError: null });
       }
     },
 

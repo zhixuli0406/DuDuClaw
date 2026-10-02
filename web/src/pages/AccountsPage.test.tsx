@@ -38,6 +38,24 @@ describe('AccountsPage (MDS)', () => {
     ).toBeInTheDocument();
   });
 
+  it('does not offer Antigravity in the one-click-login CLI picker (agy has no login subcommand)', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<AccountsPage />);
+
+    await user.click(screen.getByRole('button', { name: /One-click sign-in/i }));
+    expect(await screen.findByRole('button', { name: /Grok/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Antigravity/i })).not.toBeInTheDocument();
+  });
+
+  it('does not offer Gemini in the one-click-login CLI picker (the Gemini CLI is deprecated)', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<AccountsPage />);
+
+    await user.click(screen.getByRole('button', { name: /One-click sign-in/i }));
+    expect(await screen.findByRole('button', { name: /Grok/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Gemini/i })).not.toBeInTheDocument();
+  });
+
   // WP-C (§2-2): the page used to have zero links to any AI staff member, so an
   // account could not be traced back to the work it pays for.
   it('lists the staff members whose account pool names each account', async () => {

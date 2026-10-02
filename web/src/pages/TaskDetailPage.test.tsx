@@ -420,3 +420,66 @@ describe('TaskDetailPage — I-3b pin/archive from the detail kebab', () => {
     });
   });
 });
+
+// ── L2 round 5: discovery tasks are run by the dedicated lifecycle service —
+// the gateway refuses every `tasks.update`-family write on them, so the
+// generic detail page must not offer controls that can only fail.
+
+const DISCOVERY: TaskInfo = { ...TASK, id: 'task-disc0001', kind: 'discovery', status: 'pending_approval' };
+const LOCK_HINT = 'This is a code exploration. Its status and details are managed in the exploration section of the Goals page.';
+
+describe('TaskDetailPage — discovery task (L2 round 5)', () => {
+  beforeEach(() => {
+    mockWsClient.call.mockResolvedValue({ tasks: [DISCOVERY], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [DISCOVERY], comments: {}, activities: [], loading: false });
+  });
+
+  it('shows the lifecycle hint with a link to /goals and no writers', () => {
+    renderAt('task-disc0001');
+    expect(screen.getByText(LOCK_HINT)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open Goals' })).toHaveAttribute('href', '/goals');
+    // No header quick-complete, no inline title editor, no status picker.
+    expect(screen.queryByRole('button', { name: 'Mark complete' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Task title' })).toBeNull();
+    expect(screen.getByText('Draft the launch plan')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'To do' })).toBeNull();
+  });
+
+  it('an ordinary task keeps its writers and shows no hint', () => {
+    mockWsClient.call.mockResolvedValue({ tasks: [TASK], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [TASK], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    expect(screen.queryByText(LOCK_HINT)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Task title' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Mark complete' })).toBeInTheDocument();
+  });
+});
+
+describe('TaskDetailPage — discovery task has no delete (L2 round 6)', () => {
+  it('the more menu offers no delete for a discovery run; an ordinary task keeps it', async () => {
+    const user = userEvent.setup();
+    mockWsClient.call.mockResolvedValue({ tasks: [DISCOVERY], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [DISCOVERY], comments: {}, activities: [], loading: false });
+    const { unmount } = renderAt('task-disc0001');
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
+    expect(await screen.findByRole('menuitem', { name: /Copy link/ })).toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: /Delete/ })).toBeNull();
+    unmount();
+
+    mockWsClient.call.mockResolvedValue({ tasks: [TASK], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [TASK], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
+    expect(await screen.findByRole('menuitem', { name: /Delete/ })).toBeInTheDocument();
+  });
+});
+
+describe('TaskDetailPage — no goal follow-up on a discovery run (L2 round 7)', () => {
+  it('a finished goal-mode discovery task does not offer the continue panel', () => {
+    const done = { ...DISCOVERY, status: 'done' as const, goal_mode: true };
+    mockWsClient.call.mockResolvedValue({ tasks: [done], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [done], comments: {}, activities: [], loading: false });
+    renderAt('task-disc0001');
+    expect(screen.queryByText(en['tasks.continue.title'])).toBeNull();
+  });
+});

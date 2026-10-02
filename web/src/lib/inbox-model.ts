@@ -408,3 +408,25 @@ export function persistPrefs(prefs: InboxPrefs): void {
     /* private mode */
   }
 }
+
+/** Inbox sources gated by viewer role on the gateway (not by agent binding). */
+export type InboxRoleGatedSource = 'approvals' | 'budget' | 'failedRuns' | 'installs';
+
+/**
+ * L2: sources the gateway is KNOWN to refuse for this role (verified against a
+ * live gateway) — the Inbox skips them instead of turning an expected denial
+ * into the "part of this didn't load" banner. Unknown role ⇒ nothing skipped
+ * (call everything; a denial then surfaces like any other failure).
+ *
+ * This MIRRORS server role gates — the gateway stays the source of truth;
+ * keep in sync when these change:
+ *   - `approvals.list`, `install_requests.list`, `budget.incidents` →
+ *     `require_manager!()` in `crates/duduclaw-gateway/src/handlers/dispatch_org.rs`
+ *   - `audit.unified_log` → `require_admin!()` in
+ *     `crates/duduclaw-gateway/src/handlers/dispatch_system.rs`
+ */
+export function inboxSourcesDeniedFor(role: string | undefined): ReadonlySet<InboxRoleGatedSource> {
+  if (role === 'employee') return new Set(['approvals', 'budget', 'failedRuns', 'installs']);
+  if (role === 'manager') return new Set(['failedRuns']);
+  return new Set();
+}

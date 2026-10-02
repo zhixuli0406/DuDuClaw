@@ -170,7 +170,7 @@ export function RowSelect({
           className="w-full"
           aria-label={typeof label === 'string' ? label : undefined}
         >
-          <SelectValue>{current?.label}</SelectValue>
+          <SelectValue>{current?.label ?? (value || undefined)}</SelectValue>
         </SelectTrigger>
         <SelectContent>
           {options.map((o) => (

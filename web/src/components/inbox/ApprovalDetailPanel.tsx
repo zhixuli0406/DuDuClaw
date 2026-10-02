@@ -32,6 +32,7 @@ import { timeAgo, timeRemaining } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import type { ApprovalItem, ApprovalSimulation } from '@/lib/api';
 import { expiryState } from '@/lib/inbox-model';
+import { runtimeLabel } from '@/lib/discovery-api';
 import { useNowTick } from '@/hooks/useNowTick';
 import {
   approvalRisk,
@@ -46,6 +47,7 @@ import { parseSkillCreatePayload, type SkillCreatePayload } from '@/components/s
 import { formatTimeSaved } from '@/components/skills/status-meta';
 import { OpenInChannelButton } from './OpenInChannelButton';
 import { pilotReviewDeepLink } from '@/lib/decision-review-link';
+import { parseDiscoveryApproval, type DiscoveryApprovalSummary } from './discovery-approval-payload';
 
 // ── Local mds-token property primitives (replace the Calm Glass PropertyRow) ──
 
@@ -85,6 +87,7 @@ const DESCRIBED_KINDS = new Set([
   'agent_hire',
   'wiki_ingest',
   'support_pilot_review',
+  'discovery',
 ]);
 
 /** D1/D2: `true` when there is an actual narrative or risk point to show —
@@ -127,6 +130,55 @@ function SimulationSection({ simulation, t }: { simulation: ApprovalSimulation; 
           </div>
         )}
       </div>
+    </Section>
+  );
+}
+
+/** L7: plain-language view of a Discovery run spec. Every value is payload
+ *  DATA rendered as text; absent / wrong-typed fields simply have no row. */
+function DiscoverySpecSection({
+  spec,
+  intl,
+}: {
+  spec: DiscoveryApprovalSummary;
+  intl: ReturnType<typeof useIntl>;
+}) {
+  const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
+  const secs = spec.maxWallSecs;
+  const nodesPerRound =
+    spec.branchCount !== undefined && spec.refineCount !== undefined
+      ? spec.branchCount * (spec.refineCount + 1)
+      : undefined;
+  return (
+    <Section title={t('approval.discovery.title')}>
+      {spec.runtime && <Row label={t('approval.discovery.runtime')}><Mono>{runtimeLabel(spec.runtime, intl)}</Mono></Row>}
+      {spec.model && <Row label={t('approval.discovery.model')}><Mono>{spec.model}</Mono></Row>}
+      {spec.evaluator && <Row label={t('approval.discovery.evaluator')}><Mono>{spec.evaluator}</Mono></Row>}
+      {spec.branchCount !== undefined && (
+        <Row label={t('approval.discovery.branches')}>{spec.branchCount}</Row>
+      )}
+      {spec.refineCount !== undefined && (
+        <Row label={t('approval.discovery.refinements')}>{spec.refineCount}</Row>
+      )}
+      {spec.maxRounds !== undefined && <Row label={t('approval.discovery.rounds')}>{spec.maxRounds}</Row>}
+      {spec.maxAgentCalls !== undefined && (
+        <Row label={t('approval.discovery.maxAgentCalls')}>{spec.maxAgentCalls}</Row>
+      )}
+      {spec.maxUsd !== undefined && (
+        <Row label={t('approval.discovery.budget')}>{t('approval.discovery.usd', { amount: spec.maxUsd })}</Row>
+      )}
+      {secs !== undefined && (
+        <Row label={t('approval.discovery.timeLimit')}>
+          {secs % 60 === 0 && secs > 0
+            ? t('approval.discovery.minutes', { n: secs / 60 })
+            : t('approval.discovery.seconds', { n: secs })}
+        </Row>
+      )}
+      {nodesPerRound !== undefined && (
+        <p className="pt-1 text-xs text-muted-foreground">
+          {t('approval.discovery.nodesPerRound', { nodes: nodesPerRound })}
+        </p>
+      )}
     </Section>
   );
 }
@@ -228,6 +280,7 @@ function GenericApprovalView({
   const facts = extractPlanFacts(approval.payload);
   const described = DESCRIBED_KINDS.has(approval.kind);
   const kindDesc = described ? t(`approval.plan.kind.${approval.kind}`) : t('approval.plan.kind.unknown');
+  const discoverySpec = approval.kind === 'discovery' ? parseDiscoveryApproval(approval.payload) : null;
   const reviewLink = approval.kind === 'support_pilot_review'
     ? pilotReviewDeepLink(approval.payload, approval.id) : null;
   // The Decision Lab deep link is admin-only (`RoleGuard minRole="admin"` on
@@ -277,6 +330,8 @@ function GenericApprovalView({
           )}
         </div>
       </Section>
+
+      {discoverySpec && <DiscoverySpecSection spec={discoverySpec} intl={intl} />}
 
       {reviewLink && <div className="space-y-1 rounded-lg border p-3">
         {isAdminReviewer ? (

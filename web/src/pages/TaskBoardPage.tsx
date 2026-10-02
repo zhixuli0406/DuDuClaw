@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import { useTasksStore } from '@/stores/tasks-store';
+import { PartialLoadNotice } from '@/components/PartialLoadNotice';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAssignStore } from '@/stores/assign-store';
 import {
@@ -123,12 +124,27 @@ const COLUMNS: ReadonlyArray<{ status: TaskStatus; writable: boolean }> = [
   { status: 'blocked', writable: true },
 ];
 
-/** Which board column a task's status belongs to (folds failed→blocked,
- *  pending→todo). Pure — shared by the board filter and list grouping. */
+/** Discovery rows are run by the dedicated lifecycle service; the gateway
+ *  refuses every generic `tasks.update`-family write on them. */
+function isDiscoveryTask(task: TaskInfo): boolean {
+  return task.kind === 'discovery';
+}
+
+const COLUMN_STATUSES: ReadonlySet<string> = new Set(COLUMNS.map((c) => c.status));
+
+/** Which board column a task's status belongs to (folds failed→blocked;
+ *  pending / discovery `pending_approval` / `queued` → todo, matching
+ *  `toStatusKey`). `cancelled` stays off the board as before; any status the
+ *  UI does not know lands in todo rather than silently vanishing. */
+function columnOf(taskStatus: TaskStatus): TaskStatus | null {
+  if (taskStatus === 'failed') return 'blocked';
+  if (taskStatus === 'cancelled') return null;
+  return COLUMN_STATUSES.has(taskStatus) ? taskStatus : 'todo';
+}
+
+/** Pure — shared by the board filter and list grouping. */
 function inColumn(taskStatus: TaskStatus, column: TaskStatus): boolean {
-  if (column === 'blocked') return taskStatus === 'blocked' || taskStatus === 'failed';
-  if (column === 'todo') return taskStatus === 'todo' || taskStatus === 'pending';
-  return taskStatus === column;
+  return columnOf(taskStatus) === column;
 }
 
 /** 1-based round number shown on revising/review cards. */
@@ -186,27 +202,38 @@ function TaskCard({
     [task.id],
   );
 
+  // Discovery runs belong to their own lifecycle service — the gateway refuses
+  // every `tasks.update` on them, so the card cannot be moved between columns.
+  const lifecycleLocked = isDiscoveryTask(task);
   return (
     <div
-      draggable
-      onDragStart={handleDragStart}
+      draggable={!lifecycleLocked}
+      onDragStart={lifecycleLocked ? undefined : handleDragStart}
       onClick={() => onOpen(task.id)}
-      className="group/card w-64 shrink-0 cursor-grab rounded-lg border border-surface-border bg-surface p-3 shadow-[var(--surface-shadow)] transition-colors hover:bg-surface-hover active:cursor-grabbing"
+      title={lifecycleLocked ? intl.formatMessage({ id: 'tasks.discovery.locked' }) : undefined}
+      className={cn(
+        'group/card w-64 shrink-0 rounded-lg border border-surface-border bg-surface p-3 shadow-[var(--surface-shadow)] transition-colors hover:bg-surface-hover',
+        lifecycleLocked ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing',
+      )}
     >
       <div className="flex items-start justify-between gap-2">
         <p className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{task.title}</p>
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onRemove(task);
-          }}
-          className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/card:opacity-100 pointer-coarse:opacity-100"
-          title={intl.formatMessage({ id: 'tasks.remove' })}
-          aria-label={intl.formatMessage({ id: 'tasks.remove' })}
-        >
-          <Trash2 className="size-3.5" />
-        </button>
+        {/* The gateway refuses `tasks.remove` on a discovery run (it would
+            orphan the run) — no delete affordance for it. */}
+        {!lifecycleLocked && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onRemove(task);
+            }}
+            className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/card:opacity-100 pointer-coarse:opacity-100"
+            title={intl.formatMessage({ id: 'tasks.remove' })}
+            aria-label={intl.formatMessage({ id: 'tasks.remove' })}
+          >
+            <Trash2 className="size-3.5" />
+          </button>
+        )}
       </div>
 
       {task.description && (
@@ -460,9 +487,18 @@ function TaskListRow({
         />
       </span>
 
-      {/* Inline status editor (kept: list quick-status change). */}
-      <span onClick={(e) => e.stopPropagation()} className="flex shrink-0 items-center">
-        <StatusIcon status={toStatusKey(task.status)} size="sm" onChange={(key) => onStatus(task, key)} />
+      {/* Inline status editor (kept: list quick-status change). Discovery
+          runs are read-only here — their lifecycle service owns the status. */}
+      <span
+        onClick={(e) => e.stopPropagation()}
+        className="flex shrink-0 items-center"
+        title={isDiscoveryTask(task) ? intl.formatMessage({ id: 'tasks.discovery.locked' }) : undefined}
+      >
+        <StatusIcon
+          status={toStatusKey(task.status)}
+          size="sm"
+          onChange={isDiscoveryTask(task) ? undefined : (key) => onStatus(task, key)}
+        />
       </span>
 
       <span className="hidden w-16 shrink-0 font-mono text-xs tabular-nums text-muted-foreground md:inline">
@@ -704,6 +740,7 @@ export function TaskBoardPage() {
     tasks,
     loading,
     error,
+    tasksPartialError,
     clearError,
     fetchTasks,
     createTask,
@@ -826,6 +863,23 @@ export function TaskBoardPage() {
     [intl, navigate],
   );
 
+  /** Discovery runs: the gateway refuses `tasks.update` (only the discovery
+   *  lifecycle service may change them). Covers batch "mark done", which
+   *  never went through the drag / picker guards. */
+  const refuseIfDiscovery = useCallback(
+    (task: TaskInfo): boolean => {
+      if (!isDiscoveryTask(task)) return false;
+      toast.info(intl.formatMessage({ id: 'tasks.discovery.locked' }), {
+        action: {
+          label: intl.formatMessage({ id: 'tasks.discovery.locked.action' }),
+          onClick: () => navigate('/goals'),
+        },
+      });
+      return true;
+    },
+    [intl, navigate],
+  );
+
   // One completion path for drag-drop, list StatusIcon, and batch: write via the
   // store, and fire the §5.5 celebration when a task first reaches `done`.
   // The needs_human refusal lives HERE rather than at each call site, so a path
@@ -835,13 +889,14 @@ export function TaskBoardPage() {
     (task: TaskInfo, next: TaskStatus) => {
       if (next === task.status) return;
       if (refuseIfNeedsHuman(task)) return;
+      if (refuseIfDiscovery(task)) return;
       if (next === 'done') {
         celebrateTaskDone(intl.formatMessage({ id: 'tasks.celebrate.done' }));
         if (task.assigned_to) setBurst({ agentId: task.assigned_to });
       }
       moveTask(task.id, next);
     },
-    [moveTask, intl, refuseIfNeedsHuman],
+    [moveTask, intl, refuseIfNeedsHuman, refuseIfDiscovery],
   );
 
   const handleDrop = useCallback(
@@ -909,15 +964,48 @@ export function TaskBoardPage() {
     [filteredTasks, selected],
   );
 
+  /** One toast for a whole batch that contained discovery runs (they are
+   *  skipped, never written — the gateway refuses update/remove on them). */
+  const noteDiscoverySkipped = useCallback(
+    (count: number) => {
+      if (count === 0) return;
+      toast.info(intl.formatMessage({ id: 'tasks.batch.discoverySkipped' }, { count }), {
+        action: {
+          label: intl.formatMessage({ id: 'tasks.discovery.locked.action' }),
+          onClick: () => navigate('/goals'),
+        },
+      });
+    },
+    [intl, navigate],
+  );
+
   const handleBatchDone = useCallback(() => {
-    for (const t of selectedTasks) applyStatus(t, 'done');
+    const writable = selectedTasks.filter((t) => !isDiscoveryTask(t));
+    for (const t of writable) applyStatus(t, 'done');
+    noteDiscoverySkipped(selectedTasks.length - writable.length);
     clearSelection();
-  }, [selectedTasks, applyStatus, clearSelection]);
+  }, [selectedTasks, applyStatus, clearSelection, noteDiscoverySkipped]);
+
+  // Toolbar "Delete": a selection of ONLY discovery runs has nothing to
+  // delete — skip the "delete 0 tasks?" confirmation, say why, clear.
+  const requestBatchDelete = useCallback(() => {
+    if (selectedTasks.length > 0 && selectedTasks.every(isDiscoveryTask)) {
+      noteDiscoverySkipped(selectedTasks.length);
+      clearSelection();
+      return;
+    }
+    setConfirmBatch(true);
+  }, [selectedTasks, noteDiscoverySkipped, clearSelection]);
 
   const handleBatchDelete = useCallback(async () => {
     clearError();
+    const deletable = selectedTasks.filter((t) => !isDiscoveryTask(t));
+    noteDiscoverySkipped(selectedTasks.length - deletable.length);
+    // Drop the skipped runs from the selection now, so a retry after a
+    // partial failure neither re-sends them nor repeats the skipped toast.
+    if (deletable.length !== selectedTasks.length) setSelected(new Set(deletable.map((t) => t.id)));
     let failed = 0;
-    for (const t of selectedTasks) {
+    for (const t of deletable) {
       await removeTask(t.id);
       if (useTasksStore.getState().error != null) {
         failed += 1;
@@ -931,7 +1019,7 @@ export function TaskBoardPage() {
     }
     clearSelection();
     setConfirmBatch(false);
-  }, [selectedTasks, removeTask, clearSelection, clearError, intl]);
+  }, [selectedTasks, removeTask, clearSelection, clearError, intl, noteDiscoverySkipped]);
 
   // Per-AI-staff buckets (incl. an unassigned bucket) — the single grouping
   // source shared by the list "by staff" view and the kanban swimlanes.
@@ -1076,6 +1164,9 @@ export function TaskBoardPage() {
 
       {/* Body */}
       <div className="min-h-[50vh] pb-16 pt-2">
+        {error == null && tasksPartialError != null && (
+          <PartialLoadNotice className="px-2 pb-3" onRetry={() => void fetchTasks()} />
+        )}
         {error != null && (
           <div className="px-2 pb-3">
             <ErrorState
@@ -1208,7 +1299,7 @@ export function TaskBoardPage() {
               <Check />
               {intl.formatMessage({ id: 'tasks.batch.markDone' })}
             </Button>
-            <Button variant="destructive" size="sm" onClick={() => setConfirmBatch(true)}>
+            <Button variant="destructive" size="sm" onClick={requestBatchDelete}>
               <Trash2 />
               {intl.formatMessage({ id: 'tasks.batch.delete' })}
             </Button>
@@ -1258,7 +1349,11 @@ export function TaskBoardPage() {
           <DialogHeader>
             <DialogTitle>{intl.formatMessage({ id: 'tasks.batch.delete' })}</DialogTitle>
             <DialogDescription>
-              {intl.formatMessage({ id: 'tasks.batch.deleteConfirm' }, { count: selected.size })}
+              {intl.formatMessage(
+                { id: 'tasks.batch.deleteConfirm' },
+                // Discovery runs in the selection are skipped, not deleted.
+                { count: selectedTasks.filter((t) => !isDiscoveryTask(t)).length },
+              )}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

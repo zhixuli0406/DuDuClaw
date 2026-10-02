@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useUrlStateNullable } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
 import { usePlansStore } from '@/stores/plans-store';
+import { PartialLoadNotice } from '@/components/PartialLoadNotice';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { cn } from '@/lib/utils';
@@ -133,7 +134,7 @@ export function PlansPage() {
   // `error` was never destructured before (P05 Blocker, phase-4 audit): every
   // failed mutation set it in the store and the page carried on as if the edit
   // had landed. Read it, show it, and let the user retry.
-  const { plans, steps, loading, error, clearError, fetchPlans, fetchPlan, createPlan, updatePlan, removePlan, addStep, updateStep, removeStep } =
+  const { plans, steps, loading, error, partialError, clearError, fetchPlans, fetchPlan, createPlan, updatePlan, removePlan, addStep, updateStep, removeStep } =
     usePlansStore();
   const { agents, fetchAgents } = useAgentsStore();
 
@@ -229,6 +230,7 @@ export function PlansPage() {
       />
 
       <div className="flex flex-1 flex-col gap-6 p-4 md:p-6">
+        {error == null && partialError != null && <PartialLoadNotice onRetry={() => void fetchPlans()} />}
         {error != null && plans.length > 0 && (
           <ErrorState
             variant="inline"
@@ -419,7 +421,8 @@ export function PlansPage() {
                   ) : (
                     <ul className="divide-y divide-surface-border">
                       {planSteps.map((s, i) => {
-                        const Icon = STATUS_ICON[s.status];
+                        // Unknown server step status → plain circle, never an undefined component.
+                        const Icon = STATUS_ICON[s.status] ?? Circle;
                         return (
                           <li key={s.id} className="group flex items-center gap-2 px-4 py-2">
                             <button

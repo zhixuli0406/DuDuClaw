@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, type ComponentType, type ReactNode } from 'react';
+import { isDeprecatedRuntime } from '@/lib/deprecated-runtimes';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
@@ -92,15 +93,16 @@ function Field({
 }
 
 /**
- * The CLIs one-click sign-in can drive. Labels are product names, so they stay
+ * The CLIs one-click sign-in can drive. Antigravity (`agy`) is deliberately
+ * absent: it has no login subcommand (the gateway reports `login_method:
+ * "none"`), so its Google sign-in is done by running `agy` in a terminal on
+ * the host. Labels are product names, so they stay
  * verbatim; the one that needs a qualifier ("which subscription is this?")
  * carries an i18n key instead.
  */
 const CLI_OPTIONS: ReadonlyArray<[LoginRuntime, string, string?]> = [
   ['claude', 'Claude'],
   ['codex', 'Codex'],
-  ['gemini', 'Gemini'],
-  ['antigravity', 'Antigravity (agy)'],
   ['grok', 'Grok', 'cliLogin.runtime.grok.suffix'],
 ];
 
@@ -422,6 +424,7 @@ export function AccountsPage() {
                         <p className="font-medium text-foreground">
                           {CLI_CRED_LABELS[c.runtime] ?? c.runtime}
                           {c.runtime === 'grok' && intl.formatMessage({ id: 'cliLogin.runtime.grok.suffix' })}
+                          {isDeprecatedRuntime(c.runtime) && ` (${intl.formatMessage({ id: 'common.deprecated' })})`}
                         </p>
                         <p className="font-mono text-xs text-muted-foreground">{c.store}</p>
                       </div>

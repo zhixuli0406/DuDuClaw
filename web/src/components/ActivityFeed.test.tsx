@@ -56,3 +56,28 @@ describe('ActivityFeed three-tier denoising', () => {
     expect(screen.getByText(/consecutive updates/i)).toBeInTheDocument();
   });
 });
+
+// ── L2 round 3: fanned-out activity feed — partial-load notice ──
+describe('ActivityFeed partial-load notice (L2)', () => {
+  const PARTIAL_NOTICE = "Some AI employees' data couldn't be loaded this time — showing what did load.";
+
+  it('partial result: renders the events plus one status notice', () => {
+    useTasksStore.setState({
+      activities: [ev('p1', 'task_created', 'bot', 'arrived event')] as never,
+      activitiesPartialError: new Error('one agent failed'),
+    });
+    renderWithProviders(<ActivityFeed />);
+    expect(screen.getByText('arrived event')).toBeInTheDocument();
+    expect(screen.getByText(PARTIAL_NOTICE).closest('[role="status"]')).not.toBeNull();
+  });
+
+  it('clean result: no notice', () => {
+    useTasksStore.setState({
+      activities: [ev('c1', 'task_created', 'bot', 'clean event')] as never,
+      activitiesPartialError: null,
+    });
+    renderWithProviders(<ActivityFeed />);
+    expect(screen.getByText('clean event')).toBeInTheDocument();
+    expect(screen.queryByText(PARTIAL_NOTICE)).toBeNull();
+  });
+});

@@ -27,6 +27,11 @@ describe('<ApprovalRequestCard> — O-3 inline HITL approval', () => {
     expect(screen.getByText('Tool call')).toBeInTheDocument();
   });
 
+  it('labels a discovery approval instead of falling back to "other" (L7)', () => {
+    renderWithProviders(<ApprovalRequestCard payload={{ ...ITEM, kind: 'discovery' }} />);
+    expect(screen.getByText('Code discovery')).toBeInTheDocument();
+  });
+
   it('approve calls approvals.decide(id, true) and resolves the card', async () => {
     const decide = vi.spyOn(api.approvals, 'decide').mockResolvedValue({ id: 'appr-1', decided: 'approved' });
     renderWithProviders(<ApprovalRequestCard payload={ITEM} />);

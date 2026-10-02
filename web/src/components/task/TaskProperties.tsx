@@ -133,6 +133,7 @@ export function TaskProperties({
   task,
   agents,
   statusLocked = false,
+  lifecycleLocked = false,
   onStatusChange,
   onPriorityChange,
   onAssign,
@@ -146,6 +147,10 @@ export function TaskProperties({
    * here would be a second, weaker path to the same decision.
    */
   statusLocked?: boolean;
+  /** L2 round 5: a discovery run — the gateway refuses `tasks.update` /
+   *  `tasks.assign` on it, so priority and assignee render read-only too and
+   *  the hint points at the Goals page instead of the inbox. */
+  lifecycleLocked?: boolean;
   onStatusChange: (next: import('@/lib/api').TaskStatus) => void;
   onPriorityChange: (next: TaskPriority) => void;
   onAssign: (agentName: string) => void;
@@ -185,14 +190,27 @@ export function TaskProperties({
         </PropRow>
         {statusLocked && (
           <p className="px-1 pb-1 text-xs text-muted-foreground">
-            {intl.formatMessage({ id: 'tasks.needsHuman.propsHint' })}
+            {intl.formatMessage({ id: lifecycleLocked ? 'tasks.discovery.locked' : 'tasks.needsHuman.propsHint' })}
           </p>
         )}
         <PropRow label={intl.formatMessage({ id: 'tasks.field.priority' })} icon={Flag}>
-          <PriorityPopover value={task.priority} onChange={onPriorityChange} />
+          {lifecycleLocked ? (
+            <span className="flex items-center gap-1.5 text-sm text-foreground">
+              <PriorityIcon priority={task.priority} size="sm" />
+              {intl.formatMessage({ id: `tasks.priority.${task.priority}`, defaultMessage: task.priority })}
+            </span>
+          ) : (
+            <PriorityPopover value={task.priority} onChange={onPriorityChange} />
+          )}
         </PropRow>
         <PropRow label={intl.formatMessage({ id: 'tasks.field.assignTo' })} icon={UserRound}>
-          <AssigneePopover agents={agents} value={task.assigned_to || null} onChange={onAssign} align="right" />
+          {lifecycleLocked ? (
+            <span className="text-sm text-foreground">
+              {agents.find((a) => a.name === task.assigned_to)?.display_name || task.assigned_to || '—'}
+            </span>
+          ) : (
+            <AssigneePopover agents={agents} value={task.assigned_to || null} onChange={onAssign} align="right" />
+          )}
         </PropRow>
       </PropSection>
 

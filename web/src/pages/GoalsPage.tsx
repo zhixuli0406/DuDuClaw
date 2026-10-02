@@ -4,6 +4,7 @@ import { useNavigate, useSearchParams } from 'react-router';
 import { Target, Plus, RefreshCw, Check, Trash2, Hand, Search, Pin } from 'lucide-react';
 
 import { api, type TaskInfo } from '@/lib/api';
+import { DiscoverySection } from '@/components/tasks/DiscoverySection';
 import { timeAgo } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -315,7 +316,7 @@ export function GoalsPage() {
         goal_mode: true,
         ...(agentFilter ? { agent_id: agentFilter } : {}),
       });
-      setTasks((r.tasks ?? []).filter((t) => t.goal_mode));
+      setTasks((r.tasks ?? []).filter((t) => t.goal_mode && t.kind !== 'discovery'));
       setLoadError(null);
     } catch (e) {
       console.warn('[api]', e);
@@ -349,8 +350,8 @@ export function GoalsPage() {
             limit: LIST_PAGE_SIZE,
             offset: archivedOffsetRef.current,
           });
-          const rows = r.tasks ?? [];
-          archivedOffsetRef.current += rows.length;
+          const rows = (r.tasks ?? []).filter(t => t.kind !== 'discovery');
+          archivedOffsetRef.current += (r.tasks ?? []).length;
           setListHasMore(archivedOffsetRef.current < (r.total ?? 0));
           setListTasks((prev) => {
             const base = reset ? [] : prev;
@@ -377,8 +378,8 @@ export function GoalsPage() {
           const nextOffsets: Record<string, number> = { ...offsets };
           results.forEach((r, i) => {
             const status = FINISHED_STATUSES[i];
-            const rows = r.tasks ?? [];
-            nextOffsets[status] = (offsets[status] ?? 0) + rows.length;
+            const rows = (r.tasks ?? []).filter(t => t.kind !== 'discovery');
+            nextOffsets[status] = (offsets[status] ?? 0) + (r.tasks ?? []).length;
             if (nextOffsets[status] < (r.total ?? 0)) hasMore = true;
             fetched = fetched.concat(rows);
           });
@@ -532,6 +533,8 @@ export function GoalsPage() {
           </Button>
         </div>
       </div>
+
+      <DiscoverySection agentId={agentFilter || undefined} enabled={connState === 'authenticated' && (isAdmin || !!agentFilter)} />
 
       {loading || waitingForListToRuleOutEmpty ? (
         <CollectionPageState state="loading" />

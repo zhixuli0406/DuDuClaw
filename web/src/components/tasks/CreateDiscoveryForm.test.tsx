@@ -1,0 +1,81 @@
+import { describe, expect, it, vi } from 'vitest';
+import { screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { renderWithProviders } from '@/test/render';
+import { CreateDiscoveryForm } from './CreateDiscoveryForm';
+import type { DiscoveryCatalog } from '@/lib/discovery-api';
+const catalog: DiscoveryCatalog = { roots: [{ id: 'approved-1', label: 'Synthetic workspace' }], evaluators: [{ name: 'sum', label: 'Sum evaluator' }], runtimes: ['codex'], can_create: true, requires_approval: true };
+describe('CreateDiscoveryForm', () => {
+  it('submits approved IDs and independent call/dollar/wall budgets, preserving approval notice', async () => {
+    const create=vi.fn().mockResolvedValue(undefined); const user=userEvent.setup();
+    renderWithProviders(<CreateDiscoveryForm catalog={catalog} agentId="agnes" onCreate={create} />);
+    expect(screen.getByText(/Requires approval/)).toBeInTheDocument();
+    await user.type(screen.getByRole('textbox',{name:'Title'}),'Compare outputs');
+    await user.type(screen.getByRole('textbox',{name:'Description'}),'Find a valid alternative');
+    await user.type(screen.getByRole('textbox',{name:'Model'}),'configured-model');
+    await user.click(screen.getByRole('button',{name:'Create exploration'}));
+    await waitFor(()=>expect(create).toHaveBeenCalledTimes(1));
+    const body=create.mock.calls[0][0];
+    expect(body.assigned_to).toBe('agnes');expect(body.discovery.approved_root_id).toBe('approved-1');expect(body.discovery.evaluator).toBe('sum');
+    expect(body.discovery.budget).toEqual({max_agent_calls:4,max_usd:1,max_wall_secs:90,max_rounds:2});
+    expect(JSON.stringify(body)).not.toMatch(/operator|sandbox|starting_workspace|allow_unconfined/);
+  });
+  it('labels runtimes with product names but submits the raw runtime id',async()=>{
+    const create=vi.fn().mockResolvedValue(undefined); const user=userEvent.setup();
+    renderWithProviders(<CreateDiscoveryForm catalog={{...catalog,runtimes:['openai-compat','codex']}} agentId="agnes" onCreate={create} />);
+    expect(screen.getByRole('option',{name:'OpenAI-compatible'})).toHaveValue('openai-compat');
+    expect(screen.getByRole('option',{name:'Codex'})).toHaveValue('codex');
+    await user.type(screen.getByRole('textbox',{name:'Title'}),'x');
+    await user.type(screen.getByRole('textbox',{name:'Description'}),'y');
+    await user.type(screen.getByRole('textbox',{name:'Model'}),'m');
+    await user.click(screen.getByRole('button',{name:'Create exploration'}));
+    await waitFor(()=>expect(create).toHaveBeenCalledTimes(1));
+    expect(create.mock.calls[0][0].discovery.runtime).toBe('openai-compat');
+  });
+  it('uses backend capability rather than granting permission from the client role', () => {
+    renderWithProviders(<CreateDiscoveryForm catalog={{...catalog,can_create:false}} agentId="agnes" onCreate={vi.fn()} />);
+    expect(screen.queryByRole('button',{name:'Create exploration'})).not.toBeInTheDocument();
+    expect(screen.getByText(/not permitted/)).toBeInTheDocument();
+  });
+  it('labels refine_count as refinements, accepts 0 and shows nodes per round',async()=>{
+    const create=vi.fn().mockResolvedValue(undefined); const user=userEvent.setup();
+    renderWithProviders(<CreateDiscoveryForm catalog={catalog} agentId="agnes" onCreate={create} />);
+    expect(screen.queryByText('Attempts per branch')).not.toBeInTheDocument();
+    const input=screen.getByRole('spinbutton',{name:'Refinements per branch'});
+    expect(input).toHaveAttribute('min','0');
+    expect(screen.getByText(/4 nodes per round/)).toBeInTheDocument();
+    await user.clear(input);await user.type(input,'0');
+    expect(screen.getByText(/2 nodes per round/)).toBeInTheDocument();
+    await user.type(screen.getByRole('textbox',{name:'Title'}),'x');
+    await user.type(screen.getByRole('textbox',{name:'Description'}),'y');
+    await user.type(screen.getByRole('textbox',{name:'Model'}),'m');
+    await user.click(screen.getByRole('button',{name:'Create exploration'}));
+    await waitFor(()=>expect(create).toHaveBeenCalledTimes(1));
+    expect(create.mock.calls[0][0].discovery.refine_count).toBe(0);
+  });
+  it('an empty number field is invalid (not coerced to 0) and hides the node count',async()=>{
+    const user=userEvent.setup();
+    renderWithProviders(<CreateDiscoveryForm catalog={catalog} agentId="agnes" onCreate={vi.fn()} />);
+    await user.type(screen.getByRole('textbox',{name:'Title'}),'x');
+    await user.type(screen.getByRole('textbox',{name:'Description'}),'y');
+    await user.type(screen.getByRole('textbox',{name:'Model'}),'m');
+    expect(screen.getByRole('button',{name:'Create exploration'})).toBeEnabled();
+    await user.clear(screen.getByRole('spinbutton',{name:'Refinements per branch'}));
+    expect(screen.getByRole('button',{name:'Create exploration'})).toBeDisabled();
+    expect(screen.queryByText(/\d+ nodes per round/)).not.toBeInTheDocument();
+    await user.clear(screen.getByRole('spinbutton',{name:'Call limit'}));
+    await user.type(screen.getByRole('spinbutton',{name:'Refinements per branch'}),'1');
+    expect(screen.getByRole('button',{name:'Create exploration'})).toBeDisabled();
+  });
+  it('an explicit 0 refinements stays valid and the helper shows branches × 1',async()=>{
+    const user=userEvent.setup();
+    renderWithProviders(<CreateDiscoveryForm catalog={catalog} agentId="agnes" onCreate={vi.fn()} />);
+    await user.type(screen.getByRole('textbox',{name:'Title'}),'x');
+    await user.type(screen.getByRole('textbox',{name:'Description'}),'y');
+    await user.type(screen.getByRole('textbox',{name:'Model'}),'m');
+    const input=screen.getByRole('spinbutton',{name:'Refinements per branch'});
+    await user.clear(input);await user.type(input,'0');
+    expect(screen.getByRole('button',{name:'Create exploration'})).toBeEnabled();
+    expect(screen.getByText(/Currently 2 nodes per round/)).toBeInTheDocument();
+  });
+});

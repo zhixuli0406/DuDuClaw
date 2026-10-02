@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   sortInbox,
+  inboxSourcesDeniedFor,
   filterByTab,
   filterByCategory,
   filterByStatus,
@@ -295,5 +296,18 @@ describe('expiryState', () => {
     expect(state!.remainingMs).toBe(0);
     expect(state!.expired).toBe(true);
     expect(state!.nearExpiry).toBe(false);
+  });
+});
+
+describe('inboxSourcesDeniedFor (L2 role-expected denials)', () => {
+  it('employee skips every manager/admin-gated source', () => {
+    expect([...inboxSourcesDeniedFor('employee')].sort()).toEqual(['approvals', 'budget', 'failedRuns', 'installs']);
+  });
+  it('manager skips only the admin audit log', () => {
+    expect([...inboxSourcesDeniedFor('manager')]).toEqual(['failedRuns']);
+  });
+  it('admin and unknown roles skip nothing', () => {
+    expect(inboxSourcesDeniedFor('admin').size).toBe(0);
+    expect(inboxSourcesDeniedFor(undefined).size).toBe(0);
   });
 });

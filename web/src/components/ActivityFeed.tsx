@@ -2,6 +2,7 @@ import { useEffect, useCallback, useState, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { useTasksStore } from '@/stores/tasks-store';
+import { PartialLoadNotice } from '@/components/PartialLoadNotice';
 import { useConnectionStore } from '@/stores/connection-store';
 import type { ActivityEvent, ActivityType } from '@/lib/api';
 import { glyphText } from '@/lib/agent-glyph';
@@ -244,7 +245,7 @@ export function ActivityFeed({
   agents?: ReadonlyArray<{ name: string; display_name: string; icon: string }>;
 }) {
   const intl = useIntl();
-  const { activities, fetchActivities } = useTasksStore();
+  const { activities, activitiesPartialError, fetchActivities } = useTasksStore();
   const connectionState = useConnectionStore((s) => s.state);
   const [visibleCount, setVisibleCount] = useState(limit);
   const [filterAgent, setFilterAgent] = useState<string>(agentId ?? '');
@@ -292,6 +293,9 @@ export function ActivityFeed({
           {intl.formatMessage({ id: showAll ? 'activity.showLess' : 'activity.showAll' })}
         </button>
       </div>
+      {/* L2: some bound employees' activity didn't load — no retry here (the
+          feed has no refresh affordance; it reloads on filter / reconnect). */}
+      {activitiesPartialError != null && <PartialLoadNotice className="mb-2" />}
       {rows.rows.length === 0 ? (
         <div className="flex items-center justify-center py-12 text-muted-foreground">
           <p>{intl.formatMessage({ id: 'activity.empty' })}</p>

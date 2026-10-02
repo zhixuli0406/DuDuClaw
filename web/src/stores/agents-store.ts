@@ -28,7 +28,7 @@ interface AgentsStore {
   updateAgent: (
     id: string,
     fields: AgentUpdateParams,
-  ) => Promise<{ success: boolean; runtime_provider_aligned?: string | null } | undefined>;
+  ) => Promise<{ success: boolean; runtime_provider_aligned?: string | null; runtime_provider_align_skipped?: string | null } | undefined>;
   removeAgent: (id: string) => Promise<void>;
   /** WP4 — archive (recoverable). Rejected by the backend for the main agent. */
   archiveAgent: (id: string) => Promise<void>;

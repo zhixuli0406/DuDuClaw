@@ -115,9 +115,12 @@ export function StatusIcon({
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
-  const Icon = ICONS[status];
+  // Never render an undefined component: a status outside the vocabulary
+  // (new server state, unmapped caller) draws — and is labelled — as `todo`.
+  const safe: TaskStatusKey = status in ICONS ? status : 'todo';
+  const Icon = ICONS[safe];
   const px = SIZES[size];
-  const color = `var(--status-task-icon-${status})`;
+  const color = `var(--status-task-icon-${safe})`;
 
   useEffect(() => {
     if (!open) return;
@@ -141,7 +144,7 @@ export function StatusIcon({
 
   if (!onChange) {
     return (
-      <span className={cn('inline-flex', className)} title={label(status)} role="img" aria-label={label(status)}>
+      <span className={cn('inline-flex', className)} title={label(safe)} role="img" aria-label={label(safe)}>
         {glyph}
       </span>
     );
@@ -154,8 +157,8 @@ export function StatusIcon({
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
-        aria-label={label(status)}
-        title={label(status)}
+        aria-label={label(safe)}
+        title={label(safe)}
         onClick={() => setOpen((v) => !v)}
         className="inline-flex items-center justify-center rounded-xl p-0.5 outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
       >

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { useNavigate, useParams } from 'react-router';
+import { Link, useNavigate, useParams } from 'react-router';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
@@ -176,6 +176,11 @@ export function TaskDetailPage() {
   // channel buttons offer. The generic status picker never handled it correctly
   // anyway: `pending` (= 重試) was not among its options at all.
   const needsHuman = task?.status === 'needs_human';
+  // L2 round 5: a discovery run is owned by its lifecycle service — the
+  // gateway refuses every `tasks.update`-family write (status / title /
+  // description / priority / assign / pin / archive) on it, so none of those
+  // controls are offered here.
+  const lifecycleLocked = task?.kind === 'discovery';
 
   // I-3a "接著做": a goal-mode task that already reached a terminal state
   // (done / failed / cancelled) can take a follow-up message and be reopened
@@ -184,7 +189,9 @@ export function TaskDetailPage() {
   // reopened round still goes through the MAV judge (see `GoalContinuePanel`'s
   // hint copy) — this is intentional, not a limitation.
   const canGoalContinue =
-    !!task?.goal_mode && (task?.status === 'done' || task?.status === 'failed' || task?.status === 'cancelled');
+    !lifecycleLocked &&
+    !!task?.goal_mode &&
+    (task?.status === 'done' || task?.status === 'failed' || task?.status === 'cancelled');
 
   // ── Right-hand PropertiesPanel (shell column, spec §5.3 式1 right 320) ──
   useEffect(() => () => clearPanel(), [clearPanel]);
@@ -196,14 +203,15 @@ export function TaskDetailPage() {
         <TaskProperties
           task={task}
           agents={agents}
-          statusLocked={needsHuman}
+          statusLocked={needsHuman || lifecycleLocked}
+          lifecycleLocked={lifecycleLocked}
           onStatusChange={applyStatus}
           onPriorityChange={applyPriority}
           onAssign={applyAssign}
         />
       ),
     });
-  }, [task, agents, needsHuman, setPanel, intl, applyStatus, applyPriority, applyAssign]);
+  }, [task, agents, needsHuman, lifecycleLocked, setPanel, intl, applyStatus, applyPriority, applyAssign]);
 
   const copyLink = useCallback(() => {
     try {
@@ -318,7 +326,7 @@ export function TaskDetailPage() {
           <>
             {/* Hidden while the task waits on a decision — the panel below is
                 the single writer for that state (WP-A §2-6). */}
-            {!needsHuman && (
+            {!needsHuman && !lifecycleLocked && (
               <Button
                 variant="ghost"
                 size="icon-sm"
@@ -342,18 +350,25 @@ export function TaskDetailPage() {
                   <Link2 />
                   {intl.formatMessage({ id: 'tasks.detail.copyLink' })}
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => void togglePin()}>
-                  {task.pinned ? <PinOff /> : <Pin />}
-                  {intl.formatMessage({ id: task.pinned ? 'goals.action.unpin' : 'goals.action.pin' })}
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => void toggleArchive()}>
-                  {task.archived ? <ArchiveRestore /> : <Archive />}
-                  {intl.formatMessage({ id: task.archived ? 'goals.action.unarchive' : 'goals.action.archive' })}
-                </DropdownMenuItem>
-                <DropdownMenuItem variant="destructive" onClick={() => setConfirmRemove(true)}>
-                  <Trash2 />
-                  {intl.formatMessage({ id: 'tasks.remove' })}
-                </DropdownMenuItem>
+                {!lifecycleLocked && (
+                  <>
+                    <DropdownMenuItem onClick={() => void togglePin()}>
+                      {task.pinned ? <PinOff /> : <Pin />}
+                      {intl.formatMessage({ id: task.pinned ? 'goals.action.unpin' : 'goals.action.pin' })}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => void toggleArchive()}>
+                      {task.archived ? <ArchiveRestore /> : <Archive />}
+                      {intl.formatMessage({ id: task.archived ? 'goals.action.unarchive' : 'goals.action.archive' })}
+                    </DropdownMenuItem>
+                  </>
+                )}
+                {/* `tasks.remove` is refused for a discovery run too. */}
+                {!lifecycleLocked && (
+                  <DropdownMenuItem variant="destructive" onClick={() => setConfirmRemove(true)}>
+                    <Trash2 />
+                    {intl.formatMessage({ id: 'tasks.remove' })}
+                  </DropdownMenuItem>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
             <Button
@@ -395,14 +410,26 @@ export function TaskDetailPage() {
           </button>
         )}
 
-        {/* Title (inline edit) */}
+        {/* Title (inline edit; read-only for a discovery run) */}
         <div className="space-y-2">
-          <InlineEditor
-            value={task.title}
-            onCommit={(next) => updateTask(task.id, { title: next })}
-            ariaLabel={intl.formatMessage({ id: 'tasks.field.title' })}
-            textClassName="text-2xl font-bold tracking-tight text-foreground"
-          />
+          {lifecycleLocked ? (
+            <h1 className="px-1.5 text-2xl font-bold tracking-tight text-foreground">{task.title}</h1>
+          ) : (
+            <InlineEditor
+              value={task.title}
+              onCommit={(next) => updateTask(task.id, { title: next })}
+              ariaLabel={intl.formatMessage({ id: 'tasks.field.title' })}
+              textClassName="text-2xl font-bold tracking-tight text-foreground"
+            />
+          )}
+          {lifecycleLocked && (
+            <p role="note" className="flex flex-wrap items-center gap-x-2 px-1.5 text-xs text-muted-foreground">
+              <span>{intl.formatMessage({ id: 'tasks.discovery.locked' })}</span>
+              <Link to="/goals" className="font-medium text-brand underline-offset-2 hover:underline">
+                {intl.formatMessage({ id: 'tasks.discovery.locked.action' })}
+              </Link>
+            </p>
+          )}
           {/* Meta row: status glyph + source + live */}
           <div className="flex flex-wrap items-center gap-2 px-1.5">
             <StatusIcon status={toStatusKey(task.status)} size="sm" />
@@ -491,14 +518,20 @@ export function TaskDetailPage() {
           <h2 className="mb-1 px-1.5 text-xs font-medium text-muted-foreground">
             {intl.formatMessage({ id: 'tasks.field.description' })}
           </h2>
-          <InlineEditor
-            value={task.description}
-            onCommit={(next) => updateTask(task.id, { description: next })}
-            multiline
-            placeholder={intl.formatMessage({ id: 'tasks.detail.noDescription' })}
-            ariaLabel={intl.formatMessage({ id: 'tasks.field.description' })}
-            textClassName="whitespace-pre-wrap text-sm text-foreground/90"
-          />
+          {lifecycleLocked ? (
+            <p className="whitespace-pre-wrap px-1.5 text-sm text-foreground/90">
+              {task.description || intl.formatMessage({ id: 'tasks.detail.noDescription' })}
+            </p>
+          ) : (
+            <InlineEditor
+              value={task.description}
+              onCommit={(next) => updateTask(task.id, { description: next })}
+              multiline
+              placeholder={intl.formatMessage({ id: 'tasks.detail.noDescription' })}
+              ariaLabel={intl.formatMessage({ id: 'tasks.field.description' })}
+              textClassName="whitespace-pre-wrap text-sm text-foreground/90"
+            />
+          )}
         </div>
 
         {/* Subtasks (real: derived from parent_task_id) */}

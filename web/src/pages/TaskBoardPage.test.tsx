@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
@@ -336,5 +336,238 @@ describe('TaskBoardPage — a failed delete is reported, not mimed as success', 
 
     await waitFor(() => expect(removeTask).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+});
+
+// ── L2 round 3: non-admin fan-out — WIP gauge + partial-load notice ──
+import { useAuthStore } from '@/stores/auth-store';
+
+const PARTIAL_NOTICE = "Some AI employees' data couldn't be loaded this time — showing what did load.";
+
+function signInManager(agents: string[]) {
+  useAuthStore.setState({
+    user: { id: 'u1', email: 'u@x', display_name: 'U', role: 'manager', status: 'active' },
+    bindings: agents.map((agent_name) => ({ user_id: 'u1', agent_name, access_level: 'viewer', bound_at: '2026-09-01T00:00:00Z' })),
+    isAuthenticated: true,
+  });
+}
+
+describe('TaskBoardPage for a non-admin (L2)', () => {
+  beforeEach(() => {
+    useTasksStore.setState({ tasks: [], loading: false, error: null, tasksPartialError: null });
+  });
+  afterEach(() => {
+    useAuthStore.setState({ user: null, bindings: [], isAuthenticated: false });
+  });
+
+  function gateway(failAgent?: string) {
+    return (method: string, params?: Record<string, unknown>) => {
+      const agent = params?.agent_id as string | undefined;
+      if (method === 'tasks.list' || method === 'tasks.flow_metrics') {
+        if (!agent) return Promise.reject(new Error('agent_id parameter is required'));
+        if (agent === failAgent) return Promise.reject(new Error('backend hiccup'));
+      }
+      if (method === 'tasks.list') {
+        return Promise.resolve({ tasks: [task({ id: `task-${agent}`, title: `Work of ${agent}`, assigned_to: agent })] });
+      }
+      if (method === 'tasks.flow_metrics') {
+        return Promise.resolve({ agents: [], review_queue_depth: 0, review_wip_limit: 5, accepts_last_7d: 0, avg_daily_accepts_7d: 0 });
+      }
+      return Promise.resolve({ agents: AGENTS, events: [] });
+    };
+  }
+
+  it('a manager now sees the review-column WIP gauge', async () => {
+    signInManager(['nova']);
+    mockWsClient.call.mockImplementation(gateway());
+    renderWithProviders(<TaskBoardPage />);
+    expect(await screen.findByTitle('Review queue: 0 of 5 (WIP limit)')).toBeInTheDocument();
+  });
+
+  it('partial result: renders the tasks that loaded plus one status notice', async () => {
+    signInManager(['nova', 'zed']);
+    mockWsClient.call.mockImplementation(gateway('zed'));
+    renderWithProviders(<TaskBoardPage />);
+    expect(await screen.findByText('Work of nova')).toBeInTheDocument();
+    const notice = await screen.findByText(PARTIAL_NOTICE);
+    expect(notice.closest('[role="status"]')).not.toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('clean result: no notice (and a clean load clears an earlier one)', async () => {
+    useTasksStore.setState({ tasksPartialError: new Error('earlier') });
+    signInManager(['nova', 'zed']);
+    mockWsClient.call.mockImplementation(gateway());
+    renderWithProviders(<TaskBoardPage />);
+    expect(await screen.findByText('Work of zed')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText(PARTIAL_NOTICE)).toBeNull());
+  });
+});
+
+describe('TaskBoardPage with discovery statuses (L2 round 4)', () => {
+  it('puts pending_approval / queued tasks in the To Do column (no crash, no vanish)', async () => {
+    const rows = [
+      task({ id: 'task-disc0001', title: 'Pending discovery', status: 'pending_approval' as never }),
+      task({ id: 'task-disc0002', title: 'Queued discovery', status: 'queued' as never }),
+      task({ id: 'task-disc0003', title: 'Mystery state', status: 'from_the_future' as never }),
+    ];
+    mockWsClient.call.mockResolvedValue({ tasks: rows, agents: AGENTS, events: [] });
+    useTasksStore.setState({ tasks: rows, loading: false });
+    renderWithProviders(<TaskBoardPage />);
+    const heading = await screen.findByRole('heading', { name: 'To Do' });
+    const column = heading.closest('.w-70') as HTMLElement;
+    expect(within(column).getByText('Pending discovery')).toBeInTheDocument();
+    expect(within(column).getByText('Queued discovery')).toBeInTheDocument();
+    expect(within(column).getByText('Mystery state')).toBeInTheDocument();
+  });
+});
+
+describe('TaskBoardPage — discovery tasks are read-only (L2 round 5)', () => {
+  const DISC = task({ id: 'task-disc0009', title: 'Exploration run', status: 'queued' as never, kind: 'discovery' });
+  const PLAIN = task({ id: 'task-plain009', title: 'Plain work', status: 'todo' });
+
+  beforeEach(() => {
+    mockWsClient.call.mockResolvedValue({ tasks: [DISC, PLAIN], agents: AGENTS, events: [] });
+    useTasksStore.setState({ tasks: [DISC, PLAIN], loading: false });
+  });
+
+  it('kanban: a discovery card is not draggable and says where it is managed; a plain card still is', async () => {
+    renderWithProviders(<TaskBoardPage />);
+    const disc = (await screen.findByText('Exploration run')).closest('[draggable]') as HTMLElement;
+    expect(disc).toHaveAttribute('draggable', 'false');
+    expect(disc.getAttribute('title')).toMatch(/managed in the exploration section of the Goals page/);
+    const plain = screen.getByText('Plain work').closest('[draggable]') as HTMLElement;
+    expect(plain).toHaveAttribute('draggable', 'true');
+  });
+
+  it('list: a discovery row has no status picker; a plain row keeps it', async () => {
+    localStorage.setItem('duduclaw:tasks:view', 'list');
+    renderWithProviders(<TaskBoardPage />);
+    const discRow = (await screen.findByText('Exploration run')).closest('li') as HTMLElement;
+    expect(within(discRow).queryByRole('button', { name: 'To do' })).toBeNull();
+    const plainRow = screen.getByText('Plain work').closest('li') as HTMLElement;
+    expect(within(plainRow).getByRole('button', { name: 'To do' })).toBeInTheDocument();
+  });
+});
+
+describe('TaskBoardPage — discovery tasks cannot be deleted; batches skip them (L2 round 6)', () => {
+  const D1 = task({ id: 'task-disc0101', title: 'Exploration A', status: 'queued' as never, kind: 'discovery' });
+  const D2 = task({ id: 'task-disc0102', title: 'Exploration B', status: 'pending_approval' as never, kind: 'discovery' });
+  const P1 = task({ id: 'task-plain101', title: 'Plain one', status: 'todo' });
+  const SKIPPED = '2 code explorations were skipped — they are managed in the exploration section of the Goals page.';
+
+  beforeEach(() => {
+    mockWsClient.call.mockResolvedValue({ tasks: [D1, D2, P1], agents: AGENTS, events: [] });
+    useTasksStore.setState({ tasks: [D1, D2, P1], loading: false, error: null });
+  });
+
+  async function selectAllInList() {
+    localStorage.setItem('duduclaw:tasks:view', 'list');
+    renderWithProviders(<TaskBoardPage />);
+    const user = userEvent.setup();
+    for (const title of ['Exploration A', 'Exploration B', 'Plain one']) {
+      const row = (await screen.findByText(title)).closest('li') as HTMLElement;
+      await user.click(within(row).getByRole('checkbox'));
+    }
+    return user;
+  }
+
+  it('kanban: a discovery card has no delete button; a plain card keeps it', async () => {
+    renderWithProviders(<TaskBoardPage />);
+    const disc = (await screen.findByText('Exploration A')).closest('[draggable]') as HTMLElement;
+    expect(within(disc).queryByRole('button', { name: 'Delete Task' })).toBeNull();
+    const plain = screen.getByText('Plain one').closest('[draggable]') as HTMLElement;
+    expect(within(plain).getByRole('button', { name: 'Delete Task' })).toBeInTheDocument();
+  });
+
+  it('bulk delete skips discovery tasks, deletes the rest, and says so in ONE toast', async () => {
+    const removeTask = vi.fn().mockResolvedValue(undefined);
+    useTasksStore.setState({ removeTask } as never);
+    const { seen, off } = captureToasts();
+    const user = await selectAllInList();
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(removeTask).toHaveBeenCalledTimes(1));
+    expect(removeTask).toHaveBeenCalledWith('task-plain101');
+    const skipped = seen.filter((t) => t.message === SKIPPED);
+    expect(skipped).toHaveLength(1);
+    off();
+  });
+
+  it('bulk mark-done skips discovery tasks with ONE toast and still completes the rest', async () => {
+    const moveTask = vi.fn();
+    useTasksStore.setState({ moveTask } as never);
+    const { seen, off } = captureToasts();
+    const user = await selectAllInList();
+    await user.click(screen.getByRole('button', { name: 'Mark done' }));
+    await waitFor(() => expect(moveTask).toHaveBeenCalledWith('task-plain101', 'done'));
+    expect(moveTask).toHaveBeenCalledTimes(1);
+    expect(seen.filter((t) => t.message === SKIPPED)).toHaveLength(1);
+    expect(seen.filter((t) => /exploration/i.test(t.message))).toHaveLength(1);
+    off();
+  });
+});
+
+describe('TaskBoardPage — batch polish (L2 round 7)', () => {
+  const D1 = task({ id: 'task-disc0201', title: 'Exploration X', status: 'queued' as never, kind: 'discovery' });
+  const D2 = task({ id: 'task-disc0202', title: 'Exploration Y', status: 'queued' as never, kind: 'discovery' });
+  const P1 = task({ id: 'task-plain201', title: 'Plain X', status: 'todo' });
+  const SKIPPED_2 = '2 code explorations were skipped — they are managed in the exploration section of the Goals page.';
+  const SKIPPED_1 = '1 code exploration was skipped — it is managed in the exploration section of the Goals page.';
+
+  async function selectInList(rows: TaskInfo[]) {
+    mockWsClient.call.mockResolvedValue({ tasks: rows, agents: AGENTS, events: [] });
+    useTasksStore.setState({ tasks: rows, loading: false, error: null });
+    localStorage.setItem('duduclaw:tasks:view', 'list');
+    renderWithProviders(<TaskBoardPage />);
+    const user = userEvent.setup();
+    for (const r of rows) {
+      const row = (await screen.findByText(r.title)).closest('li') as HTMLElement;
+      await user.click(within(row).getByRole('checkbox'));
+    }
+    return user;
+  }
+
+  it('bulk delete with ONLY discovery selected: no confirmation dialog, one toast, selection cleared', async () => {
+    const removeTask = vi.fn();
+    useTasksStore.setState({ removeTask } as never);
+    const { seen, off } = captureToasts();
+    const user = await selectInList([D1, D2]);
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(seen.filter((t) => t.message === SKIPPED_2)).toHaveLength(1);
+    expect(removeTask).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: 'Mark done' })).toBeNull(); // toolbar gone = selection cleared
+    off();
+  });
+
+  it('bulk mark-done with ONLY discovery selected: one toast, nothing written', async () => {
+    const moveTask = vi.fn();
+    useTasksStore.setState({ moveTask } as never);
+    const { seen, off } = captureToasts();
+    const user = await selectInList([D1, D2]);
+    await user.click(screen.getByRole('button', { name: 'Mark done' }));
+    expect(moveTask).not.toHaveBeenCalled();
+    expect(seen.filter((t) => t.message === SKIPPED_2)).toHaveLength(1);
+    off();
+  });
+
+  it('a retry after a partial delete failure does not repeat the skipped toast', async () => {
+    const removeTask = vi.fn(async () => {
+      useTasksStore.setState({ error: new Error('boom') });
+    });
+    useTasksStore.setState({ removeTask } as never);
+    const { seen, off } = captureToasts();
+    const user = await selectInList([D1, P1]);
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+    let dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(removeTask).toHaveBeenCalledTimes(1));
+    dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(removeTask).toHaveBeenCalledTimes(2));
+    expect(seen.filter((t) => t.message === SKIPPED_1)).toHaveLength(1);
+    off();
   });
 });

@@ -1,4 +1,13 @@
 import { client } from './ws-client';
+import {
+  fanOutByAgent,
+  mergeById,
+  mergeFlowMetrics,
+  byPinnedThenUpdated,
+  byUpdatedDesc,
+  byTimestampDesc,
+  type PartialFanOut,
+} from './agent-fanout';
 import { migrateScanArgs, migrateApplyArgs } from './migrate';
 import type { RunDetail, RunSummary } from './run-transcript';
 
@@ -689,7 +698,12 @@ export type TaskStatus =
   | 'needs_human'
   | 'failed'
   | 'pending'
-  | 'cancelled';
+  | 'cancelled'
+  // Discovery rows (`kind: "discovery"`) in `tasks.list`: waiting for the
+  // operator's approval / waiting for a worker. Display-only — never written
+  // by the UI (`WritableStatus` stays the four board statuses).
+  | 'pending_approval'
+  | 'queued';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'urgent';
 
 /** H11 — why a goal task is parked `needs_human`. Mirrors the Rust
@@ -705,6 +719,8 @@ export type PauseReasonToken =
   | 'unknown';
 
 export interface TaskInfo {
+  /** Discovery is orchestrated separately from the ordinary goal worker. */
+  kind?: 'task' | 'goal' | 'discovery';
   id: string;
   title: string;
   description: string;
@@ -2556,6 +2572,13 @@ export interface RuntimeDetect {
   grok?: boolean;
   claude_oauth: boolean;
   claude_subscription: string | null;
+  /** Per-runtime rows; deprecation fields are absent on older gateways. */
+  runtimes?: Array<{
+    id?: string;
+    deprecated?: boolean;
+    replacement?: string | null;
+    remove_in?: string | null;
+  }>;
 }
 
 /** Providers `runtime.install` knows how to install (hard-coded gateway whitelist). */
@@ -3172,6 +3195,9 @@ export interface IdentityResolveResult {
 
 // ── CAP: per-agent [capabilities] ───────────────────────────────
 
+// 'native' (driving the host desktop) was removed server-side. It can still be
+// returned for an employee saved with it; the dashboard shows it as removed
+// and never offers it as a new choice.
 export type ComputerUseMode = 'container' | 'native' | 'auto';
 
 export interface ComputerUseConfig {
@@ -4860,6 +4886,9 @@ export const api = {
         /** Save-time auto-align: provider the gateway rewrote `[runtime]` to
          *  (model↔provider family mismatch), or null when untouched. */
         runtime_provider_aligned?: string | null;
+        /** Set ("deprecated_runtime") when the inferred runtime is deprecated and
+         *  the gateway deliberately left `[runtime] provider` untouched. */
+        runtime_provider_align_skipped?: string | null;
       }>,
     /** WP4 — soft-delete: the AI staff member is hidden from every list but its
      *  data is retained on disk (not recoverable via the UI). */
@@ -6355,7 +6384,14 @@ export const api = {
       agent_id?: string;
       priority?: TaskPriority;
       goal_mode?: boolean;
-    }) => client.call('tasks.list', filters ?? {}) as Promise<{ tasks: TaskInfo[] }>,
+    }) =>
+      // Non-admins must scope by agent_id (gateway `check_agent_filter!`):
+      // an un-scoped listing fans out over the viewer's agents (L2).
+      fanOutByAgent(
+        filters,
+        (p) => client.call('tasks.list', p) as Promise<{ tasks: TaskInfo[] }>,
+        (rs) => ({ tasks: mergeById(rs.map((r) => r.tasks ?? []), byPinnedThenUpdated) }),
+      ),
     create: (params: TaskCreateParams) =>
       client.call('tasks.create', { ...params }) as Promise<{ task: TaskInfo }>,
     update: (taskId: string, fields: TaskUpdateParams) =>
@@ -6385,8 +6421,14 @@ export const api = {
       client.call('tasks.role_turns', { task_id: taskId }) as Promise<TaskRoleTurns>,
     // Iterative Kanban: per-agent + board flow metrics. Non-admins pass an
     // agent_id and see only that agent's slice.
+    // Non-admins without an agent fan out over their bound agents (L2);
+    // `null` = a non-admin with no agents (board renders without a gauge).
     flowMetrics: (agentId?: string) =>
-      client.call('tasks.flow_metrics', agentId ? { agent_id: agentId } : {}) as Promise<FlowMetrics>,
+      fanOutByAgent(
+        agentId ? { agent_id: agentId } : undefined,
+        (p) => client.call('tasks.flow_metrics', p) as Promise<FlowMetrics | null>,
+        mergeFlowMetrics,
+      ) as Promise<(FlowMetrics & PartialFanOut) | null>,
     // ── Goal-loop management (/goals page, 2026-08-14) ────────
     /** Assign an autonomous goal from the dashboard — same semantics as the
      *  channel `/goal` command (goal_mode task, judge loop, needs_human
@@ -6487,7 +6529,11 @@ export const api = {
   // the user (here) and the agent (plan_get / plan_update_step MCP) edit.
   plans: {
     list: (filters?: { agent_id?: string; status?: PlanStatus }) =>
-      client.call('plans.list', filters ?? {}) as Promise<{ plans: PlanInfo[] }>,
+      fanOutByAgent(
+        filters,
+        (p) => client.call('plans.list', p) as Promise<{ plans: PlanInfo[] }>,
+        (rs) => ({ plans: mergeById(rs.map((r) => r.plans ?? []), byUpdatedDesc) }),
+      ),
     get: (planId: string) =>
       client.call('plans.get', { plan_id: planId }) as Promise<{ plan: PlanInfo; steps: PlanStep[] }>,
     create: (params: PlanCreateParams) =>
@@ -6518,8 +6564,27 @@ export const api = {
       }) as Promise<{ dismissed: boolean; decision_id: string }>,
   },
   activity: {
+    /**
+     * Activity feed. Non-admins without `agent_id` fan out over their bound
+     * agents (see `agent-fanout.ts`); the merged result is each agent's newest
+     * `limit` events re-sorted by `timestamp DESC` and cut to `limit`, with
+     * `total` summed and `partial_error` set when some agents failed.
+     *
+     * Paging caveat: on that fanned-out path `offset` is forwarded to EVERY
+     * agent, so `offset > 0` does not page the merged feed — it skips `offset`
+     * rows per agent. Page only with an explicit `agent_id` (or as admin).
+     * The `limit ?? 20` cut mirrors the server default in
+     * `crates/duduclaw-gateway/src/handlers/activity_timeline_rpc.rs`.
+     */
     list: (params?: { agent_id?: string; type?: ActivityType; limit?: number; offset?: number }) =>
-      client.call('activity.list', params ?? {}) as Promise<{ events: ActivityEvent[]; total: number }>,
+      fanOutByAgent(
+        params,
+        (p) => client.call('activity.list', p) as Promise<{ events: ActivityEvent[]; total: number }>,
+        (rs) => ({
+          events: mergeById(rs.map((r) => r.events ?? []), byTimestampDesc).slice(0, params?.limit ?? 20),
+          total: rs.reduce((n, r) => n + (r.total ?? 0), 0),
+        }),
+      ),
     subscribe: () =>
       client.call('activity.subscribe'),
     // No unsubscribe: the backend broadcasts activity events to every

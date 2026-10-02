@@ -4,6 +4,7 @@ import { api, type ApprovalItem, type TaskInfo, type UnifiedAuditEvent } from '@
 import { Skeleton } from '@/components/mds';
 import { cn } from '@/lib/utils';
 import { useSharedLeaderQuery } from '@/hooks/useSharedLeaderQuery';
+import { PartialLoadNotice } from '@/components/PartialLoadNotice';
 import {
   buildAttentionItems,
   countStandbyAgents,
@@ -32,6 +33,9 @@ interface RawOverviewData {
   approvals: ApprovalItem[];
   needsHumanTasks: TaskInfo[];
   channelFailures: UnifiedAuditEvent[];
+  /** L2: the needs_human query came back partial (a bound agent failed).
+   *  A boolean, not the error — this payload is shared across tabs. */
+  tasksPartial: boolean;
 }
 
 async function fetchOverviewData(): Promise<RawOverviewData> {
@@ -44,6 +48,9 @@ async function fetchOverviewData(): Promise<RawOverviewData> {
     approvals: approvalsRes?.approvals ?? [],
     needsHumanTasks: tasksRes?.tasks ?? [],
     channelFailures: auditRes?.events ?? [],
+    // A total failure of this query is at least as incomplete as a partial
+    // one — never let it read as a calm "0 waiting for you".
+    tasksPartial: tasksRes == null || tasksRes.partial_error != null,
   };
 }
 
@@ -123,7 +130,8 @@ export function HealthOverview({ agents, enabled }: HealthOverviewProps) {
   }, [data, nameOf, intl]);
 
   const counts = useMemo(() => overviewCounts(countStandbyAgents(agents), items), [agents, items]);
-  const clear = isAllClear(counts);
+  // Never claim "all clear" while the needs_human query is incomplete.
+  const clear = isAllClear(counts) && !data?.tasksPartial;
   const severe = counts.undelivered > 0;
 
   const separator = intl.formatMessage({ id: 'home.overview.separator' });
@@ -166,7 +174,9 @@ export function HealthOverview({ agents, enabled }: HealthOverviewProps) {
         </div>
       )}
 
-      <NeedsAttentionList items={items.slice(0, ROW_CAP)} total={items.length} />
+      {data?.tasksPartial && <PartialLoadNotice />}
+
+      <NeedsAttentionList items={items.slice(0, ROW_CAP)} total={items.length} incomplete={!!data?.tasksPartial} />
     </div>
   );
 }

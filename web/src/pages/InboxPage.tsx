@@ -13,6 +13,7 @@ import {
 import { api, type ApprovalItem, type TaskInfo, type DecisionInfo, type InstallRequestInfo } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useApprovalsStore } from '@/stores/approvals-store';
+import { useAuthStore } from '@/stores/auth-store';
 import { excludeRecoveredChannelFailures, channelFailureChannel } from '@/lib/home-overview';
 import { toast, formatError } from '@/lib/toast';
 import { cn } from '@/lib/utils';
@@ -80,6 +81,8 @@ import {
   READ_KEY,
   ARCHIVED_KEY,
   PROCESSED_KEY,
+  inboxSourcesDeniedFor,
+  type InboxRoleGatedSource,
 } from '@/lib/inbox-model';
 
 /** How many agents to poll for open decisions (best-effort, capped). */
@@ -165,9 +168,18 @@ export function InboxPage() {
       if (firstFailure == null) firstFailure = e;
       return null;
     };
+    // L2: a source the gateway refuses for this viewer's role is skipped, not
+    // called — its denial is expected and must not raise the partial-load
+    // banner. Every other failure (incl. a denial the role should NOT get)
+    // still goes through `note`.
+    const denied = inboxSourcesDeniedFor(useAuthStore.getState().user?.role);
+    const unlessDenied = <T,>(src: InboxRoleGatedSource, run: () => Promise<T>) =>
+      denied.has(src) ? Promise.resolve(null) : run().catch(note);
     const [approvalsRes, budgetRes, tasksRes, needsHumanRes, agentsRes, failedRes, installRes] = await Promise.all([
-      api.approvals.list().catch(note),
-      api.budget.incidents().catch(note),
+      unlessDenied('approvals', () => api.approvals.list()),
+      unlessDenied('budget', () => api.budget.incidents()),
+      // Non-admins: `tasks.list` fans out over the viewer's bound agents
+      // (gateway agent_id contract) inside the API layer.
       api.tasks.list({ status: 'blocked' }).catch(note),
       // W1-2: a goal-loop task escalated to needs_human is a distinct status
       // from plain `blocked` (task_store.rs) — the Inbox previously never
@@ -175,12 +187,15 @@ export function InboxPage() {
       // the kind of "等你決定" item this page exists for (04 doc §D.6).
       api.tasks.list({ status: 'needs_human' }).catch(note),
       api.agents.list().catch(note),
-      api.audit.unifiedLog({ sources: ['channel_failure'], limit: FAILED_RUN_CAP }).catch(note),
+      unlessDenied('failedRuns', () => api.audit.unifiedLog({ sources: ['channel_failure'], limit: FAILED_RUN_CAP })),
       // Install approval requests actionable by this viewer (manager/admin).
-      // Employees get 403 → null and simply see no install rows (Bug#3).
-      // Employees get 403 here by design — an expected denial, not an outage.
-      api.installRequests.list().catch(() => null),
+      // Employees are refused by design (Bug#3) — skipped via `unlessDenied`.
+      unlessDenied('installs', () => api.installRequests.list()),
     ]);
+    // L2: a fanned-out task list can come back partial (one bound agent's
+    // request failed) — keep its rows, but say part of the Inbox is missing.
+    if (tasksRes?.partial_error != null) note(tasksRes.partial_error);
+    if (needsHumanRes?.partial_error != null) note(needsHumanRes.partial_error);
     setLoadError(firstFailure);
 
     const nameMap: Record<string, string> = {};

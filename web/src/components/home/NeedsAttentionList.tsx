@@ -39,9 +39,12 @@ export interface NeedsAttentionListProps {
   items: readonly InboxItem[];
   /** Full count, for the "查看全部" affordance and the overflow hint. */
   total: number;
+  /** A source failed to load — an empty list then means "unknown", so the
+   *  calm "nothing needs you / all running fine" empty state is withheld. */
+  incomplete?: boolean;
 }
 
-export function NeedsAttentionList({ items, total }: NeedsAttentionListProps) {
+export function NeedsAttentionList({ items, total, incomplete = false }: NeedsAttentionListProps) {
   const intl = useIntl();
   const overflow = total - items.length;
 
@@ -62,7 +65,7 @@ export function NeedsAttentionList({ items, total }: NeedsAttentionListProps) {
         )}
       </CardHeader>
 
-      {items.length === 0 ? (
+      {items.length === 0 && incomplete ? null : items.length === 0 ? (
         <Empty
           icon={CheckCircle2}
           title={intl.formatMessage({ id: 'home.overview.attention.emptyTitle' })}

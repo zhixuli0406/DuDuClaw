@@ -306,3 +306,13 @@ describe('GoalsPage — I-3b 已結束 pagination (no more hard 20-item cutoff)'
     expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument();
   });
 });
+
+it('keeps discovery tasks out of ordinary goal cards even when a legacy row has goal_mode set', async () => {
+  const original=mockWsClient.call.getMockImplementation();
+  mockWsClient.call.mockImplementation((method:string,...params:unknown[])=>method==='tasks.list'
+    ? Promise.resolve({tasks:[goalTask,{...goalTask,id:'discovery-legacy',title:'Must not use goal intervention',kind:'discovery',goal_mode:true}]})
+    : original?.(method,...params));
+  renderWithProviders(<GoalsPage />);
+  expect(await screen.findByText('整理客戶月報')).toBeInTheDocument();
+  expect(screen.queryByText('Must not use goal intervention')).not.toBeInTheDocument();
+});

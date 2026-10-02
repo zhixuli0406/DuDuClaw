@@ -1,6 +1,7 @@
 import { Suspense, useEffect } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router';
 import { AppSidebar } from './AppSidebar';
+import { RouteErrorBoundary } from './RouteErrorBoundary';
 import { crumbsFor } from './nav-model';
 import { MobileBottomNav } from './MobileBottomNav';
 import { GuidedTour } from '@/components/tour/GuidedTour';
@@ -156,9 +157,11 @@ function AppShell() {
           </div>
           {/* Re-key on route change to replay the entrance reveal */}
           <div key={location.pathname} className="page-enter flex flex-1 flex-col p-4 pb-20 md:p-6 md:pb-6">
-            <Suspense fallback={<RouteFallback />}>
-              <Outlet />
-            </Suspense>
+            <RouteErrorBoundary resetKey={location.pathname}>
+              <Suspense fallback={<RouteFallback />}>
+                <Outlet />
+              </Suspense>
+            </RouteErrorBoundary>
           </div>
         </div>
       </SidebarInset>

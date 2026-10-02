@@ -40,3 +40,20 @@ describe('<StatusIcon>', () => {
     expect(screen.getByRole('img', { name: 'Cancelled' })).toBeInTheDocument();
   });
 });
+
+describe('<StatusIcon> unknown key (L2 round 4)', () => {
+  it('falls back to a safe glyph + label instead of rendering an undefined component', () => {
+    renderWithProviders(<StatusIcon status={'pending_approval' as never} />);
+    expect(screen.getByRole('img', { name: 'To do' })).toBeInTheDocument();
+  });
+});
+
+describe('<StatusIcon> null / undefined at runtime (L2 round 7)', () => {
+  it('renders the safe glyph for both', () => {
+    const { unmount } = renderWithProviders(<StatusIcon status={null as never} />);
+    expect(screen.getByRole('img', { name: 'To do' })).toBeInTheDocument();
+    unmount();
+    renderWithProviders(<StatusIcon status={undefined as never} />);
+    expect(screen.getByRole('img', { name: 'To do' })).toBeInTheDocument();
+  });
+});

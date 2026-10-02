@@ -104,3 +104,132 @@ describe('InboxPage deep link (W2-5 H5, ?item=<id>)', () => {
     });
   });
 });
+
+// ── L2: non-admin viewers (agent_id contract + role-expected denials) ──
+import { useAuthStore, type UserRole } from '@/stores/auth-store';
+
+/** Simulates the real gateway's per-role answers (verified live, L2). */
+function gatewayFor(role: UserRole, overrides: Record<string, () => Promise<unknown>> = {}) {
+  const denied: Record<UserRole, string[]> = {
+    admin: [],
+    manager: ['audit.unified_log'],
+    employee: ['approvals.list', 'budget.incidents', 'audit.unified_log', 'install_requests.list'],
+  };
+  return (method: string, params?: Record<string, unknown>) => {
+    if (overrides[method]) return overrides[method]();
+    if (denied[role].includes(method)) return Promise.reject(new Error('permission denied'));
+    if (method === 'tasks.list') {
+      if (role !== 'admin' && !params?.agent_id) {
+        return Promise.reject(new Error('agent_id parameter is required'));
+      }
+      const status = params?.status as string;
+      return Promise.resolve({
+        tasks: [
+          {
+            id: `${status}-1`,
+            title: `Stuck ${status} task`,
+            description: '',
+            status,
+            priority: 'medium',
+            assigned_to: 'discovery-live',
+            created_by: 'x',
+            created_at: '2026-09-30T00:00:00Z',
+            updated_at: '2026-09-30T00:00:00Z',
+          },
+        ],
+      });
+    }
+    if (method === 'agents.list') {
+      return Promise.resolve({ agents: [{ name: 'discovery-live', display_name: 'Discovery Live' }] });
+    }
+    if (method === 'decisions.list') return Promise.resolve({ decisions: [] });
+    return Promise.resolve({});
+  };
+}
+
+function signIn(role: UserRole) {
+  useAuthStore.setState({
+    user: { id: 'u1', email: 'u@x', display_name: 'U', role, status: 'active' },
+    bindings: [{ user_id: 'u1', agent_name: 'discovery-live', access_level: 'operator', bound_at: '2026-09-01T00:00:00Z' }],
+    isAuthenticated: true,
+  });
+}
+
+describe('InboxPage for non-admin viewers (L2)', () => {
+  beforeEach(() => {
+    useConnectionStore.setState({ state: 'authenticated' as never, error: null });
+  });
+
+  it('manager: lists blocked + needs_human tasks of bound agents, no error banner', async () => {
+    signIn('manager');
+    mockWsClient.call.mockImplementation(gatewayFor('manager'));
+    renderAt('/inbox');
+    await waitFor(() => {
+      expect(screen.getAllByText('Stuck needs_human task').length).toBeGreaterThan(0);
+    });
+    expect(screen.getAllByText('Stuck blocked task').length).toBeGreaterThan(0);
+    expect(screen.queryByText("Some items couldn't be loaded")).toBeNull();
+  });
+
+  it('employee: role-expected denials raise no banner', async () => {
+    signIn('employee');
+    mockWsClient.call.mockImplementation(gatewayFor('employee'));
+    renderAt('/inbox');
+    await waitFor(() => {
+      expect(screen.getAllByText('Stuck needs_human task').length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByText("Some items couldn't be loaded")).toBeNull();
+  });
+
+  it('employee: an unexpected failure still raises the banner', async () => {
+    signIn('employee');
+    mockWsClient.call.mockImplementation(
+      gatewayFor('employee', { 'agents.list': () => Promise.reject(new Error('network down')) }),
+    );
+    renderAt('/inbox');
+    await waitFor(() => {
+      expect(screen.getByText("Some items couldn't be loaded")).toBeInTheDocument();
+    });
+  });
+
+  it('manager: a denial NOT expected for the role still raises the banner', async () => {
+    signIn('manager');
+    mockWsClient.call.mockImplementation(
+      gatewayFor('manager', { 'approvals.list': () => Promise.reject(new Error('permission denied')) }),
+    );
+    renderAt('/inbox');
+    await waitFor(() => {
+      expect(screen.getByText("Some items couldn't be loaded")).toBeInTheDocument();
+    });
+  });
+});
+
+describe('InboxPage fan-out partial failure (L2 round 2)', () => {
+  beforeEach(() => {
+    useConnectionStore.setState({ state: 'authenticated' as never, error: null });
+  });
+
+  it('manager with two agents: one agent failing keeps the other agent\'s tasks AND shows the banner', async () => {
+    useAuthStore.setState({
+      user: { id: 'u1', email: 'u@x', display_name: 'U', role: 'manager', status: 'active' },
+      bindings: [
+        { user_id: 'u1', agent_name: 'ok-agent', access_level: 'viewer', bound_at: '2026-09-01T00:00:00Z' },
+        { user_id: 'u1', agent_name: 'bad-agent', access_level: 'viewer', bound_at: '2026-09-01T00:00:00Z' },
+      ],
+      isAuthenticated: true,
+    });
+    const base = gatewayFor('manager');
+    mockWsClient.call.mockImplementation((method: string, params?: Record<string, unknown>) => {
+      if (method === 'tasks.list' && params?.agent_id === 'bad-agent') {
+        return Promise.reject(new Error('backend hiccup'));
+      }
+      return base(method, params);
+    });
+    renderAt('/inbox');
+    await waitFor(() => {
+      expect(screen.getAllByText('Stuck needs_human task').length).toBeGreaterThan(0);
+    });
+    expect(screen.getAllByText('Stuck blocked task').length).toBeGreaterThan(0);
+    expect(screen.getByText("Some items couldn't be loaded")).toBeInTheDocument();
+  });
+});
