@@ -532,5 +532,24 @@ pub fn create_from_config(config: &toml::Table) -> AccountRotator {
     let rotation = config.get("rotation").and_then(|v| v.as_table());
     let strategy_str = rotation.and_then(|r| r.get("strategy")).and_then(|v| v.as_str()).unwrap_or("priority");
     let cooldown = rotation.and_then(|r| r.get("cooldown_after_rate_limit_seconds")).and_then(|v| v.as_integer()).unwrap_or(120) as u64;
-    AccountRotator::new(RotationStrategy::from_str(strategy_str), cooldown)
+    let rotator = AccountRotator::new(RotationStrategy::from_str(strategy_str), cooldown);
+    let inherit = host_credentials_policy(config).unwrap_or_else(|error| {
+        warn!(error, "Invalid account loading policy — ambient credentials disabled");
+        false
+    });
+    rotator.inherit_host_credentials.store(inherit, Ordering::Relaxed);
+    rotator
+}
+
+/// Missing settings preserve host inheritance; malformed settings must never
+/// turn an intended opt-out back into automatic credential discovery.
+pub(super) fn host_credentials_policy(config: &toml::Table) -> Result<bool, String> {
+    let Some(section) = config.get("account_loading") else { return Ok(true); };
+    let table = section.as_table()
+        .ok_or_else(|| "account_loading must be a table".to_string())?;
+    match table.get("inherit_host_credentials") {
+        None => Ok(true),
+        Some(value) => value.as_bool()
+            .ok_or_else(|| "account_loading.inherit_host_credentials must be a boolean".to_string()),
+    }
 }

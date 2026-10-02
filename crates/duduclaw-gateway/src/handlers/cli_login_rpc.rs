@@ -39,18 +39,10 @@ impl MethodHandler {
         let spec = match crate::cli_auth::spec_for(runtime) {
             Some(s) => s,
             None => {
-                // API-key-only runtimes (openai_compat, qwen, vibe): naming the
-                // key variable turns a dead end into an actionable answer.
-                let key_hint = runtime
-                    .spec()
-                    .auth
-                    .api_key_env
-                    .map(|e| format!(" — set {e} instead"))
-                    .unwrap_or_default();
-                return WsFrame::error_response(
-                    "",
-                    &format!("'{runtime_str}' has no interactive login (use an API key{key_hint})"),
-                );
+                // Runtimes with no scriptable login (openai_compat, qwen, vibe,
+                // antigravity): naming the key variable AND the catalog's
+                // login hint turns a dead end into an actionable answer.
+                return WsFrame::error_response("", &no_login_message(runtime_str, runtime.spec()));
             }
         };
 
@@ -293,5 +285,47 @@ impl MethodHandler {
             }
             other => other, // propagate the accounts.add error verbatim
         }
+    }
+}
+
+/// Error text for `auth.cli_login.start` on a runtime with no scriptable login:
+/// the API-key variable plus the catalog's zh-TW login hint, so the answer for
+/// e.g. Antigravity says what to actually do (run `agy` in a terminal, or use
+/// API-key mode) instead of only "no interactive login".
+fn no_login_message(
+    runtime_str: &str,
+    spec: &duduclaw_core::runtime_catalog::RuntimeSpec,
+) -> String {
+    let key_hint = spec
+        .auth
+        .api_key_env
+        .map(|e| format!(" — set {e} instead"))
+        .unwrap_or_default();
+    let login_hint = spec
+        .auth
+        .login_hint
+        .map(|h| format!("。{}", h.zh_tw))
+        .unwrap_or_default();
+    format!("'{runtime_str}' has no interactive login (use an API key{key_hint}){login_hint}")
+}
+
+#[cfg(test)]
+mod no_login_message_tests {
+    use super::no_login_message;
+    use duduclaw_core::types::RuntimeType;
+
+    #[test]
+    fn antigravity_answer_names_the_key_and_the_terminal_sign_in() {
+        let msg = no_login_message("antigravity", RuntimeType::Antigravity.spec());
+        assert!(msg.contains("GEMINI_API_KEY"), "{msg}");
+        assert!(msg.contains("`agy`"), "{msg}");
+        assert!(msg.contains("[antigravity] auth"), "{msg}");
+        assert!(!msg.contains("ANTIGRAVITY_API_KEY"), "{msg}");
+    }
+
+    #[test]
+    fn a_runtime_without_a_hint_keeps_the_key_only_message() {
+        let msg = no_login_message("openai_compat", RuntimeType::OpenAiCompat.spec());
+        assert!(msg.starts_with("'openai_compat' has no interactive login"), "{msg}");
     }
 }

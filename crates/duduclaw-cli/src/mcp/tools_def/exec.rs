@@ -26,7 +26,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "execute_program",
-        description: "Execute a program that can call DuDuClaw MCP tools via RPC. Only final stdout enters context.",
+        description: "Run a python, bash or javascript script in an offline, non-root container and return its output. The script cannot call DuDuClaw tools. Only final stdout enters context.",
         params: &[
             ParamDef {
                 name: "code",
@@ -100,42 +100,38 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "computer_screenshot",
-        description: "Capture a screenshot of the virtual display (L5 container) or host screen (L5b native). Returns base64-encoded PNG. Requires computer_use capability.",
-        params: &[ParamDef {
-            name: "display",
-            description: "Which display to capture: 'container' (default) or 'native'",
-            required: false,
-        }],
+        description: "See your computer-use session: returns a PNG image (sensitive areas masked) plus actions used and time left. Actions never return a screenshot; call this to check.",
+        params: &[],
     },
     ToolDef {
         name: "computer_click",
-        description: "Click at specific coordinates on the screen. Requires computer_use capability.",
+        description: "Click in your computer-use session at screenshot pixel (x, y). Left button by default; button='right', or double=true for a left double-click.",
         params: &[
             ParamDef {
                 name: "x",
-                description: "X coordinate",
+                description: "X pixel from the left edge (0-based, within the display width)",
                 required: true,
             },
             ParamDef {
                 name: "y",
-                description: "Y coordinate",
+                description: "Y pixel from the top edge (0-based, within the display height)",
                 required: true,
             },
             ParamDef {
                 name: "button",
-                description: "Mouse button: 'left' (default), 'right', 'middle'",
+                description: "'left' (default) or 'right'",
                 required: false,
             },
             ParamDef {
                 name: "double",
-                description: "Double-click if true (default: false)",
+                description: "true for a double-click (left button only)",
                 required: false,
             },
         ],
     },
     ToolDef {
         name: "computer_type",
-        description: "Type text at the current cursor position. Requires computer_use capability.",
+        description: "Type text into the focused element of your computer-use session (max 2,000 characters). Risky input may need a person to confirm in the chat.",
         params: &[ParamDef {
             name: "text",
             description: "Text to type",
@@ -144,67 +140,76 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "computer_key",
-        description: "Press a key combination (e.g., 'ctrl+s', 'Return', 'Tab'). Requires computer_use capability.",
+        description: "Press a key or key combination in your computer-use session, e.g. 'Return', 'Tab', 'ctrl+s'. Letters, digits, '+', '-', '_' only.",
         params: &[ParamDef {
             name: "key",
-            description: "Key combination (e.g., 'ctrl+c', 'Return', 'alt+Tab')",
+            description: "Key or combination, e.g. 'Return', 'ctrl+c', 'alt+Tab'",
             required: true,
         }],
     },
     ToolDef {
         name: "computer_scroll",
-        description: "Scroll at specific coordinates. Requires computer_use capability.",
+        description: "Scroll in your computer-use session with the pointer at pixel (x, y).",
         params: &[
             ParamDef {
                 name: "x",
-                description: "X coordinate",
+                description: "X pixel from the left edge",
                 required: true,
             },
             ParamDef {
                 name: "y",
-                description: "Y coordinate",
+                description: "Y pixel from the top edge",
                 required: true,
             },
             ParamDef {
                 name: "direction",
-                description: "Scroll direction: 'up' or 'down' (default: 'down')",
+                description: "'up' or 'down' (default)",
                 required: false,
             },
             ParamDef {
                 name: "amount",
-                description: "Number of scroll clicks (default: 3)",
+                description: "Scroll clicks, 1-20 (default 3)",
                 required: false,
             },
         ],
     },
     ToolDef {
         name: "computer_session_start",
-        description: "Start a new Computer Use session with a virtual display container. Returns session_id on success. Requires computer_use capability.",
+        description: "Start your own computer-use session: a virtual display in an isolated container; network only to allowlisted sites. One per employee; ends on stop, after 2 idle minutes, or at its limits.",
         params: &[
             ParamDef {
                 name: "task",
-                description: "Description of what to accomplish",
-                required: true,
+                description: "What the session is for (kept in the audit log)",
+                required: false,
             },
             ParamDef {
                 name: "width",
-                description: "Display width in pixels (default: 1280)",
+                description: "Display width in pixels, 320-1920 (default from agent.toml, usually 1280)",
                 required: false,
             },
             ParamDef {
                 name: "height",
-                description: "Display height in pixels (default: 800)",
+                description: "Display height in pixels, 240-1200 (default from agent.toml, usually 800)",
                 required: false,
             },
         ],
     },
     ToolDef {
+        name: "computer_navigate",
+        description: "Open an https:// page in your computer-use session's browser. Only sites on your allowlist (listed at session start) are reachable. Counts as one action.",
+        params: &[ParamDef {
+            name: "url",
+            description: "Full https:// URL whose host is on your allowlist, e.g. https://example.com/page",
+            required: true,
+        }],
+    },
+    ToolDef {
         name: "computer_session_stop",
-        description: "Stop an active Computer Use session and clean up the container.",
+        description: "Stop your computer-use session and remove its container. Call it when you are done.",
         params: &[ParamDef {
             name: "session_id",
-            description: "Session ID returned by computer_session_start",
-            required: true,
+            description: "Optional; defaults to your active session",
+            required: false,
         }],
     },
     ToolDef {

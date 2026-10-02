@@ -109,14 +109,65 @@ pub(crate) fn detect_claude_oauth_from_file() -> Option<(bool, Option<String>)> 
     None
 }
 
+/// One deprecated runtime value that a dashboard write put into
+/// `agent.toml [runtime]` (R1, 2026-10). The write itself succeeds; the
+/// caller turns each of these into a `runtime_provider_deprecated` audit row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeprecatedRuntimeWrite {
+    /// `"provider"` or `"fallback"`.
+    pub field: &'static str,
+    /// Canonical runtime id that was written.
+    pub value: &'static str,
+    pub replacement: &'static str,
+    pub remove_in: &'static str,
+}
+
+impl DeprecatedRuntimeWrite {
+    fn for_value(field: &'static str, v: &str) -> Option<Self> {
+        let rt = duduclaw_core::types::RuntimeType::from_id(v)?;
+        let dep = rt.deprecation()?;
+        Some(Self {
+            field,
+            value: rt.as_str(),
+            replacement: dep.replacement,
+            remove_in: dep.remove_in,
+        })
+    }
+}
+
+/// [`apply_runtime_to_table_reporting`]'s result: the human-readable change
+/// list plus every deprecated value written.
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeApplyOutcome {
+    pub changes: Vec<String>,
+    pub deprecated: Vec<DeprecatedRuntimeWrite>,
+}
+
 /// Validate + write the `[runtime]` section from the `runtime` params object.
 /// Fields: `provider` (enum), `fallback` (string). (RT.1)
+///
+/// Test-facing shorthand; production calls
+/// [`apply_runtime_to_table_reporting`] so deprecated writes get audited.
+#[cfg(test)]
 pub(crate) fn apply_runtime_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec<String>, String> {
+    apply_runtime_to_table_reporting(table, params).map(|o| o.changes)
+}
+
+/// [`apply_runtime_to_table`], additionally reporting which written values
+/// newly name a deprecated runtime (a value equal to the stored one is not
+/// reported). The write is identical either way — a
+/// deprecated runtime is still accepted (deprecation policy: old values keep
+/// working until the removal version).
+pub(crate) fn apply_runtime_to_table_reporting(
+    table: &mut toml::Table,
+    params: &Value,
+) -> Result<RuntimeApplyOutcome, String> {
     let mut changes: Vec<String> = Vec::new();
+    let mut deprecated: Vec<DeprecatedRuntimeWrite> = Vec::new();
 
     let rt = match params.get("runtime").and_then(|v| v.as_object()) {
         Some(r) => r,
-        None => return Ok(changes),
+        None => return Ok(RuntimeApplyOutcome::default()),
     };
 
     let section = table
@@ -124,6 +175,19 @@ pub(crate) fn apply_runtime_to_table(table: &mut toml::Table, params: &Value) ->
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
         .as_table_mut()
         .ok_or_else(|| "Invalid [runtime] section".to_string())?;
+    // A deprecated value is reported only when this write introduces it
+    // (new or changed): re-saving an agent that already runs `gemini` while
+    // editing an unrelated field is not a fresh decision to audit.
+    let stored = |section: &toml::Table, key: &str| {
+        section
+            .get(key)
+            .and_then(|v| v.as_str())
+            .and_then(duduclaw_core::types::RuntimeType::parse)
+            .map(|rt| rt.as_str())
+    };
+    let introduces = |previous: Option<&'static str>, v: &str| {
+        duduclaw_core::types::RuntimeType::from_id(v).map(|rt| rt.as_str()) != previous
+    };
 
     if let Some(v) = rt.get("provider").and_then(|v| v.as_str()) {
         if !is_valid_runtime_provider(v) {
@@ -132,8 +196,12 @@ pub(crate) fn apply_runtime_to_table(table: &mut toml::Table, params: &Value) ->
                 valid_runtime_providers_display()
             ));
         }
+        let previous = stored(section, "provider");
         section.insert("provider".into(), toml::Value::String(v.into()));
         changes.push(format!("runtime.provider = \"{v}\""));
+        if introduces(previous, v) {
+            deprecated.extend(DeprecatedRuntimeWrite::for_value("provider", v));
+        }
     }
     if let Some(v) = rt.get("fallback").and_then(|v| v.as_str()) {
         let v = v.trim();
@@ -148,11 +216,66 @@ pub(crate) fn apply_runtime_to_table(table: &mut toml::Table, params: &Value) ->
                     valid_runtime_providers_display()
                 ));
             }
+            let previous = stored(section, "fallback");
             section.insert("fallback".into(), toml::Value::String(v.into()));
             changes.push(format!("runtime.fallback = \"{v}\""));
+            if introduces(previous, v) {
+                deprecated.extend(DeprecatedRuntimeWrite::for_value("fallback", v));
+            }
         }
     }
-    Ok(changes)
+    Ok(RuntimeApplyOutcome { changes, deprecated })
+}
+
+/// Emit one `runtime_provider_deprecated` audit event (and a `warn!`) per
+/// deprecated value a dashboard RPC wrote. Mirrors `judge_mode_deprecated`
+/// in `system.update_config`. `user_id` is the authenticated caller;
+/// `"unknown"` only when a path genuinely carries no identity.
+pub(crate) fn audit_deprecated_runtime_writes(
+    home_dir: &std::path::Path,
+    agent_id: &str,
+    source_rpc: &str,
+    user_id: &str,
+    writes: &[DeprecatedRuntimeWrite],
+) {
+    for w in writes {
+        warn!(
+            agent = %agent_id,
+            field = w.field,
+            value = w.value,
+            replacement = w.replacement,
+            remove_in = w.remove_in,
+            source = source_rpc,
+            "agent runtime set to a deprecated runtime via {source_rpc} — see docs/guides/deprecations.md"
+        );
+        crate::security_autopilot::audit_and_emit(
+            home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "runtime_provider_deprecated",
+                agent_id,
+                duduclaw_security::audit::Severity::Warning,
+                deprecated_runtime_audit_details(agent_id, source_rpc, user_id, w),
+            ),
+        );
+    }
+}
+
+/// The audit payload, split out so its shape is unit-testable.
+pub(crate) fn deprecated_runtime_audit_details(
+    agent_id: &str,
+    source_rpc: &str,
+    user_id: &str,
+    w: &DeprecatedRuntimeWrite,
+) -> Value {
+    json!({
+        "agent_id": agent_id,
+        "field": format!("runtime.{}", w.field),
+        "value": w.value,
+        "replacement": w.replacement,
+        "remove_in": w.remove_in,
+        "source": source_rpc,
+        "user_id": user_id,
+    })
 }
 
 /// Validate a 0.0–1.0 threshold field, returning the float or an error.

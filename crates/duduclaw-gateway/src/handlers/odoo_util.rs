@@ -119,26 +119,31 @@ impl MethodHandler {
 
     /// Validate that a URL is safe for Odoo connections.
     /// Requires HTTPS with non-private host, except for strict localhost.
+    ///
+    /// The host is taken from the parsed URL, never by prefix: with a prefix
+    /// check `http://localhost:3000@evil.com` passed as local (its host is
+    /// `evil.com`), and `https://user@10.0.0.1/` hid a private address behind
+    /// userinfo. Any userinfo is refused outright.
     pub(crate) fn is_safe_odoo_url(url: &str) -> bool {
         if url.len() > 512 {
             return false;
         }
-        // Allow HTTP only for strict localhost — must be followed by '/' or ':' or end of string
-        for prefix in &["http://127.0.0.1", "http://localhost", "http://[::1]"] {
-            if let Some(rest) = url.strip_prefix(prefix) {
-                if rest.is_empty() || rest.starts_with('/') || rest.starts_with(':') {
-                    return true;
-                }
-            }
+        let Ok(parsed) = url::Url::parse(url) else {
+            return false;
+        };
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return false;
         }
-        if url.starts_with("https://") {
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        match parsed.scheme() {
+            // Allow HTTP only for strict localhost.
+            "http" => matches!(host, "127.0.0.1" | "localhost" | "[::1]"),
             // Reject private/reserved IPs to prevent SSRF against cloud metadata, LAN, etc.
-            let host_part = &url["https://".len()..];
-            // Extract host (before first '/' or ':' for port)
-            let host = host_part.split(&['/', ':'][..]).next().unwrap_or("");
-            return !Self::is_private_host(host);
+            "https" => !Self::is_private_host(host),
+            _ => false,
         }
-        false
     }
 
     /// Check if a hostname is a private/reserved IP or a known metadata endpoint.
@@ -165,27 +170,43 @@ impl MethodHandler {
             || lower == "metadata.azure.internal"
     }
 
-    /// Check if an IP address is private, loopback, link-local, or otherwise reserved.
+    /// Check if an IP address is private, loopback, link-local, or otherwise
+    /// not a public internet address — the workspace-wide classifier
+    /// ([`duduclaw_core::net_addr::is_public_ip`]).
     pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()           // 127.0.0.0/8
-                    || v4.is_private()      // 10/8, 172.16/12, 192.168/16
-                    || v4.is_link_local()   // 169.254/16
-                    || v4.is_unspecified()  // 0.0.0.0
-                    || v4.is_broadcast()    // 255.255.255.255
-                    || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 // 100.64/10 (CGNAT)
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()           // ::1
-                    || v6.is_unspecified()  // ::
-                    // IPv4-mapped (::ffff:x.x.x.x) — check the embedded v4
-                    || v6.to_ipv4_mapped().is_some_and(|v4| Self::is_private_ip(std::net::IpAddr::V4(v4)))
-                    // Link-local (fe80::/10)
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
-                    // Unique Local Address (fc00::/7)
-                    || (v6.octets()[0] & 0xfe) == 0xfc
-            }
+        !duduclaw_core::net_addr::is_public_ip(&ip)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn odoo_url_host_is_parsed_not_prefix_matched() {
+        for url in [
+            "http://localhost:3000@evil.com",
+            "http://localhost@evil.com/odoo",
+            "http://localhost.evil.com",
+            "http://127.0.0.1.evil.com",
+            "https://user@10.0.0.1/",
+            "https://user:pw@odoo.example.com/",
+            "https://169.254.169.254/",
+            "http://odoo.example.com",
+            "ftp://localhost",
+            "not a url",
+        ] {
+            assert!(!MethodHandler::is_safe_odoo_url(url), "{url} must be refused");
+        }
+        for url in [
+            "http://localhost",
+            "http://localhost:8069",
+            "http://127.0.0.1:8069/web",
+            "http://[::1]:8069",
+            "https://odoo.example.com",
+            "https://odoo.example.com:8443/odoo",
+        ] {
+            assert!(MethodHandler::is_safe_odoo_url(url), "{url} must be accepted");
         }
     }
 }

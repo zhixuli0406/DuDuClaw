@@ -114,6 +114,8 @@ pub enum Scope {
     /// `MemoryWrite` *is* externally grantable, so any external MCP key
     /// holding `memory:write` could reach the team channel.
     TeamHandoff,
+    /// Internal discovery requests and ACL-bound queries; never externally grantable.
+    DiscoveryExecute,
     Admin,
 }
 
@@ -144,6 +146,7 @@ impl std::fmt::Display for Scope {
             Scope::DbRead => "db:read",
             Scope::FilesRead => "files:read",
             Scope::TeamHandoff => "team:handoff",
+            Scope::DiscoveryExecute => "discovery:execute",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -182,6 +185,7 @@ fn scope_from_str(s: &str) -> Option<Scope> {
         "files:read" => Scope::FilesRead,
         "team:handoff" => Scope::TeamHandoff,
         "recording" => Scope::Recording,
+        "discovery:execute" => Scope::DiscoveryExecute,
         "admin" => Scope::Admin,
         _ => return None,
     })
@@ -219,6 +223,7 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
 /// leaving it unmapped means it requires Admin.
 pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
     match tool_name {
+        "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact" | "discovery_cancel" => Some(Scope::DiscoveryExecute),
         // ── Memory: read family ──────────────────────────────────────────
         "memory_search"
         | "memory_read"
@@ -513,4 +518,12 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // doc comment on this function.
         _ => Some(Scope::Admin),
     }
+}
+
+/// Argument-aware create scope; ordinary tasks retain their Admin contract.
+pub fn tool_requires_scope_for_args(tool: &str, args: &serde_json::Value) -> Option<Scope> {
+    if tool == "tasks_create" && args.get("kind").and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("discovery")) {
+        Some(Scope::DiscoveryExecute)
+    } else { tool_requires_scope(tool) }
 }

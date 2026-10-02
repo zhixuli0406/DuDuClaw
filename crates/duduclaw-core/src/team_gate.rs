@@ -21,7 +21,8 @@
 //!
 //! | layer | rule | result |
 //! |---|---|---|
-//! | mode | `always_solo` / `always_team` | dominates everything |
+//! | sandbox | the employee has `[container] sandbox_enabled = true` | Solo, ahead of `mode` |
+//! | mode | `always_solo` / `always_team` | dominates everything below |
 //! | L0 | channel source · plan-first pending · irreversible action in the plan · fewer than [`TEAM_GATE_MIN_BUDGET_ROUNDS`] rounds | Solo |
 //! | L1 | four independent signals, ≥ [`TEAM_GATE_SIGNALS_FOR_TEAM`] hit | Team |
 //! | L2 | exactly [`TEAM_GATE_GREY_BAND_SIGNALS`] hit | [`GateDecision::GreyBand`] |
@@ -132,6 +133,13 @@ pub struct GateInputs {
     pub produces_artifacts: bool,
     /// Resolved `[team] gate`.
     pub mode: TeamGateMode,
+    /// The employee has `agent.toml [container] sandbox_enabled = true`. Role
+    /// members run the employee's CLI on the host with the full platform tool
+    /// surface, which is exactly what the sandbox exists to prevent, so this
+    /// employee never forms a team: the round runs Solo through the sandboxed
+    /// dispatch path. Checked ahead of `mode`, so the testing-only
+    /// `always_team` cannot override it.
+    pub sandbox_enabled: bool,
 }
 
 impl Default for GateInputs {
@@ -153,6 +161,7 @@ impl Default for GateInputs {
             acceptance_criteria_count: 0,
             produces_artifacts: false,
             mode: TeamGateMode::Auto,
+            sandbox_enabled: false,
         }
     }
 }
@@ -281,9 +290,19 @@ pub fn evaluate_signals(input: &GateInputs) -> GateSignals {
 
 /// The gate.
 ///
-/// Evaluation order is load-bearing: `mode` first (an operator override must
-/// be an override), then L0 exclusions, then the L1 count.
+/// Evaluation order is load-bearing: the sandbox rule first (an isolation
+/// boundary is not a tuning knob, so no mode may form a team around it), then
+/// `mode` (an operator override must be an override), then L0 exclusions, then
+/// the L1 count.
 pub fn decide(input: &GateInputs) -> GateDecision {
+    // ── Isolation boundary ──────────────────────────────────────────────
+    if input.sandbox_enabled {
+        return GateDecision::Solo {
+            reason: "sandbox_enabled",
+            effort_hint: None,
+        };
+    }
+
     // ── Operator override ───────────────────────────────────────────────
     match input.mode {
         TeamGateMode::AlwaysSolo => {
@@ -428,6 +447,45 @@ mod tests {
                 },
                 code: "team",
                 reason: "mode_always_team",
+            },
+            // ── sandbox-enabled employee never forms a team ─────────────
+            Row {
+                name: "sandbox_enabled is solo even with every signal",
+                input: GateInputs {
+                    sandbox_enabled: true,
+                    ..with_signals(4)
+                },
+                code: "solo",
+                reason: "sandbox_enabled",
+            },
+            Row {
+                name: "sandbox_enabled beats always_team",
+                input: GateInputs {
+                    sandbox_enabled: true,
+                    mode: TeamGateMode::AlwaysTeam,
+                    ..with_signals(4)
+                },
+                code: "solo",
+                reason: "sandbox_enabled",
+            },
+            Row {
+                name: "sandbox_enabled under always_solo reports the sandbox",
+                input: GateInputs {
+                    sandbox_enabled: true,
+                    mode: TeamGateMode::AlwaysSolo,
+                    ..eligible()
+                },
+                code: "solo",
+                reason: "sandbox_enabled",
+            },
+            Row {
+                name: "sandbox_enabled skips the grey band too",
+                input: GateInputs {
+                    sandbox_enabled: true,
+                    ..with_signals(2)
+                },
+                code: "solo",
+                reason: "sandbox_enabled",
             },
             // ── L0 ───────────────────────────────────────────────────────
             Row {
@@ -612,6 +670,26 @@ mod tests {
     }
 
     // ── property-style ──────────────────────────────────────────────────
+
+    #[test]
+    fn sandbox_enabled_is_solo_for_every_mode_and_input_shape() {
+        for mode in [TeamGateMode::Auto, TeamGateMode::AlwaysSolo, TeamGateMode::AlwaysTeam] {
+            for source in [TaskSource::GoalCommand, TaskSource::Autopilot, TaskSource::Other] {
+                for signals in 0..=4u8 {
+                    let input = GateInputs {
+                        sandbox_enabled: true,
+                        mode,
+                        source,
+                        budget_rounds: 99,
+                        ..with_signals(signals)
+                    };
+                    let got = decide(&input);
+                    assert!(got.is_solo(), "{input:?} → {got:?}");
+                    assert_eq!(got.reason(), "sandbox_enabled");
+                }
+            }
+        }
+    }
 
     #[test]
     fn always_solo_dominates_every_input_shape() {

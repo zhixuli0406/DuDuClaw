@@ -81,7 +81,8 @@ pub use rules::{
 use rules::{EPHEMERAL_DIR_NAME, FrozenVerdict, HOOK_SETTINGS_FILES, IDENTITY_ENV_KEYS};
 use matcher::{
     components_after_ci, describe_pairs, first_line, identity_env_pairs, mentions_other_agent_dir,
-    mentions_own_soul_md, owning_agent_dir, write_verb,
+    mentions_own_contract_toml, mentions_own_soul_md, mentions_removed_agent_area, owning_agent_dir,
+    write_verb,
 };
 
 use std::path::Path;
@@ -458,6 +459,15 @@ pub fn check_caller_scope(file_path: &Path, home: &Path, caller: &HookCaller) ->
     };
     match caller {
         HookCaller::Absent => unreachable!("handled above"),
+        // Removed-name reservation: `_trash` is not an agent directory but the
+        // place removed employees are kept; reported as such rather than as
+        // "another employee's files".
+        HookCaller::Agent(id) if owner.eq_ignore_ascii_case(crate::agent_trash::AGENT_TRASH_DIR) => {
+            GuardDecision::BlockedRemovedAgentArea {
+                caller: id.clone(),
+                attempted_path: normalized,
+            }
+        }
         HookCaller::Untrusted(claimed) => GuardDecision::BlockedUntrustedCaller {
             caller: claimed.clone(),
             attempted_path: normalized,
@@ -508,6 +518,42 @@ pub fn check_own_soul_write(file_path: &Path, home: &Path, caller: &HookCaller) 
     }
 }
 
+/// Contract lock — block an agent-identified caller from writing its OWN
+/// `CONTRACT.toml` via Write/Edit/MultiEdit.
+///
+/// Same shape as [`check_own_soul_write`] and the same gap it closes:
+/// [`check_caller_scope`] only refuses *another* agent's directory, and the
+/// location guard allows `CONTRACT.toml` at its canonical path, so an agent
+/// holding Write could delete its own `must_not` boundaries. The contract is
+/// the operator's boundary on the agent, so there is **no** opt-in flag;
+/// operators change it through the dashboard (`contract.update`, admin only),
+/// which never passes through this hook. `HookCaller::Absent` (operator running
+/// by hand) is a no-op; `HookCaller::Untrusted` is refused earlier by
+/// [`check_caller_scope`] for every path under `<home>/agents/`.
+pub fn check_own_contract_write(file_path: &Path, home: &Path, caller: &HookCaller) -> GuardDecision {
+    let HookCaller::Agent(caller_id) = caller else {
+        return GuardDecision::NotAgentFile;
+    };
+    match file_path.file_name().and_then(|n| n.to_str()) {
+        Some(n) if n.eq_ignore_ascii_case("CONTRACT.toml") => {}
+        _ => return GuardDecision::NotAgentFile,
+    }
+    let normalized = lexical_normalize(file_path);
+    let Some(owner) = owning_agent_dir(&normalized, home) else {
+        return GuardDecision::NotAgentFile;
+    };
+    if owner.eq_ignore_ascii_case(caller_id) {
+        GuardDecision::BlockedOwnContractWrite {
+            caller: caller_id.clone(),
+            attempted_path: normalized,
+        }
+    } else {
+        // A foreign agent's CONTRACT.toml is already blocked by
+        // `check_caller_scope`, which runs first in the hook pipeline.
+        GuardDecision::NotAgentFile
+    }
+}
+
 /// Bash-side companion: block obviously write-shaped shell commands that
 /// mention a delegation-authority file.
 ///
@@ -544,6 +590,19 @@ pub fn check_bash_protected_write(command: &str, home: &Path, caller: &HookCalle
         .collect();
 
     if let HookCaller::Agent(caller_id) = caller {
+        // Removed-name reservation — the removed-employee area, under any
+        // spelling that names it (`agents/_trash/…`, `../_trash/…`). Checked
+        // ahead of the foreign-directory rule so it is reported for what it
+        // is. Moving a *live* agent directory away by hand (`mv agents/x
+        // agents/x.bak`) is the foreign-directory rule's case below; a
+        // follow-up `create_agent x` is refused by the MCP side anyway (name
+        // collision with the moved copy, or the dangling `org.toml` record).
+        if mentions_removed_agent_area(&normalized) && write_verb(&normalized).is_some() {
+            return GuardDecision::BlockedRemovedAgentArea {
+                caller: caller_id.clone(),
+                attempted_path: home.join("agents").join(crate::agent_trash::AGENT_TRASH_DIR),
+            };
+        }
         if let Some(owner) = mentions_other_agent_dir(&normalized, caller_id) {
             if write_verb(&normalized).is_some() {
                 return GuardDecision::BlockedForeignAgentDir {
@@ -571,6 +630,14 @@ pub fn check_bash_protected_write(command: &str, home: &Path, caller: &HookCalle
             return GuardDecision::BlockedOwnSoulWrite {
                 caller: caller_id.clone(),
                 attempted_path: home.join("agents").join(caller_id).join("SOUL.md"),
+            };
+        }
+
+        // Contract lock — identical matcher, own `CONTRACT.toml`.
+        if mentions_own_contract_toml(&normalized, caller_id) && write_verb(&normalized).is_some() {
+            return GuardDecision::BlockedOwnContractWrite {
+                caller: caller_id.clone(),
+                attempted_path: home.join("agents").join(caller_id).join("CONTRACT.toml"),
             };
         }
     }

@@ -369,7 +369,14 @@ pub fn parse_judge_model_hint(section: &toml::Table) -> Option<UtilityModelHint>
     let provider = match raw_provider {
         None => None,
         Some(s) => match RuntimeType::parse(s) {
-            Some(p) => Some(p),
+            Some(p) => {
+                // R1 (2026-10): a deprecated runtime still judges; say so once.
+                crate::runtime_config::warn_once_if_deprecated_runtime(
+                    p,
+                    crate::runtime_config::DeprecatedRuntimeSource::JudgeProvider,
+                );
+                Some(p)
+            }
             None => {
                 // Never substitute (the `RuntimeType::parse` anti-pattern the
                 // module doc names): drop the whole hint and say so.
@@ -781,53 +788,132 @@ impl ExternalAcceptanceJudge {
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // Own process group / tree so a timeout can kill everything the judge
+        // spawned, not just its leader; `kill_on_drop` is the backstop for a
+        // cancelled review future.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
+        cmd.kill_on_drop(true);
 
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("spawn external judge `{}` failed: {e}", self.program()))?;
+        let pid = child.id();
 
-        // Write stdin and collect output under ONE deadline. Writing before
-        // reading can deadlock on a child that fills its stdout pipe first,
-        // so the write is dropped into the same timed future as the wait.
+        // Feed stdin, drain both pipes and wait — all concurrently under ONE
+        // deadline, so a child that fills a pipe before reading stdin cannot
+        // deadlock us. The readers stop BUFFERING past their cap but keep
+        // draining (so the child never blocks on a full pipe and its exit
+        // status stays meaningful); memory is bounded by the caps, time by
+        // the deadline.
         let stdin = child.stdin.take();
-        let run = async move {
-            if let Some(mut stdin) = stdin {
-                // A judge that ignores stdin closes the pipe early: a broken
-                // pipe here is not fatal on its own — let the verdict decide.
-                let _ = stdin.write_all(payload.as_bytes()).await;
-                let _ = stdin.shutdown().await;
-            }
-            child.wait_with_output().await
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let run = async {
+            let feed = async move {
+                if let Some(mut stdin) = stdin {
+                    // A judge that ignores stdin closes the pipe early: a broken
+                    // pipe here is not fatal on its own — let the verdict decide.
+                    let _ = stdin.write_all(payload.as_bytes()).await;
+                    let _ = stdin.shutdown().await;
+                }
+            };
+            let (_, out, err, status) = tokio::join!(
+                feed,
+                read_bounded(stdout, EXTERNAL_STDOUT_MAX_BYTES),
+                read_bounded(stderr, EXTERNAL_STDERR_MAX_BYTES),
+                child.wait(),
+            );
+            Ok::<_, std::io::Error>((status?, out?, err?))
         };
 
-        let output = tokio::time::timeout(Duration::from_secs(self.config.timeout_secs), run)
-            .await
-            .map_err(|_| {
-                format!(
-                    "external judge `{}` timed out after {}s",
-                    self.program(),
-                    self.config.timeout_secs
-                )
-            })?
-            .map_err(|e| format!("external judge `{}` io error: {e}", self.program()))?;
+        let (status, stdout_bytes, stderr_bytes) =
+            match tokio::time::timeout(Duration::from_secs(self.config.timeout_secs), run).await {
+                Ok(res) => {
+                    res.map_err(|e| format!("external judge `{}` io error: {e}", self.program()))?
+                }
+                Err(_) => {
+                    kill_judge_tree(&mut child, pid).await;
+                    return Err(format!(
+                        "external judge `{}` timed out after {}s",
+                        self.program(),
+                        self.config.timeout_secs
+                    ));
+                }
+            };
 
         // Unlike `duduclaw eval` (whose non-zero exit encodes "some case
         // failed"), an external judge's exit status is not a verdict channel:
         // a crashed judge must never be read as "fail" (which would burn a
         // retry round on a platform defect) nor as "pass". Non-zero ⇒ Err ⇒
         // the MAV panel decides.
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             let tail = duduclaw_core::truncate_bytes(stderr.trim(), 500);
             return Err(format!(
                 "external judge `{}` exited {} — stderr tail: {tail}",
                 self.program(),
-                output.status
+                status
             ));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
         parse_external_verdict(&stdout)
+    }
+}
+
+/// Byte cap on the child's buffered stderr (only a short head reaches the log).
+const EXTERNAL_STDERR_MAX_BYTES: usize = 64 * 1024;
+
+/// Read a child pipe to EOF, buffering at most `cap` bytes. Bytes past the
+/// cap are read and discarded, never accumulated. `None` pipe ⇒ empty.
+async fn read_bounded<R>(pipe: Option<R>, cap: usize) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let Some(mut pipe) = pipe else {
+        return Ok(Vec::new());
+    };
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = pipe.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        let room = cap.saturating_sub(buf.len());
+        if room > 0 {
+            buf.extend_from_slice(&chunk[..n.min(room)]);
+        }
+    }
+}
+
+/// Kill a timed-out judge together with everything it spawned, then reap it.
+/// Best-effort: failures are logged, never returned (the caller is already
+/// on the degrade-to-MAV path).
+async fn kill_judge_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
+    if let Some(pid) = pid {
+        // Unix: the pid is the pgid (`process_group(0)`). Windows: `taskkill
+        // /T` is a blocking subprocess, so keep it off the async worker.
+        match tokio::task::spawn_blocking(move || {
+            duduclaw_core::platform::kill_process_group(pid)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!(pid, "external judge group kill: {e}"),
+            Err(e) => tracing::debug!(pid, "external judge group kill task: {e}"),
+        }
+    }
+    let _ = child.start_kill();
+    if tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(?pid, "external judge did not exit within 5s of SIGKILL");
     }
 }
 
@@ -1419,6 +1505,91 @@ mod tests {
         assert!(err.contains("timed out"), "{err}");
     }
 
+    /// FX6: a timed-out judge must not outlive the timeout — neither the
+    /// leader nor a background grandchild it spawned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_judge_timeout_leaves_no_surviving_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let leader_pid = dir.path().join("leader.pid");
+        let child_pid = dir.path().join("child.pid");
+        let bin = script(
+            dir.path(),
+            "hang.sh",
+            &format!(
+                "echo $$ > '{}'\nsleep 60 &\necho $! > '{}'\nwait",
+                leader_pid.display(),
+                child_pid.display()
+            ),
+        );
+        let err = external(vec![bin.to_string_lossy().into_owned()], 1)
+            .judge("c", "t", "r")
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+
+        for file in [&leader_pid, &child_pid] {
+            let pid: i32 = std::fs::read_to_string(file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // The leader is reaped by the judge; the reparented grandchild is
+            // reaped by init — poll briefly for that.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
+                if !alive {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "judge process {pid} survived the timeout"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    /// FX6: a judge that floods stdout is bounded in memory and still
+    /// degrades cleanly (here: the flood never forms a JSON verdict).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_judge_stdout_flood_is_bounded_and_degrades() {
+        let dir = tempfile::tempdir().unwrap();
+        // ~8 MiB of non-JSON output, then a clean exit.
+        let bin = script(
+            dir.path(),
+            "flood.sh",
+            "cat > /dev/null\nhead -c 8388608 /dev/zero | tr '\\0' 'x'",
+        );
+        let err = external(vec![bin.to_string_lossy().into_owned()], 30)
+            .judge("c", "t", "r")
+            .await
+            .unwrap_err();
+        assert!(err.contains("no JSON object"), "{err}");
+
+        // The reader itself never buffers past its cap.
+        let big = vec![b'y'; EXTERNAL_STDOUT_MAX_BYTES * 3];
+        let got = read_bounded(Some(&big[..]), EXTERNAL_STDOUT_MAX_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), EXTERNAL_STDOUT_MAX_BYTES);
+    }
+
+    /// FX6: an endless flood is cut off by the deadline, not by memory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_judge_endless_flood_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(dir.path(), "yes.sh", "cat > /dev/null\nexec yes");
+        let err = external(vec![bin.to_string_lossy().into_owned()], 1)
+            .judge("c", "t", "r")
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn external_judge_bad_json_is_an_error_not_a_pass() {
@@ -1462,5 +1633,33 @@ mod tests {
             timeout_secs: 5,
         });
         assert!(j.judge("c", "t", "r").await.is_err());
+    }
+
+    /// R1 (2026-10): a `gemini` judge provider keeps judging (the hint is
+    /// unchanged) and its deprecation notice fires once per process — every
+    /// parse consults it, the de-duplication lets exactly one through.
+    #[test]
+    fn judge_provider_deprecation_notice_fires_once() {
+        use crate::runtime_config::{CONSULTED_NOTICES, DeprecatedRuntimeSource, deprecated_runtime_first_notice};
+        CONSULTED_NOTICES.with(|n| n.borrow_mut().clear());
+        for _ in 0..3 {
+            let h = parse_judge_model_hint(&dispatch_table("judge_provider = \"gemini\"")).unwrap();
+            assert_eq!(h.provider, Some(RuntimeType::Gemini));
+        }
+        let consulted = CONSULTED_NOTICES.with(|n| n.borrow().clone());
+        assert_eq!(consulted.len(), 3, "{consulted:?}");
+        assert!(consulted.iter().all(|(rt, src, agent)| *rt == "gemini"
+            && *src == DeprecatedRuntimeSource::JudgeProvider && agent.is_none()));
+        let mut seen = std::collections::HashSet::new();
+        let fired: Vec<String> = consulted
+            .iter()
+            .filter_map(|(_, src, agent)| deprecated_runtime_first_notice(&mut seen, RuntimeType::Gemini, *src, agent.as_deref()))
+            .collect();
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert!(fired[0].starts_with("config.toml [dispatch] judge_provider"), "{fired:?}");
+        // A live judge provider consults nothing.
+        CONSULTED_NOTICES.with(|n| n.borrow_mut().clear());
+        parse_judge_model_hint(&dispatch_table("judge_provider = \"codex\"")).unwrap();
+        assert!(CONSULTED_NOTICES.with(|n| n.borrow().is_empty()));
     }
 }

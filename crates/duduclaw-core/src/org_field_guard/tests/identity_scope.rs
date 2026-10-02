@@ -700,3 +700,196 @@ fn bash_foreign_agent_dir_rule_still_wins_over_soul_md_check() {
         other => panic!("expected BlockedForeignAgentDir, got {other:?}"),
     }
 }
+
+// ── Contract lock: CONTRACT.toml self-write guard ───────────────
+
+#[test]
+fn own_contract_write_is_blocked() {
+    let p = home().join("agents/sales-rep/CONTRACT.toml");
+    match check_own_contract_write(&p, &home(), &agent("sales-rep")) {
+        GuardDecision::BlockedOwnContractWrite { caller, attempted_path } => {
+            assert_eq!(caller, "sales-rep");
+            assert_eq!(attempted_path, p);
+        }
+        other => panic!("expected BlockedOwnContractWrite, got {other:?}"),
+    }
+    let msg = check_own_contract_write(&p, &home(), &agent("sales-rep"))
+        .block_message()
+        .unwrap();
+    assert!(msg.contains("CONTRACT.toml"));
+    assert!(msg.contains("儀表板"));
+    assert!(!msg.contains("can_modify_own_soul"), "the contract has no opt-in");
+}
+
+#[test]
+fn own_contract_write_is_case_insensitive_and_normalizing() {
+    let p = PathBuf::from("/users/ALICE/.duduclaw/agents/Sales-Rep/sub/../contract.TOML");
+    assert!(matches!(
+        check_own_contract_write(&p, &home(), &agent("sales-rep")),
+        GuardDecision::BlockedOwnContractWrite { .. }
+    ));
+}
+
+#[test]
+fn own_contract_rule_ignores_foreign_dirs_other_files_absent_caller_and_projects() {
+    // Foreign: Stage 0 (`check_caller_scope`) owns that refusal.
+    let foreign = home().join("agents/ceo/CONTRACT.toml");
+    assert_eq!(
+        check_own_contract_write(&foreign, &home(), &agent("sales-rep")),
+        GuardDecision::NotAgentFile
+    );
+    assert!(matches!(
+        check_caller_scope(&foreign, &home(), &agent("sales-rep")),
+        GuardDecision::BlockedForeignAgentDir { .. }
+    ));
+    let own = home().join("agents/sales-rep/CONTRACT.toml");
+    assert_eq!(
+        check_own_contract_write(&own, &home(), &HookCaller::Absent),
+        GuardDecision::NotAgentFile,
+        "operator convention — unrestricted"
+    );
+    assert_eq!(
+        check_own_contract_write(&home().join("agents/sales-rep/SOUL.md"), &home(), &agent("sales-rep")),
+        GuardDecision::NotAgentFile
+    );
+    assert_eq!(
+        check_own_contract_write(
+            &PathBuf::from("/Users/alice/Project/app/CONTRACT.toml"),
+            &home(),
+            &agent("sales-rep")
+        ),
+        GuardDecision::NotAgentFile
+    );
+}
+
+#[test]
+fn bash_own_contract_write_is_blocked_and_reads_are_not() {
+    for cmd in [
+        "echo '' > CONTRACT.toml",
+        "rm contract.toml",
+        "mv CONTRACT.toml /tmp/x",
+        "cat x > /Users/alice/.duduclaw/agents/sales-rep/CONTRACT.toml",
+    ] {
+        assert!(
+            matches!(
+                check_bash_protected_write(cmd, &home(), &agent("sales-rep")),
+                GuardDecision::BlockedOwnContractWrite { .. }
+            ),
+            "not blocked: {cmd}"
+        );
+    }
+    for cmd in ["cat CONTRACT.toml", "echo x > old_contract.toml"] {
+        assert_eq!(
+            check_bash_protected_write(cmd, &home(), &agent("sales-rep")),
+            GuardDecision::NotAgentFile,
+            "{cmd}"
+        );
+    }
+    assert_eq!(
+        check_bash_protected_write("echo x > CONTRACT.toml", &home(), &HookCaller::Absent),
+        GuardDecision::NotAgentFile
+    );
+    // Foreign contract still takes the cross-agent rule.
+    assert!(matches!(
+        check_bash_protected_write(
+            "echo x > /Users/alice/.duduclaw/agents/ceo/CONTRACT.toml",
+            &home(),
+            &agent("sales-rep")
+        ),
+        GuardDecision::BlockedForeignAgentDir { .. }
+    ));
+}
+
+// ── `./`-relative spellings of the caller's own SOUL.md / CONTRACT.toml ──
+//
+// The hook's Bash cwd is the agent's own directory, so `./SOUL.md`,
+// `././SOUL.md`, `.//SOUL.md` and `x/../SOUL.md` all name the same file as a
+// bare `SOUL.md`. Normalisation is lexical; the filesystem is never read.
+
+const RELATIVE_SPELLINGS: &[&str] = &["{f}", "./{f}", "././{f}", ".//{f}", "./sub/../{f}"];
+
+fn spelled(template: &str, file: &str) -> String {
+    template.replace("{f}", file)
+}
+
+#[test]
+fn bash_relative_own_soul_write_is_blocked_in_every_spelling() {
+    for file in ["SOUL.md", "soul.md", "Soul.MD"] {
+        for t in RELATIVE_SPELLINGS {
+            let path = spelled(t, file);
+            for cmd in [format!("echo x > {path}"), format!("rm {path}"), format!("echo x >{path}")] {
+                assert!(
+                    matches!(
+                        check_bash_protected_write(&cmd, &home(), &agent("sales-rep")),
+                        GuardDecision::BlockedOwnSoulWrite { .. }
+                    ),
+                    "not blocked: {cmd}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bash_relative_own_contract_write_is_blocked_in_every_spelling() {
+    for file in ["CONTRACT.toml", "contract.toml", "Contract.TOML"] {
+        for t in RELATIVE_SPELLINGS {
+            let path = spelled(t, file);
+            for cmd in [format!("echo x > {path}"), format!("mv {path} /tmp/x"), format!("tee '{path}'")] {
+                assert!(
+                    matches!(
+                        check_bash_protected_write(&cmd, &home(), &agent("sales-rep")),
+                        GuardDecision::BlockedOwnContractWrite { .. }
+                    ),
+                    "not blocked: {cmd}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bash_relative_own_file_reads_still_pass() {
+    for file in ["SOUL.md", "CONTRACT.toml"] {
+        // Absolute-form read passes today; every relative spelling must too.
+        let absolute = format!("cat /Users/alice/.duduclaw/agents/sales-rep/{file}");
+        assert_eq!(
+            check_bash_protected_write(&absolute, &home(), &agent("sales-rep")),
+            GuardDecision::NotAgentFile,
+            "{absolute}"
+        );
+        for t in RELATIVE_SPELLINGS {
+            let cmd = format!("cat {}", spelled(t, file));
+            assert_eq!(
+                check_bash_protected_write(&cmd, &home(), &agent("sales-rep")),
+                GuardDecision::NotAgentFile,
+                "{cmd}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bash_relative_spellings_that_leave_the_agent_dir_are_not_own() {
+    // `../SOUL.md` is the agents root, not the caller's own directory, and a
+    // subdirectory's file is a different file — neither collapses to the
+    // bare spelling. (Bash is a speed bump, not a sandbox; these are simply
+    // not this rule's match.)
+    for cmd in [
+        "echo x > ../SOUL.md",
+        "echo x > ./../CONTRACT.toml",
+        "echo x > ./notes/SOUL.md",
+        "echo x > ./old_contract.toml",
+    ] {
+        assert_eq!(
+            check_bash_protected_write(cmd, &home(), &agent("sales-rep")),
+            GuardDecision::NotAgentFile,
+            "{cmd}"
+        );
+    }
+    // No agent identity ⇒ operator at a terminal ⇒ unrestricted, as before.
+    assert_eq!(
+        check_bash_protected_write("echo x > ./CONTRACT.toml", &home(), &HookCaller::Absent),
+        GuardDecision::NotAgentFile
+    );
+}

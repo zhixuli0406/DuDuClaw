@@ -28,7 +28,7 @@ mod scope;
 pub mod strategy;
 
 pub use grants::{external_tool_allowed, EXTERNALLY_GRANTABLE_SCOPES};
-pub use scope::{parse_scopes, tool_requires_scope, Scope};
+pub use scope::{parse_scopes, tool_requires_scope, tool_requires_scope_for_args, Scope};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

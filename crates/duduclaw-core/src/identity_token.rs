@@ -170,6 +170,76 @@ pub fn verify_token(key: &[u8], agent_id: &str, token: &str) -> bool {
     mac.verify_slice(&bytes).is_ok()
 }
 
+// ── Signed internal requests ─────────────────────────────────────────────────
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn internal_request_mac(
+    internal_key: &[u8],
+    agent_id: &str,
+    agent_token: &str,
+    timestamp: &str,
+    nonce: &str,
+    body: &[u8],
+) -> HmacSha256 {
+    use sha2::Digest;
+    let body_hash = hex_lower(&Sha256::digest(body));
+    let mut mac = HmacSha256::new_from_slice(internal_key).expect("HMAC accepts any key length");
+    for (i, part) in [agent_id, agent_token, timestamp, nonce, body_hash.as_str()].iter().enumerate() {
+        if i > 0 {
+            mac.update(b"\n");
+        }
+        mac.update(part.as_bytes());
+    }
+    mac
+}
+
+/// The signature of one gateway-internal HTTP request (the computer-use route):
+/// `hex(HMAC-SHA256(key = internal_key, agent_id + "\n" + agent_token + "\n" +
+/// timestamp + "\n" + nonce + "\n" + hex(sha256(body))))`.
+///
+/// Neither the internal key nor the identity token travels on the wire: a
+/// local process that binds the gateway port while the gateway is down
+/// receives only a signature that is useless for any other request. The
+/// fields are newline-separated; the caller validates that `agent_id`,
+/// `timestamp` and `nonce` contain no newline (the receiver does).
+pub fn internal_request_signature(
+    internal_key: &[u8],
+    agent_id: &str,
+    agent_token: &str,
+    timestamp: &str,
+    nonce: &str,
+    body: &[u8],
+) -> String {
+    hex_lower(&internal_request_mac(internal_key, agent_id, agent_token, timestamp, nonce, body).finalize().into_bytes())
+}
+
+/// Constant-time check of an [`internal_request_signature`] (through
+/// `Mac::verify_slice`). A malformed (non-hex / wrong-length) signature is
+/// rejected without reaching the comparison.
+pub fn verify_internal_request_signature(
+    internal_key: &[u8],
+    agent_id: &str,
+    agent_token: &str,
+    timestamp: &str,
+    nonce: &str,
+    body: &[u8],
+    signature: &str,
+) -> bool {
+    let Some(bytes) = decode_hex(signature.trim()) else {
+        return false;
+    };
+    internal_request_mac(internal_key, agent_id, agent_token, timestamp, nonce, body)
+        .verify_slice(&bytes)
+        .is_ok()
+}
+
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) || s.is_empty() {
         return None;
@@ -315,6 +385,30 @@ mod tests {
 
     fn key() -> Vec<u8> {
         (0u8..32).collect()
+    }
+
+    #[test]
+    fn internal_request_signature_binds_every_field() {
+        let k = b"ddc_prod_0123456789abcdef0123456789abcdef";
+        let tok = mint_token(&key(), "alice");
+        let sig = internal_request_signature(k, "alice", &tok, "1700000000", "00ff", b"{\"op\":\"status\"}");
+        // Independent construction of the documented message.
+        use sha2::Digest;
+        let body_hash = hex_lower(&Sha256::digest(b"{\"op\":\"status\"}"));
+        let mut mac = HmacSha256::new_from_slice(k).unwrap();
+        mac.update(format!("alice\n{tok}\n1700000000\n00ff\n{body_hash}").as_bytes());
+        assert_eq!(sig, hex_lower(&mac.finalize().into_bytes()));
+        let ok = |id: &str, t: &str, ts: &str, n: &str, b: &[u8], s: &str| {
+            verify_internal_request_signature(k, id, t, ts, n, b, s)
+        };
+        assert!(ok("alice", &tok, "1700000000", "00ff", b"{\"op\":\"status\"}", &sig));
+        assert!(!ok("bob", &tok, "1700000000", "00ff", b"{\"op\":\"status\"}", &sig));
+        assert!(!ok("alice", "00", "1700000000", "00ff", b"{\"op\":\"status\"}", &sig));
+        assert!(!ok("alice", &tok, "1700000001", "00ff", b"{\"op\":\"status\"}", &sig));
+        assert!(!ok("alice", &tok, "1700000000", "00fe", b"{\"op\":\"status\"}", &sig));
+        assert!(!ok("alice", &tok, "1700000000", "00ff", b"{\"op\":\"stop\"}", &sig));
+        assert!(!ok("alice", &tok, "1700000000", "00ff", b"{\"op\":\"status\"}", "zz"));
+        assert!(!verify_internal_request_signature(b"other-key", "alice", &tok, "1700000000", "00ff", b"{\"op\":\"status\"}", &sig));
     }
 
     /// RFC 4231 test case 1 — a fixed vector proves this is real HMAC-SHA256

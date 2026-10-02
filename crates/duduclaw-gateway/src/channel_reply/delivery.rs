@@ -250,77 +250,21 @@ pub(super) fn parse_session_id_parts(session_id: &str) -> (&str, &str) {
     }
 }
 
+/// The Anthropic API key the direct-API reply fallback uses:
+/// `ANTHROPIC_API_KEY` when set and non-empty, else `config.toml [api]
+/// anthropic_api_key(_enc)` (resolved through the same secret reader as every
+/// other config credential). `None` when neither yields a value.
 pub(super) async fn get_api_key(home_dir: &Path) -> Option<String> {
-    // Environment variable takes precedence
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        if !key.is_empty() {
-            return Some(key);
-        }
-    }
-    // Try encrypted config field, fallback to plaintext
-    crate::config_crypto::read_encrypted_config_field(home_dir, "api", "anthropic_api_key").await
+    api_key_with_env(std::env::var("ANTHROPIC_API_KEY").ok(), home_dir).await
 }
 
-/// Heuristic: does the user's message look like a computer use request?
-///
-/// Matches keywords in Chinese, English, and Japanese that indicate the
-/// user wants the agent to interact with the desktop GUI.
-pub(super) fn looks_like_computer_use_request(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    // Chinese keywords
-    let cn = [
-        "打開",
-        "開啟",
-        "點擊",
-        "截圖",
-        "螢幕",
-        "桌面",
-        "滑鼠",
-        "鍵盤",
-        "操作電腦",
-        "幫我開",
-        "幫我點",
-        "幫我按",
-        "幫我打",
-        "幫我填",
-        "幫我輸入",
-        "幫我關",
-        "視窗",
-        "列印",
-        "下載",
-        "安裝",
-    ];
-    // English keywords
-    let en = [
-        "open app",
-        "click on",
-        "take screenshot",
-        "on my screen",
-        "on my desktop",
-        "mouse",
-        "keyboard",
-        "type into",
-        "fill the form",
-        "close the window",
-        "print the",
-        "download the",
-        "install the",
-        "open the browser",
-        "control my computer",
-        "on my computer",
-    ];
-    // Japanese keywords
-    let jp = [
-        "画面",
-        "クリック",
-        "開いて",
-        "入力して",
-        "スクリーンショット",
-    ];
-
-    cn.iter().any(|kw| lower.contains(&kw.to_lowercase()))
-        || en.iter().any(|kw| lower.contains(kw))
-        || jp.iter().any(|kw| lower.contains(&kw.to_lowercase()))
+/// [`get_api_key`] with the environment value passed in, so tests never
+/// depend on (or read) the process environment.
+pub(super) async fn api_key_with_env(env: Option<String>, home_dir: &Path) -> Option<String> {
+    if let Some(key) = env.filter(|k| !k.is_empty()) {
+        return Some(key);
+    }
+    crate::config_crypto::read_encrypted_config_field(home_dir, "api", "anthropic_api_key").await
 }
 
 // ─────────────────────────────────────────────────────────────────────

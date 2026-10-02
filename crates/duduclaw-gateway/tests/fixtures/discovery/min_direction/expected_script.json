@@ -1,0 +1,111 @@
+{
+  "pareto_auc": 0.666666667,
+  "pareto_reward": 0.6,
+  "parallel_penalty": 0.666666667,
+  "out_of_support": false,
+  "points": [
+    {
+      "beta": 0.0,
+      "probes": 1,
+      "decision_rounds": 1,
+      "effective_sequential_rounds": 1,
+      "attainment": 0.0,
+      "work": 0.111111111,
+      "parallel_penalty": 1.0,
+      "context_mismatch_rate": 1.0,
+      "batches": [
+        [
+          "r1-b0-a0"
+        ]
+      ]
+    },
+    {
+      "beta": 0.25,
+      "probes": 2,
+      "decision_rounds": 1,
+      "effective_sequential_rounds": 1,
+      "attainment": 0.0,
+      "work": 0.222222222,
+      "parallel_penalty": 0.5,
+      "context_mismatch_rate": 0.5,
+      "batches": [
+        [
+          "r1-b1-a0",
+          "r1-b0-a0"
+        ]
+      ]
+    },
+    {
+      "beta": 0.5,
+      "probes": 3,
+      "decision_rounds": 2,
+      "effective_sequential_rounds": 2,
+      "attainment": 1.0,
+      "work": 0.333333333,
+      "parallel_penalty": 0.666666667,
+      "context_mismatch_rate": 0.0,
+      "batches": [
+        [
+          "r1-b1-a0",
+          "r1-b2-a0"
+        ],
+        [
+          "r1-b2-a1"
+        ]
+      ]
+    },
+    {
+      "beta": 0.75,
+      "probes": 4,
+      "decision_rounds": 2,
+      "effective_sequential_rounds": 2,
+      "attainment": 0.0,
+      "work": 0.444444444,
+      "parallel_penalty": 0.5,
+      "context_mismatch_rate": 0.75,
+      "batches": [
+        [
+          "r1-b0-a0",
+          "r1-b1-a0"
+        ],
+        [
+          "r1-b0-a1",
+          "r1-b1-a1"
+        ]
+      ]
+    },
+    {
+      "beta": 1.0,
+      "probes": 9,
+      "decision_rounds": 6,
+      "effective_sequential_rounds": 6,
+      "attainment": 1.0,
+      "work": 1.0,
+      "parallel_penalty": 0.666666667,
+      "context_mismatch_rate": 0.333333333,
+      "batches": [
+        [
+          "r1-b0-a0",
+          "r1-b1-a0"
+        ],
+        [
+          "r1-b2-a0"
+        ],
+        [
+          "r1-b0-a1",
+          "r1-b1-a1"
+        ],
+        [
+          "r1-b2-a1"
+        ],
+        [
+          "r1-b0-a2",
+          "r1-b1-a2"
+        ],
+        [
+          "r1-b2-a2"
+        ]
+      ]
+    }
+  ]
+}

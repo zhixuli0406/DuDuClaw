@@ -70,6 +70,12 @@ impl MethodHandler {
                         "trigger": cfg.agent.trigger,
                         "icon": cfg.agent.icon,
                         "reports_to": cfg.agent.reports_to,
+                        // `[container] sandbox_enabled` / `network_access` —
+                        // the edit page's two task-sandbox switches bind to
+                        // these top-level keys (`AgentDetail` in api.ts).
+                        // Absent `[container]` ⇒ the typed defaults (false).
+                        "sandbox_enabled": cfg.container.sandbox_enabled,
+                        "network_access": cfg.container.network_access,
                         "soul_preview": a.soul.as_ref().map(|s| {
                             let t = truncate_bytes(s, 500);
                             if t.len() < s.len() { format!("{t}…") } else { s.clone() }

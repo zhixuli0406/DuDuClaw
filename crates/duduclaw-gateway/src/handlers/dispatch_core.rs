@@ -70,7 +70,7 @@ impl MethodHandler {
             }
             "agents.create" => {
                 require_admin!();
-                self.handle_agents_create(params).await
+                self.handle_agents_create_as(params, Some(ctx)).await
             }
             "agents.delegate" => {
                 // H1 fix: delegate is high-risk — requires operator-level access
@@ -87,7 +87,7 @@ impl MethodHandler {
             }
             "agents.update" => {
                 let _ = check_agent!(AccessLevel::Owner);
-                self.handle_agents_update(params).await
+                self.handle_agents_update_as(params, Some(ctx)).await
             }
             "agents.remove" => {
                 require_admin!();

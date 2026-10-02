@@ -5,6 +5,7 @@
 
 mod claim_cases;
 mod goal_cases;
+mod ledger_cases;
 mod plan_cases;
 mod pure_cases;
 mod review_cases;

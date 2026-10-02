@@ -268,8 +268,17 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
             // P2b and the per-role ledger cannot lose the measured cost.
             record_usage(home, agent_id, request_type, model, usage, role_attribution).await;
         } else {
+            // A1-3 ledger: task-locals do not cross `tokio::spawn`, so carry
+            // the goal-round attribution (if any) into the detached write.
+            let goal_round = crate::runtime::GOAL_ROUND_ATTRIBUTION
+                .try_with(Clone::clone)
+                .ok();
             tokio::spawn(async move {
-                record_usage(home, agent_id, request_type, model, usage, None).await;
+                let write = record_usage(home, agent_id, request_type, model, usage, None);
+                match goal_round {
+                    Some(g) => crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(g, write).await,
+                    None => write.await,
+                }
             });
         }
     }
@@ -508,6 +517,63 @@ tokio::task_local! {
     /// asked for one. Read with [`output_schema_override`]; absent scope ⇒
     /// `None` ⇒ every runtime builds a byte-identical argv.
     pub static OUTPUT_SCHEMA: std::sync::Arc<serde_json::Value>;
+
+    /// Explicit attribution for the rotated Claude utility CLI path. This is
+    /// independent of channel replies; absent scope leaves legacy CLI calls
+    /// unchanged, and the enclosing goal scope supplies episode/round.
+    pub(crate) static CLAUDE_UTILITY_AGENT_ID: String;
+}
+
+pub(crate) fn is_claude_utility_call() -> bool {
+    CLAUDE_UTILITY_AGENT_ID.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn is_observed_claude_model(model: &str) -> bool {
+    let model = model.trim();
+    !model.is_empty() && model != "<synthetic>"
+}
+
+/// Persist canonical CLI result usage synchronously, including cache tokens
+/// and the model the CLI reports. No observed usage/model means no guessed
+/// row. Called once per CLI attempt, so rotated paid retries are retained.
+pub(crate) async fn record_claude_utility_result(
+    home_dir: &Path,
+    event: &serde_json::Value,
+    observed_model: Option<&str>,
+) -> bool {
+    let Ok(agent_id) = CLAUDE_UTILITY_AGENT_ID.try_with(Clone::clone) else { return false };
+    if agent_id.is_empty() { return false; }
+    let Some(total) = event.get("usage").and_then(TokenUsage::from_json) else { return false };
+    let by_model = event.get("modelUsage").and_then(|v| v.as_object());
+    let measured: Option<Vec<(String, TokenUsage)>> = match by_model {
+        Some(models) if models.len() == 1 => {
+            let name = models.keys().next().unwrap();
+            if is_observed_claude_model(name) { Some(vec![(name.clone(), total)]) }
+            else { observed_model.filter(|name| is_observed_claude_model(name))
+                .map(|name| vec![(name.to_owned(), total)]) }
+        }
+        Some(models) if models.len() > 1 => models.iter()
+            .filter(|(name, _)| is_observed_claude_model(name)).map(|(name, usage)| {
+            Some((name.clone(), TokenUsage {
+                input_tokens: usage.get("inputTokens")?.as_u64()?,
+                output_tokens: usage.get("outputTokens")?.as_u64()?,
+                cache_read_tokens: usage.get("cacheReadInputTokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                cache_creation_tokens: usage.get("cacheCreationInputTokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            }))
+        }).collect::<Option<Vec<_>>>().filter(|rows| !rows.is_empty()),
+        _ => observed_model.filter(|name| is_observed_claude_model(name))
+            .map(|name| vec![(name.to_owned(), total)]),
+    };
+    let Some(measured) = measured else {
+        tracing::warn!("Claude utility result has usage without an unambiguous observed model; cost row omitted");
+        return false;
+    };
+    let role = crate::runtime::ROLE_COST_ATTRIBUTION.try_with(Clone::clone).ok();
+    for (model, usage) in measured {
+        record_usage(home_dir.to_path_buf(), agent_id.clone(), RequestType::Evolution,
+            model, usage, role.clone()).await;
+    }
+    true
 }
 
 /// The caller's required reply schema for this call, if any. `None` outside an
@@ -582,7 +648,8 @@ pub async fn run_utility_prompt_with_hint(
                  does not forward it yet — the call runs at the model's default effort"
             );
         }
-        crate::channel_reply::call_claude_cli_public(prompt, &spec.model, system_prompt, home_dir)
+        CLAUDE_UTILITY_AGENT_ID.scope(agent_id.to_owned(),
+            crate::channel_reply::call_claude_cli_public(prompt, &spec.model, system_prompt, home_dir))
             .await
     } else {
         let fut = run_agent_prompt_text(AgentPrompt {
@@ -633,6 +700,144 @@ mod hint_tests {
             provider: RuntimeType::Claude,
             model: "claude-haiku-4-5".to_string(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn goal_judge_claude_cli_records_measured_usage_without_api() {
+        const CHILD_HOME: &str = "DUDU_TEST_JUDGE_CLI_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            let home = PathBuf::from(home);
+            // The resolver also scans fixed global installations and chooses
+            // the newest version. Assert the fixture wins before any prompt
+            // can be sent; PATH alone is not a hermetic guarantee.
+            assert_eq!(duduclaw_core::which_claude().as_deref(), home.join("bin/claude").to_str());
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                use crate::dispatch_engine::{DispatchEngine, GoalAcceptanceCaller, LlmAcceptanceJudge, LlmPreEvaluator};
+                use crate::task_store::{TaskRow, TaskStore};
+                use std::sync::Arc;
+                crate::cost_telemetry::init_telemetry(&home).unwrap();
+                let store = Arc::new(TaskStore::open(&home).unwrap());
+                let mut task = TaskRow::new("fixture-goal".into(), "fixture task".into(),
+                    "deliver the work".into(), "medium".into(), "fixture-worker".into(), "system".into());
+                task.status = "pending".into();
+                task.goal_mode = true;
+                task.max_retries = 3;
+                task.acceptance_criteria = Some("the deliverable is correct".into());
+                store.insert_task(&task).await.unwrap();
+                let now = chrono::Utc::now();
+                let lease = (now + chrono::Duration::minutes(5)).to_rfc3339();
+                assert!(store.atomic_claim(&task.id, "fixture-worker", &now.to_rfc3339(), &lease)
+                    .await.unwrap().is_claimed());
+                store.complete_task(&task.id, "delivered fixture", "fixture-worker").await.unwrap();
+                let engine = DispatchEngine::new(store.clone(), Some(Arc::new(LlmAcceptanceJudge::new(
+                    GoalAcceptanceCaller { home_dir: home.clone() }))))
+                    .with_evaluator(Arc::new(LlmPreEvaluator::new(GoalAcceptanceCaller { home_dir: home.clone() })));
+                engine.tick_once().await.unwrap();
+                assert_eq!(store.get_task(&task.id).await.unwrap().unwrap().status, "done");
+                let conn = rusqlite::Connection::open(home.join("cost_telemetry.db")).unwrap();
+                let rows: Vec<(String, String, String, i64, Option<String>, String, i64, i64, i64)> = conn
+                    .prepare("SELECT agent_id,request_type,episode_id,round,role,model,input_tokens,output_tokens,cache_creation_tokens FROM token_usage ORDER BY id")
+                    .unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))
+                    .unwrap().collect::<Result<_, _>>().unwrap();
+                assert_eq!(rows.len(), 2, "both real production CLI stages must persist measured usage; rows={rows:?}; wrapper_calls={:?}",
+                    std::fs::read_to_string(home.join("cli-count")));
+                for row in &rows {
+                    assert_eq!((&*row.0, &*row.1, &*row.2, row.3, &row.4, &*row.5),
+                        ("goal-acceptance-judge", "evolution", "fixture-goal", 1, &None, "claude-haiku-4-5"));
+                }
+                assert_eq!((rows[0].6, rows[0].7, rows[0].8), (9, 12, 31));
+                assert_eq!((rows[1].6, rows[1].7, rows[1].8), (13, 7, 23));
+
+                // Successful prose without a usage event cannot become a
+                // fabricated zero-cost row, including outside review scope.
+                run_utility_prompt(&home, None, "unmeasured-utility", "", "fixture", 16).await.unwrap();
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM token_usage", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+                assert!(crate::runtime::GOAL_ROUND_ATTRIBUTION.try_with(|_| ()).is_err());
+
+                // A synthetic assistant error must not replace a genuinely
+                // observed model before terminal measured error usage arrives.
+                assert!(run_utility_prompt(&home, None, "synthetic-after-model", "", "fixture", 16).await.is_err());
+                let observed: (String, i64, i64, i64, Option<String>, Option<i64>, Option<String>) = conn
+                    .query_row("SELECT model,input_tokens,output_tokens,cache_creation_tokens,episode_id,round,role FROM token_usage WHERE agent_id='synthetic-after-model'", [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).unwrap();
+                assert_eq!(observed, ("claude-haiku-4-5".into(), 17, 3, 5, None, None, None));
+                assert!(run_utility_prompt(&home, None, "synthetic-only", "", "fixture", 16).await.is_err());
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM token_usage", [], |r| r.get::<_, i64>(0)).unwrap(), 3,
+                    "synthetic-only cannot establish a real model or produce a cost row");
+            });
+            return;
+        }
+
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let bin = home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // This intentionally requests a different model from the one the
+        // result actually reports, so the recorder cannot copy a config name.
+        std::fs::write(home.join("config.toml"),
+            "[runtime]\nutility_provider = \"claude\"\nutility_model = \"claude-sonnet-4-6\"\n").unwrap();
+        for (file, reply, input, output, cache) in [
+            ("first.jsonl", r#"{"decision":"candidate_complete","evidence":"delivered fixture","next_step":"check delivery","blocker_key":null}"#, 9, 12, 31),
+            ("second.jsonl", "PASS\nfixture accepted", 13, 7, 23),
+        ] {
+            let result = serde_json::json!({"type":"result","subtype":"success","is_error":false,
+                "result":reply,"usage":{"input_tokens":input,"output_tokens":output,
+                    "cache_read_input_tokens":0,"cache_creation_input_tokens":cache},
+                "modelUsage":{"claude-haiku-4-5":{"inputTokens":input,"outputTokens":output,
+                    "cacheReadInputTokens":0,"cacheCreationInputTokens":cache}}});
+            std::fs::write(home.join(file), format!("{result}\n")).unwrap();
+        }
+        std::fs::write(home.join("unmeasured.jsonl"),
+            "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"PASS\"}\n").unwrap();
+        for (file, real_model, input, output, cache) in [
+            ("synthetic-after-model.jsonl", true, 17, 3, 5),
+            ("synthetic-only.jsonl", false, 21, 4, 6),
+        ] {
+            let mut lines = String::new();
+            if real_model {
+                lines.push_str(&format!("{}\n", serde_json::json!({"type":"assistant",
+                    "message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"started fixture"}]}})));
+            }
+            lines.push_str(&format!("{}\n", serde_json::json!({"type":"assistant",
+                "message":{"model":"<synthetic>","content":[{"type":"text","text":"synthetic error fixture"}]}})));
+            lines.push_str(&format!("{}\n", serde_json::json!({"type":"result","is_error":true,
+                "subtype":"error_during_execution","result":"fixture terminal error",
+                "usage":{"input_tokens":input,"output_tokens":output,"cache_read_input_tokens":0,"cache_creation_input_tokens":cache}})));
+            std::fs::write(home.join(file), lines).unwrap();
+        }
+        let wrapper = bin.join("claude");
+        std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '99999.0.0\\n'; exit 0; fi\nif [ \"$1\" = auth ]; then printf '{\"loggedIn\":false}\\n'; exit 0; fi\nn=0\nif [ -f \"$HOME/cli-count\" ]; then n=$(/bin/cat \"$HOME/cli-count\"); fi\nn=$((n+1))\nprintf '%s' \"$n\" > \"$HOME/cli-count\"\ncase \"$n\" in\n1) /bin/cat \"$HOME/first.jsonl\";;\n2) /bin/cat \"$HOME/second.jsonl\";;\n3) /bin/cat \"$HOME/unmeasured.jsonl\";;\n4) /bin/cat \"$HOME/synthetic-after-model.jsonl\";;\n5) /bin/cat \"$HOME/synthetic-only.jsonl\";;\n*) exit 2;;\nesac\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Global telemetry/CLI discovery are process singletons. An isolated
+        // child test keeps PATH/HOME/auth and parent parallel tests untouched.
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        // module_path! includes the crate prefix; libtest names do not.
+        let full_test_name = concat!(module_path!(), "::goal_judge_claude_cli_records_measured_usage_without_api");
+        let test_name = full_test_name.split_once("::").unwrap().1;
+        command.env_clear().env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", home).env(CHILD_HOME, home)
+            .args(["--exact", test_name, "--nocapture"])
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).process_group(0);
+        let mut child = command.spawn().unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if child.try_wait().unwrap().is_some() { break; }
+            if started.elapsed() > std::time::Duration::from_secs(15) {
+                let _ = duduclaw_core::platform::kill_process_group(child.id());
+                let _ = child.wait();
+                panic!("isolated judge CLI fixture exceeded its deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "child must execute the fixture test: {}", String::from_utf8_lossy(&output.stdout));
+        assert!(output.status.success(), "isolated CLI regression: {} {}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert_eq!(std::fs::read_to_string(home.join("cli-count")).unwrap(), "5");
     }
 
     #[test]

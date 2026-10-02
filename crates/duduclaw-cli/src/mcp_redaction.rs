@@ -258,6 +258,11 @@ pub fn redact_tool_result_with(
     };
 
     let ctx = duduclaw_redaction::ToolContext { tool_name, args };
+    // MCP image blocks carry base64 pixels, not text: a text rule matching
+    // inside the base64 (a digit run, say) would corrupt the PNG. They are
+    // set aside for the text pass and put back afterwards; screenshots are
+    // masked at capture time instead.
+    let images = take_image_data(value);
     if let Err(e) = pipeline.redact_value(value, &ctx) {
         tracing::error!(
             target: "duduclaw_cli::mcp_redaction",
@@ -267,6 +272,40 @@ pub fn redact_tool_result_with(
             "redact_tool_result: redact failed; withholding the whole result"
         );
         *value = Value::String(REDACTION_FAILED_PLACEHOLDER.to_string());
+        return;
+    }
+    restore_image_data(value, images);
+}
+
+/// Remove the `data` of every `{"type":"image"}` block in a tool result's
+/// `content`, returning `(index, data)` pairs for [`restore_image_data`].
+fn take_image_data(value: &mut Value) -> Vec<(usize, Value)> {
+    let Some(blocks) = value.get_mut("content").and_then(Value::as_array_mut) else {
+        return Vec::new();
+    };
+    let mut taken = Vec::new();
+    for (i, block) in blocks.iter_mut().enumerate() {
+        if block.get("type").and_then(Value::as_str) == Some("image") {
+            if let Some(data) = block.get_mut("data") {
+                taken.push((i, std::mem::replace(data, Value::String(String::new()))));
+            }
+        }
+    }
+    taken
+}
+
+/// Put back what [`take_image_data`] removed (only into blocks that are
+/// still image blocks at the same index).
+fn restore_image_data(value: &mut Value, taken: Vec<(usize, Value)>) {
+    let Some(blocks) = value.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (i, data) in taken {
+        if let Some(block) = blocks.get_mut(i)
+            && block.get("type").and_then(Value::as_str) == Some("image")
+        {
+            block["data"] = data;
+        }
     }
 }
 
@@ -566,5 +605,28 @@ category = "PERSON"
         assert_eq!(r["error"]["code"], -32007);
         assert_eq!(r["error"]["data"]["tool"], "web_fetch");
         assert_eq!(r["error"]["data"]["tokens_seen"], 2);
+    }
+}
+#[cfg(test)]
+mod image_block_tests {
+    use super::*;
+
+    #[test]
+    fn image_data_is_set_aside_and_restored() {
+        let mut v = serde_json::json!({"content": [
+            {"type": "image", "data": "iVBORw0KGgo0912345678", "mimeType": "image/png"},
+            {"type": "text", "text": "已用 1/50 個動作"}
+        ]});
+        let taken = take_image_data(&mut v);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(v["content"][0]["data"], "");
+        v["content"][1]["text"] = Value::String("redacted".into());
+        restore_image_data(&mut v, taken);
+        assert_eq!(v["content"][0]["data"], "iVBORw0KGgo0912345678");
+        assert_eq!(v["content"][1]["text"], "redacted");
+        // A result replaced by the failure placeholder gets nothing back.
+        let mut failed = Value::String(REDACTION_FAILED_PLACEHOLDER.into());
+        restore_image_data(&mut failed, vec![(0, Value::String("x".into()))]);
+        assert_eq!(failed, Value::String(REDACTION_FAILED_PLACEHOLDER.into()));
     }
 }

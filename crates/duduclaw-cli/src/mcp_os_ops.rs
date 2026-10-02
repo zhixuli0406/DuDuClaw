@@ -521,9 +521,10 @@ async fn require_factory_reset_approval_via(
     } else {
         caller_client_id
     };
-    match crate::mcp::run_install_approval(
+    match crate::mcp::run_tool_approval(
         broker,
         agent_id,
+        "os_factory_reset",
         "系統操作員 agent 要求執行 factory reset：清除裝置狀態並於下次開機重新佈建。",
         json!({ "tool": "os_factory_reset" }),
         FACTORY_RESET_APPROVAL_TTL_SECONDS,

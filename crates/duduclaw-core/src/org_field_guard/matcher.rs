@@ -286,6 +286,20 @@ pub(super) fn agents_dir_segments(normalized_command: &str) -> Vec<&str> {
     out
 }
 
+/// Whether any path in `normalized_command` (already lowercased, `/`
+/// separators) has a component that is exactly the removed-employee directory
+/// name (`_trash`). Component equality, never a substring test, so
+/// `my_trash/` or `_trash_old` do not count. Catches the spellings the
+/// `agents/<id>/` scan cannot see, notably the cwd-relative `../_trash/…`
+/// (an agent's Bash cwd is its own agent directory). Speed bump only, like the
+/// rest of this module: `T=_tr; rm -rf ../${T}ash` evades it.
+pub(super) fn mentions_removed_agent_area(normalized_command: &str) -> bool {
+    let trash = crate::agent_trash::AGENT_TRASH_DIR.to_ascii_lowercase();
+    normalized_command
+        .split(|c: char| c.is_whitespace() || matches!(c, '/' | '\'' | '"' | ';' | '&' | '|' | '(' | ')' | '<' | '>' | '='))
+        .any(|component| component == trash)
+}
+
 /// Find a `agents/<id>/` path segment in `normalized_command` whose `<id>`
 /// is not `caller_id`. Returns the first match. See
 /// [`agents_dir_segments`] for the boundary-check contract.
@@ -305,9 +319,11 @@ pub(super) fn mentions_other_agent_dir(normalized_command: &str, caller_id: &str
 /// directory prefix (or lack thereof) independent of unrelated `agents/`
 /// text elsewhere in the command. A token is "own" when either:
 ///
-/// - it is a bare/relative filename (no `/` at all) — an agent's Bash cwd is
-///   its own agent directory, so an unqualified `SOUL.md` can only resolve
-///   to its own file; or
+/// - it is a bare/relative filename whose directory part lexically
+///   normalises to nothing (`SOUL.md`, `./SOUL.md`, `././SOUL.md`,
+///   `.//SOUL.md`, `x/../SOUL.md`) — an agent's Bash cwd is its own agent
+///   directory, so such a spelling can only resolve to its own file
+///   (`../SOUL.md` keeps its `..` and does not count); or
 /// - its directory portion contains a boundary-checked `agents/<caller_id>/`
 ///   segment (see [`agents_dir_segments`] — `myagents/<caller_id>/SOUL.md`
 ///   does NOT count, same false-positive guard as `mentions_other_agent_dir`
@@ -318,21 +334,65 @@ pub(super) fn mentions_other_agent_dir(normalized_command: &str, caller_id: &str
 /// case is caught earlier by [`mentions_other_agent_dir`] when a write verb
 /// is also present; in isolation it is simply not this caller's file.
 pub(super) fn mentions_own_soul_md(normalized_command: &str, caller_id: &str) -> bool {
+    mentions_own_agent_file(normalized_command, caller_id, "soul.md")
+}
+
+/// Contract-lock companion of [`mentions_own_soul_md`]: whether
+/// `normalized_command` (already lowercased) targets `caller_id`'s OWN
+/// `CONTRACT.toml` via Bash. Same per-token rules, same caveats.
+pub(super) fn mentions_own_contract_toml(normalized_command: &str, caller_id: &str) -> bool {
+    mentions_own_agent_file(normalized_command, caller_id, "contract.toml")
+}
+
+/// Shared body of the "own file" Bash matchers. `basename_lower` must be
+/// lowercase, matching the already-lowercased command.
+fn mentions_own_agent_file(normalized_command: &str, caller_id: &str, basename_lower: &str) -> bool {
     let caller_lower = caller_id.to_ascii_lowercase();
     normalized_command.split_whitespace().any(|raw_tok| {
         let tok = raw_tok.trim_matches(|c: char| matches!(c, '\'' | '"' | '>' | '<'));
-        // Only a token whose filename component is *exactly* `soul.md`
+        // Only a token whose filename component is *exactly* the basename
         // qualifies — `strip_suffix` on e.g. "old_soul.md" leaves a
         // non-empty, non-`/`-terminated remainder ("old_"), which the match
         // below correctly rejects instead of treating it as a directory.
-        let Some(rest) = tok.strip_suffix("soul.md") else {
+        let Some(rest) = tok.strip_suffix(basename_lower) else {
             return false;
         };
         match rest.strip_suffix('/') {
             None if rest.is_empty() => true, // bare "soul.md" ⇒ own file (cwd is the agent's own dir)
             None => false,                   // e.g. "old_soul.md" — not a real path boundary
-            Some(dir) if dir.is_empty() => true, // "/soul.md" — no agent dir named at all
-            Some(dir) => agents_dir_segments(dir).into_iter().any(|seg| seg == caller_lower),
+            Some(dir) => {
+                // Lexical only — the filesystem is never consulted. `./`,
+                // `././`, `.//` and `x/../` collapse to nothing, i.e. the
+                // same cwd-relative spelling as a bare `soul.md`; "/soul.md"
+                // (no agent dir named at all) also lands here.
+                let dir = lexical_dir(dir);
+                dir.is_empty()
+                    || agents_dir_segments(&dir).into_iter().any(|seg| seg == caller_lower)
+            }
         }
     })
+}
+
+/// Lexically normalise the directory part of a `/`-separated command token:
+/// drop empty and `.` segments, and let `..` cancel the preceding ordinary
+/// segment. A `..` with nothing to cancel is kept, so `../soul.md` (the
+/// agents root, not the caller's own directory) never collapses to the empty
+/// "cwd" spelling. Leading `/` is not preserved — callers only ask "is
+/// anything left" and "which `agents/<id>/` segments are named", and
+/// [`agents_dir_segments`] already treats a string start as a boundary.
+fn lexical_dir(dir: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in dir.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => match out.last() {
+                Some(last) if *last != ".." => {
+                    out.pop();
+                }
+                _ => out.push(".."),
+            },
+            other => out.push(other),
+        }
+    }
+    out.join("/")
 }

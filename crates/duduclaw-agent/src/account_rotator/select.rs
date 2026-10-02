@@ -32,7 +32,8 @@ impl AccountRotator {
     /// pool. If the config declares no accounts for `provider`, a single
     /// ephemeral account is synthesized from the provider's standard env var
     /// (e.g. `OPENAI_API_KEY`) so a user with just that env var still rotates
-    /// (trivially) through the same machinery.
+    /// (trivially) through the same machinery. This fallback is disabled by
+    /// `[account_loading] inherit_host_credentials = false`.
     pub async fn select_for_provider(&self, provider: &str) -> Option<AccountEnv> {
         self.select_for_provider_with_pool(provider, &[]).await
     }
@@ -91,9 +92,10 @@ impl AccountRotator {
         }
 
         if available.is_empty() {
-            if !has_any_for_provider {
-                // No configured accounts for this provider → env-var fallback.
-                drop(accounts);
+            if !has_any_for_provider && self.inherit_host_credentials.load(Ordering::Relaxed) {
+                // Hold the accounts read lock through synchronous env lookup
+                // so a reload cannot publish a different inheritance policy
+                // between checking it and synthesizing an ambient account.
                 return env_fallback_account_env(provider);
             }
             warn!(provider, "No available accounts for rotation");

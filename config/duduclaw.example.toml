@@ -260,7 +260,7 @@ port = 18789
 #   grok 1.0.41      --reasoning-effort <v>              low medium high  (values
 #                                                        undocumented — capped
 #                                                        conservatively)
-#   gemini           (no flag exists — logged and ignored)
+#   gemini           (deprecated; no flag exists — logged and ignored)
 #
 # So `effort = "max"` on a codex agent runs at `xhigh`, and on an antigravity or
 # grok agent at `high`. It is never dropped silently and never sent as a value
@@ -380,7 +380,7 @@ port = 18789
 # override. Both are optional; unset ⇒ the judge uses the ordinary utility
 # model ([runtime] utility_provider / utility_model), exactly as before.
 #
-# judge_provider = "gemini"              # A runtime id: claude | codex | gemini | …
+# judge_provider = "antigravity"        # A runtime id: claude | codex | antigravity | … (gemini is deprecated in v1.67.0, removed in v1.69.0)
 # judge_model = "gemini-3-pro-preview"   # Model id within that runtime
 #
 # Rules:
@@ -434,7 +434,7 @@ port = 18789
 # model = "claude-sonnet-4-6"
 #
 # [team.roles.verifier]
-# runtime = "gemini"          # Must not share the executor's model family (hard rule)
+# runtime = "antigravity"     # Must not share the executor's model family (hard rule)
 # model = "gemini-3-pro-preview"
 #
 # [team.roles.utility]
@@ -506,6 +506,58 @@ port = 18789
 # Specialist settings. Everything below is off, empty, or already correct
 # for a normal install — reach for it when you have a specific reason.
 # ═══════════════════════════════════════════════════════════════════════
+
+# ── Task sandbox (per-agent container isolation) ───────────
+# Applies to agents with `agent.toml [container] sandbox_enabled = true`
+# (which also needs `network_access = true`). `image` also applies to the
+# script sandbox (PTC `execute_program`, `secaudit` PoC). The two escape
+# hatches are separate keys: `when_unavailable` for delegated tasks,
+# `script_when_unavailable` for PTC scripts (secaudit never runs on the host).
+# Docker only; the image is never pulled automatically (`docker pull <image>`).
+# Read on every sandboxed task.
+# An unknown key or a bad value makes the whole section invalid, and an
+# invalid section means the sandbox is unavailable (the task fails).
+# tmp_bytes + workspace_bytes must not exceed memory_bytes.
+# Guide: docs/guides/task-sandbox.md
+# [container.sandbox]
+# image = "ghcr.io/zhixuli0406/duduclaw:v<version>"  # Default: the platform image for the running version
+# memory_bytes = 4294967296    # 4 GiB (max 64 GiB)
+# pids = 128
+# cpu_millis = 1000            # Thousandths of a core
+# tmp_bytes = 268435456        # 256 MiB writable /tmp (tmpfs, max 16 GiB)
+# workspace_bytes = 536870912  # 512 MiB /workspace working directory (tmpfs, max 16 GiB)
+# max_turns = 30               # Step limit per task
+# when_unavailable = "fail"    # fail | run_unsandboxed (runs on the host WITHOUT isolation; audited as task_sandbox_bypassed)
+# script_when_unavailable = "fail"  # PTC scripts only: fail | run_unsandboxed (runs the script on the host; audited as script_sandbox_bypassed)
+# [container.sandbox.executables]   # In-image path per runtime; only for a custom image
+# claude = "/usr/bin/claude"
+# codex = "/usr/bin/codex"
+# gemini = "/usr/bin/gemini"
+# antigravity = "/usr/local/bin/agy"
+# grok = "/usr/local/bin/grok"
+# openai-compat = "/usr/local/bin/python3"
+
+# ── Computer use (L5 container image) ──────────────────────
+# Image for computer-use sessions (agents with `agent.toml [capabilities]
+# computer_use = true`). Default: ghcr.io/zhixuli0406/duduclaw-computer-use:v<version>,
+# published per release by .github/workflows/computer-use-image.yml.
+# The image is never pulled automatically (`docker pull <image>`). To run a
+# local build instead (repo root:
+#   docker build -f container/Dockerfile.computer-use -t duduclaw-computer-use:latest .)
+# set the key below. A digest reference is accepted. One global key, no
+# per-agent override. An unknown key or a bad value makes the section
+# invalid, and an invalid section means computer use is unavailable (never
+# a fallback to the default). Read on every computer-use session start
+# (by the eight computer_* MCP tools, the only computer-use path).
+# Guide: docs/features/08-browser-automation.md
+# [computer_use]
+# image = "duduclaw-computer-use:latest"
+#
+# Which sites a tool-driven session may open is per agent, not here. Without
+# it the session container has no network at all:
+#   # agents/<id>/agent.toml
+#   [capabilities.computer_use_config]
+#   allowed_domains = ["example.com"]   # exact hostnames, at most 20
 
 # ── Delegation authority ────────────────────────────────────
 # Who may hand work to whom. The `reports_to` tree is the authority; this

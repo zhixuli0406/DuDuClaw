@@ -8,6 +8,9 @@ use super::*;
 pub(crate) fn task_row_to_json(r: &TaskRow) -> Value {
     json!({
         "id": r.id,
+        // Canonical `TaskKind` spelling; the dashboard locks discovery rows
+        // read-only and keeps them off the goal board based on this field.
+        "kind": r.kind.as_str(),
         "title": r.title,
         "description": r.description,
         "status": r.status,
@@ -87,6 +90,13 @@ pub(crate) fn task_iteration_to_json(r: &TaskIterationRow) -> Value {
             .and_then(|s| serde_json::from_str::<Value>(s).ok()),
         "dispatch_count": r.dispatch_count,
         "repeat_streak": r.repeat_streak,
+        // A1 ledger (2026-09-30): additive fields; null on older rows. The
+        // larger JSON blobs (gate inputs, state block, knobs) stay in the DB
+        // for offline analysis and are not shipped to the timeline.
+        "evaluator_verdict": r.evaluator_verdict,
+        "iter_seq": r.iter_seq,
+        "team_mode": r.team_mode,
+        "pause_reason": r.pause_reason,
     })
 }
 

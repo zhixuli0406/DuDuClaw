@@ -709,6 +709,15 @@ pub enum TeamNote {
         role: Role,
         effort: crate::effort::Effort,
     },
+    /// The role runs on a runtime the catalog marks deprecated (e.g. the
+    /// Gemini CLI, R1 2026-10). The role still resolves and runs; the note
+    /// carries the replacement and removal version for the caller's log.
+    ///
+    /// Never pushed into [`ResolvedTeam::notes`] — it is derived on demand by
+    /// [`ResolvedTeam::deprecation_notes`], so a deprecation (a change in
+    /// what the platform *says*, not in what a config *does*) leaves the
+    /// resolved team byte-identical.
+    DeprecatedRuntime { role: Role, runtime: &'static str },
 }
 
 impl TeamNote {
@@ -718,6 +727,7 @@ impl TeamNote {
             TeamNote::ExecutorFanoutClamped { .. } => "executor_fanout_clamped",
             TeamNote::UnknownGateMode { .. } => "unknown_gate_mode",
             TeamNote::EffortWithoutRoleBinding { .. } => "effort_without_role_binding",
+            TeamNote::DeprecatedRuntime { .. } => "deprecated_runtime",
         }
     }
 }
@@ -739,6 +749,12 @@ impl std::fmt::Display for TeamNote {
                 "[team.roles.{role}] effort `{effort}` is ignored: the role declares neither \
                  runtime nor model, so it cascades to the employee's own model"
             ),
+            TeamNote::DeprecatedRuntime { role, runtime } => {
+                match crate::runtime_catalog::spec_for(runtime).and_then(|s| s.deprecation) {
+                    Some(dep) => write!(f, "[team.roles.{role}] {}", dep.notice(runtime)),
+                    None => write!(f, "[team.roles.{role}] runtime `{runtime}` is deprecated"),
+                }
+            }
         }
     }
 }
@@ -884,6 +900,25 @@ impl ResolvedTeam {
             Role::Verifier => Some(&self.verifier),
             Role::Utility => self.utility.as_ref(),
         }
+    }
+
+    /// One [`TeamNote::DeprecatedRuntime`] per bound role whose runtime the
+    /// catalog marks deprecated, in planner → executor → verifier → utility
+    /// order. Empty for a team with no deprecated runtime. Derived rather
+    /// than stored so [`Self::notes`] is unchanged by a deprecation.
+    pub fn deprecation_notes(&self) -> Vec<TeamNote> {
+        [Role::Planner, Role::Executor, Role::Verifier, Role::Utility]
+            .into_iter()
+            .filter_map(|r| self.role(r))
+            .filter(|rr| {
+                crate::runtime_catalog::spec_for(rr.runtime)
+                    .is_some_and(|s| s.deprecation.is_some())
+            })
+            .map(|rr| TeamNote::DeprecatedRuntime {
+                role: rr.role,
+                runtime: rr.runtime,
+            })
+            .collect()
     }
 }
 
@@ -1213,6 +1248,19 @@ impl RuntimeType {
     pub fn valid_values() -> String {
         crate::runtime_catalog::id_list_pipe()
     }
+
+    /// This runtime's deprecation window, from the catalog (the single source
+    /// of the version strings). `None` ⇒ not deprecated.
+    pub fn deprecation(&self) -> Option<crate::runtime_catalog::RuntimeDeprecation> {
+        self.spec().deprecation
+    }
+
+    /// `true` ⇒ the runtime still parses and runs, but is scheduled for
+    /// removal. Never consulted by [`Self::parse`] — deprecation changes what
+    /// callers *say*, not what a value resolves to.
+    pub fn is_deprecated(&self) -> bool {
+        self.deprecation().is_some()
+    }
 }
 
 /// Product *form factor* of a DuDuClaw deployment, orthogonal to the license
@@ -1474,8 +1522,8 @@ pub struct ContainerConfig {
     pub cmd: Vec<String>,
     /// Environment variables to inject into the container, as `(key, value)` pairs.
     ///
-    /// HC5: used to inject `DUDUCLAW_PTC_SOCKET` so in-container scripts can reach
-    /// the host RPC bridge over the bind-mounted UDS socket.
+    /// The PTC script sandbox passes none: scripts get no RPC socket or
+    /// tool bridge.
     #[serde(default)]
     pub env: Vec<(String, String)>,
 }
@@ -1541,15 +1589,17 @@ pub struct PermissionsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CapabilitiesConfig {
-    /// Allow Claude Code's `computer_use` tool (screenshot + mouse + keyboard).
-    /// WARNING: operates on the host display — only enable for attended local use.
+    /// Allow the `computer_*` MCP tools (screenshot + mouse + keyboard in a
+    /// gateway-owned container session).
     #[serde(default)]
     pub computer_use: bool,
 
     /// Computer use execution mode.
-    /// - `container` (default): L5a — run inside Docker/Apple Container with Xvfb.
-    /// - `native`: L5b — directly control the host desktop (enigo + OS screen capture).
-    /// - `auto`: choose based on agent trust level and task requirements.
+    /// - `container` (default): L5a — run inside a Docker container with Xvfb.
+    /// - `native`: removed. Still parses; the `computer_*` tools refuse an
+    ///   employee set to it (no fallback to a container) and `duduclaw
+    ///   doctor` lists such employees.
+    /// - `auto`: treated as `container`.
     #[serde(default)]
     pub computer_use_mode: ComputerUseMode,
 
@@ -1829,7 +1879,8 @@ pub struct ToolPolicy {
 pub enum ComputerUseMode {
     /// L5a: run inside an isolated container with Xvfb virtual display.
     Container,
-    /// L5b: directly control the host desktop (requires explicit trust).
+    /// Removed (it drove the host desktop). Kept so existing `agent.toml`
+    /// files parse; every computer-use entry point refuses it.
     Native,
     /// Auto-select based on agent trust level and task requirements.
     Auto,
@@ -1859,6 +1910,78 @@ pub struct ComputerUseCapConfig {
     pub display_height: u32,
     /// Automatically confirm trusted operations (in allowed_apps whitelist).
     pub auto_confirm_trusted: bool,
+    /// Hosts a tool-driven computer-use session may open (`computer_navigate`).
+    /// Exact hostnames only; read through [`Self::navigation_hosts`], which
+    /// drops invalid entries. Empty (default) = no network at all. The
+    /// chat-driven gateway loop ignores this list and always runs without
+    /// network.
+    #[serde(deserialize_with = "crate::lenient::string_vec")]
+    pub allowed_domains: Vec<String>,
+}
+
+/// Most hosts a computer-use navigation allowlist may hold (after
+/// de-duplication); later entries are dropped.
+pub const COMPUTER_USE_MAX_ALLOWED_DOMAINS: usize = 20;
+
+/// [`ComputerUseCapConfig::navigation_hosts`]: the usable hosts and the raw
+/// entries that were dropped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NavigationHosts {
+    /// Lowercased, de-duplicated, valid hostnames (at most
+    /// [`COMPUTER_USE_MAX_ALLOWED_DOMAINS`]), in configuration order.
+    pub hosts: Vec<String>,
+    /// Entries that were not usable (invalid shape, wildcard, IP literal,
+    /// port/path-bearing, or over the cap).
+    pub dropped: Vec<String>,
+}
+
+/// Normalize one navigation-allowlist entry: trimmed and lowercased, then
+/// accepted only when it is an exact hostname per
+/// [`crate::is_valid_egress_host`] (no wildcard) whose last label starts with
+/// an ASCII letter (so numeric forms such as `1.2.3` or `0x7f000001`, which
+/// resolvers read as IP addresses, are refused too).
+pub fn normalize_navigation_host(entry: &str) -> Option<String> {
+    let host = entry.trim().to_ascii_lowercase();
+    if host.starts_with('*') || !crate::is_valid_egress_host(&host) {
+        return None;
+    }
+    let last = host.rsplit('.').next()?;
+    if !last.as_bytes().first().is_some_and(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(host)
+}
+
+impl ComputerUseCapConfig {
+    /// The usable navigation allowlist: every entry normalized with
+    /// [`normalize_navigation_host`], duplicates removed, capped at
+    /// [`COMPUTER_USE_MAX_ALLOWED_DOMAINS`]. Each dropped entry logs a
+    /// warning (the entry itself is operator configuration, not a secret).
+    pub fn navigation_hosts(&self) -> NavigationHosts {
+        let mut out = NavigationHosts::default();
+        for raw in &self.allowed_domains {
+            match normalize_navigation_host(raw) {
+                Some(host) if out.hosts.contains(&host) => {}
+                Some(host) if out.hosts.len() < COMPUTER_USE_MAX_ALLOWED_DOMAINS => out.hosts.push(host),
+                Some(_) => {
+                    tracing::warn!(
+                        entry = %crate::truncate_chars(raw, 80),
+                        max = COMPUTER_USE_MAX_ALLOWED_DOMAINS,
+                        "computer_use_config.allowed_domains: over the limit, entry ignored"
+                    );
+                    out.dropped.push(raw.clone());
+                }
+                None => {
+                    tracing::warn!(
+                        entry = %crate::truncate_chars(raw, 80),
+                        "computer_use_config.allowed_domains: not an exact hostname (wildcard, IP address, port or path), entry ignored"
+                    );
+                    out.dropped.push(raw.clone());
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Default for ComputerUseCapConfig {
@@ -1875,6 +1998,7 @@ impl Default for ComputerUseCapConfig {
             display_width: 1280,
             display_height: 800,
             auto_confirm_trusted: false,
+            allowed_domains: Vec::new(),
         }
     }
 }
@@ -3269,6 +3393,11 @@ pub struct ForkSection {
     #[serde(deserialize_with = "crate::lenient::opt")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub judge: Option<String>,
+    /// Hours a retained (unresolved) branch workspace under `<home>/fork_ws/`
+    /// survives before the sweep deletes it. Missing / `< 1` ⇒ `24`.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_workspace_ttl_hours: Option<i64>,
 }
 
 impl Default for ForkSection {
@@ -3283,6 +3412,7 @@ impl Default for ForkSection {
             test_timeout_s: None,
             fine_grained_judge: false,
             judge: None,
+            retained_workspace_ttl_hours: None,
         }
     }
 }
@@ -5336,6 +5466,45 @@ runtime = "gemini"
         assert_eq!(ncodes.len(), n);
     }
 
+    /// R1 (2026-10): a role on the deprecated Gemini CLI still validates and
+    /// leaves `notes` untouched; the deprecation surfaces only through the
+    /// derived `deprecation_notes()`.
+    #[test]
+    fn a_gemini_role_resolves_unchanged_and_yields_a_derived_deprecation_note() {
+        let c = team(
+            r#"
+[roles.executor]
+runtime = "codex"
+[roles.verifier]
+runtime = "gemini"
+"#,
+        );
+        let r = validate_team(&c).unwrap();
+        assert_eq!(r.verifier.runtime, "gemini");
+        assert!(r.notes.is_empty(), "deprecation must not alter notes");
+        let dn = r.deprecation_notes();
+        assert_eq!(
+            dn,
+            vec![TeamNote::DeprecatedRuntime {
+                role: Role::Verifier,
+                runtime: "gemini"
+            }]
+        );
+        assert_eq!(dn[0].code(), "deprecated_runtime");
+        let text = dn[0].to_string();
+        assert!(text.contains("antigravity") && text.contains("v1.69.0"), "{text}");
+
+        let c = team(
+            r#"
+[roles.executor]
+runtime = "codex"
+[roles.verifier]
+runtime = "antigravity"
+"#,
+        );
+        assert!(validate_team(&c).unwrap().deprecation_notes().is_empty());
+    }
+
     // ── agent.toml round-trip ───────────────────────────────────────────
 
     #[test]
@@ -5434,5 +5603,64 @@ credit_rate = 2.0
         let out = toml::to_string(&cfg).unwrap();
         assert!(!out.contains("accounts"), "re-serialized: {out}");
         assert!(!out.contains("credit_rate"), "re-serialized: {out}");
+    }
+
+    // ── computer-use navigation allowlist ─────────────────────────────────
+
+    #[test]
+    fn navigation_hosts_normalize_dedup_and_drop_invalid() {
+        let cfg = ComputerUseCapConfig {
+            allowed_domains: vec![
+                " Example.COM ".into(),
+                "example.com".into(),
+                "docs.example.com".into(),
+                "*.example.com".into(),
+                "93.184.216.34".into(),
+                "1.2.3".into(),
+                "0x7f000001".into(),
+                "example.com:443".into(),
+                "example.com/path".into(),
+                "https://example.com".into(),
+                "".into(),
+                "user@example.com".into(),
+                "[::1]".into(),
+            ],
+            ..Default::default()
+        };
+        let got = cfg.navigation_hosts();
+        assert_eq!(got.hosts, vec!["example.com".to_string(), "docs.example.com".to_string()]);
+        assert_eq!(got.dropped.len(), 10);
+    }
+
+    #[test]
+    fn navigation_hosts_cap_at_twenty() {
+        let cfg = ComputerUseCapConfig {
+            allowed_domains: (0..25).map(|i| format!("h{i}.example.com")).collect(),
+            ..Default::default()
+        };
+        let got = cfg.navigation_hosts();
+        assert_eq!(got.hosts.len(), COMPUTER_USE_MAX_ALLOWED_DOMAINS);
+        assert_eq!(got.hosts[0], "h0.example.com");
+        assert_eq!(got.dropped.len(), 5);
+    }
+
+    #[test]
+    fn allowed_domains_reads_from_toml_and_tolerates_wrong_types() {
+        let caps: CapabilitiesConfig = toml::from_str(
+            "computer_use = true\n[computer_use_config]\nallowed_domains = [\"example.com\", 7]\n",
+        )
+        .unwrap();
+        assert!(caps.computer_use);
+        assert_eq!(caps.computer_use_config.allowed_domains, vec!["example.com".to_string()]);
+        // A non-array value degrades to empty without losing the rest.
+        let caps: CapabilitiesConfig = toml::from_str(
+            "computer_use = true\n[computer_use_config]\nmax_actions = 9\nallowed_domains = \"example.com\"\n",
+        )
+        .unwrap();
+        assert!(caps.computer_use);
+        assert_eq!(caps.computer_use_config.max_actions, 9);
+        assert!(caps.computer_use_config.allowed_domains.is_empty());
+        // Absent = empty.
+        assert!(ComputerUseCapConfig::default().navigation_hosts().hosts.is_empty());
     }
 }

@@ -59,3 +59,5 @@ mod device_rpc_tests;
 mod system_settings_rpc_tests;
 mod power_local_dispatch_tests;
 mod db_source_capability_tests;
+mod runtime_deprecation_tests;
+mod agents_inspect_sandbox_tests;

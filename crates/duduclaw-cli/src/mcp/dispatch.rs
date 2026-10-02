@@ -81,12 +81,16 @@ pub(crate) async fn handle_tools_call(
             // ── 2026-07 additions (verified mutating, previously untracked) ──
             | "execute_program"
             | "office_script"
+            // `computer_screenshot` is audited too (summary only: the image
+            // block never reaches `extract_tool_result_text`).
+            | "computer_screenshot"
             | "computer_click"
             | "computer_type"
             | "computer_key"
             | "computer_scroll"
             | "computer_session_start"
             | "computer_session_stop"
+            | "computer_navigate"
             | "shared_wiki_delete"
             | "canvas_push"
             | "canvas_clear"
@@ -263,7 +267,13 @@ pub(crate) async fn handle_tools_call(
         "create_reminder" => handle_create_reminder(&arguments, home_dir, default_agent).await,
         "list_reminders" => handle_list_reminders(&arguments, home_dir, default_agent).await,
         "cancel_reminder" => handle_cancel_reminder(&arguments, home_dir, default_agent).await,
-        "create_agent" => handle_create_agent(&arguments, home_dir, default_agent).await,
+        // The org gates and the removed-name reservation judge the agent the
+        // call acts for: the process's `default_agent` on the internal key,
+        // the key's own client id otherwise (a per-agent key IS the agent).
+        "create_agent" => {
+            handle_create_agent(&arguments, home_dir, acting_agent_id(caller_client_id, default_agent))
+                .await
+        }
         "list_agents" => handle_list_agents(&arguments, home_dir, default_agent).await,
         "create_task" => handle_create_task(&arguments, home_dir, default_agent).await,
         "check_responses" => handle_check_responses(&arguments, home_dir).await,
@@ -272,7 +282,10 @@ pub(crate) async fn handle_tools_call(
         "spawn_agent" => handle_spawn_agent(&arguments, home_dir, default_agent).await,
         "spawn_ephemeral" => handle_spawn_ephemeral(&arguments, home_dir, default_agent).await,
         "agent_update" => handle_agent_update(&arguments, home_dir, default_agent).await,
-        "agent_remove" => handle_agent_remove(&arguments, home_dir, default_agent).await,
+        "agent_remove" => {
+            handle_agent_remove(&arguments, home_dir, acting_agent_id(caller_client_id, default_agent))
+                .await
+        }
         "agent_update_soul" => handle_agent_update_soul(&arguments, home_dir).await,
         // T5/O13 merged skill-search entry. `skill_bank_search` still routes
         // here (further down) as a deprecated alias that pins source="bank".
@@ -409,7 +422,7 @@ pub(crate) async fn handle_tools_call(
         // Skill Internalization tools
         "skill_extract" => handle_skill_extract(&arguments, home_dir, default_agent).await,
         // Program execution
-        "execute_program" => handle_execute_program(&arguments).await,
+        "execute_program" => handle_execute_program(&arguments, home_dir, default_agent).await,
         // Office document script execution (agent_id from caller context)
         "office_script" => handle_office_script(&arguments, home_dir, default_agent).await,
         // Skill Bank tools
@@ -425,6 +438,8 @@ pub(crate) async fn handle_tools_call(
         // Task Board tools
         "tasks_list" => handle_tasks_list(&arguments, home_dir, default_agent).await,
         "tasks_create" => handle_tasks_create(&arguments, home_dir, default_agent).await,
+        "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact" | "discovery_cancel" =>
+            handle_discovery_query(tool_name, &arguments, home_dir, default_agent).await,
         "tasks_update" => handle_tasks_update(&arguments, home_dir, default_agent).await,
         "tasks_claim" => handle_tasks_claim(&arguments, home_dir, default_agent).await,
         "tasks_renew" => handle_tasks_renew(&arguments, home_dir, default_agent).await,
@@ -483,7 +498,10 @@ pub(crate) async fn handle_tools_call(
                     "computer_use capability is not enabled for this agent. Set [capabilities] computer_use = true in agent.toml",
                 );
             }
-            handle_computer_use_tool(tool_name, &arguments).await
+            // The session lives in the gateway, which re-checks the
+            // capability, the image (never pulled; a missing image comes back
+            // as readable text naming the remedy), ownership and every action.
+            handle_computer_use_tool(tool_name, &arguments, home_dir, default_agent).await
         }
         // RFC-26: Live Run Forking tools (gated by Scope::ForkExecute + per-agent
         // [fork] enabled toggle checked inside each handler).
@@ -739,13 +757,15 @@ pub(crate) async fn handle_tools_call(
         } else {
             extract_tool_result_text(&result)
         };
+        // `computer_type`'s text never reaches the audit (F5): only its length.
+        let audit_arguments = audit_safe_arguments(tool_name, &arguments);
         duduclaw_security::audit::append_tool_call_with_input(
             home_dir,
             &actual_agent,
             tool_name,
             &params_summary,
             success,
-            Some(&arguments),
+            Some(&audit_arguments),
             result_text_for_grounding.as_deref(),
         );
     }

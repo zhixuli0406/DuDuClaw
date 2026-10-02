@@ -216,15 +216,51 @@ fn build_wrapped_argv(cmd: &Command, profile_path: &Path) -> Result<Vec<CString>
     Ok(argv)
 }
 
-/// Resolve the child environment (inherited parent env + the command's
-/// overrides) into `KEY=VALUE` C strings. `pre_exec`'s `execve` bypasses std's
-/// own env application, so we reproduce it here.
-fn build_envp(cmd: &Command) -> Result<Vec<CString>, SandboxError> {
+/// Resolve the child environment into `KEY=VALUE` C strings. `pre_exec`'s
+/// `execve` runs before std applies its environment, so both `env_clear` and
+/// explicit overrides must be respected here.
+fn build_envp(cmd: &mut Command) -> Result<Vec<CString>, SandboxError> {
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
 
-    let mut env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    // Command does not expose its inheritance flag. Its env_remove operation
+    // retains a None tombstone in inheriting mode, but removes the entry in
+    // env_clear mode (std::sys::process::env::CommandEnv::remove). Probe that
+    // distinction with a key containing '=': Unix environment names cannot
+    // contain the separator, so this can never remove a real parent variable.
+    // The harmless tombstone stays on Command because no public API erases it
+    // in inheriting mode; exclude it from our execve environment explicitly.
+    // This std behavior is covered by the live environment integration tests;
+    // those tests must run when upgrading the Rust toolchain.
+    const INHERITANCE_PROBE: &str = "=";
+    let has_probe = |command: &Command| {
+        command.get_envs().any(|(key, value)| {
+            key == OsStr::new(INHERITANCE_PROBE) && value.is_none()
+        })
+    };
+    // Verify the required std behavior on known states before interpreting the
+    // caller's state. A toolchain changing the tombstone semantics must refuse
+    // confinement rather than silently treating env_clear as inheritance.
+    let mut inherited = Command::new(SANDBOX_EXEC);
+    inherited.env_remove(INHERITANCE_PROBE);
+    let mut cleared = Command::new(SANDBOX_EXEC);
+    cleared.env_clear().env_remove(INHERITANCE_PROBE);
+    if !has_probe(&inherited) || has_probe(&cleared) {
+        return Err(SandboxError::Profile(
+            "cannot safely resolve Command environment inheritance".into(),
+        ));
+    }
+    cmd.env_remove(INHERITANCE_PROBE);
+    let inherits = has_probe(cmd);
+    let mut env: BTreeMap<OsString, OsString> = if inherits {
+        std::env::vars_os().collect()
+    } else {
+        BTreeMap::new()
+    };
     for (k, v) in cmd.get_envs() {
+        if k == OsStr::new(INHERITANCE_PROBE) {
+            continue;
+        }
         match v {
             Some(val) => {
                 env.insert(k.to_os_string(), val.to_os_string());

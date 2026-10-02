@@ -367,6 +367,107 @@ pub fn renew(home_dir: &Path, lease: &Lease, ttl_secs: u64) {
     });
 }
 
+/// Renew only a still-live slot with the same id and class. Missing, expired
+/// or revoked slots return false; malformed state and bounded lock/write
+/// failures propagate. Unlike `renew`, this never restores ownership.
+pub fn renew_checked(home_dir: &Path, lease: &Lease, ttl_secs: u64) -> std::io::Result<bool> {
+    use std::io::{Error, ErrorKind};
+    let Some(id) = &lease.id else { return Ok(false); };
+    let ttl_ms = i64::try_from(ttl_secs.checked_mul(1000)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "lease TTL overflow"))?)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "lease TTL overflow"))?;
+    if ttl_ms == 0 { return Ok(false); }
+    let path = home_dir.join(STATE_FILE);
+    let _lock = checked_state_lock(&path)?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut state: State = serde_json::from_slice(&bytes)
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+    let now_ms = now_epoch_ms();
+    let Some(record) = state.get_mut(id) else { return Ok(false); };
+    if record.class != lease.class || record.expires_ms <= now_ms { return Ok(false); }
+    record.expires_ms = now_ms.checked_add(ttl_ms)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "lease expiry overflow"))?;
+    save_state(&path, &state)?;
+    Ok(true)
+}
+
+fn checked_state_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    use fs2::FileExt;
+    use std::io::ErrorKind;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false)
+        .read(true).write(true).open(std::path::PathBuf::from(lock_path))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error) if error.kind() == ErrorKind::WouldBlock && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(lock)
+}
+
+/// Discovery admission must verify persisted authority and never fail open.
+pub fn try_acquire_checked(home_dir: &Path, class: &str, limit: Option<u32>, ttl_secs: u64)
+    -> std::io::Result<AcquireOutcome> {
+    use std::io::{Error, ErrorKind};
+    let cap = limit.filter(|cap| *cap > 0)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "checked admission requires a positive finite cap"))?;
+    if class.is_empty() || class.len() > 128
+        || !class.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')) {
+        return Err(Error::new(ErrorKind::InvalidInput, "invalid checked admission class"));
+    }
+    let ttl_ms = i64::try_from(ttl_secs.checked_mul(1000)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "lease TTL overflow"))?)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "lease TTL overflow"))?;
+    if ttl_ms == 0 { return Err(Error::new(ErrorKind::InvalidInput, "checked admission requires a positive TTL")); }
+    let path = home_dir.join(STATE_FILE);
+    let _lock = checked_state_lock(&path)?;
+    let mut state: State = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => State::new(),
+        Err(error) => return Err(error),
+    };
+    let now_ms = now_epoch_ms();
+    let active = count_class(&state, class, now_ms);
+    if active >= cap { return Ok(AcquireOutcome::AtCapacity { active, limit: cap }); }
+    let expires_ms = now_ms.checked_add(ttl_ms)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "lease expiry overflow"))?;
+    prune_expired(&mut state, now_ms);
+    let id = format!("{class}-{}", uuid::Uuid::new_v4());
+    state.insert(id.clone(), LeaseRec { class: class.to_owned(), expires_ms });
+    save_state(&path, &state)?;
+    Ok(AcquireOutcome::Admitted(Lease { id: Some(id), class: class.to_owned() }))
+}
+
+/// Bounded release used by discovery's renewable authority guard.
+pub fn release_checked(home_dir: &Path, lease: &Lease) -> std::io::Result<bool> {
+    use std::io::{Error, ErrorKind};
+    let Some(id) = &lease.id else { return Ok(false); };
+    let path = home_dir.join(STATE_FILE);
+    let _lock = checked_state_lock(&path)?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut state: State = serde_json::from_slice(&bytes)
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+    if !state.get(id).is_some_and(|record| record.class == lease.class) { return Ok(false); }
+    state.remove(id);
+    save_state(&path, &state)?;
+    Ok(true)
+}
+
 /// Live in-flight count for `class` (for observability / tests). Prunes expired
 /// leases as a side effect so a stale file does not over-report.
 pub fn active_count(home_dir: &Path, class: &str) -> u32 {
@@ -385,6 +486,146 @@ pub fn active_count(home_dir: &Path, class: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_acquire_refuses_corrupt_authority_without_resetting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        std::fs::write(&path, b"{corrupt authority").unwrap();
+        assert!(try_acquire_checked(dir.path(), "discovery-operator", Some(1), 60).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"{corrupt authority");
+    }
+
+    #[test]
+    fn checked_acquire_has_a_deadline_for_contended_authority() {
+        use fs2::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false)
+            .read(true).write(true).open(dir.path().join(format!("{STATE_FILE}.lock"))).unwrap();
+        lock.lock_exclusive().unwrap();
+        let home = dir.path().to_path_buf();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(try_acquire_checked(&home, "discovery-operator", Some(1), 60)).unwrap();
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(lock);
+        worker.join().unwrap();
+        assert!(result.is_ok(), "checked admission must have a lock deadline");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn checked_acquire_keeps_live_operator_canary_unchanged_at_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = match try_acquire(dir.path(), "discovery-operator", Some(1), 60) {
+            AcquireOutcome::Admitted(lease) => lease, _ => panic!("canary unavailable"),
+        };
+        let path = dir.path().join(STATE_FILE);
+        let before = std::fs::read(&path).unwrap();
+        assert!(try_acquire_checked(dir.path(), "discovery-operator", Some(1), 60).unwrap().is_at_capacity());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(renew_checked(dir.path(), &lease, 60).unwrap());
+    }
+
+    #[test]
+    fn checked_acquire_refuses_unguarded_or_invalid_free_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        for (class, cap, ttl) in [("valid", None, 60), ("valid", Some(0), 60),
+            ("", Some(1), 60), ("invalid\nclass", Some(1), 60), ("valid", Some(1), 0),
+            ("valid", Some(1), u64::MAX)] {
+            assert!(try_acquire_checked(dir.path(), class, cap, ttl).is_err(), "invalid authority accepted");
+        }
+        assert!(!dir.path().join(STATE_FILE).exists());
+    }
+
+    #[test]
+    fn checked_release_does_not_wait_forever_for_a_contended_lock() {
+        use fs2::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let lease = checked_test_lease(dir.path(), 60);
+        let lock_path = dir.path().join(format!("{STATE_FILE}.lock"));
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false)
+            .read(true).write(true).open(lock_path).unwrap();
+        lock.lock_exclusive().unwrap();
+        let path = dir.path().to_path_buf();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || { send.send(release_checked(&path, &lease)).unwrap(); });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(lock);
+        worker.join().unwrap();
+        assert!(result.is_ok(), "checked release must have a lock deadline");
+        assert!(result.unwrap().is_err(), "contended authority must not be modified");
+    }
+
+    fn checked_test_lease(home: &Path, ttl: u64) -> Lease {
+        match try_acquire(home, "discovery-operator", Some(1), ttl) {
+            AcquireOutcome::Admitted(lease) => lease,
+            _ => panic!("test lease unavailable"),
+        }
+    }
+
+    #[test]
+    fn checked_renew_does_not_resurrect_an_expired_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = checked_test_lease(dir.path(), 0);
+        assert!(!renew_checked(dir.path(), &lease, 60).unwrap());
+        assert_eq!(active_count(dir.path(), "discovery-operator"), 0);
+    }
+
+    #[test]
+    fn checked_renew_does_not_reclaim_a_revoked_slot_from_a_new_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let former = checked_test_lease(dir.path(), 60);
+        release(dir.path(), &former);
+        let current = checked_test_lease(dir.path(), 60);
+        assert!(!renew_checked(dir.path(), &former, 60).unwrap());
+        assert_eq!(active_count(dir.path(), "discovery-operator"), 1);
+        release(dir.path(), &former);
+        assert!(renew_checked(dir.path(), &current, 60).unwrap());
+    }
+
+    #[test]
+    fn checked_renew_refuses_corrupt_state_instead_of_resetting_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = checked_test_lease(dir.path(), 60);
+        let path = dir.path().join(STATE_FILE);
+        std::fs::write(&path, b"corrupt lease state").unwrap();
+        assert!(renew_checked(dir.path(), &lease, 60).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"corrupt lease state");
+    }
+
+    #[test]
+    fn checked_renew_requires_the_same_class_and_keeps_a_live_lease_guarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = checked_test_lease(dir.path(), 60);
+        assert!(renew_checked(dir.path(), &lease, 120).unwrap());
+        assert!(try_acquire(dir.path(), "discovery-operator", Some(1), 60).is_at_capacity());
+        let path = dir.path().join(STATE_FILE);
+        let mut state = load_state(&path);
+        state.get_mut(lease.id.as_ref().unwrap()).unwrap().class = "different-class".into();
+        save_state(&path, &state).unwrap();
+        assert!(!renew_checked(dir.path(), &lease, 120).unwrap());
+        assert!(!renew_checked(dir.path(), &Lease::unguarded("discovery-operator"), 60).unwrap());
+    }
+
+    #[test]
+    fn checked_renew_lock_contention_has_a_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = checked_test_lease(dir.path(), 60);
+        let lock = std::fs::OpenOptions::new().read(true).write(true)
+            .open(dir.path().join("concurrency_leases.json.lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let home = dir.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(renew_checked(&home, &lease, 60)).unwrap();
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        drop(lock);
+        worker.join().unwrap();
+        assert!(matches!(result, Ok(Err(_))), "renewal must not wait indefinitely for the gate lock");
+    }
 
     #[test]
     fn release_class_drops_only_that_class() {

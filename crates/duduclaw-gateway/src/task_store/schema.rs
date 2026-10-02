@@ -41,6 +41,16 @@ impl TaskStore {
              CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to);
              CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
 
+             CREATE TABLE IF NOT EXISTS discovery_decision_receipts (
+                 approval_id TEXT PRIMARY KEY,
+                 task_id TEXT NOT NULL,
+                 decider TEXT NOT NULL,
+                 approve INTEGER NOT NULL CHECK (approve IN (0,1)),
+                 payload_sha256 TEXT NOT NULL,
+                 frozen_sha256 TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+
              CREATE TABLE IF NOT EXISTS activity (
                  id          TEXT PRIMARY KEY,
                  event_type  TEXT NOT NULL,
@@ -88,7 +98,62 @@ impl TaskStore {
         Self::init_plan_schema(conn)?;
         // ── Iterative Kanban: iteration detail table (v1.45) ──
         Self::init_iteration_schema(conn)?;
+        Self::init_survival_evidence_schema(conn)?;
         Ok(())
+    }
+
+    /// Install receipts for future goal rows only. Historical absence remains unknown.
+    fn init_survival_evidence_schema(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_survival_evidence (
+                task_id TEXT PRIMARY KEY,
+                difficulty TEXT CHECK(difficulty IS NULL OR difficulty IN ('simple','complex','mixed')),
+                manual_retry INTEGER CHECK(manual_retry IS NULL OR manual_retry IN (0,1)),
+                human_approved INTEGER CHECK(human_approved IS NULL OR human_approved IN (0,1)),
+                evidence_version INTEGER NOT NULL DEFAULT 1 CHECK(evidence_version >= 1),
+                difficulty_dispatches INTEGER NOT NULL DEFAULT 0 CHECK(difficulty_dispatches >= 0),
+                human_approved_iteration_id INTEGER
+             );"
+        ).map_err(|e| format!("init survival evidence table: {e}"))?;
+        let existing: HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(task_survival_evidence)")
+                .map_err(|e| format!("inspect survival evidence columns: {e}"))?;
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| format!("query survival evidence columns: {e}"))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|e| format!("collect survival evidence columns: {e}"))?
+        };
+        if !existing.contains("difficulty_dispatches") {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE task_survival_evidence ADD COLUMN difficulty_dispatches INTEGER NOT NULL DEFAULT 0 CHECK(difficulty_dispatches >= 0);
+                 UPDATE task_survival_evidence SET difficulty=NULL;
+                 COMMIT;"
+            ).map_err(|e| format!("migrate survival difficulty completeness: {e}"))?;
+        }
+        if !existing.contains("human_approved_iteration_id") {
+            conn.execute("ALTER TABLE task_survival_evidence ADD COLUMN human_approved_iteration_id INTEGER", [])
+                .map_err(|e| format!("migrate survival approval iteration: {e}"))?;
+        }
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS task_survival_evidence_new_goal
+             AFTER INSERT ON tasks WHEN NEW.goal_mode = 1 AND NEW.kind IN ('task','goal')
+             BEGIN
+                INSERT INTO task_survival_evidence(task_id,manual_retry,human_approved)
+                VALUES(NEW.id,0,0);
+             END;
+             CREATE TRIGGER IF NOT EXISTS task_survival_evidence_invalidate_approval
+             AFTER UPDATE OF status,result_summary,acceptance_criteria,title,description ON tasks
+             WHEN OLD.status IS NOT NEW.status OR OLD.result_summary IS NOT NEW.result_summary
+                OR OLD.acceptance_criteria IS NOT NEW.acceptance_criteria
+                OR OLD.title IS NOT NEW.title OR OLD.description IS NOT NEW.description
+             BEGIN
+                UPDATE task_survival_evidence SET human_approved=0,human_approved_iteration_id=NULL
+                WHERE task_id=NEW.id;
+             END;
+             CREATE TRIGGER IF NOT EXISTS task_survival_evidence_remove_task
+             AFTER DELETE ON tasks BEGIN DELETE FROM task_survival_evidence WHERE task_id=OLD.id; END;"
+        ).map_err(|e| format!("init survival evidence schema: {e}"))
     }
 
     /// Iterative Kanban: idempotent iteration-detail schema. New table only
@@ -147,6 +212,31 @@ impl TaskStore {
             // its own rejection, so a later budget-exhausted escalation has
             // nothing to attach (see `goal_loop/state.rs`).
             ("worker_excerpt", "worker_excerpt TEXT"),
+            // 2026-09-30 A1 ledger completeness (DESIGN-dream-rsi-2026-09 §6
+            // "A1 清單"): facts needed to reconstruct a round offline that
+            // were previously in-memory only or overwritten later. All
+            // nullable, purely additive — nothing in the goal loop reads them
+            // back for a decision.
+            // - evaluator_verdict: the two-stage pre-evaluator's verdict
+            //   (`continue` / `candidate_complete` / `blocked`); NULL when it
+            //   did not run or degraded.
+            ("evaluator_verdict", "evaluator_verdict TEXT"),
+            // - iter_seq: the driver's dispatch ordinal (`InFlight.iter`)
+            //   compared against the iteration cap; memory-only before.
+            ("iter_seq", "iter_seq INTEGER"),
+            // - team_mode / gate_inputs_json: Solo vs Team for this round and
+            //   the team gate's inputs + decision when it was evaluated.
+            ("team_mode", "team_mode TEXT"),
+            ("gate_inputs_json", "gate_inputs_json TEXT"),
+            // - state_block_json: the `<state>` block inputs behind
+            //   `state_hash` (size-capped, truncation recorded in the JSON).
+            ("state_block_json", "state_block_json TEXT"),
+            // - knobs_json: `gvu::knob_snapshot::KnobSnapshot` at verdict time.
+            ("knobs_json", "knobs_json TEXT"),
+            // - pause_reason: the pause class at the moment the round
+            //   escalated to needs_human; survives `resolve_needs_human`
+            //   clearing `tasks.pause_reason`.
+            ("pause_reason", "pause_reason TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -269,6 +359,10 @@ impl TaskStore {
             // Solo. Same idempotent ALTER TABLE ADD COLUMN pattern as every
             // migration above.
             ("team_spec_json", "team_spec_json TEXT"),
+            ("kind", "kind TEXT NOT NULL DEFAULT 'task'"),
+            ("discovery_spec_json", "discovery_spec_json TEXT"),
+            ("discovery_run_id", "discovery_run_id TEXT"),
+            ("discovery_approval_id", "discovery_approval_id TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -276,6 +370,10 @@ impl TaskStore {
                     .map_err(|e| format!("add column {col}: {e}"))?;
             }
         }
+        conn.execute("UPDATE tasks SET kind='goal' WHERE kind='task' AND goal_mode=1", [])
+            .map_err(|e| format!("migrate goal kind: {e}"))?;
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_discovery_run ON tasks(discovery_run_id) WHERE discovery_run_id IS NOT NULL", [])
+            .map_err(|e| format!("index discovery run: {e}"))?;
         // Index for the dispatcher's zombie scan (status + lease).
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_lease ON tasks(status, lease_expires_at)",

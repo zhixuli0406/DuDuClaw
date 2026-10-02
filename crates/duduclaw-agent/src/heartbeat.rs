@@ -203,6 +203,13 @@ impl LiveAgent {
 /// Maximum total concurrent evolution subprocesses across all agents (BE-H5).
 const MAX_GLOBAL_CONCURRENT: usize = 8;
 
+/// Called right before the proactive check spawns the agent's CLI on the host,
+/// with `(home_dir, agent_id, sandbox_enabled)` from the agent config the check
+/// already loaded. The gateway wires it to `task_sandbox::note_not_applied`
+/// (`path = "proactive"`) so a sandbox-enabled employee's host run is never
+/// silent; this crate cannot reach the gateway's task sandbox itself.
+pub type HostRunNotice = Arc<dyn Fn(&Path, &str, bool) + Send + Sync>;
+
 pub struct HeartbeatScheduler {
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
@@ -218,6 +225,8 @@ pub struct HeartbeatScheduler {
     /// U1 natural-timing deferral state (silence breaker + proactive checks).
     /// In-memory only — restart merely restarts the 6h deferral cap clock.
     timing_deferrals: Arc<crate::proactive_timing::DeferralLedger>,
+    /// See [`HostRunNotice`]. `None` (tests, standalone use) ⇒ no notice.
+    host_run_notice: Option<HostRunNotice>,
 }
 
 impl HeartbeatScheduler {
@@ -231,7 +240,15 @@ impl HeartbeatScheduler {
             proactive_states: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             silence_tx: None,
             timing_deferrals: Arc::new(crate::proactive_timing::DeferralLedger::new()),
+            host_run_notice: None,
         }
+    }
+
+    /// Builder: install the [`HostRunNotice`] the proactive check calls before
+    /// it spawns the agent's CLI on the host.
+    pub fn with_host_run_notice(mut self, notice: HostRunNotice) -> Self {
+        self.host_run_notice = Some(notice);
+        self
     }
 
     /// Builder: install a channel that receives [`SilenceBreakerEvent`]s. Gateway
@@ -323,8 +340,9 @@ impl HeartbeatScheduler {
             let sem = agent.active_runs.clone();
             let ps = self.proactive_states.clone();
             let timing = self.timing_deferrals.clone();
+            let notice = self.host_run_notice.clone();
             tokio::spawn(async move {
-                execute_heartbeat(&home, &aid, &sem, &ps, &timing).await;
+                execute_heartbeat(&home, &aid, &sem, &ps, &timing, notice.as_ref()).await;
             });
             true
         } else {
@@ -508,12 +526,14 @@ impl HeartbeatScheduler {
                 let global_sem = self.global_semaphore.clone();
                 let proactive_states = self.proactive_states.clone();
                 let timing = self.timing_deferrals.clone();
+                let notice = self.host_run_notice.clone();
                 tokio::spawn(async move {
                     let _global_permit = match global_sem.acquire().await {
                         Ok(p) => p,
                         Err(_) => return,
                     };
-                    execute_heartbeat(&home, &aid, &sem, &proactive_states, &timing).await;
+                    execute_heartbeat(&home, &aid, &sem, &proactive_states, &timing, notice.as_ref())
+                        .await;
                 });
             }
         }
@@ -544,6 +564,7 @@ async fn execute_heartbeat(
     semaphore: &tokio::sync::Semaphore,
     proactive_states: &tokio::sync::Mutex<HashMap<String, crate::proactive::ProactiveState>>,
     timing_deferrals: &crate::proactive_timing::DeferralLedger,
+    host_run_notice: Option<&HostRunNotice>,
 ) {
     let _permit = match semaphore.try_acquire() {
         Ok(p) => p,
@@ -581,7 +602,8 @@ async fn execute_heartbeat(
     check_soul_integrity_with_audit(home_dir, agent_id).await;
 
     // ── Proactive check (new) ──
-    execute_proactive_check(home_dir, agent_id, proactive_states, timing_deferrals).await;
+    execute_proactive_check(home_dir, agent_id, proactive_states, timing_deferrals, host_run_notice)
+        .await;
 
     info!(agent = agent_id, "Heartbeat cycle complete");
 }
@@ -698,6 +720,16 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
         tdb.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| format!("set busy_timeout: {e}"))?;
 
+        // Legacy stores have no kind column. Once present, only the explicit
+        // ordinary-worker kinds may wake this scheduler; unknown kinds deny.
+        let has_kind = {
+            let mut columns = tdb.prepare("PRAGMA table_info(tasks)").map_err(|e| e.to_string())?;
+            let names = columns.query_map([], |row| row.get::<_,String>(1)).map_err(|e| e.to_string())?
+                .collect::<std::result::Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
+            names.iter().any(|name| name == "kind")
+        };
+        let kind_gate = if has_kind { "AND kind IN ('task','goal')" } else { "" };
+
         // Highest-priority unstarted task for this agent. `pending` = durable
         // dispatch-engine tasks awaiting a claim — without it here they are
         // never surfaced to anyone (MED finding, 2026-07 review).
@@ -708,9 +740,9 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
         // heartbeat pull remains the fallback wake-up for ordinary tasks.
         let todo: Option<(String, String, String)> = tdb
             .query_row(
-                "SELECT id, title, priority, source_channel, source_chat_id FROM tasks
+                &format!("SELECT id, title, priority, source_channel, source_chat_id FROM tasks
                  WHERE assigned_to = ?1 AND status IN ('todo', 'pending')
-                   AND COALESCE(goal_mode, 0) = 0
+                   AND COALESCE(goal_mode, 0) = 0 {kind_gate}
                  ORDER BY CASE priority
                      WHEN 'critical' THEN 0
                      WHEN 'urgent'   THEN 1
@@ -718,7 +750,7 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
                      WHEN 'medium'   THEN 3
                      ELSE 4
                    END, created_at ASC
-                 LIMIT 1",
+                 LIMIT 1"),
                 rusqlite::params![&agent],
                 |row| {
                     Ok((
@@ -745,11 +777,11 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
         let stall_cutoff = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
         let stalled: Option<(String, String)> = tdb
             .query_row(
-                "SELECT id, title, source_channel, source_chat_id FROM tasks
+                &format!("SELECT id, title, source_channel, source_chat_id FROM tasks
                  WHERE assigned_to = ?1 AND status = 'in_progress'
-                   AND updated_at < ?2
+                   AND updated_at < ?2 {kind_gate}
                  ORDER BY updated_at ASC
-                 LIMIT 1",
+                 LIMIT 1"),
                 rusqlite::params![&agent, stall_cutoff],
                 |row| {
                     Ok((
@@ -877,6 +909,7 @@ async fn execute_proactive_check(
     agent_id: &str,
     proactive_states: &tokio::sync::Mutex<HashMap<String, crate::proactive::ProactiveState>>,
     timing_deferrals: &crate::proactive_timing::DeferralLedger,
+    host_run_notice: Option<&HostRunNotice>,
 ) {
     use crate::proactive;
 
@@ -994,6 +1027,12 @@ async fn execute_proactive_check(
 
     let result = match claude {
         Some(claude_path) => {
+            // Not the task sandbox: the check needs the agent's MCP tools.
+            // Report it for a sandbox-enabled employee (the gateway's notice
+            // is once per agent per process; sandbox off ⇒ nothing).
+            if let Some(notice) = host_run_notice {
+                notice(home_dir, agent_id, agent_config.container.sandbox_enabled);
+            }
             // Write system prompt to a temp file — Claude CLI ≥2 supports
             // --system-prompt-file and this avoids cmdline length / leak issues.
             let prompt_file = match tempfile::NamedTempFile::new() {
@@ -1210,7 +1249,7 @@ pub fn start_heartbeat_scheduler(
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
 ) -> Arc<HeartbeatScheduler> {
-    start_heartbeat_scheduler_with(home_dir, registry, None)
+    start_heartbeat_scheduler_with(home_dir, registry, None, None)
 }
 
 /// Same as [`start_heartbeat_scheduler`] but allows the caller to install a
@@ -1220,10 +1259,14 @@ pub fn start_heartbeat_scheduler_with(
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
     silence_tx: Option<tokio::sync::mpsc::UnboundedSender<SilenceBreakerEvent>>,
+    host_run_notice: Option<HostRunNotice>,
 ) -> Arc<HeartbeatScheduler> {
     let mut sched = HeartbeatScheduler::new(home_dir, registry);
     if let Some(tx) = silence_tx {
         sched = sched.with_silence_tx(tx);
+    }
+    if let Some(notice) = host_run_notice {
+        sched = sched.with_host_run_notice(notice);
     }
     let scheduler = Arc::new(sched);
     let s = scheduler.clone();
@@ -1463,6 +1506,28 @@ mod tests {
              );",
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_and_unknown_kinds_never_generate_ordinary_worker_heartbeat() {
+        for kind in ["discovery", "unrecognized"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            init_test_tasks_db(&home.join("tasks.db"));
+            init_test_queue_db(&home.join("message_queue.db"));
+            let tasks = rusqlite::Connection::open(home.join("tasks.db")).unwrap();
+            tasks.execute("ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task'", []).unwrap();
+            let old = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+            for (id,status) in [("queued", "pending"), ("active", "in_progress")] {
+                tasks.execute("INSERT INTO tasks(id,title,status,assigned_to,goal_mode,created_at,updated_at,kind)
+                    VALUES(?1,'discovery fixture',?2,'worker',0,?3,?3,?4)",
+                    rusqlite::params![id,status,old,kind]).unwrap();
+            }
+            poll_assigned_tasks(home,"worker").await.unwrap();
+            let queue=rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
+            let count:i64=queue.query_row("SELECT COUNT(*) FROM message_queue",[],|row|row.get(0)).unwrap();
+            assert_eq!(count,0,"{kind} must not wake an ordinary worker through pending or stall SQL");
+        }
     }
 
     #[tokio::test]

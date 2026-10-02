@@ -1,0 +1,130 @@
+{
+  "pareto_auc": 0.665364699,
+  "pareto_reward": 0.615364699,
+  "parallel_penalty": 0.5,
+  "out_of_support": false,
+  "points": [
+    {
+      "beta": 0.0,
+      "probes": 1,
+      "decision_rounds": 1,
+      "effective_sequential_rounds": 1,
+      "attainment": 0.485989579,
+      "work": 0.0625,
+      "parallel_penalty": 1.0,
+      "context_mismatch_rate": 0.0,
+      "batches": [
+        [
+          "r1-b2-a0"
+        ]
+      ]
+    },
+    {
+      "beta": 0.25,
+      "probes": 3,
+      "decision_rounds": 2,
+      "effective_sequential_rounds": 2,
+      "attainment": 0.628293128,
+      "work": 0.1875,
+      "parallel_penalty": 0.666666667,
+      "context_mismatch_rate": 0.333333333,
+      "batches": [
+        [
+          "r1-b2-a0",
+          "r1-b0-a0"
+        ],
+        [
+          "r1-b2-a1"
+        ]
+      ]
+    },
+    {
+      "beta": 0.5,
+      "probes": 6,
+      "decision_rounds": 2,
+      "effective_sequential_rounds": 2,
+      "attainment": 0.724969491,
+      "work": 0.375,
+      "parallel_penalty": 0.333333333,
+      "context_mismatch_rate": 0.333333333,
+      "batches": [
+        [
+          "r1-b0-a0",
+          "r1-b1-a0",
+          "r1-b2-a0",
+          "r1-b3-a0"
+        ],
+        [
+          "r1-b3-a1",
+          "r1-b2-a1"
+        ]
+      ]
+    },
+    {
+      "beta": 0.75,
+      "probes": 12,
+      "decision_rounds": 3,
+      "effective_sequential_rounds": 3,
+      "attainment": 0.859789925,
+      "work": 0.75,
+      "parallel_penalty": 0.25,
+      "context_mismatch_rate": 0.416666667,
+      "batches": [
+        [
+          "r1-b0-a0",
+          "r1-b1-a0",
+          "r1-b2-a0",
+          "r1-b3-a0"
+        ],
+        [
+          "r1-b0-a1",
+          "r1-b1-a1",
+          "r1-b2-a1",
+          "r1-b3-a1"
+        ],
+        [
+          "r1-b0-a2",
+          "r1-b1-a2",
+          "r1-b2-a2",
+          "r1-b3-a2"
+        ]
+      ]
+    },
+    {
+      "beta": 1.0,
+      "probes": 16,
+      "decision_rounds": 4,
+      "effective_sequential_rounds": 4,
+      "attainment": 1.0,
+      "work": 1.0,
+      "parallel_penalty": 0.25,
+      "context_mismatch_rate": 0.5,
+      "batches": [
+        [
+          "r1-b0-a0",
+          "r1-b1-a0",
+          "r1-b2-a0",
+          "r1-b3-a0"
+        ],
+        [
+          "r1-b0-a1",
+          "r1-b1-a1",
+          "r1-b2-a1",
+          "r1-b3-a1"
+        ],
+        [
+          "r1-b0-a2",
+          "r1-b1-a2",
+          "r1-b2-a2",
+          "r1-b3-a2"
+        ],
+        [
+          "r1-b0-a3",
+          "r1-b1-a3",
+          "r1-b2-a3",
+          "r1-b3-a3"
+        ]
+      ]
+    }
+  ]
+}

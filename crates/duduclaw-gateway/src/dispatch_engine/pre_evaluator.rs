@@ -52,7 +52,7 @@ pub enum PreDecision {
 }
 
 impl PreDecision {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             PreDecision::Continue => "continue",
             PreDecision::CandidateComplete => "candidate_complete",

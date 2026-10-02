@@ -503,3 +503,36 @@ mod token_owner_tests {
     }
 }
 
+
+/// The direct-API fallback's key resolution (moved here from the removed
+/// chat-triggered computer-use loop, which shared it).
+#[cfg(test)]
+mod api_key_resolution_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn env_first_then_config_and_none_without_either() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No env value, no config.toml: nothing.
+        assert_eq!(api_key_with_env(None, tmp.path()).await, None);
+        // An empty env value counts as unset.
+        assert_eq!(api_key_with_env(Some(String::new()), tmp.path()).await, None);
+        // A config without the field, or with a blank removal marker: nothing.
+        std::fs::write(tmp.path().join("config.toml"), "[api]\n").unwrap();
+        assert_eq!(api_key_with_env(None, tmp.path()).await, None);
+        std::fs::write(tmp.path().join("config.toml"), "[api]\nanthropic_api_key = \"\"\n").unwrap();
+        assert_eq!(api_key_with_env(None, tmp.path()).await, None);
+        // A configured key.
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[api]\nanthropic_api_key = \"test-dummy-key\"\n",
+        )
+        .unwrap();
+        assert_eq!(api_key_with_env(None, tmp.path()).await.as_deref(), Some("test-dummy-key"));
+        // The environment wins over the config.
+        assert_eq!(
+            api_key_with_env(Some("env-dummy-key".into()), tmp.path()).await.as_deref(),
+            Some("env-dummy-key")
+        );
+    }
+}

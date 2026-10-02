@@ -47,9 +47,28 @@ impl MethodHandler {
                 );
             }
         }
+        if record.as_ref().is_some_and(|record| record.action_kind == "discovery") {
+            let caller = match crate::discovery::service::TrustedCaller::from_user(ctx) {
+                Ok(caller) => caller, Err(error) => return WsFrame::error_response("", &error),
+            };
+            let store = match self.task_store().await { Ok(store) => store, Err(frame) => return frame };
+            if let Err(error) = crate::discovery::service::prepare_approval_decision(&store, &broker, &caller, &approval_id, approve).await {
+                return WsFrame::error_response("", &error);
+            }
+        }
         let decided_by = format!("dashboard:{}", ctx.user_id);
         if let Err(e) = broker.decide(&approval_id, approve, &decided_by).await {
             return WsFrame::error_response("", &format!("decide: {e}"));
+        }
+
+        if record.as_ref().is_some_and(|record| record.action_kind == "discovery") {
+            let caller = match crate::discovery::service::TrustedCaller::from_user(ctx) {
+                Ok(caller) => caller, Err(error) => return WsFrame::error_response("", &error),
+            };
+            let store = match self.task_store().await { Ok(store) => store, Err(frame) => return frame };
+            if let Err(error) = crate::discovery::service::authorize_approved_request(&store, &broker, &caller, &approval_id).await {
+                return WsFrame::error_response("", &error);
+            }
         }
 
         // H1 (unified decision hand-off, 07-unified-decision-design.md §6):

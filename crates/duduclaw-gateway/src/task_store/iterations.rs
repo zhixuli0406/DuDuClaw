@@ -5,8 +5,8 @@ use super::*;
 
 impl TaskStore {
     /// Open a work round for a goal-mode task (called by the goal loop driver on
-    /// dispatch). Idempotent per `(task_id, round)`: a stall re-dispatch of the
-    /// same round is a no-op, so a round row is created exactly once.
+    /// dispatch). A stall re-dispatch reuses the current open attempt; a
+    /// human retry after a sealed attempt opens a new row of the same round.
     pub async fn record_iteration_dispatch(
         &self,
         task_id: &str,
@@ -30,8 +30,89 @@ impl TaskStore {
         state_hash: Option<&str>,
         repeat_streak: Option<i64>,
     ) -> Result<(), String> {
+        self.record_iteration_dispatch_with_ledger(
+            task_id,
+            round,
+            now,
+            state_hash,
+            repeat_streak,
+            &IterationDispatchLedger::default(),
+        )
+        .await
+    }
+
+    /// A1 ledger completeness: [`Self::record_iteration_dispatch_with_state`]
+    /// plus the dispatch-time facts that were previously memory-only
+    /// (`iter_seq`, Solo/Team, gate inputs, the `<state>` block). Each field
+    /// is `COALESCE`d on a stall re-dispatch, so a `None` never erases a value
+    /// an earlier dispatch of the same round recorded.
+    pub async fn record_iteration_dispatch_with_ledger(
+        &self,
+        task_id: &str,
+        round: i64,
+        now: &str,
+        state_hash: Option<&str>,
+        repeat_streak: Option<i64>,
+        ledger: &IterationDispatchLedger,
+    ) -> Result<(), String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("iteration dispatch: begin: {e}"))?;
+        let previous_dispatches: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(dispatch_count),0) FROM task_iterations WHERE task_id=?1",
+            params![task_id], |r| r.get(0),
+        ).map_err(|e| format!("iteration dispatch: count prior dispatches: {e}"))?;
+        iter_dispatch_conn(&tx, task_id, round, now, state_hash, repeat_streak, ledger)?;
+        record_survival_difficulty_conn(&tx, task_id, previous_dispatches, ledger)?;
+        tx.commit().map_err(|e| format!("iteration dispatch: commit: {e}"))
+    }
+
+    /// A1: stamp the two-stage pre-evaluator's verdict on the round that is
+    /// about to be sealed (the latest un-judged round — the exact lookup
+    /// `iter_verdict_conn` uses, so both writes land on the same row). No
+    /// open round ⇒ no-op. Pure bookkeeping: callers log and ignore errors.
+    pub async fn record_iteration_evaluator_verdict(
+        &self,
+        task_id: &str,
+        evaluator_verdict: &str,
+    ) -> Result<(), String> {
         let conn = self.conn.lock().await;
-        iter_dispatch_conn(&conn, task_id, round, now, state_hash, repeat_streak)
+        let row_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM task_iterations
+                  WHERE task_id = ?1 AND judged_at IS NULL AND verdict IS NULL
+                  ORDER BY round DESC, id DESC LIMIT 1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("iter evaluator lookup: {e}"))?;
+        if let Some(id) = row_id {
+            conn.execute(
+                "UPDATE task_iterations SET evaluator_verdict = ?2 WHERE id = ?1",
+                params![id, evaluator_verdict],
+            )
+            .map_err(|e| format!("iter evaluator update: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// A1: record the pause class on the task's latest iteration row when an
+    /// escalation happens outside the settle path (the driver's own caps /
+    /// oscillation, a team round asking for a human). Never touches the
+    /// verdict; never overwrites a pause class already on the row. No row ⇒
+    /// no-op. Pure bookkeeping: callers log and ignore errors.
+    pub async fn stamp_iteration_pause(&self, task_id: &str, pause: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE task_iterations SET pause_reason = ?2
+              WHERE id = (SELECT id FROM task_iterations WHERE task_id = ?1
+                           ORDER BY round DESC, id DESC LIMIT 1)
+                AND pause_reason IS NULL",
+            params![task_id, pause],
+        )
+        .map_err(|e| format!("iter pause stamp: {e}"))?;
+        Ok(())
     }
 
     /// All iteration rows for a task, oldest round first (the revision timeline).
@@ -135,6 +216,28 @@ impl TaskStore {
     // ── G8 goal chain ───────────────────────────────────────
 }
 
+/// Count dispatch occurrences, not judge rounds. Any missing snapshot makes
+/// the historical classification unknown permanently instead of filling a gap
+/// from today's editable task text.
+fn record_survival_difficulty_conn(conn: &Connection, task_id: &str, previous_dispatches: i64, ledger: &IterationDispatchLedger) -> Result<(), String> {
+    let difficulty = ledger.gate_inputs_json.as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.get("goal_difficulty").and_then(|v| v.as_str()).map(str::to_owned))
+        .filter(|value| matches!(value.as_str(), "simple" | "complex"));
+    conn.execute(
+        "UPDATE task_survival_evidence
+         SET difficulty=CASE WHEN difficulty_dispatches=?2 AND ?3 IS NOT NULL THEN
+                 CASE WHEN difficulty_dispatches=0 THEN ?3
+                      WHEN difficulty=?3 THEN difficulty ELSE 'mixed' END
+                 ELSE NULL END,
+             difficulty_dispatches=CASE WHEN difficulty_dispatches=?2 AND ?3 IS NOT NULL
+                 THEN difficulty_dispatches+1 ELSE difficulty_dispatches END
+         WHERE task_id=?1 AND evidence_version=1",
+        params![task_id,previous_dispatches,difficulty],
+    ).map_err(|e| format!("iteration dispatch: survival difficulty receipt: {e}"))?;
+    Ok(())
+}
+
 fn row_to_iteration(row: &rusqlite::Row) -> rusqlite::Result<TaskIterationRow> {
     Ok(TaskIterationRow {
         id: row.get(0)?,
@@ -151,6 +254,13 @@ fn row_to_iteration(row: &rusqlite::Row) -> rusqlite::Result<TaskIterationRow> {
         state_hash: row.get(11)?,
         repeat_streak: row.get(12)?,
         worker_excerpt: row.get(13)?,
+        evaluator_verdict: row.get(14)?,
+        iter_seq: row.get(15)?,
+        team_mode: row.get(16)?,
+        gate_inputs_json: row.get(17)?,
+        state_block_json: row.get(18)?,
+        knobs_json: row.get(19)?,
+        pause_reason: row.get(20)?,
     })
 }
 
@@ -163,7 +273,9 @@ pub(super) fn list_iterations_conn(conn: &Connection, task_id: &str) -> Result<V
         .prepare(
             "SELECT id, task_id, round, dispatched_at, submitted_at, judged_at,
                     verdict, judge_feedback, feedback_class, verdict_json,
-                    dispatch_count, state_hash, repeat_streak, worker_excerpt
+                    dispatch_count, state_hash, repeat_streak, worker_excerpt,
+                    evaluator_verdict, iter_seq, team_mode, gate_inputs_json,
+                    state_block_json, knobs_json, pause_reason
                FROM task_iterations WHERE task_id = ?1 ORDER BY round ASC, id ASC",
         )
         .map_err(|e| format!("prepare iterations: {e}"))?;
@@ -191,11 +303,10 @@ fn round_seconds(dispatched_at: &str, submitted_at: &str) -> i64 {
     }
 }
 
-/// Open round `round` for `task_id` if it does not already exist. Idempotent
-/// per `(task_id, round)` in the timeline sense — a stall re-dispatch of the
-/// same round keeps the original `dispatched_at` but increments
-/// `dispatch_count` and refreshes the visit-graph signal (the count was
-/// previously memory-only in the driver and lost on every restart).
+/// Open an attempt for `round`. A stall re-dispatch of the latest open attempt
+/// keeps its original `dispatched_at`, increments `dispatch_count`, and refreshes
+/// the visit-graph signal. A sealed attempt is immutable: a human retry creates
+/// a new row even when the logical round number has not advanced.
 fn iter_dispatch_conn(
     conn: &Connection,
     task_id: &str,
@@ -203,38 +314,64 @@ fn iter_dispatch_conn(
     now: &str,
     state_hash: Option<&str>,
     repeat_streak: Option<i64>,
+    ledger: &IterationDispatchLedger,
 ) -> Result<(), String> {
-    let exists: Option<i64> = conn
+    let latest: Option<(i64, bool)> = conn
         .query_row(
-            "SELECT id FROM task_iterations WHERE task_id = ?1 AND round = ?2",
+            "SELECT id, judged_at IS NOT NULL OR verdict IS NOT NULL
+               FROM task_iterations WHERE task_id = ?1 AND round = ?2
+               ORDER BY id DESC LIMIT 1",
             params![task_id, round],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .map_err(|e| format!("iter dispatch lookup: {e}"))?;
-    if let Some(id) = exists {
+    if let Some((id, false)) = latest {
         conn.execute(
             "UPDATE task_iterations
                 SET dispatch_count = dispatch_count + 1,
                     state_hash = COALESCE(?2, state_hash),
-                    repeat_streak = COALESCE(?3, repeat_streak)
+                    repeat_streak = COALESCE(?3, repeat_streak),
+                    iter_seq = COALESCE(?4, iter_seq),
+                    team_mode = COALESCE(?5, team_mode),
+                    gate_inputs_json = COALESCE(?6, gate_inputs_json),
+                    state_block_json = COALESCE(?7, state_block_json)
               WHERE id = ?1",
-            params![id, state_hash, repeat_streak],
+            params![
+                id,
+                state_hash,
+                repeat_streak,
+                ledger.iter_seq,
+                ledger.team_mode.as_deref(),
+                ledger.gate_inputs_json.as_deref(),
+                ledger.state_block_json.as_deref()
+            ],
         )
         .map_err(|e| format!("iter dispatch bump: {e}"))?;
         return Ok(());
     }
     conn.execute(
-        "INSERT INTO task_iterations (task_id, round, dispatched_at, state_hash, repeat_streak)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![task_id, round, now, state_hash, repeat_streak],
+        "INSERT INTO task_iterations (task_id, round, dispatched_at, state_hash, repeat_streak,
+                                      iter_seq, team_mode, gate_inputs_json, state_block_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            task_id,
+            round,
+            now,
+            state_hash,
+            repeat_streak,
+            ledger.iter_seq,
+            ledger.team_mode.as_deref(),
+            ledger.gate_inputs_json.as_deref(),
+            ledger.state_block_json.as_deref()
+        ],
     )
     .map_err(|e| format!("iter dispatch insert: {e}"))?;
     Ok(())
 }
 
-/// Stamp the worker submission on the latest open round (max round with a NULL
-/// `submitted_at`) and return that round's agent seconds. When no open round
+/// Stamp the worker submission on the latest unsealed, unsubmitted attempt
+/// (round DESC, id DESC) and return that attempt's agent seconds. When no open round
 /// exists (e.g. a direct claim→complete path that skipped the driver dispatch),
 /// one is created retroactively anchored at `fallback_dispatch` (claim time) so
 /// the agent clock is still captured. Returns 0 seconds when the elapsed time is
@@ -250,7 +387,8 @@ pub(super) fn iter_submit_conn(
         .query_row(
             "SELECT id, dispatched_at FROM task_iterations
               WHERE task_id = ?1 AND submitted_at IS NULL
-              ORDER BY round DESC LIMIT 1",
+                AND judged_at IS NULL AND verdict IS NULL
+              ORDER BY round DESC, id DESC LIMIT 1",
             params![task_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -278,9 +416,12 @@ pub(super) fn iter_submit_conn(
 /// Seal the judge verdict on the latest un-judged round (max round with a NULL
 /// `judged_at`). No open round ⇒ no-op (best-effort telemetry).
 /// `worker_excerpt` (WP-4F): a bounded, CJK-safe-truncated snapshot of this
-/// round's own worker output — `None` for the accept path (never needed,
-/// see `TaskIterationRow::worker_excerpt`'s doc) and for callers with no
-/// result text to snapshot.
+/// round's own worker output (see [`crate::goal_budget_best_round::worker_excerpt`]);
+/// `None` for callers with no result text to snapshot.
+/// `knobs_json` / `pause_reason` (A1 ledger): the harness knob snapshot at
+/// sealing time and, for an escalating verdict, the pause class. A `None`
+/// pause never erases one already on the row.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn iter_verdict_conn(
     conn: &Connection,
     task_id: &str,
@@ -288,13 +429,15 @@ pub(super) fn iter_verdict_conn(
     feedback: &str,
     verdict_json: Option<&str>,
     worker_excerpt: Option<&str>,
+    knobs_json: Option<&str>,
+    pause_reason: Option<&str>,
     now: &str,
 ) -> Result<(), String> {
     let row_id: Option<i64> = conn
         .query_row(
             "SELECT id FROM task_iterations
-              WHERE task_id = ?1 AND judged_at IS NULL
-              ORDER BY round DESC LIMIT 1",
+              WHERE task_id = ?1 AND judged_at IS NULL AND verdict IS NULL
+              ORDER BY round DESC, id DESC LIMIT 1",
             params![task_id],
             |r| r.get(0),
         )
@@ -304,11 +447,78 @@ pub(super) fn iter_verdict_conn(
         conn.execute(
             "UPDATE task_iterations
                 SET judged_at = ?2, verdict = ?3, judge_feedback = ?4,
-                    verdict_json = ?5, worker_excerpt = ?6
+                    verdict_json = ?5, worker_excerpt = ?6,
+                    knobs_json = ?7, pause_reason = COALESCE(?8, pause_reason)
               WHERE id = ?1",
-            params![id, now, verdict, feedback, verdict_json, worker_excerpt],
+            params![
+                id,
+                now,
+                verdict,
+                feedback,
+                verdict_json,
+                worker_excerpt,
+                knobs_json,
+                pause_reason
+            ],
         )
         .map_err(|e| format!("iter verdict update: {e}"))?;
     }
     Ok(())
+}
+
+/// A1-2: seal the latest un-judged round as `escalated` when the settle path
+/// parks the task through `mark_needs_human_with_pause` (evaluator `blocked`,
+/// judge error, `human_only` / `evaluator_only` fail-closed) — previously such
+/// a round kept `verdict = NULL` forever.
+///
+/// `judge_feedback` is deliberately left **NULL**: no judge ruled, and the
+/// goal loop derives its `<state>` block's `excluded_approaches` (and so the
+/// A2 `state_hash`) from every row's `judge_feedback`. Writing the pause
+/// reason there would change the next round's prompt and fingerprint. The
+/// reason lives on the task row as before; the class goes to `pause_reason`.
+/// [`crate::goal_budget_best_round::pick_best_round`] skips rows of this
+/// shape (`escalated` + NULL feedback) for the same no-behavior-change reason.
+pub(super) fn iter_escalate_seal_conn(
+    conn: &Connection,
+    task_id: &str,
+    pause_reason: &str,
+    worker_excerpt: Option<&str>,
+    knobs_json: Option<&str>,
+    now: &str,
+) -> Result<(), String> {
+    let row_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM task_iterations
+              WHERE task_id = ?1 AND judged_at IS NULL AND verdict IS NULL
+              ORDER BY round DESC, id DESC LIMIT 1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("iter escalate lookup: {e}"))?;
+    if let Some(id) = row_id {
+        conn.execute(
+            "UPDATE task_iterations
+                SET judged_at = ?2, verdict = 'escalated', worker_excerpt = ?3,
+                    knobs_json = ?4, pause_reason = ?5
+              WHERE id = ?1",
+            params![id, now, worker_excerpt, knobs_json, pause_reason],
+        )
+        .map_err(|e| format!("iter escalate update: {e}"))?;
+    }
+    Ok(())
+}
+
+/// A1 ledger completeness: dispatch-time facts recorded alongside the round
+/// row. Every field optional — `Default` reproduces the pre-A1 write exactly.
+#[derive(Debug, Clone, Default)]
+pub struct IterationDispatchLedger {
+    /// The driver's dispatch ordinal (`InFlight.iter` of this dispatch).
+    pub iter_seq: Option<i64>,
+    /// `solo` | `team`.
+    pub team_mode: Option<String>,
+    /// Team gate inputs + decision JSON, when the gate was evaluated.
+    pub gate_inputs_json: Option<String>,
+    /// Size-capped JSON of the `<state>` block inputs.
+    pub state_block_json: Option<String>,
 }

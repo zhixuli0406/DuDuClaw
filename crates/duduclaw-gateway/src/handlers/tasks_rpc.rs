@@ -100,6 +100,15 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_tasks_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        match params.get("kind").and_then(Value::as_str).unwrap_or("task").trim().to_ascii_lowercase().as_str() {
+            "discovery" => return self.handle_discovery_create(params, ctx).await,
+            "goal" => return self.handle_tasks_goal_create(params, ctx).await,
+            "" | "task" => {},
+            _ => return WsFrame::error_response("", "unknown task kind"),
+        }
+        if params.get("kind").is_some_and(|value| !value.is_null() && !value.is_string()) {
+            return WsFrame::error_response("", "kind must be a string");
+        }
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,

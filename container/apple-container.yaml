@@ -2,7 +2,13 @@
 # Requires macOS 26+ with container CLI
 
 name: duduclaw-agent
-image: duduclaw-agent:latest
+# The platform's published image for your DuDuClaw version (the tag carries
+# the `v` prefix, e.g. ghcr.io/zhixuli0406/duduclaw:v1.67.0). It is the same
+# image `config.toml [container.sandbox] image` defaults to; it is never
+# pulled automatically. Note: DuDuClaw's built-in Apple Container backend
+# currently refuses to create sandbox containers (no network/tmpfs/memory
+# isolation yet) — this file is a manual sample only.
+image: ghcr.io/zhixuli0406/duduclaw:v<version>
 
 resources:
   cpus: 2

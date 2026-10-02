@@ -4,6 +4,15 @@
 # Usage:
 #   docker build -f container/Dockerfile.browser-sandbox -t duduclaw/browser-sandbox .
 #   docker run --read-only --tmpfs /tmp:size=256m --network=none duduclaw/browser-sandbox
+#
+# Nothing in the repository starts this image. It works with
+# `--network=none` only: the ENTRYPOINT is domain-filter.sh, which needs root
+# and CAP_NET_ADMIN to install its egress filter, but this image runs as
+# `USER sandbox`. With any network attached the filter cannot be installed
+# and the script refuses to start (fail closed); it never runs unfiltered.
+# A networked run would need the filter installed as root with NET_ADMIN
+# before dropping to the unprivileged user (as Dockerfile.computer-use's
+# entrypoint does), which this Dockerfile does not do.
 
 FROM mcr.microsoft.com/playwright:v1.52.0-noble
 

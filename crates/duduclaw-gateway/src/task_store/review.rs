@@ -29,7 +29,7 @@ impl TaskStore {
             let row: Option<(bool, Option<String>, i64, Option<String>, String)> = tx
                 .query_row(
                     "SELECT goal_mode, claimed_by, revision_round, claimed_at, created_at
-                       FROM tasks WHERE id = ?1",
+                       FROM tasks WHERE id = ?1 AND kind IN ('task','goal')",
                     params![id],
                     |r| {
                         Ok((
@@ -63,7 +63,7 @@ impl TaskStore {
                         "UPDATE tasks
                         SET status = 'review', result_summary = ?2,
                             lease_expires_at = NULL, updated_at = ?3
-                      WHERE id = ?1 AND status NOT IN ('done', 'cancelled')",
+                      WHERE id = ?1 AND kind IN ('task','goal') AND status NOT IN ('done', 'cancelled')",
                         params![id, summary, now],
                     )
                     .map_err(|e| format!("complete (review): {e}"))?;
@@ -77,7 +77,7 @@ impl TaskStore {
                         iter_submit_conn(&tx, id, &now, revision_round + 1, fallback_dispatch)?;
                     if secs > 0 {
                         tx.execute(
-                            "UPDATE tasks SET agent_seconds = agent_seconds + ?2 WHERE id = ?1",
+                            "UPDATE tasks SET agent_seconds = agent_seconds + ?2 WHERE id = ?1 AND kind IN ('task','goal')",
                             params![id, secs],
                         )
                         .map_err(|e| format!("complete (agent_seconds): {e}"))?;
@@ -88,7 +88,7 @@ impl TaskStore {
                     "UPDATE tasks
                         SET status = 'done', result_summary = ?2,
                             completed_at = ?3, lease_expires_at = NULL, updated_at = ?3
-                      WHERE id = ?1 AND status NOT IN ('done', 'cancelled')",
+                      WHERE id = ?1 AND kind IN ('task','goal') AND status NOT IN ('done', 'cancelled')",
                     params![id, summary, now],
                 )
                 .map_err(|e| format!("complete (done): {e}"))?;
@@ -111,22 +111,66 @@ impl TaskStore {
         feedback: &str,
         verdict_json: Option<&str>,
     ) -> Result<bool, String> {
+        self.accept_review_with_ledger(id, feedback, verdict_json, None)
+            .await
+    }
+
+    /// [`Self::accept_review_with_verdict`] plus the A1 ledger's harness knob
+    /// snapshot (`knobs_json`) sealed on the accepted round. Task-state
+    /// transition is identical.
+    pub async fn accept_review_with_ledger(
+        &self,
+        id: &str,
+        feedback: &str,
+        verdict_json: Option<&str>,
+        knobs_json: Option<&str>,
+    ) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let now = Utc::now().to_rfc3339();
+        // A1-2: read the accepted round's own output for its excerpt. The
+        // UPDATE below never touches `result_summary`, so reading it first is
+        // equivalent to reading it after. A read failure only loses the
+        // excerpt, never the acceptance.
+        let result_summary: Option<String> = conn
+            .query_row(
+                "SELECT result_summary FROM tasks WHERE id = ?1 AND kind IN ('task','goal')",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                tracing::warn!(task = id, error = %e, "accept: excerpt read failed (non-fatal)");
+                None
+            })
+            .flatten();
         let n = conn
             .execute(
                 "UPDATE tasks
                     SET status = 'done', completed_at = ?2, judge_feedback = ?3, updated_at = ?2
-                  WHERE id = ?1 AND status = 'review'",
+                  WHERE id = ?1 AND kind IN ('task','goal') AND status = 'review'",
                 params![id, now, feedback],
             )
             .map_err(|e| format!("accept review: {e}"))?;
         if n == 1 {
-            // Iterative Kanban: seal the current round's verdict. No
-            // `worker_excerpt` snapshot needed on the accept path — an
-            // accepted task never re-enters `needs_human`, so this round can
-            // never be a WP-4F best-round candidate.
-            iter_verdict_conn(&conn, id, "accepted", feedback, verdict_json, None, &now)?;
+            // Iterative Kanban: seal the current round's verdict. A1-2
+            // (2026-09-30): the accepted round now keeps the same bounded
+            // `worker_excerpt` snapshot the reject path stores, so every
+            // sealed round in the ledger carries its own output (it is still
+            // never a WP-4F best-round candidate — `pick_best_round` only
+            // considers rejected/escalated rounds).
+            let excerpt =
+                crate::goal_budget_best_round::worker_excerpt(result_summary.as_deref());
+            iter_verdict_conn(
+                &conn,
+                id,
+                "accepted",
+                feedback,
+                verdict_json,
+                excerpt.as_deref(),
+                knobs_json,
+                None,
+                &now,
+            )?;
         }
         Ok(n == 1)
     }
@@ -160,6 +204,22 @@ impl TaskStore {
         soft_cap: i64,
         verdict_json: Option<&str>,
     ) -> Result<String, String> {
+        self.reject_review_with_ledger(id, feedback, soft_cap, verdict_json, None)
+            .await
+    }
+
+    /// [`Self::reject_review_with_verdict`] plus the A1 ledger's harness knob
+    /// snapshot sealed on the rejected/escalated round. On the escalation
+    /// branch the round row also records `pause_reason = budget_exhausted`.
+    /// Task-state transitions are identical.
+    pub async fn reject_review_with_ledger(
+        &self,
+        id: &str,
+        feedback: &str,
+        soft_cap: i64,
+        verdict_json: Option<&str>,
+        knobs_json: Option<&str>,
+    ) -> Result<String, String> {
         let row = match self.get_task(id).await? {
             Some(r) => r,
             None => return Err(format!("task not found: {id}")),
@@ -171,18 +231,8 @@ impl TaskStore {
         // still readable. Bounded + CJK-safe so a multi-KB agent reply never
         // balloons the iteration history row. `None` when the round produced
         // no result text at all.
-        let worker_excerpt: Option<String> = row
-            .result_summary
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                duduclaw_core::truncate_bytes(
-                    s,
-                    crate::goal_budget_best_round::WORKER_EXCERPT_MAX_BYTES,
-                )
-                .to_string()
-            });
+        let worker_excerpt: Option<String> =
+            crate::goal_budget_best_round::worker_excerpt(row.result_summary.as_deref());
         let conn = self.conn.lock().await;
         if row.retry_count < row.max_retries {
             let new_retry = row.retry_count + 1;
@@ -195,7 +245,7 @@ impl TaskStore {
                         lease_expires_at = NULL, retry_count = ?2, revision_round = ?3,
                         diminishing = ?4, judge_feedback = ?5, result_summary = NULL,
                         updated_at = ?6
-                  WHERE id = ?1 AND status = 'review'",
+                  WHERE id = ?1 AND kind IN ('task','goal') AND status = 'review'",
                     params![id, new_retry, new_round, diminishing as i64, feedback, now],
                 )
                 .map_err(|e| format!("reject review (revising): {e}"))?;
@@ -207,6 +257,8 @@ impl TaskStore {
                     feedback,
                     verdict_json,
                     worker_excerpt.as_deref(),
+                    knobs_json,
+                    None,
                     &now,
                 )?;
             }
@@ -220,7 +272,7 @@ impl TaskStore {
                     "UPDATE tasks
                     SET status = 'needs_human', judge_feedback = ?2, pause_reason = ?4,
                         updated_at = ?3
-                  WHERE id = ?1 AND status = 'review'",
+                  WHERE id = ?1 AND kind IN ('task','goal') AND status = 'review'",
                     params![
                         id,
                         feedback,
@@ -237,6 +289,8 @@ impl TaskStore {
                     feedback,
                     verdict_json,
                     worker_excerpt.as_deref(),
+                    knobs_json,
+                    Some(crate::pause_reason::PauseReason::BudgetExhausted.as_str()),
                     &now,
                 )?;
 
@@ -257,7 +311,7 @@ impl TaskStore {
                         let enriched =
                             crate::goal_budget_best_round::compose_escalation_note(feedback, &pick);
                         let _ = conn.execute(
-                            "UPDATE tasks SET judge_feedback = ?2 WHERE id = ?1",
+                            "UPDATE tasks SET judge_feedback = ?2 WHERE id = ?1 AND kind IN ('task','goal')",
                             params![id, enriched],
                         );
                     }
@@ -302,10 +356,66 @@ impl TaskStore {
             .execute(
                 "UPDATE tasks SET status = 'needs_human', judge_feedback = ?2, pause_reason = ?4,
                         updated_at = ?3
-                  WHERE id = ?1",
+                  WHERE id = ?1 AND kind IN ('task','goal')",
                 params![id, reason, now, pause.as_str()],
             )
             .map_err(|e| format!("mark needs_human: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// A1-2: [`Self::mark_needs_human_with_pause`] for the **settle** path —
+    /// a round that ends in `needs_human` without a judge ruling (evaluator
+    /// `blocked`, judge error, `human_only` / `evaluator_only` fail-closed).
+    ///
+    /// The task-row write is byte-identical to `mark_needs_human_with_pause`
+    /// (same statement, same result). Afterwards, only when that write took
+    /// effect, the latest un-judged round is sealed `escalated` with the pause
+    /// class, the round's own output excerpt and the knob snapshot (see
+    /// `iter_escalate_seal_conn` for why `judge_feedback` stays NULL). The
+    /// seal is pure bookkeeping: its failure is logged and never returned.
+    pub async fn mark_needs_human_sealing_round(
+        &self,
+        id: &str,
+        reason: &str,
+        pause: crate::pause_reason::PauseReason,
+        knobs_json: Option<&str>,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let n = conn
+            .execute(
+                "UPDATE tasks SET status = 'needs_human', judge_feedback = ?2, pause_reason = ?4,
+                        updated_at = ?3
+                  WHERE id = ?1 AND kind IN ('task','goal')",
+                params![id, reason, now, pause.as_str()],
+            )
+            .map_err(|e| format!("mark needs_human: {e}"))?;
+        if n > 0 {
+            let seal = conn
+                .query_row(
+                    "SELECT result_summary FROM tasks WHERE id = ?1 AND kind IN ('task','goal')",
+                    params![id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|e| format!("escalate seal: excerpt read: {e}"))
+                .and_then(|summary| {
+                    let excerpt = crate::goal_budget_best_round::worker_excerpt(
+                        summary.flatten().as_deref(),
+                    );
+                    iter_escalate_seal_conn(
+                        &conn,
+                        id,
+                        pause.as_str(),
+                        excerpt.as_deref(),
+                        knobs_json,
+                        &now,
+                    )
+                });
+            if let Err(e) = seal {
+                tracing::warn!(task = id, error = %e, "A1 ledger: escalated-round seal failed (non-fatal)");
+            }
+        }
         Ok(n > 0)
     }
 
@@ -320,7 +430,7 @@ impl TaskStore {
     pub async fn clear_plan_pending(&self, id: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE tasks SET plan_pending = NULL WHERE id = ?1",
+            "UPDATE tasks SET plan_pending = NULL WHERE id = ?1 AND kind IN ('task','goal')",
             params![id],
         )
         .map_err(|e| format!("clear plan_pending: {e}"))?;
@@ -344,47 +454,66 @@ impl TaskStore {
         decision: &str,
         note: &str,
     ) -> Result<bool, String> {
+        self.resolve_needs_human_inner(id, decision, note, false).await
+    }
+
+    /// Called only after the dashboard/channel authorization gate succeeds.
+    pub(crate) async fn resolve_needs_human_with_survival_evidence(
+        &self, id: &str, decision: &str, note: &str,
+    ) -> Result<bool, String> {
+        self.resolve_needs_human_inner(id, decision, note, true).await
+    }
+
+    async fn resolve_needs_human_inner(
+        &self, id: &str, decision: &str, note: &str, authenticated: bool,
+    ) -> Result<bool, String> {
         let note_opt: Option<&str> = if note.trim().is_empty() {
             None
         } else {
             Some(note)
         };
-        let conn = self.conn.lock().await;
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("resolve needs_human: begin: {e}"))?;
         let now = Utc::now().to_rfc3339();
         // H11: the pause is over on every branch — clear the class so a task
         // sent back around the loop (or closed out) never renders a stale
         // 「卡住沒進展」chip from the pause a human just resolved.
         let n = match decision {
-            "retry" => conn
+            "retry" => tx
                 .execute(
                     "UPDATE tasks
                         SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
                             lease_expires_at = NULL, result_summary = NULL,
                             judge_feedback = ?2, pause_reason = NULL, updated_at = ?3
-                      WHERE id = ?1 AND status = 'needs_human'",
+                      WHERE id = ?1 AND kind IN ('task','goal') AND status = 'needs_human'",
                     params![id, note_opt, now],
                 )
                 .map_err(|e| format!("resolve needs_human (retry): {e}"))?,
-            "done" => conn
+            "done" => tx
                 .execute(
                     "UPDATE tasks
                         SET status = 'done', completed_at = ?3, judge_feedback = ?2,
                             pause_reason = NULL, updated_at = ?3
-                      WHERE id = ?1 AND status = 'needs_human'",
+                      WHERE id = ?1 AND kind IN ('task','goal') AND status = 'needs_human'",
                     params![id, note_opt, now],
                 )
                 .map_err(|e| format!("resolve needs_human (done): {e}"))?,
-            "abort" => conn
+            "abort" => tx
                 .execute(
                     "UPDATE tasks
                         SET status = 'cancelled', judge_feedback = ?2, pause_reason = NULL,
                             updated_at = ?3
-                      WHERE id = ?1 AND status = 'needs_human'",
+                      WHERE id = ?1 AND kind IN ('task','goal') AND status = 'needs_human'",
                     params![id, note_opt, now],
                 )
                 .map_err(|e| format!("resolve needs_human (abort): {e}"))?,
             other => return Err(format!("unknown needs_human decision: {other}")),
         };
+        if n == 1 && authenticated {
+            survival_decision_receipt_conn(&tx, id, decision)?;
+        }
+        tx.commit().map_err(|e| format!("resolve needs_human: commit: {e}"))?;
         Ok(n == 1)
     }
 
@@ -420,24 +549,41 @@ impl TaskStore {
     /// `pending` task carrying a stale completion timestamp from a previous
     /// `done` round would misrepresent the row.
     pub async fn continue_from_terminal(&self, id: &str, message: &str) -> Result<bool, String> {
+        self.continue_from_terminal_inner(id, message, false).await
+    }
+
+    /// The verified dashboard decision path; agent-facing bare calls do not assert a human retry.
+    pub(crate) async fn continue_from_terminal_with_survival_evidence(
+        &self, id: &str, message: &str,
+    ) -> Result<bool, String> {
+        self.continue_from_terminal_inner(id, message, true).await
+    }
+
+    async fn continue_from_terminal_inner(&self, id: &str, message: &str, authenticated: bool) -> Result<bool, String> {
         let message = message.trim();
         if message.is_empty() {
             return Err("接著做需要附上訊息".into());
         }
         let stamped = format!("{CONTINUE_MESSAGE_PREFIX}{message}");
-        let conn = self.conn.lock().await;
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("continue from terminal: begin: {e}"))?;
         let now = Utc::now().to_rfc3339();
-        let n = conn
+        let n = tx
             .execute(
                 "UPDATE tasks
                     SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
                         lease_expires_at = NULL, result_summary = NULL, completed_at = NULL,
                         judge_feedback = ?2, updated_at = ?3
-                  WHERE id = ?1 AND status IN ('done', 'failed', 'cancelled')
+                  WHERE id = ?1 AND kind IN ('task','goal') AND status IN ('done', 'failed', 'cancelled')
                     AND COALESCE(goal_mode, 0) = 1",
                 params![id, stamped, now],
             )
             .map_err(|e| format!("continue from terminal: {e}"))?;
+        if n == 1 && authenticated {
+            survival_decision_receipt_conn(&tx, id, "retry")?;
+        }
+        tx.commit().map_err(|e| format!("continue from terminal: commit: {e}"))?;
         Ok(n == 1)
     }
 
@@ -472,7 +618,7 @@ impl TaskStore {
         let n = conn
             .execute(
                 "UPDATE tasks SET claimed_by = ?2, updated_at = ?3
-                  WHERE id = ?1 AND status = 'needs_human'",
+                  WHERE id = ?1 AND kind IN ('task','goal') AND status = 'needs_human'",
                 params![id, decider, now],
             )
             .map_err(|e| format!("claim needs_human: {e}"))?;
@@ -509,7 +655,7 @@ impl TaskStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id FROM tasks
-                  WHERE COALESCE(goal_mode, 0) = 1
+                  WHERE kind IN ('task','goal') AND COALESCE(goal_mode, 0) = 1
                     AND source_channel = ?1 AND source_chat_id = ?2
                     AND status NOT IN ('done', 'cancelled', 'failed')
                     AND (claimed_by IS NULL OR claimed_by = ?3)",
@@ -525,7 +671,7 @@ impl TaskStore {
         drop(stmt);
         for id in &ids {
             conn.execute(
-                "UPDATE tasks SET claimed_by = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE tasks SET claimed_by = ?2, updated_at = ?3 WHERE id = ?1 AND kind IN ('task','goal')",
                 params![id, decider, now],
             )
             .map_err(|e| format!("claim conversation tasks (update {id}): {e}"))?;
@@ -544,7 +690,7 @@ impl TaskStore {
             .execute(
                 "UPDATE tasks
                     SET status = 'cancelled', judge_feedback = ?2, updated_at = ?3
-                  WHERE id = ?1 AND status NOT IN ('done', 'cancelled', 'failed')",
+                  WHERE id = ?1 AND kind IN ('task','goal') AND status NOT IN ('done', 'cancelled', 'failed')",
                 params![id, reason, now],
             )
             .map_err(|e| format!("cancel task: {e}"))?;
@@ -552,4 +698,26 @@ impl TaskStore {
     }
 
     // ── Iterative Kanban: iteration detail (v1.45) ──────────
+}
+
+/// Private receipt writer. Neither arbitrary Activity events nor public task
+/// mutation methods can enter this path. The caller owns the transition's tx.
+fn survival_decision_receipt_conn(conn: &Connection, task_id: &str, decision: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO task_survival_evidence(task_id,evidence_version)
+         SELECT id,1 FROM tasks WHERE id=?1 AND goal_mode=1 AND kind IN ('task','goal')
+         ON CONFLICT(task_id) DO NOTHING",
+        params![task_id],
+    ).map_err(|e| format!("survival evidence: initialize partial receipt: {e}"))?;
+    conn.execute(
+        "UPDATE task_survival_evidence
+         SET manual_retry=CASE WHEN ?2='retry' THEN 1 ELSE manual_retry END,
+             human_approved=CASE WHEN ?2='done' THEN 1 ELSE 0 END,
+             human_approved_iteration_id=CASE WHEN ?2='done' THEN
+                 (SELECT id FROM task_iterations WHERE task_id=?1 ORDER BY id DESC LIMIT 1)
+                 ELSE NULL END
+         WHERE task_id=?1 AND evidence_version=1",
+        params![task_id,decision],
+    ).map_err(|e| format!("survival evidence: write decision receipt: {e}"))?;
+    Ok(())
 }

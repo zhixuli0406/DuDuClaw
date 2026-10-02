@@ -171,6 +171,36 @@ pub fn build_tools_call_request(id: i64, name: &str, args: Value) -> Value {
 }
 
 /// Extract a JSON-RPC `error` member into [`McpError::Rpc`], if present.
+/// Whether a Streamable-HTTP MCP endpoint may be used: any `https://` URL,
+/// or plain `http://` only when the parsed host is exactly `localhost`, an
+/// IPv4 loopback address (127.0.0.0/8) or `::1`. The host is compared after
+/// parsing, never by prefix: `http://localhost.evil.com` and
+/// `http://localhost@evil.com` are remote hosts and need `https`.
+fn http_endpoint_allowed(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "https" => parsed.host_str().is_some(),
+        "http" => match parsed.host_str() {
+            Some(host) if host.eq_ignore_ascii_case("localhost") => true,
+            // `host_str` brackets an IPv6 literal (`[::1]`).
+            Some(host) => match host
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(host)
+                .parse::<std::net::IpAddr>()
+            {
+                Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
+                Ok(std::net::IpAddr::V6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+                Err(_) => false,
+            },
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 fn rpc_error_of(frame: &Value) -> Option<McpError> {
     let err = frame.get("error")?;
     let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
@@ -369,10 +399,7 @@ impl McpClient {
         headers: &[(String, String)],
         timeout: Duration,
     ) -> Result<Self, McpError> {
-        if !url.starts_with("https://")
-            && !url.starts_with("http://127.0.0.1")
-            && !url.starts_with("http://localhost")
-        {
+        if !http_endpoint_allowed(url) {
             return Err(McpError::Spawn(format!(
                 "MCP HTTP endpoint must be https:// (or localhost for dev): {url}"
             )));
@@ -1024,6 +1051,39 @@ impl ToolExecutor for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_endpoint_host_is_compared_exactly_not_by_prefix() {
+        // Remote hosts that merely start with a local-looking string.
+        for url in [
+            "http://localhost.evil.com",
+            "http://localhost.evil.com/mcp",
+            "http://localhost@evil.com",
+            "http://localhost:3000@evil.com/mcp",
+            "http://127.0.0.1.evil.com",
+            "http://127.0.0.1.evil.com:8080/mcp",
+            "http://remote.example",
+            "http://[::2]:8080",
+            "ftp://localhost/mcp",
+            "localhost:3000",
+            "not a url",
+        ] {
+            assert!(!http_endpoint_allowed(url), "{url} must need https");
+        }
+        // Loopback over plain http, and any https endpoint.
+        for url in [
+            "http://[::1]:8080",
+            "http://[::1]/mcp",
+            "http://localhost:3000",
+            "http://LOCALHOST:3000/mcp",
+            "http://127.0.0.1:8765/mcp",
+            "http://127.1.2.3/mcp",
+            "https://remote.example",
+            "https://remote.example/mcp",
+        ] {
+            assert!(http_endpoint_allowed(url), "{url} must be accepted");
+        }
+    }
 
     #[test]
     fn initialize_request_shape() {

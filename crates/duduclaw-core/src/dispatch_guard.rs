@@ -60,6 +60,8 @@ use serde::{Deserialize, Serialize};
 /// operator as "the platform broke" rather than "a limit was reached"
 /// (design `DESIGN-team-as-agent-2026-09.md` §3.8, fix ②).
 pub const PATH_KIND_ROLE_TEAM: &str = "role_team";
+/// Exploration attempts and policy development have their own rate bucket.
+pub const PATH_KIND_DISCOVERY: &str = "discovery";
 
 /// Default for [`DispatchGuardConfig::role_team_max_in_window`].
 ///

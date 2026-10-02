@@ -1,43 +1,105 @@
 # DuDuClaw Computer Use — L5 Container
-# Virtual display (Xvfb) + Chromium + VNC for Claude computer_use tool
+# Virtual display (Xvfb) + window manager + Chromium (kiosk) + optional VNC,
+# driven by the gateway's computer_use_orchestrator through `docker exec`.
 #
-# Usage:
-#   docker build -f container/Dockerfile.computer-use -t duduclaw/computer-use .
-#   docker run -p 5900:5900 duduclaw/computer-use
+# Contract with the Rust side (crates/duduclaw-gateway/src/computer_use_orchestrator.rs):
+#   - image name: by default the orchestrator launches
+#     `ghcr.io/zhixuli0406/duduclaw-computer-use:v<gateway version>`
+#     (crates/duduclaw-gateway/src/computer_use_image.rs), published for
+#     linux/amd64 + linux/arm64 by .github/workflows/computer-use-image.yml on
+#     release tags `v*`, after a smoke test with the orchestrator's own flags.
+#     It is never pulled automatically (--pull never + a presence check). To
+#     run a local build instead:
+#       docker build -f container/Dockerfile.computer-use -t duduclaw-computer-use:latest .
+#     and set `config.toml [computer_use] image = "duduclaw-computer-use:latest"`.
+#   - it is run with --pull never, --read-only, --tmpfs /tmp:size=256m,
+#     --security-opt no-new-privileges, --cpus 1, --memory 512m,
+#     --pids-limit 512, usually --network=none, and -e DISPLAY=:99
+#     -e DISPLAY_SIZE=<w>x<h>. Everything that writes goes to /tmp; root-side
+#     temp files go to /tmp/duduclaw-root (root, 0700, made by the entrypoint).
+#   - the gateway execs: `xdotool getactivewindow` (readiness; needs an EWMH
+#     window manager, hence openbox), `xdotool ...` actions, `scrot -o
+#     /tmp/duduclaw-root/screen.png` + `cat` (screenshots),
+#     `duduclaw-eval-dom <js>` (sensitive-region detection for screenshot
+#     masking; see that script) and `docker exec -i ... duduclaw-navigate`
+#     with the https URL on stdin (the `computer_navigate` tool).
+#   - tool-driven sessions with a navigation allowlist run with
+#     --network bridge (never --network=none), --cap-add=NET_ADMIN, one
+#     --add-host per pinned host and -e ALLOWED_IPS=<ip,...>
+#     (domain-filter.sh: TCP 443 to those addresses only, no DNS, loopback
+#     only to 127.0.0.1); the entrypoint drops NET_ADMIN after that.
+#
+# Base image: Debian, because Ubuntu 24.04's `chromium-browser` is a transitional
+# package for the snap and its /usr/bin/chromium-browser only prints
+# "requires the chromium snap to be installed" inside Docker. Debian's
+# `chromium` is a real deb.
 
-FROM ubuntu:24.04
+FROM debian:trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DISPLAY=:99
 ENV DISPLAY_SIZE=1280x800
 
-# Install Xvfb, VNC, Chromium, and utilities
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Xvfb, VNC, window manager, Chromium, input/screenshot tools, the domain
+# filter's iptables/dig, fonts, and python3 for duduclaw-eval-dom (stdlib only).
+# The apt cache mount keeps already-downloaded .debs across interrupted builds
+# (~310 MB of archives); it is not part of the image.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     x11vnc \
-    chromium-browser \
+    openbox \
+    chromium \
     xdotool \
     imagemagick \
     scrot \
     iptables \
-    dnsutils \
+    bind9-dnsutils \
+    python3 \
     fonts-noto-cjk \
     fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
+# Non-root user the browser and window manager run as. The entrypoint itself
+# stays root only to program iptables in domain-filter.sh.
 RUN groupadd -r sandbox && useradd -r -g sandbox -m sandbox
 
-# Copy entrypoint and domain filter
 COPY container/scripts/computer-use-entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY container/scripts/domain-filter.sh /usr/local/bin/domain-filter.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/domain-filter.sh
+COPY container/scripts/duduclaw-eval-dom /usr/local/bin/duduclaw-eval-dom
+COPY container/scripts/duduclaw-navigate /usr/local/bin/duduclaw-navigate
+COPY container/scripts/duduclaw_cdp.py /usr/local/bin/duduclaw_cdp.py
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/domain-filter.sh \
+        /usr/local/bin/duduclaw-eval-dom /usr/local/bin/duduclaw-navigate \
+    && chmod 0644 /usr/local/bin/duduclaw_cdp.py
+
+# Managed Chromium policies (container/scripts/chromium-policy.json):
+#   - name resolution through /etc/hosts only (the gateway's --add-host
+#     pins): no built-in async DNS client, no DNS-over-HTTPS (the entrypoint
+#     also passes --disable-features=AsyncDns,DnsOverHttps);
+#   - pages may not reach loopback / private addresses and are never asked
+#     to (LocalNetworkAccessBlockedForUrls, LocalNetworkBlockedForUrls,
+#     LoopbackNetworkBlockedForUrls: no "access other apps and services on
+#     this device" prompt the AI could accept);
+#   - no incognito, guest or new-profile windows, no file dialogs, printing
+#     or downloads; file://, chrome://, chrome-untrusted://, devtools://,
+#     view-source: and javascript: URLs are blocked, and a new tab opens
+#     about:blank. DeveloperToolsAvailability / ...Blocklist are deliberately
+#     NOT set: in this Chromium they also refuse every DevTools-protocol
+#     command on the loopback port, which the masking and navigation helpers
+#     need (the DevTools front end itself is blocked as devtools://*);
+#   - permission prompts (popups, notifications, geolocation, USB/serial/HID,
+#     file system, direct sockets, window management, capture) are denied
+#     without asking, and password / autofill / bookmark UI is off.
+COPY container/scripts/chromium-policy.json /etc/chromium/policies/managed/duduclaw.json
+RUN chmod 0644 /etc/chromium/policies/managed/duduclaw.json
 
 # Working directories
 RUN mkdir -p /agent /workspace /screenshots && \
     chown sandbox:sandbox /workspace /screenshots
 
-# Expose VNC port
+# VNC (only when VNC_ENABLED=true and the port is published)
 EXPOSE 5900
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \

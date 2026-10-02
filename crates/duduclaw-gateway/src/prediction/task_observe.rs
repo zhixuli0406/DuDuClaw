@@ -109,6 +109,17 @@ pub fn record_native_evidence(task_id: &str, round: u32, events: Vec<NativeToolE
     }
 }
 
+/// The bridge key's round for a task whose `tasks.revision_round` is
+/// `revision_round`: the settle side takes evidence for `revision_round + 1`
+/// (`dispatch_engine/review.rs`), and `revision_round` does not move between
+/// the dispatch and that settle, so the producer (`dispatcher.rs`) must key
+/// by the same value — NOT by the goal-loop marker's `iter=`, which is the
+/// driver's dispatch ordinal and diverges after a stall re-dispatch or a
+/// gateway restart. One function so the two sides cannot drift.
+pub fn evidence_round_for_revision(revision_round: i64) -> u32 {
+    (revision_round as u32).saturating_add(1)
+}
+
 /// Consumer-side entry point: called by
 /// `dispatch_engine.rs::settle_forward_model` once per settled round.
 /// Removes (not just reads) the entry — a round is only ever settled once,

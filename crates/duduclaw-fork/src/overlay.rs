@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use crate::copy_policy::CopyPolicy;
 use crate::error::{ForkError, Result};
 
 /// Available copy-on-write workspace backends (RFC-26 §4.3 / §6 Q1).
@@ -95,6 +96,7 @@ pub struct BranchOverlay {
     _root: tempfile::TempDir,
     work: PathBuf,
     backend: OverlayBackend,
+    policy: CopyPolicy,
 }
 
 impl BranchOverlay {
@@ -107,32 +109,66 @@ impl BranchOverlay {
         Self::create_with(parent, detect_backend())
     }
 
-    /// Create with an explicit backend (used by tests to exercise both paths).
+    /// Create with an explicit backend (used by tests to exercise both paths),
+    /// under [`CopyPolicy::fork_default`].
     pub fn create_with(parent: impl AsRef<Path>, backend: OverlayBackend) -> Result<Self> {
-        let parent = parent.as_ref().to_path_buf();
+        Self::create_with_policy(parent, backend, CopyPolicy::fork_default())
+    }
+
+    /// Create with an explicit backend and copy policy. Both backends end in the
+    /// same state: the native clone gets a policy post-pass that removes
+    /// excluded names, escaping symlinks and special files.
+    pub fn create_with_policy(
+        parent: impl AsRef<Path>,
+        backend: OverlayBackend,
+        policy: CopyPolicy,
+    ) -> Result<Self> {
+        let parent = parent.as_ref();
         if !parent.is_dir() {
             return Err(ForkError::Overlay(format!(
                 "parent workspace is not a directory: {}",
                 parent.display()
             )));
         }
-        let root = tempfile::Builder::new()
-            .prefix("duduclaw_fork_")
-            .tempdir()
-            .map_err(|e| ForkError::Overlay(format!("create overlay tempdir: {e}")))?;
-        let work = root.path().join("ws"); // must not exist for native clone
+        // Canonical parent: a symlinked parent path must not make `cp -R` clone
+        // the link itself (which would alias the branch onto the parent).
+        let parent = parent
+            .canonicalize()
+            .map_err(|e| ForkError::Overlay(format!("canonicalize parent: {e}")))?;
+        // Snapshot readers must not observe a multi-file promotion halfway
+        // through; the reserved sidecar is excluded even for custom policies.
+        let publication_parent = parent.clone();
+        crate::with_parent_publication(&publication_parent, |_| {
+            let root = tempfile::Builder::new()
+                .prefix("duduclaw_fork_")
+                .tempdir()
+                .map_err(|e| ForkError::Overlay(format!("create overlay tempdir: {e}")))?;
+            crate::retention::set_private(root.path())?;
+            let work = root.path().join("ws"); // must not exist for native clone
 
-        let effective = match backend {
-            OverlayBackend::NativeCow if clone_tree_native(&parent, &work).is_ok() => {
+            let native_ok = backend == OverlayBackend::NativeCow
+                && clone_tree_native(&parent, &work).is_ok()
+                && match policy.sanitize_clone(&parent, &work) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!("fork overlay: CoW post-pass failed, using snapshot: {e}");
+                        false
+                    }
+                };
+            let effective = if native_ok {
                 OverlayBackend::NativeCow
-            }
-            _ => {
-                // Snapshot (also the fallback when a native clone fails mid-create).
-                copy_tree(&parent, &work)?;
+            } else {
+                // Snapshot (also the fallback when a native clone or its post-pass
+                // fails mid-create). Start from an empty target.
+                if std::fs::symlink_metadata(&work).is_ok() {
+                    std::fs::remove_dir_all(&work)
+                        .map_err(|e| ForkError::Overlay(format!("reset overlay dir: {e}")))?;
+                }
+                policy.copy_tree(&parent, &work)?;
                 OverlayBackend::Snapshot
-            }
-        };
-        Ok(BranchOverlay { parent, _root: root, work, backend: effective })
+            };
+            Ok(BranchOverlay { parent, _root: root, work, backend: effective, policy })
+        })
     }
 
     /// The branch's private writable root. The agent subprocess runs against this.
@@ -150,48 +186,102 @@ impl BranchOverlay {
         self.backend
     }
 
+    /// Last-resort recovery: relinquish automatic deletion of the private root.
+    pub(crate) fn keep_source(self) -> PathBuf {
+        let workspace = self.work.clone();
+        self._root.keep();
+        workspace
+    }
+
     /// Merge this branch's writes back into the parent workspace (winner only).
     ///
     /// Overwrites parent files that the branch changed and adds new ones. Files the
-    /// branch deleted are *not* propagated (additive merge).
+    /// branch deleted are *not* propagated (additive merge). The copy policy
+    /// applies: excluded names and escaping symlinks are never written back.
     pub fn promote(&self) -> Result<()> {
-        copy_tree(&self.work, &self.parent)
+        promote_workspace(&self.work, &self.parent, &self.policy).map(|_| ())
+    }
+
+    /// Move this branch workspace out of its temp dir to `dest` (which must not
+    /// exist) so it survives the overlay being dropped. Renames when `dest` is on
+    /// the same filesystem, otherwise copies under the overlay's policy and lets
+    /// the temp dir be removed on drop. Returns the persisted path.
+    pub fn persist_to(self, dest: &Path) -> Result<PathBuf> {
+        if std::fs::symlink_metadata(dest).is_ok() {
+            return Err(ForkError::Overlay(format!(
+                "retained workspace destination already exists: {}",
+                dest.display()
+            )));
+        }
+        if std::fs::rename(&self.work, dest).is_err() {
+            if let Err(e) = self.policy.copy_tree(&self.work, dest) {
+                let _ = std::fs::remove_dir_all(dest);
+                return Err(e);
+            }
+        }
+        Ok(dest.to_path_buf())
+        // `self` drops here: the temp root (now without `ws` after a rename) goes.
     }
 }
 
-/// Recursively copy `src` into `dst`, creating `dst` subdirectories as needed.
-/// Symlinks are copied as their target contents to keep branch writes contained
-/// within the overlay (no escape via symlink into the parent during a run).
-fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)
-        .map_err(|e| ForkError::Overlay(format!("create {}: {e}", dst.display())))?;
-
-    for entry in std::fs::read_dir(src)
-        .map_err(|e| ForkError::Overlay(format!("read_dir {}: {e}", src.display())))?
-    {
-        let entry =
-            entry.map_err(|e| ForkError::Overlay(format!("dir entry in {}: {e}", src.display())))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|e| ForkError::Overlay(format!("file_type: {e}")))?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-
-        if file_type.is_dir() {
-            copy_tree(&from, &to)?;
-        } else {
-            // Regular file or symlink-to-file: copy contents.
-            std::fs::copy(&from, &to)
-                .map_err(|e| ForkError::Overlay(format!("copy {} -> {}: {e}", from.display(), to.display())))?;
-        }
+/// Promote a (possibly retained) branch workspace into `parent` under `policy`.
+/// Shared by [`BranchOverlay::promote`] and the deferred `merge_or_select` path.
+pub fn promote_workspace(
+    workspace: &Path,
+    parent: &Path,
+    policy: &CopyPolicy,
+) -> Result<crate::copy_policy::CopyReport> {
+    if !parent.is_dir() {
+        return Err(ForkError::Overlay(format!(
+            "parent workspace is not a directory: {}",
+            parent.display()
+        )));
     }
-    Ok(())
+    crate::with_parent_publication(parent, |publication| publication.promote(workspace, policy))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn publication_lock_inode_is_never_copied_or_replaced_by_a_branch() {
+        let parent = tempfile::tempdir().unwrap();
+        let reserved = ".duduclaw-fork-publication.lock";
+        fs::write(parent.path().join(reserved), "host-owned lock").unwrap();
+        let overlay = BranchOverlay::create_with_policy(parent.path(), OverlayBackend::Snapshot,
+            CopyPolicy::with_excludes(Vec::<String>::new())).unwrap();
+        assert!(!overlay.workspace().join(reserved).exists());
+        fs::write(overlay.workspace().join(reserved), "branch replacement").unwrap();
+        overlay.promote().unwrap();
+        assert_eq!(fs::read_to_string(parent.path().join(reserved)).unwrap(), "host-owned lock");
+    }
+
+    #[test]
+    fn parent_equal_to_home_cannot_replace_held_resolution_lock_and_admit_new_writer() {
+        let home = tempfile::tempdir().unwrap();
+        let key = home.path().join("fork_resolution.lock");
+        let (admitted, await_admitted) = std::sync::mpsc::channel();
+        let mut writer = None;
+        let entered_early = duduclaw_core::with_file_lock(&key, || {
+            let overlay = BranchOverlay::create_with_policy(home.path(), OverlayBackend::Snapshot,
+                CopyPolicy::with_excludes(Vec::<String>::new())).unwrap();
+            // A branch can invent the reserved file even after a safe snapshot.
+            fs::write(overlay.workspace().join("fork_resolution.lock.lock"), "replace host inode").unwrap();
+            overlay.promote().unwrap();
+            let key = key.clone();
+            writer = Some(std::thread::spawn(move || {
+                duduclaw_core::with_file_lock(&key, || {
+                    admitted.send(()).unwrap();
+                    Ok(())
+                }).unwrap();
+            }));
+            Ok(await_admitted.recv_timeout(std::time::Duration::from_millis(200)).is_ok())
+        }).unwrap();
+        writer.unwrap().join().unwrap();
+        assert!(!entered_early, "a new writer must wait for the original HOME lock holder");
+    }
 
     #[test]
     fn detect_backend_is_deterministic_and_safe() {
@@ -270,6 +360,126 @@ mod tests {
         overlay.promote().unwrap();
         assert_eq!(fs::read_to_string(parent.path().join("a.txt")).unwrap(), "changed");
         assert_eq!(fs::read_to_string(parent.path().join("new.txt")).unwrap(), "added");
+    }
+
+    fn backends() -> Vec<OverlayBackend> {
+        // NativeCow silently degrades to Snapshot where unsupported, so both
+        // variants are always safe to request.
+        vec![OverlayBackend::Snapshot, OverlayBackend::NativeCow]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_outside_file_is_not_copied_on_any_backend() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "outside-secret").unwrap();
+        for backend in backends() {
+            let parent = tempfile::tempdir().unwrap();
+            fs::write(parent.path().join("a.txt"), "a").unwrap();
+            fs::create_dir_all(parent.path().join("sub")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("secret.txt"),
+                parent.path().join("sub/leak"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(outside.path(), parent.path().join("leakdir")).unwrap();
+
+            let overlay = BranchOverlay::create_with(parent.path(), backend).unwrap();
+            let ws = overlay.workspace();
+            assert!(fs::symlink_metadata(ws.join("sub/leak")).is_err(), "{backend:?}");
+            assert!(fs::symlink_metadata(ws.join("leakdir")).is_err(), "{backend:?}");
+            assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "a");
+        }
+    }
+
+    #[test]
+    fn excluded_names_absent_on_any_backend() {
+        for backend in backends() {
+            let parent = tempfile::tempdir().unwrap();
+            fs::write(parent.path().join(".env"), "TOKEN=x").unwrap();
+            fs::write(parent.path().join(".env.production"), "TOKEN=y").unwrap();
+            fs::create_dir_all(parent.path().join("certs")).unwrap();
+            fs::write(parent.path().join("certs/server.pem"), "pem").unwrap();
+            fs::write(parent.path().join("certs/id_rsa"), "key").unwrap();
+            fs::write(parent.path().join(".netrc"), "machine").unwrap();
+            fs::create_dir_all(parent.path().join(".claude")).unwrap();
+            fs::write(parent.path().join(".claude/settings.json"), "{}").unwrap();
+            fs::write(parent.path().join("main.rs"), "fn main(){}").unwrap();
+
+            let overlay = BranchOverlay::create_with(parent.path(), backend).unwrap();
+            let ws = overlay.workspace();
+            for gone in [".env", ".env.production", "certs/server.pem", "certs/id_rsa", ".netrc"] {
+                assert!(fs::symlink_metadata(ws.join(gone)).is_err(), "{backend:?}: {gone}");
+            }
+            // Hooks and ordinary files are kept.
+            assert!(ws.join(".claude/settings.json").is_file(), "{backend:?}");
+            assert!(ws.join("main.rs").is_file(), "{backend:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promote_drops_branch_created_escaping_symlink_and_secret() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("host_secret"), "host").unwrap();
+        for backend in backends() {
+            let parent = tempfile::tempdir().unwrap();
+            fs::write(parent.path().join("a.txt"), "orig").unwrap();
+            let overlay = BranchOverlay::create_with(parent.path(), backend).unwrap();
+            let ws = overlay.workspace();
+            fs::write(ws.join("a.txt"), "changed").unwrap();
+            fs::write(ws.join(".env"), "LEAK=1").unwrap();
+            std::os::unix::fs::symlink(outside.path().join("host_secret"), ws.join("grab"))
+                .unwrap();
+            // A symlink pointing at the parent's absolute path is outside the
+            // branch root too.
+            std::os::unix::fs::symlink(parent.path().join("a.txt"), ws.join("to_parent")).unwrap();
+
+            overlay.promote().unwrap();
+            assert_eq!(fs::read_to_string(parent.path().join("a.txt")).unwrap(), "changed");
+            assert!(fs::symlink_metadata(parent.path().join(".env")).is_err(), "{backend:?}");
+            assert!(fs::symlink_metadata(parent.path().join("grab")).is_err(), "{backend:?}");
+            assert!(fs::symlink_metadata(parent.path().join("to_parent")).is_err(), "{backend:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_root_relative_symlink_survives_copy_and_promote() {
+        for backend in backends() {
+            let parent = tempfile::tempdir().unwrap();
+            fs::create_dir_all(parent.path().join("docs")).unwrap();
+            fs::write(parent.path().join("docs/guide.md"), "guide").unwrap();
+            std::os::unix::fs::symlink("docs/guide.md", parent.path().join("GUIDE")).unwrap();
+
+            let overlay = BranchOverlay::create_with(parent.path(), backend).unwrap();
+            let link = overlay.workspace().join("GUIDE");
+            assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "{backend:?}");
+            assert_eq!(fs::read_link(&link).unwrap(), Path::new("docs/guide.md"));
+            assert_eq!(fs::read_to_string(&link).unwrap(), "guide");
+
+            // Branch adds its own in-root link; promote recreates it as a link.
+            std::os::unix::fs::symlink("docs", overlay.workspace().join("d")).unwrap();
+            overlay.promote().unwrap();
+            let promoted = parent.path().join("d");
+            assert!(fs::symlink_metadata(&promoted).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read_to_string(promoted.join("guide.md")).unwrap(), "guide");
+        }
+    }
+
+    #[test]
+    fn persist_to_moves_workspace_out_of_temp() {
+        let parent = tempfile::tempdir().unwrap();
+        fs::write(parent.path().join("a.txt"), "a").unwrap();
+        let keep = tempfile::tempdir().unwrap();
+        let dest = keep.path().join("retained");
+        let overlay = BranchOverlay::create_with(parent.path(), OverlayBackend::Snapshot).unwrap();
+        fs::write(overlay.workspace().join("new.txt"), "branch").unwrap();
+        let temp_ws = overlay.workspace().to_path_buf();
+        let got = overlay.persist_to(&dest).unwrap();
+        assert_eq!(got, dest);
+        assert_eq!(fs::read_to_string(dest.join("new.txt")).unwrap(), "branch");
+        assert!(!temp_ws.exists(), "temp workspace is gone after persist");
     }
 
     #[test]

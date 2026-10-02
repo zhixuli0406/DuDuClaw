@@ -11,9 +11,9 @@ reports_to = "none"
 icon = "fork-knife"
 
 # Optional: choose the AI runtime backend (default: claude).
-# Providers: "claude" | "codex" | "gemini" | "antigravity" | "openai_compat".
+# Providers: "claude" | "codex" | "gemini" (deprecated in v1.67.0, removed in v1.69.0; use "antigravity") | "antigravity" | "openai_compat".
 # "antigravity" drives Google's `agy` CLI (the 2026-06-18 successor to the
-# personal Gemini CLI; install to ~/.local/bin/agy, key via ANTIGRAVITY_API_KEY).
+# personal Gemini CLI; install to ~/.local/bin/agy, Google sign-in via `agy` in a terminal, or `[antigravity] auth = "api_key"` + GEMINI_API_KEY).
 # See docs/todo/TODO-antigravity-cli-migration.md.
 # [runtime]
 # provider = "antigravity"

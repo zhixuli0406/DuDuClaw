@@ -253,7 +253,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "agent_remove",
-        description: "Remove an agent (moves to _trash/ for recovery). Refuses to remove the main agent.",
+        description: "Remove an agent. The administrator can restore it; its name stays reserved and cannot be reused with create_agent. Refuses to remove the main agent.",
         params: &[ParamDef {
             name: "agent_id",
             description: "Agent name to remove",

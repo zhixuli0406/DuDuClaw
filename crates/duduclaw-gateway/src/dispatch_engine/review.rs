@@ -17,6 +17,24 @@ impl DispatchEngine {
 
         let now = Utc::now().to_rfc3339();
         for task in self.store.tasks_in_status("review").await? {
+            // Attribute both adjudication stages to the same open iteration
+            // the settle methods seal. A task counter can diverge from the
+            // ledger after a repair; do not derive this from dispatch ordinals
+            // or from the counter after a rejection increments it.
+            let cost_round = match self.store.list_iterations(&task.id).await {
+                Ok(rows) => rows.iter().rev()
+                    .find(|row| row.judged_at.is_none() && row.verdict.is_none())
+                    .map(|row| row.round),
+                Err(error) => {
+                    warn!(task = %task.id, %error, "review cost attribution: iteration lookup failed (non-fatal)");
+                    None
+                }
+            };
+            let attribution = crate::runtime::GoalRoundAttribution {
+                episode_id: task.id.clone(),
+                round: cost_round,
+            };
+            crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(attribution, async {
             // H9-G goal contract freeze (harness-borrowings 2026-08 WP-D):
             // the judge reads the immutable baseline snapshotted at goal
             // creation, not the mutable `acceptance_criteria` field a
@@ -96,7 +114,8 @@ impl DispatchEngine {
             // would degrade `full` back to `mcp_only` even though the
             // collector actually ran (this is the exact half-fix the WP-A10
             // report warned against).
-            let round = (task.revision_round as u32).saturating_add(1);
+            let round =
+                crate::prediction::task_observe::evidence_round_for_revision(task.revision_round);
             let native_evidence: Option<Vec<NativeToolEvent>> =
                 crate::prediction::task_observe::take_native_evidence(&task.id, round);
             let native_slice: &[NativeToolEvent] = native_evidence.as_deref().unwrap_or(&[]);
@@ -141,6 +160,11 @@ impl DispatchEngine {
             // pre-seam flow.
             let judge_mode = crate::judge_mode::JudgeMode::from_home(self.home_dir.as_deref());
 
+            // A1 ledger (2026-09-30): harness knob snapshot sealed on this
+            // round's `task_iterations` row, captured once per settle pass.
+            // Read-only telemetry — nothing below consults it.
+            let knobs_json = self.round_knobs_json(&task);
+
             // `human_only`: never machine-judged. Parked BEFORE any evidence
             // work or LLM/subprocess call so the mode is also the cheapest.
             // Uses the WP-A9 `observed_outcome` short-circuit (not a bare
@@ -150,10 +174,11 @@ impl DispatchEngine {
                               一律交由人工判定是否完成。"
                     .to_string();
                 self.store
-                    .mark_needs_human_with_pause(
+                    .mark_needs_human_sealing_round(
                         &task.id,
                         &reason,
                         crate::pause_reason::PauseReason::BlockedNeedsDecision,
+                        knobs_json.as_deref(),
                     )
                     .await?;
                 self.revoke_task_grants(&task.id).await;
@@ -195,7 +220,13 @@ impl DispatchEngine {
                         );
                         let status = self
                             .store
-                            .reject_review(&task.id, &feedback, self.soft_cap)
+                            .reject_review_with_ledger(
+                                &task.id,
+                                &feedback,
+                                self.soft_cap,
+                                None,
+                                knobs_json.as_deref(),
+                            )
                             .await?;
                         // Phase closed (a rejection re-opens the loop) → revoke
                         // scoped grants, mirroring the judge-rejection path.
@@ -310,7 +341,13 @@ impl DispatchEngine {
                                 Some(crate::fault_attribution::GroundingVerdict::Fail);
                             let status = self
                                 .store
-                                .reject_review(&task.id, &feedback, self.soft_cap)
+                                .reject_review_with_ledger(
+                                    &task.id,
+                                    &feedback,
+                                    self.soft_cap,
+                                    None,
+                                    knobs_json.as_deref(),
+                                )
                                 .await?;
                             // Phase closed (a rejection re-opens the loop) → revoke
                             // scoped grants, mirroring the judge-rejection path.
@@ -487,10 +524,11 @@ impl DispatchEngine {
                         &reason,
                     );
                     self.store
-                        .mark_needs_human_with_pause(
+                        .mark_needs_human_sealing_round(
                             &task.id,
                             &reason,
                             crate::pause_reason::PauseReason::Infra,
+                            knobs_json.as_deref(),
                         )
                         .await?;
                     self.revoke_task_grants(&task.id).await;
@@ -543,9 +581,24 @@ impl DispatchEngine {
                             ("bail_hint", bail_hint_note.as_deref().unwrap_or("")),
                         ]);
                         let eval_fut = evaluator.evaluate(&criteria, &task_text, &transcript);
-                        match time::timeout(Duration::from_secs(EVALUATOR_TIMEOUT_SECS), eval_fut)
-                            .await
-                        {
+                        let eval_result =
+                            time::timeout(Duration::from_secs(EVALUATOR_TIMEOUT_SECS), eval_fut)
+                                .await;
+                        // A1 ledger: record the first-stage verdict on the
+                        // round about to be sealed (NULL stays NULL when the
+                        // evaluator errored or timed out). Pure bookkeeping —
+                        // a failed write is logged and the decision below is
+                        // unaffected.
+                        if let Ok(Ok(ev)) = &eval_result {
+                            if let Err(e) = self
+                                .store
+                                .record_iteration_evaluator_verdict(&task.id, ev.decision.as_str())
+                                .await
+                            {
+                                warn!(task = %task.id, error = %e, "A1 ledger: evaluator verdict write failed (non-fatal)");
+                            }
+                        }
+                        match eval_result {
                             Ok(Ok(ev)) => match ev.decision {
                                 PreDecision::Continue => {
                                     // Not a completion candidate — retry with
@@ -556,7 +609,13 @@ impl DispatchEngine {
                                     let feedback = format_continue_feedback(&ev);
                                     let status = self
                                         .store
-                                        .reject_review(&task.id, &feedback, self.soft_cap)
+                                        .reject_review_with_ledger(
+                                            &task.id,
+                                            &feedback,
+                                            self.soft_cap,
+                                            None,
+                                            knobs_json.as_deref(),
+                                        )
                                         .await?;
                                     // Phase closed → revoke scoped grants,
                                     // mirroring every other rejection path.
@@ -577,10 +636,11 @@ impl DispatchEngine {
                                     // reason text itself is evaluator prose and
                                     // must never be re-parsed for the class).
                                     self.store
-                                        .mark_needs_human_with_pause(
+                                        .mark_needs_human_sealing_round(
                                             &task.id,
                                             &reason,
                                             crate::pause_reason::PauseReason::BlockedNeedsDecision,
+                                            knobs_json.as_deref(),
                                         )
                                         .await?;
                                     self.revoke_task_grants(&task.id).await;
@@ -639,10 +699,11 @@ impl DispatchEngine {
                                     );
                                     warn!(task = %task.id, error = %e, "judge seam: evaluator_only 評估失敗 → needs_human（fail-closed）");
                                     self.store
-                                        .mark_needs_human_with_pause(
+                                        .mark_needs_human_sealing_round(
                                             &task.id,
                                             &reason,
                                             crate::pause_reason::PauseReason::Infra,
+                                            knobs_json.as_deref(),
                                         )
                                         .await?;
                                     self.revoke_task_grants(&task.id).await;
@@ -665,10 +726,11 @@ impl DispatchEngine {
                                     );
                                     warn!(task = %task.id, secs = EVALUATOR_TIMEOUT_SECS, "judge seam: evaluator_only 評估逾時 → needs_human（fail-closed）");
                                     self.store
-                                        .mark_needs_human_with_pause(
+                                        .mark_needs_human_sealing_round(
                                             &task.id,
                                             &reason,
                                             crate::pause_reason::PauseReason::Infra,
+                                            knobs_json.as_deref(),
                                         )
                                         .await?;
                                     self.revoke_task_grants(&task.id).await;
@@ -773,10 +835,11 @@ impl DispatchEngine {
                             .as_ref()
                             .and_then(|a| serde_json::to_string(a).ok());
                         self.store
-                            .accept_review_with_verdict(
+                            .accept_review_with_ledger(
                                 &task.id,
                                 &v.feedback,
                                 verdict_json.as_deref(),
+                                knobs_json.as_deref(),
                             )
                             .await?;
                         // WP3 (PORTICO): task phase closed → auto-revoke its grants.
@@ -831,11 +894,12 @@ impl DispatchEngine {
                             .and_then(|a| serde_json::to_string(a).ok());
                         let status = self
                             .store
-                            .reject_review_with_verdict(
+                            .reject_review_with_ledger(
                                 &task.id,
                                 &v.feedback,
                                 self.soft_cap,
                                 verdict_json.as_deref(),
+                                knobs_json.as_deref(),
                             )
                             .await?;
                         // WP3 (PORTICO): a rejection re-opens the loop for a retry,
@@ -855,10 +919,11 @@ impl DispatchEngine {
                         // class from "the agent got stuck", so a human sees
                         // 「系統問題」rather than a false no-progress verdict.
                         self.store
-                            .mark_needs_human_with_pause(
+                            .mark_needs_human_sealing_round(
                                 &task.id,
                                 &format!("judge unavailable: {e}"),
                                 crate::pause_reason::PauseReason::Infra,
+                                knobs_json.as_deref(),
                             )
                             .await?;
                         // WP3 (PORTICO): parked for a human → revoke task grants.
@@ -1014,7 +1079,66 @@ impl DispatchEngine {
                     }
                 }
             }
+            Ok::<(), String>(())
+            }).await?;
         }
         Ok(())
+    }
+}
+
+impl DispatchEngine {
+    /// A1 ledger: the harness knob snapshot for this task's worker, as JSON.
+    /// `None` without a wired `home_dir` (test / legacy construction) or on a
+    /// serialization failure — telemetry only, never consulted by settle.
+    fn round_knobs_json(&self, task: &TaskRow) -> Option<String> {
+        let home = self.home_dir.as_deref()?;
+        let worker = task.claimed_by.as_deref().unwrap_or(task.assigned_to.as_str());
+        let agent_dir = home.join("agents").join(worker);
+        let snapshot = crate::gvu::knob_snapshot::capture(home, &agent_dir);
+        // The retry cap is task-local, so the global/agent snapshot alone
+        // cannot reconstruct the guard that settled this task.
+        let snapshot = serde_json::to_value(snapshot).and_then(|mut value| {
+            value["max_retries"] = serde_json::Value::from(task.max_retries);
+            value["task_knob_snapshot_version"] = serde_json::Value::from(1);
+            serde_json::to_string(&value)
+        });
+        match snapshot {
+            Ok(json) => Some(json),
+            Err(e) => {
+                warn!(task = %task.id, error = %e, "A1 ledger: knob snapshot serialize failed (non-fatal)");
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod survival_snapshot_tests {
+    use super::*;
+    struct Accept;
+    #[async_trait]
+    impl AcceptanceJudge for Accept {
+        async fn judge(&self, _: &str, _: &str, _: &str) -> Result<AcceptanceVerdict, String> {
+            Ok(AcceptanceVerdict { passed: true, feedback: "PASS".into(), aspects: None })
+        }
+    }
+    #[tokio::test]
+    async fn survival_evidence_sealed_knobs_include_task_retry_cap_without_reclassifying_current_task() {
+        let home=tempfile::tempdir().unwrap();
+        let store=Arc::new(TaskStore::open(home.path()).unwrap());
+        let mut task=TaskRow::new("snapshot".into(),"Send report".into(),"".into(),"medium".into(),"alice".into(),"system".into());
+        task.goal_mode=true; task.status="pending".into(); task.max_retries=7;
+        task.acceptance_criteria=Some("Report sent".into());
+        store.insert_task(&task).await.unwrap();
+        store.record_iteration_dispatch("snapshot",1,"2026-10-01T00:00:00Z").await.unwrap();
+        assert!(store.atomic_claim("snapshot","alice","2026-10-01T00:00:00Z","2026-10-01T00:05:00Z").await.unwrap().is_claimed());
+        store.complete_task("snapshot","Report sent","alice").await.unwrap();
+        let engine=DispatchEngine::new(store.clone(),Some(Arc::new(Accept))).with_home_dir(home.path().to_path_buf());
+        engine.review_goal_tasks().await.unwrap();
+        let reopened=TaskStore::open(home.path()).unwrap();
+        let rows=reopened.list_iterations("snapshot").await.unwrap();
+        assert_eq!(rows[0].verdict.as_deref(),Some("accepted"));
+        let snapshot:serde_json::Value=serde_json::from_str(rows[0].knobs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot["max_retries"],7,"historical task retry cap must be in the sealed snapshot");
     }
 }

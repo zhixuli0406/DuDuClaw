@@ -1,0 +1,12 @@
+{
+  "schema": "duduclaw.discovery.world.v1",
+  "run_id": "fixture-irregular",
+  "round": 2,
+  "direction": "max",
+  "baseline_score": 2.16666666666667,
+  "branch_count": 6,
+  "refine_count": 3,
+  "max_parallelism": 3,
+  "policy_id": "synthetic-live-order",
+  "beta": 0.6
+}

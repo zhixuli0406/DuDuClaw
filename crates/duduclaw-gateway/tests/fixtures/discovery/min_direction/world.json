@@ -1,0 +1,12 @@
+{
+  "schema": "duduclaw.discovery.world.v1",
+  "run_id": "fixture-min_direction",
+  "round": 1,
+  "direction": "min",
+  "baseline_score": 10.0,
+  "branch_count": 3,
+  "refine_count": 2,
+  "max_parallelism": 2,
+  "policy_id": "synthetic-live-order",
+  "beta": 0.6
+}

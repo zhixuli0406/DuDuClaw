@@ -29,7 +29,7 @@ impl TaskStore {
         // Load the claim-relevant state under the write lock.
         let row: Option<(String, Option<String>, String)> = tx
             .query_row(
-                "SELECT status, claimed_by, depends_on FROM tasks WHERE id = ?1",
+                "SELECT status, claimed_by, depends_on FROM tasks WHERE id = ?1 AND kind IN ('task','goal')",
                 params![id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -76,7 +76,7 @@ impl TaskStore {
                     SET claimed_by = ?2, claimed_at = ?3, lease_expires_at = ?4,
                         lease_renewed_at = ?3,
                         status = 'in_progress', assigned_to = ?2, updated_at = ?3
-                  WHERE id = ?1 AND status IN ('pending', 'revising') AND claimed_by IS NULL",
+                  WHERE id = ?1 AND kind IN ('task','goal') AND status IN ('pending', 'revising') AND claimed_by IS NULL",
                 params![id, agent_id, now, lease_expires_at],
             )
             .map_err(|e| format!("atomic claim: {e}"))?;
@@ -104,7 +104,7 @@ impl TaskStore {
         let n = conn
             .execute(
                 "UPDATE tasks SET lease_expires_at = ?3, lease_renewed_at = ?4, updated_at = ?4
-                  WHERE id = ?1 AND claimed_by = ?2 AND status = 'in_progress'",
+                  WHERE id = ?1 AND kind IN ('task','goal') AND claimed_by = ?2 AND status = 'in_progress'",
                 params![id, agent_id, new_expiry, now],
             )
             .map_err(|e| format!("renew lease: {e}"))?;
@@ -155,7 +155,7 @@ impl TaskStore {
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {TASK_COLUMNS} FROM tasks
-                      WHERE status = 'pending' AND claimed_by IS NULL AND archived = 0
+                      WHERE kind IN ('task','goal') AND status = 'pending' AND claimed_by IS NULL AND archived = 0
                       ORDER BY created_at ASC"
                 ))
                 .map_err(|e| format!("prepare claimable: {e}"))?;
@@ -182,7 +182,7 @@ impl TaskStore {
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {TASK_COLUMNS} FROM tasks
-                      WHERE status = 'in_progress'
+                      WHERE kind IN ('task','goal') AND status = 'in_progress'
                         AND lease_expires_at IS NOT NULL
                         AND claimed_by IS NOT NULL"
                 ))
@@ -252,7 +252,7 @@ impl TaskStore {
                 "UPDATE tasks
                     SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
                         lease_expires_at = NULL, retry_count = ?2, updated_at = ?3
-                  WHERE id = ?1 AND claimed_by = ?4 AND status = 'in_progress'
+                  WHERE id = ?1 AND kind IN ('task','goal') AND claimed_by = ?4 AND status = 'in_progress'
                     AND lease_expires_at = ?5",
                 params![id, new_retry, now, claimer, scanned_lease],
             )
@@ -275,7 +275,7 @@ impl TaskStore {
                 "UPDATE tasks
                     SET status = 'failed', lease_expires_at = NULL,
                         blocked_reason = ?2, updated_at = ?3
-                  WHERE id = ?1 AND claimed_by = ?4 AND status = 'in_progress'
+                  WHERE id = ?1 AND kind IN ('task','goal') AND claimed_by = ?4 AND status = 'in_progress'
                     AND lease_expires_at = ?5",
                 params![
                     id,

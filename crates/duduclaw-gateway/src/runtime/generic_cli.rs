@@ -1163,6 +1163,7 @@ mod tests {
             fallback_models: &[],
             vendor_url: "https://example.invalid",
             verified: false,
+            deprecation: None,
         };
         assert!(STDIN_SPEC.headless.prompt_via_stdin());
         let rt = GenericCliRuntime::with_program(&STDIN_SPEC, "/bin/cat");

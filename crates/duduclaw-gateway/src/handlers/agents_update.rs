@@ -8,7 +8,19 @@ impl MethodHandler {
     ///
     /// Supports identity, model, budget, heartbeat, permissions, and evolution fields.
     /// Only sends changed fields — unchanged fields are omitted from the request.
+    #[cfg(test)]
     pub(crate) async fn handle_agents_update(&self, params: Value) -> WsFrame {
+        self.handle_agents_update_as(params, None).await
+    }
+
+    /// `agents.update`. `caller` is the authenticated dashboard user; it is
+    /// recorded on the `runtime_provider_deprecated` audit row (R1, 2026-10).
+    /// `None` only for paths that genuinely carry no identity.
+    pub(crate) async fn handle_agents_update_as(
+        &self,
+        params: Value,
+        caller: Option<&UserContext>,
+    ) -> WsFrame {
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
@@ -181,6 +193,16 @@ impl MethodHandler {
         let aligned_provider: std::sync::Arc<std::sync::Mutex<Option<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let aligned_for_closure = aligned_provider.clone();
+        // R1 (2026-10): deprecated runtime values this write put into
+        // `[runtime]` (audited after the commit), and why the auto-align was
+        // skipped when the runtime it would have chosen is deprecated.
+        let deprecated_writes: std::sync::Arc<
+            std::sync::Mutex<Vec<super::runtime_apply::DeprecatedRuntimeWrite>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deprecated_for_closure = deprecated_writes.clone();
+        let align_skipped: std::sync::Arc<std::sync::Mutex<Option<&'static str>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let align_skipped_for_closure = align_skipped.clone();
 
         let result = self.update_agent_toml(&agent_id, move |table| {
             // ── Identity fields ([agent] section) ──
@@ -782,8 +804,11 @@ impl MethodHandler {
 
             // ── Runtime ([runtime] section, RT.1) ──
             // provider enum / fallback.
-            let rt_changes = apply_runtime_to_table(table, &params_clone)?;
-            changes.extend(rt_changes);
+            let rt_outcome = apply_runtime_to_table_reporting(table, &params_clone)?;
+            changes.extend(rt_outcome.changes);
+            if let Ok(mut slot) = deprecated_for_closure.lock() {
+                *slot = rt_outcome.deprecated;
+            }
 
             // ── Evolution advanced ([evolution.*] fields, EVO.1–EVO.3) ──
             // external_factors + the skill-synthesis / graduation scalars.
@@ -998,8 +1023,22 @@ impl MethodHandler {
                     if let Some(provider) = provider
                         && !crate::runtime_config::model_matches_provider(&model, provider)
                     {
-                        if let Some(aligned) =
-                            crate::runtime_config::infer_provider_for_model(&model)
+                        let inferred = crate::runtime_config::infer_provider_for_model(&model);
+                        let (inferred, skipped) = auto_align_target(inferred);
+                        if let Some(reason) = skipped {
+                            // Reported through the response field only: a
+                            // skip is not a change, so it must not satisfy
+                            // the "No valid fields to update" guard below.
+                            tracing::info!(
+                                model = %model,
+                                reason,
+                                "runtime.provider not auto-aligned: the matching runtime is deprecated"
+                            );
+                            if let Ok(mut slot) = align_skipped_for_closure.lock() {
+                                *slot = Some(reason);
+                            }
+                        }
+                        if let Some(aligned) = inferred
                         {
                             let rt_section = table
                                 .entry("runtime")
@@ -1041,6 +1080,18 @@ impl MethodHandler {
                     {
                         warn!(agent = %agent_id, error = %e, "org.toml upsert failed on agents.update");
                     }
+                }
+
+                // R1 (2026-10): the write committed; audit any deprecated
+                // runtime value it carried, naming the caller.
+                if let Ok(writes) = deprecated_writes.lock() {
+                    audit_deprecated_runtime_writes(
+                        &self.home_dir,
+                        &agent_id,
+                        "agents.update",
+                        caller.map(|c| c.user_id.as_str()).unwrap_or("unknown"),
+                        &writes,
+                    );
                 }
 
                 // WP: sync SOUL.md / IDENTITY.md self-introduction text to
@@ -1128,6 +1179,9 @@ impl MethodHandler {
                         // Save-time model↔provider auto-align: the provider the
                         // gateway rewrote [runtime] to, or null when untouched.
                         "runtime_provider_aligned": aligned_provider.lock().ok().and_then(|s| s.clone()),
+                        // R1 (2026-10): why the auto-align did NOT run (the
+                        // runtime the model maps to is deprecated), or null.
+                        "runtime_provider_align_skipped": align_skipped.lock().ok().and_then(|s| *s),
                         "message": if hot_reloaded {
                             "Agent updated successfully"
                         } else {
@@ -1138,5 +1192,20 @@ impl MethodHandler {
             }
             Err(e) => WsFrame::error_response("", &e),
         }
+    }
+}
+
+/// R1 (2026-10): the save-time auto-align never writes a deprecated runtime.
+/// Returns the runtime to align to (unchanged when not deprecated) and, when
+/// the inferred runtime is deprecated, `None` plus the reason token surfaced
+/// as `runtime_provider_align_skipped`. Deliberately does not retarget to the
+/// replacement: Antigravity's `--model` takes display names, so handing it a
+/// Gemini CLI model id could silently pick a different model.
+pub(crate) fn auto_align_target(
+    inferred: Option<duduclaw_core::types::RuntimeType>,
+) -> (Option<duduclaw_core::types::RuntimeType>, Option<&'static str>) {
+    match inferred {
+        Some(rt) if rt.is_deprecated() => (None, Some("deprecated_runtime")),
+        other => (other, None),
     }
 }

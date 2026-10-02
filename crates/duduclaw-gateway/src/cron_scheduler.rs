@@ -52,6 +52,16 @@ impl AgentInvoker for RealAgentInvoker {
         agent_id: &str,
         prompt: &str,
     ) -> Result<String, String> {
+        // Cron needs the platform tools, so it stays on the host — but never
+        // silently for a sandbox-enabled employee (registry read, no file I/O).
+        let sandboxed = crate::task_sandbox::sandbox_enabled_in_registry(registry, agent_id).await;
+        crate::task_sandbox::note_not_applied(
+            home_dir,
+            agent_id,
+            sandboxed,
+            crate::task_sandbox::HostPath::Cron,
+            crate::task_sandbox::HostAction::RanOnHost,
+        );
         call_claude_for_agent_with_type(
             home_dir,
             registry,

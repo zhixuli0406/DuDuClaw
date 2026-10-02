@@ -690,6 +690,7 @@ pub async fn freeze_for_task(
             for note in &resolved.notes {
                 info!(agent = %agent_id, note = note.code(), "team spec note: {note}");
             }
+            log_team_runtime_deprecations(&resolved, &cascaded);
             let spec = FrozenTeamSpec::from_resolved(&resolved);
             let json = match serde_json::to_string(&spec) {
                 Ok(j) => j,
@@ -761,6 +762,31 @@ pub async fn freeze_for_task(
             }
         }
     }
+}
+
+/// R1 (2026-10): warn once per process when a team role explicitly names a
+/// deprecated runtime. Roles that merely cascaded onto the employee's own
+/// runtime are skipped — that value was read (and warned about) as the
+/// employee's `[runtime] provider`. Returns the roles that were reported, for
+/// tests; the team itself is unchanged.
+fn log_team_runtime_deprecations(resolved: &ResolvedTeam, cascaded: &[Role]) -> Vec<Role> {
+    let mut reported = Vec::new();
+    for note in resolved.deprecation_notes() {
+        if let duduclaw_core::types::TeamNote::DeprecatedRuntime { role, runtime } = &note {
+            if cascaded.contains(role) {
+                continue;
+            }
+            if let Some(rt) = RuntimeType::from_id(runtime) {
+                crate::runtime_config::warn_once_if_deprecated_runtime(
+                    rt,
+                    crate::runtime_config::DeprecatedRuntimeSource::TeamRole,
+                );
+            }
+            debug!(note = note.code(), "team spec note: {note}");
+            reported.push(*role);
+        }
+    }
+    reported
 }
 
 /// Log the WP-2 capacity warning at most once per process, the first time a
@@ -848,6 +874,11 @@ pub fn build_gate_inputs(
 ) -> GateInputs {
     let criteria = frozen_criteria(task);
     let goal_cfg = crate::goal_loop::GoalLoopConfig::from_home(home_dir);
+    // Intentional coupling (confirmed by the project owner 2026-09-30): the
+    // team gate reads the GLOBAL `iteration_cap`. So `iteration_cap` changes
+    // round CONTENT (Solo vs Team), not only how far a chain may run — the
+    // round history of a task that formed a team cannot be replayed under a
+    // different cap and be expected to reproduce the same rounds.
     let budget_rounds = goal_cfg
         .iteration_cap
         .saturating_sub(task.revision_round.max(0) as u32);
@@ -908,6 +939,13 @@ pub fn build_gate_inputs(
         acceptance_criteria_count: criteria.as_deref().map(count_criteria).unwrap_or(0),
         produces_artifacts: criteria.as_deref().map(mentions_artifacts).unwrap_or(false),
         mode: spec.gate,
+        // A sandbox-enabled employee never forms a team (the gate's first
+        // rule): read through `agent_toml::load`, so a preset-resolved
+        // `agent.resolved.toml` counts exactly as the registry counts it.
+        sandbox_enabled: duduclaw_core::agent_toml::load_for_agent(home_dir, &task.assigned_to)
+            .container
+            .sandbox_enabled
+            .unwrap_or(false),
     }
 }
 
@@ -1017,9 +1055,50 @@ pub fn decide_gate(
     spec: &FrozenTeamSpec,
     planner: PlannerSignals,
 ) -> GateDecision {
+    decide_gate_recorded(home_dir, task, spec, planner).0
+}
+
+/// [`decide_gate`] that also returns the gate's inputs, fired signals and
+/// decision as JSON, for the A1 round ledger (`task_iterations.gate_inputs_json`).
+/// The decision and the audit event are exactly what `decide_gate` produces —
+/// the JSON is an extra, read-only rendering of the same values.
+pub fn decide_gate_recorded(
+    home_dir: &Path,
+    task: &TaskRow,
+    spec: &FrozenTeamSpec,
+    planner: PlannerSignals,
+) -> (GateDecision, serde_json::Value) {
     let inputs = build_gate_inputs(home_dir, task, spec, planner);
     let signals = team_gate::evaluate_signals(&inputs);
     let decision = team_gate::decide(&inputs);
+    let record = serde_json::json!({
+        "v": 1,
+        "decision": decision.code(),
+        "reason": decision.reason(),
+        "signals_hit": signals.hit_codes(),
+        "signals_count": signals.count(),
+        "inputs": {
+            "source": inputs.source.as_str(),
+            "plan_first_pending": inputs.plan_first_pending,
+            "irreversible_in_plan": inputs.irreversible_in_plan,
+            "budget_rounds": inputs.budget_rounds,
+            "independent_items": inputs.independent_items,
+            "dependency_hubs": inputs.dependency_hubs,
+            "estimated_input_tokens": inputs.estimated_input_tokens,
+            "context_window_tokens": inputs.context_window_tokens,
+            "capability_gap_pp": inputs.capability_gap_pp,
+            "declared_mde_pp": inputs.declared_mde_pp,
+            "acceptance_criteria_count": inputs.acceptance_criteria_count,
+            "produces_artifacts": inputs.produces_artifacts,
+            "mode": inputs.mode.as_str(),
+        },
+    });
+    // Present only when on, so the ledger row of every employee without the
+    // sandbox stays byte-identical to what it was before this input existed.
+    let mut record = record;
+    if inputs.sandbox_enabled {
+        record["inputs"]["sandbox_enabled"] = serde_json::Value::Bool(true);
+    }
     audit_team_event(
         home_dir,
         AUDIT_TEAM_GATE_DECISION,
@@ -1039,7 +1118,7 @@ pub fn decide_gate(
             },
         }),
     );
-    decision
+    (decision, record)
 }
 
 // ── Degrade chain ───────────────────────────────────────────────────────
@@ -4645,6 +4724,24 @@ mod tests {
     use super::*;
     use duduclaw_core::task_packet::{Constraint, Finding, OutputFormat};
 
+    /// R1 (2026-10): an explicitly bound Gemini role is reported; the same
+    /// role cascaded from the employee is not (its provider read reports it).
+    #[test]
+    fn team_role_deprecation_is_reported_only_for_explicit_bindings() {
+        let cfg = TeamConfig::from_toml_value(
+            &"[roles.executor]\nruntime = \"codex\"\n[roles.verifier]\nruntime = \"gemini\"\n"
+                .parse::<toml::Value>()
+                .unwrap(),
+        );
+        let resolved = validate_team(&cfg).unwrap();
+        assert_eq!(resolved.verifier.runtime, "gemini");
+        assert_eq!(
+            log_team_runtime_deprecations(&resolved, &[]),
+            vec![Role::Verifier]
+        );
+        assert!(log_team_runtime_deprecations(&resolved, &[Role::Verifier]).is_empty());
+    }
+
     #[tokio::test]
     async fn queued_member_waits_until_capacity_frees_then_scaffolds() {
         let dir = tempfile::tempdir().unwrap();
@@ -5172,6 +5269,44 @@ skill_security_scan = false
         let mut plain = task("task-2");
         plain.team_spec_json = None;
         assert!(frozen_spec(&plain).is_none());
+    }
+
+    /// A sandbox-enabled employee never forms a team: the gate reads the flag
+    /// from the employee's own `agent.toml` and decides Solo with reason
+    /// `sandbox_enabled`, even for a task that would otherwise leave Solo and
+    /// even under the testing-only `always_team`. The ledger row carries the
+    /// input only when it is on.
+    #[test]
+    fn sandbox_enabled_employee_gates_solo_and_records_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent_dir = home.join("agents").join("agnes");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[model]\npreferred = \"claude-sonnet-4-6\"\n\n[container]\nsandbox_enabled = true\n",
+        )
+        .unwrap();
+        let mut t = task("task-sb");
+        t.acceptance_criteria_baseline =
+            Some("產出一份 CSV 檔案\n附上一份報告\n附上一張圖表\n提供完整程式碼".to_string());
+        let planner = PlannerSignals { independent_items: Some(6), dependency_hubs: Some(0) };
+        let inputs = build_gate_inputs(home, &t, &spec(), planner);
+        assert!(inputs.sandbox_enabled);
+        let (decision, record) = decide_gate_recorded(home, &t, &spec(), planner);
+        assert!(decision.is_solo(), "{decision:?}");
+        assert_eq!(decision.reason(), "sandbox_enabled");
+        assert_eq!(record["inputs"]["sandbox_enabled"], serde_json::Value::Bool(true));
+
+        let mut always = spec();
+        always.gate = TeamGateMode::AlwaysTeam;
+        assert_eq!(decide_gate(home, &t, &always, planner).reason(), "sandbox_enabled");
+
+        // Sandbox off (the key absent): the ledger row has no such input.
+        write_agent(home, "agnes", Some("claude"), "claude-sonnet-4-6");
+        let (decision, record) = decide_gate_recorded(home, &t, &spec(), planner);
+        assert!(!decision.is_solo(), "{decision:?}");
+        assert!(record["inputs"].get("sandbox_enabled").is_none(), "{record}");
     }
 
     // ── H11: the capability matrix as a prior ───────────────────────────

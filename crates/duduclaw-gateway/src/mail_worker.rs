@@ -380,6 +380,15 @@ async fn trigger_for_mail(
     if item.suspicious || item.agent_id.is_empty() {
         return false;
     }
+    // The triggered run's whole effect is its platform tool calls (read the
+    // mail, `mail_send` a draft, open a task); its reply text is discarded.
+    // The task sandbox has none of those tools, so a sandboxed run would do
+    // nothing, and a host run would hand untrusted inbound mail to the very
+    // employee the operator chose to isolate. Skip it, and say so.
+    let sandboxed = crate::task_sandbox::sandbox_enabled_in_registry(registry, &item.agent_id).await;
+    if mail_trigger_skipped_for_sandbox(home_dir, &item.agent_id, sandboxed) {
+        return false;
+    }
     let prompt = format!(
         "[Agent Mail] 你的信箱收到一封新信，請閱讀後決定要不要處理。\n\n{}",
         mail::render_mail_as_data(&item)
@@ -403,6 +412,25 @@ async fn trigger_for_mail(
             false
         }
     }
+}
+
+/// The Agent Mail half of the sandbox-coverage rule: a sandbox-enabled
+/// employee is never woken by an arriving mail. Returns `true` when the trigger
+/// must be skipped, after reporting it (`task_sandbox_not_applied`, `path =
+/// "mail"`, `action = "skipped"`, once per agent per process). The mail itself
+/// stays in the inbox, unmarked, for a human to handle.
+fn mail_trigger_skipped_for_sandbox(home_dir: &Path, agent_id: &str, sandbox_enabled: bool) -> bool {
+    if !sandbox_enabled {
+        return false;
+    }
+    crate::task_sandbox::note_not_applied(
+        home_dir,
+        agent_id,
+        true,
+        crate::task_sandbox::HostPath::Mail,
+        crate::task_sandbox::HostAction::Skipped,
+    );
+    true
 }
 
 // ── Outbound settler ─────────────────────────────────────────────────────
@@ -990,5 +1018,117 @@ smtp_tls = "none"
             resolve_smtp_config(h.path()).unwrap().smtp_tls,
             crate::email::SmtpTls::Starttls
         );
+    }
+
+    // ── sandbox coverage ────────────────────────────────────────────────
+
+    fn write_agent(home: &Path, name: &str, sandbox_enabled: bool) {
+        let dir = home.join("agents").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            format!(
+                r#"
+[agent]
+name = "{name}"
+display_name = "{name}"
+role = "specialist"
+status = "active"
+trigger = "@{name}"
+reports_to = ""
+icon = "X"
+
+[model]
+preferred = "claude-opus-5"
+fallback = ""
+account_pool = []
+
+[budget]
+monthly_limit_cents = 1000
+warn_threshold_percent = 80
+hard_stop = false
+
+[container]
+sandbox_enabled = {sandbox_enabled}
+network_access = true
+timeout_ms = 60000
+max_concurrent = 2
+readonly_project = false
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 300
+max_concurrent_runs = 1
+cron = ""
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = []
+
+[evolution]
+skill_auto_activate = false
+skill_security_scan = false
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn audit_text(home: &Path) -> String {
+        let mut all = String::new();
+        let mut stack = vec![home.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    all.push_str(&text);
+                }
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn mail_trigger_decision_follows_the_sandbox_flag() {
+        let h = home();
+        assert!(!mail_trigger_skipped_for_sandbox(h.path(), "mail-dec-off", false));
+        assert!(!audit_text(h.path()).contains("task_sandbox_not_applied"));
+        assert!(mail_trigger_skipped_for_sandbox(h.path(), "mail-dec-on", true));
+        // Still skipped after the once-per-process report has been spent.
+        assert!(mail_trigger_skipped_for_sandbox(h.path(), "mail-dec-on", true));
+        let audit = audit_text(h.path());
+        assert_eq!(audit.matches("task_sandbox_not_applied").count(), 1, "{audit}");
+        assert!(audit.contains("\"path\":\"mail\"") && audit.contains("\"action\":\"skipped\""), "{audit}");
+    }
+
+    #[tokio::test]
+    async fn sandbox_enabled_owner_is_never_woken_by_arriving_mail() {
+        let h = home();
+        write_agent(h.path(), "mail-sandboxed", true);
+        let mut reg = AgentRegistry::new(h.path().join("agents"));
+        reg.scan().await.unwrap();
+        let registry = Arc::new(RwLock::new(reg));
+        write_eml(
+            h.path(),
+            "q.eml",
+            "From: a@b.com\r\nSubject: 報價\r\nMessage-ID: <sb@x>\r\n\r\n請報價\r\n",
+        );
+        let mut r = PollReport::default();
+        let mut budget = 10;
+        let fresh = poll_dropfolder(h.path(), &enabled_cfg(), "mail-sandboxed", &mut r, &mut budget);
+        assert_eq!(fresh.len(), 1);
+
+        assert!(!trigger_for_mail(h.path(), &registry, &fresh[0]).await);
+        let item = mail::get_inbox_item(h.path(), &fresh[0]).unwrap();
+        assert!(!item.triggered, "a skipped trigger must not read as triggered");
+        let audit = audit_text(h.path());
+        assert!(audit.contains("task_sandbox_not_applied") && audit.contains("mail-sandboxed"), "{audit}");
     }
 }

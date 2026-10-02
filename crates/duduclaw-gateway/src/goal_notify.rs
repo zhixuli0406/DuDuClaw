@@ -1166,7 +1166,7 @@ pub(crate) async fn apply_needs_human(
         _ => return Err("不支援的動作".into()),
     };
     let changed = store
-        .resolve_needs_human(task_id, decision, "")
+        .resolve_needs_human_with_survival_evidence(task_id, decision, "")
         .await
         .map_err(|e| e.to_string())?;
     if !changed {
@@ -1263,7 +1263,7 @@ pub(crate) async fn apply_needs_human_from_dashboard(
         _ => return Err("不支援的動作".into()),
     };
     let changed = store
-        .resolve_needs_human(task_id, decision, note)
+        .resolve_needs_human_with_survival_evidence(task_id, decision, note)
         .await
         .map_err(|e| e.to_string())?;
     if !changed {
@@ -1315,7 +1315,7 @@ pub(crate) async fn apply_continue_from_dashboard(
     if !task.goal_mode {
         return Err("只有目標任務可以接著做".into());
     }
-    let changed = store.continue_from_terminal(task_id, message).await?;
+    let changed = store.continue_from_terminal_with_survival_evidence(task_id, message).await?;
     if !changed {
         return Ok("此任務目前的狀態不允許接著做（可能已被他人變更）。".into());
     }

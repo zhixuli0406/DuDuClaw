@@ -15,7 +15,6 @@ use tracing::{info, warn};
 
 use crate::claude_runner::call_claude_for_agent_with_type;
 use duduclaw_agent::registry::AgentRegistry;
-use duduclaw_container::sandbox;
 
 use duduclaw_core::{
     ENV_DELEGATION_DEPTH, ENV_DELEGATION_ORIGIN, ENV_DELEGATION_SENDER, ENV_HOP_DEPTH,
@@ -275,7 +274,7 @@ async fn poll_and_dispatch_sqlite(
         .await;
 
         let dispatch_fut =
-            dispatch_to_agent(home_dir, registry, &msg.target, &msg.payload, &delegation);
+            dispatch_to_agent_outcome(home_dir, registry, &msg.target, &msg.payload, &delegation);
         // v1.10: scope wiki RL trust feedback context so the sub-agent's
         // wiki RAG citations land in the same tracker bucket as the
         // originating turn. Pulled from `message_queue.{turn_id, session_id}`
@@ -299,18 +298,43 @@ async fn poll_and_dispatch_sqlite(
             ))
         });
 
-        let result = match (native_collector.clone(), msg.reply_channel.clone()) {
-            (Some(collector), Some(rc)) if !rc.is_empty() => {
+        // A1-3 ledger: attribute this goal round's token usage to the task
+        // (`episode_id`) and its `task_iterations.round`. The marker's
+        // `iter=` is the driver's dispatch ordinal, not the round (they
+        // diverge on stall re-dispatches and after a restart), so the round
+        // is read from `tasks.revision_round` — stable while the task waits
+        // in pending/revising. Lookup failure keeps the task id and leaves
+        // the round NULL. Recording only; the dispatch itself is unchanged.
+        //
+        // The same lookup keys the native-evidence bridge below: the settle
+        // side takes evidence for `revision_round + 1`, so filing it under the
+        // marker's `iter=` lost it after any stall re-dispatch or restart.
+        let goal_revision_round = match goal_loop_ref {
+            Some((task_id, _)) => lookup_task_revision_round(home_dir, task_id).await,
+            None => None,
+        };
+        let goal_attr = goal_loop_ref.map(|(task_id, _)| crate::runtime::GoalRoundAttribution {
+            episode_id: task_id.to_string(),
+            round: goal_revision_round.map(|r| r + 1),
+        });
+        let result = match (native_collector.clone().zip(goal_attr), msg.reply_channel.clone()) {
+            (Some((collector, attr)), Some(rc)) if !rc.is_empty() => {
                 crate::runtime::NATIVE_TOOL_COLLECTOR
                     .scope(
                         collector,
-                        crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut),
+                        crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(
+                            attr,
+                            crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut),
+                        ),
                     )
                     .await
             }
-            (Some(collector), _) => {
+            (Some((collector, attr)), _) => {
                 crate::runtime::NATIVE_TOOL_COLLECTOR
-                    .scope(collector, dispatch_fut)
+                    .scope(
+                        collector,
+                        crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(attr, dispatch_fut),
+                    )
                     .await
             }
             (None, Some(rc)) if !rc.is_empty() => {
@@ -356,7 +380,8 @@ async fn poll_and_dispatch_sqlite(
         // Best-effort: a poisoned mutex or empty batch degrades silently
         // (`record_native_evidence`/`extend_native_tool_events` never
         // panic), never affects the dispatch result already computed above.
-        if let (Some((task_id, round)), Some(collector)) = (goal_loop_ref, native_collector) {
+        if let (Some((task_id, marker_iter)), Some(collector)) = (goal_loop_ref, native_collector) {
+            let round = goal_evidence_round(goal_revision_round, marker_iter);
             let events = collector.lock().map(|g| g.clone()).unwrap_or_default();
             // WP-F (P2-c): the in-memory bridge above is remove-once and
             // process-lifetime, so it is long gone by the time a human opens
@@ -397,28 +422,69 @@ async fn poll_and_dispatch_sqlite(
                 );
             }
             Err(e) => {
-                queue.fail(&msg.id, &e).await?;
+                let host_text = e.host_text();
+                queue.fail(&msg.id, &host_text).await?;
                 warn!(
                     msg_id = %msg.id,
                     target = %msg.target,
-                    error = %e,
+                    error = %host_text,
                     "SQLite queue: message dispatch failed"
                 );
                 // Best-effort user-facing fallback: previously a terminal dispatch
                 // failure was only logged, so a delegation callback (if any) sat
                 // unconsumed forever and the requester never learned their
-                // sub-task died (silent drop). Classify the error the same way
-                // `channel_reply` does for the main-line CLI failure path and
-                // forward a short, non-leaking zh-TW notice — never the raw `e`
-                // (which may contain stderr text or internal paths).
-                let label = short_failure_label(crate::channel_reply::classify_cli_failure(&e));
-                let fallback_text = format!("⚠️ 子任務處理失敗：{label}。請稍後再試或改寫指令。");
+                // sub-task died (silent drop). See `dispatch_failure_reply`:
+                // ordinary errors become a classified, non-leaking zh-TW notice;
+                // task-sandbox refusals carry their own operator-safe message.
+                let fallback_text = dispatch_failure_reply(&e);
                 forward_delegation_response(home_dir, &msg.id, &fallback_text, &msg.target).await;
             }
         }
     }
 
     Ok(())
+}
+
+/// Why a dispatch failed, as the two delegation reply paths need it.
+#[derive(Debug)]
+enum DispatchError {
+    /// The task sandbox refused or failed the task. Its `message` is built
+    /// by `task_sandbox` without CLI output or host paths, so it may be
+    /// forwarded to the requester.
+    Sandbox(crate::task_sandbox::SandboxFailure),
+    /// Any other error. May carry raw CLI stderr or internal paths: never
+    /// forwarded as is.
+    Other(String),
+}
+
+impl DispatchError {
+    /// Full text for host-local records (logs, the queue row).
+    fn host_text(&self) -> String {
+        match self {
+            Self::Sandbox(failure) => failure.host_text(),
+            Self::Other(e) => e.clone(),
+        }
+    }
+}
+
+/// The notice forwarded to the requester when a delegated task failed.
+///
+/// A task-sandbox failure forwards its own message (reason code, and the
+/// remedy such as `docker pull <image>`). Every other error keeps the
+/// classified, non-leaking fallback: the raw text never leaves the host.
+fn dispatch_failure_reply(error: &DispatchError) -> String {
+    match error {
+        DispatchError::Sandbox(failure) if failure.unavailable => {
+            format!("⚠️ 子任務未執行（任務沙箱）：{}", failure.message)
+        }
+        DispatchError::Sandbox(failure) => {
+            format!("⚠️ 子任務失敗（任務沙箱，{}）：{}", failure.code, failure.message)
+        }
+        DispatchError::Other(e) => {
+            let label = short_failure_label(crate::channel_reply::classify_cli_failure(e));
+            format!("⚠️ 子任務處理失敗：{label}。請稍後再試或改寫指令。")
+        }
+    }
 }
 
 /// Short zh-TW category label for a classified dispatch failure, used only in
@@ -766,7 +832,7 @@ async fn poll_and_dispatch(
             // "Stop blocks late spawns" analog). See the invalidation call
             // after this dispatch resolves.
             let turn_id_for_admission_invalidate = turn_id_for_scope.clone();
-            let dispatch_fut = dispatch_to_agent(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env);
+            let dispatch_fut = dispatch_to_agent_outcome(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_SESSION_ID
                 .scope(session_id_for_scope, dispatch_fut);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
@@ -808,14 +874,8 @@ async fn poll_and_dispatch(
 
             let mut response_text = match &result {
                 Ok(text) => text.clone(),
-                Err(e) => {
-                    // Same non-leaking fallback as the SQLite queue path: the raw
-                    // error may carry stderr text or internal paths, so forward a
-                    // classified zh-TW notice instead.
-                    let label =
-                        short_failure_label(crate::channel_reply::classify_cli_failure(e));
-                    format!("⚠️ 子任務處理失敗：{label}。請稍後再試或改寫指令。")
-                }
+                // Same reply as the SQLite queue path (`dispatch_failure_reply`).
+                Err(e) => dispatch_failure_reply(e),
             };
 
             // ── L2+L4: Post-Action Hallucination Audit ──────────
@@ -1035,7 +1095,9 @@ impl DelegationEnv {
     }
 }
 
-/// Dispatch a task to an agent — L1 sandbox → direct call.
+/// Dispatch a task to an agent — task sandbox (when enabled) → direct call.
+/// Errors flattened to host text, for callers that never reply to a
+/// requester (TaskSpec steps, the replanner).
 async fn dispatch_to_agent(
     home_dir: &std::path::Path,
     registry: &Arc<RwLock<AgentRegistry>>,
@@ -1043,6 +1105,20 @@ async fn dispatch_to_agent(
     prompt: &str,
     delegation: &DelegationEnv,
 ) -> Result<String, String> {
+    dispatch_to_agent_outcome(home_dir, registry, agent_id, prompt, delegation)
+        .await
+        .map_err(|e| e.host_text())
+}
+
+/// [`dispatch_to_agent`] with a typed error, so the delegation reply paths
+/// can tell a task-sandbox failure from any other error.
+async fn dispatch_to_agent_outcome(
+    home_dir: &std::path::Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent_id: &str,
+    prompt: &str,
+    delegation: &DelegationEnv,
+) -> Result<String, DispatchError> {
     // O2: ephemeral synthesized agents (`eph-*`) live under
     // `<home>/agents/.ephemeral/` and are invisible to the registry scan.
     // Route them through the ephemeral loader; everything downstream
@@ -1056,7 +1132,8 @@ async fn dispatch_to_agent(
                 env_map,
                 crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt),
             )
-            .await;
+            .await
+            .map_err(DispatchError::Other);
     }
     // Read isolation flags from agent config.
     let use_sandbox = {
@@ -1076,123 +1153,45 @@ async fn dispatch_to_agent(
     // inject it as per-subprocess env vars (thread-safe, no global state).
     let env_map = delegation.to_env_map();
 
-    let env_map_clone = env_map.clone();
     crate::claude_runner::DELEGATION_ENV
         .scope(env_map, async {
-            if use_sandbox && sandbox::is_sandbox_available().await {
-                info!(agent = agent_id, "Dispatching via sandbox (L1)");
-                dispatch_sandboxed(home_dir, registry, agent_id, prompt, &env_map_clone).await
-            } else {
-                call_claude_for_agent_with_type(
-                    home_dir,
-                    registry,
-                    agent_id,
-                    prompt,
-                    crate::cost_telemetry::RequestType::Dispatch,
-                )
-                .await
+            if use_sandbox {
+                info!(agent = agent_id, "Dispatching via task sandbox");
+                match dispatch_sandboxed(home_dir, registry, agent_id, prompt).await {
+                    crate::task_sandbox::SandboxDispatch::Completed(result) => {
+                        return result.map_err(DispatchError::Sandbox);
+                    }
+                    crate::task_sandbox::SandboxDispatch::RunUnsandboxed => {}
+                }
             }
+            call_claude_for_agent_with_type(
+                home_dir,
+                registry,
+                agent_id,
+                prompt,
+                crate::cost_telemetry::RequestType::Dispatch,
+            )
+            .await
+            .map_err(DispatchError::Other)
         })
         .await
 }
 
-/// Execute a task inside a sandboxed Docker container.
+/// Execute a task inside the per-agent task sandbox (`crate::task_sandbox`).
+///
+/// Fail closed: when the sandbox cannot run, the task fails with a reason
+/// (audited as `task_sandbox_unavailable`). Only the operator escape hatch
+/// `config.toml [container.sandbox] when_unavailable = "run_unsandboxed"`
+/// returns [`crate::task_sandbox::SandboxDispatch::RunUnsandboxed`], audited
+/// as `task_sandbox_bypassed` on every task. The sandbox has no platform MCP
+/// tools, so the delegation env (depth / origin / hop) has no reader inside.
 async fn dispatch_sandboxed(
     home_dir: &std::path::Path,
     registry: &Arc<RwLock<AgentRegistry>>,
     agent_id: &str,
     prompt: &str,
-    delegation_env: &std::collections::HashMap<String, String>,
-) -> Result<String, String> {
-    let reg = registry.read().await;
-    let agent = if agent_id == "default" {
-        reg.main_agent()
-    } else {
-        reg.get(agent_id)
-    };
-    let agent = agent.ok_or_else(|| format!("Agent '{agent_id}' not found"))?;
-
-    let agent_dir = agent.dir.clone();
-    let model = agent.config.model.preferred.clone();
-    let network = agent.config.container.network_access;
-    let timeout_ms = agent.config.container.timeout_ms;
-    let capabilities = agent.config.capabilities.clone();
-
-    // Build system prompt
-    let mut parts = Vec::new();
-    if let Some(soul) = &agent.soul {
-        parts.push(format!("# Soul\n{soul}"));
-    }
-    if let Some(identity) = &agent.identity {
-        parts.push(format!("# Identity\n{identity}"));
-    }
-    let system_prompt = parts.join("\n\n---\n\n");
-    drop(reg);
-
-    // O1: confidence-aware delegation routing (opt-in, default OFF). The
-    // sandboxed dispatch path resolves its model here (it bypasses
-    // call_claude_for_agent_with_type), so apply the same tier routing
-    // symmetrically. When off this returns `model` byte-identically.
-    // Tier routing only applies to Claude runtimes (multi-model doctrine —
-    // tier models are Claude ids; a codex/gemini agent keeps its own model).
-    let delegation_settings = crate::runtime_config::load_runtime_settings(&agent_dir);
-    let model = crate::delegation_router::resolve_delegation_model(
-        home_dir,
-        &agent_dir,
-        agent_id,
-        prompt,
-        &model,
-        &delegation_settings.utility_model,
-        delegation_settings.non_claude_provider().is_none(),
-    );
-
-    // Get API key
-    let api_key = crate::claude_runner::get_api_key_from_home(home_dir).await;
-    if api_key.is_empty() {
-        return Err("No API key configured for sandbox".to_string());
-    }
-
-    let timeout = std::time::Duration::from_millis(timeout_ms);
-    let extra_env: Vec<(String, String)> = delegation_env
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let denied_tools = capabilities.disallowed_tools();
-    // W1.7: the in-container argv follows the agent's `[runtime] provider`
-    // flag dialect (claude default; codex/gemini/agy per their CLIs).
-    let runtime = crate::runtime_config::agent_runtime_provider(&agent_dir);
-    let result = sandbox::run_sandboxed_for_runtime(
-        runtime,
-        &agent_dir,
-        prompt,
-        &model,
-        &system_prompt,
-        &api_key,
-        timeout,
-        network,
-        &extra_env,
-        &denied_tools,
-    )
-    .await?;
-
-    if result.timed_out {
-        return Err("Sandbox execution timed out".to_string());
-    }
-
-    if result.exit_code != 0 {
-        return Err(format!(
-            "Sandbox exit code {}: {}",
-            result.exit_code,
-            result.stderr.chars().take(200).collect::<String>()
-        ));
-    }
-
-    let text = result.stdout.trim().to_string();
-    if text.is_empty() {
-        Ok("(empty response from sandbox)".to_string())
-    } else {
-        Ok(text)
-    }
+) -> crate::task_sandbox::SandboxDispatch {
+    crate::task_sandbox::dispatch(home_dir, registry, agent_id, prompt).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3289,6 +3288,18 @@ pub(crate) fn extract_goal_loop_task_id_and_round(payload: &str) -> Option<(&str
     Some((task_id, round))
 }
 
+/// Round under which a goal-loop dispatch's native tool evidence (and its
+/// persisted file changes) is filed: the settle side's key
+/// (`task_observe::evidence_round_for_revision`) when the task's
+/// `revision_round` could be read, else the marker's `iter=` as a last
+/// resort (the pre-fix behavior, right whenever no re-dispatch happened).
+fn goal_evidence_round(revision_round: Option<i64>, marker_iter: u32) -> u32 {
+    match revision_round {
+        Some(r) => crate::prediction::task_observe::evidence_round_for_revision(r),
+        None => marker_iter,
+    }
+}
+
 /// Read a task's originating channel (`source_channel`/`source_chat_id`,
 /// stamped at `/goal` kickoff — see `task_store.rs`'s P5 fields) directly
 /// from `tasks.db`. Read-only, best-effort — a bare query rather than a
@@ -3322,6 +3333,30 @@ async fn lookup_task_source_channel(home_dir: &Path, task_id: &str) -> Option<(S
         (Some(c), Some(i)) if !c.is_empty() && !i.is_empty() => Some((c, i)),
         _ => None,
     })
+}
+
+/// A1-3 ledger: a goal task's current `revision_round` from `tasks.db`,
+/// read-only and best-effort (same bare-query shape as
+/// [`lookup_task_source_channel`]). `None` on any failure.
+async fn lookup_task_revision_round(home_dir: &Path, task_id: &str) -> Option<i64> {
+    let db_path = home_dir.join("tasks.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let id = task_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&db_path).ok()?;
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+        conn.query_row(
+            "SELECT revision_round FROM tasks WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Read + parse `config.toml`. Shared by the typing-guard resolvers below.
@@ -4486,6 +4521,51 @@ bot_token = "{token}"
     }
 
     #[test]
+    fn goal_evidence_round_falls_back_to_marker_only_without_lookup() {
+        assert_eq!(goal_evidence_round(Some(0), 2), 1);
+        assert_eq!(goal_evidence_round(Some(3), 1), 4);
+        assert_eq!(goal_evidence_round(None, 2), 2);
+    }
+
+    /// FX4: a stall re-dispatch sends marker `iter=2` while the task's
+    /// `revision_round` is still 0. The dispatcher's bridge write must land
+    /// under the key the settle side (`dispatch_engine/review.rs`) takes.
+    #[tokio::test]
+    async fn stall_redispatch_evidence_is_found_by_the_settle_side() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let c = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+            c.execute_batch(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY, revision_round INTEGER NOT NULL);
+                 INSERT INTO tasks VALUES ('fx4-stall-task', 0);",
+            )
+            .unwrap();
+        }
+        let payload = "[goal-loop task_id=fx4-stall-task iter=2] 你有一個自主目標任務要推進";
+        let (task_id, marker_iter) = extract_goal_loop_task_id_and_round(payload).unwrap();
+        assert_eq!(marker_iter, 2);
+
+        // Producer side, exactly as the dispatch branch computes it.
+        let revision = lookup_task_revision_round(dir.path(), task_id).await;
+        assert_eq!(revision, Some(0));
+        let round = goal_evidence_round(revision, marker_iter);
+        let event = crate::runtime::NativeToolEvent {
+            tool_name: "Bash".to_string(),
+            success: true,
+            result_text: None,
+            input_text: None,
+        };
+        crate::prediction::task_observe::record_native_evidence(task_id, round, vec![event]);
+
+        // Settle side: `revision_round` is still 0 when the round is reviewed.
+        let settle_round = crate::prediction::task_observe::evidence_round_for_revision(0);
+        let taken = crate::prediction::task_observe::take_native_evidence(task_id, settle_round);
+        assert_eq!(taken.map(|v| v.len()), Some(1));
+        // Nothing was filed under the stale marker ordinal.
+        assert!(crate::prediction::task_observe::take_native_evidence(task_id, 2).is_none());
+    }
+
+    #[test]
     fn extract_goal_loop_task_id_and_round_none_for_non_goal_loop() {
         assert_eq!(
             extract_goal_loop_task_id_and_round("just a normal delegation payload"),
@@ -4837,5 +4917,76 @@ bot_token = "{token}"
             .is_err(),
             "a takeover must not mute unrelated conversations"
         );
+    }
+
+    // ── delegation failure reply (task sandbox vs. ordinary errors) ──
+
+    fn sandbox_spec(home: &std::path::Path) -> crate::task_sandbox::TaskSpec {
+        crate::task_sandbox::TaskSpec {
+            agent_id: "worker".into(),
+            agent_dir: home.join("agents/worker"),
+            runtime: duduclaw_core::types::RuntimeType::Claude,
+            model: "claude-sonnet-4-6".into(),
+            system_prompt: String::new(),
+            prompt: "hi".into(),
+            network_access: true,
+            timeout: std::time::Duration::from_secs(60),
+            disallowed_tools: vec![],
+            explicit_denied_tools: vec![],
+            account_pool: vec![],
+        }
+    }
+
+    /// The live defect: a missing sandbox image reached the requester as
+    /// 「未知錯誤」. The reply now carries the reason code and the remedy.
+    #[test]
+    fn sandbox_unavailable_reaches_the_reply_with_code_and_remedy() {
+        use crate::task_sandbox::{SandboxDispatch, SandboxError, Unavailable, settings::WhenUnavailable};
+        let home = tempfile::tempdir().unwrap();
+        let image = "ghcr.io/zhixuli0406/duduclaw:1.66.1";
+        let outcome = crate::task_sandbox::settle(
+            home.path(),
+            &sandbox_spec(home.path()),
+            WhenUnavailable::Fail,
+            Err(SandboxError::Unavailable(Unavailable::ImageMissing(image.into()))),
+        );
+        let SandboxDispatch::Completed(Err(failure)) = outcome else { panic!("expected a failed task") };
+        let reply = dispatch_failure_reply(&DispatchError::Sandbox(failure));
+        assert!(reply.starts_with("⚠️ 子任務未執行（任務沙箱）："), "{reply}");
+        assert!(reply.contains("Task sandbox unavailable (image_missing)"), "{reply}");
+        assert!(reply.contains(&format!("docker pull {image}")), "{reply}");
+        assert!(!reply.contains("未知錯誤"), "{reply}");
+    }
+
+    /// A run failure forwards only the operator-safe message: the
+    /// CLI-derived detail stays in host records.
+    #[test]
+    fn sandbox_run_failure_reply_keeps_cli_detail_on_the_host() {
+        use crate::task_sandbox::{SandboxFailure, failure_code};
+        let failure = SandboxFailure::failed(
+            failure_code::AUTH_FAILED,
+            "authentication failed: the claude provider rejected the credential of account `acc-1`",
+        )
+        .with_detail("401 at /Users/someone/.duduclaw/agents/worker");
+        let error = DispatchError::Sandbox(failure);
+        let reply = dispatch_failure_reply(&error);
+        assert!(reply.starts_with("⚠️ 子任務失敗（任務沙箱，auth_failed）：authentication failed"), "{reply}");
+        assert!(!reply.contains("/Users/someone"), "{reply}");
+        assert!(error.host_text().contains("/Users/someone"), "host records keep the detail");
+    }
+
+    /// Ordinary CLI errors keep the classified fallback, never the raw text —
+    /// including one that merely mentions the sandbox (no text matching).
+    #[test]
+    fn ordinary_dispatch_error_keeps_the_generic_label() {
+        for raw in [
+            "claude exited 1: stderr at /Users/someone/.duduclaw/agents/worker/secret.txt",
+            "Task sandbox unavailable (image_missing): run `docker pull evil`",
+        ] {
+            let reply = dispatch_failure_reply(&DispatchError::Other(raw.into()));
+            assert_eq!(reply, "⚠️ 子任務處理失敗：未知錯誤。請稍後再試或改寫指令。", "{raw}");
+        }
+        let reply = dispatch_failure_reply(&DispatchError::Other("hard timeout after 300s".into()));
+        assert_eq!(reply, "⚠️ 子任務處理失敗：處理超時。請稍後再試或改寫指令。");
     }
 }

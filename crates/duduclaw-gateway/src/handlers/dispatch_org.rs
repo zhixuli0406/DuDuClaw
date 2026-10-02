@@ -57,6 +57,8 @@ impl MethodHandler {
         }
 
         match method {
+            "discovery.catalog" | "discovery.list" | "discovery.tree" | "discovery.artifact" | "discovery.cancel" =>
+                self.handle_discovery_rpc(method, params, ctx).await,
             "dashboard.layout.view" => {
                 require_manager!();
                 self.handle_dashboard_layout_view(params, ctx).await

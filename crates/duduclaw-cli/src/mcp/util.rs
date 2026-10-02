@@ -242,8 +242,66 @@ pub(crate) fn extract_tool_result_text(result: &Value) -> Option<String> {
 
 /// Build a short summary of tool call parameters for audit logging.
 /// Avoids logging full payloads (which may contain sensitive data).
+/// The tool arguments as they may be written to an audit row. `computer_type`
+/// is reduced to `{"chars": n}`: the text typed inside the computer-use
+/// container (a password, say) must never reach `tool_calls.jsonl`, from
+/// where the recent-actions feed can replay it into prompts. Every other
+/// tool's arguments are returned unchanged (`computer_key` carries a key
+/// name, which is fine).
+pub(crate) fn audit_safe_arguments(tool_name: &str, args: &Value) -> Value {
+    match tool_name {
+        "computer_type" => {
+            let chars = args.get("text").and_then(|v| v.as_str()).map(|t| t.chars().count()).unwrap_or(0);
+            serde_json::json!({ "chars": chars })
+        }
+        "computer_navigate" => {
+            let (host, path_len) = navigate_url_summary(args);
+            serde_json::json!({ "host": host, "path_len": path_len })
+        }
+        _ => args.clone(),
+    }
+}
+
+/// `computer_navigate`'s URL reduced to its host and path length: the query
+/// string (tokens, search terms) and the path itself never reach
+/// `tool_calls.jsonl`. An unparseable URL gives `None` / 0.
+fn navigate_url_summary(args: &Value) -> (Option<String>, usize) {
+    let parsed = args.get("url").and_then(|v| v.as_str()).and_then(|u| reqwest::Url::parse(u).ok());
+    match parsed {
+        Some(url) => (
+            url.host_str().map(|h| duduclaw_core::truncate_chars(h, 80).to_string()),
+            url.path().len(),
+        ),
+        None => (None, 0),
+    }
+}
+
 pub(crate) fn build_params_summary(tool_name: &str, args: &Value) -> String {
     match tool_name {
+        // Computer use: coordinates / sizes only. Typed text is summarised by
+        // its length and a screenshot by its name (the image never lands in
+        // the audit).
+        "computer_click" | "computer_scroll" => {
+            let n = |k: &str| args.get(k).map(|v| v.to_string()).unwrap_or_default();
+            format!("x={} y={}", n("x"), n("y"))
+        }
+        "computer_type" => {
+            let chars = args.get("text").and_then(|v| v.as_str()).map(|t| t.chars().count()).unwrap_or(0);
+            format!("chars={chars}")
+        }
+        "computer_key" => {
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            format!("key={}", duduclaw_core::truncate_chars(key, 32))
+        }
+        "computer_screenshot" => "screenshot".to_string(),
+        "computer_navigate" => {
+            let (host, path_len) = navigate_url_summary(args);
+            format!("host={} path_len={path_len}", host.as_deref().unwrap_or("?"))
+        }
+        "computer_session_start" | "computer_session_stop" => {
+            let id = args.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+            format!("session_id={}", duduclaw_core::truncate_chars(id, 64))
+        }
         "create_agent" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
             let display = args
@@ -253,8 +311,10 @@ pub(crate) fn build_params_summary(tool_name: &str, args: &Value) -> String {
             format!("name={name} display_name={display}")
         }
         "agent_remove" => {
-            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            format!("name={name}")
+            // The tool's parameter is `agent_id`; this used to read `name`,
+            // so every removal was summarised as `name=?`.
+            let agent = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("agent_id={}", duduclaw_core::truncate_chars(agent, 64))
         }
         "agent_update" => {
             let agent = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -319,3 +379,21 @@ pub(crate) fn build_params_summary(tool_name: &str, args: &Value) -> String {
 }
 
 // ── Voice / ASR / TTS handlers ─────────────────────────────────
+
+#[cfg(test)]
+mod computer_navigate_audit_tests {
+    use super::*;
+
+    #[test]
+    fn navigate_audit_keeps_host_and_path_length_only() {
+        let args = serde_json::json!({"url": "https://Example.com/a/b?token=secret#frag"});
+        let safe = audit_safe_arguments("computer_navigate", &args);
+        assert_eq!(safe, serde_json::json!({"host": "example.com", "path_len": 4}));
+        let summary = build_params_summary("computer_navigate", &args);
+        assert_eq!(summary, "host=example.com path_len=4");
+        assert!(!safe.to_string().contains("secret") && !summary.contains("secret"));
+        let bad = serde_json::json!({"url": "not a url"});
+        assert_eq!(audit_safe_arguments("computer_navigate", &bad), serde_json::json!({"host": null, "path_len": 0}));
+        assert_eq!(build_params_summary("computer_navigate", &bad), "host=? path_len=0");
+    }
+}

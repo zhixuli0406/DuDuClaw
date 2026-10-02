@@ -1,69 +1,50 @@
-//! L5 Computer Use client — calls the Claude Messages API with `computer_use`
-//! tool to control a virtual display inside a container sandbox.
+//! L5 computer-use primitives shared by the `computer_*` tool sessions
+//! (`computer_use_sessions`): the action type, the error type, and the
+//! sensitive-region detection and masking applied to every screenshot.
 //!
-//! This module follows the same HTTP client patterns as `direct_api.rs` (shared
-//! `OnceLock<reqwest::Client>`, 120s timeout) but adds the `computer_20251124`
-//! tool type and multi-turn tool-use conversation handling.
-//!
-//! Reference: <https://docs.anthropic.com/en/docs/agents-and-tools/computer-use>
+//! The gateway-run, chat-triggered loop that called the Anthropic Messages
+//! API with the `computer_20251124` tool was removed: it never completed a
+//! session in a released build. [`ComputerAction`] keeps that tool's action
+//! names, which the `computer_*` tools translate into.
 
-use duduclaw_core::truncate_bytes;
 use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const API_BASE: &str = "https://api.anthropic.com/v1/messages";
-const API_VERSION: &str = "2023-06-01";
-const BETA_HEADER: &str = "computer-use-2025-01-24";
-const DEFAULT_MAX_TOKENS: u32 = 4096;
-const DEFAULT_DISPLAY_WIDTH: u32 = 1280;
-const DEFAULT_DISPLAY_HEIGHT: u32 = 800;
-const DEFAULT_MAX_ACTIONS: u32 = 50;
 const MAX_SELECTOR_LENGTH: usize = 100;
 const MAX_SELECTORS: usize = 20;
-
-// ---------------------------------------------------------------------------
-// Shared HTTP client (same pattern as direct_api.rs)
-// ---------------------------------------------------------------------------
-
-static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-
-fn http_client() -> &'static reqwest::Client {
-    HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("Failed to build HTTP client")
-    })
-}
+/// Upper bound on the in-container `duduclaw-eval-dom` call. Exceeding it is a
+/// detection failure, so the caller masks the full screenshot (fail closed).
+const DOM_DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
-/// Errors from the Computer Use session.
+/// Errors from a computer-use session.
 #[derive(Debug)]
 pub enum ComputerUseError {
-    /// The session exceeded `max_actions` without completing.
-    MaxActionsExceeded,
-    /// HTTP or Anthropic API error.
+    /// A container / Docker operation failed. (The name predates the removal
+    /// of the Anthropic API loop; the text never carries API output now.)
     ApiError(String),
-    /// Failed to parse the API response.
+    /// A screenshot could not be decoded or re-encoded.
     ParseError(String),
+    /// Computer use cannot start on this host (image missing, invalid
+    /// `[computer_use]` config, Docker not answering). The text is
+    /// operator-safe, carries no raw Docker output and is shown to the
+    /// caller as is.
+    Unavailable(String),
 }
 
 impl std::fmt::Display for ComputerUseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MaxActionsExceeded => write!(f, "Maximum actions exceeded"),
             Self::ApiError(msg) => write!(f, "API error: {msg}"),
             Self::ParseError(msg) => write!(f, "Parse error: {msg}"),
+            Self::Unavailable(msg) => f.write_str(msg),
         }
     }
 }
@@ -191,6 +172,33 @@ fn is_safe_css_selector(selector: &str) -> bool {
     })
 }
 
+/// Exit status `duduclaw-eval-dom` uses for exactly one failure: more than
+/// one browser page is visible at once (e.g. after `ctrl+n`), so it cannot
+/// tell which one is on screen. Every other failure exits 1. Mirrors
+/// `EXIT_SEVERAL_PAGES` in `container/scripts/duduclaw-eval-dom`.
+pub const EVAL_DOM_EXIT_SEVERAL_PAGES: i32 = 3;
+
+/// Why sensitive-region detection produced no regions. Either way the caller
+/// masks the whole screenshot (fail closed); the kind only tells it why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegionDetectFailure {
+    /// The helper reported several visible pages
+    /// ([`EVAL_DOM_EXIT_SEVERAL_PAGES`]).
+    SeveralPages,
+    /// Any other failure: spawn error, timeout, other non-zero exit,
+    /// unparseable output, invalid container name. The text is for logs only.
+    Failed(String),
+}
+
+impl std::fmt::Display for RegionDetectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SeveralPages => f.write_str("several browser pages are visible at once"),
+            Self::Failed(msg) => f.write_str(msg),
+        }
+    }
+}
+
 /// Detect sensitive regions by executing DOM queries inside a container.
 ///
 /// Runs JavaScript in the browser container to find elements matching
@@ -199,7 +207,7 @@ fn is_safe_css_selector(selector: &str) -> bool {
 pub async fn detect_sensitive_regions(
     container_name: &str,
     patterns: &[String],
-) -> Result<Vec<[u32; 4]>, ComputerUseError> {
+) -> Result<Vec<[u32; 4]>, RegionDetectFailure> {
     // Validate container name to prevent argument injection
     if container_name.is_empty()
         || container_name.len() > 128
@@ -208,7 +216,7 @@ pub async fn detect_sensitive_regions(
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         || container_name.starts_with('-')
     {
-        return Err(ComputerUseError::ApiError(format!(
+        return Err(RegionDetectFailure::Failed(format!(
             "invalid container name: {container_name}"
         )));
     }
@@ -247,25 +255,49 @@ pub async fn detect_sensitive_regions(
     //
     // HS5 fix (invocation): `chromium-browser --evaluate-script=...` is NOT a
     // valid Chromium flag, so the old call failed virtually every time. We run
-    // the JS through the container's Node + CDP helper instead. The container
-    // image is expected to expose `duduclaw-eval-dom` (a thin Node/puppeteer or
-    // CDP wrapper) that reads the script from argv and prints the JSON result on
-    // stdout. The JS is passed as a single argument; it is already constrained
+    // the JS through the container's CDP helper instead. The container image
+    // ships `duduclaw-eval-dom` (`container/scripts/duduclaw-eval-dom`, Python
+    // standard library, loopback DevTools port) that reads the script from argv
+    // and prints the JSON result on stdout; any failure exits non-zero. The JS is passed as a single argument; it is already constrained
     // to JSON-escaped, validated CSS selectors (see `safe_patterns` above) so it
     // cannot inject shell metacharacters across the `docker exec` boundary.
-    let output = tokio::process::Command::new("docker")
+    //
+    // Bounded: a wedged browser (e.g. thread cap hit) must not stall the
+    // screenshot loop. On timeout we return `Err`, which makes
+    // `capture_masked_screenshot` mask the whole screenshot (fail closed);
+    // `kill_on_drop` kills the `docker exec` client when the future is dropped.
+    let exec = tokio::process::Command::new("docker")
         .args(["exec", container_name, "duduclaw-eval-dom", &js])
-        .output()
-        .await
-        .map_err(|e| ComputerUseError::ApiError(format!("container exec failed: {e}")))?;
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(DOM_DETECT_TIMEOUT, exec).await {
+        Ok(result) => result
+            .map_err(|e| RegionDetectFailure::Failed(format!("container exec failed: {e}")))?,
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = DOM_DETECT_TIMEOUT.as_secs(),
+                "Sensitive region detection timed out"
+            );
+            return Err(RegionDetectFailure::Failed(format!(
+                "sensitive region detection timed out after {}s",
+                DOM_DETECT_TIMEOUT.as_secs()
+            )));
+        }
+    };
 
     if !output.status.success() {
         // HS5 fix (fail closed): detection failure must NOT silently proceed
         // without masking — that ships an unmasked screenshot. Return an error
         // so the caller can fail closed (mask the full screen / abort upload).
+        // The several-pages case is told apart by the helper's exit status
+        // alone, never by its free-text stderr.
+        if output.status.code() == Some(EVAL_DOM_EXIT_SEVERAL_PAGES) {
+            tracing::warn!("Sensitive region detection: several pages are visible at once");
+            return Err(RegionDetectFailure::SeveralPages);
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::warn!(stderr = %stderr.trim(), "Sensitive region detection failed");
-        return Err(ComputerUseError::ApiError(format!(
+        return Err(RegionDetectFailure::Failed(format!(
             "sensitive region detection failed: {}",
             stderr.trim()
         )));
@@ -276,7 +308,7 @@ pub async fn detect_sensitive_regions(
     // "all clear". The previous `unwrap_or_default()` turned malformed output
     // into an empty (no-mask) result.
     let regions: Vec<[u32; 4]> = serde_json::from_str(stdout.trim()).map_err(|e| {
-        ComputerUseError::ParseError(format!("could not parse detected regions: {e}"))
+        RegionDetectFailure::Failed(format!("could not parse detected regions: {e}"))
     })?;
 
     if !regions.is_empty() {
@@ -290,10 +322,10 @@ pub async fn detect_sensitive_regions(
 }
 
 // ---------------------------------------------------------------------------
-// Computer actions (maps to `computer_20251124` tool spec)
+// Computer actions (named after the `computer_20251124` tool spec)
 // ---------------------------------------------------------------------------
 
-/// An action the model requests on the virtual display.
+/// An action on the virtual display (the `computer_*` tools translate into it).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "action")]
 pub enum ComputerAction {
@@ -324,335 +356,12 @@ pub enum ComputerAction {
 }
 
 // ---------------------------------------------------------------------------
-// Message / content types for conversation history
-// ---------------------------------------------------------------------------
-
-/// A single conversation message (user or assistant turn).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub role: String,
-    pub content: Vec<ContentBlock>,
-}
-
-/// Content blocks that appear inside messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ContentBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "image")]
-    Image { source: ImageSource },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: Value,
-    },
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        tool_use_id: String,
-        content: Vec<ContentBlock>,
-    },
-}
-
-/// Image source for base64-encoded screenshots.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImageSource {
-    #[serde(rename = "type")]
-    pub source_type: String,
-    pub media_type: String,
-    pub data: String,
-}
-
-// ---------------------------------------------------------------------------
-// Result type
-// ---------------------------------------------------------------------------
-
-/// The outcome of a single `execute_step` call.
-pub struct ComputerUseResult {
-    /// Actions the model wants executed on the virtual display.
-    pub actions: Vec<ComputerAction>,
-    /// Optional text reasoning from the model.
-    pub text_response: Option<String>,
-    /// Input tokens consumed.
-    pub input_tokens: u64,
-    /// Output tokens consumed.
-    pub output_tokens: u64,
-}
-
-// ---------------------------------------------------------------------------
-// Session
-// ---------------------------------------------------------------------------
-
-/// A stateful Computer Use session that tracks action count and enforces limits.
-pub struct ComputerUseSession {
-    api_key: String,
-    model: String,
-    display_width: u32,
-    display_height: u32,
-    max_actions: u32,
-    actions_taken: u32,
-    pub masking: Option<MaskingConfig>,
-}
-
-impl ComputerUseSession {
-    /// Create a new session with default display dimensions and action limit.
-    pub fn new(api_key: String, model: String, masking: Option<MaskingConfig>) -> Self {
-        Self {
-            api_key,
-            model,
-            display_width: DEFAULT_DISPLAY_WIDTH,
-            display_height: DEFAULT_DISPLAY_HEIGHT,
-            max_actions: DEFAULT_MAX_ACTIONS,
-            actions_taken: 0,
-            masking,
-        }
-    }
-
-    /// Create a session with custom display size and action limit.
-    pub fn with_config(
-        api_key: String,
-        model: String,
-        display_width: u32,
-        display_height: u32,
-        max_actions: u32,
-        masking: Option<MaskingConfig>,
-    ) -> Self {
-        Self {
-            api_key,
-            model,
-            display_width,
-            display_height,
-            max_actions,
-            actions_taken: 0,
-            masking,
-        }
-    }
-
-    /// How many actions have been taken so far.
-    pub fn actions_taken(&self) -> u32 {
-        self.actions_taken
-    }
-
-    /// Build the `computer_20251124` tool definition for the API request.
-    pub fn build_tool_definition(&self) -> Value {
-        serde_json::json!({
-            "type": "computer_20251124",
-            "name": "computer",
-            "display_width_px": self.display_width,
-            "display_height_px": self.display_height
-        })
-    }
-
-    /// Execute one step of the computer-use loop.
-    ///
-    /// Sends the current screenshot plus conversation history to the API and
-    /// returns any actions the model wants performed and optional text reasoning.
-    pub async fn execute_step(
-        &mut self,
-        screenshot_base64: &str,
-        task: &str,
-        conversation: &[Message],
-    ) -> Result<ComputerUseResult, ComputerUseError> {
-        if self.actions_taken >= self.max_actions {
-            warn!(
-                taken = self.actions_taken,
-                max = self.max_actions,
-                "Computer use action limit reached"
-            );
-            return Err(ComputerUseError::MaxActionsExceeded);
-        }
-
-        let body = self.build_request_body(screenshot_base64, task, conversation);
-        let client = http_client();
-
-        let response = client
-            .post(API_BASE)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .header("anthropic-beta", BETA_HEADER)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ComputerUseError::ApiError(format!("HTTP request failed: {e}")))?;
-
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| ComputerUseError::ApiError(format!("Failed to read body: {e}")))?;
-
-        if !status.is_success() {
-            return Err(ComputerUseError::ApiError(format!(
-                "API error ({status}): {}",
-                truncate_bytes(&response_text, 300)
-            )));
-        }
-
-        let parsed: Value = serde_json::from_str(&response_text)
-            .map_err(|e| ComputerUseError::ParseError(format!("JSON parse failed: {e}")))?;
-
-        self.parse_response(&parsed)
-    }
-
-    /// Assemble the full JSON request body.
-    fn build_request_body(
-        &self,
-        screenshot_base64: &str,
-        task: &str,
-        conversation: &[Message],
-    ) -> Value {
-        let system_prompt = format!(
-            "You are controlling a computer with a {w}x{h} display to accomplish the following task:\n\n{task}",
-            w = self.display_width,
-            h = self.display_height,
-        );
-
-        // Build messages: conversation history + current screenshot
-        let mut messages: Vec<Value> = conversation
-            .iter()
-            .map(|m| serde_json::to_value(m).unwrap_or_default())
-            .collect();
-
-        // Append the current screenshot as a user turn
-        let screenshot_message = serde_json::json!({
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": screenshot_base64
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": "Here is the current screenshot. What action should I take next?"
-                }
-            ]
-        });
-        messages.push(screenshot_message);
-
-        serde_json::json!({
-            "model": self.model,
-            "max_tokens": DEFAULT_MAX_TOKENS,
-            "system": system_prompt,
-            "tools": [self.build_tool_definition()],
-            "messages": messages
-        })
-    }
-
-    /// Parse the API response, extracting actions and text.
-    fn parse_response(&mut self, response: &Value) -> Result<ComputerUseResult, ComputerUseError> {
-        let content = response
-            .get("content")
-            .and_then(|c| c.as_array())
-            .ok_or_else(|| {
-                ComputerUseError::ParseError("Missing 'content' array in response".to_string())
-            })?;
-
-        let mut actions = Vec::new();
-        let mut text_parts = Vec::new();
-
-        for block in content {
-            let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-            match block_type {
-                "text" => {
-                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                        text_parts.push(text.to_string());
-                    }
-                }
-                "tool_use" => {
-                    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    if name == "computer" {
-                        if let Some(input) = block.get("input") {
-                            match serde_json::from_value::<ComputerAction>(input.clone()) {
-                                Ok(action) => {
-                                    self.actions_taken += 1;
-                                    actions.push(action);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        error = %e,
-                                        input = %input,
-                                        "Failed to parse computer action"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let input_tokens = response
-            .get("usage")
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-
-        let output_tokens = response
-            .get("usage")
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-
-        let text_response = if text_parts.is_empty() {
-            None
-        } else {
-            Some(text_parts.join("\n"))
-        };
-
-        info!(
-            actions_count = actions.len(),
-            total_actions = self.actions_taken,
-            max_actions = self.max_actions,
-            input_tokens,
-            output_tokens,
-            "Computer use step completed"
-        );
-
-        Ok(ComputerUseResult {
-            actions,
-            text_response,
-            input_tokens,
-            output_tokens,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tool_definition_structure() {
-        let session =
-            ComputerUseSession::new("test-key".into(), "claude-sonnet-4-20250514".into(), None);
-        let def = session.build_tool_definition();
-
-        assert_eq!(def["type"], "computer_20251124");
-        assert_eq!(def["name"], "computer");
-        assert_eq!(def["display_width_px"], 1280);
-        assert_eq!(def["display_height_px"], 800);
-    }
-
-    #[test]
-    fn tool_definition_custom_size() {
-        let session =
-            ComputerUseSession::with_config("key".into(), "model".into(), 1920, 1080, 100, None);
-        let def = session.build_tool_definition();
-        assert_eq!(def["display_width_px"], 1920);
-        assert_eq!(def["display_height_px"], 1080);
-    }
 
     #[test]
     fn action_serialize_screenshot() {
@@ -725,83 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn max_actions_enforced() {
-        let mut session =
-            ComputerUseSession::with_config("key".into(), "model".into(), 1280, 800, 2, None);
-        // Simulate having taken the max number of actions
-        session.actions_taken = 2;
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let result = rt.block_on(session.execute_step("base64data", "test task", &[]));
-        assert!(matches!(result, Err(ComputerUseError::MaxActionsExceeded)));
-    }
-
-    #[test]
-    fn parse_response_extracts_actions_and_text() {
-        let mut session = ComputerUseSession::new("key".into(), "model".into(), None);
-        let response = serde_json::json!({
-            "content": [
-                {"type": "text", "text": "I see a button. Let me click it."},
-                {
-                    "type": "tool_use",
-                    "id": "toolu_01",
-                    "name": "computer",
-                    "input": {"action": "left_click", "coordinate": [500, 300]}
-                }
-            ],
-            "usage": {
-                "input_tokens": 1500,
-                "output_tokens": 42
-            }
-        });
-
-        let result = session.parse_response(&response).unwrap();
-        assert_eq!(result.actions.len(), 1);
-        assert!(
-            matches!(&result.actions[0], ComputerAction::LeftClick { coordinate } if *coordinate == [500, 300])
-        );
-        assert_eq!(
-            result.text_response.as_deref(),
-            Some("I see a button. Let me click it.")
-        );
-        assert_eq!(result.input_tokens, 1500);
-        assert_eq!(result.output_tokens, 42);
-        assert_eq!(session.actions_taken(), 1);
-    }
-
-    #[test]
-    fn message_serialization() {
-        let msg = Message {
-            role: "user".into(),
-            content: vec![
-                ContentBlock::Text {
-                    text: "Hello".into(),
-                },
-                ContentBlock::Image {
-                    source: ImageSource {
-                        source_type: "base64".into(),
-                        media_type: "image/png".into(),
-                        data: "abc123".into(),
-                    },
-                },
-            ],
-        };
-        let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["role"], "user");
-        assert_eq!(json["content"].as_array().unwrap().len(), 2);
-        assert_eq!(json["content"][0]["type"], "text");
-        assert_eq!(json["content"][1]["type"], "image");
-    }
-
-    #[test]
     fn error_display() {
-        let e = ComputerUseError::MaxActionsExceeded;
-        assert_eq!(e.to_string(), "Maximum actions exceeded");
-
         let e = ComputerUseError::ApiError("timeout".into());
         assert_eq!(e.to_string(), "API error: timeout");
 

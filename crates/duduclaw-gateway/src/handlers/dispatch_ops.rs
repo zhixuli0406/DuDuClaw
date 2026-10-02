@@ -87,7 +87,7 @@ impl MethodHandler {
             }
             "os.settings.update" => {
                 require_admin!();
-                self.handle_os_settings_update(params).await
+                self.handle_os_settings_update(params, Some(ctx)).await
             }
             "os.gate.recent" => {
                 require_admin!();

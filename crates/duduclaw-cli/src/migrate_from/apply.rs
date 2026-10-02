@@ -492,17 +492,25 @@ pub(super) fn copy_into_agent_memory(ctx: &Ctx, agent_id: &str, src: &Path) -> s
 }
 
 /// Recursively copy a directory tree.
+///
+/// Symlinks are never followed (classified via `DirEntry::file_type`, which
+/// does not traverse links) and are skipped along with special files: an
+/// imported skill or archive must not pull content from outside its own tree
+/// (e.g. a link to `~/.ssh/id_rsa`) into an agent directory, nor recurse
+/// forever through a link to an ancestor.
 pub(super) fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dest)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
+        let ft = entry.file_type()?;
         let path = entry.path();
         let target = dest.join(entry.file_name());
-        if path.is_dir() {
+        if ft.is_dir() {
             copy_dir_recursive(&path, &target)?;
-        } else {
+        } else if ft.is_file() {
             std::fs::copy(&path, &target)?;
         }
+        // symlink / fifo / socket / device: skipped.
     }
     Ok(())
 }
@@ -584,5 +592,28 @@ pub(super) fn import_wiki_page(
     match store.write_page_with_author(&page.rel_path, &content, "import") {
         Ok(()) => report.imported("wiki", &page.rel_path),
         Err(e) => report.skipped("wiki", &page.rel_path, format!("寫入失敗: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod copy_dir_tests {
+    use super::copy_dir_recursive;
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_does_not_follow_symlinks() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("id_rsa"), "PRIVATE").unwrap();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("SKILL.md"), "skill").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("id_rsa"), src.path().join("key")).unwrap();
+        std::os::unix::fs::symlink(src.path(), src.path().join("loop")).unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        let out = dst.path().join("copy");
+        copy_dir_recursive(src.path(), &out).unwrap();
+        assert!(out.join("SKILL.md").is_file());
+        assert!(std::fs::symlink_metadata(out.join("key")).is_err());
+        assert!(std::fs::symlink_metadata(out.join("loop")).is_err());
     }
 }

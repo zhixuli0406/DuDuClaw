@@ -142,6 +142,17 @@ impl MethodHandler {
     }
 
     pub(crate) fn handle_fork_resolve(&self, params: Value) -> WsFrame {
+        // MCP selection uses the same key. Hold the lock across the fresh
+        // resolved check, file promotion, durable resolution and retention GC.
+        match duduclaw_core::with_file_lock(&self.home_dir.join("fork_resolution.lock"), || {
+            Ok(self.handle_fork_resolve_locked(params))
+        }) {
+            Ok(response) => response,
+            Err(e) => WsFrame::error_response("", &format!("fork resolution lock unavailable: {e}")),
+        }
+    }
+
+    fn handle_fork_resolve_locked(&self, params: Value) -> WsFrame {
         let store = match self.open_fork_store() {
             Ok(s) => s,
             Err(f) => return f,
@@ -154,6 +165,11 @@ impl MethodHandler {
             Some(b) => b,
             None => return WsFrame::error_response("", "branch_id is required"),
         };
+        for id in [fork_id, branch_id] {
+            if let Err(e) = duduclaw_fork::retention::validate_id(id) {
+                return WsFrame::error_response("", &e.to_string());
+            }
+        }
         let fork = match store.get_fork(fork_id) {
             Ok(Some(f)) => f,
             Ok(None) => return WsFrame::error_response("", "fork not found"),
@@ -166,15 +182,42 @@ impl MethodHandler {
         if !branches.iter().any(|b| b.branch_id == branch_id) {
             return WsFrame::error_response("", "branch not found in fork");
         }
-        let aggregate = branches.iter().map(|b| b.spent_usd).sum();
-        match store.set_resolution(fork_id, Some(branch_id), true, true, aggregate) {
-            Ok(_) => WsFrame::ok_response(
-                "",
-                json!({
-                    "fork_id": fork_id, "resolved": true, "winner": branch_id,
-                }),
-            ),
-            Err(e) => WsFrame::error_response("", &format!("resolve fork: {e}")),
+        let (workspace, parent) = match retained_fork_promotion_paths(
+            &self.home_dir, &store, fork_id, branch_id,
+        ) {
+            Ok(paths) => paths,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        match duduclaw_fork::with_parent_publication(&parent, |publication| {
+            let report = match publication.promote(
+                &workspace,
+                // Same rule as the agent-side `merge_or_select`: an operator
+                // picking a branch never carries agent-structure files (or
+                // `.claude/`) back into an agent directory.
+                &duduclaw_fork::CopyPolicy::promote_for_parent(&parent, &self.home_dir),
+            ) {
+                Ok(report) => report,
+                Err(e) => return Ok(WsFrame::error_response("", &format!("promotion failed, fork left unresolved: {e}"))),
+            };
+            let aggregate = branches.iter().map(|b| b.spent_usd).sum();
+            Ok(match store.set_resolution(fork_id, Some(branch_id), true, true, aggregate) {
+                Ok(_) => {
+                    if let Err(e) = duduclaw_fork::retention::remove_fork(
+                        &duduclaw_fork::retention::retained_root(&self.home_dir), fork_id,
+                    ) {
+                        tracing::warn!("fork {fork_id}: removing retained copies failed: {e}");
+                    }
+                    let _ = store.clear_fork_workspaces(fork_id);
+                    WsFrame::ok_response("", json!({
+                        "fork_id": fork_id, "resolved": true, "promoted": true,
+                        "winner": branch_id, "files_copied": report.files_copied,
+                    }))
+                }
+                Err(e) => WsFrame::error_response("", &format!("files were promoted but the store update failed: {e}")),
+            })
+        }) {
+            Ok(response) => response,
+            Err(error) => WsFrame::error_response("", &format!("fork parent publication lock unavailable: {error}")),
         }
     }
 
@@ -287,5 +330,114 @@ impl MethodHandler {
                 &format!("could not parse migrate-from JSON output: {e}"),
             ),
         }
+    }
+}
+
+fn retained_fork_promotion_paths(
+    home: &std::path::Path, store: &duduclaw_fork::ForkStore,
+    fork_id: &str, branch_id: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let retained = duduclaw_fork::retention::fork_dir(
+        &duduclaw_fork::retention::retained_root(home), fork_id,
+    ).map_err(|e| e.to_string())?;
+    let workspace = store.branch_workspace(branch_id).map_err(|e| e.to_string())?
+        .map(std::path::PathBuf::from).ok_or("no retained workspace; nothing can be promoted")?;
+    if !workspace.is_dir() || !duduclaw_fork::retention::is_contained(&retained, &workspace) {
+        return Err("retained workspace is missing, expired, or outside this fork".into());
+    }
+    let parent = store.parent_workspace(fork_id).map_err(|e| e.to_string())?
+        .map(std::path::PathBuf::from).ok_or("no parent workspace recorded")?;
+    if !parent.is_dir() { return Err("parent workspace no longer exists; nothing was promoted".into()); }
+    Ok((workspace, parent))
+}
+
+#[cfg(test)]
+mod fork_promotion_tests {
+    use super::*;
+
+    fn fixture(home: &std::path::Path) -> (duduclaw_fork::ForkStore, std::path::PathBuf) {
+        let store = duduclaw_fork::ForkStore::open(home.join("fork_store.db")).unwrap();
+        store.insert_fork(&duduclaw_fork::ForkRow {
+            fork_id: "fork-test".into(), agent_id: "test".into(), prompt: "fixture".into(),
+            merge_mode: "manual".into(), resolved: false, winner: None, promoted: false,
+            aggregate_spent_usd: 0.0, created_at: chrono::Utc::now().to_rfc3339(),
+        }, &[duduclaw_fork::BranchRow {
+            branch_id: "branch-test".into(), fork_id: "fork-test".into(), steering: None,
+            budget_usd: 0.1, state: "finished".into(), spent_usd: 0.01,
+            output: "fixture".into(), test_exit_code: Some(0),
+        }, duduclaw_fork::BranchRow {
+            branch_id: "branch-second".into(), fork_id: "fork-test".into(), steering: None,
+            budget_usd: 0.1, state: "finished".into(), spent_usd: 0.01,
+            output: "fixture".into(), test_exit_code: Some(0),
+        }]).unwrap();
+        let parent = home.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        store.set_parent_workspace("fork-test", Some(&parent.to_string_lossy())).unwrap();
+        (store, parent)
+    }
+
+    #[tokio::test]
+    async fn dashboard_resolution_promotes_real_files_and_cleans_retained_copies() {
+        let home = tempfile::tempdir().unwrap();
+        let (store, parent) = fixture(home.path());
+        let workspace = home.path().join("fork_ws/fork-test/branch-test");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("artifact.txt"), "winner").unwrap();
+        std::fs::write(workspace.join(".env"), "secret fixture").unwrap();
+        store.set_branch_workspace("branch-test", Some(&workspace.to_string_lossy())).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let response = handler.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-test"}));
+        assert!(matches!(response, WsFrame::Response { ok: true, .. }));
+        assert_eq!(std::fs::read_to_string(parent.join("artifact.txt")).unwrap(), "winner");
+        assert!(!parent.join(".env").exists());
+        assert!(store.get_fork("fork-test").unwrap().unwrap().promoted);
+        assert!(!workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn dashboard_resolution_refuses_missing_or_escaping_workspace() {
+        for escaping in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let (store, parent) = fixture(home.path());
+            if escaping {
+                let outside = home.path().join("outside");
+                std::fs::create_dir(&outside).unwrap();
+                store.set_branch_workspace("branch-test", Some(&outside.to_string_lossy())).unwrap();
+            }
+            let handler = MethodHandler::new(home.path().to_path_buf()).await;
+            let response = handler.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-test"}));
+            assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+            let fork = store.get_fork("fork-test").unwrap().unwrap();
+            assert!(!fork.promoted && !fork.resolved);
+            assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn competing_dashboard_selections_copy_only_one_winner() {
+        let home = tempfile::tempdir().unwrap();
+        let (store, parent) = fixture(home.path());
+        for branch in ["branch-test", "branch-second"] {
+            let workspace = home.path().join("fork_ws/fork-test").join(branch);
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("winner.txt"), branch).unwrap();
+            std::fs::write(workspace.join(branch), "unique to winner").unwrap();
+            store.set_branch_workspace(branch, Some(&workspace.to_string_lossy())).unwrap();
+        }
+        let handler = std::sync::Arc::new(MethodHandler::new(home.path().to_path_buf()).await);
+        let first = handler.clone();
+        let second = handler.clone();
+        let (first, second) = tokio::join!(
+            tokio::task::spawn_blocking(move || first.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-test"}))),
+            tokio::task::spawn_blocking(move || second.handle_fork_resolve(json!({"fork_id":"fork-test","branch_id":"branch-second"}))),
+        );
+        let succeeded = [first.unwrap(), second.unwrap()].into_iter()
+            .filter(|response| matches!(response, WsFrame::Response { ok: true, .. })).count();
+        assert_eq!(succeeded, 1);
+        let winner = store.get_fork("fork-test").unwrap().unwrap().winner.unwrap();
+        assert_eq!(std::fs::read_to_string(parent.join("winner.txt")).unwrap(), winner);
+        assert!(parent.join(&winner).exists());
+        let loser = if winner == "branch-test" { "branch-second" } else { "branch-test" };
+        assert!(!parent.join(loser).exists());
     }
 }

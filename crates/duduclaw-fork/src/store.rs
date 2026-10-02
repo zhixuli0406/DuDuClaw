@@ -105,7 +105,96 @@ impl ForkStore {
              CREATE INDEX IF NOT EXISTS idx_forks_created ON forks(created_at);",
         )
         .map_err(map_err)?;
+        Self::migrate(&conn)?;
         Ok(ForkStore { conn: Mutex::new(conn) })
+    }
+
+    /// Additive, idempotent migrations. Every added column is nullable so an
+    /// older `fork_store.db` opens unchanged and old rows read as "unknown".
+    fn migrate(conn: &Connection) -> Result<()> {
+        // (table, column, type) — retained-workspace bookkeeping (RFC-26 P6):
+        // the parent a fork was taken from and each branch's retained workspace.
+        const ADDED: &[(&str, &str, &str)] = &[
+            ("forks", "parent_workspace", "TEXT"),
+            ("fork_branches", "workspace_path", "TEXT"),
+        ];
+        for (table, column, ty) in ADDED {
+            let exists = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .and_then(|mut stmt| {
+                    let names = stmt
+                        .query_map([], |r| r.get::<_, String>(1))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    Ok(names.iter().any(|n| n == column))
+                })
+                .map_err(map_err)?;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))
+                    .map_err(map_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the parent workspace a fork was taken from (for deferred promote).
+    pub fn set_parent_workspace(&self, fork_id: &str, parent: Option<&str>) -> Result<bool> {
+        let conn = self.conn.lock().expect("fork store poisoned");
+        let n = conn
+            .execute(
+                "UPDATE forks SET parent_workspace=?2 WHERE fork_id=?1",
+                params![fork_id, parent],
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
+    }
+
+    /// The parent workspace recorded for a fork, if any.
+    pub fn parent_workspace(&self, fork_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("fork store poisoned");
+        let v: Option<Option<String>> = conn
+            .query_row(
+                "SELECT parent_workspace FROM forks WHERE fork_id=?1",
+                params![fork_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(v.flatten())
+    }
+
+    /// Record (or clear) a branch's retained workspace path.
+    pub fn set_branch_workspace(&self, branch_id: &str, path: Option<&str>) -> Result<bool> {
+        let conn = self.conn.lock().expect("fork store poisoned");
+        let n = conn
+            .execute(
+                "UPDATE fork_branches SET workspace_path=?2 WHERE branch_id=?1",
+                params![branch_id, path],
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
+    }
+
+    /// A branch's retained workspace path, if any.
+    pub fn branch_workspace(&self, branch_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("fork store poisoned");
+        let v: Option<Option<String>> = conn
+            .query_row(
+                "SELECT workspace_path FROM fork_branches WHERE branch_id=?1",
+                params![branch_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(v.flatten())
+    }
+
+    /// Clear every retained workspace path of a fork (after promote/cleanup).
+    pub fn clear_fork_workspaces(&self, fork_id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("fork store poisoned");
+        conn.execute(
+            "UPDATE fork_branches SET workspace_path=NULL WHERE fork_id=?1",
+            params![fork_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
     }
 
     /// Insert a new fork plus its branches in one transaction.
@@ -177,14 +266,68 @@ impl ForkStore {
         Ok(n > 0)
     }
 
-    /// Mark every branch of a fork as `state` (used for Running transition).
+    /// Transition active rows only; durable terminal states are never reopened.
     pub fn set_all_branch_states(&self, fork_id: &str, state: &str) -> Result<()> {
+        let previous = match state {
+            "running" => "state='pending'",
+            "failed" => "state IN ('pending','running')",
+            _ => return Err(ForkError::Config("unsupported bulk fork transition".into())),
+        };
         let conn = self.conn.lock().expect("fork store poisoned");
         conn.execute(
-            "UPDATE fork_branches SET state=?2 WHERE fork_id=?1",
+            &format!("UPDATE fork_branches SET state=?2 WHERE fork_id=?1 AND {previous}
+                AND EXISTS(SELECT 1 FROM forks WHERE fork_id=?1 AND resolved=0)"),
             params![fork_id, state],
         )
         .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Claim exactly the pending rows requested by this driver. The caller also
+    /// holds its HOME publication lock; IMMEDIATE protects cross-connection CAS.
+    pub fn claim_pending_branches(&self, fork_id: &str, requested: &[String], parent: &str) -> Result<Vec<BranchRow>> {
+        let mut conn = self.conn.lock().expect("fork store poisoned");
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(map_err)?;
+        let mut rows = {
+            let mut statement = tx.prepare("SELECT b.branch_id,b.fork_id,b.steering,b.budget_usd,b.state,b.spent_usd,b.output,b.test_exit_code
+                FROM fork_branches b JOIN forks f ON f.fork_id=b.fork_id
+                WHERE b.fork_id=?1 AND b.state='pending' AND f.resolved=0 ORDER BY b.branch_id").map_err(map_err)?;
+            let rows = statement.query_map(params![fork_id], Self::map_branch_row).map_err(map_err)?
+                .collect::<std::result::Result<Vec<_>, _>>().map_err(map_err)?;
+            rows.into_iter().filter(|row| requested.contains(&row.branch_id)).collect::<Vec<_>>()
+        };
+        for row in &mut rows {
+            tx.execute("UPDATE fork_branches SET state='running' WHERE branch_id=?1 AND fork_id=?2 AND state='pending'",
+                params![row.branch_id, fork_id]).map_err(map_err)?;
+            row.state = "running".into();
+        }
+        if !rows.is_empty() {
+            tx.execute("UPDATE forks SET parent_workspace=?2 WHERE fork_id=?1 AND resolved=0", params![fork_id, parent]).map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(rows)
+    }
+
+    /// Preserve real results and a recovery path when file/DB publication fails.
+    /// A late error cannot overwrite cancellation or an operator's final choice.
+    pub fn record_publication_failure(&self, fork_id: &str, results: &[crate::BranchResult],
+        sources: &[crate::RetainedBranch], spent: f64, error: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("fork store poisoned");
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(map_err)?;
+        for result in results {
+            let output = format!("{}\n[publication_failed] {error}", result.output);
+            tx.execute("UPDATE fork_branches SET state='publication_failed',spent_usd=?3,output=?4,test_exit_code=?5
+                WHERE branch_id=?1 AND fork_id=?2 AND state IN ('pending','running','finished')
+                AND EXISTS(SELECT 1 FROM forks WHERE fork_id=?2 AND resolved=0)",
+                params![result.id.0, fork_id, result.spent_usd, output, result.test_exit_code.map(i64::from)]).map_err(map_err)?;
+        }
+        for source in sources {
+            tx.execute("UPDATE fork_branches SET workspace_path=?3 WHERE branch_id=?1 AND fork_id=?2 AND state='publication_failed'
+                AND EXISTS(SELECT 1 FROM forks WHERE fork_id=?2 AND resolved=0)",
+                params![source.branch_id.0, fork_id, source.workspace.to_string_lossy()]).map_err(map_err)?;
+        }
+        tx.execute("UPDATE forks SET aggregate_spent_usd=?2 WHERE fork_id=?1 AND resolved=0", params![fork_id, spent]).map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
         Ok(())
     }
 
@@ -262,7 +405,7 @@ impl ForkStore {
             branches_total,
             branches_finished: count_state("finished")?,
             branches_budget_killed: count_state("budget_killed")?,
-            branches_failed: count_state("failed")?,
+            branches_failed: count_state("failed")? + count_state("publication_failed")?,
             aggregate_spent_usd: spent,
         })
     }
@@ -384,6 +527,29 @@ mod tests {
     }
 
     #[test]
+    fn startup_and_failure_transitions_preserve_persisted_terminal_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork.db");
+        let worker = ForkStore::open(&path).unwrap();
+        worker.insert_fork(&fork_row("f1"), &[
+            branch_row("pending", "f1", "pending"),
+            branch_row("cancelled", "f1", "pending"),
+            branch_row("done", "f1", "finished"),
+        ]).unwrap();
+        let operator = ForkStore::open(&path).unwrap();
+        operator.update_branch("cancelled", "terminated", 0.02, "operator stopped", None).unwrap();
+        worker.set_all_branch_states("f1", "running").unwrap();
+        let state = |id: &str| worker.list_branches("f1").unwrap().into_iter().find(|row| row.branch_id == id).unwrap().state;
+        assert_eq!(state("cancelled"), "terminated", "another process's cancellation must survive scheduling");
+        assert_eq!(state("done"), "finished", "a completed branch cannot be claimed again");
+        assert_eq!(state("pending"), "running");
+        operator.update_branch("pending", "terminated", 0.03, "cancelled during execution", None).unwrap();
+        worker.set_all_branch_states("f1", "failed").unwrap();
+        assert_eq!(state("pending"), "terminated", "a late execution failure cannot override cancellation");
+        assert_eq!(state("done"), "finished");
+    }
+
+    #[test]
     fn list_forks_newest_first() {
         let s = ForkStore::open_in_memory().unwrap();
         let mut f1 = fork_row("f1");
@@ -420,6 +586,50 @@ mod tests {
         assert_eq!(m.branches_failed, 1);
         assert_eq!(m.branches_budget_killed, 1);
         assert!((m.aggregate_spent_usd - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn workspace_columns_roundtrip() {
+        let s = ForkStore::open_in_memory().unwrap();
+        s.insert_fork(&fork_row("f1"), &[branch_row("b1", "f1", "finished")]).unwrap();
+        assert_eq!(s.parent_workspace("f1").unwrap(), None);
+        assert!(s.set_parent_workspace("f1", Some("/p")).unwrap());
+        assert_eq!(s.parent_workspace("f1").unwrap().as_deref(), Some("/p"));
+        assert!(s.set_branch_workspace("b1", Some("/ws/b1")).unwrap());
+        assert_eq!(s.branch_workspace("b1").unwrap().as_deref(), Some("/ws/b1"));
+        s.clear_fork_workspaces("f1").unwrap();
+        assert_eq!(s.branch_workspace("b1").unwrap(), None);
+        assert_eq!(s.branch_workspace("ghost").unwrap(), None);
+    }
+
+    #[test]
+    fn old_schema_db_migrates_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork_store.db");
+        {
+            // Pre-migration schema, with a row, as shipped before this change.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE forks (fork_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+                   prompt TEXT NOT NULL, merge_mode TEXT NOT NULL,
+                   resolved INTEGER NOT NULL DEFAULT 0, winner TEXT,
+                   promoted INTEGER NOT NULL DEFAULT 0,
+                   aggregate_spent_usd REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+                 CREATE TABLE fork_branches (branch_id TEXT PRIMARY KEY, fork_id TEXT NOT NULL,
+                   steering TEXT, budget_usd REAL NOT NULL DEFAULT 0, state TEXT NOT NULL,
+                   spent_usd REAL NOT NULL DEFAULT 0, output TEXT NOT NULL DEFAULT '',
+                   test_exit_code INTEGER);
+                 INSERT INTO forks VALUES ('f0','a','p','manual',0,NULL,0,0,'2026-01-01');",
+            )
+            .unwrap();
+        }
+        let s = ForkStore::open(&path).unwrap();
+        assert!(s.get_fork("f0").unwrap().is_some());
+        assert_eq!(s.parent_workspace("f0").unwrap(), None);
+        drop(s);
+        // Reopening runs the migration again as a no-op.
+        let s = ForkStore::open(&path).unwrap();
+        assert!(s.set_parent_workspace("f0", Some("/p")).unwrap());
     }
 
     #[test]

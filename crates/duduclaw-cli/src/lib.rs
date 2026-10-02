@@ -75,6 +75,8 @@ pub mod redaction_verify; // WP2: `duduclaw redaction verify` evidence report
 mod secaudit; // Code security audit MVP: intake + OSS scanner orchestration (`duduclaw secaudit`)
 mod service;
 pub mod weekly_report; // Per-agent weekly usage report
+mod knobs_survival;
+mod discover_cli;
 pub mod wiki_scope; // RFC-21 §3: shared-wiki SoT namespace policy
 mod wizard;
 
@@ -256,11 +258,81 @@ async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
     while let Ok(Some(entry)) = entries.next_entry().await {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+        // `file_type()` does not follow symlinks: a directory symlink cycle
+        // must not recurse forever, and a link must not pull out-of-tree
+        // content into the backup.
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            copy_symlink(&src_path, &dst_path).await;
+        } else if file_type.is_dir() {
             Box::pin(copy_dir_recursive(&src_path, &dst_path)).await;
-        } else if let Err(e) = tokio::fs::copy(&src_path, &dst_path).await {
-            eprintln!("Failed to copy {}: {e}", src_path.display());
+        } else if file_type.is_file() {
+            if let Err(e) = tokio::fs::copy(&src_path, &dst_path).await {
+                eprintln!("Failed to copy {}: {e}", src_path.display());
+            }
         }
+        // Sockets, FIFOs and device nodes are skipped.
+    }
+}
+
+/// Recreate `src` (a symlink) at `dst` pointing at the same target. Windows
+/// symlink creation needs a privilege and a file/dir decision, so links are
+/// skipped there.
+async fn copy_symlink(src: &std::path::Path, dst: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        let target = match tokio::fs::read_link(src).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Failed to read link {}: {e}", src.display());
+                return;
+            }
+        };
+        if let Err(e) = tokio::fs::symlink(&target, dst).await {
+            eprintln!("Failed to recreate link {}: {e}", dst.display());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (src, dst);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod copy_dir_recursive_tests {
+    use super::copy_dir_recursive;
+
+    #[tokio::test]
+    async fn self_referential_dir_symlink_terminates_and_is_kept_as_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("agents");
+        std::fs::create_dir_all(src.join("a")).unwrap();
+        std::fs::write(src.join("a/SOUL.md"), "soul").unwrap();
+        std::os::unix::fs::symlink("..", src.join("a/loop")).unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("a/out")).unwrap();
+
+        let dst = tmp.path().join("backup");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            copy_dir_recursive(&src, &dst),
+        )
+        .await
+        .expect("copy must terminate on a symlink cycle");
+
+        assert_eq!(std::fs::read_to_string(dst.join("a/SOUL.md")).unwrap(), "soul");
+        let loop_meta = std::fs::symlink_metadata(dst.join("a/loop")).unwrap();
+        assert!(loop_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(dst.join("a/loop")).unwrap(),
+            std::path::PathBuf::from("..")
+        );
+        // Out-of-tree content stays a link, not a copied file.
+        let out_meta = std::fs::symlink_metadata(dst.join("a/out")).unwrap();
+        assert!(out_meta.file_type().is_symlink());
     }
 }
 
@@ -1814,6 +1886,12 @@ enum OpsCommands {
 
 #[derive(Subcommand)]
 enum ToolingCommands {
+    /// Operator-only experimental exploration runner.
+    #[command(hide = true)]
+    Discover {
+        #[command(subcommand)]
+        command: discover_cli::DiscoverCommands,
+    },
     /// Start DuDuClaw MCP server (for Claude Code integration)
     McpServer,
 
@@ -2407,6 +2485,12 @@ enum MaintenanceCommands {
         format: String,
     },
 
+    /// Inspect goal-loop survival evidence from the local ledger.
+    Knobs {
+        #[command(subcommand)]
+        command: KnobsCommands,
+    },
+
     /// Print version information
     Version,
 
@@ -2605,6 +2689,21 @@ enum AgentCommands {
     Run {
         /// Agent name
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KnobsCommands {
+    /// Read protected survival evidence from the local ledger.
+    Survival {
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
+        format: String,
     },
 }
 
@@ -3686,6 +3785,20 @@ fn read_config_log_level() -> Option<String> {
 /// Installs rustls provider, tracing subscriber, parses CLI args, and dispatches.
 /// Pro binary calls [`set_extension`] before this to inject Pro features into the gateway.
 pub async fn entry_point() {
+    let cli = Cli::parse();
+    if is_read_only_survival_command(&cli.command) {
+        // Analysis must reach neither persistent logging/OTLP initialization
+        // nor the persistent redaction override path before dispatch.
+        if cli.force_disable_redaction {
+            eprintln!("Error: --force-disable-redaction cannot be used with read-only knobs survival");
+            std::process::exit(2);
+        }
+        if let Err(error) = run(cli).await {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Install ring as the default rustls CryptoProvider (required for TLS WebSocket connections).
     // Must be called before any TLS connection is attempted (Discord, edge-tts, etc.).
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -3793,8 +3906,6 @@ pub async fn entry_point() {
         .with(duduclaw_gateway::otel::subscriber_layer())
         .init();
 
-    let cli = Cli::parse();
-
     // RFC-23: apply force-disable override BEFORE dispatching to any
     // subcommand. The dual-key check (env=off + flag=true) prevents an
     // accidental break-glass; we log loudly and write the persistent
@@ -3849,6 +3960,12 @@ pub async fn entry_point() {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
+}
+
+fn is_read_only_survival_command(command: &Commands) -> bool {
+    matches!(command, Commands::Maintenance(MaintenanceCommands::Knobs {
+        command: KnobsCommands::Survival { .. },
+    }))
 }
 
 async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
@@ -5121,6 +5238,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Ops(OpsCommands::Security) => cmd_security_posture().await,
         Commands::Ops(OpsCommands::Import { file, force }) => cmd_import_data(file, force).await,
         Commands::Tooling(ToolingCommands::McpServer) => cmd_mcp_server().await,
+        Commands::Tooling(ToolingCommands::Discover { command }) => {
+            discover_cli::execute(command, &duduclaw_home(), agent_session_identity().as_deref()).await
+        }
         Commands::Tooling(ToolingCommands::McpProxy { server, upstream }) => {
             // stdout is the JSON-RPC channel (CLI-H7) — tracing already goes
             // to stderr from `entry_point`, same as `mcp-server`.
@@ -5334,6 +5454,11 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 &format,
             )
             .await
+        }
+        Commands::Maintenance(MaintenanceCommands::Knobs { command: KnobsCommands::Survival {
+            days, agent, output, format,
+        } }) => {
+            knobs_survival::run(&duduclaw_home(), days, agent.as_deref(), output.as_deref(), &format).await
         }
         Commands::Maintenance(MaintenanceCommands::Version) => {
             println!("duduclaw {}", duduclaw_gateway::updater::current_version());
@@ -5839,7 +5964,6 @@ fn walk_md_files(root: &std::path::Path, sink: &mut dyn FnMut(&std::path::Path))
 /// identity: see that function's doc comment.
 async fn cmd_hook_agent_file_guard(agent_id_arg: Option<&str>) -> duduclaw_core::error::Result<()> {
     use std::io::Read;
-    use std::path::PathBuf;
 
     let mut buf = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
@@ -5866,6 +5990,33 @@ async fn cmd_hook_agent_file_guard(agent_id_arg: Option<&str>) -> duduclaw_core:
     let home = duduclaw_home();
     let caller = resolve_hook_caller(&home, agent_id_arg);
 
+    let Some(decision) = agent_file_guard_decision(tool_name, &envelope, &home, &caller) else {
+        return Ok(());
+    };
+
+    if let Some(msg) = decision.block_message() {
+        eprintln!("{msg}");
+        // Exit 2 — Claude Code interprets this as a block and surfaces
+        // stderr back to the agent so the model learns to retry with
+        // the `create_agent` MCP tool instead.
+        std::process::exit(2);
+    }
+
+    Ok(())
+}
+
+/// The decision half of [`cmd_hook_agent_file_guard`], free of stdin and
+/// `process::exit` so every stage can be tested per tool. `None` means the
+/// hook has nothing to judge (unrelated tool, missing `file_path` /
+/// `command`) and lets the call through, exactly as before the extraction.
+fn agent_file_guard_decision(
+    tool_name: &str,
+    envelope: &serde_json::Value,
+    home: &std::path::Path,
+    caller: &duduclaw_core::HookCaller,
+) -> Option<duduclaw_core::GuardDecision> {
+    use std::path::PathBuf;
+    let home = home.to_path_buf();
     let decision = match tool_name {
         "Write" | "Edit" | "MultiEdit" => {
             let Some(file_path_str) = envelope
@@ -5873,7 +6024,7 @@ async fn cmd_hook_agent_file_guard(agent_id_arg: Option<&str>) -> duduclaw_core:
                 .and_then(|v| v.as_str())
             else {
                 // No file_path — nothing to check, fail open.
-                return Ok(());
+                return None;
             };
             let file_path = PathBuf::from(file_path_str);
 
@@ -5891,8 +6042,13 @@ async fn cmd_hook_agent_file_guard(agent_id_arg: Option<&str>) -> duduclaw_core:
                 // which would otherwise allow a write to SOUL.md's own
                 // canonical path.
                 let own_soul = duduclaw_core::check_own_soul_write(&file_path, &home, &caller);
+                // Contract lock — CONTRACT.toml likewise, with no opt-in.
+                let own_contract =
+                    duduclaw_core::check_own_contract_write(&file_path, &home, &caller);
                 if !own_soul.is_allowed() {
                     own_soul
+                } else if !own_contract.is_allowed() {
+                    own_contract
                 } else {
                     // Stage 1 — location guard (is this agent-structure file
                     // allowed to live here at all?).
@@ -5921,28 +6077,100 @@ async fn cmd_hook_agent_file_guard(agent_id_arg: Option<&str>) -> duduclaw_core:
                 .pointer("/tool_input/command")
                 .and_then(|v| v.as_str())
             else {
-                return Ok(());
+                return None;
             };
             let sentinel = duduclaw_core::check_bash_command(command, &home);
             if !sentinel.is_allowed() {
                 sentinel
             } else {
-                duduclaw_core::check_bash_protected_write(command, &home, &caller)
+                let protected = duduclaw_core::check_bash_protected_write(command, &home, &caller);
+                if !protected.is_allowed() {
+                    protected
+                } else {
+                    bash_reserved_agent_create(command, &home, &caller).unwrap_or(protected)
+                }
             }
         }
         // Other tool calls (Read, Grep, WebSearch, etc.) are none of our business.
-        _ => return Ok(()),
+        _ => return None,
     };
+    Some(decision)
+}
 
-    if let Some(msg) = decision.block_message() {
-        eprintln!("{msg}");
-        // Exit 2 — Claude Code interprets this as a block and surfaces
-        // stderr back to the agent so the model learns to retry with
-        // the `create_agent` MCP tool instead.
-        std::process::exit(2);
+/// Removed-name reservation, Bash lane: refuse `duduclaw agent create <name>`
+/// from an agent-identified caller when `<name>` is reserved
+/// (`duduclaw_core::agent_trash`).
+///
+/// Why here and not only in `scaffold_agent_dir`: that check keys on the
+/// identity env vars, and a Claude-runtime employee's Bash children do not
+/// carry them (the identity lives in `.mcp.json`; this hook learns its caller
+/// from the `--agent` flag baked into its own command). Every non-flag word
+/// after `agent create` in the same shell segment is checked, so a flag placed
+/// before the name does not hide it; over-blocking a display name that happens
+/// to equal a reserved id is accepted. A speed bump like the rest of the Bash
+/// lane: `x=agent; duduclaw $x create …`, an alias, or another binary name
+/// evades it, and pack/expert install and `migrate-from` take their names from
+/// a manifest, not the command line.
+fn bash_reserved_agent_create(
+    command: &str,
+    home: &std::path::Path,
+    caller: &duduclaw_core::HookCaller,
+) -> Option<duduclaw_core::GuardDecision> {
+    let duduclaw_core::HookCaller::Agent(caller_id) = caller else {
+        return None;
+    };
+    let lowered = command.to_ascii_lowercase();
+    for segment in lowered.split(|c: char| matches!(c, ';' | '&' | '|' | '\n' | '(' | ')' | '`')) {
+        let tokens: Vec<&str> = segment
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c: char| matches!(c, '\'' | '"')))
+            .collect();
+        let Some(bin_at) = tokens.iter().position(|t| {
+            let base = t.rsplit(['/', '\\']).next().unwrap_or(t);
+            base == "duduclaw" || base == "duduclaw.exe"
+        }) else {
+            continue;
+        };
+        let rest = &tokens[bin_at + 1..];
+        let Some(verb_at) = rest.windows(2).position(|w| w[0] == "agent" && w[1] == "create") else {
+            continue;
+        };
+        // The positional `<name>`: every `agent create` flag is a long flag
+        // that takes a value, so `--flag value` skips two words and
+        // `--flag=value` one.
+        let mut args = rest[verb_at + 2..].iter();
+        let mut name = None;
+        while let Some(word) = args.next() {
+            if word.starts_with('-') {
+                if !word.contains('=') {
+                    args.next();
+                }
+                continue;
+            }
+            name = Some(*word);
+            break;
+        }
+        if let Some(word) = name {
+            if !duduclaw_core::is_valid_agent_id(word) {
+                continue;
+            }
+            let reservation = duduclaw_core::agent_trash::check_name_reserved_for_ai(home, word);
+            if reservation.is_reserved() {
+                duduclaw_security::audit::log_agent_name_reserved(
+                    home,
+                    caller_id,
+                    word,
+                    "cli_bash_agent_create",
+                    reservation.as_str(),
+                );
+                return Some(duduclaw_core::GuardDecision::BlockedReservedAgentName {
+                    caller: caller_id.clone(),
+                    name: word.to_string(),
+                });
+            }
+        }
     }
-
-    Ok(())
+    None
 }
 
 /// `duduclaw hook data-file-guard` — RFC-23 §14.4 PreToolUse hook.
@@ -6317,6 +6545,54 @@ mod resolve_hook_caller_tests {
             msg.contains("找不到"),
             "expected arg validation, got: {msg}"
         );
+    }
+
+    fn scaffold_for(name: &str) -> super::AgentScaffold {
+        super::AgentScaffold {
+            name: name.to_string(),
+            display_name: name.to_string(),
+            role: "specialist".to_string(),
+            reports_to: String::new(),
+            icon: "x".to_string(),
+            trigger: format!("@{name}"),
+            provider: duduclaw_core::types::RuntimeType::Claude,
+            model_preferred: None,
+            soul_body: None,
+        }
+    }
+
+    /// Every CLI creation path (`agent create`, pack/expert install,
+    /// `migrate-from`) scaffolds through `scaffold_agent_dir`; inside an agent
+    /// session a removed name is reserved there, and the refusal is audited.
+    #[tokio::test]
+    async fn scaffold_refuses_removed_name_inside_an_agent_session() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("agents/_trash/writer_20261002101010")).unwrap();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_ID, "ceo");
+        }
+        let res = super::scaffold_agent_dir(home.path(), &scaffold_for("writer")).await;
+        clear_env();
+
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("已被移除") && msg.contains("儀表板"), "{msg}");
+        assert!(!home.path().join("agents/writer").exists());
+        let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("agent_name_reserved") && audit.contains("cli_scaffold"), "{audit}");
+    }
+
+    #[tokio::test]
+    async fn scaffold_allows_removed_name_for_an_operator_terminal() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("agents/_trash/writer_20261002101010")).unwrap();
+        let res = super::scaffold_agent_dir(home.path(), &scaffold_for("writer")).await;
+        assert!(res.is_ok(), "{res:?}");
+        assert!(home.path().join("agents/writer/agent.toml").exists());
     }
 }
 
@@ -8205,6 +8481,105 @@ async fn cmd_status() -> duduclaw_core::error::Result<()> {
     Ok(())
 }
 
+/// `duduclaw doctor` row for the per-agent task sandbox: Docker reachable,
+/// sandbox image present locally (never pulled), which agents enable the
+/// sandbox, and a warning for any of them with `network_access = false`
+/// (the AI inside could not reach its model provider). Shares the probe with
+/// `duduclaw_gateway::task_sandbox::doctor`.
+async fn task_sandbox_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    use duduclaw_gateway::task_sandbox::doctor::{Level, check};
+    let (level, message) = check(home).await;
+    let status = match level {
+        Level::Pass => CheckStatus::Pass,
+        Level::Warn => CheckStatus::Warn,
+    };
+    ("任務沙箱".to_string(), status, message)
+}
+
+/// `duduclaw doctor` row for computer use: which container image a session
+/// would run (`config.toml [computer_use] image`, else the versioned
+/// published image), whether it is present locally (never pulled), which
+/// employees have `[capabilities] computer_use = true`, and which are still
+/// set to the removed `computer_use_mode = "native"`. Shares the probe with
+/// `duduclaw_gateway::computer_use_image`.
+async fn computer_use_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    use duduclaw_gateway::task_sandbox::doctor::Level;
+    let (level, message) = duduclaw_gateway::computer_use_image::check(home).await;
+    let status = match level {
+        Level::Pass => CheckStatus::Pass,
+        Level::Warn => CheckStatus::Warn,
+    };
+    ("電腦操作".to_string(), status, message)
+}
+
+/// Pure half of [`deprecated_runtime_check`]: one finding per agent field
+/// (`provider` / `fallback`) whose value is a deprecated runtime. Input rows
+/// are `(agent name, [runtime] provider, [runtime] fallback)` as written.
+/// Unknown values are not this check's business (the runtime reader already
+/// logs them loudly) and are skipped.
+fn deprecated_runtime_findings(
+    agents: &[(String, Option<String>, Option<String>)],
+) -> Vec<String> {
+    use duduclaw_core::types::RuntimeType;
+    let mut out = Vec::new();
+    for (name, provider, fallback) in agents {
+        for (field, value) in [("provider", provider), ("fallback", fallback)] {
+            let Some(rt) = value.as_deref().and_then(RuntimeType::parse) else {
+                continue;
+            };
+            if let Some(dep) = rt.deprecation() {
+                out.push(format!(
+                    "{name}: [runtime] {field} = \"{}\" → 改成 \"{}\"（{} 移除）",
+                    rt.as_str(),
+                    dep.replacement,
+                    dep.remove_in
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// `duduclaw doctor` row (R1, 2026-10): agents whose `[runtime] provider` or
+/// `fallback` names a deprecated runtime. Reports, never rewrites — the value
+/// still works until the removal version.
+async fn deprecated_runtime_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let name = "已棄用的 runtime".to_string();
+    let pass = || (name.clone(), CheckStatus::Pass, "沒有員工使用已棄用的 runtime".to_string());
+    // No agents directory at all is an empty roster (nothing can be
+    // deprecated); any other problem reading it stays a warning.
+    match std::fs::symlink_metadata(home.join("agents")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return pass(),
+        _ => {}
+    }
+    let mut registry = duduclaw_agent::registry::AgentRegistry::new(home.join("agents"));
+    if let Err(e) = registry.scan().await {
+        return (name, CheckStatus::Warn, format!("無法讀取 AI 員工清單：{e}"));
+    }
+    let mut rows: Vec<(String, Option<String>, Option<String>)> = registry
+        .list()
+        .into_iter()
+        .map(|a| {
+            (
+                a.config.agent.name.clone(),
+                a.config.runtime.provider.clone(),
+                a.config.runtime.fallback.clone(),
+            )
+        })
+        .collect();
+    rows.sort();
+    let findings = deprecated_runtime_findings(&rows);
+    if findings.is_empty() {
+        return pass();
+    }
+    let mut lines = findings;
+    lines.push(format!(
+        "設定仍可運作，移除版本前請遷移，步驟見 {}",
+        duduclaw_core::runtime_catalog::DEPRECATIONS_DOC
+    ));
+    (name, CheckStatus::Warn, lines.join("\n         "))
+}
+
 /// `duduclaw doctor`
 /// WP22 T1 — the `duduclaw doctor` row for organisational-authority drift.
 ///
@@ -8840,6 +9215,15 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
         }
     }
 
+    // Check 4b: task sandbox prerequisites + sandbox-enabled agents.
+    checks.push(task_sandbox_check(&home).await);
+
+    // Check 4b-2: computer-use image + employees that use computer use.
+    checks.push(computer_use_check(&home).await);
+
+    // Check 4c: agents on a deprecated runtime (R1, 2026-10).
+    checks.push(deprecated_runtime_check(&home).await);
+
     // Print results
     let mut has_failure = false;
     for (name, status, message) in &checks {
@@ -9129,6 +9513,12 @@ fn parse_runtime_provider_strict(s: &str) -> Result<duduclaw_core::types::Runtim
     })
 }
 
+/// One-line operator notice for a deprecated runtime (`None` for a live
+/// one). Shared by `agent create --runtime` and `doctor`.
+fn runtime_deprecation_notice(provider: duduclaw_core::types::RuntimeType) -> Option<String> {
+    provider.deprecation().map(|d| d.notice(provider.as_str()))
+}
+
 /// Context-file names the provider's CLI reads for agent-directory context.
 ///
 /// CLAUDE.md is always scaffolded (Claude Code compatibility is a project
@@ -9206,6 +9596,29 @@ pub(crate) async fn scaffold_agent_dir(
             "Agent directory already exists: {}",
             agent_dir.display()
         )));
+    }
+
+    // Removed-name reservation for AI sessions (see
+    // `duduclaw_core::agent_trash`). Every CLI path that writes a fresh agent
+    // directory — `agent create`, `pack`/`expert install`, `migrate-from` —
+    // funnels through here, and an employee with a Bash tool can run any of
+    // them. Same session test as `org sync` (identity env present ⇒ AI); like
+    // that one it is a speed bump, since a shell can unset the variables. An
+    // operator terminal carries neither variable and is not restricted.
+    if let Some(claimed) = agent_session_identity() {
+        let reservation = duduclaw_core::agent_trash::check_name_reserved_for_ai(home, &s.name);
+        if reservation.is_reserved() {
+            duduclaw_security::audit::log_agent_name_reserved(
+                home,
+                &claimed,
+                &s.name,
+                "cli_scaffold",
+                reservation.as_str(),
+            );
+            return Err(DuDuClawError::Agent(
+                duduclaw_core::agent_trash::name_reserved_message(&s.name, reservation),
+            ));
+        }
     }
 
     // Create directory structure
@@ -9417,6 +9830,10 @@ async fn cmd_agent_create(
             .map_err(|e| DuDuClawError::Agent(format!("--runtime: {e}")))?,
         None => duduclaw_core::types::RuntimeType::Claude,
     };
+    // R1 (2026-10): a deprecated runtime is still accepted; say so once.
+    if let Some(notice) = runtime_deprecation_notice(provider) {
+        eprintln!("{} {notice}", style("deprecated:").yellow());
+    }
 
     if !is_valid_agent_id(&agent_name) {
         return Err(DuDuClawError::Agent(format!(
@@ -10992,6 +11409,191 @@ mod account_credential_row_tests {
     }
 }
 
+/// `duduclaw doctor`'s task-sandbox row.
+#[cfg(test)]
+mod task_sandbox_doctor_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn doctor_task_sandbox_row_passes_without_sandboxed_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (name, status, detail) = task_sandbox_check(tmp.path()).await;
+        assert_eq!(name, "任務沙箱");
+        assert_eq!(status, CheckStatus::Pass, "{detail}");
+        assert!(detail.contains("沒有員工開啟任務沙箱"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn doctor_task_sandbox_row_warns_on_an_offline_sandboxed_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents/evaluator");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = include_str!("../../../templates/evaluator/agent.toml")
+            .replace("sandbox_enabled = false", "sandbox_enabled = true");
+        std::fs::write(dir.join("agent.toml"), raw).unwrap();
+        let (_, status, detail) = task_sandbox_check(tmp.path()).await;
+        assert_eq!(status, CheckStatus::Warn, "{detail}");
+        assert!(detail.contains("network_access = false") && detail.contains("evaluator"), "{detail}");
+        assert!(
+            detail.contains(duduclaw_gateway::task_sandbox::doctor::HOST_PATHS_NOTE),
+            "{detail}"
+        );
+    }
+}
+
+/// `duduclaw doctor`'s computer-use row.
+#[cfg(test)]
+mod computer_use_doctor_tests {
+    use super::*;
+
+    fn write_agent(home: &std::path::Path, name: &str, computer_use: bool) {
+        let dir = home.join("agents").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = include_str!("../../../templates/evaluator/agent.toml")
+            .replacen("name = \"evaluator\"", &format!("name = \"{name}\""), 1);
+        let raw = if computer_use {
+            raw.replacen("computer_use = false", "computer_use = true", 1)
+        } else {
+            raw
+        };
+        std::fs::write(dir.join("agent.toml"), raw).unwrap();
+    }
+
+    #[tokio::test]
+    async fn doctor_computer_use_row_passes_without_computer_use_employees() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(tmp.path(), "evaluator", false);
+        let (name, status, detail) = computer_use_check(tmp.path()).await;
+        assert_eq!(name, "電腦操作");
+        assert_eq!(status, CheckStatus::Pass, "{detail}");
+        assert!(detail.contains("沒有員工開啟電腦操作"), "{detail}");
+        assert!(
+            detail.contains(&duduclaw_gateway::computer_use_image::default_image()),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_computer_use_row_warns_when_the_image_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(tmp.path(), "operator-bot", true);
+        // A tag that cannot exist locally: the image is absent (or Docker is
+        // unreachable); both are a Warn for an employee that uses it.
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[computer_use]\nimage = \"duduclaw-doctor-test/absent:never\"\n",
+        )
+        .unwrap();
+        let (_, status, detail) = computer_use_check(tmp.path()).await;
+        assert_eq!(status, CheckStatus::Warn, "{detail}");
+        assert!(detail.contains("operator-bot"), "{detail}");
+        assert!(
+            detail.contains("docker pull duduclaw-doctor-test/absent:never")
+                || detail.contains("Docker 無法連線"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_computer_use_row_reports_each_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(tmp.path(), "nav-bot", true);
+        write_agent(tmp.path(), "plain-bot", true);
+        let path = tmp.path().join("agents/nav-bot/agent.toml");
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("\n[capabilities.computer_use_config]\nallowed_domains = [\"example.com\", \"docs.example.com\", \"*.bad.example\"]\n");
+        std::fs::write(&path, raw).unwrap();
+        let (_, _, detail) = computer_use_check(tmp.path()).await;
+        assert!(detail.contains("nav-bot 可開啟 2 個網域（另有 1 個項目"), "{detail}");
+        assert!(detail.contains("plain-bot 沒有可用的網域"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn doctor_computer_use_row_warns_on_an_invalid_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(tmp.path(), "operator-bot", true);
+        std::fs::write(tmp.path().join("config.toml"), "[computer_use]\nimage = \"-v\"\n").unwrap();
+        let (_, status, detail) = computer_use_check(tmp.path()).await;
+        assert_eq!(status, CheckStatus::Warn, "{detail}");
+        assert!(detail.contains("[computer_use] 設定無效"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn doctor_computer_use_row_names_employees_still_set_to_native() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(tmp.path(), "desk-bot", true);
+        write_agent(tmp.path(), "plain-bot", true);
+        let path = tmp.path().join("agents/desk-bot/agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let raw = raw.replacen("[capabilities]\n", "[capabilities]\ncomputer_use_mode = \"native\"\n", 1);
+        assert!(raw.contains("computer_use_mode = \"native\""), "template has no [capabilities] line");
+        std::fs::write(&path, raw).unwrap();
+        let (_, status, detail) = computer_use_check(tmp.path()).await;
+        assert_eq!(status, CheckStatus::Warn, "{detail}");
+        assert!(detail.contains("computer_use_mode = \"native\"：desk-bot。"), "{detail}");
+        assert!(detail.contains("已移除"), "{detail}");
+        assert!(!detail.contains("：desk-bot, plain-bot。"), "{detail}");
+    }
+}
+
+/// R1 (2026-10) — `duduclaw doctor`'s deprecated-runtime row and the
+/// `agent create --runtime gemini` notice.
+#[cfg(test)]
+mod deprecated_runtime_doctor_tests {
+    use super::*;
+
+    #[test]
+    fn doctor_findings_list_only_deprecated_provider_and_fallback() {
+        let rows = vec![
+            ("a".to_string(), Some("gemini".to_string()), None),
+            ("b".to_string(), Some("claude".to_string()), Some("gemini".to_string())),
+            ("c".to_string(), Some("antigravity".to_string()), Some("codex".to_string())),
+            ("d".to_string(), Some("nonsense".to_string()), None),
+            ("e".to_string(), None, None),
+        ];
+        let f = deprecated_runtime_findings(&rows);
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f[0].starts_with("a: [runtime] provider = \"gemini\""), "{f:?}");
+        assert!(f[1].starts_with("b: [runtime] fallback = \"gemini\""), "{f:?}");
+        assert!(f.iter().all(|l| l.contains("antigravity") && l.contains("v1.69.0")));
+    }
+
+    #[tokio::test]
+    async fn doctor_deprecated_runtime_row_passes_on_an_empty_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (name, status, detail) = deprecated_runtime_check(tmp.path()).await;
+        assert_eq!(name, "已棄用的 runtime");
+        assert_eq!(status, CheckStatus::Pass, "{detail}");
+    }
+
+    #[tokio::test]
+    async fn doctor_deprecated_runtime_row_warns_on_a_gemini_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents/evaluator");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = format!(
+            "{}\n[runtime]\nprovider = \"gemini\"\n",
+            include_str!("../../../templates/evaluator/agent.toml")
+        );
+        std::fs::write(dir.join("agent.toml"), raw).unwrap();
+        let (_, status, detail) = deprecated_runtime_check(tmp.path()).await;
+        assert_eq!(status, CheckStatus::Warn, "{detail}");
+        assert!(detail.contains("evaluator") && detail.contains("gemini"), "{detail}");
+        assert!(detail.contains("docs/guides/deprecations.md"), "{detail}");
+    }
+
+    #[test]
+    fn agent_create_notice_only_for_deprecated_runtimes() {
+        use duduclaw_core::types::RuntimeType;
+        let n = runtime_deprecation_notice(RuntimeType::Gemini).expect("gemini warns");
+        assert!(n.contains("antigravity") && n.contains("v1.69.0"), "{n}");
+        assert!(runtime_deprecation_notice(RuntimeType::Antigravity).is_none());
+        assert!(runtime_deprecation_notice(RuntimeType::Claude).is_none());
+        // Still accepted by the strict parser.
+        assert_eq!(parse_runtime_provider_strict("gemini").unwrap(), RuntimeType::Gemini);
+    }
+}
+
 /// WP22 T1 — `duduclaw doctor`'s organisational-authority row + `org sync`.
 #[cfg(test)]
 mod org_authority_tests {
@@ -11789,5 +12391,221 @@ mod cli_verb_consolidation_tests {
             !about.trim().is_empty(),
             "`duduclaw wizard` must have an about string in --help"
         );
+    }
+}
+
+#[cfg(test)]
+mod discovery_survival_cli_tests {
+    use super::*;
+    #[test]
+    fn discovery_survival_uses_the_documented_knobs_command_and_report_options() {
+        let cli = Cli::try_parse_from(["duduclaw", "knobs", "survival", "--days", "14",
+            "--agent", "worker", "--format", "json"]).expect("documented operator command must parse");
+        assert!(is_read_only_survival_command(&cli.command));
+        match cli.command {
+            Commands::Maintenance(MaintenanceCommands::Knobs { command: KnobsCommands::Survival {
+                days, agent, output, format } }) => {
+                assert_eq!(days, 14);
+                assert_eq!(agent.as_deref(), Some("worker"));
+                assert!(output.is_none());
+                assert_eq!(format, "json");
+            }
+            _ => panic!("knobs survival was routed to a different command"),
+        }
+    }
+}
+
+/// Contract lock — the agent-file-guard hook's per-tool decision for
+/// `CONTRACT.toml`, end to end through [`agent_file_guard_decision`].
+#[cfg(test)]
+mod contract_lock_hook_tests {
+    use super::*;
+    use duduclaw_core::{GuardDecision, HookCaller};
+    use serde_json::json;
+
+    fn home() -> std::path::PathBuf {
+        std::path::PathBuf::from("/Users/alice/.duduclaw")
+    }
+
+    fn agent(id: &str) -> HookCaller {
+        HookCaller::Agent(id.to_string())
+    }
+
+    fn file_envelope(tool: &str, path: &std::path::Path) -> serde_json::Value {
+        let p = path.to_string_lossy();
+        match tool {
+            "Write" => json!({"tool_name": "Write", "tool_input": {"file_path": p, "content": ""}}),
+            "Edit" => json!({"tool_name": "Edit", "tool_input": {
+                "file_path": p, "old_string": "must_not", "new_string": "x"}}),
+            _ => json!({"tool_name": "MultiEdit", "tool_input": {
+                "file_path": p, "edits": [{"old_string": "must_not", "new_string": "x"}]}}),
+        }
+    }
+
+    fn decide(tool: &str, env: &serde_json::Value, caller: &HookCaller) -> GuardDecision {
+        agent_file_guard_decision(tool, env, &home(), caller).expect("hook must judge this call")
+    }
+
+    #[test]
+    fn own_contract_write_is_blocked_for_write_edit_and_multiedit() {
+        let path = home().join("agents/sales-rep/CONTRACT.toml");
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            let d = decide(tool, &file_envelope(tool, &path), &agent("sales-rep"));
+            assert!(
+                matches!(d, GuardDecision::BlockedOwnContractWrite { ref caller, .. } if caller == "sales-rep"),
+                "{tool}: {d:?}"
+            );
+            let msg = d.block_message().unwrap();
+            assert!(msg.contains("CONTRACT.toml") && msg.contains("儀表板"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn own_contract_write_is_blocked_for_bash() {
+        for cmd in [
+            "echo '' > CONTRACT.toml",
+            "rm CONTRACT.toml",
+            "sed -i '' '/must_not/d' contract.toml",
+            "cat x > /Users/alice/.duduclaw/agents/sales-rep/CONTRACT.toml",
+        ] {
+            let env = json!({"tool_name": "Bash", "tool_input": {"command": cmd}});
+            let d = decide("Bash", &env, &agent("sales-rep"));
+            assert!(matches!(d, GuardDecision::BlockedOwnContractWrite { .. }), "{cmd}: {d:?}");
+        }
+        // Reading it stays allowed.
+        let env = json!({"tool_name": "Bash", "tool_input": {"command": "cat CONTRACT.toml"}});
+        assert!(decide("Bash", &env, &agent("sales-rep")).is_allowed());
+    }
+
+    #[test]
+    fn foreign_contract_write_stays_on_the_cross_agent_rule() {
+        let path = home().join("agents/ceo/CONTRACT.toml");
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            let d = decide(tool, &file_envelope(tool, &path), &agent("sales-rep"));
+            assert!(matches!(d, GuardDecision::BlockedForeignAgentDir { ref owner, .. } if owner == "ceo"), "{tool}: {d:?}");
+        }
+        let env = json!({"tool_name": "Bash", "tool_input": {
+            "command": "echo x > /Users/alice/.duduclaw/agents/ceo/CONTRACT.toml"}});
+        assert!(matches!(
+            decide("Bash", &env, &agent("sales-rep")),
+            GuardDecision::BlockedForeignAgentDir { .. }
+        ));
+    }
+
+    #[test]
+    fn operator_without_agent_identity_is_unaffected_by_the_contract_lock() {
+        let path = home().join("agents/sales-rep/CONTRACT.toml");
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            let d = decide(tool, &file_envelope(tool, &path), &HookCaller::Absent);
+            assert!(d.is_allowed(), "{tool}: {d:?}");
+        }
+        let env = json!({"tool_name": "Bash", "tool_input": {"command": "echo x > CONTRACT.toml"}});
+        assert!(decide("Bash", &env, &HookCaller::Absent).is_allowed());
+    }
+
+    #[test]
+    fn soul_md_behaviour_is_unchanged_next_to_the_contract_lock() {
+        let soul = home().join("agents/sales-rep/SOUL.md");
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            let d = decide(tool, &file_envelope(tool, &soul), &agent("sales-rep"));
+            assert!(matches!(d, GuardDecision::BlockedOwnSoulWrite { .. }), "{tool}: {d:?}");
+            assert!(d.block_message().unwrap().contains("can_modify_own_soul"));
+        }
+        let env = json!({"tool_name": "Bash", "tool_input": {"command": "echo x > SOUL.md"}});
+        assert!(matches!(decide("Bash", &env, &agent("sales-rep")), GuardDecision::BlockedOwnSoulWrite { .. }));
+        // Other own files are still writable.
+        let notes = home().join("agents/sales-rep/MEMORY.md");
+        assert!(decide("Write", &file_envelope("Write", &notes), &agent("sales-rep")).is_allowed());
+    }
+}
+
+#[cfg(test)]
+mod removed_name_hook_tests {
+    //! Removed-name reservation through the real `agent-file-guard` decision:
+    //! the `_trash` area is not AI-writable, and `duduclaw agent create
+    //! <reserved>` from an employee's Bash is refused (the CLI's own env-based
+    //! check is inert for Claude-runtime employees, whose Bash children carry
+    //! no identity env).
+    use super::*;
+    use duduclaw_core::{GuardDecision, HookCaller};
+    use serde_json::json;
+
+    fn agent(id: &str) -> HookCaller {
+        HookCaller::Agent(id.to_string())
+    }
+
+    fn bash(cmd: &str) -> serde_json::Value {
+        json!({"tool_name": "Bash", "tool_input": {"command": cmd}})
+    }
+
+    fn home_with_trash() -> tempfile::TempDir {
+        let h = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(h.path().join("agents/_trash/writer_20261002101010")).unwrap();
+        std::fs::create_dir_all(h.path().join("agents/ceo")).unwrap();
+        h
+    }
+
+    #[test]
+    fn write_tools_into_trash_are_blocked() {
+        let h = home_with_trash();
+        let p = h.path().join("agents/_trash/writer_20261002101010/CONTRACT.toml");
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            let env = json!({"tool_name": tool, "tool_input": {
+                "file_path": p.to_string_lossy(), "content": "", "old_string": "a", "new_string": "b",
+                "edits": [{"old_string": "a", "new_string": "b"}]}});
+            let d = agent_file_guard_decision(tool, &env, h.path(), &agent("ceo")).unwrap();
+            assert!(matches!(d, GuardDecision::BlockedRemovedAgentArea { .. }), "{tool}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn bash_rm_of_trash_is_blocked() {
+        let h = home_with_trash();
+        for cmd in ["rm -rf ../_trash/writer_20261002101010", "rm -rf ~/.duduclaw/agents/_trash"] {
+            let d = agent_file_guard_decision("Bash", &bash(cmd), h.path(), &agent("ceo")).unwrap();
+            assert!(matches!(d, GuardDecision::BlockedRemovedAgentArea { .. }), "{cmd}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn bash_cli_create_of_reserved_name_is_blocked_and_audited() {
+        let h = home_with_trash();
+        for cmd in [
+            "duduclaw agent create writer",
+            "/opt/homebrew/bin/duduclaw agent create --role pm writer",
+            "cd /tmp && duduclaw agent create --display-name=Writer \"writer\"",
+        ] {
+            let d = agent_file_guard_decision("Bash", &bash(cmd), h.path(), &agent("ceo")).unwrap();
+            assert!(
+                matches!(d, GuardDecision::BlockedReservedAgentName { ref name, .. } if name == "writer"),
+                "{cmd}: {d:?}"
+            );
+            let msg = d.block_message().unwrap();
+            assert!(msg.contains("儀表板") && !msg.contains("_trash"), "{msg}");
+        }
+        let audit = std::fs::read_to_string(h.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("agent_name_reserved") && audit.contains("cli_bash_agent_create"));
+    }
+
+    #[test]
+    fn bash_cli_create_of_other_names_and_operators_pass() {
+        let h = home_with_trash();
+        for cmd in [
+            "duduclaw agent create writer2",
+            "duduclaw agent create bob --reports-to writer",
+            "duduclaw agent list",
+            "echo writer",
+        ] {
+            let d = agent_file_guard_decision("Bash", &bash(cmd), h.path(), &agent("ceo")).unwrap();
+            assert!(d.is_allowed(), "{cmd}: {d:?}");
+        }
+        let d = agent_file_guard_decision(
+            "Bash",
+            &bash("duduclaw agent create writer"),
+            h.path(),
+            &HookCaller::Absent,
+        )
+        .unwrap();
+        assert!(d.is_allowed(), "{d:?}");
     }
 }

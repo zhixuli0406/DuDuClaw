@@ -135,6 +135,9 @@ pub mod security_autopilot;
 pub mod security_rules_seed;
 pub mod takeover;
 pub mod task_store;
+/// Per-agent task sandbox (`[container] sandbox_enabled`), built on the
+/// Discovery attempt-container blocks.
+pub mod task_sandbox;
 pub mod tick_config;
 pub mod tick_headers;
 pub mod tick_source;
@@ -167,6 +170,8 @@ pub mod delegation;
 pub mod delegation_gate;
 pub mod delegation_router;
 pub mod direct_api;
+/// B0-1 exploration-tree ledger, replay simulator and policy protocol (offline only).
+pub mod discovery;
 pub mod discord;
 pub mod discord_voice;
 pub mod dispatcher;
@@ -228,7 +233,9 @@ pub mod ccr_runtime;
 pub mod channel_sender;
 pub mod chat_commands;
 pub mod computer_use;
+pub mod computer_use_image;
 pub mod computer_use_orchestrator;
+pub mod computer_use_sessions;
 pub mod decision_brief;
 pub mod decision_calibration;
 pub mod decision_dashboard;

@@ -9,6 +9,8 @@ pub(crate) fn task_row_to_json(row: &duduclaw_gateway::task_store::TaskRow) -> V
         .collect();
     serde_json::json!({
         "id": row.id,
+        "kind": row.kind,
+        "discovery_run_id": row.discovery_run_id,
         "title": row.title,
         "description": row.description,
         "status": row.status,
@@ -132,6 +134,12 @@ pub(crate) async fn handle_tasks_create(args: &Value, home_dir: &Path, default_a
         Ok(k) => k,
         Err(e) => return tool_error(&e),
     };
+    if kind == crate::mcp_alias::TaskKind::Discovery {
+        if args.get("schedule").is_some_and(|value| !value.is_null()) {
+            return tool_error("discovery cannot be scheduled through ordinary task workers");
+        }
+        return handle_discovery_create(args, home_dir, default_agent).await;
+    }
     let schedule = match args.get("schedule") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(raw)) => match crate::mcp_alias::classify_schedule(raw) {

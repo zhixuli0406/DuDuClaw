@@ -601,15 +601,23 @@ pub fn collect_review_pairs(
     if !has_excerpt {
         return Ok(Vec::new());
     }
+    // Older accepted rows carry no `worker_excerpt`; the accepted output
+    // survives in `tasks.result_summary`, so fall back to it for the chosen
+    // side. Both columns are selected and the choice is made in Rust so the
+    // fallback goes through the same excerpt bound as a stored excerpt — an
+    // untruncated chosen text against a bounded rejected excerpt would bias
+    // the pair toward "longer is better".
     let mut stmt = conn
         .prepare(
             "SELECT t.id, t.title, t.description, t.assigned_to,
                     COALESCE(t.completed_at, t.updated_at),
-                    acc.worker_excerpt, rej.worker_excerpt
+                    acc.worker_excerpt,
+                    t.result_summary,
+                    rej.worker_excerpt
              FROM tasks t
              JOIN task_iterations acc
                ON acc.task_id = t.id AND acc.verdict = 'accepted'
-              AND COALESCE(acc.worker_excerpt, '') <> ''
+              AND COALESCE(NULLIF(acc.worker_excerpt, ''), t.result_summary, '') <> ''
              JOIN task_iterations rej
                ON rej.task_id = t.id AND rej.verdict = 'rejected'
               AND COALESCE(rej.worker_excerpt, '') <> ''
@@ -626,14 +634,19 @@ pub fn collect_review_pairs(
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
             ))
         })
         .map_err(|e| io_err(tasks_db, e))?
         .filter_map(std::result::Result::ok)
-        .filter(|(_, _, _, agent, ts, _, _)| {
+        .filter(|(_, _, _, agent, ts, _, _, _)| {
             sources.matches_agent(agent) && sources.after_since(ts)
+        })
+        .filter_map(|(id, title, desc, agent, ts, acc_excerpt, summary, rejected)| {
+            let chosen = accepted_text(acc_excerpt.as_deref(), summary.as_deref())?;
+            Some((id, title, desc, agent, ts, chosen, rejected))
         })
         .map(|(_, title, desc, _, _, chosen, rejected)| PreferencePair {
             source: "task_review".to_string(),
@@ -647,6 +660,16 @@ pub fn collect_review_pairs(
         })
         .collect();
     Ok(rows)
+}
+
+/// The chosen side of a review pair: the accepted round's stored excerpt when
+/// present, else the task's `result_summary` bounded by the same shared
+/// excerpt rule (`goal_loop::state::worker_excerpt`, char-boundary safe).
+fn accepted_text(acc_excerpt: Option<&str>, result_summary: Option<&str>) -> Option<String> {
+    // Re-applying the rule to a stored excerpt is idempotent; it also keeps a
+    // hand-edited or pre-bound row from escaping the bound.
+    use crate::goal_loop::state::worker_excerpt;
+    worker_excerpt(acc_excerpt).or_else(|| worker_excerpt(result_summary))
 }
 
 // ─────────────────────────── dataset CRUD ───────────────────────────
@@ -1331,6 +1354,93 @@ mod tests {
         assert_eq!(pairs[0].chosen, "全部對上");
         assert_eq!(pairs[0].rejected, "漏了三筆");
         assert!(pairs[0].prompt.starts_with("對帳"));
+    }
+
+    fn review_db(
+        dir: &tempfile::TempDir,
+        summary: Option<&str>,
+        acc_excerpt: Option<&str>,
+    ) -> std::path::PathBuf {
+        let db = dir.path().join("tasks.db");
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, description TEXT, status TEXT,
+                 assigned_to TEXT, created_at TEXT, updated_at TEXT, completed_at TEXT,
+                 result_summary TEXT);
+             CREATE TABLE task_iterations (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT,
+                 round INTEGER, dispatched_at TEXT, verdict TEXT, worker_excerpt TEXT);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO tasks VALUES ('t1','對帳','八月發票','done','finance',
+                 '2026-09-01T00:00:00Z','2026-09-02T00:00:00Z','2026-09-02T00:00:00Z',?1)",
+            [summary],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_iterations (task_id,round,dispatched_at,verdict,worker_excerpt)
+             VALUES ('t1',1,'2026-09-01T00:00:00Z','rejected','漏了三筆')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_iterations (task_id,round,dispatched_at,verdict,worker_excerpt)
+             VALUES ('t1',2,'2026-09-01T01:00:00Z','accepted',?1)",
+            [acc_excerpt],
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn review_pairs_fall_back_to_result_summary_when_accepted_excerpt_empty() {
+        for excerpt in [None, Some("")] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = review_db(&dir, Some("最終對帳結果"), excerpt);
+            let pairs = collect_review_pairs(&db, &DatasetSources::default()).unwrap();
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].chosen, "最終對帳結果");
+            assert_eq!(pairs[0].rejected, "漏了三筆");
+        }
+    }
+
+    #[test]
+    fn review_pairs_prefer_accepted_excerpt_over_result_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = review_db(&dir, Some("最終對帳結果"), Some("驗收輪節錄"));
+        let pairs = collect_review_pairs(&db, &DatasetSources::default()).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].chosen, "驗收輪節錄");
+    }
+
+    #[test]
+    fn review_pairs_bound_result_summary_fallback_to_the_excerpt_rule() {
+        use crate::goal_loop::state::WORKER_EXCERPT_MAX_BYTES;
+        // 3-byte CJK chars; 500 is not a multiple of 3, so a raw byte cut
+        // would land mid-char.
+        let long = "對".repeat(400);
+        let dir = tempfile::tempdir().unwrap();
+        let db = review_db(&dir, Some(&long), None);
+        let pairs = collect_review_pairs(&db, &DatasetSources::default()).unwrap();
+        assert_eq!(pairs.len(), 1);
+        let chosen = &pairs[0].chosen;
+        assert!(chosen.len() <= WORKER_EXCERPT_MAX_BYTES);
+        assert_eq!(chosen.len(), (WORKER_EXCERPT_MAX_BYTES / 3) * 3);
+        assert!(chosen.chars().all(|c| c == '對'));
+        assert_eq!(
+            Some(chosen.clone()),
+            crate::goal_loop::state::worker_excerpt(Some(&long))
+        );
+    }
+
+    #[test]
+    fn review_pairs_skip_when_no_accepted_text_anywhere() {
+        for summary in [None, Some("")] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = review_db(&dir, summary, None);
+            let pairs = collect_review_pairs(&db, &DatasetSources::default()).unwrap();
+            assert!(pairs.is_empty());
+        }
     }
 
     fn seed_approvals(path: &Path) {

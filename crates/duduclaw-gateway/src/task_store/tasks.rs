@@ -174,6 +174,10 @@ impl TaskStore {
     }
 
     pub async fn insert_task(&self, row: &TaskRow) -> Result<(), String> {
+        if row.kind == TaskKind::Discovery && (row.goal_mode || row.discovery_run_id.is_none() || row.discovery_spec_json.is_none()) {
+            return Err("discovery requires a frozen specification and dedicated run identity".into());
+        }
+        let kind = if row.kind == TaskKind::Task && row.goal_mode { TaskKind::Goal } else { row.kind };
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO tasks
@@ -185,10 +189,10 @@ impl TaskStore {
                  goal_id, lease_renewed_at, source_channel, source_chat_id,
                  revision_round, diminishing, agent_seconds, source_discord_guild_id,
                  deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason,
-                 plan_pending, archived, pinned, team_spec_json)
+                 plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
+                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)",
             params![
                 row.id,
                 row.title,
@@ -230,6 +234,10 @@ impl TaskStore {
                 row.archived as i64,
                 row.pinned as i64,
                 row.team_spec_json,
+                kind.as_str(),
+                row.discovery_spec_json,
+                row.discovery_run_id,
+                row.discovery_approval_id,
             ],
         )
         .map_err(|e| format!("insert task: {e}"))?;
@@ -282,7 +290,7 @@ impl TaskStore {
         let conn = self.conn.lock().await;
         let n = conn
             .execute(
-                "UPDATE tasks SET assigned_to=?2, updated_at=?3 WHERE id=?1 AND assigned_to=''",
+                "UPDATE tasks SET assigned_to=?2, updated_at=?3 WHERE id=?1 AND assigned_to='' AND kind IN ('task','goal')",
                 params![id, agent_id, now],
             )
             .map_err(|e| format!("claim task: {e}"))?;
@@ -293,6 +301,8 @@ impl TaskStore {
     /// `from_agent` to `to_agent`, and follow through on any active claim/lease
     /// so the successor holds the work outright. Returns the number of tasks
     /// moved. Idempotent — a re-run finds nothing left assigned to `from_agent`.
+    /// Discovery rows are excluded: their run ledger is bound to the original
+    /// agent, and reassigning them breaks attribution for every public view.
     pub async fn reassign_open_tasks(
         &self,
         from_agent: &str,
@@ -306,7 +316,7 @@ impl TaskStore {
                     SET assigned_to = ?2,
                         claimed_by = CASE WHEN claimed_by = ?1 THEN ?2 ELSE claimed_by END,
                         updated_at = ?3
-                  WHERE assigned_to = ?1 AND status != 'done'",
+                  WHERE assigned_to = ?1 AND status != 'done' AND kind IN ('task','goal')",
                 params![from_agent, to_agent, now],
             )
             .map_err(|e| format!("reassign open tasks: {e}"))?;
@@ -367,6 +377,11 @@ impl TaskStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| format!("update task: begin: {e}"))?;
+            let kind: Option<String> = tx.query_row("SELECT kind FROM tasks WHERE id=?1", params![id], |r| r.get(0))
+                .optional().map_err(|e| e.to_string())?;
+            if kind.as_deref() == Some("discovery") {
+                return Err("discovery tasks require the dedicated lifecycle service".into());
+            }
             if let Some(deps) = &new_deps {
                 let edges = depends_edges_conn(&tx)?;
                 if introduces_dependency_cycle(&edges, id, deps) {
@@ -534,11 +549,24 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Generic delete. Discovery rows own a run ledger, frozen request,
+    /// artifacts and possibly a pending approval, so they are refused here
+    /// (same rule as [`Self::update_task`]); the kind check and the delete are
+    /// one statement, so no concurrent writer can slip a discovery row through.
     pub async fn remove_task(&self, id: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let count = conn
-            .execute("DELETE FROM tasks WHERE id = ?1", params![id])
+            .execute("DELETE FROM tasks WHERE id = ?1 AND kind <> 'discovery'", params![id])
             .map_err(|e| format!("remove task: {e}"))?;
+        if count == 0 {
+            let kind: Option<String> = conn
+                .query_row("SELECT kind FROM tasks WHERE id = ?1", params![id], |r| r.get(0))
+                .optional()
+                .map_err(|e| format!("remove task: {e}"))?;
+            if kind.is_some() {
+                return Err("discovery tasks require the dedicated lifecycle service".into());
+            }
+        }
         Ok(count > 0)
     }
 
@@ -595,5 +623,13 @@ pub(super) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         archived: row.get::<_, i64>(38)? != 0,
         pinned: row.get::<_, i64>(39)? != 0,
         team_spec_json: row.get(40)?,
+        kind: match row.get::<_, String>(41)?.as_str() {
+            "task" => TaskKind::Task, "goal" => TaskKind::Goal, "discovery" => TaskKind::Discovery,
+            value => return Err(rusqlite::Error::FromSqlConversionFailure(41, rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("unknown task kind: {value}"))))),
+        },
+        discovery_spec_json: row.get(42)?,
+        discovery_run_id: row.get(43)?,
+        discovery_approval_id: row.get(44)?,
     })
 }

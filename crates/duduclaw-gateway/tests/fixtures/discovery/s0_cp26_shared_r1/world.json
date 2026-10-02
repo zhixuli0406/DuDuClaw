@@ -1,0 +1,12 @@
+{
+  "schema": "duduclaw.discovery.world.v1",
+  "run_id": "cp26",
+  "round": 1,
+  "direction": "max",
+  "baseline_score": 2.166666667,
+  "branch_count": 4,
+  "refine_count": 3,
+  "max_parallelism": 4,
+  "policy_id": "baseline-parallel-refine",
+  "beta": 0.6
+}

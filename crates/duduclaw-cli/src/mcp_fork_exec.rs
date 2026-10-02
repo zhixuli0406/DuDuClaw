@@ -28,6 +28,9 @@ use duduclaw_fork::{
 
 use crate::mcp_fork::{ForkSettings, parse_merge_mode};
 
+#[path = "mcp_fork_recovery.rs"]
+mod recovery;
+
 // ── Account selection abstraction ───────────────────────────────────────────
 
 /// Minimal env handed to a spawned branch run.
@@ -244,6 +247,7 @@ pub struct RotatingBranchExecutor<P: AccountProvider, S: CliSpawner> {
     /// branches, enabling cross-branch pre-emption (RFC-26 §4.2). Complements
     /// `pool`'s post-completion fail-closed accounting.
     aggregate: Arc<duduclaw_fork::LiveAggregate>,
+    durable: Option<(Arc<duduclaw_fork::ForkStore>, String)>,
 }
 
 impl<P: AccountProvider, S: CliSpawner> RotatingBranchExecutor<P, S> {
@@ -254,7 +258,20 @@ impl<P: AccountProvider, S: CliSpawner> RotatingBranchExecutor<P, S> {
             spawner,
             pool: Arc::new(Pool::new(cap)),
             aggregate: Arc::new(duduclaw_fork::LiveAggregate::new(cap)),
+            durable: None,
         }
+    }
+
+    fn with_store(mut self, store: Arc<duduclaw_fork::ForkStore>, fork_id: String) -> Self {
+        self.durable = Some((store, fork_id));
+        self
+    }
+
+    fn runnable(&self, branch_id: &str) -> ForkResult<bool> {
+        if is_cancelled(branch_id) { return Ok(false); }
+        let Some((store, fork_id)) = &self.durable else { return Ok(true); };
+        Ok(store.get_fork(fork_id)?.is_some_and(|fork| !fork.resolved)
+            && store.list_branches(fork_id)?.iter().any(|branch| branch.branch_id == branch_id && branch.state == "running"))
     }
 }
 
@@ -264,7 +281,7 @@ impl<P: AccountProvider, S: CliSpawner> BranchExecutor for RotatingBranchExecuto
         self.pool.register(inv.branch_id.clone(), inv.budget_usd);
 
         // Honor a cancellation requested before the branch started.
-        if is_cancelled(&inv.branch_id.0) {
+        if !self.runnable(&inv.branch_id.0)? {
             return Ok(BranchResult {
                 id: inv.branch_id,
                 state: BranchState::Terminated,
@@ -288,6 +305,12 @@ impl<P: AccountProvider, S: CliSpawner> BranchExecutor for RotatingBranchExecuto
             }
         };
 
+        // Account selection may await long enough for another process to cancel.
+        if !self.runnable(&inv.branch_id.0)? {
+            return Ok(BranchResult { id: inv.branch_id, state: BranchState::Terminated,
+                output: "branch terminated before spawn".into(), spent_usd: 0.0, test_exit_code: None });
+        }
+
         let full_prompt = match &inv.steering {
             Some(s) if !s.trim().is_empty() => {
                 format!("{}\n\n## Strategy for this branch\n{}", inv.prompt, s)
@@ -304,10 +327,18 @@ impl<P: AccountProvider, S: CliSpawner> BranchExecutor for RotatingBranchExecuto
             budget_usd: inv.budget_usd,
             aggregate: Some(self.aggregate.clone()),
         };
-        let out = self
-            .spawner
-            .spawn(&ctx, &full_prompt, &inv.workspace, &account.env_vars)
-            .await;
+        let mut running = Box::pin(self.spawner.spawn(&ctx, &full_prompt, &inv.workspace, &account.env_vars));
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(100));
+        let out = loop {
+            tokio::select! {
+                output = &mut running => break output,
+                _ = poll.tick(), if self.durable.is_some() => {
+                    if !self.runnable(&inv.branch_id.0).unwrap_or(false) {
+                        request_cancel(&inv.branch_id.0);
+                    }
+                }
+            }
+        };
         // Stop counting this branch toward the live aggregate so its siblings'
         // combined spend drops once it has finished or been killed.
         self.aggregate.finish(&inv.branch_id.0);
@@ -315,7 +346,9 @@ impl<P: AccountProvider, S: CliSpawner> BranchExecutor for RotatingBranchExecuto
 
         // Charge the aggregate pool for whatever was spent.
         let charge = self.pool.try_charge(&inv.branch_id, out.spent_usd);
-        let state = match out.outcome {
+        let state = if !self.runnable(&inv.branch_id.0).unwrap_or(false) {
+            BranchState::Terminated
+        } else { match out.outcome {
             SpawnOutcome::Failed => BranchState::Failed,
             SpawnOutcome::Cancelled => BranchState::Terminated,
             SpawnOutcome::BudgetExceeded => BranchState::BudgetKilled,
@@ -324,7 +357,7 @@ impl<P: AccountProvider, S: CliSpawner> BranchExecutor for RotatingBranchExecuto
                 Charge::BranchExceeded | Charge::AggregateExceeded => BranchState::BudgetKilled,
                 Charge::Allowed => BranchState::Finished,
             },
-        };
+        }};
 
         let cost_cents = (out.spent_usd * 100.0).round().max(0.0) as u64;
         self.provider
@@ -392,20 +425,50 @@ pub async fn execute_fork<P, S, J>(
         settings,
         home_dir,
     } = req;
-    let branch_count = branches.len();
     let store = match duduclaw_fork::ForkStore::open(crate::mcp_fork::fork_store_path(&home_dir)) {
-        Ok(s) => s,
+        Ok(s) => Arc::new(s),
         Err(e) => {
             tracing::error!("fork {fork_id}: cannot open store: {e}");
             return;
         }
     };
-    let _ = store.set_all_branch_states(&fork_id, "running");
+    // Record the parent so a later manual `merge_or_select` knows where a
+    // retained branch workspace must be promoted to.
+    let parent_record = parent_workspace
+        .canonicalize()
+        .unwrap_or_else(|_| parent_workspace.clone());
+    let requested = branches.iter().map(|branch| branch.id.0.clone()).collect::<Vec<_>>();
+    let claimed = match duduclaw_core::with_file_lock(&home_dir.join("fork_resolution.lock"), || {
+        store.claim_pending_branches(&fork_id, &requested, &parent_record.to_string_lossy())
+            .map_err(std::io::Error::other)
+    }) {
+        Ok(rows) => rows,
+        Err(error) => { tracing::error!("fork {fork_id}: cannot claim pending branches: {error}"); return; }
+    };
+    if claimed.is_empty() { return; }
+    let branches = claimed.into_iter().map(|row| duduclaw_fork::Branch::with_id(
+        duduclaw_fork::BranchId(row.branch_id), duduclaw_fork::BranchSpec {
+            steering: row.steering, budget_usd: row.budget_usd,
+        })).collect::<Vec<_>>();
+    let branch_count = branches.len();
+    // Unresolved forks keep their finished branch workspaces here (RFC-26 P6).
+    let retain_dir = match duduclaw_fork::retention::fork_dir(
+        &crate::mcp_fork::retained_root(&home_dir),
+        &fork_id,
+    ) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            tracing::error!("fork {fork_id}: cannot establish retained workspace path: {e}");
+            let _ = store.set_all_branch_states(&fork_id, "failed");
+            return;
+        }
+    };
 
     let aggregate = settings
         .aggregate_budget_usd
         .max(settings.default_budget_usd);
-    let executor = Arc::new(RotatingBranchExecutor::new(provider, spawner, aggregate));
+    let executor = Arc::new(RotatingBranchExecutor::new(provider, spawner, aggregate)
+        .with_store(store.clone(), fork_id.clone()));
     let controller = match ForkController::new(fork_config(&settings), executor) {
         Ok(c) => c,
         Err(e) => {
@@ -416,29 +479,28 @@ pub async fn execute_fork<P, S, J>(
     };
 
     match controller
-        .run_and_resolve_branches(&prompt, branches, &parent_workspace, judge.as_ref())
+        .prepare_branches(
+            &prompt,
+            branches,
+            &parent_workspace,
+            judge.as_ref(),
+        )
         .await
     {
-        Ok(resolution) => {
-            // Persist each branch result.
-            for res in &resolution.results {
-                let _ = store.update_branch(
-                    &res.id.0,
-                    branch_state_str(res.state),
-                    res.spent_usd,
-                    &res.output,
-                    res.test_exit_code.map(|c| c as i64),
-                );
-            }
+        Ok(prepared) => {
+            let resolution = match publish_prepared_resolution(&home_dir, &store, &fork_id,
+                prepared, retain_dir.as_deref()) {
+                Ok(Some(resolution)) => resolution,
+                Ok(None) => {
+                    tracing::info!("fork {fork_id}: a final selection already exists; background publication skipped");
+                    return;
+                }
+                Err(error) => {
+                    tracing::error!("fork {fork_id}: background publication failed: {error}");
+                    return;
+                }
+            };
             let winner = resolution.decision.winner.as_ref().map(|w| w.0.clone());
-            let resolved = winner.is_some() && !resolution.decision.needs_confirmation;
-            let _ = store.set_resolution(
-                &fork_id,
-                winner.as_deref(),
-                resolution.promoted,
-                resolved,
-                resolution.aggregate_spent_usd,
-            );
 
             tracing::info!(
                 "fork {fork_id} resolved: promoted={} spend=${:.4}",
@@ -489,20 +551,112 @@ pub async fn execute_fork<P, S, J>(
         }
         Err(e) => {
             tracing::error!("fork {fork_id} execution failed: {e}");
-            // Any branch still 'running' in the store is marked failed.
-            if let Ok(rows) = store.list_branches(&fork_id) {
-                for b in rows.iter().filter(|b| b.state == "running") {
-                    let _ = store.update_branch(
-                        &b.branch_id,
-                        "failed",
-                        b.spent_usd,
-                        &b.output,
-                        b.test_exit_code,
-                    );
-                }
-            }
+            // SQL CAS cannot overwrite a concurrent persisted cancellation.
+            let _ = store.set_all_branch_states(&fork_id, "failed");
         }
     }
+}
+
+/// Publish all result rows and retained paths atomically with respect to manual
+/// selection/termination/GC. A late publisher must not reopen a resolved fork.
+fn publish_prepared_resolution(
+    home: &Path, store: &duduclaw_fork::ForkStore, fork_id: &str,
+    prepared: duduclaw_fork::PreparedFork, retain_dir: Option<&Path>,
+) -> std::io::Result<Option<duduclaw_fork::ForkResolution>> {
+    let original = prepared.resolution().clone();
+    // Agent-structure files are never carried back into an agent directory;
+    // an ordinary project parent promotes them like any other file.
+    let policy = duduclaw_fork::CopyPolicy::promote_for_parent(prepared.parent(), home);
+    let prepared = prepared.with_promote_policy(policy);
+    let recovery = match recovery::Recovery::prepare(home, fork_id, &prepared) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            // Nothing has touched the parent. Keep the original private TempDirs
+            // even if the designated recovery volume itself is unavailable.
+            let sources = prepared.keep_sources();
+            if let Err(journal_error) = recovery::emergency_journal(home, fork_id, &original, &sources, &error.to_string()) {
+                tracing::error!("fork {fork_id}: recovery journal unavailable: {journal_error}; sources={sources:?}");
+            }
+            if let Err(db_error) = store.record_publication_failure(fork_id, &original.results, &sources,
+                original.aggregate_spent_usd, &error.to_string()) {
+                tracing::error!("fork {fork_id}: recovery DB unavailable: {db_error}");
+            }
+            return Err(error);
+        }
+    };
+    let result = duduclaw_core::with_file_lock(&home.join("fork_resolution.lock"), || {
+        let current = store.get_fork(fork_id).map_err(std::io::Error::other)?
+            .ok_or_else(|| std::io::Error::other("fork disappeared before publication"))?;
+        if current.resolved { return Ok(None); }
+        let cancelled = store.list_branches(fork_id).map_err(std::io::Error::other)?
+            .into_iter().filter(|branch| branch.state == "terminated")
+            .map(|branch| duduclaw_fork::BranchId(branch.branch_id)).collect::<Vec<_>>();
+        // The home lock protects retained sources and state; the canonical-parent
+        // lock also serializes different homes publishing into the same tree.
+        prepared.publish_with_observer(retain_dir, &cancelled,
+            || recovery.before_parent_write().map_err(|error| duduclaw_fork::ForkError::Overlay(error.to_string())),
+            |resolution| {
+            publish_resolution_locked(home, store, fork_id, &resolution)
+                .map_err(|error| duduclaw_fork::ForkError::Overlay(error.to_string()))?;
+            Ok(Some(resolution))
+        }).map_err(std::io::Error::other)
+    });
+    match result {
+        Ok(resolution) => { recovery.complete(); Ok(resolution) }
+        Err(error) => {
+            if let Err(journal_error) = recovery.failed(&error.to_string()) {
+                tracing::error!("fork {fork_id}: cannot update recovery journal: {journal_error}");
+            }
+            if let Err(db_error) = store.record_publication_failure(fork_id, &original.results, &recovery.sources,
+                original.aggregate_spent_usd, &error.to_string()) {
+                tracing::error!("fork {fork_id}: publication failure persisted only in recovery journal: {db_error}");
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+fn publish_resolution(
+    home: &Path, store: &duduclaw_fork::ForkStore, fork_id: &str,
+    resolution: &duduclaw_fork::ForkResolution,
+) -> std::io::Result<bool> {
+    duduclaw_core::with_file_lock(&home.join("fork_resolution.lock"), || {
+        publish_resolution_locked(home, store, fork_id, resolution)
+    })
+}
+
+fn publish_resolution_locked(
+    home: &Path, store: &duduclaw_fork::ForkStore, fork_id: &str,
+    resolution: &duduclaw_fork::ForkResolution,
+) -> std::io::Result<bool> {
+    let current = store.get_fork(fork_id).map_err(std::io::Error::other)?
+        .ok_or_else(|| std::io::Error::other("fork disappeared before publication"))?;
+    if current.resolved { return Ok(false); }
+    let terminated: std::collections::HashSet<_> = store.list_branches(fork_id)
+        .map_err(std::io::Error::other)?.into_iter()
+        .filter(|branch| branch.state == "terminated")
+        .map(|branch| branch.branch_id).collect();
+    for result in &resolution.results {
+        if terminated.contains(&result.id.0) { continue; }
+        store.update_branch(&result.id.0, branch_state_str(result.state), result.spent_usd,
+            &result.output, result.test_exit_code.map(i64::from)).map_err(std::io::Error::other)?;
+    }
+    for retained in &resolution.retained {
+        if terminated.contains(&retained.branch_id.0) {
+            duduclaw_fork::retention::remove_branch(&crate::mcp_fork::retained_root(home),
+                fork_id, &retained.branch_id.0).map_err(std::io::Error::other)?;
+            continue;
+        }
+        store.set_branch_workspace(&retained.branch_id.0,
+            Some(&retained.workspace.to_string_lossy())).map_err(std::io::Error::other)?;
+    }
+    let winner = resolution.decision.winner.as_ref().map(|winner| winner.0.as_str());
+    let resolved = winner.is_some() && !resolution.decision.needs_confirmation;
+    store.set_resolution(fork_id, winner, resolution.promoted, resolved,
+        resolution.aggregate_spent_usd).map_err(std::io::Error::other)?;
+    if resolved { crate::mcp_fork::discard_retained_fork(home, store, fork_id); }
+    Ok(true)
 }
 
 /// Map a `BranchState` to its store string (lowercase, matches `ForkStore`).
@@ -854,6 +1008,315 @@ mod tests {
     use super::*;
     use duduclaw_fork::BranchId;
 
+    fn publication_fixture(home: &Path) -> (duduclaw_fork::ForkStore, duduclaw_fork::ForkResolution, std::path::PathBuf) {
+        let agent_dir = home.join("agents/a1");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[fork]\nenabled=true\n").unwrap();
+        let store = duduclaw_fork::ForkStore::open(crate::mcp_fork::fork_store_path(home)).unwrap();
+        store.insert_fork(&duduclaw_fork::ForkRow {
+            fork_id: "publication-fork".into(), agent_id: "a1".into(), prompt: "fixture".into(),
+            merge_mode: "manual".into(), resolved: false, winner: None, promoted: false,
+            aggregate_spent_usd: 0.0, created_at: chrono::Utc::now().to_rfc3339(),
+        }, &[duduclaw_fork::BranchRow {
+            branch_id: "publication-branch".into(), fork_id: "publication-fork".into(), steering: None,
+            budget_usd: 0.1, state: "finished".into(), spent_usd: 0.02,
+            output: "fixture".into(), test_exit_code: Some(0),
+        }]).unwrap();
+        let parent = home.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let workspace = crate::mcp_fork::retained_root(home).join("publication-fork/publication-branch");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("winner.txt"), "winner fixture").unwrap();
+        store.set_parent_workspace("publication-fork", Some(&parent.to_string_lossy())).unwrap();
+        let resolution = duduclaw_fork::ForkResolution {
+            results: vec![BranchResult { id: BranchId("publication-branch".into()), state: BranchState::Finished,
+                output: "published fixture".into(), spent_usd: 0.04, test_exit_code: Some(0) }],
+            verdict: None, decision: duduclaw_fork::MergeDecision {
+                winner: None, needs_confirmation: true, reason: "manual".into(),
+            }, promoted: false, aggregate_spent_usd: 0.04,
+            retained: vec![duduclaw_fork::RetainedBranch {
+                branch_id: BranchId("publication-branch".into()), workspace,
+            }],
+        };
+        (store, resolution, parent)
+    }
+
+    #[test]
+    fn background_publication_stages_results_and_paths_before_manual_selection() {
+        let home = tempfile::tempdir().unwrap();
+        let (store, resolution, _) = publication_fixture(home.path());
+        assert!(publish_resolution(home.path(), &store, "publication-fork", &resolution).unwrap());
+        let branch = store.list_branches("publication-fork").unwrap().remove(0);
+        assert_eq!(branch.output, "published fixture");
+        assert_eq!(branch.spent_usd, 0.04);
+        assert!(store.branch_workspace("publication-branch").unwrap().is_some());
+        assert!(!store.get_fork("publication-fork").unwrap().unwrap().resolved);
+    }
+
+    #[test]
+    fn barrier_late_background_publication_cannot_reopen_manual_resolution() {
+        let home = tempfile::tempdir().unwrap();
+        let (store, resolution, parent) = publication_fixture(home.path());
+        // Reproduce the old partial-publication window: a selectable path was
+        // visible before the background publisher wrote its final resolution.
+        store.set_branch_workspace("publication-branch", Some(&resolution.retained[0].workspace.to_string_lossy())).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (completed, await_completion) = std::sync::mpsc::channel();
+        let selector_barrier = barrier.clone();
+        let selector_home = home.path().to_path_buf();
+        let selector = std::thread::spawn(move || {
+            selector_barrier.wait();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let selected = runtime.block_on(crate::mcp_fork::handle_merge_or_select(
+                &serde_json::json!({"fork_id":"publication-fork","branch_id":"publication-branch"}),
+                &selector_home, "a1"));
+            completed.send(selected).unwrap();
+        });
+        barrier.wait();
+        let selected = await_completion.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_ne!(selected.get("isError").and_then(serde_json::Value::as_bool), Some(true));
+        assert!(!publish_resolution(home.path(), &store, "publication-fork", &resolution).unwrap());
+        selector.join().unwrap();
+        let fork = store.get_fork("publication-fork").unwrap().unwrap();
+        assert!(fork.resolved && fork.promoted);
+        assert_eq!(fork.winner.as_deref(), Some("publication-branch"));
+        assert_eq!(std::fs::read_to_string(parent.join("winner.txt")).unwrap(), "winner fixture");
+        assert!(store.branch_workspace("publication-branch").unwrap().is_none());
+        assert!(!resolution.retained[0].workspace.exists());
+    }
+
+    #[test]
+    fn background_publication_preserves_terminated_branch_and_discards_its_copy() {
+        let home = tempfile::tempdir().unwrap();
+        let (store, resolution, _) = publication_fixture(home.path());
+        store.update_branch("publication-branch", "terminated", 0.02, "cancelled fixture", None).unwrap();
+        assert!(publish_resolution(home.path(), &store, "publication-fork", &resolution).unwrap());
+        assert_eq!(store.list_branches("publication-fork").unwrap()[0].state, "terminated");
+        assert!(store.branch_workspace("publication-branch").unwrap().is_none());
+        assert!(!resolution.retained[0].workspace.exists());
+    }
+
+    struct ConflictingSpawner;
+    #[async_trait]
+    impl CliSpawner for ConflictingSpawner {
+        async fn spawn(&self, _ctx: &SpawnCtx, _prompt: &str, ws: &Path,
+            _env: &HashMap<String, String>) -> CliRunOutput {
+            std::fs::write(ws.join("winner.txt"), "automatic winner").unwrap();
+            std::fs::write(ws.join("paired.txt"), "automatic winner").unwrap();
+            CliRunOutput { output: "automatic answer".into(), spent_usd: 0.01,
+                outcome: SpawnOutcome::Completed }
+        }
+    }
+
+    struct PublicationReadyJudge(std::sync::mpsc::Sender<()>, std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+    #[async_trait]
+    impl JudgeAgent for PublicationReadyJudge {
+        async fn judge(&self, _prompt: &str, results: &[BranchResult]) -> duduclaw_fork::Result<duduclaw_fork::JudgeVerdict> {
+            self.0.send(()).unwrap();
+            self.1.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            Ok(duduclaw_fork::JudgeVerdict {
+                winner: results[0].id.clone(), per_branch_scores: Vec::new(), confidence: 1.0,
+                rationale: "trusted fixture".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn automatic_adoption_waits_for_publication_lock_before_touching_shared_parent() {
+        automatic_publication_while_locked(None);
+    }
+
+    #[test]
+    fn late_automatic_adoption_cannot_overwrite_final_operator_selection() {
+        automatic_publication_while_locked(Some("resolved"));
+    }
+
+    #[test]
+    fn terminated_automatic_winner_is_not_promoted_or_retained() {
+        automatic_publication_while_locked(Some("terminated"));
+    }
+
+    fn automatic_request(home: &Path, parent: &Path) -> ForkExecRequest {
+        let store = duduclaw_fork::ForkStore::open(crate::mcp_fork::fork_store_path(home)).unwrap();
+        if store.list_branches("publication-fork").unwrap()[0].state == "finished" {
+            store.update_branch("publication-branch", "pending", 0.0, "", None).unwrap();
+        }
+        ForkExecRequest {
+            fork_id: "publication-fork".into(), prompt: "fixture".into(),
+            branches: vec![duduclaw_fork::Branch::with_id(BranchId("publication-branch".into()),
+                duduclaw_fork::BranchSpec { steering: None, budget_usd: 0.1 })],
+            parent_workspace: parent.to_path_buf(), home_dir: home.to_path_buf(),
+            settings: ForkSettings { merge_mode: "auto".into(), ..ForkSettings::default() },
+        }
+    }
+
+    #[test]
+    fn persisted_prestart_termination_is_not_resurrected_or_executed() {
+        let home = tempfile::tempdir().unwrap();
+        let (store, _, parent) = publication_fixture(home.path());
+        store.update_branch("publication-branch", "terminated", 0.02, "cancelled before scheduling", None).unwrap();
+        let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(execute_fork(automatic_request(home.path(), &parent),
+            Arc::new(FakeProvider { accounts: 1 }), Arc::new(CountingSpawner(spawned.clone())),
+            Arc::new(duduclaw_fork::judge::HeuristicJudge)));
+        assert_eq!(store.list_branches("publication-fork").unwrap()[0].state, "terminated");
+        assert!(!parent.join("winner.txt").exists());
+        assert!(!store.get_fork("publication-fork").unwrap().unwrap().promoted);
+        assert_eq!(spawned.load(std::sync::atomic::Ordering::SeqCst), 0, "cancelled rows must not consume a spawn");
+    }
+
+    struct CountingSpawner(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl CliSpawner for CountingSpawner {
+        async fn spawn(&self, ctx: &SpawnCtx, prompt: &str, ws: &Path, env: &HashMap<String, String>) -> CliRunOutput {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ConflictingSpawner.spawn(ctx, prompt, ws, env).await
+        }
+    }
+
+    struct FaultingPublicationJudge(std::path::PathBuf);
+    #[async_trait]
+    impl JudgeAgent for FaultingPublicationJudge {
+        async fn judge(&self, _prompt: &str, results: &[BranchResult]) -> duduclaw_fork::Result<duduclaw_fork::JudgeVerdict> {
+            // Inject a lock failure only after the branch produced real files.
+            let sidecar = self.0.join("fork_resolution.lock.lock");
+            if sidecar.exists() { std::fs::remove_file(&sidecar).unwrap(); }
+            std::fs::create_dir(&sidecar).unwrap();
+            Ok(duduclaw_fork::JudgeVerdict { winner: results[0].id.clone(), confidence: 1.0,
+                per_branch_scores: Vec::new(), rationale: "trusted lock-fault fixture".into() })
+        }
+    }
+
+    #[test]
+    fn publication_lock_failure_keeps_recoverable_sources_and_terminal_diagnostic() {
+        let home = tempfile::tempdir().unwrap();
+        let (store, _, parent) = publication_fixture(home.path());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(execute_fork(automatic_request(home.path(), &parent),
+            Arc::new(FakeProvider { accounts: 1 }), Arc::new(ConflictingSpawner),
+            Arc::new(FaultingPublicationJudge(home.path().to_path_buf()))));
+        assert_eq!(store.list_branches("publication-fork").unwrap()[0].state, "publication_failed");
+        let recovery_root = home.path().join("fork_recovery/publication-fork");
+        let attempts = std::fs::read_dir(&recovery_root).unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        assert_eq!(attempts.len(), 1);
+        let recovery = attempts[0].path();
+        assert_eq!(std::fs::read_to_string(recovery.join("publication-branch/winner.txt")).unwrap(), "automatic winner");
+        let journal: serde_json::Value = serde_json::from_slice(&std::fs::read(recovery.join("publication.json")).unwrap()).unwrap();
+        assert_eq!(journal["status"], "publication_failed");
+        assert!(!parent.join("winner.txt").exists());
+        assert!(!store.get_fork("publication-fork").unwrap().unwrap().promoted);
+    }
+
+    struct FaultingDatabaseJudge(std::path::PathBuf, bool);
+    #[async_trait]
+    impl JudgeAgent for FaultingDatabaseJudge {
+        async fn judge(&self, _prompt: &str, results: &[BranchResult]) -> duduclaw_fork::Result<duduclaw_fork::JudgeVerdict> {
+            let connection = rusqlite::Connection::open(crate::mcp_fork::fork_store_path(&self.0)).unwrap();
+            let condition = if self.1 { "1" } else { "NEW.state='finished'" };
+            connection.execute_batch(&format!("CREATE TRIGGER publication_fault BEFORE UPDATE ON fork_branches
+                WHEN {condition} BEGIN SELECT RAISE(ABORT,'trusted fixture DB fault'); END;")).unwrap();
+            Ok(duduclaw_fork::JudgeVerdict { winner: results[0].id.clone(), confidence: 1.0,
+                per_branch_scores: Vec::new(), rationale: "trusted DB fault fixture".into() })
+        }
+    }
+
+    #[test]
+    fn database_fault_after_real_parent_copy_keeps_partial_marker_and_private_source() {
+        publication_database_fault(false);
+    }
+
+    #[test]
+    fn database_unwritable_failure_is_durable_in_recovery_journal() {
+        publication_database_fault(true);
+    }
+
+    fn publication_database_fault(all_updates: bool) {
+        let home = tempfile::tempdir().unwrap();
+        let (store, _, parent) = publication_fixture(home.path());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(execute_fork(automatic_request(home.path(), &parent),
+            Arc::new(FakeProvider { accounts: 1 }), Arc::new(ConflictingSpawner),
+            Arc::new(FaultingDatabaseJudge(home.path().to_path_buf(), all_updates))));
+        for name in ["winner.txt", "paired.txt"] {
+            assert_eq!(std::fs::read_to_string(parent.join(name)).unwrap(), "automatic winner");
+        }
+        let attempt = std::fs::read_dir(home.path().join("fork_recovery/publication-fork")).unwrap()
+            .next().unwrap().unwrap().path();
+        let journal: serde_json::Value = serde_json::from_slice(&std::fs::read(attempt.join("publication.json")).unwrap()).unwrap();
+        assert_eq!(journal["status"], "publication_failed");
+        assert_eq!(journal["parent_may_be_partial"], true, "a failed DB commit cannot pretend no parent files changed");
+        assert_eq!(journal["aggregate_spent_usd"], 0.01);
+        assert_eq!(std::fs::read_to_string(attempt.join("publication-branch/winner.txt")).unwrap(), "automatic winner");
+        let branch = store.list_branches("publication-fork").unwrap().remove(0);
+        if !all_updates {
+            assert_eq!(branch.state, "publication_failed");
+            assert_eq!(branch.spent_usd, 0.01);
+            assert!(store.branch_workspace("publication-branch").unwrap().unwrap().contains("fork_recovery"));
+        } else {
+            assert_eq!(branch.state, "running", "the injected DB refuses even failure updates; journal is recovery authority");
+        }
+        assert!(!store.get_fork("publication-fork").unwrap().unwrap().resolved);
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(attempt.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+        }
+    }
+
+    fn automatic_publication_while_locked(late_action: Option<&str>) {
+        let home = tempfile::tempdir().unwrap();
+        let (store, resolution, parent) = publication_fixture(home.path());
+        std::fs::remove_dir_all(crate::mcp_fork::retained_root(home.path())).unwrap();
+        store.update_branch("publication-branch", "pending", 0.0, "", None).unwrap();
+        for name in ["winner.txt", "paired.txt"] {
+            std::fs::write(parent.join(name), "manual winner").unwrap();
+        }
+        let (ready, await_ready) = std::sync::mpsc::channel();
+        let (permit, await_permit) = std::sync::mpsc::channel();
+        let request = ForkExecRequest {
+                fork_id: "publication-fork".into(), prompt: "fixture".into(),
+                branches: vec![duduclaw_fork::Branch::with_id(resolution.results[0].id.clone(),
+                    duduclaw_fork::BranchSpec { steering: None, budget_usd: 0.1 })],
+                parent_workspace: parent.clone(), home_dir: home.path().to_path_buf(),
+                settings: ForkSettings { merge_mode: "auto".into(), ..ForkSettings::default() },
+        };
+        let worker = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(execute_fork(request, Arc::new(FakeProvider { accounts: 1 }),
+                    Arc::new(ConflictingSpawner), Arc::new(PublicationReadyJudge(ready, std::sync::Mutex::new(await_permit)))));
+        });
+        await_ready.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let observed = duduclaw_core::with_file_lock(&home.path().join("fork_resolution.lock"), || {
+            match late_action {
+                Some("resolved") => {
+                    store.set_resolution("publication-fork", Some("publication-branch"), true, true, 0.02).unwrap();
+                }
+                Some("terminated") => {
+                    store.update_branch("publication-branch", "terminated", 0.02, "operator cancelled", None).unwrap();
+                }
+                _ => {}
+            }
+            permit.send(()).unwrap();
+            // The judge is complete, but another fork's publication still owns
+            // the lock. Neither conflicting file may change before release.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(["winner.txt", "paired.txt"].map(|name| std::fs::read_to_string(parent.join(name)).unwrap()))
+        }).unwrap();
+        worker.join().unwrap();
+        assert_eq!(observed, ["manual winner", "manual winner"]);
+        let final_content = if late_action.is_some() { "manual winner" } else { "automatic winner" };
+        assert_eq!(std::fs::read_to_string(parent.join("winner.txt")).unwrap(), final_content);
+        assert_eq!(std::fs::read_to_string(parent.join("paired.txt")).unwrap(), final_content);
+        let fork = store.get_fork("publication-fork").unwrap().unwrap();
+        if late_action == Some("terminated") {
+            assert!(!fork.resolved && !fork.promoted);
+            assert_eq!(store.list_branches("publication-fork").unwrap()[0].state, "terminated");
+        } else {
+            assert!(fork.resolved && fork.promoted);
+        }
+        assert!(!crate::mcp_fork::retained_root(home.path()).join("publication-fork").exists());
+    }
+
     struct FakeProvider {
         accounts: usize,
     }
@@ -1089,6 +1552,7 @@ mod tests {
             },
             promoted: true,
             aggregate_spent_usd: 0.1,
+            retained: Vec::new(),
         };
         metrics.record_resolution(&resolution);
         let snap = metrics.snapshot();

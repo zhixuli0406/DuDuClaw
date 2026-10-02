@@ -1,0 +1,113 @@
+//! Durable whole-run accounting, including calls that never produce a node.
+use super::{DiscoveryStore, StoreError};
+use crate::discovery::budget::BudgetSnapshot;
+use rusqlite::{params, OptionalExtension};
+
+impl DiscoveryStore {
+    pub fn load_run_budget_snapshot(&self, run_id: &str) -> Result<Option<BudgetSnapshot>, StoreError> {
+        let json: Option<String> = self.conn.query_row(
+            "SELECT snapshot FROM discovery_run_budget WHERE run_id=?1", [run_id], |r| r.get(0)
+        ).optional()?;
+        json.map(|json| {
+            let snapshot: BudgetSnapshot = serde_json::from_str(&json)?;
+            if !snapshot.valid() { return Err(StoreError::Corrupt("invalid run budget snapshot".into())); }
+            Ok(snapshot)
+        }).transpose()
+    }
+}
+
+pub(crate) fn persist(home: &std::path::Path, run_id: &str, limits: crate::discovery::contracts::RunBudget,
+    sequence: u64, snapshot: BudgetSnapshot) -> Result<(), StoreError> {
+    if !snapshot.valid() { return Err(StoreError::Corrupt("invalid run budget snapshot".into())); }
+    let conn = super::private_connection(&home.join(super::DB_FILE))?;
+    conn.busy_timeout(std::time::Duration::from_millis(200))?;
+    let configured: Option<(u32, f64, u64)> = conn.query_row(
+        "SELECT budget_calls,budget_usd,budget_secs FROM discovery_runs WHERE run_id=?1",
+        [run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+    if configured != Some((limits.max_agent_calls, limits.max_usd, limits.max_wall_secs)) {
+        return Err(StoreError::Corrupt("budget does not match its durable run".into()));
+    }
+    let changed = conn.execute("INSERT INTO discovery_run_budget(run_id,sequence,snapshot,updated_at)
+        VALUES(?1,?2,?3,?4) ON CONFLICT(run_id) DO UPDATE SET sequence=excluded.sequence,
+        snapshot=excluded.snapshot,updated_at=excluded.updated_at
+        WHERE excluded.sequence > discovery_run_budget.sequence",
+        params![run_id, super::to_i64(sequence,"budget sequence")?, serde_json::to_string(&snapshot)?,
+            chrono::Utc::now().to_rfc3339()])?;
+    if changed != 1 { return Err(StoreError::Corrupt("stale or reused run budget binding".into())); }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::{budget::SharedBudget, contracts::RunBudget, tree::{CostSource, Direction}};
+    fn fixture() -> (tempfile::TempDir, SharedBudget) {
+        let home = tempfile::tempdir().unwrap();
+        let limits = RunBudget { max_agent_calls:3, max_usd:3.0, max_wall_secs:30, max_rounds:1 };
+        DiscoveryStore::open(home.path()).unwrap().create_run("run-1", "goal", "agent", "score",
+            &"a".repeat(64), Direction::Max, &limits).unwrap();
+        (home, SharedBudget::new(limits).unwrap())
+    }
+    #[test]
+    fn run_budget_survives_reopen_and_includes_pending_retry_and_development_calls_without_nodes() {
+        let (home, budget) = fixture();
+        budget.bind_run(home.path(), "run-1").unwrap();
+        let attempt = budget.reserve_call().unwrap();
+        assert!(budget.observe_cost(attempt, 0.05));
+        let pending = DiscoveryStore::open(home.path()).unwrap().load_run_budget_snapshot("run-1")
+            .unwrap().expect("a pending reservation must be durable before process spawn");
+        assert_eq!((pending.agent_calls,pending.pending_calls), (1,1));
+        budget.finish_accounted_call(attempt, 0.1, CostSource::Reported);
+        let retry = budget.reserve_call().unwrap();
+        budget.finish_accounted_call(retry, 0.2, CostSource::Estimated);
+        let development = budget.reserve_call().unwrap();
+        budget.finish_accounted_call(development, f64::NAN, CostSource::Unknown);
+        let settled = DiscoveryStore::open(home.path()).unwrap().load_run_budget_snapshot("run-1")
+            .unwrap().unwrap();
+        assert_eq!((settled.agent_calls, settled.pending_calls, settled.unknown_calls), (3,0,1));
+        assert_eq!(settled.reported_usd, 0.1);
+        assert_eq!(settled.estimated_usd, 0.2);
+        assert!(settled.unknown_reserved_usd > 0.0);
+        assert!(settled.spent_usd >= settled.reported_usd + settled.estimated_usd + settled.unknown_reserved_usd);
+    }
+    #[test]
+    fn a_shared_budget_cannot_rebind_to_another_run_or_home() {
+        let (home, budget) = fixture();
+        budget.bind_run(home.path(), "run-1").unwrap();
+        assert!(budget.clone().bind_run(home.path(), "different-run").is_err());
+        let (foreign, _) = fixture();
+        assert!(budget.bind_run(foreign.path(), "run-1").is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_database_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn database_and_wal_are_private_even_when_the_home_is_traversable() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let store = DiscoveryStore::open(home.path()).unwrap();
+        store.conn.execute("INSERT INTO discovery_runs(run_id,direction,created_at) VALUES('private','max','now')", []).unwrap();
+        for file in ["discovery.db", "discovery.db-wal", "discovery.db-shm"] {
+            let mode = std::fs::metadata(home.path().join(file)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "raw frozen policy data requires a private SQLite file: {file}");
+        }
+    }
+    #[test]
+    fn database_entry_points_refuse_shared_linked_and_hardlinked_files() {
+        let home = tempfile::tempdir().unwrap();
+        let original = home.path().join("original.db");
+        drop(DiscoveryStore::open_path(&original).unwrap());
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(DiscoveryStore::open_path(&original).is_err(), "existing shared databases must be rejected");
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let linked = home.path().join("linked.db");
+        std::os::unix::fs::symlink(&original, &linked).unwrap();
+        assert!(DiscoveryStore::open_path(&linked).is_err(), "SQLite must not follow an alias");
+        std::fs::remove_file(&linked).unwrap();
+        std::fs::hard_link(&original, &linked).unwrap();
+        assert!(DiscoveryStore::open_path(&linked).is_err(), "multiple names invalidate the private file authority");
+    }
+}

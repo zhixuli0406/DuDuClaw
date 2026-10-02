@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""duduclaw-eval-dom: evaluate one JavaScript expression in the browser page
+that is visible on the computer-use display, via the Chrome DevTools Protocol.
+
+Contract with the Rust side (crates/duduclaw-gateway/src/computer_use.rs,
+`detect_sensitive_regions`; called from `capture_masked_screenshot` in
+computer_use_orchestrator.rs):
+
+  argv      `docker exec <container> duduclaw-eval-dom <js>` -- exactly one
+            argument, a JavaScript *expression* (the gateway sends
+            `JSON.stringify(Array.from(document.querySelectorAll(<sel>)).map(
+            el => [x, y, w, h] of getBoundingClientRect(), rounded))`).
+  stdout    only the result, nothing else. The gateway parses it as
+            `Vec<[u32; 4]>` and paints those rectangles black on the PNG it
+            gets from `scrot` on DISPLAY :99, so each rectangle MUST be in
+            screenshot pixels: x, y, width, height, non-negative integers.
+  exit      0 on success. Any failure (browser down, no visible page, timeout,
+            JS exception, viewport not where we expect it) exits non-zero with
+            a reason on stderr; the gateway then masks the WHOLE screenshot
+            (fail closed). Never print a guess. The status is 3
+            (EXIT_SEVERAL_PAGES, mirrored by EVAL_DOM_EXIT_SEVERAL_PAGES in
+            computer_use.rs) when several pages are visible at once, and 1 for
+            every other failure; the gateway tells the AI why the screenshot
+            is black from that status alone, never from the stderr text.
+
+Coordinate mapping. getBoundingClientRect() returns CSS pixels relative to the
+page viewport. The entrypoint starts Chromium in kiosk mode at 0,0 covering the
+whole Xvfb screen with --force-device-scale-factor=1, so viewport origin ==
+screen origin. This helper does not trust that blindly: in the same evaluation
+it reads devicePixelRatio, innerWidth/innerHeight, screenX/screenY and the
+visual-viewport scale, and refuses (exit 1) unless the viewport starts at
+screen 0,0 and covers the full DISPLAY_SIZE (within 2 px). When the result has
+the region shape (a JSON array of [x, y, w, h] number arrays) it converts CSS
+px to screen px (x devicePixelRatio, which also covers ctrl+plus page zoom),
+rounds outward, grows each rectangle by 1 px on every side (the gateway has
+already rounded CSS values, so a fractionally positioned element could
+otherwise keep a sliver unmasked), clips to the screen, and drops rectangles
+with no visible area
+(off-screen or zero-size elements, whose negative coordinates the gateway's
+u32 parser would otherwise reject). Any other result is printed unchanged.
+
+Page selection: every CDP target of type "page" is evaluated; exactly one must
+report document.visibilityState == "visible" (the active tab of the kiosk
+window). Zero visible pages -> exit 1, several -> exit 3; either way the
+gateway masks the whole screenshot (it cannot tell which page is on top). DevTools offers no
+per-target visibility, so visibility is read from the document, but always in
+an isolated world (duduclaw_cdp.evaluate_isolated): the expression, the
+geometry read-back and visibilityState all run there, where the page's own
+redefinitions of DOM methods, getters or JSON do not apply.
+
+Network: connects only to 127.0.0.1:<DUDUCLAW_CDP_PORT, default 9222>; the
+WebSocket path is taken from the target list but the host is never taken from
+it. Standard library only; the CDP/WebSocket code lives in duduclaw_cdp.py,
+shared with duduclaw-navigate.
+"""
+
+import json
+import math
+import os
+import signal
+import sys
+
+sys.dont_write_bytecode = True  # read-only root filesystem
+
+from duduclaw_cdp import CdpError, WebSocket, evaluate_isolated, list_pages as _list_pages  # noqa: E402
+
+TIMEOUT_SECS = float(os.environ.get("DUDUCLAW_EVAL_DOM_TIMEOUT", "5"))
+GEOMETRY_TOLERANCE_PX = 2
+PAD_PX = 1
+EDGE_EPSILON = 1e-3
+# Stable machine-readable marker for "several pages are visible at once"
+# (see the module docstring). Every other failure exits 1.
+EXIT_SEVERAL_PAGES = 3
+
+EvalError = CdpError
+
+
+class SeveralPagesVisible(Exception):
+    pass
+
+
+def fail(msg, code=1):
+    sys.stderr.write(f"duduclaw-eval-dom: {msg}\n")
+    sys.stderr.flush()
+    os._exit(code)
+
+
+def on_alarm(_signum, _frame):
+    fail(f"timed out after {TIMEOUT_SECS:g}s")
+
+
+def screen_size():
+    raw = os.environ.get("DISPLAY_SIZE", "1280x800")
+    try:
+        w, h = raw.lower().split("x", 1)
+        w, h = int(w), int(h)
+    except ValueError:
+        raise EvalError(f"bad DISPLAY_SIZE {raw!r}")
+    if w <= 0 or h <= 0:
+        raise EvalError(f"bad DISPLAY_SIZE {raw!r}")
+    return w, h
+
+
+def list_pages():
+    return _list_pages(TIMEOUT_SECS)
+
+
+def wrap(expr):
+    # The expression is evaluated exactly once; geometry is read in the same
+    # task so the page cannot change between the two.
+    return (
+        "(() => {\n"
+        "const __duduclaw_v = (\n" + expr + "\n);\n"
+        "const vv = window.visualViewport;\n"
+        "return {v: __duduclaw_v, vis: document.visibilityState,"
+        " dpr: window.devicePixelRatio, iw: window.innerWidth, ih: window.innerHeight,"
+        " sx: window.screenX, sy: window.screenY,"
+        " vs: vv ? vv.scale : 1, vx: vv ? vv.offsetLeft : 0, vy: vv ? vv.offsetTop : 0};\n"
+        "})()"
+    )
+
+
+def evaluate(path, expr):
+    ws = WebSocket(path, TIMEOUT_SECS)
+    try:
+        result = evaluate_isolated(ws, wrap(expr))
+    finally:
+        ws.close()
+    if "exceptionDetails" in result:
+        desc = result["exceptionDetails"].get("exception", {}).get("description") \
+            or result["exceptionDetails"].get("text", "exception")
+        raise EvalError(f"JavaScript exception: {desc.splitlines()[0]}")
+    value = result.get("result", {}).get("value")
+    if not isinstance(value, dict):
+        raise EvalError("unexpected evaluation result shape")
+    return value
+
+
+def check_geometry(info, width, height):
+    dpr = info.get("dpr")
+    if not isinstance(dpr, (int, float)) or dpr <= 0:
+        raise EvalError(f"bad devicePixelRatio {dpr!r}")
+    if info.get("vs") != 1 or info.get("vx") != 0 or info.get("vy") != 0:
+        raise EvalError("page is pinch-zoomed/scrolled visual viewport; refusing")
+    if info.get("sx") != 0 or info.get("sy") != 0:
+        raise EvalError(f"browser window not at screen origin (screenX={info.get('sx')}, screenY={info.get('sy')})")
+    vw, vh = info.get("iw", 0) * dpr, info.get("ih", 0) * dpr
+    if abs(vw - width) > GEOMETRY_TOLERANCE_PX or abs(vh - height) > GEOMETRY_TOLERANCE_PX:
+        raise EvalError(f"viewport {vw:g}x{vh:g} px does not cover the {width}x{height} screen")
+    return dpr
+
+
+def is_region_list(v):
+    return isinstance(v, list) and all(
+        isinstance(r, list) and len(r) == 4
+        and all(isinstance(n, (int, float)) and not isinstance(n, bool) and math.isfinite(n) for n in r)
+        for r in v
+    )
+
+
+def to_screen(regions, dpr, width, height):
+    out = []
+    for x, y, w, h in regions:
+        if w <= 0 or h <= 0:
+            continue
+        # Outward rounding (EDGE_EPSILON absorbs float noise such as a 1.1
+        # zoom reported as 1.10000002) plus PAD_PX on every side: the gateway
+        # already rounded each CSS value to an integer, which can cut up to
+        # half a CSS pixel off an edge of a fractionally positioned element.
+        x0 = max(0, math.floor(x * dpr + EDGE_EPSILON) - PAD_PX)
+        y0 = max(0, math.floor(y * dpr + EDGE_EPSILON) - PAD_PX)
+        x1 = min(width, math.ceil((x + w) * dpr - EDGE_EPSILON) + PAD_PX)
+        y1 = min(height, math.ceil((y + h) * dpr - EDGE_EPSILON) + PAD_PX)
+        if x1 > x0 and y1 > y0:
+            out.append([x0, y0, x1 - x0, y1 - y0])
+    return out
+
+
+def main():
+    if len(sys.argv) != 2 or not sys.argv[1].strip():
+        fail("usage: duduclaw-eval-dom '<javascript expression>'")
+    signal.signal(signal.SIGALRM, on_alarm)
+    signal.alarm(max(1, math.ceil(TIMEOUT_SECS)))
+    expr = sys.argv[1]
+    try:
+        width, height = screen_size()
+        pages = list_pages()
+        if not pages:
+            raise EvalError("no open page in the browser")
+        visible = []
+        for path in pages:
+            info = evaluate(path, expr)
+            if info.get("vis") == "visible":
+                visible.append(info)
+        if not visible:
+            raise EvalError(f"none of {len(pages)} page(s) is visible")
+        if len(visible) > 1:
+            raise SeveralPagesVisible(f"{len(visible)} pages are visible at once; cannot tell which one is on screen")
+        info = visible[0]
+        dpr = check_geometry(info, width, height)
+        value = info.get("v")
+        parsed = value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                parsed = None
+        if is_region_list(parsed):
+            out = json.dumps(to_screen(parsed, dpr, width, height), separators=(",", ":"))
+        elif isinstance(value, str):
+            out = value
+        else:
+            out = json.dumps(value, separators=(",", ":"))
+    except SeveralPagesVisible as e:
+        fail(str(e), EXIT_SEVERAL_PAGES)
+    except EvalError as e:
+        fail(str(e))
+    except (OSError, ValueError) as e:
+        fail(f"{type(e).__name__}: {e}")
+    signal.alarm(0)
+    sys.stdout.write(out + "\n")
+    sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

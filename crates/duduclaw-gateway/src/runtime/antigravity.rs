@@ -11,10 +11,18 @@
 //!   - binary `agy` (installed to `~/.local/bin/agy`), not `gemini`
 //!   - model flag `--model <id>`, not `-m <id>`
 //!   - permission bypass `--dangerously-skip-permissions`, not `--approval-mode yolo`
-//!   - API key env `ANTIGRAVITY_API_KEY`, not `GEMINI_API_KEY`
-//!   - MCP config under `~/.gemini/antigravity-cli/settings.json`
+//!   - API-key route: `GEMINI_API_KEY` in the env AND `"modelProvider": "gemini"`
+//!     in `~/.gemini/antigravity-cli/settings.json`, opted into explicitly via
+//!     `config.toml [antigravity] auth = "api_key"` (agy 1.1.13+; there is no
+//!     `ANTIGRAVITY_API_KEY` — the variable this runtime used to forward never
+//!     existed, see `commercial/docs/REPORT-antigravity-runtime-auth-2026-10.md`)
+//!   - MCP config in `<workspace>/.agents/mcp_config.json` (agy ignores
+//!     `mcpServers` in any `settings.json`); identity rides the spawn env
 //!
-//! Verified against `agy --help` + live runs (v1.0.12, 2026-06-25). Confirmed facts:
+//! See [`super::antigravity_setup`] for the auth / MCP / env decisions.
+//!
+//! Originally written against `agy --help` + live runs (v1.0.12, 2026-06-25);
+//! the flags below were re-checked on 1.2.10–1.2.14. Confirmed facts:
 //!   - `-p` / `--print` takes the prompt as its **value** (not a boolean) and
 //!     must be the LAST flag — it consumes the next argv token as the prompt, so
 //!     any flag after `-p` is swallowed as the prompt. All other flags go first.
@@ -40,6 +48,7 @@ use tracing::info;
 
 use duduclaw_core::types::{CapabilitiesConfig, SandboxLevel, sandbox_level_for};
 
+use super::antigravity_setup as setup;
 use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 
 /// Derive agy sandbox / permission flags from the agent's capabilities.
@@ -263,13 +272,62 @@ const MAX_SYSTEM_PROMPT_BYTES: usize = 65536;
 /// Runtime that delegates to the Google Antigravity CLI (`agy`).
 pub struct AntigravityRuntime {
     agy_path: String,
+    /// Test-only seams for the `#[ignore]` end-to-end tests: a temp user HOME
+    /// (settings path + the child's `HOME`), a fixed fake key, and a stand-in
+    /// MCP command. Production builds have no such field.
+    #[cfg(test)]
+    hooks: TestHooks,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks {
+    user_home: Option<std::path::PathBuf>,
+    gemini_key: Option<String>,
+    mcp_command: Option<(std::path::PathBuf, Vec<String>)>,
 }
 
 impl AntigravityRuntime {
     pub fn new() -> Self {
         Self {
             agy_path: resolve_agy_path(),
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         }
+    }
+
+    /// The OS user's home whose `.gemini/antigravity-cli/settings.json` agy reads.
+    fn user_home(&self) -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(h) = &self.hooks.user_home {
+            return Some(h.clone());
+        }
+        dirs::home_dir()
+    }
+
+    /// Gemini key for `api_key` mode (rotator → env); see `antigravity_setup`.
+    async fn resolve_gemini_key(
+        &self,
+        context: &RuntimeContext,
+    ) -> Option<setup::GeminiKey> {
+        #[cfg(test)]
+        if let Some(k) = &self.hooks.gemini_key {
+            return setup::GeminiKey::new(k.clone());
+        }
+        setup::resolve_gemini_key(&context.home_dir, &context.account_pool).await
+    }
+
+    /// `(command, args)` of the MCP server registered for agy: the absolute
+    /// duduclaw binary + `mcp-server`.
+    fn mcp_command(&self) -> (std::path::PathBuf, Vec<String>) {
+        #[cfg(test)]
+        if let Some(c) = &self.hooks.mcp_command {
+            return c.clone();
+        }
+        (
+            duduclaw_core::resolve_duduclaw_bin(),
+            vec!["mcp-server".to_string()],
+        )
     }
 }
 
@@ -292,48 +350,6 @@ fn resolve_agy_path() -> String {
         }
     }
     "agy".to_string()
-}
-
-/// Idempotently add `dir` to agy's `trustedWorkspaces` so that running there does
-/// not trigger the interactive "trust this workspace?" prompt (which would hang a
-/// headless subprocess). Writes the global `~/.gemini/antigravity-cli/settings.json`
-/// under a cross-process lock (multiple agents may share it). Best-effort: any IO
-/// error is returned for the caller to log, never to abort the agent call.
-fn ensure_workspace_trusted(dir: &std::path::Path) -> std::io::Result<()> {
-    let Some(home) = dirs::home_dir() else {
-        return Ok(());
-    };
-    let settings_path = home
-        .join(".gemini")
-        .join("antigravity-cli")
-        .join("settings.json");
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Canonicalize so the stored path matches what agy compares against.
-    let target = dir
-        .canonicalize()
-        .unwrap_or_else(|_| dir.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
-
-    duduclaw_core::with_file_lock(&settings_path, || {
-        let existing = std::fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
-        let mut settings: serde_json::Value =
-            serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}));
-        let mut list: Vec<serde_json::Value> = settings
-            .get("trustedWorkspaces")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        if list.iter().any(|v| v.as_str() == Some(target.as_str())) {
-            return Ok(()); // already trusted — no write
-        }
-        list.push(serde_json::Value::String(target.clone()));
-        settings["trustedWorkspaces"] = serde_json::Value::Array(list);
-        let out = serde_json::to_string_pretty(&settings).unwrap_or_default();
-        std::fs::write(&settings_path, out)
-    })
 }
 
 /// Build the prompt payload: system instructions + history + user message, all
@@ -399,19 +415,135 @@ impl AgentRuntime for AntigravityRuntime {
             "antigravity sandbox flags derived from capabilities"
         );
 
-        // W2 (MCP wiring): register the duduclaw MCP server in the agent's
-        // antigravity settings before spawning. Idempotent merge;
-        // warn-not-fatal — registration failing must not block the reply.
-        if let Some(ref dir) = context.agent_dir {
-            if let Err(e) =
-                Self::ensure_duduclaw_mcp_config(dir, &context.agent_id, &context.home_dir).await
-            {
+        // ── Auth route: `config.toml [antigravity] auth` ──────────────────
+        // Decided BEFORE anything is written or spawned. In `api_key` mode a
+        // missing key fails here with an actionable message instead of agy's
+        // generic "authentication required". Absent setting ⇒ no key handling
+        // at all (the pre-2026-10 behaviour minus the dead ANTIGRAVITY_API_KEY).
+        let auth = setup::auth_mode_from_home(&context.home_dir);
+        let candidate_key = if auth == setup::AntigravityAuth::ApiKey {
+            self.resolve_gemini_key(context).await
+        } else {
+            None
+        };
+        let gemini_key = setup::require_key_for_mode(auth, candidate_key)?;
+
+        // Working root: normally the agent's own directory, but a caller may
+        // override the cwd via `super::SPAWN_OVERRIDE` (today: the team
+        // composer, putting a role member in the employee's workspace so its
+        // files outlive the throwaway scaffold — design §4.3 E3). Identity is
+        // NOT affected: it rides this spawn's environment (below), never a
+        // file in the shared workspace.
+        let work_root: Option<std::path::PathBuf> =
+            super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
+
+        // User settings, ONE locked read-merge-write:
+        //   * trust the working root — agy shows an *interactive* "trust this
+        //     workspace?" prompt for any dir not in `trustedWorkspaces`, which
+        //     blocks a headless subprocess forever, and an untrusted workspace's
+        //     `.agents/mcp_config.json` is not loaded;
+        //   * `modelProvider` per the auth mode.
+        // Failure is a warning, except in `api_key` mode where agy would
+        // silently ignore the key without `modelProvider` — fail closed there.
+        let api_key_mode = auth == setup::AntigravityAuth::ApiKey;
+        match self.user_home() {
+            Some(home) => {
+                let trusted = work_root.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    setup::ensure_user_settings(&home, trusted.as_deref(), auth)
+                })
+                .await;
+                let failure = match outcome {
+                    Ok(Ok(o)) => {
+                        // C1: a leftover `modelProvider = "gemini"` (from an
+                        // earlier `api_key` setting) keeps agy on the key route
+                        // even with the setting removed; without a key every
+                        // call fails. Say so once; never edit the file here.
+                        if auth == setup::AntigravityAuth::Unset
+                            && o.had_gemini_provider
+                            && duduclaw_core::provider_env::resolve_env_key(setup::GEMINI_PROVIDER)
+                                .is_none()
+                        {
+                            static STALE_WARNED: std::sync::Once = std::sync::Once::new();
+                            STALE_WARNED.call_once(|| {
+                                tracing::warn!(
+                                    runtime = "antigravity",
+                                    "agy is still on the Gemini API-key route (modelProvider = \"gemini\" \
+                                     in ~/.gemini/antigravity-cli/settings.json, left by an earlier \
+                                     [antigravity] auth = \"api_key\") but no GEMINI_API_KEY is set — \
+                                     set config.toml [antigravity] auth = \"login\" to switch back to \
+                                     Google sign-in, or supply a Gemini key"
+                                );
+                            });
+                        }
+                        None
+                    }
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(e) => Some(format!("settings task join failed: {e}")),
+                };
+                if let Some(e) = failure {
+                    if api_key_mode {
+                        return Err(format!(
+                            "Antigravity API key 模式需要在 ~/.gemini/antigravity-cli/settings.json \
+                             寫入 \"modelProvider\": \"gemini\"，但寫入失敗：{e}"
+                        ));
+                    }
+                    tracing::warn!(
+                        runtime = "antigravity",
+                        agent = %context.agent_id,
+                        error = %e,
+                        "could not update agy settings.json, so the workspace could not be marked \
+                         trusted — agy may wait on its interactive trust prompt until the print \
+                         timeout; continuing"
+                    );
+                }
+            }
+            None if api_key_mode => {
+                return Err(
+                    "Antigravity API key 模式找不到使用者 HOME，無法設定 agy 的 modelProvider"
+                        .to_string(),
+                );
+            }
+            None => {}
+        }
+
+        // MCP wiring: register the duduclaw MCP server in the workspace agy
+        // actually opens. Idempotent merge; warn-not-fatal — registration
+        // failing must not block the reply.
+        if let Some(ref root) = work_root {
+            if let Err(e) = self.ensure_duduclaw_mcp_config(root, &context.home_dir).await {
                 tracing::warn!(
                     runtime = "antigravity",
                     agent = %context.agent_id,
                     error = %e,
-                    "failed to write antigravity MCP settings — continuing without it"
+                    "failed to write antigravity .agents/mcp_config.json — continuing without it"
                 );
+            }
+        }
+        // The pre-2026-10 per-agent settings file was never read by agy and
+        // holds a plaintext agent token: remove it when that is all it holds.
+        if let Some(ref dir) = context.agent_dir {
+            let d = dir.clone();
+            match tokio::task::spawn_blocking(move || setup::remove_legacy_agent_settings(&d)).await
+            {
+                Ok(Ok(true)) => info!(
+                    runtime = "antigravity",
+                    agent = %context.agent_id,
+                    "removed legacy per-agent antigravity settings.json (unused MCP block)"
+                ),
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    runtime = "antigravity",
+                    agent = %context.agent_id,
+                    error = %e,
+                    "failed to remove legacy per-agent antigravity settings.json"
+                ),
+                Err(e) => tracing::warn!(
+                    runtime = "antigravity",
+                    agent = %context.agent_id,
+                    error = %e,
+                    "legacy settings cleanup join failed"
+                ),
             }
         }
 
@@ -450,30 +582,7 @@ impl AgentRuntime for AntigravityRuntime {
 
         // Point agy at the working root as its workspace so it does not silently
         // spin up a default `~/.gemini/antigravity-cli/scratch/` project.
-        //
-        // Working root: normally the agent's own directory, but a caller may
-        // override the cwd via `super::SPAWN_OVERRIDE` (today: the team
-        // composer, putting a role member in the employee's workspace so its
-        // files outlive the throwaway scaffold — design §4.3 E3). Until the
-        // 2026-09-28 review this runtime ignored the override, so an agy role
-        // member's work was deleted by the immediate GC. Identity is NOT
-        // affected: the MCP settings written above stay keyed to `agent_dir`.
-        //
-        // CRITICAL: agy shows an *interactive* "trust this workspace?" prompt for
-        // any dir not in `trustedWorkspaces`. In a headless subprocess (no TTY)
-        // that prompt blocks forever — `--dangerously-skip-permissions` only
-        // auto-approves *tool* calls, not workspace trust. So we pre-seed the
-        // working root (the dir agy actually opens) into agy's settings before
-        // spawning. Best-effort: a failure here just risks the prompt, it must
-        // not abort the call.
-        let work_root: Option<std::path::PathBuf> =
-            super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
         if let Some(ref dir) = work_root {
-            let d = dir.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || ensure_workspace_trusted(&d)).await
-            {
-                tracing::warn!(agent = %context.agent_id, error = %e, "ensure_workspace_trusted join failed");
-            }
             cmd.arg("--add-dir").arg(dir);
             cmd.current_dir(dir);
         }
@@ -481,11 +590,47 @@ impl AgentRuntime for AntigravityRuntime {
         // Prompt LAST, as the value of `-p` (see ordering note above).
         cmd.arg("-p").arg(&payload);
 
-        // Pass API key if available (Antigravity's own env var).
-        let api_key = std::env::var("ANTIGRAVITY_API_KEY").unwrap_or_default();
-        if !api_key.is_empty() {
-            cmd.env("ANTIGRAVITY_API_KEY", &api_key);
+        // Identity for the MCP child agy starts (it inherits this env), the MCP
+        // forward set and this call's DUDUCLAW_HOME — same as the Grok runtime.
+        for (k, v) in setup::identity_env_pairs(&context.home_dir, &context.agent_id) {
+            cmd.env(k, v);
         }
+        match auth {
+            setup::AntigravityAuth::ApiKey => {
+                // The resolved key is the only Gemini key agy sees.
+                for name in duduclaw_core::provider_env::provider_env_key_names(setup::GEMINI_PROVIDER) {
+                    cmd.env_remove(name);
+                }
+                if let Some(ref key) = gemini_key {
+                    cmd.env(setup::GEMINI_KEY_ENV, key.expose());
+                }
+            }
+            setup::AntigravityAuth::Login => {
+                // Explicit Google sign-in: no key reaches agy.
+                for name in duduclaw_core::provider_env::provider_env_key_names(setup::GEMINI_PROVIDER) {
+                    cmd.env_remove(name);
+                }
+            }
+            setup::AntigravityAuth::Unset => {}
+        }
+        #[cfg(test)]
+        if let Some(ref h) = self.hooks.user_home {
+            // Test-only: point the child at the temp HOME whose settings the
+            // runtime just wrote, never the developer's real ~/.gemini, and
+            // keep the run hermetic from this shell's DuDuClaw instance.
+            cmd.env("HOME", h);
+            for var in [
+                "DUDUCLAW_MCP_API_KEY",
+                "DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED",
+                "DUDUCLAW_PORT",
+                "DUDUCLAW_INSTANCE",
+            ] {
+                cmd.env_remove(var);
+            }
+        }
+        // Kept in scope until the result is built: every string derived from
+        // agy's output is scrubbed of it (and of any Google-key shape).
+        let key_for_redaction: Option<&str> = gemini_key.as_ref().map(|k| k.expose());
 
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -512,7 +657,7 @@ impl AgentRuntime for AntigravityRuntime {
 
         if !output.status.success() {
             let code = output.status.code().unwrap_or(-1);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = setup::redact_key(&String::from_utf8_lossy(&output.stderr), key_for_redaction);
             return Err(format!(
                 "Antigravity CLI exited with {code}: {}",
                 stderr.chars().take(500).collect::<String>()
@@ -520,7 +665,8 @@ impl AgentRuntime for AntigravityRuntime {
         }
 
         let raw = String::from_utf8_lossy(&output.stdout);
-        let parsed = parse_stream_output(&raw)?;
+        let parsed =
+            parse_stream_output(&raw).map_err(|e| setup::redact_key(&e, key_for_redaction))?;
         if let Some(reason) = parsed.degraded {
             tracing::warn!(
                 runtime = "antigravity",
@@ -546,7 +692,7 @@ impl AgentRuntime for AntigravityRuntime {
         // dropped by every channel and poison the session with an empty
         // assistant turn.
         if content.is_empty() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = setup::redact_key(&String::from_utf8_lossy(&output.stderr), key_for_redaction);
             return Err(format!(
                 "Empty response from Antigravity CLI (exit 0); stderr tail: {}",
                 duduclaw_core::truncate_bytes(stderr.trim(), 300)
@@ -593,90 +739,49 @@ impl AntigravityRuntime {
 // ── MCP config ──────────────────────────────────────────────────
 
 impl AntigravityRuntime {
-    /// Write MCP server configuration to Antigravity settings.
+    /// Write MCP server definitions into `<work_root>/.agents/mcp_config.json`,
+    /// the workspace file agy loads for a trusted workspace (agy ignores
+    /// `mcpServers` inside any `settings.json` — measured on 1.2.14).
     ///
-    /// If `agent_dir` is provided, writes to
-    /// `agent_dir/.gemini/antigravity-cli/settings.json` for per-agent isolation.
-    /// Otherwise writes to the global `~/.gemini/antigravity-cli/settings.json`.
-    ///
-    /// Merges per server name (other `mcpServers` entries and unrelated settings —
-    /// e.g. `trustedWorkspaces` — are preserved) and is idempotent: returns
-    /// `Ok(false)` without writing when every requested entry already matches.
+    /// Merges per server name (other servers and unrelated keys are preserved)
+    /// under a cross-process lock kept under `duduclaw_home` (never in the
+    /// agent-writable workspace) and is idempotent: returns `Ok(false)` without
+    /// writing when every requested entry already matches. Symlink-safe: a
+    /// symlinked `.agents` or `mcp_config.json` is refused (see
+    /// `antigravity_setup::write_mcp_config`). Definitions should carry no
+    /// `env` block — identity belongs in the spawn environment.
     pub async fn write_mcp_config(
-        agent_dir: Option<&std::path::Path>,
+        work_root: &std::path::Path,
+        duduclaw_home: &std::path::Path,
         servers: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bool, String> {
-        let settings_path = if let Some(dir) = agent_dir {
-            dir.join(".gemini")
-                .join("antigravity-cli")
-                .join("settings.json")
-        } else {
-            dirs::home_dir()
-                .ok_or("No home dir")?
-                .join(".gemini")
-                .join("antigravity-cli")
-                .join("settings.json")
-        };
-        let existing = tokio::fs::read_to_string(&settings_path)
+        let root = work_root.to_path_buf();
+        let home = duduclaw_home.to_path_buf();
+        let mut list: Vec<(String, serde_json::Value)> = servers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        list.sort_by(|a, b| a.0.cmp(&b.0));
+        tokio::task::spawn_blocking(move || setup::write_mcp_config(&root, &home, &list))
             .await
-            .unwrap_or_else(|_| "{}".to_string());
-        let mut settings: serde_json::Value =
-            serde_json::from_str(&existing).unwrap_or(serde_json::json!({}));
-        if !settings.is_object() {
-            settings = serde_json::json!({});
-        }
-        let mcp = settings
-            .as_object_mut()
-            .expect("settings is an object — normalized above")
-            .entry("mcpServers")
-            .or_insert(serde_json::json!({}));
-        if !mcp.is_object() {
-            *mcp = serde_json::json!({});
-        }
-        let map = mcp
-            .as_object_mut()
-            .expect("mcpServers normalized to object");
-        let mut changed = false;
-        for (name, def) in servers {
-            if map.get(name) != Some(def) {
-                map.insert(name.clone(), def.clone());
-                changed = true;
-            }
-        }
-        if !changed {
-            return Ok(false);
-        }
-        if let Some(parent) = settings_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        tokio::fs::write(
-            &settings_path,
-            serde_json::to_string_pretty(&settings).unwrap_or_default(),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        // Carries DUDUCLAW_AGENT_TOKEN in plaintext — restrict to the owning
-        // OS user (0600 on Unix; no-op on Windows).
-        duduclaw_core::platform::set_owner_only(&settings_path).ok();
-        Ok(true)
+            .map_err(|e| format!("mcp_config write task join failed: {e}"))?
+            .map_err(|e| e.to_string())
     }
 
-    /// W2: ensure the duduclaw MCP server (absolute binary + `mcp-server` arg +
-    /// `DUDUCLAW_AGENT_ID` env) is registered in the agent's antigravity
-    /// settings. Called before every spawn; idempotent.
-    pub async fn ensure_duduclaw_mcp_config(
-        agent_dir: &std::path::Path,
-        agent_id: &str,
-        home_dir: &std::path::Path,
+    /// Ensure the duduclaw MCP server (absolute binary + `mcp-server`, no env)
+    /// is registered in `work_root`. Called before every spawn; idempotent.
+    async fn ensure_duduclaw_mcp_config(
+        &self,
+        work_root: &std::path::Path,
+        duduclaw_home: &std::path::Path,
     ) -> Result<bool, String> {
-        let Some(def) = super::duduclaw_mcp_server_json_for_home(agent_id, home_dir) else {
+        let (command, args) = self.mcp_command();
+        let Some(def) = setup::mcp_server_entry(&command, &args) else {
             return Err("duduclaw binary did not resolve to an absolute path".to_string());
         };
         let mut servers = std::collections::HashMap::new();
-        servers.insert("duduclaw".to_string(), def);
-        Self::write_mcp_config(Some(agent_dir), &servers).await
+        servers.insert(setup::MCP_SERVER_NAME.to_string(), def);
+        Self::write_mcp_config(work_root, duduclaw_home, &servers).await
     }
 }
 
@@ -973,5 +1078,203 @@ mod tests {
         eprintln!("agy responded: {:?}", resp.content);
         assert!(!resp.content.is_empty(), "empty response from agy");
         assert_eq!(resp.runtime_name, "antigravity");
+    }
+
+    // ── 2026-10 key route + MCP registration, against the REAL agy ──────────
+    //
+    // Both tests point the agy child's HOME at a temp directory (test-only hook;
+    // production never overrides HOME), so the developer's real `~/.gemini` and
+    // Google sign-in are never read or written, and use a FAKE key, so no model
+    // call can succeed. Run with:
+    //   cargo test -p duduclaw-gateway --lib --no-default-features -- --ignored \
+    //     e2e_agy_api_key_mode_reaches_gemini_with_the_runtime_settings \
+    //     e2e_agy_starts_the_registered_mcp_server_with_the_agent_identity
+
+    const FAKE_KEY: &str = concat!("AI", "zaSyDUDUCLAW-e2e-fake-key-000000000000");
+
+    fn installed_agy() -> Option<String> {
+        let p = resolve_agy_path();
+        if p != "agy" {
+            return Some(p);
+        }
+        duduclaw_core::which_agy()
+    }
+
+    fn installed_python3() -> Option<std::path::PathBuf> {
+        ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.is_file())
+    }
+
+    struct E2eDirs {
+        _tmp: tempfile::TempDir,
+        user_home: std::path::PathBuf,
+        duduclaw_home: std::path::PathBuf,
+        agent_dir: std::path::PathBuf,
+    }
+
+    fn e2e_dirs() -> E2eDirs {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_home = tmp.path().join("user-home");
+        let duduclaw_home = tmp.path().join("duduclaw-home");
+        let agent_dir = tmp.path().join("agent");
+        for d in [&user_home, &duduclaw_home, &agent_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(
+            duduclaw_home.join("config.toml"),
+            "[antigravity]\nauth = \"api_key\"\n",
+        )
+        .unwrap();
+        E2eDirs {
+            _tmp: tmp,
+            user_home,
+            duduclaw_home,
+            agent_dir,
+        }
+    }
+
+    fn e2e_runtime(
+        agy: String,
+        dirs: &E2eDirs,
+        mcp_command: (std::path::PathBuf, Vec<String>),
+    ) -> AntigravityRuntime {
+        AntigravityRuntime {
+            agy_path: agy,
+            hooks: TestHooks {
+                user_home: Some(dirs.user_home.clone()),
+                gemini_key: Some(FAKE_KEY.to_string()),
+                mcp_command: Some(mcp_command),
+            },
+        }
+    }
+
+    fn e2e_ctx(dirs: &E2eDirs, agent_id: &str) -> RuntimeContext {
+        RuntimeContext {
+            agent_dir: Some(dirs.agent_dir.clone()),
+            system_prompt: String::new(),
+            model: String::new(),
+            max_tokens: 64,
+            home_dir: dirs.duduclaw_home.clone(),
+            agent_id: agent_id.to_string(),
+            preferred_provider: None,
+            conversation_history: vec![],
+            capabilities: None,
+            account_pool: vec![],
+            effort: None,
+            allow_cross_family_failover: false,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "drives the real agy binary (temp HOME, fake key, zero inference)"]
+    async fn e2e_agy_api_key_mode_reaches_gemini_with_the_runtime_settings() {
+        let Some(agy) = installed_agy() else {
+            eprintln!("agy not installed — skipping");
+            return;
+        };
+        let dirs = e2e_dirs();
+        let rt = e2e_runtime(
+            agy,
+            &dirs,
+            (std::path::PathBuf::from("/usr/bin/true"), vec![]),
+        );
+        let err = rt
+            .execute("Reply with exactly: PONG", &e2e_ctx(&dirs, "e2e-agy-key"))
+            .await
+            .expect_err("a fake key must never produce a reply");
+        eprintln!("agy failure text: {err}");
+        assert!(
+            err.contains("API key not valid"),
+            "the Gemini key route was not engaged: {err}"
+        );
+        assert!(!err.contains(FAKE_KEY), "the key must not be echoed: {err}");
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(setup::user_settings_path(&dirs.user_home)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["modelProvider"], "gemini");
+        let canon = dirs.agent_dir.canonicalize().unwrap();
+        assert_eq!(
+            settings["trustedWorkspaces"],
+            serde_json::json!([canon.to_string_lossy()])
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "drives the real agy binary (temp HOME, fake key, stub MCP server)"]
+    async fn e2e_agy_starts_the_registered_mcp_server_with_the_agent_identity() {
+        let Some(agy) = installed_agy() else {
+            eprintln!("agy not installed — skipping");
+            return;
+        };
+        let Some(python) = installed_python3() else {
+            eprintln!("python3 not installed — skipping");
+            return;
+        };
+        let dirs = e2e_dirs();
+        let marker = dirs.user_home.join("mcp-started.txt");
+        let script = dirs.user_home.join("stub_mcp.py");
+        std::fs::write(
+            &script,
+            format!(
+                r#"import json, os, sys
+with open({marker:?}, "a") as f:
+    f.write(os.environ.get("DUDUCLAW_AGENT_ID", "<none>") + "\n")
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if "id" not in msg:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {{"protocolVersion": msg.get("params", {{}}).get("protocolVersion", "2024-11-05"),
+                  "capabilities": {{"tools": {{}}}},
+                  "serverInfo": {{"name": "stub", "version": "0"}}}}
+        out = {{"jsonrpc": "2.0", "id": msg["id"], "result": result}}
+    elif method == "tools/list":
+        out = {{"jsonrpc": "2.0", "id": msg["id"], "result": {{"tools": []}}}}
+    else:
+        out = {{"jsonrpc": "2.0", "id": msg["id"], "error": {{"code": -32601, "message": "no"}}}}
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.stdout.flush()
+"#,
+                marker = marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        // A pre-2026-10 per-agent file holding only the plaintext MCP block.
+        let legacy = setup::legacy_agent_settings_path(&dirs.agent_dir);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(
+            &legacy,
+            r#"{"mcpServers":{"duduclaw":{"env":{"DUDUCLAW_AGENT_TOKEN":"stale"}}}}"#,
+        )
+        .unwrap();
+
+        let rt = e2e_runtime(
+            agy,
+            &dirs,
+            (python, vec![script.to_string_lossy().into_owned()]),
+        );
+        let res = rt
+            .execute("Reply with exactly: PONG", &e2e_ctx(&dirs, "e2e-agy-mcp"))
+            .await;
+        let err = res.expect_err("a fake key must never produce a reply");
+        eprintln!("agy failure text: {err}");
+
+        let cfg = std::fs::read_to_string(setup::mcp_config_path(&dirs.agent_dir)).unwrap();
+        assert!(!cfg.contains("DUDUCLAW_AGENT"), "identity must not be on disk: {cfg}");
+        assert!(!legacy.exists(), "the mcp-only legacy file must be deleted");
+
+        let started = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert!(
+            started.lines().any(|l| l == "e2e-agy-mcp"),
+            "stub MCP server was not started with the agent id; marker: {started:?}"
+        );
     }
 }

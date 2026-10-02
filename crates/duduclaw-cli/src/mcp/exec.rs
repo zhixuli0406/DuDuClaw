@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) async fn handle_execute_program(args: &Value) -> Value {
+pub(crate) async fn handle_execute_program(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
     use crate::ptc::sandbox::{PtcRpcServer, PtcSandbox};
     use crate::ptc::types::{ScriptLanguage, ScriptRequest};
 
@@ -50,19 +50,18 @@ pub(crate) async fn handle_execute_program(args: &Value) -> Value {
         max_output_bytes: MAX_OUTPUT_BYTES,
     };
 
-    // Create a temporary RPC server for the sandbox execution.
-    // If a PTC socket is already set in the environment, reuse that path;
-    // otherwise create a unique temporary socket path.
-    let socket_path = std::env::var("DUDUCLAW_PTC_SOCKET")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::temp_dir().join(format!("duduclaw_ptc_exec_{}.sock", std::process::id()))
-        });
+    // The RPC bridge descriptor. Nothing serves this socket yet
+    // (`PtcRpcServer` has no listener) and the container path never mounts
+    // it. The path is always our own per-process name — never one taken
+    // from the environment, since dropping the descriptor deletes the file.
+    let socket_path =
+        std::env::temp_dir().join(format!("duduclaw_ptc_exec_{}.sock", std::process::id()));
     let rpc_server = PtcRpcServer::new(socket_path);
 
-    // Use PtcSandbox::execute_in_container which tries container isolation
-    // first and falls back to direct subprocess execution.
-    match PtcSandbox::execute_in_container(&req, &rpc_server).await {
+    // Container isolation first; when it cannot run, `[container.sandbox]
+    // script_when_unavailable` decides between refusing (default) and an
+    // audited host run.
+    match PtcSandbox::run_program(&req, &rpc_server, home_dir, default_agent).await {
         Ok(result) => {
             if result.exit_code == 0 {
                 serde_json::json!({
@@ -343,4 +342,26 @@ pub(crate) async fn handle_session_restore_context(args: &Value) -> Value {
             "note": "Search for hidden/archived messages. Results returned when session context is available.",
         }).to_string() }],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused script sandbox reaches the tool result the model (and the
+    /// operator reading the transcript) sees: reason code and remedy, flagged
+    /// as an error, never replaced by a generic label.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn script_sandbox_refusal_reaches_the_tool_result() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[container.sandbox]\npids = 0\n").unwrap();
+        let args = serde_json::json!({ "code": "echo hi", "language": "bash" });
+        let result = handle_execute_program(&args, home.path(), "worker").await;
+        assert_eq!(result["isError"], serde_json::json!(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("Script sandbox unavailable (invalid_config)"), "{text}");
+        assert!(text.contains("The script was not run"), "{text}");
+        assert!(text.contains("Fix the [container.sandbox] section of config.toml"), "{text}");
+    }
 }

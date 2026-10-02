@@ -42,6 +42,10 @@ pub struct ForkSettings {
     /// `HeuristicJudge` on any LLM failure). Unknown values fall back to
     /// `"heuristic"` with a logged warning (fail-safe).
     pub judge: String,
+    /// Hours an unresolved fork's retained branch workspaces
+    /// (`<home>/fork_ws/<fork_id>/`) survive before the sweep deletes them.
+    /// Missing / `< 1` ⇒ 24.
+    pub retained_workspace_ttl_hours: u64,
 }
 
 impl Default for ForkSettings {
@@ -56,6 +60,7 @@ impl Default for ForkSettings {
             test_timeout_s: 120,
             fine_grained_judge: false,
             judge: "heuristic".to_string(),
+            retained_workspace_ttl_hours: 24,
         }
     }
 }
@@ -129,6 +134,11 @@ fn fork_settings_from_section(f: duduclaw_core::types::ForkSection) -> ForkSetti
             }
             None => def.judge.clone(),
         },
+        retained_workspace_ttl_hours: f
+            .retained_workspace_ttl_hours
+            .filter(|n| *n >= 1)
+            .map(|n| n as u64)
+            .unwrap_or(def.retained_workspace_ttl_hours),
     }
 }
 
@@ -164,6 +174,73 @@ pub fn fork_store_path(home_dir: &Path) -> std::path::PathBuf {
 pub fn open_store(home_dir: &Path) -> Result<ForkStore, Value> {
     ForkStore::open(fork_store_path(home_dir))
         .map_err(|e| err(format!("could not open fork store: {e}")))
+}
+
+// ── Retained workspaces (`<home>/fork_ws`) ──────────────────────────────────
+
+/// Root of retained branch workspaces for this home.
+pub fn retained_root(home_dir: &Path) -> std::path::PathBuf {
+    duduclaw_fork::retention::retained_root(home_dir)
+}
+
+/// Delete retained fork workspaces older than the configured TTL. Best-effort.
+fn sweep_retained(home_dir: &Path, settings: &ForkSettings) {
+    let ttl = std::time::Duration::from_secs(
+        settings.retained_workspace_ttl_hours.saturating_mul(3600),
+    );
+    duduclaw_fork::retention::sweep_expired(&retained_root(home_dir), ttl);
+}
+
+/// Remove a fork's retained workspaces and clear their store paths. Best-effort.
+pub(crate) fn discard_retained_fork(home_dir: &Path, store: &ForkStore, fork_id: &str) {
+    if let Err(e) = duduclaw_fork::retention::remove_fork(&retained_root(home_dir), fork_id) {
+        tracing::warn!("fork {fork_id}: removing retained workspaces failed: {e}");
+    }
+    let _ = store.clear_fork_workspaces(fork_id);
+}
+
+/// Resolve the retained workspace + recorded parent for a manual selection.
+/// Every check fails closed with an explicit reason.
+fn retained_promotion_paths(
+    home_dir: &Path,
+    store: &ForkStore,
+    fork_id: &str,
+    branch_id: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let fork_dir = duduclaw_fork::retention::fork_dir(&retained_root(home_dir), fork_id)
+        .map_err(|e| e.to_string())?;
+    let ws = store
+        .branch_workspace(branch_id)
+        .map_err(|e| format!("store error: {e}"))?
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            format!(
+                "no retained workspace for branch {branch_id} (the fork was never executed, \
+                 the branch did not finish, or its workspace expired); nothing can be promoted"
+            )
+        })?;
+    if !ws.is_dir() {
+        return Err(format!(
+            "retained workspace for branch {branch_id} is missing on disk; nothing can be promoted"
+        ));
+    }
+    if !duduclaw_fork::retention::is_contained(&fork_dir, &ws) {
+        return Err(format!(
+            "retained workspace for branch {branch_id} is outside this fork's retention directory"
+        ));
+    }
+    let parent = store
+        .parent_workspace(fork_id)
+        .map_err(|e| format!("store error: {e}"))?
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| format!("no parent workspace recorded for fork {fork_id}"))?;
+    if !parent.is_dir() {
+        return Err(format!(
+            "parent workspace {} no longer exists; nothing was promoted",
+            parent.display()
+        ));
+    }
+    Ok((ws, parent))
 }
 
 // ── JSON helpers (match existing handler envelope) ──────────────────────────
@@ -230,6 +307,12 @@ pub async fn handle_fork_run(args: &Value, home_dir: &Path, agent_id: &str) -> V
         Ok(s) => s,
         Err(e) => return e,
     };
+    if let Err(error) = duduclaw_core::with_file_lock(&home_dir.join("fork_resolution.lock"), || {
+        sweep_retained(home_dir, &settings);
+        Ok(())
+    }) {
+        return err(format!("fork retention lock unavailable: {error}"));
+    }
 
     let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p.to_string(),
@@ -464,53 +547,109 @@ pub async fn handle_diff_branches(args: &Value, home_dir: &Path, agent_id: &str)
 }
 
 /// `merge_or_select` — resolve a fork. With `branch_id` selects explicitly.
+///
+/// An explicit selection promotes the branch's **retained** workspace
+/// (`<home>/fork_ws/<fork_id>/<branch_id>/`, kept when the fork finished
+/// without a final resolution) into the parent the fork was taken from, under
+/// the same copy policy as execution-time promotion. When that workspace or
+/// the parent is gone, the call errors and the fork stays unresolved — it never
+/// reports a promotion that did not happen.
 pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
     }
-    let store = match open_store(home_dir) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let fork_id = match args.get("fork_id").and_then(|v| v.as_str()) {
-        Some(f) => f.to_string(),
-        None => return err("fork_id is required"),
-    };
-    let explicit = args
-        .get("branch_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let fork = match store.get_fork(&fork_id) {
-        Ok(Some(f)) => f,
-        Ok(None) => return err(format!("fork not found: {fork_id}")),
-        Err(e) => return err(format!("store error: {e}")),
-    };
-    if fork.resolved {
-        return err(format!("fork already resolved (winner: {:?})", fork.winner));
-    }
-    let branches = store.list_branches(&fork_id).unwrap_or_default();
-
-    let winner = match explicit {
-        Some(id) => {
-            if !branches.iter().any(|b| b.branch_id == id) {
-                return err(format!("branch not found in fork: {id}"));
+    match duduclaw_core::with_file_lock(&home_dir.join("fork_resolution.lock"), || {
+        let value = (|| {
+            let store = match open_store(home_dir) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            sweep_retained(home_dir, &settings);
+            let fork_id = match args.get("fork_id").and_then(|v| v.as_str()) {
+                Some(f) => f.to_string(),
+                None => return err("fork_id is required"),
+            };
+            let explicit = args
+                .get("branch_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // Ids end up in filesystem paths: validate before any lookup (fail closed).
+            if let Err(e) = duduclaw_fork::retention::validate_id(&fork_id) {
+                return err(e.to_string());
             }
-            id
-        }
-        None => {
-            return err(
-                "automatic judge selection runs during fork execution; pass branch_id to select explicitly here",
-            );
-        }
-    };
+            if let Some(id) = &explicit {
+                if let Err(e) = duduclaw_fork::retention::validate_id(id) {
+                    return err(e.to_string());
+                }
+            }
 
-    let aggregate = branches.iter().map(|b| b.spent_usd).sum();
-    if let Err(e) = store.set_resolution(&fork_id, Some(&winner), true, true, aggregate) {
-        return err(format!("store error: {e}"));
+            let fork = match store.get_fork(&fork_id) {
+                Ok(Some(f)) => f,
+                Ok(None) => return err(format!("fork not found: {fork_id}")),
+                Err(e) => return err(format!("store error: {e}")),
+            };
+            // Promotion now writes files into the fork's parent workspace: only the
+            // agent that owns the fork may do that.
+            if fork.agent_id != agent_id {
+                return err(format!("fork {fork_id} belongs to another agent"));
+            }
+            if fork.resolved {
+                discard_retained_fork(home_dir, &store, &fork_id);
+                return err(format!("fork already resolved (winner: {:?})", fork.winner));
+            }
+            let branches = store.list_branches(&fork_id).unwrap_or_default();
+
+            let winner = match explicit {
+                Some(id) => {
+                    if !branches.iter().any(|b| b.branch_id == id) {
+                        return err(format!("branch not found in fork: {id}"));
+                    }
+                    id
+                }
+                None => {
+                    return err(
+                        "automatic judge selection runs during fork execution; pass branch_id to select explicitly here",
+                    );
+                }
+            };
+
+            let (ws, parent) = match retained_promotion_paths(home_dir, &store, &fork_id, &winner) {
+                Ok(p) => p,
+                Err(e) => return err(e),
+            };
+            match duduclaw_fork::with_parent_publication(&parent, |publication| {
+                let report = match publication.promote(
+                    &ws,
+                    &duduclaw_fork::CopyPolicy::promote_for_parent(&parent, home_dir),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => return Ok(err(format!("promotion failed, fork left unresolved: {e}"))),
+                };
+
+                let aggregate = branches.iter().map(|b| b.spent_usd).sum();
+                if let Err(e) = store.set_resolution(&fork_id, Some(&winner), true, true, aggregate) {
+                    return Ok(err(format!("files were promoted but the store update failed: {e}")));
+                }
+                discard_retained_fork(home_dir, &store, &fork_id);
+                Ok(ok_json(json!({
+                    "fork_id": fork_id,
+                    "resolved": true,
+                    "promoted": true,
+                    "winner": winner,
+                    "files_copied": report.files_copied,
+                    "dropped_by_policy": report.excluded + report.symlinks_dropped + report.special_dropped,
+                })))
+            }) {
+                Ok(value) => value,
+                Err(error) => err(format!("fork parent publication lock unavailable: {error}")),
+            }
+        })();
+        Ok(value)
+    }) {
+        Ok(value) => value,
+        Err(error) => err(format!("fork resolution lock unavailable: {error}")),
     }
-    ok_json(json!({ "fork_id": fork_id, "resolved": true, "winner": winner }))
 }
 
 /// `terminate_branch` — mark a branch terminated (kills its subprocess in P4 follow-up).
@@ -519,36 +658,63 @@ pub async fn handle_terminate_branch(args: &Value, home_dir: &Path, agent_id: &s
     if let Some(e) = require_enabled(&settings) {
         return e;
     }
-    let store = match open_store(home_dir) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let fork_id = match args.get("fork_id").and_then(|v| v.as_str()) {
-        Some(f) => f.to_string(),
-        None => return err("fork_id is required"),
-    };
-    let branch_id = match args.get("branch_id").and_then(|v| v.as_str()) {
-        Some(b) => b.to_string(),
-        None => return err("branch_id is required"),
-    };
-    let branches = store.list_branches(&fork_id).unwrap_or_default();
-    let current = match branches.iter().find(|b| b.branch_id == branch_id) {
-        Some(b) => b,
-        None => return err(format!("branch not found in fork: {branch_id}")),
-    };
-    // Signal the executor to skip the branch if it hasn't started yet (a running
-    // subprocess is killed on task drop / shutdown via kill_on_drop).
-    crate::mcp_fork_exec::request_cancel(&branch_id);
-    match store.update_branch(
-        &branch_id,
-        "terminated",
-        current.spent_usd,
-        &current.output,
-        current.test_exit_code,
-    ) {
-        Ok(true) => ok(format!("branch {branch_id} terminated")),
-        Ok(false) => err(format!("branch not found in fork: {branch_id}")),
-        Err(e) => err(format!("store error: {e}")),
+    match duduclaw_core::with_file_lock(&home_dir.join("fork_resolution.lock"), || {
+        let value = (|| {
+            let store = match open_store(home_dir) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            let fork_id = match args.get("fork_id").and_then(|v| v.as_str()) {
+                Some(f) => f.to_string(),
+                None => return err("fork_id is required"),
+            };
+            let branch_id = match args.get("branch_id").and_then(|v| v.as_str()) {
+                Some(b) => b.to_string(),
+                None => return err("branch_id is required"),
+            };
+            for id in [&fork_id, &branch_id] {
+                if let Err(e) = duduclaw_fork::retention::validate_id(id) {
+                    return err(e.to_string());
+                }
+            }
+            match store.get_fork(&fork_id) {
+                Ok(Some(fork)) if fork.agent_id == agent_id => {}
+                Ok(Some(_)) => return err("fork belongs to another agent"),
+                Ok(None) => return err(format!("fork not found: {fork_id}")),
+                Err(error) => return err(format!("store error: {error}")),
+            }
+            let branches = store.list_branches(&fork_id).unwrap_or_default();
+            let current = match branches.iter().find(|b| b.branch_id == branch_id) {
+                Some(b) => b,
+                None => return err(format!("branch not found in fork: {branch_id}")),
+            };
+            // Signal the executor to skip the branch if it hasn't started yet (a running
+            // subprocess is killed on task drop / shutdown via kill_on_drop).
+            crate::mcp_fork_exec::request_cancel(&branch_id);
+            // A terminated branch can no longer be selected: drop its retained
+            // workspace (and the fork dir once empty) instead of leaving it behind.
+            if let Err(e) =
+                duduclaw_fork::retention::remove_branch(&retained_root(home_dir), &fork_id, &branch_id)
+            {
+                tracing::warn!("fork {fork_id}: removing retained branch {branch_id} failed: {e}");
+            }
+            let _ = store.set_branch_workspace(&branch_id, None);
+            match store.update_branch(
+                &branch_id,
+                "terminated",
+                current.spent_usd,
+                &current.output,
+                current.test_exit_code,
+            ) {
+                Ok(true) => ok(format!("branch {branch_id} terminated")),
+                Ok(false) => err(format!("branch not found in fork: {branch_id}")),
+                Err(e) => err(format!("store error: {e}")),
+            }
+        })();
+        Ok(value)
+    }) {
+        Ok(value) => value,
+        Err(error) => err(format!("fork resolution lock unavailable: {error}")),
     }
 }
 
@@ -709,6 +875,7 @@ test_timeout_s = 60
             assert_eq!(s.test_timeout_s, 120, "{body:?}");
             assert!(!s.fine_grained_judge, "{body:?}");
             assert_eq!(s.judge, "heuristic", "{body:?}");
+            assert_eq!(s.retained_workspace_ttl_hours, 24, "{body:?}");
         }
     }
 
@@ -872,16 +1039,52 @@ test_timeout_s = 60
         assert!(is_error(&v));
     }
 
-    #[tokio::test]
-    async fn merge_explicit_selection() {
-        let home = enabled_home();
-        let run = handle_fork_run(&json!({"prompt": "x", "n": 2}), home.path(), "a1").await;
+    /// Fork via the handler (no execution backend in tests), then stage what a
+    /// finished-but-unresolved execution would have left behind: a retained
+    /// workspace for `branch` and the recorded parent.
+    fn stage_retained(
+        home: &Path,
+        fork_id: &str,
+        branch: &str,
+        parent: &Path,
+    ) -> std::path::PathBuf {
+        let ws = retained_root(home).join(fork_id).join(branch);
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = open_store(home).unwrap();
+        assert!(
+            store
+                .set_parent_workspace(fork_id, Some(&parent.to_string_lossy()))
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_branch_workspace(branch, Some(&ws.to_string_lossy()))
+                .unwrap()
+        );
+        ws
+    }
+
+    async fn fork_two(home: &Path) -> (String, String) {
+        let run = handle_fork_run(&json!({"prompt": "x", "n": 2}), home, "a1").await;
         let payload: Value = serde_json::from_str(&text(&run)).unwrap();
-        let fork_id = payload["fork_id"].as_str().unwrap().to_string();
-        let winner = payload["branches"][0]["branch_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        (
+            payload["fork_id"].as_str().unwrap().to_string(),
+            payload["branches"][0]["branch_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn merge_explicit_selection_promotes_retained_workspace() {
+        let home = enabled_home();
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::write(parent.path().join("keep.txt"), "parent").unwrap();
+        let (fork_id, winner) = fork_two(home.path()).await;
+        let ws = stage_retained(home.path(), &fork_id, &winner, parent.path());
+        std::fs::write(ws.join("made_in_branch.txt"), "branch output").unwrap();
+        std::fs::write(ws.join(".env"), "SECRET=1").unwrap();
 
         let m = handle_merge_or_select(
             &json!({"fork_id": fork_id, "branch_id": winner}),
@@ -889,7 +1092,17 @@ test_timeout_s = 60
             "a1",
         )
         .await;
-        assert!(!is_error(&m));
+        assert!(!is_error(&m), "{}", text(&m));
+        assert_eq!(
+            std::fs::read_to_string(parent.path().join("made_in_branch.txt")).unwrap(),
+            "branch output"
+        );
+        assert!(parent.path().join("keep.txt").is_file());
+        assert!(!parent.path().join(".env").exists(), "secrets are never promoted");
+        let fork = open_store(home.path()).unwrap().get_fork(&fork_id).unwrap().unwrap();
+        assert!(fork.promoted && fork.resolved);
+        assert_eq!(fork.winner.as_deref(), Some(winner.as_str()));
+        assert!(!retained_root(home.path()).join(&fork_id).exists());
 
         // Second resolve fails (already resolved).
         let m2 = handle_merge_or_select(
@@ -899,6 +1112,243 @@ test_timeout_s = 60
         )
         .await;
         assert!(is_error(&m2));
+    }
+
+    #[tokio::test]
+    async fn concurrent_manual_selection_adopts_only_once() {
+        let home = enabled_home();
+        let parent = tempfile::tempdir().unwrap();
+        let (fork_id, winner) = fork_two(home.path()).await;
+        let workspace = stage_retained(home.path(), &fork_id, &winner, parent.path());
+        for i in 0..100 {
+            std::fs::write(workspace.join(format!("file-{i}")), vec![b'x'; 1024]).unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads = (0..2).map(|_| {
+            let home = home.path().to_path_buf();
+            let args = json!({"fork_id":fork_id,"branch_id":winner});
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                barrier.wait();
+                runtime.block_on(handle_merge_or_select(&args, &home, "a1"))
+            })
+        }).collect::<Vec<_>>();
+        let results = threads.into_iter().map(|thread| thread.join().unwrap()).collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|value| !is_error(value)).count(), 1);
+        assert_eq!(results.iter().filter(|value| is_error(value)).count(), 1);
+        assert!(parent.path().join("file-99").is_file());
+        let record = open_store(home.path()).unwrap().get_fork(&fork_id).unwrap().unwrap();
+        assert!(record.resolved && record.promoted);
+        assert_eq!(record.winner, Some(winner));
+    }
+
+    #[test]
+    fn same_parent_different_homes_share_publication_through_commit_and_cleanup() {
+        let first_home = enabled_home();
+        let second_home = enabled_home();
+        let parent = tempfile::tempdir().unwrap();
+        for name in ["winner.txt", "paired.txt"] {
+            std::fs::write(parent.path().join(name), "original").unwrap();
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut fixtures = Vec::new();
+        for (home, tag) in [(first_home.path(), "first"), (second_home.path(), "second")] {
+            let (fork_id, winner) = runtime.block_on(fork_two(home));
+            let workspace = stage_retained(home, &fork_id, &winner, parent.path());
+            for name in ["winner.txt", "paired.txt"] {
+                std::fs::write(workspace.join(name), tag).unwrap();
+            }
+            fixtures.push((home.to_path_buf(), fork_id, winner, workspace));
+        }
+        let mut workers = Vec::new();
+        let (started, await_started) = std::sync::mpsc::channel();
+        let before_release = duduclaw_fork::with_parent_publication(parent.path(), |_| {
+            for (home, fork_id, winner, _) in &fixtures {
+                let home = home.clone();
+                let args = json!({"fork_id":fork_id,"branch_id":winner});
+                let started = started.clone();
+                workers.push(std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                    started.send(()).unwrap();
+                    runtime.block_on(handle_merge_or_select(&args, &home, "a1"))
+                }));
+            }
+            for _ in 0..2 { await_started.recv_timeout(std::time::Duration::from_secs(5)).unwrap(); }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let contents = ["winner.txt", "paired.txt"].map(|name| std::fs::read_to_string(parent.path().join(name)).unwrap());
+            let sources_and_state = fixtures.iter().all(|(home, fork, _, workspace)| {
+                workspace.exists() && !open_store(home).unwrap().get_fork(fork).unwrap().unwrap().resolved
+            });
+            Ok((contents, sources_and_state))
+        }).unwrap();
+        let responses = workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>();
+        assert_eq!(before_release.0, ["original", "original"]);
+        assert!(before_release.1, "waiting publishers cannot commit or clean their source");
+        assert!(responses.iter().all(|response| !is_error(response)));
+        let winner = std::fs::read_to_string(parent.path().join("winner.txt")).unwrap();
+        assert!(winner == "first" || winner == "second");
+        assert_eq!(std::fs::read_to_string(parent.path().join("paired.txt")).unwrap(), winner);
+        for (home, fork_id, _, workspace) in fixtures {
+            let fork = open_store(&home).unwrap().get_fork(&fork_id).unwrap().unwrap();
+            assert!(fork.resolved && fork.promoted);
+            assert!(!workspace.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_without_retained_workspace_errors_and_stays_unpromoted() {
+        let home = enabled_home();
+        let (fork_id, winner) = fork_two(home.path()).await;
+        let m = handle_merge_or_select(
+            &json!({"fork_id": fork_id, "branch_id": winner}),
+            home.path(),
+            "a1",
+        )
+        .await;
+        assert!(is_error(&m));
+        assert!(text(&m).contains("no retained workspace"));
+        let fork = open_store(home.path()).unwrap().get_fork(&fork_id).unwrap().unwrap();
+        assert!(!fork.promoted && !fork.resolved);
+        assert_eq!(fork.winner, None);
+
+        // Recorded but deleted on disk: still an honest error, still unresolved.
+        let parent = tempfile::tempdir().unwrap();
+        let ws = stage_retained(home.path(), &fork_id, &winner, parent.path());
+        std::fs::remove_dir_all(&ws).unwrap();
+        let m = handle_merge_or_select(
+            &json!({"fork_id": fork_id, "branch_id": winner}),
+            home.path(),
+            "a1",
+        )
+        .await;
+        assert!(is_error(&m));
+        let fork = open_store(home.path()).unwrap().get_fork(&fork_id).unwrap().unwrap();
+        assert!(!fork.promoted && !fork.resolved);
+    }
+
+    #[tokio::test]
+    async fn merge_rejects_workspace_outside_retention_dir() {
+        let home = enabled_home();
+        let parent = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (fork_id, winner) = fork_two(home.path()).await;
+        stage_retained(home.path(), &fork_id, &winner, parent.path());
+        // Tamper: point the branch at a directory outside fork_ws/<fork_id>.
+        open_store(home.path())
+            .unwrap()
+            .set_branch_workspace(&winner, Some(&elsewhere.path().to_string_lossy()))
+            .unwrap();
+        let m = handle_merge_or_select(
+            &json!({"fork_id": fork_id, "branch_id": winner}),
+            home.path(),
+            "a1",
+        )
+        .await;
+        assert!(is_error(&m));
+        let fork = open_store(home.path()).unwrap().get_fork(&fork_id).unwrap().unwrap();
+        assert!(!fork.promoted);
+    }
+
+    #[tokio::test]
+    async fn merge_rejects_malicious_ids() {
+        let home = enabled_home();
+        let (fork_id, _) = fork_two(home.path()).await;
+        for bad in ["../x", "..", "a/b", "..\\x"] {
+            let m = handle_merge_or_select(
+                &json!({"fork_id": fork_id, "branch_id": bad}),
+                home.path(),
+                "a1",
+            )
+            .await;
+            assert!(is_error(&m), "{bad}");
+            assert!(text(&m).contains("invalid"), "{bad}: {}", text(&m));
+        }
+        let m = handle_merge_or_select(
+            &json!({"fork_id": "../etc", "branch_id": "b"}),
+            home.path(),
+            "a1",
+        )
+        .await;
+        assert!(is_error(&m));
+    }
+
+    #[tokio::test]
+    async fn merge_by_other_agent_is_refused() {
+        let home = enabled_home();
+        let other = home.path().join("agents").join("a2");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("agent.toml"), "[fork]\nenabled = true\n").unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let (fork_id, winner) = fork_two(home.path()).await;
+        stage_retained(home.path(), &fork_id, &winner, parent.path());
+        let m = handle_merge_or_select(
+            &json!({"fork_id": fork_id, "branch_id": winner}),
+            home.path(),
+            "a2",
+        )
+        .await;
+        assert!(is_error(&m));
+    }
+
+    #[tokio::test]
+    async fn terminate_by_other_agent_preserves_workspace_and_store() {
+        let home = enabled_home();
+        let other = home.path().join("agents/a2");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("agent.toml"), "[fork]\nenabled = true\n").unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let (fork_id, bid) = fork_two(home.path()).await;
+        let ws = stage_retained(home.path(), &fork_id, &bid, parent.path());
+        std::fs::write(ws.join("owner-output.txt"), "preserved").unwrap();
+        let before = handle_inspect_branches(&json!({"fork_id": fork_id}), home.path(), "a1").await;
+        let denied = handle_terminate_branch(
+            &json!({"fork_id": fork_id, "branch_id": bid}), home.path(), "a2",
+        ).await;
+        assert!(is_error(&denied));
+        assert!(text(&denied).contains("another agent"));
+        assert_eq!(std::fs::read_to_string(ws.join("owner-output.txt")).unwrap(), "preserved");
+        assert_eq!(open_store(home.path()).unwrap().branch_workspace(&bid).unwrap(),
+            Some(ws.to_string_lossy().into_owned()));
+        let after = handle_inspect_branches(&json!({"fork_id": fork_id}), home.path(), "a1").await;
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn terminate_branch_drops_retained_workspace() {
+        let home = enabled_home();
+        let parent = tempfile::tempdir().unwrap();
+        let (fork_id, bid) = fork_two(home.path()).await;
+        stage_retained(home.path(), &fork_id, &bid, parent.path());
+        let t = handle_terminate_branch(
+            &json!({"fork_id": fork_id, "branch_id": bid}),
+            home.path(),
+            "a1",
+        )
+        .await;
+        assert!(!is_error(&t));
+        assert!(!retained_root(home.path()).join(&fork_id).exists());
+        assert_eq!(open_store(home.path()).unwrap().branch_workspace(&bid).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_retained_workspace_ttl() {
+        assert_eq!(parse_fork_settings("[fork]\n").retained_workspace_ttl_hours, 24);
+        assert_eq!(
+            parse_fork_settings("[fork]\nretained_workspace_ttl_hours = 6\n")
+                .retained_workspace_ttl_hours,
+            6
+        );
+        assert_eq!(
+            parse_fork_settings("[fork]\nretained_workspace_ttl_hours = 0\n")
+                .retained_workspace_ttl_hours,
+            24
+        );
+        assert_eq!(
+            parse_fork_settings("[fork]\nretained_workspace_ttl_hours = \"x\"\n")
+                .retained_workspace_ttl_hours,
+            24
+        );
     }
 
     #[tokio::test]

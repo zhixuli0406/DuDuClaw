@@ -62,6 +62,33 @@ pub(crate) async fn handle_create_agent(params: &Value, home_dir: &Path, caller_
         });
     }
 
+    // Removed-name reservation. `agent_remove` moves an employee to `_trash`
+    // instead of deleting it; recreating the same name here would hand the
+    // seat (channel bindings, org position) to a fresh employee without the
+    // operator's CONTRACT.toml / [capabilities] / sandbox settings. Every MCP
+    // caller is treated as an AI caller for this rule: no supported operator
+    // flow creates employees through MCP (the dashboard has `agents.create`,
+    // the terminal has `duduclaw agent create`), and an "operator" signal on
+    // this surface (absent identity env) is something an employee with a shell
+    // can fake by relaunching the server. Fails closed on an unlistable trash.
+    let reservation = duduclaw_core::agent_trash::check_name_reserved_for_ai(home_dir, name);
+    if reservation.is_reserved() {
+        duduclaw_security::audit::log_agent_name_reserved(
+            home_dir,
+            caller_agent,
+            name,
+            "mcp_create_agent",
+            reservation.as_str(),
+        );
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Error: {}",
+                duduclaw_core::agent_trash::name_reserved_message(name, reservation)
+            )}],
+            "isError": true
+        });
+    }
+
     // Agent-count cap (edition / license quota). The dashboard enforces this
     // in `tier_limit_message`; without the same gate here, any agent could
     // `create_agent` its way past the Personal-edition cap or a signed

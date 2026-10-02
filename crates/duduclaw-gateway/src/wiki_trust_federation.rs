@@ -345,6 +345,15 @@ fn is_internal_url(url: &str) -> bool {
     if host_lower.contains('%') {
         return true;
     }
+    // An IP literal is classified by the workspace-wide public-address check
+    // (documentation, benchmarking, multicast, reserved, NAT64/6to4 forms…);
+    // the string patterns below stay as the fallback for shorthand spellings
+    // that do not parse as an `IpAddr`.
+    if let Ok(ip) = host_lower.parse::<std::net::IpAddr>() {
+        if !duduclaw_core::net_addr::is_public_ip(&ip) {
+            return true;
+        }
+    }
     if host_lower == "localhost"
         || host_lower == "0.0.0.0"
         || host_lower.ends_with(".localhost")

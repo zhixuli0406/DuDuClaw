@@ -27,11 +27,19 @@ uuid = { workspace = true }
 
 # Copy-on-write workspace overlay (MVP backend — RFC-26 §6 Q1)
 tempfile = "3"
+sha2 = "0.10"
+fs2 = "0.4"
 
 # Cross-process shared fork store (WAL SQLite) — both the MCP server and the
 # gateway read/write fork state through this.
 rusqlite = { workspace = true }
 chrono = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

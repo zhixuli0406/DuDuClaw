@@ -551,6 +551,16 @@ impl CostTelemetry {
             }
         }
 
+        // A1-3 ledger (2026-09-30): per-round cost attribution for goal-loop
+        // dispatches (`crate::runtime::GOAL_ROUND_ATTRIBUTION`). Nullable,
+        // additive; same "duplicate column name" ignore pattern as above.
+        if let Err(e) = conn.execute("ALTER TABLE token_usage ADD COLUMN round INTEGER", []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(format!("token_usage round migration failed: {e}"));
+            }
+        }
+
         // Ephemeral-agent parent attribution (2026-07): `eph-<uuid>` scaffolds
         // record their parent here at scaffold time (see
         // `crate::ephemeral::scaffold` → [`record_ephemeral_parent`]). Raw
@@ -699,6 +709,15 @@ impl CostTelemetry {
         episode_id: Option<&str>,
     ) {
         let now = chrono::Utc::now().to_rfc3339();
+        // A1-3 ledger: a goal-loop dispatch carries its task id / round in a
+        // task-local. An explicit `episode_id` (team role) wins; the goal
+        // scope only fills what is missing. Absent scope ⇒ both stay as
+        // before (NULL).
+        let goal_round = crate::runtime::GOAL_ROUND_ATTRIBUTION
+            .try_with(Clone::clone)
+            .ok();
+        let episode_id = episode_id.or(goal_round.as_ref().map(|g| g.episode_id.as_str()));
+        let round: Option<i64> = goal_round.as_ref().and_then(|g| g.round);
         let efficiency = usage.cache_efficiency();
         let cost = cost_for(model, usage);
         let cache_hit_rate = usage.cache_efficiency();
@@ -727,8 +746,8 @@ impl CostTelemetry {
              (agent_id, request_type, model, input_tokens, cache_read_tokens,
               cache_creation_tokens, output_tokens, cache_efficiency, cost_millicents,
               cache_hit_rate, cache_savings_millicents, created_at, user_id, channel,
-              compressed, compression_stages, role, episode_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+              compressed, compression_stages, role, episode_id, round)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 agent_id,
                 request_type.as_str(),
@@ -748,6 +767,7 @@ impl CostTelemetry {
                 stages,
                 role,
                 episode_id,
+                round,
             ],
         );
         drop(conn);
@@ -2604,6 +2624,45 @@ mod tests {
         assert_eq!(a[0].requests, 1);
         let all = telemetry.summary_by_role(None, 0).await.unwrap();
         assert_eq!(all.len(), 2, "legacy NULL-role row must not be guessed");
+    }
+
+    #[tokio::test]
+    async fn goal_round_scope_stamps_episode_and_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("goal_round_cost.db");
+        let telemetry = CostTelemetry::new(&path).unwrap();
+        // Reopen: the additive `round` migration must be idempotent.
+        let telemetry2 = CostTelemetry::new(&path).unwrap();
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        crate::runtime::GOAL_ROUND_ATTRIBUTION
+            .scope(
+                crate::runtime::GoalRoundAttribution {
+                    episode_id: "task-g".to_string(),
+                    round: Some(3),
+                },
+                telemetry.record("alice", RequestType::Dispatch, "claude-sonnet-4-6", &usage),
+            )
+            .await;
+        // Outside any scope: both columns stay NULL, as before.
+        telemetry2
+            .record("alice", RequestType::Dispatch, "claude-sonnet-4-6", &usage)
+            .await;
+        let conn = telemetry.conn.lock().await;
+        let rows: Vec<(Option<String>, Option<i64>, Option<String>)> = conn
+            .prepare("SELECT episode_id, round, role FROM token_usage ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (Some("task-g".to_string()), Some(3), None));
+        assert_eq!(rows[1], (None, None, None));
     }
 
     #[tokio::test]

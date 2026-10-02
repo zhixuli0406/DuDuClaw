@@ -1,5 +1,6 @@
 pub mod agent_guard;
 pub mod agent_rename;
+pub mod agent_trash;
 pub mod agent_toml;
 pub mod appliance;
 pub mod autostart;
@@ -25,6 +26,7 @@ pub mod identity_token;
 pub mod keychain;
 pub mod lenient;
 pub mod match_utils;
+pub mod net_addr;
 pub mod mcp_scopes;
 pub mod org;
 pub mod org_field_guard;
@@ -36,6 +38,7 @@ pub mod protected_section;
 pub mod provider_env;
 pub mod relay_protocol;
 pub mod runtime_catalog;
+pub mod sandbox_image;
 pub mod secaudit_config;
 pub mod sensitivity;
 pub mod spawn_admission;
@@ -91,7 +94,8 @@ pub use grounding::{
 };
 pub use identity_token::{
     agent_identity_env_vars, agent_identity_env_vars_default, ensure_key as ensure_identity_key,
-    identity_key_path, load_key as load_identity_key, mint_token as mint_identity_token,
+    identity_key_path, internal_request_signature, load_key as load_identity_key,
+    mint_token as mint_identity_token, verify_internal_request_signature,
     verify_claim as verify_identity_claim, verify_env_identity, verify_token as verify_identity_token,
     IdentityVerdict, ENV_AGENT_TOKEN, IDENTITY_KEY_FILE, UNTRUSTED_AGENT_ID,
 };
@@ -99,7 +103,7 @@ pub use keychain::{resolve_master_key, KeychainError, MasterKeySource};
 pub use match_utils::{is_valid_discord_snowflake, is_valid_egress_host, origin_host_matches, word_contains_ci};
 pub use org_field_guard::{
     check_bash_protected_write, check_caller_scope, check_identity_surface_write,
-    check_own_soul_write, check_protected_toml_write, classify_identity_surface,
+    check_own_contract_write, check_own_soul_write, check_protected_toml_write, classify_identity_surface,
     classify_protected_toml, HookCaller, ProtectedSurface, ProtectedTomlKind,
     AGENT_CAPABILITY_SECTION, AGENT_ORG_FIELDS, CONFIG_PROTECTED_SECTIONS,
 };

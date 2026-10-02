@@ -4,6 +4,8 @@
 //! Each runtime translates its JSONL output format into a unified `RuntimeResponse`.
 
 pub mod antigravity;
+mod antigravity_fs;
+mod antigravity_setup;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
@@ -364,6 +366,21 @@ pub struct RoleCostAttribution {
     pub episode_id: String,
 }
 
+/// A1-3 ledger: which goal task and round a dispatch belongs to, so every
+/// `token_usage` row it records carries `episode_id` = task id and
+/// `round` = the task's `task_iterations.round` (`revision_round + 1` at
+/// dispatch). Scoped by the SQLite-queue dispatcher around a goal-loop work
+/// message and by the team composer around a team round. Absent scope ⇒ both
+/// columns stay NULL, exactly as before. Recording only — never read by any
+/// routing or budget decision.
+#[derive(Debug, Clone)]
+pub struct GoalRoundAttribution {
+    pub episode_id: String,
+    /// `None` when the round could not be resolved (the task-id attribution
+    /// is still kept).
+    pub round: Option<i64>,
+}
+
 tokio::task_local! {
     /// Caller-imposed spawn overrides for this call — see [`SpawnOverride`].
     /// Absent scope ⇒ every runtime builds a byte-identical argv.
@@ -379,6 +396,9 @@ tokio::task_local! {
     pub static ROLE_USAGE: std::sync::Arc<std::sync::Mutex<crate::role_turns::RoleTurnUsage>>;
 
     pub static ROLE_COST_ATTRIBUTION: RoleCostAttribution;
+
+    /// See [`GoalRoundAttribution`].
+    pub static GOAL_ROUND_ATTRIBUTION: GoalRoundAttribution;
 }
 
 /// The caller's cwd override for this spawn, if any. `None` outside a

@@ -98,6 +98,35 @@ pub(crate) const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
     "send_message",
 ];
 
+// ── Parameter types ──────────────────────────────────────────
+
+/// JSON Schema types of the parameters that are not strings, as
+/// `(tool, param, type)`. Every other parameter renders as `"string"`.
+///
+/// An overlay rather than a field on `ParamDef`: the table holds ~530
+/// `ParamDef` literals that are all strings, and a field would have to be
+/// spelled out on every one of them. `param_types_name_real_params` keeps
+/// each row pointing at a parameter that exists.
+pub(crate) const PARAM_TYPES: &[(&str, &str, &str)] = &[
+    ("computer_click", "x", "integer"),
+    ("computer_click", "y", "integer"),
+    ("computer_click", "double", "boolean"),
+    ("computer_scroll", "x", "integer"),
+    ("computer_scroll", "y", "integer"),
+    ("computer_scroll", "amount", "integer"),
+    ("computer_session_start", "width", "integer"),
+    ("computer_session_start", "height", "integer"),
+];
+
+/// The JSON Schema type of one parameter (see [`PARAM_TYPES`]).
+pub(crate) fn param_type(tool: &str, param: &str) -> &'static str {
+    PARAM_TYPES
+        .iter()
+        .find(|(t, p, _)| *t == tool && *p == param)
+        .map(|(_, _, ty)| *ty)
+        .unwrap_or("string")
+}
+
 // ── JSON-RPC helpers ─────────────────────────────────────────
 
 pub(crate) fn build_tool_schema(tool: &ToolDef) -> Value {
@@ -108,7 +137,7 @@ pub(crate) fn build_tool_schema(tool: &ToolDef) -> Value {
         properties.insert(
             param.name.to_string(),
             serde_json::json!({
-                "type": "string",
+                "type": param_type(tool.name, param.name),
                 "description": param.description
             }),
         );
@@ -117,6 +146,29 @@ pub(crate) fn build_tool_schema(tool: &ToolDef) -> Value {
         }
     }
 
+    if tool.name == "tasks_create" {
+        properties.insert("kind".into(),serde_json::json!({"type":"string","enum":["task","goal","discovery"],"default":"task"}));
+        properties.insert("discovery".into(),serde_json::json!({
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "approved_root_id":{"type":"string"},"evaluator":{"type":"string"},
+                "runtime":{"type":"string"},"model":{"type":"string"},
+                "branch_count":{"type":"integer","minimum":1},
+                "refine_count":{"type":"integer","minimum":0},
+                "max_parallelism":{"type":"integer","minimum":1},
+                "direction":{"type":"string","enum":["max","min"],"default":"max"},
+                "budget":{"type":"object","additionalProperties":false,"properties":{
+                    "max_agent_calls":{"type":"integer","minimum":1},
+                    "max_usd":{"type":"number","exclusiveMinimum":0},
+                    "max_wall_secs":{"type":"integer","minimum":1},
+                    "max_rounds":{"type":"integer","minimum":1}},
+                    "required":["max_agent_calls","max_usd","max_wall_secs","max_rounds"]}
+            },"required":["approved_root_id","evaluator","runtime","model","branch_count","refine_count","max_parallelism","budget"]
+        }));
+    }
+    if tool.name == "discovery_list" {
+        properties.insert("limit".into(),serde_json::json!({"type":"integer","minimum":1,"maximum":100,"default":20}));
+    }
     serde_json::json!({
         "name": tool.name,
         "description": tool.description,
@@ -130,7 +182,38 @@ pub(crate) fn build_tool_schema(tool: &ToolDef) -> Value {
 
 #[cfg(test)]
 mod registration_tests {
-    use super::{EXTERNAL_TOOLS_WHITELIST, TOOL_GROUPS, tools};
+    use super::{EXTERNAL_TOOLS_WHITELIST, PARAM_TYPES, TOOL_GROUPS, build_tool_schema, tools};
+
+    #[test]
+    fn param_types_name_real_params() {
+        for (tool, param, ty) in PARAM_TYPES {
+            let def = tools().find(|t| t.name == *tool).unwrap_or_else(|| panic!("{tool} not registered"));
+            assert!(def.params.iter().any(|p| p.name == *param), "{tool}.{param} does not exist");
+            assert!(matches!(*ty, "integer" | "boolean" | "number"), "{tool}.{param}: {ty}");
+        }
+    }
+
+    #[test]
+    fn computer_tool_schemas_declare_integer_and_boolean_params() {
+        let schema = |name: &str| build_tool_schema(tools().find(|t| t.name == name).unwrap());
+        let click = schema("computer_click");
+        let props = &click["inputSchema"]["properties"];
+        assert_eq!(props["x"]["type"], "integer");
+        assert_eq!(props["y"]["type"], "integer");
+        assert_eq!(props["double"]["type"], "boolean");
+        assert_eq!(props["button"]["type"], "string");
+        assert_eq!(click["inputSchema"]["required"], serde_json::json!(["x", "y"]));
+        let scroll = schema("computer_scroll");
+        assert_eq!(scroll["inputSchema"]["properties"]["amount"]["type"], "integer");
+        let start = schema("computer_session_start");
+        assert_eq!(start["inputSchema"]["properties"]["width"]["type"], "integer");
+        assert_eq!(start["inputSchema"]["required"], serde_json::json!([]));
+        // Other tools are untouched.
+        let other = schema("memory_search");
+        for (_, p) in other["inputSchema"]["properties"].as_object().unwrap() {
+            assert_eq!(p["type"], "string");
+        }
+    }
 
     #[test]
     fn user_code_profile_tool_registered() {

@@ -47,9 +47,132 @@ pub(crate) fn install_approval_required(agent_dir: &Path, tool_name: &str, _call
     is_install_class_tool(tool_name) && !duduclaw_gateway::approval::auto_approve_install(agent_dir)
 }
 
+/// What an approval is asked for. Decides the `action_kind` the inbox and
+/// channel notifications render, and the wording the agent gets back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalSubject<'a> {
+    /// Installing a skill / tool (`mcp_install`, rendered 「安裝新技能／工具」).
+    Install,
+    /// Calling one tool (`mcp_call`, rendered 「執行高風險工具」).
+    ToolCall(&'a str),
+}
+
+impl ApprovalSubject<'_> {
+    /// The `approvals.db` `action_kind`.
+    pub(crate) fn action_kind(&self) -> &'static str {
+        match self {
+            Self::Install => "mcp_install",
+            Self::ToolCall(_) => "mcp_call",
+        }
+    }
+
+    /// The subject for a tool going through the per-agent approval gate:
+    /// install-class tools keep the install wording, every other tool is a
+    /// tool call.
+    pub(crate) fn for_tool(tool_name: &str) -> ApprovalSubject<'_> {
+        if is_install_class_tool(tool_name) {
+            ApprovalSubject::Install
+        } else {
+            ApprovalSubject::ToolCall(tool_name)
+        }
+    }
+
+    pub(crate) fn denied_message(&self, approval_id: &str) -> String {
+        match self {
+            Self::Install => format!("安裝要求已被管理員拒絕（審核編號 {approval_id}）。"),
+            Self::ToolCall(tool) => {
+                format!("工具「{tool}」的呼叫已被管理員拒絕（審核編號 {approval_id}）。")
+            }
+        }
+    }
+
+    pub(crate) fn expired_message(&self, approval_id: &str) -> String {
+        match self {
+            Self::Install => {
+                format!("安裝要求逾時未核可，已自動拒絕（fail-closed，審核編號 {approval_id}）。")
+            }
+            Self::ToolCall(tool) => {
+                format!("工具「{tool}」的呼叫逾時未核可，已自動拒絕（審核編號 {approval_id}）。")
+            }
+        }
+    }
+
+    /// The request could not be filed, the status was still pending, or
+    /// waiting for it failed.
+    pub(crate) fn failed_message(&self, what: &str) -> String {
+        match self {
+            Self::Install => format!("{what}，已拒絕安裝（fail-closed）。"),
+            Self::ToolCall(tool) => format!("{what}，工具「{tool}」的呼叫已拒絕。"),
+        }
+    }
+
+    /// The broker could not be opened at all.
+    pub(crate) fn broker_unavailable_message(&self) -> String {
+        match self {
+            Self::Install => {
+                "審批系統暫時無法使用，已拒絕安裝（fail-closed）。請稍後再試或由管理員手動安裝。"
+                    .to_string()
+            }
+            Self::ToolCall(tool) => format!(
+                "審批系統暫時無法使用，工具「{tool}」的呼叫已拒絕。請稍後再試或由管理員手動處理。"
+            ),
+        }
+    }
+}
+
 /// Run one approval round against a broker: request → block on decision.
 /// Denial, TTL-expiry, and request failure all map to `Denied` (fail-closed).
-/// Split out from [`gate_install_approval`] so tests can drive it with an
+/// `simulation` stamps a D1 narrative on the row
+/// (`ApprovalBroker::request_with_simulation`) for the channel push.
+pub(crate) async fn run_approval(
+    broker: &duduclaw_gateway::approval::ApprovalBroker,
+    agent_id: &str,
+    subject: ApprovalSubject<'_>,
+    summary: &str,
+    payload: Value,
+    ttl_seconds: i64,
+    poll: std::time::Duration,
+    simulation: Option<Value>,
+) -> InstallApprovalOutcome {
+    use duduclaw_gateway::approval::ApprovalStatus;
+
+    // External content (skill name/description) is truncated before it is
+    // persisted or shown in the inbox (CJK-safe, no raw byte slicing).
+    let summary = duduclaw_core::truncate_chars(summary, INSTALL_APPROVAL_SUMMARY_MAX_CHARS);
+    let kind = subject.action_kind();
+
+    let requested = match simulation {
+        Some(sim) => {
+            broker
+                .request_with_simulation(agent_id, kind, &summary, payload, ttl_seconds, sim)
+                .await
+        }
+        None => broker.request(agent_id, kind, &summary, payload, ttl_seconds).await,
+    };
+    let approval_id = match requested {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "approval request failed — denying (fail-closed)");
+            return InstallApprovalOutcome::Denied(subject.failed_message("審批系統無法建立審核請求"));
+        }
+    };
+
+    match broker.await_decision(&approval_id, poll).await {
+        Ok(ApprovalStatus::Approved) => InstallApprovalOutcome::Proceed,
+        Ok(ApprovalStatus::Denied) => InstallApprovalOutcome::Denied(subject.denied_message(&approval_id.to_string())),
+        Ok(ApprovalStatus::Expired) => InstallApprovalOutcome::Denied(subject.expired_message(&approval_id.to_string())),
+        Ok(ApprovalStatus::Pending) => {
+            InstallApprovalOutcome::Denied(subject.failed_message("審核狀態異常（仍為待審）"))
+        }
+        Err(e) => {
+            warn!(error = %e, "await_decision failed — denying (fail-closed)");
+            InstallApprovalOutcome::Denied(subject.failed_message("等待審核決定時發生錯誤"))
+        }
+    }
+}
+
+/// [`run_approval`] for an install (`mcp_install`, install wording). Split
+/// out from [`gate_install_approval`] so tests can drive it with an
 /// in-memory broker and a short TTL/poll. `pub(crate)`: see
 /// [`InstallApprovalOutcome`]'s doc comment.
 pub(crate) async fn run_install_approval(
@@ -60,103 +183,31 @@ pub(crate) async fn run_install_approval(
     ttl_seconds: i64,
     poll: std::time::Duration,
 ) -> InstallApprovalOutcome {
-    use duduclaw_gateway::approval::ApprovalStatus;
-
-    // External content (skill name/description) is truncated before it is
-    // persisted or shown in the inbox (CJK-safe, no raw byte slicing).
-    let summary = duduclaw_core::truncate_chars(summary, INSTALL_APPROVAL_SUMMARY_MAX_CHARS);
-
-    let approval_id = match broker
-        .request(agent_id, "mcp_install", &summary, payload, ttl_seconds)
+    run_approval(broker, agent_id, ApprovalSubject::Install, summary, payload, ttl_seconds, poll, None)
         .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(error = %e, "install approval request failed — denying (fail-closed)");
-            return InstallApprovalOutcome::Denied(
-                "審批系統無法建立審核請求，已拒絕安裝（fail-closed）。".to_string(),
-            );
-        }
-    };
-
-    match broker.await_decision(&approval_id, poll).await {
-        Ok(ApprovalStatus::Approved) => InstallApprovalOutcome::Proceed,
-        Ok(ApprovalStatus::Denied) => InstallApprovalOutcome::Denied(format!(
-            "安裝要求已被管理員拒絕（審核編號 {approval_id}）。"
-        )),
-        Ok(ApprovalStatus::Expired) => InstallApprovalOutcome::Denied(format!(
-            "安裝要求逾時未核可，已自動拒絕（fail-closed，審核編號 {approval_id}）。"
-        )),
-        Ok(ApprovalStatus::Pending) => InstallApprovalOutcome::Denied(
-            "審核狀態異常（仍為待審），已拒絕安裝（fail-closed）。".to_string(),
-        ),
-        Err(e) => {
-            warn!(error = %e, "await_decision failed — denying (fail-closed)");
-            InstallApprovalOutcome::Denied(
-                "等待審核決定時發生錯誤，已拒絕安裝（fail-closed）。".to_string(),
-            )
-        }
-    }
 }
 
-/// Same as [`run_install_approval`], but stamps a D1 simulation narrative on
-/// the approval row via `ApprovalBroker::request_with_simulation` instead of
-/// the plain `request`, so the downstream channel push can render the D2
-/// forward-trajectory line. Used only by the ActionGuard escalation path in
-/// [`gate_tool_approval_dispatch`] — every other `run_install_approval` caller
-/// (install-class gate, VeriOS situation gate) is a separate, unaffected
-/// function.
-pub(crate) async fn run_install_approval_with_simulation(
+/// [`run_approval`] for one tool call (`mcp_call`, tool-call wording).
+pub(crate) async fn run_tool_approval(
     broker: &duduclaw_gateway::approval::ApprovalBroker,
     agent_id: &str,
+    tool_name: &str,
     summary: &str,
     payload: Value,
     ttl_seconds: i64,
     poll: std::time::Duration,
-    simulation: Value,
 ) -> InstallApprovalOutcome {
-    use duduclaw_gateway::approval::ApprovalStatus;
-
-    let summary = duduclaw_core::truncate_chars(summary, INSTALL_APPROVAL_SUMMARY_MAX_CHARS);
-
-    let approval_id = match broker
-        .request_with_simulation(
-            agent_id,
-            "mcp_install",
-            &summary,
-            payload,
-            ttl_seconds,
-            simulation,
-        )
-        .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(error = %e, "install approval request failed — denying (fail-closed)");
-            return InstallApprovalOutcome::Denied(
-                "審批系統無法建立審核請求，已拒絕安裝（fail-closed）。".to_string(),
-            );
-        }
-    };
-
-    match broker.await_decision(&approval_id, poll).await {
-        Ok(ApprovalStatus::Approved) => InstallApprovalOutcome::Proceed,
-        Ok(ApprovalStatus::Denied) => InstallApprovalOutcome::Denied(format!(
-            "安裝要求已被管理員拒絕（審核編號 {approval_id}）。"
-        )),
-        Ok(ApprovalStatus::Expired) => InstallApprovalOutcome::Denied(format!(
-            "安裝要求逾時未核可，已自動拒絕（fail-closed，審核編號 {approval_id}）。"
-        )),
-        Ok(ApprovalStatus::Pending) => InstallApprovalOutcome::Denied(
-            "審核狀態異常（仍為待審），已拒絕安裝（fail-closed）。".to_string(),
-        ),
-        Err(e) => {
-            warn!(error = %e, "await_decision failed — denying (fail-closed)");
-            InstallApprovalOutcome::Denied(
-                "等待審核決定時發生錯誤，已拒絕安裝（fail-closed）。".to_string(),
-            )
-        }
-    }
+    run_approval(
+        broker,
+        agent_id,
+        ApprovalSubject::ToolCall(tool_name),
+        summary,
+        payload,
+        ttl_seconds,
+        poll,
+        None,
+    )
+    .await
 }
 
 /// Gate an install-class tool behind admin approval on the stdio path.
@@ -222,6 +273,15 @@ pub(crate) async fn gate_tool_approval_dispatch(
     payload: Value,
 ) -> std::result::Result<(), String> {
     if tool_name == "skill_hub_install" {
+        return Ok(());
+    }
+    // The eight `computer_*` tools are gated in the gateway, which owns the
+    // session: `computer_use_sessions` runs `approval_required_tools` /
+    // `irreversible_tools` / `maybe_irreversible_tools` (as always-required)
+    // through the ApprovalBroker for every op, because the internal route can
+    // be called without passing through this dispatcher. Gating here too
+    // would ask the human twice.
+    if crate::mcp_dispatch::COMPUTER_USE_TOOLS.contains(&tool_name) {
         return Ok(());
     }
     // W3-3b (a): caller-derived — `.ephemeral/` included (see
@@ -348,41 +408,25 @@ pub(crate) async fn gate_tool_approval_dispatch(
                     summary.push_str(&rendered);
                 }
             }
+            let subject = ApprovalSubject::for_tool(tool_name);
             let broker = match duduclaw_gateway::approval::ApprovalBroker::open(home_dir) {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(error = %e, "ApprovalBroker unavailable — denying tool call (fail-closed)");
-                    return Err(
-                        "審批系統暫時無法使用，已拒絕執行（fail-closed）。請稍後再試或由管理員手動處理。"
-                            .to_string(),
-                    );
+                    return Err(subject.broker_unavailable_message());
                 }
             };
-            let outcome = match &narrative {
-                Some(n) => {
-                    run_install_approval_with_simulation(
-                        &broker,
-                        agent_id,
-                        &summary,
-                        payload,
-                        INSTALL_APPROVAL_TTL_SECONDS,
-                        INSTALL_APPROVAL_POLL,
-                        n.to_json(),
-                    )
-                    .await
-                }
-                None => {
-                    run_install_approval(
-                        &broker,
-                        agent_id,
-                        &summary,
-                        payload,
-                        INSTALL_APPROVAL_TTL_SECONDS,
-                        INSTALL_APPROVAL_POLL,
-                    )
-                    .await
-                }
-            };
+            let outcome = run_approval(
+                &broker,
+                agent_id,
+                subject,
+                &summary,
+                payload,
+                INSTALL_APPROVAL_TTL_SECONDS,
+                INSTALL_APPROVAL_POLL,
+                narrative.as_ref().map(|n| n.to_json()),
+            )
+            .await;
             match outcome {
                 InstallApprovalOutcome::Proceed => Ok(()),
                 InstallApprovalOutcome::Denied(msg) => Err(msg),
@@ -461,23 +505,23 @@ pub(crate) async fn gate_os_situation_dispatch(
                 "工具「{tool_name}」情境判定為「{}」，需經管理員核可後才能執行（VeriOS 情境分類 ASK 閘）",
                 cr.class.as_str()
             );
+            let subject = ApprovalSubject::for_tool(tool_name);
             let broker = match duduclaw_gateway::approval::ApprovalBroker::open(home_dir) {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(error = %e, "ApprovalBroker unavailable — denying OS action (fail-closed)");
-                    return Err(
-                        "審批系統暫時無法使用，已拒絕執行（fail-closed）。請稍後再試或由管理員手動處理。"
-                            .to_string(),
-                    );
+                    return Err(subject.broker_unavailable_message());
                 }
             };
-            match run_install_approval(
+            match run_approval(
                 &broker,
                 agent_id,
+                subject,
                 &summary,
                 payload,
                 sc::SITUATION_APPROVAL_TTL_SECS,
                 INSTALL_APPROVAL_POLL,
+                None,
             )
             .await
             {

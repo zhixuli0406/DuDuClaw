@@ -11,13 +11,17 @@ use super::KNOWN_MCP_SCOPES;
 /// site the dashboard actually validates against, catching a future
 /// accidental re-introduction of a local override here.
 ///
-/// 25 since W3-3b split `team_handoff` onto its own internal-only
+/// 26 with Discovery's explicit `discovery:execute` scope, following
+/// W3-3b's split of `team_handoff` onto its own internal-only
 /// `team:handoff` scope (2026-09-28), on top of WP-F2's `files:read`
 /// (§14.2 local data-file tools) and WP-D's `db:read` (§13.7 read-only
 /// SQL data sources).
 #[test]
-fn known_mcp_scopes_has_all_25_entries() {
-    assert_eq!(KNOWN_MCP_SCOPES.len(), 25);
+fn known_mcp_scopes_has_all_26_entries() {
+    assert_eq!(KNOWN_MCP_SCOPES.len(), 26);
+    assert!(KNOWN_MCP_SCOPES.contains(&"discovery:execute"));
+    let unique: std::collections::HashSet<_> = KNOWN_MCP_SCOPES.iter().collect();
+    assert_eq!(unique.len(), KNOWN_MCP_SCOPES.len(), "duplicate MCP scope");
 }
 
 /// Spot-check a sample of the 12 scopes that were previously missing —

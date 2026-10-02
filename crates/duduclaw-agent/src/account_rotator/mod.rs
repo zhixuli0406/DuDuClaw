@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use duduclaw_security::secret_manager::SecretManagerConfig;
@@ -35,6 +36,9 @@ mod types;
 
 pub struct AccountRotator {
     accounts: Arc<RwLock<Vec<Account>>>,
+    /// Published under the accounts write lock and read under its read lock.
+    /// This prevents selection from reviving a disabled pool via ambient keys.
+    inherit_host_credentials: AtomicBool,
     strategy: RotationStrategy,
     round_robin_index: Arc<RwLock<usize>>,
     cooldown_seconds: u64,
@@ -57,6 +61,7 @@ pub(crate) use types::{auth_dead_backoff, probe_backoff};
 use load::{
     API_KEY_ENC_FIELDS, OAUTH_TOKEN_ENC_FIELDS, build_account_env, detect_default_oauth_session,
     doubled_cooldown, env_fallback_account_env, has_nonempty_field, resolve_api_key,
+    host_credentials_policy,
     resolve_oauth_credentials, resolve_oauth_token, should_autodetect_anthropic_oauth,
 };
 use types::{AUTH_DEAD_BASE_MINUTES, AUTH_DEAD_CAP_MINUTES};
@@ -88,3 +93,5 @@ mod wp10c_provider_env_delegation_tests;
 mod wp8a_secret_ref_consolidation_tests;
 #[cfg(test)]
 mod wpa_load_from_config_provider_tests;
+#[cfg(test)]
+mod host_inheritance_tests;

@@ -350,6 +350,8 @@ pub fn append_night_cache(agent_dir: &Path, entry: &NightCacheEntry) -> std::io:
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct NightPassReport {
     pub agent_id: String,
+    /// Cross-task discovery replay uses no provider calls.
+    pub discovery: Option<crate::discovery::night::NightReport>,
     /// N3: number of schemas induced/refreshed.
     pub schemas_induced: usize,
     /// N4: number of consolidations that passed verification and were stored.
@@ -364,6 +366,77 @@ pub struct NightPassReport {
     pub spent_cents: u64,
     /// Non-fatal notes (skipped sub-passes, verification failures, ...).
     pub notes: Vec<String>,
+}
+
+// ── Activity Feed surfacing ───────────────────────────────────
+
+/// One-sentence zh-TW summary of what a night pass produced, or `None` when
+/// nothing changed (the caller must then stay silent). No stage codes or
+/// paths appear in the text; it is shown on the dashboard Activity Feed.
+fn pass_activity_summary(report: &NightPassReport) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if report.sleep_cached {
+        parts.push("預先整理了一份對話洞察".to_string());
+    }
+    if report.prefetch_cached {
+        parts.push("預先準備了一份常用資料".to_string());
+    }
+    if report.schemas_induced > 0 {
+        parts.push(format!("歸納出 {} 個知識模式", report.schemas_induced));
+    }
+    if report.consolidations_stored > 0 {
+        parts.push(format!("整併了 {} 筆記憶", report.consolidations_stored));
+    }
+    if report.consolidations_rolled_back > 0 {
+        parts.push(format!(
+            "有 {} 筆記憶整併未通過驗證而復原",
+            report.consolidations_rolled_back
+        ));
+    }
+    if let Some(discovery)=&report.discovery {
+        let adopted=discovery.namespaces.iter().filter(|item|item.adopted).count();
+        parts.push(format!("探索策略檢查 {} 個世界，選入 {} 個任務／{} 個世界，{} 組更新預設，{} 個排除項目",
+            discovery.observed_worlds,discovery.selected_tasks,discovery.selected_worlds,adopted,
+            discovery.exclusions.values().sum::<usize>()+discovery.selection_exclusions.values().sum::<usize>()));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("夜間整理完成：{}。", parts.join("、")))
+}
+
+/// Best-effort: append one `night_engine.pass_complete` Activity Feed row
+/// when the pass produced something. Returns whether a row was written.
+/// Never fails the night loop; errors are logged as warnings.
+async fn post_pass_activity(home_dir: &Path, report: &NightPassReport) -> bool {
+    let Some(summary) = pass_activity_summary(report) else {
+        return false;
+    };
+    let store = match crate::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "night engine: cannot open task store for activity row");
+            return false;
+        }
+    };
+    let mut public_report=report.clone();
+    public_report.discovery=report.discovery.as_ref().map(|discovery|discovery.public_view());
+    let row = crate::task_store::ActivityRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type: "night_engine.pass_complete".to_string(),
+        agent_id: report.agent_id.clone(),
+        task_id: None,
+        summary,
+        timestamp: Utc::now().to_rfc3339(),
+        metadata: serde_json::to_string(&public_report).ok(),
+    };
+    match store.append_activity(&row).await {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(error = %e, "night engine: activity append failed");
+            false
+        }
+    }
 }
 
 // ── Orchestrator ──────────────────────────────────────────────
@@ -468,6 +541,23 @@ impl NightEngine {
             agent_id: agent_id.to_string(),
             ..Default::default()
         };
+        // No NightLlm crosses into this deterministic discovery phase.
+        let discovery_home=self.home_dir.clone();
+        let discovery_agent=agent_id.to_string();
+        let discovery_budget=crate::discovery::night::night_budget();
+        let worker_budget=discovery_budget.clone();
+        let worker=tokio::task::spawn_blocking(move ||crate::discovery::night::run_with_budget(
+            &discovery_home,&discovery_agent,worker_budget));
+        match tokio::time::timeout(std::time::Duration::from_secs(crate::discovery::night::NIGHT_WALL_SECS),worker).await {
+            Ok(Ok(discovery))=>report.discovery=discovery,
+            Ok(Err(_))=>report.notes.push("Discovery night worker unavailable".into()),
+            Err(_)=>{
+                discovery_budget.cancel();
+                report.discovery=Some(crate::discovery::night::NightReport {
+                    schema:"duduclaw.discovery.night.v1".into(),agent_id:agent_id.into(),zero_llm:true,
+                    reason:Some("night_deadline_report_only".into()),..Default::default()});
+            }
+        }
         let mut budget = PassBudget::new(cfg.max_pass_cost_cents);
         let ctx_window = cfg.context_window as usize;
 
@@ -728,9 +818,17 @@ pub fn spawn_night_engine(
                 // agent's cheap utility model (haiku-class by default).
                 let adapter = crate::night_llm::build_night_llm(&home_dir, &agent_id, &cfg);
                 let llm: Option<&dyn NightLlm> = adapter.as_ref().map(|a| a as &dyn NightLlm);
-                let _ = e
+                // `None` = pass did not run (disabled / not idle / breaker
+                // open): stay silent. `Some` is surfaced only when non-empty.
+                match e
                     .maybe_run(&agent_id, &cfg, last_active, now, &memory, llm)
-                    .await;
+                    .await
+                {
+                    Some(report) => {
+                        post_pass_activity(&home_dir, &report).await;
+                    }
+                    None => {}
+                }
             }
         }
     });
@@ -740,6 +838,130 @@ pub fn spawn_night_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── activity surfacing ──
+    #[test]
+    fn activity_summary_none_for_empty_report() {
+        assert!(pass_activity_summary(&NightPassReport::default()).is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_night_runs_without_calling_a_supplied_provider() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingProvider(AtomicUsize);
+        #[async_trait::async_trait]
+        impl NightLlm for CountingProvider {
+            async fn infer(&self, _: &str, _: &str) -> std::result::Result<NightInference, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err("discovery must never call a provider".into())
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let store = crate::discovery::store::DiscoveryStore::open(home.path()).unwrap();
+        let limits = crate::discovery::contracts::RunBudget {
+            max_agent_calls: 1, max_usd: 1., max_wall_secs: 1, max_rounds: 1,
+        };
+        store.create_run("imported-night", "fixture", "a", "score", &"a".repeat(64),
+            crate::discovery::tree::Direction::Max, &limits).unwrap();
+        store.insert_world(&crate::discovery::tree::World {
+            schema: crate::discovery::tree::WORLD_SCHEMA.into(), run_id: "imported-night".into(), round: 1,
+            direction: crate::discovery::tree::Direction::Max, baseline_score: 0., branch_count: 1,
+            refine_count: 0, max_parallelism: 1, policy_id: crate::discovery::policy::BASELINE_POLICY_ID.into(), beta: 0.6,
+        }).unwrap();
+        store.finish_run("imported-night", "interrupted", None).unwrap();
+        let engine = NightEngine::new(home.path().into());
+        let memory = SqliteMemoryEngine::in_memory().unwrap();
+        let provider = CountingProvider(AtomicUsize::new(0));
+        let cfg = NightEngineConfig { sleep_time: false, prefetch: false,
+            schema_induction: false, recurrence_consolidation: false, ..Default::default() };
+        let report = engine.run_pass("a", &cfg, Utc::now(), &memory, Some(&provider)).await;
+        assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+        assert_eq!(report.spent_cents, 0);
+        let discovery = report.discovery.expect("discovery night phase must run");
+        assert!(discovery.zero_llm);
+        assert_eq!(discovery.observed_worlds, 1);
+        assert_eq!(discovery.exclusions.get("partial"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn discovery_night_activity_preserves_report_only_exclusions() {
+        let home = tempfile::tempdir().unwrap();
+        let report = NightPassReport { agent_id: "a".into(), discovery: Some(crate::discovery::night::NightReport {
+            schema: "duduclaw.discovery.night.v1".into(), agent_id: "a".into(), observed_worlds: 1,
+            zero_llm: true, exclusions: [("partial".into(), 1)].into(),
+            reason: Some("insufficient_distinct_tasks".into()), ..Default::default()
+        }), ..Default::default() };
+        assert!(post_pass_activity(home.path(), &report).await);
+        let store = crate::task_store::TaskStore::open(home.path()).unwrap();
+        let (rows, _) = store.list_activity(Some("a"), Some("night_engine.pass_complete"), 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].summary.contains("探索"));
+        assert!(!rows[0].summary.contains("證實"));
+        let metadata: serde_json::Value = serde_json::from_str(rows[0].metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["discovery"]["exclusions"]["partial"], 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_night_activity_redacts_raw_policy_source_at_its_boundary() {
+        use crate::discovery::night::{DefaultsNamespace,FrozenDefaults,VersionedDefaults,NamespaceReport,NightReport};
+        let home=tempfile::tempdir().unwrap();
+        let raw="PRIVATE_POLICY_CANARY_SOURCE";
+        let bundle=FrozenDefaults {policy_id:"candidate".into(),source:Some(raw.into()),source_sha256:Some("f".repeat(64)),
+            beta:0.6,knobs:Default::default(),origin_task_ids:vec!["training-task".into()]};
+        let report=NightPassReport {agent_id:"a".into(),discovery:Some(NightReport {agent_id:"a".into(),
+            zero_llm:true,namespaces:vec![NamespaceReport {namespace:DefaultsNamespace {agent_id:"a".into(),
+                scorer_name:"score".into(),scorer_hash:"a".repeat(64),direction:crate::discovery::tree::Direction::Max,
+                approved_root_id:"project".into(),runtime:"claude".into(),configured_model:"haiku".into()},
+                old_default:VersionedDefaults {version:1,bundle:bundle.clone()},
+                new_default:VersionedDefaults {version:2,bundle},candidates:1,fresh_heldout_tasks:8,
+                evidence:Default::default(),adopted:true,reason:"fixture".into()}],..Default::default()}),..Default::default()};
+        assert!(post_pass_activity(home.path(),&report).await);
+        let store=crate::task_store::TaskStore::open(home.path()).unwrap();
+        let (rows,_)=store.list_activity(Some("a"),Some("night_engine.pass_complete"),10,0).await.unwrap();
+        let json=rows[0].metadata.as_deref().unwrap();assert!(!json.contains(raw));
+        let value:serde_json::Value=serde_json::from_str(json).unwrap();
+        assert_eq!(value["discovery"]["namespaces"][0]["new_default"]["version"],2);
+        assert_eq!(value["discovery"]["namespaces"][0]["new_default"]["bundle"]["source_sha256"],"f".repeat(64));
+    }
+
+    #[test]
+    fn activity_summary_mentions_nonzero_counters_without_codes() {
+        let r = NightPassReport {
+            agent_id: "a".into(),
+            schemas_induced: 2,
+            consolidations_stored: 3,
+            consolidations_rolled_back: 1,
+            sleep_cached: true,
+            prefetch_cached: true,
+            ..Default::default()
+        };
+        let s = pass_activity_summary(&r).unwrap();
+        for needle in ["洞察", "常用資料", "2 個", "3 筆", "1 筆"] {
+            assert!(s.contains(needle), "missing {needle} in {s}");
+        }
+        for code in ["N1", "N2", "N3", "N4"] {
+            assert!(!s.contains(code), "leaked {code} in {s}");
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_row_written_only_for_nonempty_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = NightPassReport { agent_id: "a".into(), ..Default::default() };
+        assert!(!post_pass_activity(dir.path(), &empty).await);
+        let full = NightPassReport {
+            agent_id: "a".into(),
+            schemas_induced: 1,
+            ..Default::default()
+        };
+        assert!(post_pass_activity(dir.path(), &full).await);
+        let store = crate::task_store::TaskStore::open(dir.path()).unwrap();
+        let (rows, _) = store
+            .list_activity(Some("a"), Some("night_engine.pass_complete"), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
 
     fn t(mins_ago: i64) -> Option<DateTime<Utc>> {
         Some(Utc::now() - chrono::Duration::minutes(mins_ago))

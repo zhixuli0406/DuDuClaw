@@ -29,7 +29,6 @@ impl UserContext {
     ///
     /// # Security
     /// This context bypasses all ACL checks. Use ONLY for:
-    /// - Ed25519 challenge-response (legacy auth path)
     /// - Legacy pre-shared token auth
     /// - Local-only mode (no users in DB, no auth token configured)
     ///

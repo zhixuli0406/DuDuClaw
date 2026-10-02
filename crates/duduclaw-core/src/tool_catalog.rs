@@ -1028,10 +1028,15 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "tasks_create",
-        "Create a Kanban board task",
+        "Create task/goal (Admin), or discovery (discovery:execute)",
         "admin",
         "task",
     ),
+    ("discovery_catalog", "List approved discovery roots, evaluators and runtimes", "discovery:execute", "discovery"),
+    ("discovery_list", "List authorized discovery runs", "discovery:execute", "discovery"),
+    ("discovery_tree", "Read a discovery tree and durable accounting", "discovery:execute", "discovery"),
+    ("discovery_artifact", "Read a verified discovery artifact", "discovery:execute", "discovery"),
+    ("discovery_cancel", "Cancel an authorized discovery run", "discovery:execute", "discovery"),
     ("tasks_update", "Update board task fields", "admin", "task"),
     (
         "tasks_claim",
@@ -1210,6 +1215,12 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     (
         "computer_scroll",
         "Scroll at screen coordinates",
+        "admin",
+        "computer",
+    ),
+    (
+        "computer_navigate",
+        "Open an allowlisted https page",
         "admin",
         "computer",
     ),
@@ -1585,10 +1596,52 @@ pub fn mcp_tool_base_name(entry: &str) -> &str {
     e
 }
 
+/// What `[capabilities] denied_tools` / `allowed_tools` decide for one tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolListVerdict {
+    /// Neither list stops the call.
+    Allowed,
+    /// The tool is in `denied_tools` (always wins over `allowed_tools`).
+    Denied,
+    /// `allowed_tools` is non-empty (allowlist mode) and does not name it.
+    NotAllowlisted,
+}
+
+/// The `denied_tools` / `allowed_tools` decision shared by every gate that
+/// enforces them (the MCP dispatch front door and the gateway's computer-use
+/// route): exact equality on [`mcp_tool_base_name`] of both sides, never a
+/// substring; `denied_tools` wins; a non-empty `allowed_tools` switches the
+/// agent into allowlist mode.
+pub fn tool_list_verdict(tool_name: &str, denied: &[String], allowed: &[String]) -> ToolListVerdict {
+    let base = mcp_tool_base_name(tool_name);
+    if denied.iter().any(|d| mcp_tool_base_name(d) == base) {
+        return ToolListVerdict::Denied;
+    }
+    if !allowed.is_empty() && !allowed.iter().any(|a| mcp_tool_base_name(a) == base) {
+        return ToolListVerdict::NotAllowlisted;
+    }
+    ToolListVerdict::Allowed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn tool_list_verdict_denied_wins_and_allowlist_is_exact() {
+        let v = |d: &[&str], a: &[&str]| {
+            let d: Vec<String> = d.iter().map(|s| s.to_string()).collect();
+            let a: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            tool_list_verdict("computer_click", &d, &a)
+        };
+        assert_eq!(v(&[], &[]), ToolListVerdict::Allowed);
+        assert_eq!(v(&["mcp__duduclaw__computer_click"], &["computer_click"]), ToolListVerdict::Denied);
+        assert_eq!(v(&[], &["computer_clicker"]), ToolListVerdict::NotAllowlisted);
+        assert_eq!(v(&[], &["computer"]), ToolListVerdict::NotAllowlisted);
+        assert_eq!(v(&["computer"], &[]), ToolListVerdict::Allowed);
+        assert_eq!(v(&[], &["mcp__duduclaw__computer_click"]), ToolListVerdict::Allowed);
+    }
 
     #[test]
     fn test_mcp_tool_base_name_bare_passthrough() {

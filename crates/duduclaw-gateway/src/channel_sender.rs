@@ -118,11 +118,46 @@ fn require_feishu_code_zero(body: &str) -> Result<(), ChannelSendError> {
 /// here keyed by the user/chat ID. When the channel handler receives the user's
 /// reply (「確認」「好」「yes」or 「取消」「no」), it calls `resolve_confirmation()`
 /// which sends the result through the oneshot.
-static CONFIRMATION_REGISTRY: std::sync::OnceLock<Mutex<HashMap<String, oneshot::Sender<bool>>>> =
+static CONFIRMATION_REGISTRY: std::sync::OnceLock<Mutex<HashMap<String, PendingConfirmation>>> =
     std::sync::OnceLock::new();
 
-fn confirmation_registry() -> &'static Mutex<HashMap<String, oneshot::Sender<bool>>> {
+/// One registered waiter: a unique id (so a guard only ever removes its own
+/// entry) and the oneshot its reply resolves.
+type PendingConfirmation = (u64, oneshot::Sender<bool>);
+
+fn confirmation_registry() -> &'static Mutex<HashMap<String, PendingConfirmation>> {
     CONFIRMATION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Removes a waiter's registry entry when the wait ends, however it ends —
+/// a reply, the timeout, or the waiting future being dropped (a cancelled
+/// request). Without it a dropped waiter left its entry behind and every
+/// later confirmation for that chat answered "already pending" until someone
+/// replied.
+struct PendingConfirmationGuard {
+    user_id: String,
+    id: u64,
+}
+
+impl Drop for PendingConfirmationGuard {
+    fn drop(&mut self) {
+        fn remove_own(reg: &mut HashMap<String, PendingConfirmation>, user_id: &str, id: u64) {
+            if reg.get(user_id).is_some_and(|(entry, _)| *entry == id) {
+                reg.remove(user_id);
+            }
+        }
+        match confirmation_registry().try_lock() {
+            Ok(mut reg) => remove_own(&mut reg, &self.user_id, self.id),
+            Err(_) => {
+                let (user_id, id) = (std::mem::take(&mut self.user_id), self.id);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        remove_own(&mut *confirmation_registry().lock().await, &user_id, id);
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Wait for a user's confirmation reply with timeout.
@@ -133,32 +168,31 @@ pub async fn wait_for_confirmation(
     user_id: &str,
     timeout_secs: u64,
 ) -> Result<bool, ChannelSendError> {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let (tx, rx) = oneshot::channel();
-    {
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _guard = {
         // L33: don't clobber an in-flight confirmation for the same user. The
         // previous code overwrote the prior oneshot, so the first waiter was
         // silently dropped (its sender freed → it resolved as "declined").
-        // Reject the new request instead and let the caller retry later.
+        // Reject the new request instead and let the caller retry later. An
+        // entry whose waiter is gone (receiver dropped) is stale and replaced.
         let mut reg = confirmation_registry().lock().await;
-        if reg.contains_key(user_id) {
+        if reg.get(user_id).is_some_and(|(_, pending)| !pending.is_closed()) {
             return Err(ChannelSendError(format!(
                 "a confirmation is already pending for user {user_id}"
             )));
         }
-        reg.insert(user_id.to_string(), tx);
-    }
+        reg.insert(user_id.to_string(), (id, tx));
+        PendingConfirmationGuard { user_id: user_id.to_string(), id }
+    };
 
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
         Ok(Ok(confirmed)) => Ok(confirmed),
-        Ok(Err(_)) => {
-            // Sender dropped — treat as declined
-            Ok(false)
-        }
-        Err(_) => {
-            // Timeout — remove from registry and treat as declined
-            confirmation_registry().lock().await.remove(user_id);
-            Ok(false)
-        }
+        // Sender dropped — treat as declined.
+        Ok(Err(_)) => Ok(false),
+        // Timeout — the guard removes the entry; treat as declined.
+        Err(_) => Ok(false),
     }
 }
 
@@ -191,7 +225,7 @@ pub async fn resolve_confirmation(user_id: &str, reply_text: &str) -> bool {
 
     // Only remove the pending sender once we know the reply is decisive.
     let sender = confirmation_registry().lock().await.remove(user_id);
-    if let Some(tx) = sender {
+    if let Some((_, tx)) = sender {
         let _ = tx.send(confirmed);
         true
     } else {
@@ -241,7 +275,11 @@ fn is_denial_reply(text: &str) -> bool {
 
 /// Check if there are any pending confirmations for a user.
 pub async fn has_pending_confirmation(user_id: &str) -> bool {
-    confirmation_registry().lock().await.contains_key(user_id)
+    confirmation_registry()
+        .lock()
+        .await
+        .get(user_id)
+        .is_some_and(|(_, pending)| !pending.is_closed())
 }
 
 // ---------------------------------------------------------------------------
@@ -2385,7 +2423,7 @@ mod tests {
         super::confirmation_registry()
             .lock()
             .await
-            .insert("test-user".into(), tx);
+            .insert("test-user".into(), (0, tx));
 
         // Resolve it
         assert!(super::resolve_confirmation("test-user", "好").await);
@@ -2414,7 +2452,7 @@ mod tests {
         super::confirmation_registry()
             .lock()
             .await
-            .insert("amb-user".into(), tx);
+            .insert("amb-user".into(), (0, tx));
 
         // Ambiguous message → not resolved, still pending.
         assert!(!super::resolve_confirmation("amb-user", "什麼意思？").await);
@@ -2447,6 +2485,42 @@ mod tests {
         assert!(second.is_err(), "second confirmation should be rejected");
 
         // Resolve the first so the background task completes.
+        assert!(super::resolve_confirmation(user, "yes").await);
+        assert!(h.await.unwrap().unwrap());
+    }
+
+    /// F6: a waiter whose future is dropped (a cancelled request) leaves no
+    /// entry behind, so the next confirmation for that chat is not refused
+    /// as "already pending".
+    #[tokio::test]
+    async fn a_dropped_waiter_leaves_no_pending_entry() {
+        let user = "dropped-waiter-f6";
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            wait_for_confirmation(user, 30),
+        )
+        .await;
+        assert!(waited.is_err(), "the outer timeout drops the waiting future");
+        // Removal may run on a spawned task when the lock was busy.
+        for _ in 0..100 {
+            if !super::has_pending_confirmation(user).await
+                && !super::confirmation_registry().lock().await.contains_key(user)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!super::confirmation_registry().lock().await.contains_key(user));
+        let h = tokio::spawn(async move { wait_for_confirmation(user, 5).await });
+        let mut registered = false;
+        for _ in 0..200 {
+            if super::has_pending_confirmation(user).await {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(registered, "a new confirmation is accepted after the drop");
         assert!(super::resolve_confirmation(user, "yes").await);
         assert!(h.await.unwrap().unwrap());
     }

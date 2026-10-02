@@ -8,6 +8,7 @@
     use crate::task_store::{TaskRow, TaskStore};
     use crate::tool_activity::filter_tool_activity;
 
+    mod a1_ledger;
     mod engine;
     mod grounding;
     mod judge_failure;

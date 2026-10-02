@@ -146,6 +146,35 @@ pub enum GuardDecision {
         caller: String,
         attempted_path: PathBuf,
     },
+    /// Contract lock: an agent-identified caller tried to write `CONTRACT.toml`
+    /// inside its OWN agent directory via Write/Edit/MultiEdit/Bash. The
+    /// contract's `must_not` / `must_always` boundaries are the operator's
+    /// limits on the agent, so unlike SOUL.md there is no opt-in flag at all;
+    /// the only write path is the dashboard's admin-only `contract.update`
+    /// RPC, which never runs through this hook. Another agent's contract is
+    /// refused earlier by [`Self::BlockedForeignAgentDir`].
+    BlockedOwnContractWrite {
+        caller: String,
+        attempted_path: PathBuf,
+    },
+    /// Removed-name reservation (`crate::agent_trash`): an agent-identified
+    /// caller tried to write, move or delete something under
+    /// `<home>/agents/_trash/`, where removed employees are kept. Emptying an
+    /// entry would release the reserved name; moving one back would restore an
+    /// employee without the administrator. The path is deliberately not echoed
+    /// in the message.
+    BlockedRemovedAgentArea {
+        caller: String,
+        attempted_path: PathBuf,
+    },
+    /// Removed-name reservation, CLI lane: an agent-identified caller ran
+    /// `duduclaw agent create <name>` (via Bash) for a name that is reserved
+    /// because an employee of that name was removed, or the reservation could
+    /// not be checked.
+    BlockedReservedAgentName {
+        caller: String,
+        name: String,
+    },
 }
 
 impl GuardDecision {
@@ -251,6 +280,25 @@ impl GuardDecision {
                  請改呼叫 agent_update_soul 這個 MCP 工具，而不是直接寫檔。",
                 attempted_path.display(),
                 caller
+            )),
+            Self::BlockedOwnContractWrite { caller, attempted_path } => Some(format!(
+                "已封鎖：CONTRACT.toml 是管理者為 AI 員工設定的行為界線，AI 員工不可直接改寫（即使是自己的）。\n\
+                 檔案：{}\n\
+                 你的身分：{}\n\
+                 如果需要調整界線，請告知管理者，由管理者在儀表板修改這份契約。",
+                attempted_path.display(),
+                caller
+            )),
+            Self::BlockedRemovedAgentArea { caller, .. } => Some(format!(
+                "已封鎖：已移除的 AI 員工由管理者保管，AI 員工不可改寫、移動或刪除。\n\
+                 你的身分：{caller}\n\
+                 需要復原或清除已移除的員工，請由管理者在儀表板處理。"
+            )),
+            Self::BlockedReservedAgentName { caller, name } => Some(format!(
+                "已封鎖：無法以「{name}」建立 AI 員工，先前有一位同名的員工已被移除，這個名稱目前保留中\
+                 （或目前無法確認）。\n\
+                 你的身分：{caller}\n\
+                 要重新使用這個名稱，請由管理者在儀表板處理；或改用其他名稱，透過 create_agent 建立。"
             )),
             _ => None,
         }

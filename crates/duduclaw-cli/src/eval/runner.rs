@@ -423,6 +423,19 @@ async fn run_live(
         .or_else(|| duduclaw_core::which_claude_in_home(home))
         .ok_or_else(|| "claude CLI not found (PATH + known install locations)".to_string())?;
 
+    // Live eval runs the employee's CLI on the host, never in the task
+    // sandbox: report it once per agent per eval run when the sandbox is on.
+    duduclaw_gateway::task_sandbox::note_not_applied(
+        home,
+        agent,
+        duduclaw_core::agent_toml::load(&agent_dir)
+            .container
+            .sandbox_enabled
+            .unwrap_or(false),
+        duduclaw_gateway::task_sandbox::HostPath::Eval,
+        duduclaw_gateway::task_sandbox::HostAction::RanOnHost,
+    );
+
     // Keep the guards alive for the whole child lifetime.
     let sys_file = match case.case.system_prompt.as_deref() {
         Some(sp) if !sp.trim().is_empty() => Some(TempPromptFile::create(sp)?),

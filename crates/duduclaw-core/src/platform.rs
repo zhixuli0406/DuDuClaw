@@ -598,6 +598,18 @@ pub fn kill_process(pid: u32) -> std::io::Result<()> {
     sys::kill_process(pid)
 }
 
+/// Forcefully kill a whole process group / tree.
+///
+/// Unix: `kill(-pgid, SIGKILL)` — every process still in group `pgid` (spawn
+/// the leader with `process_group(0)` so its pgid equals its pid). `pgid`
+/// values 0 (the caller's own group), 1 (`kill(-1)` would signal every
+/// process the caller may signal) and anything that does not fit `i32` are
+/// refused with `InvalidInput` rather than sent.
+/// Windows: `taskkill /T /F /PID <pgid>` — the process and its descendants.
+pub fn kill_process_group(pgid: u32) -> std::io::Result<()> {
+    sys::kill_process_group(pgid)
+}
+
 /// Send SIGINT to the current process for graceful self-shutdown.
 ///
 /// On Windows, uses `GenerateConsoleCtrlEvent(CTRL_C_EVENT)`.
@@ -751,6 +763,24 @@ mod sys {
         }
     }
 
+    pub fn kill_process_group(pgid: u32) -> std::io::Result<()> {
+        let group = match i32::try_from(pgid) {
+            Ok(g) if g > 1 => g,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing to signal process group {pgid}"),
+                ));
+            }
+        };
+        let rc = unsafe { libc::kill(-group, libc::SIGKILL) };
+        if rc != 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn self_interrupt() {
         unsafe { libc::kill(libc::getpid(), libc::SIGINT); }
     }
@@ -868,6 +898,28 @@ mod sys {
         terminate_process(pid)
     }
 
+    pub fn kill_process_group(pgid: u32) -> std::io::Result<()> {
+        if pgid == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to kill process tree 0",
+            ));
+        }
+        let status = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pgid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "taskkill /T /F /PID {pgid} exited with {status}"
+            )))
+        }
+    }
+
     pub fn self_interrupt() {
         use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
         // CTRL_C_EVENT = 0
@@ -973,6 +1025,55 @@ mod home_tests {
                 Some(v) => std::env::set_var("DUDUCLAW_INSTANCE", v),
                 None => std::env::remove_var("DUDUCLAW_INSTANCE"),
             }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod process_group_tests {
+    use super::kill_process_group;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn refuses_reserved_and_out_of_range_groups() {
+        for pgid in [0u32, 1, u32::MAX, i32::MAX as u32 + 1] {
+            let err = kill_process_group(pgid).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "pgid {pgid}");
+        }
+    }
+
+    #[test]
+    fn kills_leader_and_grandchild_in_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        // The leader forks a background grandchild (same group), records its
+        // pid, then waits on it.
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let grandchild: i32 = loop {
+            if let Ok(raw) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = raw.trim().parse() {
+                    break pid;
+                }
+            }
+            assert!(Instant::now() < deadline, "grandchild pid never written");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        kill_process_group(child.id()).unwrap();
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+        // The grandchild was reparented; poll until the kernel reaps it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(grandchild, 0) } == 0 {
+            assert!(Instant::now() < deadline, "grandchild {grandchild} survived");
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }

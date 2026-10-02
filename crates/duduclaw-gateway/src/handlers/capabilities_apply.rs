@@ -190,6 +190,37 @@ pub(crate) fn apply_capabilities_to_table(
             }
         }
 
+        // Navigation allowlist for tool-driven sessions: REPLACE semantics,
+        // every entry must be an exact hostname (the reader would drop it
+        // anyway; refusing here tells the operator at save time).
+        if let Some(arr) = cfg.get("allowed_domains").and_then(|v| v.as_array()) {
+            let mut hosts: Vec<String> = Vec::with_capacity(arr.len());
+            for item in arr {
+                let raw = item.as_str().ok_or_else(|| {
+                    "computer_use_config.allowed_domains entries must be strings".to_string()
+                })?;
+                let host = duduclaw_core::types::normalize_navigation_host(raw).ok_or_else(|| {
+                    format!(
+                        "computer_use_config.allowed_domains entry '{}' is not an exact hostname (no wildcard, IP address, port or path)",
+                        duduclaw_core::truncate_chars(raw.trim(), 80)
+                    )
+                })?;
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
+            let max = duduclaw_core::types::COMPUTER_USE_MAX_ALLOWED_DOMAINS;
+            if hosts.len() > max {
+                return Err(format!("computer_use_config.allowed_domains holds at most {max} hosts"));
+            }
+            let n = hosts.len();
+            sub.insert(
+                "allowed_domains".into(),
+                toml::Value::Array(hosts.into_iter().map(toml::Value::String).collect()),
+            );
+            changes.push(format!("capabilities.computer_use_config.allowed_domains = [{n} entries]"));
+        }
+
         if let Some(v) = cfg.get("max_session_minutes").and_then(|v| v.as_u64()) {
             if v == 0 || v > 1440 {
                 return Err("max_session_minutes must be 1-1440".into());

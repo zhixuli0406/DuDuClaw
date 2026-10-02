@@ -133,6 +133,7 @@ mod mcp_oauth;
 mod google_rpc;
 mod accounts_util;
 mod tasks_rpc;
+mod discovery_rpc;
 mod tasks_detail_rpc;
 mod plans_rpc;
 mod activity_timeline_rpc;

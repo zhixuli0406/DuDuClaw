@@ -1,0 +1,114 @@
+# Validation only: no tag, release, deployment, provider call or repository write.
+# Manual runs validate the selected remote ref, never an uncommitted worktree.
+name: Release readiness validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release-readiness.yml
+      - Cargo.toml
+      - Cargo.lock
+      - crates/duduclaw-core/**
+      - crates/duduclaw-fork/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-readiness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows:
+    name: Windows native mutex, ACL and process cleanup
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Record validated source
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          git rev-parse HEAD | Set-Content evidence/source.txt
+          Get-FileHash -Algorithm SHA256 Cargo.lock, crates/duduclaw-fork/src/test_runner.rs, crates/duduclaw-fork/src/publication_windows.rs, .github/workflows/release-readiness.yml |
+            Format-List | Out-String | Add-Content evidence/source.txt
+          rustc --version --verbose | Add-Content evidence/source.txt
+          cargo --version | Add-Content evidence/source.txt
+      - name: Run every required Windows case on the native host
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tests = @(
+            'publication::windows::tests::protected_owner_mutex_and_private_recovery_directory_are_validated',
+            'publication::windows::tests::namespace_squatter_with_broad_acl_is_rejected',
+            'test_runner::tests::windows::passing_command_exit_zero',
+            'test_runner::tests::windows::failing_command_nonzero',
+            'test_runner::tests::windows::runs_in_workspace_cwd',
+            'test_runner::tests::windows::timeout_kills_and_marks',
+            'test_runner::tests::windows::timeout_kills_child_and_grandchild'
+          )
+          foreach ($test in $tests) {
+            $filename = $test.Replace('::', '-') + '.log'
+            $output = & cargo test --locked -p duduclaw-fork --lib $test -- --exact --nocapture --test-threads=1 2>&1 |
+              Tee-Object -FilePath (Join-Path evidence $filename)
+            $exitCode = $LASTEXITCODE
+            $output | Write-Output
+            if ($exitCode -ne 0) { throw "Required Windows test failed: $test (exit $exitCode)" }
+            if (-not ($output | Where-Object { "$_" -match '^test result: ok\. 1 passed; 0 failed; 0 ignored;' })) {
+              throw "Required Windows test did not execute exactly once: $test"
+            }
+          }
+      - name: Upload Windows validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-readiness-windows-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  unix:
+    name: Fork native tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      # The fork/core dependency graph does not include gateway/xcap; Linux
+      # desktop libraries from the full-workspace CI are unnecessary here.
+      - name: Record validated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/source.txt
+          rustc --version --verbose >> evidence/source.txt
+          cargo --version >> evidence/source.txt
+      - name: Compile and run fork tests on the native host
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p duduclaw-fork --lib -- --test-threads=1 2>&1 | tee evidence/fork-tests.log
+      - name: Upload native validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-readiness-${{ matrix.os }}-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14

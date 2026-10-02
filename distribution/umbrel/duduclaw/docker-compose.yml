@@ -7,7 +7,7 @@ services:
       APP_PORT: 18789
 
   server:
-    image: ghcr.io/zhixuli0406/duduclaw:1.56.0
+    image: ghcr.io/zhixuli0406/duduclaw:v1.56.0
     restart: on-failure
     stop_grace_period: 30s
     environment:

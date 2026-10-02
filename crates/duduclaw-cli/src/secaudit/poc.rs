@@ -8,21 +8,18 @@
 //! execution happens ONLY inside an isolated container via the existing
 //! `duduclaw-container` sandbox primitive (`RuntimeBackend` /
 //! `ContainerRuntime` — the same Docker/Apple-Container abstraction the PTC
-//! script sandbox [`crate::ptc::sandbox`] and the agent-task sandbox
-//! (`duduclaw_container::sandbox`) already use): `--network=none`, a tmpfs
+//! script sandbox [`crate::ptc::sandbox`] already uses): `--network=none`, a tmpfs
 //! workspace, a read-only mounted script, a hard 120-second timeout.
 //!
 //! **Hard rule (§3.3): the PoC never runs on the host.** Unlike
-//! [`crate::ptc::sandbox::PtcSandbox::execute_in_container`] — which
-//! silently falls back to a bare host subprocess when no container runtime
-//! is available (a fine default for that module's trusted-script use case,
-//! wrong here) — every path in [`execute_in_sandbox`] that can't get a real,
-//! healthy container simply returns `Err`, and [`maybe_run_poc`] turns that
+//! [`crate::ptc::sandbox::PtcSandbox::run_program`] — which runs the script
+//! as an (audited) host subprocess when the operator set `[container.sandbox]
+//! script_when_unavailable = "run_unsandboxed"` — every path in
+//! [`execute_in_sandbox`] that can't get a real, healthy container simply
+//! returns `Err` whatever that switch says, and [`maybe_run_poc`] turns that
 //! into a `poc_skipped: "sandbox unavailable: <reason>"` evidence entry and
-//! stops. This is why this module reimplements the container dance instead
-//! of calling `PtcSandbox::execute_in_container` directly — reusing it would
-//! silently violate the hard rule on any machine without Docker/Apple
-//! Container.
+//! stops. This is why this module drives the container itself instead of
+//! calling `PtcSandbox::run_program`.
 //!
 //! PoC source and output are masked
 //! (`duduclaw_security::audit::mask_sensitive_text`) and truncated before
@@ -236,8 +233,23 @@ pub async fn maybe_run_poc<C: LlmCaller>(
 /// a stub `LlmCaller`) carry the tested behavior up to the point this
 /// function would be called.
 async fn execute_in_sandbox(script: &str, language: &str) -> Result<(i64, String), String> {
-    let runtime = duduclaw_container::RuntimeBackend::detect()
+    // Same image as the task sandbox (`[container.sandbox] image`, default the
+    // published platform image); an invalid section or a missing image means
+    // "sandbox unavailable" — never a host run.
+    let image =
+        duduclaw_gateway::task_sandbox::settings::script_sandbox_image(&crate::duduclaw_home())?;
+    let runtime = duduclaw_container::RuntimeBackend::detect_with_image(&image)
         .map_err(|e| format!("no container runtime detected: {e}"))?;
+    execute_in_runtime(&runtime, script, language).await
+}
+
+/// [`execute_in_sandbox`] against an already-selected runtime — the seam the
+/// real-Docker test drives with an explicit image.
+async fn execute_in_runtime(
+    runtime: &duduclaw_container::RuntimeBackend,
+    script: &str,
+    language: &str,
+) -> Result<(i64, String), String> {
     let health = runtime
         .health_check()
         .await
@@ -246,15 +258,16 @@ async fn execute_in_sandbox(script: &str, language: &str) -> Result<(i64, String
         return Err(format!("container runtime unhealthy: {}", health.message));
     }
 
-    let tmp_dir =
-        std::env::temp_dir().join(format!("duduclaw-secaudit-poc-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("cannot create temp workspace: {e}"))?;
+    // Private, randomly named, removed when `scratch` drops (every path).
+    let scratch = crate::ptc::sandbox::container_script_dir("duduclaw-secaudit-poc-")
+        .map_err(|e| format!("cannot create temp workspace: {e}"))?;
+    let tmp_dir = scratch.path();
 
     let (script_filename, cmd) = match language {
         "python" => (
             "poc.py",
             vec![
-                duduclaw_core::platform::python3_command().to_string(),
+                crate::ptc::sandbox::CONTAINER_PYTHON.to_string(),
                 "/workspace/poc.py".to_string(),
             ],
         ),
@@ -262,14 +275,19 @@ async fn execute_in_sandbox(script: &str, language: &str) -> Result<(i64, String
             "poc.sh",
             vec!["bash".to_string(), "/workspace/poc.sh".to_string()],
         ),
-        other => {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(format!("unsupported PoC language {other:?}"));
-        }
+        other => return Err(format!("unsupported PoC language {other:?}")),
     };
-    if let Err(e) = std::fs::write(tmp_dir.join(script_filename), script) {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(format!("cannot write poc script: {e}"));
+    crate::ptc::sandbox::write_container_script(tmp_dir, script_filename, script)
+        .map_err(|e| format!("cannot write poc script: {e}"))?;
+    match runtime.image_present().await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "container create failed: {}",
+                duduclaw_core::sandbox_image::image_missing_message(&image_of(runtime))
+            ));
+        }
+        Err(e) => return Err(format!("container runtime unavailable: {e}")),
     }
 
     let config = ContainerConfig {
@@ -287,28 +305,25 @@ async fn execute_in_sandbox(script: &str, language: &str) -> Result<(i64, String
         env: vec![],
     };
 
-    let container_id = match runtime.create(config).await {
-        Ok(id) => id,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(format!("container create failed: {e}"));
+    // `run_once` force-removes the container on every path, including
+    // when this future is cancelled, and enforces the hard timeout.
+    match runtime.run_once(config, POC_TIMEOUT).await {
+        Ok(exit) => Ok((exit.exit_code, exit.logs)),
+        Err(duduclaw_container::RunFailure::Create(e)) => Err(format!("container create failed: {e}")),
+        Err(duduclaw_container::RunFailure::Start(e)) => Err(format!("container start failed: {e}")),
+        Err(duduclaw_container::RunFailure::Wait(e)) => Err(format!("container wait failed: {e}")),
+        Err(duduclaw_container::RunFailure::TimedOut) => {
+            Err("container execution exceeded the 120s hard timeout".to_string())
         }
-    };
-    if let Err(e) = runtime.start(&container_id).await {
-        let _ = runtime.remove(&container_id).await;
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(format!("container start failed: {e}"));
     }
+}
 
-    let wait_result = tokio::time::timeout(POC_TIMEOUT, runtime.wait(&container_id)).await;
-    let _ = runtime.stop(&container_id, Duration::from_secs(5)).await;
-    let _ = runtime.remove(&container_id).await;
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-
-    match wait_result {
-        Ok(Ok(exit)) => Ok((exit.exit_code, exit.logs)),
-        Ok(Err(e)) => Err(format!("container wait failed: {e}")),
-        Err(_) => Err("container execution exceeded the 120s hard timeout".to_string()),
+/// The image a runtime creates containers from (for the missing-image
+/// message); the Apple backend never creates any.
+fn image_of(runtime: &duduclaw_container::RuntimeBackend) -> String {
+    match runtime {
+        duduclaw_container::RuntimeBackend::Docker(rt) => rt.image().to_string(),
+        _ => duduclaw_container::docker::default_image(),
     }
 }
 
@@ -490,5 +505,44 @@ mod tests {
         maybe_run_poc(dir.path(), &mut f, &caller, true).await;
         assert_eq!(f.evidence[0].kind, EvidenceKind::PocSkipped);
         assert!(f.evidence[0].detail.contains("poc_generation_failed"));
+    }
+
+    /// Real Docker: a trivial Python script through the script-sandbox path
+    /// (`execute_in_runtime`, the body of the PoC executor), in the image
+    /// named by `DUDU_TASK_SANDBOX_IMAGE` (else the published platform image
+    /// for this version). The image must already be present — it is never
+    /// pulled. The interpreter is found through the image's PATH, so an image
+    /// whose python3 is `/usr/bin/python3` works as well as the platform
+    /// image's `/usr/local/bin/python3`.
+    ///
+    /// `DUDU_TASK_SANDBOX_IMAGE=<image> cargo test -p duduclaw-cli --lib \
+    ///   --features app-compat -- --ignored script_sandbox_docker`
+    #[tokio::test]
+    #[ignore = "requires a Docker daemon + the sandbox image present locally"]
+    async fn script_sandbox_docker_runs_python_offline_as_non_root() {
+        let image = std::env::var("DUDU_TASK_SANDBOX_IMAGE")
+            .unwrap_or_else(|_| duduclaw_container::docker::default_image());
+        let runtime = duduclaw_container::RuntimeBackend::Docker(
+            duduclaw_container::docker::DockerRuntime::with_image(&image)
+                .expect("Docker daemon must be reachable"),
+        );
+        // A raw string: `\` line continuations would strip the leading
+        // spaces Python needs for the `try:` / `except` bodies.
+        let script = r#"import os, socket
+print('SANDBOX_OK', 6 * 7)
+print('UID', os.getuid())
+try:
+    socket.create_connection(('1.1.1.1', 53), timeout=1)
+    print('NET_OPEN')
+except OSError:
+    print('NET_BLOCKED')
+"#;
+        let (exit_code, output) = execute_in_runtime(&runtime, script, "python")
+            .await
+            .expect("script sandbox must run");
+        assert_eq!(exit_code, 0, "{output}");
+        assert!(output.contains("SANDBOX_OK 42"), "{output}");
+        assert!(output.contains("NET_BLOCKED"), "{output}");
+        assert!(!output.contains("UID 0\n") && !output.contains("UID 0\r"), "{output}");
     }
 }

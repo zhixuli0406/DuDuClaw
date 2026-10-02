@@ -343,6 +343,7 @@ mod tests {
         "code_map",
         "computer_click",
         "computer_key",
+        "computer_navigate",
         "computer_screenshot",
         "computer_scroll",
         "computer_session_start",

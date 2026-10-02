@@ -1,0 +1,208 @@
+name: Computer-use image
+
+# Build + push the multi-arch computer-use container image to GHCR:
+# `ghcr.io/zhixuli0406/duduclaw-computer-use:<tag>` + `:latest`, built from
+# `container/Dockerfile.computer-use` (Debian + Xvfb + openbox + Chromium +
+# python3 for `duduclaw-eval-dom`). The gateway runs
+# `ghcr.io/zhixuli0406/duduclaw-computer-use:v<gateway version>` for an L5a
+# computer-use session (`duduclaw_core::sandbox_image::computer_use_image`)
+# and never pulls it: operators `docker pull` it, and `duduclaw doctor` says so.
+#
+# Same triggers and layout as docker-image.yml (release tag `v*` or manual
+# dispatch; one NATIVE build job per architecture pushing by digest, then a
+# merge job creating the multi-arch manifest). A separate workflow on purpose:
+# a failure of this image never blocks the server image, and vice versa.
+#
+# Each build job smoke-tests the image BEFORE pushing it, with the flags the
+# orchestrator uses (`build_docker_run_args`, no-network mode): the virtual
+# display and window manager must come up, a screenshot must be taken, and
+# `duduclaw-eval-dom` must reach Chromium over CDP. A broken browser package
+# fails the workflow instead of shipping.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to publish (e.g. v1.67.0)"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/zhixuli0406/duduclaw-computer-use
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build into the local Docker image store first, so the smoke test runs
+      # the exact layers that are pushed next. Cache scopes are distinct from
+      # docker-image.yml's (`amd64` / `arm64`) so the two images never evict
+      # each other's GHA cache entries.
+      - name: Build for smoke test (load)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: container/Dockerfile.computer-use
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: duduclaw-computer-use:smoke
+          cache-from: type=gha,scope=computer-use-${{ matrix.arch }}
+          # ignore-error: same reason as docker-image.yml — a cache-export
+          # failure after a good build must never fail the publish.
+          cache-to: type=gha,mode=max,scope=computer-use-${{ matrix.arch }},ignore-error=true
+
+      # Mirrors the orchestrator's no-network `docker run` argv and its
+      # readiness probe (`xdotool getactivewindow`), then exercises the
+      # things a broken package breaks: `scrot`, `duduclaw-eval-dom` and
+      # `duduclaw-navigate` (which must fail cleanly without network).
+      - name: Smoke test (orchestrator flags, no network)
+        env:
+          SMOKE_CONTAINER: duduclaw-cu-smoke-${{ matrix.arch }}
+        run: |
+          set -eu
+          c="${SMOKE_CONTAINER}"
+          cleanup() {
+            docker logs "$c" 2>&1 | tail -n 100 || true
+            docker rm -f "$c" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run -d --pull never --name "$c" \
+            --read-only --tmpfs /tmp:size=256m \
+            --label managed-by=duduclaw-ci \
+            --security-opt no-new-privileges \
+            --cpus 1 --memory 512m --pids-limit 512 \
+            --network=none \
+            -e DISPLAY_SIZE=1280x800 -e DISPLAY=:99 \
+            duduclaw-computer-use:smoke
+          ready=""
+          for _ in $(seq 1 90); do
+            if docker exec "$c" xdotool getactivewindow >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::xdotool getactivewindow never succeeded (display / window manager / browser not up)"
+            exit 1
+          fi
+          docker exec "$c" scrot -o /tmp/duduclaw-root/screen.png
+          out="$(docker exec "$c" duduclaw-eval-dom 'JSON.stringify([])')"
+          if [ "$out" != "[]" ]; then
+            echo "::error::duduclaw-eval-dom returned '$out', expected '[]'"
+            exit 1
+          fi
+          # Without network the navigation helper must fail cleanly: a
+          # non-zero exit and exactly one JSON line with ok=false.
+          set +e
+          nav="$(printf 'https://example.com/\n' | docker exec -i "$c" duduclaw-navigate)"
+          nav_rc=$?
+          set -e
+          if [ "$nav_rc" -eq 0 ] || [ "$(printf '%s\n' "$nav" | wc -l)" -ne 1 ] \
+            || ! printf '%s' "$nav" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("ok") is False and isinstance(d.get("error"), str) else 1)'; then
+            echo "::error::duduclaw-navigate without network returned rc=$nav_rc '$nav', expected a non-zero exit and one JSON line with ok=false"
+            exit 1
+          fi
+          echo "smoke test passed: display ready, screenshot taken, DOM helper answered [], navigate failed cleanly ($nav)"
+
+      # Push by digest only: the per-arch image gets no tag of its own, the
+      # merge job below is the only thing that names it. Same builder, same
+      # inputs as the smoke build, so every layer is a cache hit.
+      - name: Build and push (by digest)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: container/Dockerfile.computer-use
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=computer-use-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=computer-use-${{ matrix.arch }},ignore-error=true
+
+      - name: Export digest
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: computer-use-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge manifest and tag
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Resolve image tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: computer-use-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -eu
+          ls -1
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ steps.meta.outputs.tag }}" \
+            -t "${IMAGE}:latest" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.tag }}"

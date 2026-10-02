@@ -1,11 +1,11 @@
-//! PTC (Process-to-Claude) — sandbox script execution with MCP tool access.
+//! PTC (Process-to-Claude) — sandboxed script execution (`execute_program`).
 //!
-//! Provides two execution modes:
-//! - Direct subprocess (`PtcSandbox::execute`)
-//! - Container-isolated (`PtcSandbox::execute_in_container`) with fallback
+//! Entry point: `PtcSandbox::run_program` — container-isolated; when the
+//! container cannot run, `config.toml [container.sandbox]
+//! script_when_unavailable` decides between refusing (default) and an
+//! audited host subprocess (`PtcSandbox::execute`).
 //!
-//! Scripts communicate with the host via a Unix Domain Socket RPC server
-//! (`PtcRpcServer`) to invoke MCP tools.
+//! Scripts cannot call MCP tools: `PtcRpcServer` is an unserved descriptor.
 
 pub mod sandbox;
 pub mod types;

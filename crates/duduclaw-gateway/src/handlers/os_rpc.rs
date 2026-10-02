@@ -110,7 +110,11 @@ impl MethodHandler {
     /// delegates, so the quota gate, `[os_watch]` / `[proactive]` validators,
     /// and the three-subsystem hot reload are reused verbatim (one write path,
     /// no divergence).
-    pub(crate) async fn handle_os_settings_update(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_os_settings_update(
+        &self,
+        params: Value,
+        caller: Option<&UserContext>,
+    ) -> WsFrame {
         let Some(agent_id) = params.get("agent_id").and_then(|v| v.as_str()) else {
             return WsFrame::error_response("", "Missing 'agent_id' parameter");
         };
@@ -142,7 +146,7 @@ impl MethodHandler {
             mapped.insert("os_watch".into(), Value::Object(ow));
         }
 
-        self.handle_agents_update(Value::Object(mapped)).await
+        self.handle_agents_update_as(Value::Object(mapped), caller).await
     }
 
     /// `os.gate.recent` — tail of `proactive_gate.jsonl` (default 50, max 200)

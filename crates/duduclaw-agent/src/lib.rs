@@ -25,6 +25,7 @@ pub use budget::{BudgetManager, BudgetStatus};
 pub use heartbeat::{
     HeartbeatScheduler,
     HeartbeatStatus,
+    HostRunNotice,
     SilenceBreakerEvent,
     start_heartbeat_scheduler,
     start_heartbeat_scheduler_with,

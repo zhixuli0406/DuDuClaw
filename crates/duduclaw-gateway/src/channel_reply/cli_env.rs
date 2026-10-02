@@ -272,6 +272,15 @@ pub(super) async fn spawn_claude_cli_with_env(
     {
         cmd.env(duduclaw_core::ENV_TRUST_SESSION_ID, &session_id);
     }
+    // Record `(agent, turn) → reply channel` for as long as this CLI runs, so
+    // the computer-use route can ask a human in THIS chat (and only here)
+    // about a high-risk action of this employee. Dropped when this function
+    // returns, i.e. when the turn's CLI is done.
+    let _computer_use_turn = crate::claude_runner::CHANNEL_REPLY_AGENT_ID
+        .try_with(|id| id.clone())
+        .ok()
+        .filter(|id| !id.is_empty())
+        .and_then(|agent| crate::computer_use_sessions::turns::register_current_turn(&agent));
 
     // Prevent "nested session" error when gateway was launched from a Claude Code session
     cmd.env_remove("CLAUDECODE");
@@ -335,6 +344,7 @@ pub(super) async fn spawn_claude_cli_with_env(
     // can be recorded for channel-path replies (previously: 0 entries for
     // agnes despite 23-min runs because rotate_cli_spawn discarded usage).
     let mut token_usage: Option<crate::cost_telemetry::TokenUsage> = None;
+    let mut utility_usage_recorded = false;
     // Track last tool type to suppress duplicate progress messages
     let mut last_tool_reported: Option<String> = None;
     // The model the CLI actually answered with (from `message.model`), reported
@@ -589,6 +599,15 @@ pub(super) async fn spawn_claude_cli_with_env(
                                 // into `result_text` and return Ok to the caller.
                                 Some("result") => {
                                     result_events += 1;
+                                    // Utility CLI calls carry their own caller
+                                    // scope, rather than masquerading as channel
+                                    // turns. Record real usage before error exits
+                                    // and await the write before review can settle.
+                                    if !utility_usage_recorded {
+                                        utility_usage_recorded = crate::runtime_dispatch::record_claude_utility_result(
+                                            home_dir, &event, reported_model.as_deref(),
+                                        ).await;
+                                    }
                                     last_result_subtype = event
                                         .get("subtype")
                                         .and_then(|s| s.as_str())
@@ -722,6 +741,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                                     if let Some(m) = event
                                         .pointer("/message/model")
                                         .and_then(|v| v.as_str())
+                                        .filter(|m| crate::runtime_dispatch::is_observed_claude_model(m))
                                     {
                                         if reported_model.as_deref() != Some(m) {
                                             reported_model = Some(m.to_string());
@@ -937,7 +957,8 @@ pub(super) async fn spawn_claude_cli_with_env(
     // RFC-22 P1-7: record cost_telemetry for the channel reply. Skipped when
     // the task_local agent_id is unset (e.g. invoked outside channel_reply,
     // such as the dispatch path which already records via claude_runner).
-    if let (Some(usage), Ok(agent_id)) = (
+    if !crate::runtime_dispatch::is_claude_utility_call()
+        && let (Some(usage), Ok(agent_id)) = (
         token_usage.as_ref(),
         crate::claude_runner::CHANNEL_REPLY_AGENT_ID.try_with(|id| id.clone()),
     ) {
@@ -990,4 +1011,3 @@ pub(super) async fn spawn_claude_cli_with_env(
 
     Ok(result_text)
 }
-

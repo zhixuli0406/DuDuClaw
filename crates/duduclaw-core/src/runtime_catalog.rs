@@ -348,6 +348,39 @@ pub struct RuntimeSpec {
     /// confirmed against vendor documentation or a live binary. See the
     /// entry's comment for exactly which. Never silently `true`.
     pub verified: bool,
+    /// `Some` ⇒ this runtime is deprecated and will be removed (project
+    /// policy: the value survives two minor versions). The value still parses
+    /// and runs during the window; readers warn, dashboard writes are
+    /// audited. The ONE place the version strings live — see
+    /// `docs/guides/deprecations.md`.
+    pub deprecation: Option<RuntimeDeprecation>,
+}
+
+/// A runtime's deprecation window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeDeprecation {
+    /// Version that first marked the runtime deprecated (e.g. `v1.67.0`).
+    pub since: &'static str,
+    /// Version that removes it (e.g. `v1.69.0`).
+    pub remove_in: &'static str,
+    /// Canonical id of the runtime that takes over.
+    pub replacement: &'static str,
+}
+
+/// Where the documentation of every deprecation lives. Named in every
+/// deprecation message so an operator reading a log line knows where to go.
+pub const DEPRECATIONS_DOC: &str = "docs/guides/deprecations.md";
+
+impl RuntimeDeprecation {
+    /// One-line, operator-facing notice: what is deprecated, what replaces
+    /// it, when it is removed, where the migration steps are. Shared by the
+    /// gateway's warn-once readers, the CLI's stderr notice and `doctor`.
+    pub fn notice(&self, id: &str) -> String {
+        format!(
+            "runtime \"{id}\" is deprecated since {} and will be removed in {}; switch to \"{}\" (migration steps: {})",
+            self.since, self.remove_in, self.replacement, DEPRECATIONS_DOC
+        )
+    }
 }
 
 // ── The table ────────────────────────────────────────────────────────────
@@ -415,6 +448,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         ],
         vendor_url: "https://docs.anthropic.com/en/docs/claude-code",
         verified: true,
+        deprecation: None,
     },
     // ── OpenAI Codex ─────────────────────────────────────────────────────
     RuntimeSpec {
@@ -463,6 +497,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         ],
         vendor_url: "https://github.com/openai/codex",
         verified: true,
+        deprecation: None,
     },
     // ── Google Gemini CLI ────────────────────────────────────────────────
     RuntimeSpec {
@@ -510,6 +545,14 @@ pub const CATALOG: &[RuntimeSpec] = &[
         ],
         vendor_url: "https://github.com/google-gemini/gemini-cli",
         verified: true,
+        // R1 (2026-10): Google stopped serving personal accounts through the
+        // Gemini CLI on 2026-06-18; Antigravity (`agy`) takes over. The value
+        // keeps parsing and running for the deprecation window.
+        deprecation: Some(RuntimeDeprecation {
+            since: "v1.67.0",
+            remove_in: "v1.69.0",
+            replacement: "antigravity",
+        }),
     },
     // ── Google Antigravity (`agy`) ───────────────────────────────────────
     RuntimeSpec {
@@ -525,8 +568,10 @@ pub const CATALOG: &[RuntimeSpec] = &[
             url: "https://antigravity.google/cli/install.sh",
         },
         headless: HeadlessSpec {
-            // Verified in `runtime/antigravity.rs` against `agy --help` v1.0.12:
-            // `agy -p <prompt>`, model via `--model` taking the DISPLAY name.
+            // Re-verified on agy 1.2.10–1.2.14 (`runtime/antigravity.rs`):
+            // `agy -p <prompt>` (the prompt is `-p`'s value and must be last),
+            // model via `--model` taking the DISPLAY name. The runtime module
+            // adds `--output-format stream-json` itself.
             args_template: &["-p", "{prompt}"],
             output: OutputFormat::Text,
             model_flag: Some("--model"),
@@ -534,21 +579,29 @@ pub const CATALOG: &[RuntimeSpec] = &[
             extra_env: &[],
         },
         auth: AuthSpec {
-            api_key_env: Some("ANTIGRAVITY_API_KEY"),
-            login: LoginMethod::BrowserOauth { args: &["login"] },
+            // agy 1.1.13+ reads `GEMINI_API_KEY`, but ONLY together with
+            // `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`;
+            // the runtime writes that when `config.toml [antigravity] auth =
+            // "api_key"`. (`ANTIGRAVITY_API_KEY`, used here until 2026-10, never
+            // existed — the binary does not contain the string.)
+            api_key_env: Some("GEMINI_API_KEY"),
+            // There is no `agy login` subcommand (1.2.14: `unexpected argument
+            // "login"`, exit 2). Sign-in happens inside the interactive TUI
+            // started by bare `agy`, which cannot be driven headlessly.
+            login: LoginMethod::None,
             // `agy` has no documented single credential file; presence is
             // inferred from the CLI itself, so the credential-store card is
             // skipped for this runtime.
             credential_paths: &[],
             tos_note: Some(LocaleText {
-                en: "Same Google consumer-subscription restriction as Gemini CLI. Use ANTIGRAVITY_API_KEY when remote.",
-                zh_tw: "與 Gemini CLI 相同的 Google 消費者訂閱限制。遠端請改用 ANTIGRAVITY_API_KEY。",
-                ja_jp: "Gemini CLI と同じ Google の消費者向けサブスクリプション制限が適用されます。リモートの場合は ANTIGRAVITY_API_KEY をご利用ください。",
+                en: "Same Google consumer-subscription restriction as Gemini CLI. For remote or container deployments use API-key mode (config.toml [antigravity] auth = \"api_key\" plus a Gemini API key).",
+                zh_tw: "與 Gemini CLI 相同的 Google 消費者訂閱限制。遠端或容器部署請改用 API key 模式（config.toml [antigravity] auth = \"api_key\"，並提供 Gemini API key）。",
+                ja_jp: "Gemini CLI と同じ Google の消費者向けサブスクリプション制限が適用されます。リモートやコンテナでの運用では API キー モード（config.toml [antigravity] auth = \"api_key\" と Gemini API キー）をご利用ください。",
             }),
             login_hint: Some(LocaleText {
-                en: "Complete the Antigravity sign-in in a browser on this machine. Use ANTIGRAVITY_API_KEY when remote.",
-                zh_tw: "於同機瀏覽器完成 Antigravity 登入。遠端請改用 ANTIGRAVITY_API_KEY。",
-                ja_jp: "同一マシンのブラウザで Antigravity にサインインしてください。リモートの場合は ANTIGRAVITY_API_KEY をご利用ください。",
+                en: "Sign in by running `agy` in a terminal on this machine and following the prompts. For remote or container deployments use API-key mode: config.toml [antigravity] auth = \"api_key\" plus a Gemini API key.",
+                zh_tw: "請在這台主機的終端機執行 `agy`，依畫面提示完成登入。遠端或容器部署請改用 API key 模式：config.toml [antigravity] auth = \"api_key\"，並提供 Gemini API key。",
+                ja_jp: "このマシンのターミナルで `agy` を実行し、画面の案内に従ってサインインしてください。リモートやコンテナでの運用では API キー モード（config.toml [antigravity] auth = \"api_key\" と Gemini API キー）をご利用ください。",
             }),
         },
         mcp: true,
@@ -559,6 +612,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         ],
         vendor_url: "https://antigravity.google/docs/cli",
         verified: true,
+        deprecation: None,
     },
     // ── xAI Grok Build ───────────────────────────────────────────────────
     RuntimeSpec {
@@ -614,6 +668,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         fallback_models: &[("grok-build-0.1", "Grok Build 0.1"), ("grok-4", "Grok 4")],
         vendor_url: "https://docs.x.ai/build/cli",
         verified: true,
+        deprecation: None,
     },
     // ── Alibaba Qwen Code ────────────────────────────────────────────────
     //
@@ -678,6 +733,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         ],
         vendor_url: "https://github.com/QwenLM/qwen-code",
         verified: true,
+        deprecation: None,
     },
     // ── Moonshot AI Kimi Code ────────────────────────────────────────────
     //
@@ -733,6 +789,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         fallback_models: &[("kimi-code/kimi-for-coding", "Kimi for Coding")],
         vendor_url: "https://github.com/MoonshotAI/kimi-code",
         verified: true,
+        deprecation: None,
     },
     // ── GitHub Copilot CLI ───────────────────────────────────────────────
     //
@@ -803,6 +860,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         ],
         vendor_url: "https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli",
         verified: true,
+        deprecation: None,
     },
     // ── AWS Kiro CLI ─────────────────────────────────────────────────────
     //
@@ -870,6 +928,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         fallback_models: &[],
         vendor_url: "https://kiro.dev/docs/cli/headless",
         verified: true,
+        deprecation: None,
     },
     // ── Cursor CLI ───────────────────────────────────────────────────────
     //
@@ -935,6 +994,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         ],
         vendor_url: "https://cursor.com/docs/cli/headless",
         verified: true,
+        deprecation: None,
     },
     // ── Mistral Vibe ─────────────────────────────────────────────────────
     //
@@ -1002,6 +1062,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         ],
         vendor_url: "https://docs.mistral.ai/vibe/code/cli/work-with-cli",
         verified: true,
+        deprecation: None,
     },
     // ── OpenCode ─────────────────────────────────────────────────────────
     //
@@ -1067,6 +1128,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         ],
         vendor_url: "https://opencode.ai/docs/cli/",
         verified: true,
+        deprecation: None,
     },
     // ── OpenAI-compatible HTTP (no CLI) ──────────────────────────────────
     RuntimeSpec {
@@ -1104,6 +1166,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         fallback_models: &[],
         vendor_url: "https://platform.openai.com/docs/api-reference/chat",
         verified: true,
+        deprecation: None,
     },
 ];
 
@@ -1500,5 +1563,68 @@ mod tests {
             assert!(!spec.install.command_display().is_empty());
             assert!(!spec.install.kind().is_empty());
         }
+    }
+
+    /// 2026-10 (agy 1.2.14, measured): `ANTIGRAVITY_API_KEY` does not exist and
+    /// there is no `agy login`. The key route is `GEMINI_API_KEY` + the
+    /// `[antigravity] auth = "api_key"` setting; sign-in is the bare `agy` TUI.
+    #[test]
+    fn antigravity_names_the_real_key_and_has_no_scripted_login() {
+        let spec = spec_for("antigravity").unwrap();
+        assert_eq!(spec.auth.api_key_env, Some("GEMINI_API_KEY"));
+        assert_eq!(spec.auth.login, LoginMethod::None);
+        assert!(spec.auth.login.args().is_empty());
+        for text in [spec.auth.tos_note, spec.auth.login_hint].into_iter().flatten() {
+            for t in [text.en, text.zh_tw, text.ja_jp] {
+                assert!(!t.contains("ANTIGRAVITY_API_KEY"), "stale variable in {t:?}");
+                assert!(t.contains("[antigravity] auth"), "API-key mode not named in {t:?}");
+            }
+        }
+        let hint = spec.auth.login_hint.unwrap();
+        assert!(hint.zh_tw.contains("`agy`"), "{}", hint.zh_tw);
+    }
+
+    /// R1 (2026-10): only the Gemini CLI carries a deprecation window, and it
+    /// points at a real, non-deprecated replacement.
+    #[test]
+    fn only_gemini_is_deprecated_and_its_replacement_is_live() {
+        for spec in CATALOG {
+            if spec.id == "gemini" {
+                let dep = spec.deprecation.expect("gemini is deprecated");
+                assert_eq!(dep.since, "v1.67.0");
+                assert_eq!(dep.remove_in, "v1.69.0");
+                assert_eq!(dep.replacement, "antigravity");
+                let repl = spec_for(dep.replacement).expect("replacement is a catalog id");
+                assert!(repl.deprecation.is_none(), "replacement must not itself be deprecated");
+            } else {
+                assert!(spec.deprecation.is_none(), "{} unexpectedly deprecated", spec.id);
+            }
+        }
+    }
+
+    #[test]
+    fn deprecation_notice_names_replacement_version_and_doc() {
+        let dep = spec_for("gemini").unwrap().deprecation.unwrap();
+        let n = dep.notice("gemini");
+        assert!(n.contains("\"gemini\""), "{n}");
+        assert!(n.contains("\"antigravity\""), "{n}");
+        assert!(n.contains("v1.69.0"), "{n}");
+        assert!(n.contains(DEPRECATIONS_DOC), "{n}");
+    }
+
+    /// Deprecation changes nothing about resolution: order, model tie-break
+    /// and alias lookup are exactly what they were.
+    #[test]
+    fn deprecation_does_not_change_resolution() {
+        assert_eq!(runtime_for_model("gemini-3-pro-preview").unwrap().id, "gemini");
+        assert_eq!(spec_for("gemini").unwrap().id, "gemini");
+        assert!(all_ids().any(|id| id == "gemini"));
+        assert_eq!(
+            crate::types::RuntimeType::parse("gemini"),
+            Some(crate::types::RuntimeType::Gemini)
+        );
+        assert!(crate::types::RuntimeType::Gemini.is_deprecated());
+        assert!(!crate::types::RuntimeType::Antigravity.is_deprecated());
+        assert!(!crate::types::RuntimeType::Claude.is_deprecated());
     }
 }

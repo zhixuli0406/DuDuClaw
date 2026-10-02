@@ -703,6 +703,27 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    // Discovery never resumes a crashed experiment. The maintenance gate
+    // shares the operator lease, so a live CLI run is left alone.
+    if let Err(error) = crate::discovery::maintenance::on_gateway_start(&home_dir) {
+        warn!(%error, "discovery startup maintenance refused");
+    }
+
+    // Task-sandbox leftovers (containers stopped or past their deadline,
+    // orphaned run directories): at boot, then every 10 minutes so a failed
+    // per-task cleanup does not wait for the next restart. Background:
+    // never delays boot; a no-op while `<home>/sandbox` does not exist.
+    tokio::spawn(crate::task_sandbox::sweep::run_periodically(home_dir.clone()));
+
+    // Tool-driven computer-use sessions (`computer_*` MCP tools →
+    // `POST /api/internal/computer-use`): the reaper ends expired or idle
+    // sessions every 15 s; the orphan sweep removes `duduclaw-cu-*`
+    // containers of this home a crashed gateway left behind, at boot and
+    // every 10 minutes.
+    let computer_use_sessions =
+        crate::computer_use_sessions::ComputerUseSessions::new(home_dir.clone());
+    computer_use_sessions.spawn_background();
+
     // ── Initialize user database & JWT ───────────────────────
     let user_db_path = home_dir.join("users.db");
     let user_db = Arc::new(UserDb::new(&user_db_path).map_err(|e| {
@@ -1133,10 +1154,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // prediction.db (gated by a 4h per-agent cool-down).
     let (silence_tx, silence_rx) =
         tokio::sync::mpsc::unbounded_channel::<duduclaw_agent::SilenceBreakerEvent>();
+    // The proactive check runs the agent's CLI on the host; for a
+    // sandbox-enabled employee that is reported, never silent.
+    let proactive_notice: duduclaw_agent::HostRunNotice =
+        std::sync::Arc::new(|home: &std::path::Path, agent_id: &str, sandbox_enabled: bool| {
+            crate::task_sandbox::note_not_applied(
+                home,
+                agent_id,
+                sandbox_enabled,
+                crate::task_sandbox::HostPath::Proactive,
+                crate::task_sandbox::HostAction::RanOnHost,
+            );
+        });
     let heartbeat = duduclaw_agent::heartbeat::start_heartbeat_scheduler_with(
         home_dir.clone(),
         handler.registry().clone(),
         Some(silence_tx),
+        Some(proactive_notice),
     );
     handler.set_heartbeat(heartbeat).await;
     info!("Heartbeat scheduler started (per-agent evolution + monitoring)");
@@ -1275,6 +1309,22 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 None
             }
         };
+
+    // Dedicated discovery tasks share durable CAS claims and the host lease;
+    // ordinary task dispatch never sees this queue.
+    if task_store_opt.is_some() {
+        let discovery_home = home_dir.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if let Err(error) = crate::discovery::service::poll(&discovery_home).await {
+                    warn!(%error, "discovery task queue refused execution");
+                }
+            }
+        });
+    }
 
     // Initialize autopilot rule store (SQLite autopilot.db)
     let autopilot_store_opt: Option<Arc<crate::autopilot_store::AutopilotStore>> =
@@ -2534,6 +2584,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // — trust is proven by subscription_id + machine_fingerprint. Own state
     // (home_dir) + 64 KiB body cap, like the federation route above.
     app = app.merge(crate::license_serve::router(home_dir.clone()));
+
+    // ── Tool-driven computer use (internal) ───────────────────────
+    // Always mounted; every request must come from a loopback peer, carry
+    // the gateway-internal MCP key and a verified employee identity token
+    // (`computer_use_sessions::auth`). Own state + 64 KiB body cap.
+    app = app.merge(crate::computer_use_sessions::http::router(
+        computer_use_sessions.clone(),
+    ));
 
     // ── Telegram Mini App (D-S1 spike) ────────────────────────────
     // Always mounted; every handler self-gates on `config.toml [miniapp]
@@ -14923,26 +14981,20 @@ async fn ws_handler(
 /// * `has_credential` — a frame that DID present a jwt/token must
 ///   authenticate or be refused; it never silently degrades to a restricted
 ///   session (that would turn an expired token into a quiet downgrade).
-/// * `explicitly_requested || !ed25519_configured` — an Ed25519 client's own
-///   `connect` frame is credential-less by design (the signature arrives in
-///   the *next* frame), so on an Ed25519-configured gateway the caller has to
-///   say `pre_auth: true` to opt out of the challenge flow. With no Ed25519
-///   configured there is no such ambiguity and the marker is optional.
+/// * A `pre_auth: true` marker in the `connect` params is accepted but not
+///   required: it only ever disambiguated the removed Ed25519
+///   challenge-response flow (whose `connect` frame was also credential-less),
+///   and with that flow gone there is nothing left to disambiguate.
 /// * `is_appliance` / `peer_is_loopback` — the same two fences the RPC itself
 ///   re-checks (`power_local::evaluate`). Checking them here as well means an
 ///   off-appliance or off-box caller never even gets a session object, and
 ///   the RPC-level check is defence in depth, not the only guard.
 fn pre_auth_handshake_allowed(
     has_credential: bool,
-    explicitly_requested: bool,
-    ed25519_configured: bool,
     is_appliance: bool,
     peer_is_loopback: bool,
 ) -> bool {
-    !has_credential
-        && (explicitly_requested || !ed25519_configured)
-        && is_appliance
-        && peer_is_loopback
+    !has_credential && is_appliance && peer_is_loopback
 }
 
 /// The `UserContext` a restricted pre-auth (lock-screen) connection carries.
@@ -14983,7 +15035,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     // Supports 3 modes:
     //   1. JWT token: { "method": "connect", "params": { "jwt": "..." } }
     //   2. Legacy token: { "method": "connect", "params": { "token": "..." } }
-    //   3. Ed25519 challenge-response (existing flow)
+    //   3. Appliance lock screen: credential-less, loopback, restricted
     //   4. No auth configured: admin fallback
 
     let user_ctx: UserContext = if state.auth.is_auth_required() || has_users(&state.user_db) {
@@ -15028,8 +15080,6 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 .filter(|s| !s.is_empty());
                             let pre_auth_ok = pre_auth_handshake_allowed(
                                 jwt_param.is_some() || token_param.is_some(),
-                                params.get("pre_auth").and_then(|v| v.as_bool()) == Some(true),
-                                state.auth.is_ed25519(),
                                 duduclaw_core::is_appliance(),
                                 crate::power_local::ip_is_loopback(peer.ip()),
                             );
@@ -15084,7 +15134,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                             // ── Restricted pre-auth (appliance lock screen) ─────
                             // Ordered AFTER the JWT branch (a presented
                             // credential always authenticates or fails) and
-                            // BEFORE Ed25519/legacy-token, guarded by
+                            // BEFORE the legacy token, guarded by
                             // `pre_auth_handshake_allowed` so it can only ever
                             // win for a credential-less caller sitting at an
                             // appliance. The session it grants is restricted at
@@ -15107,89 +15157,6 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                     .await;
                                 info!(peer = %peer.ip(), "lock-screen pre-auth WebSocket session granted");
                                 Ok(pre_auth_context())
-                            }
-                            // ── Ed25519 challenge-response ──────────────────────
-                            else if state.auth.is_ed25519() {
-                                // M23: challenge is per-connection — held in this
-                                // local and threaded into verify_ed25519 below, so
-                                // concurrent handshakes never clobber each other.
-                                let (challenge_b64, challenge) = state.auth.issue_challenge();
-                                let resp = WsFrame::ok_response(
-                                    &id,
-                                    serde_json::json!({ "challenge": challenge_b64 }),
-                                );
-                                let _ = socket
-                                    .send(Message::Text(
-                                        serde_json::to_string(&resp).unwrap_or_default().into(),
-                                    ))
-                                    .await;
-
-                                // Wait for the `authenticate` message (with timeout)
-                                match tokio::time::timeout(auth_timeout, socket.recv())
-                                    .await
-                                    .unwrap_or(None)
-                                {
-                                    Some(Ok(Message::Text(auth_text))) => {
-                                        match serde_json::from_str::<WsFrame>(&auth_text) {
-                                            Ok(WsFrame::Request {
-                                                id: auth_id,
-                                                method: auth_method,
-                                                params: auth_params,
-                                            }) if auth_method == "authenticate" => {
-                                                let sig = auth_params
-                                                    .get("signature")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("");
-                                                match state.auth.verify_ed25519(sig, &challenge) {
-                                                    Ok(()) => {
-                                                        let ok = WsFrame::ok_response(
-                                                            &auth_id,
-                                                            serde_json::json!({"status": "authenticated"}),
-                                                        );
-                                                        let _ = socket
-                                                            .send(Message::Text(
-                                                                serde_json::to_string(&ok)
-                                                                    .unwrap_or_default()
-                                                                    .into(),
-                                                            ))
-                                                            .await;
-                                                        // Ed25519 users get admin context (backward compat)
-                                                        Ok(UserContext::admin_fallback())
-                                                    }
-                                                    Err(_) => {
-                                                        let err = WsFrame::error_response(
-                                                            &auth_id,
-                                                            "Ed25519 authentication failed",
-                                                        );
-                                                        let _ = socket
-                                                            .send(Message::Text(
-                                                                serde_json::to_string(&err)
-                                                                    .unwrap_or_default()
-                                                                    .into(),
-                                                            ))
-                                                            .await;
-                                                        Err(())
-                                                    }
-                                                }
-                                            }
-                                            _ => {
-                                                let err = WsFrame::error_response(
-                                                    "",
-                                                    "expected authenticate message",
-                                                );
-                                                let _ = socket
-                                                    .send(Message::Text(
-                                                        serde_json::to_string(&err)
-                                                            .unwrap_or_default()
-                                                            .into(),
-                                                    ))
-                                                    .await;
-                                                Err(())
-                                            }
-                                        }
-                                    }
-                                    _ => Err(()),
-                                }
                             }
                             // ── Legacy token authentication ────────────────────
                             else if state.auth.is_auth_required() {
@@ -16179,29 +16146,16 @@ mod pre_auth_handshake_tests {
     use super::*;
 
     /// Argument order is easy to transpose, so name them at every call site.
-    fn allowed(
-        has_credential: bool,
-        explicitly_requested: bool,
-        ed25519: bool,
-        appliance: bool,
-        loopback: bool,
-    ) -> bool {
-        pre_auth_handshake_allowed(
-            has_credential,
-            explicitly_requested,
-            ed25519,
-            appliance,
-            loopback,
-        )
+    fn allowed(has_credential: bool, appliance: bool, loopback: bool) -> bool {
+        pre_auth_handshake_allowed(has_credential, appliance, loopback)
     }
 
     /// The one accepted shape: no credential, on an appliance, over loopback.
-    /// With no Ed25519 configured the explicit marker is optional, so the
-    /// shell works whether or not it sends one.
+    /// The `pre_auth: true` marker is not an input any more, so the shell
+    /// works whether or not it sends one.
     #[test]
-    fn credential_less_loopback_appliance_is_admitted_with_or_without_the_marker() {
-        assert!(allowed(false, true, false, true, true));
-        assert!(allowed(false, false, false, true, true));
+    fn credential_less_loopback_appliance_is_admitted() {
+        assert!(allowed(false, true, true));
     }
 
     /// Each fence, failed on its own, refuses — nothing here is advisory.
@@ -16210,35 +16164,23 @@ mod pre_auth_handshake_tests {
         // Presented a credential: must authenticate or fail, never silently
         // degrade to a restricted session (an expired token is not a lock
         // screen).
-        assert!(!allowed(true, true, false, true, true));
+        assert!(!allowed(true, true, true));
         // Not an appliance.
-        assert!(!allowed(false, true, false, false, true));
+        assert!(!allowed(false, false, true));
         // Not sitting at the machine.
-        assert!(!allowed(false, true, false, true, false));
-    }
-
-    /// An Ed25519 client's own `connect` frame is credential-less by design
-    /// (the signature arrives in the NEXT frame), so on an Ed25519-configured
-    /// gateway the pre-auth branch must not swallow it — only an explicit
-    /// `pre_auth: true` opts out of the challenge flow.
-    #[test]
-    fn ed25519_challenge_flow_is_not_hijacked() {
-        assert!(!allowed(false, false, true, true, true));
-        assert!(allowed(false, true, true, true, true));
+        assert!(!allowed(false, true, false));
     }
 
     /// The blanket case worth stating once: off-appliance, NOTHING admits a
-    /// pre-auth session — not the marker, not loopback, not both.
+    /// pre-auth session — not loopback, not a credential-less frame.
     #[test]
     fn off_appliance_nothing_admits_a_pre_auth_session() {
-        for &requested in &[true, false] {
-            for &ed25519 in &[true, false] {
-                for &loopback in &[true, false] {
-                    assert!(
-                        !allowed(false, requested, ed25519, false, loopback),
-                        "requested={requested} ed25519={ed25519} loopback={loopback}"
-                    );
-                }
+        for &credential in &[true, false] {
+            for &loopback in &[true, false] {
+                assert!(
+                    !allowed(credential, false, loopback),
+                    "credential={credential} loopback={loopback}"
+                );
             }
         }
     }

@@ -54,6 +54,16 @@ impl GoalLoopDriver {
         self.store
             .mark_needs_human_with_pause(&task.id, &effective_reason, pause)
             .await?;
+        // A1 ledger: keep the pause class on the latest round row, where it
+        // survives `resolve_needs_human` clearing `tasks.pause_reason`. The
+        // verdict is not touched. Bookkeeping only — failure is logged.
+        if let Err(e) = self
+            .store
+            .stamp_iteration_pause(&task.id, pause.as_str())
+            .await
+        {
+            warn!(task = %task.id, error = %e, "A1 ledger: iteration pause stamp failed (non-fatal)");
+        }
         // WP3 (PORTICO): escalation ends the autonomous phase (iteration cap /
         // oscillation) → revoke the task's grants. Mirrors the DispatchEngine
         // needs_human revocation for the goal-loop-side escalation path.

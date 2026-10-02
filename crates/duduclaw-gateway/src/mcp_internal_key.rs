@@ -240,6 +240,112 @@ pub fn ensure_internal_mcp_key(home_dir: &Path) -> Result<String, String> {
     .map_err(|e| format!("internal MCP key provisioning failed: {e}"))
 }
 
+/// Every currently valid `gateway-internal` key in
+/// `<home>/config.toml [mcp_keys]`.
+///
+/// Mirrors the MCP authenticator's acceptance rules for this one client:
+/// `client_id = "gateway-internal"`, not external, a parseable `created_at`
+/// no older than [`HARD_EXPIRY_DAYS`]. Every other key (an operator's
+/// external client keys included) is left out. Fail closed: an unreadable or
+/// malformed `config.toml` yields none. The caller must never log the
+/// returned values.
+pub fn valid_internal_keys(home_dir: &Path) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(home_dir.join("config.toml")) else {
+        return Vec::new();
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
+        return Vec::new();
+    };
+    let Some(keys) = table.get("mcp_keys").and_then(|v| v.as_table()) else {
+        return Vec::new();
+    };
+    let now = Utc::now();
+    let mut out = Vec::new();
+    for (key, val) in keys {
+        if val.get("client_id").and_then(|v| v.as_str()) != Some(INTERNAL_CLIENT_ID) {
+            continue;
+        }
+        if val.get("is_external").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let created_at = val
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        let Some(created_at) = created_at else {
+            continue;
+        };
+        if age_in_days(created_at, now) <= HARD_EXPIRY_DAYS && !key.is_empty() {
+            out.push(key.clone());
+        }
+    }
+    out
+}
+
+/// Whether `presented` is a currently valid `gateway-internal` key in
+/// `<home>/config.toml [mcp_keys]` (the acceptance rules of
+/// [`valid_internal_keys`]). The comparison runs over every valid entry
+/// without early exit and is constant-time per entry.
+pub fn verify_internal_key(home_dir: &Path, presented: &str) -> bool {
+    if presented.is_empty() {
+        return false;
+    }
+    valid_internal_keys(home_dir)
+        .iter()
+        .fold(false, |matched, key| matched | constant_time_eq(key.as_bytes(), presented.as_bytes()))
+}
+
+/// Length-checked, data-independent byte comparison.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+
+    fn write(dir: &Path, body: &str) {
+        std::fs::write(dir.join("config.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn only_a_fresh_gateway_internal_key_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let internal = "ddc_prod_0123456789abcdef0123456789abcdef";
+        let external = "ddc_prod_fedcba9876543210fedcba9876543210";
+        let old = "ddc_prod_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let now = Utc::now();
+        let stale = now - chrono::Duration::days(HARD_EXPIRY_DAYS + 2);
+        write(
+            tmp.path(),
+            &format!(
+                "[mcp_keys.\"{internal}\"]\nclient_id = \"{INTERNAL_CLIENT_ID}\"\nis_external = false\n\
+                 created_at = \"{}\"\nscopes = [\"admin\"]\n\n\
+                 [mcp_keys.\"{external}\"]\nclient_id = \"claude-desktop\"\nis_external = true\n\
+                 created_at = \"{}\"\nscopes = [\"admin\"]\n\n\
+                 [mcp_keys.\"{old}\"]\nclient_id = \"{INTERNAL_CLIENT_ID}\"\nis_external = false\n\
+                 created_at = \"{}\"\nscopes = [\"admin\"]\n",
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+                stale.to_rfc3339(),
+            ),
+        );
+        assert!(verify_internal_key(tmp.path(), internal));
+        assert!(!verify_internal_key(tmp.path(), external), "another client's key");
+        assert!(!verify_internal_key(tmp.path(), old), "expired internal key");
+        assert!(!verify_internal_key(tmp.path(), ""));
+        assert!(!verify_internal_key(tmp.path(), &internal[..internal.len() - 1]));
+        write(tmp.path(), "[mcp_keys\n");
+        assert!(!verify_internal_key(tmp.path(), internal), "malformed config accepts nothing");
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!verify_internal_key(empty.path(), internal), "missing config accepts nothing");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

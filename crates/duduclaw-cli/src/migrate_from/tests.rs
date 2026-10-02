@@ -261,6 +261,13 @@ async fn end_to_end_openclaw_apply_writes_real_artifacts() {
         "# Mem\n- fact one\n- fact two\n",
     )
     .unwrap();
+    // Inject the user home explicitly so this test never scans the machine's
+    // ~/.agents/skills or changes HOME for concurrent tests.
+    let user_home = tmp.path().join("user-home");
+    let skill = user_home.join(".agents/skills/fixture-skill");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "# Fixture skill\nSummarize local notes.\n")
+        .unwrap();
 
     let ctx = Ctx {
         home: home.clone(),
@@ -270,7 +277,9 @@ async fn end_to_end_openclaw_apply_writes_real_artifacts() {
         agent: None,
         redact: true,
     };
-    let report = super::openclaw::migrate(&ctx, Some(src)).await.unwrap();
+    let report = super::openclaw::migrate_with_home(&ctx, Some(src), &user_home)
+        .await
+        .unwrap();
 
     // Agent scaffolded with imported soul + stripped model.
     let agent_toml = std::fs::read_to_string(home.join("agents/main/agent.toml")).unwrap();
@@ -293,6 +302,7 @@ async fn end_to_end_openclaw_apply_writes_real_artifacts() {
 
     // Memory store materialised.
     assert!(home.join("memory.db").exists());
+    assert!(home.join("agents/main/SKILLS/fixture-skill/SKILL.md").exists());
 
     // Everything imported cleanly.
     assert_eq!(report.overall(), "COMPLETE");
@@ -332,7 +342,13 @@ async fn json_output_matches_locked_contract() {
         agent: None,
         redact: true,
     };
-    let report = super::openclaw::migrate(&ctx, Some(src)).await.unwrap();
+    let report = super::openclaw::migrate_with_home(
+        &ctx,
+        Some(src),
+        &tmp.path().join("user-home"),
+    )
+    .await
+    .unwrap();
 
     // Serialize exactly as `--json` does, then re-parse to prove it is valid.
     let value = report.to_json(None);

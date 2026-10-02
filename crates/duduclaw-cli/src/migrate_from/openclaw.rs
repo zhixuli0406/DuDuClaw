@@ -119,8 +119,7 @@ pub(super) fn parse_openclaw(src: &str) -> std::result::Result<OpenClawConfig, S
     })
 }
 
-fn default_source() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
+fn default_source(home: &Path) -> PathBuf {
     for name in [".openclaw", ".moltbot", ".clawdbot"] {
         let p = home.join(name);
         if p.exists() {
@@ -154,8 +153,7 @@ fn workspace_dir(src: &Path, spec: &AgentSpec, single: bool) -> PathBuf {
 }
 
 /// Collect skill directories following the OpenClaw priority order.
-fn skill_dirs(src: &Path, workspace: &Path) -> Vec<PathBuf> {
-    let home = dirs::home_dir().unwrap_or_default();
+fn skill_dirs(src: &Path, workspace: &Path, home: &Path) -> Vec<PathBuf> {
     let roots = [
         workspace.join("skills"),
         workspace.join(".agents").join("skills"),
@@ -177,7 +175,18 @@ fn skill_dirs(src: &Path, workspace: &Path) -> Vec<PathBuf> {
 }
 
 pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report> {
-    let src = source.unwrap_or_else(default_source);
+    let home = dirs::home_dir().unwrap_or_default();
+    migrate_with_home(ctx, source, &home).await
+}
+
+/// Keep the source user home separate from DuDuClaw's destination home and
+/// injectable, so migration tests need no process-wide HOME mutation.
+pub(super) async fn migrate_with_home(
+    ctx: &Ctx,
+    source: Option<PathBuf>,
+    home: &Path,
+) -> Result<Report> {
+    let src = source.unwrap_or_else(|| default_source(home));
     let mut report = Report::new("openclaw", &src.display().to_string(), ctx.apply);
 
     let Some(cfg_path) = find_config(&src) else {
@@ -342,7 +351,7 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
         }
 
         // Skills (scanned + installed).
-        let skills = skill_dirs(&src, &ws);
+        let skills = skill_dirs(&src, &ws, home);
         if !skills.is_empty() {
             install_skills(ctx, &mut report, &agent_id, &skills);
         }
@@ -372,7 +381,7 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
         );
     }
 
-    if !skill_dirs(&src, &src.join("workspace")).is_empty() || cfg.agents.iter().any(|_| true) {
+    if !skill_dirs(&src, &src.join("workspace"), home).is_empty() || cfg.agents.iter().any(|_| true) {
         report.note("已安裝的 skills 皆通過 duduclaw-security 注入掃描 (input_guard, 6 規則)。");
     }
 

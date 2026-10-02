@@ -21,7 +21,7 @@ const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_t
      goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
      source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json, \
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
-     pause_reason, plan_pending, archived, pinned, team_spec_json";
+     pause_reason, plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -40,6 +40,8 @@ pub(crate) const CONTINUE_MESSAGE_PREFIX: &str = "\u{0}duduclaw:continue\u{0}";
 
 mod activity;
 mod claim;
+mod discovery;
+pub(crate) use discovery::DiscoveryDecisionReceipt;
 mod goals;
 mod iterations;
 mod plans;
@@ -50,6 +52,8 @@ mod tasks;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_survival_evidence;
 
 pub use plans::plan_order_for_insert;
 pub use pure::{
@@ -58,8 +62,26 @@ pub use pure::{
 };
 
 use goals::depends_edges_conn;
-use iterations::{iter_submit_conn, iter_verdict_conn, list_iterations_conn};
+pub use iterations::IterationDispatchLedger;
+use iterations::{
+    iter_escalate_seal_conn, iter_submit_conn, iter_verdict_conn, list_iterations_conn,
+};
 use tasks::row_to_task;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    #[default]
+    Task,
+    Goal,
+    Discovery,
+}
+impl TaskKind {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Task => "task", Self::Goal => "goal", Self::Discovery => "discovery" }
+    }
+    pub fn ordinary_worker(self) -> bool { matches!(self, Self::Task | Self::Goal) }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRow {
@@ -286,6 +308,15 @@ pub struct TaskRow {
     /// parse (`FrozenTeamSpec::parse`): there is no "partial team".
     #[serde(default)]
     pub team_spec_json: Option<String>,
+    #[serde(default)]
+    pub kind: TaskKind,
+    /// Immutable public discovery specification; authority is not request data.
+    #[serde(default, skip_serializing)]
+    pub discovery_spec_json: Option<String>,
+    #[serde(default)]
+    pub discovery_run_id: Option<String>,
+    #[serde(default)]
+    pub discovery_approval_id: Option<String>,
 }
 
 fn empty_deps() -> String {
@@ -348,6 +379,10 @@ impl TaskRow {
             archived: false,
             pinned: false,
             team_spec_json: None,
+            kind: TaskKind::Task,
+            discovery_spec_json: None,
+            discovery_run_id: None,
+            discovery_approval_id: None,
         }
     }
 }
@@ -387,10 +422,35 @@ pub struct TaskIterationRow {
     pub repeat_streak: Option<i64>,
     /// WP-4F: a bounded, CJK-safe-truncated snapshot of this round's own
     /// worker output, taken at verdict time (before `result_summary` is
-    /// wiped on rejection). `None` for accepted rounds (never needed — an
-    /// accepted task never re-enters `needs_human`) and for rows sealed
-    /// before this column existed.
+    /// wiped on rejection). Written on every sealed round since the
+    /// 2026-09-30 A1 ledger change (accepted and escalated rounds included);
+    /// `None` for rows sealed before that on the accept path, rows sealed
+    /// before this column existed, and rounds with no result text.
     pub worker_excerpt: Option<String>,
+    // ── 2026-09-30 A1 ledger completeness — see `schema.rs`. All optional
+    // and `serde(default)` so older serialized rows still deserialize. ──
+    /// Two-stage pre-evaluator verdict (`continue` / `candidate_complete` /
+    /// `blocked`); `None` when it did not run or degraded.
+    #[serde(default)]
+    pub evaluator_verdict: Option<String>,
+    /// The driver's dispatch ordinal compared against the iteration cap.
+    #[serde(default)]
+    pub iter_seq: Option<i64>,
+    /// `solo` | `team` for this round's dispatch.
+    #[serde(default)]
+    pub team_mode: Option<String>,
+    /// Team gate inputs + decision JSON, when the gate was evaluated.
+    #[serde(default)]
+    pub gate_inputs_json: Option<String>,
+    /// The `<state>` block inputs injected for this round (size-capped JSON).
+    #[serde(default)]
+    pub state_block_json: Option<String>,
+    /// Harness knob snapshot JSON captured when the verdict was sealed.
+    #[serde(default)]
+    pub knobs_json: Option<String>,
+    /// Pause class at the moment this round escalated to needs_human.
+    #[serde(default)]
+    pub pause_reason: Option<String>,
 }
 
 /// Per-agent slice of [`FlowMetrics`] (Iterative Kanban analytics, P2).

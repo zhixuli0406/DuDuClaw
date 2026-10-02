@@ -7,6 +7,7 @@ impl AccountRotator {
     pub fn new(strategy: RotationStrategy, cooldown_seconds: u64) -> Self {
         Self {
             accounts: Arc::new(RwLock::new(Vec::new())),
+            inherit_host_credentials: AtomicBool::new(true),
             strategy,
             round_robin_index: Arc::new(RwLock::new(0)),
             cooldown_seconds,
@@ -24,13 +25,40 @@ impl AccountRotator {
         self
     }
 
-    /// Load accounts from config.toml + detect OAuth sessions from ~/.claude/
+    /// Load explicit accounts, optionally inheriting host OAuth/environment keys.
     pub async fn load_from_config(&self, home_dir: &Path) -> Result<usize, String> {
+        self.load_from_config_using(home_dir, detect_default_oauth_session).await
+    }
+
+    /// Keep host-session detection injectable without mutating process PATH/HOME.
+    pub(super) async fn load_from_config_using(
+        &self,
+        home_dir: &Path,
+        detector: impl FnOnce() -> Option<Account> + Send + 'static,
+    ) -> Result<usize, String> {
         let config_path = home_dir.join("config.toml");
-        let content = tokio::fs::read_to_string(&config_path)
-            .await
-            .unwrap_or_default();
-        let table: toml::Table = content.parse().unwrap_or_default();
+        let config = async {
+            let content = match tokio::fs::read_to_string(&config_path).await {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(format!("Failed to read account config.toml ({:?})", error.kind())),
+            };
+            // TOML errors can quote source lines containing credentials. Keep
+            // the diagnostic actionable without returning the source text.
+            let table: toml::Table = content.parse()
+                .map_err(|_| "Failed to parse account config.toml".to_string())?;
+            let inherit = host_credentials_policy(&table)?;
+            Ok((table, inherit))
+        }.await;
+        let (table, inherit_host_credentials) = match config {
+            Ok(config) => config,
+            Err(error) => {
+                let mut accounts = self.accounts.write().await;
+                accounts.clear();
+                self.inherit_host_credentials.store(false, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
 
         let mut loaded = Vec::new();
 
@@ -181,10 +209,10 @@ impl AccountRotator {
         // OAuth seat (copilot / qwen / codex added via `duduclaw auth device`)
         // must NOT suppress the Anthropic host-login auto-detect, or the
         // anthropic pool ends up empty and every channel reply fails NoAccounts.
-        if should_autodetect_anthropic_oauth(&loaded) {
+        if inherit_host_credentials && should_autodetect_anthropic_oauth(&loaded) {
             // Use spawn_blocking to avoid holding a tokio worker thread
             // while waiting for the `claude` CLI subprocess.
-            let detected = tokio::task::spawn_blocking(detect_default_oauth_session)
+            let detected = tokio::task::spawn_blocking(detector)
                 .await
                 .ok()
                 .flatten();
@@ -227,7 +255,7 @@ impl AccountRotator {
                 }
             }
 
-        if loaded.is_empty()
+        if inherit_host_credentials && loaded.is_empty()
             && let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
                 && !key.is_empty() {
                     loaded.push(Account {
@@ -290,7 +318,9 @@ impl AccountRotator {
         }
 
         info!(total = count, oauth = oauth_count, api_key = apikey_count, strategy = ?self.strategy, "Accounts loaded");
-        *self.accounts.write().await = loaded;
+        let mut accounts = self.accounts.write().await;
+        *accounts = loaded;
+        self.inherit_host_credentials.store(inherit_host_credentials, Ordering::Relaxed);
         Ok(count)
     }
 }

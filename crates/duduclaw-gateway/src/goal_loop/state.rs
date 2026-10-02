@@ -227,6 +227,51 @@ pub fn state_hash(state: &StateBlock) -> String {
     short_hash(&state.hash_input())
 }
 
+/// Byte cap for `task_iterations.state_block_json` (A1 ledger).
+pub const STATE_BLOCK_LEDGER_MAX_BYTES: usize = 16 * 1024;
+
+/// A1 ledger: the `<state>` block as dispatched, serialized so `state_hash`
+/// can be recomputed offline (the hash inputs are `goal`,
+/// `confirmed_facts`, `pending_hypotheses` and the last
+/// `excluded_approaches` entry; the advisory fields are kept for context).
+///
+/// Bounded to [`STATE_BLOCK_LEDGER_MAX_BYTES`]. An oversize block is stored
+/// as `{"v":1,"truncated":true,"original_bytes":N,"state_hash":..,
+/// "state_prefix":"<char-boundary-truncated JSON text>"}` so the row stays
+/// valid JSON and the truncation is explicit. Read-only: never feeds back
+/// into dispatch.
+pub fn state_block_ledger_json(state: &StateBlock, hash: &str) -> String {
+    let full = serde_json::json!({
+        "v": 1,
+        "truncated": false,
+        "state_hash": hash,
+        "state": {
+            "goal": state.goal,
+            "confirmed_facts": state.confirmed_facts,
+            "pending_hypotheses": state.pending_hypotheses,
+            "excluded_approaches": state.excluded_approaches,
+            "loop_warning": state.loop_warning,
+            "bail_hint": state.bail_hint,
+            "tool_streak_hint": state.tool_streak_hint,
+        },
+    })
+    .to_string();
+    if full.len() <= STATE_BLOCK_LEDGER_MAX_BYTES {
+        return full;
+    }
+    // Leave headroom for the wrapper and for JSON string escaping of the
+    // prefix (every `"` in the embedded JSON text doubles when re-escaped).
+    let prefix = duduclaw_core::truncate_bytes(&full, STATE_BLOCK_LEDGER_MAX_BYTES / 3);
+    serde_json::json!({
+        "v": 1,
+        "truncated": true,
+        "original_bytes": full.len(),
+        "state_hash": hash,
+        "state_prefix": prefix,
+    })
+    .to_string()
+}
+
 /// Shared hashing primitive: NFKC-normalize (fullwidth/compat forms fold to
 /// their canonical form so an agent's fullwidth punctuation doesn't produce
 /// a spurious distinct hash), collapse whitespace runs, SHA-256, first 16
@@ -575,6 +620,17 @@ impl PauseReason {
 /// a raw byte slice.
 pub const WORKER_EXCERPT_MAX_BYTES: usize = 500;
 
+/// The one excerpt rule for `task_iterations.worker_excerpt`: trimmed,
+/// `None` when empty, bounded to [`WORKER_EXCERPT_MAX_BYTES`] on a char
+/// boundary. Shared by every sealing path (reject, accept, escalate) so the
+/// stored excerpts are comparable across verdicts.
+pub fn worker_excerpt(result_summary: Option<&str>) -> Option<String> {
+    result_summary
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| duduclaw_core::truncate_bytes(s, WORKER_EXCERPT_MAX_BYTES).to_string())
+}
+
 /// How many gap tokens are actually listed in [`compose_escalation_note`]
 /// (a display budget; the underlying extraction can return up to
 /// `goal_gap_fingerprint`'s own `MAX_FINGERPRINT_TOKENS`).
@@ -611,6 +667,14 @@ pub fn pick_best_round(iterations: &[TaskIterationRow]) -> Option<BestRoundPick>
     let candidates: Vec<&TaskIterationRow> = iterations
         .iter()
         .filter(|it| matches!(it.verdict.as_deref(), Some("rejected") | Some("escalated")))
+        // A1-2 (2026-09-30): rounds parked by the settle path without a
+        // judge ruling are now sealed `escalated` with NULL `judge_feedback`
+        // (`task_store::iterations::iter_escalate_seal_conn`). Before that
+        // they stayed `verdict = NULL` and were never candidates here; they
+        // are skipped so the pick — and the escalation note built from it —
+        // is exactly what it was. Every judge-ruled `escalated` row carries
+        // non-NULL feedback, so this excludes only the new shape.
+        .filter(|it| !(it.verdict.as_deref() == Some("escalated") && it.judge_feedback.is_none()))
         .collect();
     if candidates.is_empty() {
         return None;

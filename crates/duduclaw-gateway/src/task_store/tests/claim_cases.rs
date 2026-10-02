@@ -2,6 +2,56 @@
 
 use super::*;
 
+fn discovery_fixture(id: &str) -> TaskRow {
+    let mut value = serde_json::to_value(pending_task(id)).unwrap();
+    value["kind"] = serde_json::json!("discovery");
+    value["discovery_run_id"] = serde_json::json!(format!("discovery-run-{id}"));
+    value["discovery_spec_json"] = serde_json::json!("{\"approved_root_id\":\"root-fixture\",\"evaluator\":\"score-fixture\"}");
+    serde_json::from_value(value).unwrap()
+}
+
+#[tokio::test]
+async fn discovery_task_kind_and_frozen_spec_survive_real_store_roundtrip() {
+    let (store, _directory) = temp_store();
+    store.insert_task(&discovery_fixture("discovery-roundtrip")).await.unwrap();
+    let row=store.get_task("discovery-roundtrip").await.unwrap().unwrap();
+    assert_eq!(row.discovery_spec_json.as_deref(),Some("{\"approved_root_id\":\"root-fixture\",\"evaluator\":\"score-fixture\"}"));
+    let value = serde_json::to_value(row).unwrap();
+    assert_eq!(value["kind"], "discovery");
+    assert_eq!(value["discovery_run_id"], "discovery-run-discovery-roundtrip");
+    assert!(value.get("discovery_spec_json").is_none());
+}
+
+#[tokio::test]
+async fn discovery_task_cannot_enter_any_normal_worker_claim_or_zombie_path() {
+    let (store, _directory) = temp_store();
+    store.insert_task(&discovery_fixture("discovery-pending")).await.unwrap();
+    assert!(store.claimable_tasks().await.unwrap().iter().all(|row| row.id != "discovery-pending"));
+    assert_eq!(store.atomic_claim("discovery-pending", "ordinary-worker",
+        "2026-09-30T10:00:00Z", "2026-09-30T10:05:00Z").await.unwrap(), ClaimOutcome::NotClaimable);
+    let mut running = discovery_fixture("discovery-running");
+    running.status = "in_progress".into();
+    running.claimed_by = Some("discovery-runner".into());
+    running.claimed_at = Some("2026-09-30T09:00:00Z".into());
+    running.lease_renewed_at = running.claimed_at.clone();
+    running.lease_expires_at = Some("2026-09-30T09:05:00Z".into());
+    store.insert_task(&running).await.unwrap();
+    assert!(store.reclaim_zombies("2026-09-30T10:00:00Z").await.unwrap().iter()
+        .all(|outcome| outcome.task_id != "discovery-running"));
+    assert_eq!(store.get_task("discovery-running").await.unwrap().unwrap().status, "in_progress");
+}
+
+#[tokio::test]
+async fn legacy_goal_rows_receive_goal_kind_without_changing_their_worker_contract() {
+    let (store, _directory) = temp_store();
+    let mut goal = pending_task("legacy-kind-goal");
+    goal.goal_mode = true;
+    store.insert_task(&goal).await.unwrap();
+    assert_eq!(serde_json::to_value(store.get_task("legacy-kind-goal").await.unwrap().unwrap()).unwrap()["kind"], "goal");
+    assert_eq!(store.atomic_claim("legacy-kind-goal", "ordinary-worker",
+        "2026-09-30T10:00:00Z", "2026-09-30T10:05:00Z").await.unwrap(), ClaimOutcome::Claimed);
+}
+
 #[test]
 fn deep_back_edge_is_cycle() {
     // a -> b -> c. Setting c's parent = a closes a 3-cycle.

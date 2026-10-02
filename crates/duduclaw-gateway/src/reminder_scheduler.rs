@@ -778,6 +778,17 @@ async fn deliver_reminder(
             // only: any resolution failure yields `None` and the CLI call
             // proceeds unaffected.
             let typing_guard = build_reminder_typing_guard(home_dir, http, reminder).await;
+            // Reminders need the platform tools, so they stay on the host —
+            // but never silently for a sandbox-enabled employee.
+            let sandboxed =
+                crate::task_sandbox::sandbox_enabled_in_registry(registry, &reminder.agent_id).await;
+            crate::task_sandbox::note_not_applied(
+                home_dir,
+                &reminder.agent_id,
+                sandboxed,
+                crate::task_sandbox::HostPath::Reminder,
+                crate::task_sandbox::HostAction::RanOnHost,
+            );
             let result = call_claude_for_agent_with_type(
                 home_dir,
                 registry,

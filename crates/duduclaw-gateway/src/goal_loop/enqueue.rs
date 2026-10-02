@@ -102,21 +102,28 @@ impl GoalLoopDriver {
         }
     }
 
+    /// Returns the team dispatch (tracking id, confirmed-team flag) when the
+    /// round runs as a team, plus — for the A1 round ledger — the team gate's
+    /// inputs/decision JSON whenever the gate was evaluated (`None` when no
+    /// frozen spec exists, so the gate was never consulted). The ledger half
+    /// is observation only; the dispatch decision is unchanged.
     pub(super) async fn try_team_dispatch(
         &self,
         task: &TaskRow,
         iter: u32,
         state_text: &str,
-    ) -> Option<(String, bool)> {
+    ) -> (Option<(String, bool)>, Option<String>) {
         let mut task = task.clone();
         self.ensure_frozen_team_spec(&mut task).await;
-        let spec = crate::team_composer::frozen_spec(&task)?;
+        let Some(spec) = crate::team_composer::frozen_spec(&task) else {
+            return (None, None);
+        };
         // Said once per process, the first time a team is actually considered
         // (design §3.8 fix ③): whether `[dispatch] ephemeral_max_active` can
         // hold the concurrent role members this configuration can need.
         crate::team_composer::warn_role_team_capacity_once(&self.home_dir);
 
-        let decision = crate::team_composer::decide_gate(
+        let (decision, mut gate_record) = crate::team_composer::decide_gate_recorded(
             &self.home_dir,
             &task,
             &spec,
@@ -130,7 +137,7 @@ impl GoalLoopDriver {
             // The Solo branch is not "do nothing": the gate's effort
             // suggestion and the signal vector are already audited by
             // `decide_gate`. The round itself is unchanged.
-            return None;
+            return (None, Some(gate_record.to_string()));
         }
 
         let home_dir = self.home_dir.clone();
@@ -157,19 +164,31 @@ impl GoalLoopDriver {
                 max_spawns_per_task = budget.max_spawns_per_task,
                 "team spawn budget cannot pay for a minimal round — this task runs Solo"
             );
-            return None;
+            // A1 ledger: the gate said Team/grey band but the budget forced
+            // Solo — record that override next to the gate's own verdict.
+            gate_record["budget_forces_solo"] = serde_json::Value::Bool(true);
+            return (None, Some(gate_record.to_string()));
         }
+        // A1-3 ledger: the team round's token usage carries the task id and
+        // its `task_iterations.round` (same value the tick records).
+        let goal_attr = crate::runtime::GoalRoundAttribution {
+            episode_id: task.id.clone(),
+            round: Some(task.revision_round + 1),
+        };
         tokio::spawn(async move {
-            let outcome =
-                crate::team_composer::run_team_round(crate::team_composer::TeamRoundContext {
-                    home_dir: &home_dir,
-                    task: &task,
-                    round: iter,
-                    spec: &spec,
-                    state_text: &state_text,
-                    spawns_used,
-                    grey_band,
-                })
+            let outcome = crate::runtime::GOAL_ROUND_ATTRIBUTION
+                .scope(
+                    goal_attr,
+                    crate::team_composer::run_team_round(crate::team_composer::TeamRoundContext {
+                        home_dir: &home_dir,
+                        task: &task,
+                        round: iter,
+                        spec: &spec,
+                        state_text: &state_text,
+                        spawns_used,
+                        grey_band,
+                    }),
+                )
                 .await;
             match outcome {
                 crate::team_composer::TeamRoundOutcome::Submitted { summary, .. } => {
@@ -191,6 +210,10 @@ impl GoalLoopDriver {
                         .await
                     {
                         warn!(task = %task.id, "team round needs_human write failed: {e}");
+                    } else if let Err(e) = store.stamp_iteration_pause(&task.id, pause.as_str()).await
+                    {
+                        // A1 ledger: bookkeeping only — never affects the park.
+                        warn!(task = %task.id, "A1 ledger: iteration pause stamp failed (non-fatal): {e}");
                     }
                 }
                 crate::team_composer::TeamRoundOutcome::SoloFallback { reason } => {
@@ -216,7 +239,7 @@ impl GoalLoopDriver {
         });
         // The grey band can still resolve Solo after the planner runs. Until
         // then, do not tell the user the task has definitively formed a team.
-        Some((tracking_id, !grey_band))
+        (Some((tracking_id, !grey_band)), Some(gate_record.to_string()))
     }
 }
 

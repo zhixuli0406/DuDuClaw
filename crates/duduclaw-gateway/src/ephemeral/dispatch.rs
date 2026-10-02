@@ -143,6 +143,17 @@ pub async fn dispatch_with(
     );
     loaded.config.model.preferred = model;
 
+    // The scaffold copied the parent's `[container]` verbatim, so this is the
+    // parent employee's sandbox flag. An ephemeral run is not sandboxed; say
+    // so (once per parent per process) instead of running silently.
+    crate::task_sandbox::note_not_applied(
+        home_dir,
+        &meta.parent,
+        loaded.config.container.sandbox_enabled,
+        crate::task_sandbox::HostPath::Ephemeral,
+        crate::task_sandbox::HostAction::RanOnHost,
+    );
+
     let result = crate::claude_runner::call_claude_for_agent_preloaded_with(
         home_dir,
         registry,

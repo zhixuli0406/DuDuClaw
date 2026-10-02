@@ -780,14 +780,33 @@ impl GoalLoopDriver {
             // instead of one wake-up message. `None` — no spec, gate says
             // Solo, or `[team]` absent entirely (the default) — falls through
             // to the unchanged single-agent dispatch below.
-            let (dispatched_message_id, team_dispatched) =
-                match self.try_team_dispatch(task, next_iter, &state_text).await {
-                    Some((tracking_id, confirmed_team)) => (tracking_id, confirmed_team),
-                    None => (
-                        self.enqueue_work(task, next_iter, &state_text).await?,
-                        false,
-                    ),
-                };
+            // A1 ledger: the `<state>` block exactly as dispatched (loop
+            // warning included), serialized before the dispatch consumes it.
+            let state_block_json = goal_state::state_block_ledger_json(&state_block, &state_hash);
+            let (team_dispatch, gate_inputs_json) =
+                self.try_team_dispatch(task, next_iter, &state_text).await;
+            // Freeze the same title/description/criteria classifier the
+            // difficulty-scaled guard used for this actual dispatch.
+            let difficulty_text = format!("{}\n{}\n{}", task.title, task.description,
+                task.acceptance_criteria.as_deref().unwrap_or(""));
+            let difficulty = match crate::dispatch_engine::classify_goal_difficulty(&difficulty_text) {
+                crate::dispatch_engine::Difficulty::Simple => "simple",
+                crate::dispatch_engine::Difficulty::Complex => "complex",
+            };
+            let mut gate_inputs = gate_inputs_json.as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            gate_inputs["goal_difficulty"] = serde_json::Value::String(difficulty.to_string());
+            let gate_inputs_json = Some(gate_inputs.to_string());
+            let ran_as_team = team_dispatch.is_some();
+            let (dispatched_message_id, team_dispatched) = match team_dispatch {
+                Some((tracking_id, confirmed_team)) => (tracking_id, confirmed_team),
+                None => (
+                    self.enqueue_work(task, next_iter, &state_text).await?,
+                    false,
+                ),
+            };
             // A2: commit this round's state as the latest dispatched state
             // for the unchanged-streak comparison the NEXT rejection
             // re-dispatch will make (see the peek/commit split in the guard
@@ -807,14 +826,28 @@ impl GoalLoopDriver {
             // timeline can show "why no progress" after the fact —
             // previously that signal was memory-only and vanished on
             // restart.
+            //
+            // A1 ledger (2026-09-30): also persists the dispatch ordinal the
+            // iteration guard compares against the cap (`next_iter`, stored
+            // as `InFlight.iter` below — the guard itself is unchanged),
+            // Solo/Team (a grey-band round that later resolves Solo inside the
+            // composer is recorded `team` with gate decision `grey_band`),
+            // the gate record and the `<state>` block.
+            let ledger = crate::task_store::IterationDispatchLedger {
+                iter_seq: Some(i64::from(next_iter)),
+                team_mode: Some(if ran_as_team { "team" } else { "solo" }.to_string()),
+                gate_inputs_json,
+                state_block_json: Some(state_block_json),
+            };
             if let Err(e) = self
                 .store
-                .record_iteration_dispatch_with_state(
+                .record_iteration_dispatch_with_ledger(
                     &task.id,
                     task.revision_round + 1,
                     &now.to_rfc3339(),
                     Some(&state_hash),
                     Some(committed_streak as i64),
+                    &ledger,
                 )
                 .await
             {

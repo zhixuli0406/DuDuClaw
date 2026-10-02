@@ -8,6 +8,19 @@
 use super::super::{ParamDef, ToolDef};
 
 pub(super) const TOOLS: &[ToolDef] = &[
+    ToolDef {name:"discovery_catalog",description:"List approved discovery root IDs, evaluators and supported runtimes; host paths and policy source remain private.",
+        params:&[ParamDef {name:"agent_id",description:"Assigned agent; defaults to caller. Delegation authorization is checked.",required:false}]},
+    ToolDef {name:"discovery_list",description:"List discovery runs visible to the verified creator or authorized manager.",
+        params:&[ParamDef {name:"agent_id",description:"Optional assigned-agent filter; caller ACL still applies.",required:false},
+            ParamDef {name:"limit",description:"Maximum results, from 1 to 100; default 20.",required:false}]},
+    ToolDef {name:"discovery_tree",description:"Read an authorized discovery run, node tree, round grids and durable shared-budget accounting.",
+        params:&[ParamDef {name:"run_id",description:"Opaque run ID returned by tasks_create or discovery_list.",required:true}]},
+    ToolDef {name:"discovery_artifact",description:"Read a verified artifact manifest, or download one file as base64 (maximum 16 MiB). Uses opaque IDs; never host paths.",
+        params:&[ParamDef {name:"run_id",description:"Opaque authorized run ID.",required:true},
+            ParamDef {name:"file_id",description:"Optional opaque file ID from the verified manifest; omit for metadata.",required:false}]},
+    ToolDef {name:"discovery_cancel",description:"Durably cancel an authorized discovery run. Cancellation survives restarts and stops the shared runner budget.",
+        params:&[ParamDef {name:"run_id",description:"Opaque authorized run ID.",required:true}]},
+
     ToolDef {
         name: "tasks_list",
         description: "List tasks from the shared Kanban board. Defaults to tasks assigned to the calling agent. Pass assigned_to='*' for all agents. Use this to see your task queue.",
@@ -36,7 +49,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "tasks_create",
-        description: "Create work — one entry point for tasks, autonomous goals and scheduled work. Default: a Kanban task. kind='goal': an AI judge panel decides done. schedule=<cron|RFC3339>: recurring or one-shot.",
+        description: "Create a task, goal or discovery run. Discovery uses approved catalog IDs and awaits manager approval. Ordinary work may use schedule=<cron|RFC3339>.",
         params: &[
             ParamDef {
                 name: "title",
@@ -45,7 +58,12 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "kind",
-                description: "What to create: 'task' (Kanban board task, default) or 'goal' (autonomous goal — judge acceptance, frozen contract, optional plan_first)",
+                description: "task (default), goal (judge acceptance), or discovery (isolated tree search, manager approval)",
+                required: false,
+            },
+            ParamDef {
+                name: "discovery",
+                description: "With kind='discovery': approved root/evaluator/runtime IDs, model, grid limits and shared budget. Obtain IDs from discovery_catalog.",
                 required: false,
             },
             ParamDef {

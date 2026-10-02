@@ -29,7 +29,8 @@ pub struct ScriptResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
-    /// Number of MCP tool calls made via RPC during execution.
+    /// MCP tool calls made by the script. Always 0: scripts cannot call
+    /// tools (no RPC bridge is served).
     pub tool_calls_count: u64,
     /// Wall-clock execution time in milliseconds.
     pub execution_ms: u64,

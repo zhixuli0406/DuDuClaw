@@ -97,6 +97,7 @@ pub enum TaskKind {
     /// driven to completion by the goal loop. Same path as the dashboard
     /// `tasks.goal_create` RPC and the chat `/goal` command.
     Goal,
+    Discovery,
 }
 
 impl TaskKind {
@@ -105,6 +106,7 @@ impl TaskKind {
         match self {
             TaskKind::Task => "task",
             TaskKind::Goal => "goal",
+            TaskKind::Discovery => "discovery",
         }
     }
 }
@@ -119,6 +121,7 @@ pub fn resolve_task_kind(args: &Value) -> Result<TaskKind, String> {
         Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
             "" | "task" => Ok(TaskKind::Task),
             "goal" => Ok(TaskKind::Goal),
+            "discovery" => Ok(TaskKind::Discovery),
             other => Err(format!(
                 "unknown kind '{other}' — use \"task\" (Kanban board task, default) or \"goal\" (autonomous goal with judge acceptance)"
             )),

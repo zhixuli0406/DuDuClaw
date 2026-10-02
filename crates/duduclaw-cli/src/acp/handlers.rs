@@ -143,6 +143,18 @@ pub async fn handle_prompt_with_agent(
         }
     };
 
+    // This path calls the agent directly, not through the task sandbox: say
+    // so (once per agent per process) for a sandbox-enabled employee.
+    let sandboxed =
+        duduclaw_gateway::task_sandbox::sandbox_enabled_in_registry(&registry, &target_agent).await;
+    duduclaw_gateway::task_sandbox::note_not_applied(
+        home_dir,
+        &target_agent,
+        sandboxed,
+        duduclaw_gateway::task_sandbox::HostPath::Acp,
+        duduclaw_gateway::task_sandbox::HostAction::RanOnHost,
+    );
+
     // Execute through the gateway delegation path. The target agent's runtime
     // provider is honoured inside call_claude_for_agent_with_type.
     match duduclaw_gateway::claude_runner::call_claude_for_agent_with_type(

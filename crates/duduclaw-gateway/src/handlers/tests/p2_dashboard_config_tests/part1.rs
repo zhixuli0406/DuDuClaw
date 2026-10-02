@@ -667,3 +667,54 @@ pub(super) fn os_watch_apply_writes_footprint_flag() {
             .expect("apply");
     assert!(changes3.is_empty());
 }
+
+// ── computer-use navigation allowlist ────────────────────────────────────
+
+#[test]
+pub(super) fn cap_computer_use_allowed_domains_normalized_and_kept_by_unrelated_saves() {
+    let mut table = toml::Table::new();
+    let changes = apply_capabilities_to_table(
+        &mut table,
+        &json!({ "capabilities": { "computer_use_config": {
+            "allowed_domains": ["Example.com", "example.com", "docs.example.com"]
+        } } }),
+    )
+    .expect("apply");
+    assert!(changes.iter().any(|c| c.contains("allowed_domains = [2 entries]")));
+    // An unrelated save to the same sub-table keeps the list.
+    apply_capabilities_to_table(
+        &mut table,
+        &json!({ "capabilities": { "computer_use_config": { "max_actions": 30 } } }),
+    )
+    .expect("apply");
+    let cap = table.get("capabilities").unwrap().as_table().unwrap();
+    let cfg: duduclaw_core::types::CapabilitiesConfig =
+        cap.clone().try_into().expect("deserializes into CapabilitiesConfig");
+    assert_eq!(
+        cfg.computer_use_config.allowed_domains,
+        vec!["example.com".to_string(), "docs.example.com".to_string()]
+    );
+    assert_eq!(cfg.computer_use_config.max_actions, 30);
+}
+
+#[test]
+pub(super) fn cap_computer_use_allowed_domains_refuses_invalid_and_oversize() {
+    for bad in ["*.example.com", "93.184.216.34", "example.com:443", "example.com/x", ""] {
+        let mut t = toml::Table::new();
+        assert!(
+            apply_capabilities_to_table(
+                &mut t,
+                &json!({ "capabilities": { "computer_use_config": { "allowed_domains": [bad] } } }),
+            )
+            .is_err(),
+            "{bad} must be refused"
+        );
+    }
+    let many: Vec<String> = (0..21).map(|i| format!("h{i}.example.com")).collect();
+    let mut t = toml::Table::new();
+    assert!(apply_capabilities_to_table(
+        &mut t,
+        &json!({ "capabilities": { "computer_use_config": { "allowed_domains": many } } }),
+    )
+    .is_err());
+}

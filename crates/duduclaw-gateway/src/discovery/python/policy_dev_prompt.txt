@@ -1,0 +1,275 @@
+You are improving one **prefix-only exploration policy**. Edit only
+`$method_file` and implement `OptimalPolicy.solve(self, question)`.
+Do not solve the scientific task and do not edit any other program.
+
+## Objective: quality, work, and parallelism
+
+The environment is a frozen, irregular branch x attempt grid. A policy opens a root
+or refines the next cell of an already-open branch. Each revealed cell costs one
+probe. The policy sees only the cells it has revealed so far; unrevealed scores are
+unknown.
+
+The evaluator sweeps your single `beta` knob over [0.0, 0.25, 0.5, 0.75, 1.0] and ranks the resulting curve by:
+
+    pareto.reward = pareto.auc - lambda * parallel_penalty      (lambda = 0.1)
+
+`pareto.auc` rewards reaching high per-trace attainment with few **total probes**:
+attainment = (best revealed - baseline) / (best in the trace - baseline), clamped to [0,1];
+work = probes / cells in the trace; auc = integral over work in [0,1] of the best attainment
+reached at or below that work. Revealing every cell therefore earns no area at all.
+`parallel_penalty` is the mean of
+`effective_sequential_rounds / total_probes` over the sweep. For a batch of size
+`k` with `W = question.max_parallelism` workers, it costs one decision round and
+`ceil(k / W)` effective sequential rounds. A serial policy has penalty near 1;
+useful full batches approach `1/W`. Therefore choose only promising probes, but
+batch independent promising probes whenever possible.
+
+A local implementation failure does not by itself prove that its parent direction
+is poor. Weigh recovery value against new roots and ordinary refinements while
+keeping batches parallel.
+
+## API
+
+    question.reset()                                  # no-op, kept for compatibility
+    question.observed() -> dict[str, Observation]    # revealed prefix only
+    question.legal_actions() -> list[str]            # roots + opened-branch frontiers
+    question.legal_roots() -> list[str]              # unopened roots only
+    question.opened_branches() -> list[int]
+    question.meta(cell_id) -> CellMeta               # .branch .attempt .parent_id .seq .tags (legal or revealed cells only)
+    question.probe_batch(cells, on_reveal=None) -> list[Observation]
+    question.baseline_score
+    question.max_parallelism
+
+`Observation` (a dict that also allows attribute access) supplies `cell_id`, `branch`, `attempt`, `score`,
+`evaluated`, `valid`, `fail_class`, `error`, `delta_vs_baseline`, `delta_vs_parent`, `n_valid`, and
+`n_total` (`n_valid`/`n_total` are always None for this task). `fail_class` is one of
+`ok`, `invalid_solution`, `runtime_error`, `timeout`, `no_output`, `tamper`.
+An illegal batch raises an exception and leaves the state unchanged; two consecutive illegal
+batches disqualify the policy. When the episode is over, `probe_batch` ends `solve` for you.
+There is no helper library: write the signal helpers you need (e.g. branch_promising,
+branch_failed_hard, probe_improved_vs_parent, probe_improved_vs_baseline) in the file.
+
+**Success semantics:** an evaluated observation with `error is None` and
+`fail_class == "ok"` is a successful evaluation. A *successful anchor* below means the best
+historical score from such a successful evaluation. Score direction: higher is better.
+
+Derive every decision statistic from `question.observed()`.
+
+## Required branch trajectory and failure interpretation
+
+For each opened branch, reconstruct its ordered prefix trajectory, not only its
+latest observation or best score: successful anchor, score trend, regressions,
+failure/repair sequence, and explored versus remaining depth.
+
+Before closing or deprioritizing a failed frontier, classify it as
+hard-unrecoverable, repairable implementation failure, weak-but-underexplored, or
+repeatedly unpromising after sufficient valid evidence. Invalid solutions (overlap or
+boundary violations), crashes and missing output are normally repairable. Do not infer
+algorithmic failure from one such error. Classify the current failure episode: a later
+successful result reopens the branch and cancels closure based only on an earlier failure.
+
+## Required batch decision loop
+
+At each decision round:
+
+1. Read the prefix, reconstruct trajectories, and close only branches with
+   cumulative evidence of being hard-unrecoverable or repeatedly unpromising.
+2. Rank legal roots and legal branch frontiers using only prefix-derived signals:
+   successful anchor, parent->child gain, complete branch trajectory, actual success
+   versus failure evidence, failure recoverability, prior repair outcomes, remaining
+   depth, and cross-branch comparison.
+3. Rank actual repairable failures and underexplored frontiers in deterministic
+   queues using trajectory, recoverability, remaining depth, repeated failures, and
+   beta. A repairable failure retains eligibility unless cumulative evidence lowers
+   its relative priority.
+4. Build one **dynamic portfolio** batch of independent candidates, up to
+   `question.max_parallelism`: exploitation (strong normal refinements),
+   exploration (new roots or underexplored branches), and at most one recovery
+   (an actual repairable failure). When multiple roles are eligible, give
+   exploration and justified recovery representation before filling remaining slots
+   by priority; adapt this to prefix evidence rather than fixed quotas. Recovery
+   must not displace normal successful refinements or leave workers idle. Never
+   sample randomly, and do not default to a singleton merely because its top
+   candidate is clear.
+5. Stop only after considering the whole revealed portfolio: active, underexplored,
+   recoverable, unopened, and remaining legal candidates. Do not stop while an
+   eligible high-priority recovery or underexplored candidate remains; every
+   remaining action needs an evidence-based decision to continue, reserve, or close.
+
+A batch must contain distinct cells that are all legal *before* the call. It may
+contain several roots and/or one frontier from each opened branch. It must never
+contain a parent and its child together. Do not use a fixed widen-all / deepen-all
+wave schedule: adapt batch composition after every revealed prefix.
+
+Minimal structure:
+
+    class OptimalPolicy:
+        NAME = "OptimalPolicy"
+
+        def __init__(self, config):
+            self.beta = float(config.get("beta", 0.6))
+
+        def solve(self, question):
+            closed = set()
+            while True:
+                prefix = question.observed()
+                update_closed(closed, prefix, question)
+                batch = select_batch(prefix, question, closed)
+                if not batch:
+                    break
+                question.probe_batch(batch)
+
+## Hard constraints
+
+- Keep `NAME = "OptimalPolicy"` and implement `class OptimalPolicy` in `$method_file` only.
+- **Sandbox:** the file runs in an isolated process. Imports are limited to math, statistics,
+  itertools, functools, collections, dataclasses, typing, heapq, bisect. `open`, `eval`, `exec`,
+  `compile`, `__import__`, `getattr`/`setattr`, `globals`/`locals`/`vars`, and any dunder
+  attribute other than `__init__` are rejected before the policy runs. No randomness, no clock:
+  Private attribute access and private imported exports are also rejected;
+  use public instance fields and methods, or module helper functions such as `_schedule`.
+  two replays of the same (trace, beta) must produce identical probe sequences (do not iterate
+  over a set of strings to make a decision; sort first).
+- **Prefix-only:** decisions may use revealed observations, `baseline_score`, legal
+  sets, structural `meta`, and your helper signals. Never use unrevealed scores, a true
+  optimum, hardcoded winning cell ids, absolute score targets, or internal trace data.
+  `meta()` on a cell that is neither legal nor revealed disqualifies the policy.
+- Every prune, widen, deepen, batch, and stop decision must be explainable from the
+  current prefix. Shallow weak scores are not enough to discard a branch: deeper
+  attempts can recover. A repairable latest failure must not erase its historical
+  successful anchor or by itself cause permanent starvation.
+- Always terminate when no batch is selected; do not assume a budget cap exists.
+- A selected batch must be legal, have no duplicate ids, and contain at most
+  `question.max_parallelism` cells.
+- Each replay episode has a 10-second wall-clock limit.
+
+## Beta: fixed per run, adaptive across cycles
+
+Read exactly one scalar in `__init__` and keep it as `self.beta`:
+
+    self.beta = float(config.get("beta", <sensible_default>))
+
+The operator supplies the first live episode's beta. After a policy version is
+selected, the host queries its scalar default with an empty config and freezes
+that default for the next live episode. Offline replay supplies each sweep beta
+explicitly. The host records the actual deployed beta in every live manifest.
+
+Beta has three distinct roles. Do not conflate them:
+
+1. **Within one replay or live episode:** beta is fixed. Route every behavioral
+   threshold through one `_schedule(beta) -> dict`. High beta means more width,
+   deeper patience, and weaker pruning. Low beta means fewer probes, earlier
+   stagnation stops, and stronger pruning. Never change beta from observations inside
+   `solve()`. Route recovery eligibility, reserve threshold, and waiting through
+   the same schedule: high beta is more patient; low beta remains selective without
+   treating one repairable failure as automatic closure.
+2. **During offline evaluation:** eval sweeps a fixed beta grid. This measures whether
+   the policy exposes a real attainment/work/parallelism trade-off; it is not online
+   beta adaptation.
+3. **When proposing the next policy version:** choose the baked-in default beta once,
+   using evidence from earlier *live* cycles and their beta sweeps. That default will
+   remain fixed throughout the next live exploration episode.
+
+Keep all thresholds relative to the prefix; never use absolute score cutoffs.
+
+Use the following cross-cycle default-beta rule. Read the most recent 2-3
+**live** `$trace_pool/iter*/live_cycle_manifest.json` sidecars for each iteration's
+final best score and actual baked-in beta. Read the matching archived `beta_sweep.json`
+values (`pareto.reward`, AUC, parallel penalty, and the per-beta frontier). Scores alone
+do not establish that beta caused a change, so always use both sources:
+
+- live best is still improving: keep the prior default beta unless its sweep clearly
+  shows a better nearby beta;
+- live best has plateaued, and higher beta reaches higher attainment for a reasonable
+  work/parallelism cost in the sweep: raise the default by a small step (about
+  0.1-0.2, clamped to [0, 1]);
+- a high default beta has already been tried through a plateau, and high-beta sweep
+  points add work without higher attainment: lower it by a small step;
+- history is insufficient or evidence conflicts: use a moderately exploratory default
+  (about 0.6), rather than pretending the replay ceiling is a live stopping signal.
+
+The beta sweep is non-degenerate only if beta changes the attainment/work trade-off.
+It also reveals whether the policy batches. Do not select the default simply as the
+smallest beta that reaches a frozen trace's known ceiling.
+
+## Required next-cycle grid planning
+
+Every proposed policy **must** implement this deterministic method:
+
+    def plan_grid(self, context):
+        ...
+        return {"branch_count": W, "refine_count": R, "reason": "..."}
+
+This method runs **before** a new live grid is created. It does not make a
+within-episode decision and must never inspect a current episode's outcomes.
+It must always return that dict. When history is empty or insufficient, still
+return an explicit conservative bootstrap plan derived from the context's hard-cap
+fields, with a factual reason.
+
+The plan creates branches `0..W-1` and attempts `0..R`; `R` is the number of
+refinements allowed after each root. The runner validates
+`1 <= W <= context["hard_max_branch_count"]` and
+`0 <= R <= context["hard_max_refine_count"]`; an invalid plan disqualifies the policy.
+In replay, a requested plan beyond the frozen trace's `context["trace_branch_count"]`
+or `context["trace_refine_count"]` is out of support and earns zero replay reward.
+A live round is additionally capped at $round_probe_cap probes.
+
+Use only the prefix-safe facts in `context`:
+
+- `history`: completed earlier live rounds (list of dicts: round, planned_branch_count,
+  planned_refine_count, opened_branch_count, max_attempt_reached, probes,
+  decision_rounds, best_score, beta, policy_id);
+- `hard_max_branch_count`, `hard_max_refine_count`, `worker_cap`;
+- replay structural support fields `trace_branch_count` / `trace_refine_count`
+  (present only in replay). Do not read raw trace outcomes inside `plan_grid`.
+
+Choose width versus depth from evidence, not a default preference:
+
+- many semantically distinct roots improve early while deeper refinements stall:
+  increase width and reduce/hold depth;
+- high gains arrive late on a small, repeatable set of directions: reduce/hold width
+  and increase depth;
+- all explored directions plateau after sufficient depth while meaningful direction
+  classes remain uncovered: increase width;
+- repeated hard, unrecoverable failures or strongly redundant directions: reduce
+  width and depth conservatively;
+- conflicting or insufficient history: return an explicit conservative bootstrap
+  plan derived from the context, and state that evidence is insufficient.
+
+Include a short, factual `reason` in every plan. `plan_grid` answers how many
+directions to make available; `solve` still decides which legal roots/frontiers to
+open, refine, prune, or stop. Do not choose roots merely because their branch id is
+small. The runtime grid is the hard bound. Before finishing, verify that the edited
+file contains a `plan_grid` that returns the dict on every path.
+
+## Learn from history without leaking outcomes
+
+Earlier policy versions are in `$history_dir/r####_*/`. Read their `method.py` and
+`proposal_results/beta_sweep.json`. Start from a strong recent policy, retain
+mechanisms that raised `pareto.reward`, and make a concrete change when progress
+stalls. The baseline under `$history_dir/baseline/` is a parallel-refine floor to beat.
+
+Each version also archives `proposal_results/policy_execution_traces.jsonl`: one replay
+episode per `(frozen trace, beta)`. Use it to diagnose general behavior -- serial batches,
+premature stops, over-pruning, or wasted probes -- from the prefix state, selected
+batch, and revealed outcomes at each decision round. It is **between-round feedback
+only**: never read it inside `solve()`, and never copy a trace-specific branch,
+cell id, score, or target into policy logic.
+
+`$trace_pool` may be read only outside `solve()`. Prefer the
+`live_cycle_manifest.json` sidecars over raw replay outcomes for the per-iteration
+live trend. Never copy trace scores, targets, or cell ids into policy logic.
+
+Optional self-check (costs no agent calls; runs the same sandboxed replay the evaluator uses):
+
+    $check_cmd
+
+## Deliverable
+
+Write a complete adaptive policy in `$method_file`. Include a short module
+docstring describing its prefix signals, batch rule, beta schedule, default-beta
+rationale, grid-planning rule, and safeguards against over-pruning, over-stopping,
+permanent starvation after repairable failures, and serial probes. Before finishing,
+verify trajectory-based ranking, the stated success semantics, non-automatic
+zero-valid closure, deterministic recovery competition, and portfolio-level stop.
+Write only `$method_file`; everything else in this directory is read-only.

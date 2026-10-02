@@ -19,10 +19,13 @@
 
 pub mod branch;
 pub mod budget;
+pub mod copy_policy;
 pub mod error;
 pub mod judge;
 pub mod merge;
 pub mod overlay;
+pub mod publication;
+pub mod retention;
 pub mod store;
 pub mod test_runner;
 
@@ -36,7 +39,9 @@ pub use budget::{Charge, LiveAggregate, Pool, Preempt};
 pub use error::{ForkError, Result};
 pub use judge::{JudgeAgent, JudgeScores, JudgeVerdict};
 pub use merge::{MergeDecision, DEFAULT_CONFIDENCE_THRESHOLD};
-pub use overlay::{detect_backend, BranchOverlay, OverlayBackend};
+pub use copy_policy::{CopyPolicy, CopyReport};
+pub use overlay::{detect_backend, promote_workspace, BranchOverlay, OverlayBackend};
+pub use publication::{with_parent_publication, ParentPublication};
 pub use store::{BranchRow, ForkRow, ForkStore, ForkStoreMetrics};
 pub use test_runner::TestOutcome;
 
@@ -183,6 +188,8 @@ impl<E: BranchExecutor + 'static> ForkController<E> {
         if branches.is_empty() {
             return Err(ForkError::Config("a fork needs at least one branch".into()));
         }
+        let parent_workspace = parent_workspace.canonicalize()
+            .map_err(|error| ForkError::Overlay(format!("canonicalize fork parent: {error}")))?;
         let pool = Arc::new(Pool::new(self.config.aggregate_budget_usd));
         let mut handles = Vec::with_capacity(branches.len());
         let mut overlays: HashMap<BranchId, BranchOverlay> = HashMap::with_capacity(branches.len());
@@ -190,7 +197,7 @@ impl<E: BranchExecutor + 'static> ForkController<E> {
         for branch in branches {
             pool.register(branch.id.clone(), branch.spec.budget_usd);
 
-            let overlay = BranchOverlay::create(parent_workspace)?;
+            let overlay = BranchOverlay::create(&parent_workspace)?;
             let inv = BranchInvocation {
                 branch_id: branch.id.clone(),
                 prompt: prompt.to_string(),
@@ -244,6 +251,37 @@ impl<E: BranchExecutor + 'static> ForkController<E> {
         parent_workspace: &std::path::Path,
         judge: &J,
     ) -> Result<ForkResolution> {
+        self.run_and_resolve_branches_retaining(prompt, branches, parent_workspace, judge, None)
+            .await
+    }
+
+    /// Like [`Self::run_and_resolve_branches`], but when the fork ends without
+    /// promoting a winner (confirmation pending, `Manual` mode) and `retain_dir`
+    /// is given, every `Finished` branch workspace is persisted to
+    /// `<retain_dir>/<branch_id>/` (owner-only permissions) so a later manual
+    /// selection can still promote real files. Listed in
+    /// [`ForkResolution::retained`]. A fork resolved finally retains nothing.
+    ///
+    /// Retention failure aborts publication so an external recovery owner can
+    /// retain its archived source instead of committing an unavailable branch.
+    pub async fn run_and_resolve_branches_retaining<J: JudgeAgent>(
+        &self,
+        prompt: &str,
+        branches: Vec<Branch>,
+        parent_workspace: &std::path::Path,
+        judge: &J,
+        retain_dir: Option<&std::path::Path>,
+    ) -> Result<ForkResolution> {
+        self.prepare_branches(prompt, branches, parent_workspace, judge).await?
+            .publish(retain_dir, &[], Ok)
+    }
+
+    /// Run and judge without changing the parent or exposing retained paths.
+    /// The caller publishes only after checking current state under its store lock.
+    pub async fn prepare_branches<J: JudgeAgent>(
+        &self, prompt: &str, branches: Vec<Branch>,
+        parent_workspace: &std::path::Path, judge: &J,
+    ) -> Result<PreparedFork> {
         let (mut results, overlays, pool) =
             self.spawn_all(prompt, branches, parent_workspace).await?;
 
@@ -286,29 +324,120 @@ impl<E: BranchExecutor + 'static> ForkController<E> {
             }
         };
 
-        // Promote the winner only when the decision is final.
-        let mut promoted = false;
-        let winner_overlay = decision
-            .winner
-            .as_ref()
-            .filter(|_| !decision.needs_confirmation)
-            .and_then(|w| overlays.get(w));
-        if let Some(overlay) = winner_overlay {
-            overlay.promote()?;
-            promoted = true;
-        }
-
         // Aggregate spend is summed from the branch results (each executor charges
         // its own budget pool live; see RotatingBranchExecutor in the cli crate).
         let aggregate_spent_usd: f64 = results.iter().map(|r| r.spent_usd).sum();
         let _ = &pool; // pool reserved for executor-side per-branch enforcement (P4)
 
-        Ok(ForkResolution {
-            results,
-            verdict,
-            decision,
-            promoted,
-            aggregate_spent_usd,
+        Ok(PreparedFork {
+            parent: overlays.values().next().expect("nonempty fork overlays").parent().to_path_buf(), overlays,
+            promote_policy: CopyPolicy::promote_default(),
+            resolution: ForkResolution { results, verdict, decision, promoted: false,
+                aggregate_spent_usd, retained: Vec::new() },
+        })
+    }
+}
+
+/// Owns private temporary overlays until publication; TTL GC cannot observe them.
+pub struct PreparedFork {
+    parent: std::path::PathBuf,
+    overlays: HashMap<BranchId, BranchOverlay>,
+    resolution: ForkResolution,
+    /// Policy the winner is promoted under. Defaults to the fail-closed
+    /// [`CopyPolicy::promote_default`]; a caller that knows the DuDuClaw home
+    /// narrows it with [`CopyPolicy::promote_for_parent`].
+    promote_policy: CopyPolicy,
+}
+
+impl PreparedFork {
+    pub fn resolution(&self) -> &ForkResolution { &self.resolution }
+
+    /// The parent workspace a winner would be promoted into.
+    pub fn parent(&self) -> &std::path::Path { &self.parent }
+
+    /// Replace the promotion policy (see [`CopyPolicy::promote_for_parent`]).
+    pub fn with_promote_policy(mut self, policy: CopyPolicy) -> Self {
+        self.promote_policy = policy;
+        self
+    }
+
+    /// Preserve independent private copies before entering publication, so an
+    /// IO/DB fault cannot drop the only source with the prepared TempDirs.
+    pub fn archive_sources(&self, destination: &std::path::Path) -> Result<Vec<RetainedBranch>> {
+        retention::ensure_private_dir(destination)?;
+        let mut sources = Vec::new();
+        for (id, overlay) in &self.overlays {
+            retention::validate_id(&id.0)?;
+            let workspace = destination.join(&id.0);
+            retention::ensure_private_dir(&workspace)?;
+            CopyPolicy::fork_default().copy_tree(overlay.workspace(), &workspace)?;
+            sources.push(RetainedBranch { branch_id: id.clone(), workspace });
+        }
+        Ok(sources)
+    }
+
+    pub fn keep_sources(self) -> Vec<RetainedBranch> {
+        self.overlays.into_iter().map(|(branch_id, overlay)| RetainedBranch {
+            branch_id, workspace: overlay.keep_source(),
+        }).collect()
+    }
+
+    /// Apply/retain and publish under one parent lock. Caller-owned store locks
+    /// must already be held. Cancelled branches can neither win nor be retained.
+    pub fn publish<T>(
+        self, retain_dir: Option<&std::path::Path>, cancelled: &[BranchId],
+        publish: impl FnOnce(ForkResolution) -> Result<T>,
+    ) -> Result<T> {
+        self.publish_with_observer(retain_dir, cancelled, || Ok(()), publish)
+    }
+
+    /// Persist a truthful uncertainty marker before the first parent write.
+    pub fn publish_with_observer<T>(
+        mut self, retain_dir: Option<&std::path::Path>, cancelled: &[BranchId],
+        before_parent_write: impl FnOnce() -> Result<()>,
+        publish: impl FnOnce(ForkResolution) -> Result<T>,
+    ) -> Result<T> {
+        let parent = self.parent.clone();
+        with_parent_publication(&parent, |publication| {
+            let eligible = |id: &BranchId| !cancelled.contains(id) && self.resolution.results.iter()
+                .any(|result| &result.id == id && result.state == BranchState::Finished);
+            if self.resolution.decision.winner.as_ref().is_some_and(|id| !eligible(id)) {
+                self.resolution.decision.winner = None;
+                self.resolution.decision.needs_confirmation = true;
+                self.resolution.decision.reason = "selected branch no longer eligible for publication".into();
+            }
+            let winner_overlay = self.resolution.decision.winner.as_ref()
+                .filter(|_| !self.resolution.decision.needs_confirmation)
+                .and_then(|winner| self.overlays.get(winner));
+            if let Some(overlay) = winner_overlay {
+                before_parent_write()?;
+                publication.promote(overlay.workspace(), &self.promote_policy)?;
+                self.resolution.promoted = true;
+            }
+            if let (false, Some(dir)) = (self.resolution.promoted, retain_dir) {
+                let survivors: Vec<BranchId> = self.resolution.results
+                    .iter()
+                    .filter(|r| r.state == BranchState::Finished && !cancelled.contains(&r.id))
+                    .map(|r| r.id.clone())
+                    .collect();
+                if !survivors.is_empty() {
+                    retention::ensure_private_dir(dir)?;
+                    for id in survivors {
+                        let Some(overlay) = self.overlays.remove(&id) else { continue };
+                        retention::validate_id(&id.0)?;
+                        let dest = dir.join(&id.0);
+                        match overlay.persist_to(&dest) {
+                            Ok(path) => {
+                                retention::set_private(&path)?;
+                                self.resolution.retained.push(RetainedBranch { branch_id: id, workspace: path });
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            }
+
+            publish(self.resolution)
         })
     }
 }
@@ -322,6 +451,17 @@ pub struct ForkResolution {
     /// Whether the winner's overlay was merged into the parent workspace.
     pub promoted: bool,
     pub aggregate_spent_usd: f64,
+    /// Branch workspaces kept on disk for a later manual selection (empty when
+    /// the fork resolved finally or retention was not requested).
+    pub retained: Vec<RetainedBranch>,
+}
+
+/// A branch workspace persisted by
+/// [`ForkController::run_and_resolve_branches_retaining`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedBranch {
+    pub branch_id: BranchId,
+    pub workspace: std::path::PathBuf,
 }
 
 #[cfg(test)]
@@ -475,6 +615,63 @@ mod tests {
         assert!(res.decision.winner.is_some());
         // Parent untouched until confirmation.
         assert!(!parent.path().join("result.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn unresolved_fork_retains_workspaces_for_manual_selection() {
+        let parent = tempfile::tempdir().unwrap();
+        let keep = tempfile::tempdir().unwrap();
+        let retain = keep.path().join("fork-x");
+        let c = ctrl_with(MergeMode::Manual);
+        let specs = vec![
+            BranchSpec { steering: Some("alpha".into()), budget_usd: 0.5 },
+            BranchSpec { steering: Some("beta".into()), budget_usd: 0.5 },
+        ];
+        let res = c
+            .run_and_resolve_branches_retaining(
+                "solve",
+                specs.into_iter().map(Branch::new).collect(),
+                parent.path(),
+                &judge::HeuristicJudge,
+                Some(&retain),
+            )
+            .await
+            .unwrap();
+        assert!(!res.promoted);
+        assert_eq!(res.retained.len(), 2);
+        for r in &res.retained {
+            assert!(r.workspace.starts_with(&retain));
+            assert!(r.workspace.join("result.txt").is_file());
+        }
+        // A later selection promotes the retained files into the parent.
+        promote_workspace(&res.retained[0].workspace, parent.path(), &CopyPolicy::fork_default())
+            .unwrap();
+        assert!(parent.path().join("result.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn final_resolution_retains_nothing() {
+        let parent = tempfile::tempdir().unwrap();
+        let keep = tempfile::tempdir().unwrap();
+        let retain = keep.path().join("fork-y");
+        let c = ctrl_with(MergeMode::Auto);
+        let specs = vec![
+            BranchSpec { steering: Some("a".into()), budget_usd: 0.5 },
+            BranchSpec { steering: Some("b".into()), budget_usd: 0.5 },
+        ];
+        let res = c
+            .run_and_resolve_branches_retaining(
+                "solve",
+                specs.into_iter().map(Branch::new).collect(),
+                parent.path(),
+                &judge::HeuristicJudge,
+                Some(&retain),
+            )
+            .await
+            .unwrap();
+        assert!(res.promoted);
+        assert!(res.retained.is_empty());
+        assert!(!retain.exists());
     }
 
     #[tokio::test]

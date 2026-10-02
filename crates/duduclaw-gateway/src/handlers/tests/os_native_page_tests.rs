@@ -409,7 +409,7 @@ async fn os_settings_update_remaps_and_writes_footprint() {
             "footprint": true,
             "frontmost_poll_secs": 45,
             "proactive": { "enabled": true, "base_threshold": 4 },
-        }))
+        }), None)
         .await;
     assert!(
         frame_ok(&frame),

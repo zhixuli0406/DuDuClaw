@@ -163,6 +163,38 @@ async fn resume_on_restart_pause_is_idempotent_across_two_boots() {
     );
 }
 
+/// FX5: the boot-time pause records `restart` on the interrupted round's
+/// ledger row (via `escalate` → `stamp_iteration_pause`) without inventing a
+/// verdict — the round was dispatched and never judged.
+#[tokio::test]
+async fn resume_on_restart_pause_stamps_restart_on_the_open_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, queue) = open_stores(dir.path()).await;
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[goal_loop]\nresume_on_restart = \"pause\"\n",
+    )
+    .unwrap();
+
+    let mut t = goal_task("g1", "alice");
+    t.status = "in_progress".into();
+    store.insert_task(&t).await.unwrap();
+    store
+        .record_iteration_dispatch_with_state("g1", 1, "2026-09-30T00:00:00Z", None, None)
+        .await
+        .unwrap();
+
+    let paused = pause_inflight_on_restart(store.clone(), queue, dir.path()).await;
+    assert_eq!(paused, 1);
+
+    let rows = store.list_iterations("g1").await.unwrap();
+    assert_eq!(rows.len(), 1, "no extra row is created by the pause");
+    assert_eq!(rows[0].round, 1);
+    assert_eq!(rows[0].pause_reason.as_deref(), Some("restart"));
+    assert_eq!(rows[0].verdict, None, "a restart is not a verdict");
+    assert_eq!(rows[0].judged_at, None, "the round stays open for the retry");
+}
+
 // ── H7: continuation feedback is single-instance, not accumulated ──
 
 /// Audit finding (H7): `enqueue_work`'s `<judge_feedback>` block is

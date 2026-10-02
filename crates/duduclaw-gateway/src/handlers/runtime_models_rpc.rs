@@ -37,25 +37,7 @@ impl MethodHandler {
                 .credential_paths
                 .first()
                 .map(|rel| Value::Bool(user_home.join(rel).exists()));
-            rows.push(json!({
-                "id": spec.id,
-                "display_name": spec.display_name,
-                "binary": spec.binary,
-                "installed": found.is_some(),
-                "path": found,
-                "install_channel": spec.install.kind(),
-                "install_command": spec.install.command_display(),
-                "login_method": spec.auth.login.kind(),
-                "login_remote_safe": spec.auth.login.remote_safe(),
-                "api_key_env": spec.auth.api_key_env,
-                "credential_present": cred_present,
-                "mcp": spec.mcp,
-                "headless_verified": spec.verified,
-                "vendor_url": spec.vendor_url,
-                "tos_note": spec.auth.tos_note.map(|t| json!({
-                    "en": t.en, "zh-TW": t.zh_tw, "ja-JP": t.ja_jp,
-                })),
-            }));
+            rows.push(runtime_detect_row(spec, found.as_deref(), cred_present));
         }
         let (claude_oauth, claude_subscription) = detect_claude_oauth(claude_bin.as_deref()).await;
 
@@ -190,4 +172,37 @@ impl MethodHandler {
             }),
         )
     }
+}
+
+/// One `runtime.detect` row. Pure (no probing) so its shape is unit-testable.
+pub(crate) fn runtime_detect_row(
+    spec: &duduclaw_core::runtime_catalog::RuntimeSpec,
+    found: Option<&str>,
+    cred_present: Option<Value>,
+) -> Value {
+    let dep = spec.deprecation;
+    json!({
+        "id": spec.id,
+        "display_name": spec.display_name,
+        "binary": spec.binary,
+        "installed": found.is_some(),
+        "path": found,
+        "install_channel": spec.install.kind(),
+        "install_command": spec.install.command_display(),
+        "login_method": spec.auth.login.kind(),
+        "login_remote_safe": spec.auth.login.remote_safe(),
+        "api_key_env": spec.auth.api_key_env,
+        "credential_present": cred_present,
+        "mcp": spec.mcp,
+        "headless_verified": spec.verified,
+        "vendor_url": spec.vendor_url,
+        "tos_note": spec.auth.tos_note.map(|t| json!({
+            "en": t.en, "zh-TW": t.zh_tw, "ja-JP": t.ja_jp,
+        })),
+        // R1 (2026-10): catalog deprecation window, so the dashboard
+        // can label a saved deprecated runtime instead of offering it.
+        "deprecated": dep.is_some(),
+        "replacement": dep.map(|d| d.replacement),
+        "remove_in": dep.map(|d| d.remove_in),
+    })
 }

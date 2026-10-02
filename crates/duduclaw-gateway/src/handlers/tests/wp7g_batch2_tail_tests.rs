@@ -57,6 +57,27 @@ fn task_row_to_json_surfaces_archived_and_pinned() {
     );
 }
 
+// task_row_to_json must surface the canonical task kind: the dashboard locks
+// discovery rows read-only and keeps them off the goal board from it.
+#[test]
+fn task_row_to_json_surfaces_canonical_kind() {
+    let mut row = TaskRow::new(
+        "t-kind".into(),
+        "title".into(),
+        "desc".into(),
+        "medium".into(),
+        "agent-a".into(),
+        "agent-a".into(),
+    );
+    assert_eq!(task_row_to_json(&row)["kind"], json!("task"));
+    row.kind = crate::task_store::TaskKind::Goal;
+    assert_eq!(task_row_to_json(&row)["kind"], json!("goal"));
+    row.kind = crate::task_store::TaskKind::Discovery;
+    assert_eq!(task_row_to_json(&row)["kind"], json!("discovery"));
+    // Same spelling as the store's own serde form (one mapping, not two).
+    assert_eq!(serde_json::to_value(row.kind).unwrap(), task_row_to_json(&row)["kind"]);
+}
+
 // ── #2: tools.catalog must list search.query (drift guard) ─────────
 #[tokio::test]
 async fn tools_catalog_lists_search_query() {

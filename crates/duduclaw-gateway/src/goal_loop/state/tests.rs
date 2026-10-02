@@ -32,6 +32,13 @@ mod goal_state {
             state_hash: None,
             repeat_streak: None,
             worker_excerpt: None,
+            evaluator_verdict: None,
+            iter_seq: None,
+            team_mode: None,
+            gate_inputs_json: None,
+            state_block_json: None,
+            knobs_json: None,
+            pause_reason: None,
         }
     }
 
@@ -580,6 +587,13 @@ mod goal_budget_best_round {
             state_hash: None,
             repeat_streak: None,
             worker_excerpt: worker_excerpt.map(str::to_string),
+            evaluator_verdict: None,
+            iter_seq: None,
+            team_mode: None,
+            gate_inputs_json: None,
+            state_block_json: None,
+            knobs_json: None,
+            pause_reason: None,
         }
     }
 
@@ -786,5 +800,99 @@ mod goal_budget_best_round {
         // half-eaten one that `truncate_bytes` had to reject entirely).
         assert!(!truncated.is_empty());
         assert!(truncated.chars().all(|c| c == '驗'));
+    }
+}
+
+mod a1_ledger {
+    use super::super::*;
+
+    fn row(round: i64, verdict: &str, feedback: Option<&str>, excerpt: &str) -> TaskIterationRow {
+        TaskIterationRow {
+            id: round,
+            task_id: "g1".to_string(),
+            round,
+            dispatched_at: "2026-09-30T00:00:00Z".to_string(),
+            submitted_at: Some("2026-09-30T00:05:00Z".to_string()),
+            judged_at: Some("2026-09-30T00:06:00Z".to_string()),
+            verdict: Some(verdict.to_string()),
+            judge_feedback: feedback.map(str::to_string),
+            feedback_class: None,
+            verdict_json: None,
+            dispatch_count: 1,
+            state_hash: None,
+            repeat_streak: None,
+            worker_excerpt: Some(excerpt.to_string()),
+            evaluator_verdict: None,
+            iter_seq: None,
+            team_mode: None,
+            gate_inputs_json: None,
+            state_block_json: None,
+            knobs_json: None,
+            pause_reason: Some("infra".to_string()),
+        }
+    }
+
+    /// A settle-path escalation (NULL feedback) sealed after a rejected
+    /// round must not change the WP-4F pick — before A1 that round stayed
+    /// `verdict = NULL` and was never a candidate.
+    #[test]
+    fn pick_best_round_ignores_unjudged_escalated_rounds() {
+        let rejected = row(1, "rejected", Some("missing tests"), "round one");
+        let parked = row(2, "escalated", None, "round two");
+        let before = pick_best_round(std::slice::from_ref(&rejected));
+        let after = pick_best_round(&[rejected, parked]);
+        assert_eq!(before, after);
+        assert_eq!(after.unwrap().round, 1);
+    }
+
+    #[test]
+    fn pick_best_round_with_only_unjudged_escalations_is_none() {
+        assert_eq!(pick_best_round(&[row(1, "escalated", None, "x")]), None);
+    }
+
+    #[test]
+    fn worker_excerpt_helper_trims_and_bounds() {
+        assert_eq!(worker_excerpt(None), None);
+        assert_eq!(worker_excerpt(Some("   ")), None);
+        assert_eq!(worker_excerpt(Some(" ok ")).as_deref(), Some("ok"));
+        let long = "字".repeat(400);
+        let ex = worker_excerpt(Some(&long)).unwrap();
+        assert!(ex.len() <= WORKER_EXCERPT_MAX_BYTES);
+        assert!(ex.chars().all(|c| c == '字'));
+    }
+
+    fn block(goal: &str) -> StateBlock {
+        StateBlock {
+            goal: goal.to_string(),
+            confirmed_facts: vec!["fact".into()],
+            pending_hypotheses: vec![],
+            excluded_approaches: vec!["tried x".into()],
+            loop_warning: None,
+            bail_hint: None,
+            tool_streak_hint: None,
+        }
+    }
+
+    #[test]
+    fn state_block_ledger_json_round_trips_hash_inputs() {
+        let b = block("ship it");
+        let h = state_hash(&b);
+        let v: serde_json::Value = serde_json::from_str(&state_block_ledger_json(&b, &h)).unwrap();
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["state_hash"], h.as_str());
+        assert_eq!(v["state"]["goal"], "ship it");
+        assert_eq!(v["state"]["excluded_approaches"][0], "tried x");
+    }
+
+    #[test]
+    fn state_block_ledger_json_is_capped_and_marks_truncation() {
+        let b = block(&"長".repeat(20_000)); // 60 KB goal
+        let h = state_hash(&b);
+        let out = state_block_ledger_json(&b, &h);
+        assert!(out.len() <= STATE_BLOCK_LEDGER_MAX_BYTES, "len {}", out.len());
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert!(v["original_bytes"].as_u64().unwrap() > STATE_BLOCK_LEDGER_MAX_BYTES as u64);
+        assert_eq!(v["state_hash"], h.as_str());
     }
 }

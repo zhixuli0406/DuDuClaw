@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""duduclaw-navigate: open one https:// URL in the browser page that is
+visible on the computer-use display, via the Chrome DevTools Protocol.
+
+Contract with the Rust side (crates/duduclaw-gateway/src/
+computer_use_orchestrator.rs, `ComputerUseOrchestrator::navigate`, called by
+the tool-driven `navigate` action in computer_use_sessions):
+
+  input     `docker exec -i <container> duduclaw-navigate` -- no arguments;
+            the URL arrives on stdin (one line, at most 2000 bytes plus an
+            optional trailing newline), so it never appears in a process
+            list. Any argument is refused (`usage`, exit 2): the old argv
+            form is not supported. The gateway has already checked that the
+            URL's host is one of the hosts pinned for this session; this
+            helper refuses anything but https again (defence in depth).
+  stdout    exactly one JSON line, nothing else:
+              {"ok": bool, "host": "<final host>" | null,
+               "error": "net::ERR_..." | "<short code>" | null}
+            Never page content: only the final page's host name.
+  exit      0 when the page loaded (load event within 15 s, final URL https);
+            1 when navigation failed; 2 for a bad argument or input.
+
+Short codes: usage, bad_url, cdp_unreachable, no_visible_page,
+several_visible_pages, timeout, not_https, navigation_failed.
+
+Page selection: the page target(s) whose document.visibilityState is
+"visible", read in an isolated world (duduclaw_cdp.evaluate_isolated) so the
+page cannot fake it. With exactly one, that page is navigated. With several
+(the AI opened another tab or window), the first visible tab that fills
+the screen from 0,0 (the kiosk window), else the first visible tab, in the
+DevTools target order is kept and every other tab is closed (Chromium's own
+top-chrome WebUI pages, such as the omnibox popup, are never closed), then the
+kept page is brought to the front and must be the only visible one;
+otherwise `several_visible_pages`. Closing is safe here because the kept
+page is about to be replaced by the requested URL anyway, and it returns the
+session to one page, which screenshot masking needs (it fails closed with
+several). Network: loopback DevTools port only (duduclaw_cdp). Standard
+library only.
+"""
+
+import json
+import os
+import re
+import signal
+import sys
+import time
+from urllib.parse import urlsplit
+
+sys.dont_write_bytecode = True  # read-only root filesystem
+
+from duduclaw_cdp import (  # noqa: E402
+    CdpError, WebSocket, activate_page, close_page, evaluate_isolated, is_browser_ui,
+    list_page_targets,
+)
+
+LOAD_TIMEOUT_SECS = 15.0
+TOTAL_TIMEOUT_SECS = 18
+STEP_TIMEOUT_SECS = 5.0
+MAX_URL_BYTES = 2000
+NET_ERROR_RE = re.compile(r"^net::ERR_[A-Z0-9_]{1,64}$")
+HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62})(\.[a-z0-9]([a-z0-9-]{0,62}))*$")
+
+
+def emit(ok, host=None, error=None, code=None):
+    sys.stdout.write(json.dumps({"ok": ok, "host": host, "error": error}, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    os._exit(0 if ok else (code if code is not None else 1))
+
+
+def on_alarm(_signum, _frame):
+    emit(False, error="timeout")
+
+
+def valid_url(url):
+    if len(url.encode()) > MAX_URL_BYTES or not url.startswith("https://"):
+        return False
+    if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+        return False
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme != "https" or not parts.hostname:
+        return False
+    if parts.username is not None or parts.password is not None:
+        return False
+    return port in (None, 443)
+
+
+def safe_host(host):
+    if isinstance(host, str) and len(host) <= 253 and HOST_RE.match(host):
+        return host
+    return None
+
+
+def read_url():
+    """The URL from stdin: one line, at most MAX_URL_BYTES bytes plus an
+    optional trailing newline, valid UTF-8. None when it is not that."""
+    raw = sys.stdin.buffer.read(MAX_URL_BYTES + 2)
+    if raw.endswith(b"\n"):
+        raw = raw[:-1]
+    if not raw or len(raw) > MAX_URL_BYTES or b"\n" in raw:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def page_state(path):
+    """(visibilityState, protocol, hostname) of one page, read in an
+    isolated world."""
+    ws = WebSocket(path, STEP_TIMEOUT_SECS)
+    try:
+        result = evaluate_isolated(
+            ws,
+            "[document.visibilityState, location.protocol, location.hostname,"
+            " window.screenX, window.screenY,"
+            " window.innerWidth * window.devicePixelRatio,"
+            " window.innerHeight * window.devicePixelRatio]",
+        )
+    finally:
+        ws.close()
+    value = result.get("result", {}).get("value")
+    if not (isinstance(value, list) and len(value) == 7):
+        raise CdpError("unexpected evaluation result shape")
+    return value
+
+
+def screen_size():
+    try:
+        w, h = os.environ.get("DISPLAY_SIZE", "1280x800").lower().split("x", 1)
+        return int(w), int(h)
+    except ValueError:
+        return None
+
+
+def is_kiosk_viewport(state):
+    """The page fills the screen from 0,0 (the kiosk window, not a normal
+    window opened with ctrl+n)."""
+    size = screen_size()
+    if size is None:
+        return False
+    _, _, _, sx, sy, vw, vh = state
+    nums = all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in (sx, sy, vw, vh))
+    return nums and sx == 0 and sy == 0 and abs(vw - size[0]) <= 2 and abs(vh - size[1]) <= 2
+
+
+def visible_pages():
+    """(all (path, url) page targets, visible ones)."""
+    try:
+        pages = list_page_targets(STEP_TIMEOUT_SECS)
+    except (CdpError, OSError, ValueError):
+        emit(False, error="cdp_unreachable")
+    visible = []
+    for path, url in pages:
+        try:
+            state = page_state(path)
+        except (CdpError, OSError, ValueError):
+            continue
+        if state[0] == "visible":
+            visible.append((path, url, is_kiosk_viewport(state)))
+    return pages, visible
+
+
+def visible_page():
+    pages, visible = visible_pages()
+    tabs = [(p, kiosk) for p, u, kiosk in visible if not is_browser_ui(u)]
+    if not tabs:
+        emit(False, error="no_visible_page")
+    if len(visible) == 1:
+        return tabs[0][0]
+    # Prefer a tab in the full-screen kiosk window, so closing the others
+    # leaves the window screenshot masking can map.
+    keep = next((p for p, kiosk in tabs if kiosk), tabs[0][0])
+    try:
+        for path, url in pages:
+            if path != keep and not is_browser_ui(url):
+                close_page(path, STEP_TIMEOUT_SECS)
+        activate_page(keep, STEP_TIMEOUT_SECS)
+    except (CdpError, OSError, ValueError):
+        emit(False, error="several_visible_pages")
+    # Closing is asynchronous; give the browser a moment to settle.
+    for _ in range(20):
+        _, visible = visible_pages()
+        if [p for p, _, _ in visible] == [keep]:
+            return keep
+        time.sleep(0.1)
+    emit(False, error="several_visible_pages")
+
+
+def navigate(path, url):
+    ws = WebSocket(path, STEP_TIMEOUT_SECS)
+    try:
+        ws.call("Page.enable")
+        result = ws.call("Page.navigate", {"url": url})
+        error_text = result.get("errorText")
+        if error_text:
+            token = error_text if NET_ERROR_RE.match(error_text) else "navigation_failed"
+            emit(False, error=token)
+        deadline = time.monotonic() + LOAD_TIMEOUT_SECS
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                emit(False, error="timeout")
+            ws.settimeout(left)
+            try:
+                msg = ws.recv_json()
+            except OSError:
+                emit(False, error="timeout")
+            if msg.get("method") == "Page.loadEventFired":
+                break
+    finally:
+        ws.close()
+
+
+def main():
+    signal.signal(signal.SIGALRM, on_alarm)
+    signal.alarm(TOTAL_TIMEOUT_SECS)
+    if len(sys.argv) != 1:
+        emit(False, error="usage", code=2)
+    url = read_url()
+    if url is None or not valid_url(url):
+        emit(False, error="bad_url", code=2)
+    try:
+        path = visible_page()
+        navigate(path, url)
+        _, protocol, host = page_state(path)[:3]
+    except (CdpError, OSError, ValueError):
+        emit(False, error="navigation_failed")
+    if protocol != "https:":
+        emit(False, error="not_https")
+    emit(True, host=safe_host(host))
+
+
+if __name__ == "__main__":
+    main()

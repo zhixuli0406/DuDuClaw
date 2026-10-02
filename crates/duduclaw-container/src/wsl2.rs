@@ -9,11 +9,16 @@ use tracing::info;
 /// WSL2 Direct runtime for Windows.
 ///
 /// Executes containers through WSL2 without Docker Desktop by
-/// forwarding docker commands via `wsl.exe -d <distro> -- docker ...`.
+/// forwarding docker commands via `wsl.exe -d <distro> --exec docker ...`
+/// ([`distro_exec_args`]): `--exec` runs `docker` directly, so no shell in
+/// the distro interprets a path component containing spaces, `$` or `;`.
 #[allow(dead_code)]
 pub struct Wsl2Runtime {
     distro: String,
     wsl_binary: std::path::PathBuf,
+    /// Image the containers are created from — the same resolver as the
+    /// Docker backend (`crate::docker::default_image`, overridable).
+    image: String,
 }
 
 impl Wsl2Runtime {
@@ -24,7 +29,24 @@ impl Wsl2Runtime {
         Self {
             distro,
             wsl_binary: std::path::PathBuf::from(r"C:\Windows\System32\wsl.exe"),
+            image: crate::docker::default_image(),
         }
+    }
+
+    /// [`Self::new`] running `image` (validated, never pulled by this code —
+    /// `docker create` inside the distro may still pull on its own; see
+    /// [`Self::create`]).
+    pub fn with_image(image: &str) -> Result<Self> {
+        let image = image.trim();
+        if !duduclaw_core::sandbox_image::valid_image(image) {
+            return Err(DuDuClawError::Container(format!(
+                "invalid sandbox image reference {image:?}"
+            )));
+        }
+        Ok(Self {
+            image: image.to_string(),
+            ..Self::new()
+        })
     }
 
     /// Detect the best WSL2 distro available on this machine.
@@ -70,11 +92,29 @@ impl Wsl2Runtime {
         }
     }
 
+    /// Whether the image is present inside the distro (never pulls). A
+    /// failing `docker image inspect` reads as "not present".
+    pub async fn image_present(&self) -> Result<bool> {
+        #[cfg(target_os = "windows")]
+        {
+            Ok(self.wsl_exec(&["docker", "image", "inspect", "--format", "{{.Id}}", &self.image]).await.is_ok())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(false)
+        }
+    }
+
+    /// What the remove-on-drop guard needs to run `docker rm -f` later.
+    pub(crate) fn remover(&self) -> Remover {
+        Remover { wsl_binary: self.wsl_binary.clone(), distro: self.distro.clone() }
+    }
+
     /// Execute a command inside the configured WSL2 distro and return stdout.
     #[cfg(target_os = "windows")]
     async fn wsl_exec(&self, args: &[&str]) -> Result<String> {
         let output = tokio::process::Command::new(&self.wsl_binary)
-            .args(["-d", &self.distro, "--"])
+            .args(distro_exec_args(&self.distro))
             .args(args)
             .output()
             .await
@@ -92,6 +132,30 @@ impl Wsl2Runtime {
     }
 }
 
+/// The `wsl.exe` arguments that run the following argv directly (no shell)
+/// inside `distro`. Every distro command in this file goes through it.
+pub(crate) fn distro_exec_args(distro: &str) -> [&str; 3] {
+    ["-d", distro, "--exec"]
+}
+
+/// Fire-and-forget `docker rm -f` inside the distro (remove-on-drop guard).
+pub(crate) struct Remover {
+    wsl_binary: std::path::PathBuf,
+    distro: String,
+}
+
+impl Remover {
+    pub(crate) fn remove(&self, id: &str) {
+        let _ = std::process::Command::new(&self.wsl_binary)
+            .args(distro_exec_args(&self.distro))
+            .args(["docker", "rm", "-f", id])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 #[async_trait]
 impl ContainerRuntime for Wsl2Runtime {
     async fn create(&self, config: ContainerConfig) -> Result<ContainerId> {
@@ -99,17 +163,46 @@ impl ContainerRuntime for Wsl2Runtime {
         {
             let container_name = format!("duduclaw-{}", uuid::Uuid::new_v4());
 
-            let mut args = vec!["docker", "create", "--name", &container_name];
+            // Same contract as the Docker backend: an explicit command (the
+            // platform image's ENTRYPOINT is the gateway), never root, and no
+            // pull — `--pull never` makes a missing image an error.
+            let Some((program, rest)) = config.cmd.split_first() else {
+                return Err(DuDuClawError::Container(
+                    "script sandbox needs an explicit command (the image's default entrypoint is the gateway)"
+                        .into(),
+                ));
+            };
+            let user = duduclaw_core::sandbox_image::IMAGE_DEFAULT_USER;
 
-            // Add bind mounts, converting Windows paths to WSL paths
-            let mount_strings: Vec<String> = config
-                .additional_mounts
-                .iter()
-                .map(|m| {
-                    let mode = if m.readonly { "ro" } else { "rw" };
-                    format!("{}:{}:{}", m.host, m.container, mode)
-                })
-                .collect();
+            // Same ceilings as the Docker backend (`crate::docker::SCRIPT_*`).
+            let memory = crate::docker::SCRIPT_MEMORY_BYTES.to_string();
+            let pids = crate::docker::SCRIPT_PIDS_LIMIT.to_string();
+            let cpus = format!("{:.3}", crate::docker::SCRIPT_NANO_CPUS as f64 / 1e9);
+            let tmpfs = format!("/tmp:{}", crate::docker::SCRIPT_TMPFS_OPTIONS);
+            let log_size = format!("max-size={}", crate::docker::SCRIPT_LOG_MAX_SIZE);
+            let log_files = format!("max-file={}", crate::docker::SCRIPT_LOG_MAX_FILES);
+            let mut args = vec![
+                "docker", "create", "--name", &container_name, "--pull", "never",
+                "--user", user, "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges",
+                "--memory", &memory, "--memory-swap", &memory, "--pids-limit", &pids, "--cpus", &cpus,
+                "--tmpfs", &tmpfs,
+                "--log-driver", "json-file", "--log-opt", &log_size, "--log-opt", &log_files,
+                "--entrypoint", program.as_str(),
+            ];
+
+            // Bind mounts: the Windows host path is converted to the
+            // distro's `/mnt/<drive>/…` view; anything that cannot be
+            // converted (UNC, relative) refuses the container.
+            let mut mount_strings: Vec<String> = Vec::new();
+            for m in &config.additional_mounts {
+                let mode = if m.readonly { "ro" } else { "rw" };
+                let host = crate::wsl_path::windows_to_wsl_path(&m.host).map_err(DuDuClawError::Container)?;
+                if m.container.contains([':', ',']) || !m.container.starts_with('/') {
+                    return Err(DuDuClawError::Container(format!("invalid container mount path {:?}", m.container)));
+                }
+                mount_strings.push(format!("{host}:{}:{mode}", m.container));
+            }
 
             for mount_str in &mount_strings {
                 args.push("-v");
@@ -125,8 +218,8 @@ impl ContainerRuntime for Wsl2Runtime {
                 args.push("none");
             }
 
-            // HC5: inject env vars (`-e K=V`) so DUDUCLAW_PTC_SOCKET reaches the
-            // in-container script.
+            // HC5: inject the requested env vars (`-e K=V`); the PTC path
+            // passes none (there is no RPC socket).
             let env_strings: Vec<String> = config
                 .env
                 .iter()
@@ -137,15 +230,20 @@ impl ContainerRuntime for Wsl2Runtime {
                 args.push(env_str);
             }
 
-            args.push("duduclaw-agent:latest");
+            args.push(self.image.as_str());
 
-            // HC5: append the user command (after the image name) so the script
-            // actually runs.
-            for part in &config.cmd {
+            // HC5: append the command's arguments (after the image name) so
+            // the script actually runs; the program itself is `--entrypoint`.
+            for part in rest {
                 args.push(part);
             }
 
-            let output = self.wsl_exec(&args).await?;
+            let output = self.wsl_exec(&args).await.map_err(|e| {
+                DuDuClawError::Container(format!(
+                    "{e} (if the sandbox image is missing inside the WSL distro, run `docker pull {}` there; it is never pulled automatically)",
+                    self.image
+                ))
+            })?;
             info!(name = %container_name, "WSL2 container created");
             Ok(ContainerId(output.trim().to_string()))
         }
@@ -211,7 +309,13 @@ impl ContainerRuntime for Wsl2Runtime {
     async fn logs(&self, id: &ContainerId) -> Result<String> {
         #[cfg(target_os = "windows")]
         {
-            self.wsl_exec(&["docker", "logs", &id.0]).await
+            // The log is capped on disk by `--log-opt`; the read is bounded too.
+            let mut output = self.wsl_exec(&["docker", "logs", &id.0]).await?;
+            if output.len() > crate::docker::SCRIPT_LOG_READ_MAX_BYTES {
+                output = duduclaw_core::truncate_bytes(&output, crate::docker::SCRIPT_LOG_READ_MAX_BYTES).to_string();
+                output.push_str("\n...[output truncated]");
+            }
+            Ok(output)
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -268,5 +372,17 @@ impl ContainerRuntime for Wsl2Runtime {
                 uptime_seconds: 0,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every distro command runs its argv directly (`--exec`), never through
+    /// the distro's shell (`--`).
+    #[test]
+    fn distro_commands_bypass_the_shell() {
+        assert_eq!(distro_exec_args("Ubuntu-24.04"), ["-d", "Ubuntu-24.04", "--exec"]);
     }
 }

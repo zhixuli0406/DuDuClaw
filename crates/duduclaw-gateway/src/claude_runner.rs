@@ -3700,6 +3700,9 @@ pub(crate) struct ClaudeCmdGuards {
     prompt: Option<tempfile::TempPath>,
     /// RFC-23 §13.6 `--mcp-config` rewritten config, when redaction is active.
     mcp_proxy: Option<tempfile::TempPath>,
+    /// `(agent, turn) → reply channel` registration for the computer-use
+    /// route's confirmations; lives as long as the spawned CLI.
+    turn: Option<crate::computer_use_sessions::turns::TurnGuard>,
 }
 
 fn prepare_claude_cmd(
@@ -3993,11 +3996,20 @@ fn prepare_claude_cmd(
         cmd.env(duduclaw_core::ENV_TRUST_SESSION_ID, &session_id);
     }
 
+    // The spawned employee is the one whose identity owns this spawn's
+    // config directory (its `.mcp.json` names the same id). Recorded only
+    // while the guards live, i.e. while the CLI runs.
+    let turn = config_dir
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        .and_then(crate::computer_use_sessions::turns::register_current_turn);
+
     (
         cmd,
         ClaudeCmdGuards {
             prompt: prompt_guard,
             mcp_proxy: mcp_proxy_guard,
+            turn,
         },
     )
 }

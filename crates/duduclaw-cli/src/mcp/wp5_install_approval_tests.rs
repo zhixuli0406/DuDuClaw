@@ -150,6 +150,25 @@ async fn dispatch_gate_skips_skill_hub_install() {
 }
 
 #[tokio::test]
+async fn dispatch_gate_skips_the_computer_tools_the_gateway_gates() {
+    // The gateway's computer-use route asks for approval itself; the MCP
+    // dispatcher must not ask a second time. No broker is ever opened.
+    let home = TempHome::new();
+    write_agent_toml(
+        home.path(),
+        "dudu",
+        "[capabilities]\napproval_required_tools = [\"computer_click\"]\n\
+         irreversible_tools = [\"computer_type\"]\nmaybe_irreversible_tools = [\"computer_key\"]\n",
+    );
+    for tool in ["computer_click", "computer_type", "computer_key"] {
+        let out =
+            super::gate_tool_approval_dispatch(home.path(), "dudu", tool, serde_json::json!({})).await;
+        assert!(out.is_ok(), "{tool} is gated in the gateway, not here");
+    }
+    assert!(!home.path().join("approvals.db").exists(), "no broker was opened");
+}
+
+#[tokio::test]
 async fn dispatch_gate_proceeds_for_unlisted_tool() {
     // A tool that is neither install-class nor listed in approval_required_tools
     // proceeds without a gate — the elevation must not accidentally gate every
@@ -239,6 +258,75 @@ async fn approval_denied_blocks() {
     match out {
         InstallApprovalOutcome::Denied(msg) => assert!(msg.contains("拒絕"), "got: {msg}"),
         InstallApprovalOutcome::Proceed => panic!("denied approval must NOT proceed"),
+    }
+}
+
+/// A non-install tool's approval is filed as `mcp_call` and its refusal
+/// names the tool call, not an install.
+#[tokio::test(flavor = "current_thread")]
+async fn tool_call_approval_uses_tool_wording_and_mcp_call_kind() {
+    let broker = in_mem_broker();
+    let b2 = broker.clone();
+    let seen_kind = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = std::sync::Arc::clone(&seen_kind);
+    tokio::spawn(async move {
+        for _ in 0..50 {
+            if let Ok(pending) = b2.list_pending(Some("dudu")).await {
+                if let Some(rec) = pending.first() {
+                    *seen.lock().unwrap() = rec.action_kind.clone();
+                    b2.decide(&rec.id, false, "dashboard:admin").await.unwrap();
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    let out = run_tool_approval(
+        &broker,
+        "dudu",
+        "computer_click",
+        "工具「computer_click」需經管理員核可",
+        serde_json::json!({}),
+        60,
+        Duration::from_millis(10),
+    )
+    .await;
+    assert_eq!(seen_kind.lock().unwrap().as_str(), "mcp_call");
+    match out {
+        InstallApprovalOutcome::Denied(msg) => {
+            assert!(msg.starts_with("工具「computer_click」的呼叫已被管理員拒絕（審核編號 "), "got: {msg}");
+            assert!(!msg.contains("安裝"), "got: {msg}");
+        }
+        InstallApprovalOutcome::Proceed => panic!("denied approval must NOT proceed"),
+    }
+}
+
+#[test]
+fn approval_subject_wording_and_kinds() {
+    let install = ApprovalSubject::for_tool("skill_hub_install");
+    let tool = ApprovalSubject::for_tool("os_open");
+    assert_eq!(install, ApprovalSubject::Install);
+    assert_eq!(install.action_kind(), "mcp_install");
+    assert_eq!(tool.action_kind(), "mcp_call");
+    assert_eq!(install.denied_message("a1"), "安裝要求已被管理員拒絕（審核編號 a1）。");
+    assert_eq!(tool.denied_message("a1"), "工具「os_open」的呼叫已被管理員拒絕（審核編號 a1）。");
+    assert_eq!(tool.expired_message("a1"), "工具「os_open」的呼叫逾時未核可，已自動拒絕（審核編號 a1）。");
+    assert_eq!(
+        install.expired_message("a1"),
+        "安裝要求逾時未核可，已自動拒絕（fail-closed，審核編號 a1）。"
+    );
+    assert_eq!(
+        tool.broker_unavailable_message(),
+        "審批系統暫時無法使用，工具「os_open」的呼叫已拒絕。請稍後再試或由管理員手動處理。"
+    );
+    for text in [
+        tool.denied_message("x"),
+        tool.expired_message("x"),
+        tool.failed_message("審批系統無法建立審核請求"),
+        tool.broker_unavailable_message(),
+    ] {
+        assert!(!text.contains("——"), "{text}");
+        assert!(!(text.contains("不是") && text.contains("而是")), "{text}");
     }
 }
 

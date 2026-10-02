@@ -4,7 +4,20 @@
 use super::*;
 
 impl MethodHandler {
+    /// Test entry point without a caller identity. Production goes through
+    /// [`Self::handle_agents_create_as`] so every audit row names the caller.
+    #[cfg(test)]
     pub(crate) async fn handle_agents_create(&self, params: Value) -> WsFrame {
+        self.handle_agents_create_as(params, None).await
+    }
+
+    /// `agents.create`. `caller` is the authenticated dashboard user; it is
+    /// recorded on the `runtime_provider_deprecated` audit row (R1, 2026-10).
+    pub(crate) async fn handle_agents_create_as(
+        &self,
+        params: Value,
+        caller: Option<&UserContext>,
+    ) -> WsFrame {
         let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let display_name = params
             .get("display_name")
@@ -214,10 +227,13 @@ impl MethodHandler {
         // the dashboard onboarding pick a non-Claude backend at create time
         // instead of a follow-up update. No `runtime` key ⇒ no-op (existing
         // callers unaffected). Invalid provider ⇒ fail and clean up the dir.
-        if let Err(e) = apply_runtime_to_table(&mut agent_config, &params) {
-            let _ = tokio::fs::remove_dir_all(&agent_dir).await;
-            return WsFrame::error_response("", &e);
-        }
+        let runtime_outcome = match apply_runtime_to_table_reporting(&mut agent_config, &params) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&agent_dir).await;
+                return WsFrame::error_response("", &e);
+            }
+        };
 
         let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
@@ -240,6 +256,16 @@ impl MethodHandler {
         if let Err(e) = duduclaw_core::org_store::upsert(&self.home_dir, name, org_entry) {
             warn!(agent = %name, error = %e, "org.toml upsert failed on agents.create");
         }
+
+        // R1 (2026-10): a deprecated runtime is still written, but the write
+        // is audited with the caller so the migration is traceable.
+        audit_deprecated_runtime_writes(
+            &self.home_dir,
+            name,
+            "agents.create",
+            caller.map(|c| c.user_id.as_str()).unwrap_or("unknown"),
+            &runtime_outcome.deprecated,
+        );
 
         // Honor an optional `soul` param (the agent's persona / system prompt).
         // Trim + cap defensively; fall back to a stock one-liner when absent.

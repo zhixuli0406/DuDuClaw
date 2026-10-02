@@ -76,6 +76,21 @@ pub struct ModelSectionView {
     pub delegation_routing: Option<bool>,
 }
 
+/// The `[container]` key the team gate reads: whether this employee's tasks
+/// must run inside the task sandbox.
+///
+/// A narrow projection of [`crate::types::ContainerConfig`] (whose
+/// `timeout_ms` / `max_concurrent` / `readonly_project` are required). Read
+/// through [`load`] so a preset-resolved `agent.resolved.toml` is honored the
+/// same way the registry honors it. Absent or wrong-typed ⇒ `None` ⇒ off,
+/// matching `ContainerConfig`'s `#[serde(default)]` on the same key.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct ContainerSectionView {
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub sandbox_enabled: Option<bool>,
+}
+
 /// The `[agent]` identity keys the former shadow readers consumed.
 ///
 /// A narrow projection rather than [`crate::types::AgentInfo`] for the same
@@ -307,6 +322,9 @@ pub struct AgentTomlSections {
     pub mcp: McpSectionView,
     #[serde(deserialize_with = "crate::lenient::or_default")]
     pub goal_intent: GoalIntentSectionView,
+    /// `[container]` — only `sandbox_enabled` (see [`ContainerSectionView`]).
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub container: ContainerSectionView,
     /// `[team]` — per-employee Team-as-Agent role overrides (P1/WP-1).
     ///
     /// No narrow "view" struct: unlike `[model]` / `[agent]` / `[budget]`,

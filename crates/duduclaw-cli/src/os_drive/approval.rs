@@ -58,9 +58,10 @@ pub async fn gate(home_dir: &Path, description: &str, tool: &str) -> Result<(), 
         }
     };
 
-    match crate::mcp::run_install_approval(
+    match crate::mcp::run_tool_approval(
         &broker,
         &agent_id,
+        tool,
         description,
         serde_json::json!({ "tool": tool }),
         OS_DRIVE_APPROVAL_TTL_SECONDS,

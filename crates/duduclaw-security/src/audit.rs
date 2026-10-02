@@ -266,6 +266,45 @@ pub fn log_git_credentials_granted(home_dir: &Path, agent_id: &str, env_names: &
     append_audit_event(home_dir, &event);
 }
 
+/// Log an AI caller's refused attempt to create an employee under a name that
+/// is reserved because an employee of that name was removed
+/// (`duduclaw_core::agent_trash`). `requested` must already be a validated
+/// agent id; `path_kind` / `reason` are fixed tokens chosen by the code, never
+/// caller text.
+pub fn log_agent_name_reserved(
+    home_dir: &Path,
+    caller: &str,
+    requested: &str,
+    path_kind: &str,
+    reason: &str,
+) {
+    let event = AuditEvent::new(
+        "agent_name_reserved",
+        caller,
+        Severity::Warning,
+        serde_json::json!({
+            "requested_name": requested,
+            "path_kind": path_kind,
+            "reason": reason,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log an employee removal performed by an AI caller (MCP `agent_remove`).
+pub fn log_agent_removed(home_dir: &Path, caller: &str, subject: &str) {
+    let event = AuditEvent::new(
+        "agent_removed",
+        caller,
+        Severity::Warning,
+        serde_json::json!({
+            "subject": subject,
+            "moved_to_trash": true,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
 /// Log a skill quarantine event.
 pub fn log_skill_quarantined(home_dir: &Path, agent_id: &str, skill_name: &str, reason: &str) {
     let event = AuditEvent::new(

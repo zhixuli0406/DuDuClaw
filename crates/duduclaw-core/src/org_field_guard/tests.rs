@@ -65,6 +65,8 @@ mod toml_rules;
 /// `.mcp.json`, hook settings, `identity.key`, `org.toml`, WP22 T2 and the
 /// WP1.1 C3 SOUL.md self-write guard.
 mod identity_scope;
+/// Removed-name reservation: the `_trash` area is not AI-writable.
+mod removed_area;
 
 // ── O9: the frozen-field table itself ───────────────────────────
 //

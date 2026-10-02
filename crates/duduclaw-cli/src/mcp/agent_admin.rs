@@ -77,15 +77,24 @@ pub(crate) async fn handle_agent_remove(params: &Value, home_dir: &Path, caller:
         tracing::warn!(agent = %agent_id, error = %e, "org.toml removal failed on agent_remove");
     }
 
+    duduclaw_security::audit::log_agent_removed(home_dir, caller, agent_id);
+
+    // The reader of this text is the calling AI employee (every MCP caller is
+    // treated as one; see the reservation note in `handle_create_agent`). It
+    // deliberately carries no trash path and no `rm -rf` line: restoring or
+    // purging a removed employee is the administrator's decision, and the
+    // name stays reserved against AI callers while the trash entry exists.
     serde_json::json!({
-        "content": [{"type": "text", "text": format!(
-            "Agent '{agent_id}' removed (moved to trash).\n\
-             Recovery path: {}\n\n\
-             To permanently delete: rm -rf {}",
-            trash_path.display(),
-            trash_path.display()
-        )}]
+        "content": [{"type": "text", "text": removal_message_for_ai(agent_id)}]
     })
+}
+
+/// Success text for an AI caller of `agent_remove`. No paths, no commands.
+pub(crate) fn removal_message_for_ai(agent_id: &str) -> String {
+    format!(
+        "已移除 AI 員工「{agent_id}」。管理者可以在需要時把它復原;\
+         在那之前,「{agent_id}」這個名稱會保留,AI 員工無法再用它建立新員工。"
+    )
 }
 
 /// WP1.1 C4 (`DESIGN-evolution-v3-aee.md` §1.9.2) — `[permissions]

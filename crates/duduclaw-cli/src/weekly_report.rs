@@ -25,6 +25,11 @@ use duduclaw_gateway::evolution_events::reliability::ReliabilitySummary;
 use duduclaw_gateway::task_store::TaskStore;
 use serde::Serialize;
 
+#[path = "weekly_report_goal.rs"]
+pub(crate) mod goal_survival;
+#[path = "weekly_report_goal_readonly.rs"]
+pub(crate) mod goal_survival_readonly;
+
 /// Hard cap on activity rows scanned per agent. The activity table has no time
 /// index, so we fetch DESC-ordered rows up to this cap and filter by timestamp
 /// client-side. If the cap is hit, the renderer notes that older rows in the
@@ -85,6 +90,8 @@ pub struct ReportData {
     pub agents: Vec<AgentReport>,
     /// True when at least one agent's activity scan hit ACTIVITY_FETCH_CAP.
     pub activity_truncated: bool,
+    /// Goal-loop survival table (goal tasks created inside the window).
+    pub goal_survival: goal_survival::GoalSurvival,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -241,6 +248,10 @@ async fn collect(home_dir: &Path, days: u32, agent_filter: Option<&str>) -> Resu
             .then_with(|| a.name.cmp(&b.name))
     });
 
+    // A failed read degrades to an empty section rather than failing the report.
+    let goal_survival =
+        survival_result(goal_survival::collect(&tasks, &window_start, agent_filter).await);
+
     Ok(ReportData {
         generated_at: now,
         window_start,
@@ -250,7 +261,32 @@ async fn collect(home_dir: &Path, days: u32, agent_filter: Option<&str>) -> Resu
         total_agents_active: active_count,
         agents: agent_reports,
         activity_truncated,
+        goal_survival,
     })
+}
+
+fn survival_result(
+    result: std::result::Result<goal_survival::GoalSurvival, String>,
+) -> goal_survival::GoalSurvival {
+    match result {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(error = %e, "weekly-report: goal survival table failed");
+            goal_survival::GoalSurvival::unavailable(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod survival_failure_tests {
+    #[test]
+    fn survival_read_failure_is_unavailable_instead_of_zero_tasks() {
+        let report = super::survival_result(Err("no such table: task_iterations".into()));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["availability"], "unavailable");
+        assert!(super::goal_survival::render_markdown(&report).contains("無法讀取"));
+        assert!(!super::goal_survival::render_markdown(&report).contains("沒有目標任務"));
+    }
 }
 
 async fn collect_activity(
@@ -445,6 +481,8 @@ pub fn render_markdown(report: &ReportData) -> String {
         out.push('\n');
     }
 
+    out.push_str(&goal_survival::render_markdown(&report.goal_survival));
+
     // Footer
     out.push_str("---\n\n");
     out.push_str("**資料來源**：\n");
@@ -601,6 +639,7 @@ mod tests {
                 },
             ],
             activity_truncated: false,
+            goal_survival: goal_survival::build(Vec::new(), 0),
         }
     }
 
