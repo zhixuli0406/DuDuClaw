@@ -144,7 +144,7 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同。如果你已經建�
 
 1. **排入佇列**：將傳入的任務排入 Agent 既有的任務系統（`TaskSpec`、`tasks/` 目錄）。
 2. **追蹤**狀態轉換（queued → running → completed/failed/cancelled）。
-3. **路由**任務執行至 Agent 的正常 runtime（Claude / Codex / Gemini / OpenAI-compat）。
+3. **路由**任務執行至 Agent 的正常 runtime（Claude / Codex / Antigravity / Grok / OpenAI-compat 或其他目錄內 runtime；Gemini CLI runtime 已棄用）。
 4. **暴露**任務封套中的結果，讓客戶端能輪詢取得。
 
 這代表透過 ACP 提交的任務，會流經與透過頻道或 MCP 工具提交的任務**相同**的管線，這是單一事實來源，在 Logs/Activity dashboard 中統一可觀測。
@@ -164,6 +164,8 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同。如果你已經建�
 > ```
 >
 > `duduclaw acp-server` 維持 A2A 用途：兩個協定刻意分開在不同指令上。
+
+## 目前可用的功能（stdio 上的 A2A）
 
 ### CI/CD Pipeline
 
@@ -188,7 +190,7 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同。如果你已經建�
 |----------|---------|-----------|---------|
 | **MCP** | 將 DuDuClaw 的工具（channel、memory、agent、wiki、task……）暴露給 AI runtime | Runtime → DuDuClaw | `duduclaw mcp-server` |
 | **ACP/A2A** | 讓外部客戶端（IDE、pipeline、其他 Agent）向 DuDuClaw 發送任務 | IDE → DuDuClaw | `duduclaw acp-server` |
-| **Runtime stdio** | DuDuClaw 衍生一個 runtime（Claude/Codex/Gemini）子行程並透過 stdio JSON 與它對話 | DuDuClaw → Runtime | *內部* |
+| **Runtime stdio** | DuDuClaw 衍生一個 runtime（Claude/Codex/Antigravity/Grok，棄用期間仍含 Gemini）子行程並透過 stdio JSON 與它對話 | DuDuClaw → Runtime | *內部* |
 
 它們是三場各自獨立的對話，全都在 stdio 上，全都與 JSON-RPC 相鄰。同一個 Agent 在執行期同時參與這三者。
 
@@ -211,7 +213,7 @@ HTTP 對 Dashboard 與 Prometheus metrics 仍然可用，但對 IDE ↔ Agent �
 
 Agent Card 宣告 `streaming: true` 與 `multi_turn: true`。這向客戶端傳達：
 
-- **串流**：長時間執行的任務可以在同一條 stdio 連線上發出進度事件，不只是單一回應。
+- **串流**：長時間執行的任務可以在同一條 stdio 連線上陸續發出進度事件，最後才送出回應。
 - **多輪**：一個任務情境可以橫跨多個請求／回應對（釐清、後續追問）而不喪失狀態。
 
 這些能力對映 Session Memory Stack，釘選指令、滾雪球式回顧與關鍵事實，都會橫跨多輪 ACP 對話延續，方式與頻道訊息中相同。
@@ -225,7 +227,7 @@ ACP 與 MCP 一樣，繼承 DuDuClaw 的安全邊界：
 - **CONTRACT.toml**：must_not/must_always 規則依然適用；經由 ACP 提交的任務無法違反它們。
 - **能力閘控**：`agent.toml [capabilities]` 的預設拒絕仍然閘控工具存取。
 - **稽核日誌**：經由 ACP 提交的任務會以 source=`acp` 出現在 `audit.unified_log` 中。
-- **沙箱化**：任務仍然會流經 worktree 層，並（可選地）流經容器沙箱。
+- **沙箱化**：任務與其他任務一樣，套用可選的每 Agent 任務沙箱，詳見[任務沙箱](../../guides/zh-TW/task-sandbox.md)。
 
 客戶端是 IDE 並不會授予較高的信任；Agent 自身的策略才是最後一道防線。
 
@@ -234,7 +236,7 @@ ACP 與 MCP 一樣，繼承 DuDuClaw 的安全邊界：
 ## 與其他系統的互動
 
 - **Task Board**：經由 ACP 提交的任務流經與經由頻道提交者相同的 `TaskStore`。兩者都會顯示在 Dashboard Activity Feed 中。
-- **Runtime 選擇**：Agent 的正常 runtime（Claude/Codex/Gemini/OpenAI）處理 ACP 任務，相同的工作階段記憶、相同的 prompt cache 策略、相同的帳號輪替。
+- **Runtime 選擇**：Agent 的正常 runtime（Claude/Codex/Antigravity/Grok/OpenAI-compat；Gemini CLI 自 v1.67.0 起棄用）處理 ACP 任務，相同的工作階段記憶、相同的 prompt cache 策略、相同的帳號輪替。
 - **演化**：ACP 任務在關鍵事實萃取與預測錯誤校準上，計為「實質性輪次」。
 - **稽核日誌**：所有 ACP 請求都以 source=`acp` 記錄，與其他四個稽核來源（security / tool_calls / channel_failures / feedback）並列。
 

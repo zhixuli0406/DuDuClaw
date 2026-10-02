@@ -214,6 +214,24 @@ When `create_agent` creates a new employee, the caller can only attach it to its
 - You cannot create an employee attached under your own manager (unless the operator is that manager or someone above)
 - Creating employees from the dashboard is unrestricted (a human operation)
 
+### A removed employee's name stays reserved
+
+`agent_remove` does not delete an employee: it moves the directory to `~/.duduclaw/agents/_trash/<id>_<14-digit timestamp>`. Without a further rule, a lead could remove a report and `create_agent` the same name, and the new seat would carry the name but none of the controls the operator had set on the old one (`CONTRACT.toml`, `[capabilities]` restrictions, the sandbox setting).
+
+So an AI caller cannot create an employee whose name:
+
+- has an entry in `_trash/` (whole-id match),
+- is still recorded in `org.toml` although its directory is gone, or
+- cannot be checked because `_trash/` cannot be listed (fail closed).
+
+Every MCP caller counts as an AI caller. The CLI scaffold path (`duduclaw agent create`, pack and expert install, `migrate-from`) applies the same rule when it sees an agent identity in its environment (`DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN`), and the `agent-file-guard` hook blocks a Bash `duduclaw agent create <reserved name>`. A different name is always allowed. `agent_remove` tells the AI that the employee was removed, that the administrator can restore it and that the name is reserved; it no longer returns the trash path or an `rm -rf` hint.
+
+Operators are not restricted: the dashboard and a human at a terminal can reuse the name. Restoring or purging a removed employee is done by hand on `~/.duduclaw/agents/_trash/<id>_<timestamp>`; the dashboard has no control for it. Refusals are audited in `security_audit.jsonl` as `agent_name_reserved` (`requested_name`, `path_kind` = `mcp_create_agent` / `cli_scaffold` / `cli_bash_agent_create`, `reason` = `removed_to_trash` / `dangling_org_record` / `trash_unlistable`); removals as `agent_removed` (`subject`, `moved_to_trash`).
+
+Limits: Claude, Codex and Gemini employees carry their identity in `.mcp.json`, not in their Bash environment, so the CLI cannot tell that `pack install`, `expert install` or `migrate-from` run from their Bash is an AI session; the Bash rules are heuristics, and real containment is not granting Bash. Verified through the real MCP server with an employee's own registration (remove, refused re-creation, a different name accepted, the hook blocks, the audit rows); the CLI scaffold path was exercised only by unit tests.
+
+`create_agent` and `agent_remove` called over HTTP with a non-internal MCP key are judged by that key's own client id (they used to be treated as the server process's default agent), so the subtree check above applies to the real caller.
+
 ---
 
 ## Identity verification (advanced)

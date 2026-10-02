@@ -12,12 +12,22 @@ The one-line difference: normally a task walks one path and starts over when it 
 
 A DuDuClaw agent runs as a `claude` CLI subprocess, so a "branch" is one isolated subprocess execution carrying:
 
-- its own **workspace overlay** (copy-on-write: it reads the parent workspace, but writes land only in its own copy, so branches never contaminate each other)
+- its own **workspace overlay** (copy-on-write: it starts from a filtered parent copy and writes into its own copy)
 - its own **account** (the AccountRotator assigns distinct accounts, so branches never collide on the same rate limit)
 - its own **budget cap** and an optional **steering message** (telling the branch which direction to try)
-- a **read-only shared view** of the parent workspace
+- a **copy of the parent at branch creation**, filtered by the fork copy policy
 
 After finishing, each branch can optionally run a `test_command` (for example `pytest -q`), and its exit code feeds the judge's scoring.
+
+---
+
+## Selecting a retained branch
+
+Unresolved forks retain finished branch workspaces under `<home>/fork_ws/<fork_id>/<branch_id>/`. The default retention is 24 hours, configured by `[fork] retained_workspace_ttl_hours`; cleanup runs when fork tools are used. Select with `merge_or_select` and both `fork_id` and `branch_id`. The MCP tool accepts selection only from the creating agent; a manager can also select through the dashboard. Manual selections and retention cleanup share a cross-process lock. Automatic execution-time promotion does not yet share that lock across concurrent forks: schedule automatic forks using the same parent workspace sequentially. The call copies actual files into the recorded parent workspace before marking the fork promoted, then removes retained copies. A missing or expired copy, missing parent, or failed promotion returns an error rather than claiming success. Calling without `branch_id` does not rerun the judge; automatic judging happens during execution.
+
+The same copy policy applies when creating, retaining, and promoting branches. It excludes `.env`, `.env.*`, `*.pem`, `*.key`, SSH private-key names, `.npmrc`, `.pypirc`, and `.netrc`. Symlinks are never followed: external and dangling links are dropped; verified internal links are recreated on Unix. Hardlinks become independent files and special files are dropped. Promotion replaces files rather than writing through destination links. This name-based policy does not detect every possible secret filename. When the promotion target is an agent directory, promotion also never copies agent-structure files back: `SOUL.md`, `CONTRACT.toml`, `agent.toml`, `.mcp.json`, `.claude/` and the other agent-structure files stay as they are in the parent. Branches can still read them.
+
+A configured `test_command` runs in the branch copy. On timeout, Unix kills its process group and Windows uses `taskkill /T /F`; output capture is bounded. Descendants that detach into another process group are outside that Unix cleanup boundary, and output-reader waits have a bounded grace period.
 
 ---
 
@@ -82,6 +92,7 @@ aggregate_budget_usd = 1.50  # cap across all branches
 merge_mode = "auto_with_fallback"
 test_command = ""            # optional; empty ⇒ judge's test_pass_ratio neutralized
 test_timeout_s = 120
+retained_workspace_ttl_hours = 24          # unresolved branch copies
 ```
 
 MCP tools (registered only when the agent sets `[fork] enabled = true`, uniformly gated behind `Scope::ForkExecute`, fail-closed):
@@ -91,7 +102,7 @@ MCP tools (registered only when the agent sets `[fork] enabled = true`, uniforml
 | `fork_run` | Split the current task into N branches |
 | `inspect_branches` | List live branches + state + spend |
 | `diff_branches` | File/output diff between two branches |
-| `merge_or_select` | Resolve a fork (judge verdict or your pick) |
+| `merge_or_select` | Promote an explicitly selected retained branch; creating agent only |
 | `terminate_branch` | Kill a runaway branch |
 | `fork_cost` | Aggregate and per-branch spend |
 

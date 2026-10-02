@@ -23,7 +23,9 @@ Discussion #27274:
   break for paid-key users.
 - **Replacement**: `agy`, a Go single-binary (no Node runtime). Installs to
   `~/.local/bin/agy`; config under `~/.gemini/antigravity-cli/`. Multiplexes
-  Gemini 3.x + Claude 4.6 + GPT-OSS models. API key env: `ANTIGRAVITY_API_KEY`.
+  Gemini 3.x + Claude 4.6 + GPT-OSS models. API key route: `GEMINI_API_KEY` env + settings `modelProvider: "gemini"` (see the 2026-10-01 note below).
+
+> 2026-10-01: verified against agy 1.2.14 — the key variable is `GEMINI_API_KEY` plus settings `modelProvider: "gemini"`; `ANTIGRAVITY_API_KEY` never existed. There is also no `agy login` subcommand, and MCP config is read from `<agent workspace>/.agents/mcp_config.json`, not `~/.gemini/antigravity-cli/settings.json`.
 
 ## `agy --help` ground truth (v1.0.12, smoke-tested 2026-06-25)
 

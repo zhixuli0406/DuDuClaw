@@ -21,8 +21,15 @@ What is actually in the product is smaller and easier to reason about: **two Pre
 It exits 2 — which Claude Code reads as "block this tool call" — when:
 
 - an agent writes an **agent-structure file** (`agent.toml`, `SOUL.md`, `CLAUDE.md`, `.mcp.json`, …) outside the canonical `<home>/agents/<name>/` tree. Scaffolding a new agent has to go through the `create_agent` MCP tool, which carries the delegation-authorization gate;
-- an agent writes **its own `SOUL.md`**, even in the right place. Personality is operator-managed. The one exception is an agent that has explicitly opted in with `agent.toml [permissions] can_modify_own_soul = true`, and even then only for itself;
-- an agent touches **another agent's** files at all.
+- an agent writes **its own `SOUL.md`**, even in the right place. Personality is operator-managed. The hook has no opt-in: an agent explicitly opted in with `agent.toml [permissions] can_modify_own_soul = true` changes its own `SOUL.md` through the `agent_update_soul` MCP tool, never by writing the file;
+- an agent writes **its own `CONTRACT.toml`**, even in the right place (decision `BlockedOwnContractWrite`). The contract is the operator's boundary on the agent, so there is no opt-in flag at all; the block message tells the agent to ask the operator, who changes it from the dashboard (`contract.update`, admin only, which does not pass through this hook);
+- an agent touches **another agent's** files at all;
+- an agent writes, moves or deletes anything under **`agents/_trash/`**, where removed employees are kept (Bash by heuristic);
+- an agent runs **`duduclaw agent create <name>`** from Bash for a name that is reserved because a removed employee had it (see [Delegation isolation](37-delegation-isolation.md#a-removed-employees-name-stays-reserved)); the refusal is audited as `agent_name_reserved` with `path_kind` `cli_bash_agent_create`.
+
+For Bash, the own-`SOUL.md` and own-`CONTRACT.toml` rules are a heuristic: a write-shaped command that names the file, as `agents/<self>/…` or as a relative spelling such as `CONTRACT.toml` or `./CONTRACT.toml`, is blocked. That is a speed bump. A command that hides the file name (a variable, an encoded string, a script) can get past it; real isolation is not giving the agent Bash.
+
+Live forking (`fork_run`) respects the same files from the other side: branches can read the agent's structure files, but promoting a branch back into the agent directory never copies `SOUL.md`, `CONTRACT.toml`, `agent.toml`, `.mcp.json`, `.claude/` or the other agent-structure files over the parent's copies.
 
 ## Guard 2 — `data-file-guard` (PreToolUse, Rust, RFC-23 §14.4)
 

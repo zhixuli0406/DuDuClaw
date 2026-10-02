@@ -97,6 +97,7 @@
 | 跨 session 使用者畫像 | 每使用者偏好 traits(temporal supersession)→ session-stable 的 `## About This User` 回覆注入;`user_profile_record` / `user_profile_get` MCP 工具 |
 | GDPR 匯出/抹除 | `duduclaw gdpr export\|erase <contact>` 涵蓋記憶(triple + 自由文字提及 + key_facts,四表級聯,SHA-256 假名 tombstone)**與** session 儲存(`<channel>:<chat_id>` prefix) |
 | 記憶 PPR 效能量測 | `duduclaw memory bench` — P50/P95 延遲 + 分區建議(LightRAG 量測 gate) |
+| Custom Dashboard Widgets | 在沙盒 runtime 中執行的 AI 引導或原始 HTML 儀表板卡片;Widget Studio 分享/匯入/匯出([30-custom-widgets.md](30-custom-widgets.md)) |
 | 預算斷路器 | 每 agent 滑動視窗硬上限(`[budget] daily_cap_cents`),到頂即於 choke-point 阻斷 LLM 呼叫;寫 `budget_events.jsonl` |
 | 燒錢速率異常偵測 | 對每 agent 每日花費做滾動平均+標準差離群偵測(`cost_anomaly.rs`) |
 | 稽核匯出 + SIEM sink | `duduclaw audit` — 正規化並串流 JSONL 稽核軌跡至 NDJSON / webhook |
@@ -117,7 +118,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| Multi-Runtime AI Agent 平台 | 統一 `AgentRuntime` trait — Claude / Codex / Gemini / Antigravity (`agy`) / OpenAI-compat 五後端自動偵測 |
+| Multi-Runtime AI Agent 平台 | 統一 `AgentRuntime` trait — Claude / Codex / Gemini（已棄用）/ Antigravity (`agy`) / OpenAI-compat 五後端自動偵測 |
 | MCP Server（JSON-RPC 2.0） | 透過 stdin/stdout 向 AI Runtime 暴露 80+ 工具；註冊於 `<agent>/.mcp.json`（Claude CLI `-p` 僅讀取專案層級），gateway 啟動時自動建立/修復 |
 | ACP/A2A Server | 兩個指令：`duduclaw acp` — IDE agent panel 用的 Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` 串流、未設定時回 `AUTH_REQUIRED`）；`duduclaw acp-server` — A2A 協定（`agent/discover` / `message/send` / `tasks/*`、`.well-known/agent.json` AgentCard） |
 | Agent 目錄結構 | `.claude/`、`.mcp.json`、`SOUL.md`、`CLAUDE.md`、`CONTRACT.toml`、`agent.toml`、`wiki/`、`SKILLS/`、`memory/`、`tasks/`、`state/` |
@@ -135,8 +136,9 @@
 |------|------|
 | Claude Runtime | Claude Code SDK (`claude` CLI) + JSONL streaming + `--resume` 原生多輪 |
 | Codex Runtime | OpenAI Codex CLI + `--json` streaming，以 `AGENTS.md` 檔案傳遞 system prompt |
-| Gemini Runtime | Google Gemini CLI + `--output-format stream-json`，以 `GEMINI_SYSTEM_MD` env 傳遞 system prompt，`--approval-mode yolo`。Google 於 2026-06-18 退役個人版 Gemini CLI 後，保留給付費 `GEMINI_API_KEY` 用戶 |
-| Antigravity Runtime（v1.24.0）| Google Antigravity CLI（`agy`，2026-06-18 Gemini CLI 後繼者），走 oneshot `agy -p --dangerously-skip-permissions --print-timeout 300s`。二進位自動解析（PATH → `~/.local/bin/agy`）；無 `--system` 旗標，故 system prompt + 歷史內嵌進 prompt（CJK-safe）；認證 `ANTIGRAVITY_API_KEY`；自動把 agent 目錄預植進 agy 的 `trustedWorkspaces`（跨程序檔鎖）以免 headless 卡在信任提示；token 用量為估算（print 模式無統計）|
+| Gemini Runtime（v1.67.0 棄用，v1.69.0 移除；請改用 Antigravity）| Google Gemini CLI + `--output-format stream-json`，以 `GEMINI_SYSTEM_MD` env 傳遞 system prompt，`--approval-mode yolo`。Google 於 2026-06-18 退役個人版 Gemini CLI 後，保留給付費 `GEMINI_API_KEY` 用戶 |
+| Antigravity Runtime（v1.24.0）| Google Antigravity CLI（`agy`，2026-06-18 Gemini CLI 後繼者），走 oneshot `agy -p --dangerously-skip-permissions --print-timeout 300s`。二進位自動解析（PATH → `~/.local/bin/agy`）；無 `--system` 旗標，故 system prompt + 歷史內嵌進 prompt（CJK-safe）；認證用 Google 登入（在主機終端機執行 `agy`）或 API key 模式（`config.toml [antigravity] auth = "api_key"` + Gemini API key）；MCP 工具註冊在各 agent 工作區的 `.agents/mcp_config.json`；自動把 agent 目錄預植進 agy 的 `trustedWorkspaces`（跨程序檔鎖）以免 headless 卡在信任提示；token 用量為估算（print 模式無統計）|
+| Grok Runtime（R4）| xAI Grok CLI(「Grok Build」),走 oneshot `grok -p`(2026-07-13 對照 docs.x.ai 驗證)。二進位 `grok`(curl 安裝;第三方 `grok-cli` 作為備援探測);`--model` 選模型;`--tools`/`--disallowed-tools` 限縮(+ `native_sandbox` 硬閘);system prompt + 歷史內嵌進 prompt(CJK-safe);duduclaw MCP server 以 `[mcp_servers.duduclaw]` TOML 寫入各 agent 的 `<agent_dir>/.grok/config.toml`(+ agent 身分經 spawn env 轉送);以 `XAI_API_KEY` env 認證;token 用量為估算(純 stdout)。**殘餘項**(需實機 CLI):`--tools` 清單分隔符、`mcp_servers` 的專案本地 `config.toml` 探索、真實用量的 `--output-format json` schema,以及完整 `--model` 清單(`grok models`),文件僅確認 `grok-4.5` / `grok-build-0.1` |
 | OpenAI-compat Runtime | HTTP 端點（MiniMax / DeepSeek 等）REST API |
 | RuntimeRegistry | 自動偵測已安裝 CLI，per-agent `[runtime]` 設定 |
 | Cross-Provider Failover | `FailoverManager` 健康追蹤、冷卻、不可重試錯誤偵測 |
@@ -179,7 +181,7 @@
 
 > **進化系統 v3（2026-08-06）→ S11（2026-09-29）**：進化標的從「整份改寫
 > `SOUL.md`」改為 **playbook**（小顆粒、可個別退休的基因形規則；`SOUL.md`
-> 對 agent 唯讀），並於 2026-09-29 **直接移除** legacy SOUL 改寫路徑——
+> 對 agent 唯讀），並於 2026-09-29 **直接移除** legacy SOUL 改寫路徑：
 > `[evolution] legacy_soul_evolution` 逃生門、`SOUL.md` 版本化、24 小時觀察
 > 期、自動回滾、超額 consolidate 重寫、deferred GVU 重試與
 > `duduclaw evolution finalize` CLI 全部一併移除。`[evolution] gvu_enabled`
@@ -230,7 +232,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| OpenAI 相容 HTTP | 唯一出貨的 backend——llama-server／Ollama／vLLM／SGLang／llamafile。行程內的 llama.cpp、mistral.rs、MLX 三個 backend 已於 2026-09 移除（release binary 從未編譯過它們）|
+| OpenAI 相容 HTTP | 唯一出貨的 backend：llama-server／Ollama／vLLM／SGLang／llamafile。行程內的 llama.cpp、mistral.rs、MLX 三個 backend 已於 2026-09 移除（release binary 從未編譯過它們）|
 | 信心路由器 | LocalFast / LocalStrong / CloudAPI 三層路由 + CJK-aware token 估算 |
 | InferenceManager | 多模式自動切換：llamafile → Direct → OpenAI-compat → Cloud API |
 | llamafile 管理 | 子程序生命週期、零安裝跨 6 OS |
@@ -261,12 +263,12 @@
 
 | 功能 | 說明 |
 |------|------|
-| `agent-file-guard` PreToolUse hook | `duduclaw hook agent-file-guard`（Rust 子命令，matcher `Write\|Edit\|MultiEdit\|Bash`，由 `agent_hook_installer` 逐 agent 安裝）——擋正規樹外的 agent 結構檔、擋寫自己的 SOUL.md、擋跨 agent 寫入 |
+| `agent-file-guard` PreToolUse hook | `duduclaw hook agent-file-guard`（Rust 子命令，matcher `Write\|Edit\|MultiEdit\|Bash`，由 `agent_hook_installer` 逐 agent 安裝）：擋正規樹外的 agent 結構檔、擋寫自己的 SOUL.md 與 CONTRACT.toml、擋跨 agent 寫入 |
 | `org_field_guard` | 同一個 hook 內的欄位級凍結：`[agent] reports_to`／`department`／`name`、整張 `[capabilities]` 表，以及 `config.toml [delegation]`／`[acp]`；內容無法解析或寫入意圖無法重建一律 fail-closed |
 | `data-file-guard` PreToolUse hook | `duduclaw hook data-file-guard`（RFC-23 §14.4，H10 2026-09 起為 Rust 子命令，matcher `Read\|Bash`），只有去識別化生效時才武裝；本質是 `Bash` 檔名啟發式，不是沙箱 |
-| Ed25519 認證 | 挑戰-回應式 WebSocket 認證 |
+| Dashboard 認證 | JWT 帳號登入（Argon2id 密碼，`users.db`）或 gateway 管理員 token。早期的 Ed25519 挑戰回應路徑已移除，從來沒有任何設定能啟用它 |
 | AES-256-GCM | API 金鑰靜態加密、per-agent 隔離 |
-| Prompt Injection 掃描 | `input_guard`——7 類規則、阻擋門檻 60、先 NFKC 正規化、英文＋zh-TW 樣式、XML 分隔標籤保護 |
+| Prompt Injection 掃描 | `input_guard`：7 類規則、阻擋門檻 60、先 NFKC 正規化、英文＋zh-TW 樣式、XML 分隔標籤保護 |
 | SOUL.md 漂移偵測 | SHA-256 指紋比對 |
 | CONTRACT.toml | 行為邊界 + `duduclaw test` 紅隊測試（9 場景）；自動注入所有 runtime 的 system prompt |
 | RBAC 矩陣（唯讀檢視）| 安全頁把每個 agent 的工具／網路／審批矩陣渲染出來，資料源是 `agent.toml [capabilities]`。`duduclaw-security::rbac` 模組已移除（零呼叫端），可編輯的權威來源就是各 agent 的 capability envelope |
@@ -274,10 +276,10 @@
 | JSONL 審計日誌 | async 寫入，格式相容 Rust `AuditEvent` schema |
 | Unicode 正規化 | NFKC 偵測同形字攻擊 |
 | Action Claim Verifier | 工具呼叫聲明的簽章驗證 |
-| 容器沙盒 | Docker (Bollard) / Apple Container / WSL2 — `--network=none`、tmpfs、read-only rootfs、512MB limit |
+| 容器沙盒 | 兩條獨立路徑。任務沙箱（`agent.toml [container] sandbox_enabled`）：只支援 Docker，把被委派任務的 AI CLI 放進唯讀、非 root、有資源上限的容器，不能用時任務失敗而不是改成不隔離（[指南](../../guides/zh-TW/task-sandbox.md)）。腳本沙箱（PTC `execute_program`、`duduclaw secaudit` 的 PoC 步驟）：Docker（Windows 先試 WSL2），`--network=none`、唯讀根檔案系統，只掛一個唯讀的私有腳本目錄；沙箱不能用時 PTC 不執行，除非設 `script_when_unavailable = "run_unsandboxed"` |
 | Secret 洩漏掃描 | 20+ 模式（Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URL 等）|
 | 敏感資料遮蔽（RFC-23，v1.14.0）| `duduclaw-redaction` crate — 內部資料（Odoo / shared wiki / file tools）以 `<REDACT:CATEGORY:hash8>` token 取代後才送 LLM，受信邊界（user channel reply、白名單工具 egress）自動還原；AES-256-GCM SQLite vault（per-agent 32-byte key，0o600）、TTL 7d 兩階段 GC、5 個內建 profile、五層 enable/disable resolver、JSONL audit 10MB rotation；2026-09 新增欄位級規則：`db_field`（Odoo `model.field`／`model.*` 語法糖）與通用 `json_path`，命中欄位整值 token 化而非比對內容樣態，並附 `duduclaw redaction verify` JSON 模式供活體驗證；`db_field` 原本寫死只認 Odoo 的對照表，2026-09 進一步抽成任何 MCP 工具都能綁的 `[redaction.data_sources.*]` 登錄表，去識別化的涵蓋範圍也首次跨出 DuDuClaw 自己的 MCP server，見下一列 |
-| 資料來源與原生資料庫連接器（2026-09）| `[redaction.data_sources.<name>]` 登錄表（`tools`、`table_arg`／`table`、`record_paths`、`key_alias`）讓 `db_field` 規則的 `source` 能指名任何工具型資料來源，不再只有內建的 `odoo`；`duduclaw mcp-proxy`（spawn 時改寫 `.mcp.json`）把客戶自接的外部 stdio MCP server 導向與 DuDuClaw 自家 MCP server 同一套 egress／回傳去識別化，openai-compat 直連 API 的工具迴圈則由 `ToolInterceptor` 掛鉤做同一件事的行程內版本，HTTP/SSE MCP server 與 codex／gemini／antigravity runtime 目前尚未涵蓋；新增唯讀 `duduclaw-db` crate（sqlx：PostgreSQL／MySQL／SQLite，三層唯讀保證）提供四個 MCP 工具（`db_sources`／`db_tables`／`db_select`／`db_query`，`db_query` 只在 `allowed_tables = ["*"]` 時才開放），受 `Scope::DbRead`（`db:read`）與 deny-by-default 的 per-agent `[capabilities] db_sources` 授權雙重把關；dashboard 新增「資料來源」（兩分頁）與「資料表欄位規則」卡，含試跑與去識別化毒化橫幅；地端檔案（2026-09）補上另一段缺口：Claude CLI 內建 `Read`／`Bash` 不是 MCP 工具，從未經過去識別化節流點，新增三個 MCP 工具 `file_read`／`csv_read`／`xlsx_read`（路徑圍欄、`files:read` scope），內建 `duduclaw_files` 登錄來源讓 `db_field` 規則可寫 `customers.csv.name`／`客戶清單.xlsx.地址`，以及一個 PreToolUse hook `data-file-guard`（`[redaction] data_file_guard`，預設開）擋下內建讀檔路徑，誠實標明是檔名啟發式而非沙箱（[55-data-sources.md](55-data-sources.md)）|
+| 資料來源與原生資料庫連接器（2026-09）| `[redaction.data_sources.<name>]` 登錄表（`tools`、`table_arg`／`table`、`record_paths`、`key_alias`）讓 `db_field` 規則的 `source` 能指名任何工具型資料來源，不再只有內建的 `odoo`；`duduclaw mcp-proxy`（spawn 時改寫 `.mcp.json`）把客戶自接的外部 stdio MCP server 導向與 DuDuClaw 自家 MCP server 同一套 egress／回傳去識別化，openai-compat 直連 API 的工具迴圈則由 `ToolInterceptor` 掛鉤做同一件事的行程內版本，HTTP/SSE MCP server 與 codex／gemini／antigravity runtime 目前尚未涵蓋；新增唯讀 `duduclaw-db` crate（sqlx：PostgreSQL／MySQL／SQLite，三層唯讀保證）提供四個 MCP 工具（`db_sources`／`db_tables`／`db_select`／`db_query`，`db_query` 只在 `allowed_tables = ["*"]` 時才開放），受 `Scope::DbRead`（`db:read`）與 deny-by-default 的 per-agent `[capabilities] db_sources` 授權雙重把關；dashboard 新增「資料來源」（兩分頁）與「資料表欄位規則」卡，含試跑與去識別化毒化橫幅；地端檔案（2026-09）補上另一段缺口：Claude CLI 內建 `Read`／`Bash` 不是 MCP 工具，從未經過去識別化節流點，新增三個 MCP 工具 `file_read`／`csv_read`／`xlsx_read`（路徑圍欄、`files:read` scope），內建 `duduclaw_files` 登錄來源讓 `db_field` 規則可寫 `customers.csv.name`／`客戶清單.xlsx.地址`，以及一個 PreToolUse hook `data-file-guard`（`[redaction] data_file_guard`，預設開）擋下內建讀檔路徑，誠實標明是檔名啟發式而非沙箱；**AI 偵測與自訂規則（2026-09）**：新增 `type = "ner"` 規則類型與內建 `ai_pii` profile（「AI 智慧偵測」），在本機透過 ONNX Runtime 執行 OpenAI Privacy Filter（Apache-2.0）（`ort` `load-dynamic`，release binary 不連結 runtime；`redaction.model.install` 以固定的 sha256 下載模型與 runtime，另有 `.status`／`.cancel`／`.remove`；優先序低於所有 regex 規則，精確樣式優先；實測召回率如實公布，regex profile 仍作為第一層保持開啟）；儀表板自建的**自訂規則**（`~/.duduclaw/redaction/profiles/custom.toml`：資料類型名稱加關鍵字清單或樣式，每種規則類型都有 per-rule `enabled`，`[meta.labels]` 顯示名稱，以及供 TOML 規則包使用的 `redaction.custom_rules.*` 與 `redaction.profiles.import`／`.remove` RPC）、`redaction.suggest_pattern`（貼上 2–5 個範例，得到經驗證的樣式；本機推論 → utility model → 啟發式，絕不捏造樣式），以及對未儲存草稿規則執行的 `redaction.dry_run`（[55-data-sources.md](55-data-sources.md)）|
 
 ## 記憶系統
 
@@ -300,18 +302,6 @@
 | `memory_alias_add` / `memory_alias_list`（D3）| 管理實體別名的 MCP 工具 — add 把 `alias` 收斂到某 `canonical` 實體（scope `memory:write`），list 回傳 `(canonical, alias)` 配對（scope `memory:read`）；命名空間隔離 |
 | Decision Continuity（RFC-24，v1.23.0）| 當 agent 提出列舉式選項（方案 A/B/C），每個選項固化進 Temporal Memory 的 **semantic** 層（獨立於對話壓縮），待決事項回合間重新注入；稍後「用方案 C」（跨回合 / session / 程序）從持久狀態解析而非猜測。偵測確定性、零 LLM；`decision_resolve` / `decision_list` MCP 工具 + Dashboard 面板 + Prometheus 計數器；per-agent opt-in `[memory] decision_continuity = true`（TTL `decision_ttl_days`，預設 7）|
 
-## Git Worktree 隔離（v1.6.0）
-
-| 功能 | 說明 |
-|------|------|
-| L0 隔離層 | 每任務 git worktree — 比容器沙箱便宜，防止並行 Agent 檔案衝突 |
-| 原子合併 | dry-run pre-check → abort → 乾淨時真實合併；全域 `Mutex` 保護 |
-| Snap 工作流 | create → execute → inspect → merge/cleanup；純函數決策邏輯 |
-| 友善分支名 | `wt/{agent_id}/{adjective}-{noun}`，50×50 word list |
-| copy_env_files | 路徑遍歷 jail + 拒絕 symlink + 1MB 大小上限 |
-| AgentExitCode | 結構化退出碼 — Success / Error / Retry / KeepAlive |
-| 資源上限 | 每 agent 5 個、全域 20 個 |
-
 ## 帳號與成本管理
 
 | 功能 | 說明 |
@@ -331,16 +321,17 @@
 | L1 `web_fetch_cached` | 經 SSRF 閘、帶磁碟快取的 HTTP GET（body 截斷在 6 萬字元）|
 | L2 `web_extract` | 同一條抓取路徑＋CSS 選擇器擷取（`text`／`html`／`json`）|
 | L3 headless（可選，外部）| 在該 agent 的 `.mcp.json` 註冊 Playwright 或 Browserbase MCP server；不在 binary 內，L2 也不會自動降級過去 |
-| L5 Computer Use | 七個 `computer_*` MCP 工具，經 `computer_use_orchestrator` 驅動容器虛擬顯示器 |
+| L5 Computer Use | 由 `computer_use_orchestrator` 啟動的容器虛擬顯示器（映像 `ghcr.io/zhixuli0406/duduclaw-computer-use:v<版本>`，不會自動下載），由 AI 員工透過八個 `computer_*` MCP 工具驅動（`session_start`／`screenshot`／`click`／`type`／`key`／`scroll`／`navigate`／`session_stop`；session 由 gateway 持有，透過簽章的 loopback 路由連線，每位員工一個，不需要 API 金鑰，網路只通到 `[capabilities.computer_use_config] allowed_domains` 列出的主機）。聊天觸發的 gateway 迴圈與 `native` 主機桌面模式已移除 |
 | 能力閘門 | `agent.toml [capabilities]` 預設拒絕（`computer_use`／`browser_via_bash`／`allowed_tools`／`denied_tools`）；`denied_tools` 同時以 `--disallowedTools` 與 MCP 分派總門兩處強制 |
 
 ## 容器沙盒
 
+同一個名稱底下有兩條獨立的程式路徑。
+
 | 功能 | 說明 |
 |------|------|
-| Docker | Bollard API，全平台 |
-| Apple Container | macOS 15+ 原生 |
-| WSL2 | Windows Linux 子系統 |
+| 任務沙箱 | 逐員工開啟（`agent.toml [container] sandbox_enabled = true`）。被委派的任務會在 Docker 容器裡執行該員工的 AI CLI：唯讀根檔案系統、非 root、丟棄所有 capability、記憶體／行程／CPU 上限、用完即丟的私有工作目錄、員工目錄以唯讀掛在 `/agent`。只有檔案與 shell 工具，沒有平台 MCP 工具。需要 `network_access = true` 與已拉到本機的 image，只支援 Docker。不能用時任務失敗（稽核 `task_sandbox_unavailable`），除非在 `config.toml [container.sandbox]` 設 `when_unavailable = "run_unsandboxed"`。開了沙箱的員工不會組成團隊（goal 回合在沙箱裡以 Solo 執行），也不會被信件叫醒；通道回覆、cron、提醒等對話類途徑仍在主機執行，並寫稽核事件 `task_sandbox_not_applied`。見[任務沙箱指南](../../guides/zh-TW/task-sandbox.md) |
+| 腳本沙箱 | PTC `execute_program` 與 `duduclaw secaudit` 的 PoC 步驟使用。透過 `duduclaw-container`，macOS／Linux 用 Docker，Windows 先試 WSL2 再試 Docker（WSL2 尚未在真正的 Windows 主機上執行過）；不會選用 Apple Container 後端。與任務沙箱同一個 image，不自動下載；`--network=none`、唯讀根檔案系統、2 GiB／256 個行程／1 顆 CPU、`/tmp` tmpfs、600 秒硬上限，只掛一個唯讀的私有腳本目錄。不能用時 PTC 預設失敗（`[container.sandbox] script_when_unavailable`），PoC 永遠不在主機上執行（[指南](../../guides/zh-TW/task-sandbox.md)） |
 
 ## 排程系統
 
@@ -401,7 +392,7 @@
 | 功能 | 說明 |
 |------|------|
 | 一次性 PTY 呼叫（`duduclaw-cli-runtime`）| 在真正的偽終端下 spawn CLI（Win 10 1809+ 用 ConPTY、Unix 經 `portable-pty` 用 openpty）並把 stdout 讀到 EOF，服務那些 stdout 接到 pipe 就拒跑的 CLI。使用者：Grok runtime 與 CLI 登入輔助流程。`clear_env` 把 gateway 的廠商 API 金鑰擋在子行程外；`deadline` 是絕對 wall-clock 上限。見 [27-pty-pool-runtime](27-pty-pool-runtime.md) |
-| PTY session 連線池 —— **2026-09 移除** | 長駐的 sentinel-framed `claude` REPL 連線池、`duduclaw-cli-worker` 子行程＋supervisor、`RuntimeMode::PtyPool`、`GET /api/runtime/status`、`pty_pool_*` / `worker_*` 指標與 `[runtime] pty_pool_enabled` / `worker_managed` 鍵全部移除。理由：它所保的 Anthropic 程式化用量拆分於 2026-06-15 暫停後從未恢復，而連線池的 session 沒有對話維度（跨對話 context 洩漏），本來就無法安全啟用 |
+| PTY session 連線池（**2026-09 移除**） | 長駐的 sentinel-framed `claude` REPL 連線池、`duduclaw-cli-worker` 子行程＋supervisor、`RuntimeMode::PtyPool`、`GET /api/runtime/status`、`pty_pool_*` / `worker_*` 指標與 `[runtime] pty_pool_enabled` / `worker_managed` 鍵全部移除。理由：它所保的 Anthropic 程式化用量拆分於 2026-06-15 暫停後從未恢復，而連線池的 session 沒有對話維度（跨對話 context 洩漏），本來就無法安全啟用 |
 
 ## MCP HTTP/SSE 傳輸（W20）
 

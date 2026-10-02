@@ -44,25 +44,25 @@ Send an email to **louis.li@dudustudio.monster** with:
 1. **Acknowledgment**: We will confirm receipt within the timeline above
 2. **Assessment**: We will evaluate the severity and impact
 3. **Fix**: We will develop and test a patch
-4. **Release**: Commercial editions receive patches immediately; Community edition follows per the [Security Patch SOP](docs/security-patch-sop.md)
+4. **Release**: Commercial editions receive patches immediately; Community edition follows per the maintainers' internal security patch procedure
 5. **Credit**: We will credit you in the advisory (unless you prefer anonymity)
 
 ## Scope
 
 The following are in scope for security reports:
 
-- **DuDuClaw core** (all 12 Rust crates)
+- **DuDuClaw core** (all 24 Rust workspace crates)
 - **Web Dashboard** (React frontend)
 - **Python bridge** (`python/duduclaw/`)
-- **Container sandbox** escape or bypass
+- **Container sandbox** escape or bypass (task sandbox, script sandbox, computer-use container)
 - **SOUL Guard** bypass (SHA-256 drift detection)
 - **Input Guard** bypass (prompt injection scanner)
-- **Credential Proxy** key leakage
+- **Credential handling** key leakage (encrypted config, `secret_ref`, spawn-env allowlist)
 - **AES-256 encryption** weaknesses
-- **Ed25519 auth** bypass
-- **RBAC** privilege escalation
+- **Dashboard authentication** bypass (JWT account login, admin token; these are the only two dashboard authentication paths)
+- **Authorization** privilege escalation (delegation policy, MCP scopes, `[capabilities]`)
 - **CONTRACT.toml** validation bypass
-- **Browser automation** unauthorized escalation (L1-L5)
+- **Browser automation / computer use** capability bypass (`[capabilities] computer_use`, `denied_tools`, SSRF gate), the internal computer-use route (`/api/internal/computer-use`) and the computer-use site allowlist
 
 ### Out of Scope
 
@@ -74,17 +74,72 @@ The following are in scope for security reports:
 
 ## Security Architecture
 
-DuDuClaw implements defense in depth:
+DuDuClaw implements defense in depth. Each layer below is what the code does today:
 
-- **Layer 1**: Input Guard — prompt injection detection (6 rule categories, risk score 0-100)
-- **Layer 2**: RBAC Engine — 7 permission types, per-agent role enforcement
-- **Layer 3**: SOUL Guard — SHA-256 drift detection with 10 versioned backups
-- **Layer 4**: Credential Proxy — per-agent key isolation with AES-256-GCM encryption
-- **Layer 5**: Container Sandbox — Docker/Apple Container with `--network=none`, tmpfs, read-only rootfs
-- **Layer 6**: CONTRACT.toml — behavioral boundary enforcement with runtime validation
-- **Layer 7**: Audit Log — append-only JSONL security event trail
+- **Layer 1**: Input Guard — prompt-injection scanner (`duduclaw-security/src/input_guard.rs`): 7 rule categories, risk score 0-100, blocks at 60 or above (a few categories block instantly). Runs at the MCP dispatch front door, on `migrate-from` imports, expert-pack installs and skill vetting
+- **Layer 2**: Authorization — there is no RBAC engine (the module was removed). Who may command whom comes from the delegation policy (`duduclaw-core/src/delegation_policy.rs`), MCP scopes (a tool missing from the scope table requires Admin) and the per-agent `agent.toml [capabilities]` grants, all enforced at the MCP dispatcher; an agent-structure and org-field PreToolUse hook (`duduclaw hook agent-file-guard`) stops agents rewriting their own `SOUL.md`, their own `CONTRACT.toml` (no opt-in; operators change it through the admin-only `contract.update` RPC), `reports_to` or `[capabilities]`. Its Bash rule is a heuristic speed bump (a command that hides the file name can pass), so real containment is not granting Bash. Promoting a live-fork branch back into an agent directory never copies agent-structure files (`SOUL.md`, `CONTRACT.toml`, `agent.toml`, `.mcp.json`, `.claude/`, …) over the parent's
+- **Layer 3**: SOUL Guard — SHA-256 drift detection of each `SOUL.md`, with up to 10 versioned backups in `.soul_history/` (`duduclaw-security/src/soul_guard.rs`)
+- **Layer 4**: Secrets — channel tokens, API keys and connector credentials are stored AES-256-GCM encrypted (`duduclaw-security/src/crypto.rs`, key in `~/.duduclaw/.keyfile`) and resolved per agent through `secret_ref`; agent CLI subprocesses start from an allowlisted environment that strips `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD` variables. The old "credential proxy" module was removed
+- **Layer 5**: Containers — there is no single container layer. (a) The per-agent task sandbox (Docker only, off by default, fails closed, see [docs/guides/task-sandbox.md](docs/guides/task-sandbox.md)): read-only root, non-root (a gateway with uid or gid 0 is refused), all capabilities dropped, memory/pids/CPU limits, `--rm --pull never`; the working directory is a size-capped `/workspace` tmpfs, and of the agent directory only `SOUL.md`, `IDENTITY.md`, `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `CONTRACT.toml`, `SKILLS/` and `wiki/` are mounted read-only (never `.mcp.json`, `.claude/`, `state/`, `agent.toml` or databases); leftovers are swept at gateway start and every 10 minutes; it covers delegated/dashboard tasks, heartbeat task-board wake-ups, autopilot `delegate`/`run_skill`, goal rounds (always Solo for a sandboxed employee, never a team) and plan steps, skips the Agent Mail arrival trigger, and leaves channel replies, cron, reminders, the proactive check, ephemeral agents, `duduclaw acp` and live `duduclaw eval` on the host with a once-per-process `task_sandbox_not_applied` audit event; (b) the script sandbox in `duduclaw-container` used by the security-audit PoC and PTC `execute_program`: the same image as the task sandbox (never pulled automatically), Docker on macOS/Linux and WSL2-then-Docker on Windows (the Apple Container backend is never selected), the host user (`1000:1000` when the host is root), all capabilities dropped, `no-new-privileges`, read-only root, `--network=none`, 2 GiB memory without swap, 256 PIDs, 1 CPU, a `/tmp` tmpfs, a capped log, a 600 s hard limit, only a private read-only script directory mounted; when it cannot run, PTC refuses the script by default (`[container.sandbox] script_when_unavailable`, audited as `script_sandbox_unavailable` / `script_sandbox_bypassed`) and the PoC never runs on the host; (c) the computer-use container (image `ghcr.io/zhixuli0406/duduclaw-computer-use:v<gateway version>`, published by `.github/workflows/computer-use-image.yml` from `container/Dockerfile.computer-use`, overridable only by the global `config.toml [computer_use] image`; never pulled automatically: `--pull never` plus a presence check before each session, a missing image fails the start with a message; read-only root, tmpfs, 1 CPU, 512 MB, 512 PIDs, `--security-opt no-new-privileges`, Chromium and the window manager as an unprivileged user under a managed browser policy, DevTools port on container loopback only, screenshots captured in a root-only (0700) directory the browser user cannot touch; `--network=none` unless a tool-driven session has allowlist hosts that resolved at start (see "Computer-use tools" below), and only then are `--network bridge` and `NET_ADMIN` added so the domain filter can install its default-deny egress rule (loopback limited to 127.0.0.1 / ::1, Docker's resolver 127.0.0.11 rejected); if it cannot install the rule while a non-loopback route exists the container refuses to start, never running with unfiltered egress; screenshots are masked fail-closed: password inputs, `.credit-card` and `[data-sensitive]` elements are painted black, and if the in-container detection helper fails the whole screenshot is masked; the whole screenshot is also masked when the focused window's title carries a credential marker or cannot be read (command error, timeout, non-zero exit, non-UTF-8); browser UI outside the page, cross-origin iframes and shadow DOM are not detected); (d) one-shot Discovery attempt/evaluator containers
+- **Layer 6**: CONTRACT.toml — `[boundaries] must_not` is matched against every outgoing channel reply and a match blocks the reply and writes an audit event; `must_always` and `max_tool_calls_per_turn` are injected into the system prompt as instructions, not enforced at runtime (see [docs/spec/contract-toml-spec.md](docs/spec/contract-toml-spec.md))
+- **Layer 7**: Audit Log — append-only JSONL: `security_audit.jsonl` for security events and `tool_calls.jsonl` for every tool call, with secrets masked
 
-For full architecture details, see [docs/CLAUDE.md](docs/CLAUDE.md).
+For full details, see [docs/features/05-security-defense.md](docs/features/05-security-defense.md) and [docs/architecture/overview.md](docs/architecture/overview.md).
+
+### Computer-use tools: the internal route and the site allowlist
+
+The eight `computer_*` MCP tools run in the per-agent `duduclaw mcp-server` process, which owns no container. Each call is forwarded to the gateway as `POST /api/internal/computer-use`, and the gateway owns the session and runs every check. Details: [docs/features/08-browser-automation.md](docs/features/08-browser-automation.md).
+
+**How the route authenticates its caller.** Every check is required and fails closed, and every failure returns the same `unauthorized` answer:
+
+1. The TCP peer must be a loopback address (the connection's own address; forwarded headers are not read).
+2. The request carries `X-Duduclaw-Agent-Id`, `X-Duduclaw-Timestamp` (unix seconds), `X-Duduclaw-Nonce` (16 random bytes as 32 lowercase hex characters) and `X-Duduclaw-Signature`: HMAC-SHA256, keyed with the gateway-internal MCP key, over the agent id, that agent's identity token, the timestamp, the nonce and the SHA-256 of the body. The gateway derives the agent token itself from `~/.duduclaw/identity.key` (missing file: refused), tries every currently valid internal key, and compares in constant time. Neither the key nor the token is sent, so a process that binds the port while the gateway is down learns nothing reusable. `Authorization` is ignored on this route.
+3. The timestamp must be within 60 seconds of the gateway's clock.
+4. A nonce seen in the last 120 seconds is refused (replay).
+
+On top of that: 120 requests per agent per minute and a 64 KiB body cap. Known limit, the same as for the identity token: a process running as the same OS user can read `identity.key` and the internal key.
+
+**What the gateway checks again.** Because the route can be called without passing through the MCP dispatcher, the gateway re-applies the calling agent's `denied_tools` / `allowed_tools`, `scoped_tools` grants and the three approval lists (`approval_required_tools`, `irreversible_tools`, `maybe_irreversible_tools`, the last one always asked, with no model judge) for every operation. One session per agent; ephemeral agents are refused, and so is `[capabilities] computer_use_mode = "native"` (the host-desktop mode was removed together with the chat-triggered loop; the `computer_*` tools are the only computer-use path). High-risk actions need a person to confirm them in the chat the agent's current turn is answering; the gateway takes that chat from its own record of live turns, never from the request, and refuses the action when there is none (unless the operator set `auto_confirm_trusted = true`). Typed text never reaches an approval text, a confirmation prompt or an audit row; only its character count does.
+
+**The site allowlist.** `agent.toml [capabilities.computer_use_config] allowed_domains` lists exact hostnames (no wildcards, no IP addresses, at most 20). With none, the session container runs with `--network=none`. Otherwise the gateway resolves each host at session start, skips any host whose answer contains a non-public address or no IPv4 address, pins each remaining address into the container with `--add-host`, and passes the address set to the container's egress filter: outgoing traffic is dropped by default, only TCP 443 to the pinned addresses is allowed, and DNS is refused. `computer_navigate` accepts only `https://`, no user name or password, port absent or 443, and a host that is exactly one of the session's resolved hosts. The kiosk browser has no address bar, so this tool is the only way to open a page. The URL is validated before any approval is requested, the approval text names only the validated host, and the URL reaches the in-container helper on stdin, never in a process argument list.
+
+**Inside the container.** Loopback traffic is limited to `127.0.0.1` and `::1`, and Docker's embedded resolver `127.0.0.11` is rejected, so DNS cannot be used as an exfiltration channel even on a user-defined Docker network. Chromium runs under a managed policy (`container/scripts/chromium-policy.json`): pages cannot request local-network or loopback access, so a page cannot reach the DevTools port; incognito, guest windows, file dialogs, printing and downloads are off; `file://`, `chrome://`, `devtools://`, `view-source:` and `javascript://` URLs are blocked. The masking and navigation helpers run their JavaScript in an isolated world, so a page cannot redefine the DOM functions they read. Known limits: `ctrl+n` still opens an ordinary window with an address bar (network reach is unchanged; screenshots are fully masked while more than one page is visible), and a root process started through `docker exec` still holds the container's `NET_ADMIN`, because only the entrypoint's own process tree drops it; the gateway is the only party that execs into the container.
+
+Residual risks the operator accepts by adding a site:
+
+- An allowlisted site receives anything the AI types or submits on it.
+- A site that proxies or redirects through its own domain can relay content from or to elsewhere.
+- Addresses are pinned at session start; a site whose address changes during the session stops working until a new session starts.
+- The allowlist is per agent and covers tool-driven sessions only.
+
+### Outbound address check (fixed in v1.67.0)
+
+Every outbound SSRF gate now classifies addresses with one function, `duduclaw_core::net_addr::is_public_ip`: `web_fetch_cached`, `web_extract`, media downloads, the resident-sensing sources, the relay URL check, MCP server import, the skills RPC, the Odoo URL check, the wiki-federation peer check and computer-use pinning.
+
+**Released versions are affected.** The check used by the web tools and the gateway's other `web_fetch`-based gates knew only `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `0.0.0.0`, `::1` and `fc00::/7`. Anything else was treated as public, so an IPv4-mapped address such as `http://[::ffff:127.0.0.1]:PORT/` passed it and reached loopback, and so did NAT64 and 6to4 forms of internal addresses. Newly refused: IPv4 `0.0.0.0/8`, `100.64.0.0/10`, `192.0.0.0/24`, `192.0.2.0/24`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4`; IPv6 everything outside global unicast `2000::/3`, plus Teredo `2001::/32`, `2001:db8::/32` and `3fff::/20`. IPv4-mapped (`::ffff:0:0/96`), NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) addresses are judged by the IPv4 address inside them; IPv4-compatible `::/96` and local-use NAT64 `64:ff9b:1::/48` are refused as a class. The Odoo URL check already covered the private, loopback, link-local, CGNAT and broadcast IPv4 ranges and the IPv4-mapped, link-local and unique-local IPv6 forms; it now also refuses the documentation, benchmarking, `192.0.0.0/24`, `0.0.0.0/8`, multicast and reserved ranges and the IPv6 forms listed above. The wiki-federation peer check now classifies an IP-literal peer with the same function before its string patterns.
+
+### Removed employees' names are reserved against AI callers (fixed in v1.67.0)
+
+An AI employee that supervises others could `agent_remove` a subordinate and then `create_agent` the same name, getting a seat with the same name but without the controls the operator had set on the old one (`CONTRACT.toml`, `[capabilities]` restrictions, the sandbox setting). `agent_remove` moves the employee to `~/.duduclaw/agents/_trash/<id>_<14-digit timestamp>`, and now, when an AI caller creates an employee, the name is refused if:
+
+- `_trash/` holds an entry for that id (whole-id match),
+- `org.toml` still records the id while its directory is gone, or
+- `_trash/` exists but cannot be listed (fail closed).
+
+Every MCP caller counts as an AI caller; there is no operator exemption over MCP. The CLI scaffold path (`duduclaw agent create`, pack and expert install, `migrate-from`) applies the same rule when it detects an AI session through `DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN`, and the `agent-file-guard` hook additionally blocks a Bash `duduclaw agent create <reserved name>` and AI writes, moves and deletes under `agents/_trash/`. Refusals are audited as `agent_name_reserved` (`requested_name`, `path_kind`, `reason`) and removals as `agent_removed`. `agent_remove` no longer hands the AI the trash path or an `rm -rf` hint.
+
+Operators are not restricted: the dashboard and a human at a terminal can reuse a reserved name. Restoring or purging a removed employee means operating on `~/.duduclaw/agents/_trash/<id>_<timestamp>` by hand; the dashboard has no restore or purge control. Known gaps: for Claude, Codex and Gemini employees the CLI cannot detect an AI session from the Bash environment (their identity is in `.mcp.json`), so `pack install`, `expert install` and `migrate-from` run from such an employee's Bash are not covered; the Bash rules are heuristics an employee with Bash can defeat, so real containment is not granting Bash. Not yet tested through a running gateway.
+
+Related change: `create_agent` and `agent_remove` called over HTTP with a non-internal MCP key are now judged by that key's own client id, so the organisation-scope check applies to the real caller (previously such calls were treated as the process's default agent).
+
+### Local-address and userinfo checks (fixed in v1.67.0)
+
+- The `duduclaw-llm` MCP HTTP client accepts a plain `http://` endpoint only when the parsed host is exactly `localhost`, an address in `127.0.0.0/8`, or `::1`. Before, a prefix test let `http://localhost.evil.com` count as local.
+- The Odoo URL check parses the URL and refuses any user name or password in it. Before, `http://localhost:3000@evil.com` was treated as local and `https://user@10.0.0.1/` could hide a private address.
+
+### Approval lists were not enforced for per-agent MCP calls (fixed in v1.67.0)
+
+Before this fix, the MCP approval gate read `[capabilities]` for the literal principal `gateway-internal` (the name of the gateway's internal key) instead of the agent making the call. No agent directory has that name, so for every agent started by the gateway `approval_required_tools`, `irreversible_tools` and `maybe_irreversible_tools` had no effect on calls through its own MCP server: listed tools ran without asking. The gate now resolves the acting agent, so after upgrading, tools on those lists wait for a human decision (up to 300 seconds, no answer is a refusal). The redaction vault for those calls is keyed by the same acting agent. External API keys are unaffected.
 
 ## Binary Distribution Security
 

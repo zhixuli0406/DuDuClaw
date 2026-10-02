@@ -1,6 +1,6 @@
 # 進化スイッチ一覧：各トグルが制御するもの
 
-DuDuClawのエージェントは時間とともに自己改善できます。予測誤差を振り返り、自分自身の`SOUL.md`を書き換え、新しいスキルを合成し、活用されていない領域を探索します。これらの経路はすべてオプトイン方式で、それぞれ独立してオン・オフできます。本ガイドは、どのスイッチが何を管轄するか、そしてエージェントを完全に凍結する方法をまとめた唯一のマップです。
+DuDuClawのエージェントは時間とともに自己改善できます。予測誤差を振り返り、playbook の経験則を蓄積し（`SOUL.md` はエージェント自身からは読み取り専用です）、新しいスキルを合成し、活用されていない領域を探索します。これらの経路にはそれぞれ専用のスイッチがあります。本ガイドは、どのスイッチが何を管轄するか、そしてエージェントを完全に凍結する方法をまとめた唯一のマップです。
 
 ## マスタースイッチ
 
@@ -17,7 +17,7 @@ enabled = true   # master kill-switch (default: true)
 
 | 経路 | 何が止まるか |
 |---|---|
-| GVUセルフプレイループ | `SOUL.md`の提案が生成されず、観察期間も開かれない |
+| 進化ループ（AEE） | playbookのラウンドは実行されず、確定観察ウィンドウも開かれない |
 | Heartbeatの沈黙ブレーカー | 沈黙後の強制リフレクションを**発火しない** |
 | チャンネル予測経路 | スキルの診断／有効化／合成／卒業とGVUトリガーがすべてスキップされる |
 | サブエージェントディスパッチのリフレクション | `maybe_run_gvu`が即座に短絡して戻る |
@@ -40,7 +40,7 @@ enabled = true   # master kill-switch (default: true)
 
 値はすべての scaffold が明示的に書き込むため、トグルは `agent.toml` 上で常に見えます。既存の `agent.toml` は現状の値を保ちます（キーが無ければ `false` と読まれ、ランタイム側のフェイルクローズなゲートは変わっていません）。オプトアウトするには `gvu_enabled = false` を設定してください。
 
-同日（H3）、3つのスキル系ノブが実際に効くようになりました——それまではダッシュボードが書き込むだけで、読み手がいませんでした：
+同日（H3）、4 つのスキル系ノブが実際に効くようになりました。それまではダッシュボードが書き込むだけで、読み手がいませんでした：
 
 | ノブ | デフォルト | 制御対象 |
 |---|---|---|
@@ -60,7 +60,11 @@ enabled = true   # master kill-switch (default: true)
 gvu_cooldown_minutes = 60   # default 60; 0 disables the cooldown
 ```
 
-クールダウンはトリガーがゲートを通過した瞬間からカウントを開始します（サイクル終了時ではありません）。結果（applied／abandoned／deferred／timed_out／skipped）にかかわらず適用されます。スロットリングの対象は成功した呼び出しだけでなく、*試行された*LLM呼び出しのコストだからです。状態はメモリ上にあり、gatewayの再起動でリセットされます。
+クールダウンはトリガーがゲートを通過した瞬間からカウントを開始します（サイクル終了時ではありません）。結果（applied／abandoned／skipped）にかかわらず適用されます。スロットリングの対象は成功した呼び出しだけでなく、*試行された*LLM呼び出しのコストだからです。状態はメモリ上にあり、gatewayの再起動でリセットされます。
+
+### 障害帰属（`config.toml [evolution] fault_attribution`、デフォルト `true`）
+
+却下されたgoal-loopのラウンドが、注入済みのplaybookルールに対してカウントされる前（`harmful`の加算、シャドウ候補のスコアリング、F2bの統合ソース）に、gatewayは決定的でLLMコストゼロのルールチェーンでそのラウンドの障害側を分類します（`crates/duduclaw-gateway/src/fault_attribution.rs`）。`grader`（判定が決定的なgrounding証拠と矛盾した）、`environment`（rate limit／課金／タイムアウト／spawn失敗）、`harness`（返信がツール使用を主張しているのにネイティブのツールイベントが観測されなかった、またはケイパビリティゲートが呼び出しをブロックした）、`unknown`（観測の忠実度がない）、それ以外は`model`です。学習ループに入るのは`model`のラウンドだけで、除外されたラウンドはすべて`fault_attributed`監査イベントを書き込むため、除外が見える形で残ります。`fault_attribution = false`にすると、2026-09以前の挙動をバイト単位で復元します。根拠：arXiv:2605.22842（帰属システムが64/64件の失敗でモデルを責めた）およびarXiv:2607.28802。
 
 ### どのエンジンが動くか：AEE のみ
 
@@ -177,11 +181,11 @@ duduclaw agent unfreeze <agent-id>
 
 | キー | デフォルト | ページ |
 |---|---|---|
-| `config.toml [memory] novelty_gate` | `true` | [memory-and-knowledge.md](../memory-and-knowledge.md) — ほぼ重複した意味記憶を拒否する |
-| `config.toml [dispatch] grounding_precheck_enabled` | `true` | [goal-loop.md](../goal-loop.md) — 承認判定の前にLLMコストゼロで証拠をチェックする |
-| `config.toml [dispatch] two_stage_judge` | `true` | [goal-loop.md](../goal-loop.md) — MAV承認パネルの前に低コストな第一段階の評価器を挟む |
-| `config.toml [goal_loop] resume_on_restart` | `"pause"` | [goal-loop.md](../goal-loop.md) — gateway再起動時に進行中のゴールタスクを`needs_human`にエスカレーションする。代わりに再開させるには`"auto"`を設定。ダッシュボード：設定 → 自動化 |
-| `config.toml [task_forward_model] enabled` | `true`（v1.54 以降） | [goal-loop.md](../goal-loop.md) — タスクレベルの予測・実行・検証のワールドモデル。無効にするには `false` を設定 |
-| `config.toml [goal_loop] progress_report_minutes` | `10` | [goal-loop.md](../goal-loop.md) — クレーム済みのゴールタスクがこの分数だけ進捗シグナルを示していないとき通知する（介入はしない）。`0`で無効化 |
-| `config.toml [goal_loop] tool_streak_advisory` | `true` | [goal-loop.md](../goal-loop.md) — 1ラウンド内で同一ツール呼び出しが3/5/8回連続したとき、段階的に強まるアドバイザリを注入する。LLMコストゼロで、決してブロックしない |
-| `config.toml [dispatch] admission` | `"queue"` | [goal-loop.md](../goal-loop.md) — 容量超過の一時的なサブエージェント生成は即座に失敗する代わりに永続的なFIFOキューに入る。pre-H19の即時拒否挙動に戻すには`"fail"`を設定 |
+| `config.toml [memory] novelty_gate` | `true` | [memory-and-knowledge.md](./memory-and-knowledge.md) — ほぼ重複した意味記憶を拒否する |
+| `config.toml [dispatch] grounding_precheck_enabled` | `true` | [goal-loop.md](./goal-loop.md) — 承認判定の前にLLMコストゼロで証拠をチェックする |
+| `config.toml [dispatch] two_stage_judge` | `true` | [goal-loop.md](./goal-loop.md) — MAV承認パネルの前に低コストな第一段階の評価器を挟む |
+| `config.toml [goal_loop] resume_on_restart` | `"pause"` | [goal-loop.md](./goal-loop.md) — gateway再起動時に進行中のゴールタスクを`needs_human`にエスカレーションする。代わりに再開させるには`"auto"`を設定。ダッシュボード：設定 → 自動化 |
+| `config.toml [task_forward_model] enabled` | `true`（v1.54 以降） | [goal-loop.md](./goal-loop.md) — タスクレベルの予測・実行・検証のワールドモデル。無効にするには `false` を設定 |
+| `config.toml [goal_loop] progress_report_minutes` | `10` | [goal-loop.md](./goal-loop.md) — クレーム済みのゴールタスクがこの分数だけ進捗シグナルを示していないとき通知する（介入はしない）。`0`で無効化 |
+| `config.toml [goal_loop] tool_streak_advisory` | `true` | [goal-loop.md](./goal-loop.md) — 1ラウンド内で同一ツール呼び出しが3/5/8回連続したとき、段階的に強まるアドバイザリを注入する。LLMコストゼロで、決してブロックしない |
+| `config.toml [dispatch] admission` | `"queue"` | [goal-loop.md](./goal-loop.md) — 容量超過の一時的なサブエージェント生成は即座に失敗する代わりに永続的なFIFOキューに入る。pre-H19の即時拒否挙動に戻すには`"fail"`を設定 |

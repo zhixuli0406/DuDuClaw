@@ -1,9 +1,9 @@
 # Evolution switches — what each toggle controls
 
 DuDuClaw agents can improve themselves over time: reflecting on prediction
-errors, rewriting their own `SOUL.md`, synthesising new skills, and exploring
-underused domains. Every one of those paths is opt-in and independently
-switchable. This guide is the single map of which switch governs what, and how
+errors, accumulating playbook rules (their `SOUL.md` is read-only to them),
+synthesising new skills, and exploring underused domains. Each of those paths
+has its own switch. This guide is the single map of which switch governs what, and how
 to freeze an agent completely.
 
 ## The master switch
@@ -60,8 +60,8 @@ visible in `agent.toml` rather than an absent key. An agent whose
 still reads as `false` — the runtime gate is unchanged and fail-closed).
 Set `gvu_enabled = false` to opt an agent out.
 
-Three per-agent skill-lifecycle knobs became live on the same date (H3) —
-before it they were written by the dashboard and read by nobody:
+Four per-agent skill-lifecycle knobs became live on the same date (H3).
+Before it they were written by the dashboard and read by nobody:
 
 | Knob | Default | Controls |
 |---|---|---|

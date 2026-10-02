@@ -175,6 +175,13 @@ fetchmail、isync、procmail、あるいはローカルMTAからの転送を受�
   とはコストの発生する判断なので、ホームごとにオプトインが必要です
   (`[mail] auto_trigger`)。オンにしていても、フラグが立てられた到着メー
   ルがトリガーされることはありません。
+- **サンドボックスを有効にした従業員はメールで起動されない。**
+  `agent.toml [container] sandbox_enabled = true` の従業員では到着即トリガー
+  がスキップされます。トリガーされた実行は[タスクサンドボックス](../../guides/ja-JP/task-sandbox.md)
+  にないプラットフォームツールに依存し、信頼できない受信内容を扱うためです。
+  メールは人が対応できるよう受信箱に残り、何も実行されません。gateway は監査
+  イベント `task_sandbox_not_applied`（`path = "mail"`、`action = "skipped"`）
+  を従業員ごと・プロセスごとに 1 回書きます。
 - **許可リストは常に完全一致/ドメイン一致で、部分文字列マッチは行わな
   い。** `allowed_senders` / `allowed_recipients`の各エントリは、完全なア
   ドレスか`@domain.com`形式のドメインプレフィックスのいずれかです。許可

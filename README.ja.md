@@ -8,7 +8,7 @@
 
 DuDuClaw は、Claude Code・Codex・Gemini などの AI コマンドラインツールを、Telegram・LINE・Discord をはじめとする 11 のメッセージングアプリに常駐し、納品前には独立した判定役の検証を通過し、使った費用を一円単位で記録する AI社員に変えます。
 
-必要なのは Rust バイナリ 1 つだけ。チャネルルーティング、会話メモリ、マルチアカウントローテーション、行動ガードレール、ローカル推論、Web ダッシュボードをすべて内蔵。AI の頭脳は Claude・Codex・Gemini・Antigravity、あるいは任意の OpenAI 互換 API へいつでも切り替えられ、設定とメモリは自分のマシンに残ります。コアは Apache 2.0 ライセンスです。
+必要なのは Rust バイナリ 1 つだけ。チャネルルーティング、会話メモリ、マルチアカウントローテーション、行動ガードレール、ローカル推論、Web ダッシュボードをすべて内蔵。AI の頭脳は Claude・Codex・Gemini(非推奨)・Antigravity、あるいは任意の OpenAI 互換 API へいつでも切り替えられ、設定とメモリは自分のマシンに残ります。コアは Apache 2.0 ライセンスです。
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.66.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
@@ -44,7 +44,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | マルチ LLM フェイルオーバー | 手動再起動 | 4 種のローテーション戦略 + クロスプロバイダ failover |
 | LLM 切替時のコンテキスト | 消失 | 完全保持 |
 | 会話メモリと知識ベース | 単発セッション | SQLite 時系列メモリ + 階層 wiki を自動注入 |
-| ツールの LLM 間共有 | ベンダーごとに書き直し | 243 MCP ツールを一度書けば 5 バックエンドで共用 |
+| ツールの LLM 間共有 | ベンダーごとに書き直し | 249 MCP ツールを一度書けば 5 バックエンドで共用 |
 | ガードレール / 監査 / 秘密情報管理 | 自作 | ポリシーカーネル + OS サンドボックス + AES-256-GCM 内蔵 |
 | 顧客に渡す一台まるごとの専用機 | Linux を自分で入れ、更新と改ざん対策も自前 | DuDuClaw OS イメージ:A/B アップデートとロールバック + 読み取り専用ルート、電源を入れるだけ;人と AI がデスクトップを共用しても日常利用の邪魔をしない |
 
@@ -55,14 +55,14 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 AI ランタイムが頭脳、DuDuClaw が配管、その間を MCP(JSON-RPC 2.0)がつなぎます。頭脳は差し替え可能、配管はそのまま:
 
 ```
-AI Runtime (brain) — Claude Code / Codex / Gemini / Antigravity / OpenAI-compat
+AI Runtime (brain) — Claude Code / Codex / Gemini (deprecated) / Antigravity / OpenAI-compat
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 5 バックエンド自動検出、エージェントごとに設定
   ├─ Session Memory — ネイティブ --resume + 時系列メモリ + key facts + 階層 wiki
-  ├─ MCP Server — 243 ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
+  ├─ MCP Server — 249 ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
   ├─ Evolution Engine — GVU² 二重ループ進化 + 予測駆動 + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS サンドボックス + redaction vault
   ├─ Inference Engine — OpenAI 互換ローカルサーバー(llama-server / Ollama / vLLM)/ llamafile
@@ -70,7 +70,7 @@ DuDuClaw (plumbing)
   └─ Web Dashboard — React 19 SPA(32 ページ)、rust-embed でバイナリに内蔵
 ```
 
-Rust ワークスペースは 20 crate 構成:基盤の `duduclaw-core`、サービス層 `duduclaw-gateway`、統一 API 層 `duduclaw-llm`、ローカル推論 `duduclaw-inference`、認知メモリ `duduclaw-memory`、セキュリティ層 `duduclaw-security` など。全体設計は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。
+Rust ワークスペースは 24 crate 構成:基盤の `duduclaw-core`、サービス層 `duduclaw-gateway`、統一 API 層 `duduclaw-llm`、ローカル推論 `duduclaw-inference`、認知メモリ `duduclaw-memory`、セキュリティ層 `duduclaw-security` など。全体設計は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。
 
 同じ gateway + dashboard は、マシン一台まるごとという形でも提供しています。[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) は Yocto でビルドしたアプライアンスイメージで、Yocto レイヤーとリリースパイプラインは独立したリポジトリに置き、本リポジトリの Rust ワークスペースを剪定済みスナップショットとして取り込んでいます。詳しくは下記のインストール節を参照してください。
 
@@ -80,7 +80,7 @@ Rust ワークスペースは 20 crate 構成:基盤の `duduclaw-core`、サー
 
 DuDuClaw 自体には LLM が含まれません。まず AI の頭脳を用意してください(ブラウザのセットアップウィザードで後から設定することも可能です):
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、Antigravity のいずれかを入れてログインする
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)(非推奨、v1.69.0 で削除)、Antigravity のいずれかを入れてログインする
 - 任意の OpenAI 互換プロバイダの API キーを用意する
 - あるいはローカル GGUF モデルを使う(クラウドアカウント不要)
 
@@ -169,9 +169,9 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 | 領域 | 内蔵機能 | 詳細 |
 |------|----------|------|
 | チャネル | 11 チャネル(Telegram / LINE / Discord + 音声 / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat)、エージェントごとの bot、ホット起動/停止、プラットフォーム最適レンダリング、入力中インジケータ、長時間タスクの進捗ボード | [docs/features](docs/features/README.md) |
-| マルチランタイム | Claude / Codex / Gemini / Antigravity / OpenAI-compat、自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| マルチランタイム | Claude / Codex / Gemini(非推奨、v1.69.0 で削除)/ Antigravity / OpenAI-compat、自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 統一 LLM API 層 | `duduclaw-llm` が 4 つのネイティブプロトコル(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat)を単一の正規化リクエストでカバー。8 つの OpenAI-compat プリセット(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 価格レジストリ + クロスプロバイダ fallback を内蔵 | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP サーバー | 243 ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート、外部には 7 ツールのみ公開 | [docs/api](docs/api/README.md) |
+| MCP サーバー | 249 ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート、外部には 7 ツールのみ公開 | [docs/api](docs/api/README.md) |
 | メモリ | SQLite 時系列メモリ(事実の置換チェーン)、HippoRAG-lite 知識グラフ検索(Personalized PageRank)、エビングハウス忘却曲線によるアーカイブ、エージェント横断の共有 wiki | [docs/features](docs/features/README.md) |
 | 自己進化 | GVU² 二重ループ + 予測駆動(会話の約 90% は LLM コストゼロ)、SOUL.md バージョン管理 + 24 時間観察期間つき自動ロールバック、MistakeNotebook のターン横断メモリ | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | セキュリティ | PolicyKernel reference monitor(LLM 不使用、fail-closed)、macOS Seatbelt / Linux Landlock ネイティブサンドボックス、Docker / Apple Container / WSL2 コンテナサンドボックス、secret redaction vault、CONTRACT.toml 行動契約 + レッドチーム CLI | [SECURITY.md](SECURITY.md) |
@@ -247,7 +247,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | 言語 | Rust | TypeScript | Rust | Python |
 | チャネル | 11 | 25+ | 8 | 0(API)|
 | マルチランタイム | 5 バックエンド | 単一 | 単一 | マルチ LLM |
-| MCP サーバー | 243 ツール | なし | なし | なし |
+| MCP サーバー | 249 ツール | なし | なし | なし |
 | 自己進化エンジン | GVU² 二重ループ | なし | なし | なし |
 | ローカル推論 | 5 バックエンド + 信頼度ルーティング | なし | なし | なし |
 | 行動契約 | CONTRACT.toml + レッドチーム | なし | WASM サンドボックス | なし |

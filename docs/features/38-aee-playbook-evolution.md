@@ -64,16 +64,16 @@ Learning proposal (one rule)
 
 ## How to enable it
 
-Evolution learning has always been opt-in; both switches must be on:
+Both switches must be on:
 
 ```toml
 # agent.toml
 [evolution]
 enabled = true        # master switch
-gvu_enabled = true    # the learning loop itself (default false; you must turn it on explicitly)
+gvu_enabled = true    # the learning loop itself
 ```
 
-The default for `gvu_enabled` is now `false` (this release fixed a long-standing configuration contradiction — config files produced by the templates could say `= true` while the runtime often treated the value as `false`, and the two sides disagreed). If you relied on the old behavior where omitting the key auto-enabled the loop, turn it on explicitly after upgrading.
+Agents created through onboarding, the industry-template wizard or the `create_agent` tool get `gvu_enabled = true` written into their `agent.toml` (since 2026-09-29). The runtime gate itself is unchanged: a missing or malformed key reads as `false`, so an `agent.toml` written by hand, or created before that date without the line, stays off until you add it.
 
 Other common settings:
 

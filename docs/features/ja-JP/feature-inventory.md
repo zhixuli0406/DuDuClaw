@@ -97,6 +97,7 @@
 | セッション横断ユーザープロファイル | ユーザーごとの嗜好 traits(temporal supersession)→ セッション安定な `## About This User` を返信に注入。`user_profile_record` / `user_profile_get` MCP ツール |
 | GDPR エクスポート/消去 | `duduclaw gdpr export\|erase <contact>` が記憶(triple + 本文言及 + key_facts、4 テーブルのカスケード、SHA-256 仮名 tombstone)**と**セッションストア(`<channel>:<chat_id>` プレフィックス)を対象 |
 | 記憶 PPR ベンチ | `duduclaw memory bench` — P50/P95 レイテンシ + パーティション推奨(LightRAG 計測ゲート) |
+| Custom Dashboard Widgets | サンドボックス化されたランタイムで動作する、AI ガイドまたは生 HTML のダッシュボードカード。Widget Studio での共有/インポート/エクスポート([30-custom-widgets.md](30-custom-widgets.md)) |
 | 予算サーキットブレーカー | エージェント単位のスライディングウィンドウ上限(`[budget] daily_cap_cents`)。上限到達で choke-point にて LLM 呼び出しを遮断。`budget_events.jsonl` |
 | バーンレート異常検知 | エージェントごとの日次支出に対し移動平均+標準偏差で外れ値を検出(`cost_anomaly.rs`) |
 | 監査エクスポート + SIEM sink | `duduclaw audit` — JSONL 監査ログを正規化し NDJSON / webhook へストリーム |
@@ -117,7 +118,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| マルチランタイム AI エージェントプラットフォーム | 統一 `AgentRuntime` trait — Claude / Codex / Gemini / Antigravity (`agy`) / OpenAI-compat 5 バックエンド自動検出 |
+| マルチランタイム AI エージェントプラットフォーム | 統一 `AgentRuntime` trait — Claude / Codex / Gemini（非推奨）/ Antigravity (`agy`) / Grok (`grok`) / OpenAI-compat 6 バックエンド自動検出 |
 | MCP Server（JSON-RPC 2.0）| stdin/stdout 経由で AI Runtime に 80+ ツールを公開。`<agent>/.mcp.json` に登録（Claude CLI `-p` はプロジェクトレベルのみ読取）、起動時に自動生成/修復 |
 | ACP/A2A Server | 2 コマンド：`duduclaw acp` — IDE agent panel 向け Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` ストリーミング、未設定時は `AUTH_REQUIRED`）；`duduclaw acp-server` — A2A プロトコル（`agent/discover` / `message/send` / `tasks/*`、`.well-known/agent.json` AgentCard） |
 | エージェントディレクトリ構造 | `.claude/`, `.mcp.json`, `SOUL.md`, `CLAUDE.md`, `CONTRACT.toml`, `agent.toml`, `wiki/`, `SKILLS/`, `memory/`, `tasks/`, `state/` |
@@ -135,8 +136,9 @@
 |------|------|
 | Claude Runtime | Claude Code SDK (`claude` CLI) + JSONL ストリーミング + `--resume` ネイティブマルチターン |
 | Codex Runtime | OpenAI Codex CLI + `--json` ストリーミング、`AGENTS.md` で system prompt を渡す |
-| Gemini Runtime | Google Gemini CLI + `--output-format stream-json`、`GEMINI_SYSTEM_MD` env で system prompt、`--approval-mode yolo`。Google が 2026-06-18 に個人向け Gemini CLI を廃止後、有料 `GEMINI_API_KEY` 利用者向けに維持 |
-| Antigravity Runtime（v1.24.0）| Google Antigravity CLI（`agy`、2026-06-18 の Gemini CLI 後継）、ワンショット `agy -p --dangerously-skip-permissions --print-timeout 300s` で駆動。バイナリ自動解決（PATH → `~/.local/bin/agy`）；`--system` フラグがないため system prompt + 履歴をプロンプトに埋め込み（CJK セーフ）；認証 `ANTIGRAVITY_API_KEY`；エージェントのディレクトリを agy の `trustedWorkspaces` に事前登録（クロスプロセスロック）し、ヘッドレスの信頼ダイアログでのハングを回避；トークン使用量は推定（print モードは統計なし）|
+| Gemini Runtime（v1.67.0 で非推奨、v1.69.0 で削除予定。Antigravity を使用）| Google Gemini CLI + `--output-format stream-json`、`GEMINI_SYSTEM_MD` env で system prompt、`--approval-mode yolo`。Google が 2026-06-18 に個人向け Gemini CLI を廃止後、有料 `GEMINI_API_KEY` 利用者向けに維持 |
+| Antigravity Runtime（v1.24.0）| Google Antigravity CLI（`agy`、2026-06-18 の Gemini CLI 後継）、ワンショット `agy -p --dangerously-skip-permissions --print-timeout 300s` で駆動。バイナリ自動解決（PATH → `~/.local/bin/agy`）；`--system` フラグがないため system prompt + 履歴をプロンプトに埋め込み（CJK セーフ）；認証は Google サインイン（ホストのターミナルで `agy` を実行）または API キーモード（`config.toml [antigravity] auth = "api_key"` + Gemini API キー）；MCP ツールは各エージェントのワークスペースの `.agents/mcp_config.json` に登録；エージェントのディレクトリを agy の `trustedWorkspaces` に事前登録（クロスプロセスロック）し、ヘッドレスの信頼ダイアログでのハングを回避；トークン使用量は推定（print モードは統計なし）|
+| Grok Runtime（R4）| xAI Grok CLI(「Grok Build」)。oneshot の `grok -p` で駆動(2026-07-13 に docs.x.ai と照合して検証)。バイナリは `grok`(curl でインストール。サードパーティの `grok-cli` はフォールバック探索)。`--model` でモデル選択。`--tools`/`--disallowed-tools` による制限(+ `native_sandbox` のハードゲート)。system prompt と履歴はプロンプトに埋め込み(CJK-safe)。duduclaw MCP server は `[mcp_servers.duduclaw]` の TOML として agent ごとの `<agent_dir>/.grok/config.toml` に書き込み(+ agent の識別情報は spawn env で引き継ぎ)。認証は `XAI_API_KEY` env。トークン使用量は推定(プレーン stdout)。**未解決項目**(実機 CLI が必要):`--tools` リストの区切り文字、`mcp_servers` 用のプロジェクトローカル `config.toml` 探索、実使用量のための `--output-format json` スキーマ、完全な `--model` 一覧(`grok models`)。ドキュメントで確認済みなのは `grok-4.5` / `grok-build-0.1` のみ |
 | OpenAI 互換 Runtime | HTTP エンドポイント（MiniMax / DeepSeek 等）REST API |
 | RuntimeRegistry | インストール済み CLI の自動検出、per-agent `[runtime]` 設定 |
 | クロスプロバイダーフェイルオーバー | `FailoverManager` ヘルス追跡、クールダウン、再試行不可エラー検出 |
@@ -153,7 +155,7 @@
 | Snowball Recap | 各ターンの user message 先頭に `<task_recap>` を付加、LLM コストゼロ |
 | Clarification 累積 | エージェントの質問 + ユーザー回答 → pinned instructions に追加（≤1000 文字） |
 | P2 Key-Fact Accumulator | 実質的なターン毎に 2-4 事実 → `key_facts` FTS5 テーブル → top-3 注入（~100-150 tokens vs MemGPT 6,500、−87%） |
-| CLI 軽量パス | `call_claude_cli_lightweight()` — 25-40% コスト削減 |
+| CLI 軽量パス | `call_claude_cli_lightweight()` — `--effort medium --max-turns 1 --no-session-persistence --tools ""`、25-40% コスト削減 |
 | 安定化フラグ | `--strict-mcp-config` + `--exclude-dynamic-system-prompt-sections`（10-15% token 削減）；`--bare` は v1.8.11 で削除（OAuth キーチェーンを破壊） |
 | CJK セーフ文字列スライス | `duduclaw_core::truncate_bytes` / `truncate_chars` が 31 箇所の unsafe byte-index スライスを置換 |
 
@@ -262,10 +264,10 @@
 
 | 機能 | 説明 |
 |------|------|
-| `agent-file-guard` PreToolUse フック | `duduclaw hook agent-file-guard`（Rust サブコマンド、matcher `Write\|Edit\|MultiEdit\|Bash`、`agent_hook_installer` がエージェント毎に導入）——正規ツリー外のエージェント構造ファイル、自分の SOUL.md への書き込み、他エージェントへの書き込みをブロック |
+| `agent-file-guard` PreToolUse フック | `duduclaw hook agent-file-guard`（Rust サブコマンド、matcher `Write\|Edit\|MultiEdit\|Bash`、`agent_hook_installer` がエージェント毎に導入）——正規ツリー外のエージェント構造ファイル、自分の SOUL.md と CONTRACT.toml への書き込み、他エージェントへの書き込みをブロック |
 | `org_field_guard` | 同じフック内のフィールド単位の凍結：`[agent] reports_to`／`department`／`name`、`[capabilities]` テーブル全体、`config.toml [delegation]`／`[acp]`。パース不能・書き込み意図の再構成不能はいずれも fail-closed |
 | `data-file-guard` PreToolUse フック | `duduclaw hook data-file-guard`（RFC-23 §14.4、H10 2026-09 から Rust サブコマンド、matcher `Read\|Bash`）。匿名化が有効なときだけ武装。サンドボックスではなく `Bash` のファイル名ヒューリスティック |
-| Ed25519 認証 | チャレンジレスポンス WebSocket 認証 |
+| ダッシュボード認証 | JWT アカウントログイン（Argon2id パスワード、`users.db`）または gateway の管理者トークン。以前の Ed25519 チャレンジレスポンスの経路は削除されました。どの設定からも有効にできないものでした |
 | AES-256-GCM | API キーの保存時暗号化、per-agent 隔離 |
 | Prompt Injection スキャナ | `input_guard` — 7 ルールカテゴリ、ブロック閾値 60、NFKC 正規化、英語＋zh-TW パターン、XML 区切りタグ保護 |
 | SOUL.md ドリフト検出 | SHA-256 フィンガープリント比較 |
@@ -275,10 +277,10 @@
 | JSONL 監査ログ | 非同期書込、Rust `AuditEvent` スキーマ互換 |
 | Unicode 正規化 | NFKC で同形異字攻撃を検出 |
 | Action Claim Verifier | ツール実行クレームの署名検証 |
-| コンテナサンドボックス | Docker (Bollard) / Apple Container / WSL2 — `--network=none`、tmpfs、read-only rootfs、512MB 上限 |
+| コンテナサンドボックス | 独立した 2 つのパス。タスクサンドボックス（`agent.toml [container] sandbox_enabled`）：Docker のみ。委任されたタスクの AI CLI を読み取り専用・非 root・リソース制限付きのコンテナで実行し、使えないときは隔離なしにせずタスクを失敗させる（[ガイド](../../guides/ja-JP/task-sandbox.md)）。スクリプトサンドボックス（PTC `execute_program`、`duduclaw secaudit` の PoC ステップ）：Docker（Windows ではまず WSL2）、`--network=none`、読み取り専用ルート、マウントは読み取り専用の専用スクリプトディレクトリのみ。サンドボックスが使えないとき PTC は実行しない（`script_when_unavailable = "run_unsandboxed"` の場合を除く） |
 | シークレット漏洩スキャナ | 20+ パターン（Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URL 等） |
 | 機密データのリダクション（RFC-23、v1.14.0）| `duduclaw-redaction` crate — 内部データ（Odoo / shared wiki / file tools）を `<REDACT:CATEGORY:hash8>` トークンに置換してから LLM へ送り、信頼境界（user channel reply、許可リストツールの egress）で自動復元；AES-256-GCM SQLite vault（per-agent 32-byte key、0o600）、TTL 7d の 2 段階 GC、5 つの組み込みプロファイル、5 層の enable/disable リゾルバ、JSONL 監査ログ 10MB ローテーション；2026-09 にフィールド単位のルールを追加、`db_field`（Odoo `model.field` / `model.*` の糖衣構文）と汎用 `json_path` は内容のパターン照合ではなく該当フィールドの値そのものをトークン化する。`duduclaw redaction verify` の JSON モードで実際に効くことを検証できる；`db_field` は元々 Odoo 専用に固定されたテーブルしか持たなかったが、2026-09 に任意の MCP ツールが紐付けられる `[redaction.data_sources.*]` レジストリへ一般化され、リダクションの適用範囲も DuDuClaw 自身の MCP server の外へ初めて広がった（詳細は次の行）|
-| データソースとネイティブ DB コネクタ（2026-09）| `[redaction.data_sources.<name>]` レジストリ（`tools`、`table_arg`/`table`、`record_paths`、`key_alias`）により、`db_field` ルールの `source` が組み込みの `odoo` 以外の任意のツール由来データソースを指せるようになった；`duduclaw mcp-proxy`（spawn 時の `.mcp.json` 書き換え）は顧客自身が用意した外部 stdio MCP server を、DuDuClaw 自身の MCP server と同じ egress／結果リダクションの経路に通す。openai-compat の直接 API ツールループには `ToolInterceptor` フックが同じ役割をインプロセスで果たす。HTTP/SSE の MCP server と codex／gemini／antigravity ランタイムはまだ対象外；新設の読み取り専用 `duduclaw-db` crate（sqlx：PostgreSQL／MySQL／SQLite、3 層の読み取り専用保証）は 4 つの MCP ツール（`db_sources`／`db_tables`／`db_select`／`db_query`、`db_query` は `allowed_tables = ["*"]` のときのみ許可）を提供し、`Scope::DbRead`（`db:read`）とデフォルト拒否のエージェント単位 `[capabilities] db_sources` 許可の二重ゲートで保護される；ダッシュボードには「データソース」（2 タブ：ツール経由／データベース接続）と「テーブル項目ルール」カードが追加され、試験実行と `[redaction]` 設定破損時の保護未起動バナーを備える；地端ファイル(2026-09)は別の穴を埋める。Claude CLI 組み込みの `Read`／`Bash` は MCP ツールではなく、これまで遮蔽の絞り込み点を一度も通っていなかった。新たに `file_read`／`csv_read`／`xlsx_read` の 3 つの MCP ツール(パスの柵、`files:read` スコープ)、内蔵の `duduclaw_files` レジストリソース(`db_field` ルールで `customers.csv.name`／`客戶清單.xlsx.地址` のように書ける)、組み込みの読み込み経路をブロックする PreToolUse フック `data-file-guard`(`[redaction] data_file_guard`、デフォルト on)を追加し、サンドボックスではなくファイル名のヒューリスティックであることを正直に明記している（[55-data-sources.md](55-data-sources.md)）|
+| データソースとネイティブ DB コネクタ（2026-09）| `[redaction.data_sources.<name>]` レジストリ（`tools`、`table_arg`/`table`、`record_paths`、`key_alias`）により、`db_field` ルールの `source` が組み込みの `odoo` 以外の任意のツール由来データソースを指せるようになった；`duduclaw mcp-proxy`（spawn 時の `.mcp.json` 書き換え）は顧客自身が用意した外部 stdio MCP server を、DuDuClaw 自身の MCP server と同じ egress／結果リダクションの経路に通す。openai-compat の直接 API ツールループには `ToolInterceptor` フックが同じ役割をインプロセスで果たす。HTTP/SSE の MCP server と codex／gemini／antigravity ランタイムはまだ対象外；新設の読み取り専用 `duduclaw-db` crate（sqlx：PostgreSQL／MySQL／SQLite、3 層の読み取り専用保証）は 4 つの MCP ツール（`db_sources`／`db_tables`／`db_select`／`db_query`、`db_query` は `allowed_tables = ["*"]` のときのみ許可）を提供し、`Scope::DbRead`（`db:read`）とデフォルト拒否のエージェント単位 `[capabilities] db_sources` 許可の二重ゲートで保護される；ダッシュボードには「データソース」（2 タブ：ツール経由／データベース接続）と「テーブル項目ルール」カードが追加され、試験実行と `[redaction]` 設定破損時の保護未起動バナーを備える；ローカルファイル(2026-09)は別の穴を埋める。Claude CLI 組み込みの `Read`／`Bash` は MCP ツールではなく、これまで遮蔽の絞り込み点を一度も通っていなかった。新たに `file_read`／`csv_read`／`xlsx_read` の 3 つの MCP ツール(パスの柵、`files:read` スコープ)、内蔵の `duduclaw_files` レジストリソース(`db_field` ルールで `customers.csv.name`／`客戶清單.xlsx.地址` のように書ける)、組み込みの読み込み経路をブロックする PreToolUse フック `data-file-guard`(`[redaction] data_file_guard`、デフォルト on)を追加し、サンドボックスではなくファイル名のヒューリスティックであることを正直に明記している；**AI 検出とカスタムルール（2026-09）**：新しい `type = "ner"` ルール種別と内蔵 `ai_pii` プロファイル(「AI スマート検出」)が、OpenAI Privacy Filter(Apache-2.0)を ONNX Runtime 経由でオンデバイス実行する(`ort` `load-dynamic`。release バイナリはランタイムをリンクせず、`redaction.model.install` が sha256 を固定してモデルとランタイムをダウンロードし、`.status`／`.cancel`／`.remove` も併設。優先度はすべての regex ルールより低く、厳密なパターンが優先される。実測の再現率は正直に公開し、regex プロファイルは第 1 層として有効のまま)；ダッシュボードで作成する**カスタムルール**(`~/.duduclaw/redaction/profiles/custom.toml`：データ種別名とキーワードリストまたはパターン、全ルール種別に対するルール単位の `enabled`、`[meta.labels]` の表示名、TOML ルールパック用の `redaction.custom_rules.*` と `redaction.profiles.import`／`.remove` RPC)、`redaction.suggest_pattern`(2〜5 件の例を貼り付けると検証済みパターンを生成。ローカル推論 → utility model → ヒューリスティックの順で、パターンを捏造することはない)、そして未保存のドラフトルールに対する `redaction.dry_run`（[55-data-sources.md](55-data-sources.md)）|
 
 ## メモリシステム
 
@@ -301,18 +303,6 @@
 | `memory_alias_add` / `memory_alias_list`（D3）| エンティティエイリアスを管理する MCP ツール — add は `alias` を `canonical` エンティティに畳み込む（scope `memory:write`）、list は `(canonical, alias)` ペアを返す（scope `memory:read`）；名前空間分離 |
 | Decision Continuity（RFC-24、v1.23.0）| エージェントが列挙式の選択肢（案 A/B/C）を提示した際、各選択肢を Temporal Memory の **semantic** 層に永続化（会話圧縮から独立）し、未決事項をターンごとに再注入；後から「案 C で」（別ターン / セッション / プロセス）と言われても推測ではなく永続状態から解決。検出は決定論的でゼロ LLM；`decision_resolve` / `decision_list` MCP ツール + ダッシュボードパネル + Prometheus カウンタ；`[memory] decision_continuity = true` でエージェント単位の opt-in（TTL `decision_ttl_days`、既定 7）|
 
-## Git Worktree 分離（v1.6.0）
-
-| 機能 | 説明 |
-|------|------|
-| L0 分離レイヤー | タスク毎の git worktree — コンテナサンドボックスより軽量、並行エージェントのファイル衝突防止 |
-| アトミックマージ | dry-run 事前チェック → abort → クリーンなら実マージ；グローバル `Mutex` 保護 |
-| Snap ワークフロー | create → execute → inspect → merge/cleanup；純粋関数の意思決定ロジック |
-| フレンドリーブランチ名 | `wt/{agent_id}/{adjective}-{noun}`、50×50 ワードリスト |
-| copy_env_files | パス走査 jail + symlink 拒否 + 1MB サイズ上限 |
-| AgentExitCode | 構造化終了コード — Success / Error / Retry / KeepAlive |
-| リソース上限 | エージェント毎 5 個、全体 20 個 |
-
 ## アカウントとコスト管理
 
 | 機能 | 説明 |
@@ -332,16 +322,17 @@
 | L1 `web_fetch_cached` | SSRF ゲート付き・ディスクキャッシュ付き HTTP GET（本文は 6 万文字で切り詰め） |
 | L2 `web_extract` | 同じ取得経路＋CSS セレクタ抽出（`text`／`html`／`json`） |
 | L3 ヘッドレス（任意・外部） | Playwright または Browserbase をエージェント毎の `.mcp.json` に MCP サーバーとして登録。バイナリには含まれず、L2 からのフォールバックもなし |
-| L5 Computer Use | 7 つの `computer_*` MCP ツールが `computer_use_orchestrator` 経由でコンテナの仮想ディスプレイを駆動 |
+| L5 Computer Use | `computer_use_orchestrator` が起動するコンテナの仮想ディスプレイ（イメージ `ghcr.io/zhixuli0406/duduclaw-computer-use:v<バージョン>`、自動 pull なし）。スタッフが 8 つの `computer_*` MCP ツール（`session_start` / `screenshot` / `click` / `type` / `key` / `scroll` / `navigate` / `session_stop`。署名付き loopback ルート経由で到達する gateway 所有のセッション、スタッフごとに 1 つ、API キー不要、ネットワークは `[capabilities.computer_use_config] allowed_domains` のホストにのみ）で駆動します。チャットで起動する gateway のループと `native` のホストデスクトップモードは削除されました |
 | 能力ゲーティング | `agent.toml [capabilities]` はデフォルト拒否（`computer_use`／`browser_via_bash`／`allowed_tools`／`denied_tools`）。`denied_tools` は `--disallowedTools` と MCP ディスパッチゲートの両方で強制 |
 
 ## コンテナサンドボックス
 
+同じ名前の下に独立した 2 つのコードパスがあります。
+
 | 機能 | 説明 |
 |------|------|
-| Docker | Bollard API、全プラットフォーム |
-| Apple Container | macOS 15+ ネイティブ |
-| WSL2 | Windows Linux サブシステム |
+| タスクサンドボックス | エージェント単位で有効化（`agent.toml [container] sandbox_enabled = true`）。委任されたタスクは Docker コンテナ内でエージェントの AI CLI として実行されます。読み取り専用ルートファイルシステム、非 root、全 capability 破棄、メモリ／プロセス／CPU 制限、使い捨ての専用ワークスペース、エージェントのディレクトリを `/agent` に読み取り専用マウント。ファイルツールとシェルツールのみで、プラットフォームの MCP ツールはありません。`network_access = true` とローカルに取得済みのイメージが必要で、Docker のみ対応。使えないときはタスクが失敗し（監査 `task_sandbox_unavailable`）、`config.toml [container.sandbox]` の `when_unavailable = "run_unsandboxed"` で隔離なし実行に戻せます。サンドボックスを有効にした従業員はチームを組まず（goal ラウンドはサンドボックス内で Solo）、メールでも起動されません。チャネル返信、cron、リマインダーなどの会話系の経路はホスト上で実行され、監査イベント `task_sandbox_not_applied` が書かれます。[タスクサンドボックスガイド](../../guides/ja-JP/task-sandbox.md)を参照 |
+| スクリプトサンドボックス | PTC `execute_program` と `duduclaw secaudit` の PoC ステップが使用。`duduclaw-container` 経由で、macOS／Linux は Docker、Windows はまず WSL2、次に Docker（WSL2 は実際の Windows ホストでは未実行）。Apple Container バックエンドは選ばれません。タスクサンドボックスと同じイメージで、自動ダウンロードなし。`--network=none`、読み取り専用ルート、2 GiB／256 プロセス／1 CPU、`/tmp` tmpfs、600 秒の絶対上限、マウントは読み取り専用の専用スクリプトディレクトリのみ。使えないとき PTC は既定で失敗し（`[container.sandbox] script_when_unavailable`）、PoC はホスト上で実行されません（[ガイド](../../guides/ja-JP/task-sandbox.md)） |
 
 ## スケジューリング
 

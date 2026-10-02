@@ -25,7 +25,7 @@ The final image ships with:
 
 - The `duduclaw` main binary (Rust, includes the dashboard)
 - `@anthropic-ai/claude-code`, `@openai/codex`, `@google/gemini-cli` (installed via `npm i -g`)
-- The `docker.io` CLI (used to call the host Docker daemon to create agent sandboxes)
+- The `docker.io` CLI (a client for the Docker daemon behind the mounted socket; used by the task sandbox when it is enabled)
 - (Optional) Python 3.12: only needed for the LLMLingua-2 prompt compressor (requires `llmlingua`); skill security scanning and channel replies are already Rust-native and no longer depend on Python
 
 ---
@@ -286,9 +286,13 @@ OPENAI_API_KEY=sk-proj-...
 
 Billed by usage, at OpenAI API pricing.
 
-### 6.3 Gemini (Google) CLI
+### 6.3 Gemini (Google) CLI (deprecated)
 
-#### Method A: Google OAuth
+> **Deprecated in v1.67.0, removed in v1.69.0.** Google stopped serving free, Google AI Pro and Google AI Ultra individual accounts through Gemini CLI on 2026-06-18, so a personal Google login no longer works with it. API-key and enterprise (Gemini Code Assist) use is unaffected. The image keeps shipping the Gemini CLI until removal. Use the Antigravity runtime (`antigravity`, binary `agy`) instead; see [Deprecations](deprecations.md#gemini-cli-runtime).
+>
+> Signing in to Antigravity through `agy` needs a terminal and an OS keyring, which a container does not have, so containers use API-key mode: set `config.toml [antigravity] auth = "api_key"` and supply the same Gemini API key (a `gemini` provider account, or `GEMINI_API_KEY` below). Antigravity keeps its settings under `~/.gemini` as well, so the `duduclaw-gemini` volume below stays in place.
+
+#### Method A: Google OAuth (Gemini Code Assist / enterprise accounts only)
 
 ```bash
 docker compose exec duduclaw bash
@@ -297,8 +301,6 @@ gemini auth
 # State is written to /home/duduclaw/.gemini/, i.e. the duduclaw-gemini volume
 exit
 ```
-
-Google currently offers a free quota for the Gemini CLI, which is fine for everyday use.
 
 #### Method B: API key fallback
 
@@ -318,8 +320,8 @@ Each agent can specify which runtime to use in its own `agent.toml`:
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-preferred = "claude"      # primary runtime: claude / codex / gemini / openai-compat
-fallback = "gemini"       # automatically switches over when Claude is unavailable
+preferred = "claude"      # primary runtime: claude / codex / antigravity / openai-compat (gemini is deprecated)
+fallback = "antigravity"  # automatically switches over when Claude is unavailable
 ```
 
 See [features/13-multi-runtime.md](../features/13-multi-runtime.md) for a full example and the failover strategy.
@@ -357,7 +359,7 @@ Plus a mounted host path:
 
 | Path | Purpose | Requirement |
 |------|------|-------|
-| `/var/run/docker.sock` | Lets the container call the host Docker daemon to create agent sandboxes | **Required**, used for container-sandbox isolated execution |
+| `/var/run/docker.sock` | Lets the container talk to the host Docker daemon | Only for the per-agent task sandbox (off by default); running the task sandbox from a containerised gateway is not covered by [task-sandbox.md](task-sandbox.md) and has not been verified |
 
 ### 7.1 Backup
 
@@ -613,9 +615,9 @@ After a restart, the startup log prints the extra origins that took effect. See
 - Check the connection status indicator for that channel under Dashboard → Channels
 - Check the logs: `docker compose logs -f duduclaw | grep -i webhook`
 
-### Container sandbox can't start a sub-agent
+### Task sandbox can't start
 
-DuDuClaw calls the host Docker daemon through `docker.sock` to create isolated containers for running agent tasks. If this fails:
+This only applies to agents with `agent.toml [container] sandbox_enabled = true`. Running the task sandbox from a gateway that itself runs in a container is not covered and has not been verified; the sandbox image must be present on the Docker daemon that the socket points to, and the sandbox is never pulled automatically (see [task-sandbox.md](task-sandbox.md)). The container-side steps below only check that the socket works:
 
 ```bash
 # Test whether the socket works from inside the container

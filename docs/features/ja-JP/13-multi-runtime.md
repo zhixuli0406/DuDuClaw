@@ -1,6 +1,6 @@
 # マルチランタイムエージェント実行
 
-> 1つのプラットフォーム、12のAIバックエンド——Claude、Codex、Gemini、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode、そしてOpenAI互換エンドポイント。
+> 1つのプラットフォームに 13 のランタイム ID：12 の CLI バックエンド（Claude、Codex、Gemini、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）と、任意の OpenAI 互換エンドポイントに HTTP で接続する `openai_compat` です。
 
 ---
 
@@ -37,8 +37,8 @@ AgentRuntime trait:
 |---|---|---|---|---|---|---|
 | Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token`（コード貼り付け） | `~/.claude/.credentials.json` |
 | OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login`（localhost コールバック） | `~/.codex/auth.json` |
-| Gemini CLI | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login`（localhost コールバック） | `~/.gemini/oauth_creds.json` |
-| Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | text | `agy login`（localhost コールバック） | — |
+| Gemini CLI（v1.67.0 で非推奨、v1.69.0 で削除） | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login`（localhost コールバック） | `~/.gemini/oauth_creds.json` |
+| Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json（v1.2.10） | ターミナルで `agy` を実行して Google サインイン（`login` サブコマンドなし）、または API キーモード | OS keyring |
 | Grok Build | `grok` | `x.ai/cli/install.sh`（手動） | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
 | Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | なし（API キーのみ） | `~/.qwen/.env` |
 | Kimi Code | `kimi` | npm `@moonshot-ai/kimi-code` | `-p <prompt> --output-format stream-json` | jsonl | `kimi login`（デバイスコード） | `~/.kimi-code/credentials/` |
@@ -63,9 +63,11 @@ AgentRuntime trait:
 
 ### バックエンドの駆動方法
 
-5 つのバックエンドは専用のランタイム モジュールを持ちます。共有できないベンダー固有の配線——アカウント ローテーション（Claude）、各 CLI 独自形式での MCP 設定注入、ケーパビリティ→サンドボックス フラグの変換、出力が空だった場合の PTY リカバリ——があるためです。それ以外はすべて、カタログ エントリーからそのまま組み立てられる**単一の**汎用 print-mode ランタイム（`runtime/generic_cli.rs`）が駆動します：テンプレート argv でバイナリを起動し、プロンプトを引数または stdin で渡し、text / JSON / JSONL を最終応答テキストへ解析し、非ゼロ終了や認証要求のマーカーをフェイルオーバー チェーンが理解できる型付きエラーへ対応付けます。
+5 つの CLI バックエンド（`claude`、`codex`、`gemini`、`antigravity`、`grok`。`runtime/mod.rs` の `BESPOKE_RUNTIME_IDS`）は専用のランタイム モジュールを持ちます。共有できないベンダー固有の配線——アカウント ローテーション（Claude）、各 CLI 独自形式での MCP 設定注入、ケーパビリティ→サンドボックス フラグの変換、出力が空だった場合の PTY リカバリ——があるためです。それ以外はすべて、カタログ エントリーからそのまま組み立てられる**単一の**汎用 print-mode ランタイム（`runtime/generic_cli.rs`）が駆動します：テンプレート argv でバイナリを起動し、プロンプトを引数または stdin で渡し、text / JSON / JSONL を最終応答テキストへ解析し、非ゼロ終了や認証要求のマーカーをフェイルオーバー チェーンが理解できる型付きエラーへ対応付けます。残り 7 つの CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）はこの汎用ランタイムを通ります。`openai_compat` は CLI ではなく、独自の HTTP モジュール（`runtime/openai_compat.rs`）を持ちます。手書きのモジュールは合計 6 つです。
 
 ### 当初の 4 つのバックエンド
+
+以下は DuDuClaw が最初に出荷した 4 つのバックエンドです。専用モジュールを持つ残り 2 つの CLI、Antigravity と Grok は、後の各セクションで説明します。
 
 **Claude Runtime** — Claude Code CLI（`claude`）をJSONLストリーミング出力で呼び出します。ネイティブMCPツールサポート、bash実行、Web検索、ファイル操作が組み込まれた最も機能豊富なバックエンドです。
 
@@ -98,6 +100,8 @@ JSONL STDOUTイベントを解析
 ```
 
 **Gemini Runtime** — Google Gemini CLIを`--output-format stream-json`で呼び出し、構造化出力を取得します。
+
+> **v1.67.0 で非推奨、v1.69.0 で削除予定。** Google は 2026-06-18 に、個人アカウント（無料、AI Pro、AI Ultra）に対する Gemini CLI での提供を停止しました。Antigravity ランタイムをご利用ください。削除までは従来どおり動作します。Gemini API プロバイダーは影響を受けません。移行手順は[非推奨となった名称](../../guides/ja-JP/deprecations.md#gemini-cli-ランタイム)を参照してください。
 
 ```
 Agent設定：runtime = "gemini"
@@ -155,8 +159,10 @@ Registryは利用可能なバックエンドを把握
 ```toml
 [runtime]
 preferred = "claude"    # プライマリバックエンド
-fallback = "gemini"     # プライマリが利用不可時のフォールバック
+fallback = "antigravity"     # プライマリが利用不可時のフォールバック
 ```
+
+優先設定がない場合、Registryは最初に利用可能なバックエンドを使用します。
 
 ### Per-Agent設定
 
@@ -165,9 +171,81 @@ fallback = "gemini"     # プライマリが利用不可時のフォールバッ
 ```
 Agent "dudu"（カスタマーサポート）→ Claude（最高の推論能力）
 Agent "coder"（コード生成）    → Codex（コードに最適化）
-Agent "analyst"（データ分析）   → Gemini（大規模コンテキストウィンドウ）
+Agent "analyst"（データ分析）   → Antigravity
 Agent "local"（プライバシー重視）→ OpenAI互換（ローカルエンドポイント）
 ```
+
+つまり、単一のDuDuClawインストールで複数のAIプロバイダーにまたがるエージェントを統括でき、それぞれがタスクに最適なバックエンドを使えます。
+
+---
+
+## Effort
+
+最近の推論モデルには、モデルの選択とは別に**深さ**のダイヤルがあります。この 1 回の呼び出しでどれだけ深く考えるか、という設定です。ベンダーごとに書き方が異なり、受け付ける値も同じではありません。DuDuClaw はこれを 1 つの設定にまとめ、変換を引き受けます。
+
+エージェントに設定します。
+
+```toml
+# <home>/agents/<id>/agent.toml
+[model]
+preferred = "claude-opus-5"
+effort    = "high"          # low | medium | high | xhigh | max
+```
+
+未設定がデフォルトで、*フラグを一切渡さない*ことを意味します。spawn の内容はこの機能のない DuDuClaw とバイト単位で同一で、プロバイダー自身のデフォルトの深さが適用されます。
+
+### ランタイムごとのフラグ対応
+
+インストール済みのバイナリに対して 2026-09-24 に実測した結果です（`research/multi-model-routing-2026-09/17-P0-cli-flag-probe.md` §4 + §6）。ドキュメントからの推測ではありません。
+
+| ランタイム | 実測バージョン | effort の表現方法 | CLI が受け付ける値 |
+|---|---|---|---|
+| `claude` | 2.1.258 | `--effort <v>` | `low` `medium` `high` `xhigh` `max` |
+| `codex` | 0.156.1 | `-c model_reasoning_effort=<v>`（設定オーバーライド、専用フラグなし） | `low` `medium` `high` `xhigh` |
+| `antigravity`（`agy`） | 1.2.10 | `--effort <v>` | `low` `medium` `high` |
+| `grok` | 1.0.41 | `--reasoning-effort <v>`（別名 `--effort`） | *`--help` では列挙されていません* |
+| `gemini` | — | **フラグが存在しません**。debug ログに記録して無視します | — |
+| `openai_compat` | — | リクエストボディの `reasoning_effort` | `low` `medium` `high` |
+
+### クランプ表
+
+受け付ける値の集合が異なるため、設定値は対象ランタイムが受け付ける値まで**下方向に**クランプされます。黙って捨てられることも、CLI が拒否する値が送られることもありません。
+
+| 設定値 | claude | codex | antigravity | grok | openai_compat | gemini |
+|---|---|---|---|---|---|---|
+| `low` | `low` | `low` | `low` | `low` | `low` | — |
+| `medium` | `medium` | `medium` | `medium` | `medium` | `medium` | — |
+| `high` | `high` | `high` | `high` | `high` | `high` | — |
+| `xhigh` | `xhigh` | `xhigh` | **`high`** | **`high`** | **`high`** | — |
+| `max` | `max` | **`xhigh`** | **`high`** | **`high`** | **`high`** | — |
+
+Grok を意図的に `high` で頭打ちにしているのは、`--help` がフラグ名には触れていても値を列挙していないためです。`xhigh`/`max` を渡すと "unexpected value" で spawn 全体が落ちるおそれがあります。`openai_compat` も、8 つの異質なプリセットにまたがるため同じ理由で上限を設けています。どちらの上限も 1 か所（`duduclaw-core/src/effort.rs`）にあり、実機での動作確認が取れた時点で引き上げられます。
+
+### Direct-API の対応
+
+API レベルの経路（`duduclaw-llm`）は、同じ値を各ベンダーのネイティブなフィールドへ載せます。
+
+| プロトコル | フィールド |
+|---|---|
+| Anthropic Messages | `output_config.effort`（GA、beta ヘッダー不要） |
+| OpenAI Responses | `reasoning.effort` |
+| OpenAI-compat chat/completions | `reasoning_effort`（トップレベル） |
+| Gemini `generateContent` | `generationConfig.thinkingConfig.thinkingLevel`。**未検証**、下記参照 |
+
+> Gemini のキーは、**確認が取れていない**唯一の対応です。入れ物としての `thinkingConfig` は検証済みで（既存の `thinkingBudget` が使っていて、すでに出荷されています）、同じ階層の `thinkingLevel` キーは確認できませんでした。ai.google.dev を 2 回取得しましたが、どちらも `GenerationConfig` のリファレンスが途中で切れていて、このキーに触れていませんでした。Interactions API では `generation_config.thinking_level` と書かれているため、`generateContent` 側の camelCase 版は推測です。フィールドが設定されたときだけ送られるので、effort が未設定ならこのキーが送られることはありません。頼る前に再検証してください。
+
+### コストとキャッシュ
+
+引き上げる前に知っておくことが 2 つあります。
+
+- **effort はトークンを消費します。** キャッシュやプロンプトの整理といった無料の改善の次に来る、品質とコストを交換する最初のレバーで、範囲の最上位は本当に難しい作業でだけ元が取れます。コーディングや長時間のエージェントタスクでは効果が大きく、チャット、分類、大量処理のルートでは `low` で十分なことが多くあります。
+- **会話の途中で effort を変えると、多くのモデルでプロンプトキャッシュが無効になります。** effort はキャッシュされるプレフィックスの一部になるためです。エージェントごとに値を 1 つ決めたらそのままにし、ターンごとに調整しないでください。
+
+effort を意図的にエージェント主導にしていない場所が 1 つあります。軽量な抽出経路（セッション圧縮、GVU、wiki 取り込み）で、`medium` に固定されています。機械的な抽出が、会話エージェントを `max` に上げたせいで高くなるべきではないからです。
+
+### PTY プール
+
+*（2026-09 に削除。）* 以前、effort は PTY プールの**セッションキャッシュキー**の一部で、異なる effort を求める 2 つの呼び出しには、別々のプール済みセッションが割り当てられていました。プールはなくなり、すべての spawn が自分自身の `--effort` フラグを持ちます。
 
 ---
 
@@ -180,16 +258,21 @@ Claude runtime：レート制限中（クールダウン：2分）
      |
      v
 FailoverManagerがagent設定を確認：
-  fallback = "gemini"
+  fallback = "antigravity"
      |
      v
-Gemini runtimeにルーティング
+Antigravity runtimeにルーティング
      |
      v
 Claudeクールダウン完了 → プライマリルーティングを復元
 ```
 
-フェイルオーバーはユーザーに透過的です——どのバックエンドが処理しても、ユーザーはレスポンスを受け取ります。
+フェイルオーバーはユーザーに透過的です——どのバックエンドが処理しても、ユーザーはレスポンスを受け取ります。ヘルス状態はバックエンドごとに独立して追跡されます：
+
+- **Healthy**：通常動作
+- **Rate-Limited**：短いクールダウン（2分）
+- **Error**：指数バックオフ
+- **Non-Retryable**：手動対応が必要（認証失敗、課金）
 
 ---
 
@@ -197,24 +280,111 @@ Claudeクールダウン完了 → プライマリルーティングを復元
 
 ### ベンダーロックインなし
 
-DuDuClawは単一AIプロバイダーに賭けません。Claudeが値上げすれば、CodexやGeminiにエージェントを移行できます。
+DuDuClawは単一AIプロバイダーに賭けません。Claudeが値上げすれば、CodexやGeminiにエージェントを移行できます。Geminiが強力な新機能を追加すれば、インフラを作り直さずに採用できます。
 
 ### 各タスクに最適なツール
 
-コード生成はCodexの方が効果的かもしれません。複雑な推論はClaudeの方が強いかもしれません。Multi-Runtimeにより、正しいタスクに正しい頭脳をマッチングできます。
+コード生成はCodexの方が効果的かもしれません。複雑な推論はClaudeの方が強いかもしれません。データ分析はGeminiの大きなコンテキストウィンドウの恩恵を受けるかもしれません。Multi-Runtimeにより、正しいタスクに正しい頭脳をマッチングできます。
 
 ### レジリエンス
 
 1つのプロバイダーがダウンしても、他が稼働し続けます。ローカル推論フォールバックと組み合わせることで、DuDuClawはどの単一プロバイダーの障害にも耐えられます。
 
+### コスト最適化
+
+プロバイダーごとに料金が異なります。`LeastCost`ローテーション戦略は、クエリの種類ごとに最も価格性能比の高いプロバイダーへルーティングできます。
+
 ---
 
 ## 他システムとの連携
+
+### Codex の非対話承認（2026-09）
+
+Codex 0.156.x は、すべての MCP ツール呼び出しを承認リクエストの背後に置きます。`approval_policy=never` ではそのリクエストが自動拒否され、`mcp_servers.<id>.default_tools_approval_mode` も `projects.<cwd>.trust_level` も結果を変えません。`--approve-for-me`（自動レビュー）がサポートされている非対話の抜け道で、`-s/--sandbox` とは同時に指定できません。エージェントのディレクトリは git リポジトリではないため、`--skip-git-repo-check` を常に渡し、stdin を閉じます。
+
+**ケーパビリティのレベルごとに 1 組のフラグ**（2026-09-28 に変更。エージェントを制限する前に ReadOnly の行を読んでください）：
+
+| `[capabilities]` のレベル | Codex のフラグ | エージェントにできること |
+|---|---|---|
+| ReadOnly（書き込みツールを付与していない、またはすべて拒否） | `-s read-only -c approval_policy=never` | 読み取りと推論ができます。書き込みは**実際にブロック**されます。**すべての MCP ツール呼び出しが自動拒否**されるため、その回のエージェントは duduclaw のツールを持ちません。spawn ごとに `warn!` を 1 件出力して知らせます。 |
+| WorkspaceWrite（デフォルト） | `--approve-for-me -c approval_policy=never -c sandbox_mode="workspace-write"` | ワークスペース内に書き込めます。duduclaw の MCP ツールをすべて使えます。 |
+| FullAccess（明示的な `computer_use = true`） | `--dangerously-bypass-approvals-and-sandbox` | 制限なし。オペレーターが明示的に付与した場合のみです。 |
+
+2026-09-28 までは、ReadOnly でも `--approve-for-me` と `-c sandbox_mode="read-only"` を使っていました。これは**フェイルオープン**でした。`--approve-for-me` の自動レビューは workspace-write のサンドボックスで動くため、read-only の宣言は形だけのもので、ケーパビリティを制限したエージェントでもファイルを書けてしまいました。現在は実際に効力のあるフラグを渡しており、その代償が MCP ツールの面です。エージェントにツールを残したい場合は WorkspaceWrite を付与してください。Codex における ReadOnly は「何も変更してはならない」という意味で、ツールもそこに含まれます。
+
+### Codex の MCP 認証情報：0.157 以降は `env_vars`、それより前は `argv` にフォールバック（2026-09-28）
+
+Codex の spawn は、呼び出しごとの `-c` 設定オーバーライドで duduclaw の MCP サーバーを登録します。その登録が運ぶ値のうち 2 つは機密です。`DUDUCLAW_MCP_API_KEY` と `DUDUCLAW_AGENT_TOKEN` です。この登録（と以下の処理すべて）は ReadOnly を含むすべての Codex spawn で行われます。ReadOnly ではサーバーは登録されますが、上の表のとおり、Codex がそのサーバーへの呼び出しをすべて自動拒否します。
+
+**認証情報を環境変数に置くだけでは済まない理由。** 2026-09-28 に実機で確認し、Codex のソースとも突き合わせました。Codex はすべての stdio MCP サーバー子プロセスに `env_clear()` をかけ、11 個の名前のデフォルト許可リスト（`HOME`、`PATH`、`SHELL`、`USER`、`LOGNAME`、`TERM`、`TMPDIR`、`TZ`、`LANG`、`LC_ALL`、`__CF_USER_TEXT_ENCODING`）と、設定で宣言されたものだけを戻します。gateway 自身のプロセス環境は MCP サーバーに届かないため、`Command::env()` だけでは何も渡りません。設定チャネルが唯一のチャネルです。
+
+**DuDuClaw の現在の動作。** 設定チャネルには 2 つの形があり、その Codex バイナリが報告するバージョンから、バイナリごとに決めます。
+
+| Codex のバージョン | 認証情報の形 | `ps` に見えるもの |
+|---|---|---|
+| **≥ 0.157.0** | `-c mcp_servers.duduclaw.env_vars=["DUDUCLAW_MCP_API_KEY", "DUDUCLAW_AGENT_TOKEN"]`。値は Codex の**プロセス**環境に設定し、Codex がそこから MCP 子プロセスへコピーします | 変数の**名前**のみ |
+| **< 0.157.0**、またはバージョンを読み取れない | `-c mcp_servers.duduclaw.env.<K>="<value>"`（従来の動作） | 認証情報の**値** |
+
+認証情報ではない項目（`DUDUCLAW_HOME`、`DUDUCLAW_PORT`、`DUDUCLAW_AGENT_ID`、`DUDUCLAW_INSTANCE`）は、どちらの経路でも `env.<K>="<value>"` の形のままです。機密ではなく、設定テーブルに残しておけば、プロセス環境が将来消去されても登録は機能するからです。「認証情報」かどうかは名前の末尾の完全一致で決めます。`_API_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD`（ASCII の大文字小文字を区別しない）で、`duduclaw-core` の spawn-env 許可リストが強制するのと同じ形の規約です。
+
+**無条件ではなくバージョンで切り替える理由。** `env_vars` は `codex-cli 0.157.1` で動作を確認済みですが、このキーを受け付ける最小バージョンは未確認で、`RawMcpServerConfig` には `deny_unknown_fields` が付いています。知らないほど古い Codex では、設定の解析時に実行が落ちる（すべての spawn が失われる）か、認証情報が黙って捨てられる（エラーなしにエージェントが duduclaw のツールをすべて失う）かのどちらかです。そこで gateway はバイナリのパスごと、プロセスごとに 1 回だけ `codex --version` を実行し、`codex-cli X.Y.Z` を解析して、`0.157.0` 未満、解析不能、探査不能（spawn 失敗、非ゼロ終了、5 秒のタイムアウト）のいずれも「非対応」として扱い、`warn!` を 1 件出して従来の `argv` の形へフォールバックします。探査の失敗が spawn を失敗させることはありません。
+
+**フォールバック経路にいる場合**（古い Codex、共有またはマルチテナントのホスト）は、露出が現実のものになります。コマンドライン引数は同じホスト上のどのプロセスからも読めます（`ps -ww`、`/proc/<pid>/cmdline`）。Codex CLI を 0.157.1 以降にアップグレードすれば、設定を変えなくても認証情報が `argv` から外れます。
+
+**両方の経路に共通する緩和策。** `argv` に載せてよい env キーの集合は、既知の `DUDUCLAW_*` のブロックにテストで固定されており、新しい機密が黙って加わることはありません。すべてのキーは、展開前に素の TOML キーであることを検証され（`env_vars` 配列内の名前も含む）、すべての値は TOML のクォートが施されます。
+
+### 作業ディレクトリのオーバーライドはすべての CLI バックエンドに届く（2026-09-28）
+
+呼び出し側は、ある spawn をエージェント自身のディレクトリ以外の場所で実行するよう求められます。現在の呼び出し側はチームコンポーザー（team composer）だけで、ロールメンバーを従業員のワークスペースに置きます。こうすると、使い捨ての scaffold がメンバーの終了と同時にガベージコレクトされても、メンバーが書いたファイルは残ります。
+
+2026-09-28 までは、このリクエストに応えるのは Codex バックエンドだけでした。Gemini、Antigravity、Grok は、依頼にかかわらずエージェントのディレクトリで spawn されたため、この 3 つのいずれかで動くロールメンバーは、数秒後に削除されるディレクトリで作業していました。現在は 4 つすべてが共通のヘルパーで作業ルートを解決し、要求されたパスが実在するディレクトリかどうかも確認します。そうでなければ警告を出し、どこでもない場所へ spawn せずにエージェントのディレクトリへフォールバックします。ネイティブな OS サンドボックスも同じルートを対象にするため、書き込み権限を得るのはオーバーライドされたルートです。
+
+オーバーライドが動かすのは**作業ディレクトリだけ**です。エージェントの ID（MCP サーバーの登録、ツールが認証に使うエージェント ID、エージェント自身の設定）はエージェントのディレクトリに残ります。
+
+バックエンド固有の影響が 2 つあります。見つけてもらうのではなく、先に書いておきます。
+
+- **Antigravity** は作業ルートを事前に信頼済みにし（`agy` は対話的な「このワークスペースを信頼しますか？」のプロンプトを出し、ヘッドレス実行を止めてしまうため）、`--add-dir` として渡します。
+- **Grok** は、MCP 登録（`.grok/config.toml`）とサンドボックスプロファイル名（`.grok/sandbox.toml`）の両方を、エージェントのディレクトリではなく作業ディレクトリから解決します。そのためオーバーライドされたルートには両ファイルのコピーが置かれ、そうしなければメンバーはツールなし、解決できないサンドボックスプロファイルで spawn されます。既知の制限：この 2 つのファイルはディレクトリをキーにしているため、1 つのワークスペースを共有する 2 つの Grok ロールメンバーは、互いに宣言済みの env ブロックを上書きします。command/args の部分はメンバー間で同一で、MCP 子プロセスが実際に認証に使うのはプロセスごとの ID なので、影響範囲は宣言されたブロックだけです。
+
+### Antigravity の認証と MCP ツール（2026-10-01）
+
+`agy` には `login` サブコマンドがないため、ダッシュボードにはワンクリックのサインインがありません。認証方法は 2 つです。
+
+- **Google サインイン**：DuDuClaw が動いているホストのターミナルで `agy` を実行し、案内に従います。認証情報は OS の keyring に保存されるため、keyring やブラウザのないコンテナ・リモートホストでは使えません。
+- **API キーモード**：`config.toml` に `[antigravity] auth = "api_key"` を設定し、Gemini API キーを `gemini` プロバイダーのアカウント、または環境変数 `GEMINI_API_KEY` として用意します。Gateway が agy の設定に `modelProvider` を自動で書き込みます。`auth = "login"` で Google サインインに戻り、その `modelProvider` の項目も削除されます。`auth` を一度も設定していない場合、gateway は `modelProvider` に触れず、Gemini キーも渡さないため、agy はそれまでの認証方法のままです。
+
+`ANTIGRAVITY_API_KEY` という変数は存在しません。プラットフォームの MCP ツールは、各エージェントのワークスペースの `<agent workspace>/.agents/mcp_config.json` に登録されます。
+
+API key モードに切り替える前に知っておくこと：
+
+- この設定は OS ユーザー全体に効きます。agy は `modelProvider` をユーザーレベルの設定ファイルに保存するため、同じアカウントで対話的に使う `agy` も API key 経路に切り替わります。
+- 同じ OS ユーザーで 2 つの gateway を動かし、`auth` に異なる値を設定すると、互いにこの項目を上書きします。
+- `api_key` を使った後に Google サインインへ戻すには、`auth = "login"` を明示してください。`auth` の行を削除するだけでは戻りません。設定がない場合 gateway は `modelProvider` に触れないため、以前に書き込まれた `"gemini"` が agy の設定に残り、gateway はログで通知するだけです。`login` モードでは、gateway は `GEMINI_API_KEY`／`GOOGLE_API_KEY` を agy とその実行コマンドに渡しません。`api_key` モードでは、エージェントの shell からこのキーを読めます（agy は環境変数から受け取る必要があるため）。
+
+### Antigravity のストリーム解析は失敗ではなく縮退する（2026-09-28）
+
+`agy --output-format stream-json` のデコーダーは、以前は 6 か所で独立して厳格でした。解析できない行が 1 行ある、`result` イベントがない、`response` フィールドがない、`usage` ブロックの整数が 1 つ足りない、のどれかで実行全体がエラーになり、*すでに回答済み*の `agy` が spawn 失敗として報告され、ロールメンバーも失われました。
+
+形の不一致は縮退して扱い、事実は縮退させません。解析できない行はスキップします。result がなければ、ストリームの最後の空でない行を回答として使います。`usage` ブロックがない、または不完全な場合は、でっち上げた 0 ではなく不明なトークン数になります。縮退のたびに、何が欠けていたかを示す `warn!` を 1 件出します。いまも即座に失敗する唯一のケースは、明示的な `SUCCESS` 以外のステータスです。これは `agy` が実行の失敗を伝えているのであって、こちらが認識できなかった形ではありません。
+
+### フォールバックのランタイムが受け取るモデル（2026-09）
+
+別のランタイムへフェイルオーバーするとき、元のモデル id をそのまま転送することはありません（Codex エージェントの `gpt-5.4` を Claude CLI に渡してはいけません）。FailoverManager は、順序のある 4 つの分岐でフォールバック先のモデルを解決し、どれも当てはまらなければ spawn を拒否します。
+
+1. `agent.toml [model] fallbacks` のうち、そのファミリーが確実にフォールバック先のランタイムに属する最初のエントリー（`openai/gpt-5.4` のような修飾付き id は、Direct-API チェーンが使うのと同じ `split_model_id` の規則で修飾を外します）。
+2. 元のモデル。すでにフォールバック先のランタイムに属している場合。
+3. そのランタイムのカタログ既定値（`fallback_models[0]`。ライブ探索が失敗したときにダッシュボードが提示するのと同じリスト）。
+4. いずれでもなければ、この試行は `no model configured for fallback runtime <name>` として失敗扱いになり、spawn しません。
+
+置き換えが起きるたびに、`agent / from_runtime / to_runtime / from_model / to_model` を `warn` レベルで記録します。
+
+**judge と evaluator の呼び出しは、ファミリーをまたぐフェイルオーバーから完全に外れます**（2026-09-28 訂正）。オペレーターが judge のランタイムまたはモデル（`[dispatch] judge_provider` / `judge_model`）を指定した場合、その呼び出しの目的は*どのファミリーが答えるか*にあります。そのため失敗した judge の spawn を別ファミリーのモデルで救済することはなく、呼び出し側が明示的に、見える形で縮退します。この除外は以前、judge のヒントがプロバイダーを解決済みのデフォルトから*動かした*ときにしか働きませんでした。そのため judge のファミリーとデフォルトの utility のファミリーがたまたま同じ場合（たとえば両方が `codex`。Codex もデフォルトの utility ランタイムにしたとき、去相関 judge の構成が行き着く状況です）には、置き換えが黙って復活していました。現在は、ファミリーを名指しすればそのファミリーを要求したことになり、それがデフォルトでもあるかどうかは関係ありません。ヒントなしの utility 呼び出しのフェイルオーバーは従来どおりです。
 
 - **Account Rotator**：全プロバイダーの認証情報を管理、クロスプロバイダーフェイルオーバー付き。
 - **Confidence Router**：runtimeレイヤーの下位に位置——ローカル vs. クラウドを決定。Runtimeレイヤーは*どの*クラウドかを決定。
 - **CostTelemetry**：プロバイダーごとのコストを追跡し、情報に基づくルーティング決定を支援。
 - **MCP Server**：ツールはサポートする全バックエンドに公開（ClaudeはネイティブMCP経由、その他はツールインジェクション経由）。
+- **Agent Config**：各エージェントの`agent.toml`がruntimeの優先設定とフォールバックチェーンを指定します。
 
 ---
 
@@ -242,4 +412,4 @@ api_key_enc = "..."          # anthropic は従来通り anthropic_api_key_enc �
 
 ## まとめ
 
-AI領域はマルチプロバイダーです。単一CLIの上に構築するのは、単一OSのためだけにソフトウェアを書くようなもの——動くけど、いつか動かなくなります。`AgentRuntime` traitが差異を抽象化し、DuDuClawがClaude、Codex、Gemini、そしてOpenAI互換エンドポイントを交換可能なバックエンドとして扱えるようにします。
+AI領域はマルチプロバイダーです。単一CLIの上に構築するのは、単一OSのためだけにソフトウェアを書くようなもの——動くけど、いつか動かなくなります。`AgentRuntime` traitが差異を抽象化し、DuDuClawがClaude、Codex、Gemini、そしてOpenAI互換エンドポイントを交換可能なバックエンドとして扱えるようにします。エージェントは常に、利用可能な最良の頭脳を得られます。

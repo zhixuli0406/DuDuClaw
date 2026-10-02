@@ -25,7 +25,7 @@ This RFC does two things:
 | MCP integration | Full MCP server + HTTP/SSE | ✅ covered |
 | Hooks (PRE/POST_TOOL_USE + security preset) | `.claude/hooks/` 3-phase defense | ✅ covered |
 | Agent Teams (shared TODO + message bus + deps) | `reports_to` hierarchy + Task Board + Shared Wiki + `bus_queue.jsonl` | **Enhance**: task-claim atomicity + dependency cycle detection on Task Board |
-| Checkpoints (save / rewind / fork) | `duduclaw-durability/checkpoint.rs` (linear, in-memory) | **Enhance**: add `fork()` + `rewind()` + durable backend |
+| Checkpoints (save / rewind / fork) | ~~`duduclaw-durability/checkpoint.rs`~~ (removed 2026-07-04, commit `b0639b96`) | **Enhance**: add `fork()` + `rewind()` + durable backend — **NOT AVAILABLE** in current codebase |
 | Sub-agents / Swarms | `create_agent` / `spawn_agent` / `list_agents` | ✅ covered |
 | Plan Mode (clarify-first planner subagent) | Task Board (no interactive clarify) | **New (small)**: clarify-first planner mode |
 | **Live Run Forking + Judge Agent** | GVU is **sequential** self-play, not parallel competing branches | **New (core)** — §3 |
@@ -114,7 +114,7 @@ Prometheus counters mirroring the PTY-pool style: `fork_runs_total`, `fork_branc
 A `plan_start` MCP tool + `[planner] clarify_first = true`: before executing an ambiguous task, the planner subagent emits up to 3 clarifying questions, waits for answers (or times out to best-effort), then decomposes into Task Board subtasks with dependencies. Reuses existing `tasks_create` + sub-agent spawn.
 
 ### 4.2 Checkpoint fork/rewind
-Extend `duduclaw-durability/checkpoint.rs`: add `fork(checkpoint_id) -> new_id` (copy state under a new lineage) and `rewind(task_id, checkpoint_id)` (restore an earlier snapshot), plus a durable SQLite backend so checkpoints survive restart. Enables "explore alternative approach from checkpoint X".
+❌ **REMOVED** — The `duduclaw-durability/checkpoint.rs` module (which would have provided `fork(checkpoint_id) -> new_id` and `rewind(task_id, checkpoint_id)` with a durable SQLite backend) was removed in commit `b0639b96` on 2026-07-04. The entire `duduclaw-durability` crate was found to have zero call sites in the production codebase. This capability is not available in the current codebase. Checkpoint save/rewind/fork functionality does not exist.
 
 ### 4.3 Built-in skill set parity
 Ship `code-review`, `refactor`, `test-writer`, `git-workflow` as first-class bundled `SKILL.md` files in the skill registry so a fresh agent has the deep-agents default toolbox.
@@ -136,7 +136,7 @@ Add atomic task **claim** (compare-and-set on `assignee`) and **dependency cycle
 | **P3** | 6 MCP tools + `Scope::ForkExecute` + dispatch wiring | Medium | ✅ Done |
 | **P4** | Parallel execution (N branches), aggregate budget pool, native CoW overlay (`clonefile`/reflink), streaming budget kill, external SIGKILL | Medium-High | ✅ Done |
 | **P5** | Prometheus metrics on gateway `/metrics` (via shared `ForkStore`) + `fork_history.jsonl` + Activity Feed + dashboard `ForkPage` | Low | ✅ Done |
-| **P6** | Secondary parity items (§4) — Plan Mode, checkpoint fork/rewind + SQLite, built-in skills, memory `/improve`, Task Board claim + cycle detection | Low | ✅ Done |
+| **P6** | Secondary parity items (§4) — Plan Mode, **~~checkpoint fork/rewind~~ (removed, see §4.2)**, built-in skills, memory `/improve`, Task Board claim + cycle detection | Low | ✅ Partial (checkpoint item not available) |
 
 Each phase is independently shippable and default-off; nothing changes runtime behavior until an agent sets `[fork] enabled = true`.
 

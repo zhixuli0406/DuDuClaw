@@ -121,7 +121,7 @@
 
 | Feature | Description |
 |---------|-------------|
-| Multi-Runtime AI Agent Platform | Unified `AgentRuntime` trait — Claude / Codex / Gemini / Antigravity (`agy`) / Grok (`grok`) / OpenAI-compat six backends with auto-detection |
+| Multi-Runtime AI Agent Platform | Unified `AgentRuntime` trait — Claude / Codex / Gemini (deprecated) / Antigravity (`agy`) / Grok (`grok`) / OpenAI-compat six backends with auto-detection |
 | MCP Server (JSON-RPC 2.0) | Exposes 80+ tools to AI Runtime via stdin/stdout; registered at `<agent>/.mcp.json` (v1.8.5 — Claude CLI `-p` only reads project-level), gateway auto-creates/repairs on startup |
 | ACP/A2A Server | Two commands: `duduclaw acp` — Agent Client Protocol v1 for IDE agent panels (Zed / JetBrains / nvim; `initialize` / `session/new` / `session/prompt` streaming, `AUTH_REQUIRED` when unconfigured); `duduclaw acp-server` — A2A protocol (`agent/discover` / `message/send` / `tasks/*`, `.well-known/agent.json` AgentCard) |
 | Agent Directory Structure | `.claude/`, `.mcp.json`, `SOUL.md`, `CLAUDE.md`, `CONTRACT.toml`, `agent.toml`, `wiki/`, `SKILLS/`, `memory/`, `tasks/`, `state/` |
@@ -139,8 +139,8 @@
 |---------|-------------|
 | Claude Runtime | Claude Code SDK (`claude` CLI) with JSONL streaming + `--resume` multi-turn |
 | Codex Runtime | OpenAI Codex CLI with `--json` streaming events, `AGENTS.md` file for system prompt |
-| Gemini Runtime | Google Gemini CLI with `--output-format stream-json`, `GEMINI_SYSTEM_MD` env var for system prompt, `--approval-mode yolo`. Retained for paid `GEMINI_API_KEY` users after Google retired the personal-tier Gemini CLI on 2026-06-18 |
-| Antigravity Runtime (v1.24.0) | Google Antigravity CLI (`agy`, the 2026-06-18 Gemini-CLI successor), driven via oneshot `agy -p --dangerously-skip-permissions --print-timeout 300s`. Binary auto-resolve (PATH → `~/.local/bin/agy`); no `--system` flag so the system prompt + history are embedded in the prompt (CJK-safe); auth `ANTIGRAVITY_API_KEY`; auto-pre-seeds the agent dir into agy's `trustedWorkspaces` (cross-process lock) to avoid a headless trust-prompt hang; token usage estimated (print mode exposes no stats) |
+| Gemini Runtime (deprecated in v1.67.0, removed in v1.69.0; use Antigravity) | Google Gemini CLI with `--output-format stream-json`, `GEMINI_SYSTEM_MD` env var for system prompt, `--approval-mode yolo`. Retained for paid `GEMINI_API_KEY` users after Google retired the personal-tier Gemini CLI on 2026-06-18 |
+| Antigravity Runtime (v1.24.0) | Google Antigravity CLI (`agy`, the 2026-06-18 Gemini-CLI successor), driven via oneshot `agy -p --dangerously-skip-permissions --print-timeout 300s`. Binary auto-resolve (PATH → `~/.local/bin/agy`); no `--system` flag so the system prompt + history are embedded in the prompt (CJK-safe); auth via Google sign-in (run `agy` in a host terminal) or API-key mode (`config.toml [antigravity] auth = "api_key"` + Gemini API key); MCP tools registered per agent workspace in `.agents/mcp_config.json`; auto-pre-seeds the agent dir into agy's `trustedWorkspaces` (cross-process lock) to avoid a headless trust-prompt hang; token usage estimated (print mode exposes no stats) |
 | Grok Runtime (R4) | xAI Grok CLI ("Grok Build"), driven via oneshot `grok -p` (verified against docs.x.ai 2026-07-13). Binary `grok` (curl-installed; third-party `grok-cli` as fallback probe); `--model` selection; `--tools`/`--disallowed-tools` confinement (+ `native_sandbox` hard gate); system prompt + history embedded in the prompt (CJK-safe); duduclaw MCP server written as `[mcp_servers.duduclaw]` TOML into per-agent `<agent_dir>/.grok/config.toml` (+ agent identity forwarded via spawn env); `XAI_API_KEY` env auth; token usage estimated (plain stdout). **Residuals** (need a live CLI): `--tools` list delimiter, project-local `config.toml` discovery for `mcp_servers`, `--output-format json` schema for real usage, and the full `--model` roster (`grok models`) — only `grok-4.5` / `grok-build-0.1` are doc-confirmed |
 | OpenAI-compat Runtime | HTTP endpoint (MiniMax / DeepSeek / etc.) via REST API |
 | RuntimeRegistry | Auto-detection of installed CLIs, per-agent `[runtime]` config |
@@ -268,10 +268,10 @@
 
 | Feature | Description |
 |---------|-------------|
-| `agent-file-guard` PreToolUse hook | `duduclaw hook agent-file-guard` (Rust subcommand, matcher `Write\|Edit\|MultiEdit\|Bash`, installed per agent by `agent_hook_installer`) — blocks agent-structure files outside the canonical tree, own-SOUL.md writes, cross-agent writes |
+| `agent-file-guard` PreToolUse hook | `duduclaw hook agent-file-guard` (Rust subcommand, matcher `Write\|Edit\|MultiEdit\|Bash`, installed per agent by `agent_hook_installer`) — blocks agent-structure files outside the canonical tree, own-SOUL.md and own-CONTRACT.toml writes, cross-agent writes |
 | `org_field_guard` | Field-level freeze inside the same hook: `[agent] reports_to`/`department`/`name`, the whole `[capabilities]` table, and `config.toml [delegation]`/`[acp]` — fail-closed on unparseable or unreconstructable writes |
 | `data-file-guard` PreToolUse hook | `duduclaw hook data-file-guard` (RFC-23 §14.4, Rust subcommand since H10 2026-09, matcher `Read\|Bash`), armed only when redaction is active; a `Bash` filename heuristic, not a sandbox |
-| Ed25519 Auth | Challenge-response WebSocket authentication |
+| Dashboard auth | JWT account login (Argon2id passwords, `users.db`) or the gateway admin token. The earlier Ed25519 challenge-response path has been removed; no configuration could ever enable it |
 | AES-256-GCM | API key encryption at rest, per-agent key isolation |
 | Prompt Injection Scanner | `input_guard` — 7 rule categories, block threshold 60, NFKC-normalized, en + zh-TW patterns, XML delimiter protection |
 | SOUL.md Drift Detection | SHA-256 fingerprint comparison |
@@ -281,7 +281,7 @@
 | JSONL Audit Log | Full tool call recording, async write |
 | Unicode Normalization | NFKC normalization to detect homograph attacks |
 | Action Claim Verifier | Signature validation for tool execution claims |
-| Container Sandbox | Docker (Bollard) / Apple Container / WSL2 — `--network=none`, tmpfs, read-only rootfs, 512MB limit |
+| Container Sandbox | Two separate paths. Task sandbox (`agent.toml [container] sandbox_enabled`): Docker only, runs a delegated task's AI CLI in a read-only, non-root, resource-limited container, fails closed ([guide](../guides/task-sandbox.md)). Script sandbox (PTC `execute_program`, `duduclaw secaudit` PoC): Docker (WSL2 first on Windows), `--network=none`, read-only root, only a private read-only script directory mounted; PTC refuses to run when the sandbox is unavailable unless `script_when_unavailable = "run_unsandboxed"` |
 | Secret Leak Scanner | 20+ patterns (Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URLs) |
 | Sensitive Data Redaction (RFC-23, v1.14.0) | `duduclaw-redaction` crate — internal data (Odoo / shared wiki / file tools) is replaced with `<REDACT:CATEGORY:hash8>` tokens before reaching the LLM and auto-restored at trusted egress (user channel reply, whitelisted tools); AES-256-GCM SQLite vault (per-agent 32-byte key, 0o600), TTL 7d two-phase GC, 5 built-in profiles, five-layer enable/disable resolver, JSONL audit with 10MB rotation; field-level rules added 2026-09 — `db_field` (Odoo `model.field` / `model.*` sugar) and generic `json_path` tokenize the whole matched field value instead of pattern-matching content, plus a `duduclaw redaction verify` JSON mode to prove a rule fires against a sample tool result; `db_field`'s Odoo-only table generalized (2026-09) into a `[redaction.data_sources.*]` registry any MCP tool can bind to, and redaction's reach extended past DuDuClaw's own MCP server for the first time — see the next row |
 | Data Sources & Native DB Connector (2026-09) | `[redaction.data_sources.<name>]` registry (`tools`, `table_arg`/`table`, `record_paths`, `key_alias`) lets a `db_field` rule's `source` name any tool-backed data source, not just the built-in `odoo`; `duduclaw mcp-proxy` (a spawn-time `.mcp.json` rewrite) routes a customer's own external stdio MCP servers through the same egress/result redaction DuDuClaw's own MCP server applies, and a `ToolInterceptor` hook does the in-process equivalent for the openai-compat direct-API tool loop — HTTP/SSE MCP servers and the codex/gemini/antigravity runtimes are not covered yet; new read-only `duduclaw-db` crate (sqlx: PostgreSQL/MySQL/SQLite, three-layer read-only enforcement) exposes four MCP tools (`db_sources` / `db_tables` / `db_select` / `db_query`, `db_query` refused unless `allowed_tables = ["*"]`) behind `Scope::DbRead` (`db:read`) plus a deny-by-default per-agent `[capabilities] db_sources` grant; dashboard gains 資料來源 (two tabs) and 資料表欄位規則 cards with a 試跑 dry-run and a poison banner for a broken `[redaction]` config; local files (2026-09) close a separate gap — the Claude CLI's built-in `Read`/`Bash` are not MCP tools and never passed the redaction choke point — with three new MCP tools `file_read`/`csv_read`/`xlsx_read` (path-fenced, `files:read` scope), a built-in `duduclaw_files` registry source (`db_field` rules like `customers.csv.name` / `客戶清單.xlsx.地址`), and a PreToolUse `data-file-guard` hook (`[redaction] data_file_guard`, default on) blocking the built-in route, honestly documented as a filename heuristic rather than a sandbox; **AI detection + custom rules (2026-09)**: a new `type = "ner"` rule kind and built-in `ai_pii` profile ("AI 智慧偵測") run OpenAI Privacy Filter (Apache-2.0) on-device through ONNX Runtime (`ort` `load-dynamic` — the release binary links no runtime; `redaction.model.install` downloads model + runtime with pinned sha256, `.status`/`.cancel`/`.remove` alongside; priority below every regex rule so exact patterns win; measured recall published honestly, regex profiles stay on as the first layer); dashboard-authored **custom rules** (`~/.duduclaw/redaction/profiles/custom.toml`: a data-type name + keyword list or pattern, per-rule `enabled` on every rule kind, `[meta.labels]` display names, `redaction.custom_rules.*` and `redaction.profiles.import`/`.remove` RPCs for TOML rule packs), `redaction.suggest_pattern` (paste 2–5 examples → a validated pattern; local inference → utility model → heuristic, never a fabricated pattern) and `redaction.dry_run` on unsaved draft rules ([55-data-sources.md](55-data-sources.md)) |
@@ -307,18 +307,6 @@
 | `memory_alias_add` / `memory_alias_list` (D3) | MCP tools to manage entity aliases — add folds an `alias` onto a `canonical` entity (scope `memory:write`), list returns `(canonical, alias)` pairs (scope `memory:read`); namespace-isolated |
 | Decision Continuity (RFC-24, v1.23.0) | When an agent offers an enumerated choice (Option A/B/C), each option is persisted into the Temporal Memory **semantic** layer (independent of conversation compression) and open decisions are re-injected each turn; a later "use Option C" (new turn / session / process) resolves from durable state instead of being guessed. Deterministic, zero-LLM detection; `decision_resolve` / `decision_list` MCP tools + Dashboard panel + Prometheus counters; per-agent opt-in `[memory] decision_continuity = true` (TTL `decision_ttl_days`, default 7) |
 
-## Git Worktree Isolation (v1.6.0)
-
-| Feature | Description |
-|---------|-------------|
-| L0 Isolation Layer | Per-task git worktree — cheaper than container sandbox, prevents concurrent agent file collisions |
-| Atomic Merge | Dry-run pre-check → abort → real merge if clean; protected by global `Mutex` |
-| Snap Workflow | create → execute → inspect → merge/cleanup; pure-function decision logic |
-| Friendly Branch Names | `wt/{agent_id}/{adjective}-{noun}` from 50×50 word lists |
-| copy_env_files | Path traversal jail, symlink rejection, 1MB size limit |
-| AgentExitCode | Structured exit codes — Success / Error / Retry / KeepAlive |
-| Resource Limits | Max 5 worktrees per agent, 20 total |
-
 ## Account & Cost Management
 
 | Feature | Description |
@@ -338,16 +326,17 @@
 | L1 `web_fetch_cached` | SSRF-gated, disk-cached HTTP GET (body truncated at 60k chars) |
 | L2 `web_extract` | Same fetch path + CSS-selector extraction (`text` / `html` / `json`) |
 | L3 headless (optional, external) | Playwright or Browserbase registered as a per-agent MCP server in `.mcp.json`; not part of the binary, no fallback into it |
-| L5 Computer Use | Seven `computer_*` MCP tools driving a container virtual display via `computer_use_orchestrator` |
+| L5 Computer Use | A container virtual display started by `computer_use_orchestrator` (image `ghcr.io/zhixuli0406/duduclaw-computer-use:v<version>`, never pulled automatically), driven by the employee through eight `computer_*` MCP tools (`session_start` / `screenshot` / `click` / `type` / `key` / `scroll` / `navigate` / `session_stop`; gateway-owned session reached over a signed loopback route, one per employee, no API key needed, network only to the hosts in `[capabilities.computer_use_config] allowed_domains`). The chat-triggered gateway loop and the `native` host-desktop mode were removed |
 | Capability Gating | `agent.toml [capabilities]` deny-by-default (`computer_use` / `browser_via_bash` / `allowed_tools` / `denied_tools`); `denied_tools` enforced both as `--disallowedTools` and at the MCP dispatch gate |
 
 ## Container Sandbox
 
+Two separate code paths share the name.
+
 | Feature | Description |
 |---------|-------------|
-| Docker | Bollard API, all platforms |
-| Apple Container | Native macOS 15+ |
-| WSL2 | Windows Linux subsystem |
+| Task sandbox | Per-agent (`agent.toml [container] sandbox_enabled = true`). A delegated task runs the agent's AI CLI in a Docker container: read-only root filesystem, non-root user, all capabilities dropped, memory / process / CPU limits, a private throw-away workspace, the agent directory mounted read-only at `/agent`. File and shell tools only; no platform MCP tools. Needs `network_access = true` and a locally pulled image. Docker only. When it cannot run, the task fails (audit `task_sandbox_unavailable`) unless `config.toml [container.sandbox] when_unavailable = "run_unsandboxed"`. A sandboxed employee never forms a Team (goal rounds run Solo in the sandbox) and is not woken by mail; channel replies, cron, reminders and the other conversation paths stay on the host and write the audit event `task_sandbox_not_applied`. See [Task sandbox guide](../guides/task-sandbox.md) |
+| Script sandbox | Used by PTC `execute_program` and the `duduclaw secaudit` PoC step. Docker on macOS/Linux, WSL2 then Docker on Windows (WSL2 not yet run on a real Windows host), via `duduclaw-container`; the Apple Container backend is never selected. Same image as the task sandbox, never pulled; `--network=none`, read-only root, 2 GiB / 256 PIDs / 1 CPU, `/tmp` tmpfs, 600 s hard cap, only a private read-only script directory mounted. When unavailable, PTC fails by default (`[container.sandbox] script_when_unavailable`); the PoC never runs on the host ([guide](../guides/task-sandbox.md)) |
 
 ## Scheduling
 

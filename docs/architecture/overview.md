@@ -2,12 +2,12 @@
 
 ## Architecture Overview (v1.13.1)
 
-DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code / Codex / Gemini** CLI as AI backends via a unified `AgentRuntime` trait with auto-detection and per-agent configuration. DuDuClaw is not a standalone LLM product; it is the plumbing layer that turns one (or many) AI CLIs into long-running agents with channel routing, session memory, self-evolution, multi-account rotation, local LLM inference, browser automation, and IDE integration.
+DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code / Codex / Antigravity / Grok** CLI (plus OpenAI-compatible APIs) as AI backends via a unified `AgentRuntime` trait with auto-detection and per-agent configuration (the Gemini CLI backend is deprecated in v1.67.0, removed in v1.69.0, replaced by Antigravity). DuDuClaw is not a standalone LLM product; it is the plumbing layer that turns one (or many) AI CLIs into long-running agents with channel routing, session memory, self-evolution, multi-account rotation, local LLM inference, browser automation, and IDE integration.
 
 ## Key Architectural Decisions
 
 ### Runtime & Transport
-- **Multi-Runtime** (`AgentRuntime` trait) — Claude / Codex / Gemini / OpenAI-compat four backends, `RuntimeRegistry` auto-detection, per-agent config in `agent.toml [runtime]`.
+- **Multi-Runtime** (`AgentRuntime` trait) — Claude / Codex / Antigravity (`agy`) / Grok / OpenAI-compat backends plus Gemini CLI (deprecated in v1.67.0, removed in v1.69.0, replaced by Antigravity), `RuntimeRegistry` auto-detection, per-agent config in `agent.toml [runtime]`.
 - **Cross-runtime failover model substitution** (`failover.rs`): when `[runtime] fallback` sends a call to a *different* provider, the fallback runtime no longer inherits the primary's model id (a codex agent's `gpt-5.4` used to be spawned against the Claude runtime). The model is resolved in four ordered branches — ① the first `agent.toml [model] fallbacks` entry whose family confidently belongs to the fallback runtime (qualified `provider/model` entries are unqualified), ② keep the requested model when that runtime already serves it (this is how `openai_compat`, which declares no model family, keeps proxying arbitrary ids), ③ the runtime catalog's own first model for that backend, ④ otherwise **refuse to spawn** and report `no model configured for fallback runtime <P>`, recorded as a failed attempt. Every substitution emits a `warn!` carrying `agent` / `from_runtime` / `to_runtime` / `from_model` / `to_model`.
 - **MCP Server (stdio)** (`duduclaw mcp-server`) exposes channel, memory, agent, skill, task, shared wiki, and autopilot tools to AI Runtime via JSON-RPC 2.0 over stdin/stdout. Registered at the agent level in `<agent>/.mcp.json` (v1.8.5 reverted v1.8.4's global registration because Claude CLI `-p --dangerously-skip-permissions` only reads project-level `.mcp.json`). Gateway startup auto-creates/repairs `.mcp.json` for all agents.
 - **MCP Server (HTTP/SSE)** (`duduclaw http-server --bind 127.0.0.1:8765`, v1.9.4) — Bearer-authenticated `POST /mcp/v1/call` (single JSON-RPC tool call), `GET /mcp/v1/stream` (SSE long-lived event stream, Bearer / `?api_key=`), `POST /mcp/v1/stream/call` (async + SSE result push), `GET /healthz` (no auth). Token bucket rate limit (60 req/min). `mcp_sse_store.rs` manages SSE connections with broadcast channels. Complements stdio for external HTTP clients.
@@ -55,7 +55,7 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 ### Wiki Knowledge Layer (v1.8.9)
 - **4-layer architecture** (Vault-for-LLM inspired): L0 Identity / L1 Core / L2 Context / L3 Deep.
 - **Trust weighting** (`trust` 0.0-1.0 frontmatter) — search results ranked by trust-weighted score.
-- **Auto-injection**: `build_system_prompt()` auto-injects L0+L1 pages into WIKI_CONTEXT across CLI / channel reply / dispatcher paths — unified across Claude / Codex / Gemini / OpenAI runtimes.
+- **Auto-injection**: `build_system_prompt()` auto-injects L0+L1 pages into WIKI_CONTEXT across CLI / channel reply / dispatcher paths — unified across the Claude / Codex / Antigravity / Grok / OpenAI-compat runtimes (and the deprecated Gemini runtime).
 - **FTS5 index** (`unicode61` tokenizer) — auto-syncs on every write/delete, manual rebuild via `wiki_rebuild_fts`.
 - **Knowledge graph**: `wiki_graph` MCP tool exports BFS-limited Mermaid diagrams; node shapes by layer.
 - **Dedup detection**: `wiki_dedup` detects duplicate pages by title match + tag Jaccard similarity (≥0.8).
@@ -68,15 +68,6 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 - **Memory decay daily scheduler**: background task runs `duduclaw_memory::decay::run_decay` every 24h. Low-importance + 30 days old → archived. Archived + 90 days → permanent delete.
 - **Cognitive memory MCP tools**: `memory_search_by_layer` (episodic/semantic filter), `memory_successful_conversations`, `memory_episodic_pressure`, `memory_consolidation_status`.
 - **MemGPT 3-layer system** (Core Memory, Recall Memory, Archival Bridge, Budget Manager, Consolidation Pipeline, 6 MCP tools) was **removed in v1.8.1** (−1,985 LOC) — the prompt injection caused 6,500 token bloat per prompt and "lost in the middle" attention degradation.
-
-### Worktree Isolation (v1.6.0)
-- **Git worktree L0 isolation layer** — per-task filesystem isolation cheaper than container sandbox.
-- **WorktreeManager**: create / remove / list / cleanup_stale lifecycle.
-- **Atomic merge**: dry-run pre-check → abort → real merge if clean. Protected by global `Mutex`.
-- **Snap workflow**: create → execute → inspect → merge/cleanup (pure-function decision logic for testability).
-- **Branch naming**: `wt/{agent_id}/{adjective}-{noun}` from 50×50 word lists.
-- **copy_env_files**: path traversal jail + symlink rejection + 1MB size limit.
-- **Resource limits**: max 5 worktrees per agent, 20 total.
 
 ### Local Inference
 - **Unified `InferenceBackend` trait** (`duduclaw-inference` crate): OpenAI-compatible HTTP (llama-server/Ollama/vLLM/SGLang/llamafile). The in-process llama.cpp, mistral.rs and MLX backends were removed in 2026-09 — no release binary ever compiled them; run a local OpenAI-compatible server instead.
@@ -107,9 +98,9 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 - **CONTRACT.toml** — `must_not` / `must_always` boundaries, auto-injected into system prompt; `duduclaw test` red-team CLI (9 built-in scenarios).
 - **Unified multi-source audit log**: `audit.unified_log` merges `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` into common envelope (timestamp / source / event_type / agent_id / severity / summary / details) with Logs page filter chips.
 - **AES-256-GCM** at rest — per-agent key isolation.
-- **Ed25519 challenge-response** WebSocket auth.
-- **Container sandbox** (Docker / Apple Container / WSL2) — `--network=none`, tmpfs, read-only rootfs, 512MB limit.
-- **Browser automation & computer use** — three MCP tool groups the agent chooses between, no auto-router: L1 `web_fetch_cached` (SSRF-gated, cached HTTP), L2 `web_extract` (CSS selector scrape), L5 seven `computer_*` tools driving a container virtual display via `computer_use_orchestrator`. L3 headless is an optional per-agent Playwright/Browserbase MCP server (`.mcp.json`). Deny-by-default via `CapabilitiesConfig` (`computer_use` / `browser_via_bash` / `allowed_tools` / `denied_tools`). The dead `browser_router.rs` 5-layer router and its "L4 Sandbox Browser" tier were removed in 2026-09.
+- **Dashboard / WebSocket auth**: JWT account login (Argon2id-hashed passwords in `users.db`) or the gateway admin token. An earlier Ed25519 challenge-response path has been removed from the gateway; no configuration could ever enable it. Ed25519 is still used for licence signatures, update verification and the relay device protocol.
+- **Container sandbox** — two separate paths. The per-agent *task sandbox* (`agent.toml [container] sandbox_enabled`) runs a delegated task's AI CLI in a read-only, non-root, resource-limited Docker container (Docker only, needs `network_access = true`, fails closed when it cannot run; see [Task sandbox guide](../guides/task-sandbox.md)). The *script sandbox* used by PTC `execute_program` and the `secaudit` PoC step runs on Docker (WSL2 first on Windows) with `--network=none`, a read-only root and only a private read-only script directory mounted; when it cannot run, PTC refuses the script unless `[container.sandbox] script_when_unavailable = "run_unsandboxed"`, and the PoC never runs on the host.
+- **Browser automation & computer use** — two fetch tools and an optional browser server the agent chooses between, no auto-router: L1 `web_fetch_cached` (SSRF-gated, cached HTTP), L2 `web_extract` (CSS selector scrape). L5 computer use runs in a container started by `computer_use_orchestrator` (image `ghcr.io/zhixuli0406/duduclaw-computer-use:v<version>`, never pulled automatically, actions via `xdotool`) and is driven by the agent through eight `computer_*` MCP tools, which the `duduclaw mcp-server` process forwards to gateway-owned sessions over a signed loopback route (`POST /api/internal/computer-use`, `computer_use_sessions/`; network only to the per-agent `allowed_domains` hosts, pinned at session start). The chat-triggered loop and the `native` host-desktop mode were removed. L3 headless is an optional per-agent Playwright/Browserbase MCP server (`.mcp.json`). Deny-by-default via `CapabilitiesConfig` (`computer_use` / `browser_via_bash` / `allowed_tools` / `denied_tools`). The dead `browser_router.rs` 5-layer router and its "L4 Sandbox Browser" tier were removed in 2026-09.
 - **CJK-safe byte slicing**: `duduclaw_core::truncate_bytes` / `truncate_chars` replaced 31 unsafe `s[..s.len().min(N)]` sites (fixed v1.8.11 multi-byte codepoint panics).
 
 ### Accounts & Cost
@@ -147,12 +138,7 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 - **Dashboard WebSocket heartbeat**: server Ping every 30s, close idle sockets after 60s without Pong. Client `ping` application-level RPC every 25s (browsers can't issue control frames).
 
 ### Reliability & Governance (v1.9.4)
-- **`duduclaw-durability` crate** — five-pillar durability:
-  - `idempotency.rs`: key-based dedup preventing duplicate execution.
-  - `retry.rs`: exponential backoff with jitter strategy.
-  - `circuit_breaker.rs`: three-state Closed / Open / HalfOpen with `probe_inflight` accounting (v1.9.4 fix: OPEN→HALF_OPEN transition increments `probe_inflight` to prevent ghost-probe overage).
-  - `checkpoint.rs`: resumable task progress.
-  - `dlq.rs`: Dead Letter Queue for terminally failed messages.
+- **`duduclaw-durability` crate** (🗑️ **Removed in commit `b0639b96` on 2026-07-04**) — This crate contained a five-pillar durability framework (`idempotency`, `retry`, `circuit_breaker`, `checkpoint`, `dlq`). It was removed after determining it had zero call sites in the production codebase. The gateway's LLM fallback chain relies on other mechanisms (see `gateway/failover.rs`). Historical references to checkpoint save/rewind/fork are not available in the current codebase.
 - **`duduclaw-governance` crate** (W19-P1 M1-A) — `PolicyRegistry` (YAML + hot reload + agent-priority merge + fail-safe + concurrent upsert safety), four `PolicyType`s (Rate / Permission / Quota / Lifecycle), `quota_manager.rs` (per-agent / per-policy soft + hard quotas), `error_codes.rs` (QUOTA_EXCEEDED / POLICY_DENIED / ...), approval workflow + audit log. Default policy set in `policies/global.yaml`.
 - **LLM fallback chain** (`gateway/failover.rs`, module `failover::model`) — layer 2 of the three-layer failover stack (account → model → runtime, all under one module tree since 2026-09-29): primary timeout / 503 / 429 / overloaded auto-switches to the lighter fallback model, never on a billing error. `is_llm_fallback_error` / `should_attempt_model_fallback` are pure functions with unit tests; `FailoverManager::model_fallback_for` is the combined decision every dispatch path calls. UTF-8-safe truncation via `char_indices`.
 - **Evolution Events system** (`gateway/evolution_events/`) — 30+ event schema, async batch+retry emitter, query interface, reliability guarantees. HTTP endpoints exposed on gateway and surfaced in Web `ReliabilityPage`.

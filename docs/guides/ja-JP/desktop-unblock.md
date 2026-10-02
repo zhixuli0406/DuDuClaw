@@ -141,7 +141,7 @@ GitHub repoの Settings → Secrets and variables → Actions で以下を追加
 | --- | --- | --- |
 | **D4.1🧪** | 署名＋公証済みの`.dmg`を**あなたの証明書を一度もインストールしたことがない別のMac**にコピーし、ダブルクリックする → 「from an unidentified developer」（未確認の開発者からのものです、という趣旨の警告）が表示されないこと | ✅ **検証済み**（2026-07-01、`desktop-v1.31.0`）：`stapler validate` = *worked*、`spctl -a` = accepted / Notarized Developer ID |
 | **D3.1🧪** | hardened runtimeで署名した後にアプリを開き、sidecarが引き続きCLIをspawnできること／ネットワークに到達できることを確認する（チャットでネットワークを必要とする操作をトリガーする） | ⬜ 署名版アプリでの実測がまだ |
-| **D3.2🧪** | Computer Useを初めて使う際、システムがAccessibility／Screen Recordingの権限プロンプトを表示し、許可後にスクリーンショット撮影／擬似入力が動作すること | ⬜ 未検証 |
+| **D3.2🧪** | Computer Useを初めて使う際、システムがAccessibility／Screen Recordingの権限プロンプトを表示し、許可後にスクリーンショット撮影／擬似入力が動作すること | ⛔ **廃止**（2026-10）：ホストデスクトップの Computer Use（`native` モード）は削除されました。Computer Use は現在、`computer_*` MCP ツールを通じて隔離されたコンテナ内でのみ動くため、これらの macOS の権限を求めることはありません |
 | **D5署名／クリーンマシン** | D4.1と同様。加えて`spctl -a -vvv DuDuClaw.app`が`accepted`を返すこと | ✅ **検証済み**：`spctl -a -vvv` = `accepted, source=Notarized Developer ID` |
 
 ---

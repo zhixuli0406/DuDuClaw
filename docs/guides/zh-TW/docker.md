@@ -28,7 +28,7 @@ DuDuClaw 的 Docker 映像建置於 `container/Dockerfile.server`，採三階段
 
 - `duduclaw` 主程式（Rust，含 dashboard）
 - `@anthropic-ai/claude-code`、`@openai/codex`、`@google/gemini-cli`（透過 `npm i -g`）
-- `docker.io` CLI（用於呼叫宿主機 Docker daemon 建立 agent sandbox）
+- `docker.io` CLI（掛載 socket 後面那個 Docker daemon 的用戶端；啟用任務沙箱時才會用到）
 - （選用）Python 3.12：僅 LLMLingua-2 提示壓縮器（需 `llmlingua`）才需要；Skill 安全掃描與通道回覆已是 Rust-native，不再依賴 Python
 
 ---
@@ -307,9 +307,13 @@ OPENAI_API_KEY=sk-proj-...
 
 按量計費（OpenAI API 定價）。
 
-### 6.3 Gemini（Google）CLI
+### 6.3 Gemini（Google）CLI（已棄用）
 
-#### 方法 A：Google OAuth
+> **v1.67.0 棄用，v1.69.0 移除。** Google 在 2026-06-18 停止以 Gemini CLI 服務免費、Google AI Pro 與 Google AI Ultra 的個人帳號，所以個人 Google 登入已經無法搭配它使用。API key 與企業（Gemini Code Assist）用法不受影響。image 在移除前仍內含 Gemini CLI。請改用 Antigravity runtime（`antigravity`，執行檔 `agy`），詳見[已棄用名稱](deprecations.md#gemini-cli-runtime)。
+>
+> 透過 `agy` 登入 Antigravity 需要終端機與 OS keyring，容器裡兩者都沒有，所以容器請用 API key 模式：設定 `config.toml [antigravity] auth = "api_key"`，並提供同一把 Gemini API key（`gemini` provider 帳號，或下方的 `GEMINI_API_KEY`）。Antigravity 的設定同樣存在 `~/.gemini` 底下，所以下方的 `duduclaw-gemini` volume 要保留。
+
+#### 方法 A：Google OAuth（僅限 Gemini Code Assist／企業帳號）
 
 ```bash
 docker compose exec duduclaw bash
@@ -318,8 +322,6 @@ gemini auth
 # 狀態寫入 /home/duduclaw/.gemini/ ── 即 duduclaw-gemini volume
 exit
 ```
-
-Google 對 Gemini CLI 目前提供免費額度，適合日常使用。
 
 #### 方法 B：API Key Fallback
 
@@ -339,8 +341,8 @@ GEMINI_API_KEY=AIza...
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-preferred = "claude"      # 主 runtime：claude / codex / gemini / openai-compat
-fallback = "gemini"       # Claude 不可用時自動切換
+preferred = "claude"      # 主 runtime：claude / codex / antigravity / openai-compat（gemini 已棄用）
+fallback = "antigravity"  # Claude 不可用時自動切換
 ```
 
 完整範例與 failover 策略請見
@@ -379,7 +381,7 @@ claude auth status
 
 | 路徑 | 用途 | 必要性 |
 |------|------|-------|
-| `/var/run/docker.sock` | 讓容器呼叫宿主機 Docker daemon 建立 agent sandbox | **必要**，用於 container sandbox 隔離執行 |
+| `/var/run/docker.sock` | 讓容器呼叫宿主機 Docker daemon | 只有逐員工的任務沙箱會用到（預設關閉）；gateway 本身跑在容器裡時使用任務沙箱，[task-sandbox.md](task-sandbox.md) 沒有涵蓋，也沒有驗證過 |
 
 ### 7.1 備份
 
@@ -651,10 +653,9 @@ allowed_origins = ["duduclaw.your-tailnet.ts.net"]
 - 到 Dashboard → Channels 檢查該 channel 的連線狀態指示燈
 - 看 log：`docker compose logs -f duduclaw | grep -i webhook`
 
-### Container sandbox 無法啟動子 agent
+### 任務沙箱無法啟動
 
-DuDuClaw 會透過 `docker.sock` 呼叫宿主機 Docker daemon 建立隔離容器
-執行 agent tasks。若失敗：
+這只適用於 `agent.toml [container] sandbox_enabled = true` 的員工。gateway 本身跑在容器裡時使用任務沙箱，並未涵蓋也沒有驗證過；沙箱 image 必須已存在於 socket 指向的那個 Docker daemon，而且不會自動下載（見 [task-sandbox.md](task-sandbox.md)）。下面的容器端步驟只確認 socket 能不能用：
 
 ```bash
 # 測試 socket 能否從容器內使用

@@ -235,19 +235,22 @@ process that owns the child, which is where kill must originate.
 
 ---
 
-## Phase 6 — Secondary parity items (RFC-26 §4, independent) ✅ DONE
+## Phase 6 — Secondary parity items (RFC-26 §4, independent) ⚠️ PARTIALLY COMPLETE
 
 > These are **independent** of the core forking feature (P1–P5) and each touches a
-> different existing subsystem. All five (6.1 Plan Mode, 6.2 Checkpoint fork/rewind +
-> durable SQLite, 6.3 Built-in skills, 6.4 Memory `/improve`, 6.5 Task Board claim +
-> cycle detection) landed across Round 2/3, each with unit tests.
+> different existing subsystem. Four of five items (6.1 Plan Mode, **6.2 Checkpoint fork/rewind + durable SQLite (REMOVED — see below)**, 6.3 Built-in skills, 6.4 Memory `/improve`, 6.5 Task Board claim + cycle detection) landed across Round 2/3, each with unit tests. **Item 6.2 is no longer available** due to the deletion of the `duduclaw-durability` crate on 2026-07-04 (commit `b0639b96`).
 
-### 6.2 Checkpoint fork/rewind (`crates/duduclaw-durability/src/checkpoint.rs`) ✅ DONE
-- [x] `fork(checkpoint_id, new_task_id) -> Checkpoint` (copy state under new lineage) (test)
-- [x] `rewind(task_id, checkpoint_id)` (restore earlier snapshot as current) (test)
-- [x] Lineage tracking — `Checkpoint.parent_checkpoint_id` (test)
-- [x] `get_by_id` + id-addressable `archive` (bounded at 2× `max_checkpoints`)
-- [x] **Round 2**: durable SQLite backend — `CheckpointManager::with_persistence(config, &db_path)` opens a `rusqlite` connection, creates the `checkpoints` table (with `parent_checkpoint_id` lineage column), and reloads on construction so fork/rewind/lineage survive restart (test persists then reopens). `new()` stays pure in-memory (unchanged).
+### 6.2 Checkpoint fork/rewind (~~`crates/duduclaw-durability/src/checkpoint.rs`~~) ❌ REMOVED
+
+**This item is no longer available.** The entire `duduclaw-durability` crate was removed in commit `b0639b96` on 2026-07-04 after verification that it had zero call sites in the production codebase. Historical implementation details are listed below for reference only:
+
+- ~~`fork(checkpoint_id, new_task_id) -> Checkpoint` (copy state under new lineage)~~
+- ~~`rewind(task_id, checkpoint_id)` (restore earlier snapshot as current)~~
+- ~~Lineage tracking — `Checkpoint.parent_checkpoint_id`~~
+- ~~`get_by_id` + id-addressable `archive` (bounded at 2× `max_checkpoints`)~~
+- ~~**Round 2**: durable SQLite backend~~
+
+**Impact**: Checkpoint save/rewind/fork functionality is not available in the current codebase.
 
 ### 6.1 Plan Mode (clarify-first planner) ✅ DONE
 - [x] **Round 2**: `plan_start` MCP tool (`mcp_planner.rs`) + `[planner]` config — clarify-first flow emits ≤3 clarifying questions then decomposes into `tasks_create` steps wiring `depends_on` for ordered steps (7 tests).

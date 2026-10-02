@@ -146,7 +146,7 @@ policy = "fixed_hierarchy"  # Dispatch policy (which AI employee picks up a task
 grounding_precheck_enabled = true  # Grounding precheck before acceptance (see "Grounding precheck"). Default true
 two_stage_judge = true  # Run a cheap first-stage evaluation before acceptance (see "Two-stage acceptance judging"). Default true
 judge = "mav"           # Who makes the acceptance call (see "Swapping the acceptance judge"). mav / external (evaluator_only / human_only are deprecated, removed in v1.68.0). Default mav
-judge_provider = "gemini"            # Optional: run the judge on another runtime (see "Running the judge on a different model"). Unset ⇒ the default utility runtime
+judge_provider = "antigravity"      # Optional: run the judge on another runtime (see "Running the judge on a different model"). Unset ⇒ the default utility runtime
 judge_model = "gemini-3-pro-preview" # Optional: judge model id within that runtime. Unset ⇒ the default utility model
 admission = "queue"     # What happens when ephemeral spawns hit the concurrency cap, "queue" or "fail". Default queue (see "Ephemeral spawn admission queueing" below)
 
@@ -222,9 +222,13 @@ Two new reasons a team task can land in your lap:
 
 ### The gate
 
-Before each round, a zero-LLM rule set decides Solo or Team. It leans Solo on purpose: a signal it cannot measure never fires, and three of four signals must fire to form a team. A live channel turn, a plan still awaiting your approval, or fewer than three rounds of budget left are all hard Solo.
+Before each round, a zero-LLM rule set (`crates/duduclaw-core/src/team_gate.rs`) decides Solo or Team. It leans Solo on purpose.
 
-Land on exactly two signals and the loop runs the planning stage once — a call the task needed anyway — then re-decides using what the plan actually broke the work into. Four or more genuinely independent sub-tasks forms the team; fewer falls back to the ordinary single-employee round, with the plan kept on disk.
+1. **Hard Solo**: the employee has `[container] sandbox_enabled = true` (checked before every mode, including `always_team`, so a sandboxed employee never forms a team), a live channel turn, a plan-first goal still awaiting your approval, an irreversible action in the plan, or fewer than three rounds of budget left.
+2. **Count four signals**: *bulk* (at least four independent work items and no dependency hubs), *context overflow* (the estimated input is larger than the model's context window), *capability gap* (the role-matrix gap is at or above the matrix's declared MDE) and *long horizon* (at least three acceptance criteria and the task produces artifacts). A signal it cannot measure never fires.
+3. **Decide**: three or more signals form the team; zero or one runs Solo; exactly two is the grey band.
+
+In the grey band the loop runs the planning stage once (a call the task needed anyway) and applies the same rule again, this time with the bulk signal measured from the sub-task packets the planner wrote. Before a plan exists the bulk signal has nothing to measure, so the grey band always means two of the other three signals fired, and the second pass forms the team only when the plan holds four or more sub-tasks with no dependency hubs between them. Otherwise the round falls back to the ordinary single-employee round. A team spec with no planner role cannot take the second pass and runs Solo.
 
 Every verdict is written to the audit log as `team_gate_decision` with the signals that fired, so a deployment's Solo/Team split is measurable rather than anecdotal.
 
@@ -368,7 +372,7 @@ When the AI employee reports completion and a task enters review, before the acc
 
 ## Task forward model (v1.53; default on since v1.54)
 
-When enabled, before each dispatch the goal loop "predicts" how the run will likely go, based on statistics from past tasks of the same kind (whether it'll fail, roughly which tool categories it'll use). After execution, it compares the prediction against the actual observation and records it as a transition, so the system builds up a task-level world model of "what tends to happen when doing this kind of thing." Works across every runtime (claude / codex / gemini / openai-compat):
+When enabled, before each dispatch the goal loop "predicts" how the run will likely go, based on statistics from past tasks of the same kind (whether it'll fail, roughly which tool categories it'll use). After execution, it compares the prediction against the actual observation and records it as a transition, so the system builds up a task-level world model of "what tends to happen when doing this kind of thing." It runs for every runtime, but how much it sees depends on whether the runtime feeds the native tool-event collector. Claude (the dispatch stream-json path), Codex, Gemini CLI (deprecated in v1.67.0, removed in v1.69.0), Antigravity and OpenAI-compatible agents record their native tool events, so their observations can reach `Full`. Grok and the seven generic print-mode CLIs (Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) attach no collector, so their observations are `McpOnly` (built from `tool_calls.jsonl` alone), or `None` when that file holds nothing for the round. The pipeline:
 
 - **Layered prediction fallback**: uses matching statistics when available, falls back to overall marginal statistics, then a prior default. Cold start never spends an LLM call.
 - **Honest fidelity grading**: every observation is tagged with its evidence fidelity (native tool events / audit-log-only / no evidence), so "we didn't see it" is never conflated with "it didn't happen."
@@ -417,7 +421,7 @@ A judge drawn from the same model family as the worker tends to forgive exactly 
 
 ```toml
 [dispatch]
-judge_provider = "gemini"              # A runtime id: claude, codex, gemini, grok, openai_compat, …
+judge_provider = "antigravity"        # A runtime id: claude, codex, antigravity, grok, openai_compat, … (gemini is deprecated)
 judge_model = "gemini-3-pro-preview"   # Model id within that runtime
 ```
 
@@ -425,7 +429,7 @@ Both are optional and independent. Unset, the judge keeps using the ordinary uti
 
 **Scope: global only.** There is no per-agent version of these keys. Every AI employee's work is judged by the same configured judge.
 
-What happens when the setting can't be honoured — in all three cases the judge falls back to the default utility model and keeps working, because a routing preference must never stall a verdict:
+What happens when the setting can't be honoured: in all four cases below (the first three are caught before anything is spawned, the fourth after the judge failed while running), the judge falls back to the default utility model and keeps working, because a routing preference must never stall a verdict:
 
 | Situation | Behavior |
 |---|---|

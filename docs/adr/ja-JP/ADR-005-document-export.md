@@ -43,6 +43,7 @@ md → HTML → PDF への印刷が可能である。PDF の品質は高く、�
 `browser_router.rs` は現時点ではスケルトンにすぎず、実際のブラウザ自動化は
 この router ではなく Playwright MCP 経由で動いており、PDF 出力の完全な
 ループはまだ配線されていない。「すでにあるもの」として扱うことはできない。
+*（2026-10-01 注記：`browser_router.rs` は 2026-09 に削除されており、呼び出し元は一度もなかった。[08-browser-automation](../../features/ja-JP/08-browser-automation.md) を参照。）*
 
 **(d) Google Slides API**
 ネイティブな Google Slides であり、Google Workspace をヘビーに利用する顧客に

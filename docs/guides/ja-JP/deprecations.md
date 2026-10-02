@@ -5,8 +5,10 @@
 MCP ツールは `tools/list` にも残っているので、古い名前を覚えたモデルはそのまま
 呼び出せます。
 
-**方針**: 古い名称は **マイナーバージョン 2 つ分** 残します。このページの項目はすべて
-**v1.66.0** で非推奨になり、**v1.68.0** での削除を予定しています。
+**方針**: 古い名称は **マイナーバージョン 2 つ分** 残します。このページの項目は
+**v1.66.0** で非推奨になり、**v1.68.0** での削除を予定しています。例外は Gemini CLI
+ランタイム（[ランタイム](#ランタイム)参照）で、**v1.67.0** で非推奨になり、**v1.69.0**
+での削除を予定しています。
 
 各面での示し方:
 
@@ -16,6 +18,7 @@ MCP ツールは `tools/list` にも残っているので、古い名前を覚�
 | CLI サブコマンド | clap の `hide = true` — `--help` には出ないが解析される | 使える |
 | `config.toml` の値 | 読み込み時にプロセスごと 1 回 `warn!`、ダッシュボード経由の書き込み時には監査イベント | 使える。設定された挙動が黙って置き換わることはない |
 | ダッシュボード | 新しい名前だけを提示。保存済みの非推奨値は「非推奨」ラベル付きで表示 | 使える |
+| エージェントランタイム | 読み込み時にプロセスごと 1 回 `warn!`、ダッシュボード経由の書き込み時には監査イベント `runtime_provider_deprecated`。ダッシュボードは選択肢として提示しなくなり、保存済みの値には「非推奨」ラベルを付ける | 使える。解析も実行もこれまでどおり |
 
 ---
 
@@ -167,12 +170,84 @@ doc コメントの注意書きだけで区別されていた 2 つの別プロ�
 
 ---
 
+## ランタイム
+
+### Gemini CLI ランタイム
+
+**Gemini CLI エージェントランタイム**（ランタイム id `gemini`、実行ファイル `gemini`、
+npm パッケージ `@google/gemini-cli`）は **v1.67.0** で非推奨となり、**v1.69.0** での
+削除を予定しています。後継は **Antigravity CLI ランタイム**（`antigravity`、実行ファイル
+`agy`）です。
+
+| 旧 | 新 |
+|---|---|
+| `agent.toml [runtime] provider = "gemini"` | `provider = "antigravity"` |
+| `agent.toml [runtime] fallback = "gemini"` | `fallback = "antigravity"` |
+| `config.toml [runtime] utility_provider = "gemini"` | `utility_provider = "antigravity"` |
+| `config.toml [dispatch] judge_provider = "gemini"` | `judge_provider = "antigravity"` |
+| `[team.roles.*] runtime = "gemini"` | `runtime = "antigravity"` |
+| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
+
+**まだ使えるもの**: 上記の旧い値は v1.69.0 までこれまでどおり解析・実行されます。読み
+込み時にはプロセスごとに警告を 1 回記録し、ダッシュボード（`agents.create` /
+`agents.update`）経由で書き込むと監査イベント `runtime_provider_deprecated` も残ります。
+ダッシュボードは Gemini を提示しなくなりますが、保存済みの `gemini` は「非推奨」ラベル
+付きで表示されます。エージェント編集ページのランタイム選択肢には Antigravity が加わり
+ました。「選択したモデルに合わせてランタイムを揃える」処理は、非推奨のランタイムを書き
+込まなくなりました。初回セットアップウィザードの既定値は Gemini から Antigravity に
+変わりました。Docker イメージは削除まで Gemini CLI を同梱し続け、`duduclaw doctor` は
+`provider` または `fallback` が非推奨ランタイムのエージェントを一覧表示します。
+
+**非推奨ではないもの**: **Gemini API プロバイダー**（プロバイダー id `gemini`、
+`GEMINI_API_KEY`、LLM 層の `generateContent` プロトコル、`gemini` プロバイダーアカウ
+ント）は影響を受けません。Antigravity の API キーモードもこれを使います。
+
+**理由**: Google は 2026-06-18 に、無料、Google AI Pro、Google AI Ultra の個人アカウ
+ントに対する Gemini CLI での提供を停止し、Antigravity CLI への移行を案内しています。
+API キーとエンタープライズ（Gemini Code Assist）のユーザーは影響を受けず、Gemini CLI
+自体は引き続きメンテナンスされています（出典: メンテナーの
+[告知](https://github.com/google-gemini/gemini-cli/discussions/28017)、Google の
+[移行ガイド](https://antigravity.google/docs/cli/gcli-migration/)）。Gemini CLI が終了
+したわけではありません。
+
+**移行手順**:
+
+1. `agent.toml` で `[runtime] provider = "gemini"`（および `fallback = "gemini"`）を
+   `"antigravity"` に変更する。
+2. 認証: Google アカウントでサインインする場合は、ホストのターミナルで `agy` を実行して
+   ログインを完了する。Gemini CLI を API キーで認証していた場合は
+   `config.toml [antigravity] auth = "api_key"` を設定し、同じ Gemini API キー
+   （`gemini` プロバイダーアカウント、または `GEMINI_API_KEY`）を使い続ける。
+3. モデル名: `agy models` が一覧表示する名前を使う。Gemini CLI の設定からコピーした id
+   では同じモデルが選ばれないことがある。
+4. `duduclaw doctor` を実行すると、`provider` または `fallback` が非推奨ランタイムの
+   エージェントが一覧表示される。
+
+**削除の前提条件**: v1.69.0 でこのランタイムを削除する前に、Antigravity の API キー
+モードを実際の Gemini API キーで検証しておく必要があります。これまでに試したのは、キー
+が無効な場合のエラー経路だけです。
+
+---
+
 ## v1.68.0 で起きること
 
-上記の古い名称はすべて削除されます。v1.67.x より先へ上げる前に:
+上記の古い名称はすべて削除されます。ただし Gemini CLI ランタイムは v1.69.0 まで残ります（次節）。v1.67.x より先へ上げる前に:
 
 1. エージェントのプロンプト、スキル、自動化から古い MCP ツール名を grep する。
 2. スクリプト、cron エントリ、systemd unit から古い CLI の綴りを grep する。
 3. `config.toml [dispatch] judge` が非推奨の値のままでないか確認する。
 
 対象ツールの説明の先頭にある `[deprecated → …]` は、grep できるように付けています。
+
+## v1.69.0 で起きること
+
+Gemini CLI ランタイムが削除されます（`runtime/gemini.rs`、カタログ項目、Discovery の
+Gemini ファミリー、Docker イメージ内の `gemini-cli` パッケージ）。Gemini API プロバイ
+ダーは残ります。v1.68.x より先へ上げる前に:
+
+1. すべての `agent.toml` から `provider = "gemini"` と `fallback = "gemini"` を grep
+   する。または `duduclaw doctor` を実行する。
+2. `config.toml` の `utility_provider`、`[dispatch] judge_provider`、
+   `[team.roles.*] runtime`、`[discovery.attempt.runtimes.gemini]` が `gemini` のまま
+   でないか確認する。
+3. 上記の Antigravity のサインインまたは API キー設定を済ませる。

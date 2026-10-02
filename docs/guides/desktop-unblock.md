@@ -141,7 +141,7 @@ In the GitHub repo, go to Settings → Secrets and variables → Actions and add
 | --- | --- | --- |
 | **D4.1 🧪** | Copy the signed and notarized `.dmg` to **another Mac that has never had your certificate installed**, then double-click it → it should **not** show "from an unidentified developer" (來自未識別開發者) | ✅ **Verified** (2026-07-01, `desktop-v1.31.0`): `stapler validate` = *worked*, `spctl -a` = accepted / Notarized Developer ID |
 | **D3.1 🧪** | After signing with the hardened runtime, open the app and confirm the sidecar can still spawn the CLI / reach the network (trigger a chat action that needs the network) | ⬜ Still needs a real run inside the signed app |
-| **D3.2 🧪** | The first time Computer Use runs, the system should show the Accessibility / Screen Recording permission prompt; after granting it, screenshots/simulated input should work | ⬜ Not yet verified |
+| **D3.2 🧪** | The first time Computer Use runs, the system should show the Accessibility / Screen Recording permission prompt; after granting it, screenshots/simulated input should work | ⛔ **Obsolete** (2026-10): host-desktop computer use (the `native` mode) was removed; computer use now runs only in an isolated container through the `computer_*` MCP tools, so it never asks for these macOS permissions |
 | **D5 signing/clean machine** | Same as D4.1, and `spctl -a -vvv DuDuClaw.app` should return `accepted` | ✅ **Verified**: `spctl -a -vvv` = `accepted, source=Notarized Developer ID` |
 
 ---

@@ -83,6 +83,8 @@ Recordings land in `~/.duduclaw/recordings/<id>/` (directory permissions 700), w
   input-event stream, and distillation relies solely on the window-switch sequence.
 - Desktop replay is fundamentally a computer-use task (`skill_type: desktop-sop`) —
   replay executes step by step, verifies each step with a screenshot, and stops on any
-  failure.
+  failure. These are instructions in the SKILL.md, not an enforced replay engine, and
+  the `computer_*` tools drive an isolated container browser rather than the host
+  desktop the recording came from.
 - Browser recording needs a locally available Playwright; `headless=true` is only
   suitable for verification (use the default headed mode for human demonstrations).

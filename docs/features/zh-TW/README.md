@@ -14,31 +14,31 @@
 | 3 | [信心路由器與本地推論引擎](03-confidence-router.md) | 智慧模型選擇，節省 80% 以上 API 費用 |
 | 4 | [檔案式 IPC 訊息匯流排](04-file-based-ipc.md) | 結構化跨 Agent 委派 + TaskSpec 工作流 |
 | 5 | [安全防線](05-security-defense.md) | 四道現役守衛各跑在哪裡，以及它們都擋不住什麼 |
-| 7 | [多帳號輪替與跨供應商容錯](07-account-rotation.md) | 跨 Claude/Codex/Gemini 的認證資料智慧排程 |
-| 8 | [瀏覽器自動化與 Computer Use](08-browser-automation.md) | 三組由 agent 自行選擇的 MCP 工具，沒有自動路由器 |
+| 7 | [多帳號輪替與跨供應商容錯](07-account-rotation.md) | 跨 Claude/Codex/Antigravity 的認證資料智慧排程 |
+| 8 | [瀏覽器自動化與 Computer Use](08-browser-automation.md) | agent 自行選擇的兩個抓取工具與可選的瀏覽器 server，加上透過八個 `computer_*` MCP 工具驅動的電腦操作 session；沒有自動路由器 |
 | 9 | [行為契約與紅隊測試](09-behavioral-contracts.md) | 可機器執行的 Agent 行為邊界 |
 | 10 | [認知記憶系統](10-cognitive-memory.md) | 仿人腦記憶設計，具備遺忘曲線 |
 | 11 | [Prompt 預算強制](11-token-compression.md) | 估算 prompt、走三個階段，不然就拒絕 |
 | 12 | [產業模板與 Odoo ERP 橋接](12-industry-templates.md) | 開箱即用的商業智慧 |
-| 13 | [Multi-Runtime Agent 執行](13-multi-runtime.md) | Claude / Codex / Gemini / OpenAI-compat 統一後端 |
+| 13 | [Multi-Runtime Agent 執行](13-multi-runtime.md) | Claude / Codex / Antigravity / Grok / OpenAI-compat 等多種後端統一（Gemini CLI 已棄用） |
 | 14 | [語音管線](14-voice-pipeline.md) | 兩條分開接線的 STT／TTS 路徑：fail-closed 的 HTTP 端點與寫死供應商的 Telegram handler |
 | 15 | [Skill 生命週期引擎](15-skill-lifecycle.md) | 7 階段自動化技能萃取與管理 |
 | 16 | [Session 記憶堆疊](16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |
 | 17 | [Wiki 知識分層](17-wiki-knowledge-layer.md) | L0-L3 四層信任加權知識，自動注入系統 prompt |
-| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | stdio JSON-RPC 2.0，Zed/JetBrains/Neovim 整合 |
+| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | `duduclaw acp` 說 Agent Client Protocol v1，供 IDE 面板（Zed / JetBrains / nvim）使用；`duduclaw acp-server` 是 A2A stdio 介面 |
 | 20 | [記憶智能](20-memory-intelligence.md) | 時序事實 + Reflexion 迴圈 + 批次擷取（v1.19.0） |
 | 23 | [Autopilot 規則引擎](23-autopilot-engine.md) | 事件驅動自動化 + 斷路器 |
 | 24 | [任務看板與活動動態](24-task-board.md) | Agent 即隊友的任務管理 |
 | 25 | [身分解析](25-identity-resolution.md) | WikiCache / Notion / Chained 供應器（RFC-21 §1） |
 | 26 | [MCP HTTP/SSE 傳輸](26-mcp-http-sse.md) | Bearer 認證 REST + SSE 端點（W20） |
 | 27 | [一次性 PTY 呼叫](27-pty-pool-runtime.md) | 給需要真終端機的 CLI 一個 PTY；連線池已於 2026-09 移除 |
-| 28 | [即時執行分支（Live Forking）](28-live-forking.md) | 並行分支 + AI 評審（duduclaw-fork, RFC-26） |
+| 28 | [即時執行分支（Live Forking）](28-live-forking.md) | 並行分支與 AI 評審；複本篩選、保留分支實際採用及測試逾時清理 |
 | 29 | [演化事件](29-evolution-events.md) | 黑盒紀錄器，批次 + 重試遞送 |
 | 30 | [自訂儀表板小工具](30-custom-widgets.md) | AI 引導或原始 HTML 的儀表板卡片，沙箱內執行 |
 | 31 | [辦公文件套件](31-office-document-suite.md) | 真實 docx/xlsx/pptx/pdf 產出：DELIVER 交付協定、歸檔與預覽 |
 | 32 | [專家包](32-expert-packs.md) | 可安裝的 AI 團隊：內建目錄、LLM 引導自製、部門×階級組織對位 |
 | 33 | [OS 感知與主動關懷](33-os-native-perception.md) | 檔案監看＋前景感知 → 足跡記憶、關懷檢查、一鍵自動化 |
-| 34 | [自主目標迴圈](34-goal-loop.md) | /goal → 迴圈到完成，MAV 驗收判官；卡住升級真人 |
+| 34 | [自主目標迴圈](34-goal-loop.md) | /goal → MAV 驗收，記錄逐輪狀態與成本；週報存活表明示樣本限制 |
 | 35 | [照片 → 桌寵](35-photo-desktop-pet.md) | 本地照片轉像素桌寵：Codex Pets 動作表＋漫遊引擎 |
 | 36 | [錄製 → 技能](36-recording-to-skill.md) | 瀏覽器/桌面錄製蒸餾成審批制 SKILL.md 草稿 |
 | 37 | [部門與階級隔離](37-delegation-isolation.md) | 組織邊界委派政策：階級 / 部門 / 白名單強制 |
@@ -58,10 +58,13 @@
 | 51 | [DuDuClaw OS 快捷鍵總表](51-os-keyboard-shortcuts.md) | DuDuClaw OS 全部快捷鍵：compositor 全域綁定、殼 UI、首次設定、鎖定畫面 |
 | 52 | [DuDuClaw OS 桌面版](52-desktop-edition.md) | 人與 AI 共用一台機器：影子工作區、人輸入永遠優先、明確交還、共駕預設關閉 |
 | 53 | [裝置上的本地模型](53-local-models.md) | 六個查證過的 GGUF，一鍵下載、一鍵啟用；預設 hybrid，速度誠實不灌水 |
-| 54 | [微調與後訓練](54-finetune.md) | 資料在這裡整理、訓練到別的 GPU 上跑、GGUF／LoRA 再收回來——這台機器不做訓練 |
+| 54 | [微調與後訓練](54-finetune.md) | 資料在這裡整理、訓練到別的 GPU 上跑、GGUF／LoRA 再收回來，這台機器不做訓練 |
 | 55 | [資料來源與原生資料庫連接器](55-data-sources.md) | 任何 `db_field` 規則都能指向的登錄表，讓客戶自接的外部 MCP server 也去識別化的 proxy，以及第一方的唯讀 PostgreSQL／MySQL／SQLite 連接器 |
-| 58 | [夜間引擎](58-night-engine.md) | 閒置時段的記憶整理：四個子階段（兩個確定性、兩個走輔助模型）、每 pass 花費上限與每日斷路器，兩道各自獨立的開關預設全關 |
-| 59 | [本機 proxy](59-local-proxy.md) | `duduclaw proxy`——OpenAI 相容的 localhost 端點，讓 Aider／Cline／Codex 借用帳號池；強制 Bearer、預設綁 loopback，並誠實揭露訂閱制 OAuth 席次無法轉發 |
+| 56 | [團隊即員工（Team-as-Agent）](56-team-as-agent.md) | 一位員工內部分 規劃／執行／審核／合成 四個角色，各自綁定自己的 runtime 與模型。開關預設開啟，但要在 `[team.roles]` 指名第二家廠商才會真的成團；可拆性閘逐任務判定，角色之間交換 TaskPacket 而不是逐字稿 |
+| 57 | [UCCI 校準串接](57-ucci-calibrated-cascade.md) | 實驗性、需主動開啟的本地路由層：以 isotonic 校準的 router，依 token margin 不確定度決定 LocalFast→LocalStrong→雲端的升級，取代舊的 post-hoc 信心閘；離線擬合，預設關閉 |
+| 58 | [夜間引擎](58-night-engine.md) | 閒置時段的記憶整理：四個子階段（兩個確定性、兩個走輔助模型）、每 pass 花費上限與每日斷路器，兩道各自獨立的開關預設全關；有成果的整理會顯示於 Activity Feed |
+| 59 | [本機 proxy](59-local-proxy.md) | `duduclaw proxy`：OpenAI 相容的 localhost 端點，讓 Aider／Cline／Codex 借用帳號池；強制 Bearer、預設綁 loopback，並誠實揭露訂閱制 OAuth 席次無法轉發 |
+| 60 | [Discovery 探索](60-discovery.md) | 核准工作區探索、預算與樹狀帳本、雜湊驗證成品、零 LLM held-out 策略比較；整合驗證中 |
 
 ---
 

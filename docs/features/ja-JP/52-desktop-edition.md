@@ -40,7 +40,7 @@
   ルなウィザード形式です。
 - **AI ランタイムの認証**——ウィザードの 1 ステップで、イメージがランタ
   イムを同梱している AI サービスを一覧します(Claude Code、Codex、
-  Gemini CLI、Grok、Qwen、Kimi、Copilot、Cursor、Mistral Vibe、
+  Gemini CLI（非推奨）、Grok、Qwen、Kimi、Copilot、Cursor、Mistral Vibe、
   OpenCode、および API キーのみの各社。Kiro はサポート対象のランタイムで
   すが、imageには意図的に同梱されていません)。各行には未設定 / キー保存済み /
   ログイン済みのいずれかが表示されます。API キーを貼り付ける(管理画面と

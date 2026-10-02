@@ -21,6 +21,8 @@ DuDuClaw 的帳號輪替對 API 認證資料做的是同一件事——自動、
 
 ### 帳號類型
 
+若驗證環境不能自動載入主機登入或供應商環境金鑰，請在該環境的 `config.toml` 設定 `[account_loading] inherit_host_credentials = false`。明確指定的帳號認證資料仍可使用。適用範圍與錯誤處理見[使用明確指定的帳號池驗證](../../guides/zh-TW/isolated-validation.md)。
+
 系統支援兩種 API 認證資料：
 
 **OAuth Session** — 連結到訂閱方案（Pro、Team、Max）。通常包含月度免費 API 呼叫配額。它們是「回饋卡」（優先使用）。
@@ -226,7 +228,7 @@ LeastCost 策略確保免費配額（來自訂閱）優先消耗。付費 API �
 
 ## 跨供應商容錯
 
-搭配 DuDuClaw 的 Multi-Runtime 架構（Claude / Codex / Gemini / OpenAI-compat），帳號輪替延伸到跨供應商層級。**FailoverManager** 協調跨供應商的健康狀態：
+搭配 DuDuClaw 的 Multi-Runtime 架構（Claude / Codex / Antigravity / OpenAI-compat；Gemini CLI runtime 於 v1.67.0 棄用、v1.69.0 移除），帳號輪替延伸到跨供應商層級。**FailoverManager** 協調跨供應商的健康狀態：
 
 ```
 主要供應商（Claude）被限速
@@ -234,7 +236,7 @@ LeastCost 策略確保免費配額（來自訂閱）優先消耗。付費 API �
      v
 FailoverManager 檢查替代方案：
   - Codex CLI 可用？→ 路由過去
-  - Gemini CLI 可用？→ 路由過去
+  - Antigravity CLI 可用？→ 路由過去
   - 本地推論可用？→ 路由過去
      |
      v

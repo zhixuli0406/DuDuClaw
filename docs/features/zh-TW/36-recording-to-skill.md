@@ -44,7 +44,7 @@ HAR 在停止當下**就地**遮罩,任何下游讀取之前:
 2. 通過者暫存在隔離的草稿區(`~/.duduclaw/skills-drafts/<id>/SKILL.md`),並經共用的 ApprovalBroker 建立待審紀錄、送到真人面前。
 3. 只有儀表板的核准動作會安裝 skill,而且該安裝會再跑一次自己的重掃。被駁回的草稿留在隔離區。
 
-桌面來源的 skill 帶 `skill_type: desktop-sop`,以 computer-use 任務重播:一步一步、每步之後截圖驗證、遇到第一個失敗就停。
+桌面來源的 skill 帶 `skill_type: desktop-sop`,以 computer-use 任務重播:一步一步、每步之後截圖驗證、遇到第一個失敗就停。這些重播規則是寫進 SKILL.md、要 agent 照著做的指示，不是另外一套重播引擎。Agent 的 `computer_*` 工具驅動的是隔離容器裡的瀏覽器，不是錄製時所在的桌面，所以需要主機應用程式的桌面 SOP 無法用它們重播。
 
 ## 能力閘
 

@@ -21,6 +21,8 @@ DuDuClaw's account rotation does the same thing with API credentials — automat
 
 ### Account Types
 
+For a validation instance that must not auto-load the host's login or provider environment keys, set `[account_loading] inherit_host_credentials = false` in its `config.toml`. Explicit account credentials remain authorized. See [validation with an explicit account pool](../guides/isolated-validation.md) for the scope and failure behavior.
+
 The system supports two types of API credentials:
 
 **OAuth Sessions** — Linked to subscription plans (Pro, Team, Max). These typically include a monthly quota of free API calls as part of the subscription. They're the "cashback cards" — use them first.
@@ -250,7 +252,7 @@ The entire system is automatic. Once configured, operators don't need to manuall
 
 ## Cross-Provider Failover
 
-With DuDuClaw's Multi-Runtime architecture (Claude / Codex / Gemini / OpenAI-compat), account rotation extends across providers. The **FailoverManager** coordinates cross-provider health:
+With DuDuClaw's Multi-Runtime architecture (Claude / Codex / Antigravity / OpenAI-compat; the Gemini CLI runtime is deprecated in v1.67.0 and removed in v1.69.0), account rotation extends across providers. The **FailoverManager** coordinates cross-provider health:
 
 ```
 Primary provider (Claude) rate-limited
@@ -258,7 +260,7 @@ Primary provider (Claude) rate-limited
      v
 FailoverManager checks alternatives:
   - Codex CLI available? → Route there
-  - Gemini CLI available? → Route there
+  - Antigravity CLI available? → Route there
   - Local inference available? → Route there
      |
      v

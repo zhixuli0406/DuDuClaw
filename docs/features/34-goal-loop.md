@@ -42,6 +42,18 @@ The panel prompt also carries four standing discipline clauses, always on (no co
 
 Judge depth scales with goal difficulty (a local, zero-LLM heuristic): simple single-step goals get a two-aspect check (correctness + safety) and a lower iteration cap; hard goals get the full panel. The safety aspect is never dropped at any depth.
 
+## Round history and weekly report (v1.67.0)
+
+Each dispatched round records the evaluator and judge decisions, dispatch sequence, Solo/Team mode and gate inputs, state and configuration snapshots, and any pause reason. Accepted rounds retain a bounded worker excerpt. Retrying a paused task adds a fresh open record; sealed decisions remain available, including after the pause is resolved. Token usage is attributed to the task and round.
+
+`duduclaw weekly-report --days 30 --format json` includes goal statistics grouped by retry limit and Solo/Team mode. For each cutoff, it reports how many accepted tasks would be lost, how many rounds would be saved, and the fraction of accepted tasks completed by that round, with a 95% Wilson interval. Cancelled and still-running tasks are listed separately. Legacy configuration snapshots stay unknown; small samples are explicitly labelled as indistinguishable from luck. This descriptive table does not establish that changing the retry limit improves results.
+
+`duduclaw knobs survival --days 30 --format json` is the dedicated read-only history report. It groups recorded retry limits, dispatch-time difficulty, Solo/Team mode, and verified manual retries. Missing or inconsistent historical snapshots remain unknown. A separate human-approved cohort uses authenticated outcome decisions; ordinary activity messages and permission to start a goal are not outcome approval. An approval without a bound iteration is counted separately, without inventing its round.
+
+The command reads a private copy of the task ledger, verified against source hashes and file identity before and after capture. It does not migrate or update the task, cost, or audit databases. A nonempty WAL or journal makes the report unavailable; checkpoint it through the normal service before reporting. Missing, corrupt, changing, or oversized history produces an explicit error rather than an empty successful report. Output defaults to stdout; `--output` writes only the chosen report artifact and rejects aliases of database files and sidecars. The tables describe logical judged rounds, not total dispatches or an experiment proving a better retry policy; manual intervention and unknown settings retain that limitation.
+
+The reader refuses oversized reports rather than returning a truncated subset: a 64 MiB source database, 5,000 tasks in the selected window, 2,000 iteration records, 64 KiB per text field, 8 MiB of retained text, logical rounds up to 1,000, and 2,000 table rows across both cohorts. Capture, SQL, and aggregation share a two-second deadline. File artifacts are published with directory-descriptor protection on Unix; other platforms explicitly reject `--output` and support stdout. The four reserved database/sidecar names cannot be used as output basenames.
+
 ## Hard Guards — the Driver Owns the Bounds
 
 Termination is guaranteed by the driver, not by trusting the model:

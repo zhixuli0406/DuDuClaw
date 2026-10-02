@@ -45,26 +45,26 @@ recursively, run in sorted order). It defaults to `./evals`.
 | `--case <id>` | Exact case selection by stable id (the case file's **filename stem**, e.g. `p0-ceo-boundary-money-001`). Repeatable or comma‑separated. Never loads a case just to decide whether to run it, and never ambiguous the way `--filter` can be. |
 | `--exclude-dir <name>` | Exclude case files under a directory of this name (repeatable), e.g. `--exclude-dir held-out` to skip a held‑out rotation. Omit to include everything (default, unchanged). |
 | `--replay` | Parse recorded `*.transcript.jsonl` files instead of running the agent live (offline, zero credentials). Mutually exclusive with `--record`. |
-| `--record` | Live‑run, then write a `*.transcript.jsonl` baseline next to each case. A case may pin `[case] runtime` plus `[case] model` for a non-Claude baseline; the transcript is synthesized from that runtime's observable events. CLI `--runtime`/`--model` overrides remain forbidden with `--record` so a run cannot silently overwrite a differently declared baseline. |
+| `--record` | Live‑run, then write a `*.transcript.jsonl` baseline next to each case. A case may pin `[case] runtime` plus `[case] model` for a non-Claude baseline; the transcript is synthesized from that runtime's observable events. A CLI `--model` override or a non‑Claude CLI `--runtime` override remains forbidden with `--record` so a run cannot silently overwrite a differently declared baseline. |
 | `--no-judge` | Skip the `[judge]` rubric even when a case enables it (fully deterministic, zero‑cost). |
 | `--report <path>` | Write a JSON report (per‑case assertions, judge score/rationale, transcript diagnostics, durations, and — see [Honest statistics](#honest-statistics) — a `stats` block). |
 | `--repeats <N>` | Run each case `N` times and aggregate its pass **rate** instead of one noisy 0/1 (default `1`, unchanged behavior). See [Honest statistics](#honest-statistics). |
 | `--baseline <report.json>` | Paired statistical comparison against a previously written `--report` file. See [Honest statistics](#honest-statistics). |
 | `--mde <fraction>` | Declared minimum detectable effect for the resolution check, as a pass‑rate fraction (default `0.10` = 10 percentage points). See [Honest statistics](#honest-statistics). |
 | `--cluster-by <key>` | Cluster key for cluster‑robust standard errors. Only `dir` (default, each case's directory) is implemented — any other value is refused. See [Honest statistics](#honest-statistics). |
-| `--runtime <id>` | Which backend runs every case (`claude` — the default and the pre‑P2 path — `codex`, `gemini`, `antigravity`, `grok`, `openai_compat`, or any other catalog runtime id). An unknown id is refused, never treated as `claude`. **Omitted ⇒ each case's own `[case] runtime`, else `claude`.** See [Capability matrix](#capability-matrix---matrix). |
+| `--runtime <id>` | Which backend runs every case (`claude` — the default and the pre‑P2 path — `codex`, `gemini` (deprecated in v1.67.0, removed in v1.69.0; see [deprecations](deprecations.md#gemini-cli-runtime)), `antigravity`, `grok`, `openai_compat`, or any other catalog runtime id). An unknown id is refused, never treated as `claude`. **Omitted ⇒ each case's own `[case] runtime`, else `claude`.** See [Capability matrix](#capability-matrix---matrix). |
 | `--model <id>` | Model id override for every case, within `--runtime`. Omit to use each case's own `[case] model`. The report's `model` header always names what actually ran. |
 | `--paired-seeds` | Derive a deterministic seed per `(case id, repeat)` so the same draws line up across models (Miller's paired design). **Recorded, not applied** — no runtime in this build can consume a seed; each run says so via `seed_applied: false`. |
+| `--agent <id>` | Run every case under **this** provisioned agent instead of each case's own `[case] agent`. Recorded as `agent_override` in the report header and as `agent` per run. See [Borrowing one agent](#borrowing-one-agent---agent). |
+| `--matrix` | Measure the role→model capability matrix instead of running the suite once. See [Capability matrix](#capability-matrix---matrix). Brings `--roles`, `--models`, `--weak`, `--strong`, `--domain`, `--budget-usd`, `--max-cases`, `--temperature` — each of which is **refused without** `--matrix`. |
 
-`--record` is **refused** together with a non‑Claude `--runtime` or any `--model`
-override: recording would replace each case's committed baseline transcript with a
+`--record` is **refused** together with a CLI `--runtime` override naming a
+non‑Claude runtime (`--runtime claude` is accepted) or any CLI `--model` override: recording would replace each case's committed baseline transcript with a
 run of a model the case does not declare (and, for a non‑Claude runtime, with a
 synthesized transcript of different fidelity). Pin both in the case file instead —
 `[case] runtime` plus `[case] model` — and record without any override. Those two
 fields are what a run actually executes on when no CLI override is given; a CLI
 override still wins over them.
-| `--agent <id>` | Run every case under **this** provisioned agent instead of each case's own `[case] agent`. Recorded as `agent_override` in the report header and as `agent` per run. See [Borrowing one agent](#borrowing-one-agent---agent). |
-| `--matrix` | Measure the role→model capability matrix instead of running the suite once. See [Capability matrix](#capability-matrix---matrix). Brings `--roles`, `--models`, `--weak`, `--strong`, `--domain`, `--budget-usd`, `--max-cases`, `--temperature` — each of which is **refused without** `--matrix`. |
 
 **Case ids and suite uniqueness.** Every case's stable id is its filename stem
 (`[case] name` stays the human‑readable title, not the identity — `--filter`
@@ -721,7 +721,17 @@ because that utility call does not return usage to the matrix reporter.
   `bottleneck` (per‑role Δ with intervals + the resolved/unresolved outcome and
   its reason), `cost_estimate`, `budget_stop`, and every `runs[]` row.
 - **`role_model_matrix.toml`** next to it — the durable prior the team composer
-  will read (P5; it is **not** wired into the composer yet). One `[header]` plus
+  reads. The composer looks for it at `<DUDUCLAW_HOME>/role_model_matrix.toml`,
+  so copy it there to put it into effect. It is read for two things: a role in
+  `[team.roles.*]` with no `model` written takes the best **resolved** cell on
+  that role's own runtime (n‑weighted across domains; unresolved cells, ties, a
+  winner from another model family and a runtime with no CLI or credentials on
+  this host are all ignored, falling back to the employee's `[model] preferred`);
+  and the team gate's capability‑gap signal compares the executor's current
+  model with that winner, against the same file's declared MDE (see
+  [Goal loop: the gate](goal-loop.md#the-gate)). A file that fails validation
+  is ignored. The report header's `planner: "deferred"` only says `--matrix`
+  itself does not measure the planner role. One `[header]` plus
   one `[[cell]]` per measured cell. A statistic that could not be computed is an
   **absent key**, never a fabricated number; a cell with zero usable observations
   gets a report row but no matrix cell. The file is validated on both write and
@@ -740,10 +750,14 @@ because that utility call does not return usage to the matrix reporter.
 
 `--budget-usd <cap>` checks **before** dispatching each run, so the cap is a
 ceiling on spend and not merely a report of having exceeded it. Costs are priced
-through `duduclaw_llm::ModelRegistry`'s vendored table: from the usage the runtime
+through `duduclaw_llm::ModelRegistry` (the vendored table plus
+`<DUDUCLAW_HOME>/models.toml`): from the usage the runtime
 actually reported where it returns one, and otherwise from a coarse
 25k‑in / 4k‑out per‑run assumption (the design's own cost model). A model the
-registry has never heard of is a flat $0.05 stub. All three are labelled per run
+registry has never heard of is priced with the flat, labelled $0.05 stub, which
+can only happen without `--budget-usd` (with a budget, such a model refuses the
+run, see [Making `--budget-usd` meaningful](#making---budget-usd-meaningful)).
+All three are labelled per run
 in `runs[].cost_source` — never blended into one authoritative‑looking figure.
 Note that the Claude CLI path reports no usage at all, so a Claude‑only matrix is
 priced entirely from the coarse assumption.

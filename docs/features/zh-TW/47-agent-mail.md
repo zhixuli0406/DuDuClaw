@@ -144,6 +144,11 @@ smtp_tls = "starttls"                # none | implicit | starttls(預設)
 - **到達即觸發預設關閉。** 信一到就叫醒 agent 是一個要花錢的決定，所以每個
   部署要自己開（`[mail] auto_trigger`），而且就算開了，被標記的信仍然不會
   觸發。
+- **開了沙箱的員工不會被信件叫醒。** `agent.toml [container] sandbox_enabled
+  = true` 的員工，到達即觸發一律跳過：觸發後的執行要靠[任務沙箱](../../guides/zh-TW/task-sandbox.md)
+  裡沒有的平台工具，而且處理的是不受信任的外來內容。信件留在收件匣等人處理，
+  不會執行任何東西。gateway 會寫稽核事件 `task_sandbox_not_applied`
+  （`path = "mail"`、`action = "skipped"`），每位員工每個行程一次。
 - **白名單一律精確比對，不做子字串比對。** `allowed_senders` /
   `allowed_recipients` 的每一筆要嘛是完整地址，要嘛是 `@domain.com` 開頭的
   整個網域；像 `evil-example.com` 這種「只是包含」允許網域的相似域名一律

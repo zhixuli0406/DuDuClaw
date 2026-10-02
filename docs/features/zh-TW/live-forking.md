@@ -12,12 +12,22 @@ Live Forking 讓一個正在執行的任務當場分裂成 N 條競爭分支，�
 
 DuDuClaw 的 agent 是以 `claude` CLI 子行程跑的，所以一條「分支」就是一次隔離的子行程執行，帶著：
 
-- 自己的**工作區疊層**（copy-on-write：讀得到父工作區，寫只寫進自己的副本，互不污染）
+- 自己的**工作區疊層**（copy-on-write：從經篩選的父工作區副本開始，變更寫進自己的副本）
 - 自己的**帳號**（由 AccountRotator 分派不同帳號，分支之間不會撞到同一個 rate limit）
 - 自己的**預算上限**與可選的**引導語**（steering：告訴這條分支往哪個方向試）
-- 對父工作區的**唯讀共享視圖**
+- 父工作區**在建立分支時的副本**，內容經 fork 複製規則篩選
 
 跑完每條分支可選跑一個 `test_command`（例如 `pytest -q`），用 exit code 餵給 judge 評分。
+
+---
+
+## 採用保留的分支
+
+尚未採用的 fork 會把已完成分支保留在 `<home>/fork_ws/<fork_id>/<branch_id>/`。預設保留 24 小時，可由 `[fork] retained_workspace_ttl_hours` 調整；使用 fork 工具時會清理過期副本。呼叫 `merge_or_select` 時需帶 `fork_id` 與 `branch_id`，MCP 工具只接受建立該 fork 的 agent 採用；Dashboard 的 manager 也能挑選。人工採用與保留副本清理共用跨行程鎖。執行時自動採用尚未在不同 fork 之間共用此鎖，因此使用相同父工作區的自動 fork 應依序執行。工具會先把實際檔案複製到紀錄中的父工作區，再標記採用成功並清除保留副本。副本遺失或過期、父工作區不存在、複製失敗都會回報錯誤。省略 `branch_id` 不會重跑評審；自動評審在執行分支時完成。
+
+建立、保留與採用分支都使用同一套複製規則，排除 `.env`、`.env.*`、`*.pem`、`*.key`、SSH 私鑰名稱、`.npmrc`、`.pypirc` 與 `.netrc`。符號連結不會被跟隨：指向外部或目標不存在的連結會丟棄，Unix 上確認留在來源樹內的連結會重建。硬連結會變成獨立檔案，特殊檔案會丟棄；採用時會替換目的檔案，不會透過目的連結寫入。這是依名稱排除的規則，無法辨識所有可能的機密檔名。採用目標是 agent 目錄時，採用也絕不會把 agent 結構檔複製回去：`SOUL.md`、`CONTRACT.toml`、`agent.toml`、`.mcp.json`、`.claude/` 與其他 agent 結構檔維持上層原本的內容。分支仍然可以讀取它們。
+
+`test_command` 會在分支副本內執行。逾時時，Unix 會終止該行程群組，Windows 使用 `taskkill /T /F`；輸出擷取有大小上限。Unix 子行程若自行脫離群組，便不在此清理邊界內，輸出讀取也有有限的收尾等待時間。
 
 ---
 
@@ -82,6 +92,7 @@ aggregate_budget_usd = 1.50  # 所有分支合計上限
 merge_mode = "auto_with_fallback"
 test_command = ""            # 可選;空 ⇒ judge 的 test_pass_ratio 中性化
 test_timeout_s = 120
+retained_workspace_ttl_hours = 24          # 尚未採用的分支副本
 ```
 
 MCP 工具（agent 開了 `[fork] enabled = true` 才註冊，統一 gated 在 `Scope::ForkExecute`，fail-closed）：
@@ -91,7 +102,7 @@ MCP 工具（agent 開了 `[fork] enabled = true` 才註冊，統一 gated 在 `
 | `fork_run` | 把當前任務分成 N 條分支 |
 | `inspect_branches` | 列出活著的分支 + 狀態 + 花費 |
 | `diff_branches` | 兩條分支的檔案/輸出差異 |
-| `merge_or_select` | 收斂一個 fork（judge 判或你指定） |
+| `merge_or_select` | 建立該 fork 的 agent 明確挑選並採用保留分支 |
 | `terminate_branch` | 殺掉一條失控的分支 |
 | `fork_cost` | 合計與各分支花費 |
 

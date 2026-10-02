@@ -2,12 +2,13 @@
 
 ## アーキテクチャ概要（v1.13.1）
 
-DuDuClawは**マルチランタイム AI エージェントプラットフォーム（Multi-Runtime AI Agent Platform）**であり、統一された `AgentRuntime` トレイトを通じて**Claude Code / Codex / Gemini** CLIをAIバックエンドとしてサポートし、自動検出とエージェントごとの設定に対応しています。DuDuClawは単体のLLM製品ではなく、1つ（または複数）のAI CLIを、チャネルルーティング・セッション記憶・自己進化・マルチアカウントローテーション・ローカルLLM推論・ブラウザ自動化・IDE統合を備えた長時間稼働エージェントへと変える配管層です。
+DuDuClawは**マルチランタイム AI エージェントプラットフォーム（Multi-Runtime AI Agent Platform）**であり、統一された `AgentRuntime` トレイトを通じて**Claude Code / Codex / Antigravity / Grok** CLI（および OpenAI 互換 API）をAIバックエンドとしてサポートし（Gemini CLI バックエンドは v1.67.0 で非推奨、v1.69.0 で削除、Antigravity に置き換え）、自動検出とエージェントごとの設定に対応しています。DuDuClawは単体のLLM製品ではなく、1つ（または複数）のAI CLIを、チャネルルーティング・セッション記憶・自己進化・マルチアカウントローテーション・ローカルLLM推論・ブラウザ自動化・IDE統合を備えた長時間稼働エージェントへと変える配管層です。
 
 ## 主要なアーキテクチャ上の決定
 
 ### ランタイムとトランスポート
-- **Multi-Runtime**（`AgentRuntime` トレイト）— Claude / Codex / Gemini / OpenAI-compat の4バックエンド、`RuntimeRegistry` による自動検出、エージェントごとの設定は `agent.toml [runtime]` に記述。
+- **Multi-Runtime**（`AgentRuntime` トレイト）— Claude / Codex / Antigravity（`agy`）/ Grok / OpenAI-compat のバックエンドと、非推奨の Gemini CLI（v1.67.0 で非推奨、v1.69.0 で削除、Antigravity に置き換え）、`RuntimeRegistry` による自動検出、エージェントごとの設定は `agent.toml [runtime]` に記述。
+- **ランタイム間フェイルオーバー時のモデル置換**（`failover.rs`）：`[runtime] fallback` が*別の* provider に呼び出しを回す場合、フォールバック先ランタイムはプライマリのモデルidを引き継がなくなりました（以前は codex エージェントの `gpt-5.4` が Claude ランタイムに対して spawn されていました）。モデルは次の4つの分岐を順に評価して決まります。① `agent.toml [model] fallbacks` のうち、モデルファミリーが確実にフォールバック先ランタイムのものである最初のエントリ（`provider/model` 形式の修飾は外します）、② そのランタイムが要求されたモデルをすでに扱える場合は要求モデルを維持（モデルファミリーを宣言しない `openai_compat` が任意のidをプロキシし続けられるのはこの分岐によります）、③ ランタイムカタログがそのバックエンドに載せている最初のモデル、④ いずれにも当てはまらなければ**spawn を拒否**し、`no model configured for fallback runtime <P>` を報告して失敗した試行として記録します。置換のたびに `agent` / `from_runtime` / `to_runtime` / `from_model` / `to_model` を含む `warn!` を出力します。
 - **MCP Server（stdio）**（`duduclaw mcp-server`）— stdin/stdout上のJSON-RPC 2.0を通じて、チャネル・メモリ・エージェント・skill・task・共有wiki・autopilotの各ツールをAI Runtimeに公開します。登録はエージェントレベルの `<agent>/.mcp.json`（v1.8.5でv1.8.4のグローバル登録を取り消しました。Claude CLIの `-p --dangerously-skip-permissions` はプロジェクトレベルの `.mcp.json` しか読み込まないため）。Gateway起動時に全エージェントの `.mcp.json` を自動作成・修復します。
 - **MCP Server（HTTP/SSE）**（`duduclaw http-server --bind 127.0.0.1:8765`、v1.9.4）— Bearer認証の `POST /mcp/v1/call`（単発のJSON-RPCツール呼び出し）、`GET /mcp/v1/stream`（長時間接続のSSEイベントストリーム、Bearerまたは `?api_key=`）、`POST /mcp/v1/stream/call`（非同期＋SSE結果プッシュ）、`GET /healthz`（認証不要）。トークンバケット方式のレート制限（60 req/min）。`mcp_sse_store.rs` がbroadcastチャネルでSSE接続を管理します。外部HTTPクライアント向けにstdioを補完します。
 - **ACP/A2A Server**（`duduclaw acp-server`）— stdio JSON-RPC 2.0ループで、`agent/discover`、`tasks/send`、`tasks/get`、`tasks/cancel` メソッドを提供し、`.well-known/agent.json` のAgentCardを出力します。Agent Client Protocolを通じてZed / JetBrains / NeovimなどIDE統合を可能にします。
@@ -54,7 +55,7 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 ### Wikiナレッジレイヤー（v1.8.9）
 - **4層アーキテクチャ**（Vault-for-LLMに着想）：L0 Identity / L1 Core / L2 Context / L3 Deep。
 - **信頼度重み付け**（frontmatterの `trust`、0.0〜1.0）— 検索結果は信頼度加重スコアで順位付けされます。
-- **自動注入**：`build_system_prompt()` がL0+L1ページを自動的にWIKI_CONTEXTへ注入します。CLI／チャネル返信／dispatcherの各パスに対応し、Claude / Codex / Gemini / OpenAIの各ランタイムで統一されています。
+- **自動注入**：`build_system_prompt()` がL0+L1ページを自動的にWIKI_CONTEXTへ注入します。CLI／チャネル返信／dispatcherの各パスに対応し、Claude / Codex / Antigravity / Grok / OpenAI-compat の各ランタイム（および非推奨の Gemini）で統一されています。
 - **FTS5インデックス**（`unicode61` トークナイザー）— 書き込み/削除のたびに自動同期、`wiki_rebuild_fts` で手動再構築も可能。
 - **ナレッジグラフ**：`wiki_graph` MCPツールがBFS深度を制限したMermaid図をエクスポート。ノードの形状はレイヤーごとに異なります。
 - **重複検出**：`wiki_dedup` はタイトル一致＋タグのJaccard類似度（≥0.8）で重複ページを検出します。
@@ -67,15 +68,6 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 - **メモリ減衰の日次スケジューラー**：バックグラウンドタスクが24時間ごとに `duduclaw_memory::decay::run_decay` を実行。重要度が低く30日経過 → アーカイブ。アーカイブ済みで90日経過 → 完全削除。
 - **認知メモリMCPツール**：`memory_search_by_layer`（エピソード/意味フィルター）、`memory_successful_conversations`、`memory_episodic_pressure`、`memory_consolidation_status`。
 - **MemGPT 3層システム**（Core Memory、Recall Memory、Archival Bridge、Budget Manager、Consolidation Pipeline、MCPツール6個）は**v1.8.1で削除**されました（−1,985行）— このプロンプト注入方式はプロンプトごとに6,500トークンも肥大化させ、「lost in the middle」による注意力の劣化を引き起こしていました。
-
-### Worktree分離（v1.6.0）
-- **Git worktree L0分離レイヤー**— タスクごとのファイルシステム分離で、コンテナサンドボックスより低コスト。
-- **WorktreeManager**：create / remove / list / cleanup_staleのライフサイクル管理。
-- **アトミックマージ**：dry-runによる事前チェック → abort → クリーンな場合のみ実マージ。グローバル `Mutex` で保護。
-- **Snapワークフロー**：create → execute → inspect → merge/cleanup（判定ロジックは純粋関数で実装し、テスト容易性を確保）。
-- **ブランチ命名**：`wt/{agent_id}/{adjective}-{noun}`、50×50の単語リストから生成。
-- **copy_env_files**：パストラバーサル対策（jail）+ symlink拒否 + 1MBサイズ上限。
-- **リソース上限**：エージェントごとに最大5個のworktree、全体で最大20個。
 
 ### ローカル推論
 - **統一 `InferenceBackend` トレイト**（`duduclaw-inference` crate）：llama.cpp（Metal/CUDA/Vulkan/CPU）、mistral.rs（ISQ + PagedAttention + Speculative Decoding）、OpenAI互換HTTP（Exo/llamafile/vLLM/SGLang）。
@@ -106,9 +98,9 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 - **CONTRACT.toml**— `must_not` / `must_always` の境界ルール、system promptに自動注入。`duduclaw test` レッドチームCLI（組み込み9シナリオ）。
 - **統一マルチソース監査ログ**：`audit.unified_log` が `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` を共通のエンベロープ（timestamp / source / event_type / agent_id / severity / summary / details）にマージし、Logsページのフィルターチップで絞り込めます。
 - 保存時は**AES-256-GCM**— エージェントごとに鍵を分離。
-- **Ed25519 challenge-response** によるWebSocket認証。
-- **コンテナサンドボックス**（Docker / Apple Container / WSL2）— `--network=none`、tmpfs、読み取り専用rootfs、512MB上限。
-- **ブラウザ自動化と Computer Use**——エージェントが選ぶ3グループの MCP ツール、自動ルーターなし：L1 `web_fetch_cached`（SSRF ゲート付きキャッシュ HTTP）、L2 `web_extract`（CSS セレクタスクレイプ）、L5 は `computer_use_orchestrator` がコンテナの仮想ディスプレイを駆動する7つの `computer_*` ツール。L3 ヘッドレスはエージェントごとの任意の Playwright/Browserbase MCP サーバー（`.mcp.json`）。`CapabilitiesConfig`（`computer_use` / `browser_via_bash` / `allowed_tools` / `denied_tools`）によりデフォルト拒否。死コードだった `browser_router.rs` の5層ルーターとその「L4 Sandbox Browser」層は 2026-09 に削除。
+- **ダッシュボード／WebSocket 認証**：JWT アカウントログイン（パスワードは Argon2id でハッシュ化して `users.db` に保存）、または gateway の管理者トークンです。以前の Ed25519 challenge-response の経路は gateway から削除されました。どの設定からも有効にできないものでした。Ed25519 はライセンス署名、更新の検証、relay のデバイスプロトコルで引き続き使われます。
+- **コンテナサンドボックス**：独立した 2 つのパスがあります。エージェント単位の*タスクサンドボックス*（`agent.toml [container] sandbox_enabled`）は、委任されたタスクの AI CLI を読み取り専用・非 root・リソース制限付きの Docker コンテナで実行します（Docker のみ、`network_access = true` が必要、使えないときはタスクが失敗。[タスクサンドボックスガイド](../../guides/ja-JP/task-sandbox.md)を参照）。PTC `execute_program` と `secaudit` の PoC ステップが使う*スクリプトサンドボックス*は Docker 上（Windows ではまず WSL2）で動き、`--network=none`、読み取り専用ルートで、マウントは読み取り専用の専用スクリプトディレクトリだけです。使えないとき PTC はスクリプトを実行せず（`[container.sandbox] script_when_unavailable = "run_unsandboxed"` の場合を除く）、PoC はホスト上で実行されません。
+- **ブラウザ自動化と Computer Use**——エージェントが選ぶ取得ツール 2 つと任意のブラウザサーバー、自動ルーターなし：L1 `web_fetch_cached`（SSRF ゲート付きキャッシュ HTTP）、L2 `web_extract`（CSS セレクタスクレイプ）。L5 Computer Use は `computer_use_orchestrator` が起動するコンテナ内で動き（イメージ `ghcr.io/zhixuli0406/duduclaw-computer-use:v<バージョン>`、自動 pull なし、アクションは `xdotool`）、エージェントが 8 つの `computer_*` MCP ツールで駆動します（`duduclaw mcp-server` プロセスが署名付き loopback ルート `POST /api/internal/computer-use`、`computer_use_sessions/` を通じて gateway 所有のセッションに転送。ネットワークはセッション開始時にピン留めされた、エージェントごとの `allowed_domains` のホストにのみ）。チャットで起動するループと `native` のホストデスクトップモードは削除されました。L3 ヘッドレスはエージェントごとの任意の Playwright/Browserbase MCP サーバー（`.mcp.json`）。`CapabilitiesConfig`（`computer_use` / `browser_via_bash` / `allowed_tools` / `denied_tools`）によりデフォルト拒否。死コードだった `browser_router.rs` の5層ルーターとその「L4 Sandbox Browser」層は 2026-09 に削除。
 - **CJK安全なバイトスライス**：`duduclaw_core::truncate_bytes` / `truncate_chars` が31箇所の安全でない `s[..s.len().min(N)]` を置き換え（v1.8.11のマルチバイトコードポイントpanicを修正）。
 
 ### アカウントとコスト
@@ -119,6 +111,7 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 - **`FailureReason` 分類**— RateLimited / Billing / Timeout / BinaryMissing / SpawnError / EmptyResponse / NoAccounts / Unknown。カテゴリごとに専用のzh-TWユーザー向けメッセージを表示し、`channel_failures.jsonl` に監査記録を残します。
 - **バイナリ検出**：`which_claude()` / `which_claude_in_home()` がHomebrew（Intel + Apple Silicon）、Bun、Volta、npm-global、`.claude/bin`、`.local/bin`、asdf shims、NVMバージョンディレクトリを探索します。`PATH` が空の状態でlaunchdから起動されたgatewayがバイナリを発見できない問題を修正。
 - **CostTelemetry**：SQLiteベースのトークン使用量トラッキングとキャッシュ効率分析（`cache_read / (input + cache_read + cache_creation)`）、200Kの価格崖警告、適応的ルーティング（キャッシュ効率<30% → ローカルへ）。MCPツール：`cost_summary`、`cost_agents`、`cost_recent`。
+- **モデル別コスト集計**（`CostTelemetry::summary_by_model`）：`token_usage` には最初のスキーマから `model` 列がありましたが、集計はすべて agent / user / day 単位で、「どのモデルにお金が使われているか」には答えられませんでした。`summary_by_model(agent_id: Option<&str>, since_unix)` はモデル別にグループ化し（コストの高い順。モデルidが記録されていない行は推測せず `"(unknown)"` にまとめます）、`requests` / `input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_creation_tokens` / `cost_millicents` + `cost_usd` / `cache_efficiency` を返します。コストは各行に保存済みの `cost_millicents` の合計で、他の集計と同じ単一の価格計算経路（`cost_for`、記録時に1回だけ適用）を使い、再計算はしません。`cost_usd` は単位換算のみです。公開は追加的に行います。MCP の `cost_summary` と `cost_agents` のレスポンスに同じ期間の `by_model` 配列が加わり（`cost_agents` の agent 行は、トップレベルのJSON配列には名前付きの兄弟フィールドを持たせられないため `agents` キーの下に移ります）、ダッシュボードRPC `cost.by_model`（パラメータ `agent_id?`、`days?`、デフォルト7、1〜365に制限）は他の `cost.*` と同じ admin ゲートの下で集計を返します。`cost_summary` / `cost_agents` 内で集計に失敗した場合は、呼び出し側が実際に行った呼び出しを失敗させず、空の `by_model` に縮退します。
 - **Direct APIクライアント**（`direct_api.rs`）：純粋なチャットではClaude CLIを迂回し、system promptに `cache_control: ephemeral` を付与 → キャッシュヒット率95%以上。単一の `reqwest::Client`（タイムアウト120秒）を使用。全OAuthアカウントがクールダウン中のフォールバックとして利用。
 
 ### スケジューリング
@@ -145,12 +138,7 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 - **Dashboard WebSocketハートビート**：サーバーは30秒ごとにPingを送信し、Pongが60秒間なければアイドルソケットを切断します。クライアント側は25秒ごとにアプリケーションレベルの `ping` RPCを送信します（ブラウザは制御フレームを送出できないため）。
 
 ### 信頼性とガバナンス（v1.9.4）
-- **`duduclaw-durability` crate**— 5本柱の耐久性：
-  - `idempotency.rs`：キーベースの重複排除で二重実行を防止。
-  - `retry.rs`：ジッター付き指数バックオフ戦略。
-  - `circuit_breaker.rs`：Closed / Open / HalfOpenの3状態、`probe_inflight` によるカウント（v1.9.4での修正：OPEN→HALF_OPEN遷移時に `probe_inflight` をインクリメントし、ゴーストプローブの超過を防止）。
-  - `checkpoint.rs`：再開可能なタスク進捗。
-  - `dlq.rs`：最終的に失敗したメッセージ用のDead Letter Queue。
+- **`duduclaw-durability` crate**（🗑️ **2026-07-04 のコミット `b0639b96` で削除**）— このcrateは5本柱の耐久性フレームワーク（`idempotency`、`retry`、`circuit_breaker`、`checkpoint`、`dlq`）を含んでいました。本体コードベース全体で呼び出し元がないことが検証されたため、削除されました。gatewayのLLM fallbackチェーンは他のメカニズムを使用しています（`gateway/failover.rs`を参照）。チェックポイント保存/復元/フォーク機能は現在のコードベースでは利用できません。
 - **`duduclaw-governance` crate**（W19-P1 M1-A）— `PolicyRegistry`（YAML + ホットリロード + エージェント優先度マージ + fail-safe + 並行upsertの安全性）、4種類の `PolicyType`（Rate / Permission / Quota / Lifecycle）、`quota_manager.rs`（エージェントごと/ポリシーごとのソフト・ハードクォータ）、`error_codes.rs`（QUOTA_EXCEEDED / POLICY_DENIED / ...）、承認ワークフロー + 監査ログ。デフォルトのポリシーセットは `policies/global.yaml`。
 - **LLM fallbackチェーン**（`gateway/failover.rs` の `failover::model`）— 3層フェイルオーバー（アカウント → モデル → ランタイム、2026-09-29 より同一モジュールツリー）の第2層：プライマリのタイムアウト/503/429/overloadedで、より軽いフォールバックモデルへ自動的に切り替えます（課金エラーでは発動しません）。`is_llm_fallback_error` / `should_attempt_model_fallback` はユニットテスト付きの純粋関数で、ディスパッチ経路は統合された `FailoverManager::model_fallback_for` を呼びます。`char_indices` によるUTF-8安全な切り詰め。
 - **Evolution Eventsシステム**（`gateway/evolution_events/`）— 30種類以上のイベントスキーマ、非同期バッチ+リトライのエミッター、クエリインターフェース、信頼性の保証。gateway上でHTTPエンドポイントとして公開され、Webの `ReliabilityPage` に表示されます。

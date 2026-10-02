@@ -44,7 +44,7 @@ The draft **never lands directly in a loadable skill library**:
 2. What passes is staged in an isolated drafts area (`~/.duduclaw/skills-drafts/<id>/SKILL.md`) with a pending-approval record routed to a human through the shared ApprovalBroker.
 3. Only the dashboard approval action installs the skill — and that install runs its own re-scan. A rejection leaves the draft in quarantine.
 
-Desktop-derived skills carry `skill_type: desktop-sop` and replay as computer-use tasks: step by step, with a screenshot verification after each step, stopping on the first failure.
+Desktop-derived skills carry `skill_type: desktop-sop` and replay as computer-use tasks: step by step, with a screenshot verification after each step, stopping on the first failure. These replay rules are instructions written into the SKILL.md for the agent to follow, not a separate replay engine. The agent's `computer_*` tools drive an isolated container browser, not the desktop the recording was made on, so a desktop SOP that needs a host application cannot be replayed with them.
 
 ## The Capability Gate
 

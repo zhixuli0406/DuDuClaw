@@ -216,7 +216,7 @@ TaskSpec：
 
 - **HeartbeatScheduler**：驅動每個 Agent 的輪詢節奏。
 - **Agent Registry**：調度器知道存在哪些 Agent 及其併發限制。
-- **容器沙盒**：當任務需要隔離時，調度器在容器內而非直接在主機上啟動子程序。
+- **任務沙箱**：員工的 `agent.toml [container] sandbox_enabled = true` 時，調度器把任務的 AI CLI 放進上鎖的 Docker 容器執行，而不是直接在主機上跑；沙箱不能用時任務會失敗。見[任務沙箱指南](../../guides/zh-TW/task-sandbox.md)。
 - **DelegationEnvelope**：為複雜的多 Agent 交接提供結構化背景資訊。
 - **TaskSpec**：讓多步驟工作流具備依賴感知，支援重試與重新規劃。
 - **Multi-Runtime**：調度器依每個 Agent 的 runtime 設定，啟動對應的 CLI 後端（Claude/Codex/Gemini）。

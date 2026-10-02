@@ -1,29 +1,30 @@
 # DuDuClaw 系統架構設計
 
-> 版本：1.9.4
-> 日期：2026-05-02
+> 版本：1.66.1（workspace `Cargo.toml`）
+> 日期：2026-10-01
 >
-> 本文件涵蓋 v1.4.29 之後的核心架構基線。v1.9.x 新增的可靠性 / 治理層、
-> 記憶評測子系統、MCP HTTP/SSE Transport 等請參閱 [CHANGELOG.md](CHANGELOG.md)
-> 與 [docs/CLAUDE.md](docs/CLAUDE.md)；後者已同步至 v1.9.4 並作為本文件的
-> 增量補充，避免本文件所述的詳細流程被新功能蓋掉。
+> 本文件是精簡總覽。各子系統的細節見
+> [docs/architecture/overview.md](docs/architecture/overview.md)、
+> [docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md)
+> 與 [docs/features/](docs/features/README.md)；版本差異見 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
 ## 目錄
 
 1. [設計決策](#一設計決策)
-2. [總覽：Extension Layer 模式](#二總覽extension-layer-模式)
+2. [總覽：Plumbing 層](#二總覽plumbing-層)
 3. [多 Agent 架構](#三多-agent-架構)
 4. [Rust 核心層](#四rust-核心層)
-5. [Python 擴充層](#五python-擴充層)
+5. [Python 套件](#五python-套件)
 6. [安全系統](#六安全系統)
-7. [自主進化引擎（Prediction-Driven + GVU）](#七自主進化引擎prediction-driven--gvu)
+7. [自主進化引擎（Prediction-Driven + AEE）](#七自主進化引擎prediction-driven--aee)
 8. [記憶系統](#八記憶系統)
 9. [通訊通道](#九通訊通道)
 10. [Web 管理介面](#十web-管理介面)
 11. [專案結構](#十一專案結構)
 12. [設定格式](#十二設定格式)
+13. [其他子系統](#十三其他子系統)
 
 ---
 
@@ -31,108 +32,93 @@
 
 | 決策項目 | 選擇 | 理由 |
 |----------|------|------|
-| AI 對話 | **Claude Code SDK (`claude` CLI)** | 內建工具鏈（bash、web search、file ops）、MCP 相容、官方維護 |
+| AI 對話 | **多 runtime CLI**（`AgentRuntime` trait）：Claude Code、Codex、Antigravity（`agy`）、Grok、OpenAI-compatible；Gemini CLI 於 v1.67.0 棄用、v1.69.0 移除（由 Antigravity 取代）；另有 `runtime_catalog.rs` 收錄的其他 CLI | 工具鏈、MCP 相容與 session 由各家 CLI 負責，per-agent 在 `agent.toml [runtime]` 選擇 |
 | 核心語言 | **Rust** | 記憶體安全、高效能、單 binary 部署 |
-| 擴充語言 | **Python (PyO3)** | Claude Code SDK 整合、通道插件彈性 |
-| Agent 隔離 | **資料夾 + SOUL.md** | 簡單直覺，無容器開銷；IPC 透過 `bus_queue.jsonl` |
+| Python | **獨立 companion 套件**（`pip install duduclaw`），無 PyO3 綁定 | Rust binary 不呼叫它，見第五節 |
+| Agent 隔離 | **資料夾 + SOUL.md**；選配 Docker 任務沙箱（預設關） | 預設無容器開銷；沙箱見 [docs/guides/task-sandbox.md](docs/guides/task-sandbox.md) |
 | IPC 機制 | **File-based queue** (`bus_queue.jsonl`) | 零依賴，跨程序讀寫，天然持久化 |
-| 首批通道 | LINE + Telegram + Discord | 台灣市場 + 國際社群 |
-| 安全認證 | **Ed25519 challenge-response** | 非對稱簽章，無密碼傳輸 |
-| API key 儲存 | **AES-256-GCM** | 對稱加密，base64 存於 config.toml |
+| 通道 | 十一個：Telegram、LINE、Discord、Slack、WhatsApp、Feishu、Google Chat、Microsoft Teams、WeCom、DingTalk、WebChat | 全部在 Rust gateway 內實作 |
+| Dashboard 認證 | **JWT 帳號登入**（`duduclaw-auth`：Argon2 + JWT，`users.db`）或 admin token（`[gateway] auth_token_enc`） | 早期的 Ed25519 challenge-response 認證路徑已移除（從來沒有設定能啟用它，儀表板也沒有實作 client 端） |
+| API key 儲存 | **AES-256-GCM** | 金鑰檔 `~/.duduclaw/.keyfile`，密文以 base64 存於 config |
 | 日誌推送 | **BroadcastLayer** tracing | 即時推播 log 到 WebSocket，零侵入 |
-| Evolution | **預測驅動 + AEE playbook 進化**（GVU 整份改寫 SOUL.md 降為選配逃生門） | 90% 零 LLM 成本，Significant/Critical 才觸發；`SOUL.md` 對 agent 唯讀 |
-| 任務驗收（v1.53） | **判官前確定性防線**：grounding 證據預檢 + outcome schema 校驗；任務層 forward model 選配（`[task_forward_model]` 預設關） | 證據不落地就不燒判官 LLM；世界模型用統計先行，冷啟動零 LLM（見 [docs/guides/goal-loop.md](docs/guides/goal-loop.md)） |
+| Evolution | **預測驅動 + AEE playbook 進化**（整份改寫 SOUL.md 的舊路徑已於 2026-09-29 移除） | 約 90% 對話零 LLM 成本，Significant/Critical 才觸發；`SOUL.md` 對 agent 唯讀 |
+| 任務驗收 | **判官前確定性防線**：grounding 證據預檢 + outcome schema 校驗；任務層 forward model（`[task_forward_model]` 自 v1.54 預設開） | 證據不落地就不燒判官 LLM；世界模型統計先行，冷啟動零 LLM（見 [docs/guides/goal-loop.md](docs/guides/goal-loop.md)） |
 | Token 計算 | **CJK-aware heuristic** | CJK 字元 ~1.5 chars/token，ASCII ~4 chars/token |
 
 ---
 
-## 二、總覽：Extension Layer 模式
+## 二、總覽：Plumbing 層
 
-DuDuClaw **不是**一個獨立的 AI 平台。它是 **Claude Code 的擴充層 (extension layer)**。
+DuDuClaw 本身不訓練、不提供模型。對話、工具使用與上下文管理交給 AI CLI；DuDuClaw 負責把一個或多個 CLI 變成長駐的 agent。
 
 ```
-┌─────────────────────────────────────────┐
-│           Claude Code SDK               │
-│    (brain: bash / web / file / MCP)     │
-└────────────────┬────────────────────────┘
-                 │ MCP Protocol
-                 │ JSON-RPC 2.0 over stdin/stdout
-┌────────────────▼────────────────────────┐
-│              DuDuClaw                   │
-│  ┌──────────┐  ┌──────────┐            │
-│  │ MCP      │  │ Session  │            │
-│  │ Server   │  │ Manager  │            │
-│  └──────────┘  └──────────┘            │
-│  ┌──────────┐  ┌──────────┐            │
-│  │ Channel  │  │ Memory   │            │
-│  │ Router   │  │ Engine   │            │
-│  └──────────┘  └──────────┘            │
-│  ┌──────────┐  ┌──────────┐            │
-│  │Evolution │  │ Account  │            │
-│  │ Engine   │  │ Rotator  │            │
-│  └──────────┘  └──────────┘            │
-│  ┌──────────────────────────────┐      │
-│  │    Web Dashboard (embedded)  │      │
-│  └──────────────────────────────┘      │
-└─────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│ AI Runtime（Claude Code / Codex / agy /     │
+│ Grok / OpenAI-compat / Gemini CLI 棄用中）   │
+└────────────────┬────────────────────────────┘
+                 │ MCP（JSON-RPC 2.0，stdio；另有 HTTP/SSE）
+┌────────────────▼────────────────────────────┐
+│              DuDuClaw                       │
+│  MCP Server   Session Manager               │
+│  Channel Router   Memory Engine             │
+│  Evolution (AEE)   Account Rotator          │
+│  Task Board / Goal Loop   Autopilot         │
+│  Web Dashboard (embedded)                   │
+└─────────────────────────────────────────────┘
 ```
 
 核心原則：
-- **AI = Claude Code SDK** — 對話邏輯、工具使用、上下文管理全由 `claude` CLI 負責
-- **DuDuClaw = Plumbing** — 通道路由、session 持久化、記憶搜尋、帳號輪替
-- **橋接 = MCP Protocol** — `duduclaw mcp-server` 作為 MCP Server，工具以 JSON-RPC 2.0 暴露
+- **AI = CLI runtime**：對話邏輯、工具使用、上下文管理由各 runtime 負責
+- **DuDuClaw = Plumbing**：通道路由、session 持久化、記憶搜尋、帳號輪替、排程與驗收
+- **橋接 = MCP**：`duduclaw mcp-server` 以 JSON-RPC 2.0 暴露工具；`duduclaw http-server` 提供 HTTP/SSE transport
 
 ---
 
 ## 三、多 Agent 架構
 
-### 3.1 Agent 目錄結構
+### 3.1 目錄結構
 
-每個 Agent 是一個資料夾，與 Claude Code 完全相容：
+每個 Agent 是一個資料夾，與 Claude Code 相容：
 
 ```
 ~/.duduclaw/
 ├── config.toml                     # 全域設定（含加密 API key）
-├── secret.key                      # AES-256-GCM 主加密金鑰
+├── .keyfile                        # AES-256-GCM 金鑰（32 bytes）
 ├── bus_queue.jsonl                 # 跨 Agent 訊息隊列（file-based IPC）
-├── cron_tasks.jsonl                # Cron 任務持久化（JSONL 格式）
+├── sessions.db / memory.db         # session 歷史、共用記憶庫（以 agent_id 區分）
+├── tasks.db / cron_tasks.db        # Task Board、Cron 任務
+├── approvals.db / events.db        # HITL 審批、Autopilot 事件
+├── shared/wiki/                    # 跨 Agent 共享知識庫
 │
 └── agents/
-    ├── dudu/                       # 主 Agent
+    ├── dudu/
     │   ├── agent.toml              # Agent 設定（見第十二節）
-    │   ├── SOUL.md                 # 人格定義
+    │   ├── SOUL.md                 # 人格定義（agent 唯讀）
     │   ├── CLAUDE.md               # Claude Code 指引
-    │   ├── .mcp.json               # MCP Server 設定（指向 duduclaw mcp-server）
-    │   ├── .claude/
-    │   │   └── settings.local.json
-    │   ├── SKILLS/                 # 技能集（可由 Macro 反思自動產出）
-    │   ├── memory/                 # 每日筆記
-    │   │   └── 202603/
-    │   │       └── 20260319.md
-    │   └── state/
-    │       └── state.db            # SQLite（記憶 + session 歷史）
-    │
-    └── coder/                      # 另一個 Agent
-        └── ...
+    │   ├── CONTRACT.toml           # 行為契約（選配）
+    │   ├── .mcp.json               # MCP Server 設定（duduclaw 條目由 gateway 開機時補齊）
+    │   ├── .claude/settings.json   # PreToolUse hooks（agent-file-guard 等）
+    │   ├── SKILLS/                 # 技能集
+    │   ├── wiki/                   # Agent 私有 wiki
+    │   └── state/working_state.json # 跨喚醒工作狀態
+    └── .ephemeral/                 # 一次性 agent（team role member 等）
 ```
 
 ### 3.2 跨 Agent 委派（File-based IPC）
 
-Agent 之間透過 `bus_queue.jsonl` 傳遞訊息，無需容器或網路：
-
 ```
-Agent A (Claude Code) → MCP tool: send_to_agent
+Agent A → MCP tool: send_to_agent / spawn_agent
+         │  （delegation_policy 授權檢查）
+         ▼
+bus_queue.jsonl  ← MCP server 追加 JSON 行（advisory lock）
          │
          ▼
-bus_queue.jsonl  ← Rust bridge 寫入 JSON 行
-         │
-         ▼
-Agent B runner (subprocess) 讀取並執行
+AgentDispatcher（gateway）消費 → spawn Agent B 的 runtime CLI
 ```
 
-格式：
+格式（`duduclaw-cli/src/mcp/spawn.rs`）：
 ```json
-{"to": "coder", "from": "dudu", "task": "幫我 code review", "ts": "2026-03-19T10:00:00Z"}
+{"type": "agent_message", "message_id": "uuid", "agent_id": "coder", "payload": "幫我 code review", "timestamp": "2026-03-19T10:00:00Z", "sender_agent": "dudu", "delegation_depth": 1, "hop_depth": 1}
 ```
 
 ---
@@ -141,60 +127,34 @@ Agent B runner (subprocess) 讀取並執行
 
 ### 4.1 Crate 架構
 
-```
-crates/                            # v1.9.4 共 16 個 crate（`duduclaw-db` 為 2026-09 新增，此列表其餘部分未逐一更新到目前 workspace 全貌）
-├── duduclaw-core/                 # 共用型別、traits、錯誤定義
-├── duduclaw-agent/                # Agent 掃描、agent.toml 解析、心跳、預算
-├── duduclaw-auth/                 # 多用戶認證（Argon2、JWT、ACL）
-├── duduclaw-security/             # AES-256-GCM 加密、Ed25519 驗證、SOUL guard、audit
-├── duduclaw-container/            # Docker / Apple Container / WSL2 沙箱
-├── duduclaw-memory/               # SQLite + FTS5 全文搜尋 + 評測 batch query API
-├── duduclaw-inference/            # 本地推論引擎（llama.cpp / mistral.rs / Exo / llamafile）
-├── duduclaw-gateway/              # Axum 伺服器、通道整合、WebSocket、MCP tools、LLM fallback、evolution events
-├── duduclaw-bus/                  # tokio broadcast + mpsc 訊息路由
-├── duduclaw-bridge/               # PyO3 Rust↔Python 橋接（bus_queue 寫入）
-├── duduclaw-odoo/                 # Odoo ERP 中間層（JSON-RPC, 17 MCP tools）
-├── duduclaw-db/  ← 2026-09        # 唯讀 SQL 資料來源連接器（sqlx：PostgreSQL/MySQL/SQLite，四個 MCP 工具）
-├── duduclaw-cli/                  # clap CLI 入口、mcp-server (stdio/HTTP/SSE)、migrate
-├── duduclaw-dashboard/            # rust-embed 嵌入 React SPA
-├── duduclaw-desktop/              # 桌面端 wrapper（macOS/Windows/Linux）
-├── duduclaw-durability/  ← v1.9.4 # 持久性框架（idempotency / retry / circuit breaker / checkpoint / DLQ）
-└── duduclaw-governance/  ← v1.9.4 # PolicyRegistry / quota_manager / error_codes / audit / approval
-```
+Workspace 共 24 個 crate，完整清單與一行說明見[第十一節](#十一專案結構)。主要依賴方向：`duduclaw-cli`（binary 入口）→ `duduclaw-gateway`（服務層）→ `duduclaw-agent` / `-memory` / `-security` / `-llm` / `-inference` 等 → `duduclaw-core`（共用型別）。
 
 ### 4.2 Gateway（`duduclaw-gateway`）
 
-核心服務，負責所有 WebSocket 請求分發：
-
 ```
-axum WebSocket
+axum HTTP + WebSocket（/ws）
     │
-    ├── auth.rs       — Ed25519 challenge-response 認證
-    ├── handlers.rs   — JSON-RPC dispatch（agents.*, memory.*, system.*, …）
-    ├── channel_reply.rs — 通道回覆、session 管理、token 壓縮
-    ├── server.rs     — socket.split() + tokio::select! 並行驅動
-    ├── log.rs        — BroadcastLayer：tracing → WebSocket push
-    ├── discord.rs    — Discord Gateway WebSocket bot
-    └── telegram.rs   — Telegram long polling bot
+    ├── auth.rs          — admin token 驗證輔助（JWT 由 duduclaw-auth 處理）
+    ├── handlers/        — JSON-RPC dispatch（agents.*, memory.*, tasks.*, system.*, …）
+    ├── channel_reply/   — 通道回覆、session 管理、prompt 組裝、token 壓縮
+    ├── server.rs        — 路由、WebSocket 連線處理（tokio::select! 並行驅動）
+    ├── log.rs           — BroadcastLayer：tracing → WebSocket push
+    ├── runtime/         — claude / codex / gemini / antigravity / grok / openai_compat / generic_cli
+    ├── dispatcher.rs    — bus_queue 消費與 sub-agent spawn
+    └── telegram.rs / line.rs / discord.rs / slack.rs / whatsapp.rs / feishu.rs /
+        googlechat.rs / msteams.rs / wecom.rs / dingtalk.rs / webchat.rs
 ```
 
-### 4.3 WebSocket 認證流程（Ed25519）
+### 4.3 WebSocket 認證
 
-```
-Client                          Server
-  │                               │
-  │── { "method": "connect" } ──► │
-  │                               │  issue_challenge(): 32-byte random
-  │◄── { "challenge": "<b64>" } ──│
-  │                               │
-  │  sign(challenge, privkey)     │
-  │── { "method": "authenticate"  │
-  │    "signature": "<b64>" } ──► │  verify_ed25519(sig, pubkey, challenge)
-  │                               │
-  │◄── { "ok": true } ────────────│
-```
+`connect` frame 接受兩種憑證（`server.rs` `handle_socket`）：
 
-實作於 `auth.rs`，使用 `ring` crate 的 `ED25519` 算法。
+1. `{"method": "connect", "params": {"jwt": "..."}}`：`POST /api/login` 取得的 JWT
+2. `{"method": "connect", "params": {"token": "..."}}`：admin token
+
+沒有帶任何憑證的連線一律拒絕，只有一個例外：值班機（appliance）上來自本機 loopback 的連線，會得到只能操作鎖定畫面的受限 session。
+
+早期的 Ed25519 challenge-response 路徑已從 gateway 移除：沒有任何設定讀取公鑰，只有測試建構過它，儀表板也從未實作 client 端，所以它從來無法啟用。Ed25519 仍用在授權簽章、更新驗證與 relay 裝置協定，這些不受影響。
 
 ### 4.4 日誌廣播（BroadcastLayer）
 
@@ -213,95 +173,43 @@ broadcast::Sender<String>
     └──► WebSocket client B
 ```
 
-Server 端用 `tokio::select!` 並行處理收訊與推播：
-
-```rust
-loop {
-    tokio::select! {
-        msg_opt = stream.next() => { /* handle RPC */ }
-        log_line = log_rx.recv(), if logs_subscribed => {
-            sink.send(Message::Text(log_line)).await;
-        }
-    }
-}
-```
-
 ### 4.5 Cron 任務管理
 
-任務儲存於 `~/.duduclaw/cron_tasks.jsonl`，每行一個 JSON：
+任務存於 SQLite `~/.duduclaw/cron_tasks.db`（`cron_store.rs`，WAL；舊的 `cron_tasks.jsonl` 開機時自動遷移並改名為 `.migrated`），由 `CronScheduler`（`cron_scheduler.rs`）依 cron 表達式觸發。主要欄位：`id`、`name`、`agent_id`、`cron`、`task`、`enabled`、`cron_timezone`、`notify_channel` / `notify_chat_id`，外加執行統計。
 
-```json
-{"id": "uuid", "name": "daily-reflect", "schedule": "0 0 * * *", "agent_id": "dudu", "action": "meso_reflect", "enabled": true}
-```
-
-操作：
-- `cron.list` → 讀取全部行
-- `cron.add` → 追加新行
-- `cron.pause` → 原地修改 `enabled: false`
-- `cron.remove` → 刪除對應行
+RPC：`cron.list` / `cron.add` / `cron.update` / `cron.pause` / `cron.resume` / `cron.remove`。
 
 ### 4.6 HeartbeatScheduler
 
-`duduclaw-agent/src/heartbeat.rs` 負責 bus polling 和靜默破壞器：
+`duduclaw-agent/src/heartbeat.rs`：
 
 ```
-HeartbeatScheduler::run()  （每 30 秒 tick）
+HeartbeatScheduler::run()  （每 30 秒 tick，每 5 分鐘從 registry 重新同步）
     │
-    ├─ 每次心跳 → count_pending_bus_messages()
-    │
-    └─ 靜默破壞器 → 超過 max_silence_hours 未進化 → 重置時間戳
+    ├─ 每個 agent 的 cron/interval 心跳 → bus polling（max_concurrent_runs semaphore）
+    ├─ Task Board 拉取：對所有 agent（不論 heartbeat.enabled），每 agent 每 60 秒最多一次
+    └─ 靜默破壞器：超過 max_silence_hours 無進化觸發 → 發出 SilenceBreakerEvent，
+       由 gateway 轉成 forced reflection
 ```
 
-進化反思由預測引擎在 `channel_reply.rs` 中事件驅動觸發，不由 heartbeat 觸發。
+一般的進化反思由預測引擎在對話後事件驅動觸發。
 
 ---
 
-## 五、Python 擴充層
+## 五、Python 套件
 
-### 5.1 模組結構
+`python/duduclaw/` 是發佈到 PyPI 的 companion 套件，與 Rust binary 並存，Rust 端不呼叫它，也沒有 PyO3 綁定：
 
 ```
 python/duduclaw/
-├── channels/           # 通道插件
-│   ├── base.py         # BaseChannel，on_message_received() 呼叫 _native.send_to_bus()
-│   ├── telegram.py     # Telegram long polling
-│   ├── line_.py        # LINE webhook
-│   └── discord_.py     # Discord（備用，主要由 Rust 處理）
-│
-├── sdk/                # Claude Code SDK 橋接
-│   ├── chat.py         # 呼叫 claude CLI subprocess 執行對話
-│   ├── account.py      # Account 物件（含完整 api_key 欄位）
-│   ├── rotator.py      # AccountRotator：4 種輪替策略
-│   └── health.py       # check_account_health()：呼叫 GET /v1/models 驗證
-│
-├── evolution/          # Skill Vetter 安全掃描
-│   ├── vetter.py       # 技能安全審查（6 類規則）
-│   └── run.py          # CLI 入口：python3 -m duduclaw.evolution.run vet
-│
-└── tools/              # Agent 動態管理工具
-    └── agent_tools.py  # agent_list / agent_create / agent_delegate / agent_status
+├── agents/        # capability-based agent routing（manifest loader、matcher、router）
+├── mcp/           # MCP 輔助：API key 認證與 scope 檢查、記憶工具
+├── evolution/     # Skill Vetter 安全掃描（vetter.py、run.py）
+├── tools/         # agent_tools.py：agent_list / agent_create / agent_delegate / agent_status
+└── memory_eval/   # 記憶評測（LOCOMO 等），僅 repo 內使用，不進 wheel
 ```
 
-### 5.2 帳號輪替（AccountRotator）
-
-支援 4 種策略：
-
-| 策略 | 說明 |
-|------|------|
-| `round-robin` | 依序使用每個帳號 |
-| `least-used` | 優先選用使用次數最少的帳號 |
-| `budget-aware` | 依預算剩餘比例加權選擇 |
-| `failover` | 主帳號優先，失敗時依序切換備用 |
-
-### 5.3 PyO3 橋接層
-
-`duduclaw-bridge` crate 提供 Python native module `_native`：
-
-```python
-import _native
-_native.send_message(agent_id, content)   # 寫訊息到 bus_queue.jsonl
-_native.send_to_bus(payload_json)         # 通用 bus 寫入
-```
+`agent_tools.py` 的 `agent_delegate` 會嘗試 `import _native`；repo 內沒有對應的原生模組，因此回傳 `"_native bridge not available"` 警告。通道、帳號輪替與健康檢查都在 Rust 端（第六、九節）。
 
 ---
 
@@ -310,91 +218,85 @@ _native.send_to_bus(payload_json)         # 通用 bus 寫入
 ### 6.1 API Key 加密
 
 ```
-duduclaw onboard
-    │
+duduclaw onboard / dashboard
     │  使用者輸入明文 API Key
     ▼
 AES-256-GCM 加密（ring crate）
-    │  key 存於 ~/.duduclaw/secret.key
+    │  key 存於 ~/.duduclaw/.keyfile
     ▼
-anthropic_api_key_enc = "<base64 ciphertext+nonce+tag>"
+api_key_enc / *_enc = "<base64 ciphertext>"
     │  寫入 ~/.duduclaw/config.toml
 ```
 
-讀取時：解密 → 注入 `ANTHROPIC_API_KEY` 環境變數，不落地。
+讀取時解密，只在 spawn 時顯式注入子行程環境；spawn env 以白名單建立（`duduclaw-core/src/spawn_env.rs`），其餘 `*_API_KEY` 等變數不會繼承。`secret://` 參照由 `duduclaw-security/src/secret_ref.rs` 解析。
 
-### 6.2 帳號健康檢查
+### 6.2 帳號輪替與健康檢查
 
-`health.py` 呼叫 Anthropic REST API 驗證 key 有效性：
+帳號池在 `duduclaw-agent/src/account_rotator/`，策略為 `priority`（預設）/ `least_cost` / `failover` / `round_robin`。健康檢查（`credential_probe.rs`）呼叫：
 
 ```
 GET https://api.anthropic.com/v1/models
-    ├─ 200 OK → healthy
-    ├─ 401   → unhealthy（key 無效或過期）
-    └─ 網路錯誤 → inconclusive（不計入輪替降級）
+    ├─ 200      → 恢復可用
+    ├─ 401/403  → auth_dead（指數退避 15 分鐘到 6 小時）
+    └─ 429 / 網路錯誤 → 不改變狀態
 ```
+
+### 6.3 其他防護
+
+| 模組 | 位置 | 功能 |
+|------|------|------|
+| Soul Guard | `duduclaw-security/src/soul_guard.rs` | SHA-256 指紋（`~/.duduclaw/soul_hashes/`）+ `.soul_history/` 最多 10 版備份 |
+| Input Guard | `duduclaw-security/src/input_guard.rs` | 7 類 prompt injection 規則，NFKC 正規化，分數 ≥ 60 阻擋 |
+| Audit Log | `duduclaw-security/src/audit.rs` | `security_audit.jsonl` append-only 安全事件 |
+| PreToolUse hooks | `duduclaw hook agent-file-guard` / `data-file-guard` | 擋 agent 寫自己的 SOUL.md 與 CONTRACT.toml（Bash 部分是啟發式減速帶）、跨 agent 寫入、組織欄位修改 |
+| 委派授權 | `duduclaw-core/src/delegation_policy.rs` | `reports_to` 樹 + 部門 + 白名單，fail-closed |
+
+**Injection 規則類別與權重**：instruction_override (40)、role_hijack (35)、system_prompt_extraction (30)、tool_abuse (30)、termination_manipulation (30)、encoding_bypass (25)、data_exfiltration (25)。
+
+詳見 [docs/features/05-security-defense.md](docs/features/05-security-defense.md)。
 
 ---
 
-## 七、自主進化引擎（Prediction-Driven + AEE / GVU）
+## 七、自主進化引擎（Prediction-Driven + AEE）
 
-> 完整技術文件：[docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md)（第十二章為 v3 現況）
+> 完整技術文件：[docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md)、[docs/features/38-aee-playbook-evolution.md](docs/features/38-aee-playbook-evolution.md)
 
-進化引擎以**預測誤差**驅動，取代固定計時器反思，約 90% 的對話零 LLM 成本。
+進化引擎以**預測誤差**驅動，約 90% 的對話零 LLM 成本。`SOUL.md` 對 agent 唯讀，學習落地成 playbook 行為規則（獨立驗證、獨立回滾）。整份改寫 `SOUL.md` 的舊 GVU 路徑（含 24h 觀察期與 `legacy_soul_evolution` 開關）已於 2026-09-29 移除。
 
-**v3（2026-08-06）現況**：§7.2 描述的 GVU 迴圈——整份改寫 `SOUL.md`——現在是
-**非預設的逃生門**（`agent.toml [evolution] legacy_soul_evolution = true` 才會
-啟用）。預設路徑改為 **AEE**：`SOUL.md` 對 agent 唯讀，學習落地成 playbook
-行為規則（獨立驗證、獨立回滾），詳見
-[docs/features/38-aee-playbook-evolution.md](docs/features/38-aee-playbook-evolution.md)。
-§7.2/§7.3 對啟用 `legacy_soul_evolution` 的 agent 仍原封不動有效。
+### 7.1 預測引擎
 
-### 7.1 預測引擎（Phase 1）
-
-每次對話後自動執行（< 1ms, 零 LLM）：
+每次對話後執行（零 LLM），程式在 `duduclaw-gateway/src/prediction/`：
 
 ```
 predict() → calculate_error() → route()
     │               │                │
     ▼               ▼                ▼
  UserModel     PredictionError    EvolutionAction
- 統計預測       加權組合誤差        None / StoreEpisodic / TriggerGVU
+ 統計預測       加權組合誤差        None / StoreEpisodic / TriggerReflection / TriggerEmergencyEvolution
 ```
 
-**誤差分級**（Dual Process Theory）：
+**誤差分級**（預設閾值，`metacognition.rs`）：
 
 | 等級 | 閾值 | 動作 | LLM 成本 |
 |------|------|------|---------|
 | Negligible | < 0.2 | 無 | 0 |
 | Moderate | 0.2-0.5 | 存情節記憶 | 0 |
-| Significant | 0.5-0.8 | GVU 反思 | 2-6 次 |
-| Critical | ≥ 0.8 | 緊急 GVU | 2-6 次 |
+| Significant | 0.5-0.8 | 反思（AEE 回合） | 有 |
+| Critical | ≥ 0.8 | 緊急進化 | 有 |
 
-**MetaCognition**：每 100 次預測自適應調整閾值邊界（效果好放寬、效果差收緊）。
+**MetaCognition**：每 100 次預測自適應調整閾值，雙向調整。
 
-### 7.2 GVU 自我博弈迴圈（Phase 2）
+### 7.2 AEE 回合
 
-Generator → Verifier → Updater，最多 3 輪：
-
-```
-GENERATE (Claude Haiku + OPRO 歷史 + TextGrad 反饋)
-    ↓
-VERIFY (4 層)
-  L1: 合約邊界 + 安全性          [零 LLM]
-  L2: 回滾重複 + 搖擺偵測       [零 LLM]
-  L3: LLM 法官 (score ≥ 0.7)   [1 API]
-  L4: 趨勢一致性                [零 LLM]
-    ↓
-APPLY → 原子寫入 SOUL.md → 24h 觀察期 → Confirm / Rollback
-```
+`gvu/aee/`：`intent.rs` 依 `[evolution] strategy` 決定 repair / optimize / innovate → `inner_loop.rs` 最多 3 輪 generate / gate / shadow-apply / score → Gate（`verifier_gate.rs`，確定性、零 LLM、可否決）先跑，再由 Measure（`verifier_measure.rs`，評測案例通過率、判官分數等，無否決權）評分 → 與 champion 快照比較，matches-or-improves 才 commit → 逐條 entry 依自己的 eval case 在 `aee_settle_hours` 後結算，退步只回滾該條。`agent.toml [evolution] gvu_enabled` 為入口開關，`gvu_cooldown_minutes` 控制頻率。
 
 ### 7.3 安全機制
 
-- **XML 隔離**：所有不受信任內容用 XML tag 包裹
-- **合約強制**：`CONTRACT.toml` 的 `must_not` / `must_always` 在 L1 硬性檢查
-- **原子寫入**：temp 檔 → rename，失敗不會損壞 SOUL.md
+- **XML 隔離**：不受信任內容以 XML tag 包裹（`xml_fence.rs`）
+- **合約強制**：`CONTRACT.toml` 的 `must_not` 進入 Gate 檢查（`must_always` 只寫進提示，Gate 不檢查）
+- **SOUL.md 唯讀**：MCP `agent_update_soul` 與 file-guard hook 拒絕 agent 身分寫入
 - **SHA-256 指紋**：soul_guard 偵測非法修改
-- **AES-256-GCM**：回滾差異加密儲存
+- **Reward-hack 稽核**：`gvu/reward_hack.rs`
 
 ---
 
@@ -402,17 +304,9 @@ APPLY → 原子寫入 SOUL.md → 24h 觀察期 → Confirm / Rollback
 
 ### 8.1 SQLite + FTS5
 
-`duduclaw-memory/src/engine.rs` 實作 `SqliteMemoryEngine`：
+`duduclaw-memory/src/engine.rs` 實作 `SqliteMemoryEngine`，所有 agent 共用 `~/.duduclaw/memory.db`，以 `agent_id` 區分（舊的 per-agent `memory.db` 開機時由 `memory_migrate.rs` 合併）。`memories` 表除 `id` / `agent_id` / `content` / `timestamp` / `tags` 外，另有 `layer`（episodic / semantic）、`importance`、`access_count`，以及 temporal / 知識圖譜欄位（`valid_from`、`valid_until`、`superseded_by`、`subject` / `predicate` / `object` 等）。全文索引：
 
 ```sql
-CREATE TABLE memories (
-    id        TEXT PRIMARY KEY,
-    agent_id  TEXT NOT NULL,
-    content   TEXT NOT NULL,
-    timestamp TEXT NOT NULL,
-    tags      TEXT NOT NULL DEFAULT '[]'
-);
-
 CREATE VIRTUAL TABLE memories_fts USING fts5(
     content,
     agent_id UNINDEXED,
@@ -425,27 +319,29 @@ CREATE VIRTUAL TABLE memories_fts USING fts5(
 
 | 方法 | 說明 |
 |------|------|
-| `store(agent_id, entry)` | 同時寫入 `memories` + `memories_fts` |
-| `search(agent_id, query, limit)` | FTS5 MATCH 搜尋，按相關性排序 |
-| `list_recent(agent_id, limit)` | ORDER BY timestamp DESC（無 FTS） |
-| `summarize(agent_id, window)` | 取時間區間 entries，呼叫 Claude 產生語意摘要 |
+| `store(agent_id, entry)` | 寫入 `memories` + `memories_fts` |
+| `search(agent_id, query, limit)` | FTS5 搜尋，預設只回傳目前有效的事實 |
+| `store_temporal(entry, meta)` | 同 subject/predicate 自動取代舊事實並串接 supersession chain |
+| `get_by_ids(...)` | 批次取回（MCP `memory_fetch_batch`） |
+| `list_recent(agent_id, limit)` | 依時間排序（無 FTS） |
+| `summarize(agent_id, window)` | 取時間區間 entries，呼叫 Claude 產生摘要 |
+
+檢索排序與衰減（Ebbinghaus、HippoRAG-lite）見 [docs/features/10-cognitive-memory.md](docs/features/10-cognitive-memory.md) 與 [docs/features/20-memory-intelligence.md](docs/features/20-memory-intelligence.md)。
 
 ### 8.3 Token 估算（CJK-aware）
 
-Session 壓縮前估算 token 數：
+Session 壓縮前估算 token 數（`channel_reply/delivery.rs`）：
 
 ```rust
 fn estimate_tokens(text: &str) -> u32 {
-    // CJK: U+3000–U+9FFF 及相關範圍
-    // CJK 字元 ~1.5 chars/token
-    // ASCII 字元 ~4 chars/token
+    // CJK: U+3000–U+9FFF、U+F900–U+FAFF 及兩段 supplementary 範圍
     let cjk_tokens = (cjk_chars as f32 / 1.5).ceil() as u32;
     let other_tokens = (other_chars as f32 / 4.0).ceil() as u32;
     cjk_tokens + other_tokens + 1
 }
 ```
 
-超過 50k token 時，呼叫 `claude-haiku` 產生摘要並壓縮 session。
+Session 存於 `~/.duduclaw/sessions.db`，超過 50k token（`session.rs` `COMPRESSION_THRESHOLD`）時產生摘要並壓縮。
 
 ---
 
@@ -453,47 +349,34 @@ fn estimate_tokens(text: &str) -> u32 {
 
 ### 9.1 架構
 
-所有通道最終都經過 `channel_reply.rs` 的 `build_reply()` 處理，統一通過 session 管理與 Claude 呼叫：
+所有通道最終經過 `channel_reply/entry.rs` 的 `build_reply()`，統一走 session 管理與 runtime 呼叫：
 
 ```
-用戶訊息 (LINE/Telegram/Discord)
+用戶訊息（十一個通道之一）
     │
     ▼
-build_reply(content, ctx)
+build_reply(text, ctx)
     │
-    ├─ 取得/建立 session (SQLite)
+    ├─ 取得/建立 session (sessions.db)
     ├─ 估算 token，超限自動壓縮
-    ├─ 組裝 Claude 提示 (含 SOUL.md + session 歷史)
-    ├─ 呼叫 claude CLI subprocess
+    ├─ 組裝 prompt（SOUL.md、session 歷史、記憶、工作狀態等）
+    ├─ 經帳號輪替呼叫 runtime CLI subprocess
     ├─ 儲存回覆至 session
-    └─ 返回回覆文字
+    └─ 返回回覆文字（依平台轉換 markdown）
 ```
 
-### 9.2 Discord（Gateway WebSocket）
+### 9.2 各通道傳輸方式
 
-`discord.rs` 使用 `tokio::select!` 並行處理訊息與心跳：
-
-```rust
-loop {
-    tokio::select! {
-        msg_opt = read.next() => {
-            // 處理 HELLO / DISPATCH / RECONNECT
-        }
-        Some(seq) = heartbeat_rx.recv() => {
-            // 獨立計時器觸發，不依賴訊息到達
-            write.send(heartbeat_payload).await;
-        }
-    }
-}
-```
-
-### 9.3 Telegram
-
-Long polling 模式，定期呼叫 `getUpdates`，無需公開 webhook endpoint。
-
-### 9.4 LINE
-
-Webhook 模式，需公開 HTTPS endpoint（由 `duduclaw gateway` 提供）。
+| 通道 | 傳輸 |
+|------|------|
+| Telegram | Long polling（`getUpdates`） |
+| LINE | Webhook `POST /webhook/line`（或經 cloud relay） |
+| Discord | Gateway WebSocket，`tokio::select!` 並行處理訊息與心跳，支援 op 6 RESUME |
+| Slack | Socket Mode |
+| WhatsApp | Cloud API webhook |
+| Feishu、WeCom、DingTalk | Webhook（各自的簽章驗證） |
+| Google Chat、Microsoft Teams | Webhook（JWT 驗證） |
+| WebChat | WebSocket |
 
 ---
 
@@ -501,23 +384,16 @@ Webhook 模式，需公開 HTTPS endpoint（由 `duduclaw gateway` 提供）。
 
 ### 10.1 技術棧
 
-- **React 19 + TypeScript** — 前端框架
-- **shadcn/ui + Tailwind CSS 4** — UI 元件，溫暖 amber 色系
-- **Zustand** — 狀態管理
-- **WebSocket** — 即時資料（系統狀態、日誌推播）
-- **rust-embed** — React SPA 嵌入 Rust binary（零額外部署）
+- **Vite + React 19 + TypeScript + React Router 7**
+- **Tailwind CSS 4** + 自有元件庫 `web/src/components/mds/`（設計規範見 `web/DESIGN.md`）
+- **Zustand**：狀態管理
+- **WebSocket**：JSON-RPC 與即時資料（系統狀態、日誌推播、Activity Feed）
+- **rust-embed**：`duduclaw-dashboard` 把 build 產物嵌入 binary
+- **i18n**：zh-TW / en / ja-JP（`web/src/i18n/`）
 
 ### 10.2 頁面
 
-| 頁面 | 功能 |
-|------|------|
-| Dashboard | 系統狀態、uptime、連線數 |
-| Agents | Agent 清單、狀態、建立/暫停/恢復 |
-| Memory | 記憶搜尋、瀏覽 |
-| Channels | Telegram/LINE/Discord 連線狀態 |
-| Logs | 即時 log 推播（BroadcastLayer） |
-| Cron | 排程任務管理（CRUD） |
-| Settings | API key 管理、帳號輪替設定 |
+`web/src/pages/` 目前有 74 個 `*Page.tsx`，涵蓋首頁、AI 員工、通道、記憶與知識、Task Board / Goals、Autopilot、帳號與成本、安全、裝置與系統設定等。導覽分組見 `web/src/apps/registry.ts`。
 
 ---
 
@@ -525,104 +401,137 @@ Webhook 模式，需公開 HTTPS endpoint（由 `duduclaw gateway` 提供）。
 
 ```
 DuDuClaw/
-├── crates/                     # Rust crates（9 個）
-│   ├── duduclaw-core/          # 共用型別 + traits
-│   ├── duduclaw-agent/         # Agent 管理 + 心跳 + 預算
-│   ├── duduclaw-security/      # AES-256-GCM + Ed25519
-│   ├── duduclaw-memory/        # SQLite + FTS5 記憶引擎
-│   ├── duduclaw-gateway/       # Axum + 通道 + WebSocket + log
-│   ├── duduclaw-bus/           # tokio broadcast/mpsc 路由
-│   ├── duduclaw-bridge/        # PyO3 Rust↔Python
-│   ├── duduclaw-cli/           # CLI 入口 + MCP server
-│   └── duduclaw-dashboard/     # rust-embed React SPA
+├── crates/                       # Rust workspace（24 個 crate）
+│   ├── duduclaw-core/            # 共用型別、traits、設定解析、runtime/tool catalog、委派政策
+│   ├── duduclaw-auth/            # 多用戶認證（Argon2、JWT、ACL、OTP）
+│   ├── duduclaw-gateway/         # 服務層：axum 伺服器、通道、WebSocket RPC、runtime、進化、排程
+│   ├── duduclaw-security/        # AES-256-GCM、soul guard、input guard、audit、secret 參照
+│   ├── duduclaw-memory/          # SQLite + FTS5 記憶引擎、wiki、因果證據圖
+│   ├── duduclaw-container/       # 容器 runtime 抽象（Docker / Apple Container / WSL2）
+│   ├── duduclaw-agent/           # Agent registry、心跳、預算、帳號輪替、skill 載入
+│   ├── duduclaw-cli/             # `duduclaw` binary：clap CLI、MCP server（stdio / HTTP / SSE）
+│   ├── duduclaw-dashboard/       # rust-embed 嵌入 React SPA
+│   ├── duduclaw-odoo/            # Odoo ERP JSON-RPC 中間層
+│   ├── duduclaw-inference/       # 本地 LLM 推論（OpenAI-compatible HTTP、llamafile、路由）
+│   ├── duduclaw-desktop/         # 原生桌面控制（滑鼠、鍵盤、截圖）；gateway 已不再使用（native 電腦操作模式於 2026-10 移除）
+│   ├── duduclaw-identity/        # Identity Resolution provider（RFC-21 §1）
+│   ├── duduclaw-redaction/       # 敏感資料去識別化管線（RFC-23）
+│   ├── duduclaw-cli-runtime/     # 跨平台 one-shot PTY 呼叫 AI CLI
+│   ├── duduclaw-license/         # License client：解析、驗證、功能閘
+│   ├── duduclaw-fork/            # Live Run Forking（RFC-26）：並行分支 + AI 判官選擇
+│   ├── duduclaw-llm/             # Provider-agnostic API 層（Anthropic / OpenAI / Gemini / OpenAI-compat）
+│   ├── duduclaw-sandbox/         # 原生行程隔離（macOS Seatbelt / Linux Landlock）
+│   ├── duduclaw-os/              # OS 整合（檔案監看、原生通知、open），OS-native 線 Phase 1
+│   ├── duduclaw-pets/            # 照片轉桌面寵物包 + 本地去背
+│   ├── duduclaw-relay/           # Cloud Relay：webhook 轉發 + LAN 裝置探索（可獨立部署）
+│   ├── duduclaw-sysd/            # 值班機 image 的權限分離 root 系統服務（Unix socket）
+│   └── duduclaw-db/              # 唯讀 SQL 資料來源（PostgreSQL / MySQL / SQLite）
 │
-├── python/duduclaw/            # Python 擴充層
-│   ├── channels/               # 通道插件
-│   ├── sdk/                    # Claude Code SDK 整合
-│   ├── evolution/              # Skill Vetter 安全掃描
-│   └── tools/                  # Agent 動態管理工具
-│
-├── web/                        # React Dashboard
-│   └── src/
-│       ├── components/         # UI 元件 (shadcn/ui)
-│       ├── pages/              # 頁面
-│       ├── stores/             # Zustand 狀態管理
-│       ├── lib/                # WebSocket API client
-│       └── i18n/               # zh-TW / en
-│
-├── config/                     # 設定範例
-├── scripts/                    # 安裝腳本
-├── ARCHITECTURE.md             # 本文件
-└── CLAUDE.md                   # AI 協作設計上下文
+├── web/                          # React Dashboard（見第十節）
+├── python/duduclaw/              # Python companion 套件（見第五節）
+├── src-tauri/                    # 桌面 app 殼（Tauri 2，不在主 workspace）
+├── npm/                          # npm 發佈包（各平台 binary + wrapper）
+├── clients/                      # 外部用戶端（VS Code、Chrome、Obsidian、Stream Deck、WordPress）
+├── distribution/                 # 散發素材（Claude marketplace、packs、registries、NAS、Railway 等）
+├── container/                    # Dockerfile 與 compose 範例
+├── config/                       # 設定範例（duduclaw.example.toml）
+├── templates/                    # Agent / preset / redteam 等範本
+├── evals/                        # Agent 行為評測案例
+├── tests/                        # 跨 crate 測試（python/、rust/）
+├── scripts/                      # 安裝與 release 腳本
+├── docs/                         # 公開文件（architecture / features / guides / rfc / spec …）
+├── wiki/                         # 內部知識庫與報告
+├── ARCHITECTURE.md               # 本文件
+└── CLAUDE.md                     # AI 協作設計上下文
 ```
+
+`duduclaw-shell`、`duduclaw-comp`、`duduclaw-native-gui` 已移到 DuDuClaw-OS repo。
 
 ---
 
 ## 十二、設定格式
 
-### 12.1 `agent.toml`
+### 12.1 `agent.toml`（節錄自 `templates/evaluator/agent.toml`）
 
 ```toml
-name = "dudu"
-description = "主助理 Agent"
-status = "active"      # active | paused | archived
-isMain = true
-created_at = "2026-03-19T00:00:00Z"
+[agent]
+name = "evaluator"
+display_name = "QA Evaluator"
+role = "specialist"
+status = "active"
+reports_to = ""
+
+# [runtime]
+# provider = "antigravity"   # claude（預設）| codex | antigravity | openai_compat | …
+# fallback = "claude"
 
 [model]
-id = "claude-opus-4-6"
-temperature = 0.7
-max_tokens = 8192
+preferred = "claude-haiku-4-5"
+fallback = "claude-haiku-4-5"
+account_pool = []            # 空 = 全部帳號
+api_mode = "cli"
+
+[container]
+sandbox_enabled = false      # 任務沙箱，見 docs/guides/task-sandbox.md
+network_access = false
 
 [heartbeat]
-enabled = true
-interval_secs = 3600
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
 
 [budget]
-monthly_usd = 20.0
-warning_threshold = 0.8
+monthly_limit_cents = 500
+warn_threshold_percent = 80
+hard_stop = false
 
 [permissions]
-allow_file_write = true
-allow_network = true
-allow_shell = false
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_soul = false
 
 [evolution]
-gvu_enabled = true          # 預設 false，opt-in；啟用後預設走 AEE，非整份改寫 SOUL.md
-max_silence_hours = 12.0
-observation_period_hours = 24.0   # legacy_soul_evolution=true 時才適用；AEE 用 aee_settle_hours
+gvu_enabled = false          # AEE 入口開關；新 agent 由 onboarding 寫入 true
+max_silence_hours = 168.0
+
+[capabilities]
+computer_use = false
+allowed_tools = []
+denied_tools = []
 ```
 
-### 12.2 `config.toml`（全域）
+### 12.2 `config.toml`（全域，節錄自 `config/duduclaw.example.toml`）
 
 ```toml
-[api]
-anthropic_api_key_enc = "<base64 AES-256-GCM ciphertext>"
+[[accounts]]
+id = "main"
+type = "api_key"
+# api_key_enc = "<AES-256-GCM ciphertext>"
+monthly_budget_cents = 5000
+priority = 1
 
-[channels]
-telegram_bot_token = "<token>"
-line_channel_token = "<token>"
-discord_bot_token = "<token>"
+[rotation]
+strategy = "priority"        # round_robin | least_cost | failover | priority
 
 [gateway]
-port = 7070
-host = "127.0.0.1"
-ed25519_pubkey = "<base64 public key>"
+bind = "127.0.0.1"
+port = 18789
+
+# [channels]                 # 扁平 `<platform>_<field>[_enc]` 鍵
+# telegram_bot_token_enc = "<ciphertext>"
+# line_channel_token_enc = "<ciphertext>"
+# discord_bot_token_enc = "<ciphertext>"
+
+# [api]                      # 帳號池為空時的最後備援
+# anthropic_api_key_enc = "<ciphertext>"
 ```
 
 ### 12.3 `bus_queue.jsonl`（IPC）
 
-```json
-{"id": "uuid", "to": "coder", "from": "dudu", "task": "code review", "ts": "2026-03-19T10:00:00Z"}
-```
+格式見 3.2。
 
-### 12.4 `cron_tasks.jsonl`
-
-```json
-{"id": "uuid", "name": "daily-macro", "schedule": "0 0 * * *", "agent_id": "dudu", "action": "macro_reflect", "enabled": true}
-```
-
-### 12.5 `CONTRACT.toml`（行為契約）
+### 12.4 `CONTRACT.toml`（行為契約）
 
 ```toml
 [boundaries]
@@ -631,7 +540,7 @@ must_always = ["respond in zh-TW", "refuse harmful requests"]
 max_tool_calls_per_turn = 10
 ```
 
-### 12.6 `security_audit.jsonl`
+### 12.5 `security_audit.jsonl`
 
 ```json
 {"timestamp": "2026-03-23T12:00:00Z", "event_type": "soul_drift", "agent_id": "dudu", "severity": "critical", "details": {"expected_hash": "abc...", "actual_hash": "def..."}}
@@ -639,124 +548,52 @@ max_tool_calls_per_turn = 10
 
 ---
 
-## 十三、Phase 2 新增模組（v0.6.0）
+## 十三、其他子系統
 
-### 13.1 容器沙箱（Container Sandbox）
+### 13.1 沙箱
 
-```
-Agent Task
-  ↓ dispatch_to_agent()
-  ├─ sandbox_enabled = false → call_claude_for_agent() [直接呼叫]
-  └─ sandbox_enabled = true  → run_sandboxed() [Docker 容器]
-                                 ├─ Agent dir: /agent (read-only mount)
-                                 ├─ Workspace: /workspace (tmpfs 256MB)
-                                 ├─ Network: none (預設離線)
-                                 ├─ Root FS: read-only
-                                 ├─ Memory: 512MB limit
-                                 └─ Timeout: auto-kill
-```
+兩條獨立路徑：
 
-**Runtime 偵測優先級**：Apple Container (macOS 15+) > WSL2 (Windows) > Docker
+- **任務沙箱**（`agent.toml [container] sandbox_enabled`，預設關，僅支援 Docker，`duduclaw-gateway/src/task_sandbox.rs`）：唯讀 rootfs、非 root、drop 全部 capabilities、記憶體 4 GiB / pids 128 / `/tmp` 256 MiB 等限制、私有工作區、agent 目錄唯讀掛在 `/agent`。AI 必須連到 provider，所以需要 `network_access = true`。條件不足時 fail closed。進沙箱的是 bus／儀表板派的任務、heartbeat 看板喚醒、autopilot `delegate`／`run_skill`、goal 回合與多步驟計畫步驟；開了沙箱的員工 goal 回合一律 Solo（不組團隊），到信觸發直接跳過；通道回覆、cron、提醒、主動檢查、ephemeral、`duduclaw acp`、live `duduclaw eval` 仍在主機執行，各寫一次 `task_sandbox_not_applied` 稽核事件。見 [docs/guides/task-sandbox.md](docs/guides/task-sandbox.md)。
+- **腳本沙箱**（`duduclaw-container`，PTC 與 `secaudit` PoC 使用）：Docker / Apple Container / WSL2，`--network=none`，tmpfs 工作區。
 
-### 13.2 安全防護層（Security Layer）
+### 13.2 Skill 生態系統
 
-| 模組 | 檔案 | 功能 |
-|------|------|------|
-| Soul Guard | `soul_guard.rs` | SHA-256 指紋 + `.soul_hash` 持久化 + `.soul_history/` 10 版備份 |
-| Input Guard | `input_guard.rs` | 6 類 prompt injection 規則（風險評分 0-100） |
-| Audit Log | `audit.rs` | JSONL append-only 安全事件日誌 |
-| Key Vault | `key_vault.rs` | Per-agent 通道權限 + API key 隔離 |
+`duduclaw-agent` 的 `skill_loader.rs` 解析 SKILL.md frontmatter，`skill_registry.rs` 做本地加權搜尋（name +10、tag +7、description +5）。MCP：`skill_search`（`source` 參數涵蓋 hub 與 skill bank）、`skill_list`。
 
-**Injection 規則類別**：instruction_override (40), role_hijack (35), system_prompt_extraction (30), tool_abuse (30), encoding_bypass (25), data_exfiltration (25), unicode_injection (20)
+Skill 自動合成（Voyager-inspired）：Gap Accumulator → 從情節記憶合成 SKILL.md → 安全掃描 → 沙箱試用（TTL）→ 跨 Agent 畢業。由 `agent.toml [evolution] skill_synthesis_enabled` 控制，預設關。MCP：`skill_security_scan`、`skill_graduate`、`skill_synthesis_status`。
 
-### 13.3 Skill 生態系統
+### 13.3 紅隊測試
+
+`duduclaw test <agent>` 執行 9 項檢查：SOUL.md 完整性、行為契約存在性、六種 injection 偵測（instruction override、role hijack、system prompt extraction、tool abuse、data exfiltration、encoding bypass）、contract enforcement。`--bank` 可載入外部案例庫（範本 `templates/redteam/starter-bank.jsonl`）。輸出：終端機摘要 + `~/.duduclaw/test-report-<agent>.json`。
+
+### 13.4 Sub-Agent 編排
 
 ```
-skill_loader.rs     ← 解析 SKILL.md YAML frontmatter
-skill_registry.rs   ← 本地 JSON 索引 + 加權搜尋
-MCP: skill_search   ← Agent 自主搜尋 skill
-MCP: skill_list     ← 列出 agent 已安裝 skill
+Main Agent
+  ├─ create_agent(name, role, soul, reports_to)  → 建立 agent 目錄
+  ├─ spawn_agent / send_to_agent                 → 寫入 bus_queue.jsonl
+  │     → AgentDispatcher 消費 → spawn runtime CLI → 結果回寫
+  ├─ list_agents()                               → 依呼叫者可見範圍過濾
+  └─ agent_status(agent_id)
 ```
 
-**搜尋權重**：name x10 > tag x7 > description x5
+授權規則見 [docs/features/37-delegation-isolation.md](docs/features/37-delegation-isolation.md)。
 
-### 13.4 紅隊測試（Red Team）
+### 13.5 Task Board 與 Goal Loop
 
-`duduclaw test <agent>` 內建 9 項測試：
+SQLite `tasks.db`。Dashboard RPC：`tasks.list` / `tasks.create` / `tasks.update` / `tasks.remove` / `tasks.assign`、`activity.list`。Agent 用 MCP：`tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post`。`/goal` 與 `tasks_create kind="goal"` 走自主 Goal Loop（MAV 判官驗收、卡住轉 `needs_human`），見 [docs/features/24-task-board.md](docs/features/24-task-board.md) 與 [docs/guides/goal-loop.md](docs/guides/goal-loop.md)。
 
-1. SOUL.md 完整性
-2. 行為契約存在性
-3. Instruction override 偵測
-4. Role hijack 偵測
-5. System prompt extraction 偵測
-6. Tool abuse 偵測
-7. Data exfiltration 偵測
-8. Encoding bypass 偵測
-9. Contract enforcement 驗證
+### 13.6 共享知識庫（Shared Wiki）
 
-輸出：彩色終端機摘要 + `~/.duduclaw/test-report-<agent>.json`
+儲存於 `~/.duduclaw/shared/wiki/`，可見性由 `wiki_visible_to` capability 控制，`.scope.toml` 定義命名空間政策。MCP：`wiki_ls` / `wiki_read` / `wiki_write` / `wiki_search` / `wiki_stats` / `wiki_lint` 以 `scope: "agent" | "shared"` 切換；`shared_wiki_*` 為棄用別名（v1.68.0 移除），`shared_wiki_delete` 與 `wiki_share` 保留原名。見 [docs/features/17-wiki-knowledge-layer.md](docs/features/17-wiki-knowledge-layer.md)。
 
-### 13.5 Sub-Agent 編排
+### 13.7 Autopilot 規則引擎
 
-```
-Main Agent (Claude Code)
-  ├─ create_agent(name, role, soul, reports_to)  → 建立持久化 agent 目錄
-  ├─ spawn_agent(agent_id, task)                 → 寫入 bus_queue.jsonl
-  │     → AgentDispatcher 消費 → spawn claude CLI → 結果回寫
-  ├─ list_agents()                               → 掃描 agents/ 目錄
-  └─ agent_status(agent_id)                      → 配置 + 待處理任務數
-```
+事件匯流排（`tokio::broadcast`）驅動：
 
-### 13.6 統一 Heartbeat Scheduler
+- 觸發事件：`task_created` / `task_updated` / `task_status_changed` / `activity_new` / `channel_message` / `agent_idle` / `cron_tick` / `tick` / `odoo_event` / `os_file` 等
+- 動作：`delegate` / `notify` / `run_skill`
+- 每條規則三態斷路器，歷史記錄於 `autopilot_history`，MCP 端事件經 `events.db` 進入引擎
 
-Per-agent 排程系統，負責 bus polling 和靜默破壞器：
-
-- 每個 agent 獨立的 cron/interval 設定
-- `max_concurrent_runs` Semaphore 並行控制
-- 每 30 秒 tick，每 5 分鐘從 registry 重新同步
-- 靜默破壞器：超過 `max_silence_hours`（預設 12h）無進化觸發 → 記錄警告
-- 進化反思由預測引擎在對話後事件驅動觸發（見 [第七節](#七自主進化引擎prediction-driven--gvu)）
-- RPC 方法：`heartbeat.status` + `heartbeat.trigger`
-
-## 十四、v1.4.29 新增模組
-
-### 14.1 Skill 自動合成（Phase 3-4）
-
-Voyager-inspired 技能自動合成管線：
-
-1. **Gap Accumulator** — 追蹤重複出現的領域缺口
-2. **Skill Synthesis** — 從情境記憶（episodic memory）自動合成新 Skill
-3. **Sandbox Trial** — 沙箱環境試用評估（TTL 管理）
-4. **Cross-Agent Graduation** — 經驗證的 Skill 自動升級至全域可用
-5. **Skill Recommendation** — 為新 Agent 推薦已驗證的 Skill
-
-MCP 工具：`skill_security_scan`、`skill_graduate`、`skill_synthesis_status`
-
-### 14.2 Task Board
-
-SQLite-backed 任務管理系統：
-
-- 狀態追蹤（pending / in_progress / completed / cancelled）
-- 優先級（low / medium / high / critical）
-- Agent 指派與轉派
-- 即時 Activity Feed（WebSocket 推播）
-- MCP 工具：`tasks.list`、`tasks.create`、`tasks.update`、`tasks.assign`、`activity.list`、`activity.subscribe`
-
-### 14.3 共享知識庫（Shared Wiki）
-
-跨 Agent 共享知識管理：
-
-- 儲存路徑：`~/.duduclaw/shared/wiki/`
-- Wiki Target 分類：agent / shared / both（自動路由）
-- `wiki_visible_to` capability 控制可見性
-- 全文搜尋 + 作者歸屬
-- MCP 工具：`shared_wiki_ls`、`shared_wiki_read`、`shared_wiki_write`、`shared_wiki_search`、`shared_wiki_delete`、`shared_wiki_stats`、`wiki_share`
-
-### 14.4 Autopilot 規則引擎
-
-事件驅動的自動化系統：
-
-- 觸發器：task_created / task_status_changed / channel_message / agent_idle / cron
-- 動作：task_delegate / notify / skill_execute
-- Dashboard 設定頁面（Autopilot tab）
-- 歷史紀錄與執行監控
+見 [docs/features/23-autopilot-engine.md](docs/features/23-autopilot-engine.md)。

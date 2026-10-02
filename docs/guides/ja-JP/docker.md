@@ -28,7 +28,7 @@ DuDuClawのDockerイメージは `container/Dockerfile.server` で構築され�
 
 - `duduclaw` メインプログラム（Rust製、dashboard込み）
 - `@anthropic-ai/claude-code`、`@openai/codex`、`@google/gemini-cli`（`npm i -g` でインストール）
-- `docker.io` CLI（ホストのDocker daemonを呼び出してagent sandboxを作成するために使用）
+- `docker.io` CLI（マウントしたソケットの先にある Docker daemon のクライアント。タスクサンドボックスを有効にした場合に使用）
 - （任意）Python 3.12：LLMLingua-2 のプロンプト圧縮（`llmlingua` が必要）にのみ必要。Skillのセキュリティスキャンとchannel返信はすでにRustネイティブ実装で、Pythonには依存しません
 
 ---
@@ -305,9 +305,13 @@ OPENAI_API_KEY=sk-proj-...
 
 従量課金（OpenAI APIの料金体系）です。
 
-### 6.3 Gemini（Google）CLI
+### 6.3 Gemini（Google）CLI（非推奨）
 
-#### 方法A：Google OAuth
+> **v1.67.0 で非推奨、v1.69.0 で削除予定。** Google は 2026-06-18 に、無料、Google AI Pro、Google AI Ultra の個人アカウントに対する Gemini CLI での提供を停止したため、個人の Google ログインではもう使えません。API キーとエンタープライズ（Gemini Code Assist）での利用は影響を受けません。イメージは削除まで Gemini CLI を同梱し続けます。代わりに Antigravity ランタイム（`antigravity`、実行ファイル `agy`）を使ってください。詳細は[非推奨となった名称](deprecations.md)を参照してください。
+>
+> `agy` 経由の Antigravity サインインにはターミナルと OS キーリングが必要ですが、コンテナにはどちらもありません。コンテナでは API キーモードを使います。`config.toml [antigravity] auth = "api_key"` を設定し、同じ Gemini API キー（`gemini` プロバイダーアカウント、または下記の `GEMINI_API_KEY`）を用意してください。Antigravity も設定を `~/.gemini` 配下に保存するため、下記の `duduclaw-gemini` volume は残します。
+
+#### 方法A：Google OAuth（Gemini Code Assist／エンタープライズアカウントのみ）
 
 ```bash
 docker compose exec duduclaw bash
@@ -316,8 +320,6 @@ gemini auth
 # 状態は /home/duduclaw/.gemini/ に書き込まれる（duduclaw-gemini volume）
 exit
 ```
-
-GoogleはGemini CLIに対して現在無料枠を提供しており、日常利用に適しています。
 
 #### 方法B：APIキーFallback
 
@@ -337,8 +339,8 @@ Google AI Studioの料金体系で課金されます。
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-preferred = "claude"      # メインruntime：claude / codex / gemini / openai-compat
-fallback = "gemini"       # Claudeが利用不可の際に自動切り替え
+preferred = "claude"      # メインruntime：claude / codex / antigravity / openai-compat（geminiは非推奨）
+fallback = "antigravity"  # Claudeが利用不可の際に自動切り替え
 ```
 
 完全な例とfailover戦略については
@@ -377,7 +379,7 @@ claude auth status
 
 | パス | 用途 | 必要性 |
 |------|------|-------|
-| `/var/run/docker.sock` | コンテナがホストのDocker daemonを呼び出しagent sandboxを作成するために使用 | **必須**。container sandboxによる隔離実行に使用 |
+| `/var/run/docker.sock` | コンテナがホストの Docker daemon を呼び出すために使用 | エージェント単位のタスクサンドボックスでのみ使用（デフォルトはオフ）。gateway 自体がコンテナ内で動く場合のタスクサンドボックスは [task-sandbox.md](task-sandbox.md) の対象外で、検証もされていません |
 
 ### 7.1 バックアップ
 
@@ -652,9 +654,9 @@ allowed_origins = ["duduclaw.your-tailnet.ts.net"]
 - Dashboard → Channelsで該当channelの接続状態インジケーターを確認してください
 - logを確認する：`docker compose logs -f duduclaw | grep -i webhook`
 
-### Container sandboxがsub-agentを起動できない
+### タスクサンドボックスが起動しない
 
-DuDuClawは `docker.sock` を通じてホストのDocker daemonを呼び出し、agent tasksを実行する隔離コンテナを作成します。失敗する場合：
+これは `agent.toml [container] sandbox_enabled = true` のエージェントにのみ当てはまります。gateway 自体がコンテナ内で動く場合のタスクサンドボックスは対象外で、検証もされていません。サンドボックスイメージは、ソケットが指す Docker daemon 上に存在している必要があり、自動ダウンロードはされません（[task-sandbox.md](task-sandbox.md) を参照）。以下のコンテナ側の手順は、ソケットが使えるかどうかだけを確認します。
 
 ```bash
 # コンテナ内からsocketが使えるかテストする

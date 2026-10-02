@@ -10,7 +10,7 @@
 
 當分身們回來時，**入口處的評審**會詢問每一個發現了什麼：你到達出口了嗎？路線多乾淨？你有把握嗎？評審保留那個真正找到出路的分身，捨棄其餘的（彷彿那些死路從未發生過）。
 
-DuDuClaw 的 Live Run Forking 就是把這個概念套用到 agent 執行上。一項任務被拆成多個平行**分支（branch）**，每個分支在自己隔離的工作區裡執行，擁有自己的帳號和自己的預算。當它們完成後，**AI 評審**為它們評分，贏家的成果會被合併回 parent；落敗的分支則被丟棄。
+DuDuClaw 的 Live Run Forking 就是把這個概念套用到 agent 執行上。一項任務被拆成多個平行**分支（branch）**，每個分支在自己隔離的工作區裡執行，擁有自己的帳號和自己的預算。當它們完成後，**AI 評審**為它們評分；自動採用的最終決策會合併贏家，需要確認時則保留已完成副本供後續選擇。
 
 這個模式的靈感來自 [`pydantic-deepagents`](https://github.com/vstorm-co/pydantic-deepagents)，它的招牌能力正是如此：將進行中的執行分叉成競爭分支，讓評審合併贏家。RFC-26 把這個概念對映到 DuDuClaw 既有的 `AccountRotator`、容器沙箱與 GVU 評審原語上。
 
@@ -44,7 +44,7 @@ DuDuClaw 的 GVU 自我對弈迴圈已經能改善一個答案，但它是**循�
                                    v
         ┌──────────────────────────────────────────────────────────┐
         │  每個分支取得：                                            │
-        │   • copy-on-write 工作區 overlay（read-through parent）    │
+        │   • copy-on-write 工作區副本（建立時複製 parent）    │
         │   • 來自 AccountRotator 的獨立帳號                         │
         │   • 自己的 per-branch budget_usd 上限                      │
         │   • 選用的 steering 訊息                                   │
@@ -71,7 +71,7 @@ DuDuClaw 的 GVU 自我對弈迴圈已經能改善一個答案，但它是**循�
                             └──────┬──────┘
                                    v
                   winner.overlay.promote() → parent 工作區
-                  （落敗者丟棄；其餘一切不變）
+                  （採用完成後清理保留副本）
 ```
 
 一切都是**預設關閉**。除非 agent 在 `agent.toml` 設定 `[fork] enabled = true`，否則不會發生任何分叉。
@@ -172,18 +172,28 @@ confidence = quality_spread       · 0.4
 | `Vote` | 取樣評審 `VOTE_ROUNDS`（3）次取多數；平手或平均信心過低 ⇒ 延後 |
 | `Manual` | 永遠交由 operator（`winner = None`） |
 
-低於 `DEFAULT_CONFIDENCE_THRESHOLD` 的贏家**無論何種模式**都會被延後。贏家的 overlay **只有**在決策為最終且不需確認時才會被 `promote()` 進 parent 工作區；否則 parent 維持原狀，直到 operator 透過 `merge_or_select` 解決。
+低於 `DEFAULT_CONFIDENCE_THRESHOLD` 的贏家**無論何種模式**都會被延後。贏家的 overlay **只有**在決策為最終且不需確認時才會被 `promote()` 進 parent 工作區；否則 parent 維持原狀，直到建立該 fork 的 agent 透過 `merge_or_select` 明確採用保留的分支。
 
 ---
 
 ## Copy-on-Write Overlay
 
-每個分支在一個 `BranchOverlay` 裡工作，它 read-through parent 工作區，但把寫入保留在本地直到 promote：
+每個分支在建立時取得父工作區的獨立 `BranchOverlay` 副本，並把變更寫進自己的副本；父工作區後續的修改不會形成共享的即時視圖：
 
 - **`Snapshot`**，可攜的 MVP 後端：對 parent 做遞迴 `copy_tree`。
 - **`NativeCow`**：macOS/APFS 上透過 `cp -c` 走 `clonefile(2)`，Linux btrfs/XFS 上走 `cp --reflink=always`。
 
-`detect_backend()` 對主機探測一次（快取）並在原生 clone 失敗時退回 `Snapshot`，**隔離永不被妥協，只犧牲速度/空間最佳化**。落敗的 overlay 被丟棄；只有贏家的寫入被合併過去。
+`detect_backend()` 對主機探測一次（快取）並在原生 clone 失敗時退回 `Snapshot`，**隔離永不被妥協，只犧牲速度/空間最佳化**。自動採用的最終決策只合併贏家；需要確認或人工挑選時，已完成分支的副本會保留供後續選擇。
+
+---
+
+## 採用保留的分支
+
+尚未採用的 fork 會把已完成分支保留在 `<home>/fork_ws/<fork_id>/<branch_id>/`。預設保留 24 小時，可由 `[fork] retained_workspace_ttl_hours` 調整；使用 fork 工具時會清理過期副本。呼叫 `merge_or_select` 時需帶 `fork_id` 與 `branch_id`，MCP 工具只接受建立該 fork 的 agent 採用；Dashboard 的 manager 也能挑選。人工採用與保留副本清理共用跨行程鎖。執行時自動採用尚未在不同 fork 之間共用此鎖，因此使用相同父工作區的自動 fork 應依序執行。工具會先把實際檔案複製到紀錄中的父工作區，再標記採用成功並清除保留副本。副本遺失或過期、父工作區不存在、複製失敗都會回報錯誤。省略 `branch_id` 不會重跑評審；自動評審在執行分支時完成。
+
+建立、保留與採用分支都使用同一套複製規則，排除 `.env`、`.env.*`、`*.pem`、`*.key`、SSH 私鑰名稱、`.npmrc`、`.pypirc` 與 `.netrc`。符號連結不會被跟隨：指向外部或目標不存在的連結會丟棄，Unix 上確認留在來源樹內的連結會重建。硬連結會變成獨立檔案，特殊檔案會丟棄；採用時會替換目的檔案，不會透過目的連結寫入。這是依名稱排除的規則，無法辨識所有可能的機密檔名。採用目標是 agent 目錄時，採用也絕不會把 agent 結構檔複製回去：`SOUL.md`、`CONTRACT.toml`、`agent.toml`、`.mcp.json`、`.claude/` 與其他 agent 結構檔維持上層原本的內容。分支仍然可以讀取它們。
+
+`test_command` 會在分支副本內執行。逾時時，Unix 會終止該行程群組，Windows 使用 `taskkill /T /F`；輸出擷取有大小上限。Unix 子行程若自行脫離群組，便不在此清理邊界內，輸出讀取也有有限的收尾等待時間。
 
 ---
 
@@ -196,7 +206,7 @@ confidence = quality_spread       · 0.4
 | `fork_run` | 將當前任務拆成 N 個分支 |
 | `inspect_branches` | 列出存活分支 + 狀態 + 花費 |
 | `diff_branches` | 顯示兩個分支間的檔案/輸出 diff（每側 `truncate_bytes`） |
-| `merge_or_select` | 解決一個分叉，評審裁定或明確挑選 |
+| `merge_or_select` | 由建立該 fork 的 agent 明確挑選並採用保留分支 |
 | `terminate_branch` | 終止失控分支（取消尚未開始的；對進行中的子行程在串流中途 SIGKILL） |
 | `fork_cost` | 合計 + per-branch 花費 |
 
@@ -217,6 +227,7 @@ aggregate_budget_usd = 1.50               # 跨所有分支
 merge_mode           = "auto_with_fallback"
 test_command         = ""                 # 選用；空 ⇒ test_pass_ratio 中性化
 test_timeout_s       = 120
+retained_workspace_ttl_hours = 24          # 尚未採用的分支副本
 ```
 
 缺漏或格式錯誤的 `[fork]` 區塊是停用的 fail-safe，不 panic。無效的子值（如 `max_branches = 0`、負預算）退回預設；未知的 `merge_mode` 字串退回 `AutoWithFallback` 並附警告。

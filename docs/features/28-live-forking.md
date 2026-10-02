@@ -10,7 +10,7 @@ Imagine standing at a junction in a maze. You don't know which way leads to the 
 
 When the clones come back, a **judge at the entrance** asks each one what it found: did you reach the exit? how clean was the route? are you sure? The judge keeps the clone that actually found the way out and discards the rest — as if the dead-ends never happened.
 
-DuDuClaw's Live Run Forking is the same idea applied to an agent run. A single task is split into parallel **branches**, each running in its own isolated workspace with its own account and its own budget. When they finish, an **AI judge** scores them and the winner's work is merged back into the parent — the losing branches are thrown away.
+DuDuClaw's Live Run Forking is the same idea applied to an agent run. A single task is split into parallel **branches**, each running in its own isolated workspace with its own account and its own budget. When they finish, an **AI judge** scores them. A final automatic decision merges the winner into the parent; decisions requiring confirmation retain finished copies for later selection.
 
 This pattern is inspired by [`pydantic-deepagents`](https://github.com/vstorm-co/pydantic-deepagents), whose signature capability is exactly this: fork an in-flight run into competing branches and let a judge merge the winner. RFC-26 maps that concept onto DuDuClaw's existing `AccountRotator`, container sandbox, and GVU judge primitives.
 
@@ -44,7 +44,7 @@ When a task has multiple plausible approaches and you can afford to try several 
                                    v
         ┌──────────────────────────────────────────────────────────┐
         │  Each branch gets:                                         │
-        │   • a copy-on-write workspace overlay (read-through parent)│
+        │   • a copy-on-write workspace copy (parent at creation)    │
         │   • a distinct account from the AccountRotator             │
         │   • its own per-branch budget_usd cap                      │
         │   • an optional steering message                           │
@@ -172,18 +172,28 @@ Each sub-score is clamped to `[0,1]` (out-of-range ⇒ clamp + warn; NaN ⇒ 0.0
 | `Vote` | Sample the judge `VOTE_ROUNDS` (3) times, take the majority; tie or low mean-confidence ⇒ defer |
 | `Manual` | Always defer to the operator (`winner = None`) |
 
-A winner below `DEFAULT_CONFIDENCE_THRESHOLD` is deferred **regardless** of mode. The winner's overlay is `promote()`d into the parent workspace **only** when the decision is final and needs no confirmation — otherwise the parent is left untouched until an operator resolves it via `merge_or_select`.
+A winner below `DEFAULT_CONFIDENCE_THRESHOLD` is deferred **regardless** of mode. The winner's overlay is `promote()`d into the parent workspace **only** when the decision is final and needs no confirmation — otherwise the parent is left untouched until the creating agent explicitly selects a retained branch via `merge_or_select`.
 
 ---
 
 ## Copy-on-Write Overlays
 
-Each branch works in a `BranchOverlay` that reads through the parent workspace but keeps its writes local until promotion:
+Each branch works in a separate `BranchOverlay` copied from the parent at creation. It writes into that copy; later parent edits are not a shared live view:
 
 - **`Snapshot`** — the portable MVP backend: a recursive `copy_tree` of the parent.
 - **`NativeCow`** — `clonefile(2)` via `cp -c` on macOS/APFS, `cp --reflink=always` on Linux btrfs/XFS.
 
-`detect_backend()` probes the host once (cached) and falls back to `Snapshot` if a native clone fails — **isolation is never compromised, only the speed/space optimization**. Losing overlays are discarded; only the winner's writes are merged through.
+`detect_backend()` probes the host once (cached) and falls back to `Snapshot` if a native clone fails — **isolation is never compromised, only the speed/space optimization**. A final automatic selection promotes only the winner. When confirmation or manual selection is required, finished branch copies are retained for later selection.
+
+---
+
+## Selecting a retained branch
+
+Unresolved forks retain finished branch workspaces under `<home>/fork_ws/<fork_id>/<branch_id>/`. The default retention is 24 hours, configured by `[fork] retained_workspace_ttl_hours`; cleanup runs when fork tools are used. Select with `merge_or_select` and both `fork_id` and `branch_id`. The MCP tool accepts selection only from the creating agent; a manager can also select through the dashboard. Manual selections and retention cleanup share a cross-process lock. Automatic execution-time promotion does not yet share that lock across concurrent forks: schedule automatic forks using the same parent workspace sequentially. The call copies actual files into the recorded parent workspace before marking the fork promoted, then removes retained copies. A missing or expired copy, missing parent, or failed promotion returns an error rather than claiming success. Calling without `branch_id` does not rerun the judge; automatic judging happens during execution.
+
+The same copy policy applies when creating, retaining, and promoting branches. It excludes `.env`, `.env.*`, `*.pem`, `*.key`, SSH private-key names, `.npmrc`, `.pypirc`, and `.netrc`. Symlinks are never followed: external and dangling links are dropped; verified internal links are recreated on Unix. Hardlinks become independent files and special files are dropped. Promotion replaces files rather than writing through destination links. This name-based policy does not detect every possible secret filename. When the promotion target is an agent directory, promotion also never copies agent-structure files back: `SOUL.md`, `CONTRACT.toml`, `agent.toml`, `.mcp.json`, `.claude/` and the other agent-structure files stay as they are in the parent. Branches can still read them.
+
+A configured `test_command` runs in the branch copy. On timeout, Unix kills its process group and Windows uses `taskkill /T /F`; output capture is bounded. Descendants that detach into another process group are outside that Unix cleanup boundary, and output-reader waits have a bounded grace period.
 
 ---
 
@@ -196,7 +206,7 @@ All six tools are gated behind `Scope::ForkExecute` (enumerated explicitly; any 
 | `fork_run` | Split the current task into N branches |
 | `inspect_branches` | List live branches + state + spend |
 | `diff_branches` | Show file/output diff between two branches (`truncate_bytes` on each side) |
-| `merge_or_select` | Resolve a fork — judge verdict or explicit pick |
+| `merge_or_select` | Promote an explicit retained branch selected by the creating agent |
 | `terminate_branch` | Kill a runaway branch (cancels not-yet-started; SIGKILLs an in-flight subprocess mid-stream) |
 | `fork_cost` | Aggregate + per-branch spend |
 
@@ -217,6 +227,7 @@ aggregate_budget_usd = 1.50               # across all branches
 merge_mode           = "auto_with_fallback"
 test_command         = ""                 # optional; empty ⇒ test_pass_ratio neutralized
 test_timeout_s       = 120
+retained_workspace_ttl_hours = 24          # unresolved branch copies
 ```
 
 A missing or malformed `[fork]` block is a disabled fail-safe — no panic. Invalid sub-values (e.g. `max_branches = 0`, negative budget) fall back to defaults; an unknown `merge_mode` string falls back to `AutoWithFallback` with a warning.

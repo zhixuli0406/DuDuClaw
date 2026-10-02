@@ -61,7 +61,7 @@ trust: 0.1   — Speculative, draft
 
 ## 自動注入フロー
 
-注入はsystem prompt組み立て時に発生します——3つの場所で行われるため、4つすべてのruntime（Claude／Codex／Gemini／OpenAI）が同じ知識を得ます：
+注入はsystem prompt組み立て時に発生します——3つの場所で行われるため、すべてのruntime（Claude、Codex、Antigravity、Grok、OpenAI互換、およびcatalogのその他のruntime）が同じ知識を得ます：
 
 ```
 User sends message
@@ -375,7 +375,7 @@ L0+L1ページの自動注入は、医師のアイデンティティと現在の
 
 ### Runtime非依存
 
-Claude、Codex、Gemini、OpenAI互換runtimeはすべて同じwikiを見ます——注入がruntime境界の*前*、`build_system_prompt`で行われるからです。
+すべてのruntimeが同じwikiを見ます——注入がruntime境界の*前*、`build_system_prompt`で行われるからです。
 
 ### 蓄積ループを閉じる
 

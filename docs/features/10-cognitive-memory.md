@@ -23,20 +23,20 @@ DuDuClaw's memory system mirrors this architecture.
 
 ### Two Memory Stores
 
-**Episodic Memory** — Records of specific interactions, tagged with:
+**Episodic Memory** — Records of specific events, each stored with:
 - Timestamp (when did this happen?)
-- Context (which channel? which user? what topic?)
-- Emotional valence (was this positive, negative, or neutral?)
+- Tags and source event (what produced it, e.g. a prediction observation)
+- Importance (0–10) and access history (how often and how recently it was recalled)
 
 Example entries:
 ```
 [2026-04-05 14:30] User asked about Rust lifetimes in Discord.
   Struggled with 'static lifetime. Explained with analogy.
-  Interaction: positive (user said "that makes sense!")
+  importance: 4
 
 [2026-04-06 09:15] User reported a bug in the billing module.
   Root cause: null check missing in invoice calculation.
-  Interaction: negative (user frustrated, issue critical)
+  importance: 8
 ```
 
 **Semantic Memory** — Distilled facts and knowledge, without temporal context:
@@ -62,8 +62,8 @@ For each memory entry, compute:
      +---> Importance: How significant was this event?
      |       (Critical decisions > casual chat)
      |
-     +---> Relevance: How semantically close is this to the query?
-             (Embedding distance or keyword overlap)
+     +---> Relevance: How closely does it match the query?
+             (Full-text keyword rank)
      |
      v
 Final score = weighted combination of all three
@@ -72,39 +72,44 @@ Final score = weighted combination of all three
 Return top-N memories, sorted by score
 ```
 
-The weights between the three dimensions are configurable. An agent that handles urgent support tickets might weight Recency and Importance higher. An agent that serves as a knowledge base might weight Relevance higher.
+The weights are fixed defaults in the engine (recency 0.25, importance 0.35, keyword relevance 0.35); they are not configured per agent. Two extra signals can add to the score: a knowledge-graph signal (0.15, Personalized PageRank over stored subject–predicate–object facts) and a vector-similarity signal (0.15, when an embedder is attached). Each score is then scaled by how trusted the memory's origin is (weight 0.10).
 
 This approach is inspired by the Stanford **Generative Agents** research paper, which demonstrated that this 3D retrieval produces more human-like memory recall than simple keyword search.
 
 ### Memory Decay: Forgetting Curves
 
-Not all memories should live forever. The system implements **spaced-repetition forgetting curves**:
+Not all memories should live forever. The recency score follows an **Ebbinghaus forgetting curve**, and a daily job archives memories that have faded:
 
 ```
 Memory created
      |
      v
-  Initial strength: 1.0
+  Retrievability R = exp(-t / S)
+  (t = days since last access, R starts at 1.0)
      |
      v
   Time passes without access...
      |
      v
-  Strength decays: 0.8 → 0.6 → 0.4 → 0.2
+  R decays toward 0
      |
      v
-  Below threshold? → Mark as "faded"
-     (Still exists, but won't surface in normal retrieval)
+  Older than 30 days, importance below 3,
+  not semantic, and R below 0.05?
+     → Moved to the archive
+     (No longer returned by retrieval;
+      deleted after 90 days in the archive)
      |
      v
-  If accessed again → Strength resets to 1.0
-     (The memory is "refreshed" and starts decaying again)
+  If accessed again → t resets, so R is back to 1.0,
+     and stability S grows with every access
 ```
 
-The decay rate varies by importance:
-- **Critical memories** (security incidents, key decisions): Slow decay, high threshold
-- **Important memories** (user preferences, recurring topics): Medium decay
-- **Casual memories** (greetings, small talk): Fast decay, low threshold
+Stability `S` depends on importance and recall:
+- **Higher importance** (up to 2× at importance 10): slower decay; importance 3 and above is never archived
+- **Frequent recall**: `S` grows with `ln(1 + access_count)`, capped at 365 days
+- **Low importance, never recalled**: fastest decay (base stability 14 days, scaled down)
+- **Semantic memories** are never archived
 
 This prevents the memory store from growing unboundedly. Old, unimportant memories naturally fade away, keeping the retrieval system fast and focused.
 
@@ -129,9 +134,9 @@ Returns matches ranked by relevance
 
 This complements the 3D-weighted search: full-text search is for when you know *what* you're looking for; 3D-weighted search is for when you need contextually appropriate recall.
 
-### Vector Index
+### Vector Similarity
 
-For semantic search (finding memories that are *conceptually* similar, even if they don't share keywords), the system maintains a vector index:
+For finding memories that are similar even when they don't share whole keywords, the engine can compare embedding vectors:
 
 ```
 Query: "invoice calculation error"
@@ -140,7 +145,7 @@ Query: "invoice calculation error"
 Convert to embedding vector
      |
      v
-Find nearest neighbors in vector space
+Cosine similarity against the agent's embedded memories
      |
      v
 Results include memories about:
@@ -149,37 +154,36 @@ Results include memories about:
   - "tax calculation edge case" (conceptually adjacent)
 ```
 
-The vector index catches connections that keyword search misses — because "invoice calculation error" and "billing module null check" share no keywords, but are clearly about related topics.
+The shipped embedder is a local character n-gram hashing embedder (no model download), so it matches overlapping word fragments, including CJK text, rather than meaning in the way a neural embedding model does. The comparison is a brute-force scan; there is no separate vector index. It is attached on the gateway's memory engines when `[memory] novelty_gate` is on (the default), and on the MCP memory tools only when `DUDUCLAW_SEMANTIC_VECTORS=1` is set.
 
 ---
 
-## Federated Memory: Cross-Agent Knowledge Sharing
+## Cross-Agent Knowledge Sharing
 
-In a multi-agent setup, agents sometimes need to access each other's knowledge — but not everything. The federated memory system provides controlled sharing:
+Memory is per agent. The memory tools (`memory_search`, `memory_store`, `memory_read`, …) only read and write the calling agent's own namespace; there are no per-memory sharing levels. Knowledge that several agents need goes into the shared wiki instead:
 
 ```
 Agent A (customer support) needs product info
      |
      v
-Query Agent B's (product specialist) memory
+Search the shared wiki (wiki_search scope="shared")
      |
      v
-Privacy check:
-  Is this memory marked as shareable?
+Visibility check:
+  Does wiki_visible_to allow this agent?
      |
   +--+--+
   |     |
  Yes    No
   |     |
   v     v
-Return  Access
-result  denied
+Return  Not
+result  visible
 ```
 
-Memories have sharing levels:
-- **Private**: Only the owning agent can access
-- **Team**: Agents in the same group can access
-- **Public**: Any agent can access
+Knowledge lives at two levels:
+- **Agent memory and agent wiki**: Only the owning agent
+- **Shared wiki** (`~/.duduclaw/shared/wiki/`): Agents allowed by their `wiki_visible_to` capability
 
 This mirrors how organizations handle information: some knowledge is department-specific, some is company-wide, and some is need-to-know.
 
@@ -187,23 +191,24 @@ This mirrors how organizations handle information: some knowledge is department-
 
 ## Wiki Knowledge Base
 
-Beyond conversational memory, the system supports structured knowledge ingestion:
+Beyond conversational memory, the system keeps structured knowledge as wiki pages:
 
 ```
-External knowledge source (URL, document, wiki)
+Knowledge source
+  (wiki_write by an agent, operator edits,
+   reference documents auto-filed from conversation)
      |
      v
-Ingest pipeline:
-  - Parse content
-  - Extract structured data
-  - Index for full-text search
-  - Generate embeddings for vector search
+Wiki page:
+  - Markdown with frontmatter
+  - Agent-local or shared scope
+  - Indexed for full-text search
      |
      v
-Knowledge base (queryable by all agents)
+Knowledge base (searchable with wiki_search)
 ```
 
-The web dashboard includes an interactive **knowledge graph visualization** that shows how different pieces of knowledge are connected — topics, entities, and their relationships.
+The dashboard's Knowledge Hub page includes a **relationship graph** that shows how wiki pages connect through shared topics. See [wiki knowledge layer](17-wiki-knowledge-layer.md).
 
 ---
 
@@ -223,19 +228,19 @@ The forgetting curve ensures memory doesn't grow without bound. The system natur
 
 ### Cross-Agent Intelligence
 
-Federated memory means knowledge doesn't stay siloed. A product insight learned by one agent can benefit the support agent, the sales agent, and the documentation agent — all automatically, with privacy controls.
+The shared wiki means knowledge doesn't stay siloed. A product insight written there by one agent can serve the support agent, the sales agent, and the documentation agent, within the visibility rules the operator sets.
 
 ---
 
 ## Interaction with Other Systems
 
-- **Evolution Engine**: Memory patterns inform the prediction engine's accuracy.
-- **Session Manager**: Conversation history flows into episodic memory.
-- **Wiki Ingestion**: Structured knowledge feeds into the semantic memory store.
-- **Dashboard**: Memory contents, search interface, and knowledge graph are all accessible through the web interface.
+- **Prediction engine**: Writes episodic observations (`source_event = prediction_episodic`) after channel replies.
+- **Conversation distillation**: Facts from conversations become semantic memories; reference documents become wiki pages with a short pointer in memory.
+- **Memory intelligence**: Temporal supersession, reflexion rules and origin trust build on this engine. See [memory intelligence](20-memory-intelligence.md).
+- **Dashboard**: Memory contents, search, and the Knowledge Hub graph are accessible through the web interface.
 
 ---
 
 ## The Takeaway
 
-Memory is what separates a stateless chatbot from a useful assistant. By modeling memory after human cognition — episodic/semantic separation, importance-weighted retrieval, natural forgetting, and controlled sharing — DuDuClaw gives agents the ability to learn, remember, and grow from every interaction.
+Memory is what separates a stateless chatbot from a useful assistant. By modeling memory after human cognition — episodic/semantic separation, importance-weighted retrieval, natural forgetting, and a shared knowledge base — DuDuClaw gives agents the ability to learn, remember, and grow from every interaction.

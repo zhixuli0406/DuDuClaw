@@ -8,7 +8,7 @@
 
 DuDuClaw 把 Claude Code、Codex、Gemini 這類 AI 指令列工具，變成公司裡交得出東西的 AI 員工：常駐 Telegram、LINE、Discord 等 11 個通訊軟體，交件前有獨立判官驗收，花掉的每一塊錢都記在帳上。
 
-你只需要一個 Rust binary。通道路由、對話記憶、多帳號輪替、行為安全邊界、本地推論、Web 管理後台全部內建;AI 大腦要用 Claude、Codex、Gemini、Antigravity 還是任何 OpenAI 相容 API 隨你換,設定和記憶都留在你自己的機器上。核心採 Apache 2.0 授權。
+你只需要一個 Rust binary。通道路由、對話記憶、多帳號輪替、行為安全邊界、本地推論、Web 管理後台全部內建;AI 大腦要用 Claude、Codex、Gemini(已棄用)、Antigravity 還是任何 OpenAI 相容 API 隨你換,設定和記憶都留在你自己的機器上。核心採 Apache 2.0 授權。
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.66.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
@@ -44,7 +44,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | 多 LLM 容錯切換 | 手動重啟 | 4 種輪替策略 + 跨供應商 failover |
 | 換 LLM 時保留上下文 | 遺失 | 完整保留 |
 | 對話記憶與知識庫 | 單次 session | SQLite 時態記憶 + 分層 wiki + 自動注入 |
-| 工具跨 LLM 共用 | 每家重寫 | 243 個 MCP 工具寫一次,五種後端共用 |
+| 工具跨 LLM 共用 | 每家重寫 | 249 個 MCP 工具寫一次,五種後端共用 |
 | 安全邊界 / 稽核 / 密鑰管理 | 自己造 | 政策核心 + OS 沙箱 + AES-256-GCM 內建 |
 | 交給客戶的整台值班機 | 自己裝 Linux,更新與防竄改自己管 | DuDuClaw OS 映像:A/B 更新回滾 + 唯讀 root,插電即用;人機共用桌面,不影響日常使用 |
 
@@ -55,14 +55,14 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 AI 運行時是大腦,DuDuClaw 是水電管線,中間用 MCP(JSON-RPC 2.0)橋接。大腦可換,管線不動:
 
 ```
-AI Runtime (brain) — Claude Code / Codex / Gemini / Antigravity / OpenAI-compat
+AI Runtime (brain) — Claude Code / Codex / Gemini (deprecated) / Antigravity / OpenAI-compat
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 5 種後端自動偵測,per-agent 設定
   ├─ Session Memory — 原生 --resume + 時態記憶 + key-fact 累積 + 分層 wiki
-  ├─ MCP Server — 243 個工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
+  ├─ MCP Server — 249 個工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
   ├─ Evolution Engine — 預測驅動 + AEE playbook 進化(v3 預設) + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS 沙箱 + redaction vault
   ├─ Inference Engine — OpenAI 相容本地伺服器(llama-server / Ollama / vLLM)/ llamafile
@@ -70,7 +70,7 @@ DuDuClaw (plumbing)
   └─ Web Dashboard — React 19 SPA(32 頁),rust-embed 嵌入 binary
 ```
 
-Rust workspace 由 20 個 crate 組成:核心地基 `duduclaw-core`、服務層 `duduclaw-gateway`、統一 API 層 `duduclaw-llm`、本地推論 `duduclaw-inference`、認知記憶 `duduclaw-memory`、安全層 `duduclaw-security` 等。完整設計見 [ARCHITECTURE.md](ARCHITECTURE.md)。
+Rust workspace 由 24 個 crate 組成:核心地基 `duduclaw-core`、服務層 `duduclaw-gateway`、統一 API 層 `duduclaw-llm`、本地推論 `duduclaw-inference`、認知記憶 `duduclaw-memory`、安全層 `duduclaw-security` 等。完整設計見 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 本地模型的實驗性校準路由參考 Varun Kotte 的 [UCCI（arXiv:2605.18796）](https://arxiv.org/abs/2605.18796)；設定與資料準備見 [UCCI calibrated cascade](docs/features/57-ucci-calibrated-cascade.md)。
 
@@ -82,7 +82,7 @@ Rust workspace 由 20 個 crate 組成:核心地基 `duduclaw-core`、服務層 
 
 DuDuClaw 本身不含 LLM,需要一個 AI 大腦。五選一(之後也能在瀏覽器引導中設定):
 
-- 裝好 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli) 或 Antigravity 其中之一並登入
+- 裝好 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)(已棄用,v1.69.0 移除)或 Antigravity 其中之一並登入
 - 準備一把 API key,走任何 OpenAI 相容供應商
 - 或用本地 GGUF 模型,不需要任何雲端帳號
 
@@ -171,9 +171,9 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | 領域 | 內建能力 | 深入閱讀 |
 |------|----------|----------|
 | 通訊通道 | 11 通道(Telegram / LINE / Discord + 語音 / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat),per-agent bot、熱啟停、平台原生排版、輸入中指示、長任務進度看板 | [docs/features](docs/features/README.md) |
-| Multi-Runtime | Claude / Codex / Gemini / Antigravity / OpenAI-compat 五後端,自動偵測、per-agent 設定、換後端保留上下文 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Multi-Runtime | Claude / Codex / Gemini(已棄用,v1.69.0 移除)/ Antigravity / OpenAI-compat 五後端,自動偵測、per-agent 設定、換後端保留上下文 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 統一 LLM API 層 | `duduclaw-llm` 用一套正規化請求覆蓋 4 種原生協定(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat),內建 8 個 OpenAI-compat preset(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 計價 registry + 跨供應商 fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP Server | 243 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport,對外只暴露 7 個白名單工具 | [docs/api](docs/api/README.md) |
+| MCP Server | 249 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport,對外只暴露 7 個白名單工具 | [docs/api](docs/api/README.md) |
 | 記憶系統 | SQLite 時態記憶(事實取代鏈)、HippoRAG-lite 知識圖譜檢索(Personalized PageRank)、Ebbinghaus 遺忘曲線自動封存、跨 agent 共享 wiki | [docs/features](docs/features/README.md) |
 | 自我進化 | 預測驅動(約 90% 對話零 LLM 成本)、AEE playbook 進化(v3 預設,SOUL.md 對 agent 唯讀,行為規則獨立驗證 + 條目級觀察窗回滾)、MistakeNotebook 跨回合記憶;GVU² SOUL.md 整份改寫降為選配逃生門 | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | 安全 | PolicyKernel reference monitor(零 LLM、fail-closed)、macOS Seatbelt / Linux Landlock 原生沙箱、Docker / Apple Container / WSL2 容器沙箱、secret redaction vault、CONTRACT.toml 行為契約 + 紅隊測試 | [SECURITY.md](SECURITY.md) |
@@ -249,7 +249,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | 語言 | Rust | TypeScript | Rust | Python |
 | 通道 | 11 | 25+ | 8 | 0(API)|
 | Multi-Runtime | 5 後端 | 單一 | 單一 | 多 LLM |
-| MCP Server | 243 個工具 | 無 | 無 | 無 |
+| MCP Server | 249 個工具 | 無 | 無 | 無 |
 | 自我進化引擎 | GVU² 雙迴圈 | 無 | 無 | 無 |
 | 本地推論 | 5 後端 + 信心路由 | 無 | 無 | 無 |
 | 行為契約 | CONTRACT.toml + 紅隊 | 無 | WASM 沙箱 | 無 |

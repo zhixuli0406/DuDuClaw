@@ -130,4 +130,4 @@ config.toml 裡的舊值再重跑，或改用 `--rename` 匯入成獨立 agent�
 
 **Q：非 Claude 模型會怎樣？**
 會原樣保留成 `[model] preferred` 並標 `PARTIAL`，提示你人工確認要對映到哪個 runtime
-（codex / gemini / openai_compat）。DuDuClaw 不會替你猜。
+（codex / antigravity / openai_compat，或已於 v1.67.0 棄用、v1.69.0 移除的 gemini，見[棄用說明](deprecations.md#gemini-cli-runtime)）。DuDuClaw 不會替你猜。

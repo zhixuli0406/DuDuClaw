@@ -90,6 +90,8 @@ Anthropic's own guidance is the reason: "When the work is one dependent chain, o
 
 The gate is zero-LLM and deterministic:
 
+**Sandbox rule, checked first:** an employee with `agent.toml [container] sandbox_enabled = true` is always Solo (reason `sandbox_enabled`). This rule runs before every mode, including `always_team`, so a sandboxed employee never forms a team and no role member runs on the host; its goal rounds run Solo inside the [task sandbox](../guides/task-sandbox.md).
+
 **Hard exclusions — always Solo:** a live channel turn (the facade answers), a plan-first goal still awaiting approval, a plan containing an irreversible action, or fewer than 3 goal-loop rounds of budget left.
 
 **Four signals.** Three or more fire ⇒ team:
@@ -130,7 +132,7 @@ model   = "gpt-5.5"
 effort  = "medium"
 
 [team.roles.verifier]
-runtime = "gemini"
+runtime = "antigravity"
 model   = "gemini-3.7-flash"
 effort  = "low"
 
@@ -151,7 +153,7 @@ So an employee overriding only `[team.roles.executor] effort` keeps the global r
 
 ### `gate`
 
-`auto` runs the rules above. `always_solo` is the kill switch. `always_team` is **testing only** — it bypasses every hard exclusion, including the irreversible-action one. An unrecognised value degrades to `auto` and is reported.
+`auto` runs the rules above. `always_solo` is the kill switch. `always_team` is **testing only** — it bypasses every hard exclusion, including the irreversible-action one. It does not bypass the sandbox rule. An unrecognised value degrades to `auto` and is reported.
 
 ### `effort`
 
@@ -177,7 +179,7 @@ Declaring only a `model` is fine — the catalog binds it to the runtime that se
 
 ### 2. First-batch runtimes only
 
-`claude`, `codex`, `gemini`, `antigravity`, `grok`. Anything else — including `openai_compat`, `qwen`, `copilot`, `cursor` — is refused (`runtime_not_allowed`).
+`claude`, `codex`, `gemini` (deprecated in v1.67.0, removed in v1.69.0: use `antigravity`), `antigravity`, `grok`. Anything else — including `openai_compat`, `qwen`, `copilot`, `cursor` — is refused (`runtime_not_allowed`).
 
 The reason is tools, not capability: these five register DuDuClaw's MCP server natively, so a role running on one gets the full tool surface. A role that silently loses its tools produces confident tool-free narration, which the verifier cannot tell apart from actual work.
 

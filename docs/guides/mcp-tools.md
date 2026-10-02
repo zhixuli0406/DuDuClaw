@@ -37,7 +37,7 @@ still reaches the real gate and is still refused, with the gate's own message.
 | `recording` | `agent.toml [capabilities]` | 5 browser/desktop recording tools hidden |
 | `system_operator` | `agent.toml [capabilities]` | 19 appliance operation tools hidden |
 | `codrive` | `agent.toml [capabilities]` | `codrive_run` / `codrive_status` hidden |
-| `computer_use` | `agent.toml [capabilities]` | 7 `computer_*` tools hidden |
+| `computer_use` | `agent.toml [capabilities]` | 8 `computer_*` tools hidden (see [`computer_*`](#computer_--sessions-run-by-the-gateway) below) |
 | `db_sources` | `agent.toml [capabilities]` | 4 `db_*` tools hidden |
 | `[fork] enabled` | `agent.toml` | 6 forking tools hidden |
 | `scoped_tools` | `agent.toml [capabilities]` + live grant | Hidden until a task-scoped grant is active |
@@ -178,6 +178,71 @@ Beyond the standard flags, `field` accepts `stagnation_enabled` (bool),
 `stagnation_window_seconds` (60–604800), `stagnation_trigger_threshold`
 (1–1000) and `stagnation_action` (`log_only` | `suppress`). See
 [evolution-switches.md](evolution-switches.md).
+
+### `execute_program` — where the script runs
+
+The script runs in the script sandbox: a container from the image in
+`config.toml [container.sandbox] image` (the same image as the
+[task sandbox](task-sandbox.md), never pulled automatically). The container
+runs as the host user (`1000:1000` when the host process is root, and always on
+WSL2), with all capabilities dropped, `no-new-privileges`, a read-only root
+filesystem, no network, 2 GiB of memory with no swap, 256 processes, one CPU
+and a small `/tmp` tmpfs. Only a private directory holding the script is
+mounted, read-only, at `/workspace`. `timeout_seconds` (default 30, at most
+300) applies under a hard cap of 600 seconds, stdout and stderr come back as
+one output (the read is capped at 2 MiB, the reply at 1 MiB), and the container
+is force-removed if the call is cancelled. Docker is used on macOS and Linux;
+on Windows WSL2 is tried first, then Docker.
+
+When the sandbox cannot run (no Docker, image missing, invalid
+`[container.sandbox]`, …) the script is **not run**: the tool returns
+`Script sandbox unavailable (<code>): …` with the `docker pull <image>`
+command and writes the audit event `script_sandbox_unavailable`. Older versions
+silently ran the script on the host instead. To get that back, set
+`[container.sandbox] script_when_unavailable = "run_unsandboxed"` (a separate
+key from the task sandbox's `when_unavailable`); every host run is then
+audited as `script_sandbox_bypassed`.
+
+A script cannot call platform tools back: there is no RPC socket inside the
+container.
+
+### `computer_*` — sessions run by the gateway
+
+The eight tools drive one computer-use session per employee: an isolated
+container with a virtual display and a kiosk browser. The MCP server only
+forwards each call to the gateway over loopback
+(`POST /api/internal/computer-use`, signed per request); the gateway owns the
+container and runs every check, so the gateway must be running. Hidden unless
+`agent.toml [capabilities] computer_use = true`.
+
+| Tool | Parameters | Notes |
+|---|---|---|
+| `computer_session_start` | `task` string, optional; `width` integer 320–1920; `height` integer 240–1200 | One session per employee. The result lists the limits, whether high-risk actions can be confirmed in a chat, and the sites `computer_navigate` can open |
+| `computer_screenshot` | none | MCP image block (PNG, masked) followed by a text block with actions used and time left. A fully masked picture is reported as such in the text, with the reason (several windows, sensitive or unreadable front window, detection failure) and the next step |
+| `computer_click` | `x`, `y` integers (required); `button` string `left`/`right`; `double` boolean | `double` is left button only |
+| `computer_type` | `text` string (required), 1–2,000 characters | Audited as a character count only |
+| `computer_key` | `key` string (required): letters, digits, `+`, `-`, `_` | e.g. `Return`, `ctrl+s` |
+| `computer_scroll` | `x`, `y` integers (required); `direction` string `up`/`down` (default `down`); `amount` integer 1–20 (default 3) | |
+| `computer_navigate` | `url` string (required) | `https://` only, host exactly on the employee's `[capabilities.computer_use_config] allowed_domains` and resolved at session start, port absent or 443, no user name or password, at most 2,000 bytes. With no allowlist the session has no network and the call is refused |
+| `computer_session_stop` | `session_id` string, optional | Removes the container |
+
+Integer and boolean parameters also accept numeric and `"true"`/`"false"`
+strings. Click, type, key, scroll and navigate each count as one action
+against `max_actions` (default 50). Limits, the approval and confirmation
+rules, the network allowlist and its residual risks are in
+[Browser automation](../features/08-browser-automation.md).
+
+### `create_agent` / `agent_remove` — removed names are reserved
+
+`agent_remove` moves the employee to `~/.duduclaw/agents/_trash/` and answers
+that the employee was removed, that the administrator can restore it, and that
+the name is reserved. It returns no path. `create_agent` then refuses that
+name for every MCP caller while a trash entry exists, while `org.toml` still
+records the id without a directory, or while the trash cannot be listed; a
+different name works. Operators can reuse the name from the dashboard or a
+terminal. Over HTTP with a non-internal key, both tools act as that key's own
+client id. Details:
+[Delegation isolation](../features/37-delegation-isolation.md#a-removed-employees-name-stays-reserved).
 
 ## Deprecated aliases are still listed
 

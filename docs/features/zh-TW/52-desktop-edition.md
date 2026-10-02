@@ -32,7 +32,7 @@ Windows 與 Android 應用程式；同時 DuDuClaw gateway 與它的 AI 員工�
 - **首次開機精靈**：第一次開機時設定語言、網路、管理員帳號和幾項偏好；
   live 安裝器 ISO 本身也是一套圖形化精靈。
 - **AI runtime 授權**：精靈其中一步列出映像內建 runtime 的每一家 AI 服務
-  （Claude Code、Codex、Gemini CLI、Grok、Qwen、Kimi、Copilot、Cursor、
+  （Claude Code、Codex、Gemini CLI（已棄用）、Grok、Qwen、Kimi、Copilot、Cursor、
   Mistral Vibe、OpenCode，以及純 API 金鑰的幾家；Kiro 是支援的 runtime，
   但刻意沒有內建進映像），每一列標明目前是未設定、已存金鑰還是已登入。可以貼上 API 金鑰（走跟管理面同一條加
   密的 `[[accounts]]` 路徑），CLI 有登入流程的也可以直接登入帳號：機器會

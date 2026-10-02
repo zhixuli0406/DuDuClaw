@@ -21,6 +21,8 @@ DuDuClawのアカウントローテーションはAPI認証情報に対してま
 
 ### アカウントタイプ
 
+検証環境でホストのログインやプロバイダー環境キーの自動読み込みを禁止する場合は、その環境の `config.toml` に `[account_loading] inherit_host_credentials = false` を設定してください。明示した認証情報は引き続き利用できます。範囲とエラー処理は[明示したアカウントプールで検証する](../../guides/ja-JP/isolated-validation.md)を参照してください。
+
 システムは2種類のAPI認証情報をサポートします：
 
 **OAuthセッション** — サブスクリプションプラン（Pro、Team、Max）に連携。通常、サブスクリプションの一部として月間の無料API呼び出し枠を含みます。「キャッシュバックカード」——優先して使用。
@@ -227,7 +229,7 @@ LeastCost戦略が無料クォータ（サブスクリプションから）を�
 
 ## クロスプロバイダーフェイルオーバー
 
-DuDuClawのMulti-Runtimeアーキテクチャ（Claude / Codex / Gemini / OpenAI-compat）により、アカウントローテーションはプロバイダーをまたいで拡張されます。**FailoverManager** がクロスプロバイダーのヘルス状態を調整します：
+DuDuClawのMulti-Runtimeアーキテクチャ（Claude / Codex / Antigravity / OpenAI-compat。Gemini CLI ランタイムは v1.67.0 で非推奨、v1.69.0 で削除予定）により、アカウントローテーションはプロバイダーをまたいで拡張されます。**FailoverManager** がクロスプロバイダーのヘルス状態を調整します：
 
 ```
 プライマリプロバイダー（Claude）がレート制限
@@ -235,7 +237,7 @@ DuDuClawのMulti-Runtimeアーキテクチャ（Claude / Codex / Gemini / OpenAI
      v
 FailoverManagerが代替を確認：
   - Codex CLIは利用可能か？→ そちらにルーティング
-  - Gemini CLIは利用可能か？→ そちらにルーティング
+  - Antigravity CLIは利用可能か？→ そちらにルーティング
   - ローカル推論は利用可能か？→ そちらにルーティング
      |
      v

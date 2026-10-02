@@ -346,7 +346,7 @@ The dashboard's Logs page filter chips already cover `wiki` and `tool`;
 ## Reference
 
 - [`RFC-21-identity-credential-isolation.md`](RFC-21-identity-credential-isolation.md) — the design doc this guide implements.
-- [`docs/features/17-wiki-knowledge-layer.md`](features/17-wiki-knowledge-layer.md) — overview of the shared wiki + namespace policy section.
-- [`crates/duduclaw-identity/`](../crates/duduclaw-identity/) — `IdentityProvider` trait, `WikiCacheIdentityProvider`, `NotionIdentityProvider`, `ChainedProvider`.
-- [`crates/duduclaw-cli/src/odoo_pool.rs`](../crates/duduclaw-cli/src/odoo_pool.rs) — per-agent connector pool.
-- [`crates/duduclaw-odoo/src/agent_config.rs`](../crates/duduclaw-odoo/src/agent_config.rs) — `agent.toml [odoo]` parser + `OdooConfigResolver`.
+- [`docs/features/17-wiki-knowledge-layer.md`](../features/17-wiki-knowledge-layer.md) — overview of the shared wiki + namespace policy section.
+- [`crates/duduclaw-identity/`](../../crates/duduclaw-identity) — `IdentityProvider` trait, `WikiCacheIdentityProvider`, `NotionIdentityProvider`, `ChainedProvider`.
+- [`crates/duduclaw-cli/src/odoo_pool.rs`](../../crates/duduclaw-cli/src/odoo_pool.rs) — per-agent connector pool.
+- [`crates/duduclaw-odoo/src/agent_config.rs`](../../crates/duduclaw-odoo/src/agent_config.rs) — `agent.toml [odoo]` parser + `OdooConfigResolver`.

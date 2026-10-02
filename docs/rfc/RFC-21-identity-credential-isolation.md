@@ -76,50 +76,50 @@ Numbers below were verified by code search on 2026-05-04 against the
 ### Identity surface
 
 - MCP **caller** identity is fully realised:
-  [crates/duduclaw-cli/src/mcp_auth.rs:39-44](crates/duduclaw-cli/src/mcp_auth.rs#L39-L44)
+  [crates/duduclaw-cli/src/mcp_auth.rs:39-44](../../crates/duduclaw-cli/src/mcp_auth)
   — `Principal { client_id, scopes, is_external, created_at }`, validated at
-  [mcp_auth.rs:171](crates/duduclaw-cli/src/mcp_auth.rs#L171) (`authenticate_with_key`)
-  and bound at server start in [mcp.rs:5927-5931](crates/duduclaw-cli/src/mcp.rs#L5927-L5931).
+  [mcp_auth.rs:171](../../crates/duduclaw-cli/src/mcp_auth) (`authenticate_with_key`)
+  and bound at server start in [mcp.rs:5927-5931](../../crates/duduclaw-cli/src/mcp).
 - MCP **conversation-partner** identity (Discord user → real person) is
   **absent**. There is no provider trait, no resolver entry point, no
   `identity_resolve` MCP tool. The only thing an agent can do is call
   `shared_wiki_read` on a known path — exactly what #21 reports.
 - SOUL.md "ProjectMember" wording is written by `create_agent` at
-  [mcp.rs:2709-2711](crates/duduclaw-cli/src/mcp.rs#L2709-L2711) but never parsed
+  [mcp.rs:2709-2711](../../crates/duduclaw-cli/src/mcp) but never parsed
   back; it is plain text injected into the system prompt.
 
 ### Odoo credential surface
 
 - `OdooConfig` is one struct, one `[odoo]` block:
-  [crates/duduclaw-odoo/src/config.rs:7-35](crates/duduclaw-odoo/src/config.rs#L7-L35).
-  `from_toml` ([config.rs:73-78](crates/duduclaw-odoo/src/config.rs#L73-L78))
+  [crates/duduclaw-odoo/src/config.rs:7-35](../../crates/duduclaw-odoo/src/config.rs).
+  `from_toml` ([config.rs:73-78](../../crates/duduclaw-odoo/src/config.rs))
   knows nothing about agents.
 - The connector is global — `Arc<RwLock<Option<OdooConnector>>>` at
-  [mcp.rs:6064](crates/duduclaw-cli/src/mcp.rs#L6064). `handle_odoo_connect`
-  ([mcp.rs:5103](crates/duduclaw-cli/src/mcp.rs#L5103)) decrypts once, stores
+  [mcp.rs:6064](../../crates/duduclaw-cli/src/mcp). `handle_odoo_connect`
+  ([mcp.rs:5103](../../crates/duduclaw-cli/src/mcp)) decrypts once, stores
   once, and every subsequent `odoo_*` tool call reads that single connector.
-- The 15 Odoo MCP tools at [mcp.rs:558-668](crates/duduclaw-cli/src/mcp.rs#L558-L668)
+- The 15 Odoo MCP tools at [mcp.rs:558-668](../../crates/duduclaw-cli/src/mcp)
   perform **no scope check**. The existing `Scope` enum
-  ([mcp_auth.rs:14-22](crates/duduclaw-cli/src/mcp_auth.rs#L14-L22)) covers
+  ([mcp_auth.rs:14-22](../../crates/duduclaw-cli/src/mcp_auth)) covers
   `MemoryRead/Write`, `WikiRead/Write`, `MessagingSend`, `Admin` — there is
   no `OdooRead` / `OdooWrite`.
 - Per-agent crypto isolation does exist in spirit
-  ([crates/duduclaw-security/src/crypto.rs](crates/duduclaw-security/src/crypto.rs))
+  ([crates/duduclaw-security/src/crypto.rs](../../crates/duduclaw-security/src/crypto.rs))
   but the keyfile is machine-level (`~/.duduclaw/.keyfile`,
-  [mcp.rs:5833-5843](crates/duduclaw-cli/src/mcp.rs#L5833-L5843)). The
+  [mcp.rs:5833-5843](../../crates/duduclaw-cli/src/mcp)). The
   reporter's claim — "only encryption is isolated, not authority" — is
   factually correct.
 
 ### Shared wiki write surface
 
-- `handle_shared_wiki_write` ([mcp.rs:7701-7760](crates/duduclaw-cli/src/mcp.rs#L7701-L7760))
+- `handle_shared_wiki_write` ([mcp.rs:7701-7760](../../crates/duduclaw-cli/src/mcp))
   enforces: path safety, size cap, sensitive-pattern scan, frontmatter
   presence, fallback-content rejection, author attribution. It does **not**
   enforce: namespace ownership, read-only namespaces, or external-sync
   origin.
 - Wiki "category" exists only as a path prefix (`identity/`, `access/`,
   `SOP/`, ...). There is no enum, no policy table, no per-namespace ACL.
-- `wiki_visible_to` ([mcp.rs:6666-6688](crates/duduclaw-cli/src/mcp.rs#L6666-L6688))
+- `wiki_visible_to` ([mcp.rs:6666-6688](../../crates/duduclaw-cli/src/mcp))
   is per-agent visibility for the *agent-private* wiki; it is not consulted
   for `shared_wiki_*`.
 
@@ -218,7 +218,7 @@ through that source — with the shared wiki demoted to a transparent cache.
     a promise the code never kept.
 
     `Scope` enum extended:
-    [crates/duduclaw-cli/src/mcp_auth.rs:14-22](crates/duduclaw-cli/src/mcp_auth.rs#L14-L22)
+    [crates/duduclaw-cli/src/mcp_auth.rs:14-22](../../crates/duduclaw-cli/src/mcp_auth)
     gains `IdentityRead` / `IdentityWrite`.
 
 5. **Auto-injection into channel reply path** — when a channel message
@@ -314,12 +314,12 @@ attribute every operation to the correct agent.
     }
     ```
 
-   Edit [crates/duduclaw-odoo/src/config.rs](crates/duduclaw-odoo/src/config.rs)
+   Edit [crates/duduclaw-odoo/src/config.rs](../../crates/duduclaw-odoo/src/config.rs)
    and a new `crates/duduclaw-odoo/src/agent_config.rs`.
 
 3. **Connector pool, not singleton** — replace the global
    `Arc<RwLock<Option<OdooConnector>>>` at
-   [mcp.rs:6064](crates/duduclaw-cli/src/mcp.rs#L6064) with:
+   [mcp.rs:6064](../../crates/duduclaw-cli/src/mcp) with:
 
     ```rust
     pub struct OdooConnectorPool {
@@ -329,11 +329,11 @@ attribute every operation to the correct agent.
     }
     ```
 
-   `handle_odoo_*` ([mcp.rs:5093 onwards](crates/duduclaw-cli/src/mcp.rs#L5093))
+   `handle_odoo_*` ([mcp.rs:5093 onwards](../../crates/duduclaw-cli/src/mcp))
    take the calling agent's `Principal`, derive `(agent_id, profile)`, and
    look up / lazily build the right connector.
 
-4. **New scopes** in [crates/duduclaw-cli/src/mcp_auth.rs:14-22](crates/duduclaw-cli/src/mcp_auth.rs#L14-L22):
+4. **New scopes** in [crates/duduclaw-cli/src/mcp_auth.rs:14-22](../../crates/duduclaw-cli/src/mcp_auth):
 
     ```rust
     Scope::OdooRead          // odoo:read
@@ -341,7 +341,7 @@ attribute every operation to the correct agent.
     Scope::OdooExecute       // odoo:execute   (workflow buttons / payments)
     ```
 
-   Tool registration table at [mcp.rs:558-668](crates/duduclaw-cli/src/mcp.rs#L558-L668)
+   Tool registration table at [mcp.rs:558-668](../../crates/duduclaw-cli/src/mcp)
    gains a `required_scope` field; dispatcher rejects with
    `POLICY_DENIED` (re-using the existing governance error code) when the
    caller's `Principal.scopes` does not include the tool's scope.
@@ -418,7 +418,7 @@ duplicate an external person record into the wiki and create a divergence.
     ```
 
 2. **Enforcement in `handle_shared_wiki_write`** — extend
-   [crates/duduclaw-cli/src/mcp.rs:7701-7760](crates/duduclaw-cli/src/mcp.rs#L7701-L7760)
+   [crates/duduclaw-cli/src/mcp.rs:7701-7760](../../crates/duduclaw-cli/src/mcp)
    with one early-return check after path validation:
 
     ```rust
@@ -510,8 +510,8 @@ this RFC:
 ## References
 
 - Issue [#21](https://github.com/zhixuli0406/DuDuClaw/issues/21) — original report by Ruby-11235813
-- [`crates/duduclaw-cli/src/mcp_auth.rs`](crates/duduclaw-cli/src/mcp_auth.rs) — existing `Principal` / `Scope` model (extended by §1, §2)
-- [`crates/duduclaw-cli/src/mcp.rs`](crates/duduclaw-cli/src/mcp.rs) — MCP tool dispatcher (touched by all three sections)
-- [`crates/duduclaw-odoo/src/config.rs`](crates/duduclaw-odoo/src/config.rs) — current single-config model (refactored by §2)
-- [`docs/features/17-wiki-knowledge-layer.md`](docs/features/17-wiki-knowledge-layer.md) — current shared-wiki documentation (updated by §3)
-- [`docs/TODO-agent-honesty.md`](docs/TODO-agent-honesty.md) — sister effort: prompt-layer claims vs. system-layer enforcement (same overarching philosophy as this RFC)
+- [`crates/duduclaw-cli/src/mcp_auth.rs`](../../crates/duduclaw-cli/src/mcp_auth) — existing `Principal` / `Scope` model (extended by §1, §2)
+- [`crates/duduclaw-cli/src/mcp.rs`](../../crates/duduclaw-cli/src/mcp) — MCP tool dispatcher (touched by all three sections)
+- [`crates/duduclaw-odoo/src/config.rs`](../../crates/duduclaw-odoo/src/config.rs) — current single-config model (refactored by §2)
+- [`docs/features/17-wiki-knowledge-layer.md`](../../docs/features/17-wiki-knowledge-layer.md) — current shared-wiki documentation (updated by §3)
+- [`docs/TODO-agent-honesty.md`](../../docs/todo/TODO-agent-honesty.md) — sister effort: prompt-layer claims vs. system-layer enforcement (same overarching philosophy as this RFC)

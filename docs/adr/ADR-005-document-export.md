@@ -40,6 +40,7 @@ render to PDF. PDF quality would be high with controllable layout. **Honest cave
 current state**: the gateway's `browser_router.rs` is currently a skeleton — actual browser
 automation runs through Playwright MCP, not this router, and the full loop for PDF
 rendering hasn't been wired end-to-end yet. It cannot be treated as "already there."
+*(Note, 2026-10-01: `browser_router.rs` was deleted in 2026-09 and never had a call site; see [08-browser-automation](../features/08-browser-automation.md).)*
 
 **(d) Google Slides API**
 Native Google Slides, the closest fit for customers heavily invested in Google Workspace.

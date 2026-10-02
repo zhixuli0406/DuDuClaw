@@ -61,7 +61,7 @@ Search results are ranked by **trust-weighted score** = `fts5_rank × trust`. A 
 
 ## Auto-Injection Flow
 
-The injection happens at system prompt assembly time — in three places, so all four runtimes (Claude / Codex / Gemini / OpenAI) get the same knowledge:
+The injection happens at system prompt assembly time — in three places, so every runtime (Claude, Codex, Antigravity, Grok, OpenAI-compatible and the rest of the catalog) gets the same knowledge:
 
 ```
 User sends message
@@ -389,7 +389,7 @@ A `trust` score means the agent can reason about the reliability of its knowledg
 
 ### Runtime Agnostic
 
-Claude, Codex, Gemini, and OpenAI-compatible runtimes all see the same wiki — because the injection happens *before* the runtime boundary, in `build_system_prompt`.
+Every runtime sees the same wiki — because the injection happens *before* the runtime boundary, in `build_system_prompt`.
 
 ### Closes the Accumulation Loop
 

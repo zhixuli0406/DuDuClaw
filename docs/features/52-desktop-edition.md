@@ -35,7 +35,7 @@ them.
 - **First-run wizard** — language, network, administrator account, and a few
   preferences on first boot; the live installer ISO is a graphical wizard too.
 - **AI runtime authorization** — one step of that wizard lists every AI
-  provider the image ships a runtime for (Claude Code, Codex, Gemini CLI,
+  provider the image ships a runtime for (Claude Code, Codex, Gemini CLI (deprecated),
   Grok, Qwen, Kimi, Copilot, Cursor, Mistral Vibe, OpenCode, plus the
   plain API-key providers — Kiro is a supported runtime but is deliberately
   not bundled in the image), each row showing whether it is unset, has a key

@@ -8,7 +8,7 @@
 
 DuDuClaw turns Claude Code, Codex, and Gemini into AI employees who actually deliver: they staff eleven messaging apps like Telegram, LINE, and Discord, an independent judge reviews their work before it ships, and every dollar they spend gets logged.
 
-All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain for Claude, Codex, Gemini, Antigravity, or any OpenAI-compatible API whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
+All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain for Claude, Codex, Gemini (deprecated), Antigravity, or any OpenAI-compatible API whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.66.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
@@ -44,7 +44,7 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 | Multi-LLM failover | Manual restart | 4 rotation strategies + cross-provider failover |
 | Context survives switching LLMs | Lost | Preserved |
 | Conversation memory and knowledge base | Single session | SQLite temporal memory + layered wiki, auto-injected |
-| Tools shared across LLMs | Rewrite per vendor | Write 243 MCP tools once, use on all 5 backends |
+| Tools shared across LLMs | Rewrite per vendor | Write 249 MCP tools once, use on all 5 backends |
 | Guardrails / audit / secret management | Build it yourself | Policy kernel + OS sandbox + AES-256-GCM built in |
 | A whole box to hand to a customer | Install Linux yourself, manage updates and tamper resistance yourself | DuDuClaw OS image: A/B update with rollback + read-only root, plug in and go; a desktop shared by a person and the AI without getting in each other's way |
 
@@ -55,14 +55,14 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 The AI runtime is the brain, DuDuClaw is the plumbing, and MCP (JSON-RPC 2.0) is the bridge. Swap the brain, keep the plumbing:
 
 ```
-AI Runtime (brain) — Claude Code / Codex / Gemini / Antigravity / OpenAI-compat
+AI Runtime (brain) — Claude Code / Codex / Gemini (deprecated) / Antigravity / OpenAI-compat
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 5 backends, auto-detected, configured per agent
   ├─ Session Memory — native --resume + temporal memory + key facts + layered wiki
-  ├─ MCP Server — 243 tools (channels, memory, agents, skills, tasks, wiki, ERP)
+  ├─ MCP Server — 249 tools (channels, memory, agents, skills, tasks, wiki, ERP)
   ├─ Evolution Engine — GVU² dual-loop evolution + prediction-driven + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS sandbox + redaction vault
   ├─ Inference Engine — OpenAI-compatible local server (llama-server / Ollama / vLLM) / llamafile
@@ -70,7 +70,7 @@ DuDuClaw (plumbing)
   └─ Web Dashboard — React 19 SPA (32 pages), embedded via rust-embed
 ```
 
-The Rust workspace is 20 crates: the `duduclaw-core` foundation, the `duduclaw-gateway` service layer, the `duduclaw-llm` unified API layer, `duduclaw-inference` for local models, `duduclaw-memory` for cognitive memory, `duduclaw-security`, and more. Full design in [ARCHITECTURE.md](ARCHITECTURE.md).
+The Rust workspace is 24 crates: the `duduclaw-core` foundation, the `duduclaw-gateway` service layer, the `duduclaw-llm` unified API layer, `duduclaw-inference` for local models, `duduclaw-memory` for cognitive memory, `duduclaw-security`, and more. Full design in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Experimental calibrated local routing uses Varun Kotte's [UCCI (arXiv:2605.18796)](https://arxiv.org/abs/2605.18796). See [UCCI calibrated cascade](docs/features/57-ucci-calibrated-cascade.md) for configuration and data preparation.
 
@@ -82,7 +82,7 @@ The same gateway + dashboard also ships as a whole machine: [DuDuClaw OS](https:
 
 DuDuClaw doesn't ship its own LLM — you need an AI brain first. Pick one (you can also set this up later in the browser wizard):
 
-- Install and log in to [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or Antigravity
+- Install and log in to [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli) (deprecated, removed in v1.69.0), or Antigravity
 - Bring an API key for any OpenAI-compatible provider
 - Or use a local GGUF model — no cloud account needed
 
@@ -171,9 +171,9 @@ duduclaw service install   # start on boot (launchd / systemd)
 | Area | What's built in | Read more |
 |------|-----------------|-----------|
 | Channels | 11 channels (Telegram / LINE / Discord + voice / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards | [docs/features](docs/features/README.md) |
-| Multi-runtime | Claude / Codex / Gemini / Antigravity / OpenAI-compat, auto-detected, per-agent config, context survives backend switches | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Multi-runtime | Claude / Codex / Gemini (deprecated, removed in v1.69.0) / Antigravity / OpenAI-compat, auto-detected, per-agent config, context survives backend switches | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Unified LLM API layer | `duduclaw-llm` covers 4 native protocols (Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat) with one normalized request, plus 8 OpenAI-compat presets (DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen), a pricing registry, and cross-provider fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP server | 243 tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports, with only 7 whitelisted tools exposed externally | [docs/api](docs/api/README.md) |
+| MCP server | 249 tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports, with only 7 whitelisted tools exposed externally | [docs/api](docs/api/README.md) |
 | Memory | SQLite temporal memory (fact supersession chains), HippoRAG-lite knowledge-graph retrieval (Personalized PageRank), Ebbinghaus forgetting-curve archival, cross-agent shared wiki | [docs/features](docs/features/README.md) |
 | Self-evolution | GVU² dual loop + prediction-driven (about 90% of conversations cost zero LLM calls), SOUL.md versioning with 24h observation and auto-rollback, MistakeNotebook cross-turn memory | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | Security | PolicyKernel reference monitor (zero-LLM, fail-closed), macOS Seatbelt / Linux Landlock native sandbox, Docker / Apple Container / WSL2 container sandbox, secret redaction vault, CONTRACT.toml behavioral contracts + red-team CLI | [SECURITY.md](SECURITY.md) |
@@ -249,7 +249,7 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 | Language | Rust | TypeScript | Rust | Python |
 | Channels | 11 | 25+ | 8 | 0 (API) |
 | Multi-runtime | 5 backends | single | single | multi-LLM |
-| MCP server | 243 tools | no | no | no |
+| MCP server | 249 tools | no | no | no |
 | Self-evolution engine | GVU² dual loop | no | no | no |
 | Local inference | 5 backends + confidence routing | no | no | no |
 | Behavioral contracts | CONTRACT.toml + red team | no | WASM sandbox | no |

@@ -3,8 +3,9 @@
 這頁列的名稱都還能用，但將來會拿掉。目前一個都還沒移除：每個舊名稱照舊接受、行為
 完全不變；MCP 工具也還留在 `tools/list` 裡，學過舊名稱的模型可以繼續呼叫。
 
-**政策**：舊名稱保留 **兩個 minor 版本**。本頁全部在 **v1.66.0** 標為棄用，預計於
-**v1.68.0** 移除。
+**政策**：舊名稱保留 **兩個 minor 版本**。本頁項目在 **v1.66.0** 標為棄用，預計於
+**v1.68.0** 移除；唯一例外是 Gemini CLI runtime（見 [Runtime](#runtime)），它在
+**v1.67.0** 標為棄用，預計於 **v1.69.0** 移除。
 
 各介面怎麼標示：
 
@@ -14,6 +15,7 @@
 | CLI 子命令 | clap `hide = true`——`--help` 看不到，但照樣解析 | 能 |
 | `config.toml` 設定值 | 讀取時每個行程 `warn!` 一次；經儀表板寫入時另留審計事件 | 能。已設定的行為絕不會被偷偷換掉 |
 | 儀表板 | 只提供新名稱。已存的舊值仍顯示，標「已棄用」 | 能 |
+| Agent runtime | 讀取時每個行程 `warn!` 一次；經儀表板寫入時另留 `runtime_provider_deprecated` 審計事件。儀表板不再提供該選項，已存的值標「已棄用」 | 能，解析與執行方式跟以前完全一樣 |
 
 ---
 
@@ -157,12 +159,78 @@ skill bank 目前仍是空的 in-memory stub，所以 `source="bank"` 會誠實�
 
 ---
 
+## Runtime
+
+### Gemini CLI runtime
+
+**Gemini CLI agent runtime**（runtime id `gemini`、執行檔 `gemini`、npm 套件
+`@google/gemini-cli`）在 **v1.67.0** 標為棄用，預計於 **v1.69.0** 移除。接手的是
+**Antigravity CLI runtime**（`antigravity`，執行檔 `agy`）。
+
+| 舊 | 新 |
+|---|---|
+| `agent.toml [runtime] provider = "gemini"` | `provider = "antigravity"` |
+| `agent.toml [runtime] fallback = "gemini"` | `fallback = "antigravity"` |
+| `config.toml [runtime] utility_provider = "gemini"` | `utility_provider = "antigravity"` |
+| `config.toml [dispatch] judge_provider = "gemini"` | `judge_provider = "antigravity"` |
+| `[team.roles.*] runtime = "gemini"` | `runtime = "antigravity"` |
+| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
+
+**還能用的部分**：上面每個舊值到 v1.69.0 之前照樣解析、照樣執行。讀到時每個行程記
+一次警告；經儀表板（`agents.create`／`agents.update`）寫入時，另記一筆
+`runtime_provider_deprecated` 審計事件。儀表板不再提供 Gemini，但已存的 `gemini`
+照樣顯示並標「已棄用」；員工編輯頁的 runtime 選單則補上了 Antigravity。「依所選模型
+自動對齊 runtime」的步驟不會再寫入已棄用的 runtime。首次設定精靈的預設值由 Gemini
+改成 Antigravity。Docker image 在移除前仍內含 Gemini CLI，`duduclaw doctor` 會列出
+`provider` 或 `fallback` 用到已棄用 runtime 的員工。
+
+**不在棄用範圍**：**Gemini API provider**（provider id `gemini`、`GEMINI_API_KEY`、
+LLM 層的 `generateContent` 協定、`gemini` provider 帳號）不受影響，Antigravity 的
+API key 模式也會用到它。
+
+**原因**：Google 在 2026-06-18 停止以 Gemini CLI 服務免費、Google AI Pro 與 Google AI
+Ultra 的個人帳號，並引導這些使用者改用 Antigravity CLI。API key 與企業（Gemini Code
+Assist）使用者不受影響，Gemini CLI 本身仍在維護（來源：維護者的
+[公告](https://github.com/google-gemini/gemini-cli/discussions/28017)；Google 的
+[遷移指南](https://antigravity.google/docs/cli/gcli-migration/)）。Gemini CLI 並沒有被
+關閉。
+
+**遷移步驟**：
+
+1. 在 `agent.toml` 把 `[runtime] provider = "gemini"`（以及 `fallback = "gemini"`）
+   改成 `"antigravity"`。
+2. 驗證方式：用 Google 帳號登入的人，在主機的終端機執行 `agy` 完成登入。原本用 API
+   key 驗證 Gemini CLI 的人，設定 `config.toml [antigravity] auth = "api_key"`，繼續
+   用同一把 Gemini API key（`gemini` provider 帳號，或 `GEMINI_API_KEY`）。
+3. 模型名稱：以 `agy models` 列出的名稱為準；從 Gemini CLI 設定抄過來的 id 不一定會
+   選到同一個模型。
+4. 執行 `duduclaw doctor`，它會列出 `provider` 或 `fallback` 用到已棄用 runtime 的
+   員工。
+
+**移除前提**：在 v1.69.0 移除這個 runtime 之前，必須先用真的 Gemini API key 驗證過
+Antigravity 的 API key 模式。目前只驗過「金鑰無效」的錯誤路徑。
+
+---
+
 ## v1.68.0 會發生什麼
 
-上面每個舊名稱都會被移除。升級到 v1.67.x 以上之前：
+上面每個舊名稱都會被移除，只有 Gemini CLI runtime 例外，它保留到 v1.69.0（見下一節）。升級到 v1.67.x 以上之前：
 
 1. 用 grep 掃你的 agent prompt、skill、自動化流程裡的舊 MCP 工具名稱。
 2. 用 grep 掃你的腳本、cron 設定、systemd unit 裡的舊 CLI 寫法。
 3. 檢查 `config.toml [dispatch] judge` 是不是還停在棄用值。
 
 每個受影響工具說明開頭的 `[deprecated → …]` 前綴就是為了讓你 grep 得到。
+
+## v1.69.0 會發生什麼
+
+Gemini CLI runtime 會被移除（`runtime/gemini.rs`、catalog 項目、Discovery 的 Gemini
+family，以及 Docker image 內的 `gemini-cli` 套件）。Gemini API provider 保留。升級
+到 v1.68.x 以上之前：
+
+1. 用 grep 掃每個 `agent.toml` 裡的 `provider = "gemini"` 與 `fallback = "gemini"`，
+   或直接執行 `duduclaw doctor`。
+2. 檢查 `config.toml` 的 `utility_provider`、`[dispatch] judge_provider`、
+   `[team.roles.*] runtime` 與 `[discovery.attempt.runtimes.gemini]` 有沒有還設成
+   `gemini`。
+3. 完成上述 Antigravity 的登入或 API key 設定。

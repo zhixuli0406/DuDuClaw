@@ -147,5 +147,5 @@ CONFLICT は移行先にすでに値があり、既存の設定を守るため�
 
 **Q：Claude 以外のモデルはどうなりますか？**
 `[model] preferred` にそのまま保持され `PARTIAL` としてマークされます。どの
-runtime（codex / gemini / openai_compat）にマッピングするかは人手での確認が
+runtime（codex / antigravity / openai_compat、または v1.67.0 で非推奨・v1.69.0 で削除の gemini。[非推奨ガイド](deprecations.md#gemini-cli-ランタイム)参照）にマッピングするかは人手での確認が
 必要になります。DuDuClaw が代わりに推測することはありません。

@@ -269,7 +269,7 @@
 - [ ] 🧪 簽章 + hardened 後 sidecar 仍能 spawn / 連網(**阻塞:需簽章 + 執行**)。
 
 #### D3.2 Computer Use 系統授權(加分項)
-- [~] 🟡 entitlements 含 `apple-events`;Computer Use 走既有 `duduclaw-desktop`(enigo/xcap)。
+- [~] 🟡 entitlements 含 `apple-events`;Computer Use 走既有 `duduclaw-desktop`(enigo/xcap)。(2026-10 更正:gateway 已移除操作主機桌面的 native 模式,不再依賴 `duduclaw-desktop`;電腦操作只透過 `computer_*` MCP 工具在隔離容器內進行,本項不再適用。)
 - [x] 📝 授權引導寫入 `docs/guides/desktop-build.md` / `desktop-release.md`(簽章 App 才能正確觸發系統對話框)。
 - [ ] 🧪 簽章 App 內截圖 / 模擬輸入(**阻塞:需簽章 + GUI**)。
 

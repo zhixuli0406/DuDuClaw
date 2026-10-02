@@ -7,7 +7,8 @@ that learned the old name can keep calling it.
 
 **Policy.** A deprecated name survives **two minor versions**. Everything on
 this page was deprecated in **v1.66.0** and is scheduled for removal in
-**v1.68.0**.
+**v1.68.0**, except the Gemini CLI runtime (see [Runtimes](#runtimes)), which is
+deprecated in **v1.67.0** and scheduled for removal in **v1.69.0**.
 
 How each surface signals deprecation:
 
@@ -17,6 +18,7 @@ How each surface signals deprecation:
 | CLI subcommand | clap `hide = true` — gone from `--help`, still parsed | Yes |
 | `config.toml` value | `warn!` once per process on read, plus an audit event when written | Yes — the configured behaviour is never silently substituted |
 | Dashboard | Only the new name is offered. A saved deprecated value stays visible, labelled 已棄用 | Yes |
+| Agent runtime | `warn!` once per process on read; a `runtime_provider_deprecated` audit event when written through the dashboard. The dashboard stops offering it and labels a saved value 已棄用 | Yes — parsed and executed exactly as before |
 
 ---
 
@@ -171,9 +173,69 @@ silently switching it.
 
 ---
 
+## Runtimes
+
+### Gemini CLI runtime
+
+The **Gemini CLI agent runtime** (runtime id `gemini`, binary `gemini`, npm
+package `@google/gemini-cli`) is deprecated in **v1.67.0** and scheduled for
+removal in **v1.69.0**. Its replacement is the **Antigravity CLI runtime**
+(`antigravity`, binary `agy`).
+
+| Old | New |
+|---|---|
+| `agent.toml [runtime] provider = "gemini"` | `provider = "antigravity"` |
+| `agent.toml [runtime] fallback = "gemini"` | `fallback = "antigravity"` |
+| `config.toml [runtime] utility_provider = "gemini"` | `utility_provider = "antigravity"` |
+| `config.toml [dispatch] judge_provider = "gemini"` | `judge_provider = "antigravity"` |
+| `[team.roles.*] runtime = "gemini"` | `runtime = "antigravity"` |
+| `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
+
+**What still works.** Every old value above keeps parsing and running exactly as
+before until v1.69.0. Reading one logs a warning once per process; setting it
+through the dashboard (`agents.create` / `agents.update`) also records a
+`runtime_provider_deprecated` audit event. The dashboard no longer offers Gemini
+but shows a saved `gemini` value labelled 已棄用, and the agent edit page's
+runtime picker now offers Antigravity. The "align the runtime with the chosen
+model" step no longer writes a deprecated runtime. The setup wizard's default
+changed from Gemini to Antigravity. The Docker image keeps shipping the Gemini
+CLI until removal, and `duduclaw doctor` lists agents whose `provider` or
+`fallback` is a deprecated runtime.
+
+**Not deprecated.** The **Gemini API provider** (provider id `gemini`,
+`GEMINI_API_KEY`, the `generateContent` protocol in the LLM layer, a `gemini`
+provider account) is unaffected. Antigravity's API-key mode uses it too.
+
+**Why.** Google stopped serving free, Google AI Pro and Google AI Ultra
+individual accounts through Gemini CLI on 2026-06-18 and directs them to
+Antigravity CLI. API-key and enterprise (Gemini Code Assist) users are
+unaffected, and Gemini CLI is still maintained (source: the maintainers'
+[announcement](https://github.com/google-gemini/gemini-cli/discussions/28017);
+Google's [migration guide](https://antigravity.google/docs/cli/gcli-migration/)).
+Gemini CLI has not been shut down.
+
+**Migrating.**
+
+1. In `agent.toml`, change `[runtime] provider = "gemini"` (and
+   `fallback = "gemini"`) to `"antigravity"`.
+2. Authentication. For Google sign-in, run `agy` in a terminal on the host and
+   complete the login. If you authenticated Gemini CLI with an API key, set
+   `config.toml [antigravity] auth = "api_key"` and keep using the same Gemini
+   API key (a `gemini` provider account, or `GEMINI_API_KEY`).
+3. Model names. Use the names `agy models` lists; an id copied from a Gemini CLI
+   setup may not select the same model.
+4. Run `duduclaw doctor`; it lists agents whose `provider` or `fallback` is a
+   deprecated runtime.
+
+**Removal precondition.** Before the runtime is removed in v1.69.0,
+Antigravity's API-key mode must have been verified with a real Gemini API key.
+So far only the invalid-key path has been exercised.
+
+---
+
 ## What happens in v1.68.0
 
-Each old name above is removed. Before upgrading past v1.67.x:
+Each old name above is removed, except the Gemini CLI runtime, which stays until v1.69.0 (next section). Before upgrading past v1.67.x:
 
 1. Grep your agent prompts, skills, and automations for the old MCP tool names.
 2. Grep your scripts, cron entries, and systemd units for the old CLI spellings.
@@ -181,3 +243,16 @@ Each old name above is removed. Before upgrading past v1.67.x:
 
 The `[deprecated → …]` prefix in every affected tool description is
 machine-greppable on purpose.
+
+## What happens in v1.69.0
+
+The Gemini CLI runtime is removed (`runtime/gemini.rs`, the catalog entry, the
+Discovery Gemini family, and the `gemini-cli` package in the Docker image). The
+Gemini API provider stays. Before upgrading past v1.68.x:
+
+1. Grep every `agent.toml` for `provider = "gemini"` and `fallback = "gemini"`,
+   or run `duduclaw doctor`.
+2. Check `config.toml` for `utility_provider`, `[dispatch] judge_provider`,
+   `[team.roles.*] runtime` and `[discovery.attempt.runtimes.gemini]` set to
+   `gemini`.
+3. Complete the Antigravity sign-in or API-key setup described above.

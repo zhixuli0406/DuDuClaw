@@ -34,6 +34,7 @@ Pandoc 才啟用，沒偵測到就 fail-soft 降級為 md 附件。
 PDF 品質高、排版可控。**誠實的現況警告**：gateway 的 `browser_router.rs`
 目前是骨架，實際的瀏覽器自動化走 Playwright MCP 而非這個 router，PDF 出圖
 的完整迴路尚未串通，不能當成「現成的」。
+*（2026-10-01 註：`browser_router.rs` 已在 2026-09 刪除，從未有任何呼叫端；見 [08-browser-automation](../../features/zh-TW/08-browser-automation.md)。）*
 
 **(d) Google Slides API**
 原生 Google Slides，對重度用 Google Workspace 的客戶最貼。缺點是需要 OAuth、

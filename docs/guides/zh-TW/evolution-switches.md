@@ -1,6 +1,6 @@
 # 演化開關總覽：每個開關控制什麼
 
-DuDuClaw 的 AI 員工能隨時間自我改進：反思預測誤差、累積可退場的經驗法則、合成新技能。本指南是唯一一份地圖，說明哪個開關管哪件事，以及如何完全凍結一個 AI 員工。（2026-09-29 起，改寫 `SOUL.md` 的舊路徑已移除；人格檔案對 AI 員工唯讀。）
+DuDuClaw 的 agent 能隨時間自我改進：反思預測誤差、累積 playbook 經驗法則（`SOUL.md` 對 agent 自己是唯讀的）、合成新技能，以及探索較少被使用的領域。這些路徑各有自己的開關。本指南是唯一一份地圖，說明哪個開關管哪件事，以及如何完全凍結一個 agent。
 
 ## 總開關
 
@@ -36,11 +36,11 @@ enabled = true   # master kill-switch (default: true)
 | `skill_synthesis_enabled` | `false` | 從重複出現的領域缺口合成新技能 |
 | `skill_auto_activate` | `false` | 在對話中途啟用建議的技能 |
 
-**`gvu_enabled` 自 2026-09-29（K2）起出廠即為 `true`。** 有兩件事讓這個改變站得住腳。第一，引擎不再改寫 `SOUL.md`——舊路徑已於同日移除（S11），現在演化的對象是 playbook：一條條可獨立退場的行為規則，每條都綁至少一個 eval case，經過觀察窗後各自定案；`SOUL.md` 對 AI 員工維持唯讀。第二，一輪的成本兩頭都有界：`gvu_cooldown_minutes` 節制多久才能起一輪，零 LLM 成本的 Gate 會在付判官錢之前就否決注定失敗的候選。
+**`gvu_enabled` 自 2026-09-29（K2）起出廠即為 `true`。** 有兩件事讓這個改變站得住腳。第一，引擎不再改寫 `SOUL.md`，舊路徑已於同日移除（S11），現在演化的對象是 playbook：一條條可獨立退場的行為規則，每條都綁至少一個 eval case，經過觀察窗後各自對照該 case 定案；`SOUL.md` 對 agent 維持唯讀。第二，一輪的成本兩頭都有界：`gvu_cooldown_minutes` 節制多久才能起一輪，零 LLM 成本的 Gate 會在付判官錢之前就否決注定失敗的候選。
 
 每一份 scaffold 仍會把這個鍵明確寫進 `agent.toml`，開關看得見，不是靠「鍵不存在＝關閉」。既有 `agent.toml` 維持原值（缺鍵仍讀成 `false`，執行期的 fail-closed 閘門沒有改變）。要讓某位 AI 員工退出，設 `gvu_enabled = false`。
 
-同日（H3）另有三個 per-agent 技能旋鈕開始真正生效——在此之前它們由儀表板寫入、卻沒有任何讀取端：
+同日（H3）另有四個 per-agent 技能旋鈕開始真正生效，在此之前它們由儀表板寫入，卻沒有任何讀取端：
 
 | 旋鈕 | 預設值 | 控制什麼 |
 |---|---|---|
@@ -49,7 +49,7 @@ enabled = true   # master kill-switch (default: true)
 | `skill_synthesis_cooldown_hours` | `24` | 同主題觸發後的靜默期 |
 | `skill_graduation_min_lift` | `0.1` | 技能成為畢業候選所需的最低實測增益 |
 
-另外八個同族鍵（`skill_graduation_enabled`、`skill_recommendation_enabled`、`skill_recommendation_threshold`、`curiosity_enabled`、`curiosity_threshold`、`curiosity_max_daily`、`skill_behavior_monitor_enabled`、`skill_behavior_drift_threshold`）則直接移除——它們完全沒有讀取端。舊的 `agent.toml` 留著這些鍵無害，會被忽略，而那本來就是它們實際的行為。
+另外八個同族鍵（`skill_graduation_enabled`、`skill_recommendation_enabled`、`skill_recommendation_threshold`、`curiosity_enabled`、`curiosity_threshold`、`curiosity_max_daily`、`skill_behavior_monitor_enabled`、`skill_behavior_drift_threshold`）則直接移除，因為它們完全沒有讀取端。舊的 `agent.toml` 留著這些鍵無害，會被忽略，而那本來就是它們實際的行為。
 
 ### GVU 冷卻時間
 
@@ -60,13 +60,17 @@ enabled = true   # master kill-switch (default: true)
 gvu_cooldown_minutes = 60   # default 60; 0 disables the cooldown
 ```
 
-冷卻時間從觸發被放行的那一刻開始計算（不是循環結束時），而且不論結果為何都會套用（applied／abandoned／skipped），因為要節流的成本是*嘗試*的 LLM 呼叫次數，不只是成功的呼叫。狀態存在記憶體中，gateway 重啟就會重置。
+冷卻時間從觸發被放行的那一刻開始計算（不是循環結束時），而且不論結果為何都會套用（applied／abandoned／skipped），因為要節流的成本是*嘗試*的 LLM 呼叫次數，含失敗在內的所有呼叫。狀態存在記憶體中，gateway 重啟就會重置。
+
+### 錯誤歸因（`config.toml [evolution] fault_attribution`，預設 `true`）
+
+被駁回的 goal-loop 回合在計入已注入的 playbook 規則之前（`harmful` 加一、影子候選評分、F2b 整併來源），gateway 會先用一條決定性、零 LLM 的規則鏈判定該回合的錯誤歸屬方（`crates/duduclaw-gateway/src/fault_attribution.rs`）：`grader`（判官與決定性的 grounding 證據相互矛盾）、`environment`（rate limit／計費／逾時／spawn 失敗）、`harness`（回覆宣稱用過工具，卻沒有觀察到任何原生工具事件，或能力閘門擋下了該次呼叫）、`unknown`（沒有任何觀測保真度），其餘則是 `model`。只有 `model` 回合會餵進學習迴圈；每一個被排除的回合都會寫一筆 `fault_attributed` 稽核事件，讓排除動作看得見。設成 `fault_attribution = false` 可逐位元還原 2026-09 之前的行為。依據：arXiv:2605.22842（歸因系統在 64/64 個失敗中都怪罪模型）與 arXiv:2607.28802。
 
 ### 實際跑的是哪個引擎：只有 AEE
 
 當 `gvu_enabled = true` 時，實際運作的演化引擎是 **AEE**（Agentic Evolution Engine）。AEE 演化的是 playbook：一條條小型、可獨立退場的行為規則，每一條都連結至少一個 eval case，而且從不改寫 `SOUL.md`。人格檔案的所有權屬於操作者。
 
-**2026-09-29（S11）移除：`legacy_soul_evolution` 逃生艙與它背後整套改寫 `SOUL.md` 的 Generator→Verifier→Updater 循環**，連同 `SOUL.md` 版本化、24 小時觀察期、自動回滾、超額整併斷路器與 `duduclaw evolution finalize` CLI 一併移除。`SOUL.md` 自 Evolution v3（WP1.1）起對 AI 員工就已唯讀，這些機制守護的寫入路徑本身早就不存在了。舊 `agent.toml` 留著 `legacy_soul_evolution = true` 會被忽略，該員工照樣走 AEE。
+**2026-09-29（S11）移除：`legacy_soul_evolution` 逃生艙與它背後整套改寫 `SOUL.md` 的 Generator→Verifier→Updater 循環**，連同 `SOUL.md` 版本化、24 小時觀察期、自動回滾、上限死結整併斷路器與 `duduclaw evolution finalize` CLI 一併移除。`SOUL.md` 自 Evolution v3（WP1.1）起對 AI 員工就已唯讀，這些機制守護的寫入路徑本身早就不存在了。舊 `agent.toml` 留著 `legacy_soul_evolution = true` 會被忽略，該員工照樣走 AEE。
 
 AEE 一輪提交之後，新增的條目會先經過觀察，才會定案：
 
@@ -165,8 +169,8 @@ duduclaw agent unfreeze <agent-id>
 總開關的重點在於，你切下去之後可以證明真的沒有任何東西還在演化。檢查方式：
 
 1. 在該 agent 上設定 `[evolution] enabled = false`。
-2. 觀察 `prediction.db`（`evolution_events` / `gvu_experiment_log`）：不應該出現新的 GVU 紀錄列。
-3. `SOUL.md` 不應該改變——不過自 2026-09-29 起，平台已經沒有任何路徑能代替 AI 員工寫它。
+2. 觀察 `evolution.db`（`gvu_experiment_log`）與 `prediction.db`（`evolution_events`）：不應該出現新的紀錄列。
+3. `SOUL.md` 不應該改變，不過自 2026-09-29 起，平台已經沒有任何路徑能代替 agent 寫它。
 4. 不應該開啟任何定案觀察窗（`aee_pending_settlement` 沒有待定列）。
 
 這對應到本專案針對這個功能所跑的自動化驗證。
@@ -177,7 +181,7 @@ duduclaw agent unfreeze <agent-id>
 
 | 鍵 | 預設值 | 頁面 |
 |---|---|---|
-| `config.toml [memory] novelty_gate` | `true` | [memory-and-knowledge.md](../memory-and-knowledge.md) — 拒絕近乎重複的語意記憶 |
+| `config.toml [memory] novelty_gate` | `true` | [memory-and-knowledge.md](./memory-and-knowledge.md) — 拒絕近乎重複的語意記憶 |
 | `config.toml [dispatch] grounding_precheck_enabled` | `true` | [goal-loop.md](./goal-loop.md) — 在驗收判官之前做零 LLM 成本的證據檢查 |
 | `config.toml [dispatch] two_stage_judge` | `true` | [goal-loop.md](./goal-loop.md) — 在 MAV 驗收判官團之前先跑一個低成本的第一階段評估器 |
 | `config.toml [goal_loop] resume_on_restart` | `"pause"` | [goal-loop.md](./goal-loop.md) — gateway 重啟時把進行中的目標任務升級為 `needs_human`；設成 `"auto"` 則改為自動恢復。Dashboard：設定 → 自動化 |

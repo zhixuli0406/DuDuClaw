@@ -148,7 +148,7 @@ Behind `tasks/send`, `tasks/get`, and `tasks/cancel` lives the `A2ATaskManager`.
 
 1. **Queue** incoming tasks into the agent's existing task system (`TaskSpec`, `tasks/` directory).
 2. **Track** status transitions (queued → running → completed/failed/cancelled).
-3. **Route** task execution through the agent's normal runtime (Claude / Codex / Gemini / OpenAI-compat).
+3. **Route** task execution through the agent's normal runtime (Claude / Codex / Antigravity / Grok / OpenAI-compat or another catalog runtime; the Gemini CLI runtime is deprecated).
 4. **Expose** results in the task envelope so the client can poll for them.
 
 This means tasks submitted via ACP flow through the **same** pipelines as tasks submitted via channels or MCP tools — single source of truth, unified observability in the Logs/Activity dashboard.
@@ -212,7 +212,7 @@ This is worth mapping because the naming overlaps:
 |----------|---------|-----------|---------|
 | **MCP** | Expose DuDuClaw's tools (channel, memory, agent, wiki, task, ...) to an AI runtime | Runtime → DuDuClaw | `duduclaw mcp-server` |
 | **ACP/A2A** | Let external clients (IDEs, pipelines, other agents) send tasks to DuDuClaw | IDE → DuDuClaw | `duduclaw acp-server` |
-| **Runtime stdio** | DuDuClaw spawns a runtime (Claude/Codex/Gemini) subprocess and talks to it via stdio JSON | DuDuClaw → Runtime | *Internal* |
+| **Runtime stdio** | DuDuClaw spawns a runtime (Claude/Codex/Antigravity/Grok, or Gemini while deprecated) subprocess and talks to it via stdio JSON | DuDuClaw → Runtime | *Internal* |
 
 They're three distinct conversations, all on stdio, all JSON-RPC-adjacent. The same agent participates in all three simultaneously at runtime.
 
@@ -249,7 +249,7 @@ ACP, like MCP, inherits DuDuClaw's security boundaries:
 - **CONTRACT.toml** — must_not/must_always rules still apply; an ACP-submitted task can't violate them.
 - **Capability gating** — `agent.toml [capabilities]` deny-by-default still gates tool access.
 - **Audit log** — tasks submitted via ACP appear in `audit.unified_log` with source=`acp`.
-- **Sandboxing** — tasks still run through the worktree layer and (optionally) container sandbox.
+- **Sandboxing** — tasks run under the same optional per-agent task sandbox as any other task; see [Task sandbox](../guides/task-sandbox.md).
 
 The client being an IDE doesn't grant elevated trust — the agent's own policies are the last line of defense.
 
@@ -258,7 +258,7 @@ The client being an IDE doesn't grant elevated trust — the agent's own policie
 ## Interaction with Other Systems
 
 - **Task Board**: ACP-submitted tasks flow through the same `TaskStore` as channel-submitted ones. Both show in the Dashboard Activity Feed.
-- **Runtime selection**: The agent's normal runtime (Claude/Codex/Gemini/OpenAI) handles ACP tasks — same session memory, same prompt cache strategy, same account rotation.
+- **Runtime selection**: The agent's normal runtime (Claude/Codex/Antigravity/Grok/OpenAI-compat; Gemini CLI is deprecated since v1.67.0) handles ACP tasks — same session memory, same prompt cache strategy, same account rotation.
 - **Evolution**: ACP tasks count as "substantive turns" for Key-Fact extraction and prediction error calibration.
 - **Audit log**: All ACP requests are logged with source=`acp`, alongside the other four audit sources (security / tool_calls / channel_failures / feedback).
 

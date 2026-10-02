@@ -6,7 +6,7 @@ conversations, an open question nobody came back to. The night engine is the bac
 pass that cleans that up during idle windows, and optionally does a little pre-reading
 for tomorrow.
 
-It is **off by default, behind two separate switches**, and this page exists because
+It is **off by default, with per-agent enablement and an additional global switch for model calls**, and this page exists because
 without it there was no way for an operator to find out how to turn it on.
 
 ---
@@ -101,6 +101,8 @@ Night passes log from the `duduclaw_gateway::night_engine` target. A completed p
 logs `night pass complete`
 with the sub-passes that ran; a skipped one says why (`night pass skipped: daily
 circuit breaker open`, or nothing at all when the agent was not idle).
+
+When a pass caches sleep-time insights or prefetched material, creates schemas, stores consolidations, or rolls back a failed consolidation, the dashboard Activity Feed receives one `night_engine.pass_complete` entry. Its summary reports the result and counts. An empty or skipped pass produces no Activity Feed entry. Feed writes are best effort: a write failure is logged and does not stop the night engine.
 
 ```bash
 # systemd

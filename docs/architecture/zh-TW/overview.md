@@ -2,12 +2,13 @@
 
 ## 架構總覽（v1.13.1）
 
-DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Platform）**，透過統一的 `AgentRuntime` trait 支援 **Claude Code / Codex / Gemini** CLI 作為 AI 後端，具備自動偵測與逐 Agent 設定能力。DuDuClaw 並非獨立的 LLM 產品；它是把一個（或多個）AI CLI 轉變成長駐運作 Agent 的管線層，涵蓋通道路由、對話記憶、自我演化、多帳號輪替、本機 LLM 推理、瀏覽器自動化與 IDE 整合。
+DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Platform）**，透過統一的 `AgentRuntime` trait 支援 **Claude Code / Codex / Antigravity / Grok** CLI（另有 OpenAI 相容 API）作為 AI 後端（Gemini CLI 後端自 v1.67.0 起棄用，v1.69.0 移除，由 Antigravity 取代），具備自動偵測與逐 Agent 設定能力。DuDuClaw 並非獨立的 LLM 產品；它是把一個（或多個）AI CLI 轉變成長駐運作 Agent 的管線層，涵蓋通道路由、對話記憶、自我演化、多帳號輪替、本機 LLM 推理、瀏覽器自動化與 IDE 整合。
 
 ## 關鍵架構決策
 
 ### 執行環境與傳輸層
-- **Multi-Runtime**（`AgentRuntime` trait）— Claude / Codex / Gemini / OpenAI-compat 四種後端，`RuntimeRegistry` 自動偵測，逐 Agent 設定寫在 `agent.toml [runtime]`。
+- **Multi-Runtime**（`AgentRuntime` trait）— Claude / Codex / Antigravity（`agy`）/ Grok / OpenAI-compat 後端，另有已棄用的 Gemini CLI（v1.67.0 起棄用、v1.69.0 移除，由 Antigravity 取代），`RuntimeRegistry` 自動偵測，逐 Agent 設定寫在 `agent.toml [runtime]`。
+- **跨 runtime failover 的模型替換**（`failover.rs`）：當 `[runtime] fallback` 把呼叫轉到*不同*的 provider 時，備援 runtime 不再沿用主要 runtime 的模型 id（過去 codex Agent 的 `gpt-5.4` 會被拿去丟給 Claude runtime）。模型依四個有序分支解析：① `agent.toml [model] fallbacks` 中第一個明確屬於備援 runtime 模型家族的項目（帶 `provider/model` 前綴的會去掉前綴）；② 若該 runtime 本來就能服務所要求的模型，則保留原模型（`openai_compat` 不宣告模型家族，靠這條分支繼續代理任意 id）；③ runtime catalog 為該後端列出的第一個模型；④ 以上皆無則**拒絕 spawn**，回報 `no model configured for fallback runtime <P>`，並記為一次失敗的嘗試。每次替換都會輸出 `warn!`，帶有 `agent` / `from_runtime` / `to_runtime` / `from_model` / `to_model`。
 - **MCP Server（stdio）**（`duduclaw mcp-server`）透過 stdin/stdout 上的 JSON-RPC 2.0，把通道、記憶、Agent、skill、task、共用 wiki、autopilot 等工具暴露給 AI Runtime。註冊層級在 Agent 端的 `<agent>/.mcp.json`（v1.8.5 撤回了 v1.8.4 的全域註冊，因為 Claude CLI `-p --dangerously-skip-permissions` 只會讀取專案層級的 `.mcp.json`）。Gateway 啟動時會自動為所有 Agent 建立／修復 `.mcp.json`。
 - **MCP Server（HTTP/SSE）**（`duduclaw http-server --bind 127.0.0.1:8765`，v1.9.4）— Bearer 驗證的 `POST /mcp/v1/call`（單次 JSON-RPC 工具呼叫）、`GET /mcp/v1/stream`（長駐 SSE 事件串流，Bearer 或 `?api_key=`）、`POST /mcp/v1/stream/call`（非同步 + SSE 結果推送）、`GET /healthz`（免驗證）。Token bucket 速率限制（60 req/min）。`mcp_sse_store.rs` 用 broadcast channel 管理 SSE 連線。與 stdio 互補，服務外部 HTTP client。
 - **ACP/A2A Server**（`duduclaw acp-server`）— stdio JSON-RPC 2.0 迴圈，提供 `agent/discover`、`tasks/send`、`tasks/get`、`tasks/cancel` 方法，並輸出 `.well-known/agent.json` AgentCard。透過 Agent Client Protocol 支援 Zed / JetBrains / Neovim 等 IDE 整合。
@@ -54,7 +55,7 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 ### Wiki 知識層（v1.8.9）
 - **四層架構**（受 Vault-for-LLM 啟發）：L0 Identity / L1 Core / L2 Context / L3 Deep。
 - **信任權重**（frontmatter 中的 `trust`，0.0-1.0）— 搜尋結果依信任加權分數排序。
-- **自動注入**：`build_system_prompt()` 會把 L0+L1 頁面自動注入 WIKI_CONTEXT，涵蓋 CLI／通道回覆／dispatcher 三條路徑，在 Claude / Codex / Gemini / OpenAI 各 runtime 間保持一致。
+- **自動注入**：`build_system_prompt()` 會把 L0+L1 頁面自動注入 WIKI_CONTEXT，涵蓋 CLI／通道回覆／dispatcher 三條路徑，在 Claude / Codex / Antigravity / Grok / OpenAI-compat 各 runtime（以及已棄用的 Gemini）間保持一致。
 - **FTS5 索引**（`unicode61` tokenizer）— 每次寫入／刪除都自動同步，也可透過 `wiki_rebuild_fts` 手動重建。
 - **知識圖譜**：`wiki_graph` MCP 工具匯出限制 BFS 深度的 Mermaid 圖；節點形狀依層級區分。
 - **去重偵測**：`wiki_dedup` 透過標題比對 + 標籤 Jaccard 相似度（≥0.8）偵測重複頁面。
@@ -67,15 +68,6 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 - **記憶衰減每日排程**：背景任務每 24 小時執行一次 `duduclaw_memory::decay::run_decay`。低重要性 + 滿 30 天 → 歸檔。已歸檔 + 滿 90 天 → 永久刪除。
 - **認知記憶 MCP 工具**：`memory_search_by_layer`（情節／語意篩選）、`memory_successful_conversations`、`memory_episodic_pressure`、`memory_consolidation_status`。
 - **MemGPT 三層系統**（Core Memory、Recall Memory、Archival Bridge、Budget Manager、Consolidation Pipeline，共 6 個 MCP 工具）**已於 v1.8.1 移除**（−1,985 行程式碼）— 該注入方式讓每個 prompt 膨脹 6,500 token，並造成「lost in the middle」注意力衰退。
-
-### Worktree 隔離（v1.6.0）
-- **Git worktree L0 隔離層**— 逐任務檔案系統隔離，成本比容器沙箱低。
-- **WorktreeManager**：create / remove / list / cleanup_stale 生命週期管理。
-- **原子合併**：dry-run 預檢 → abort → 乾淨才真正合併。以全域 `Mutex` 保護。
-- **Snap 工作流**：create → execute → inspect → merge/cleanup（判斷邏輯採純函式設計，便於測試）。
-- **分支命名**：`wt/{agent_id}/{adjective}-{noun}`，取自 50×50 字詞清單。
-- **copy_env_files**：路徑穿越防護（path traversal jail）+ 拒絕 symlink + 1MB 大小上限。
-- **資源上限**：每個 Agent 最多 5 個 worktree，總計上限 20 個。
 
 ### 本機推理
 - **統一 `InferenceBackend` trait**（`duduclaw-inference` crate）：llama.cpp（Metal/CUDA/Vulkan/CPU）、mistral.rs（ISQ + PagedAttention + Speculative Decoding）、OpenAI 相容 HTTP（Exo/llamafile/vLLM/SGLang）。
@@ -106,9 +98,9 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 - **CONTRACT.toml**— `must_not` / `must_always` 邊界規則，自動注入 system prompt；`duduclaw test` 紅隊測試 CLI（內建 9 種情境）。
 - **統一多來源稽核日誌**：`audit.unified_log` 把 `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` 整併成統一格式（timestamp / source / event_type / agent_id / severity / summary / details），並在 Logs 頁提供篩選 chip。
 - **AES-256-GCM** 靜態加密— 逐 Agent 金鑰隔離。
-- **Ed25519 challenge-response** WebSocket 驗證。
-- **容器沙箱**（Docker / Apple Container / WSL2）— `--network=none`、tmpfs、唯讀 rootfs、512MB 上限。
-- **瀏覽器自動化與 Computer Use**——三組由 agent 自行選擇的 MCP 工具，沒有自動路由器：L1 `web_fetch_cached`（經 SSRF 閘、帶快取的 HTTP）、L2 `web_extract`（CSS 選擇器爬取）、L5 七個 `computer_*` 工具經 `computer_use_orchestrator` 驅動容器虛擬顯示器。L3 headless 是可選的 per-agent Playwright／Browserbase MCP server（`.mcp.json`）。透過 `CapabilitiesConfig`（`computer_use`／`browser_via_bash`／`allowed_tools`／`denied_tools`）預設拒絕。死碼 `browser_router.rs` 的五層路由器與它的「L4 Sandbox Browser」層級已於 2026-09 移除。
+- **Dashboard／WebSocket 驗證**：JWT 帳號登入（密碼以 Argon2id 雜湊存於 `users.db`）或 gateway 管理員 token。早期的 Ed25519 challenge-response 路徑已從 gateway 移除，從來沒有任何設定能啟用它。Ed25519 仍用在授權簽章、更新驗證與 relay 裝置協定。
+- **容器沙箱**：有兩條獨立路徑。逐員工的*任務沙箱*（`agent.toml [container] sandbox_enabled`）把被委派任務的 AI CLI 放進唯讀、非 root、有資源上限的 Docker 容器（只支援 Docker，需要 `network_access = true`，不能用時任務失敗；見[任務沙箱指南](../../guides/zh-TW/task-sandbox.md)）。PTC `execute_program` 與 `secaudit` PoC 步驟使用的*腳本沙箱*跑在 Docker 上（Windows 先試 WSL2），`--network=none`、唯讀根檔案系統，只掛一個唯讀的私有腳本目錄；不能用時 PTC 不執行腳本，除非設 `[container.sandbox] script_when_unavailable = "run_unsandboxed"`，PoC 則永遠不在主機上執行。
+- **瀏覽器自動化與 Computer Use**——agent 自行選擇的兩個抓取工具與可選的瀏覽器 server，沒有自動路由器：L1 `web_fetch_cached`（經 SSRF 閘、帶快取的 HTTP）、L2 `web_extract`（CSS 選擇器爬取）。L5 電腦操作跑在 `computer_use_orchestrator` 啟動的容器裡（映像 `ghcr.io/zhixuli0406/duduclaw-computer-use:v<版本>`，不會自動下載，動作以 `xdotool` 執行），由 agent 透過八個 `computer_*` MCP 工具驅動，`duduclaw mcp-server` 行程會把這些呼叫透過簽章的 loopback 路由轉給 gateway 持有的 session（`POST /api/internal/computer-use`、`computer_use_sessions/`；網路只通到逐 agent 的 `allowed_domains` 主機，並在 session 啟動時釘住位址）。聊天觸發的迴圈與 `native` 主機桌面模式已移除。L3 headless 是可選的 per-agent Playwright／Browserbase MCP server（`.mcp.json`）。透過 `CapabilitiesConfig`（`computer_use`／`browser_via_bash`／`allowed_tools`／`denied_tools`）預設拒絕。死碼 `browser_router.rs` 的五層路由器與它的「L4 Sandbox Browser」層級已於 2026-09 移除。
 - **CJK 安全位元組切片**：`duduclaw_core::truncate_bytes` / `truncate_chars` 取代了 31 處不安全的 `s[..s.len().min(N)]` 寫法（修正 v1.8.11 的多位元組 codepoint panic）。
 
 ### 帳號與成本
@@ -119,6 +111,7 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 - **`FailureReason` 分類**— RateLimited / Billing / Timeout / BinaryMissing / SpawnError / EmptyResponse / NoAccounts / Unknown，各分類對應專屬的 zh-TW 使用者訊息，並記錄至 `channel_failures.jsonl` 稽核紀錄。
 - **執行檔探測**：`which_claude()` / `which_claude_in_home()` 會探測 Homebrew（Intel + Apple Silicon）、Bun、Volta、npm-global、`.claude/bin`、`.local/bin`、asdf shims、NVM 版本目錄，修正由 launchd 啟動的 gateway 在 `PATH` 為空時找不到執行檔的問題。
 - **CostTelemetry**：以 SQLite 追蹤 token 用量，並分析快取效率（`cache_read / (input + cache_read + cache_creation)`），200K 價格斷崖預警，自適應路由（快取效率 <30% → 轉本機）。MCP 工具：`cost_summary`、`cost_agents`、`cost_recent`。
+- **逐模型成本彙總**（`CostTelemetry::summary_by_model`）：`token_usage` 自第一版 schema 起就有 `model` 欄位，但所有彙總都只按 agent / user / day 分組，「錢花在哪個模型上？」無從回答。`summary_by_model(agent_id: Option<&str>, since_unix)` 依模型分組（花費最高者在前；沒有記錄模型 id 的列歸入 `"(unknown)"`，不做猜測），並回報 `requests` / `input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_creation_tokens` / `cost_millicents` + `cost_usd` / `cache_efficiency`。成本是各列已儲存 `cost_millicents` 的加總，與其他彙總走同一條定價路徑（`cost_for`，於記錄時只套用一次），不重新推算；`cost_usd` 僅為單位換算。以加法方式對外提供：MCP 的 `cost_summary` 與 `cost_agents` 回應在同一時間窗新增 `by_model` 陣列（`cost_agents` 原本的 agent 列改放到 `agents` 鍵下，因為頂層 JSON 陣列無法附帶具名的同層欄位），儀表板 RPC `cost.by_model`（參數 `agent_id?`、`days?`，預設 7，限制在 1–365）則在與其他 `cost.*` 相同的 admin 閘門下回傳彙總。`cost_summary` / `cost_agents` 內部若彙總失敗，會退化為空的 `by_model`，不會讓呼叫者實際發出的請求失敗。
 - **Direct API client**（`direct_api.rs`）：純聊天情境略過 Claude CLI，system prompt 加上 `cache_control: ephemeral` → 快取命中率 95%+。使用單例 `reqwest::Client`，逾時 120 秒；於所有 OAuth 帳號皆冷卻中時作為備援。
 
 ### 排程
@@ -145,12 +138,7 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 - **Dashboard WebSocket 心跳**：伺服器每 30 秒送一次 Ping，60 秒未收到 Pong 就關閉閒置連線。Client 端每 25 秒送一次應用層 `ping` RPC（瀏覽器無法送出 control frame）。
 
 ### 可靠性與治理（v1.9.4）
-- **`duduclaw-durability` crate**— 五大耐用性支柱：
-  - `idempotency.rs`：以 key 為基礎的去重，防止重複執行。
-  - `retry.rs`：指數退避 + 抖動策略。
-  - `circuit_breaker.rs`：Closed / Open / HalfOpen 三態，搭配 `probe_inflight` 計數（v1.9.4 修正：OPEN→HALF_OPEN 轉換時會遞增 `probe_inflight`，避免幽靈探測超額）。
-  - `checkpoint.rs`：可續跑的任務進度。
-  - `dlq.rs`：給終局失敗訊息用的 Dead Letter Queue。
+- **`duduclaw-durability` crate**（🗑️ **已於 2026-07-04 commit `b0639b96` 中移除**）— 該 crate 包含了五大耐用性支柱（`idempotency`、`retry`、`circuit_breaker`、`checkpoint`、`dlq`）。經驗證，整個工作區沒有任何呼叫端，遂被移除。gateway 的 LLM fallback 鏈改用其他機制（見 `gateway/failover.rs`）。checkpoint 保存／復原／分叉等功能在現行程式碼中不可用。
 - **`duduclaw-governance` crate**（W19-P1 M1-A）— `PolicyRegistry`（YAML + 熱重載 + 逐 Agent 優先序合併 + fail-safe + 並行 upsert 安全）、四種 `PolicyType`（Rate / Permission / Quota / Lifecycle）、`quota_manager.rs`（逐 Agent／逐政策的軟性與硬性配額）、`error_codes.rs`（QUOTA_EXCEEDED / POLICY_DENIED / ...）、審批工作流 + 稽核日誌。預設政策集在 `policies/global.yaml`。
 - **LLM fallback 鏈**（`gateway/failover.rs` 的 `failover::model`）— 三層備援（帳號 → 模型 → runtime，2026-09-29 起同屬一個模組樹）的第二層：主模型逾時／503／429／overloaded 時自動切換到較輕的備援模型，帳務錯誤一律不觸發。`is_llm_fallback_error` / `should_attempt_model_fallback` 是有單元測試的純函式，派工路徑一律呼叫合併後的 `FailoverManager::model_fallback_for`。以 `char_indices` 確保 UTF-8 安全截斷。
 - **Evolution Events 系統**（`gateway/evolution_events/`）— 30+ 種事件 schema、非同步批次 + 重試發射器、查詢介面、可靠性保證。以 HTTP endpoint 暴露在 gateway 上，並顯示於 Web 的 `ReliabilityPage`。

@@ -144,7 +144,7 @@ stdio 上の JSON-RPC は MCP が使うトランスポートと同じです—�
 
 1. **キューに入れる**——受信したタスクをエージェントの既存タスクシステム（`TaskSpec`、`tasks/` ディレクトリ）にキューイングする。
 2. **追跡する**——ステータス遷移（queued → running → completed/failed/cancelled）を追跡する。
-3. **ルーティングする**——タスクの実行をエージェントの通常の runtime（Claude / Codex / Gemini / OpenAI-compat）にルーティングする。
+3. **ルーティングする**——タスクの実行をエージェントの通常の runtime（Claude / Codex / Antigravity / Grok / OpenAI-compat、またはカタログ内の他の runtime。Gemini CLI runtime は非推奨）にルーティングする。
 4. **公開する**——クライアントがポーリングできるよう、タスクエンベロープに結果を公開する。
 
 つまり、ACP 経由で送信されたタスクは、チャネルや MCP ツール経由で送信されたタスクと**同じ**パイプラインを流れます——単一の信頼できる情報源、Logs/Activity ダッシュボードでの統一された可観測性です。
@@ -164,6 +164,8 @@ stdio 上の JSON-RPC は MCP が使うトランスポートと同じです—�
 > ```
 >
 > `duduclaw acp-server` は引き続き A2A 用です——2 つのプロトコルは意図的に別コマンドに分かれています。
+
+## 現在使える機能（stdio 上の A2A）
 
 ### CI/CD パイプライン
 
@@ -188,7 +190,7 @@ HTTP server も認証トークンもポート管理も不要——コンテナ�
 |----------|---------|-----------|---------|
 | **MCP** | DuDuClaw のツール（channel、memory、agent、wiki、task……）を AI runtime に公開 | Runtime → DuDuClaw | `duduclaw mcp-server` |
 | **ACP/A2A** | 外部クライアント（IDE、パイプライン、他のエージェント）が DuDuClaw にタスクを送信 | IDE → DuDuClaw | `duduclaw acp-server` |
-| **Runtime stdio** | DuDuClaw が runtime（Claude/Codex/Gemini）サブプロセスを起動し stdio JSON で対話 | DuDuClaw → Runtime | *内部* |
+| **Runtime stdio** | DuDuClaw が runtime（Claude/Codex/Antigravity/Grok、非推奨期間中は Gemini も）サブプロセスを起動し stdio JSON で対話 | DuDuClaw → Runtime | *内部* |
 
 これらは3つの異なる会話で、すべて stdio 上にあり、すべて JSON-RPC に隣接しています。同じエージェントが実行時にこの3つすべてに同時に参加します。
 
@@ -225,7 +227,7 @@ ACP は MCP と同様、DuDuClaw のセキュリティ境界を継承します�
 - **CONTRACT.toml**——must_not/must_always ルールは依然適用されます。ACP 経由で送信されたタスクはこれらに違反できません。
 - **能力ゲーティング**——`agent.toml [capabilities]` のデフォルト拒否は依然ツールアクセスをゲートします。
 - **監査ログ**——ACP 経由で送信されたタスクは `audit.unified_log` に source=`acp` で出現します。
-- **サンドボックス化**——タスクは依然 worktree レイヤーを、そして（オプションで）コンテナサンドボックスを通って実行されます。
+- **サンドボックス化**——タスクは他のタスクと同じく、オプションのエージェント別タスクサンドボックスの下で実行されます。詳細は[タスクサンドボックス](../../guides/ja-JP/task-sandbox.md)を参照してください。
 
 クライアントが IDE であることが昇格された信頼を付与することはありません——エージェント自身のポリシーが最後の防衛線です。
 
@@ -234,7 +236,7 @@ ACP は MCP と同様、DuDuClaw のセキュリティ境界を継承します�
 ## 他システムとの連携
 
 - **Task Board**：ACP 経由で送信されたタスクは、チャネル経由で送信されたものと同じ `TaskStore` を流れます。両者とも Dashboard Activity Feed に表示されます。
-- **Runtime 選択**：エージェントの通常の runtime（Claude/Codex/Gemini/OpenAI）が ACP タスクを処理します——同じセッションメモリ、同じ prompt cache 戦略、同じアカウントローテーション。
+- **Runtime 選択**：エージェントの通常の runtime（Claude/Codex/Antigravity/Grok/OpenAI-compat。Gemini CLI は v1.67.0 で非推奨）が ACP タスクを処理します——同じセッションメモリ、同じ prompt cache 戦略、同じアカウントローテーション。
 - **進化**：ACP タスクは、キーファクト抽出と予測エラー較正において「実質的なターン」としてカウントされます。
 - **監査ログ**：すべての ACP リクエストは source=`acp` で記録され、他の4つの監査ソース（security / tool_calls / channel_failures / feedback）と並びます。
 

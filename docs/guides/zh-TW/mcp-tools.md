@@ -27,7 +27,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 | `recording` | `agent.toml [capabilities]` | 隱藏 5 個錄製工具 |
 | `system_operator` | `agent.toml [capabilities]` | 隱藏 19 個值班機操作工具 |
 | `codrive` | `agent.toml [capabilities]` | 隱藏 `codrive_run` / `codrive_status` |
-| `computer_use` | `agent.toml [capabilities]` | 隱藏 7 個 `computer_*` |
+| `computer_use` | `agent.toml [capabilities]` | 隱藏 8 個 `computer_*`（見下方 [`computer_*`](#computer_由-gateway-執行的-session)） |
 | `db_sources` | `agent.toml [capabilities]` | 隱藏 4 個 `db_*` |
 | `[fork] enabled` | `agent.toml` | 隱藏 6 個分支工具 |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有效授權 | 在階段性授權生效前一律隱藏 |
@@ -109,6 +109,35 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 ### `evolution_toggle` — 停滯偵測子欄位
 
 除標準旗標外，`field` 還接受 `stagnation_enabled`（bool）、`stagnation_window_seconds`（60–604800）、`stagnation_trigger_threshold`（1–1000）、`stagnation_action`（`log_only` | `suppress`）。見 [evolution-switches.md](../evolution-switches.md)。
+
+### `execute_program`：腳本在哪裡執行
+
+腳本在腳本沙箱裡執行，也就是用 `config.toml [container.sandbox] image` 指定的 image 起一個容器（與[任務沙箱](task-sandbox.md)同一個 image，不會自動下載）。容器以主機使用者身分執行（主機行程是 root 時改用 `1000:1000`，WSL2 上一律如此），丟棄所有 capability、`no-new-privileges`、唯讀根檔案系統、沒有網路、2 GiB 記憶體且不用 swap、256 個行程、1 顆 CPU，以及一個小的 `/tmp` tmpfs。只掛載一個放腳本的私有目錄，唯讀掛在 `/workspace`。`timeout_seconds`（預設 30，最多 300）之外還有 600 秒的硬上限；stdout 與 stderr 合成一份輸出回來（讀取上限 2 MiB，回覆上限 1 MiB）；呼叫被取消時容器會被強制移除。macOS 與 Linux 用 Docker；Windows 先試 WSL2，再試 Docker。
+
+沙箱不能用時（沒有 Docker、image 不在本機、`[container.sandbox]` 無效等），腳本**不會執行**：工具回傳 `Script sandbox unavailable (<代碼>): …` 並附上 `docker pull <image>` 指令，同時寫入稽核事件 `script_sandbox_unavailable`。舊版遇到這種情況會默默改在主機上執行。要恢復舊行為，設 `[container.sandbox] script_when_unavailable = "run_unsandboxed"`（與任務沙箱的 `when_unavailable` 是不同的鍵），之後每次在主機上執行都會記一筆 `script_sandbox_bypassed`。
+
+腳本無法回頭呼叫平台工具：容器裡沒有 RPC socket。
+
+### `computer_*`：由 gateway 執行的 session
+
+這八個工具為每位 AI 員工驅動一個電腦操作 session：一個帶虛擬顯示器與 kiosk 瀏覽器的隔離容器。MCP server 只負責把每次呼叫透過 loopback 轉給 gateway（`POST /api/internal/computer-use`，每個請求各自簽章）；容器由 gateway 持有，所有檢查也由 gateway 執行，所以 gateway 必須在執行中。除非 `agent.toml [capabilities] computer_use = true`，否則這些工具是隱藏的。
+
+| 工具 | 參數 | 備註 |
+|---|---|---|
+| `computer_session_start` | `task` 字串，選填；`width` 整數 320–1920；`height` 整數 240–1200 | 每位員工一個 session。結果會列出各項上限、高風險動作能否在聊天中確認，以及 `computer_navigate` 能開哪些網站 |
+| `computer_screenshot` | 無 | MCP 圖片區塊（PNG，已遮罩），後面接一個文字區塊，寫已用動作數與剩餘時間。整張圖被遮掉時，文字會如實說明，並寫出原因（多個視窗、焦點視窗敏感或讀不到、偵測失敗）與下一步 |
+| `computer_click` | `x`、`y` 整數（必填）；`button` 字串 `left`/`right`；`double` 布林 | `double` 只限左鍵 |
+| `computer_type` | `text` 字串（必填），1–2,000 字元 | 稽核只記字元數 |
+| `computer_key` | `key` 字串（必填）：字母、數字、`+`、`-`、`_` | 例如 `Return`、`ctrl+s` |
+| `computer_scroll` | `x`、`y` 整數（必填）；`direction` 字串 `up`/`down`（預設 `down`）；`amount` 整數 1–20（預設 3） | |
+| `computer_navigate` | `url` 字串（必填） | 只接受 `https://`，主機必須剛好在該員工的 `[capabilities.computer_use_config] allowed_domains` 上且在 session 啟動時解析成功，連接埠不寫或為 443，不得帶使用者名稱或密碼，最長 2,000 位元組。沒有白名單時 session 沒有網路，呼叫會被拒絕 |
+| `computer_session_stop` | `session_id` 字串，選填 | 移除容器 |
+
+整數與布林參數也接受數字字串與 `"true"`/`"false"` 字串。點擊、輸入、按鍵、捲動與導覽各算一個動作，計入 `max_actions`（預設 50）。各項上限、審批與確認規則、網路白名單及其殘留風險，見[瀏覽器自動化](../../features/zh-TW/08-browser-automation.md)。
+
+### `create_agent` / `agent_remove`：移除後的名稱會被保留
+
+`agent_remove` 會把該員工移到 `~/.duduclaw/agents/_trash/`，並回覆該員工已被移除、管理員可以還原、名稱已被保留，不會回傳路徑。接著 `create_agent` 會對所有 MCP 呼叫端拒絕這個名稱，條件是 trash 裡還有對應項目、`org.toml` 仍記錄這個 id 但沒有對應目錄，或 trash 無法列出；換一個名稱則可以建立。操作者可以從 Dashboard 或終端機重用這個名稱。透過 HTTP 且使用非內部金鑰時，兩個工具都以該金鑰自己的 client id 作為身分執行。細節見[委派隔離](../../features/zh-TW/37-delegation-isolation.md#被移除員工的名稱仍被保留)。
 
 ## 已棄用的別名仍會列出
 

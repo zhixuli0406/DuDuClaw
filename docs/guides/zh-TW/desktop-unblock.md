@@ -141,7 +141,7 @@ cd src-tauri && cargo tauri build          # 簽章 + 公證 + staple(env 齊全
 | --- | --- | --- |
 | **D4.1 🧪** | 把簽章+公證後的 `.dmg` 傳到**另一台從未裝過你憑證的 Mac**，雙擊 → **不**跳「來自未識別開發者」 | ✅ **已驗**（2026-07-01，`desktop-v1.31.0`）：`stapler validate` = *worked*、`spctl -a` = accepted / Notarized Developer ID |
 | **D3.1 🧪** | 簽章+hardened 後開 App，sidecar 仍能 spawn CLI / 連網（在 chat 觸發需網路的動作） | ⬜ 待在簽章版 App 內實跑 |
-| **D3.2 🧪** | 首次用 Computer Use → 系統跳 Accessibility / Screen Recording 授權框，授權後截圖/模擬輸入可動 | ⬜ 待驗 |
+| **D3.2 🧪** | 首次用 Computer Use → 系統跳 Accessibility / Screen Recording 授權框，授權後截圖/模擬輸入可動 | ⛔ **已作廢**（2026-10）：主機桌面的 computer use（`native` 模式）已移除；現在電腦操作只在隔離容器裡透過 `computer_*` MCP 工具執行，所以不會要求這些 macOS 權限 |
 | **D5 簽章/乾淨機** | 同 D4.1，且 `spctl -a -vvv DuDuClaw.app` 回 `accepted` | ✅ **已驗**：`spctl -a -vvv` = `accepted, source=Notarized Developer ID` |
 
 ---

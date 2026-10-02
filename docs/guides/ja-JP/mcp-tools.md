@@ -27,7 +27,7 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 | `recording` | `agent.toml [capabilities]` | 録画系 5 ツールを非表示 |
 | `system_operator` | `agent.toml [capabilities]` | アプライアンス操作 19 ツールを非表示 |
 | `codrive` | `agent.toml [capabilities]` | `codrive_run` / `codrive_status` を非表示 |
-| `computer_use` | `agent.toml [capabilities]` | `computer_*` 7 ツールを非表示 |
+| `computer_use` | `agent.toml [capabilities]` | `computer_*` 8 ツールを非表示（下の [`computer_*`](#computer_--gateway-が実行するセッション) を参照） |
 | `db_sources` | `agent.toml [capabilities]` | `db_*` 4 ツールを非表示 |
 | `[fork] enabled` | `agent.toml` | 分岐系 6 ツールを非表示 |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有効な付与 | タスクスコープの付与が有効になるまで非表示 |
@@ -109,6 +109,35 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 ### `evolution_toggle` — 停滞検知のサブフィールド
 
 標準フラグに加えて `field` は `stagnation_enabled`（bool）、`stagnation_window_seconds`（60–604800）、`stagnation_trigger_threshold`（1–1000）、`stagnation_action`（`log_only` | `suppress`）を受け付けます。[evolution-switches.md](../evolution-switches.md) を参照してください。
+
+### `execute_program` — スクリプトの実行場所
+
+スクリプトはスクリプトサンドボックスで実行されます。`config.toml [container.sandbox] image` のイメージから作るコンテナで、[タスクサンドボックス](task-sandbox.md)と同じイメージです（自動ではダウンロードされません）。コンテナはホストのユーザーで動きます（ホストのプロセスが root のときは `1000:1000`、WSL2 では常にこちら）。すべての capability を破棄し、`no-new-privileges`、読み取り専用のルートファイルシステム、ネットワークなし、2 GiB のメモリ（swap なし）、256 プロセス、1 CPU、小さな `/tmp` tmpfs が適用されます。マウントされるのはスクリプトを置いた専用ディレクトリだけで、`/workspace` に読み取り専用でマウントされます。`timeout_seconds`（既定 30、最大 300）に加えて 600 秒の絶対上限があり、stdout と stderr は 1 つの出力として返ります（読み取り上限 2 MiB、返信上限 1 MiB）。呼び出しがキャンセルされるとコンテナは強制削除されます。macOS と Linux では Docker を使い、Windows ではまず WSL2、次に Docker を試します。
+
+サンドボックスが使えないとき（Docker がない、イメージがない、`[container.sandbox]` が無効など）、スクリプトは**実行されません**。ツールは `docker pull <image>` のコマンドを含む `Script sandbox unavailable (<コード>): …` を返し、監査イベント `script_sandbox_unavailable` を書きます。以前のバージョンでは、この場合に黙ってホスト上で実行していました。その動作に戻すには `[container.sandbox] script_when_unavailable = "run_unsandboxed"` を設定します（タスクサンドボックスの `when_unavailable` とは別のキーです）。ホストでの実行は毎回 `script_sandbox_bypassed` として監査されます。
+
+スクリプトからプラットフォームのツールを呼び返すことはできません。コンテナ内に RPC ソケットはありません。
+
+### `computer_*` — gateway が実行するセッション
+
+8 つのツールは、スタッフごとに 1 つの Computer Use セッションを駆動します。仮想ディスプレイとキオスクブラウザを持つ、隔離されたコンテナです。MCP サーバーは各呼び出しを loopback 経由で gateway に転送するだけで（`POST /api/internal/computer-use`、リクエストごとに署名）、コンテナを所有してすべてのチェックを行うのは gateway なので、gateway が動いている必要があります。`agent.toml [capabilities] computer_use = true` でない限り非表示です。
+
+| ツール | パラメータ | 備考 |
+|---|---|---|
+| `computer_session_start` | `task` 文字列、任意。`width` 整数 320–1920。`height` 整数 240–1200 | スタッフごとにセッションは 1 つ。結果には、上限、高リスクのアクションをチャットで確認できるか、`computer_navigate` が開けるサイトが載る |
+| `computer_screenshot` | なし | MCP の画像ブロック（PNG、マスク済み）に続いて、使用済みアクション数と残り時間のテキストブロック。全体がマスクされた画像は、その旨が理由（複数のウィンドウ、機密性のある、または読み取れない前面ウィンドウ、検出の失敗）と次の手順とともにテキストで報告される |
+| `computer_click` | `x`、`y` 整数（必須）。`button` 文字列 `left`/`right`。`double` 真偽値 | `double` は左ボタンのみ |
+| `computer_type` | `text` 文字列（必須）、1–2,000 文字 | 監査には文字数のみ記録される |
+| `computer_key` | `key` 文字列（必須）：英字、数字、`+`、`-`、`_` | 例：`Return`、`ctrl+s` |
+| `computer_scroll` | `x`、`y` 整数（必須）。`direction` 文字列 `up`/`down`（既定 `down`）。`amount` 整数 1–20（既定 3） | |
+| `computer_navigate` | `url` 文字列（必須） | `https://` のみ。ホストはスタッフの `[capabilities.computer_use_config] allowed_domains` に完全一致し、かつセッション開始時に解決できたもの。ポートはないか 443、ユーザー名・パスワードなし、2,000 バイト以下。許可リストがなければセッションにネットワークはなく、呼び出しは拒否される |
+| `computer_session_stop` | `session_id` 文字列、任意 | コンテナを削除する |
+
+整数と真偽値のパラメータは、数値の文字列と `"true"`/`"false"` の文字列も受け付けます。クリック、入力、キー、スクロール、ナビゲートはそれぞれ 1 アクションとして `max_actions`（既定 50）に数えられます。上限、承認と確認のルール、ネットワーク許可リストとその残存リスクは[ブラウザ自動化](../../features/ja-JP/08-browser-automation.md)にあります。
+
+### `create_agent` / `agent_remove` — 削除された名前は予約される
+
+`agent_remove` は社員を `~/.duduclaw/agents/_trash/` に移動し、社員が削除されたこと、管理者が復元できること、名前が予約されていることを答えます。パスは返しません。その後 `create_agent` は、ゴミ箱にエントリがある間、`org.toml` がディレクトリのない id を記録している間、またはゴミ箱を一覧できない間、すべての MCP caller についてその名前を拒否します。別の名前なら動作します。運用者はダッシュボードまたはターミナルから名前を再利用できます。非内部キーで HTTP 越しに呼ぶと、どちらのツールもそのキー自身の client id として動作します。詳細：[委譲の隔離](../../features/ja-JP/37-delegation-isolation.md#削除された社員の名前は予約されたままになる)。
 
 ## 非推奨エイリアスは引き続き掲載されます
 

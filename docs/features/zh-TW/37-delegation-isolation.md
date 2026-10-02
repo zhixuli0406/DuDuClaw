@@ -214,6 +214,24 @@ allow = [
 - 不能建立員工掛到主管底下（除非操作者就是那個主管或更上層）
 - Dashboard 建立員工不受限（人類操作）
 
+### 被移除員工的名稱仍被保留
+
+`agent_remove` 不會刪除員工：它把目錄移到 `~/.duduclaw/agents/_trash/<id>_<14 位數時間戳>`。如果沒有再加一條規則，主管可以先移除一個下屬，再用 `create_agent` 建立同名員工，新的席位會帶著那個名稱，卻沒有操作者替舊席位設下的任何控制（`CONTRACT.toml`、`[capabilities]` 限制、沙箱設定）。
+
+所以 AI 呼叫端不能建立名稱符合以下任一條件的員工：
+
+- `_trash/` 裡有對應項目（比對完整 id），
+- 目錄已不存在，但 `org.toml` 仍記錄這個名稱，或
+- 因為無法列出 `_trash/` 而無法檢查（fail closed）。
+
+每個 MCP 呼叫端都算 AI 呼叫端。CLI 的建立路徑（`duduclaw agent create`、pack 與 expert 安裝、`migrate-from`）在環境裡看到 agent 身分（`DUDUCLAW_AGENT_ID`／`DUDUCLAW_AGENT_TOKEN`）時套用同一條規則，`agent-file-guard` hook 也會擋下 Bash 的 `duduclaw agent create <保留的名稱>`。換一個名稱永遠可以。`agent_remove` 會告訴 AI 該員工已被移除、管理員可以還原、名稱已被保留；它不再回傳 trash 路徑或 `rm -rf` 提示。
+
+操作者不受限制：Dashboard 與坐在終端機前的人可以重用這個名稱。還原或清除被移除的員工，要手動處理 `~/.duduclaw/agents/_trash/<id>_<時間戳>`，Dashboard 沒有對應的控制項。拒絕會以 `agent_name_reserved` 記進 `security_audit.jsonl`（`requested_name`、`path_kind` = `mcp_create_agent`／`cli_scaffold`／`cli_bash_agent_create`、`reason` = `removed_to_trash`／`dangling_org_record`／`trash_unlistable`）；移除則記為 `agent_removed`（`subject`、`moved_to_trash`）。
+
+限制：Claude、Codex 與 Gemini 員工的身分放在 `.mcp.json`，不在 Bash 環境裡，所以 CLI 無法得知從它們的 Bash 執行的 `pack install`、`expert install` 或 `migrate-from` 是 AI session；Bash 的規則是啟發式判斷，真正的隔離是不給 agent Bash。已用員工自己的註冊資訊經真的 MCP server 實測（移除、同名重建被拒、換名字可建立、hook 的攔阻、稽核紀錄）；CLI 建立員工的那條路徑只有單元測試。
+
+透過 HTTP、使用非內部 MCP 金鑰呼叫的 `create_agent` 與 `agent_remove`，改以該金鑰自己的 client id 判定（以前會被當成伺服器行程的預設 agent），所以上面的子樹檢查會套用在真正的呼叫端上。
+
 ---
 
 ## 身分驗證（進階）

@@ -146,6 +146,8 @@ policy = "fixed_hierarchy"  # 派工策略（選哪個 AI 員工接任務）。�
 grounding_precheck_enabled = true  # 驗收前的證據落地預檢（見「證據落地預檢」）。預設 true
 two_stage_judge = true  # 驗收前先跑便宜的第一階段評估（見「兩段式驗收裁決」）。預設 true
 judge = "mav"           # 由誰做驗收裁決（見「換掉驗收判官」）。mav / external（evaluator_only / human_only 已棄用，v1.68.0 移除）。預設 mav
+judge_provider = "antigravity"      # 選填：讓判官跑在另一個 runtime 上（見「讓判官跑在另一個模型上」）。未設 ⇒ 預設的工具用 runtime
+judge_model = "gemini-3-pro-preview" # 選填：該 runtime 內的判官模型 id。未設 ⇒ 預設的工具用模型
 admission = "queue"     # 子代理（ephemeral spawn）撞並發上限時的處置，"queue" 或 "fail"。預設 queue（見下方「ephemeral spawn 准入排隊」）
 
 [task_forward_model]    # 任務層前瞻模型（見同名章節）。v1.54 起預設開啟
@@ -195,8 +197,113 @@ max_hop_depth = 5       # 委派鏈跨行程 re-spawn 的深度上限。預設 5
 | `fixed_hierarchy` | **預設**。派給任務原本的 `assigned_to`，不改動。零 LLM 成本、完全確定性。 |
 | `round_robin` | 依「任務類別」（有標籤取第一個標籤，否則取優先級）在員工名冊中輪詢分派。狀態僅存記憶體，重啟即從頭。 |
 | `llm_select` | 由工具用 LLM 從名冊挑最合適的員工。**失敗關閉**：輸出不在名冊內、或解析/LLM 失敗，一律退回 `fixed_hierarchy` 的結果，絕不派給捏造的員工。不硬編碼任何模型名（走設定的工具用 runtime）。 |
+| `role_team` | 選出的仍然是**AI 員工**，與 `fixed_hierarchy` 完全一樣。角色活在該員工**內部**，見下方「團隊回合」。這個設定的用途是讓「這個部署會組團隊」在日誌與遙測中看得到，它不會改變任務指派給誰。 |
 
 名冊 = `<home>/agents/` 下的員工目錄。名冊為空時，`round_robin` / `llm_select` 都退回原指派（不孤兒化）。改派會寫回任務的 `assigned_to`，讓 heartbeat 拉取與活動記錄一致。
+
+---
+
+## 團隊回合（Team-as-Agent）
+
+一位 AI 員工可以在自己內部把一輪目標當成小團隊來做：**規劃 → 執行 → 審核**，每個角色各用自己廠商的模型。自 v1.66 起 `[team] enabled` 預設為 **`true`**，但真正讓團隊成形的是在 `[team.roles]` 指名第二家廠商，與這個旗標無關。沒寫任何角色時，執行與審核兩個角色都會 cascade 到員工自己的模型，屬於同一個模型家族，去相關規則會拒絕這份規格：任務照舊走 Solo，安靜地，不留稽核列。完整說明見 [56-team-as-agent.md](../../features/zh-TW/56-team-as-agent.md)，這一節只談它對 goal loop 的影響。
+
+> 整條路徑（規劃者、執行者、審核者，以及在角色之間傳遞封包的 `team_handoff` 工具）都已落地，並已實際跑過一輪被判官接受的活體回合；這只是一次整合結果，不代表已量測出勝過 Solo。只在你看得到的部署上設定 `[team.roles]`。`enabled = false`（全域或單一員工）與 `gate = "always_solo"` 都是一行還原。
+
+### 你會看到什麼
+
+對話裡沒有任何新東西。員工用同一個聲音回答，進度出現在同一個看板，需要你的任務仍帶著六種暫停分類之一。內部則把一輪拆成三個階段，取代原本的一則喚醒訊息，只有執行者的最終成品會送到驗收判官，而判官就是**同一套**兩段式評估器加三面向判官團。團隊改變的是誰來做事，不改變誰來判定做完。
+
+團隊任務有兩種新的原因會落到你手上：
+
+| 暫停 | 發生了什麼 |
+|---|---|
+| 需要決策（`blocked_needs_decision`） | 規劃階段沒有交回任何子任務。迴圈不會從它的敘述文字去猜一份拆解，而是問你這個目標到底能不能拆，或是乾脆讓單一員工去跑。 |
+| 預算用盡（`budget_exhausted`） | 任務在**已經花掉一部分之後**用完了角色成員的 spawn 額度。它會交出自己做出的最佳一輪，與其他預算升級相同。預算連一輪降級後的編組都付不起的任務會改走 Solo，因為讓一件根本沒開始的工作被停住，比用一般方式做完更糟。 |
+
+### 閘門
+
+每一輪開始前，一組零 LLM 的規則（`crates/duduclaw-core/src/team_gate.rs`）決定走 Solo 還是 Team。它刻意偏向 Solo。
+
+1. **強制 Solo**：員工開了 `[container] sandbox_enabled = true`（排在所有模式之前檢查，`always_team` 也蓋不過，所以開了沙箱的員工不會組成團隊）、即時通道回合、仍在等你核准的 plan-first 目標、計畫裡含不可逆動作、剩餘預算不足三輪。
+2. **計算四個訊號**：*批量*（至少四個可獨立進行的工作項目，且沒有依賴樞紐）、*脈絡溢出*（估計的輸入超過模型的脈絡視窗）、*能力差距*（角色矩陣的差距達到或超過矩陣宣告的 MDE）、*長程*（至少三條驗收標準，且任務會產出檔案）。量不到的訊號永遠不會觸發。
+3. **判定**：三個以上訊號成團；零或一個走 Solo；剛好兩個是灰帶。
+
+灰帶時，迴圈會先跑一次規劃階段（這是任務本來就需要的一次呼叫），再套用同一套規則，這次的批量訊號改用規劃者實際寫出的子任務封包來量。計畫出現之前批量訊號沒有東西可量，所以灰帶一定是另外三個訊號中有兩個觸發；第二次判斷只有在計畫含四個以上、彼此之間沒有依賴樞紐的子任務時才成團，否則退回一般的單一員工回合。沒有規劃角色的團隊規格做不了第二次判斷，直接走 Solo。
+
+每次裁決都會以 `team_gate_decision` 寫入稽核日誌，附上觸發的訊號，所以一個部署的 Solo/Team 比例可以量測，不必靠印象。
+
+### 規格依任務凍結
+
+任務所用的團隊在建立時決定一次，存在任務上。之後對 `[team]` 的修改只影響下一個任務。規格驗證失敗（最常見的是審核者與執行者同一個模型家族）時完全不會成團：任務走 Solo，不會出現局部團隊。
+
+這個拒絕是否有聲音，取決於是誰要求組團隊。明寫了 `enabled = true` 的操作者，或設了角色但驗證失敗的操作者，會拿到以 `team_refused` 記錄的稽核列，附上角色與原因。完全沒動過 `[team]` 的部署只會得到一行 `debug!`，稽核日誌裡什麼都沒有：這個拒絕是 v1.66 翻轉預設值之後每個安裝的預設狀態，若在每個目標任務上都蓋一列，真正的拒絕反而會找不到。
+
+角色的 `model` 沒設時，也可以先從量測得到的能力矩陣（`<DUDUCLAW_HOME>` 下的 `role_model_matrix.toml`，由 `duduclaw eval --matrix` 寫出）取值，取不到才退回員工的 `[model] preferred`。只採計該角色自己 runtime 上的 `resolved` 格，平手不選任何模型，明確設定的模型永遠優先。
+
+### 預算與降級鏈
+
+```toml
+# config.toml
+[dispatch.team_budget]
+max_spawns_per_task = 12                 # 4 個角色 x 3 輪；下限鉗到 3
+max_turns_per_role  = 3
+degrade_order = ["utility", "verifier_second_pass", "executor_replica"]
+```
+
+一輪的計費是 `planner? + executors + verifier + repair?`。審核者是 utility 呼叫而不是 scaffold，但它會寫自己的帳本列，而預算計算的正是帶有 member id 的列，所以它和其他階段一樣佔一個額度。下限 3 就是規劃者 ＋ 執行者 ＋ 審核者。
+
+spawn 預算縮水時，能力依下列順序放棄：先放棄合成，再放棄審核者的一次修補，最後 fan-out 收斂成單一執行者，之後任務才以 `budget_exhausted` 升級。無法辨識的項目會被丟棄並記一筆警告；整份清單都不可用時沿用預設鏈。
+
+第一個團隊回合開始前，迴圈也會檢查一次 `[dispatch] ephemeral_max_active` 是否容納得了這份設定可能需要的並行角色成員數（`max_concurrent × iteration_cap × roles`，預設下是 45，而預設上限為 32），不足時警告並給出該調高的數字。這只是提醒，不會強制：超過上限後角色 spawn 會排隊、也可能過期，否則要到很晚才會以「某一輪莫名缺了審核者」的形式浮現。
+
+角色成員的 spawn 走自己的斷路器 bucket 與預算（`[dispatch_guard] role_team_max_in_window`，預設 60），所以組團隊中的員工絕不會觸發保護員工自己子代理 spawn 的斷路器。
+
+### 團隊回合的證據：員工**加上**它的成員
+
+一輪之後的所有環節，包括團隊自己的審核者、證據落地預檢，以及 MAV 判官團的 `<tool_activity>` 摘要，都讀取任務在認領到驗收這段時間窗內的工具呼叫稽核軌跡。Solo 回合時，這條軌跡屬於單一個 agent id。團隊回合則不然：工作由短命的角色成員以**它們自己的** id 完成，而員工自己的時間窗裡可能只有開啟這一輪的那一筆帳務呼叫。
+
+這樣讀的話，團隊回合看起來就像一個宣稱做了事、實際什麼都沒做的任務。活體第 3 輪正是如此，審核者與 settle 評估器都用「沒有工具活動支持檔案建立」駁回了確實完成的工作。所以團隊回合的證據集合是**員工 ∪ 該輪的角色成員**，成員取自 `role_turns.jsonl`，兩條路徑都一樣：
+
+- 團隊審核者的 `<tool_activity>` 區塊，以及
+- settle 路徑的證據落地預檢與判官摘要。
+
+重複的 id 會合併，沒有角色成員的任務不會多出任何 id，所以 Solo 任務看到的證據與以前逐位相同。時間窗不變，因此即使依輪次查詢退回整個任務（迴圈內的進行中迭代計數與 settle 路徑的修訂計數是分開的，跨 gateway 重啟後可能分歧），其他輪的成員也不會貢獻任何內容。
+
+角色成員也在**員工的**工作區工作，而不是在它們自己的一次性 scaffold 裡，所以成員寫出的檔案在審核者詢問時仍然存在。目前會寫檔的角色只限 claude 與 codex，見 [56-team-as-agent.md](../../features/zh-TW/56-team-as-agent.md#成員在員工的工作區運作而非自己的骨架目錄)。
+
+把 id 取聯集有其必要，但還不夠。活體第 8 輪之後又補上兩個證據來源，兩者都由團隊審核者與 settle 路徑共用，因此兩邊不會對同一輪各說各話：
+
+- **原生工具工作會被持久化。** 透過原生工具工作的成員（codex 的 `shell`、Claude 的 `Write`）不會發出 MCP 呼叫，所以在此之前它的工作在稽核軌跡裡完全沒有痕跡，第 8 輪就因此駁回了三個確實存在的檔案。現在每個原生工具事件都會以成員的 id 寫成一列 `tool_calls.jsonl`，帶著遮罩後的呼叫輸入與結果文字，以及 `source = "native"` 和產生它的 runtime/模型。自我回音類工具的輸出維持被抑制，與 MCP writer 的做法一致，所以角色永遠無法拿自己回音的封包來證明自己的宣稱。
+- **`<artifact_receipts>`**：封包宣告的每個 `artifacts[].path` 都會對員工的工作區做 stat 與雜湊，結果（`<path> <bytes>B sha256=<hex> exists|missing|mismatch`）同時成為 prompt 區塊與一列 `artifact_receipt` 稽核。宣告了路徑但沒給雜湊時，雜湊由實際位元組補上；宣告的雜湊與實際**不一致**時，保留宣告值並記為 `mismatch`，同時產生 `team_packet_artifact_mismatch` 事件，讓調包留得下痕跡，不會被悄悄校正。只有 `exists` 算確認。
+
+沒有宣告任何產物的任務不會多出區塊，沒有原生工具成員的 Solo 回合看到的內容與以前完全相同。
+
+### 稽核事件與各角色紀錄
+
+| 事件 | 意義 |
+|---|---|
+| `team_gate_decision` | Solo / Team / 灰帶，附觸發的訊號 |
+| `team_refused` | 已啟用的規格驗證失敗，任務走 Solo |
+| `team_round_started` | 三階段回合開始，附角色與任何降級步驟 |
+| `team_member_spawned` | 建立了一個角色成員（角色、runtime、模型） |
+| `team_stage_failed` | 某個階段沒有產出下一階段需要的東西，或根本無法執行，附 `role`、`runtime`、`model` 與錯誤 |
+| `team_handoff` | 某個角色歸檔了一個封包（leg、輪次、大小、對象、檔案） |
+| `team_packet_skipped` | 封包檔無法讀取、標記錯誤或無效而被忽略 |
+| `team_packet_artifact_refused` | 封包宣告的產物路徑解析到員工工作區之外 |
+| `team_packet_fidelity_corrected` | 封包自行宣告的證據等級與實際觀察不符，已被覆寫 |
+
+### 封包放在哪裡
+
+每個階段都透過呼叫 `team_handoff` 交接，路徑由工具推導，不由呼叫者提供：
+
+```
+~/.duduclaw/team_packets/<task_id>/r<round>/planner-to-executor.json
+~/.duduclaw/team_packets/<task_id>/r<round>/planner-to-executor.01.json   … up to .99
+```
+
+規劃者把目標拆成四個子任務時，會在同一個 leg 上寫四個封包，所以**新的**封包佔下一個編號槽，重新歸檔**同一個** `packet_id` 則覆寫它自己的檔案（逾時後重試不會讓子任務重複）。下一階段依數字順序讀回這些槽：先是標準檔，再是 `.01`、`.02`……。封包自己的 `from_role` / `to_role` / 任務 / 輪次與所在檔案不符，或驗證失敗時，會被略過並以 `team_packet_skipped` 稽核；一個壞檔不會讓該階段失去其餘封包。
+
+每個階段也會在 `<home>/role_turns.jsonl` 追加一列：角色、runtime、模型、effort、它產出的封包、觀察的證據等級、結束方式。權限、鎖與輪替方式與 `tool_calls.jsonl` 相同。
 
 ---
 
@@ -274,7 +381,7 @@ AI 員工回報完成、任務進入驗收時，在呼叫驗收判官之前會�
 開啟後，goal loop 在每次派工前會依過往同類任務的統計先「預測」這次執行
 大概會如何（會不會失敗、大概動用哪些工具類別），執行結束後把預測與實際
 觀察比對並記錄成轉移，讓系統對「做這類事會發生什麼」累積出任務層的世界
-模型。所有 runtime（claude / codex / gemini / openai-compat）通用：
+模型。每個 runtime 都會跑這套流程，但看得到多少，取決於該 runtime 有沒有把原生工具事件餵給收集器。Claude（派工的 stream-json 路徑）、Codex、Gemini CLI（v1.67.0 起棄用，v1.69.0 移除）、Antigravity 與 OpenAI 相容的 agent 會記錄原生工具事件，觀察可以達到 `Full`。Grok 與七個通用 print-mode CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）沒有接收集器，觀察只會是 `McpOnly`（只靠 `tool_calls.jsonl`），該輪在那個檔案裡沒有紀錄時則是 `None`。流程如下：
 
 - **預測分層退化**：有同類統計用統計、沒有就用整體邊際、再沒有用先驗
   預設值，冷啟動不花任何 LLM 費用。
@@ -320,9 +427,60 @@ AI 員工回報完成、任務進入 `review` 之後，不是每次都直接燒�
 | `evaluator_only` | 只跑第一階段評估器，`candidate_complete` 直接判過 | **已棄用，v1.68.0 移除。** 改用 `mav`：`two_stage_judge` 本來就先跑便宜的評估器，只有完成候選才付判官團的錢 |
 | `human_only` | 沒有機器裁決，每個 `review` 任務都轉 `needs_human` | **已棄用，v1.68.0 移除。** 改用 `mav` ＋ 每 agent 的 `[capabilities] autonomy_level` / `approval_required_tools` |
 
-四個值仍然全部解析得到，已經設定棄用模式的部署行為完全不變——只會每個行程記一次警告；若該值是從儀表板寫入的，另記一筆 `judge_mode_deprecated` 審計事件。儀表板只提供 `mav` 與 `external`，但已存的舊值會照樣顯示（標「已棄用」），不會被偷偷換掉。詳見 [deprecations.md](deprecations.md)。
+四個值仍然全部解析得到，已經設定棄用模式的部署行為完全不變，只會每個行程記一次警告；若該值是從儀表板寫入的，另記一筆 `judge_mode_deprecated` 審計事件。儀表板只提供 `mav` 與 `external`，但已存的舊值會照樣顯示（標「已棄用」），不會被偷偷換掉。詳見 [deprecations.md](deprecations.md)。
 
 寫錯值不會靜默生效：gateway 會警告並回退 `mav`（驗收最嚴的一個）。這個設定每次裁決時重讀，跟 `two_stage_judge` 一樣改完即生效，不必重啟。
+
+### 讓判官跑在另一個模型上
+
+與工作者同一個模型家族的判官，往往會原諒該家族自己才會犯的錯。它和工作者有相同的盲點，所以同一家廠商給的第二意見，價值比看起來低（arXiv:2607.13918）。兩個選填的鍵可以把驗收判官，連同便宜的第一階段評估器，一起移到另一個 runtime 與模型上：
+
+```toml
+[dispatch]
+judge_provider = "antigravity"        # runtime id：claude, codex, antigravity, grok, openai_compat, …（gemini 已棄用）
+judge_model = "gemini-3-pro-preview"   # 該 runtime 內的模型 id
+```
+
+兩個鍵都是選填，彼此獨立。沒設時，判官沿用一般的工具用模型（`[runtime] utility_provider` / `utility_model`），這正是每個既有部署目前的行為，所以省略它們不會改變任何事。
+
+**範圍：只有全域。** 沒有每個 agent 各自的版本。每位 AI 員工的工作都由同一個設定的判官來判。
+
+設定無法被採用時會發生什麼：下表四種情況（前三種在任何東西啟動前就攔下，第四種是判官執行中失敗）判官都會退回預設的工具用模型並繼續運作，因為路由偏好絕不能卡住一次裁決：
+
+| 情況 | 行為 |
+|---|---|
+| `judge_model` 指名另一家廠商的模型，但 `judge_provider` 沒設 | **拒絕，不猜。** 在判官 runtime 解析為 Claude 時，只設 `judge_model = "gemini-…"` 是設定錯誤，不是要系統去推斷 runtime 的指示。覆寫會在任何東西被 spawn 之前就丟棄（所以不花任何成本），並把這次丟棄以 `judge_seam_degraded` 寫入 `security_audit.jsonl`。把 runtime 也寫上就能運作。 |
+| `judge_provider` 不是這個 build 認得的 runtime id | **整個**覆寫被丟棄並警告，訊息列出有效的 id。打錯字絕不會悄悄把判官送到別的後端。 |
+| `judge_provider` 的 CLI 或後端沒有安裝在這台主機上 | 在 spawn 之前偵測到，覆寫被丟棄，並以同樣方式稽核。 |
+| 判官 runtime 可用、被使用，之後**在執行中失敗**（參數錯誤、驗證失敗、崩潰） | 判官會在預設的工具用模型上重跑一次，失敗以 `judge_seam_degraded` 稽核，帶 `reason: "hinted_runtime_failed"`，以及 provider、模型、底層錯誤，和最後實際完成判決的備援模型。關鍵是失敗的判官**不會**被一般的跨 runtime failover 救回：路由到另一個家族的呼叫會停用跨家族 failover 來執行，所以它永遠不會被工作者自己的家族悄悄接手回答。同家族 failover（Claude 的某一級換到另一級）仍照常運作。 |
+
+兩個稽核事件讓這項設定的實際效果看得見，而不是被假定，兩者都寫入 `security_audit.jsonl`：
+
+- `model_routed`：覆寫生效，把判官移出了工作者自己的模型。帶 `{slot: "judge", from: <worker model>, to: <judge model>, provider, reason: "dispatch.judge_model"}`。
+- `judge_same_family`：工作者與判官其實屬於同一個模型家族，所以你並沒有拿到去相關的第二意見。這是**警告，不是拒絕**：裁決照常進行。每個（AI 員工, 判官模型）組合在每次 gateway 執行中只記一次，所以一個很長的目標迴圈只會產生一行，不會每輪一行。
+
+與 `judge` 本身一樣，兩個鍵都在每次裁決時重讀，不必重啟 gateway。
+
+#### 需要結構化輸出的判官
+
+Claude 會遵守「只回覆一個 JSON 物件」。Codex 不一定會，而團隊功能的活體第 8 輪證明這會讓一次裁決白費：設 `judge_provider = "codex"` 時，第一階段評估器與 MAV 判官團都用散文回答，兩個解析器都以 fail-closed 拒絕（「evaluator reply has no string `decision` field」）。解析器是對的，自動接受垃圾輸出正是判官解析器絕不能做的事，但一個在結構上無法被解析的判官，就是一個不能用的 seam。
+
+所以每個裁決階段現在都會公布**它自己的解析器**所要求的 JSON schema，能強制回覆格式的 runtime 就會照做：
+
+| 階段 | Schema |
+|---|---|
+| 第一階段評估器 | `{decision: "continue"｜"candidate_complete"｜"blocked", evidence, next_step}`（`blocker_key` 可宣告但非必填，解析器在非 blocked 判定上會拒絕它） |
+| MAV 判官團 | 每個啟用面向各一個 `{pass, reason}` 物件，全部必填；面向集合隨目標難度而定，與 prompt 和解析器的做法完全一致 |
+
+目前只有 `codex` 接上了：schema 寫到暫存檔，以 `codex exec --output-schema <FILE>` 傳入。其他 runtime 只在 `debug` 層級記錄這個請求並忽略。**schema 是偏好，不是前提條件**：後端無法約束輸出時不會有任何東西失敗，而且 schema 檔案無法備妥時，呼叫會不帶這個旗標照跑，不會因此不跑。沒有任何設定鍵：schema 由解析器的契約推導，所以解析器變動與 schema 變動會一起移動。
+
+#### 判官的 effort
+
+判官 hint 除了 provider 與 model，也可以帶推理 **effort**。內部的 `UtilityModelHint` 有三個彼此獨立的部分：`provider`、`model`、`effort`，所以呼叫端可以把判官移到另一家廠商、改變它思考的深度，或兩者都做。
+
+Effort 刻意**不**算進 hint 的「是否為空」檢查：這裡的空代表「解析到同一組 `(provider, model)` 規格」，模型家族驗證關心的正是這件事。Effort 改變的是模型想得多用力，不影響由哪個模型回答。
+
+**目前還沒有 `[dispatch] judge_effort` 鍵**，設定檔這一半是刻意留作後續。目前沒設判官 effort 時，會退回被評判的 agent 自己 `agent.toml [model] effort`（各 runtime 的旗標對照與鉗制表見 [Effort](../../features/zh-TW/13-multi-runtime.md#effort)），對多數設定而言這就是你要的行為：判官思考的力度與它所評判的 agent 相同。
 
 ### 外部判官（`external`）
 

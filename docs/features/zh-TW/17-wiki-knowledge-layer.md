@@ -61,7 +61,7 @@ trust: 0.1   — Speculative, draft
 
 ## 自動注入流程
 
-注入發生在組裝 system prompt 時，分布在三個地方，因此四種 runtime（Claude／Codex／Gemini／OpenAI）都能得到相同的知識：
+注入發生在組裝 system prompt 時，分布在三個地方，因此每一種 runtime（Claude、Codex、Antigravity、Grok、OpenAI 相容，以及 catalog 裡的其他 runtime）都能得到相同的知識：
 
 ```
 User sends message
@@ -375,7 +375,7 @@ you need historical context or deep references.
 
 ### Runtime 無關
 
-Claude、Codex、Gemini 與 OpenAI 相容 runtime 都看到相同的 wiki，因為注入發生在 runtime 邊界*之前*，在 `build_system_prompt` 中。
+每一種 runtime 都看到相同的 wiki，因為注入發生在 runtime 邊界*之前*，在 `build_system_prompt` 中。
 
 ### 閉合累積迴圈
 

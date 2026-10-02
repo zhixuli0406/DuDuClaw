@@ -2,7 +2,7 @@
 
 > **狀態：已歸檔** — 以下所有 25 項問題均已在 v0.5.0–v0.5.1 (Phase 1–6) 中修復。
 > **2026-09-29 註記**：本檔引用的 `python/duduclaw/sdk/chat.py`、`sdk/health.py`、`channels/base.py`（C-6／H-8／H-9）已於 2026-09-29 功能盤點（S12 Python 縮編）移除，歷史紀錄保留原文不改。
-> 當前版本：v0.6.0 — 活躍任務追蹤見 [Phase2-TODO.md](Phase2-TODO.md)
+> 當前版本：v0.6.0 — 活躍任務追蹤見 Phase2-TODO.md
 >
 > 原始記錄日期：2026-03-16
 > 原始版本：v0.4.0
@@ -274,6 +274,7 @@ fn send_message(agent_id: &str, payload: &str) -> PyResult<String> {
 - **檔案**：`crates/duduclaw-gateway/src/auth.rs:6–7`
 - **問題**：`AuthManager` 結構上有 Ed25519 challenge-response 的設計，但實際邏輯標記為 Phase 5
 - **現況**：Dashboard 對外無任何認證保護
+- **2026-10-01 更新（已解決）**：Dashboard 認證早已改為 JWT 帳號登入（`duduclaw-auth`）或 admin token；從未能啟用的 Ed25519 challenge-response 路徑已從 `auth.rs` 與 handshake 移除
 
 ---
 

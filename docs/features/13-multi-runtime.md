@@ -1,6 +1,6 @@
 # Multi-Runtime Agent Execution
 
-> One platform, twelve AI backends — Claude, Codex, Gemini, Antigravity, Grok, Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode, and any OpenAI-compatible endpoint.
+> One platform, thirteen runtime ids: twelve CLI backends (Claude, Codex, Gemini, Antigravity, Grok, Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) plus `openai_compat`, which talks HTTP to any OpenAI-compatible endpoint.
 
 ---
 
@@ -41,8 +41,8 @@ unloggable-into.
 |---|---|---|---|---|---|---|
 | Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token` (paste-back) | `~/.claude/.credentials.json` |
 | OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login` (localhost callback) | `~/.codex/auth.json` |
-| Gemini CLI | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login` (localhost callback) | `~/.gemini/oauth_creds.json` |
-| Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json (v1.2.10) | Google OAuth | — |
+| Gemini CLI (deprecated in v1.67.0, removed in v1.69.0) | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login` (localhost callback) | `~/.gemini/oauth_creds.json` |
+| Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json (v1.2.10) | Google sign-in via `agy` in a terminal (no `login` subcommand), or API-key mode | OS keyring |
 | Grok Build | `grok` | `x.ai/cli/install.sh` (manual) | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
 | Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | none (API key only) | `~/.qwen/.env` |
 | Kimi Code | `kimi` | npm `@moonshot-ai/kimi-code` | `-p <prompt> --output-format stream-json` | jsonl | `kimi login` (device code) | `~/.kimi-code/credentials/` |
@@ -82,7 +82,8 @@ the risk" acknowledgement before starting a subscription login.
 
 ### How Backends Are Driven
 
-Five backends have bespoke runtime modules, because each has real per-vendor
+Five CLI backends (`claude`, `codex`, `gemini`, `antigravity`, `grok`;
+`BESPOKE_RUNTIME_IDS` in `runtime/mod.rs`) have bespoke runtime modules, because each has real per-vendor
 wiring that is not shareable — account rotation (Claude), MCP config injection
 in the CLI's own format, capability→sandbox-flag translation, PTY recovery for
 empty-output failures. Everything else is driven by **one** generic print-mode
@@ -90,9 +91,15 @@ runtime (`runtime/generic_cli.rs`) built straight from the catalog entry: spawn
 the binary with the templated argv, deliver the prompt as an argument or on
 stdin, parse text / JSON / JSONL back to the final assistant text, and map a
 non-zero exit or an auth-required marker to a typed failure the failover chain
-understands.
+understands. The seven other CLIs (Qwen Code, Kimi Code, GitHub Copilot CLI,
+Kiro, Cursor, Mistral Vibe, OpenCode) go through that generic runtime.
+`openai_compat` is not a CLI: it has its own HTTP module
+(`runtime/openai_compat.rs`). That makes six hand-written modules in total.
 
 ### The Original Four Backends
+
+These are the four backends DuDuClaw shipped first. Antigravity and Grok, the
+other two bespoke CLI modules, are covered in their own sections further down.
 
 **Claude Runtime** — Calls the Claude Code CLI (`claude`) with JSONL streaming output. This is the most feature-rich backend, with native MCP tool support, bash execution, web search, and file operations built in.
 
@@ -125,6 +132,8 @@ Extract response
 ```
 
 **Gemini Runtime** — Calls the Google Gemini CLI with `--output-format stream-json` for structured output.
+
+> **Deprecated in v1.67.0, removed in v1.69.0.** Google stopped serving individual (free, AI Pro, AI Ultra) accounts through Gemini CLI on 2026-06-18; use the Antigravity runtime instead. It keeps working until removal. The Gemini API provider is not affected. Migration steps: [Deprecations](../guides/deprecations.md#gemini-cli-runtime).
 
 ```
 Agent config: runtime = "gemini"
@@ -184,7 +193,7 @@ Agents can specify their preferred runtime in `agent.toml`:
 ```toml
 [runtime]
 preferred = "claude"    # Primary backend
-fallback = "gemini"     # If primary is unavailable
+fallback = "antigravity"     # If primary is unavailable
 ```
 
 If no preference is set, the registry uses the first available backend.
@@ -196,7 +205,7 @@ Different agents can use different backends simultaneously:
 ```
 Agent "dudu" (customer support)  → Claude (best reasoning)
 Agent "coder" (code generation)  → Codex (optimized for code)
-Agent "analyst" (data analysis)  → Gemini (large context window)
+Agent "analyst" (data analysis)  → Antigravity
 Agent "local" (privacy-sensitive) → OpenAI-compat (local endpoint)
 ```
 
@@ -283,10 +292,10 @@ Claude runtime: rate-limited (cooldown: 2min)
      |
      v
 FailoverManager checks agent config:
-  fallback = "gemini"
+  fallback = "antigravity"
      |
      v
-Route to Gemini runtime
+Route to Antigravity runtime
      |
      v
 When Claude cools down → restore primary routing
@@ -354,7 +363,10 @@ means "may not change anything", tools included.
 
 A Codex spawn registers the duduclaw MCP server through per-invocation `-c`
 config overrides, and two of the values that registration carries are secrets:
-`DUDUCLAW_MCP_API_KEY` and `DUDUCLAW_AGENT_TOKEN`.
+`DUDUCLAW_MCP_API_KEY` and `DUDUCLAW_AGENT_TOKEN`. The registration (and
+everything below) happens on every Codex spawn, ReadOnly included: at ReadOnly
+the server is registered, but Codex auto-rejects each call to it, as the table
+above says.
 
 **Why the credential cannot just live in the environment.** Live-probed
 2026-09-28 and confirmed against the Codex source: Codex `env_clear()`s every
@@ -436,6 +448,21 @@ Two backend-specific consequences, stated rather than left to be discovered:
   The command/args halves are identical between members and the per-process
   identity is what the MCP child actually authenticates with, so the blast
   radius is the declared block only.
+
+### Antigravity authentication and MCP tools (2026-10-01)
+
+`agy` has no `login` subcommand, so the dashboard offers no one-click sign-in for it. Two ways to authenticate:
+
+- **Google sign-in**: run `agy` in a terminal on the host running DuDuClaw and follow the prompts. The credentials live in the OS keyring, so this does not work in a container or on a remote host with no keyring or browser.
+- **API-key mode**: set `[antigravity] auth = "api_key"` in `config.toml` and supply a Gemini API key, either as a `gemini` provider account or in the `GEMINI_API_KEY` environment variable. The gateway then writes `modelProvider` into agy's settings itself. `auth = "login"` switches back to Google sign-in and removes that `modelProvider` entry. If `auth` has never been set, the gateway leaves `modelProvider` alone and passes no Gemini key, so agy keeps whatever route it was already on.
+
+There is no `ANTIGRAVITY_API_KEY` variable. The platform's MCP tools are registered per agent workspace in `<agent workspace>/.agents/mcp_config.json`.
+
+Three things to know before switching to API-key mode:
+
+- The setting applies to the whole OS user. agy keeps `modelProvider` in its user-level settings file, so your own interactive `agy` under the same account moves to the API-key route too.
+- Two gateways running under one OS user with different `auth` values overwrite each other's value.
+- To go back to Google sign-in after using `api_key`, set `auth = "login"` explicitly. Removing the `auth` line is not enough: with no setting the gateway does not touch `modelProvider`, so the `"gemini"` value written earlier stays in agy's settings, and the gateway only logs a reminder. In `login` mode the gateway does not pass `GEMINI_API_KEY` / `GOOGLE_API_KEY` to agy or the commands it runs; in `api_key` mode the agent's shell can read the key (agy has to receive it through the environment).
 
 ### Antigravity stream parsing degrades instead of failing (2026-09-28)
 

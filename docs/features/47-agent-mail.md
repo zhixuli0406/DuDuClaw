@@ -167,6 +167,13 @@ chart, not a flat namespace.
 - **Trigger-on-arrival defaults off.** Waking an agent on arrival is a spend
   decision, so it's opt-in per home (`[mail] auto_trigger`), and even when
   on, a flagged arrival never triggers.
+- **A sandboxed employee is never woken by mail.** For an employee with
+  `agent.toml [container] sandbox_enabled = true` the arrival trigger is
+  skipped: the triggered run depends on platform tools the
+  [task sandbox](../guides/task-sandbox.md) does not provide, and it handles
+  untrusted inbound content. The mail stays in the inbox for a person; nothing
+  runs. The gateway writes the audit event `task_sandbox_not_applied`
+  (`path = "mail"`, `action = "skipped"`) once per employee per process.
 - **Allowlists are exact/domain matches, never substrings.** `allowed_senders`
   / `allowed_recipients` entries are either a full address or an
   `@domain.com` prefix; a lookalike domain that merely *contains* an allowed
