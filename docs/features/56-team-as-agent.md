@@ -463,7 +463,7 @@ Round 8 finally ran the whole pipeline on real backends: planner on Claude, exec
 
 A further thing was structural rather than a bug: both the verifier and the acceptance path read tool evidence **scoped to one agent id**. A team's work is done by ephemeral members under their own ids, so the employee's audit window was empty and "no tool activity" was the honest reading of what they were shown. The evidence set for a team round is now the employee ∪ that round's members, on both paths; a non-team task adds no ids and sees byte-identical evidence.
 
-Rounds 9–13 exposed path interpretation and stale second-instance state during settle. The fixes are recorded in the [design's live-test log](../../commercial/docs/DESIGN-team-as-agent-2026-09.md#43-p1-活體驗證紀錄). Round 14 passed the existing acceptance judge in one team round; it remains a single integration result, not a comparative quality measurement.
+Rounds 9–13 exposed path interpretation and stale second-instance state during settle. The fixes are recorded in the design's internal live-test log, which is not published. Round 14 passed the existing acceptance judge in one team round; it remains a single integration result, not a comparative quality measurement.
 
 ## Which model for which role (P2)
 

@@ -2,7 +2,7 @@
   "name": "duduclaw",
   "version": "1.67.0",
   "mcpName": "io.github.zhixuli0406/duduclaw",
-  "description": "Open-source AI Agent platform unifying Claude / Codex / Gemini CLIs. Multi-LLM routing, 200+ MCP tools, 9+ messaging channels. Rust + Python.",
+  "description": "Open-source AI agent platform for Claude Code, Codex, Antigravity and other AI CLIs: 249 MCP tools, 11 messaging channels, one Rust binary.",
   "license": "Apache-2.0",
   "author": {
     "name": "Louis Li",

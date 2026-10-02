@@ -47,7 +47,7 @@ MCP bridge         ─┘                                   1. イベント一�
 | **ActivityNew** | `activity_new` | Activity Feed に新しい項目が投稿される | activity オブジェクト |
 | **ChannelMessage** | `channel_message` | channel にメッセージが届く | `channel`、`agent_id`、`text` |
 | **AgentIdle** | `agent_idle` | ある agent がアイドルになる | `agent_id`、`idle_minutes` |
-| **CronTick** | `cron_tick` | スケジューラが周期的 tick を発する | `now` |
+| **CronTick** | `cron_tick` | 発火しません。型はありますが送出するコードがありません。v1.67.1 から新しいルールでは使えません（後述） | `now` |
 | **RunAtRisk** | `run_at_risk` | 予測が実行中タスクの失敗を見込む | `agent_id`、`session_id`、`score`、`level`、`reasons` |
 | **OsFileEvent** | `os_file` | agent の `[os_watch]` がファイル変更を検知 | `agent_id`、`path`、`kind`（created / modified / removed / renamed）、`file_name`、`extension` |
 | **OsFrontmostEvent** | `os_frontmost` | 前面のアプリまたはウィンドウタイトルが変わる | `agent_id`、`app`、`window_title`、`prev_app` |
@@ -55,7 +55,7 @@ MCP bridge         ─┘                                   1. イベント一�
 | **SecurityEvent** | `security_event` | warning / critical レベルの監査イベント、またはセキュリティ態勢の変化 | `severity`、`event_type`、`agent_id`、`source` |
 | **OdooEvent** | `odoo_event` | Odoo のポーリングまたは `POST /webhook/odoo` が ERP の変更を報告 | `event_type`、`model`、`record_id`、`record`（トップレベルのスカラー値も平坦化） |
 
-ルールは関心のある `trigger_event` を宣言するため、`channel_message` ルールが `cron_tick` を目にすることはありません。この 13 の名前は `sequence` ルールの `first` / `then` に使える合法なイベントでもあります。エンジンには内部イベント `cep_trigger` もあり、シーケンスマッチャーが一致したルールを発火させるために出しますが、`trigger_event` には使えません。
+ルールは関心のある `trigger_event` を宣言するため、`channel_message` ルールが `task_created` を目にすることはありません。`autopilot.create` は `cron_tick` 以外の 12 の名前を受け付けます。`autopilot.update` は保存済みルールのトリガーがすでに `cron_tick` の場合に限り受け付けるため、そのルールは保存し直せます。他のルールを `cron_tick` に変更すると、作成時と同じメッセージで拒否されます。定時に実行したい作業はスケジューラ（「例行工作」ページ、または `schedule` 付きの `tasks_create`）を使ってください。13 の名前はすべて引き続き `sequence` ルールの `first` / `then` に使えます。エンジンには内部イベント `cep_trigger` もあり、シーケンスマッチャーが一致したルールを発火させるために出しますが、`trigger_event` には使えません。
 
 ---
 
@@ -81,6 +81,24 @@ MCP bridge         ─┘                                   1. イベント一�
 | `contains` | 文字列が部分文字列を含む、または配列が値を含む |
 
 **存在しない**フィールドはいかなる比較も満たしません——`eq null` を含めて。これは意図的です：存在しないフィールドが `eq null` に一致することを許したために、あるルールがすべてのイベントに対して大量発火したことがありました。欠落は不一致、例外なし。
+
+### 条件なし
+
+条件のないルールは、トリガーイベントが発生するたびに実行されます。「条件なし」とは、作成時に `conditions` を渡さない場合、`null`、`{}`、`{ "all": [] }` のいずれかです。`{ "any": [] }` は保存できますが、一致することはありません。
+
+**v1.67.1 の動作変更。** `autopilot.create` は `conditions` がないと `{}` として保存します。v1.67.1 より前のエンジンは `{}` をフィールドが空の単一条件として扱ったため、そうしたルールは一度も発火しませんでした。v1.67.1 からは、トリガーイベントが発生するたびに発火します。`null` と `{ "all": [] }` は以前からすべてに一致していました。発火し始める有効なルールを探すには、gateway のホストで次を実行し、意図しないものは無効化または編集してください。
+
+```bash
+sqlite3 ~/.duduclaw/autopilot.db \
+  "SELECT id, name, trigger_event FROM autopilot_rules
+   WHERE enabled = 1 AND sequence IS NULL AND trim(conditions) = '{}';"
+```
+
+ダッシュボードで編集ボタンからそのルールを開くと、「条件なし：トリガーが起きるたびに実行されます。」と表示されます。
+
+### 書き込み時の検証
+
+`autopilot.create`、`autopilot.update`（および帰納されたルールの有効化）は、保存前に条件ツリーを検証します。各ノードはオブジェクトでなければなりません。値が条件の配列である `all` / `any` グループか、空でない文字列の `field` を持つ単一条件です。`op` は省略可能（省略時は `eq`）で、書く場合は上の表の演算子に限ります。ネストは 16 階層までです。拒否メッセージには問題のあるノードのパスが入ります（例：`conditions.all[1]: a condition needs a non-empty "field" (or use an "all"/"any" group)`）。v1.67.1 より前は、こうした条件は保存され、一致することはありませんでした。
 
 ---
 
@@ -208,7 +226,17 @@ autopilot.remove  ── ルールを削除
 autopilot.history ── 実行ログ
 ```
 
-すべての `create` / `update` は**書き込み時に** `trigger_event` と `action` 構造を検証します——不正なルールは後で `autopilot_history` で静かに失敗するのではなく、即座に拒否されます。すべての実行（成功、エラー、またはブレーカー遷移）はステータスとエラー文脈を持つ行を追記します。
+すべての `create` / `update` は**書き込み時に** `trigger_event`、`conditions` ツリー、`action` 構造を検証します——不正なルールは後で `autopilot_history` で静かに失敗するのではなく、即座に拒否されます。すべての実行（成功、エラー、またはブレーカー遷移）はステータスとエラー文脈を持つ行を追記します。
+
+### ダッシュボードのルールフォーム
+
+「設定 → オートパイロット」でルールを作成・編集します。v1.67.1 より前、このフォームは動作に `agent_id` と `prompt_template` を送っていましたが、サーバーが要求するのは `target_agent` と `prompt` です。存在しない `schedule` トリガーも選択肢にあり、書き込む `from_status` / `idle_minutes` / `cron` もフィールド／演算子／値の条件形式ではありませんでした。サーバーは毎回保存を拒否したため、ダッシュボードからはルールを1件も作れませんでした。v1.67.1 からは次のとおりです。
+
+- トリガーの一覧は `autopilot.create` が受け付ける 12 のイベントで、`tick`（監視ソースに新しいデータが来たとき）と `odoo_event`（Odoo のデータが変わったとき）も含みます。保存済みルールのトリガーが一覧にない場合（例：`cron_tick`）、その値を表示したまま保持します。
+- 条件は「フィールド／比較方法／比較値」の行のリストで、「すべて一致」（`all`）か「いずれか一致」（`any`）でまとめます。トリガーごとにフィールド名の候補が出ますが、任意の名前を入力できます。`tick` と `odoo_event` のフィールド名は監視ソースや Odoo レコード側で決まり、フォームにもその旨が表示されます。`gt` / `gte` / `lt` / `lte` の比較値は数値が必要です。`in` / `not_in` はカンマ区切りで複数の値を書きます。行が1つもないとフォームは `{ "all": [] }` を保存し、イベントのたびに実行されます。
+- 動作は `delegate`、`notify`、`run_skill` で、必須フィールドは上の表のとおりです。`notify` では telegram、line、discord、slack、whatsapp、feishu、googlechat、teams、wecom、dingtalk を選べます。
+- 各ルールに編集ボタンがあり、編集時は変更したフィールドだけを送ります。フラットな一覧にできない条件、イベントシーケンスのルール、上記3種以外の動作はロック表示になり、保存済みの内容をそのまま保持します。フォームが扱わない動作のキー（`screen`、`context_ticks` など）も保持されます。新しいルールにはフォームから追加できないため、`autopilot.create` / `autopilot.update` を使ってください。
+- 保存が拒否されると、ダイアログ内にサーバーのメッセージが表示されます。
 
 ---
 

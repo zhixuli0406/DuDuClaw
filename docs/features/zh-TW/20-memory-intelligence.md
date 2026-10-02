@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_valid
 
 ### 自動衝突解決
 
-當 `store_temporal(entry, TemporalMeta)` 同時帶有 `subject` 與 `predicate` 時，引擎會把 `(agent_id, subject, predicate)` 視為一個事實識別。任何具有相同三元組、目前仍有效的資料列，會在插入新列之前被關閉：
+當 `store_temporal(entry, TemporalMeta)` 同時帶有 `subject` 與 `predicate` 時，引擎會把 `(agent_id, subject, predicate)` 視為一個事實識別。任何具有相同三元組、目前仍有效的資料列，會在插入新列之前被關閉；目前事實的可信度較高時例外，這時寫入會被拒絕（見[下文](#取代時的可信度檢查v1671)）：
 
 ```
 store_temporal(agent="dudu",
@@ -122,14 +122,61 @@ INSERT 新列：  supersedes = <舊 id>
 
 `invalidate_by_origin(agent, origin, since)`（MCP `memory_invalidate_by_origin`，scope `admin`）是投毒來源的補救閥門：它會讓某個**精確** `origin` 的所有現行有效事實過期（只過期、不刪除；比對採等值，絕不用子字串），並可選擇只限於 `since` 之後（含）得知的事實。凡 `derived_from` 引用到被清除 id 的事實，其 `origin_trust` 會被壓到 ≤ 0.1（源自投毒輸入的衍生物不能繼續被信任）。`search()` 會立即停止回傳這些被清除的事實，而 `get_history()` 仍保留完整的鏈，並標記 `invalidated_by_event = "origin_purge"`。
 
+v1.67.1 起，被視為 AI 員工的呼叫者只能讓 `channel`、`mcp_external`、`tool_echo` 這三個低於 agent 衍生上限的類別過期。其他來源會被拒絕並記入稽核 `memory_invalidate_refused`。這項判定採 fail-closed：凡是使用 gateway 共用內部金鑰的呼叫者，不論行程裡有沒有員工身分，一律視為 AI 員工；屬於某位員工或臨時員工（`eph-` 開頭的 id）的金鑰也一樣。只有對應不到任何員工的 admin 金鑰不受限制。之前，被操縱的 AI 員工一次呼叫就能讓它命名空間裡所有操作者等級的事實過期（是哪個命名空間，見下方已知限制）。
+
 ### 寫入端投毒防護（D2）
 
 D1 讓你能*撤銷*一個投毒來源；D2 則在源頭就攔下大部分毒物（PoisonedRAG，arXiv:2402.07867）。自動蒸餾的寫入路徑在兩端設防：
 
 - **寫入端掃描＋爆量偵測。**一筆蒸餾出的事實在儲存前，其內容與 `(subject, predicate, object)` 會先過共用的 prompt-injection 規則引擎：命中即**丟棄**該事實（fail-closed，絕不寫入），並記錄一筆 `prompt_injection` 安全稽核事件。另外有一個 per-`(agent, origin, subject)` 的滑動窗計數器（`knowledge_guard`，與 dispatch 斷路器同樣採持久化 ＋ advisory-lock 模式），當單一來源在窗內對同一 subject 寫入 `>= max_per_subject` 筆事實時，會把整批隔離（即「One Shot Dominance」／k-doc 模式）。被隔離的事實以 `quarantined = 1` 儲存，屬**惰性**：它們永不取代乾淨事實，並在人工裁決前被排除於所有取回讀取路徑（FTS、graph、vector、`list_recent`、`summarize`）之外。
-- **處理流程。**一次隔離會發出一筆 `ApprovalBroker` 請求（`action_kind = "knowledge_quarantine"`）並送出 `knowledge.quarantined` 事件。核准 → 事實被釋放（`quarantined = 0`，現在可取回）；拒絕 → 事實過期（`invalidated_by_event = "quarantine_reject"`），其 `origin_trust` 壓到 ≤ 0.1；TTL 逾時視同拒絕（fail-closed）。
+- **處理流程。**一次隔離會發出一筆 `ApprovalBroker` 請求（`action_kind = "knowledge_quarantine"`，期限 24 小時）並送出 `knowledge.quarantined` 事件。核准 → 每筆事實依一般時序規則與下方的取代可信度檢查釋放：成為目前事實（或重複確認、或存成歷史）；被可信度更高的目前事實擋下的，會轉成有自己審核項目的暫存說法，不直接套用（v1.67.1；之前核准只是清掉旗標）。寫入時就會被檢查擋下的爆量事實，直接進暫存說法，不進爆量批次。轉換時文字超過 600 字的資料列不建立審核項目，只記入稽核 `memory_supersession_refused`（`not_held_reason: "too_long"`）。部分失敗後再次核准同一個爆量項目，會補建還缺的衝突審核項目（判斷是否已存在時只看衝突項目）。拒絕 → 事實過期（`invalidated_by_event = "quarantine_reject"`），其 `origin_trust` 壓到 ≤ 0.1；TTL 逾時視同拒絕（fail-closed）。
 
 **排序端信任。**`origin_trust` 現在會參與取回排序（權重 `w_trust`，預設 0.10）：每個候選的分數會乘上 `(1 − w_trust) + w_trust · origin_trust`，讓未經驗證的頻道蒸餾事實（trust 0.3）無法勝過策展過的事實（trust 1.0）。在 HippoRAG-lite graph 中，一個三元組的邊會依其 `origin_trust` 加權，縮小低信任事實的 Personalized-PageRank 質量，直接抑制「單一投毒三元組被 PPR 放大兩跳」這條路徑。舊資料列（trust 1.0）的排序與 D2 之前逐位元組相同。
+
+### 取代時的可信度檢查（v1.67.1）
+
+v1.67.1 之前，同一個 `(agent, subject, predicate)` 的新事實一定會取代目前的事實，不管來源。從聊天對話萃取的事實（可信度 0.3）會蓋掉同一 subject 與 predicate 的現有事實，不論它的可信度，例如 AI 員工自己推得的事實或沒有記錄來源的舊資料（0.6），鍵值相同時也包括匯入的事實（0.7）。操作者核准過的事實（1.0）從 v1.67.1 起才有，由下方的審核核准寫入，並受這項檢查保護。現在 `store_temporal` 在取代之前會先比較可信度（`duduclaw-memory/src/supersession_guard.rs`）：
+
+- 寫入的可信度是有效的 `origin_trust`（套用來源類別上限與 `derived_from` 限制之後的值）。目前事實的可信度是它儲存的 `origin_trust`，再以它的來源類別上限封頂；來源綁定之前寫入的資料列視為 `unattributed`（0.6）。多方佐證只提高 `confidence`，不提高可信度，所以不列入比較。
+- 只要這個三元組目前有效、未被隔離的資料列中，有任何一列的可信度嚴格高於這次寫入，就什麼都不寫。可信度相同或更高時照舊取代，舊資料列留在歷史鏈裡。
+- 重複確認同一個 object、沒有完整三元組的寫入、以及時間較早的歷史片段（`valid_from` 較舊）不經過這項檢查。
+- 檢查比對的是完全相同的 `subject` 與 `predicate` 字串。同一件事若用拼法不同的 subject 或 predicate 存下，會被當成另一個三元組，兩者照舊並存。
+
+來源類別上限（`origin.rs`）：`user_direct`（含舊別名 `user`）1.0、`operator` 1.0、`import` 0.7、`agent_derived` 0.6、`user_profile` 0.6、`unattributed` 0.6、`tool_echo` 0.5、`channel` 0.3、`mcp_external` 0.3。`user_profile` 在 v1.67.1 成為獨立類別，之前它是 `user_direct` 的別名，上限 1.0。`user_profile_record` MCP 工具與「說話者描述自己」的使用者輪廓萃取現在都寫入 `user_profile`（萃取之前寫的是 `channel`，0.3）。因此 AI 員工的紀錄與使用者後來的說法可以互相更正、不需審核，但兩者都無法取代操作者核准過的值。
+
+各寫入路徑遇到拒絕時的處理：
+
+| 路徑 | 被拒絕時 |
+|---|---|
+| 對話事實萃取（`wiki_ingest`，來源 `channel`） | 暫存待審（見下） |
+| 使用者輪廓特徵萃取（`profile_distill`，來源 `user_profile`） | 暫存待審（見下） |
+| `user_profile_record` MCP 工具 | 回傳錯誤（"a more trusted value already exists for this field, so it was not changed"），不寫入 |
+| `duduclaw migrate-from` | 該項目回報為略過 |
+| 足跡萃取、reflexion 規則整併、夜間引擎的 schema 與整併 | 略過該項目並記錄 log |
+| 其他呼叫 `store_temporal` 的地方 | 收到寫出兩邊可信度的錯誤 |
+
+**暫存待審的說法。** 在兩條萃取路徑中，被拒絕的說法會以惰性資料列存下（`quarantined = 1`，三元組只放在 `metadata.held_claim`，檢索看不到），並在儀表板「收件匣」建立一筆 `knowledge_quarantine` 審核項目。項目只依存下來的暫存列產生，列出核准後會寫入的所有東西：完整的新說法與新值，旁邊並排目前內容與目前的值；如果是某個人的使用者輪廓，會寫出是誰的輪廓（使用者 id）。目前內容超過 600 字會截斷，並註明已截斷。新說法超過 600 字時不送審，只寫入稽核（`not_held_reason: "too_long"`）。相同的說法（subject、predicate、object 都一樣）已在等待審核時，不會重複暫存。每位 AI 員工每個 UTC 日最多新增 20 筆。某個 UTC 日第一次超過上限時，動態牆會出現一則事件（`knowledge_review_cap_reached`）；超過上限的拒絕都只寫入稽核紀錄（`memory_supersession_refused`，`review_cap_hit: true`，`not_held_reason: "daily_cap"`）。
+
+- 核准：以操作者權限（來源 `operator`）寫入的，正是建立審核項目時依據的那筆暫存說法，取代目前事實。審核項目帶有這筆說法的摘要值（內容、subject、predicate、object）。若說法本身或受保護的事實在建立項目後改變，就不寫入任何內容，結果訊息會說明情況已改變，暫存列隨之關閉；同一說法日後再出現時會重新送審。
+- 系統先套用變更，成功後才記錄決定；同一個項目的核准與拒絕會依序逐一處理。套用失敗時，項目維持待審，儀表板顯示伺服器的錯誤，可以再試一次。變更已套用但決定沒能記錄時（項目剛好在中途逾期，或儲存發生錯誤），儀表板會收到說明已套用了什麼的錯誤，並寫入稽核紀錄 `knowledge_review_decision_unrecorded`。
+- 拒絕：捨棄這則說法。
+- 超過 24 小時期限的項目無法核准，逾期視同拒絕。
+- 這類項目只能在儀表板決定，需要 manager 或 admin 角色（`approvals.decide`）。聊天通道只會收到不含按鈕、也不含說法內容的通知，而且不會送到說法來源的那個對話；按舊按鈕或用文字回覆決定都會被拒絕，並提示到儀表板處理。Telegram Mini App 的詳細頁對這類項目也只顯示同一則通知。v1.67.1 之前，在通道按下知識審核的按鈕只會把審核標成已決定，不會真的釋放任何內容。
+- 每天一次的清理（與記憶衰減一起執行）會把審核項目已不在等待狀態、且建立超過一小時的隔離資料列（暫存說法與爆量批次都算）當成拒絕關閉。
+- 資料主體的匯出與刪除（`gdpr.rs`）也會比對暫存說法的 subject 與 object；被刪除的暫存說法無法再被核准。`duduclaw gdpr erase <contact> --confirm` 另外會撤回涵蓋被刪資料列的待審項目、把審核紀錄裡所有這類項目（不論狀態）的文字換掉，並刪除對應的 `knowledge.quarantined` 事件。沒有帶資料列 id 的事件（例如注入掃描丟棄的紀錄）無法比對，會留到事件保存期限 7 天後清除。前一步失敗時後面的步驟照樣執行；失敗的步驟會列出來，指令以非零結束，並提示重新執行同一個指令即可完成，重複執行是安全的。重新執行時即使已找不到記憶資料列，仍會用完全相同的 subject 從審核項目與事件中移除這個人的文字。
+- 排程與系統提示（虛擬使用者 `system`）不再寫入使用者輪廓。`user_profile_record` 會拒絕虛擬使用者（`system`、`anonymous`、`unknown`），並對 predicate 與值都做提示注入掃描，達到封鎖等級就拒絕。
+
+`config.toml [memory] supersession_trust_guard`（預設 `true`）設成 `false` 會關閉這項檢查。讀取這個設定的是 gateway 經 `memory_factory::build_memory_engine` 建立的引擎，以及 `duduclaw mcp-server` 的記憶引擎。直接建立的引擎（例如儀表板的記憶 RPC 與 `duduclaw migrate-from`）不看這個設定，檢查一律開啟。尚未在真實聊天通道上驗證。
+
+### 已知限制：兩個記憶命名空間（v1.67.1 未修正）
+
+AI 員工透過 MCP 記憶工具（`memory_store`、`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_alias_add` / `memory_alias_list`、`memory_get_history`、`memory_get_at`、`memory_invalidate_by_origin`、`user_profile_record`、`user_profile_get`、`user_code_profile`）寫入或讀取的記憶，命名空間由 MCP 金鑰決定。gateway 啟動的每位 AI 員工都用 gateway 的內部金鑰，所以全部共用同一個命名空間 `internal/gateway-internal`（從 v1.44.0 加入這把金鑰起就是如此）。gateway 自己做的事（對話與輪廓萃取、審核核准、把重點事實與輪廓區塊注入提示）用的是員工自己的 id。後果：
+
+- 同一個 gateway 的 AI 員工，會共用彼此透過這些工具存的記憶。
+- AI 員工透過工具存的內容，不是 gateway 注入它提示的內容；它的 `memory_search` 也看不到 gateway 萃取的內容。輪廓區塊反映的是萃取出的特徵與核准過的審核，不是 `user_profile_record` 的呼叫。
+- 可信度檢查只在同一個命名空間內比較。它保護 gateway 萃取與操作者核准的事實不被聊天衍生的寫入取代，但不會在兩邊之間仲裁。
+
+AI 員工之間的隔離只對 gateway 寫入的記憶成立。要改變這一點需要資料遷移，目前尚未排定。
 
 ### 自動建檔的知識庫頁面（WP5c）
 
@@ -270,6 +317,13 @@ get_by_ids(namespace, ids)
 enabled = true          # 同來源爆量偵測器的總開關。預設 true
 window_secs = 3600      # 滑動窗長度（秒）。預設 3600（1 小時）
 max_per_subject = 5     # 一個來源在窗內對同一 subject 可寫入的事實上限，超過即隔離。預設 5
+```
+
+取代時的可信度檢查預設開啟：
+
+```toml
+[memory]
+supersession_trust_guard = true   # false = 可信度較低的寫入又能取代可信度較高的目前事實（v1.67.1 之前的行為）
 ```
 
 寫入路徑上的注入掃描是無條件執行的（無設定項）。排序信任權重 `w_trust`（預設 0.10）位於 `RetrievalWeights`（per-engine，非 config 鍵）；當 `w_trust = 0.0` 時，排序與 D2 之前逐位元組相同。

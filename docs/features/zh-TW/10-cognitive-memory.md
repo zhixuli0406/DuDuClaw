@@ -160,7 +160,7 @@ Results include memories about:
 
 ## 跨 agent 知識共享
 
-記憶以 agent 為單位。記憶工具（`memory_search`、`memory_store`、`memory_read`…）只讀寫呼叫者自己的命名空間，也沒有逐筆記憶的共享等級。多個 agent 都需要的知識改放共享 wiki：
+gateway 寫入的記憶（對話與輪廓萃取、核准的審核、重點事實）以 agent 為單位。MCP 記憶工具（`memory_search`、`memory_store`、`memory_read`…）讀寫的是 MCP 金鑰對應的命名空間；gateway 啟動的每位 AI 員工都用 gateway 的內部金鑰，所以透過這些工具，同一個 gateway 的所有員工共用一個命名空間（`internal/gateway-internal`），和各員工由 gateway 寫入的記憶是分開的。這是已知限制，見 [20-memory-intelligence.md](20-memory-intelligence.md#已知限制兩個記憶命名空間v1671-未修正)。沒有逐筆記憶的共享等級。多個 agent 都需要的知識改放共享 wiki：
 
 ```
 Agent A (customer support) needs product info

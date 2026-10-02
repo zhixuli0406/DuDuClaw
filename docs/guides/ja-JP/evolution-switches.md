@@ -182,6 +182,7 @@ duduclaw agent unfreeze <agent-id>
 | キー | デフォルト | ページ |
 |---|---|---|
 | `config.toml [memory] novelty_gate` | `true` | [memory-and-knowledge.md](./memory-and-knowledge.md) — ほぼ重複した意味記憶を拒否する |
+| `config.toml [memory] supersession_trust_guard` | `true`（v1.67.1） | [20-memory-intelligence.md](../../features/ja-JP/20-memory-intelligence.md#置き換え時の信頼度チェックv1671) — 信頼度の低い書き込みは、より信頼度の高い現在の事実を置き換えられない。抽出された主張はダッシュボードの審査へ |
 | `config.toml [dispatch] grounding_precheck_enabled` | `true` | [goal-loop.md](./goal-loop.md) — 承認判定の前にLLMコストゼロで証拠をチェックする |
 | `config.toml [dispatch] two_stage_judge` | `true` | [goal-loop.md](./goal-loop.md) — MAV承認パネルの前に低コストな第一段階の評価器を挟む |
 | `config.toml [goal_loop] resume_on_restart` | `"pause"` | [goal-loop.md](./goal-loop.md) — gateway再起動時に進行中のゴールタスクを`needs_human`にエスカレーションする。代わりに再開させるには`"auto"`を設定。ダッシュボード：設定 → 自動化 |

@@ -42,13 +42,14 @@ duduclaw start
 
 - **ライセンス**：`license.json` はマシンフィンガープリント（hostname + MAC）に紐づいている。
   マシンを変更してもPersonal Editionのコア機能はそのまま動作する（Apache 2.0）。Pro付加モジュール
-  がある場合は、[spec-license-module.md](../../../commercial/docs/spec-license-module.md) §7.3の
-  セルフサービス再紐付けフローに従うこと。
+  がある場合は、ライセンスの発行元が新しいマシンへ紐付け直す必要があります。
 - **チャンネルトークン**：channel bot tokenは暗号化された設定内にあり、一緒に移行される。IPや
   ドメインを変更した際は、webhook URLの更新を忘れないこと。
-- **EditionProfile**：セルフホストのデフォルトは `personal`。`DUDUCLAW_EDITION` 環境変数または
-  `agent.toml [edition] profile` で上書きできる（優先順位は
-  [personal-edition-plan.md](../../../commercial/docs/personal-edition-plan.md) §4を参照）。
+- **EditionProfile**：gateway は次の順に判定します。まず `DUDUCLAW_EDITION` 環境変数（`personal` または
+  `enterprise`）、次にライセンスのティア（Business、OEM、Partner、Self-Host Pro は `enterprise`）、
+  どちらもなければ `personal` です。ダッシュボードの切り替えスイッチも設定ファイルのキーもありません。
+  `agent.toml [edition] profile` を読むコードは存在しません。該当ライセンスなしでセルフホスト環境を
+  エンタープライズとして動かすには、gateway の環境に `DUDUCLAW_EDITION=enterprise` を設定して再起動します。
 
 ## ロードマップ（計画中）
 
@@ -56,5 +57,3 @@ duduclaw start
   tarballを生成する。
 - 起動時にマネージドからエクスポートされたtarballをワンクリックでインポートできるようにする。
 - マネージド ↔ セルフホストのラウンドトリップ整合性を自動検証する。
-
-追跡先：`commercial/docs/TODO-personal-edition.md` のP4項目。

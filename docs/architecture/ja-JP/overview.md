@@ -124,7 +124,7 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 ### タスクとナレッジ
 - **Task Board**：SQLiteベースのタスク管理（状態/優先度/割り当てを追跡）+ リアルタイムActivity Feed WebSocket。ダッシュボード RPC：`tasks.list/create/update/remove/assign`、`activity.list`。エージェント向け MCP ツール：`tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post`。
 - **共有ナレッジベース**：`~/.duduclaw/shared/wiki/`、Wikiの対象分類（agent/shared/both）に対応。MCPツール：`scope="shared"` を付けた `wiki_ls/read/write/search/stats/lint`（`shared_wiki_*` の表記は非推奨のエイリアスで、v1.68.0 で削除）、および `shared_wiki_delete` と `wiki_share`。
-- **Autopilotルールエンジン**：委任/通知/skill実行の自動化。トリガー（13種類）：`task_created`、`task_updated`、`task_status_changed`、`activity_new`、`channel_message`、`agent_idle`、`cron_tick`、`run_at_risk`、`os_file`、`os_frontmost`、`tick`、`security_event`、`odoo_event`（[23-autopilot-engine](../../features/ja-JP/23-autopilot-engine.md)）。
+- **Autopilotルールエンジン**：委任/通知/skill実行の自動化。新しいルールが使えるトリガー（12種類）：`task_created`、`task_updated`、`task_status_changed`、`activity_new`、`channel_message`、`agent_idle`、`run_at_risk`、`os_file`、`os_frontmost`、`tick`、`security_event`、`odoo_event`。`cron_tick` は送出されず、v1.67.1 から作成時に拒否（[23-autopilot-engine](../../features/ja-JP/23-autopilot-engine.md)）。
 
 ### インテグレーション
 - **Odoo ERPブリッジ**（`duduclaw-odoo` crate）：CE/EEに対応するJSON-RPCミドルウェア、17個のMCPツール（CRM/Sales/Inventory/Accounting）、EditionGate自動検出、イベントポーリング + `POST /webhook/odoo`（どちらもデフォルト無効）が `odoo_event` の autopilot ルールに流れます。`OdooConnectorPool` によるエージェントごとの認証情報分離（RFC-21 §2、v1.11.0）。Dashboardの保存前テスト：`odoo.test` RPCがインラインパラメータを受け付け（v1.13.1）、認証情報を省略すると保存済みシークレットにフォールバック。`odoo.configure` と同じSSRF/HTTPS/DB名バリデーターを使用。`scrub_odoo_error()` が接続エラーを240文字に切り詰め、HTML/URLの漏洩を防ぎます。

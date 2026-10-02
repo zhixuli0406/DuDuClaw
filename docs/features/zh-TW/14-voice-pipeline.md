@@ -23,7 +23,7 @@
 | 端點 | 驗證 | 行為 |
 |---|---|---|
 | `POST /api/stt` | Bearer JWT | body 上限 10 MiB。**在碰 body 之前**先從 `config.toml [voice]` 解析供應商，沒設定就回 **501 fail-closed**——絕不猜測、絕不編造逐字稿 |
-| `POST /api/tts` | Bearer JWT | 經 `TtsRouter::auto_detect` 在四個 TTS 供應商之間分派 |
+| `POST /api/tts` | Bearer JWT | 每次請求讀 `inference.toml [voice] tts_provider`／`tts_voice`，據此選 `TtsRouter` 策略（`edge-tts` → 只用 edge，`minimax`／`openai-tts` → 雲端優先，其他 → 本地優先）；設成 `none`／`off`／`disabled` 時回 501 |
 | `GET`／`POST /api/voice/config` | Bearer JWT | 讀寫 `[voice]` 的 STT 設定 |
 
 **STT 供應商**（`stt.rs`，兩個實作）：
@@ -57,7 +57,9 @@ stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --
 
 **接著它呼叫 `duduclaw_inference::whisper::transcribe(bytes, Some("zh"), WhisperMode::Api)`——供應商與語言都是寫死的。** 語音回覆（每個聊天室用 `/voice` 切換）直接 new 一個 `EdgeTtsProvider`，同樣寫死；音訊上傳失敗時會退回純文字。
 
-所以 `inference.toml [voice]` 的 `asr_provider`／`asr_language`／`tts_provider`／`tts_voice`——儀表板會寫入並以 `auto | whisper-api | whisper-local` 與 `auto | edge-tts | minimax | openai-tts | piper` 驗證——**目前對 Telegram 路徑沒有任何影響**。在 UI 改了它們，Telegram 的語音訊息行為一點都不會變。這是已知缺口，寫在這裡，而不是留給操作者自己撞上。
+所以儀表板「語音」分頁寫入的 `inference.toml [voice] tts_provider`／`tts_voice` 只影響 `POST /api/tts`，**目前對 Telegram 路徑沒有任何影響**。在 UI 改了它們，Telegram 的語音訊息行為不會變。這是已知缺口，寫在這裡，免得操作者自己撞上。
+
+v1.67.1 起，「語音」分頁拿掉了「語音回覆模式」「語音辨識」「語言」三個欄位。它們寫入的 `voice_reply_enabled`、`asr_provider`、`asr_language` 在 gateway 裡沒有任何程式讀取。已經存在 `inference.toml` 的值保持原樣，分頁儲存時不再送這三個鍵。`/api/stt` 的語音轉文字設定在同一分頁的進階卡片（`config.toml [voice] stt_*`）。
 
 ---
 

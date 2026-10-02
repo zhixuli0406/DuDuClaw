@@ -96,7 +96,7 @@
 |------|------|
 | Aider 式程式碼符號圖（`code_map` MCP 工具） | tree-sitter 符號圖疊在 HippoRAG-lite Personalized-PageRank 引擎上；依查詢相關度排序 repo 檔案 |
 | 語意向量記憶（`w_vec`） | FTS/graph 之外的第三個 re-rank 訊號；零依賴、CJK-safe 的 `NgramHashEmbedder`，以 `DUDUCLAW_SEMANTIC_VECTORS=1` 開啟 |
-| 跨 session 使用者畫像 | 每使用者偏好 traits（temporal supersession）→ session-stable 的 `## About This User` 回覆注入；`user_profile_record` / `user_profile_get` MCP 工具 |
+| 跨 session 使用者畫像 | 每使用者偏好 traits（temporal supersession）→ session-stable 的 `## About This User` 回覆注入（來自 gateway 萃取與核准的審核）；`user_profile_record` / `user_profile_get` MCP 工具讀寫的是所有 gateway 啟動的員工共用的另一個命名空間，不會進入這個區塊（已知限制，v1.67.1） |
 | GDPR 匯出／抹除 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`（舊寫法 `gdpr export` 在 v1.68.0 前仍可解析），涵蓋記憶（triple + 提及 + key_facts，四表級聯，SHA-256 tombstone）**與** session 儲存（`<channel>:<chat_id>` prefix） |
 | Custom Dashboard Widgets | 在沙盒 runtime 中執行的 AI 引導或原始 HTML 儀表板卡片；Widget Studio 分享／匯入／匯出（[30-custom-widgets.md](30-custom-widgets.md)） |
 | 預算斷路器 | 每 agent 滑動視窗硬上限（`[budget] daily_cap_cents`），到頂即於 choke-point 阻斷 LLM 呼叫；寫 `budget_events.jsonl` |
@@ -293,12 +293,13 @@
 | 記憶衰減排程 | 每日背景執行：低重要度 + 30 天以上歸檔，歸檔 + 90 天以上永久刪除 |
 | 認知記憶 MCP 工具 | `memory_search_by_layer` / `memory_successful_conversations` / `memory_episodic_pressure` / `memory_consolidation_status` |
 | Key-Fact Accumulator | `key_facts` + FTS5：跨 session 輕量記憶（見 Session 記憶堆疊） |
-| Temporal Memory（F1，v1.19.0） | `memories` 經冪等遷移新增時序／知識圖譜欄位（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）；`store_temporal()` 對同一 `(agent, subject, predicate)` 自動衝突解析並串接 supersession chain；`search()` 預設只回傳現行有效列；`get_history()` / `get_at()` 提供鏈與時間點查詢 |
+| Temporal Memory（F1，v1.19.0） | `memories` 經冪等遷移新增時序／知識圖譜欄位（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）；`store_temporal()` 對同一 `(agent, subject, predicate)` 自動衝突解析並串接 supersession chain（v1.67.1 起，寫入可信度不低於目前事實時才取代）；`search()` 預設只回傳現行有效列；`get_history()` / `get_at()` 提供鏈與時間點查詢 |
 | Reflexion Loop（F2，v1.19.0） | 橋接既有 `MistakeNotebook`：F2a 將近期未解決錯誤注入作答 prompt（`## Past Mistakes to Avoid`，CJK-safe 比對 + recency fallback）；F2b 將 ≥3 則同 `MistakeCategory` 錯誤整併為一條語意記憶規則（`reflexion.rs`）後標記來源已解決。觸發訊號 = `ErrorCategory` Significant/Critical（MetaCognition 自適應） |
 | `memory_fetch_batch`（F3，v1.19.0） | MCP 工具 + `get_by_ids` 一次以 ID 取回 ≤100 筆（命名空間／擁有權強制，部分命中 → `missing_ids`） |
 | Bi-temporal + build-time provenance（D1） | `memories` 經冪等遷移新增 `ingested_at`（transaction-time 軸，有別於 world-time 的 `valid_from`）＋ `invalidated_by_event`/`invalidated_at`（哪個 source_event 於何時關閉一列）。`store_temporal()` 的取代由 world-time 的 `valid_from` 決定（可容忍亂序：較早的事實會以有界歷史區段插入而不擾動現行事實；無 `valid_from` 的寫入維持既有的攝入順序行為）；再次觀察到相同事實會**再確認**（metadata `reaffirmed_by`，≤20，並累加 `access_count`），不新增一列 |
 | `memory_get_history` / `memory_get_at`（D1） | 時序讀取 API 的 MCP 揭露：完整取代鏈（含 provenance 欄位）與某 `(subject, predicate)` 三元組的時間點查詢（scope `memory:read`） |
-| `memory_invalidate_by_origin`（D1） | 來源回溯原語：讓某**精確** `origin` 的所有現行有效事實過期（只過期、不刪除；可選限定某截止時間之後），並將 `origin_trust ≤ 0.1` 級聯至 `derived_from` 的後代；歷史保留（`invalidated_by_event = "origin_purge"`）。scope `admin` |
+| 取代時的可信度檢查（v1.67.1） | 寫入的有效 `origin_trust` 嚴格低於目前事實（儲存值以其類別上限封頂）時不能取代它；相同或更高照舊取代。對話事實與使用者輪廓特徵萃取被拒時會暫存，送到只能在儀表板決定的 `knowledge_quarantine` 審核（24 小時，每位 AI 員工每 UTC 日最多新增 20 筆，超過只寫稽核）；其他路徑略過或回傳錯誤。`user_profile` 來源上限 1.0 → 0.6。`config.toml [memory] supersession_trust_guard`（預設開）（[20-memory-intelligence.md](20-memory-intelligence.md#取代時的可信度檢查v1671)） |
+| `memory_invalidate_by_origin`（D1） | 來源回溯原語：讓某**精確** `origin` 的所有現行有效事實過期（只過期、不刪除；可選限定某截止時間之後），並將 `origin_trust ≤ 0.1` 級聯至 `derived_from` 的後代；歷史保留（`invalidated_by_event = "origin_purge"`）。scope `admin`；v1.67.1 起以 AI 員工身分呼叫時只能處理 `channel` / `mcp_external` / `tool_echo`（其他拒絕並稽核 `memory_invalidate_refused`） |
 | 圖檢索演進（D3） | HippoRAG-lite graph 獲得四項 fail-safe 改良（未啟用時逐位元組相同）：**(1)** per-agent 持久化圖快取（`RwLock`），由每筆更動三元組寫入遞增的 per-agent 世代計數器失效，僅在超過 `GRAPH_CACHE_MIN_TRIPLES = 500` 時啟用；**(2)** 透過 `entity_alias(agent_id, canonical, alias)` 的實體別名合併：在建圖＋seeding 前把表面形式收斂到同一節點，正規化＋鏈攤平；**(3)** 附掛到邊上的述詞邊標籤（PPR 不變），餵給 `engine.export_graph(agent, limit)` → 可序列化 `{nodes, edges}` 快照（隔離事實加註旗標）供 D6 策展 UI；**(4)** 可選的 embedding seeding（`graph_embed_seed`）：PPR seed ＝ whole-word FTS ∪ query embedding 最鄰近實體向量（同模型 cosine，top-k，惰性 `entity_embedding` 快取），預設關閉 |
 | `memory_alias_add` / `memory_alias_list`（D3） | 管理實體別名的 MCP 工具：add 把 `alias` 收斂到某 `canonical` 實體（scope `memory:write`），list 回傳 `(canonical, alias)` 配對（scope `memory:read`）；命名空間隔離 |
 | Decision Continuity（RFC-24，v1.23.0） | 當 agent 提出列舉式選項（方案 A/B/C），每個選項固化進 Temporal Memory 的 **semantic** 層（獨立於對話壓縮），待決事項每回合重新注入；稍後「用方案 C」（跨回合／session／程序）從持久狀態解析，不靠猜測。偵測確定性、零 LLM；`decision_resolve` / `decision_list` MCP 工具 + Dashboard 面板 + Prometheus 計數器；per-agent opt-in `[memory] decision_continuity = true`（TTL `decision_ttl_days`，預設 7） |
@@ -357,10 +358,10 @@
 
 | 功能 | 說明 |
 |------|------|
-| 事件匯流排 | `tokio::broadcast`（容量 8192），規則可見的事件共 13 種：`task_created` / `task_updated` / `task_status_changed` / `activity_new` / `channel_message` / `agent_idle` / `cron_tick` / `run_at_risk` / `os_file` / `os_frontmost` / `tick` / `security_event` / `odoo_event`（[23-autopilot-engine.md](23-autopilot-engine.md)） |
+| 事件匯流排 | `tokio::broadcast`（容量 8192），新規則可訂閱的事件共 12 種：`task_created` / `task_updated` / `task_status_changed` / `activity_new` / `channel_message` / `agent_idle` / `run_at_risk` / `os_file` / `os_frontmost` / `tick` / `security_event` / `odoo_event`；`cron_tick` 從不送出，v1.67.1 起建立規則時拒絕（[23-autopilot-engine.md](23-autopilot-engine.md)） |
 | 規則條件 | `all` / `any` + `eq/neq/in/not_in/gt/gte/lt/lte/contains` 運算子 |
 | 動作型別 | `delegate`（enqueue bus task）、`notify`（通道）、`run_skill`（skill 名稱 + 目標經 alphanumeric allowlist + `canonicalize()` 路徑圍堵驗證） |
-| 規則 CRUD | Dashboard RPC `autopilot.list/create/update/remove/history` + agent MCP `autopilot_list`；寫入時驗證結構 |
+| 規則 CRUD | Dashboard RPC `autopilot.list/create/update/remove/history` + agent MCP `autopilot_list`；寫入時驗證觸發事件、條件與動作；沒有條件的規則每次事件都會執行（v1.67.1） |
 | 三態斷路器 | 每規則 `Closed` / `Open` / `HalfOpen`：60s 內 10 次觸發轉 Open（60s 冷卻），再 HalfOpen probe；防止自我增強迴圈；轉換記入 history + Activity Feed |
 | events.db 橋接 | SQLite（WAL + 單調遞增 id + 7 天 prune）取代舊 `events.jsonl`：無 rotation race、無 partial-line 風險 |
 
@@ -450,7 +451,7 @@
 | 國際化 | zh-TW / en / ja-JP（600+ 翻譯鍵） |
 | 深淺色主題 | 系統偏好 + 手動切換 |
 | Experiment Logger | Trajectory recording，供 RL/RLHF 離線分析 |
-| Marketplace RPC | `marketplace.list` 提供真實 MCP 目錄（Playwright / Browserbase / Filesystem / GitHub / Slack / Postgres / SQLite / Memory / Fetch / Brave Search） |
+| Marketplace RPC | `marketplace.list` 提供內建 MCP 目錄：v1.67.1 起共四張卡片（Playwright `@playwright/mcp`、Browserbase `@browserbasehq/mcp`、Filesystem、Memory），另合併 `~/.duduclaw/marketplace.json` 的項目 |
 | Partner Portal | SQLite `PartnerStore` + profile/stats/customers CRUD + 7 個 RPC |
 
 ## 商業功能

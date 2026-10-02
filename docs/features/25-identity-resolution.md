@@ -196,6 +196,14 @@ two hard-coded the wiki cache, so an operator who configured Notion saw the
 dashboard resolve through it while every agent still read only the local cache.
 They now agree.
 
+The dashboard side is enterprise-only: the gateway refuses every `identity.*`
+RPC on a personal install. Since v1.67.1 the 身分解析 (Identity) tab on the
+integrations page is hidden in personal mode (before, it only showed an error
+there), and a `?tab=identity` link falls back to the first tab. The MCP tool
+and the `<sender>` block are not tied to the edition. Enterprise mode comes
+from the licence tier or `DUDUCLAW_EDITION=enterprise`; there is no dashboard
+switch.
+
 ---
 
 ## The `<sender>` Block: Identity as Data

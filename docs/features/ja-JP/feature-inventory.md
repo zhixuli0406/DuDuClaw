@@ -94,7 +94,7 @@
 |------|------|
 | Aider 式コードシンボルグラフ(`code_map` MCP ツール) | tree-sitter シンボルグラフを HippoRAG-lite Personalized-PageRank エンジン上で実行し、クエリとの関連度でリポジトリのソースファイルをランク付け |
 | セマンティックベクトル記憶(`w_vec`) | FTS/graph に加えた第三の re-rank シグナル。依存ゼロ・CJK 安全の `NgramHashEmbedder`、`DUDUCLAW_SEMANTIC_VECTORS=1` で有効化 |
-| セッション横断ユーザープロファイル | ユーザーごとの嗜好 traits(temporal supersession)→ セッション安定な `## About This User` を返信に注入。`user_profile_record` / `user_profile_get` MCP ツール |
+| セッション横断ユーザープロファイル | ユーザーごとの嗜好 traits(temporal supersession)→ セッション安定な `## About This User` を返信に注入（gateway の抽出と承認済みの審査から）。`user_profile_record` / `user_profile_get` MCP ツールは gateway が起動する全従業員で共有される別の名前空間を読み書きするため、このブロックには反映されない（既知の制限、v1.67.1） |
 | GDPR エクスポート/消去 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`(旧表記 `gdpr export` は v1.68.0 まで引き続き解釈される)が記憶(triple + 本文言及 + key_facts、4 テーブルのカスケード、SHA-256 仮名 tombstone)**と**セッションストア(`<channel>:<chat_id>` プレフィックス)を対象 |
 | Custom Dashboard Widgets | サンドボックス化されたランタイムで動作する、AI ガイドまたは生 HTML のダッシュボードカード。Widget Studio での共有/インポート/エクスポート([30-custom-widgets.md](30-custom-widgets.md)) |
 | 予算サーキットブレーカー | エージェント単位のスライディングウィンドウ上限(`[budget] daily_cap_cents`)。上限到達で choke-point にて LLM 呼び出しを遮断。`budget_events.jsonl` |
@@ -292,12 +292,13 @@
 | メモリ減衰スケジューラ | 日次バックグラウンド — 低重要度 + 30 日以上アーカイブ、アーカイブ + 90 日以上完全削除 |
 | 認知メモリ MCP ツール | `memory_search_by_layer` / `memory_successful_conversations` / `memory_episodic_pressure` / `memory_consolidation_status` |
 | Key-Fact Accumulator | `key_facts` + FTS5 — セッション横断の軽量メモリ（セッションメモリスタック参照） |
-| Temporal Memory（F1、v1.19.0）| `memories` に冪等マイグレーションで時系列/ナレッジグラフ列（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）を追加；`store_temporal()` が同一 `(agent, subject, predicate)` を自動コンフリクト解決し supersession chain を連結；`search()` はデフォルトで現行有効行のみフィルタ；`get_history()` / `get_at()` がチェーンとポイントインタイムを提供 |
+| Temporal Memory（F1、v1.19.0）| `memories` に冪等マイグレーションで時系列/ナレッジグラフ列（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）を追加；`store_temporal()` が同一 `(agent, subject, predicate)` を自動コンフリクト解決し supersession chain を連結（v1.67.1 から、書き込みの信頼度が現在の事実以上の場合のみ置き換え）；`search()` はデフォルトで現行有効行のみフィルタ；`get_history()` / `get_at()` がチェーンとポイントインタイムを提供 |
 | Reflexion Loop（F2、v1.19.0）| 既存 `MistakeNotebook` をブリッジ — F2a は未解決の最近のミスを回答プロンプトに注入（`## Past Mistakes to Avoid`、CJK セーフ照合 + recency フォールバック）；F2b は同一 `MistakeCategory` のミス ≥3 件を 1 つの意味メモリルールに統合（`reflexion.rs`）し元を解決済みに。トリガー = `ErrorCategory` Significant/Critical（MetaCognition 適応） |
 | `memory_fetch_batch`（F3、v1.19.0）| MCP ツール + `get_by_ids` が ≤100 件を ID で一括取得（名前空間/所有権を強制、部分ヒット → `missing_ids`） |
 | Bi-temporal + build-time provenance（D1）| `memories` に冪等マイグレーションで `ingested_at`（transaction-time 軸、world-time の `valid_from` とは別）＋ `invalidated_by_event`/`invalidated_at`（どの source_event が行をいつクローズしたか）を追加。`store_temporal()` の置換は world-time の `valid_from` で決定（順不同に強い — 先行する事実は現行を乱さず有界の履歴セグメントとして挿入；`valid_from` なしの書き込みは従来の取り込み順の挙動を維持）；同一事実の再観測は行を追加せず**再確認**（metadata `reaffirmed_by`、≤20、＋ `access_count` 加算） |
 | `memory_get_history` / `memory_get_at`（D1）| 時系列読み取り API の MCP 露出 — 完全な置換チェーン（provenance 列付き）と `(subject, predicate)` トリプルのポイントインタイム参照（scope `memory:read`） |
-| `memory_invalidate_by_origin`（D1）| ソースロールバックのプリミティブ — **厳密な** `origin` のすべての現在有効な事実を失効（削除はしない、任意でカットオフ以降に限定）、`origin_trust ≤ 0.1` を `derived_from` の子孫へカスケード；履歴は保持（`invalidated_by_event = "origin_purge"`）。scope `admin` |
+| 置き換え時の信頼度チェック（v1.67.1） | 書き込みの実効 `origin_trust` が現在の事実（保存値をクラス上限で頭打ち）より厳密に低い場合は置き換え不可。同じか高ければ従来どおり置き換え。会話事実とプロフィール特性の抽出で拒否された主張は保留され、ダッシュボード専用の `knowledge_quarantine` 審査へ（24 時間、AI 従業員ごとに UTC 日あたり新規 20 件まで、超過分は監査ログのみ）。他の経路はスキップまたはエラー。`user_profile` オリジン上限 1.0 → 0.6。`config.toml [memory] supersession_trust_guard`（デフォルト有効）（[20-memory-intelligence.md](20-memory-intelligence.md#置き換え時の信頼度チェックv1671)） |
+| `memory_invalidate_by_origin`（D1）| ソースロールバックのプリミティブ — **厳密な** `origin` のすべての現在有効な事実を失効（削除はしない、任意でカットオフ以降に限定）、`origin_trust ≤ 0.1` を `derived_from` の子孫へカスケード；履歴は保持（`invalidated_by_event = "origin_purge"`）。scope `admin`。v1.67.1 から AI 従業員として呼ぶ場合は `channel` / `mcp_external` / `tool_echo` のみ（他は拒否、監査 `memory_invalidate_refused`） |
 | グラフ検索の進化（D3）| HippoRAG-lite graph が4つの fail-safe な改良を獲得（未使用時はバイト単位で同一）：**(1)** per-agent 永続グラフキャッシュ（`RwLock`）、トリプル変更書き込みごとに加算される per-agent 世代カウンタで無効化、`GRAPH_CACHE_MIN_TRIPLES = 500` 超のみ有効；**(2)** `entity_alias(agent_id, canonical, alias)` によるエンティティエイリアス統合 — 構築＋シード前に表層形を1ノードへ畳み込み、正規化＋チェーン平坦化；**(3)** エッジに付帯する述語エッジラベル（PPR 不変）が `engine.export_graph(agent, limit)` → シリアライズ可能な `{nodes, edges}` スナップショット（隔離事実はフラグ付き）に供給し D6 キュレーション UI へ；**(4)** オプトインの embedding seeding（`graph_embed_seed`）— PPR シード ＝ whole-word FTS ∪ クエリ埋め込み最近傍エンティティベクトル（同一モデル cosine、top-k、遅延 `entity_embedding` キャッシュ）、デフォルトオフ |
 | `memory_alias_add` / `memory_alias_list`（D3）| エンティティエイリアスを管理する MCP ツール — add は `alias` を `canonical` エンティティに畳み込む（scope `memory:write`）、list は `(canonical, alias)` ペアを返す（scope `memory:read`）；名前空間分離 |
 | Decision Continuity（RFC-24、v1.23.0）| エージェントが列挙式の選択肢（案 A/B/C）を提示した際、各選択肢を Temporal Memory の **semantic** 層に永続化（会話圧縮から独立）し、未決事項をターンごとに再注入；後から「案 C で」（別ターン / セッション / プロセス）と言われても推測ではなく永続状態から解決。検出は決定論的でゼロ LLM；`decision_resolve` / `decision_list` MCP ツール + ダッシュボードパネル + Prometheus カウンタ；`[memory] decision_continuity = true` でエージェント単位の opt-in（TTL `decision_ttl_days`、既定 7）|
@@ -356,10 +357,10 @@
 
 | 機能 | 説明 |
 |------|------|
-| イベントバス | `tokio::broadcast`（容量 8192）。ルールから見えるイベントは 13 種：`task_created` / `task_updated` / `task_status_changed` / `activity_new` / `channel_message` / `agent_idle` / `cron_tick` / `run_at_risk` / `os_file` / `os_frontmost` / `tick` / `security_event` / `odoo_event`（[23-autopilot-engine.md](23-autopilot-engine.md)） |
+| イベントバス | `tokio::broadcast`（容量 8192）。新しいルールが購読できるイベントは 12 種：`task_created` / `task_updated` / `task_status_changed` / `activity_new` / `channel_message` / `agent_idle` / `run_at_risk` / `os_file` / `os_frontmost` / `tick` / `security_event` / `odoo_event`。`cron_tick` は送出されず、v1.67.1 から作成時に拒否（[23-autopilot-engine.md](23-autopilot-engine.md)） |
 | ルール条件 | `all` / `any` + `eq/neq/in/not_in/gt/gte/lt/lte/contains` 演算子 |
 | アクション型 | `delegate`（bus task をエンキュー）、`notify`（チャネル）、`run_skill`（skill 名 + ターゲットを alphanumeric allowlist + `canonicalize()` パス封じ込めで検証）|
-| ルール CRUD | Dashboard RPC `autopilot.list/create/update/remove/history` + agent MCP `autopilot_list`；書込時に構造検証 |
+| ルール CRUD | Dashboard RPC `autopilot.list/create/update/remove/history` + agent MCP `autopilot_list`；書込時にトリガー・条件・動作を検証。条件なしのルールはイベントのたびに実行（v1.67.1） |
 | 3 状態サーキットブレーカー | ルール毎 `Closed` / `Open` / `HalfOpen` — 60s 内 10 回発火で Open（60s クールダウン）、その後 HalfOpen probe；自己強化ループを防止；遷移は history + Activity Feed に記録 |
 | events.db ブリッジ | SQLite（WAL + 単調増加 id + 7 日 prune）が旧 `events.jsonl` を置換 — rotation race・partial-line ハザードなし |
 
@@ -449,7 +450,7 @@
 | 国際化 | zh-TW / en / ja-JP（600+ 翻訳キー） |
 | ダーク/ライトテーマ | システム設定 + 手動トグル |
 | Experiment Logger | RL/RLHF オフライン分析用のトラジェクトリ記録 |
-| Marketplace RPC | `marketplace.list` が実 MCP カタログを提供（Playwright / Browserbase / Filesystem / GitHub / Slack / Postgres / SQLite / Memory / Fetch / Brave Search） |
+| Marketplace RPC | `marketplace.list` が組み込み MCP カタログを提供：v1.67.1 から 4 枚（Playwright `@playwright/mcp`、Browserbase `@browserbasehq/mcp`、Filesystem、Memory）、加えて `~/.duduclaw/marketplace.json` の項目 |
 | Partner Portal | SQLite `PartnerStore` + 7 RPCs（profile/stats/customers CRUD） |
 
 ## 商用機能

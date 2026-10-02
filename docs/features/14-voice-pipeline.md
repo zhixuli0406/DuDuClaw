@@ -23,7 +23,7 @@ The most important thing to know: **the HTTP voice endpoints and the Telegram vo
 | Endpoint | Auth | Behavior |
 |---|---|---|
 | `POST /api/stt` | Bearer JWT | 10 MiB body cap. Resolves the provider from `config.toml [voice]` **before** touching the body, and returns **501 fail-closed** when none is configured — it never guesses or fabricates a transcript |
-| `POST /api/tts` | Bearer JWT | Routes through `TtsRouter::auto_detect` over the four TTS providers |
+| `POST /api/tts` | Bearer JWT | Reads `inference.toml [voice] tts_provider` / `tts_voice` on each request and picks a `TtsRouter` strategy from them (`edge-tts` → edge only, `minimax` / `openai-tts` → cloud best, anything else → local first); `none` / `off` / `disabled` returns 501 |
 | `GET`/`POST /api/voice/config` | Bearer JWT | Read/write the `[voice]` STT settings |
 
 **STT providers** (`stt.rs`, two implementations):
@@ -57,7 +57,9 @@ A voice or audio message triggers `transcribe_voice`: the bot calls `getFile`, v
 
 **It then calls `duduclaw_inference::whisper::transcribe(bytes, Some("zh"), WhisperMode::Api)` — the provider and the language are hardcoded.** Voice replies (toggled per chat with `/voice`) construct `EdgeTtsProvider` directly, also hardcoded, with a text fallback when the audio upload fails.
 
-So `inference.toml [voice] asr_provider` / `asr_language` / `tts_provider` / `tts_voice` — written and validated by the dashboard against `auto | whisper-api | whisper-local` and `auto | edge-tts | minimax | openai-tts | piper` — **do not currently affect the Telegram path**. Changing them in the UI changes nothing for a Telegram voice message. This is a known gap, stated here rather than left for an operator to discover.
+So `inference.toml [voice] tts_provider` / `tts_voice`, which the dashboard's Voice tab writes, reach `POST /api/tts` only and **do not currently affect the Telegram path**. Changing them in the UI changes nothing for a Telegram voice message. This is a known gap, stated here rather than left for an operator to discover.
+
+Since v1.67.1 the Voice tab no longer shows 語音回覆模式 (voice reply mode), 語音辨識 (speech recognition provider) or 語言 (language). They wrote `voice_reply_enabled`, `asr_provider` and `asr_language`, which nothing in the gateway reads. Values already in `inference.toml` stay there untouched; the tab no longer sends those keys. Speech-to-text for `/api/stt` is configured in the tab's advanced card (`config.toml [voice] stt_*`).
 
 ---
 

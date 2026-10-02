@@ -153,7 +153,7 @@ cat ~/.duduclaw/agents/my-bot/.mcp.json
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": ["@anthropic-ai/mcp-server-playwright", "--headless"],
+      "args": ["-y", "@playwright/mcp", "--headless"],
       "env": {}
     }
   }
@@ -161,8 +161,9 @@ cat ~/.duduclaw/agents/my-bot/.mcp.json
 ```
 
 **Prerequisites:**
-- `npm install -g @anthropic-ai/mcp-server-playwright`
-- Playwright Chromium: `npx playwright install chromium`
+- Node.js with `npx`. `npx -y` downloads `@playwright/mcp` on first start; no global install is needed.
+- A browser the server can launch. Which one and how to install it are described in the `@playwright/mcp` README; this guide does not repeat them.
+- Before v1.67.1 this example named `@anthropic-ai/mcp-server-playwright`, which does not exist on npm. An `.mcp.json` written from the old example still has that name and fails at start; change it to the line above.
 
 Whether the agent may call this server's tools is decided by its `[capabilities] allowed_tools` / `denied_tools`.
 

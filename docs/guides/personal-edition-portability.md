@@ -42,18 +42,18 @@ duduclaw start
 
 - **License**: `license.json` is bound to the machine fingerprint (hostname + MAC). The
   Personal Edition core keeps working after a machine change (Apache 2.0); if you have a Pro
-  add-on module, follow the self-serve rebinding flow in
-  [spec-license-module.md](../../commercial/docs/spec-license-module.md) §7.3.
+  add-on module, the licence has to be rebound to the new machine by whoever issued it.
 - **Channel tokens**: channel bot tokens live inside the encrypted config and move along with
   everything else; remember to update the webhook URL when the IP or domain changes.
-- **EditionProfile**: self-hosted defaults to `personal`; override it with the `DUDUCLAW_EDITION`
-  environment variable or `agent.toml [edition] profile` (see the precedence order in
-  [personal-edition-plan.md](../../commercial/docs/personal-edition-plan.md) §4).
+- **EditionProfile**: the gateway resolves it in this order: the `DUDUCLAW_EDITION` environment
+  variable (`personal` or `enterprise`), then the licence tier (Business, OEM, Partner and
+  Self-Host Pro imply `enterprise`), then `personal`. There is no dashboard switch and no
+  config-file key: `agent.toml [edition] profile` is not read by anything. To run a self-hosted
+  install as enterprise without such a licence, set `DUDUCLAW_EDITION=enterprise` in the
+  gateway's environment and restart it.
 
 ## Roadmap (planned)
 
 - A Dashboard "one-click export my data" (一鍵匯出我的資料) button that generates the tarball.
 - One-click import of a managed export's tarball on startup.
 - Automated round-trip consistency verification between managed and self-hosted.
-
-Tracked in `commercial/docs/TODO-personal-edition.md`, item P4.

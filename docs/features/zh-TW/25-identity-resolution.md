@@ -186,6 +186,8 @@ identity_resolve { channel, external_id }
 
 三個呼叫點——這個 MCP 工具、下面的 `<sender>` 區塊、儀表板的 `identity.resolve` RPC——都走同一個讀 `config.toml [identity] provider` 的共用建構器。2026-09 功能盤點之前，前兩者是硬編死在 wiki 快取上的，所以設定了 Notion 的 operator 會看到儀表板真的走 Notion，但每個 AI 員工其實只讀得到本地快取。現在三者一致。
 
+儀表板這一側只有企業版能用：個人版的 gateway 會拒絕所有 `identity.*` RPC。v1.67.1 起，個人版的整合頁不再顯示「身分解析」分頁（之前在個人版只會顯示錯誤），`?tab=identity` 的連結會改開第一個分頁。MCP 工具與 `<sender>` 區塊與版本無關。企業版由授權方案或 `DUDUCLAW_EDITION=enterprise` 決定，儀表板沒有切換開關。
+
 ---
 
 ## `<sender>` 區塊：把身分當成資料

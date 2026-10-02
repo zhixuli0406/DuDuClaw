@@ -38,15 +38,15 @@ duduclaw start
 ## 切換時的注意事項
 
 - **授權**：`license.json` 綁定機器指紋（hostname + MAC）。換機器後個人版核心照常運作（Apache 2.0），
-  若有 Pro 加值模組，依 [spec-license-module.md](../../../commercial/docs/spec-license-module.md) §7.3 走 self-serve 重新綁定。
+  若有 Pro 加值模組，需要由發出授權的一方把授權重新綁定到新機器。
 - **頻道 token**：channel bot token 在加密設定內，會一起搬過去；換 IP/網域時記得更新 webhook URL。
-- **EditionProfile**：自架預設 `personal`；可用 `DUDUCLAW_EDITION` 環境變數或 `agent.toml [edition] profile`
-  覆寫（優先序見 [personal-edition-plan.md](../../../commercial/docs/personal-edition-plan.md) §4）。
+- **EditionProfile**：gateway 依序判定：先看 `DUDUCLAW_EDITION` 環境變數（`personal` 或 `enterprise`），
+  再看授權方案（Business、OEM、Partner、Self-Host Pro 視為 `enterprise`），都沒有就是 `personal`。
+  儀表板沒有切換開關，設定檔也沒有對應的鍵：`agent.toml [edition] profile` 沒有任何程式讀取。
+  沒有上述授權、又要讓自架環境以企業版執行，請在 gateway 的環境加上 `DUDUCLAW_EDITION=enterprise` 後重新啟動。
 
 ## 路線圖（規劃中）
 
 - Dashboard「一鍵匯出我的資料」按鈕（產生 tarball）。
 - 啟動時一鍵匯入代管匯出的 tarball。
 - 代管 ↔ 自架 round-trip 一致性自動驗證。
-
-追蹤：`commercial/docs/TODO-personal-edition.md` P4。

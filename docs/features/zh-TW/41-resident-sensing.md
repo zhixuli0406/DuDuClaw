@@ -382,6 +382,13 @@ price 這個欄位上次真的有值的那一次，中間夾了幾筆沒帶 pric
 - `screen` 不是 tick 專屬，它是規則層級的通用欄位，任何 `trigger_event`
   都能掛，只是本文以 tick 場景為主。
 
+v1.67.1 起，這條規則的條件部分可以在儀表板建立（設定 → 自動化 → 新增規則）：
+觸發事件選「監控來源有新資料時」（`tick`），加上兩列條件 `source` 等於
+`twse-2330`、`pct_price` 大於 `2`。表單沒有 `context_ticks` 與 `screen` 的欄位；
+編輯已經帶有它們的規則時會原樣保留，新規則要加上它們只能用
+`autopilot.create` / `autopilot.update`。v1.67.1 之前儀表板表單建不出任何規則
+（見 [23-autopilot-engine.md](23-autopilot-engine.md)）。
+
 ---
 
 ## Dashboard 觀測

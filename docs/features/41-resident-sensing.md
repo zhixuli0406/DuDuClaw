@@ -467,6 +467,16 @@ anywhere:
 - `screen` is not tick-specific — it is a rule-level general field any
   `trigger_event` can carry; this document just focuses on the tick scenario.
 
+Since v1.67.1 the conditions part of this rule can be built in the dashboard
+(Settings → Autopilot → New Rule): pick the trigger "A monitoring source reports
+new data" (`tick`) and add the rows `source` equals `twse-2330` and `pct_price`
+is greater than `2`. The form
+has no fields for `context_ticks` or `screen`. It keeps them when you edit a
+rule that already has them, but a new rule gets them only through
+`autopilot.create` / `autopilot.update`. Before v1.67.1 the dashboard form could
+not create any rule (see
+[23-autopilot-engine.md](23-autopilot-engine.md#the-dashboard-rule-form)).
+
 ---
 
 ## Dashboard observability

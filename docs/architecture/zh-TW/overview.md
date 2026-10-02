@@ -124,7 +124,7 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 ### 任務與知識
 - **Task Board**：以 SQLite 管理任務，追蹤狀態／優先順序／指派，並提供即時 Activity Feed WebSocket。儀表板 RPC：`tasks.list/create/update/remove/assign`、`activity.list`；agent MCP 工具：`tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post`。
 - **共用知識庫**：`~/.duduclaw/shared/wiki/`，具備 Wiki 目標分類（agent/shared/both）。MCP 工具：`wiki_ls/read/write/search/stats/lint` 搭配 `scope="shared"`（`shared_wiki_*` 寫法是已棄用的別名，於 v1.68.0 移除），另有 `shared_wiki_delete` 與 `wiki_share`。
-- **Autopilot 規則引擎**：自動化委派／通知／skill 執行。觸發事件（13 種）：`task_created`、`task_updated`、`task_status_changed`、`activity_new`、`channel_message`、`agent_idle`、`cron_tick`、`run_at_risk`、`os_file`、`os_frontmost`、`tick`、`security_event`、`odoo_event`（[23-autopilot-engine](../../features/zh-TW/23-autopilot-engine.md)）。
+- **Autopilot 規則引擎**：自動化委派／通知／skill 執行。新規則可用的觸發事件（12 種）：`task_created`、`task_updated`、`task_status_changed`、`activity_new`、`channel_message`、`agent_idle`、`run_at_risk`、`os_file`、`os_frontmost`、`tick`、`security_event`、`odoo_event`；`cron_tick` 從不送出，v1.67.1 起建立時拒絕（[23-autopilot-engine](../../features/zh-TW/23-autopilot-engine.md)）。
 
 ### 整合
 - **Odoo ERP 橋接**（`duduclaw-odoo` crate）：支援 CE/EE 的 JSON-RPC 中介層，17 個 MCP 工具（CRM/Sales/Inventory/Accounting）、EditionGate 自動偵測、事件輪詢 + `POST /webhook/odoo`（兩者預設關閉），餵給 `odoo_event` autopilot 規則。透過 `OdooConnectorPool` 做逐 Agent 憑證隔離（RFC-21 §2，v1.11.0）。Dashboard 儲存前測試：`odoo.test` RPC 接受 inline 參數（v1.13.1）— 省略憑證欄位時退回已儲存的密鑰；使用與 `odoo.configure` 相同的 SSRF／HTTPS／資料庫名稱驗證器；`scrub_odoo_error()` 將連線錯誤訊息裁剪至 240 字元，避免洩漏 HTML 或 URL。

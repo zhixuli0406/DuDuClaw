@@ -82,6 +82,13 @@ The in-process backends this page used to list were removed on 2026-09-29 (`wiki
 
 `BackendType::LlamaCpp` and `MistralRs` remain parseable config values so an existing `inference.toml` still loads, but selecting one returns `BackendUnavailable` with a message naming `openai_compat`.
 
+Writes are checked as of v1.67.1:
+
+- `inference.update` (the dashboard inference page) accepts `backend = "openai_compat"` or an empty value, which removes the key so the engine picks `openai_compat` itself. Any other value is refused before anything is written, with a message naming `openai_compat`. One exception keeps old files saveable: a removed value that is already the stored one may be sent back unchanged, so the page can still save other settings until you change it. The page shows such a value labelled as no longer supported.
+- `agents.update` refuses any `[model.local] backend` other than `openai_compat` (this check predates v1.67.1).
+- The scaffold default for `[model.local] backend`, `duduclaw onboard`, `duduclaw wizard` and the shipped agent templates now write `openai_compat` (they wrote `llama_cpp` before).
+- The dashboard no longer shows fields nothing reads: 記憶體上限 (`max_memory_mb`), and the generation rows GPU Layers / Context 大小 (`[generation] gpu_layers` / `context_size`) on the inference page; Context 長度 / GPU Layers (`[model.local] context_length` / `gpu_layers`) on the agent edit page. The external server owns memory, GPU offload and context size. Saved values stay in the files untouched.
+
 ### The InferenceManager state machine
 
 The manager keeps a priority chain with automatic failover:

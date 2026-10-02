@@ -47,7 +47,7 @@ A rule can subscribe to thirteen kinds of `AutopilotEvent`. Each carries a paylo
 | **ActivityNew** | `activity_new` | A new Activity Feed entry is posted | activity object |
 | **ChannelMessage** | `channel_message` | A message arrives on a channel | `channel`, `agent_id`, `text` |
 | **AgentIdle** | `agent_idle` | An agent has been idle | `agent_id`, `idle_minutes` |
-| **CronTick** | `cron_tick` | The scheduler emits a periodic tick | `now` |
+| **CronTick** | `cron_tick` | Never: the variant exists but no producer sends it. Since v1.67.1 a new rule cannot use it (see below) | `now` |
 | **RunAtRisk** | `run_at_risk` | Foresight predicts that a running task is heading for failure | `agent_id`, `session_id`, `score`, `level`, `reasons` |
 | **OsFileEvent** | `os_file` | The agent's `[os_watch]` watcher sees a file change | `agent_id`, `path`, `kind` (created / modified / removed / renamed), `file_name`, `extension` |
 | **OsFrontmostEvent** | `os_frontmost` | The frontmost app or window title changes | `agent_id`, `app`, `window_title`, `prev_app` |
@@ -55,7 +55,7 @@ A rule can subscribe to thirteen kinds of `AutopilotEvent`. Each carries a paylo
 | **SecurityEvent** | `security_event` | A warning- or critical-level audit event, or a security posture change | `severity`, `event_type`, `agent_id`, `source` |
 | **OdooEvent** | `odoo_event` | The Odoo poller or `POST /webhook/odoo` reports an ERP change | `event_type`, `model`, `record_id`, `record` (its top-level scalar keys are also flattened) |
 
-A rule declares which `trigger_event` it cares about, so a `channel_message` rule never even sees a `cron_tick`. The same thirteen names are the legal `first` / `then` events of a `sequence` rule. The engine also carries an internal `cep_trigger` event that the sequence matcher emits to fire a matched rule; it is not a valid `trigger_event`.
+A rule declares which `trigger_event` it cares about, so a `channel_message` rule never sees a `task_created`. `autopilot.create` accepts the twelve names other than `cron_tick`; `autopilot.update` accepts `cron_tick` only when the stored rule already has it, so such a rule can still be saved; changing another rule to `cron_tick` is refused with the same message as on create. Work that should run on a schedule belongs to the cron scheduler (the 例行工作 / Routines page, or `tasks_create` with `schedule`). All thirteen names are still legal `first` / `then` events of a `sequence` rule. The engine also carries an internal `cep_trigger` event that the sequence matcher emits to fire a matched rule; it is not a valid `trigger_event`.
 
 ---
 
@@ -81,6 +81,24 @@ A leaf condition looks up a field by path and applies an operator:
 | `contains` | string contains substring, or array contains value |
 
 A field that is **absent** never satisfies any comparison — including `eq null`. This is deliberate: allowing an absent field to match `eq null` once caused a rule to mass-fire against every event. Missing means no match, full stop.
+
+### No conditions
+
+A rule with no conditions fires on every event of its trigger. "No conditions" is any of: `conditions` absent from the create call, `null`, `{}` or `{ "all": [] }`. `{ "any": [] }` is accepted but never matches.
+
+**Behaviour change in v1.67.1.** `autopilot.create` stores an absent `conditions` as `{}`, and before v1.67.1 the engine treated `{}` as a leaf with an empty field, so such a rule never fired. From v1.67.1 those rules fire on every event of their trigger. `null` and `{ "all": [] }` already matched everything before. To find enabled rules that will start firing, run this on the gateway host and disable or edit any you did not intend:
+
+```bash
+sqlite3 ~/.duduclaw/autopilot.db \
+  "SELECT id, name, trigger_event FROM autopilot_rules
+   WHERE enabled = 1 AND sequence IS NULL AND trim(conditions) = '{}';"
+```
+
+In the dashboard, opening such a rule with the edit button shows "No conditions: the rule runs every time the trigger happens."
+
+### Write-time validation
+
+`autopilot.create` and `autopilot.update` (and enabling an induced rule) validate the condition tree before saving. Each node must be an object: an `all` / `any` group whose value is an array of conditions, or a leaf with a non-empty string `field` and an optional `op` from the table above (`eq` when omitted). Nesting is capped at 16 levels. A refusal names the path of the bad node, for example `conditions.all[1]: a condition needs a non-empty "field" (or use an "all"/"any" group)`. Before v1.67.1 such a leaf was stored and never matched.
 
 ---
 
@@ -208,7 +226,17 @@ autopilot.remove  ── delete a rule
 autopilot.history ── execution log
 ```
 
-Every `create` / `update` validates the `trigger_event` and `action` structure **at write time** — a malformed rule is rejected immediately rather than failing silently later in `autopilot_history`. Every execution (success, error, or breaker transition) appends a row with status and error context.
+Every `create` / `update` validates the `trigger_event`, the `conditions` tree and the `action` structure **at write time** — a malformed rule is rejected immediately rather than failing silently later in `autopilot_history`. Every execution (success, error, or breaker transition) appends a row with status and error context.
+
+### The dashboard rule form
+
+Settings → Autopilot creates and edits rules. Before v1.67.1 its form sent an action with `agent_id` and `prompt_template` where the server requires `target_agent` and `prompt`, offered a `schedule` trigger that does not exist, and wrote conditions such as `from_status` / `idle_minutes` / `cron` that are not field/op/value leaves. The server refused every save, so no rule could be created from the dashboard. Since v1.67.1:
+
+- The trigger list is the twelve events `autopilot.create` accepts, including `tick` ("A monitoring source reports new data") and `odoo_event` ("An Odoo record changes"). A stored rule whose trigger the form does not offer (for example `cron_tick`) keeps it and shows it.
+- Conditions are a list of field / operator / value rows joined by "all" or "any" matching. Field names are suggested per trigger; any name can be typed. For `tick` and `odoo_event` the field names come from your source or Odoo records, and the form says so. Values for `gt` / `gte` / `lt` / `lte` must be numbers; `in` / `not_in` take a comma-separated list. With no rows the form saves `{ "all": [] }`, which fires on every event.
+- Actions are `delegate`, `notify` and `run_skill`, with the required fields from the table above. `notify` offers telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom and dingtalk.
+- Each rule has an edit button. Editing sends only the fields that changed. Conditions the form cannot show as a flat list, event-sequence rules and actions other than the three above are shown as locked and kept exactly as stored. Action keys the form does not own (`screen`, `context_ticks`, …) are kept as stored; the form cannot add them to a new rule, so set those through `autopilot.create` / `autopilot.update`.
+- A refused save shows the server's message inside the dialog.
 
 ---
 

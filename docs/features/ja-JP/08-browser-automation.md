@@ -45,14 +45,14 @@ JavaScript レンダリングのページを扱うには、そのエージェン
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": ["@anthropic-ai/mcp-server-playwright", "--headless"],
+      "args": ["-y", "@playwright/mcp", "--headless"],
       "env": {}
     }
   }
 }
 ```
 
-Browserbase については、`browserbase_mcp_config` が `browserbase` という名前のサーバーを生成し、`npx @browserbasehq/mcp-server-browserbase` を実行します。`env` には `${BROWSERBASE_API_KEY}` と `${BROWSERBASE_PROJECT_ID}` という参照だけが入り、秘密情報そのものは `.mcp.json` に書き込まれません。marketplace のカタログ項目は別のパッケージ名 `@anthropic-ai/mcp-server-browserbase` を指定しているため、実際にどちらをインストールするか確認してください。
+Browserbase については、`browserbase_mcp_config` と marketplace の `browserbase` カードが同じ項目を生成します。`npx -y @browserbasehq/mcp` を実行し、`env` には `${BROWSERBASE_API_KEY}`、`${BROWSERBASE_PROJECT_ID}`、`${GEMINI_API_KEY}`（最後のものはサーバーのデフォルトモデル用）という参照だけが入り、秘密情報そのものは `.mcp.json` に書き込まれません。3つの変数はすべて、AI 従業員の CLI が動く環境に設定する必要があります。v1.67.1 より前は、marketplace のカードと生成される Playwright 項目が npm に存在しないパッケージ名（`@anthropic-ai/mcp-server-playwright`、`@anthropic-ai/mcp-server-browserbase` などの `@anthropic-ai/mcp-server-*`）を指定し、生成される Browserbase 項目は非推奨の `@browserbasehq/mcp-server-browserbase` を使っていました。これらの名前ですでに書き込まれた項目は自動では書き換えられず、CLI が起動しようとすると失敗するため、手動で修正するか再インストールしてください。
 
 DuDuClaw のバイナリには含まれず、L2 からここへのフォールバックもありません。そのエージェントの `allowed_tools` / `denied_tools` が呼び出せるかを決めます。
 

@@ -100,6 +100,8 @@ Tauri 原生桌面版,啟動應用程式時會自動拉起本機 Gateway,全程�
 | Windows x64 | `DuDuClaw_*_x64_en-US.msi` | 未購買 Authenticode 憑證,SmartScreen 會示警;點「更多資訊」→「仍要執行」即可安裝,解鎖細節見 [docs/guides/desktop-unblock.md](docs/guides/desktop-unblock.md) |
 | Linux | `*_amd64.AppImage` / `.deb` | 免簽 |
 
+> macOS 桌面版目前最新是 v1.66.1([desktop-v1.66.1](https://github.com/zhixuli0406/DuDuClaw/releases/tag/desktop-v1.66.1)):v1.67.0 的 macOS 版在 Apple 公證這一步失敗,沒有發佈。Windows 與 Linux 已有 v1.67.0。
+
 裝好打開就是完整體驗——啟動精靈會在應用程式內帶你設定 AI 後端與第一個 agent,不需要另外跑指令。
 
 ### npm(進階 / 伺服器用途,所有平台含 Windows)

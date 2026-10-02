@@ -25,6 +25,8 @@ Nobody else triggers it: regular employee accounts, bindings whose channel accou
 
 Deployments where nobody has bound a channel account yet (say, a one-person company right after install) get **no automatic takeover**. That is deliberate: in that situation the only available identity proof is "the message came from the configured destination", which inside a channel means "you" — applying it would mean the owner's first message silences the AI forever. To pause the AI in such a deployment, use the `!STOP` safe word, or complete one channel binding in the dashboard first.
 
+**Channel bindings are made on the 成員 (Members) page, `/manage/users`, which exists only in enterprise mode.** On a personal install that page and its `users.*` calls are not available, so no channel account can be bound from the dashboard and an admin speaking never starts a takeover; `!STOP` and the `/takeover` status command still work. Enterprise mode comes from the licence tier or the `DUDUCLAW_EDITION=enterprise` environment variable; there is no dashboard switch (see [personal-edition-portability.md](../guides/personal-edition-portability.md)).
+
 Typing `/takeover` in the channel tells you which of these situations you are in.
 
 ### What happens during a takeover

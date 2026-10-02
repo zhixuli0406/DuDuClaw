@@ -7,6 +7,6 @@
 /plugin install duduclaw-connect@duduclaw
 ```
 
-`duduclaw-connect` 內容：DuDuClaw MCP server 註冊（`npx -y duduclaw mcp-server`，200+ 工具）＋一個「何時用哪個工具」的 usage skill。沒有 hooks（信任負擔最低）。
+`duduclaw-connect` 內容：DuDuClaw MCP server 註冊（`npx -y duduclaw mcp-server`，249 個工具）＋一個「何時用哪個工具」的 usage skill。沒有 hooks（信任負擔最低）。
 
 維護：版本隨 npm 包演進不需每版更新（npx 抓 latest）；marketplace.json 的 plugin version 只在 skill/結構變動時 bump。

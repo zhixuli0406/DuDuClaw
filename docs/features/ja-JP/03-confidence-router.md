@@ -84,6 +84,13 @@ CJK（中国語・日本語・韓国語）ユーザーにとって微妙です�
 
 `BackendType::LlamaCpp` と `MistralRs` は既存の `inference.toml` が読めるようパース可能な値として残していますが、選択すると `openai_compat` を案内する `BackendUnavailable` が返ります。
 
+v1.67.1 から書き込み時に検査します。
+
+- `inference.update`（ダッシュボードの推論ページ）は `backend = "openai_compat"` または空の値だけを受け付けます。空の値はキーを削除し、エンジンが自分で `openai_compat` を選びます。それ以外の値は何も書き込む前に拒否され、`openai_compat` を案内するメッセージが返ります。古いファイルを保存できるよう例外が1つあります。すでに保存されている削除済みの値をそのまま送り返した場合は受け付けるので、変更するまでの間もこのページで他の設定を保存できます。ページではその値をサポート終了と表示します。
+- `agents.update` は `openai_compat` 以外の `[model.local] backend` を拒否します（この検査は v1.67.1 以前からあります）。
+- `[model.local] backend` のデフォルト値、`duduclaw onboard`、`duduclaw wizard`、同梱のエージェントテンプレートは `openai_compat` を書くようになりました（以前は `llama_cpp`）。
+- 何も読まないフィールドをダッシュボードから外しました。推論ページの「記憶體上限」（`max_memory_mb`）、生成設定の「GPU Layers」「Context 大小」（`[generation] gpu_layers` / `context_size`）、AI 従業員編集ページの「Context 長度」「GPU Layers」（`[model.local] context_length` / `gpu_layers`）です。メモリ、GPU オフロード、コンテキスト長は外部サーバーが管理します。保存済みの値はファイルにそのまま残ります。
+
 ### InferenceManager ステートマシン
 
 マネージャーは自動フェイルオーバー付きの優先チェーンを維持します：

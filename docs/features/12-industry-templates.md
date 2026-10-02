@@ -211,6 +211,11 @@ trigger. Alongside `event_type` / `model` / `record_id`, each record's
 top-level scalar fields are available directly, so a condition reads
 `{"field": "state", "op": "eq", "value": "sale"}` with no extra plumbing.
 
+Since v1.67.1 such a rule can also be created in the dashboard (Settings →
+Autopilot → New Rule, trigger "An Odoo record changes"): type the Odoo field
+name, for example `state`, as the condition field. Before v1.67.1 the dashboard
+form could not create any rule.
+
 Security notes, because this endpoint is reachable from outside:
 
 - While `webhook_enabled` is off the route returns **404** — a stock install

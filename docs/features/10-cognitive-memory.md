@@ -160,7 +160,7 @@ The shipped embedder is a local character n-gram hashing embedder (no model down
 
 ## Cross-Agent Knowledge Sharing
 
-Memory is per agent. The memory tools (`memory_search`, `memory_store`, `memory_read`, …) only read and write the calling agent's own namespace; there are no per-memory sharing levels. Knowledge that several agents need goes into the shared wiki instead:
+Memory the gateway writes (conversation and profile distillation, approved reviews, key facts) is per agent. The MCP memory tools (`memory_search`, `memory_store`, `memory_read`, …) read and write the namespace of the MCP key; every employee the gateway spawns uses the gateway's internal key, so through those tools all employees of one gateway share one namespace (`internal/gateway-internal`), separate from the gateway-written memory of each employee. This is a known limit, see [20-memory-intelligence.md](20-memory-intelligence.md#known-limit-two-memory-namespaces-not-fixed-in-v1671). There are no per-memory sharing levels. Knowledge that several agents need goes into the shared wiki instead:
 
 ```
 Agent A (customer support) needs product info

@@ -45,14 +45,14 @@ L1 與 L2 都不執行 JavaScript。單頁應用（SPA）只會回傳空殼。
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": ["@anthropic-ai/mcp-server-playwright", "--headless"],
+      "args": ["-y", "@playwright/mcp", "--headless"],
       "env": {}
     }
   }
 }
 ```
 
-Browserbase 方面，`browserbase_mcp_config` 產生名為 `browserbase` 的 server，執行 `npx @browserbasehq/mcp-server-browserbase`，`env` 只放 `${BROWSERBASE_API_KEY}` 與 `${BROWSERBASE_PROJECT_ID}` 這兩個參照，金鑰本身不會寫進 `.mcp.json`。marketplace 目錄裡的項目用的是另一個套件名稱 `@anthropic-ai/mcp-server-browserbase`，安裝前請確認實際裝的是哪一個。
+Browserbase 方面，`browserbase_mcp_config` 與 marketplace 的 `browserbase` 卡片產生同一個項目：執行 `npx -y @browserbasehq/mcp`，`env` 只放 `${BROWSERBASE_API_KEY}`、`${BROWSERBASE_PROJECT_ID}`、`${GEMINI_API_KEY}` 三個參照（最後一個給這個 server 的預設模型用），金鑰本身不會寫進 `.mcp.json`。這三個變數都要設在 AI 員工的 CLI 執行時的環境裡。v1.67.1 之前，marketplace 卡片與產生的 Playwright 項目用的是 npm 上不存在的套件名稱（`@anthropic-ai/mcp-server-playwright`、`@anthropic-ai/mcp-server-browserbase` 等 `@anthropic-ai/mcp-server-*`），產生的 Browserbase 項目則用已棄用的 `@browserbasehq/mcp-server-browserbase`；已經用這些名稱寫入的項目不會被自動改寫，CLI 啟動它時會失敗，請手動修改或重新安裝。
 
 它不在 DuDuClaw binary 裡，L2 也不會自動降級到它。該 agent 的 `allowed_tools`／`denied_tools` 決定能不能呼叫。
 

@@ -82,6 +82,13 @@ DuDuClaw 的信心路由器就是 LLM 查詢的差旅審核員，評估每個查
 
 `BackendType::LlamaCpp` 與 `MistralRs` 保留成可解析的設定值，讓舊的 `inference.toml` 仍能載入，但選到它們會回 `BackendUnavailable`，訊息指向 `openai_compat`。
 
+v1.67.1 起寫入時會檢查：
+
+- `inference.update`（儀表板推論頁）只接受 `backend = "openai_compat"` 或空值。空值會刪掉這個鍵，由引擎自己選 `openai_compat`。其他值在寫入任何東西之前就被拒絕，訊息指向 `openai_compat`。有一個例外讓舊檔案仍能儲存：已經存在檔案裡的已移除值原樣送回時照收，所以在你改掉它之前，這一頁仍能儲存其他設定。頁面會把這種值標示為已停止支援。
+- `agents.update` 拒絕 `openai_compat` 以外的 `[model.local] backend`（這項檢查在 v1.67.1 之前就有）。
+- `[model.local] backend` 的預設值、`duduclaw onboard`、`duduclaw wizard` 與內建 agent 範本現在都寫 `openai_compat`（之前寫 `llama_cpp`）。
+- 儀表板拿掉了沒有程式讀取的欄位：推論頁的「記憶體上限」（`max_memory_mb`）、生成設定的「GPU Layers」「Context 大小」（`[generation] gpu_layers`／`context_size`）；AI 員工編輯頁的「Context 長度」「GPU Layers」（`[model.local] context_length`／`gpu_layers`）。記憶體、GPU 卸載與 context 大小由外部伺服器自己管。已儲存的值留在檔案裡不動。
+
 ### InferenceManager 狀態機
 
 管理器維護一條帶自動容錯的優先鏈：

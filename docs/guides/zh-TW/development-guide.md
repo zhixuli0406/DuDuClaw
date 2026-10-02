@@ -144,7 +144,7 @@ cat ~/.duduclaw/agents/my-bot/.mcp.json
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": ["@anthropic-ai/mcp-server-playwright", "--headless"],
+      "args": ["-y", "@playwright/mcp", "--headless"],
       "env": {}
     }
   }
@@ -152,8 +152,9 @@ cat ~/.duduclaw/agents/my-bot/.mcp.json
 ```
 
 **前置需求：**
-- `npm install -g @anthropic-ai/mcp-server-playwright`
-- Playwright Chromium：`npx playwright install chromium`
+- 需要 Node.js 與 `npx`。`npx -y` 會在第一次啟動時下載 `@playwright/mcp`，不必全域安裝。
+- 需要一個這個 server 能啟動的瀏覽器。要哪一個、怎麼安裝，請看 `@playwright/mcp` 的 README，這裡不重複。
+- v1.67.1 之前這個範例寫的是 `@anthropic-ai/mcp-server-playwright`，npm 上沒有這個套件。照舊範例寫的 `.mcp.json` 仍是這個名稱，啟動時會失敗，請改成上面那一行。
 
 這個 server 的工具能不能被該 agent 呼叫，由 `[capabilities] allowed_tools` / `denied_tools` 決定。
 

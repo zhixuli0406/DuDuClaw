@@ -277,6 +277,7 @@ Not evolution toggles, but part of the same learn-and-verify surface:
 | Key | Default | Page |
 |---|---|---|
 | `config.toml [memory] novelty_gate` | `true` | [memory-and-knowledge.md](./memory-and-knowledge.md) — rejects near-duplicate semantic memories |
+| `config.toml [memory] supersession_trust_guard` | `true` (v1.67.1) | [20-memory-intelligence.md](../features/20-memory-intelligence.md#supersession-trust-guard-v1671) — a lower-trust write cannot replace a more trusted current fact; distilled claims go to dashboard review |
 | `config.toml [dispatch] grounding_precheck_enabled` | `true` | [goal-loop.md](./goal-loop.md) — zero-LLM evidence check before the acceptance judge |
 | `config.toml [dispatch] two_stage_judge` | `true` | [goal-loop.md](./goal-loop.md) — cheap first-stage evaluator before the MAV acceptance panel |
 | `config.toml [goal_loop] resume_on_restart` | `"pause"` | [goal-loop.md](./goal-loop.md) — escalates in-flight goal tasks to `needs_human` on gateway restart; set `"auto"` to resume them instead. Dashboard: Settings → Automation |

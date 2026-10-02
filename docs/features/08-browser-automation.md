@@ -45,14 +45,14 @@ Nothing writes this entry automatically. `crates/duduclaw-agent/src/mcp_template
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": ["@anthropic-ai/mcp-server-playwright", "--headless"],
+      "args": ["-y", "@playwright/mcp", "--headless"],
       "env": {}
     }
   }
 }
 ```
 
-For Browserbase, `browserbase_mcp_config` builds a `browserbase` server that runs `npx @browserbasehq/mcp-server-browserbase` with `env` holding the references `${BROWSERBASE_API_KEY}` and `${BROWSERBASE_PROJECT_ID}`, so the secrets themselves are never written to `.mcp.json`. The marketplace catalog entry names a different package, `@anthropic-ai/mcp-server-browserbase`; check which one you actually install.
+For Browserbase, `browserbase_mcp_config` and the marketplace `browserbase` card build the same entry: `npx -y @browserbasehq/mcp` with `env` holding the references `${BROWSERBASE_API_KEY}`, `${BROWSERBASE_PROJECT_ID}` and `${GEMINI_API_KEY}` (the last one is for the server's default model), so the secrets themselves are never written to `.mcp.json`. All three variables must be set in the environment the agent's CLI runs in. Before v1.67.1 the marketplace cards and the generated Playwright entry named packages that do not exist on npm (`@anthropic-ai/mcp-server-playwright`, `@anthropic-ai/mcp-server-browserbase` and the other `@anthropic-ai/mcp-server-*` names), and the generated Browserbase entry used the deprecated `@browserbasehq/mcp-server-browserbase`; an entry already written with one of those names is left as it is and fails when the CLI tries to start it, so edit or reinstall it.
 
 It is not part of the DuDuClaw binary and there is no fallback from L2 into it. The agent's `allowed_tools` / `denied_tools` decide whether the agent may call it.
 

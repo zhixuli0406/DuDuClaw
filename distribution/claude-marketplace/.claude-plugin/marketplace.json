@@ -5,14 +5,14 @@
     "url": "https://github.com/zhixuli0406"
   },
   "metadata": {
-    "description": "Official DuDuClaw plugins — connect Claude Code to your self-hosted AI-employee platform (channels, persistent memory, task board, shared wiki, 200+ MCP tools).",
+    "description": "Official DuDuClaw plugins — connect Claude Code to your self-hosted AI-employee platform (channels, persistent memory, task board, shared wiki, 249 MCP tools).",
     "version": "0.1.0"
   },
   "plugins": [
     {
       "name": "duduclaw-connect",
       "source": "./plugins/duduclaw-connect",
-      "description": "Wire Claude Code to a local DuDuClaw gateway: 200+ MCP tools (memory, wiki, tasks, channels) + a usage skill.",
+      "description": "Wire Claude Code to a local DuDuClaw gateway: 249 MCP tools (memory, wiki, tasks, channels) + a usage skill.",
       "version": "0.1.0",
       "author": { "name": "DuDu Digital" },
       "homepage": "https://github.com/zhixuli0406/DuDuClaw",

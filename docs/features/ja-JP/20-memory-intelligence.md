@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_valid
 
 ### 自動コンフリクト解決
 
-`store_temporal(entry, TemporalMeta)` が `subject` と `predicate` の**両方**を伴って呼ばれると、エンジンは `(agent_id, subject, predicate)` を事実の同一性として扱います。同じトリプルを持つ現在有効な行は、新しい行を挿入する前にクローズされます：
+`store_temporal(entry, TemporalMeta)` が `subject` と `predicate` の**両方**を伴って呼ばれると、エンジンは `(agent_id, subject, predicate)` を事実の同一性として扱います。同じトリプルを持つ現在有効な行は、新しい行を挿入する前にクローズされます。ただし現在の事実のほうが信頼度が高い場合は書き込みが拒否されます（[後述](#置き換え時の信頼度チェックv1671)）：
 
 ```
 store_temporal(agent="dudu",
@@ -122,14 +122,61 @@ store_temporal(agent="dudu",
 
 `invalidate_by_origin(agent, origin, since)`（MCP `memory_invalidate_by_origin`、scope `admin`）は、汚染されたソースへの是正弁です：**厳密な** `origin`（部分文字列ではなく等値）のすべての現在有効な事実を失効させ（削除は決してしない）、任意で `since` 以降に知った事実に限定できます。`derived_from` が削除された id を参照する事実は、その `origin_trust` が ≤ 0.1 に切り下げられます（汚染された入力の派生物は信頼され続けられません）。`search()` はこれら削除された事実の返却を即座に停止し、`get_history()` は `invalidated_by_event = "origin_purge"` として完全なチェーンを保持します。
 
+v1.67.1 から、AI 従業員とみなされる呼び出し元は、agent 派生の上限より低い `channel`、`mcp_external`、`tool_echo` の3クラスしか失効させられません。それ以外のオリジンは拒否され、`memory_invalidate_refused` として監査されます。この判定は fail-closed です。gateway の共有内部キーを使う呼び出し元は、プロセスに従業員の身元があるかどうかにかかわらず AI 従業員とみなされ、従業員や一時従業員（`eph-` で始まる id）に属するキーも同様です。どの従業員にも対応しない admin キーだけが制限を受けません。以前は、誘導された AI 従業員が1回の呼び出しで、自分の名前空間にあるオペレーター水準の事実をすべて失効させられました（どの名前空間かは後述の既知の制限を参照）。
+
 ### 書き込み側の汚染防護（D2）
 
 D1 は汚染されたソースを*取り消す*ことができます；D2 はほとんどの汚染をそもそも入り込ませません（PoisonedRAG、arXiv:2402.07867）。自動蒸留の書き込みパスは両端で守られます：
 
 - **書き込み側スキャン + バースト検知。**蒸留された事実が保存される前に、その内容と `(subject, predicate, object)` が共有のプロンプトインジェクションルールエンジンを通ります：一致すればその事実は**破棄**され（fail-closed、決して書き込まれない）、`prompt_injection` セキュリティ監査イベントが記録されます。別途、per-`(agent, origin, subject)` のスライディングウィンドウカウンタ（`knowledge_guard`、dispatch ブレーカーと同じ永続化 + advisory-lock パターン）があり、単一のオリジンがウィンドウ内で同じ subject について `>= max_per_subject` 件の事実を書き込むと、バッチを隔離します（「One Shot Dominance」／k-doc パターン）。隔離された事実は `quarantined = 1` で保存され、**不活性**です：クリーンな事実を決して置換せず、人間が判断するまですべての取得読み取りパス（FTS、graph、vector、`list_recent`、`summarize`）から除外されます。
-- **処理。**隔離は `ApprovalBroker` リクエスト（`action_kind = "knowledge_quarantine"`）を発行し、`knowledge.quarantined` イベントを送出します。承認 → 事実は解放されます（`quarantined = 0`、取得可能に）；拒否 → 事実は失効し（`invalidated_by_event = "quarantine_reject"`）、その `origin_trust` が ≤ 0.1 に切り下げられます；TTL 失効は拒否とみなされます（fail-closed）。
+- **処理。**隔離は `ApprovalBroker` リクエスト（`action_kind = "knowledge_quarantine"`、期限 24 時間）を発行し、`knowledge.quarantined` イベントを送出します。承認 → 各事実は通常の時系列ルールと下記の置き換え信頼度チェックを通して解放されます。現在の事実になる（または再確認、または履歴として保存）か、より信頼度の高い現在の事実に阻まれたものは、独自の審査項目を持つ保留主張に変わり、そのまま適用はされません（v1.67.1。以前は承認でフラグを外すだけでした）。書き込み時点でチェックに拒否されるバースト事実は、バースト一括ではなく直接保留主張になります。変換時に本文が 600 文字を超える行は審査項目を作らず、`memory_supersession_refused`（`not_held_reason: "too_long"`）として監査だけされます。部分的な失敗の後に同じバースト項目を再び承認すると、不足している衝突審査項目を作成します（既存かどうかの判定は衝突項目だけを数えます）。拒否 → 事実は失効し（`invalidated_by_event = "quarantine_reject"`）、その `origin_trust` が ≤ 0.1 に切り下げられます；TTL 失効は拒否とみなされます（fail-closed）。
 
 **ランキング側の信頼。**`origin_trust` は取得ランキングに参加するようになりました（重み `w_trust`、デフォルト 0.10）：各候補のスコアは `(1 − w_trust) + w_trust · origin_trust` で乗算されるため、未検証のチャネル蒸留事実（trust 0.3）はキュレートされた事実（trust 1.0）を上回れません。HippoRAG-lite graph では、トリプルのエッジがその `origin_trust` で重み付けされ、低信頼な事実の Personalized-PageRank の質量を縮小します。これは「単一の汚染トリプルが PPR によって2ホップ増幅される」経路を直接抑制します。レガシー行（trust 1.0）は D2 以前のパスとバイト単位で同一にランクされます。
+
+### 置き換え時の信頼度チェック（v1.67.1）
+
+v1.67.1 より前は、同じ `(agent, subject, predicate)` の新しい事実が、出典に関係なく必ず現在の事実を置き換えていました。チャット会話から抽出された事実（信頼度 0.3）は、同じ subject と predicate の現在の事実を、その信頼度にかかわらず置き換えていました。たとえば AI 従業員が自分で導いた事実や出典が記録されていない行（0.6）、キーが一致すればインポートされた事実（0.7）も対象でした。オペレーターが承認した事実（1.0）は v1.67.1 から、後述の審査承認によって書き込まれるようになったもので、このチェックで保護されます。現在の `store_temporal` は、置き換える前に信頼度を比較します（`duduclaw-memory/src/supersession_guard.rs`）。
+
+- 書き込みの信頼度は実効 `origin_trust`（オリジンクラスの上限と `derived_from` の制限を適用した後の値）です。現在の事実の信頼度は保存済みの `origin_trust` をそのクラスの上限で頭打ちにした値で、オリジン紐付け以前に書かれた行は `unattributed`（0.6）として読みます。裏付けは `confidence` を上げるだけで信頼度は上げないため、比較には入りません。
+- そのトリプルの現在有効で隔離されていない行のどれかが、書き込みより厳密に高い信頼度を持つ場合、何も書き込みません。同じかそれ以上の信頼度なら従来どおり置き換え、古い行は履歴チェーンに残ります。
+- 同じ object の再確認、完全なトリプルを持たない書き込み、時系列が前の履歴セグメント（古い `valid_from`）はチェックの対象外です。
+- チェックは `subject` と `predicate` の文字列の完全一致で比べます。同じ事実が綴りの違う subject や predicate で保存された場合は別のトリプルとして扱われ、従来どおり併存します。
+
+オリジンクラスの上限（`origin.rs`）：`user_direct`（旧エイリアス `user` を含む）1.0、`operator` 1.0、`import` 0.7、`agent_derived` 0.6、`user_profile` 0.6、`unattributed` 0.6、`tool_echo` 0.5、`channel` 0.3、`mcp_external` 0.3。`user_profile` は v1.67.1 で独立したクラスになりました。以前は `user_direct` のエイリアスで上限 1.0 でした。`user_profile_record` MCP ツールと、話者が自分について述べた内容のプロフィール抽出は、どちらも `user_profile` で書き込みます（抽出は以前 `channel`、0.3 でした）。そのため AI 従業員の記録とユーザーの後の発言は審査なしで互いを訂正できますが、どちらもオペレーターが承認した値は置き換えられません。
+
+書き込み経路ごとの拒否時の扱い：
+
+| 経路 | 拒否されたとき |
+|---|---|
+| 会話事実の抽出（`wiki_ingest`、オリジン `channel`） | 審査待ちとして保留（後述） |
+| ユーザープロフィール特性の抽出（`profile_distill`、オリジン `user_profile`） | 審査待ちとして保留（後述） |
+| `user_profile_record` MCP ツール | エラー（"a more trusted value already exists for this field, so it was not changed"）を返し、書き込みません |
+| `duduclaw migrate-from` | その項目をスキップとして報告します |
+| フットプリント抽出、reflexion ルール統合、夜間エンジンのスキーマと統合 | その項目をスキップしてログに記録します |
+| その他の `store_temporal` 呼び出し元 | 双方の信頼度を記したエラーを受け取ります |
+
+**保留された主張。** 2つの抽出経路では、拒否された主張を不活性な行として保存し（`quarantined = 1`、トリプルは `metadata.held_claim` のみに保持、検索からは見えません）、ダッシュボードの受信箱（收件匣）に `knowledge_quarantine` の審査項目を作成します。項目は保存された保留行だけから作られ、承認で書き込まれるものをすべて示します。新しい主張の全文と新しい値が、現在の内容と現在の値と並べて表示され、ユーザープロフィールの場合は誰のプロフィールか（ユーザー id）も示されます。600 文字を超える現在の内容は切り詰められ、その旨が表示されます。600 文字を超える主張は審査に回されず、監査（`not_held_reason: "too_long"`）にだけ記録されます。同じ主張（subject、predicate、object が同じ）がすでに審査待ちなら、重複して保留しません。AI 従業員ごとに UTC の1日あたり新規 20 件までです。その日に初めて上限を超えたとき、アクティビティフィードにイベントが1件（`knowledge_review_cap_reached`）出ます。上限を超えた拒否はすべて監査ログ（`memory_supersession_refused`、`review_cap_hit: true`、`not_held_reason: "daily_cap"`）にだけ記録されます。
+
+- 承認：審査項目の元になった保存済みの主張そのものを、オペレーター権限（オリジン `operator`）で書き込み、現在の事実を置き換えます。審査項目はその主張（内容、subject、predicate、object）のダイジェストを持ちます。項目の作成後に主張または保護対象の事実が変わっていた場合は何も書き込まず、状況が変わったことを結果として示し、保留行を閉じます。同じ主張が再び現れたら、改めて審査に回ります。
+- 変更を適用してから決定を記録し、同じ項目への承認と却下は1件ずつ順に処理されます。適用に失敗した場合、項目は審査待ちのまま残り、ダッシュボードにサーバーのエラーが表示され、やり直せます。変更は適用されたのに決定を記録できなかった場合（途中で期限切れになった、またはストアのエラー）、ダッシュボードには何が適用されたかを示すエラーが返り、監査ログ `knowledge_review_decision_unrecorded` が書かれます。
+- 却下：主張を破棄します。
+- 24 時間の期限を過ぎた項目は承認できず、期限切れは却下とみなします。
+- これらの項目はダッシュボードでのみ、manager または admin ロールのアカウントが決定します（`approvals.decide`）。チャットチャネルにはボタンも主張の内容も含まない通知だけが届き、主張の出どころの会話には送られません。古いボタンの押下やテキストでの返信による決定は拒否され、ダッシュボードへの案内が返ります。Telegram Mini App の詳細画面も、これらの項目については同じ通知だけを表示します。v1.67.1 より前は、チャネルで知識審査のボタンを押すと承認が決定済みになるだけで、何も解放されませんでした。
+- 毎日の掃除（メモリ減衰と一緒に実行）が、審査項目が待機中でなくなり作成から1時間を超えた隔離行（保留された主張とバースト一括の両方）を、却下として閉じます。
+- データ主体のエクスポートと削除（`gdpr.rs`）は、保留された主張の subject と object も照合します。削除された保留主張は承認できなくなります。`duduclaw gdpr erase <contact> --confirm` は、削除された行を含む審査待ちの項目を取り下げ、状態にかかわらずそうした項目の本文を審査ストアから置き換え、対応する `knowledge.quarantined` イベントを削除します。行 id を持たないイベント（注入スキャンでの破棄など）は照合できず、7 日間のイベント保持期間が過ぎると削除されます。前の手順が失敗しても後の手順はすべて実行され、失敗は一覧表示され、コマンドは非ゼロで終了して同じコマンドの再実行を案内します（繰り返しても安全です）。再実行でメモリ行が見つからなくても、subject の完全一致で審査項目とイベントからその人の文字列を取り除きます。
+- スケジュールやシステムのプロンプト（疑似ユーザー `system`）はユーザープロフィールを書き込まなくなりました。`user_profile_record` は疑似ユーザー（`system`、`anonymous`、`unknown`）を拒否し、predicate と値の両方をプロンプトインジェクションのスキャンにかけ、ブロック水準に達すると拒否します。
+
+`config.toml [memory] supersession_trust_guard`（デフォルト `true`）を `false` にするとこのチェックを無効にできます。この設定を読むのは、gateway が `memory_factory::build_memory_engine` で作るエンジンと、`duduclaw mcp-server` のメモリエンジンです。直接作られるエンジン（ダッシュボードのメモリ RPC や `duduclaw migrate-from` など）は設定に関係なく常にチェックが有効です。実際のチャットチャネルでは未検証です。
+
+### 既知の制限：2つのメモリ名前空間（v1.67.1 では未修正）
+
+AI 従業員が MCP のメモリツール（`memory_store`、`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_alias_add` / `memory_alias_list`、`memory_get_history`、`memory_get_at`、`memory_invalidate_by_origin`、`user_profile_record`、`user_profile_get`、`user_code_profile`）で読み書きするメモリの名前空間は、MCP キーから決まります。gateway が起動する AI 従業員はすべて gateway の内部キーを使うため、1つの名前空間 `internal/gateway-internal` を共有します（このキーが導入された v1.44.0 からそうなっています）。gateway 自身の処理（会話とプロフィールの抽出、審査の承認、重要事実とプロフィールブロックのプロンプトへの注入）は従業員自身の id を使います。その結果：
+
+- 同じ gateway の AI 従業員は、これらのツールで保存したメモリを共有します。
+- AI 従業員がツールで保存した内容は、gateway がその従業員のプロンプトに注入する内容とは別物で、従業員の `memory_search` からは gateway が抽出した内容は見えません。プロフィールブロックに反映されるのは抽出された特性と承認済みの審査で、`user_profile_record` の呼び出しではありません。
+- 信頼度チェックは1つの名前空間の中でしか比較しません。gateway が抽出した事実とオペレーターが承認した事実をチャット由来の書き込みから守りますが、2つのプールの間を調停はしません。
+
+従業員間の分離が成り立つのは gateway が書き込んだメモリだけです。これを変えるにはデータ移行が必要で、予定はまだ決まっていません。
 
 ### 自動作成されたナレッジページ（WP5c）
 
@@ -270,6 +317,13 @@ get_by_ids(namespace, ids)
 enabled = true          # 同一オリジンのバースト検知器のマスタースイッチ。デフォルト true
 window_secs = 3600      # スライディングウィンドウ長（秒）。デフォルト 3600（1 時間）
 max_per_subject = 5     # 1 つのオリジンがウィンドウ内で同一 subject に書き込める事実の上限。超えると隔離。デフォルト 5
+```
+
+置き換え時の信頼度チェックはデフォルトで有効です：
+
+```toml
+[memory]
+supersession_trust_guard = true   # false = 信頼度の低い書き込みが再び信頼度の高い現在の事実を置き換えられる（v1.67.1 より前の動作）
 ```
 
 書き込みパスのインジェクションスキャンは無条件です（設定なし）。ランキングの信頼重み `w_trust`（デフォルト 0.10）は `RetrievalWeights`（エンジン単位、config キーではない）にあります；`w_trust = 0.0` のときランキングは D2 以前のパスとバイト単位で同一です。

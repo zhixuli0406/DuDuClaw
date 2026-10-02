@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+### Added
+- **自動化規則可以在儀表板編輯**：「設定 → 自動化」的每條規則多了編輯按鈕。編輯時只送出有改動的欄位；表單無法攤成清單的條件、事件序列規則、以及委派／通知／執行技能以外的動作會顯示為鎖定並原樣保留，`screen`、`context_ticks` 等表單不管的動作欄位也原樣保留。
+
+### Changed
+- **行為變更：沒有條件的自動化規則現在每次事件都會執行**。建立規則時沒帶 `conditions` 會存成 `{}`；之前引擎把 `{}` 當成欄位為空的條件，這種規則從來沒觸發過。現在 `{}`、`null`、沒帶 `conditions`、`{ "all": [] }` 都代表「觸發事件每次發生都執行」（`{ "any": [] }` 仍然永遠不匹配）。升級後原本不會動的規則可能開始執行，請先在 gateway 主機查出已啟用的這類規則，不想要的停用或補上條件：`sqlite3 ~/.duduclaw/autopilot.db "SELECT id, name, trigger_event FROM autopilot_rules WHERE enabled = 1 AND sequence IS NULL AND trim(conditions) = '{}';"`。在儀表板用編輯按鈕打開這種規則，會顯示「目前沒有設定條件」。說明見 `docs/features/23-autopilot-engine.md`。
+- **自動化規則的條件在儲存時檢查**：`autopilot.create`、`autopilot.update` 與啟用歸納規則時，條件樹的每個節點必須是 `all`／`any` 群組或帶非空 `field` 的條件，`op` 必須是已知運算子，巢狀最多 16 層。不合格會拒絕儲存，訊息寫出出錯節點的路徑（例如 `conditions.all[1]`）。之前這種條件會被存下來，然後永遠不匹配。
+- **行為變更：`cron_tick` 不能再用來建立新規則**：沒有任何程式送出這個事件，掛在上面的規則永遠不會觸發。`autopilot.create` 與規則歸納會拒絕它，訊息指向排程工作。`autopilot.update` 只在規則原本就是 `cron_tick` 時接受（已存的規則照常可以儲存），把其他規則改成 `cron_tick` 會和建立時一樣被拒絕。要定時執行請用「例行工作」頁或帶 `schedule` 的 `tasks_create`。
+- **行為變更：本地推論設定只接受 `openai_compat`**：`inference.update`（儀表板推論頁）收到 `llama_cpp`、`mistral_rs` 等已移除的 `backend` 會在寫入前拒絕，訊息指向 `openai_compat`；空值會刪掉這個鍵，由引擎自動選用。檔案裡已經存的舊值原樣送回時照收，所以改掉它之前其他設定仍能儲存。推論頁的「推論後端」改成下拉選單（未指定／OpenAI 相容伺服器），舊值會標示「已停止支援」；選「未指定」儲存時送出空值，檔案裡的舊後端因此被移除；被拒絕時在頁面上顯示伺服器訊息。`[model.local] backend` 的預設值、`duduclaw onboard` 與 `duduclaw wizard`、內建的 evaluator／manufacturing／restaurant／trading 範本與 system-operator preset 改寫 `openai_compat`（之前寫 `llama_cpp`）。
+- **行為變更：`user_profile` 來源的可信度上限由 1.0 降為 0.6**。`user_profile_record` MCP 工具（AI 員工記下的使用者資料）與使用者輪廓萃取（說話者描述自己，之前寫成 `channel`，0.3）現在都用 `user_profile` 類別、上限 0.6。兩者可以互相更正、不需審核，但都無法取代操作者核准過的值（1.0）或匯入的值（0.7）；工具說明註明 `origin_trust` 參數最多存成 0.6。舊資料列在比較時一律以 0.6 計。
+- **爆量隔離的核准也經過可信度檢查**：同一來源一小時內對同一主題寫入 5 筆以上而被隔離的批次，核准時每筆照一般時序規則套用（之前核准只是清掉隔離旗標）；會和可信度更高的現有內容衝突的那幾筆，改成各自的審核項目，不直接套用。寫入當下就會被擋的爆量事實直接進審核項目。轉換時文字超過 600 字的不建立審核項目，只記稽核 `memory_supersession_refused`（`not_held_reason: "too_long"`）。部分失敗後再次核准同一個爆量項目，會補建還缺的衝突審核項目。
+- **行為變更：知識審核只能在儀表板決定**。`knowledge_quarantine` 類審核推到聊天通道時只是一則沒有按鈕、不含說法內容的通知（不會送回說法來源的對話，見 Security）；按舊按鈕或用文字回覆決定都會被拒絕，並提示到儀表板處理。需要 manager 或 admin 角色。過了 24 小時期限的項目無法核准。同一個項目的核准與拒絕依序逐一處理；變更已套用但決定沒能記錄時（項目剛好逾期，或儲存發生錯誤），儀表板會收到說明已套用了什麼的錯誤，並寫入稽核 `knowledge_review_decision_unrecorded`。收件匣的知識審核不再顯示「在通道開啟」按鈕。
+- **npm 套件說明**：`npm/duduclaw/package.json` 的 description 改為現況：Claude Code、Codex、Antigravity 等 AI CLI，249 個 MCP 工具、11 個訊息通道、單一 Rust 執行檔。Claude Code plugin marketplace 清單與 MCP registry 的 `server.json` 也把「200+」改成 249。
+
+### Removed
+- **儀表板上沒有程式讀取的欄位**：「設定 → 語音」的語音回覆模式、語音辨識、語言（`voice_reply_enabled`、`asr_provider`、`asr_language`）；推論頁的記憶體上限（`max_memory_mb`）與生成設定的 GPU Layers、Context 大小（`[generation] gpu_layers`／`context_size`）；AI 員工編輯頁本地模型區的 Context 長度與 GPU Layers（`[model.local] context_length`／`gpu_layers`）。這些值由外部推論伺服器自己管理，或根本沒有讀取端。已經存在設定檔裡的值保持原樣，頁面儲存時不再送出或改動它們。語音分頁保留文字轉語音的供應商與聲音（`tts_provider`／`tts_voice`，`POST /api/tts` 會讀），以及進階卡片的語音轉文字設定。
+- **MCP 工具市集移除六張卡片**：GitHub、Slack、PostgreSQL、SQLite、Fetch、Brave Search。它們指向的套件不存在，或上游已不再維護。內建的替代：GitHub 用 `github_*` 工具（需在儀表板連接 GitHub），PostgreSQL／SQLite 用內建唯讀資料庫連接器（`db_*` 工具，需替 AI 員工授權資料來源），抓網頁用 `web_fetch_cached`／`web_extract`，搜尋用 `web_search`。Slack 沒有內建的替代工具。要繼續用這些伺服器，可以把定義寫進 `~/.duduclaw/marketplace.json` 或手動加入 `.mcp.json`。
+
+### Fixed
+- **儀表板建不出自動化規則**：「設定 → 自動化」的表單送出的動作欄位是 `agent_id`／`prompt_template`（伺服器要 `target_agent`／`prompt`），還提供不存在的 `schedule` 觸發事件，伺服器每次都拒絕。新表單照伺服器的格式送出：觸發事件是建立規則時接受的十二個事件（含 `tick` 監控來源與 `odoo_event` Odoo 資料變動）；條件是「欄位／比較方式／比較值」的列，可選全部符合或任一符合，`tick` 與 `odoo_event` 會提示欄位名稱的來源；動作是委派、通知（十個通道）、執行技能。儲存被拒絕時在對話框內顯示伺服器訊息。
+- **MCP 工具市集的一鍵卡片指向不存在的 npm 套件**（`@anthropic-ai/mcp-server-*`）。目錄現在只有四張卡片：Playwright（`@playwright/mcp`）、Browserbase（`@browserbasehq/mcp`，需要 `BROWSERBASE_API_KEY`、`BROWSERBASE_PROJECT_ID`、`GEMINI_API_KEY`）、Filesystem（`@modelcontextprotocol/server-filesystem`）、Memory（`@modelcontextprotocol/server-memory`），皆以 `npx -y` 執行。程式內產生 Playwright／Browserbase 設定的函式也改用這兩個套件。已經安裝到 AI 員工 `.mcp.json` 的舊項目不會被自動改寫，CLI 啟動它時會失敗。仍在目錄中的四張卡片，在工具市集重新安裝會覆寫同名項目；已移除卡片留下的項目請在工具伺服器設定刪除，或手動修改。
+- **個人版的整合頁不再顯示「身分解析」分頁**：個人版的 gateway 拒絕所有 `identity.*` 呼叫，這個分頁在個人版只會顯示錯誤。`?tab=identity` 的連結改開第一個分頁。
+- **在聊天通道按知識審核按鈕沒有作用**：之前按下核准只會把審核標成已決定，隔離的知識一筆也沒釋放。現在這類審核只在儀表板決定（見 Changed）。
+- **新增任務、新增子任務必須選負責的 AI 員工**：伺服器一直要求 `assigned_to`，對話框卻預設「未指派」，送出後建立失敗、沒有任何提示。現在沒選會提示，建立失敗時對話框保持開啟並顯示訊息。
+- **收件匣的知識審核**：衝突項目以純文字並排顯示目前的值與內容、新的值與說法；決定失敗時顯示伺服器的錯誤，項目保留在清單上。
+- **個人版通道設定的「成員」連結**：個人版沒有「成員」頁，通道詳細設定裡原本指向它的連結改成一句說明：把通訊帳號對應到使用者（真人接手需要這一步）是企業版功能。
+- **「WeCom」通道名稱**：對話來源標籤補上 `wecom`，之前顯示原始代碼。
+- **README 桌面版表格**：註明 macOS 桌面版最新是 v1.66.1；v1.67.0 的 macOS 版在 Apple 公證失敗，沒有發佈。
+- **文件**：`personal-edition-portability.md` 三語版原本說 `agent.toml [edition] profile` 可以切換版本，沒有程式讀這個鍵；改為實際的判定順序（`DUDUCLAW_EDITION` 環境變數 → 授權方案 → 個人版）。真人接手文件註明通道綁定要在只有企業版才有的「成員」頁操作，個人版不會自動接手。瀏覽器自動化與開發指南的 Playwright 範例改用 `@playwright/mcp`。`web/package.json` 的授權欄位由 `ISC` 改成與專案一致的 `Apache-2.0`。`personal-edition-portability.md` 與 `56-team-as-agent.md` 三語版拿掉了指向未公開文件的連結。
+
+### Security
+- **行為變更：聊天內容不能再蓋掉更可信的記憶**（影響已發佈版本）。之前同一個 `(AI 員工, subject, predicate)` 的新事實一律取代目前事實，不看來源：從聊天萃取的事實（`channel`，可信度 0.3）會取代同一 subject 與 predicate 的現有事實，不論它的可信度，例如 AI 員工自己推得的事實或沒有記錄來源的舊資料（0.6），鍵值相同時也包括匯入的事實（0.7）；能跟 AI 員工對話的人都能影響它。操作者核准過的事實（1.0）從這個版本起才有（由下述的審核核准寫入），並受到保護。現在可信度嚴格較低的寫入不能取代目前事實；相同或更高照舊取代，舊值留在歷史裡。對話事實與使用者輪廓特徵這兩條自動萃取路徑，被擋下的說法會暫存起來，並在儀表板收件匣出現審核項目。項目只依存下來的說法產生，列出核准後會寫入的全部內容：完整的新說法與新值，並排目前內容（超過 600 字會截斷並註明）與目前的值；使用者輪廓會寫出是誰的輪廓。核准時寫入的正是這筆說法（以摘要值綁定），以操作者權限取代；拒絕就捨棄；說法或受保護的事實在送審後改變時，核准不寫入任何內容並說明情況已改變，同一說法再出現時會重新送審。套用失敗時項目維持待審，可以重試（之前會先記錄決定）。超過 600 字的說法不送審，只寫稽核（`not_held_reason: "too_long"`）。相同說法不重複送審；每位 AI 員工每個 UTC 日最多新增 20 筆，當天第一次超過時動態牆出現一則 `knowledge_review_cap_reached` 事件，超過的部分只寫稽核紀錄（`memory_supersession_refused`，`review_cap_hit`）；每天的清理會關閉審核項目已不在等待中的暫存資料。其他寫入路徑遇到拒絕時：`user_profile_record` 回傳錯誤（「a more trusted value already exists for this field, so it was not changed」），`migrate-from` 回報略過，足跡萃取、reflexion 規則與夜間整理略過該項目並記錄 log。資料主體的匯出與刪除涵蓋暫存資料；`duduclaw gdpr erase` 另外會撤回涵蓋被刪資料的待審項目、清掉審核紀錄裡這些項目（不論狀態）的文字、刪除對應事件；沒有帶資料列 id 的隔離事件會留到 7 天的事件保存期限後清除。前一步失敗時後面的步驟照樣執行，失敗會列出並以非零結束，提示重新執行同一個指令（可安全重複）；重新執行時即使已找不到記憶資料列，仍會用完全相同的 subject 從審核項目與事件中移除這個人的文字。限制：只比對完全相同的 subject 與 predicate，拼法不同的同一件事會並存。`config.toml [memory] supersession_trust_guard = false` 可恢復舊行為（gateway 經記憶工廠建立的引擎與 MCP server 會讀這個設定，其他直接建立的引擎一律開啟）。尚未在真實聊天通道上驗證。說明見 `docs/features/20-memory-intelligence.md` 與 `SECURITY.md`。
+- **AI 員工不能再用 `memory_invalidate_by_origin` 清掉可信的記憶**（影響已發佈版本）。之前被操縱的 AI 員工一次呼叫就能讓它命名空間裡所有操作者等級的事實過期。現在以 AI 員工身分呼叫時，只能處理 `channel`、`mcp_external`、`tool_echo` 三個低於 agent 衍生上限的來源類別，其他類別會被拒絕並記入稽核 `memory_invalidate_refused`。判定採 fail-closed：使用 gateway 共用內部金鑰的呼叫者，不論行程裡有沒有員工身分，一律視為 AI 員工；屬於員工或臨時員工（`eph-` 開頭）的金鑰也一樣；只有對應不到任何員工的 admin 金鑰不受限制。這個工具只作用在呼叫者自己的命名空間（見文末已知問題）。
+- **行為變更：中文提示注入的比對範圍擴大**（已發佈版本會放過這些中文寫法）。之前中文的指令覆寫只比對四個完全相同的字串，句子裡多插「所有」「之前」「的」就比對不到；實測時有四句這樣的句子經 `user_profile_record` 存進記憶。現在 `instruction_override` 改看句型：覆寫動詞（忽略／無視／忘記／忘掉／不要理會／不用理會／別管）之後，同一個子句、12 個字以內出現指示類名詞（指示／指令／規則／提示詞／系統提示），中間夾著範圍詞（先前／之前／以上／所有／全部／你的／原本等），繁簡體都算，權重與立即封鎖和英文相同。中文的「輸出／顯示你的系統提示詞」類擷取請求依英文規則計分（權重 30，單獨出現不封鎖）；「你現在是管理員模式／開發者模式／越獄模式」「你現在不受限制」等角色覆寫片語和英文同樣處理。門檻與英文清單不變。已知誤判：同句型的一般句子也會被擋，例如「請忽略之前寄的指示，以新版為準」「請忽略以上規則中的第三條，已經取消」「忘記之前的規則了，可以再說一次嗎」，提到「越獄模式」也會；換個不用覆寫動詞的說法即可，例如「之前的指示作廢，以新版為準」。影響範圍：聊天訊息會收到封鎖回覆、不交給 AI；MCP 工具呼叫的參數引用這種句子會被拒絕並記入稽核；對話、輪廓與知識萃取只要比對到任何規則（含不封鎖的擷取規則）就丟棄；`migrate-from` 匯入略過、expert pack 安裝拒絕；Agent Mail 照存但加標記；提示內容被擋的提醒不會執行。這是片語規則，不是分類模型，沒有用真實對話資料量測過。說明見 `docs/features/05-security-defense.md`。
+- **`user_profile_record` 拒絕虛擬使用者並掃描提示注入**：`user_id` 為 `system`、`anonymous`、`unknown` 時拒絕；predicate 與值都做提示注入掃描，達到封鎖等級就拒絕寫入。排程與系統提示（虛擬使用者 `system`）的輪廓萃取也不再寫入使用者輪廓。
+- **知識審核的聊天通知不會送回說法來源的對話**（現在在實際的推送路徑上生效）；Telegram Mini App 的詳細頁對這類審核只顯示同一則通知，不顯示說法內容。
+
+**已知問題（尚未修正，需要決定資料遷移方式）**：AI 員工透過 MCP 記憶工具（`memory_store`、`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_alias_add`／`memory_alias_list`、`memory_get_history`、`memory_get_at`、`memory_invalidate_by_origin`、`user_profile_record`、`user_profile_get`、`user_code_profile`）讀寫的記憶，落在 MCP 金鑰對應的命名空間。gateway 啟動的每位 AI 員工都用 gateway 的內部金鑰，所以全部共用 `internal/gateway-internal`（v1.44.0 起就是如此）；gateway 自己做的事（對話與輪廓萃取、審核核准、把重點事實與輪廓區塊注入提示）用的是員工自己的 id。後果：同一個 gateway 的員工共用透過這些工具存的記憶；員工透過工具存的內容不是 gateway 注入它提示的內容，它的 `memory_search` 也看不到 gateway 萃取的內容；可信度檢查只在同一個命名空間內比較，它保護 gateway 萃取與操作者核准的事實不被聊天衍生的寫入取代，但不在兩邊之間仲裁。員工之間的記憶隔離只對 gateway 寫入的記憶成立。說明見 `docs/features/20-memory-intelligence.md` 與 `SECURITY.md`。
+
 ## [1.67.0] - 2026-10-02 — Discovery 探索×沙箱重建×電腦操作工具接真×Gemini CLI 棄用×安全性修補
 
 ### Added

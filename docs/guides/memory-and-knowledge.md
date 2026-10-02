@@ -16,7 +16,7 @@ The one-line distinction:
 | How it fills up | Accumulates automatically, no instruction needed | Auto-filed when you paste a charter/SOP/spec-type document; or say "write this to the knowledge base" to be explicit |
 | Stored as | Discrete facts | Markdown pages |
 | Categorization | The system sorts by topic automatically | Directories (folders) plus the page path you give it |
-| Handling old information | A new version of the same fact supersedes the old one automatically, with history preserved | Overwrites the whole page; auto-filed pages keep a one-line revision log at the bottom (see 2.4), manually written pages don't |
+| Handling old information | A new version of the same fact supersedes the old one automatically, with history preserved, unless the old one comes from a more trusted source (then it goes to review) | Overwrites the whole page; auto-filed pages keep a one-line revision log at the bottom (see 2.4), manually written pages don't |
 | When it gets recalled | Three categories inject automatically, everything else needs an active lookup | L0/L1 auto-inject every turn, L2/L3 need an active search |
 | Who can see it | Only this AI employee | Personal knowledge base is private to the agent; the shared knowledge base is readable company-wide |
 | What belongs here | Scattered facts, preferences, and decisions that surface mid-conversation | Content worth looking up long-term: return policy, quoting process, product specs |
@@ -157,6 +157,8 @@ Everything else needs the AI employee to judge that a search is warranted and ru
 
 When a new statement about the same topic comes in, the old one gets marked "superseded" and the new one takes its place. Expanding any memory shows the full supersession chain, and you can also ask "what was the answer as of a given point in time." So correcting course doesn't require deleting the old entry first; just say the new thing.
 
+One exception (v1.67.1): a statement from a chat cannot replace a fact from a more trusted source, such as one you approved in the dashboard or one imported with `migrate-from`. The new statement is held, and a review item appears in the dashboard inbox (收件匣) showing the current content and the new statement side by side. Approve it and the new statement replaces the old one; deny it and it is discarded. These items can only be decided in the dashboard, within 24 hours. Details: [Memory Intelligence](../features/20-memory-intelligence.md#supersession-trust-guard-v1671).
+
 ### 4.4 Deleting a memory
 
 Hover over any entry in the memory list and a trash icon appears on the right; two clicks (the second confirms) deletes it. A deleted memory disappears immediately from search, browsing, and conversation injection.
@@ -173,7 +175,7 @@ Underneath, this is a soft delete: the record moves to an archive table, an admi
 | Set up a return policy it follows every time | Write it to the knowledge base and set `layer: core` |
 | Organize today's research findings from a few papers | Write it to the knowledge base, under `sources/` |
 | A policy every AI employee in the company must follow | Write it to the shared knowledge base |
-| Correct something it remembered wrong | Just say the correct version — the old one gets superseded automatically |
+| Correct something it remembered wrong | Just say the correct version — the old one gets superseded automatically; if the old one came from a more trusted source, approve the review item in the dashboard inbox |
 | Remove one incorrect memory | Hover over it in the memory list and click the trash icon |
 | Make it forget a whole document | Delete that page from the knowledge base |
 | Paste in a company charter so it can look it up later | Just paste it — it auto-files; once confirmed as official knowledge in the curation station, it injects every time |

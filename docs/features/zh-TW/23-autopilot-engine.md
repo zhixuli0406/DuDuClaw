@@ -47,7 +47,7 @@ MCP bridge         ─┘                                   1. 事件相符？  
 | **ActivityNew** | `activity_new` | Activity Feed 出現新的一筆 | activity 物件 |
 | **ChannelMessage** | `channel_message` | channel 上收到訊息 | `channel`、`agent_id`、`text` |
 | **AgentIdle** | `agent_idle` | 某個 agent 進入閒置 | `agent_id`、`idle_minutes` |
-| **CronTick** | `cron_tick` | 排程器發出週期性 tick | `now` |
+| **CronTick** | `cron_tick` | 從不觸發：有這個型別，但沒有任何程式送出它。v1.67.1 起新規則不能用它（見下文） | `now` |
 | **RunAtRisk** | `run_at_risk` | 預測判斷執行中的任務正走向失敗 | `agent_id`、`session_id`、`score`、`level`、`reasons` |
 | **OsFileEvent** | `os_file` | agent 的 `[os_watch]` 監看到檔案變動 | `agent_id`、`path`、`kind`（created / modified / removed / renamed）、`file_name`、`extension` |
 | **OsFrontmostEvent** | `os_frontmost` | 前景 App 或視窗標題改變 | `agent_id`、`app`、`window_title`、`prev_app` |
@@ -55,7 +55,7 @@ MCP bridge         ─┘                                   1. 事件相符？  
 | **SecurityEvent** | `security_event` | warning 或 critical 等級的稽核事件，或安全態勢改變 | `severity`、`event_type`、`agent_id`、`source` |
 | **OdooEvent** | `odoo_event` | Odoo 輪詢或 `POST /webhook/odoo` 回報 ERP 變更 | `event_type`、`model`、`record_id`、`record`（其頂層純量欄位也會攤平） |
 
-規則會宣告它關心哪個 `trigger_event`，因此 `channel_message` 規則根本不會看到 `cron_tick`。這十三個名稱也是 `sequence` 規則合法的 `first` / `then` 事件。引擎另有一個內部事件 `cep_trigger`，由序列比對器發出以觸發已比對成功的規則，不能當 `trigger_event` 使用。
+規則會宣告它關心哪個 `trigger_event`，因此 `channel_message` 規則不會看到 `task_created`。`autopilot.create` 接受 `cron_tick` 以外的十二個名稱；`autopilot.update` 只在規則原本就是 `cron_tick` 時接受它，讓這種已存規則能照常儲存；把其他規則改成 `cron_tick` 會和建立時一樣被拒絕。要定時執行的工作請交給排程器（「例行工作」頁，或帶 `schedule` 的 `tasks_create`）。這十三個名稱仍都是 `sequence` 規則合法的 `first` / `then` 事件。引擎另有一個內部事件 `cep_trigger`，由序列比對器發出以觸發已比對成功的規則，不能當 `trigger_event` 使用。
 
 ---
 
@@ -81,6 +81,24 @@ MCP bridge         ─┘                                   1. 事件相符？  
 | `contains` | 字串包含子字串，或陣列包含某值 |
 
 **不存在**的欄位永遠無法滿足任何比較，包括 `eq null`。這是刻意的：曾經允許不存在的欄位匹配 `eq null`，導致某條規則對每個事件大量觸發。缺失即不匹配，沒有例外。
+
+### 沒有條件
+
+沒有條件的規則，在觸發事件每次發生時都會執行。「沒有條件」包括：建立時沒帶 `conditions`、`null`、`{}`、`{ "all": [] }`。`{ "any": [] }` 可以儲存，但永遠不會匹配。
+
+**v1.67.1 行為變更。** `autopilot.create` 沒收到 `conditions` 時會存成 `{}`。v1.67.1 之前，引擎把 `{}` 當成欄位為空的單一條件，這種規則從來不會觸發。v1.67.1 起，這些規則會在觸發事件每次發生時執行。`null` 與 `{ "all": [] }` 本來就是全部匹配。要找出會開始觸發的已啟用規則，在 gateway 主機上執行下列指令，不想要的就停用或編輯：
+
+```bash
+sqlite3 ~/.duduclaw/autopilot.db \
+  "SELECT id, name, trigger_event FROM autopilot_rules
+   WHERE enabled = 1 AND sequence IS NULL AND trim(conditions) = '{}';"
+```
+
+在儀表板用編輯按鈕打開這種規則，會看到「目前沒有設定條件：每次觸發事件發生時都會執行。」
+
+### 寫入時驗證
+
+`autopilot.create`、`autopilot.update`（以及啟用歸納出的規則）在儲存前會檢查條件樹。每個節點都必須是物件：值為條件陣列的 `all` / `any` 群組，或是帶非空字串 `field` 的單一條件，`op` 可省略（預設 `eq`），有寫就必須是上表的運算子。巢狀最多 16 層。拒絕訊息會寫出出錯節點的路徑，例如 `conditions.all[1]: a condition needs a non-empty "field" (or use an "all"/"any" group)`。v1.67.1 之前這種條件會被存下來，然後永遠不匹配。
 
 ---
 
@@ -208,7 +226,17 @@ autopilot.remove  ── 刪除規則
 autopilot.history ── 執行記錄
 ```
 
-每次 `create` / `update` 都會**在寫入時**驗證 `trigger_event` 與 `action` 結構。格式錯誤的規則會立即被拒絕，而非稍後在 `autopilot_history` 中靜默失敗。每次執行（成功、錯誤或斷路器轉換）都會附加一列，帶有狀態與錯誤脈絡。
+每次 `create` / `update` 都會**在寫入時**驗證 `trigger_event`、`conditions` 條件樹與 `action` 結構。格式錯誤的規則會立即被拒絕，而非稍後在 `autopilot_history` 中靜默失敗。每次執行（成功、錯誤或斷路器轉換）都會附加一列，帶有狀態與錯誤脈絡。
+
+### 儀表板的規則表單
+
+在「設定 → 自動化」建立與編輯規則。v1.67.1 之前，這個表單送出的動作用 `agent_id`、`prompt_template`，伺服器要的是 `target_agent`、`prompt`；它還提供不存在的 `schedule` 觸發事件，寫入的 `from_status`／`idle_minutes`／`cron` 也不是欄位／運算子／值的條件格式。伺服器每次都拒絕儲存，所以從儀表板建不出任何規則。v1.67.1 起：
+
+- 觸發事件清單就是 `autopilot.create` 接受的十二個事件，包括 `tick`（監控來源有新資料時）與 `odoo_event`（Odoo 資料變動時）。已存規則的觸發事件若不在清單裡（例如 `cron_tick`），會照原值顯示並保留。
+- 條件是一列一列的「欄位／比較方式／比較值」，用「全部符合才執行」（`all`）或「任一符合就執行」（`any`）串起來。每種觸發事件會建議欄位名稱，也可以自己輸入。`tick` 與 `odoo_event` 的欄位名稱來自你的監控來源或 Odoo 紀錄，表單會提示這一點。`gt` / `gte` / `lt` / `lte` 的比較值必須是數字；`in` / `not_in` 用逗號分隔多個值。一列都沒有時，表單存成 `{ "all": [] }`，每次事件都會執行。
+- 動作有 `delegate`、`notify`、`run_skill`，必填欄位見上方表格。`notify` 可選 telegram、line、discord、slack、whatsapp、feishu、googlechat、teams、wecom、dingtalk。
+- 每條規則都有編輯按鈕，編輯時只送出有改動的欄位。表單無法攤成清單的條件、事件序列規則、以及上述三種以外的動作會顯示為鎖定，原樣保留。表單不管的動作欄位（`screen`、`context_ticks` 等）也原樣保留；新規則無法在表單加上它們，請改用 `autopilot.create` / `autopilot.update`。
+- 儲存被拒絕時，對話框裡會顯示伺服器的訊息。
 
 ---
 

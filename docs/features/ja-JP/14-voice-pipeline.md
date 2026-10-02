@@ -23,7 +23,7 @@
 | エンドポイント | 認証 | 挙動 |
 |---|---|---|
 | `POST /api/stt` | Bearer JWT | ボディ上限 10 MiB。ボディに触れる**前に** `config.toml [voice]` からプロバイダを解決し、未設定なら **501 で fail-closed**——推測も文字起こしの捏造もしません |
-| `POST /api/tts` | Bearer JWT | `TtsRouter::auto_detect` が4つの TTS プロバイダに振り分け |
+| `POST /api/tts` | Bearer JWT | リクエストごとに `inference.toml [voice] tts_provider` / `tts_voice` を読み、`TtsRouter` の戦略を選びます（`edge-tts` → edge のみ、`minimax` / `openai-tts` → クラウド優先、それ以外 → ローカル優先）。`none` / `off` / `disabled` のときは 501 を返します |
 | `GET`／`POST /api/voice/config` | Bearer JWT | `[voice]` の STT 設定を読み書き |
 
 **STT プロバイダ**（`stt.rs`、実装は2つ）：
@@ -57,7 +57,9 @@ stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --
 
 **その後 `duduclaw_inference::whisper::transcribe(bytes, Some("zh"), WhisperMode::Api)` を呼びます——プロバイダも言語もハードコードです。** 音声返信（チャットごとに `/voice` で切替）は `EdgeTtsProvider` を直接構築します。これもハードコードで、音声アップロードが失敗したらテキストにフォールバックします。
 
-つまり `inference.toml [voice]` の `asr_provider` / `asr_language` / `tts_provider` / `tts_voice` は——ダッシュボードが `auto | whisper-api | whisper-local` と `auto | edge-tts | minimax | openai-tts | piper` で検証して書き込むにもかかわらず——**現状 Telegram 経路には影響しません**。UI で変えても Telegram の音声メッセージの挙動は1ミリも変わりません。既知のギャップとして、運用者が自分でぶつかる前にここに明記します。
+つまりダッシュボードの「語音」タブが書き込む `inference.toml [voice] tts_provider` / `tts_voice` は `POST /api/tts` にだけ効き、**現状 Telegram 経路には影響しません**。UI で変えても Telegram の音声メッセージの挙動は変わりません。既知のギャップとして、運用者が自分でぶつかる前にここに明記します。
+
+v1.67.1 から、「語音」タブには「語音回覆模式」（音声返信モード）、「語音辨識」（音声認識）、「語言」（言語）の3項目が表示されません。これらが書き込んでいた `voice_reply_enabled`、`asr_provider`、`asr_language` を gateway で読むコードはありません。`inference.toml` に既にある値はそのまま残り、タブの保存ではこれらのキーを送りません。`/api/stt` の音声認識は同じタブの詳細カード（`config.toml [voice] stt_*`）で設定します。
 
 ---
 
