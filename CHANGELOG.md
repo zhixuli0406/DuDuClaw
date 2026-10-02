@@ -76,7 +76,7 @@
 - **Discovery 事件串流檢查**：attempt 的輸出出現超過 3 行無法解析的內容、Claude／Grok 回覆中出現文字與允許工具以外的區塊型別、或 Antigravity 有白名單外的工具未被原生 hook 擋下時，該 attempt 作廢並以 `tool_violation` 結束探索。這項檢查讀的是容器內 CLI 自己的輸出，容器內行程刻意偽造串流的情況由容器隔離與預算上限圍住，已在功能文件的已知限制說明。
 - **工作區複製與提升**：共用複製規則排除 `.env*`、金鑰及根外連結；探索採更嚴格規則，丟棄全部連結與多重硬連結。分支不再自動攜帶這些機密檔案，需自行配置憑證。
 - **macOS 沙箱環境**：修復 `env_clear()` 被環境重建忽略而洩漏父行程變數的問題；加入執行時見證，無法辨識時拒絕執行。
-- **分支採用權限與競爭**：人工採用、背景結果發布及保留資料清理共用跨行程鎖；其他員工不能終止或刪除不屬於自己的分支。
+- **分支採用權限與競爭**：人工採用、背景結果發布及保留資料清理共用跨行程鎖；其他員工不能終止或刪除不屬於自己的分支。 Windows 上的已知問題：以系統管理員身分執行時 fork 一律失敗的缺陷已修正（程式原本拒絕使用自己建立、擁有者為 Administrators 群組的暫存目錄），但 Windows CI 仍有 4 個發布流程測試未通過（自動採用與發布鎖的先後順序、資料庫故障後的復原）。live fork 需逐員工以 `agent.toml [fork] enabled = true` 開啟，預設關閉；在這些測試通過之前，請不要在 Windows 上開啟。
 - **探索策略與評分器**：正式 Python 策略使用釘住 image 的資源受限容器；評分容器先確認建立，再啟動具截止時間的可信 supervisor。成果副本須符合評分前雜湊，才可寫入有效帳本並成為最佳快照。
 - **AI 員工不能再改寫自己的 `CONTRACT.toml`**：PreToolUse hook `duduclaw hook agent-file-guard` 原本只擋別的員工的契約，員工用 Write／Edit／MultiEdit 或 Bash 就能刪掉自己的 `must_not` 界線。現在員工身分的呼叫寫自己目錄裡的 `CONTRACT.toml` 一律擋下（判定 `BlockedOwnContractWrite`），沒有任何開放旗標；Bash 規則同時辨識 `agents/<自己>/CONTRACT.toml` 與 `CONTRACT.toml`、`./CONTRACT.toml` 這類相對寫法，自己的 `SOUL.md` 也比照辦理。擋下時的訊息會請員工去找操作者，操作者照舊在儀表板修改契約（`contract.update`，僅限管理者）。Bash 規則是減速帶，把檔名藏起來的指令仍可能繞過；真正的隔離是不給員工 Bash。
 - **live fork 採用不再把 agent 結構檔帶回員工目錄**：分支被採用回員工目錄（`<home>/agents/<id>`，含 ephemeral 員工）時，目錄根部的 `agent.toml`、`SOUL.md`、`CLAUDE.md`、`MEMORY.md`、`.mcp.json`、`CONTRACT.toml` 與整個 `.claude/` 一律維持上層原本的內容，分支裡的改動不會覆蓋回去；指向這些檔案的符號連結也不會被重建。`fork_run` 的自動採用、手動選擇與儀表板上由操作者選分支三條路徑都適用。分支仍然可以讀取這些檔案，子目錄裡的同名檔（例如 `docs/CLAUDE.md`）與一般專案目錄的 fork 不受影響。上層是 gateway home 或 `agents/` 本身時，採用不會寫進任何員工目錄。
