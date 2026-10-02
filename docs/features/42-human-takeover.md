@@ -1,6 +1,6 @@
 # Human takeover
 
-> An admin who types directly in a channel silences the AI for that one conversation until they hand it back — no button to press, no mode to switch, no global settings touched.
+> An admin who types directly in a channel silences the AI for that one conversation until they hand it back — no button to press, no mode to switch, no global settings touched. This automatic path is off by default (opt-in since v1.56): turn it on with `[takeover] enabled = true`.
 
 ---
 
@@ -59,7 +59,7 @@ Every skip is written to the gateway log, so "why didn't the AI say anything" al
 
 | Action | How |
 |---|---|
-| Start | An admin speaks in the conversation (default 60 minutes) |
+| Start | An admin speaks in the conversation (default 60 minutes); requires `[takeover] enabled = true`, which is off by default |
 | Extend | `/takeover +30m` (also accepts `+30`, `30m`, `45min`) |
 | Status | `/takeover` — who holds the takeover, minutes remaining |
 | End early | `/takeover end` (also accepts `結束`) |
@@ -115,7 +115,7 @@ The displayed name comes from the dashboard display name. When none is set, it s
 
 ```toml
 [takeover]
-enabled = true            # on by default; set false to turn the feature off entirely
+enabled = false           # off by default (opt-in since v1.56); true = an admin speaking starts a takeover. The /takeover commands are not affected by this switch
 duration_minutes = 60     # length of one takeover
 max_duration_minutes = 720  # extension ceiling (hard cap 12 hours)
 ```

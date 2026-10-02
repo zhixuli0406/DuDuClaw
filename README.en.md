@@ -6,9 +6,9 @@
 
 </div>
 
-DuDuClaw turns Claude Code, Codex, and Gemini into AI employees who actually deliver: they staff eleven messaging apps like Telegram, LINE, and Discord, an independent judge reviews their work before it ships, and every dollar they spend gets logged.
+DuDuClaw turns AI command-line tools such as Claude Code, Codex and Antigravity into AI employees who actually deliver: they staff eleven messaging apps like Telegram, LINE, and Discord, an independent judge reviews their work before it ships, and every dollar they spend gets logged.
 
-All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain for Claude, Codex, Gemini (deprecated), Antigravity, or any OpenAI-compatible API whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
+All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain between twelve CLI backends (Claude Code, Codex, Antigravity, Grok and others; Gemini CLI is deprecated) or any OpenAI-compatible API whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.67.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
@@ -44,7 +44,7 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 | Multi-LLM failover | Manual restart | 4 rotation strategies + cross-provider failover |
 | Context survives switching LLMs | Lost | Preserved |
 | Conversation memory and knowledge base | Single session | SQLite temporal memory + layered wiki, auto-injected |
-| Tools shared across LLMs | Rewrite per vendor | Write 249 MCP tools once, use on all 5 backends |
+| Tools shared across LLMs | Rewrite per vendor | 249 MCP tools written once, reachable from the Claude, Codex, Gemini, Antigravity, Grok and OpenAI-compatible runtimes |
 | Guardrails / audit / secret management | Build it yourself | Policy kernel + OS sandbox + AES-256-GCM built in |
 | A whole box to hand to a customer | Install Linux yourself, manage updates and tamper resistance yourself | DuDuClaw OS image: A/B update with rollback + read-only root, plug in and go; a desktop shared by a person and the AI without getting in each other's way |
 
@@ -55,19 +55,19 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 The AI runtime is the brain, DuDuClaw is the plumbing, and MCP (JSON-RPC 2.0) is the bridge. Swap the brain, keep the plumbing:
 
 ```
-AI Runtime (brain) — Claude Code / Codex / Gemini (deprecated) / Antigravity / OpenAI-compat
+AI Runtime (brain) — Claude Code / Codex / Antigravity / Grok / … (12 CLIs) / OpenAI-compat
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
-  ├─ Multi-Runtime — 5 backends, auto-detected, configured per agent
+  ├─ Multi-Runtime — 13 runtime ids (12 CLIs + OpenAI-compat), auto-detected, per agent
   ├─ Session Memory — native --resume + temporal memory + key facts + layered wiki
   ├─ MCP Server — 249 tools (channels, memory, agents, skills, tasks, wiki, ERP)
-  ├─ Evolution Engine — GVU² dual-loop evolution + prediction-driven + MistakeNotebook
+  ├─ Evolution Engine — prediction-driven + AEE playbook rules + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS sandbox + redaction vault
   ├─ Inference Engine — OpenAI-compatible local server (llama-server / Ollama / vLLM) / llamafile
   ├─ Account Rotator — OAuth + API key rotation, budgets, health checks
-  └─ Web Dashboard — React 19 SPA (32 pages), embedded via rust-embed
+  └─ Web Dashboard — React 19 SPA, embedded via rust-embed
 ```
 
 The Rust workspace is 24 crates: the `duduclaw-core` foundation, the `duduclaw-gateway` service layer, the `duduclaw-llm` unified API layer, `duduclaw-inference` for local models, `duduclaw-memory` for cognitive memory, `duduclaw-security`, and more. Full design in [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -82,9 +82,9 @@ The same gateway + dashboard also ships as a whole machine: [DuDuClaw OS](https:
 
 DuDuClaw doesn't ship its own LLM — you need an AI brain first. Pick one (you can also set this up later in the browser wizard):
 
-- Install and log in to [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli) (deprecated, removed in v1.69.0), or Antigravity
+- Install one of the supported AI CLIs, such as [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex) or Antigravity (the full list is in [multi-runtime](docs/features/13-multi-runtime.md); [Gemini CLI](https://github.com/google-gemini/gemini-cli) is deprecated and removed in v1.69.0), and give it an API key. Anthropic and Google block consumer subscription tokens used by third-party products, and accounts have been suspended, so an API key is the supported path
 - Bring an API key for any OpenAI-compatible provider
-- Or use a local GGUF model — no cloud account needed
+- Or run a local model behind an OpenAI-compatible server (llama-server, Ollama, vLLM, llamafile) — no cloud account needed
 
 <a id="install"></a>
 
@@ -170,19 +170,19 @@ duduclaw service install   # start on boot (launchd / systemd)
 
 | Area | What's built in | Read more |
 |------|-----------------|-----------|
-| Channels | 11 channels (Telegram / LINE / Discord + voice / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards | [docs/features](docs/features/README.md) |
-| Multi-runtime | Claude / Codex / Gemini (deprecated, removed in v1.69.0) / Antigravity / OpenAI-compat, auto-detected, per-agent config, context survives backend switches | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Channels | 11 channels (Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards; Telegram voice messages are transcribed through the OpenAI Whisper API. Discord voice channels are a non-default build feature and are not in the release binaries | [docs/features](docs/features/README.md) |
+| Multi-runtime | 13 runtime ids: Claude Code / Codex / Antigravity / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode / Gemini CLI (deprecated, removed in v1.69.0) plus OpenAI-compat; auto-detected, per-agent config, context survives backend switches | [docs/features/13](docs/features/13-multi-runtime.md) |
 | Unified LLM API layer | `duduclaw-llm` covers 4 native protocols (Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat) with one normalized request, plus 8 OpenAI-compat presets (DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen), a pricing registry, and cross-provider fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP server | 249 tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports, with only 7 whitelisted tools exposed externally | [docs/api](docs/api/README.md) |
+| MCP server | 249 tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports; an external client key gets a 7-tool baseline unless the operator grants it memory, wiki or messaging scopes, and connector, execution and admin tools are never exposed externally | [docs/api](docs/api/README.md) |
 | Memory | SQLite temporal memory (fact supersession chains), HippoRAG-lite knowledge-graph retrieval (Personalized PageRank), Ebbinghaus forgetting-curve archival, cross-agent shared wiki | [docs/features](docs/features/README.md) |
-| Self-evolution | GVU² dual loop + prediction-driven (about 90% of conversations cost zero LLM calls), SOUL.md versioning with 24h observation and auto-rollback, MistakeNotebook cross-turn memory | [evolution-engine.md](docs/architecture/evolution-engine.md) |
-| Security | PolicyKernel reference monitor (zero-LLM, fail-closed), macOS Seatbelt / Linux Landlock native sandbox, Docker / Apple Container / WSL2 container sandbox, secret redaction vault, CONTRACT.toml behavioral contracts + red-team CLI | [SECURITY.md](SECURITY.md) |
-| Accounts and cost | OAuth + API key rotation (4 strategies), rate-limit and billing cooldowns, cost telemetry with cache-efficiency analytics, cross-platform PTY pool driving OAuth subscription accounts | [docs/features](docs/features/README.md) |
-| Local inference | Any OpenAI-compatible local server (llama-server / Ollama / vLLM / SGLang) or llamafile, with three-tier confidence routing; built-in Whisper speech recognition and vector embeddings | [docs/features](docs/features/README.md) |
-| Fine-tuning | Build SFT / DPO datasets (ShareGPT / Alpaca) from this machine's conversations, task results and approval decisions, train them on your own GPU host (SSH + LLaMA-Factory) or Together's cloud, then import the GGUF / LoRA back into the local models directory. No local training — integrated graphics cannot train — and data leaving the machine requires an explicit acknowledgement | [docs/features/53](docs/features/54-finetune.md) |
-| Live forking | RFC-26: fork an in-progress task into N competing branches, each in a copy-on-write isolate, with an AI judge picking the winner to merge (off by default) | [docs/rfc](docs/rfc) |
+| Self-evolution | Prediction-driven (by design most conversations end without an LLM call) + AEE playbook evolution: SOUL.md is read-only for agents, learned behavior is small rules that each link an eval case, a rule is committed only if it matches or beats the current playbook and is settled on its own after 24h; MistakeNotebook cross-turn memory | [evolution-engine.md](docs/architecture/evolution-engine.md) |
+| Security | PolicyKernel reference monitor (zero-LLM, fail-closed), macOS Seatbelt / Linux Landlock native sandbox (per agent, off by default), container sandboxes (task sandbox: Docker only, off by default; script sandbox: Docker, with WSL2 tried first on Windows), secret redaction vault, CONTRACT.toml behavioral contracts + red-team CLI | [SECURITY.md](SECURITY.md) |
+| Accounts and cost | OAuth + API key rotation (4 strategies), rate-limit and billing cooldowns, cost telemetry with cache-efficiency analytics. Each call runs the official CLI as a fresh process (the PTY session pool was removed in 2026-09; a one-shot pseudo-terminal remains for CLIs that require a TTY, such as Grok). Anthropic and Google block consumer subscription tokens in third-party products, so use API keys ([multi-runtime](docs/features/13-multi-runtime.md)) | [docs/features](docs/features/README.md) |
+| Local inference | Any OpenAI-compatible local server (llama-server / Ollama / vLLM / SGLang) or llamafile, with three-tier confidence routing | [docs/features](docs/features/README.md) |
+| Fine-tuning | Build SFT / DPO datasets (ShareGPT / Alpaca) from this machine's conversations, task results and approval decisions, train them on your own GPU host (SSH + LLaMA-Factory) or Together's cloud, then import the GGUF / LoRA back into the local models directory. No local training — integrated graphics cannot train — and data leaving the machine requires an explicit acknowledgement | [docs/features/54](docs/features/54-finetune.md) |
+| Live forking | RFC-26: fork an in-progress task into N competing branches, each in a copy-on-write isolate, with an AI judge picking the winner to merge (off by default; in v1.67.0 do not enable it on Windows, see CHANGELOG) | [docs/rfc](docs/rfc) |
 | Auto-update | One click from the dashboard or unattended (`auto_update = true`); SHA-256 + Ed25519 verification, in-place restart, open tabs reload themselves | [deployment-guide.md](docs/guides/deployment-guide.md) |
-| Web dashboard | React 19 + TypeScript SPA, 32 pages, embedded in the binary; zh-TW / en / ja | [docs/features](docs/features/README.md) |
+| Web dashboard | React 19 + TypeScript SPA embedded in the binary; zh-TW / en / ja | [docs/features](docs/features/README.md) |
 | ERP | Odoo bridge with 17 MCP tools (CRM / sales / inventory / accounting), CE/EE auto-detection, per-agent credential isolation | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
 | DuDuClaw OS | Yocto appliance image (current release v0.2.0, embedding platform v1.63.0): own compositor / shell with keyboard shortcuts, human–AI co-driving (dedicated agent seat, shadow workspace, human input freezes the agent, Super+Esc emergency stop; compiled in, off by default), A/B atomic update with rollback, read-only root, first-boot provisioning + LAN dashboard, app compatibility layer (Flatpak / Bottles / Waydroid); Secure Boot signing / dm-verity / TPM2 are build overlay options (still not enabled as of v0.2.0); separate repo and version line, pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
 
@@ -204,15 +204,15 @@ duduclaw eval                # run the agent behavior eval suite
 duduclaw update              # check for and install updates
 duduclaw service install     # install as a system service; also start / stop / status / logs / uninstall
 duduclaw export / import     # export / import ~/.duduclaw (portable personal data)
-duduclaw migrate-from openclaw   # painless migration from OpenClaw / Hermes / paperclip (dry-run by default, --apply to write)
+duduclaw migrate from openclaw   # painless migration from OpenClaw / Hermes / paperclip (dry-run by default, --apply to write)
 duduclaw mcp-server          # start the MCP server (stdio JSON-RPC 2.0)
 duduclaw http-server         # start the MCP HTTP/SSE transport (Bearer auth)
 duduclaw acp                 # start the Agent Client Protocol server (Zed / JetBrains / Neovim agent panels)
-duduclaw acp-server          # start the A2A server (agent-to-agent interop)
+duduclaw acp server          # start the A2A server (agent-to-agent interop)
 duduclaw license             # license management (activate / status / redeem / rebind / …)
 ```
 
-Run `duduclaw --help` for all 26 commands and their subcommands; developer topics are in the [development guide](docs/guides/development-guide.md).
+Run `duduclaw --help` for the full command list and subcommands; developer topics are in the [development guide](docs/guides/development-guide.md).
 
 <a id="trust"></a>
 
@@ -221,7 +221,7 @@ Run `duduclaw --help` for all 26 commands and their subcommands; developer topic
 What you install is fully transparent:
 
 - **What's in the npm package**: a small JS wrapper plus platform binaries (`@duduclaw/<platform>` optionalDependencies). `postinstall` only checks that the platform package is present ([`install.js`](npm/duduclaw/scripts/install.js)); nothing is downloaded from arbitrary URLs or executed
-- **No telemetry**: zero phone-home connections; all secrets stay on your machine, encrypted with AES-256-GCM
+- **No telemetry**: no usage data or conversation content is sent to us. The gateway checks GitHub Releases for updates every 6 hours; with a paid license installed it also refreshes the license with the license server (every 3–7 days depending on tier) and fetches the revocation list daily. Without a license file there is no licensing traffic. Secrets stay on your machine, encrypted with AES-256-GCM
 - **No privilege escalation**: runs entirely in user space
 - **Maintainer**: DuDu Digital Technology Co., Ltd. (registered in Taiwan, tax ID 94139082)
 
@@ -248,10 +248,10 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 |---|---|---|---|---|
 | Language | Rust | TypeScript | Rust | Python |
 | Channels | 11 | 25+ | 8 | 0 (API) |
-| Multi-runtime | 5 backends | single | single | multi-LLM |
+| Multi-runtime | 13 runtime ids (12 CLIs + OpenAI-compat) | single | single | multi-LLM |
 | MCP server | 249 tools | no | no | no |
-| Self-evolution engine | GVU² dual loop | no | no | no |
-| Local inference | 5 backends + confidence routing | no | no | no |
+| Self-evolution engine | AEE playbook rules (prediction-driven) | no | no | no |
+| Local inference | OpenAI-compatible local server / llamafile + confidence routing | no | no | no |
 | Behavioral contracts | CONTRACT.toml + red team | no | WASM sandbox | no |
 | License | Apache 2.0 (open core) | MIT | open source | $59+/mo |
 
@@ -272,7 +272,7 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 
 ## License
 
-Open core: the core is [Apache License 2.0](LICENSE), free to use, modify, and distribute. Commercial add-on modules (`commercial/`) are closed source and paid, covering industry templates, the enterprise dashboard, and license verification. See [LICENSING.md](LICENSING.md).
+Open core: the core is [Apache License 2.0](LICENSE), free to use, modify, and distribute. Commercial add-ons (`commercial/`, not in this repository), such as the premium industry packs, are closed source and paid; a license key unlocks them. The license-verification client (`crates/duduclaw-license`) is part of the Apache 2.0 core. See [LICENSING.md](LICENSING.md).
 
 <p align="center">
   🐾 Built with louis.li

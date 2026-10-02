@@ -150,7 +150,7 @@ HippoRAG-lite graph は4つの独立した改良を得ました（HippoRAG 2 + L
 
 ## F2：Reflexion Loop
 
-F2 は**既存**の `MistakeNotebook` を応答パスに橋渡しします——新しいストアではありません。トリガー信号は既存の `ErrorCategory`（Significant／Critical、MetaCognition が自己調整）であり——SOUL.md の提案を検証する GVU Verifier では**ありません**。
+F2 は**既存**の `MistakeNotebook` を応答パスに橋渡しします——新しいストアではありません。トリガー信号は既存の `ErrorCategory`（Significant／Critical、MetaCognition が自己調整）であり、候補の playbook エントリを判定する進化エンジンの Gate／Measure ではありません。
 
 ### F2a — 過去の間違いをプロンプトに注入
 
@@ -178,7 +178,7 @@ query_by_topic(keywords, agent, 3)   ← トピック範囲の想起
   - <間違い 2 のプロンプトセクション>
 ```
 
-これは `MistakeNotebook` をタスク横断学習に橋渡しし、エージェントが類似トピックで過去の失敗を繰り返すのを止めます——GVU SOUL.md パス内だけではありません。
+これは `MistakeNotebook` をタスク横断学習に橋渡しし、エージェントが類似トピックで過去の失敗を繰り返すのを止めます。進化エンジンの内部だけにとどまりません。
 
 ### F2b — 同カテゴリ ≥3 件の間違いを1つのルールに統合
 

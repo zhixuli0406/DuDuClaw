@@ -45,6 +45,8 @@ The `AuditEventType` enum (in `schema.rs`) spans three domains. The original P0 
 | **Governance (W19-P1)** | `governance_violation`, `governance_approval_requested`, `governance_approval_decided`, `governance_policy_changed`, `governance_quota_reset` | Policy violations, approval workflow, policy CRUD, daily quota resets |
 | **Durability (W19-P1)** | `durability_retry_attempt`, `durability_retry_exhausted`, `durability_circuit_opened`, `durability_circuit_recovered`, `durability_checkpoint_saved`, `durability_dlq_replayed` | Retry attempts and exhaustion, circuit-breaker transitions, checkpoint saves, DLQ replays |
 
+> The Governance and Durability types are still defined in the schema, but nothing in the codebase emits them: the `duduclaw-durability` crate was deleted in 2026-07 and the governance layer had no enforcer and was removed in v1.66.
+
 The `Outcome` enum is similarly layered: P0 has `success` / `failure` / `suppressed`; W19-P1 adds `blocked`, `warned`, `throttled`, `pending`, `approved`, `rejected`, `triggered`, `recovered` — so a `governance_violation` can be `blocked`, an approval can be `pending`, and a `durability_circuit_opened` can be `triggered`.
 
 ---

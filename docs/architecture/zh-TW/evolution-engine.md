@@ -2,7 +2,7 @@
 
 > 版本：v2.0（prediction-driven + GVU self-play）+ v3 增補（AEE / playbook，2026-08-06）
 > 日期：2026-03-29（v3 增補：2026-08-06）
-> 狀態：Production — 197 tests passing（v2.0 基準）；v3 AEE 見第十二章
+> 狀態：第三章（預測引擎）與第十二章（AEE）描述現行程式碼；v2.0 的 SOUL.md 改寫路徑已於 2026-09-29 移除（見下方說明）
 
 **讀本文前先看這段（S11 現況，2026-09-29）**：本文第四章描述的「GVU 直接改寫
 SOUL.md」流程，以及支撐它的一切（`agent.toml [evolution] legacy_soul_evolution`
@@ -25,7 +25,7 @@ deferred GVU 重試、`duduclaw evolution finalize` CLI）**已從程式碼移�
 1. [架構概覽](#一架構概覽)
 2. [設計哲學](#二設計哲學)
 3. [預測引擎（Phase 1）](#三預測引擎phase-1)
-4. [GVU 自我博弈迴圈（Phase 2，legacy 逃生門）](#四gvu-自我博弈迴圈phase-2)
+4. [GVU 自我博弈迴圈（Phase 2，2026-09-29 已移除）](#四gvu-自我博弈迴圈phase-2)
 5. [整合點](#五整合點)
 6. [安全機制](#六安全機制)
 7. [設定格式（legacy）](#七設定格式)
@@ -39,8 +39,9 @@ deferred GVU 重試、`duduclaw evolution finalize` CLI）**已從程式碼移�
 
 ## 一、架構概覽
 
-自主進化引擎讓 Agent 根據實際對話表現，自動修改自身的人格設定檔（`SOUL.md`）。
-系統以**預測誤差**驅動，取代固定計時器反思，約 90% 的對話零 LLM 成本。
+自主進化引擎讓 Agent 從實際對話與任務結果中學到小型行為規則（playbook 條目，見第十二章）。
+人格設定檔 `SOUL.md` 對 Agent 唯讀，引擎不會改寫它。系統以**預測誤差**驅動，取代固定計時器反思：
+Significant 與 Critical 誤差會啟動需要 LLM 的進化輪次，Negligible 誤差也有一小部分會因探索（ε，下限 5%）而啟動，前提是 `[evolution] gvu_enabled` 為開（2026-09-29 起出廠預設開）。
 
 ```
 用戶對話
@@ -55,21 +56,21 @@ deferred GVU 重試、`duduclaw evolution finalize` CLI）**已從程式碼移�
     │             │                         │
     ▼             ▼                         ▼
  Negligible    Moderate                Significant / Critical
- (零成本)      (存記憶)                (觸發 GVU)
+ (零成本)      (存記憶)                (啟動一輪進化)
                                           │
                                           ▼
                               ┌────────────────────────┐
-                              │  GVU Self-Play Loop     │
-                              │  Generator → Verifier   │
-                              │      → Updater          │
-                              │  (最多 3 輪)            │
+                              │  AEE round (ch. 12)     │
+                              │  generate → Gate →      │
+                              │  Measure (≤3 rounds)    │
                               └───────────┬────────────┘
                                           │
                                           ▼
                               ┌────────────────────────┐
-                              │  SOUL.md 原子寫入       │
-                              │  + 24h 觀察期           │
-                              │  + 自動 Confirm/Rollback│
+                              │  commit playbook entry  │
+                              │  if it matches or beats │
+                              │  the champion; settle   │
+                              │  each entry on its own  │
                               └────────────────────────┘
 ```
 
@@ -81,10 +82,10 @@ deferred GVU 重試、`duduclaw evolution finalize` CLI）**已從程式碼移�
 |------|---------|
 | **出錯才反思** | 預測誤差 < 0.2 時零成本，不浪費 API token |
 | **自我校準** | MetaCognition 每 100 次預測自動調整閾值邊界 |
-| **安全優先** | 4 層驗證（3 層零成本 + 1 層 LLM）+ 合約邊界 + 原子寫入 |
-| **可回滾** | 每次修改有 24h 觀察期，指標惡化自動回滾 |
+| **安全優先** | 確定性 Gate（零 LLM，保有否決權）在任何判官呼叫之前執行；每個候選條目都對照 Agent 的合約檢查；`SOUL.md` 對 Agent 唯讀 |
+| **可回滾** | 每個已提交條目在 `aee_settle_hours`（預設 24h）後對照自己連結的 eval 案例結算；退步只撤那一條 |
 | **XML 隔離** | 所有不受信任內容用 XML tag 包裹，防 prompt injection |
-| **加密保存** | 回滾差異以 AES-256-GCM 加密，分離於 Agent 目錄外 |
+| **小單位** | 每個 playbook 條目最多 400 字元，且至少連結一個 eval 案例 |
 
 ---
 
@@ -313,6 +314,8 @@ if critical_proportion > 20%:
 ---
 
 ## 四、GVU 自我博弈迴圈（Phase 2）
+
+> 已於 2026-09-29（S11）移除。本章為歷史紀錄，實際運行的引擎見第十二章。
 
 ### 4.1 模組結構
 
@@ -583,7 +586,7 @@ Generating → Verifying → Rejected   ──╮
 4. update_model()      → 更新使用者模型
 5. diagnose()          → 技能生命週期診斷
 6. route()             → 路由進化動作
-7. gvu.run()           → 若觸發，執行 GVU 迴圈
+7. gvu.run()           → 若觸發，執行一輪進化（AEE，第十二章）
 8. metacognition       → 回饋結果
 ```
 
@@ -613,7 +616,7 @@ must_always = ["respond in zh-TW", "refuse harmful requests"]
 max_tool_calls_per_turn = 10
 ```
 
-L1 驗證器在模擬最終 SOUL.md 上強制執行這些邊界。
+AEE 的 `G-Contract` 閘門以 `must_not`（加上內建預設）檢查每個候選 playbook 條目，並把 `must_always` 當作狀態不變式檢查（`gvu/verifier_gate.rs`）。
 
 ### 5.4 Soul Guard（完整性保護）
 
@@ -625,11 +628,13 @@ L1 驗證器在模擬最終 SOUL.md 上強制執行這些邊界。
 | 分離儲存 | 雜湊存在 `~/.duduclaw/soul_hashes/<agent>.hash`，非 Agent 目錄內 |
 | 漂移偵測 | 指紋不符時發出 `CRITICAL` 等級安全警告 |
 | 版本備份 | `.soul_history/SOUL_<timestamp>.md`，最多 10 個版本 |
-| 接受變更 | GVU Updater 成功套用後呼叫 `accept_soul_change()` |
+| 接受變更 | 經 `agent_update_soul` MCP 工具寫入 `SOUL.md` 後呼叫 `accept_soul_change()`（操作者，或設了 `can_modify_own_soul = true` 的 Agent） |
 
 ---
 
 ## 六、安全機制
+
+> 6.1–6.3 描述的是已移除的 SOUL.md 改寫路徑，保留為歷史紀錄；AEE 的檢查見 §12.5.2。6.4 的每 Agent 執行鎖仍然有效（`gvu/loop_.rs`）。
 
 ### 6.1 Prompt Injection 防護
 
@@ -983,8 +988,7 @@ round_seq += 1
 
 **內迴圈期間絕不落地**：只有最終 commit 那一步碰 SQLite；被放棄的內迴圈
 輪次讓 playbook 逐位元組不變（`failure_history` 除外，會刻意保留這輪學到
-的教訓）。**AEE 從不寫 SOUL.md**：SOUL cap 超標的整份壓回走第四章 WP0.2
-consolidate 路徑，與 AEE 迴圈正交，兩者只共用同一支 cooldown。
+的教訓）。**AEE 從不寫 SOUL.md。**
 
 #### 12.5.1 策略配比（GEP G4，取代裸 ε 探索）
 
@@ -1070,7 +1074,7 @@ eval_suites_root = "evals"     # AEE 重放子行程找題庫的根目錄
 eval_binary = "/usr/local/bin/duduclaw"   # 選填，覆寫預設二進位路徑
 ```
 
-新 CLI：`duduclaw playbook export --agent <id> [--out <path>]`（GEP-gene
+新 CLI：`duduclaw export playbook --agent <id> [--out <path>]`（舊寫法 `duduclaw playbook export` 在 v1.68.0 前仍可用；GEP-gene
 形 JSON 匯出，本地檔案，不接任何外部 hub）；`duduclaw playbook
 migrate-soul --agent <id> [--apply]`（WP1.4：舊 SOUL.md 行為規則抽成
 playbook 條目草稿，人審後 `--apply` 套用）；`duduclaw eval-scaffold
@@ -1081,8 +1085,9 @@ playbook 條目草稿，人審後 `--apply` 套用）；`duduclaw eval-scaffold
 錄製對生產環境零副作用、金鑰不入 transcript）（詳見
 `docs/guides/evals.md`）。
 
-Dashboard 記憶頁「自主學習」分頁：進化模式總覽、版本歷史、停滯偵測卡、
-拒絕遙測圖、整併紀錄、Playbook 條目卡片（匯出／手動 retire）。
+Dashboard 記憶頁「自主進化」分頁：進化模式總覽、停滯偵測卡、拒絕遙測圖、
+Playbook 條目卡片（匯出／手動 retire）。版本歷史與整併紀錄卡只服務已移除的
+SOUL.md 路徑，已於 v1.66 拿掉。
 
 ### 12.8 檔案索引
 
@@ -1105,7 +1110,6 @@ Dashboard 記憶頁「自主學習」分頁：進化模式總覽、版本歷史�
 | Gate（保留否決權） | `crates/duduclaw-gateway/src/gvu/verifier_gate.rs` |
 | Measure（分數向量） | `crates/duduclaw-gateway/src/gvu/verifier_measure.rs` |
 | Champion + 提交閘 | `crates/duduclaw-gateway/src/gvu/champion.rs` |
-| SOUL cap 死鎖解除 | `crates/duduclaw-gateway/src/gvu/consolidate.rs` |
 | 停滯偵測器 | `crates/duduclaw-gateway/src/gvu/stagnation.rs` |
 | 拒絕遙測 | `crates/duduclaw-gateway/src/gvu/telemetry.rs` |
 | MistakeNotebook 軌跡證據 | `crates/duduclaw-gateway/src/gvu/mistake_notebook.rs`（`TrajectoryEvidence`） |

@@ -162,7 +162,7 @@ The HippoRAG-lite graph gained four independent refinements (HippoRAG 2 + LightR
 
 ## F2: The Reflexion Loop
 
-F2 bridges the **existing** `MistakeNotebook` into the answering path — it is not a new store. The trigger signal is the existing `ErrorCategory` (Significant / Critical, MetaCognition-adaptive) — **not** the GVU Verifier, which validates SOUL.md proposals.
+F2 bridges the **existing** `MistakeNotebook` into the answering path — it is not a new store. The trigger signal is the existing `ErrorCategory` (Significant / Critical, MetaCognition-adaptive) — **not** the evolution engine's Gate/Measure verifier, which judges candidate playbook entries.
 
 ### F2a — Inject past mistakes into the prompt
 
@@ -190,7 +190,7 @@ Append to prompt:
   - <mistake 2 prompt section>
 ```
 
-This bridges `MistakeNotebook` → cross-task learning, so the agent stops repeating past failures on similar topics — not just inside the GVU SOUL.md path.
+This bridges `MistakeNotebook` → cross-task learning, so the agent stops repeating past failures on similar topics — not just inside the evolution engine.
 
 ### F2b — Consolidate ≥3 same-category mistakes into one rule
 

@@ -22,7 +22,7 @@
 | 12 | [業種テンプレートとOdoo ERP連携](12-industry-templates.md) | すぐに使えるビジネスインテリジェンス |
 | 13 | [マルチランタイムエージェント実行](13-multi-runtime.md) | Claude / Codex / Antigravity / Grok / OpenAI互換など複数バックエンドを統一（Gemini CLI は非推奨） |
 | 14 | [音声パイプライン](14-voice-pipeline.md) | 別々に配線された2つの STT/TTS 経路：fail-closed な HTTP と、ハードコードされた Telegram ハンドラ |
-| 15 | [スキルライフサイクルエンジン](15-skill-lifecycle.md) | 7段階の自動スキル抽出・管理 |
+| 15 | [スキルライフサイクルエンジン](15-skill-lifecycle.md) | 6段階の自動スキル抽出・管理 |
 | 16 | [セッションメモリスタック](16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |
 | 17 | [Wiki 知識レイヤー](17-wiki-knowledge-layer.md) | L0-L3 信頼度加重知識の自動注入 |
 | 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | `duduclaw acp` は IDE パネル（Zed / JetBrains / nvim）向けに Agent Client Protocol v1 を話し、`duduclaw acp-server` は A2A の stdio インターフェースです |

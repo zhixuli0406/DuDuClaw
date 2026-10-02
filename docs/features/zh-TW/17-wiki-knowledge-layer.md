@@ -385,7 +385,6 @@ you need historical context or deep references.
 
 ## 與其他系統的互動
 
-- **GVU 迴圈**：SOUL.md 更新可由透過 wiki 搜尋偵測到的模式觸發；演化引擎知道 Agent 知道什麼。
 - **Skill 生命週期**：技能萃取會諮詢 wiki 以取得脈絡。從記憶合成的技能可以引用支持它的 wiki 頁面。
 - **安全性**：包含機密的 wiki 頁面會被那個對其他可寫面執行的同一個掃描器標記。CONTRACT.toml 中的 `must_not` 規則可以限制 Agent 被允許寫入哪些層級。
 - **Dashboard**：Knowledge Hub 頁面以層級過濾器與圖譜視覺化呈現 wiki。

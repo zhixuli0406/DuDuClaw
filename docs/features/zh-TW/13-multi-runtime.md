@@ -154,15 +154,15 @@ Registry 知道哪些後端可用
 
 `/opt/duduclaw/runtimes/bin` 是 DuDuClaw OS 值班機映像放內建 CLI 的位置，即使 gateway 沒有繼承到互動式 `PATH`，映像內建的 runtime 一樣找得到。
 
-Agent 可以在 `agent.toml` 中指定偏好的 runtime：
+Agent 在 `agent.toml` 中指定使用的 runtime：
 
 ```toml
 [runtime]
-preferred = "claude"    # 主要後端
+provider = "claude"          # 主要後端
 fallback = "antigravity"     # 主要不可用時的備案
 ```
 
-若未設定偏好，Registry 使用第一個可用的後端。
+沒有寫 `provider` 時，Agent 使用 Claude。無法辨識的值會記一筆警告，同樣退回 Claude。
 
 ### Per-Agent 設定
 

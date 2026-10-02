@@ -35,19 +35,27 @@ MCP bridge         ─┘                                   1. イベント一�
 
 ---
 
-## 5つのイベント型
+## イベント型
 
-エンジンは5種類の `AutopilotEvent` を購読します。各イベントは payload を運び、条件が照合できるフィールドマップに平坦化されます：
+ルールは 13 種類の `AutopilotEvent` を購読できます。各イベントは payload を運び、条件が照合できるフィールドマップに平坦化されます：
 
 | イベント | `event_name` | 発火タイミング | 主なフィールド |
 |----------|--------------|----------------|----------------|
 | **TaskCreated** | `task_created` | Task Board に新しい task が現れる | task オブジェクト（id、title、priority……） |
+| **TaskUpdated** | `task_updated` | task のフィールドが更新される | task オブジェクト |
 | **TaskStatusChanged** | `task_status_changed` | task がステータス間を移動 | `task_id`、`from`、`to`、task オブジェクト |
+| **ActivityNew** | `activity_new` | Activity Feed に新しい項目が投稿される | activity オブジェクト |
 | **ChannelMessage** | `channel_message` | channel にメッセージが届く | `channel`、`agent_id`、`text` |
 | **AgentIdle** | `agent_idle` | ある agent がアイドルになる | `agent_id`、`idle_minutes` |
 | **CronTick** | `cron_tick` | スケジューラが周期的 tick を発する | `now` |
+| **RunAtRisk** | `run_at_risk` | 予測が実行中タスクの失敗を見込む | `agent_id`、`session_id`、`score`、`level`、`reasons` |
+| **OsFileEvent** | `os_file` | agent の `[os_watch]` がファイル変更を検知 | `agent_id`、`path`、`kind`（created / modified / removed / renamed）、`file_name`、`extension` |
+| **OsFrontmostEvent** | `os_frontmost` | 前面のアプリまたはウィンドウタイトルが変わる | `agent_id`、`app`、`window_title`、`prev_app` |
+| **Tick** | `tick` | 常駐センシングのソース（`[[tick.sources]]`）が観測を出す | `source`、`ts`、抽出フィールドとその `prev_` / `delta_` / `pct_` 派生フィールド |
+| **SecurityEvent** | `security_event` | warning / critical レベルの監査イベント、またはセキュリティ態勢の変化 | `severity`、`event_type`、`agent_id`、`source` |
+| **OdooEvent** | `odoo_event` | Odoo のポーリングまたは `POST /webhook/odoo` が ERP の変更を報告 | `event_type`、`model`、`record_id`、`record`（トップレベルのスカラー値も平坦化） |
 
-ルールは関心のある `trigger_event` を宣言するため、`channel_message` ルールが `cron_tick` を目にすることはありません。
+ルールは関心のある `trigger_event` を宣言するため、`channel_message` ルールが `cron_tick` を目にすることはありません。この 13 の名前は `sequence` ルールの `first` / `then` に使える合法なイベントでもあります。エンジンには内部イベント `cep_trigger` もあり、シーケンスマッチャーが一致したルールを発火させるために出しますが、`trigger_event` には使えません。
 
 ---
 
@@ -67,6 +75,7 @@ MCP bridge         ─┘                                   1. イベント一�
 | `eq` | フィールドが期待値と等しい |
 | `neq` | フィールドが期待値と等しくない |
 | `in` | フィールドが値の配列のいずれかである |
+| `not_in` | フィールドが値の配列のどれでもない |
 | `gt` / `gte` | フィールドが数値的に大きい（または等しい） |
 | `lt` / `lte` | フィールドが数値的に小さい（または等しい） |
 | `contains` | 文字列が部分文字列を含む、または配列が値を含む |

@@ -2,7 +2,7 @@
 
 > Version: v2.0 (prediction-driven + GVU self-play) + v3 addendum (AEE / playbook, 2026-08-06)
 > Date: 2026-03-29 (v3 addendum: 2026-08-06)
-> Status: Production — 197 tests passing (v2.0 baseline); see chapter 12 for v3 AEE
+> Status: chapter 3 (prediction engine) and chapter 12 (AEE) describe the running code; the v2.0 SOUL.md rewrite path was removed on 2026-09-29 (see the note below)
 
 **Read this before the rest of the document (S11 status, 2026-09-29)**: the "GVU rewrites SOUL.md directly" flow described in chapter 4 — and everything that supported it (the `agent.toml [evolution] legacy_soul_evolution` escape hatch, `SOUL.md` versioning, the 24-hour observation window, automatic rollback, the cap-deadlock consolidate rewrite, deferred-GVU retry, the `duduclaw evolution finalize` CLI) — has been **removed from the codebase**. `SOUL.md` became read-only for agents in v3 (2026-08-06), so by then those mechanisms were already guarding a write path that no longer existed. **Chapters 4, 7, 8 and 9 are retained as history**: they describe how the engine used to work and why each guard was built, which is still the fastest way to understand the design pressure behind chapter 12 — but nothing in them is live code any more. The engine that runs is AEE (chapter 12), and `[evolution] gvu_enabled` now ships `true` from the factory. Full design: `commercial/docs/DESIGN-evolution-v3-aee.md`; planning and root-cause forensics: `commercial/docs/TODO-evolution-v3-2026-08.md`; user-facing walkthrough: `docs/features/38-aee-playbook-evolution.md`; switch details: `docs/guides/evolution-switches.md`.
 
@@ -13,7 +13,7 @@
 1. [Architecture overview](#1-architecture-overview)
 2. [Design philosophy](#2-design-philosophy)
 3. [Prediction engine (Phase 1)](#3-prediction-engine-phase-1)
-4. [GVU self-play loop (Phase 2, legacy escape hatch)](#4-gvu-self-play-loop-phase-2)
+4. [GVU self-play loop (Phase 2, removed 2026-09-29)](#4-gvu-self-play-loop-phase-2)
 5. [Integration points](#5-integration-points)
 6. [Security mechanisms](#6-security-mechanisms)
 7. [Configuration format (legacy)](#7-configuration-format)
@@ -27,7 +27,7 @@
 
 ## 1. Architecture overview
 
-The autonomous evolution engine lets an agent automatically modify its own personality profile (`SOUL.md`) based on real conversation performance. The system is driven by **prediction error** rather than a fixed-interval timer, keeping roughly 90% of conversations at zero LLM cost.
+The autonomous evolution engine lets an agent learn small behavior rules (playbook entries, chapter 12) from real conversation and task outcomes. `SOUL.md`, the persona file, is read-only for agents and the engine never rewrites it. The system is driven by **prediction error** rather than a fixed-interval timer: Significant and Critical errors start an LLM-backed evolution round, and so does a small exploration share of Negligible ones (ε, with a hard floor of 5%), only when `[evolution] gvu_enabled` is on (the factory default since 2026-09-29).
 
 ```
 User conversation
@@ -42,21 +42,21 @@ User conversation
     │             │                         │
     ▼             ▼                         ▼
  Negligible    Moderate                Significant / Critical
- (zero cost)   (store to memory)       (triggers GVU)
+ (zero cost)   (store to memory)       (starts an evolution round)
                                           │
                                           ▼
                               ┌────────────────────────┐
-                              │  GVU Self-Play Loop     │
-                              │  Generator → Verifier   │
-                              │      → Updater          │
-                              │  (up to 3 rounds)       │
+                              │  AEE round (ch. 12)     │
+                              │  generate → Gate →      │
+                              │  Measure (≤3 rounds)    │
                               └───────────┬────────────┘
                                           │
                                           ▼
                               ┌────────────────────────┐
-                              │  SOUL.md atomic write   │
-                              │  + 24h observation      │
-                              │  + auto confirm/rollback│
+                              │  commit playbook entry  │
+                              │  if it matches or beats │
+                              │  the champion; settle   │
+                              │  each entry on its own  │
                               └────────────────────────┘
 ```
 
@@ -68,10 +68,10 @@ User conversation
 |------|---------|
 | **Reflect only on error** | Zero cost when prediction error < 0.2 — no wasted API tokens |
 | **Self-calibration** | MetaCognition automatically adjusts threshold boundaries every 100 predictions |
-| **Safety first** | 4-layer verification (3 zero-cost + 1 LLM) + contract boundaries + atomic writes |
-| **Rollback capable** | Every change gets a 24h observation period; metric regressions trigger automatic rollback |
+| **Safety first** | A deterministic Gate (zero LLM, keeps veto power) runs before any judge call; every candidate entry is checked against the agent's contract; `SOUL.md` is read-only for agents |
+| **Rollback capable** | Each committed entry is settled against its own linked eval case after `aee_settle_hours` (default 24h); a regression retires only that entry |
 | **XML isolation** | All untrusted content is wrapped in XML tags to prevent prompt injection |
-| **Encrypted storage** | Rollback diffs are AES-256-GCM encrypted and stored outside the agent directory |
+| **Small units** | A playbook entry is at most 400 characters and must link at least one eval case |
 
 ---
 
@@ -300,6 +300,8 @@ if critical_proportion > 20%:
 ---
 
 ## 4. GVU self-play loop (Phase 2)
+
+> Removed on 2026-09-29 (S11). This chapter is history; the running engine is chapter 12.
 
 ### 4.1 Module structure
 
@@ -570,7 +572,7 @@ After every user conversation ends, the following runs in a background `tokio::s
 4. update_model()      → update the user model
 5. diagnose()          → skill lifecycle diagnosis
 6. route()             → route to an evolution action
-7. gvu.run()           → run the GVU loop if triggered
+7. gvu.run()           → run an evolution round (AEE, chapter 12) if triggered
 8. metacognition       → feed the result back
 ```
 
@@ -600,7 +602,7 @@ must_always = ["respond in zh-TW", "refuse harmful requests"]
 max_tool_calls_per_turn = 10
 ```
 
-The L1 verifier enforces these boundaries against the simulated final SOUL.md.
+In AEE the `G-Contract` gate checks every candidate playbook entry against `must_not` (plus built-in defaults) and treats `must_always` as a state invariant (`gvu/verifier_gate.rs`).
 
 ### 5.4 Soul Guard (integrity protection)
 
@@ -612,11 +614,13 @@ Location: `crates/duduclaw-security/src/soul_guard.rs`
 | Separate storage | The hash is stored at `~/.duduclaw/soul_hashes/<agent>.hash`, outside the agent directory |
 | Drift detection | A `CRITICAL`-level security alert fires when the fingerprint doesn't match |
 | Version backups | `.soul_history/SOUL_<timestamp>.md`, up to 10 versions |
-| Accepting a change | `accept_soul_change()` is called once the GVU Updater successfully applies a change |
+| Accepting a change | `accept_soul_change()` is called after a `SOUL.md` write through the `agent_update_soul` MCP tool (operator, or an agent opted in with `can_modify_own_soul = true`) |
 
 ---
 
 ## 6. Security mechanisms
+
+> Sections 6.1–6.3 describe the removed SOUL.md rewrite path and are kept as history; AEE's checks are in §12.5.2. The per-agent run lock in 6.4 still applies (`gvu/loop_.rs`).
 
 ### 6.1 Prompt injection defense
 
@@ -952,10 +956,7 @@ round_seq += 1
 **Nothing lands during the inner loop** — only the final commit step touches
 SQLite; a round the inner loop abandons leaves the playbook byte-for-byte
 unchanged (except `failure_history`, which deliberately keeps the lesson
-learned that round). **AEE never writes SOUL.md** — the whole-file
-compression path for a SOUL.md over its cap goes through chapter 4's WP0.2
-consolidate path, orthogonal to the AEE loop; the two share only the same
-cooldown.
+learned that round). **AEE never writes SOUL.md.**
 
 #### 12.5.1 Strategy mix (GEP G4, replacing bare epsilon exploration)
 
@@ -1052,7 +1053,7 @@ eval_suites_root = "evals"     # Root directory the AEE replay subprocess search
 eval_binary = "/usr/local/bin/duduclaw"   # Optional, overrides the default binary path
 ```
 
-New CLIs: `duduclaw playbook export --agent <id> [--out <path>]` (exports
+New CLIs: `duduclaw export playbook --agent <id> [--out <path>]` (the older `duduclaw playbook export` spelling still parses until v1.68.0; exports
 GEP-gene-shaped JSON to a local file, no external hub); `duduclaw playbook
 migrate-soul --agent <id> [--apply]` (WP1.4 — extracts behavior rules from a
 legacy SOUL.md into draft playbook entries for human review before `--apply`);
@@ -1065,9 +1066,10 @@ a temporary `.mcp.json` copy (`DUDUCLAW_HOME` pointed at the eval home,
 production and keys never enter the transcript) (see
 `docs/guides/evals.md`).
 
-Dashboard: the memory page's "Autonomous learning" tab — evolution mode
-overview, version history, stagnation-detection card, rejection telemetry
-chart, consolidation log, playbook entry cards (export / manual retire).
+Dashboard: the memory page's "Self-Improvement" tab — evolution mode
+overview, stagnation-detection card, rejection telemetry chart, playbook
+entry cards (export / manual retire). The version-history and consolidation
+cards served the removed SOUL.md path and were dropped in v1.66.
 
 ### 12.8 File index
 
@@ -1090,7 +1092,6 @@ chart, consolidation log, playbook entry cards (export / manual retire).
 | Gate (retains veto power) | `crates/duduclaw-gateway/src/gvu/verifier_gate.rs` |
 | Measure (score vector) | `crates/duduclaw-gateway/src/gvu/verifier_measure.rs` |
 | Champion + commit gate | `crates/duduclaw-gateway/src/gvu/champion.rs` |
-| SOUL cap deadlock release | `crates/duduclaw-gateway/src/gvu/consolidate.rs` |
 | Stagnation detector | `crates/duduclaw-gateway/src/gvu/stagnation.rs` |
 | Rejection telemetry | `crates/duduclaw-gateway/src/gvu/telemetry.rs` |
 | MistakeNotebook trajectory evidence | `crates/duduclaw-gateway/src/gvu/mistake_notebook.rs` (`TrajectoryEvidence`) |

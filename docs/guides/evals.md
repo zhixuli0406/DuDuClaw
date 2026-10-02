@@ -10,12 +10,12 @@ This is the ADK‑evalset / Braintrust eval‑action pattern adapted to DuDuClaw
 one TOML file per case, an exit code CI can gate on, and an offline replay mode
 so regressions are catchable without spending tokens.
 
-> **Why this matters for a self‑evolving platform.** DuDuClaw's GVU loop rewrites
-> `SOUL.md` and validates its own changes with its own Verifier. That Verifier is
+> **Why this matters for a self‑evolving platform.** DuDuClaw's evolution engine (AEE)
+> learns playbook rules and validates them with its own Gate and Measure. That check is
 > *inside* the loop — it can drift together with the thing it is grading. Evals are
 > the **external yardstick**: a fixed, human‑authored set of expected behaviors that
-> a prompt change, a runtime/provider swap, a `claude` CLI upgrade, or a GVU
-> `SOUL.md` rewrite **cannot silently regress**. See
+> a prompt change, a runtime/provider swap, a `claude` CLI upgrade, or a newly
+> committed playbook rule **cannot silently regress**. See
 > [GVU yardstick](#evolution-integration-the-external-yardstick) below.
 
 ---

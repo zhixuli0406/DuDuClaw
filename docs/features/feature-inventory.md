@@ -1,11 +1,12 @@
 # DuDuClaw Complete Feature Inventory
 
-> v1.24.0 core + 2026-07/08 additions | Last updated: 2026-08-16 (v1.61.0)
+> v1.24.0 core + 2026-07/08 additions | Last reviewed against the code: 2026-10-02 (v1.67.0)
 >
-> Note: the sections below describe the v1.24.0 baseline. The **additions**
-> blocks immediately after capture features shipped since (see `CHANGELOG.md`
-> for the authoritative list). The `ja-JP/` and `zh-TW/` mirrors are synced
-> with the additions blocks.
+> Note: the sections below started as the v1.24.0 baseline and have been
+> corrected where features were removed or changed. The **additions** blocks
+> immediately after cover features up to v1.61; later additions are listed in
+> `CHANGELOG.md`, which is the authoritative list. The `ja-JP/` and `zh-TW/`
+> mirrors carry the same content.
 
 ---
 
@@ -30,7 +31,7 @@
 | Local model marketplace (v1.57) | Pick a use case → hardware-fit lights computed from this machine's memory → one-click install with auto-chosen quantization from five vetted HF publishers; MoE dual-track verdict flags "expert-offload viable" for 30B-A3B-class models on 16GB machines ([45-local-model-marketplace.md](45-local-model-marketplace.md)) |
 | Working State — cross-wake authoritative state (v1.57) | Per-agent key-value posture + handoff note auto-injected into every wake-up (cron / heartbeat / goal loop / channels) as the single source of truth; explicit-tool-only updates with required reason + supersession history, `expected_value` CAS against concurrent wakes, `ttl_hours` for day-scoped rules, 32-key cap; `[memory] working_state_enabled`, default on ([44-working-state.md](44-working-state.md)) |
 | Scheduled runs gain memory + visibility (v1.57) | Successful cron/dispatch executions now feed the same distillation/knowledge pipeline (hourly per-agent throttle) and land in the run-history page — previously a purely schedule-driven agent accumulated nothing and showed zero runs |
-| Ecosystem & distribution surfaces (v1.57) | Six free industry starter packs (safety boundaries intact), pack registry install/publish with client-side sha256 + minisign verification, CONTRIBUTING.md + build-your-own-pack tutorial, public-website chat widget (guest mode, default off) + WordPress plugin, Chrome / VS Code extensions, wearable transcript ingestion (`POST /ingest/transcript`), `duduclaw tunnel`, LINE friend-QR/NFC kit; external MCP tool surface becomes scope-driven; Homebrew channel retired |
+| Ecosystem & distribution surfaces (v1.57) | Six free industry starter packs (safety boundaries intact), pack registry install/publish with client-side sha256 + minisign verification, CONTRIBUTING.md + build-your-own-pack tutorial, public-website chat widget (guest mode, default off) + WordPress plugin, Chrome / VS Code extensions, wearable transcript ingestion (`POST /ingest/transcript`), LINE friend-QR/NFC kit (the `duduclaw tunnel` helper added here was removed in 2026-09); external MCP tool surface becomes scope-driven; Homebrew channel retired |
 | Goal task console `/goals` (v1.58) | Dashboard page assigning goals directly to agents (same semantics as `/goal`), full per-round execution timeline (`tasks.timeline`), in-place human intervention — all dashboard needs_human decisions unified onto the same fail-closed `tasks.goal_decide` path as channel buttons |
 | Foresight page (v1.58) | The LLM→LWM loop made visible: predict → act → observe → compare, per-round prediction-vs-actual (`forward.chain`), per-agent skill verdict cards (Brier + Murphy decomposition, three honest labels), world-model state buckets readable for the first time; per-aspect MAV verdicts, run links, retry/no-progress signals, and prediction sub-errors now persisted per round |
 | Channel OTP fallback + settings integration (v1.58) | Login-OTP delivery tries the global bot token then every per-agent bot token (dedup, ordered) — fixing silent failure when the bot moved to a single agent; agent channel settings and channel management now share one editor/dialog; sidebar "new feature" (`newIn`) badge convention introduced |
@@ -38,7 +39,7 @@
 | Per-goal contract fields + self-study (v1.59) | `duration_hours` (deadline → needs_human) and `risk_boundary` (empty ⇒ five-line baseline) on goal creation, injected every round and checked by the MAV safety aspect; `/goal` gains `時限:`/`邊界:` segments; optional structured-prediction requirement; agents with same-day belief misses get an automatic evening self-study goal |
 | Dispatch engine default ON + scheduler liveness (v1.59) | `[dispatch] enabled` default flipped to true (assigned goals now execute out of the box) with a hot-reload dashboard toggle; `/healthz` returns 503 when cron/heartbeat loops stall >5 min — closing the incident where a scheduler-dead container stayed "healthy" for days |
 | Two-stage judging + judge hardening (v1.60) | Cheap first-stage evaluator (`continue`/`candidate_complete`/`blocked`) in front of the MAV panel (default on; any failure degrades to full MAV, never auto-pass); four judge discipline clauses (anti-ratchet, audit-don't-fabricate, anti-scope-creep, self-claims-aren't-evidence); truncated-panel and first-token `PASS` false-positive holes closed; gap-fingerprint stall detection; bail-pattern detection; `resume_on_restart` default `pause` |
-| Pluggable judge seam (v1.60) | `[dispatch] judge = mav / evaluator_only / external / human_only` — external-judge failures always degrade back to MAV (stricter, audited) with its feedback treated as untrusted DATA; unknown values fall back to `mav`; dashboard selector under Settings → Automation |
+| Pluggable judge seam (v1.60) | `[dispatch] judge = mav / evaluator_only / external / human_only` (`evaluator_only` and `human_only` are deprecated since v1.66.0 and removed in v1.68.0) — external-judge failures always degrade back to MAV (stricter, audited) with its feedback treated as untrusted DATA; unknown values fall back to `mav`; dashboard selector under Settings → Automation |
 | Goal contract freeze (v1.60) | Acceptance criteria frozen at creation into an immutable `acceptance_criteria_baseline` read by judges and evaluator alike; agent-identity `tasks_update` edits of goal acceptance criteria refused with audit; `/goal` without criteria gets four-element guidance + suggested outcome-style criteria |
 | Goal-loop human signals + admission queue (v1.60) | Closed six-way `pause_reason` classification on needs_human (statically stamped, never parsed from LLM text); overdue-progress reporting (`progress_report_minutes`); zero-LLM tool-streak advisories (3/5/8 escalation); bounded FIFO admission queue for ephemeral spawns (default `queue`); best-round handoff on budget exhaustion (deterministic pick + gap list instead of empty-handed escalation) |
 | Agent Mail (v1.60) | Per-agent mailbox (`/mail` page): Gmail API / drop-folder inbound, outbound always drafts pending ApprovalBroker confirmation (a background worker is the only sender), DATA-fenced content, dedicated non-grantable scopes, cross-agent reads via delegation policy ([47-agent-mail.md](47-agent-mail.md)) |
@@ -98,12 +99,11 @@
 | Aider-style code map (`code_map` MCP tool) | tree-sitter symbol graph over the HippoRAG-lite Personalized-PageRank engine; ranks repo files by relevance to a query |
 | Semantic vector memory (`w_vec`) | third re-rank signal beside FTS/graph; zero-dep CJK-safe `NgramHashEmbedder`, opt-in `DUDUCLAW_SEMANTIC_VECTORS=1` |
 | Cross-session user profile | per-user preference traits (temporal supersession) → session-stable `## About This User` reply injection; `user_profile_record` / `user_profile_get` MCP tools |
-| GDPR export/erase | `duduclaw gdpr export\|erase <contact>` over memory (triples + mentions + key_facts, 4-table cascade, SHA-256 tombstone) **and** the session store (`<channel>:<chat_id>` prefix) |
-| Memory PPR bench | `duduclaw memory bench` — P50/P95 latency + partition recommendation (LightRAG measurement gate) |
+| GDPR export/erase | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm` (the older `gdpr export` spelling still parses until v1.68.0) over memory (triples + mentions + key_facts, 4-table cascade, SHA-256 tombstone) **and** the session store (`<channel>:<chat_id>` prefix) |
 | Custom Dashboard Widgets | AI-guided or raw-HTML dashboard cards in a sandboxed runtime; Widget Studio share/import/export ([30-custom-widgets.md](30-custom-widgets.md)) |
 | Budget circuit breaker | hard per-agent rolling-window spend caps (`[budget] daily_cap_cents`) that block LLM calls at the choke-point; `budget_events.jsonl` |
 | Burn-rate cost anomaly | rolling mean+stddev outlier detection over per-day spend (`cost_anomaly.rs`) |
-| Audit export + SIEM sink | `duduclaw audit` — normalize + stream the JSONL audit trails to NDJSON / a webhook |
+| Audit export + SIEM sink | `duduclaw export audit` (formerly `duduclaw audit`) — normalize + stream the JSONL audit trails to NDJSON / a webhook |
 | Output guardrail hook | opt-in `[guardrails]` — secret-leak / injection-echo / deny-phrase / PII scan before send |
 | CI red-team scan | `duduclaw redteam` — jailbreak variants from `CONTRACT.toml` `must_not`, run through the input-guard |
 | Security posture report | `duduclaw security` — weighted checklist of active protections |
@@ -112,8 +112,8 @@
 | MCP Bridge | `[[mcp.external]]` — mount external MCP servers with a deny-by-default tool filter + `env://` / `secret://` credentials; per-SaaS recipes in `guides/mcp-bridge.md` |
 | Secret manager backends | 1Password Connect + Infisical adapters; `secret://<backend>/<name>` resolution wired into the MCP Bridge |
 | MCP/skill trust tiering | official / active / orphan classification from repo push-age + owner type |
-| Email channel (partial) | async SMTP send (`lettre`, loopback-verified) + RFC822 inbound parse; IMAP poll + channel lifecycle are PENDING-LIVE |
-| Communication Channels | now **nine** (adds Google Chat + Microsoft Teams over the 7 below) |
+| Email (via Agent Mail) | `email.rs` (SMTP send with `lettre`, RFC822 parsing) is used by Agent Mail since v1.60. There is no IMAP polling, and email is not one of the channels |
+| Communication Channels | now **eleven**: Google Chat and Microsoft Teams, later WeCom and DingTalk, on top of the original seven (see the channel table below) |
 
 ---
 
@@ -121,9 +121,9 @@
 
 | Feature | Description |
 |---------|-------------|
-| Multi-Runtime AI Agent Platform | Unified `AgentRuntime` trait — Claude / Codex / Gemini (deprecated) / Antigravity (`agy`) / Grok (`grok`) / OpenAI-compat six backends with auto-detection |
-| MCP Server (JSON-RPC 2.0) | Exposes 80+ tools to AI Runtime via stdin/stdout; registered at `<agent>/.mcp.json` (v1.8.5 — Claude CLI `-p` only reads project-level), gateway auto-creates/repairs on startup |
-| ACP/A2A Server | Two commands: `duduclaw acp` — Agent Client Protocol v1 for IDE agent panels (Zed / JetBrains / nvim; `initialize` / `session/new` / `session/prompt` streaming, `AUTH_REQUIRED` when unconfigured); `duduclaw acp-server` — A2A protocol (`agent/discover` / `message/send` / `tasks/*`, `.well-known/agent.json` AgentCard) |
+| Multi-Runtime AI Agent Platform | Unified `AgentRuntime` trait — 13 runtime ids in `runtime_catalog.rs`: twelve CLI backends (Claude, Codex, Gemini (deprecated), Antigravity, Grok, Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) plus OpenAI-compat HTTP, with auto-detection ([13-multi-runtime.md](13-multi-runtime.md)) |
+| MCP Server (JSON-RPC 2.0) | Exposes 249 tools (v1.67.0; `tools/list` is filtered to what the caller may call) to AI Runtime via stdin/stdout; registered at `<agent>/.mcp.json` (v1.8.5 — Claude CLI `-p` only reads project-level), gateway auto-creates/repairs on startup |
+| ACP/A2A Server | Two commands: `duduclaw acp` (= `duduclaw acp client`) — Agent Client Protocol v1 for IDE agent panels (Zed / JetBrains / nvim; `initialize` / `session/new` / `session/prompt` streaming, `AUTH_REQUIRED` when unconfigured); `duduclaw acp server` (formerly `acp-server`, which still parses until v1.68.0) — A2A protocol (`agent/discover` / `message/send` / `tasks/*`, `/.well-known/agent-card.json` Agent Card with a legacy `/agent.json` alias) |
 | Agent Directory Structure | `.claude/`, `.mcp.json`, `SOUL.md`, `CLAUDE.md`, `CONTRACT.toml`, `agent.toml`, `wiki/`, `SKILLS/`, `memory/`, `tasks/`, `state/` |
 | Sub-agent Orchestration | `create_agent` / `spawn_agent` / `list_agents` with `reports_to` hierarchy + D3.js OrgChart + "## Your Team" auto-injection |
 | DelegationEnvelope | Structured handoff protocol — context / constraints / task_chain / expected_output |
@@ -139,7 +139,7 @@
 |---------|-------------|
 | Claude Runtime | Claude Code SDK (`claude` CLI) with JSONL streaming + `--resume` multi-turn |
 | Codex Runtime | OpenAI Codex CLI with `--json` streaming events, `AGENTS.md` file for system prompt |
-| Gemini Runtime (deprecated in v1.67.0, removed in v1.69.0; use Antigravity) | Google Gemini CLI with `--output-format stream-json`, `GEMINI_SYSTEM_MD` env var for system prompt, `--approval-mode yolo`. Retained for paid `GEMINI_API_KEY` users after Google retired the personal-tier Gemini CLI on 2026-06-18 |
+| Gemini Runtime (deprecated in v1.67.0, removed in v1.69.0; use Antigravity) | Google Gemini CLI with `--output-format stream-json`, `GEMINI_SYSTEM_MD` env var for system prompt, approval mode derived from the agent's capabilities (`auto_edit` by default, `--sandbox` added for read-only agents, `yolo` only for full-access ones). Retained for paid `GEMINI_API_KEY` users after Google retired the personal-tier Gemini CLI on 2026-06-18 |
 | Antigravity Runtime (v1.24.0) | Google Antigravity CLI (`agy`, the 2026-06-18 Gemini-CLI successor), driven via oneshot `agy -p --dangerously-skip-permissions --print-timeout 300s`. Binary auto-resolve (PATH → `~/.local/bin/agy`); no `--system` flag so the system prompt + history are embedded in the prompt (CJK-safe); auth via Google sign-in (run `agy` in a host terminal) or API-key mode (`config.toml [antigravity] auth = "api_key"` + Gemini API key); MCP tools registered per agent workspace in `.agents/mcp_config.json`; auto-pre-seeds the agent dir into agy's `trustedWorkspaces` (cross-process lock) to avoid a headless trust-prompt hang; token usage estimated (print mode exposes no stats) |
 | Grok Runtime (R4) | xAI Grok CLI ("Grok Build"), driven via oneshot `grok -p` (verified against docs.x.ai 2026-07-13). Binary `grok` (curl-installed; third-party `grok-cli` as fallback probe); `--model` selection; `--tools`/`--disallowed-tools` confinement (+ `native_sandbox` hard gate); system prompt + history embedded in the prompt (CJK-safe); duduclaw MCP server written as `[mcp_servers.duduclaw]` TOML into per-agent `<agent_dir>/.grok/config.toml` (+ agent identity forwarded via spawn env); `XAI_API_KEY` env auth; token usage estimated (plain stdout). **Residuals** (need a live CLI): `--tools` list delimiter, project-local `config.toml` discovery for `mcp_servers`, `--output-format json` schema for real usage, and the full `--model` roster (`grok models`) — only `grok-4.5` / `grok-build-0.1` are doc-confirmed |
 | OpenAI-compat Runtime | HTTP endpoint (MiniMax / DeepSeek / etc.) via REST API |
@@ -152,7 +152,7 @@
 |---------|-------------|
 | Native Multi-Turn | Claude CLI `--resume` + SHA-256 deterministic session ID + history-in-prompt fallback (stale session, account rotation, unknown stream-json error) |
 | Turn Trimming | >800 chars → head 300 + tail 200 + `[trimmed N chars]`, CJK-safe char-level slicing |
-| Prompt Cache Strategy | Direct API "system_and_3" breakpoint placement, ~75% multi-turn hit rate |
+| Prompt Cache Strategy | Direct API "system_and_3" breakpoint placement (no measured hit rate is published) |
 | Compression Summary Injection | Post-compression summaries (role=system) injected into system prompt, not conversation turns |
 | Instruction Pinning | First user message → async Haiku extraction → `sessions.pinned_instructions` → injected at system prompt tail |
 | Snowball Recap | Each turn prepends `<task_recap>` to user message — zero LLM cost, U-shaped attention tail |
@@ -162,19 +162,22 @@
 | Stabilization Flags | `--strict-mcp-config` + `--exclude-dynamic-system-prompt-sections` (10-15% token reduction); `--bare` removed v1.8.11 (broke OAuth keychain) |
 | CJK-Safe String Slicing | `duduclaw_core::truncate_bytes` / `truncate_chars` replaced 31 unsafe byte-index sites |
 
-## Communication Channels (7)
+## Communication Channels (11)
 
 | Channel | Protocol |
 |---------|----------|
 | Telegram | Long polling, file/photo/sticker/voice, forums/topics, mention-only, voice transcription |
 | LINE | Webhook, HMAC-SHA256 signature, sticker support, per-chat settings |
-| Discord | Gateway WebSocket, slash commands (`/ask /status /config /session /agent`), voice channels (Songbird), auto-thread (session id stable across entire thread lifetime post-v1.8.14), embed replies |
+| Discord | Gateway WebSocket, slash commands (`/ask /status /config /session /agent`), voice channels only in builds with the non-default `discord-voice` feature (release binaries do not include it), auto-thread (session id stable across entire thread lifetime post-v1.8.14), embed replies |
 | Slack | Socket Mode, mention-only, thread replies |
-| WhatsApp | Cloud API |
+| WhatsApp | Cloud API webhook, signature verification fail-closed |
 | Feishu | Open Platform v2 |
+| Google Chat | Webhook (JWT-verified), service-account send |
+| Microsoft Teams | Azure Bot / Connector v3 (JWT-verified) |
+| WeCom | HMAC-SHA1 signature + AES-256-CBC message encryption |
+| DingTalk | HMAC-SHA256 signature + time window |
 | WebChat | Embedded `/ws/chat` WebSocket + React frontend (Zustand store) |
 | Channel Hot-Start/Stop | Dashboard-driven dynamic launch/termination |
-| Generic Webhook | `POST /webhook/{agent_id}` + HMAC-SHA256 signature verification |
 | Media Pipeline | Auto-resize (max 1568px) + MIME detection + Vision integration |
 | Sticker System | LINE sticker catalog + emotion detection + Discord emoji equivalents |
 | Channel Failure Tracking | `channel_failures.jsonl` with `FailureReason` enum (RateLimited/Billing/Timeout/BinaryMissing/SpawnError/EmptyResponse/NoAccounts/Unknown) |
@@ -196,7 +199,7 @@
 
 | Feature | Description |
 |---------|-------------|
-| Prediction-Driven Engine | Active Inference + Dual Process Theory, ~90% zero LLM cost |
+| Prediction-Driven Engine | Active Inference + Dual Process Theory; by design most conversations end without an LLM call (no measured share is published) |
 | Dual Process Router | System 1 (rules) / System 2 (LLM reflection) |
 | AEE (v3 default) | Agentic Evolution Engine — Generator inner loop (≤3 rounds) → Gate (deterministic, veto) / Measure (scored, no veto) split → champion + matches-or-improves commit gate → entry-level accept/rollback against linked eval cases |
 | Playbook (v3 default) | Gene-shaped behavior rules (category/signals_match/eval_cases/success_streak), extends the existing rule_lifecycle store, 0.92-cosine dedup, capacity + stale/archive lifecycle |
@@ -205,7 +208,7 @@
 | Stagnation Detector (v3) | Scans `evolution.db` every 30 min for consecutive-rejected / D-days-zero-apply / repeated-rejection-reason signals, posts to Activity Feed + dashboard |
 | ConversationOutcome | Zero-LLM conversation result detection (TaskType / Satisfaction / Completion), zh-TW + en |
 | Agent-as-Evaluator | Independent Evaluator Agent (Haiku cost control) for adversarial verification, structured JSON verdict |
-| Orchestrator Template | 5-step planning (Analyze → Decompose → Delegate → Evaluate → Synthesize) + complexity routing |
+| Orchestrator example | 5-step planning (Analyze → Decompose → Delegate → Evaluate → Synthesize) + complexity routing; an example under `docs/examples/orchestrator/`, copied by hand (not applied automatically) |
 
 ## Wiki Knowledge Layer (v1.8.9)
 
@@ -219,17 +222,17 @@
 | Dedup Detection | `wiki_dedup` — title match + tag Jaccard similarity (≥0.8) |
 | Reverse Backlink Index | Scans `related` frontmatter + body markdown links for bidirectional mapping |
 | Search Filters | `min_trust` / `layer` / `expand` (1-hop related/backlink expansion) |
-| Shared Wiki | `~/.duduclaw/shared/wiki/` cross-agent SOPs + policies + specs; `wiki_visible_to` capability control; MCP tools `shared_wiki_ls/read/write/search/delete/stats`, `wiki_share`; SoT policy via `.scope.toml` (see Identity & Access) |
+| Shared Wiki | `~/.duduclaw/shared/wiki/` cross-agent SOPs + policies + specs; `wiki_visible_to` capability control; MCP tools `wiki_ls/read/write/search/stats/lint` with `scope="shared"` (the `shared_wiki_*` spellings are deprecated aliases, removed in v1.68.0), plus `shared_wiki_delete` and `wiki_share`; SoT policy via `.scope.toml` (see Identity & Access) |
 | CLAUDE_WIKI Template | Included in agent CLAUDE.md on creation, provides wiki MCP tool usage guide |
 
 ## Skill Ecosystem
 
 | Feature | Description |
 |---------|-------------|
-| 7-Stage Lifecycle | Activation → Compression → Extraction → Reconstruction → Distillation → Diagnostician → Gap Analysis |
+| 6-Stage Lifecycle | Activation → Compression (three-layer progressive loading) → Extraction → Distillation → Diagnosis → Gap Analysis ([15-skill-lifecycle.md](15-skill-lifecycle.md)); the former Reconstruction stage had no caller and was removed in 2026-09 |
 | GitHub Live Indexing | Search API with 24h local cache, weighted search |
 | Skill Marketplace | Web dashboard browsing, installation, security scanning |
-| Skill Auto-Synthesis | Gap accumulator → synthesize from episodic memory (Voyager-inspired) → sandbox trial with TTL → cross-agent graduation |
+| Skill Auto-Synthesis | Gap accumulator → synthesize from episodic memory (Voyager-inspired) → sandbox trial with TTL → cross-agent graduation; off by default (`agent.toml [evolution] skill_synthesis_enabled`) |
 | Skill Synthesis Scheduler (W19-P1, v1.22.0) | Runs the "conversation → skill" extraction autonomously on an interval — `config.toml [skill_synthesis] auto_run / dry_run / interval_hours / lookback_days` + dashboard `skill_synthesis.get/update` RPC; `skill_synthesis_threshold` is a `u32` count (fixed the registry scan rejecting `0.7`) |
 | Skill Security Scanner (Rust-native) | `skill_lifecycle::security_scanner` scans candidate skills, no Python dependency |
 
@@ -243,26 +246,24 @@
 | llamafile Manager | Subprocess lifecycle, zero-install portable inference across 6 OS |
 | Model Management | `model_search` (HuggingFace), `model_download` (resume + mirror), `model_recommend` (hardware-aware) |
 
-## Compression Engine
+## Prompt Compression
 
 | Feature | Description |
 |---------|-------------|
-| Meta-Token (LTSC) | Rust-native lossless BPE-like, 27-47% compression on structured input |
-| LLMLingua-2 | Microsoft token-importance pruning, 2-5x lossy compression |
-| StreamingLLM | Attention sink + sliding window KV-cache for infinite conversations |
-| Strategy Selector | `compress_text` accepts `strategy` param — `meta_token` / `llmlingua` / `streaming_llm` / `auto` |
+| Reply-path budget pipeline | TurnTrim → DropOldestToolEchoes → BisectAndSummarize, cost-pressure aware, CJK-safe token estimation ([11-token-compression.md](11-token-compression.md)). The earlier Meta-Token / LLMLingua-2 / StreamingLLM compressor and its `compress_text` tool were removed in v1.33 |
+| Cache-aware guard | Compression is skipped when recent cache efficiency is above 50% and the budget overshoot is below 15% |
 
 ## Voice Pipeline
 
+See [14-voice-pipeline.md](14-voice-pipeline.md). The HTTP endpoints and the Telegram voice handler are wired separately.
+
 | Feature | Description |
 |---------|-------------|
-| ASR (Speech-to-Text) | Whisper.cpp (local) / SenseVoice ONNX (local) / OpenAI Whisper API / Deepgram (streaming) |
-| TTS (Text-to-Speech) | Piper ONNX (local) / MiniMax T2A (auto-detect CJK/Latin) / Edge TTS / OpenAI TTS |
-| VAD | Silero ONNX voice activity detection |
-| Audio Decode | symphonia: OGG Opus, MP3, AAC, WAV, FLAC → PCM |
-| Discord Voice | Songbird integration, voice channel participation |
-| LiveKit Voice | WebRTC multi-agent voice rooms |
-| ONNX Embedding | BERT WordPiece tokenizer + ONNX Runtime vector embedding |
+| HTTP endpoints | `POST /api/stt` (OpenAI-compatible transcription API or a local command template; returns 501 when `[voice]` has no STT provider), `POST /api/tts`, `GET`/`POST /api/voice/config` |
+| TTS providers | Piper (local ONNX voices) / Edge TTS / MiniMax T2A (picks a CJK or Latin voice) / OpenAI TTS, behind one router |
+| Telegram voice | Voice messages are transcribed with the OpenAI Whisper API; `/voice` replies use Edge TTS. Both are hardcoded, so the dashboard voice settings do not affect Telegram |
+| Not in release binaries | In-process Whisper (`whisper` feature of `duduclaw-inference`), ONNX embedding (`onnx` feature) and Discord voice channels (`discord-voice` feature) compile only when you build with those features |
+| Never implemented | SenseVoice, Deepgram, Silero VAD, `symphonia` decoding and LiveKit voice rooms were listed here before; none of them has code |
 
 ## Security
 
@@ -282,7 +283,7 @@
 | Unicode Normalization | NFKC normalization to detect homograph attacks |
 | Action Claim Verifier | Signature validation for tool execution claims |
 | Container Sandbox | Two separate paths. Task sandbox (`agent.toml [container] sandbox_enabled`): Docker only, runs a delegated task's AI CLI in a read-only, non-root, resource-limited container, fails closed ([guide](../guides/task-sandbox.md)). Script sandbox (PTC `execute_program`, `duduclaw secaudit` PoC): Docker (WSL2 first on Windows), `--network=none`, read-only root, only a private read-only script directory mounted; PTC refuses to run when the sandbox is unavailable unless `script_when_unavailable = "run_unsandboxed"` |
-| Secret Leak Scanner | 20+ patterns (Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URLs) |
+| Secret Leak Scanner | 19 secret patterns (Anthropic / OpenAI / AWS / GitHub / GitLab / Slack / Stripe / Google / SendGrid / JWT / PEM keys and key or password assignments) plus a high-entropy check, used by the skill security scanner |
 | Sensitive Data Redaction (RFC-23, v1.14.0) | `duduclaw-redaction` crate — internal data (Odoo / shared wiki / file tools) is replaced with `<REDACT:CATEGORY:hash8>` tokens before reaching the LLM and auto-restored at trusted egress (user channel reply, whitelisted tools); AES-256-GCM SQLite vault (per-agent 32-byte key, 0o600), TTL 7d two-phase GC, 5 built-in profiles, five-layer enable/disable resolver, JSONL audit with 10MB rotation; field-level rules added 2026-09 — `db_field` (Odoo `model.field` / `model.*` sugar) and generic `json_path` tokenize the whole matched field value instead of pattern-matching content, plus a `duduclaw redaction verify` JSON mode to prove a rule fires against a sample tool result; `db_field`'s Odoo-only table generalized (2026-09) into a `[redaction.data_sources.*]` registry any MCP tool can bind to, and redaction's reach extended past DuDuClaw's own MCP server for the first time — see the next row |
 | Data Sources & Native DB Connector (2026-09) | `[redaction.data_sources.<name>]` registry (`tools`, `table_arg`/`table`, `record_paths`, `key_alias`) lets a `db_field` rule's `source` name any tool-backed data source, not just the built-in `odoo`; `duduclaw mcp-proxy` (a spawn-time `.mcp.json` rewrite) routes a customer's own external stdio MCP servers through the same egress/result redaction DuDuClaw's own MCP server applies, and a `ToolInterceptor` hook does the in-process equivalent for the openai-compat direct-API tool loop — HTTP/SSE MCP servers and the codex/gemini/antigravity runtimes are not covered yet; new read-only `duduclaw-db` crate (sqlx: PostgreSQL/MySQL/SQLite, three-layer read-only enforcement) exposes four MCP tools (`db_sources` / `db_tables` / `db_select` / `db_query`, `db_query` refused unless `allowed_tables = ["*"]`) behind `Scope::DbRead` (`db:read`) plus a deny-by-default per-agent `[capabilities] db_sources` grant; dashboard gains 資料來源 (two tabs) and 資料表欄位規則 cards with a 試跑 dry-run and a poison banner for a broken `[redaction]` config; local files (2026-09) close a separate gap — the Claude CLI's built-in `Read`/`Bash` are not MCP tools and never passed the redaction choke point — with three new MCP tools `file_read`/`csv_read`/`xlsx_read` (path-fenced, `files:read` scope), a built-in `duduclaw_files` registry source (`db_field` rules like `customers.csv.name` / `客戶清單.xlsx.地址`), and a PreToolUse `data-file-guard` hook (`[redaction] data_file_guard`, default on) blocking the built-in route, honestly documented as a filename heuristic rather than a sandbox; **AI detection + custom rules (2026-09)**: a new `type = "ner"` rule kind and built-in `ai_pii` profile ("AI 智慧偵測") run OpenAI Privacy Filter (Apache-2.0) on-device through ONNX Runtime (`ort` `load-dynamic` — the release binary links no runtime; `redaction.model.install` downloads model + runtime with pinned sha256, `.status`/`.cancel`/`.remove` alongside; priority below every regex rule so exact patterns win; measured recall published honestly, regex profiles stay on as the first layer); dashboard-authored **custom rules** (`~/.duduclaw/redaction/profiles/custom.toml`: a data-type name + keyword list or pattern, per-rule `enabled` on every rule kind, `[meta.labels]` display names, `redaction.custom_rules.*` and `redaction.profiles.import`/`.remove` RPCs for TOML rule packs), `redaction.suggest_pattern` (paste 2–5 examples → a validated pattern; local inference → utility model → heuristic, never a fabricated pattern) and `redaction.dry_run` on unsaved draft rules ([55-data-sources.md](55-data-sources.md)) |
 
@@ -292,10 +293,9 @@
 |---------|-------------|
 | Episodic / Semantic Separation | Generative Agents 3D-weighted retrieval (Recency + Importance + Relevance) |
 | Full-Text Search (FTS5) | SQLite built-in |
-| Vector Index | Embedding-based semantic search (ONNX BERT / Qwen3-Embedding) |
+| Vector re-rank signal | Built-in character n-gram hash embedder (`NgramHashEmbedder`, opt-in `DUDUCLAW_SEMANTIC_VECTORS=1`); it matches surface fragments, not meaning. The ONNX embedder needs the non-default `onnx` build feature, which release binaries do not include |
 | Memory Decay Scheduler | Daily background task — low-importance + 30d old → archived, archived + 90d → permanent delete |
 | Cognitive Memory MCP Tools | `memory_search_by_layer`, `memory_successful_conversations`, `memory_episodic_pressure`, `memory_consolidation_status` |
-| Federated Memory | Cross-agent knowledge sharing (Private / Team / Public levels) |
 | Key-Fact Accumulator | `key_facts` table with FTS5 — cross-session lightweight memory (see Session Memory Stack) |
 | Temporal Memory (F1, v1.19.0) | `memories` gains temporal/knowledge-graph columns (`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`) via idempotent migration; `store_temporal()` auto conflict-resolves same `(agent, subject, predicate)` and links supersession chain; `search()` default-filters to currently-valid rows; `get_history()` / `get_at()` expose chain + point-in-time |
 | Reflexion Loop (F2, v1.19.0) | Bridges existing `MistakeNotebook` — F2a injects recent unresolved mistakes into answering prompt (`## Past Mistakes to Avoid`, CJK-safe match + recency fallback); F2b consolidates ≥3 same-`MistakeCategory` mistakes into one semantic memory rule (`reflexion.rs`) then marks sources resolved. Trigger = `ErrorCategory` Significant/Critical (MetaCognition-adaptive) |
@@ -315,7 +315,7 @@
 | Dual Dispatch Path | Both sub-agent dispatcher (`claude_runner::call_with_rotation`) and channel reply (`channel_reply::call_claude_cli_rotated`) go through rotator |
 | CostTelemetry | SQLite token tracking + cache efficiency analytics + 200K price cliff warning |
 | Budget Manager | Per-account monthly limits + cooldown + adaptive routing (cache_eff <30% → local) |
-| Direct API | Bypass CLI, `cache_control: ephemeral`, 95%+ cache hit rate |
+| Direct API | Bypass CLI, `cache_control: ephemeral` on the system prompt; paid fallback when OAuth accounts are rate-limited (no measured hit rate is published) |
 | Channel Failure Tracking | `channel_failures.jsonl` with category-specific zh-TW messages |
 | Binary Discovery | `which_claude()` / `which_claude_in_home()` probe Homebrew (Intel + Apple Silicon) / Bun / Volta / npm-global / `.claude/bin` / `.local/bin` / asdf / NVM |
 
@@ -342,7 +342,7 @@ Two separate code paths share the name.
 
 | Feature | Description |
 |---------|-------------|
-| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` persistent (v1.8.12), `schedule_task` MCP tool with corrected schema including `agent_id` + `name` |
+| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` persistent (v1.8.12); schedules are created with `tasks_create` + `schedule` (the older `schedule_task` tool is a deprecated alias, removed in v1.68.0) |
 | ReminderScheduler | One-shot reminders (relative `5m`/`2h`/`1d` or ISO 8601), `direct` or `agent_callback` mode |
 | HeartbeatScheduler | Per-agent unified scheduling — bus polling + GVU silence breaker + cron |
 | Scheduler-Level Task-Board Pull (v1.9.3) | `poll_assigned_tasks` moved into `HeartbeatScheduler::run` tick — scans entire agent registry every 30s (no longer skips `enabled=false` agents); 1-hour LIKE-marker cooldown prevents stampedes |
@@ -361,8 +361,8 @@ Two separate code paths share the name.
 
 | Feature | Description |
 |---------|-------------|
-| Event Bus | `tokio::broadcast` (capacity 8192) — `TaskCreated` / `TaskStatusChanged` / `ChannelMessage` / `AgentIdle` / `CronTick` |
-| Rule Conditions | `all` / `any` + `eq/neq/in/gt/lt/contains` operators |
+| Event Bus | `tokio::broadcast` (capacity 8192) — 13 rule-visible events: `task_created` / `task_updated` / `task_status_changed` / `activity_new` / `channel_message` / `agent_idle` / `cron_tick` / `run_at_risk` / `os_file` / `os_frontmost` / `tick` / `security_event` / `odoo_event` ([23-autopilot-engine.md](23-autopilot-engine.md)) |
+| Rule Conditions | `all` / `any` + `eq/neq/in/not_in/gt/gte/lt/lte/contains` operators |
 | Action Types | `delegate` (enqueue bus task), `notify` (channel), `run_skill` (skill name + target validated via alphanumeric allowlist + `canonicalize()` path containment) |
 | Rule CRUD | Dashboard RPC `autopilot.list/create/update/remove/history` + agent MCP `autopilot_list`; structure validated at write time |
 | 3-State Circuit Breaker | Per-rule `Closed` / `Open` / `HalfOpen` — 10 fires in 60s trips Open (60s cooldown), then HalfOpen probe; prevents self-reinforcing loops; transitions logged to history + Activity Feed |
@@ -391,6 +391,7 @@ Two separate code paths share the name.
 | Live Run Forking (`duduclaw-fork`) | pydantic-deepagents-inspired parallel branching of a live run — explore multiple continuations concurrently |
 | AI Judge | Scores parallel branches to select the best continuation |
 | Budget Control | `budget.rs` caps fork fan-out / cost |
+| Status | Off by default (per agent `[fork] enabled`). In v1.67.0, four release-flow tests still fail on Windows CI, so do not enable it on Windows yet (see `CHANGELOG.md`) |
 
 ## CLI Runtime (one-shot PTY)
 
@@ -412,9 +413,9 @@ Two separate code paths share the name.
 
 | Feature | Description |
 |---------|-------------|
-| Odoo Bridge | 15 MCP tools (CRM/Sales/Inventory/Accounting), JSON-RPC middleware |
+| Odoo Bridge | 17 MCP tools (CRM/Sales/Inventory/Accounting), JSON-RPC middleware |
 | Edition Gate | CE/EE auto-detection, feature gating |
-| Event Polling | Proactive agent notifications on Odoo state changes |
+| Event sync | A poller (`[odoo] poll_enabled`) and `POST /webhook/odoo` (`[odoo] webhook_enabled`, shared secret required), both off by default, emit `odoo_event` for autopilot rules |
 | Per-Agent Credential Isolation | `OdooConnectorPool` keyed by `(agent_id, profile)`; audit log carries `profile` + `ok=bool` (v1.11.0 / RFC-21 §2) |
 | Dashboard Test-Before-Save | `odoo.test` accepts inline params; missing credential falls back to stored secret; inline mode reuses the same SSRF / HTTPS / db-name validators (v1.13.1) |
 
@@ -423,8 +424,7 @@ Two separate code paths share the name.
 | Feature | Description |
 |---------|-------------|
 | RL Trajectory Collector | Writes `~/.duduclaw/rl_trajectories.jsonl` during channel interactions |
-| `duduclaw rl` CLI | `export` / `stats` / `reward` — composite reward (outcome × 0.7 + efficiency × 0.2 + overlong × 0.1) |
-| Prometheus Metrics | `GET /metrics` — requests, tokens, duration histogram, channel status |
+| Prometheus Metrics | `GET /metrics` — failover, wiki trust, decision continuity, prompt compression, resident sensing (`tick_*`), goal-loop and live-fork counters. Six request/token/duration/session/channel/budget series that were never incremented were removed in v1.66; per-request cost lives in `cost_telemetry.db` |
 | Dashboard WebSocket Heartbeat | Server Ping 30s + 60s idle close; client `ping` RPC 25s |
 | BroadcastLayer | Tracing layer streams real-time logs to WebSocket subscribers |
 
@@ -432,7 +432,7 @@ Two separate code paths share the name.
 
 | Feature | Description |
 |---------|-------------|
-| LOCOMO Memory Evaluation (W21, v1.9.4) | `python/duduclaw/memory_eval/` — `retrieval_accuracy` / `retention_rate` / `locomo_integrity_check`; `cron_runner` daily 03:00 UTC; 5-min `smoke_test` P0; `build_golden_qa.py` builds gold-standard QA set; 200-entry `data/golden_qa_set.jsonl`; `duduclaw-memory` batch query API |
+| LOCOMO Memory Evaluation (W21, v1.9.4) | `python/duduclaw/memory_eval/` — `retrieval_accuracy` / `retention_rate` / `locomo_integrity_check`; `cron_runner` is a manual CLI entry point (`python -m memory_eval.cron_runner smoke_test\|weekly_kpis\|monthly_locomo`), nothing in the repo schedules it; 5-min `smoke_test` P0; `build_golden_qa.py` builds gold-standard QA set; 200-entry `data/golden_qa_set.jsonl`; `duduclaw-memory` batch query API |
 | Python Agents Routing (v1.9.4) | `python/duduclaw/agents/` — capability-based routing (`capabilities/` manifest loader + matcher, `routing/` router + resolution + memory_resolver) |
 | Python MCP Scope Enforcement (v1.9.4) | `python/duduclaw/mcp/` — API key auth with key masking; memory tools (store/read/search/namespace/quota) with strict scope enforcement (`memory:write` / `memory:read`) at `execute()` entry |
 
@@ -445,7 +445,7 @@ Two separate code paths share the name.
 | DuDuClaw Design System (mds) | Shared `web/src/components/mds/` component library (OKLCH tokens, four-layer surfaces, three-tier shadows, Inter / Geist Mono) + `nav-model.ts` grouped sidebar (personal / work / company / settings) + `web/DESIGN.md` spec; every page built on the shared primitives with synchronized en/ja/zh i18n |
 | Real-time Log Streaming | BroadcastLayer tracing → WebSocket push |
 | Memory → Key Insights Tab | `key_facts` cards with access_count badge + timestamp + collapsible source metadata |
-| Memory → Evolution Tab | SOUL.md version history with pre/post metric deltas + status badges |
+| Memory → Self-Improvement tab | Learning overview, stagnation warnings, rejection statistics, plain-language playbook rule cards with JSON export and manual disable ([38-aee-playbook-evolution.md](38-aee-playbook-evolution.md)) |
 | Logs → History Tab Rewrite | Source filter chips + per-source counts + severity dropdown + severity-colored left borders + JSON detail expansion |
 | Toast Notifications | Module-scoped event bus, max-5 queue, warm stone/amber/emerald/rose variants, respects `prefers-reduced-motion` |
 | OrgChart | D3.js interactive agent hierarchy visualization |
@@ -461,8 +461,8 @@ Two separate code paths share the name.
 
 | Feature | Description |
 |---------|-------------|
-| License Tiers | Free / Pro / Enterprise |
+| License Tiers | Nine tiers in `crates/duduclaw-license/src/tier.rs` (opensource, hobby, solo, studio, business, partner, personal_pro_self_host, self_host_pro, oem). The capability gates are `premium_templates`, `white_label` and `industry_evolution_params`; see [LICENSING.md](../../LICENSING.md) |
 | Hardware Fingerprint | License binding |
-| Industry Templates | Manufacturing / Restaurant / Trading |
+| Industry Templates | Manufacturing / Restaurant / Trading (free); premium industry packs need `premium_templates` |
 | CLI Tools | 12+ subcommands |
 | Partner Portal | Multi-tenant reseller interface |

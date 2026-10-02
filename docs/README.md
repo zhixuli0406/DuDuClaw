@@ -24,7 +24,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/12-industry-templates.md](features/12-industry-templates.md) | Industry templates & Odoo ERP bridge |
 | [features/13-multi-runtime.md](features/13-multi-runtime.md) | Multi-runtime agent execution — Claude / Codex / Antigravity / Grok / OpenAI-compatible (Gemini CLI deprecated) |
 | [features/14-voice-pipeline.md](features/14-voice-pipeline.md) | Voice pipeline — STT/TTS over two separately-wired paths |
-| [features/15-skill-lifecycle.md](features/15-skill-lifecycle.md) | Skill lifecycle engine — 7-stage automated extraction |
+| [features/15-skill-lifecycle.md](features/15-skill-lifecycle.md) | Skill lifecycle engine — 6-stage automated extraction |
 | [features/16-session-memory-stack.md](features/16-session-memory-stack.md) | Session memory stack — pinned instructions + snowball recap + key facts |
 | [features/17-wiki-knowledge-layer.md](features/17-wiki-knowledge-layer.md) | Wiki knowledge layer — L0-L3 trust-weighted auto-injection |
 | [features/19-agent-client-protocol.md](features/19-agent-client-protocol.md) | Agent Client Protocol — `duduclaw acp` (ACP v1 for IDE panels: Zed / JetBrains / nvim) + `duduclaw acp-server` (A2A over stdio) |
@@ -94,7 +94,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | Document | Description | Status |
 |----------|-------------|--------|
 | [architecture/overview.md](architecture/overview.md) | System architecture overview | Current |
-| [architecture/evolution-engine.md](architecture/evolution-engine.md) | Evolution Engine — Prediction + GVU (legacy SOUL.md path) + AEE/Playbook (v3 default, ch.12) + Cognitive Memory | Current |
+| [architecture/evolution-engine.md](architecture/evolution-engine.md) | Evolution Engine — Prediction + AEE/Playbook (the only evolution path; the legacy SOUL.md rewrite path was removed) + Cognitive Memory | Current |
 
 ## Design Proposals (RFC / ADR)
 

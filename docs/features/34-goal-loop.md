@@ -60,7 +60,7 @@ Termination is guaranteed by the driver, not by trusting the model:
 
 | Guard | Default | On breach |
 |---|---|---|
-| Iteration cap (dispatches per task) | 8 (hard goals), 3 (simple) | `needs_human` |
+| Iteration cap (dispatches per task) | 5 (hard goals), 3 (simple) | `needs_human` |
 | Wall clock from creation | 24 h | `needs_human` |
 | Concurrent goal tasks | 3 | queued, not dispatched |
 | Stagnation detection | two consecutive rejections with the same **gap fingerprint** (`path:line` citations + backtick key tokens extracted and normalized from the feedback, not raw text equality — a reworded restatement of the same gap still matches; falls back to literal-text comparison only when no citation/token is extractable) | early `needs_human` |

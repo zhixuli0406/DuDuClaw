@@ -188,15 +188,15 @@ Registry knows which backends are available
 bundled CLIs, so a runtime shipped in the image is discovered even when the
 gateway inherited no interactive `PATH`.
 
-Agents can specify their preferred runtime in `agent.toml`:
+Agents choose their runtime in `agent.toml`:
 
 ```toml
 [runtime]
-preferred = "claude"    # Primary backend
+provider = "claude"          # Primary backend
 fallback = "antigravity"     # If primary is unavailable
 ```
 
-If no preference is set, the registry uses the first available backend.
+If `provider` is absent, the agent runs on Claude. An unrecognised value logs a warning and also falls back to Claude.
 
 ### Per-Agent Configuration
 

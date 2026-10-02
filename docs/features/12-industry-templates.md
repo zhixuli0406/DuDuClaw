@@ -24,10 +24,9 @@ Each template is a complete agent starter kit:
 templates/{industry}/
 ├── SOUL.md           # Agent personality tuned for the industry
 ├── CONTRACT.toml     # Industry-specific behavioral boundaries
-└── wiki/             # Domain knowledge base
-    ├── glossary.md   # Industry terminology
-    ├── processes.md  # Standard operating procedures
-    └── compliance.md # Regulatory requirements
+├── agent.toml        # Agent configuration
+└── …                 # Industry extras: restaurant FAQ.json + PROACTIVE.md,
+                      # manufacturing SOP-template/, trading price-list-template.csv
 ```
 
 **SOUL.md** — The agent's personality is pre-configured with industry-appropriate communication style:
@@ -36,23 +35,19 @@ templates/{industry}/
 - A trading agent is concise, numbers-focused, and risk-aware
 
 **CONTRACT.toml** — Behavioral boundaries reflect industry regulations:
-- A manufacturing agent must never approve materials that fail quality thresholds
-- A restaurant agent must never recommend dishes to customers with declared allergies without explicit warnings
-- A trading agent must always include risk disclaimers in investment-related responses
+- A manufacturing agent must not approve an equipment restart without human confirmation
+- A restaurant agent must always include allergen warnings when discussing menu items
+- A trading agent must always include trade terms (FOB/CIF/EXW) in every quotation
 
-**Wiki** — Domain knowledge that the agent can reference:
-- Industry terminology and abbreviations
-- Standard operating procedures
-- Regulatory requirements and compliance checklists
-- Common scenarios and recommended responses
+**Extras** — Starter material the agent works from: a FAQ and a proactive-check schedule for the restaurant, an equipment-abnormality SOP template for manufacturing, a price-list template for trading. Replace the placeholder values with your own data.
 
 ### Available Templates
 
-**Manufacturing** — Covers supply chain management, production scheduling, quality control, and equipment maintenance. The agent understands concepts like lead time, defect rates, BOM (Bill of Materials), and MRP (Material Requirements Planning).
+**Manufacturing** — A factory operations assistant: monitors production, reports anomalies with a severity tag, relays SOP procedures and coordinates between shifts.
 
-**Restaurant** — Covers order management, inventory tracking, customer service, and food safety. The agent understands concepts like table turnover, food cost percentage, FIFO inventory rotation, and allergen management.
+**Restaurant** — A customer service assistant: answers inquiries and menu questions, takes reservations, and lists allergens when menu items come up.
 
-**Trading** — Covers market data interpretation, portfolio management, risk assessment, and compliance. The agent understands concepts like P/E ratios, margin requirements, stop-loss orders, and regulatory reporting.
+**Trading** — An international trade assistant: answers buyer inquiries, quotes from the price list with trade terms and a validity period, and tracks orders between buyers and suppliers.
 
 ### Customization Flow
 
@@ -60,7 +55,7 @@ Templates are starting points, not straightjackets:
 
 ```
 Step 1: Deploy template
-  $ duduclaw agent create --template restaurant --name "my-restaurant-agent"
+  $ duduclaw wizard            # pick the industry from the menu
 
 Step 2: Customize personality
   Edit SOUL.md to match your specific brand voice
@@ -72,8 +67,10 @@ Step 4: Add domain knowledge
   Import your menu, suppliers, procedures into the wiki
 
 Step 5: Let evolution take over
-  The agent's personality refines itself through GVU cycles
-  while staying within your customized contract boundaries
+  SOUL.md stays as you wrote it (agents cannot edit it). What the
+  agent learns is a set of small playbook rules, each linked to an
+  eval case and retired on its own when it stops helping, all inside
+  your contract boundaries (see features/38)
 ```
 
 ---
@@ -130,7 +127,7 @@ User: "Create a sales order for customer ABC, 10 units of Widget X"
 Agent understands the intent
      |
      v
-Agent calls MCP tool: sale_order_create
+Agent calls MCP tools: odoo_sale_create_quotation, then odoo_sale_confirm
      |
      v
 DuDuClaw Odoo Bridge translates to JSON-RPC call
@@ -146,29 +143,16 @@ Agent: "Sales order SO-2024-0042 created for ABC.
         10 units of Widget X, total: $1,500."
 ```
 
-### Available Operations (15 MCP Tools)
+### Available Operations (17 MCP Tools)
 
-The bridge exposes operations across four business domains:
+The bridge exposes these tools (`crates/duduclaw-cli/src/mcp/tools_def/odoo.rs`):
 
-**CRM (Customer Relationship Management)**
-- Qualify leads (score likelihood to convert)
-- Create opportunities from qualified leads
-- Update lead status and notes
-
-**Sales**
-- Create sales orders with line items
-- Check order status
-- Generate quotations
-
-**Inventory**
-- Check stock levels
-- Adjust inventory quantities
-- Track shipments
-
-**Accounting**
-- Create invoices from sales orders
-- Process payments
-- Check account balances
+- **Connection**: `odoo_connect`, `odoo_status`
+- **CRM**: `odoo_crm_leads` (list leads), `odoo_crm_create_lead`, `odoo_crm_update_stage`
+- **Sales**: `odoo_sale_orders` (list orders), `odoo_sale_create_quotation`, `odoo_sale_confirm`
+- **Inventory**: `odoo_inventory_products` (search products), `odoo_inventory_check` (stock level)
+- **Accounting**: `odoo_invoice_list`, `odoo_payment_status`
+- **Generic**: `odoo_search` (search any model), `odoo_execute` (call a model method), `odoo_report`, `odoo_partner_search`, `odoo_schema_fields`
 
 ### Edition Detection
 
@@ -302,7 +286,7 @@ Templates, the ERP bridge, and the evolution system work together seamlessly. Th
 - **Evolution Engine**: Agents deployed from templates evolve like any other agent. The template is the starting point, not the permanent state.
 - **Behavioral Contracts**: Each template includes a contract tailored to the industry's compliance requirements.
 - **Memory System**: Domain knowledge from the wiki is indexed and searchable through the memory system.
-- **Channel Integration**: Template agents work with all 7 supported communication channels.
+- **Channel Integration**: Template agents work with all 11 supported communication channels.
 - **Cost Management**: ERP bridge operations are tracked in CostTelemetry for budget visibility.
 
 ---

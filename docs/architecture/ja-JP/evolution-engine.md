@@ -2,7 +2,7 @@
 
 > バージョン：v2.0（prediction-driven + GVU self-play）+ v3追補（AEE / playbook、2026-08-06）
 > 日付：2026-03-29（v3追補：2026-08-06）
-> ステータス：Production — 197 tests passing（v2.0基準）；v3 AEEは第12章を参照
+> ステータス：第3章（予測エンジン）と第12章（AEE）が現行コードを説明する。v2.0 の SOUL.md 書き換え経路は 2026-09-29 に削除済み（下の注記を参照）
 
 **本稿を読む前にご確認ください（S11の現況、2026-09-29）**：第4章で説明する「GVUがSOUL.mdを直接書き換える」フローと、それを支えていたすべて（`agent.toml [evolution] legacy_soul_evolution` 非常口、`SOUL.md` バージョン管理、24時間の観察ウィンドウ、自動ロールバック、サイズ上限のconsolidate書き換え、deferred GVU再試行、`duduclaw evolution finalize` CLI）は**コードベースから削除されました**。`SOUL.md` はv3（2026-08-06）でエージェントに対して読み取り専用になっており、その時点でこれらが守っていた書き込み経路はすでに存在していませんでした。**第4・7・8・9章は履歴として残します**：エンジンが以前どう動いていたか、各ガードがなぜ建てられたかを説明しており、第12章の設計圧力を理解する最短経路であることは変わりません——ただし、そこに生きたコードは1行もありません。実際に動くエンジンはAEE（第12章）で、`[evolution] gvu_enabled` は出荷時 `true` になりました。設計全文：`commercial/docs/DESIGN-evolution-v3-aee.md`；計画と根本原因の鑑識：`commercial/docs/TODO-evolution-v3-2026-08.md`；ユーザー向けの解説：`docs/features/ja-JP/38-aee-playbook-evolution.md`；スイッチの詳細：`docs/guides/ja-JP/evolution-switches.md`。
 
@@ -13,7 +13,7 @@
 1. [アーキテクチャ概要](#1-アーキテクチャ概要)
 2. [設計思想](#2-設計思想)
 3. [予測エンジン（Phase 1）](#3-予測エンジンphase-1)
-4. [GVUセルフプレイループ（Phase 2、レガシーのエスケープハッチ）](#4-gvuセルフプレイループphase-2)
+4. [GVUセルフプレイループ（Phase 2、2026-09-29 削除）](#4-gvuセルフプレイループphase-2)
 5. [統合ポイント](#5-統合ポイント)
 6. [セキュリティ機構](#6-セキュリティ機構)
 7. [設定フォーマット（レガシー）](#7-設定フォーマット)
@@ -27,7 +27,7 @@
 
 ## 1. アーキテクチャ概要
 
-自律進化エンジンは、agentが実際の会話パフォーマンスに基づいて自分のパーソナリティプロファイル（`SOUL.md`）を自動的に修正できるようにする仕組みである。システムは固定間隔タイマーではなく**予測誤差**によって駆動され、会話の約90%をゼロLLMコストに保つ。
+自律進化エンジンは、agentが実際の会話とタスクの結果から小さな行動ルール（playbookエントリ、第12章）を学ぶ仕組みである。パーソナリティファイル `SOUL.md` はagentに対して読み取り専用で、エンジンが書き換えることはない。システムは固定間隔タイマーではなく**予測誤差**によって駆動され、LLMを使う進化ラウンドを始めるのはSignificantとCriticalの誤差で、Negligibleの誤差も探索（ε、下限5%）として一部が始める。いずれも `[evolution] gvu_enabled` がオンである必要がある（2026-09-29 から出荷時オン）。
 
 ```
 ユーザーとの会話
@@ -42,21 +42,21 @@
     │             │                         │
     ▼             ▼                         ▼
  Negligible    Moderate                Significant / Critical
-（ゼロコスト）  （メモリに保存）         （GVUをトリガー）
+（ゼロコスト）  （メモリに保存）         （進化ラウンドを開始）
                                           │
                                           ▼
                               ┌────────────────────────┐
-                              │  GVU Self-Play Loop     │
-                              │  Generator → Verifier   │
-                              │      → Updater          │
-                              │  （最大3ラウンド）        │
+                              │  AEE round (ch. 12)     │
+                              │  generate → Gate →      │
+                              │  Measure (≤3 rounds)    │
                               └───────────┬────────────┘
                                           │
                                           ▼
                               ┌────────────────────────┐
-                              │  SOUL.md アトミック書き込み │
-                              │  + 24時間観察            │
-                              │  + 自動confirm/rollback  │
+                              │  commit playbook entry  │
+                              │  if it matches or beats │
+                              │  the champion; settle   │
+                              │  each entry on its own  │
                               └────────────────────────┘
 ```
 
@@ -68,10 +68,10 @@
 |------|---------|
 | **エラー時のみ振り返る** | 予測誤差が0.2未満のときはゼロコスト——APIトークンを浪費しない |
 | **自己校正** | MetaCognitionが100回の予測ごとにしきい値の境界を自動調整 |
-| **安全性優先** | 4層検証（ゼロコスト3層 + LLM1層）+ 契約境界 + アトミック書き込み |
-| **ロールバック可能** | 変更のたびに24時間の観察期間があり、指標が悪化すると自動的にロールバック |
+| **安全性優先** | 決定論的なGate（ゼロLLM、拒否権を保持）がジャッジ呼び出しより先に走る。候補エントリはすべてagentの契約と照合される。`SOUL.md` はagentに対して読み取り専用 |
+| **ロールバック可能** | コミットされた各エントリは `aee_settle_hours`（既定24時間）後に、紐づくevalケースで個別に清算される。退行すればそのエントリだけが退役 |
 | **XML隔離** | 信頼できないコンテンツはすべてXMLタグで包み、prompt injectionを防止 |
-| **暗号化保存** | ロールバック差分はAES-256-GCMで暗号化し、agentディレクトリの外に分離保存 |
+| **小さな単位** | playbookエントリは最大400文字で、少なくとも1つのevalケースに紐づく必要がある |
 
 ---
 
@@ -300,6 +300,8 @@ if critical_proportion > 20%:
 ---
 
 ## 4. GVUセルフプレイループ（Phase 2）
+
+> 2026-09-29（S11）に削除済み。この章は履歴であり、現在動いているエンジンは第12章。
 
 ### 4.1 モジュール構成
 
@@ -570,7 +572,7 @@ Generating → Verifying → Rejected   ──╮
 4. update_model()      → ユーザーモデルの更新
 5. diagnose()          → スキルライフサイクル診断
 6. route()             → 進化アクションへのルーティング
-7. gvu.run()           → トリガーされた場合、GVUループを実行
+7. gvu.run()           → トリガーされた場合、進化ラウンド（AEE、第12章）を実行
 8. metacognition       → 結果をフィードバック
 ```
 
@@ -600,7 +602,7 @@ must_always = ["respond in zh-TW", "refuse harmful requests"]
 max_tool_calls_per_turn = 10
 ```
 
-L1バリデーターは、シミュレートされた最終的なSOUL.mdに対してこれらの境界を強制する。
+AEEの `G-Contract` ゲートは、候補のplaybookエントリをすべて `must_not`（組み込みの既定値を含む）と照合し、`must_always` を状態不変条件として扱う（`gvu/verifier_gate.rs`）。
 
 ### 5.4 Soul Guard（整合性保護）
 
@@ -612,11 +614,13 @@ L1バリデーターは、シミュレートされた最終的なSOUL.mdに対�
 | 分離保存 | ハッシュは `~/.duduclaw/soul_hashes/<agent>.hash` に保存され、agentディレクトリの外に置かれる |
 | ドリフト検出 | フィンガープリントが一致しない場合、`CRITICAL` レベルのセキュリティ警告を発する |
 | バージョンバックアップ | `.soul_history/SOUL_<timestamp>.md`、最大10バージョン |
-| 変更の受け入れ | GVU Updaterが変更の適用に成功した後 `accept_soul_change()` を呼び出す |
+| 変更の受け入れ | `agent_update_soul` MCPツールで `SOUL.md` を書き込んだ後に `accept_soul_change()` を呼び出す（オペレーター、または `can_modify_own_soul = true` を設定したagent） |
 
 ---
 
 ## 6. セキュリティ機構
+
+> 6.1〜6.3 は削除済みのSOUL.md書き換え経路の説明で、履歴として残している。AEEのチェックは §12.5.2 を参照。6.4 のagentごとの実行ロックは引き続き有効（`gvu/loop_.rs`）。
 
 ### 6.1 Prompt Injection対策
 
@@ -960,9 +964,7 @@ round_seq += 1
 **内側ループの実行中は一切反映されない**——最終のcommitステップだけがSQLiteに
 触れる；内側ループが放棄したラウンドは、playbookをバイト単位で不変のままにする
 （`failure_history` は例外で、そのラウンドで学んだ教訓を意図的に保持する）。
-**AEEはSOUL.mdを一切書き込まない**——capを超えたSOUL.mdの全文圧縮は第4章の
-WP0.2 consolidate経路を通り、AEEループとは直交していて、両者は同じcooldownの
-みを共有する。
+**AEEはSOUL.mdを一切書き込まない。**
 
 #### 12.5.1 戦略の配分比率（GEP G4、素のε探索に代わるもの）
 
@@ -1063,7 +1065,7 @@ eval_suites_root = "evals"     # AEEリプレイサブプロセスがeval suite�
 eval_binary = "/usr/local/bin/duduclaw"   # 任意、デフォルトのバイナリパスを上書き
 ```
 
-新しいCLI：`duduclaw playbook export --agent <id> [--out <path>]`（GEP-gene
+新しいCLI：`duduclaw export playbook --agent <id> [--out <path>]`（旧表記 `duduclaw playbook export` は v1.68.0 まで使用可。GEP-gene
 形式のJSONをエクスポート、ローカルファイルのみ、外部hubには一切接続しない）；
 `duduclaw playbook migrate-soul --agent <id> [--apply]`（WP1.4——既存の
 SOUL.mdの行動ルールをplaybookエントリの草稿として抽出し、人によるレビュー後に
@@ -1076,9 +1078,9 @@ SOUL.mdの行動ルールをplaybookエントリの草稿として抽出し、�
 ゼロで、キーがtranscriptに入ることもない）（詳細は `docs/guides/evals.md`
 を参照）。
 
-Dashboard：記憶ページの「自律学習」タブ——進化モードの概要、バージョン履歴、
-停滞検出カード、拒否テレメトリのグラフ、統合ログ、Playbookエントリカード
-（エクスポート／手動retire）。
+Dashboard：記憶ページの「自己進化」タブ。進化モードの概要、停滞検出カード、
+拒否テレメトリのグラフ、Playbookエントリカード（エクスポート／手動retire）。
+バージョン履歴と統合ログのカードは削除済みのSOUL.md経路用で、v1.66で外された。
 
 ### 12.8 ファイル索引
 
@@ -1101,7 +1103,6 @@ Dashboard：記憶ページの「自律学習」タブ——進化モードの�
 | Gate（拒否権を保持） | `crates/duduclaw-gateway/src/gvu/verifier_gate.rs` |
 | Measure（スコアベクトル） | `crates/duduclaw-gateway/src/gvu/verifier_measure.rs` |
 | Champion + コミットゲート | `crates/duduclaw-gateway/src/gvu/champion.rs` |
-| SOUL capデッドロック解除 | `crates/duduclaw-gateway/src/gvu/consolidate.rs` |
 | 停滞検出器 | `crates/duduclaw-gateway/src/gvu/stagnation.rs` |
 | 拒否テレメトリ | `crates/duduclaw-gateway/src/gvu/telemetry.rs` |
 | MistakeNotebook軌跡エビデンス | `crates/duduclaw-gateway/src/gvu/mistake_notebook.rs`（`TrajectoryEvidence`） |

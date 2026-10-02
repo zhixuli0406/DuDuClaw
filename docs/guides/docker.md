@@ -40,7 +40,7 @@ The final image ships with:
 | Disk space | ≥ 4 GB | The build consumes ~3 GB temporarily; the final image is roughly ~1.2 GB |
 | Port | `18789` | Default gateway port, changeable |
 
-If you want channel webhooks (LINE, WhatsApp, Feishu, generic webhook) to receive external messages, you also need a **publicly reachable HTTPS URL**. The simplest options are
+If you want channel webhooks (LINE, WhatsApp, Feishu and the other webhook channels) to receive external messages, you also need a **publicly reachable HTTPS URL**. The simplest options are
 [Tailscale Funnel](#11-tailscale-funnel-public-https-for-webhooks) or
 [Cloudflare Tunnel](deployment-guide.md#4-cloudflare-tunnel-long-term-stable).
 
@@ -202,6 +202,8 @@ Each of the three OAuth state directories inside the container has its own named
 
 This means **you only need to log in once — rebuilding the container doesn't require logging in again**.
 
+> **Subscription logins carry account risk.** Since 2026-03 Anthropic and Google block consumer subscription tokens used by third-party products, and accounts have been suspended; OpenAI's policy on a ChatGPT subscription login driven by a third-party product is unclear. The setup-token, interactive-login and ChatGPT methods below are subscription logins. An API key is the supported path. See [features/13-multi-runtime.md](../features/13-multi-runtime.md).
+
 ### 6.1 Claude Code CLI
 
 #### Method A: setup token (recommended)
@@ -320,13 +322,13 @@ Each agent can specify which runtime to use in its own `agent.toml`:
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-preferred = "claude"      # primary runtime: claude / codex / antigravity / openai-compat (gemini is deprecated)
+provider = "claude"       # primary runtime: claude / codex / antigravity / openai-compat … (gemini is deprecated)
 fallback = "antigravity"  # automatically switches over when Claude is unavailable
 ```
 
 See [features/13-multi-runtime.md](../features/13-multi-runtime.md) for a full example and the failover strategy.
 
-If nothing is specified, `RuntimeRegistry` scans `PATH` on startup and picks the first available runtime.
+If `provider` is not set, the agent runs on Claude.
 
 ### 6.5 Verify all three CLIs are detected
 
@@ -459,7 +461,7 @@ If you don't want auto-updates at all, just remove the watchtower service block.
 
 ## 10. Channel webhooks need a public HTTPS URL
 
-LINE, WhatsApp, Feishu, and generic webhooks all need **an HTTPS URL reachable from the public internet** to receive messages. If your DuDuClaw instance runs on a home network or a server without a public IP, common options include:
+LINE, WhatsApp, Feishu and the other webhook channels all need **an HTTPS URL reachable from the public internet** to receive messages. If your DuDuClaw instance runs on a home network or a server without a public IP, common options include:
 
 | Option | Fits | Cost | Guide |
 |------|---------|------|------|

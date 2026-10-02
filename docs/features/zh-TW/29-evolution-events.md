@@ -45,6 +45,8 @@ AuditEvent {
 | **Governance（W19-P1）** | `governance_violation`、`governance_approval_requested`、`governance_approval_decided`、`governance_policy_changed`、`governance_quota_reset` | 政策違規、核准工作流程、政策 CRUD、每日配額重置 |
 | **Durability（W19-P1）** | `durability_retry_attempt`、`durability_retry_exhausted`、`durability_circuit_opened`、`durability_circuit_recovered`、`durability_checkpoint_saved`、`durability_dlq_replayed` | 重試嘗試與耗盡、斷路器狀態轉換、檢查點儲存、DLQ 重播 |
 
+> Governance 與 Durability 兩組型別仍定義在 schema 裡，但程式碼中沒有任何地方會發出它們：`duduclaw-durability` crate 已於 2026-07 刪除，governance 層因為沒有任何執行端已於 v1.66 移除。
+
 `Outcome` 列舉同樣分層：P0 有 `success` / `failure` / `suppressed`；W19-P1 加入 `blocked`、`warned`、`throttled`、`pending`、`approved`、`rejected`、`triggered`、`recovered`，因此一個 `governance_violation` 可以是 `blocked`、一個核准可以是 `pending`、一個 `durability_circuit_opened` 可以是 `triggered`。
 
 ---

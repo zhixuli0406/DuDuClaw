@@ -4,11 +4,11 @@ Golden-task 的**行為回歸測試**（behavioral regression）。每個 case �
 
 這是把 ADK-evalset／Braintrust 的 eval-action 模式搬進 DuDuClaw 的做法：一個 case 對應一份 TOML 檔案，一個 CI 能拿來把關的 exit code，加上離線重放模式，讓回歸問題不必花費 token 就能被抓到。
 
-> **為什麼這件事對一個會自我演化的平台特別重要。** DuDuClaw 的 GVU 迴圈會改寫
-> `SOUL.md`，並用自己的 Verifier 驗證自己做的改動。這個 Verifier 就在迴圈
+> **為什麼這件事對一個會自我演化的平台特別重要。** DuDuClaw 的進化引擎（AEE）會學習
+> playbook 規則，並用自己的 Gate 與 Measure 驗證這些規則。這道檢查就在迴圈
 > *裡面*：它可能跟著自己評分的對象一起漂移。Eval 正是**外部量尺**：一套固定、
 > 由人撰寫的預期行為集合，不論是 prompt 改動、runtime／provider 換人、
-> `claude` CLI 升級，還是 GVU 改寫 `SOUL.md`，都**不能悄悄讓它退步**。詳見下方
+> `claude` CLI 升級，還是新提交的 playbook 規則，都**不能悄悄讓它退步**。詳見下方
 > [外部量尺](#演化整合外部量尺)。
 
 ---

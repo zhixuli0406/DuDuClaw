@@ -45,6 +45,8 @@ AuditEvent {
 | **Governance（W19-P1）** | `governance_violation`、`governance_approval_requested`、`governance_approval_decided`、`governance_policy_changed`、`governance_quota_reset` | ポリシー違反、承認ワークフロー、ポリシー CRUD、日次クォータのリセット |
 | **Durability（W19-P1）** | `durability_retry_attempt`、`durability_retry_exhausted`、`durability_circuit_opened`、`durability_circuit_recovered`、`durability_checkpoint_saved`、`durability_dlq_replayed` | リトライの試行と枯渇、サーキットブレーカーの状態遷移、チェックポイント保存、DLQ リプレイ |
 
+> Governance と Durability の型は schema に定義されたままですが、コードベースのどこからも発行されません。`duduclaw-durability` crate は 2026-07 に削除され、governance 層は執行箇所がないため v1.66 で削除されました。
+
 `Outcome` 列挙も同様に階層化されています：P0 は `success` / `failure` / `suppressed`、W19-P1 で `blocked`、`warned`、`throttled`、`pending`、`approved`、`rejected`、`triggered`、`recovered` が加わります——したがって `governance_violation` は `blocked` になり得て、承認は `pending` になり得て、`durability_circuit_opened` は `triggered` になり得ます。
 
 ---

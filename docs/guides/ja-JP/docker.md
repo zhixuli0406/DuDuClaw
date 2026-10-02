@@ -43,7 +43,7 @@ DuDuClawのDockerイメージは `container/Dockerfile.server` で構築され�
 | ディスク容量 | ≥ 4 GB | ビルド中は一時的に約3 GB使用。完成イメージは約1.2 GB |
 | Port | `18789` | デフォルトのgateway port、変更可能 |
 
-channel webhook（LINE、WhatsApp、Feishu、Generic Webhook）で外部からのメッセージを受信するには、
+channel webhook（LINE、WhatsApp、Feishu など webhook を使うチャネル）で外部からのメッセージを受信するには、
 **公開HTTPS URL** が別途必要です。最も手軽な選択肢は
 [Tailscale Funnel](#11-tailscale-funnel-公開httpsをwebhookに提供)
 または
@@ -218,6 +218,8 @@ docker compose up -d
 
 つまり、**一度ログインすればコンテナを再構築してもログインし直す必要はありません**。
 
+> **サブスクリプションでのログインにはアカウントのリスクがあります。** 2026-03 以降、Anthropic と Google はサードパーティ製品で使われる個人向けサブスクリプションのトークンをサーバー側でブロックしており、停止されたアカウントもあります。OpenAI がサードパーティ製品による ChatGPT サブスクリプションのログインをどう扱うかは明確ではありません。以下の setup token、コンテナ内の対話ログイン、ChatGPT ログインはいずれもサブスクリプションのログインです。API キーの利用を推奨します。[features/13-multi-runtime.md](../../features/ja-JP/13-multi-runtime.md) を参照してください。
+
 ### 6.1 Claude Code CLI
 
 #### 方法A：Setup Token（推奨）
@@ -339,14 +341,14 @@ Google AI Studioの料金体系で課金されます。
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-preferred = "claude"      # メインruntime：claude / codex / antigravity / openai-compat（geminiは非推奨）
+provider = "claude"       # メインruntime：claude / codex / antigravity / openai-compat …（geminiは非推奨）
 fallback = "antigravity"  # Claudeが利用不可の際に自動切り替え
 ```
 
 完全な例とfailover戦略については
 [features/13-multi-runtime.md](../../features/ja-JP/13-multi-runtime.md)を参照してください。
 
-指定がない場合、`RuntimeRegistry` は起動時にPATHをスキャンし、最初に見つかった利用可能なruntimeを選択します。
+`provider` を指定しない場合、エージェントは Claude で動作します。
 
 ### 6.5 3つのCLIがすべて認識されているか確認
 
@@ -481,7 +483,7 @@ Gatewayは `GET /metrics` エンドポイントを提供しています。指標
 
 ## 10. Channel Webhookには公開HTTPSが必要
 
-LINE / WhatsApp / Feishu / Generic Webhookはいずれも**インターネットからアクセス可能なHTTPS URL**
+LINE / WhatsApp / Feishu など webhook を使うチャネルはいずれも**インターネットからアクセス可能なHTTPS URL**
 がなければメッセージを受信できません。DuDuClawが家庭用ネットワークやグローバルIPのないサーバーで動作している場合、
 よく使われる方法は以下の通りです。
 

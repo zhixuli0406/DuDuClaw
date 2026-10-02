@@ -399,7 +399,6 @@ Before v1.8.9, the Wiki was write-only from the LLM's perspective: everyone coul
 
 ## Interaction with Other Systems
 
-- **GVU Loop**: SOUL.md updates can be triggered by patterns detected via wiki search — the evolution engine knows what the agent knows.
 - **Skill Lifecycle**: Skill extraction consults the wiki for context. A skill synthesized from memory can cite the wiki pages that support it.
 - **Security**: Wiki pages containing secrets get flagged by the same scanner that runs on other writable surfaces. The `must_not` rules in CONTRACT.toml can restrict which layers an agent is allowed to write to.
 - **Dashboard**: The Knowledge Hub page renders the wiki with layer filters and a graph visualization.

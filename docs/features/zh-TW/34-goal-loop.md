@@ -60,7 +60,7 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 | 防護 | 預設 | 觸發時 |
 |---|---|---|
-| 迭代上限(每任務派工數) | 8(困難目標)、3(簡單目標) | `needs_human` |
+| 迭代上限(每任務派工數) | 5(困難目標)、3(簡單目標) | `needs_human` |
 | 自建立起算的 wall clock | 24 h | `needs_human` |
 | 並行目標任務數 | 3 | 排隊,不派工 |
 | 停滯偵測 | 連續兩輪駁回回饋的 **gap 指紋**相同(從回饋抽取 `path:line` 引用與反引號關鍵詞正規化而成,不是逐字比對,換句話說的同一個 gap 也算;抽不到任何引用/關鍵詞才退回逐字比對) | 提前 `needs_human` |

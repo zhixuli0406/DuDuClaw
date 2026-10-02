@@ -35,19 +35,27 @@ The bus has a capacity of 8,192 — enough to absorb a burst of events without a
 
 ---
 
-## The Five Event Types
+## The Event Types
 
-The engine subscribes to five kinds of `AutopilotEvent`. Each carries a payload that is flattened into a field map the conditions can match against:
+A rule can subscribe to thirteen kinds of `AutopilotEvent`. Each carries a payload that is flattened into a field map the conditions can match against:
 
 | Event | `event_name` | Fired when | Key fields |
 |-------|--------------|------------|------------|
 | **TaskCreated** | `task_created` | A new task lands on the Task Board | task object (id, title, priority, ...) |
+| **TaskUpdated** | `task_updated` | A task's fields are updated | task object |
 | **TaskStatusChanged** | `task_status_changed` | A task moves between statuses | `task_id`, `from`, `to`, task object |
+| **ActivityNew** | `activity_new` | A new Activity Feed entry is posted | activity object |
 | **ChannelMessage** | `channel_message` | A message arrives on a channel | `channel`, `agent_id`, `text` |
 | **AgentIdle** | `agent_idle` | An agent has been idle | `agent_id`, `idle_minutes` |
 | **CronTick** | `cron_tick` | The scheduler emits a periodic tick | `now` |
+| **RunAtRisk** | `run_at_risk` | Foresight predicts that a running task is heading for failure | `agent_id`, `session_id`, `score`, `level`, `reasons` |
+| **OsFileEvent** | `os_file` | The agent's `[os_watch]` watcher sees a file change | `agent_id`, `path`, `kind` (created / modified / removed / renamed), `file_name`, `extension` |
+| **OsFrontmostEvent** | `os_frontmost` | The frontmost app or window title changes | `agent_id`, `app`, `window_title`, `prev_app` |
+| **Tick** | `tick` | A resident-sensing source (`[[tick.sources]]`) produces an observation | `source`, `ts`, the extracted fields and their `prev_` / `delta_` / `pct_` companions |
+| **SecurityEvent** | `security_event` | A warning- or critical-level audit event, or a security posture change | `severity`, `event_type`, `agent_id`, `source` |
+| **OdooEvent** | `odoo_event` | The Odoo poller or `POST /webhook/odoo` reports an ERP change | `event_type`, `model`, `record_id`, `record` (its top-level scalar keys are also flattened) |
 
-A rule declares which `trigger_event` it cares about, so a `channel_message` rule never even sees a `cron_tick`.
+A rule declares which `trigger_event` it cares about, so a `channel_message` rule never even sees a `cron_tick`. The same thirteen names are the legal `first` / `then` events of a `sequence` rule. The engine also carries an internal `cep_trigger` event that the sequence matcher emits to fire a matched rule; it is not a valid `trigger_event`.
 
 ---
 
@@ -67,6 +75,7 @@ A leaf condition looks up a field by path and applies an operator:
 | `eq` | field equals expected |
 | `neq` | field does not equal expected |
 | `in` | field is one of an array of values |
+| `not_in` | field is none of an array of values |
 | `gt` / `gte` | field is numerically greater (or equal) |
 | `lt` / `lte` | field is numerically less (or equal) |
 | `contains` | string contains substring, or array contains value |

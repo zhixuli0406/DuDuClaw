@@ -154,15 +154,15 @@ Registryは利用可能なバックエンドを把握
 
 `/opt/duduclaw/runtimes/bin` は DuDuClaw OS アプライアンス イメージが同梱 CLI を配置する場所です。ゲートウェイが対話的な `PATH` を引き継いでいなくても、イメージ同梱のランタイムは検出されます。
 
-エージェントは`agent.toml`で優先runtimeを指定できます：
+エージェントは`agent.toml`で使用するruntimeを指定します：
 
 ```toml
 [runtime]
-preferred = "claude"    # プライマリバックエンド
+provider = "claude"          # プライマリバックエンド
 fallback = "antigravity"     # プライマリが利用不可時のフォールバック
 ```
 
-優先設定がない場合、Registryは最初に利用可能なバックエンドを使用します。
+`provider` がない場合、エージェントは Claude で動作します。認識できない値は警告を記録し、同じく Claude にフォールバックします。
 
 ### Per-Agent設定
 

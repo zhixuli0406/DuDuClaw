@@ -7,16 +7,16 @@ DuDuClaw lets AI employees read and write data in your ERP / CRM directly. The t
 
 | System | Version / type | Status | What it can do | Isolation & audit |
 |--------|----------------|--------|----------------|-------------------|
-| **Odoo** | CE (Community) / EE (Enterprise) | ✅ Supported | CRM leads, quotations and sales orders, inventory lookups, invoice and payment status (15 tools in total) | Per-agent credentials, action / model allowlists, every operation audited |
+| **Odoo** | CE (Community) / EE (Enterprise) | ✅ Supported | CRM leads, quotations and sales orders, inventory lookups, invoice and payment status (17 tools in total) | Per-agent credentials, action / model allowlists, every operation audited |
 | **ERPNext** | v14+ | 🔜 Planned | First validation implementation once the abstraction layer lands | Shares the same isolation mechanisms as Odoo |
 | **Twenty** | Open-source CRM | 📋 Planned | CRM scenarios (leads / opportunities / contacts) | Same as above |
-| Other REST/JSON-RPC ERPs | — | 📋 Under evaluation | Extensible via the `ErpConnector` contract | Built into the contract; new implementations get it for free |
+| Other REST/JSON-RPC ERPs | — | 📋 Under evaluation | Extensible via the planned `ErpConnector` contract (ADR-004, not implemented yet) | Would be built into the contract |
 
 ## Talking points for sales
 
 **When a prospect says "Odoo only fits small and mid-size companies — we're bigger than that":**
 
-Odoo is indeed most at home in companies of 15-50 people; that's its sweet spot. But DuDuClaw's approach to ERP is not tied to Odoo. Underneath sits an abstract contract called `ErpConnector` (see ADR-004), and Odoo is just the first implementation. Once the contract is settled, connecting ERPNext, Twenty, or a customer's own REST/JSON-RPC system follows the same path, and a newly connected system automatically inherits per-agent credential isolation, action allowlists, and full operation auditing. These are part of the contract itself, not something rewritten for every new integration.
+Odoo is indeed most at home in companies of 15-50 people; that's its sweet spot. DuDuClaw's approach to ERP is not meant to stay tied to Odoo. ADR-004 decides on an abstract contract called `ErpConnector` with Odoo as its first implementation; that contract is not implemented yet, and today the bridge is the Odoo connector only. Once the contract lands, connecting ERPNext, Twenty, or a customer's own REST/JSON-RPC system would follow the same path, and a newly connected system would inherit per-agent credential isolation, action allowlists, and full operation auditing from the contract instead of each integration rewriting them.
 
 So the honest pitch to a large enterprise customer is: **"Odoo runs today; for the system you use, we have a standardized integration layer that can extend to it, and ERPNext is the first scheduled validation case."** No overselling with "we support everything", and no turning the customer away either.
 

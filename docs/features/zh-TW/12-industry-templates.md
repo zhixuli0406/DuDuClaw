@@ -24,10 +24,9 @@ DuDuClaw 的產業模板就是 Agent 部署的套餐。每個模板包含 Agent 
 templates/{industry}/
 ├── SOUL.md           # 針對產業調校的 Agent 人格
 ├── CONTRACT.toml     # 產業專屬行為邊界
-└── wiki/             # 領域知識庫
-    ├── glossary.md   # 產業術語
-    ├── processes.md  # 標準作業程序
-    └── compliance.md # 法規要求
+├── agent.toml        # Agent 設定
+└── …                 # 產業附加檔：餐飲 FAQ.json + PROACTIVE.md、
+                      # 製造 SOP-template/、貿易 price-list-template.csv
 ```
 
 **SOUL.md** — Agent 的人格預設了符合產業的溝通風格：
@@ -36,31 +35,32 @@ templates/{industry}/
 - 貿易業 Agent 簡潔、數字導向、有風險意識
 
 **CONTRACT.toml** — 行為邊界反映產業法規：
-- 製造業 Agent 絕不能批准未達品質門檻的物料
-- 餐飲業 Agent 絕不能在未明確警告的情況下向有聲明過敏原的顧客推薦菜品
-- 貿易業 Agent 必須在投資相關回應中包含風險免責聲明
+- 製造業 Agent 未經人工確認不得核准設備重新啟動
+- 餐飲業 Agent 談到菜色時一律附上過敏原警語
+- 貿易業 Agent 每份報價都要寫明貿易條件（FOB/CIF/EXW）
 
-**Wiki** — Agent 可引用的領域知識：產業術語與縮寫、標準作業程序、法規要求與合規清單、常見情境與建議回應。
+**附加檔** — Agent 工作時用的起始資料：餐飲有 FAQ 與主動檢查排程，製造有設備異常 SOP 範本，貿易有價目表範本。請把佔位值換成自己的資料。
 
 ### 可用模板
 
-**製造業** — 涵蓋供應鏈管理、生產排程、品質管控、設備維護。
+**製造業** — 工廠營運助理：監看生產、以嚴重度標籤回報異常、轉達 SOP 步驟、協調交接班。
 
-**餐飲業** — 涵蓋訂單管理、庫存追蹤、客戶服務、食品安全。
+**餐飲業** — 客服助理：回答詢問與菜單問題、接受訂位，談到菜色時列出過敏原。
 
-**貿易業** — 涵蓋市場資料解讀、投資組合管理、風險評估、合規。
+**貿易業** — 國際貿易助理：回覆買家詢價，依價目表報價並附貿易條件與報價有效期，追蹤買賣雙方之間的訂單。
 
 ### 客製化流程
 
 模板是起點，不是束縛：
 
 ```
-步驟 1：部署模板
+步驟 1：部署模板（`duduclaw wizard`，從選單選產業）
 步驟 2：客製化人格——編輯 SOUL.md 以符合你的品牌語氣
 步驟 3：調整邊界——修改 CONTRACT.toml 以符合特定合規要求
 步驟 4：新增領域知識——匯入菜單、供應商、流程到 wiki
-步驟 5：讓演化接手——Agent 人格透過 GVU 循環自我精煉，
-        同時維持在客製化的契約邊界內
+步驟 5：讓演化接手：SOUL.md 維持你寫的樣子（Agent 不能修改），
+        Agent 學到的是一條條小型 playbook 規則，每條連結一個 eval 案例，
+        不再有幫助時單獨退休，全部維持在客製化的契約邊界內（見 features/38）
 ```
 
 ---
@@ -117,7 +117,7 @@ DuDuClaw 包含一個中介軟體，將 Agent 直接連接到 Odoo（全球使�
 Agent 理解意圖
      |
      v
-Agent 呼叫 MCP 工具：sale_order_create
+Agent 呼叫 MCP 工具：odoo_sale_create_quotation，再呼叫 odoo_sale_confirm
      |
      v
 DuDuClaw Odoo Bridge 轉譯為 JSON-RPC 呼叫
@@ -133,14 +133,16 @@ Agent：「已建立銷售訂單 SO-2024-0042，客戶 ABC。
         Widget X 10 個，合計：$1,500。」
 ```
 
-### 可用操作（15 個 MCP 工具）
+### 可用操作（17 個 MCP 工具）
 
-橋接暴露跨四大商業領域的操作：
+橋接提供以下工具（`crates/duduclaw-cli/src/mcp/tools_def/odoo.rs`）：
 
-**CRM** — 潛客資格認定、商機建立、潛客狀態更新
-**銷售** — 建立銷售訂單、檢查訂單狀態、生成報價單
-**庫存** — 檢查庫存水位、調整庫存數量、追蹤出貨
-**會計** — 從銷售訂單建立發票、處理付款、查詢帳戶餘額
+- **連線**：`odoo_connect`、`odoo_status`
+- **CRM**：`odoo_crm_leads`（列出潛客）、`odoo_crm_create_lead`、`odoo_crm_update_stage`
+- **銷售**：`odoo_sale_orders`（列出訂單）、`odoo_sale_create_quotation`、`odoo_sale_confirm`
+- **庫存**：`odoo_inventory_products`（搜尋產品）、`odoo_inventory_check`（庫存水位）
+- **會計**：`odoo_invoice_list`、`odoo_payment_status`
+- **通用**：`odoo_search`（搜尋任一模型）、`odoo_execute`（呼叫模型方法）、`odoo_report`、`odoo_partner_search`、`odoo_schema_fields`
 
 ### 版本偵測
 
@@ -238,7 +240,7 @@ Odoo 橋接將 Agent 從對話助手轉變為作業工具。它們不只是*建�
 - **演化引擎**：從模板部署的 Agent 像其他 Agent 一樣演化。模板是起點，不是永久狀態。
 - **行為契約**：每個模板包含針對產業合規要求量身打造的契約。
 - **記憶系統**：wiki 中的領域知識透過記憶系統索引和可搜尋。
-- **通道整合**：模板 Agent 支援所有 7 個通訊通道。
+- **通道整合**：模板 Agent 支援所有 11 個通訊通道。
 - **成本管理**：ERP 橋接操作在 CostTelemetry 中追蹤以供預算可見。
 
 ---

@@ -41,7 +41,7 @@
 | Dashboard 認證 | **JWT 帳號登入**（`duduclaw-auth`：Argon2 + JWT，`users.db`）或 admin token（`[gateway] auth_token_enc`） | 早期的 Ed25519 challenge-response 認證路徑已移除（從來沒有設定能啟用它，儀表板也沒有實作 client 端） |
 | API key 儲存 | **AES-256-GCM** | 金鑰檔 `~/.duduclaw/.keyfile`，密文以 base64 存於 config |
 | 日誌推送 | **BroadcastLayer** tracing | 即時推播 log 到 WebSocket，零侵入 |
-| Evolution | **預測驅動 + AEE playbook 進化**（整份改寫 SOUL.md 的舊路徑已於 2026-09-29 移除） | 約 90% 對話零 LLM 成本，Significant/Critical 才觸發；`SOUL.md` 對 agent 唯讀 |
+| Evolution | **預測驅動 + AEE playbook 進化**（整份改寫 SOUL.md 的舊路徑已於 2026-09-29 移除） | 設計上多數對話不需呼叫 LLM（未公布實測比例），Significant/Critical 誤差與少量 ε 探索才觸發；`SOUL.md` 對 agent 唯讀 |
 | 任務驗收 | **判官前確定性防線**：grounding 證據預檢 + outcome schema 校驗；任務層 forward model（`[task_forward_model]` 自 v1.54 預設開） | 證據不落地就不燒判官 LLM；世界模型統計先行，冷啟動零 LLM（見 [docs/guides/goal-loop.md](docs/guides/goal-loop.md)） |
 | Token 計算 | **CJK-aware heuristic** | CJK 字元 ~1.5 chars/token，ASCII ~4 chars/token |
 
@@ -261,7 +261,7 @@ GET https://api.anthropic.com/v1/models
 
 > 完整技術文件：[docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md)、[docs/features/38-aee-playbook-evolution.md](docs/features/38-aee-playbook-evolution.md)
 
-進化引擎以**預測誤差**驅動，約 90% 的對話零 LLM 成本。`SOUL.md` 對 agent 唯讀，學習落地成 playbook 行為規則（獨立驗證、獨立回滾）。整份改寫 `SOUL.md` 的舊 GVU 路徑（含 24h 觀察期與 `legacy_soul_evolution` 開關）已於 2026-09-29 移除。
+進化引擎以**預測誤差**驅動，設計上多數對話不需呼叫 LLM（未公布實測比例）。`SOUL.md` 對 agent 唯讀，學習落地成 playbook 行為規則（獨立驗證、獨立回滾）。整份改寫 `SOUL.md` 的舊 GVU 路徑（含 24h 觀察期與 `legacy_soul_evolution` 開關）已於 2026-09-29 移除。
 
 ### 7.1 預測引擎
 
@@ -407,7 +407,7 @@ DuDuClaw/
 │   ├── duduclaw-gateway/         # 服務層：axum 伺服器、通道、WebSocket RPC、runtime、進化、排程
 │   ├── duduclaw-security/        # AES-256-GCM、soul guard、input guard、audit、secret 參照
 │   ├── duduclaw-memory/          # SQLite + FTS5 記憶引擎、wiki、因果證據圖
-│   ├── duduclaw-container/       # 容器 runtime 抽象（Docker / Apple Container / WSL2）
+│   ├── duduclaw-container/       # 腳本沙箱的容器後端（Docker；Windows 先試 WSL2）
 │   ├── duduclaw-agent/           # Agent registry、心跳、預算、帳號輪替、skill 載入
 │   ├── duduclaw-cli/             # `duduclaw` binary：clap CLI、MCP server（stdio / HTTP / SSE）
 │   ├── duduclaw-dashboard/       # rust-embed 嵌入 React SPA
@@ -555,7 +555,7 @@ max_tool_calls_per_turn = 10
 兩條獨立路徑：
 
 - **任務沙箱**（`agent.toml [container] sandbox_enabled`，預設關，僅支援 Docker，`duduclaw-gateway/src/task_sandbox.rs`）：唯讀 rootfs、非 root、drop 全部 capabilities、記憶體 4 GiB / pids 128 / `/tmp` 256 MiB 等限制、私有工作區、agent 目錄唯讀掛在 `/agent`。AI 必須連到 provider，所以需要 `network_access = true`。條件不足時 fail closed。進沙箱的是 bus／儀表板派的任務、heartbeat 看板喚醒、autopilot `delegate`／`run_skill`、goal 回合與多步驟計畫步驟；開了沙箱的員工 goal 回合一律 Solo（不組團隊），到信觸發直接跳過；通道回覆、cron、提醒、主動檢查、ephemeral、`duduclaw acp`、live `duduclaw eval` 仍在主機執行，各寫一次 `task_sandbox_not_applied` 稽核事件。見 [docs/guides/task-sandbox.md](docs/guides/task-sandbox.md)。
-- **腳本沙箱**（`duduclaw-container`，PTC 與 `secaudit` PoC 使用）：Docker / Apple Container / WSL2，`--network=none`，tmpfs 工作區。
+- **腳本沙箱**（`duduclaw-container`，PTC 與 `secaudit` PoC 使用）：macOS／Linux 用 Docker，Windows 先試 WSL2 再用 Docker（Apple Container 後端不會被選用），`--network=none`，tmpfs 工作區；無法使用時 PTC 預設拒絕執行（`[container.sandbox] script_when_unavailable`），PoC 一律不在主機執行。
 
 ### 13.2 Skill 生態系統
 

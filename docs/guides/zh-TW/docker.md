@@ -43,7 +43,7 @@ DuDuClaw 的 Docker 映像建置於 `container/Dockerfile.server`，採三階段
 | 磁碟空間 | ≥ 4 GB | 建置期間會暫用 ~3 GB；成品映像約 ~1.2 GB |
 | Port | `18789` | 預設 gateway port，可改 |
 
-若要讓 channel webhook（LINE、WhatsApp、Feishu、Generic Webhook）能收到外部訊息，
+若要讓 channel webhook（LINE、WhatsApp、Feishu 等走 webhook 的通道）能收到外部訊息，
 還需要一個 **公開 HTTPS URL**。最簡單的方案是
 [Tailscale Funnel](#11-tailscale-funnel-公開-https-給-webhook) 或
 [Cloudflare Tunnel](deployment-guide.md#4-cloudflare-tunnel-long-term-stable)。
@@ -219,6 +219,8 @@ docker compose up -d
 
 這代表 **登入一次後即使容器重建也不需重登**。
 
+> **訂閱登入有帳號風險。** 自 2026-03 起，Anthropic 與 Google 會在伺服器端封鎖第三方產品使用的消費者訂閱 token，也已有帳號被停權；OpenAI 對第三方產品驅動 ChatGPT 訂閱登入的政策尚不明確。下面的 setup token、容器內互動登入與 ChatGPT 登入都屬於訂閱登入，建議使用 API key。詳見 [features/13-multi-runtime.md](../../features/zh-TW/13-multi-runtime.md)。
+
 ### 6.1 Claude Code CLI
 
 #### 方法 A：Setup Token（推薦）
@@ -341,14 +343,14 @@ GEMINI_API_KEY=AIza...
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-preferred = "claude"      # 主 runtime：claude / codex / antigravity / openai-compat（gemini 已棄用）
+provider = "claude"       # 主 runtime：claude / codex / antigravity / openai-compat …（gemini 已棄用）
 fallback = "antigravity"  # Claude 不可用時自動切換
 ```
 
 完整範例與 failover 策略請見
 [features/13-multi-runtime.md](../../features/zh-TW/13-multi-runtime.md)。
 
-未指定時，`RuntimeRegistry` 啟動掃描 PATH 後挑選第一個可用的 runtime。
+沒有設定 `provider` 時，agent 使用 Claude。
 
 ### 6.5 驗證三個 CLI 都認得出來
 
@@ -483,7 +485,7 @@ Gateway 提供 `GET /metrics` 端點，指標清單見
 
 ## 10. Channel Webhook 需要公開 HTTPS
 
-LINE / WhatsApp / Feishu / Generic Webhook 都需要**可從網際網路存取的 HTTPS URL**
+LINE / WhatsApp / Feishu 等走 webhook 的通道都需要**可從網際網路存取的 HTTPS URL**
 才能收到訊息。若你的 DuDuClaw 跑在家用網路或沒有公網 IP 的伺服器，
 常用方案：
 

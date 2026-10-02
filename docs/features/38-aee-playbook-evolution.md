@@ -98,10 +98,9 @@ strategy = "balanced"         # whether each learning round leans toward fixing 
 
 ## How to observe it
 
-The dashboard's Memory page gained a "self-directed learning" (自主學習) tab, showing:
+The dashboard's Memory page gained a "Self-Improvement" (自主進化) tab, showing:
 
-- **Evolution mode overview**: how many agents have learning enabled, and whether each runs the new mechanism or the legacy escape hatch
-- **Version history**: a timeline of every learning event
+- **Evolution mode overview**: how many agents have learning enabled
 - **Stagnation detection**: when an agent's learning gets rejected round after round, or it has gone a long time without learning anything new, a warning appears here (previously this situation was completely invisible)
 - **Rejection statistics chart**: which gate blocks the most proposals, so you can tell whether the rules are too strict or the agent's proposal quality is poor
 - **Learned-rule list**: the rules each agent currently holds. Each card renders in **plain language** ("when a task hits 'can't do this, capability missing', I will 'first check which tools I have'"), with a one-line "why this rule exists" underneath describing source and evidence (distilled from how many failures, guarded by how many eval cases, actually used how many times, and helpful in how many of those); the raw rule text shown to the model folds under "view raw rule content" and expands on demand. Status uses consistent plain-language labels: **under observation (not yet active) / on trial / active / unused for a long time, shelved / retired**. One click exports everything as JSON, or disables a rule you disagree with.

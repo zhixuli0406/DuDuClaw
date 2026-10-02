@@ -128,7 +128,7 @@ An AI employee that supervises others could `agent_remove` a subordinate and the
 
 Every MCP caller counts as an AI caller; there is no operator exemption over MCP. The CLI scaffold path (`duduclaw agent create`, pack and expert install, `migrate-from`) applies the same rule when it detects an AI session through `DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN`, and the `agent-file-guard` hook additionally blocks a Bash `duduclaw agent create <reserved name>` and AI writes, moves and deletes under `agents/_trash/`. Refusals are audited as `agent_name_reserved` (`requested_name`, `path_kind`, `reason`) and removals as `agent_removed`. `agent_remove` no longer hands the AI the trash path or an `rm -rf` hint.
 
-Operators are not restricted: the dashboard and a human at a terminal can reuse a reserved name. Restoring or purging a removed employee means operating on `~/.duduclaw/agents/_trash/<id>_<timestamp>` by hand; the dashboard has no restore or purge control. Known gaps: for Claude, Codex and Gemini employees the CLI cannot detect an AI session from the Bash environment (their identity is in `.mcp.json`), so `pack install`, `expert install` and `migrate-from` run from such an employee's Bash are not covered; the Bash rules are heuristics an employee with Bash can defeat, so real containment is not granting Bash. Not yet tested through a running gateway.
+Operators are not restricted: the dashboard and a human at a terminal can reuse a reserved name. Restoring or purging a removed employee means operating on `~/.duduclaw/agents/_trash/<id>_<timestamp>` by hand; the dashboard has no restore or purge control. Known gaps: for Claude, Codex and Gemini employees the CLI cannot detect an AI session from the Bash environment (their identity is in `.mcp.json`), so `pack install`, `expert install` and `migrate-from` run from such an employee's Bash are not covered; the Bash rules are heuristics an employee with Bash can defeat, so real containment is not granting Bash. Verified through the real MCP server with an employee's own registration (remove, refused re-creation, a different name accepted, the hook blocks, the audit rows); the CLI scaffold path was exercised only by unit tests.
 
 Related change: `create_agent` and `agent_remove` called over HTTP with a non-internal MCP key are now judged by that key's own client id, so the organisation-scope check applies to the real caller (previously such calls were treated as the process's default agent).
 
@@ -155,7 +155,7 @@ DuDuClaw binaries are:
 
 What we do **not** do:
 
-- ❌ Phone home / telemetry
+- ❌ Telemetry: no usage data or conversation content is sent to us. Network calls the gateway makes on its own: an update check against GitHub Releases every 6 hours, and, only when a paid license is installed, a license refresh (every 3–7 days depending on tier) and a daily revocation-list fetch from the license server
 - ❌ Collect API keys (secrets stay on the user's machine via an AES-256-GCM vault)
 - ❌ Auto-execute untrusted downloaded code
 - ❌ Require root / privileged escalation

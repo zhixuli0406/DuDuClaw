@@ -35,19 +35,27 @@ MCP bridge         ─┘                                   1. 事件相符？  
 
 ---
 
-## 五種事件型別
+## 事件型別
 
-引擎訂閱五種 `AutopilotEvent`。每種都攜帶一個 payload，會被攤平成一個欄位映射供條件比對：
+規則可以訂閱十三種 `AutopilotEvent`。每種都攜帶一個 payload，會被攤平成一個欄位映射供條件比對：
 
 | 事件 | `event_name` | 觸發時機 | 關鍵欄位 |
 |------|--------------|----------|----------|
 | **TaskCreated** | `task_created` | Task Board 上出現新 task | task 物件（id、title、priority……） |
+| **TaskUpdated** | `task_updated` | task 的欄位被更新 | task 物件 |
 | **TaskStatusChanged** | `task_status_changed` | task 在狀態間移動 | `task_id`、`from`、`to`、task 物件 |
+| **ActivityNew** | `activity_new` | Activity Feed 出現新的一筆 | activity 物件 |
 | **ChannelMessage** | `channel_message` | channel 上收到訊息 | `channel`、`agent_id`、`text` |
 | **AgentIdle** | `agent_idle` | 某個 agent 進入閒置 | `agent_id`、`idle_minutes` |
 | **CronTick** | `cron_tick` | 排程器發出週期性 tick | `now` |
+| **RunAtRisk** | `run_at_risk` | 預測判斷執行中的任務正走向失敗 | `agent_id`、`session_id`、`score`、`level`、`reasons` |
+| **OsFileEvent** | `os_file` | agent 的 `[os_watch]` 監看到檔案變動 | `agent_id`、`path`、`kind`（created / modified / removed / renamed）、`file_name`、`extension` |
+| **OsFrontmostEvent** | `os_frontmost` | 前景 App 或視窗標題改變 | `agent_id`、`app`、`window_title`、`prev_app` |
+| **Tick** | `tick` | 常駐感知來源（`[[tick.sources]]`）產生一筆觀測 | `source`、`ts`、擷取欄位及其 `prev_` / `delta_` / `pct_` 衍生欄位 |
+| **SecurityEvent** | `security_event` | warning 或 critical 等級的稽核事件，或安全態勢改變 | `severity`、`event_type`、`agent_id`、`source` |
+| **OdooEvent** | `odoo_event` | Odoo 輪詢或 `POST /webhook/odoo` 回報 ERP 變更 | `event_type`、`model`、`record_id`、`record`（其頂層純量欄位也會攤平） |
 
-規則會宣告它關心哪個 `trigger_event`，因此 `channel_message` 規則根本不會看到 `cron_tick`。
+規則會宣告它關心哪個 `trigger_event`，因此 `channel_message` 規則根本不會看到 `cron_tick`。這十三個名稱也是 `sequence` 規則合法的 `first` / `then` 事件。引擎另有一個內部事件 `cep_trigger`，由序列比對器發出以觸發已比對成功的規則，不能當 `trigger_event` 使用。
 
 ---
 
@@ -67,6 +75,7 @@ MCP bridge         ─┘                                   1. 事件相符？  
 | `eq` | 欄位等於期望值 |
 | `neq` | 欄位不等於期望值 |
 | `in` | 欄位是某個值陣列的其中之一 |
+| `not_in` | 欄位不是值陣列中的任何一個 |
 | `gt` / `gte` | 欄位在數值上大於（或等於） |
 | `lt` / `lte` | 欄位在數值上小於（或等於） |
 | `contains` | 字串包含子字串，或陣列包含某值 |

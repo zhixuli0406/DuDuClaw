@@ -150,7 +150,7 @@ HippoRAG-lite graph 獲得四項各自獨立的改良（對齊 HippoRAG 2 + Ligh
 
 ## F2：Reflexion Loop
 
-F2 把**既有**的 `MistakeNotebook` 橋接進回答路徑，它不是一個新的儲存。觸發訊號是既有的 `ErrorCategory`（Significant／Critical，由 MetaCognition 自我調適），**而非** GVU Verifier（後者驗證的是 SOUL.md 提案）。
+F2 把**既有**的 `MistakeNotebook` 橋接進回答路徑，它不是一個新的儲存。觸發訊號是既有的 `ErrorCategory`（Significant／Critical，由 MetaCognition 自我調適），**而非**進化引擎的 Gate／Measure 驗證器（後者評的是候選 playbook 條目）。
 
 ### F2a — 將過去的錯誤注入 prompt
 
@@ -178,7 +178,7 @@ query_by_topic(keywords, agent, 3)   ← 主題範疇的回想
   - <錯誤 2 的 prompt 區塊>
 ```
 
-這把 `MistakeNotebook` 橋接到跨任務學習，讓 Agent 在相似主題上停止重蹈覆轍，不只侷限在 GVU SOUL.md 路徑內。
+這把 `MistakeNotebook` 橋接到跨任務學習，讓 Agent 在相似主題上停止重蹈覆轍，不只侷限在進化引擎內。
 
 ### F2b — 將同類別 ≥3 筆錯誤整併成一條規則
 

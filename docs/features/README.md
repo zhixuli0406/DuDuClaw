@@ -22,7 +22,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 12 | [Industry Templates & Odoo ERP Bridge](12-industry-templates.md) | Out-of-the-box business intelligence |
 | 13 | [Multi-Runtime Agent Execution](13-multi-runtime.md) | Claude / Codex / Antigravity / Grok / OpenAI-compat and more behind one backend (Gemini CLI deprecated) |
 | 14 | [Voice Pipeline](14-voice-pipeline.md) | STT/TTS over two paths — a fail-closed HTTP pair and a hardcoded Telegram handler |
-| 15 | [Skill Lifecycle Engine](15-skill-lifecycle.md) | 7-stage automated skill extraction and management |
+| 15 | [Skill Lifecycle Engine](15-skill-lifecycle.md) | 6-stage automated skill extraction and management |
 | 16 | [Session Memory Stack](16-session-memory-stack.md) | Pinned instructions + snowball recap + key-fact accumulator |
 | 17 | [Wiki Knowledge Layer](17-wiki-knowledge-layer.md) | L0-L3 trust-weighted knowledge with auto-injection |
 | 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | `duduclaw acp` speaks Agent Client Protocol v1 for IDE panels (Zed / JetBrains / nvim); `duduclaw acp-server` is the A2A stdio surface |
