@@ -325,6 +325,26 @@ impl ApprovalBroker {
         self.store.list_pending(agent_id).await
     }
 
+    /// Every approval of one `action_kind`, any status.
+    pub async fn list_by_kind(&self, kind: &str) -> Result<Vec<ApprovalRecord>, String> {
+        self.store.list_by_kind(kind).await
+    }
+
+    /// Withdraw a pending approval as a system DENY (`decided_by` names why).
+    /// Returns `false` when it was no longer pending.
+    pub async fn withdraw(&self, id: &ApprovalId, decided_by: &str) -> Result<bool, String> {
+        let n = self
+            .store
+            .decide_if_pending(id, ApprovalStatus::Denied, decided_by, &Utc::now().to_rfc3339())
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// Overwrite an approval's summary and payload (data-subject erase).
+    pub async fn replace_text(&self, id: &ApprovalId, summary: &str, payload: &Value) -> Result<(), String> {
+        self.store.replace_text(id, summary, payload).await.map(|_| ())
+    }
+
     /// Sweep: mark every pending approval past its TTL as `expired`.
     /// Returns the number expired. TTL expiry counts as DENY.
     pub async fn expire_stale(&self) -> Result<u64, String> {

@@ -61,3 +61,4 @@ mod power_local_dispatch_tests;
 mod db_source_capability_tests;
 mod runtime_deprecation_tests;
 mod agents_inspect_sandbox_tests;
+mod knowledge_quarantine_decide_tests;

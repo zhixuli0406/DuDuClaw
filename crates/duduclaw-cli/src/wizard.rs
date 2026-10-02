@@ -666,7 +666,7 @@ api_mode = "cli"
 
 [model.local]
 model = ""
-backend = "llama_cpp"
+backend = "openai_compat"
 context_length = 4096
 gpu_layers = -1
 prefer_local = true

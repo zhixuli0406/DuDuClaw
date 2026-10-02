@@ -61,9 +61,12 @@ pub struct ProfileTrait {
     pub value: String,
 }
 
-/// Default origin for profile writes: an explicit, operator/agent-initiated
-/// `user_profile` record (legacy alias of `user_direct`, trust ceiling 1.0).
-const DEFAULT_PROFILE_ORIGIN: &str = "user_profile";
+/// Default origin for profile writes: the `user_profile` class — a record the
+/// AI employee keeps about a user. It is the AI's record, not the user's or
+/// the operator's direct input, so its ceiling is the agent-derived `0.6`
+/// (`crate::origin::USER_PROFILE`); an operator-approved value (`1.0`) can
+/// only be replaced through review.
+const DEFAULT_PROFILE_ORIGIN: &str = crate::origin::USER_PROFILE.name;
 
 /// Record (or update) one preference trait about a user. Re-recording the same
 /// `predicate` supersedes the prior value via the temporal chain.
@@ -110,6 +113,89 @@ pub async fn record_trait_with_origin(
     origin: &str,
     origin_trust: f64,
 ) -> Result<String> {
+    let (entry, meta) = trait_write(agent_id, user_id, predicate, value, origin, origin_trust);
+    engine.store_temporal(agent_id, entry, meta).await
+}
+
+/// [`record_trait_with_origin`] with the typed outcome of
+/// [`SqliteMemoryEngine::store_temporal_outcome`]: a trait that would replace a
+/// more trusted current value comes back as `Refused` instead of an `Err`, so
+/// the caller can hold it for review via [`hold_trait`].
+#[allow(clippy::too_many_arguments)]
+pub async fn record_trait_outcome(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    user_id: &str,
+    predicate: &str,
+    value: &str,
+    origin: &str,
+    origin_trust: f64,
+) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
+    let (entry, meta) = trait_write(agent_id, user_id, predicate, value, origin, origin_trust);
+    engine.store_temporal_outcome(agent_id, entry, meta).await
+}
+
+/// Hold a refused trait inert for human review
+/// ([`SqliteMemoryEngine::hold_refused_claim`]). Returns the held row id.
+#[allow(clippy::too_many_arguments)]
+pub async fn hold_trait(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    user_id: &str,
+    predicate: &str,
+    value: &str,
+    origin: &str,
+    origin_trust: f64,
+) -> Result<String> {
+    Ok(hold_trait_outcome(engine, agent_id, user_id, predicate, value, origin, origin_trust)
+        .await?
+        .id)
+}
+
+/// [`hold_trait`], reporting whether the trait was newly held or an identical
+/// one was already pending review
+/// ([`SqliteMemoryEngine::hold_refused_claim_outcome`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn hold_trait_outcome(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    user_id: &str,
+    predicate: &str,
+    value: &str,
+    origin: &str,
+    origin_trust: f64,
+) -> Result<crate::supersession_guard::HeldClaim> {
+    let (entry, meta) = trait_write(agent_id, user_id, predicate, value, origin, origin_trust);
+    engine.hold_refused_claim_outcome(agent_id, entry, meta).await
+}
+
+/// [`hold_trait_outcome`] with an admission gate for NEW held rows
+/// ([`SqliteMemoryEngine::hold_refused_claim_gated`]): `Ok(None)` when the
+/// gate refused (nothing written).
+#[allow(clippy::too_many_arguments)]
+pub async fn hold_trait_gated(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    user_id: &str,
+    predicate: &str,
+    value: &str,
+    origin: &str,
+    origin_trust: f64,
+    admit: &mut (dyn FnMut() -> bool + Send),
+) -> Result<Option<crate::supersession_guard::HeldClaim>> {
+    let (entry, meta) = trait_write(agent_id, user_id, predicate, value, origin, origin_trust);
+    engine.hold_refused_claim_gated(agent_id, entry, meta, admit).await
+}
+
+/// The entry + temporal metadata one trait write stores.
+fn trait_write(
+    agent_id: &str,
+    user_id: &str,
+    predicate: &str,
+    value: &str,
+    origin: &str,
+    origin_trust: f64,
+) -> (MemoryEntry, TemporalMeta) {
     let entry = MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: agent_id.to_string(),
@@ -131,7 +217,7 @@ pub async fn record_trait_with_origin(
         origin_trust: Some(origin_trust.clamp(0.0, 1.0)),
         ..Default::default()
     };
-    engine.store_temporal(agent_id, entry, meta).await
+    (entry, meta)
 }
 
 /// Fetch the currently-valid profile traits for a user, sorted by predicate.
@@ -223,6 +309,10 @@ pub async fn consolidate_profile(
         .map(|t| format!("{}: {}", t.predicate, t.value))
         .collect::<Vec<_>>()
         .join("; ");
+    // The summary is derived from the current trait rows: `derived_from`
+    // makes the engine clamp its trust to the least trusted of them, so a
+    // summary of distilled traits never outranks the traits themselves.
+    let source_ids = current_trait_ids(engine, agent_id, user_id).await?;
 
     let entry = MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
@@ -242,11 +332,48 @@ pub async fn consolidate_profile(
         predicate: Some(SUMMARY_PREDICATE.to_string()),
         object: Some(summary),
         confidence: Some(0.9),
-        origin: Some("user_profile".to_string()),
+        origin: Some(DEFAULT_PROFILE_ORIGIN.to_string()),
+        derived_from: Some(source_ids),
         ..Default::default()
     };
-    let id = engine.store_temporal(agent_id, entry, meta).await?;
-    Ok(Some(id))
+    match engine.store_temporal_outcome(agent_id, entry, meta).await? {
+        crate::supersession_guard::TemporalWriteOutcome::Stored(id) => Ok(Some(id)),
+        // An older summary is more trusted than the traits it is rebuilt from
+        // now (e.g. a trait was re-recorded at lower trust): keep it rather
+        // than fail the caller; the next consolidation retries.
+        crate::supersession_guard::TemporalWriteOutcome::Refused(r) => {
+            tracing::warn!(agent = agent_id, "profile summary not replaced: {r}");
+            Ok(None)
+        }
+    }
+}
+
+/// Ids of the currently valid trait rows [`profile_traits`] reads (summary
+/// excluded), for the summary's `derived_from`.
+async fn current_trait_ids(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    user_id: &str,
+) -> Result<Vec<String>> {
+    let subject = user_subject(user_id);
+    let conn = engine.conn_for_maintenance().await;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM memories
+             WHERE agent_id = ?1 AND subject = ?2 AND valid_until IS NULL
+               AND predicate IS NOT NULL AND predicate != ?3",
+        )
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![agent_id, subject, SUMMARY_PREDICATE], |r| {
+            r.get::<_, String>(0)
+        })
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+    let mut ids = Vec::new();
+    for r in rows {
+        ids.push(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+    }
+    Ok(ids)
 }
 
 #[cfg(test)]

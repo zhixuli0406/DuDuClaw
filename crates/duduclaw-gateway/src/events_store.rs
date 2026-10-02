@@ -244,6 +244,69 @@ impl EventBusStore {
         Ok(id)
     }
 
+    /// Delete `event` rows whose JSON payload lists any of `ids` under
+    /// `quarantined_ids` (data-subject erase of review events). Rows with
+    /// unparseable payloads are left alone. Returns the number deleted.
+    pub async fn delete_by_quarantined_ids(
+        &self,
+        event: &str,
+        ids: &HashSet<String>,
+    ) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().await;
+        let candidates: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, payload FROM events WHERE event = ?1")
+                .map_err(|e| format!("prepare scrub events: {e}"))?;
+            stmt.query_map(params![event], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| format!("query scrub events: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("collect scrub events: {e}"))?
+        };
+        let mut n = 0usize;
+        for (rowid, payload) in candidates {
+            let hit = serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|v| v.get("quarantined_ids").and_then(|a| a.as_array()).cloned())
+                .is_some_and(|a| a.iter().any(|x| x.as_str().is_some_and(|s| ids.contains(s))));
+            if hit {
+                n += conn
+                    .execute("DELETE FROM events WHERE id = ?1", params![rowid])
+                    .map_err(|e| format!("delete event: {e}"))?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Delete `event` rows whose JSON payload `subject` EQUALS `subject`
+    /// (exact match). Rows with unparseable payloads are left alone.
+    pub async fn delete_by_payload_subject(&self, event: &str, subject: &str) -> Result<usize, String> {
+        let conn = self.conn.lock().await;
+        let candidates: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, payload FROM events WHERE event = ?1")
+                .map_err(|e| format!("prepare scrub events: {e}"))?;
+            stmt.query_map(params![event], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| format!("query scrub events: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("collect scrub events: {e}"))?
+        };
+        let mut n = 0usize;
+        for (rowid, payload) in candidates {
+            let hit = serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .is_some_and(|v| v.get("subject").and_then(|s| s.as_str()) == Some(subject));
+            if hit {
+                n += conn
+                    .execute("DELETE FROM events WHERE id = ?1", params![rowid])
+                    .map_err(|e| format!("delete event: {e}"))?;
+            }
+        }
+        Ok(n)
+    }
+
     /// Delete events older than `cutoff_iso` (RFC3339 timestamp string).
     /// Returns the number of rows deleted.
     pub async fn prune_before(&self, cutoff_iso: &str) -> Result<usize, String> {

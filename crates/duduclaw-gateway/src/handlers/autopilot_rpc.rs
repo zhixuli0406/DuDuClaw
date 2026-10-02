@@ -36,10 +36,15 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("task_created")
             .to_string();
-        if let Err(e) = validate_autopilot_trigger_event(&trigger_event) {
+        if let Err(e) = validate_autopilot_trigger_event_for_create(&trigger_event) {
             return WsFrame::error_response("", &e);
         }
+        // Absent conditions mean "fire on every event of this trigger"; the
+        // engine evaluates the stored `{}` as always-true.
         let conditions = params.get("conditions").cloned().unwrap_or(json!({}));
+        if let Err(e) = validate_autopilot_conditions(&conditions) {
+            return WsFrame::error_response("", &e);
+        }
         let action = params.get("action").cloned().unwrap_or(json!({}));
         // Reject malformed rules at write time so the dashboard surfaces
         // the error immediately rather than silently in autopilot_history
@@ -89,14 +94,27 @@ impl MethodHandler {
         if rule_id.is_empty() {
             return WsFrame::error_response("", "rule_id is required");
         }
-        // Re-validate any provided trigger_event / action fields.
+        // Re-validate any provided trigger_event / action fields. A legacy
+        // trigger (`cron_tick`) survives only on a rule that already had it.
         if let Some(t) = params.get("trigger_event").and_then(|v| v.as_str()) {
-            if let Err(e) = validate_autopilot_trigger_event(t) {
+            let stored = match store.get_rule(rule_id).await {
+                Ok(Some(row)) => row.trigger_event,
+                Ok(None) => {
+                    return WsFrame::error_response("", &format!("Rule not found: {rule_id}"));
+                }
+                Err(e) => return WsFrame::error_response("", &format!("update rule: {e}")),
+            };
+            if let Err(e) = validate_autopilot_trigger_event_for_update(t, &stored) {
                 return WsFrame::error_response("", &e);
             }
         }
         if let Some(a) = params.get("action") {
             if let Err(e) = validate_autopilot_action(a) {
+                return WsFrame::error_response("", &e);
+            }
+        }
+        if let Some(c) = params.get("conditions") {
+            if let Err(e) = validate_autopilot_conditions(c) {
                 return WsFrame::error_response("", &e);
             }
         }

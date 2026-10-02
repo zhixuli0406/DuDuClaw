@@ -121,13 +121,13 @@ impl MethodHandler {
         if title.is_empty() {
             return WsFrame::error_response("", "title is required");
         }
-        // `assigned_to` is OPTIONAL — an empty value means "unassigned". An
-        // unassigned task is never auto-dispatched: the heartbeat task-board
-        // pull (`poll_assigned_tasks`, `WHERE assigned_to = <agent>`) and the
-        // goal-loop driver (`!assigned_to.trim().is_empty()`) both filter on a
-        // concrete assignee, so a human-organising task stays on the board
-        // until someone explicitly claims it (Bug#4 — prevents an agent
-        // silently picking up a bookkeeping task and burning LLM spend).
+        // `assigned_to` is REQUIRED on this RPC: the dispatcher
+        // (`dispatch_org.rs`, "tasks.create") refuses an empty value before
+        // this handler runs, because the per-agent Operator check needs a
+        // named target. (The empty-means-unassigned handling below only
+        // matters for direct in-process callers.) An unassigned task is never
+        // auto-dispatched: the heartbeat task-board pull and the goal-loop
+        // driver both filter on a concrete assignee (Bug#4).
         let assigned_to = params
             .get("assigned_to")
             .and_then(|v| v.as_str())

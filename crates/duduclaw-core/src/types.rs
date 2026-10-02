@@ -1277,8 +1277,10 @@ impl RuntimeType {
 /// could self-host.
 ///
 /// Resolution precedence (see [`EditionProfile::resolve`]):
-/// `DUDUCLAW_EDITION` env  >  `agent.toml [edition] profile`  >  license tier
-/// >  default ([`Personal`]).
+/// `DUDUCLAW_EDITION` env  >  license tier  >  default ([`Personal`]).
+/// `resolve` also takes an explicit override between the two (the gateway's
+/// `GatewayConfig.edition`, meant for an embedding host); the shipped CLI
+/// always passes `None`, and no `agent.toml` key feeds it.
 ///
 /// [`Personal`]: EditionProfile::Personal
 /// [`Enterprise`]: EditionProfile::Enterprise
@@ -1352,10 +1354,12 @@ impl EditionProfile {
     }
 
     /// Resolve the active edition using the documented precedence:
-    /// env override > explicit config > license tier > default.
+    /// env override > explicit override > license tier > default.
     ///
     /// - `env`: value of `DUDUCLAW_EDITION` (`None` if unset).
-    /// - `config`: value of `agent.toml [edition] profile` (`None` if unset).
+    /// - `config`: an explicit override from the caller (the gateway passes
+    ///   `GatewayConfig.edition`, which the shipped CLI leaves `None`; no
+    ///   `agent.toml` key is read for it).
     /// - `tier_key`: the active license tier's TOML key (`None` for open-source).
     pub fn resolve(env: Option<&str>, config: Option<&str>, tier_key: Option<&str>) -> Self {
         if let Some(e) = env.map(str::trim).filter(|s| !s.is_empty()) {
@@ -1454,7 +1458,10 @@ mod edition_cap_tests {
 pub struct LocalModelConfig {
     /// Model file path or id (e.g., "qwen3-8b-q4_k_m" or full path to .gguf)
     pub model: String,
-    /// Backend type: "llama_cpp", "openai_compat", "mistral_rs"
+    /// Backend type. Only `"openai_compat"` (a local OpenAI-compatible
+    /// server) can start; the in-process `"llama_cpp"` / `"mistral_rs"`
+    /// backends were removed on 2026-09-29 and an existing file carrying one
+    /// still parses (the dashboard shows it so the user can change it).
     #[serde(default = "default_local_backend")]
     pub backend: String,
     /// Context window size
@@ -1474,7 +1481,7 @@ pub struct LocalModelConfig {
 }
 
 fn default_local_backend() -> String {
-    "llama_cpp".to_string()
+    "openai_compat".to_string()
 }
 
 fn default_local_context() -> u32 {

@@ -182,6 +182,41 @@ impl ApprovalStore {
         .map_err(|e| format!("decide approval: {e}"))
     }
 
+    /// Every approval of one `action_kind`, any status (GDPR scrub).
+    pub(super) async fn list_by_kind(&self, kind: &str) -> Result<Vec<ApprovalRecord>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, action_kind, summary, payload, status,
+                        created_at, decided_at, decided_by, ttl_seconds,
+                        notify_channel, notify_chat_id, reminded_at, simulation
+                 FROM approvals WHERE action_kind = ?1 ORDER BY created_at ASC",
+            )
+            .map_err(|e| format!("prepare list_by_kind: {e}"))?;
+        let rows = stmt
+            .query_map(params![kind], row_to_record)
+            .map_err(|e| format!("query list_by_kind: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list_by_kind: {e}"))?;
+        Ok(rows)
+    }
+
+    /// Replace an approval's summary and payload (GDPR scrub). Status,
+    /// decision and timestamps are untouched.
+    pub(super) async fn replace_text(
+        &self,
+        id: &ApprovalId,
+        summary: &str,
+        payload: &Value,
+    ) -> Result<usize, String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE approvals SET summary = ?1, payload = ?2, simulation = NULL WHERE id = ?3",
+            params![summary, payload.to_string(), id.as_str()],
+        )
+        .map_err(|e| format!("scrub approval: {e}"))
+    }
+
     pub(super) async fn list_pending(&self, agent_id: Option<&str>) -> Result<Vec<ApprovalRecord>, String> {
         let conn = self.conn.lock().await;
         match agent_id {

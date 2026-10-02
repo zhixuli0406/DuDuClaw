@@ -70,8 +70,30 @@ pub fn novelty_gate_enabled_from_config(home_dir: &Path) -> bool {
         .unwrap_or(default)
 }
 
+/// Reads `[memory] supersession_trust_guard` from `<home_dir>/config.toml`.
+/// Default `true` (guard on) when the file is absent, unreadable, malformed,
+/// or the key is unset — fails closed: only an explicit `false` lets a
+/// lower-trust write replace a more trusted current fact
+/// (`duduclaw_memory::supersession_guard`). Mirrors
+/// `duduclaw_cli::mcp::supersession_trust_guard_enabled_from_config`.
+pub fn supersession_trust_guard_enabled_from_config(home_dir: &Path) -> bool {
+    let default = true;
+    let Ok(content) = std::fs::read_to_string(home_dir.join("config.toml")) else {
+        return default;
+    };
+    let Ok(table) = content.parse::<toml::Table>() else {
+        return default;
+    };
+    table
+        .get("memory")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("supersession_trust_guard"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
+
 /// Open a `SqliteMemoryEngine` at `db_path`, honoring `[memory] novelty_gate`
-/// from `<home_dir>/config.toml`.
+/// and `[memory] supersession_trust_guard` from `<home_dir>/config.toml`.
 ///
 /// - `db_path` is the actual `memory.db` file to open — per-agent, and not
 ///   always a simple `home_dir`-relative join (some callers cross-reference a
@@ -94,7 +116,8 @@ pub fn novelty_gate_enabled_from_config(home_dir: &Path) -> bool {
 /// on next construction / process restart); this module makes no caching
 /// decision of its own.
 pub fn build_memory_engine(db_path: &Path, home_dir: &Path) -> Result<SqliteMemoryEngine> {
-    let engine = SqliteMemoryEngine::new(db_path)?;
+    let engine = SqliteMemoryEngine::new(db_path)?
+        .with_supersession_trust_guard(supersession_trust_guard_enabled_from_config(home_dir));
     let engine = if novelty_gate_enabled_from_config(home_dir) {
         engine
             .with_embedder(Arc::new(NgramHashEmbedder::new()))
@@ -142,6 +165,42 @@ mod tests {
         )
         .unwrap();
         assert!(!novelty_gate_enabled_from_config(dir.path()));
+    }
+
+    #[test]
+    fn supersession_trust_guard_defaults_on_and_reads_false() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(supersession_trust_guard_enabled_from_config(dir.path()));
+        std::fs::write(dir.path().join("config.toml"), "not = = toml").unwrap();
+        assert!(supersession_trust_guard_enabled_from_config(dir.path()));
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[memory]\nsupersession_trust_guard = \"no\"\n",
+        )
+        .unwrap();
+        assert!(
+            supersession_trust_guard_enabled_from_config(dir.path()),
+            "a non-boolean value fails closed"
+        );
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[memory]\nsupersession_trust_guard = false\n",
+        )
+        .unwrap();
+        assert!(!supersession_trust_guard_enabled_from_config(dir.path()));
+    }
+
+    #[test]
+    fn factory_wires_supersession_trust_guard() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("memory.db");
+        assert!(build_memory_engine(&db, home.path()).unwrap().supersession_trust_guard);
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[memory]\nsupersession_trust_guard = false\n",
+        )
+        .unwrap();
+        assert!(!build_memory_engine(&db, home.path()).unwrap().supersession_trust_guard);
     }
 
     #[tokio::test]

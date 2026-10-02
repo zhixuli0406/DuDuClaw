@@ -442,7 +442,15 @@ pub async fn induce_schema(
             })),
             ..Default::default()
         };
-        let id = engine.store_temporal(agent_id, entry, meta).await?;
+        // L5: a supersession-guard refusal (a more trusted fact already holds
+        // this key) skips this theme only; real errors still propagate.
+        let id = match engine.store_temporal_outcome(agent_id, entry, meta).await? {
+            crate::supersession_guard::TemporalWriteOutcome::Stored(id) => id,
+            crate::supersession_guard::TemporalWriteOutcome::Refused(r) => {
+                tracing::info!(agent = agent_id, "night schema skipped: {r}");
+                continue;
+            }
+        };
         stored.push(InducedSchema {
             memory_id: id,
             key: theme.key,
@@ -527,7 +535,15 @@ pub async fn consolidate_recurrent(
                 })),
                 ..Default::default()
             };
-            Some(engine.store_temporal(agent_id, entry, meta).await?)
+            // L5: a guard refusal leaves this theme unstored (like a failed
+            // verification) instead of aborting the remaining themes.
+            match engine.store_temporal_outcome(agent_id, entry, meta).await? {
+                crate::supersession_guard::TemporalWriteOutcome::Stored(id) => Some(id),
+                crate::supersession_guard::TemporalWriteOutcome::Refused(r) => {
+                    tracing::info!(agent = agent_id, "night consolidation skipped: {r}");
+                    None
+                }
+            }
         } else {
             tracing::debug!(
                 agent = agent_id,
@@ -687,6 +703,55 @@ mod tests {
         assert!(hits.iter().any(
             |m| m.layer == MemoryLayer::Semantic && m.source_event == "night_schema_induction"
         ));
+    }
+
+    async fn operator_fact(engine: &SqliteMemoryEngine, agent: &str, subject: String, predicate: &str) {
+        engine
+            .store_temporal(
+                agent,
+                ep(agent, "operator-set value"),
+                TemporalMeta {
+                    subject: Some(subject),
+                    predicate: Some(predicate.to_string()),
+                    origin: Some("operator".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// L5: a supersession-guard refusal on one theme (an operator value holds
+    /// its key) skips that theme; the others are still stored, no error.
+    #[tokio::test]
+    async fn induce_schema_continues_after_a_refusal() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        for c in ["gateway deploy alpha", "gateway deploy beta", "gateway deploy gamma"] {
+            engine.store("agent-r", ep("agent-r", c)).await.unwrap();
+        }
+        let first = induce_schema(&engine, "agent-r", 100, 3, 10).await.unwrap();
+        assert!(first.len() >= 2, "need two themes: {first:?}");
+        operator_fact(&engine, "agent-r", format!("schema:{}", first[0].key), "night_induced").await;
+        let second = induce_schema(&engine, "agent-r", 100, 3, 10).await.unwrap();
+        assert_eq!(second.len(), first.len() - 1);
+        assert!(second.iter().all(|s| s.key != first[0].key));
+    }
+
+    #[tokio::test]
+    async fn consolidate_recurrent_continues_after_a_refusal() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        for c in ["gateway deploy alpha", "gateway deploy beta", "gateway deploy gamma"] {
+            engine.store("agent-c", ep("agent-c", c)).await.unwrap();
+        }
+        let first = consolidate_recurrent(&engine, "agent-c", 100, 3, 10).await.unwrap();
+        let stored: Vec<_> = first.iter().filter(|r| r.stored_id.is_some()).collect();
+        assert!(stored.len() >= 2, "need two stored themes: {first:?}");
+        let blocked = stored[0].key.clone();
+        operator_fact(&engine, "agent-c", format!("consolidated:{blocked}"), "night_consolidated").await;
+        let second = consolidate_recurrent(&engine, "agent-c", 100, 3, 10).await.unwrap();
+        let b = second.iter().find(|r| r.key == blocked).unwrap();
+        assert!(b.stored_id.is_none());
+        assert!(second.iter().filter(|r| r.stored_id.is_some()).count() >= 1);
     }
 
     #[tokio::test]

@@ -171,52 +171,153 @@ pub(crate) fn autopilot_rule_to_json(r: &AutopilotRuleRow) -> Value {
     })
 }
 
-/// Extract a field value from YAML-style frontmatter (`---` delimited).
+/// Trigger events a NEW rule may subscribe to — every name the engine
+/// actually emits (`AutopilotEvent::event_name`). The dashboard mirrors this
+/// list by hand in `web/src/lib/autopilot-rules.ts` (`SERVER_TRIGGER_EVENTS`);
+/// `autopilot_validation_tests` pins the two together.
+pub(crate) const AUTOPILOT_CREATE_TRIGGER_EVENTS: &[&str] = &[
+    "task_created",
+    "task_updated",
+    "task_status_changed",
+    "activity_new",
+    "channel_message",
+    "agent_idle",
+    // Foresight signal (see `autopilot_engine::Event::RunAtRisk`) — was
+    // missing here, so rules could never subscribe to it (2026-07 MED).
+    "run_at_risk",
+    // OS-native perception events (`autopilot_engine::AutopilotEvent::OsFileEvent`
+    // / `OsFrontmostEvent`) — same class of gap as `run_at_risk` above: the
+    // engine has fired these since P1/P2-4 but a dashboard-authored rule
+    // could never subscribe to either (2026-07-23 P3-4 audit follow-up).
+    "os_file",
+    "os_frontmost",
+    // Resident sensing (WP2) — `autopilot_engine::AutopilotEvent::Tick`.
+    // Without this entry a dashboard-authored rule could never subscribe
+    // to a configured `[[tick.sources]]` feed at all.
+    "tick",
+    // OS security line P0 (C1) — `autopilot_engine::AutopilotEvent::SecurityEvent`.
+    // Same gap class as `run_at_risk`/`os_file` above: without this entry
+    // a dashboard-authored rule (or `rule_induction`'s
+    // `enable_induced_rule`) could never subscribe to a security event
+    // even though the engine has fired them since this change.
+    "security_event",
+    // G4 (2026-09 feature audit) — `autopilot_engine::AutopilotEvent::OdooEvent`.
+    // The Odoo bridge (poller + `/webhook/odoo`) had no bus variant at all
+    // before this; without the entry here a dashboard-authored rule could
+    // not subscribe to an ERP change.
+    "odoo_event",
+];
+
+/// Trigger events still accepted on stored rules (update / re-validation) but
+/// refused on create. `cron_tick` has an enum variant but no emitter anywhere —
+/// a rule on it never fires; scheduled work belongs to the cron scheduler.
+pub(crate) const AUTOPILOT_LEGACY_TRIGGER_EVENTS: &[&str] = &["cron_tick"];
+
 /// Validate a trigger_event string against the set understood by AutopilotEngine.
 /// Rejecting unknown values at write time avoids rules that are stored
 /// successfully but can never fire.
+///
+/// Accepts the legacy names in [`AUTOPILOT_LEGACY_TRIGGER_EVENTS`] so updating
+/// an already-stored rule keeps working; new rules go through
+/// [`validate_autopilot_trigger_event_for_create`].
 pub(crate) fn validate_autopilot_trigger_event(ev: &str) -> Result<(), String> {
-    const KNOWN: &[&str] = &[
-        "task_created",
-        "task_updated",
-        "task_status_changed",
-        "activity_new",
-        "channel_message",
-        "agent_idle",
-        "cron_tick",
-        // Foresight signal (see `autopilot_engine::Event::RunAtRisk`) — was
-        // missing here, so rules could never subscribe to it (2026-07 MED).
-        "run_at_risk",
-        // OS-native perception events (`autopilot_engine::AutopilotEvent::OsFileEvent`
-        // / `OsFrontmostEvent`) — same class of gap as `run_at_risk` above: the
-        // engine has fired these since P1/P2-4 but a dashboard-authored rule
-        // could never subscribe to either (2026-07-23 P3-4 audit follow-up).
-        "os_file",
-        "os_frontmost",
-        // Resident sensing (WP2) — `autopilot_engine::AutopilotEvent::Tick`.
-        // Without this entry a dashboard-authored rule could never subscribe
-        // to a configured `[[tick.sources]]` feed at all.
-        "tick",
-        // OS security line P0 (C1) — `autopilot_engine::AutopilotEvent::SecurityEvent`.
-        // Same gap class as `run_at_risk`/`os_file` above: without this entry
-        // a dashboard-authored rule (or `rule_induction`'s
-        // `enable_induced_rule`) could never subscribe to a security event
-        // even though the engine has fired them since this change.
-        "security_event",
-        // G4 (2026-09 feature audit) — `autopilot_engine::AutopilotEvent::OdooEvent`.
-        // The Odoo bridge (poller + `/webhook/odoo`) had no bus variant at all
-        // before this; without the entry here a dashboard-authored rule could
-        // not subscribe to an ERP change.
-        "odoo_event",
-    ];
-    if KNOWN.iter().any(|k| *k == ev) {
+    if AUTOPILOT_CREATE_TRIGGER_EVENTS.iter().any(|k| *k == ev)
+        || AUTOPILOT_LEGACY_TRIGGER_EVENTS.iter().any(|k| *k == ev)
+    {
         Ok(())
     } else {
         Err(format!(
             "unknown trigger_event '{ev}'; must be one of: {}",
-            KNOWN.join(", ")
+            AUTOPILOT_CREATE_TRIGGER_EVENTS.join(", ")
         ))
     }
+}
+
+/// [`validate_autopilot_trigger_event`] for a rule being created: the legacy
+/// `cron_tick` is refused because nothing emits it.
+pub(crate) fn validate_autopilot_trigger_event_for_create(ev: &str) -> Result<(), String> {
+    if AUTOPILOT_LEGACY_TRIGGER_EVENTS.iter().any(|k| *k == ev) {
+        return Err(format!(
+            "trigger_event '{ev}' is never emitted, so a rule on it would never fire; \
+             create a scheduled task instead (schedule_task / the scheduled tasks page)"
+        ));
+    }
+    validate_autopilot_trigger_event(ev)
+}
+
+/// [`validate_autopilot_trigger_event`] for `autopilot.update`: a legacy
+/// trigger (`cron_tick`) is accepted only when the stored rule already has it
+/// (an unchanged value round-tripped by the editor); changing any other rule
+/// TO it is refused with the create path's message, since it would never fire.
+pub(crate) fn validate_autopilot_trigger_event_for_update(
+    new_ev: &str,
+    stored_ev: &str,
+) -> Result<(), String> {
+    if AUTOPILOT_LEGACY_TRIGGER_EVENTS.iter().any(|k| *k == new_ev) && new_ev != stored_ev {
+        return validate_autopilot_trigger_event_for_create(new_ev);
+    }
+    validate_autopilot_trigger_event(new_ev)
+}
+
+/// Validate a rule's `conditions` tree at write time.
+///
+/// "No conditions" — `null`, `{}`, `{"all": []}` — is legal and means the rule
+/// fires on every event of its trigger (see `autopilot_engine::evaluate`).
+/// `{"any": []}` is legal but never matches. Everything else must be an
+/// `all`/`any` group whose value is an array of valid conditions, or a leaf
+/// with a non-empty string `field` and (optionally, default `eq`) a known `op`.
+/// A malformed leaf would evaluate false forever, so it is refused here.
+pub(crate) fn validate_autopilot_conditions(conditions: &Value) -> Result<(), String> {
+    validate_condition_node(conditions, "conditions", 0)
+}
+
+/// Nesting cap for condition groups — far beyond any hand-authored rule.
+const MAX_CONDITION_DEPTH: usize = 16;
+
+fn validate_condition_node(node: &Value, path: &str, depth: usize) -> Result<(), String> {
+    if depth > MAX_CONDITION_DEPTH {
+        return Err(format!("{path}: conditions nested deeper than {MAX_CONDITION_DEPTH} levels"));
+    }
+    if node.is_null() {
+        return Ok(());
+    }
+    let obj = node
+        .as_object()
+        .ok_or_else(|| format!("{path} must be an object (a condition or an all/any group)"))?;
+    if obj.is_empty() {
+        return Ok(());
+    }
+    for group in ["all", "any"] {
+        if let Some(v) = obj.get(group) {
+            let items = v
+                .as_array()
+                .ok_or_else(|| format!("{path}.{group} must be an array of conditions"))?;
+            for (i, item) in items.iter().enumerate() {
+                validate_condition_node(item, &format!("{path}.{group}[{i}]"), depth + 1)?;
+            }
+            return Ok(());
+        }
+    }
+    match obj.get("field") {
+        Some(Value::String(f)) if !f.trim().is_empty() => {}
+        _ => {
+            return Err(format!(
+                "{path}: a condition needs a non-empty \"field\" (or use an \"all\"/\"any\" group)"
+            ));
+        }
+    }
+    match obj.get("op") {
+        None => {}
+        Some(Value::String(op))
+            if crate::autopilot_engine::CONDITION_OPS.iter().any(|k| *k == op.as_str()) => {}
+        Some(other) => {
+            return Err(format!(
+                "{path}: unknown op {other}; must be one of: {}",
+                crate::autopilot_engine::CONDITION_OPS.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validate an autopilot action JSON object at rule-write time.

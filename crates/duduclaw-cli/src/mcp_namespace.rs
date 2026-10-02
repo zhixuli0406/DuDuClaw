@@ -189,4 +189,16 @@ mod tests {
         let result = resolve(&p);
         assert!(result.is_ok(), "valid client_id should succeed");
     }
+
+    /// Documents current behaviour (investigation, not a fix): every
+    /// gateway-spawned employee authenticates with the shared internal key,
+    /// so the namespace is the same for all of them and never the bare agent
+    /// id the gateway's own memory paths use.
+    #[test]
+    fn internal_key_namespace_is_shared_and_not_the_agent_id() {
+        let p = make_principal(duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID, false);
+        let ns = resolve(&p).unwrap();
+        assert_eq!(ns.write_namespace, "internal/gateway-internal");
+        assert_ne!(ns.write_namespace, "agnes");
+    }
 }

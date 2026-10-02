@@ -27,14 +27,15 @@
 //!   own profile.
 //! - **CJK-safe.** Every truncation goes through `truncate_chars`; no byte
 //!   slicing (project convention #1).
-//! - **Provenance recorded, not enforced** (v1.41 origin binding). Traits
-//!   captured here are stamped with the `channel` origin class and its `0.3`
-//!   trust, the same tier as every other distilled fact, so a distilled trait
-//!   cannot later claim the provenance of a deliberate `user_profile` write.
-//!   This is **bookkeeping for downstream consumers — it is not a gate**: the
-//!   trait is still written, still queried by `profile_traits`, and still
-//!   injected into the prompt. Content safety comes from the write-side
-//!   injection scan below, not from the trust number.
+//! - **Provenance** (v1.41 origin binding, revised 2026-10 M2). Every trait
+//!   captured here is about the SPEAKER'S OWN profile (`subject =
+//!   user:<sender id>` — the extractor only accepts first-person markers and
+//!   the write is always keyed on the speaker), so it is stamped with the
+//!   `user_profile` origin class (ceiling `0.6`) — the same class as the AI
+//!   employee's own `user_profile_record`. The two can therefore correct each
+//!   other without review, while neither can replace a value an operator set
+//!   or approved (`1.0`), which still goes to review. Content safety comes
+//!   from the write-side injection scan below, not from the trust number.
 //! - **Write-side content guard.** The three free-text predicates
 //!   (`preferred_name` / `prefers` / `dislikes`) carry user-authored text
 //!   straight into every future system prompt, so each value is run through the
@@ -66,14 +67,18 @@ pub const PREDICATE_PREFERS: &str = "prefers";
 /// Bare negative preference (same `user_code` convention).
 pub const PREDICATE_DISLIKES: &str = "dislikes";
 
-/// v1.41 origin binding: these traits come from conversation distillation, the
-/// lowest-trust tier — identical to `wiki_ingest::DISTILL_ORIGIN`.
-pub const PROFILE_DISTILL_ORIGIN: &str = duduclaw_memory::origin::CHANNEL_DISTILL.name;
+/// Origin of distilled traits: the speaker's own statements about themselves
+/// are a profile record (`user_profile`, ceiling 0.6), the same class as the
+/// AI employee's `user_profile_record` — not the generic `channel` class
+/// (0.3) of distilled facts about anything else (M2, 2026-10). Every write
+/// here targets `user_subject(<speaker id>)`; nothing in this module writes
+/// another person's subject.
+pub const PROFILE_DISTILL_ORIGIN: &str = duduclaw_memory::origin::USER_PROFILE.name;
 
 /// Declared trust equals the class ceiling exactly; `store_temporal` would
 /// clamp anything higher anyway, so being explicit documents intent (same
 /// pattern as `footprint_distill::FOOTPRINT_ORIGIN_TRUST`).
-pub const PROFILE_DISTILL_ORIGIN_TRUST: f64 = duduclaw_memory::origin::CHANNEL_DISTILL.ceiling;
+pub const PROFILE_DISTILL_ORIGIN_TRUST: f64 = duduclaw_memory::origin::USER_PROFILE.ceiling;
 
 /// At most this many traits are captured from one turn — a wall of text must
 /// not be able to rewrite the whole profile in a single message.
@@ -551,9 +556,12 @@ fn push_unique(out: &mut Vec<ProfileTraitCandidate>, predicate: &str, value: &st
 // ---------------------------------------------------------------------------
 
 /// User ids that carry no identity and must never own a profile.
-fn is_anonymous(user_id: &str) -> bool {
+pub fn is_anonymous(user_id: &str) -> bool {
     let u = user_id.trim();
-    u.is_empty() || u == "anonymous" || u == "unknown"
+    // R-L6: `"system"` is the pseudo-user of cron / dispatch prompts — an
+    // operator- or system-authored prompt is not a person's statement about
+    // themselves, so it never feeds a profile.
+    u.is_empty() || u == "anonymous" || u == "unknown" || u == "system"
 }
 
 /// Predicates whose value is free user text and therefore has to clear the
@@ -591,13 +599,70 @@ fn injection_rules_hit(value: &str) -> Option<Vec<String>> {
 /// Each free-text value is scanned first; a hit drops **that trait only** — the
 /// rest of the batch still lands, so one poisoned clause cannot suppress the
 /// user's legitimate preferences.
+#[cfg(test)]
 pub(crate) async fn store_profile_traits(
     engine: &SqliteMemoryEngine,
     agent_id: &str,
     user_id: &str,
     traits: &[ProfileTraitCandidate],
 ) -> usize {
+    store_profile_traits_reported(engine, agent_id, user_id, traits)
+        .await
+        .0
+}
+
+/// A distilled trait the memory engine's supersession trust guard refused (the
+/// user's current value came from a more trusted source, e.g. a value an
+/// operator set or approved), held inert for human review.
+#[derive(Debug)]
+pub(crate) struct HeldTrait {
+    pub(crate) refusal: duduclaw_memory::SupersessionRefusal,
+    pub(crate) held_id: String,
+    pub(crate) value: String,
+    /// `false` when the identical trait was already held and pending review.
+    pub(crate) newly_held: bool,
+    /// The user's current value for this predicate (the protected fact).
+    pub(crate) existing_value: String,
+}
+
+/// Plain zh-TW name of what a profile predicate describes, for review cards
+/// (internal predicate tokens never reach the user).
+pub(crate) fn predicate_label_zh(predicate: &str) -> &'static str {
+    match predicate {
+        PREDICATE_PREFERRED_NAME => "使用者希望的稱呼",
+        PREDICATE_REPLY_STYLE => "使用者偏好的回覆方式",
+        PREDICATE_REPLY_LANGUAGE => "使用者偏好的回覆語言",
+        PREDICATE_PREFERS => "使用者的喜好",
+        PREDICATE_DISLIKES => "使用者不喜歡的事",
+        _ => "使用者的個人偏好",
+    }
+}
+
+/// [`store_profile_traits`] plus the traits held for review.
+#[cfg(test)]
+pub(crate) async fn store_profile_traits_reported(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    user_id: &str,
+    traits: &[ProfileTraitCandidate],
+) -> (usize, Vec<HeldTrait>) {
+    let (written, held, _) = store_profile_traits_capped(engine, agent_id, user_id, traits, None).await;
+    (written, held)
+}
+
+/// [`store_profile_traits_reported`] with the daily review cap (M1) when
+/// `home_dir` is given: a refused trait beyond the cap is not held and comes
+/// back in the third element (the caller audits it). `None` = no cap.
+pub(crate) async fn store_profile_traits_capped(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    user_id: &str,
+    traits: &[ProfileTraitCandidate],
+    home_dir: Option<&Path>,
+) -> (usize, Vec<HeldTrait>, Vec<duduclaw_memory::SupersessionRefusal>) {
     let mut written = 0usize;
+    let mut held: Vec<HeldTrait> = Vec::new();
+    let mut capped: Vec<duduclaw_memory::SupersessionRefusal> = Vec::new();
     for t in traits {
         if FREE_TEXT_PREDICATES.contains(&t.predicate.as_str()) {
             if let Some(rules) = injection_rules_hit(&t.value) {
@@ -610,7 +675,7 @@ pub(crate) async fn store_profile_traits(
                 continue;
             }
         }
-        match duduclaw_memory::user_profile::record_trait_with_origin(
+        match duduclaw_memory::user_profile::record_trait_outcome(
             engine,
             agent_id,
             user_id,
@@ -621,7 +686,69 @@ pub(crate) async fn store_profile_traits(
         )
         .await
         {
-            Ok(_) => written += 1,
+            Ok(duduclaw_memory::TemporalWriteOutcome::Stored(_)) => written += 1,
+            Ok(duduclaw_memory::TemporalWriteOutcome::Refused(refusal)) => {
+                // Idempotent: the same trait repeated while pending review is
+                // not held twice. A NEW held row consumes the daily cap.
+                let content = format!("{}: {}", t.predicate, t.value);
+                if !crate::wiki_ingest::fits_review_card(&content) {
+                    // R-M1: a card must show the whole statement.
+                    if let Some(h) = home_dir {
+                        crate::wiki_ingest::audit_supersession_refused_not_held(
+                            h,
+                            agent_id,
+                            "profile_distill",
+                            &refusal,
+                            crate::wiki_ingest::NotHeld::TooLong,
+                        );
+                    }
+                    continue;
+                }
+                let mut admitter = home_dir.map(|h| crate::wiki_ingest::held_claim_admitter(h, agent_id));
+                let mut admit = || admitter.as_mut().is_none_or(|a| a.admit());
+                let outcome = duduclaw_memory::user_profile::hold_trait_gated(
+                    engine,
+                    agent_id,
+                    user_id,
+                    &t.predicate,
+                    &t.value,
+                    PROFILE_DISTILL_ORIGIN,
+                    PROFILE_DISTILL_ORIGIN_TRUST,
+                    &mut admit,
+                )
+                .await;
+                if admitter.as_ref().is_some_and(|a| a.first_cap_hit()) {
+                    if let Some(h) = home_dir {
+                        crate::wiki_ingest::emit_review_cap_reached(h, agent_id).await;
+                    }
+                }
+                match outcome {
+                    Ok(None) => capped.push(refusal),
+                    Ok(Some(h)) => {
+                        // Trait rows store `"{predicate}: {value}"`; show the value.
+                        let stored =
+                            crate::wiki_ingest::existing_fact_content(engine, agent_id, &refusal)
+                                .await;
+                        let prefix = format!("{}: ", t.predicate);
+                        let existing_value = stored
+                            .strip_prefix(prefix.as_str())
+                            .map(str::to_string)
+                            .unwrap_or(stored);
+                        held.push(HeldTrait {
+                            refusal,
+                            held_id: h.id,
+                            value: t.value.clone(),
+                            newly_held: h.newly_held,
+                            existing_value,
+                        })
+                    }
+                    Err(e) => warn!(
+                        agent = agent_id,
+                        predicate = %t.predicate,
+                        "profile distill: refused trait could not be held for review: {e}"
+                    ),
+                }
+            }
             Err(e) => warn!(
                 agent = agent_id,
                 predicate = %t.predicate,
@@ -629,7 +756,7 @@ pub(crate) async fn store_profile_traits(
             ),
         }
     }
-    written
+    (written, held, capped)
 }
 
 /// First stage of the distillation pipeline: capture the user's self-stated
@@ -639,8 +766,8 @@ pub(crate) async fn store_profile_traits(
 /// Runs *before* the ingest-tier gate on purpose: "叫我老李就好" is far shorter
 /// than the tier floor yet is exactly the kind of statement that must stick.
 ///
-/// `home_dir` is only used to raise the WP6 `memory.changed` dashboard signal
-/// when a trait actually lands.
+/// `home_dir` raises the WP6 `memory.changed` dashboard signal when a trait
+/// actually lands, and holds the per-agent daily review cap (M1).
 pub async fn run_profile_distill(
     user_text: &str,
     agent_id: &str,
@@ -675,9 +802,71 @@ pub async fn run_profile_distill(
             .map_err(|e| format!("open memory engine: {e}"))?;
         engine.set_memory_quota_gb(quota_gb);
         let rt = tokio::runtime::Handle::current();
-        Ok::<usize, String>(rt.block_on(store_profile_traits(&engine, &agent, &user, &traits)))
+        Ok::<(usize, Vec<HeldTrait>, Vec<duduclaw_memory::SupersessionRefusal>), String>(
+            rt.block_on(store_profile_traits_capped(
+                &engine,
+                &agent,
+                &user,
+                &traits,
+                Some(home.as_path()),
+            )),
+        )
     })
     .await;
+
+    // Traits refused by the supersession trust guard: audit each and send
+    // them to the same knowledge-review approval as conversation distillation.
+    let result = match result {
+        Ok(Ok((n, held, capped))) => {
+            for refusal in &capped {
+                crate::wiki_ingest::audit_supersession_refused_capped(
+                    home_dir,
+                    agent_id,
+                    "profile_distill",
+                    refusal,
+                );
+            }
+            if !held.is_empty() {
+                let outcomes: Vec<crate::wiki_ingest::QuarantineOutcome> = held
+                    .iter()
+                    .map(|h| {
+                        crate::wiki_ingest::audit_supersession_refused(
+                            home_dir,
+                            agent_id,
+                            "profile_distill",
+                            &h.refusal,
+                            Some(&h.held_id),
+                            !h.newly_held,
+                        );
+                        crate::wiki_ingest::QuarantineOutcome {
+                            origin: PROFILE_DISTILL_ORIGIN.to_string(),
+                            subject: h.refusal.subject.clone(),
+                            reason: crate::wiki_ingest::trust_held_reason(&h.refusal),
+                            snippet: duduclaw_core::truncate_bytes(&h.value, 500).to_string(),
+                            ids: vec![h.held_id.clone()],
+                            disposition: crate::wiki_ingest::DISPOSITION_TRUST_HELD,
+                            held: Some(crate::wiki_ingest::HeldClaimDetail {
+                                subject_label: predicate_label_zh(&h.refusal.predicate).to_string(),
+                                existing_content: h.existing_value.clone(),
+                                newly_held: h.newly_held,
+                            }),
+                        }
+                    })
+                    .collect();
+                let origin = crate::wiki_ingest::ingest_origin();
+                crate::wiki_ingest::dispatch_quarantine_side_effects(
+                    agent_id,
+                    home_dir,
+                    memory_db,
+                    &outcomes,
+                    origin.as_ref(),
+                )
+                .await;
+            }
+            Ok(Ok(n))
+        }
+        other => other.map(|r| r.map(|(n, _, _)| n)),
+    };
 
     match result {
         Ok(Ok(n)) if n > 0 => {
@@ -962,6 +1151,114 @@ mod tests {
         );
     }
 
+    /// Seed an operator-approved profile value (what a review approval writes).
+    async fn seed_operator_value(engine: &SqliteMemoryEngine, agent: &str, user: &str, predicate: &str, value: &str) {
+        let out = duduclaw_memory::user_profile::record_trait_outcome(
+            engine,
+            agent,
+            user,
+            predicate,
+            value,
+            duduclaw_memory::origin::OPERATOR.name,
+            1.0,
+        )
+        .await
+        .unwrap();
+        assert!(out.stored_id().is_some());
+    }
+
+    /// A distilled trait cannot replace a value an operator set or approved
+    /// (ceiling 1.0): it is held for review with the refusal attached, and
+    /// the approved value stays current.
+    #[tokio::test]
+    async fn distilled_trait_is_held_when_a_more_trusted_value_exists() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        seed_operator_value(&engine, "a1", "u1", PREDICATE_PREFERRED_NAME, "李總").await;
+        let traits = extract_profile_traits("以後請稱呼我老李。");
+        let (written, held) = store_profile_traits_reported(&engine, "a1", "u1", &traits).await;
+        assert_eq!(written, 0);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].value, "老李");
+        assert_eq!(held[0].refusal.write_origin, PROFILE_DISTILL_ORIGIN);
+        assert_eq!(held[0].refusal.existing_origin.as_deref(), Some("operator"));
+        assert_eq!(
+            engine.is_quarantined("a1", &held[0].held_id).await.unwrap(),
+            Some(true)
+        );
+        let stored = duduclaw_memory::user_profile::profile_traits(&engine, "a1", "u1")
+            .await
+            .unwrap();
+        let names: Vec<_> = stored
+            .iter()
+            .filter(|t| t.predicate == PREDICATE_PREFERRED_NAME)
+            .map(|t| t.value.as_str())
+            .collect();
+        assert_eq!(names, vec!["李總"]);
+        // The review card shows the current value, not the stored row form.
+        assert_eq!(held[0].existing_value, "李總");
+        assert!(held[0].newly_held);
+
+        // The same trait repeated while pending is not held again; a
+        // different value for the same predicate is its own claim.
+        let (_, again) = store_profile_traits_reported(&engine, "a1", "u1", &traits).await;
+        assert_eq!(again.len(), 1);
+        assert!(!again[0].newly_held);
+        assert_eq!(again[0].held_id, held[0].held_id);
+        let other = extract_profile_traits("以後請稱呼我阿李。");
+        let (_, other) = store_profile_traits_reported(&engine, "a1", "u1", &other).await;
+        assert_eq!(other.len(), 1);
+        assert!(other[0].newly_held);
+        assert_ne!(other[0].held_id, held[0].held_id);
+    }
+
+    /// M2: the AI employee's record of a user (`user_profile_record`, even
+    /// when it asks for 1.0) and the user's own later statement correct each
+    /// other without review — in both directions.
+    #[tokio::test]
+    async fn agent_record_and_user_statement_correct_each_other() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        // The agent recorded a (wrong) name at the trust it asked for.
+        duduclaw_memory::record_trait(&engine, "a1", "u1", PREDICATE_PREFERRED_NAME, "李總", 1.0)
+            .await
+            .unwrap();
+        // The user corrects it: written directly, nothing held.
+        let traits = extract_profile_traits("以後請稱呼我老李。");
+        let (written, held) = store_profile_traits_reported(&engine, "a1", "u1", &traits).await;
+        assert_eq!((written, held.len()), (1, 0));
+        let value = |e: Vec<duduclaw_memory::ProfileTrait>| {
+            e.into_iter()
+                .find(|t| t.predicate == PREDICATE_PREFERRED_NAME)
+                .map(|t| t.value)
+        };
+        assert_eq!(
+            value(duduclaw_memory::user_profile::profile_traits(&engine, "a1", "u1").await.unwrap()),
+            Some("老李".to_string())
+        );
+        // And the agent can record a later correction over the user's value.
+        duduclaw_memory::record_trait(&engine, "a1", "u1", PREDICATE_PREFERRED_NAME, "老李哥", 1.0)
+            .await
+            .unwrap();
+        assert_eq!(
+            value(duduclaw_memory::user_profile::profile_traits(&engine, "a1", "u1").await.unwrap()),
+            Some("老李哥".to_string())
+        );
+    }
+
+    #[test]
+    fn predicate_labels_are_plain_zh() {
+        for p in [
+            PREDICATE_PREFERRED_NAME,
+            PREDICATE_REPLY_STYLE,
+            PREDICATE_REPLY_LANGUAGE,
+            PREDICATE_PREFERS,
+            PREDICATE_DISLIKES,
+            "anything_else",
+        ] {
+            let l = predicate_label_zh(p);
+            assert!(!l.is_empty() && !l.is_ascii() && !l.contains('_'), "{p} → {l}");
+        }
+    }
+
     /// M1: a value that trips the shared injection rule engine is dropped at
     /// the write boundary, and only that value — the rest of the batch lands.
     #[tokio::test]
@@ -1015,21 +1312,41 @@ mod tests {
         assert!(!is_anonymous("u123"));
     }
 
-    /// v1.41 origin binding: distilled traits declare the `channel` class, so
-    /// `store_temporal` clamps them to that ceiling — a distilled trait cannot
-    /// claim the trust of a deliberate profile write.
+    /// R-L6: cron / dispatch prompts run with the pseudo-user "system"; they
+    /// are not a person's statements and never write a profile.
+    #[tokio::test]
+    async fn system_prompts_never_write_a_profile() {
+        assert!(is_anonymous("system"));
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("memory.db");
+        run_profile_distill("以後請稱呼我老李。", "a1", "system", &db, home.path()).await;
+        run_profile_distill("以後請稱呼我老李。", "a1", "u1", &db, home.path()).await;
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        assert!(duduclaw_memory::user_profile::profile_block(&engine, "a1", "system")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(duduclaw_memory::user_profile::profile_block(&engine, "a1", "u1")
+            .await
+            .unwrap()
+            .is_some(), "a real speaker still gets a profile");
+    }
+
+    /// M2 origin binding: distilled self-statements declare the
+    /// `user_profile` class (the AI-record ceiling 0.6) — equal to the AI
+    /// employee's own profile record, below an operator-approved value.
     #[test]
-    fn distilled_traits_use_the_lowest_trust_origin() {
-        assert_eq!(PROFILE_DISTILL_ORIGIN, "channel");
-        assert!((PROFILE_DISTILL_ORIGIN_TRUST - 0.3).abs() < f64::EPSILON);
+    fn distilled_traits_use_the_profile_record_origin() {
+        assert_eq!(PROFILE_DISTILL_ORIGIN, "user_profile");
+        assert!((PROFILE_DISTILL_ORIGIN_TRUST - 0.6).abs() < f64::EPSILON);
         assert!(
             PROFILE_DISTILL_ORIGIN_TRUST
                 <= duduclaw_memory::origin::trust_ceiling(PROFILE_DISTILL_ORIGIN),
             "declared trust must not exceed its own class ceiling"
         );
         assert!(
-            PROFILE_DISTILL_ORIGIN_TRUST < duduclaw_memory::origin::trust_ceiling("user_profile"),
-            "distillation must rank below a deliberate profile write"
+            PROFILE_DISTILL_ORIGIN_TRUST < duduclaw_memory::origin::trust_ceiling("operator"),
+            "distillation must rank below an operator-approved value"
         );
     }
 }

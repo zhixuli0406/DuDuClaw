@@ -244,7 +244,7 @@ fn inference_root_and_passthrough_sections_written() {
     let mut t = toml::Table::new();
     let params = json!({
         "enabled": true,
-        "backend": "llama_cpp",
+        "backend": "openai_compat",
         "max_memory_mb": 8192,
         "llamafile": { "auto_start": true, "port": 8080 },
         "embedding": { "enabled": false, "model": "bge-small-zh" },
@@ -255,6 +255,52 @@ fn inference_root_and_passthrough_sections_written() {
     assert_eq!(t.get("max_memory_mb").unwrap().as_integer(), Some(8192));
     let lf = t.get("llamafile").unwrap().as_table().unwrap();
     assert_eq!(lf.get("port").unwrap().as_integer(), Some(8080));
+}
+
+#[test]
+fn inference_backend_refuses_removed_values_on_write() {
+    for removed in ["llama_cpp", "mistral_rs", "mlx", "whatever"] {
+        let mut t = toml::Table::new();
+        t.insert("enabled".into(), toml::Value::Boolean(false));
+        let params = json!({ "backend": removed, "enabled": true });
+        let err = apply_inference_to_table(&mut t, &params).unwrap_err();
+        assert!(err.contains("openai_compat"), "message must name the supported value: {err}");
+        // Refused before anything was written.
+        assert_eq!(t.get("enabled").unwrap().as_bool(), Some(false));
+        assert!(t.get("backend").is_none());
+    }
+    let mut t = toml::Table::new();
+    assert!(apply_inference_to_table(&mut t, &json!({ "backend": 3 })).is_err());
+}
+
+#[test]
+fn inference_backend_supported_empty_and_stored_echo() {
+    // Supported value is written.
+    let mut t = toml::Table::new();
+    let changes = apply_inference_to_table(&mut t, &json!({ "backend": "openai_compat" })).unwrap();
+    assert_eq!(t.get("backend").unwrap().as_str(), Some("openai_compat"));
+    assert!(changes.iter().any(|c| c.contains("inference.backend")));
+
+    // A stored removed value still loads and can be echoed back unchanged
+    // (the dashboard re-sends the loaded value on every save)...
+    let mut t: toml::Table = toml::from_str("backend = \"llama_cpp\"\nenabled = false\n").unwrap();
+    let changes =
+        apply_inference_to_table(&mut t, &json!({ "backend": "llama_cpp", "enabled": true })).unwrap();
+    assert_eq!(t.get("backend").unwrap().as_str(), Some("llama_cpp"));
+    assert_eq!(t.get("enabled").unwrap().as_bool(), Some(true));
+    assert!(!changes.iter().any(|c| c.contains("inference.backend")));
+    // ...but not switched to the other removed value.
+    assert!(apply_inference_to_table(&mut t, &json!({ "backend": "mistral_rs" })).is_err());
+    // ...and the user can move off it, to the supported value or to auto.
+    apply_inference_to_table(&mut t, &json!({ "backend": "openai_compat" })).unwrap();
+    assert_eq!(t.get("backend").unwrap().as_str(), Some("openai_compat"));
+    let changes = apply_inference_to_table(&mut t, &json!({ "backend": "" })).unwrap();
+    assert!(t.get("backend").is_none(), "empty clears the key");
+    assert!(changes.iter().any(|c| c.contains("inference.backend")));
+    // Absent leaves it alone.
+    let mut t: toml::Table = toml::from_str("backend = \"openai_compat\"").unwrap();
+    apply_inference_to_table(&mut t, &json!({ "enabled": true })).unwrap();
+    assert_eq!(t.get("backend").unwrap().as_str(), Some("openai_compat"));
 }
 
 #[test]

@@ -74,6 +74,346 @@ const QUARANTINE_APPROVAL_TTL_SECONDS: i64 = 24 * 3600;
 /// (CJK-safe via `truncate_bytes`, never raw byte slicing).
 const QUARANTINE_SUMMARY_MAX_BYTES: usize = 500;
 
+/// [`QuarantineOutcome::disposition`] for a claim the memory engine's
+/// supersession trust guard refused (it would have replaced a more trusted
+/// current fact). The claim is held inert via
+/// `SqliteMemoryEngine::hold_refused_claim` and goes to the same
+/// `knowledge_quarantine` approval as a burst, with `promote_on_approve` set:
+/// approving re-writes it with the reviewer's (operator) authority.
+pub(crate) const DISPOSITION_TRUST_HELD: &str = "trust_held";
+
+/// Audit event written for every supersession-guard refusal on a gateway
+/// auto-write path.
+pub(crate) const AUDIT_SUPERSESSION_REFUSED: &str = "memory_supersession_refused";
+
+/// Record a supersession-guard refusal in the security audit log. Carries the
+/// triple's subject/predicate, both origins and trusts and the row ids — no
+/// claim text (the snippet only travels in the approval summary, like a
+/// burst quarantine).
+pub(crate) fn audit_supersession_refused(
+    home_dir: &Path,
+    agent_id: &str,
+    path: &str,
+    refusal: &duduclaw_memory::SupersessionRefusal,
+    held_id: Option<&str>,
+    repeat_of_pending: bool,
+) {
+    audit_refusal_event(home_dir, agent_id, path, refusal, held_id, repeat_of_pending, None);
+}
+
+/// Why a refused claim was NOT held for review (audited only, no card).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotHeld {
+    /// The agent's daily review cap was reached.
+    DailyCap,
+    /// The statement is longer than a card can show in full
+    /// ([`MAX_FACT_CONTENT_CHARS`]).
+    TooLong,
+}
+
+impl NotHeld {
+    fn as_str(self) -> &'static str {
+        match self {
+            NotHeld::DailyCap => "daily_cap",
+            NotHeld::TooLong => "too_long",
+        }
+    }
+}
+
+/// A refusal beyond the per-agent daily review cap
+/// ([`crate::auto_wiki_page::MAX_HELD_CLAIMS_PER_DAY`]): audited only — no
+/// held row and no review card — with `review_cap_hit = true`.
+pub(crate) fn audit_supersession_refused_capped(
+    home_dir: &Path,
+    agent_id: &str,
+    path: &str,
+    refusal: &duduclaw_memory::SupersessionRefusal,
+) {
+    audit_refusal_event(home_dir, agent_id, path, refusal, None, false, Some(NotHeld::DailyCap));
+}
+
+/// A refusal not held for another reason (see [`NotHeld`]): audited only.
+pub(crate) fn audit_supersession_refused_not_held(
+    home_dir: &Path,
+    agent_id: &str,
+    path: &str,
+    refusal: &duduclaw_memory::SupersessionRefusal,
+    why: NotHeld,
+) {
+    audit_refusal_event(home_dir, agent_id, path, refusal, None, false, Some(why));
+}
+
+fn audit_refusal_event(
+    home_dir: &Path,
+    agent_id: &str,
+    path: &str,
+    refusal: &duduclaw_memory::SupersessionRefusal,
+    held_id: Option<&str>,
+    repeat_of_pending: bool,
+    not_held: Option<NotHeld>,
+) {
+    crate::security_autopilot::audit_and_emit(
+        home_dir,
+        &duduclaw_security::audit::AuditEvent::new(
+            AUDIT_SUPERSESSION_REFUSED,
+            agent_id,
+            duduclaw_security::audit::Severity::Warning,
+            serde_json::json!({
+                "path": path,
+                // Chat-derived subject/predicate: capped, never interpreted.
+                "subject": truncate_chars(&refusal.subject, AUDIT_TRIPLE_PART_MAX_CHARS),
+                "predicate": truncate_chars(&refusal.predicate, AUDIT_TRIPLE_PART_MAX_CHARS),
+                "write_origin": refusal.write_origin,
+                "write_trust": refusal.write_trust,
+                "existing_origin": refusal.existing_origin,
+                "existing_trust": refusal.existing_trust,
+                "existing_id": refusal.existing_id,
+                "held_id": held_id,
+                // The identical claim was already held and pending review: no
+                // new held row (and no new approval card while that one is
+                // still open). Counted here so repeats stay visible.
+                "repeat_of_pending": repeat_of_pending,
+                // The agent's daily review cap was reached: nothing was held
+                // and no card was filed for this refusal.
+                "review_cap_hit": not_held == Some(NotHeld::DailyCap),
+                "not_held_reason": not_held.map(NotHeld::as_str),
+                "daily_review_cap": crate::auto_wiki_page::MAX_HELD_CLAIMS_PER_DAY,
+            }),
+        ),
+    );
+}
+
+/// The not-held audit row for a held claim known only by its stored row (a
+/// burst row converted at release, whose refusal numbers are not at hand).
+fn audit_not_held_view(
+    home_dir: &Path,
+    agent_id: &str,
+    view: &duduclaw_memory::HeldClaimView,
+    write_origin: &str,
+    why: NotHeld,
+) {
+    crate::security_autopilot::audit_and_emit(
+        home_dir,
+        &duduclaw_security::audit::AuditEvent::new(
+            AUDIT_SUPERSESSION_REFUSED,
+            agent_id,
+            duduclaw_security::audit::Severity::Warning,
+            serde_json::json!({
+                "path": "quarantine_release",
+                "subject": truncate_chars(&view.subject, AUDIT_TRIPLE_PART_MAX_CHARS),
+                "predicate": truncate_chars(&view.predicate, AUDIT_TRIPLE_PART_MAX_CHARS),
+                "write_origin": write_origin,
+                "existing_id": view.conflicts_with,
+                "held_id": view.id,
+                "review_cap_hit": why == NotHeld::DailyCap,
+                "not_held_reason": why.as_str(),
+                "daily_review_cap": crate::auto_wiki_page::MAX_HELD_CLAIMS_PER_DAY,
+            }),
+        ),
+    );
+}
+
+/// Cap on a triple part echoed into an audit row.
+const AUDIT_TRIPLE_PART_MAX_CHARS: usize = 200;
+
+/// Admission gate for a NEW held claim (M1): one unit of the agent's daily
+/// review quota (`auto_wiki_page::QuotaKind::HeldClaim`, cross-process,
+/// shared with the auto-wiki counters' file). An agent id that is not a valid
+/// directory name is refused (fail closed — it would address a path outside
+/// the agent tree). A repeat of a claim already pending never calls this.
+pub(crate) fn held_claim_admitter(home_dir: &Path, agent_id: &str) -> HeldClaimAdmitter {
+    HeldClaimAdmitter {
+        home: home_dir.to_path_buf(),
+        agent: agent_id.to_string(),
+        first_cap_hit: false,
+    }
+}
+
+/// See [`held_claim_admitter`]. Records whether a refusal was the first over
+/// the cap today ([`Self::first_cap_hit`]) so the caller raises one Activity
+/// Feed signal (R-M6).
+pub(crate) struct HeldClaimAdmitter {
+    home: PathBuf,
+    agent: String,
+    first_cap_hit: bool,
+}
+
+impl HeldClaimAdmitter {
+    pub(crate) fn admit(&mut self) -> bool {
+        if !duduclaw_core::is_valid_agent_id(&self.agent) {
+            return false;
+        }
+        match crate::auto_wiki_page::try_consume_quota_detail(
+            &self.home,
+            &self.agent,
+            crate::auto_wiki_page::QuotaKind::HeldClaim,
+        ) {
+            crate::auto_wiki_page::QuotaVerdict::Allowed => true,
+            crate::auto_wiki_page::QuotaVerdict::Denied { first_today } => {
+                self.first_cap_hit |= first_today;
+                false
+            }
+        }
+    }
+
+    /// `true` once a refusal made by this admitter was the first over the
+    /// daily cap for this agent (UTC day).
+    pub(crate) fn first_cap_hit(&self) -> bool {
+        self.first_cap_hit
+    }
+}
+
+/// Activity Feed event raised once per agent per UTC day when the daily
+/// review cap is first reached (R-M6).
+pub(crate) const ACTIVITY_REVIEW_CAP_REACHED: &str = "knowledge_review_cap_reached";
+
+/// Raise [`ACTIVITY_REVIEW_CAP_REACHED`] (best-effort; the audit row exists
+/// regardless).
+pub(crate) async fn emit_review_cap_reached(home_dir: &Path, agent_id: &str) {
+    let Ok(store) = crate::task_store::TaskStore::open(home_dir) else { return };
+    let row = crate::task_store::ActivityRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type: ACTIVITY_REVIEW_CAP_REACHED.to_string(),
+        agent_id: agent_id.to_string(),
+        task_id: None,
+        summary: format!(
+            "今天待審的知識已達上限（{} 則），今天之後與現有內容衝突的新說法不會排入審核，只留稽核紀錄。",
+            crate::auto_wiki_page::MAX_HELD_CLAIMS_PER_DAY
+        ),
+        timestamp: Utc::now().to_rfc3339(),
+        metadata: Some(
+            serde_json::json!({ "daily_review_cap": crate::auto_wiki_page::MAX_HELD_CLAIMS_PER_DAY })
+                .to_string(),
+        ),
+    };
+    if let Err(e) = store.append_activity(&row).await {
+        warn!(agent = agent_id, "review-cap activity append failed: {e}");
+    }
+}
+
+/// True when a held claim's statement fits a card in full (R-M1). Facts are
+/// cut to [`MAX_FACT_CONTENT_CHARS`] at ingestion; anything longer is not held.
+pub(crate) fn fits_review_card(content: &str) -> bool {
+    content.chars().count() <= MAX_FACT_CONTENT_CHARS
+}
+
+/// The machine-readable reason carried by a [`DISPOSITION_TRUST_HELD`] outcome
+/// (audit event, events.db row and approval payload — never the card text).
+pub(crate) fn trust_held_reason(refusal: &duduclaw_memory::SupersessionRefusal) -> String {
+    format!(
+        "trust: {} {:.2} < {} {:.2}",
+        refusal.write_origin,
+        refusal.write_trust,
+        refusal.existing_origin.as_deref().unwrap_or("legacy"),
+        refusal.existing_trust,
+    )
+}
+
+/// `approval_notify` pushes an approval summary to chat channels cut at 300
+/// characters; a trust-held card is kept within that so the trailing
+/// [`SNIPPET_MARKER`] + statement is never cut off.
+pub(crate) const TRUST_HELD_SUMMARY_MAX_CHARS: usize = 300;
+/// Per-part caps inside a trust-held summary (chars, CJK-safe). Fixed wording
+/// is ~110 chars, so the three parts plus ellipses stay under the cap.
+const HELD_CARD_SUBJECT_MAX_CHARS: usize = 30;
+const HELD_CARD_EXISTING_MAX_CHARS: usize = 70;
+const HELD_CARD_STATEMENT_MAX_CHARS: usize = 80;
+
+/// The dashboard (`web/src/components/inbox/knowledge-quarantine.ts`) recovers
+/// the new statement by cutting the summary at the LAST occurrence of this
+/// marker, so the statement is always rendered last and the marker is removed
+/// from every untrusted part.
+pub(crate) const SNIPPET_MARKER: &str = "內容摘要：";
+
+/// Extra detail a [`DISPOSITION_TRUST_HELD`] outcome carries for its review
+/// card. Text fields are untrusted data (a chat-derived claim and a stored
+/// fact) and are only ever rendered through [`held_card_text`].
+#[derive(Debug, Clone)]
+pub(crate) struct HeldClaimDetail {
+    /// Plain zh-TW phrase for what the fact is about (the card's subject).
+    pub(crate) subject_label: String,
+    /// The protected fact's current value (display text; the card builder
+    /// fills it from the stored row).
+    pub(crate) existing_content: String,
+    /// `false` when an identical claim was already held and pending: no new
+    /// held row was written and `ids` is the existing one.
+    pub(crate) newly_held: bool,
+}
+
+/// Render untrusted text for a review card: every whitespace / control run
+/// becomes one space (so it cannot forge a new line in a plain-text channel
+/// message), the [`SNIPPET_MARKER`] is removed (so it cannot move where the
+/// dashboard cuts), and the result is cut to `max_chars` with an ellipsis.
+pub(crate) fn held_card_text(raw: &str, max_chars: usize) -> String {
+    let mut flat = String::with_capacity(raw.len().min(4096));
+    let mut gap = false;
+    for c in raw.replace(SNIPPET_MARKER, " ").chars() {
+        if c.is_whitespace() || c.is_control() {
+            gap = true;
+            continue;
+        }
+        if gap && !flat.is_empty() {
+            flat.push(' ');
+        }
+        gap = false;
+        flat.push(c);
+    }
+    if flat.chars().count() > max_chars {
+        let mut cut = truncate_chars(&flat, max_chars.saturating_sub(1));
+        cut.push('…');
+        cut
+    } else {
+        flat
+    }
+}
+
+/// The plain zh-TW summary of a trust-held review card: what the conflict is
+/// about, the current value, and what approve / deny do, ending with
+/// [`SNIPPET_MARKER`] + the new statement. No origin names, trust numbers or
+/// other internal terms — those stay in the audit event and the payload.
+pub(crate) fn trust_held_summary(detail: &HeldClaimDetail, statement: &str) -> String {
+    let subject = held_card_text(&detail.subject_label, HELD_CARD_SUBJECT_MAX_CHARS);
+    let existing = held_card_text(&detail.existing_content, HELD_CARD_EXISTING_MAX_CHARS);
+    let existing = if existing.is_empty() { "（無法讀取）".to_string() } else { existing };
+    let statement = held_card_text(statement, HELD_CARD_STATEMENT_MAX_CHARS);
+    let summary = format!(
+        "對話中有一則關於「{subject}」的新說法，和系統目前採用、來源更可靠的內容不一致，\
+         所以還沒有套用。目前內容：「{existing}」。核准會改用這則新說法取代目前內容；\
+         拒絕則捨棄這則新說法。{SNIPPET_MARKER}{statement}"
+    );
+    // The per-part caps already keep this under the cap; the cut is a backstop.
+    truncate_chars(&summary, TRUST_HELD_SUMMARY_MAX_CHARS)
+}
+
+/// True when a pending `knowledge_quarantine` approval already covers one of
+/// `ids` (exact id match). Any broker error reads as "no card" so a review is
+/// never lost — at worst a duplicate card is filed.
+async fn pending_review_card_exists(
+    broker: &crate::approval::ApprovalBroker,
+    agent_id: &str,
+    ids: &[String],
+) -> bool {
+    let pending = match broker.list_pending(Some(agent_id)).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(agent = agent_id, "pending approval lookup failed: {e}");
+            return false;
+        }
+    };
+    // Only a trust-held (conflict) card counts: a burst card listing the same
+    // id — e.g. the burst card being decided when a retried release
+    // re-reports a row it converted earlier — is not this claim's review.
+    pending.iter().any(|rec| {
+        rec.action_kind == ACTION_KIND_KNOWLEDGE_QUARANTINE
+            && rec.payload.get("disposition").and_then(|v| v.as_str()) == Some(DISPOSITION_TRUST_HELD)
+            && rec
+                .payload
+                .get("quarantined_ids")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| a.iter().any(|v| v.as_str().is_some_and(|s| ids.iter().any(|i| i == s))))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Classification
 // ---------------------------------------------------------------------------
@@ -1078,6 +1418,12 @@ pub async fn persist_wiki_pointer(
 ///
 /// Called asynchronously after `build_reply_with_session_inner` returns.
 /// Non-blocking, non-failing — errors are logged and swallowed.
+///
+/// `origin` is the conversation the turn came from, `(channel, chat_id)`,
+/// captured by the caller BEFORE it spawned this task (the reply-channel
+/// task-local does not cross `tokio::spawn`). It is recorded on any review
+/// card this turn files, and the card's notice is never sent there (R-L1).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ingest(
     user_text: &str,
     assistant_reply: &str,
@@ -1086,18 +1432,35 @@ pub async fn run_ingest(
     home_dir: &Path,
     memory_db: &Path,
     session_id: &str,
+    origin: Option<(String, String)>,
 ) {
-    run_ingest_inner(
-        user_text,
-        assistant_reply,
-        agent_id,
-        user_id,
-        home_dir,
-        memory_db,
-        session_id,
-        None,
-    )
-    .await
+    INGEST_ORIGIN
+        .scope(
+            origin,
+            run_ingest_inner(
+                user_text,
+                assistant_reply,
+                agent_id,
+                user_id,
+                home_dir,
+                memory_db,
+                session_id,
+                None,
+            ),
+        )
+        .await
+}
+
+tokio::task_local! {
+    /// The originating conversation of the ingest running in this task (set
+    /// by [`run_ingest`] inside the spawned task, so it is visible to every
+    /// stage awaited from there).
+    static INGEST_ORIGIN: Option<(String, String)>;
+}
+
+/// The originating conversation of the current ingest, if any.
+pub(crate) fn ingest_origin() -> Option<(String, String)> {
+    INGEST_ORIGIN.try_with(|o| o.clone()).ok().flatten()
 }
 
 /// [`run_ingest`] with the utility-model call injectable (`None` in
@@ -1258,19 +1621,23 @@ async fn run_ingest_inner(
 
 /// D2: what the write-side guard did to one `(origin, subject)` group.
 #[derive(Debug, Clone)]
-struct QuarantineOutcome {
-    origin: String,
-    subject: String,
-    /// Human-readable reason (injection rules matched, or burst detail).
-    reason: String,
+pub(crate) struct QuarantineOutcome {
+    pub(crate) origin: String,
+    pub(crate) subject: String,
+    /// Human-readable reason (injection rules matched, burst detail, or the
+    /// two trusts for a supersession-guard refusal).
+    pub(crate) reason: String,
     /// A short, CJK-safe snippet of the offending fact content.
-    snippet: String,
+    pub(crate) snippet: String,
     /// Memory ids held under `quarantined = 1` (empty for the injection-DROP
     /// disposition, where the fact was never written).
-    ids: Vec<String>,
-    /// `"dropped"` (injection hit, not written) or `"quarantined"` (burst,
-    /// written inert and pending human review).
-    disposition: &'static str,
+    pub(crate) ids: Vec<String>,
+    /// `"dropped"` (injection hit, not written), `"quarantined"` (burst,
+    /// written inert and pending human review) or [`DISPOSITION_TRUST_HELD`]
+    /// (refused by the supersession trust guard, held inert pending review).
+    pub(crate) disposition: &'static str,
+    /// Review-card detail, present for [`DISPOSITION_TRUST_HELD`] only.
+    pub(crate) held: Option<HeldClaimDetail>,
 }
 
 /// Result of the protected store path.
@@ -1278,9 +1645,29 @@ struct QuarantineOutcome {
 struct ProtectedStoreReport {
     stored: usize,
     skipped: usize,
-    /// Groups that were dropped or quarantined; the async caller emits an
-    /// events.db `knowledge.quarantined` row and (for burst) an approval.
+    /// Facts refused by the supersession trust guard and held for review.
+    held: usize,
+    /// Groups that were dropped, quarantined or held; the async caller emits
+    /// an events.db `knowledge.quarantined` row and (for burst / held) an
+    /// approval.
     outcomes: Vec<QuarantineOutcome>,
+}
+
+/// The current value of the fact a refused claim would have replaced, for the
+/// review card (CJK-safe truncated). Empty when it cannot be read.
+pub(crate) async fn existing_fact_content(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    refusal: &duduclaw_memory::SupersessionRefusal,
+) -> String {
+    match engine.get_by_id(agent_id, &refusal.existing_id).await {
+        Ok(Some(e)) => truncate_bytes(&e.content, QUARANTINE_SUMMARY_MAX_BYTES).to_string(),
+        Ok(None) => String::new(),
+        Err(e) => {
+            warn!(agent = agent_id, "read protected fact for review card failed: {e}");
+            String::new()
+        }
+    }
 }
 
 /// Persist facts into the agent's memory database on a blocking thread.
@@ -1351,11 +1738,12 @@ async fn persist_facts(
         }
     };
 
-    if report.stored > 0 || report.skipped > 0 {
+    if report.stored > 0 || report.skipped > 0 || report.held > 0 {
         info!(
             agent = agent_id,
             stored = report.stored,
             skipped = report.skipped,
+            held = report.held,
             quarantined_groups = report.outcomes.len(),
             "Conversation distill: facts persisted to memory"
         );
@@ -1382,31 +1770,96 @@ async fn persist_facts(
     if report.outcomes.is_empty() {
         return;
     }
-    dispatch_quarantine_side_effects(agent_id, &home, memory_db, &report.outcomes).await;
+    let origin = ingest_origin();
+    dispatch_quarantine_side_effects(agent_id, &home, memory_db, &report.outcomes, origin.as_ref())
+        .await;
 }
 
 /// Emit one `knowledge.quarantined` events.db row per outcome and, for burst
-/// (`quarantined`) outcomes, request a human approval. Best-effort: any error
-/// here is logged and swallowed — the reply/distill path is never affected.
-async fn dispatch_quarantine_side_effects(
+/// (`quarantined`) and trust-held outcomes, request a human approval.
+/// Best-effort: any error here is logged and swallowed — the reply/distill
+/// path is never affected.
+///
+/// R-H1: a trust-held card (and its events row) is built from the HELD ROW AS
+/// STORED, re-read by id here — never from the incoming fact — so a repeat
+/// that matched an older held row can never show one statement and promote
+/// another. `origin` is the conversation the facts came from (captured before
+/// the distillation was spawned); it is recorded on the card and the card's
+/// notice is never sent there.
+pub(crate) async fn dispatch_quarantine_side_effects(
     agent_id: &str,
     home_dir: &Path,
     memory_db: &Path,
     outcomes: &[QuarantineOutcome],
+    origin: Option<&(String, String)>,
 ) {
     let events = crate::events_store::EventBusStore::open(home_dir).ok();
     let broker = crate::approval::ApprovalBroker::open(home_dir).ok();
 
     for outcome in outcomes {
+        let trust_held = outcome.disposition == DISPOSITION_TRUST_HELD;
+
+        // A held claim repeated while its review card is still open: no new
+        // card and no new events row (the audit event already counted it). If
+        // the earlier card is gone (expired, never filed), file one for the
+        // existing held row so the claim still gets reviewed.
+        if trust_held && outcome.held.as_ref().is_some_and(|h| !h.newly_held) {
+            if let Some(b) = &broker {
+                if pending_review_card_exists(b, agent_id, &outcome.ids).await {
+                    info!(
+                        agent = agent_id,
+                        held_ids = ?outcome.ids,
+                        "held claim repeated while its review card is pending — no new card"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let card = if trust_held {
+            let Some(held_id) = outcome.ids.first() else { continue };
+            match read_held_view(home_dir, memory_db, agent_id, held_id).await {
+                Some(view) if fits_review_card(&view.content) => {
+                    Some(trust_held_card(
+                        agent_id,
+                        memory_db,
+                        &view,
+                        &outcome.origin,
+                        &outcome.reason,
+                        origin,
+                    ))
+                }
+                Some(view) => {
+                    warn!(agent = agent_id, %held_id, "held claim too long for a card — not filed");
+                    audit_not_held_view(home_dir, agent_id, &view, &outcome.origin, NotHeld::TooLong);
+                    continue;
+                }
+                None => {
+                    warn!(agent = agent_id, %held_id, "held claim not readable — no card filed");
+                    continue;
+                }
+            }
+        } else if outcome.disposition == "quarantined" && !outcome.ids.is_empty() {
+            Some(burst_card(agent_id, memory_db, outcome, origin))
+        } else {
+            None
+        };
+
         // events.db bridge — same append model as the autopilot events bus.
+        // For a trust-held claim the text comes from the stored row.
         if let Some(store) = &events {
+            let snippet = card
+                .as_ref()
+                .filter(|_| trust_held)
+                .and_then(|(_, p)| p["snippet"].as_str().map(str::to_string))
+                .unwrap_or_else(|| outcome.snippet.clone());
             let payload = serde_json::json!({
                 "agent_id": agent_id,
                 "origin": outcome.origin,
                 "subject": outcome.subject,
                 "disposition": outcome.disposition,
                 "reason": outcome.reason,
-                "snippet": outcome.snippet,
+                "snippet": snippet,
                 "quarantined_ids": outcome.ids,
             })
             .to_string();
@@ -1418,40 +1871,139 @@ async fn dispatch_quarantine_side_effects(
             }
         }
 
-        // Only burst-quarantined batches (facts actually written, held for
-        // review) get an approval — injection DROPs are already gone.
-        if outcome.disposition == "quarantined" && !outcome.ids.is_empty() {
-            if let Some(broker) = &broker {
-                let summary = format!(
-                    "偵測到同一來源在短時間內對「{subject}」寫入大量知識（{reason}）。\
-                     已暫時隔離 {n} 筆，待您核准後才會生效。內容摘要：{snippet}",
-                    subject = outcome.subject,
-                    reason = outcome.reason,
-                    n = outcome.ids.len(),
-                    snippet = outcome.snippet,
-                );
-                let payload = serde_json::json!({
-                    "memory_db": memory_db.to_string_lossy(),
-                    "agent_id": agent_id,
-                    "origin": outcome.origin,
-                    "subject": outcome.subject,
-                    "quarantined_ids": outcome.ids,
-                });
-                if let Err(e) = broker
-                    .request(
-                        agent_id,
-                        ACTION_KIND_KNOWLEDGE_QUARANTINE,
-                        &summary,
-                        payload,
-                        QUARANTINE_APPROVAL_TTL_SECONDS,
-                    )
-                    .await
-                {
-                    warn!(agent = agent_id, "quarantine approval request failed: {e}");
-                }
+        if let (Some((summary, payload)), Some(broker)) = (card, &broker) {
+            if let Err(e) = broker
+                .request(
+                    agent_id,
+                    ACTION_KIND_KNOWLEDGE_QUARANTINE,
+                    &summary,
+                    payload,
+                    QUARANTINE_APPROVAL_TTL_SECONDS,
+                )
+                .await
+            {
+                warn!(agent = agent_id, "quarantine approval request failed: {e}");
             }
         }
     }
+}
+
+/// Read a held claim as stored (on a blocking thread, through the factory).
+async fn read_held_view(
+    home_dir: &Path,
+    memory_db: &Path,
+    agent_id: &str,
+    held_id: &str,
+) -> Option<duduclaw_memory::HeldClaimView> {
+    let home = home_dir.to_path_buf();
+    let db = memory_db.to_path_buf();
+    let agent = agent_id.to_string();
+    let id = held_id.to_string();
+    let r = tokio::task::spawn_blocking(move || {
+        let engine = crate::memory_factory::build_memory_engine(&db, &home)
+            .map_err(|e| format!("open memory engine: {e}"))?;
+        tokio::runtime::Handle::current()
+            .block_on(engine.held_claim_view(&agent, &id))
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    match r {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            warn!(agent = agent_id, "read held claim failed: {e}");
+            None
+        }
+        Err(e) => {
+            warn!(agent = agent_id, "read held claim task failed: {e}");
+            None
+        }
+    }
+}
+
+/// Max chars of the protected fact's text on a card (`existing_content`).
+pub(crate) const CARD_EXISTING_CONTENT_MAX_CHARS: usize = 600;
+/// Max chars of a card's `subject_label`.
+const CARD_SUBJECT_LABEL_MAX_CHARS: usize = 80;
+
+fn insert_origin(payload: &mut serde_json::Value, origin: Option<&(String, String)>) {
+    if let Some((ch, chat)) = origin {
+        payload["origin_channel"] = serde_json::json!(ch);
+        payload["origin_chat_id"] = serde_json::json!(chat);
+    }
+}
+
+/// Summary + payload of a trust-held review card, built ONLY from the stored
+/// held row (R-H1 / R-M1). The approve path re-checks `claim_digest` against
+/// the row, so the card and what gets written cannot diverge.
+pub(crate) fn trust_held_card(
+    agent_id: &str,
+    memory_db: &Path,
+    view: &duduclaw_memory::HeldClaimView,
+    write_origin: &str,
+    reason: &str,
+    origin: Option<&(String, String)>,
+) -> (String, serde_json::Value) {
+    let label = held_subject_label(&view.subject, &view.predicate);
+    let existing_full = view.existing_content.clone().unwrap_or_default();
+    let existing_truncated = existing_full.chars().count() > CARD_EXISTING_CONTENT_MAX_CHARS;
+    let existing_shown = truncate_chars(&existing_full, CARD_EXISTING_CONTENT_MAX_CHARS);
+    let detail = HeldClaimDetail {
+        subject_label: label.clone(),
+        existing_content: existing_shown.clone(),
+        newly_held: true,
+    };
+    let summary = trust_held_summary(&detail, &view.content);
+    let mut payload = serde_json::json!({
+        "memory_db": memory_db.to_string_lossy(),
+        "agent_id": agent_id,
+        "origin": write_origin,
+        "subject": view.subject,
+        "quarantined_ids": [view.id],
+        // Approve ⇒ promote with the approver's authority (not a plain
+        // release, which would leave the claim off the triple, low trust).
+        "promote_on_approve": true,
+        "disposition": DISPOSITION_TRUST_HELD,
+        "subject_label": held_card_text(&label, CARD_SUBJECT_LABEL_MAX_CHARS),
+        "predicate": view.predicate,
+        // The whole statement and the value that approval writes.
+        "snippet": view.content,
+        "new_value": view.object,
+        "existing_id": view.conflicts_with,
+        "existing_content": existing_shown,
+        "existing_content_truncated": existing_truncated,
+        "existing_value": view.existing_object,
+        "claim_digest": view.claim_digest,
+        "reason": reason,
+    });
+    insert_origin(&mut payload, origin);
+    (summary, payload)
+}
+
+/// Summary + payload of a burst (`quarantined`) review card.
+fn burst_card(
+    agent_id: &str,
+    memory_db: &Path,
+    outcome: &QuarantineOutcome,
+    origin: Option<&(String, String)>,
+) -> (String, serde_json::Value) {
+    let mut payload = serde_json::json!({
+        "memory_db": memory_db.to_string_lossy(),
+        "agent_id": agent_id,
+        "origin": outcome.origin,
+        "subject": outcome.subject,
+        "quarantined_ids": outcome.ids,
+        "subject_label": held_card_text(&outcome.subject, CARD_SUBJECT_LABEL_MAX_CHARS),
+    });
+    insert_origin(&mut payload, origin);
+    let summary = format!(
+        "偵測到同一來源在短時間內對「{subject}」寫入大量知識（{reason}）。\
+         已暫時隔離 {n} 筆，在儀表板審核通過後才會生效。內容摘要：{snippet}",
+        subject = outcome.subject,
+        reason = outcome.reason,
+        n = outcome.ids.len(),
+        snippet = outcome.snippet,
+    );
+    (summary, payload)
 }
 
 /// Store distilled facts into the memory engine. Returns `(stored, skipped)`.
@@ -1658,6 +2210,7 @@ async fn store_facts_protected(
                     .to_string(),
                 ids: Vec::new(),
                 disposition: "dropped",
+                held: None,
             });
             continue;
         }
@@ -1743,10 +2296,85 @@ async fn store_facts_protected(
             source_event: DISTILL_SOURCE_EVENT.to_string(),
         };
 
-        let id = engine
-            .store_temporal(agent_id, entry, meta)
+        let outcome = engine
+            .store_temporal_outcome(agent_id, entry.clone(), meta.clone())
             .await
             .map_err(|e| format!("store fact: {e}"))?;
+        let id = match outcome {
+            duduclaw_memory::TemporalWriteOutcome::Stored(id) => id,
+            duduclaw_memory::TemporalWriteOutcome::Refused(refusal) => {
+                // The claim would have replaced a more trusted current fact.
+                // Hold it inert for human review instead of dropping it.
+                // Idempotent: an identical claim already pending review is
+                // not held twice (and gets no second card downstream).
+                if !fits_review_card(&entry.content) {
+                    // R-M1: a card must show the whole statement; ingestion
+                    // already caps it, so this only guards the invariant.
+                    report.skipped += 1;
+                    audit_supersession_refused_not_held(
+                        home_dir,
+                        agent_id,
+                        "conversation_distill",
+                        &refusal,
+                        NotHeld::TooLong,
+                    );
+                    continue;
+                }
+                let mut admitter = held_claim_admitter(home_dir, agent_id);
+                let held = engine
+                    .hold_refused_claim_gated(agent_id, entry, meta, &mut || admitter.admit())
+                    .await;
+                let held = match held {
+                    Ok(Some(h)) => h,
+                    Ok(None) => {
+                        // Daily review cap reached: audited only, nothing held.
+                        report.skipped += 1;
+                        audit_supersession_refused_capped(
+                            home_dir,
+                            agent_id,
+                            "conversation_distill",
+                            &refusal,
+                        );
+                        if admitter.first_cap_hit() {
+                            emit_review_cap_reached(home_dir, agent_id).await;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        // R-L8: one fact that cannot be held must not stop
+                        // the rest of the batch.
+                        report.skipped += 1;
+                        warn!(agent = agent_id, "hold refused fact failed (skipped): {e}");
+                        continue;
+                    }
+                };
+                report.held += 1;
+                audit_supersession_refused(
+                    home_dir,
+                    agent_id,
+                    "conversation_distill",
+                    &refusal,
+                    Some(&held.id),
+                    !held.newly_held,
+                );
+                let existing_content = existing_fact_content(engine, agent_id, &refusal).await;
+                report.outcomes.push(QuarantineOutcome {
+                    origin: DISTILL_ORIGIN.to_string(),
+                    subject: refusal.subject.clone(),
+                    reason: trust_held_reason(&refusal),
+                    snippet: truncate_bytes(&p.content, QUARANTINE_SUMMARY_MAX_BYTES)
+                        .to_string(),
+                    ids: vec![held.id],
+                    disposition: DISPOSITION_TRUST_HELD,
+                    held: Some(HeldClaimDetail {
+                        subject_label: held_subject_label(&refusal.subject, &refusal.predicate),
+                        existing_content,
+                        newly_held: held.newly_held,
+                    }),
+                });
+                continue;
+            }
+        };
         report.stored += 1;
 
         if is_quarantined {
@@ -1789,45 +2417,326 @@ async fn store_facts_protected(
             snippet,
             ids,
             disposition: "quarantined",
+            held: None,
         });
     }
 
     Ok(report)
 }
 
-/// Release or reject a quarantined batch as decided by a human via the
-/// ApprovalBroker (D2 processing end). Opens the memory engine on a blocking
-/// thread (rusqlite is `!Send`) and applies the decision:
+/// What one knowledge-quarantine decision did (see
+/// [`apply_quarantine_decision`]).
+#[derive(Debug, Default)]
+pub struct QuarantineDecisionReport {
+    /// Held claims re-written with operator authority.
+    pub promoted: usize,
+    /// Burst rows released.
+    pub released: usize,
+    /// Rows rejected (expired, trust downgraded).
+    pub rejected: usize,
+    /// Held claims not written because the protected fact changed after the
+    /// card was filed (M3); each held row was closed out.
+    pub stale: usize,
+    /// Burst rows the supersession guard refused at release (H2): now held
+    /// claims, each needing its own conflict card.
+    pub(crate) held: Vec<QuarantineOutcome>,
+}
+
+impl QuarantineDecisionReport {
+    /// The `side_effect` object `approvals.decide` returns. Every count is a
+    /// non-negative JSON integer and is always present for its branch:
+    /// promote → `quarantine_promoted` + `quarantine_stale`; release →
+    /// `quarantine_released` + `quarantine_held`; deny → `quarantine_rejected`.
+    pub fn side_effect(&self, approve: bool, promote: bool) -> serde_json::Value {
+        if approve && promote {
+            serde_json::json!({
+                "quarantine_promoted": self.promoted,
+                "quarantine_stale": self.stale,
+            })
+        } else if approve {
+            serde_json::json!({
+                "quarantine_released": self.released,
+                "quarantine_held": self.held.len(),
+            })
+        } else {
+            serde_json::json!({ "quarantine_rejected": self.rejected })
+        }
+    }
+}
+
+/// Plain label for the subject of a held claim on a review card: a profile
+/// subject (`user:<id>`) is named by what the predicate describes, never by
+/// the raw id; any other subject is shown as is (sanitised at render time).
+pub(crate) fn held_subject_label(subject: &str, predicate: &str) -> String {
+    match subject.strip_prefix("user:") {
+        // R-L5: say whose profile it is (the stable user id; no display-name
+        // lookup that could fail).
+        Some(user) => format!(
+            "{}（使用者 {}）",
+            crate::profile_distill::predicate_label_zh(predicate),
+            user
+        ),
+        None => subject.to_string(),
+    }
+}
+
+/// The review-card outcome for a burst row a release turned into a held claim.
+pub(crate) fn release_held_outcome(h: &duduclaw_memory::ReleaseHeld) -> QuarantineOutcome {
+    // The card itself is built from the stored row (`trust_held_card`); this
+    // carries only what the row does not: the write's origin and the
+    // internal reason. A row re-reported by a retried release is marked not
+    // newly held, so its card is filed only if none is pending.
+    let (origin, subject, reason) = match &h.refusal {
+        Some(r) => (r.write_origin.clone(), r.subject.clone(), trust_held_reason(r)),
+        None => (String::new(), String::new(), "trust: held at release".to_string()),
+    };
+    QuarantineOutcome {
+        origin,
+        subject,
+        reason,
+        snippet: String::new(),
+        ids: vec![h.held_id.clone()],
+        disposition: DISPOSITION_TRUST_HELD,
+        held: Some(HeldClaimDetail {
+            subject_label: String::new(),
+            existing_content: String::new(),
+            newly_held: h.newly_converted,
+        }),
+    }
+}
+
+/// Apply a knowledge-quarantine decision made by a human in the dashboard
+/// (D2 processing end; channel decisions are refused for this kind — see
+/// `approval_notify::is_dashboard_only_kind`). Opens the memory engine on a
+/// blocking thread (rusqlite is `!Send`) through `memory_factory`, so the
+/// `[memory] supersession_trust_guard` switch applies:
 ///
-/// - `approve == true`  → [`SqliteMemoryEngine::release_quarantine`] (clears
-///   `quarantined`, the facts become visible to retrieval).
-/// - `approve == false` → [`SqliteMemoryEngine::reject_quarantine`] (expires
-///   the facts and downgrades their `origin_trust`).
-///
-/// Returns the number of rows affected. Used by `handle_approvals_decide`.
+/// - `approve` + `promote` (a [`DISPOSITION_TRUST_HELD`] claim) →
+///   [`SqliteMemoryEngine::promote_quarantined`] with the `operator` origin:
+///   the approver accepts the claim, so it is re-written with operator trust
+///   and supersedes the fact that outranked it — unless that fact changed
+///   since the card was filed (`stale`).
+/// - `approve` (a burst batch) → [`SqliteMemoryEngine::release_quarantine`]:
+///   triple rows supersede with real semantics; rows the trust guard refuses
+///   become held claims (`held`, the caller files their cards).
+/// - deny → [`SqliteMemoryEngine::reject_quarantine`] (expires the rows and
+///   downgrades their `origin_trust`).
 pub async fn apply_quarantine_decision(
+    home_dir: PathBuf,
     memory_db: PathBuf,
     agent_id: String,
     ids: Vec<String>,
     approve: bool,
-) -> Result<usize, String> {
+    promote: bool,
+    claim_digest: Option<String>,
+) -> Result<QuarantineDecisionReport, String> {
     tokio::task::spawn_blocking(move || {
-        let engine =
-            SqliteMemoryEngine::new(&memory_db).map_err(|e| format!("open memory engine: {e}"))?;
+        let engine = crate::memory_factory::build_memory_engine(&memory_db, &home_dir)
+            .map_err(|e| format!("open memory engine: {e}"))?;
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
-            if approve {
-                engine
+            let mut report = QuarantineDecisionReport::default();
+            if approve && promote {
+                // R-H1: bound to the digest the card recorded. A card without
+                // one (or with a different one) promotes nothing: stale.
+                let digest = claim_digest.unwrap_or_default();
+                let bound: Vec<(String, String)> =
+                    ids.iter().map(|i| (i.clone(), digest.clone())).collect();
+                let p = engine
+                    .promote_quarantined_bound(
+                        &agent_id,
+                        &bound,
+                        duduclaw_memory::origin::OPERATOR.name,
+                    )
+                    .await
+                    .map_err(|e| format!("promote held claim: {e}"))?;
+                report.promoted = p.promoted;
+                report.stale = p.stale;
+            } else if approve {
+                let r = engine
                     .release_quarantine(&agent_id, &ids)
                     .await
-                    .map_err(|e| format!("release quarantine: {e}"))
+                    .map_err(|e| format!("release quarantine: {e}"))?;
+                report.released = r.released;
+                report.held = r.held.iter().map(release_held_outcome).collect();
             } else {
-                engine
+                report.rejected = engine
                     .reject_quarantine(&agent_id, &ids, "quarantine_reject")
                     .await
-                    .map_err(|e| format!("reject quarantine: {e}"))
+                    .map_err(|e| format!("reject quarantine: {e}"))?;
             }
+            Ok(report)
         })
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {e}"))?
+}
+
+/// What [`scrub_review_store_for_erased`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ErasedReviewScrub {
+    /// Pending review cards withdrawn (system deny).
+    pub withdrawn: usize,
+    /// Review cards (any status) whose text was replaced.
+    pub scrubbed: usize,
+    /// `knowledge.quarantined` events.db rows deleted.
+    pub events_deleted: usize,
+}
+
+/// `decided_by` of a review card withdrawn because its rows were erased.
+pub const DECIDED_BY_GDPR_ERASE: &str = "system:gdpr_erase";
+
+/// Data-subject erase follow-up (R-M3): after `gdpr_erase` deleted
+/// `erased_ids`, remove the person's text from the review store too — every
+/// pending `knowledge_quarantine` card covering an erased row is withdrawn
+/// (system deny, `decided_by = system:gdpr_erase`), every such card of any
+/// status has its summary and text fields replaced, and every
+/// `knowledge.quarantined` events.db row listing an erased id is deleted.
+/// `knowledge.quarantined` rows that carry no ids (injection drops, blocked
+/// pages) cannot be matched by id and stay until the events.db retention
+/// prune (7 days).
+pub async fn scrub_review_store_for_erased(
+    home_dir: &Path,
+    erased_ids: &[String],
+) -> Result<ErasedReviewScrub, String> {
+    if erased_ids.is_empty() {
+        return Ok(ErasedReviewScrub::default());
+    }
+    let erased: HashSet<String> = erased_ids.iter().cloned().collect();
+    let card_ids = |rec: &crate::approval::ApprovalRecord| -> Vec<String> {
+        rec.payload
+            .get("quarantined_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    };
+    let mut out = scrub_cards(home_dir, |rec| card_ids(rec).iter().any(|i| erased.contains(i))).await?;
+    let events = crate::events_store::EventBusStore::open(home_dir)
+        .map_err(|e| format!("events store (cards were scrubbed): {e}"))?;
+    out.events_deleted = events
+        .delete_by_quarantined_ids("knowledge.quarantined", &erased)
+        .await?;
+    Ok(out)
+}
+
+/// Fallback for an erase re-run (R-M3 retry): the memory rows are already
+/// gone, so no ids come back. Scrub by the contact instead — review cards
+/// whose stored `subject` EQUALS the contact (exact match, never substring),
+/// and `knowledge.quarantined` events whose `subject` equals it.
+pub async fn scrub_review_store_for_contact(
+    home_dir: &Path,
+    contact: &str,
+) -> Result<ErasedReviewScrub, String> {
+    if contact.is_empty() {
+        return Ok(ErasedReviewScrub::default());
+    }
+    let mut out = scrub_cards(home_dir, |rec| {
+        rec.payload.get("subject").and_then(|v| v.as_str()) == Some(contact)
+    })
+    .await?;
+    let events = crate::events_store::EventBusStore::open(home_dir)
+        .map_err(|e| format!("events store (cards were scrubbed): {e}"))?;
+    out.events_deleted = events
+        .delete_by_payload_subject("knowledge.quarantined", contact)
+        .await?;
+    Ok(out)
+}
+
+/// The erase follow-up the CLI runs: by the erased ids when there are any,
+/// otherwise (a re-run after an earlier failure) by the contact.
+pub async fn scrub_review_store_after_erase(
+    home_dir: &Path,
+    erased_ids: &[String],
+    contact: &str,
+) -> Result<ErasedReviewScrub, String> {
+    if erased_ids.is_empty() {
+        scrub_review_store_for_contact(home_dir, contact).await
+    } else {
+        scrub_review_store_for_erased(home_dir, erased_ids).await
+    }
+}
+
+/// Withdraw (when pending) and scrub every knowledge-review card `matches`.
+async fn scrub_cards(
+    home_dir: &Path,
+    matches: impl Fn(&crate::approval::ApprovalRecord) -> bool,
+) -> Result<ErasedReviewScrub, String> {
+    let mut out = ErasedReviewScrub::default();
+    let broker = crate::approval::ApprovalBroker::open(home_dir)?;
+    for rec in broker.list_by_kind(ACTION_KIND_KNOWLEDGE_QUARANTINE).await? {
+        if !matches(&rec) {
+            continue;
+        }
+        if rec.status == crate::approval::ApprovalStatus::Pending
+            && broker.withdraw(&rec.id, DECIDED_BY_GDPR_ERASE).await?
+        {
+            out.withdrawn += 1;
+        }
+        let payload = serde_json::json!({
+            "agent_id": rec.payload.get("agent_id").cloned().unwrap_or_default(),
+            "memory_db": rec.payload.get("memory_db").cloned().unwrap_or_default(),
+            "disposition": rec.payload.get("disposition").cloned().unwrap_or_default(),
+            "quarantined_ids": rec.payload.get("quarantined_ids").cloned().unwrap_or_default(),
+            "erased": true,
+        });
+        broker
+            .replace_text(&rec.id, "（內容已依資料刪除請求移除）", &payload)
+            .await?;
+        out.scrubbed += 1;
+    }
+    Ok(out)
+}
+
+/// Event recorded on a quarantined row closed because its review lapsed.
+pub(crate) const QUARANTINE_REVIEW_LAPSED_EVENT: &str = "quarantine_review_lapsed";
+
+/// Rows younger than this are never swept: the row is written before its
+/// review card is filed, so a fresh row may not be covered yet.
+const QUARANTINE_SWEEP_GRACE_HOURS: i64 = 1;
+
+/// L1 — close out quarantined rows (held claims and burst batches) in
+/// `memory_db` whose review is no longer pending: the card expired, was
+/// decided without effect, or was never filed. Treated as a rejection.
+///
+/// Fail closed: when the pending approvals cannot be read, nothing is swept.
+pub async fn sweep_unreviewed_quarantine(home_dir: &Path, memory_db: &Path) -> Result<usize, String> {
+    sweep_unreviewed_quarantine_before(
+        home_dir,
+        memory_db,
+        Utc::now() - chrono::Duration::hours(QUARANTINE_SWEEP_GRACE_HOURS),
+    )
+    .await
+}
+
+/// [`sweep_unreviewed_quarantine`] with an explicit cutoff (rows written
+/// before it are eligible).
+pub(crate) async fn sweep_unreviewed_quarantine_before(
+    home_dir: &Path,
+    memory_db: &Path,
+    cutoff: chrono::DateTime<Utc>,
+) -> Result<usize, String> {
+    let broker = crate::approval::ApprovalBroker::open(home_dir)?;
+    // `list_pending` expires stale cards first, so a lapsed card is not pending.
+    let pending = broker.list_pending(None).await?;
+    let keep: HashSet<String> = pending
+        .iter()
+        .filter(|r| r.action_kind == ACTION_KIND_KNOWLEDGE_QUARANTINE)
+        .filter_map(|r| r.payload.get("quarantined_ids").and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    let db = memory_db.to_path_buf();
+    let home = home_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let engine = crate::memory_factory::build_memory_engine(&db, &home)
+            .map_err(|e| format!("open memory engine: {e}"))?;
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(engine.expire_unreviewed_quarantine(
+            &keep,
+            cutoff,
+            QUARANTINE_REVIEW_LAPSED_EVENT,
+        ))
+        .map_err(|e| format!("sweep: {e}"))
     })
     .await
     .map_err(|e| format!("spawn_blocking: {e}"))?
@@ -2108,6 +3017,17 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// The `claim_digest` a card for this held row carries (None when the row
+    /// is not a pending held claim).
+    async fn digest_of(db: &Path, agent: &str, id: &str) -> Option<String> {
+        SqliteMemoryEngine::new(db)
+            .unwrap()
+            .held_claim_view(agent, id)
+            .await
+            .unwrap()
+            .map(|v| v.claim_digest)
+    }
+
     /// Store a clean curated triple so the graph/FTS have a legitimate baseline.
     async fn store_clean(
         engine: &SqliteMemoryEngine,
@@ -2266,6 +3186,358 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // ── Supersession trust guard on the distillation path ────────────────
+
+    fn refund_fact(object: &str) -> DistilledFact {
+        DistilledFact {
+            subject: Some("policy:refund".to_string()),
+            predicate: Some("window".to_string()),
+            object: Some(object.to_string()),
+            content: format!("the refund window is {object}"),
+            confidence: Some(0.9),
+        }
+    }
+
+    fn current_refund(
+        h: &[duduclaw_memory::TemporalRecord],
+    ) -> Vec<&duduclaw_memory::TemporalRecord> {
+        h.iter().filter(|r| r.valid_until.is_none()).collect()
+    }
+
+    /// The attack end to end through the real distillation store path: a chat
+    /// message distilled into a single (non-burst, injection-clean) fact
+    /// contradicting an operator-curated fact. The operator fact stays current;
+    /// the claim is held for review, audited and surfaced as `trust_held`; an
+    /// approval promotes it with operator authority.
+    #[tokio::test]
+    async fn redteam_distilled_fact_cannot_replace_operator_fact() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let engine = crate::memory_factory::build_memory_engine(&db, home.path()).unwrap();
+        let agent = "support";
+        store_clean(
+            &engine,
+            agent,
+            "policy:refund",
+            "window",
+            "7 days",
+            "the refund window is 7 days",
+        )
+        .await;
+        let op_id = current_refund(&engine.get_history(agent, "policy:refund", "window").await.unwrap())[0]
+            .id
+            .clone();
+
+        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+            .await
+            .unwrap();
+        assert_eq!(report.stored, 0);
+        assert_eq!(report.held, 1);
+        let held: Vec<&QuarantineOutcome> = report
+            .outcomes
+            .iter()
+            .filter(|o| o.disposition == DISPOSITION_TRUST_HELD)
+            .collect();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].subject, "policy:refund");
+        assert_eq!(held[0].ids.len(), 1);
+        assert!(held[0].reason.starts_with("trust: channel 0.30 < user 1.00"), "{}", held[0].reason);
+
+        let h = engine.get_history(agent, "policy:refund", "window").await.unwrap();
+        assert_eq!(h.len(), 1, "the held claim is not part of the fact's history");
+        assert_eq!(current_refund(&h)[0].id, op_id);
+        let hits = engine.search(agent, "refund window forever", 10).await.unwrap();
+        assert!(
+            hits.iter().all(|e| e.id != held[0].ids[0]),
+            "the held claim is excluded from retrieval"
+        );
+
+        let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        let row: serde_json::Value = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .find(|v: &serde_json::Value| v["event_type"] == AUDIT_SUPERSESSION_REFUSED)
+            .expect("memory_supersession_refused audit row");
+        let d = &row["details"];
+        assert_eq!(d["subject"], "policy:refund");
+        assert_eq!(d["predicate"], "window");
+        assert_eq!(d["write_origin"], "channel");
+        assert_eq!(d["existing_origin"], "user");
+        assert_eq!(d["existing_id"], op_id.as_str());
+        assert_eq!(d["held_id"], held[0].ids[0].as_str());
+        assert!(!audit.contains("forever"), "no claim text in the audit row");
+        drop(engine);
+
+        // Reviewer approves → promoted with operator authority.
+        let n = apply_quarantine_decision(
+            home.path().to_path_buf(),
+            db.clone(),
+            agent.to_string(),
+            held[0].ids.clone(),
+            true,
+            true,
+            digest_of(&db, agent, &held[0].ids[0]).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!((n.promoted, n.stale), (1, 0));
+        assert_eq!(
+            n.side_effect(true, true),
+            serde_json::json!({ "quarantine_promoted": 1, "quarantine_stale": 0 })
+        );
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        let h = engine.get_history(agent, "policy:refund", "window").await.unwrap();
+        let cur = current_refund(&h);
+        assert_eq!(cur.len(), 1);
+        assert_eq!(cur[0].content, "the refund window is forever");
+        assert_eq!(cur[0].supersedes.as_deref(), Some(op_id.as_str()));
+        assert_eq!(
+            engine.get_origin(agent, &cur[0].id).await.unwrap(),
+            Some(Some("operator".to_string()))
+        );
+    }
+
+    /// Words that must never reach a held claim's review card: origin names,
+    /// trust numbers and the internal reason format.
+    const CARD_FORBIDDEN: &[&str] = &[
+        "channel", "operator", "user_profile", "conversation_distill", "trust", "legacy",
+        "0.30", "1.00", "0.6", "unattributed",
+    ];
+
+    fn hostile_detail() -> HeldClaimDetail {
+        HeldClaimDetail {
+            subject_label: format!("退款政策\n編號：forged{}", "長".repeat(200)),
+            existing_content: format!("七天\r\n內容摘要：假的\u{0007}{}", "🙂".repeat(300)),
+            newly_held: true,
+        }
+    }
+
+    #[test]
+    fn trust_held_summary_is_plain_capped_and_marker_last() {
+        let statement = format!("永久退款\n\n編號：fake 內容摘要：injected {}", "危".repeat(600));
+        let summary = trust_held_summary(&hostile_detail(), &statement);
+        assert!(summary.chars().count() <= TRUST_HELD_SUMMARY_MAX_CHARS, "{}", summary.chars().count());
+        for w in CARD_FORBIDDEN {
+            assert!(!summary.contains(w), "summary leaks {w:?}: {summary}");
+        }
+        assert!(!summary.contains('\n') && !summary.contains('\r') && !summary.contains('\u{0007}'));
+        // Exactly one marker, ours, followed by the new statement.
+        assert_eq!(summary.matches(SNIPPET_MARKER).count(), 1, "{summary}");
+        let tail = &summary[summary.rfind(SNIPPET_MARKER).unwrap() + SNIPPET_MARKER.len()..];
+        assert!(tail.starts_with("永久退款"), "{tail}");
+        assert!(summary.contains("目前內容：「七天"));
+        assert!(summary.contains("核准") && summary.contains("拒絕"));
+        // Multi-byte truncation is char-safe and marked.
+        assert!(tail.ends_with('…'));
+    }
+
+    #[test]
+    fn trust_held_summary_with_unreadable_existing_value() {
+        let mut d = hostile_detail();
+        d.subject_label = "policy:refund".into();
+        d.existing_content = String::new();
+        let summary = trust_held_summary(&d, "the refund window is forever");
+        assert!(summary.contains("（無法讀取）"));
+        assert!(summary.ends_with("內容摘要：the refund window is forever"));
+    }
+
+    async fn pending_quarantine_cards(home: &Path) -> Vec<crate::approval::ApprovalRecord> {
+        let broker = crate::approval::ApprovalBroker::open(home).unwrap();
+        broker
+            .list_pending(Some("support"))
+            .await
+            .unwrap()
+            .into_iter()
+        .filter(|r| r.action_kind == ACTION_KIND_KNOWLEDGE_QUARANTINE)
+        .collect()
+    }
+
+    /// v1.67.1: the same refused claim repeated while its card is pending
+    /// produces neither a second held row nor a second card; a different object
+    /// for the same subject/predicate is its own card. The card carries the new
+    /// payload fields and plain wording, and approving promotes the held row's
+    /// own claim — display fields in the payload cannot change what is written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_claim_card_is_idempotent_plain_and_tamper_proof() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        let op_id = current_refund(&engine.get_history(agent, "policy:refund", "window").await.unwrap())[0]
+            .id
+            .clone();
+
+        let first = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+            .await
+            .unwrap();
+        let held_id = first.outcomes[0].ids[0].clone();
+        assert!(first.outcomes[0].held.as_ref().unwrap().newly_held);
+        dispatch_quarantine_side_effects(agent, home.path(), &db, &first.outcomes, None).await;
+        assert_eq!(pending_quarantine_cards(home.path()).await.len(), 1);
+
+        // Repeats within the hour: same held id, still one card. (Kept below
+        // the same-origin burst limit — 5 facts about one subject per hour —
+        // past which the burst quarantine takes over, as before.)
+        for _ in 0..2 {
+            let again = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+                .await
+                .unwrap();
+            assert_eq!(again.outcomes[0].ids, vec![held_id.clone()]);
+            assert!(!again.outcomes[0].held.as_ref().unwrap().newly_held);
+            dispatch_quarantine_side_effects(agent, home.path(), &db, &again.outcomes, None).await;
+        }
+        let cards = pending_quarantine_cards(home.path()).await;
+        assert_eq!(cards.len(), 1, "a repeated claim must not file another card");
+        let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        let repeats = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["event_type"] == AUDIT_SUPERSESSION_REFUSED)
+            .filter(|v| v["details"]["repeat_of_pending"] == true)
+            .count();
+        assert_eq!(repeats, 2, "every repeat is still audited");
+
+        // A different object is a separate claim with its own card.
+        let other = store_facts_protected(&engine, agent, &[refund_fact("30 days")], home.path())
+            .await
+            .unwrap();
+        assert_ne!(other.outcomes[0].ids[0], held_id);
+        dispatch_quarantine_side_effects(agent, home.path(), &db, &other.outcomes, None).await;
+        assert_eq!(pending_quarantine_cards(home.path()).await.len(), 2);
+
+        // Card content.
+        let card = cards.into_iter().next().unwrap();
+        for w in CARD_FORBIDDEN {
+            assert!(!card.summary.contains(w), "summary leaks {w:?}: {}", card.summary);
+        }
+        assert!(card.summary.ends_with("內容摘要：the refund window is forever"), "{}", card.summary);
+        let p = &card.payload;
+        assert_eq!(p["disposition"], DISPOSITION_TRUST_HELD);
+        assert_eq!(p["promote_on_approve"], true);
+        assert_eq!(p["subject"], "policy:refund");
+        assert_eq!(p["predicate"], "window");
+        assert_eq!(p["snippet"], "the refund window is forever");
+        assert_eq!(p["existing_id"], op_id.as_str());
+        assert_eq!(p["existing_content"], "the refund window is 7 days");
+        assert!(p["reason"].as_str().unwrap().starts_with("trust: "));
+        assert_eq!(p["quarantined_ids"], serde_json::json!([held_id.clone()]));
+        drop(engine);
+
+        // Tampered display fields: the approve path reads only ids/db/flags.
+        let mut tampered = p.clone();
+        tampered["snippet"] = serde_json::json!("the refund window is 999 years");
+        tampered["existing_content"] = serde_json::json!("x");
+        tampered["object"] = serde_json::json!("999 years");
+        tampered["predicate"] = serde_json::json!("other");
+        let ids: Vec<String> = tampered["quarantined_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let n = apply_quarantine_decision(
+            home.path().to_path_buf(),
+            PathBuf::from(tampered["memory_db"].as_str().unwrap()),
+            tampered["agent_id"].as_str().unwrap().to_string(),
+            ids,
+            true,
+            tampered["promote_on_approve"].as_bool().unwrap(),
+            tampered["claim_digest"].as_str().map(str::to_string),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n.promoted, 1);
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        let h = engine.get_history(agent, "policy:refund", "window").await.unwrap();
+        let cur = current_refund(&h);
+        assert_eq!(cur.len(), 1);
+        assert_eq!(cur[0].content, "the refund window is forever");
+        assert!(engine.get_history(agent, "policy:refund", "other").await.unwrap().is_empty());
+        assert_eq!(engine.find_pending_held_claim(agent, "policy:refund", "window", Some("forever")).await.unwrap(), None);
+    }
+
+    /// Denying a held claim expires it; the operator fact is untouched.
+    #[tokio::test]
+    async fn denied_trust_held_claim_is_discarded() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        let agent = "support";
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        let report = store_facts_protected(&engine, agent, &[refund_fact("365 days")], home.path())
+            .await
+            .unwrap();
+        let ids = report.outcomes[0].ids.clone();
+        drop(engine);
+        let n = apply_quarantine_decision(
+            home.path().to_path_buf(),
+            db.clone(),
+            agent.to_string(),
+            ids.clone(),
+            false,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n.rejected, 1);
+        assert_eq!(n.side_effect(false, true), serde_json::json!({ "quarantine_rejected": 1 }));
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        let h = engine.get_history(agent, "policy:refund", "window").await.unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].content, "the refund window is 7 days");
+        assert!(h[0].valid_until.is_none());
+        assert_eq!(engine.get_origin_trust(agent, &ids[0]).await.unwrap(), Some(0.1));
+    }
+
+    /// `[memory] supersession_trust_guard = false`: the factory-built engine
+    /// behaves as before the guard — the distilled fact supersedes.
+    #[tokio::test]
+    async fn guard_off_in_config_restores_old_distill_behaviour() {
+        let home = tmp_home();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[memory]\nsupersession_trust_guard = false\n",
+        )
+        .unwrap();
+        let engine =
+            crate::memory_factory::build_memory_engine(&home.path().join("memory.db"), home.path())
+                .unwrap();
+        let agent = "support";
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        let report = store_facts_protected(&engine, agent, &[refund_fact("365 days")], home.path())
+            .await
+            .unwrap();
+        assert_eq!((report.stored, report.held), (1, 0));
+        assert!(report.outcomes.is_empty());
+        let h = engine.get_history(agent, "policy:refund", "window").await.unwrap();
+        assert_eq!(current_refund(&h)[0].content, "the refund window is 365 days");
+        assert!(!home.path().join("security_audit.jsonl").exists());
+    }
+
+    /// A customer correcting their own earlier (distilled) statement is the
+    /// same origin class — allowed, no review.
+    #[tokio::test]
+    async fn same_origin_correction_is_not_held() {
+        let home = tmp_home();
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "support";
+        store_facts_protected(&engine, agent, &[refund_fact("7 days")], home.path())
+            .await
+            .unwrap();
+        let report = store_facts_protected(&engine, agent, &[refund_fact("14 days")], home.path())
+            .await
+            .unwrap();
+        assert_eq!((report.stored, report.held), (1, 0));
+        let h = engine.get_history(agent, "policy:refund", "window").await.unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(current_refund(&h)[0].content, "the refund window is 14 days");
     }
 
     // ── WP5c knowledge routing ────────────────────────────────────────────
@@ -3046,5 +4318,616 @@ mod tests {
         );
         // Both are visible to retrieval (none quarantined).
         assert!(!engine.search(agent, "python", 10).await.unwrap().is_empty());
+    }
+
+    // ── v1.67.1 second batch (H2 / M1 / M3 / M5 / L1) ────────────────────
+
+    /// H2(a): five claims on one subject (the burst threshold) that contradict
+    /// a more trusted fact are held as conflict claims — not a burst batch
+    /// whose approval would only flip a flag.
+    #[tokio::test]
+    async fn burst_that_contradicts_a_trusted_fact_goes_to_held_claims() {
+        let home = tmp_home();
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "support";
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        let facts: Vec<DistilledFact> = (0..5)
+            .map(|i| DistilledFact {
+                subject: Some("policy:refund".to_string()),
+                predicate: Some("window".to_string()),
+                object: Some(format!("{} days", 100 + i)),
+                content: format!("the refund window is {} days", 100 + i),
+                confidence: Some(0.9),
+            })
+            .collect();
+        let report = store_facts_protected(&engine, agent, &facts, home.path())
+            .await
+            .unwrap();
+        assert_eq!(report.held, 5);
+        assert!(report.outcomes.iter().all(|o| o.disposition == DISPOSITION_TRUST_HELD));
+        assert!(!report.outcomes.iter().any(|o| o.disposition == "quarantined"));
+    }
+
+    /// H2(b): approving a burst batch whose row is outranked at release turns
+    /// it into a held claim with its own conflict card; the side effect
+    /// reports `quarantine_released` and `quarantine_held`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn burst_release_refused_by_the_guard_files_a_conflict_card() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        let mut engine = SqliteMemoryEngine::new(&db).unwrap();
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        // A burst row written while the guard was off (the pre-fix state).
+        engine.supersession_trust_guard = false;
+        let mut q = TemporalMeta {
+            subject: Some("policy:refund".into()),
+            predicate: Some("window".into()),
+            object: Some("forever".into()),
+            origin: Some(DISTILL_ORIGIN.into()),
+            origin_trust: Some(DISTILL_ORIGIN_TRUST),
+            ..TemporalMeta::default()
+        };
+        q.quarantined = true;
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: "the refund window is forever".to_string(),
+            timestamp: Utc::now(),
+            tags: vec![],
+            embedding: None,
+            layer: MemoryLayer::Semantic,
+            importance: 5.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: DISTILL_SOURCE_EVENT.to_string(),
+        };
+        let row = engine.store_temporal(agent, entry, q).await.unwrap();
+        drop(engine);
+
+        let report = apply_quarantine_decision(
+            home.path().to_path_buf(),
+            db.clone(),
+            agent.to_string(),
+            vec![row.clone()],
+            true,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.released, 0);
+        assert_eq!(report.held.len(), 1);
+        assert_eq!(
+            report.side_effect(true, false),
+            serde_json::json!({ "quarantine_released": 0, "quarantine_held": 1 })
+        );
+        dispatch_quarantine_side_effects(agent, home.path(), &db, &report.held, None).await;
+        let cards = pending_quarantine_cards(home.path()).await;
+        assert_eq!(cards.len(), 1);
+        let p = &cards[0].payload;
+        assert_eq!(p["disposition"], DISPOSITION_TRUST_HELD);
+        assert_eq!(p["promote_on_approve"], true);
+        assert_eq!(p["quarantined_ids"], serde_json::json!([row.clone()]));
+        assert_eq!(p["subject_label"], "policy:refund");
+        assert_eq!(p["existing_content"], "the refund window is 7 days");
+
+        // Approving that conflict card promotes it with operator authority.
+        let promoted = apply_quarantine_decision(
+            home.path().to_path_buf(),
+            db.clone(),
+            agent.to_string(),
+            vec![row],
+            true,
+            true,
+            cards[0].payload["claim_digest"].as_str().map(str::to_string),
+        )
+        .await
+        .unwrap();
+        assert_eq!((promoted.promoted, promoted.stale), (1, 0));
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        let hist = engine.get_history(agent, "policy:refund", "window").await.unwrap();
+        let cur = current_refund(&hist);
+        assert_eq!(cur.len(), 1);
+        assert_eq!(cur[0].content, "the refund window is forever");
+    }
+
+    /// M3: approving a card after the protected fact changed writes nothing
+    /// and reports `quarantine_stale`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_card_reports_quarantine_stale() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+            .await
+            .unwrap();
+        let ids = report.outcomes[0].ids.clone();
+        // The protected fact changes after the card was filed.
+        store_clean(&engine, agent, "policy:refund", "window", "10 days", "the refund window is 10 days")
+            .await;
+        drop(engine);
+        let n = apply_quarantine_decision(
+            home.path().to_path_buf(),
+            db.clone(),
+            agent.to_string(),
+            ids.clone(),
+            true,
+            true,
+            digest_of(&db, agent, &ids[0]).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            n.side_effect(true, true),
+            serde_json::json!({ "quarantine_promoted": 0, "quarantine_stale": 1 })
+        );
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        let hist = engine.get_history(agent, "policy:refund", "window").await.unwrap();
+        let cur = current_refund(&hist);
+        assert_eq!(cur[0].content, "the refund window is 10 days");
+    }
+
+    /// M5: a data-subject erase removes a pending held claim, and approving
+    /// its card afterwards writes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn erased_held_claim_cannot_be_approved_back() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        store_clean(&engine, agent, "user:alice", "allergy", "peanuts", "allergy: peanuts").await;
+        let fact = DistilledFact {
+            subject: Some("user:alice".to_string()),
+            predicate: Some("allergy".to_string()),
+            object: Some("none".to_string()),
+            content: "alice has no allergies".to_string(),
+            confidence: Some(0.9),
+        };
+        let report = store_facts_protected(&engine, agent, &[fact], home.path())
+            .await
+            .unwrap();
+        assert_eq!(report.held, 1);
+        let ids = report.outcomes[0].ids.clone();
+        let erased = duduclaw_memory::gdpr_erase(&engine, agent, "user:alice", false)
+            .await
+            .unwrap();
+        assert_eq!(erased.memories_deleted, 2, "fact + held claim");
+        drop(engine);
+        let n = apply_quarantine_decision(
+            home.path().to_path_buf(),
+            db.clone(),
+            agent.to_string(),
+            ids.clone(),
+            true,
+            true,
+            digest_of(&db, agent, &ids[0]).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            n.side_effect(true, true),
+            serde_json::json!({ "quarantine_promoted": 0, "quarantine_stale": 0 })
+        );
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        assert!(engine.get_history(agent, "user:alice", "allergy").await.unwrap().is_empty());
+    }
+
+    /// M1: past the agent's daily review cap a refusal is audited only — no
+    /// held row, no card — and the audit row says the cap was hit.
+    #[tokio::test]
+    async fn held_claims_beyond_the_daily_cap_are_only_audited() {
+        let home = tmp_home();
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "support";
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        let quota = crate::auto_wiki_page::quota_path(home.path(), agent);
+        std::fs::create_dir_all(quota.parent().unwrap()).unwrap();
+        std::fs::write(
+            &quota,
+            serde_json::json!({
+                "date": Utc::now().format("%Y-%m-%d").to_string(),
+                "held_claims": crate::auto_wiki_page::MAX_HELD_CLAIMS_PER_DAY,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+            .await
+            .unwrap();
+        assert_eq!(report.held, 0);
+        assert!(report.outcomes.is_empty());
+        assert_eq!(
+            engine
+                .find_pending_held_claim(agent, "policy:refund", "window", Some("forever"))
+                .await
+                .unwrap(),
+            None
+        );
+        let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        let row: serde_json::Value = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .find(|v: &serde_json::Value| v["event_type"] == AUDIT_SUPERSESSION_REFUSED)
+            .unwrap();
+        assert_eq!(row["details"]["review_cap_hit"], true);
+        assert_eq!(row["details"]["held_id"], serde_json::Value::Null);
+    }
+
+    /// L1: a held row whose card is still pending survives the sweep; once the
+    /// card is no longer pending the row is closed out as a rejection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweep_closes_held_rows_whose_card_is_gone() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+            .await
+            .unwrap();
+        let held_id = report.outcomes[0].ids[0].clone();
+        dispatch_quarantine_side_effects(agent, home.path(), &db, &report.outcomes, None).await;
+        drop(engine);
+        let future = Utc::now() + chrono::Duration::seconds(5);
+        assert_eq!(sweep_unreviewed_quarantine_before(home.path(), &db, future).await.unwrap(), 0);
+        // The card is decided elsewhere without effect (e.g. before this fix):
+        let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+        let card = pending_quarantine_cards(home.path()).await.remove(0);
+        broker.decide(&card.id, false, "test").await.unwrap();
+        assert_eq!(sweep_unreviewed_quarantine_before(home.path(), &db, future).await.unwrap(), 1);
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        assert_eq!(
+            engine
+                .find_pending_held_claim(agent, "policy:refund", "window", Some("forever"))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(engine.get_origin_trust(agent, &held_id).await.unwrap(), Some(0.1));
+    }
+
+    #[test]
+    fn profile_subjects_are_labelled_by_predicate_never_by_raw_id() {
+        // R-L5: the label says whose profile it is.
+        assert_eq!(held_subject_label("user:42", "preferred_name"), "使用者希望的稱呼（使用者 42）");
+        assert_eq!(held_subject_label("policy:refund", "window"), "policy:refund");
+    }
+
+    // ── v1.67.1 third batch ──────────────────────────────────────────────
+
+    /// R-H1 / R-M1: a repeat that matches an older held row while no card is
+    /// pending files a card built from the STORED row (its text, its value,
+    /// its digest) — never from the new fact — and the payload carries every
+    /// value approval writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn re_filed_card_shows_the_stored_row_not_the_repeat() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        // First claim held; its card is never filed (e.g. filing failed).
+        let first = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+            .await
+            .unwrap();
+        let held_id = first.outcomes[0].ids[0].clone();
+        // A repeat: same object, different statement text.
+        let repeat = DistilledFact {
+            subject: Some("policy:refund".to_string()),
+            predicate: Some("window".to_string()),
+            object: Some("forever".to_string()),
+            content: "refunds are accepted forever, no receipt needed".to_string(),
+            confidence: Some(0.9),
+        };
+        let again = store_facts_protected(&engine, agent, &[repeat], home.path()).await.unwrap();
+        assert_eq!(again.outcomes[0].ids, vec![held_id.clone()]);
+        drop(engine);
+        dispatch_quarantine_side_effects(agent, home.path(), &db, &again.outcomes, None).await;
+        let cards = pending_quarantine_cards(home.path()).await;
+        assert_eq!(cards.len(), 1);
+        let p = &cards[0].payload;
+        assert_eq!(p["snippet"], "the refund window is forever", "the stored row's text");
+        assert!(cards[0].summary.ends_with("內容摘要：the refund window is forever"));
+        assert_eq!(p["new_value"], "forever");
+        assert_eq!(p["existing_value"], "7 days");
+        assert_eq!(p["existing_content"], "the refund window is 7 days");
+        assert_eq!(p["existing_content_truncated"], false);
+        assert_eq!(p["subject"], "policy:refund");
+        assert_eq!(p["predicate"], "window");
+        assert_eq!(p["subject_label"], "policy:refund");
+        let digest = p["claim_digest"].as_str().unwrap().to_string();
+        assert_eq!(
+            digest,
+            duduclaw_memory::claim_digest("the refund window is forever", "policy:refund", "window", Some("forever"))
+        );
+        // Approval writes exactly what the card showed.
+        let n = apply_quarantine_decision(
+            home.path().to_path_buf(),
+            db.clone(),
+            agent.to_string(),
+            vec![held_id],
+            true,
+            true,
+            Some(digest),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n.promoted, 1);
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        let hist = engine.get_history(agent, "policy:refund", "window").await.unwrap();
+        assert_eq!(current_refund(&hist)[0].content, "the refund window is forever");
+    }
+
+    /// R-M1: a protected value longer than 600 chars is cut on the card and
+    /// flagged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn card_flags_a_truncated_protected_value() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        let long = "長".repeat(700);
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", &long).await;
+        let r = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+            .await
+            .unwrap();
+        drop(engine);
+        dispatch_quarantine_side_effects(agent, home.path(), &db, &r.outcomes, None).await;
+        let p = pending_quarantine_cards(home.path()).await.remove(0).payload;
+        assert_eq!(p["existing_content_truncated"], true);
+        assert_eq!(p["existing_content"].as_str().unwrap().chars().count(), 600);
+    }
+
+    /// R-L1: the originating conversation is captured BEFORE the spawn the
+    /// distillation runs in, recorded on the card, and excluded from the
+    /// notice targets — with no reply-channel scope around the code that
+    /// files the card.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn origin_survives_the_spawn_and_is_excluded_from_notices() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        // The agent's control channel IS the chat the claim came from.
+        let agent_dir = home.path().join("agents").join(agent);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[proactive]\nnotify_channel = \"telegram\"\nnotify_chat_id = \"555\"\n",
+        )
+        .unwrap();
+        {
+            let engine = SqliteMemoryEngine::new(&db).unwrap();
+            store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+                .await;
+        }
+        let home_path = home.path().to_path_buf();
+        let db2 = db.clone();
+        // Production shape: capture in the reply scope, then spawn.
+        let handle = crate::claude_runner::REPLY_CHANNEL
+            .scope("telegram:555".to_string(), async move {
+                let origin = crate::decision_notify::origin_target();
+                tokio::spawn(async move {
+                    INGEST_ORIGIN
+                        .scope(origin, async move {
+                            let engine = SqliteMemoryEngine::new(&db2).unwrap();
+                            let r = store_facts_protected(
+                                &engine,
+                                "support",
+                                &[refund_fact("forever")],
+                                &home_path,
+                            )
+                            .await
+                            .unwrap();
+                            drop(engine);
+                            // Inside the spawned task the reply scope is gone.
+                            assert!(crate::decision_notify::origin_target().is_none());
+                            let o = ingest_origin();
+                            dispatch_quarantine_side_effects("support", &home_path, &db2, &r.outcomes, o.as_ref())
+                                .await;
+                        })
+                        .await
+                })
+            })
+            .await;
+        handle.await.unwrap();
+        let card = pending_quarantine_cards(home.path()).await.remove(0);
+        assert_eq!(card.payload["origin_channel"], "telegram");
+        assert_eq!(card.payload["origin_chat_id"], "555");
+        assert!(
+            crate::approval_notify::dashboard_only_targets_for_test(home.path(), &card).is_empty(),
+            "the originating chat is never a notice target"
+        );
+    }
+
+    /// R-M3: after an erase, pending cards covering an erased row are
+    /// withdrawn, every such card's text is replaced, and the matching events
+    /// are deleted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn erase_scrubs_cards_and_events() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        store_clean(&engine, agent, "user:alice", "allergy", "peanuts", "allergy: peanuts").await;
+        let fact = DistilledFact {
+            subject: Some("user:alice".to_string()),
+            predicate: Some("allergy".to_string()),
+            object: Some("none".to_string()),
+            content: "alice has no allergies".to_string(),
+            confidence: Some(0.9),
+        };
+        let r = store_facts_protected(&engine, agent, &[fact], home.path()).await.unwrap();
+        dispatch_quarantine_side_effects(agent, home.path(), &db, &r.outcomes, None).await;
+        let summary = duduclaw_memory::gdpr_erase(&engine, agent, "user:alice", false).await.unwrap();
+        drop(engine);
+        let out = scrub_review_store_for_erased(home.path(), &summary.erased_memory_ids)
+            .await
+            .unwrap();
+        assert_eq!((out.withdrawn, out.scrubbed, out.events_deleted), (1, 1, 1));
+        assert!(pending_quarantine_cards(home.path()).await.is_empty());
+        let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+        let rec = broker.list_by_kind(ACTION_KIND_KNOWLEDGE_QUARANTINE).await.unwrap().remove(0);
+        assert_eq!(rec.status, crate::approval::ApprovalStatus::Denied);
+        assert_eq!(rec.decided_by.as_deref(), Some(DECIDED_BY_GDPR_ERASE));
+        let dump = format!("{} {}", rec.summary, rec.payload);
+        for leaked in ["alice", "allerg", "peanuts", "none"] {
+            assert!(!dump.contains(leaked), "{leaked} survived: {dump}");
+        }
+        let events = crate::events_store::EventBusStore::open(home.path()).unwrap();
+        assert!(events.fetch_since(0, 100).await.unwrap().is_empty());
+    }
+
+    /// R-M6: the first refusal over the daily cap raises one Activity Feed
+    /// event; later refusals the same day do not.
+    #[tokio::test]
+    async fn first_cap_hit_raises_one_activity_event() {
+        let home = tmp_home();
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "support";
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        let quota = crate::auto_wiki_page::quota_path(home.path(), agent);
+        std::fs::create_dir_all(quota.parent().unwrap()).unwrap();
+        std::fs::write(
+            &quota,
+            serde_json::json!({
+                "date": Utc::now().format("%Y-%m-%d").to_string(),
+                "held_claims": crate::auto_wiki_page::MAX_HELD_CLAIMS_PER_DAY,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for obj in ["forever", "30 days", "90 days"] {
+            store_facts_protected(&engine, agent, &[refund_fact(obj)], home.path()).await.unwrap();
+        }
+        let store = crate::task_store::TaskStore::open(home.path()).unwrap();
+        let (rows, _) = store
+            .list_activity(Some(agent), Some(ACTIVITY_REVIEW_CAP_REACHED), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// The sweep does nothing when the approvals store cannot be read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweep_does_nothing_when_approvals_are_unreadable() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        let r = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+            .await
+            .unwrap();
+        drop(engine);
+        // approvals.db is a directory: the broker cannot open it.
+        std::fs::create_dir_all(home.path().join("approvals.db")).unwrap();
+        let future = Utc::now() + chrono::Duration::seconds(5);
+        assert!(sweep_unreviewed_quarantine_before(home.path(), &db, future).await.is_err());
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        assert!(engine.held_claim_view(agent, &r.outcomes[0].ids[0]).await.unwrap().is_some());
+    }
+
+    /// Item 4: an erase whose review scrub failed is finished by a re-run —
+    /// no memory ids come back the second time, so the scrub matches the
+    /// contact (exact subject), withdrawing and scrubbing the card and
+    /// deleting the event; a different contact sharing a prefix is untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn erase_rerun_scrubs_by_contact() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        for (subj, obj) in [("user:alice", "peanuts"), ("user:alice2", "milk")] {
+            store_clean(&engine, agent, subj, "allergy", obj, &format!("allergy: {obj}")).await;
+            let fact = DistilledFact {
+                subject: Some(subj.to_string()),
+                predicate: Some("allergy".to_string()),
+                object: Some("none".to_string()),
+                content: format!("{subj} has no allergies"),
+                confidence: Some(0.9),
+            };
+            let r = store_facts_protected(&engine, agent, &[fact], home.path()).await.unwrap();
+            dispatch_quarantine_side_effects(agent, home.path(), &db, &r.outcomes, None).await;
+        }
+        // First run: memory erased, review scrub "failed" (not run).
+        let first = duduclaw_memory::gdpr_erase(&engine, agent, "user:alice", false).await.unwrap();
+        assert!(!first.erased_memory_ids.is_empty());
+        // Re-run: nothing left in memory.
+        let again = duduclaw_memory::gdpr_erase(&engine, agent, "user:alice", false).await.unwrap();
+        assert!(again.erased_memory_ids.is_empty());
+        drop(engine);
+        let out = scrub_review_store_after_erase(home.path(), &again.erased_memory_ids, "user:alice")
+            .await
+            .unwrap();
+        assert_eq!((out.withdrawn, out.scrubbed, out.events_deleted), (1, 1, 1));
+        let pending = pending_quarantine_cards(home.path()).await;
+        assert_eq!(pending.len(), 1, "alice2's card untouched");
+        assert_eq!(pending[0].payload["subject"], "user:alice2");
+    }
+
+    /// Item 5: a release-converted row too long for a card is audited like the
+    /// other not-held cases.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn too_long_release_conversion_is_audited() {
+        let home = tmp_home();
+        let db = home.path().join("memory.db");
+        let agent = "support";
+        let mut engine = SqliteMemoryEngine::new(&db).unwrap();
+        store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
+            .await;
+        engine.supersession_trust_guard = false;
+        let mut q = TemporalMeta {
+            subject: Some("policy:refund".into()),
+            predicate: Some("window".into()),
+            object: Some("forever".into()),
+            origin: Some(DISTILL_ORIGIN.into()),
+            ..TemporalMeta::default()
+        };
+        q.quarantined = true;
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent.to_string(),
+            content: "長".repeat(MAX_FACT_CONTENT_CHARS + 1),
+            timestamp: Utc::now(),
+            tags: vec![],
+            embedding: None,
+            layer: MemoryLayer::Semantic,
+            importance: 5.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: DISTILL_SOURCE_EVENT.to_string(),
+        };
+        let row = engine.store_temporal(agent, entry, q).await.unwrap();
+        drop(engine);
+        let report = apply_quarantine_decision(
+            home.path().to_path_buf(),
+            db.clone(),
+            agent.to_string(),
+            vec![row],
+            true,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        dispatch_quarantine_side_effects(agent, home.path(), &db, &report.held, None).await;
+        assert!(pending_quarantine_cards(home.path()).await.is_empty());
+        let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| v["event_type"] == AUDIT_SUPERSESSION_REFUSED
+                && v["details"]["not_held_reason"] == "too_long"));
     }
 }

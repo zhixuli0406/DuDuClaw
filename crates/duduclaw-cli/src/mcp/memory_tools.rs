@@ -161,6 +161,26 @@ pub(crate) fn novelty_gate_enabled_from_config(home_dir: &Path) -> bool {
         .unwrap_or(default)
 }
 
+/// `[memory] supersession_trust_guard` in `config.toml`, default `true`
+/// (fails closed: absent / malformed / non-boolean all keep the guard on).
+/// Mirrors `duduclaw_gateway::memory_factory::supersession_trust_guard_enabled_from_config`
+/// — duplicated for the same reason as [`novelty_gate_enabled_from_config`].
+pub(crate) fn supersession_trust_guard_enabled_from_config(home_dir: &Path) -> bool {
+    let default = true;
+    let Ok(content) = std::fs::read_to_string(home_dir.join("config.toml")) else {
+        return default;
+    };
+    let Ok(table) = content.parse::<toml::Table>() else {
+        return default;
+    };
+    table
+        .get("memory")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("supersession_trust_guard"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
+
 /// Run the MCP server, reading JSON-RPC from stdin and writing responses to stdout.
 /// Opt-in: attach the local char-n-gram semantic embedder (the `w_vec` memory
 /// retrieval signal) when `DUDUCLAW_SEMANTIC_VECTORS=1`. Off by default →
@@ -194,10 +214,12 @@ pub(crate) fn maybe_with_semantic_embedder(
             "[memory] novelty_gate = false — B1 write-time near-duplicate rejection disabled"
         );
     }
-    engine.with_novelty_gate_config(duduclaw_memory::NoveltyGateConfig {
-        enabled: novelty_gate_enabled,
-        ..duduclaw_memory::NoveltyGateConfig::default()
-    })
+    engine
+        .with_novelty_gate_config(duduclaw_memory::NoveltyGateConfig {
+            enabled: novelty_gate_enabled,
+            ..duduclaw_memory::NoveltyGateConfig::default()
+        })
+        .with_supersession_trust_guard(supersession_trust_guard_enabled_from_config(home_dir))
 }
 
 #[cfg(test)]
@@ -255,6 +277,21 @@ mod novelty_gate_config_tests {
         )
         .unwrap();
         assert!(novelty_gate_enabled_from_config(dir.path()));
+    }
+
+    #[test]
+    fn maybe_with_semantic_embedder_wires_supersession_trust_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("memory.db");
+        let on = maybe_with_semantic_embedder(SqliteMemoryEngine::new(&db).unwrap(), dir.path());
+        assert!(on.supersession_trust_guard, "default must be on");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[memory]\nsupersession_trust_guard = false\n",
+        )
+        .unwrap();
+        let off = maybe_with_semantic_embedder(SqliteMemoryEngine::new(&db).unwrap(), dir.path());
+        assert!(!off.supersession_trust_guard);
     }
 
     /// Fix-2 M1 end-to-end: `maybe_with_semantic_embedder` wires the config

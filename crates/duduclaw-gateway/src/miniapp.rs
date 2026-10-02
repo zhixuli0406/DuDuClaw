@@ -704,14 +704,31 @@ async fn detail_handler(
         reason_prefix: crate::decision_notify::reason_prefix(DecisionSource::Approval).to_string(),
         agent: rec.agent_id.clone(),
         action: crate::approval_notify::zh_action_kind(&rec.action_kind).to_string(),
-        summary: duduclaw_core::truncate_chars(&rec.summary, SUMMARY_MAX_CHARS),
-        trajectory,
+        // R-L2: a dashboard-only kind carries a claim and a protected value
+        // in its summary; the Mini App shows only the plain notice.
+        summary: detail_summary(&rec),
+        trajectory: if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind) {
+            None
+        } else {
+            trajectory
+        },
         status: rec.status.as_str().to_string(),
         settled: rec.status.is_terminal(),
         expires_at_epoch: rec.expires_at_epoch(),
         ttl_seconds: rec.ttl_seconds,
     };
     (StatusCode::OK, Json(json!({ "approval": detail }))).into_response()
+}
+
+/// The summary the Mini App shows. R-L2: a dashboard-only kind carries a
+/// claim and a protected value in its summary, so only the plain notice (the
+/// same text the channel gets) is returned for it.
+fn detail_summary(rec: &crate::approval::ApprovalRecord) -> String {
+    if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind) {
+        crate::approval_notify::dashboard_only_notice_body(rec, false)
+    } else {
+        duduclaw_core::truncate_chars(&rec.summary, SUMMARY_MAX_CHARS)
+    }
 }
 
 /// `POST /miniapp/api/approval/decide` — verify, then hand off to the unified
@@ -1396,5 +1413,30 @@ mod tests {
         }
         assert!(html.contains("同意這個動作"));
         assert!(html.contains("拒絕這個動作"));
+    }
+
+    #[test]
+    fn dashboard_only_kind_summary_is_redacted() {
+        let mut rec = crate::approval::ApprovalRecord {
+            id: crate::approval::ApprovalId::from("ap-1".to_string()),
+            agent_id: "support".into(),
+            action_kind: "knowledge_quarantine".into(),
+            summary: "對話中有一則新說法 目前內容：「七天」 內容摘要：永久退款".into(),
+            payload: serde_json::json!({ "disposition": "trust_held" }),
+            status: crate::approval::ApprovalStatus::Pending,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            decided_at: None,
+            decided_by: None,
+            ttl_seconds: 300,
+            notify_channel: None,
+            notify_chat_id: None,
+            reminded_at: None,
+            simulation: None,
+        };
+        let s = detail_summary(&rec);
+        assert!(!s.contains("永久退款") && !s.contains("七天"), "{s}");
+        assert!(s.contains("儀表板"));
+        rec.action_kind = "mcp_install".into();
+        assert!(detail_summary(&rec).contains("永久退款"));
     }
 }

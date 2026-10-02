@@ -80,6 +80,150 @@ fn trigger_event_accepts_odoo_events() {
 }
 
 #[test]
+fn create_refuses_cron_tick_but_update_keeps_accepting_it() {
+    // Nothing emits `cron_tick`; a new rule on it would never fire.
+    let err = validate_autopilot_trigger_event_for_create("cron_tick").unwrap_err();
+    assert!(err.contains("never emitted"), "{err}");
+    assert!(err.contains("scheduled task"), "{err}");
+    // Stored rules keep loading and updating.
+    assert!(validate_autopilot_trigger_event("cron_tick").is_ok());
+    for ev in AUTOPILOT_CREATE_TRIGGER_EVENTS {
+        assert!(validate_autopilot_trigger_event_for_create(ev).is_ok(), "{ev}");
+    }
+    assert!(validate_autopilot_trigger_event_for_create("randomEvent").is_err());
+    // The unknown-event message no longer advertises the dead name.
+    let unknown = validate_autopilot_trigger_event("randomEvent").unwrap_err();
+    assert!(!unknown.contains("cron_tick"), "{unknown}");
+}
+
+#[test]
+fn conditions_validator_accepts_no_conditions_and_rejects_malformed_leaves() {
+    for ok in [
+        Value::Null,
+        json!({}),
+        json!({ "all": [] }),
+        json!({ "any": [] }),
+        json!({ "field": "agent_id", "value": "a" }),
+        json!({ "field": "agent_id", "op": "eq", "value": "a" }),
+        json!({ "all": [ { "field": "task.priority", "op": "in", "value": ["high"] },
+                         { "any": [ { "field": "text", "op": "contains", "value": "x" } ] } ] }),
+        json!({ "all": [ {} ] }),
+    ] {
+        assert!(validate_autopilot_conditions(&ok).is_ok(), "{ok} must be accepted");
+    }
+    for bad in [
+        json!({ "op": "eq", "value": "a" }),
+        json!({ "field": "", "op": "eq" }),
+        json!({ "field": "  " }),
+        json!({ "field": 3 }),
+        json!({ "field": "a", "op": "like" }),
+        json!({ "field": "a", "op": 1 }),
+        json!({ "all": {} }),
+        json!({ "any": "x" }),
+        json!({ "all": [ { "value": 1 } ] }),
+        json!({ "any": [ { "field": "a" }, { "op": "eq" } ] }),
+        json!("always"),
+        json!([]),
+        json!(1),
+    ] {
+        let err = validate_autopilot_conditions(&bad).expect_err(&format!("{bad} must be refused"));
+        assert!(err.starts_with("conditions"), "message must name the path: {err}");
+    }
+    // Pathologically deep nesting is refused, not recursed without bound.
+    let mut deep = json!({ "field": "a" });
+    for _ in 0..40 {
+        deep = json!({ "all": [deep] });
+    }
+    assert!(validate_autopilot_conditions(&deep).is_err());
+}
+
+/// The dashboard mirrors the server's trigger list by hand
+/// (`web/src/lib/autopilot-rules.ts` `SERVER_TRIGGER_EVENTS`). Every name a new
+/// rule may use must be offered there, and the dashboard may list nothing the
+/// server does not accept (a legacy update-only name is tolerated).
+#[test]
+fn dashboard_trigger_list_mirrors_server() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../web/src/lib/autopilot-rules.ts");
+    let src = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "SKIP dashboard_trigger_list_mirrors_server: {} absent (source tree without web/)",
+                path.display()
+            );
+            return;
+        }
+        Err(e) => panic!("read {}: {e}", path.display()),
+    };
+    let ts = parse_ts_string_array(&src, "SERVER_TRIGGER_EVENTS")
+        .unwrap_or_else(|| panic!("SERVER_TRIGGER_EVENTS array not found in {}", path.display()));
+    let ts: std::collections::BTreeSet<String> = ts.into_iter().collect();
+    let create: std::collections::BTreeSet<String> =
+        AUTOPILOT_CREATE_TRIGGER_EVENTS.iter().map(|s| s.to_string()).collect();
+    let legacy: std::collections::BTreeSet<String> =
+        AUTOPILOT_LEGACY_TRIGGER_EVENTS.iter().map(|s| s.to_string()).collect();
+
+    let missing: Vec<_> = create.difference(&ts).collect();
+    assert!(missing.is_empty(), "server create triggers missing from the dashboard list: {missing:?}");
+    let extra: Vec<_> = ts.iter().filter(|t| !create.contains(*t) && !legacy.contains(*t)).collect();
+    assert!(extra.is_empty(), "dashboard lists triggers the server refuses: {extra:?}");
+}
+
+/// Extract the string literals of `<name> = [ ... ]` from TypeScript source,
+/// tolerant of quotes style, trailing commas, line/block comments and layout.
+fn parse_ts_string_array(src: &str, name: &str) -> Option<Vec<String>> {
+    let decl = src.find(&format!("{name} ="))?;
+    let rest = &src[decl..];
+    let open = rest.find('[')?;
+    let body = &rest[open + 1..];
+    let mut out = Vec::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ']' => return Some(out),
+            '/' if chars.peek() == Some(&'/') => {
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = ' ';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            '\'' | '"' | '`' => {
+                let mut lit = String::new();
+                for n in chars.by_ref() {
+                    if n == c {
+                        break;
+                    }
+                    lit.push(n);
+                }
+                out.push(lit);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[test]
+fn ts_array_parser_handles_layout_and_comments() {
+    let src = "export const X = [\n  'a', // note ']'\n  \"b\" /* c */,\n] as const;";
+    assert_eq!(parse_ts_string_array(src, "X").unwrap(), vec!["a", "b"]);
+    assert_eq!(parse_ts_string_array("const X = ['a','b']", "X").unwrap(), vec!["a", "b"]);
+    assert!(parse_ts_string_array("const Y = []", "X").is_none());
+}
+
+#[test]
 fn trigger_event_rejects_typos() {
     assert!(validate_autopilot_trigger_event("task.created").is_err());
     assert!(validate_autopilot_trigger_event("").is_err());
@@ -192,4 +336,17 @@ fn action_rejects_a_malformed_screen_at_write_time() {
             "screen {bad} must be refused"
         );
     }
+}
+
+/// `autopilot.update`: `cron_tick` round-trips on a rule that already has it,
+/// and changing any other rule to it is refused with the create message.
+#[test]
+fn update_accepts_cron_tick_only_when_unchanged() {
+    assert!(validate_autopilot_trigger_event_for_update("cron_tick", "cron_tick").is_ok());
+    let err = validate_autopilot_trigger_event_for_update("cron_tick", "task_created").unwrap_err();
+    assert_eq!(err, validate_autopilot_trigger_event_for_create("cron_tick").unwrap_err());
+    // Moving off the legacy trigger, and ordinary changes, are unaffected.
+    assert!(validate_autopilot_trigger_event_for_update("task_created", "cron_tick").is_ok());
+    assert!(validate_autopilot_trigger_event_for_update("tick", "task_created").is_ok());
+    assert!(validate_autopilot_trigger_event_for_update("nope", "nope").is_err());
 }

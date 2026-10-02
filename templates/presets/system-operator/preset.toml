@@ -73,7 +73,7 @@ fallback = "claude-haiku-4-5"
 preferred = "claude-sonnet-4-6"
 
 [model.local]
-backend = "llama_cpp"
+backend = "openai_compat"
 context_length = 8192
 gpu_layers = -1
 model = ""

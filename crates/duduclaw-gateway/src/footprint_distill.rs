@@ -427,8 +427,14 @@ async fn write_footprint_triples(
             )),
             ..TemporalMeta::default()
         };
-        let id = engine.store_temporal(agent_id, entry, meta).await?;
-        ids.push(id);
+        // L5: a supersession-guard refusal (a more trusted value holds this
+        // key) skips this triple and logs; real errors still propagate.
+        match engine.store_temporal_outcome(agent_id, entry, meta).await? {
+            duduclaw_memory::TemporalWriteOutcome::Stored(id) => ids.push(id),
+            duduclaw_memory::TemporalWriteOutcome::Refused(r) => {
+                tracing::info!(agent = agent_id, "footprint triple skipped: {r}");
+            }
+        }
     }
     Ok(ids)
 }
@@ -1122,6 +1128,45 @@ mod tests {
             duduclaw_memory::read_sensitivity_metadata(Some(&hours_fact.1)),
             Sensitivity::Personal
         );
+    }
+
+    /// L5: an operator value on one footprint key refuses that triple only;
+    /// the other triples are still written and the call does not fail.
+    #[tokio::test]
+    async fn write_footprint_triples_continues_after_a_refusal() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        engine
+            .store_temporal(
+                "agent-x",
+                MemoryEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    agent_id: "agent-x".into(),
+                    content: "operator-set hours".into(),
+                    timestamp: Utc::now(),
+                    tags: vec![],
+                    embedding: None,
+                    layer: MemoryLayer::Semantic,
+                    importance: 5.0,
+                    access_count: 0,
+                    last_accessed: None,
+                    source_event: "test".into(),
+                },
+                TemporalMeta {
+                    subject: Some(FOOTPRINT_SUBJECT.into()),
+                    predicate: Some(PREDICATE_ACTIVE_HOURS.into()),
+                    object: Some("operator".into()),
+                    origin: Some("operator".into()),
+                    ..TemporalMeta::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut stats = AgentDayStats::new(NaiveDate::from_ymd_opt(2026, 7, 20).unwrap());
+        stats.app_seconds.insert("VSCode".into(), 3600);
+        stats.dir_counts.insert("/Users/me/proj".into(), 4);
+        stats.hour_counts[9] = 3;
+        let ids = write_footprint_triples(&engine, "agent-x", &stats).await.unwrap();
+        assert_eq!(ids.len(), 2, "hours refused, app + directory written");
     }
 
     #[tokio::test]

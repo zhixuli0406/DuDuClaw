@@ -25,7 +25,7 @@ pub struct McpServerDef {
 
 /// Generate a Playwright MCP server configuration.
 pub fn playwright_mcp_config(headless: bool) -> McpConfig {
-    let mut args = vec!["@anthropic-ai/mcp-server-playwright".to_string()];
+    let mut args = vec!["-y".to_string(), PLAYWRIGHT_MCP_PACKAGE.to_string()];
     if headless {
         args.push("--headless".to_string());
     }
@@ -97,20 +97,17 @@ pub fn ensure_playwright_in_config(agent_dir: &Path, headless: bool) -> Result<(
 /// Generate a Browserbase MCP server configuration.
 ///
 /// The `api_key` and `project_id` parameters are ignored; the generated config
-/// always uses environment variable references (`${BROWSERBASE_API_KEY}` and
-/// `${BROWSERBASE_PROJECT_ID}`) so that actual secrets are never written to
-/// `.mcp.json` on disk. Callers must ensure the corresponding environment
-/// variables are set at runtime.
+/// always uses environment variable references (`${BROWSERBASE_API_KEY}`,
+/// `${BROWSERBASE_PROJECT_ID}` and `${GEMINI_API_KEY}` for the server's
+/// default model) so that actual secrets are never written to `.mcp.json` on
+/// disk. Callers must ensure the corresponding environment variables are set
+/// at runtime.
 pub fn browserbase_mcp_config(_api_key: &str, _project_id: &str) -> McpConfig {
-    let mut env = std::collections::HashMap::new();
-    env.insert("BROWSERBASE_API_KEY".to_string(), "${BROWSERBASE_API_KEY}".to_string());
-    env.insert("BROWSERBASE_PROJECT_ID".to_string(), "${BROWSERBASE_PROJECT_ID}".to_string());
-
     let mut servers = std::collections::HashMap::new();
     servers.insert("browserbase".to_string(), McpServerDef {
         command: "npx".to_string(),
-        args: vec!["@browserbasehq/mcp-server-browserbase".to_string()],
-        env,
+        args: vec!["-y".to_string(), BROWSERBASE_MCP_PACKAGE.to_string()],
+        env: env_refs(&BROWSERBASE_REQUIRED_ENV),
     });
 
     McpConfig { mcp_servers: servers }
@@ -506,7 +503,28 @@ pub struct McpCatalogItem {
     pub required_env: Vec<String>,
 }
 
+/// npm package that serves the Playwright MCP server (Microsoft; `--headless` supported).
+pub const PLAYWRIGHT_MCP_PACKAGE: &str = "@playwright/mcp";
+/// npm package that serves the Browserbase MCP server. The older
+/// `@browserbasehq/mcp-server-browserbase` is deprecated in favour of this one.
+pub const BROWSERBASE_MCP_PACKAGE: &str = "@browserbasehq/mcp";
+/// Environment the Browserbase server needs: its own key + project, plus a key
+/// for the default Stagehand model (Gemini) per the package README.
+pub const BROWSERBASE_REQUIRED_ENV: [&str; 3] =
+    ["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "GEMINI_API_KEY"];
+
+/// `${NAME}` references for each env name, so secrets never land in `.mcp.json`.
+fn env_refs(names: &[&str]) -> std::collections::HashMap<String, String> {
+    names.iter().map(|n| (n.to_string(), format!("${{{n}}}"))).collect()
+}
+
 /// Return the built-in MCP marketplace catalog.
+///
+/// Only packages confirmed on the npm registry and not marked deprecated /
+/// unsupported are listed (checked 2026-10-03). The former `@anthropic-ai/
+/// mcp-server-*` names never existed, and the github / slack / postgres /
+/// brave-search / sqlite / fetch cards were removed: their
+/// `@modelcontextprotocol/server-*` packages are unsupported or absent.
 pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
     vec![
         McpCatalogItem {
@@ -514,13 +532,13 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "Playwright".into(),
             description: "Browser automation".into(),
             category: "browser".into(),
-            author: "Anthropic".into(),
+            author: "Microsoft".into(),
             tags: vec!["browser".into(), "automation".into(), "testing".into()],
             featured: true,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
-                args: vec!["@anthropic-ai/mcp-server-playwright".into(), "--headless".into()],
+                args: vec!["-y".into(), PLAYWRIGHT_MCP_PACKAGE.into(), "--headless".into()],
                 env: Default::default(),
             },
             required_env: vec![],
@@ -530,96 +548,33 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "Browserbase".into(),
             description: "Cloud browser".into(),
             category: "browser".into(),
-            author: "community".into(),
+            author: "Browserbase".into(),
             tags: vec!["browser".into(), "cloud".into(), "automation".into()],
             featured: false,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
-                args: vec!["@anthropic-ai/mcp-server-browserbase".into()],
-                env: [
-                    ("BROWSERBASE_API_KEY".into(), "${BROWSERBASE_API_KEY}".into()),
-                    ("BROWSERBASE_PROJECT_ID".into(), "${BROWSERBASE_PROJECT_ID}".into()),
-                ].into_iter().collect(),
+                args: vec!["-y".into(), BROWSERBASE_MCP_PACKAGE.into()],
+                env: env_refs(&BROWSERBASE_REQUIRED_ENV),
             },
-            required_env: vec!["BROWSERBASE_API_KEY".into(), "BROWSERBASE_PROJECT_ID".into()],
+            required_env: BROWSERBASE_REQUIRED_ENV.iter().map(|s| s.to_string()).collect(),
         },
         McpCatalogItem {
             id: "filesystem".into(),
             name: "Filesystem".into(),
             description: "File access".into(),
             category: "data".into(),
-            author: "Anthropic".into(),
+            author: "Model Context Protocol".into(),
             tags: vec!["files".into(), "storage".into(), "local".into()],
             featured: true,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
-                args: vec!["@anthropic-ai/mcp-server-filesystem".into(), ".".into()],
-                env: Default::default(),
-            },
-            required_env: vec![],
-        },
-        McpCatalogItem {
-            id: "github".into(),
-            name: "GitHub".into(),
-            description: "GitHub API".into(),
-            category: "data".into(),
-            author: "Anthropic".into(),
-            tags: vec!["github".into(), "git".into(), "api".into(), "code".into()],
-            featured: true,
-            requires_oauth: false,
-            default_def: McpServerDef {
-                command: "npx".into(),
-                args: vec!["@anthropic-ai/mcp-server-github".into()],
-                env: [("GITHUB_TOKEN".into(), "${GITHUB_TOKEN}".into())].into_iter().collect(),
-            },
-            required_env: vec!["GITHUB_TOKEN".into()],
-        },
-        McpCatalogItem {
-            id: "slack".into(),
-            name: "Slack".into(),
-            description: "Slack".into(),
-            category: "communication".into(),
-            author: "Anthropic".into(),
-            tags: vec!["slack".into(), "messaging".into(), "chat".into()],
-            featured: false,
-            requires_oauth: false,
-            default_def: McpServerDef {
-                command: "npx".into(),
-                args: vec!["@anthropic-ai/mcp-server-slack".into()],
-                env: [("SLACK_BOT_TOKEN".into(), "${SLACK_BOT_TOKEN}".into())].into_iter().collect(),
-            },
-            required_env: vec!["SLACK_BOT_TOKEN".into()],
-        },
-        McpCatalogItem {
-            id: "postgres".into(),
-            name: "PostgreSQL".into(),
-            description: "PostgreSQL".into(),
-            category: "data".into(),
-            author: "Anthropic".into(),
-            tags: vec!["database".into(), "sql".into(), "postgres".into()],
-            featured: true,
-            requires_oauth: false,
-            default_def: McpServerDef {
-                command: "npx".into(),
-                args: vec!["@anthropic-ai/mcp-server-postgres".into()],
-                env: [("DATABASE_URL".into(), "${DATABASE_URL}".into())].into_iter().collect(),
-            },
-            required_env: vec!["DATABASE_URL".into()],
-        },
-        McpCatalogItem {
-            id: "sqlite".into(),
-            name: "SQLite".into(),
-            description: "SQLite".into(),
-            category: "data".into(),
-            author: "Anthropic".into(),
-            tags: vec!["database".into(), "sql".into(), "sqlite".into(), "local".into()],
-            featured: false,
-            requires_oauth: false,
-            default_def: McpServerDef {
-                command: "npx".into(),
-                args: vec!["@anthropic-ai/mcp-server-sqlite".into()],
+                args: vec![
+                    "-y".into(),
+                    "@modelcontextprotocol/server-filesystem".into(),
+                    ".".into(),
+                ],
                 env: Default::default(),
             },
             required_env: vec![],
@@ -629,48 +584,16 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "Memory".into(),
             description: "Persistent memory".into(),
             category: "data".into(),
-            author: "Anthropic".into(),
+            author: "Model Context Protocol".into(),
             tags: vec!["memory".into(), "storage".into(), "knowledge".into()],
             featured: false,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
-                args: vec!["@anthropic-ai/mcp-server-memory".into()],
+                args: vec!["-y".into(), "@modelcontextprotocol/server-memory".into()],
                 env: Default::default(),
             },
             required_env: vec![],
-        },
-        McpCatalogItem {
-            id: "fetch".into(),
-            name: "Fetch".into(),
-            description: "HTTP fetch".into(),
-            category: "data".into(),
-            author: "Anthropic".into(),
-            tags: vec!["http".into(), "web".into(), "api".into()],
-            featured: false,
-            requires_oauth: false,
-            default_def: McpServerDef {
-                command: "npx".into(),
-                args: vec!["@anthropic-ai/mcp-server-fetch".into()],
-                env: Default::default(),
-            },
-            required_env: vec![],
-        },
-        McpCatalogItem {
-            id: "brave-search".into(),
-            name: "Brave Search".into(),
-            description: "Brave Search".into(),
-            category: "data".into(),
-            author: "Anthropic".into(),
-            tags: vec!["search".into(), "web".into(), "brave".into()],
-            featured: false,
-            requires_oauth: false,
-            default_def: McpServerDef {
-                command: "npx".into(),
-                args: vec!["@anthropic-ai/mcp-server-brave-search".into()],
-                env: [("BRAVE_API_KEY".into(), "${BRAVE_API_KEY}".into())].into_iter().collect(),
-            },
-            required_env: vec!["BRAVE_API_KEY".into()],
         },
     ]
 }
@@ -763,7 +686,99 @@ mod tests {
         // Values must be env var references, never the literal secret.
         assert_eq!(server.env["BROWSERBASE_API_KEY"], "${BROWSERBASE_API_KEY}");
         assert_eq!(server.env["BROWSERBASE_PROJECT_ID"], "${BROWSERBASE_PROJECT_ID}");
-        assert!(server.args.contains(&"@browserbasehq/mcp-server-browserbase".to_string()));
+        assert_eq!(server.env["GEMINI_API_KEY"], "${GEMINI_API_KEY}");
+        assert!(server.args.contains(&BROWSERBASE_MCP_PACKAGE.to_string()));
+    }
+
+    /// npm scopes/prefixes confirmed not to exist on the registry. A catalogue
+    /// entry under one of these installs nothing and fails at first spawn.
+    const DEAD_PACKAGE_PREFIXES: &[&str] = &["@anthropic-ai/mcp-server-"];
+
+    /// The npm package an `npx` definition runs: the first non-flag argument.
+    fn npx_package(def: &McpServerDef) -> Option<&str> {
+        def.args.iter().map(String::as_str).find(|a| !a.starts_with('-'))
+    }
+
+    /// Every `${NAME}` reference inside the definition's env values.
+    fn referenced_env_names(def: &McpServerDef) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for v in def.env.values() {
+            let mut rest = v.as_str();
+            while let Some(start) = rest.find("${") {
+                let after = &rest[start + 2..];
+                match after.find('}') {
+                    Some(end) => {
+                        out.insert(after[..end].to_string());
+                        rest = &after[end + 1..];
+                    }
+                    None => break,
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_def_sound(label: &str, def: &McpServerDef) {
+        assert!(!def.command.trim().is_empty(), "{label}: empty command");
+        assert!(!def.args.is_empty(), "{label}: empty args");
+        let pkg = npx_package(def).unwrap_or_else(|| panic!("{label}: no package argument"));
+        for dead in DEAD_PACKAGE_PREFIXES {
+            assert!(
+                !pkg.starts_with(dead),
+                "{label}: package '{pkg}' uses the non-existent prefix '{dead}'"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_entries_name_real_packages_and_declare_env() {
+        let catalog = marketplace_catalog();
+        assert!(!catalog.is_empty());
+        let mut ids = std::collections::BTreeSet::new();
+        for item in &catalog {
+            assert!(ids.insert(item.id.clone()), "duplicate catalogue id '{}'", item.id);
+            assert_def_sound(&item.id, &item.default_def);
+            assert!(!item.author.trim().is_empty(), "{}: empty author", item.id);
+
+            // Declared env == the env the definition passes, and every env value
+            // is a reference to a declared name (never a literal secret).
+            let declared: std::collections::BTreeSet<String> =
+                item.required_env.iter().cloned().collect();
+            let passed: std::collections::BTreeSet<String> =
+                item.default_def.env.keys().cloned().collect();
+            assert_eq!(declared, passed, "{}: required_env != env keys", item.id);
+            let referenced = referenced_env_names(&item.default_def);
+            assert_eq!(referenced, declared, "{}: env values must reference declared names", item.id);
+            for name in &item.required_env {
+                assert!(!name.trim().is_empty(), "{}: empty env name", item.id);
+            }
+        }
+    }
+
+    #[test]
+    fn generated_browser_configs_name_real_packages() {
+        for (name, def) in playwright_mcp_config(true)
+            .mcp_servers
+            .into_iter()
+            .chain(browserbase_mcp_config("k", "p").mcp_servers)
+        {
+            assert_def_sound(&name, &def);
+        }
+        let bb = browserbase_mcp_config("k", "p");
+        let env: std::collections::BTreeSet<&str> =
+            bb.mcp_servers["browserbase"].env.keys().map(String::as_str).collect();
+        assert_eq!(env, BROWSERBASE_REQUIRED_ENV.into_iter().collect());
+    }
+
+    #[test]
+    fn dead_prefix_check_catches_old_names() {
+        let def = McpServerDef {
+            command: "npx".into(),
+            args: vec!["-y".into(), "@anthropic-ai/mcp-server-playwright".into()],
+            env: Default::default(),
+        };
+        let caught = std::panic::catch_unwind(|| assert_def_sound("legacy", &def));
+        assert!(caught.is_err(), "the dead-prefix guard must reject the old package name");
     }
 
     #[test]
@@ -773,7 +788,7 @@ mod tests {
         let mut initial = McpConfig { mcp_servers: std::collections::HashMap::new() };
         initial.mcp_servers.insert("memory".to_string(), McpServerDef {
             command: "npx".to_string(),
-            args: vec!["@anthropic-ai/mcp-server-memory".to_string()],
+            args: vec!["-y".to_string(), "@modelcontextprotocol/server-memory".to_string()],
             env: std::collections::HashMap::new(),
         });
         write_mcp_config(dir.path(), &initial).expect("initial write should succeed");
@@ -1003,7 +1018,7 @@ mod tests {
                 },
                 "playwright": {
                     "command": "npx",
-                    "args": ["@anthropic-ai/mcp-server-playwright", "--headless"],
+                    "args": ["-y", "@playwright/mcp", "--headless"],
                     "env": {}
                 }
             }
@@ -1024,8 +1039,8 @@ mod tests {
             Some("npx")
         );
         assert_eq!(
-            got["mcpServers"]["playwright"]["args"][0].as_str(),
-            Some("@anthropic-ai/mcp-server-playwright")
+            got["mcpServers"]["playwright"]["args"][1].as_str(),
+            Some("@playwright/mcp")
         );
     }
 

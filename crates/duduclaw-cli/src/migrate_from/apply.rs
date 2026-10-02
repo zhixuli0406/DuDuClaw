@@ -140,8 +140,13 @@ pub(super) async fn store_import_memory(
         source_event: format!("migrate-from-{}", ctx.platform.as_str()),
     };
     meta.origin = Some("import".to_string());
-    match eng.store_temporal(agent_id, entry, meta).await {
-        Ok(_) => report.imported("memory", label),
+    match eng.store_temporal_outcome(agent_id, entry, meta).await {
+        Ok(duduclaw_memory::TemporalWriteOutcome::Stored(_)) => report.imported("memory", label),
+        // L5: a more trusted current value (operator-set or approved) is kept;
+        // the import does not overwrite it. Not a failure.
+        Ok(duduclaw_memory::TemporalWriteOutcome::Refused(_)) => {
+            report.skipped("memory", label, "已有更可信的現有內容，保留原值未覆寫")
+        }
         Err(e) => report.skipped("memory", label, format!("寫入失敗: {e}")),
     }
 }

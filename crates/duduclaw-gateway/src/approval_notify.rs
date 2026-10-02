@@ -163,7 +163,142 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
     push(home_dir, rec, true).await
 }
 
+/// Approval kinds decided in the dashboard only (H1, v1.67.1). Their channel
+/// push is a plain notice without decision buttons or a text-reply verb, it is
+/// never sent to the conversation the action came from, and a channel press /
+/// text decision that still arrives for one is refused (see
+/// [`apply_decision`]).
+///
+/// `knowledge_quarantine` is the only member: approving it writes knowledge
+/// with operator authority (a held claim is promoted, a burst is released),
+/// and a channel press can only be authorised by the push destination when no
+/// identity system is configured — which, for a claim that came from a chat,
+/// could be the very person who made the claim.
+pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
+    kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
+}
+
+/// What a refused channel decision for a [`is_dashboard_only_kind`] approval
+/// says.
+pub(crate) const DASHBOARD_ONLY_REFUSAL: &str =
+    "這則知識審核只能在儀表板的待辦清單決定，請開啟儀表板處理（這裡的回覆不會生效）。";
+
+/// The zh-TW body of the plain notice for a dashboard-only approval. Carries
+/// no claim text, no stored value and no decision verb — only that something
+/// is waiting, for which AI employee, and until when.
+pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
+    let head = if reminder {
+        "⏰ 有一則知識審核快到期了，逾時會自動捨棄"
+    } else {
+        "📥 有一則知識等待審核"
+    };
+    let what = match rec.payload.get("disposition").and_then(|v| v.as_str()) {
+        Some(d) if d == crate::wiki_ingest::DISPOSITION_TRUST_HELD => {
+            "對話中的新說法和目前採用的內容不一致，尚未套用"
+        }
+        _ => "同一來源短時間內寫入大量知識，已暫時隔離",
+    };
+    format!(
+        "{head}\n\
+         AI 員工：{agent}\n\
+         狀況：{what}\n\
+         這類知識變更只能在儀表板的待辦清單決定，請開啟儀表板審核。\n\
+         期限：{deadline}未審核將自動捨棄\n\
+         編號：{id}",
+        agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
+        deadline = deadline_phrase(rec),
+        id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
+    )
+}
+
+/// Destinations for a dashboard-only notice: the agent's own control
+/// channel, else the approvers' linked chats — never the originating
+/// conversation, which is excluded explicitly rather than by relying on the
+/// reply-channel task-local being absent.
+fn dashboard_only_targets(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Vec<(String, String)> {
+    let origin = origin_target();
+    let base = match (
+        reminder,
+        rec.notify_channel.as_deref(),
+        rec.notify_chat_id.as_deref(),
+    ) {
+        (true, Some(ch), Some(id)) if !ch.is_empty() && !id.is_empty() => {
+            vec![(ch.to_string(), id.to_string())]
+        }
+        _ => resolve_targets(
+            None,
+            crate::goal_notify::agent_notify_target(home_dir, &rec.agent_id),
+            approver_links(home_dir),
+        ),
+    };
+    // R-L1: the origin recorded on the card at filing (captured before the
+    // distillation was spawned) is the reliable one; the task-local is a
+    // second line for callers that still run inside the reply scope.
+    let recorded = match (
+        rec.payload.get("origin_channel").and_then(|v| v.as_str()),
+        rec.payload.get("origin_chat_id").and_then(|v| v.as_str()),
+    ) {
+        (Some(ch), Some(chat)) => Some((ch.to_string(), chat.to_string())),
+        _ => None,
+    };
+    base.into_iter()
+        .filter(|t| origin.as_ref() != Some(t) && recorded.as_ref() != Some(t))
+        .collect()
+}
+
+/// Test seam: the notice targets for a first push of `rec`.
+#[cfg(test)]
+pub(crate) fn dashboard_only_targets_for_test(home_dir: &Path, rec: &ApprovalRecord) -> Vec<(String, String)> {
+    dashboard_only_targets(home_dir, rec, false)
+}
+
+/// Push the plain dashboard-only notice: no buttons, no card record (so no
+/// text-reply decision can find it), first reachable destination wins.
+async fn push_dashboard_only(
+    home_dir: &Path,
+    rec: &ApprovalRecord,
+    reminder: bool,
+) -> Option<(String, String)> {
+    let targets = dashboard_only_targets(home_dir, rec, reminder);
+    if targets.is_empty() {
+        return None;
+    }
+    let policy = crate::notify_governance::QuietPolicy {
+        window: crate::notify_governance::load_global_window(home_dir),
+        tz: crate::notify_governance::NotifyTz::System,
+    };
+    let level = crate::decision_notify::notify_level(DecisionSource::Approval);
+    if policy.decide(level, chrono::Utc::now()).is_some() {
+        // Quiet hours: the inbox still shows it; the reminder retries.
+        return None;
+    }
+    let mut text = dashboard_only_notice_body(rec, reminder);
+    if let Some(url) = crate::deep_link::deep_link(
+        home_dir,
+        crate::deep_link::DeepLinkKind::Approval,
+        rec.id.as_str(),
+    ) {
+        text.push_str(&format!("\n\n👉 {url}"));
+    }
+    let http = reqwest::Client::new();
+    for (channel, chat_id) in targets {
+        let Some(token) = crate::goal_notify::channel_token(home_dir, &rec.agent_id, &channel).await
+        else {
+            continue;
+        };
+        if crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text)
+            .await
+        {
+            return Some((channel, chat_id));
+        }
+    }
+    None
+}
+
 async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(String, String)> {
+    if is_dashboard_only_kind(&rec.action_kind) {
+        return push_dashboard_only(home_dir, rec, reminder).await;
+    }
     // A reminder retraces the delivered destination; a first push resolves the
     // chain. (`notify_channel` is only ever set after a successful delivery.)
     let targets = match (
@@ -281,6 +416,11 @@ pub(crate) async fn apply_decision(
     // admin-only Decision Lab. Check terminal rows before disclosing status.
     if rec.action_kind == "support_pilot_review" && role != Some(duduclaw_auth::UserRole::Admin) {
         return Err("此人工檢視需由可開啟 Decision Lab 的管理員決定。".into());
+    }
+    // H1: decided in the dashboard only — an older card's button, a crafted
+    // callback or a text reply never decides it; the approval stays pending.
+    if is_dashboard_only_kind(&rec.action_kind) {
+        return Err(DASHBOARD_ONLY_REFUSAL.into());
     }
     if rec.status.is_terminal() {
         return Ok(match rec.status {
@@ -940,5 +1080,87 @@ mod tests {
         .await
         .unwrap();
         assert!(out.is_err());
+    }
+
+    // ── H1: knowledge review is dashboard-only ─────────────────
+
+    #[tokio::test]
+    async fn knowledge_quarantine_cannot_be_decided_from_a_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = ApprovalBroker::open(dir.path()).unwrap();
+        let id = disk
+            .request(
+                "sales-bot",
+                "knowledge_quarantine",
+                "知識審核",
+                json!({ "disposition": "trust_held", "promote_on_approve": true }),
+                300,
+            )
+            .await
+            .unwrap();
+        // Even the exact destination the notice landed on (the solo-operator
+        // authority path) cannot decide it — by button, legacy button or
+        // text reply (all of which route through `apply_decision`).
+        disk.set_notify_target_for_test(&id, "telegram", "555")
+            .await
+            .unwrap();
+        for data in [
+            crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Approve, id.as_str()),
+            crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Deny, id.as_str()),
+            format!("duduclaw:approval_ok:{}", id.as_str()),
+        ] {
+            let out = decide_from_channel(dir.path(), "telegram", "555", &data)
+                .await
+                .unwrap();
+            assert_eq!(out, Err(DASHBOARD_ONLY_REFUSAL.to_string()));
+        }
+        assert_eq!(disk.poll(&id).await.unwrap(), ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn dashboard_only_notice_has_no_claim_text_and_points_to_the_dashboard() {
+        let mut r = rec("knowledge_quarantine");
+        r.summary = "對話中有一則關於「退款」的新說法 內容摘要：永久退款".into();
+        r.payload = json!({ "disposition": "trust_held" });
+        let body = dashboard_only_notice_body(&r, false);
+        assert!(body.contains("儀表板"));
+        assert!(!body.contains("永久退款") && !body.contains("退款"));
+        assert!(!body.contains("knowledge_quarantine"));
+        // No reply verb is offered.
+        assert!(!body.contains("同意") && !body.contains("核准"));
+        r.payload = json!({});
+        assert!(dashboard_only_notice_body(&r, true).contains("快到期"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_only_notice_never_targets_the_originating_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents").join("sales-bot");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[proactive]\nnotify_channel = \"telegram\"\nnotify_chat_id = \"555\"\n",
+        )
+        .unwrap();
+        let r = rec("knowledge_quarantine");
+        let home = dir.path().to_path_buf();
+        // The claim came from the very chat the agent's control channel
+        // points at: excluded explicitly.
+        let got = crate::claude_runner::REPLY_CHANNEL
+            .scope("telegram:555".to_string(), async move {
+                dashboard_only_targets(&home, &r, false)
+            })
+            .await;
+        assert!(got.is_empty(), "{got:?}");
+        // A different origin leaves the control channel in place, and the
+        // origin itself is never chosen.
+        let r = rec("knowledge_quarantine");
+        let home = dir.path().to_path_buf();
+        let got = crate::claude_runner::REPLY_CHANNEL
+            .scope("telegram:777".to_string(), async move {
+                dashboard_only_targets(&home, &r, false)
+            })
+            .await;
+        assert_eq!(got, vec![("telegram".to_string(), "555".to_string())]);
     }
 }

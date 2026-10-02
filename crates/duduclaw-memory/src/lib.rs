@@ -25,6 +25,7 @@ pub mod novelty_gate;
 pub mod origin;
 pub mod router;
 pub mod sensitivity;
+pub mod supersession_guard;
 pub mod trust_store;
 pub mod user_code;
 pub mod user_profile;
@@ -46,6 +47,11 @@ pub use janitor::{JanitorConfig, JanitorReport, WikiJanitor};
 pub use lifecycle::{reassign_agent, reassign_agent_cross_db, ReassignSummary};
 pub use novelty_gate::{NoveltyGateConfig, NoveltyRejection};
 pub use origin::{trust_ceiling, OriginClass};
+pub use supersession_guard::{
+    claim_digest, HeldClaim, HeldClaimView, PromotionReport, ReleaseHeld, ReleaseReport,
+    SupersessionRefusal,
+    TemporalWriteOutcome,
+};
 pub use router::classify;
 pub use sensitivity::{
     read_from_metadata as read_sensitivity_metadata, stamp_metadata as stamp_sensitivity_metadata,

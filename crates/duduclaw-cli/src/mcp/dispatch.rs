@@ -229,8 +229,20 @@ pub(crate) async fn handle_tools_call(
             crate::mcp_memory_handlers::handle_memory_get_at(&arguments, memory, ns_ctx).await
         }
         "memory_invalidate_by_origin" => {
+            let env_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
+            let client_is_agent = duduclaw_core::is_valid_agent_id(caller_client_id)
+                && home_dir.join("agents").join(caller_client_id).join("agent.toml").is_file();
+            let acting = crate::mcp_memory_handlers::ai_employee_caller(
+                caller_client_id,
+                env_agent.as_deref(),
+                client_is_agent,
+            );
             crate::mcp_memory_handlers::handle_memory_invalidate_by_origin(
-                &arguments, memory, ns_ctx,
+                &arguments,
+                memory,
+                ns_ctx,
+                acting.as_deref(),
+                home_dir,
             )
             .await
         }

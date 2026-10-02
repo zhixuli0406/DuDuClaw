@@ -1281,6 +1281,19 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                     let rt = tokio::runtime::Handle::current();
                     rt.block_on(duduclaw_memory::decay::run_decay(&engine, &p));
                 });
+                // L1: quarantined rows whose review card is no longer pending
+                // (expired / decided without effect / never filed) are closed
+                // out as rejected instead of staying quarantined forever.
+                // Fails closed: unreadable approvals ⇒ nothing swept.
+                match crate::wiki_ingest::sweep_unreviewed_quarantine(&hd, &hd.join("memory.db"))
+                    .await
+                {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(closed = n, "memory: lapsed knowledge reviews closed out")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("memory: lapsed-review sweep skipped: {e}"),
+                }
             }
         });
     }

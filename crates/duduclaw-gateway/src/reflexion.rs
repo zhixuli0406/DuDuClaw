@@ -459,10 +459,21 @@ async fn consolidate_group(
         ..Default::default()
     };
 
-    let semantic_id = engine
-        .store_temporal(agent_id, entry, meta)
+    // L5: a supersession-guard refusal means a more trusted (operator-
+    // approved) value already governs this category key. The rule is not
+    // stored, but the sources are still resolved below — otherwise every
+    // later settle would rebuild and re-refuse the same rule (a retry loop).
+    let semantic_id = match engine
+        .store_temporal_outcome(agent_id, entry, meta)
         .await
-        .map_err(|e| format!("store semantic rule: {e}"))?;
+        .map_err(|e| format!("store semantic rule: {e}"))?
+    {
+        duduclaw_memory::TemporalWriteOutcome::Stored(id) => Some(id),
+        duduclaw_memory::TemporalWriteOutcome::Refused(r) => {
+            tracing::info!(agent = agent_id, "reflexion rule not stored: {r}");
+            None
+        }
+    };
 
     // Resolve source mistakes so they stop re-triggering and re-counting.
     let id_refs: Vec<&str> = source_ids.iter().map(|s| s.as_str()).collect();
@@ -470,7 +481,7 @@ async fn consolidate_group(
         .mark_resolved(&id_refs)
         .map_err(|e| format!("mark resolved: {e}"))?;
 
-    Ok(Some(semantic_id))
+    Ok(semantic_id)
 }
 
 /// Build a concise generalised rule from recurring mistakes (deterministic).
@@ -1003,6 +1014,61 @@ mod tests {
     /// row's id is returned and its access_count bumped, no duplicate row) —
     /// so "let through" here means "reaches the store and resolves its
     /// mistakes", not "creates a second row".
+    /// L5: an operator value on the category key refuses the rule; the
+    /// consolidation returns Ok(None) and still resolves its sources, so the
+    /// same refusal is not rebuilt on every later settle.
+    #[tokio::test]
+    async fn refused_rule_resolves_sources_instead_of_retrying() {
+        let dir = TempDir::new().unwrap();
+        let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
+        let mem_path = dir.path().join("memory.db");
+        {
+            let engine = SqliteMemoryEngine::new(&mem_path).unwrap();
+            engine
+                .store_temporal(
+                    "agent-ref",
+                    duduclaw_core::types::MemoryEntry {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        agent_id: "agent-ref".into(),
+                        content: "operator rule".into(),
+                        timestamp: chrono::Utc::now(),
+                        tags: vec![],
+                        embedding: None,
+                        layer: duduclaw_core::types::MemoryLayer::Semantic,
+                        importance: 5.0,
+                        access_count: 0,
+                        last_accessed: None,
+                        source_event: "test".into(),
+                    },
+                    duduclaw_memory::TemporalMeta {
+                        subject: Some("category:capability".into()),
+                        predicate: Some("requires_care".into()),
+                        origin: Some("operator".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        record_n(&nb, "agent-ref", MistakeCategory::Capability, 3, "");
+        let r = maybe_consolidate(
+            &nb,
+            &mem_path,
+            dir.path(),
+            "agent-ref",
+            MistakeCategory::Capability,
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(r.is_none(), "refused rule is not stored");
+        assert_eq!(
+            nb.count_unresolved_by_category("agent-ref", MistakeCategory::Capability),
+            0,
+            "sources resolved, no retry loop"
+        );
+    }
+
     #[tokio::test]
     async fn novelty_gate_disabled_in_config_lets_duplicate_consolidation_through() {
         let dir = TempDir::new().unwrap();

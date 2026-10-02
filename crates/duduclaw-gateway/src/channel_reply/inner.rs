@@ -3181,6 +3181,9 @@ pub(super) async fn build_reply_with_session_inner(
             // `None` = no gate in scope (non-channel caller) ⇒ previous
             // behaviour; a dropped sender ⇒ skip (fail-closed).
             let delivery_verdict = ccr_delivery_verdict();
+            // R-L1: the reply-channel task-local does not cross the spawn
+            // below; capture the originating conversation here.
+            let origin_for_distill = crate::decision_notify::origin_target();
             tokio::spawn(async move {
                 if let Some(verdict) = delivery_verdict {
                     if !matches!(verdict.await, Ok(true)) {
@@ -3195,6 +3198,7 @@ pub(super) async fn build_reply_with_session_inner(
                     &home_for_distill,
                     &memory_db_for_distill,
                     &session_for_distill,
+                    origin_for_distill,
                 )
                 .await;
             });

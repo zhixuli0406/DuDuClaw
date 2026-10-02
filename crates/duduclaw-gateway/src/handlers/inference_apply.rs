@@ -66,6 +66,58 @@ pub(crate) fn inf_apply_scalars(
     Ok(())
 }
 
+/// `inference.toml` `backend` values the inference engine can start. The
+/// in-process `llama_cpp` / `mistral_rs` backends were removed on 2026-09-29;
+/// those strings still deserialize (`duduclaw_inference::BackendType`) but fail
+/// at init, so they are refused on write.
+pub(crate) const SUPPORTED_INFERENCE_BACKENDS: &[&str] = &["openai_compat"];
+
+/// What `inference.update` does with the root `backend` key.
+#[derive(Debug, PartialEq)]
+pub(crate) enum BackendWrite {
+    /// Absent, or the stored value echoed back unchanged.
+    Unchanged,
+    /// Empty string: remove the key so the engine picks its default.
+    Clear,
+    Set(String),
+}
+
+/// Validate an incoming `backend`. Supported values and `""` are accepted.
+/// A removed value is refused with a message naming the supported one —
+/// except when it equals what is already stored: the dashboard echoes the
+/// loaded value on every save, and an existing file must keep loading and
+/// saving until the user picks a new backend.
+pub(crate) fn inf_validate_backend(
+    table: &toml::Table,
+    p: &serde_json::Map<String, Value>,
+) -> Result<BackendWrite, String> {
+    let Some(raw) = p.get("backend") else {
+        return Ok(BackendWrite::Unchanged);
+    };
+    if raw.is_null() {
+        return Ok(BackendWrite::Unchanged);
+    }
+    let v = raw
+        .as_str()
+        .ok_or_else(|| "inference.backend must be a string".to_string())?
+        .trim();
+    if v.is_empty() {
+        return Ok(BackendWrite::Clear);
+    }
+    if table.get("backend").and_then(|b| b.as_str()) == Some(v) {
+        return Ok(BackendWrite::Unchanged);
+    }
+    if SUPPORTED_INFERENCE_BACKENDS.iter().any(|b| *b == v) {
+        return Ok(BackendWrite::Set(v.to_string()));
+    }
+    Err(format!(
+        "inference.backend '{v}' is not supported: the in-process llama_cpp / mistral_rs \
+         backends were removed; use \"{}\" (a local OpenAI-compatible server such as \
+         llama-server, Ollama or vLLM) or leave it empty",
+        SUPPORTED_INFERENCE_BACKENDS.join("\", \"")
+    ))
+}
+
 /// Apply an `inference.update` params object onto an inference.toml table.
 /// Returns the change list. Validates router thresholds (strong < fast) and
 /// generation ranges. Does NOT handle the openai_compat secret — that is done
@@ -80,6 +132,9 @@ pub(crate) fn apply_inference_to_table(
         .ok_or_else(|| "params must be an object".to_string())?;
 
     // ── root scalars (INF.2) ──
+    // `backend` is validated before anything is written so a refused value
+    // leaves the table untouched.
+    let backend_write = inf_validate_backend(table, p)?;
     inf_apply_scalars(
         table,
         p,
@@ -87,10 +142,22 @@ pub(crate) fn apply_inference_to_table(
         &["enabled", "auto_load"],
         &["max_memory_mb"],
         &[],
-        &["backend", "models_dir", "default_model"],
+        &["models_dir", "default_model"],
         &[],
         &mut changes,
     )?;
+    match backend_write {
+        BackendWrite::Unchanged => {}
+        BackendWrite::Clear => {
+            if table.remove("backend").is_some() {
+                changes.push("inference.backend = (auto)".into());
+            }
+        }
+        BackendWrite::Set(v) => {
+            changes.push(format!("inference.backend = \"{v}\""));
+            table.insert("backend".into(), toml::Value::String(v));
+        }
+    }
 
     // ── [generation] (INF.3) ──
     if let Some(g) = p.get("generation").and_then(|v| v.as_object()) {

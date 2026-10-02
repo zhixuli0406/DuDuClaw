@@ -33,6 +33,17 @@ fn like_escape(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// The memory-row predicate for "references the contact" (`?2` = contact,
+/// `?3` = escaped LIKE pattern): the triple's subject/object, a free-text
+/// mention, or — for a claim held for trust review, whose triple lives only in
+/// `metadata.held_claim` until a reviewer accepts it — the held subject/object
+/// (M5: an erased contact's pending claim must not survive to be approved).
+const CONTACT_MATCH: &str = "(subject = ?2 OR object = ?2 OR content LIKE ?3 ESCAPE '\\'
+      OR (CASE WHEN json_valid(metadata)
+               THEN json_extract(metadata, '$.held_claim.subject') END) = ?2
+      OR (CASE WHEN json_valid(metadata)
+               THEN json_extract(metadata, '$.held_claim.object') END) = ?2)";
+
 /// Outcome of an erase: how many rows were removed and the tombstone id (if one
 /// was written).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -41,6 +52,10 @@ pub struct GdprEraseSummary {
     pub memories_deleted: u64,
     pub key_facts_deleted: u64,
     pub tombstone_id: Option<String>,
+    /// Ids of the memory rows deleted — the caller scrubs review cards and
+    /// events that reference them (R-M3).
+    #[serde(skip_serializing)]
+    pub erased_memory_ids: Vec<String>,
 }
 
 /// Aggregate every stored row referencing `contact` into a JSON bundle
@@ -54,15 +69,14 @@ pub async fn gdpr_export(
     let like = format!("%{}%", like_escape(contact));
 
     let mut mem_stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT id, content, layer, timestamp, tags, subject, predicate, object,
                     valid_from, valid_until, superseded_by, supersedes, confidence,
                     origin, origin_trust
              FROM memories
-             WHERE agent_id = ?1
-               AND (subject = ?2 OR object = ?2 OR content LIKE ?3 ESCAPE '\\')
-             ORDER BY COALESCE(valid_from, timestamp) ASC",
-        )
+             WHERE agent_id = ?1 AND {CONTACT_MATCH}
+             ORDER BY COALESCE(valid_from, timestamp) ASC"
+        ))
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
     let mem_rows = mem_stmt
         .query_map(rusqlite::params![agent_id, contact, like], |r| {
@@ -142,9 +156,7 @@ pub async fn gdpr_erase(
     let mem_ids: Vec<String> = {
         let mut stmt = conn
             .prepare(
-                "SELECT id FROM memories
-                 WHERE agent_id = ?1
-                   AND (subject = ?2 OR object = ?2 OR content LIKE ?3 ESCAPE '\\')",
+                &format!("SELECT id FROM memories WHERE agent_id = ?1 AND {CONTACT_MATCH}"),
             )
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let rows = stmt
@@ -287,6 +299,7 @@ pub async fn gdpr_erase(
                 memories_deleted,
                 key_facts_deleted,
                 tombstone_id,
+                erased_memory_ids: mem_ids,
             })
         }
         Err(e) => {
@@ -432,5 +445,58 @@ mod tests {
             bundle["counts"]["memories"], 1,
             "underscore matched literally"
         );
+    }
+
+    /// M5: a claim held for trust review keeps its triple only in
+    /// `metadata.held_claim`; export and erase still find it, and an erased
+    /// held claim can no longer be promoted (nothing is written back).
+    #[tokio::test]
+    async fn held_claim_is_exported_erased_and_cannot_be_promoted_after() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        engine
+            .store_temporal(
+                "a",
+                entry("op", "a", "prefers: tea"),
+                TemporalMeta {
+                    subject: Some("user:alice".into()),
+                    predicate: Some("prefers".into()),
+                    object: Some("tea".into()),
+                    origin: Some("operator".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let held = engine
+            .hold_refused_claim(
+                "a",
+                entry("held", "a", "prefers: coffee"),
+                TemporalMeta {
+                    subject: Some("user:alice".into()),
+                    predicate: Some("prefers".into()),
+                    object: Some("coffee".into()),
+                    origin: Some("channel".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let bundle = gdpr_export(&engine, "a", "user:alice").await.unwrap();
+        assert_eq!(bundle["counts"]["memories"], 2, "fact + held claim");
+        assert!(bundle["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == serde_json::json!(held)));
+
+        let summary = gdpr_erase(&engine, "a", "user:alice", false).await.unwrap();
+        assert_eq!(summary.memories_deleted, 2);
+        let report = engine
+            .promote_quarantined("a", &[held], "operator")
+            .await
+            .unwrap();
+        assert_eq!((report.promoted, report.stale), (0, 0));
+        let after = gdpr_export(&engine, "a", "user:alice").await.unwrap();
+        assert_eq!(after["counts"]["memories"], 0);
     }
 }

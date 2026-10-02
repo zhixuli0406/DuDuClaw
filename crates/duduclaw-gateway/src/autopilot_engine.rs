@@ -401,9 +401,18 @@ pub const ODOO_RESERVED_FIELD_NAMES: &[&str] =
 ///   `{ "all": [ cond, cond, ... ] }`
 ///   `{ "any": [ cond, cond, ... ] }`
 ///   `{ "field": "task.priority", "op": "in", "value": ["high","urgent"] }`
-/// `null` or missing conditions means "always true".
+/// "No conditions" — `null`, missing, `{}` or `{ "all": [] }` — means "always
+/// true" (the rule fires on every event of its trigger). `{ "any": [] }` never
+/// matches, and neither does a leaf without a usable `field` (the write-time
+/// validator `handlers::validate_autopilot_conditions` refuses those).
 pub fn evaluate(conditions: &Value, fields: &serde_json::Map<String, Value>) -> bool {
     if conditions.is_null() {
+        return true;
+    }
+    // `{}` is what a caller that omitted `conditions` gets stored (the RPC
+    // default). Before v1.67.1 it fell through to the leaf path with an empty
+    // field and never matched, so such rules were silently dead.
+    if conditions.as_object().is_some_and(|o| o.is_empty()) {
         return true;
     }
     if let Some(all) = conditions.get("all").and_then(|v| v.as_array()) {
@@ -2447,6 +2456,26 @@ mod tests {
     fn eval_null_is_true() {
         let m = serde_json::Map::new();
         assert!(evaluate(&Value::Null, &m));
+    }
+
+    /// v1.67.1: "no conditions" fires on every event of the trigger — a rule
+    /// created without `conditions` is stored as `{}`, which used to fall
+    /// through to the leaf path with an empty field and never match.
+    #[test]
+    fn eval_no_conditions_shapes_are_true_and_empty_any_is_false() {
+        let mut m = serde_json::Map::new();
+        m.insert("agent_id".into(), Value::String("a".into()));
+        assert!(evaluate(&serde_json::json!({}), &m));
+        assert!(evaluate(&serde_json::json!({ "all": [] }), &m));
+        assert!(evaluate(&serde_json::json!({}), &serde_json::Map::new()));
+        assert!(!evaluate(&serde_json::json!({ "any": [] }), &m));
+        // A malformed leaf (keys, but no usable field) still never matches.
+        assert!(!evaluate(&serde_json::json!({ "op": "eq", "value": "a" }), &m));
+        assert!(!evaluate(&serde_json::json!({ "field": "", "value": "a" }), &m));
+        assert!(!evaluate(&serde_json::json!({ "field": "agent_id", "op": "bogus", "value": "a" }), &m));
+        // Ordinary leaves are unchanged.
+        assert!(evaluate(&serde_json::json!({ "field": "agent_id", "op": "eq", "value": "a" }), &m));
+        assert!(!evaluate(&serde_json::json!({ "field": "agent_id", "op": "eq", "value": "b" }), &m));
     }
 
     #[test]

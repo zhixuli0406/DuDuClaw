@@ -61,6 +61,20 @@ pub const MCP_EXTERNAL: OriginClass = OriginClass {
     name: "mcp_external",
     ceiling: 0.3,
 };
+/// A record about a user's profile (`subject = "user:<id>"`): either the AI
+/// employee recording what it learned about the user (`user_profile_record`
+/// MCP tool, consolidated profile summary) or profile distillation of the
+/// speaker's own statements about themselves. Both are the AI's record, not
+/// direct user or operator input, so the class sits at the agent-derived
+/// ceiling: the agent's record and the user's later statement can correct
+/// each other without review, and neither can replace an operator-approved
+/// value. (Until 2026-10 this was a legacy alias of `user_direct` at `1.0`;
+/// rows stored at `1.0` then are read at this ceiling by the supersession
+/// guard, which caps stored trust at the class ceiling.)
+pub const USER_PROFILE: OriginClass = OriginClass {
+    name: "user_profile",
+    ceiling: 0.6,
+};
 /// Unlabelled writes (legacy paths mid-migration). Fail-safe ceiling `0.6` —
 /// the default for any origin we do not recognize.
 pub const UNATTRIBUTED: OriginClass = OriginClass {
@@ -71,12 +85,13 @@ pub const UNATTRIBUTED: OriginClass = OriginClass {
 /// Map a raw origin string to its canonical [`OriginClass`].
 ///
 /// Unknown origins (including empty strings) resolve to [`UNATTRIBUTED`] —
-/// fail-safe, never full trust. `"user"` / `"user_profile"` are legacy aliases
-/// for user-direct provenance (predate the canonical table) and keep their
-/// historical `1.0` ceiling so existing curated/profile facts do not regress.
+/// fail-safe, never full trust. `"user"` is a legacy alias for user-direct
+/// provenance (predates the canonical table) and keeps its `1.0` ceiling.
+/// `"user_profile"` is its own class at `0.6` (see [`USER_PROFILE`]).
 pub fn classify(origin: &str) -> OriginClass {
     match origin {
-        "user_direct" | "user" | "user_profile" => USER_DIRECT,
+        "user_direct" | "user" => USER_DIRECT,
+        "user_profile" => USER_PROFILE,
         "operator" => OPERATOR,
         "import" => IMPORT,
         "agent_derived" => AGENT_DERIVED,
@@ -92,6 +107,21 @@ pub fn classify(origin: &str) -> OriginClass {
 /// The maximum `origin_trust` a fact from `origin` may hold. Unknown → `0.6`.
 pub fn trust_ceiling(origin: &str) -> f64 {
     classify(origin).ceiling
+}
+
+/// `true` when `origin` is exactly the canonical name of a class in the table
+/// (aliases and unknown strings are not).
+pub fn is_canonical_class(origin: &str) -> bool {
+    classify(origin).name == origin
+}
+
+/// `true` when facts of `origin` may be mass-invalidated by an AI employee
+/// (R-H2): a canonical class whose ceiling is STRICTLY below the
+/// agent-derived ceiling — i.e. less trusted than anything the employee
+/// itself writes. Derived from the table, never from a name list; unknown
+/// strings and aliases are refused.
+pub fn ai_may_invalidate(origin: &str) -> bool {
+    is_canonical_class(origin) && classify(origin).ceiling < AGENT_DERIVED.ceiling
 }
 
 /// Canonical class name for distinctness comparisons (Sybil-resistant
@@ -134,12 +164,39 @@ mod tests {
         assert_eq!(trust_ceiling("channel"), 0.3);
         assert_eq!(trust_ceiling("mcp_external"), 0.3);
         assert_eq!(trust_ceiling("unattributed"), 0.6);
+        assert_eq!(trust_ceiling("user_profile"), 0.6);
     }
 
     #[test]
-    fn legacy_aliases_keep_user_direct_trust() {
+    fn ai_invalidation_is_limited_to_classes_below_agent_derived() {
+        for o in ["channel", "mcp_external", "tool_echo"] {
+            assert!(ai_may_invalidate(o), "{o}");
+        }
+        for o in [
+            "operator", "user_direct", "user", "import", "agent_derived", "user_profile",
+            "unattributed", "who-knows", "", "Channel",
+        ] {
+            assert!(!ai_may_invalidate(o), "{o}");
+        }
+    }
+
+    #[test]
+    fn legacy_user_alias_keeps_user_direct_trust() {
         assert_eq!(classify("user"), USER_DIRECT);
-        assert_eq!(classify("user_profile"), USER_DIRECT);
+    }
+
+    /// M2: a profile record is the AI's record — its own class (rollback by
+    /// origin still finds it) at the agent-derived ceiling, below an operator
+    /// or import fact.
+    #[test]
+    fn user_profile_is_its_own_class_at_the_agent_ceiling() {
+        assert_eq!(classify("user_profile"), USER_PROFILE);
+        assert_eq!(class_name("user_profile"), "user_profile");
+        assert_eq!(USER_PROFILE.ceiling, AGENT_DERIVED.ceiling);
+        assert!(USER_PROFILE.ceiling < OPERATOR.ceiling);
+        assert!(USER_PROFILE.ceiling < IMPORT.ceiling);
+        // Unchanged: it still counts as an independent corroborating class.
+        assert!(is_corroborating("user_profile"));
     }
 
     #[test]

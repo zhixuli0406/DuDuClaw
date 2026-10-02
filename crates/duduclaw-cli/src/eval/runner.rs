@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn rewrite_points_duduclaw_home_at_the_eval_home() {
-        let raw = r#"{"mcpServers":{"duduclaw":{"command":"/usr/local/bin/duduclaw","args":["mcp-server"],"env":{"DUDUCLAW_HOME":"/Users/prod/.duduclaw","DUDUCLAW_AGENT_ID":"law-intake","DUDUCLAW_MCP_API_KEY":"ddc_prod_deadbeef"}},"playwright":{"command":"npx","args":["@anthropic-ai/mcp-server-playwright"]}}}"#;
+        let raw = r#"{"mcpServers":{"duduclaw":{"command":"/usr/local/bin/duduclaw","args":["mcp-server"],"env":{"DUDUCLAW_HOME":"/Users/prod/.duduclaw","DUDUCLAW_AGENT_ID":"law-intake","DUDUCLAW_MCP_API_KEY":"ddc_prod_deadbeef"}},"playwright":{"command":"npx","args":["-y","@playwright/mcp"]}}}"#;
         let out = rewrite_mcp_home(raw, Path::new("/tmp/sandbox-home")).expect("must rewrite");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(

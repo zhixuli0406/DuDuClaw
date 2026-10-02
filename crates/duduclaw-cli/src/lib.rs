@@ -7870,7 +7870,7 @@ context_size = 4096
             r#"
 [model.local]
 model = "{local_model_id}"
-backend = "llama_cpp"
+backend = "openai_compat"
 context_length = 4096
 gpu_layers = -1
 prefer_local = {prefer}
@@ -10462,6 +10462,29 @@ async fn cmd_gdpr_erase(
 
     let summary = duduclaw_memory::gdpr_erase(&engine, &agent, &contact, tombstone).await?;
 
+    // From here on every step runs even if an earlier one failed (the memory
+    // rows are already gone, so the rest must not be skipped); failures are
+    // collected and reported together with a non-zero exit at the end.
+    let mut failures: Vec<String> = Vec::new();
+
+    // R-M3: the person's text must not survive in the review store either —
+    // withdraw pending knowledge-review cards that cover an erased row, scrub
+    // the text of every such card, delete the matching review events. On a
+    // re-run (no memory ids left) this matches by the contact instead.
+    let review = match duduclaw_gateway::wiki_ingest::scrub_review_store_after_erase(
+        &duduclaw_home(),
+        &summary.erased_memory_ids,
+        &contact,
+    )
+    .await
+    {
+        Ok(r) => Some(r),
+        Err(e) => {
+            failures.push(format!("review store: {e}"));
+            None
+        }
+    };
+
     // Sessions live in a separate store (keyed by `<channel>:<chat_id>`); erase
     // them by the same contact identifier. A `user:*` contact matches zero
     // sessions — harmless.
@@ -10469,14 +10492,35 @@ async fn cmd_gdpr_erase(
         use duduclaw_gateway::session::SessionManager;
         let db_path = duduclaw_home().join("sessions.db");
         if db_path.exists() {
-            let mgr = SessionManager::new(&db_path)
-                .map_err(|e| DuDuClawError::Gateway(format!("open sessions.db: {e}")))?;
-            mgr.erase_sessions_for_contact(&contact).await?
+            match SessionManager::new(&db_path) {
+                Ok(mgr) => match mgr.erase_sessions_for_contact(&contact).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        failures.push(format!("sessions: {e}"));
+                        (0, 0)
+                    }
+                },
+                Err(e) => {
+                    failures.push(format!("sessions: open sessions.db: {e}"));
+                    (0, 0)
+                }
+            }
         } else {
             (0, 0)
         }
     };
 
+    if let Some(review) = &review {
+        if review.scrubbed > 0 || review.events_deleted > 0 {
+            println!(
+                "{} Review store: {} card(s) withdrawn, {} card(s) scrubbed, {} event(s) deleted",
+                console::style("✓").green(),
+                review.withdrawn,
+                review.scrubbed,
+                review.events_deleted,
+            );
+        }
+    }
     println!(
         "{} Erased {} memories + {} key facts + {} sessions ({} msgs) for '{}' (agent {}){}",
         console::style("✓").green(),
@@ -10491,6 +10535,15 @@ async fn cmd_gdpr_erase(
             None => String::new(),
         }
     );
+    if !failures.is_empty() {
+        for f in &failures {
+            eprintln!("{} Not completed — {f}", console::style("✗").red());
+        }
+        return Err(DuDuClawError::Gateway(format!(
+            "erase incomplete ({}); re-run the same command to finish — it is safe to repeat",
+            failures.join("; ")
+        )));
+    }
     Ok(())
 }
 

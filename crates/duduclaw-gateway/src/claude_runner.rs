@@ -558,9 +558,11 @@ where
             let home = home_dir.to_path_buf();
             let memory_db = home_dir.join("memory.db");
             let session = format!("{}:{agent_id}", request_type.as_str());
+            // R-L1: captured before the spawn (task-locals do not cross it).
+            let origin = crate::decision_notify::origin_target();
             tokio::spawn(async move {
                 crate::wiki_ingest::run_ingest(
-                    &user_text, &reply, &agent, "system", &home, &memory_db, &session,
+                    &user_text, &reply, &agent, "system", &home, &memory_db, &session, origin,
                 )
                 .await;
             });

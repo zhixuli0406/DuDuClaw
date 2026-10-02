@@ -80,6 +80,11 @@ pub const MAX_AUTO_PAGES_PER_DAY: u32 = 20;
 /// Circuit breaker — grey-band utility-model arbitrations per agent per day.
 pub const MAX_L2_CALLS_PER_DAY: u32 = 20;
 
+/// New held claims (supersession-guard refusals sent to human review) per
+/// agent per UTC day. Beyond it a refusal is only audited — no held row, no
+/// review card — so a flood of contradicting claims cannot bury the inbox.
+pub const MAX_HELD_CLAIMS_PER_DAY: u32 = 20;
+
 /// Byte cap on the verbatim原文 block (P6 = A: keep the source text, but
 /// bounded). `WikiStore::write_page` itself caps the whole page at 512 KB.
 const MAX_ORIGINAL_BYTES: usize = 64 * 1024;
@@ -267,6 +272,8 @@ pub enum QuotaKind {
     Page,
     /// Grey-band utility-model arbitrations.
     L2Call,
+    /// New held claims filed for trust review (`wiki_ingest` / `profile_distill`).
+    HeldClaim,
 }
 
 impl QuotaKind {
@@ -274,12 +281,14 @@ impl QuotaKind {
         match self {
             QuotaKind::Page => MAX_AUTO_PAGES_PER_DAY,
             QuotaKind::L2Call => MAX_L2_CALLS_PER_DAY,
+            QuotaKind::HeldClaim => MAX_HELD_CLAIMS_PER_DAY,
         }
     }
     fn field(self) -> &'static str {
         match self {
             QuotaKind::Page => "pages",
             QuotaKind::L2Call => "l2_calls",
+            QuotaKind::HeldClaim => "held_claims",
         }
     }
 }
@@ -303,11 +312,27 @@ pub fn quota_path(home_dir: &Path, agent_id: &str) -> PathBuf {
 /// security gate; the security gates are scope + injection and both fail
 /// closed). The failure is logged.
 pub fn try_consume_quota(home_dir: &Path, agent_id: &str, kind: QuotaKind) -> bool {
+    matches!(try_consume_quota_detail(home_dir, agent_id, kind), QuotaVerdict::Allowed)
+}
+
+/// What [`try_consume_quota_detail`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaVerdict {
+    Allowed,
+    /// Over the day's limit. `first_today` is `true` exactly once per agent,
+    /// kind and UTC day — for the first refusal — so a caller can raise one
+    /// operator-visible signal instead of one per refusal.
+    Denied { first_today: bool },
+}
+
+/// [`try_consume_quota`], also reporting whether this refusal is the first
+/// over the limit today (same file, same lock, same fail-open semantics).
+pub fn try_consume_quota_detail(home_dir: &Path, agent_id: &str, kind: QuotaKind) -> QuotaVerdict {
     let path = quota_path(home_dir, agent_id);
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             warn!(agent = agent_id, "auto-wiki quota dir unavailable: {e}");
-            return true;
+            return QuotaVerdict::Allowed;
         }
     }
     let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -324,18 +349,24 @@ pub fn try_consume_quota(home_dir: &Path, agent_id: &str, kind: QuotaKind) -> bo
         }
         let used = doc.get(kind.field()).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         if used >= kind.limit() {
-            return Ok(false);
+            let flag = format!("{}_over_notified", kind.field());
+            let first_today = doc.get(&flag).and_then(|v| v.as_bool()) != Some(true);
+            if first_today {
+                doc[flag.as_str()] = serde_json::json!(true);
+                std::fs::write(&path, serde_json::to_string(&doc).unwrap_or_default())?;
+            }
+            return Ok(QuotaVerdict::Denied { first_today });
         }
         doc[kind.field()] = serde_json::json!(used + 1);
         std::fs::write(&path, serde_json::to_string(&doc).unwrap_or_default())?;
-        Ok(true)
+        Ok(QuotaVerdict::Allowed)
     });
 
     match result {
-        Ok(allowed) => allowed,
+        Ok(v) => v,
         Err(e) => {
             warn!(agent = agent_id, "auto-wiki quota bookkeeping failed: {e}");
-            true
+            QuotaVerdict::Allowed
         }
     }
 }

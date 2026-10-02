@@ -355,7 +355,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "memory_invalidate_by_origin",
-        description: "Rollback primitive: expire (never delete) every currently-valid fact from one origin, optionally from a cutoff. Derived facts lose trust; history stays queryable. Use to remediate a poisoned source.",
+        description: "Expire (never delete) every current fact from one origin, optionally since a cutoff; derived facts lose trust. AI employees may only target channel, mcp_external or tool_echo.",
         params: &[
             ParamDef {
                 name: "origin",
@@ -437,7 +437,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "origin_trust",
-                description: "Confidence 0..1 in this observation (default 1.0)",
+                description: "Confidence 0..1 in this observation (default 1.0; stored at most 0.6, the AI-record ceiling)",
                 required: false,
             },
         ],

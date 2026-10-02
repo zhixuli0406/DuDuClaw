@@ -595,7 +595,7 @@ impl RuleInductor {
 
             // Reuse the exact write-time validators the dashboard uses. A
             // candidate that would not pass a hand-authored write is dropped.
-            if let Err(e) = crate::handlers::validate_autopilot_trigger_event(&p.event_type) {
+            if let Err(e) = crate::handlers::validate_autopilot_trigger_event_for_create(&p.event_type) {
                 warn!(fp = %p.fingerprint, error = %e, "rule_induction: candidate trigger invalid — skipping");
                 continue;
             }
@@ -734,7 +734,8 @@ impl RuleInductor {
 
         // Re-validate the artifact that actually takes effect (defense in depth
         // — never trust the stored payload blindly). Fail-closed.
-        crate::handlers::validate_autopilot_trigger_event(&trigger_event)?;
+        crate::handlers::validate_autopilot_trigger_event_for_create(&trigger_event)?;
+        crate::handlers::validate_autopilot_conditions(&conditions)?;
         crate::handlers::validate_autopilot_action(&action)?;
 
         let metadata = json!({

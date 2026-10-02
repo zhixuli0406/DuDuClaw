@@ -297,7 +297,7 @@ impl ApprovalRecord {
     }
 
     /// True if pending and past its TTL (or has an unparseable timestamp).
-    fn is_stale(&self, now: DateTime<Utc>) -> bool {
+    pub(crate) fn is_stale(&self, now: DateTime<Utc>) -> bool {
         if self.status != ApprovalStatus::Pending {
             return false;
         }
