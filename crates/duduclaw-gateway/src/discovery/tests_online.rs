@@ -160,6 +160,7 @@ async fn execute(
 }
 #[tokio::test]
 async fn real_rounds_persist_visible_siblings_and_export_rescored_best() {
+    crate::discovery::maintenance::require_discovery_sweep_client!();
     let (dir, config, spec, runner) = setup(8, false).await;
     let report = execute(dir.path(), config, spec, runner.clone()).await;
     assert_eq!(report.status, "degraded");
@@ -223,6 +224,7 @@ async fn real_rounds_persist_visible_siblings_and_export_rescored_best() {
 }
 #[tokio::test]
 async fn exhaustion_exports_best_and_infra_failure_never_becomes_a_node() {
+    crate::discovery::maintenance::require_discovery_sweep_client!();
     let (dir, config, spec, runner) = setup(1, false).await;
     let report = execute(dir.path(), config, spec, runner).await;
     assert_eq!(report.budget.agent_calls, 1);
@@ -266,6 +268,7 @@ impl Evaluator for SlowScorer {
 }
 #[tokio::test]
 async fn evaluator_is_bounded_by_run_deadline_and_failed_baseline_stays_failed() {
+    crate::discovery::maintenance::require_discovery_sweep_client!();
     let (dir, config, mut spec, runner) = setup(2, false).await;
     spec.budget.max_wall_secs = 1;
     let budget = SharedBudget::new(spec.budget).unwrap();
@@ -283,6 +286,7 @@ struct BrokenPlan;
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn release_grid_limit_dynamic_rounds_preserve_all_planned_cells_and_reject_expansion() {
+    crate::discovery::maintenance::require_discovery_sweep_client!();
     for exceed_second in [false, true] {
         let (dir, config, mut spec, runner) = setup(4, false).await;
         spec.branch_count = 1000;
@@ -312,6 +316,7 @@ async fn release_grid_limit_dynamic_rounds_preserve_all_planned_cells_and_reject
 
 #[tokio::test]
 async fn release_grid_limit_operator_entry_rejects_oversize_before_any_attempt() {
+    crate::discovery::maintenance::require_discovery_sweep_client!();
     let (dir, config, mut spec, runner) = setup(1, false).await;
     spec.branch_count = 1000;
     spec.refine_count = 20;
@@ -338,6 +343,7 @@ impl PolicySource for BrokenSource {
 }
 #[tokio::test]
 async fn broken_plan_degrades_to_baseline_and_preserves_best_artifact() {
+    crate::discovery::maintenance::require_discovery_sweep_client!();
     let (dir, config, spec, runner) = setup(8, false).await;
     let report = run(dir.path().into(), config, spec, OnlineComponents {
         runner: runner.clone(), evaluator: Arc::new(Scorer), policy: Arc::new(BrokenSource), dreaming: None,
@@ -363,6 +369,7 @@ impl AttemptRunner for SlowSibling {
 }
 #[tokio::test]
 async fn deadline_during_a_sibling_delivers_the_already_verified_checkpoint() {
+    crate::discovery::maintenance::require_discovery_sweep_client!();
     let (dir, config, mut spec, _) = setup(2, false).await;
     spec.budget.max_wall_secs = 1;
     spec.budget.max_rounds = 1;
@@ -392,6 +399,7 @@ impl Evaluator for MutatingScorer {
 }
 #[tokio::test]
 async fn changed_source_during_evaluation_never_becomes_a_scored_checkpoint() {
+    crate::discovery::maintenance::require_discovery_sweep_client!();
     let (dir, config, spec, runner) = setup(2, false).await;
     let report = run(dir.path().into(), config, spec, OnlineComponents {
         runner: runner.clone(), evaluator: Arc::new(MutatingScorer),
@@ -463,6 +471,7 @@ impl Evaluator for NoisyScorer {
 }
 #[tokio::test]
 async fn valid_rescore_updates_report_without_requiring_bitwise_score_equality() {
+    crate::discovery::maintenance::require_discovery_sweep_client!();
     let (dir, config, spec, runner) = setup(8, false).await;
     let report = run(dir.path().into(), config, spec, OnlineComponents {
         runner: runner.clone(), evaluator: Arc::new(NoisyScorer),

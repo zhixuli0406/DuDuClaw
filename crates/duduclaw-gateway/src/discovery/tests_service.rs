@@ -425,6 +425,7 @@ async fn wait_terminal(home:&Path,task_id:&str)->TaskRow {
 
 #[tokio::test]
 async fn discovery_real_rpc_approval_queue_online_terminal_tree_and_artifact_journey() {
+    crate::discovery::maintenance::require_discovery_sweep_client!();
     let (dir,mut spec,_broker)=fixture(); let home=dir.path().canonicalize().unwrap(); spec.budget.max_rounds=1;
     let handler=crate::handlers::MethodHandler::new(home.clone()).await;
     handler.set_task_store(Arc::new(TaskStore::open(&home).unwrap())).await;
@@ -468,6 +469,7 @@ async fn discovery_real_rpc_approval_queue_online_terminal_tree_and_artifact_jou
 
 #[tokio::test]
 async fn discovery_real_rpc_cancellation_stops_shared_budget_and_survives_restarted_poll() {
+    crate::discovery::maintenance::require_discovery_sweep_client!();
     let (dir,mut spec,_broker)=fixture(); let home=dir.path().canonicalize().unwrap(); spec.budget.max_rounds=1;
     let handler=crate::handlers::MethodHandler::new(home.clone()).await;
     handler.set_task_store(Arc::new(TaskStore::open(&home).unwrap())).await;

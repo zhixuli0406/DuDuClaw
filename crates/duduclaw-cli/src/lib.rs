@@ -11449,7 +11449,10 @@ mod computer_use_doctor_tests {
     fn write_agent(home: &std::path::Path, name: &str, computer_use: bool) {
         let dir = home.join("agents").join(name);
         std::fs::create_dir_all(&dir).unwrap();
+        // A Windows checkout gives the template CRLF line endings; the tests
+        // below edit it with `\n`-anchored patterns, so normalise first.
         let raw = include_str!("../../../templates/evaluator/agent.toml")
+            .replace("\r\n", "\n")
             .replacen("name = \"evaluator\"", &format!("name = \"{name}\""), 1);
         let raw = if computer_use {
             raw.replacen("computer_use = false", "computer_use = true", 1)

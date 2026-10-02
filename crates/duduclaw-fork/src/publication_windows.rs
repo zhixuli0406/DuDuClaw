@@ -50,20 +50,39 @@ fn pin_parent_with_access(path: &Path, access: u32) -> Result<(File, Vec<u8>)> {
     Ok((file, key))
 }
 
-fn current_user() -> Result<(Vec<usize>, String)> {
+/// One `GetTokenInformation` record of the current process token. The usize
+/// allocation keeps the record (TOKEN_USER / TOKEN_OWNER) and its trailing SID
+/// correctly aligned.
+fn token_information(class: TOKEN_INFORMATION_CLASS, minimum: usize, what: &str) -> Result<Vec<usize>> {
     let mut raw = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
-        return Err(os_error("open publication user token"));
+        return Err(os_error(&format!("open publication {what} token")));
     }
     let token = Handle(raw);
     let mut needed = 0;
-    unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed); }
-    if needed < std::mem::size_of::<TOKEN_USER>() as u32 { return Err(os_error("size publication user token")); }
-    // usize allocation keeps TOKEN_USER and its trailing SID correctly aligned.
+    unsafe { GetTokenInformation(token.0, class, std::ptr::null_mut(), 0, &mut needed); }
+    if (needed as usize) < minimum { return Err(os_error(&format!("size publication {what} token"))); }
     let mut data = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
-    if unsafe { GetTokenInformation(token.0, TokenUser, data.as_mut_ptr().cast(), needed, &mut needed) } == 0 {
-        return Err(os_error("read publication user token"));
+    if unsafe { GetTokenInformation(token.0, class, data.as_mut_ptr().cast(), needed, &mut needed) } == 0 {
+        return Err(os_error(&format!("read publication {what} token")));
     }
+    Ok(data)
+}
+
+/// Whether `owner` is this process token's default owner — the SID Windows
+/// stamps on every object this process creates without an explicit owner.
+/// For a normal user that is the user SID itself; for an elevated member of
+/// Administrators (default policy) it is BUILTIN\Administrators, so a
+/// directory this very process made with `std::fs` / `tempfile` is owned by
+/// that group rather than by the user.
+fn is_token_default_owner(owner: PSID) -> Result<bool> {
+    let data = token_information(TokenOwner, std::mem::size_of::<TOKEN_OWNER>(), "owner")?;
+    let default_owner = unsafe { (*(data.as_ptr().cast::<TOKEN_OWNER>())).Owner };
+    Ok(!default_owner.is_null() && unsafe { IsValidSid(default_owner) != 0 && EqualSid(owner, default_owner) != 0 })
+}
+
+fn current_user() -> Result<(Vec<usize>, String)> {
+    let data = token_information(TokenUser, std::mem::size_of::<TOKEN_USER>(), "user")?;
     let sid = unsafe { (*(data.as_ptr().cast::<TOKEN_USER>())).User.Sid };
     let mut text = std::ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 { return Err(os_error("format publication user SID")); }
@@ -146,7 +165,7 @@ pub(super) fn make_private_directory(path: &Path) -> Result<()> {
     }
     // Only tighten an owned real directory; never follow a junction or change
     // a foreign owner's entry while preparing private retained/recovery data.
-    let (directory, _) = pin_parent_with_access(path, FILE_GENERIC_READ | WRITE_DAC)?;
+    let (directory, identity) = pin_parent_with_access(path, FILE_GENERIC_READ | WRITE_DAC)?;
     let mut owner = std::ptr::null_mut();
     let mut existing = std::ptr::null_mut();
     let status = unsafe { GetSecurityInfo(directory.as_raw_handle(), SE_FILE_OBJECT,
@@ -154,7 +173,13 @@ pub(super) fn make_private_directory(path: &Path) -> Result<()> {
         std::ptr::null_mut(), &mut existing) };
     if status != ERROR_SUCCESS { return Err(ForkError::Overlay(format!("read recovery owner: {status}"))); }
     let existing = LocalAllocation(existing);
-    if owner.is_null() || unsafe { EqualSid(owner, sid) } == 0 {
+    let owned = !owner.is_null() && unsafe { EqualSid(owner, sid) } != 0;
+    // An elevated administrator's own `std::fs`/`tempfile` directories are
+    // owned by its token default owner (BUILTIN\Administrators), not by the
+    // user SID. That owner is this process's own identity, so the entry is
+    // re-stamped to the user SID below; any other owner stays foreign.
+    let restamp_owner = !owned && !owner.is_null() && is_token_default_owner(owner)?;
+    if !owned && !restamp_owner {
         return Err(ForkError::Overlay("recovery directory has a foreign owner".into()));
     }
     drop(existing);
@@ -164,11 +189,24 @@ pub(super) fn make_private_directory(path: &Path) -> Result<()> {
     if unsafe { GetSecurityDescriptorDacl(security.0, &mut present, &mut acl, &mut defaulted) } == 0 || present == 0 || acl.is_null() {
         return Err(os_error("read private recovery ACL"));
     }
-    let status = unsafe { SetSecurityInfo(directory.as_raw_handle(), SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(), std::ptr::null_mut(), acl, std::ptr::null_mut()) };
+    // WRITE_OWNER is requested only when the owner must change, so the common
+    // (already user-owned) path opens exactly what it opened before. The first
+    // handle omits FILE_SHARE_DELETE and is still held, so the entry cannot be
+    // swapped between the two opens; the identity check makes that explicit.
+    let (target, info, new_owner) = if restamp_owner {
+        let (reopened, reopened_identity) = pin_parent_with_access(path, FILE_GENERIC_READ | WRITE_DAC | WRITE_OWNER)?;
+        if reopened_identity != identity {
+            return Err(ForkError::Overlay("recovery directory identity changed".into()));
+        }
+        (Some(reopened), OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, sid)
+    } else {
+        (None, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, std::ptr::null_mut())
+    };
+    let handle = target.as_ref().unwrap_or(&directory).as_raw_handle();
+    let status = unsafe { SetSecurityInfo(handle, SE_FILE_OBJECT, info,
+        new_owner, std::ptr::null_mut(), acl, std::ptr::null_mut()) };
     if status != ERROR_SUCCESS { return Err(ForkError::Overlay(format!("protect recovery directory: {status}"))); }
-    validate_security(directory.as_raw_handle(), sid, SE_FILE_OBJECT, FILE_ALL_ACCESS,
+    validate_security(handle, sid, SE_FILE_OBJECT, FILE_ALL_ACCESS,
         (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8)
 }
 

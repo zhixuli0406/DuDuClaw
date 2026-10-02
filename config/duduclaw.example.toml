@@ -538,8 +538,9 @@ port = 18789
 # openai-compat = "/usr/local/bin/python3"
 
 # ── Computer use (L5 container image) ──────────────────────
-# Image for computer-use sessions (agents with `agent.toml [capabilities]
-# computer_use = true`). Default: ghcr.io/zhixuli0406/duduclaw-computer-use:v<version>,
+# Image for computer-use sessions (agents whose `agent.toml` sets
+# `[capabilities] computer_use = true`).
+# Default: ghcr.io/zhixuli0406/duduclaw-computer-use:v<version>,
 # published per release by .github/workflows/computer-use-image.yml.
 # The image is never pulled automatically (`docker pull <image>`). To run a
 # local build instead (repo root:

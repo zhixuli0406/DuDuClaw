@@ -257,7 +257,15 @@ mod scoped_cancellation_tests {
     #[test]
     fn scoped_default_beta_cannot_stage_source_outside_the_run_quota() {
         let home = tempfile::tempdir().unwrap();
-        let mut runtime = PythonPolicyRuntime::experimental_native_for_tests().unwrap();
+        // Native confinement exists only on macOS (sandbox-exec); elsewhere the
+        // runtime is unavailable by design, as in tests_policy_runner::runtime().
+        let mut runtime = match PythonPolicyRuntime::experimental_native_for_tests() {
+            Ok(runtime) => runtime,
+            #[cfg(target_os = "macos")]
+            Err(reason) => panic!("policy runtime must be exercised on macOS: {reason}"),
+            #[cfg(not(target_os = "macos"))]
+            Err(reason) => { eprintln!("policy runtime unavailable: {reason}"); return; }
+        };
         runtime.scope = Some(PolicyScope { home: home.path().canonicalize().unwrap(), run_id: "quota-run".into(),
             budget: super::super::budget::SharedBudget::new(super::super::contracts::RunBudget {
                 max_agent_calls: 1, max_usd: 1.0, max_wall_secs: 10, max_rounds: 1 }).unwrap(),

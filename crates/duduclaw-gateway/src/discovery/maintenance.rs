@@ -361,6 +361,38 @@ pub fn on_gateway_start(home: &Path) -> Result<(), String> {
     reconcile_with_lease(home, &lease)
 }
 
+/// Test-only: whether the start-of-run orphan sweep can work on this host —
+/// a `docker` client on PATH (the same lookup [`reconcile_with_lease`] uses)
+/// that can list containers. Every online run reconciles first and fails
+/// closed without it, so tests that drive a whole run skip on hosts without
+/// Docker instead of failing on the missing dependency.
+#[cfg(test)]
+pub(super) fn sweep_client_available_for_tests() -> bool {
+    let Ok(clients) = SweepClient::detected() else { return false };
+    clients.iter().all(|client| {
+        std::process::Command::new(&client.program)
+            .env_clear().envs(client.environment.iter().cloned())
+            .args(["ps", "-q"])
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status().is_ok_and(|status| status.success())
+    })
+}
+
+/// Test-only: early-return from a test that drives a whole online run when
+/// [`sweep_client_available_for_tests`] is false, saying why.
+#[cfg(test)]
+macro_rules! require_discovery_sweep_client {
+    () => {
+        if !$crate::discovery::maintenance::sweep_client_available_for_tests() {
+            eprintln!("skipped: an online run's orphan sweep needs a reachable `docker` client on PATH");
+            return;
+        }
+    };
+}
+#[cfg(test)]
+pub(super) use require_discovery_sweep_client;
+
 #[cfg(test)]
 mod tests {
     use super::*;
