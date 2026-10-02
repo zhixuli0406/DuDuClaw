@@ -21,6 +21,7 @@ const CHANNEL_LABELS: Record<string, string> = {
   googlechat: 'Google Chat',
   teams: 'Teams',
   dingtalk: 'DingTalk',
+  wecom: 'WeCom',
 };
 
 export interface SessionChannel {

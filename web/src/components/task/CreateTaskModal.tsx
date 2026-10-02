@@ -17,6 +17,7 @@ import {
 } from '@/components/mds';
 import { AssigneePopover, type AssigneeOption } from './AssigneePopover';
 import type { TaskCreateParams, TaskPriority } from '@/lib/api';
+import { formatError, formatErrorDetail } from '@/lib/toast';
 
 /**
  * CreateTaskModal — the one "＋交辦任務" surface (§5.3 T5.1). Opened either from
@@ -45,34 +46,51 @@ export function CreateTaskModal({
   const [assignedTo, setAssignedTo] = useState('');
   const [priority, setPriority] = useState<TaskPriority>('medium');
   const [submitting, setSubmitting] = useState(false);
+  // Shown inline: the missing-assignee hint, or a refused create.
+  const [assigneeMissing, setAssigneeMissing] = useState(false);
+  const [createError, setCreateError] = useState<unknown>(null);
 
-  // Reset the form each time the modal opens. Default to UNASSIGNED (empty) so
-  // a manually-organised task is not silently handed to the first agent and
-  // auto-dispatched (Bug#4). A subtask still inherits its parent's assignee via
-  // `defaultAssignee` when one is provided.
+  // Reset the form each time the modal opens. The assignee starts EMPTY so a
+  // task is never silently handed to the first agent and auto-dispatched
+  // (Bug#4); the person must pick one, because the gateway refuses a task
+  // without `assigned_to` (`tasks.create` in handlers/dispatch_org.rs). A
+  // subtask still inherits its parent's assignee via `defaultAssignee`.
   useEffect(() => {
     if (open) {
       setTitle('');
       setDescription('');
       setPriority('medium');
       setAssignedTo(defaultAssignee ?? '');
+      setAssigneeMissing(false);
+      setCreateError(null);
     }
   }, [open, defaultAssignee]);
 
   const handleSubmit = useCallback(async () => {
     if (!title.trim()) return;
+    if (!assignedTo) {
+      setAssigneeMissing(true);
+      return;
+    }
     setSubmitting(true);
+    setCreateError(null);
     try {
-      await onCreate({
+      const created = await onCreate({
         title: title.trim(),
         description: description.trim() || undefined,
-        // Omit when unassigned — the gateway treats a missing assignee as an
-        // unassigned (never auto-dispatched) task.
-        ...(assignedTo ? { assigned_to: assignedTo } : {}),
+        assigned_to: assignedTo,
         priority,
         ...(parentTaskId ? { parent_task_id: parentTaskId } : {}),
       });
+      // The tasks store answers `null` when the gateway refused the create;
+      // keep the dialog open so nothing typed is lost.
+      if (created === null) {
+        setCreateError(true);
+        return;
+      }
       onClose();
+    } catch (e) {
+      setCreateError(e);
     } finally {
       setSubmitting(false);
     }
@@ -110,8 +128,20 @@ export function CreateTaskModal({
 
           <ModalField label={intl.formatMessage({ id: 'tasks.field.assignTo' })}>
             <div className="rounded-lg border border-input px-1 py-1">
-              <AssigneePopover agents={agents} value={assignedTo || null} onChange={setAssignedTo} allowUnassigned />
+              <AssigneePopover
+                agents={agents}
+                value={assignedTo || null}
+                onChange={(name) => {
+                  setAssignedTo(name);
+                  if (name) setAssigneeMissing(false);
+                }}
+              />
             </div>
+            {assigneeMissing && (
+              <p role="alert" className="text-xs text-destructive">
+                {intl.formatMessage({ id: 'tasks.create.assigneeRequired' })}
+              </p>
+            )}
           </ModalField>
 
           <ModalField label={intl.formatMessage({ id: 'tasks.field.priority' })}>
@@ -130,6 +160,13 @@ export function CreateTaskModal({
               </SelectContent>
             </Select>
           </ModalField>
+          {createError != null && (
+            <p role="alert" className="rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+              {createError === true
+                ? intl.formatMessage({ id: 'tasks.create.failed' })
+                : formatErrorDetail(createError) || formatError(createError)}
+            </p>
+          )}
         </div>
 
         <DialogFooter>

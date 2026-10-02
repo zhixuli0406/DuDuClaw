@@ -1,8 +1,8 @@
-import { useEffect, useState, useCallback, type ReactNode } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { useAgentsStore } from '@/stores/agents-store';
 import { api, type AutopilotRule, type AutopilotHistoryEntry } from '@/lib/api';
+import { ruleActionTarget } from '@/lib/autopilot-rules';
 import { toast, formatError } from '@/lib/toast';
 import {
   Card,
@@ -11,56 +11,17 @@ import {
   Empty,
   ErrorState,
   Switch,
-  Input,
-  Textarea,
-  Select,
-  SelectTrigger,
-  SelectValue,
-  SelectContent,
-  SelectItem,
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
-  DialogFooter,
 } from '@/components/mds';
 import { ConfirmDialog } from '@/components/settings/controls';
-import { AutonomyNote } from '@/components/AutonomyNote';
-import { FieldBlock } from '@/pages/agent-form/form-rows';
-import { Plus, Clock, XCircle, Workflow } from 'lucide-react';
-import { glyphText } from '@/lib/agent-glyph';
+import { Plus, Clock, XCircle, Workflow, Pencil } from 'lucide-react';
 import { TickSourcesCard } from './TickSourcesCard';
+import { AutopilotRuleDialog, useActionLabel, useTriggerLabel } from './AutopilotRuleDialog';
 
 // ── Autopilot Tab ───────────────────────────────────────────
-
-/** Stacked label + mds Select, for the create dialog's enum pickers. */
-function DialogSelect({
-  label,
-  value,
-  onChange,
-  options,
-}: {
-  label: ReactNode;
-  value: string;
-  onChange: (v: string) => void;
-  options: ReadonlyArray<{ value: string; label: ReactNode }>;
-}) {
-  const current = options.find((o) => o.value === value);
-  return (
-    <FieldBlock label={label}>
-      <Select value={value} onValueChange={(v) => onChange(String(v))}>
-        <SelectTrigger className="w-full" aria-label={typeof label === 'string' ? label : undefined}>
-          <SelectValue>{current?.label}</SelectValue>
-        </SelectTrigger>
-        <SelectContent>
-          {options.map((o) => (
-            <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-    </FieldBlock>
-  );
-}
 
 export function AutopilotTab() {
   const intl = useIntl();
@@ -74,6 +35,9 @@ export function AutopilotTab() {
   const [actionError, setActionError] = useState<unknown>(null);
   const [historyError, setHistoryError] = useState<unknown>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [editRule, setEditRule] = useState<AutopilotRule | null>(null);
+  const triggerLabel = useTriggerLabel();
+  const actionLabel = useActionLabel();
   const [historyRuleId, setHistoryRuleId] = useState<string | null>(null);
   const [historyEntries, setHistoryEntries] = useState<AutopilotHistoryEntry[]>([]);
   const [removeTarget, setRemoveTarget] = useState<{ id: string; name: string } | null>(null);
@@ -189,13 +153,15 @@ export function AutopilotTab() {
                     <h4 className="font-medium text-foreground">{rule.name}</h4>
                     <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
                       <Badge variant="secondary">
-                        {intl.formatMessage({ id: `autopilot.trigger.${rule.trigger_event}` })}
+                        {triggerLabel(rule.trigger_event)}
                       </Badge>
-                      <span>→</span>
+                      <span aria-hidden>→</span>
                       <Badge variant="outline">
-                        {intl.formatMessage({ id: `autopilot.action.${rule.action.type}` })}
+                        {actionLabel(rule.action?.type ?? '')}
                       </Badge>
-                      <span className="text-muted-foreground">({rule.action.agent_id})</span>
+                      {ruleActionTarget(rule.action) && (
+                        <span className="text-muted-foreground">({ruleActionTarget(rule.action)})</span>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -203,14 +169,25 @@ export function AutopilotTab() {
                   <Button
                     variant="ghost"
                     size="icon-sm"
+                    onClick={() => setEditRule(rule)}
+                    title={intl.formatMessage({ id: 'autopilot.edit' })}
+                    aria-label={intl.formatMessage({ id: 'autopilot.edit' })}
+                  >
+                    <Pencil />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
                     onClick={() => handleViewHistory(rule.id)}
                     title={intl.formatMessage({ id: 'autopilot.history' })}
+                    aria-label={intl.formatMessage({ id: 'autopilot.history' })}
                   >
                     <Clock />
                   </Button>
                   <Button
                     variant="ghost"
                     size="icon-sm"
+                    aria-label={intl.formatMessage({ id: 'autopilot.remove' })}
                     onClick={() => setRemoveTarget({ id: rule.id, name: rule.name })}
                     className="text-muted-foreground hover:text-destructive"
                   >
@@ -232,11 +209,18 @@ export function AutopilotTab() {
         </div>
       )}
 
-      {/* Create Rule Dialog */}
+      {/* Create / Edit Rule Dialog */}
       {showCreate && (
-        <AutopilotCreateDialog
+        <AutopilotRuleDialog
           onClose={() => setShowCreate(false)}
-          onCreated={() => { setShowCreate(false); fetchRules(); }}
+          onSaved={() => { setShowCreate(false); fetchRules(); }}
+        />
+      )}
+      {editRule && (
+        <AutopilotRuleDialog
+          rule={editRule}
+          onClose={() => setEditRule(null)}
+          onSaved={() => { setEditRule(null); fetchRules(); }}
         />
       )}
 
@@ -260,176 +244,6 @@ export function AutopilotTab() {
         confirmLabel={intl.formatMessage({ id: 'autopilot.remove' })}
       />
     </div>
-  );
-}
-
-function AutopilotCreateDialog({
-  onClose,
-  onCreated,
-}: {
-  onClose: () => void;
-  onCreated: () => void;
-}) {
-  const intl = useIntl();
-  const { agents, fetchAgents } = useAgentsStore();
-  const [name, setName] = useState('');
-  const [triggerEvent, setTriggerEvent] = useState<string>('task_created');
-  const [actionType, setActionType] = useState<string>('delegate');
-  const [actionAgent, setActionAgent] = useState('');
-  const [promptTemplate, setPromptTemplate] = useState('');
-  const [skillName, setSkillName] = useState('');
-  const [fromStatus, setFromStatus] = useState('');
-  const [toStatus, setToStatus] = useState('');
-  const [idleMinutes, setIdleMinutes] = useState('30');
-  const [cronExpr, setCronExpr] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-
-  useEffect(() => { fetchAgents(); }, [fetchAgents]);
-  useEffect(() => { if (agents.length > 0 && !actionAgent) setActionAgent(agents[0].name); }, [agents, actionAgent]);
-
-  const triggerEvents = ['task_created', 'task_status_changed', 'channel_message', 'agent_idle', 'schedule'] as const;
-  const actionTypes = ['delegate', 'notify', 'run_skill'] as const;
-  const statuses = ['todo', 'in_progress', 'done', 'blocked'] as const;
-
-  const handleSubmit = useCallback(async () => {
-    if (!name.trim() || !actionAgent) return;
-    setSubmitting(true);
-    try {
-      const conditions: Record<string, unknown> = {};
-      if (triggerEvent === 'task_status_changed') {
-        if (fromStatus) conditions.from_status = fromStatus;
-        if (toStatus) conditions.to_status = toStatus;
-      }
-      if (triggerEvent === 'agent_idle' && idleMinutes) {
-        conditions.idle_minutes = parseInt(idleMinutes, 10);
-      }
-      if (triggerEvent === 'schedule' && cronExpr) {
-        conditions.cron = cronExpr;
-      }
-
-      await api.autopilot.create({
-        name: name.trim(),
-        trigger_event: triggerEvent as typeof triggerEvents[number],
-        conditions,
-        action: {
-          type: actionType as typeof actionTypes[number],
-          agent_id: actionAgent,
-          ...(actionType === 'delegate' && promptTemplate ? { prompt_template: promptTemplate } : {}),
-          ...(actionType === 'run_skill' && skillName ? { skill_name: skillName } : {}),
-        },
-      });
-      onCreated();
-    } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
-    } finally {
-      setSubmitting(false);
-    }
-  }, [name, triggerEvent, actionType, actionAgent, promptTemplate, skillName, fromStatus, toStatus, idleMinutes, cronExpr, onCreated]);
-
-  const statusOptions = [
-    { value: '', label: intl.formatMessage({ id: 'tasks.filter.all' }) },
-    ...statuses.map((s) => ({ value: s, label: intl.formatMessage({ id: `tasks.status.${s}` }) })),
-  ];
-
-  return (
-    <Dialog open onOpenChange={(o) => { if (!o) onClose(); }}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{intl.formatMessage({ id: 'autopilot.create' })}</DialogTitle>
-        </DialogHeader>
-
-        <div className="space-y-4">
-          <FieldBlock label={intl.formatMessage({ id: 'autopilot.field.name' })}>
-            <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus />
-          </FieldBlock>
-
-          <DialogSelect
-            label={intl.formatMessage({ id: 'autopilot.field.triggerEvent' })}
-            value={triggerEvent}
-            onChange={setTriggerEvent}
-            options={triggerEvents.map((t) => ({ value: t, label: intl.formatMessage({ id: `autopilot.trigger.${t}` }) }))}
-          />
-
-          {/* Conditional fields based on trigger type */}
-          {triggerEvent === 'task_status_changed' && (
-            <div className="grid grid-cols-2 gap-3">
-              <DialogSelect
-                label={intl.formatMessage({ id: 'autopilot.field.fromStatus' })}
-                value={fromStatus}
-                onChange={setFromStatus}
-                options={statusOptions}
-              />
-              <DialogSelect
-                label={intl.formatMessage({ id: 'autopilot.field.toStatus' })}
-                value={toStatus}
-                onChange={setToStatus}
-                options={statusOptions}
-              />
-            </div>
-          )}
-
-          {triggerEvent === 'agent_idle' && (
-            <FieldBlock label={intl.formatMessage({ id: 'autopilot.field.idleMinutes' })}>
-              <Input type="number" min={1} value={idleMinutes} onChange={(e) => setIdleMinutes(e.target.value)} />
-            </FieldBlock>
-          )}
-
-          {triggerEvent === 'schedule' && (
-            <FieldBlock label={intl.formatMessage({ id: 'autopilot.field.cron' })}>
-              <Input value={cronExpr} onChange={(e) => setCronExpr(e.target.value)} placeholder="0 9 * * 1-5" />
-            </FieldBlock>
-          )}
-
-          <div className="grid grid-cols-2 gap-3">
-            <DialogSelect
-              label={intl.formatMessage({ id: 'autopilot.field.action' })}
-              value={actionType}
-              onChange={setActionType}
-              options={actionTypes.map((a) => ({ value: a, label: intl.formatMessage({ id: `autopilot.action.${a}` }) }))}
-            />
-            <DialogSelect
-              label={intl.formatMessage({ id: 'autopilot.field.actionAgent' })}
-              value={actionAgent}
-              onChange={setActionAgent}
-              options={agents.map((a) => ({ value: a.name, label: `${glyphText(a.icon)} ${a.display_name}` }))}
-            />
-          </div>
-
-          {actionType === 'delegate' && (
-            <FieldBlock label={intl.formatMessage({ id: 'autopilot.field.promptTemplate' })}>
-              <Textarea
-                className="min-h-[80px] resize-y"
-                value={promptTemplate}
-                onChange={(e) => setPromptTemplate(e.target.value)}
-                placeholder="Handle the newly created task: {{task.title}}"
-              />
-            </FieldBlock>
-          )}
-
-          {actionType === 'delegate' && <AutonomyNote id="autopilotDelegate" />}
-
-          {actionType === 'run_skill' && (
-            <FieldBlock label={intl.formatMessage({ id: 'autopilot.field.skillName' })}>
-              <Input value={skillName} onChange={(e) => setSkillName(e.target.value)} />
-            </FieldBlock>
-          )}
-        </div>
-
-        <DialogFooter>
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            {intl.formatMessage({ id: 'common.cancel' })}
-          </Button>
-          <Button
-            variant="brand"
-            size="sm"
-            onClick={handleSubmit}
-            disabled={submitting || !name.trim() || !actionAgent}
-          >
-            {intl.formatMessage({ id: 'autopilot.create' })}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   );
 }
 

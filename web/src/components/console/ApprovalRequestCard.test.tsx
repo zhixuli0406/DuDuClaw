@@ -82,4 +82,79 @@ describe('<ApprovalRequestCard> — O-3 inline HITL approval', () => {
     );
     expect(screen.getByText('The device restarts.')).toBeInTheDocument();
   });
+
+  describe('knowledge conflict held for review', () => {
+    const HELD: ApprovalItem = {
+      ...ITEM,
+      kind: 'knowledge_quarantine',
+      summary: '對話中出現一則與現有記憶「Acme」衝突的說法…內容摘要：Acme moved to Taipei',
+      payload: { subject: 'Acme', quarantined_ids: ['m1'], promote_on_approve: true },
+    };
+
+    it('approving reports that the memory was updated', async () => {
+      vi.spyOn(api.approvals, 'decide').mockResolvedValue({
+        id: 'appr-1',
+        decided: 'approved',
+        side_effect: { quarantine_promoted: 1 },
+      });
+      renderWithProviders(<ApprovalRequestCard payload={HELD} />);
+      await userEvent.setup().click(screen.getByRole('button', { name: 'Approve' }));
+      expect(
+        await screen.findByText('Memory updated: the new statement replaced the old one'),
+      ).toBeInTheDocument();
+    });
+
+    it('rejecting reports that the current memory stays', async () => {
+      vi.spyOn(api.approvals, 'decide').mockResolvedValue({
+        id: 'appr-1',
+        decided: 'denied',
+        side_effect: { quarantine_rejected: 1 },
+      });
+      renderWithProviders(<ApprovalRequestCard payload={HELD} />);
+      await userEvent.setup().click(screen.getByRole('button', { name: 'Reject' }));
+      expect(
+        await screen.findByText('The new statement was discarded and the current memory stays'),
+      ).toBeInTheDocument();
+    });
+
+    it('a stale decision says nothing was written', async () => {
+      vi.spyOn(api.approvals, 'decide').mockResolvedValue({
+        id: 'appr-1',
+        decided: 'approved',
+        side_effect: { quarantine_stale: 1 },
+      });
+      renderWithProviders(<ApprovalRequestCard payload={HELD} />);
+      await userEvent.setup().click(screen.getByRole('button', { name: 'Approve' }));
+      expect(await screen.findByText(/nothing was written/)).toBeInTheDocument();
+    });
+
+    it('approving a batch reports released and held-back counts', async () => {
+      vi.spyOn(api.approvals, 'decide').mockResolvedValue({
+        id: 'appr-1',
+        decided: 'approved',
+        side_effect: { quarantine_released: 2, quarantine_held: 1 },
+      });
+      renderWithProviders(
+        <ApprovalRequestCard payload={{ ...HELD, payload: { subject: 'x', quarantined_ids: ['a', 'b', 'c'] } }} />,
+      );
+      await userEvent.setup().click(screen.getByRole('button', { name: 'Approve' }));
+      expect(
+        await screen.findByText(
+          '2 accepted; 1 conflicted with more reliable content and were set aside as separate items to confirm',
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('says the full text is in the inbox', () => {
+      renderWithProviders(<ApprovalRequestCard payload={HELD} />);
+      expect(
+        screen.getByText('The full new statement and the current content are in the inbox.'),
+      ).toBeInTheDocument();
+    });
+
+    it('labels the kind instead of falling back to "other"', () => {
+      renderWithProviders(<ApprovalRequestCard payload={HELD} />);
+      expect(screen.getByText('Knowledge to confirm')).toBeInTheDocument();
+    });
+  });
 });

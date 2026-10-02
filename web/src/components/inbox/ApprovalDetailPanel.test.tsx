@@ -340,3 +340,143 @@ describe('<ApprovalDetailPanel> discovery (L7)', () => {
     }
   });
 });
+
+describe('<ApprovalDetailPanel> knowledge conflict held for review', () => {
+  const held: ApprovalItem = {
+    id: 'apr-k',
+    agent_id: 'assistant',
+    kind: 'knowledge_quarantine',
+    summary:
+      '對話中出現一則與現有記憶「王小明」衝突的說法，但它的來源可信度較低（trust: conversation_distill 0.60 < operator 1.00），' +
+      '所以沒有取代現有內容。已暫存 1 筆；核准後會以您的權限取代現有內容，拒絕則捨棄。內容摘要：王小明的生日是 3 月 5 日',
+    created_at: '2026-10-03T00:00:00Z',
+    ttl_seconds: 86400,
+    payload: { subject: '王小明', quarantined_ids: ['m1'], promote_on_approve: true },
+  };
+
+  it('explains the conflict, shows the topic and new statement, and what each decision does', () => {
+    renderWithProviders(
+      <ApprovalDetailPanel approval={held} onApprove={() => {}} onReject={() => {}} />,
+    );
+    expect(screen.getByText('New statement conflicts with memory')).toBeInTheDocument();
+    expect(screen.getByText('王小明')).toBeInTheDocument();
+    expect(screen.getByText('王小明的生日是 3 月 5 日')).toBeInTheDocument();
+    expect(screen.getByText('Approve: the new statement replaces the current memory.')).toBeInTheDocument();
+    expect(
+      screen.getByText('Reject: the new statement is discarded and the current memory stays.'),
+    ).toBeInTheDocument();
+    // The server sentence (with its internal detail) is not shown as the summary.
+    expect(screen.queryByText(/conversation_distill/)).not.toBeInTheDocument();
+  });
+
+  it('a burst quarantine keeps the generic view with its summary', () => {
+    renderWithProviders(
+      <ApprovalDetailPanel
+        approval={{ ...held, summary: 'burst summary', payload: { subject: 'x', quarantined_ids: ['a'] } }}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(screen.getByText('burst summary')).toBeInTheDocument();
+    expect(screen.queryByText('New statement conflicts with memory')).not.toBeInTheDocument();
+  });
+});
+
+describe('<ApprovalDetailPanel> knowledge conflict with current value', () => {
+  it('shows the current content and the new statement side by side, without the reason or a chat jump', () => {
+    const approval: ApprovalItem = {
+      id: 'apr-k2',
+      agent_id: 'assistant',
+      kind: 'knowledge_quarantine',
+      summary:
+        '對話中有一則關於「退款政策」的新說法，和系統目前採用、來源更可靠的內容不一致，所以還沒有套用。' +
+        '目前內容：「七天內可退」。核准會改用這則新說法取代目前內容；拒絕則捨棄這則新說法。內容摘要：三十天內可退',
+      created_at: '2026-10-03T00:00:00Z',
+      ttl_seconds: 86400,
+      channel: 'telegram',
+      channel_link: 'https://t.me/x',
+      payload: {
+        subject: 'policy:refund',
+        quarantined_ids: ['h1'],
+        promote_on_approve: true,
+        disposition: 'trust_held',
+        predicate: 'window',
+        snippet: '三十天內可退',
+        existing_id: 'e1',
+        existing_content: '七天內可退',
+        reason: 'trust: conversation_distill 0.60 < operator 1.00',
+      },
+    };
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={() => {}} onReject={() => {}} />);
+    expect(screen.getByText('Current content')).toBeInTheDocument();
+    expect(screen.getByText('七天內可退')).toBeInTheDocument();
+    expect(screen.getByText('三十天內可退')).toBeInTheDocument();
+    expect(screen.getByText('退款政策')).toBeInTheDocument();
+    expect(screen.queryByText(/trust:/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Telegram/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Telegram/ })).not.toBeInTheDocument();
+  });
+});
+
+describe('<ApprovalDetailPanel> full-write conflict card', () => {
+  const statement = '退款期限改為三十天。' + '詳細條件'.repeat(150) + ' https://evil.example/x **粗體** <b>html</b>';
+  const approval: ApprovalItem = {
+    id: 'apr-k3',
+    agent_id: 'assistant',
+    kind: 'knowledge_quarantine',
+    summary: '對話中有一則關於「退款政策」的新說法…內容摘要：短',
+    created_at: '2026-10-03T00:00:00Z',
+    ttl_seconds: 86400,
+    payload: {
+      disposition: 'trust_held',
+      promote_on_approve: true,
+      quarantined_ids: ['h1'],
+      subject: 'policy:refund',
+      subject_label: '退款政策',
+      predicate: 'window',
+      snippet: statement,
+      new_value: '三十天',
+      existing_content: '退款期限為七天。',
+      existing_content_truncated: true,
+      existing_value: '七天',
+      reason: 'trust: a 0.6 < b 1.0',
+      claim_digest: 'sha256:zzz',
+    },
+  };
+
+  it('labels value and statement on both sides, shows the whole statement as plain text', () => {
+    const { container } = renderWithProviders(
+      <ApprovalDetailPanel approval={approval} onApprove={() => {}} onReject={() => {}} />,
+    );
+    expect(screen.getByText('Current value')).toBeInTheDocument();
+    expect(screen.getByText('七天')).toBeInTheDocument();
+    expect(screen.getByText('New value')).toBeInTheDocument();
+    expect(screen.getByText('三十天')).toBeInTheDocument();
+    expect(screen.getByText('退款期限為七天。')).toBeInTheDocument();
+    // Whole statement, exact text — no truncation.
+    expect(screen.getByText(statement)).toBeInTheDocument();
+    expect(screen.getByText(/only the beginning is shown/)).toBeInTheDocument();
+    // Plain text: no link, no bold, no injected element.
+    const side = container.querySelector('[data-conflict-side="new"]')!;
+    expect(side.querySelector('a, b, strong')).toBeNull();
+    // No clamp classes on the written text.
+    expect(side.innerHTML).not.toMatch(/line-clamp|truncate/);
+    expect(screen.queryByText(/sha256|trust:|policy:refund/)).not.toBeInTheDocument();
+  });
+
+  it('shows the server error from a failed decision and keeps the buttons', () => {
+    renderWithProviders(
+      <ApprovalDetailPanel
+        approval={approval}
+        onApprove={() => {}}
+        onReject={() => {}}
+        decideError={new Error('decided, but quarantine side-effect failed: memory db locked')}
+      />,
+    );
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain('The decision did not go through');
+    expect(alert.textContent).toContain('memory db locked');
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument();
+  });
+});
+

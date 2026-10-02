@@ -11,6 +11,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import { api, type ApprovalItem, type TaskInfo, type DecisionInfo, type InstallRequestInfo } from '@/lib/api';
+import { approvalListTitle, parseKnowledgeQuarantine, quarantineResultMessage } from '@/components/inbox/knowledge-quarantine';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useApprovalsStore } from '@/stores/approvals-store';
 import { useAuthStore } from '@/stores/auth-store';
@@ -210,7 +211,9 @@ export function InboxPage() {
         item: {
           id: `approval:${a.id}`,
           type: 'approval',
-          title: a.summary,
+          // The server sentence for a held conflict carries internal detail;
+          // the row says what it is in plain words instead.
+          title: approvalListTitle(a, intl.formatMessage),
           agentId: a.agent_id,
           timestamp: a.created_at,
           urgency: TYPE_URGENCY.approval,
@@ -421,21 +424,37 @@ export function InboxPage() {
     setSelectedId((cur) => (cur === id ? null : cur));
   }, []);
 
+  // The server records a decision only after its effect succeeded, so a
+  // failed decide leaves the item pending: keep the row and show why.
+  const [decideErrors, setDecideErrors] = useState<Record<string, unknown>>({});
+
   const decide = useCallback(
     async (item: InboxItem, approve: boolean) => {
       const entry = findEntry(item.id);
       if (!entry) return;
       const a = entry.raw as ApprovalItem;
+      setDecideErrors((prev) => {
+        if (!(item.id in prev)) return prev;
+        const { [item.id]: _cleared, ...rest } = prev;
+        return rest;
+      });
       try {
-        await api.approvals.decide(a.id, approve); // side_effect field ignored
+        const res = await api.approvals.decide(a.id, approve);
         if (approve) setApprovedToday(bumpApprovedToday());
+        // A knowledge-quarantine decision says what happened to the memory;
+        // every other kind keeps the generic text.
+        const knowledge = parseKnowledgeQuarantine(a.kind, a.payload, a.summary);
+        const result = knowledge ? quarantineResultMessage(res, knowledge.variant) : null;
         toast.success(
-          approve
-            ? intl.formatMessage({ id: 'approvals.approvedToast' }, { summary: a.summary })
-            : t('inbox.approval.rejectedToast'),
+          result
+            ? intl.formatMessage({ id: result.id }, result.values)
+            : approve
+              ? intl.formatMessage({ id: 'approvals.approvedToast' }, { summary: a.summary })
+              : t('inbox.approval.rejectedToast'),
         );
         markProcessed(item.id);
       } catch (e) {
+        setDecideErrors((prev) => ({ ...prev, [item.id]: e }));
         toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
       }
     },
@@ -643,6 +662,7 @@ export function InboxPage() {
             agentName={agentName((raw as ApprovalItem).agent_id)}
             onApprove={() => decide(item, true)}
             onReject={() => decide(item, false)}
+            decideError={decideErrors[item.id]}
             onDecided={() => markProcessed(item.id)}
           />
         );
@@ -741,7 +761,7 @@ export function InboxPage() {
           </DetailShell>
         );
     }
-  }, [selectedEntry, agentName, decide, markProcessed, navigate, archive, t]);
+  }, [selectedEntry, agentName, decide, decideErrors, markProcessed, navigate, archive, t]);
 
   // ── Left column: header + tabs + list ────────────────────────────────────────
   const listColumn = (

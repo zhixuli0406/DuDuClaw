@@ -17,6 +17,7 @@ import {
   type AttentionSourceRow,
 } from '@/lib/home-overview';
 import { NeedsAttentionList } from './NeedsAttentionList';
+import { approvalListTitle } from '@/components/inbox/knowledge-quarantine';
 
 /** Rows shown before the "還有 N 件" overflow hint kicks in. */
 const ROW_CAP = 6;
@@ -102,7 +103,7 @@ export function HealthOverview({ agents, enabled }: HealthOverviewProps) {
   const items = useMemo(() => {
     const approvalRows: AttentionSourceRow[] = (data?.approvals ?? []).map((a) => ({
       id: a.id,
-      title: a.summary,
+      title: approvalListTitle(a, intl.formatMessage),
       agentId: a.agent_id,
       timestamp: a.created_at,
     }));

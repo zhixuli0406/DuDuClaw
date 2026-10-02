@@ -5,6 +5,7 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { ChannelsPage } from './ChannelsPage';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useSystemStore } from '@/stores/system-store';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -108,6 +109,29 @@ describe('ChannelsPage — behavior & access detail dialog', () => {
     const detailItem = await screen.findByText('Behavior & Access');
     await user.click(detailItem);
   }
+
+  it('enterprise: links to the member page for channel identity', async () => {
+    const user = userEvent.setup();
+    mockRpcs();
+    useSystemStore.setState({ status: { edition_profile: 'enterprise' } } as never);
+
+    await openDetailDialog(user);
+
+    expect(await screen.findByRole('button', { name: 'Go to User Management' })).toBeInTheDocument();
+    expect(screen.queryByText(/not available in the personal edition/)).not.toBeInTheDocument();
+  });
+
+  it('personal: no link to the enterprise-only member page, a plain sentence instead', async () => {
+    const user = userEvent.setup();
+    mockRpcs();
+    useSystemStore.setState({ status: { edition_profile: 'personal' } } as never);
+
+    await openDetailDialog(user);
+
+    expect(await screen.findByText(/not available in the personal edition/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Go to User Management' })).not.toBeInTheDocument();
+    useSystemStore.setState({ status: null } as never);
+  });
 
   it('loads behavior settings and shows both tabs', async () => {
     const user = userEvent.setup();

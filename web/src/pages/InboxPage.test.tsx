@@ -77,6 +77,31 @@ describe('InboxPage deep link (W2-5 H5, ?item=<id>)', () => {
     expect(screen.getAllByText('Run a shell command').length).toBeGreaterThan(0);
   });
 
+  it('a failed approve shows the server error and keeps the item in place', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'approvals.list') {
+        return Promise.resolve({
+          count: 1,
+          approvals: [{ ...APPROVAL_FIXTURE, id: 'apr-9', summary: 'Hold this knowledge' }],
+        });
+      }
+      if (method === 'approvals.decide') {
+        return Promise.reject(new Error('decided, but quarantine side-effect failed: db locked'));
+      }
+      return Promise.resolve({});
+    });
+
+    renderAt('/inbox?item=apr-9');
+    const approve = await screen.findByRole('button', { name: 'Approve' });
+    approve.click();
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('db locked');
+    // Still selected, still decidable: nothing was removed optimistically.
+    expect(screen.getAllByText('Hold this knowledge').length).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument();
+  });
+
   it('opens the linked item from an already-prefixed id (dashboard-originated link)', async () => {
     mockWsClient.call.mockImplementation((method: string) => {
       if (method === 'approvals.list') {

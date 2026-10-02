@@ -29,7 +29,7 @@ import {
   DialogClose,
 } from '@/components/mds';
 import { timeAgo, timeRemaining } from '@/lib/format';
-import { toast, formatError } from '@/lib/toast';
+import { toast, formatError, formatErrorDetail } from '@/lib/toast';
 import type { ApprovalItem, ApprovalSimulation } from '@/lib/api';
 import { expiryState } from '@/lib/inbox-model';
 import { runtimeLabel } from '@/lib/discovery-api';
@@ -48,6 +48,7 @@ import { formatTimeSaved } from '@/components/skills/status-meta';
 import { OpenInChannelButton } from './OpenInChannelButton';
 import { pilotReviewDeepLink } from '@/lib/decision-review-link';
 import { parseDiscoveryApproval, type DiscoveryApprovalSummary } from './discovery-approval-payload';
+import { parseKnowledgeQuarantine, type KnowledgeQuarantineView } from './knowledge-quarantine';
 
 // ── Local mds-token property primitives (replace the Calm Glass PropertyRow) ──
 
@@ -88,6 +89,7 @@ const DESCRIBED_KINDS = new Set([
   'wiki_ingest',
   'support_pilot_review',
   'discovery',
+  'knowledge_quarantine',
 ]);
 
 /** D1/D2: `true` when there is an actual narrative or risk point to show —
@@ -183,6 +185,100 @@ function DiscoverySpecSection({
   );
 }
 
+/** A held conversation statement that conflicts with a more reliable memory
+ *  (`promote_on_approve`). Shows only what the server sent: the topic, the
+ *  new statement (cut from the summary) and what each decision does. */
+/**
+ * One side of the conflict. Every string here comes from a chat user, so it
+ * is rendered as a React text node only: no markdown, no HTML, no link
+ * detection. The new statement is what gets written, so it is never clamped
+ * or collapsed; long text wraps.
+ */
+function ConflictSide({
+  tone,
+  value,
+  valueLabel,
+  text,
+  textLabel,
+  note,
+}: {
+  tone: 'current' | 'new';
+  value?: string;
+  valueLabel: string;
+  text?: string;
+  textLabel: string;
+  note?: string;
+}) {
+  if (!value && !text) return null;
+  return (
+    <div
+      className={cn(
+        'min-w-0 space-y-1.5 rounded-md p-2',
+        tone === 'current' ? 'bg-muted' : 'border border-brand/30',
+      )}
+      data-conflict-side={tone}
+    >
+      {value && (
+        <div className="space-y-0.5">
+          <p className="text-xs text-muted-foreground">{valueLabel}</p>
+          <p className="whitespace-pre-wrap break-words font-medium text-foreground">{value}</p>
+        </div>
+      )}
+      {text && (
+        <div className="space-y-0.5">
+          <p className="text-xs text-muted-foreground">{textLabel}</p>
+          <p className="whitespace-pre-wrap break-words text-foreground">{text}</p>
+        </div>
+      )}
+      {note && <p className="text-xs text-muted-foreground">{note}</p>}
+    </div>
+  );
+}
+
+function KnowledgeConflictSection({
+  view,
+  t,
+}: {
+  view: KnowledgeQuarantineView;
+  t: (id: string) => string;
+}) {
+  return (
+    <Section title={t('approval.knowledge.conflict.title')}>
+      <div className="space-y-2 rounded-lg border p-3 text-sm">
+        <p className="text-muted-foreground">{t('approval.knowledge.conflict.explain')}</p>
+        {view.subject && (
+          <Row label={t('approval.knowledge.conflict.subject')}>
+            <span className="break-words">{view.subject}</span>
+          </Row>
+        )}
+        {(view.current || view.currentValue || view.statement || view.newValue) && (
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <ConflictSide
+              tone="current"
+              value={view.currentValue}
+              valueLabel={t('approval.knowledge.conflict.currentValue')}
+              text={view.current}
+              textLabel={t('approval.knowledge.conflict.current')}
+              note={view.currentTruncated ? t('approval.knowledge.conflict.currentTruncated') : undefined}
+            />
+            <ConflictSide
+              tone="new"
+              value={view.newValue}
+              valueLabel={t('approval.knowledge.conflict.newValue')}
+              text={view.statement}
+              textLabel={t('approval.knowledge.conflict.statement')}
+            />
+          </div>
+        )}
+        <ul className="list-disc space-y-0.5 pl-4 text-xs text-muted-foreground">
+          <li>{t('approval.knowledge.conflict.onApprove')}</li>
+          <li>{t('approval.knowledge.conflict.onReject')}</li>
+        </ul>
+      </div>
+    </Section>
+  );
+}
+
 function riskBadgeVariant(level: RiskLevel): 'destructive' | 'secondary' | 'outline' {
   return level === 'high' ? 'destructive' : level === 'medium' ? 'secondary' : 'outline';
 }
@@ -220,6 +316,7 @@ export function ApprovalDetailPanel({
   onApprove,
   onReject,
   onDecided,
+  decideError,
 }: {
   approval: ApprovalItem;
   agentName?: string;
@@ -228,6 +325,8 @@ export function ApprovalDetailPanel({
   /** Called after a self-contained (skill_create) decision succeeds, so the
    *  parent can remove the decided row without issuing a second decide. */
   onDecided?: () => void;
+  /** Set when the parent's last decide failed; the item is still pending. */
+  decideError?: unknown;
 }) {
   // ── skill_create specialization ──
   if (approval.kind === 'skill_create') {
@@ -246,7 +345,13 @@ export function ApprovalDetailPanel({
   }
 
   return (
-    <GenericApprovalView approval={approval} agentName={agentName} onApprove={onApprove} onReject={onReject} />
+    <GenericApprovalView
+      approval={approval}
+      agentName={agentName}
+      onApprove={onApprove}
+      onReject={onReject}
+      decideError={decideError}
+    />
   );
 }
 
@@ -263,11 +368,13 @@ function GenericApprovalView({
   agentName,
   onApprove,
   onReject,
+  decideError,
 }: {
   approval: ApprovalItem;
   agentName?: string;
   onApprove: () => void;
   onReject: () => void;
+  decideError?: unknown;
 }) {
   const intl = useIntl();
   const navigate = useNavigate();
@@ -279,7 +386,11 @@ function GenericApprovalView({
   const risk = approvalRisk(approval.kind, approval.payload);
   const facts = extractPlanFacts(approval.payload);
   const described = DESCRIBED_KINDS.has(approval.kind);
-  const kindDesc = described ? t(`approval.plan.kind.${approval.kind}`) : t('approval.plan.kind.unknown');
+  const knowledge = parseKnowledgeQuarantine(approval.kind, approval.payload, approval.summary);
+  const knowledgeConflict = knowledge?.variant === 'conflict' ? knowledge : null;
+  const kindDesc = knowledgeConflict
+    ? t('approval.plan.kind.knowledge_quarantine.conflict')
+    : described ? t(`approval.plan.kind.${approval.kind}`) : t('approval.plan.kind.unknown');
   const discoverySpec = approval.kind === 'discovery' ? parseDiscoveryApproval(approval.payload) : null;
   const reviewLink = approval.kind === 'support_pilot_review'
     ? pilotReviewDeepLink(approval.payload, approval.id) : null;
@@ -320,7 +431,12 @@ function GenericApprovalView({
             <p className="min-w-0 flex-1 text-sm font-medium text-foreground">{kindDesc}</p>
             <RiskBadge level={risk} label={t(`approval.risk.${risk}`)} />
           </div>
-          <p className="text-sm text-muted-foreground">{approval.summary}</p>
+          {/* A conflict whose statement we could read gets the plain view
+              below instead of the server sentence (which carries internal
+              detail); anything else keeps the summary as before. */}
+          {!(knowledgeConflict && knowledgeConflict.statement) && (
+            <p className="text-sm text-muted-foreground">{approval.summary}</p>
+          )}
           {approval.agent_id && (
             <div className="flex items-center gap-1.5 pt-0.5 text-xs text-muted-foreground">
               <ActorAvatar actorType="agent" size="xs" name={agentName ?? approval.agent_id} />
@@ -332,6 +448,8 @@ function GenericApprovalView({
       </Section>
 
       {discoverySpec && <DiscoverySpecSection spec={discoverySpec} intl={intl} />}
+
+      {knowledgeConflict && <KnowledgeConflictSection view={knowledgeConflict} t={t} />}
 
       {reviewLink && <div className="space-y-1 rounded-lg border p-3">
         {isAdminReviewer ? (
@@ -346,7 +464,9 @@ function GenericApprovalView({
 
       {/* W2-3 reverse handoff (E8): jump back to where this decision card
           was actually pushed. Renders nothing when unresolvable. */}
-      <OpenInChannelButton channel={approval.channel} link={approval.channel_link} />
+      {/* Knowledge reviews are decided here only; the chat message is just a
+          pointer to the inbox, so there is nothing to jump back to. */}
+      {!knowledge && <OpenInChannelButton channel={approval.channel} link={approval.channel_link} />}
 
       {/* ── Near-expiry warning — only shown in the last third of the
           TTL window, so it signals urgency instead of adding noise to every
@@ -435,6 +555,19 @@ function GenericApprovalView({
           </div>
         )}
       </div>
+
+      {decideError != null && (
+        <div
+          role="alert"
+          className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+        >
+          <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+          <div className="min-w-0 space-y-0.5">
+            <p className="font-medium">{t('approval.decide.failed')}</p>
+            <p className="whitespace-pre-wrap break-words">{formatErrorDetail(decideError) || formatError(decideError)}</p>
+          </div>
+        </div>
+      )}
 
       {/* ── Decision (after the summary is read) ── */}
       <div className="flex items-center gap-2">

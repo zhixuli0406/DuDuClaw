@@ -4,8 +4,6 @@ import { useNavigate } from 'react-router';
 import {
   api,
   type OsAgentStatus,
-  type AutopilotCondition,
-  type AutopilotAction,
 } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -45,11 +43,6 @@ import { FolderInput, BellRing, Wand2 } from 'lucide-react';
  */
 
 type TemplateKind = 'file' | 'app';
-
-/** Engine-shaped condition/action payloads (the legacy TS types in api.ts
- *  predate the `all/any + field/op/value` engine schema — server validates). */
-const asCondition = (v: unknown) => v as AutopilotCondition;
-const asAction = (v: unknown) => v as AutopilotAction;
 
 export function OsAutomationTemplates({
   agents,
@@ -96,16 +89,16 @@ export function OsAutomationTemplates({
     await api.autopilot.create({
       name: t('os.templates.file.ruleName', { agent: displayNameOf(selected.agent_id) }),
       trigger_event: 'os_file',
-      conditions: asCondition({
+      conditions: {
         all: [{ field: 'agent_id', op: 'eq', value: selected.agent_id }],
-      }),
-      action: asAction({
+      },
+      action: {
         type: 'delegate',
         target_agent: selected.agent_id,
         prompt:
           '收到新檔案事件：{path}（變更類型 {kind}）。請判斷檔案性質（發票／收據／合約／一般文件），' +
           '把它歸檔到你工作目錄中對應的子資料夾，並以一句話回報你做了什麼。',
-      }),
+      },
     });
   };
 
@@ -117,18 +110,18 @@ export function OsAutomationTemplates({
         app: appKeyword.trim(),
       }),
       trigger_event: 'os_frontmost',
-      conditions: asCondition({
+      conditions: {
         all: [
           { field: 'agent_id', op: 'eq', value: selected.agent_id },
           { field: 'app', op: 'contains', value: appKeyword.trim() },
         ],
-      }),
-      action: asAction({
+      },
+      action: {
         type: 'notify',
         channel,
         chat_id: chatId.trim(),
         text: reminderText.trim() || t('os.templates.app.defaultText'),
-      }),
+      },
     });
   };
 

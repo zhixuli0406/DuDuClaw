@@ -13,7 +13,7 @@ import {
 } from '@/components/mds';
 import { AdvancedSection, type SelectOption } from '@/components/settings/controls';
 import { AutonomyNote } from '@/components/AutonomyNote';
-import { RowSelect, RowSwitch, RowText, FieldBlock } from '@/pages/agent-form/form-rows';
+import { RowSelect, RowText, FieldBlock } from '@/pages/agent-form/form-rows';
 
 // ── Voice Settings Tab ─────────────────────────────────────────
 
@@ -34,12 +34,15 @@ const EMPTY_STT: SttConfig = {
 
 export function VoiceTab() {
   const intl = useIntl();
+  // Only the [voice] keys the gateway actually reads: `tts_provider` /
+  // `tts_voice` (the speech-synthesis endpoint in server.rs). The former
+  // 語音回覆模式 / 語音辨識 / 語言 controls wrote `voice_reply_enabled` /
+  // `asr_provider` / `asr_language`, which nothing reads; they were removed
+  // (values already in inference.toml are left untouched — the save below
+  // never sends those keys). Speech-to-text lives in the advanced card.
   const [config, setConfig] = useState({
-    asr_provider: 'auto',
     tts_provider: 'auto',
-    asr_language: 'zh',
     tts_voice: '',
-    voice_reply_enabled: false,
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -55,7 +58,10 @@ export function VoiceTab() {
     setLoadError(null);
     api.system.config().then((res) => {
       if (res?.voice) {
-        setConfig((prev) => ({ ...prev, ...res.voice }));
+        setConfig((prev) => ({
+          tts_provider: res.voice?.tts_provider ?? prev.tts_provider,
+          tts_voice: res.voice?.tts_voice ?? prev.tts_voice,
+        }));
       }
     }).catch((e) => {
       setLoadError(e);
@@ -80,23 +86,12 @@ export function VoiceTab() {
     }
   };
 
-  const asrOptions: SelectOption[] = [
-    { value: 'auto', label: intl.formatMessage({ id: 'voice.provider.auto' }), raw: 'auto' },
-    { value: 'whisper-api', label: intl.formatMessage({ id: 'voice.provider.whisperApi' }), raw: 'whisper-api' },
-    { value: 'whisper-local', label: 'Whisper Local', raw: 'whisper-local' },
-  ];
   const ttsOptions: SelectOption[] = [
     { value: 'auto', label: intl.formatMessage({ id: 'voice.provider.auto' }), raw: 'auto' },
     { value: 'edge-tts', label: intl.formatMessage({ id: 'voice.provider.edgeTts' }), raw: 'edge-tts' },
     { value: 'minimax', label: intl.formatMessage({ id: 'voice.provider.minimax' }), raw: 'minimax' },
     { value: 'openai-tts', label: intl.formatMessage({ id: 'voice.provider.openaiTts' }), raw: 'openai-tts' },
     { value: 'piper', label: intl.formatMessage({ id: 'voice.provider.piper' }), raw: 'piper' },
-  ];
-  const langOptions: SelectOption[] = [
-    { value: 'zh', label: '中文', raw: 'zh' },
-    { value: 'en', label: 'English', raw: 'en' },
-    { value: 'ja', label: '日本語', raw: 'ja' },
-    { value: 'ko', label: '한국어', raw: 'ko' },
   ];
 
   return (
@@ -112,32 +107,12 @@ export function VoiceTab() {
 
       <SettingsSection>
         <SettingsCard>
-          <RowSwitch
-            label={intl.formatMessage({ id: 'voice.voiceMode' })}
-            description={intl.formatMessage({ id: 'voice.voiceMode.help' })}
-            checked={config.voice_reply_enabled}
-            onChange={(v) => setConfig({ ...config, voice_reply_enabled: v })}
-          />
-          <RowSelect
-            label={intl.formatMessage({ id: 'voice.asrProvider' })}
-            description={intl.formatMessage({ id: 'voice.asrProvider.help' })}
-            value={config.asr_provider}
-            onChange={(v) => setConfig({ ...config, asr_provider: v })}
-            options={asrOptions}
-          />
           <RowSelect
             label={intl.formatMessage({ id: 'voice.ttsProvider' })}
             description={intl.formatMessage({ id: 'voice.ttsProvider.help' })}
             value={config.tts_provider}
             onChange={(v) => setConfig({ ...config, tts_provider: v })}
             options={ttsOptions}
-          />
-          <RowSelect
-            label={intl.formatMessage({ id: 'voice.language' })}
-            description={intl.formatMessage({ id: 'voice.language.help' })}
-            value={config.asr_language}
-            onChange={(v) => setConfig({ ...config, asr_language: v })}
-            options={langOptions}
           />
         </SettingsCard>
         {saveError != null && (

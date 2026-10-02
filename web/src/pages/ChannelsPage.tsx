@@ -14,6 +14,9 @@ import {
 import { client } from '@/lib/ws-client';
 import { toast, formatError } from '@/lib/toast';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useSystemStore } from '@/stores/system-store';
+import { useAuthStore } from '@/stores/auth-store';
+import { isVisible, type Gated } from '@/lib/nav-visibility';
 import { ConfirmDialog } from '@/components/settings/controls';
 import { AddChannelDialog, CHANNEL_TYPES, DialogField } from '@/components/channels/AddChannelDialog';
 import {
@@ -68,6 +71,9 @@ import {
   QrCode as QrCodeIcon,
   Printer,
 } from 'lucide-react';
+
+/** 成員 (`/manage/users`) is Enterprise-only — same gate as the 身分解析 tab. */
+const USERS_PAGE_GATE: Gated = { enterprise: true };
 
 const channelMeta: Record<
   string,
@@ -803,6 +809,9 @@ function ChannelDetailDialog({
   useEffect(() => {
     if (open) setTab('behavior');
   }, [open]);
+  const isPersonal = useSystemStore((st) => st.status?.edition_profile) === 'personal';
+  const role = useAuthStore((st) => st.user?.role);
+  const usersPageVisible = isVisible(USERS_PAGE_GATE, role, isPersonal);
 
   return (
     <Dialog open={open} onOpenChange={(o) => { if (!o) onClose(); }}>
@@ -818,17 +827,25 @@ function ChannelDetailDialog({
             員工) and "驗證身分" (who is who on the channel) — both live on
             UsersPage. Point admins there instead of letting them assume this
             dialog covers everything. */}
+        {/* The 成員 page is Enterprise-only (same gate as the 身分解析 tab), so
+            on Personal the link would lead nowhere; say so in plain words. */}
         <div className="flex items-start gap-2 rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
           <Info className="mt-0.5 size-3.5 shrink-0" />
-          <span className="flex-1">{t('channels.detail.crossLink')}</span>
-          <Button
-            variant="link"
-            size="sm"
-            className="h-auto shrink-0 p-0"
-            onClick={() => navigate('/manage/users')}
-          >
-            {t('channels.detail.crossLink.action')}
-          </Button>
+          {usersPageVisible ? (
+            <>
+              <span className="flex-1">{t('channels.detail.crossLink')}</span>
+              <Button
+                variant="link"
+                size="sm"
+                className="h-auto shrink-0 p-0"
+                onClick={() => navigate('/manage/users')}
+              >
+                {t('channels.detail.crossLink.action')}
+              </Button>
+            </>
+          ) : (
+            <span className="flex-1">{t('channels.detail.crossLink.personal')}</span>
+          )}
         </div>
 
         {platform && (

@@ -8,6 +8,7 @@ import { timeRemaining } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import type { ApprovalRequestArtifact } from './artifact-types';
 import { ArtifactShell } from './ArtifactShell';
+import { parseKnowledgeQuarantine, quarantineResultMessage } from '@/components/inbox/knowledge-quarantine';
 
 /** Fallback-to-"其他操作" lookup for an unknown backend `kind`. (The legacy
  *  `ApprovalsPage` this was copied from was deleted in 2026-09; `/approvals`
@@ -35,6 +36,8 @@ export function ApprovalRequestCard({ payload }: { payload: ApprovalRequestArtif
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
   const [status, setStatus] = useState<CardStatus>('idle');
   const [error, setError] = useState<string | null>(null);
+  // Set when the decision result says what happened (knowledge quarantine).
+  const [resultText, setResultText] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
   // Live TTL tick, same idea as `ApprovalModal`'s countdown — only while a
@@ -49,10 +52,14 @@ export function ApprovalRequestCard({ payload }: { payload: ApprovalRequestArtif
     setStatus('busy');
     setError(null);
     try {
-      await api.approvals.decide(payload.id, approve);
-      toast.success(
-        t(approve ? 'approvals.approvedToast' : 'approvals.deniedToast', { summary: payload.summary }),
-      );
+      const res = await api.approvals.decide(payload.id, approve);
+      const knowledge = parseKnowledgeQuarantine(payload.kind, payload.payload, payload.summary);
+      const result = knowledge ? quarantineResultMessage(res, knowledge.variant) : null;
+      const text = result
+        ? t(result.id, result.values)
+        : t(approve ? 'approvals.approvedToast' : 'approvals.deniedToast', { summary: payload.summary });
+      setResultText(result ? text : null);
+      toast.success(text);
       setStatus(approve ? 'approved' : 'denied');
     } catch (e) {
       console.warn('[console.artifact.approval_request]', payload.id, e);
@@ -69,7 +76,7 @@ export function ApprovalRequestCard({ payload }: { payload: ApprovalRequestArtif
       <ArtifactShell icon={approved ? Check : X} title={t('console.artifact.approvalRequest.title')}>
         <p className={cn('flex items-center gap-2 text-sm', approved ? 'text-success' : 'text-muted-foreground')}>
           {approved ? <Check className="size-4 shrink-0" aria-hidden="true" /> : <X className="size-4 shrink-0" aria-hidden="true" />}
-          {t(approved ? 'approvals.approvedToast' : 'approvals.deniedToast', { summary: payload.summary })}
+          {resultText ?? t(approved ? 'approvals.approvedToast' : 'approvals.deniedToast', { summary: payload.summary })}
         </p>
       </ArtifactShell>
     );
@@ -92,6 +99,9 @@ export function ApprovalRequestCard({ payload }: { payload: ApprovalRequestArtif
           </span>
         </div>
         <p className="break-words text-sm text-foreground">{payload.summary}</p>
+        {parseKnowledgeQuarantine(payload.kind, payload.payload, payload.summary)?.variant === 'conflict' && (
+          <p className="text-xs text-muted-foreground">{t('approval.knowledge.fullTextInInbox')}</p>
+        )}
         {payload.simulation && payload.simulation.world_state_change.trim() !== '' && (
           <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
             <Compass className="mt-0.5 size-3 shrink-0" aria-hidden="true" />

@@ -46,6 +46,7 @@ import {
   Bot,
 } from 'lucide-react';
 import { hasMinRole } from '@/lib/roles';
+import { approvalListTitle } from '@/components/inbox/knowledge-quarantine';
 
 /** Default widget order for a fresh user (server catalog order also matches). */
 const DEFAULT_ORDER = ['needs_me', 'my_agents', 'recent_activity', 'my_tasks', 'channel_health'];
@@ -254,7 +255,7 @@ export function HomePage() {
     ]).then(([approvals, budget, blocked, needsHuman, failed]) => {
       const items: InboxItem[] = [];
       for (const a of approvals?.approvals ?? []) {
-        items.push({ id: `approval:${a.id}`, type: 'approval', title: a.summary, agentId: a.agent_id, timestamp: a.created_at, urgency: TYPE_URGENCY.approval, actionable: true, status: 'pending' });
+        items.push({ id: `approval:${a.id}`, type: 'approval', title: approvalListTitle(a, intl.formatMessage), agentId: a.agent_id, timestamp: a.created_at, urgency: TYPE_URGENCY.approval, actionable: true, status: 'pending' });
       }
       for (const t of [...(blocked?.tasks ?? []), ...(needsHuman?.tasks ?? [])]) {
         items.push({ id: `blocked:${t.id}`, type: 'blocked', title: t.title, agentId: t.assigned_to || undefined, timestamp: t.updated_at, urgency: TYPE_URGENCY.blocked, actionable: true, status: t.status });

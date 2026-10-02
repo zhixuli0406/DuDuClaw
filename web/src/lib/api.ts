@@ -10,6 +10,11 @@ import {
 } from './agent-fanout';
 import { migrateScanArgs, migrateApplyArgs } from './migrate';
 import type { RunDetail, RunSummary } from './run-transcript';
+import type {
+  AutopilotRule,
+  AutopilotCreateParams,
+  AutopilotUpdateFields,
+} from './autopilot-rules';
 
 // Type definitions matching Rust types
 export interface AgentInfo {
@@ -852,8 +857,10 @@ export interface TaskCreateParams {
   title: string;
   description?: string;
   priority?: TaskPriority;
-  /** Optional — omit for an unassigned task (never auto-dispatched, Bug#4). */
-  assigned_to?: string;
+  /** Required: the gateway refuses `tasks.create` without it
+   *  ("assigned_to is required", handlers/dispatch_org.rs) and checks the
+   *  caller's Operator access on this agent. */
+  assigned_to: string;
   tags?: string[];
   parent_task_id?: string;
 }
@@ -1037,53 +1044,18 @@ export interface TaskComment {
 
 // ── Autopilot types ─────────────────────────────────────────
 
-export type AutopilotTriggerEvent =
-  | 'task_created'
-  | 'task_status_changed'
-  | 'channel_message'
-  | 'agent_idle'
-  | 'schedule'
-  // OS-native perception events (P2-4) — used by the OS-page rule templates.
-  | 'os_file'
-  | 'os_frontmost';
-
-export type AutopilotActionType = 'delegate' | 'notify' | 'run_skill';
-
-export interface AutopilotCondition {
-  from_status?: TaskStatus;
-  to_status?: TaskStatus;
-  agent_id?: string;
-  channel_type?: string;
-  idle_minutes?: number;
-  cron?: string;
-}
-
-export interface AutopilotAction {
-  type: AutopilotActionType;
-  agent_id: string;
-  prompt_template?: string;
-  skill_name?: string;
-}
-
-export interface AutopilotRule {
-  id: string;
-  name: string;
-  enabled: boolean;
-  trigger_event: AutopilotTriggerEvent;
-  conditions: AutopilotCondition;
-  action: AutopilotAction;
-  created_at: string;
-  last_triggered_at?: string;
-  trigger_count: number;
-}
-
-export interface AutopilotCreateParams {
-  name: string;
-  trigger_event: AutopilotTriggerEvent;
-  conditions: AutopilotCondition;
-  action: AutopilotAction;
-}
-
+// The rule wire contract lives in `./autopilot-rules` (one module mirrors
+// the gateway's trigger list, condition operators and action fields).
+export type {
+  AutopilotTriggerEvent,
+  AutopilotActionType,
+  AutopilotCondition,
+  AutopilotConditionLeaf,
+  AutopilotAction,
+  AutopilotRule,
+  AutopilotCreateParams,
+  AutopilotUpdateFields,
+} from './autopilot-rules';
 export interface AutopilotHistoryEntry {
   id: string;
   rule_id: string;
@@ -6137,6 +6109,9 @@ export const api = {
       }) as Promise<{
         id: string;
         decided: 'approved' | 'denied';
+        /** What the decision changed, shape varies by kind (e.g.
+         *  `{ quarantine_promoted: n }` for a held knowledge conflict). */
+        side_effect?: Record<string, unknown> | null;
       }>,
   },
   // W3-1 — read-only: conversations a human currently holds. See
@@ -6619,7 +6594,7 @@ export const api = {
       client.call('autopilot.list') as Promise<{ rules: AutopilotRule[] }>,
     create: (params: AutopilotCreateParams) =>
       client.call('autopilot.create', { ...params }) as Promise<{ rule: AutopilotRule }>,
-    update: (ruleId: string, fields: Partial<AutopilotCreateParams> & { enabled?: boolean }) =>
+    update: (ruleId: string, fields: AutopilotUpdateFields) =>
       client.call('autopilot.update', { rule_id: ruleId, ...fields }) as Promise<{ rule: AutopilotRule }>,
     remove: (ruleId: string) =>
       client.call('autopilot.remove', { rule_id: ruleId }) as Promise<{ success: boolean }>,

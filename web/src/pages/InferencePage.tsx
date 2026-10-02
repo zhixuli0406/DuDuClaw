@@ -10,7 +10,8 @@ import {
   type InferenceOpenAiCompat,
 } from '@/lib/api';
 import { ChipEditor } from '@/components/shared/ChipEditor';
-import { toast, formatError } from '@/lib/toast';
+import type { SelectOption } from '@/components/settings/controls';
+import { toast, formatError, formatErrorDetail } from '@/lib/toast';
 import {
   Button,
   Input,
@@ -21,7 +22,7 @@ import {
   type SettingsSaveStatus,
   type SettingsRowTier,
 } from '@/components/mds';
-import { RowText, RowSecret, RowSwitch, FieldBlock } from '@/pages/agent-form/form-rows';
+import { RowText, RowSecret, RowSwitch, RowSelect, FieldBlock } from '@/pages/agent-form/form-rows';
 import { Cpu, Save, RefreshCw, Loader2, AlertTriangle } from 'lucide-react';
 
 /** Read a flat backend sub-section value as a string for the input field. */
@@ -79,6 +80,8 @@ export function InferencePage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // The gateway's refusal (e.g. a removed backend), shown next to the form.
+  const [saveError, setSaveError] = useState<unknown>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Root scalars
@@ -87,7 +90,11 @@ export function InferencePage() {
   const [modelsDir, setModelsDir] = useState('');
   const [defaultModel, setDefaultModel] = useState('');
   const [autoLoad, setAutoLoad] = useState(false);
-  const [maxMemoryMb, setMaxMemoryMb] = useState<number | undefined>(undefined);
+  // 記憶體上限 (`max_memory_mb`) and the generation 「GPU Layers」/「Context 大小」
+  // rows were removed: nothing in the gateway or inference crate reads those
+  // keys (the only backend left is an external OpenAI-compatible server,
+  // which owns its own memory, GPU offload and context size). Saved values
+  // stay in inference.toml untouched — `generation` round-trips as loaded.
 
   // Generation
   const [gen, setGen] = useState<InferenceGeneration>({});
@@ -127,7 +134,6 @@ export function InferencePage() {
       setModelsDir(res.models_dir ?? '');
       setDefaultModel(res.default_model ?? '');
       setAutoLoad(Boolean(res.auto_load));
-      setMaxMemoryMb(res.max_memory_mb ?? undefined);
       setGen(res.generation ?? {});
       setRouter(res.router ?? {});
       const ocIn = res.openai_compat ?? {};
@@ -177,14 +183,17 @@ export function InferencePage() {
       return;
     }
     setSaving(true);
+    setSaveError(null);
     try {
       const payload: InferenceUpdate = {
         enabled,
-        backend: backend || undefined,
+        // Always sent: "" asks the gateway to drop the key (automatic), so a
+        // stored removed backend is really cleared; an unchanged value is a
+        // no-op server-side (`inf_validate_backend`).
+        backend,
         models_dir: modelsDir || undefined,
         default_model: defaultModel || undefined,
         auto_load: autoLoad,
-        max_memory_mb: maxMemoryMb,
         generation: gen,
         router,
         openai_compat: {
@@ -204,6 +213,7 @@ export function InferencePage() {
       // Re-load so masked secret state / authoritative values refresh.
       await load();
     } catch (e) {
+      setSaveError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
@@ -228,6 +238,18 @@ export function InferencePage() {
       </SettingsSection>
     );
   };
+
+  // The only backend the inference engine can start is `openai_compat`
+  // (`duduclaw-inference` BackendType; `llama_cpp` / `mistral_rs` still parse
+  // but fail at initialisation). Empty = not set, which auto-selects it too.
+  // A legacy saved value stays visible, labelled, so it is not hidden.
+  const backendOptions: SelectOption[] = [
+    { value: '', label: t('inference.backend.auto'), raw: '' },
+    { value: 'openai_compat', label: t('inference.backend.openaiCompat'), raw: 'openai_compat' },
+    ...(backend && backend !== 'openai_compat'
+      ? [{ value: backend, label: intl.formatMessage({ id: 'inference.backend.removed' }, { name: backend }), raw: backend }]
+      : []),
+  ];
 
   const saveStatus: SettingsSaveStatus = saving ? 'saving' : saved ? 'saved' : 'idle';
 
@@ -254,6 +276,19 @@ export function InferencePage() {
           </Button>
         </div>
       </div>
+
+      {saveError != null && (
+        <div
+          role="alert"
+          className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2.5 text-sm text-destructive"
+        >
+          <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+          <div className="space-y-0.5">
+            <p className="font-medium">{t('inference.saveRejected')}</p>
+            <p className="break-words">{formatErrorDetail(saveError) || formatError(saveError)}</p>
+          </div>
+        </div>
+      )}
 
       {/* Model install moved to the marketplace — this page keeps runtime
           settings only (the old curated list UX is retired). */}
@@ -283,11 +318,10 @@ export function InferencePage() {
           <SettingsSection title={t('inference.section.backend')}>
             <SettingsCard>
               <RowSwitch label={t('inference.enabled')} checked={enabled} onChange={setEnabled} />
-              <RowText label={t('inference.backend')} description={t('inference.backend.hint')} value={backend} onChange={setBackend} placeholder="llama_cpp" />
+              <RowSelect label={t('inference.backend')} description={t('inference.backend.hint')} value={backend} onChange={setBackend} options={backendOptions} />
               <RowText label={t('inference.modelsDir')} description={t('inference.modelsDir.hint')} value={modelsDir} onChange={setModelsDir} placeholder="~/.duduclaw/models" />
               <RowText label={t('inference.defaultModel')} description={t('inference.defaultModel.hint')} value={defaultModel} onChange={setDefaultModel} />
               <RowSwitch label={t('inference.autoLoad')} checked={autoLoad} onChange={setAutoLoad} />
-              <RowNumOpt label={t('inference.maxMemoryMb')} description={t('inference.maxMemoryMb.hint')} value={maxMemoryMb} onChange={setMaxMemoryMb} min={0} />
             </SettingsCard>
           </SettingsSection>
 
@@ -297,8 +331,6 @@ export function InferencePage() {
               <RowNumOpt label={t('inference.gen.maxTokens')} value={gen.max_tokens} onChange={(n) => setGen((p) => ({ ...p, max_tokens: n }))} min={1} />
               <RowNumOpt label={t('inference.gen.temperature')} description="0.0-2.0" value={gen.temperature} onChange={(n) => setGen((p) => ({ ...p, temperature: n }))} min={0} max={2} step={0.05} />
               <RowNumOpt label={t('inference.gen.topP')} description="0.0-1.0" value={gen.top_p} onChange={(n) => setGen((p) => ({ ...p, top_p: n }))} min={0} max={1} step={0.05} />
-              <RowNumOpt label={t('inference.gen.gpuLayers')} value={gen.gpu_layers} onChange={(n) => setGen((p) => ({ ...p, gpu_layers: n }))} min={-1} />
-              <RowNumOpt label={t('inference.gen.contextSize')} value={gen.context_size} onChange={(n) => setGen((p) => ({ ...p, context_size: n }))} min={512} />
             </SettingsCard>
             <FieldBlock label={t('inference.gen.stop')} description={t('inference.gen.stop.hint')}>
               <ChipEditor values={gen.stop ?? []} onChange={(v) => setGen((p) => ({ ...p, stop: v }))} placeholder="</s>" addLabel={t('common.add')} />

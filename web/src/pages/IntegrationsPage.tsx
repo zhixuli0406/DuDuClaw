@@ -7,6 +7,9 @@ import { McpKeysPage } from './McpKeysPage';
 import { OdooPage } from './OdooPage';
 import { IdentityPage } from './IdentityPage';
 import { GoogleIntegrationPage } from './GoogleIntegrationPage';
+import { useSystemStore } from '@/stores/system-store';
+import { useAuthStore } from '@/stores/auth-store';
+import { isVisible, type Gated } from '@/lib/nav-visibility';
 
 /**
  * Google Workspace 分頁。v1.48.0 起開放：原本等的是原廠 OAuth App 驗證，
@@ -21,6 +24,14 @@ const GOOGLE_INTEGRATION_ENABLED = true;
 
 const TAB_IDS = ['mcp', 'google', 'odoo', 'identity'] as const;
 type TabId = (typeof TAB_IDS)[number];
+
+/**
+ * 身分解析 is Enterprise-only: the gateway rejects every `identity.*` RPC on a
+ * Personal install (`handlers/gates.rs` `is_enterprise_only_method`), so the
+ * tab could only ever show an error there. Same `enterprise` gate the sidebar
+ * uses; a `?tab=identity` link on Personal falls back to the first tab.
+ */
+const IDENTITY_TAB_GATE: Gated = { enterprise: true };
 
 /**
  * IntegrationsPage — the `/manage/integrations` surface. Four entries since
@@ -42,7 +53,13 @@ export function IntegrationsPage() {
   // P11 (state-as-URL): the active tab *is* `?tab=` — no shadow `useState`, so
   // Back/Forward and a pasted link can never disagree with what is rendered.
   // An unknown or hidden tab resolves to the first one rather than a blank panel.
-  const hidden: TabId[] = GOOGLE_INTEGRATION_ENABLED ? [] : ['google'];
+  const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
+  const role = useAuthStore((s) => s.user?.role);
+  const identityVisible = isVisible(IDENTITY_TAB_GATE, role, isPersonal);
+  const hidden: TabId[] = [
+    ...(GOOGLE_INTEGRATION_ENABLED ? [] : (['google'] as TabId[])),
+    ...(identityVisible ? [] : (['identity'] as TabId[])),
+  ];
   const [tab, setTab] = useUrlState('tab', TAB_IDS[0], { allowed: TAB_IDS });
   const active: TabId = hidden.includes(tab) ? TAB_IDS[0] : tab;
 
@@ -66,10 +83,12 @@ export function IntegrationsPage() {
             <Building2 />
             {intl.formatMessage({ id: 'integrations.tab.odoo' })}
           </TabsTab>
-          <TabsTab value="identity">
-            <UserSearch />
-            {intl.formatMessage({ id: 'integrations.tab.identity' })}
-          </TabsTab>
+          {identityVisible && (
+            <TabsTab value="identity">
+              <UserSearch />
+              {intl.formatMessage({ id: 'integrations.tab.identity' })}
+            </TabsTab>
+          )}
         </TabsList>
         <TabsPanel value="mcp">
           <div className="space-y-8">
@@ -86,9 +105,11 @@ export function IntegrationsPage() {
         <TabsPanel value="odoo">
           <OdooPage />
         </TabsPanel>
-        <TabsPanel value="identity">
-          <IdentityPage />
-        </TabsPanel>
+        {identityVisible && (
+          <TabsPanel value="identity">
+            <IdentityPage />
+          </TabsPanel>
+        )}
       </Tabs>
     </div>
   );

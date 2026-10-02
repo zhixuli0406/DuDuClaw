@@ -1604,9 +1604,11 @@ export function EditAgentPage() {
             </SettingsCard>
             {usesLocalModel && (
               <SettingsCard>
+                {/* 「Context 長度」/「GPU Layers」 were removed: `[model.local]
+                    context_length` / `gpu_layers` have no runtime reader (the
+                    external OpenAI-compatible server owns both). Saved values
+                    are kept — the form still round-trips them as loaded. */}
                 <RowSelect label={t('agents.edit.inferenceBackend')} value={form.local_backend ?? 'openai_compat'} onChange={(v) => updateField('local_backend', v)} options={localBackendOptions} />
-                <RowNumber label={t('agents.edit.contextLength')} value={form.local_context_length ?? 4096} min={512} onChange={(v) => updateField('local_context_length', v)} />
-                <RowNumber label={t('agents.edit.gpuLayers')} value={form.local_gpu_layers ?? -1} min={-1} onChange={(v) => updateField('local_gpu_layers', v)} />
               </SettingsCard>
             )}
           </SettingsSection>
