@@ -17,21 +17,31 @@
 //! ignored — a malicious repo is a known prompt-injection vector against
 //! security tooling, and this pipeline audits arbitrary, untrusted repos.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Deserialize;
 
+use duduclaw_core::llm_contract::strict_json::{self, Violation};
 use duduclaw_fork::judge::LlmCaller;
 
+use super::coverage::{DEFER_CANDIDATE_CAP, DEFER_ENGINE_UNAVAILABLE};
 use super::intake::HotspotFile;
-use super::llm_util::{escape_xml_tag, extract_context_window, extract_json_array, slugify};
-use super::schema::{EngineRun, EvidenceItem, EvidenceKind, Finding, FindingKind, Severity};
+use super::llm_util::{escape_xml_tag, extract_context_window, number_lines, slugify};
+use super::precheck::{self, DiskLines};
+use super::prompts::{
+    ANCHORS_ZH_TW, ANTI_PATTERNS, LINE_NUMBER_INSTRUCTIONS, THREAT_MODEL_INSTRUCTIONS,
+    TRACE_CONDITIONS_INSTRUCTIONS,
+};
+use super::schema::{
+    AI_AUDIT_ENGINE_NAME, Condition, EngineRun, EvidenceItem, EvidenceKind, Finding, FindingKind,
+    Severity, ThreatModel, TraceStep, compute_root_fingerprint,
+};
 
 /// `source_engine` value stamped on every ai_audit-originated finding —
 /// shared with `adversarial.rs`/`poc.rs` so they can select exactly this
 /// subset (static scanner findings never reach either step).
-pub const AI_AUDIT_ENGINE: &str = "ai_audit";
+pub const AI_AUDIT_ENGINE: &str = AI_AUDIT_ENGINE_NAME;
 
 /// Prompt budget per module (task spec: "單模組 prompt 預算 ≤48KB").
 pub const MODULE_PROMPT_BUDGET_BYTES: usize = 48 * 1024;
@@ -43,9 +53,12 @@ pub const MAX_CANDIDATES_PER_MODULE: usize = 8;
 pub const MAX_TOTAL_AI_CANDIDATES: usize = 60;
 /// Output budget for the ai_audit call. Bigger than
 /// `runtime_dispatch::UTILITY_MAX_TOKENS` (2048) because a module's response
-/// can list several candidates, each carrying `reasoning` + `trigger_path`
-/// prose.
-pub const AI_AUDIT_MAX_TOKENS: u32 = 4096;
+/// can list several candidates, each carrying a threat model, a trace and
+/// conditions.
+pub const AI_AUDIT_MAX_TOKENS: u32 = 8192;
+/// Cap on each model-supplied free-text slot kept in the report (threat
+/// model slots, trace scope/description, conditions).
+pub const FIELD_MAX_BYTES: usize = 1000;
 /// Cap on `EvidenceItem.detail` text for ai_audit reasoning — bigger than
 /// `schema::SNIPPET_MAX_BYTES` since this is meant to stay legible prose,
 /// not a code excerpt.
@@ -81,8 +94,10 @@ fn module_key(file: &str) -> String {
     }
 }
 
-/// Rank repo files into modules and return the top `max_modules`, each
-/// carrying its files pre-ranked (highest signal first). Pure — takes
+/// Rank repo files into modules and return ALL of them, sorted highest score
+/// first, each carrying its files pre-ranked (highest signal first). The
+/// caller sends the first `--max-modules` to the model and records the rest
+/// as `deferred` coverage (v2: the tail is no longer silently dropped). Pure — takes
 /// already-computed intake signals (`all_files` from
 /// `intake::walk_repo_files`, `hotspots`/`entry_points` from
 /// `intake::RepoProfile`), touches no filesystem itself.
@@ -90,7 +105,6 @@ pub fn rank_modules(
     all_files: &[String],
     hotspots: &[HotspotFile],
     entry_points: &[String],
-    max_modules: usize,
 ) -> Vec<ModuleTarget> {
     let hotspot_by_file: HashMap<&str, &HotspotFile> =
         hotspots.iter().map(|h| (h.file.as_str(), h)).collect();
@@ -135,7 +149,6 @@ pub fn rank_modules(
             .cmp(&a.score)
             .then_with(|| a.module_path.cmp(&b.module_path))
     });
-    ranked.truncate(max_modules);
     ranked
 }
 
@@ -175,11 +188,15 @@ pub fn build_ai_audit_prompt(module_path: &str, files: &[(String, String)]) -> S
     let mut blocks = String::new();
     for (path, content) in files {
         let escaped_path = escape_xml_tag(path, "path");
-        let escaped_content = escape_xml_tag(content, "file_content");
+        // Every line carries its real 1-based line number (`<n> | text`):
+        // models count lines badly, so `line` / `trace[].line` must be
+        // copied from this gutter, never counted.
+        let escaped_content = escape_xml_tag(&number_lines(content, 1), "file_content");
         blocks.push_str(&format!(
             "<file>\n<path>{escaped_path}</path>\n<file_content>\n{escaped_content}\n</file_content>\n</file>\n\n"
         ));
     }
+    let module_path = escape_xml_tag(module_path, "module_files");
     format!(
         "You are a security auditor performing a deep review of ONE module from a \
 larger repository (module: {module_path}). Below are this module's highest-signal \
@@ -196,47 +213,47 @@ gaps, unsafe cross-module data flow, injection via unusual sinks, race \
 conditions, and similar. Do not restate generic style nits a linter would \
 already catch. If you find nothing concrete and specific, reply with an empty \
 JSON array `[]` — never invent a finding just to have something to report.\n\n\
-Reply with ONLY a JSON array, no prose, no markdown fences. Each element:\n\
+{ANCHORS_ZH_TW}\n{ANTI_PATTERNS}\n{THREAT_MODEL_INSTRUCTIONS}\n{TRACE_CONDITIONS_INSTRUCTIONS}\n{LINE_NUMBER_INSTRUCTIONS}\n\
+Reply with ONLY a JSON array (a markdown fence around it is tolerated, nothing \
+else): no prose before or after, no extra keys. A reply that is not exactly this \
+shape is discarded as a whole. Each element has exactly these keys:\n\
 {{\"kind\": \"<short category, e.g. sql_injection|auth_bypass|ssrf|secret_exposure|race_condition|other>\", \
 \"severity\": \"critical\"|\"high\"|\"medium\"|\"low\"|\"info\", \"title\": \"<short title>\", \
 \"file\": \"<repo-relative path, exactly as shown in a <path> tag above>\", \
 \"line\": <line number or null>, \"reasoning\": \"<why this is a real, exploitable issue>\", \
-\"trigger_path\": \"<concrete precondition / call path that reaches this code>\"}}\n\n\
+\"threat_model\": {{\"principal\": \"…\", \"input\": \"…\", \"control\": \"…\", \"boundary\": \"…\", \"affected\": \"…\", \"result\": \"…\"}}, \
+\"trace\": [{{\"kind\": \"entrypoint\", \"file\": \"…\", \"line\": 1, \"scope\": \"…\", \"description\": \"…\"}}], \
+\"conditions\": [{{\"kind\": \"authentication_level\", \"description\": \"…\"}}]}}\n\n\
 <module_files>\n{blocks}</module_files>\n"
     )
 }
 
 // ── response parsing ─────────────────────────────────────────────────
 
+/// One candidate as the model must return it. `deny_unknown_fields` and
+/// required fields make the contract exact: a reply with an extra key, a
+/// missing threat model, an unknown severity or an unknown condition kind is
+/// a contract violation, and the module's whole reply is discarded.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawCandidate {
-    #[serde(default)]
     pub kind: String,
-    #[serde(default)]
-    pub severity: String,
-    #[serde(default)]
+    pub severity: Severity,
     pub title: String,
-    #[serde(default)]
     pub file: String,
     #[serde(default)]
     pub line: Option<u32>,
-    #[serde(default)]
     pub reasoning: String,
+    pub threat_model: ThreatModel,
+    pub trace: Vec<TraceStep>,
     #[serde(default)]
-    pub trigger_path: String,
+    pub conditions: Vec<Condition>,
 }
 
-/// Parse an ai_audit response into candidates. `Err` only when the whole
-/// reply isn't a JSON array at all — fail-closed, the caller records
-/// `parse_error` and produces zero findings for that module, never panics.
-/// Individual malformed FIELDS (missing severity, empty kind, ...) degrade
-/// via `#[serde(default)]` rather than dropping the whole batch, matching
-/// this codebase's scanner-normalizer convention (see `scanners/semgrep.rs`).
-pub fn parse_ai_candidates(raw: &str) -> Result<Vec<RawCandidate>, String> {
-    let slice = extract_json_array(raw)
-        .ok_or_else(|| "no JSON array found in ai_audit response".to_string())?;
-    serde_json::from_str::<Vec<RawCandidate>>(slice)
-        .map_err(|e| format!("ai_audit JSON parse failed: {e}"))
+/// Parse an ai_audit reply with the strict contract: the whole reply must be
+/// exactly one JSON array of [`RawCandidate`]. Never repaired.
+pub fn parse_ai_candidates(raw: &str) -> Result<Vec<RawCandidate>, Violation> {
+    strict_json::parse_strict::<Vec<RawCandidate>>(raw)
 }
 
 /// Map the LLM's free-text `kind` into the fixed `FindingKind` bucket.
@@ -257,12 +274,103 @@ fn map_ai_kind(raw: &str) -> FindingKind {
     }
 }
 
+fn cap(s: &str) -> String {
+    duduclaw_core::truncate_bytes(s, FIELD_MAX_BYTES).to_string()
+}
+
+/// Turn one parsed candidate into a `Candidate` finding with its v2 fields,
+/// then run the deterministic pre-check (which may set it `Refuted`).
+fn candidate_to_finding(
+    rc: RawCandidate,
+    file_map: &HashMap<&str, &str>,
+    prompt_paths: &HashSet<String>,
+    oracle: &DiskLines<'_>,
+) -> Finding {
+    let violations = precheck::check_candidate(
+        &rc.file,
+        rc.line,
+        &rc.trace,
+        &rc.threat_model,
+        prompt_paths,
+        oracle,
+    );
+    let content = file_map.get(rc.file.as_str()).copied().unwrap_or("");
+    let snippet = extract_context_window(content, rc.line, 2).unwrap_or_default();
+    let kind = map_ai_kind(&rc.kind);
+    let reasoning = duduclaw_core::truncate_bytes(&rc.reasoning, EVIDENCE_DETAIL_MAX_BYTES);
+    let evidence = vec![EvidenceItem {
+        kind: EvidenceKind::AiAnalysis,
+        source: AI_AUDIT_ENGINE.to_string(),
+        detail: format!("reasoning: {reasoning}"),
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    }];
+    let rule_id = format!("ai-audit/{}", slugify(&rc.kind));
+    let title = if rc.title.trim().is_empty() {
+        format!("AI-identified {} issue", rc.kind)
+    } else {
+        rc.title.clone()
+    };
+    let title = duduclaw_core::truncate_bytes(&title, 300).to_string();
+    let mut f = Finding::candidate(
+        AI_AUDIT_ENGINE,
+        kind,
+        rc.severity,
+        title,
+        rc.file.clone(),
+        rc.line,
+        &snippet,
+        rule_id.clone(),
+        evidence,
+    );
+    let scope = rc
+        .trace
+        .last()
+        .map(|s| s.scope.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(rc.file.as_str());
+    f.root_fingerprint = compute_root_fingerprint(AI_AUDIT_ENGINE, &rule_id, &rc.file, scope);
+    f.threat_model = Some(ThreatModel {
+        principal: cap(&rc.threat_model.principal),
+        input: cap(&rc.threat_model.input),
+        control: cap(&rc.threat_model.control),
+        boundary: cap(&rc.threat_model.boundary),
+        affected: cap(&rc.threat_model.affected),
+        result: cap(&rc.threat_model.result),
+    });
+    f.trace = rc
+        .trace
+        .iter()
+        .map(|s| TraceStep {
+            kind: s.kind,
+            file: duduclaw_core::truncate_bytes(&s.file, 4096).to_string(),
+            line: s.line,
+            scope: cap(&s.scope),
+            description: cap(&s.description),
+        })
+        .collect();
+    f.conditions = rc
+        .conditions
+        .iter()
+        .map(|c| Condition {
+            kind: c.kind,
+            description: cap(&c.description),
+        })
+        .collect();
+    precheck::apply_precheck(&mut f, violations);
+    f
+}
+
 // ── orchestration ────────────────────────────────────────────────────
 
-fn build_module_prompt(
-    repo_root: &Path,
-    module: &ModuleTarget,
-) -> Option<(String, Vec<(String, String)>)> {
+/// What one module's prompt actually contained.
+struct ModulePrompt {
+    prompt: String,
+    files: Vec<(String, String)>,
+    /// Files that went in only partially (prompt byte budget).
+    truncated: Vec<String>,
+}
+
+fn build_module_prompt(repo_root: &Path, module: &ModuleTarget) -> Option<ModulePrompt> {
     let lens: Vec<(String, u64)> = module
         .files
         .iter()
@@ -275,48 +383,122 @@ fn build_module_prompt(
     if lens.is_empty() {
         return None;
     }
+    let len_of: HashMap<&str, u64> = lens.iter().map(|(p, l)| (p.as_str(), *l)).collect();
     let plan = plan_file_budget(&lens, MODULE_PROMPT_BUDGET_BYTES);
     let mut files = Vec::new();
+    let mut truncated = Vec::new();
     for (path, cap) in plan {
         if cap == 0 {
             continue;
         }
         if let Ok(content) = std::fs::read_to_string(repo_root.join(&path)) {
-            let truncated = duduclaw_core::truncate_bytes(&content, cap).to_string();
-            files.push((path, truncated));
+            let kept = duduclaw_core::truncate_bytes(&content, cap).to_string();
+            let full_len = len_of.get(path.as_str()).copied().unwrap_or(0) as usize;
+            if kept.len() < content.len() || cap < full_len {
+                truncated.push(path.clone());
+            }
+            files.push((path, kept));
         }
-        // Binary / non-UTF8 files silently skipped — best-effort, matches
-        // the rest of secaudit's fail-open-on-unreadable-file convention.
+        // Binary / non-UTF8 files skipped — best-effort, matches the rest of
+        // secaudit's fail-open-on-unreadable-file convention.
     }
     if files.is_empty() {
         return None;
     }
-    Some((build_ai_audit_prompt(&module.module_path, &files), files))
+    Some(ModulePrompt {
+        prompt: build_ai_audit_prompt(&module.module_path, &files),
+        files,
+        truncated,
+    })
+}
+
+/// How one module's audit attempt ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleOutcome {
+    /// The reply met the contract. `note` records e.g. candidates dropped by
+    /// the per-module cap.
+    Reviewed {
+        note: Option<String>,
+    },
+    Unreadable {
+        reason: String,
+    },
+    LlmFailed {
+        reason: String,
+    },
+    ParseFailed {
+        reason: String,
+    },
+    /// Never sent (`candidate_cap` / `engine_unavailable`).
+    Deferred {
+        reason: String,
+    },
+}
+
+/// Per-module data the coverage list is built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleAuditReport {
+    pub module_path: String,
+    pub outcome: ModuleOutcome,
+    /// Paths whose content went into the prompt.
+    pub reviewed_paths: Vec<String>,
+    pub truncated_paths: Vec<String>,
+    /// Ids of the findings this module produced (including pre-check
+    /// refutations).
+    pub candidate_ids: Vec<String>,
+}
+
+impl ModuleAuditReport {
+    fn bare(module: &ModuleTarget, outcome: ModuleOutcome) -> Self {
+        ModuleAuditReport {
+            module_path: module.module_path.clone(),
+            outcome,
+            reviewed_paths: Vec::new(),
+            truncated_paths: Vec::new(),
+            candidate_ids: Vec::new(),
+        }
+    }
 }
 
 /// Outcome of the whole ai_audit step.
 pub enum AiAuditOutcome {
-    /// No LLM call could even be reached (or there were no candidate
-    /// modules at all) — caller records this as `EngineMissing`, honest
-    /// degradation per task spec, never a crash.
-    Unavailable { reason: String },
-    /// At least one module's LLM call succeeded — `engine_runs` carries a
-    /// per-module outcome (including any later modules that individually
-    /// failed), `findings` carries every accepted candidate.
+    /// No LLM call could even be reached (`engine_unreachable`), or there
+    /// were no candidate modules at all — caller records this as
+    /// `EngineMissing`, honest degradation, never a crash.
+    Unavailable {
+        reason: String,
+        engine_unreachable: bool,
+        module_reports: Vec<ModuleAuditReport>,
+    },
+    /// At least one module's LLM call succeeded.
     Ran {
         engine_runs: Vec<EngineRun>,
         findings: Vec<Finding>,
+        module_reports: Vec<ModuleAuditReport>,
+        /// The run-wide candidate cap dropped candidates or skipped modules
+        /// (⇒ `run_status = incomplete`, `validation_budget_exhausted`).
+        candidate_cap_hit: bool,
     },
 }
 
-/// Run the AI deep-audit step over `modules` (already ranked + capped by
-/// `--max-modules`). Not unit-tested directly (touches the filesystem + a
-/// live LLM call) — same convention as `scanners::run_all`; the pure
-/// decision logic above (`rank_modules`, `plan_file_budget`,
-/// `parse_ai_candidates`, `map_ai_kind`) carries the tested behavior, and
-/// this function is exercised via a stub `LlmCaller` in the tests below for
-/// its control flow (unavailable-on-first-failure, per-module error
-/// recording, candidate caps).
+fn module_engine_run(
+    module: &ModuleTarget,
+    count: usize,
+    ms: u128,
+    err: Option<String>,
+) -> EngineRun {
+    EngineRun {
+        engine: format!("ai_audit:{}", module.module_path),
+        findings_count: count,
+        duration_ms: ms,
+        parse_error: err,
+        timed_out: false,
+    }
+}
+
+/// Run the AI deep-audit step over `modules` (the first `--max-modules` of
+/// [`rank_modules`]). Returns a [`ModuleAuditReport`] for every module it
+/// was given. Every candidate goes through the deterministic pre-check here.
 pub async fn run_ai_audit<C: LlmCaller>(
     repo_root: &Path,
     modules: &[ModuleTarget],
@@ -326,59 +508,95 @@ pub async fn run_ai_audit<C: LlmCaller>(
         return AiAuditOutcome::Unavailable {
             reason: "no candidate modules found (empty repo, or no readable files under it)"
                 .to_string(),
+            engine_unreachable: false,
+            module_reports: Vec::new(),
         };
     }
 
+    let oracle = DiskLines::new(repo_root);
     let mut engine_runs = Vec::new();
-    let mut findings = Vec::new();
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut module_reports = Vec::new();
     let mut llm_reachable = false;
+    let mut candidate_cap_hit = false;
 
-    for module in modules {
+    for (idx, module) in modules.iter().enumerate() {
         if findings.len() >= MAX_TOTAL_AI_CANDIDATES {
-            engine_runs.push(EngineRun {
-                engine: format!("ai_audit:{}", module.module_path),
-                findings_count: 0,
-                duration_ms: 0,
-                parse_error: Some(format!(
+            candidate_cap_hit = true;
+            engine_runs.push(module_engine_run(
+                module,
+                0,
+                0,
+                Some(format!(
                     "skipped: already reached the {MAX_TOTAL_AI_CANDIDATES}-candidate safety cap for this run"
                 )),
-                timed_out: false,
-            });
+            ));
+            module_reports.push(ModuleAuditReport::bare(
+                module,
+                ModuleOutcome::Deferred {
+                    reason: DEFER_CANDIDATE_CAP.to_string(),
+                },
+            ));
             continue;
         }
 
         let started = std::time::Instant::now();
-        let Some((prompt, files)) = build_module_prompt(repo_root, module) else {
-            engine_runs.push(EngineRun {
-                engine: format!("ai_audit:{}", module.module_path),
-                findings_count: 0,
-                duration_ms: started.elapsed().as_millis(),
-                parse_error: Some(
-                    "no readable text content in this module (binary files, unreadable, or all budget-excluded)"
-                        .to_string(),
-                ),
-                timed_out: false,
-            });
+        let Some(mp) = build_module_prompt(repo_root, module) else {
+            let reason =
+                "no readable text content in this module (binary files, unreadable, or all budget-excluded)"
+                    .to_string();
+            engine_runs.push(module_engine_run(
+                module,
+                0,
+                started.elapsed().as_millis(),
+                Some(reason.clone()),
+            ));
+            module_reports.push(ModuleAuditReport::bare(
+                module,
+                ModuleOutcome::Unreadable { reason },
+            ));
             continue;
         };
+        let reviewed_paths: Vec<String> = mp.files.iter().map(|(p, _)| p.clone()).collect();
 
-        let raw = match caller.complete(&prompt).await {
+        let raw = match caller.complete(&mp.prompt).await {
             Ok(r) => r,
             Err(e) => {
+                let reason = format!("llm call failed: {e}");
                 if !llm_reachable {
                     // First-ever call couldn't even reach an LLM — treat the
                     // whole step as unavailable and stop (cost guard: don't
-                    // hammer a dead endpoint N more times).
+                    // hammer a dead endpoint N more times). The modules not
+                    // attempted are recorded as deferred.
+                    module_reports.push(ModuleAuditReport {
+                        reviewed_paths,
+                        truncated_paths: mp.truncated,
+                        ..ModuleAuditReport::bare(module, ModuleOutcome::LlmFailed { reason })
+                    });
+                    for rest in &modules[idx + 1..] {
+                        module_reports.push(ModuleAuditReport::bare(
+                            rest,
+                            ModuleOutcome::Deferred {
+                                reason: DEFER_ENGINE_UNAVAILABLE.to_string(),
+                            },
+                        ));
+                    }
                     return AiAuditOutcome::Unavailable {
                         reason: format!("LLM call failed: {e}"),
+                        engine_unreachable: true,
+                        module_reports,
                     };
                 }
-                engine_runs.push(EngineRun {
-                    engine: format!("ai_audit:{}", module.module_path),
-                    findings_count: 0,
-                    duration_ms: started.elapsed().as_millis(),
-                    parse_error: Some(format!("llm call failed: {e}")),
-                    timed_out: false,
+                engine_runs.push(module_engine_run(
+                    module,
+                    0,
+                    started.elapsed().as_millis(),
+                    Some(reason.clone()),
+                ));
+                module_reports.push(ModuleAuditReport {
+                    reviewed_paths,
+                    truncated_paths: mp.truncated,
+                    ..ModuleAuditReport::bare(module, ModuleOutcome::LlmFailed { reason })
                 });
                 continue;
             }
@@ -386,68 +604,76 @@ pub async fn run_ai_audit<C: LlmCaller>(
         llm_reachable = true;
 
         match parse_ai_candidates(&raw) {
-            Err(e) => {
-                engine_runs.push(EngineRun {
-                    engine: format!("ai_audit:{}", module.module_path),
-                    findings_count: 0,
-                    duration_ms: started.elapsed().as_millis(),
-                    parse_error: Some(e),
-                    timed_out: false,
+            Err(v) => {
+                let reason = format!("reply violated the JSON contract (discarded): {v}");
+                engine_runs.push(module_engine_run(
+                    module,
+                    0,
+                    started.elapsed().as_millis(),
+                    Some(reason.clone()),
+                ));
+                module_reports.push(ModuleAuditReport {
+                    reviewed_paths,
+                    truncated_paths: mp.truncated,
+                    ..ModuleAuditReport::bare(module, ModuleOutcome::ParseFailed { reason })
                 });
             }
             Ok(raw_candidates) => {
-                let file_map: HashMap<&str, &str> = files
+                let file_map: HashMap<&str, &str> = mp
+                    .files
                     .iter()
                     .map(|(p, c)| (p.as_str(), c.as_str()))
                     .collect();
-                let mut count = 0usize;
+                let prompt_paths: HashSet<String> = reviewed_paths.iter().cloned().collect();
+                let total = raw_candidates.len();
+                let mut ids = Vec::new();
+                let mut taken = 0usize;
+                let mut duplicates = 0usize;
                 for rc in raw_candidates.into_iter().take(MAX_CANDIDATES_PER_MODULE) {
-                    if rc.file.trim().is_empty() {
-                        continue;
-                    }
-                    let content = file_map.get(rc.file.as_str()).copied().unwrap_or("");
-                    let snippet = extract_context_window(content, rc.line, 2);
-                    let severity = rc.severity.parse::<Severity>().unwrap_or(Severity::Medium);
-                    let kind = map_ai_kind(&rc.kind);
-                    let reasoning =
-                        duduclaw_core::truncate_bytes(&rc.reasoning, EVIDENCE_DETAIL_MAX_BYTES);
-                    let trigger =
-                        duduclaw_core::truncate_bytes(&rc.trigger_path, EVIDENCE_DETAIL_MAX_BYTES);
-                    let detail = format!("reasoning: {reasoning}\ntrigger_path: {trigger}");
-                    let evidence = vec![EvidenceItem {
-                        kind: EvidenceKind::AiAnalysis,
-                        source: AI_AUDIT_ENGINE.to_string(),
-                        detail,
-                        recorded_at: chrono::Utc::now().to_rfc3339(),
-                    }];
-                    let rule_id = format!("ai-audit/{}", slugify(&rc.kind));
-                    let title = if rc.title.trim().is_empty() {
-                        format!("AI-identified {} issue", rc.kind)
-                    } else {
-                        rc.title.clone()
-                    };
-                    findings.push(Finding::candidate(
-                        AI_AUDIT_ENGINE,
-                        kind,
-                        severity,
-                        title,
-                        rc.file.clone(),
-                        rc.line,
-                        &snippet,
-                        rule_id,
-                        evidence,
-                    ));
-                    count += 1;
                     if findings.len() >= MAX_TOTAL_AI_CANDIDATES {
+                        candidate_cap_hit = true;
                         break;
                     }
+                    let f = candidate_to_finding(rc, &file_map, &prompt_paths, &oracle);
+                    // Same (kind, file, line, snippet) twice is the same
+                    // finding id; the report requires unique ids.
+                    if findings.iter().any(|g| g.id == f.id) {
+                        duplicates += 1;
+                        continue;
+                    }
+                    ids.push(f.id.clone());
+                    findings.push(f);
+                    taken += 1;
                 }
-                engine_runs.push(EngineRun {
-                    engine: format!("ai_audit:{}", module.module_path),
-                    findings_count: count,
-                    duration_ms: started.elapsed().as_millis(),
-                    parse_error: None,
-                    timed_out: false,
+                let capped = total.saturating_sub(taken + duplicates);
+                let mut notes = Vec::new();
+                if capped > 0 {
+                    notes.push(format!(
+                        "{capped} candidate(s) dropped by the per-module ({MAX_CANDIDATES_PER_MODULE}) or run-wide ({MAX_TOTAL_AI_CANDIDATES}) cap"
+                    ));
+                }
+                if duplicates > 0 {
+                    notes.push(format!(
+                        "{duplicates} duplicate candidate(s) (same id) dropped"
+                    ));
+                }
+                let note = if notes.is_empty() {
+                    None
+                } else {
+                    Some(notes.join("; "))
+                };
+                engine_runs.push(module_engine_run(
+                    module,
+                    taken,
+                    started.elapsed().as_millis(),
+                    None,
+                ));
+                module_reports.push(ModuleAuditReport {
+                    module_path: module.module_path.clone(),
+                    outcome: ModuleOutcome::Reviewed { note },
+                    reviewed_paths,
+                    truncated_paths: mp.truncated,
+                    candidate_ids: ids,
                 });
             }
         }
@@ -456,6 +682,8 @@ pub async fn run_ai_audit<C: LlmCaller>(
     AiAuditOutcome::Ran {
         engine_runs,
         findings,
+        module_reports,
+        candidate_cap_hit,
     }
 }
 
@@ -490,36 +718,43 @@ mod tests {
             "crates/b/src/lib.rs".to_string(),
         ];
         let hotspots = vec![hotspot("crates/a/src/lib.rs", 5, 5)];
-        let modules = rank_modules(&files, &hotspots, &[], 5);
+        let modules = rank_modules(&files, &hotspots, &[]);
         assert_eq!(modules[0].module_path, "crates/a");
         assert!(modules[0].score > modules[1].score);
     }
 
+    /// v2: `rank_modules` returns every module (the caller takes the first
+    /// `--max-modules` and records the rest as deferred coverage). Was
+    /// `rank_modules_truncates_to_max_modules`.
     #[test]
-    fn rank_modules_truncates_to_max_modules() {
+    fn rank_modules_returns_every_module_sorted() {
         let files: Vec<String> = (0..10).map(|i| format!("dir{i}/main.rs")).collect();
-        let modules = rank_modules(&files, &[], &[], 3);
-        assert_eq!(modules.len(), 3);
+        let modules = rank_modules(&files, &[], &[]);
+        assert_eq!(modules.len(), 10);
+        let paths: Vec<&str> = modules.iter().map(|m| m.module_path.as_str()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted, "equal scores tie-break by module path");
     }
 
     #[test]
     fn rank_modules_falls_back_to_entry_points_when_no_git_history() {
         let files = vec!["a/main.rs".to_string(), "b/util.rs".to_string()];
         let entry_points = vec!["a/main.rs".to_string()];
-        let modules = rank_modules(&files, &[], &entry_points, 5);
+        let modules = rank_modules(&files, &[], &entry_points);
         assert_eq!(modules[0].module_path, "a");
     }
 
     #[test]
     fn rank_modules_empty_input_is_empty_output() {
-        assert!(rank_modules(&[], &[], &[], 5).is_empty());
+        assert!(rank_modules(&[], &[], &[]).is_empty());
     }
 
     #[test]
     fn rank_modules_files_within_a_module_are_ranked_hotspot_first() {
         let files = vec!["a/x.rs".to_string(), "a/y.rs".to_string()];
         let hotspots = vec![hotspot("a/y.rs", 3, 3)];
-        let modules = rank_modules(&files, &hotspots, &[], 5);
+        let modules = rank_modules(&files, &hotspots, &[]);
         assert_eq!(modules[0].files[0], "a/y.rs");
     }
 
@@ -559,17 +794,26 @@ mod tests {
         assert!(plan_file_budget(&[], 1000).is_empty());
     }
 
-    // ── parse_ai_candidates ───────────────────────────────────────────
+    // ── parse_ai_candidates (strict contract) ─────────────────────────
+
+    fn cand_json(file: &str, line: u32) -> String {
+        format!(
+            r#"{{"kind":"sql_injection","severity":"high","title":"t","file":"{file}","line":{line},"reasoning":"r",
+"threat_model":{{"principal":"anon","input":"q","control":"auth","boundary":"net","affected":"db","result":"read"}},
+"trace":[{{"kind":"entrypoint","file":"{file}","line":1,"scope":"main","description":"in"}},{{"kind":"sink","file":"{file}","line":{line},"scope":"main","description":"exec"}}],
+"conditions":[{{"kind":"authentication_level","description":"none"}}]}}"#
+        )
+    }
 
     #[test]
-    fn parse_ai_candidates_happy_path() {
-        let raw = r#"```json
-[{"kind":"sql_injection","severity":"high","title":"t","file":"a.py","line":10,"reasoning":"r","trigger_path":"p"}]
-```"#;
-        let parsed = parse_ai_candidates(raw).unwrap();
+    fn parse_ai_candidates_happy_path_with_fence() {
+        let raw = format!("```json\n[{}]\n```", cand_json("a.py", 10));
+        let parsed = parse_ai_candidates(&raw).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].file, "a.py");
         assert_eq!(parsed[0].line, Some(10));
+        assert_eq!(parsed[0].trace.len(), 2);
+        assert_eq!(parsed[0].severity, Severity::High);
     }
 
     #[test]
@@ -582,13 +826,33 @@ mod tests {
         assert!(parse_ai_candidates("not json at all, no brackets").is_err());
     }
 
+    /// v2: prose around the array is a contract violation (v1 sliced the
+    /// outermost brackets out of it).
     #[test]
-    fn parse_ai_candidates_missing_optional_fields_degrade_gracefully() {
-        let raw = r#"[{"file":"a.py"}]"#;
-        let parsed = parse_ai_candidates(raw).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].kind, "");
-        assert!(parsed[0].line.is_none());
+    fn parse_ai_candidates_rejects_prose_around_the_array() {
+        assert!(parse_ai_candidates("Here you go: []").is_err());
+        assert!(parse_ai_candidates("[] hope that helps").is_err());
+    }
+
+    /// v2: missing required fields are a contract violation (v1 defaulted
+    /// them). Was `parse_ai_candidates_missing_optional_fields_degrade_gracefully`.
+    #[test]
+    fn parse_ai_candidates_missing_required_fields_is_a_violation() {
+        assert!(parse_ai_candidates(r#"[{"file":"a.py"}]"#).is_err());
+    }
+
+    #[test]
+    fn parse_ai_candidates_rejects_unknown_fields_and_unknown_enums() {
+        let extra = cand_json("a.py", 2).replacen(
+            "\"kind\":\"sql_injection\"",
+            "\"kind\":\"x\",\"trigger_path\":\"p\"",
+            1,
+        );
+        assert!(parse_ai_candidates(&format!("[{extra}]")).is_err());
+        let bad_cond = cand_json("a.py", 2).replace("authentication_level", "moon_phase");
+        assert!(parse_ai_candidates(&format!("[{bad_cond}]")).is_err());
+        let bad_sev = cand_json("a.py", 2).replace("\"high\"", "\"severe\"");
+        assert!(parse_ai_candidates(&format!("[{bad_sev}]")).is_err());
     }
 
     // ── map_ai_kind ───────────────────────────────────────────────────
@@ -626,7 +890,23 @@ mod tests {
             &[("crates/foo/lib.rs".to_string(), "fn x(){}".to_string())],
         );
         assert!(prompt.contains("crates/foo"));
-        assert!(prompt.contains("\"trigger_path\""));
+        assert!(prompt.contains("\"threat_model\""));
+        assert!(prompt.contains("\"trace\""));
+        assert!(prompt.contains(ANCHORS_ZH_TW));
+        assert!(prompt.contains(ANTI_PATTERNS));
+        assert!(prompt.contains(LINE_NUMBER_INSTRUCTIONS));
+    }
+
+    #[test]
+    fn build_ai_audit_prompt_numbers_every_file_line() {
+        let prompt = build_ai_audit_prompt(
+            "a",
+            &[(
+                "a/x.py".to_string(),
+                "import os\n\nos.system(cmd)".to_string(),
+            )],
+        );
+        assert!(prompt.contains("    1 | import os\n    2 | \n    3 | os.system(cmd)"));
     }
 
     // ── run_ai_audit (stub-driven control flow) ──────────────────────
@@ -690,7 +970,18 @@ mod tests {
         };
         let outcome = run_ai_audit(dir.path(), &modules, &caller).await;
         match outcome {
-            AiAuditOutcome::Unavailable { reason } => assert!(reason.contains("no CLI available")),
+            AiAuditOutcome::Unavailable {
+                reason,
+                engine_unreachable,
+                module_reports,
+            } => {
+                assert!(reason.contains("no CLI available"));
+                assert!(engine_unreachable);
+                assert!(matches!(
+                    module_reports[0].outcome,
+                    ModuleOutcome::LlmFailed { .. }
+                ));
+            }
             AiAuditOutcome::Ran { .. } => panic!("expected Unavailable"),
         }
     }
@@ -703,23 +994,45 @@ mod tests {
             score: 1,
             files: vec!["a/main.rs".to_string()],
         }];
-        let reply = r#"[{"kind":"rce","severity":"critical","title":"eval on user input","file":"a/main.rs","line":1,"reasoning":"r","trigger_path":"p"}]"#;
+        let reply = format!("[{}]", cand_json("a/main.rs", 1)).replace("\"high\"", "\"critical\"");
         let caller = StubCaller {
-            replies: std::sync::Mutex::new(vec![Ok(reply.to_string())]),
+            replies: std::sync::Mutex::new(vec![Ok(reply)]),
         };
         let outcome = run_ai_audit(dir.path(), &modules, &caller).await;
         match outcome {
             AiAuditOutcome::Ran {
                 engine_runs,
                 findings,
+                module_reports,
+                candidate_cap_hit,
             } => {
                 assert_eq!(engine_runs.len(), 1);
                 assert_eq!(engine_runs[0].findings_count, 1);
                 assert_eq!(findings.len(), 1);
                 assert_eq!(findings[0].source_engine, AI_AUDIT_ENGINE);
                 assert_eq!(findings[0].severity, Severity::Critical);
+                assert_eq!(
+                    findings[0].severity_basis,
+                    crate::secaudit::schema::SeverityBasis::ModelSelfReported
+                );
+                assert!(
+                    findings[0].precheck.as_ref().unwrap().passed,
+                    "{:?}",
+                    findings[0].precheck
+                );
+                assert!(findings[0].threat_model.is_some());
+                assert!(!candidate_cap_hit);
+                assert_eq!(module_reports.len(), 1);
+                assert_eq!(
+                    module_reports[0].reviewed_paths,
+                    vec!["a/main.rs".to_string()]
+                );
+                assert_eq!(
+                    module_reports[0].candidate_ids,
+                    vec![findings[0].id.clone()]
+                );
             }
-            AiAuditOutcome::Unavailable { reason } => {
+            AiAuditOutcome::Unavailable { reason, .. } => {
                 panic!("expected Ran, got Unavailable: {reason}")
             }
         }
@@ -751,7 +1064,13 @@ mod tests {
             AiAuditOutcome::Ran {
                 engine_runs,
                 findings,
+                module_reports,
+                ..
             } => {
+                assert!(matches!(
+                    module_reports[1].outcome,
+                    ModuleOutcome::LlmFailed { .. }
+                ));
                 assert_eq!(engine_runs.len(), 2);
                 assert!(findings.is_empty());
                 assert!(
@@ -762,7 +1081,7 @@ mod tests {
                         .contains("transient")
                 );
             }
-            AiAuditOutcome::Unavailable { reason } => {
+            AiAuditOutcome::Unavailable { reason, .. } => {
                 panic!("expected Ran, got Unavailable: {reason}")
             }
         }
@@ -784,11 +1103,17 @@ mod tests {
             AiAuditOutcome::Ran {
                 engine_runs,
                 findings,
+                module_reports,
+                ..
             } => {
                 assert!(findings.is_empty());
                 assert!(engine_runs[0].parse_error.is_some());
+                assert!(matches!(
+                    module_reports[0].outcome,
+                    ModuleOutcome::ParseFailed { .. }
+                ));
             }
-            AiAuditOutcome::Unavailable { reason } => {
+            AiAuditOutcome::Unavailable { reason, .. } => {
                 panic!("expected Ran, got Unavailable: {reason}")
             }
         }
@@ -803,7 +1128,7 @@ mod tests {
             files: vec!["a/main.rs".to_string()],
         }];
         let many: Vec<String> = (0..20)
-            .map(|i| format!(r#"{{"kind":"x","severity":"low","title":"t{i}","file":"a/main.rs","reasoning":"r","trigger_path":"p"}}"#))
+            .map(|i| cand_json("a/main.rs", 1).replacen("sql_injection", &format!("kind{i}"), 1))
             .collect();
         let reply = format!("[{}]", many.join(","));
         let caller = StubCaller {
@@ -814,9 +1139,138 @@ mod tests {
             AiAuditOutcome::Ran { findings, .. } => {
                 assert_eq!(findings.len(), MAX_CANDIDATES_PER_MODULE);
             }
-            AiAuditOutcome::Unavailable { reason } => {
+            AiAuditOutcome::Unavailable { reason, .. } => {
                 panic!("expected Ran, got Unavailable: {reason}")
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_ai_audit_precheck_refutes_a_candidate_pointing_outside_the_prompt() {
+        let dir = tmp_repo_with_files(&[("a/main.rs", "fn a(){}\nfn b(){}\n")]);
+        let modules = vec![ModuleTarget {
+            module_path: "a".to_string(),
+            score: 1,
+            files: vec!["a/main.rs".to_string()],
+        }];
+        // line 99 is out of range, and the trace points at /etc/passwd.
+        let bad = cand_json("a/main.rs", 99).replacen(
+            "\"file\":\"a/main.rs\",\"line\":1",
+            "\"file\":\"/etc/passwd\",\"line\":1",
+            1,
+        );
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![Ok(format!("[{bad}]"))]),
+        };
+        match run_ai_audit(dir.path(), &modules, &caller).await {
+            AiAuditOutcome::Ran {
+                findings,
+                module_reports,
+                ..
+            } => {
+                assert_eq!(findings.len(), 1);
+                let f = &findings[0];
+                assert_eq!(f.status, crate::secaudit::schema::FindingStatus::Refuted);
+                let pc = f.precheck.as_ref().unwrap();
+                assert!(!pc.passed);
+                assert!(
+                    pc.violations.iter().any(|v| v.contains("outside 1..=2")),
+                    "{pc:?}"
+                );
+                assert!(
+                    pc.violations
+                        .iter()
+                        .any(|v| v.starts_with("trace[0].file: unsafe path")),
+                    "{pc:?}"
+                );
+                // Refuted-by-precheck still makes the module a `candidate` module.
+                assert_eq!(module_reports[0].candidate_ids.len(), 1);
+            }
+            AiAuditOutcome::Unavailable { reason, .. } => panic!("{reason}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_ai_audit_run_wide_cap_defers_later_modules() {
+        let mut files = Vec::new();
+        for i in 0..9 {
+            files.push((format!("m{i}/main.rs"), "fn a(){}\n".to_string()));
+        }
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let dir = tmp_repo_with_files(&refs);
+        let modules: Vec<ModuleTarget> = (0..9)
+            .map(|i| ModuleTarget {
+                module_path: format!("m{i}"),
+                score: 1,
+                files: vec![format!("m{i}/main.rs")],
+            })
+            .collect();
+        let replies: Vec<Result<String, String>> = (0..9)
+            .map(|i| {
+                let many: Vec<String> = (0..MAX_CANDIDATES_PER_MODULE)
+                    .map(|j| {
+                        cand_json(&format!("m{i}/main.rs"), 1).replacen(
+                            "sql_injection",
+                            &format!("kind{j}"),
+                            1,
+                        )
+                    })
+                    .collect();
+                Ok(format!("[{}]", many.join(",")))
+            })
+            .collect();
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(replies),
+        };
+        match run_ai_audit(dir.path(), &modules, &caller).await {
+            AiAuditOutcome::Ran {
+                findings,
+                module_reports,
+                candidate_cap_hit,
+                ..
+            } => {
+                assert_eq!(findings.len(), MAX_TOTAL_AI_CANDIDATES);
+                assert!(candidate_cap_hit);
+                assert_eq!(module_reports.len(), 9);
+                assert_eq!(
+                    module_reports[8].outcome,
+                    ModuleOutcome::Deferred {
+                        reason: DEFER_CANDIDATE_CAP.to_string()
+                    }
+                );
+            }
+            AiAuditOutcome::Unavailable { reason, .. } => panic!("{reason}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_ai_audit_drops_duplicate_ids_within_a_reply() {
+        let dir = tmp_repo_with_files(&[("a/main.rs", "fn a(){}\n")]);
+        let modules = vec![ModuleTarget {
+            module_path: "a".to_string(),
+            score: 1,
+            files: vec!["a/main.rs".to_string()],
+        }];
+        let one = cand_json("a/main.rs", 1);
+        let caller = StubCaller {
+            replies: std::sync::Mutex::new(vec![Ok(format!("[{one},{one}]"))]),
+        };
+        match run_ai_audit(dir.path(), &modules, &caller).await {
+            AiAuditOutcome::Ran {
+                findings,
+                module_reports,
+                ..
+            } => {
+                assert_eq!(findings.len(), 1);
+                assert!(matches!(
+                    &module_reports[0].outcome,
+                    ModuleOutcome::Reviewed { note: Some(n) } if n.contains("duplicate")
+                ));
+            }
+            AiAuditOutcome::Unavailable { reason, .. } => panic!("{reason}"),
         }
     }
 }

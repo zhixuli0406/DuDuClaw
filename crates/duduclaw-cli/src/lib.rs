@@ -2284,6 +2284,38 @@ enum MaintenanceCommands {
         /// `<DUDUCLAW_HOME>/secaudit/reports/` (read by the dashboard).
         #[arg(long)]
         save: bool,
+
+        /// Also count findings parked for human review (NeedsHuman, whose
+        /// severity is the model's own estimate) toward --fail-on. Off by
+        /// default: they are listed separately and do not fail the run.
+        #[arg(long = "fail-on-needs-human")]
+        fail_on_needs_human: bool,
+
+        /// Run the adversarial verifier and PoC steps under this agent's
+        /// `[runtime]` config instead of the `--agent` one, so the claim is
+        /// checked by a different model. Recorded in the report as
+        /// `verifier.independence`. Only relevant with `--profile deep`.
+        #[arg(long = "verifier-agent", value_name = "ID")]
+        verifier_agent: Option<String>,
+
+        /// Do not carry statuses (suppressed / refuted on unchanged source)
+        /// over from the newest saved report for this repo.
+        #[arg(long = "no-prior")]
+        no_prior: bool,
+    },
+
+    /// Validate a saved `duduclaw secaudit` JSON report against the report
+    /// contract (schema version, finding paths and traces, status evidence,
+    /// summary recomputed from the findings, coverage, run status, verifier).
+    ///
+    /// Exit code: 0 valid, 1 violations (printed one per line on stderr),
+    /// 2 the file is unreadable or not JSON.
+    ///
+    /// Example:
+    ///     duduclaw secaudit-validate ~/.duduclaw/secaudit/reports/20261003T120000Z.json
+    SecauditValidate {
+        /// Path to the report JSON.
+        report: PathBuf,
     },
 
     /// Playbook maintenance (§1.4 gene JSON export, D5=B).
@@ -5381,11 +5413,14 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             max_modules,
             poc,
             save,
+            fail_on_needs_human,
+            verifier_agent,
+            no_prior,
         }) => {
             // Custom 0/1/2 exit contract (task spec) — not the generic
             // "any Err ⇒ exit 1" wrapper `run()`'s caller applies, same
             // reasoning as `Commands::Tooling(ToolingCommands::DesktopRecordWorker)` above.
-            let code = secaudit::cmd_secaudit(
+            let code = secaudit::cmd_secaudit_v2(
                 &duduclaw_home(),
                 secaudit::SecauditOptions {
                     repo_path,
@@ -5397,8 +5432,18 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                     poc,
                     save,
                 },
+                secaudit::SecauditV2Flags {
+                    fail_on_needs_human,
+                    verifier_agent,
+                    no_prior,
+                },
             )
             .await;
+            std::process::exit(code);
+        }
+        Commands::Maintenance(MaintenanceCommands::SecauditValidate { report }) => {
+            // Same custom 0/1/2 exit contract as `secaudit`.
+            let code = secaudit::cmd_secaudit_validate(&report).await;
             std::process::exit(code);
         }
         Commands::Maintenance(MaintenanceCommands::Playbook(PlaybookCommands::Export { agent, out })) => {

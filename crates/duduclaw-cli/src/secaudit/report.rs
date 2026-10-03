@@ -12,14 +12,22 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::secaudit::schema::{AuditReport, ProfileMode, Severity};
+use duduclaw_core::llm_contract::coverage::RunStatus;
 
-/// CI exit code for a completed scan. `0` unless at least one finding is at
-/// or above `fail_on`. Pure function over the already-computed summary —
-/// infra-level failures (bad repo path, can't write `--report`) are decided
-/// by the caller before a report even exists, and use `2` directly.
+use crate::secaudit::schema::{
+    AuditReport, ProfileMode, Severity, SeverityCounts, VerifierIndependence,
+};
+use crate::secaudit::validator::validate_report;
+
+/// CI exit code for a completed scan. `0` unless at least one finding the
+/// gate reads ([`crate::secaudit::schema::Summary::gate_counts`] =
+/// `by_severity`: `Candidate` / `Confirmed`, plus `NeedsHuman` under
+/// `--fail-on-needs-human`, rule `schema::severity_buckets`) is at or
+/// above `fail_on`. Pure function over the already-computed summary —
+/// infra-level failures (bad repo path, can't write `--report`, a report
+/// that fails validation) are decided by the caller and use `2` directly.
 pub fn exit_code(report: &AuditReport, fail_on: Severity) -> i32 {
-    if report.summary.by_severity.count_at_or_above(fail_on) > 0 {
+    if report.summary.gate_counts().count_at_or_above(fail_on) > 0 {
         1
     } else {
         0
@@ -73,38 +81,70 @@ pub fn render_summary(report: &AuditReport, fail_on: Severity) -> String {
     out.push('\n');
 
     out.push_str("Findings 統計：\n");
-    let excluded = report
-        .summary
-        .total_findings
-        .saturating_sub(report.summary.by_severity.total());
-    if excluded > 0 {
+    let (gated, needs_human, inert) = finding_buckets(report);
+    if needs_human + inert > 0 {
         out.push_str(&format!(
-            "  總計：{}（可行動 {}、已證偽/已壓制 {}——不計入嚴重度統計與 fail-on 判定）\n",
-            report.summary.total_findings,
-            report.summary.by_severity.total(),
-            excluded
+            "  總計：{}（計入 fail-on {gated}、待人工判斷 {needs_human}、已證偽/已壓制 {inert}）\n",
+            report.summary.total_findings
         ));
+        out.push_str("  （已證偽/已壓制的發現永遠不計入嚴重度統計與 fail-on 判定）\n");
     } else {
         out.push_str(&format!("  總計：{}\n", report.summary.total_findings));
     }
     out.push_str(&format!(
-        "  Critical: {}  High: {}  Medium: {}  Low: {}  Info: {}\n",
-        report.summary.by_severity.critical,
-        report.summary.by_severity.high,
-        report.summary.by_severity.medium,
-        report.summary.by_severity.low,
-        report.summary.by_severity.info,
+        "  {}\n",
+        severity_row(&report.summary.by_severity)
     ));
+    if report.summary.gate_includes_needs_human {
+        // Flag on: NeedsHuman is already inside `by_severity`
+        // (`schema::severity_buckets`); say so instead of a second row.
+        let (with_nh, without_nh) = (
+            crate::secaudit::schema::severity_buckets(&report.findings, true).0,
+            crate::secaudit::schema::severity_buckets(&report.findings, false).0,
+        );
+        let nh = with_nh.total().saturating_sub(without_nh.total());
+        if nh > 0 {
+            out.push_str(&format!(
+                "  待人工判斷：{nh} 筆（模型自評、已計入上方統計與 fail-on，--fail-on-needs-human）\n"
+            ));
+        }
+    } else {
+        let nh = &report.summary.needs_human_by_severity;
+        if nh.total() > 0 {
+            out.push_str(&format!(
+                "  待人工判斷（模型自評、不計入 fail-on）：{}\n",
+                severity_row(nh)
+            ));
+        }
+    }
+    if report.summary.carried_from_prior > 0 {
+        out.push_str(&format!(
+            "  沿用先前報告判定：{}（原始碼未變更，未重新呼叫模型）\n",
+            report.summary.carried_from_prior
+        ));
+    }
 
     if report.profile.mode == ProfileMode::Deep {
         out.push('\n');
         out.push_str("AI 深度審計／對抗式覆核／PoC（deep profile）：\n");
         out.push_str(&format!(
-            "  AI 候選：{}　已證偽：{}　待人工覆核：{}　PoC 已執行：{}\n",
+            "  AI 候選：{}　已證偽：{}（其中前置檢查證偽 {}）　待人工覆核：{}　PoC 已執行：{}\n",
             report.summary.ai_audit_candidates,
             report.summary.ai_audit_refuted,
+            report.summary.precheck_refuted,
             report.summary.ai_audit_needs_human,
             report.summary.poc_ran,
+        ));
+        render_coverage(report, &mut out);
+        render_verifier_and_prior(report, &mut out);
+    }
+    if report.run_status == RunStatus::Incomplete {
+        out.push_str(&format!(
+            "  執行狀態：未完成（{}）\n",
+            report
+                .incomplete_reason
+                .map(incomplete_reason_zh)
+                .unwrap_or("原因未記錄")
         ));
     }
 
@@ -156,17 +196,109 @@ pub fn render_summary(report: &AuditReport, fail_on: Severity) -> String {
     } else {
         out.push_str(&format!(
             "結論：發現 {} 項 {} 以上等級的問題，未通過。\n",
-            report.summary.by_severity.count_at_or_above(fail_on),
+            report.summary.gate_counts().count_at_or_above(fail_on),
             fail_on.as_str()
         ));
     }
     out
 }
 
+/// `(gated, needs_human, inert)` counted from the findings: refuted +
+/// suppressed are inert; needs_human is its own bucket only when the
+/// `--fail-on-needs-human` flag is off (otherwise it is gated, matching
+/// `schema::severity_buckets`); everything else is gated.
+fn finding_buckets(report: &AuditReport) -> (usize, usize, usize) {
+    use crate::secaudit::schema::FindingStatus;
+    let include_nh = report.summary.gate_includes_needs_human;
+    let (mut gated, mut needs_human, mut inert) = (0, 0, 0);
+    for f in &report.findings {
+        match f.status {
+            FindingStatus::Refuted | FindingStatus::Suppressed => inert += 1,
+            FindingStatus::NeedsHuman if !include_nh => needs_human += 1,
+            _ => gated += 1,
+        }
+    }
+    (gated, needs_human, inert)
+}
+
+fn severity_row(c: &SeverityCounts) -> String {
+    format!(
+        "Critical: {}  High: {}  Medium: {}  Low: {}  Info: {}",
+        c.critical, c.high, c.medium, c.low, c.info
+    )
+}
+
+fn incomplete_reason_zh(
+    r: duduclaw_core::llm_contract::coverage::IncompleteReason,
+) -> &'static str {
+    use duduclaw_core::llm_contract::coverage::IncompleteReason as R;
+    match r {
+        R::EngineUnavailable => "AI 引擎無法使用",
+        R::ValidationBudgetExhausted => "候選數已達全程上限，部分候選或模組未處理",
+        R::BudgetCannotFundReserves => "預算不足以保留覆核額度",
+        R::CriticBudgetExhausted => "覆核預算用盡",
+        R::Interrupted => "執行被中斷",
+    }
+}
+
+fn render_coverage(report: &AuditReport, out: &mut String) {
+    let c = &report.summary.coverage;
+    out.push_str(&format!(
+        "  模組覆蓋：共 {}　已審 {}（無候選 {}、有候選 {}）　延後 {}　失敗 {}\n",
+        c.modules_total,
+        c.covered + c.candidate,
+        c.covered,
+        c.candidate,
+        c.deferred,
+        c.failed
+    ));
+    if c.partial {
+        out.push_str(&format!("  部分覆蓋：{} 模組未審\n", c.deferred + c.failed));
+    }
+}
+
+fn render_verifier_and_prior(report: &AuditReport, out: &mut String) {
+    let v = &report.verifier;
+    let who = |a: &Option<String>| a.clone().unwrap_or_else(|| "全域 runtime".to_string());
+    let line = match v.independence {
+        VerifierIndependence::NotRun => "未執行覆核".to_string(),
+        VerifierIndependence::SameAgent => {
+            format!("同一 agent 覆核（{}）", who(&v.verifier_agent))
+        }
+        VerifierIndependence::DifferentAgent => format!(
+            "獨立 agent 覆核（審計：{}；覆核：{}）",
+            who(&v.audit_agent),
+            who(&v.verifier_agent)
+        ),
+    };
+    out.push_str(&format!("  覆核獨立性：{line}\n"));
+    match &report.prior_run {
+        Some(p) => out.push_str(&format!(
+            "  先前報告承接：{}　沿用已壓制 {}、沿用已證偽 {}、重新覆核先前確認 {}、原始碼已變更 {}\n",
+            p.report_file,
+            p.carried_suppressed,
+            p.carried_refuted,
+            p.revalidated_prior_confirmed,
+            p.changed_source
+        )),
+        None => out.push_str("  先前報告承接：無（沒有可承接的先前報告，或已用 --no-prior 停用）\n"),
+    }
+}
+
 /// Write the full JSON report to `path` (pretty-printed, matching `duduclaw
-/// eval`'s `--report` convention). Any I/O failure here is an infra error
-/// (exit 2) at the call site.
+/// eval`'s `--report` convention). The report validator runs first: a
+/// report with any violation is not written and the error lists every
+/// violation, one per line. Any failure here is an infra error (exit 2) at
+/// the call site.
 pub fn write_json_report(report: &AuditReport, path: &Path) -> std::io::Result<()> {
+    let violations = validate_report(report);
+    if !violations.is_empty() {
+        let lines: Vec<String> = violations.iter().map(|v| v.to_string()).collect();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("report failed validation:\n{}", lines.join("\n")),
+        ));
+    }
     let json = serde_json::to_string_pretty(report)
         .map_err(|e| std::io::Error::other(format!("serialize report: {e}")))?;
     std::fs::write(path, json + "\n")
@@ -188,6 +320,16 @@ pub fn save_timestamp_basic(now: chrono::DateTime<chrono::Utc>) -> String {
 /// (`duduclaw-gateway::secaudit_reports`) reads this directory and depends
 /// on the shape never changing, only growing. Returns the path written.
 pub fn save_report(home_dir: &Path, report: &AuditReport) -> std::io::Result<PathBuf> {
+    // Validate before creating anything (write_json_report validates again;
+    // this keeps a bad report from leaving an empty reports directory).
+    let violations = validate_report(report);
+    if !violations.is_empty() {
+        let lines: Vec<String> = violations.iter().map(|v| v.to_string()).collect();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("report failed validation:\n{}", lines.join("\n")),
+        ));
+    }
     let dir = home_dir.join("secaudit").join("reports");
     std::fs::create_dir_all(&dir)?;
     let filename = format!("{}.json", save_timestamp_basic(chrono::Utc::now()));
@@ -204,7 +346,8 @@ mod tests {
     use super::*;
     use crate::secaudit::intake::{GitHistoryStatus, HotspotFile, LanguageStat, RepoProfile};
     use crate::secaudit::schema::{
-        EngineMissing, EngineRun, Finding, FindingKind, ProfileMode, ScanProfile, Summary,
+        CURRENT_SCHEMA_VERSION, CoverageSummary, EngineMissing, EngineRun, Finding, FindingKind,
+        FindingStatus, GatePolicy, PriorRunInfo, ProfileMode, ScanProfile, Summary, VerifierInfo,
     };
 
     fn base_report(findings: Vec<Finding>) -> AuditReport {
@@ -226,8 +369,14 @@ mod tests {
                 engine: "osv-scanner".to_string(),
                 reason: "requires network access".to_string(),
             }],
-            summary: Summary::from_findings(&findings, 1, 1),
+            summary: Summary::from_findings(&findings, 1, 1, GatePolicy::default(), &[]),
             findings,
+            schema_version: CURRENT_SCHEMA_VERSION,
+            run_status: RunStatus::Complete,
+            incomplete_reason: None,
+            coverage: vec![],
+            prior_run: None,
+            verifier: VerifierInfo::default(),
         }
     }
 
@@ -321,7 +470,13 @@ mod tests {
                 },
             ],
             findings: vec![],
-            summary: Summary::from_findings(&[], 0, 4),
+            summary: Summary::from_findings(&[], 0, 4, GatePolicy::default(), &[]),
+            schema_version: CURRENT_SCHEMA_VERSION,
+            run_status: RunStatus::Complete,
+            incomplete_reason: None,
+            coverage: vec![],
+            prior_run: None,
+            verifier: VerifierInfo::default(),
         };
         assert_eq!(exit_code(&report, Severity::High), 0);
         let text = render_summary(&report, Severity::High);
@@ -451,7 +606,7 @@ mod tests {
         let text = render_summary(&deep, Severity::High);
         assert!(text.contains("AI 深度審計"));
         assert!(text.contains("AI 候選：3"));
-        assert!(text.contains("已證偽：1"));
+        assert!(text.contains("已證偽：1（其中前置檢查證偽 0）"));
         assert!(text.contains("待人工覆核：2"));
         assert!(text.contains("PoC 已執行：1"));
 
@@ -490,5 +645,167 @@ mod tests {
         let path = save_report(home.path(), &report).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    // ── v2 sections ──────────────────────────────────────────────────
+
+    fn needs_human_high() -> Finding {
+        let mut f = Finding::candidate(
+            "ai_audit",
+            FindingKind::Other,
+            Severity::High,
+            "t",
+            "f",
+            None,
+            "s",
+            "r",
+            vec![],
+        );
+        f.status = FindingStatus::NeedsHuman;
+        f
+    }
+
+    #[test]
+    fn needs_human_is_shown_but_not_gated_by_default() {
+        let mut report = base_report(vec![]);
+        report.summary =
+            Summary::from_findings(&[needs_human_high()], 1, 1, GatePolicy::default(), &[]);
+        assert_eq!(exit_code(&report, Severity::High), 0);
+        let text = render_summary(&report, Severity::High);
+        assert!(text.contains("待人工判斷（模型自評、不計入 fail-on）"));
+        assert!(text.contains("通過"));
+    }
+
+    #[test]
+    fn fail_on_needs_human_gates_needs_human() {
+        let mut report = base_report(vec![needs_human_high()]);
+        report.summary = Summary::from_findings(
+            &[needs_human_high()],
+            1,
+            1,
+            GatePolicy {
+                include_needs_human: true,
+            },
+            &[],
+        );
+        assert_eq!(exit_code(&report, Severity::High), 1);
+        let text = render_summary(&report, Severity::High);
+        assert!(text.contains("待人工判斷：1 筆"));
+        assert!(text.contains("已計入上方統計與 fail-on"));
+        assert!(text.contains("High: 1"));
+        assert!(text.contains("未通過"));
+    }
+
+    #[test]
+    fn render_summary_shows_coverage_verifier_and_prior_in_deep_profile() {
+        let mut report = base_report(vec![]);
+        report.profile.mode = ProfileMode::Deep;
+        report.summary.coverage = CoverageSummary {
+            modules_total: 7,
+            covered: 2,
+            candidate: 1,
+            deferred: 3,
+            failed: 1,
+            partial: true,
+        };
+        report.verifier = VerifierInfo {
+            independence: VerifierIndependence::DifferentAgent,
+            audit_agent: Some("auditor".into()),
+            verifier_agent: Some("checker".into()),
+        };
+        report.prior_run = Some(PriorRunInfo {
+            report_file: "20261001T000000Z.json".into(),
+            carried_suppressed: 1,
+            carried_refuted: 2,
+            revalidated_prior_confirmed: 0,
+            changed_source: 4,
+        });
+        let text = render_summary(&report, Severity::High);
+        assert!(text.contains("模組覆蓋：共 7"));
+        assert!(text.contains("部分覆蓋：4 模組未審"));
+        assert!(text.contains("獨立 agent 覆核（審計：auditor；覆核：checker）"));
+        assert!(text.contains("20261001T000000Z.json"));
+        assert!(text.contains("原始碼已變更 4"));
+
+        report.prior_run = None;
+        report.verifier = VerifierInfo::default();
+        let text = render_summary(&report, Severity::High);
+        assert!(text.contains("先前報告承接：無"));
+        assert!(text.contains("未執行覆核"));
+    }
+
+    #[test]
+    fn render_summary_marks_incomplete_runs() {
+        let mut report = base_report(vec![]);
+        report.run_status = RunStatus::Incomplete;
+        report.incomplete_reason =
+            Some(duduclaw_core::llm_contract::coverage::IncompleteReason::EngineUnavailable);
+        let text = render_summary(&report, Severity::High);
+        assert!(text.contains("執行狀態：未完成（AI 引擎無法使用）"));
+    }
+
+    #[test]
+    fn write_and_save_refuse_an_invalid_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut report = base_report(vec![]);
+        report.schema_version = 1;
+        let path = dir.path().join("r.json");
+        let err = write_json_report(&report, &path).unwrap_err();
+        assert!(err.to_string().contains("schema_version is 1"));
+        assert!(!path.exists());
+        let home = tempfile::tempdir().unwrap();
+        assert!(save_report(home.path(), &report).is_err());
+        assert!(!home.path().join("secaudit").exists());
+    }
+
+    #[test]
+    fn total_line_shows_three_buckets_from_the_findings() {
+        let mut refuted = needs_human_high();
+        refuted.status = FindingStatus::Refuted;
+        refuted.title = "other".into();
+        refuted.file = "g".into();
+        let scanner_hit = Finding::candidate(
+            "semgrep",
+            FindingKind::StaticAnalysis,
+            Severity::Low,
+            "t",
+            "f",
+            None,
+            "s",
+            "r",
+            vec![],
+        );
+        let findings = vec![needs_human_high(), needs_human_high(), refuted, scanner_hit];
+        let mut report = base_report(findings.clone());
+        let text = render_summary(&report, Severity::High);
+        assert!(
+            text.contains("總計：4（計入 fail-on 1、待人工判斷 2、已證偽/已壓制 1）"),
+            "{text}"
+        );
+        assert!(text.contains("永遠不計入嚴重度統計與 fail-on 判定"));
+
+        // Live-run regression: 2 NeedsHuman, nothing refuted.
+        let only_nh = base_report(vec![needs_human_high(), needs_human_high()]);
+        let text = render_summary(&only_nh, Severity::High);
+        assert!(
+            text.contains("總計：2（計入 fail-on 0、待人工判斷 2、已證偽/已壓制 0）"),
+            "{text}"
+        );
+
+        // Flag on: NeedsHuman is gated.
+        report.summary = Summary::from_findings(
+            &findings,
+            1,
+            1,
+            GatePolicy {
+                include_needs_human: true,
+            },
+            &[],
+        );
+        let text = render_summary(&report, Severity::High);
+        assert!(
+            text.contains("總計：4（計入 fail-on 3、待人工判斷 0、已證偽/已壓制 1）"),
+            "{text}"
+        );
     }
 }

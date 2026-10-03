@@ -242,9 +242,132 @@ pub fn read_report(home_dir: &Path, basename: &str) -> Result<Value, String> {
     serde_json::from_slice::<Value>(&raw).map_err(|e| format!("報告 JSON 格式錯誤：{e}"))
 }
 
-/// Read-modify-write one finding's `status` field (`secaudit.finding_status`
-/// — the operator confirm/suppress/refute action). Locked (cross-process
-/// safe) + atomic temp-file-then-rename, mirroring `working_state::persist`.
+/// Severity keys of the summary tables, in the CLI's `SeverityCounts` order.
+const SEVERITY_KEYS: &[&str] = &["critical", "high", "medium", "low", "info"];
+
+/// Normalize a finding's `severity` string to a [`SEVERITY_KEYS`] entry.
+/// `informational` reads as `info`; anything else unknown is `None` (the
+/// finding is then left out of the tables, without error).
+fn severity_key(raw: &str) -> Option<&'static str> {
+    match raw {
+        "informational" => Some("info"),
+        other => SEVERITY_KEYS.iter().copied().find(|k| *k == other),
+    }
+}
+
+/// Record an operator decision on one finding: overwrite `status`, set
+/// `severity_basis` to `operator`, and append an `operator_review` evidence
+/// item (creating the `evidence` array if absent or not an array).
+fn apply_operator_review(
+    obj: &mut serde_json::Map<String, Value>,
+    status: &str,
+    recorded_at: &str,
+) {
+    obj.insert("status".to_string(), Value::String(status.to_string()));
+    obj.insert(
+        "severity_basis".to_string(),
+        Value::String("operator".to_string()),
+    );
+    let item = serde_json::json!({
+        "kind": "operator_review",
+        "source": "dashboard",
+        "detail": format!("operator_decision: {status}"),
+        "recorded_at": recorded_at,
+    });
+    match obj.get_mut("evidence").and_then(Value::as_array_mut) {
+        Some(evidence) => evidence.push(item),
+        None => {
+            obj.insert("evidence".to_string(), Value::Array(vec![item]));
+        }
+    }
+}
+
+/// Recompute `summary.by_severity` and `summary.needs_human_by_severity`
+/// from all findings (secaudit v2 §3.3, D1=B). `refuted` / `suppressed`
+/// count in neither table; `needs_human` counts in `needs_human_by_severity`
+/// unless `summary.gate_includes_needs_human` is `true`, in which case it
+/// counts in `by_severity`; every other status counts in `by_severity`.
+/// Only those two keys are written. A report without a `summary` object
+/// (v1) is left untouched.
+fn recompute_severity_tables(doc: &mut Value) {
+    let gate_includes_needs_human = doc
+        .get("summary")
+        .and_then(|s| s.get("gate_includes_needs_human"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if !doc.get("summary").is_some_and(Value::is_object) {
+        return;
+    }
+    let mut gated = [0u64; 5];
+    let mut needs_human = [0u64; 5];
+    if let Some(findings) = doc.get("findings").and_then(Value::as_array) {
+        for f in findings {
+            let Some(sev) = f
+                .get("severity")
+                .and_then(Value::as_str)
+                .and_then(severity_key)
+            else {
+                continue;
+            };
+            let Some(idx) = SEVERITY_KEYS.iter().position(|k| *k == sev) else {
+                continue;
+            };
+            match f.get("status").and_then(Value::as_str) {
+                Some("refuted") | Some("suppressed") => {}
+                Some("needs_human") if !gate_includes_needs_human => needs_human[idx] += 1,
+                _ => gated[idx] += 1,
+            }
+        }
+    }
+    let table = |counts: &[u64; 5]| {
+        let mut m = serde_json::Map::new();
+        for (k, n) in SEVERITY_KEYS.iter().zip(counts.iter()) {
+            m.insert((*k).to_string(), Value::from(*n));
+        }
+        Value::Object(m)
+    };
+    if let Some(summary) = doc.get_mut("summary").and_then(Value::as_object_mut) {
+        summary.insert("by_severity".to_string(), table(&gated));
+        summary.insert("needs_human_by_severity".to_string(), table(&needs_human));
+    }
+    recompute_ai_audit_counters(doc);
+}
+
+/// Recompute `summary.ai_audit_refuted` / `summary.ai_audit_needs_human`
+/// from all findings (`source_engine == "ai_audit"` with that status). Only
+/// those two keys are written (`ai_audit_candidates` and the rest stay as
+/// they are); a report without a `summary` object is left untouched.
+fn recompute_ai_audit_counters(doc: &mut Value) {
+    if !doc.get("summary").is_some_and(Value::is_object) {
+        return;
+    }
+    let mut refuted = 0u64;
+    let mut needs_human = 0u64;
+    if let Some(findings) = doc.get("findings").and_then(Value::as_array) {
+        for f in findings {
+            if f.get("source_engine").and_then(Value::as_str) != Some("ai_audit") {
+                continue;
+            }
+            match f.get("status").and_then(Value::as_str) {
+                Some("refuted") => refuted += 1,
+                Some("needs_human") => needs_human += 1,
+                _ => {}
+            }
+        }
+    }
+    if let Some(summary) = doc.get_mut("summary").and_then(Value::as_object_mut) {
+        summary.insert("ai_audit_refuted".to_string(), Value::from(refuted));
+        summary.insert("ai_audit_needs_human".to_string(), Value::from(needs_human));
+    }
+}
+
+/// Read-modify-write one finding's review decision (`secaudit.finding_status`
+/// — the operator confirm/suppress/refute action). Besides `status`, it sets
+/// the finding's `severity_basis` to `operator`, appends an
+/// `operator_review` evidence item, and recomputes the summary's
+/// `by_severity` / `needs_human_by_severity` tables, so a reviewed v2 report
+/// still passes `duduclaw secaudit-validate`. Locked (cross-process safe) +
+/// atomic temp-file-then-rename, mirroring `working_state::persist`.
 ///
 /// Returns the updated finding object on success.
 pub fn set_finding_status(
@@ -273,20 +396,24 @@ pub fn set_finding_status(
             )
         })?;
 
-        let Some(findings) = doc.get_mut("findings").and_then(Value::as_array_mut) else {
-            return Ok(Err("報告缺少 findings 陣列".to_string()));
+        let recorded_at = chrono::Utc::now().to_rfc3339();
+        let updated = {
+            let Some(findings) = doc.get_mut("findings").and_then(Value::as_array_mut) else {
+                return Ok(Err("報告缺少 findings 陣列".to_string()));
+            };
+            let Some(finding) = findings
+                .iter_mut()
+                .find(|f| f.get("id").and_then(Value::as_str) == Some(finding_id))
+            else {
+                return Ok(Err(format!("finding_id 不存在：{finding_id}")));
+            };
+            let Some(obj) = finding.as_object_mut() else {
+                return Ok(Err("finding 格式錯誤（非 JSON object）".to_string()));
+            };
+            apply_operator_review(obj, status, &recorded_at);
+            finding.clone()
         };
-        let Some(finding) = findings
-            .iter_mut()
-            .find(|f| f.get("id").and_then(Value::as_str) == Some(finding_id))
-        else {
-            return Ok(Err(format!("finding_id 不存在：{finding_id}")));
-        };
-        let Some(obj) = finding.as_object_mut() else {
-            return Ok(Err("finding 格式錯誤（非 JSON object）".to_string()));
-        };
-        obj.insert("status".to_string(), Value::String(status.to_string()));
-        let updated = finding.clone();
+        recompute_severity_tables(&mut doc);
 
         let tmp = path.with_extension("json.tmp");
         let json = serde_json::to_string_pretty(&doc).map_err(|e| {
@@ -521,6 +648,152 @@ mod tests {
             let updated = set_finding_status(&home.0, &file, "f-1", status).unwrap();
             assert_eq!(updated["status"], *status);
         }
+    }
+
+    fn finding(id: &str, severity: &str, status: &str) -> String {
+        format!(
+            r#"{{ "id": "{id}", "source_engine": "ai_audit", "kind": "ai_audit",
+                 "severity": "{severity}", "title": "t", "file": "src/a.rs",
+                 "line": 1, "snippet": "s", "rule_id": null, "evidence": [],
+                 "status": "{status}", "severity_basis": "model_self_reported" }}"#
+        )
+    }
+
+    fn v2_report(findings: &[String], gate_includes_needs_human: bool) -> String {
+        format!(
+            r#"{{
+                "schema_version": 2,
+                "repo": "/tmp/repo",
+                "findings": [{}],
+                "summary": {{
+                    "total_findings": {},
+                    "by_severity": {{ "critical": 9, "high": 9, "medium": 9, "low": 9, "info": 9 }},
+                    "needs_human_by_severity": {{ "critical": 9, "high": 9, "medium": 9, "low": 9, "info": 9 }},
+                    "gate_includes_needs_human": {gate_includes_needs_human},
+                    "engines_run_count": 3,
+                    "precheck_refuted": 7,
+                    "ai_audit_candidates": 5,
+                    "ai_audit_refuted": 99,
+                    "ai_audit_needs_human": 99
+                }}
+            }}"#,
+            findings.join(","),
+            findings.len()
+        )
+    }
+
+    fn mixed_findings() -> Vec<String> {
+        vec![
+            finding("f-crit", "critical", "candidate"),
+            finding("f-high", "high", "confirmed"),
+            finding("f-med", "medium", "needs_human"),
+            finding("f-low", "low", "refuted"),
+            finding("f-info", "informational", "suppressed"),
+            finding("f-info2", "informational", "needs_human"),
+            finding("f-bogus", "bogus", "candidate"),
+            // Scanner finding: counts in no ai_audit counter (and its unknown
+            // severity keeps it out of the tables).
+            finding("f-scan", "bogus", "refuted").replacen("\"ai_audit\"", "\"semgrep\"", 1),
+        ]
+    }
+
+    fn counts(v: &Value) -> [u64; 5] {
+        let mut out = [0u64; 5];
+        for (i, k) in SEVERITY_KEYS.iter().enumerate() {
+            out[i] = v[*k].as_u64().unwrap_or(u64::MAX);
+        }
+        out
+    }
+
+    #[test]
+    fn set_finding_status_appends_operator_evidence_and_basis() {
+        let home = TempHome::new();
+        home.write_report("r.json", &v2_report(&mixed_findings(), false));
+        let updated = set_finding_status(&home.0, "r.json", "f-crit", "confirmed").unwrap();
+        assert_eq!(updated["status"], "confirmed");
+        assert_eq!(updated["severity_basis"], "operator");
+        let ev = updated["evidence"].as_array().unwrap();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["kind"], "operator_review");
+        assert_eq!(ev[0]["source"], "dashboard");
+        assert_eq!(ev[0]["detail"], "operator_decision: confirmed");
+        let at = ev[0]["recorded_at"].as_str().unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(at).is_ok(), "{at}");
+
+        // Persisted, and a second decision appends rather than replaces.
+        set_finding_status(&home.0, "r.json", "f-crit", "refuted").unwrap();
+        let doc = read_report(&home.0, "r.json").unwrap();
+        let f = &doc["findings"][0];
+        assert_eq!(f["evidence"].as_array().unwrap().len(), 2);
+        assert_eq!(f["evidence"][1]["detail"], "operator_decision: refuted");
+        // Other findings keep their own basis.
+        assert_eq!(doc["findings"][1]["severity_basis"], "model_self_reported");
+    }
+
+    #[test]
+    fn set_finding_status_creates_missing_evidence_array() {
+        let home = TempHome::new();
+        let body =
+            r#"{ "findings": [ { "id": "f-1", "severity": "low", "status": "candidate" } ] }"#;
+        home.write_report("r.json", body);
+        let updated = set_finding_status(&home.0, "r.json", "f-1", "suppressed").unwrap();
+        assert_eq!(updated["evidence"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn set_finding_status_recomputes_tables_gate_off() {
+        let home = TempHome::new();
+        home.write_report("r.json", &v2_report(&mixed_findings(), false));
+        set_finding_status(&home.0, "r.json", "f-high", "refuted").unwrap();
+        let doc = read_report(&home.0, "r.json").unwrap();
+        let s = &doc["summary"];
+        // critical candidate counts; high now refuted; low refuted and info
+        // suppressed count nowhere; bogus severity ignored.
+        assert_eq!(counts(&s["by_severity"]), [1, 0, 0, 0, 0]);
+        assert_eq!(counts(&s["needs_human_by_severity"]), [0, 0, 1, 0, 1]);
+        // ai_audit counters: f-high + f-low refuted; f-med + f-info2 pending.
+        assert_eq!(s["ai_audit_refuted"], 2);
+        assert_eq!(s["ai_audit_needs_human"], 2);
+        assert_eq!(s["ai_audit_candidates"], 5, "left untouched");
+        // Other summary fields untouched.
+        assert_eq!(s["total_findings"], 8);
+        assert_eq!(s["engines_run_count"], 3);
+        assert_eq!(s["precheck_refuted"], 7);
+        assert_eq!(s["gate_includes_needs_human"], false);
+    }
+
+    #[test]
+    fn set_finding_status_recomputes_tables_gate_on() {
+        let home = TempHome::new();
+        home.write_report("r.json", &v2_report(&mixed_findings(), true));
+        set_finding_status(&home.0, "r.json", "f-crit", "confirmed").unwrap();
+        let doc = read_report(&home.0, "r.json").unwrap();
+        let s = &doc["summary"];
+        // needs_human findings move into by_severity when the gate includes them.
+        assert_eq!(counts(&s["by_severity"]), [1, 1, 1, 0, 1]);
+        assert_eq!(counts(&s["needs_human_by_severity"]), [0, 0, 0, 0, 0]);
+        // Counters do not depend on the gate flag.
+        assert_eq!(s["ai_audit_refuted"], 1);
+        assert_eq!(s["ai_audit_needs_human"], 2);
+        assert_eq!(s["ai_audit_candidates"], 5, "left untouched");
+    }
+
+    #[test]
+    fn set_finding_status_v1_report_without_summary_still_works() {
+        let home = TempHome::new();
+        let body = format!(
+            r#"{{ "repo": "/tmp/repo", "findings": [{}] }}"#,
+            sample_finding("semgrep-aaa", "candidate")
+        );
+        home.write_report("r.json", &body);
+        let updated = set_finding_status(&home.0, "r.json", "semgrep-aaa", "confirmed").unwrap();
+        assert_eq!(updated["status"], "confirmed");
+        let doc = read_report(&home.0, "r.json").unwrap();
+        assert!(
+            doc.get("summary").is_none(),
+            "no summary is invented for v1"
+        );
+        assert_eq!(doc["findings"][0]["severity_basis"], "operator");
     }
 
     #[test]
