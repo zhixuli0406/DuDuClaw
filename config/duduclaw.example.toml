@@ -75,6 +75,9 @@ port = 18789
 # resume_on_restart = "pause"  # pause | auto — what happens to in-flight goals after a restart
 # tool_streak_advisory = true  # Inject an advisory after 3/5/8 identical consecutive tool calls
 # planner_enabled = false      # Let an LLM decompose the goal into dependent sub-tasks first
+# criteria_ledger = "report"   # off | report | enforce — per-criterion acceptance ledger: report numbers
+#                              # the criteria C1..Cn and parses the worker's <criteria_status> tag;
+#                              # enforce also makes the judge rule on every criterion
 
 # ── Goal risk boundary ──────────────────────────────────────
 # Injected into every dispatch round of a goal that did not declare its own
@@ -375,6 +378,14 @@ port = 18789
 # judge_command = []         # argv of the external judge; required when judge = "external"
 # judge_timeout_secs = 120   # External-judge timeout, clamped to [1, 3600]
 # two_stage_judge = true     # Run the cheap first-stage evaluator before the MAV panel
+# strict_reply_parsing = "shadow"  # off | shadow (default) | enforce — judge replies under the
+#                            # strict JSON contract (whole reply = exactly one JSON value).
+#                            # shadow: today's lenient parse decides, the strict parse is only
+#                            # compared (Prometheus judge_parse_shadow_total + audit
+#                            # judge_parse_shadow_mismatch). enforce: the strict parse decides
+#                            # and a violation fails closed (panel FAIL / evaluator and
+#                            # external judge degrade to MAV). off: no strict parse at all.
+#                            # Unknown value ⇒ shadow. Read per decision, no restart.
 # grounding_precheck_enabled = true  # Zero-LLM evidence check before the acceptance judge
 # grounding_min_overlap_chars = 6    # Minimum shared span, counted CJK-safely
 # admission = "queue"        # queue (durable FIFO) | fail (pre-H19 hard reject)

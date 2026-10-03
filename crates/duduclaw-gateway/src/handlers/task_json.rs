@@ -39,7 +39,12 @@ pub(crate) fn task_row_to_json(r: &TaskRow) -> Value {
         // H9-G goal contract freeze: the immutable snapshot taken at goal
         // creation, when one exists (see `TaskRow::acceptance_criteria_baseline`).
         "acceptance_criteria_baseline": r.acceptance_criteria_baseline,
-        "result_summary": r.result_summary,
+        // WP-G2: never show the raw `<criteria_status>` tag (the settle
+        // rewrites the stored copy; this covers the window before it).
+        "result_summary": crate::goal_loop::criteria_ledger::display_result_summary(
+            r.criteria_ledger.as_deref(),
+            r.result_summary.as_deref(),
+        ),
         "retry_count": r.retry_count,
         "max_retries": r.max_retries,
         "claimed_by": r.claimed_by,
@@ -447,5 +452,24 @@ pub(crate) fn goal_task_settle_verb(new_status: &str) -> Option<crate::decision_
         "done" => Some(DecisionVerb::MarkedDone),
         "cancelled" => Some(DecisionVerb::Abandoned),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod criteria_tag_tests {
+    use super::*;
+
+    /// WP-G2: the dashboard's 「最新產出摘要」 never shows the raw
+    /// `<criteria_status>` tag of a ledger goal; other tasks are untouched.
+    #[test]
+    fn task_row_to_json_strips_the_criteria_tag_only_for_ledger_goals() {
+        let mut r = TaskRow::new("t".into(), "g".into(), String::new(), "medium".into(), "a".into(), "s".into());
+        let tagged = "已完成\n<criteria_status>[{\"id\":\"C1\"}]</criteria_status>";
+        r.result_summary = Some(tagged.into());
+        assert_eq!(task_row_to_json(&r)["result_summary"], tagged);
+        r.criteria_ledger = Some("{}".into());
+        assert_eq!(task_row_to_json(&r)["result_summary"], "已完成");
+        r.result_summary = None;
+        assert!(task_row_to_json(&r)["result_summary"].is_null());
     }
 }

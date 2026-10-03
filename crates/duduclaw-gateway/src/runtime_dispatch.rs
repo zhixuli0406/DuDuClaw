@@ -732,8 +732,9 @@ mod hint_tests {
                     .await.unwrap().is_claimed());
                 store.complete_task(&task.id, "delivered fixture", "fixture-worker").await.unwrap();
                 let engine = DispatchEngine::new(store.clone(), Some(Arc::new(LlmAcceptanceJudge::new(
-                    GoalAcceptanceCaller { home_dir: home.clone() }))))
-                    .with_evaluator(Arc::new(LlmPreEvaluator::new(GoalAcceptanceCaller { home_dir: home.clone() })));
+                    GoalAcceptanceCaller { home_dir: home.clone() }).with_reply_contract_home(home.clone()))))
+                    .with_evaluator(Arc::new(LlmPreEvaluator::new(GoalAcceptanceCaller { home_dir: home.clone() })
+                        .with_reply_contract_home(home.clone())));
                 engine.tick_once().await.unwrap();
                 assert_eq!(store.get_task(&task.id).await.unwrap().unwrap().status, "done");
                 let conn = rusqlite::Connection::open(home.join("cost_telemetry.db")).unwrap();

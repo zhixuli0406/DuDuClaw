@@ -502,6 +502,10 @@ impl MethodHandler {
                 "activity": activity.iter().map(activity_row_to_json).collect::<Vec<_>>(),
                 "pending_kickoff": pending_kickoff,
                 "runs": runs,
+                // WP-G2: the per-criterion acceptance ledger, `null` when the
+                // goal has none (older goals, or created with
+                // `[goal_loop] criteria_ledger = "off"`).
+                "criteria_ledger": criteria_ledger_json(&self.home_dir, &row),
             }),
         )
     }
@@ -666,5 +670,58 @@ impl MethodHandler {
                 "avg_daily_accepts_7d": metrics.avg_daily_accepts_7d,
             }),
         )
+    }
+}
+
+/// WP-G2 `criteria_ledger` field of `tasks.timeline`: the design's RPC shape
+/// (`{mode, units[], last_report_round, invalid_reports}`) or `null`. `mode`
+/// is the mode in effect now (`[goal_loop] criteria_ledger`).
+pub(crate) fn criteria_ledger_json(home_dir: &std::path::Path, row: &TaskRow) -> Value {
+    use crate::goal_loop::criteria_ledger::{CriteriaLedger, CriteriaLedgerMode};
+    CriteriaLedger::from_json(row.criteria_ledger.as_deref())
+        .map(|l| l.to_rpc_json(CriteriaLedgerMode::from_home(Some(home_dir))))
+        .unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod criteria_ledger_rpc_tests {
+    use super::*;
+    use crate::goal_loop::criteria_ledger::{CriteriaLedger, CriteriaLedgerMode};
+
+    #[test]
+    fn tasks_timeline_criteria_ledger_shape_and_null() {
+        let home = tempfile::tempdir().unwrap();
+        let mut row = TaskRow::new(
+            "t1".into(),
+            "goal".into(),
+            String::new(),
+            "medium".into(),
+            "a".into(),
+            "system".into(),
+        );
+        assert!(criteria_ledger_json(home.path(), &row).is_null());
+        row.criteria_ledger = Some("not json".into());
+        assert!(criteria_ledger_json(home.path(), &row).is_null());
+
+        row.criteria_ledger = CriteriaLedger::new("t1", "產出報表\n寄出", CriteriaLedgerMode::Report)
+            .map(|l| l.to_json());
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[goal_loop]\ncriteria_ledger = \"enforce\"\n",
+        )
+        .unwrap();
+        let v = criteria_ledger_json(home.path(), &row);
+        assert_eq!(v["mode"], "enforce", "mode is the one in effect now");
+        assert_eq!(v["units"].as_array().unwrap().len(), 2);
+        let unit = &v["units"][1];
+        for key in ["id", "handle", "text", "status", "evidence", "unresolved", "updated_round"] {
+            assert!(unit.get(key).is_some(), "missing {key}");
+        }
+        assert_eq!(unit["handle"], "C2");
+        assert_eq!(unit["text"], "寄出");
+        assert_eq!(unit["status"], "planned");
+        assert!(unit["updated_round"].is_null());
+        assert!(v["last_report_round"].is_null());
+        assert_eq!(v["invalid_reports"], 0);
     }
 }

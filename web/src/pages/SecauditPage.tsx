@@ -13,6 +13,7 @@ import {
 import {
   api,
   type SecauditFinding,
+  type SecauditSeverityCounts,
   type SecauditFindingStatus,
   type SecauditReport,
   type SecauditReportRow,
@@ -205,6 +206,250 @@ function ReportListRowView({
   );
 }
 
+const THREAT_FIELDS = ['principal', 'input', 'control', 'boundary', 'affected', 'result'] as const;
+
+function DetailBlock({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="space-y-1.5">
+      <p className="text-xs font-medium text-muted-foreground">{title}</p>
+      {children}
+    </div>
+  );
+}
+
+/** v2-only detail blocks. Every block renders nothing when its field is
+ *  absent/empty, so a v1 finding expands exactly as before. */
+function FindingV2Detail({ finding }: { finding: SecauditFinding }) {
+  const intl = useIntl();
+  const tm = finding.threat_model;
+  const trace = finding.trace ?? [];
+  const conditions = finding.conditions ?? [];
+  const blockers = finding.blockers ?? [];
+  const plan = finding.validation_plan;
+  const precheck = finding.precheck;
+  const failedPrecheck = precheck && !precheck.passed ? precheck : null;
+  const t = (id: string, defaultMessage?: string) => intl.formatMessage({ id, defaultMessage });
+  return (
+    <>
+      {tm && (
+        <DetailBlock title={t('secaudit.finding.threat.title')}>
+          <dl className="grid grid-cols-1 gap-x-3 gap-y-1 text-xs sm:grid-cols-[auto_1fr]">
+            {THREAT_FIELDS.map((k) => (
+              <div key={k} className="contents">
+                <dt className="text-muted-foreground">{t(`secaudit.finding.threat.${k}`)}</dt>
+                <dd className="text-foreground">{tm[k]}</dd>
+              </div>
+            ))}
+          </dl>
+        </DetailBlock>
+      )}
+      {trace.length > 0 && (
+        <DetailBlock title={t('secaudit.finding.trace.title')}>
+          <ol className="space-y-1.5">
+            {trace.map((st, i) => (
+              <li key={i} className="rounded-md border border-surface-border p-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="secondary" className="text-[10px]">
+                    {t(`secaudit.finding.trace.kind.${st.kind}`, st.kind)}
+                  </Badge>
+                  <span className="font-mono text-muted-foreground">
+                    {st.file}:{st.line}
+                  </span>
+                  {st.scope && <span className="font-mono text-foreground">{st.scope}</span>}
+                </div>
+                <p className="mt-1 text-muted-foreground">{st.description}</p>
+              </li>
+            ))}
+          </ol>
+        </DetailBlock>
+      )}
+      {conditions.length > 0 && (
+        <DetailBlock title={t('secaudit.finding.conditions.title')}>
+          <ul className="space-y-1 text-xs">
+            {conditions.map((c, i) => (
+              <li key={i} className="flex flex-wrap items-start gap-2">
+                <Badge variant="secondary" className="text-[10px]">
+                  {t(`secaudit.finding.condition.kind.${c.kind}`, c.kind)}
+                </Badge>
+                <span className="min-w-0 flex-1 text-foreground">{c.description}</span>
+              </li>
+            ))}
+          </ul>
+        </DetailBlock>
+      )}
+      {blockers.length > 0 && (
+        <DetailBlock title={t('secaudit.finding.blockers.title')}>
+          <ul className="list-disc space-y-1 pl-4 text-xs text-foreground">
+            {blockers.map((b, i) => (
+              <li key={i}>{b}</li>
+            ))}
+          </ul>
+        </DetailBlock>
+      )}
+      {plan && (plan.local || plan.deployment) && (
+        <DetailBlock title={t('secaudit.finding.plan.title')}>
+          <dl className="space-y-1 text-xs">
+            {plan.local && (
+              <div>
+                <dt className="text-muted-foreground">{t('secaudit.finding.plan.local')}</dt>
+                <dd className="text-foreground">{plan.local}</dd>
+              </div>
+            )}
+            {plan.deployment && (
+              <div>
+                <dt className="text-muted-foreground">{t('secaudit.finding.plan.deployment')}</dt>
+                <dd className="text-foreground">{plan.deployment}</dd>
+              </div>
+            )}
+          </dl>
+        </DetailBlock>
+      )}
+      {failedPrecheck && (
+        <DetailBlock title={t('secaudit.finding.precheck.title')}>
+          <ul className="list-disc space-y-1 pl-4 text-xs text-destructive">
+            {failedPrecheck.violations.map((v, i) => (
+              <li key={i}>{v}</li>
+            ))}
+          </ul>
+        </DetailBlock>
+      )}
+    </>
+  );
+}
+
+const INCOMPLETE_REASONS = [
+  'budget_cannot_fund_reserves',
+  'validation_budget_exhausted',
+  'critic_budget_exhausted',
+  'engine_unavailable',
+  'interrupted',
+];
+
+/** Report-level v2 header blocks (banner, coverage, verifier, prior run,
+ *  needs-human stats). Renders nothing for a v1 report. */
+function ReportV2Header({ report }: { report: SecauditReport }) {
+  const intl = useIntl();
+  const t = (id: string, values?: Record<string, string | number>) =>
+    intl.formatMessage({ id }, values);
+  const cov = report.summary.coverage;
+  const verifier = report.verifier;
+  const prior = report.prior_run;
+  const nh = report.summary.needs_human_by_severity;
+  const gated = report.summary.gate_includes_needs_human === true;
+  const incomplete = report.run_status === 'incomplete';
+  const showStats = !!nh || report.summary.gate_includes_needs_human !== undefined;
+
+  let verifierText: string | null = null;
+  if (verifier) {
+    const known = ['same_agent', 'different_agent', 'not_run'].includes(verifier.independence);
+    const label = t(`secaudit.verifier.${known ? verifier.independence : 'unknown'}`);
+    verifierText =
+      verifier.audit_agent != null || verifier.verifier_agent != null
+        ? t('secaudit.verifier.agents', {
+            label,
+            audit: verifier.audit_agent ?? t('secaudit.verifier.defaultAgent'),
+            verifier: verifier.verifier_agent ?? t('secaudit.verifier.defaultAgent'),
+          })
+        : label;
+  }
+
+  if (!incomplete && !cov && !verifier && !prior && !showStats) return null;
+
+  const reasonKey = INCOMPLETE_REASONS.includes(report.incomplete_reason ?? '')
+    ? (report.incomplete_reason as string)
+    : 'unknown';
+
+  return (
+    <div className="space-y-2 pt-1">
+      {incomplete && (
+        <div role="alert" className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden />
+          <div>
+            <p className="font-medium text-foreground">{t('secaudit.incomplete.title')}</p>
+            <p className="text-muted-foreground">{t(`secaudit.incomplete.reason.${reasonKey}`)}</p>
+          </div>
+        </div>
+      )}
+      {(verifierText || prior) && (
+        <div className="flex flex-wrap gap-1.5">
+          {verifierText && (
+            <Badge variant="secondary" className="text-[10px]">
+              {verifierText}
+            </Badge>
+          )}
+          {prior && (
+            <Badge variant="secondary" className="whitespace-normal text-[10px]">
+              {t('secaudit.prior.chip', {
+                suppressed: prior.carried_suppressed,
+                refuted: prior.carried_refuted,
+                revalidated: prior.revalidated_prior_confirmed,
+                changed: prior.changed_source,
+              })}
+              {!!report.summary.carried_from_prior &&
+                `；${t('secaudit.prior.total', { n: report.summary.carried_from_prior })}`}
+            </Badge>
+          )}
+        </div>
+      )}
+      {cov && (
+        <Card data-size="sm">
+          <CardContent className="space-y-1.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-xs font-medium text-foreground">{t('secaudit.coverage.title')}</p>
+              {cov.partial && (
+                <Badge variant="secondary" className="text-[10px]">
+                  {t('secaudit.coverage.partial')}
+                </Badge>
+              )}
+            </div>
+            <dl className="flex flex-wrap gap-x-5 gap-y-1 text-xs">
+              {(['modules_total', 'covered', 'candidate', 'deferred', 'failed'] as const).map((k) => (
+                <div key={k} className="flex items-baseline gap-1.5">
+                  <dt className="text-muted-foreground">
+                    {t(`secaudit.coverage.${k === 'modules_total' ? 'total' : k}`)}
+                  </dt>
+                  <dd className="tabular-nums text-foreground">{cov[k]}</dd>
+                </div>
+              ))}
+              {!!report.summary.precheck_refuted && (
+                <div className="flex items-baseline gap-1.5">
+                  <dt className="text-muted-foreground">{t('secaudit.coverage.precheckRefuted')}</dt>
+                  <dd className="tabular-nums text-foreground">{report.summary.precheck_refuted}</dd>
+                </div>
+              )}
+            </dl>
+          </CardContent>
+        </Card>
+      )}
+      {showStats && (
+        <div className="space-y-1 text-xs text-muted-foreground">
+          <StatsRow label={t('secaudit.stats.confirmed')} counts={report.summary.by_severity} />
+          {gated ? (
+            <p>{t('secaudit.stats.needsHumanGated')}</p>
+          ) : (
+            nh && <StatsRow label={t('secaudit.stats.needsHuman')} counts={nh} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatsRow({ label, counts }: { label: string; counts: SecauditSeverityCounts }) {
+  const intl = useIntl();
+  const empty = SEVERITY_ORDER.every((s) => !counts[s]);
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+      <span>{label}</span>
+      {empty ? (
+        <span className="text-muted-foreground/70">{intl.formatMessage({ id: 'secaudit.stats.none' })}</span>
+      ) : (
+        <SeverityCountDots counts={counts} />
+      )}
+    </div>
+  );
+}
+
 function FindingCard({
   finding,
   expanded,
@@ -230,6 +475,14 @@ function FindingCard({
               <Badge variant="secondary" className="shrink-0 text-[10px]">
                 {finding.source_engine}
               </Badge>
+              {finding.severity_basis === 'model_self_reported' && (
+                <span
+                  className="shrink-0 text-[10px] text-muted-foreground"
+                  title={intl.formatMessage({ id: 'secaudit.finding.basis.title' })}
+                >
+                  {intl.formatMessage({ id: 'secaudit.finding.basis.model' })}
+                </span>
+              )}
               <span className={cn('shrink-0 text-xs font-medium', statusTone(finding.status))}>
                 {intl.formatMessage({ id: `secaudit.status.${finding.status}`, defaultMessage: finding.status })}
               </span>
@@ -258,6 +511,7 @@ function FindingCard({
                 {finding.snippet}
               </pre>
             )}
+            <FindingV2Detail finding={finding} />
             <div className="space-y-1.5">
               <p className="text-xs font-medium text-muted-foreground">
                 {intl.formatMessage({ id: 'secaudit.finding.evidence.title' })}
@@ -529,6 +783,7 @@ export function SecauditPage() {
                 )}
               </div>
             )}
+            <ReportV2Header report={report} />
           </div>
 
           <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">

@@ -74,6 +74,8 @@ pub mod signals;
 pub mod state;
 /// Goal decomposition + plan-first ("想一想") planner (D4 / I-1c).
 pub mod plan;
+/// WP-G2: per-criterion acceptance ledger (`## 驗收帳本` + `<criteria_status>`).
+pub mod criteria_ledger;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

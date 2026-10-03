@@ -715,6 +715,27 @@ export type PauseReasonToken =
   | 'restart'
   | 'unknown';
 
+export type CriteriaUnitStatus = 'planned' | 'covered' | 'blocked' | 'candidate';
+
+export interface CriteriaLedgerUnit {
+  id: string;
+  /** Short handle shown to people: "C1".. */
+  handle: string;
+  text: string;
+  status: CriteriaUnitStatus;
+  evidence: string[];
+  unresolved: string[];
+  updated_round: number | null;
+}
+
+/** WP-G2 per-criterion acceptance ledger (null/absent = feature off for this task). */
+export interface CriteriaLedger {
+  mode: 'off' | 'report' | 'enforce';
+  units: CriteriaLedgerUnit[];
+  last_report_round: number | null;
+  invalid_reports: number;
+}
+
 export interface TaskInfo {
   /** Discovery is orchestrated separately from the ordinary goal worker. */
   kind?: 'task' | 'goal' | 'discovery';
@@ -804,7 +825,7 @@ export interface TaskIteration {
   feedback_class?: string | null;
   /** Per-aspect MAV panel results — null for deterministic rejections and
    *  rows judged before 2026-08-14. */
-  aspects?: Array<{ name: string; pass: boolean; reason: string }> | null;
+  aspects?: Array<{ name: string; pass: boolean; reason: string; criterion?: boolean }> | null;
   /** How many times this round was dispatched (stall re-dispatches). */
   dispatch_count?: number;
   /** Same-(state, action) repeat streak at dispatch time (≥2 = no progress). */
@@ -1561,6 +1582,89 @@ export interface SecauditFinding {
   evidence: SecauditEvidenceItem[];
   /** candidate | confirmed | refuted | needs_human | suppressed */
   status: string;
+  // ── schema v2 (all optional; absent on v1 reports) ──
+  root_fingerprint?: string;
+  file_hash?: string | null;
+  /** scanner_rule | model_self_reported | operator */
+  severity_basis?: string;
+  threat_model?: SecauditThreatModel | null;
+  trace?: SecauditTraceStep[];
+  conditions?: SecauditCondition[];
+  blockers?: string[];
+  validation_plan?: SecauditValidationPlan | null;
+  precheck?: SecauditPrecheck | null;
+}
+
+export interface SecauditThreatModel {
+  principal: string;
+  input: string;
+  control: string;
+  boundary: string;
+  affected: string;
+  result: string;
+}
+
+export interface SecauditTraceStep {
+  /** entrypoint | propagation | sink */
+  kind: string;
+  file: string;
+  line: number;
+  scope: string;
+  description: string;
+}
+
+export interface SecauditCondition {
+  /** authentication_level | authorization_role | user_interaction | … */
+  kind: string;
+  description: string;
+}
+
+export interface SecauditValidationPlan {
+  local: string | null;
+  deployment: string | null;
+}
+
+export interface SecauditPrecheck {
+  passed: boolean;
+  violations: string[];
+}
+
+/** budget_cannot_fund_reserves | validation_budget_exhausted |
+ *  critic_budget_exhausted | engine_unavailable | interrupted */
+export type SecauditIncompleteReason = string;
+
+export interface SecauditModuleCoverage {
+  module_path: string;
+  /** covered | candidate | deferred | unreadable | llm_failed | parse_failed */
+  status: string;
+  reason: string | null;
+  reviewed_paths: string[];
+  truncated_paths: string[];
+  candidate_ids: string[];
+}
+
+export interface SecauditPriorRun {
+  report_file: string;
+  carried_suppressed: number;
+  carried_refuted: number;
+  revalidated_prior_confirmed: number;
+  changed_source: number;
+}
+
+export interface SecauditVerifier {
+  /** same_agent | different_agent | not_run */
+  independence: string;
+  audit_agent: string | null;
+  verifier_agent: string | null;
+}
+
+export interface SecauditCoverageSummary {
+  modules_total: number;
+  covered: number;
+  candidate: number;
+  deferred: number;
+  failed: number;
+  partial: boolean;
 }
 
 export interface SecauditEngineRun {
@@ -1584,9 +1688,23 @@ export interface SecauditReport {
   engines_run: SecauditEngineRun[];
   engines_missing: SecauditEngineMissing[];
   findings: SecauditFinding[];
+  // ── schema v2 (all optional; absent on v1 reports) ──
+  schema_version?: number;
+  /** complete | incomplete */
+  run_status?: string;
+  incomplete_reason?: SecauditIncompleteReason | null;
+  coverage?: SecauditModuleCoverage[];
+  prior_run?: SecauditPriorRun | null;
+  verifier?: SecauditVerifier;
   summary: {
     total_findings: number;
     by_severity: SecauditSeverityCounts;
+    /** Model self-reported; excluded from `by_severity` and the gate. */
+    needs_human_by_severity?: SecauditSeverityCounts;
+    gate_includes_needs_human?: boolean;
+    coverage?: SecauditCoverageSummary;
+    precheck_refuted?: number;
+    carried_from_prior?: number;
     engines_run_count: number;
     engines_missing_count: number;
     /** AI deep-audit + PoC counters (§3.2 steps 3-5) — additive fields, may
@@ -1683,6 +1801,8 @@ export interface GoalTimeline {
     created_at: string;
     ttl_seconds: number;
   } | null;
+  /** WP-G2 per-criterion ledger; null/absent renders the plain criteria text. */
+  criteria_ledger?: CriteriaLedger | null;
   /** Execution transcripts recorded for this task's rounds (durable
    *  dispatch_runs linkage). */
   runs: Array<{

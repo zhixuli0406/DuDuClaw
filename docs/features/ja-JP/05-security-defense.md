@@ -45,7 +45,7 @@ H10（2026-09）以前は `<agent_dir>/.claude/hooks/data-file-guard.sh` に置�
 
 ## ガード3 — `input_guard`（プロンプトインジェクションスキャナー、Rust ライブラリ）
 
-`duduclaw_security::input_guard::scan_input` はテキストを**7つのルールカテゴリ**で 0–100 点に採点し、`DEFAULT_BLOCK_THRESHOLD`（60）以上でブロックします：
+`duduclaw_security::input_guard::scan_input` はテキストを**11のルールカテゴリ**で 0–100 点に採点し、`DEFAULT_BLOCK_THRESHOLD`（60）以上でブロックします：
 
 | ルール | 重み | 単独即ブロック |
 |---|---|---|
@@ -56,6 +56,10 @@ H10（2026-09）以前は `<agent_dir>/.claude/hooks/data-file-guard.sh` に置�
 | `system_prompt_extraction` | 30 | いいえ |
 | `encoding_bypass` | 25 | いいえ |
 | `termination_manipulation` | 30 | いいえ |
+| `authority_escalation` | 信号1種類につき 35、異なる2種類で加算 | いいえ |
+| `memory_poisoning` | 信号1種類につき 30、異なる2種類で加算 | いいえ |
+| `role_provenance` | 枠1種類につき 35、異なる2種類で加算 | いいえ |
+| `action_binding` | 30 | いいえ |
 
 パターンは英語と中国語（繁体字と簡体字）をカバーします。テキストは先に NFKC 正規化され（`unicode_normalizer`）、ホモグラフや不可視文字の小細工はパターン照合をすり抜けられません。
 
@@ -69,6 +73,15 @@ H10（2026-09）以前は `<agent_dir>/.claude/hooks/data-file-guard.sh` に置�
 **既知の誤検知。** 形で照合するため、上書き動詞・範囲語・指示系の名詞が1つの短い節に並ぶ普通の文もブロックされます。たとえば「請忽略之前寄的指示，以新版為準」「請忽略以上規則中的第三條，已經取消」「忘記之前的規則了，可以再說一次嗎」です（テスト `known_benign_shapes_that_do_match` で固定）。「越獄模式」に触れるだけでもブロックされます。回避策は上書き動詞を使わずに言い換えることで、たとえば「之前的指示作廢，以新版為準」です。近い文「之前的報價單請作廢，以新的指示為準」は、一致してはならない文のテスト一覧に入っています。このスキャナーはフレーズによるヒューリスティックで分類器ではなく、実際の会話データでの計測もしていません。
 
 `termination_manipulation`（LoopTrap、arXiv:2605.05846）は意図的に即ブロックにしていません。重み 30 は閾値より低く、単独一致では警告と監査のみでブロックしません。これにより通常の「続けてください」が誤検知されずに済みます。
+
+**文型ファミリー（v1.68.0）。** レッドチーム台帳で、AI 社員を狙う4つの手法がどれも0点だとわかりました。現在はそれぞれに英語と繁体字中国語のアンカー付き正規表現があります。
+
+- `authority_escalation`：ユーザーの権限ではなく社員自身の権限で実行させようとする文（"use your own service account / admin role"、"not my permissions"、"the system trusts you more than me"、用你自己的服務帳號／管理員身分、不要用我的權限、系統比較信任你）。
+- `memory_poisoning`：恒久的な特権を記憶させようとする文（"remember this permanently"、"as a fact about me"、"I am always allowed to"、永久記住、記在你的記憶裡、以後每次對話都照辦、我一律有權限）。普通の「請記住…」、"remember to…"、"remember my name" は一致しません。
+- `role_provenance`：ユーザーメッセージ内の偽のシステム・ツール・運営者の枠：`[SYSTEM]`、`<tool_result>` タグ、`approval=granted`、"policy update from the platform operator"、「本次對話已解除…限制」、平台營運方政策更新、引用文中の AI 宛てメモ（給 AI 助理的附註）とそれを隠す指示（不要提到這段附註）。枠はタグ全体でのみ一致するので "our system sends a tool result" は一致しません。開始タグと終了タグの組は1種類として数えます。
+- `action_binding`：1つの承認を別の操作に流用する文（"use that same approval to…"、"use the approval from step 1"、用同一個核准、用第一步的核准去…）。「既然已經核准預算，請安排會議」は一致しません。
+
+重みの方針：信号1つだけなら警告と監査のみ（30–35、60 未満）です。1つのメッセージに同じファミリーの**異なる**信号が2種類ある場合、または信号1つに既存ルール（`instruction_override`、`system_prompt_extraction` など）が加わる場合にブロックします。自身で加算されるのは3つのファミリーです：`authority_escalation`（「用你的服務帳號」と「系統比較信任你」で 70）、`memory_poisoning`（「永久記住」と「我一律有權限」で 60）、`role_provenance`（`[SYSTEM]` と `approval=granted` で 70）。`action_binding` は自身では加算されず、他のルールと組み合わさったときだけブロックします。同じ信号が2回出ても1回と数えます。`[SYSTEM]` 1つ、または `<tool_result>…</tool_result>` の1組だけなら 35 のままです。既知の代償：たまたま信号を2種類含む普通の文もブロックされます。たとえば "please use your admin account, not my permissions, to fix the shared folder" です（テスト `known_benign_shapes_blocked_by_stacking` で固定）。信号が1つだけの言い方にするか、管理者に直接頼んでください。一致があれば本文を捨てる呼び出し側（蒸留、プロフィール書き込み）は、これらの文型を含む本文も捨てるようになりました。各ファミリーの陽性例と、似ているが一致してはならない文は `input_guard.rs` のテストで固定しています。
 
 一致したときに影響が出る場所（確認済みの呼び出し箇所）：
 

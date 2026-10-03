@@ -483,3 +483,109 @@ describe('TaskDetailPage — no goal follow-up on a discovery run (L2 round 7)',
     expect(screen.queryByText(en['tasks.continue.title'])).toBeNull();
   });
 });
+
+describe('TaskDetailPage — WP-G2 criteria ledger', () => {
+  const baseGoal: TaskInfo = { ...TASK, goal_mode: true, acceptance_criteria: 'C1 a\nC2 b\nC3 c\nC4 d' };
+  const unit = (n: number, status: 'planned' | 'covered' | 'blocked' | 'candidate', extra = {}) => ({
+    id: `u${n}`,
+    handle: `C${n}`,
+    text: `criterion text ${n}`,
+    status,
+    evidence: [] as string[],
+    unresolved: [] as string[],
+    updated_round: 1,
+    ...extra,
+  });
+  const mount = (t: TaskInfo & { criteria_ledger?: unknown }, iterations: unknown[] = []) => {
+    const { criteria_ledger, ...task } = t;
+    mockWsClient.call.mockImplementation((method: string) => {
+      switch (method) {
+        case 'tasks.list':
+          return Promise.resolve({ tasks: [task] });
+        case 'agents.list':
+          return Promise.resolve({ agents: AGENTS });
+        case 'tasks.timeline':
+          return Promise.resolve({
+            task,
+            iterations,
+            activity: [],
+            runs: [],
+            pending_kickoff: null,
+            criteria_ledger: criteria_ledger ?? null,
+          });
+        default:
+          return Promise.resolve({});
+      }
+    });
+    useTasksStore.setState({ tasks: [task], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+  };
+
+  it('renders one row per unit with status chips, summary, and inline blocker', async () => {
+    mount({
+      ...baseGoal,
+      criteria_ledger: {
+        mode: 'report',
+        last_report_round: 2,
+        invalid_reports: 0,
+        units: [
+          unit(1, 'planned'),
+          unit(2, 'covered', { evidence: ['report.pdf attached'] }),
+          unit(3, 'blocked', { unresolved: ['needs API key', 'second'] }),
+          unit(4, 'candidate'),
+        ],
+      },
+    });
+    expect(await screen.findByText('1 of 4 done, 1 stuck')).toBeInTheDocument();
+    expect(screen.getByText('To do')).toBeInTheDocument();
+    expect(screen.getByText('Done')).toBeInTheDocument();
+    expect(screen.getByText('Stuck')).toBeInTheDocument();
+    expect(screen.getByText('In progress, awaiting check')).toBeInTheDocument();
+    expect(screen.getByText('C3')).toBeInTheDocument();
+    expect(screen.getByText('criterion text 2')).toBeInTheDocument();
+    expect(screen.getAllByText('needs API key').length).toBeGreaterThan(0);
+    expect(screen.queryByText(/judged separately/)).toBeNull();
+    expect(screen.queryByText(/could not be read/)).toBeNull();
+  });
+
+  it('shows the unreadable-report note and the enforce label when applicable', async () => {
+    mount({
+      ...baseGoal,
+      criteria_ledger: { mode: 'enforce', last_report_round: 1, invalid_reports: 2, units: [unit(1, 'planned')] },
+    });
+    expect(await screen.findByText(/last progress report could not be read/)).toBeInTheDocument();
+    expect(screen.getByText('Each criterion is judged separately')).toBeInTheDocument();
+  });
+
+  it('renders the plain criteria text when criteria_ledger is null', () => {
+    mount({ ...baseGoal, acceptance_criteria: 'Ship the Q3 report', criteria_ledger: null });
+    expect(screen.getByText('Ship the Q3 report')).toBeInTheDocument();
+    expect(screen.queryByText('To do')).toBeNull();
+    expect(screen.queryByText(/done,.*stuck/)).toBeNull();
+  });
+
+  it('renders criterion verdict rows separately from the normal aspects', async () => {
+    mount(
+      {
+        ...baseGoal,
+        criteria_ledger: { mode: 'enforce', last_report_round: 1, invalid_reports: 0, units: [unit(1, 'planned')] },
+      },
+      [
+        {
+          round: 1,
+          status: 'rejected',
+          aspects: [
+            { name: 'correctness', pass: true, reason: 'ok' },
+            { name: 'C1', pass: false, reason: 'no chart in report', criterion: true },
+          ],
+        },
+      ],
+    );
+    const group = await screen.findByTestId('criterion-verdicts');
+    expect(group).toHaveTextContent('Per-criterion verdicts');
+    expect(group).toHaveTextContent('C1');
+    expect(group).toHaveTextContent('Fail');
+    expect(group).toHaveTextContent('no chart in report');
+    expect(group).not.toHaveTextContent('correctness');
+  });
+});

@@ -9,6 +9,7 @@
     use crate::tool_activity::filter_tool_activity;
 
     mod a1_ledger;
+    mod criteria_ledger;
     mod engine;
     mod grounding;
     mod judge_failure;

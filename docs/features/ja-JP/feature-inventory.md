@@ -101,7 +101,7 @@
 | バーンレート異常検知 | エージェントごとの日次支出に対し移動平均+標準偏差で外れ値を検出(`cost_anomaly.rs`) |
 | 監査エクスポート + SIEM sink | `duduclaw export audit`(旧 `duduclaw audit`) — JSONL 監査ログを正規化し NDJSON / webhook へストリーム |
 | 送信 guardrail フック | opt-in `[guardrails]` — 送信前に秘密情報の漏洩 / インジェクション反響 / 禁止フレーズ / PII をスキャン |
-| CI レッドチームスキャン | `duduclaw redteam` — `CONTRACT.toml` の `must_not` から jailbreak バリアントを生成し input-guard に通す |
+| CI レッドチームスキャン | `duduclaw redteam`／`duduclaw test` — `CONTRACT.toml` の `must_not` から 11 手法 × 英語／繁体字中国語の攻撃を生成し、input-guard に通してカバレッジ台帳にする。ブロックされなかったユニットは「実環境での検証待ち」で脆弱性ではない。`duduclaw test --emit-evals` がそれらの `duduclaw eval` ケースを生成する |
 | セキュリティ姿勢レポート | `duduclaw security` — 有効な防御の重み付きチェックリスト |
 | バックアップ / リストア | `duduclaw backup` / `restore` — タイムスタンプ付きホームアーカイブ + SHA-256 サイドカー(リストア時に検証) |
 | セッションリプレイ | `duduclaw session replay <id>` — セッションのターンを順に出力(`--tools` 併用可) |
@@ -269,9 +269,9 @@
 | `data-file-guard` PreToolUse フック | `duduclaw hook data-file-guard`（RFC-23 §14.4、H10 2026-09 から Rust サブコマンド、matcher `Read\|Bash`）。匿名化が有効なときだけ武装。サンドボックスではなく `Bash` のファイル名ヒューリスティック |
 | ダッシュボード認証 | JWT アカウントログイン（Argon2id パスワード、`users.db`）または gateway の管理者トークン。以前の Ed25519 チャレンジレスポンスの経路は削除されました。どの設定からも有効にできないものでした |
 | AES-256-GCM | API キーの保存時暗号化、per-agent 隔離 |
-| Prompt Injection スキャナ | `input_guard` — 7 ルールカテゴリ、ブロック閾値 60、NFKC 正規化、英語＋zh-TW パターン、XML 区切りタグ保護 |
+| Prompt Injection スキャナ | `input_guard` — 11 ルールカテゴリ、ブロック閾値 60、NFKC 正規化、英語＋zh-TW パターン、XML 区切りタグ保護 |
 | SOUL.md ドリフト検出 | SHA-256 フィンガープリント比較 |
-| CONTRACT.toml | 行動境界 + `duduclaw test` レッドチーム CLI（9 シナリオ）；全ランタイムの system prompt へ自動注入 |
+| CONTRACT.toml | 行動境界 + `duduclaw test` レッドチーム CLI（9 シナリオ + カバレッジ台帳）；全ランタイムの system prompt へ自動注入 |
 | RBAC マトリクス（読み取り専用ビュー）| セキュリティページがエージェント毎のツール／ウェブ／承認マトリクスを `agent.toml [capabilities]` から描画します。`duduclaw-security::rbac` モジュールは削除済み（呼び出し元ゼロ）で、編集可能な真実の源は各エージェントの capability envelope です |
 | 統一監査ログ | `audit.unified_log` が `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` を統合。Logs ページのソースフィルタ + 重要度ドロップダウン |
 | JSONL 監査ログ | ツール呼び出しの完全記録、非同期書込 |

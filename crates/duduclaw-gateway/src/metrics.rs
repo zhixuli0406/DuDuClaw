@@ -16,6 +16,20 @@ pub fn global_metrics() -> &'static Arc<MetricsRegistry> {
     METRICS.get_or_init(|| Arc::new(MetricsRegistry::new()))
 }
 
+/// `parser` label values of `judge_parse_shadow_total` (WP-G1). Closed,
+/// code-defined set — index order is the counter matrix's row order.
+pub const JUDGE_PARSE_SHADOW_PARSERS: [&str; 3] = ["panel", "pre_evaluator", "external"];
+
+/// `outcome` label values of `judge_parse_shadow_total` (WP-G1). Closed,
+/// code-defined set — index order is the counter matrix's column order.
+pub const JUDGE_PARSE_SHADOW_OUTCOMES: [&str; 5] = [
+    "agree",
+    "strict_rejects",
+    "lenient_rejects",
+    "both_reject",
+    "disagree",
+];
+
 /// Registry holding all Prometheus-compatible metrics.
 pub struct MetricsRegistry {
     // Counters
@@ -118,6 +132,15 @@ pub struct MetricsRegistry {
     /// Restore swap outcomes applied at boot (`perform_pending_restore_swap`).
     pub backup_restore_swap_ok_total: AtomicU64,
     pub backup_restore_swap_fail_total: AtomicU64,
+
+    // ── WP-G1 (llm_contract goal loop): judge reply strict-parse shadow ──
+    /// `judge_parse_shadow_total{parser, outcome}`: one count per judge /
+    /// evaluator / external-judge decision observed under
+    /// `[dispatch] strict_reply_parsing = "shadow" | "enforce"`. Fixed
+    /// matrix indexed by [`JUDGE_PARSE_SHADOW_PARSERS`] ×
+    /// [`JUDGE_PARSE_SHADOW_OUTCOMES`] — both label sets are closed, so a
+    /// lock-free array is enough and the parsers (sync code) never await.
+    pub judge_parse_shadow: [[AtomicU64; 5]; 3],
 }
 
 impl MetricsRegistry {
@@ -159,6 +182,44 @@ impl MetricsRegistry {
             backup_schedule_fail_total: AtomicU64::new(0),
             backup_restore_swap_ok_total: AtomicU64::new(0),
             backup_restore_swap_fail_total: AtomicU64::new(0),
+
+            judge_parse_shadow: Default::default(),
+        }
+    }
+
+    /// A fresh, empty registry. Production code uses [`global_metrics`];
+    /// tests that assert exact counts use their own instance so parallel
+    /// tests cannot bleed into each other's totals.
+    #[cfg(test)]
+    pub(crate) fn new_isolated() -> Self {
+        Self::new()
+    }
+
+    // ── WP-G1: judge reply strict-parse shadow ────────────────────────
+
+    /// Record one shadow classification. Both labels must come from
+    /// [`JUDGE_PARSE_SHADOW_PARSERS`] / [`JUDGE_PARSE_SHADOW_OUTCOMES`]; an
+    /// unknown label is dropped with a `debug!` (every call site passes a
+    /// typed enum's `as_str()`, pinned to these arrays by a test).
+    pub fn judge_parse_shadow(&self, parser: &str, outcome: &str) {
+        let p = JUDGE_PARSE_SHADOW_PARSERS.iter().position(|x| *x == parser);
+        let o = JUDGE_PARSE_SHADOW_OUTCOMES.iter().position(|x| *x == outcome);
+        match (p, o) {
+            (Some(p), Some(o)) => {
+                self.judge_parse_shadow[p][o].fetch_add(1, Ordering::Relaxed);
+            }
+            _ => tracing::debug!(parser, outcome, "judge_parse_shadow: unknown label dropped"),
+        }
+    }
+
+    /// Current value of one `judge_parse_shadow_total` series (0 for an
+    /// unknown label pair).
+    pub fn judge_parse_shadow_count(&self, parser: &str, outcome: &str) -> u64 {
+        let p = JUDGE_PARSE_SHADOW_PARSERS.iter().position(|x| *x == parser);
+        let o = JUDGE_PARSE_SHADOW_OUTCOMES.iter().position(|x| *x == outcome);
+        match (p, o) {
+            (Some(p), Some(o)) => self.judge_parse_shadow[p][o].load(Ordering::Relaxed),
+            _ => 0,
         }
     }
 
@@ -594,6 +655,20 @@ impl MetricsRegistry {
             self.backup_restore_swap_fail_total.load(Ordering::Relaxed)
         ));
 
+        // ── WP-G1: judge reply strict-parse shadow ──
+        out.push_str(
+            "# HELP judge_parse_shadow_total Judge reply parses compared against the strict JSON contract, by parser and outcome.\n",
+        );
+        out.push_str("# TYPE judge_parse_shadow_total counter\n");
+        for (p, parser) in JUDGE_PARSE_SHADOW_PARSERS.iter().enumerate() {
+            for (o, outcome) in JUDGE_PARSE_SHADOW_OUTCOMES.iter().enumerate() {
+                out.push_str(&format!(
+                    "judge_parse_shadow_total{{parser=\"{parser}\",outcome=\"{outcome}\"}} {}\n",
+                    self.judge_parse_shadow[p][o].load(Ordering::Relaxed)
+                ));
+            }
+        }
+
         out
     }
 }
@@ -877,6 +952,30 @@ mod tests {
         let map = r.goal_loop_bail_pattern.read().await;
         assert_eq!(map.get("stopping_here"), Some(&2));
         assert_eq!(map.get("verdict_line"), Some(&1));
+    }
+
+    // ── WP-G1: judge reply strict-parse shadow ──
+
+    #[tokio::test]
+    async fn judge_parse_shadow_counts_and_renders_every_series() {
+        let r = MetricsRegistry::new();
+        r.judge_parse_shadow("panel", "agree");
+        r.judge_parse_shadow("panel", "agree");
+        r.judge_parse_shadow("external", "strict_rejects");
+        r.judge_parse_shadow("bogus", "agree");
+        r.judge_parse_shadow("panel", "bogus");
+        assert_eq!(r.judge_parse_shadow_count("panel", "agree"), 2);
+        assert_eq!(r.judge_parse_shadow_count("external", "strict_rejects"), 1);
+        assert_eq!(r.judge_parse_shadow_count("bogus", "agree"), 0);
+        let output = r.render().await;
+        assert!(output.contains("judge_parse_shadow_total{parser=\"panel\",outcome=\"agree\"} 2"));
+        assert!(output.contains(
+            "judge_parse_shadow_total{parser=\"external\",outcome=\"strict_rejects\"} 1"
+        ));
+        assert!(output.contains(
+            "judge_parse_shadow_total{parser=\"pre_evaluator\",outcome=\"disagree\"} 0"
+        ));
+        assert_eq!(output.matches("judge_parse_shadow_total{").count(), 15);
     }
 
     #[tokio::test]

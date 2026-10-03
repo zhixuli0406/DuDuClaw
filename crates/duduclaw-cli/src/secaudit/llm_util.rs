@@ -1,11 +1,13 @@
-//! Shared prompt-hardening + LLM-response-parsing helpers for the AI-audit /
-//! adversarial-review / PoC steps (§3.2 steps 3-5).
+//! Shared prompt-hardening helpers for the AI-audit / adversarial-review /
+//! PoC steps (§3.2 steps 3-5).
 //!
-//! `escape_xml_tag` / `strip_json_fences` are local copies of the same
-//! conventions `duduclaw-fork::judge` and `duduclaw-gateway::goal_plan` each
-//! keep in-crate (see their own doc comments) — small enough pure functions
-//! that duplicating them beats adding a cross-crate dependency just for two
-//! string helpers.
+//! LLM replies are parsed with `duduclaw_core::llm_contract::strict_json`
+//! (the whole reply must be exactly one JSON value). The earlier
+//! "slice from the first `{` to the last `}`" helpers were removed in v2:
+//! a reply that violates the contract is discarded, never repaired.
+//!
+//! `escape_xml_tag` is a local copy of the convention `duduclaw-fork::judge`
+//! and `duduclaw-gateway::goal_plan` each keep in-crate.
 
 use std::path::{Path, PathBuf};
 
@@ -17,48 +19,6 @@ use async_trait::async_trait;
 /// terminate its own fence early and inject a new "instruction" section.
 pub fn escape_xml_tag(content: &str, tag: &str) -> String {
     content.replace(&format!("</{tag}>"), &format!("<\u{200b}/{tag}>"))
-}
-
-/// Strip ```json / ``` markdown fences an LLM may wrap its JSON reply in.
-pub fn strip_json_fences(s: &str) -> &str {
-    let t = s.trim();
-    let after_open = if let Some(rest) = t.strip_prefix("```json") {
-        rest
-    } else if let Some(rest) = t.strip_prefix("```") {
-        rest
-    } else {
-        return t;
-    };
-    let body = after_open.trim_start();
-    match body.rfind("```") {
-        Some(end) => body[..end].trim(),
-        None => body.trim(),
-    }
-}
-
-/// Slice the outermost `[` … `]` JSON array out of a (possibly fenced,
-/// possibly prose-wrapped) LLM reply. `None` when no array delimiters are
-/// found — callers treat that as a parse failure (fail-closed, no finding).
-pub fn extract_json_array(raw: &str) -> Option<&str> {
-    let stripped = strip_json_fences(raw);
-    let start = stripped.find('[')?;
-    let end = stripped.rfind(']')?;
-    if end < start {
-        return None;
-    }
-    Some(&stripped[start..=end])
-}
-
-/// Slice the outermost `{` … `}` JSON object out of a (possibly fenced,
-/// possibly prose-wrapped) LLM reply.
-pub fn extract_json_object(raw: &str) -> Option<&str> {
-    let stripped = strip_json_fences(raw);
-    let start = stripped.find('{')?;
-    let end = stripped.rfind('}')?;
-    if end < start {
-        return None;
-    }
-    Some(&stripped[start..=end])
 }
 
 /// A small ASCII-safe slug for embedding an LLM-supplied free-text category
@@ -89,22 +49,62 @@ pub fn slugify(s: &str) -> String {
 
 /// Extract a real on-disk context window (`context` lines before/after a
 /// 1-based `line`) from `content`. Grounds prompts/snippets in actual source
-/// text rather than trusting an LLM's own restatement of it. A missing
-/// `line`, or one outside the file's range, falls back to the file's first
-/// lines — still real content, never LLM prose.
-pub fn extract_context_window(content: &str, line: Option<u32>, context: usize) -> String {
+/// text rather than trusting an LLM's own restatement of it.
+///
+/// `line == None` ⇒ the window starts at the top of the file. A `line`
+/// outside `1..=line_count` ⇒ `None`: the caller decides what an
+/// out-of-range claim means (v1 silently fell back to the top of the file,
+/// which showed a verifier the wrong code).
+pub fn extract_context_window(content: &str, line: Option<u32>, context: usize) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
+    let idx0 = match line {
+        None => 0,
+        Some(l) => {
+            let l = l as usize;
+            if l == 0 || l > lines.len() {
+                return None;
+            }
+            l - 1
+        }
+    };
     if lines.is_empty() {
-        return String::new();
+        return Some(String::new());
     }
-    let idx0 = line
-        .map(|l| l as usize)
-        .filter(|&l| l >= 1 && l <= lines.len())
-        .map(|l| l - 1)
-        .unwrap_or(0);
     let start = idx0.saturating_sub(context);
     let end = (idx0 + context + 1).min(lines.len());
-    lines[start..end].join("\n")
+    Some(lines[start..end].join("\n"))
+}
+
+/// Width of the right-aligned line-number gutter in prompts.
+pub const LINE_NO_WIDTH: usize = 5;
+
+/// One numbered prompt line: `<n> | <text>` with `n` right-aligned to
+/// [`LINE_NO_WIDTH`]. The model is told to cite exactly this number.
+pub fn format_numbered_line(line_no: usize, text: &str) -> String {
+    format!("{line_no:>width$} | {text}", width = LINE_NO_WIDTH)
+}
+
+/// Prefix every line of `text` with its 1-based file line number, the
+/// first line being `first_line_no`. Works on whole lines only (`str::lines`),
+/// so it never cuts inside a multi-byte character. Empty text ⇒ empty
+/// string.
+pub fn number_lines(text: &str, first_line_no: usize) -> String {
+    text.lines()
+        .enumerate()
+        .map(|(i, l)| format_numbered_line(first_line_no + i, l))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// [`extract_context_window`], numbered with the real file line numbers.
+/// `None` when `line` is out of range.
+pub fn numbered_context_window(content: &str, line: Option<u32>, context: usize) -> Option<String> {
+    let window = extract_context_window(content, line, context)?;
+    let first = match line {
+        None => 1,
+        Some(l) => (l as usize).saturating_sub(context).max(1),
+    };
+    Some(number_lines(&window, first))
 }
 
 /// Shared production [`duduclaw_fork::judge::LlmCaller`] for every ai-driven
@@ -184,48 +184,6 @@ mod tests {
         );
     }
 
-    // ── strip_json_fences ────────────────────────────────────────────
-
-    #[test]
-    fn strip_json_fences_removes_json_fence() {
-        assert_eq!(strip_json_fences("```json\n[1,2,3]\n```"), "[1,2,3]");
-    }
-
-    #[test]
-    fn strip_json_fences_removes_bare_fence() {
-        assert_eq!(strip_json_fences("```\n{\"a\":1}\n```"), "{\"a\":1}");
-    }
-
-    #[test]
-    fn strip_json_fences_passes_through_unfenced_text() {
-        assert_eq!(strip_json_fences("  [1,2]  "), "[1,2]");
-    }
-
-    // ── extract_json_array / extract_json_object ────────────────────
-
-    #[test]
-    fn extract_json_array_slices_outermost_brackets_ignoring_prose() {
-        let raw = "Sure, here you go:\n```json\n[{\"a\":1}]\n```\nHope that helps!";
-        assert_eq!(extract_json_array(raw), Some("[{\"a\":1}]"));
-    }
-
-    #[test]
-    fn extract_json_array_none_when_no_brackets() {
-        assert_eq!(extract_json_array("no json here"), None);
-    }
-
-    #[test]
-    fn extract_json_object_slices_outermost_braces() {
-        let raw = "```json\n{\"verdict\": \"refuted\"}\n```";
-        assert_eq!(extract_json_object(raw), Some("{\"verdict\": \"refuted\"}"));
-    }
-
-    #[test]
-    fn extract_json_object_none_when_brackets_reversed() {
-        // `}` before `{` — malformed, must not slice a nonsense range.
-        assert_eq!(extract_json_object("} garbage {"), None);
-    }
-
     // ── slugify ───────────────────────────────────────────────────────
 
     #[test]
@@ -251,31 +209,76 @@ mod tests {
     fn extract_context_window_centers_on_the_given_line() {
         let content = "l1\nl2\nl3\nl4\nl5";
         let window = extract_context_window(content, Some(3), 1);
-        assert_eq!(window, "l2\nl3\nl4");
+        assert_eq!(window.as_deref(), Some("l2\nl3\nl4"));
     }
 
     #[test]
     fn extract_context_window_clamps_at_file_boundaries() {
         let content = "l1\nl2\nl3";
-        assert_eq!(extract_context_window(content, Some(1), 5), "l1\nl2\nl3");
-        assert_eq!(extract_context_window(content, Some(3), 5), "l1\nl2\nl3");
+        assert_eq!(
+            extract_context_window(content, Some(1), 5).as_deref(),
+            Some("l1\nl2\nl3")
+        );
+        assert_eq!(
+            extract_context_window(content, Some(3), 5).as_deref(),
+            Some("l1\nl2\nl3")
+        );
     }
 
     #[test]
-    fn extract_context_window_falls_back_to_start_when_no_line() {
+    fn extract_context_window_starts_at_top_when_no_line() {
         let content = "l1\nl2\nl3\nl4\nl5\nl6\nl7";
-        assert_eq!(extract_context_window(content, None, 1), "l1\nl2");
+        assert_eq!(
+            extract_context_window(content, None, 1).as_deref(),
+            Some("l1\nl2")
+        );
     }
 
+    /// v2: an out-of-range line is `None` (v1 fell back to the file's top,
+    /// showing the wrong code as if it were the claimed location).
     #[test]
-    fn extract_context_window_out_of_range_line_falls_back_to_start() {
+    fn extract_context_window_out_of_range_line_is_none() {
         let content = "l1\nl2\nl3";
-        assert_eq!(extract_context_window(content, Some(999), 1), "l1\nl2");
+        assert_eq!(extract_context_window(content, Some(999), 1), None);
+        assert_eq!(extract_context_window(content, Some(0), 1), None);
     }
 
     #[test]
-    fn extract_context_window_empty_content_is_empty_string() {
-        assert_eq!(extract_context_window("", Some(1), 2), "");
+    fn extract_context_window_empty_content() {
+        assert_eq!(extract_context_window("", None, 2).as_deref(), Some(""));
+        assert_eq!(extract_context_window("", Some(1), 2), None);
+    }
+
+    // ── number_lines / numbered_context_window ───────────────────────
+
+    #[test]
+    fn number_lines_right_aligns_and_starts_at_the_given_line() {
+        assert_eq!(number_lines("a\nb", 9), "    9 | a\n   10 | b");
+        assert_eq!(number_lines("", 1), "");
+    }
+
+    #[test]
+    fn number_lines_is_cjk_safe() {
+        let out = number_lines("客戶資料\n🔒 密碼", 1);
+        assert_eq!(out, "    1 | 客戶資料\n    2 | 🔒 密碼");
+    }
+
+    #[test]
+    fn numbered_context_window_uses_real_file_line_numbers() {
+        let content = "l1\nl2\nl3\nl4\nl5";
+        assert_eq!(
+            numbered_context_window(content, Some(4), 1).as_deref(),
+            Some("    3 | l3\n    4 | l4\n    5 | l5")
+        );
+        assert_eq!(
+            numbered_context_window(content, Some(1), 3).as_deref(),
+            Some("    1 | l1\n    2 | l2\n    3 | l3\n    4 | l4")
+        );
+        assert_eq!(
+            numbered_context_window(content, None, 1).as_deref(),
+            Some("    1 | l1\n    2 | l2")
+        );
+        assert_eq!(numbered_context_window(content, Some(9), 1), None);
     }
 
     // ── resolve_agent_dir ────────────────────────────────────────────

@@ -1774,6 +1774,7 @@ dependencies = [
  "hmac",
  "keyring",
  "libc",
+ "percent-encoding",
  "serde",
  "serde_json",
  "sha2",
@@ -1782,6 +1783,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "unicode-normalization",
  "uuid",
  "windows-sys 0.59.0",
 ]

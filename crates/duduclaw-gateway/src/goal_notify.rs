@@ -407,8 +407,15 @@ fn progress_body(task: &TaskRow, progress: &GoalProgress) -> String {
             )
         }
         GoalProgress::Done => {
-            let sum = task
-                .result_summary
+            // WP-G2: a goal with a criteria ledger asks the worker to end its
+            // summary with a `<criteria_status>` JSON tag — machine data, not
+            // something to push into the conversation. Goals without a ledger
+            // keep their text untouched.
+            let summary = crate::goal_loop::criteria_ledger::display_result_summary(
+                task.criteria_ledger.as_deref(),
+                task.result_summary.as_deref(),
+            );
+            let sum = summary
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -503,6 +510,15 @@ fn needs_human_body(task: &TaskRow, trajectory: Option<&str>, channel: &str) -> 
         .filter(|s| !s.is_empty())
         .unwrap_or("(未提供原因)");
     let trajectory_block = trajectory.map(|t| format!("\n{t}\n")).unwrap_or_default();
+    // WP-G2: which criteria are still open (blocked / never reported /
+    // awaiting confirmation) and what is unresolved. Only when the goal has a
+    // ledger; otherwise the card is unchanged.
+    let ledger_line = crate::goal_loop::criteria_ledger::CriteriaLedger::from_json(
+        task.criteria_ledger.as_deref(),
+    )
+    .and_then(|l| crate::goal_loop::criteria_ledger::needs_human_summary(&l.units))
+    .map(|s| format!("{s}\n"))
+    .unwrap_or_default();
     let choices = if channel == "line" {
         format!("請選擇：重試 / 標記完成。\n{LINE_SECONDARY_ACTIONS_HINT}")
     } else {
@@ -515,6 +531,7 @@ fn needs_human_body(task: &TaskRow, trajectory: Option<&str>, channel: &str) -> 
          目標：{goal}\n\
          類型：{pause}\n\
          卡住原因：{reason}\n\
+         {ledger_line}\
          編號：{id}\n\
          {trajectory_block}\n\
          {choices}",
@@ -1607,6 +1624,47 @@ mod tests {
             "alice".into(),
             "goal:telegram".into(),
         )
+    }
+
+    /// WP-G2: a ledger goal's needs_human card names the open criteria and
+    /// their unresolved text; its ✅ push never shows the `<criteria_status>`
+    /// tag. A goal without a ledger renders exactly as before.
+    #[test]
+    fn criteria_ledger_reaches_the_card_and_the_tag_never_reaches_the_chat() {
+        use crate::goal_loop::criteria_ledger::{
+            CriteriaLedger, CriteriaLedgerMode, CriterionReport, CriterionStatus, apply_report,
+        };
+        let mut plain = mk_task("g1");
+        plain.status = "needs_human".into();
+        plain.judge_feedback = Some("做不到".into());
+        let before = needs_human_body(&plain, None, "telegram");
+        assert!(!before.contains("驗收帳本"));
+
+        let ledger = CriteriaLedger::new("g1", "產出月報\n寄給 Louis", CriteriaLedgerMode::Report).unwrap();
+        let units = apply_report(
+            &ledger.units,
+            &[
+                CriterionReport { handle: "C1".into(), status: CriterionStatus::Covered, evidence: vec!["月報.md".into()], unresolved: vec![] },
+                CriterionReport { handle: "C2".into(), status: CriterionStatus::Blocked, evidence: vec![], unresolved: vec!["沒有寄信權限".into()] },
+            ],
+            1,
+        );
+        let mut with = plain.clone();
+        with.criteria_ledger = Some(CriteriaLedger { units, ..ledger }.to_json());
+        let body = needs_human_body(&with, None, "telegram");
+        assert!(body.contains("驗收帳本：1/2 條已回報達成；C2 受阻（沒有寄信權限）\n編號："), "{body}");
+        // Removing the ledger line gives back the old card byte for byte.
+        let ledger_line = "驗收帳本：1/2 條已回報達成；C2 受阻（沒有寄信權限）\n";
+        assert_eq!(body.replace(ledger_line, ""), before);
+
+        let tagged = "完成月報\n<criteria_status>[{\"id\":\"C1\"}]</criteria_status>";
+        with.result_summary = Some(tagged.into());
+        let done = progress_body(&with, &GoalProgress::Done);
+        assert!(!done.contains("criteria_status"), "{done}");
+        assert!(done.ends_with("完成月報"), "{done}");
+        // No ledger: the text is untouched.
+        plain.result_summary = Some(tagged.into());
+        assert!(progress_body(&plain, &GoalProgress::Done).contains("<criteria_status>"));
     }
 
     /// Dashboard needs_human decision must behave exactly like the channel

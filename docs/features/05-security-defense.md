@@ -45,7 +45,7 @@ Until H10 (2026-09) this was a POSIX shell script at `<agent_dir>/.claude/hooks/
 
 ## Guard 3 — `input_guard` (prompt-injection scanner, Rust library)
 
-`duduclaw_security::input_guard::scan_input` scores text 0–100 across **seven rule categories** and blocks at or above `DEFAULT_BLOCK_THRESHOLD` (60):
+`duduclaw_security::input_guard::scan_input` scores text 0–100 across **eleven rule categories** and blocks at or above `DEFAULT_BLOCK_THRESHOLD` (60):
 
 | Rule | Weight | Instant block |
 |---|---|---|
@@ -56,6 +56,10 @@ Until H10 (2026-09) this was a POSIX shell script at `<agent_dir>/.claude/hooks/
 | `system_prompt_extraction` | 30 | no |
 | `encoding_bypass` | 25 | no |
 | `termination_manipulation` | 30 | no |
+| `authority_escalation` | 35 per signal, two different signals add up | no |
+| `memory_poisoning` | 30 per signal, two different signals add up | no |
+| `role_provenance` | 35 per frame, two different frames add up | no |
+| `action_binding` | 30 | no |
 
 Patterns cover English and Chinese (Traditional and Simplified). Text is NFKC-normalized first (`unicode_normalizer`), so homograph and invisible-character tricks cannot slip past a pattern.
 
@@ -69,6 +73,15 @@ Patterns cover English and Chinese (Traditional and Simplified). Text is NFKC-no
 **Known false positives.** The rule matches by shape, so ordinary sentences with an override verb, a scope word and an instruction noun in one short clause are blocked too, for example 「請忽略之前寄的指示，以新版為準」, 「請忽略以上規則中的第三條，已經取消」 and 「忘記之前的規則了，可以再說一次嗎」 (pinned by the test `known_benign_shapes_that_do_match`). Any mention of 越獄模式 also blocks. The workaround is to say the same thing without the override verb, for example 「之前的指示作廢，以新版為準」; the close sentence 「之前的報價單請作廢，以新的指示為準」 is in the test list of text that must not match. The scanner is a phrase heuristic, not a classifier, and has not been measured against real conversation data.
 
 `termination_manipulation` (LoopTrap, arXiv:2605.05846) is deliberately not an instant block: weight 30 sits below the threshold, so a single match warns and audits rather than blocking, which keeps ordinary "please continue" requests working.
+
+**Sentence-shape families (v1.68.0).** The red-team ledger found four agent-specific techniques that scored zero. Each now has an English and a Traditional Chinese set of anchored regexes:
+
+- `authority_escalation`: asking the employee to act with its own authority instead of the user's ("use your own service account / admin role", "not my permissions", "the system trusts you more than me"; 用你自己的服務帳號／管理員身分, 不要用我的權限, 系統比較信任你).
+- `memory_poisoning`: asking it to store a standing entitlement ("remember this permanently", "as a fact about me", "I am always allowed to"; 永久記住, 記在你的記憶裡, 以後每次對話都照辦, 我一律有權限). Plain 「請記住…」, "remember to…" and "remember my name" do not match.
+- `role_provenance`: a fake system, tool or operator frame inside a user message: `[SYSTEM]`, `<tool_result>` tags, `approval=granted`, "policy update from the platform operator", "restriction lifted for this session", a note addressed to the AI inside quoted text and the instruction to hide it (平台營運方政策更新, 本次對話已解除…限制, 給 AI 助理的附註, 不要提到這段附註). Frame tokens match only as whole tags, so "our system sends a tool result" does not match; an opening and a closing tag count as one frame.
+- `action_binding`: reusing one approval for a different action ("use that same approval to…", "use the approval from step 1"; 用同一個核准, 用第一步的核准去…). 「既然已經核准預算，請安排會議」 does not match.
+
+Weight policy: one signal warns and audits (30–35, below 60). A message is blocked when it carries two *different* signals of the same family, or one signal plus an existing rule such as `instruction_override` or `system_prompt_extraction`. Stacking applies to `authority_escalation` ("use your service account" plus "the system trusts you more" = 70), `memory_poisoning` ("remember this permanently" plus "I am always allowed to" = 60) and `role_provenance` (`[SYSTEM]` plus `approval=granted` = 70). `action_binding` does not stack with itself and blocks only with another rule. Two hits of the same signal count once: a single `[SYSTEM]`, or one `<tool_result>…</tool_result>` pair, stays at 35. Known cost: an ordinary-looking sentence that happens to carry two signals is blocked too, for example "please use your admin account, not my permissions, to fix the shared folder" (pinned by the test `known_benign_shapes_blocked_by_stacking`). Say it with one signal, or ask an administrator to do it. Callers that drop text on any match (distillation, profile writes) now also drop text that contains one of these shapes. Positive and look-alike phrasings for each family are pinned by tests in `input_guard.rs`.
 
 Where a match shows up (verified call sites):
 

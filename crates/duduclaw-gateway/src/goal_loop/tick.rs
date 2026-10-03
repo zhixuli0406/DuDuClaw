@@ -765,6 +765,16 @@ impl GoalLoopDriver {
             // ── Dispatch: enqueue a work message on the existing wake-up rail ──
             let next_iter = current_iter + 1;
             let mut state_text = state_block.render();
+            // WP-G2: the per-criterion ledger sits right after the `<state>`
+            // block. No ledger (older goals) or `criteria_ledger = "off"` ⇒
+            // nothing is appended and the payload is byte-identical.
+            if let Some(section) = super::criteria_ledger::dispatch_section(
+                task.criteria_ledger.as_deref(),
+                super::criteria_ledger::CriteriaLedgerMode::from_home(Some(&self.home_dir)),
+            ) {
+                state_text.push_str("\n\n");
+                state_text.push_str(&section);
+            }
             if let Some(section) = &task_rule_section {
                 state_text.push_str("\n\n");
                 state_text.push_str(section);

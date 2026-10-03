@@ -237,6 +237,10 @@ impl TaskStore {
             //   escalated to needs_human; survives `resolve_needs_human`
             //   clearing `tasks.pause_reason`.
             ("pause_reason", "pause_reason TEXT"),
+            // WP-G2 (2026-10): the criteria ledger as it stood after this
+            // round's `<criteria_status>` report was processed. Nullable;
+            // bookkeeping only, nothing reads it back for a decision.
+            ("criteria_ledger_json", "criteria_ledger_json TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -363,6 +367,10 @@ impl TaskStore {
             ("discovery_spec_json", "discovery_spec_json TEXT"),
             ("discovery_run_id", "discovery_run_id TEXT"),
             ("discovery_approval_id", "discovery_approval_id TEXT"),
+            // WP-G2 (2026-10): per-criterion acceptance ledger, latest state
+            // as JSON. Nullable — every pre-existing row reads back as "no
+            // ledger", which behaves exactly as before WP-G2.
+            ("criteria_ledger", "criteria_ledger TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {

@@ -189,10 +189,10 @@ impl TaskStore {
                  goal_id, lease_renewed_at, source_channel, source_chat_id,
                  revision_round, diminishing, agent_seconds, source_discord_guild_id,
                  deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason,
-                 plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id)
+                 plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id, criteria_ledger)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)",
+                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)",
             params![
                 row.id,
                 row.title,
@@ -238,6 +238,7 @@ impl TaskStore {
                 row.discovery_spec_json,
                 row.discovery_run_id,
                 row.discovery_approval_id,
+                row.criteria_ledger,
             ],
         )
         .map_err(|e| format!("insert task: {e}"))?;
@@ -631,5 +632,6 @@ pub(super) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         discovery_spec_json: row.get(42)?,
         discovery_run_id: row.get(43)?,
         discovery_approval_id: row.get(44)?,
+        criteria_ledger: row.get(45)?,
     })
 }

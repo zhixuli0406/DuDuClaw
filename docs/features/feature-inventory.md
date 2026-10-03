@@ -105,7 +105,7 @@
 | Burn-rate cost anomaly | rolling mean+stddev outlier detection over per-day spend (`cost_anomaly.rs`) |
 | Audit export + SIEM sink | `duduclaw export audit` (formerly `duduclaw audit`) — normalize + stream the JSONL audit trails to NDJSON / a webhook |
 | Output guardrail hook | opt-in `[guardrails]` — secret-leak / injection-echo / deny-phrase / PII scan before send |
-| CI red-team scan | `duduclaw redteam` — jailbreak variants from `CONTRACT.toml` `must_not`, run through the input-guard |
+| CI red-team scan | `duduclaw redteam` / `duduclaw test` — 11 attack techniques × en/zh-TW from `CONTRACT.toml` `must_not`, run through the input-guard as a coverage ledger; unblocked units are "needs live validation", not findings; `duduclaw test --emit-evals` writes `duduclaw eval` cases for them |
 | Security posture report | `duduclaw security` — weighted checklist of active protections |
 | Backup / restore | `duduclaw backup` / `restore` — timestamped home archive + SHA-256 sidecar (verified on restore) |
 | Session replay | `duduclaw session replay <id>` — print a session's turns (+ `--tools`) |
@@ -274,9 +274,9 @@ See [14-voice-pipeline.md](14-voice-pipeline.md). The HTTP endpoints and the Tel
 | `data-file-guard` PreToolUse hook | `duduclaw hook data-file-guard` (RFC-23 §14.4, Rust subcommand since H10 2026-09, matcher `Read\|Bash`), armed only when redaction is active; a `Bash` filename heuristic, not a sandbox |
 | Dashboard auth | JWT account login (Argon2id passwords, `users.db`) or the gateway admin token. The earlier Ed25519 challenge-response path has been removed; no configuration could ever enable it |
 | AES-256-GCM | API key encryption at rest, per-agent key isolation |
-| Prompt Injection Scanner | `input_guard` — 7 rule categories, block threshold 60, NFKC-normalized, en + zh-TW patterns, XML delimiter protection |
+| Prompt Injection Scanner | `input_guard` — 11 rule categories, block threshold 60, NFKC-normalized, en + zh-TW patterns, XML delimiter protection |
 | SOUL.md Drift Detection | SHA-256 fingerprint comparison |
-| CONTRACT.toml | Behavioral boundaries + `duduclaw test` red-team CLI (9 built-in scenarios); auto-injected into system prompt for all runtimes |
+| CONTRACT.toml | Behavioral boundaries + `duduclaw test` red-team CLI (9 built-in scenarios + coverage ledger); auto-injected into system prompt for all runtimes |
 | RBAC matrix (read-only view) | The Security page renders a per-agent tool/web/approval matrix derived from `agent.toml [capabilities]`. The `duduclaw-security::rbac` module was removed (zero callers); the editable source of truth is each agent's capability envelope |
 | Unified Audit Log | `audit.unified_log` merges `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` — Logs page source filter + severity dropdown |
 | JSONL Audit Log | Full tool call recording, async write |
