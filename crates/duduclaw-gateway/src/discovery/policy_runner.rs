@@ -485,7 +485,8 @@ impl PythonPolicyRuntime {
                 "python3", "-S", "-s", "-B"]);
             for arg in args {
                 let arg = stage.and_then(|stage| Path::new(arg).strip_prefix(stage).ok())
-                    .map(|relative| Path::new("/policy").join(relative).into_os_string())
+                    .and_then(|relative| super::evaluator::container_path("/policy", relative))
+                    .map(OsString::from)
                     .unwrap_or_else(|| OsString::from(arg));
                 create.arg(arg);
             }

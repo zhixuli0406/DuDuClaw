@@ -825,11 +825,12 @@ fn docker_command_with_labels(
             });
         if Path::new(token).is_absolute() {
             let path = Path::new(token).canonicalize().map_err(|e| e.to_string())?;
-            let mapped = Path::new("/evaluator").join(
+            let value = container_path(
+                "/evaluator",
                 path.strip_prefix(root)
                     .map_err(|_| "unmapped evaluator path")?,
-            );
-            let value = mapped.to_string_lossy().into_owned();
+            )
+            .ok_or("unmapped evaluator path")?;
             command.arg(match prefix {
                 Some(prefix) => format!("{prefix}={value}"),
                 None => value,
@@ -839,6 +840,19 @@ fn docker_command_with_labels(
         }
     }
     Ok(command)
+}
+/// Path inside a Linux container: `base` plus the plain components of a
+/// host-relative path, always joined with `/`. `Path::join` would use the
+/// host separator (a backslash on Windows) and hand the container a path that does
+/// not exist. `None` for anything but plain UTF-8 components.
+pub(crate) fn container_path(base: &str, relative: &Path) -> Option<String> {
+    let mut out = base.trim_end_matches('/').to_string();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else { return None };
+        out.push('/');
+        out.push_str(part.to_str()?);
+    }
+    Some(out)
 }
 /// Extend the established `pass`/`feedback` judge envelope with score fields.
 pub fn parse_score(
@@ -1020,6 +1034,14 @@ mod tests {
         assert!(evaluator.register("missing").await.is_err());
     }
     #[test]
+    fn container_paths_use_forward_slashes_on_every_host() {
+        let relative = Path::new("nested").join("judge");
+        assert_eq!(container_path("/evaluator", &relative).as_deref(), Some("/evaluator/nested/judge"));
+        assert_eq!(container_path("/policy/", Path::new("p.py")).as_deref(), Some("/policy/p.py"));
+        assert_eq!(container_path("/policy", &Path::new("..").join("x")), None);
+    }
+    #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn directory_hash_detects_edit_and_nested_insertion() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("judge"), "x").unwrap();

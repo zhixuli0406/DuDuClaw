@@ -528,6 +528,7 @@ mod tests {
         (temp, config, seed, run, node.join("ws"))
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn materializes_exact_path_and_drops_identity_and_secrets() {
         let (_temp, config, seed, run, ws) = setup();
         fs::write(seed.join("solution.json"), "{}").unwrap();
@@ -788,6 +789,7 @@ mod lifecycle_tests {
         assert_eq!(affordable_grid(&seed, &run, &config, 4, 3).unwrap(), (4, 0));
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn retention_only_removes_completed_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -805,6 +807,7 @@ mod lifecycle_tests {
         assert!(root.join("evaluators").exists());
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn hooks_live_outside_run_and_deny_escaping_file_operations() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -915,6 +918,7 @@ pub fn export_workspace(
 mod export_tests {
     use super::*;
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn exports_only_into_private_artifact_targets() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap().join("discovery");
@@ -978,6 +982,7 @@ mod export_tests {
 mod related_retention_tests {
     use super::*;
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn retention_cleans_completed_run_associations_and_keeps_running_data() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap().join("discovery");
@@ -1061,6 +1066,7 @@ mod visibility_guard_tests {
         }
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn reads_own_and_explicit_completed_workspace_but_denies_ledgers_and_live_siblings() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();

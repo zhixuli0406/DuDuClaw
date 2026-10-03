@@ -822,9 +822,15 @@ mod tests {
 
     // ── MCP config ──
 
+    /// An absolute command path on the host platform (a rooted path without a
+    /// drive letter is not absolute on Windows).
+    #[cfg(unix)]
+    const ABS_COMMAND: &str = "/opt/duduclaw/bin/duduclaw";
+    #[cfg(windows)]
+    const ABS_COMMAND: &str = r"C:\duduclaw\bin\duduclaw.exe";
+
     fn entry() -> Value {
-        mcp_server_entry(Path::new("/opt/duduclaw/bin/duduclaw"), &["mcp-server".to_string()])
-            .unwrap()
+        mcp_server_entry(Path::new(ABS_COMMAND), &["mcp-server".to_string()]).unwrap()
     }
 
     #[test]
@@ -832,7 +838,7 @@ mod tests {
         let e = entry();
         let obj = e.as_object().unwrap();
         assert_eq!(obj.len(), 2, "only command + args: {e}");
-        assert_eq!(e["command"], "/opt/duduclaw/bin/duduclaw");
+        assert_eq!(e["command"], ABS_COMMAND);
         assert_eq!(e["args"], serde_json::json!(["mcp-server"]));
         assert!(e.get("env").is_none());
         assert!(mcp_server_entry(Path::new("duduclaw"), &[]).is_none());

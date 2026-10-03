@@ -101,6 +101,7 @@ async fn dream_replays_each_revision_selects_improvement_and_persists_audit() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn dream_budget_exhaustion_keeps_incumbent_and_degraded_source_skips_calls() {
     let dir = tempfile::tempdir().unwrap();
     let req = request(dir.path());

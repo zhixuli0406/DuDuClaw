@@ -1116,6 +1116,7 @@ mod lease_tests {
         }
     }
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     async fn revoked_operator_cannot_deliver_a_valid_checkpoint_after_final_scoring() {
         let home = tempfile::tempdir().unwrap();
         let seed = home.path().join("seed");

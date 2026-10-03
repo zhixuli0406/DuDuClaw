@@ -207,10 +207,28 @@ fn generic_cli_runtimes_are_unsupported() {
         assert_eq!(err.code(), "unsupported_runtime", "{runtime:?}");
     }
     for runtime in [RuntimeType::Claude, RuntimeType::Codex, RuntimeType::Gemini, RuntimeType::Antigravity, RuntimeType::Grok] {
-        assert!(preflight(&SandboxSettings::default(), &spec(runtime)).is_ok(), "{runtime:?}");
+        let result = preflight(&SandboxSettings::default(), &spec(runtime));
+        #[cfg(unix)]
+        assert!(result.is_ok(), "{runtime:?}");
+        // The sandbox needs a unix host; a supported runtime on any other
+        // host is refused by platform, never silently accepted.
+        #[cfg(not(unix))]
+        assert_eq!(result.unwrap_err().code(), "unsupported_platform", "{runtime:?}");
     }
 }
 
+#[cfg(not(unix))]
+#[test]
+fn non_unix_hosts_fail_closed_with_unsupported_platform() {
+    let err = preflight(&SandboxSettings::default(), &spec(RuntimeType::Claude)).unwrap_err();
+    assert_eq!(err, Unavailable::UnsupportedPlatform);
+    assert_eq!(err.code(), "unsupported_platform");
+    assert!(err.message().contains("unix host"), "{}", err.message());
+}
+
+// Model/timeout checks run after the platform gate, so they are only
+// reachable on unix hosts (elsewhere `non_unix_hosts_fail_closed_...` holds).
+#[cfg_attr(not(unix), ignore = "the task sandbox refuses non-unix hosts before the model/timeout checks")]
 #[test]
 fn empty_model_or_zero_timeout_is_invalid_config() {
     let mut s = spec(RuntimeType::Claude);

@@ -213,6 +213,7 @@ fn apply_limits(command: &mut Command, spec: &ConfinementSpec) {
 mod tests {
     use super::*;
     #[test]
+    #[cfg_attr(not(unix), ignore = "seatbelt confinement is unix-only and its profile takes POSIX absolute paths")]
     fn policy_profile_denies_network_writes_and_mach_lookup() {
         let spec = ConfinementSpec {
             readonly: vec![PathBuf::from("/opt/policy")],
@@ -225,6 +226,7 @@ mod tests {
         assert!(profile.contains("file-read-metadata (literal \"/opt\")"));
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "seatbelt confinement is unix-only and its profile takes POSIX absolute paths")]
     fn quotes_untrusted_paths_and_refuses_relative_or_control() {
         assert!(quoted(Path::new("relative")).is_err());
         assert!(quoted(Path::new("/tmp/x\n(allow network*)")).is_err());

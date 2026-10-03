@@ -132,6 +132,7 @@ fn namespace() -> DefaultsNamespace {
     }
 }
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn completed_dream_writer_rows_become_comparable_only_after_terminal_attestation() {
     let home = tempfile::tempdir().unwrap();
     let (store, tree, request) = fixture(home.path(), "terminal-pipeline");
@@ -267,6 +268,7 @@ async fn completed_dream_writer_rows_become_comparable_only_after_terminal_attes
     );
 }
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn dream_canonical_policy_identity_is_separate_from_its_development_occurrence() {
     let home = tempfile::tempdir().unwrap();
     let (store, tree, request) = fixture(home.path(), "canonical-pipeline");

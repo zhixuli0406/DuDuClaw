@@ -600,8 +600,13 @@ mod tests {
         assert!(apply(json!({"files": {"allowed_roots": ["/"]}})).is_err());
         assert!(apply(json!({"files": {"allowed_roots": ["/srv/../etc"]}})).is_err());
         assert!(apply(json!({"files": {"allowed_roots": ["/./"]}})).is_err());
-        let (t, _) = apply(json!({"files": {"allowed_roots": ["/srv/a", "/srv/a", ""]}})).unwrap();
+        // `/srv/a` has no drive letter, so it is not absolute on Windows.
+        let abs = if cfg!(windows) { r"C:\srv\a" } else { "/srv/a" };
+        let (t, _) = apply(json!({"files": {"allowed_roots": [abs, abs, ""]}})).unwrap();
         assert_eq!(toml_at(&t, "files.allowed_roots").unwrap().as_array().unwrap().len(), 1);
+        if cfg!(windows) {
+            assert!(apply(json!({"files": {"allowed_roots": [r"C:\"]}})).is_err(), "drive root");
+        }
     }
 
     #[test]

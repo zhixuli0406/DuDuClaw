@@ -23,6 +23,13 @@
 - **`duduclaw test` 的紅隊輸出改為覆蓋帳本**：沒被輸入防護擋下的單位不再用紅色 ✗ 顯示，改標「待活體驗證」，因為那只代表確定性這層沒攔，不代表 agent 會照做。
 - **輸入防護從七類規則增加為十一類**：通道訊息、MCP 前門、對話／個人檔案／知識萃取、`user_profile_record` 等呼叫端，凡是命中任何規則就丟棄文字的路徑（萃取、個人檔案寫入、goal 意圖），現在也會丟棄上述四種句型。紅隊帳本實測（內建餐飲業範本，154 個單位）：涵蓋數從 14 升到 70，`injection`、`indirect_injection`、`memory_poisoning`、`role_provenance`、`authority_escalation` 各 14/14，`action_binding`、`direct`、`roleplay`、`authority`、`obfuscation`、`tool_arg_injection` 仍是 0/14（單一訊號只警告）；eval 案例從 140 個降為 84 個。入門案例庫四個新類別全數通過，5 個良性探針維持放行、零過度防禦；舊有的 `system_prompt_extraction` 與 `encoding_bypass` 案例（各 3 個）仍然漏掉，加入前就是如此。
 - **行為變更：驗收判官的 prompt 一律多一行系統提供的 worker 工作目錄**（`<home>/agents/<id>`），不分模式。原因：活測中判官不知道工作目錄在哪裡，把正確的結果駁回兩次，一個 goal 多跑到四輪，補上這行後一輪通過。
+- **CI：在 windows-latest 失敗的 84 個 gateway 測試已處理**：其中 3 個是產品缺陷（見下方 Fixed），70 個測的是 Discovery，它依設計只支援 Unix，在 Windows 上跳過，並以一個 Windows 測試斷言它確實以拒絕收場（fail closed），其餘是只適用 Unix 的測試夾具。Windows 的結果目前只經過交叉編譯驗證，等 CI 實際跑完才算數。
+
+### Fixed
+- **Windows：並行閘把「鎖被別人佔著」當成 I/O 錯誤**（`crates/duduclaw-core/src/concurrency_gate.rs`）：Windows 上鎖衝突回的是 `ERROR_LOCK_VIOLATION`，不是 `WouldBlock`，所以兩個重疊的租約續期可能讓操作者的租約失效。現在用和因果儲存相同的方式辨識鎖衝突。
+- **Windows：`[container.sandbox] executables` 的每個合法路徑都被拒絕**：這些項目是容器映像內的路徑（`/usr/bin/...`），之前卻套用主機的路徑規則驗證；現在一律當 POSIX 路徑驗證。Discovery 的評估器與策略容器路徑在所有主機上都用 `/` 組合。
+- **非 Unix 主機上的 Discovery 會直說原因**：回報 `discovery is unavailable on this platform…`，不再誤報成資料庫資料列損毀；行為（拒絕執行）不變。
+- **Windows：`files.allowed_roots` 驗證測試用了 Unix 路徑**：`/srv/a` 在 Windows 沒有磁碟代號，不算絕對路徑，測試因此失敗；改用各平台各自的絕對路徑，Windows 另驗 `C:\` 磁碟根目錄會被拒。程式行為不變。
 
 ### Security
 - **`duduclaw secaudit --profile deep` 的檔案路徑驗證**（已發布版本受影響）：對抗式覆核與 PoC 步驟會把模型回傳的 `file` 直接接在 repository 根目錄後面，沒有驗證，絕對路徑可以讓讀檔跑到 repository 外面。現在每個模型回傳的路徑在開檔前都先通過 `SafeRepoPath` 驗證（只允許相對路徑，拒絕 `..`、磁碟機與 UNC 前綴、反斜線、控制字元、Windows 保留名稱）。

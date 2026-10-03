@@ -517,3 +517,38 @@ fn validation_rejects_broken_trees() {
         Err(TreeError::InvalidWorld(_))
     ));
 }
+
+/// Discovery is unix-only by design: its store, private directories and
+/// integrity trees rely on uid/mode/link-count checks. Every other host must
+/// get an explicit "unavailable" answer, never an unverified store.
+#[cfg(not(unix))]
+#[test]
+fn non_unix_hosts_fail_closed_before_touching_discovery_state() {
+    let home = tempfile::tempdir().unwrap();
+    let error = super::DiscoveryStore::open(home.path())
+        .err()
+        .expect("store must refuse");
+    assert!(
+        matches!(error, super::store::StoreError::UnsupportedPlatform(_)),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("unavailable on this platform"),
+        "{error}"
+    );
+    assert!(
+        !home.path().join("discovery.db").exists(),
+        "no database is created"
+    );
+
+    assert!(super::workspace::create_private_directory(&home.path().join("discovery")).is_err());
+    assert!(!home.path().join("discovery").exists());
+
+    let tree = home.path().join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    std::fs::write(tree.join("judge"), "x").unwrap();
+    assert!(
+        super::workspace::directory_sha256(&tree).is_err(),
+        "unverifiable link counts fail closed"
+    );
+}
