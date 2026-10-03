@@ -16,7 +16,7 @@ What follows is what actually exists.
 
 ## Two paths, two configurations
 
-The most important thing to know: **the HTTP voice endpoints and the Telegram voice handler are wired separately, and the `[voice]` settings only reach one of them.**
+The most important thing to know: **the HTTP voice endpoints and the Telegram voice handler are wired separately.** Since v1.68.0 speech-to-text (`config.toml [voice] stt_*`) reaches both, plus LINE audio messages; text-to-speech (`inference.toml [voice] tts_*`) still reaches the HTTP endpoints only.
 
 ### Path 1 — the HTTP endpoints (dashboard, WebChat)
 
@@ -55,11 +55,11 @@ stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --
 
 A voice or audio message triggers `transcribe_voice`: the bot calls `getFile`, validates the returned `file_path` against traversal (`..`, absolute paths, NUL, non-allowlisted characters), downloads with a size cap checked both on `content_length` and on the actual bytes, and transcribes.
 
-**It then calls `duduclaw_inference::whisper::transcribe(bytes, Some("zh"), WhisperMode::Api)` — the provider and the language are hardcoded.** Voice replies (toggled per chat with `/voice`) construct `EdgeTtsProvider` directly, also hardcoded, with a text fallback when the audio upload fails.
+**Since v1.68.0 it calls `stt::transcribe_channel_audio`, which uses the dashboard's speech-to-text settings (`config.toml [voice] stt_*`, the same provider `/api/stt` uses).** Only when no STT provider is configured does it fall back to OpenAI Whisper with the environment variable `OPENAI_API_KEY`; a configured provider that fails is an error, with no fallback. The language is still fixed to `zh`. LINE audio messages take the same path. Before v1.68.0 both channels always used the environment-key Whisper path. Voice replies (toggled per chat with `/voice`) construct `EdgeTtsProvider` directly, also hardcoded, with a text fallback when the audio upload fails.
 
 So `inference.toml [voice] tts_provider` / `tts_voice`, which the dashboard's Voice tab writes, reach `POST /api/tts` only and **do not currently affect the Telegram path**. Changing them in the UI changes nothing for a Telegram voice message. This is a known gap, stated here rather than left for an operator to discover.
 
-Since v1.67.1 the Voice tab no longer shows 語音回覆模式 (voice reply mode), 語音辨識 (speech recognition provider) or 語言 (language). They wrote `voice_reply_enabled`, `asr_provider` and `asr_language`, which nothing in the gateway reads. Values already in `inference.toml` stay there untouched; the tab no longer sends those keys. Speech-to-text for `/api/stt` is configured in the tab's advanced card (`config.toml [voice] stt_*`).
+Since v1.67.1 the Voice tab no longer shows 語音回覆模式 (voice reply mode), 語音辨識 (speech recognition provider) or 語言 (language). They wrote `voice_reply_enabled`, `asr_provider` and `asr_language`, which nothing in the gateway reads. Values already in `inference.toml` stay there untouched; the tab no longer sends those keys, and since v1.68.0 the fields are gone from the configuration struct and `system.update_config` ignores them. Speech-to-text for `/api/stt` is configured in the tab's advanced card (`config.toml [voice] stt_*`).
 
 ---
 
@@ -92,4 +92,4 @@ The `onnx` feature of `duduclaw-inference` enables `OnnxEmbeddingProvider` (ONNX
 
 ## The takeaway
 
-Voice works in two places, and the honest version says so: a fail-closed HTTP pair that the dashboard configures, and a Telegram handler with its provider hardcoded. Naming the second one is more useful than a diagram of a VAD that was never written.
+Voice works in two places, and the honest version says so: a fail-closed HTTP pair that the dashboard configures, and a Telegram handler whose voice replies still use a hardcoded provider (its transcription follows the dashboard since v1.68.0). Naming the second one is more useful than a diagram of a VAD that was never written.

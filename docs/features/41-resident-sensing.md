@@ -178,8 +178,9 @@ Two rules make this safe to turn on:
 
 `conservative` is the one to pick if the screener's fail-open default worried
 you: when the local model cannot answer, the action is suppressed instead of
-dispatched. The dashboard's 即時監控來源 card shows which preset is active
-(read-only — `config.toml` owns the setting).
+dispatched. The dashboard's 即時監控來源 card shows which preset is active.
+Since v1.68.0 the preset is set under Settings → Advanced → Automation →
+Live data feeds (`[tick] preset`).
 
 ### Six things to know about the websocket source
 
@@ -497,8 +498,23 @@ sources" (auto-refreshing every 15 seconds), backed by two admin-only RPCs:
   required, `limit` capped at 50), ordered oldest to newest; expanding the card
   shows each record's timestamp and field contents.
 
-The card itself is read-only — adding or enabling a source is an edit to
-`config.toml`, not a button on the dashboard.
+The monitoring card itself only reads. Since v1.68.0 the settings and the
+sources are edited on Settings → Advanced → Automation → Live data feeds:
+
+- `[tick] enabled`, `preset`, `allow_command_sources` and `dns_ttl_secs` go
+  through `system.update_config`. A change to `allow_command_sources` is also
+  audited as `config_protected_key_changed`.
+- The Feeds list adds, edits and removes `[[tick.sources]]` entries through
+  three admin-only RPCs, `tick.sources.list` / `upsert` / `remove` (id, kind,
+  URL / command / path, interval, JSON fields, headers, rate cap, baseline
+  shelf life, websocket subscribe frames). Header values are never returned,
+  only `headers_count`; writing a `command` source is audited as
+  `config_protected_key_changed` with key `tick.sources.command`.
+- After a save the gateway restarts the sources in place when its live-feed
+  runtime is loaded (`hot_reloaded: true`); otherwise the response says
+  `restart_required: true` and the dashboard shows the restart banner.
+- A `config.toml` that does not parse is never rewritten; fix it in the
+  Advanced config editor first.
 
 ---
 

@@ -85,9 +85,15 @@ The in-process backends this page used to list were removed on 2026-09-29 (`wiki
 Writes are checked as of v1.67.1:
 
 - `inference.update` (the dashboard inference page) accepts `backend = "openai_compat"` or an empty value, which removes the key so the engine picks `openai_compat` itself. Any other value is refused before anything is written, with a message naming `openai_compat`. One exception keeps old files saveable: a removed value that is already the stored one may be sent back unchanged, so the page can still save other settings until you change it. The page shows such a value labelled as no longer supported.
-- `agents.update` refuses any `[model.local] backend` other than `openai_compat` (this check predates v1.67.1).
+- `agents.update` refuses any `[model.local] backend` other than `openai_compat` (this check predates v1.67.1). Since v1.68.0 the agent edit page no longer sends `[model.local] backend` / `context_length` / `gpu_layers` at all.
 - The scaffold default for `[model.local] backend`, `duduclaw onboard`, `duduclaw wizard` and the shipped agent templates now write `openai_compat` (they wrote `llama_cpp` before).
 - The dashboard no longer shows fields nothing reads: 記憶體上限 (`max_memory_mb`), and the generation rows GPU Layers / Context 大小 (`[generation] gpu_layers` / `context_size`) on the inference page; Context 長度 / GPU Layers (`[model.local] context_length` / `gpu_layers`) on the agent edit page. The external server owns memory, GPU offload and context size. Saved values stay in the files untouched.
+
+Since v1.68.0:
+
+- A successful `inference.update` resets the gateway's cached inference engine, so the next channel reply and dispatch use the new settings (before, the ~20 inference settings were ignored until a restart). The page says the engine has reloaded.
+- The inference page edits `[llamafile]` with typed fields (`enabled`, `dir`, `default_file`, `host`, `port`, `gpu_layers`, `context_size`, `extra_args`) and, under Confidence Router → Advanced, `[router] local_tools` and the UCCI keys (`ucci_fast_router`, `ucci_strong_router`, `ucci_observations`, `ucci_shadow_strong`, `ucci_shadow_max_inflight` 1 to 16, `ucci_drop_stop_token`) plus `[generation] capture_logprobs` / `capture_top_logprobs`. Clearing a llamafile field on the page does not remove the stored value; use the Advanced config editor.
+- `max_memory_mb`, `[generation] gpu_layers` / `context_size` and `[embedding]` are no longer part of the configuration struct; `inference.update` ignores them.
 
 ### The InferenceManager state machine
 

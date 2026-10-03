@@ -308,6 +308,17 @@ paths:
     post:
       tags: [agents]
       summary: Update agent configuration fields
+      description: >
+        Partial: only keys present are written. Changing an org-guarded key
+        ([agent] reports_to/department/name, any [capabilities] key,
+        [container] sandbox_enabled/network_access, [permissions]
+        can_modify_own_soul) requires an admin and writes an
+        `agent_authority_changed` security audit row. The resulting file must
+        load as AgentConfig. v1.68 adds budget.daily_cap_cents, model.effort,
+        fork.enabled, team.*, guardrails.*, memory.*, night_engine.enabled,
+        runtime.minimal_context, capabilities.{approval_required_tools,
+        irreversible_tools, maybe_irreversible_tools, scoped_tools} and the
+        typed `advanced_kv` rows.
       requestBody:
         content:
           application/json:
@@ -1275,18 +1286,39 @@ paths:
   /rpc/system.update_config:
     post:
       tags: [system]
-      summary: Update system configuration (log_level, rotation, etc.)
+      summary: Update config.toml keys (admin)
+      description: >
+        Partial update: only keys present are written. Parameters are named
+        after their TOML path and may be sent nested
+        (`{"takeover": {"enabled": true}}`) or flat (`{"takeover.enabled": true}`).
+        A wrong type or out-of-range value rejects the whole update and
+        nothing is written. v1.68 keys: takeover.*, mail.*, webchat.*
+        (widget_key is never echoed), tick.*, files.allowed_roots (absolute
+        paths), night.llm_enabled, dispatch.{policy (adds role_team),
+        judge_provider, judge_model}, acp.trusted (audited as
+        config_protected_key_changed), telemetry.otlp_endpoint,
+        container.sandbox.* (validated as a whole section), computer_use.image,
+        memory.supersession_trust_guard, team.{enabled, gate,
+        roles.<planner|executor|verifier|utility|synthesizer>.{runtime,model,effort}},
+        integrations.github, redaction.purge_after_expire_days,
+        secret_manager.{onepassword_*, infisical_*}. Removed: voice.asr_provider,
+        voice.asr_language, voice.voice_reply_enabled.
       requestBody:
         content:
           application/json:
             schema:
               type: object
+              additionalProperties: true
               properties:
                 log_level:
                   type: string
                   enum: [trace, debug, info, warn, error]
                 rotation_strategy:
                   type: string
+                  enum: [priority, round_robin, least_cost, failover]
+                log_format:
+                  type: string
+                  enum: [pretty, json]
       responses:
         "200":
           description: Config updated
@@ -1301,6 +1333,136 @@ paths:
                     type: array
                     items:
                       type: string
+                  applied:
+                    type: boolean
+                  hot_reloaded:
+                    type: array
+                    items:
+                      type: string
+                  restart_required:
+                    type: array
+                    description: TOML keys (or a whole section such as `tick`) that take effect only after a gateway restart.
+                    items:
+                      type: string
+
+  /rpc/config.raw.get:
+    post:
+      tags: [system]
+      summary: Read a config file as TOML text with secrets masked (admin)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  description: "`config`, `inference` or `agent:<id>`"
+      responses:
+        "200":
+          description: Masked file
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  file: { type: string }
+                  exists: { type: boolean }
+                  content: { type: string, description: "Secret values replaced by «set»; [mcp_keys] omitted" }
+                  masked: { type: array, items: { type: string } }
+                  hidden_sections: { type: array, items: { type: string } }
+                  hash: { type: string, description: "Send back as base_hash" }
+
+  /rpc/config.raw.set:
+    post:
+      tags: [system]
+      summary: Validate and write a config file (admin; backup + audit)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [file, content]
+              properties:
+                file: { type: string }
+                content: { type: string, description: "«set» keeps the stored value" }
+                base_hash: { type: string }
+      responses:
+        "200":
+          description: Written
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  changed_sections: { type: array, items: { type: string } }
+                  protected_changed: { type: boolean }
+                  backup: { type: string, nullable: true }
+                  hot_reloaded: { type: array, items: { type: string } }
+                  restart_required: { type: array, items: { type: string } }
+
+  /rpc/tick.sources.list:
+    post:
+      tags: [system]
+      summary: List [[tick.sources]] with validation state (admin; header values never returned)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Sources
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /rpc/tick.sources.upsert:
+    post:
+      tags: [system]
+      summary: Add or update one tick source by id (admin)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              additionalProperties: true
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  changes: { type: array, items: { type: string } }
+                  hot_reloaded: { type: boolean }
+                  restart_required: { type: boolean }
+
+  /rpc/tick.sources.remove:
+    post:
+      tags: [system]
+      summary: Remove one tick source by id (admin)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+      responses:
+        "200":
+          description: Removed
+          content:
+            application/json:
+              schema:
+                type: object
 
   /rpc/system.version:
     post:

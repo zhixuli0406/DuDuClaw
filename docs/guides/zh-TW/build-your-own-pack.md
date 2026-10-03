@@ -43,7 +43,7 @@ display_name = "小幫手"
 
 ### 或者直接寫新的 `pack.toml`
 
-上面的 `expert.toml` 是舊格式，支援到 **v1.68.0**。新包可以改宣告 `pack.toml`——團隊包、單人產業板模、職務組合共用的同一份 schema：
+上面的 `expert.toml` 是舊格式，支援到 **v1.69.0**。新包可以改宣告 `pack.toml`——團隊包、單人產業板模、職務組合共用的同一份 schema：
 
 ```toml
 [pack]

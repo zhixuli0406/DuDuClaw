@@ -173,8 +173,8 @@ preset = "conservative"   # または "aggressive"。キー自体を省くと従
 
 スクリーニング層のfail-open既定が気になっていたなら `conservative` を選んでください。
 ローカルモデルが答えられないとき、アクションは送り出されずに抑制されます。
-ダッシュボードの「即時監控來源」カードには現在有効なpresetが表示されます
-（読み取り専用。設定の持ち主は `config.toml` です）。
+ダッシュボードの「即時監控來源」カードには現在有効なpresetが表示されます。
+v1.68.0 から、システム設定 → 詳細設定 → 自動化エンジン → 常駐センシングで設定できます（`[tick] preset`）。
 
 ### websocketソースについて知っておくべき6つのこと
 
@@ -470,8 +470,22 @@ v1.67.1 から、このルールの条件部分はダッシュボードで作成
   上限50件）。時系列の古い順に並び、カードを展開すると各件のタイムスタンプと
   フィールド内容が見られます。
 
-カード自体は読み取り専用です——ソースの追加や有効化は`config.toml`を編集する操作で
-あり、ダッシュボード上で押せるボタンではありません。
+監視カード自体は表示だけを行います。v1.68.0 から、設定とソースはシステム設定 →
+詳細設定 → 自動化エンジン → 常駐センシングで編集します。
+
+- `[tick] enabled`、`preset`、`allow_command_sources`、`dns_ttl_secs` は
+  `system.update_config` で書き込みます。`allow_command_sources` の変更は
+  `config_protected_key_changed` としても監査されます。
+- データソース一覧は管理者専用の RPC `tick.sources.list` / `upsert` / `remove` で
+  `[[tick.sources]]` を追加・編集・削除します（id、種類、URL／コマンド／パス、
+  間隔、JSON フィールド、ヘッダー、レート上限、基準値の有効期間、websocket の購読
+  フレーム）。ヘッダーの値は返さず `headers_count` だけを返します。`command` 型
+  ソースの書き込みはキー `tick.sources.command` の `config_protected_key_changed`
+  として監査されます。
+- 保存後、gateway に常駐センシングが読み込まれていればその場でソースを再起動します
+  （`hot_reloaded: true`）。そうでなければ応答は `restart_required: true` となり、
+  ダッシュボードに再起動の案内が出ます。
+- 解析できない `config.toml` は書き換えません。先に設定ファイルの詳細編集で直してください。
 
 ---
 

@@ -11,7 +11,7 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 - **跨 runtime failover 的模型替換**（`failover.rs`）：當 `[runtime] fallback` 把呼叫轉到*不同*的 provider 時，備援 runtime 不再沿用主要 runtime 的模型 id（過去 codex Agent 的 `gpt-5.4` 會被拿去丟給 Claude runtime）。模型依四個有序分支解析：① `agent.toml [model] fallbacks` 中第一個明確屬於備援 runtime 模型家族的項目（帶 `provider/model` 前綴的會去掉前綴）；② 若該 runtime 本來就能服務所要求的模型，則保留原模型（`openai_compat` 不宣告模型家族，靠這條分支繼續代理任意 id）；③ runtime catalog 為該後端列出的第一個模型；④ 以上皆無則**拒絕 spawn**，回報 `no model configured for fallback runtime <P>`，並記為一次失敗的嘗試。每次替換都會輸出 `warn!`，帶有 `agent` / `from_runtime` / `to_runtime` / `from_model` / `to_model`。
 - **MCP Server（stdio）**（`duduclaw mcp-server`）透過 stdin/stdout 上的 JSON-RPC 2.0，把通道、記憶、Agent、skill、task、共用 wiki、autopilot 等工具暴露給 AI Runtime。註冊層級在 Agent 端的 `<agent>/.mcp.json`（v1.8.5 撤回了 v1.8.4 的全域註冊，因為 Claude CLI `-p --dangerously-skip-permissions` 只會讀取專案層級的 `.mcp.json`）。Gateway 啟動時會自動為所有 Agent 建立／修復 `.mcp.json`。
 - **MCP Server（HTTP/SSE）**（`duduclaw http-server --bind 127.0.0.1:8765`，v1.9.4）— Bearer 驗證的 `POST /mcp/v1/call`（單次 JSON-RPC 工具呼叫）、`GET /mcp/v1/stream`（長駐 SSE 事件串流，Bearer 或 `?api_key=`）、`POST /mcp/v1/stream/call`（非同步 + SSE 結果推送）、`GET /healthz`（免驗證）。Token bucket 速率限制（60 req/min）。`mcp_sse_store.rs` 用 broadcast channel 管理 SSE 連線。與 stdio 互補，服務外部 HTTP client。
-- **ACP 與 A2A**— `duduclaw acp`（等同 `duduclaw acp client`）透過 stdio 實作 Agent Client Protocol v1，服務 Zed / JetBrains / Neovim 的 agent 面板。`duduclaw acp server`（舊名 `acp-server`，v1.68.0 前仍可解析）提供 A2A：`message/send` 會附加到 `bus_queue.jsonl`，`tasks/get` 把 bus 的觀察結果對應回 A2A 狀態，Agent Card 位於 `/.well-known/agent-card.json`（舊路徑 `/agent.json` 為別名）。
+- **ACP 與 A2A**— `duduclaw acp`（等同 `duduclaw acp client`）透過 stdio 實作 Agent Client Protocol v1，服務 Zed / JetBrains / Neovim 的 agent 面板。`duduclaw acp server`（舊名 `acp-server`，v1.69.0 前仍可解析）提供 A2A：`message/send` 會附加到 `bus_queue.jsonl`，`tasks/get` 把 bus 的觀察結果對應回 A2A 狀態，Agent Card 位於 `/.well-known/agent-card.json`（舊路徑 `/agent.json` 為別名）。
 - **Agent 目錄**與 Claude Code 相容：每個目錄都包含 `.claude/`、`.mcp.json`、`SOUL.md`、`CLAUDE.md`、`CONTRACT.toml`、`agent.toml`、`wiki/`、`SKILLS/`、`memory/`、`tasks/`、`state/`。
 
 ### 通道（11 個）
@@ -112,7 +112,7 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 
 ### 排程
 - **HeartbeatScheduler**：逐 Agent 統一排程，涵蓋 bus 輪詢 + GVU 靜默斷路器 + cron，以 `max_concurrent_runs` semaphore 限流。
-- **CronScheduler**：讀取 `cron_tasks.jsonl`（v1.8.12 起加上 `cron_tasks.db`），依 cron 表達式觸發任務。`list_cron_tasks` 會回傳所有任務（v1.8.3 起不再依 default_agent 篩選）。排程以 `tasks_create` + `schedule` 建立；較舊的 `schedule_task` MCP 工具是已棄用的別名，於 v1.68.0 移除。
+- **CronScheduler**：讀取 `cron_tasks.jsonl`（v1.8.12 起加上 `cron_tasks.db`），依 cron 表達式觸發任務。`list_cron_tasks` 會回傳所有任務（v1.8.3 起不再依 default_agent 篩選）。排程以 `tasks_create` + `schedule` 建立；較舊的 `schedule_task` MCP 工具是已棄用的別名，於 v1.69.0 移除。
 - **ReminderScheduler**：一次性提醒（相對時間 `5m`/`2h`/`1d` 或 ISO 8601），可用 `direct` 靜態訊息或 `agent_callback` 喚醒模式。
 
 ### Skill 生態系
@@ -123,7 +123,7 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 
 ### 任務與知識
 - **Task Board**：以 SQLite 管理任務，追蹤狀態／優先順序／指派，並提供即時 Activity Feed WebSocket。儀表板 RPC：`tasks.list/create/update/remove/assign`、`activity.list`；agent MCP 工具：`tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post`。
-- **共用知識庫**：`~/.duduclaw/shared/wiki/`，具備 Wiki 目標分類（agent/shared/both）。MCP 工具：`wiki_ls/read/write/search/stats/lint` 搭配 `scope="shared"`（`shared_wiki_*` 寫法是已棄用的別名，於 v1.68.0 移除），另有 `shared_wiki_delete` 與 `wiki_share`。
+- **共用知識庫**：`~/.duduclaw/shared/wiki/`，具備 Wiki 目標分類（agent/shared/both）。MCP 工具：`wiki_ls/read/write/search/stats/lint` 搭配 `scope="shared"`（`shared_wiki_*` 寫法是已棄用的別名，於 v1.69.0 移除），另有 `shared_wiki_delete` 與 `wiki_share`。
 - **Autopilot 規則引擎**：自動化委派／通知／skill 執行。新規則可用的觸發事件（12 種）：`task_created`、`task_updated`、`task_status_changed`、`activity_new`、`channel_message`、`agent_idle`、`run_at_risk`、`os_file`、`os_frontmost`、`tick`、`security_event`、`odoo_event`；`cron_tick` 從不送出，v1.67.1 起建立時拒絕（[23-autopilot-engine](../../features/zh-TW/23-autopilot-engine.md)）。
 
 ### 整合

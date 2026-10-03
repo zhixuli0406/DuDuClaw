@@ -51,7 +51,7 @@ MCP bridge         ─┘                                   1. 事件相符？  
 | **RunAtRisk** | `run_at_risk` | 預測判斷執行中的任務正走向失敗 | `agent_id`、`session_id`、`score`、`level`、`reasons` |
 | **OsFileEvent** | `os_file` | agent 的 `[os_watch]` 監看到檔案變動 | `agent_id`、`path`、`kind`（created / modified / removed / renamed）、`file_name`、`extension` |
 | **OsFrontmostEvent** | `os_frontmost` | 前景 App 或視窗標題改變 | `agent_id`、`app`、`window_title`、`prev_app` |
-| **Tick** | `tick` | 常駐感知來源（`[[tick.sources]]`）產生一筆觀測 | `source`、`ts`、擷取欄位及其 `prev_` / `delta_` / `pct_` 衍生欄位 |
+| **Tick** | `tick` | 常駐感知來源（`[[tick.sources]]`，v1.68.0 起可在系統設定 → 進階設定 → 自動化引擎 →「常駐感知」編輯）產生一筆觀測 | `source`、`ts`、擷取欄位及其 `prev_` / `delta_` / `pct_` 衍生欄位 |
 | **SecurityEvent** | `security_event` | warning 或 critical 等級的稽核事件，或安全態勢改變 | `severity`、`event_type`、`agent_id`、`source` |
 | **OdooEvent** | `odoo_event` | Odoo 輪詢或 `POST /webhook/odoo` 回報 ERP 變更 | `event_type`、`model`、`record_id`、`record`（其頂層純量欄位也會攤平） |
 

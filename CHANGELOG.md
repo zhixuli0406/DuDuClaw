@@ -2,6 +2,59 @@
 
 ## [Unreleased]
 
+### Added
+- **儀表板補上之前只能手改設定檔的開關**。完整對照（頁面、設定鍵、是否需要重啟）見 `docs/guides/dashboard-settings.md`（三語）。系統設定 → 進階設定 → 自動化引擎：派工策略 `role_team`、驗收判官的執行環境與模型（`[dispatch] judge_provider`／`judge_model`）、夜間整理模型階段（`[night] llm_enabled`），以及真人接手（`[takeover]`）、AI 員工信箱（`[mail]`）、一員工四角色全域預設（`[team]`）、常駐感知（`[tick]`）四張卡片。系統分頁：任務沙箱（`[container.sandbox]` 全部欄位，整段驗證）、電腦操作映像（`[computer_use] image`）、記憶可信度守門、OpenTelemetry 送往位址（只在含 `otel` 的版本顯示，`system.status` 新增 `otel_compiled`）、GitHub 工具開關（可關）、信任外部 A2A 請求（`[acp] trusted`，只限管理員）、地端檔案根目錄（`[files] allowed_roots`）、日誌格式、1Password／Infisical 密鑰後端欄位。通道管理：網站聊天元件（`[webchat] public_widget`／`widget_key`）。本地推理：llamafile 欄位、信心路由進階（`local_tools`、`ucci_*`）、`capture_logprobs`／`capture_top_logprobs`。AI 員工編輯頁：每日花費上限、四份需要把關的工具清單、平行分支、出站內容防護、推理力度、七個新執行環境（qwen、kimi、copilot、kiro、cursor、vibe、opencode）、員工層級的一員工四角色、精簡啟動內容、決策延續、夜間整理，以及帶型別的進階鍵值編輯器。
+- **常駐感知資料來源可以在儀表板新增、編輯、刪除**：新 RPC `tick.sources.list`／`upsert`／`remove`（管理員）。存檔後 gateway 已載入常駐感知時會立即重新啟動資料來源，否則回報需要重啟。`headers` 的值不回傳，只回傳數量。
+- **設定檔進階編輯**（系統設定 → 進階設定，只限管理員，RPC `config.raw.get`／`config.raw.set`）：直接編輯 `config.toml`、`inference.toml` 與各員工的 `agent.toml`。密鑰類的值顯示為 `«set»`，原樣保留就保留原值；先檢查 TOML 語法（錯誤指出行與欄）再用對應型別驗證，失敗不寫入；寫入前備份 `<檔名>.bak-<時間>`（保留 5 份）；以開啟時的雜湊值偵測同時修改；每次寫入記稽核 `config_raw_edited`；回傳需要重啟的部分。
+- **需要重啟的設定會說清楚**：`system.update_config` 回傳新的 `restart_required` 清單，系統設定頁與通道管理頁顯示提示，gateway 重啟後自動消失。
+- **`duduclaw memory migrate-namespace`**（隱藏指令，只限操作者終端機）：`list`、`export`、`assign`、`archive`，用來處理 v1.68.0 以前留在共用記憶池的資料，見 Changed 的記憶命名空間一項。
+
+### Changed
+- **行為變更：MCP 記憶工具改用員工自己的命名空間**。gateway 啟動的員工以內部金鑰呼叫記憶工具（`memory_*`、`user_profile_record`／`user_profile_get`、`user_code_profile`）時，若 `DUDUCLAW_AGENT_ID` 通過 `DUDUCLAW_AGENT_TOKEN` 驗證（`identity.key` 存在時 gateway 會寫進 `.mcp.json`），就讀寫該員工 id 的命名空間，也就是 gateway 萃取、核准審核、注入提示所用的那一個。身分無法驗證時維持舊的共用池 `internal/gateway-internal`；HTTP 傳輸一律不沿用行程環境的身分；client id 是現有員工的個別金鑰對應到該員工。v1.68.0 以前寫進共用池的資料不會自動搬移，升級後員工透過工具看不到它們，由操作者用 `duduclaw memory migrate-namespace` 搬：`list` 依 `tool_calls.jsonl` 列出每筆的作者，`export --out` 匯出（0600），`assign --to <員工> --all|--ids|--attributed [--include-inferred] [--refused hold|skip] [--include-flagged]` 搬移（看起來像提示注入的資料預設不搬，要加 `--include-flagged`；不加 `--confirm` 只是預演；被目標中更可信的事實擋下的預設轉為待審並建立收件匣項目），`archive --confirm` 讓剩下的失效並加標籤 `namespace-archived`；實際執行記稽核 `memory_namespace_migrated`；在 AI 員工的工作階段中拒絕執行。說明見 `docs/features/20-memory-intelligence.md`。
+- **行為變更：`[permissions]` 四個旗標開始生效**。`can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 寫成 `false` 時，MCP 分派閘會拒絕對應工具（`create_agent`；`send_to_agent`／`spawn_agent`；`schedule_task`／`create_reminder`／帶 `schedule` 的 `tasks_create`；`skill_hub_install`／`shared_skill_adopt`／`skill_graduate`／`skill_pin`／`skill_from_recording`），回 -32003 並記 `permission_denied`。沒寫或型別錯誤時放行，`agent.toml` 存在但讀不到或無法解析時拒絕，外部金鑰不受影響。因為以前的範本常寫 `false`，升級後第一次開機會對每位員工遷移一次：`[permissions]` 裡沒有 `permissions_enforced_since` 的檔案，四個旗標的 `false` 一律改成 `true` 並加上 `permissions_enforced_since = "1.68.0"`（稽核 `permission_flags_reset`）。臨時角色成員（`agents/.ephemeral/`）不遷移，它們範本裡的 `false` 從此真的生效。新建員工與內建範本改寫 `true`。
+- **行為變更：Odoo 的 `features_*` 開關開始生效**。`odoo_search`／`odoo_execute`／`odoo_schema_fields` 與各模組工具在模組關閉時拒絕呼叫（模型前綴對應：`crm`、`sale`、`stock`／`product`、`account`、`project`、`hr`；`res.partner` 等其他模型不受限）。預設 crm、sale、inventory、accounting 開，**project 與 hr 關**，所以沒寫 `features_project`／`features_hr` 的既有安裝不能再查 `project.*`／`hr.*`。工具仍出現在 `tools/list`。`[odoo] protocol = "xmlrpc"` 存檔時會被拒絕，只支援 JSON-RPC。
+- **行為變更：Discord「指定 AI 員工」（`agent_override`）的全域設定開始生效**，伺服器層級的值優先，沒有時用全域值，私訊也套用；個別員工綁定的 bot 仍然優先。
+- **行為變更：`agents.update` 只寫收到的欄位**。之前編輯頁每次存檔都會把 `[heartbeat] cron` 清空（`agents.inspect` 沒回傳它），一些分段也會用預設值蓋掉已存的設定。`agents.inspect` 現在回傳 `heartbeat.cron`。
+- **行為變更：權限類欄位只限管理員**。`agents.update` 改動 `[agent] reports_to`／`department`／`name`、整個 `[capabilities]`、`sandbox_enabled`、`network_access`、`can_modify_own_soul` 時，非管理員會被拒絕，成功的改動記稽核 `agent_authority_changed`，被拒絕的嘗試記 `agent_authority_refused`；`org.toml` 只在 `reports_to` 或 `department` 真的變了才更新。
+- **進階鍵值編輯器改為帶型別**（`{section, key, value, type}`），寫入前用完整的 `AgentConfig` 解析，失敗整筆拒絕。之前所有值都存成字串，可能讓員工因解析失敗從清單消失。不能編輯 `agent`、`capabilities`、`container`、`permissions`、`channels`、`odoo`、`mcp`、`runtime` 區段。
+- **設定改動不必重啟**：`inference.update` 存檔後重設推理引擎；輪替策略與限流冷卻存檔後清掉輪替快取（之前最多延遲 30 分鐘）；日誌等級透過 reload handle 立即套用（`RUST_LOG` 已設時除外）；WhatsApp、飛書、Google Chat、Teams、企業微信、釘釘的六條 webhook 路由一律掛著，通道設定好之前回 404，設定好之後驗證平台簽章（簽章錯誤回 401）；`channels.add` 不必重啟就啟動通道（之前要重啟，平台送來的請求得到 404），`channels.add` 回 `restart_required: false` 與 `not_started_reason`；個別員工的 Slack bot 新增後立即啟動。
+- **`system.update_config` 與 `tick.sources.*`、`config.raw.set` 寫入前檢查檔案**：`config.toml` 無法解析時拒絕寫入（之前會當成空表，存檔後只剩這次送的鍵）；寫入時鎖檔並比對讀取時的雜湊，期間被其他寫入者改過就拒絕。其他設定 RPC 仍沿用舊的讀取方式。
+- **行為變更：安裝需要環境變數的 MCP 卡片時要一併填入值**。`marketplace.install` 多了 `env` 參數（`{ "變數名": "值" }`），卡片 `required_env` 列出的每個變數都要有非空的值；缺少、空字串或寫成 `${NAME}` 參照都會被拒絕，訊息列出缺少的變數名稱（不含任何值）。不在 `required_env` 裡的變數名稱也會被拒絕。`mcp.update` 以卡片 id 安裝同一張卡片時套用同樣的檢查，值放在 `server_def.env`。值以字面字串寫進該 AI 員工的 `.mcp.json`（檔案權限 0600，與 `claude mcp add -e` 的存法相同），不寫進記錄。目錄裡的 `default_def.env` 改成空字串佔位。
+- **`mcp.list` 不再回傳環境變數的值**：每個 server 的 `env` 改成 `{ "變數名": "set" | "not_set" | "reference" }`（`reference` 代表 `${NAME}` 參照），目錄卡片的 `default_def.env` 也一樣。之前會原樣回傳，包括 AI 員工 `.mcp.json` 裡的金鑰。
+
+### Deprecated
+- **v1.66.0 棄用項目的移除時程順延一個 minor，由 v1.68.0 改為 v1.69.0**：`shared_wiki_*`、`schedule_task`、`skill_bank_search`、舊 CLI 寫法、三種舊包格式與 `expert install`／`expert list`、`[dispatch] judge` 的 `evaluator_only`／`human_only` 都延到 v1.69.0 才移除，與 Gemini CLI runtime 同版；目的是讓 v1.68.0 維持純功能版本。本版不移除任何東西，各舊名稱照常可用，對照表見 `docs/guides/deprecations.md`。
+
+### Removed
+- **存檔後沒有作用的儀表板欄位**（已存的值留在檔案裡，不再被讀取）：語音的 `asr_provider`／`asr_language`／`voice_reply_enabled`；推理的 `max_memory_mb`、`[generation] gpu_layers`／`context_size`（llamafile 改用 `[llamafile]` 的同名欄位）、`[embedding]`；員工的 `[model.local] backend`／`context_length`／`gpu_layers`、貼圖卡片、停滯偵測卡片、`skill_security_scan`／`skill_auto_activate`、容器 `cmd`／`env`／掛載／`readonly_project`／`max_concurrent`、`token_budget_per_check`、`check_interval`；員工層級的 LINE／WhatsApp／飛書／企業微信／釘釘憑證（這五個通道只讀 `config.toml [channels]`；Discord、Telegram、Slack 的員工 bot 不變）；去識別化「資料來源保護」的 `sub_agent`；Odoo 頁的通訊協定選單；KILLSWITCH 的 `[audit]` 區段。進階鍵值編輯器拒絕寫入 `[sticker]`、`[ptc]`、`[cultural_context]`。
+- **沒有讀取端的設定解析**：`config.toml [secaudit]`（`secaudit_config.rs`）、員工 `[memory]` 的 MemGPT 殘留鍵（`enabled`、`core_tokens`、`recall_tokens`、`archival_tokens`、`recall_auto_inject`、`archival_auto_retrieve`）、`[task_forward_model] cold_start_llm`／`min_samples`／`mature_n`。舊檔案照常載入，這些鍵被忽略。
+- **新建的員工（儀表板、MCP 與 CLI 建立路徑）不再寫入 `micro_reflection`／`meso_reflection`／`macro_reflection`**：沒有程式讀取這三個鍵；既有員工檔案裡的值保持原樣。
+- **永遠失敗的瀏覽器審批視窗**（`ApprovalModal.tsx`）：它呼叫的 `browser.respond_approval` 在 gateway 沒有處理函式。審批一律走收件匣。
+
+### Fixed
+- **Browserbase 卡片裝好後拿不到金鑰**：卡片寫進 `.mcp.json` 的是 `${BROWSERBASE_API_KEY}` 這類參照。Claude CLI 從自己的環境展開參照，而 gateway 啟動 AI 員工的 CLI 時只保留白名單環境變數（`*_API_KEY` 一律不帶），參照展開成空字串，server 沒有金鑰就啟動。現在安裝時填入的值會直接寫進 `.mcp.json`（見 Changed）。
+- **`duduclaw doctor` 在 Docker 半掛時仍說「Docker daemon is reachable」**：之前只看 `/_ping`。2026-10-03 的 Docker Desktop 回應了 ping，`/info` 與 `docker ps` 卻回 EOF，同一次 doctor 的任務沙箱與電腦操作兩列則說無法連線。現在 doctor 的 Docker 列、`duduclaw status`、任務沙箱、電腦操作（doctor 與開始工作階段）都用同一個檢查：`docker info` 要回伺服器版本、`docker ps` 要成功，各 5 秒逾時，結果共用 5 秒；EOF、空回應、逾時都算無法使用。腳本沙箱（PTC `execute_program`、`secaudit` PoC）用 Docker API 走同一套判定（`info` ＋ 列容器）。電腦操作在 Docker 半掛時改回報「Docker 沒有回應」，之前會誤報 image 不在本機、叫人 `docker pull`。儀表板「診斷」頁的容器執行環境列仍用舊的 `docker info` 檢查，可能與 CLI 結果不同。
+- **Windows：live fork 結果發佈前的復原備份一律失敗**：`fork_recovery` 備份分支檔案後會逐檔 flush，Windows 上用唯讀 handle 呼叫 `FlushFileBuffers` 會被拒絕，發佈因此在寫入上層工作區之前中止。改用可寫 handle flush（帶唯讀屬性的備份檔暫時取消屬性、flush 後還原）。這是 v1.67.0 已知問題裡四個只在 Windows CI 失敗的 `mcp_fork_exec` 測試的原因；修正是否完整要等 Windows CI 跑過才知道。
+- **存了沒作用的儀表板欄位，現在接上讀取端**：
+  - 安全設定的緊急停止門檻（`KILLSWITCH.toml [triggers]`）：只有檔案裡寫了、且在範圍內的鍵才生效，儀表板每個門檻多了啟用勾選，送 `null` 會取消該門檻；檔案修改時間變了就重讀。`cost_limit_usd` 比對 24 小時全域花費，達到時把全域降到 L2，之後要等 failsafe 自動恢復或有人 `!RESUME` 才解除；`max_replies_per_minute` 依對話計算，超出的訊息靜默丟棄；`max_consecutive_errors` 與 `error_rate_threshold`（最近 20 次、至少 10 次）讓該對話的 failsafe 升一級。`killswitch.get` 回傳 `triggers_enforced`。
+  - 去識別化的資料來源保護：`user_input`（送進 AI 前）、`system_prompt`（組好的提示，預設只套用標了 `apply_to_system_prompt` 的規則）、`cron_context`（條件腳本的觸發訊息）。出錯時停止這一輪。`purge_after_expire_days` 接上保管庫清理（之前固定 30 天）。
+  - Telegram、LINE 語音訊息改用儀表板的語音轉文字設定（`[voice] stt_*`），沒設定時才退回 `OPENAI_API_KEY` 的 Whisper；已設定但失敗時不退回。
+  - Discord `thread_archive_minutes`（60、1440、4320、10080，其他值當 1440）。
+  - 飛書、釘釘的 `mention_only` 與 `allowed_channels`（私訊不過濾）。WhatsApp 與企業微信沒有這兩項，儀表板也不再顯示。
+  - 帳號 `tags`，`account_pool` 也能用標籤比對（完全相同、不分大小寫）。
+  - 品牌副標題顯示在登入頁與安全設定頁。
+  - `[identity.notion] refresh_seconds`（快取查詢結果，0 不快取）。
+  - `[memory] graph_embed_seed`／`graph_embed_seed_top_k` 套用到員工的記憶檢索（之前只影響儀表板自己的搜尋）。
+  - `[logging] format = "json"`（重啟後 stderr 與檔案日誌輸出 JSON）。
+- **帳號 e-mail 遮罩**：非 ASCII 的 e-mail 本地部分不再造成 panic（改用字元計算）。
+
+### Security
+- **AI 員工 `.mcp.json` 寫入時就是 0600**：`add_server_to_config`／`remove_server_from_config` 先建立權限 0600 的暫存檔再寫入、改名，之前暫存檔以預設權限寫完才改權限，中間有一段時間其他使用者可讀。
+- **六個 webhook 通道與 WebChat 讓任何人執行管理指令**（已發布版本受影響）：WhatsApp、飛書、Teams、企業微信、Google Chat、釘釘呼叫聊天指令時把 `is_admin` 寫死成 true，任何傳訊者都能執行 `!STOP`、`!STOP ALL`、`!RESUME`、`/model`。現在依該通道的 `admin_users` 設定比對傳訊者或對話 id（完全相同），沒設定就沒有人是管理員；Google Chat 與 Teams 也能設定 `admin_users` 了。WebChat 只有啟用中的儀表板管理員帳號算管理員，網站元件訪客一律不算。
+- **儀表板設定的管理權杖重啟後消失**（v1.22.0 起的版本受影響）：儀表板把 `[gateway] auth_token` 加密存成 `auth_token_enc`，啟動時卻只讀明文，重啟後 gateway 沒有管理權杖。現在依序讀環境變數 `DUDUCLAW_AUTH_TOKEN`、`auth_token_enc`、明文 `auth_token`（也接受 `secret://` 參照）。
+- **`agents.update` 讓非管理員擁有者改動權限欄位且不留紀錄**（已發布版本受影響）：見 Changed 的權限類欄位一項。
+- **`acp.trusted`、`tick.allow_command_sources`、`container.sandbox.when_unavailable`、`script_when_unavailable`、`memory.supersession_trust_guard` 的每次改動記稽核 `config_protected_key_changed`**（含前後值）。
+
 ## [1.67.1] - 2026-10-03 — 記憶可信度守門×自動化規則表單×中文注入掃描×Marketplace 與推論設定修正
 
 ### Added

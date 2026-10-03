@@ -96,7 +96,7 @@ duduclaw pack install ./my-team    # 依 kind 分流；付費內容只在一處�
 
 `kind` 決定安裝路線：職務組合寫進職務組合庫（`presets/<id>/preset.toml`，再用 `duduclaw preset bind` 綁到某位員工），團隊包與產業板模走 [features/32](32-expert-packs.md) 描述的完整安全管線。`tier` 是唯一的付費判定：以前有四段程式各自從目錄路徑推「這是不是付費內容」，現在包自己帶著 tier，只有一個判斷式讀它。
 
-**三種舊格式到 v1.68.0 都還能用。** `expert.toml`、`team.toml`、`preset.toml` 原樣讀取，磁碟上一個字都不改——付費內容樹裡的法規條文是逐字人審過的，不交給機器轉檔。`duduclaw expert install` 與 `duduclaw preset` 維持為同一條程式路徑的別名。想看舊檔在新 schema 下長什麼樣，跑 `duduclaw pack inspect <dir> --emit-canonical`：它只印出來，不寫檔。
+**三種舊格式到 v1.69.0 都還能用。** `expert.toml`、`team.toml`、`preset.toml` 原樣讀取，磁碟上一個字都不改——付費內容樹裡的法規條文是逐字人審過的，不交給機器轉檔。`duduclaw expert install` 與 `duduclaw preset` 維持為同一條程式路徑的別名。想看舊檔在新 schema 下長什麼樣，跑 `duduclaw pack inspect <dir> --emit-canonical`：它只印出來，不寫檔。
 
 ---
 

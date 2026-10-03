@@ -32,9 +32,13 @@ port = 18789
 # auto_update = true  # Pro default: true (auto-download + install + restart)
                        # CE default: false (notify only). Override with env DUDUCLAW_AUTO_UPDATE.
 # allowed_origins = []       # Extra dashboard origins; empty means loopback only
-# auth_token_enc = "<ciphertext>"  # Dashboard admin token; written encrypted
+# auth_token_enc = "<ciphertext>"  # Dashboard admin token; written encrypted, read at startup since v1.68.0
 
-# Log level is NOT under `[logging]`. It used to be documented here, and
+# `[logging] format = "json"` switches stderr and the file log to JSON lines
+# (read at startup, so a change needs a restart; any other value is plain
+# text). Dashboard (v1.68.0): Settings → Advanced → System → General.
+#
+# Log level is NOT under `[logging]`. It used to be documented there, and
 # nothing ever read it — the dashboard reported success while the level never
 # changed (fixed 2026-09-06). The live key is `[general] log_level` below, or
 # the RUST_LOG environment variable, which wins over both.
@@ -93,6 +97,8 @@ port = 18789
 # ── Memory engine ───────────────────────────────────────────
 # Write-time deduplication, the cross-invocation action feed, and the
 # cross-wake working state. docs/features/44-working-state.md
+# Dashboard (v1.68.0): `supersession_trust_guard` is on Settings → Advanced → System →
+# Memory, tracing and trust (applies to new sessions).
 # [memory]
 # novelty_gate = true                     # Reject near-duplicate semantic writes
 # recent_actions_enabled = true           # Inject the agent's own recent audited actions
@@ -158,12 +164,15 @@ port = 18789
 # ── Local data files ────────────────────────────────────────
 # Extra directories `file_read` / `csv_read` / `xlsx_read` may open, on top
 # of the agent's own directory and `<home>/attachments`. Absolute paths only.
+# Dashboard (v1.68.0): Settings → Advanced → System → Local file folders.
 # [files]
 # allowed_roots = []
 
 # ── Agent mailbox ───────────────────────────────────────────
 # Inbound mail can wake an agent; outbound always goes through the approval
 # broker. docs/features/47-agent-mail.md
+# Dashboard (v1.68.0): enabled, gmail_enabled, dropfolder_enabled, default_agent and
+# auto_trigger are on Settings → Advanced → Automation → AI employee mailbox.
 # [mail]
 # enabled = false              # Master switch; the MCP tools refuse while off
 # gmail_enabled = false        # Poll a connected Gmail account
@@ -357,6 +366,8 @@ port = 18789
 # ── Dispatch / acceptance judge ──────────────────────────────
 # Full reference: docs/guides/goal-loop.md
 #
+# Dashboard (v1.68.0): policy (incl. role_team), judge_provider and judge_model are on
+# Settings → Advanced → Automation → Goal loop & dispatch.
 # [dispatch]
 # enabled = true             # Background dispatch engine + goal-loop driver (on since v1.59)
 # policy = "fixed_hierarchy" # fixed_hierarchy | round_robin | llm_select | role_team
@@ -419,6 +430,7 @@ port = 18789
 #      cannot pay for one on its first round runs Solo.
 # `enabled = false` remains a real kill switch (it also beats a global `true`).
 #
+# Dashboard (v1.68.0): Settings → Advanced → Automation → One employee, four roles.
 # [team]
 # enabled = true             # Master switch. false = never form a team for this fleet/agent
 # executor_fanout = 1        # Executor copies working the same sub-task (1-3, clamped)
@@ -519,6 +531,7 @@ port = 18789
 # invalid section means the sandbox is unavailable (the task fails).
 # tmp_bytes + workspace_bytes must not exceed memory_bytes.
 # Guide: docs/guides/task-sandbox.md
+# Dashboard (v1.68.0): Settings → Advanced → System → Task sandbox (applies per task).
 # [container.sandbox]
 # image = "ghcr.io/zhixuli0406/duduclaw:v<version>"  # Default: the platform image for the running version
 # memory_bytes = 4294967296    # 4 GiB (max 64 GiB)
@@ -551,6 +564,7 @@ port = 18789
 # a fallback to the default). Read on every computer-use session start
 # (by the eight computer_* MCP tools, the only computer-use path).
 # Guide: docs/features/08-browser-automation.md
+# Dashboard (v1.68.0): Settings → Advanced → System → Task sandbox → Computer-use image.
 # [computer_use]
 # image = "duduclaw-computer-use:latest"
 #
@@ -573,6 +587,8 @@ port = 18789
 # ── Inter-agent protocol entry (A2A / ACP) ──────────────────
 # `trusted = true` puts the ACP client on the system-sender list, which is
 # system-level delegation scope. Leave it off unless you own that endpoint.
+# Dashboard (v1.68.0): Settings → Advanced → System → Memory, tracing and trust (admins
+# only; every change is audited as config_protected_key_changed).
 # [acp]
 # trusted = false
 
@@ -602,6 +618,8 @@ port = 18789
 # ── OpenTelemetry export ────────────────────────────────────
 # Off until an endpoint is set; with none, the tracing layer costs nothing.
 # docs/guides/observability.md
+# Dashboard (v1.68.0): Settings → Advanced → System → Memory, tracing and trust, shown
+# only in builds with the otel feature. Restart required.
 # [telemetry]
 # otlp_endpoint = "http://127.0.0.1:4317"  # Setting this is what turns export on
 # otlp_protocol = "grpc"       # grpc | http/protobuf (http currently warns and uses grpc)
@@ -618,13 +636,13 @@ port = 18789
 # calibration_enabled = true   # Brier/RPS scoring + Murphy decomposition
 # held_out_gate_enabled = true # Evidence-less rules start as shadow candidates
 # rule_induction = true        # Deterministic task-rule induction from repeated transitions
-# cold_start_llm = false       # Reserved; a cold bucket still costs zero LLM calls
-# min_samples = 3              # Parsed for forward compatibility; not yet load-bearing
-# mature_n = 10                # Parsed for forward compatibility; not yet load-bearing
 
 # ── Resident sensing (external data streams) ────────────────
 # Polls or subscribes to an outside feed and turns each observation into an
 # autopilot event. Off entirely by default. docs/features/41-resident-sensing.md
+# Dashboard (v1.68.0): Settings → Advanced → Automation → Live data feeds, including
+# the [[tick.sources]] list (tick.sources.* RPCs). Sources restart in place
+# after a save when the live-feed runtime is loaded.
 # [tick]
 # enabled = false
 # allow_command_sources = false  # `command` sources need this extra grant as well
@@ -665,7 +683,7 @@ port = 18789
 # [odoo]
 # url = ""                     # Empty counts as "not configured"
 # db = ""
-# protocol = "jsonrpc"
+# protocol = "jsonrpc"         # Only jsonrpc; "xmlrpc" is refused when saved (v1.68.0)
 # auth_method = "api_key"
 # username = ""
 # api_key_enc = ""             # Written encrypted by the dashboard
@@ -674,6 +692,8 @@ port = 18789
 # poll_models = ["crm.lead", "sale.order"]
 # webhook_enabled = false      # Accept pushes from Odoo
 # webhook_secret_enc = ""
+# Module switches, enforced since v1.68.0: a call on a model of a switched-off
+# module (crm.*, sale.*, stock.*/product.*, account.*, project.*, hr.*) is refused.
 # features_crm = true
 # features_sale = true
 # features_inventory = true
@@ -690,7 +710,7 @@ port = 18789
 # client. docs/guides/google-workspace-integration.md · docs/guides/github.md
 # [integrations]
 # google_workspace = false
-# github = false               # Gates the 5 github_* tools (off since the 2026-09 audit)
+# github = false               # Gates the 5 github_* tools (off since the 2026-09 audit); dashboard toggle can turn it off (v1.68.0)
 #
 # [integrations.google_service_account]
 # key_file = "/path/to/service-account.json"
@@ -774,6 +794,7 @@ port = 18789
 # ── Human takeover ──────────────────────────────────────────
 # A human manager speaking in a thread silences the AI for a while.
 # docs/features/42-human-takeover.md
+# Dashboard (v1.68.0): Settings → Advanced → Automation → Human takeover.
 # [takeover]
 # enabled = false
 # duration_minutes = 60        # Silence window after a manager speaks
@@ -859,6 +880,7 @@ port = 18789
 # ── Embedded web chat widget ────────────────────────────────
 # Anonymous visitors on a public page. Fail-closed: without a long enough
 # key the widget refuses every connection.
+# Dashboard (v1.68.0): Channels → Website chat widget (has a Generate button for the key).
 # [webchat]
 # public_widget = false
 # widget_key = ""              # At least 16 characters
@@ -885,6 +907,8 @@ port = 18789
 # ── Secret manager ──────────────────────────────────────────
 # Backend behind `secret://<backend>/<name>` references.
 # docs/guides/mcp-bridge.md
+# Dashboard (v1.68.0): Settings → Advanced → System → Secret Manager → Advanced: secret
+# backend (1Password and Infisical fields; tokens stored encrypted).
 # [secret_manager]
 # backend = "local"            # local | vault | env
 # vault_addr = ""
@@ -897,15 +921,6 @@ port = 18789
 # infisical_token_enc = ""
 # infisical_project_id = ""
 # infisical_environment = "prod"
-
-# ── Code security audit ─────────────────────────────────────
-# One of the few things here that is ON by default.
-# docs/features/49-code-security-audit.md
-# [secaudit]
-# scheduled_scan = true
-# scan_paths = []              # Empty lets the OS scheduler decide the scope
-# profile = "quick"            # quick | deep
-# rules_dir = ""               # Extra semgrep rules; empty uses the built-ins
 
 # ── Office delivery gate ────────────────────────────────────
 # Structural check on a generated document before it is delivered.
@@ -954,6 +969,7 @@ port = 18789
 # ever turn the feature ON. The deterministic sub-passes (N3 schema induction,
 # N4 recurrence-gated consolidation) never call a model and are unaffected.
 # docs/features/58-night-engine.md
+# Dashboard (v1.68.0): Settings → Advanced → Automation → Knowledge & memory.
 # [night]
 # llm_enabled = false          # Default. N1/N2 no-op with a log line while off
 

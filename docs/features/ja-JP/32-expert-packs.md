@@ -35,7 +35,7 @@ duduclaw pack install <src>        # kindで経路分岐。プレミアム内容
 
 `duduclaw expert install`は`pack install`のエイリアスで、挙動は完全に同じです。制作側の動詞(`pack`、`publish`、`export`、`convert-teams`、`hooks`、`remove`)は`duduclaw expert`配下に残ります。ダッシュボードのワンクリックインストールと`experts.install`も同じコードに到達します——どちらも元々CLIを駆動しているためです。
 
-**`expert.toml`、`team.toml`、`preset.toml`はv1.68.0まで動き続けます。** ディスク上は何も書き換えません。`duduclaw pack inspect <dir> --emit-canonical`は旧パックに対応する`pack.toml`を表示するので、自分でレビューしてから移行できます——あなたが責任を持つ内容を機械が書き換えるのではなく。
+**`expert.toml`、`team.toml`、`preset.toml`はv1.69.0まで動き続けます。** ディスク上は何も書き換えません。`duduclaw pack inspect <dir> --emit-canonical`は旧パックに対応する`pack.toml`を表示するので、自分でレビューしてから移行できます——あなたが責任を持つ内容を機械が書き換えるのではなく。
 
 ## インストールパイプライン
 

@@ -85,9 +85,15 @@ DuDuClaw 的信心路由器就是 LLM 查詢的差旅審核員，評估每個查
 v1.67.1 起寫入時會檢查：
 
 - `inference.update`（儀表板推論頁）只接受 `backend = "openai_compat"` 或空值。空值會刪掉這個鍵，由引擎自己選 `openai_compat`。其他值在寫入任何東西之前就被拒絕，訊息指向 `openai_compat`。有一個例外讓舊檔案仍能儲存：已經存在檔案裡的已移除值原樣送回時照收，所以在你改掉它之前，這一頁仍能儲存其他設定。頁面會把這種值標示為已停止支援。
-- `agents.update` 拒絕 `openai_compat` 以外的 `[model.local] backend`（這項檢查在 v1.67.1 之前就有）。
+- `agents.update` 拒絕 `openai_compat` 以外的 `[model.local] backend`（這項檢查在 v1.67.1 之前就有）。v1.68.0 起員工編輯頁完全不再送出 `[model.local] backend`／`context_length`／`gpu_layers`。
 - `[model.local] backend` 的預設值、`duduclaw onboard`、`duduclaw wizard` 與內建 agent 範本現在都寫 `openai_compat`（之前寫 `llama_cpp`）。
 - 儀表板拿掉了沒有程式讀取的欄位：推論頁的「記憶體上限」（`max_memory_mb`）、生成設定的「GPU Layers」「Context 大小」（`[generation] gpu_layers`／`context_size`）；AI 員工編輯頁的「Context 長度」「GPU Layers」（`[model.local] context_length`／`gpu_layers`）。記憶體、GPU 卸載與 context 大小由外部伺服器自己管。已儲存的值留在檔案裡不動。
+
+v1.68.0 起：
+
+- `inference.update` 存檔成功後會重設 gateway 快取的推論引擎，下一則通道回覆與派工就用新設定（之前約 20 個推論設定要重啟才生效）。頁面會提示引擎已重新載入。
+- 推論頁以帶型別的欄位編輯 `[llamafile]`（`enabled`、`dir`、`default_file`、`host`、`port`、`gpu_layers`、`context_size`、`extra_args`），並在「信心路由 (Router)」→「進階」編輯 `[router] local_tools` 與 UCCI 相關鍵（`ucci_fast_router`、`ucci_strong_router`、`ucci_observations`、`ucci_shadow_strong`、`ucci_shadow_max_inflight` 1 到 16、`ucci_drop_stop_token`），以及 `[generation] capture_logprobs`／`capture_top_logprobs`。在頁面上清空 llamafile 欄位不會刪除已存的值，請用「設定檔進階編輯」。
+- `max_memory_mb`、`[generation] gpu_layers`／`context_size` 與 `[embedding]` 已從設定結構移除，`inference.update` 收到時忽略。
 
 ### InferenceManager 狀態機
 

@@ -13,13 +13,19 @@
 # Reference: https://killswitch.md/ (KILLSWITCH.md Standard, 2026-03)
 
 [triggers]
-# Max replies per minute per scope before rate-limiting.
+# Only the keys written here are enforced (v1.68.0); a key left out is not
+# applied at all, so an upgrade never caps a running deployment silently.
+# Max replies per minute per conversation; extra messages are dropped.
 max_replies_per_minute = 10
-# Max consecutive errors before failsafe escalation.
+# Failed replies in a row (per conversation) before the failsafe level
+# escalates one step.
 max_consecutive_errors = 5
-# Error rate (0.0-1.0) threshold for failsafe escalation.
+# Failure share over the last 20 replies of a conversation (at least 10)
+# above which the failsafe level escalates one step (0.0-1.0).
 error_rate_threshold = 0.3
-# Daily API cost limit in USD.
+# API spend over the last 24 h, all agents, in USD. When reached, every
+# conversation gets the restricted reply; the global level stays restricted
+# until the failsafe recovers or someone sends !RESUME. 0 = off.
 cost_limit_usd = 50.0
 
 [circuit_breaker]
@@ -66,9 +72,3 @@ status = ["!STATUS", "!狀態"]
 enabled = true
 # Languages to include in the defensive prompt.
 languages = ["en", "zh-TW"]
-
-[audit]
-# Enable killswitch event audit logging.
-enabled = true
-# Path to the audit JSONL file (~ expands to ~/.duduclaw/).
-path = "~/.duduclaw/killswitch_audit.jsonl"

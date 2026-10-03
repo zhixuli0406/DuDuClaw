@@ -122,7 +122,7 @@ The temporal store tracks **two** time axes: `valid_from`/`valid_until` (world-t
 
 `invalidate_by_origin(agent, origin, since)` — MCP `memory_invalidate_by_origin` (scope `admin`) — is the remediation valve for a poisoned source: it expires (never deletes) every currently-valid fact from an **exact** `origin` (equality, never substring), optionally limited to facts learned at/after `since`. Facts whose `derived_from` cites a purged id have their `origin_trust` floored to ≤ 0.1 (a derivation of poisoned input can't stay trusted). `search()` immediately stops returning the purged facts, while `get_history()` preserves the full chain with `invalidated_by_event = "origin_purge"`.
 
-Since v1.67.1 a caller treated as an AI employee may only invalidate the `channel`, `mcp_external` and `tool_echo` classes, the ones below the agent-derived ceiling. Any other origin is refused and audited as `memory_invalidate_refused`. The check fails closed: any caller on the gateway's shared internal key counts as an AI employee, whether or not an employee identity is present in the process, and so does a key that belongs to an employee or to an ephemeral employee (`eph-` ids). Only an admin key that maps to no employee is unrestricted. Before, a steered AI employee could expire every operator-level fact in its namespace in one call (which namespace that is: see the known limit below).
+Since v1.67.1 a caller treated as an AI employee may only invalidate the `channel`, `mcp_external` and `tool_echo` classes, the ones below the agent-derived ceiling. Any other origin is refused and audited as `memory_invalidate_refused`. The check fails closed: any caller on the gateway's shared internal key counts as an AI employee, whether or not an employee identity is present in the process, and so does a key that belongs to an employee or to an ephemeral employee (`eph-` ids). Only an admin key that maps to no employee is unrestricted. Before, a steered AI employee could expire every operator-level fact in its namespace in one call (since v1.68.0 that is the employee's own namespace, see [Memory namespaces](#memory-namespaces-v1680)).
 
 ### Write-side poison protection (D2)
 
@@ -168,15 +168,39 @@ What each write path does with a refusal:
 
 `config.toml [memory] supersession_trust_guard` (default `true`) switches the guard off when set to `false`. It is read by engines built through the gateway's `memory_factory::build_memory_engine` and by the `duduclaw mcp-server` memory engine. Engines constructed directly (for example the dashboard's memory RPCs and `duduclaw migrate-from`) keep the guard on regardless of the setting. Not verified on a real chat channel.
 
-### Known limit: two memory namespaces (not fixed in v1.67.1)
+### Memory namespaces (v1.68.0)
 
-Memory that an AI employee writes or reads through the MCP memory tools (`memory_store`, `memory_search`, `memory_read`, `memory_fetch_batch`, `memory_alias_add` / `memory_alias_list`, `memory_get_history`, `memory_get_at`, `memory_invalidate_by_origin`, `user_profile_record`, `user_profile_get`, `user_code_profile`) lives in a namespace derived from the MCP key. Every employee the gateway spawns uses the gateway's internal key, so they all share one namespace, `internal/gateway-internal` (so since v1.44.0, when that key was introduced). Everything the gateway does itself (conversation and profile distillation, review approval, injecting key facts and the profile block into prompts) uses the employee's own id. Consequences:
+The MCP memory tools (`memory_store`, `memory_search`, `memory_read`, `memory_fetch_batch`, `memory_alias_add` / `memory_alias_list`, `memory_get_history`, `memory_get_at`, `memory_invalidate_by_origin`, `user_profile_record`, `user_profile_get`, `user_code_profile`) choose their namespace from the caller (`crates/duduclaw-cli/src/mcp_namespace.rs`, `resolve_for_caller`):
 
-- Employees of the same gateway share the memory they store through those tools.
-- What an employee stores through the tools is not what the gateway injects into its prompts, and its `memory_search` does not see what the gateway distilled. The profile block reflects distilled traits and approved reviews, not `user_profile_record` calls.
-- The trust guard compares facts within one namespace. It protects gateway-distilled and operator-approved facts from chat-derived writes, and does not arbitrate between the two pools.
+| caller | namespace it writes and reads (plus `shared/public` for reads) |
+|---|---|
+| gateway internal key, with a verified employee identity | the employee's own id, e.g. `agnes` |
+| gateway internal key, no verified identity | `internal/gateway-internal` (the old shared pool) |
+| a per-agent MCP key whose client id is an existing employee (`agents/<id>/agent.toml`) | that employee's id |
+| any other internal key | `internal/<client_id>` |
+| an external key | `external/<client_id>` (unchanged) |
 
-Isolation between employees holds for gateway-written memory only. Changing this needs a data migration and has not been scheduled.
+"Verified" means `DUDUCLAW_AGENT_ID` is proven by `DUDUCLAW_AGENT_TOKEN` (an HMAC over the id, keyed by `~/.duduclaw/identity.key`). The gateway writes that pair into each employee's `.mcp.json` when `identity.key` exists. A missing, wrong or unprovable token leaves the caller in the old shared pool, so an id that cannot be proven never reaches an employee's memory. The HTTP transport (`duduclaw http-server`) never takes the identity from its own process environment: an internal key over HTTP stays in the shared pool, and a per-agent key still maps to its employee.
+
+The employee's own id is the namespace the gateway already used for distillation, review approval and prompt injection (key facts, profile block). So, after upgrading, an employee's `memory_search` sees what the gateway distilled, what it stores through the tools is what the gateway injects, the trust guard arbitrates both in one place, and employees no longer read each other's tool-stored memory.
+
+**Behaviour change.** Rows written before v1.68.0 stay in `internal/gateway-internal`. Nothing moves them automatically, and an employee with a verified identity no longer sees them through the tools. An operator moves them with a hidden command that refuses to run inside an AI employee's session (when `DUDUCLAW_AGENT_ID` or `DUDUCLAW_AGENT_TOKEN` is set):
+
+```bash
+duduclaw memory migrate-namespace list                      # counts, and who wrote each row
+duduclaw memory migrate-namespace export --out pool.json    # every field, file mode 0600, never overwrites
+duduclaw memory migrate-namespace assign --to agnes --attributed            # dry run (the default)
+duduclaw memory migrate-namespace assign --to agnes --attributed --confirm  # real run
+duduclaw memory migrate-namespace archive --confirm         # expire what is left, tagged namespace-archived
+```
+
+- `list` attributes each row from `tool_calls.jsonl` (and `tool_calls.jsonl.old`): by memory id in a memory tool's result, by exact content of a `memory_store` input, or, as a weaker hint, by the only employee with audit rows within ten minutes. `user_profile_record` calls are not written to `tool_calls.jsonl`, so those rows can only be attributed by time.
+- `assign --to <employee>` needs exactly one of `--all` (also moves the pool's entity aliases), `--ids <id,…>` or `--attributed` (rows attributed by id or content; add `--include-inferred` for time-based ones). Without `--confirm` it only prints the plan; `--dry-run` forces a plan.
+- A moved row keeps its id. In the target it is judged like a new write there: the same value already current becomes history pointing at the surviving fact, an older row becomes a historical segment, and a row the target's more trusted current fact refuses is held for review (`--refused hold`, the default, files an item in the dashboard inbox) or left in the pool (`--refused skip`). Quarantined rows stay in the pool, and so do rows that look like prompt injection unless `--include-flagged` is passed.
+- `archive` expires the rows still valid in the pool and tags them `namespace-archived`; they stay readable for history.
+- A real `assign` or `archive` writes the audit event `memory_namespace_migrated`.
+
+Covered by unit and integration tests that drive the real MCP handlers and the gateway's injection paths on one `memory.db`.
 
 ### Auto-filed knowledge pages (WP5c)
 

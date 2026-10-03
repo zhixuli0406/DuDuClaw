@@ -215,7 +215,7 @@ GitHub Search API
 | `hub` | 只查策展過的 registry（anthropic-skills / clawhub / lobehub / skills-sh） | 你只要經過審核、有排名的結果 |
 | `bank` | 只查學會的 skill bank | 你要找的是這台部署自己學會的東西 |
 
-skill bank 目前仍是空的 in-memory stub，所以 `source="bank"` 會誠實回報「空的」，不會偷偷拿 hub 結果充數。`skill_bank_search` 仍可使用，屬 `source="bank"` 的棄用別名，v1.68.0 移除——見[已棄用名稱](../../guides/zh-TW/deprecations.md)。
+skill bank 目前仍是空的 in-memory stub，所以 `source="bank"` 會誠實回報「空的」，不會偷偷拿 hub 結果充數。`skill_bank_search` 仍可使用，屬 `source="bank"` 的棄用別名，v1.69.0 移除——見[已棄用名稱](../../guides/zh-TW/deprecations.md)。
 
 ### MCP 工具
 

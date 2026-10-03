@@ -51,7 +51,7 @@ MCP bridge         ─┘                                   1. イベント一�
 | **RunAtRisk** | `run_at_risk` | 予測が実行中タスクの失敗を見込む | `agent_id`、`session_id`、`score`、`level`、`reasons` |
 | **OsFileEvent** | `os_file` | agent の `[os_watch]` がファイル変更を検知 | `agent_id`、`path`、`kind`（created / modified / removed / renamed）、`file_name`、`extension` |
 | **OsFrontmostEvent** | `os_frontmost` | 前面のアプリまたはウィンドウタイトルが変わる | `agent_id`、`app`、`window_title`、`prev_app` |
-| **Tick** | `tick` | 常駐センシングのソース（`[[tick.sources]]`）が観測を出す | `source`、`ts`、抽出フィールドとその `prev_` / `delta_` / `pct_` 派生フィールド |
+| **Tick** | `tick` | 常駐センシングのソース（`[[tick.sources]]`。v1.68.0 からシステム設定 → 詳細設定 → 自動化エンジン → 常駐センシングで編集可能）が観測を出す | `source`、`ts`、抽出フィールドとその `prev_` / `delta_` / `pct_` 派生フィールド |
 | **SecurityEvent** | `security_event` | warning / critical レベルの監査イベント、またはセキュリティ態勢の変化 | `severity`、`event_type`、`agent_id`、`source` |
 | **OdooEvent** | `odoo_event` | Odoo のポーリングまたは `POST /webhook/odoo` が ERP の変更を報告 | `event_type`、`model`、`record_id`、`record`（トップレベルのスカラー値も平坦化） |
 

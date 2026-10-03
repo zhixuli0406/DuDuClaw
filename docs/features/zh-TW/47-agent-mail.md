@@ -56,6 +56,8 @@ smtp_tls = "starttls"                # none | implicit | starttls(預設)
 `[mail]` 裡每一個欄位獨立容錯：型別寫錯或漏寫，只有那一欄退回預設值，不會
 因為一行打錯字讓整個信箱失效。
 
+v1.68.0 起，`enabled`、`gmail_enabled`、`dropfolder_enabled`、`default_agent`、`auto_trigger` 也能在儀表板設定：系統設定 → 進階設定 → 自動化引擎 →「AI 員工信箱」（只限管理員，不必重啟）。外發設定仍在 `config.toml` 或「設定檔進階編輯」修改。
+
 ## 兩種入站傳輸
 
 兩種都刻意做成零額外依賴：不需要 IMAP 函式庫，也不需要另開一套憑證儲存。

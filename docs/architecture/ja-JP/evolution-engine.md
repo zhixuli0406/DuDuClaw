@@ -1065,7 +1065,7 @@ eval_suites_root = "evals"     # AEEリプレイサブプロセスがeval suite�
 eval_binary = "/usr/local/bin/duduclaw"   # 任意、デフォルトのバイナリパスを上書き
 ```
 
-新しいCLI：`duduclaw export playbook --agent <id> [--out <path>]`（旧表記 `duduclaw playbook export` は v1.68.0 まで使用可。GEP-gene
+新しいCLI：`duduclaw export playbook --agent <id> [--out <path>]`（旧表記 `duduclaw playbook export` は v1.69.0 まで使用可。GEP-gene
 形式のJSONをエクスポート、ローカルファイルのみ、外部hubには一切接続しない）；
 `duduclaw playbook migrate-soul --agent <id> [--apply]`（WP1.4——既存の
 SOUL.mdの行動ルールをplaybookエントリの草稿として抽出し、人によるレビュー後に

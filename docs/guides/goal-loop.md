@@ -145,7 +145,7 @@ enabled = true          # Enable the autonomous dispatch engine (includes the go
 policy = "fixed_hierarchy"  # Dispatch policy (which AI employee picks up a task). See "Dispatch policy" below. Default fixed_hierarchy
 grounding_precheck_enabled = true  # Grounding precheck before acceptance (see "Grounding precheck"). Default true
 two_stage_judge = true  # Run a cheap first-stage evaluation before acceptance (see "Two-stage acceptance judging"). Default true
-judge = "mav"           # Who makes the acceptance call (see "Swapping the acceptance judge"). mav / external (evaluator_only / human_only are deprecated, removed in v1.68.0). Default mav
+judge = "mav"           # Who makes the acceptance call (see "Swapping the acceptance judge"). mav / external (evaluator_only / human_only are deprecated, removed in v1.69.0). Default mav
 judge_provider = "antigravity"      # Optional: run the judge on another runtime (see "Running the judge on a different model"). Unset ⇒ the default utility runtime
 judge_model = "gemini-3-pro-preview" # Optional: judge model id within that runtime. Unset ⇒ the default utility model
 admission = "queue"     # What happens when ephemeral spawns hit the concurrency cap, "queue" or "fail". Default queue (see "Ephemeral spawn admission queueing" below)
@@ -408,8 +408,8 @@ After the AI employee reports completion and a task enters `review`, it doesn't 
 |---|---|---|
 | `mav` (default) | First-stage evaluator → three-aspect MAV judge panel | The general case |
 | `external` | Your own program (`judge_command`) | Wiring in your own CI, a rules engine, or a second model as judge |
-| `evaluator_only` | Only the first-stage evaluator runs; `candidate_complete` passes directly | **Deprecated, removed in v1.68.0.** Use `mav`: `two_stage_judge` already runs the cheap evaluator first and only pays for the panel on a completion candidate |
-| `human_only` | No machine verdict; every `review` task escalates to `needs_human` | **Deprecated, removed in v1.68.0.** Use `mav` plus per-agent `[capabilities] autonomy_level` / `approval_required_tools` |
+| `evaluator_only` | Only the first-stage evaluator runs; `candidate_complete` passes directly | **Deprecated, removed in v1.69.0.** Use `mav`: `two_stage_judge` already runs the cheap evaluator first and only pays for the panel on a completion candidate |
+| `human_only` | No machine verdict; every `review` task escalates to `needs_human` | **Deprecated, removed in v1.69.0.** Use `mav` plus per-agent `[capabilities] autonomy_level` / `approval_required_tools` |
 
 All four values still parse, so a deployment already on a deprecated mode keeps behaving exactly as configured — it logs one warning per process, and a write through the dashboard records a `judge_mode_deprecated` audit event. The dashboard offers only `mav` and `external`, but shows a saved deprecated value (labelled 已棄用) rather than silently switching it. See [deprecations.md](deprecations.md).
 

@@ -132,7 +132,7 @@ upstream = "notion"
 [identity.notion]
 database_id     = "abc123def456..."
 api_key_enc     = "<encrypted via duduclaw-security>"
-refresh_seconds = 300
+refresh_seconds = 300          # since v1.68.0: successful lookups are cached this long; 0 = no cache
 
 # Optional — adjust if your Notion property names differ from defaults.
 [identity.notion.field_map]
@@ -284,6 +284,14 @@ confirm the right slot was used. Try a write tool with a read-only key
 — it should be denied **before** any HTTP call leaves the process. Tail
 `tool_calls.jsonl` (or filter `source=tool` in `audit.unified_log`) to
 see the per-call attribution row with `profile=...; ok=...`.
+
+### Module switches (`features_*`, enforced since v1.68.0)
+
+The global `config.toml [odoo]` switches `features_crm`, `features_sale`, `features_inventory`, `features_accounting`, `features_project` and `features_hr` now gate calls. A call on a model whose module is switched off is refused before any connection and before the per-agent ACL, with an MCP error and an audit row. Models map to modules by prefix: `crm.*` → crm, `sale.*` → sale, `stock.*` / `product.*` → inventory, `account.*` → accounting, `project.*` → project, `hr.*` → hr; other models such as `res.partner` are never gated. The generic `odoo_search`, `odoo_execute` and `odoo_schema_fields` are checked against the model they name. Tools stay in `tools/list`.
+
+**Behaviour change:** crm, sale, inventory and accounting default to on; **project and hr default to off**. An install that never wrote `features_project` / `features_hr` can no longer search or execute on `project.*` / `hr.*` until those switches are turned on (Odoo page in the dashboard, or `config.toml`).
+
+`[odoo] protocol = "xmlrpc"` is refused when saved; only JSON-RPC (or an absent key) is accepted.
 
 ### Migration from a single global Odoo account
 

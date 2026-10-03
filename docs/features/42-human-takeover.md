@@ -124,6 +124,8 @@ max_duration_minutes = 720  # extension ceiling (hard cap 12 hours)
 
 Bad values (0, negative, astronomical) are clamped into a sane range rather than breaking the feature — a typo in a config file should not cost you "the AI never speaks again" or "the pause ends after one second".
 
+Since v1.68.0 the three keys can also be set from the dashboard: Settings → Advanced → Automation → Human takeover ("Pause automatically when a person replies", "Pause length (minutes)", "Longest pause (minutes)"). The save goes through `system.update_config` (admin only), refuses a pause length above the maximum, and applies without a restart.
+
 State lives in `~/.duduclaw/takeover_state.json`, the only file ever written. When nobody is taking over, the file is empty (or absent). **No global settings, no `agent.toml`, no channel configuration are touched** — the most important line in LINE's four-part design, and the reason support agents dare to use this feature at all.
 
 ---

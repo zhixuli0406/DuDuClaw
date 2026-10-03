@@ -7,8 +7,10 @@ that learned the old name can keep calling it.
 
 **Policy.** A deprecated name survives **two minor versions**. Everything on
 this page was deprecated in **v1.66.0** and is scheduled for removal in
-**v1.68.0**, except the Gemini CLI runtime (see [Runtimes](#runtimes)), which is
-deprecated in **v1.67.0** and scheduled for removal in **v1.69.0**.
+**v1.69.0**, together with the Gemini CLI runtime (see [Runtimes](#runtimes)), which is
+deprecated in **v1.67.0** and scheduled for the same release.
+
+> The removal of the v1.66.0 deprecations moved from v1.68.0 to v1.69.0 in v1.68.0, to keep v1.68.0 a feature-only release.
 
 How each surface signals deprecation:
 
@@ -233,9 +235,9 @@ So far only the invalid-key path has been exercised.
 
 ---
 
-## What happens in v1.68.0
+## What happens to the names above in v1.69.0
 
-Each old name above is removed, except the Gemini CLI runtime, which stays until v1.69.0 (next section). Before upgrading past v1.67.x:
+Each old name above is removed in v1.69.0 (the Gemini CLI runtime goes in the same release, next section). Before upgrading past v1.68.x:
 
 1. Grep your agent prompts, skills, and automations for the old MCP tool names.
 2. Grep your scripts, cron entries, and systemd units for the old CLI spellings.
@@ -248,7 +250,7 @@ machine-greppable on purpose.
 
 The Gemini CLI runtime is removed (`runtime/gemini.rs`, the catalog entry, the
 Discovery Gemini family, and the `gemini-cli` package in the Docker image). The
-Gemini API provider stays. Before upgrading past v1.68.x:
+Gemini API provider stays. Before upgrading past v1.69.x:
 
 1. Grep every `agent.toml` for `provider = "gemini"` and `fallback = "gemini"`,
    or run `duduclaw doctor`.

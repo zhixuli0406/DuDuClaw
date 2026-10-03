@@ -52,7 +52,7 @@ JavaScript レンダリングのページを扱うには、そのエージェン
 }
 ```
 
-Browserbase については、`browserbase_mcp_config` と marketplace の `browserbase` カードが同じ項目を生成します。`npx -y @browserbasehq/mcp` を実行し、`env` には `${BROWSERBASE_API_KEY}`、`${BROWSERBASE_PROJECT_ID}`、`${GEMINI_API_KEY}`（最後のものはサーバーのデフォルトモデル用）という参照だけが入り、秘密情報そのものは `.mcp.json` に書き込まれません。3つの変数はすべて、AI 従業員の CLI が動く環境に設定する必要があります。v1.67.1 より前は、marketplace のカードと生成される Playwright 項目が npm に存在しないパッケージ名（`@anthropic-ai/mcp-server-playwright`、`@anthropic-ai/mcp-server-browserbase` などの `@anthropic-ai/mcp-server-*`）を指定し、生成される Browserbase 項目は非推奨の `@browserbasehq/mcp-server-browserbase` を使っていました。これらの名前ですでに書き込まれた項目は自動では書き換えられず、CLI が起動しようとすると失敗するため、手動で修正するか再インストールしてください。
+Browserbase については、`browserbase_mcp_config` と marketplace の `browserbase` カードが同じ項目を生成します。`npx -y @browserbasehq/mcp` を実行し、`env` には `BROWSERBASE_API_KEY`、`BROWSERBASE_PROJECT_ID`、`GEMINI_API_KEY`（最後のものはサーバーのデフォルトモデル用）が入ります。値はカードのインストール時に入力し（`marketplace.install` は `env: { 変数名: 値 }` で受け取り、値が欠けていればインストールを拒否して変数名を表示します）、`claude mcp add -e` と同じく文字列のまま AI 従業員の `.mcp.json` に書き込まれます。ファイルは所有者のみ読み書き可能（0600）で、`mcp.list` は各値を `set`／`not_set`／`reference` としてしか返しません。`${NAME}` 参照はここでは機能しません。CLI は自分の環境から展開しますが、gateway は `*_API_KEY` 形式の名前をすべて除いた許可リストの環境で AI 従業員の CLI を起動するためです。この変更の前はカードが参照を書き込んでおり、サーバーはキーなしで起動していました。v1.67.1 より前は、marketplace のカードと生成される Playwright 項目が npm に存在しないパッケージ名（`@anthropic-ai/mcp-server-playwright`、`@anthropic-ai/mcp-server-browserbase` などの `@anthropic-ai/mcp-server-*`）を指定し、生成される Browserbase 項目は非推奨の `@browserbasehq/mcp-server-browserbase` を使っていました。これらの名前ですでに書き込まれた項目は自動では書き換えられず、CLI が起動しようとすると失敗するため、手動で修正するか再インストールしてください。
 
 DuDuClaw のバイナリには含まれず、L2 からここへのフォールバックもありません。そのエージェントの `allowed_tools` / `denied_tools` が呼び出せるかを決めます。
 

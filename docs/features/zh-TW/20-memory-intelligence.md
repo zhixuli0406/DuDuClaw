@@ -122,7 +122,7 @@ INSERT 新列：  supersedes = <舊 id>
 
 `invalidate_by_origin(agent, origin, since)`（MCP `memory_invalidate_by_origin`，scope `admin`）是投毒來源的補救閥門：它會讓某個**精確** `origin` 的所有現行有效事實過期（只過期、不刪除；比對採等值，絕不用子字串），並可選擇只限於 `since` 之後（含）得知的事實。凡 `derived_from` 引用到被清除 id 的事實，其 `origin_trust` 會被壓到 ≤ 0.1（源自投毒輸入的衍生物不能繼續被信任）。`search()` 會立即停止回傳這些被清除的事實，而 `get_history()` 仍保留完整的鏈，並標記 `invalidated_by_event = "origin_purge"`。
 
-v1.67.1 起，被視為 AI 員工的呼叫者只能讓 `channel`、`mcp_external`、`tool_echo` 這三個低於 agent 衍生上限的類別過期。其他來源會被拒絕並記入稽核 `memory_invalidate_refused`。這項判定採 fail-closed：凡是使用 gateway 共用內部金鑰的呼叫者，不論行程裡有沒有員工身分，一律視為 AI 員工；屬於某位員工或臨時員工（`eph-` 開頭的 id）的金鑰也一樣。只有對應不到任何員工的 admin 金鑰不受限制。之前，被操縱的 AI 員工一次呼叫就能讓它命名空間裡所有操作者等級的事實過期（是哪個命名空間，見下方已知限制）。
+v1.67.1 起，被視為 AI 員工的呼叫者只能讓 `channel`、`mcp_external`、`tool_echo` 這三個低於 agent 衍生上限的類別過期。其他來源會被拒絕並記入稽核 `memory_invalidate_refused`。這項判定採 fail-closed：凡是使用 gateway 共用內部金鑰的呼叫者，不論行程裡有沒有員工身分，一律視為 AI 員工；屬於某位員工或臨時員工（`eph-` 開頭的 id）的金鑰也一樣。只有對應不到任何員工的 admin 金鑰不受限制。之前，被操縱的 AI 員工一次呼叫就能讓它命名空間裡所有操作者等級的事實過期（v1.68.0 起是該員工自己的命名空間，見下方[記憶命名空間](#記憶命名空間v1680)）。
 
 ### 寫入端投毒防護（D2）
 
@@ -168,15 +168,39 @@ v1.67.1 之前，同一個 `(agent, subject, predicate)` 的新事實一定會�
 
 `config.toml [memory] supersession_trust_guard`（預設 `true`）設成 `false` 會關閉這項檢查。讀取這個設定的是 gateway 經 `memory_factory::build_memory_engine` 建立的引擎，以及 `duduclaw mcp-server` 的記憶引擎。直接建立的引擎（例如儀表板的記憶 RPC 與 `duduclaw migrate-from`）不看這個設定，檢查一律開啟。尚未在真實聊天通道上驗證。
 
-### 已知限制：兩個記憶命名空間（v1.67.1 未修正）
+### 記憶命名空間（v1.68.0）
 
-AI 員工透過 MCP 記憶工具（`memory_store`、`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_alias_add` / `memory_alias_list`、`memory_get_history`、`memory_get_at`、`memory_invalidate_by_origin`、`user_profile_record`、`user_profile_get`、`user_code_profile`）寫入或讀取的記憶，命名空間由 MCP 金鑰決定。gateway 啟動的每位 AI 員工都用 gateway 的內部金鑰，所以全部共用同一個命名空間 `internal/gateway-internal`（從 v1.44.0 加入這把金鑰起就是如此）。gateway 自己做的事（對話與輪廓萃取、審核核准、把重點事實與輪廓區塊注入提示）用的是員工自己的 id。後果：
+MCP 記憶工具（`memory_store`、`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_alias_add` / `memory_alias_list`、`memory_get_history`、`memory_get_at`、`memory_invalidate_by_origin`、`user_profile_record`、`user_profile_get`、`user_code_profile`）依呼叫者決定命名空間（`crates/duduclaw-cli/src/mcp_namespace.rs` 的 `resolve_for_caller`）：
 
-- 同一個 gateway 的 AI 員工，會共用彼此透過這些工具存的記憶。
-- AI 員工透過工具存的內容，不是 gateway 注入它提示的內容；它的 `memory_search` 也看不到 gateway 萃取的內容。輪廓區塊反映的是萃取出的特徵與核准過的審核，不是 `user_profile_record` 的呼叫。
-- 可信度檢查只在同一個命名空間內比較。它保護 gateway 萃取與操作者核准的事實不被聊天衍生的寫入取代，但不會在兩邊之間仲裁。
+| 呼叫者 | 讀寫的命名空間（讀取時另加 `shared/public`） |
+|---|---|
+| gateway 內部金鑰，且員工身分驗證通過 | 該員工自己的 id，例如 `agnes` |
+| gateway 內部金鑰，身分未驗證 | `internal/gateway-internal`（舊的共用池） |
+| 個別員工的 MCP 金鑰，client id 是現有員工（有 `agents/<id>/agent.toml`） | 該員工的 id |
+| 其他內部金鑰 | `internal/<client_id>` |
+| 外部金鑰 | `external/<client_id>`（不變） |
 
-AI 員工之間的隔離只對 gateway 寫入的記憶成立。要改變這一點需要資料遷移，目前尚未排定。
+「驗證通過」指 `DUDUCLAW_AGENT_ID` 由 `DUDUCLAW_AGENT_TOKEN` 證明（以 `~/.duduclaw/identity.key` 對 id 做的 HMAC）。`identity.key` 存在時，gateway 會把這組值寫進每位員工的 `.mcp.json`。權杖缺少、錯誤或無法驗證時，呼叫者留在舊的共用池，無法證明的 id 碰不到任何員工的記憶。HTTP 傳輸（`duduclaw http-server`）一律不從自己的行程環境取身分：經 HTTP 的內部金鑰留在共用池，個別員工金鑰仍對應到該員工。
+
+員工自己的 id 就是 gateway 原本萃取、核准審核、注入提示（重點事實、輪廓區塊）所用的命名空間。升級後，員工的 `memory_search` 看得到 gateway 萃取的內容，透過工具存的就是 gateway 注入的，可信度檢查在同一處仲裁兩者，員工之間也不再讀得到彼此透過工具存的記憶。
+
+**行為變更。** v1.68.0 以前寫入的資料留在 `internal/gateway-internal`，不會自動搬移；身分驗證通過的員工透過工具也看不到它們。操作者用一個隱藏指令搬移，這個指令在 AI 員工的工作階段中（設有 `DUDUCLAW_AGENT_ID` 或 `DUDUCLAW_AGENT_TOKEN`）會拒絕執行：
+
+```bash
+duduclaw memory migrate-namespace list                      # 筆數，以及每筆是誰寫的
+duduclaw memory migrate-namespace export --out pool.json    # 全部欄位，檔案權限 0600，不覆寫既有檔
+duduclaw memory migrate-namespace assign --to agnes --attributed            # 預演（預設）
+duduclaw memory migrate-namespace assign --to agnes --attributed --confirm  # 實際執行
+duduclaw memory migrate-namespace archive --confirm         # 剩下的設為失效並加標籤 namespace-archived
+```
+
+- `list` 依 `tool_calls.jsonl`（含 `tool_calls.jsonl.old`）判斷每筆資料的作者：記憶工具結果裡的記憶 id、`memory_store` 輸入內容完全相同，或者（較弱的線索）前後十分鐘內只有一位員工有稽核紀錄。`user_profile_record` 不寫入 `tool_calls.jsonl`，這類資料只能依時間推定。
+- `assign --to <員工>` 必須指定 `--all`（連同共用池的實體別名一起搬）、`--ids <id,…>`、`--attributed`（依 id 或內容歸屬的資料；加 `--include-inferred` 連時間推定的也搬）三者之一。沒有 `--confirm` 只印出計畫；`--dry-run` 一律只印計畫。
+- 搬移的資料保留原 id。在目標命名空間裡比照新寫入判斷：目標已有相同的目前事實，就成為指向該事實的歷史；比目標目前事實舊的成為歷史片段；被目標中可信度較高的目前事實擋下的，`--refused hold`（預設）會轉成待審並在儀表板收件匣建立審核項目，`--refused skip` 則留在共用池。隔離中的資料留在共用池；看起來像提示注入的資料也留在共用池，除非加上 `--include-flagged`。
+- `archive` 把共用池裡仍有效的資料設為失效並加上 `namespace-archived` 標籤，保留供查閱。
+- 實際執行的 `assign` 與 `archive` 會寫稽核事件 `memory_namespace_migrated`。
+
+單元與整合測試在同一個 `memory.db` 上驅動真實的 MCP 處理函式與 gateway 注入路徑。
 
 ### 自動建檔的知識庫頁面（WP5c）
 

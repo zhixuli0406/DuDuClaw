@@ -4,8 +4,10 @@
 完全不變；MCP 工具也還留在 `tools/list` 裡，學過舊名稱的模型可以繼續呼叫。
 
 **政策**：舊名稱保留 **兩個 minor 版本**。本頁項目在 **v1.66.0** 標為棄用，預計於
-**v1.68.0** 移除；唯一例外是 Gemini CLI runtime（見 [Runtime](#runtime)），它在
-**v1.67.0** 標為棄用，預計於 **v1.69.0** 移除。
+**v1.69.0** 移除，Gemini CLI runtime（見 [Runtime](#runtime)）在 **v1.67.0** 標為棄用，
+同樣預計於 **v1.69.0** 移除。
+
+> v1.66.0 棄用項目的移除時程，在 v1.68.0 發版時從 v1.68.0 順延到 v1.69.0，目的是讓 v1.68.0 維持純功能版本。
 
 各介面怎麼標示：
 
@@ -212,9 +214,9 @@ Antigravity 的 API key 模式。目前只驗過「金鑰無效」的錯誤路�
 
 ---
 
-## v1.68.0 會發生什麼
+## 上述名稱在 v1.69.0 會發生什麼
 
-上面每個舊名稱都會被移除，只有 Gemini CLI runtime 例外，它保留到 v1.69.0（見下一節）。升級到 v1.67.x 以上之前：
+上面每個舊名稱都會在 v1.69.0 移除（Gemini CLI runtime 同版移除，見下一節）。升級到 v1.68.x 以上之前：
 
 1. 用 grep 掃你的 agent prompt、skill、自動化流程裡的舊 MCP 工具名稱。
 2. 用 grep 掃你的腳本、cron 設定、systemd unit 裡的舊 CLI 寫法。
@@ -226,7 +228,7 @@ Antigravity 的 API key 模式。目前只驗過「金鑰無效」的錯誤路�
 
 Gemini CLI runtime 會被移除（`runtime/gemini.rs`、catalog 項目、Discovery 的 Gemini
 family，以及 Docker image 內的 `gemini-cli` 套件）。Gemini API provider 保留。升級
-到 v1.68.x 以上之前：
+到 v1.69.x 以上之前：
 
 1. 用 grep 掃每個 `agent.toml` 裡的 `provider = "gemini"` 與 `fallback = "gemini"`，
    或直接執行 `duduclaw doctor`。

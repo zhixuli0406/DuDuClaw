@@ -165,6 +165,12 @@ An effort declared on a role that binds neither runtime nor model is inert (the 
 
 ---
 
+### From the dashboard (v1.68.0)
+
+- Global defaults: Settings → Advanced → Automation → One employee, four roles (global default) writes `config.toml [team] enabled`, `gate` and `[team.roles.<role>] runtime` / `model` / `effort`. The synthesizer role shown on the page is stored as `utility`. Applies to the next goal.
+- Per employee: the employee edit page → Brain & engine → One employee, four roles writes `agent.toml [team] enabled` and `[team.roles.<role>]`.
+- Settings → Advanced → Automation → Dispatch policy now offers `role_team`.
+
 ## Three rules the validator enforces
 
 A spec that breaks any of these does not form a team. The task runs Solo and the dashboard says why — a partial team is never formed.
@@ -615,7 +621,7 @@ Honest list, so nothing here reads as more finished than it is:
 - The L0 "irreversible action in the plan" exclusion is not evaluated by the gate; ActionGuard still guards irreversible calls at the point of the call, unchanged by teams.
 - ~~**The never-trim exemption is keyed on four literal markdown headings, not on the composer.**~~ Closed: the exemption is bound to the composer by a per-process sentinel marker line, and the two ceilings stay as defence in depth. See "Two seams worth knowing about".
 - **`role_turns.jsonl` counts a verifier row against the spawn budget that `plan_round` did not plan for.** The verifier is a utility call, but its ledger row carries `member_id = "team-verifier"`, and `spawns_used_for_task` counts every row with one — so each round costs one spawn more than the plan projected.
-- `cost.by_role` now reports measured team-stage spend by role and model, optionally narrowed by task id (`episode_id`). Old rows without a role remain unattributed. The dashboard team configuration card and packet/tool drill-down remain to be wired.
+- `cost.by_role` now reports measured team-stage spend by role and model, optionally narrowed by task id (`episode_id`). Old rows without a role remain unattributed. Team configuration is on the dashboard since v1.68.0 (see "Configuring roles"); the packet/tool drill-down remains to be wired.
 - Verifier token usage is captured when its runtime supplies a usage block; otherwise its `usage_*` fields are absent rather than zero. The same rule applies to planner and executor usage. The live probe's role cost ledger is incomplete and cannot serve as a provider bill.
 - **Structured judge output is codex-only.** `--output-schema` is the one structured-output flag wired; a gemini or openai-compat judge still has to be persuaded by the prompt. The team verifier now shares the offline verifier schema and accepts strict JSON as well as leading-token prose; codex team verification still needs a live round.
 - **Artifact receipts only cover paths a packet declares.** A file a member wrote without listing it in `artifacts[]` is evidenced by its native tool row but gets no hash. Sweeping the workspace for undeclared changes is future work.

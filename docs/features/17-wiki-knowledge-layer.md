@@ -205,7 +205,7 @@ Visibility is controlled via the `wiki_visible_to` capability on each page — d
 
 **One tool set, two wikis.** `wiki_ls` / `wiki_read` / `wiki_write` / `wiki_search` / `wiki_stats` / `wiki_lint` all take a `scope` parameter: `"agent"` (the default — your own wiki, unchanged) or `"shared"` (the cross-agent wiki). `wiki_share` copies a page from your wiki into the shared one, and `shared_wiki_delete` keeps its own name because there is deliberately no agent-local delete.
 
-The six `shared_wiki_*` spellings (`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`) still work as deprecated aliases and land on exactly the same handlers; they are removed in v1.68.0. See [deprecations](../guides/deprecations.md).
+The six `shared_wiki_*` spellings (`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`) still work as deprecated aliases and land on exactly the same handlers; they are removed in v1.69.0. See [deprecations](../guides/deprecations.md).
 
 ### Namespace SoT Policy (`.scope.toml`)
 

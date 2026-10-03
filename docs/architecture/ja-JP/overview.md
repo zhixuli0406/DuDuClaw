@@ -11,7 +11,7 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 - **ランタイム間フェイルオーバー時のモデル置換**（`failover.rs`）：`[runtime] fallback` が*別の* provider に呼び出しを回す場合、フォールバック先ランタイムはプライマリのモデルidを引き継がなくなりました（以前は codex エージェントの `gpt-5.4` が Claude ランタイムに対して spawn されていました）。モデルは次の4つの分岐を順に評価して決まります。① `agent.toml [model] fallbacks` のうち、モデルファミリーが確実にフォールバック先ランタイムのものである最初のエントリ（`provider/model` 形式の修飾は外します）、② そのランタイムが要求されたモデルをすでに扱える場合は要求モデルを維持（モデルファミリーを宣言しない `openai_compat` が任意のidをプロキシし続けられるのはこの分岐によります）、③ ランタイムカタログがそのバックエンドに載せている最初のモデル、④ いずれにも当てはまらなければ**spawn を拒否**し、`no model configured for fallback runtime <P>` を報告して失敗した試行として記録します。置換のたびに `agent` / `from_runtime` / `to_runtime` / `from_model` / `to_model` を含む `warn!` を出力します。
 - **MCP Server（stdio）**（`duduclaw mcp-server`）— stdin/stdout上のJSON-RPC 2.0を通じて、チャネル・メモリ・エージェント・skill・task・共有wiki・autopilotの各ツールをAI Runtimeに公開します。登録はエージェントレベルの `<agent>/.mcp.json`（v1.8.5でv1.8.4のグローバル登録を取り消しました。Claude CLIの `-p --dangerously-skip-permissions` はプロジェクトレベルの `.mcp.json` しか読み込まないため）。Gateway起動時に全エージェントの `.mcp.json` を自動作成・修復します。
 - **MCP Server（HTTP/SSE）**（`duduclaw http-server --bind 127.0.0.1:8765`、v1.9.4）— Bearer認証の `POST /mcp/v1/call`（単発のJSON-RPCツール呼び出し）、`GET /mcp/v1/stream`（長時間接続のSSEイベントストリーム、Bearerまたは `?api_key=`）、`POST /mcp/v1/stream/call`（非同期＋SSE結果プッシュ）、`GET /healthz`（認証不要）。トークンバケット方式のレート制限（60 req/min）。`mcp_sse_store.rs` がbroadcastチャネルでSSE接続を管理します。外部HTTPクライアント向けにstdioを補完します。
-- **ACP と A2A**— `duduclaw acp`（= `duduclaw acp client`）は Zed / JetBrains / Neovim のエージェントパネル向けに、stdio 上で Agent Client Protocol v1 を実装します。`duduclaw acp server`（旧名 `acp-server`、v1.68.0 までは引き続き解釈されます）は A2A を提供します。`message/send` は `bus_queue.jsonl` に追記し、`tasks/get` は bus の観測結果を A2A の状態に対応づけ、Agent Card は `/.well-known/agent-card.json`（旧 `/agent.json` エイリアスあり）にあります。
+- **ACP と A2A**— `duduclaw acp`（= `duduclaw acp client`）は Zed / JetBrains / Neovim のエージェントパネル向けに、stdio 上で Agent Client Protocol v1 を実装します。`duduclaw acp server`（旧名 `acp-server`、v1.69.0 までは引き続き解釈されます）は A2A を提供します。`message/send` は `bus_queue.jsonl` に追記し、`tasks/get` は bus の観測結果を A2A の状態に対応づけ、Agent Card は `/.well-known/agent-card.json`（旧 `/agent.json` エイリアスあり）にあります。
 - **エージェントディレクトリ**はClaude Codeと互換性があります。各ディレクトリには `.claude/`、`.mcp.json`、`SOUL.md`、`CLAUDE.md`、`CONTRACT.toml`、`agent.toml`、`wiki/`、`SKILLS/`、`memory/`、`tasks/`、`state/` が含まれます。
 
 ### チャネル（11種類）
@@ -112,7 +112,7 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 
 ### スケジューリング
 - **HeartbeatScheduler**：エージェントごとの統一スケジューリング。busポーリング + GVUサイレンスブレーカー + cron、`max_concurrent_runs` セマフォで制御。
-- **CronScheduler**：`cron_tasks.jsonl`（v1.8.12以降は `cron_tasks.db` も）を読み込み、cron式に従ってタスクを発火します。`list_cron_tasks` は全タスクを返します（v1.8.3以降、default_agentによる絞り込みは行いません）。スケジュールは `tasks_create` + `schedule` で作成します。旧来の `schedule_task` MCPツールは非推奨のエイリアスで、v1.68.0 で削除されます。
+- **CronScheduler**：`cron_tasks.jsonl`（v1.8.12以降は `cron_tasks.db` も）を読み込み、cron式に従ってタスクを発火します。`list_cron_tasks` は全タスクを返します（v1.8.3以降、default_agentによる絞り込みは行いません）。スケジュールは `tasks_create` + `schedule` で作成します。旧来の `schedule_task` MCPツールは非推奨のエイリアスで、v1.69.0 で削除されます。
 - **ReminderScheduler**：一回限りのリマインダー（相対時間 `5m`/`2h`/`1d` またはISO 8601）、`direct` 静的メッセージまたは `agent_callback` ウェイクアップモード。
 
 ### Skillエコシステム
@@ -123,7 +123,7 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 
 ### タスクとナレッジ
 - **Task Board**：SQLiteベースのタスク管理（状態/優先度/割り当てを追跡）+ リアルタイムActivity Feed WebSocket。ダッシュボード RPC：`tasks.list/create/update/remove/assign`、`activity.list`。エージェント向け MCP ツール：`tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post`。
-- **共有ナレッジベース**：`~/.duduclaw/shared/wiki/`、Wikiの対象分類（agent/shared/both）に対応。MCPツール：`scope="shared"` を付けた `wiki_ls/read/write/search/stats/lint`（`shared_wiki_*` の表記は非推奨のエイリアスで、v1.68.0 で削除）、および `shared_wiki_delete` と `wiki_share`。
+- **共有ナレッジベース**：`~/.duduclaw/shared/wiki/`、Wikiの対象分類（agent/shared/both）に対応。MCPツール：`scope="shared"` を付けた `wiki_ls/read/write/search/stats/lint`（`shared_wiki_*` の表記は非推奨のエイリアスで、v1.69.0 で削除）、および `shared_wiki_delete` と `wiki_share`。
 - **Autopilotルールエンジン**：委任/通知/skill実行の自動化。新しいルールが使えるトリガー（12種類）：`task_created`、`task_updated`、`task_status_changed`、`activity_new`、`channel_message`、`agent_idle`、`run_at_risk`、`os_file`、`os_frontmost`、`tick`、`security_event`、`odoo_event`。`cron_tick` は送出されず、v1.67.1 から作成時に拒否（[23-autopilot-engine](../../features/ja-JP/23-autopilot-engine.md)）。
 
 ### インテグレーション

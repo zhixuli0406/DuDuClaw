@@ -145,7 +145,7 @@ enabled = true          # 自律ディスパッチエンジン（goal loop ド�
 policy = "fixed_hierarchy"  # ディスパッチポリシー（どの AI従業員がタスクを引き受けるか）。後述「ディスパッチポリシー」を参照。デフォルト fixed_hierarchy
 grounding_precheck_enabled = true  # 検収前のグラウンディング事前チェック（「グラウンディング事前チェック」を参照）。デフォルト true
 two_stage_judge = true  # 検収前に安価な一次評価を実行するか（「二段階検収判定」を参照）。デフォルト true
-judge = "mav"           # 誰が検収を判定するか（「検収ジャッジの差し替え」を参照）。mav / external（evaluator_only / human_only は非推奨、v1.68.0 で削除）。デフォルト mav
+judge = "mav"           # 誰が検収を判定するか（「検収ジャッジの差し替え」を参照）。mav / external（evaluator_only / human_only は非推奨、v1.69.0 で削除）。デフォルト mav
 judge_provider = "antigravity"      # 任意：ジャッジを別のランタイムで実行（「ジャッジを別のモデルで実行する」を参照）。未設定 ⇒ デフォルトのユーティリティ用ランタイム
 judge_model = "gemini-3-pro-preview" # 任意：そのランタイム内のジャッジ用モデル id。未設定 ⇒ デフォルトのユーティリティ用モデル
 admission = "queue"     # エフェメラルな子エージェント（ephemeral spawn）が並行数上限に達したときの扱い、"queue" または "fail"。デフォルト queue（後述「エフェメラル spawn の受け入れキュー」を参照）
@@ -408,8 +408,8 @@ AI従業員が完了を報告しタスクが `review` に入った後、毎回�
 |---|---|---|
 | `mav`（デフォルト） | 一次評価器 → 3方向 MAV ジャッジパネル | 一般的なケース |
 | `external` | あなた自身のプログラム（`judge_command`） | 自前の CI、ルールエンジン、あるいは2つ目のモデルをジャッジとして組み込みたい場合 |
-| `evaluator_only` | 一次評価器のみを実行し、`candidate_complete` は直接合格とする | **非推奨、v1.68.0 で削除。** `mav` を使ってください。`two_stage_judge` がすでに安価な評価器を先に走らせ、完了候補のときだけパネルの費用を払います |
-| `human_only` | 機械による判定はなく、すべての `review` タスクが `needs_human` へ | **非推奨、v1.68.0 で削除。** `mav` とエージェント単位の `[capabilities] autonomy_level` / `approval_required_tools` を使ってください |
+| `evaluator_only` | 一次評価器のみを実行し、`candidate_complete` は直接合格とする | **非推奨、v1.69.0 で削除。** `mav` を使ってください。`two_stage_judge` がすでに安価な評価器を先に走らせ、完了候補のときだけパネルの費用を払います |
+| `human_only` | 機械による判定はなく、すべての `review` タスクが `needs_human` へ | **非推奨、v1.69.0 で削除。** `mav` とエージェント単位の `[capabilities] autonomy_level` / `approval_required_tools` を使ってください |
 
 4つの値はすべて引き続き解析されるため、非推奨モードで運用中の環境は設定どおりに動作します。プロセスごとに警告を1回記録し、ダッシュボード経由で書き込まれた場合は `judge_mode_deprecated` の監査イベントも残ります。ダッシュボードは `mav` と `external` だけを提示しますが、保存済みの非推奨値はラベル付きで表示し、黙って切り替えることはありません。[deprecations.md](deprecations.md) を参照。
 

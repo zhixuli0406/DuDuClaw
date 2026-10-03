@@ -122,7 +122,7 @@ store_temporal(agent="dudu",
 
 `invalidate_by_origin(agent, origin, since)`（MCP `memory_invalidate_by_origin`、scope `admin`）は、汚染されたソースへの是正弁です：**厳密な** `origin`（部分文字列ではなく等値）のすべての現在有効な事実を失効させ（削除は決してしない）、任意で `since` 以降に知った事実に限定できます。`derived_from` が削除された id を参照する事実は、その `origin_trust` が ≤ 0.1 に切り下げられます（汚染された入力の派生物は信頼され続けられません）。`search()` はこれら削除された事実の返却を即座に停止し、`get_history()` は `invalidated_by_event = "origin_purge"` として完全なチェーンを保持します。
 
-v1.67.1 から、AI 従業員とみなされる呼び出し元は、agent 派生の上限より低い `channel`、`mcp_external`、`tool_echo` の3クラスしか失効させられません。それ以外のオリジンは拒否され、`memory_invalidate_refused` として監査されます。この判定は fail-closed です。gateway の共有内部キーを使う呼び出し元は、プロセスに従業員の身元があるかどうかにかかわらず AI 従業員とみなされ、従業員や一時従業員（`eph-` で始まる id）に属するキーも同様です。どの従業員にも対応しない admin キーだけが制限を受けません。以前は、誘導された AI 従業員が1回の呼び出しで、自分の名前空間にあるオペレーター水準の事実をすべて失効させられました（どの名前空間かは後述の既知の制限を参照）。
+v1.67.1 から、AI 従業員とみなされる呼び出し元は、agent 派生の上限より低い `channel`、`mcp_external`、`tool_echo` の3クラスしか失効させられません。それ以外のオリジンは拒否され、`memory_invalidate_refused` として監査されます。この判定は fail-closed です。gateway の共有内部キーを使う呼び出し元は、プロセスに従業員の身元があるかどうかにかかわらず AI 従業員とみなされ、従業員や一時従業員（`eph-` で始まる id）に属するキーも同様です。どの従業員にも対応しない admin キーだけが制限を受けません。以前は、誘導された AI 従業員が1回の呼び出しで、自分の名前空間にあるオペレーター水準の事実をすべて失効させられました（v1.68.0 からはその従業員自身の名前空間です。後述の[メモリの名前空間](#メモリの名前空間v1680)を参照）。
 
 ### 書き込み側の汚染防護（D2）
 
@@ -168,15 +168,39 @@ v1.67.1 より前は、同じ `(agent, subject, predicate)` の新しい事実�
 
 `config.toml [memory] supersession_trust_guard`（デフォルト `true`）を `false` にするとこのチェックを無効にできます。この設定を読むのは、gateway が `memory_factory::build_memory_engine` で作るエンジンと、`duduclaw mcp-server` のメモリエンジンです。直接作られるエンジン（ダッシュボードのメモリ RPC や `duduclaw migrate-from` など）は設定に関係なく常にチェックが有効です。実際のチャットチャネルでは未検証です。
 
-### 既知の制限：2つのメモリ名前空間（v1.67.1 では未修正）
+### メモリの名前空間（v1.68.0）
 
-AI 従業員が MCP のメモリツール（`memory_store`、`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_alias_add` / `memory_alias_list`、`memory_get_history`、`memory_get_at`、`memory_invalidate_by_origin`、`user_profile_record`、`user_profile_get`、`user_code_profile`）で読み書きするメモリの名前空間は、MCP キーから決まります。gateway が起動する AI 従業員はすべて gateway の内部キーを使うため、1つの名前空間 `internal/gateway-internal` を共有します（このキーが導入された v1.44.0 からそうなっています）。gateway 自身の処理（会話とプロフィールの抽出、審査の承認、重要事実とプロフィールブロックのプロンプトへの注入）は従業員自身の id を使います。その結果：
+MCP のメモリツール（`memory_store`、`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_alias_add` / `memory_alias_list`、`memory_get_history`、`memory_get_at`、`memory_invalidate_by_origin`、`user_profile_record`、`user_profile_get`、`user_code_profile`）は呼び出し元から名前空間を決めます（`crates/duduclaw-cli/src/mcp_namespace.rs` の `resolve_for_caller`）。
 
-- 同じ gateway の AI 従業員は、これらのツールで保存したメモリを共有します。
-- AI 従業員がツールで保存した内容は、gateway がその従業員のプロンプトに注入する内容とは別物で、従業員の `memory_search` からは gateway が抽出した内容は見えません。プロフィールブロックに反映されるのは抽出された特性と承認済みの審査で、`user_profile_record` の呼び出しではありません。
-- 信頼度チェックは1つの名前空間の中でしか比較しません。gateway が抽出した事実とオペレーターが承認した事実をチャット由来の書き込みから守りますが、2つのプールの間を調停はしません。
+| 呼び出し元 | 読み書きする名前空間（読み取りでは `shared/public` も対象） |
+|---|---|
+| gateway 内部キー、従業員の身元が検証済み | その従業員自身の id（例：`agnes`） |
+| gateway 内部キー、身元が未検証 | `internal/gateway-internal`（従来の共有プール） |
+| 従業員ごとの MCP キーで、client id が既存の従業員（`agents/<id>/agent.toml` がある） | その従業員の id |
+| その他の内部キー | `internal/<client_id>` |
+| 外部キー | `external/<client_id>`（変更なし） |
 
-従業員間の分離が成り立つのは gateway が書き込んだメモリだけです。これを変えるにはデータ移行が必要で、予定はまだ決まっていません。
+「検証済み」とは、`DUDUCLAW_AGENT_ID` が `DUDUCLAW_AGENT_TOKEN`（`~/.duduclaw/identity.key` を鍵とした id の HMAC）で証明されていることです。`identity.key` があると、gateway はこの組を各従業員の `.mcp.json` に書き込みます。トークンがない、誤っている、検証できない場合、呼び出し元は従来の共有プールに留まり、証明できない id が従業員のメモリに届くことはありません。HTTP トランスポート（`duduclaw http-server`）は自プロセスの環境から身元を取りません。HTTP 経由の内部キーは共有プールに留まり、従業員ごとのキーはその従業員に対応します。
+
+従業員自身の id は、gateway が抽出、審査の承認、プロンプトへの注入（重要事実、プロフィールブロック）にもともと使っていた名前空間です。アップグレード後は、従業員の `memory_search` から gateway が抽出した内容が見え、ツールで保存した内容が gateway の注入対象になり、信頼度チェックが両者を同じ場所で調停し、従業員どうしがツールで保存したメモリを読み合うこともなくなります。
+
+**動作の変更。** v1.68.0 より前に書き込まれた行は `internal/gateway-internal` に残り、自動では移動しません。身元が検証された従業員からは、ツール経由で見えなくなります。オペレーターは隠しコマンドで移動します。このコマンドは AI 従業員のセッション内（`DUDUCLAW_AGENT_ID` または `DUDUCLAW_AGENT_TOKEN` が設定されている）では実行を拒否します。
+
+```bash
+duduclaw memory migrate-namespace list                      # 件数と、各行を誰が書いたか
+duduclaw memory migrate-namespace export --out pool.json    # 全フィールド、ファイル権限 0600、既存ファイルは上書きしない
+duduclaw memory migrate-namespace assign --to agnes --attributed            # 予行（既定）
+duduclaw memory migrate-namespace assign --to agnes --attributed --confirm  # 実行
+duduclaw memory migrate-namespace archive --confirm         # 残りを失効させ namespace-archived タグを付ける
+```
+
+- `list` は `tool_calls.jsonl`（と `tool_calls.jsonl.old`）から各行の書き手を判定します。メモリツールの結果に含まれるメモリ id、`memory_store` の入力内容の完全一致、または弱い手がかりとして前後10分以内に監査記録があるのが1人の従業員だけの場合です。`user_profile_record` は `tool_calls.jsonl` に記録されないため、その行は時刻からしか推定できません。
+- `assign --to <従業員>` には `--all`（共有プールのエンティティ別名も移動）、`--ids <id,…>`、`--attributed`（id か内容で帰属した行。時刻推定の行も含めるなら `--include-inferred`）のいずれか1つが必要です。`--confirm` がなければ計画を表示するだけで、`--dry-run` を付けると常に計画のみです。
+- 移動した行は id を保ちます。移動先では新しい書き込みと同じく判定されます。同じ値が現在の事実としてあれば、その事実を指す履歴になります。移動先の現在の事実より古い行は履歴区間になります。移動先のより信頼度の高い現在の事実に拒否された行は、`--refused hold`（既定）でレビュー待ちになりダッシュボードの受信箱に審査項目が作られ、`--refused skip` では共有プールに残ります。隔離中の行は共有プールに残ります。プロンプトインジェクションに見える行も、`--include-flagged` を付けない限り共有プールに残ります。
+- `archive` は共有プールでまだ有効な行を失効させ、`namespace-archived` タグを付けます。履歴として読めるまま残ります。
+- 実際に実行した `assign` と `archive` は監査イベント `memory_namespace_migrated` を書き込みます。
+
+単体テストと統合テストが、同じ `memory.db` 上で実際の MCP ハンドラーと gateway の注入経路を動かしています。
 
 ### 自動作成されたナレッジページ（WP5c）
 

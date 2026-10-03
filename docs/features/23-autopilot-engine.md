@@ -51,7 +51,7 @@ A rule can subscribe to thirteen kinds of `AutopilotEvent`. Each carries a paylo
 | **RunAtRisk** | `run_at_risk` | Foresight predicts that a running task is heading for failure | `agent_id`, `session_id`, `score`, `level`, `reasons` |
 | **OsFileEvent** | `os_file` | The agent's `[os_watch]` watcher sees a file change | `agent_id`, `path`, `kind` (created / modified / removed / renamed), `file_name`, `extension` |
 | **OsFrontmostEvent** | `os_frontmost` | The frontmost app or window title changes | `agent_id`, `app`, `window_title`, `prev_app` |
-| **Tick** | `tick` | A resident-sensing source (`[[tick.sources]]`) produces an observation | `source`, `ts`, the extracted fields and their `prev_` / `delta_` / `pct_` companions |
+| **Tick** | `tick` | A resident-sensing source (`[[tick.sources]]`, editable since v1.68.0 under Settings → Advanced → Automation → Live data feeds) produces an observation | `source`, `ts`, the extracted fields and their `prev_` / `delta_` / `pct_` companions |
 | **SecurityEvent** | `security_event` | A warning- or critical-level audit event, or a security posture change | `severity`, `event_type`, `agent_id`, `source` |
 | **OdooEvent** | `odoo_event` | The Odoo poller or `POST /webhook/odoo` reports an ERP change | `event_type`, `model`, `record_id`, `record` (its top-level scalar keys are also flattened) |
 

@@ -74,6 +74,13 @@ goal kickoff with a `grant:<tool>` tag. This is the one place the pruning costs
 something, and it is deliberate: advertising a tool that is denied right now is
 the failure mode the rule above exists to remove.
 
+### Exceptions since v1.68.0: listed but refused
+
+Two new gates refuse a call without removing the tool from `tools/list`:
+
+- `agent.toml [permissions]`: a flag written as `false` refuses `create_agent` (`can_create_agents`); `send_to_agent`, `spawn_agent` (`can_send_cross_agent`); `schedule_task`, `create_reminder` and `tasks_create` with a `schedule` (`can_schedule_tasks`); `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording` (`can_modify_own_skills`). The refusal is JSON-RPC error -32003 and a `permission_denied` audit event. An `agent.toml` that exists but cannot be read or parsed refuses these tools; a missing one allows them. `tasks_create` without a `schedule` stays allowed, which is why these flags are checked per call. Ephemeral role members are scaffolded with `can_create_agents`, `can_modify_own_skills` and `can_schedule_tasks` set to `false`.
+- `config.toml [odoo] features_*`: Odoo tools stay listed and are refused per call for models of a switched-off module (project and hr are off by default).
+
 ## The description budget
 
 Each tool's `description` is capped at **200 bytes** and each parameter's

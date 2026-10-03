@@ -37,7 +37,7 @@
 | 每目標契約欄位 + 自主研究（v1.59） | 建目標時可設 `duration_hours`（到期 → needs_human）與 `risk_boundary`（留空套五行基本款），逐輪注入並由 MAV safety 面向檢核；`/goal` 支援 `時限:`／`邊界:` 段；可勾選要求結構化預測；當日信念失準的員工自動獲派晚間研究目標 |
 | 派工引擎預設開 + 排程器活性（v1.59） | `[dispatch] enabled` 預設改 true（指派目標開箱即跑），儀表板熱切換；`/healthz` 在 cron／heartbeat 迴圈停擺逾 5 分鐘時回 503：修復排程層全滅、容器卻連日顯示 healthy 的事故 |
 | 兩段式裁決 + 判官硬化（v1.60） | MAV 判官團之前先跑便宜的第一階段評估器（`continue`/`candidate_complete`/`blocked`，預設開；任何故障降級直跑完整 MAV，絕不自動通過）；四條判官紀律（反棘輪、只稽核不自建證據、反契約外擴張、自稱完成不是證據）；修掉截斷面板與首 token `PASS` 誤判兩個 fail-open 洞；gap 指紋停滯偵測；提前收工偵測；`resume_on_restart` 預設 `pause` |
-| 可換判官 seam（v1.60） | `[dispatch] judge = mav / evaluator_only / external / human_only`（`evaluator_only` 與 `human_only` 自 v1.66.0 起棄用，v1.68.0 移除）：外部判官任何故障一律降級回 MAV（變嚴、留稽核），其 feedback 視為未受信 DATA；未知值回退 `mav`；設定→自動化有下拉選擇器 |
+| 可換判官 seam（v1.60） | `[dispatch] judge = mav / evaluator_only / external / human_only`（`evaluator_only` 與 `human_only` 自 v1.66.0 起棄用，v1.69.0 移除）：外部判官任何故障一律降級回 MAV（變嚴、留稽核），其 feedback 視為未受信 DATA；未知值回退 `mav`；設定→自動化有下拉選擇器 |
 | 目標契約凍結（v1.60） | 建立時把驗收標準凍結成不可變 `acceptance_criteria_baseline`，判官與評估器一律讀這份基準；agent 身分以 `tasks_update` 改 goal 任務驗收標準一律拒絕並留稽核；`/goal` 未帶標準時附四要素引導與 outcome 式標準建議 |
 | 目標迴圈人為信號 + 准入排隊（v1.60） | needs_human 帶封閉六類 `pause_reason`（觸發現場靜態標記，絕不從 LLM 敘述反解）；逾時進度通報（`progress_report_minutes`）；零 LLM 工具連擊 advisory（3/5/8 逐級）；ephemeral spawn 超限改有界 FIFO 排隊（預設 `queue`）；預算耗盡改交「最佳輪成品」（確定性挑選 + 差距清單，不再空手升級） |
 | Agent Mail（v1.60） | 每 agent 信箱（`/mail` 頁）：Gmail API／drop folder 入站，外發一律先建草稿等 ApprovalBroker 確認（背景 worker 是唯一寄信者），信件內容 DATA 圍欄，獨立不可外部授予的 scope，跨 agent 讀信過 delegation policy 判定（[47-agent-mail.md](47-agent-mail.md)） |
@@ -97,7 +97,7 @@
 | Aider 式程式碼符號圖（`code_map` MCP 工具） | tree-sitter 符號圖疊在 HippoRAG-lite Personalized-PageRank 引擎上；依查詢相關度排序 repo 檔案 |
 | 語意向量記憶（`w_vec`） | FTS/graph 之外的第三個 re-rank 訊號；零依賴、CJK-safe 的 `NgramHashEmbedder`，以 `DUDUCLAW_SEMANTIC_VECTORS=1` 開啟 |
 | 跨 session 使用者畫像 | 每使用者偏好 traits（temporal supersession）→ session-stable 的 `## About This User` 回覆注入（來自 gateway 萃取與核准的審核）；`user_profile_record` / `user_profile_get` MCP 工具讀寫的是所有 gateway 啟動的員工共用的另一個命名空間，不會進入這個區塊（已知限制，v1.67.1） |
-| GDPR 匯出／抹除 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`（舊寫法 `gdpr export` 在 v1.68.0 前仍可解析），涵蓋記憶（triple + 提及 + key_facts，四表級聯，SHA-256 tombstone）**與** session 儲存（`<channel>:<chat_id>` prefix） |
+| GDPR 匯出／抹除 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`（舊寫法 `gdpr export` 在 v1.69.0 前仍可解析），涵蓋記憶（triple + 提及 + key_facts，四表級聯，SHA-256 tombstone）**與** session 儲存（`<channel>:<chat_id>` prefix） |
 | Custom Dashboard Widgets | 在沙盒 runtime 中執行的 AI 引導或原始 HTML 儀表板卡片；Widget Studio 分享／匯入／匯出（[30-custom-widgets.md](30-custom-widgets.md)） |
 | 預算斷路器 | 每 agent 滑動視窗硬上限（`[budget] daily_cap_cents`），到頂即於 choke-point 阻斷 LLM 呼叫；寫 `budget_events.jsonl` |
 | 燒錢速率異常偵測 | 對每日花費做滾動平均＋標準差離群偵測（`cost_anomaly.rs`） |
@@ -121,7 +121,7 @@
 |------|------|
 | Multi-Runtime AI Agent 平台 | 統一 `AgentRuntime` trait：`runtime_catalog.rs` 中有 13 個 runtime id，包含十二個 CLI 後端（Claude、Codex、Gemini（已棄用）、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）與 OpenAI-compat HTTP，支援自動偵測（[13-multi-runtime.md](13-multi-runtime.md)） |
 | MCP Server（JSON-RPC 2.0） | 透過 stdin/stdout 向 AI Runtime 暴露 249 個工具（v1.67.0；`tools/list` 只列出呼叫者可呼叫的工具）；註冊於 `<agent>/.mcp.json`（v1.8.5，Claude CLI `-p` 僅讀取專案層級），gateway 啟動時自動建立／修復 |
-| ACP/A2A Server | 兩個指令：`duduclaw acp`（= `duduclaw acp client`），IDE agent panel 用的 Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` 串流，未設定時回 `AUTH_REQUIRED`）；`duduclaw acp server`（原 `acp-server`，v1.68.0 前仍可解析），A2A 協定（`agent/discover` / `message/send` / `tasks/*`，`/.well-known/agent-card.json` Agent Card，另有 legacy `/agent.json` 別名） |
+| ACP/A2A Server | 兩個指令：`duduclaw acp`（= `duduclaw acp client`），IDE agent panel 用的 Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` 串流，未設定時回 `AUTH_REQUIRED`）；`duduclaw acp server`（原 `acp-server`，v1.69.0 前仍可解析），A2A 協定（`agent/discover` / `message/send` / `tasks/*`，`/.well-known/agent-card.json` Agent Card，另有 legacy `/agent.json` 別名） |
 | Agent 目錄結構 | `.claude/`、`.mcp.json`、`SOUL.md`、`CLAUDE.md`、`CONTRACT.toml`、`agent.toml`、`wiki/`、`SKILLS/`、`memory/`、`tasks/`、`state/` |
 | Sub-agent 編排 | `create_agent` / `spawn_agent` / `list_agents` + `reports_to` 階層 + D3.js 組織圖 + 系統 prompt 自動注入「## Your Team」 |
 | DelegationEnvelope | 結構化交接協議：context / constraints / task_chain / expected_output |
@@ -218,7 +218,7 @@
 | Dedup 偵測 | `wiki_dedup`：標題匹配 + 標籤 Jaccard 相似度（≥0.8） |
 | 反向 backlink 索引 | 掃描 `related` frontmatter + body markdown 連結，建立雙向對應 |
 | 搜尋篩選 | `min_trust` / `layer` / `expand`（1-hop related/backlink 擴充） |
-| 共享 Wiki | `~/.duduclaw/shared/wiki/` 跨 Agent SOP／政策／規格；`wiki_visible_to` 可見度控制；MCP 工具 `wiki_ls/read/write/search/stats/lint` 搭配 `scope="shared"`（`shared_wiki_*` 寫法為已棄用別名，v1.68.0 移除），另有 `shared_wiki_delete` 與 `wiki_share`；`.scope.toml` SoT 政策（見「身分與存取」） |
+| 共享 Wiki | `~/.duduclaw/shared/wiki/` 跨 Agent SOP／政策／規格；`wiki_visible_to` 可見度控制；MCP 工具 `wiki_ls/read/write/search/stats/lint` 搭配 `scope="shared"`（`shared_wiki_*` 寫法為已棄用別名，v1.69.0 移除），另有 `shared_wiki_delete` 與 `wiki_share`；`.scope.toml` SoT 政策（見「身分與存取」） |
 | CLAUDE_WIKI 模板 | 新 Agent 建立時納入 CLAUDE.md，提供 wiki MCP 工具使用指引 |
 
 ## 技能生態
@@ -339,7 +339,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永久化（v1.8.12）；排程以 `tasks_create` + `schedule` 建立（舊的 `schedule_task` 工具為已棄用別名，v1.68.0 移除） |
+| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永久化（v1.8.12）；排程以 `tasks_create` + `schedule` 建立（舊的 `schedule_task` 工具為已棄用別名，v1.69.0 移除） |
 | ReminderScheduler | 一次性提醒（相對 `5m`/`2h`/`1d` 或 ISO 8601），`direct` / `agent_callback` 兩種模式 |
 | HeartbeatScheduler | 每 Agent 統一排程：bus polling + GVU 沉默喚醒 + cron |
 | 排程器級任務板拉取（v1.9.3） | `poll_assigned_tasks` 移入 `HeartbeatScheduler::run` tick：每 30s 掃描整個 agent registry（不再略過 `enabled=false` 的 agent）；1 小時 LIKE-marker 冷卻防止 stampede |

@@ -52,7 +52,7 @@ L1 與 L2 都不執行 JavaScript。單頁應用（SPA）只會回傳空殼。
 }
 ```
 
-Browserbase 方面，`browserbase_mcp_config` 與 marketplace 的 `browserbase` 卡片產生同一個項目：執行 `npx -y @browserbasehq/mcp`，`env` 只放 `${BROWSERBASE_API_KEY}`、`${BROWSERBASE_PROJECT_ID}`、`${GEMINI_API_KEY}` 三個參照（最後一個給這個 server 的預設模型用），金鑰本身不會寫進 `.mcp.json`。這三個變數都要設在 AI 員工的 CLI 執行時的環境裡。v1.67.1 之前，marketplace 卡片與產生的 Playwright 項目用的是 npm 上不存在的套件名稱（`@anthropic-ai/mcp-server-playwright`、`@anthropic-ai/mcp-server-browserbase` 等 `@anthropic-ai/mcp-server-*`），產生的 Browserbase 項目則用已棄用的 `@browserbasehq/mcp-server-browserbase`；已經用這些名稱寫入的項目不會被自動改寫，CLI 啟動它時會失敗，請手動修改或重新安裝。
+Browserbase 方面，`browserbase_mcp_config` 與 marketplace 的 `browserbase` 卡片產生同一個項目：執行 `npx -y @browserbasehq/mcp`，`env` 放 `BROWSERBASE_API_KEY`、`BROWSERBASE_PROJECT_ID`、`GEMINI_API_KEY`（最後一個給這個 server 的預設模型用）。值在安裝卡片時填入（`marketplace.install` 以 `env: { 變數名: 值 }` 接收，缺值會拒絕安裝並列出變數名稱），跟 `claude mcp add -e` 一樣以字串原樣寫進該 AI 員工的 `.mcp.json`。檔案權限只有擁有者可讀寫（0600），`mcp.list` 對每個值只回 `set`／`not_set`／`reference`。這裡用 `${NAME}` 參照行不通：CLI 從自己的環境展開參照，而 gateway 啟動 AI 員工的 CLI 時只保留白名單環境變數，`*_API_KEY` 形式的名稱全部拿掉。改版前卡片寫的就是參照，server 啟動時沒有金鑰。v1.67.1 之前，marketplace 卡片與產生的 Playwright 項目用的是 npm 上不存在的套件名稱（`@anthropic-ai/mcp-server-playwright`、`@anthropic-ai/mcp-server-browserbase` 等 `@anthropic-ai/mcp-server-*`），產生的 Browserbase 項目則用已棄用的 `@browserbasehq/mcp-server-browserbase`；已經用這些名稱寫入的項目不會被自動改寫，CLI 啟動它時會失敗，請手動修改或重新安裝。
 
 它不在 DuDuClaw binary 裡，L2 也不會自動降級到它。該 agent 的 `allowed_tools`／`denied_tools` 決定能不能呼叫。
 

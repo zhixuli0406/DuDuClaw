@@ -35,7 +35,7 @@ duduclaw pack install <src>        # 依 kind 分流;付費內容只在一處檢
 
 `duduclaw expert install` 是 `pack install` 的別名,行為完全相同;製作端動詞(`pack`、`publish`、`export`、`convert-teams`、`hooks`、`remove`)仍留在 `duduclaw expert` 之下。儀表板的一鍵安裝與 `experts.install` 走到的是同一段程式,因為它們本來就是驅動 CLI。
 
-**`expert.toml`、`team.toml`、`preset.toml` 到 v1.68.0 都還能用。** 磁碟上一個字都不改。`duduclaw pack inspect <dir> --emit-canonical` 會印出舊包對應的 `pack.toml`,讓你自己審過再遷移——而不是讓機器去改寫由你負責的內容。
+**`expert.toml`、`team.toml`、`preset.toml` 到 v1.69.0 都還能用。** 磁碟上一個字都不改。`duduclaw pack inspect <dir> --emit-canonical` 會印出舊包對應的 `pack.toml`,讓你自己審過再遷移——而不是讓機器去改寫由你負責的內容。
 
 ## 安裝管線
 

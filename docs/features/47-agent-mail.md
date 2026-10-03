@@ -60,6 +60,8 @@ smtp_tls = "starttls"                # none | implicit | starttls (default)
 Every field falls back independently on a wrong type or a missing key — one
 bad line in `[mail]` never disables the rest of the mailbox.
 
+Since v1.68.0 `enabled`, `gmail_enabled`, `dropfolder_enabled`, `default_agent` and `auto_trigger` can also be set on the dashboard: Settings → Advanced → Automation → AI employee mailbox (admin only, applies without a restart). The outbound settings are still edited in `config.toml` or the Advanced config editor.
+
 ## Two Inbound Transports
 
 Both are dependency-free on purpose — no IMAP crate, no second credential

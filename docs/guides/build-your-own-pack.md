@@ -43,7 +43,7 @@ Write the persona in `agents/helper/soul.md`. Identity / responsibilities / boun
 
 ### Or write the canonical `pack.toml`
 
-`expert.toml` above is the legacy dialect — fully supported until **v1.68.0**. New packs can instead declare a `pack.toml`, the one schema shared by teams, single-persona industry packs and job presets:
+`expert.toml` above is the legacy dialect — fully supported until **v1.69.0**. New packs can instead declare a `pack.toml`, the one schema shared by teams, single-persona industry packs and job presets:
 
 ```toml
 [pack]

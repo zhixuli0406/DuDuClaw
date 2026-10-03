@@ -205,7 +205,7 @@ Report candidate duplicates:
 
 **一套工具，兩個 wiki。** `wiki_ls` / `wiki_read` / `wiki_write` / `wiki_search` / `wiki_stats` / `wiki_lint` 都吃一個 `scope` 參數：`"agent"`（預設，就是你自己的 wiki，行為不變）或 `"shared"`（跨 agent 的共享 wiki）。`wiki_share` 把你 wiki 裡的頁面複製進共享 wiki；`shared_wiki_delete` 保留原名，因為 agent-local 那側刻意沒有刪除入口。
 
-六個 `shared_wiki_*` 寫法（`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`）仍可使用，屬棄用別名，落在完全相同的 handler 上，v1.68.0 移除。見[已棄用名稱](../../guides/zh-TW/deprecations.md)。
+六個 `shared_wiki_*` 寫法（`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`）仍可使用，屬棄用別名，落在完全相同的 handler 上，v1.69.0 移除。見[已棄用名稱](../../guides/zh-TW/deprecations.md)。
 
 ### 命名空間 SoT 政策（`.scope.toml`）
 

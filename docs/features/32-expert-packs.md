@@ -35,7 +35,7 @@ duduclaw pack install <src>        # routes by `kind`; premium content checks th
 
 `duduclaw expert install` is an alias for `pack install` and behaves identically; the authoring verbs (`pack`, `publish`, `export`, `convert-teams`, `hooks`, `remove`) stay under `duduclaw expert`. The dashboard's one-click install and `experts.install` reach the same code, because both already drive the CLI.
 
-**`expert.toml`, `team.toml` and `preset.toml` keep working until v1.68.0.** Nothing on disk is rewritten. `duduclaw pack inspect <dir> --emit-canonical` prints the `pack.toml` a legacy pack corresponds to so you can review and migrate it deliberately, rather than having a machine rewrite content you are responsible for.
+**`expert.toml`, `team.toml` and `preset.toml` keep working until v1.69.0.** Nothing on disk is rewritten. `duduclaw pack inspect <dir> --emit-canonical` prints the `pack.toml` a legacy pack corresponds to so you can review and migrate it deliberately, rather than having a machine rewrite content you are responsible for.
 
 ## The Install Pipeline
 

@@ -35,7 +35,7 @@
 | ゴール単位の契約フィールド + 自主研究(v1.59) | ゴール作成時に `duration_hours`(期限超過 → needs_human)と `risk_boundary`(空なら 5 行のベースライン)を設定可能、毎ラウンド注入され MAV の safety 観点の基準に;`/goal` は `時限:`/`邊界:` セグメント対応;構造化予測を任意で要求可能;当日の信念を外したエージェントには夜間の自主研究ゴールを自動割り当て |
 | ディスパッチエンジンのデフォルト有効化 + スケジューラ生存性(v1.59) | `[dispatch] enabled` デフォルトを true に(割り当てたゴールが箱出しで実行される)、ダッシュボードでホット切替;cron/heartbeat ループが 5 分以上停止すると `/healthz` が 503——スケジューラ全滅中もコンテナが healthy 表示だった事故を封じる |
 | 二段階裁決 + 判定の強化(v1.60) | MAV 判定団の前に安価な第一段階評価器(`continue`/`candidate_complete`/`blocked`、デフォルト on;いかなる障害も完全 MAV へ降格、自動合格は絶対にしない);判定規律 4 条(反ラチェット、監査のみで証拠を自作しない、契約外拡張禁止、自己申告の完了は証拠でない);切り詰められたパネル JSON と先頭トークン `PASS` の 2 つの誤検出穴を封鎖;gap 指紋による停滞検出;早期切り上げ検出;`resume_on_restart` デフォルト `pause` |
-| 差し替え可能な判定 seam(v1.60) | `[dispatch] judge = mav / evaluator_only / external / human_only`(`evaluator_only` と `human_only` は v1.66.0 から非推奨、v1.68.0 で削除)。外部判定の障害は常に MAV へ降格(より厳格、監査記録付き)、その feedback は未信頼 DATA として処理;未知の値は `mav` にフォールバック;設定→自動化にセレクタ |
+| 差し替え可能な判定 seam(v1.60) | `[dispatch] judge = mav / evaluator_only / external / human_only`(`evaluator_only` と `human_only` は v1.66.0 から非推奨、v1.69.0 で削除)。外部判定の障害は常に MAV へ降格(より厳格、監査記録付き)、その feedback は未信頼 DATA として処理;未知の値は `mav` にフォールバック;設定→自動化にセレクタ |
 | ゴール契約の凍結(v1.60) | 作成時に受け入れ基準を不変の `acceptance_criteria_baseline` として凍結、判定と評価器はこのベースラインのみを読む;エージェント身分による goal タスク受け入れ基準の変更は拒否 + 監査記録;基準なしの `/goal` には 4 要素ガイダンスと outcome 式基準の提案を付与 |
 | ゴールループの人間シグナル + アドミッションキュー(v1.60) | needs_human に閉じた 6 分類の `pause_reason`(トリガー現場で静的スタンプ、LLM の記述から逆解析しない);超過進捗レポート(`progress_report_minutes`);LLM ゼロのツール連打アドバイザリ(3/5/8 段階);ephemeral spawn の上限超過は有界 FIFO キューに(デフォルト `queue`);予算枯渇時は「ベストラウンド成果物」を引き渡し(決定論的選択 + ギャップ一覧、手ぶらエスカレーションの廃止) |
 | Agent Mail(v1.60) | エージェントごとのメールボックス(`/mail` ページ):Gmail API / drop folder 受信、送信は常にドラフト作成 → ApprovalBroker 確認待ち(実送信はバックグラウンドワーカーのみ)、メール内容は DATA フェンス、外部付与不可の専用 scope、エージェント横断の閲覧は組織権限判定を通過([47-agent-mail.md](47-agent-mail.md)) |
@@ -95,7 +95,7 @@
 | Aider 式コードシンボルグラフ(`code_map` MCP ツール) | tree-sitter シンボルグラフを HippoRAG-lite Personalized-PageRank エンジン上で実行し、クエリとの関連度でリポジトリのソースファイルをランク付け |
 | セマンティックベクトル記憶(`w_vec`) | FTS/graph に加えた第三の re-rank シグナル。依存ゼロ・CJK 安全の `NgramHashEmbedder`、`DUDUCLAW_SEMANTIC_VECTORS=1` で有効化 |
 | セッション横断ユーザープロファイル | ユーザーごとの嗜好 traits(temporal supersession)→ セッション安定な `## About This User` を返信に注入（gateway の抽出と承認済みの審査から）。`user_profile_record` / `user_profile_get` MCP ツールは gateway が起動する全従業員で共有される別の名前空間を読み書きするため、このブロックには反映されない（既知の制限、v1.67.1） |
-| GDPR エクスポート/消去 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`(旧表記 `gdpr export` は v1.68.0 まで引き続き解釈される)が記憶(triple + 本文言及 + key_facts、4 テーブルのカスケード、SHA-256 仮名 tombstone)**と**セッションストア(`<channel>:<chat_id>` プレフィックス)を対象 |
+| GDPR エクスポート/消去 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`(旧表記 `gdpr export` は v1.69.0 まで引き続き解釈される)が記憶(triple + 本文言及 + key_facts、4 テーブルのカスケード、SHA-256 仮名 tombstone)**と**セッションストア(`<channel>:<chat_id>` プレフィックス)を対象 |
 | Custom Dashboard Widgets | サンドボックス化されたランタイムで動作する、AI ガイドまたは生 HTML のダッシュボードカード。Widget Studio での共有/インポート/エクスポート([30-custom-widgets.md](30-custom-widgets.md)) |
 | 予算サーキットブレーカー | エージェント単位のスライディングウィンドウ上限(`[budget] daily_cap_cents`)。上限到達で choke-point にて LLM 呼び出しを遮断。`budget_events.jsonl` |
 | バーンレート異常検知 | エージェントごとの日次支出に対し移動平均+標準偏差で外れ値を検出(`cost_anomaly.rs`) |
@@ -119,7 +119,7 @@
 |------|------|
 | マルチランタイム AI エージェントプラットフォーム | 統一 `AgentRuntime` trait。`runtime_catalog.rs` に 13 のランタイム id：12 の CLI バックエンド（Claude、Codex、Gemini（非推奨）、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）と OpenAI-compat HTTP、自動検出付き（[13-multi-runtime.md](13-multi-runtime.md)） |
 | MCP Server（JSON-RPC 2.0）| stdin/stdout 経由で AI Runtime に 249 ツールを公開（v1.67.0。`tools/list` は呼び出し元が呼べるものだけにフィルタ）。`<agent>/.mcp.json` に登録（v1.8.5、Claude CLI `-p` はプロジェクトレベルのみ読取）、ゲートウェイが起動時に自動生成/修復 |
-| ACP/A2A Server | 2 コマンド：`duduclaw acp`（= `duduclaw acp client`）は IDE agent panel 向け Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` ストリーミング、未設定時は `AUTH_REQUIRED`）；`duduclaw acp server`（旧 `acp-server`、v1.68.0 まで引き続き解釈される）は A2A プロトコル（`agent/discover` / `message/send` / `tasks/*`、`/.well-known/agent-card.json` の Agent Card と旧 `/agent.json` の別名） |
+| ACP/A2A Server | 2 コマンド：`duduclaw acp`（= `duduclaw acp client`）は IDE agent panel 向け Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` ストリーミング、未設定時は `AUTH_REQUIRED`）；`duduclaw acp server`（旧 `acp-server`、v1.69.0 まで引き続き解釈される）は A2A プロトコル（`agent/discover` / `message/send` / `tasks/*`、`/.well-known/agent-card.json` の Agent Card と旧 `/agent.json` の別名） |
 | エージェントディレクトリ構造 | `.claude/`, `.mcp.json`, `SOUL.md`, `CLAUDE.md`, `CONTRACT.toml`, `agent.toml`, `wiki/`, `SKILLS/`, `memory/`, `tasks/`, `state/` |
 | サブエージェントオーケストレーション | `create_agent` / `spawn_agent` / `list_agents` + `reports_to` 階層 + D3.js OrgChart + 「## Your Team」自動注入 |
 | DelegationEnvelope | 構造化受け渡しプロトコル — context / constraints / task_chain / expected_output |
@@ -217,7 +217,7 @@
 | Dedup 検出 | `wiki_dedup` — タイトルマッチ + タグ Jaccard 類似度（≥0.8） |
 | 逆 backlink 索引 | `related` frontmatter + body markdown リンクをスキャン |
 | 検索フィルタ | `min_trust` / `layer` / `expand`（1-hop related/backlink 拡張） |
-| 共有 Wiki | `~/.duduclaw/shared/wiki/` — 組織横断 SOP/ポリシー/仕様、`wiki_visible_to` 可視性制御；MCP ツール `wiki_ls/read/write/search/stats/lint` を `scope="shared"` で使用（`shared_wiki_*` 表記は非推奨の別名で v1.68.0 で削除）、加えて `shared_wiki_delete` と `wiki_share`；`.scope.toml` SoT ポリシー（「アイデンティティとアクセス」参照）|
+| 共有 Wiki | `~/.duduclaw/shared/wiki/` — 組織横断 SOP/ポリシー/仕様、`wiki_visible_to` 可視性制御；MCP ツール `wiki_ls/read/write/search/stats/lint` を `scope="shared"` で使用（`shared_wiki_*` 表記は非推奨の別名で v1.69.0 で削除）、加えて `shared_wiki_delete` と `wiki_share`；`.scope.toml` SoT ポリシー（「アイデンティティとアクセス」参照）|
 | CLAUDE_WIKI テンプレート | 新規エージェント作成時に CLAUDE.md へ同梱、LLM に wiki MCP ツールの使い方を教示 |
 
 ## スキルエコシステム
@@ -338,7 +338,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永続化（v1.8.12）。スケジュールは `tasks_create` + `schedule` で作成（旧 `schedule_task` ツールは非推奨の別名で v1.68.0 で削除） |
+| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永続化（v1.8.12）。スケジュールは `tasks_create` + `schedule` で作成（旧 `schedule_task` ツールは非推奨の別名で v1.69.0 で削除） |
 | ReminderScheduler | 一度限りのリマインダー（相対 `5m`/`2h`/`1d` または ISO 8601）、`direct` / `agent_callback` モード |
 | HeartbeatScheduler | エージェント毎統一スケジューリング — バスポーリング + GVU サイレンスブレイカー + cron |
 | スケジューラレベルのタスクボードプル（v1.9.3）| `poll_assigned_tasks` を `HeartbeatScheduler::run` tick へ移動 — 30s 毎に全エージェントレジストリを走査（`enabled=false` をスキップしない）；1 時間 LIKE-marker クールダウンでスタンピード防止 |

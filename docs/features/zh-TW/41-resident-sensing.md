@@ -158,8 +158,8 @@ preset = "conservative"   # 或 "aggressive"；不寫這個鍵就維持原本的
   不會替你猜一個。
 
 如果你原本就擔心初篩層 fail-open 的預設，選 `conservative`：地端模型答不出來時，
-動作會被攔下來而不是照樣派出去。儀表板的「即時監控來源」卡片會顯示目前生效的 preset
-（唯讀，設定由 `config.toml` 擁有）。
+動作會被攔下來而不是照樣派出去。儀表板的「即時監控來源」卡片會顯示目前生效的 preset。
+v1.68.0 起可以在系統設定 → 進階設定 → 自動化引擎 →「常駐感知」設定（`[tick] preset`）。
 
 ### websocket 來源要知道的六件事
 
@@ -406,8 +406,20 @@ v1.67.1 起，這條規則的條件部分可以在儀表板建立（設定 → �
 - **`ticks.recent`**：取單一來源最近的觀測值（`source` 必填，`limit` 上限
   50 筆），依時間由舊到新排列，展開卡片可看到每筆的時間戳與欄位內容。
 
-卡片本身是唯讀的：新增或啟用一個來源是改 `config.toml` 的動作，不是儀表板上
-可以按的按鈕。
+監控卡片本身只負責顯示。v1.68.0 起，設定與資料來源在系統設定 → 進階設定 →
+自動化引擎 →「常駐感知」編輯：
+
+- `[tick] enabled`、`preset`、`allow_command_sources`、`dns_ttl_secs` 透過
+  `system.update_config` 寫入；改動 `allow_command_sources` 另記稽核
+  `config_protected_key_changed`。
+- 「資料來源」清單透過三個只限管理員的 RPC `tick.sources.list` / `upsert` /
+  `remove` 新增、編輯、刪除 `[[tick.sources]]`（id、種類、網址／指令／路徑、
+  間隔、JSON 欄位、標頭、速率上限、基準有效期、websocket 訂閱訊框）。標頭的值
+  不會回傳，只回傳 `headers_count`；寫入 `command` 類來源記稽核
+  `config_protected_key_changed`（鍵名 `tick.sources.command`）。
+- 存檔後，gateway 已載入常駐感知時會直接重新啟動資料來源（`hot_reloaded: true`）；
+  否則回應 `restart_required: true`，儀表板顯示重啟提示。
+- 無法解析的 `config.toml` 不會被改寫，請先在「設定檔進階編輯」修好。
 
 ---
 

@@ -150,7 +150,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/hardware-requirements.md](guides/hardware-requirements.md) | DuDuClaw OS 硬體需求與相容性指南（硬性條件 x86-64+AVX2／UEFI／SSD、最低/建議/舒適配置表、自組 PC 相容性檢查清單、x86 筆電評估、推薦迷你主機 N100/N305/8845HS、驅動缺口 MT7927/RTL8125、樹莓派/Arduino/ESP32 為何跑不了 OS＋作為 resident sensing 感測端點的接入方式、兩層總矩陣、為何不能用 ARM/Mac 模擬、燒 USB 而非光碟） | Current |
 | [guides/remote-gpu-host.md](guides/remote-gpu-host.md) | 遠端 GPU 主機準備指南（Ubuntu + CUDA 驅動、venv 安裝 LLaMA-Factory、工作目錄、選用 llama.cpp 轉 GGUF、SSH 金鑰授權與 `BatchMode` 驗證、表單欄位對照、先跑乾跑、template 對照表、故障排除） | Current |
 | guides/app-compat.md | 已移至 DuDuClaw-OS repo `docs/guides/app-compat.md`（2026-09-29） | Moved |
-| [guides/deprecations.md](guides/deprecations.md) | 已棄用名稱總表（T5：`shared_wiki_*`→`wiki_* scope`、`create_task`/`schedule_task`→`tasks_create kind`/`schedule`、`skill_bank_search`→`skill_search source`、CLI `migrate`/`export`/`acp` 收斂、`[dispatch] judge` 兩個模式；全部 v1.68.0 移除） | Current |
+| [guides/deprecations.md](guides/deprecations.md) | 已棄用名稱總表（T5：`shared_wiki_*`→`wiki_* scope`、`create_task`/`schedule_task`→`tasks_create kind`/`schedule`、`skill_bank_search`→`skill_search source`、CLI `migrate`/`export`/`acp` 收斂、`[dispatch] judge` 兩個模式；全部 v1.69.0 移除） | Current |
 | [guides/desktop-build.md](guides/desktop-build.md) | Desktop app — local build guide (Tauri 2 shell running the gateway as a sidecar) | Current |
 | [guides/desktop-release.md](guides/desktop-release.md) | Desktop app — release, signing and auto-update pipeline | Current |
 | [guides/desktop-unblock.md](guides/desktop-unblock.md) | Desktop app — what the remaining blocked items need (toolchain, credentials, a second machine) | Current |
@@ -158,6 +158,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/deployment-guide.md](guides/deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |
+| [guides/dashboard-settings.md](guides/dashboard-settings.md) | 儀表板設定對照（v1.68.0）：每個開關的頁面位置、寫入的設定鍵、是否需要重啟；AI 員工編輯頁欄位與管理員限定欄位；`[permissions]` 生效與開機遷移；「設定檔進階編輯」（遮罩、驗證、備份、稽核、衝突偵測）（also in `zh-TW/` and `ja-JP/`） | Current |
 | [guides/mcp-tools.md](guides/mcp-tools.md) | `tools/list` 宣告面（O7）：依呼叫者能力裁剪的規則表、`notifications/tools/list_changed`、200-byte 說明預算與唯一例外，以及從說明搬出的長版細節（`codrive_run` 三段階梯、`working_state_handoff` 結構化模式、`skill_search` source、`evolution_toggle` 停滯子欄位） | Current |
 | [guides/mcp-bridge.md](guides/mcp-bridge.md) | Mounting external MCP servers (`[[mcp.external]]`, stdio + Streamable HTTP `url` mounts) + `secret://`/`bearer_token` credentials + per-SaaS recipes (Gmail/Plane/Chatwoot/Invoice Ninja/WooCommerce) | Current |
 | [guides/google-workspace-integration.md](guides/google-workspace-integration.md) | Google Workspace 設定指南（選路徑導覽：自建 OAuth client／服務帳號網域委派／Apps Script 橋接三選一，逐步操作 + 11 個 scope 用途一覽 + 設定頁按鈕對照，D5：不預埋官方憑證） | Current |

@@ -16,7 +16,7 @@
 
 ## 兩條路徑、兩套設定
 
-最重要的一點：**HTTP 語音端點與 Telegram 語音處理是分開接線的，而 `[voice]` 設定只到得了其中一條。**
+最重要的一點：**HTTP 語音端點與 Telegram 語音處理是分開接線的。** v1.68.0 起語音轉文字（`config.toml [voice] stt_*`）兩邊都用得到，LINE 語音訊息也一樣；文字轉語音（`inference.toml [voice] tts_*`）仍然只影響 HTTP 端點。
 
 ### 路徑 1 — HTTP 端點（儀表板、WebChat）
 
@@ -55,11 +55,11 @@ stt_command   = "whisper-cli -m /models/ggml-base.bin -f {audio} --output-txt --
 
 語音或音訊訊息會觸發 `transcribe_voice`：bot 呼叫 `getFile`，對回傳的 `file_path` 做路徑穿越驗證（`..`、絕對路徑、NUL、非白名單字元），下載時在 `content_length` 與實際位元組兩處都檢查大小上限，然後轉錄。
 
-**接著它呼叫 `duduclaw_inference::whisper::transcribe(bytes, Some("zh"), WhisperMode::Api)`——供應商與語言都是寫死的。** 語音回覆（每個聊天室用 `/voice` 切換）直接 new 一個 `EdgeTtsProvider`，同樣寫死；音訊上傳失敗時會退回純文字。
+**v1.68.0 起它呼叫 `stt::transcribe_channel_audio`，使用儀表板的語音轉文字設定（`config.toml [voice] stt_*`，與 `/api/stt` 同一個供應商）。** 只有沒設定語音轉文字供應商時，才退回用環境變數 `OPENAI_API_KEY` 的 OpenAI Whisper；已設定的供應商失敗時直接回報錯誤，不退回。語言仍固定為 `zh`。LINE 的語音訊息走同一條路徑。v1.68.0 以前這兩個通道一律走環境變數金鑰的 Whisper。 語音回覆（每個聊天室用 `/voice` 切換）直接 new 一個 `EdgeTtsProvider`，同樣寫死；音訊上傳失敗時會退回純文字。
 
 所以儀表板「語音」分頁寫入的 `inference.toml [voice] tts_provider`／`tts_voice` 只影響 `POST /api/tts`，**目前對 Telegram 路徑沒有任何影響**。在 UI 改了它們，Telegram 的語音訊息行為不會變。這是已知缺口，寫在這裡，免得操作者自己撞上。
 
-v1.67.1 起，「語音」分頁拿掉了「語音回覆模式」「語音辨識」「語言」三個欄位。它們寫入的 `voice_reply_enabled`、`asr_provider`、`asr_language` 在 gateway 裡沒有任何程式讀取。已經存在 `inference.toml` 的值保持原樣，分頁儲存時不再送這三個鍵。`/api/stt` 的語音轉文字設定在同一分頁的進階卡片（`config.toml [voice] stt_*`）。
+v1.67.1 起，「語音」分頁拿掉了「語音回覆模式」「語音辨識」「語言」三個欄位。它們寫入的 `voice_reply_enabled`、`asr_provider`、`asr_language` 在 gateway 裡沒有任何程式讀取。已經存在 `inference.toml` 的值保持原樣，分頁儲存時不再送這三個鍵；v1.68.0 起設定結構也拿掉了這三個欄位，`system.update_config` 收到時忽略。`/api/stt` 的語音轉文字設定在同一分頁的進階卡片（`config.toml [voice] stt_*`）。
 
 ---
 
@@ -92,4 +92,4 @@ v1.67.1 起，「語音」分頁拿掉了「語音回覆模式」「語音辨識
 
 ## 總結
 
-語音在兩個地方會動，而誠實版本就直說：一組由儀表板設定的 fail-closed HTTP 端點，加上一個供應商寫死的 Telegram handler。點名第二個，比畫一張從來沒寫過的 VAD 流程圖有用得多。
+語音在兩個地方會動，而誠實版本就直說：一組由儀表板設定的 fail-closed HTTP 端點，加上一個語音回覆供應商仍寫死的 Telegram handler（轉錄自 v1.68.0 起跟著儀表板設定）。點名第二個，比畫一張從來沒寫過的 VAD 流程圖有用得多。

@@ -87,9 +87,15 @@ CJK（中国語・日本語・韓国語）ユーザーにとって微妙です�
 v1.67.1 から書き込み時に検査します。
 
 - `inference.update`（ダッシュボードの推論ページ）は `backend = "openai_compat"` または空の値だけを受け付けます。空の値はキーを削除し、エンジンが自分で `openai_compat` を選びます。それ以外の値は何も書き込む前に拒否され、`openai_compat` を案内するメッセージが返ります。古いファイルを保存できるよう例外が1つあります。すでに保存されている削除済みの値をそのまま送り返した場合は受け付けるので、変更するまでの間もこのページで他の設定を保存できます。ページではその値をサポート終了と表示します。
-- `agents.update` は `openai_compat` 以外の `[model.local] backend` を拒否します（この検査は v1.67.1 以前からあります）。
+- `agents.update` は `openai_compat` 以外の `[model.local] backend` を拒否します（この検査は v1.67.1 以前からあります）。v1.68.0 からは社員の編集ページが `[model.local] backend`／`context_length`／`gpu_layers` を送らなくなりました。
 - `[model.local] backend` のデフォルト値、`duduclaw onboard`、`duduclaw wizard`、同梱のエージェントテンプレートは `openai_compat` を書くようになりました（以前は `llama_cpp`）。
 - 何も読まないフィールドをダッシュボードから外しました。推論ページの「記憶體上限」（`max_memory_mb`）、生成設定の「GPU Layers」「Context 大小」（`[generation] gpu_layers` / `context_size`）、AI 従業員編集ページの「Context 長度」「GPU Layers」（`[model.local] context_length` / `gpu_layers`）です。メモリ、GPU オフロード、コンテキスト長は外部サーバーが管理します。保存済みの値はファイルにそのまま残ります。
+
+v1.68.0 から：
+
+- `inference.update` が成功すると gateway のキャッシュされた推論エンジンがリセットされ、次のチャネル返信とディスパッチから新しい設定が使われます（以前は約20の推論設定が再起動まで無視されていました）。ページにはエンジンを再読み込みしたと表示されます。
+- 推論ページでは `[llamafile]` を型付きの項目（`enabled`、`dir`、`default_file`、`host`、`port`、`gpu_layers`、`context_size`、`extra_args`）で編集でき、信頼度ルーター → 詳細で `[router] local_tools` と UCCI 関連のキー（`ucci_fast_router`、`ucci_strong_router`、`ucci_observations`、`ucci_shadow_strong`、`ucci_shadow_max_inflight` 1〜16、`ucci_drop_stop_token`）、`[generation] capture_logprobs`／`capture_top_logprobs` も編集できます。ページで llamafile の項目を空にしても保存済みの値は消えません。設定ファイルの詳細編集を使ってください。
+- `max_memory_mb`、`[generation] gpu_layers`／`context_size`、`[embedding]` は設定構造から削除され、`inference.update` は受け取っても無視します。
 
 ### InferenceManager ステートマシン
 

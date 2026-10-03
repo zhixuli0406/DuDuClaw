@@ -51,6 +51,13 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 
 `scoped_tools` に載ったツールは付与が有効になるまで非表示なので、エージェントが `tools/list` から名前を読んで申請することはできません。別の手段で名前を伝えてください——`SOUL.md` に書く、playbook ルールにする、あるいはゴール開始時に `grant:<tool>` タグで付与を発行する。剪定が代償を伴う唯一の箇所であり、意図的なものです。今この瞬間に拒否されるツールを宣言することこそ、上のルールが取り除こうとしている失敗モードだからです。
 
+### v1.68.0 からの例外：一覧に出るが拒否される
+
+新しい2つのゲートは、ツールを `tools/list` から外さずに呼び出しを拒否します。
+
+- `agent.toml [permissions]`：`false` と書かれたフラグは、`create_agent`（`can_create_agents`）、`send_to_agent`・`spawn_agent`（`can_send_cross_agent`）、`schedule_task`・`create_reminder`・`schedule` 付きの `tasks_create`（`can_schedule_tasks`）、`skill_hub_install`・`shared_skill_adopt`・`skill_graduate`・`skill_pin`・`skill_from_recording`（`can_modify_own_skills`）を拒否します。拒否は JSON-RPC エラー -32003 と監査イベント `permission_denied` になります。`agent.toml` が存在するのに読めない・解析できない場合はこれらのツールを拒否し、ファイルがなければ許可します。`schedule` なしの `tasks_create` は許可されるため、これらのフラグは呼び出しごとに確認されます。一時的な役割メンバーは `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` が `false` で作られます。
+- `config.toml [odoo] features_*`：Odoo ツールは一覧に残り、無効になったモジュールのモデルへの呼び出しは呼び出しごとに拒否されます（project と hr は既定でオフ）。
+
 ## 説明のバイト予算
 
 各ツールの `description` は **200 バイト**、各パラメータの説明も **200 バイト**が上限です（明記された例外が 1 件だけあります）。この上限は慣習ではなくテストで強制されます。

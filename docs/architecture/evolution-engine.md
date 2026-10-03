@@ -1053,7 +1053,7 @@ eval_suites_root = "evals"     # Root directory the AEE replay subprocess search
 eval_binary = "/usr/local/bin/duduclaw"   # Optional, overrides the default binary path
 ```
 
-New CLIs: `duduclaw export playbook --agent <id> [--out <path>]` (the older `duduclaw playbook export` spelling still parses until v1.68.0; exports
+New CLIs: `duduclaw export playbook --agent <id> [--out <path>]` (the older `duduclaw playbook export` spelling still parses until v1.69.0; exports
 GEP-gene-shaped JSON to a local file, no external hub); `duduclaw playbook
 migrate-soul --agent <id> [--apply]` (WP1.4 — extracts behavior rules from a
 legacy SOUL.md into draft playbook entries for human review before `--apply`);

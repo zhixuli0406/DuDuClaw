@@ -160,7 +160,7 @@ Results include memories about:
 
 ## エージェント間の知識共有
 
-gateway が書き込むメモリ（会話とプロフィールの抽出、承認済みの審査、重要事実）はエージェント単位です。MCP のメモリツール（`memory_search`、`memory_store`、`memory_read` など）は MCP キーに対応する名前空間を読み書きします。gateway が起動する従業員はすべて gateway の内部キーを使うため、これらのツールを通すと同じ gateway の全従業員が1つの名前空間（`internal/gateway-internal`）を共有し、各従業員の gateway が書き込んだメモリとは別になります。これは既知の制限です（[20-memory-intelligence.md](20-memory-intelligence.md#既知の制限2つのメモリ名前空間v1671-では未修正) を参照）。メモリごとの共有レベルはありません。複数のエージェントが必要とする知識は、代わりに共有 wiki に置きます。
+gateway が書き込むメモリ（会話とプロフィールの抽出、承認済みの審査、重要事実）はエージェント単位です。v1.68.0 から、gateway が起動した従業員の身元トークンが検証できる場合、MCP のメモリツール（`memory_search`、`memory_store`、`memory_read` など）も同じエージェント単位の名前空間を使います。身元が検証できない場合は従来の共有プール `internal/gateway-internal` に留まります。v1.68.0 より前にそのプールへ書かれた行は自動では移動せず、オペレーターが `duduclaw memory migrate-namespace` で移動します（[20-memory-intelligence.md](20-memory-intelligence.md#メモリの名前空間v1680) を参照）。メモリごとの共有レベルはありません。複数のエージェントが必要とする知識は、代わりに共有 wiki に置きます。
 
 ```
 Agent A (customer support) needs product info

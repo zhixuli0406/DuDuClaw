@@ -100,7 +100,15 @@ A2A 委譲の述語（`delegation_policy::can_delegate`）は、`agent.toml` の
 
 **監査証跡** — `tool_calls.jsonl` はすべてのツール呼び出しを記録し、`result_text`／`input_text` はマスク済み（3パスのシークレットマスキング、切り詰めより先にマスク）、パーミッションは `0600`、行はハッシュチェーンで連結され、16 MB でローテーションします。`security_audit.jsonl` はセキュリティイベントを別に保持します。このログはグラウンディング事前チェックと受け入れ判定者が読む証拠源でもあるため、弱めれば検証も弱まります。
 
-**エージェント単位の鍵分離** — MCP API キー、チャネルトークン、コネクタ認証情報はエージェント単位で、`secret_ref` 経由で解決されます。1つのエージェントの漏洩がプラットフォーム全体の漏洩にはなりません。
+**エージェント単位の鍵分離** — MCP API キーとコネクタ認証情報はエージェント単位で、`secret_ref` 経由で解決されます。1つのエージェントの漏洩がプラットフォーム全体の漏洩にはなりません。チャネルの認証情報は2種類に分かれます。LINE、WhatsApp、Feishu、Google Chat、Teams、WeCom、DingTalk は `config.toml [channels]` にあるデプロイ全体共通の認証情報を使い、社員専用の bot トークンがあるのは Telegram、Discord、Slack だけです（自分のトークンがない社員は `reports_to` をたどって上位を探し、最後にグローバルのトークンを使います）。
+
+**チャネル上のチャットコマンド（v1.68.0）** — `!STOP`、`!STOP ALL`、`!RESUME`、`/model <名前>` には管理者が必要です。WhatsApp、Feishu、Teams、WeCom、Google Chat、DingTalk では以前、すべての送信者に `is_admin = true` を渡していたため、bot にメッセージを送れる人なら誰でも停止や再開ができました。現在これらのチャネルは、送信者 id または会話 id をチャネルの `admin_users` 設定（グローバル範囲。Google Chat と Teams も設定可能になりました）と完全一致で照合し、一覧がなければ誰も管理者になりません。WebChat では、有効なダッシュボードアカウントで役割が管理者のものだけが該当し、Web サイト用ウィジェットの訪問者は該当しません。
+
+**キルスイッチのしきい値（v1.68.0）** — `KILLSWITCH.toml [triggers]` の4つのしきい値には以前は読み取り側がありませんでした。現在はファイルに書かれていて範囲内のキーだけが有効になり、セキュリティ設定ページではしきい値ごとにチェックボックスがあります（チェックを外すと `null` を送り、キーを削除します）。ファイルが変わると読み直します。`cost_limit_usd` は全社員の24時間の支出と比べ、達するとグローバルの failsafe レベルを制限状態にし、failsafe が自然に回復するか誰かが `!RESUME` を送るまで続きます。`max_replies_per_minute` は会話ごとに数え、超過分は黙って破棄します。`max_consecutive_errors` と `error_rate_threshold`（直近20回、最低10回）はその会話の failsafe レベルを1段階上げます。発動ごとに `killswitch_trigger` として監査されます。`KILLSWITCH.toml` の `[audit]` セクションは読まれなくなりました。
+
+**秘匿化のデータソース保護（v1.68.0）** — 「プライバシー / 秘匿化」タブの「資料來源保護」スイッチが機能するようになりました。`user_input` はチャネルのメッセージを AI に渡す前に、`system_prompt` は組み立て済みのプロンプトを（既定では `apply_to_system_prompt` が付いたルールだけ）、`cron_context` は条件スクリプトのトリガーメッセージを秘匿化します。エラー時は秘匿化されていない内容を送らず、そのターンを止めます。`sub_agent` スイッチは削除されました。`purge_after_expire_days` は保管庫の掃除に使われるようになりました。
+
+**権限フラグ（v1.68.0）** — `agent.toml [permissions]` の `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` が `false` と書かれていると、MCP のディスパッチゲートで対応するツールが拒否されます（`permission_denied` として監査）。アップグレード後の最初の起動で古いテンプレートの `false` を `true` に移行します。[ダッシュボード設定の対応表](../../guides/ja-JP/dashboard-settings.md#ai-社員の編集ページ)を参照してください。
 
 ---
 
