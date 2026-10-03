@@ -57,6 +57,35 @@ This hint doesn't appear when `||` acceptance criteria are given explicitly. Sub
 
 ---
 
+## Acceptance ledger (per-criterion)
+
+The frozen acceptance criteria are one block of text. The judge is told to check them item by item, but nothing a program could read showed that every item had actually been handled. The acceptance ledger fixes that.
+
+**When it is created.** A goal created through the dashboard or the MCP `tasks_create kind="goal"` tool gets a ledger at creation, from the frozen baseline: one criterion per non-empty line, numbered `C1`, `C2`, … in order. At most 20 criteria are tracked; lines beyond the 20th are folded into `C20` with a note, never dropped. The system also derives a stable id per criterion (`canonical_id(task id, "criterion", index, fingerprint of the text)`), so the model only ever echoes a short handle and never invents an id. Goals created before this feature, or while the mode is `off`, have no ledger and run exactly as before. Goals started from the chat `/goal` command and from a confirmed goal suggestion (both "立為目標任務" and "想一想") get a ledger the same way. Goals created by autopilot rules and the sub-tasks of a planner-decomposed goal have no ledger.
+
+**What the worker sees.** Every dispatch round carries a `## 驗收帳本` section right after the `<state>` block, one line per criterion with its current status, and the reporting instruction. The worker ends its `tasks_complete` result summary with a tag:
+
+```
+<criteria_status>[{"id": "C1", "status": "covered", "evidence": ["wrote reports/summary.md"], "unresolved": []},
+ {"id": "C2", "status": "blocked", "evidence": [], "unresolved": ["no permission to send mail"]}]</criteria_status>
+```
+
+The tag body must be exactly one JSON array (no prose around it, no extra fields), every handle exactly once. `status` is `covered` (evidence required, unresolved empty), `blocked` (unresolved required) or `candidate` (thinks it is done, wants confirmation; evidence required). Each evidence or unresolved entry is cut at 500 characters, at most 8 entries per field. A report that breaks any rule is discarded as a whole: the ledger stays as it was, its `invalid_reports` counter goes up, and one `criteria_status_invalid` event goes to `security_audit.jsonl` with the violation and at most 200 masked characters of the tag body. A round without the tag changes nothing and is not counted. The tag is removed from the text the judge reads and from the ✅ message pushed back to the chat.
+
+**Modes** (`config.toml [goal_loop] criteria_ledger`, read at every round, no restart):
+
+| Mode | Ledger | Judge |
+|---|---|---|
+| `off` | Not created, not injected, not parsed | Unchanged |
+| `report` (default) | Created, injected, parsed, shown to people | Gets the worker's self-reported ledger as a reference block marked "self-report, not evidence"; its reply format is unchanged |
+| `enforce` | Same as `report` | The panel must also return `criteria: [{"id": "C1", "pass": true, "reason": "..."}]` with every handle exactly once. A missing or duplicated handle is a FAIL for that criterion, and `correctness` passes only if every criterion passes and the aspect itself passes |
+
+An unknown value reads as `report`. Moving to `enforce` follows the same observation discipline as `strict_reply_parsing`: switch it yourself after watching real judge rounds. Under `enforce` an external judge (`judge = "external"`) is not asked for per-criterion verdicts; its own pass/fail stands.
+
+**What you see.** `tasks.timeline` returns `criteria_ledger` (`null` when the goal has none) with `mode` (the mode in effect now), `units[]` (`id`, `handle`, `text`, `status`, `evidence`, `unresolved`, `updated_round`), `last_report_round` and `invalid_reports`. A needs_human card for a goal with a ledger adds one line such as `驗收帳本：1/3 條已回報達成；C2 受阻（沒有寄信權限）；C3 尚未回報`. Each round's ledger is also kept on its iteration row for later review.
+
+`needs_human`'s `pause_reason` and the ledger answer different questions (why the loop stopped versus which criterion is still open); they are not merged.
+
 ## Outer-loop progress board
 
 Every state transition on a goal task pushes a short (one-to-three-line) progress message back to the source conversation:
@@ -145,6 +174,7 @@ enabled = true          # Enable the autonomous dispatch engine (includes the go
 policy = "fixed_hierarchy"  # Dispatch policy (which AI employee picks up a task). See "Dispatch policy" below. Default fixed_hierarchy
 grounding_precheck_enabled = true  # Grounding precheck before acceptance (see "Grounding precheck"). Default true
 two_stage_judge = true  # Run a cheap first-stage evaluation before acceptance (see "Two-stage acceptance judging"). Default true
+strict_reply_parsing = "shadow"  # Judge replies under the strict JSON contract: off / shadow / enforce (see "Strict reply contract"). Default shadow
 judge = "mav"           # Who makes the acceptance call (see "Swapping the acceptance judge"). mav / external (evaluator_only / human_only are deprecated, removed in v1.69.0). Default mav
 judge_provider = "antigravity"      # Optional: run the judge on another runtime (see "Running the judge on a different model"). Unset ⇒ the default utility runtime
 judge_model = "gemini-3-pro-preview" # Optional: judge model id within that runtime. Unset ⇒ the default utility model
@@ -164,6 +194,7 @@ planner_enabled = false  # When on, allows splitting a goal into a dependency DA
 resume_on_restart = "pause"  # What happens to in-flight goal tasks on gateway restart, "auto" or "pause" (see "Restart behavior"). Default pause, switchable under Settings → Automation on the dashboard
 progress_report_minutes = 10  # How long a claimed task can go without a progress signal before one report fires; `0` disables it (see "Stall-timeout progress reports"). Default 10
 tool_streak_advisory = true   # Whether to inject a reminder at 3/5/8 consecutive calls to the same tool with the same arguments (see "Tool streak advisory"). Default true
+criteria_ledger = "report"    # Per-criterion acceptance ledger: off / report / enforce (see "Acceptance ledger"). Default report
 
 [dispatch_guard]        # Feedback-path circuit breaker (guards against self-reinforcing loops)
 window_secs = 60        # Sliding window length (seconds). Default 60
@@ -505,6 +536,27 @@ To use `duduclaw eval` as the judge, just point `judge_command` at a script that
 
 **The subprocess inherits the gateway's full environment.** `judge_command` runs directly through the platform's process-spawn path (`tokio::process::Command`), with no `env_clear()` and no allowlist filtering. Your judge program can see the gateway process's entire environment at the time it's called, including the secrets the gateway uses to call LLM providers and channel APIs. This doesn't mean data is actively handed to the judge (its only input is the stdin JSON shown above); the judge program simply has the *ability* to read those environment variables (for example, a malicious or buggy program reading `std::env::vars()`). This isn't a vulnerability — it's a design tradeoff of this seam today: **only point it at a program you trust and whose source you know**, never a third-party or unreviewed executable. If you need tighter isolation (a judge process that genuinely can't see the gateway's secrets), wrap `judge_command` in a script that clears its own environment first, then re-injects only the handful of variables the judge actually needs.
 
+### Strict reply contract (`strict_reply_parsing`)
+
+All three verdict parsers (the MAV panel, the first-stage evaluator and the external judge) find their JSON by cutting from the first `{` to the last `}`. That quietly accepts a reply with prose around the object, and repairs some broken ones. The strict contract accepts a reply only when the whole reply, after trimming and at most one outer ```` ```json ```` fence, is exactly one JSON value of the expected shape with no extra fields: the panel's `{pass, reason}` object for each active aspect, the evaluator's `decision` / `evidence` / `next_step` / optional `blocker_key`, or the external judge's `pass` plus optional `feedback`.
+
+```toml
+[dispatch]
+strict_reply_parsing = "shadow"   # off | shadow (default) | enforce
+```
+
+| Mode | Who decides | Strict parse |
+|---|---|---|
+| `off` | Today's lenient parse, byte for byte | Never runs |
+| `shadow` (default) | Today's lenient parse | Runs on the same reply and is only compared |
+| `enforce` | The strict parse | A violation takes the parser's existing failure path: the panel returns its fail-closed FAIL; the evaluator and the external judge count as failed and the MAV panel decides |
+
+An unknown value falls back to `shadow`. The key is read at every verdict, so a change takes effect without a restart.
+
+Each compared verdict increments the Prometheus counter `judge_parse_shadow_total{parser, outcome}` (`parser` is `panel`, `pre_evaluator` or `external`; `outcome` is `agree`, `strict_rejects`, `lenient_rejects`, `both_reject` or `disagree`). Every outcome other than `agree` also writes one `judge_parse_shadow_mismatch` event to `security_audit.jsonl` with the parser, the outcome, the strict violation and the first 200 characters of the reply after secret masking.
+
+The default moves from `shadow` to `enforce` only by an operator decision based on these numbers: at least 50 judge rounds or 7 days of observation, with `strict_rejects` under 2% of compared verdicts. Nothing flips it automatically. Before switching a deployment yourself, check `strict_rejects` for your own judge runtime; a model that habitually adds a sentence after the JSON will have its verdicts turned into FAILs (panel) or MAV degrades (evaluator, external judge) under `enforce`.
+
 ## Acceptance judge discipline
 
 Both the MAV judge and the first-stage evaluator have several rules baked into their prompts, targeting a failure mode caught in live testing: a judge inventing its own false rejections and permanently blocking correct work.
@@ -515,6 +567,8 @@ Both the MAV judge and the first-stage evaluator have several rules baked into t
 - **The agent's own claim of "done" isn't evidence**: self-reports like "already done" or "already handled" don't by themselves justify a pass; the judge must check the acceptance criteria against the actual output item by item.
 
 These rules have no config switch — they apply immediately to every goal task.
+
+The panel prompt also carries one line the system provides, not the worker: the worker's working directory, `<home>/agents/<agent_id>` as an absolute path (`<worker_working_directory>`). Relative paths in the result refer to it. It is there in every mode, including `criteria_ledger = "off"`, and is left out only when the dispatch engine has no home directory. Before this line existed, a correct `hello.txt` was rejected twice because the judge read the agent directory as "a subdirectory, not the working directory".
 
 ## Dynamic judge depth (MaAS)
 

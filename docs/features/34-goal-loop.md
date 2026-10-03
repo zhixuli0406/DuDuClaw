@@ -40,6 +40,8 @@ Once a round reaches the panel, `DispatchEngine` runs a **three-aspect MAV panel
 
 The panel prompt also carries four standing discipline clauses, always on (no config gate): **no ratcheting** the bar higher round over round when the criteria haven't changed; **audit, don't author** — the judge may only check the worker's submitted evidence and the tool-activity digest, never invent its own; **no scope creep** — a requirement absent from the acceptance criteria can't be the reason for a rejection; and **a self-reported "done" is not evidence** on its own.
 
+Each criterion also gets a status in a per-criterion acceptance ledger (`C1`, `C2`, …) that the worker reports every round and that the judge and the task detail page can read. How it is created, which modes exist (`[goal_loop] criteria_ledger`, default `report`) and what the judge does with it are in the [acceptance ledger section](../guides/goal-loop.md#acceptance-ledger-per-criterion) of the goal loop guide.
+
 Judge depth scales with goal difficulty (a local, zero-LLM heuristic): simple single-step goals get a two-aspect check (correctness + safety) and a lower iteration cap; hard goals get the full panel. The safety aspect is never dropped at any depth.
 
 ## Round history and weekly report (v1.67.0)

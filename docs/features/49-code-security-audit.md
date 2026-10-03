@@ -36,7 +36,7 @@ read, and an honest label when the run did not finish.
    output into one finding shape. A scanner that isn't installed is reported
    as missing with the reason, never silently skipped.
 3. **AI deep audit** (`--profile deep`). Reads each ranked module under a
-   fixed prompt budget. The model must answer in one strict JSON array; a
+   fixed prompt budget. Every file excerpt sent to the model is line-numbered (`<n> | code`), and the model must copy those numbers into its answer instead of counting lines itself. The model must answer in one strict JSON array; a
    reply with prose around it, or two JSON values, voids that module's
    answer instead of being patched up. Every candidate has to fill in:
    - a **threat model** with six slots: `principal` (who attacks), `input`
@@ -65,7 +65,7 @@ read, and an honest label when the run did not finish.
    sees the whole picture it needs: a large window of the main file (up to
    24 KiB around the reported line), the lines around every other trace
    step, the threat model and the conditions. It answers `refuted` or
-   `plausible`. A `plausible` verdict must name what blocks automatic
+   `plausible`. `refuted` is reserved for "the claimed defect is not there". If the defect is real but the reported location is wrong, the verifier returns `plausible` with a `corrected_line` and/or `corrected_trace`. The corrections are re-checked against the repository before they are applied; the finding keeps its id and root fingerprint, and a `verifier_corrected: line 10→14` evidence item records the change. A `plausible` verdict must name what blocks automatic
    confirmation (`blockers`) and say how a human could validate it
    (`validation_plan`, locally and/or in a deployment); without those the
    verdict is rejected and the candidate stays a candidate. Static-scanner
@@ -80,14 +80,15 @@ read, and an honest label when the run did not finish.
 Every module the ranking produced gets one coverage entry, including the ones
 `--max-modules` left out. Status is one of: `covered` (read, no candidates),
 `candidate` (read, at least one candidate), `deferred` (not reviewed because of
-`--max-modules` or the candidate cap), `unreadable`, `llm_failed` or
+`--max-modules`, the candidate cap, or an unreachable AI engine), `unreadable`, `llm_failed` or
 `parse_failed`. The summary prints a line such as "partial coverage: N modules
 not reviewed" whenever any module was not read. A green result on a partially
 covered repo means "nothing found in what was read", and the report says so.
 
 The run itself has a `run_status`: `complete` or `incomplete`. An incomplete
 run carries an `incomplete_reason`, for example `engine_unavailable` (the AI
-engine failed on its first call) or `validation_budget_exhausted` (the
+engine failed on a call; the modules not yet attempted are marked `deferred`
+with that reason) or `validation_budget_exhausted` (the
 candidate cap was reached). The quick profile has no AI steps and is always
 complete.
 
@@ -105,7 +106,7 @@ unchanged:
   report counts it as a re-validated prior confirmation;
 - the file changed: nothing is carried, and the report counts it.
 
-A prior report that cannot be read is skipped with one line on stderr.
+If the newest earlier report cannot be read, or is a v1 report, it is skipped with one line on stderr and the search continues with older files.
 `--no-prior` turns the whole mechanism off. The report's `prior_run` block
 says which file it carried from and how many findings of each kind.
 
@@ -132,7 +133,7 @@ a build.
 the report labels it `model_self_reported`. These findings are counted in a
 separate `needs_human_by_severity` table, shown apart in the dashboard, and
 do **not** fail the build. If you want them to, add `--fail-on-needs-human`:
-the gate then reads both tables. The reasoning is that a model's guess about
+they are then counted into `by_severity` and `needs_human_by_severity` drops to zero, so the gate sees a single table. The reasoning is that a model's guess about
 severity is not evidence, so by default it cannot break your pipeline, but you
 can choose to be strict.
 
@@ -147,7 +148,7 @@ agents. The tool does not force a different model; it makes the choice visible.
 validator checks it: unique ids, safe file paths, a refuted finding has its
 review evidence, a `needs_human` finding has blockers, summary counts match the
 findings, every coverage entry points at real findings, an incomplete run
-states why. If the validator finds a violation it prints them and exits `2`
+states why. A finding that carries a `verifier_corrected` record must have passed the pre-check. Findings the pre-check already refuted are exempt from the file and line rules, since a bad location is why they were refuted. Duplicate finding ids are merged before the check, with a note on stderr. If the validator finds a violation it prints them and exits `2`
 rather than writing a bad report. `duduclaw secaudit-validate <report.json>`
 runs the same checks on a saved file: exit `0` valid, `1` violations (listed
 one per line), `2` unreadable or not JSON. Reports from before v2 have no
@@ -180,7 +181,10 @@ adversarial verdict, any PoC transcript) and, for AI findings, the six
 threat-model slots, the trace, the conditions, the blockers, the validation
 plan and any pre-check violations. A "model self-assessed" note sits next to a
 severity the model chose itself. Each finding carries three reviewer actions
-(confirm, suppress, refute) that write back to the report. The page is
+(confirm, suppress, refute) that write back to the report: the action is stored
+as an `operator_review` evidence item, the finding's `severity_basis` becomes
+`operator`, and the severity counts are recomputed, so a reviewed report still
+passes `secaudit-validate`. The page is
 manager-gated. A v1 report with none of the new fields still opens normally.
 
 ## What's deliberately left to you

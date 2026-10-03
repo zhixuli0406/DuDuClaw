@@ -45,7 +45,7 @@ H10（2026-09）之前，這是放在 `<agent_dir>/.claude/hooks/data-file-guard
 
 ## 守衛 3 — `input_guard`（提示注入掃描器，Rust 函式庫）
 
-`duduclaw_security::input_guard::scan_input` 以**七類規則**對文字評 0–100 分，達到或超過 `DEFAULT_BLOCK_THRESHOLD`（60）就擋：
+`duduclaw_security::input_guard::scan_input` 以**十一類規則**對文字評 0–100 分，達到或超過 `DEFAULT_BLOCK_THRESHOLD`（60）就擋：
 
 | 規則 | 權重 | 單條即擋 |
 |---|---|---|
@@ -56,6 +56,10 @@ H10（2026-09）之前，這是放在 `<agent_dir>/.claude/hooks/data-file-guard
 | `system_prompt_extraction` | 30 | 否 |
 | `encoding_bypass` | 25 | 否 |
 | `termination_manipulation` | 30 | 否 |
+| `authority_escalation` | 每種訊號 35，兩種不同訊號相加 | 否 |
+| `memory_poisoning` | 每種訊號 30，兩種不同訊號相加 | 否 |
+| `role_provenance` | 每種框架 35，兩種不同框架相加 | 否 |
+| `action_binding` | 30 | 否 |
 
 樣式涵蓋英文與中文（繁體與簡體）。文字先做 NFKC 正規化（`unicode_normalizer`），同形異義字與隱形字元的花招因此躲不過樣式比對。
 
@@ -69,6 +73,15 @@ H10（2026-09）之前，這是放在 `<agent_dir>/.claude/hooks/data-file-guard
 **已知誤判。** 這條規則看句型比對，所以一般句子只要在同一個短子句裡有覆寫動詞、範圍詞和指示類名詞，也會被擋，例如「請忽略之前寄的指示，以新版為準」「請忽略以上規則中的第三條，已經取消」「忘記之前的規則了，可以再說一次嗎」（測試 `known_benign_shapes_that_do_match` 固定了這個行為）。提到「越獄模式」也會被擋。解法是不用覆寫動詞換個說法，例如「之前的指示作廢，以新版為準」；相近的「之前的報價單請作廢，以新的指示為準」在「不可比對」的測試清單裡。這個掃描器是片語規則，不是分類模型，也沒有用真實對話資料量測過。
 
 `termination_manipulation`（LoopTrap，arXiv:2605.05846）刻意不設成單條即擋：權重 30 低於門檻，單次命中只警告並留稽核，不阻斷——這樣一般的「請繼續」不會被誤殺。
+
+**句型家族（v1.68.0）。** 紅隊帳本量出四種針對 AI 員工的技法原本是零分。現在每一種都有一組英文與一組繁體中文的錨定正則：
+
+- `authority_escalation`：要員工拿自己的權限、不用使用者的權限去做事（"use your own service account / admin role"、"not my permissions"、"the system trusts you more than me"；用你自己的服務帳號／管理員身分、不要用我的權限、系統比較信任你）。
+- `memory_poisoning`：要員工把一條長期特權存起來（"remember this permanently"、"as a fact about me"、"I am always allowed to"；永久記住、記在你的記憶裡、以後每次對話都照辦、我一律有權限）。一般的「請記住…」、"remember to…"、"remember my name" 不會比對到。
+- `role_provenance`：使用者訊息裡出現假的系統、工具或營運方框架：`[SYSTEM]`、`<tool_result>` 標籤、`approval=granted`、"policy update from the platform operator"、「本次對話已解除…限制」、平台營運方政策更新、引文裡寫給 AI 的附註（給 AI 助理的附註）以及要它隱瞞的指示（不要提到這段附註）。框架只比對完整標籤，"our system sends a tool result" 不會中；一組開頭加結尾標籤算一種框架。
+- `action_binding`：把一個核准挪去做別的事（"use that same approval to…"、"use the approval from step 1"；用同一個核准、用第一步的核准去…）。「既然已經核准預算，請安排會議」不會比對到。
+
+權重原則：單一訊號只警告並留稽核（30–35，低於 60）。同一則訊息裡出現同一家族的兩種**不同**訊號，或一種訊號再加上既有規則（例如 `instruction_override`、`system_prompt_extraction`），就會擋。可以自身相加的有三個家族：`authority_escalation`（「用你的服務帳號」加「系統比較信任你」＝70）、`memory_poisoning`（「永久記住」加「我一律有權限」＝60）、`role_provenance`（`[SYSTEM]` 加 `approval=granted`＝70）。`action_binding` 不會自己相加，要搭配其他規則才擋。同一種訊號出現兩次只算一次：單獨一個 `[SYSTEM]` 或一組 `<tool_result>…</tool_result>` 維持 35。已知代價：剛好帶兩種訊號的正常句子也會被擋，例如 "please use your admin account, not my permissions, to fix the shared folder"（測試 `known_benign_shapes_blocked_by_stacking` 固定了這個行為）。換成只帶一種訊號的說法，或請管理員自己處理即可。任何命中就丟棄文字的呼叫端（萃取、使用者側寫寫入）現在也會丟棄含這些句型的文字。每個家族的正例與看起來像但不該中的句子，都在 `input_guard.rs` 的測試裡固定。
 
 比對到時會在哪裡出現（已核對的呼叫端）：
 

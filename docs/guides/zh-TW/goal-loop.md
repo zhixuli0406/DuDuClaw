@@ -57,6 +57,35 @@
 
 ---
 
+## 驗收帳本（逐條驗收標準）
+
+凍結的驗收標準是一整段文字。判官被要求逐條檢查，但過去沒有任何程式讀得到的證據能說明每一條都被處理過。驗收帳本補的就是這個。
+
+**何時建立。** 經儀表板或 MCP `tasks_create kind="goal"` 建立的目標，會在建立當下從凍結基準產生帳本：每個非空行一條，依序編號 `C1`、`C2`…。最多追蹤 20 條，第 21 行起併入 `C20` 並附註，不會丟掉。系統另外替每條算出穩定 id（`canonical_id(任務 id, "criterion", 序號, 原文指紋)`），模型只需回填短代號，不會自己造 id。這個功能上線前建立的目標、或模式為 `off` 時建立的目標沒有帳本，行為完全照舊。從聊天 `/goal` 指令、以及確認目標建議（「立為目標任務」與「想一想」兩種）建立的目標，也用同一套方式建立帳本。autopilot 規則建立的目標、以及規劃器拆出的子任務沒有帳本。
+
+**執行者看到什麼。** 每一輪派工訊息在 `<state>` 區塊後面多一段 `## 驗收帳本`，每條一行、附目前狀態，以及回報方式。執行者在 `tasks_complete` 的結果摘要最後附上標記：
+
+```
+<criteria_status>[{"id": "C1", "status": "covered", "evidence": ["寫入 reports/summary.md"], "unresolved": []},
+ {"id": "C2", "status": "blocked", "evidence": [], "unresolved": ["沒有寄信權限"]}]</criteria_status>
+```
+
+標記內只能是一個 JSON 陣列（前後不能夾文字、不能有多的欄位），每個代號恰好一次。`status` 只能是 `covered`（evidence 必填、unresolved 必須空）、`blocked`（unresolved 必填）、`candidate`（自認完成、待確認，evidence 必填）。每項 evidence／unresolved 截到 500 字，每欄最多 8 項。違反任何一條，整筆回報作廢：帳本維持原狀、`invalid_reports` 加一，並在 `security_audit.jsonl` 寫一筆 `criteria_status_invalid`（違規說明＋最多 200 字遮罩後的標記內容）。沒附標記的回合什麼都不改，也不計數。判官讀到的文字與推回聊天的 ✅ 訊息都會先拿掉這個標記。
+
+**三種模式**（`config.toml [goal_loop] criteria_ledger`，每一輪讀取，免重啟）：
+
+| 模式 | 帳本 | 判官 |
+|---|---|---|
+| `off` | 不建立、不注入、不解析 | 不變 |
+| `report`（預設） | 建立、注入、解析、顯示給人看 | 多收到一段執行者自述的帳本，明標「自述，不是證據」；回覆格式不變 |
+| `enforce` | 同 `report` | 面板必須多回 `criteria: [{"id": "C1", "pass": true, "reason": "..."}]`，每個代號恰好一次。少一條或重複＝該條 FAIL；`correctness` 必須每條都過、且該面向本身也過才算過 |
+
+未知值一律當 `report`。切到 `enforce` 比照 `strict_reply_parsing` 的觀察期紀律：看過真實判官回合後由你自己切換。`enforce` 下外部判官（`judge = "external"`）不會被要求逐條裁決，以它自己的 pass/fail 為準。
+
+**你看得到什麼。** `tasks.timeline` 回傳 `criteria_ledger`（沒有帳本時為 `null`），內含 `mode`（目前生效的模式）、`units[]`（`id`、`handle`、`text`、`status`、`evidence`、`unresolved`、`updated_round`）、`last_report_round`、`invalid_reports`。有帳本的目標卡到 needs_human 時，通知卡多一行，例如 `驗收帳本：1/3 條已回報達成；C2 受阻（沒有寄信權限）；C3 尚未回報`。每一輪的帳本也會留在該輪的 iteration 紀錄上，事後可查。
+
+needs_human 的 `pause_reason` 和帳本回答的是不同問題（迴圈為什麼停下 vs. 哪一條還沒完成），兩者不合併。
+
 ## 外層進度看板
 
 目標任務的每個狀態轉移都會推一則簡短（一到三行）的進度訊息回來源對話：
@@ -145,6 +174,7 @@ enabled = true          # 啟用自主派工引擎（含 goal loop 驅動器）�
 policy = "fixed_hierarchy"  # 派工策略（選哪個 AI 員工接任務）。見下方「派工策略」。預設 fixed_hierarchy
 grounding_precheck_enabled = true  # 驗收前的證據落地預檢（見「證據落地預檢」）。預設 true
 two_stage_judge = true  # 驗收前先跑便宜的第一階段評估（見「兩段式驗收裁決」）。預設 true
+strict_reply_parsing = "shadow"  # 判官回覆的嚴格 JSON 契約：off / shadow / enforce（見「判官回覆嚴格契約」）。預設 shadow
 judge = "mav"           # 由誰做驗收裁決（見「換掉驗收判官」）。mav / external（evaluator_only / human_only 已棄用，v1.69.0 移除）。預設 mav
 judge_provider = "antigravity"      # 選填：讓判官跑在另一個 runtime 上（見「讓判官跑在另一個模型上」）。未設 ⇒ 預設的工具用 runtime
 judge_model = "gemini-3-pro-preview" # 選填：該 runtime 內的判官模型 id。未設 ⇒ 預設的工具用模型
@@ -164,6 +194,7 @@ planner_enabled = false  # 開啟後允許把目標拆成帶依賴的子任務 D
 resume_on_restart = "pause"  # gateway 重啟時 in-flight 目標任務的處置，"auto" 或 "pause"（見「重啟行為」）。預設 pause，可在儀表板「設定 → 自動化」切換
 progress_report_minutes = 10  # 已認領任務多久沒進度訊號才通報一次，`0` 關閉（見「逾時進度通報」）。預設 10
 tool_streak_advisory = true   # 同工具同參數連擊 3/5/8 次時是否注入提醒（見「工具連擊 advisory」）。預設 true
+criteria_ledger = "report"    # 驗收標準逐條帳本：off / report / enforce（見「驗收帳本」）。預設 report
 
 [dispatch_guard]        # 回饋路徑斷路器（防再生型無限迴圈）
 window_secs = 60        # 滑動窗長度（秒）。預設 60
@@ -521,6 +552,27 @@ judge_timeout_secs = 120   # 預設 120
 
 **子行程會繼承 gateway 的完整環境變數。** `judge_command` 是用平台的 process spawn 直接執行（`tokio::process::Command`），沒有做 `env_clear()` 或任何白名單過濾。你指定的判官程式看得到 gateway 行程當下的整組環境變數，這包含 gateway 用來呼叫 LLM 供應商、通道 API 的那些密鑰。這不代表資料被主動傳給判官（判官吃的輸入只有上面那份 stdin JSON）；判官程式本身有能力讀取這些環境變數（例如惡意或寫壞的程式去讀 `std::env::vars()`）。這不是漏洞，是這個 seam 目前的設計取捨：**只指向你自己信任、來源清楚的程式**，不要指向第三方或未經審查的執行檔；需要更嚴格隔離（例如判官行程完全看不到 gateway 密鑰）的話，把 `judge_command` 包成一支先自行清空環境變數、再重新注入判官實際需要的少數變數的 wrapper 腳本。
 
+### 判官回覆嚴格契約（`strict_reply_parsing`）
+
+三個裁決解析點（MAV 判官團、第一階段評估器、外部判官）目前都用「第一個 `{` 到最後一個 `}`」切出 JSON，所以回覆前後夾著散文也會被接受，有些壞掉的回覆還會被順手修好。嚴格契約只接受這種回覆：整段去掉前後空白、最多拆掉一層 ```` ```json ```` 圍欄之後，剛好是一個形狀正確的 JSON 值，而且沒有多餘欄位。判官團是每個啟用面向一個 `{pass, reason}`，評估器是 `decision`／`evidence`／`next_step`／可省略的 `blocker_key`，外部判官是 `pass` 加可省略的 `feedback`。
+
+```toml
+[dispatch]
+strict_reply_parsing = "shadow"   # off | shadow（預設）| enforce
+```
+
+| 模式 | 誰決定裁決 | 嚴格解析 |
+|---|---|---|
+| `off` | 現行寬鬆解析，逐位不變 | 完全不跑 |
+| `shadow`（預設） | 現行寬鬆解析 | 對同一份回覆跑一次，只做比對 |
+| `enforce` | 嚴格解析 | 違反契約就走該解析點原本的故障路徑：判官團回 fail-closed 的未通過；評估器與外部判官視為失敗，改由 MAV 判官團決定 |
+
+不認得的值一律當 `shadow`。每次裁決都會重讀這個鍵，改了不用重啟。
+
+每次比對都會讓 Prometheus 計數器 `judge_parse_shadow_total{parser, outcome}` 加一（`parser` 是 `panel`、`pre_evaluator` 或 `external`；`outcome` 是 `agree`、`strict_rejects`、`lenient_rejects`、`both_reject` 或 `disagree`）。只要結果不是 `agree`，就再往 `security_audit.jsonl` 寫一筆 `judge_parse_shadow_mismatch`，內容有解析點、比對結果、嚴格解析的違規說明，以及遮罩密鑰後的回覆前 200 字。
+
+預設值從 `shadow` 換成 `enforce`，要等操作者看過數字後拍板：至少累積 50 次判官回合或觀察 7 天，而且 `strict_rejects` 低於比對總數的 2%。系統不會自己切換。想先在自己的部署切成 `enforce` 的話，先看你用的判官 runtime 的 `strict_rejects`：習慣在 JSON 後面補一句話的模型，在 `enforce` 下會讓判官團直接判未通過，評估器和外部判官則退回 MAV。
+
 ## 驗收判官紀律
 
 MAV 判官與第一階段評估器的 prompt 都內建幾條紀律，治的是「判官自己製造假駁回，讓正確的工作卡死」這個活測抓到過的失敗模式：
@@ -531,6 +583,8 @@ MAV 判官與第一階段評估器的 prompt 都內建幾條紀律，治的是�
 - **agent 自稱完成不是證據**：「已完成」「已處理好」這類自述本身不構成通過理由，判官必須逐項比對驗收標準與實際產出。
 
 這幾條紀律沒有 config 開關，即刻套用到所有 goal 任務。
+
+判官 prompt 另外帶一行由系統提供（不是執行者自述）的事實：執行者的工作目錄，也就是 `<home>/agents/<agent_id>` 的絕對路徑（`<worker_working_directory>`），結果裡的相對路徑都相對於它。這一行在每種模式都有，包含 `criteria_ledger = "off"`；只有派工引擎沒有 home 目錄時才省略。加這一行之前，一個正確的 `hello.txt` 被駁回兩次，原因是判官把 agent 目錄當成「子目錄，不是工作目錄」。
 
 ## 動態判官深度（MaAS）
 

@@ -89,7 +89,7 @@ DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Pla
 ### 安全性
 - **Claude Code PreToolUse hooks**（由 `agent_hook_installer` 逐 agent 裝進 `<agent_dir>/.claude/settings.json`）：`duduclaw hook agent-file-guard`（Rust 子命令，matcher `Write|Edit|MultiEdit|Bash`；擋正規樹外的 agent 結構檔、擋寫自己的 SOUL.md、擋跨 agent 寫入，並含 `org_field_guard` 對 `reports_to`／`department`／`name`／`[capabilities]`／`[delegation]`／`[acp]` 的欄位級凍結）與 `duduclaw hook data-file-guard`（RFC-23 §14.4，matcher `Read|Bash`，只有去識別化生效時才武裝；它是 `Bash` 檔名啟發式，並非沙箱。H10 2026-09 已取代原本在 Windows 上失效的 shell 腳本）。2026-04 的三階段 shell 腳本防禦與其 GREEN／YELLOW／RED 威脅等級狀態機已於 `ba015a48` 移除，詳見 [`docs/features/zh-TW/05-security-defense.md`](../../features/zh-TW/05-security-defense.md)。
 - **SOUL.md 漂移偵測**（SHA-256 指紋，`.soul_history/` 保留最多 10 個版本備份）。
-- **Prompt injection 掃描器**（`input_guard`，7 類規則，阻擋門檻 60，先 NFKC 正規化，英文＋zh-TW 樣式，XML 分隔符保護）。
+- **Prompt injection 掃描器**（`input_guard`，11 類規則，阻擋門檻 60，先 NFKC 正規化，英文＋zh-TW 樣式，XML 分隔符保護）。
 - **機密外洩掃描器**— 19 種機密樣式（Anthropic / OpenAI / AWS / GitHub / GitLab / Slack / Stripe / Google / SendGrid / JWT / PEM 金鑰，以及金鑰或密碼的賦值）加上高熵值檢查，由 skill 安全掃描器使用。
 - **CONTRACT.toml**— `must_not` / `must_always` 邊界規則，自動注入 system prompt；`duduclaw test` 紅隊測試 CLI（內建 9 種情境）。
 - **統一多來源稽核日誌**：`audit.unified_log` 把 `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` 整併成統一格式（timestamp / source / event_type / agent_id / severity / summary / details），並在 Logs 頁提供篩選 chip。

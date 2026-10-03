@@ -89,7 +89,7 @@ DuDuClawは**マルチランタイム AI エージェントプラットフォー
 ### セキュリティ
 - **Claude Code PreToolUse hooks**（`agent_hook_installer` がエージェントごとに `<agent_dir>/.claude/settings.json` へ導入）：`duduclaw hook agent-file-guard`（Rust サブコマンド、matcher `Write|Edit|MultiEdit|Bash`。正規ツリー外のエージェント構造ファイル、自分の SOUL.md への書き込み、他エージェントへの書き込みをブロックし、`reports_to` / `department` / `name` / `[capabilities]` / `[delegation]` / `[acp]` に対する `org_field_guard` のフィールド単位凍結を含む）と `duduclaw hook data-file-guard`（RFC-23 §14.4、matcher `Read|Bash`、匿名化が有効なときだけ武装。サンドボックスではなく `Bash` のファイル名ヒューリスティック。H10 2026-09 が Windows で無効だったシェルスクリプトを置き換え）。2026-04 の3段階シェルスクリプト防御と GREEN/YELLOW/RED の脅威レベルステートマシンは `ba015a48` で削除済みです。[`docs/features/ja-JP/05-security-defense.md`](../../features/ja-JP/05-security-defense.md) を参照。
 - **SOUL.mdドリフト検出**（SHA-256フィンガープリント、`.soul_history/` に最大10世代のバックアップ）。
-- **Prompt injectionスキャナー**（`input_guard`、7種類のルールカテゴリ、ブロック閾値60、NFKC正規化、英語＋zh-TW パターン、XML区切り文字による保護）。
+- **Prompt injectionスキャナー**（`input_guard`、11種類のルールカテゴリ、ブロック閾値60、NFKC正規化、英語＋zh-TW パターン、XML区切り文字による保護）。
 - **機密情報漏洩スキャナー**— 19 種類の機密パターン（Anthropic / OpenAI / AWS / GitHub / GitLab / Slack / Stripe / Google / SendGrid / JWT / PEM 鍵、および鍵やパスワードの代入）と高エントロピー検査。skill セキュリティスキャナーが使用します。
 - **CONTRACT.toml**— `must_not` / `must_always` の境界ルール、system promptに自動注入。`duduclaw test` レッドチームCLI（組み込み9シナリオ）。
 - **統一マルチソース監査ログ**：`audit.unified_log` が `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl` を共通のエンベロープ（timestamp / source / event_type / agent_id / severity / summary / details）にマージし、Logsページのフィルターチップで絞り込めます。

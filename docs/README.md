@@ -18,7 +18,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/05-security-defense.md](features/05-security-defense.md) | Security defense — the four live guards and what none of them covers |
 | [features/07-account-rotation.md](features/07-account-rotation.md) | Multi-account rotation — intelligent credential scheduling |
 | [features/08-browser-automation.md](features/08-browser-automation.md) | Browser automation & computer use — two fetch tools, an optional browser server and computer-use sessions driven through eight `computer_*` MCP tools; no auto-router |
-| [features/09-behavioral-contracts.md](features/09-behavioral-contracts.md) | Behavioral contracts — machine-enforceable agent boundaries |
+| [features/09-behavioral-contracts.md](features/09-behavioral-contracts.md) | Behavioral contracts — machine-enforceable agent boundaries, red-team coverage ledger (11 techniques, `--emit-evals`) |
 | [features/10-cognitive-memory.md](features/10-cognitive-memory.md) | Cognitive memory — human-inspired memory with forgetting |
 | [features/11-token-compression.md](features/11-token-compression.md) | Prompt budget enforcement — estimate, three stages, or refuse |
 | [features/12-industry-templates.md](features/12-industry-templates.md) | Industry templates & Odoo ERP bridge |
@@ -55,7 +55,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/46-belief-loop.md](features/46-belief-loop.md) | Belief loop — structured predictions about the outside world, deterministically scored against reality |
 | [features/47-agent-mail.md](features/47-agent-mail.md) | Agent Mail — per-agent inbox (Gmail / drop folder); outbound mail always requires human confirmation |
 | [features/48-goal-intent-router.md](features/48-goal-intent-router.md) | Goal intent router — chat channels notice task delegation and offer to create a goal; never auto-created |
-| [features/49-code-security-audit.md](features/49-code-security-audit.md) | Code security audit — `duduclaw secaudit`: static scanners + AI deep audit + adversarial review + sandboxed PoC |
+| [features/49-code-security-audit.md](features/49-code-security-audit.md) | Code security audit — `duduclaw secaudit`: static scanners + AI deep audit with threat model and pre-check + adversarial review + coverage ledger + report validator + sandboxed PoC |
 | [features/50-duduclaw-os-appliance.md](features/50-duduclaw-os-appliance.md) | DuDuClaw OS appliance — bootable image, LAN dashboard onboarding, device page, sysd privilege separation, webhook relay |
 | [features/51-os-keyboard-shortcuts.md](features/51-os-keyboard-shortcuts.md) | DuDuClaw OS keyboard shortcuts — global compositor bindings, shell UI, first-run setup, lock screen |
 | [features/52-desktop-edition.md](features/52-desktop-edition.md) | DuDuClaw OS desktop edition — one machine shared by a person and the AI: shadow workspace, human input always wins, explicit hand-back, off-by-default co-driving |

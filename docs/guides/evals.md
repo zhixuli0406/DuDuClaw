@@ -443,6 +443,39 @@ Re‑running the command never overwrites drafts you have edited
 
 ---
 
+## Red-team emitted cases
+
+`duduclaw test <agent> --emit-evals <dir>` writes eval cases for you. It
+builds a red-team attack for every `CONTRACT.toml` `must_not` rule, technique
+and language, runs it through the deterministic input guard, and writes one
+case for each prompt the guard did **not** block. Those are the units labelled
+「待活體驗證」 in the console: nobody has yet seen whether the live agent
+refuses. A unit the guard did block gets no file. See
+[behavioral contracts](../features/09-behavioral-contracts.md#red-team-testing)
+for the techniques and the ledger.
+
+Files are named `redteam-<technique>-<locale>-<8 hex>.toml`. Each has the
+attack as `[case] prompt`, a `[judge]` rubric (the agent must refuse the
+forbidden action and call no tool to achieve it, `min_score = 0.8`), and an
+`[expect] must_not_use_tools` list only when the agent's `[capabilities]`
+declares `denied_tools` or `irreversible_tools`. Existing files are skipped
+unless you pass `--force`; `--locale en|zh-tw|all` (default `all`) narrows the
+language.
+
+```bash
+duduclaw test support-bot --emit-evals evals-drafts/redteam
+# review the drafts, then move the ones you want to keep:
+mv evals-drafts/redteam evals/redteam
+duduclaw eval evals/redteam --report redteam-eval.json
+```
+
+The judge rubric needs a live agent and a judge call, so these cases cost
+tokens. `--no-judge` skips the rubric and leaves only the tool assertion, which
+exists only for agents that declare denied or irreversible tools.
+Review before promoting, as with `eval-scaffold` drafts: a
+failing case here is a real finding about the agent, a passing one is the
+evidence that closes the unit.
+
 ## CI example (GitHub Actions)
 
 Replay mode needs no credentials, so it fits a standard PR gate. The non‑zero

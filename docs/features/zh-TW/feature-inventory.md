@@ -103,7 +103,7 @@
 | 燒錢速率異常偵測 | 對每日花費做滾動平均＋標準差離群偵測（`cost_anomaly.rs`） |
 | 稽核匯出 + SIEM sink | `duduclaw export audit`（原 `duduclaw audit`）：正規化並串流 JSONL 稽核軌跡至 NDJSON／webhook |
 | 出站 guardrail hook | opt-in `[guardrails]`：送出前掃描憑證洩漏／injection echo／deny 詞／PII |
-| CI 紅隊掃描 | `duduclaw redteam`：由 `CONTRACT.toml` `must_not` 生成 jailbreak 變體，跑過 input-guard |
+| CI 紅隊掃描 | `duduclaw redteam`／`duduclaw test`：由 `CONTRACT.toml` `must_not` 生成 11 種手法 × 中英文攻擊，跑過 input-guard 並建成覆蓋帳本；沒被擋下的單位標為「待活體驗證」，不算漏洞；`duduclaw test --emit-evals` 為它們產生 `duduclaw eval` 案例 |
 | 安全姿態報告 | `duduclaw security`：現行防護的加權檢查清單 |
 | 備份／還原 | `duduclaw backup` / `restore`：時間戳家目錄封存 + SHA-256 sidecar（還原時驗證） |
 | Session 重播 | `duduclaw session replay <id>`：逐輪印出 session（可加 `--tools`） |
@@ -270,9 +270,9 @@
 | `data-file-guard` PreToolUse hook | `duduclaw hook data-file-guard`（RFC-23 §14.4，H10 2026-09 起為 Rust 子命令，matcher `Read\|Bash`），只有去識別化生效時才武裝；本質是 `Bash` 檔名啟發式，並非沙箱 |
 | Dashboard 認證 | JWT 帳號登入（Argon2id 密碼，`users.db`）或 gateway 管理員 token。早期的 Ed25519 挑戰回應路徑已移除，從來沒有任何設定能啟用它 |
 | AES-256-GCM | API 金鑰靜態加密、per-agent 金鑰隔離 |
-| Prompt Injection 掃描 | `input_guard`：7 類規則、阻擋門檻 60、先 NFKC 正規化、英文＋zh-TW 樣式、XML 分隔標籤保護 |
+| Prompt Injection 掃描 | `input_guard`：11 類規則、阻擋門檻 60、先 NFKC 正規化、英文＋zh-TW 樣式、XML 分隔標籤保護 |
 | SOUL.md 漂移偵測 | SHA-256 指紋比對 |
-| CONTRACT.toml | 行為邊界 + `duduclaw test` 紅隊 CLI（9 個內建場景）；自動注入所有 runtime 的 system prompt |
+| CONTRACT.toml | 行為邊界 + `duduclaw test` 紅隊 CLI（9 個內建場景＋覆蓋帳本）；自動注入所有 runtime 的 system prompt |
 | RBAC 矩陣（唯讀檢視） | 安全頁把每個 agent 的工具／網路／審批矩陣渲染出來，資料源是 `agent.toml [capabilities]`。`duduclaw-security::rbac` 模組已移除（零呼叫端），可編輯的權威來源就是各 agent 的 capability envelope |
 | 統一多源審計日誌 | `audit.unified_log` 合併 `security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl`；日誌頁提供來源篩選 + 嚴重度下拉 |
 | JSONL 審計日誌 | 完整記錄工具呼叫，async 寫入 |
