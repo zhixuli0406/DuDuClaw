@@ -97,6 +97,84 @@ impl TaskStore {
         Ok(())
     }
 
+    /// WP-G2: write the task's criteria ledger (latest state) and, in the
+    /// same transaction, snapshot it onto the round about to be sealed (the
+    /// latest un-judged iteration row — the lookup
+    /// [`Self::record_iteration_evaluator_verdict`] uses). No open round ⇒
+    /// only the task column is written.
+    pub async fn set_criteria_ledger(&self, task_id: &str, ledger_json: &str) -> Result<(), String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("criteria ledger: begin: {e}"))?;
+        tx.execute(
+            "UPDATE tasks SET criteria_ledger = ?2 WHERE id = ?1",
+            params![task_id, ledger_json],
+        )
+        .map_err(|e| format!("criteria ledger: task write: {e}"))?;
+        let row_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM task_iterations
+                  WHERE task_id = ?1 AND judged_at IS NULL AND verdict IS NULL
+                  ORDER BY round DESC, id DESC LIMIT 1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("criteria ledger: round lookup: {e}"))?;
+        if let Some(id) = row_id {
+            tx.execute(
+                "UPDATE task_iterations SET criteria_ledger_json = ?2 WHERE id = ?1",
+                params![id, ledger_json],
+            )
+            .map_err(|e| format!("criteria ledger: round snapshot: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("criteria ledger: commit: {e}"))
+    }
+
+    /// WP-G2: replace the stored worker reply with its tag-stripped form
+    /// once the `<criteria_status>` report has been read, so every stored
+    /// copy downstream (`result_summary` on the task row, the
+    /// `worker_excerpt` each verdict seals from it, the dashboard's latest
+    /// output) carries no raw tag. The parsed ledger keeps the content.
+    /// Compare-and-set on the exact text read at settle: a newer submission
+    /// that landed in between is never overwritten. Returns whether a row
+    /// changed.
+    pub async fn rewrite_result_summary(
+        &self,
+        task_id: &str,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE tasks SET result_summary = ?3
+                  WHERE id = ?1 AND result_summary = ?2",
+                params![task_id, expected, replacement],
+            )
+            .map_err(|e| format!("rewrite result_summary: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// WP-G2: per-round ledger snapshots `(round, json)`, oldest first.
+    pub async fn iteration_criteria_snapshots(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<(i64, Option<String>)>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT round, criteria_ledger_json FROM task_iterations
+                  WHERE task_id = ?1 ORDER BY round ASC, id ASC",
+            )
+            .map_err(|e| format!("prepare criteria snapshots: {e}"))?;
+        stmt.query_map(params![task_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| format!("query criteria snapshots: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect criteria snapshots: {e}"))
+    }
+
     /// A1: record the pause class on the task's latest iteration row when an
     /// escalation happens outside the settle path (the driver's own caps /
     /// oscillation, a team round asking for a human). Never touches the

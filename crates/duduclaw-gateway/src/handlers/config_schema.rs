@@ -24,18 +24,28 @@ pub(crate) enum Ty {
     Float,
     StrArray,
     Table,
+    /// A string that must be one of the listed values (exact match). For
+    /// keys whose reader would otherwise fall back silently on a typo.
+    OneOf(&'static [&'static str]),
 }
 
+/// `[dispatch] strict_reply_parsing` values (WP-G1).
+const STRICT_REPLY_PARSING_VALUES: &[&str] = &["off", "shadow", "enforce"];
+
+/// `[goal_loop] criteria_ledger` values (WP-G2).
+const CRITERIA_LEDGER_VALUES: &[&str] = &["off", "report", "enforce"];
+
 impl Ty {
-    fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            Ty::Bool => "true or false",
-            Ty::Str => "a string",
-            Ty::UInt => "a non-negative integer",
-            Ty::Port => "a port number (1-65535)",
-            Ty::Float => "a number",
-            Ty::StrArray => "an array of strings",
-            Ty::Table => "a table",
+            Ty::Bool => "true or false".to_string(),
+            Ty::Str => "a string".to_string(),
+            Ty::UInt => "a non-negative integer".to_string(),
+            Ty::Port => "a port number (1-65535)".to_string(),
+            Ty::Float => "a number".to_string(),
+            Ty::StrArray => "an array of strings".to_string(),
+            Ty::Table => "a table".to_string(),
+            Ty::OneOf(values) => format!("one of \"{}\"", values.join("\", \"")),
         }
     }
 
@@ -48,6 +58,7 @@ impl Ty {
             Ty::Float => v.is_float() || v.is_integer(),
             Ty::StrArray => v.as_array().is_some_and(|a| a.iter().all(|x| x.is_str())),
             Ty::Table => v.is_table(),
+            Ty::OneOf(values) => v.as_str().is_some_and(|s| values.contains(&s)),
         }
     }
 }
@@ -112,6 +123,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("goal_loop", "stalled_secs", UInt),
     ("goal_loop", "progress_report_minutes", UInt),
     ("goal_loop", "tool_streak_advisory", Bool),
+    ("goal_loop", "criteria_ledger", OneOf(CRITERIA_LEDGER_VALUES)),
     ("dispatch", "enabled", Bool),
     ("dispatch", "policy", Str),
     ("dispatch", "judge", Str),
@@ -120,6 +132,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("dispatch", "judge_command", StrArray),
     ("dispatch", "judge_timeout_secs", UInt),
     ("dispatch", "two_stage_judge", Bool),
+    ("dispatch", "strict_reply_parsing", OneOf(STRICT_REPLY_PARSING_VALUES)),
     ("dispatch", "grounding_precheck_enabled", Bool),
     ("dispatch", "grounding_min_overlap_chars", UInt),
     ("dispatch", "admission", Str),
@@ -272,6 +285,27 @@ mod tests {
         assert!(check("[night]\nllm_enabled = \"nah\"\n").is_err());
         assert!(check("[gateway]\nport = 70000\n").is_err());
         assert!(check("[dispatch.team_budget]\nmax_spawns_per_task = -1\n").is_err());
+    }
+
+    #[test]
+    fn strict_reply_parsing_is_an_optional_string_enum() {
+        for v in ["off", "shadow", "enforce"] {
+            check(&format!("[dispatch]\nstrict_reply_parsing = \"{v}\"\n")).unwrap();
+        }
+        check("[dispatch]\ntwo_stage_judge = true\n").unwrap();
+        let e = check("[dispatch]\nstrict_reply_parsing = \"enforced\"\n").unwrap_err();
+        assert!(e.contains("strict_reply_parsing") && e.contains("\"enforce\""), "{e}");
+        assert!(check("[dispatch]\nstrict_reply_parsing = true\n").is_err());
+    }
+
+    #[test]
+    fn criteria_ledger_is_an_optional_string_enum() {
+        for v in ["off", "report", "enforce"] {
+            check(&format!("[goal_loop]\ncriteria_ledger = \"{v}\"\n")).unwrap();
+        }
+        let e = check("[goal_loop]\ncriteria_ledger = \"shadow\"\n").unwrap_err();
+        assert!(e.contains("criteria_ledger") && e.contains("\"report\""), "{e}");
+        assert!(check("[goal_loop]\ncriteria_ledger = false\n").is_err());
     }
 
     #[test]

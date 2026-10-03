@@ -52,10 +52,43 @@ impl DispatchEngine {
                 .as_deref()
                 .map(|h| workspace_prefixes_for(&h.join("agents").join(&task.assigned_to)))
                 .unwrap_or_default();
-            let result = strip_workspace_prefixes(
-                &task.result_summary.clone().unwrap_or_default(),
-                &workspace_prefixes,
+            // ── WP-G2: per-criterion ledger. Read the worker's
+            // `<criteria_status>` report, persist the updated ledger (plus a
+            // snapshot on this round's iteration row), and strip the tag from
+            // the text every judge stage sees. No ledger, or
+            // `[goal_loop] criteria_ledger = "off"` ⇒ nothing here runs and
+            // the result text is untouched (byte-identical to before).
+            let ledger_mode = crate::goal_loop::criteria_ledger::CriteriaLedgerMode::from_home(
+                self.home_dir.as_deref(),
             );
+            let raw_result = task.result_summary.clone().unwrap_or_default();
+            let (worker_text, ledger_after) = match (ledger_mode, &task.criteria_ledger) {
+                (crate::goal_loop::criteria_ledger::CriteriaLedgerMode::Off, _) | (_, None) => {
+                    (raw_result, None)
+                }
+                (mode, Some(stored)) => {
+                    match crate::goal_loop::criteria_ledger::CriteriaLedger::from_json(Some(stored)) {
+                        Some(ledger) => {
+                            let next = self
+                                .settle_criteria_ledger(&task, &ledger, &raw_result, mode)
+                                .await;
+                            (crate::goal_loop::criteria_ledger::strip_tag(&raw_result), Some(next))
+                        }
+                        None => {
+                            warn!(task = %task.id, "WP-G2: stored criteria ledger unreadable — ignored for this round");
+                            (raw_result, None)
+                        }
+                    }
+                }
+            };
+            // `enforce` only: the handles the MAV panel must rule on one by one.
+            let enforce_handles: Vec<String> = match (&ledger_after, ledger_mode) {
+                (Some(l), crate::goal_loop::criteria_ledger::CriteriaLedgerMode::Enforce) => {
+                    l.handles()
+                }
+                _ => Vec::new(),
+            };
+            let result = strip_workspace_prefixes(&worker_text, &workspace_prefixes);
             // H1: the bare goal text, kept immutable. The MAV panel reads
             // `task_desc` (which accumulates evidence/contract blocks below);
             // the cheap first-stage evaluator reads this plus its own
@@ -466,6 +499,30 @@ impl DispatchEngine {
                 task_desc = format!("{task_desc}\n\n<bail_hint>\n{note}\n</bail_hint>");
             }
 
+            // System-provided fact (every mode, independent of the ledger):
+            // the worker's working directory, so the panel reads relative
+            // paths in the result against the right root. Live run
+            // 2026-10-03: a correct `hello.txt` was rejected twice because
+            // the judge thought the agent directory was "a subdirectory, not
+            // the working directory". Omitted without a home dir.
+            if let Some(block) = super::worker_working_directory_block(
+                self.home_dir
+                    .as_deref()
+                    .map(|h| h.join("agents").join(&task.assigned_to))
+                    .as_deref(),
+            ) {
+                task_desc = format!("{task_desc}\n\n{block}");
+            }
+
+            // WP-G2: the worker's self-reported ledger as a reference block
+            // (report + enforce). Marked as self-report, never evidence.
+            if let Some(ledger) = &ledger_after {
+                task_desc = format!(
+                    "{task_desc}\n\n{}",
+                    crate::goal_loop::criteria_ledger::render_judge_reference(&ledger.units)
+                );
+            }
+
             // ── P0/WP-B: judge-model routing audit ──
             // Advisory only — it cannot change a verdict. Placed BEFORE the
             // first-stage evaluator because both LLM stages share the judge
@@ -786,7 +843,7 @@ impl DispatchEngine {
                                     judge_mode,
                                     &detail,
                                 );
-                                judge.judge(&criteria, &task_desc, &result).await
+                                call_mav(judge, &criteria, &task_desc, &result, &enforce_handles).await
                             }
                             Some(cfg) => {
                                 let ext = crate::judge_mode::ExternalAcceptanceJudge::new(cfg);
@@ -818,13 +875,13 @@ impl DispatchEngine {
                                             judge_mode,
                                             &e,
                                         );
-                                        judge.judge(&criteria, &task_desc, &result).await
+                                        call_mav(judge, &criteria, &task_desc, &result, &enforce_handles).await
                                     }
                                 }
                             }
                         }
                     }
-                    None => judge.judge(&criteria, &task_desc, &result).await,
+                    None => call_mav(judge, &criteria, &task_desc, &result, &enforce_handles).await,
                 };
                 match verdict {
                     Ok(v) if v.passed => {
@@ -1086,7 +1143,71 @@ impl DispatchEngine {
     }
 }
 
+/// The MAV panel call: the per-criterion contract only when `enforce` handed
+/// over handles, otherwise exactly the pre-WP-G2 `judge` call.
+async fn call_mav(
+    judge: &Arc<dyn AcceptanceJudge>,
+    criteria: &str,
+    task_desc: &str,
+    result: &str,
+    handles: &[String],
+) -> Result<AcceptanceVerdict, String> {
+    if handles.is_empty() {
+        judge.judge(criteria, task_desc, result).await
+    } else {
+        judge
+            .judge_with_criteria(criteria, task_desc, result, handles)
+            .await
+    }
+}
+
 impl DispatchEngine {
+    /// WP-G2: settle this round's `<criteria_status>` report against the
+    /// stored ledger, persist the result (task column + round snapshot) and
+    /// audit an invalid report. Returns the ledger the judge should see.
+    /// Persistence and audit are best-effort: a failure is logged and never
+    /// changes the adjudication.
+    async fn settle_criteria_ledger(
+        &self,
+        task: &TaskRow,
+        ledger: &crate::goal_loop::criteria_ledger::CriteriaLedger,
+        reply: &str,
+        mode: crate::goal_loop::criteria_ledger::CriteriaLedgerMode,
+    ) -> crate::goal_loop::criteria_ledger::CriteriaLedger {
+        use crate::goal_loop::criteria_ledger::{ReportResult, invalid_report_event, settle_round};
+        let round = task.revision_round + 1;
+        let (next, outcome) = settle_round(ledger, reply, round, mode);
+        if let Err(e) = self.store.set_criteria_ledger(&task.id, &next.to_json()).await {
+            warn!(task = %task.id, error = %e, "WP-G2: criteria ledger write failed (non-fatal)");
+        }
+        // Every stored copy downstream (task row, the `worker_excerpt` the
+        // verdict below seals) is derived from `result_summary`; replace it
+        // with the tag-stripped text now that the ledger holds the content.
+        let stripped = crate::goal_loop::criteria_ledger::strip_tag(reply);
+        if stripped != reply {
+            if let Err(e) = self.store.rewrite_result_summary(&task.id, reply, &stripped).await {
+                warn!(task = %task.id, error = %e, "WP-G2: result_summary tag strip failed (non-fatal)");
+            }
+        }
+        match &outcome {
+            ReportResult::Applied => {
+                debug!(task = %task.id, round, "WP-G2: criteria_status report applied");
+            }
+            ReportResult::Absent => {
+                debug!(task = %task.id, round, "WP-G2: no criteria_status report this round");
+            }
+            ReportResult::Invalid { error, body } => {
+                info!(task = %task.id, round, violation = %error, "WP-G2: criteria_status report invalid — ledger unchanged");
+                if let Some(home) = self.home_dir.as_deref() {
+                    let agent = task.claimed_by.as_deref().unwrap_or(task.assigned_to.as_str());
+                    let event = invalid_report_event(agent, &task.id, round, error, body);
+                    crate::security_autopilot::audit_and_emit(home, &event);
+                }
+            }
+        }
+        next
+    }
+
     /// A1 ledger: the harness knob snapshot for this task's worker, as JSON.
     /// `None` without a wired `home_dir` (test / legacy construction) or on a
     /// serialization failure — telemetry only, never consulted by settle.

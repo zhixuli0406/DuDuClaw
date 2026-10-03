@@ -36,7 +36,11 @@ pub(crate) fn task_row_to_json(row: &duduclaw_gateway::task_store::TaskRow) -> V
         // H9-G goal contract freeze: the immutable snapshot taken at goal
         // creation, when one exists (see `TaskRow::acceptance_criteria_baseline`).
         "acceptance_criteria_baseline": row.acceptance_criteria_baseline,
-        "result_summary": row.result_summary,
+        // WP-G2: the raw `<criteria_status>` tag never reaches a display copy.
+        "result_summary": duduclaw_gateway::goal_loop::criteria_ledger::display_result_summary(
+            row.criteria_ledger.as_deref(),
+            row.result_summary.as_deref(),
+        ),
         "judge_feedback": row.judge_feedback,
         // Iterative Kanban (v1.45): revision-round cache + agent clock.
         "revision_round": row.revision_round,
@@ -707,5 +711,29 @@ pub(crate) async fn handle_tasks_renew(args: &Value, home_dir: &Path, default_ag
         Ok(Some(t)) => tool_text(&serde_json::json!({ "task": task_row_to_json(&t) }).to_string()),
         Ok(None) => tool_error(&format!("task not found: {task_id}")),
         Err(e) => tool_error(&format!("renew lease: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod criteria_tag_tests {
+    use super::*;
+
+    /// WP-G2: the MCP / bus copy of a ledger goal's reply carries no raw
+    /// `<criteria_status>` tag; a task without a ledger is untouched.
+    #[test]
+    fn task_row_to_json_strips_the_criteria_tag_only_for_ledger_goals() {
+        let mut r = duduclaw_gateway::task_store::TaskRow::new(
+            "t".into(),
+            "g".into(),
+            String::new(),
+            "medium".into(),
+            "a".into(),
+            "s".into(),
+        );
+        let tagged = "完成\n<criteria_status>[]</criteria_status>";
+        r.result_summary = Some(tagged.into());
+        assert_eq!(task_row_to_json(&r)["result_summary"], tagged);
+        r.criteria_ledger = Some("{}".into());
+        assert_eq!(task_row_to_json(&r)["result_summary"], "完成");
     }
 }

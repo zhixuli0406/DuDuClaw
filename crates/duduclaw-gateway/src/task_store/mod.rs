@@ -21,7 +21,7 @@ const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_t
      goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
      source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json, \
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
-     pause_reason, plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id";
+     pause_reason, plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id, criteria_ledger";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -317,6 +317,15 @@ pub struct TaskRow {
     pub discovery_run_id: Option<String>,
     #[serde(default)]
     pub discovery_approval_id: Option<String>,
+    /// WP-G2 per-criterion acceptance ledger (JSON of
+    /// [`crate::goal_loop::criteria_ledger::CriteriaLedger`]). Written at goal
+    /// creation (`goal_create_core`) when `[goal_loop] criteria_ledger` is
+    /// not `off`, then only through [`TaskStore::set_criteria_ledger`] at
+    /// settle. `None` for every task without a ledger — those behave exactly
+    /// as before WP-G2. Not serialized: the task-detail RPC ships it in its
+    /// own typed shape.
+    #[serde(default, skip_serializing)]
+    pub criteria_ledger: Option<String>,
 }
 
 fn empty_deps() -> String {
@@ -383,6 +392,7 @@ impl TaskRow {
             discovery_spec_json: None,
             discovery_run_id: None,
             discovery_approval_id: None,
+            criteria_ledger: None,
         }
     }
 }

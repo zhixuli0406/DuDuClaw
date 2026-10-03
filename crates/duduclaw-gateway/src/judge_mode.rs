@@ -277,6 +277,10 @@ pub struct ExternalJudgeConfig {
     /// Wall-clock budget for one invocation, clamped to
     /// `[JUDGE_TIMEOUT_MIN_SECS, JUDGE_TIMEOUT_MAX_SECS]`.
     pub timeout_secs: u64,
+    /// WP-G1: the home this config was read from. The verdict parser reads
+    /// `[dispatch] strict_reply_parsing` from it at each decision and audits
+    /// shadow mismatches into it. `None` ⇒ strict contract off.
+    pub home_dir: Option<std::path::PathBuf>,
 }
 
 impl ExternalJudgeConfig {
@@ -310,6 +314,7 @@ impl ExternalJudgeConfig {
         Some(Self {
             command,
             timeout_secs,
+            home_dir: Some(home_dir.to_path_buf()),
         })
     }
 }
@@ -699,6 +704,104 @@ pub fn parse_external_verdict(raw: &str) -> Result<AcceptanceVerdict, String> {
     })
 }
 
+// ── WP-G1: strict external verdict contract ─────────────────────────────
+
+/// `pass` as [`parse_external_verdict`] accepts it: a JSON bool or one of
+/// the verdict strings [`coerce_pass`] recognises.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum StrictPassField {
+    Bool(bool),
+    Text(String),
+}
+
+/// The external judge reply under the strict contract: one object with
+/// `pass` and an optional `feedback` string, nothing else.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictExternalReply {
+    pass: StrictPassField,
+    #[serde(default)]
+    feedback: Option<String>,
+}
+
+/// Parse an external judge's stdout under the strict contract, then apply
+/// the same `pass` coercion and feedback sanitization as the lenient parser.
+/// A failed semantic check is reported as a
+/// [`Violation::Schema`](duduclaw_core::llm_contract::strict_json::Violation::Schema).
+fn parse_external_verdict_strict(
+    raw: &str,
+) -> Result<AcceptanceVerdict, duduclaw_core::llm_contract::strict_json::Violation> {
+    use duduclaw_core::llm_contract::strict_json::{Violation, parse_strict_with_limit};
+    let reply: StrictExternalReply = parse_strict_with_limit(raw, EXTERNAL_STDOUT_MAX_BYTES)?;
+    let passed = match reply.pass {
+        StrictPassField::Bool(b) => Some(b),
+        StrictPassField::Text(t) => coerce_pass(&serde_json::Value::String(t)),
+    }
+    .ok_or_else(|| Violation::Schema {
+        detail: "`pass` is not a recognised verdict".to_string(),
+    })?;
+    let feedback = sanitize_external_feedback(reply.feedback.as_deref().unwrap_or(""))
+        .map_err(|detail| Violation::Schema { detail })?;
+    Ok(AcceptanceVerdict {
+        passed,
+        feedback,
+        aspects: None,
+    })
+}
+
+/// WP-G1 entry point for the external judge: [`parse_external_verdict`] plus
+/// the strict contract according to `mode`. Under `enforce` a violation is
+/// an `Err`, so `review_goal_tasks` degrades to the MAV panel exactly as for
+/// any other external-judge failure.
+pub fn parse_external_verdict_contract(
+    raw: &str,
+    mode: crate::dispatch_engine::StrictReplyParsing,
+    home_dir: Option<&Path>,
+) -> Result<AcceptanceVerdict, String> {
+    parse_external_verdict_contract_with(crate::metrics::global_metrics(), raw, mode, home_dir)
+}
+
+/// [`parse_external_verdict_contract`] against an explicit metrics registry.
+pub(crate) fn parse_external_verdict_contract_with(
+    metrics: &crate::metrics::MetricsRegistry,
+    raw: &str,
+    mode: crate::dispatch_engine::StrictReplyParsing,
+    home_dir: Option<&Path>,
+) -> Result<AcceptanceVerdict, String> {
+    use crate::dispatch_engine::{
+        ReplyParser, ShadowObservation, ShadowOutcome, StrictReplyParsing, record_shadow,
+    };
+    if mode == StrictReplyParsing::Off {
+        return parse_external_verdict(raw);
+    }
+    let lenient = parse_external_verdict(raw);
+    let strict = parse_external_verdict_strict(raw);
+    let same = matches!(
+        (&lenient, &strict),
+        (Ok(l), Ok(s)) if l.passed == s.passed
+    );
+    let outcome = ShadowOutcome::classify(lenient.is_ok(), strict.is_ok(), same);
+    record_shadow(
+        metrics,
+        home_dir,
+        &ShadowObservation {
+            parser: ReplyParser::External,
+            mode,
+            outcome,
+            violation: strict.as_ref().err(),
+            lenient_error: lenient.as_ref().err().map(String::as_str),
+            raw,
+        },
+    );
+    match mode {
+        StrictReplyParsing::Enforce => strict.map_err(|v| {
+            format!("external judge reply violates the strict JSON contract: {v}")
+        }),
+        _ => lenient,
+    }
+}
+
 /// Cap, scan, and label an external judge's feedback before it may enter a
 /// prompt.
 ///
@@ -860,7 +963,10 @@ impl ExternalAcceptanceJudge {
         }
 
         let stdout = String::from_utf8_lossy(&stdout_bytes);
-        parse_external_verdict(&stdout)
+        // WP-G1: mode read per decision from the config's home.
+        let home = self.config.home_dir.as_deref();
+        let mode = crate::dispatch_engine::StrictReplyParsing::from_home(home);
+        parse_external_verdict_contract(&stdout, mode, home)
     }
 }
 
@@ -1441,6 +1547,7 @@ mod tests {
         ExternalAcceptanceJudge::new(ExternalJudgeConfig {
             command,
             timeout_secs,
+            home_dir: None,
         })
     }
 
@@ -1631,6 +1738,7 @@ mod tests {
         let j = ExternalAcceptanceJudge::new(ExternalJudgeConfig {
             command: vec!["definitely-not-a-real-duduclaw-judge-binary".into()],
             timeout_secs: 5,
+            home_dir: None,
         });
         assert!(j.judge("c", "t", "r").await.is_err());
     }

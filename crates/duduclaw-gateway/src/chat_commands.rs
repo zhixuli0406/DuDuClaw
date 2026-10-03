@@ -1065,6 +1065,14 @@ pub(crate) async fn handle_goal_create(
     // a later operator edit to the latter cannot retroactively change what the
     // task is judged on.
     task.acceptance_criteria_baseline = Some(criteria);
+    // WP-G2: number the frozen baseline into the per-criterion ledger (same
+    // shared helper as `goal_create_core`; no-op under `criteria_ledger =
+    // "off"`).
+    task.criteria_ledger = crate::goal_loop::criteria_ledger::ledger_for_new_goal(
+        &ctx.home_dir,
+        &task.id,
+        task.acceptance_criteria_baseline.as_deref(),
+    );
     // Goal contract v2 (design §6 G1/G3): same semantics as the dashboard
     // form — deadline computed at creation; boundary stored only when
     // explicitly given (baseline is applied at injection time instead).
@@ -2871,6 +2879,48 @@ mod goal_contract_tests {
             task.acceptance_criteria_baseline.as_deref(),
             Some("整理客戶資料成報表")
         );
+    }
+
+    /// WP-G2: chat `/goal` builds the criteria ledger from the frozen
+    /// baseline through the shared helper; `criteria_ledger = "off"` builds
+    /// none.
+    #[tokio::test]
+    async fn goal_create_builds_the_criteria_ledger_unless_off() {
+        use crate::goal_loop::criteria_ledger::CriteriaLedger;
+        async fn create(off: bool) -> Option<String> {
+            let dir = tempfile::tempdir().unwrap();
+            if off {
+                std::fs::write(
+                    dir.path().join("config.toml"),
+                    "[goal_loop]\ncriteria_ledger = \"off\"\n",
+                )
+                .unwrap();
+            }
+            let ctx = test_ctx(dir.path());
+            let _ = handle_goal_create(
+                &ctx,
+                "telegram:123:abc",
+                "agent-l",
+                "整理客戶資料成報表",
+                Some("含營收圖表\n寄出給 Louis"),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await;
+            let store = crate::task_store::TaskStore::open(dir.path()).unwrap();
+            let tasks = store
+                .list_tasks_filtered(None, Some("agent-l"), None, Some(true))
+                .await
+                .unwrap();
+            assert_eq!(tasks.len(), 1, "{tasks:?}");
+            tasks[0].criteria_ledger.clone()
+        }
+        let ledger = CriteriaLedger::from_json(create(false).await.as_deref()).expect("ledger");
+        assert_eq!(ledger.handles(), vec!["C1".to_string(), "C2".to_string()]);
+        assert_eq!(ledger.units[1].text, "寄出給 Louis");
+        assert!(create(true).await.is_none());
     }
 
     // ── v1.68.0: webhook channels honour `admin_users` ─────────────────

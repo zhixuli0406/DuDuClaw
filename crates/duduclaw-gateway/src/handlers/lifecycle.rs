@@ -449,18 +449,23 @@ impl MethodHandler {
         let caller = crate::dispatch_engine::GoalAcceptanceCaller {
             home_dir: self.home_dir.clone(),
         };
-        let judge: Arc<dyn crate::dispatch_engine::AcceptanceJudge> =
-            Arc::new(crate::dispatch_engine::LlmAcceptanceJudge::new(caller));
+        let judge: Arc<dyn crate::dispatch_engine::AcceptanceJudge> = Arc::new(
+            crate::dispatch_engine::LlmAcceptanceJudge::new(caller)
+                .with_reply_contract_home(self.home_dir.clone()),
+        );
         // H1 two-stage adjudication: the cheap first-stage evaluator runs on
         // the SAME utility choke-point as the panel (own caller instance — the
         // judge consumed the first). Always wired; `[dispatch] two_stage_judge`
         // (default true) is read at review time so the switch hot-reloads.
         let evaluator: Arc<dyn crate::dispatch_engine::PreAcceptanceEvaluator> =
-            Arc::new(crate::dispatch_engine::LlmPreEvaluator::new(
-                crate::dispatch_engine::GoalAcceptanceCaller {
-                    home_dir: self.home_dir.clone(),
-                },
-            ));
+            Arc::new(
+                crate::dispatch_engine::LlmPreEvaluator::new(
+                    crate::dispatch_engine::GoalAcceptanceCaller {
+                        home_dir: self.home_dir.clone(),
+                    },
+                )
+                .with_reply_contract_home(self.home_dir.clone()),
+            );
         let mut builder = crate::dispatch_engine::DispatchEngine::new(ts, Some(judge))
             .with_evaluator(evaluator)
             // WP4 GroundEval: fold `tool_calls.jsonl` evidence into the

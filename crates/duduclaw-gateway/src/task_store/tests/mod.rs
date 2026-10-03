@@ -4,6 +4,7 @@
 //! files for size only.
 
 mod claim_cases;
+mod criteria_cases;
 mod goal_cases;
 mod ledger_cases;
 mod plan_cases;

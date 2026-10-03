@@ -157,6 +157,15 @@ pub async fn create_goal_task(
     // H9-G goal contract freeze (harness-borrowings 2026-08 WP-D): the judge
     // reads this column, never the mutable `acceptance_criteria` field.
     task.acceptance_criteria_baseline = Some(acceptance_criteria);
+    // WP-G2: number the frozen baseline into a per-criterion ledger, once,
+    // at the same frozen-contract moment. `[goal_loop] criteria_ledger =
+    // "off"` (or an empty baseline) creates none, and a goal without a
+    // ledger behaves exactly as before WP-G2.
+    task.criteria_ledger = crate::goal_loop::criteria_ledger::ledger_for_new_goal(
+        home_dir,
+        &task_id,
+        task.acceptance_criteria_baseline.as_deref(),
+    );
     if let Some(tag) = &outcome_tag {
         task.tags = tag.clone();
     }
@@ -287,6 +296,34 @@ mod tests {
             created.task.acceptance_criteria_baseline.as_deref(),
             Some("含營收圖表")
         );
+    }
+
+    /// WP-G2: the default mode (`report`, no config) numbers the frozen
+    /// baseline into a ledger; `off` creates none.
+    #[tokio::test]
+    async fn goal_create_core_builds_the_criteria_ledger_unless_off() {
+        use crate::goal_loop::criteria_ledger::{CriteriaLedger, CriterionStatus};
+        let home = tempfile::tempdir().expect("tempdir");
+        let store = store_in(home.path()).await;
+        let mut r = req("a");
+        r.acceptance_criteria = Some("含營收圖表\n\n寄出月報".into());
+        let created = create_goal_task(home.path(), &store, r).await.expect("create");
+        let stored = store.get_task(&created.task.id).await.unwrap().unwrap();
+        let ledger = CriteriaLedger::from_json(stored.criteria_ledger.as_deref()).expect("ledger");
+        assert_eq!(ledger.units.len(), 2);
+        assert_eq!(ledger.units[1].handle, "C2");
+        assert_eq!(ledger.units[1].text, "寄出月報");
+        assert!(ledger.units.iter().all(|u| u.status == CriterionStatus::Planned));
+        assert!(ledger.units[0].id.starts_with(&created.task.id));
+
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[goal_loop]\ncriteria_ledger = \"off\"\n",
+        )
+        .unwrap();
+        let created = create_goal_task(home.path(), &store, req("a")).await.expect("create");
+        let stored = store.get_task(&created.task.id).await.unwrap().unwrap();
+        assert!(stored.criteria_ledger.is_none());
     }
 
     /// Fail-closed validation lives here so both rails reject the same inputs

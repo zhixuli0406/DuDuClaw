@@ -160,7 +160,24 @@ pub fn parse_pre_evaluation(raw: &str) -> Result<PreEvaluation, String> {
     let val: serde_json::Value = serde_json::from_str(&raw[start..=end])
         .map_err(|e| format!("evaluator reply is not valid JSON: {e}"))?;
 
-    let decision = match val.get("decision").and_then(|d| d.as_str()).map(str::trim) {
+    pre_evaluation_from_fields(
+        val.get("decision").and_then(|v| v.as_str()),
+        val.get("evidence").and_then(|v| v.as_str()).unwrap_or(""),
+        val.get("next_step").and_then(|v| v.as_str()).unwrap_or(""),
+        val.get("blocker_key").and_then(|v| v.as_str()).unwrap_or(""),
+    )
+}
+
+/// The field contract shared by the lenient [`parse_pre_evaluation`] and the
+/// WP-G1 strict path: same checks, same order, same error text. `decision`
+/// is `None` when the reply has no string `decision`.
+fn pre_evaluation_from_fields(
+    decision: Option<&str>,
+    evidence: &str,
+    next_step: &str,
+    blocker_key: &str,
+) -> Result<PreEvaluation, String> {
+    let decision = match decision.map(str::trim) {
         Some("continue") => PreDecision::Continue,
         Some("candidate_complete") => PreDecision::CandidateComplete,
         Some("blocked") => PreDecision::Blocked,
@@ -168,28 +185,18 @@ pub fn parse_pre_evaluation(raw: &str) -> Result<PreEvaluation, String> {
         None => return Err("evaluator reply has no string `decision` field".to_string()),
     };
 
-    let field = |name: &str| -> Result<String, String> {
-        let v = val
-            .get(name)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
+    let field = |name: &str, v: &str| -> Result<String, String> {
+        let v = v.trim().to_string();
         if v.is_empty() {
             Err(format!("evaluator reply has empty `{name}`"))
         } else {
             Ok(v)
         }
     };
-    let evidence = field("evidence")?;
-    let next_step = field("next_step")?;
+    let evidence = field("evidence", evidence)?;
+    let next_step = field("next_step", next_step)?;
 
-    let raw_key = val
-        .get("blocker_key")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let raw_key = blocker_key.trim().to_string();
     let blocker_key = match decision {
         PreDecision::Blocked => {
             if !is_snake_case_key(&raw_key) {
@@ -216,6 +223,90 @@ pub fn parse_pre_evaluation(raw: &str) -> Result<PreEvaluation, String> {
         next_step,
         blocker_key,
     })
+}
+
+// ── WP-G1: strict evaluator contract ────────────────────────────────────
+
+/// The evaluator reply exactly as [`pre_evaluator_output_schema`] declares
+/// it. `blocker_key` may be omitted or `null`: the prompt tells the model to
+/// leave it out on a non-blocked decision, and the lenient parser has always
+/// accepted that.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictPreEvaluationReply {
+    decision: String,
+    evidence: String,
+    next_step: String,
+    #[serde(default)]
+    blocker_key: Option<String>,
+}
+
+/// Parse an evaluator reply under the strict contract, then apply the same
+/// field checks as the lenient parser. A failed field check is reported as
+/// [`Violation::Schema`](duduclaw_core::llm_contract::strict_json::Violation::Schema).
+fn parse_pre_evaluation_strict(
+    raw: &str,
+) -> Result<PreEvaluation, duduclaw_core::llm_contract::strict_json::Violation> {
+    use duduclaw_core::llm_contract::strict_json::{Violation, parse_strict};
+    let reply: StrictPreEvaluationReply = parse_strict(raw)?;
+    pre_evaluation_from_fields(
+        Some(&reply.decision),
+        &reply.evidence,
+        &reply.next_step,
+        reply.blocker_key.as_deref().unwrap_or(""),
+    )
+    .map_err(|detail| Violation::Schema { detail })
+}
+
+/// WP-G1 entry point for the first-stage evaluator: [`parse_pre_evaluation`]
+/// plus the strict contract according to `mode`. Under `enforce` a violation
+/// is an `Err`, so the caller degrades to the MAV panel exactly as it does
+/// for any other evaluator failure.
+pub fn parse_pre_evaluation_contract(
+    raw: &str,
+    mode: super::strict_shadow::StrictReplyParsing,
+    home_dir: Option<&std::path::Path>,
+) -> Result<PreEvaluation, String> {
+    parse_pre_evaluation_contract_with(crate::metrics::global_metrics(), raw, mode, home_dir)
+}
+
+/// [`parse_pre_evaluation_contract`] against an explicit metrics registry.
+pub(crate) fn parse_pre_evaluation_contract_with(
+    metrics: &crate::metrics::MetricsRegistry,
+    raw: &str,
+    mode: super::strict_shadow::StrictReplyParsing,
+    home_dir: Option<&std::path::Path>,
+) -> Result<PreEvaluation, String> {
+    use super::strict_shadow::{
+        ReplyParser, ShadowObservation, ShadowOutcome, StrictReplyParsing, record_shadow,
+    };
+    if mode == StrictReplyParsing::Off {
+        return parse_pre_evaluation(raw);
+    }
+    let lenient = parse_pre_evaluation(raw);
+    let strict = parse_pre_evaluation_strict(raw);
+    let same = matches!(
+        (&lenient, &strict),
+        (Ok(l), Ok(s)) if l.decision == s.decision
+    );
+    let outcome = ShadowOutcome::classify(lenient.is_ok(), strict.is_ok(), same);
+    record_shadow(
+        metrics,
+        home_dir,
+        &ShadowObservation {
+            parser: ReplyParser::PreEvaluator,
+            mode,
+            outcome,
+            violation: strict.as_ref().err(),
+            lenient_error: lenient.as_ref().err().map(String::as_str),
+            raw,
+        },
+    );
+    match mode {
+        StrictReplyParsing::Enforce => strict
+            .map_err(|v| format!("evaluator reply violates the strict JSON contract: {v}")),
+        _ => lenient,
+    }
 }
 
 /// Assemble the evaluator transcript from labelled items, enforcing the
@@ -255,11 +346,23 @@ pub(super) fn build_evaluator_transcript(items: &[(&str, &str)]) -> String {
 /// [`crate::runtime_dispatch::run_utility_prompt`]), no tools, JSON out.
 pub struct LlmPreEvaluator<C: duduclaw_fork::judge::LlmCaller> {
     caller: C,
+    /// WP-G1: see [`LlmAcceptanceJudge`]'s field of the same name.
+    reply_contract_home: Option<std::path::PathBuf>,
 }
 
 impl<C: duduclaw_fork::judge::LlmCaller> LlmPreEvaluator<C> {
     pub fn new(caller: C) -> Self {
-        Self { caller }
+        Self {
+            caller,
+            reply_contract_home: None,
+        }
+    }
+
+    /// WP-G1: read `[dispatch] strict_reply_parsing` from (and audit shadow
+    /// mismatches into) `home_dir`, whatever the caller is.
+    pub fn with_reply_contract_home(mut self, home_dir: std::path::PathBuf) -> Self {
+        self.reply_contract_home = Some(home_dir);
+        self
     }
 }
 
@@ -277,7 +380,10 @@ impl<C: duduclaw_fork::judge::LlmCaller> PreAcceptanceEvaluator for LlmPreEvalua
             with_judge_output_schema(pre_evaluator_output_schema(), self.caller.complete(&prompt))
                 .await
                 .map_err(|e| format!("two-stage evaluator llm error: {e}"))?;
-        parse_pre_evaluation(&raw)
+        // WP-G1: mode read per decision (hot reload).
+        let home = self.reply_contract_home.as_deref();
+        let mode = super::strict_shadow::StrictReplyParsing::from_home(home);
+        parse_pre_evaluation_contract(&raw, mode, home)
     }
 }
 

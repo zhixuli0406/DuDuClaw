@@ -436,3 +436,48 @@ async fn plan_pending_task_is_not_dispatched_before_approval() {
         "needs_human"
     );
 }
+
+/// WP-G2: a goal with a criteria ledger carries the `## 驗收帳本` section
+/// right after the `<state>` block; `criteria_ledger = "off"` and goals
+/// without a ledger dispatch the same payload as before.
+#[tokio::test]
+async fn dispatch_injects_the_criteria_ledger_only_when_present_and_not_off() {
+    use crate::goal_loop::criteria_ledger::{CriteriaLedger, CriteriaLedgerMode};
+    async fn payload(mode: Option<&str>, with_ledger: bool) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(m) = mode {
+            std::fs::write(
+                dir.path().join("config.toml"),
+                format!("[goal_loop]\ncriteria_ledger = \"{m}\"\n"),
+            )
+            .unwrap();
+        }
+        let (store, queue) = open_stores(dir.path()).await;
+        let mut t = goal_task("g1", "alice");
+        t.acceptance_criteria = Some("產出 hello.txt\n內容含你好".into());
+        if with_ledger {
+            t.criteria_ledger = CriteriaLedger::new("g1", "產出 hello.txt\n內容含你好", CriteriaLedgerMode::Report)
+                .map(|l| l.to_json());
+        }
+        store.insert_task(&t).await.unwrap();
+        let d = driver(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf());
+        d.tick_once().await.unwrap();
+        let pending = queue.pending_messages(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        pending[0].payload.clone()
+    }
+    let with = payload(None, true).await;
+    assert!(with.contains("## 驗收帳本"), "{with}");
+    assert!(with.contains("[C1] 產出 hello.txt — 尚未回報"));
+    assert!(with.contains("[C2] 內容含你好 — 尚未回報"));
+    let state_end = with.find("</state>").expect("state block");
+    let ledger_at = with.find("## 驗收帳本").unwrap();
+    let boundary_at = with.find("## 本目標風險邊界").unwrap();
+    assert!(state_end < ledger_at && ledger_at < boundary_at);
+
+    let off = payload(Some("off"), true).await;
+    let none = payload(None, false).await;
+    assert!(!off.contains("驗收帳本"));
+    assert_eq!(off, none, "off with a ledger == no ledger");
+}

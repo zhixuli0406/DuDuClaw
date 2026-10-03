@@ -194,11 +194,17 @@ mod judge;
 mod pre_evaluator;
 mod review;
 mod settle;
+mod strict_shadow;
 mod tool_activity_fmt;
 
 use grounding::*;
 pub use judge::*;
 pub use pre_evaluator::*;
+// WP-G1: strict JSON contract for judge replies (shadow → enforce).
+pub(crate) use strict_shadow::{ShadowObservation, record_shadow};
+pub use strict_shadow::{
+    REPLY_HEAD_CHARS, ReplyParser, SHADOW_MISMATCH_EVENT, ShadowOutcome, StrictReplyParsing,
+};
 pub(crate) use tool_activity_fmt::*;
 
 // ── Engine ──────────────────────────────────────────────────

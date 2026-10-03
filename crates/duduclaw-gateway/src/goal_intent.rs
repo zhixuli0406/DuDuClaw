@@ -1325,6 +1325,7 @@ async fn accept_as_goal(ctx: &ReplyContext, session_id: &str, pending: &PendingS
 /// deliberately NOT unit-tested; see that function's own doc comment). This
 /// function never touches the network.
 fn build_plan_first_task(
+    home_dir: &std::path::Path,
     session_id: &str,
     pending: &PendingSuggest,
     plan_result: Result<String, String>,
@@ -1353,6 +1354,13 @@ fn build_plan_first_task(
     // H9-G goal contract freeze — same immutable-baseline snapshot as every
     // other goal-creation path.
     task.acceptance_criteria_baseline = Some(pending.description.clone());
+    // WP-G2: the shared ledger helper (reads `[goal_loop] criteria_ledger`
+    // from `home_dir`; no-op when off).
+    task.criteria_ledger = crate::goal_loop::criteria_ledger::ledger_for_new_goal(
+        home_dir,
+        &task.id,
+        task.acceptance_criteria_baseline.as_deref(),
+    );
     if !channel.is_empty() {
         task.source_channel = Some(channel);
     }
@@ -1390,7 +1398,7 @@ async fn accept_as_plan_first(
             "goal intent: plan-first generation failed — parking needs_human (infra class)"
         );
     }
-    let task = build_plan_first_task(session_id, pending, plan_result);
+    let task = build_plan_first_task(&ctx.home_dir, session_id, pending, plan_result);
 
     if let Err(e) = store.insert_task(&task).await {
         return format!("⚠️ 無法建立目標任務：{e}");
@@ -1977,7 +1985,9 @@ mod tests {
             ttl_minutes: 10,
             nonce: "test-nonce".to_string(),
         };
+        let home = tempfile::tempdir().unwrap();
         let task = build_plan_first_task(
+            home.path(),
             "telegram:123:abc",
             &pending,
             Ok("- 步驟一\n- 步驟二".to_string()),
@@ -2006,7 +2016,13 @@ mod tests {
             ttl_minutes: 10,
             nonce: "test-nonce".to_string(),
         };
-        let task = build_plan_first_task("telegram:123:abc", &pending, Err("timeout".to_string()));
+        let home = tempfile::tempdir().unwrap();
+        let task = build_plan_first_task(
+            home.path(),
+            "telegram:123:abc",
+            &pending,
+            Err("timeout".to_string()),
+        );
         assert_eq!(task.status, "needs_human");
         assert!(task.plan_pending.is_none());
         assert_eq!(
@@ -2014,6 +2030,52 @@ mod tests {
             Some("整理客戶資料成月報並寄出"),
             "the baseline must freeze even when the planner itself failed"
         );
+    }
+
+    /// WP-G2: both goal-intent confirmations build the criteria ledger —
+    /// "1" via `handle_goal_create`, "2" (想一想) via `build_plan_first_task`
+    /// — and neither does under `criteria_ledger = "off"`.
+    #[tokio::test]
+    async fn goal_intent_confirmations_build_the_criteria_ledger_unless_off() {
+        use crate::goal_loop::criteria_ledger::CriteriaLedger;
+        let pending = PendingSuggest {
+            agent_id: "agent-g".to_string(),
+            description: "整理客戶資料成月報並寄出".to_string(),
+            created_at: Utc::now(),
+            ttl_minutes: 10,
+            nonce: "test-nonce".to_string(),
+        };
+        for off in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            if off {
+                std::fs::write(
+                    home.path().join("config.toml"),
+                    "[goal_loop]\ncriteria_ledger = \"off\"\n",
+                )
+                .unwrap();
+            }
+            // "2" 想一想.
+            let planned =
+                build_plan_first_task(home.path(), "telegram:123:abc", &pending, Ok("- 一".into()));
+            // "1" 立為目標任務.
+            let ctx = test_ctx(home.path());
+            let _ = accept_as_goal(&ctx, "telegram:123:abc", &pending).await;
+            let store = crate::task_store::TaskStore::open(home.path()).unwrap();
+            let tasks = store
+                .list_tasks_filtered(None, Some("agent-g"), None, Some(true))
+                .await
+                .unwrap();
+            assert_eq!(tasks.len(), 1, "{tasks:?}");
+            for stored in [planned.criteria_ledger.as_deref(), tasks[0].criteria_ledger.as_deref()] {
+                if off {
+                    assert!(stored.is_none());
+                } else {
+                    let l = CriteriaLedger::from_json(stored).expect("ledger");
+                    assert_eq!(l.units.len(), 1);
+                    assert_eq!(l.units[0].text, "整理客戶資料成月報並寄出");
+                }
+            }
+        }
     }
 
     #[tokio::test]
