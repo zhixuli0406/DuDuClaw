@@ -25,9 +25,11 @@ scripts/live-test/make-home.sh /tmp/ddc-live --port 18977
 
 # 2. Boot the gateway once on that home. Boot writes each employee's .mcp.json,
 #    the internal MCP key and identity.key; the probe reads them from there.
-export DUDUCLAW_HOME=/tmp/ddc-live
+#    HOME is replaced with the empty directory make-home.sh created: the gateway
+#    and the AI CLI it spawns look for logins and settings under HOME, so
+#    without this they would use your own account and quota.
 export DUDUCLAW_BIN=$PWD/target/debug/duduclaw   # optional, default: duduclaw on PATH
-duduclaw run --yes &
+HOME=/tmp/ddc-live/os-home DUDUCLAW_HOME=/tmp/ddc-live duduclaw run --yes &
 
 # 3. Probe both employees
 scripts/live-test/mcp-probe.sh /tmp/ddc-live plain
