@@ -70,20 +70,24 @@
 //! function plus a new branch here. The public surface, every decision, and
 //! every message string are unchanged by that split.
 
+mod bash_cmd;
+mod bash_lane;
+mod bash_parse;
 mod matcher;
+mod real_path;
+
+pub use real_path::resolve_real_path;
+use real_path::with_real_path;
 mod rules;
 
 pub use rules::{
-    AGENT_CAPABILITY_SECTION, AGENT_ORG_FIELDS, CONFIG_PROTECTED_SECTIONS, ProtectedSurface,
-    ProtectedTomlKind,
+    AGENT_CAPABILITY_SECTION, AGENT_EDITABLE_SECTIONS, AGENT_ORG_FIELDS, AGENT_SECURITY_KEYS,
+    AGENT_SECURITY_SECTIONS,
+    CONFIG_PROTECTED_SECTIONS, HOME_WRITABLE_DIRS, ProtectedSurface, ProtectedTomlKind,
 };
 
 use rules::{EPHEMERAL_DIR_NAME, FrozenVerdict, HOOK_SETTINGS_FILES, IDENTITY_ENV_KEYS};
-use matcher::{
-    components_after_ci, describe_pairs, first_line, identity_env_pairs, mentions_other_agent_dir,
-    mentions_own_contract_toml, mentions_own_soul_md, mentions_removed_agent_area, owning_agent_dir,
-    write_verb,
-};
+use matcher::{components_after_ci, describe_pairs, first_line, identity_env_pairs, owning_agent_dir};
 
 use std::path::Path;
 
@@ -154,6 +158,32 @@ pub fn check_protected_toml_write(
     existing: Option<&str>,
     new_content: &str,
 ) -> GuardDecision {
+    protected_toml_write(file_path, home, false, existing, new_content)
+}
+
+/// [`check_protected_toml_write`] plus, for an agent-identified or untrusted
+/// `caller`, the G1 rows ([`AGENT_SECURITY_SECTIONS`] /
+/// [`AGENT_SECURITY_KEYS`]) of the caller's `agent.toml`. For
+/// [`HookCaller::Absent`] (an operator working by hand) the result is
+/// exactly [`check_protected_toml_write`]'s. This is what the hook calls.
+pub fn check_protected_toml_write_as(
+    file_path: &Path,
+    home: &Path,
+    caller: &HookCaller,
+    existing: Option<&str>,
+    new_content: &str,
+) -> GuardDecision {
+    let agent_caller = !matches!(caller, HookCaller::Absent);
+    protected_toml_write(file_path, home, agent_caller, existing, new_content)
+}
+
+fn protected_toml_write(
+    file_path: &Path,
+    home: &Path,
+    agent_caller: bool,
+    existing: Option<&str>,
+    new_content: &str,
+) -> GuardDecision {
     let Some(kind) = classify_protected_toml(file_path, home) else {
         return GuardDecision::NotAgentFile;
     };
@@ -191,7 +221,7 @@ pub fn check_protected_toml_write(
 
     // Accumulate per verdict group, preserving table order.
     let mut groups: Vec<(FrozenVerdict, Vec<String>)> = Vec::new();
-    for entry in rules::frozen_for(kind) {
+    for entry in rules::frozen_for_caller(kind, agent_caller) {
         let changed = matcher::diff_frozen(&entry.shape, &old_table, &new_table);
         match groups.last_mut() {
             Some((verdict, acc)) if *verdict == entry.verdict => acc.extend(changed),
@@ -216,6 +246,11 @@ pub fn check_protected_toml_write(
                 changed,
             },
             FrozenVerdict::ProtectedSection => GuardDecision::BlockedProtectedSection {
+                file_name,
+                attempted_path,
+                changed,
+            },
+            FrozenVerdict::AgentSecuritySection => GuardDecision::BlockedAgentSecuritySection {
                 file_name,
                 attempted_path,
                 changed,
@@ -426,22 +461,48 @@ impl HookCaller {
 /// Decide whether `caller` may write `file_path` **at all**, before any
 /// content comparison.
 ///
-/// Two rules, both fail-closed and both no-ops for [`HookCaller::Absent`]:
+/// Rules, all fail-closed and all no-ops for [`HookCaller::Absent`]:
 ///
 /// 1. `<home>/agents/<other>/**` where `<other>` is not the caller → DENY.
 ///    `<home>/agents/.ephemeral/<eph-id>/**` is owned by `<eph-id>`, so an
-///    ephemeral agent may write its own scaffold and nobody else's.
+///    ephemeral agent may write its own scaffold and nobody else's. An
+///    [`HookCaller::Untrusted`] caller is refused everywhere under
+///    `<home>/agents/`, its "own" directory included.
 /// 2. `<home>/config.toml` → DENY outright (WP22 supersedes WP21's
 ///    section-level comparison for agent callers; every legitimate writer —
 ///    dashboard RPC, MCP tools, the gateway itself — goes through Rust and
 ///    never through this hook).
+/// 3. G1 (2026-10): anything else under `<home>` → DENY, except the shared
+///    [`HOME_WRITABLE_DIRS`] (`attachments/`). An allow-list rather than a
+///    list of protected files, because `<home>` holds dozens of stores the
+///    platform treats as evidence or authority — `tool_calls.jsonl`,
+///    `evals/` (held-out sets included), `tasks.db`, `approvals.db`,
+///    breaker state, licences, `skills/`, `shared/wiki/` — and a new one must
+///    not start out writable. Their legitimate writers are the gateway and
+///    the gated MCP tools, neither of which runs through this hook.
 ///
-/// Returns [`GuardDecision::NotAgentFile`] when the path is outside both
-/// scopes, so the caller falls through to the WP21 guards.
+/// Returns [`GuardDecision::NotAgentFile`] when the path is outside `<home>`
+/// or is a permitted place, so the caller falls through to the WP21 guards.
+///
+/// # Symbolic links (G1 round 2)
+///
+/// Every rule is applied twice: to the literal path against the literal
+/// `<home>`, and to the real path ([`resolve_real_path`]) against the real
+/// `<home>`; a block from either wins. A link inside the caller's own
+/// directory that points at `<home>` state, a `..` after such a link, a
+/// dangling link (writing through it creates its target) and a `<home>`
+/// reached through a link are all judged on where the write really lands.
+/// A path that cannot be resolved for any reason other than "the tail does
+/// not exist yet" is refused.
 pub fn check_caller_scope(file_path: &Path, home: &Path, caller: &HookCaller) -> GuardDecision {
     if matches!(caller, HookCaller::Absent) {
         return GuardDecision::NotAgentFile;
     }
+    with_real_path(file_path, home, |p, h| caller_scope_at(p, h, caller))
+}
+
+/// [`check_caller_scope`]'s rules on one (path, home) pair.
+fn caller_scope_at(file_path: &Path, home: &Path, caller: &HookCaller) -> GuardDecision {
     let normalized = lexical_normalize(file_path);
 
     // Rule 2 — the home config.toml, whole file.
@@ -453,9 +514,42 @@ pub fn check_caller_scope(file_path: &Path, home: &Path, caller: &HookCaller) ->
         };
     }
 
+    let Some(rest) = components_after_ci(&normalized, &lexical_normalize(home)) else {
+        // Outside `<home>`: a user project, `/tmp`, … — none of this rule's
+        // business.
+        return GuardDecision::NotAgentFile;
+    };
+    let home_state = || GuardDecision::BlockedHomeStateWrite {
+        caller: caller.claimed().to_string(),
+        attempted_path: normalized.clone(),
+    };
+
+    let under_agents = rest.first().is_some_and(|c| c.eq_ignore_ascii_case("agents"));
+    if !under_agents {
+        // Rule 3 — `<home>` state, except the shared writable directories
+        // (their contents, not the directory entry itself).
+        let writable = rest.len() >= 2
+            && HOME_WRITABLE_DIRS
+                .iter()
+                .any(|d| rest[0].eq_ignore_ascii_case(d));
+        return if writable {
+            GuardDecision::NotAgentFile
+        } else {
+            home_state()
+        };
+    }
+
     // Rule 1 — someone else's agent directory.
     let Some(owner) = owning_agent_dir(&normalized, home) else {
-        return GuardDecision::NotAgentFile;
+        // `<home>/agents` itself, a stray file at the agents root, or the
+        // `.ephemeral` root: no owner, so nobody's own directory.
+        return match caller {
+            HookCaller::Untrusted(claimed) => GuardDecision::BlockedUntrustedCaller {
+                caller: claimed.clone(),
+                attempted_path: normalized,
+            },
+            _ => home_state(),
+        };
     };
     match caller {
         HookCaller::Absent => unreachable!("handled above"),
@@ -498,6 +592,12 @@ pub fn check_own_soul_write(file_path: &Path, home: &Path, caller: &HookCaller) 
     let HookCaller::Agent(caller_id) = caller else {
         return GuardDecision::NotAgentFile;
     };
+    // G1 round 2: a link named anything (`persona.md`) pointing at the own
+    // SOUL.md is judged on its target too.
+    with_real_path(file_path, home, |p, h| own_soul_at(p, h, caller_id))
+}
+
+fn own_soul_at(file_path: &Path, home: &Path, caller_id: &String) -> GuardDecision {
     match file_path.file_name().and_then(|n| n.to_str()) {
         Some(n) if n.eq_ignore_ascii_case("SOUL.md") => {}
         _ => return GuardDecision::NotAgentFile,
@@ -534,6 +634,10 @@ pub fn check_own_contract_write(file_path: &Path, home: &Path, caller: &HookCall
     let HookCaller::Agent(caller_id) = caller else {
         return GuardDecision::NotAgentFile;
     };
+    with_real_path(file_path, home, |p, h| own_contract_at(p, h, caller_id))
+}
+
+fn own_contract_at(file_path: &Path, home: &Path, caller_id: &String) -> GuardDecision {
     match file_path.file_name().and_then(|n| n.to_str()) {
         Some(n) if n.eq_ignore_ascii_case("CONTRACT.toml") => {}
         _ => return GuardDecision::NotAgentFile,
@@ -578,144 +682,63 @@ pub fn check_own_contract_write(file_path: &Path, home: &Path, caller: &HookCall
 /// agent identity, a command that both (a) mentions `agents/<other>/` for an
 /// `<other>` that is not the caller and looks like a real agent id, and (b)
 /// contains a write verb, is blocked the same way — same conservative
-/// philosophy, same false-positive tolerance. `HookCaller::Absent` and
-/// `HookCaller::Untrusted` are no-ops here: an absent identity is an operator
-/// running by hand (unrestricted, matching `check_caller_scope`), and an
-/// untrusted claim is already refused outright by the Write/Edit lane before
-/// this Bash check would even be reached for the same caller.
+/// philosophy, same false-positive tolerance. `HookCaller::Absent` is a
+/// no-op here: an absent identity is an operator running by hand
+/// (unrestricted, matching `check_caller_scope`).
+///
+/// # G1 (2026-10) — untrusted callers and `<home>` state
+///
+/// - An [`HookCaller::Untrusted`] caller used to pass this lane for any path
+///   under `agents/`, while the Write/Edit lane refused the same path. It is
+///   now refused the same way here: a write-shaped command that names any
+///   `agents/<id>/` path, the removed-employee area, a cwd-relative peer
+///   directory, or the claimed id's own `SOUL.md` / `CONTRACT.toml`.
+/// - For agent and untrusted callers, a write-shaped command that names a
+///   place under `<home>` other than the caller's own directory and
+///   `attachments/` is refused ([`GuardDecision::BlockedHomeStateWrite`]);
+///   see [`matcher::bash_home_targets`] for which spellings are recognised.
+///   This runs after the established basename checks, so `config.toml`,
+///   `org.toml`, `.mcp.json`, … keep their older messages.
 pub fn check_bash_protected_write(command: &str, home: &Path, caller: &HookCaller) -> GuardDecision {
-    let normalized: String = command
+    check_bash_protected_write_in(command, home, caller, None)
+}
+
+/// [`check_bash_protected_write`] with the shell's `cwd` from the hook
+/// envelope; `None` falls back to `<home>/agents/<caller>` (the gateway's
+/// spawn directory).
+pub fn check_bash_protected_write_in(
+    command: &str,
+    home: &Path,
+    caller: &HookCaller,
+    cwd: Option<&Path>,
+) -> GuardDecision {
+    // G1 round 3: shell escapes are undone before any rule reads the command
+    // (`r\m`, `S\OUL.md`, a `\` line continuation). The text rules run over
+    // two spellings — escapes undone, and the round-1 `\` → `/` form that
+    // Windows paths need — and the positional rules tokenise the raw command
+    // themselves. `2>/dev/null`, `2>&1`, `>&N` are removed first everywhere.
+    let lower = |s: &str| s.to_ascii_lowercase();
+    let unescaped = bash_parse::strip_fd_redirects(&lower(&bash_parse::shell_unescape(command)));
+    let slashed: String = command
         .chars()
         .map(|c| if c == '\\' { '/' } else { c.to_ascii_lowercase() })
         .collect();
-
-    if let HookCaller::Agent(caller_id) = caller {
-        // Removed-name reservation — the removed-employee area, under any
-        // spelling that names it (`agents/_trash/…`, `../_trash/…`). Checked
-        // ahead of the foreign-directory rule so it is reported for what it
-        // is. Moving a *live* agent directory away by hand (`mv agents/x
-        // agents/x.bak`) is the foreign-directory rule's case below; a
-        // follow-up `create_agent x` is refused by the MCP side anyway (name
-        // collision with the moved copy, or the dangling `org.toml` record).
-        if mentions_removed_agent_area(&normalized) && write_verb(&normalized).is_some() {
-            return GuardDecision::BlockedRemovedAgentArea {
-                caller: caller_id.clone(),
-                attempted_path: home.join("agents").join(crate::agent_trash::AGENT_TRASH_DIR),
-            };
-        }
-        if let Some(owner) = mentions_other_agent_dir(&normalized, caller_id) {
-            if write_verb(&normalized).is_some() {
-                return GuardDecision::BlockedForeignAgentDir {
-                    caller: caller_id.clone(),
-                    owner: owner.clone(),
-                    attempted_path: home.join("agents").join(&owner),
-                };
-            }
-        }
-
-        // WP1.1 C3 — same speed-bump philosophy as the delegation-authority
-        // checks below: a write-shaped command targeting the caller's OWN
-        // `SOUL.md` — either an explicit `agents/<caller_id>/…/SOUL.md` path,
-        // or a bare/relative reference with no `agents/` path segment at all
-        // (an agent's Bash cwd is its own agent directory, so `echo … >
-        // SOUL.md` targets its own file) — is blocked. Deliberately does
-        // NOT fire on a command that mentions `agents/` at all without also
-        // matching the caller's own prefix: that is either the foreign-dir
-        // rule above (already handled), a false positive like
-        // `myagents/ceo/SOUL.md` (must not match `agents/` at all — same
-        // boundary caveat as `mentions_other_agent_dir`), or simply none of
-        // this rule's business. See `check_own_soul_write` for the precise
-        // Write/Edit-lane version.
-        if mentions_own_soul_md(&normalized, caller_id) && write_verb(&normalized).is_some() {
-            return GuardDecision::BlockedOwnSoulWrite {
-                caller: caller_id.clone(),
-                attempted_path: home.join("agents").join(caller_id).join("SOUL.md"),
-            };
-        }
-
-        // Contract lock — identical matcher, own `CONTRACT.toml`.
-        if mentions_own_contract_toml(&normalized, caller_id) && write_verb(&normalized).is_some() {
-            return GuardDecision::BlockedOwnContractWrite {
-                caller: caller_id.clone(),
-                attempted_path: home.join("agents").join(caller_id).join("CONTRACT.toml"),
-            };
+    let slashed = bash_parse::strip_fd_redirects(&slashed);
+    for normalized in [unescaped.as_str(), slashed.as_str()] {
+        let d = bash_lane::bash_name_rules(normalized, home, caller);
+        if !d.is_allowed() {
+            return d;
         }
     }
-
-    // `agent.toml` anywhere: the basename is DuDuClaw-specific, and writing
-    // one outside the canonical tree is already forbidden by `agent_guard`.
-    let mentions_agent_toml = normalized.contains("agent.toml");
-
-    // `config.toml`: only the DuDuClaw home one. Any other `config.toml`
-    // belongs to a user project the agent may legitimately be editing.
-    let home_config = lexical_normalize(&home.join("config.toml"))
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .replace('\\', "/");
-    let mentions_home_config =
-        normalized.contains(&home_config) || normalized.contains(".duduclaw/config.toml");
-
-    // WP22 T5 — the authoritative org store and its bootstrap marker. Same
-    // scoping rule as `config.toml`: only the DuDuClaw home ones, because
-    // `org.toml` could plausibly be a file in a user project. Deleting either
-    // is as damaging as rewriting them (`rm org.toml` degrades every
-    // delegation decision back to the `agent.toml` mirrors), and `rm ` is
-    // already in `WRITE_VERBS`.
-    let mentions_org_store = [
-        crate::org_store::ORG_STORE_FILE,
-        crate::org_store::ORG_SEEDED_FILE,
-    ]
-    .iter()
-    .any(|basename| {
-        let home_path = lexical_normalize(&home.join(basename))
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .replace('\\', "/");
-        normalized.contains(&home_path) || normalized.contains(&format!(".duduclaw/{basename}"))
-    });
-
-    // Identity / enforcement surface (see `check_identity_surface_write`).
-    // `.mcp.json` and `identity.key` are DuDuClaw-specific basenames; the hook
-    // settings file is matched only through its `.claude/` parent so a
-    // project's own `settings.json` is untouched.
-    let mentions_mcp_json = normalized.contains(".mcp.json");
-    let mentions_identity_key = normalized.contains(crate::identity_token::IDENTITY_KEY_FILE);
-    let mentions_hook_settings = HOOK_SETTINGS_FILES
-        .iter()
-        .any(|f| normalized.contains(&format!(".claude/{f}")));
-
-    if !mentions_agent_toml
-        && !mentions_home_config
-        && !mentions_org_store
-        && !mentions_mcp_json
-        && !mentions_identity_key
-        && !mentions_hook_settings
-    {
-        return GuardDecision::NotAgentFile;
+    for normalized in [unescaped.as_str(), slashed.as_str()] {
+        let d = bash_lane::bash_protected_basenames(normalized, home);
+        if !d.is_allowed() {
+            return d;
+        }
     }
-
-    let Some(verb) = write_verb(&normalized) else {
-        return GuardDecision::NotAgentFile;
-    };
-
-    let file_name = if mentions_agent_toml {
-        "agent.toml"
-    } else if mentions_org_store {
-        crate::org_store::ORG_STORE_FILE
-    } else if mentions_home_config {
-        "config.toml"
-    } else if mentions_identity_key {
-        crate::identity_token::IDENTITY_KEY_FILE
-    } else if mentions_mcp_json {
-        ".mcp.json"
-    } else {
-        "settings.json"
-    };
-
-    GuardDecision::BlockedBashProtectedWrite {
-        file_name: file_name.to_string(),
-        verb: verb.to_string(),
-    }
+    let positional = bash_parse::strip_fd_redirects(command);
+    bash_lane::bash_home_state_write(&positional, home, caller, cwd)
+        .unwrap_or(GuardDecision::NotAgentFile)
 }
 
 #[cfg(test)]

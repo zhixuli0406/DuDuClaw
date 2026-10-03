@@ -103,10 +103,14 @@ pub use identity_token::{
 pub use keychain::{resolve_master_key, KeychainError, MasterKeySource};
 pub use match_utils::{is_valid_discord_snowflake, is_valid_egress_host, origin_host_matches, word_contains_ci};
 pub use org_field_guard::{
-    check_bash_protected_write, check_caller_scope, check_identity_surface_write,
-    check_own_contract_write, check_own_soul_write, check_protected_toml_write, classify_identity_surface,
+    check_bash_protected_write, check_bash_protected_write_in, check_caller_scope,
+    check_identity_surface_write, resolve_real_path,
+    check_own_contract_write, check_own_soul_write, check_protected_toml_write,
+    check_protected_toml_write_as, classify_identity_surface,
     classify_protected_toml, HookCaller, ProtectedSurface, ProtectedTomlKind,
-    AGENT_CAPABILITY_SECTION, AGENT_ORG_FIELDS, CONFIG_PROTECTED_SECTIONS,
+    AGENT_CAPABILITY_SECTION, AGENT_EDITABLE_SECTIONS, AGENT_ORG_FIELDS, AGENT_SECURITY_KEYS,
+    AGENT_SECURITY_SECTIONS,
+    CONFIG_PROTECTED_SECTIONS, HOME_WRITABLE_DIRS,
 };
 pub use org_store::{
     OrgDrift, OrgEntry, OrgStore, OrgSyncChange, ORG_SEEDED_FILE, ORG_STORE_FILE, ORG_STORE_SCHEMA,

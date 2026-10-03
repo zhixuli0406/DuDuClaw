@@ -2627,6 +2627,18 @@ enum HookCommands {
         /// rewrite to claim a different id.
         #[arg(long)]
         agent: Option<String>,
+        /// The DuDuClaw home this agent belongs to, baked into the installed
+        /// hook command by `agent_hook_installer` (G1 round 2).
+        ///
+        /// The gateway starts the agent's CLI with a scrubbed environment
+        /// (`spawn_env::AGENT_CLI_ENV_ALLOWLIST` has no `DUDUCLAW_HOME`), so
+        /// without this the hook fell back to `$HOME/.duduclaw` and judged
+        /// every path of a non-default home as "outside home". Trusted ahead
+        /// of `DUDUCLAW_HOME` for the same reason as `--agent`: it lives in
+        /// the frozen `.claude/settings.json`. Must be absolute; anything
+        /// else is ignored.
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
     },
 
     /// RFC-23 §14.4 — guard `Read`/`Bash` against reaching a data file
@@ -3850,6 +3862,14 @@ pub async fn entry_point() {
             eprintln!("Error: --force-disable-redaction cannot be used with read-only knobs survival");
             std::process::exit(2);
         }
+        if let Err(error) = run(cli).await {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if is_hook_command(&cli.command) {
+        // A hook runs once per tool call: no file logger, no TLS provider.
         if let Err(error) = run(cli).await {
             eprintln!("Error: {error}");
             std::process::exit(1);
@@ -5499,8 +5519,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             key,
             default_provider,
         }) => proxy::run(&bind, key, default_provider).await,
-        Commands::Maintenance(MaintenanceCommands::Hook(HookCommands::AgentFileGuard { agent })) => {
-            cmd_hook_agent_file_guard(agent.as_deref()).await
+        Commands::Maintenance(MaintenanceCommands::Hook(HookCommands::AgentFileGuard { agent, home })) => {
+            cmd_hook_agent_file_guard(agent.as_deref(), home.as_deref()).await
         }
         Commands::Maintenance(MaintenanceCommands::Hook(HookCommands::DataFileGuard)) => {
             cmd_hook_data_file_guard().await
@@ -6030,7 +6050,10 @@ fn walk_md_files(root: &std::path::Path, sink: &mut dyn FnMut(&std::path::Path))
 ///
 /// `agent_id_arg` is the WP22 T2 fix for `resolve_hook_caller`'s env-only
 /// identity: see that function's doc comment.
-async fn cmd_hook_agent_file_guard(agent_id_arg: Option<&str>) -> duduclaw_core::error::Result<()> {
+async fn cmd_hook_agent_file_guard(
+    agent_id_arg: Option<&str>,
+    home_arg: Option<&std::path::Path>,
+) -> duduclaw_core::error::Result<()> {
     use std::io::Read;
 
     let mut buf = String::new();
@@ -6055,7 +6078,32 @@ async fn cmd_hook_agent_file_guard(agent_id_arg: Option<&str>) -> duduclaw_core:
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let home = duduclaw_home();
+    if !matches!(tool_name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Bash") {
+        return Ok(());
+    }
+    let cwd = envelope
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from);
+    let claimed = agent_id_arg
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default());
+    let env_home = std::env::var("DUDUCLAW_HOME").ok();
+    let home = match resolve_hook_home(home_arg, &claimed, env_home.as_deref()) {
+        Ok(h) => h,
+        Err(reason) => {
+            let refusal = duduclaw_core::GuardDecision::BlockedUnresolvablePath {
+                attempted_path: cwd.unwrap_or_default(),
+                reason,
+            };
+            if let Some(msg) = refusal.block_message() {
+                eprintln!("{msg}");
+            }
+            std::process::exit(2);
+        }
+    };
     let caller = resolve_hook_caller(&home, agent_id_arg);
 
     let Some(decision) = agent_file_guard_decision(tool_name, &envelope, &home, &caller) else {
@@ -6073,6 +6121,44 @@ async fn cmd_hook_agent_file_guard(agent_id_arg: Option<&str>) -> duduclaw_core:
     Ok(())
 }
 
+/// G1 — the DuDuClaw home this hook guards.
+///
+/// 1. `--home` (absolute), baked into the installed command.
+/// 2. Operator (no claimed agent id): the default `duduclaw_home()`, as
+///    before — an operator running `claude` by hand is not restricted.
+/// 3. An explicitly set, absolute `DUDUCLAW_HOME` in the hook's environment.
+/// 4. Otherwise an employee caller is refused (`Err`).
+///
+/// Round 4 (S3): the envelope's working directory is never used. The
+/// employee's shell controls it — it can build a look-alike `agents/<id>`
+/// tree, `cd` into it, and have the hook judge (and verify identity
+/// against) a fake home. A team role member needs no inference either: it
+/// runs the hook installed in its employee's directory, whose command
+/// already carries `--home`.
+fn resolve_hook_home(
+    home_arg: Option<&std::path::Path>,
+    claimed: &str,
+    env_home: Option<&str>,
+) -> std::result::Result<std::path::PathBuf, String> {
+    if let Some(h) = home_arg.filter(|h| h.is_absolute()) {
+        return Ok(h.to_path_buf());
+    }
+    if claimed.trim().is_empty() {
+        return Ok(duduclaw_home());
+    }
+    if let Some(e) = env_home.map(str::trim).filter(|e| !e.is_empty() && std::path::Path::new(e).is_absolute()) {
+        return Ok(std::path::PathBuf::from(e));
+    }
+    Err("hook 指令沒有帶 --home，環境中也沒有明確設定的 DUDUCLAW_HOME，無法確認 DuDuClaw 資料目錄位置".to_string())
+}
+
+/// Hook subcommands run once per tool call and answer on stderr; they skip
+/// the file logger (which would also create `logs/` under whatever home the
+/// environment implies, not the one the hook guards).
+fn is_hook_command(command: &Commands) -> bool {
+    matches!(command, Commands::Maintenance(MaintenanceCommands::Hook(_)))
+}
+
 /// The decision half of [`cmd_hook_agent_file_guard`], free of stdin and
 /// `process::exit` so every stage can be tested per tool. `None` means the
 /// hook has nothing to judge (unrelated tool, missing `file_path` /
@@ -6085,22 +6171,51 @@ fn agent_file_guard_decision(
 ) -> Option<duduclaw_core::GuardDecision> {
     use std::path::PathBuf;
     let home = home.to_path_buf();
+    // Claude Code puts the session's working directory in every hook
+    // envelope; relative paths are resolved against it (G1 round 2).
+    let cwd = envelope
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
     let decision = match tool_name {
-        "Write" | "Edit" | "MultiEdit" => {
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
+            // NotebookEdit names its target `notebook_path`.
             let Some(file_path_str) = envelope
                 .pointer("/tool_input/file_path")
+                .or_else(|| envelope.pointer("/tool_input/notebook_path"))
                 .and_then(|v| v.as_str())
             else {
                 // No file_path — nothing to check, fail open.
                 return None;
             };
-            let file_path = PathBuf::from(file_path_str);
+            let file_path = match (&cwd, PathBuf::from(file_path_str)) {
+                (Some(c), p) if p.is_relative() => c.join(p),
+                // No working directory in the envelope: an employee's CLI
+                // starts in its own agent directory (round 3).
+                (None, p) if p.is_relative() => match caller {
+                    duduclaw_core::HookCaller::Absent => p,
+                    duduclaw_core::HookCaller::Agent(id) | duduclaw_core::HookCaller::Untrusted(id) => {
+                        match agent_dir_of(&home, id) {
+                            Some(dir) => dir.join(p),
+                            None => {
+                                return Some(duduclaw_core::GuardDecision::BlockedUnresolvablePath {
+                                    attempted_path: p,
+                                    reason: "相對路徑沒有可用的工作目錄可推算".to_string(),
+                                });
+                            }
+                        }
+                    }
+                },
+                (_, p) => p,
+            };
 
             // Stage 0 (WP22 T2) — caller scope. Coarsest and cheapest: may
             // this caller touch this directory at all? Runs first so a write
             // into someone else's agent directory is refused for the honest
-            // reason, whatever the file happens to contain.
-            let scoped = duduclaw_core::check_caller_scope(&file_path, &home, &caller);
+            // reason, whatever the file happens to contain. Since G1 round 2
+            // it also judges the path's real location (symbolic links).
+            let scoped = duduclaw_core::check_caller_scope(&file_path, &home, caller);
             if !scoped.is_allowed() {
                 scoped
             } else {
@@ -6109,33 +6224,31 @@ fn agent_file_guard_decision(
                 // (Stage 0 above). Runs before Stage 1's location guard,
                 // which would otherwise allow a write to SOUL.md's own
                 // canonical path.
-                let own_soul = duduclaw_core::check_own_soul_write(&file_path, &home, &caller);
+                let own_soul = duduclaw_core::check_own_soul_write(&file_path, &home, caller);
                 // Contract lock — CONTRACT.toml likewise, with no opt-in.
                 let own_contract =
-                    duduclaw_core::check_own_contract_write(&file_path, &home, &caller);
+                    duduclaw_core::check_own_contract_write(&file_path, &home, caller);
                 if !own_soul.is_allowed() {
                     own_soul
                 } else if !own_contract.is_allowed() {
                     own_contract
                 } else {
-                    // Stage 1 — location guard (is this agent-structure file
-                    // allowed to live here at all?).
-                    let located = duduclaw_core::check_agent_file_write(&file_path, &home);
-                    if !located.is_allowed() {
-                        located
+                    // Stages 1–3 on the literal path, then — when a link
+                    // makes the real target a different file — on the real
+                    // path too, so `notes.toml -> agent.toml` is judged as
+                    // `agent.toml`. A path that cannot be resolved was
+                    // already refused by Stage 0 for agent callers.
+                    let literal = content_stages(tool_name, envelope, &file_path, &home, caller);
+                    if !literal.is_allowed() {
+                        literal
                     } else {
-                        // Stage 2 (WP21 欠帳 ②) — content guard for the files the
-                        // A2A delegation predicate reads. `None` when the path is
-                        // not one of them; stage 3 then guards the files that
-                        // decide *who the caller is* and *whether this hook runs
-                        // at all*.
-                        check_protected_toml_tool_call(tool_name, &envelope, &file_path, &home)
-                            .or_else(|| {
-                                check_identity_surface_tool_call(
-                                    tool_name, &envelope, &file_path, &home,
-                                )
-                            })
-                            .unwrap_or(located)
+                        match real_pair(&file_path, &home) {
+                            Some((real, real_home)) if real != file_path => {
+                                let d = content_stages(tool_name, envelope, &real, &real_home, caller);
+                                if d.is_allowed() { literal } else { d }
+                            }
+                            _ => literal,
+                        }
                     }
                 }
             }
@@ -6151,7 +6264,12 @@ fn agent_file_guard_decision(
             if !sentinel.is_allowed() {
                 sentinel
             } else {
-                let protected = duduclaw_core::check_bash_protected_write(command, &home, &caller);
+                let protected = duduclaw_core::check_bash_protected_write_in(
+                    command,
+                    &home,
+                    caller,
+                    cwd.as_deref(),
+                );
                 if !protected.is_allowed() {
                     protected
                 } else {
@@ -6163,6 +6281,75 @@ fn agent_file_guard_decision(
         _ => return None,
     };
     Some(decision)
+}
+
+/// The caller's own agent directory (`agents/<id>`, or the ephemeral
+/// scaffold when that is where it exists); `None` for a malformed id.
+fn agent_dir_of(home: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
+    if !duduclaw_core::is_valid_agent_id(id) {
+        return None;
+    }
+    let eph = home.join("agents").join(".ephemeral").join(id);
+    Some(if eph.is_dir() { eph } else { home.join("agents").join(id) })
+}
+
+/// Stages 1–3 of the Write lane for one (path, home) pair: the location
+/// guard, the delegation-authority content guard and the identity-surface
+/// guard.
+fn content_stages(
+    tool_name: &str,
+    envelope: &serde_json::Value,
+    file_path: &std::path::Path,
+    home: &std::path::Path,
+    caller: &duduclaw_core::HookCaller,
+) -> duduclaw_core::GuardDecision {
+    // Stage 1 — location guard (is this agent-structure file allowed to live
+    // here at all?).
+    let located = duduclaw_core::check_agent_file_write(file_path, home);
+    if !located.is_allowed() {
+        return located;
+    }
+    // Stage 2 (WP21 欠帳 ②) — content guard for the files the A2A delegation
+    // predicate reads. `None` when the path is not one of them; stage 3 then
+    // guards the files that decide *who the caller is* and *whether this hook
+    // runs at all*.
+    check_protected_toml_tool_call(tool_name, envelope, file_path, home, caller)
+        .or_else(|| check_identity_surface_tool_call(tool_name, envelope, file_path, home))
+        .unwrap_or(located)
+}
+
+/// The real (path, home) pair, or `None` when either cannot be resolved.
+fn real_pair(
+    file_path: &std::path::Path,
+    home: &std::path::Path,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    Some((
+        duduclaw_core::resolve_real_path(file_path).ok()?,
+        duduclaw_core::resolve_real_path(home).ok()?,
+    ))
+}
+
+/// Read the current content of a guarded file. `Ok(None)` only when the file
+/// does not exist; any other read error is returned so the caller refuses
+/// (an unreadable file cannot be compared, G1 round 2).
+fn read_existing(path: &std::path::Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn unreadable_existing(path: &std::path::Path, e: &std::io::Error) -> duduclaw_core::GuardDecision {
+    duduclaw_core::GuardDecision::BlockedUnverifiable {
+        file_name: path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(unknown)")
+            .to_string(),
+        attempted_path: duduclaw_core::agent_guard::lexical_normalize(path),
+        reason: format!("無法讀取現有檔案，無法比對受保護欄位：{e}"),
+    }
 }
 
 /// Removed-name reservation, Bash lane: refuse `duduclaw agent create <name>`
@@ -6652,6 +6839,24 @@ mod resolve_hook_caller_tests {
         assert!(audit.contains("agent_name_reserved") && audit.contains("cli_scaffold"), "{audit}");
     }
 
+    /// Round 5: the CLI creation path refuses the reserved system names the
+    /// MCP `create_agent` tool and the dashboard already refuse — for the
+    /// operator too (an employee with such an id would be resolved as
+    /// untrusted and lose its task / cron / reminder tools).
+    #[tokio::test]
+    async fn scaffold_refuses_reserved_system_names() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let home = tempfile::tempdir().unwrap();
+        for name in ["cron", "dashboard", "default", "heartbeat", "doctor-probe"] {
+            let res = super::scaffold_agent_dir(home.path(), &scaffold_for(name)).await;
+            let msg = res.unwrap_err().to_string();
+            assert!(msg.contains("保留"), "{name}: {msg}");
+            assert!(!home.path().join("agents").join(name).exists(), "{name}");
+        }
+        assert!(super::scaffold_agent_dir(home.path(), &scaffold_for("writer")).await.is_ok());
+    }
+
     #[tokio::test]
     async fn scaffold_allows_removed_name_for_an_operator_terminal() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -6673,20 +6878,31 @@ mod resolve_hook_caller_tests {
 /// [`duduclaw_core::check_protected_toml_write`]. A write whose effect cannot
 /// be reconstructed is DENIED — fail closed, since the whole point is that the
 /// judged party must not be able to edit the evidence.
+///
+/// `caller` selects the rule set: an agent-identified or untrusted caller also
+/// gets the G1 rows (`[permissions]`, `[container]`, `[budget]`, …, see
+/// `duduclaw_core::AGENT_SECURITY_SECTIONS`); `HookCaller::Absent` keeps the
+/// pre-G1 rules exactly.
 fn check_protected_toml_tool_call(
     tool_name: &str,
     envelope: &serde_json::Value,
     file_path: &std::path::Path,
     home: &std::path::Path,
+    caller: &duduclaw_core::HookCaller,
 ) -> Option<duduclaw_core::GuardDecision> {
     duduclaw_core::classify_protected_toml(file_path, home)?;
 
-    let existing = std::fs::read_to_string(file_path).ok();
+    // Only a missing file is "new"; any other read error is refused.
+    let existing = match read_existing(file_path) {
+        Ok(v) => v,
+        Err(e) => return Some(unreadable_existing(file_path, &e)),
+    };
 
     match reconstruct_written_content(tool_name, envelope, existing.as_deref()) {
-        Some(new_content) => Some(duduclaw_core::check_protected_toml_write(
+        Some(new_content) => Some(duduclaw_core::check_protected_toml_write_as(
             file_path,
             home,
+            caller,
             existing.as_deref(),
             &new_content,
         )),
@@ -6724,7 +6940,10 @@ fn check_identity_surface_tool_call(
     // outright, so their post-write content is irrelevant (and `identity.key`
     // is binary — reading it as a string would fail anyway).
     let (existing, new_content) = if surface == duduclaw_core::ProtectedSurface::AgentMcpJson {
-        let existing = std::fs::read_to_string(file_path).ok();
+        let existing = match read_existing(file_path) {
+            Ok(v) => v,
+            Err(e) => return Some(unreadable_existing(file_path, &e)),
+        };
         let new_content = reconstruct_written_content(tool_name, envelope, existing.as_deref());
         (existing, new_content)
     } else {
@@ -7277,6 +7496,9 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             String::new(),
         )
     };
+    if let Some(e) = reserved_agent_name_error(&agent_name) {
+        return Err(e);
+    }
 
     // ── 4. Channels (advanced mode) ──────────────────────────
     let mut line_token = String::new();
@@ -9717,10 +9939,26 @@ pub(crate) struct AgentScaffold {
 /// .mcp.json) under `<home>/agents/<name>`. Fail-closed: errors if the target
 /// directory already exists — the caller decides skip/rename semantics before
 /// calling. Does not print; callers own their own console output.
+/// Round 5: the CLI refuses the names reserved for system identities
+/// (`duduclaw_core::is_reserved_agent_id` — the system senders, `default`,
+/// `a2a-client`, `doctor-probe`, `__…`), the same check the MCP `create_agent`
+/// tool and the dashboard `agents.create` already apply. An employee with such
+/// an id would be resolved as untrusted by the MCP identity check.
+pub(crate) fn reserved_agent_name_error(name: &str) -> Option<DuDuClawError> {
+    duduclaw_core::is_reserved_agent_id(name).then(|| {
+        DuDuClawError::Agent(format!(
+            "無法建立 AI 員工「{name}」：這個名稱保留給系統內部身分使用（例如排程、心跳、儀表板），請改用其他名稱。"
+        ))
+    })
+}
+
 pub(crate) async fn scaffold_agent_dir(
     home: &std::path::Path,
     s: &AgentScaffold,
 ) -> duduclaw_core::error::Result<std::path::PathBuf> {
+    if let Some(e) = reserved_agent_name_error(&s.name) {
+        return Err(e);
+    }
     let agent_dir = home.join("agents").join(&s.name);
     if agent_dir.exists() {
         return Err(DuDuClawError::Agent(format!(
@@ -12405,7 +12643,7 @@ mod protected_toml_hook_tests {
         home.write_agent_toml(BASE);
         let new = BASE.replace("\"ceo\"", "\"victim\"");
         let env = write_envelope(&home.agent_toml(), &new);
-        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0)
+        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0, &duduclaw_core::HookCaller::Absent)
             .expect("path must be classified as protected");
         assert!(matches!(d, GuardDecision::BlockedOrgFieldChange { .. }));
         assert!(d.block_message().unwrap().contains("agent_update"));
@@ -12420,7 +12658,7 @@ mod protected_toml_hook_tests {
             "department = \"eng\"",
             "department = \"finance\"",
         );
-        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0).unwrap();
+        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0, &duduclaw_core::HookCaller::Absent).unwrap();
         assert!(matches!(d, GuardDecision::BlockedOrgFieldChange { .. }));
     }
 
@@ -12433,7 +12671,7 @@ mod protected_toml_hook_tests {
             "preferred = \"sonnet\"",
             "preferred = \"opus\"",
         );
-        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0).unwrap();
+        let d = check_protected_toml_tool_call("Edit", &env, &home.agent_toml(), &home.0, &duduclaw_core::HookCaller::Absent).unwrap();
         assert_eq!(d, GuardDecision::AllowedAgentWrite);
         assert!(d.block_message().is_none());
     }
@@ -12453,7 +12691,7 @@ mod protected_toml_hook_tests {
             }
         });
         let d =
-            check_protected_toml_tool_call("MultiEdit", &env, &home.agent_toml(), &home.0).unwrap();
+            check_protected_toml_tool_call("MultiEdit", &env, &home.agent_toml(), &home.0, &duduclaw_core::HookCaller::Absent).unwrap();
         assert!(matches!(d, GuardDecision::BlockedOrgFieldChange { .. }));
     }
 
@@ -12463,7 +12701,7 @@ mod protected_toml_hook_tests {
         std::fs::create_dir_all(home.0.join("agents/fresh")).unwrap();
         let path = home.0.join("agents/fresh/agent.toml");
         let env = write_envelope(&path, BASE);
-        let d = check_protected_toml_tool_call("Write", &env, &path, &home.0).unwrap();
+        let d = check_protected_toml_tool_call("Write", &env, &path, &home.0, &duduclaw_core::HookCaller::Absent).unwrap();
         assert_eq!(d, GuardDecision::AllowedAgentWrite);
     }
 
@@ -12472,7 +12710,7 @@ mod protected_toml_hook_tests {
         let home = TempHome::new();
         home.write_agent_toml(BASE);
         let env = write_envelope(&home.agent_toml(), "[agent\nname =");
-        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0).unwrap();
+        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0, &duduclaw_core::HookCaller::Absent).unwrap();
         assert!(matches!(d, GuardDecision::BlockedUnverifiable { .. }));
     }
 
@@ -12484,7 +12722,7 @@ mod protected_toml_hook_tests {
             "tool_name": "Write",
             "tool_input": { "file_path": home.agent_toml().to_string_lossy() }
         });
-        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0).unwrap();
+        let d = check_protected_toml_tool_call("Write", &env, &home.agent_toml(), &home.0, &duduclaw_core::HookCaller::Absent).unwrap();
         match d {
             GuardDecision::BlockedUnverifiable { reason, .. } => {
                 assert!(reason.contains("還原"));
@@ -12498,7 +12736,7 @@ mod protected_toml_hook_tests {
         let home = TempHome::new();
         let path = home.0.join("notes.md");
         let env = write_envelope(&path, "hello");
-        assert!(check_protected_toml_tool_call("Write", &env, &path, &home.0).is_none());
+        assert!(check_protected_toml_tool_call("Write", &env, &path, &home.0, &duduclaw_core::HookCaller::Absent).is_none());
     }
 
     #[test]
@@ -12507,7 +12745,7 @@ mod protected_toml_hook_tests {
         let path = home.0.join("config.toml");
         std::fs::write(&path, "[delegation]\npolicy = \"department\"\n").unwrap();
         let env = write_envelope(&path, "[delegation]\npolicy = \"open\"\n");
-        let d = check_protected_toml_tool_call("Write", &env, &path, &home.0).unwrap();
+        let d = check_protected_toml_tool_call("Write", &env, &path, &home.0, &duduclaw_core::HookCaller::Absent).unwrap();
         assert!(matches!(d, GuardDecision::BlockedProtectedSection { .. }));
     }
 
@@ -12517,7 +12755,7 @@ mod protected_toml_hook_tests {
         let path = home.0.join("config.toml");
         std::fs::write(&path, "[general]\nlog_level = \"info\"\n").unwrap();
         let env = write_envelope(&path, "[general]\nlog_level = \"debug\"\n");
-        let d = check_protected_toml_tool_call("Write", &env, &path, &home.0).unwrap();
+        let d = check_protected_toml_tool_call("Write", &env, &path, &home.0, &duduclaw_core::HookCaller::Absent).unwrap();
         assert_eq!(d, GuardDecision::AllowedAgentWrite);
     }
 
@@ -12923,6 +13161,219 @@ mod contract_lock_hook_tests {
         // Other own files are still writable.
         let notes = home().join("agents/sales-rep/MEMORY.md");
         assert!(decide("Write", &file_envelope("Write", &notes), &agent("sales-rep")).is_allowed());
+    }
+}
+
+#[cfg(test)]
+mod g1_home_state_hook_tests {
+    //! G1 (2026-10) through the real `agent-file-guard` decision: `<home>`
+    //! state is not agent-writable on either lane, the untrusted caller is
+    //! refused alike on both lanes, and the caller's own `agent.toml`
+    //! security sections are frozen for agent callers only.
+    use super::*;
+    use duduclaw_core::{GuardDecision, HookCaller};
+    use serde_json::json;
+
+    fn agent(id: &str) -> HookCaller {
+        HookCaller::Agent(id.to_string())
+    }
+
+    fn write(path: &std::path::Path, content: &str) -> serde_json::Value {
+        json!({"tool_name": "Write", "tool_input": {
+            "file_path": path.to_string_lossy(), "content": content}})
+    }
+
+    fn bash(cmd: &str) -> serde_json::Value {
+        json!({"tool_name": "Bash", "tool_input": {"command": cmd}})
+    }
+
+    fn home_with_agent() -> tempfile::TempDir {
+        let h = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(h.path().join("agents/tester")).unwrap();
+        std::fs::write(
+            h.path().join("agents/tester/agent.toml"),
+            "[agent]\nname = \"tester\"\nreports_to = \"ceo\"\n\n[permissions]\ncan_modify_own_soul = false\n",
+        )
+        .unwrap();
+        h
+    }
+
+    #[test]
+    fn write_and_bash_to_home_evidence_are_blocked() {
+        let h = home_with_agent();
+        for rel in [
+            "tool_calls.jsonl",
+            "evals/tester/case_a.toml",
+            "evals/tester/held-out/h1.toml",
+            "evals/tester/_holdout/h1.toml",
+            "evals/peer/case_b.toml",
+        ] {
+            let p = h.path().join(rel);
+            let d = agent_file_guard_decision("Write", &write(&p, "x"), h.path(), &agent("tester"))
+                .unwrap();
+            assert!(matches!(d, GuardDecision::BlockedHomeStateWrite { .. }), "{rel}: {d:?}");
+            let cmd = format!("echo x >> '{}'", p.display());
+            let d = agent_file_guard_decision("Bash", &bash(&cmd), h.path(), &agent("tester"))
+                .unwrap();
+            assert!(matches!(d, GuardDecision::BlockedHomeStateWrite { .. }), "{cmd}: {d:?}");
+        }
+        // Own directory and the shared attachments fallback stay writable.
+        for rel in ["agents/tester/notes.md", "attachments/out.pdf"] {
+            let d = agent_file_guard_decision(
+                "Write",
+                &write(&h.path().join(rel), "x"),
+                h.path(),
+                &agent("tester"),
+            )
+            .unwrap();
+            assert!(d.is_allowed(), "{rel}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn untrusted_bash_into_a_peer_dir_is_blocked_like_write() {
+        let h = home_with_agent();
+        let untrusted = HookCaller::Untrusted("tester".to_string());
+        let p = h.path().join("agents/peer/notes.md");
+        let w = agent_file_guard_decision("Write", &write(&p, "x"), h.path(), &untrusted).unwrap();
+        let cmd = format!("echo x >> '{}'", p.display());
+        let b = agent_file_guard_decision("Bash", &bash(&cmd), h.path(), &untrusted).unwrap();
+        assert!(matches!(w, GuardDecision::BlockedUntrustedCaller { .. }), "{w:?}");
+        assert!(matches!(b, GuardDecision::BlockedUntrustedCaller { .. }), "{b:?}");
+    }
+
+    #[test]
+    fn own_agent_toml_permissions_are_frozen_for_the_agent_only() {
+        let h = home_with_agent();
+        let p = h.path().join("agents/tester/agent.toml");
+        let widened = "[agent]\nname = \"tester\"\nreports_to = \"ceo\"\n\n[permissions]\ncan_modify_own_soul = true\n";
+        let d = agent_file_guard_decision("Write", &write(&p, widened), h.path(), &agent("tester"))
+            .unwrap();
+        assert!(matches!(d, GuardDecision::BlockedAgentSecuritySection { .. }), "{d:?}");
+        // Same edit through Edit.
+        let edit = json!({"tool_name": "Edit", "tool_input": {
+            "file_path": p.to_string_lossy(),
+            "old_string": "can_modify_own_soul = false",
+            "new_string": "can_modify_own_soul = true"}});
+        let d = agent_file_guard_decision("Edit", &edit, h.path(), &agent("tester")).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedAgentSecuritySection { .. }), "{d:?}");
+        // The operator keeps the pre-G1 rules.
+        let d = agent_file_guard_decision("Write", &write(&p, widened), h.path(), &HookCaller::Absent)
+            .unwrap();
+        assert!(d.is_allowed(), "{d:?}");
+    }
+
+    #[test]
+    fn notebook_edit_is_judged_like_write() {
+        let h = home_with_agent();
+        let env = json!({"tool_name": "NotebookEdit", "tool_input": {
+            "notebook_path": h.path().join("evals/tester/x.ipynb").to_string_lossy(),
+            "new_source": "x"}});
+        let d = agent_file_guard_decision("NotebookEdit", &env, h.path(), &agent("tester")).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedHomeStateWrite { .. }), "{d:?}");
+        let env = json!({"tool_name": "NotebookEdit", "tool_input": {
+            "notebook_path": h.path().join("agents/tester/n.ipynb").to_string_lossy(),
+            "new_source": "x"}});
+        let d = agent_file_guard_decision("NotebookEdit", &env, h.path(), &agent("tester")).unwrap();
+        assert!(d.is_allowed(), "{d:?}");
+    }
+
+    #[test]
+    fn envelope_cwd_is_used_for_bash_and_relative_write_paths() {
+        let h = home_with_agent();
+        // Bash: `cd` happened in an earlier call; the envelope says the shell
+        // now sits in `<home>`.
+        let env = json!({"tool_name": "Bash", "cwd": h.path().to_string_lossy(),
+            "tool_input": {"command": "echo x > tool_calls.jsonl"}});
+        let d = agent_file_guard_decision("Bash", &env, h.path(), &agent("tester")).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedHomeStateWrite { .. }), "{d:?}");
+        // Write with a relative path resolves against the same cwd.
+        let env = json!({"tool_name": "Write", "cwd": h.path().to_string_lossy(),
+            "tool_input": {"file_path": "evals/tester/a.toml", "content": "x"}});
+        let d = agent_file_guard_decision("Write", &env, h.path(), &agent("tester")).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedHomeStateWrite { .. }), "{d:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_to_own_agent_toml_is_judged_as_agent_toml() {
+        let h = home_with_agent();
+        let link = h.path().join("agents/tester/settings.toml");
+        std::os::unix::fs::symlink(h.path().join("agents/tester/agent.toml"), &link).unwrap();
+        let widened = "[agent]\nname = \"tester\"\nreports_to = \"ceo\"\n\n[permissions]\ncan_modify_own_soul = true\n";
+        let d = agent_file_guard_decision("Write", &write(&link, widened), h.path(), &agent("tester"))
+            .unwrap();
+        assert!(matches!(d, GuardDecision::BlockedAgentSecuritySection { .. }), "{d:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_agent_toml_is_refused_not_treated_as_new() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = home_with_agent();
+        let p = h.path().join("agents/tester/agent.toml");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&p).is_ok() {
+            // Running as root: permissions do not stop the read; nothing to test.
+            return;
+        }
+        let d = agent_file_guard_decision(
+            "Write",
+            &write(&p, "[agent]\nname = \"tester\"\n"),
+            h.path(),
+            &agent("tester"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedUnverifiable { .. }), "{d:?}");
+    }
+
+    // ── Round 3 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn relative_write_without_envelope_cwd_resolves_from_the_agent_dir() {
+        let h = home_with_agent();
+        let env = json!({"tool_name": "Write", "tool_input": {
+            "file_path": "../../evals/tester/a.toml", "content": "x"}});
+        let d = agent_file_guard_decision("Write", &env, h.path(), &agent("tester")).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedHomeStateWrite { .. }), "{d:?}");
+        let env = json!({"tool_name": "Write", "tool_input": {
+            "file_path": "notes.md", "content": "x"}});
+        let d = agent_file_guard_decision("Write", &env, h.path(), &agent("tester")).unwrap();
+        assert!(d.is_allowed(), "{d:?}");
+    }
+
+    #[test]
+    fn hook_home_is_never_inferred_from_the_working_directory() {
+        // S3: the envelope `cwd` is under the employee's control (it can
+        // build a look-alike `agents/<id>` tree and `cd` into it), so it
+        // never decides the home — not even when it sits inside the real one.
+        let h = tempfile::tempdir().unwrap();
+        let cwd = h.path().join("agents/me");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(h.path().join("agents/.ephemeral/eph-1")).unwrap();
+        assert!(resolve_hook_home(None, "me", None).is_err());
+        assert!(resolve_hook_home(None, "eph-1", None).is_err());
+        // `--home`, then an explicit absolute DUDUCLAW_HOME, still work.
+        assert_eq!(
+            resolve_hook_home(Some(h.path()), "me", None),
+            Ok(h.path().to_path_buf())
+        );
+        assert_eq!(
+            resolve_hook_home(None, "me", Some("/srv/dd")),
+            Ok(std::path::PathBuf::from("/srv/dd"))
+        );
+        assert!(resolve_hook_home(None, "me", Some("relative/dd")).is_err());
+    }
+
+    #[test]
+    fn hook_subcommands_skip_the_file_logger() {
+        let cli = Cli::try_parse_from(["duduclaw", "hook", "agent-file-guard", "--agent", "x"])
+            .or_else(|_| {
+                Cli::try_parse_from(["duduclaw", "maintenance", "hook", "agent-file-guard", "--agent", "x"])
+            })
+            .expect("hook command parses");
+        assert!(is_hook_command(&cli.command));
     }
 }
 

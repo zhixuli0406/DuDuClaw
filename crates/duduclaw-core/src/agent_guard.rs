@@ -175,6 +175,36 @@ pub enum GuardDecision {
         caller: String,
         name: String,
     },
+    /// G1 (2026-10): an agent-identified (or untrusted) caller tried to
+    /// write, move or delete something under `<home>` outside its own agent
+    /// directory and the shared `attachments/` fallback — the audit log
+    /// (`tool_calls.jsonl`, the evidence grounding, the judge digest and the
+    /// recent-actions feed read), the eval suites and held-out sets under
+    /// `evals/`, every SQLite store, breaker state, licences, the shared
+    /// wiki and global skills. See
+    /// [`crate::org_field_guard::check_caller_scope`].
+    BlockedHomeStateWrite {
+        caller: String,
+        attempted_path: PathBuf,
+    },
+    /// G1 / C (2026-10): the write would change a section or key of the
+    /// caller's own `agent.toml` that a security gate reads (`[permissions]`,
+    /// `[container]`, `[budget]`, `[runtime]`, `[evolution]`, …, `[prompt]
+    /// cli_bare_mode`, `[model] account_pool`, `[agent] role`). Agent
+    /// callers only; see `org_field_guard::rules::AGENT_SECURITY_SECTIONS`.
+    BlockedAgentSecuritySection {
+        file_name: String,
+        attempted_path: PathBuf,
+        changed: Vec<String>,
+    },
+    /// G1 round 3: where the write would really land could not be
+    /// established — a dangling or looping symbolic link, an unreadable
+    /// parent directory, a relative path with no known working directory, or
+    /// a hook that cannot tell which DuDuClaw home it guards. Fail closed.
+    BlockedUnresolvablePath {
+        attempted_path: PathBuf,
+        reason: String,
+    },
 }
 
 impl GuardDecision {
@@ -299,6 +329,29 @@ impl GuardDecision {
                  （或目前無法確認）。\n\
                  你的身分：{caller}\n\
                  要重新使用這個名稱，請由管理者在儀表板處理；或改用其他名稱，透過 create_agent 建立。"
+            )),
+            Self::BlockedHomeStateWrite { caller, attempted_path } => Some(format!(
+                "已封鎖：DuDuClaw 資料目錄裡的稽核紀錄、評測集、資料庫與系統狀態不可由 AI 員工直接寫入、移動或刪除。\n\
+                 檔案：{}\n\
+                 你的身分：{caller}\n\
+                 你可以寫入自己的資料夾（agents/{caller}/）或共用附件資料夾（attachments/）；\
+                 其他資料請透過對應的 MCP 工具處理（例如 wiki_write、tasks_update），或請管理者從儀表板調整。",
+                attempted_path.display()
+            )),
+            Self::BlockedUnresolvablePath { attempted_path, reason } => Some(format!(
+                "已封鎖：無法確認這次寫入實際會落在哪裡，為避免繞過資料夾保護一律拒絕。\n\
+                 檔案：{}\n\
+                 原因：{reason}",
+                attempted_path.display()
+            )),
+            Self::BlockedAgentSecuritySection { attempted_path, changed, .. } => Some(format!(
+                "已封鎖：agent.toml 中與權限、沙箱、預算、審核或身分有關的設定不可由 AI 員工直接修改，\
+                 請由管理者透過儀表板調整。\n\
+                 檔案：{}\n\
+                 偵測到的變更：{}\n\
+                 原因：這些設定由安全檢查讀取，允許執行中的程序自行改寫等同自助放寬限制。",
+                attempted_path.display(),
+                changed.join("；")
             )),
             _ => None,
         }

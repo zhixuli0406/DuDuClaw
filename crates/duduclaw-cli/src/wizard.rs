@@ -154,6 +154,10 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
         ));
     }
 
+    if let Some(e) = crate::reserved_agent_name_error(&agent_name) {
+        return Err(e);
+    }
+
     // 6. Select features
     let feature_indices = MultiSelect::new()
         .with_prompt("Select features (space to toggle, enter to confirm)")

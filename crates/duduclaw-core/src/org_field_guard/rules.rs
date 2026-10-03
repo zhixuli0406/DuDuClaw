@@ -54,6 +54,123 @@ pub const AGENT_ORG_FIELDS: &[&str] = &["reports_to", "department", "name"];
 /// the hook only sees Claude Code's own `Write` / `Edit` / `Bash` tool calls.
 pub const AGENT_CAPABILITY_SECTION: &str = "capabilities";
 
+/// `agent.toml` sections a security gate reads, frozen whole against the
+/// agent's own Write/Edit (G1 / C, 2026-10; agent callers only — see
+/// [`FrozenCallers`]). Each entry, and the gate that reads it:
+///
+/// - `permissions` — `mcp_dispatch::permission_for_call` (`can_create_agents`
+///   / `can_send_cross_agent` / `can_modify_own_skills` /
+///   `can_schedule_tasks`) and the `agent_update_soul` gate
+///   (`can_modify_own_soul`).
+/// - `container` — the task sandbox (`sandbox_enabled`, `network_access`) and
+///   the team gate's `sandbox_enabled` Solo rule.
+/// - `budget` — `budget::check_agent_budget` (limits, `hard_stop`).
+/// - `guardrails` — the output guardrail (`block_secrets`, `redact_pii`,
+///   `block_injection_echo`, `deny_phrases`).
+/// - `runtime` — `provider` / `fallback` pick the CLI; only the Claude runtime
+///   runs this very hook, and codex/gemini derive their sandbox flag per
+///   runtime. `minimal_context` decides the `--tools` narrowing.
+/// - `fork` — `[fork] enabled` gates the fork tools in `tools/list`; budget
+///   caps.
+/// - `evolution` — the AEE commit gate's `[evolution.noise_band]`, the
+///   `require_causal_evidence` gate, and the spend switches (`gvu_enabled`,
+///   `skill_synthesis_enabled`).
+/// - `task_forward_model` — the held-out rule gate (`held_out_gate_enabled`).
+/// - `channels` — per-agent bot credentials.
+/// - `odoo` — per-agent ERP credentials and the `allowed_models` /
+///   `allowed_actions` filter.
+/// - `mcp` — `[[mcp.external]]` servers and their `allowed_tools` /
+///   `denied_tools`.
+/// - `redaction` — per-agent redaction blocks (and through them the
+///   data-file guard's arming).
+/// - `ptc` — programmatic tool calling switch and its tool list.
+/// - `night_engine` — idle-time LLM spend and its per-pass cost cap.
+/// - `os_watch` — which host paths the OS-native watcher observes.
+/// - `team` — `[team.roles.*]` picks the runtime/model of each role,
+///   including the verifier that judges this employee's own output.
+///
+/// Since G1 round 3 the freeze itself is an allow-list
+/// ([`AGENT_EDITABLE_SECTIONS`]): every section not listed editable is frozen,
+/// so this list is the documented reason for the known ones, and a test keeps
+/// it disjoint from the editable list.
+pub const AGENT_SECURITY_SECTIONS: &[&str] = &[
+    "permissions",
+    "container",
+    "budget",
+    "guardrails",
+    "runtime",
+    "fork",
+    "evolution",
+    "task_forward_model",
+    "channels",
+    "odoo",
+    "mcp",
+    "redaction",
+    "ptc",
+    "night_engine",
+    "os_watch",
+    "team",
+];
+
+/// The only `agent.toml` sections the agent may still edit with Write/Edit
+/// (G1 round 3: an allow-list — every other top-level section, including any
+/// added later, is frozen for agent callers).
+///
+/// - `agent` / `model` / `prompt` — editable except the keys in
+///   [`AGENT_SECURITY_KEYS`] (and `[agent]`'s org fields, frozen by WP21).
+/// - `heartbeat` — wake-up schedule.
+/// - `proactive` — proactive check cadence and where its notices go.
+/// - `research` — opt-in evening self-study (spends LLM; no gate reads it).
+/// - `goal_intent` — channel-side goal detection thresholds.
+/// - `memory` — per-agent memory knobs.
+/// - `skills` — recommended skill list.
+/// - `sticker`, `cultural_context` — reply style.
+/// - `preset` — informational mirror; the binding authority is
+///   `<home>/preset_bindings.toml`.
+/// - `planner` — clarify-first planning knobs.
+pub const AGENT_EDITABLE_SECTIONS: &[&str] = &[
+    "agent",
+    "model",
+    "prompt",
+    "heartbeat",
+    "proactive",
+    "research",
+    "goal_intent",
+    "memory",
+    "skills",
+    "sticker",
+    "cultural_context",
+    "preset",
+    "planner",
+];
+
+/// Single keys frozen inside otherwise editable `agent.toml` sections:
+///
+/// - `[agent] role` — `shared_wiki_delete` lets the `main` role delete any
+///   shared page.
+/// - `[prompt] cli_bare_mode` — adds `--bare`, which makes the Claude CLI skip
+///   hooks (this one included).
+/// - `[model] account_pool` — which rotator accounts (whose credentials and
+///   quota) the agent may spend.
+pub const AGENT_SECURITY_KEYS: &[(&str, &[&str])] = &[
+    ("agent", &["role"]),
+    ("prompt", &["cli_bare_mode"]),
+    ("model", &["account_pool"]),
+];
+
+/// Top-level directories under `<home>` that an agent caller may still write
+/// besides its own agent directory (G1, 2026-10). Only `attachments/`: the
+/// documented fallback location for a `📎DELIVER:` deliverable
+/// (`office_docs::validate_deliver_path`) and a read root of the data-file
+/// tools (`mcp_files::allowed_roots`). Writing the directory entry itself
+/// (replacing or deleting the whole folder) is not covered.
+pub const HOME_WRITABLE_DIRS: &[&str] = &["attachments"];
+
+/// DuDuClaw-specific evidence file names that the Bash lane recognises by
+/// basename alone (any directory, rotated suffixes included), because an
+/// agent can reach them through a `cd` the token scan cannot follow.
+pub(super) const HOME_EVIDENCE_BASENAMES: &[&str] = &["tool_calls.jsonl", "security_audit.jsonl"];
+
 /// Sections of `<home>/config.toml` that feed the delegation predicate.
 ///
 /// `[delegation]` carries the policy + whitelist; `[acp] trusted` widens the
@@ -144,6 +261,9 @@ pub(super) const HOOK_SETTINGS_FILES: [&str; 2] = ["settings.json", "settings.lo
 pub(super) const WRITE_VERBS: &[&str] = &[
     ">", "tee", "sed -i", "sed --in-place", "perl -i", "perl -pi", "mv ", "cp ", "rm ", "dd ",
     "truncate", "install ", "python", "ruby", "node ", "cat <<", "printf",
+    // G1 round 2: link creation (a link is the way around a path check),
+    // permission / ownership / timestamp changes, sync and database CLIs.
+    "ln ", "chmod", "chown", "unlink", "rmdir", "shred", "rsync", "sqlite3", "touch ", "ditto",
 ];
 
 /// How a frozen entry is compared, and how a change is worded.
@@ -174,6 +294,19 @@ pub(super) enum FrozenShape {
     /// `[acp]`), so adding, removing or reshaping it all register.
     /// Message: `[{section}]：{before} → {after}`.
     WholeSection { section: &'static str },
+    /// Whole-value equality of named keys inside a table (`[prompt]
+    /// cli_bare_mode`, `[model] account_pool`), for sections where only some
+    /// keys feed a gate. A missing table, a missing key and a non-table
+    /// section all read as "absent", so adding, deleting or reshaping
+    /// registers. Message: `{section}.{key}：{before} → {after}`.
+    ValueKeys {
+        section: &'static str,
+        keys: &'static [&'static str],
+    },
+    /// Every top-level key of the file except `editable`, each diffed like
+    /// [`Self::TableKeys`] (a non-table value on either side is reported
+    /// whole). An allow-list: anything not named editable is frozen.
+    AllSectionsExcept { editable: &'static [&'static str] },
 }
 
 /// Which [`crate::GuardDecision`] a changed entry produces.
@@ -190,6 +323,20 @@ pub(super) enum FrozenVerdict {
     ProtectedField,
     /// `GuardDecision::BlockedProtectedSection`
     ProtectedSection,
+    /// `GuardDecision::BlockedAgentSecuritySection`
+    AgentSecuritySection,
+}
+
+/// Which callers a frozen entry applies to.
+///
+/// The WP21 rows predate caller identity and have always applied to every
+/// hook invocation, the operator included; they keep doing so. The G1 rows
+/// (2026-10) apply only to an agent-identified or untrusted caller, so an
+/// operator running `claude` by hand in an agent directory is unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FrozenCallers {
+    Everyone,
+    AgentsOnly,
 }
 
 /// One frozen entry: which file it lives in, how it is compared, and which
@@ -199,6 +346,7 @@ pub(super) struct FrozenField {
     pub kind: ProtectedTomlKind,
     pub shape: FrozenShape,
     pub verdict: FrozenVerdict,
+    pub callers: FrozenCallers,
 }
 
 /// **The** frozen-field table — the single place that says what this guard
@@ -218,6 +366,7 @@ pub(super) const FROZEN_FIELDS: &[FrozenField] = &[
             keys: AGENT_ORG_FIELDS,
         },
         verdict: FrozenVerdict::OrgField,
+        callers: FrozenCallers::Everyone,
     },
     FrozenField {
         kind: ProtectedTomlKind::AgentToml,
@@ -225,6 +374,7 @@ pub(super) const FROZEN_FIELDS: &[FrozenField] = &[
             section: AGENT_CAPABILITY_SECTION,
         },
         verdict: FrozenVerdict::ProtectedField,
+        callers: FrozenCallers::Everyone,
     },
     FrozenField {
         kind: ProtectedTomlKind::HomeConfigToml,
@@ -232,6 +382,7 @@ pub(super) const FROZEN_FIELDS: &[FrozenField] = &[
             section: CONFIG_PROTECTED_SECTIONS[0],
         },
         verdict: FrozenVerdict::ProtectedSection,
+        callers: FrozenCallers::Everyone,
     },
     FrozenField {
         kind: ProtectedTomlKind::HomeConfigToml,
@@ -239,6 +390,45 @@ pub(super) const FROZEN_FIELDS: &[FrozenField] = &[
             section: CONFIG_PROTECTED_SECTIONS[1],
         },
         verdict: FrozenVerdict::ProtectedSection,
+        callers: FrozenCallers::Everyone,
+    },
+    // G1 round 3: every top-level section that is not on the editable
+    // allow-list, so a section added in a later release is frozen the day it
+    // lands. `AGENT_SECURITY_SECTIONS` documents why the known ones matter.
+    FrozenField {
+        kind: ProtectedTomlKind::AgentToml,
+        shape: FrozenShape::AllSectionsExcept {
+            editable: AGENT_EDITABLE_SECTIONS,
+        },
+        verdict: FrozenVerdict::AgentSecuritySection,
+        callers: FrozenCallers::AgentsOnly,
+    },
+    FrozenField {
+        kind: ProtectedTomlKind::AgentToml,
+        shape: FrozenShape::ValueKeys {
+            section: AGENT_SECURITY_KEYS[0].0,
+            keys: AGENT_SECURITY_KEYS[0].1,
+        },
+        verdict: FrozenVerdict::AgentSecuritySection,
+        callers: FrozenCallers::AgentsOnly,
+    },
+    FrozenField {
+        kind: ProtectedTomlKind::AgentToml,
+        shape: FrozenShape::ValueKeys {
+            section: AGENT_SECURITY_KEYS[1].0,
+            keys: AGENT_SECURITY_KEYS[1].1,
+        },
+        verdict: FrozenVerdict::AgentSecuritySection,
+        callers: FrozenCallers::AgentsOnly,
+    },
+    FrozenField {
+        kind: ProtectedTomlKind::AgentToml,
+        shape: FrozenShape::ValueKeys {
+            section: AGENT_SECURITY_KEYS[2].0,
+            keys: AGENT_SECURITY_KEYS[2].1,
+        },
+        verdict: FrozenVerdict::AgentSecuritySection,
+        callers: FrozenCallers::AgentsOnly,
     },
 ];
 
@@ -250,7 +440,24 @@ pub(super) const AGENT_SECTION: &str = "agent";
 /// out of sync with the constant other code imports.
 const _: () = assert!(CONFIG_PROTECTED_SECTIONS.len() == 2);
 
-/// Every frozen entry that applies to `kind`, in table order.
+const _: () = assert!(AGENT_SECURITY_KEYS.len() == 3);
+
+/// Every frozen entry that applies to `kind` for **every** caller, in table
+/// order — the pre-G1 contract of [`super::check_protected_toml_write`].
+/// Production goes through [`frozen_for_caller`]; this name pins the table
+/// in the regression tests.
+#[cfg(test)]
 pub(super) fn frozen_for(kind: ProtectedTomlKind) -> impl Iterator<Item = &'static FrozenField> {
-    FROZEN_FIELDS.iter().filter(move |f| f.kind == kind)
+    frozen_for_caller(kind, false)
+}
+
+/// Every frozen entry that applies to `kind`; `agent_caller` adds the
+/// [`FrozenCallers::AgentsOnly`] rows.
+pub(super) fn frozen_for_caller(
+    kind: ProtectedTomlKind,
+    agent_caller: bool,
+) -> impl Iterator<Item = &'static FrozenField> {
+    FROZEN_FIELDS.iter().filter(move |f| {
+        f.kind == kind && (agent_caller || f.callers == FrozenCallers::Everyone)
+    })
 }
