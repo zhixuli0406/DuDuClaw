@@ -91,6 +91,28 @@ fallback = "claude"        # backend to fall back to when detection fails
   the `GEMINI_API_KEY` environment variable). Use API-key mode in a container
   or remote host with no keyring or browser.
 
+### 1.5 Live validation home
+
+Validate a build against a real gateway in an isolated home, not in `~/.duduclaw`:
+
+```bash
+scripts/live-test/make-home.sh /tmp/ddc-live --port 18977
+DUDUCLAW_HOME=/tmp/ddc-live duduclaw run --yes &      # boots once, writes .mcp.json
+scripts/live-test/mcp-probe.sh /tmp/ddc-live plain
+scripts/live-test/mcp-probe.sh /tmp/ddc-live prod-shaped
+```
+
+The home holds two employees: `plain` (no allowlist) and `prod-shaped`
+(`allowed_tools = ["mcp__duduclaw__*", ...]`, denied and approval lists, explicit
+permissions, budget, contract). The v1.67.0 regression where the wildcard allowlist
+refused every platform tool slipped through because the test employee had no
+allowlist. Rule: after upgrading a production home, probe real tools through each
+employee's own MCP registration (`mcp-probe.sh ~/.duduclaw <agent-id>`). An isolated
+home does not isolate the operator's Claude connectors (Drive, Gmail); tell test
+employees not to query external services. When the build cache fills the disk, run
+`scripts/clean-build-cache.sh --dry-run` first; it keeps third-party artifacts and
+refuses to run while `cargo` or `rustc` is alive. Details: `scripts/live-test/README.md`.
+
 ---
 
 ## 2. Browser automation and computer use debugging
