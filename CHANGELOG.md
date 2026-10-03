@@ -26,7 +26,7 @@
 - **`duduclaw test` 的紅隊輸出改為覆蓋帳本**：沒被輸入防護擋下的單位不再用紅色 ✗ 顯示，改標「待活體驗證」，因為那只代表確定性這層沒攔，不代表 agent 會照做。
 - **輸入防護從七類規則增加為十一類**：通道訊息、MCP 前門、對話／個人檔案／知識萃取、`user_profile_record` 等呼叫端，凡是命中任何規則就丟棄文字的路徑（萃取、個人檔案寫入、goal 意圖），現在也會丟棄上述四種句型。紅隊帳本實測（內建餐飲業範本，154 個單位）：涵蓋數從 14 升到 70，`injection`、`indirect_injection`、`memory_poisoning`、`role_provenance`、`authority_escalation` 各 14/14，`action_binding`、`direct`、`roleplay`、`authority`、`obfuscation`、`tool_arg_injection` 仍是 0/14（單一訊號只警告）；eval 案例從 140 個降為 84 個。入門案例庫四個新類別全數通過，5 個良性探針維持放行、零過度防禦；舊有的 `system_prompt_extraction` 與 `encoding_bypass` 案例（各 3 個）仍然漏掉，加入前就是如此。
 - **行為變更：驗收判官的 prompt 一律多一行系統提供的 worker 工作目錄**（`<home>/agents/<id>`），不分模式。原因：活測中判官不知道工作目錄在哪裡，把正確的結果駁回兩次，一個 goal 多跑到四輪，補上這行後一輪通過。
-- **CI：在 windows-latest 失敗的 84 個 gateway 測試已處理**：其中 3 個是產品缺陷（見下方 Fixed），70 個測的是 Discovery，它依設計只支援 Unix，在 Windows 上跳過，並以一個 Windows 測試斷言它確實以拒絕收場（fail closed），其餘是只適用 Unix 的測試夾具。Windows 的結果目前只經過交叉編譯驗證，等 CI 實際跑完才算數。
+- **CI：在 windows-latest 失敗的 84 個 gateway 測試已處理**：其中 3 個是產品缺陷（見下方 Fixed），70 個測的是 Discovery，它依設計只支援 Unix，在 Windows 上跳過，並以一個 Windows 測試斷言它確實以拒絕收場（fail closed），其餘是只適用 Unix 的測試夾具。windows-latest 實測（PR #45）：gateway 測試 7412 個通過、0 個失敗、91 個略過，整個 Windows 工作第一次轉綠。同一輪另外發現 `duduclaw-memory` 的 CCR 交付租約測試在慢的執行機上偶發失敗（保存期限只留 2 秒），已把期限放寬並改成輪詢，只動測試。
 - **去識別化設定頁重新顯示 `sub_agent` 來源**：v1.68.0 因為當時沒有程式讀取它而移除，現在已有讀取端（見 Added）。
 
 ### Fixed
