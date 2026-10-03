@@ -2929,7 +2929,9 @@ mod tests {
                 "soon",
                 "source",
                 1,
-                now() + 2,
+                // Whole-second clock: keep a wide margin so a slow first open
+                // (loaded CI runner) cannot push the lease past retention.
+                now() + 5,
             )
             .unwrap();
         let lease = store
@@ -2941,7 +2943,15 @@ mod tests {
                 &ccr_acl_revision(&tenant),
             )
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // Poll until retention passes instead of sleeping a fixed time.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while lease.still_valid() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lease still valid 10s after retention was set to now()+5"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         assert!(!lease.still_valid());
         // Production opens a fresh store per request, so each request runs the
         // retention sweep; one instance reused across the expiry has to drop
