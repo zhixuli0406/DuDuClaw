@@ -9,12 +9,20 @@
 //! - user messages → [`Source::UserChannelInput`] (channel reply, before the
 //!   prompt is built);
 //! - the assembled system prompt → [`Source::SystemPrompt`] (channel reply);
-//! - a cron task's trigger context → [`Source::CronContext`] (cron scheduler).
-//!
-//! `sub_agent` is not wired: no production path places a sub-agent's reply
-//! into another agent's model context (replies go to the bus and on to the
-//! user's channel, and spawned-agent tool results already pass through the
-//! `ToolResult` redaction of the MCP server).
+//! - a cron task's trigger context → [`Source::CronContext`] (cron scheduler);
+//! - a delegated agent's reply written into the delegating agent's session
+//!   history → [`Source::SubAgentReply`] (dispatcher,
+//!   `append_subagent_reply_to_parent_session`). That is the one path where
+//!   one agent's output becomes another agent's model context verbatim:
+//!   `send_to_agent`, `spawn_agent` and `spawn_ephemeral` replies all return
+//!   through it. The pass runs under the agent that owns the session (the
+//!   direct parent, or the chain root on a relayed append) and that session
+//!   id, so the owner's channel reply restores the tokens like any other.
+//!   The copy delivered to the user's channel is the user's own view and is
+//!   not redacted. Default mode `inherit` = passthrough (the child already
+//!   ran under the same `[redaction]` config); `on` applies the parent's
+//!   rules. Replies an agent fetches itself with `check_responses` arrive as
+//!   a tool result and follow `tool_results`, not this source.
 //!
 //! Fail closed: a redaction error means the text must not reach the model;
 //! callers stop the turn.
@@ -58,6 +66,45 @@ pub fn redact_text(
         .redact(text, source)
         .map(|out| out.redacted_text)
         .map_err(|e| format!("redaction failed ({}): {e}", source.category()))
+}
+
+/// The body placed into a parent's session instead of a sub-agent reply whose
+/// `sub_agent` redaction pass failed (fail closed: the raw text is dropped).
+pub const SUB_AGENT_REPLY_WITHHELD: &str =
+    "[子代理回覆未載入：去識別化處理失敗，原文已依安全設定擋下]";
+
+/// Redact a delegated agent's reply before it enters the session owned by
+/// `owner_agent` (`[redaction.sources] sub_agent`). The pass runs under the
+/// owner's agent id and `session_id` so restore on the owner's way out finds
+/// the mapping; the audit row's source detail names `responder_agent`.
+/// `Err` ⇒ the caller must not place the raw reply into that context.
+///
+/// Only mode `on` builds a pipeline: every other mode passes the text
+/// through in the pipeline too, and checking first keeps the default
+/// (`inherit`) byte-identical to the pre-wiring path even when the owner's
+/// vault key cannot be loaded.
+pub fn redact_sub_agent_reply(
+    manager: Option<&Arc<RedactionManager>>,
+    owner_agent: &str,
+    session_id: &str,
+    responder_agent: &str,
+    text: &str,
+) -> Result<String, String> {
+    let Some(m) = manager else {
+        return Ok(text.to_string());
+    };
+    if m.source_policy().sub_agent.mode != duduclaw_redaction::config::SourceMode::On {
+        return Ok(text.to_string());
+    }
+    redact_text(
+        manager,
+        owner_agent,
+        Some(session_id),
+        text,
+        &Source::SubAgentReply {
+            agent_id: responder_agent.to_string(),
+        },
+    )
 }
 
 /// Restore tokens in text bound for the end user's channel (owner caller).
@@ -184,6 +231,61 @@ mod tests {
         let m = manager_with_rules(tmp.path(), "system_prompt = \"off\"", marked);
         assert_eq!(
             redact_text(Some(&m), "main", None, EMAIL_TEXT, &sp).unwrap(),
+            EMAIL_TEXT
+        );
+    }
+
+    #[test]
+    fn sub_agent_inherit_and_off_are_byte_identical() {
+        // Default (`inherit`) and explicit `off` both pass the reply through.
+        for sources in ["", "sub_agent = \"off\"", "sub_agent = \"inherit\""] {
+            let tmp = tempfile::tempdir().unwrap();
+            let m = manager(tmp.path(), sources, "");
+            let out =
+                redact_sub_agent_reply(Some(&m), "agnes", "telegram:1", "tl", EMAIL_TEXT).unwrap();
+            assert_eq!(out.as_bytes(), EMAIL_TEXT.as_bytes(), "sources={sources:?}");
+        }
+        assert_eq!(
+            redact_sub_agent_reply(None, "agnes", "telegram:1", "tl", EMAIL_TEXT).unwrap(),
+            EMAIL_TEXT
+        );
+    }
+
+    #[test]
+    fn sub_agent_on_redacts_under_owner_and_restores_for_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(tmp.path(), "sub_agent = \"on\"", "");
+        let out =
+            redact_sub_agent_reply(Some(&m), "agnes", "telegram:1", "tl", EMAIL_TEXT).unwrap();
+        assert!(!out.contains("alice@example.com"), "{out}");
+        assert!(out.contains(duduclaw_redaction::token::TOKEN_PREFIX));
+        // The owner (parent) restores it on its way out to the user...
+        let back = restore_for_user(Some(&m), "agnes", Some("telegram:1"), out.clone());
+        assert_eq!(back, EMAIL_TEXT);
+        // ...and the audit row names the source and the responding agent.
+        let audit = std::fs::read_to_string(tmp.path().join("redaction/audit.jsonl")).unwrap();
+        assert!(audit.contains("sub_agent_reply"), "{audit}");
+        assert!(audit.contains("\"tl\""), "{audit}");
+    }
+
+    #[test]
+    fn sub_agent_on_fails_closed_when_the_pipeline_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(tmp.path(), "sub_agent = \"on\"", "");
+        // A key file of the wrong length makes the owner's pipeline unbuildable.
+        let keys = tmp.path().join("redaction/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("agnes.key"), b"short").unwrap();
+        let err = redact_sub_agent_reply(Some(&m), "agnes", "telegram:1", "tl", EMAIL_TEXT);
+        assert!(err.is_err(), "{err:?}");
+        // The same broken key does not affect the default mode.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let m2 = manager(tmp2.path(), "", "");
+        let keys2 = tmp2.path().join("redaction/keys");
+        std::fs::create_dir_all(&keys2).unwrap();
+        std::fs::write(keys2.join("agnes.key"), b"short").unwrap();
+        assert_eq!(
+            redact_sub_agent_reply(Some(&m2), "agnes", "telegram:1", "tl", EMAIL_TEXT).unwrap(),
             EMAIL_TEXT
         );
     }

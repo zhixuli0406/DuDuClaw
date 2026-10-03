@@ -115,9 +115,11 @@ const REDACTION_SOURCE_KEYS: ReadonlyArray<keyof RedactionSources> = [
   'tool_results',
   'user_input',
   'system_prompt',
-  // v1.68: `sub_agent` row removed — no path feeds one employee's reply into
-  // another's context, and a spawned employee's tool results are already
-  // covered by `tool_results`. The stored value still round-trips untouched.
+  // `sub_agent`: a delegated employee's reply as stored in the delegating
+  // employee's session. The gateway reads it (default
+  // `inherit` leaves behaviour unchanged); its tool results stay under
+  // `tool_results`.
+  'sub_agent',
   'cron_context',
 ];
 const REDACTION_MODES: ReadonlyArray<RedactionSourceMode> = ['on', 'off', 'selective', 'inherit'];
