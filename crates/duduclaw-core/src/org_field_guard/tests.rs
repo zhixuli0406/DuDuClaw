@@ -13,6 +13,16 @@ fn home() -> PathBuf {
     PathBuf::from("/Users/alice/.duduclaw")
 }
 
+/// An absolute path on the platform running the test: `/Users/alice/<rest>`
+/// on Unix, `C:\Users\alice\<rest>` on Windows. For the cases that feed a
+/// path into an `is_absolute()` check (the hook's Bash cwd), where the Unix
+/// spelling `/Users/…` has no drive and is relative on Windows. `rest` uses
+/// `/`; it is split into components so no separator is mixed in.
+fn abs_user_path(rest: &str) -> PathBuf {
+    let root = if cfg!(windows) { r"C:\Users\alice" } else { "/Users/alice" };
+    rest.split('/').fold(PathBuf::from(root), |p, c| p.join(c))
+}
+
 fn agent_toml() -> PathBuf {
     home().join("agents/agnes/agent.toml")
 }

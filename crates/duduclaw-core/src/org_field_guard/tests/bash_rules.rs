@@ -177,31 +177,34 @@ fn interpreters_with_a_home_target_stay_refused() {
 
 #[test]
 fn hook_cwd_from_the_envelope_is_honoured() {
-    let elsewhere = PathBuf::from("/Users/alice/Project/app");
+    // The cwd only counts when it is absolute, so home and cwd are spelled
+    // the platform's way (`/Users/alice/…` has no drive on Windows).
+    let home = abs_user_path(".duduclaw");
+    let elsewhere = abs_user_path("Project/app");
     // From a project directory `../..` is not `<home>`.
     let d = check_bash_protected_write_in(
         "echo x > ../../tool_calls2.jsonl",
-        &home(),
+        &home,
         &me(),
         Some(&elsewhere),
     );
     assert!(d.is_allowed(), "{d:?}");
     // From `<home>` itself a bare name is home state.
-    let d = check_bash_protected_write_in("echo x > anything", &home(), &me(), Some(&home()));
+    let d = check_bash_protected_write_in("echo x > anything", &home, &me(), Some(&home));
     assert!(matches!(d, GuardDecision::BlockedHomeStateWrite { .. }), "{d:?}");
     // A role member running in its employee's directory: relative paths
     // resolve there, not under the member's own scaffold.
-    let employee = home().join("agents/writer");
+    let employee = home.join("agents").join("writer");
     let d = check_bash_protected_write_in(
         "echo x > notes.md",
-        &home(),
+        &home,
         &agent("writer"),
         Some(&employee),
     );
     assert!(d.is_allowed(), "{d:?}");
     let d = check_bash_protected_write_in(
         "echo x > ../ceo/notes.md",
-        &home(),
+        &home,
         &agent("writer"),
         Some(&employee),
     );

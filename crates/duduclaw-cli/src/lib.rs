@@ -13359,9 +13359,12 @@ mod g1_home_state_hook_tests {
             resolve_hook_home(Some(h.path()), "me", None),
             Ok(h.path().to_path_buf())
         );
+        // Absolute in the platform's own spelling: `/srv/dd` has no drive and
+        // is relative on Windows.
+        let env_home = if cfg!(windows) { r"C:\srv\dd" } else { "/srv/dd" };
         assert_eq!(
-            resolve_hook_home(None, "me", Some("/srv/dd")),
-            Ok(std::path::PathBuf::from("/srv/dd"))
+            resolve_hook_home(None, "me", Some(env_home)),
+            Ok(std::path::PathBuf::from(env_home))
         );
         assert!(resolve_hook_home(None, "me", Some("relative/dd")).is_err());
     }

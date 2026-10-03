@@ -675,7 +675,15 @@ mod tests {
         assert_eq!(arr.len(), 2, "upgraded in place");
         assert_eq!(arr[0]["matcher"], AGENT_FILE_GUARD_MATCHER);
         let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
-        let expected = format!("--home \"{}\"", home.path().display());
+        // A Windows temp dir (`C:\Users\…\Temp\…`) holds backslashes, which
+        // `build_hook_command` single-quotes; a Unix temp dir has none of the
+        // special characters and is double-quoted.
+        let h = home.path().to_str().unwrap();
+        let expected = if h.contains('\\') {
+            format!("--home '{h}'")
+        } else {
+            format!("--home \"{h}\"")
+        };
         assert!(cmd.contains(&expected), "command: {cmd}");
         assert!(cmd.contains("--agent \"sales-rep\""), "command: {cmd}");
     }
@@ -695,13 +703,21 @@ mod tests {
 
     #[test]
     fn home_with_shell_special_characters_is_quoted_not_left_out() {
+        // Only an absolute home is written, and `/h/…` has no drive on
+        // Windows, so the root is `C:/h` there (forward slashes, so no
+        // backslash adds a quoting reason the case does not name).
+        let root = if cfg!(windows) { "C:/h" } else { "/h" };
         for (bad, quoted) in [
-            ("/h/a\"b", "'/h/a\"b'"),
-            ("/h/$HOME", "'/h/$HOME'"),
-            ("/h/`x`", "'/h/`x`'"),
-            ("/h/it's", "'/h/it'\\''s'"),
+            ("a\"b", "a\"b'"),
+            ("$HOME", "$HOME'"),
+            ("`x`", "`x`'"),
+            ("it's", "it'\\''s'"),
+            // The separator of a Windows path.
+            ("a\\b", "a\\b'"),
         ] {
-            let cmd = build_hook_command(Path::new("/bin/duduclaw"), "x", Some(Path::new(bad)));
+            let bad = format!("{root}/{bad}");
+            let quoted = format!("'{root}/{quoted}");
+            let cmd = build_hook_command(Path::new("/bin/duduclaw"), "x", Some(Path::new(&bad)));
             assert!(cmd.contains(&format!("--home {quoted}")), "{bad}: {cmd}");
         }
         let cmd = build_hook_command(Path::new("/bin/duduclaw"), "x", Some(Path::new("rel/home")));
