@@ -29,6 +29,7 @@
 - **Windows：並行閘把「鎖被別人佔著」當成 I/O 錯誤**（`crates/duduclaw-core/src/concurrency_gate.rs`）：Windows 上鎖衝突回的是 `ERROR_LOCK_VIOLATION`，不是 `WouldBlock`，所以兩個重疊的租約續期可能讓操作者的租約失效。現在用和因果儲存相同的方式辨識鎖衝突。
 - **Windows：`[container.sandbox] executables` 的每個合法路徑都被拒絕**：這些項目是容器映像內的路徑（`/usr/bin/...`），之前卻套用主機的路徑規則驗證；現在一律當 POSIX 路徑驗證。Discovery 的評估器與策略容器路徑在所有主機上都用 `/` 組合。
 - **非 Unix 主機上的 Discovery 會直說原因**：回報 `discovery is unavailable on this platform…`，不再誤報成資料庫資料列損毀；行為（拒絕執行）不變。
+- **儀表板設定頁存檔會把 `config.toml` 重排、丟掉註解**（`crates/duduclaw-gateway/src/handlers/config_commit.rs`）：`system.update_config`、常駐感知資料來源、通道、帳號、Odoo、委派、身分、推理等設定 RPC 都是把整份檔案讀成 `toml::Table`、改完再用 `toml::to_string_pretty` 整份寫回，操作者寫的註解全部消失，鍵的順序也被打亂（只有設定檔進階編輯是原文寫回）。現在兩個共用寫入點 `commit_table_locked`（`system.update_config`、`tick.sources.*`）與 `write_config_table`（其餘設定頁，也涵蓋 `inference.toml`、`KILLSWITCH.toml`、`CONTRACT.toml`）改用 `toml_edit` 原地修改：只動有變更的鍵，沒動到的鍵連同上方註解、行尾註解、空行、順序、inline table 與陣列寫法逐位元保留；改值的那一行保留行尾註解；新鍵加在所屬區段末尾，新區段加在檔案最後；`[[tick.sources]]`、`[[accounts]]` 這類陣列表格與 `*_enc` 加密值沒被指定就原樣不動。解析失敗照舊拒絕寫入，鎖檔、內容雜湊比對、owner-only 寫入、`PROTECTED_KEYS` 稽核與 `restart_required` 都沒變。繞過共用寫入點的三處（憑證清理、語音設定 HTTP 端點、開機時的內部 MCP 金鑰輪替）一併改成同一套；語音設定端點順帶補上鎖檔與雜湊比對。改寫結果讀回來若和預期的表格不一致，退回整份重新序列化（值一定正確，只是不保留排版）並記 warn。
 - **Windows：`files.allowed_roots` 驗證測試用了 Unix 路徑**：`/srv/a` 在 Windows 沒有磁碟代號，不算絕對路徑，測試因此失敗；改用各平台各自的絕對路徑，Windows 另驗 `C:\` 磁碟根目錄會被拒。程式行為不變。
 
 ### Security
