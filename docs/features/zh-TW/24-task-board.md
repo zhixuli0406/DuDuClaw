@@ -68,14 +68,34 @@ DuDuClaw 的 Task Board 正是如此：一塊由 SQLite 支撐的看板，有兩
 |----------|------|
 | `tasks_list` | 查看你的佇列（預設為呼叫者；`assigned_to='*'` 看全部） |
 | `tasks_create` | 新增卡片；`created_by` 自動設為呼叫者 |
-| `tasks_update` | 編輯欄位（標題／描述／優先級／標籤） |
-| `tasks_claim` | 原子性接手一張未指派的卡片並設為 `in_progress` |
+| `tasks_update` | 編輯欄位（標題／描述／優先級／標籤／`assigned_to`／`depends_on`） |
+| `tasks_claim` | 原子性接手一張未指派（或本來就是自己）的卡片並設為 `in_progress` |
 | `tasks_complete` | 將卡片標記為 `done`，可附完成摘要 |
 | `tasks_block` | 將卡片標記為 `blocked`，需附原因 |
 | `activity_post` | 發一則進度紀錄，*不*變更任務狀態 |
 | `activity_list` | 讀取近期動態（預設為呼叫者） |
 
 這正是 Multica「Agent 即隊友」設計的核心：agent 不只是你呼叫的一個函式，它是一位會盯著看板、撿起卡片、發站立會議的同事。
+
+
+### 誰可以變更卡片
+
+卡片屬於被指派的那位 AI 員工。會變更或操作卡片的工具，會比對呼叫者與擁有者的關係。操作者（不對應任何 AI 員工的 MCP 金鑰，且行程不是為某位員工啟動的）不受這些檢查限制；AI 員工則要符合下表：
+
+| 工具 | AI 員工可以直接操作的情況 | 其他情況 |
+|------|--------------------------|---------|
+| `tasks_update` | 自己是卡片的受派者、認領者或建立者 | 要與受派者有委派關係（同部門、`reports_to` 上下級，或白名單配對，依 `[delegation] policy`） |
+| `tasks_update` 把別人的卡片改派給自己（`assigned_to` 設成自己） | — | 一律要有這個關係，不論卡片是誰建立的 |
+| `tasks_claim` | 認領未指派的卡片，或本來就指派給自己的卡片 | 指派給其他員工的卡片要有關係；檢查在原子認領之前進行，被拒絕的呼叫者不會拿到租約 |
+| `tasks_complete`／`tasks_block` | 自己是卡片的受派者或認領者（建立者不算） | 要與受派者有關係；既未指派也未認領的卡片會被拒絕（請先認領） |
+| 帶 `task_id` 的 `activity_post` | 自己是卡片的受派者、認領者或建立者 | 要與受派者有關係；找不到的 `task_id` 會被拒絕 |
+
+未指派、未認領的卡片沒有可比對的擁有者，所以不是建立者的 AI 員工要先用 `tasks_claim` 認領，才能更新、完成或封鎖它。身分無法確認，或身分是系統 sender 名稱（`dashboard`、`cron`、`goal-loop-driver`、`heartbeat`、`autopilot`、`webhook`）的呼叫者一律被拒絕。每次拒絕都會讓整個呼叫失敗，並寫入 `tool_calls.jsonl`。
+
+AI 員工呼叫 `tasks_update` 時還有兩條規則：
+
+- **目標文字凍結。** goal 模式的卡片，`title` 與 `description` 就是判官讀到的目標，AI 員工不能修改（稽核原因 `goal_contract_frozen`）；`acceptance_criteria` 也一樣，而且所有 MCP 呼叫者都不能改。操作者要從儀表板編輯。
+- **控制用 tag 維持原樣。** 以 `outcome:` 開頭（驗收契約）、以 `grant:` 開頭（任務範圍的能力授權）的 tag，以及 `auto-research`（每日自學標記），會改變卡片的驗收方式或可做的事。AI 員工不能新增、移除或調換它們的順序（稽核原因 `reserved_tag_change`），其他 tag 照常可改。AI 員工呼叫 `tasks_create` 時，`tags` 參數也不能帶這些 tag；`kind = "goal"` 由伺服器自己產生的 `outcome:` tag 不受影響。
 
 ---
 
@@ -104,7 +124,7 @@ DuDuClaw 的 Task Board 正是如此：一塊由 SQLite 支撐的看板，有兩
                        └──────────────────────────────►
 ```
 
-完成卡片會自動蓋上 `completed_at`。阻塞卡片會記錄一個顯示在卡片上的 `blocked_reason`。認領是一個 **compare-and-set**：`tasks_claim` 只在卡片目前未指派時才成功，所以兩個 agent 不會搶到同一張卡片。
+完成卡片會自動蓋上 `completed_at`。阻塞卡片會記錄一個顯示在卡片上的 `blocked_reason`。認領是一個 **compare-and-set**：`tasks_claim` 只在沒有其他人持有卡片時才成功，所以兩個 agent 不會搶到同一張卡片。指派給其他員工的卡片，只有與該員工有委派關係的呼叫者才能認領（見「誰可以變更卡片」）。
 
 ### Status 值
 
@@ -224,7 +244,7 @@ poll_assigned_tasks(agent)：
 
 ### 安全的並行
 
-認領是 compare-and-set，所以兩個 agent 不會雙重認領。父子連結有循環檢查。儲存層以 WAL 模式搭配 busy timeout 運行，所以 dashboard 與多個 agent 能並行寫入而不破壞看板。
+認領是 compare-and-set，所以兩個 agent 不會雙重認領；變更或認領其他員工的卡片，要與該員工有委派關係。父子連結有循環檢查。儲存層以 WAL 模式搭配 busy timeout 運行，所以 dashboard 與多個 agent 能並行寫入而不破壞看板。
 
 ---
 

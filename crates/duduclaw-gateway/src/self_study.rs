@@ -132,6 +132,12 @@ pub fn should_run_now(now_local_hour: u32, cfg_hour: u32, already_ran_today: boo
     now_local_hour >= cfg_hour
 }
 
+/// NOTE (settle_source): this deliberately does NOT filter on verified
+/// settlements. It only picks a subject for a research/review goal, never
+/// reports a calibration figure, and in production every settlement is
+/// currently a self-report, so a verified-only filter would switch the
+/// feature off entirely. A self-reported miss is still a reason to look.
+///
 /// Filter `rows` (as returned by [`belief::recent`]) down to those settled
 /// **today** (UTC calendar day — matches `belief::unsettled_today`'s own
 /// date convention, since every `belief_log` timestamp is UTC) with

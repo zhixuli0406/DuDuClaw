@@ -293,14 +293,15 @@ fn ephemeral_dir_is_owned_by_its_own_id() {
 }
 
 #[test]
-fn caller_scope_ignores_paths_outside_any_agent_dir() {
+fn caller_scope_ignores_paths_outside_home() {
+    // G1 (2026-10): paths under `<home>` that belong to no agent directory
+    // (`shared/wiki/…`, the agents root, the ephemeral root) used to fall
+    // through here; they are now refused as home state — see
+    // `home_state.rs`. Only paths outside `<home>` stay none of this rule's
+    // business.
     for p in [
         PathBuf::from("/Users/alice/Project/app/src/main.rs"),
-        home().join("shared/wiki/policies/x.md"),
-        // The agents root itself has no owner component.
-        home().join("agents/README.md"),
-        // The ephemeral root likewise.
-        home().join("agents/.ephemeral/notes.txt"),
+        PathBuf::from("/Users/alice/Project/app/agents/README.md"),
     ] {
         assert_eq!(
             check_caller_scope(&p, &home(), &agent("sales-rep")),
@@ -308,6 +309,16 @@ fn caller_scope_ignores_paths_outside_any_agent_dir() {
             "{}",
             p.display()
         );
+    }
+    for rel in [
+        "shared/wiki/policies/x.md",
+        "agents/README.md",
+        "agents/.ephemeral/notes.txt",
+    ] {
+        assert!(matches!(
+            check_caller_scope(&home().join(rel), &home(), &agent("sales-rep")),
+            GuardDecision::BlockedHomeStateWrite { .. }
+        ), "{rel}");
     }
 }
 
@@ -505,18 +516,17 @@ fn bash_cross_agent_dir_write_without_caller_identity_is_not_blocked() {
 }
 
 #[test]
-fn bash_cross_agent_dir_rule_ignores_untrusted_claims() {
-    // An `Untrusted` claim is not `HookCaller::Agent`, so this
-    // particular rule stays silent on it — the untrusted caller is
-    // already refused wholesale on the Write/Edit lane, and Bash
-    // enforcement for that caller state is out of this rule's scope
-    // (documented above `check_bash_protected_write`).
+fn bash_cross_agent_dir_rule_refuses_untrusted_claims_like_write_edit() {
+    // G1 / B (2026-10): this used to stay silent for an `Untrusted` claim
+    // while the Write/Edit lane refused the same path — the one
+    // decision that differed between the two lanes. Both lanes now refuse
+    // every write under `agents/` for a rejected claim.
     let cmd = "cat header.txt > /Users/alice/.duduclaw/agents/ceo/SOUL.md";
     let untrusted = HookCaller::Untrusted("sales-rep".to_string());
-    assert_eq!(
+    assert!(matches!(
         check_bash_protected_write(cmd, &home(), &untrusted),
-        GuardDecision::NotAgentFile
-    );
+        GuardDecision::BlockedUntrustedCaller { .. }
+    ));
 }
 
 // ── WP22 T5: the org store on the Bash lane ────────────────────
@@ -875,9 +885,19 @@ fn bash_relative_spellings_that_leave_the_agent_dir_are_not_own() {
     // subdirectory's file is a different file — neither collapses to the
     // bare spelling. (Bash is a speed bump, not a sandbox; these are simply
     // not this rule's match.)
+    //
+    // G1 (2026-10): the first two now land on the agents root, which is
+    // `<home>` state, so they are refused by the home-state rule instead.
+    for cmd in ["echo x > ../SOUL.md", "echo x > ./../CONTRACT.toml"] {
+        assert!(
+            matches!(
+                check_bash_protected_write(cmd, &home(), &agent("sales-rep")),
+                GuardDecision::BlockedHomeStateWrite { .. }
+            ),
+            "{cmd}"
+        );
+    }
     for cmd in [
-        "echo x > ../SOUL.md",
-        "echo x > ./../CONTRACT.toml",
         "echo x > ./notes/SOUL.md",
         "echo x > ./old_contract.toml",
     ] {

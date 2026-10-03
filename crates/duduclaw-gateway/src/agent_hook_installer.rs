@@ -64,6 +64,11 @@ const HOOK_TAG: &str = "_duduclaw_hook";
 /// Sentinel value identifying the agent-file-guard hook specifically.
 const HOOK_ID: &str = "agent-file-guard";
 
+/// Tools the agent-file-guard hook sees. `NotebookEdit` joined in G1 round 2:
+/// it writes any `.ipynb` path (including through a link), and the hook judges
+/// its `notebook_path` like a Write.
+const AGENT_FILE_GUARD_MATCHER: &str = "Write|Edit|MultiEdit|NotebookEdit|Bash";
+
 /// Sentinel for the RFC-23 §14.4 data-file guard entry.
 const DATA_FILE_HOOK_ID: &str = "data-file-guard";
 
@@ -139,7 +144,12 @@ pub async fn ensure_agent_hook_settings(
 
     // Merge our hook descriptors into hooks.PreToolUse. Both run: a `false`
     // from either only means "already up to date".
-    let mut updated = merge_agent_file_guard_hook(&mut root, duduclaw_bin, agent_id);
+    // G1 round 2 — the agent's CLI runs with a scrubbed environment that has
+    // no `DUDUCLAW_HOME`, so the hook would fall back to `$HOME/.duduclaw`.
+    // The home is derived from the agent directory and baked in as `--home`.
+    let home = home_of_agent_dir(agent_dir);
+    let mut updated =
+        merge_agent_file_guard_hook(&mut root, duduclaw_bin, agent_id, home.as_deref());
     updated |= merge_data_file_guard_hook(&mut root, duduclaw_bin);
     if !updated {
         debug!(path = %settings_path.display(), "Hooks already up to date");
@@ -258,14 +268,19 @@ fn pre_tool_use_array(root: &mut Value) -> Option<&mut Vec<Value>> {
 /// it against `desired_entry` for byte-for-byte equality. An old-format
 /// command never equals the new `--agent`-suffixed one, so the existing
 /// "found but different → overwrite in place" branch upgrades it for free.
-fn merge_agent_file_guard_hook(root: &mut Value, duduclaw_bin: &Path, agent_id: &str) -> bool {
-    let desired_command = build_hook_command(duduclaw_bin, agent_id);
+fn merge_agent_file_guard_hook(
+    root: &mut Value,
+    duduclaw_bin: &Path,
+    agent_id: &str,
+    home: Option<&Path>,
+) -> bool {
+    let desired_command = build_hook_command(duduclaw_bin, agent_id, home);
     // Bash is included so the guard can catch agents that bypass Write/Edit
     // by running `mkdir -p /project/.claude/agents/foo` or `cat > .../agent.toml`
     // via the shell. The CLI handler dispatches on tool name internally.
     let desired_entry = json!({
         HOOK_TAG: HOOK_ID,
-        "matcher": "Write|Edit|MultiEdit|Bash",
+        "matcher": AGENT_FILE_GUARD_MATCHER,
         "hooks": [{
             "type": "command",
             "command": desired_command,
@@ -306,18 +321,58 @@ fn merge_agent_file_guard_hook(root: &mut Value, duduclaw_bin: &Path, agent_id: 
 /// or malformed directory name (should not happen for a real agent directory)
 /// falls back to the pre-T2 command rather than injecting an unquoted-looking
 /// oddity, which is no worse than the previous inert state.
-fn build_hook_command(duduclaw_bin: &Path, agent_id: &str) -> String {
+///
+/// # G1 round 2 — `--home`
+///
+/// `home` (when known and absolute) is appended as `--home "<path>"`, or
+/// single-quoted when it holds a character that is special inside double
+/// quotes. A non-UTF-8 home is left out; the hook then infers the home from
+/// its working directory or refuses an employee caller.
+/// An upgrade needs no special case: the existing "found but different →
+/// overwrite in place" branch rewrites an entry without it on the next
+/// `ensure_agent_hook_settings` call (every spawn and every boot).
+fn build_hook_command(duduclaw_bin: &Path, agent_id: &str, home: Option<&Path>) -> String {
     // Claude Code hook commands are executed via the user's shell, so
     // quote both the binary path and the agent id defensively — the path
     // may contain spaces, and the id, while already validated, gets the
     // same treatment on general principle (defense in depth, not because
     // `is_valid_agent_id` currently allows anything shell-special).
-    let base = format!("\"{}\" hook agent-file-guard", duduclaw_bin.display());
+    let mut cmd = format!("\"{}\" hook agent-file-guard", duduclaw_bin.display());
     if duduclaw_core::is_valid_agent_id(agent_id) {
-        format!("{base} --agent \"{agent_id}\"")
-    } else {
-        base
+        cmd.push_str(&format!(" --agent \"{agent_id}\""));
     }
+    if let Some(h) = home.filter(|h| h.is_absolute()).and_then(|h| h.to_str()) {
+        if h.chars().any(|c| matches!(c, '"' | '$' | '`' | '\\' | '\n' | '\r' | '\'')) {
+            // POSIX single quotes take everything literally; a `'` inside is
+            // closed, escaped and reopened. Never omitted (round 3): without
+            // `--home` the hook would have to infer the home.
+            cmd.push_str(&format!(" --home '{}'", h.replace('\'', "'\\''")));
+        } else {
+            cmd.push_str(&format!(" --home \"{h}\""));
+        }
+    }
+    cmd
+}
+
+/// `<home>` for `<home>/agents/<id>` or `<home>/agents/.ephemeral/<id>`;
+/// `None` for any other shape.
+fn home_of_agent_dir(agent_dir: &Path) -> Option<PathBuf> {
+    let parent = agent_dir.parent()?;
+    let agents = if parent
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case(".ephemeral"))
+    {
+        parent.parent()?
+    } else {
+        parent
+    };
+    if !agents
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("agents"))
+    {
+        return None;
+    }
+    agents.parent().map(Path::to_path_buf)
 }
 
 /// Resolve the absolute path to the currently running `duduclaw` binary.
@@ -360,7 +415,7 @@ mod tests {
         // data-file-guard appended after it.
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0][HOOK_TAG], HOOK_ID);
-        assert_eq!(arr[0]["matcher"], "Write|Edit|MultiEdit|Bash");
+        assert_eq!(arr[0]["matcher"], "Write|Edit|MultiEdit|NotebookEdit|Bash");
         assert_eq!(arr[1][HOOK_TAG], DATA_FILE_HOOK_ID);
         assert_eq!(arr[1]["matcher"], "Read|Bash");
         let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
@@ -496,7 +551,7 @@ mod tests {
 
     #[test]
     fn build_hook_command_quotes_path() {
-        let cmd = build_hook_command(Path::new("/path with spaces/duduclaw"), "myagent");
+        let cmd = build_hook_command(Path::new("/path with spaces/duduclaw"), "myagent", None);
         assert!(cmd.starts_with('"'));
         assert!(cmd.contains("/path with spaces/duduclaw"));
         assert!(cmd.contains("hook agent-file-guard"));
@@ -504,7 +559,7 @@ mod tests {
 
     #[test]
     fn build_hook_command_quotes_the_agent_id_too() {
-        let cmd = build_hook_command(Path::new("/usr/local/bin/duduclaw"), "sales-rep");
+        let cmd = build_hook_command(Path::new("/usr/local/bin/duduclaw"), "sales-rep", None);
         assert!(cmd.contains("--agent \"sales-rep\""), "command: {cmd}");
     }
 
@@ -515,7 +570,7 @@ mod tests {
         // shell command) fall back to the pre-T2 shape — no worse than the
         // inert state this fix replaces.
         for bad_id in ["", "has spaces", "has/slash", "semi;colon"] {
-            let cmd = build_hook_command(Path::new("/usr/local/bin/duduclaw"), bad_id);
+            let cmd = build_hook_command(Path::new("/usr/local/bin/duduclaw"), bad_id, None);
             assert!(!cmd.contains("--agent"), "id={bad_id:?} cmd={cmd}");
             assert!(cmd.contains("hook agent-file-guard"));
         }
@@ -590,6 +645,83 @@ mod tests {
             duduclaw_core::classify_identity_surface(&settings_path, home.path()),
             Some(duduclaw_core::ProtectedSurface::HookSettings),
         );
+    }
+
+    // ── G1 round 2: `--home` and NotebookEdit ─────────────────────────────
+
+    #[tokio::test]
+    async fn installed_command_carries_the_home_and_upgrades_an_entry_without_it() {
+        let home = tempfile::tempdir().unwrap();
+        let agent_dir = home.path().join("agents").join("sales-rep");
+        std::fs::create_dir_all(agent_dir.join(".claude")).unwrap();
+        // An entry from the previous release: `--agent`, no `--home`, old matcher.
+        let stale = json!({"hooks": {"PreToolUse": [{
+            HOOK_TAG: HOOK_ID,
+            "matcher": "Write|Edit|MultiEdit|Bash",
+            "hooks": [{"type": "command",
+                "command": "\"/usr/local/bin/duduclaw\" hook agent-file-guard --agent \"sales-rep\""}]
+        }]}});
+        std::fs::write(
+            agent_dir.join(".claude/settings.json"),
+            serde_json::to_string_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+        ensure_agent_hook_settings(&agent_dir, &fake_bin()).await.unwrap();
+        let settings: Value = serde_json::from_str(
+            &std::fs::read_to_string(agent_dir.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let arr = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "upgraded in place");
+        assert_eq!(arr[0]["matcher"], AGENT_FILE_GUARD_MATCHER);
+        let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
+        // A Windows temp dir (`C:\Users\…\Temp\…`) holds backslashes, which
+        // `build_hook_command` single-quotes; a Unix temp dir has none of the
+        // special characters and is double-quoted.
+        let h = home.path().to_str().unwrap();
+        let expected = if h.contains('\\') {
+            format!("--home '{h}'")
+        } else {
+            format!("--home \"{h}\"")
+        };
+        assert!(cmd.contains(&expected), "command: {cmd}");
+        assert!(cmd.contains("--agent \"sales-rep\""), "command: {cmd}");
+    }
+
+    #[test]
+    fn home_is_derived_for_regular_and_ephemeral_agent_dirs_only() {
+        assert_eq!(
+            home_of_agent_dir(Path::new("/h/.duduclaw/agents/x")),
+            Some(PathBuf::from("/h/.duduclaw"))
+        );
+        assert_eq!(
+            home_of_agent_dir(Path::new("/h/.duduclaw/agents/.ephemeral/eph-1")),
+            Some(PathBuf::from("/h/.duduclaw"))
+        );
+        assert_eq!(home_of_agent_dir(Path::new("/tmp/myagent")), None);
+    }
+
+    #[test]
+    fn home_with_shell_special_characters_is_quoted_not_left_out() {
+        // Only an absolute home is written, and `/h/…` has no drive on
+        // Windows, so the root is `C:/h` there (forward slashes, so no
+        // backslash adds a quoting reason the case does not name).
+        let root = if cfg!(windows) { "C:/h" } else { "/h" };
+        for (bad, quoted) in [
+            ("a\"b", "a\"b'"),
+            ("$HOME", "$HOME'"),
+            ("`x`", "`x`'"),
+            ("it's", "it'\\''s'"),
+            // The separator of a Windows path.
+            ("a\\b", "a\\b'"),
+        ] {
+            let bad = format!("{root}/{bad}");
+            let quoted = format!("'{root}/{quoted}");
+            let cmd = build_hook_command(Path::new("/bin/duduclaw"), "x", Some(Path::new(&bad)));
+            assert!(cmd.contains(&format!("--home {quoted}")), "{bad}: {cmd}");
+        }
+        let cmd = build_hook_command(Path::new("/bin/duduclaw"), "x", Some(Path::new("rel/home")));
+        assert!(!cmd.contains("--home"), "relative home must be ignored: {cmd}");
     }
 
     // ── RFC-23 §14.4 data-file guard (H10: Rust subcommand, not a script) ───

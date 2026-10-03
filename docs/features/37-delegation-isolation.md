@@ -41,13 +41,29 @@ Every delegation route is governed:
 **2. Task dispatch** — assigning someone while creating a task on the task board (`tasks_create`) or reassigning (`assigned_to` in `tasks_update`)
 
 - Same checks as 1; on rejection the task creation/reassignment fails
-- Claiming your own task (`tasks_claim`) is unrestricted
+- Claiming an unassigned task, or one already assigned to you (`tasks_claim`), is unrestricted; claiming a task assigned to another employee needs the same relationship with that employee
 - Dashboard assignment operations are unrestricted (they are human operations)
 
 **2b. Multi-step plans and routines** — every step of `create_task` can name an executor, and `schedule_task` can set up recurring work for someone else
 
 - Both count as delegation and are checked at creation time; `create_task` steps are checked once more right before actual dispatch
 - Scheduling for yourself or naming yourself as executor is unrestricted
+
+**2c. Changing or triggering someone else's records** — the tools that act on a record that already belongs to an AI employee
+
+Creation was checked before, but changing an existing record was not, so an update could do what creation refused. These tools now check the caller against the record's owner with the same predicate:
+
+| Tool | Owner of the record |
+|------|--------------------|
+| `tasks_update`, `tasks_claim`, `tasks_complete`, `tasks_block`, `activity_post` with a `task_id` | the task's assignee (see the task board page for when the assignee, claimer or creator may act without a relationship) |
+| `update_cron_task`, `delete_cron_task`, `pause_cron_task`, `run_cron_task` | the employee the routine runs as |
+| `create_reminder` | the employee named in `agent_id` (omitted = the caller itself) |
+
+- Acting on your own record is unrestricted; otherwise the delegation relationship decides
+- A record whose owner cannot be determined is refused (for an unassigned, unclaimed task: claim it first)
+- Operators (an MCP key that maps to no AI employee, in a process that is not running for one) are not restricted
+- The shared internal key in a process that has no employee identity acts as the internal client id, which is not a node in the org chart, so it is refused on everyone's records
+- The cron tools address one row: with `name`, a name shared by several routines is refused and the reply lists the candidate ids (before this change, `delete_cron_task` and `pause_cron_task` acted on every routine with that name, and `update_cron_task` on the first one)
 
 **3. Automation rules** — the delegate action inside autopilot rules
 
@@ -121,7 +137,8 @@ Three controls:
 Rejected delegation attempts always leave a trail, split into two files by interception point:
 
 - Blocked when dispatch is actually about to execute (bus queue, multi-step plans) → `~/.duduclaw/security_audit.jsonl`, event type `delegation_denied`
-- Blocked at the MCP tool itself (`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `create_task` / `schedule_task`) → `~/.duduclaw/tool_calls.jsonl`, also `delegation_denied`; blocked org adjustments via `create_agent` / `agent_update` are recorded as `org_placement_denied`
+- Blocked at the MCP tool itself (`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `tasks_claim` / `tasks_complete` / `tasks_block` / `activity_post` / `create_task` / `schedule_task` / the cron management tools / `create_reminder`) → `~/.duduclaw/tool_calls.jsonl`, also `delegation_denied`; blocked org adjustments via `create_agent` / `agent_update` are recorded as `org_placement_denied`
+- Record-change refusals that are not about the relationship itself are also in `tool_calls.jsonl`, with a `reason`: `owner_unknown`, `caller_unknown`, `system_sender_identity`, `reserved_tag_change`, `goal_contract_frozen`. An AI employee changing its own authority settings through `agent_update` is recorded as `agent_authority_refused` (reason `self_authority_change`)
 
 A `security_audit.jsonl` record looks like this:
 
@@ -182,6 +199,8 @@ External A2A calls default to the `a2a-client` identity, which is **not** on the
 
 The names above (plus `a2a-client`, `default`, and any name starting with `__`) are **reserved words** and cannot be used to create AI employees — doing so would amount to issuing yourself a free pass.
 
+These names are never accepted as the identity of an MCP process. The MCP `create_agent` tool, the dashboard and the `duduclaw agent create` command all refuse these names when an employee is created, and the gateway starts an employee's MCP server with that employee's directory id; as long as no employee carries one of these names, a process presenting `dashboard`, `cron`, `goal-loop-driver`, `heartbeat`, `autopilot` or `webhook` as its identity can only have claimed it itself. Such a process resolves to the untrusted identity, and the record checks above refuse it. When that substitution happens, `tool_calls.jsonl` gets one row per process (tool `mcp_identity`, reason `system_sender_identity`) naming the claimed name and where it came from (`env` for `DUDUCLAW_AGENT_ID`, `config` for `[general] default_agent`).
+
 ### What this line of defense covers, and what it does not
 
 Covered: every route by which AI employees delegate to each other through platform features (MCP tools, task board, multi-step plans, routines, task queue, external A2A). This is an **organizational permission boundary**: "who can tell whom what to do" follows the org chart.
@@ -189,7 +208,7 @@ Covered: every route by which AI employees delegate to each other through platfo
 Not covered (known boundaries by design, not bugs):
 
 - **Legacy-format tasks**: 1.52 still lets queued tasks with no sender field at all pass, logging only a warning (to avoid wiping out work still queued during an upgrade). The next version switches to rejection.
-- **Config-file-level changes**: since v1.52 a PreToolUse hook freezes the sensitive org data fields — an agent cannot rewrite `agent.toml`'s `name` / `reports_to` / `department`, its whole `[capabilities]` permission envelope (added after the Team-as-Agent review), the `[delegation]` / `[acp]` sections of `config.toml`, the `.mcp.json` identity block, `.claude/settings.json`, or `identity.key` through the Write/Edit/Bash tools. Changing these settings must go through the dashboard or the `agent_update` MCP tool — the vetted official channels. Cross-employee file edits (e.g. modifying someone else's SOUL.md) are also rejected. Non-Claude runtimes (codex/gemini etc.) cannot write to the `~/.duduclaw/` directory under the workspace-write sandbox, adding a sandbox-level line of defense. Only the FullAccess sandbox is exempt — an extreme permission the operator chooses explicitly.
+- **Config-file-level changes**: since v1.52 a PreToolUse hook freezes the sensitive org data fields — an agent cannot rewrite `agent.toml`'s `name` / `reports_to` / `department`, its whole `[capabilities]` permission envelope (added after the Team-as-Agent review), the `[delegation]` / `[acp]` sections of `config.toml`, the `.mcp.json` identity block, `.claude/settings.json`, or `identity.key` through the Write/Edit/Bash tools. Changing these settings must go through the dashboard or the `agent_update` MCP tool — the vetted official channels. The same hook also keeps an AI employee from changing its own `agent.toml` security settings and DuDuClaw home state; the rules and their limits are in [Security defense](05-security-defense.md). Cross-employee file edits (e.g. modifying someone else's SOUL.md) are also rejected. Non-Claude runtimes (codex/gemini etc.) cannot write to the `~/.duduclaw/` directory under the workspace-write sandbox, adding a sandbox-level line of defense. Only the FullAccess sandbox is exempt — an extreme permission the operator chooses explicitly.
 - **System- and human-initiated operations**: dashboard, webhooks, schedules, and automation rules are the operator's will to begin with, and always pass.
 
 ### Visibility filtering
@@ -213,6 +232,8 @@ When `create_agent` creates a new employee, the caller can only attach it to its
 - A lead can only create direct reports, or attach new employees under an existing report
 - You cannot create an employee attached under your own manager (unless the operator is that manager or someone above)
 - Creating employees from the dashboard is unrestricted (a human operation)
+
+`agent_update` has a matching rule for an employee's own settings. An AI employee cannot send `reports_to`, `db_sources`, `db_sources_add`, `db_sources_remove`, `budget_cents` or `role` about itself: the whole call is refused and recorded as `agent_authority_refused`. These change who the employee answers to, which databases it may read, how much it may spend, and whether it counts as the main agent. Its manager (a superior the delegation policy allows) or the operator makes these changes. Editing a subordinate works as before, and an AI employee can still change its own non-authority fields (display name, model, heartbeat and so on).
 
 ### A removed employee's name stays reserved
 
@@ -274,12 +295,14 @@ Agent changes made through file tools (Write/Edit/Bash) are intercepted by the P
 | `.claude/settings.json` | Whole file | Permission lists and other sensitive settings are managed centrally by the dashboard |
 | `identity.key` | (whole file) | Signing key; any change breaks identity verification |
 
+For AI-employee callers the hook also freezes the employee's own `agent.toml` security settings and DuDuClaw home state; see [Security defense](05-security-defense.md).
+
 #### The right channels for changes
 
 When these settings need to change:
 
-- **`name`, `reports_to`, `department`** → dashboard "AI employees → details → edit", or the MCP `agent_update` tool
-- **Adjusting permissions or adding tools** → dashboard "AI employees → advanced settings", the MCP `agent_update` tool, or an operator editing `agent.toml [capabilities]` in a normal editor. Neither route passes through this hook — the hook only sees Claude Code's own Write / Edit / Bash tool calls, so an employee (or one of its team role members) cannot take this route from inside a session
+- **`name`, `reports_to`, `department`** → dashboard "AI employees → details → edit", or the MCP `agent_update` tool (an AI employee can use it on a subordinate, not on its own `reports_to`; see below)
+- **Adjusting permissions or adding tools** → dashboard "AI employees → advanced settings", the MCP `agent_update` tool, or an operator editing `agent.toml [capabilities]` in a normal editor. Neither route passes through this hook — the hook only sees Claude Code's own Write / Edit / Bash tool calls, so an employee (or one of its team role members) cannot take this route from inside a session. Through `agent_update`, an AI employee can grant a database source to a subordinate but not to itself
 - **Delegation policy or white-list** → dashboard "Advanced settings → Delegation permissions", or edit `config.toml [delegation]` directly and restart the gateway
 - **Adding an MCP server** → edit the `tools` array in `.mcp.json` (leave the identity block alone), or add manually via dashboard "Advanced settings → MCP servers"
 
@@ -287,7 +310,7 @@ Interceptions are recorded in `~/.duduclaw/tool_calls.jsonl` with the `org_place
 
 #### System identities are unrestricted
 
-System senders (dashboard, webhook, cron, autopilot) operate without restriction and may change any setting. This is guaranteed by design: those sources embody the operator's will.
+System senders (dashboard, webhook, cron, autopilot) operate without restriction and may change any setting. This is guaranteed by design: those sources embody the operator's will. It applies to the gateway's own paths; an MCP process that presents one of these names as its identity is treated as untrusted (see "Who counts as system" above).
 
 ### White-list input flexibility
 

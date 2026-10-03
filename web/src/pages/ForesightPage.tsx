@@ -484,7 +484,7 @@ function directionLabel(intl: ReturnType<typeof useIntl>, direction: string | nu
  *  posture (no agent picked / n<30 counts-only / full stats), same spirit
  *  as `CalibrationCard` above but against the belief store instead
  *  of the task forward model. */
-function BeliefStatsCard({ agentId, stats }: { agentId: string; stats: BeliefStats | null }) {
+export function BeliefStatsCard({ agentId, stats }: { agentId: string; stats: BeliefStats | null }) {
   const intl = useIntl();
   if (!agentId) {
     return (
@@ -496,7 +496,17 @@ function BeliefStatsCard({ agentId, stats }: { agentId: string; stats: BeliefSta
     );
   }
   if (!stats) return null;
-  if (stats.insufficient_samples) {
+  const selfNote =
+    stats.self_reported.n > 0 ? (
+      <p className="text-xs text-muted-foreground">
+        {intl.formatMessage({ id: 'belief.stats.selfReported' }, { n: stats.self_reported.n })}
+      </p>
+    ) : null;
+  if (stats.calibration_status !== 'calibrated') {
+    const msgId =
+      stats.calibration_status === 'no_verified_settlements'
+        ? 'belief.stats.none'
+        : 'belief.stats.insufficient';
     return (
       <Card data-size="sm">
         <CardContent className="space-y-2">
@@ -504,13 +514,15 @@ function BeliefStatsCard({ agentId, stats }: { agentId: string; stats: BeliefSta
             {intl.formatMessage({ id: 'belief.stats.title' })}
           </h3>
           <p className="text-sm text-muted-foreground">
-            {intl.formatMessage({ id: 'belief.stats.insufficient' }, { n: stats.n_settled })}
+            {intl.formatMessage({ id: msgId }, { n: stats.verified.n })}
           </p>
+          {selfNote}
         </CardContent>
       </Card>
     );
   }
-  const overPct = stats.overconfidence != null ? Math.round(stats.overconfidence * 100) : null;
+  const v = stats.verified;
+  const overPct = v.overconfidence != null ? Math.round(v.overconfidence * 100) : null;
   return (
     <Card data-size="sm">
       <CardContent className="space-y-3">
@@ -519,12 +531,12 @@ function BeliefStatsCard({ agentId, stats }: { agentId: string; stats: BeliefSta
         </h3>
         <div className="grid grid-cols-4 gap-2 text-center">
           <div>
-            <p className="font-mono text-lg tabular-nums text-foreground">{stats.n_settled}</p>
-            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'belief.stats.nSettled' })}</p>
+            <p className="font-mono text-lg tabular-nums text-foreground">{v.n}</p>
+            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'belief.stats.nVerified' })}</p>
           </div>
           <div>
             <p className="font-mono text-lg tabular-nums text-foreground">
-              {stats.hit_rate_wilson_low != null ? `${Math.round(stats.hit_rate_wilson_low * 100)}%` : '—'}
+              {v.hit_rate_wilson_low != null ? `${Math.round(v.hit_rate_wilson_low * 100)}%` : '—'}
             </p>
             <p className="text-xs text-muted-foreground">
               {intl.formatMessage({ id: 'belief.stats.hitRateWilson' })}
@@ -532,7 +544,7 @@ function BeliefStatsCard({ agentId, stats }: { agentId: string; stats: BeliefSta
           </div>
           <div>
             <p className="font-mono text-lg tabular-nums text-foreground">
-              {stats.mean_brier != null ? stats.mean_brier.toFixed(2) : '—'}
+              {v.mean_brier != null ? v.mean_brier.toFixed(2) : '—'}
             </p>
             <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'belief.stats.meanBrier' })}</p>
           </div>
@@ -549,6 +561,7 @@ function BeliefStatsCard({ agentId, stats }: { agentId: string; stats: BeliefSta
             </p>
           </div>
         </div>
+        {selfNote}
         {stats.per_subject.length > 0 && (
           <div className="space-y-1 border-t border-surface-border pt-3">
             <p className="text-xs text-muted-foreground">
@@ -558,11 +571,16 @@ function BeliefStatsCard({ agentId, stats }: { agentId: string; stats: BeliefSta
               <div key={s.subject} className="flex items-center gap-2 text-xs">
                 <span className="w-20 shrink-0 truncate text-foreground">{s.subject}</span>
                 <span className="font-mono tabular-nums text-muted-foreground">
-                  {s.hits}/{s.n_settled}
+                  {s.verified.n > 0 ? `${s.verified.hits}/${s.verified.n}` : '—'}
                 </span>
-                {s.mean_brier != null && (
+                {s.self_reported.n > 0 && (
+                  <span className="text-muted-foreground">
+                    {intl.formatMessage({ id: 'belief.stats.subjectSelf' }, { n: s.self_reported.n })}
+                  </span>
+                )}
+                {s.verified.mean_brier != null && (
                   <span className="ml-auto font-mono tabular-nums text-muted-foreground">
-                    {s.mean_brier.toFixed(2)}
+                    {s.verified.mean_brier.toFixed(2)}
                   </span>
                 )}
               </div>
@@ -600,6 +618,22 @@ function BeliefRowView({ belief }: { belief: BeliefRow }) {
       ) : (
         <span className={isHit ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
           {directionLabel(intl, belief.realized_direction)} {isHit ? '✓' : '✗'}
+        </span>
+      )}
+      {settled && (
+        <span
+          className={
+            belief.settle_source === 'agent+tick_verified'
+              ? 'rounded border border-emerald-500/40 px-1 text-emerald-600 dark:text-emerald-400'
+              : 'rounded border border-amber-500/40 px-1 text-amber-600 dark:text-amber-400'
+          }
+        >
+          {intl.formatMessage({
+            id:
+              belief.settle_source === 'agent+tick_verified'
+                ? 'belief.source.verified'
+                : 'belief.source.selfReported',
+          })}
         </span>
       )}
       {belief.brier != null && (

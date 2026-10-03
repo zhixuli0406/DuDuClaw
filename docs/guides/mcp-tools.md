@@ -81,6 +81,42 @@ Two new gates refuse a call without removing the tool from `tools/list`:
 - `agent.toml [permissions]`: a flag written as `false` refuses `create_agent` (`can_create_agents`); `send_to_agent`, `spawn_agent` (`can_send_cross_agent`); `schedule_task`, `create_reminder` and `tasks_create` with a `schedule` (`can_schedule_tasks`); `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording` (`can_modify_own_skills`). The refusal is JSON-RPC error -32003 and a `permission_denied` audit event. An `agent.toml` that exists but cannot be read or parsed refuses these tools; a missing one allows them. `tasks_create` without a `schedule` stays allowed, which is why these flags are checked per call. Ephemeral role members are scaffolded with `can_create_agents`, `can_modify_own_skills` and `can_schedule_tasks` set to `false`.
 - `config.toml [odoo] features_*`: Odoo tools stay listed and are refused per call for models of a switched-off module (project and hr are off by default).
 
+### Record relationship checks: listed but refused
+
+Some tools change or trigger a record that belongs to an AI employee. They stay
+listed for every caller and check the relationship per call:
+
+- **Tasks**: `tasks_update` and `activity_post` with a `task_id` pass for the
+  task's assignee, claimer or creator; `tasks_complete` and `tasks_block` pass
+  for its assignee or claimer; `tasks_claim` passes for an unassigned task or
+  one already assigned to the caller. Anything else needs a delegation
+  relationship with the assignee (same department, `reports_to` above or below,
+  or a whitelist pair, per `[delegation] policy`). An unassigned, unclaimed task
+  must be claimed first. Taking another employee's task for yourself through
+  `tasks_update` always needs the relationship.
+- **Task fields**: an AI employee cannot change `title` or `description` of a
+  goal-mode task (`acceptance_criteria` is refused for every MCP caller), and
+  cannot add, remove or reorder tags starting with `outcome:` or `grant:` or the
+  `auto-research` tag, in `tasks_update` or in `tasks_create`'s `tags`.
+- **Routines**: `update_cron_task`, `delete_cron_task`, `pause_cron_task` and
+  `run_cron_task` need the caller to be the employee the routine runs as, or to
+  have the relationship with it. Addressed by `name`, they act on exactly one
+  routine; a shared name is refused with the candidate ids.
+- **Reminders**: `create_reminder` with an `agent_id` other than the caller
+  needs the relationship with that employee.
+- **`agent_update` on yourself**: an AI employee cannot send `reports_to`,
+  `db_sources`, `db_sources_add`, `db_sources_remove`, `budget_cents` or `role`
+  about itself (audit `agent_authority_refused`). Editing a subordinate is
+  unchanged.
+
+An operator (an MCP key that maps to no AI employee, in a process that is not
+running for one) is not restricted. The shared internal key in a process with
+no employee identity owns no record, so it is refused on everyone's. A process
+whose identity is a system sender name (`dashboard`, `cron`, …) is treated as
+untrusted. Every refusal is audited in `tool_calls.jsonl`. Details:
+[task board](../features/24-task-board.md),
+[delegation isolation](../features/37-delegation-isolation.md).
+
 ## The description budget
 
 Each tool's `description` is capped at **200 bytes** and each parameter's
@@ -238,6 +274,34 @@ strings. Click, type, key, scroll and navigate each count as one action
 against `max_actions` (default 50). Limits, the approval and confirmation
 rules, the network allowlist and its residual risks are in
 [Browser automation](../features/08-browser-automation.md).
+
+### `belief_stats` / `belief_settle` — verified and self-reported settlements
+
+Only a settlement cross-checked against a platform price counts toward
+calibration. Nothing in production supplies that cross-check today:
+`belief_settle` records every settlement as the employee's own report
+(`settle_source = "agent_unverified"`), so calibration reads "no verified
+settlements" on every current deployment.
+
+`belief_settle` returns the settled row plus `counts_toward_calibration`
+(boolean) and, when it is `false`, a `note` saying the settlement was recorded
+but does not count.
+
+`belief_stats` returns (the same object as the dashboard's `belief.summary`
+`stats`, plus a `note`):
+
+| Field | Meaning |
+|-------|---------|
+| `n_submitted` | every belief submitted, settled or not |
+| `n_settled_all` | every settled belief (`verified.n + self_reported.n`) |
+| `calibration_status` | `no_verified_settlements`, `insufficient_samples` (1–29 verified) or `calibrated` (30 or more) |
+| `verified` | `n`, `hits`, and `hit_rate`, `hit_rate_wilson_low`, `mean_brier`, `overconfidence` (all `null` unless `calibrated`) |
+| `self_reported` | `n` and a descriptive `hit_rate` (`null` when `n` is 0); not calibration |
+| `per_subject[]` | `subject`, `verified` (`n`, `hits`, `mean_brier`), `self_reported` (`n`) |
+
+The flat fields of earlier versions (`n_total`, `n_settled`,
+`insufficient_samples`, top-level `hit_rate` …) are gone. See
+[Belief loop](../features/46-belief-loop.md).
 
 ### `create_agent` / `agent_remove` — removed names are reserved
 

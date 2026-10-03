@@ -4,7 +4,8 @@ import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { useConnectionStore } from '@/stores/connection-store';
-import { ForesightPage } from './ForesightPage';
+import { ForesightPage, BeliefStatsCard } from './ForesightPage';
+import type { BeliefStats } from '@/lib/api';
 
 const summary = {
   agent_id: 'agnes',
@@ -103,5 +104,56 @@ describe('ForesightPage', () => {
     const bandRow = bandCell.closest('tr');
     expect(bandRow).not.toBeNull();
     expect(bandRow!.textContent).toContain('5');
+  });
+});
+
+describe('BeliefStatsCard', () => {
+  const base: BeliefStats = {
+    agent_id: 'agnes',
+    n_submitted: 40,
+    n_settled_all: 40,
+    calibration_status: 'no_verified_settlements',
+    verified: { n: 0, hits: 0, hit_rate: null, hit_rate_wilson_low: null, mean_brier: null, overconfidence: null },
+    self_reported: { n: 40, hit_rate: 1 },
+    per_subject: [],
+  };
+
+  it('shows no score when nothing is verified, only the self-reported count', () => {
+    renderWithProviders(<BeliefStatsCard agentId="agnes" stats={base} />);
+    expect(screen.getByText(/No verified settlements yet/)).toBeInTheDocument();
+    expect(screen.getByText(/40 more were reported by the agent itself/)).toBeInTheDocument();
+    expect(screen.queryByText('100%')).not.toBeInTheDocument();
+  });
+
+  it('shows counts only below the verified threshold', () => {
+    renderWithProviders(
+      <BeliefStatsCard
+        agentId="agnes"
+        stats={{ ...base, calibration_status: 'insufficient_samples', verified: { ...base.verified, n: 7, hits: 7 } }}
+      />,
+    );
+    expect(screen.getByText(/7 verified settlements, below the 30 needed/)).toBeInTheDocument();
+    expect(screen.queryByText('Verified settlements')).not.toBeInTheDocument();
+  });
+
+  it('shows verified-only figures once calibrated, with self-reported listed apart', () => {
+    renderWithProviders(
+      <BeliefStatsCard
+        agentId="agnes"
+        stats={{
+          ...base,
+          calibration_status: 'calibrated',
+          verified: { n: 30, hits: 18, hit_rate: 0.6, hit_rate_wilson_low: 0.42, mean_brier: 0.26, overconfidence: 0 },
+          self_reported: { n: 10, hit_rate: 1 },
+          per_subject: [
+            { subject: '2317', verified: { n: 30, hits: 18, mean_brier: 0.26 }, self_reported: { n: 10 } },
+          ],
+        }}
+      />,
+    );
+    expect(screen.getByText('Verified settlements')).toBeInTheDocument();
+    expect(screen.getByText('42%')).toBeInTheDocument();
+    expect(screen.getByText(/10 more were reported by the agent itself/)).toBeInTheDocument();
+    expect(screen.getByText('18/30')).toBeInTheDocument();
   });
 });

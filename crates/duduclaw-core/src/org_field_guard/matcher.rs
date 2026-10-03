@@ -15,7 +15,9 @@ use std::path::Path;
 
 use crate::agent_guard::lexical_normalize;
 
-use super::rules::{EPHEMERAL_DIR_NAME, FrozenShape, IDENTITY_ENV_KEYS, WRITE_VERBS};
+use super::rules::{
+    EPHEMERAL_DIR_NAME, FrozenShape, HOME_WRITABLE_DIRS, IDENTITY_ENV_KEYS, WRITE_VERBS,
+};
 
 /// Every change a frozen entry sees between `old` and `new`.
 ///
@@ -37,6 +39,33 @@ pub(super) fn diff_frozen(
             })
             .collect(),
         FrozenShape::TableKeys { section } => diff_table_keys(section, old, new),
+        FrozenShape::AllSectionsExcept { editable } => {
+            let mut keys: Vec<&str> = old.keys().map(String::as_str).collect();
+            for k in new.keys() {
+                if !keys.contains(&k.as_str()) {
+                    keys.push(k.as_str());
+                }
+            }
+            keys.sort_unstable();
+            keys.into_iter()
+                .filter(|k| !editable.contains(k))
+                .flat_map(|k| diff_table_keys(k, old, new))
+                .collect()
+        }
+        FrozenShape::ValueKeys { section, keys } => keys
+            .iter()
+            .filter_map(|key| {
+                let before = table_value(old, section, key);
+                let after = table_value(new, section, key);
+                (before != after).then(|| {
+                    format!(
+                        "{section}.{key}：{} → {}",
+                        describe_section(before),
+                        describe_section(after)
+                    )
+                })
+            })
+            .collect(),
         FrozenShape::WholeSection { section } => {
             let before = old.get(section);
             let after = new.get(section);
@@ -65,6 +94,12 @@ fn string_field(table: &toml::Table, section: &str, field: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string()
+}
+
+/// `[<section>] <key>` as a raw value; a missing table, a missing key and a
+/// non-table section all read as `None`.
+fn table_value<'a>(table: &'a toml::Table, section: &str, key: &str) -> Option<&'a toml::Value> {
+    table.get(section).and_then(|v| v.as_table()).and_then(|t| t.get(key))
 }
 
 /// Union-of-keys walk over `[<section>]`.
@@ -395,4 +430,52 @@ fn lexical_dir(dir: &str) -> String {
         }
     }
     out.join("/")
+}
+
+// ── G1: `<home>` targets named by a shell command ───────────────────────────
+
+/// What a path-shaped token in a Bash command points at, relative to
+/// `<home>` (G1, 2026-10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum HomeTarget {
+    /// Inside the caller's own agent directory.
+    OwnAgentDir,
+    /// Inside another agent's directory (`agents/<id>/…` or
+    /// `agents/.ephemeral/<id>/…`); carries `<id>`.
+    ForeignAgentDir(String),
+    /// Under `agents/_trash/`.
+    RemovedArea,
+    /// Anywhere else under `<home>` except the writable list; carries the
+    /// home-relative components (lowercased, as they appeared).
+    State(Vec<String>),
+}
+
+pub(super) fn classify_home_rest(rest: Vec<String>, caller: &str) -> Option<HomeTarget> {
+    let trash = crate::agent_trash::AGENT_TRASH_DIR.to_ascii_lowercase();
+    match rest.first().map(String::as_str) {
+        Some(first) if HOME_WRITABLE_DIRS.contains(&first) && rest.len() >= 2 => None,
+        Some("agents") => match rest.get(1).map(String::as_str) {
+            None => Some(HomeTarget::State(rest)),
+            Some(t) if t == trash => Some(HomeTarget::RemovedArea),
+            // The caller's own directory *entry* (`rm -rf .`, `mv ../me x`)
+            // takes its structure files with it, so it counts as state;
+            // only what lies inside it is the caller's.
+            Some(EPHEMERAL_DIR_NAME) => match rest.get(2) {
+                Some(owner) if owner == caller && rest.len() == 3 => Some(HomeTarget::State(rest)),
+                Some(owner) if owner == caller => Some(HomeTarget::OwnAgentDir),
+                Some(owner) => Some(HomeTarget::ForeignAgentDir(owner.clone())),
+                None => Some(HomeTarget::State(rest)),
+            },
+            Some(owner) if owner == caller && rest.len() == 2 => Some(HomeTarget::State(rest)),
+            Some(owner) if owner == caller => Some(HomeTarget::OwnAgentDir),
+            // `agents/<x>` with nothing after it and `<x>` not shaped like an
+            // agent id is a file at the agents root (`../SOUL.md` from the
+            // cwd), not a peer's directory.
+            Some(owner) if rest.len() == 2 && !crate::is_valid_agent_id(owner) => {
+                Some(HomeTarget::State(rest))
+            }
+            Some(owner) => Some(HomeTarget::ForeignAgentDir(owner.to_string())),
+        },
+        _ => Some(HomeTarget::State(rest)),
+    }
 }

@@ -35,7 +35,7 @@
 
 建立目標的當下，驗收標準會被凍結成一份不可變的基準（`acceptance_criteria_baseline`）。之後所有裁決（第一階段評估器、MAV 驗收判官）一律讀這份凍結基準，不讀事後可能被改動的欄位。這是為了擋掉兩個方向的「悄悄改契約」：AI 員工不能在做的過程中把驗收標準改鬆，操作者也不會誤以為改了儀表板上的欄位就等於重新設定了裁決依據。
 
-- **AI 員工不能改**：agent 身分呼叫 MCP `tasks_update` 若帶了 `acceptance_criteria` 想改自己 goal 任務的驗收標準，會被整筆拒絕，並留一筆審計紀錄（原因 `goal_contract_frozen`）。
+- **AI 員工不能改**：agent 身分呼叫 MCP `tasks_update` 若帶了 `acceptance_criteria` 想改自己 goal 任務的驗收標準，會被整筆拒絕，並留一筆審計紀錄（原因 `goal_contract_frozen`）。goal 任務的 `title` 與 `description` 就是判官讀到的目標，AI 員工呼叫 `tasks_update` 改其中任何一個，也會以同樣方式被拒絕。任務上的控制用 tag（`outcome:…`、`grant:…`、`auto-research`），AI 員工也不能新增、移除或調換順序（原因 `reserved_tag_change`）。
 - **操作者可以編輯顯示用的副本，但不會回頭改變裁決依據**：儀表板 `tasks.update` 仍可以修改任務上顯示的 `acceptance_criteria`（例如補充說明給人看），但凍結的基準值不會跟著變。判官與評估器繼續照原本建立時的標準裁決。真的要換一組驗收標準，等於是換一個目標。
 - 沒有凍結基準的舊任務（凍結機制上線前建立的）退回讀可變欄位，行為與過去一致。
 

@@ -97,7 +97,7 @@ DuDuClaw 本身不訓練、不提供模型。對話、工具使用與上下文�
     │   ├── CLAUDE.md               # Claude Code 指引
     │   ├── CONTRACT.toml           # 行為契約（選配）
     │   ├── .mcp.json               # MCP Server 設定（duduclaw 條目由 gateway 開機時補齊）
-    │   ├── .claude/settings.json   # PreToolUse hooks（agent-file-guard 等）
+    │   ├── .claude/settings.json   # PreToolUse hooks（agent-file-guard 帶 --agent／--home 等）
     │   ├── SKILLS/                 # 技能集
     │   ├── wiki/                   # Agent 私有 wiki
     │   └── state/working_state.json # 跨喚醒工作狀態
@@ -248,7 +248,7 @@ GET https://api.anthropic.com/v1/models
 | Soul Guard | `duduclaw-security/src/soul_guard.rs` | SHA-256 指紋（`~/.duduclaw/soul_hashes/`）+ `.soul_history/` 最多 10 版備份 |
 | Input Guard | `duduclaw-security/src/input_guard.rs` | 7 類 prompt injection 規則，NFKC 正規化，分數 ≥ 60 阻擋 |
 | Audit Log | `duduclaw-security/src/audit.rs` | `security_audit.jsonl` append-only 安全事件 |
-| PreToolUse hooks | `duduclaw hook agent-file-guard` / `data-file-guard` | 擋 agent 寫自己的 SOUL.md 與 CONTRACT.toml（Bash 部分是啟發式減速帶）、跨 agent 寫入、組織欄位修改 |
+| PreToolUse hooks | `duduclaw hook agent-file-guard` / `data-file-guard` | matcher `Write\|Edit\|MultiEdit\|NotebookEdit\|Bash`。擋 agent 寫自己的 SOUL.md 與 CONTRACT.toml、跨 agent 寫入、組織欄位修改；AI 員工在資料目錄只能寫自己的目錄與 `attachments/`（以符號連結解析後的落點判斷）；自己 `agent.toml` 只有可編輯清單裡的區段能改。Bash 部分是啟發式減速帶，規則與限制見 05 |
 | 委派授權 | `duduclaw-core/src/delegation_policy.rs` | `reports_to` 樹 + 部門 + 白名單，fail-closed |
 
 **Injection 規則類別與權重**：instruction_override (40)、role_hijack (35)、system_prompt_extraction (30)、tool_abuse (30)、termination_manipulation (30)、encoding_bypass (25)、data_exfiltration (25)。
@@ -582,7 +582,7 @@ Main Agent
 
 ### 13.5 Task Board 與 Goal Loop
 
-SQLite `tasks.db`。Dashboard RPC：`tasks.list` / `tasks.create` / `tasks.update` / `tasks.remove` / `tasks.assign`、`activity.list`。Agent 用 MCP：`tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post`。`/goal` 與 `tasks_create kind="goal"` 走自主 Goal Loop（MAV 判官驗收、卡住轉 `needs_human`），見 [docs/features/24-task-board.md](docs/features/24-task-board.md) 與 [docs/guides/goal-loop.md](docs/guides/goal-loop.md)。
+SQLite `tasks.db`。Dashboard RPC：`tasks.list` / `tasks.create` / `tasks.update` / `tasks.remove` / `tasks.assign`、`activity.list`。Agent 用 MCP：`tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post`。AI 員工改動或觸發別人的任務（以及 cron 管理工具、`create_reminder`）要與擁有者有委派關係（同部門、上下級或白名單），身分不明一律拒絕；未指派、未認領的任務要先認領（`tasks_update` 與 `activity_post` 的建立者例外）；goal 任務的標題、說明與驗收標準對 AI 員工凍結，`outcome:`／`grant:`／`auto-research` 控制用 tag 不能增刪或調換（規則在 `crates/duduclaw-cli/src/mcp/record_authz.rs`）。`/goal` 與 `tasks_create kind="goal"` 走自主 Goal Loop（MAV 判官驗收、卡住轉 `needs_human`），見 [docs/features/24-task-board.md](docs/features/24-task-board.md) 與 [docs/guides/goal-loop.md](docs/guides/goal-loop.md)。
 
 ### 13.6 共享知識庫（Shared Wiki）
 

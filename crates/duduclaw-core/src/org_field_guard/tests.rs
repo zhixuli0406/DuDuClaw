@@ -13,6 +13,16 @@ fn home() -> PathBuf {
     PathBuf::from("/Users/alice/.duduclaw")
 }
 
+/// An absolute path on the platform running the test: `/Users/alice/<rest>`
+/// on Unix, `C:\Users\alice\<rest>` on Windows. For the cases that feed a
+/// path into an `is_absolute()` check (the hook's Bash cwd), where the Unix
+/// spelling `/Users/…` has no drive and is relative on Windows. `rest` uses
+/// `/`; it is split into components so no separator is mixed in.
+fn abs_user_path(rest: &str) -> PathBuf {
+    let root = if cfg!(windows) { r"C:\Users\alice" } else { "/Users/alice" };
+    rest.split('/').fold(PathBuf::from(root), |p, c| p.join(c))
+}
+
 fn agent_toml() -> PathBuf {
     home().join("agents/agnes/agent.toml")
 }
@@ -67,6 +77,21 @@ mod toml_rules;
 mod identity_scope;
 /// Removed-name reservation: the `_trash` area is not AI-writable.
 mod removed_area;
+/// G1: `<home>` state, evidence and yardsticks are not agent-writable
+/// (both lanes), and the untrusted caller is refused alike on both lanes.
+mod home_state;
+/// Own `agent.toml` sections that security gates read (agent callers only).
+mod agent_security;
+/// G1 round 2: the Bash `<home>` rule judges command positions.
+mod bash_rules;
+/// G1 round 2: the Write/Edit lane resolves symbolic links (Unix only).
+mod symlinks;
+/// G1 round 3: regressions of the positional Bash reading, allow-list freeze.
+mod bash_round3;
+/// G1 round 4: fd-duplication boundary, strict unknown commands, short read-only list.
+mod bash_round4;
+/// G1 round 5: braced home variables, `--exec=` actions, dangling-link message path.
+mod bash_round5;
 
 // ── O9: the frozen-field table itself ───────────────────────────
 //
@@ -107,6 +132,25 @@ fn frozen_table_covers_every_exported_constant() {
         .collect();
     assert_eq!(table_keys, vec![AGENT_CAPABILITY_SECTION]);
 
+    // G1 round 3: one allow-list row carries the editable sections.
+    let all_except: Vec<&[&str]> = FROZEN_FIELDS
+        .iter()
+        .filter_map(|f| match f.shape {
+            FrozenShape::AllSectionsExcept { editable } => Some(editable),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(all_except, vec![AGENT_EDITABLE_SECTIONS]);
+
+    let value_keys: Vec<(&str, &[&str])> = FROZEN_FIELDS
+        .iter()
+        .filter_map(|f| match f.shape {
+            FrozenShape::ValueKeys { section, keys } => Some((section, keys)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(value_keys, AGENT_SECURITY_KEYS.to_vec());
+
     let whole: Vec<&str> = FROZEN_FIELDS
         .iter()
         .filter_map(|f| match f.shape {
@@ -126,6 +170,20 @@ fn frozen_table_covers_every_exported_constant() {
 #[test]
 fn frozen_table_order_and_coverage_per_file_kind() {
     use rules::{frozen_for, FrozenVerdict};
+
+    // G1 rows are agent-caller-only and come after the WP21 rows.
+    let with_agent_rows: Vec<FrozenVerdict> =
+        rules::frozen_for_caller(ProtectedTomlKind::AgentToml, true)
+            .map(|f| f.verdict)
+            .collect();
+    assert_eq!(&with_agent_rows[..2], &[FrozenVerdict::OrgField, FrozenVerdict::ProtectedField]);
+    assert!(with_agent_rows[2..]
+        .iter()
+        .all(|v| *v == FrozenVerdict::AgentSecuritySection));
+    assert_eq!(
+        with_agent_rows.len(),
+        2 + 1 + AGENT_SECURITY_KEYS.len()
+    );
 
     let agent: Vec<FrozenVerdict> = frozen_for(ProtectedTomlKind::AgentToml)
         .map(|f| f.verdict)

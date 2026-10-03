@@ -1,24 +1,24 @@
 use super::*;
 
-/// Update one or more fields in an existing agent's agent.toml.
-///
-/// Reads the current config, applies the requested changes, and writes back.
-/// Uses `toml::to_string_pretty` for consistent formatting.
-///
-/// `caller` is the MCP caller identity (`get_default_agent`); WP21 C4 uses it to
-/// gate `reports_to` re-parenting.
-///
-/// WP21 debt ⑥ — the C4 gate used to sit *inside* the `reports_to` branch only,
-/// which left the rest of the tool wide open: the same call could flip another
-/// department's agent to `status = "terminated"`, repoint its `model`, zero its
-/// budget or rewrite its heartbeat schedule without ever touching `reports_to`.
-/// Owning a node's settings is the same authority as owning its position in the
-/// tree, so `check_org_subject_allowed` ("whose settings may I touch?") is now a
-/// front gate over **every** field. Editing yourself stays free (the helper
-/// short-circuits on `node == caller`), as do system senders and the `open`
-/// policy escape hatch; changing your *own* `reports_to` still additionally
-/// needs the placement check below, which is the half this front gate does not
-/// cover.
+// Update one or more fields in an existing agent's agent.toml.
+//
+// Reads the current config, applies the requested changes, and writes back.
+// Uses `toml::to_string_pretty` for consistent formatting.
+//
+// `caller` is the MCP caller identity (`RecordActor::id`); WP21 C4 uses it to
+// gate `reports_to` re-parenting.
+//
+// WP21 debt ⑥ — the C4 gate used to sit *inside* the `reports_to` branch only,
+// which left the rest of the tool wide open: the same call could flip another
+// department's agent to `status = "terminated"`, repoint its `model`, zero its
+// budget or rewrite its heartbeat schedule without ever touching `reports_to`.
+// Owning a node's settings is the same authority as owning its position in the
+// tree, so `check_org_subject_allowed` ("whose settings may I touch?") is now a
+// front gate over **every** field. Editing yourself stays free (the helper
+// short-circuits on `node == caller`), as do system senders and the `open`
+// policy escape hatch; changing your *own* `reports_to` still additionally
+// needs the placement check below, which is the half this front gate does not
+// cover.
 /// Render a source-id list the way it reads in `agent.toml`.
 pub(crate) fn render_db_source_list(ids: &[String]) -> String {
     format!(
@@ -132,7 +132,44 @@ pub(crate) fn canonicalize_db_source_ids(
     Ok(out)
 }
 
-pub(crate) async fn handle_agent_update(params: &Value, home_dir: &Path, caller: &str) -> Value {
+/// `agent_update` parameters that change an employee's authority: the MCP
+/// counterparts of the keys the dashboard's `agents.update` treats as
+/// admin-only (`AUTHORITY_KEYS` in `duduclaw-gateway/src/handlers/
+/// agents_update_v168.rs`: `[agent] reports_to`, all of `[capabilities]` —
+/// here the `db_sources*` grant params), plus the budget and `[agent] role`
+/// (`role = "main"` is what the shared-wiki delete check and the
+/// dispatcher's `default` alias read as the main agent). An AI employee may
+/// not send any of these about itself.
+pub(crate) const SELF_AUTHORITY_PARAMS: &[&str] = &[
+    "reports_to",
+    "db_sources",
+    "db_sources_add",
+    "db_sources_remove",
+    "budget_cents",
+    "role",
+];
+
+/// Update one or more fields of an existing agent's `agent.toml` (see the
+/// notes at the top of this file for the org gate).
+///
+/// Self-edit authority guard: when an AI-employee caller targets itself, any
+/// [`SELF_AUTHORITY_PARAMS`] key refuses the whole call and is audited as
+/// `agent_authority_refused` — the org gate's `node == caller` short-circuit
+/// would otherwise let an employee grant itself a database source, raise its
+/// own budget or re-parent itself. Operators are not restricted; editing a
+/// subordinate is unchanged.
+pub(crate) async fn handle_agent_update(
+    params: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
+    let caller = actor.id();
+    if let Err(reason) = check_actor_identity(home_dir, actor, "", "agent_update") {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: {reason}")}],
+            "isError": true
+        });
+    }
     let agent_id = params
         .get("agent_id")
         .and_then(|v| v.as_str())
@@ -170,6 +207,37 @@ pub(crate) async fn handle_agent_update(params: &Value, home_dir: &Path, caller:
             "content": [{"type": "text", "text": format!("Error: {reason}")}],
             "isError": true
         });
+    }
+
+    if let Some(me) = actor.agent() {
+        let is_self = agent_id == me.trim();
+        let keys: Vec<&str> = SELF_AUTHORITY_PARAMS
+            .iter()
+            .copied()
+            .filter(|k| params.get(*k).is_some())
+            .collect();
+        if is_self && !keys.is_empty() {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                home_dir,
+                me,
+                "agent_authority_refused",
+                &format!("agent_update: '{agent_id}' may not change its own {}", keys.join(", ")),
+                false,
+                &[
+                    ("agent", serde_json::json!(agent_id)),
+                    ("keys", serde_json::json!(keys)),
+                    ("source", serde_json::json!("mcp.agent_update")),
+                    ("reason", serde_json::json!("self_authority_change")),
+                ],
+            );
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Error: 不能調整自己的權限類設定（{}），未做任何變更。這些設定只能由主管（委派政策允許的上級）或操作者在儀表板調整。",
+                    keys.join("、")
+                )}],
+                "isError": true
+            });
+        }
     }
 
     let agent_dir = home_dir.join("agents").join(agent_id);

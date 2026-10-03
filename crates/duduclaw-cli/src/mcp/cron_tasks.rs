@@ -262,6 +262,71 @@ pub(crate) fn cron_created_receipt(name: &str, cron: &str, timezone: Option<&str
 
 // ── Cron task management handlers ─────────────────────────────
 
+/// The agent a cron row runs as — the record's owner. `"default"` is the
+/// scheduler's alias for the main agent, resolved the same way
+/// `schedule_task` resolves it at creation.
+pub(crate) async fn cron_row_owner(home_dir: &Path, row: &duduclaw_gateway::cron_store::CronTaskRow) -> String {
+    if row.agent_id == "default" {
+        resolve_main_agent_name(home_dir).await
+    } else {
+        row.agent_id.clone()
+    }
+}
+
+/// Resolve the one cron row an `id` / `name` addresses (id wins, like the
+/// update path always did; a name shared by several rows is refused with the
+/// candidate ids) and check that `actor` may change or trigger it
+/// ([`check_record_change_allowed`] against the row's owner). Callers act on
+/// the returned row's id.
+pub(crate) async fn resolve_owned_cron_row(
+    store: &duduclaw_gateway::cron_store::CronStore,
+    home_dir: &Path,
+    params: &Value,
+    actor: RecordActor<'_>,
+    tool: &str,
+) -> std::result::Result<duduclaw_gateway::cron_store::CronTaskRow, Value> {
+    let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if id.is_empty() && name.is_empty() {
+        return Err(tool_error("Either 'id' or 'name' is required"));
+    }
+    let row = if !id.is_empty() {
+        match store.get(id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return Err(tool_error(&format!("Cron task not found: {id}"))),
+            Err(e) => return Err(tool_error(&format!("lookup cron task: {e}"))),
+        }
+    } else {
+        // Names are not unique in the store. Acting on "the first row with
+        // this name" would let a caller aim at a row it cannot see the owner
+        // of, so an ambiguous name is refused with the candidate ids.
+        let mut rows: Vec<_> = match store.list_all().await {
+            Ok(all) => all.into_iter().filter(|r| r.name == name).collect(),
+            Err(e) => return Err(tool_error(&format!("lookup cron task: {e}"))),
+        };
+        match rows.len() {
+            0 => return Err(tool_error(&format!("Cron task not found: {name}"))),
+            1 => rows.remove(0),
+            n => {
+                let ids: Vec<String> = rows
+                    .iter()
+                    .map(|r| format!("{} (agent: {})", r.id, r.agent_id))
+                    .collect();
+                return Err(tool_error(&format!(
+                    "{n} cron tasks are named '{name}'; nothing was changed. Call {tool} again \
+                     with `id` set to one of: {}",
+                    ids.join(", ")
+                )));
+            }
+        }
+    };
+    let owner = cron_row_owner(home_dir, &row).await;
+    check_record_change_allowed(home_dir, actor, &owner, tool, RecordKind::Cron)
+        .await
+        .map_err(|reason| tool_error(&reason))?;
+    Ok(row)
+}
+
 /// List cron tasks, optionally filtered by agent_id and enabled status.
 ///
 /// When `agent_id` is omitted, returns ALL tasks (not just the calling agent's).
@@ -348,7 +413,16 @@ pub(crate) async fn handle_list_cron_tasks(params: &Value, home_dir: &Path, _def
 }
 
 /// Update an existing cron task by ID or name. Only provided fields are changed.
-pub(crate) async fn handle_update_cron_task(params: &Value, home_dir: &Path) -> Value {
+///
+/// The row's owner (`agent_id`, which this tool cannot change) must be the
+/// caller or someone the caller may delegate to — the same predicate
+/// `schedule_task` applies at creation, so rewriting another employee's
+/// prompt cannot launder what creating it would have refused.
+pub(crate) async fn handle_update_cron_task(
+    params: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
     use duduclaw_gateway::cron_store::CronStore;
 
     let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -363,20 +437,12 @@ pub(crate) async fn handle_update_cron_task(params: &Value, home_dir: &Path) -> 
         Err(e) => return tool_error(&format!("open cron store: {e}")),
     };
 
-    // Resolve the existing row.
-    let existing = if !id.is_empty() {
-        store.get(id).await
-    } else {
-        store.get_by_name(name).await
-    };
-    let existing = match existing {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            let key = if !id.is_empty() { id } else { name };
-            return tool_error(&format!("Cron task not found: {key}"));
-        }
-        Err(e) => return tool_error(&format!("lookup cron task: {e}")),
-    };
+    // Resolve the existing row and check the caller may change it.
+    let existing =
+        match resolve_owned_cron_row(&store, home_dir, params, actor, "update_cron_task").await {
+            Ok(row) => row,
+            Err(refusal) => return refusal,
+        };
 
     // Merge provided fields over existing values.
     let new_name = params
@@ -424,7 +490,14 @@ pub(crate) async fn handle_update_cron_task(params: &Value, home_dir: &Path) -> 
 }
 
 /// Delete a cron task by ID or name.
-pub(crate) async fn handle_delete_cron_task(params: &Value, home_dir: &Path) -> Value {
+///
+/// Resolves exactly one row (id first, then a unique name) and deletes that
+/// row by id after the owner check.
+pub(crate) async fn handle_delete_cron_task(
+    params: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
     use duduclaw_gateway::cron_store::CronStore;
 
     let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -439,29 +512,28 @@ pub(crate) async fn handle_delete_cron_task(params: &Value, home_dir: &Path) -> 
         Err(e) => return tool_error(&format!("open cron store: {e}")),
     };
 
-    let deleted = if !id.is_empty() {
-        store.delete(id).await
-    } else {
-        store.delete_by_name(name).await
+    let row = match resolve_owned_cron_row(&store, home_dir, params, actor, "delete_cron_task").await
+    {
+        Ok(row) => row,
+        Err(refusal) => return refusal,
     };
+    let key = if !id.is_empty() { id } else { name };
 
-    match deleted {
-        Ok(true) => {
-            let key = if !id.is_empty() { id } else { name };
-            serde_json::json!({
-                "content": [{"type": "text", "text": format!("Cron task '{key}' deleted.")}]
-            })
-        }
-        Ok(false) => {
-            let key = if !id.is_empty() { id } else { name };
-            tool_error(&format!("Cron task not found: {key}"))
-        }
+    match store.delete(&row.id).await {
+        Ok(true) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Cron task '{key}' deleted.")}]
+        }),
+        Ok(false) => tool_error(&format!("Cron task not found: {key}")),
         Err(e) => tool_error(&format!("delete cron task: {e}")),
     }
 }
 
-/// Pause or resume a cron task by ID or name.
-pub(crate) async fn handle_pause_cron_task(params: &Value, home_dir: &Path) -> Value {
+/// Pause or resume a cron task by ID or name (one resolved row, owner-checked).
+pub(crate) async fn handle_pause_cron_task(
+    params: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
     use duduclaw_gateway::cron_store::CronStore;
 
     let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -486,24 +558,18 @@ pub(crate) async fn handle_pause_cron_task(params: &Value, home_dir: &Path) -> V
         Err(e) => return tool_error(&format!("open cron store: {e}")),
     };
 
-    let changed = if !id.is_empty() {
-        store.set_enabled(id, enabled).await
-    } else {
-        store.set_enabled_by_name(name, enabled).await
+    let row = match resolve_owned_cron_row(&store, home_dir, params, actor, "pause_cron_task").await {
+        Ok(row) => row,
+        Err(refusal) => return refusal,
     };
+    let key = if !id.is_empty() { id } else { name };
 
     let action = if enabled { "resumed" } else { "paused" };
-    match changed {
-        Ok(true) => {
-            let key = if !id.is_empty() { id } else { name };
-            serde_json::json!({
-                "content": [{"type": "text", "text": format!("Cron task '{key}' {action}.")}]
-            })
-        }
-        Ok(false) => {
-            let key = if !id.is_empty() { id } else { name };
-            tool_error(&format!("Cron task not found: {key}"))
-        }
+    match store.set_enabled(&row.id, enabled).await {
+        Ok(true) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Cron task '{key}' {action}.")}]
+        }),
+        Ok(false) => tool_error(&format!("Cron task not found: {key}")),
         Err(e) => tool_error(&format!("{action} cron task: {e}")),
     }
 }
@@ -514,19 +580,27 @@ pub(crate) async fn handle_pause_cron_task(params: &Value, home_dir: &Path) -> V
 /// name. Delegates to the gateway's standalone runner which drives the SAME
 /// dispatch path a scheduled fire uses (trigger gate + execute + run history),
 /// blocking until the run completes and returning the recorded outcome.
-pub(crate) async fn handle_run_cron_task(params: &Value, home_dir: &Path) -> Value {
-    let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-
-    let key = if !id.is_empty() {
-        id
-    } else if !name.is_empty() {
-        name
-    } else {
-        return tool_error("Either 'id' or 'name' is required");
+///
+/// The run fires the row as its owner, so triggering another employee's
+/// routine needs the same owner check as changing it; the resolved row is run
+/// by id.
+pub(crate) async fn handle_run_cron_task(
+    params: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
+    let store = match duduclaw_gateway::cron_store::CronStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open cron store: {e}")),
     };
+    let row = match resolve_owned_cron_row(&store, home_dir, params, actor, "run_cron_task").await {
+        Ok(row) => row,
+        Err(refusal) => return refusal,
+    };
+    // Release the store before the (long, blocking) run opens its own.
+    drop(store);
 
-    match duduclaw_gateway::cron_scheduler::run_cron_task_now_standalone(home_dir, key).await {
+    match duduclaw_gateway::cron_scheduler::run_cron_task_now_standalone(home_dir, &row.id).await {
         Ok(summary) => serde_json::json!({
             "content": [{"type": "text", "text": summary}]
         }),

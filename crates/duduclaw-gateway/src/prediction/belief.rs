@@ -16,9 +16,20 @@
 //!   agent's own recollection (Honest Lying, arXiv:2605.29463 — freely
 //!   reflecting agents score ~0% on catching their own past errors;
 //!   programmatic extraction scores 86%).
-//! - §0-3: small-sample discipline — `n_settled < `[`MIN_SETTLED_FOR_STATS`]
+//! - §0-3: small-sample discipline — `n_verified < `[`MIN_SETTLED_FOR_STATS`]
 //!   (30) yields counts only in [`stats`]: no Wilson bound, no mean Brier, no
-//!   overconfidence figure, and [`BeliefStats::insufficient_samples`] is set.
+//!   overconfidence figure, and [`BeliefStats::calibration_status`] is not `calibrated`.
+//! - Verified vs self-reported (fixed after v1.68.1): only a settlement whose
+//!   `settle_source` is exactly [`SETTLE_SOURCE_TICK_VERIFIED`] counts toward
+//!   any calibration figure. Every other value (the
+//!   [`SETTLE_SOURCE_UNVERIFIED`] self-report, an unknown string, NULL on a
+//!   legacy row) is a self-report and is counted separately. NOTE: as of
+//!   this version NOTHING in production supplies a `tick_price` to
+//!   [`settle`] (the `belief_settle` MCP tool, its only non-test caller,
+//!   passes `None` and the MCP process has no TickHub access), so in a real
+//!   deployment every settlement is a self-report and calibration reads
+//!   "no verified settlements" until a gateway-side verified settle path
+//!   exists.
 //! - §0-5: the realized-value cross-check against a caller-supplied
 //!   `tick_price` is a hard deterministic gate — divergence beyond
 //!   [`TICK_CROSS_CHECK_TOLERANCE_PCT`] refuses settlement outright. Never an
@@ -52,6 +63,22 @@ use super::calibration::{rps3, wilson_bounds};
 /// Below this many settled observations, [`stats`] returns counts only —
 /// design §0-3 / §2: "settled < 30 筆只展示計數,不做任何自動化決策".
 pub const MIN_SETTLED_FOR_STATS: u64 = 30;
+
+/// `settle_source` written when the caller-supplied `tick_price` agreed with
+/// `realized_value` within tolerance — the ONLY value that counts as a
+/// cross-checked (verified) settlement.
+pub const SETTLE_SOURCE_TICK_VERIFIED: &str = "agent+tick_verified";
+
+/// `settle_source` written when no usable `tick_price` was supplied: the
+/// agent's own report of the realized value, never checked by the platform.
+pub const SETTLE_SOURCE_UNVERIFIED: &str = "agent_unverified";
+
+/// Whether a stored `settle_source` marks a cross-checked settlement. Exact
+/// equality with [`SETTLE_SOURCE_TICK_VERIFIED`]; `None` (legacy rows), the
+/// empty string and any unknown value are all unverified (fail closed).
+pub fn is_verified_source(settle_source: Option<&str>) -> bool {
+    settle_source == Some(SETTLE_SOURCE_TICK_VERIFIED)
+}
 
 /// Two-sided 95% critical value for the Wilson interval on hit rate. Same
 /// value `rule_gate::DEFAULT_BASE_Z` uses for the held-out gate; kept as an
@@ -189,34 +216,98 @@ pub struct BeliefRow {
     pub source_goal_id: Option<String>,
 }
 
-/// Per-subject breakdown within [`BeliefStats`]. Raw counts only — no
-/// per-subject Wilson bound (subject-level N is typically far below
+impl BeliefRow {
+    /// True only for a settled row whose `settle_source` is a cross-checked
+    /// one ([`is_verified_source`]).
+    pub fn is_verified_settlement(&self) -> bool {
+        self.settled_at.is_some() && is_verified_source(self.settle_source.as_deref())
+    }
+}
+
+/// Verified (cross-checked) settlements of one subject. Raw counts only —
+/// no per-subject Wilson bound (subject-level N is typically far below
 /// [`MIN_SETTLED_FOR_STATS`], so a bound there would invite exactly the
 /// small-sample overreach §0-3 forbids at the aggregate level).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct SubjectStat {
-    pub subject: String,
-    pub n_settled: u64,
+pub struct SubjectVerified {
+    pub n: u64,
     pub hits: u64,
+    /// `None` when `n == 0`.
     pub mean_brier: Option<f64>,
 }
 
-/// Per-agent calibration summary (design §3 WP1 "stats 輸出"). Honest
-/// three-state posture: below [`MIN_SETTLED_FOR_STATS`],
-/// `insufficient_samples = true` and every derived statistic is `None` —
-/// only the raw counts are ever shown at small N (§0-3).
+/// Self-reported (unverified) settlements of one subject: a count, nothing
+/// that could be read as a score.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SubjectSelfReported {
+    pub n: u64,
+}
+
+/// Per-subject breakdown within [`BeliefStats`], split into the verified and
+/// self-reported blocks. Proportions must use `verified.n` as denominator.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SubjectStat {
+    pub subject: String,
+    pub verified: SubjectVerified,
+    pub self_reported: SubjectSelfReported,
+}
+
+/// Whether [`BeliefStats`] carries calibration figures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalibrationStatus {
+    /// Zero verified settlements — nothing calibrated exists. Every
+    /// calibration field is `None`; this is not a score of 0 or 1.
+    NoVerifiedSettlements,
+    /// 1..[`MIN_SETTLED_FOR_STATS`] verified settlements: counts only.
+    InsufficientSamples,
+    /// At least [`MIN_SETTLED_FOR_STATS`] verified settlements.
+    Calibrated,
+}
+
+/// Calibration figures over VERIFIED settlements only. Below
+/// [`MIN_SETTLED_FOR_STATS`] verified rows only the counts (`n`, `hits`) are
+/// filled; every derived figure is `None` (§0-3).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VerifiedStats {
+    pub n: u64,
+    pub hits: u64,
+    /// `None` unless `calibration_status == Calibrated`.
+    pub hit_rate: Option<f64>,
+    /// Wilson 95% lower bound; same gating as `hit_rate`.
+    pub hit_rate_wilson_low: Option<f64>,
+    /// Mean three-way score; same gating.
+    pub mean_brier: Option<f64>,
+    /// `mean(prob) - hit_rate`: positive means the agent's stated confidence
+    /// systematically outruns its actual hit rate; same gating.
+    pub overconfidence: Option<f64>,
+}
+
+/// The agent's own unverified settlements (includes legacy rows with a
+/// missing/empty/unknown `settle_source`). NOT calibration.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SelfReportedStats {
+    pub n: u64,
+    /// DESCRIPTIVE ONLY: share of these rows the agent reported as hits.
+    /// `None` when `n == 0`. Never gated by sample size because it is never
+    /// presented as a result.
+    pub hit_rate: Option<f64>,
+}
+
+/// Per-agent summary (design §3 WP1 "stats 輸出"). Calibration lives only in
+/// `verified`; `self_reported` is a count plus a descriptive rate. There are
+/// deliberately no flat calibration fields, so a reader written against the
+/// pre-split shape fails to type-check instead of showing a wrong rate.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BeliefStats {
     pub agent_id: String,
-    pub n_total: u64,
-    pub n_settled: u64,
-    pub insufficient_samples: bool,
-    pub hit_rate: Option<f64>,
-    pub hit_rate_wilson_low: Option<f64>,
-    pub mean_brier: Option<f64>,
-    /// `mean(prob) - hit_rate` over settled rows: positive means the agent's
-    /// stated confidence systematically outruns its actual hit rate.
-    pub overconfidence: Option<f64>,
+    /// Every belief the agent has submitted, settled or not.
+    pub n_submitted: u64,
+    /// Every settled belief: `verified.n + self_reported.n`.
+    pub n_settled_all: u64,
+    pub calibration_status: CalibrationStatus,
+    pub verified: VerifiedStats,
+    pub self_reported: SelfReportedStats,
     pub per_subject: Vec<SubjectStat>,
 }
 
@@ -456,6 +547,10 @@ pub fn submit(db_path: &Path, b: NewBelief) -> Result<String, String> {
 
 /// Settle a belief against a realized outcome (design §2 "結算規則").
 ///
+/// Only a settlement that passes a `tick_price` cross-check is recorded as
+/// [`SETTLE_SOURCE_TICK_VERIFIED`] and counts toward [`stats`] calibration;
+/// without one it is [`SETTLE_SOURCE_UNVERIFIED`], a self-report.
+///
 /// Deterministic pipeline, zero LLM (§0-1):
 /// 1. Look up the belief **scoped to `agent_id`** — a caller can only ever
 ///    settle its own beliefs, and a not-found/wrong-agent id gets the same
@@ -564,11 +659,11 @@ pub fn settle(
                      settlement refused"
                 ));
             }
-            "agent+tick_verified"
+            SETTLE_SOURCE_TICK_VERIFIED
         }
         // No tick data, or a malformed value that can't be trusted as a
         // cross-check basis — either way this is an unverified self-report.
-        _ => "agent_unverified",
+        _ => SETTLE_SOURCE_UNVERIFIED,
     };
 
     let settled_at = Utc::now().to_rfc3339();
@@ -631,18 +726,28 @@ pub fn recent(db_path: &Path, agent: Option<&str>, limit: usize) -> Vec<BeliefRo
 }
 
 /// Per-agent calibration summary (design §3 WP1). Fail-open: any db/query
-/// failure yields the all-zero, `insufficient_samples = true` shape — same
+/// failure yields the all-zero, `no_verified_settlements` shape — same
 /// posture as [`recent`], never an error to the caller.
+///
+/// Calibration figures use verified settlements only (see [`BeliefStats`]).
 pub fn stats(db_path: &Path, agent: &str) -> BeliefStats {
     let empty = || BeliefStats {
         agent_id: agent.to_string(),
-        n_total: 0,
-        n_settled: 0,
-        insufficient_samples: true,
-        hit_rate: None,
-        hit_rate_wilson_low: None,
-        mean_brier: None,
-        overconfidence: None,
+        n_submitted: 0,
+        n_settled_all: 0,
+        calibration_status: CalibrationStatus::NoVerifiedSettlements,
+        verified: VerifiedStats {
+            n: 0,
+            hits: 0,
+            hit_rate: None,
+            hit_rate_wilson_low: None,
+            mean_brier: None,
+            overconfidence: None,
+        },
+        self_reported: SelfReportedStats {
+            n: 0,
+            hit_rate: None,
+        },
         per_subject: Vec::new(),
     };
     let Ok(conn) = open_conn(db_path) else {
@@ -657,65 +762,105 @@ pub fn stats(db_path: &Path, agent: &str) -> BeliefStats {
         )
         .unwrap_or(0);
 
+    // A NULL/empty/unknown `settle_source` never equals the verified literal,
+    // so legacy rows fall on the self-reported side.
     let settled_agg = conn
         .query_row(
             "SELECT COUNT(*),
-                    SUM(CASE WHEN outcome = 'hit' THEN 1 ELSE 0 END),
-                    AVG(brier),
-                    AVG(prob)
+                    SUM(CASE WHEN COALESCE(settle_source, '') = ?2 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN COALESCE(settle_source, '') = ?2 AND outcome = 'hit' THEN 1 ELSE 0 END),
+                    AVG(CASE WHEN COALESCE(settle_source, '') = ?2 THEN brier END),
+                    AVG(CASE WHEN COALESCE(settle_source, '') = ?2 THEN prob END),
+                    SUM(CASE WHEN COALESCE(settle_source, '') <> ?2 AND outcome = 'hit' THEN 1 ELSE 0 END)
              FROM belief_log
              WHERE agent_id = ?1 AND settled_at IS NOT NULL",
-            params![agent],
+            params![agent, SETTLE_SOURCE_TICK_VERIFIED],
             |r| {
                 let n: i64 = r.get(0)?;
-                let hits: Option<i64> = r.get(1)?;
-                let mean_brier: Option<f64> = r.get(2)?;
-                let mean_prob: Option<f64> = r.get(3)?;
-                Ok((n, hits.unwrap_or(0), mean_brier, mean_prob))
+                let n_verified: Option<i64> = r.get(1)?;
+                let hits: Option<i64> = r.get(2)?;
+                let mean_brier: Option<f64> = r.get(3)?;
+                let mean_prob: Option<f64> = r.get(4)?;
+                let self_hits: Option<i64> = r.get(5)?;
+                Ok((
+                    n,
+                    n_verified.unwrap_or(0),
+                    hits.unwrap_or(0),
+                    mean_brier,
+                    mean_prob,
+                    self_hits.unwrap_or(0),
+                ))
             },
         )
         .optional()
         .unwrap_or(None);
 
-    let Some((n_settled, hits, mean_brier_raw, mean_prob_raw)) = settled_agg else {
+    let Some((n_settled, n_verified, hits, mean_brier_raw, mean_prob_raw, self_hits)) =
+        settled_agg
+    else {
         return empty();
     };
 
     let per_subject = subject_breakdown(&conn, agent);
     let n_settled_u64 = n_settled.max(0) as u64;
-    let n_total_u64 = n_total.max(0) as u64;
+    let n_verified_u64 = (n_verified.max(0) as u64).min(n_settled_u64);
+    let n_self_u64 = n_settled_u64 - n_verified_u64;
+    let hits_u64 = (hits.max(0) as u64).min(n_verified_u64);
+    let self_reported = SelfReportedStats {
+        n: n_self_u64,
+        hit_rate: if n_self_u64 > 0 {
+            Some(self_hits.max(0) as f64 / n_self_u64 as f64)
+        } else {
+            None
+        },
+    };
+    let n_submitted = n_total.max(0) as u64;
 
-    if n_settled_u64 < MIN_SETTLED_FOR_STATS {
+    if n_verified_u64 < MIN_SETTLED_FOR_STATS {
         return BeliefStats {
             agent_id: agent.to_string(),
-            n_total: n_total_u64,
-            n_settled: n_settled_u64,
-            insufficient_samples: true,
-            hit_rate: None,
-            hit_rate_wilson_low: None,
-            mean_brier: None,
-            overconfidence: None,
+            n_submitted,
+            n_settled_all: n_settled_u64,
+            calibration_status: if n_verified_u64 == 0 {
+                CalibrationStatus::NoVerifiedSettlements
+            } else {
+                CalibrationStatus::InsufficientSamples
+            },
+            verified: VerifiedStats {
+                n: n_verified_u64,
+                hits: hits_u64,
+                hit_rate: None,
+                hit_rate_wilson_low: None,
+                mean_brier: None,
+                overconfidence: None,
+            },
+            self_reported,
             per_subject,
         };
     }
 
-    let hit_rate = hits.max(0) as f64 / n_settled as f64;
-    let (wilson_lo, _) = wilson_bounds(hits.max(0) as u64, n_settled_u64, WILSON_Z);
+    let hit_rate = hits_u64 as f64 / n_verified_u64 as f64;
+    let (wilson_lo, _) = wilson_bounds(hits_u64, n_verified_u64, WILSON_Z);
     let overconfidence = mean_prob_raw.map(|mp| mp - hit_rate);
 
     BeliefStats {
         agent_id: agent.to_string(),
-        n_total: n_total_u64,
-        n_settled: n_settled_u64,
-        insufficient_samples: false,
-        hit_rate: Some(hit_rate),
-        hit_rate_wilson_low: if wilson_lo.is_nan() {
-            None
-        } else {
-            Some(wilson_lo)
+        n_submitted,
+        n_settled_all: n_settled_u64,
+        calibration_status: CalibrationStatus::Calibrated,
+        verified: VerifiedStats {
+            n: n_verified_u64,
+            hits: hits_u64,
+            hit_rate: Some(hit_rate),
+            hit_rate_wilson_low: if wilson_lo.is_nan() {
+                None
+            } else {
+                Some(wilson_lo)
+            },
+            mean_brier: mean_brier_raw,
+            overconfidence,
         },
-        mean_brier: mean_brier_raw,
-        overconfidence,
+        self_reported,
         per_subject,
     }
 }
@@ -723,22 +868,33 @@ pub fn stats(db_path: &Path, agent: &str) -> BeliefStats {
 fn subject_breakdown(conn: &Connection, agent: &str) -> Vec<SubjectStat> {
     let query = || -> rusqlite::Result<Vec<SubjectStat>> {
         let mut stmt = conn.prepare(
-            "SELECT subject, COUNT(*), SUM(CASE WHEN outcome = 'hit' THEN 1 ELSE 0 END), AVG(brier)
+            "SELECT subject, COUNT(*),
+                    SUM(CASE WHEN COALESCE(settle_source, '') = ?2 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN COALESCE(settle_source, '') = ?2 AND outcome = 'hit' THEN 1 ELSE 0 END),
+                    AVG(CASE WHEN COALESCE(settle_source, '') = ?2 THEN brier END)
              FROM belief_log
              WHERE agent_id = ?1 AND settled_at IS NOT NULL
              GROUP BY subject
              ORDER BY subject",
         )?;
-        stmt.query_map(params![agent], |r| {
+        stmt.query_map(params![agent, SETTLE_SOURCE_TICK_VERIFIED], |r| {
             let subject: String = r.get(0)?;
             let n: i64 = r.get(1)?;
-            let hits: Option<i64> = r.get(2)?;
-            let mean_brier: Option<f64> = r.get(3)?;
+            let n_verified: Option<i64> = r.get(2)?;
+            let hits: Option<i64> = r.get(3)?;
+            let mean_brier: Option<f64> = r.get(4)?;
+            let n_settled = n.max(0) as u64;
+            let n_verified = (n_verified.unwrap_or(0).max(0) as u64).min(n_settled);
             Ok(SubjectStat {
                 subject,
-                n_settled: n.max(0) as u64,
-                hits: hits.unwrap_or(0).max(0) as u64,
-                mean_brier,
+                verified: SubjectVerified {
+                    n: n_verified,
+                    hits: (hits.unwrap_or(0).max(0) as u64).min(n_verified),
+                    mean_brier,
+                },
+                self_reported: SubjectSelfReported {
+                    n: n_settled - n_verified,
+                },
             })
         })?
         .collect()
@@ -825,24 +981,42 @@ pub fn unsettled_today(db_path: &Path, agent_id: &str) -> Vec<BeliefRow> {
 
 /// Render the pre-dispatch `## 信念校準（程式化統計，勿自行臆測歷史）`
 /// dispatch-prompt section for a [`stats`] result (design §3 WP3 / §4). `None`
-/// when there is nothing to say yet (`n_settled == 0` — design: "無資料 →
+/// when there is nothing calibrated to say yet (`verified.n == 0` — design: "無資料 →
 /// 零注入"); the caller decides whether to also call [`mark_stats_injected`]
 /// once this actually gets used in a prompt.
+///
+/// Only verified settlements are ever phrased as a calibration result; the
+/// sample-size gate is on `n_verified`. Self-reported settlements are named
+/// as such and never summarised as a score.
 pub fn render_calibration_section(stats: &BeliefStats) -> Option<String> {
-    if stats.n_settled == 0 {
+    // No verified settlement ⇒ nothing calibrated to say ⇒ zero injection.
+    // (The caller stamps `stats_injected` on injection, an experiment flag
+    // that must not be set for a prompt without any calibration figure; the
+    // agent learns a settlement is unverified from the `belief_settle`
+    // response itself.)
+    if stats.verified.n == 0 {
         return None;
     }
-    let body = if stats.insufficient_samples {
+    let self_note = if stats.self_reported.n > 0 {
         format!(
-            "已結算 {} 筆，未達 {MIN_SETTLED_FOR_STATS} 筆統計門檻 — 樣本不足，\
-             目前只提供計數，不做任何命中率或校準判斷。",
-            stats.n_settled
+            "\n另有 {} 筆為你自行回報、未經交叉驗證的結算，不計入以上任何數字。",
+            stats.self_reported.n
         )
     } else {
-        let hit_pct = stats.hit_rate.unwrap_or(f64::NAN) * 100.0;
-        let wilson_pct = stats.hit_rate_wilson_low.unwrap_or(f64::NAN) * 100.0;
-        let brier = stats.mean_brier.unwrap_or(f64::NAN);
-        let overconf = stats.overconfidence.unwrap_or(f64::NAN);
+        String::new()
+    };
+    let body = if stats.calibration_status != CalibrationStatus::Calibrated {
+        format!(
+            "已驗證結算 {} 筆，未達 {MIN_SETTLED_FOR_STATS} 筆統計門檻 — 樣本不足，\
+             目前只提供計數，不做任何命中率或校準判斷。{self_note}",
+            stats.verified.n
+        )
+    } else {
+        let v = &stats.verified;
+        let hit_pct = v.hit_rate.unwrap_or(f64::NAN) * 100.0;
+        let wilson_pct = v.hit_rate_wilson_low.unwrap_or(f64::NAN) * 100.0;
+        let brier = v.mean_brier.unwrap_or(f64::NAN);
+        let overconf = v.overconfidence.unwrap_or(f64::NAN);
         let overconf_note = if overconf > 0.05 {
             "你宣告的信心持續高於實際命中率，宣告機率時應更保守"
         } else if overconf < -0.05 {
@@ -851,12 +1025,12 @@ pub fn render_calibration_section(stats: &BeliefStats) -> Option<String> {
             "宣告信心與實際命中率大致相符"
         };
         format!(
-            "已結算 {n} 筆。\n\
+            "已驗證結算 {n} 筆。\n\
              - 命中率（Wilson 95% 下界，保守估計）：{wilson_pct:.0}%（實際命中率有 95% 信心不低於此值；\
              原始命中率 {hit_pct:.0}%）。\n\
              - 平均校準分數（三向 Brier，範圍 0-1，越低代表方向判斷越準）：{brier:.3}。\n\
-             - 過度自信指標（宣告機率 − 實際命中率）：{overconf:+.2}（{overconf_note}）。",
-            n = stats.n_settled,
+             - 過度自信指標（宣告機率 − 實際命中率）：{overconf:+.2}（{overconf_note}）。{self_note}",
+            n = v.n,
         )
     };
     Some(format!("## 信念校準（程式化統計，勿自行臆測歷史）\n{body}"))
@@ -1065,8 +1239,9 @@ mod tests {
         let missing = std::path::PathBuf::from("/nonexistent/deeply/nested/prediction.db");
         assert!(recent(&missing, Some("trader"), 10).is_empty());
         let s = stats(&missing, "trader");
-        assert!(s.insufficient_samples);
-        assert_eq!(s.n_total, 0);
+        assert_ne!(s.calibration_status, CalibrationStatus::Calibrated);
+        assert_eq!(s.n_submitted, 0);
+        assert_eq!(s.calibration_status, CalibrationStatus::NoVerifiedSettlements);
     }
 
     // ── mark_stats_injected → submit stamping ──
@@ -1257,13 +1432,14 @@ mod tests {
             settle(&db, "trader", &id, 110.0, None).unwrap();
         }
         let s = stats(&db, "trader");
-        assert!(s.insufficient_samples);
-        assert_eq!(s.n_settled, 5);
-        assert_eq!(s.n_total, 5);
-        assert!(s.hit_rate.is_none());
-        assert!(s.hit_rate_wilson_low.is_none());
-        assert!(s.mean_brier.is_none());
-        assert!(s.overconfidence.is_none());
+        assert_ne!(s.calibration_status, CalibrationStatus::Calibrated);
+        assert_eq!(s.n_settled_all, 5);
+        assert_eq!(s.self_reported.n, 5);
+        assert_eq!(s.n_submitted, 5);
+        assert!(s.verified.hit_rate.is_none());
+        assert!(s.verified.hit_rate_wilson_low.is_none());
+        assert!(s.verified.mean_brier.is_none());
+        assert!(s.verified.overconfidence.is_none());
     }
 
     #[test]
@@ -1272,9 +1448,9 @@ mod tests {
         submit(&db, belief("trader", "2317", "up", 0.6, 100.0)).unwrap();
         submit(&db, belief("trader", "TAIEX", "down", 0.6, 18000.0)).unwrap();
         let s = stats(&db, "trader");
-        assert!(s.insufficient_samples);
-        assert_eq!(s.n_total, 2);
-        assert_eq!(s.n_settled, 0);
+        assert_ne!(s.calibration_status, CalibrationStatus::Calibrated);
+        assert_eq!(s.n_submitted, 2);
+        assert_eq!(s.n_settled_all, 0);
         assert!(
             s.per_subject.is_empty(),
             "no settled rows ⇒ no per-subject breakdown"
@@ -1293,48 +1469,163 @@ mod tests {
         // clean expected value (mean(prob) == 0.6 == hit_rate ⇒ 0.0).
         for _ in 0..18 {
             let id = submit(&db, belief("trader", "2317", "up", 0.6, 100.0)).unwrap();
-            settle(&db, "trader", &id, 110.0, None).unwrap();
+            settle(&db, "trader", &id, 110.0, Some(110.0)).unwrap();
         }
         for _ in 0..12 {
             let id = submit(&db, belief("trader", "2317", "up", 0.6, 100.0)).unwrap();
-            settle(&db, "trader", &id, 90.0, None).unwrap();
+            settle(&db, "trader", &id, 90.0, Some(90.0)).unwrap();
         }
 
         let s = stats(&db, "trader");
-        assert!(!s.insufficient_samples);
-        assert_eq!(s.n_settled, 30);
-        assert!((s.hit_rate.unwrap() - 0.6).abs() < 1e-9);
+        assert_eq!(s.calibration_status, CalibrationStatus::Calibrated);
+        assert_eq!(s.calibration_status, CalibrationStatus::Calibrated);
+        assert_eq!(s.n_settled_all, 30);
+        assert_eq!(s.verified.n, 30);
+        assert_eq!(s.self_reported.n, 0);
+        assert!(s.self_reported.hit_rate.is_none());
+        assert!((s.verified.hit_rate.unwrap() - 0.6).abs() < 1e-9);
         // Known Wilson 95% CI lower bound for 18/30 ≈ 0.423 (calibration.rs
         // `wilson_known_value_and_bounds`).
-        assert!((s.hit_rate_wilson_low.unwrap() - 0.423).abs() < 0.01);
-        assert!(s.hit_rate_wilson_low.unwrap() < s.hit_rate.unwrap());
+        assert!((s.verified.hit_rate_wilson_low.unwrap() - 0.423).abs() < 0.01);
+        assert!(s.verified.hit_rate_wilson_low.unwrap() < s.verified.hit_rate.unwrap());
         // hit rows score rps3([0.2,0.2,0.6], up)=0.1; miss rows score
         // rps3([0.2,0.2,0.6], down)=0.5 ⇒ mean = (18*0.1+12*0.5)/30 = 0.26.
-        assert!((s.mean_brier.unwrap() - 0.26).abs() < 1e-9);
-        assert!((s.overconfidence.unwrap() - 0.0).abs() < 1e-9);
+        assert!((s.verified.mean_brier.unwrap() - 0.26).abs() < 1e-9);
+        assert!((s.verified.overconfidence.unwrap() - 0.0).abs() < 1e-9);
     }
 
     #[test]
     fn stats_per_subject_breakdown_only_covers_settled_rows() {
         let (db, _dir) = temp_db();
         let id1 = submit(&db, belief("trader", "2317", "up", 0.6, 100.0)).unwrap();
-        settle(&db, "trader", &id1, 110.0, None).unwrap(); // hit
+        settle(&db, "trader", &id1, 110.0, Some(110.0)).unwrap(); // hit
         let id2 = submit(&db, belief("trader", "2317", "up", 0.6, 100.0)).unwrap();
-        settle(&db, "trader", &id2, 90.0, None).unwrap(); // miss
+        settle(&db, "trader", &id2, 90.0, Some(90.0)).unwrap(); // miss
         let id3 = submit(&db, belief("trader", "TAIEX", "down", 0.6, 18000.0)).unwrap();
-        settle(&db, "trader", &id3, 17000.0, None).unwrap(); // hit
+        settle(&db, "trader", &id3, 17000.0, Some(17000.0)).unwrap(); // hit
         submit(&db, belief("trader", "TAIEX", "down", 0.6, 18000.0)).unwrap(); // unsettled
 
         let s = stats(&db, "trader");
         let by_2317 = s.per_subject.iter().find(|r| r.subject == "2317").unwrap();
-        assert_eq!(by_2317.n_settled, 2);
-        assert_eq!(by_2317.hits, 1);
+        assert_eq!(by_2317.verified.n, 2);
+        assert_eq!(by_2317.verified.hits, 1);
         let by_taiex = s.per_subject.iter().find(|r| r.subject == "TAIEX").unwrap();
         assert_eq!(
-            by_taiex.n_settled, 1,
+            by_taiex.verified.n, 1,
             "the unsettled TAIEX row must not be counted"
         );
-        assert_eq!(by_taiex.hits, 1);
+        assert_eq!(by_taiex.verified.hits, 1);
+    }
+
+    // ── stats: verified vs self-reported split ──
+
+    #[test]
+    fn stats_self_reported_only_has_no_calibration_even_at_31_rows() {
+        let (db, _dir) = temp_db();
+        for _ in 0..31 {
+            let id = submit(&db, belief("trader", "2317", "up", 0.9, 100.0)).unwrap();
+            settle(&db, "trader", &id, 110.0, None).unwrap(); // all "hits"
+        }
+        let s = stats(&db, "trader");
+        assert_eq!(s.n_settled_all, 31);
+        assert_eq!(s.verified.n, 0);
+        assert_eq!(s.self_reported.n, 31);
+        assert_eq!(s.calibration_status, CalibrationStatus::NoVerifiedSettlements);
+        assert_ne!(s.calibration_status, CalibrationStatus::Calibrated);
+        assert!(s.verified.hit_rate.is_none());
+        assert!(s.verified.hit_rate_wilson_low.is_none());
+        assert!(s.verified.mean_brier.is_none());
+        assert!(s.verified.overconfidence.is_none());
+        assert_eq!(s.self_reported.hit_rate, Some(1.0));
+    }
+
+    #[test]
+    fn stats_mixed_calibration_uses_verified_rows_only() {
+        let (db, _dir) = temp_db();
+        // 30 verified: 18 hits / 12 misses. 10 self-reported hits must not
+        // move any calibration figure.
+        for _ in 0..18 {
+            let id = submit(&db, belief("trader", "2317", "up", 0.6, 100.0)).unwrap();
+            settle(&db, "trader", &id, 110.0, Some(110.0)).unwrap();
+        }
+        for _ in 0..12 {
+            let id = submit(&db, belief("trader", "2317", "up", 0.6, 100.0)).unwrap();
+            settle(&db, "trader", &id, 90.0, Some(90.0)).unwrap();
+        }
+        for _ in 0..10 {
+            let id = submit(&db, belief("trader", "2317", "up", 0.99, 100.0)).unwrap();
+            settle(&db, "trader", &id, 110.0, None).unwrap();
+        }
+        let s = stats(&db, "trader");
+        assert_eq!(s.n_settled_all, 40);
+        assert_eq!(s.verified.n, 30);
+        assert_eq!(s.self_reported.n, 10);
+        assert!((s.verified.hit_rate.unwrap() - 0.6).abs() < 1e-9);
+        assert!((s.verified.mean_brier.unwrap() - 0.26).abs() < 1e-9);
+        assert!((s.verified.overconfidence.unwrap() - 0.0).abs() < 1e-9);
+        assert_eq!(s.self_reported.hit_rate, Some(1.0));
+        let subj = &s.per_subject[0];
+        assert_eq!(subj.verified.n, 30);
+        assert_eq!(subj.self_reported.n, 10);
+        assert_eq!(subj.verified.hits, 18);
+    }
+
+    #[test]
+    fn stats_verified_below_min_is_insufficient_not_no_verified() {
+        let (db, _dir) = temp_db();
+        for _ in 0..3 {
+            let id = submit(&db, belief("trader", "2317", "up", 0.6, 100.0)).unwrap();
+            settle(&db, "trader", &id, 110.0, Some(110.0)).unwrap();
+        }
+        let s = stats(&db, "trader");
+        assert_eq!(s.verified.n, 3);
+        assert_eq!(s.calibration_status, CalibrationStatus::InsufficientSamples);
+        assert!(s.verified.hit_rate.is_none());
+    }
+
+    /// Insert a settled row directly with an arbitrary `settle_source`
+    /// (`None` = SQL NULL, as on pre-column legacy rows).
+    fn insert_settled_row(db: &Path, source: Option<&str>) {
+        let conn = open_conn(db).unwrap();
+        conn.execute(
+            "INSERT INTO belief_log
+             (belief_id, agent_id, subject, horizon, direction, prob, ref_value,
+              predicted_at, realized_value, realized_direction, outcome, brier,
+              settled_at, settle_source)
+             VALUES (?1, 'trader', '2317', 'h', 'up', 0.6, 100.0, ?2,
+                     110.0, 'up', 'hit', 0.1, ?2, ?3)",
+            params![uuid::Uuid::new_v4().to_string(), Utc::now().to_rfc3339(), source],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stats_unknown_empty_and_null_settle_source_count_as_unverified() {
+        let (db, _dir) = temp_db();
+        insert_settled_row(&db, Some("agent+tick_verified_v2"));
+        insert_settled_row(&db, Some("tick_verified"));
+        insert_settled_row(&db, Some(""));
+        insert_settled_row(&db, None);
+        insert_settled_row(&db, Some("agent_unverified"));
+        let s = stats(&db, "trader");
+        assert_eq!(s.n_settled_all, 5);
+        assert_eq!(s.verified.n, 0);
+        assert_eq!(s.self_reported.n, 5);
+        assert_eq!(s.calibration_status, CalibrationStatus::NoVerifiedSettlements);
+        // exact match is verified
+        insert_settled_row(&db, Some(SETTLE_SOURCE_TICK_VERIFIED));
+        let s = stats(&db, "trader");
+        assert_eq!(s.verified.n, 1);
+        assert_eq!(s.self_reported.n, 5);
+    }
+
+    #[test]
+    fn is_verified_source_is_exact_equality() {
+        assert!(is_verified_source(Some("agent+tick_verified")));
+        assert!(!is_verified_source(Some("agent+tick_verified ")));
+        assert!(!is_verified_source(Some("agent_unverified")));
+        assert!(!is_verified_source(Some("")));
+        assert!(!is_verified_source(None));
     }
 
     // ── get_meta / set_meta ──
@@ -1430,30 +1721,45 @@ mod tests {
 
     // ── render_calibration_section ──
 
-    fn stats_fixture(n_settled: u64, insufficient: bool) -> BeliefStats {
+    fn stats_fixture(n_verified: u64, n_self: u64) -> BeliefStats {
+        let calibrated = n_verified >= MIN_SETTLED_FOR_STATS;
         BeliefStats {
             agent_id: "trader".to_string(),
-            n_total: n_settled,
-            n_settled,
-            insufficient_samples: insufficient,
-            hit_rate: if insufficient { None } else { Some(0.6) },
-            hit_rate_wilson_low: if insufficient { None } else { Some(0.42) },
-            mean_brier: if insufficient { None } else { Some(0.26) },
-            overconfidence: if insufficient { None } else { Some(0.0) },
+            n_submitted: n_verified + n_self,
+            n_settled_all: n_verified + n_self,
+            calibration_status: if calibrated {
+                CalibrationStatus::Calibrated
+            } else if n_verified == 0 {
+                CalibrationStatus::NoVerifiedSettlements
+            } else {
+                CalibrationStatus::InsufficientSamples
+            },
+            verified: VerifiedStats {
+                n: n_verified,
+                hits: 0,
+                hit_rate: if calibrated { Some(0.6) } else { None },
+                hit_rate_wilson_low: if calibrated { Some(0.42) } else { None },
+                mean_brier: if calibrated { Some(0.26) } else { None },
+                overconfidence: if calibrated { Some(0.0) } else { None },
+            },
+            self_reported: SelfReportedStats {
+                n: n_self,
+                hit_rate: if n_self > 0 { Some(1.0) } else { None },
+            },
             per_subject: Vec::new(),
         }
     }
 
     #[test]
     fn render_calibration_section_is_none_when_nothing_settled() {
-        assert!(render_calibration_section(&stats_fixture(0, true)).is_none());
+        assert!(render_calibration_section(&stats_fixture(0, 0)).is_none());
     }
 
     #[test]
     fn render_calibration_section_below_min_shows_counts_only() {
-        let section = render_calibration_section(&stats_fixture(5, true)).unwrap();
+        let section = render_calibration_section(&stats_fixture(5, 0)).unwrap();
         assert!(section.starts_with("## 信念校準"));
-        assert!(section.contains('5'));
+        assert!(section.contains("已驗證結算 5 筆"));
         assert!(section.contains("未達"));
         // Must never fabricate a hit rate / Wilson figure at small N.
         assert!(!section.contains("Wilson"));
@@ -1461,11 +1767,29 @@ mod tests {
 
     #[test]
     fn render_calibration_section_at_min_shows_full_stats() {
-        let section = render_calibration_section(&stats_fixture(30, false)).unwrap();
+        let section = render_calibration_section(&stats_fixture(30, 0)).unwrap();
+        assert!(section.contains("已驗證結算 30 筆"));
         assert!(section.contains("Wilson"));
         assert!(section.contains("42%"));
         assert!(section.contains("0.260"));
         assert!(section.contains("+0.00"));
+        assert!(!section.contains("自行回報"), "no self-reported rows ⇒ no note");
+    }
+
+    #[test]
+    fn render_calibration_section_self_reported_only_is_zero_injection() {
+        // Injection would stamp `stats_injected` for a prompt with no
+        // calibration figure at all; the agent learns "unverified" from the
+        // belief_settle response instead.
+        assert!(render_calibration_section(&stats_fixture(0, 31)).is_none());
+    }
+
+    #[test]
+    fn render_calibration_section_mixed_counts_only_verified_and_notes_the_rest() {
+        let section = render_calibration_section(&stats_fixture(30, 7)).unwrap();
+        assert!(section.contains("已驗證結算 30 筆"));
+        assert!(section.contains("另有 7 筆"));
+        assert!(section.contains("不計入"));
     }
 
     // ── render_tick_diff_line / render_tick_diff_section ──

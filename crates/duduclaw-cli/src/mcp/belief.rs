@@ -78,11 +78,12 @@ pub(crate) async fn handle_belief_settle(args: &Value, home_dir: &Path, default_
     let agent = default_agent.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let db_path = home.join("prediction.db");
-        // Cross-check against live tick data happens gateway-side (WP3's
-        // tick-wake hook reads the same table); the MCP server process has
-        // no TickHub access, so tick_price is always None here and
-        // settle_source is honestly recorded as "agent_unverified" rather
-        // than pretending to verify it.
+        // No cross-check happens on this path: the MCP server process has no
+        // TickHub access and no other verified-price source exists, so
+        // tick_price is always None and the settlement is recorded as
+        // "agent_unverified" (a self-report that does not count toward
+        // calibration). Nothing in the gateway settles beliefs against live
+        // data today.
         duduclaw_gateway::prediction::belief::settle(
             &db_path,
             &agent,
@@ -94,7 +95,23 @@ pub(crate) async fn handle_belief_settle(args: &Value, home_dir: &Path, default_
     .await
     .unwrap_or_else(|e| Err(format!("belief_settle join error: {e}")));
     match result {
-        Ok(row) => tool_text(&serde_json::to_string(&row).unwrap_or_else(|_| "{}".to_string())),
+        Ok(row) => {
+            let verified = row.is_verified_settlement();
+            let mut out = serde_json::to_value(&row).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("counts_toward_calibration".into(), verified.into());
+                if !verified {
+                    obj.insert(
+                        "note".into(),
+                        "This settlement is your own unverified report (settle_source \
+                         agent_unverified); it was recorded but does NOT count toward \
+                         calibration statistics."
+                            .into(),
+                    );
+                }
+            }
+            tool_text(&out.to_string())
+        }
         Err(e) => tool_error(&e),
     }
 }
@@ -108,7 +125,20 @@ pub(crate) async fn handle_belief_stats(home_dir: &Path, default_agent: &str) ->
     })
     .await;
     match result {
-        Ok(stats) => tool_text(&serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())),
+        Ok(stats) => {
+            let mut out = serde_json::to_value(&stats).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert(
+                    "note".into(),
+                    "Calibration figures (hit rate, Wilson lower bound, score, overconfidence) \
+                     are under `verified` and count only cross-checked settlements. \
+                     Settlements you reported yourself are under `self_reported`: a count and \
+                     a descriptive rate, NOT calibration."
+                        .into(),
+                );
+            }
+            tool_text(&out.to_string())
+        }
         Err(e) => tool_error(&format!("belief_stats join error: {e}")),
     }
 }

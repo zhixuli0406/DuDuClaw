@@ -1493,30 +1493,68 @@ export interface BeliefRow {
   outcome: string | null;
   brier: number | null;
   settled_at: string | null;
+  /** `agent+tick_verified` = cross-checked; anything else (incl. null on
+   *  legacy rows) is the agent's own unverified report. */
   settle_source: string | null;
   source_goal_id: string | null;
+}
+
+/** Cross-checked settlements of one subject (`BeliefStats.per_subject[].verified`).
+ *  Use `n` as the denominator of any proportion. */
+export interface BeliefSubjectVerified {
+  n: number;
+  hits: number;
+  mean_brier: number | null;
+}
+
+/** Self-reported (unverified) settlements of one subject: a count only. */
+export interface BeliefSubjectSelfReported {
+  n: number;
 }
 
 /** Per-subject rollup inside `BeliefStats.per_subject`. */
 export interface BeliefSubjectStat {
   subject: string;
-  n_settled: number;
-  hits: number;
-  mean_brier: number | null;
+  verified: BeliefSubjectVerified;
+  self_reported: BeliefSubjectSelfReported;
 }
 
-/** Per-agent belief calibration stats (`belief.summary`). n<30
- *  settled ⇒ `insufficient_samples: true` and every derived field is null
- *  (§0-3 small-sample discipline — never dress up a point estimate). */
-export interface BeliefStats {
-  agent_id: string;
-  n_total: number;
-  n_settled: number;
-  insufficient_samples: boolean;
+/** `calibrated` needs >= 30 verified settlements. */
+export type BeliefCalibrationStatus =
+  | 'no_verified_settlements'
+  | 'insufficient_samples'
+  | 'calibrated';
+
+/** Calibration over cross-checked settlements ONLY. `n`/`hits` always
+ *  present; every other field is null unless `calibration_status` is
+ *  `calibrated`. */
+export interface BeliefVerifiedStats {
+  n: number;
+  hits: number;
   hit_rate: number | null;
   hit_rate_wilson_low: number | null;
   mean_brier: number | null;
   overconfidence: number | null;
+}
+
+/** The agent's own unverified settlements. NOT calibration: `hit_rate` is
+ *  descriptive and must not be shown as a score. */
+export interface BeliefSelfReportedStats {
+  n: number;
+  hit_rate: number | null;
+}
+
+/** Per-agent belief stats (`belief.summary`). Calibration lives only under
+ *  `verified`; there are no flat calibration fields on purpose. */
+export interface BeliefStats {
+  agent_id: string;
+  /** Every submitted belief, settled or not. */
+  n_submitted: number;
+  /** Every settled belief: verified.n + self_reported.n. */
+  n_settled_all: number;
+  calibration_status: BeliefCalibrationStatus;
+  verified: BeliefVerifiedStats;
+  self_reported: BeliefSelfReportedStats;
   per_subject: BeliefSubjectStat[];
 }
 

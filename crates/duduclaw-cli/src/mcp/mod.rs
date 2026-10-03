@@ -187,6 +187,7 @@ mod messaging;
 mod notion_github;
 mod odoo;
 mod os_tools;
+mod record_authz;
 mod reminders;
 mod server;
 mod skills;
@@ -237,6 +238,7 @@ pub(crate) use messaging::*;
 pub(crate) use notion_github::*;
 pub(crate) use odoo::*;
 pub(crate) use os_tools::*;
+pub(crate) use record_authz::*;
 pub(crate) use reminders::*;
 pub use server::*;
 pub(crate) use skills::*;
@@ -310,3 +312,9 @@ mod tools_list_budget_tests;
 // ── T5 merged-entry-point regression tests (O3 / O4 / O13) ─────────────────
 #[cfg(test)]
 mod merged_entry_tests;
+// Caller ↔ record relationship checks (tasks / cron / reminders / agent_update).
+#[cfg(test)]
+mod record_authz_tests;
+/// Pre-`RecordActor` handler signatures for the existing tests.
+#[cfg(test)]
+mod caller_shims;

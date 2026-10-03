@@ -1,7 +1,17 @@
 use super::*;
 
 /// Create a one-shot reminder.
-pub(crate) async fn handle_create_reminder(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+///
+/// A reminder fires as its `agent_id` (an `agent_callback` reminder wakes
+/// that employee with the given prompt), so naming another employee needs
+/// [`check_record_change_allowed`] against it — the same relationship
+/// `schedule_task` requires for a recurring wake-up. Omitted `agent_id`
+/// means the caller itself.
+pub(crate) async fn handle_create_reminder(
+    params: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
     use duduclaw_gateway::reminder_scheduler::{
         AppendResult, MAX_FUTURE_DAYS, MAX_MESSAGE_LEN, MAX_PROMPT_LEN, MAX_REMINDERS_PER_AGENT,
         Reminder, ReminderMode, ReminderStatus, append_reminder_checked, is_valid_discord_chat_id,
@@ -20,7 +30,7 @@ pub(crate) async fn handle_create_reminder(params: &Value, home_dir: &Path, defa
     let agent_id = params
         .get("agent_id")
         .and_then(|v| v.as_str())
-        .unwrap_or(default_agent);
+        .unwrap_or(actor.id());
 
     if time_str.is_empty() || channel.is_empty() || chat_id.is_empty() {
         return serde_json::json!({
@@ -33,6 +43,16 @@ pub(crate) async fn handle_create_reminder(params: &Value, home_dir: &Path, defa
     if !duduclaw_core::is_valid_agent_id(agent_id) {
         return serde_json::json!({
             "content": [{"type": "text", "text": "Error: invalid agent_id format"}],
+            "isError": true
+        });
+    }
+
+    if let Err(reason) =
+        check_record_change_allowed(home_dir, actor, agent_id, "create_reminder", RecordKind::Reminder)
+            .await
+    {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: {reason}")}],
             "isError": true
         });
     }

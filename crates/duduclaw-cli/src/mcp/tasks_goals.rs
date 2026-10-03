@@ -1,6 +1,42 @@
 use super::*;
 
-pub(crate) async fn handle_tasks_complete(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+/// The holder rule shared by `tasks_complete` and `tasks_block`: an
+/// AI-employee caller that is neither the task's `claimed_by` nor its
+/// `assigned_to` must pass [`check_record_change_allowed`] against the
+/// assignee (an unassigned, unclaimed task has no owner to authorize against
+/// and is refused — claim it first). `Err` is the ready tool error.
+pub(crate) async fn check_task_holder(
+    store: &duduclaw_gateway::task_store::TaskStore,
+    home_dir: &Path,
+    task_id: &str,
+    actor: RecordActor<'_>,
+    tool: &str,
+) -> std::result::Result<(), Value> {
+    let Some(me) = actor.agent() else {
+        return Ok(());
+    };
+    let task = match store.get_task(task_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return Err(tool_error(&format!("task not found: {task_id}"))),
+        Err(e) => return Err(tool_error(&format!("{tool}: {e}"))),
+    };
+    check_actor_identity(home_dir, actor, &task.assigned_to, tool).map_err(|r| tool_error(&r))?;
+    if task.claimed_by.as_deref() == Some(me) || task.assigned_to == me {
+        return Ok(());
+    }
+    check_record_change_allowed(home_dir, actor, &task.assigned_to, tool, RecordKind::Task)
+        .await
+        .map_err(|reason| tool_error(&reason))
+}
+
+/// Submit a task as done (goal-mode tasks go to judge review), subject to
+/// [`check_task_holder`].
+pub(crate) async fn handle_tasks_complete(
+    args: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
+    let default_agent = actor.id();
     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
     if task_id.is_empty() {
         return tool_error("task_id is required");
@@ -13,6 +49,9 @@ pub(crate) async fn handle_tasks_complete(args: &Value, home_dir: &Path, default
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
     };
+    if let Err(refusal) = check_task_holder(&store, home_dir, task_id, actor, "tasks_complete").await {
+        return refusal;
+    }
     // G1: `complete_task` routes goal-mode tasks to `review` (judge acceptance
     // pending) carrying the result summary; plain tasks go straight to `done`.
     // Also clears the lease so the completed task isn't reclaimed as a zombie.
@@ -44,7 +83,13 @@ pub(crate) async fn handle_tasks_complete(args: &Value, home_dir: &Path, default
     tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
 }
 
-pub(crate) async fn handle_tasks_block(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+/// Flag a task as blocked, subject to [`check_task_holder`].
+pub(crate) async fn handle_tasks_block(
+    args: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
+    let default_agent = actor.id();
     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
     let reason = args
         .get("reason")
@@ -64,6 +109,9 @@ pub(crate) async fn handle_tasks_block(args: &Value, home_dir: &Path, default_ag
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
     };
+    if let Err(refusal) = check_task_holder(&store, home_dir, task_id, actor, "tasks_block").await {
+        return refusal;
+    }
     // HIGH-2 sweep: same holder guard as tasks_complete — a task claimed by X
     // may only be blocked by X (a reclaimed zombie must not flip the new
     // holder's in_progress task to blocked). Unclaimed tasks keep the current
@@ -199,7 +247,17 @@ pub(crate) async fn handle_goals_list(args: &Value, home_dir: &Path) -> Value {
 // small bounded files; `spawn_blocking` keeps the advisory file lock off the
 // async runtime.
 
-pub(crate) async fn handle_activity_post(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+/// Post an Activity Feed row. Naming a `task_id` adds activity to that task,
+/// and the feed is what the goal loop's silent-progress reminder reads, so
+/// an AI-employee caller that is not the task's assignee, claimer or creator
+/// needs [`check_record_change_allowed`] against its assignee; an unknown
+/// task id is refused.
+pub(crate) async fn handle_activity_post(
+    args: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
+    let default_agent = actor.id();
     let summary = args
         .get("summary")
         .and_then(|v| v.as_str())
@@ -227,6 +285,32 @@ pub(crate) async fn handle_activity_post(args: &Value, home_dir: &Path, default_
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
     };
+    if let (Some(me), Some(tid)) = (actor.agent(), task_id.as_deref()) {
+        let task = match store.get_task(tid).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return tool_error(&format!("task not found: {tid}")),
+            Err(e) => return tool_error(&format!("activity_post: {e}")),
+        };
+        if let Err(reason) = check_actor_identity(home_dir, actor, &task.assigned_to, "activity_post") {
+            return tool_error(&reason);
+        }
+        let is_party = task.assigned_to == me
+            || task.claimed_by.as_deref() == Some(me)
+            || task.created_by == me;
+        if !is_party {
+            if let Err(reason) = check_record_change_allowed(
+                home_dir,
+                actor,
+                &task.assigned_to,
+                "activity_post",
+                RecordKind::Task,
+            )
+            .await
+            {
+                return tool_error(&reason);
+            }
+        }
+    }
     let row = duduclaw_gateway::task_store::ActivityRow {
         id: uuid::Uuid::new_v4().to_string(),
         event_type,

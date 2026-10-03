@@ -1,4 +1,8 @@
 use super::*;
+use crate::mcp::caller_shims::{
+    handle_activity_post, handle_tasks_block, handle_tasks_claim, handle_tasks_complete, handle_tasks_create,
+    handle_tasks_update,
+};
 
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_create_allows_assigning_to_direct_report() {

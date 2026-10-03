@@ -31,12 +31,12 @@
 | ゴールタスクコンソール /goals(v1.58) | ダッシュボードから直接エージェントへゴールを割り当て(`/goal` と同一セマンティクス)、ラウンドごとの完全な実行タイムライン(`tasks.timeline`)、その場での人間介入——ダッシュボードの全 needs_human 裁決がチャネルボタンと同じ fail-closed な `tasks.goal_decide` パスに統一 |
 | 予測と検証ページ(v1.58) | LLM→LWM ループの可視化:予測 → 実行 → 観測 → 対照;ラウンドごとの予測 vs 実際(`forward.chain`);エージェントごとの予測能力判定カード(Brier + Murphy 分解、3 態の誠実ラベル);世界モデル状態バケットが初めて閲覧可能に;MAV 観点別裁決、実行記録リンク、再派遣/進捗なしシグナル、予測サブ誤差もラウンド単位で永続化 |
 | チャネル OTP 候補チェーン + 設定統合(v1.58) | ログイン OTP 送信は「グローバル token 優先、次に各エージェント専用 bot token を順に試行」(重複排除・順序付き)——bot を単一エージェントへ移した後の静かな失敗を修正;エージェントのチャネル設定とチャネル管理が同一の編集ダイアログを共有;サイドバー「新機能」(`newIn`)バッジ規約導入 |
-| 信念ループ(v1.59) | 外部世界に対する構造化信念の記帳(`belief_submit` / `belief_settle` / `belief_stats` MCP ツール);提出時ベースラインに対する決定論的三方向 Brier 決算、TickHub 交差検証(エージェントは現実を自己申告できない);校正統計と信念-実値対照の 2 つのプログラム的注入フック;/foresight の信念と検証タブ([46-belief-loop.md](46-belief-loop.md)) |
+| 信念ループ(v1.59) | 外部世界に対する構造化信念の記帳(`belief_submit` / `belief_settle` / `belief_stats` MCP ツール);提出時ベースラインに対する決定論的三方向 Brier 決算;校正の数値は交差検証済みの決算だけで計算し、現時点では交差検証を提供する本番経路がないため、既存の決算はすべて自己申告として別に数えられ校正には入らない;校正統計と信念-実値対照の 2 つのプログラム的注入フック;/foresight の信念と検証タブ([46-belief-loop.md](46-belief-loop.md)) |
 | ゴール単位の契約フィールド + 自主研究(v1.59) | ゴール作成時に `duration_hours`(期限超過 → needs_human)と `risk_boundary`(空なら 5 行のベースライン)を設定可能、毎ラウンド注入され MAV の safety 観点の基準に;`/goal` は `時限:`/`邊界:` セグメント対応;構造化予測を任意で要求可能;当日の信念を外したエージェントには夜間の自主研究ゴールを自動割り当て |
 | ディスパッチエンジンのデフォルト有効化 + スケジューラ生存性(v1.59) | `[dispatch] enabled` デフォルトを true に(割り当てたゴールが箱出しで実行される)、ダッシュボードでホット切替;cron/heartbeat ループが 5 分以上停止すると `/healthz` が 503——スケジューラ全滅中もコンテナが healthy 表示だった事故を封じる |
 | 二段階裁決 + 判定の強化(v1.60) | MAV 判定団の前に安価な第一段階評価器(`continue`/`candidate_complete`/`blocked`、デフォルト on;いかなる障害も完全 MAV へ降格、自動合格は絶対にしない);判定規律 4 条(反ラチェット、監査のみで証拠を自作しない、契約外拡張禁止、自己申告の完了は証拠でない);切り詰められたパネル JSON と先頭トークン `PASS` の 2 つの誤検出穴を封鎖;gap 指紋による停滞検出;早期切り上げ検出;`resume_on_restart` デフォルト `pause` |
 | 差し替え可能な判定 seam(v1.60) | `[dispatch] judge = mav / evaluator_only / external / human_only`(`evaluator_only` と `human_only` は v1.66.0 から非推奨、v1.69.0 で削除)。外部判定の障害は常に MAV へ降格(より厳格、監査記録付き)、その feedback は未信頼 DATA として処理;未知の値は `mav` にフォールバック;設定→自動化にセレクタ |
-| ゴール契約の凍結(v1.60) | 作成時に受け入れ基準を不変の `acceptance_criteria_baseline` として凍結、判定と評価器はこのベースラインのみを読む;エージェント身分による goal タスク受け入れ基準の変更は拒否 + 監査記録;基準なしの `/goal` には 4 要素ガイダンスと outcome 式基準の提案を付与 |
+| ゴール契約の凍結(v1.60) | 作成時に受け入れ基準を不変の `acceptance_criteria_baseline` として凍結、判定と評価器はこのベースラインのみを読む;エージェント身分による goal タスクの受け入れ基準・`title`・`description` の変更は拒否 + 監査記録;基準なしの `/goal` には 4 要素ガイダンスと outcome 式基準の提案を付与 |
 | ゴールループの人間シグナル + アドミッションキュー(v1.60) | needs_human に閉じた 6 分類の `pause_reason`(トリガー現場で静的スタンプ、LLM の記述から逆解析しない);超過進捗レポート(`progress_report_minutes`);LLM ゼロのツール連打アドバイザリ(3/5/8 段階);ephemeral spawn の上限超過は有界 FIFO キューに(デフォルト `queue`);予算枯渇時は「ベストラウンド成果物」を引き渡し(決定論的選択 + ギャップ一覧、手ぶらエスカレーションの廃止) |
 | Agent Mail(v1.60) | エージェントごとのメールボックス(`/mail` ページ):Gmail API / drop folder 受信、送信は常にドラフト作成 → ApprovalBroker 確認待ち(実送信はバックグラウンドワーカーのみ)、メール内容は DATA フェンス、外部付与不可の専用 scope、エージェント横断の閲覧は組織権限判定を通過([47-agent-mail.md](47-agent-mail.md)) |
 | エージェント設定プリセット P1(v1.60) | `duduclaw preset` コマンド群 + `agent create --preset`——名前付きで再利用可能な設定バンドル;バインディング権威は `preset_bindings.toml`、解決結果はエージェントディレクトリ外へ実体化(自己改変による回避を防止)、org フィールドは値があれば全体拒否、機微セクションは静かに剥離;組み込み部門プリセット 9 種 |
@@ -264,7 +264,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| `agent-file-guard` PreToolUse フック | `duduclaw hook agent-file-guard`（Rust サブコマンド、matcher `Write\|Edit\|MultiEdit\|Bash`、`agent_hook_installer` がエージェント毎に導入）——正規ツリー外のエージェント構造ファイル、自分の SOUL.md と CONTRACT.toml への書き込み、他エージェントへの書き込みをブロック |
+| `agent-file-guard` PreToolUse フック | `duduclaw hook agent-file-guard`（Rust サブコマンド、matcher `Write\|Edit\|MultiEdit\|NotebookEdit\|Bash`、`agent_hook_installer` が `--agent` と `--home` 付きでエージェント毎に導入）——正規ツリー外のエージェント構造ファイル、自分の SOUL.md と CONTRACT.toml への書き込み、他エージェントへの書き込み、DuDuClaw ホーム内で自分のエージェントディレクトリと `attachments/` 以外への社員の書き込み（シンボリックリンク解決後の実パスで判定）、自分の `agent.toml` の編集可能セクション以外の変更をブロック。Bash 側はヒューリスティック、`Read` は対象外。ルールと制約は [05-security-defense.md](05-security-defense.md) を参照 |
 | `org_field_guard` | 同じフック内のフィールド単位の凍結：`[agent] reports_to`／`department`／`name`、`[capabilities]` テーブル全体、`config.toml [delegation]`／`[acp]`。パース不能・書き込み意図の再構成不能はいずれも fail-closed |
 | `data-file-guard` PreToolUse フック | `duduclaw hook data-file-guard`（RFC-23 §14.4、H10 2026-09 から Rust サブコマンド、matcher `Read\|Bash`）。匿名化が有効なときだけ武装。サンドボックスではなく `Bash` のファイル名ヒューリスティック |
 | ダッシュボード認証 | JWT アカウントログイン（Argon2id パスワード、`users.db`）または gateway の管理者トークン。以前の Ed25519 チャレンジレスポンスの経路は削除されました。どの設定からも有効にできないものでした |
@@ -349,7 +349,7 @@
 |------|------|
 | タスクボード | SQLite バックエンドのタスク管理 — status / priority / assignment 追跡 |
 | Dashboard RPC | `tasks.list/create/update/remove/assign`、`activity.list`（Web UI 向け）|
-| Agent MCP ツール | `tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post` — エージェントが自身のキュー把握、作業クレーム、進捗投稿 |
+| Agent MCP ツール | `tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post` — エージェントが自身のキュー把握、作業クレーム、進捗投稿。他の社員のタスクの変更・完了には委譲関係が必要で、制御用タグ（`outcome:`／`grant:`／`auto-research`）は AI 社員には変更できない |
 | リアルタイム Activity Feed | WebSocket ストリーミングの activity イベント |
 | システムプロンプト注入 | 保留タスク（最大 5 件）をエージェント system prompt へ自動注入 |
 
