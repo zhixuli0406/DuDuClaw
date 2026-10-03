@@ -26,6 +26,7 @@ pub mod grounding;
 pub mod identity_token;
 pub mod keychain;
 pub mod lenient;
+pub mod llm_contract;
 pub mod match_utils;
 pub mod net_addr;
 pub mod mcp_scopes;

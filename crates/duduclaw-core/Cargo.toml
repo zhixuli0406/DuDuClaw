@@ -28,6 +28,10 @@ base64 = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.3"
+# llm_contract (LLM output contract primitives): RFC 3986 encoding of canonical
+# coverage refs and NFC normalization before encoding. Both already in Cargo.lock.
+percent-encoding = "2.3.2"
+unicode-normalization = "0.1.25"
 
 [features]
 default = []
