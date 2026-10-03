@@ -382,7 +382,7 @@ fn detect_local_timezone_returns_valid_iana_name() {
     // specific zone (CI may run on UTC / America/Los_Angeles /
     // Asia/Taipei), but we CAN assert that whatever we get back
     // parses as a valid chrono-tz IANA name. That's the contract
-    // schedule_task relies on.
+    // the cron rail relies on.
     //
     // On hosts with no discoverable TZ (extremely minimal Docker
     // images), the function legitimately returns None — we accept

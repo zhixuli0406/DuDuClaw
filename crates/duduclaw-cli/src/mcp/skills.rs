@@ -45,12 +45,9 @@ pub(crate) fn parse_skill_description_from_content(content: &str) -> String {
 /// Search skill hubs (G5). Default aggregates across all configured hubs
 /// with the same weighted scoring the GitHub index uses; `hub` restricts to
 /// one hub by exact id. Per-hub failures are reported, never swallowed.
-/// T5/O13 — the single skill-search entry point.
-///
-/// `tool_name` is threaded in so the deprecated `skill_bank_search` alias can
-/// pin `source = "bank"` (see `mcp_alias::resolve_skill_source`); every other
-/// caller passes `"skill_search"` and the `source` argument decides.
-pub(crate) async fn handle_skill_search(params: &Value, home_dir: &Path, tool_name: &str) -> Value {
+/// T5/O13 — the single skill-search entry point; the `source` argument picks
+/// hubs, the learned skill bank, or both.
+pub(crate) async fn handle_skill_search(params: &Value, home_dir: &Path) -> Value {
     let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
     if query.is_empty() {
         return serde_json::json!({
@@ -58,7 +55,7 @@ pub(crate) async fn handle_skill_search(params: &Value, home_dir: &Path, tool_na
             "isError": true
         });
     }
-    let source = match crate::mcp_alias::resolve_skill_source(tool_name, params) {
+    let source = match crate::mcp_alias::resolve_skill_source(params) {
         Ok(s) => s,
         Err(e) => {
             return serde_json::json!({
@@ -122,7 +119,7 @@ pub(crate) async fn handle_skill_search(params: &Value, home_dir: &Path, tool_na
         duduclaw_agent::skill_hub::AggregatedSearch::default()
     };
     // The learned skill bank. Its store is an in-memory stub today (see
-    // `handle_skill_bank_search`), so this contributes zero rows rather than a
+    // `skill_bank_hits`), so this contributes zero rows rather than a
     // fabricated result — an empty source must read as empty, never as
     // "nothing here, so here is something else".
     let bank_hits: Vec<(String, String)> = if source.queries_bank() {
@@ -198,9 +195,8 @@ pub(crate) async fn handle_skill_search(params: &Value, home_dir: &Path, tool_na
 
 /// The learned skill bank's search half, as `(name, description)` rows.
 ///
-/// Honest status: the `SkillBank` store is still an in-memory stub (the same
-/// one `handle_skill_bank_search` reports on), so this returns zero rows for
-/// every query. It is a real function rather than an inline `Vec::new()` so
+/// Honest status: the `SkillBank` store is still an in-memory stub, so this
+/// returns zero rows for every query. It is a real function rather than an inline `Vec::new()` so
 /// that wiring the store later is a one-body change and the `source="bank"` /
 /// `source="all"` routing above is already exercised by tests.
 pub(crate) fn skill_bank_hits(_query: &str, _limit: usize) -> Vec<(String, String)> {

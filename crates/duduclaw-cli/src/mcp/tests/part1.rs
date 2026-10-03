@@ -133,25 +133,26 @@ fn humanize_cron_rejects_the_shapes_it_would_describe_wrongly() {
 }
 
 /// End-to-end for the WP6 emission point: creating a routine the way a
-/// channel conversation does (`schedule_task`) persists the row AND raises
-/// the `cron.changed` row the gateway tail turns into a dashboard push.
-/// Without the second half, RoutinesPage stays blank until a manual reload.
+/// channel conversation does (`tasks_create` with a cron `schedule`)
+/// persists the row AND raises the `cron.changed` row the gateway tail turns
+/// into a dashboard push. Without the second half, RoutinesPage stays blank
+/// until a manual reload.
 #[tokio::test]
-async fn schedule_task_persists_and_raises_cron_changed() {
+async fn scheduled_tasks_create_persists_and_raises_cron_changed() {
     let tmp = TempDir::new();
     let home = tmp.path();
 
     let args = serde_json::json!({
-        "name": "每日晨報",
-        "cron": "0 9 * * *",
-        "task": "整理今天的行程",
-        "agent_id": "agnes",
+        "title": "每日晨報",
+        "description": "整理今天的行程",
+        "schedule": "0 9 * * *",
+        "assigned_to": "agnes",
         "cron_timezone": "Asia/Taipei",
     });
-    let result = handle_schedule_task(&args, home, "agnes").await;
+    let result = crate::mcp::caller_shims::handle_tasks_create(&args, home, "agnes").await;
     assert!(
         result.get("isError").is_none(),
-        "schedule_task should succeed: {result}"
+        "tasks_create with a schedule should succeed: {result}"
     );
 
     // The routine is in the store the dashboard's `cron.list` reads.
@@ -168,7 +169,7 @@ async fn schedule_task_persists_and_raises_cron_changed() {
     // ...and the dashboard learns about it.
     duduclaw_gateway::dashboard_feedback::emit_for_tool(
         home,
-        "schedule_task",
+        "tasks_create",
         &args,
         &result,
         "agnes",
@@ -186,25 +187,24 @@ async fn schedule_task_persists_and_raises_cron_changed() {
     assert_eq!(payload["agent_id"], "agnes");
 }
 
-/// A rejected `schedule_task` (bad cron) persists nothing and must stay
-/// silent — a dashboard refetch triggered by a phantom event would show the
-/// user the absence of what they were just told about.
+/// A rejected schedule (bad cron) persists nothing and must stay silent — a
+/// dashboard refetch triggered by a phantom event would show the user the
+/// absence of what they were just told about.
 #[tokio::test]
-async fn rejected_schedule_task_raises_no_event() {
+async fn rejected_scheduled_tasks_create_raises_no_event() {
     let tmp = TempDir::new();
     let home = tmp.path();
 
     let args = serde_json::json!({
-        "name": "壞排程",
-        "cron": "not a cron",
-        "task": "x",
+        "title": "壞排程",
+        "schedule": "61 9 * * *",
     });
-    let result = handle_schedule_task(&args, home, "agnes").await;
-    assert_eq!(result["isError"], true);
+    let result = crate::mcp::caller_shims::handle_tasks_create(&args, home, "agnes").await;
+    assert_eq!(result["isError"], true, "{result}");
 
     duduclaw_gateway::dashboard_feedback::emit_for_tool(
         home,
-        "schedule_task",
+        "tasks_create",
         &args,
         &result,
         "agnes",
@@ -447,8 +447,8 @@ async fn create_agent_allows_non_colliding_name() {
     assert!(home.join("agents").join("brand-new-agent").exists());
 }
 
-/// `schedule_task` fires under the `cron` identity, so the row's creation
-/// is the delegation. Without this gate any agent could schedule work for
+/// A cron row fires under the `cron` identity, so the row's creation is the
+/// delegation. Without this gate any agent could schedule work for
 /// any other agent and launder it through the scheduler.
 #[tokio::test]
 async fn schedule_task_for_a_stranger_is_denied() {

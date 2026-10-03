@@ -99,7 +99,7 @@ pub(crate) fn build_minimal_inner(input: MinimalInput<'_>) -> String {
         let trimmed = truncate_to_byte_budget(soul, max_bytes);
         let s = if trimmed.len() < soul.len() {
             format!(
-                "{}\n\n[truncated for minimal mode; full SOUL available via shared_wiki_read]",
+                "{}\n\n[truncated for minimal mode]",
                 trimmed
             )
         } else {
@@ -193,9 +193,9 @@ fn mcp_tool_index() -> &'static str {
     "## Available MCP Tools (#11 Active Retrieval)\n\
      Wiki / skill / memory content is no longer inlined here — fetch it on \
      demand:\n\
-     - `wiki_search(query)` — full-text + tag search across the shared wiki\n\
-     - `wiki_read(path)` — load a specific wiki page by path\n\
-     - `shared_wiki_search` / `shared_wiki_read` — same for cross-agent wiki\n\
+     - `wiki_search(query)` — full-text + tag search across your own wiki\n\
+     - `wiki_read(page_path)` — load a specific wiki page by path\n\
+     - add `scope=\"shared\"` to either for the cross-agent shared wiki\n\
      - `skill_list()` — enumerate available skills (name + description only)\n\
      - `skill_load(name)` — load full skill body when you decide to use it\n\
      - `memory_search(query)` — semantic search over your memory engine\n\
@@ -284,6 +284,18 @@ mod tests {
         assert!(prompt.contains("wiki_search"));
         assert!(prompt.contains("skill_list"));
         assert!(prompt.contains("list_agents"));
+    }
+
+    /// The index names only tools that exist, and says how to reach the
+    /// shared wiki through the merged `wiki_*` tools.
+    #[test]
+    fn minimal_prompt_names_no_removed_tool() {
+        let big_soul = "abc\n".repeat(2500);
+        let prompt = build_minimal_inner(input(Some(&big_soul), None, "", "", 2));
+        for removed in duduclaw_core::tool_catalog::REMOVED_MCP_TOOLS {
+            assert!(!prompt.contains(removed.name), "{} still named:\n{prompt}", removed.name);
+        }
+        assert!(prompt.contains("scope=\"shared\""), "{prompt}");
     }
 
     #[test]

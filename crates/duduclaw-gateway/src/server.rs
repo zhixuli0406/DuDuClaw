@@ -15873,7 +15873,7 @@ async fn well_known_mcp_server_card() -> axum::Json<serde_json::Value> {
             {"name": "memory_search", "description": "Search agent memory"},
             {"name": "memory_store", "description": "Store memory entry"},
             {"name": "execute_program", "description": "Execute PTC script"},
-            {"name": "skill_bank_search", "description": "Search skill bank"},
+            {"name": "skill_search", "description": "Search skill hubs and the skill bank"},
             {"name": "session_restore_context", "description": "Restore hidden context"},
             {"name": "create_agent", "description": "Create sub-agent"},
             {"name": "send_to_agent", "description": "Delegate to agent"},

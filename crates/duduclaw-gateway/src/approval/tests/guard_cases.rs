@@ -266,7 +266,7 @@ fn grounding_snippets_shared_wiki_fails_closed_without_scope_policy() {
 /// Fix-2 H4a core regression (the malicious-wiki-page scenario from the
 /// review): a page in an `agent_writable` (default / unlisted)
 /// namespace — the ONE an agent can itself write via
-/// `shared_wiki_write` — must never be retrieved as grounding evidence,
+/// `wiki_write` with `scope="shared"` — must never be retrieved as grounding evidence,
 /// even when it matches the query and even when `.scope.toml` exists
 /// (protecting OTHER namespaces).
 #[test]

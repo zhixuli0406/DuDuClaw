@@ -180,7 +180,7 @@ impl MethodHandler {
         // intact". Without the check it would become a general
         // copy-any-page-to-shared primitive with none of the shared-wiki
         // safeguards (`.scope.toml`, department visibility, secret scanning)
-        // that the real `shared_wiki_write` / `wiki_share` paths apply.
+        // that the real `wiki_write` (scope shared) / `wiki_share` paths apply.
         if !crate::auto_wiki_page::is_auto_path(page_path) {
             return WsFrame::error_response("", "Only auto-filed pages can be shared here");
         }

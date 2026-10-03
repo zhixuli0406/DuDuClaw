@@ -2,7 +2,7 @@
 //!
 //! The 2026-09-29 feature audit (§1 T5, row O4) found four MCP/RPC entry
 //! points that all read as "create a task". Two of them create genuinely
-//! different objects (`schedule_task` writes a cron row; `goals_create`
+//! different objects (`tasks_create` with `schedule` writes a cron row; `goals_create`
 //! writes a why-chain hierarchy node), but `tasks.goal_create` — the
 //! dashboard's "hand this agent a goal" RPC — had no agent-facing twin at
 //! all: an agent could only create a plain board task and hope the goal loop

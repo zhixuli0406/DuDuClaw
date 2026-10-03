@@ -292,7 +292,7 @@ pub(super) async fn build_reply_with_session_inner(
     // (default), Notion, or the chained cache→upstream pair (G5 wired the
     // selection in; this used to be hard-coded to the wiki cache). The
     // formatted block is injected into the system prompt — agents no longer
-    // need to grep `shared_wiki_read("identity/discord-users.md")`
+    // need to grep `wiki_read` on `identity/discord-users.md`
     // mid-reasoning.
     let sender_block = build_sender_block(&ctx.home_dir, session_id, user_id).await;
 

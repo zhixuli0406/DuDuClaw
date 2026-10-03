@@ -5,7 +5,7 @@ use super::*;
 /// A reminder fires as its `agent_id` (an `agent_callback` reminder wakes
 /// that employee with the given prompt), so naming another employee needs
 /// [`check_record_change_allowed`] against it — the same relationship
-/// `schedule_task` requires for a recurring wake-up. Omitted `agent_id`
+/// a cron `schedule` on `tasks_create` requires for a recurring wake-up. Omitted `agent_id`
 /// means the caller itself.
 pub(crate) async fn handle_create_reminder(
     params: &Value,

@@ -1,4 +1,5 @@
-//! T5 / O3 · O4 · O13 — parameter parsing for the **merged** MCP entry points.
+//! T5 / O3 · O4 · O13 — parameter parsing for the **merged** MCP entry points,
+//! and the scan for tool names removed in v1.69.0.
 //!
 //! The 2026-09-29 feature audit (`wiki/reports/feature-audit-2026-09-29.md`
 //! §1 T5) found three families where the same capability was reachable
@@ -10,15 +11,12 @@
 //! | O4 | `create_task` / `tasks_create` / `goals_create` / `schedule_task` | `tasks_create` with `kind` + `schedule` |
 //! | O13 | `skill_search` (hubs) / `skill_bank_search` / hub-only search | `skill_search` with `source` |
 //!
-//! ## Deprecation contract (not a removal)
-//!
-//! Every old name stays **listed in `tools/list` and callable, byte-identical**
-//! for two minor versions (removal target **v1.69.0**). Only its
-//! `description` gains a `[deprecated → <new tool> <param>]` prefix, and
-//! `duduclaw_core::tool_catalog` marks it `deprecated: true`. Hiding a tool
-//! from `tools/list` would make it *uncallable* — MCP's list is the
-//! declaration surface, not a hint — so hiding is exactly the wrong move for
-//! a deprecation window. See `docs/guides/deprecations.md`.
+//! The old names were deprecated aliases for two minor versions and were
+//! removed in v1.69.0. `duduclaw_core::tool_catalog::REMOVED_MCP_TOOLS` is
+//! the one table of them: a call to one gets a tool error naming the
+//! replacement, and [`scan_agent_dir_for_removed_tools`] /
+//! [`scan_config_for_removed_tools`] find names left in settings, prompts and
+//! skills. See `docs/guides/deprecations.md`.
 //!
 //! ## Why the parsers live here rather than in `mcp.rs`
 //!
@@ -41,8 +39,7 @@ pub enum WikiScope {
     /// so an existing `wiki_read` call is byte-identical after the merge.
     #[default]
     Agent,
-    /// The cross-agent shared wiki (`<home>/shared/wiki/`) — what the legacy
-    /// `shared_wiki_*` aliases address.
+    /// The cross-agent shared wiki (`<home>/shared/wiki/`).
     Shared,
 }
 
@@ -56,21 +53,13 @@ impl WikiScope {
     }
 }
 
-/// Resolve the effective wiki scope for one tool call.
+/// Resolve the effective wiki scope for one `wiki_*` call.
 ///
-/// - A legacy `shared_wiki_*` tool name always resolves to
-///   [`WikiScope::Shared`], regardless of the arguments — the alias *is* the
-///   scope, and letting a `scope` argument override it would turn a
-///   deprecated shared-wiki alias into a back door onto an agent wiki.
-/// - Otherwise the `scope` argument decides, defaulting to
-///   [`WikiScope::Agent`].
+/// - The `scope` argument decides, defaulting to [`WikiScope::Agent`].
 /// - An unknown or non-string `scope` is an `Err` (fail-closed) — never a
 ///   silent fallback, because the two scopes have different trust boundaries
 ///   (`.scope.toml` SoT policy, author-or-main-agent delete rule).
-pub fn resolve_wiki_scope(tool_name: &str, args: &Value) -> Result<WikiScope, String> {
-    if tool_name.starts_with("shared_wiki_") {
-        return Ok(WikiScope::Shared);
-    }
+pub fn resolve_wiki_scope(args: &Value) -> Result<WikiScope, String> {
     match args.get("scope") {
         None | Some(Value::Null) => Ok(WikiScope::Agent),
         Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
@@ -136,8 +125,7 @@ pub fn resolve_task_kind(args: &Value) -> Result<TaskKind, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleSpec {
     /// A cron expression (5-field minute precision or 6-field with seconds),
-    /// handed to the persistent `CronScheduler` — the recurring rail that
-    /// `schedule_task` has always used.
+    /// handed to the persistent `CronScheduler` (the recurring rail).
     Cron(String),
     /// A single RFC3339 instant, handed to the one-shot reminder scheduler
     /// (`agent_callback` delivery). Cron rows cannot express "once", so a
@@ -208,13 +196,7 @@ impl SkillSource {
 }
 
 /// Resolve `skill_search`'s `source` argument.
-///
-/// A legacy `skill_bank_search` call always resolves to [`SkillSource::Bank`]
-/// — same reasoning as the wiki aliases: the alias *is* the source.
-pub fn resolve_skill_source(tool_name: &str, args: &Value) -> Result<SkillSource, String> {
-    if tool_name == "skill_bank_search" {
-        return Ok(SkillSource::Bank);
-    }
+pub fn resolve_skill_source(args: &Value) -> Result<SkillSource, String> {
     match args.get("source") {
         None | Some(Value::Null) => Ok(SkillSource::All),
         Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
@@ -230,6 +212,307 @@ pub fn resolve_skill_source(tool_name: &str, args: &Value) -> Result<SkillSource
     }
 }
 
+// ── Removed tool names left in settings, prompts and skills ────────────
+
+/// One place a removed MCP tool name is still written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedToolFinding {
+    /// File the name is in, relative to the scanned directory (or
+    /// `config.toml` for [`scan_config_for_removed_tools`]).
+    pub file: String,
+    /// Where in that file: a settings key such as
+    /// `[capabilities] denied_tools`, or `text` for prompt / skill prose.
+    pub location: String,
+    /// The removed tool name.
+    pub tool: &'static str,
+    /// How many times the name appears there.
+    pub occurrences: usize,
+    /// What the leftover does now and what to write instead (English,
+    /// for the operator).
+    pub advice: String,
+}
+
+/// Result of scanning one employee directory. `unreadable` names files that
+/// exist but could not be read or parsed, so a clean `findings` list is never
+/// mistaken for "checked and clean".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemovedToolScan {
+    pub findings: Vec<RemovedToolFinding>,
+    pub unreadable: Vec<String>,
+}
+
+/// `agent.toml [capabilities]` lists that name tools, and what a removed
+/// name left in each one does after the upgrade.
+const CAPABILITY_TOOL_LISTS: &[(&str, &str)] = &[
+    (
+        "allowed_tools",
+        "matches no tool any more; if it was this employee's only grant, the employee has lost it. \
+         Replace it with the new name (which also allows the call's other forms).",
+    ),
+    (
+        "denied_tools",
+        "the MCP gate still refuses the equivalent call, but the Claude CLI flag no longer matches. \
+         Replace it with the new name to deny it everywhere (that also denies the call's other forms).",
+    ),
+    (
+        "approval_required_tools",
+        "the MCP gate still asks for this approval on the equivalent call. \
+         Replace it with the new name (that also covers the call's other forms).",
+    ),
+    (
+        "irreversible_tools",
+        "the MCP gate still asks for this approval on the equivalent call. \
+         Replace it with the new name (that also covers the call's other forms).",
+    ),
+    (
+        "maybe_irreversible_tools",
+        "the MCP gate still judges the equivalent call. \
+         Replace it with the new name (that also covers the call's other forms).",
+    ),
+    (
+        "scoped_tools",
+        "the MCP gate still requires a task grant for the equivalent call. \
+         Replace it with the new name (that also covers the call's other forms).",
+    ),
+];
+
+/// Prompt files read at the directory root.
+const PROMPT_FILES: &[&str] = &[
+    "SOUL.md",
+    "IDENTITY.md",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "GEMINI.md",
+    "CONTRACT.toml",
+];
+
+/// Directories whose Markdown is read recursively.
+const PROSE_DIRS: &[&str] = &["SKILLS", "wiki"];
+
+const SCAN_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const SCAN_MAX_FILES: usize = 2_000;
+const SCAN_MAX_DEPTH: usize = 8;
+
+fn advice_for(location_effect: &str, row: &duduclaw_core::tool_catalog::RemovedMcpTool) -> String {
+    format!(
+        "{location_effect} New name: `{}`; call it with `{}`.",
+        row.replacement, row.replacement_args
+    )
+}
+
+/// Removed names a list entry reaches. A match-all entry (`*`,
+/// `mcp__duduclaw__*`) is not a leftover; a prefix wildcard such as
+/// `shared_wiki_*` is reported once per removed name it used to cover.
+fn removed_names_for_entry(entry: &str) -> Vec<&'static duduclaw_core::tool_catalog::RemovedMcpTool> {
+    use duduclaw_core::tool_catalog::{REMOVED_MCP_TOOLS, tool_entry_matches};
+    const PROBE: &str = "zz-removed-tool-probe";
+    if tool_entry_matches(entry, PROBE) {
+        return Vec::new();
+    }
+    REMOVED_MCP_TOOLS
+        .iter()
+        .filter(|row| tool_entry_matches(entry, row.name))
+        .collect()
+}
+
+/// Occurrences of `name` in `text` as a whole tool name: not preceded or
+/// followed by an identifier character, except that the Claude CLI prefix
+/// `mcp__duduclaw__` may precede it.
+fn count_tool_name(text: &str, name: &str) -> usize {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(name) {
+        let start = from + pos;
+        let end = start + name.len();
+        let before = &text[..start];
+        let before_ok = before.chars().next_back().is_none_or(|c| !is_ident(c))
+            || before.ends_with("mcp__duduclaw__");
+        let after_ok = text[end..].chars().next().is_none_or(|c| !is_ident(c));
+        if before_ok && after_ok {
+            count += 1;
+        }
+        from = end;
+    }
+    count
+}
+
+fn scan_text(rel: String, text: &str, out: &mut Vec<RemovedToolFinding>) {
+    for row in duduclaw_core::tool_catalog::REMOVED_MCP_TOOLS {
+        let occurrences = count_tool_name(text, row.name);
+        if occurrences > 0 {
+            out.push(RemovedToolFinding {
+                file: rel.clone(),
+                location: "text".to_string(),
+                tool: row.name,
+                occurrences,
+                advice: advice_for(
+                    "Prompt or skill text names a removed tool; a model following it gets an error naming the replacement.",
+                    row,
+                ),
+            });
+        }
+    }
+}
+
+/// Read a regular file (never a link) of at most [`SCAN_MAX_FILE_BYTES`].
+/// `Ok(None)` = absent, a link, or too large; `Err` = present but unreadable.
+fn read_small_file(path: &std::path::Path) -> Result<Option<String>, ()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    if !meta.file_type().is_file() || meta.len() > SCAN_MAX_FILE_BYTES {
+        return Ok(None);
+    }
+    std::fs::read_to_string(path).map(Some).map_err(|_| ())
+}
+
+fn rel_name(base: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(base).unwrap_or(path).to_string_lossy().into_owned()
+}
+
+/// Scan one employee directory (`<home>/agents/<id>`) for MCP tool names
+/// removed in v1.69.0: the `agent.toml [capabilities]` tool lists, the
+/// prompt files at the directory root, and the Markdown under `SKILLS/` and
+/// `wiki/`. Reads only; follows no symbolic links; skips files over 1 MiB.
+pub fn scan_agent_dir_for_removed_tools(agent_dir: &std::path::Path) -> RemovedToolScan {
+    let mut scan = RemovedToolScan::default();
+
+    match read_small_file(&agent_dir.join("agent.toml")) {
+        Ok(None) => {}
+        Err(()) => scan.unreadable.push("agent.toml".to_string()),
+        Ok(Some(raw)) => match raw.parse::<toml::Table>() {
+            Err(_) => scan.unreadable.push("agent.toml".to_string()),
+            Ok(table) => {
+                let caps = table.get("capabilities").and_then(|v| v.as_table());
+                for (key, effect) in CAPABILITY_TOOL_LISTS {
+                    let Some(list) = caps.and_then(|c| c.get(*key)).and_then(|v| v.as_array()) else {
+                        continue;
+                    };
+                    for entry in list.iter().filter_map(|v| v.as_str()) {
+                        for row in removed_names_for_entry(entry) {
+                            scan.findings.push(RemovedToolFinding {
+                                file: "agent.toml".to_string(),
+                                location: format!("[capabilities] {key}"),
+                                tool: row.name,
+                                occurrences: 1,
+                                advice: advice_for(effect, row),
+                            });
+                        }
+                    }
+                }
+            }
+        },
+    }
+
+    for name in PROMPT_FILES {
+        match read_small_file(&agent_dir.join(name)) {
+            Ok(Some(text)) => scan_text((*name).to_string(), &text, &mut scan.findings),
+            Ok(None) => {}
+            Err(()) => scan.unreadable.push((*name).to_string()),
+        }
+    }
+
+    let mut files_seen = 0usize;
+    for dir in PROSE_DIRS {
+        let mut stack = vec![(agent_dir.join(dir), 0usize)];
+        while let Some((current, depth)) = stack.pop() {
+            let entries = match std::fs::read_dir(&current) {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    scan.unreadable.push(rel_name(agent_dir, &current));
+                    continue;
+                }
+            };
+            let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    scan.unreadable.push(rel_name(agent_dir, &path));
+                    continue;
+                };
+                if file_type.is_dir() {
+                    if depth < SCAN_MAX_DEPTH {
+                        stack.push((path, depth + 1));
+                    }
+                } else if file_type.is_file()
+                    && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("md"))
+                {
+                    if files_seen >= SCAN_MAX_FILES {
+                        return scan;
+                    }
+                    files_seen += 1;
+                    match read_small_file(&path) {
+                        Ok(Some(text)) => {
+                            scan_text(rel_name(agent_dir, &path), &text, &mut scan.findings)
+                        }
+                        Ok(None) => {}
+                        Err(()) => scan.unreadable.push(rel_name(agent_dir, &path)),
+                    }
+                }
+            }
+        }
+    }
+    scan
+}
+
+/// Scan a parsed `config.toml` for removed tool names in the settings that
+/// match tools by name: `[provenance] sensitive_tools` and
+/// `[[ccr.allowed_sources]]` rows on the `duduclaw` server.
+pub fn scan_config_for_removed_tools(config: &toml::Table) -> Vec<RemovedToolFinding> {
+    use duduclaw_core::tool_catalog::removed_mcp_tool;
+    let mut out = Vec::new();
+    let sensitive = config
+        .get("provenance")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("sensitive_tools"))
+        .and_then(|v| v.as_array());
+    for name in sensitive.into_iter().flatten().filter_map(|v| v.as_str()) {
+        if let Some(row) = removed_mcp_tool(name.trim()) {
+            out.push(RemovedToolFinding {
+                file: "config.toml".to_string(),
+                location: "[provenance] sensitive_tools".to_string(),
+                tool: row.name,
+                occurrences: 1,
+                advice: advice_for(
+                    "the gateway now gates the new name in its place (every form of it, since the list matches names only). \
+                     Write the new name to make that explicit.",
+                    row,
+                ),
+            });
+        }
+    }
+    let sources = config
+        .get("ccr")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("allowed_sources"))
+        .and_then(|v| v.as_array());
+    for source in sources.into_iter().flatten().filter_map(|v| v.as_table()) {
+        let server = source.get("server").and_then(|v| v.as_str()).map(str::trim);
+        if server != Some(duduclaw_core::tool_catalog::DUDUCLAW_MCP_SERVER) {
+            continue;
+        }
+        let Some(row) = source.get("tool").and_then(|v| v.as_str()).and_then(|t| removed_mcp_tool(t.trim())) else {
+            continue;
+        };
+        out.push(RemovedToolFinding {
+            file: "config.toml".to_string(),
+            location: "[[ccr.allowed_sources]]".to_string(),
+            tool: row.name,
+            occurrences: 1,
+            advice: advice_for(
+                "matches no tool any more, so that tool's results are no longer compressed for retrieval.",
+                row,
+            ),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,41 +523,27 @@ mod tests {
     #[test]
     fn wiki_scope_defaults_to_agent_so_existing_calls_are_byte_identical() {
         assert_eq!(
-            resolve_wiki_scope("wiki_read", &json!({"page_path": "a.md"})).unwrap(),
+            resolve_wiki_scope(&json!({"page_path": "a.md"})).unwrap(),
             WikiScope::Agent
         );
         assert_eq!(
-            resolve_wiki_scope("wiki_read", &json!({"scope": null})).unwrap(),
+            resolve_wiki_scope(&json!({"scope": null})).unwrap(),
             WikiScope::Agent
-        );
-    }
-
-    #[test]
-    fn wiki_scope_shared_alias_ignores_a_conflicting_scope_argument() {
-        // The deprecated alias must never become a back door onto an agent
-        // wiki by passing scope="agent".
-        assert_eq!(
-            resolve_wiki_scope("shared_wiki_write", &json!({"scope": "agent"})).unwrap(),
-            WikiScope::Shared
-        );
-        assert_eq!(
-            resolve_wiki_scope("shared_wiki_ls", &json!({})).unwrap(),
-            WikiScope::Shared
         );
     }
 
     #[test]
     fn wiki_scope_rejects_unknown_and_non_string_values() {
-        assert!(resolve_wiki_scope("wiki_ls", &json!({"scope": "global"})).is_err());
-        assert!(resolve_wiki_scope("wiki_ls", &json!({"scope": 1})).is_err());
+        assert!(resolve_wiki_scope(&json!({"scope": "global"})).is_err());
+        assert!(resolve_wiki_scope(&json!({"scope": 1})).is_err());
         // Not a prefix/substring match: "sharedx" must not read as "shared".
-        assert!(resolve_wiki_scope("wiki_ls", &json!({"scope": "sharedx"})).is_err());
+        assert!(resolve_wiki_scope(&json!({"scope": "sharedx"})).is_err());
     }
 
     #[test]
     fn wiki_scope_accepts_explicit_shared_on_the_merged_name() {
         assert_eq!(
-            resolve_wiki_scope("wiki_search", &json!({"scope": " Shared "})).unwrap(),
+            resolve_wiki_scope(&json!({"scope": " Shared "})).unwrap(),
             WikiScope::Shared
         );
     }
@@ -321,15 +590,9 @@ mod tests {
     // ── O13 ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn skill_source_defaults_to_all_and_bank_alias_pins_bank() {
-        assert_eq!(
-            resolve_skill_source("skill_search", &json!({"query": "x"})).unwrap(),
-            SkillSource::All
-        );
-        assert_eq!(
-            resolve_skill_source("skill_bank_search", &json!({"source": "github"})).unwrap(),
-            SkillSource::Bank
-        );
+    fn skill_source_defaults_to_all() {
+        assert_eq!(resolve_skill_source(&json!({"query": "x"})).unwrap(), SkillSource::All);
+        assert_eq!(resolve_skill_source(&json!({"source": "bank"})).unwrap(), SkillSource::Bank);
     }
 
     #[test]
@@ -342,7 +605,83 @@ mod tests {
 
     #[test]
     fn skill_source_rejects_unknown_tokens() {
-        assert!(resolve_skill_source("skill_search", &json!({"source": "npm"})).is_err());
-        assert!(resolve_skill_source("skill_search", &json!({"source": 3})).is_err());
+        assert!(resolve_skill_source(&json!({"source": "npm"})).is_err());
+        assert!(resolve_skill_source(&json!({"source": 3})).is_err());
     }
+
+    // ── removed tool scan ───────────────────────────────────────────────
+
+    fn write(dir: &std::path::Path, rel: &str, body: &str) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn scan_finds_removed_names_in_lists_prompts_and_skills() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        write(
+            dir,
+            "agent.toml",
+            "[capabilities]\nallowed_tools = [\"mcp__duduclaw__shared_wiki_read\", \"memory_search\", \"mcp__duduclaw__*\"]\ndenied_tools = [\"shared_wiki_write\"]\nscoped_tools = [\"schedule_task\"]\napproval_required_tools = [\"shared_wiki_*\"]\n",
+        );
+        write(dir, "SOUL.md", "用 shared_wiki_read 查 SOP，再用 shared_wiki_read 確認。\n");
+        write(dir, "SKILLS/daily/SKILL.md", "Call `mcp__duduclaw__schedule_task` every morning.\n");
+        write(dir, "wiki/sop.md", "not a match: can_schedule_tasks, shared_wiki_reader, my_skill_bank_search\n");
+        write(dir, "notes.txt", "shared_wiki_read outside the scanned set\n");
+
+        let scan = scan_agent_dir_for_removed_tools(dir);
+        assert!(scan.unreadable.is_empty(), "{:?}", scan.unreadable);
+        let find = |file: &str, location: &str, tool: &str| {
+            scan.findings
+                .iter()
+                .find(|f| f.file == file && f.location == location && f.tool == tool)
+                .unwrap_or_else(|| panic!("missing {file} {location} {tool}: {:#?}", scan.findings))
+        };
+        assert!(find("agent.toml", "[capabilities] allowed_tools", "shared_wiki_read").advice.contains("wiki_read"));
+        assert!(find("agent.toml", "[capabilities] denied_tools", "shared_wiki_write").advice.contains("wiki_write"));
+        find("agent.toml", "[capabilities] scoped_tools", "schedule_task");
+        // A prefix wildcard still reaches removed names; flagged per name.
+        find("agent.toml", "[capabilities] approval_required_tools", "shared_wiki_write");
+        assert_eq!(find("SOUL.md", "text", "shared_wiki_read").occurrences, 2);
+        find(&format!("SKILLS{}daily{}SKILL.md", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR), "text", "schedule_task");
+        // Whole-name matches only, the match-all wildcard is not a leftover,
+        // and files outside the scanned set are ignored.
+        assert!(!scan.findings.iter().any(|f| f.file.starts_with("wiki")), "{:#?}", scan.findings);
+        assert!(!scan.findings.iter().any(|f| f.file == "notes.txt"));
+        assert!(!scan.findings.iter().any(|f| f.tool == "memory_search"));
+    }
+
+    #[test]
+    fn scan_reports_an_unparsable_agent_toml_instead_of_a_clean_result() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write(tmp.path(), "agent.toml", "[capabilities\nallowed_tools = [");
+        let scan = scan_agent_dir_for_removed_tools(tmp.path());
+        assert_eq!(scan.unreadable, vec!["agent.toml".to_string()]);
+    }
+
+    #[test]
+    fn scan_of_a_clean_or_missing_directory_is_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write(tmp.path(), "SOUL.md", "Use wiki_read with scope=\"shared\".\n");
+        assert_eq!(scan_agent_dir_for_removed_tools(tmp.path()), RemovedToolScan::default());
+        assert_eq!(
+            scan_agent_dir_for_removed_tools(&tmp.path().join("missing")),
+            RemovedToolScan::default()
+        );
+    }
+
+    #[test]
+    fn config_scan_flags_provenance_and_ccr_rows() {
+        let config: toml::Table = toml::from_str(
+            "[provenance]\nsensitive_tools = [\"send_to_agent\", \"shared_wiki_write\"]\n\n[[ccr.allowed_sources]]\nserver = \"duduclaw\"\ntool = \"shared_wiki_read\"\n\n[[ccr.allowed_sources]]\nserver = \"other\"\ntool = \"shared_wiki_read\"\n",
+        )
+        .unwrap();
+        let found = scan_config_for_removed_tools(&config);
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(found.iter().any(|f| f.location == "[provenance] sensitive_tools" && f.tool == "shared_wiki_write"));
+        assert!(found.iter().any(|f| f.location == "[[ccr.allowed_sources]]" && f.tool == "shared_wiki_read"));
+    }
+
 }

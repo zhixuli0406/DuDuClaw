@@ -1,6 +1,7 @@
 use super::*;
 
-/// Schedule a recurring or one-shot task. Writes directly to the shared
+/// The cron rail behind `tasks_create` with a cron `schedule`: write a
+/// recurring task. Writes directly to the shared
 /// SQLite cron store (`<home>/cron_tasks.db`). The gateway's running
 /// `CronScheduler` picks up the new task on its next baseline tick
 /// (≤ 30 seconds) — no inter-process signal is required because both
@@ -45,7 +46,7 @@ pub(crate) async fn handle_schedule_task(params: &Value, home_dir: &Path, caller
     // A scheduled task fires under the `cron` system-sender identity, so once
     // the row exists the delegation predicate waves it through by design.
     // That makes *creating* a row aimed at somebody else the delegation, and
-    // it is judged here — otherwise `schedule_task` launders any
+    // it is judged here — otherwise a scheduled task launders any
     // cross-department assignment through the scheduler.
     let scheduled_target = if agent_id == "default" {
         resolve_main_agent_name(home_dir).await
@@ -54,7 +55,7 @@ pub(crate) async fn handle_schedule_task(params: &Value, home_dir: &Path, caller
     };
     if scheduled_target != caller {
         if let Err(reason) =
-            check_delegation_allowed(home_dir, caller, &scheduled_target, "schedule_task").await
+            check_delegation_allowed(home_dir, caller, &scheduled_target, "tasks_create_schedule").await
         {
             return serde_json::json!({
                 "content": [{"type": "text", "text": format!("Error: {reason}")}],
@@ -89,7 +90,7 @@ pub(crate) async fn handle_schedule_task(params: &Value, home_dir: &Path, caller
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     // v1.8.25: auto-detect the host's IANA timezone when the caller doesn't
-    // specify one explicitly. Historically schedule_task fell through to UTC
+    // specify one explicitly. Historically the cron rail fell through to UTC
     // if `cron_timezone` was absent — which surprised every Taipei-based
     // user whose "0 8 * * *" fired at 16:00 local time. Auto-detecting
     // matches what a human would expect "8am every day" to mean when
@@ -106,9 +107,9 @@ pub(crate) async fn handle_schedule_task(params: &Value, home_dir: &Path, caller
         .or_else(|| {
             let detected = detect_local_timezone();
             if let Some(ref tz) = detected {
-                tracing::info!(detected_tz = %tz, "schedule_task: auto-detected local timezone (no cron_timezone param supplied)");
+                tracing::info!(detected_tz = %tz, "cron schedule: auto-detected local timezone (no cron_timezone param supplied)");
             } else {
-                tracing::warn!("schedule_task: could not detect local timezone — falling back to UTC");
+                tracing::warn!("cron schedule: could not detect local timezone — falling back to UTC");
             }
             detected
         });
@@ -264,7 +265,7 @@ pub(crate) fn cron_created_receipt(name: &str, cron: &str, timezone: Option<&str
 
 /// The agent a cron row runs as — the record's owner. `"default"` is the
 /// scheduler's alias for the main agent, resolved the same way
-/// `schedule_task` resolves it at creation.
+/// the cron rail resolves it at creation.
 pub(crate) async fn cron_row_owner(home_dir: &Path, row: &duduclaw_gateway::cron_store::CronTaskRow) -> String {
     if row.agent_id == "default" {
         resolve_main_agent_name(home_dir).await
@@ -416,7 +417,7 @@ pub(crate) async fn handle_list_cron_tasks(params: &Value, home_dir: &Path, _def
 ///
 /// The row's owner (`agent_id`, which this tool cannot change) must be the
 /// caller or someone the caller may delegate to — the same predicate
-/// `schedule_task` applies at creation, so rewriting another employee's
+/// the cron rail applies at creation, so rewriting another employee's
 /// prompt cannot launder what creating it would have refused.
 pub(crate) async fn handle_update_cron_task(
     params: &Value,

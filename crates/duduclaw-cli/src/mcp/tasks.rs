@@ -126,7 +126,7 @@ pub(crate) async fn handle_tasks_list(args: &Value, home_dir: &Path, default_age
 /// byte-identical to every pre-merge call; `goal` = an autonomous goal on the
 /// shared `goal_create_core` path, contract freeze and `plan_first` included)
 /// and `schedule` chooses the rail (a cron expression registers a recurring
-/// job exactly as `schedule_task` always did; an RFC3339 instant registers a
+/// job on the cron rail; an RFC3339 instant registers a
 /// one-shot reminder in `agent_callback` mode).
 ///
 /// **The WP21 C3 delegation gate is enforced once, here**, before any branch
@@ -300,9 +300,7 @@ pub(crate) async fn handle_tasks_create(
     }
 
     // ── O4 branch 2: schedule ────────────────────────────────────────────
-    // Delegated verbatim to the rails that already own these objects, so the
-    // deprecated `schedule_task` alias and this merged entry produce the same
-    // rows. A cron expression is recurring agent work; an RFC3339 instant is a
+    // Delegated verbatim to the rails that already own these objects. A cron expression is recurring agent work; an RFC3339 instant is a
     // one-shot wake-up, which the platform models as a reminder (cron rows
     // cannot express "once", and pinning a date into a cron field would
     // silently fire again next year).

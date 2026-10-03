@@ -638,3 +638,77 @@ async fn os_situation_approval_ttl_expiry_denies() {
         InstallApprovalOutcome::Proceed => panic!("TTL expiry must deny (fail-closed)"),
     }
 }
+
+// ── v1.69.0: list entries written for a removed tool name ──────────────────
+
+/// True when the dispatch gate stopped to wait for a human decision (the
+/// broker polls for minutes, so a short timeout elapsing means "gated").
+async fn dispatch_gate_waits_for_a_human(
+    home: &std::path::Path,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> bool {
+    let call = super::gate_tool_approval_dispatch(
+        home,
+        "dudu",
+        tool,
+        serde_json::json!({ "name": tool, "arguments": arguments }),
+    );
+    tokio::time::timeout(Duration::from_millis(500), call).await.is_err()
+}
+
+#[tokio::test]
+async fn approval_required_entry_for_a_removed_name_still_gates_the_new_call() {
+    let home = TempHome::new();
+    write_agent_toml(
+        home.path(),
+        "dudu",
+        "[capabilities]\napproval_required_tools = [\"shared_wiki_write\", \"schedule_task\"]\n",
+    );
+    assert!(
+        dispatch_gate_waits_for_a_human(home.path(), "wiki_write", serde_json::json!({"scope": "shared"})).await,
+        "wiki_write scope=shared must wait for approval"
+    );
+    assert!(
+        dispatch_gate_waits_for_a_human(home.path(), "tasks_create", serde_json::json!({"schedule": "0 9 * * *"})).await,
+        "tasks_create with a cron schedule must wait for approval"
+    );
+    // The same tools without the argument were never what the entries named.
+    assert!(!dispatch_gate_waits_for_a_human(home.path(), "wiki_write", serde_json::json!({})).await);
+    assert!(!dispatch_gate_waits_for_a_human(home.path(), "tasks_create", serde_json::json!({"title": "x"})).await);
+}
+
+#[tokio::test]
+async fn irreversible_entry_for_a_removed_name_still_gates_the_new_call() {
+    let home = TempHome::new();
+    write_agent_toml(
+        home.path(),
+        "dudu",
+        "[capabilities]\nirreversible_tools = [\"shared_wiki_write\"]\n",
+    );
+    assert!(
+        dispatch_gate_waits_for_a_human(home.path(), "wiki_write", serde_json::json!({"scope": " Shared "})).await
+    );
+    assert!(!dispatch_gate_waits_for_a_human(home.path(), "wiki_write", serde_json::json!({"scope": "agent"})).await);
+    assert!(!dispatch_gate_waits_for_a_human(home.path(), "wiki_write", serde_json::json!({})).await);
+}
+
+/// The judge (a model call) is never run in tests, so the maybe list is
+/// checked on the classification the judge path starts from.
+#[test]
+fn maybe_irreversible_entry_for_a_removed_name_marks_the_new_call() {
+    let home = TempHome::new();
+    write_agent_toml(
+        home.path(),
+        "dudu",
+        "[capabilities]\nmaybe_irreversible_tools = [\"shared_wiki_write\", \"skill_bank_search\"]\n",
+    );
+    let dir = home.path().join("agents").join("dudu");
+    let call = |tool: &str, args: serde_json::Value| {
+        super::static_gate_flags(&dir, tool, &serde_json::json!({ "arguments": args }))
+    };
+    assert_eq!(call("wiki_write", serde_json::json!({"scope": "shared"})), (false, true));
+    assert_eq!(call("skill_search", serde_json::json!({"source": "bank"})), (false, true));
+    assert_eq!(call("wiki_write", serde_json::json!({})), (false, false));
+    assert_eq!(call("skill_search", serde_json::json!({})), (false, false));
+}

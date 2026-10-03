@@ -53,63 +53,46 @@ fn skill_search_exposes_optional_source() {
     assert!(!p.required);
 }
 
-/// Deprecation contract: every deprecated alias is **still declared** in
-/// `TOOLS` (hiding it from `tools/list` would make it uncallable, which is
-/// the opposite of a deprecation window) and its description opens with a
-/// machine-greppable `[deprecated → …]` marker naming the replacement.
+/// v1.69.0: the removed aliases are no longer declared, so they are gone
+/// from `tools/list`; what replaces each one is still declared.
 #[test]
-fn deprecated_aliases_stay_listed_and_are_marked() {
-    for name in duduclaw_core::tool_catalog::DEPRECATED_MCP_TOOLS {
-        let t = tool(name);
+fn removed_aliases_are_not_declared_and_their_replacements_are() {
+    for removed in duduclaw_core::tool_catalog::REMOVED_MCP_TOOLS {
         assert!(
-            t.description.starts_with("[deprecated → "),
-            "{name} description must open with the deprecation marker; got: {}",
-            &t.description[..t.description.len().min(60)]
+            !tools().any(|t| t.name == removed.name),
+            "{} was removed in v{} and must not be declared",
+            removed.name,
+            removed.removed_in
         );
+        tool(removed.replacement);
+    }
+    // Never aliases, so never removed.
+    tool("shared_wiki_delete");
+    tool("wiki_share");
+}
+
+/// No declared tool still advertises a deprecation window: a leftover
+/// `[deprecated → …]` marker would promise a name that no longer exists.
+#[test]
+fn no_declared_tool_carries_a_deprecation_marker() {
+    for t in tools() {
         assert!(
-            t.description.contains("v1.69.0"),
-            "{name} must name its removal version"
+            !t.description.starts_with("[deprecated"),
+            "{} still carries a deprecation marker",
+            t.name
         );
     }
 }
 
-/// …and a non-deprecated tool must not carry the marker (so the test above
-/// cannot pass by marking everything).
+/// O3: `scope` alone decides which wiki a `wiki_*` call addresses.
 #[test]
-fn merged_entry_points_carry_no_deprecation_marker() {
-    for name in ["wiki_ls", "wiki_write", "tasks_create", "skill_search"] {
-        assert!(
-            !tool(name).description.starts_with("[deprecated"),
-            "{name} is the replacement, not the alias"
-        );
-    }
-}
-
-/// O3 alias equivalence: the shared aliases and the merged names resolve
-/// to the same scope, so a caller that keeps using the old name reaches
-/// exactly the same handler.
-#[test]
-fn shared_wiki_aliases_resolve_to_the_same_scope_as_the_merged_name() {
+fn wiki_scope_comes_from_the_scope_argument_only() {
     use crate::mcp_alias::{WikiScope, resolve_wiki_scope};
-    let shared = serde_json::json!({"scope": "shared"});
-    for (alias, merged) in [
-        ("shared_wiki_ls", "wiki_ls"),
-        ("shared_wiki_read", "wiki_read"),
-        ("shared_wiki_write", "wiki_write"),
-        ("shared_wiki_search", "wiki_search"),
-        ("shared_wiki_stats", "wiki_stats"),
-        ("shared_wiki_lint", "wiki_lint"),
-    ] {
-        assert_eq!(
-            resolve_wiki_scope(alias, &serde_json::json!({})).unwrap(),
-            resolve_wiki_scope(merged, &shared).unwrap(),
-            "{alias} and {merged} scope=\"shared\" must agree"
-        );
-        assert_eq!(
-            resolve_wiki_scope(alias, &serde_json::json!({})).unwrap(),
-            WikiScope::Shared
-        );
-    }
+    assert_eq!(
+        resolve_wiki_scope(&serde_json::json!({"scope": "shared"})).unwrap(),
+        WikiScope::Shared
+    );
+    assert_eq!(resolve_wiki_scope(&serde_json::json!({})).unwrap(), WikiScope::Agent);
 }
 
 /// The merged wiki entry point keeps `wiki:read` / `wiki:write` — adding a
@@ -125,8 +108,8 @@ fn merged_wiki_tools_keep_their_original_scopes() {
         );
     }
     assert_eq!(tool_requires_scope("wiki_write"), Some(Scope::WikiWrite));
-    // …and the shared aliases keep theirs, including the destructive one
-    // that was deliberately NOT merged.
+    // The destructive shared-wiki tool was deliberately NOT merged and keeps
+    // its own name and scope.
     assert_eq!(
         tool_requires_scope("shared_wiki_delete"),
         Some(Scope::WikiWrite)
@@ -210,7 +193,7 @@ async fn tasks_create_kind_goal_freezes_the_acceptance_contract() {
 }
 
 /// O4: a cron `schedule` lands on the cron rail and a one-shot lands on
-/// the reminder rail — the same objects the deprecated aliases produce.
+/// the reminder rail.
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_create_schedule_routes_to_the_cron_and_reminder_rails() {
     let home = std::env::temp_dir().join(format!("duduclaw-o4s-{}", uuid::Uuid::new_v4()));
@@ -231,7 +214,7 @@ async fn tasks_create_schedule_routes_to_the_cron_and_reminder_rails() {
         !cron["isError"].as_bool().unwrap_or(false),
         "cron schedule failed: {cron}"
     );
-    // Same receipt shape `schedule_task` produces (a cron row was written).
+    // A cron row was written.
     let rows = duduclaw_gateway::cron_store::CronStore::open(&home)
         .expect("cron store")
         .list_all()
@@ -278,7 +261,6 @@ async fn skill_search_bank_source_reports_an_empty_store() {
     let out = handle_skill_search(
         &serde_json::json!({"query": "pdf", "source": "bank"}),
         &home,
-        "skill_search",
     )
     .await;
     let text = out["content"][0]["text"].as_str().unwrap_or("");
@@ -290,7 +272,6 @@ async fn skill_search_bank_source_reports_an_empty_store() {
     let bad = handle_skill_search(
         &serde_json::json!({"query": "pdf", "source": "bank", "hub": "github"}),
         &home,
-        "skill_search",
     )
     .await;
     assert!(bad["isError"].as_bool().unwrap_or(false));

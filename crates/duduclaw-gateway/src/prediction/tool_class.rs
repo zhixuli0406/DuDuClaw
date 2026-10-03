@@ -147,25 +147,20 @@ fn classify_mcp(name: &str) -> Option<ToolClass> {
         "create_agent" | "agent_update" | "agent_update_soul" | "agent_remove" => ToolClass::Write,
         "agent_status" | "list_agents" => ToolClass::Read,
 
-        // ── Wiki (shared_wiki_* / wiki_*) ──
+        // ── Wiki (wiki_*, scope picks the agent or shared wiki) ──
         "wiki_ls"
         | "wiki_read"
         | "wiki_stats"
         | "wiki_graph"
         | "wiki_trust_audit"
         | "wiki_trust_history"
-        | "wiki_namespace_status"
-        | "shared_wiki_ls"
-        | "shared_wiki_read"
-        | "shared_wiki_stats" => ToolClass::Read,
-        "wiki_search" | "shared_wiki_search" => ToolClass::Search,
+        | "wiki_namespace_status" => ToolClass::Read,
+        "wiki_search" => ToolClass::Search,
         "wiki_write" | "wiki_dedup" | "wiki_lint" | "wiki_rebuild_fts" | "wiki_share"
-        | "wiki_export" | "shared_wiki_write" | "shared_wiki_delete" | "shared_wiki_lint" => {
-            ToolClass::Write
-        }
+        | "wiki_export" | "shared_wiki_delete" => ToolClass::Write,
 
         // ── Skills ──
-        "skill_search" | "skill_gaps" | "skill_bank_search" => ToolClass::Search,
+        "skill_search" | "skill_gaps" => ToolClass::Search,
         "skill_list" | "skill_curator_status" | "skill_synthesis_status" | "shared_skill_list" => {
             ToolClass::Read
         }
@@ -214,7 +209,7 @@ fn classify_mcp(name: &str) -> Option<ToolClass> {
         "decision_list" => ToolClass::Read,
 
         // ── Task/cron/reminder/plan scheduling (non tasks_*/activity_*) ──
-        "create_task" | "schedule_task" | "update_cron_task" | "delete_cron_task"
+        "create_task" | "update_cron_task" | "delete_cron_task"
         | "pause_cron_task" | "create_reminder" | "cancel_reminder" | "plan_start"
         | "plan_update_step" | "goals_create" => ToolClass::Write,
         "list_cron_tasks" | "list_reminders" | "plan_get" | "goals_list" | "task_status"
@@ -457,7 +452,6 @@ mod tests {
         "reliability_summary",
         "route_query",
         "run_cron_task",
-        "schedule_task",
         "send_message",
         "send_photo",
         "send_sticker",
@@ -467,16 +461,9 @@ mod tests {
         "shared_skill_list",
         "shared_skill_share",
         "shared_wiki_delete",
-        "shared_wiki_lint",
-        "shared_wiki_ls",
-        "shared_wiki_read",
-        "shared_wiki_search",
-        "shared_wiki_stats",
-        "shared_wiki_write",
         "sheets_append",
         "sheets_read",
         "skill_bank_feedback",
-        "skill_bank_search",
         "skill_curator_status",
         "skill_extract",
         "skill_from_recording",
@@ -531,6 +518,21 @@ mod tests {
         // untested either way.
         "code_map",
     ];
+
+    /// The surface list is the live tool set: removed names are not on it,
+    /// and they no longer classify (they cannot be called).
+    #[test]
+    fn removed_tool_names_are_off_the_surface_and_unclassified() {
+        for removed in duduclaw_core::tool_catalog::REMOVED_MCP_TOOLS {
+            assert!(!ALL_MCP_TOOL_NAMES.contains(&removed.name), "{}", removed.name);
+            assert_eq!(
+                ToolClass::classify(RuntimeType::Claude, removed.name),
+                ToolClass::Other,
+                "{}",
+                removed.name
+            );
+        }
+    }
 
     #[test]
     fn classify_exhaustive_mcp_surface_has_no_silent_other() {

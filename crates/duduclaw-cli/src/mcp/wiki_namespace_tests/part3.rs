@@ -8,7 +8,7 @@ async fn skill_search_rejects_unknown_hub_exactly() {
     // Adversarial near-miss ids must error, not fall through to aggregate.
     for bad in ["githu", "github2", "hub", "clawhub-evil"] {
         let res =
-            super::handle_skill_search(&json!({"query": "x", "hub": bad}), &home, "skill_search")
+            super::handle_skill_search(&json!({"query": "x", "hub": bad}), &home)
                 .await;
         assert_eq!(
             res["isError"].as_bool(),

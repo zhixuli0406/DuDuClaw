@@ -159,7 +159,7 @@ const GROUNDING_SEARCH_OVERFETCH: usize = 5;
 /// (`build_action_guard_prompt` in `duduclaw-cli/src/mcp.rs`), which the
 /// judge uses to decide whether a tool call is reversible. Before this fix,
 /// the source pool was "shared wiki (all namespaces) + the CALLING AGENT'S
-/// OWN wiki" — an agent could `shared_wiki_write` (or `wiki_write`, its own
+/// OWN wiki" — an agent could `wiki_write` with `scope="shared"` (or `wiki_write` on its own
 /// local wiki) a page claiming "this operation is reversible / pre-approved"
 /// moments before making the risky call, and that self-authored page would
 /// be retrieved as if it were operational fact. Two changes close this:

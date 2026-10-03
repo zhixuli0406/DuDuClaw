@@ -313,7 +313,6 @@ pub(crate) const PERMISSION_GATED_TOOLS: &[(&str, &str)] = &[
     ("send_to_agent", "can_send_cross_agent"),
     ("spawn_agent", "can_send_cross_agent"),
     ("team_handoff", "can_send_cross_agent"),
-    ("schedule_task", "can_schedule_tasks"),
     ("create_reminder", "can_schedule_tasks"),
     ("update_cron_task", "can_schedule_tasks"),
     ("run_cron_task", "can_schedule_tasks"),
@@ -610,6 +609,18 @@ impl McpDispatcher {
         // `principal.client_id`.
         let gate_agent: &str = acting_gate_agent(principal, &self.default_agent);
 
+        // ── 0a. Removed tool names (answered after the rate limit) ───────────
+        // A name removed after its deprecation window
+        // (`tool_catalog::REMOVED_MCP_TOOLS`) is answered with a tool error
+        // naming its replacement, so a model still using the old name
+        // corrects itself instead of reading a scope or permission refusal.
+        // The reply is built here but sent only after the injection scan and
+        // the rate limiter (step 2): a caller can otherwise repeat the call
+        // without limit and every call writes one `removed_tool` audit row.
+        // The scope check is skipped for these names for the same reason it
+        // is answered early: the name no longer exists, so nothing runs.
+        let removed_reply = crate::mcp::removed_tool_result(tool_name);
+
         // ── 0. External whitelist enforcement ────────────────────────────────
         // (review BLOCKER R2 / security N-1) `tools/list` already filters
         // hidden tools out of discovery, but a malicious external client can
@@ -630,7 +641,9 @@ impl McpDispatcher {
         }
 
         // ── 1. Scope check ───────────────────────────────────────────────────
-        if let Some(required) = crate::mcp_auth::tool_requires_scope_for_args(tool_name, params.get("arguments").unwrap_or(&Value::Null)) {
+        if removed_reply.is_none()
+            && let Some(required) = crate::mcp_auth::tool_requires_scope_for_args(tool_name, params.get("arguments").unwrap_or(&Value::Null))
+        {
             if !principal.scopes.contains(&required) && !principal.scopes.contains(&Scope::Admin) {
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
                 let detail = format!("required {required:?}, principal lacks it (and Admin)");
@@ -721,6 +734,18 @@ impl McpDispatcher {
             return jsonrpc_error(id, -32029, &format!("Rate limited: {e}"));
         }
 
+        // A removed name ends here: nothing runs, one audit row is written.
+        if let Some(removed) = removed_reply {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            self.audit_dispatch_denial(
+                tool_name,
+                params,
+                "removed_tool",
+                removed["content"][0]["text"].as_str().unwrap_or_default(),
+            );
+            return jsonrpc_response(id, removed);
+        }
+
         // ── 3. Namespace injection (external clients only) ───────────────────
         let mut params_owned = params.clone();
         if principal.is_external {
@@ -784,9 +809,25 @@ impl McpDispatcher {
         // capability config (`agent_gate` is the empty default for them), so
         // they are not subject to this gate.
         if !principal.is_external {
-            use duduclaw_core::tool_catalog::{ToolListVerdict, tool_list_verdict};
-            let verdict =
+            use duduclaw_core::tool_catalog::{
+                ToolListVerdict, removed_name_for_call, tool_list_matches, tool_list_verdict,
+            };
+            let mut verdict =
                 tool_list_verdict(tool_name, &agent_gate.denied_tools, &agent_gate.allowed_tools);
+            // A `denied_tools` entry written for a removed name (e.g.
+            // `shared_wiki_write`) keeps refusing the call that replaced it
+            // (`wiki_write` with `scope="shared"`) rather than lapsing
+            // silently. Only ever narrows: the removed name is never used to
+            // allow anything.
+            if verdict != ToolListVerdict::Denied
+                && let Some(legacy) = removed_name_for_call(
+                    tool_name,
+                    params_owned.get("arguments").unwrap_or(&Value::Null),
+                )
+                && tool_list_matches(&agent_gate.denied_tools, legacy)
+            {
+                verdict = ToolListVerdict::Denied;
+            }
             if verdict != ToolListVerdict::Allowed {
                 let (error_class, msg) = if verdict == ToolListVerdict::Denied {
                     (
@@ -1207,12 +1248,29 @@ impl McpDispatcher {
                     None => self.home_dir.join("agents").join(gate_agent),
                 };
             let scoped = duduclaw_gateway::capability_grants::scoped_tools(&agent_dir);
-            if duduclaw_gateway::capability_grants::set_contains_tool(&scoped, tool_name) {
+            // A `scoped_tools` entry written for a removed name (e.g.
+            // `shared_wiki_write`) keeps gating the call that replaced it
+            // (`wiki_write` with `scope="shared"`). The grant is looked up
+            // under the listed name, because that is the name
+            // `capability_request` had to be given to mint it. Only narrows.
+            let scoped_name: Option<&str> =
+                if duduclaw_gateway::capability_grants::set_contains_tool(&scoped, tool_name) {
+                    Some(tool_name)
+                } else {
+                    duduclaw_core::tool_catalog::removed_name_for_call(
+                        tool_name,
+                        params_owned.get("arguments").unwrap_or(&Value::Null),
+                    )
+                    .filter(|legacy| {
+                        duduclaw_gateway::capability_grants::set_contains_tool(&scoped, legacy)
+                    })
+                };
+            if let Some(grant_name) = scoped_name {
                 let has_grant =
                     match duduclaw_gateway::capability_grants::CapabilityGrantStore::open(
                         &self.home_dir,
                     ) {
-                        Ok(store) => store.has_active_grant(gate_agent, tool_name).await,
+                        Ok(store) => store.has_active_grant(gate_agent, grant_name).await,
                         Err(e) => {
                             warn!(
                                 agent = %gate_agent,
@@ -3265,9 +3323,8 @@ effect = "forbid"
         "os_wifi_connect", "os_wifi_scan", "os_wifi_status", "pairing_manage",
         "pause_cron_task", "plan_get", "plan_start", "plan_update_step", "reliability_summary",
         "route_query", "send_message", "send_photo", "send_sticker", "session_restore_context",
-        "shared_skill_list", "shared_wiki_delete", "shared_wiki_lint", "shared_wiki_ls",
-        "shared_wiki_read", "shared_wiki_search", "shared_wiki_stats", "shared_wiki_write",
-        "sheets_append", "sheets_read", "skill_bank_feedback", "skill_bank_search",
+        "shared_skill_list", "shared_wiki_delete", "sheets_append", "sheets_read",
+        "skill_bank_feedback",
         "skill_curator_status", "skill_gaps", "skill_list", "skill_search",
         "skill_security_scan", "skill_synthesis_status", "slides_read", "submit_feedback",
         "synthesize_speech", "task_status", "tasks_block", "tasks_claim", "tasks_complete",
@@ -3295,7 +3352,7 @@ effect = "forbid"
         let names: Vec<String> = crate::mcp::tools()
             .map(|t| crate::mcp::build_tool_schema(t)["name"].as_str().unwrap_or_default().to_string())
             .collect();
-        assert_eq!(names.len(), 249, "tool count changed — classify the new tool here");
+        assert_eq!(names.len(), 241, "tool count changed — classify the new tool here");
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
         let unclassified: Vec<&&str> = all.iter().filter(|t| !gated.contains(**t) && !not_gated.contains(**t)).collect();
         assert!(unclassified.is_empty(), "classify these tools for the [permissions] gate: {unclassified:?}");
@@ -3312,7 +3369,7 @@ effect = "forbid"
         write_scoped_toml(&tmp, "[permissions]\ncan_schedule_tasks = \"no\"\n");
         let principal = make_principal(vec![Scope::Admin], false);
         let result = dispatcher
-            .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params("schedule_task", serde_json::json!({})), &serde_json::json!(3))
+            .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params("create_reminder", serde_json::json!({})), &serde_json::json!(3))
             .await;
         assert!(result["error"]["message"].as_str().unwrap_or("").contains("[permissions]"), "{result}");
     }
@@ -3327,7 +3384,7 @@ effect = "forbid"
             .dispatch_tool_call(
                 &principal,
                 &make_ns_ctx(false),
-                &make_params("schedule_task", serde_json::json!({"cron": "0 9 * * *", "task": "x"})),
+                &make_params("tasks_create", serde_json::json!({"title": "x", "schedule": "0 9 * * *"})),
                 &serde_json::json!(1),
             )
             .await;
@@ -3335,6 +3392,138 @@ effect = "forbid"
         assert!(result["error"]["message"].as_str().unwrap().contains("can_schedule_tasks"));
         let log = std::fs::read_to_string(tmp.path().join("security_audit.jsonl")).unwrap();
         assert!(log.contains("\"permission_denied\"") && log.contains("can_schedule_tasks"), "{log}");
+    }
+
+    /// v1.69.0 (D8): a removed tool name is answered with a tool error that
+    /// names its replacement — before any scope or permission gate, so it
+    /// never reads as a refusal — and leaves one `removed_tool` audit row.
+    #[tokio::test]
+    async fn removed_tool_names_get_their_replacement_not_a_refusal() {
+        for removed in duduclaw_core::tool_catalog::REMOVED_MCP_TOOLS {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dispatcher = make_dispatcher(&tmp).await;
+            // No scopes at all: a scope refusal would show up as -32003.
+            let principal = make_principal(vec![], false);
+            let result = dispatcher
+                .dispatch_tool_call(
+                    &principal,
+                    &make_ns_ctx(false),
+                    &make_params(removed.name, serde_json::json!({"page_path": "a.md"})),
+                    &serde_json::json!(9),
+                )
+                .await;
+            assert!(result.get("error").is_none(), "{}: {result}", removed.name);
+            assert_eq!(result["result"]["isError"], true, "{}: {result}", removed.name);
+            let text = result["result"]["content"][0]["text"].as_str().unwrap_or("");
+            assert_eq!(text, removed.message(), "{}", removed.name);
+            assert!(text.contains(removed.replacement), "{text}");
+            let audit = std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap_or_default();
+            let rows: Vec<serde_json::Value> = audit
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .filter(|r: &serde_json::Value| r["tool_name"] == removed.name)
+                .collect();
+            assert_eq!(rows.len(), 1, "{}: {audit}", removed.name);
+            assert_eq!(rows[0]["error_class"], "removed_tool");
+            assert_eq!(rows[0]["success"], false);
+        }
+    }
+
+    /// A `denied_tools` entry written for a removed name keeps refusing the
+    /// call that replaced it, and nothing else.
+    #[tokio::test]
+    async fn a_denied_removed_name_still_refuses_its_replacement_call() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\ndenied_tools = [\"mcp__duduclaw__shared_wiki_write\"]\n");
+        let principal = make_principal(vec![Scope::Admin], false);
+        let shared = dispatcher
+            .dispatch_tool_call(
+                &principal,
+                &make_ns_ctx(false),
+                &make_params("wiki_write", serde_json::json!({"scope": "shared", "page_path": "a.md", "content": "x"})),
+                &serde_json::json!(1),
+            )
+            .await;
+        assert_eq!(shared["error"]["code"], -32003, "{shared}");
+        assert!(shared["error"]["message"].as_str().unwrap_or("").contains("denied_tools"), "{shared}");
+        let own = dispatcher
+            .dispatch_tool_call(
+                &principal,
+                &make_ns_ctx(false),
+                &make_params("wiki_write", serde_json::json!({"page_path": "a.md", "content": "x"})),
+                &serde_json::json!(2),
+            )
+            .await;
+        assert!(
+            !own["error"]["message"].as_str().unwrap_or("").contains("denied_tools"),
+            "the agent-wiki call was never what the entry denied: {own}"
+        );
+    }
+
+    /// A `scoped_tools` entry written for a removed name still requires a
+    /// task grant for the call that replaced it, and only for that call.
+    #[tokio::test]
+    async fn scoped_entry_for_a_removed_name_still_requires_a_grant_for_the_new_call() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nscoped_tools = [\"shared_wiki_write\", \"schedule_task\"]\n");
+        let principal = make_principal(vec![Scope::Admin], false);
+        for (tool, args) in [
+            ("wiki_write", serde_json::json!({"scope": "shared", "page_path": "a.md", "content": "x"})),
+            ("tasks_create", serde_json::json!({"title": "x", "schedule": "0 9 * * *"})),
+        ] {
+            let result = dispatcher
+                .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params(tool, args), &serde_json::json!(1))
+                .await;
+            assert_eq!(result["error"]["code"], -32003, "{tool}: {result}");
+            assert!(
+                result["error"]["message"].as_str().unwrap_or("").contains("capability_request"),
+                "{tool}: {result}"
+            );
+        }
+        for (tool, args) in [
+            ("wiki_write", serde_json::json!({"page_path": "a.md", "content": "x"})),
+            ("tasks_create", serde_json::json!({"title": "x"})),
+        ] {
+            let result = dispatcher
+                .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params(tool, args), &serde_json::json!(2))
+                .await;
+            assert!(
+                !result["error"]["message"].as_str().unwrap_or("").contains("capability_request"),
+                "{tool} without the argument was never scoped: {result}"
+            );
+        }
+    }
+
+    /// The removed-name reply sits behind the rate limiter: an exhausted
+    /// bucket gets the rate-limit refusal and no further audit rows.
+    #[tokio::test]
+    async fn removed_name_calls_are_rate_limited_and_stop_writing_audit_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        let principal = make_principal(vec![], false);
+        let call = || make_params("shared_wiki_read", serde_json::json!({"page_path": "a.md"}));
+        let first = dispatcher
+            .dispatch_tool_call(&principal, &make_ns_ctx(false), &call(), &serde_json::json!(1))
+            .await;
+        assert_eq!(first["result"]["isError"], true, "{first}");
+        let rows = |tmp: &tempfile::TempDir| {
+            std::fs::read_to_string(tmp.path().join("tool_calls.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        assert_eq!(rows(&tmp), 1);
+        // 1 token spent above; drain the rest of the Read bucket.
+        for _ in 0..200 {
+            let _ = dispatcher.rate_limiter.check(&principal.client_id, OpType::Read);
+        }
+        let limited = dispatcher
+            .dispatch_tool_call(&principal, &make_ns_ctx(false), &call(), &serde_json::json!(2))
+            .await;
+        assert_eq!(limited["error"]["code"], -32029, "{limited}");
+        assert_eq!(rows(&tmp), 1, "a rate-limited call writes no audit row");
     }
 
     #[tokio::test]

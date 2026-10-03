@@ -901,7 +901,7 @@ fn identity_rule_masks_known_people_and_round_trips_to_the_owner() {
     let redacted = pipeline
         .redact(
             tool_result,
-            &Source::ToolResult { tool_name: "shared_wiki_read".into() },
+            &Source::ToolResult { tool_name: "wiki_read".into() },
         )
         .unwrap();
 

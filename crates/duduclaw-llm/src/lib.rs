@@ -58,7 +58,7 @@ pub use moa::{
 pub use provenance::{
     CJK_TAINT_MIN_CHARS, CallDecision, DEFAULT_TAINT_MIN_CHARS, FlagKind, MAX_LEDGER_SPANS,
     MAX_LEDGER_TOTAL_CHARS, PREVIEW_MAX_CHARS, ProvenanceConfig, ProvenanceFlag, ProvenanceLedger,
-    ProvenancePolicy, SensitiveTool, SourceKind, TaintHit, TrustLevel, evaluate_call,
+    ProvenancePolicy, ScopedToolTrust, SensitiveTool, SourceKind, TaintHit, TrustLevel, evaluate_call,
     seed_default_ledger,
 };
 pub use provider::{ApiAuth, ChatProvider, ProviderId, resolve_env_key, split_model_id};

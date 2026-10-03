@@ -110,6 +110,14 @@ pub(crate) fn tool_error(msg: &str) -> Value {
     })
 }
 
+/// The tool result for a call to an MCP tool name removed after its
+/// deprecation window (`duduclaw_core::tool_catalog::REMOVED_MCP_TOOLS`): a
+/// tool error naming the replacement and its argument, so the model can
+/// correct the call itself. `None` for any other name. Exact match only.
+pub(crate) fn removed_tool_result(tool_name: &str) -> Option<Value> {
+    duduclaw_core::tool_catalog::removed_mcp_tool(tool_name).map(|row| tool_error(&row.message()))
+}
+
 // ─────────────────────────────────────────────────────────────────
 // OS-native Phase 1 tool handlers (os_notify / os_watch_status / os_open).
 // The os_native capability, scope, and (for os_open) ActionGuard gates are all

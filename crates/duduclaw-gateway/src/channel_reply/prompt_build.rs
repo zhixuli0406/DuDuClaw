@@ -329,7 +329,7 @@ pub(super) fn build_system_prompt(
 
     // RFC-21 §1: inject the `<sender>` block so SOUL.md rules like
     // "reject non-project members" become evaluable from data the agent
-    // already has, instead of requiring a mid-reasoning shared_wiki_read
+    // already has, instead of requiring a mid-reasoning shared-wiki read
     // lookup. XML-delimited per the security-hooks injection-resistance
     // convention — the block is placed before team / wiki context so the
     // agent reads "who am I talking to" before "what do I know".

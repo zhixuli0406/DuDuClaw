@@ -67,22 +67,6 @@ pub(super) const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "skill_bank_search",
-        description: "[deprecated → skill_search source=\"bank\"; removed in v1.69.0] Search the skill bank for learned skills matching a query. Returns ranked results with confidence scores.",
-        params: &[
-            ParamDef {
-                name: "query",
-                description: "Search query to match against skill names and descriptions",
-                required: true,
-            },
-            ParamDef {
-                name: "limit",
-                description: "Maximum number of results to return (default: 5)",
-                required: false,
-            },
-        ],
-    },
-    ToolDef {
         name: "skill_bank_feedback",
         description: "Provide success/failure feedback for a skill execution. Updates confidence via Bayesian update.",
         params: &[

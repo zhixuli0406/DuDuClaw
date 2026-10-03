@@ -395,7 +395,7 @@ export function RoutinesPage() {
   // WP6 — a routine created from a channel ("每天九點幫我看信") used to land in
   // `cron_tasks.db` and stay invisible here until a manual reload, which reads
   // as "the bot ignored me". The gateway now pushes `cron.changed` for every
-  // cron mutation (dashboard RPC, MCP `schedule_task`, agent self-scheduling);
+  // cron mutation (dashboard RPC, MCP `tasks_create` with `schedule`, agent self-scheduling);
   // refetch on it. Refetch rather than patch: the list is small and cannot
   // drift from the server's view this way.
   // A bulk edit raises one event per row, so the refetch is debounced (M4) —
