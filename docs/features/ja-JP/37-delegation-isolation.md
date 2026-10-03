@@ -41,13 +41,29 @@ DuDuClaw 1.52 は、複数人チーム向けの委任制御を導入しました
 **2. タスクディスパッチ** — タスクボードでのタスク作成（`tasks_create`）または再割り当て（`tasks_update` の `assigned_to`）で誰かに割り当てる
 
 - チェックは 1 と同じ。拒否時はタスクの作成／再割り当てが失敗する
-- 自分のタスクの引き受け（`tasks_claim`）は制限なし
+- 未割り当て、または自分に割り当て済みのタスクの引き受け（`tasks_claim`）は制限なし。他の社員に割り当てられたタスクを引き受けるには、その社員と同じ関係が必要
 - ダッシュボードでの割り当て操作は制限なし（すべて人間の操作）
 
 **2b. マルチステップ計画と定期業務** — `create_task` の各ステップは実行者を指定でき、`schedule_task` は他人のために定期業務をスケジュールできる
 
 - どちらも委任であり、作成時点でチェックされる。`create_task` のステップは実際のディスパッチ直前にもう一度チェックされる
 - 自分のためのスケジュール、自分を実行者に指定するのは制限なし
+
+**2c. 他人のレコードの変更・起動** — すでにいずれかの AI 社員のものになっているレコードに作用するツール
+
+以前は作成時だけがチェックされ、既存レコードの変更はチェックされなかったため、更新を使えば作成時に拒否されたことができてしまいました。次のツールは同じ述語で呼び出し元とレコードの所有者を照合します：
+
+| ツール | レコードの所有者 |
+|--------|----------------|
+| `tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`task_id` 付きの `activity_post` | タスクの割り当て先（割り当て先・引き受け者・作成者が関係なしで操作できる条件はタスクボードのページを参照） |
+| `update_cron_task`、`delete_cron_task`、`pause_cron_task`、`run_cron_task` | その定期業務を実行する社員 |
+| `create_reminder` | `agent_id` で指定した社員（省略時は呼び出し元自身） |
+
+- 自分のレコードの操作は制限なし。それ以外は委任関係で決まる
+- 所有者を判定できないレコードは拒否（未割り当て・未引き受けのタスクは先に引き受ける）
+- オペレーター（どの AI 社員にも対応しない MCP キーで、プロセスも社員用に起動されたものではない）は制限なし
+- 社員身分のないプロセスで内部共有キーを使う場合、行為者は内部 client id になる。これは組織図のどのノードでもないため、誰のレコードに対しても拒否される
+- cron ツールは 1 件だけに作用する。`name` で指定したとき、同名の定期業務が複数あれば拒否され、返答に候補の id が並ぶ（この変更以前は `delete_cron_task` と `pause_cron_task` が同名のすべての行に、`update_cron_task` は最初の 1 件に作用していた）
 
 **3. 自動化ルール** — autopilot ルール内の delegate アクション
 
@@ -121,7 +137,8 @@ allow = [
 拒否された委任の試みはすべて痕跡を残し、インターセプト地点によって 2 つのファイルに分かれます：
 
 - ディスパッチが実際に実行される直前にブロック（bus キュー、マルチステップ計画）→ `~/.duduclaw/security_audit.jsonl`、イベント型 `delegation_denied`
-- MCP ツールの時点でブロック（`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `create_task` / `schedule_task`）→ `~/.duduclaw/tool_calls.jsonl`、同じく `delegation_denied`。`create_agent` / `agent_update` による組織変更のブロックは `org_placement_denied`
+- MCP ツールの時点でブロック（`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `tasks_claim` / `tasks_complete` / `tasks_block` / `activity_post` / `create_task` / `schedule_task` / cron 管理ツール / `create_reminder`）→ `~/.duduclaw/tool_calls.jsonl`、同じく `delegation_denied`。`create_agent` / `agent_update` による組織変更のブロックは `org_placement_denied`
+- 関係そのものとは別の理由によるレコード変更の拒否も `tool_calls.jsonl` に `reason` 付きで記録される：`owner_unknown`、`caller_unknown`、`system_sender_identity`、`reserved_tag_change`、`goal_contract_frozen`。AI 社員が `agent_update` で自分の権限系設定を変えようとした場合は `agent_authority_refused`（reason `self_authority_change`）
 
 `security_audit.jsonl` のレコードはこのような形です：
 
@@ -182,6 +199,8 @@ allow = [
 
 上記の名前（および `a2a-client`、`default`、`__` で始まるすべての名前）は**予約語**であり、AI 社員の作成に使用できません——さもなければ自分に通行証を発行するのと同じことになります。
 
+これらの名前は MCP プロセスの身分としても受け付けません。MCP の `create_agent` ツール、ダッシュボード、`duduclaw agent create` コマンドはいずれも社員作成時にこれらの名前を拒否し、gateway は社員の MCP server を必ずその社員のディレクトリ id で起動します。社員がこれらの名前を使っていない限り、`dashboard`、`cron`、`goal-loop-driver`、`heartbeat`、`autopilot`、`webhook` を名乗るプロセスは自称でしかありえません。そうしたプロセスは信頼できない身分に解決され、上記のレコードチェックでも拒否されます。この置き換えが起きると、`tool_calls.jsonl` にプロセスごとに1件（ツール `mcp_identity`、reason `system_sender_identity`）が記録され、名乗った名前とその出所（`DUDUCLAW_AGENT_ID` なら `env`、`[general] default_agent` なら `config`）が残ります。
+
 ### この防衛線がカバーする範囲、しない範囲
 
 カバーする範囲：AI 社員同士がプラットフォーム機能を通じて相互に仕事を委任するすべての経路（MCP ツール、タスクボード、マルチステップ計画、定期業務、タスクキュー、外部 A2A）。これは**組織的権限境界**であり、「誰が誰に仕事を命じられるか」を組織図に沿わせるものです。
@@ -189,7 +208,7 @@ allow = [
 カバーしない範囲（設計上の既知の境界であり、バグではない）：
 
 - **旧形式タスク**：1.52 では送信者フィールドがまったくないキュータスクは引き続き通過させ、warning を 1 件記録するだけ（アップグレード時にキューに残っている仕事を全部潰さないため）。次のバージョンで拒否に変わる。
-- **設定ファイルレベルの変更**：v1.52 以降、PreToolUse hook が機微な組織データフィールドを凍結——agent は Write/Edit/Bash ツールを通じて `agent.toml` の `name` / `reports_to` / `department`、`[capabilities]` セクション全体（Team-as-Agent レビュー後に追加）、`config.toml` の `[delegation]` / `[acp]` セクション、`.mcp.json` の身分ブロック、`.claude/settings.json`、`identity.key` を書き換えられない。これらの設定変更はダッシュボードまたは `agent_update` MCP ツールという、審査済みの正式な経路を通す必要がある。社員をまたぐファイル変更（例：他人の SOUL.md の変更）も拒否される。非 Claude runtime（codex/gemini など）は workspace-write サンドボックス下で `~/.duduclaw/` ディレクトリに書き込めず、サンドボックス層の防衛線となる。FullAccess サンドボックスのみが例外で、これはオペレーターが明示的に選択した極端な権限である。
+- **設定ファイルレベルの変更**：v1.52 以降、PreToolUse hook が機微な組織データフィールドを凍結——agent は Write/Edit/Bash ツールを通じて `agent.toml` の `name` / `reports_to` / `department`、`[capabilities]` セクション全体（Team-as-Agent レビュー後に追加）、`config.toml` の `[delegation]` / `[acp]` セクション、`.mcp.json` の身分ブロック、`.claude/settings.json`、`identity.key` を書き換えられない。これらの設定変更はダッシュボードまたは `agent_update` MCP ツールという、審査済みの正式な経路を通す必要がある。同じ hook は、AI 社員が自分の `agent.toml` のセキュリティ設定や DuDuClaw ホームの状態を変更することも防ぐ。ルールと限界は[セキュリティ防御](05-security-defense.md)を参照。社員をまたぐファイル変更（例：他人の SOUL.md の変更）も拒否される。非 Claude runtime（codex/gemini など）は workspace-write サンドボックス下で `~/.duduclaw/` ディレクトリに書き込めず、サンドボックス層の防衛線となる。FullAccess サンドボックスのみが例外で、これはオペレーターが明示的に選択した極端な権限である。
 - **システムと人間が起点の操作**：ダッシュボード、webhook、スケジュール、自動化ルールはもともとオペレーターの意志であり、一律に許可される。
 
 ### 可視範囲のフィルタリング
@@ -213,6 +232,8 @@ allow = [
 - リーダーは自分の直属の部下を作るか、部下の下に接続することしかできない
 - 上司の下に社員を作ることはできない（オペレーターがその上司またはさらに上位である場合を除く）
 - ダッシュボードからの社員作成は制限なし（人間の操作）
+
+`agent_update` にも社員自身の設定についての対応する規則があります。AI 社員は自分について `reports_to`、`db_sources`、`db_sources_add`、`db_sources_remove`、`budget_cents`、`role` を送れません。呼び出し全体が拒否され、`agent_authority_refused` として記録されます。これらは社員が誰に報告するか、どのデータベースを読めるか、いくら使えるか、メイン agent と見なされるかを決める設定で、上司（委任ポリシーが許す上位者）またはオペレーターが変更します。部下の設定変更は従来どおりで、AI 社員は自分の権限以外のフィールド（表示名、モデル、ハートビートなど）は引き続き変更できます。
 
 ### 削除された社員の名前は予約されたままになる
 
@@ -274,12 +295,14 @@ Agent がファイルツール（Write/Edit/Bash）を通じて行う変更は P
 | `.claude/settings.json` | ファイル全体 | 権限リストなどの機微な設定はダッシュボードが一元管理 |
 | `identity.key` | （ファイル全体） | 署名鍵。いかなる変更も身元検証を破壊する |
 
+AI 社員身分の呼び出し元に対しては、社員自身の `agent.toml` のセキュリティ設定と DuDuClaw ホームの状態も凍結される。[セキュリティ防御](05-security-defense.md)を参照。
+
 #### 正しい変更経路
 
 これらの設定を変更する必要があるとき：
 
-- **`name`、`reports_to`、`department` の変更** → ダッシュボード「AI 社員 → 詳細 → 編集」、または MCP `agent_update` ツール
-- **権限の調整やツールの追加** → ダッシュボード「AI 社員 → 詳細設定」、MCP `agent_update` ツール、またはオペレーターが通常のエディタで `agent.toml [capabilities]` を編集。いずれもこの hook を通らない（hook が見えるのは Claude Code 自身の Write／Edit／Bash 呼び出しだけ）ため、社員（およびそのチームロールメンバー）はセッション内からこの経路を取れない
+- **`name`、`reports_to`、`department` の変更** → ダッシュボード「AI 社員 → 詳細 → 編集」、または MCP `agent_update` ツール（AI 社員は部下には使えるが、自分の `reports_to` には使えない。前述）
+- **権限の調整やツールの追加** → ダッシュボード「AI 社員 → 詳細設定」、MCP `agent_update` ツール、またはオペレーターが通常のエディタで `agent.toml [capabilities]` を編集。いずれもこの hook を通らない（hook が見えるのは Claude Code 自身の Write／Edit／Bash 呼び出しだけ）ため、社員（およびそのチームロールメンバー）はセッション内からこの経路を取れない。`agent_update` では、AI 社員は部下にデータベースソースを付与できるが、自分には付与できない
 - **権限の調整やツールの追加** → ダッシュボード「AI 社員 → 高度な設定」、または `agent.toml [capabilities]` を編集して手動指定（ファイルツールを通さない）
 - **委任ポリシーやホワイトリストの変更** → ダッシュボード「高度な設定 → 委任権限」、または `config.toml [delegation]` を直接編集して gateway を再起動
 - **MCP server の追加** → `.mcp.json` の `tools` 配列を編集（身分ブロックは触らない）、ダッシュボード「高度な設定 → MCP サーバー」で手動追加
@@ -288,7 +311,7 @@ Agent がファイルツール（Write/Edit/Bash）を通じて行う変更は P
 
 #### システム身分は無制限
 
-システム送信者（dashboard、webhook、cron、autopilot）の操作は制限を受けず、あらゆる設定を変更できます。これは設計上の保証です：これらのソースはすべてオペレーターの意志の体現だからです。
+システム送信者（dashboard、webhook、cron、autopilot）の操作は制限を受けず、あらゆる設定を変更できます。これは設計上の保証です：これらのソースはすべてオペレーターの意志の体現だからです。これは gateway 自身の経路にだけ当てはまり、これらの名前を名乗る MCP プロセスは信頼できない身分として扱われます（前述の「誰が『システム』と見なされるか」参照）。
 
 ### ホワイトリスト入力の柔軟性
 

@@ -58,6 +58,18 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 - `agent.toml [permissions]`：`false` と書かれたフラグは、`create_agent`（`can_create_agents`）、`send_to_agent`・`spawn_agent`（`can_send_cross_agent`）、`schedule_task`・`create_reminder`・`schedule` 付きの `tasks_create`（`can_schedule_tasks`）、`skill_hub_install`・`shared_skill_adopt`・`skill_graduate`・`skill_pin`・`skill_from_recording`（`can_modify_own_skills`）を拒否します。拒否は JSON-RPC エラー -32003 と監査イベント `permission_denied` になります。`agent.toml` が存在するのに読めない・解析できない場合はこれらのツールを拒否し、ファイルがなければ許可します。`schedule` なしの `tasks_create` は許可されるため、これらのフラグは呼び出しごとに確認されます。一時的な役割メンバーは `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` が `false` で作られます。
 - `config.toml [odoo] features_*`：Odoo ツールは一覧に残り、無効になったモジュールのモデルへの呼び出しは呼び出しごとに拒否されます（project と hr は既定でオフ）。
 
+### レコードの関係チェック：一覧に出るが拒否される
+
+AI 社員のものになっているレコードを変更・起動するツールがあります。どの呼び出し元にも一覧には出し、呼び出しごとに関係を確認します。
+
+- **タスク**：`tasks_update` と `task_id` 付きの `activity_post` は、タスクの割り当て先・引き受け者・作成者ならそのまま通ります。`tasks_complete` と `tasks_block` は割り当て先と引き受け者だけ、`tasks_claim` は未割り当てか自分に割り当て済みのタスクなら通ります。それ以外は割り当て先との委任関係が必要です（同じ部署、`reports_to` の上下、またはホワイトリストのペア。`[delegation] policy` に従う）。未割り当て・未引き受けのタスクは先に引き受けます。`tasks_update` で他人のタスクを自分に割り当て直すには、常にその関係が必要です。
+- **タスクのフィールド**：AI 社員はゴールモードのタスクの `title` と `description` を変更できず（`acceptance_criteria` はすべての MCP 呼び出し元が変更不可）、`tasks_update` でも `tasks_create` の `tags` でも、`outcome:`・`grant:` で始まるタグと `auto-research` タグを追加・削除・並べ替えできません。
+- **定期業務**：`update_cron_task`、`delete_cron_task`、`pause_cron_task`、`run_cron_task` は、呼び出し元がその定期業務を実行する社員本人か、その社員と関係がある場合に通ります。`name` で指定すると 1 件だけに作用し、同名が複数あれば候補 id を示して拒否します。
+- **リマインダー**：`create_reminder` の `agent_id` が呼び出し元以外なら、その社員との関係が必要です。
+- **自分への `agent_update`**：AI 社員は自分について `reports_to`、`db_sources`、`db_sources_add`、`db_sources_remove`、`budget_cents`、`role` を送れません（監査 `agent_authority_refused`）。部下の編集は従来どおりです。
+
+オペレーター（どの AI 社員にも対応しない MCP キーで、プロセスも社員用に起動されたものではない）は制限されません。社員身分のないプロセスの内部共有キーはどのレコードも所有しないため、誰のレコードでも拒否されます。身分がシステム送信者名（`dashboard`、`cron` など）のプロセスは信頼できない身分として扱われます。拒否はすべて `tool_calls.jsonl` に記録されます。詳細は[タスクボード](../../features/ja-JP/24-task-board.md)、[委任の隔離](../../features/ja-JP/37-delegation-isolation.md)を参照。
+
 ## 説明のバイト予算
 
 各ツールの `description` は **200 バイト**、各パラメータの説明も **200 バイト**が上限です（明記された例外が 1 件だけあります）。この上限は慣習ではなくテストで強制されます。
@@ -141,6 +153,25 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 | `computer_session_stop` | `session_id` 文字列、任意 | コンテナを削除する |
 
 整数と真偽値のパラメータは、数値の文字列と `"true"`/`"false"` の文字列も受け付けます。クリック、入力、キー、スクロール、ナビゲートはそれぞれ 1 アクションとして `max_actions`（既定 50）に数えられます。上限、承認と確認のルール、ネットワーク許可リストとその残存リスクは[ブラウザ自動化](../../features/ja-JP/08-browser-automation.md)にあります。
+
+### `belief_stats` / `belief_settle` — 検証済みと自己申告の決済
+
+キャリブレーションに数えるのは、プラットフォームの価格と照合した決済だけです。現時点では本番でこの照合を行う経路はなく、`belief_settle` はすべての決済を社員自身の申告（`settle_source = "agent_unverified"`）として記録します。そのため既存のどの環境でも、キャリブレーションは「検証済みの決済なし」になります。
+
+`belief_settle` は決済後の行に `counts_toward_calibration`（真偽値）を加えて返し、`false` のときは、記録はされたがキャリブレーションには数えない旨の `note` を付けます。
+
+`belief_stats` が返す内容（ダッシュボードの `belief.summary` の `stats` と同じものに `note` を追加）：
+
+| フィールド | 意味 |
+|-----------|------|
+| `n_submitted` | 提出されたすべての信念（決済済みかどうかを問わない） |
+| `n_settled_all` | 決済済みのすべての信念（`verified.n + self_reported.n`） |
+| `calibration_status` | `no_verified_settlements`、`insufficient_samples`（検証済み 1〜29 件）、`calibrated`（30 件以上） |
+| `verified` | `n`、`hits`、および `hit_rate`、`hit_rate_wilson_low`、`mean_brier`、`overconfidence`（`calibrated` 以外ではすべて `null`） |
+| `self_reported` | `n` と記述用の `hit_rate`（`n` が 0 なら `null`）。キャリブレーションではない |
+| `per_subject[]` | `subject`、`verified`（`n`、`hits`、`mean_brier`）、`self_reported`（`n`） |
+
+以前のフラットなフィールド（`n_total`、`n_settled`、`insufficient_samples`、トップレベルの `hit_rate` など）は削除されました。[信念ループ](../../features/ja-JP/46-belief-loop.md)を参照。
 
 ### `create_agent` / `agent_remove` — 削除された名前は予約される
 

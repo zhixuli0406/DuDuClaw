@@ -33,12 +33,12 @@
 | 目標任務管理台 `/goals`（v1.58） | 儀表板直接指派目標給 AI 員工（與 `/goal` 同一套語義）、每目標完整逐輪執行時間軸（`tasks.timeline`）、人工介入就地操作；儀表板所有 needs_human 裁決統一走與通道按鈕相同的 fail-closed `tasks.goal_decide` 路徑 |
 | 預測與驗證頁（v1.58） | LLM→LWM 迴圈可視化：預測 → 執行 → 觀測 → 對照；逐輪預測 vs 實際（`forward.chain`）；每 agent 預測能力判定卡（Brier + Murphy 分解，三態誠實標籤）；世界模型狀態桶首次可讀；MAV 逐面向裁決、執行紀錄連結、重派／無進展訊號與預測子誤差逐輪落庫 |
 | 通道 OTP 候選鏈 + 設定整合（v1.58） | 登入驗證碼送信改為「全域 token 優先，再逐一嘗試各 agent 專屬 bot token」（去重、排序），修復 bot 綁到單一員工後 OTP 靜默失敗；agent 通道設定與通道管理共用同一個編輯對話框；側邊欄「新功能」（`newIn`）標籤機制上線 |
-| 信念迴圈（v1.59） | 對外部世界的結構化信念記帳（`belief_submit` / `belief_settle` / `belief_stats` MCP 工具）；確定性三向 Brier 結算，對照提交時基準值並與 TickHub 交叉核對（agent 不能自報現實）；校準統計與信念對照兩個程式化注入鉤點；/foresight 信念與驗證分頁（[46-belief-loop.md](46-belief-loop.md)） |
+| 信念迴圈（v1.59） | 對外部世界的結構化信念記帳（`belief_submit` / `belief_settle` / `belief_stats` MCP 工具）；確定性三向 Brier 結算，對照提交時基準值；校準數字只計有交叉驗證的結算，目前沒有任何正式路徑提供交叉驗證，所以現有結算全是自報，另外計數、不算校準；校準統計與信念對照兩個程式化注入鉤點；/foresight 信念與驗證分頁（[46-belief-loop.md](46-belief-loop.md)） |
 | 每目標契約欄位 + 自主研究（v1.59） | 建目標時可設 `duration_hours`（到期 → needs_human）與 `risk_boundary`（留空套五行基本款），逐輪注入並由 MAV safety 面向檢核；`/goal` 支援 `時限:`／`邊界:` 段；可勾選要求結構化預測；當日信念失準的員工自動獲派晚間研究目標 |
 | 派工引擎預設開 + 排程器活性（v1.59） | `[dispatch] enabled` 預設改 true（指派目標開箱即跑），儀表板熱切換；`/healthz` 在 cron／heartbeat 迴圈停擺逾 5 分鐘時回 503：修復排程層全滅、容器卻連日顯示 healthy 的事故 |
 | 兩段式裁決 + 判官硬化（v1.60） | MAV 判官團之前先跑便宜的第一階段評估器（`continue`/`candidate_complete`/`blocked`，預設開；任何故障降級直跑完整 MAV，絕不自動通過）；四條判官紀律（反棘輪、只稽核不自建證據、反契約外擴張、自稱完成不是證據）；修掉截斷面板與首 token `PASS` 誤判兩個 fail-open 洞；gap 指紋停滯偵測；提前收工偵測；`resume_on_restart` 預設 `pause` |
 | 可換判官 seam（v1.60） | `[dispatch] judge = mav / evaluator_only / external / human_only`（`evaluator_only` 與 `human_only` 自 v1.66.0 起棄用，v1.69.0 移除）：外部判官任何故障一律降級回 MAV（變嚴、留稽核），其 feedback 視為未受信 DATA；未知值回退 `mav`；設定→自動化有下拉選擇器 |
-| 目標契約凍結（v1.60） | 建立時把驗收標準凍結成不可變 `acceptance_criteria_baseline`，判官與評估器一律讀這份基準；agent 身分以 `tasks_update` 改 goal 任務驗收標準一律拒絕並留稽核；`/goal` 未帶標準時附四要素引導與 outcome 式標準建議 |
+| 目標契約凍結（v1.60） | 建立時把驗收標準凍結成不可變 `acceptance_criteria_baseline`，判官與評估器一律讀這份基準；agent 身分以 `tasks_update` 改 goal 任務的驗收標準、`title` 或 `description` 一律拒絕並留稽核；`/goal` 未帶標準時附四要素引導與 outcome 式標準建議 |
 | 目標迴圈人為信號 + 准入排隊（v1.60） | needs_human 帶封閉六類 `pause_reason`（觸發現場靜態標記，絕不從 LLM 敘述反解）；逾時進度通報（`progress_report_minutes`）；零 LLM 工具連擊 advisory（3/5/8 逐級）；ephemeral spawn 超限改有界 FIFO 排隊（預設 `queue`）；預算耗盡改交「最佳輪成品」（確定性挑選 + 差距清單，不再空手升級） |
 | Agent Mail（v1.60） | 每 agent 信箱（`/mail` 頁）：Gmail API／drop folder 入站，外發一律先建草稿等 ApprovalBroker 確認（背景 worker 是唯一寄信者），信件內容 DATA 圍欄，獨立不可外部授予的 scope，跨 agent 讀信過 delegation policy 判定（[47-agent-mail.md](47-agent-mail.md)） |
 | Agent 組態 preset P1（v1.60） | `duduclaw preset` 指令族 + `agent create --preset`，可具名複用的組態組合；綁定權威存 `preset_bindings.toml`，解析結果物化到 agent 目錄之外（防自改繞過），org 欄位拒絕、敏感段剝除；內建 9 個部門 preset |
@@ -265,7 +265,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| `agent-file-guard` PreToolUse hook | `duduclaw hook agent-file-guard`（Rust 子命令，matcher `Write\|Edit\|MultiEdit\|Bash`，由 `agent_hook_installer` 逐 agent 安裝）：擋正規樹外的 agent 結構檔、擋寫自己的 SOUL.md 與 CONTRACT.toml、擋跨 agent 寫入 |
+| `agent-file-guard` PreToolUse hook | `duduclaw hook agent-file-guard`（Rust 子命令，matcher `Write\|Edit\|MultiEdit\|NotebookEdit\|Bash`，由 `agent_hook_installer` 逐 agent 安裝，指令帶 `--agent` 與 `--home`）：擋正規樹外的 agent 結構檔、擋寫自己的 SOUL.md 與 CONTRACT.toml、擋跨 agent 寫入、擋員工寫 DuDuClaw 資料目錄裡自己 agent 目錄與 `attachments/` 以外的位置（以解析符號連結後的實際路徑判斷）、擋改自己 `agent.toml` 可編輯區段以外的內容；Bash 通道是啟發式，`Read` 不在涵蓋範圍；規則與限制見 [05-security-defense.md](05-security-defense.md) |
 | `org_field_guard` | 同一個 hook 內的欄位級凍結：`[agent] reports_to`／`department`／`name`、整張 `[capabilities]` 表，以及 `config.toml [delegation]`／`[acp]`；內容無法解析或寫入意圖無法重建一律 fail-closed |
 | `data-file-guard` PreToolUse hook | `duduclaw hook data-file-guard`（RFC-23 §14.4，H10 2026-09 起為 Rust 子命令，matcher `Read\|Bash`），只有去識別化生效時才武裝；本質是 `Bash` 檔名啟發式，並非沙箱 |
 | Dashboard 認證 | JWT 帳號登入（Argon2id 密碼，`users.db`）或 gateway 管理員 token。早期的 Ed25519 挑戰回應路徑已移除，從來沒有任何設定能啟用它 |
@@ -350,7 +350,7 @@
 |------|------|
 | 任務板 | SQLite 後端任務管理：status / priority / assignment 追蹤 |
 | Dashboard RPC | `tasks.list/create/update/remove/assign`、`activity.list` 供 Web UI |
-| Agent MCP 工具 | `tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post`：Agent 可見自身佇列、認領工作、回報進度 |
+| Agent MCP 工具 | `tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post`：Agent 可見自身佇列、認領工作、回報進度；改動或完成別的員工的任務需要委派關係，控制用 tag（`outcome:`／`grant:`／`auto-research`）AI 員工不能動 |
 | 即時 Activity Feed | WebSocket 串流 activity 事件 |
 | 系統 prompt 注入 | 待辦任務（最多 5 筆）自動注入 Agent system prompt |
 

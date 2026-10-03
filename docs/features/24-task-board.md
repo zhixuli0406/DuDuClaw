@@ -68,14 +68,33 @@ Exposed to the AI runtime over the MCP server. These let an agent see its own qu
 |----------|---------|
 | `tasks_list` | See your queue (defaults to caller; `assigned_to='*'` for all) |
 | `tasks_create` | Add a card; `created_by` is auto-set to the caller |
-| `tasks_update` | Edit fields (title / description / priority / tags) |
-| `tasks_claim` | Atomically take an unassigned card and set it `in_progress` |
+| `tasks_update` | Edit fields (title / description / priority / tags / `assigned_to` / `depends_on`) |
+| `tasks_claim` | Atomically take a card that is unassigned (or already yours) and set it `in_progress` |
 | `tasks_complete` | Mark a card `done` with an optional completion summary |
 | `tasks_block` | Mark a card `blocked` with a required reason |
 | `activity_post` | Post a progress note *without* changing task status |
 | `activity_list` | Read recent activity (defaults to caller) |
 
 This is the heart of the Multica "Agent-as-teammate" design: an agent isn't just a function you call — it's a colleague who watches the board, picks up cards, and posts standups.
+
+### Who may change a card
+
+A card belongs to the AI employee it is assigned to. The tools that change or act on a card check the caller against that owner. An operator (an MCP key that maps to no AI employee, in a process that is not running for one) is not restricted by these checks; an AI employee is:
+
+| Tool | An AI employee may go ahead when it is… | Otherwise |
+|------|----------------------------------------|-----------|
+| `tasks_update` | the card's assignee, claimer or creator | needs a delegation relationship with the assignee (same department, `reports_to` above or below, or a whitelist pair, per `[delegation] policy`) |
+| `tasks_update` with `assigned_to` set to itself, on a card assigned to someone else | — | always needs that relationship, whoever created the card |
+| `tasks_claim` | claiming an unassigned card or one already assigned to it | a card assigned to another employee needs the relationship; it is checked before the atomic claim, so a refused caller never holds the lease |
+| `tasks_complete` / `tasks_block` | the card's assignee or claimer (the creator does not count) | needs the relationship with the assignee; a card that is neither assigned nor claimed is refused (claim it first) |
+| `activity_post` with a `task_id` | the card's assignee, claimer or creator | needs the relationship with the assignee; an unknown `task_id` is refused |
+
+An unassigned, unclaimed card has no owner to check against, so an AI employee that did not create it has to `tasks_claim` it before updating, completing or blocking it. A caller whose identity cannot be determined, or whose identity is one of the system sender names (`dashboard`, `cron`, `goal-loop-driver`, `heartbeat`, `autopilot`, `webhook`), is refused. Each refusal rejects the whole call and is written to `tool_calls.jsonl`.
+
+Two more rules apply to AI-employee callers of `tasks_update`:
+
+- **Goal text is frozen.** On a goal-mode card, `title` and `description` are what the judge reads as the goal, so an AI employee cannot change them (audit reason `goal_contract_frozen`); the same applies to `acceptance_criteria`, which is refused for every MCP caller. Operators edit these from the dashboard.
+- **Control tags stay as they are.** Tags that start with `outcome:` (the acceptance contract) or `grant:` (task-scoped capability grants), and the `auto-research` tag (the daily self-study marker), change how a card is accepted or what it may do. An AI employee cannot add, remove or reorder them (audit reason `reserved_tag_change`); other tags can be changed freely. `tasks_create` likewise refuses these tags in its `tags` argument from an AI employee. The `outcome:` tag the server builds itself for `kind = "goal"` is not affected.
 
 ---
 
@@ -104,7 +123,7 @@ A card has a `status` and a `priority`. The status moves through a small, predic
                        └──────────────────────────────►
 ```
 
-Completing a card auto-stamps `completed_at`. Blocking one records a `blocked_reason` that shows on the card. Claiming is a **compare-and-set**: `tasks_claim` only succeeds if the card is currently unassigned, so two agents can't both grab the same card.
+Completing a card auto-stamps `completed_at`. Blocking one records a `blocked_reason` that shows on the card. Claiming is a **compare-and-set**: `tasks_claim` only succeeds if nobody else holds the card, so two agents can't both grab the same card. A card assigned to another employee can be claimed only by a caller with a delegation relationship to that employee (see *Who may change a card*).
 
 ### Status values
 
@@ -224,7 +243,7 @@ Auto-injection puts open tasks in front of an active agent every turn; scheduler
 
 ### Safe Concurrency
 
-Claiming is compare-and-set, so two agents can't double-claim. Parent links are cycle-checked. The store runs in WAL mode with a busy timeout, so the dashboard and multiple agents can write concurrently without corrupting the board.
+Claiming is compare-and-set, so two agents can't double-claim, and changing or claiming another employee's card needs a delegation relationship with that employee. Parent links are cycle-checked. The store runs in WAL mode with a busy timeout, so the dashboard and multiple agents can write concurrently without corrupting the board.
 
 ---
 

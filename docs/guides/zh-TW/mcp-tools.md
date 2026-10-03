@@ -58,6 +58,18 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 - `agent.toml [permissions]`：寫成 `false` 的旗標會拒絕 `create_agent`（`can_create_agents`）；`send_to_agent`、`spawn_agent`（`can_send_cross_agent`）；`schedule_task`、`create_reminder` 與帶 `schedule` 的 `tasks_create`（`can_schedule_tasks`）；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`（`can_modify_own_skills`）。拒絕時回 JSON-RPC 錯誤 -32003 並記稽核 `permission_denied`。`agent.toml` 存在但讀不到或無法解析時，這些工具一律拒絕；檔案不存在則放行。不帶 `schedule` 的 `tasks_create` 仍然允許，所以這些旗標是逐次呼叫檢查。臨時角色成員建立時 `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` 為 `false`。
 - `config.toml [odoo] features_*`：Odoo 工具照樣列出，呼叫到已關閉模組的模型時逐次拒絕（project 與 hr 預設關閉）。
 
+### 紀錄關係檢查：列出但會拒絕
+
+有些工具會變更或觸發屬於某位 AI 員工的紀錄。它們對所有呼叫者都照常列出，每次呼叫時再檢查關係：
+
+- **任務**：`tasks_update` 與帶 `task_id` 的 `activity_post`，任務的受派者、認領者或建立者可以直接操作；`tasks_complete` 與 `tasks_block` 只認受派者與認領者；`tasks_claim` 可以認領未指派或本來就指派給自己的任務。其他情況都要與受派者有委派關係（同部門、`reports_to` 上下級，或白名單配對，依 `[delegation] policy`）。未指派、未認領的任務要先認領。用 `tasks_update` 把別人的任務改派給自己，一律要有這個關係。
+- **任務欄位**：AI 員工不能改 goal 模式任務的 `title` 或 `description`（`acceptance_criteria` 則所有 MCP 呼叫者都不能改），也不能在 `tasks_update` 或 `tasks_create` 的 `tags` 新增、移除或調換以 `outcome:`、`grant:` 開頭的 tag 與 `auto-research` tag。
+- **例行工作**：`update_cron_task`、`delete_cron_task`、`pause_cron_task`、`run_cron_task` 要求呼叫者就是這筆例行工作的執行員工，或與它有關係。以 `name` 指定時只作用於一筆；多筆同名會被拒絕，並列出候選 id。
+- **提醒**：`create_reminder` 的 `agent_id` 不是呼叫者自己時，要與該員工有關係。
+- **對自己用 `agent_update`**：AI 員工不能對自己送出 `reports_to`、`db_sources`、`db_sources_add`、`db_sources_remove`、`budget_cents` 或 `role`（稽核 `agent_authority_refused`）。修改下屬不變。
+
+操作者（不對應任何 AI 員工的 MCP 金鑰，且行程不是為某位員工啟動的）不受限。行程沒有員工身分時，內部共用金鑰不擁有任何紀錄，所以碰任何人的紀錄都會被拒絕。身分是系統 sender 名稱（`dashboard`、`cron` 等）的行程會被當成不受信任。每次拒絕都記在 `tool_calls.jsonl`。詳見[任務看板](../../features/zh-TW/24-task-board.md)、[委派隔離](../../features/zh-TW/37-delegation-isolation.md)。
+
 ## 說明字數預算
 
 每個工具的 `description` 上限 **200 bytes**，每個參數說明上限 **200 bytes**（僅一個列明的例外，見下）。這個上限由測試強制，不是靠自律。
@@ -141,6 +153,25 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 | `computer_session_stop` | `session_id` 字串，選填 | 移除容器 |
 
 整數與布林參數也接受數字字串與 `"true"`/`"false"` 字串。點擊、輸入、按鍵、捲動與導覽各算一個動作，計入 `max_actions`（預設 50）。各項上限、審批與確認規則、網路白名單及其殘留風險，見[瀏覽器自動化](../../features/zh-TW/08-browser-automation.md)。
+
+### `belief_stats` / `belief_settle`：已驗證與自報的結算
+
+只有經過平台價格交叉驗證的結算才計入校準。目前沒有任何正式路徑提供這個交叉驗證：`belief_settle` 把每一筆結算都記成員工自己的回報（`settle_source = "agent_unverified"`），所以現有部署的校準狀態都是「沒有已驗證的結算」。
+
+`belief_settle` 回傳結算後的資料列，加上 `counts_toward_calibration`（布林值）；值為 `false` 時另附 `note`，說明這筆結算有記錄但不計入校準。
+
+`belief_stats` 回傳的內容（與儀表板 `belief.summary` 的 `stats` 相同，另加一個 `note`）：
+
+| 欄位 | 意義 |
+|------|------|
+| `n_submitted` | 提交過的所有信念，不論是否已結算 |
+| `n_settled_all` | 所有已結算的信念（`verified.n + self_reported.n`） |
+| `calibration_status` | `no_verified_settlements`、`insufficient_samples`（已驗證 1–29 筆）或 `calibrated`（30 筆以上） |
+| `verified` | `n`、`hits`，以及 `hit_rate`、`hit_rate_wilson_low`、`mean_brier`、`overconfidence`（不是 `calibrated` 時都是 `null`） |
+| `self_reported` | `n` 與描述用的 `hit_rate`（`n` 為 0 時是 `null`），不是校準 |
+| `per_subject[]` | `subject`、`verified`（`n`、`hits`、`mean_brier`）、`self_reported`（`n`） |
+
+舊版的扁平欄位（`n_total`、`n_settled`、`insufficient_samples`、最上層的 `hit_rate` 等）已移除。見[信念迴圈](../../features/zh-TW/46-belief-loop.md)。
 
 ### `create_agent` / `agent_remove`：移除後的名稱會被保留
 

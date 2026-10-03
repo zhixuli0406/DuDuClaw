@@ -16,7 +16,11 @@
 
 ## 守衛 1 — `agent-file-guard`（PreToolUse，Rust）
 
-`duduclaw hook agent-file-guard` 是真正的子命令而不是 shell 腳本，所以 macOS／Linux／Windows 行為一致。Gateway 以 matcher `Write|Edit|MultiEdit|Bash` 把它註冊進 `<agent_dir>/.claude/settings.json`，每次開機重新註冊（`agent_hook_installer`），並且是合併進操作者既有設定，不是整份覆寫。
+`duduclaw hook agent-file-guard` 是真正的子命令而不是 shell 腳本，所以 macOS／Linux／Windows 行為一致。Gateway 以 matcher `Write|Edit|MultiEdit|NotebookEdit|Bash` 把它註冊進 `<agent_dir>/.claude/settings.json`，每次開機重新註冊（`agent_hook_installer`），並且是合併進操作者既有設定，不是整份覆寫。
+
+安裝的指令帶著 agent id（`--agent`），v1.68.1 之後的版本也帶著 DuDuClaw 資料目錄（`--home "<路徑>"`）。Gateway 啟動員工的 CLI 時會清空環境變數，白名單裡沒有 `DUDUCLAW_HOME`，所以先前 hook 一律退回 `$HOME/.duduclaw` 判斷；資料目錄不在預設位置的部署，真正資料目錄裡的每個路徑都被當成「資料目錄之外」。安裝器對每個 `<資料目錄>/agents/<id>`（或 `<資料目錄>/agents/.ephemeral/<id>`）形式的員工目錄都寫入 `--home`，路徑含 shell 特殊字元時改用單引號包起來。既有的安裝會在下一次啟動員工或 gateway 開機時就地改寫。
+
+Hook 依序從這些地方取得資料目錄：`--home`（只認絕對路徑）；沒有員工身分的呼叫者（hook 指令沒帶 `--agent`、環境裡也沒有 `DUDUCLAW_AGENT_ID`）照舊用預設位置；hook 環境裡明確設定的絕對路徑 `DUDUCLAW_HOME`。不會從工作目錄推回資料目錄。全部都推不出來時，該員工的每一次 `Write`／`Edit`／`MultiEdit`／`NotebookEdit`／`Bash` 呼叫都拒絕，不會拿猜測的位置判斷。`NotebookEdit` 也在同一次加入 matcher，它的 `notebook_path` 比照 `Write` 的目標判斷。Hook 子命令只在 stderr 回覆，不再寫日誌檔。
 
 以下情況它會 exit 2（Claude Code 讀成「擋掉這次工具呼叫」）：
 
@@ -24,10 +28,25 @@
 - Agent 寫**自己的 `SOUL.md`**，即使位置正確也擋。人格由操作者管理。這個 hook 沒有開放選項：在 `agent.toml [permissions] can_modify_own_soul = true` 明確開啟的 agent，只能透過 `agent_update_soul` MCP 工具改自己的 `SOUL.md`，不能直接寫檔；
 - Agent 寫**自己的 `CONTRACT.toml`**，即使位置正確也擋（判定 `BlockedOwnContractWrite`）。契約是操作者給 agent 的界線，所以完全沒有開放旗標；擋下時的訊息會請 agent 去找操作者，由操作者在儀表板修改（`contract.update`，僅限管理者，不經過這個 hook）；
 - Agent 動**別的 agent** 的檔案，一律擋；
+- Agent 寫入 **DuDuClaw 資料目錄**裡的其他任何位置。對帶員工身分（或宣稱的身分驗證失敗）的呼叫者，資料目錄底下能寫的只有自己的 agent 目錄與共用的 `attachments/`。這是允許清單，所以涵蓋稽核紀錄（`tool_calls.jsonl`，佐證檢查、判官摘要與近期行動摘要都讀它）、`evals/`（含留出集與其他員工的評測集）、所有 SQLite 資料庫、斷路器狀態、授權與組織檔、全域 `skills/` 與共用 wiki，日後新增的資料也一開始就受保護。這些資料的正當寫入者是 gateway 與受閘控的 MCP 工具，都不經過這個 hook。只有沒有員工身分的呼叫者不受影響，也就是 hook 指令沒帶 `--agent`、環境裡也沒有 `DUDUCLAW_AGENT_ID`。安裝的 hook 指令一定帶 `--agent`，hook 也優先採用它，所以操作者在某位員工的目錄裡手動執行 `claude`，會以該員工的身分被判斷（要求身分權杖的模式下，則是身分驗證失敗的呼叫者）。操作者要改這些檔案，請用儀表板，或直接用編輯器改；
+- 寫入目標是指向上述被擋位置的**符號連結**。Write／Edit 的路徑會判斷兩次：照字面一次、解析到實際落點一次（跟隨連結與連結之後的 `..`；懸空連結一律拒絕），任一次擋下就擋。相對路徑以 hook 輸入裡的工作目錄解析，輸入沒有工作目錄時以員工自己的目錄解析。無法確認實際落點的路徑一律拒絕，訊息為「無法確認這次寫入實際會落在哪裡」；
 - Agent 寫入、搬移或刪除 **`agents/_trash/`** 底下的任何東西（被移除的員工存放在那裡；Bash 以啟發式判斷）；
 - Agent 在 Bash 執行 **`duduclaw agent create <name>`**，而該名稱因為曾有員工被移除而處於保留狀態（見[委派隔離](37-delegation-isolation.md#被移除員工的名稱仍被保留)）；拒絕會以稽核事件 `agent_name_reserved` 記錄，`path_kind` 為 `cli_bash_agent_create`。
 
-在 Bash 上，「自己的 `SOUL.md`」與「自己的 `CONTRACT.toml`」兩條規則是啟發式判斷：寫入形態的指令只要點名這個檔案就擋下，不論寫成 `agents/<自己>/…`，或是 `CONTRACT.toml`、`./CONTRACT.toml` 這類相對寫法。這只是減速帶，把檔名藏起來的指令（變數、編碼字串、腳本）可以繞過；真正的隔離是不給 agent Bash。
+在 Bash 上，「自己的 `SOUL.md`」與「自己的 `CONTRACT.toml`」兩條規則是啟發式判斷：寫入形態的指令只要點名這個檔案就擋下，不論寫成 `agents/<自己>/…`，或是 `CONTRACT.toml`、`./CONTRACT.toml` 這類相對寫法。身分驗證失敗的呼叫者，寫入形態的指令只要點名 `agents/` 底下任何位置就擋，與 Write／Edit 一致。
+
+**Bash 與資料目錄允許清單。** Bash 通道用同一份允許清單判斷指令文字。以下說的「受保護的資料目錄目標」，指資料目錄裡自己的員工目錄與 `attachments/` 以外的位置、別的員工的目錄，以及被移除員工的存放區；身分驗證失敗的呼叫者，連自己的目錄也算。
+
+- 判斷前先照 bash 的讀法還原指令：續行、反斜線跳脫與引號都先還原。把輸出或錯誤輸出丟到 `/dev/null`（`2>/dev/null`、`>/dev/null`），以及把一個描述元複製到另一個（`2>&1`），不算寫入；把輸出與錯誤一起重導到檔案則算寫入。
+- 列在已知唯讀指令清單上的指令（列出、讀取、搜尋、比對之類）不檢查參數，但它們的輸出重導照樣檢查。有選項能把輸出寫進檔案、或能執行其他指令的指令，不放進清單，或在帶了那些選項時不算唯讀。員工用清單外的指令讀取資料目錄底下的檔案會被拒絕，請改用清單內的指令或對應的 MCP 工具。
+- 複製類指令（複製、安裝、下載、解壓縮封存檔）只看目的地，所以把資料目錄裡的檔案複製到自己的目錄放行。
+- 會改動參數所指對象的指令（搬移、刪除、建立連結、改權限、改擁有者或時間戳、同步、資料庫命令列工具等），以及直譯器與 shell，只要任一參數（含行內程式碼）是受保護的資料目錄目標就擋。任何指令把輸出重導到受保護的資料目錄目標也擋。
+- 其餘指令（含前綴選項無法解析的情況），只要任一參數是受保護的資料目錄目標就擋，不論指令有沒有寫入。清單外的指令要碰受保護的資料目錄路徑，唯一的出口是已知唯讀指令清單。
+- 資料目錄裡、**員工目錄與 `attachments/` 以外**的資料庫檔（`*.db` 及其 `-wal`／`-shm`／journal 檔、`*.sqlite*`），不論出現在指令哪裡，即使只是讀取也擋。員工目錄與 `attachments/` 裡的資料庫不在這條規則範圍內；別的員工的目錄仍然禁止寫入。
+- 相對路徑以 hook 輸入裡的工作目錄解析（沒有時以員工自己的目錄解析），並跟著指令裡的 `cd`／`pushd` 移動。工作目錄推算不出來、而指令任何地方提到受保護的資料目錄位置時，受檢位置上的相對路徑一律擋下；完全沒提到時則不判斷。
+- 受檢路徑上已存在的符號連結會解析，實際落點也一併判斷；無法解析的受檢路徑（包括懸空連結）一律拒絕。
+
+這是減速帶，不是隔離。真正的隔離是不給 agent Bash；限制列在「這些守衛沒有涵蓋什麼」。
 
 Live fork（`fork_run`）從另一側守住同一批檔案：分支可以讀 agent 的結構檔，但把分支採用回 agent 目錄時，絕不會用分支的版本覆蓋上層的 `SOUL.md`、`CONTRACT.toml`、`agent.toml`、`.mcp.json`、`.claude/` 或其他 agent 結構檔。
 
@@ -99,7 +118,9 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 
 `org_field_guard` 跑在同一個 `agent-file-guard` hook 裡，把重建出來的**寫入後內容**逐欄位與磁碟上的現況比對，受保護欄位或區段有變動就拒絕。`[capabilities]` 是**整張表**凍結而不是列一份鍵名清單——這樣未來版本新增的 capability 鍵，落地當天就受保護，而不是等誰想起來去補清單。
 
-依建構方式 fail-closed：新內容無法解析、既有內容無法解析、寫入意圖無法重建，三者全部拒絕。檔案還不存在則放行，因為建立走的是 `create_agent`，那裡有自己的閘。
+**員工自己的安全設定。** 對帶員工身分（或身分無法驗證）的呼叫者，它自己 `agent.toml` 的其餘部分以允許清單凍結：只有可編輯的區段能改，其他區段一律受保護，日後版本新增的區段也預設受保護。可編輯的區段是 `[agent]`、`[model]`、`[prompt]`、`[heartbeat]`、`[proactive]`、`[research]`、`[goal_intent]`、`[memory]`、`[skills]`、`[sticker]`、`[cultural_context]`、`[preset]` 與 `[planner]`。這些區段裡，`[agent] role`、`[prompt] cli_bare_mode`（它會讓 Claude CLI 略過 hook）與 `[model] account_pool` 仍凍結，組織欄位 `[agent] reports_to`／`department`／`name` 也一樣；`[capabilities]` 整張表凍結。這份允許清單適用於所有帶員工身分的呼叫者，包括在員工目錄裡手動執行 `claude` 的操作者（見 Guard 1）；較早的組織欄位與 `[capabilities]` 規則照舊對所有呼叫者生效。操作者要改這些區段，請用儀表板，或直接用編輯器改。
+
+依建構方式 fail-closed：新內容無法解析、既有內容無法解析、寫入意圖無法重建，三者全部拒絕。既有的 `agent.toml`、`config.toml` 或 `.mcp.json` 讀不到時也拒絕（以前當成新檔放行）。檔案還不存在則放行，因為建立走的是 `create_agent`，那裡有自己的閘。
 
 合法變更的既有路徑全部保留：MCP `agent_update` 工具與儀表板 `agents.update` RPC，兩者都不經過這個 hook。
 
@@ -130,6 +151,11 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 明講這一節本身就是防線的一部分。
 
 - **Hook 看得到的是 Claude Code 自己的工具呼叫，不是 MCP 工具呼叫。** MCP 有自己的閘（scope、授權、`denied_tools`）；hook 是內建 `Write`／`Edit`／`Read`／`Bash` 那面的第二道鎖。
+- **`agent-file-guard` 的 Bash 通道是啟發式。** 它讀的是指令文字，下列情況都擋不住：由變數（`$DUDUCLAW_HOME`，以及資料目錄在預設位置時的 `~/.duduclaw`、`$HOME/.duduclaw` 除外）、指令替換或其他計算產生的路徑；編碼後的指令；先寫成腳本再執行；把 here-document 餵給直譯器；別名與函式；透過環境變數讓之後啟動的 shell 載入某個檔案；清單內唯讀指令沒有被考慮到的寫檔選項；沒有寫明目的地的解壓縮或下載指令，它們寫進目前的工作目錄，而這條通道不判斷目前目錄，所以先切換進資料目錄再執行就不會被擋；在同一條指令裡先建立連結再透過它寫入；硬連結；以及檢查與實際執行之間的時間差。
+- **Bash 通道也會誤擋一些無害的指令。** 受檢位置上的路徑解析失敗時一律拒絕，即使路徑在資料目錄以外；懸空的符號連結即使指向資料目錄以外也會被拒絕。
+- **`agent-file-guard` 不涵蓋 `Read`。** 留出集與稽核紀錄員工仍然讀得到，hook 只擋寫入。
+- **只有 Claude runtime 會跑這些 hook。** Codex、Gemini、Antigravity 與其他 runtime 靠各自的沙箱旗標。
+- **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。
 - **`data-file-guard` 是啟發式。** 它比對 `Bash` 指令列裡的檔名，動態組出來的路徑就繞得過去。（它已不再在 Windows 上失效——H10 已把它改成 Rust 子命令。）
 - **沒有威脅等級狀態機。** `~/.duduclaw/threat_level` 還在，作為 computer use 協調器會輪詢的操作者 kill switch（`RED` 中止、`YELLOW` 暫停），但工作區內已沒有任何東西會寫它。檔案不存在或讀不到就視為 `GREEN`。
 - *（2026-09 移除。）* 本節原本註明 PTY session pool 不在去識別化改寫的涵蓋範圍內。該連線池已不存在——每次 Claude spawn 都是單次 spawn，正好就是改寫掛鉤的地方。

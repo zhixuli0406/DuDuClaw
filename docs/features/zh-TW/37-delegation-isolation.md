@@ -41,13 +41,29 @@ DuDuClaw 1.52 引入一套針對多人團隊的委派管制。你的 AI 員工�
 **2. 任務派遣** — 在任務板建立任務（`tasks_create`）或改派（`tasks_update` 的 `assigned_to`）時指派給某人
 
 - 檢查同 1，拒絕時任務創建/改派失敗
-- 接手自己的任務（`tasks_claim`）不受限
+- 接手未指派、或本來就指派給自己的任務（`tasks_claim`）不受限；接手指派給其他員工的任務，要與該員工有同樣的關係
 - Dashboard 的指派操作不受限（都是人類操作）
 
 **2b. 多步驟計畫與例行工作** — `create_task` 的每個步驟可以指定執行者、`schedule_task` 可以幫別人排定期工作
 
 - 兩者都是委派，建立當下就檢查；`create_task` 的步驟另外在真正派工前再檢查一次
 - 幫自己排程、指定自己執行不受限
+
+**2c. 變更或觸發別人的紀錄** — 作用在已經屬於某位 AI 員工的紀錄上的工具
+
+以前只有建立時會檢查，變更既有紀錄不會，所以用更新就能做到建立時被拒絕的事。下列工具現在用同一個述詞，比對呼叫者與紀錄擁有者：
+
+| 工具 | 紀錄的擁有者 |
+|------|------------|
+| `tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、帶 `task_id` 的 `activity_post` | 任務的受派者（受派者、認領者、建立者何時不需要關係就能操作，見任務看板頁） |
+| `update_cron_task`、`delete_cron_task`、`pause_cron_task`、`run_cron_task` | 這筆例行工作以哪位員工身分執行 |
+| `create_reminder` | `agent_id` 指定的員工（省略時就是呼叫者自己） |
+
+- 操作自己的紀錄不受限；其他情況由委派關係決定
+- 無法判定擁有者的紀錄一律拒絕（未指派、未認領的任務：先認領）
+- 操作者（不對應任何 AI 員工的 MCP 金鑰，且行程不是為某位員工啟動的）不受限
+- 內部共用金鑰、但行程沒有員工身分時，行為者是內部 client id；它不是組織圖上的任何節點，所以碰任何人的紀錄都會被拒絕
+- cron 工具一次只作用於一筆：用 `name` 指定時，多筆同名的例行工作會被拒絕，回覆會列出候選 id（這次修改之前，`delete_cron_task` 與 `pause_cron_task` 會作用在所有同名的列，`update_cron_task` 則作用在第一筆）
 
 **3. 自動化規則** — autopilot 規則裡的 delegate 動作
 
@@ -121,7 +137,8 @@ allow = [
 拒絕的委派嘗試都會留痕，依攔截點分成兩個檔案：
 
 - 派工真正要開始執行時被擋（bus 隊列、多步驟計畫）→ `~/.duduclaw/security_audit.jsonl`，事件型別 `delegation_denied`
-- MCP 工具當下被擋（`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `create_task` / `schedule_task`）→ `~/.duduclaw/tool_calls.jsonl`，同樣是 `delegation_denied`；`create_agent` / `agent_update` 的組織調整被擋則是 `org_placement_denied`
+- MCP 工具當下被擋（`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `tasks_claim` / `tasks_complete` / `tasks_block` / `activity_post` / `create_task` / `schedule_task` / cron 管理工具 / `create_reminder`）→ `~/.duduclaw/tool_calls.jsonl`，同樣是 `delegation_denied`；`create_agent` / `agent_update` 的組織調整被擋則是 `org_placement_denied`
+- 與關係本身無關的紀錄變更拒絕也記在 `tool_calls.jsonl`，帶 `reason`：`owner_unknown`、`caller_unknown`、`system_sender_identity`、`reserved_tag_change`、`goal_contract_frozen`。AI 員工透過 `agent_update` 改自己的權限類設定，記為 `agent_authority_refused`（reason `self_authority_change`）
 
 `security_audit.jsonl` 的一筆長這樣：
 
@@ -182,6 +199,8 @@ allow = [
 
 上述名稱（加上 `a2a-client`、`default`、以及任何 `__` 開頭的名稱）是**保留字**，不能拿來建立 AI 員工，否則等於幫自己發一張通行證。
 
+這些名稱也不會被接受為 MCP 行程的身分。MCP 的 `create_agent` 工具、儀表板與 `duduclaw agent create` 指令建立員工時都拒絕這些名稱，gateway 啟動員工的 MCP server 時也一律帶上該員工的目錄 id；在沒有員工使用這些名稱的情況下，宣稱自己是 `dashboard`、`cron`、`goal-loop-driver`、`heartbeat`、`autopilot` 或 `webhook` 的行程，只可能是自己宣稱的。這樣的行程會被解析成不受信任的身分，上面的紀錄檢查也會拒絕它。替換發生時，`tool_calls.jsonl` 會留一筆紀錄（工具 `mcp_identity`、reason `system_sender_identity`），寫明被宣稱的名稱與來源（`env` 代表 `DUDUCLAW_AGENT_ID`，`config` 代表 `[general] default_agent`），同一個行程只記一次。
+
 ### 這道防線管得到什麼、管不到什麼
 
 管得到：AI 員工之間透過平台功能互相派工的每一條路徑（MCP 工具、任務板、多步驟計畫、例行工作、任務隊列、外部 A2A）。這是**組織權限邊界**，讓「誰能叫誰做事」跟著組織圖走。
@@ -189,7 +208,7 @@ allow = [
 管不到（設計上的已知邊界，不是 bug）：
 
 - **舊格式任務**：1.52 版對完全沒有發送者欄位的隊列任務仍然放行，只記一筆 warning（避免升級時把還在排隊的工作全部打掉）。下一版改為拒絕。
-- **設定檔層級的改動**：從 v1.52 起，PreToolUse hook 凍結了敏感的組織資料欄位：agent 無法透過 Write/Edit/Bash 工具改寫 `agent.toml` 的 `name` / `reports_to` / `department`、整段 `[capabilities]` 權限範圍（Team-as-Agent 審查後加入）、`config.toml` 的 `[delegation]` / `[acp]` 段、`.mcp.json` 身分區塊、`.claude/settings.json` 或 `identity.key`。更改這些設定必須走儀表板或 `agent_update` MCP 工具，由經過審驗的正式管道進行。跨員工檔案修改（例如改別人的 SOUL.md）亦被拒絕。非 Claude runtime（codex/gemini 等）在 workspace-write 沙箱下無法寫入 `~/.duduclaw/` 目錄，提供沙箱層防線。只有 FullAccess 沙箱例外，屬操作者顯式選擇的極端權限。
+- **設定檔層級的改動**：從 v1.52 起，PreToolUse hook 凍結了敏感的組織資料欄位：agent 無法透過 Write/Edit/Bash 工具改寫 `agent.toml` 的 `name` / `reports_to` / `department`、整段 `[capabilities]` 權限範圍（Team-as-Agent 審查後加入）、`config.toml` 的 `[delegation]` / `[acp]` 段、`.mcp.json` 身分區塊、`.claude/settings.json` 或 `identity.key`。更改這些設定必須走儀表板或 `agent_update` MCP 工具，由經過審驗的正式管道進行。同一個 hook 也讓 AI 員工改不了自己 `agent.toml` 的安全設定，也碰不到 DuDuClaw 資料目錄裡的狀態，規則與限制見[安全防護](05-security-defense.md)。跨員工檔案修改（例如改別人的 SOUL.md）亦被拒絕。非 Claude runtime（codex/gemini 等）在 workspace-write 沙箱下無法寫入 `~/.duduclaw/` 目錄，提供沙箱層防線。只有 FullAccess 沙箱例外，屬操作者顯式選擇的極端權限。
 - **系統與人類發起的操作**：儀表板、webhook、排程、自動化規則本來就是操作者的意志，一律放行。
 
 ### 可見範圍過濾
@@ -213,6 +232,8 @@ allow = [
 - 頭目只能建立自己的直屬下級，或接在下級底下
 - 不能建立員工掛到主管底下（除非操作者就是那個主管或更上層）
 - Dashboard 建立員工不受限（人類操作）
+
+`agent_update` 對員工自己的設定也有對應規則。AI 員工不能對自己送出 `reports_to`、`db_sources`、`db_sources_add`、`db_sources_remove`、`budget_cents` 或 `role`：整個呼叫會被拒絕，並記為 `agent_authority_refused`。這些設定決定員工向誰負責、可以讀哪些資料庫、可以花多少錢，以及是否被當成主 agent，由它的主管（委派政策允許的上級）或操作者調整。修改下屬的設定與以前相同；AI 員工仍可修改自己非權限類的欄位（顯示名稱、模型、心跳等）。
 
 ### 被移除員工的名稱仍被保留
 
@@ -274,12 +295,14 @@ Agent 經檔案工具（Write/Edit/Bash）的變更會被 PreToolUse hook 攔截
 | `.claude/settings.json` | 整個檔案 | 權限清單等敏感設定統一由儀表板管理 |
 | `identity.key` | （整個檔案） | 簽章密鑰，任何更動都破壞身分驗證 |
 
+對 AI 員工身分的呼叫者，hook 另外凍結員工自己 `agent.toml` 的安全設定與 DuDuClaw 資料目錄裡的狀態，見[安全防護](05-security-defense.md)。
+
 #### 正確的變更管道
 
 需要改這些設定時：
 
-- **修改 `name`、`reports_to`、`department`** → 儀表板「AI 員工 → 詳情 → 編輯」，或用 MCP `agent_update` 工具
-- **調整權限或新增工具** → 儀表板「AI 員工 → 進階設定」、MCP `agent_update` 工具，或由操作者用一般編輯器改 `agent.toml [capabilities]`。這三條都不經這個 hook（hook 只看得到 Claude Code 自己的 Write／Edit／Bash 呼叫），所以員工（含它的團隊角色成員）無法從 session 內走這條路
+- **修改 `name`、`reports_to`、`department`** → 儀表板「AI 員工 → 詳情 → 編輯」，或用 MCP `agent_update` 工具（AI 員工可以用它改下屬，不能改自己的 `reports_to`，見上文）
+- **調整權限或新增工具** → 儀表板「AI 員工 → 進階設定」、MCP `agent_update` 工具，或由操作者用一般編輯器改 `agent.toml [capabilities]`。這三條都不經這個 hook（hook 只看得到 Claude Code 自己的 Write／Edit／Bash 呼叫），所以員工（含它的團隊角色成員）無法從 session 內走這條路。透過 `agent_update`，AI 員工可以把資料庫來源授權給下屬，但不能授權給自己
 - **調整權限或新增工具** → 儀表板「AI 員工 → 進階設定」，或編輯 `agent.toml [capabilities]` 再手動指定（不走檔案工具）
 - **改委派政策或白名單** → 儀表板「進階設定 → 委派權限」，或直接編輯 `config.toml [delegation]` 再重啟 gateway
 - **新增 MCP server** → 編輯 `.mcp.json` 的 `tools` 陣列（不要改身分區塊），儀表板「進階設定 → MCP 伺服器」手動新增
@@ -288,7 +311,7 @@ Agent 經檔案工具（Write/Edit/Bash）的變更會被 PreToolUse hook 攔截
 
 #### 系統身分無限制
 
-系統發送者（dashboard、webhook、cron、autopilot）操作不受限，可改任何設定。這是由設計保證的：這些來源都是操作者的意志體現。
+系統發送者（dashboard、webhook、cron、autopilot）操作不受限，可改任何設定。這是由設計保證的：這些來源都是操作者的意志體現。這只適用於 gateway 自己的路徑；宣稱自己是這些名稱的 MCP 行程，會被當成不受信任的身分（見上文「誰視為系統」）。
 
 ### 白名單輸入的彈性
 
