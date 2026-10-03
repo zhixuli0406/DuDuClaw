@@ -38,16 +38,32 @@ const RESUME_ON_RESTART_OPTIONS = ['pause', 'auto'] as const;
 // seam, crates/duduclaw-gateway/src/judge_mode.rs). NOTE: `judge_command` /
 // `judge_timeout_secs` are deliberately NOT here and never sent to the RPC —
 // they name an executable and stay file-only (config.toml, operator-edited).
-// An unknown string is rejected by the gateway (falls back to "mav" — the
-// strongest of the four — with a warning), so this list must stay in sync
-// with `JudgeMode::from_config_str`.
+// The gateway refuses any other value on write; this list must stay in sync
+// with `WRITABLE_JUDGE_MODES` in judge_mode.rs.
 const JUDGE_MODES = ['mav', 'external'] as const;
-// T5/O12 (feature audit 2026-09-29): still accepted by the gateway and still
-// parsed byte-identically, but no longer offered as a new choice. A deployment
-// already on one keeps seeing it in the picker — marked 已棄用 — so the value
-// is never silently rewritten behind the operator's back. Removal: v1.69.0
-// (docs/guides/deprecations.md).
-const DEPRECATED_JUDGE_MODES: readonly string[] = ['evaluator_only', 'human_only'];
+
+// Removed in v1.69.0. The gateway no longer accepts them on write, but a
+// config.toml that still holds one keeps being read: `evaluator_only` runs as
+// `mav`, `human_only` parks every review for a person. The picker shows such
+// a saved value as it is (labelled with what actually happens) instead of
+// displaying `mav`, and never writes it back.
+type RemovedJudgeMode = 'evaluator_only' | 'human_only';
+
+/** Map a stored `[dispatch] judge` string to the removed mode it means, using
+ *  the same exact-token rules as `JudgeMode::from_config_str` (trim,
+ *  ASCII-lowercase, old aliases included). `null` for anything else. */
+function removedJudgeMode(raw: string): RemovedJudgeMode | null {
+  switch (raw.trim().toLowerCase()) {
+    case 'evaluator_only':
+    case 'evaluator':
+      return 'evaluator_only';
+    case 'human_only':
+    case 'human':
+      return 'human_only';
+    default:
+      return null;
+  }
+}
 
 /** Extract the body of a top-level TOML `[section]` from the masked config
  *  string (up to the next `[` header or EOF). Section-scoped so a common key
@@ -304,18 +320,20 @@ export function AutomationTab() {
   const resumeOnRestartOptions: SelectOption[] = RESUME_ON_RESTART_OPTIONS.map((v) => ({
     value: v, label: intl.formatMessage({ id: `settings.automation.resumeOnRestart.${v}` }), raw: v,
   }));
+  const removedJudge = removedJudgeMode(judgeMode);
   const judgeModeOptions: SelectOption[] = [
     ...JUDGE_MODES.map((v) => ({
       value: v as string,
       label: intl.formatMessage({ id: `settings.automation.judgeMode.${v}` }),
       raw: v as string,
     })),
-    // Keep a saved-but-deprecated value visible (labelled) instead of letting
-    // the select fall back to a different mode than what is actually on disk.
-    ...(DEPRECATED_JUDGE_MODES.includes(judgeMode)
+    // Keep a saved removed value visible (labelled with what actually runs)
+    // instead of letting the select show a mode that is not on disk. It is
+    // only listed while it is the current value, so it cannot be picked anew.
+    ...(removedJudge
       ? [{
           value: judgeMode,
-          label: `${intl.formatMessage({ id: `settings.automation.judgeMode.${judgeMode}` })}（${intl.formatMessage({ id: 'settings.automation.judgeMode.deprecated' })}）`,
+          label: intl.formatMessage({ id: `settings.automation.judgeMode.${removedJudge}` }),
           raw: judgeMode,
         }]
       : []),
@@ -426,13 +444,14 @@ export function AutomationTab() {
             options={resumeOnRestartOptions}
           />
         </SettingsCard>
-        {/* Quick mode trades away the second review layer — surface that as
-            a visibly different (amber, not the neutral secondary tone used
-            elsewhere on this page) risk callout instead of burying it in the
-            select's own description text. */}
-        {judgeMode === 'evaluator_only' && (
-          <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-700 dark:text-amber-300">
-            {t('settings.automation.judgeMode.evaluatorOnlyRisk')}
+        {/* A saved value removed in v1.69.0: say what is happening now and
+            what to pick instead, in the amber tone used for risk callouts. */}
+        {removedJudge && (
+          <div
+            role="status"
+            className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-700 dark:text-amber-300"
+          >
+            {t(`settings.automation.judgeMode.removedNotice.${removedJudge}`)}
           </div>
         )}
         {/* judge_command names an executable and is deliberately NOT settable

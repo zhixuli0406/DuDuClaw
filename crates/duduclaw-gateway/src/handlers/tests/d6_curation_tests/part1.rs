@@ -475,12 +475,14 @@ pub(super) async fn system_update_config_rejects_bad_dispatch_policy_and_cap() {
     );
 }
 
-/// WP-5D judge seam: `[dispatch] judge` accepts exactly the four
-/// enumerated modes and persists the canonical token
-/// `JudgeMode::from_home` reads back. Two hard boundaries are asserted
-/// here because they are the seam's security posture:
+/// WP-5D judge seam: `[dispatch] judge` accepts exactly `mav` and
+/// `external` (v1.69.0 removed `evaluator_only` / `human_only`) and persists
+/// the canonical token `JudgeMode::from_home` reads back. Hard boundaries
+/// asserted here because they are the seam's security posture:
 /// - an unknown value is REJECTED at write time (the read path
 ///   additionally falls back to `mav`, so both layers fail safe);
+/// - a removed value (and its old alias) is REJECTED at write time with a
+///   message an end user can act on, and the stored value is untouched;
 /// - `judge_command` / `judge_timeout_secs` are NOT settable through this
 ///   RPC at all — they name an executable, and this method is reachable
 ///   from the dashboard.
@@ -489,7 +491,7 @@ pub(super) async fn system_update_config_judge_seam_whitelist() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
-    for mode in ["mav", "evaluator_only", "external", "human_only"] {
+    for mode in ["mav", "external"] {
         let f = handler
             .handle_system_update_config(json!({ "dispatch": { "judge": mode } }), &admin_ctx())
             .await;
@@ -501,6 +503,34 @@ pub(super) async fn system_update_config_judge_seam_whitelist() {
         );
     }
 
+    // Removed values → rejected with an actionable zh-TW message that names
+    // the replacement and no internal file name; the last good value
+    // survives.
+    for removed in ["evaluator_only", "human_only", "evaluator", "Human"] {
+        let f = handler
+            .handle_system_update_config(
+                json!({ "dispatch": { "judge": removed } }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(!frame_ok(&f), "removed value {removed} must be rejected");
+        let msg = match &f {
+            WsFrame::Response { error: Some(e), .. } => e.to_string(),
+            _ => String::new(),
+        };
+        assert!(msg.contains("v1.69.0"), "{removed}: {msg}");
+        assert!(msg.contains("標準驗收"), "{removed}: {msg}");
+        assert!(!msg.contains("config.toml"), "no internal file names: {msg}");
+        assert!(!msg.contains(".rs"), "no internal file names: {msg}");
+        assert_eq!(
+            crate::judge_mode::JudgeMode::from_home(Some(home.path())),
+            crate::judge_mode::JudgeMode::External,
+            "a refused write must leave the stored value alone ({removed})"
+        );
+    }
+    let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    assert!(!raw.contains("human_only") && !raw.contains("evaluator_only"), "{raw}");
+
     // Unknown value → rejected, and the last good value survives.
     let bad = handler
         .handle_system_update_config(
@@ -511,7 +541,7 @@ pub(super) async fn system_update_config_judge_seam_whitelist() {
     assert!(!frame_ok(&bad), "unknown judge mode must be rejected");
     assert_eq!(
         crate::judge_mode::JudgeMode::from_home(Some(home.path())),
-        crate::judge_mode::JudgeMode::HumanOnly
+        crate::judge_mode::JudgeMode::External
     );
 
     // The command is operator-only: this RPC must never write it (the key

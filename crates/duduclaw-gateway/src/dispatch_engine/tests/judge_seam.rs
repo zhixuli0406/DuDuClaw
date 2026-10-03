@@ -68,160 +68,170 @@ use super::*;
         assert_eq!(run(None).await, run(Some("judge = \"mav\"")).await);
     }
 
-    /// ② `evaluator_only` accepts on `candidate_complete` WITHOUT paying for
-    /// the panel, and labels the verdict as the weaker low-cost mode.
+    /// v1.69.0: `evaluator_only` was removed. A deployment that still has it
+    /// in `config.toml` (or the `evaluator` alias) adjudicates exactly like
+    /// `mav` — the evaluator runs first, the panel decides the completion
+    /// candidate — and the removal is reported once (audit + Activity Feed).
     #[tokio::test]
-    async fn judge_seam_evaluator_only_accepts_without_the_panel() {
-        let dir = tempfile::tempdir().unwrap();
-        write_dispatch_config(dir.path(), "judge = \"evaluator_only\"");
-        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
-        seed_review(&store, "eo1").await;
+    async fn judge_seam_removed_evaluator_only_runs_the_mav_panel() {
+        for raw in ["evaluator_only", "evaluator"] {
+            let dir = tempfile::tempdir().unwrap();
+            write_dispatch_config(dir.path(), &format!("judge = \"{raw}\""));
+            let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+            seed_review(&store, "eo1").await;
 
-        let (engine, judge_calls, evaluator) = seam_engine(
-            dir.path(),
-            store.clone(),
-            Ok(pre_eval(PreDecision::CandidateComplete, None)),
-        )
-        .await;
-        engine.tick_once().await.unwrap();
+            let (engine, judge_calls, evaluator) = seam_engine(
+                dir.path(),
+                store.clone(),
+                Ok(pre_eval(PreDecision::CandidateComplete, None)),
+            )
+            .await;
+            engine.tick_once().await.unwrap();
 
-        let t = store.get_task("eo1").await.unwrap().unwrap();
-        assert_eq!(t.status, "done");
-        assert_eq!(
-            judge_calls.load(Ordering::SeqCst),
-            0,
-            "evaluator_only must never pay for the MAV panel"
-        );
-        assert_eq!(evaluator.calls.load(Ordering::SeqCst), 1);
-        let fb = t.judge_feedback.unwrap_or_default();
-        assert!(
-            fb.contains("evaluator_only") && fb.contains("驗收強度較弱"),
-            "the accept must self-label as the weaker low-cost mode: {fb}"
-        );
+            let t = store.get_task("eo1").await.unwrap().unwrap();
+            assert_eq!(t.status, "done", "raw = {raw}");
+            assert_eq!(
+                judge_calls.load(Ordering::SeqCst),
+                1,
+                "a leftover evaluator_only must be judged by the MAV panel (raw = {raw})"
+            );
+            assert_eq!(evaluator.calls.load(Ordering::SeqCst), 1, "raw = {raw}");
+            let fb = t.judge_feedback.unwrap_or_default();
+            assert!(
+                !fb.contains("驗收強度較弱"),
+                "no weaker single-evaluator accept may survive the removal: {fb}"
+            );
+
+            let audit =
+                std::fs::read_to_string(dir.path().join("security_audit.jsonl")).unwrap_or_default();
+            assert!(
+                audit.contains("judge_mode_removed") && audit.contains("evaluator_only"),
+                "the removal must be audited (raw = {raw}): {audit}"
+            );
+            let (rows, _) = store
+                .list_activity(None, Some("judge_mode_removed"), 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1, "one Activity Feed notice (raw = {raw})");
+            assert!(rows[0].summary.contains("v1.69.0"), "{}", rows[0].summary);
+        }
     }
 
-    /// ② `evaluator_only` still rejects/escalates exactly as before on the
-    /// evaluator's own `continue` / `blocked` verdicts (those paths are mode
-    /// independent — the mode only changes what `candidate_complete` means).
+    /// v1.69.0: with the removed `evaluator_only` an evaluator malfunction or
+    /// `two_stage_judge = false` behaves as in `mav` — straight to the panel,
+    /// never a `needs_human` park and never an unopposed pass.
     #[tokio::test]
-    async fn judge_seam_evaluator_only_keeps_continue_and_blocked_routing() {
-        let dir = tempfile::tempdir().unwrap();
-        write_dispatch_config(dir.path(), "judge = \"evaluator_only\"");
-        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
-        seed_review(&store, "eo2").await;
-        let (engine, judge_calls, _) = seam_engine(
-            dir.path(),
-            store.clone(),
-            Ok(pre_eval(PreDecision::Continue, None)),
-        )
-        .await;
-        engine.tick_once().await.unwrap();
-        assert_eq!(
-            store.get_task("eo2").await.unwrap().unwrap().status,
-            "revising"
-        );
-        assert_eq!(judge_calls.load(Ordering::SeqCst), 0);
+    async fn judge_seam_removed_evaluator_only_degrades_onto_the_panel_like_mav() {
+        for (id, body, outcome) in [
+            (
+                "eo2",
+                "judge = \"evaluator_only\"",
+                Err::<PreEvaluation, String>("llm unreachable".into()),
+            ),
+            (
+                "eo3",
+                "judge = \"evaluator_only\"\ntwo_stage_judge = false",
+                Ok(pre_eval(PreDecision::CandidateComplete, None)),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_dispatch_config(dir.path(), body);
+            let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+            seed_review(&store, id).await;
+            let (engine, judge_calls, _) = seam_engine(dir.path(), store.clone(), outcome).await;
+            engine.tick_once().await.unwrap();
+            assert_eq!(store.get_task(id).await.unwrap().unwrap().status, "done", "{body}");
+            assert_eq!(judge_calls.load(Ordering::SeqCst), 1, "{body}");
+        }
     }
 
-    /// ② fail-closed: an evaluator that ERRORS under `evaluator_only` has no
-    /// panel to degrade onto, so the task parks for a human — it must never
-    /// read as an unopposed pass, and must not silently fall through to the
-    /// panel either (that would make the mode a lie).
+    /// v1.69.0: `human_only` was removed, but a deployment that still has it
+    /// must NOT fall back to machine acceptance (that would drop a human
+    /// gate). Every review parks as `needs_human` before any model call, the
+    /// pause is classified `infra` (a platform setting, not the work), the
+    /// operator-facing reason names the fix, and the removal is reported
+    /// (audit + Activity Feed).
     #[tokio::test]
-    async fn judge_seam_evaluator_only_error_fails_closed_to_needs_human() {
-        let dir = tempfile::tempdir().unwrap();
-        write_dispatch_config(dir.path(), "judge = \"evaluator_only\"");
-        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
-        seed_review(&store, "eo3").await;
+    async fn judge_seam_removed_human_only_parks_without_any_judge_call() {
+        for raw in ["human_only", "human", " Human_Only "] {
+            let dir = tempfile::tempdir().unwrap();
+            write_dispatch_config(dir.path(), &format!("judge = \"{raw}\""));
+            let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+            seed_review(&store, "ho1").await;
 
-        let (engine, judge_calls, _) =
-            seam_engine(dir.path(), store.clone(), Err("llm unreachable".into())).await;
-        engine.tick_once().await.unwrap();
+            let (engine, judge_calls, evaluator) = seam_engine(
+                dir.path(),
+                store.clone(),
+                Ok(pre_eval(PreDecision::CandidateComplete, None)),
+            )
+            .await;
+            engine.tick_once().await.unwrap();
 
-        let t = store.get_task("eo3").await.unwrap().unwrap();
-        assert_eq!(t.status, "needs_human");
-        assert_eq!(
-            judge_calls.load(Ordering::SeqCst),
-            0,
-            "a failed evaluator_only must not silently borrow the MAV panel"
-        );
-        assert_eq!(
-            t.pause_reason.as_deref(),
-            Some(crate::pause_reason::PauseReason::Infra.as_str())
-        );
+            let t = store.get_task("ho1").await.unwrap().unwrap();
+            assert_eq!(t.status, "needs_human", "raw = {raw}");
+            assert_eq!(judge_calls.load(Ordering::SeqCst), 0, "raw = {raw}");
+            assert_eq!(
+                evaluator.calls.load(Ordering::SeqCst),
+                0,
+                "a leftover human_only must not pay for any model call (raw = {raw})"
+            );
+            assert_eq!(
+                t.pause_reason.as_deref(),
+                Some(crate::pause_reason::PauseReason::Infra.as_str()),
+                "raw = {raw}"
+            );
+            let fb = t.judge_feedback.unwrap_or_default();
+            for needle in [
+                "v1.69.0",
+                "judge = \"mav\"",
+                "autonomy_level",
+                "approval_required_tools",
+            ] {
+                assert!(fb.contains(needle), "reason must name {needle}: {fb}");
+            }
+
+            let audit =
+                std::fs::read_to_string(dir.path().join("security_audit.jsonl")).unwrap_or_default();
+            assert!(
+                audit.contains("judge_mode_removed") && audit.contains("human_only"),
+                "the removal must be audited (raw = {raw}): {audit}"
+            );
+            let (rows, _) = store
+                .list_activity(None, Some("judge_mode_removed"), 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1, "one Activity Feed notice (raw = {raw})");
+        }
     }
 
-    /// ② fail-closed: `evaluator_only` with the evaluator switched off via
-    /// `[dispatch] two_stage_judge = false` leaves NO judge at all. It parks
-    /// for a human rather than accepting or quietly using the panel.
+    /// The removal notice is once per process per home, not once per task:
+    /// a second parked task in the same home adds no second audit row or
+    /// Activity Feed notice.
     #[tokio::test]
-    async fn judge_seam_evaluator_only_without_a_usable_evaluator_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        write_dispatch_config(
-            dir.path(),
-            "judge = \"evaluator_only\"\ntwo_stage_judge = false",
-        );
-        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
-        seed_review(&store, "eo4").await;
-
-        let (engine, judge_calls, evaluator) = seam_engine(
-            dir.path(),
-            store.clone(),
-            Ok(pre_eval(PreDecision::CandidateComplete, None)),
-        )
-        .await;
-        engine.tick_once().await.unwrap();
-
-        let t = store.get_task("eo4").await.unwrap().unwrap();
-        assert_eq!(t.status, "needs_human");
-        assert_eq!(judge_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(evaluator.calls.load(Ordering::SeqCst), 0);
-
-        // And the same config WITHOUT the mode is unchanged: two_stage off in
-        // `mav` mode simply means "straight to the panel".
-        let dir2 = tempfile::tempdir().unwrap();
-        write_dispatch_config(dir2.path(), "two_stage_judge = false");
-        let store2 = Arc::new(TaskStore::open(dir2.path()).unwrap());
-        seed_review(&store2, "eo5").await;
-        let (engine2, judge_calls2, _) = seam_engine(
-            dir2.path(),
-            store2.clone(),
-            Ok(pre_eval(PreDecision::CandidateComplete, None)),
-        )
-        .await;
-        engine2.tick_once().await.unwrap();
-        assert_eq!(
-            store2.get_task("eo5").await.unwrap().unwrap().status,
-            "done"
-        );
-        assert_eq!(judge_calls2.load(Ordering::SeqCst), 1);
-    }
-
-    /// `human_only` (design §6-P1's third mode): never machine-judged, and it
-    /// must ACTUALLY stop the task — "必須真的攔下、不得自動放行".
-    #[tokio::test]
-    async fn judge_seam_human_only_never_auto_accepts() {
+    async fn judge_seam_removed_mode_notice_is_written_once_per_home() {
         let dir = tempfile::tempdir().unwrap();
         write_dispatch_config(dir.path(), "judge = \"human_only\"");
         let store = Arc::new(TaskStore::open(dir.path()).unwrap());
-        seed_review(&store, "ho1").await;
-
-        let (engine, judge_calls, evaluator) = seam_engine(
+        seed_review(&store, "ho2").await;
+        let (engine, _, _) = seam_engine(
             dir.path(),
             store.clone(),
             Ok(pre_eval(PreDecision::CandidateComplete, None)),
         )
         .await;
         engine.tick_once().await.unwrap();
+        seed_review(&store, "ho3").await;
+        engine.tick_once().await.unwrap();
 
-        let t = store.get_task("ho1").await.unwrap().unwrap();
-        assert_eq!(t.status, "needs_human");
-        assert_eq!(judge_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            evaluator.calls.load(Ordering::SeqCst),
-            0,
-            "human_only must not pay for any model call"
-        );
+        assert_eq!(store.get_task("ho2").await.unwrap().unwrap().status, "needs_human");
+        assert_eq!(store.get_task("ho3").await.unwrap().unwrap().status, "needs_human");
+        let (rows, _) = store
+            .list_activity(None, Some("judge_mode_removed"), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let audit = std::fs::read_to_string(dir.path().join("security_audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("judge_mode_removed").count(), 1, "{audit}");
     }
 
 

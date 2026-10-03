@@ -473,8 +473,8 @@ pub use goal_loop::state as goal_state;
 pub mod dispatch_policy;
 // ── WP-5D: the acceptance judge as a REAL seam ("everything is a plugin"
 //        design §2 row 8 / §6-P1) — `[dispatch] judge` selects
-//        mav | evaluator_only | external | human_only; every failure path
-//        falls back to `mav`, the strongest verifier ──
+//        mav | external (evaluator_only / human_only removed in v1.69.0);
+//        every failure path falls back to `mav`, the strongest verifier ──
 pub mod judge_mode;
 // ── Audit O8 alias — see the `goal_loop` block above ──
 pub use goal_loop::plan as goal_plan;

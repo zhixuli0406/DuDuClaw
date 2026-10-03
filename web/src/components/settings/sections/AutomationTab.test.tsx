@@ -70,21 +70,32 @@ describe('<AutomationTab> acceptance judge (dispatch.judge, WP-6B)', () => {
     );
   });
 
-  // T5/O12 (feature audit 2026-09-29): `evaluator_only` / `human_only` are
-  // deprecated. The gateway still parses and honours them, so a deployment
-  // already on one must keep seeing its own value — marked as deprecated —
-  // rather than have the picker silently show a mode that is not on disk.
-  it('reflects a saved evaluator_only mode from system.config, labelled deprecated', async () => {
-    configMock.mockResolvedValue(configWithJudge('evaluator_only'));
+  // v1.69.0 removed `evaluator_only` / `human_only`. A config.toml that still
+  // holds one must show that value (labelled with what actually runs now),
+  // never silently display the default.
+  it('shows a saved human_only as removed, with what happens now, instead of the default', async () => {
+    configMock.mockResolvedValue(configWithJudge('human_only'));
     renderWithProviders(<AutomationTab />);
 
     const trigger = await screen.findByRole('combobox', { name: 'Acceptance judge' });
-    await waitFor(() =>
-      expect(trigger).toHaveTextContent(
-        'Quick mode: a lighter first-pass check only, review is more lenient — good for low-risk routine tasks'
-      )
-    );
-    expect(trigger).toHaveTextContent('deprecated');
+    await waitFor(() => expect(trigger).toHaveTextContent(/Always human review \(removed\)/));
+    expect(trigger).not.toHaveTextContent(/Standard review/);
+    expect(trigger).toHaveTextContent(/stops at "Needs your decision"/);
+    const notice = await screen.findByText(/removed in v1\.69\.0/);
+    expect(notice).toHaveTextContent(/Autonomy level/);
+    expect(notice).toHaveTextContent(/stops at "Needs your decision"/);
+  });
+
+  it('shows a saved evaluator_only (or its alias) as removed and running as standard review', async () => {
+    for (const raw of ['evaluator_only', 'Evaluator']) {
+      configMock.mockResolvedValue(configWithJudge(raw));
+      const { unmount } = renderWithProviders(<AutomationTab />);
+      const trigger = await screen.findByRole('combobox', { name: 'Acceptance judge' });
+      await waitFor(() => expect(trigger).toHaveTextContent(/Quick mode \(removed\)/));
+      expect(trigger).toHaveTextContent(/runs as standard review/);
+      expect(await screen.findByText(/removed in v1\.69\.0/)).toHaveTextContent(/stricter/);
+      unmount();
+    }
   });
 
   it('offers only the two supported judge modes and lets the user switch between them', async () => {
@@ -106,7 +117,7 @@ describe('<AutomationTab> acceptance judge (dispatch.judge, WP-6B)', () => {
         name: 'External judge: hand the decision to your own program, configured in config.toml',
       })
     ).toBeInTheDocument();
-    // The two deprecated modes are no longer offered as a new choice.
+    // The two removed modes are not offered.
     expect(screen.queryByRole('option', { name: /Quick mode/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('option', { name: /Always human review/ })).not.toBeInTheDocument();
 
@@ -122,32 +133,59 @@ describe('<AutomationTab> acceptance judge (dispatch.judge, WP-6B)', () => {
     );
   });
 
-  it('keeps a deprecated saved mode selectable in the list instead of dropping it', async () => {
+  it('lists only the saved removed value, and moving off it drops it from the list', async () => {
     const user = userEvent.setup();
     configMock.mockResolvedValue(configWithJudge('human_only'));
     renderWithProviders(<AutomationTab />);
     await waitFor(() => expect(configMock).toHaveBeenCalled());
 
-    await user.click(await screen.findByRole('combobox', { name: 'Acceptance judge' }));
+    const trigger = await screen.findByRole('combobox', { name: 'Acceptance judge' });
+    await user.click(trigger);
     await screen.findByRole('listbox');
-    expect(screen.getByRole('option', { name: /Always human review.*deprecated/ })).toBeInTheDocument();
-    // …and the other deprecated mode, which is NOT the saved value, stays out.
+    expect(screen.getByRole('option', { name: /Always human review \(removed\)/ })).toBeInTheDocument();
+    // …and the other removed mode, which is NOT the saved value, stays out.
     expect(screen.queryByRole('option', { name: /Quick mode/ })).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole('option', {
+        name: 'Standard review (default): a three-aspect AI judge panel checks the work',
+      })
+    );
+    await waitFor(() => expect(screen.queryByText(/removed in v1\.69\.0/)).not.toBeInTheDocument());
+    await user.click(trigger);
+    await screen.findByRole('listbox');
+    expect(screen.queryByRole('option', { name: /Always human review/ })).not.toBeInTheDocument();
   });
 
-  it('shows a risk callout only in quick (evaluator_only) mode', async () => {
-    // Default (mav): no risk callout, no external-command hint.
+  it('switching a saved removed value to standard review sends mav; leaving it sends nothing', async () => {
+    const user = userEvent.setup();
+    configMock.mockResolvedValue(configWithJudge('human_only'));
+    renderWithProviders(<AutomationTab />);
+    await screen.findByRole('combobox', { name: 'Acceptance judge' });
+
+    // Untouched: the removed value is never written back.
+    await user.click(screen.getByRole('button', { name: /^Save$/i }));
+    expect(updateConfigMock).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('combobox', { name: 'Acceptance judge' }));
+    await screen.findByRole('listbox');
+    await user.click(
+      screen.getByRole('option', {
+        name: 'Standard review (default): a three-aspect AI judge panel checks the work',
+      })
+    );
+    await user.click(screen.getByRole('button', { name: /^Save$/i }));
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalled());
+    const payload = updateConfigMock.mock.calls[0][0] as { dispatch: { judge: string } };
+    expect(payload.dispatch.judge).toBe('mav');
+  });
+
+  it('shows no removal notice and no external hint in the default mode', async () => {
     renderWithProviders(<AutomationTab />);
     await waitFor(() => expect(configMock).toHaveBeenCalled());
     await screen.findByRole('combobox', { name: 'Acceptance judge' });
-    expect(screen.queryByText(/Risk: Quick mode/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/removed in v1\.69\.0/)).not.toBeInTheDocument();
     expect(screen.queryByText(/judge_command/)).not.toBeInTheDocument();
-  });
-
-  it('still shows the quick-mode risk callout for a deployment saved on evaluator_only', async () => {
-    configMock.mockResolvedValue(configWithJudge('evaluator_only'));
-    renderWithProviders(<AutomationTab />);
-    expect(await screen.findByText(/Risk: Quick mode/)).toBeInTheDocument();
   });
 
   it('shows the config.toml judge_command hint only in external mode', async () => {

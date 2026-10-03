@@ -546,7 +546,7 @@ pub(super) fn iter_verdict_conn(
 
 /// A1-2: seal the latest un-judged round as `escalated` when the settle path
 /// parks the task through `mark_needs_human_with_pause` (evaluator `blocked`,
-/// judge error, `human_only` / `evaluator_only` fail-closed) — previously such
+/// judge error, a leftover removed `human_only`) — previously such
 /// a round kept `verdict = NULL` forever.
 ///
 /// `judge_feedback` is deliberately left **NULL**: no judge ruled, and the
