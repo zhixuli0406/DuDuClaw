@@ -167,7 +167,7 @@ Goose 的 Lead/Worker 功能儲存的角色設定只有模型名稱，結果 `qw
 
 ### 2. 只限第一批 runtime
 
-`claude`、`codex`、`gemini`（v1.67.0 起棄用，v1.69.0 移除：請改用 `antigravity`）、`antigravity`、`grok`。其他一律拒絕，包括 `openai_compat`、`qwen`、`copilot`、`cursor`（`runtime_not_allowed`）。
+`claude`、`codex`、`gemini`（v1.67.0 起棄用，v1.70.0 移除：請改用 `antigravity`）、`antigravity`、`grok`。其他一律拒絕，包括 `openai_compat`、`qwen`、`copilot`、`cursor`（`runtime_not_allowed`）。
 
 原因在工具，與能力無關：這五個 runtime 原生註冊 DuDuClaw 的 MCP server，所以跑在上面的角色拿得到完整的工具面。角色若靜默失去工具，會產生自信滿滿、沒有任何工具呼叫的敘述，審核者分不出它與真正做完的工作。
 
@@ -245,8 +245,8 @@ composer 以數字順序讀回相同的槽位，先是規範檔，再是 `.01`�
 
 | 角色 | 工具 | codex 成員的有效沙箱 |
 |---|---|---|
-| `planner` | `team_handoff`、`shared_wiki_search`、`memory_search` | `read-only` |
-| `executor` | **員工自己的有效工具** + `team_handoff` + `memory_search` + `shared_wiki_read` | `workspace-write` |
+| `planner` | `team_handoff`、`wiki_search`、`memory_search` | `read-only` |
+| `executor` | **員工自己的有效工具** + `team_handoff` + `memory_search` + `wiki_read` | `workspace-write` |
 | `verifier` / `utility` | `team_handoff` | `read-only` |
 
 「員工自己的有效工具」指的是：員工有白名單時，逐字取其 `[capabilities] allowed_tools`；否則取一般派工所用的同一組預設集合（`Read`、`Write`、`Edit`、`Bash`、`Glob`、`Grep`、`TodoWrite`、`WebFetch`、`WebSearch`、`mcp__duduclaw__*`）。無論哪種，執行者都是員工的子集：唯讀的員工仍會產生唯讀的執行者，員工 `denied_tools` 中的工具也絕不會被要求。

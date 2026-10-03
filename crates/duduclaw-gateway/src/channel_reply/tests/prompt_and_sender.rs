@@ -218,16 +218,31 @@ mod moa_and_provenance_wiring_tests {
     #[test]
     fn provenance_parses_warn_enforce_and_sensitive_tools() {
         let (policy, tools) = parse_provenance_settings(&cfg(
-            "[provenance]\npolicy = \"warn\"\nsensitive_tools = [\"send_to_agent\", \"shared_wiki_write\"]\n",
+            "[provenance]\npolicy = \"warn\"\nsensitive_tools = [\"send_to_agent\", \"wiki_write\"]\n",
         ));
         assert_eq!(policy, ProvenancePolicy::Warn);
         assert_eq!(
             tools,
-            vec!["send_to_agent".to_string(), "shared_wiki_write".to_string()]
+            vec!["send_to_agent".to_string(), "wiki_write".to_string()]
         );
 
         let (policy, _) = parse_provenance_settings(&cfg("[provenance]\npolicy = \"enforce\"\n"));
         assert_eq!(policy, ProvenancePolicy::Enforce);
+    }
+
+    /// A `sensitive_tools` entry written for a removed name keeps gating its
+    /// replacement instead of lapsing; it gates every form of the
+    /// replacement, because the list matches tools by name only.
+    #[test]
+    fn provenance_sensitive_removed_name_gates_its_replacement() {
+        let built = build_channel_provenance_config(
+            ProvenancePolicy::Enforce,
+            &["shared_wiki_write".to_string(), "send_to_agent".to_string()],
+            "x",
+        );
+        let names: Vec<&str> = built.sensitive_tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"wiki_write"), "{names:?}");
+        assert!(names.contains(&"send_to_agent"), "{names:?}");
     }
 
     #[test]
@@ -243,6 +258,7 @@ mod moa_and_provenance_wiring_tests {
         assert_eq!(built.policy, ProvenancePolicy::Off);
         assert!(built.sensitive_tools.is_empty());
         assert!(built.tool_trust.is_empty());
+        assert!(built.scoped_tool_trust.is_empty());
         assert!(built.initial_ledger.is_none());
     }
 
@@ -259,14 +275,23 @@ mod moa_and_provenance_wiring_tests {
             built.sensitive_tools[0].sensitive_args.is_none(),
             "all args gated"
         );
-        assert_eq!(
-            built.tool_trust.get("shared_wiki_read"),
-            Some(&SourceKind::Wiki)
-        );
-        assert_eq!(
-            built.tool_trust.get("shared_wiki_search"),
-            Some(&SourceKind::Wiki)
-        );
+        // D9: shared-wiki reads are trusted only with scope="shared"; the
+        // same tools reading the agent's own wiki stay tainted, exactly as
+        // before the old `shared_wiki_*` names were removed.
+        assert!(built.tool_trust.is_empty(), "no unconditional trust: {:?}", built.tool_trust);
+        for tool in ["wiki_read", "wiki_search"] {
+            let shared = serde_json::json!({ "scope": "shared", "query": "q", "page_path": "a.md" });
+            assert_eq!(built.result_trust(tool, &shared), SourceKind::Wiki, "{tool}");
+            for args in [
+                serde_json::json!({ "page_path": "a.md" }),
+                serde_json::json!({ "scope": "agent" }),
+            ] {
+                assert_eq!(built.result_trust(tool, &args), SourceKind::ToolResult, "{tool} {args}");
+            }
+        }
+        for removed in ["shared_wiki_read", "shared_wiki_search"] {
+            assert_eq!(built.result_trust(removed, &serde_json::json!({})), SourceKind::ToolResult);
+        }
 
         // The channel input is registered Tainted on the initial ledger:
         // evaluating a sensitive call that echoes it must flag/block.

@@ -13,18 +13,17 @@
 //!
 //! ```text
 //! duduclaw pack install <src>   ┐
-//! duduclaw expert install <src> ├─→ install_pack()  ─┬─ Preset   → <home>/presets/<id>/preset.toml
-//! experts.install RPC           │                     └─ Team/Tpl → expert::install::cmd_install
-//! experts.install_builtin RPC   ┘                                    (safe_zip, DATA scan, hooks
+//! experts.install RPC           ├─→ install_pack()  ─┬─ Preset   → <home>/presets/<id>/preset.toml
+//! experts.install_builtin RPC   │                     └─ Team/Tpl → expert::install::cmd_install
+//! experts.install_draft RPC     ┘                                    (safe_zip, DATA scan, hooks
 //!                                                                     quarantine, org_store, …)
 //! ```
 //!
-//! The two RPCs already reach the CLI by spawning `duduclaw expert install`
-//! (see `duduclaw_gateway::handlers::spawn_expert_cli`), so routing
-//! `expert install` through here converges them with no gateway change.
-//!
-//! Old names stay as aliases until **v1.69.0** (deprecation policy: two minor
-//! versions), and so do all three legacy manifest dialects.
+//! The three RPCs reach the CLI by spawning `duduclaw pack install` (see
+//! `duduclaw_gateway::handlers::spawn_pack_cli`). `duduclaw expert install`
+//! was removed in v1.69.0 and only prints that; the legacy manifest dialects
+//! (`expert.toml`, `team.toml`, `preset.toml`, industry directories) are all
+//! still read.
 
 use std::path::{Path, PathBuf};
 
@@ -126,8 +125,7 @@ pub async fn run(cmd: PackCommands) -> Result<()> {
 
 /// Flags that reach one or the other install route. Team-pack flags are
 /// ignored by the preset route and vice versa — documented per flag above
-/// rather than split into two structs, so `expert install` can hand its
-/// existing arguments straight through.
+/// rather than split into two structs, so one CLI argument set serves both.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InstallOptions {
     pub dry_run: bool,
@@ -352,7 +350,7 @@ async fn cmd_inspect(source: &str, json: bool, emit_canonical: bool) -> Result<(
         "  讀自      {}{}",
         pack.source.as_str(),
         if pack.source.is_legacy() {
-            "（舊格式，支援到 v1.69.0）"
+            "（舊格式）"
         } else {
             ""
         }
@@ -1140,7 +1138,7 @@ reports_to = "front"
     // command enum blows the 2 MiB default test stack in debug builds.
 
     #[test]
-    fn pack_subcommands_parse_and_expert_install_stays_an_alias() {
+    fn pack_subcommands_parse_and_expert_install_is_removed() {
         crate::test_support::run_on_big_stack(pack_subcommands_parse_body);
     }
 
@@ -1200,12 +1198,25 @@ reports_to = "front"
             _ => panic!("pack install parsed into the wrong command"),
         }
 
-        // The old verb must still parse — it is an alias until v1.69.0.
-        let cli = crate::Cli::try_parse_from(["duduclaw", "expert", "install", "./x"])
-            .expect("expert install still parses");
+        // The old verb parses only to be refused with a message naming
+        // `pack install` (v1.69.0); `expert list` is a real verb, not an alias.
+        let cli = crate::Cli::try_parse_from(["duduclaw", "expert", "install", "./x", "--dry-run"])
+            .expect("expert install still parses so it can explain itself");
+        match cli.command {
+            crate::Commands::Maintenance(crate::MaintenanceCommands::Expert {
+                command: crate::expert::ExpertCommands::Install(_),
+            }) => {}
+            _ => panic!("expert install must map to the removed-verb stub"),
+        }
+        let msg = crate::removed_spelling::RemovedSpelling::ExpertInstall.message();
+        assert!(msg.contains("v1.69.0") && msg.contains("duduclaw pack install"), "{msg}");
+        let cli = crate::Cli::try_parse_from(["duduclaw", "expert", "list", "--json"])
+            .expect("expert list stays");
         assert!(matches!(
             cli.command,
-            crate::Commands::Maintenance(crate::MaintenanceCommands::Expert { .. })
+            crate::Commands::Maintenance(crate::MaintenanceCommands::Expert {
+                command: crate::expert::ExpertCommands::List { json: true }
+            })
         ));
     }
 

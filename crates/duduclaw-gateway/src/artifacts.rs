@@ -1239,7 +1239,7 @@ pub async fn archive_goal_task_artifacts(
         task_id,
         // Same convention as `collect_task_artifacts`: an empty agent drops
         // the MCP-audit half so only task-keyed native rows come back — MCP
-        // tools (`shared_wiki_write` et al.) are not goal-loop file
+        // tools (`wiki_write` et al.) are not goal-loop file
         // deliverables in this sense.
         "",
         "",

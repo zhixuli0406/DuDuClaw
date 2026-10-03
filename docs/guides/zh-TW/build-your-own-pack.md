@@ -41,27 +41,11 @@ display_name = "小幫手"
 
 `agents/helper/soul.md` 寫 persona。身份／職責／邊界三段是好起點；邊界寫得越清楚，安裝者越敢用。
 
-### 或者直接寫新的 `pack.toml`
+### 關於 `pack.toml`
 
-上面的 `expert.toml` 是舊格式，支援到 **v1.69.0**。新包可以改宣告 `pack.toml`——團隊包、單人產業板模、職務組合共用的同一份 schema：
+團隊包與產業包請用 `expert.toml`。較新的 `pack.toml` schema 能描述團隊包、產業包與職務 preset，`duduclaw pack inspect` 三種都讀得懂。但 `duduclaw pack install` 目前只能安裝 `kind` 為 `"preset"` 的 `pack.toml`（職務 preset）。`kind = "team"` 或 `"template"` 的 `pack.toml` 可以讀取與檢視，還不能安裝，因為背後的安裝程式只靠 `expert.toml` 辨認團隊包或產業包。因此 `expert.toml` 雖已棄用但仍然讀取，要等 `pack.toml` 的團隊包能安裝之後，才會跟改寫後的付費板模一起移除，目前沒有訂版號。
 
-```toml
-[pack]
-schema  = 1
-id      = "my-first-pack"
-kind    = "team"        # "preset" | "team" | "template"
-tier    = "free"
-version = "0.1.0"
-label   = "友善小幫手"
-description = "示範包"
-
-[[pack.agents]]
-name = "helper"
-role = "main"
-display_name = "小幫手"
-```
-
-目錄裡其他東西（persona、技能、知識頁）都不用改。已經有舊格式的包？`duduclaw pack inspect <dir> --emit-canonical` 會印出對應的 `pack.toml` 讓你審過再存檔——它不會覆寫你的檔案。
+想看手上的包在新 schema 下長什麼樣？`duduclaw pack inspect <dir> --emit-canonical` 會印出對應的 `pack.toml` 讓你審過再存檔，它不會覆寫你的檔案。
 
 ## 2. 本機測試迴路
 
@@ -86,7 +70,7 @@ duduclaw pack install https://example.com/my-first-pack-0.1.0.zip
 duduclaw expert remove my-first-pack
 ```
 
-`duduclaw expert install`／`expert list` 仍然可用，就是前兩行的別名——同一段程式、同樣的輸出。
+`duduclaw expert install` 已在 v1.69.0 移除，執行時會印出 `duduclaw pack install` 並以結束碼 2 離開。`expert list` 仍然可用，列出已安裝的紀錄。
 
 安裝端的防護是內建的：zip-slip 圍欄、50MB 上限、內容掃描；**hooks 一律先裝進隔離區**（`hooks-disabled/`），要操作者明確信任才啟用。寫包時別假設 hooks 會自動生效。
 
@@ -104,7 +88,7 @@ duduclaw expert remove my-first-pack
 
 ## 5. 發佈與品質
 
-今天的發佈方式：把 zip 放任何可下載的網址（GitHub Release 最順手），對方 `expert install <url>`；也歡迎到板模畫廊（`distribution/gallery/`）加一頁。集中式 registry（PR 提交＋自動驗證＋簽章）建置中。
+今天的發佈方式：把 zip 放任何可下載的網址（GitHub Release 最順手），對方 `pack install <url>`；也歡迎到板模畫廊（`distribution/gallery/`）加一頁。集中式 registry（PR 提交＋自動驗證＋簽章）建置中。
 
 品質建議（未來的分級 scorecard 會看這些）：
 - [ ] SOUL 有明確「邊界」段

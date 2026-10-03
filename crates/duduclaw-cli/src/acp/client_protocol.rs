@@ -1,7 +1,7 @@
 //! Agent Client Protocol (ACP) v1 server — the editor-facing protocol used by
 //! Zed / JetBrains / nvim agent panels (agentclientprotocol.com).
 //!
-//! NOT to be confused with the A2A protocol served by `duduclaw acp-server`
+//! NOT to be confused with the A2A protocol served by `duduclaw acp server`
 //! (`super::server`) — the two share the "ACP" acronym by historical accident.
 //! This module implements the real client protocol surface:
 //!
@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(tool_kind("Bash"), "execute");
         assert_eq!(tool_kind("WebFetch"), "fetch");
         assert_eq!(tool_kind("memory_search"), "read");
-        assert_eq!(tool_kind("shared_wiki_write"), "other");
+        assert_eq!(tool_kind("wiki_write"), "other");
     }
 
     #[test]

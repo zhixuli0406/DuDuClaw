@@ -700,11 +700,25 @@ impl MethodHandler {
             // `org_field_guard` already DENIES agent writes to
             // `<home>/config.toml`) means no dashboard or agent path can point
             // the judge seam at an arbitrary binary. Value set is enumerated
-            // here and validated again by `JudgeMode::from_config_str` at read
-            // time — an unknown value falls back to `mav`, the strongest
-            // verifier.
+            // (`JudgeMode::from_config_str`); only `mav` and `external` may be
+            // written. The values removed in v1.69.0 (`evaluator_only`,
+            // `human_only` and their aliases) are refused with an end-user
+            // message naming the replacement, and the stored value is left
+            // untouched. An unknown value is refused too (the read path
+            // additionally falls back to `mav`, the strongest verifier).
             if let Some(v) = dp.get("judge").and_then(|v| v.as_str()) {
                 match crate::judge_mode::JudgeMode::from_config_str(v) {
+                    Some(mode) if mode.is_removed() => {
+                        warn!(
+                            value = mode.as_str(),
+                            "system.update_config refused a removed dispatch.judge value"
+                        );
+                        return WsFrame::error_response(
+                            "",
+                            crate::judge_mode::removed_mode_write_error(mode)
+                                .unwrap_or("這個驗收方式已移除，請改選「標準驗收」。"),
+                        );
+                    }
                     Some(mode) => {
                         let section = table
                             .entry("dispatch")
@@ -716,42 +730,11 @@ impl MethodHandler {
                             "dispatch.judge = \"{}\" (hot reload)",
                             mode.as_str()
                         ));
-                        // T5/O12 (feature audit 2026-09-29): `evaluator_only`
-                        // and `human_only` are deprecated. Still accepted (a
-                        // deployment already on one keeps working, and the
-                        // dashboard keeps showing it), but every *write* of a
-                        // deprecated value leaves a warning and an audit row
-                        // so the migration is traceable. Removal: v1.69.0.
-                        if mode.is_deprecated() {
-                            warn!(
-                                value = mode.as_str(),
-                                replacement =
-                                    mode.deprecation_replacement().unwrap_or("mav"),
-                                remove_in = "v1.69.0",
-                                "dispatch.judge set to a deprecated mode via system.update_config"
-                            );
-                            crate::security_autopilot::audit_and_emit(
-                                &self.home_dir,
-                                &duduclaw_security::audit::AuditEvent::new(
-                                    "judge_mode_deprecated",
-                                    &ctx.user_id,
-                                    duduclaw_security::audit::Severity::Warning,
-                                    json!({
-                                        "value": mode.as_str(),
-                                        "replacement": mode
-                                            .deprecation_replacement()
-                                            .unwrap_or("mav"),
-                                        "remove_in": "v1.69.0",
-                                        "source": "system.update_config",
-                                    }),
-                                ),
-                            );
-                        }
                     }
                     None => {
                         return WsFrame::error_response(
                             "",
-                            "Invalid dispatch.judge. Valid: mav, evaluator_only, external, human_only",
+                            "Invalid dispatch.judge. Valid: mav, external",
                         );
                     }
                 }

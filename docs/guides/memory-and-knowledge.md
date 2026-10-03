@@ -157,7 +157,7 @@ Everything else needs the AI employee to judge that a search is warranted and ru
 
 When a new statement about the same topic comes in, the old one gets marked "superseded" and the new one takes its place. Expanding any memory shows the full supersession chain, and you can also ask "what was the answer as of a given point in time." So correcting course doesn't require deleting the old entry first; just say the new thing.
 
-One exception (v1.67.1): a statement from a chat cannot replace a fact from a more trusted source, such as one you approved in the dashboard or one imported with `migrate-from`. The new statement is held, and a review item appears in the dashboard inbox (收件匣) showing the current content and the new statement side by side. Approve it and the new statement replaces the old one; deny it and it is discarded. These items can only be decided in the dashboard, within 24 hours. Details: [Memory Intelligence](../features/20-memory-intelligence.md#supersession-trust-guard-v1671).
+One exception (v1.67.1): a statement from a chat cannot replace a fact from a more trusted source, such as one you approved in the dashboard or one imported with `migrate from`. The new statement is held, and a review item appears in the dashboard inbox (收件匣) showing the current content and the new statement side by side. Approve it and the new statement replaces the old one; deny it and it is discarded. These items can only be decided in the dashboard, within 24 hours. Details: [Memory Intelligence](../features/20-memory-intelligence.md#supersession-trust-guard-v1671).
 
 ### 4.4 Deleting a memory
 

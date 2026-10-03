@@ -25,7 +25,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 15 | [Skill Lifecycle Engine](15-skill-lifecycle.md) | 6-stage automated skill extraction and management |
 | 16 | [Session Memory Stack](16-session-memory-stack.md) | Pinned instructions + snowball recap + key-fact accumulator |
 | 17 | [Wiki Knowledge Layer](17-wiki-knowledge-layer.md) | L0-L3 trust-weighted knowledge with auto-injection |
-| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | `duduclaw acp` speaks Agent Client Protocol v1 for IDE panels (Zed / JetBrains / nvim); `duduclaw acp-server` is the A2A stdio surface |
+| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | `duduclaw acp` speaks Agent Client Protocol v1 for IDE panels (Zed / JetBrains / nvim); `duduclaw acp server` is the A2A stdio surface |
 | 20 | [Memory Intelligence](20-memory-intelligence.md) | Temporal facts + reflexion loop + batch fetch |
 | 23 | [Autopilot Rule Engine](23-autopilot-engine.md) | Event-driven automation + circuit breaker |
 | 24 | [Task Board & Activity Feed](24-task-board.md) | Agent-as-teammate task management |

@@ -32,7 +32,7 @@
 
 | 決策項目 | 選擇 | 理由 |
 |----------|------|------|
-| AI 對話 | **多 runtime CLI**（`AgentRuntime` trait）：Claude Code、Codex、Antigravity（`agy`）、Grok、OpenAI-compatible；Gemini CLI 於 v1.67.0 棄用、v1.69.0 移除（由 Antigravity 取代）；另有 `runtime_catalog.rs` 收錄的其他 CLI | 工具鏈、MCP 相容與 session 由各家 CLI 負責，per-agent 在 `agent.toml [runtime]` 選擇 |
+| AI 對話 | **多 runtime CLI**（`AgentRuntime` trait）：Claude Code、Codex、Antigravity（`agy`）、Grok、OpenAI-compatible；Gemini CLI 於 v1.67.0 棄用、v1.70.0 移除（由 Antigravity 取代）；另有 `runtime_catalog.rs` 收錄的其他 CLI | 工具鏈、MCP 相容與 session 由各家 CLI 負責，per-agent 在 `agent.toml [runtime]` 選擇 |
 | 核心語言 | **Rust** | 記憶體安全、高效能、單 binary 部署 |
 | Python | **獨立 companion 套件**（`pip install duduclaw`），無 PyO3 綁定 | Rust binary 不呼叫它，見第五節 |
 | Agent 隔離 | **資料夾 + SOUL.md**；選配 Docker 任務沙箱（預設關） | 預設無容器開銷；沙箱見 [docs/guides/task-sandbox.md](docs/guides/task-sandbox.md) |
@@ -586,7 +586,7 @@ SQLite `tasks.db`。Dashboard RPC：`tasks.list` / `tasks.create` / `tasks.updat
 
 ### 13.6 共享知識庫（Shared Wiki）
 
-儲存於 `~/.duduclaw/shared/wiki/`，可見性由 `wiki_visible_to` capability 控制，`.scope.toml` 定義命名空間政策。MCP：`wiki_ls` / `wiki_read` / `wiki_write` / `wiki_search` / `wiki_stats` / `wiki_lint` 以 `scope: "agent" | "shared"` 切換；`shared_wiki_*` 為棄用別名（v1.68.0 移除），`shared_wiki_delete` 與 `wiki_share` 保留原名。見 [docs/features/17-wiki-knowledge-layer.md](docs/features/17-wiki-knowledge-layer.md)。
+儲存於 `~/.duduclaw/shared/wiki/`，可見性由 `wiki_visible_to` capability 控制，`.scope.toml` 定義命名空間政策。MCP：`wiki_ls` / `wiki_read` / `wiki_write` / `wiki_search` / `wiki_stats` / `wiki_lint` 以 `scope: "agent" | "shared"` 切換；六個 `shared_wiki_*` 別名已在 v1.69.0 移除，`shared_wiki_delete` 與 `wiki_share` 保留原名。見 [docs/features/17-wiki-knowledge-layer.md](docs/features/17-wiki-knowledge-layer.md)。
 
 ### 13.7 Autopilot 規則引擎
 

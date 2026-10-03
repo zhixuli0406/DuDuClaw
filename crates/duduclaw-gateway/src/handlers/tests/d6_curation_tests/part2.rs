@@ -689,3 +689,37 @@ pub(super) async fn memory_graph_absent_db_is_empty_not_error() {
         Some(0)
     );
 }
+
+/// The install RPCs reach the CLI through `duduclaw pack …` (v1.69.0 removed
+/// `expert install`); `convert-teams` stays under `expert`.
+#[cfg(unix)]
+#[tokio::test]
+pub(super) async fn experts_install_spawns_the_pack_group() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let log = home.path().join("argv.txt");
+    let fake = home.path().join("fake-duduclaw");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho \"home=$DUDUCLAW_HOME\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let args: Vec<std::ffi::OsString> =
+        vec!["install".into(), "/tmp/pack".into(), "--attach-under".into(), "ceo".into()];
+    let out = handler
+        .spawn_cli_group_with_bin(&fake, "pack", &args, 30)
+        .await
+        .expect("fake binary succeeds");
+    assert!(out.contains(&format!("home={}", home.path().display())), "{out}");
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        seen.lines().collect::<Vec<_>>(),
+        ["pack", "install", "/tmp/pack", "--attach-under", "ceo"]
+    );
+}

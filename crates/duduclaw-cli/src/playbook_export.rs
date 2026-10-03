@@ -1,4 +1,4 @@
-//! `duduclaw playbook export` — gene JSON export CLI (D5=B).
+//! `duduclaw export playbook` — gene JSON export CLI (D5=B).
 //!
 //! Thin CLI wrapper over `duduclaw_gateway::playbook::{list_active, to_gene}`
 //! (§1.4 of `commercial/docs/DESIGN-evolution-v3-aee.md`): lists every
@@ -18,14 +18,14 @@ use std::path::{Path, PathBuf};
 
 use duduclaw_core::error::{DuDuClawError, Result};
 
-/// Flags for `duduclaw playbook export`.
+/// Flags for `duduclaw export playbook`.
 pub struct ExportOptions {
     pub agent: String,
     /// Write the JSON array here. Default: stdout.
     pub out: Option<PathBuf>,
 }
 
-/// Entry point for the `playbook export` subcommand.
+/// Entry point for the `export playbook` subcommand.
 pub async fn cmd_playbook_export(home: &Path, opts: ExportOptions) -> Result<()> {
     if !duduclaw_core::is_valid_agent_id(&opts.agent) {
         return Err(DuDuClawError::Agent(format!(

@@ -44,7 +44,7 @@ DuDuClaw 1.52 引入一套針對多人團隊的委派管制。你的 AI 員工�
 - 接手未指派、或本來就指派給自己的任務（`tasks_claim`）不受限；接手指派給其他員工的任務，要與該員工有同樣的關係
 - Dashboard 的指派操作不受限（都是人類操作）
 
-**2b. 多步驟計畫與例行工作** — `create_task` 的每個步驟可以指定執行者、`schedule_task` 可以幫別人排定期工作
+**2b. 多步驟計畫與例行工作** — `create_task` 的每個步驟可以指定執行者、帶 `schedule` 的 `tasks_create` 可以幫別人排定期工作
 
 - 兩者都是委派，建立當下就檢查；`create_task` 的步驟另外在真正派工前再檢查一次
 - 幫自己排程、指定自己執行不受限
@@ -137,7 +137,7 @@ allow = [
 拒絕的委派嘗試都會留痕，依攔截點分成兩個檔案：
 
 - 派工真正要開始執行時被擋（bus 隊列、多步驟計畫）→ `~/.duduclaw/security_audit.jsonl`，事件型別 `delegation_denied`
-- MCP 工具當下被擋（`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `tasks_claim` / `tasks_complete` / `tasks_block` / `activity_post` / `create_task` / `schedule_task` / cron 管理工具 / `create_reminder`）→ `~/.duduclaw/tool_calls.jsonl`，同樣是 `delegation_denied`；`create_agent` / `agent_update` 的組織調整被擋則是 `org_placement_denied`
+- MCP 工具當下被擋（`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `tasks_claim` / `tasks_complete` / `tasks_block` / `activity_post` / `create_task` / cron 管理工具 / `create_reminder`）→ `~/.duduclaw/tool_calls.jsonl`，同樣是 `delegation_denied`；`create_agent` / `agent_update` 的組織調整被擋則是 `org_placement_denied`
 - 與關係本身無關的紀錄變更拒絕也記在 `tool_calls.jsonl`，帶 `reason`：`owner_unknown`、`caller_unknown`、`system_sender_identity`、`reserved_tag_change`、`goal_contract_frozen`。AI 員工透過 `agent_update` 改自己的權限類設定，記為 `agent_authority_refused`（reason `self_authority_change`）
 
 `security_audit.jsonl` 的一筆長這樣：
@@ -245,11 +245,11 @@ allow = [
 - 目錄已不存在，但 `org.toml` 仍記錄這個名稱，或
 - 因為無法列出 `_trash/` 而無法檢查（fail closed）。
 
-每個 MCP 呼叫端都算 AI 呼叫端。CLI 的建立路徑（`duduclaw agent create`、pack 與 expert 安裝、`migrate-from`）在環境裡看到 agent 身分（`DUDUCLAW_AGENT_ID`／`DUDUCLAW_AGENT_TOKEN`）時套用同一條規則，`agent-file-guard` hook 也會擋下 Bash 的 `duduclaw agent create <保留的名稱>`。換一個名稱永遠可以。`agent_remove` 會告訴 AI 該員工已被移除、管理員可以還原、名稱已被保留；它不再回傳 trash 路徑或 `rm -rf` 提示。
+每個 MCP 呼叫端都算 AI 呼叫端。CLI 的建立路徑（`duduclaw agent create`、pack 安裝、`migrate from`）在環境裡看到 agent 身分（`DUDUCLAW_AGENT_ID`／`DUDUCLAW_AGENT_TOKEN`）時套用同一條規則，`agent-file-guard` hook 也會擋下 Bash 的 `duduclaw agent create <保留的名稱>`。換一個名稱永遠可以。`agent_remove` 會告訴 AI 該員工已被移除、管理員可以還原、名稱已被保留；它不再回傳 trash 路徑或 `rm -rf` 提示。
 
 操作者不受限制：Dashboard 與坐在終端機前的人可以重用這個名稱。還原或清除被移除的員工，要手動處理 `~/.duduclaw/agents/_trash/<id>_<時間戳>`，Dashboard 沒有對應的控制項。拒絕會以 `agent_name_reserved` 記進 `security_audit.jsonl`（`requested_name`、`path_kind` = `mcp_create_agent`／`cli_scaffold`／`cli_bash_agent_create`、`reason` = `removed_to_trash`／`dangling_org_record`／`trash_unlistable`）；移除則記為 `agent_removed`（`subject`、`moved_to_trash`）。
 
-限制：Claude、Codex 與 Gemini 員工的身分放在 `.mcp.json`，不在 Bash 環境裡，所以 CLI 無法得知從它們的 Bash 執行的 `pack install`、`expert install` 或 `migrate-from` 是 AI session；Bash 的規則是啟發式判斷，真正的隔離是不給 agent Bash。已用員工自己的註冊資訊經真的 MCP server 實測（移除、同名重建被拒、換名字可建立、hook 的攔阻、稽核紀錄）；CLI 建立員工的那條路徑只有單元測試。
+限制：Claude、Codex 與 Gemini 員工的身分放在 `.mcp.json`，不在 Bash 環境裡，所以 CLI 無法得知從它們的 Bash 執行的 `pack install` 或 `migrate from` 是 AI session；Bash 的規則是啟發式判斷，真正的隔離是不給 agent Bash。已用員工自己的註冊資訊經真的 MCP server 實測（移除、同名重建被拒、換名字可建立、hook 的攔阻、稽核紀錄）；CLI 建立員工的那條路徑只有單元測試。
 
 透過 HTTP、使用非內部 MCP 金鑰呼叫的 `create_agent` 與 `agent_remove`，改以該金鑰自己的 client id 判定（以前會被當成伺服器行程的預設 agent），所以上面的子樹檢查會套用在真正的呼叫端上。
 

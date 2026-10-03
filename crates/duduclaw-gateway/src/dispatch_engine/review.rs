@@ -175,13 +175,6 @@ impl DispatchEngine {
             // behavior) rather than manufacturing an exclusion.
             let mut fault_grounding: Option<crate::fault_attribution::GroundingVerdict> = None;
             let mut fault_judge_passed: Option<bool> = None;
-            // WP-5D: a verdict produced by a non-MAV seam implementation
-            // (today: `evaluator_only`'s `candidate_complete`). Set here and
-            // consumed by the ONE verdict-handling `match` below, so accept /
-            // reject / artifact-archiving / grant-revocation logic exists in
-            // exactly one place regardless of which judge produced it.
-            let mut preset_verdict: Option<AcceptanceVerdict> = None;
-
             // ── WP-5D judge seam: which acceptance implementation adjudicates
             // this task ("everything is a plugin" design §2 row 8 / §6-P1).
             // Read HERE, per task, on exactly the same schedule as the
@@ -198,24 +191,33 @@ impl DispatchEngine {
             // Read-only telemetry — nothing below consults it.
             let knobs_json = self.round_knobs_json(&task);
 
-            // `human_only`: never machine-judged. Parked BEFORE any evidence
-            // work or LLM/subprocess call so the mode is also the cheapest.
-            // Uses the WP-A9 `observed_outcome` short-circuit (not a bare
-            // `continue`) so the A3 settle tail still records the escalation.
-            if judge_mode == crate::judge_mode::JudgeMode::HumanOnly {
-                let reason = "依 [dispatch] judge = \"human_only\" 設定，本部署不做機器驗收，\
-                              一律交由人工判定是否完成。"
-                    .to_string();
+            // v1.69.0 removed `evaluator_only` / `human_only`. A leftover
+            // value is reported once per home (audit + Activity Feed) so the
+            // operator sees why acceptance behaves the way it does.
+            if judge_mode.is_removed() {
+                self.report_removed_judge_mode(&task, judge_mode).await;
+            }
+
+            // Leftover `human_only`: still never machine-judged. Falling back
+            // to `mav` would let the AI panel accept work this deployment had
+            // reserved for a person, so every review parks BEFORE any
+            // evidence work or LLM/subprocess call. Classified `infra`: the
+            // pause comes from a platform setting the operator must change,
+            // not from anything in the work itself. Uses the WP-A9
+            // `observed_outcome` short-circuit (not a bare `continue`) so the
+            // A3 settle tail still records the escalation.
+            if judge_mode == crate::judge_mode::JudgeMode::RemovedHumanOnly {
+                let reason = crate::judge_mode::HUMAN_ONLY_REMOVED_PARK_REASON.to_string();
                 self.store
                     .mark_needs_human_sealing_round(
                         &task.id,
                         &reason,
-                        crate::pause_reason::PauseReason::BlockedNeedsDecision,
+                        crate::pause_reason::PauseReason::Infra,
                         knobs_json.as_deref(),
                     )
                     .await?;
                 self.revoke_task_grants(&task.id).await;
-                info!(task = %task.id, "judge seam: human_only → needs_human（不做機器驗收）");
+                info!(task = %task.id, "judge seam: removed human_only → needs_human（不做機器驗收）");
                 observed_outcome =
                     Some(crate::prediction::task_forward::ObservedOutcome::Escalated);
                 judge_feedback_for_settle = Some(reason);
@@ -234,7 +236,7 @@ impl DispatchEngine {
             let mut deterministic_note: Option<String> = None;
             // WP-5D: the `observed_outcome` half of this pattern is new —
             // guarded like every later phase (the WP-A9 pattern) so the
-            // `human_only` short-circuit above cannot be overwritten by a
+            // removed-`human_only` park above cannot be overwritten by a
             // deterministic verdict. In every other mode `observed_outcome`
             // is unconditionally `None` at this point, so the guard is
             // behavior-identical to the unguarded original.
@@ -549,50 +551,10 @@ impl DispatchEngine {
             // evaluator is wired, or when `[dispatch] two_stage_judge = false`.
             // Every failure mode below degrades to the panel — never accepts,
             // never rejects on its own malfunction.
-            //
-            // WP-5D: under `[dispatch] judge = "evaluator_only"` this stage is
-            // no longer a *pre*-filter — it is the entire acceptance decision,
-            // and there is no panel behind it to degrade onto. So the two
-            // "evaluator not available" conditions that are harmless in `mav`
-            // mode (no evaluator wired / `two_stage_judge = false`) become a
-            // fail-closed `needs_human` here: an unavailable judge must never
-            // read as an unopposed pass.
             if observed_outcome.is_none() {
                 let two_stage_enabled =
                     TwoStageJudgeConfig::from_home(self.home_dir.as_deref()).enabled;
-                let evaluator_usable = self.evaluator.is_some() && two_stage_enabled;
-                if judge_mode == crate::judge_mode::JudgeMode::EvaluatorOnly && !evaluator_usable {
-                    let reason = format!(
-                        "[dispatch] judge = \"evaluator_only\" 但第一階段評估器不可用（\
-                         evaluator_wired={}, two_stage_judge={}）——本模式沒有 MAV 判官可退回，\
-                         依 fail-closed 交由人工驗收。",
-                        self.evaluator.is_some(),
-                        two_stage_enabled
-                    );
-                    warn!(task = %task.id, "judge seam: evaluator_only 不可用 → needs_human（fail-closed）");
-                    crate::judge_mode::log_judge_seam_event(
-                        self.home_dir.as_deref(),
-                        &task
-                            .claimed_by
-                            .clone()
-                            .unwrap_or_else(|| task.assigned_to.clone()),
-                        "judge_seam_unavailable",
-                        judge_mode,
-                        &reason,
-                    );
-                    self.store
-                        .mark_needs_human_sealing_round(
-                            &task.id,
-                            &reason,
-                            crate::pause_reason::PauseReason::Infra,
-                            knobs_json.as_deref(),
-                        )
-                        .await?;
-                    self.revoke_task_grants(&task.id).await;
-                    observed_outcome =
-                        Some(crate::prediction::task_forward::ObservedOutcome::Escalated);
-                    judge_feedback_for_settle = Some(reason);
-                } else if let Some(evaluator) = &self.evaluator {
+                if let Some(evaluator) = &self.evaluator {
                     if two_stage_enabled {
                         // Live round 10: the evaluator read `agents/<id>/notes/`
                         // as "not the working directory" and rejected a correct
@@ -712,95 +674,23 @@ impl DispatchEngine {
                                     judge_feedback_for_settle = Some(reason);
                                 }
                                 PreDecision::CandidateComplete => {
-                                    // WP-5D: in `evaluator_only` this IS the
-                                    // acceptance decision — no panel follows.
-                                    // The verdict is handed to the shared
-                                    // verdict `match` below (rather than
-                                    // duplicating the accept path) and is
-                                    // labelled so nobody reading the round
-                                    // timeline mistakes a low-cost
-                                    // single-evaluator pass for a MAV panel
-                                    // verdict.
-                                    if judge_mode == crate::judge_mode::JudgeMode::EvaluatorOnly {
-                                        info!(
-                                            task = %task.id,
-                                            "judge seam: evaluator_only 第一階段判定完成候選 → 直接驗收通過（未經 MAV 判官）"
-                                        );
-                                        preset_verdict = Some(AcceptanceVerdict {
-                                            passed: true,
-                                            feedback: format!(
-                                                "驗收通過（[dispatch] judge = \"evaluator_only\" 低成本模式：\
-                                                 僅第一階段評估器裁決，未經 MAV 判官，驗收強度較弱）：{}",
-                                                ev.evidence
-                                            ),
-                                            // No panel ran ⇒ no aspects. Never
-                                            // fabricate a panel record.
-                                            aspects: None,
-                                        });
-                                    } else {
-                                        debug!(
-                                            task = %task.id,
-                                            "兩段式裁決：第一階段判定為完成候選 → 交由 MAV 判官"
-                                        );
-                                    }
+                                    debug!(
+                                        task = %task.id,
+                                        "兩段式裁決：第一階段判定為完成候選 → 交由 MAV 判官"
+                                    );
                                 }
                             },
                             Ok(Err(e)) => {
-                                // WP-5D: `mav` degrades to the panel (unchanged);
-                                // `evaluator_only` has nothing to degrade onto, so
-                                // an evaluator malfunction parks for a human.
-                                if judge_mode == crate::judge_mode::JudgeMode::EvaluatorOnly {
-                                    let reason = format!(
-                                        "[dispatch] judge = \"evaluator_only\"：第一階段評估失敗且無 MAV 判官可退回，\
-                                         依 fail-closed 交由人工驗收：{e}"
-                                    );
-                                    warn!(task = %task.id, error = %e, "judge seam: evaluator_only 評估失敗 → needs_human（fail-closed）");
-                                    self.store
-                                        .mark_needs_human_sealing_round(
-                                            &task.id,
-                                            &reason,
-                                            crate::pause_reason::PauseReason::Infra,
-                                            knobs_json.as_deref(),
-                                        )
-                                        .await?;
-                                    self.revoke_task_grants(&task.id).await;
-                                    observed_outcome = Some(
-                                        crate::prediction::task_forward::ObservedOutcome::Escalated,
-                                    );
-                                    judge_feedback_for_settle = Some(reason);
-                                } else {
-                                    warn!(
-                                        task = %task.id, error = %e,
-                                        "兩段式裁決：第一階段評估失敗 → 降級直接走 MAV 判官（不影響裁決結果）"
-                                    );
-                                }
+                                warn!(
+                                    task = %task.id, error = %e,
+                                    "兩段式裁決：第一階段評估失敗 → 降級直接走 MAV 判官（不影響裁決結果）"
+                                );
                             }
                             Err(_) => {
-                                if judge_mode == crate::judge_mode::JudgeMode::EvaluatorOnly {
-                                    let reason = format!(
-                                        "[dispatch] judge = \"evaluator_only\"：第一階段評估逾時（{EVALUATOR_TIMEOUT_SECS}s）\
-                                         且無 MAV 判官可退回，依 fail-closed 交由人工驗收。"
-                                    );
-                                    warn!(task = %task.id, secs = EVALUATOR_TIMEOUT_SECS, "judge seam: evaluator_only 評估逾時 → needs_human（fail-closed）");
-                                    self.store
-                                        .mark_needs_human_sealing_round(
-                                            &task.id,
-                                            &reason,
-                                            crate::pause_reason::PauseReason::Infra,
-                                            knobs_json.as_deref(),
-                                        )
-                                        .await?;
-                                    self.revoke_task_grants(&task.id).await;
-                                    observed_outcome = Some(
-                                        crate::prediction::task_forward::ObservedOutcome::Escalated,
-                                    );
-                                    judge_feedback_for_settle = Some(reason);
-                                } else {
-                                    warn!(
-                                        task = %task.id, secs = EVALUATOR_TIMEOUT_SECS,
-                                        "兩段式裁決：第一階段評估逾時 → 降級直接走 MAV 判官（不影響裁決結果）"
-                                    );
-                                }
+                                warn!(
+                                    task = %task.id, secs = EVALUATOR_TIMEOUT_SECS,
+                                    "兩段式裁決：第一階段評估逾時 → 降級直接走 MAV 判官（不影響裁決結果）"
+                                );
                             }
                         }
                     }
@@ -810,22 +700,19 @@ impl DispatchEngine {
             // WP-A9: skipped once a prior phase already decided the outcome.
             if observed_outcome.is_none() {
                 // ── WP-5D judge seam: resolve THIS round's verdict ──
-                // Exactly one of three sources, and the `match` below (accept /
+                // Exactly one of two sources, and the `match` below (accept /
                 // reject / artifact archive / grant revocation / A3 settle) is
-                // shared by all of them:
-                //   1. `preset_verdict` — an earlier seam stage already decided
-                //      (today: `evaluator_only`'s `candidate_complete`).
-                //   2. `external` — an operator-configured subprocess. EVERY
+                // shared by both:
+                //   1. `external` — an operator-configured subprocess. EVERY
                 //      defect (missing/malformed `judge_command`, spawn failure,
                 //      timeout, non-zero exit, unparseable verdict,
                 //      injection-flagged feedback) degrades to the MAV panel and
                 //      is audited. A degrade is never a release: the strongest
                 //      verifier decides, exactly as in `mav`.
-                //   3. `mav` (default) — `judge.judge(...)`, byte-identical to
-                //      the pre-seam flow.
-                let verdict = match preset_verdict.take() {
-                    Some(v) => Ok(v),
-                    None if judge_mode == crate::judge_mode::JudgeMode::External => {
+                //   2. `mav` (default, and a leftover `evaluator_only`) —
+                //      `judge.judge(...)`, byte-identical to the pre-seam flow.
+                let verdict = match judge_mode {
+                    crate::judge_mode::JudgeMode::External => {
                         let audit_agent = task
                             .claimed_by
                             .clone()
@@ -881,7 +768,7 @@ impl DispatchEngine {
                             }
                         }
                     }
-                    None => call_mav(judge, &criteria, &task_desc, &result, &enforce_handles).await,
+                    _ => call_mav(judge, &criteria, &task_desc, &result, &enforce_handles).await,
                 };
                 match verdict {
                     Ok(v) if v.passed => {
@@ -1229,6 +1116,47 @@ impl DispatchEngine {
                 warn!(task = %task.id, error = %e, "A1 ledger: knob snapshot serialize failed (non-fatal)");
                 None
             }
+        }
+    }
+
+    /// One-time notice (per process, per home, per removed value) that
+    /// `[dispatch] judge` still holds a value removed in v1.69.0: a
+    /// `judge_mode_removed` audit row and an Activity Feed entry attributed
+    /// to the worker of the first task that reached review. Best-effort
+    /// telemetry: a failed append is logged and never affects the review.
+    async fn report_removed_judge_mode(
+        &self,
+        task: &TaskRow,
+        mode: crate::judge_mode::JudgeMode,
+    ) {
+        let Some(home) = self.home_dir.as_deref() else {
+            return;
+        };
+        let Some(summary) = crate::judge_mode::removed_mode_activity_summary(mode) else {
+            return;
+        };
+        if !crate::judge_mode::claim_removed_mode_notice(home, mode) {
+            return;
+        }
+        let worker = task.claimed_by.as_deref().unwrap_or(task.assigned_to.as_str());
+        crate::judge_mode::log_judge_mode_removed(home, worker, mode);
+        let row = crate::task_store::ActivityRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: "judge_mode_removed".to_string(),
+            agent_id: worker.to_string(),
+            task_id: Some(task.id.clone()),
+            summary: summary.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            metadata: Some(
+                serde_json::json!({
+                    "value": mode.as_str(),
+                    "removed_in": crate::judge_mode::JUDGE_MODES_REMOVED_IN,
+                })
+                .to_string(),
+            ),
+        };
+        if let Err(e) = self.store.append_activity(&row).await {
+            warn!(task = %task.id, error = %e, "judge mode removal notice: activity append failed (non-fatal)");
         }
     }
 }

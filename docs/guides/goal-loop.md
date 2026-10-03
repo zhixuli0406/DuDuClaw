@@ -175,7 +175,7 @@ policy = "fixed_hierarchy"  # Dispatch policy (which AI employee picks up a task
 grounding_precheck_enabled = true  # Grounding precheck before acceptance (see "Grounding precheck"). Default true
 two_stage_judge = true  # Run a cheap first-stage evaluation before acceptance (see "Two-stage acceptance judging"). Default true
 strict_reply_parsing = "shadow"  # Judge replies under the strict JSON contract: off / shadow / enforce (see "Strict reply contract"). Default shadow
-judge = "mav"           # Who makes the acceptance call (see "Swapping the acceptance judge"). mav / external (evaluator_only / human_only are deprecated, removed in v1.69.0). Default mav
+judge = "mav"           # Who makes the acceptance call (see "Swapping the acceptance judge"). mav / external (evaluator_only / human_only were removed in v1.69.0). Default mav
 judge_provider = "antigravity"      # Optional: run the judge on another runtime (see "Running the judge on a different model"). Unset ⇒ the default utility runtime
 judge_model = "gemini-3-pro-preview" # Optional: judge model id within that runtime. Unset ⇒ the default utility model
 admission = "queue"     # What happens when ephemeral spawns hit the concurrency cap, "queue" or "fail". Default queue (see "Ephemeral spawn admission queueing" below)
@@ -403,7 +403,7 @@ When the AI employee reports completion and a task enters review, before the acc
 
 ## Task forward model (v1.53; default on since v1.54)
 
-When enabled, before each dispatch the goal loop "predicts" how the run will likely go, based on statistics from past tasks of the same kind (whether it'll fail, roughly which tool categories it'll use). After execution, it compares the prediction against the actual observation and records it as a transition, so the system builds up a task-level world model of "what tends to happen when doing this kind of thing." It runs for every runtime, but how much it sees depends on whether the runtime feeds the native tool-event collector. Claude (the dispatch stream-json path), Codex, Gemini CLI (deprecated in v1.67.0, removed in v1.69.0), Antigravity and OpenAI-compatible agents record their native tool events, so their observations can reach `Full`. Grok and the seven generic print-mode CLIs (Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) attach no collector, so their observations are `McpOnly` (built from `tool_calls.jsonl` alone), or `None` when that file holds nothing for the round. The pipeline:
+When enabled, before each dispatch the goal loop "predicts" how the run will likely go, based on statistics from past tasks of the same kind (whether it'll fail, roughly which tool categories it'll use). After execution, it compares the prediction against the actual observation and records it as a transition, so the system builds up a task-level world model of "what tends to happen when doing this kind of thing." It runs for every runtime, but how much it sees depends on whether the runtime feeds the native tool-event collector. Claude (the dispatch stream-json path), Codex, Gemini CLI (deprecated in v1.67.0, removed in v1.70.0), Antigravity and OpenAI-compatible agents record their native tool events, so their observations can reach `Full`. Grok and the seven generic print-mode CLIs (Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) attach no collector, so their observations are `McpOnly` (built from `tool_calls.jsonl` alone), or `None` when that file holds nothing for the round. The pipeline:
 
 - **Layered prediction fallback**: uses matching statistics when available, falls back to overall marginal statistics, then a prior default. Cold start never spends an LLM call.
 - **Honest fidelity grading**: every observation is tagged with its evidence fidelity (native tool events / audit-log-only / no evidence), so "we didn't see it" is never conflated with "it didn't happen."
@@ -439,8 +439,8 @@ After the AI employee reports completion and a task enters `review`, it doesn't 
 |---|---|---|
 | `mav` (default) | First-stage evaluator → three-aspect MAV judge panel | The general case |
 | `external` | Your own program (`judge_command`) | Wiring in your own CI, a rules engine, or a second model as judge |
-| `evaluator_only` | Only the first-stage evaluator runs; `candidate_complete` passes directly | **Deprecated, removed in v1.69.0.** Use `mav`: `two_stage_judge` already runs the cheap evaluator first and only pays for the panel on a completion candidate |
-| `human_only` | No machine verdict; every `review` task escalates to `needs_human` | **Deprecated, removed in v1.69.0.** Use `mav` plus per-agent `[capabilities] autonomy_level` / `approval_required_tools` |
+| `evaluator_only` | Only the first-stage evaluator runs; `candidate_complete` passes directly | **Removed in v1.69.0.** A leftover value is acted on as `mav` (stricter, more judge cost). Set `mav`: `two_stage_judge` already runs the cheap evaluator first and only pays for the panel on a completion candidate |
+| `human_only` | No machine verdict; every `review` task escalates to `needs_human` | **Removed in v1.69.0.** A leftover value does not fall back to machine acceptance: every item sent for acceptance stops at `needs_human` until you mark it done, or fix the setting and retry (a retry clears the earlier result). Use `mav` plus per-agent `[capabilities] autonomy_level` / `approval_required_tools` |
 
 All four values still parse, so a deployment already on a deprecated mode keeps behaving exactly as configured — it logs one warning per process, and a write through the dashboard records a `judge_mode_deprecated` audit event. The dashboard offers only `mav` and `external`, but shows a saved deprecated value (labelled 已棄用) rather than silently switching it. See [deprecations.md](deprecations.md).
 
@@ -666,7 +666,7 @@ The simulated preview covers "what might happen if this is allowed to continue";
 | Operation | One of create/overwrite, edit, delete, or command. |
 | Status | Failed or blocked calls are also listed and flagged "Failed" — this is exactly the half a live tool-status query can't see. |
 | Summary excerpt | An excerpt of the written content or command description, reusing the audit trail's masked result as-is (it never re-reads the original file just to render this). |
-| Source | Either a native runtime tool event (Write / Edit / NotebookEdit / Bash…) or an MCP audit entry (`shared_wiki_write`, etc). |
+| Source | Either a native runtime tool event (Write / Edit / NotebookEdit / Bash…) or an MCP audit entry (`wiki_write`, etc). |
 
 The evidence comes from two existing trails: native tool events from execution land as a file-change record after every dispatch round (attributed by task id), and MCP audit entries reuse the same "claim-to-review window plus executor" attribution the judge's `<tool_activity>` already relies on. **No record means no record**: when there's nothing, the tab shows "This task left no file-change record" rather than papering over it with a made-up narrative.
 

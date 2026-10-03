@@ -19,8 +19,8 @@
 //!    therefore called from `dispatcher.rs` — the ONE place every goal-loop
 //!    dispatch round's native events are already collected — and persists
 //!    just the file-effect subset into `task_changes.jsonl`, keyed by task id.
-//! 2. **MCP audit rows** (`tool_calls.jsonl`) — `shared_wiki_write` and
-//!    friends. Already durable; attributed to the task by the same
+//! 2. **MCP audit rows** (`tool_calls.jsonl`) — shared-wiki writes
+//!    (`wiki_write` with `scope="shared"`) and friends. Already durable; attributed to the task by the same
 //!    (agent, claim→review window) convention `dispatch_engine` uses for the
 //!    `<tool_activity>` judge block.
 //!
@@ -140,7 +140,7 @@ pub struct FileChange {
     pub path: String,
     pub op: ChangeOp,
     /// The tool that produced the effect, verbatim (`Write`, `apply_patch`,
-    /// `shared_wiki_write`, …).
+    /// `wiki_write`, …).
     pub tool_name: String,
     /// RFC3339 UTC.
     pub timestamp: String,
@@ -260,7 +260,15 @@ const SHELL_TOOLS: &[&str] = &["Bash", "shell", "run_shell_command", "run_termin
 /// file change. Deliberately short — a long speculative list would turn the
 /// tab into noise, and a tool with no path-bearing argument (e.g. `canvas_push`)
 /// would only ever be silently dropped, so it does not belong here.
-const MCP_WRITE_TOOLS: &[&str] = &["shared_wiki_write", "agent_update_soul"];
+///
+/// `shared_wiki_write` was removed in v1.69.0; it stays here so rows written
+/// before the upgrade still show up. Its replacement, `wiki_write`, counts
+/// only with `scope="shared"` (see [`SHARED_SCOPE_ONLY_TOOLS`]).
+const MCP_WRITE_TOOLS: &[&str] = &["shared_wiki_write", "wiki_write", "agent_update_soul"];
+
+/// Tools that are a file change only when their input carries
+/// `scope = "shared"` — writing the agent's own wiki was never listed here.
+const SHARED_SCOPE_ONLY_TOOLS: &[&str] = &["wiki_write"];
 const MCP_DELETE_TOOLS: &[&str] = &["shared_wiki_delete"];
 
 /// Leading command verbs whose file effect is unambiguous. Matched against
@@ -419,6 +427,14 @@ pub fn extract_change(
     let raw = input_text.unwrap_or("");
     let parsed: Option<serde_json::Value> = serde_json::from_str(raw).ok();
     let parsed_ref = parsed.as_ref();
+    if SHARED_SCOPE_ONLY_TOOLS.contains(&tool_name)
+        && !parsed_ref
+            .and_then(|v| v.get("scope"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("shared"))
+    {
+        return None;
+    }
 
     let (path, snippet) = if op == ChangeOp::Shell {
         let command = field_str(parsed_ref, raw, "command")
@@ -607,6 +623,34 @@ fn read_ledger(home_dir: &Path, task_id: &str) -> Vec<FileChange> {
         .collect()
 }
 
+/// The shared-wiki write audit row (`handle_shared_wiki_write`) has no
+/// `input` field: it carries `params_summary = "path=<page> size=<bytes>"`
+/// and, since v1.69.0, `scope = "shared"` as a row-level field. Rebuild the
+/// input envelope [`extract_change`] reads from that shape. A row of the
+/// removed `shared_wiki_write` name is shared by definition. Any other tool,
+/// or a row without a recoverable path, yields `None`.
+fn shared_wiki_write_input(tool_name: &str, row: &serde_json::Value) -> Option<String> {
+    let shared = match tool_name {
+        "shared_wiki_write" => true,
+        "wiki_write" => row
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("shared")),
+        _ => false,
+    };
+    if !shared {
+        return None;
+    }
+    let summary = row.get("params_summary").and_then(|v| v.as_str())?;
+    let rest = summary.strip_prefix("path=")?;
+    let (path, _size) = rest.rsplit_once(" size=")?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "page_path": path, "scope": "shared" }).to_string())
+}
+
 /// Read the MCP audit rows attributable to this task: same `agent_id` +
 /// `[since, until]` window convention `dispatch_engine` already uses for the
 /// judge's `<tool_activity>` block. An empty/unparseable window yields no
@@ -646,7 +690,15 @@ fn read_mcp_rows(home_dir: &Path, agent_id: &str, since: &str, until: &str) -> V
             continue;
         };
         let success = v.get("success").and_then(|x| x.as_bool()).unwrap_or(false);
-        let input = v.get("input").and_then(|x| x.as_str());
+        let synthesized = if v.get("input").is_none() {
+            shared_wiki_write_input(tool_name, &v)
+        } else {
+            None
+        };
+        let input = v
+            .get("input")
+            .and_then(|x| x.as_str())
+            .or(synthesized.as_deref());
         if let Some(change) =
             extract_change(tool_name, success, ts, input, ChangeSource::McpAudit, None)
         {
@@ -1107,6 +1159,88 @@ mod tests {
         assert_eq!(ev.changes[0].path, "sop/a.md");
         assert_eq!(ev.changes[0].source, ChangeSource::McpAudit);
         assert_eq!(ev.changes[0].round, None);
+    }
+
+    /// The rows the real writers leave. A shared-wiki write is written by
+    /// `handle_shared_wiki_write` through `append_tool_call_with_extras`: no
+    /// `input` field, `params_summary = "path=<page> size=<bytes>"`, and
+    /// `scope = "shared"` at row level. Writing the agent's own wiki leaves no
+    /// row at all (`wiki_write` is not in the generic audit list).
+    #[test]
+    fn real_shared_wiki_write_rows_count_and_other_scopes_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // v1.69.0 shape: name `wiki_write`, row-level scope.
+        duduclaw_security::audit::append_tool_call_with_extras(
+            home,
+            "w",
+            "wiki_write",
+            "path=sop/new.md size=12",
+            true,
+            &[("scope", "shared".into()), ("matches_caller", true.into())],
+        );
+        // Pre-1.69 shape: name `shared_wiki_write`, no scope field.
+        duduclaw_security::audit::append_tool_call_with_extras(
+            home,
+            "w",
+            "shared_wiki_write",
+            "path=sop/old.md size=7",
+            true,
+            &[("matches_caller", true.into())],
+        );
+        // A `wiki_write` row that is not the shared scope is never a change.
+        duduclaw_security::audit::append_tool_call_with_extras(
+            home,
+            "w",
+            "wiki_write",
+            "path=notes/own.md size=3",
+            true,
+            &[("scope", "agent".into())],
+        );
+        duduclaw_security::audit::append_tool_call_with_extras(
+            home,
+            "w",
+            "wiki_write",
+            "path=notes/none.md size=3",
+            true,
+            &[],
+        );
+        let now = chrono::Utc::now();
+        let ev = collect_task_changes(
+            home,
+            "task-1",
+            "w",
+            &(now - chrono::Duration::minutes(5)).to_rfc3339(),
+            &(now + chrono::Duration::minutes(5)).to_rfc3339(),
+            50,
+        );
+        let mut paths: Vec<&str> = ev.changes.iter().map(|c| c.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["sop/new.md", "sop/old.md"], "{paths:?}");
+        assert!(ev.changes.iter().all(|c| c.source == ChangeSource::McpAudit));
+    }
+
+    /// A row that does carry `input` (older or hand-made) still works, and
+    /// `wiki_write` there counts only with `scope="shared"`.
+    #[test]
+    fn wiki_write_with_an_input_envelope_counts_only_with_shared_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            r#"{"timestamp":"2026-08-15T10:01:00+00:00","agent_id":"w","tool_name":"wiki_write","success":true,"input":"{\"scope\":\"shared\",\"page_path\":\"sop/new.md\"}"}"#,
+            r#"{"timestamp":"2026-08-15T10:02:00+00:00","agent_id":"w","tool_name":"wiki_write","success":true,"input":"{\"page_path\":\"notes/own.md\"}"}"#,
+            r#"{"timestamp":"2026-08-15T10:03:00+00:00","agent_id":"w","tool_name":"wiki_write","success":true,"input":"{\"scope\":\"agent\",\"page_path\":\"notes/own2.md\"}"}"#,
+        ];
+        std::fs::write(dir.path().join("tool_calls.jsonl"), rows.join("\n")).unwrap();
+        let ev = collect_task_changes(
+            dir.path(),
+            "task-1",
+            "w",
+            "2026-08-15T10:00:00+00:00",
+            "2026-08-15T10:05:00+00:00",
+            50,
+        );
+        let paths: Vec<&str> = ev.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["sop/new.md"], "{paths:?}");
     }
 
     #[test]

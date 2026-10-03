@@ -42,9 +42,10 @@ use crate::ccr::{
 };
 use crate::error::LlmError;
 use crate::provenance::{
-    ProvenanceConfig, ProvenanceFlag, ProvenancePolicy, SourceKind, evaluate_call,
-    seed_default_ledger,
+    ProvenanceConfig, ProvenanceFlag, ProvenancePolicy, evaluate_call, seed_default_ledger,
 };
+#[cfg(test)]
+use crate::provenance::SourceKind;
 use crate::provider::ChatProvider;
 use crate::types::ToolDef;
 use crate::types::{ChatMessage, ChatRequest, ChatResponse, ContentPart, Role, StopReason};
@@ -200,9 +201,10 @@ pub async fn run_tool_loop(
 ///   always execute. Ledger overflow under `Enforce` blocks sensitive calls
 ///   fail-closed.
 /// - Every *executed* tool's result content is registered back into the
-///   ledger — as [`SourceKind::ToolResult`] (Tainted) unless
-///   `cfg.tool_trust` overrides that tool (e.g. a wiki-read tool declared
-///   [`SourceKind::Wiki`] never taints). The loop's own synthesized block
+///   ledger under [`ProvenanceConfig::result_trust`] — Tainted
+///   (`SourceKind::ToolResult`) unless `cfg.tool_trust` or
+///   `cfg.scoped_tool_trust` overrides that call (e.g. a shared-wiki read
+///   declared `SourceKind::Wiki` never taints). The loop's own synthesized block
 ///   message is not registered (it is deterministic and payload-free).
 ///
 /// `interceptor` (RFC-23 §13.6) wraps every dispatch: `before_call` may

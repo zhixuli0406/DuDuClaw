@@ -478,7 +478,7 @@ fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
 ///
 /// Returns `true` when the stored value actually changed. Callers are the
 /// *gated* writers only — MCP `create_agent` / `agent_update` / ephemeral
-/// spawn, the dashboard agent RPCs, template staging and expert install —
+/// spawn, the dashboard agent RPCs, template staging and pack install —
 /// each of which has already run its WP21 C4 authorization check.
 pub fn upsert(home: &Path, agent_id: &str, entry: OrgEntry) -> io::Result<bool> {
     let agent_id = agent_id.trim().to_string();

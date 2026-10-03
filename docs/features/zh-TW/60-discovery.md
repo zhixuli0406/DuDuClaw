@@ -155,7 +155,7 @@ Discovery 支援六個 runtime 系列，提供相同的保證：attempt 只在�
 |---|---|---|---|---|
 | Claude | `claude` | 原生 `--max-turns` | `--tools` 與 `--allowedTools` | `ANTHROPIC_API_KEY` 或 `CLAUDE_CODE_OAUTH_TOKEN` |
 | Codex | `codex` | 由 gateway 計數 | 以 `-c` 覆寫關閉 MCP、web、多代理、hook、外掛與記憶 | `OPENAI_API_KEY`（同值也會設為 `CODEX_API_KEY`），或憑證文件 |
-| Gemini（v1.67.0 起棄用，v1.69.0 移除，改用 Antigravity，見[棄用說明](../../guides/zh-TW/deprecations.md#gemini-cli-runtime)） | `gemini` | 原生 `maxSessionTurns` | `tools.core` 白名單 | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY` |
+| Gemini（v1.67.0 起棄用，v1.70.0 移除，改用 Antigravity，見[棄用說明](../../guides/zh-TW/deprecations.md#gemini-cli-runtime)） | `gemini` | 原生 `maxSessionTurns` | `tools.core` 白名單 | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY` |
 | Antigravity（`antigravity`，別名 `agy`） | `antigravity` | 由 gateway 計數 | `PreToolUse` hook 拒絕檔案／shell 以外的所有工具 | 只接受 `GEMINI_API_KEY` 或 `GOOGLE_API_KEY` |
 | Grok | `grok` | 原生 `--max-turns` | `--tools`、`--disallowed-tools`、`--disable-web-search`、`--no-subagents`、`--no-plan` | `XAI_API_KEY`，或憑證文件 |
 | OpenAI 相容（`openai-compat`，別名 `openai_compat`） | `openai-compat` | adapter 自己的迴圈 | adapter 只提供檔案與 shell 工具 | 設定檔所指 provider 的 key；另須設定 `base_url` |

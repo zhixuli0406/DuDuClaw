@@ -16,7 +16,7 @@ IDEs like Zed, JetBrains, and Neovim want to ask an agent *"can you take this ta
 That's what the two protocol servers are. DuDuClaw ships them as **separate
 commands**: `duduclaw acp` speaks the Agent Client Protocol for IDE agent
 panels (Zed / JetBrains / nvim — see "Protocol Scope" below for setup), and
-`duduclaw acp-server` speaks the A2A protocol for agent-to-agent and
+`duduclaw acp server` speaks the A2A protocol for agent-to-agent and
 script/CI integration (everything described in the next sections).
 
 ---
@@ -30,7 +30,7 @@ Together they let an IDE (or another agent, or a CI pipeline, or a shell script)
 DuDuClaw ships the server side:
 
 ```
-duduclaw acp-server
+duduclaw acp server
      |
      v
 Listens on stdin, writes to stdout (line-delimited JSON-RPC 2.0)
@@ -43,7 +43,7 @@ Responds to:
   tasks/cancel     → cancel running task
 ```
 
-Before v1.8.9, `duduclaw acp-server` was a placeholder that printed a message and returned. v1.8.9 wired it to a real `A2ATaskManager` and made it functional.
+Before v1.8.9, `duduclaw acp server` was a placeholder that printed a message and returned. v1.8.9 wired it to a real `A2ATaskManager` and made it functional.
 
 ---
 
@@ -55,7 +55,7 @@ Every ACP server can describe itself. When a client connects, it can issue `agen
 {
   "name": "duduclaw-pm",
   "description": "Project manager for DuDuClaw v1.9 roadmap",
-  "url": "stdio://duduclaw acp-server --agent duduclaw-pm",
+  "url": "stdio://duduclaw acp server --agent duduclaw-pm",
   "version": "1.8.14",
   "capabilities": {
     "streaming": true,
@@ -157,7 +157,7 @@ This means tasks submitted via ACP flow through the **same** pipelines as tasks 
 
 ## Protocol Scope — Read This First
 
-> **Status correction (2026-08-13).** `duduclaw acp-server` currently speaks the
+> **Status correction (2026-08-13).** `duduclaw acp server` currently speaks the
 > **A2A (Agent2Agent) protocol** over stdio — `agent/discover`, `message/send`,
 > `tasks/send|get|cancel` — plus the `.well-known` agent card. It does **not**
 > yet implement the *Agent Client Protocol* used by IDE agent panels
@@ -184,7 +184,7 @@ This means tasks submitted via ACP flow through the **same** pipelines as tasks 
 > { "agent_servers": { "DuDuClaw": { "command": "duduclaw", "args": ["acp"] } } }
 > ```
 >
-> `duduclaw acp-server` remains the A2A surface — the two protocols stay on
+> `duduclaw acp server` remains the A2A surface — the two protocols stay on
 > separate commands on purpose.
 
 ## What Works Today (A2A over stdio)
@@ -197,7 +197,7 @@ A pipeline step can send a task via ACP and poll for completion:
 - name: Generate release notes via DuDuClaw
   run: |
     echo '{"jsonrpc":"2.0","id":1,"method":"tasks/send","params":{"task":"..."}}' \
-      | duduclaw acp-server --agent duduclaw-pm
+      | duduclaw acp server --agent duduclaw-pm
 ```
 
 No HTTP server, no auth tokens, no port management — just stdio in the container.
@@ -211,7 +211,7 @@ This is worth mapping because the naming overlaps:
 | Protocol | Purpose | Direction | Command |
 |----------|---------|-----------|---------|
 | **MCP** | Expose DuDuClaw's tools (channel, memory, agent, wiki, task, ...) to an AI runtime | Runtime → DuDuClaw | `duduclaw mcp-server` |
-| **ACP/A2A** | Let external clients (IDEs, pipelines, other agents) send tasks to DuDuClaw | IDE → DuDuClaw | `duduclaw acp-server` |
+| **ACP/A2A** | Let external clients (IDEs, pipelines, other agents) send tasks to DuDuClaw | IDE → DuDuClaw | `duduclaw acp server` |
 | **Runtime stdio** | DuDuClaw spawns a runtime (Claude/Codex/Antigravity/Grok, or Gemini while deprecated) subprocess and talks to it via stdio JSON | DuDuClaw → Runtime | *Internal* |
 
 They're three distinct conversations, all on stdio, all JSON-RPC-adjacent. The same agent participates in all three simultaneously at runtime.

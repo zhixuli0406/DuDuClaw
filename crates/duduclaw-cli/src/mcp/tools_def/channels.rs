@@ -92,52 +92,6 @@ pub(super) const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "schedule_task",
-        description: "[deprecated → tasks_create schedule=\"<cron>\"; removed in v1.69.0] Schedule a recurring task in the persistent CronScheduler. Survives restarts; can target any agent via agent_id.",
-        params: &[
-            ParamDef {
-                name: "cron",
-                description: "Cron expression (5 fields, or 6 with seconds). Evaluated in `cron_timezone` when set, else UTC. E.g. '0 9 * * *' with cron_timezone='Asia/Taipei' fires 09:00 Taipei daily.",
-                required: true,
-            },
-            ParamDef {
-                name: "task",
-                description: "Task prompt sent to the target agent when the cron fires. Write it as an instruction the agent will follow.",
-                required: true,
-            },
-            ParamDef {
-                name: "name",
-                description: "Human-readable task name for listing / pausing / deleting later (e.g., 'xianwen-pm-daily-research').",
-                required: true,
-            },
-            ParamDef {
-                name: "agent_id",
-                description: "Target agent that will execute the task (e.g. 'xianwen-pm', 'duduclaw-tl'). Defaults to 'default' if omitted — explicit is strongly recommended.",
-                required: false,
-            },
-            ParamDef {
-                name: "notify_channel",
-                description: "Optional: channel type to auto-deliver the result to. With notify_chat_id, the response is sent there after a successful run.",
-                required: false,
-            },
-            ParamDef {
-                name: "notify_chat_id",
-                description: "Optional: chat / channel / room ID on the notify platform. Required when notify_channel is set.",
-                required: false,
-            },
-            ParamDef {
-                name: "notify_thread_id",
-                description: "Optional: Discord thread ID. Only used when notify_channel='discord' and the result should land in a specific thread.",
-                required: false,
-            },
-            ParamDef {
-                name: "cron_timezone",
-                description: "Optional IANA timezone for the cron expression (e.g. 'Asia/Taipei'). Omit to auto-detect the host's local zone; pass 'UTC' to force UTC.",
-                required: false,
-            },
-        ],
-    },
-    ToolDef {
         name: "list_cron_tasks",
         description: "List scheduled cron tasks. Returns tasks owned by the calling agent (or all tasks if agent_id is omitted).",
         params: &[

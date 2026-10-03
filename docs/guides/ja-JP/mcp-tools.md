@@ -55,7 +55,7 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 
 新しい2つのゲートは、ツールを `tools/list` から外さずに呼び出しを拒否します。
 
-- `agent.toml [permissions]`：`false` と書かれたフラグは、`create_agent`（`can_create_agents`）、`send_to_agent`・`spawn_agent`（`can_send_cross_agent`）、`schedule_task`・`create_reminder`・`schedule` 付きの `tasks_create`（`can_schedule_tasks`）、`skill_hub_install`・`shared_skill_adopt`・`skill_graduate`・`skill_pin`・`skill_from_recording`（`can_modify_own_skills`）を拒否します。拒否は JSON-RPC エラー -32003 と監査イベント `permission_denied` になります。`agent.toml` が存在するのに読めない・解析できない場合はこれらのツールを拒否し、ファイルがなければ許可します。`schedule` なしの `tasks_create` は許可されるため、これらのフラグは呼び出しごとに確認されます。一時的な役割メンバーは `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` が `false` で作られます。
+- `agent.toml [permissions]`：`false` と書かれたフラグは、`create_agent`（`can_create_agents`）、`send_to_agent`・`spawn_agent`（`can_send_cross_agent`）、`create_reminder`・`schedule` 付きの `tasks_create`（`can_schedule_tasks`）、`skill_hub_install`・`shared_skill_adopt`・`skill_graduate`・`skill_pin`・`skill_from_recording`（`can_modify_own_skills`）を拒否します。拒否は JSON-RPC エラー -32003 と監査イベント `permission_denied` になります。`agent.toml` が存在するのに読めない・解析できない場合はこれらのツールを拒否し、ファイルがなければ許可します。`schedule` なしの `tasks_create` は許可されるため、これらのフラグは呼び出しごとに確認されます。一時的な役割メンバーは `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` が `false` で作られます。
 - `config.toml [odoo] features_*`：Odoo ツールは一覧に残り、無効になったモジュールのモデルへの呼び出しは呼び出しごとに拒否されます（project と hr は既定でオフ）。
 
 ### レコードの関係チェック：一覧に出るが拒否される
@@ -179,7 +179,7 @@ AI 社員のものになっているレコードを変更・起動するツー�
 
 ## 非推奨エイリアスは引き続き掲載されます
 
-非推奨のツール名は説明に `[deprecated → …]` の接頭辞を付けたまま `tools/list` に残ります。隠せば呼べなくなり、それは非推奨期間の目的と正反対だからです。旧 → 新の完全な対照表は [deprecations.md](../deprecations.md) にあります。
+非推奨のツール名は説明に `[deprecated → …]` の接頭辞を付けたまま `tools/list` に残ります。隠せば呼べなくなり、それは非推奨期間の目的と正反対だからです。旧 → 新の完全な対照表は [deprecations.md](../deprecations.md) にあります。現在、非推奨の MCP ツールはありません。v1.66.0 の期間のエイリアスは v1.69.0 で削除されました。
 
 ## 関連文書
 

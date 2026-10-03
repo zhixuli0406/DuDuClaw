@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
+use removed_spelling::RemovedSpelling;
 mod acp;
 mod causal_cmd; // Explicit synthetic causal curation fixture
 mod causal_observational_demo; // Binary-treatment observational fixture requiring human review
@@ -23,7 +24,7 @@ mod ccr_run_cmd; // Controlled four-arm CCR execution over recorded source bytes
 mod compat_cmd; // CP-1/A3: `duduclaw compat` — compat.d declarative runner registry CLI surface
 #[cfg(feature = "app-compat")]
 mod compat_windows_vm; // CP-2/B3: `duduclaw compat windows-vm` — self-packaged Windows VM + RemoteApp bootstrap CLI
-mod data_migrate; // H3g: `duduclaw data-migrate` — /data forward-only settings migrator CLI front door
+mod data_migrate; // H3g: `duduclaw migrate data` — /data forward-only settings migrator CLI front door
 mod decision_cmd; // Local, read-only support-decision replay
 mod docs_cmd; // Stripe-style `duduclaw docs [<topic>]` (E12) — GitHub doc links, browser hand-off
 mod eval; // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
@@ -65,7 +66,8 @@ mod migrate_from; // Painless migration from OpenClaw / Hermes / paperclip
 pub mod odoo_pool; // RFC-21 §2: per-agent Odoo connector pool
 mod os_drive; // A7a: `duduclaw os <group> <verb>` self-drive CLI surface
 pub mod pack_cmd; // T5/O2: `duduclaw pack` — unified pack front door (preset / team / template)
-mod playbook_export; // WP2.2/B4 batch: gene JSON export CLI (`duduclaw playbook export`)
+mod removed_spelling; // v1.69.0: stubs for retired CLI spellings (message + exit 2)
+mod playbook_export; // WP2.2/B4 batch: gene JSON export CLI (`duduclaw export playbook`)
 mod playbook_migrate; // WP1.4: SOUL.md → playbook migration drafts (`duduclaw playbook migrate-soul`)
 mod portability; // Personal-edition data portability: export/import ~/.duduclaw
 mod premium_templates; // Licensed industry templates (commercial/templates-premium), gated by premium_templates feature
@@ -459,7 +461,7 @@ enum Commands {
     #[command(flatten)]
     Tooling(ToolingCommands),
 
-    // Audit, update, protocol-server and misc leaves (secaudit .. data-migrate).
+    // Audit, update, protocol-server and misc leaves (secaudit .. migrate data).
     #[command(flatten)]
     Maintenance(MaintenanceCommands),
 }
@@ -1720,63 +1722,19 @@ enum OpsCommands {
     ///   duduclaw migrate from <platform>   import from OpenClaw / Hermes / paperclip / Claude Code
     ///   duduclaw migrate data              appliance `/data` forward-only settings migrator
     ///
-    /// T5/O10 (feature audit 2026-09-29): these used to be three unrelated
-    /// top-level commands (`migrate`, `migrate-from`, `data-migrate`) whose
-    /// help text had to disclaim each other. The old spellings still work as
-    /// hidden aliases until v1.69.0 — see `docs/guides/deprecations.md`.
+    /// These used to be three unrelated top-level commands (`migrate`,
+    /// `migrate-from`, `data-migrate`). `migrate-from` was removed in v1.69.0
+    /// and only prints its replacement; `data-migrate` stays as a hidden alias
+    /// of `migrate data` for the boot unit of shipped DuDuClaw OS images.
     Migrate {
         #[command(subcommand)]
         command: Option<MigrateCommands>,
     },
 
-    /// Painlessly migrate from OpenClaw / Hermes / paperclip / Claude Code
-    /// into DuDuClaw.
-    ///
-    /// Default is a dry-run that prints the migration plan (what would be
-    /// imported / skipped and why). Pass `--apply` to actually write.
-    ///
-    /// Deprecated spelling of `duduclaw migrate from <platform>`; removed in
-    /// v1.69.0.
-    #[command(name = "migrate-from", hide = true)]
-    MigrateFrom {
-        /// Source platform: `openclaw`, `hermes`, `paperclip`, or `claude-code`.
-        platform: String,
-
-        /// Source directory (defaults per platform; REQUIRED for paperclip,
-        /// which reads an official `paperclipai company export` directory;
-        /// defaults to `~/.claude` for claude-code).
-        #[arg(long)]
-        source: Option<PathBuf>,
-
-        /// Actually write the imported data (default is a dry-run plan).
-        #[arg(long)]
-        apply: bool,
-
-        /// On a name clash with an existing agent, import under a
-        /// `-imported` suffix instead of skipping.
-        #[arg(long)]
-        rename: bool,
-
-        /// Emit a single machine-readable JSON object on stdout instead of the
-        /// human console plan (used by the dashboard migrate RPCs). Log output
-        /// stays on stderr so stdout is a clean protocol channel.
-        #[arg(long)]
-        json: bool,
-
-        /// Target agent id to import into. REQUIRED for `claude-code` — it
-        /// imports into an existing agent and never auto-creates one (run
-        /// `duduclaw agent create` first). Ignored by the other platforms,
-        /// which scaffold their own agent.
-        #[arg(long)]
-        agent: Option<String>,
-
-        /// Disable the PII redaction pass over `claude-code` session
-        /// transcripts before they are written to `sessions.db` / `memory.db`
-        /// (default: redaction is ON). Memory shards are never redacted
-        /// regardless of this flag — they are the user's own curated notes.
-        #[arg(long)]
-        no_redact: bool,
-    },
+    /// Removed in v1.69.0 (use `duduclaw migrate from <platform>`): prints
+    /// the replacement and exits 2.
+    #[command(name = "migrate-from", hide = true, disable_help_flag = true)]
+    MigrateFrom(removed_spelling::RemovedArgs),
 
     /// Export data out of DuDuClaw. Run a subcommand, or bare
     /// `duduclaw export` for the personal-edition archive.
@@ -1786,11 +1744,9 @@ enum OpsCommands {
     ///   duduclaw export gdpr        everything stored about one contact, as JSON
     ///   duduclaw export playbook    one agent's active playbook entries as gene JSON
     ///
-    /// T5/O10 (feature audit 2026-09-29): four unrelated exports used to be
-    /// told apart only by which command group they sat in. The old spellings
-    /// (`duduclaw audit`, `duduclaw gdpr export`, `duduclaw playbook export`)
-    /// still work as hidden aliases until v1.69.0 — see
-    /// `docs/guides/deprecations.md`.
+    /// The old spellings (`duduclaw audit`, `duduclaw gdpr export`,
+    /// `duduclaw playbook export`) were removed in v1.69.0 and now only print
+    /// their replacement.
     Export {
         #[command(subcommand)]
         command: Option<ExportCommands>,
@@ -1813,31 +1769,10 @@ enum OpsCommands {
         force: bool,
     },
 
-    /// Export aggregated audit trails (tool calls, security events, budget
-    /// events, channel failures) as NDJSON — write to a file and/or stream to a
-    /// SIEM/webhook (Splunk HEC / Elastic / Datadog / generic).
-    ///
-    /// Deprecated spelling of `duduclaw export audit`; removed in v1.69.0.
-    #[command(hide = true)]
-    Audit {
-        /// Only include records at/after this RFC3339 time (e.g.
-        /// `2026-07-01T00:00:00Z`).
-        #[arg(long)]
-        since: Option<String>,
-        /// Write NDJSON to this file (default: stdout).
-        #[arg(long)]
-        out: Option<PathBuf>,
-        /// POST the records to this SIEM/webhook URL.
-        #[arg(long)]
-        webhook: Option<String>,
-        /// Auth header for the webhook, `Name: Value`
-        /// (e.g. `Authorization: Bearer <token>`).
-        #[arg(long)]
-        webhook_auth: Option<String>,
-        /// Webhook wire format: `ndjson` (default) or `json`.
-        #[arg(long, default_value = "ndjson")]
-        format: String,
-    },
+    /// Removed in v1.69.0 (use `duduclaw export audit`): prints the
+    /// replacement and exits 2.
+    #[command(hide = true, disable_help_flag = true)]
+    Audit(removed_spelling::RemovedArgs),
 
     /// Show the security posture report (score + checklist of active
     /// protections and actionable gaps).
@@ -2384,11 +2319,10 @@ enum MaintenanceCommands {
     #[command(subcommand)]
     Lifecycle(LifecycleCommands),
 
-    /// A2A protocol server (agent-to-agent interop over stdio JSON-RPC).
-    ///
-    /// Deprecated spelling of `duduclaw acp server`; removed in v1.69.0.
-    #[command(name = "acp-server", hide = true)]
-    AcpServer,
+    /// Removed in v1.69.0 (use `duduclaw acp server`): prints the
+    /// replacement and exits 2.
+    #[command(name = "acp-server", hide = true, disable_help_flag = true)]
+    AcpServer(removed_spelling::RemovedArgs),
 
     /// Agent protocol endpoints. Bare `duduclaw acp` keeps its historical
     /// meaning (the editor-facing client protocol).
@@ -2398,8 +2332,7 @@ enum MaintenanceCommands {
     ///                         JetBrains, nvim) at it to chat with your agents
     ///   duduclaw acp server   A2A agent-to-agent interop over stdio JSON-RPC
     ///
-    /// T5/O10 (feature audit 2026-09-29): `acp` and `acp-server` were two
-    /// different protocols distinguished only by a doc-comment disclaimer.
+    /// `acp-server` (the old spelling of `acp server`) was removed in v1.69.0.
     Acp {
         #[command(subcommand)]
         command: Option<AcpCommands>,
@@ -2488,8 +2421,9 @@ enum MaintenanceCommands {
 
     /// Packs — ready-made bundles of AI employees: a whole team, a single
     /// industry persona, or one job preset. This is the main entry point;
-    /// `duduclaw expert` stays as an alias for the team-pack authoring and
-    /// maintenance verbs.
+    /// `duduclaw expert` keeps the team-pack authoring and maintenance verbs
+    /// (`pack`, `publish`, `export`, `convert-teams`, `hooks`, `remove`) and
+    /// `list` (installed packs).
     ///
     /// Examples:
     ///     duduclaw pack list
@@ -2504,9 +2438,9 @@ enum MaintenanceCommands {
     /// skills, wiki SOPs, prompts and channel hints. Install native
     /// `expert.toml` packs or import Claude Code plugins / Agent Skills.
     ///
-    /// `install` / `list` are aliases of `duduclaw pack install` / `pack list`
-    /// — the authoring verbs (`pack`, `publish`, `export`, `convert-teams`)
-    /// live only here.
+    /// `expert list` shows what is installed (`pack list` also shows what is
+    /// available). `expert install` was removed in v1.69.0; use
+    /// `duduclaw pack install`.
     Expert {
         #[command(subcommand)]
         command: expert::ExpertCommands,
@@ -2566,41 +2500,31 @@ enum MaintenanceCommands {
         topic: Option<String>,
     },
 
-    /// `/data` forward-only settings migrator (H3g). Replays baked-in
-    /// `/usr/share/duduclaw/migrations/*.sh` scripts against
-    /// `<DUDUCLAW_HOME>` — the appliance's A/B root rollback can never undo
-    /// a `/data` format change, so this is the forward-only complement.
-    /// Not `duduclaw migrate` (agent.toml conversion) or `migrate-from`
-    /// (cross-platform import) — a third, unrelated command.
+    /// Hidden alias of `duduclaw migrate data` (identical behaviour, no
+    /// deprecation message).
     ///
-    /// This is the same invocation the boot-time
-    /// `duduclaw-data-migrate.service` uses for `--run`; `--pending` /
-    /// `--check` are read-only and safe to run anytime.
-    ///
-    /// Examples:
-    ///     duduclaw migrate data --pending
-    ///     duduclaw migrate data --check       # exit 1 iff something is pending
-    ///     duduclaw migrate data --run
-    ///
-    /// Deprecated spelling of `duduclaw migrate data`; removed in v1.69.0.
+    /// Kept on purpose: deployed DuDuClaw OS images run
+    /// `duduclaw data-migrate --run` from an immutable boot unit
+    /// (`duduclaw-data-migrate.service`) in their read-only root, so a
+    /// platform binary upgraded on its own must still accept it. Remove it
+    /// only after the unit inside the OS image uses `migrate data` and the
+    /// older images are no longer supported.
     #[command(name = "data-migrate", hide = true)]
     DataMigrate {
-        /// List pending migrations. Always exits 0 (a listing is
-        /// informational, never a failure).
+        /// List pending migrations. Always exits 0.
         #[arg(long)]
         pending: bool,
 
-        /// Exit 0 if nothing is pending, 1 if something is — for
-        /// scripts/health checks. Prints no listing.
+        /// Exit 0 if nothing is pending, 1 if something is.
         #[arg(long)]
         check: bool,
 
-        /// Actually apply every pending migration, oldest-first, stopping
-        /// at the first failure.
+        /// Apply every pending migration, oldest-first, stopping at the
+        /// first failure.
         #[arg(long)]
         run: bool,
 
-        /// Machine-readable JSON output instead of the human console text.
+        /// Machine-readable JSON output.
         #[arg(long)]
         json: bool,
     },
@@ -3612,21 +3536,10 @@ enum AcpCommands {
 
 #[derive(Subcommand)]
 enum GdprCommands {
-    /// Export everything stored about a contact as a JSON bundle (read-only).
-    ///
-    /// Deprecated spelling of `duduclaw export gdpr`; removed in v1.69.0.
-    #[command(hide = true)]
-    Export {
-        /// Contact id (matched as triple subject/object or free-text mention),
-        /// e.g. `user:alice` or an email.
-        contact: String,
-        /// Agent whose memory to search (default: the configured default agent).
-        #[arg(long)]
-        agent: Option<String>,
-        /// Write the JSON bundle here (default: stdout).
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
+    /// Removed in v1.69.0 (use `duduclaw export gdpr`): prints the
+    /// replacement and exits 2.
+    #[command(hide = true, disable_help_flag = true)]
+    Export(removed_spelling::RemovedArgs),
     /// Erase everything stored about a contact (hard delete across memories +
     /// FTS + key facts). Requires --confirm; records a pseudonymised tombstone.
     Erase {
@@ -3646,25 +3559,10 @@ enum GdprCommands {
 
 #[derive(Subcommand)]
 enum PlaybookCommands {
-    /// Export one agent's active playbook entries as a GEP-gene-shaped JSON
-    /// array (`commercial/docs/DESIGN-evolution-v3-aee.md` §1.4, D5=B: local
-    /// schema alignment only, no hub I/O). An agent with no active entries
-    /// exports `[]` (never fabricated data).
-    ///
-    /// Example:
-    ///     duduclaw export playbook --agent support-bot --out genes.json
-    ///
-    /// Deprecated spelling of `duduclaw export playbook`; removed in v1.69.0.
-    #[command(hide = true)]
-    Export {
-        /// Agent id whose playbook to export.
-        #[arg(long)]
-        agent: String,
-
-        /// Write the JSON array here (default: stdout).
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
+    /// Removed in v1.69.0 (use `duduclaw export playbook`): prints the
+    /// replacement and exits 2.
+    #[command(hide = true, disable_help_flag = true)]
+    Export(removed_spelling::RemovedArgs),
 
     /// WP1.4 — extract the behaviour rules GVU accumulated in an agent's
     /// SOUL.md into a reviewable draft (`playbook_migration_draft.toml`),
@@ -5231,15 +5129,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 std::process::exit(code);
             }
         },
-        Commands::Ops(OpsCommands::MigrateFrom {
-            platform,
-            source,
-            apply,
-            rename,
-            json,
-            agent,
-            no_redact,
-        }) => migrate_from::run(&platform, source, apply, rename, json, agent, no_redact).await,
+        Commands::Ops(OpsCommands::MigrateFrom(_)) => RemovedSpelling::MigrateFrom.exit(),
         // T5/O10: `duduclaw export [data|audit|gdpr|playbook]`. Bare
         // `export --out …` keeps its historical meaning (the personal-edition
         // archive), so no existing invocation changes behavior.
@@ -5266,13 +5156,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 .await
             }
         },
-        Commands::Ops(OpsCommands::Audit {
-            since,
-            out,
-            webhook,
-            webhook_auth,
-            format,
-        }) => cmd_audit_export(since, out, webhook, webhook_auth, format).await,
+        Commands::Ops(OpsCommands::Audit(_)) => RemovedSpelling::Audit.exit(),
         Commands::Ops(OpsCommands::Redaction { command }) => match command {
             RedactionCommands::Verify {
                 file,
@@ -5287,11 +5171,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             SessionCommands::Replay { id, tools } => cmd_session_replay(id, tools).await,
         },
         Commands::Ops(OpsCommands::Gdpr { command }) => match command {
-            GdprCommands::Export {
-                contact,
-                agent,
-                out,
-            } => cmd_gdpr_export(contact, agent, out).await,
+            GdprCommands::Export(_) => RemovedSpelling::GdprExport.exit(),
             GdprCommands::Erase {
                 contact,
                 agent,
@@ -5466,12 +5346,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             let code = secaudit::cmd_secaudit_validate(&report).await;
             std::process::exit(code);
         }
-        Commands::Maintenance(MaintenanceCommands::Playbook(PlaybookCommands::Export { agent, out })) => {
-            playbook_export::cmd_playbook_export(
-                &duduclaw_home(),
-                playbook_export::ExportOptions { agent, out },
-            )
-            .await
+        Commands::Maintenance(MaintenanceCommands::Playbook(PlaybookCommands::Export(_))) => {
+            RemovedSpelling::PlaybookExport.exit()
         }
         Commands::Maintenance(MaintenanceCommands::Playbook(PlaybookCommands::MigrateSoul {
             agent,
@@ -5500,7 +5376,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Maintenance(MaintenanceCommands::Evolution(ev_cmd)) => cmd_evolution(ev_cmd, &duduclaw_home()).await,
         Commands::Maintenance(MaintenanceCommands::Os(os_cmd)) => cmd_os(os_cmd, &duduclaw_home()).await,
         Commands::Maintenance(MaintenanceCommands::Lifecycle(lc_cmd)) => cmd_lifecycle(lc_cmd, &duduclaw_home()).await,
-        Commands::Maintenance(MaintenanceCommands::AcpServer) => acp::server::run_acp_server(&duduclaw_home()).await,
+        Commands::Maintenance(MaintenanceCommands::AcpServer(_)) => RemovedSpelling::AcpServer.exit(),
         // T5/O10: `duduclaw acp [client|server]`. Bare `acp` keeps its
         // historical meaning (the editor-facing client protocol).
         Commands::Maintenance(MaintenanceCommands::Acp { command }) => match command {
@@ -5559,9 +5435,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             run,
             json,
         }) => {
-            // Custom 0/1 exit contract (task spec), same reasoning as
-            // Commands::Maintenance(MaintenanceCommands::Secaudit) above — not the generic "any Err ⇒ exit 1"
-            // wrapper.
+            // Same custom 0/1 exit contract as `migrate data`.
             let code = data_migrate::run(data_migrate::DataMigrateOptions {
                 pending,
                 check,
@@ -6364,7 +6238,7 @@ fn unreadable_existing(path: &std::path::Path, e: &std::io::Error) -> duduclaw_c
 /// before the name does not hide it; over-blocking a display name that happens
 /// to equal a reserved id is accepted. A speed bump like the rest of the Bash
 /// lane: `x=agent; duduclaw $x create …`, an alias, or another binary name
-/// evades it, and pack/expert install and `migrate-from` take their names from
+/// evades it, and pack install and `migrate from` take their names from
 /// a manifest, not the command line.
 fn bash_reserved_agent_create(
     command: &str,
@@ -6816,8 +6690,8 @@ mod resolve_hook_caller_tests {
         }
     }
 
-    /// Every CLI creation path (`agent create`, pack/expert install,
-    /// `migrate-from`) scaffolds through `scaffold_agent_dir`; inside an agent
+    /// Every CLI creation path (`agent create`, pack install,
+    /// `migrate from`) scaffolds through `scaffold_agent_dir`; inside an agent
     /// session a removed name is reserved there, and the refusal is audited.
     #[tokio::test]
     async fn scaffold_refuses_removed_name_inside_an_agent_session() {
@@ -8947,6 +8821,173 @@ async fn deprecated_runtime_check(home: &std::path::Path) -> (String, CheckStatu
     (name, CheckStatus::Warn, lines.join("\n         "))
 }
 
+/// Employee directories under `<home>/agents` the removed-item checks scan:
+/// every sub-directory except the reserved ones (`_trash`, `.ephemeral`, any
+/// dot or underscore name). Sorted for stable output.
+fn employee_dirs(home: &std::path::Path) -> std::io::Result<Vec<(String, std::path::PathBuf)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(home.join("agents"))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || name.starts_with('_') {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            out.push((name, entry.path()));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// `agent.toml [capabilities] allowed_tools` as written; empty when absent or
+/// unreadable (the scan reports unreadable files itself).
+fn allowed_tools_of(agent_dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(agent_dir.join("agent.toml"))
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+        .and_then(|t| {
+            t.get("capabilities")?
+                .as_table()?
+                .get("allowed_tools")?
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Pure half of [`removed_mcp_tools_check`]. Returns the report lines and
+/// whether any employee is left unable to call the replacement of a removed
+/// tool: an `allowed_tools` list that names a removed tool but nothing that
+/// matches its replacement (the employee loses the capability on upgrade).
+/// That outranks leftover prompt text or an approval list, which only
+/// degrade.
+fn removed_mcp_tool_lines(
+    employee: &str,
+    scan: &mcp_alias::RemovedToolScan,
+    allowed_tools: &[String],
+) -> (Vec<String>, bool) {
+    let mut lines = Vec::new();
+    let mut lost = false;
+    for f in &scan.findings {
+        let replacement_allowed = duduclaw_core::tool_catalog::tool_list_matches(allowed_tools, {
+            duduclaw_core::tool_catalog::removed_mcp_tool(f.tool)
+                .map(|r| r.replacement)
+                .unwrap_or(f.tool)
+        });
+        let loses_access =
+            f.location == "[capabilities] allowed_tools" && !replacement_allowed;
+        lost |= loses_access;
+        // These four lists still gate the call that replaced the removed
+        // name, so the entry is not lapsed; only the name is stale.
+        let still_gates = matches!(
+            f.location.as_str(),
+            "[capabilities] approval_required_tools"
+                | "[capabilities] irreversible_tools"
+                | "[capabilities] maybe_irreversible_tools"
+                | "[capabilities] scoped_tools"
+        );
+        lines.push(format!(
+            "{employee}: {} {} 寫著已移除的 `{}`（{} 處）{}。{}",
+            f.file,
+            f.location,
+            f.tool,
+            f.occurrences,
+            if loses_access {
+                "，此員工升級後失去該能力"
+            } else if still_gates {
+                "，仍會把關對應的新寫法，建議改成新名稱"
+            } else {
+                ""
+            },
+            f.advice,
+        ));
+    }
+    for file in &scan.unreadable {
+        lines.push(format!("{employee}: 無法讀取 {file}，未能檢查"));
+    }
+    (lines, lost)
+}
+
+/// `duduclaw doctor` row (v1.69.0): MCP tool names removed in v1.69.0 that an
+/// employee's settings, prompts or skills, or `config.toml`, still write.
+/// Reports, never rewrites. Fail when an employee loses a capability (its
+/// allowlist names only the removed tool), Warn for any other leftover.
+fn removed_mcp_tools_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let name = "已移除的 MCP 工具名".to_string();
+    let mut lines: Vec<String> = Vec::new();
+    let mut lost = false;
+    match employee_dirs(home) {
+        Ok(dirs) => {
+            for (id, dir) in dirs {
+                let scan = mcp_alias::scan_agent_dir_for_removed_tools(&dir);
+                let allowed = allowed_tools_of(&dir);
+                let (l, f) = removed_mcp_tool_lines(&id, &scan, &allowed);
+                lines.extend(l);
+                lost |= f;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => lines.push(format!("無法讀取 AI 員工清單：{e}，未能檢查員工設定")),
+    }
+    match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(raw) => match raw.parse::<toml::Table>() {
+            Ok(table) => {
+                for f in mcp_alias::scan_config_for_removed_tools(&table) {
+                    lines.push(format!(
+                        "全域設定: {} {} 寫著已移除的 `{}`。{}",
+                        f.file, f.location, f.tool, f.advice
+                    ));
+                }
+            }
+            Err(e) => lines.push(format!("config.toml 無法解析：{e}，未能檢查全域設定")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => lines.push(format!("無法讀取 config.toml：{e}，未能檢查全域設定")),
+    }
+    if lines.is_empty() {
+        return (name, CheckStatus::Pass, "設定、提示詞與技能沒有已移除的 MCP 工具名".to_string());
+    }
+    lines.push("對照表見 docs/guides/deprecations.md".to_string());
+    let status = if lost { CheckStatus::Fail } else { CheckStatus::Warn };
+    (name, status, lines.join("\n         "))
+}
+
+/// `duduclaw doctor` row (v1.69.0): `config.toml [dispatch] judge` set to a
+/// mode removed in v1.69.0. Reports what the gateway does with the value now
+/// and how to fix it; never rewrites.
+fn removed_judge_mode_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    use duduclaw_gateway::judge_mode::{JudgeMode, RemovedJudgeModeCheck};
+    let name = "已移除的判官模式".to_string();
+    match duduclaw_gateway::judge_mode::check_removed_judge_mode_in_home(home) {
+        RemovedJudgeModeCheck::NotUsed => {
+            (name, CheckStatus::Pass, "[dispatch] judge 沒有使用已移除的值".to_string())
+        }
+        RemovedJudgeModeCheck::Unchecked(reason) => (
+            name,
+            CheckStatus::Warn,
+            format!("未能檢查 [dispatch] judge 是否使用已移除的值：{reason}"),
+        ),
+        RemovedJudgeModeCheck::Finding(f) => {
+            // `human_only` stops every submitted piece of work, which is a
+            // failure of the goal loop rather than a leftover setting.
+            let status = if f.mode == JudgeMode::RemovedHumanOnly {
+                CheckStatus::Fail
+            } else {
+                CheckStatus::Warn
+            };
+            (
+                name,
+                status,
+                format!(
+                    "[dispatch] judge = \"{}\" 已移除，現在{}。修正：{}",
+                    f.configured, f.current_behavior, f.fix
+                ),
+            )
+        }
+    }
+}
+
 /// `duduclaw doctor`
 /// WP22 T1 — the `duduclaw doctor` row for organisational-authority drift.
 ///
@@ -9577,6 +9618,10 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // Check 4c: agents on a deprecated runtime (R1, 2026-10).
     checks.push(deprecated_runtime_check(&home).await);
 
+    // Check 4d: MCP tool names and judge modes removed in v1.69.0.
+    checks.push(removed_mcp_tools_check(&home));
+    checks.push(removed_judge_mode_check(&home));
+
     // Print results
     let mut has_failure = false;
     for (name, status, message) in &checks {
@@ -9916,7 +9961,7 @@ fn provider_context_filenames(
 /// Reusable agent-directory scaffold parameters.
 ///
 /// Shared by `cmd_agent_create` (the `duduclaw agent create` CLI path) and the
-/// `migrate-from` importer so both produce byte-compatible agent directories
+/// `migrate from` importer so both produce byte-compatible agent directories
 /// from one template — no copy-paste drift. All string fields are expected to
 /// be already normalised by the caller (validated id, canonical role).
 pub(crate) struct AgentScaffold {
@@ -9969,7 +10014,7 @@ pub(crate) async fn scaffold_agent_dir(
 
     // Removed-name reservation for AI sessions (see
     // `duduclaw_core::agent_trash`). Every CLI path that writes a fresh agent
-    // directory — `agent create`, `pack`/`expert install`, `migrate-from` —
+    // directory — `agent create`, `pack install`, `migrate from` —
     // funnels through here, and an employee with a Bash tool can run any of
     // them. Same session test as `org sync` (identity env present ⇒ AI); like
     // that one it is a speed bump, since a shell can unset the variables. An
@@ -10081,12 +10126,12 @@ skill_security_scan = true
 
     // WP22 T1 — record the authoritative org placement in `<home>/org.toml`.
     // This one call covers every CLI creation path that funnels through this
-    // scaffold: `duduclaw agent create`, the `migrate-from` importers
-    // (paperclip / hermes / openclaw), `expert install` and `expert` plugin
+    // scaffold: `duduclaw agent create`, the `migrate from` importers
+    // (paperclip / hermes / openclaw), `pack install` and `expert` plugin
     // imports. Without it, re-creating a directory that a *previous* agent of
     // the same name once occupied would leave the old (stale) store record in
     // charge of the new agent — the failure mode this task exists to prevent.
-    // Scaffolds are department-less; `expert install` records its department
+    // Scaffolds are department-less; `pack install` records its department
     // right after it patches it in. Best-effort: on failure the agent simply
     // has no record, and the fallback rule keeps its `agent.toml` governing it.
     if let Err(e) = duduclaw_core::org_store::upsert(
@@ -12200,7 +12245,7 @@ mod deprecated_runtime_doctor_tests {
         assert_eq!(f.len(), 2, "{f:?}");
         assert!(f[0].starts_with("a: [runtime] provider = \"gemini\""), "{f:?}");
         assert!(f[1].starts_with("b: [runtime] fallback = \"gemini\""), "{f:?}");
-        assert!(f.iter().all(|l| l.contains("antigravity") && l.contains("v1.69.0")));
+        assert!(f.iter().all(|l| l.contains("antigravity") && l.contains("v1.70.0")));
     }
 
     #[tokio::test]
@@ -12231,11 +12276,146 @@ mod deprecated_runtime_doctor_tests {
     fn agent_create_notice_only_for_deprecated_runtimes() {
         use duduclaw_core::types::RuntimeType;
         let n = runtime_deprecation_notice(RuntimeType::Gemini).expect("gemini warns");
-        assert!(n.contains("antigravity") && n.contains("v1.69.0"), "{n}");
+        assert!(n.contains("antigravity") && n.contains("v1.70.0"), "{n}");
         assert!(runtime_deprecation_notice(RuntimeType::Antigravity).is_none());
         assert!(runtime_deprecation_notice(RuntimeType::Claude).is_none());
         // Still accepted by the strict parser.
         assert_eq!(parse_runtime_provider_strict("gemini").unwrap(), RuntimeType::Gemini);
+    }
+}
+
+/// `duduclaw doctor` rows for items removed in v1.69.0.
+#[cfg(test)]
+mod removed_items_doctor_tests {
+    use super::*;
+
+    fn write(path: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn removed_tools_row_passes_on_an_empty_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (name, status, detail) = removed_mcp_tools_check(tmp.path());
+        assert_eq!(name, "已移除的 MCP 工具名");
+        assert_eq!(status, CheckStatus::Pass, "{detail}");
+    }
+
+    #[test]
+    fn removed_tools_row_passes_for_a_clean_employee_and_ignores_reserved_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("agents/clean/SOUL.md"), "use wiki_read with scope=\"shared\"\n");
+        write(&tmp.path().join("agents/_trash/old_1/SOUL.md"), "shared_wiki_read\n");
+        write(&tmp.path().join("agents/.ephemeral/e/SOUL.md"), "shared_wiki_read\n");
+        let (_, status, detail) = removed_mcp_tools_check(tmp.path());
+        assert_eq!(status, CheckStatus::Pass, "{detail}");
+    }
+
+    #[test]
+    fn removed_tools_row_says_the_gating_lists_still_apply_to_the_new_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("agents/sam/agent.toml"),
+            "[capabilities]\napproval_required_tools = [\"shared_wiki_write\"]\n\
+             irreversible_tools = [\"schedule_task\"]\n\
+             maybe_irreversible_tools = [\"skill_bank_search\"]\n\
+             scoped_tools = [\"shared_wiki_ls\"]\n",
+        );
+        let (_, status, detail) = removed_mcp_tools_check(tmp.path());
+        assert_eq!(status, CheckStatus::Warn, "{detail}");
+        assert_eq!(detail.matches("仍會把關對應的新寫法，建議改成新名稱").count(), 4, "{detail}");
+    }
+
+    #[test]
+    fn removed_tools_row_warns_on_prompt_text_with_file_and_advice() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("agents/sam/SOUL.md"), "先用 shared_wiki_read 查 SOP\n");
+        let (_, status, detail) = removed_mcp_tools_check(tmp.path());
+        assert_eq!(status, CheckStatus::Warn, "{detail}");
+        assert!(detail.contains("sam") && detail.contains("SOUL.md"), "{detail}");
+        assert!(detail.contains("shared_wiki_read") && detail.contains("wiki_read"), "{detail}");
+    }
+
+    #[test]
+    fn removed_tools_row_fails_when_the_allowlist_names_only_the_removed_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("agents/sam/agent.toml"),
+            "[capabilities]\nallowed_tools = [\"mcp__duduclaw__shared_wiki_read\", \"memory_search\"]\n",
+        );
+        let (_, status, detail) = removed_mcp_tools_check(tmp.path());
+        assert_eq!(status, CheckStatus::Fail, "{detail}");
+        assert!(detail.contains("sam") && detail.contains("失去該能力"), "{detail}");
+    }
+
+    #[test]
+    fn removed_tools_row_only_warns_when_the_allowlist_also_has_the_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("agents/sam/agent.toml"),
+            "[capabilities]\nallowed_tools = [\"shared_wiki_read\", \"wiki_read\"]\n",
+        );
+        let (_, status, detail) = removed_mcp_tools_check(tmp.path());
+        assert_eq!(status, CheckStatus::Warn, "{detail}");
+        assert!(!detail.contains("失去該能力"), "{detail}");
+    }
+
+    #[test]
+    fn removed_tools_row_reports_global_config_leftovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("config.toml"),
+            "[provenance]\nsensitive_tools = [\"shared_wiki_write\"]\n",
+        );
+        let (_, status, detail) = removed_mcp_tools_check(tmp.path());
+        assert_eq!(status, CheckStatus::Warn, "{detail}");
+        assert!(detail.contains("全域設定") && detail.contains("sensitive_tools"), "{detail}");
+    }
+
+    #[test]
+    fn removed_tools_row_says_when_it_could_not_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("config.toml"), "[provenance\n");
+        let (_, status, detail) = removed_mcp_tools_check(tmp.path());
+        assert_eq!(status, CheckStatus::Warn, "an unparsable config is not 'clean': {detail}");
+        assert!(detail.contains("未能檢查"), "{detail}");
+    }
+
+    #[test]
+    fn removed_judge_mode_row_passes_without_a_removed_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (name, status, detail) = removed_judge_mode_check(tmp.path());
+        assert_eq!(name, "已移除的判官模式");
+        assert_eq!(status, CheckStatus::Pass, "{detail}");
+        write(&tmp.path().join("config.toml"), "[dispatch]\njudge = \"mav\"\n");
+        assert_eq!(removed_judge_mode_check(tmp.path()).1, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn removed_judge_mode_row_says_when_it_could_not_check() {
+        for body in ["[dispatch\njudge = ", "[dispatch]\njudge = 7\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(&tmp.path().join("config.toml"), body);
+            let (_, status, detail) = removed_judge_mode_check(tmp.path());
+            assert_eq!(status, CheckStatus::Warn, "{body:?}: {detail}");
+            assert!(detail.contains("未能檢查"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn removed_judge_mode_row_warns_with_current_behavior_and_fix() {
+        for (value, behavior, want) in [
+            ("human_only", "needs_human", CheckStatus::Fail),
+            ("evaluator_only", "mav", CheckStatus::Warn),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(&tmp.path().join("config.toml"), &format!("[dispatch]\njudge = \"{value}\"\n"));
+            let (_, status, detail) = removed_judge_mode_check(tmp.path());
+            assert_eq!(status, want, "{detail}");
+            assert!(detail.contains(value) && detail.contains(behavior), "{detail}");
+            assert!(detail.contains("judge = \"mav\""), "{detail}");
+        }
     }
 }
 
@@ -12923,40 +13103,104 @@ mod cli_verb_consolidation_tests {
         }
     }
 
-    /// Deprecation contract: the old spellings are hidden from `--help` but
-    /// must still parse for two minor versions.
+    /// v1.69.0 removal contract: each retired spelling still parses (so the
+    /// user gets one clear sentence instead of clap's "unrecognized
+    /// subcommand"), swallows any trailing flags, and maps to a message that
+    /// names its replacement.
     #[test]
-    fn deprecated_cli_spellings_still_parse() {
-        run_on_big_stack(deprecated_cli_spellings_still_parse_body);
+    fn removed_cli_spellings_parse_to_stubs_that_name_the_replacement() {
+        run_on_big_stack(removed_cli_spellings_body);
     }
 
-    fn deprecated_cli_spellings_still_parse_body() {
-        match parse(&["migrate-from", "openclaw"]).command {
-            Commands::Ops(OpsCommands::MigrateFrom { platform, .. }) => {
-                assert_eq!(platform, "openclaw")
-            }
-            _ => panic!("`migrate-from` must still parse"),
-        }
-        match parse(&["data-migrate", "--check"]).command {
-            Commands::Maintenance(MaintenanceCommands::DataMigrate { check, .. }) => assert!(check),
-            _ => panic!("`data-migrate` must still parse"),
-        }
-        match parse(&["audit", "--since", "2026-01-01T00:00:00Z"]).command {
-            Commands::Ops(OpsCommands::Audit { since, .. }) => {
-                assert_eq!(since.as_deref(), Some("2026-01-01T00:00:00Z"))
-            }
-            _ => panic!("`audit` must still parse"),
-        }
-        match parse(&["gdpr", "export", "user:alice"]).command {
+    fn removed_cli_spellings_body() {
+        use crate::removed_spelling::RemovedSpelling as R;
+        let removed = |args: &[&str]| match parse(args).command {
+            Commands::Ops(OpsCommands::MigrateFrom(_)) => R::MigrateFrom,
+            Commands::Ops(OpsCommands::Audit(_)) => R::Audit,
             Commands::Ops(OpsCommands::Gdpr {
-                command: GdprCommands::Export { contact, .. },
-            }) => assert_eq!(contact, "user:alice"),
-            _ => panic!("`gdpr export` must still parse"),
+                command: GdprCommands::Export(_),
+            }) => R::GdprExport,
+            Commands::Maintenance(MaintenanceCommands::Playbook(PlaybookCommands::Export(_))) => {
+                R::PlaybookExport
+            }
+            Commands::Maintenance(MaintenanceCommands::AcpServer(_)) => R::AcpServer,
+            _ => panic!("{args:?} did not parse to a removed-spelling stub"),
+        };
+        let cases: [(&[&str], R, &str); 5] = [
+            (&["migrate-from", "openclaw", "--json"], R::MigrateFrom, "duduclaw migrate from"),
+            (&["audit", "--since", "2026-01-01T00:00:00Z"], R::Audit, "duduclaw export audit"),
+            (&["gdpr", "export", "user:alice", "--out", "x"], R::GdprExport, "duduclaw export gdpr"),
+            (&["playbook", "export", "--agent", "a"], R::PlaybookExport, "duduclaw export playbook"),
+            (&["acp-server"], R::AcpServer, "duduclaw acp server"),
+        ];
+        for (args, expected, replacement) in cases {
+            assert_eq!(removed(args), expected, "{args:?}");
+            let msg = expected.message();
+            assert!(msg.contains("v1.69.0"), "{msg}");
+            assert!(msg.contains(replacement), "{msg}");
         }
-        match parse(&["acp-server"]).command {
-            Commands::Maintenance(MaintenanceCommands::AcpServer) => {}
-            _ => panic!("`acp-server` must still parse"),
+        // The kept neighbours are untouched.
+        parse(&["gdpr", "erase", "user:alice"]);
+        parse(&["playbook", "migrate-soul", "--agent", "a"]);
+    }
+
+    /// `data-migrate` is called by the immutable boot unit of shipped DuDuClaw
+    /// OS images, so it must stay a working alias of `migrate data`.
+    #[test]
+    fn data_migrate_stays_a_working_alias_of_migrate_data() {
+        run_on_big_stack(data_migrate_alias_body);
+    }
+
+    fn data_migrate_alias_body() {
+        let old = match parse(&["data-migrate", "--check", "--json"]).command {
+            Commands::Maintenance(MaintenanceCommands::DataMigrate {
+                pending,
+                check,
+                run,
+                json,
+            }) => (pending, check, run, json),
+            _ => panic!("`data-migrate` must parse to the working DataMigrate command"),
+        };
+        let new = match parse(&["migrate", "data", "--check", "--json"]).command {
+            Commands::Ops(OpsCommands::Migrate {
+                command:
+                    Some(MigrateCommands::Data {
+                        pending,
+                        check,
+                        run,
+                        json,
+                    }),
+            }) => (pending, check, run, json),
+            _ => panic!("`migrate data` must parse"),
+        };
+        assert_eq!(old, new);
+        assert_eq!(old, (false, true, false, true));
+        match parse(&["data-migrate", "--run"]).command {
+            Commands::Maintenance(MaintenanceCommands::DataMigrate { run, .. }) => assert!(run),
+            _ => panic!("`data-migrate --run` must parse"),
         }
+    }
+
+    /// Decision D10: the three bare forms are official behaviour, not
+    /// deprecated spellings.
+    #[test]
+    fn bare_group_forms_stay_official() {
+        run_on_big_stack(bare_group_forms_body);
+    }
+
+    fn bare_group_forms_body() {
+        assert!(matches!(
+            parse(&["migrate"]).command,
+            Commands::Ops(OpsCommands::Migrate { command: None })
+        ));
+        assert!(matches!(
+            parse(&["export", "--out", "x.tar.gz"]).command,
+            Commands::Ops(OpsCommands::Export { command: None, .. })
+        ));
+        assert!(matches!(
+            parse(&["acp"]).command,
+            Commands::Maintenance(MaintenanceCommands::Acp { command: None })
+        ));
     }
 
     #[test]

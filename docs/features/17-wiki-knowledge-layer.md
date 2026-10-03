@@ -106,7 +106,7 @@ WikiFts SQLite virtual table
      v
 Search queries:
   wiki_search("rate limiting", min_trust=0.5, layer="core")
-  shared_wiki_search("SOP", expand=true)
+  wiki_search("SOP", scope="shared", expand=true)
 ```
 
 ### Search Filters
@@ -205,7 +205,7 @@ Visibility is controlled via the `wiki_visible_to` capability on each page — d
 
 **One tool set, two wikis.** `wiki_ls` / `wiki_read` / `wiki_write` / `wiki_search` / `wiki_stats` / `wiki_lint` all take a `scope` parameter: `"agent"` (the default — your own wiki, unchanged) or `"shared"` (the cross-agent wiki). `wiki_share` copies a page from your wiki into the shared one, and `shared_wiki_delete` keeps its own name because there is deliberately no agent-local delete.
 
-The six `shared_wiki_*` spellings (`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`) still work as deprecated aliases and land on exactly the same handlers; they are removed in v1.69.0. See [deprecations](../guides/deprecations.md).
+The six `shared_wiki_*` spellings (`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`) were removed in v1.69.0. They no longer appear in `tools/list`, and calling one returns an error that names the replacement (`wiki_*` with `scope="shared"`). See [deprecations](../guides/deprecations.md).
 
 ### Namespace SoT Policy (`.scope.toml`)
 
@@ -239,7 +239,7 @@ Three modes:
 | `read_only` | ❌ denied | ✅ allowed | ✅ allowed |
 | `operator_only` | ❌ denied | ❌ denied | ✅ allowed |
 
-Both `shared_wiki_write` and `shared_wiki_delete` honour the policy. Unlisted namespaces are `agent_writable` by default — the policy *only tightens*, never relaxes.
+Both `wiki_write` with `scope="shared"` and `shared_wiki_delete` honour the policy. Unlisted namespaces are `agent_writable` by default — the policy *only tightens*, never relaxes.
 
 **Fail-safe:** absent file ⇒ no policy ⇒ existing behaviour. Malformed TOML ⇒ logged warning + treated as no policy. The gateway is never blocked by a broken policy file.
 
@@ -249,7 +249,7 @@ Use `wiki_namespace_status` MCP tool to inspect the active policy before writing
 
 ### Department read-visibility (`visible_to_departments`)
 
-The write `mode` above governs *who may write* a namespace. To govern *who may read* it at the **department** level, add a `visible_to_departments` array to the same `[namespaces."x"]` table. Only agents whose `[agent] department` is on the list see that namespace — both in **prompt injection** (auto-injected L0/L1 pages) and via **`shared_wiki_search` / `shared_wiki_read` / `shared_wiki_ls`**.
+The write `mode` above governs *who may write* a namespace. To govern *who may read* it at the **department** level, add a `visible_to_departments` array to the same `[namespaces."x"]` table. Only agents whose `[agent] department` is on the list see that namespace — both in **prompt injection** (auto-injected L0/L1 pages) and via **`wiki_search` / `wiki_read` / `wiki_ls` (`scope="shared"`)**.
 
 ```toml
 # HR pages are readable only by the hr and legal departments

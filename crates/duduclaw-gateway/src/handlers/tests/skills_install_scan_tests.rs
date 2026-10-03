@@ -301,7 +301,7 @@ async fn agent_creation_seeds_the_builtin_skills() {
 }
 
 /// WP6 — a routine created from the dashboard must announce itself on the
-/// same `events.db` feedback path the MCP `schedule_task` tool uses, so a
+/// same `events.db` feedback path the MCP `tasks_create` (with `schedule`) tool uses, so a
 /// second browser tab (or the operator's phone) refreshes instead of
 /// silently disagreeing with the tab that made the change.
 #[tokio::test]

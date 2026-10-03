@@ -47,6 +47,33 @@ pub(crate) fn install_approval_required(agent_dir: &Path, tool_name: &str, _call
     is_install_class_tool(tool_name) && !duduclaw_gateway::approval::auto_approve_install(agent_dir)
 }
 
+/// Static ActionGuard classification of one call: `(always, maybe)`.
+///
+/// `always` folds in the legacy `approval_required_tools` + install-class gate
+/// and `irreversible_tools`; `maybe` is `maybe_irreversible_tools`. A list
+/// entry written for a removed tool name (`shared_wiki_write`,
+/// `schedule_task`, ...) keeps gating the call that replaced it
+/// (`wiki_write` with `scope="shared"`, `tasks_create` with `schedule`): the
+/// removed name only ever adds a match, so this is never looser than the
+/// plain tool-name check.
+pub(crate) fn static_gate_flags(agent_dir: &Path, tool_name: &str, payload: &Value) -> (bool, bool) {
+    let legacy_name = duduclaw_core::tool_catalog::removed_name_for_call(
+        tool_name,
+        payload.get("arguments").unwrap_or(&Value::Null),
+    );
+    let always = install_approval_required(agent_dir, tool_name, false)
+        || duduclaw_gateway::approval::tool_is_irreversible(agent_dir, tool_name)
+        || legacy_name.is_some_and(|legacy| {
+            duduclaw_gateway::approval::tool_requires_approval(agent_dir, legacy)
+                || duduclaw_gateway::approval::tool_is_irreversible(agent_dir, legacy)
+        });
+    let maybe = duduclaw_gateway::approval::tool_is_maybe_irreversible(agent_dir, tool_name)
+        || legacy_name.is_some_and(|legacy| {
+            duduclaw_gateway::approval::tool_is_maybe_irreversible(agent_dir, legacy)
+        });
+    (always, maybe)
+}
+
 /// What an approval is asked for. Decides the `action_kind` the inbox and
 /// channel notifications render, and the wording the agent gets back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,8 +323,7 @@ pub(crate) async fn gate_tool_approval_dispatch(
     // routes through the judge. caller_is_admin is `false` (F1: the internal MCP
     // principal always holds Admin, and this agent-autonomous path is exactly
     // what WP5 must gate).
-    let in_always = install_approval_required(&agent_dir, tool_name, false)
-        || duduclaw_gateway::approval::tool_is_irreversible(&agent_dir, tool_name);
+    let (in_always, in_maybe) = static_gate_flags(&agent_dir, tool_name, &payload);
 
     // ── P3-1 VeriOS situation five-classification ASK gate ───────────────────
     // OS ACTION tools (`os_open`, future L5b native desktop actions) route
@@ -318,7 +344,6 @@ pub(crate) async fn gate_tool_approval_dispatch(
     }
 
     // Non-OS maybe-irreversible tools stay on the ActionGuard judge path.
-    let in_maybe = duduclaw_gateway::approval::tool_is_maybe_irreversible(&agent_dir, tool_name);
 
     use duduclaw_gateway::approval::{
         ActionGate, JudgeVerdict, SimulationNarrative, resolve_action_gate,

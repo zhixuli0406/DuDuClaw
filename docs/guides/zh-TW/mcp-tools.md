@@ -55,7 +55,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 兩道新的閘門會拒絕呼叫，但不會把工具從 `tools/list` 拿掉：
 
-- `agent.toml [permissions]`：寫成 `false` 的旗標會拒絕 `create_agent`（`can_create_agents`）；`send_to_agent`、`spawn_agent`（`can_send_cross_agent`）；`schedule_task`、`create_reminder` 與帶 `schedule` 的 `tasks_create`（`can_schedule_tasks`）；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`（`can_modify_own_skills`）。拒絕時回 JSON-RPC 錯誤 -32003 並記稽核 `permission_denied`。`agent.toml` 存在但讀不到或無法解析時，這些工具一律拒絕；檔案不存在則放行。不帶 `schedule` 的 `tasks_create` 仍然允許，所以這些旗標是逐次呼叫檢查。臨時角色成員建立時 `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` 為 `false`。
+- `agent.toml [permissions]`：寫成 `false` 的旗標會拒絕 `create_agent`（`can_create_agents`）；`send_to_agent`、`spawn_agent`（`can_send_cross_agent`）；`create_reminder` 與帶 `schedule` 的 `tasks_create`（`can_schedule_tasks`）；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`（`can_modify_own_skills`）。拒絕時回 JSON-RPC 錯誤 -32003 並記稽核 `permission_denied`。`agent.toml` 存在但讀不到或無法解析時，這些工具一律拒絕；檔案不存在則放行。不帶 `schedule` 的 `tasks_create` 仍然允許，所以這些旗標是逐次呼叫檢查。臨時角色成員建立時 `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` 為 `false`。
 - `config.toml [odoo] features_*`：Odoo 工具照樣列出，呼叫到已關閉模組的模型時逐次拒絕（project 與 hr 預設關閉）。
 
 ### 紀錄關係檢查：列出但會拒絕
@@ -179,7 +179,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 ## 已棄用的別名仍會列出
 
-已棄用的工具名稱仍會出現在 `tools/list`，說明前面加 `[deprecated → …]` 前綴——因為隱藏它等於讓它叫不動，那和棄用緩衝期的用意正好相反。完整的舊 → 新對照表在 [deprecations.md](../deprecations.md)。
+已棄用的工具名稱仍會出現在 `tools/list`，說明前面加 `[deprecated → …]` 前綴——因為隱藏它等於讓它叫不動，那和棄用緩衝期的用意正好相反。完整的舊 → 新對照表在 [deprecations.md](../deprecations.md)。目前沒有任何 MCP 工具處於棄用狀態：v1.66.0 那一批別名已在 v1.69.0 移除。
 
 ## 相關文件
 

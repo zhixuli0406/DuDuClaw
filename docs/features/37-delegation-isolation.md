@@ -44,7 +44,7 @@ Every delegation route is governed:
 - Claiming an unassigned task, or one already assigned to you (`tasks_claim`), is unrestricted; claiming a task assigned to another employee needs the same relationship with that employee
 - Dashboard assignment operations are unrestricted (they are human operations)
 
-**2b. Multi-step plans and routines** — every step of `create_task` can name an executor, and `schedule_task` can set up recurring work for someone else
+**2b. Multi-step plans and routines** — every step of `create_task` can name an executor, and `tasks_create` with a `schedule` can set up recurring work for someone else
 
 - Both count as delegation and are checked at creation time; `create_task` steps are checked once more right before actual dispatch
 - Scheduling for yourself or naming yourself as executor is unrestricted
@@ -137,7 +137,7 @@ Three controls:
 Rejected delegation attempts always leave a trail, split into two files by interception point:
 
 - Blocked when dispatch is actually about to execute (bus queue, multi-step plans) → `~/.duduclaw/security_audit.jsonl`, event type `delegation_denied`
-- Blocked at the MCP tool itself (`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `tasks_claim` / `tasks_complete` / `tasks_block` / `activity_post` / `create_task` / `schedule_task` / the cron management tools / `create_reminder`) → `~/.duduclaw/tool_calls.jsonl`, also `delegation_denied`; blocked org adjustments via `create_agent` / `agent_update` are recorded as `org_placement_denied`
+- Blocked at the MCP tool itself (`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `tasks_claim` / `tasks_complete` / `tasks_block` / `activity_post` / `create_task` / the cron management tools / `create_reminder`) → `~/.duduclaw/tool_calls.jsonl`, also `delegation_denied`; blocked org adjustments via `create_agent` / `agent_update` are recorded as `org_placement_denied`
 - Record-change refusals that are not about the relationship itself are also in `tool_calls.jsonl`, with a `reason`: `owner_unknown`, `caller_unknown`, `system_sender_identity`, `reserved_tag_change`, `goal_contract_frozen`. An AI employee changing its own authority settings through `agent_update` is recorded as `agent_authority_refused` (reason `self_authority_change`)
 
 A `security_audit.jsonl` record looks like this:
@@ -245,11 +245,11 @@ So an AI caller cannot create an employee whose name:
 - is still recorded in `org.toml` although its directory is gone, or
 - cannot be checked because `_trash/` cannot be listed (fail closed).
 
-Every MCP caller counts as an AI caller. The CLI scaffold path (`duduclaw agent create`, pack and expert install, `migrate-from`) applies the same rule when it sees an agent identity in its environment (`DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN`), and the `agent-file-guard` hook blocks a Bash `duduclaw agent create <reserved name>`. A different name is always allowed. `agent_remove` tells the AI that the employee was removed, that the administrator can restore it and that the name is reserved; it no longer returns the trash path or an `rm -rf` hint.
+Every MCP caller counts as an AI caller. The CLI scaffold path (`duduclaw agent create`, pack install, `migrate from`) applies the same rule when it sees an agent identity in its environment (`DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN`), and the `agent-file-guard` hook blocks a Bash `duduclaw agent create <reserved name>`. A different name is always allowed. `agent_remove` tells the AI that the employee was removed, that the administrator can restore it and that the name is reserved; it no longer returns the trash path or an `rm -rf` hint.
 
 Operators are not restricted: the dashboard and a human at a terminal can reuse the name. Restoring or purging a removed employee is done by hand on `~/.duduclaw/agents/_trash/<id>_<timestamp>`; the dashboard has no control for it. Refusals are audited in `security_audit.jsonl` as `agent_name_reserved` (`requested_name`, `path_kind` = `mcp_create_agent` / `cli_scaffold` / `cli_bash_agent_create`, `reason` = `removed_to_trash` / `dangling_org_record` / `trash_unlistable`); removals as `agent_removed` (`subject`, `moved_to_trash`).
 
-Limits: Claude, Codex and Gemini employees carry their identity in `.mcp.json`, not in their Bash environment, so the CLI cannot tell that `pack install`, `expert install` or `migrate-from` run from their Bash is an AI session; the Bash rules are heuristics, and real containment is not granting Bash. Verified through the real MCP server with an employee's own registration (remove, refused re-creation, a different name accepted, the hook blocks, the audit rows); the CLI scaffold path was exercised only by unit tests.
+Limits: Claude, Codex and Gemini employees carry their identity in `.mcp.json`, not in their Bash environment, so the CLI cannot tell that `pack install` or `migrate from` run from their Bash is an AI session; the Bash rules are heuristics, and real containment is not granting Bash. Verified through the real MCP server with an employee's own registration (remove, refused re-creation, a different name accepted, the hook blocks, the audit rows); the CLI scaffold path was exercised only by unit tests.
 
 `create_agent` and `agent_remove` called over HTTP with a non-internal MCP key are judged by that key's own client id (they used to be treated as the server process's default agent), so the subtree check above applies to the real caller.
 

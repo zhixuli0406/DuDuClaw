@@ -131,7 +131,7 @@ strategy = "balanced"         # 各学習ラウンドを修正／最適化／探
 あるエージェントが現在学んでいるルールを一括エクスポートしたい場合（手動レビューや、将来エージェント間で経験を複製したい場合など）：
 
 ```bash
-duduclaw playbook export --agent <エージェント id> --out rules.json
+duduclaw export playbook --agent <エージェント id> --out rules.json
 ```
 
 各ルールの去就は、リンクされた「検証問題集」（eval case）が決めます。自分で検証を 1 回実行したい、または問題集を作成・拡充したい場合：

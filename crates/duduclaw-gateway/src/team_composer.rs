@@ -2125,7 +2125,13 @@ const DUDUCLAW_MCP_WILDCARD: &str = "mcp__duduclaw__*";
 
 /// Read-only helpers the executor has carried since WP-4. Kept (they are
 /// cheap and useful) but no longer the *whole* list — see [`executor_tools`].
-const EXECUTOR_HELPER_TOOLS: &[&str] = &["memory_search", "shared_wiki_read"];
+///
+/// `wiki_read` reaches the shared wiki with `scope="shared"`. A tool list
+/// names tools, not arguments, so it also allows the agent-wiki form
+/// (`scope` omitted or `"agent"`): the member's own wiki, or another
+/// employee's whose `wiki_visible_to` admits it. Both stay inside the
+/// employee's own envelope (`check_tool_subset`).
+const EXECUTOR_HELPER_TOOLS: &[&str] = &["memory_search", "wiki_read"];
 
 /// Tool subset for a role.
 ///
@@ -2136,7 +2142,9 @@ const EXECUTOR_HELPER_TOOLS: &[&str] = &["memory_search", "shared_wiki_read"];
 fn plan_tools(role: Role, parent: &duduclaw_core::types::CapabilitiesConfig) -> Vec<String> {
     let names: &[&str] = match role {
         // The planner's product is packets; it reads context and writes them.
-        Role::Planner => &["team_handoff", "shared_wiki_search", "memory_search"],
+        // `wiki_search` with `scope="shared"` is the shared-wiki search; see
+        // [`EXECUTOR_HELPER_TOOLS`] for what naming the tool also allows.
+        Role::Planner => &["team_handoff", "wiki_search", "memory_search"],
         Role::Executor => return executor_tools(parent),
         // Neither of these is spawned as a member today (the verifier is a
         // utility call), but the mapping is total so a future caller cannot
@@ -2150,7 +2158,7 @@ fn plan_tools(role: Role, parent: &duduclaw_core::types::CapabilitiesConfig) -> 
 /// `team_handoff` and the two read-only helpers.
 ///
 /// Live round 5, 2026-09-24. The executor used to get the same three-MCP-tool
-/// list as the planner (`team_handoff`, `memory_search`, `shared_wiki_read`),
+/// list as the planner (`team_handoff`, `memory_search`, and a shared-wiki read),
 /// which made the role that is *defined* as "does the work" structurally
 /// unable to do any. Two mechanisms, one cause:
 ///
@@ -7095,14 +7103,31 @@ skill_security_scan = false
         );
     }
 
+    /// v1.69.0: role tool lists name only tools that exist — a removed name
+    /// would leave the member without the shared wiki it is meant to read.
+    #[test]
+    fn role_tool_lists_name_no_removed_tool() {
+        let parent = parent_caps(&[], &[]);
+        for role in [Role::Planner, Role::Executor, Role::Verifier, Role::Utility] {
+            for tool in plan_tools(role, &parent) {
+                assert!(
+                    duduclaw_core::tool_catalog::removed_mcp_tool(&tool).is_none(),
+                    "{role:?} still lists removed tool {tool}"
+                );
+            }
+        }
+        assert!(plan_tools(Role::Planner, &parent).iter().any(|t| t == "wiki_search"));
+        assert!(plan_tools(Role::Executor, &parent).iter().any(|t| t == "wiki_read"));
+    }
+
     /// Dropping a helper the employee never granted must not fail the round —
     /// and the handoff channel must survive regardless.
     #[test]
     fn helpers_outside_the_envelope_are_dropped_not_fatal() {
-        let parent = parent_caps(&["Read", "Write", "Bash"], &["shared_wiki_read"]);
+        let parent = parent_caps(&["Read", "Write", "Bash"], &["wiki_read"]);
         let tools = plan_tools(Role::Executor, &parent);
         assert!(tools.iter().any(|t| t == "team_handoff"));
-        assert!(!tools.iter().any(|t| t == "shared_wiki_read"), "{tools:?}");
+        assert!(!tools.iter().any(|t| t == "wiki_read"), "{tools:?}");
         assert!(!tools.iter().any(|t| t == "memory_search"), "{tools:?}");
         assert!(tools.iter().any(|t| t == "Write"), "{tools:?}");
     }

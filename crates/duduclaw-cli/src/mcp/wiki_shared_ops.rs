@@ -22,7 +22,7 @@ pub(crate) async fn handle_shared_wiki_search(args: &Value, home_dir: &Path, cal
 
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
     if !wiki_dir.exists() {
-        return tool_text("No shared wiki found. Use shared_wiki_write to create the first page.");
+        return tool_text("No shared wiki found. Use wiki_write with scope=\"shared\" to create the first page.");
     }
 
     let store = duduclaw_memory::WikiStore::new_shared(home_dir);
@@ -235,7 +235,7 @@ pub(crate) async fn handle_wiki_namespace_status(home_dir: &Path, caller_agent: 
             "write_policy_from_scope_toml": departments_explicit,
         },
         // WP2.3 read-visibility filter: namespace → departments allowed to see
-        // it (prompt injection + shared_wiki_search/read). Fail-closed for any
+        // it (prompt injection + shared wiki_search/read). Fail-closed for any
         // declared namespace; unlisted namespaces stay visible to all.
         "visible_to_departments": visible_to_departments,
     });

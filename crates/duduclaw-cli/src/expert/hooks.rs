@@ -5,7 +5,7 @@
 //! `<home>/experts/<slug>/hooks-disabled/` and promoted to the enabled
 //! location `<home>/experts/<slug>/hooks/` only through an explicit grant:
 //!
-//! - `duduclaw expert install --trust-hooks …` — the operator's explicit CLI
+//! - `duduclaw pack install --trust-hooks …` — the operator's explicit CLI
 //!   grant (same convention as the codex / claude plugin `--trust` flag), or
 //! - an `ApprovalBroker` approval (`approvals.db`, surfaced in the dashboard
 //!   approval center via `approvals.list` / decided via `approvals.decide`)

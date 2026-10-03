@@ -59,7 +59,7 @@ async fn a1_judge_error_round_is_sealed_escalated() {
 }
 
 #[tokio::test]
-async fn a1_human_only_round_is_sealed_escalated() {
+async fn a1_removed_human_only_round_is_sealed_escalated() {
     let dir = tempfile::tempdir().unwrap();
     write_dispatch_config(dir.path(), "judge = \"human_only\"");
     let store = Arc::new(TaskStore::open(dir.path()).unwrap());
@@ -79,8 +79,9 @@ async fn a1_human_only_round_is_sealed_escalated() {
     );
     let it = only_round(&store, "a1h").await;
     assert_eq!(it.verdict.as_deref(), Some("escalated"));
-    assert_eq!(it.pause_reason.as_deref(), Some("blocked_needs_decision"));
-    // human_only parks before the evaluator runs.
+    // v1.69.0: the removed value parks as a platform-setting pause.
+    assert_eq!(it.pause_reason.as_deref(), Some("infra"));
+    // A leftover human_only parks before the evaluator runs.
     assert!(it.evaluator_verdict.is_none());
     // A wired home dir ⇒ the knob snapshot is sealed with the verdict.
     let knobs: serde_json::Value =

@@ -244,7 +244,7 @@ pub(crate) fn validate_autopilot_trigger_event_for_create(ev: &str) -> Result<()
     if AUTOPILOT_LEGACY_TRIGGER_EVENTS.iter().any(|k| *k == ev) {
         return Err(format!(
             "trigger_event '{ev}' is never emitted, so a rule on it would never fire; \
-             create a scheduled task instead (schedule_task / the scheduled tasks page)"
+             create a scheduled task instead (tasks_create with schedule / the scheduled tasks page)"
         ));
     }
     validate_autopilot_trigger_event(ev)

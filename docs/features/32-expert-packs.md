@@ -33,9 +33,9 @@ duduclaw pack install <src>        # routes by `kind`; premium content checks th
 
 `[pack] kind` chooses the route — `preset` (one job configuration, no identity), `team` (a roster, what an expert pack has always been), or `template` (a single industry persona). `[pack] tier` is the single premium decision: instead of four code paths each guessing "is this paid content" from a directory path, a pack carries its tier and one predicate reads it. A tier that cannot be read counts as premium — an unreadable field must never unlock paid content.
 
-`duduclaw expert install` is an alias for `pack install` and behaves identically; the authoring verbs (`pack`, `publish`, `export`, `convert-teams`, `hooks`, `remove`) stay under `duduclaw expert`. The dashboard's one-click install and `experts.install` reach the same code, because both already drive the CLI.
+`duduclaw expert install` was removed in v1.69.0: it prints `duduclaw pack install` and exits with code 2. The authoring verbs (`pack`, `publish`, `export`, `convert-teams`, `hooks`, `remove`) and `expert list` (which lists the installed records) stay under `duduclaw expert`. The dashboard's one-click install and `experts.install` reach the same code, because both already drive the CLI.
 
-**`expert.toml`, `team.toml` and `preset.toml` keep working until v1.69.0.** Nothing on disk is rewritten. `duduclaw pack inspect <dir> --emit-canonical` prints the `pack.toml` a legacy pack corresponds to so you can review and migrate it deliberately, rather than having a machine rewrite content you are responsible for.
+**`expert.toml`, `team.toml` and `preset.toml` are still read.** Nothing on disk is rewritten. `expert.toml`, `team.toml` and the industry pack directory layout are deprecated and will be removed together with the rewritten premium templates in a later version (no version number is set). The reason is that a `pack.toml` team or industry pack cannot be installed yet: the installer accepts only a `pack.toml` job preset. `preset.toml` is the storage format of job presets and is not deprecated. `duduclaw pack inspect <dir> --emit-canonical` prints the `pack.toml` a legacy pack corresponds to so you can review and migrate it deliberately, rather than having a machine rewrite content you are responsible for.
 
 ## The Install Pipeline
 

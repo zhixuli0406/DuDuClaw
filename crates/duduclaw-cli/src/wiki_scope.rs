@@ -1,7 +1,8 @@
 //! wiki_scope.rs — RFC-21 §3: Shared wiki Source-of-Truth namespace policy.
 //!
 //! Loads `~/.duduclaw/shared/wiki/.scope.toml` and decides whether a write to
-//! `shared_wiki_write` is allowed for a given top-level namespace.
+//! a shared-wiki write (`wiki_write` with `scope="shared"`) is allowed for a
+//! given top-level namespace.
 //!
 //! ## Policy file format
 //!
@@ -46,7 +47,7 @@ use tracing::warn;
 /// Namespace write-policy mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespaceMode {
-    /// Default — any agent that passes existing `shared_wiki_write` checks may write.
+    /// Default — any agent that passes the existing shared-wiki write checks may write.
     AgentWritable,
     /// Only writers whose [`WriterCapability`] matches `synced_from` may write.
     /// All other callers are denied.
@@ -295,7 +296,7 @@ pub struct NamespaceSnapshot {
 
 // ── Path helpers ─────────────────────────────────────────────────────────────
 
-/// Reserved policy filename — never permitted as a `shared_wiki_write` target.
+/// Reserved policy filename — never permitted as a shared-wiki write target.
 pub const SCOPE_POLICY_FILENAME: &str = ".scope.toml";
 
 /// WP7 built-in department access rule for the `departments/` shared-wiki

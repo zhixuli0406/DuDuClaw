@@ -224,7 +224,7 @@ impl MethodHandler {
     // ── Migrate-from handlers ───────────────────────────────
 
     /// `migrate.scan` — dry-run migration plan. Spawns `current_exe
-    /// migrate-from <platform> --json [--source <abs>]`, 60s timeout, returns
+    /// migrate from <platform> --json [--source <abs>]`, 60s timeout, returns
     /// the parsed JSON verbatim. Fail-closed: any spawn/timeout/parse failure
     /// is an error frame carrying the reason — never fabricated data.
     pub(crate) async fn handle_migrate_scan(&self, params: Value) -> WsFrame {
@@ -273,7 +273,7 @@ impl MethodHandler {
         };
 
         let mut cmd = tokio::process::Command::new(&exe);
-        cmd.arg("migrate-from").arg(&platform).arg("--json");
+        cmd.arg("migrate").arg("from").arg(&platform).arg("--json");
         if let Some(src) = source {
             cmd.arg("--source").arg(src);
         }
@@ -298,12 +298,12 @@ impl MethodHandler {
         let output = match tokio::time::timeout(dur, cmd.output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => {
-                return WsFrame::error_response("", &format!("spawn migrate-from failed: {e}"));
+                return WsFrame::error_response("", &format!("spawn migrate from failed: {e}"));
             }
             Err(_) => {
                 return WsFrame::error_response(
                     "",
-                    &format!("migrate-from timed out after {}s", dur.as_secs()),
+                    &format!("migrate from timed out after {}s", dur.as_secs()),
                 );
             }
         };
@@ -314,9 +314,9 @@ impl MethodHandler {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let tail = duduclaw_core::truncate_bytes(stderr.trim(), 500);
             let msg = if tail.is_empty() {
-                format!("migrate-from exited with status {}", output.status)
+                format!("migrate from exited with status {}", output.status)
             } else {
-                format!("migrate-from failed: {tail}")
+                format!("migrate from failed: {tail}")
             };
             return WsFrame::error_response("", &msg);
         }
@@ -327,7 +327,7 @@ impl MethodHandler {
             Ok(v) => WsFrame::ok_response("", v),
             Err(e) => WsFrame::error_response(
                 "",
-                &format!("could not parse migrate-from JSON output: {e}"),
+                &format!("could not parse migrate from JSON output: {e}"),
             ),
         }
     }

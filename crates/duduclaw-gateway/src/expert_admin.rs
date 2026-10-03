@@ -12,7 +12,7 @@
 //! (format detection, safe_zip extraction, prompt-injection / skill-security
 //! scanning, agent scaffolding). It is entangled with cli-only scaffolding
 //! helpers, so the gateway RPC reuses it by spawning
-//! `duduclaw expert install <path>` as a subprocess (same pattern as
+//! `duduclaw pack install <path>` as a subprocess (same pattern as
 //! `doctor_probes` spawning `duduclaw mcp-server`).
 
 use std::path::{Path, PathBuf};

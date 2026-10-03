@@ -1,6 +1,6 @@
 //! WP2.2 R2/R3 — pack registry consumption and publishing.
 //!
-//! Consumption: `duduclaw expert install registry:<slug>` resolves the slug
+//! Consumption: `duduclaw pack install registry:<slug>` resolves the slug
 //! against the registry index (raw GitHub by default, `DUDUCLAW_REGISTRY_URL`
 //! to override), then enforces the registry's trust rules CLIENT-side — the
 //! index being compromised must not be enough to ship a tampered archive:
@@ -250,7 +250,7 @@ pub async fn fetch_verified_archive(slug: &str) -> Result<(RegistryEntry, Vec<u8
         return Err(cfg("registry entry 的 archive_url 必須是 https".to_string()));
     }
 
-    // Archive download (reuses the same size posture as expert install's
+    // Archive download (reuses the same size posture as the pack installer's
     // MAX_UNPACK_BYTES; the zip fence re-checks on extraction).
     let archive = fetch_small(
         &entry.archive_url,

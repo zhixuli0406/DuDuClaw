@@ -2,7 +2,7 @@
 memory_eval/cron_runner.py
 評測系統 Cron Job 主入口
 
-對接 DuDuClaw schedule_task 系統
+對接 DuDuClaw 例行工作系統（MCP tasks_create 帶 schedule）
 CLI 用法：python -m memory_eval.cron_runner [smoke_test|weekly_kpis|monthly_locomo]
 
 Cron 排程（依規格 §4.1）：

@@ -106,7 +106,7 @@ WikiFts SQLite virtual table
      v
 Search queries:
   wiki_search("rate limiting", min_trust=0.5, layer="core")
-  shared_wiki_search("SOP", expand=true)
+  wiki_search("SOP", scope="shared", expand=true)
 ```
 
 ### 搜尋過濾器
@@ -205,7 +205,7 @@ Report candidate duplicates:
 
 **一套工具，兩個 wiki。** `wiki_ls` / `wiki_read` / `wiki_write` / `wiki_search` / `wiki_stats` / `wiki_lint` 都吃一個 `scope` 參數：`"agent"`（預設，就是你自己的 wiki，行為不變）或 `"shared"`（跨 agent 的共享 wiki）。`wiki_share` 把你 wiki 裡的頁面複製進共享 wiki；`shared_wiki_delete` 保留原名，因為 agent-local 那側刻意沒有刪除入口。
 
-六個 `shared_wiki_*` 寫法（`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`）仍可使用，屬棄用別名，落在完全相同的 handler 上，v1.69.0 移除。見[已棄用名稱](../../guides/zh-TW/deprecations.md)。
+六個 `shared_wiki_*` 寫法（`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`）已在 v1.69.0 移除，不再出現在 `tools/list`，呼叫時會收到指名替代寫法的錯誤（`wiki_*` 帶 `scope="shared"`）。見[棄用與移除](../../guides/zh-TW/deprecations.md)。
 
 ### 命名空間 SoT 政策（`.scope.toml`）
 
@@ -239,7 +239,7 @@ mode         = "operator_only"
 | `read_only` | ❌ 拒絕 | ✅ 允許 | ✅ 允許 |
 | `operator_only` | ❌ 拒絕 | ❌ 拒絕 | ✅ 允許 |
 
-`shared_wiki_write` 與 `shared_wiki_delete` 都會遵守該政策。未列出的命名空間預設為 `agent_writable`；該政策*只會收緊*，絕不放寬。
+`wiki_write`（`scope="shared"`）與 `shared_wiki_delete` 都會遵守該政策。未列出的命名空間預設為 `agent_writable`；該政策*只會收緊*，絕不放寬。
 
 **Fail-safe（故障安全）：** 檔案不存在 ⇒ 無政策 ⇒ 維持既有行為。TOML 格式錯誤 ⇒ 記錄警告 + 視同無政策。gateway 絕不會被一個損壞的政策檔案卡住。
 
@@ -249,7 +249,7 @@ mode         = "operator_only"
 
 ### 部門級讀取可見範圍（`visible_to_departments`）
 
-上面的 `mode` 管的是「誰能寫入」一個命名空間。要管「誰能在**部門**層級讀取」，在同一個 `[namespaces."x"]` 表格底下加一個 `visible_to_departments` 陣列。只有 `[agent] department` 落在清單上的 Agent 才看得到那個命名空間，不論是**prompt 注入**（自動注入的 L0/L1 頁面），還是透過 **`shared_wiki_search` / `shared_wiki_read` / `shared_wiki_ls`**。
+上面的 `mode` 管的是「誰能寫入」一個命名空間。要管「誰能在**部門**層級讀取」，在同一個 `[namespaces."x"]` 表格底下加一個 `visible_to_departments` 陣列。只有 `[agent] department` 落在清單上的 Agent 才看得到那個命名空間，不論是**prompt 注入**（自動注入的 L0/L1 頁面），還是透過 **`wiki_search` / `wiki_read` / `wiki_ls`（`scope="shared"`）**。
 
 ```toml
 # HR 頁面只有 hr 與 legal 部門能讀

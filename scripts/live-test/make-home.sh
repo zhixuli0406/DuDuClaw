@@ -8,6 +8,13 @@
 # `prod-shaped` (agent.toml written like a production employee, including the
 # Claude CLI wildcard allowlist `mcp__duduclaw__*`). No secrets are written;
 # the gateway provisions the MCP key and identity files itself on first boot.
+#
+# Also creates an empty operating-system home at <target-dir>/os-home. Start
+# the gateway with HOME pointing at it (the printed command does): the gateway
+# and the AI CLI it spawns look for logins and settings under HOME, so a
+# gateway started with only DUDUCLAW_HOME changed would use the operator's own
+# CLI login and quota, and an Antigravity API-key setting would rewrite the
+# operator's own settings file.
 set -euo pipefail
 
 PORT=18977
@@ -16,7 +23,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="${2:-}"; shift 2 ;;
     --port=*) PORT="${1#--port=}"; shift ;;
-    -h|--help) sed -n 2,11p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n 2,17p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) if [ -n "$TARGET" ]; then echo "only one target-dir allowed" >&2; exit 2; fi
        TARGET="$1"; shift ;;
@@ -50,8 +57,8 @@ if [ -e "$TARGET" ] && [ -n "$(ls -A "$TARGET" 2>/dev/null)" ]; then
   echo "refusing: $TARGET exists and is not empty" >&2; exit 1
 fi
 
-mkdir -p "$TARGET/agents/plain" "$TARGET/agents/prod-shaped"
-chmod 700 "$TARGET"
+mkdir -p "$TARGET/agents/plain" "$TARGET/agents/prod-shaped" "$TARGET/os-home"
+chmod 700 "$TARGET" "$TARGET/os-home"
 
 cat > "$TARGET/config.toml" <<TOML
 [gateway]
@@ -211,10 +218,13 @@ cat <<OUT
 Live-test home created: $TARGET
   gateway port : $PORT (loopback)
   employees    : plain, prod-shaped
+  os home      : $TARGET/os-home (empty; start the gateway with HOME set to it)
 
 Next:
-  export DUDUCLAW_HOME="$TARGET"
-  duduclaw run --yes          # boots once and writes each agent's .mcp.json
+  HOME="$TARGET/os-home" DUDUCLAW_HOME="$TARGET" duduclaw run --yes
+                              # boots once and writes each agent's .mcp.json
+                              # (HOME is replaced so the spawned AI CLI cannot
+                              # use your own login, quota or settings)
   scripts/live-test/mcp-probe.sh "$TARGET" plain
   scripts/live-test/mcp-probe.sh "$TARGET" prod-shaped
 OUT

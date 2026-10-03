@@ -13,8 +13,8 @@ use super::*;
 /// on real machines — typical in minimal Docker images with no
 /// `/etc/localtime`). Callers should fall back to UTC.
 ///
-/// Introduced in v1.8.25 so `schedule_task` stops surprising users by
-/// silently evaluating cron expressions in UTC when they meant local.
+/// Used so a cron schedule created without `cron_timezone` is evaluated in
+/// the host's local zone rather than silently in UTC.
 pub(crate) fn detect_local_timezone() -> Option<String> {
     let name = iana_time_zone::get_timezone().ok()?;
     // Round-trip through chrono-tz so we only ever hand back names the
@@ -340,11 +340,6 @@ pub(crate) fn build_params_summary(tool_name: &str, args: &Value) -> String {
                 .map(|a| a.len())
                 .unwrap_or(0);
             format!("tier={tier} tools={tools}")
-        }
-        "schedule_task" => {
-            let task_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-            let agent = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
-            format!("type={task_type} agent_id={agent}")
         }
         "update_cron_task" => {
             let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("?");

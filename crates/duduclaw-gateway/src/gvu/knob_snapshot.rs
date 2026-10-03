@@ -155,7 +155,7 @@ mod tests {
         fs::write(
             home.path().join("config.toml"),
             "[goal_loop]\niteration_cap = 8\nresume_on_restart = \"auto\"\n\n\
-             [dispatch]\ntwo_stage_judge = false\njudge = \"human_only\"\nadmission = \"fail\"\n",
+             [dispatch]\ntwo_stage_judge = false\njudge = \"external\"\nadmission = \"fail\"\n",
         )
         .unwrap();
         fs::write(
@@ -168,11 +168,34 @@ mod tests {
         assert_eq!(snap.iteration_cap, 8);
         assert_eq!(snap.resume_on_restart, "auto");
         assert!(!snap.two_stage_judge);
-        assert_eq!(snap.judge_mode, "human_only");
+        assert_eq!(snap.judge_mode, "external");
         assert_eq!(snap.admission_mode, "fail");
         assert_eq!(snap.noise_band_cases, 0.08);
         // holdout re-derives from the overridden cases band (half of it).
         assert_eq!(snap.noise_band_holdout, 0.04);
+    }
+
+    /// v1.69.0 removed `evaluator_only` / `human_only`. A value still left in
+    /// `config.toml` is recorded under the same token snapshots carried
+    /// before the removal (an old alias normalises to it), so `aee_round`
+    /// events from either side of the upgrade compare directly.
+    #[test]
+    fn removed_judge_modes_keep_their_historical_token() {
+        let home = tempfile::tempdir().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+        for (raw, want) in [
+            ("human_only", "human_only"),
+            ("human", "human_only"),
+            ("evaluator_only", "evaluator_only"),
+            ("evaluator", "evaluator_only"),
+        ] {
+            fs::write(
+                home.path().join("config.toml"),
+                format!("[dispatch]\njudge = \"{raw}\"\n"),
+            )
+            .unwrap();
+            assert_eq!(capture(home.path(), agent_dir.path()).judge_mode, want, "raw = {raw}");
+        }
     }
 
     #[test]

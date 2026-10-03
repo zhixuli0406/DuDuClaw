@@ -219,7 +219,7 @@ port = 18789
 # builtin_sources = true  # Also route DuDuClaw's own high-output read-only MCP
 #                         # tools (db_select / db_query / csv_read / xlsx_read /
 #                         # file_read / web_fetch_cached / web_extract /
-#                         # shared_wiki_read / wiki_read / memory_search /
+#                         # wiki_read / memory_search /
 #                         # memory_fetch_batch). Inert while `enabled = false`,
 #                         # and a result under min_compress_bytes is untouched
 #                         # either way. Set false to route only the entries
@@ -374,7 +374,7 @@ port = 18789
 # [dispatch]
 # enabled = true             # Background dispatch engine + goal-loop driver (on since v1.59)
 # policy = "fixed_hierarchy" # fixed_hierarchy | round_robin | llm_select | role_team
-# judge = "mav"              # mav (default) | evaluator_only | external | human_only
+# judge = "mav"              # mav (default) | external (evaluator_only / human_only were removed in v1.69.0)
 # judge_command = []         # argv of the external judge; required when judge = "external"
 # judge_timeout_secs = 120   # External-judge timeout, clamped to [1, 3600]
 # two_stage_judge = true     # Run the cheap first-stage evaluator before the MAV panel
@@ -402,7 +402,7 @@ port = 18789
 # override. Both are optional; unset ⇒ the judge uses the ordinary utility
 # model ([runtime] utility_provider / utility_model), exactly as before.
 #
-# judge_provider = "antigravity"        # A runtime id: claude | codex | antigravity | … (gemini is deprecated in v1.67.0, removed in v1.69.0)
+# judge_provider = "antigravity"        # A runtime id: claude | codex | antigravity | … (gemini is deprecated in v1.67.0, removed in v1.70.0)
 # judge_model = "gemini-3-pro-preview"   # Model id within that runtime
 #
 # Rules:
@@ -759,7 +759,7 @@ port = 18789
 # tools run, so unreviewed outside text cannot drive a high-risk call.
 # [provenance]
 # policy = "off"               # off | warn | enforce; an unknown value is treated as off
-# sensitive_tools = []         # e.g. ["send_to_agent", "shared_wiki_write"]
+# sensitive_tools = []         # e.g. ["send_to_agent", "wiki_write"]
 
 # ── Decision Lab kill switch ────────────────────────────────
 # The decision-twin line is exploratory: its own spec says so, and it has

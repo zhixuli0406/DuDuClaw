@@ -92,7 +92,7 @@ fn tool_window_matches_agent_and_time_range_only() {
     let inside = ToolCallRow {
         ts: ts(1, 2).to_rfc3339(),
         agent_id: "bruno".into(),
-        tool: "shared_wiki_read".into(),
+        tool: "wiki_read".into(),
         ok: true,
         preview: "path=sop".into(),
     };

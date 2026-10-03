@@ -21,7 +21,7 @@
 | Telegram Mini App 承認カード(v1.55) | 高リスク承認カードにオプトインの「詳細を見る」web-app ボタン——完全な説明、事前シミュレーションの結果、期限カウントダウン、承認/拒否;署名付き `initData` 検証、ボタン押下と同一の認可([43-telegram-miniapp.md](43-telegram-miniapp.md)) |
 | 学習パイプラインの可観測性(v1.56) | `source_facts` を記録したルールはソース事実が置換されると `source-stale` フラグ(注入時に降格 + ラベル);閾値を超えた統合失敗を理由付きで記録(`consolidation_failures.jsonl`);会話パスのルール決算も held-out ゲート経由に;帰納型 shadow 候補が会話側でもようやくサンプル外のサンプルを蓄積するように |
 | エディションと設定の強化(v1.56) | 個人版の同時実行上限は「同時実行中のゴールタスク数」(デフォルト 2、拒否せずキュー、fail-open;RFC-27)。エージェント数の上限ではない;チーム版専用画面はゲートウェイのディスパッチ入口でサーバー側ブロック;`agent.toml [model] account_pool` が実際にローテーション候補を絞る;ダッシュボードのエージェント作成はモデルの明示選択必須 |
-| 真の ACP サーバー(v1.57) | `duduclaw acp` が Agent Client Protocol v1(stdio JSON-RPC)を実装——Zed / JetBrains / nvim の agent panel が通信チャネルと同一のゲートウェイ返信パイプラインでエージェントと対話、`tool_call` / `plan` / メッセージチャンクをストリーミング;A2A の `acp-server` コマンドは無変更 |
+| 真の ACP サーバー(v1.57) | `duduclaw acp` が Agent Client Protocol v1(stdio JSON-RPC)を実装——Zed / JetBrains / nvim の agent panel が通信チャネルと同一のゲートウェイ返信パイプラインでエージェントと対話、`tool_call` / `plan` / メッセージチャンクをストリーミング;A2A の `acp server` コマンドは無変更 |
 | Remote MCP + OAuth 2.1(v1.57) | 仕様ネイティブの `POST /mcp` エンドポイント(バージョンネゴシエーション、ステートレスモード、Origin アンカーの許可リスト)+ 最小かつ完全な OAuth 2.1(RFC 9728/8414/7591、PKCE S256、オペレーター同意、refresh ローテーション)——claude.ai カスタムコネクタ / Claude モバイル / MCP Inspector がセルフホストの DuDuClaw に直接接続可能 |
 | 5 チャネルのテキスト裁決(v1.57) | 決定カードへの返信でメッセージ全体が裁決語(承認/拒否/再試行/完了/中止/一時停止、中英対応)ならボタン押下と同等——Telegram / Discord / Slack / LINE / Teams、同一の認可・重複押下保護・アクション率計測;スマートウォッチのワンタップ決定の欠落を補完 |
 | ローカルモデルマーケットプレイス(v1.57) | 用途を選ぶ → 実機メモリから算出したハードウェア適合ランプ → ワンクリックインストール(検証済み 5 発行者の HF ソースから量子化を自動選択);MoE 二重判定により 16GB マシン上の 30B-A3B 級モデルに「エキスパートオフロード可」のフラグを付ける([45-local-model-marketplace.md](45-local-model-marketplace.md)) |
@@ -35,7 +35,7 @@
 | ゴール単位の契約フィールド + 自主研究(v1.59) | ゴール作成時に `duration_hours`(期限超過 → needs_human)と `risk_boundary`(空なら 5 行のベースライン)を設定可能、毎ラウンド注入され MAV の safety 観点の基準に;`/goal` は `時限:`/`邊界:` セグメント対応;構造化予測を任意で要求可能;当日の信念を外したエージェントには夜間の自主研究ゴールを自動割り当て |
 | ディスパッチエンジンのデフォルト有効化 + スケジューラ生存性(v1.59) | `[dispatch] enabled` デフォルトを true に(割り当てたゴールが箱出しで実行される)、ダッシュボードでホット切替;cron/heartbeat ループが 5 分以上停止すると `/healthz` が 503——スケジューラ全滅中もコンテナが healthy 表示だった事故を封じる |
 | 二段階裁決 + 判定の強化(v1.60) | MAV 判定団の前に安価な第一段階評価器(`continue`/`candidate_complete`/`blocked`、デフォルト on;いかなる障害も完全 MAV へ降格、自動合格は絶対にしない);判定規律 4 条(反ラチェット、監査のみで証拠を自作しない、契約外拡張禁止、自己申告の完了は証拠でない);切り詰められたパネル JSON と先頭トークン `PASS` の 2 つの誤検出穴を封鎖;gap 指紋による停滞検出;早期切り上げ検出;`resume_on_restart` デフォルト `pause` |
-| 差し替え可能な判定 seam(v1.60) | `[dispatch] judge = mav / evaluator_only / external / human_only`(`evaluator_only` と `human_only` は v1.66.0 から非推奨、v1.69.0 で削除)。外部判定の障害は常に MAV へ降格(より厳格、監査記録付き)、その feedback は未信頼 DATA として処理;未知の値は `mav` にフォールバック;設定→自動化にセレクタ |
+| 差し替え可能な判定 seam(v1.60) | `[dispatch] judge = mav / evaluator_only / external / human_only`(`evaluator_only` と `human_only` は v1.69.0 で削除。設定に残った値の扱いは[非推奨と削除](../../guides/ja-JP/deprecations.md)を参照)。外部判定の障害は常に MAV へ降格(より厳格、監査記録付き)、その feedback は未信頼 DATA として処理;未知の値は `mav` にフォールバック;設定→自動化にセレクタ |
 | ゴール契約の凍結(v1.60) | 作成時に受け入れ基準を不変の `acceptance_criteria_baseline` として凍結、判定と評価器はこのベースラインのみを読む;エージェント身分による goal タスクの受け入れ基準・`title`・`description` の変更は拒否 + 監査記録;基準なしの `/goal` には 4 要素ガイダンスと outcome 式基準の提案を付与 |
 | ゴールループの人間シグナル + アドミッションキュー(v1.60) | needs_human に閉じた 6 分類の `pause_reason`(トリガー現場で静的スタンプ、LLM の記述から逆解析しない);超過進捗レポート(`progress_report_minutes`);LLM ゼロのツール連打アドバイザリ(3/5/8 段階);ephemeral spawn の上限超過は有界 FIFO キューに(デフォルト `queue`);予算枯渇時は「ベストラウンド成果物」を引き渡し(決定論的選択 + ギャップ一覧、手ぶらエスカレーションの廃止) |
 | Agent Mail(v1.60) | エージェントごとのメールボックス(`/mail` ページ):Gmail API / drop folder 受信、送信は常にドラフト作成 → ApprovalBroker 確認待ち(実送信はバックグラウンドワーカーのみ)、メール内容は DATA フェンス、外部付与不可の専用 scope、エージェント横断の閲覧は組織権限判定を通過([47-agent-mail.md](47-agent-mail.md)) |
@@ -46,7 +46,7 @@
 | 10 チャネル通知統一(v1.60) | autopilot `notify`、MCP `send_message`、リマインダーがすべて共有 `create_sender` ファクトリ経由の 10 チャネル対応に(WebChat は誠実に拒否)——一度も配信されたことのなかった autopilot Slack 通知の生きた bug と Google Chat / Teams の静かなスキップ欠陥を修正 |
 | 進化計測の強化(v1.60) | AEE コミットゲートを visible / held-out の 2 次元に分離(fence-only:拒否のみ可能で昇格には使えない);チャンピオン bootstrap を同形計測に;`duduclaw evolution clear-holdout-rotation` オペレーター出口;ラウンドごとに 14 ノブのスナップショットを `aee_round` イベントへ |
 | cron 曜日規約の修正(v1.61、**BREAKING**) | 数値曜日フィールドをパース時に Unix crontab 規約(0/7=日曜、1-5=月〜金)から `cron` crate の Quartz 序数へ変換、スケジューラ/heartbeat/MCP 検証/ダッシュボードが同一 normaliser を共有——従来 `* * 1-5` は日曜〜木曜に発火していた(日曜のゴースト発火 + 金曜の静かなスキップ);意図的に Quartz 規約で書かれたスケジュールはアップグレード後 1 日ずれる |
-| `duduclaw migrate-from claude-code`(v1.61) | Claude Code の memory shard(→ semantic + SPO 時間記憶)、CLAUDE.md(→ エージェント wiki の context 層、注入予算を消費しない)、セッション書き起こし(ノイズ除去で人間 prompt + assistant 最終返信のみ——実測で有効シグナルは約 1.5%)の一方向インポート;すべて `origin=import`(trust ≤ 0.7)、DATA 扱い、redaction デフォルト on、インジェクションスキャン通過、skill は fail-closed のセキュリティスキャン;`--apply` なしでは何も書き込まない |
+| `duduclaw migrate from claude-code`(v1.61) | Claude Code の memory shard(→ semantic + SPO 時間記憶)、CLAUDE.md(→ エージェント wiki の context 層、注入予算を消費しない)、セッション書き起こし(ノイズ除去で人間 prompt + assistant 最終返信のみ——実測で有効シグナルは約 1.5%)の一方向インポート;すべて `origin=import`(trust ≤ 0.7)、DATA 扱い、redaction デフォルト on、インジェクションスキャン通過、skill は fail-closed のセキュリティスキャン;`--apply` なしでは何も書き込まない |
 | チャネル能力テーブル(v1.61) | `channel_capabilities.rs` が 11 チャネル × 7 能力(ファイル/写真アップロード、対話ボタン、その場編集、typing、ネイティブ markdown、引用返信)+ 進捗スロットル秒数の単一権威;未対応の能力は静かな no-op から構造化ログへ |
 | minimal_context コンテキスト削減(v1.61) | 公式 CLI の全 spawn にキュレーション済み `--tools` リスト + `--setting-sources project,local`(agent-file-guard hook は維持):実測で固定オーバーヘッド 35,892 → 10,974 tokens/spawn(約 69% 削減);`estimate_tokens` の CJK 再校正(約 22% の過小評価を修正);MCP `tools/list` を呼び出し元 capability でフィルタ(discoverable ⊆ callable) |
 | 認証情報 P2/P3(v1.61) | 再起動不要のローテーション——アカウントプール書き込みで rotator キャッシュ無効化、Telegram は毎ポーリングで token 再解決、6 つの webhook チャネルは受信署名を per-request 検証、Odoo は次回呼び出しで再接続(Discord/Slack の常駐 WS は要再起動);spawn env を許可リストで洗浄(すべての `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD` を除去、vendor キーは呼び出し元が明示注入);エージェント単位のオプトイン `[capabilities] git_credentials`(デフォルト off)で git push 用 SSH/GPG を復元(監査付き);secret:// 収斂第 2 ラウンド(account_rotator + mcp.rs) |
@@ -95,7 +95,7 @@
 | Aider 式コードシンボルグラフ(`code_map` MCP ツール) | tree-sitter シンボルグラフを HippoRAG-lite Personalized-PageRank エンジン上で実行し、クエリとの関連度でリポジトリのソースファイルをランク付け |
 | セマンティックベクトル記憶(`w_vec`) | FTS/graph に加えた第三の re-rank シグナル。依存ゼロ・CJK 安全の `NgramHashEmbedder`、`DUDUCLAW_SEMANTIC_VECTORS=1` で有効化 |
 | セッション横断ユーザープロファイル | ユーザーごとの嗜好 traits(temporal supersession)→ セッション安定な `## About This User` を返信に注入（gateway の抽出と承認済みの審査から）。`user_profile_record` / `user_profile_get` MCP ツールは gateway が起動する全従業員で共有される別の名前空間を読み書きするため、このブロックには反映されない（既知の制限、v1.67.1） |
-| GDPR エクスポート/消去 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`(旧表記 `gdpr export` は v1.69.0 まで引き続き解釈される)が記憶(triple + 本文言及 + key_facts、4 テーブルのカスケード、SHA-256 仮名 tombstone)**と**セッションストア(`<channel>:<chat_id>` プレフィックス)を対象 |
+| GDPR エクスポート/消去 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`(旧表記 `gdpr export` は v1.69.0 で削除)が記憶(triple + 本文言及 + key_facts、4 テーブルのカスケード、SHA-256 仮名 tombstone)**と**セッションストア(`<channel>:<chat_id>` プレフィックス)を対象 |
 | Custom Dashboard Widgets | サンドボックス化されたランタイムで動作する、AI ガイドまたは生 HTML のダッシュボードカード。Widget Studio での共有/インポート/エクスポート([30-custom-widgets.md](30-custom-widgets.md)) |
 | 予算サーキットブレーカー | エージェント単位のスライディングウィンドウ上限(`[budget] daily_cap_cents`)。上限到達で choke-point にて LLM 呼び出しを遮断。`budget_events.jsonl` |
 | バーンレート異常検知 | エージェントごとの日次支出に対し移動平均+標準偏差で外れ値を検出(`cost_anomaly.rs`) |
@@ -119,7 +119,7 @@
 |------|------|
 | マルチランタイム AI エージェントプラットフォーム | 統一 `AgentRuntime` trait。`runtime_catalog.rs` に 13 のランタイム id：12 の CLI バックエンド（Claude、Codex、Gemini（非推奨）、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）と OpenAI-compat HTTP、自動検出付き（[13-multi-runtime.md](13-multi-runtime.md)） |
 | MCP Server（JSON-RPC 2.0）| stdin/stdout 経由で AI Runtime に 249 ツールを公開（v1.67.0。`tools/list` は呼び出し元が呼べるものだけにフィルタ）。`<agent>/.mcp.json` に登録（v1.8.5、Claude CLI `-p` はプロジェクトレベルのみ読取）、ゲートウェイが起動時に自動生成/修復 |
-| ACP/A2A Server | 2 コマンド：`duduclaw acp`（= `duduclaw acp client`）は IDE agent panel 向け Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` ストリーミング、未設定時は `AUTH_REQUIRED`）；`duduclaw acp server`（旧 `acp-server`、v1.69.0 まで引き続き解釈される）は A2A プロトコル（`agent/discover` / `message/send` / `tasks/*`、`/.well-known/agent-card.json` の Agent Card と旧 `/agent.json` の別名） |
+| ACP/A2A Server | 2 コマンド：`duduclaw acp`（= `duduclaw acp client`）は IDE agent panel 向け Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` ストリーミング、未設定時は `AUTH_REQUIRED`）；`duduclaw acp server`（旧 `acp-server`、v1.69.0 で削除）は A2A プロトコル（`agent/discover` / `message/send` / `tasks/*`、`/.well-known/agent-card.json` の Agent Card と旧 `/agent.json` の別名） |
 | エージェントディレクトリ構造 | `.claude/`, `.mcp.json`, `SOUL.md`, `CLAUDE.md`, `CONTRACT.toml`, `agent.toml`, `wiki/`, `SKILLS/`, `memory/`, `tasks/`, `state/` |
 | サブエージェントオーケストレーション | `create_agent` / `spawn_agent` / `list_agents` + `reports_to` 階層 + D3.js OrgChart + 「## Your Team」自動注入 |
 | DelegationEnvelope | 構造化受け渡しプロトコル — context / constraints / task_chain / expected_output |
@@ -135,7 +135,7 @@
 |------|------|
 | Claude Runtime | Claude Code SDK (`claude` CLI) + JSONL ストリーミング + `--resume` ネイティブマルチターン |
 | Codex Runtime | OpenAI Codex CLI + `--json` ストリーミング、`AGENTS.md` で system prompt を渡す |
-| Gemini Runtime（v1.67.0 で非推奨、v1.69.0 で削除予定。Antigravity を使用）| Google Gemini CLI + `--output-format stream-json`、`GEMINI_SYSTEM_MD` env で system prompt、承認モードはエージェントの capability から導出（デフォルト `auto_edit`、読み取り専用エージェントには `--sandbox` を追加、`yolo` はフルアクセスのエージェントのみ）。Google が 2026-06-18 に個人向け Gemini CLI を廃止後、有料 `GEMINI_API_KEY` 利用者向けに維持 |
+| Gemini Runtime（v1.67.0 で非推奨、v1.70.0 で削除予定。Antigravity を使用）| Google Gemini CLI + `--output-format stream-json`、`GEMINI_SYSTEM_MD` env で system prompt、承認モードはエージェントの capability から導出（デフォルト `auto_edit`、読み取り専用エージェントには `--sandbox` を追加、`yolo` はフルアクセスのエージェントのみ）。Google が 2026-06-18 に個人向け Gemini CLI を廃止後、有料 `GEMINI_API_KEY` 利用者向けに維持 |
 | Antigravity Runtime（v1.24.0）| Google Antigravity CLI（`agy`、2026-06-18 の Gemini CLI 後継）、ワンショット `agy -p --dangerously-skip-permissions --print-timeout 300s` で駆動。バイナリ自動解決（PATH → `~/.local/bin/agy`）；`--system` フラグがないため system prompt + 履歴をプロンプトに埋め込み（CJK セーフ）；認証は Google サインイン（ホストのターミナルで `agy` を実行）または API キーモード（`config.toml [antigravity] auth = "api_key"` + Gemini API キー）；MCP ツールは各エージェントのワークスペースの `.agents/mcp_config.json` に登録；エージェントのディレクトリを agy の `trustedWorkspaces` に事前登録（クロスプロセスロック）し、ヘッドレスの信頼ダイアログでのハングを回避；トークン使用量は推定（print モードは統計なし）|
 | Grok Runtime（R4）| xAI Grok CLI(「Grok Build」)。oneshot の `grok -p` で駆動(2026-07-13 に docs.x.ai と照合して検証)。バイナリは `grok`(curl でインストール。サードパーティの `grok-cli` はフォールバック探索)。`--model` でモデル選択。`--tools`/`--disallowed-tools` による制限(+ `native_sandbox` のハードゲート)。system prompt と履歴はプロンプトに埋め込み(CJK-safe)。duduclaw MCP server は `[mcp_servers.duduclaw]` の TOML として agent ごとの `<agent_dir>/.grok/config.toml` に書き込み(+ agent の識別情報は spawn env で引き継ぎ)。認証は `XAI_API_KEY` env。トークン使用量は推定(プレーン stdout)。**未解決項目**(実機 CLI が必要):`--tools` リストの区切り文字、`mcp_servers` 用のプロジェクトローカル `config.toml` 探索、実使用量のための `--output-format json` スキーマ、完全な `--model` 一覧(`grok models`)。ドキュメントで確認済みなのは `grok-4.5` / `grok-build-0.1` のみ |
 | OpenAI 互換 Runtime | HTTP エンドポイント（MiniMax / DeepSeek 等）REST API |
@@ -217,7 +217,7 @@
 | Dedup 検出 | `wiki_dedup` — タイトルマッチ + タグ Jaccard 類似度（≥0.8） |
 | 逆 backlink 索引 | `related` frontmatter + body markdown リンクをスキャン |
 | 検索フィルタ | `min_trust` / `layer` / `expand`（1-hop related/backlink 拡張） |
-| 共有 Wiki | `~/.duduclaw/shared/wiki/` — 組織横断 SOP/ポリシー/仕様、`wiki_visible_to` 可視性制御；MCP ツール `wiki_ls/read/write/search/stats/lint` を `scope="shared"` で使用（`shared_wiki_*` 表記は非推奨の別名で v1.69.0 で削除）、加えて `shared_wiki_delete` と `wiki_share`；`.scope.toml` SoT ポリシー（「アイデンティティとアクセス」参照）|
+| 共有 Wiki | `~/.duduclaw/shared/wiki/` — 組織横断 SOP/ポリシー/仕様、`wiki_visible_to` 可視性制御；MCP ツール `wiki_ls/read/write/search/stats/lint` を `scope="shared"` で使用（6 つの `shared_wiki_*` 表記は v1.69.0 で削除）、加えて `shared_wiki_delete` と `wiki_share`；`.scope.toml` SoT ポリシー（「アイデンティティとアクセス」参照）|
 | CLAUDE_WIKI テンプレート | 新規エージェント作成時に CLAUDE.md へ同梱、LLM に wiki MCP ツールの使い方を教示 |
 
 ## スキルエコシステム
@@ -338,7 +338,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永続化（v1.8.12）。スケジュールは `tasks_create` + `schedule` で作成（旧 `schedule_task` ツールは非推奨の別名で v1.69.0 で削除） |
+| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永続化（v1.8.12）。スケジュールは `tasks_create` + `schedule` で作成（旧 `schedule_task` ツールは v1.69.0 で削除） |
 | ReminderScheduler | 一度限りのリマインダー（相対 `5m`/`2h`/`1d` または ISO 8601）、`direct` / `agent_callback` モード |
 | HeartbeatScheduler | エージェント毎統一スケジューリング — バスポーリング + GVU サイレンスブレイカー + cron |
 | スケジューラレベルのタスクボードプル（v1.9.3）| `poll_assigned_tasks` を `HeartbeatScheduler::run` tick へ移動 — 30s 毎に全エージェントレジストリを走査（`enabled=false` をスキップしない）；1 時間 LIKE-marker クールダウンでスタンピード防止 |
@@ -378,7 +378,7 @@
 | Identity Resolution（`duduclaw-identity`、RFC-21 §1、v1.11.0）| `IdentityProvider` async trait — `WikiCacheIdentityProvider`（`shared/wiki/identity/people/*.md`）、`NotionIdentityProvider`（Notion `databases/query` + `field_map`）、`ChainedProvider`（cache → upstream、障害時は優雅にデグレード）|
 | `identity_resolve` MCP ツール | `Scope::IdentityRead` でゲート、標準 `ResolvedPerson` レコードを返却 |
 | Sender 自動注入 | チャネル返信が XML 区切りの `<sender>` ブロックを system prompt へ注入（ターン毎に 1 回解決）、SOUL.md「非メンバー拒否」ルールをデータ駆動化 |
-| 共有 Wiki SoT ポリシー（RFC-21 §3、v1.11.0）| `~/.duduclaw/shared/wiki/.scope.toml` が名前空間所有権を宣言 — `agent_writable`（デフォルト）、`read_only { synced_from }`、`operator_only`；`shared_wiki_write` / `shared_wiki_delete` が遵守；`wiki_namespace_status` が現行ポリシーを公開；ファイル欠如/不正 ⇒ フェイルセーフでポリシーなし |
+| 共有 Wiki SoT ポリシー（RFC-21 §3、v1.11.0）| `~/.duduclaw/shared/wiki/.scope.toml` が名前空間所有権を宣言 — `agent_writable`（デフォルト）、`read_only { synced_from }`、`operator_only`；`wiki_write`（`scope="shared"`）と `shared_wiki_delete` が遵守；`wiki_namespace_status` が現行ポリシーを公開；ファイル欠如/不正 ⇒ フェイルセーフでポリシーなし |
 
 ## Live Forking（RFC-26）
 

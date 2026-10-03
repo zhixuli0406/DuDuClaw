@@ -11,12 +11,17 @@
 # Exit 1 when a default tool is refused for the `prod-shaped` employee
 # (or when the server cannot be started); an `ERROR` line on any other employee is reported but does not change the exit code; exit 2 on usage errors.
 #
+# The server is started with HOME set to <home>/os-home (created empty when
+# missing), never the operator's own home, so nothing it spawns can pick up
+# the operator's logins or settings.
+#
 # The minted agent token and internal key only exist after the gateway has
-# booted once on that home, so run `duduclaw run` there first.
+# booted once on that home, so run `duduclaw run` there first (with
+# HOME=<home>/os-home, as make-home.sh prints).
 # Binary override: DUDUCLAW_BIN (only used when .mcp.json names no command).
 set -euo pipefail
 
-[ $# -ge 2 ] || { sed -n 2,15p "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ $# -ge 2 ] || { sed -n 2,21p "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 HOME_DIR="$1"; AGENT="$2"; shift 2
 TOOLS=("$@")
 DEFAULTS=0
@@ -27,9 +32,12 @@ fi
 
 MCP_JSON="$HOME_DIR/agents/$AGENT/.mcp.json"
 if [ ! -f "$MCP_JSON" ]; then
-  echo "missing $MCP_JSON: boot the gateway once on this home first (DUDUCLAW_HOME=$HOME_DIR duduclaw run --yes), it writes .mcp.json at boot" >&2
+  echo "missing $MCP_JSON: boot the gateway once on this home first (HOME=$HOME_DIR/os-home DUDUCLAW_HOME=$HOME_DIR duduclaw run --yes), it writes .mcp.json at boot" >&2
   exit 1
 fi
+
+mkdir -p "$HOME_DIR/os-home"
+chmod 700 "$HOME_DIR/os-home"
 
 export PROBE_MCP_JSON="$MCP_JSON" PROBE_AGENT="$AGENT" PROBE_HOME="$HOME_DIR" \
        PROBE_DEFAULTS="$DEFAULTS" PROBE_BIN="${DUDUCLAW_BIN:-duduclaw}"
@@ -53,9 +61,11 @@ cmd = os.environ["PROBE_BIN"] if "DUDUCLAW_BIN" in os.environ else entry.get("co
 if shutil.which(cmd) is None and not os.path.isfile(cmd):
     print(f"binary not found: {cmd}", file=sys.stderr); sys.exit(1)
 args = entry.get("args", ["mcp-server"])
-env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG") if k in os.environ}
+env = {k: os.environ[k] for k in ("PATH", "TMPDIR", "LANG") if k in os.environ}
 env.update(entry.get("env", {}))
 env["DUDUCLAW_HOME"] = os.path.realpath(os.environ["PROBE_HOME"])
+# Never the operator's own HOME: logins and CLI settings are looked up there.
+env["HOME"] = os.path.join(env["DUDUCLAW_HOME"], "os-home")
 env.setdefault("DUDUCLAW_AGENT_ID", agent)
 if env["DUDUCLAW_AGENT_ID"] != agent:
     print(f".mcp.json names agent {env['DUDUCLAW_AGENT_ID']!r}, expected {agent!r}", file=sys.stderr); sys.exit(1)

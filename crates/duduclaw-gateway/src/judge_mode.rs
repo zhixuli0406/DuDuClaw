@@ -18,25 +18,36 @@
 //! implementations (the doc's own criterion for grade S — `#[cfg(test)]`
 //! stubs explicitly do not count).
 //!
-//! ## The four modes
+//! ## The modes
 //!
 //! | `[dispatch] judge` | Behavior | Failure direction |
 //! |---|---|---|
-//! | `mav` (**default**) | Today's flow, unchanged: cheap [`PreAcceptanceEvaluator`](crate::dispatch_engine::PreAcceptanceEvaluator) first stage → three-aspect MAV panel | judge error ⇒ `needs_human` (pre-existing) |
-//! | `evaluator_only` | **Low-cost mode with deliberately weaker acceptance.** Only the cheap first-stage evaluator runs; its `candidate_complete` verdict accepts outright — the MAV panel is never paid for | evaluator absent / disabled / errored / timed out ⇒ `needs_human`, **never an auto-accept** |
+//! | `mav` (**default**) | Cheap [`PreAcceptanceEvaluator`](crate::dispatch_engine::PreAcceptanceEvaluator) first stage → three-aspect MAV panel | judge error ⇒ `needs_human` |
 //! | `external` | Spawn an operator-configured command ([`ExternalJudgeConfig`]); structured JSON on stdin, a JSON verdict on stdout | ANY defect (bad config, spawn failure, timeout, non-zero exit, unparseable verdict, injection-flagged feedback) ⇒ degrade to the **`mav` panel**, audited — a degrade never releases work |
-//! | `human_only` | Never machine-judged: every `review` task parks as `needs_human` | n/a — it is itself the maximal fail-closed mode |
 //!
 //! Any other value ⇒ `warn!` + `mav` (design §5 contract rule 2: unknown
 //! values fail loud, and the fallback is the *strongest* verifier, never the
 //! cheapest).
 //!
-//! ## Divergence from the design doc's value set (recorded honestly)
+//! ## Removed values (v1.69.0)
 //!
-//! §6-P1 names the first batch `mav | eval_backed | human_only`.
-//! `evaluator_only` and `external` are this WP's assignment; `human_only` is
-//! kept because §6-P1 requires it and it is the strictest mode in the table.
-//! **`eval_backed` is deliberately NOT a fourth mode** — it is `external` with
+//! `evaluator_only` and `human_only` (and their aliases `evaluator` /
+//! `human`) were removed in v1.69.0. They are still *recognised* on read so
+//! a leftover value never takes the unknown-value path, and they can no
+//! longer be written through `system.update_config`:
+//!
+//! | Leftover value | What runs | Why |
+//! |---|---|---|
+//! | `evaluator_only` | `mav` | the old single-evaluator accept was weaker; `mav` only tightens acceptance (and costs more) |
+//! | `human_only` | every review parks `needs_human` (`pause_reason = infra`) with a migration notice | falling back to `mav` would replace "a person confirms every item" with machine acceptance — a human gate silently removed |
+//!
+//! Each is warned about once per process and reported once per home through
+//! a `judge_mode_removed` audit row plus an Activity Feed notice.
+//! [`removed_judge_mode_finding`] is the pure check `duduclaw doctor` uses.
+//!
+//! ## `eval_backed` is not a mode
+//!
+//! The design doc's §6-P1 names `eval_backed`. It is `external` with
 //! `judge_command = ["duduclaw", "eval", …]`, so shipping it as its own
 //! enum arm would be a second subprocess implementation of a path that
 //! already exists. If a named preset is wanted later it belongs on top of
@@ -107,6 +118,14 @@ pub const EXTERNAL_JUDGE_SCHEMA: &str = "duduclaw.judge.v1";
 
 // ── Mode ────────────────────────────────────────────────────────────────
 
+/// The version that removed `evaluator_only` / `human_only`. One constant so
+/// every message, audit row and doctor finding names the same release.
+pub const JUDGE_MODES_REMOVED_IN: &str = "v1.69.0";
+
+/// The only values `system.update_config` (and therefore the dashboard) may
+/// write to `[dispatch] judge`.
+pub const WRITABLE_JUDGE_MODES: [&str; 2] = ["mav", "external"];
+
 /// Which acceptance-judge implementation `review_goal_tasks` routes through,
 /// parsed from `config.toml [dispatch] judge`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -115,70 +134,55 @@ pub enum JudgeMode {
     /// and the fallback every failure path lands on.
     #[default]
     Mav,
-    /// First-stage evaluator only — cheap, and **explicitly weaker
-    /// acceptance**. Never falls through to the panel; never auto-accepts on
-    /// its own malfunction either.
-    EvaluatorOnly,
     /// An operator-configured subprocess. Degrades to [`JudgeMode::Mav`] on
     /// every defect.
     External,
-    /// No machine acceptance at all — every review parks for a person.
-    HumanOnly,
+    /// `evaluator_only` (removed in v1.69.0) still present in `config.toml`.
+    /// Adjudicates exactly like [`JudgeMode::Mav`]: the old single-evaluator
+    /// accept was the weaker verifier, so the fallback only tightens
+    /// acceptance (and costs more).
+    RemovedEvaluatorOnly,
+    /// `human_only` (removed in v1.69.0) still present in `config.toml`.
+    /// Every review parks as `needs_human` with a migration notice. It is
+    /// recognised rather than treated as unknown on purpose: the unknown-value
+    /// path falls back to `mav`, which would turn "a person confirms every
+    /// item" into "the AI panel accepts on its own" — a human gate silently
+    /// removed.
+    RemovedHumanOnly,
 }
 
 impl JudgeMode {
-    /// Stable config/telemetry token. Never localise.
+    /// Stable config/telemetry token. Never localise. The removed variants
+    /// keep their historical spelling so knob snapshots and audit rows from
+    /// before and after the removal carry the same token.
     pub fn as_str(self) -> &'static str {
         match self {
             JudgeMode::Mav => "mav",
-            JudgeMode::EvaluatorOnly => "evaluator_only",
             JudgeMode::External => "external",
-            JudgeMode::HumanOnly => "human_only",
+            JudgeMode::RemovedEvaluatorOnly => "evaluator_only",
+            JudgeMode::RemovedHumanOnly => "human_only",
         }
     }
 
-    /// T5/O12 (feature audit 2026-09-29): the two modes nobody selected.
-    ///
-    /// The seam keeps **parsing** all four values — a deployment that already
-    /// has `evaluator_only` or `human_only` in `config.toml` keeps behaving
-    /// byte-identically — but the dashboard offers only `mav` / `external`,
-    /// and both the read path and the write path say so once. Scheduled for
-    /// removal in **v1.69.0** (two minor versions), per
-    /// `docs/guides/deprecations.md`.
-    ///
-    /// Replacements, stated so the warning is actionable:
-    /// - `evaluator_only` ⇒ `mav` (`[dispatch] two_stage_judge = true` already
-    ///   runs the cheap evaluator first, then pays for the panel only on a
-    ///   completion candidate — the cost motive is already covered).
-    /// - `human_only` ⇒ per-agent `[capabilities] autonomy_level` +
-    ///   `approval_required_tools`, which park work for a person without
-    ///   disabling machine adjudication platform-wide.
-    pub fn is_deprecated(self) -> bool {
-        matches!(self, JudgeMode::EvaluatorOnly | JudgeMode::HumanOnly)
-    }
-
-    /// The mode an operator should move a deprecated value to. `None` for a
-    /// supported mode.
-    pub fn deprecation_replacement(self) -> Option<&'static str> {
-        match self {
-            JudgeMode::EvaluatorOnly => Some("mav"),
-            JudgeMode::HumanOnly => Some("mav + [capabilities] autonomy_level"),
-            _ => None,
-        }
+    /// `true` for a value that is still recognised on read but can no longer
+    /// be written.
+    pub fn is_removed(self) -> bool {
+        matches!(self, JudgeMode::RemovedEvaluatorOnly | JudgeMode::RemovedHumanOnly)
     }
 
     /// Parse one raw config value. `None` ⇒ the value is **unknown** and the
     /// caller must fail loud (an empty/whitespace value is not unknown — it
-    /// reads as "unset" ⇒ `Mav`).
+    /// reads as "unset" ⇒ `Mav`). The removed values and their old aliases
+    /// parse to the `Removed*` variants, never to `None`.
     ///
     /// Exact token equality after trim + ASCII-lowercase, never substring
     /// matching (coding convention 2).
     pub fn from_config_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "mav" | "panel" => Some(JudgeMode::Mav),
-            "evaluator_only" | "evaluator" => Some(JudgeMode::EvaluatorOnly),
             "external" => Some(JudgeMode::External),
-            "human_only" | "human" => Some(JudgeMode::HumanOnly),
+            "evaluator_only" | "evaluator" => Some(JudgeMode::RemovedEvaluatorOnly),
+            "human_only" | "human" => Some(JudgeMode::RemovedHumanOnly),
             _ => None,
         }
     }
@@ -190,7 +194,8 @@ impl JudgeMode {
     /// absent key, or a non-string value all yield [`JudgeMode::Mav`]. An
     /// unrecognised *string* additionally `warn!`s — design §5 rule 2's
     /// "fail loud, never silently degrade", with `RuntimeType::parse`'s
-    /// silent-substitution as the named anti-pattern.
+    /// silent-substitution as the named anti-pattern. A removed value is
+    /// returned as its `Removed*` variant and warned about once per process.
     pub fn from_home(home_dir: Option<&Path>) -> Self {
         let Some(home_dir) = home_dir else {
             return JudgeMode::Mav;
@@ -216,17 +221,17 @@ impl JudgeMode {
                 }
                 Some(s) => match JudgeMode::from_config_str(s) {
                     Some(mode) => {
-                        // T5/O12: `from_home` runs once per reviewed task, so
-                        // the deprecation notice is emitted once per process
-                        // per mode — never on the hot path's every iteration.
-                        warn_once_if_deprecated(mode);
+                        // `from_home` runs once per reviewed task, so the
+                        // removal notice is emitted once per process per
+                        // mode — never on every iteration.
+                        warn_once_if_removed(mode);
                         mode
                     }
                     None => {
                         warn!(
                             value = %s,
                             "unknown [dispatch] judge — falling back to \"mav\" (the strongest verifier). \
-                             Valid: mav, evaluator_only, external, human_only"
+                             Valid: mav, external"
                         );
                         JudgeMode::Mav
                     }
@@ -236,29 +241,229 @@ impl JudgeMode {
     }
 }
 
-/// Emit the T5/O12 deprecation notice at most once per process per mode.
+/// Emit the removal warning at most once per process per mode.
 ///
 /// Deliberately not a plain `warn!` inside [`JudgeMode::from_home`]: that
 /// function is re-read once per reviewed task (the seam's hot-reload
 /// contract), so an unconditional warning would fill the log with the same
 /// line forever and train operators to ignore it.
-fn warn_once_if_deprecated(mode: JudgeMode) {
+fn warn_once_if_removed(mode: JudgeMode) {
     use std::sync::Once;
     static EVALUATOR_ONLY: Once = Once::new();
     static HUMAN_ONLY: Once = Once::new();
     let once = match mode {
-        JudgeMode::EvaluatorOnly => &EVALUATOR_ONLY,
-        JudgeMode::HumanOnly => &HUMAN_ONLY,
+        JudgeMode::RemovedEvaluatorOnly => &EVALUATOR_ONLY,
+        JudgeMode::RemovedHumanOnly => &HUMAN_ONLY,
         _ => return,
     };
     once.call_once(|| {
+        let behavior = match mode {
+            JudgeMode::RemovedHumanOnly => {
+                "every review parks as needs_human; no machine acceptance runs"
+            }
+            _ => "adjudicating with mav (stricter, higher judge cost)",
+        };
         warn!(
             value = mode.as_str(),
-            replacement = mode.deprecation_replacement().unwrap_or("mav"),
-            remove_in = "v1.69.0",
-            "[dispatch] judge mode is deprecated and will be removed — see docs/guides/deprecations.md"
+            removed_in = JUDGE_MODES_REMOVED_IN,
+            behavior,
+            "[dispatch] judge is set to a removed value — set judge = \"mav\"; \
+             for per-employee human sign-off use [capabilities] autonomy_level and \
+             approval_required_tools"
         );
     });
+}
+
+// ── Removed values: operator-facing text ────────────────────────────────
+
+/// The `judge_feedback` written on a task parked because `config.toml` still
+/// says `human_only`. Shown on the task page, the needs-human board and the
+/// channel notice, so it says what happened, why, and how to move on.
+pub const HUMAN_ONLY_REMOVED_PARK_REASON: &str = "這件工作沒有經過機器驗收，先停下來等你確認：\
+驗收判官設定為「一律人工驗收」（[dispatch] judge = \"human_only\"），這個選項已在 v1.69.0 移除。\
+為了不讓原本要人工確認的工作被自動放行，送驗的工作會全部停在這裡。\
+請到「系統設定 → 自動化引擎」把驗收判官改成「標準驗收」（judge = \"mav\"）；\
+需要人工把關的 AI 員工，請在該員工的設定調整「自主等級」（autonomy_level）與\
+「一律等人核可」的工具（approval_required_tools）。\
+這件工作可以直接按「標記完成」，或改好設定後按「重試」重新執行。";
+
+/// Activity Feed summary for the one-time removal notice. `None` for a
+/// supported mode.
+pub fn removed_mode_activity_summary(mode: JudgeMode) -> Option<&'static str> {
+    match mode {
+        JudgeMode::RemovedHumanOnly => Some(
+            "驗收判官設定「一律人工驗收」（judge = \"human_only\"）已在 v1.69.0 移除：\
+             目前所有送驗的工作都停在「等你決定」，不做機器驗收。\
+             請到「系統設定 → 自動化引擎」改成「標準驗收」（judge = \"mav\"），\
+             需要人工把關的員工改用「自主等級」（autonomy_level）與「一律等人核可」（approval_required_tools）。",
+        ),
+        JudgeMode::RemovedEvaluatorOnly => Some(
+            "驗收判官設定「快速模式」（judge = \"evaluator_only\"）已在 v1.69.0 移除：\
+             目前改用標準驗收（judge = \"mav\"：先做初步評估，看起來完成的工作才請判官團複核），\
+             驗收變嚴，判官費用會增加。請到「系統設定 → 自動化引擎」改選「標準驗收」或「外部判官」並儲存。",
+        ),
+        _ => None,
+    }
+}
+
+/// The error `system.update_config` returns when asked to write a removed
+/// value. End-user wording: dashboard labels only, no file or key names.
+/// `None` for a supported mode.
+pub fn removed_mode_write_error(mode: JudgeMode) -> Option<&'static str> {
+    match mode {
+        JudgeMode::RemovedHumanOnly => Some(
+            "「一律人工驗收」已在 v1.69.0 移除，無法再選用。請改選「標準驗收」；\
+             需要人工把關的 AI 員工，請在該員工的設定調整「自主等級」與「一律等人核可」的工具。",
+        ),
+        JudgeMode::RemovedEvaluatorOnly => Some(
+            "「快速模式」驗收已在 v1.69.0 移除，無法再選用。請改選「標準驗收」\
+             （會先做初步檢查，只有看起來完成的工作才請判官團複核）或「外部判官」。",
+        ),
+        _ => None,
+    }
+}
+
+// ── Removed values: one-time notice and doctor finding ──────────────────
+
+/// Claim the one-time removal notice (audit row + Activity Feed) for
+/// `(home, mode)`. `true` exactly once per process for each pair; always
+/// `false` for a supported mode. Keyed by home so two homes in one process
+/// (tests, eval homes) each get their own notice.
+pub fn claim_removed_mode_notice(home_dir: &Path, mode: JudgeMode) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    if !mode.is_removed() {
+        return false;
+    }
+    static CLAIMED: OnceLock<Mutex<HashSet<(std::path::PathBuf, &'static str)>>> =
+        OnceLock::new();
+    let set = CLAIMED.get_or_init(Default::default);
+    let mut guard = match set.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert((home_dir.to_path_buf(), mode.as_str()))
+}
+
+/// Write the `judge_mode_removed` audit row (`security_audit.jsonl`).
+pub fn log_judge_mode_removed(home_dir: &Path, agent_id: &str, mode: JudgeMode) {
+    if !mode.is_removed() {
+        return;
+    }
+    let event = duduclaw_security::audit::AuditEvent::new(
+        "judge_mode_removed",
+        agent_id,
+        duduclaw_security::audit::Severity::Warning,
+        serde_json::json!({
+            "value": mode.as_str(),
+            "removed_in": JUDGE_MODES_REMOVED_IN,
+            "behavior": match mode {
+                JudgeMode::RemovedHumanOnly => "needs_human",
+                _ => "mav",
+            },
+            "replacement": "mav",
+            "source": "config.toml [dispatch] judge",
+        }),
+    );
+    crate::security_autopilot::audit_and_emit(home_dir, &event);
+}
+
+/// What `duduclaw doctor` reports when `[dispatch] judge` holds a removed
+/// value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedJudgeModeFinding {
+    /// The removed variant the value resolves to.
+    pub mode: JudgeMode,
+    /// The value exactly as written in `config.toml` (trimmed).
+    pub configured: String,
+    /// What the gateway does with it today (zh-TW).
+    pub current_behavior: &'static str,
+    /// How to fix it (zh-TW, operator wording — names config keys).
+    pub fix: &'static str,
+}
+
+/// Pure check over the text of `config.toml`. `None` when the value is a
+/// supported one, absent, unknown, not a string, or the file does not parse
+/// (those cases have their own reporting; this finding is only about the
+/// removed values).
+pub fn removed_judge_mode_finding(config_toml: &str) -> Option<RemovedJudgeModeFinding> {
+    let table = config_toml.parse::<toml::Table>().ok()?;
+    let raw = table
+        .get("dispatch")
+        .and_then(|v| v.as_table())
+        .and_then(|d| d.get("judge"))
+        .and_then(|v| v.as_str())?;
+    let mode = JudgeMode::from_config_str(raw).filter(|m| m.is_removed())?;
+    let (current_behavior, fix) = match mode {
+        JudgeMode::RemovedHumanOnly => (
+            "每件送驗的工作都停在 needs_human（等你決定），不做機器驗收",
+            "把 [dispatch] judge 改成 judge = \"mav\"；需要人工把關的 AI 員工改用 \
+             agent.toml [capabilities] autonomy_level 與 approval_required_tools",
+        ),
+        _ => (
+            "以 mav 驗收（先做初步評估，完成候選才請判官團），比原本嚴格、判官費用較高",
+            "把 [dispatch] judge 改成 judge = \"mav\"（或 \"external\"）",
+        ),
+    };
+    Some(RemovedJudgeModeFinding {
+        mode,
+        configured: raw.trim().to_string(),
+        current_behavior,
+        fix,
+    })
+}
+
+/// [`removed_judge_mode_finding`] over `<home>/config.toml`. A missing or
+/// unreadable file yields `None`.
+pub fn removed_judge_mode_finding_in_home(home_dir: &Path) -> Option<RemovedJudgeModeFinding> {
+    let content = std::fs::read_to_string(home_dir.join("config.toml")).ok()?;
+    removed_judge_mode_finding(&content)
+}
+
+/// Outcome of looking for a removed `[dispatch] judge` value in a home.
+/// Separates "checked and it is not used" from "could not check".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovedJudgeModeCheck {
+    /// `config.toml` was read (or does not exist) and `[dispatch] judge` is
+    /// absent, a supported value, or an unknown string the gateway ignores.
+    NotUsed,
+    /// `judge` holds a removed value.
+    Finding(RemovedJudgeModeFinding),
+    /// The check could not be made; the text says why (zh-TW).
+    Unchecked(String),
+}
+
+/// Look for a removed `[dispatch] judge` value in `<home>/config.toml`.
+/// A missing file is a default configuration (`NotUsed`); an unreadable or
+/// unparsable file, a `[dispatch]` that is not a table, or a `judge` that is
+/// not a string cannot be judged and is `Unchecked`.
+pub fn check_removed_judge_mode_in_home(home_dir: &Path) -> RemovedJudgeModeCheck {
+    let content = match std::fs::read_to_string(home_dir.join("config.toml")) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return RemovedJudgeModeCheck::NotUsed;
+        }
+        Err(e) => return RemovedJudgeModeCheck::Unchecked(format!("無法讀取 config.toml：{e}")),
+    };
+    let table = match content.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(e) => return RemovedJudgeModeCheck::Unchecked(format!("config.toml 無法解析：{e}")),
+    };
+    let judge = match table.get("dispatch") {
+        None => return RemovedJudgeModeCheck::NotUsed,
+        Some(toml::Value::Table(dispatch)) => dispatch.get("judge"),
+        Some(_) => {
+            return RemovedJudgeModeCheck::Unchecked("[dispatch] 不是一個表格".to_string());
+        }
+    };
+    match judge {
+        None => RemovedJudgeModeCheck::NotUsed,
+        Some(toml::Value::String(_)) => match removed_judge_mode_finding(&content) {
+            Some(finding) => RemovedJudgeModeCheck::Finding(finding),
+            None => RemovedJudgeModeCheck::NotUsed,
+        },
+        Some(_) => RemovedJudgeModeCheck::Unchecked("[dispatch] judge 不是字串".to_string()),
+    }
 }
 
 // ── External judge config ───────────────────────────────────────────────
@@ -1075,9 +1280,9 @@ mod tests {
     fn known_modes_round_trip() {
         for m in [
             JudgeMode::Mav,
-            JudgeMode::EvaluatorOnly,
             JudgeMode::External,
-            JudgeMode::HumanOnly,
+            JudgeMode::RemovedEvaluatorOnly,
+            JudgeMode::RemovedHumanOnly,
         ] {
             assert_eq!(JudgeMode::from_config_str(m.as_str()), Some(m));
         }
@@ -1089,42 +1294,44 @@ mod tests {
         assert_eq!(JudgeMode::from_config_str(""), Some(JudgeMode::Mav));
     }
 
-    /// T5/O12 regression: the two retired modes are flagged deprecated and
-    /// name a replacement, while the two supported modes are not — and, most
-    /// importantly, **all four still parse** so an existing deployment keeps
-    /// the behavior it configured.
+    /// v1.69.0: the two removed values (and their old aliases) are still
+    /// RECOGNISED — never read as "unknown", because the unknown-value path
+    /// falls back to `mav`, which for `human_only` would silently drop a
+    /// human gate. Their telemetry tokens stay the historical spellings so
+    /// knob snapshots written before and after the removal read the same.
     #[test]
-    fn deprecated_judge_modes_are_flagged_but_still_parse() {
+    fn removed_judge_modes_are_recognised_not_unknown() {
         for (raw, mode) in [
-            ("evaluator_only", JudgeMode::EvaluatorOnly),
-            ("human_only", JudgeMode::HumanOnly),
+            ("evaluator_only", JudgeMode::RemovedEvaluatorOnly),
+            ("evaluator", JudgeMode::RemovedEvaluatorOnly),
+            ("human_only", JudgeMode::RemovedHumanOnly),
+            ("human", JudgeMode::RemovedHumanOnly),
+            (" Human_Only ", JudgeMode::RemovedHumanOnly),
         ] {
-            assert_eq!(
-                JudgeMode::from_config_str(raw),
-                Some(mode),
-                "{raw} must still parse — deprecation never removes behavior"
-            );
-            assert!(mode.is_deprecated(), "{raw} must be flagged deprecated");
-            assert!(
-                mode.deprecation_replacement().is_some(),
-                "{raw} must name a replacement so the warning is actionable"
-            );
+            assert_eq!(JudgeMode::from_config_str(raw), Some(mode), "raw = {raw:?}");
+            assert!(mode.is_removed(), "{raw} must be flagged removed");
         }
+        assert_eq!(JudgeMode::RemovedEvaluatorOnly.as_str(), "evaluator_only");
+        assert_eq!(JudgeMode::RemovedHumanOnly.as_str(), "human_only");
         for mode in [JudgeMode::Mav, JudgeMode::External] {
-            assert!(
-                !mode.is_deprecated(),
-                "{} must stay a supported mode",
-                mode.as_str()
-            );
-            assert_eq!(mode.deprecation_replacement(), None);
+            assert!(!mode.is_removed(), "{} must stay a supported mode", mode.as_str());
         }
     }
 
-    /// T5/O12: reading a deprecated mode out of a real `config.toml` still
-    /// yields that mode (the warn-once is a side effect, never a substitution
-    /// — the seam must not silently upgrade an operator's configured mode).
+    /// Only `mav` and `external` may be written; the removed values are
+    /// recognised on read but refused on write.
     #[test]
-    fn from_home_returns_deprecated_mode_unchanged() {
+    fn writable_modes_are_exactly_mav_and_external() {
+        assert_eq!(WRITABLE_JUDGE_MODES, ["mav", "external"]);
+        for raw in ["mav", "external", " MAV "] {
+            assert!(JudgeMode::from_config_str(raw).is_some_and(|m| !m.is_removed()));
+        }
+    }
+
+    /// Reading a removed value out of a real `config.toml` yields the removed
+    /// variant (the warn-once is a side effect, never a substitution).
+    #[test]
+    fn from_home_returns_the_removed_variant_unchanged() {
         let home = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             home.path().join("config.toml"),
@@ -1133,7 +1340,7 @@ mod tests {
         .expect("write config");
         assert_eq!(
             JudgeMode::from_home(Some(home.path())),
-            JudgeMode::HumanOnly
+            JudgeMode::RemovedHumanOnly
         );
     }
 
@@ -1146,6 +1353,7 @@ mod tests {
         assert_eq!(JudgeMode::from_config_str("mavv"), None);
         // Substring must not match (coding convention 2).
         assert_eq!(JudgeMode::from_config_str("not-mav-really"), None);
+        assert_eq!(JudgeMode::from_config_str("human_only_please"), None);
     }
 
     #[test]
@@ -1186,9 +1394,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (raw, want) in [
             ("mav", JudgeMode::Mav),
-            ("evaluator_only", JudgeMode::EvaluatorOnly),
+            ("evaluator_only", JudgeMode::RemovedEvaluatorOnly),
             ("external", JudgeMode::External),
-            ("human_only", JudgeMode::HumanOnly),
+            ("human_only", JudgeMode::RemovedHumanOnly),
         ] {
             std::fs::write(
                 dir.path().join("config.toml"),
@@ -1197,6 +1405,106 @@ mod tests {
             .unwrap();
             assert_eq!(JudgeMode::from_home(Some(dir.path())), want, "raw = {raw}");
         }
+    }
+
+    // ── removed-value finding (for `duduclaw doctor`) ───────────────────
+
+    #[test]
+    fn removed_judge_mode_finding_names_the_value_and_the_fix() {
+        let f = removed_judge_mode_finding("[dispatch]\njudge = \"human_only\"\n")
+            .expect("human_only is a finding");
+        assert_eq!(f.mode, JudgeMode::RemovedHumanOnly);
+        assert_eq!(f.configured, "human_only");
+        assert!(f.current_behavior.contains("needs_human"), "{}", f.current_behavior);
+        for needle in ["judge = \"mav\"", "autonomy_level", "approval_required_tools"] {
+            assert!(f.fix.contains(needle), "fix must name {needle}: {}", f.fix);
+        }
+
+        let f = removed_judge_mode_finding("[dispatch]\njudge = \"Evaluator\"\n")
+            .expect("the evaluator alias is a finding");
+        assert_eq!(f.mode, JudgeMode::RemovedEvaluatorOnly);
+        assert_eq!(f.configured, "Evaluator");
+        assert!(f.current_behavior.contains("mav"), "{}", f.current_behavior);
+        assert!(f.fix.contains("judge = \"mav\""), "{}", f.fix);
+    }
+
+    #[test]
+    fn judge_mode_check_separates_not_used_from_could_not_check() {
+        let check = |body: Option<&str>| {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(body) = body {
+                std::fs::write(dir.path().join("config.toml"), body).unwrap();
+            }
+            check_removed_judge_mode_in_home(dir.path())
+        };
+        for body in [
+            None,
+            Some(""),
+            Some("[dispatch]\nenabled = true\n"),
+            Some("[dispatch]\njudge = \"mav\"\n"),
+            Some("[dispatch]\njudge = \"external\"\n"),
+            Some("[dispatch]\njudge = \"chaos_monkey\"\n"),
+        ] {
+            assert_eq!(check(body), RemovedJudgeModeCheck::NotUsed, "body = {body:?}");
+        }
+        for body in ["[dispatch\njudge = ", "[dispatch]\njudge = 7\n", "dispatch = 3\n"] {
+            assert!(
+                matches!(check(Some(body)), RemovedJudgeModeCheck::Unchecked(_)),
+                "body = {body:?}"
+            );
+        }
+        match check(Some("[dispatch]\njudge = \"human_only\"\n")) {
+            RemovedJudgeModeCheck::Finding(f) => assert_eq!(f.mode, JudgeMode::RemovedHumanOnly),
+            other => panic!("{other:?}"),
+        }
+        // A config.toml that is a directory cannot be read: not a missing file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("config.toml")).unwrap();
+        assert!(matches!(
+            check_removed_judge_mode_in_home(dir.path()),
+            RemovedJudgeModeCheck::Unchecked(_)
+        ));
+    }
+
+    #[test]
+    fn removed_judge_mode_finding_is_none_for_supported_or_unreadable_config() {
+        for body in [
+            "",
+            "[dispatch]\nenabled = true\n",
+            "[dispatch]\njudge = \"mav\"\n",
+            "[dispatch]\njudge = \"external\"\n",
+            "[dispatch]\njudge = \"chaos_monkey\"\n",
+            "[dispatch]\njudge = 7\n",
+            "[dispatch\njudge = ",
+        ] {
+            assert!(removed_judge_mode_finding(body).is_none(), "body = {body:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert!(removed_judge_mode_finding_in_home(dir.path()).is_none());
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[dispatch]\njudge = \"evaluator_only\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            removed_judge_mode_finding_in_home(dir.path()).map(|f| f.mode),
+            Some(JudgeMode::RemovedEvaluatorOnly)
+        );
+    }
+
+    /// The removal notice is claimed once per (home, mode) — a second claim
+    /// in the same home is refused, a different home gets its own.
+    #[test]
+    fn removed_mode_notice_is_claimed_once_per_home_and_mode() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        assert!(claim_removed_mode_notice(a.path(), JudgeMode::RemovedHumanOnly));
+        assert!(!claim_removed_mode_notice(a.path(), JudgeMode::RemovedHumanOnly));
+        assert!(claim_removed_mode_notice(a.path(), JudgeMode::RemovedEvaluatorOnly));
+        assert!(claim_removed_mode_notice(b.path(), JudgeMode::RemovedHumanOnly));
+        // Supported modes never produce a notice.
+        assert!(!claim_removed_mode_notice(b.path(), JudgeMode::Mav));
+        assert!(!claim_removed_mode_notice(b.path(), JudgeMode::External));
     }
 
     // ── judge model routing config (P0/WP-B) ────────────────────────────

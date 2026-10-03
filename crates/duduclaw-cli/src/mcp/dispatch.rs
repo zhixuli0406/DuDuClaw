@@ -48,7 +48,7 @@ pub(crate) async fn handle_tools_call(
     // so their calls left no audit trail at all. Tools that already write
     // their own tool_calls.jsonl records stay OUT of this list to avoid
     // double-logging: `odoo_*` (per-call audit in handle_odoo_tool) and
-    // `shared_wiki_write` (authorship-extras record).
+    // `wiki_write` with `scope="shared"` (authorship-extras record).
     let is_state_changing = matches!(
         tool_name,
         "create_agent"
@@ -59,7 +59,6 @@ pub(crate) async fn handle_tools_call(
             | "spawn_ephemeral"
             | "send_to_agent"
             | "create_task"
-            | "schedule_task"
             | "update_cron_task"
             | "delete_cron_task"
             | "pause_cron_task"
@@ -273,7 +272,6 @@ pub(crate) async fn handle_tools_call(
         "send_to_agent" => handle_send_to_agent(&arguments, home_dir, default_agent).await,
         "send_photo" => handle_send_media(&arguments, home_dir, http, "photo").await,
         "send_sticker" => handle_send_media(&arguments, home_dir, http, "sticker").await,
-        "schedule_task" => handle_schedule_task(&arguments, home_dir, default_agent).await,
         "list_cron_tasks" => handle_list_cron_tasks(&arguments, home_dir, default_agent).await,
         "update_cron_task" => handle_update_cron_task(&arguments, home_dir, record_actor).await,
         "delete_cron_task" => handle_delete_cron_task(&arguments, home_dir, record_actor).await,
@@ -302,9 +300,8 @@ pub(crate) async fn handle_tools_call(
                 .await
         }
         "agent_update_soul" => handle_agent_update_soul(&arguments, home_dir).await,
-        // T5/O13 merged skill-search entry. `skill_bank_search` still routes
-        // here (further down) as a deprecated alias that pins source="bank".
-        "skill_search" => handle_skill_search(&arguments, home_dir, "skill_search").await,
+        // T5/O13 merged skill-search entry (`source` picks hubs / bank).
+        "skill_search" => handle_skill_search(&arguments, home_dir).await,
         "skill_gaps" => handle_skill_gaps(&arguments, home_dir, default_agent).await,
         "skill_list" => handle_skill_list(&arguments, home_dir).await,
         "skill_security_scan" => handle_skill_security_scan(&arguments, home_dir).await,
@@ -374,31 +371,26 @@ pub(crate) async fn handle_tools_call(
         "synthesize_speech" => handle_synthesize_speech(&arguments).await,
         // Wiki Knowledge Base tools — use wiki_agent (namespace-aware) instead of
         // default_agent so external clients stay isolated in their own namespace.
-        // T5/O3 — one `wiki_*` entry point with a `scope` parameter. The six
-        // `shared_wiki_*` names are deprecated aliases that land on the exact
-        // same handlers (so their behavior is byte-identical), with the scope
-        // pinned by the tool name itself — see `mcp_alias::resolve_wiki_scope`.
-        // An unknown `scope` fails closed rather than defaulting to either
-        // wiki: the two have different trust boundaries.
+        // T5/O3 — one `wiki_*` entry point with a `scope` parameter
+        // (`mcp_alias::resolve_wiki_scope`). An unknown `scope` fails closed
+        // rather than defaulting to either wiki: the two have different trust
+        // boundaries.
         name @ ("wiki_ls" | "wiki_read" | "wiki_write" | "wiki_search" | "wiki_lint"
-        | "wiki_stats" | "shared_wiki_ls" | "shared_wiki_read" | "shared_wiki_write"
-        | "shared_wiki_search" | "shared_wiki_lint" | "shared_wiki_stats") => {
-            match crate::mcp_alias::resolve_wiki_scope(name, &arguments) {
+        | "wiki_stats") => {
+            match crate::mcp_alias::resolve_wiki_scope(&arguments) {
                 Err(e) => tool_error(&e),
                 Ok(crate::mcp_alias::WikiScope::Shared) => match name {
-                    "wiki_ls" | "shared_wiki_ls" => {
-                        handle_shared_wiki_ls(home_dir, default_agent).await
-                    }
-                    "wiki_read" | "shared_wiki_read" => {
+                    "wiki_ls" => handle_shared_wiki_ls(home_dir, default_agent).await,
+                    "wiki_read" => {
                         handle_shared_wiki_read(&arguments, home_dir, default_agent).await
                     }
-                    "wiki_write" | "shared_wiki_write" => {
+                    "wiki_write" => {
                         handle_shared_wiki_write(&arguments, home_dir, default_agent).await
                     }
-                    "wiki_search" | "shared_wiki_search" => {
+                    "wiki_search" => {
                         handle_shared_wiki_search(&arguments, home_dir, default_agent).await
                     }
-                    "wiki_stats" | "shared_wiki_stats" => {
+                    "wiki_stats" => {
                         handle_shared_wiki_stats(home_dir, default_agent).await
                     }
                     _ => handle_shared_wiki_lint(home_dir, default_agent).await,
@@ -441,12 +433,6 @@ pub(crate) async fn handle_tools_call(
         // Office document script execution (agent_id from caller context)
         "office_script" => handle_office_script(&arguments, home_dir, default_agent).await,
         // Skill Bank tools
-        // T5/O13 deprecated alias → `skill_search` with source="bank"
-        // (resolved inside `handle_skill_search` from the tool name, so the
-        // alias can never be widened by passing a different `source`).
-        "skill_bank_search" => {
-            handle_skill_search(&arguments, home_dir, "skill_bank_search").await
-        }
         "skill_bank_feedback" => handle_skill_bank_feedback(&arguments).await,
         // Session tools
         "session_restore_context" => handle_session_restore_context(&arguments).await,
@@ -722,6 +708,12 @@ pub(crate) async fn handle_tools_call(
         // Odoo ERP tools
         t if t.starts_with("odoo_") => {
             handle_odoo_tool(t, &arguments, home_dir, odoo, default_agent).await
+        }
+        // A name removed after its deprecation window. `McpDispatcher` answers
+        // these before any gate; this arm covers direct callers of this
+        // function so they get the same pointer to the replacement.
+        name if duduclaw_core::tool_catalog::removed_mcp_tool(name).is_some() => {
+            removed_tool_result(name).unwrap_or_else(|| tool_error("tool removed"))
         }
         _ => {
             return jsonrpc_error(id, -32602, &format!("Unknown tool: {tool_name}"));

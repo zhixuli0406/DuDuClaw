@@ -272,22 +272,16 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "wiki_export"
         | "wiki_graph"
         | "wiki_lint"
-        | "wiki_namespace_status"
-        | "shared_wiki_read"
-        | "shared_wiki_search"
-        | "shared_wiki_ls"
-        | "shared_wiki_stats"
-        | "shared_wiki_lint" => Some(Scope::WikiRead),
+        | "wiki_namespace_status" => Some(Scope::WikiRead),
         // ── Wiki: write family (incl. destructive shared_wiki_delete) ─────
         "wiki_write"
         | "wiki_share"
         | "wiki_dedup"
         | "wiki_rebuild_fts"
-        | "shared_wiki_write"
         | "shared_wiki_delete" => Some(Scope::WikiWrite),
         // ── G15 Live Canvas ──────────────────────────────────────────────
         // Agent-authored presentation content pushed to the dashboard — same
-        // trust tier as shared_wiki_write (agent-visible content mutation;
+        // trust tier as wiki_write (agent-visible content mutation;
         // server-side ammonia-sanitized at write, sandbox-iframed at render).
         // No MCP read tool exists: viewing goes through the dashboard
         // `canvas.get` RPC only.
@@ -492,7 +486,6 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "agent_remove"
         | "send_to_agent"
         | "evolution_toggle"
-        | "schedule_task"
         | "delete_cron_task"
         | "update_cron_task"
         | "pause_cron_task"

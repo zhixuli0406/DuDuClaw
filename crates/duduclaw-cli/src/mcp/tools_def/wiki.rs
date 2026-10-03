@@ -247,62 +247,6 @@ pub(super) const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
-        name: "shared_wiki_ls",
-        description: "[deprecated → wiki_ls scope=\"shared\"; removed in v1.69.0] List pages in the shared wiki (~/.duduclaw/shared/wiki/). The shared wiki is a cross-agent public knowledge base.",
-        params: &[],
-    },
-    ToolDef {
-        name: "shared_wiki_read",
-        description: "[deprecated → wiki_read scope=\"shared\"; removed in v1.69.0] Read a page from the shared wiki. Use shared_wiki_ls or shared_wiki_search to find page paths first.",
-        params: &[ParamDef {
-            name: "page_path",
-            description: "Page path relative to shared/wiki/ (e.g. 'concepts/return-policy.md')",
-            required: true,
-        }],
-    },
-    ToolDef {
-        name: "shared_wiki_write",
-        description: "[deprecated → wiki_write scope=\"shared\"; removed in v1.69.0] Create or update a page in the shared wiki. Author is automatically tracked. All agents can contribute to the shared knowledge base.",
-        params: &[
-            ParamDef {
-                name: "page_path",
-                description: "Page path relative to shared/wiki/ (e.g. 'concepts/company-sop.md')",
-                required: true,
-            },
-            ParamDef {
-                name: "content",
-                description: "Full page content including YAML frontmatter (author field auto-injected)",
-                required: true,
-            },
-        ],
-    },
-    ToolDef {
-        name: "shared_wiki_search",
-        description: "[deprecated → wiki_search scope=\"shared\"; removed in v1.69.0] Full-text search across shared wiki pages with trust-weighted ranking. Supports layer/trust filtering.",
-        params: &[
-            ParamDef {
-                name: "query",
-                description: "Search query (keywords)",
-                required: true,
-            },
-            ParamDef {
-                name: "limit",
-                description: "Max results (default: 10)",
-                required: false,
-            },
-            ParamDef {
-                name: "min_trust",
-                description: "Minimum trust score filter (0.0-1.0)",
-                required: false,
-            },
-            ParamDef {
-                name: "layer",
-                description: "Filter by layer: identity/core/context/deep",
-                required: false,
-            },
-        ],
-    },
-    ToolDef {
         name: "shared_wiki_delete",
         description: "Delete a page from the shared wiki. Only the original author or the main agent can delete.",
         params: &[ParamDef {
@@ -310,16 +254,6 @@ pub(super) const TOOLS: &[ToolDef] = &[
             description: "Page path to delete",
             required: true,
         }],
-    },
-    ToolDef {
-        name: "shared_wiki_stats",
-        description: "[deprecated → wiki_stats scope=\"shared\"; removed in v1.69.0] Get shared wiki statistics: total pages, contributor breakdown, recent activity.",
-        params: &[],
-    },
-    ToolDef {
-        name: "shared_wiki_lint",
-        description: "[deprecated → wiki_lint scope=\"shared\"; removed in v1.69.0] Audit shared wiki pages for schema compliance: missing frontmatter, fallback markers, orphans, broken links, stale pages.",
-        params: &[],
     },
     ToolDef {
         name: "wiki_namespace_status",

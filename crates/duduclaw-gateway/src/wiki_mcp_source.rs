@@ -442,6 +442,35 @@ fn same_file_identity(before: &std::fs::Metadata, after: &std::fs::Metadata) -> 
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
 
+/// What a `wiki_read` call's `scope` argument selects. Same normalisation as
+/// the tool itself (`mcp_alias::resolve_wiki_scope`): trimmed, ASCII
+/// case-insensitive, absent or null or `local` mean `agent`.
+enum WikiScope {
+    Agent,
+    Shared,
+    Other,
+}
+
+fn wiki_scope(args: &serde_json::Map<String, Value>) -> WikiScope {
+    match args.get("scope") {
+        None | Some(Value::Null) => WikiScope::Agent,
+        Some(Value::String(raw)) => {
+            let scope = raw.trim();
+            if scope.is_empty()
+                || scope.eq_ignore_ascii_case("agent")
+                || scope.eq_ignore_ascii_case("local")
+            {
+                WikiScope::Agent
+            } else if scope.eq_ignore_ascii_case("shared") {
+                WikiScope::Shared
+            } else {
+                WikiScope::Other
+            }
+        }
+        Some(_) => WikiScope::Other,
+    }
+}
+
 #[derive(Debug)]
 struct WikiMcpSourceVerifier {
     authority: WikiSourceAuthority,
@@ -449,6 +478,14 @@ struct WikiMcpSourceVerifier {
 
 #[async_trait]
 impl McpSourceVerifier for WikiMcpSourceVerifier {
+    /// The shared wiki is not the agent wiki this authority binds to an
+    /// owner; `scope="shared"` reads were never compressed (the removed
+    /// `shared_wiki_read` was never on this route), so they pass unchanged.
+    fn passes_through(&self, args: &Value) -> bool {
+        args.as_object()
+            .is_some_and(|args| matches!(wiki_scope(args), WikiScope::Shared))
+    }
+
     async fn verify(
         &self,
         scope: &CcrScope,
@@ -457,11 +494,20 @@ impl McpSourceVerifier for WikiMcpSourceVerifier {
     ) -> Result<VerifiedMcpSource, String> {
         let args = args
             .as_object()
-            .filter(|args| !args.is_empty() && args.len() <= 2)
+            .filter(|args| !args.is_empty() && args.len() <= 3)
             .ok_or("invalid Wiki read arguments")?;
+        // `scope` is the tool's own store selector: absent or `agent` is the
+        // agent wiki this verifier attests; `shared` never reaches here (see
+        // `passes_through`); anything else is refused.
+        match wiki_scope(args) {
+            WikiScope::Agent => {}
+            WikiScope::Shared | WikiScope::Other => {
+                return Err("unexpected Wiki read scope".into());
+            }
+        }
         if args
             .keys()
-            .any(|key| key != "page_path" && key != "agent_id")
+            .any(|key| key != "page_path" && key != "agent_id" && key != "scope")
         {
             return Err("unexpected Wiki read argument".into());
         }
@@ -606,6 +652,27 @@ mod tests {
             &bound.artifact,
             &bound.artifact.version
         ));
+        // The tool's own `scope` selector: absent-equivalent values bind as before.
+        for ok_args in [
+            serde_json::json!({"page_path": PAGE_PATH, "scope": "agent"}),
+            serde_json::json!({"page_path": PAGE_PATH, "scope": " Agent "}),
+            serde_json::json!({"page_path": PAGE_PATH, "scope": "agent", "agent_id": "agent-a"}),
+        ] {
+            assert!(!verifier.passes_through(&ok_args));
+            let again = verifier.verify(&scope("agent-a"), &ok_args, &raw).await.unwrap();
+            assert_eq!(again.artifact, bound.artifact);
+        }
+        // `shared` is another store: it is delivered as-is, never bound here.
+        let shared_args = serde_json::json!({"page_path": PAGE_PATH, "scope": " Shared "});
+        assert!(verifier.passes_through(&shared_args));
+        assert!(verifier.verify(&scope("agent-a"), &shared_args, &raw).await.is_err());
+        for bad_args in [
+            serde_json::json!({"page_path": PAGE_PATH, "scope": "global"}),
+            serde_json::json!({"page_path": PAGE_PATH, "scope": 1}),
+        ] {
+            assert!(!verifier.passes_through(&bad_args));
+            assert!(verifier.verify(&scope("agent-a"), &bad_args, &raw).await.is_err());
+        }
         for bad_args in [
             serde_json::json!({"page_path": PAGE_PATH, "agent_id": "agent-b"}),
             serde_json::json!({"page_path": PAGE_PATH, "acl": "owner"}),

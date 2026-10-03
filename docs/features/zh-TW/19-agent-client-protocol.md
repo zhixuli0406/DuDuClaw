@@ -13,7 +13,7 @@
 
 像 Zed、JetBrains、Neovim 這樣的 IDE 想問 Agent「你能接這個任務嗎？」，而不必理解 DuDuClaw 的整套頻道基礎設施。它們需要的是訂位專線，一個乾淨、穩定、協定驅動的介面。
 
-那正是這兩個協定 server 的角色。DuDuClaw 把它們**分成兩個指令**出貨：`duduclaw acp` 說 IDE agent panel 用的 Agent Client Protocol（Zed／JetBrains／nvim，設定方式見下方「協定範圍」），`duduclaw acp-server` 說 A2A 協定，服務 agent 對 agent 與腳本／CI 整合（即後續各節描述的內容）。
+那正是這兩個協定 server 的角色。DuDuClaw 把它們**分成兩個指令**出貨：`duduclaw acp` 說 IDE agent panel 用的 Agent Client Protocol（Zed／JetBrains／nvim，設定方式見下方「協定範圍」），`duduclaw acp server` 說 A2A 協定，服務 agent 對 agent 與腳本／CI 整合（即後續各節描述的內容）。
 
 ---
 
@@ -26,7 +26,7 @@
 DuDuClaw 提供的是 server 端：
 
 ```
-duduclaw acp-server
+duduclaw acp server
      |
      v
 Listens on stdin, writes to stdout (line-delimited JSON-RPC 2.0)
@@ -39,7 +39,7 @@ Responds to:
   tasks/cancel     → cancel running task
 ```
 
-在 v1.8.9 之前，`duduclaw acp-server` 只是一個佔位符，印出一段訊息就返回。v1.8.9 將它接上了真正的 `A2ATaskManager`，使其得以運作。
+在 v1.8.9 之前，`duduclaw acp server` 只是一個佔位符，印出一段訊息就返回。v1.8.9 將它接上了真正的 `A2ATaskManager`，使其得以運作。
 
 ---
 
@@ -51,7 +51,7 @@ Responds to:
 {
   "name": "duduclaw-pm",
   "description": "Project manager for DuDuClaw v1.9 roadmap",
-  "url": "stdio://duduclaw acp-server --agent duduclaw-pm",
+  "url": "stdio://duduclaw acp server --agent duduclaw-pm",
   "version": "1.8.14",
   "capabilities": {
     "streaming": true,
@@ -153,7 +153,7 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同。如果你已經建�
 
 ## 協定範圍：請先讀這段
 
-> **狀態更正（2026-08-13）。**`duduclaw acp-server` 目前說的是 **A2A（Agent2Agent）協定**（stdio 上的 `agent/discover`、`message/send`、`tasks/send|get|cancel`＋`.well-known` agent card），**尚未**實作 IDE agent panel 使用的 *Agent Client Protocol*（`initialize`／`authenticate`／`session/new`／`session/prompt` 串流）。今天把 Zed、JetBrains 或 `nvim-acp` 指向它，會在 `initialize` 就收到 Method not found。兩個協定不巧共用「ACP」縮寫，本文早期版本把它們混為一談。
+> **狀態更正（2026-08-13）。**`duduclaw acp server` 目前說的是 **A2A（Agent2Agent）協定**（stdio 上的 `agent/discover`、`message/send`、`tasks/send|get|cancel`＋`.well-known` agent card），**尚未**實作 IDE agent panel 使用的 *Agent Client Protocol*（`initialize`／`authenticate`／`session/new`／`session/prompt` 串流）。今天把 Zed、JetBrains 或 `nvim-acp` 指向它，會在 `initialize` 就收到 Method not found。兩個協定不巧共用「ACP」縮寫，本文早期版本把它們混為一談。
 >
 > **更新（2026-08-13 同日）：真正的 Agent Client Protocol 已出貨，獨立指令 `duduclaw acp`。** 實作 ACP **v1**（`initialize` → `session/new` → `session/prompt`，`session/update` 串流：`agent_message_chunk`、`tool_call`／`tool_call_update`、`plan`），並支援 `session/cancel`（進行中的回合依 spec 以 `stopReason: "cancelled"` 收尾）。home 尚未設定時回 spec 的 `AUTH_REQUIRED`（`-32000`）並宣告指向終端機 `duduclaw onboard` 的認證方法。prompt 回合走與通訊頻道**同一條** gateway 回覆管線（session 記憶、契約檢查），對象是 Main 角色的 AI 員工。
 >
@@ -163,7 +163,7 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同。如果你已經建�
 > { "agent_servers": { "DuDuClaw": { "command": "duduclaw", "args": ["acp"] } } }
 > ```
 >
-> `duduclaw acp-server` 維持 A2A 用途：兩個協定刻意分開在不同指令上。
+> `duduclaw acp server` 維持 A2A 用途：兩個協定刻意分開在不同指令上。
 
 ## 目前可用的功能（stdio 上的 A2A）
 
@@ -175,7 +175,7 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同。如果你已經建�
 - name: Generate release notes via DuDuClaw
   run: |
     echo '{"jsonrpc":"2.0","id":1,"method":"tasks/send","params":{"task":"..."}}' \
-      | duduclaw acp-server --agent duduclaw-pm
+      | duduclaw acp server --agent duduclaw-pm
 ```
 
 不需要 HTTP server、不需要 auth token、不需要管理連接埠；只需容器內的 stdio。
@@ -189,7 +189,7 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同。如果你已經建�
 | 協定 | 用途 | 方向 | 指令 |
 |----------|---------|-----------|---------|
 | **MCP** | 將 DuDuClaw 的工具（channel、memory、agent、wiki、task……）暴露給 AI runtime | Runtime → DuDuClaw | `duduclaw mcp-server` |
-| **ACP/A2A** | 讓外部客戶端（IDE、pipeline、其他 Agent）向 DuDuClaw 發送任務 | IDE → DuDuClaw | `duduclaw acp-server` |
+| **ACP/A2A** | 讓外部客戶端（IDE、pipeline、其他 Agent）向 DuDuClaw 發送任務 | IDE → DuDuClaw | `duduclaw acp server` |
 | **Runtime stdio** | DuDuClaw 衍生一個 runtime（Claude/Codex/Antigravity/Grok，棄用期間仍含 Gemini）子行程並透過 stdio JSON 與它對話 | DuDuClaw → Runtime | *內部* |
 
 它們是三場各自獨立的對話，全都在 stdio 上，全都與 JSON-RPC 相鄰。同一個 Agent 在執行期同時參與這三者。

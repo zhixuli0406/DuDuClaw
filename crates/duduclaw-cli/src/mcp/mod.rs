@@ -100,7 +100,7 @@ pub(crate) struct ChannelSessionStats {
 /// WP7 precomputed department-visibility context for a single shared-wiki tool
 /// call. Built once per call (resolves the caller's department) and then reused
 /// as a cheap per-page predicate — the single READ-isolation decision point
-/// behind `shared_wiki_ls/read/search/stats/lint`.
+/// behind `wiki_ls/read/search/stats/lint` with `scope="shared"`.
 ///
 /// F4: department **read** isolation is ALWAYS in force and is orthogonal to
 /// the `.scope.toml` **write** policy. Declaring the `departments` namespace in

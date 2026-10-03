@@ -184,7 +184,7 @@ GitHub Search API → 結果（24時間キャッシュ）
 | `hub` | キュレーション済みレジストリ（anthropic-skills / clawhub / lobehub / skills-sh） | 審査済み・ランキング付きの結果だけが欲しいとき |
 | `bank` | 学習済みスキルバンク | この環境が自分で学習したものを探しているとき |
 
-学習済みスキルバンクはまだ空のインメモリスタブなので、`source="bank"` は正直に「空である」と返します。ハブの結果でごまかすことはありません。`skill_bank_search` は `source="bank"` の非推奨エイリアスとして引き続き使え、v1.69.0 で削除されます — [非推奨となった名称](../../guides/ja-JP/deprecations.md)を参照。
+学習済みスキルバンクはまだ空のインメモリスタブなので、`source="bank"` は正直に「空である」と返します。ハブの結果でごまかすことはありません。`skill_bank_search` は `source="bank"` の非推奨エイリアスでしたが、v1.69.0 で削除されました。代わりに `skill_search` に `source="bank"` を付けて呼び出してください — [非推奨と削除](../../guides/ja-JP/deprecations.md)を参照。
 
 ### MCPツール
 

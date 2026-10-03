@@ -73,7 +73,7 @@ fallback = "claude"        # backend to fall back to when detection fails
 |----------|-----------|------|------|
 | `claude` | `claude` (always available, core) | OAuth / API key rotation | Default backend |
 | `codex` | `codex` | OpenAI | — |
-| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | **Deprecated in v1.67.0, removed in v1.69.0** (see [Deprecations](deprecations.md#gemini-cli-runtime)). Personal-edition OAuth was retired on 2026-06-18; paid API keys still work |
+| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | **Deprecated in v1.67.0, removed in v1.70.0** (see [Deprecations](deprecations.md#gemini-cli-runtime)). Personal-edition OAuth was retired on 2026-06-18; paid API keys still work |
 | `antigravity` | `agy` (`~/.local/bin/agy`) | Google sign-in (`agy` in a terminal) / `GEMINI_API_KEY` | Official successor to the Gemini CLI; multi-model (Gemini 3.x + Claude + GPT-OSS) |
 | `openai_compat` | HTTP (no CLI) | per-provider key | OpenAI-compatible endpoints such as Exo / llamafile / vLLM |
 
@@ -97,10 +97,17 @@ Validate a build against a real gateway in an isolated home, not in `~/.duduclaw
 
 ```bash
 scripts/live-test/make-home.sh /tmp/ddc-live --port 18977
-DUDUCLAW_HOME=/tmp/ddc-live duduclaw run --yes &      # boots once, writes .mcp.json
+HOME=/tmp/ddc-live/os-home DUDUCLAW_HOME=/tmp/ddc-live duduclaw run --yes &   # boots once, writes .mcp.json
 scripts/live-test/mcp-probe.sh /tmp/ddc-live plain
 scripts/live-test/mcp-probe.sh /tmp/ddc-live prod-shaped
 ```
+
+Always start the gateway with `HOME` pointing at the `os-home` directory that
+`make-home.sh` creates inside the isolated home. The gateway and the AI CLI it
+spawns look for logins and settings under `HOME`. If only `DUDUCLAW_HOME` is
+changed, the spawned `claude` uses the operator's own login and spends the
+operator's own quota, and Antigravity's API-key mode rewrites the operator's own
+settings file. `mcp-probe.sh` starts the MCP server with the same `os-home`.
 
 The home holds two employees: `plain` (no allowlist) and `prod-shaped`
 (`allowed_tools = ["mcp__duduclaw__*", ...]`, denied and approval lists, explicit

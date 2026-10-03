@@ -56,37 +56,179 @@ pub struct ToolCatalogEntry {
     /// `tools/list` is the declaration surface, so hiding a tool makes it
     /// *uncallable*, which is the opposite of what a deprecation window is for
     /// — but the dashboard should not offer it as a new choice, and its
-    /// description carries a `[deprecated → …]` prefix. Removal target
-    /// v1.69.0; the full old→new table is `docs/guides/deprecations.md`.
+    /// description carries a `[deprecated → …]` prefix. The old→new table is
+    /// `docs/guides/deprecations.md`; removed names are [`REMOVED_MCP_TOOLS`].
     pub deprecated: bool,
 }
 
-/// MCP tool names that are deprecated aliases of a merged entry point
-/// (T5/O3 · O4 · O13, feature audit 2026-09-29). Removal target: **v1.69.0**.
-///
-/// Kept as a separate list rather than a fifth tuple column so adding or
-/// retiring a deprecation is a one-line diff instead of a 245-row rewrite.
-pub const DEPRECATED_MCP_TOOLS: &[&str] = &[
-    // O3 — merged into `wiki_*` with `scope = "shared"`.
-    "shared_wiki_ls",
-    "shared_wiki_read",
-    "shared_wiki_write",
-    "shared_wiki_search",
-    "shared_wiki_stats",
-    "shared_wiki_lint",
-    // O4 — merged into `tasks_create` (`schedule`). `create_task` is NOT here:
-    // it submits an explicit multi-step `steps` plan to the TaskSpec
-    // dispatcher, which `tasks_create` has no parameter for — deprecating it
-    // would promise a replacement that does not exist.
-    "schedule_task",
-    // O13 — merged into `skill_search` with `source = "bank"`.
-    "skill_bank_search",
-];
+/// MCP tool names that are deprecated aliases of a merged entry point: still
+/// listed and callable, flagged `deprecated: true` in the catalog. Empty since
+/// v1.69.0 removed the last window's aliases (see [`REMOVED_MCP_TOOLS`]); kept
+/// so the next deprecation is a one-line diff.
+pub const DEPRECATED_MCP_TOOLS: &[&str] = &[];
 
 /// Is this MCP tool name a deprecated alias? Exact match, never a prefix or
 /// substring test (coding convention 2).
 pub fn is_deprecated_tool(name: &str) -> bool {
     DEPRECATED_MCP_TOOLS.contains(&name)
+}
+
+/// An MCP tool name that was removed after its deprecation window, with the
+/// call that replaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedMcpTool {
+    /// The removed tool name.
+    pub name: &'static str,
+    /// Release that removed it, without the `v` prefix.
+    pub removed_in: &'static str,
+    /// The tool to call instead.
+    pub replacement: &'static str,
+    /// The argument that selects the removed tool's behaviour on
+    /// [`Self::replacement`], written as the model should type it.
+    pub replacement_args: &'static str,
+    /// Extra guidance for the caller, or empty.
+    pub note: &'static str,
+}
+
+impl RemovedMcpTool {
+    /// The error text a caller of the removed name receives. English on
+    /// purpose: it is read by the model, like every other tool error.
+    pub fn message(&self) -> String {
+        let mut msg = format!(
+            "`{}` was removed in v{}; call `{}` with `{}` instead.",
+            self.name, self.removed_in, self.replacement, self.replacement_args
+        );
+        if !self.note.is_empty() {
+            msg.push(' ');
+            msg.push_str(self.note);
+        }
+        msg
+    }
+
+    /// The replacement as one line for operators, e.g. ``wiki_read` with `scope="shared"``.
+    pub fn suggestion(&self) -> String {
+        format!("`{}` with `{}`", self.replacement, self.replacement_args)
+    }
+}
+
+/// The single table of removed MCP tool names. It drives the error a caller
+/// of a removed name receives and the `duduclaw doctor` scan for leftover
+/// names in employee settings, prompts and skills.
+///
+/// `shared_wiki_delete` and `wiki_share` were never aliases and stay; neither
+/// do `goals_create` (goal hierarchy) or `create_task` (multi-step plans).
+pub const REMOVED_MCP_TOOLS: &[RemovedMcpTool] = &[
+    RemovedMcpTool {
+        name: "shared_wiki_ls",
+        removed_in: "1.69.0",
+        replacement: "wiki_ls",
+        replacement_args: "scope=\"shared\"",
+        note: "",
+    },
+    RemovedMcpTool {
+        name: "shared_wiki_read",
+        removed_in: "1.69.0",
+        replacement: "wiki_read",
+        replacement_args: "scope=\"shared\"",
+        note: "",
+    },
+    RemovedMcpTool {
+        name: "shared_wiki_write",
+        removed_in: "1.69.0",
+        replacement: "wiki_write",
+        replacement_args: "scope=\"shared\"",
+        note: "",
+    },
+    RemovedMcpTool {
+        name: "shared_wiki_search",
+        removed_in: "1.69.0",
+        replacement: "wiki_search",
+        replacement_args: "scope=\"shared\"",
+        note: "",
+    },
+    RemovedMcpTool {
+        name: "shared_wiki_stats",
+        removed_in: "1.69.0",
+        replacement: "wiki_stats",
+        replacement_args: "scope=\"shared\"",
+        note: "",
+    },
+    RemovedMcpTool {
+        name: "shared_wiki_lint",
+        removed_in: "1.69.0",
+        replacement: "wiki_lint",
+        replacement_args: "scope=\"shared\"",
+        note: "",
+    },
+    RemovedMcpTool {
+        name: "schedule_task",
+        removed_in: "1.69.0",
+        replacement: "tasks_create",
+        replacement_args: "schedule=\"<cron expression>\"",
+        note: "Pass the old `name` as `title`, `task` as `description`, `agent_id` as \
+               `assigned_to`; `notify_channel`, `notify_chat_id`, `notify_thread_id` and \
+               `cron_timezone` keep their names.",
+    },
+    RemovedMcpTool {
+        name: "skill_bank_search",
+        removed_in: "1.69.0",
+        replacement: "skill_search",
+        replacement_args: "source=\"bank\"",
+        note: "",
+    },
+];
+
+/// The removed-tool row for `name`, exact match only. Accepts the bare name
+/// or the Claude CLI form `mcp__duduclaw__<name>`.
+pub fn removed_mcp_tool(name: &str) -> Option<&'static RemovedMcpTool> {
+    let bare = name
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.strip_prefix(DUDUCLAW_MCP_SERVER))
+        .and_then(|rest| rest.strip_prefix("__"))
+        .unwrap_or(name);
+    REMOVED_MCP_TOOLS.iter().find(|t| t.name == bare)
+}
+
+/// The removed name a call is equivalent to, if any: `wiki_<x>` with
+/// `scope="shared"` is the former `shared_wiki_<x>`, `tasks_create` with a
+/// cron `schedule` the former `schedule_task`, `skill_search` with
+/// `source="bank"` the former `skill_bank_search`.
+///
+/// Restrictive per-agent lists written before the removal (`denied_tools`)
+/// still name the old tool; a gate checks this name too so such an entry
+/// keeps refusing the call it used to refuse instead of silently lapsing.
+/// Never used to *grant* anything.
+pub fn removed_name_for_call(tool_name: &str, args: &serde_json::Value) -> Option<&'static str> {
+    let arg = |key: &str| args.get(key).and_then(|v| v.as_str()).map(str::trim);
+    let arg_is = |key: &str, tokens: &[&str]| {
+        arg(key).is_some_and(|v| tokens.iter().any(|t| v.eq_ignore_ascii_case(t)))
+    };
+    match tool_name {
+        "wiki_ls" | "wiki_read" | "wiki_write" | "wiki_search" | "wiki_stats" | "wiki_lint" => {
+            if !arg_is("scope", &["shared"]) {
+                return None;
+            }
+            let legacy = match tool_name {
+                "wiki_ls" => "shared_wiki_ls",
+                "wiki_read" => "shared_wiki_read",
+                "wiki_write" => "shared_wiki_write",
+                "wiki_search" => "shared_wiki_search",
+                "wiki_stats" => "shared_wiki_stats",
+                _ => "shared_wiki_lint",
+            };
+            Some(legacy)
+        }
+        // An RFC3339 instant goes to the reminder rail, which `schedule_task`
+        // never reached; only a cron expression is the old call.
+        "tasks_create" => {
+            let schedule = arg("schedule")?;
+            let is_cron =
+                !schedule.is_empty() && chrono::DateTime::parse_from_rfc3339(schedule).is_err();
+            is_cron.then_some("schedule_task")
+        }
+        "skill_search" => arg_is("source", &["bank", "skill_bank"]).then_some("skill_bank_search"),
+        _ => None,
+    }
 }
 
 /// Static table of DuDuClaw MCP tools: `(name, description, scope, category)`.
@@ -279,36 +421,6 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "wiki:read",
         "wiki",
     ),
-    (
-        "shared_wiki_read",
-        "Read a shared wiki page",
-        "wiki:read",
-        "wiki",
-    ),
-    (
-        "shared_wiki_search",
-        "Search shared wiki",
-        "wiki:read",
-        "wiki",
-    ),
-    (
-        "shared_wiki_ls",
-        "List shared wiki pages",
-        "wiki:read",
-        "wiki",
-    ),
-    (
-        "shared_wiki_stats",
-        "Shared wiki statistics",
-        "wiki:read",
-        "wiki",
-    ),
-    (
-        "shared_wiki_lint",
-        "Shared wiki health check",
-        "wiki:read",
-        "wiki",
-    ),
     // ── Wiki: write (wiki:write) ─────────────────────────────────────────
     ("wiki_write", "Write a wiki page", "wiki:write", "wiki"),
     (
@@ -321,12 +433,6 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     (
         "wiki_rebuild_fts",
         "Rebuild the wiki full-text index",
-        "wiki:write",
-        "wiki",
-    ),
-    (
-        "shared_wiki_write",
-        "Write a shared wiki page",
         "wiki:write",
         "wiki",
     ),
@@ -924,7 +1030,6 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "admin",
         "system",
     ),
-    ("schedule_task", "Schedule a cron task", "admin", "cron"),
     ("delete_cron_task", "Delete a cron task", "admin", "cron"),
     ("update_cron_task", "Update a cron task", "admin", "cron"),
     ("pause_cron_task", "Pause a cron task", "admin", "cron"),
@@ -1316,12 +1421,6 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     (
         "skill_gaps",
         "Report inferred capability gaps",
-        "admin",
-        "skill",
-    ),
-    (
-        "skill_bank_search",
-        "Search learned skills in the skill bank",
         "admin",
         "skill",
     ),
@@ -1843,41 +1942,81 @@ mod tests {
         }
     }
 
-    /// T5 regression: every name on the deprecation list must still BE in the
-    /// catalog. A deprecated tool that quietly vanished from the catalog would
-    /// disappear from the dashboard picker a release early, which is exactly
-    /// the silent removal the two-minor-version window exists to prevent.
+    /// v1.69.0: a removed name is gone from the catalog (the dashboard picker
+    /// must not offer it), and the tool that replaces it is still there.
     #[test]
-    fn deprecated_aliases_are_still_catalogued_and_flagged() {
+    fn removed_tools_are_out_of_the_catalog_and_their_replacements_are_in() {
         let catalog = builtin_tool_catalog();
-        for name in DEPRECATED_MCP_TOOLS {
-            let entry = catalog
+        assert_eq!(REMOVED_MCP_TOOLS.len(), 8);
+        for removed in REMOVED_MCP_TOOLS {
+            assert!(
+                !catalog.iter().any(|e| e.name == removed.name),
+                "{} was removed and must not be catalogued",
+                removed.name
+            );
+            let replacement = catalog
                 .iter()
-                .find(|e| e.name == *name)
-                .unwrap_or_else(|| panic!("deprecated alias {name} must stay in the catalog"));
-            assert!(entry.deprecated, "{name} must be flagged deprecated");
-            assert_eq!(entry.kind, "mcp");
+                .find(|e| e.name == removed.replacement)
+                .unwrap_or_else(|| panic!("{} must be catalogued", removed.replacement));
+            assert!(!replacement.deprecated, "{} is not an alias", removed.replacement);
+        }
+        // The two shared-wiki tools that were never aliases stay.
+        for kept in ["shared_wiki_delete", "wiki_share"] {
+            assert!(catalog.iter().any(|e| e.name == kept), "{kept}");
+            assert!(removed_mcp_tool(kept).is_none(), "{kept}");
         }
     }
 
-    /// …and the merged entry points they point at must NOT be flagged.
     #[test]
-    fn merged_entry_points_are_not_flagged_deprecated() {
-        let catalog = builtin_tool_catalog();
-        for name in ["wiki_ls", "wiki_read", "wiki_write", "wiki_search", "tasks_create", "skill_search"] {
-            let entry = catalog
-                .iter()
-                .find(|e| e.name == name)
-                .unwrap_or_else(|| panic!("{name} must be in the catalog"));
-            assert!(
-                !entry.deprecated,
-                "{name} is a merged entry point, not an alias"
-            );
-        }
-        assert!(!is_deprecated_tool("wiki_write"));
-        // Exact match only — a prefix must not read as the deprecated name.
-        assert!(is_deprecated_tool("shared_wiki_write"));
-        assert!(!is_deprecated_tool("shared_wiki_write_v2"));
+    fn removed_tool_message_names_the_replacement_and_its_argument() {
+        let row = removed_mcp_tool("shared_wiki_read").unwrap();
+        assert_eq!(
+            row.message(),
+            "`shared_wiki_read` was removed in v1.69.0; call `wiki_read` with `scope=\"shared\"` instead."
+        );
+        let row = removed_mcp_tool("schedule_task").unwrap();
+        assert!(row.message().contains("`tasks_create` with `schedule=\"<cron expression>\"`"));
+        assert!(row.message().contains("`assigned_to`"));
+        assert_eq!(
+            removed_mcp_tool("skill_bank_search").unwrap().suggestion(),
+            "`skill_search` with `source=\"bank\"`"
+        );
+    }
+
+    #[test]
+    fn removed_tool_lookup_is_exact_and_accepts_the_qualified_form() {
+        assert!(removed_mcp_tool("mcp__duduclaw__shared_wiki_write").is_some());
+        assert!(removed_mcp_tool("shared_wiki_write_v2").is_none());
+        assert!(removed_mcp_tool("schedule_tasks").is_none());
+        assert!(removed_mcp_tool("mcp__other__shared_wiki_write").is_none());
+        assert!(removed_mcp_tool("mcp__duduclawx__shared_wiki_write").is_none());
+        assert!(!is_deprecated_tool("shared_wiki_write"));
+    }
+
+    #[test]
+    fn removed_name_for_call_maps_only_the_equivalent_arguments() {
+        use serde_json::json;
+        assert_eq!(
+            removed_name_for_call("wiki_write", &json!({"scope": " Shared "})),
+            Some("shared_wiki_write")
+        );
+        assert_eq!(removed_name_for_call("wiki_read", &json!({})), None);
+        assert_eq!(removed_name_for_call("wiki_read", &json!({"scope": "agent"})), None);
+        assert_eq!(
+            removed_name_for_call("tasks_create", &json!({"schedule": "0 9 * * *"})),
+            Some("schedule_task")
+        );
+        assert_eq!(
+            removed_name_for_call("tasks_create", &json!({"schedule": "2026-10-01T09:00:00+08:00"})),
+            None
+        );
+        assert_eq!(removed_name_for_call("tasks_create", &json!({"title": "x"})), None);
+        assert_eq!(
+            removed_name_for_call("skill_search", &json!({"source": "bank"})),
+            Some("skill_bank_search")
+        );
+        assert_eq!(removed_name_for_call("skill_search", &json!({})), None);
+        assert_eq!(removed_name_for_call("shared_wiki_delete", &json!({})), None);
     }
 
     // ── O7: CCR is a registration face, not an MCP tool ──────────────────

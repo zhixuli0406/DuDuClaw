@@ -502,7 +502,7 @@ async fn wp7_explicit_scope_does_not_open_cross_department_reads() {
     );
 }
 
-/// F5: `shared_wiki_stats` must not leak other departments' page paths or
+/// F5: shared-wiki stats must not leak other departments' page paths or
 /// author counts.
 #[tokio::test(flavor = "current_thread")]
 async fn wp7_stats_hides_other_departments() {
@@ -537,7 +537,7 @@ async fn wp7_stats_hides_other_departments() {
     );
 }
 
-/// F5: `shared_wiki_lint` must not surface other departments' page paths.
+/// F5: shared-wiki lint must not surface other departments' page paths.
 #[tokio::test(flavor = "current_thread")]
 async fn wp7_lint_hides_other_departments() {
     let tmp = TempDir::new();

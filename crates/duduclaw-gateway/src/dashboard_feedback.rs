@@ -177,15 +177,25 @@ pub fn tool_feedback_event(
 
     match tool_name {
         // ── Routines ────────────────────────────────────────────────────────
-        "schedule_task" => Some((
-            EV_CRON_CHANGED,
-            json!({
-                "action": "created",
-                "name": s("name"),
-                "cron": s("cron"),
-                "agent_id": agent(),
-            }),
-        )),
+        // `tasks_create` with a cron `schedule` writes a cron row (named by
+        // `title`, run as `assigned_to` or the caller). A board task, a goal
+        // and an RFC3339 instant (the reminder rail) change no routine.
+        "tasks_create" => {
+            let schedule = s("schedule")?;
+            let schedule = schedule.trim();
+            if schedule.is_empty() || chrono::DateTime::parse_from_rfc3339(schedule).is_ok() {
+                return None;
+            }
+            Some((
+                EV_CRON_CHANGED,
+                json!({
+                    "action": "created",
+                    "name": s("title"),
+                    "cron": schedule,
+                    "agent_id": s("assigned_to").or_else(|| agent()),
+                }),
+            ))
+        }
         "update_cron_task" => Some((
             EV_CRON_CHANGED,
             json!({ "action": "updated", "id": s("id"), "name": s("name") }),
@@ -352,13 +362,28 @@ mod tests {
     /// enough context for a toast, and every cron mutation tool is covered.
     #[test]
     fn cron_tools_map_to_cron_changed() {
-        let args = json!({ "name": "晨報", "cron": "0 9 * * *", "agent_id": "sam" });
-        let (ev, payload) = tool_feedback_event("schedule_task", &args, &json!({}), "").unwrap();
+        let args = json!({ "title": "晨報", "schedule": "0 9 * * *", "assigned_to": "sam" });
+        let (ev, payload) = tool_feedback_event("tasks_create", &args, &json!({}), "").unwrap();
         assert_eq!(ev, EV_CRON_CHANGED);
         assert_eq!(payload["action"], "created");
         assert_eq!(payload["name"], "晨報");
         assert_eq!(payload["cron"], "0 9 * * *");
         assert_eq!(payload["agent_id"], "sam");
+
+        // A board task, a goal, and a one-shot instant (the reminder rail)
+        // change nothing on the routines page.
+        assert!(tool_feedback_event("tasks_create", &json!({ "title": "x" }), &json!({}), "a").is_none());
+        assert!(
+            tool_feedback_event(
+                "tasks_create",
+                &json!({ "title": "x", "schedule": "2026-10-01T09:00:00+08:00" }),
+                &json!({}),
+                "a"
+            )
+            .is_none()
+        );
+        // The removed name raises nothing: a call to it creates nothing.
+        assert!(tool_feedback_event("schedule_task", &json!({ "name": "x", "cron": "0 9 * * *" }), &json!({}), "a").is_none());
 
         for tool in [
             "update_cron_task",
@@ -433,13 +458,22 @@ mod tests {
         // An explicit argument wins: a supervisor scheduling work for a report
         // must attribute to the report, not to itself.
         let (_, payload) = tool_feedback_event(
-            "schedule_task",
-            &json!({ "name": "晨報", "cron": "0 9 * * *", "agent_id": "sam" }),
+            "tasks_create",
+            &json!({ "title": "晨報", "schedule": "0 9 * * *", "assigned_to": "sam" }),
             &json!({}),
             "supervisor",
         )
         .unwrap();
         assert_eq!(payload["agent_id"], "sam");
+        // No assignee ⇒ the cron row runs as the caller.
+        let (_, payload) = tool_feedback_event(
+            "tasks_create",
+            &json!({ "title": "晨報", "schedule": "0 9 * * *" }),
+            &json!({}),
+            "supervisor",
+        )
+        .unwrap();
+        assert_eq!(payload["agent_id"], "supervisor");
 
         // Unknown caller ⇒ null, not a guess. The dashboard treats a missing
         // agent_id as "might be mine" and refetches, which is the safe default.
@@ -520,7 +554,10 @@ mod tests {
     #[test]
     fn failed_tool_call_raises_nothing() {
         let err = json!({ "isError": true, "content": [] });
-        assert!(tool_feedback_event("schedule_task", &json!({ "name": "x" }), &err, "").is_none());
+        assert!(
+            tool_feedback_event("tasks_create", &json!({ "title": "x", "schedule": "0 9 * * *" }), &err, "")
+                .is_none()
+        );
         assert!(tool_feedback_event("memory_store", &json!({}), &err, "").is_none());
         assert!(tool_feedback_event("skill_graduate", &json!({}), &err, "").is_none());
     }

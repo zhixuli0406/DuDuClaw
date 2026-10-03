@@ -65,7 +65,7 @@ impl MethodHandler {
     /// WP6 — announce a cron mutation made through the dashboard.
     ///
     /// Deliberately routed through [`crate::dashboard_feedback::emit`] (the
-    /// `events.db` path the MCP `schedule_task` / `*_cron_task` tools use)
+    /// `events.db` path the MCP `tasks_create`-with-`schedule` / `*_cron_task` tools use)
     /// rather than [`Self::broadcast_event`]: one emitter, one whitelist, and
     /// one place to change if the transport ever moves. The acting browser tab
     /// already refetches locally — this is what makes a *second* tab, or the

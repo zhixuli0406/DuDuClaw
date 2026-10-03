@@ -25,7 +25,7 @@
 | 15 | [Skill 生命週期引擎](15-skill-lifecycle.md) | 6 階段自動化技能萃取與管理 |
 | 16 | [Session 記憶堆疊](16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |
 | 17 | [Wiki 知識分層](17-wiki-knowledge-layer.md) | L0-L3 四層信任加權知識，自動注入系統 prompt |
-| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | `duduclaw acp` 說 Agent Client Protocol v1，供 IDE 面板（Zed / JetBrains / nvim）使用；`duduclaw acp-server` 是 A2A stdio 介面 |
+| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | `duduclaw acp` 說 Agent Client Protocol v1，供 IDE 面板（Zed / JetBrains / nvim）使用；`duduclaw acp server` 是 A2A stdio 介面 |
 | 20 | [記憶智能](20-memory-intelligence.md) | 時序事實 + Reflexion 迴圈 + 批次擷取（v1.19.0） |
 | 23 | [Autopilot 規則引擎](23-autopilot-engine.md) | 事件驅動自動化 + 斷路器 |
 | 24 | [任務看板與活動動態](24-task-board.md) | Agent 即隊友的任務管理 |

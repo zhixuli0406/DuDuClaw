@@ -23,7 +23,7 @@
 | Telegram Mini App 審批卡（v1.55） | 高風險審批卡可選掛「查看詳情」web-app 按鈕（完整說明、事前模擬後果、到期倒數、同意／拒絕）；`initData` 簽章驗證，授權與按鈕同一套（[43-telegram-miniapp.md](43-telegram-miniapp.md)） |
 | 學習管線可觀測性（v1.56） | 記錄了 `source_facts` 的規則在來源事實被取代時標記 `source-stale`（注入時降權並標示）；達標後才被關卡擋下的整合失敗記錄原因（`consolidation_failures.jsonl`）；對話路徑的規則結算接上 held-out 閘；歸納型 shadow 候選在對話側也能累積樣本外紀錄 |
 | 分版與設定硬化（v1.56） | 個人版併發上限限「同時執行的目標任務數」（預設 2，排隊不拒絕、fail-open；RFC-27），永不設 AI 員工數量上限；多人團隊版專屬畫面改由 gateway 分派入口在伺服器端把關；`agent.toml [model] account_pool` 真的會篩選帳號輪替候選；儀表板建立員工必須明確選模型 |
-| 真 ACP server（v1.57） | `duduclaw acp` 實作 Agent Client Protocol v1（stdio JSON-RPC），Zed / JetBrains / nvim 的 agent panel 直連 AI 員工，走與通訊頻道同一條 gateway 回覆管線，即時串流 `tool_call` / `plan` / 訊息分塊；A2A 的 `acp-server` 指令行為不變 |
+| 真 ACP server（v1.57） | `duduclaw acp` 實作 Agent Client Protocol v1（stdio JSON-RPC），Zed / JetBrains / nvim 的 agent panel 直連 AI 員工，走與通訊頻道同一條 gateway 回覆管線，即時串流 `tool_call` / `plan` / 訊息分塊；A2A 的 `acp server` 指令行為不變 |
 | Remote MCP + OAuth 2.1（v1.57） | 規範原生 `POST /mcp` 端點（版本協商、無狀態模式、Origin 錨定白名單）+ 最小而完整的 OAuth 2.1 授權面（RFC 9728/8414/7591、PKCE S256、操作者同意、refresh 輪替），claude.ai 自訂連接器／Claude 行動版／MCP Inspector 可直連自架 DuDuClaw |
 | 五通道文字裁決（v1.57） | 回覆決定卡並送出整句裁決詞（同意／拒絕／重試／完成／中止／暫停，中英皆可）就等於按下按鈕：Telegram / Discord / Slack / LINE / Teams，同一套授權、重複按壓保護與行動率記帳；補上智慧手錶一鍵決定的缺口 |
 | 本地模型市集（v1.57） | 選用途 → 依本機記憶體算出的硬體適配燈 → 一鍵安裝（自動挑量化版本，來源為五家驗證過的 HF 發布者）；MoE 雙軌判定在 16GB 機器上為 30B-A3B 級模型標示「可 expert offload」（[45-local-model-marketplace.md](45-local-model-marketplace.md)） |
@@ -37,7 +37,7 @@
 | 每目標契約欄位 + 自主研究（v1.59） | 建目標時可設 `duration_hours`（到期 → needs_human）與 `risk_boundary`（留空套五行基本款），逐輪注入並由 MAV safety 面向檢核；`/goal` 支援 `時限:`／`邊界:` 段；可勾選要求結構化預測；當日信念失準的員工自動獲派晚間研究目標 |
 | 派工引擎預設開 + 排程器活性（v1.59） | `[dispatch] enabled` 預設改 true（指派目標開箱即跑），儀表板熱切換；`/healthz` 在 cron／heartbeat 迴圈停擺逾 5 分鐘時回 503：修復排程層全滅、容器卻連日顯示 healthy 的事故 |
 | 兩段式裁決 + 判官硬化（v1.60） | MAV 判官團之前先跑便宜的第一階段評估器（`continue`/`candidate_complete`/`blocked`，預設開；任何故障降級直跑完整 MAV，絕不自動通過）；四條判官紀律（反棘輪、只稽核不自建證據、反契約外擴張、自稱完成不是證據）；修掉截斷面板與首 token `PASS` 誤判兩個 fail-open 洞；gap 指紋停滯偵測；提前收工偵測；`resume_on_restart` 預設 `pause` |
-| 可換判官 seam（v1.60） | `[dispatch] judge = mav / evaluator_only / external / human_only`（`evaluator_only` 與 `human_only` 自 v1.66.0 起棄用，v1.69.0 移除）：外部判官任何故障一律降級回 MAV（變嚴、留稽核），其 feedback 視為未受信 DATA；未知值回退 `mav`；設定→自動化有下拉選擇器 |
+| 可換判官 seam（v1.60） | `[dispatch] judge = mav / evaluator_only / external / human_only`（`evaluator_only` 與 `human_only` 已在 v1.69.0 移除，設定檔殘留值的處理見[棄用與移除](../../guides/zh-TW/deprecations.md)）：外部判官任何故障一律降級回 MAV（變嚴、留稽核），其 feedback 視為未受信 DATA；未知值回退 `mav`；設定→自動化有下拉選擇器 |
 | 目標契約凍結（v1.60） | 建立時把驗收標準凍結成不可變 `acceptance_criteria_baseline`，判官與評估器一律讀這份基準；agent 身分以 `tasks_update` 改 goal 任務的驗收標準、`title` 或 `description` 一律拒絕並留稽核；`/goal` 未帶標準時附四要素引導與 outcome 式標準建議 |
 | 目標迴圈人為信號 + 准入排隊（v1.60） | needs_human 帶封閉六類 `pause_reason`（觸發現場靜態標記，絕不從 LLM 敘述反解）；逾時進度通報（`progress_report_minutes`）；零 LLM 工具連擊 advisory（3/5/8 逐級）；ephemeral spawn 超限改有界 FIFO 排隊（預設 `queue`）；預算耗盡改交「最佳輪成品」（確定性挑選 + 差距清單，不再空手升級） |
 | Agent Mail（v1.60） | 每 agent 信箱（`/mail` 頁）：Gmail API／drop folder 入站，外發一律先建草稿等 ApprovalBroker 確認（背景 worker 是唯一寄信者），信件內容 DATA 圍欄，獨立不可外部授予的 scope，跨 agent 讀信過 delegation policy 判定（[47-agent-mail.md](47-agent-mail.md)） |
@@ -48,7 +48,7 @@
 | 十通道通知統一（v1.60） | autopilot `notify`、MCP `send_message`、提醒全部改走共用 `create_sender` 工廠，涵蓋十個通道（WebChat 誠實拒絕）；修復 autopilot Slack 通知從未送出的問題與 Google Chat / Teams 靜默跳過缺陷 |
 | 進化量測硬化（v1.60） | AEE 提交閘拆 visible／held-out 兩個評測維度（fence-only：只否決不晉升）；冠軍 bootstrap 改同形量測；`duduclaw evolution clear-holdout-rotation` 操作者出口；每輪 14 個 harness 旋鈕快照進 `aee_round` 事件 |
 | cron 星期慣例修正（v1.61，**BREAKING**） | 數字星期欄在解析時從 Unix crontab 慣例（0/7=週日、1-5=週一到五）轉譯成 `cron` crate 的 Quartz 序數，排程器／heartbeat／MCP 驗證／儀表板共用同一份 normaliser：先前 `* * 1-5` 實際排的是週日到週四（週日幽靈觸發 + 週五靜默跳過）；刻意照 Quartz 寫的排程升級後會位移一天 |
-| `duduclaw migrate-from claude-code`（v1.61） | 單向匯入 Claude Code 的 memory shard（→ semantic + SPO 時間記憶）、CLAUDE.md（→ agent wiki context 層，不佔注入預算）與對話逐字稿（噪音濾除只留人類 prompt + assistant 最終回覆，實測有效訊號僅約 1.5%）；一律 `origin=import`（trust ≤ 0.7）、當 DATA、預設去識別化、過注入掃描、skill 過安全掃描 fail-closed；未加 `--apply` 不會寫入任何東西 |
+| `duduclaw migrate from claude-code`（v1.61） | 單向匯入 Claude Code 的 memory shard（→ semantic + SPO 時間記憶）、CLAUDE.md（→ agent wiki context 層，不佔注入預算）與對話逐字稿（噪音濾除只留人類 prompt + assistant 最終回覆，實測有效訊號僅約 1.5%）；一律 `origin=import`（trust ≤ 0.7）、當 DATA、預設去識別化、過注入掃描、skill 過安全掃描 fail-closed；未加 `--apply` 不會寫入任何東西 |
 | 通道能力表（v1.61） | `channel_capabilities.rs` 單一權威表：11 通道 × 7 能力（檔案／照片上傳、互動按鈕、edit-in-place、typing、原生 markdown、引用回覆）+ 進度節流秒數；不支援的能力從靜默 no-op 改為留下結構化 log |
 | minimal_context spawn 瘦身（v1.61） | 每次 spawn 官方 CLI 帶策展 `--tools` 清單 + `--setting-sources project,local`（保留 agent-file-guard hook）：實測固定開銷 35,892 → 10,974 tokens/次（約 69%）；`estimate_tokens` CJK 校準（修正約 22% 低估）；MCP `tools/list` 依呼叫者 capability 過濾（discoverable ⊆ callable） |
 | 憑證 P2/P3（v1.61） | 零重啟輪換：帳號池寫入即失效 rotator 快取、Telegram 每輪重解析 token、六個 webhook 通道 inbound 驗簽 per-request、Odoo 下次呼叫即重連（Discord/Slack 長駐 WS 仍需重啟）；spawn env 改白名單擦洗（濾除所有 `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`，vendor 金鑰改由呼叫端顯式注入）；per-agent `[capabilities] git_credentials`（預設關，opt-in）為 git push 類 agent 恢復 SSH/GPG，留稽核；`secret://` 收斂第二輪（account_rotator + mcp.rs） |
@@ -97,7 +97,7 @@
 | Aider 式程式碼符號圖（`code_map` MCP 工具） | tree-sitter 符號圖疊在 HippoRAG-lite Personalized-PageRank 引擎上；依查詢相關度排序 repo 檔案 |
 | 語意向量記憶（`w_vec`） | FTS/graph 之外的第三個 re-rank 訊號；零依賴、CJK-safe 的 `NgramHashEmbedder`，以 `DUDUCLAW_SEMANTIC_VECTORS=1` 開啟 |
 | 跨 session 使用者畫像 | 每使用者偏好 traits（temporal supersession）→ session-stable 的 `## About This User` 回覆注入（來自 gateway 萃取與核准的審核）；`user_profile_record` / `user_profile_get` MCP 工具讀寫的是所有 gateway 啟動的員工共用的另一個命名空間，不會進入這個區塊（已知限制，v1.67.1） |
-| GDPR 匯出／抹除 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`（舊寫法 `gdpr export` 在 v1.69.0 前仍可解析），涵蓋記憶（triple + 提及 + key_facts，四表級聯，SHA-256 tombstone）**與** session 儲存（`<channel>:<chat_id>` prefix） |
+| GDPR 匯出／抹除 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`（舊寫法 `gdpr export` 已在 v1.69.0 移除），涵蓋記憶（triple + 提及 + key_facts，四表級聯，SHA-256 tombstone）**與** session 儲存（`<channel>:<chat_id>` prefix） |
 | Custom Dashboard Widgets | 在沙盒 runtime 中執行的 AI 引導或原始 HTML 儀表板卡片；Widget Studio 分享／匯入／匯出（[30-custom-widgets.md](30-custom-widgets.md)） |
 | 預算斷路器 | 每 agent 滑動視窗硬上限（`[budget] daily_cap_cents`），到頂即於 choke-point 阻斷 LLM 呼叫；寫 `budget_events.jsonl` |
 | 燒錢速率異常偵測 | 對每日花費做滾動平均＋標準差離群偵測（`cost_anomaly.rs`） |
@@ -121,7 +121,7 @@
 |------|------|
 | Multi-Runtime AI Agent 平台 | 統一 `AgentRuntime` trait：`runtime_catalog.rs` 中有 13 個 runtime id，包含十二個 CLI 後端（Claude、Codex、Gemini（已棄用）、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）與 OpenAI-compat HTTP，支援自動偵測（[13-multi-runtime.md](13-multi-runtime.md)） |
 | MCP Server（JSON-RPC 2.0） | 透過 stdin/stdout 向 AI Runtime 暴露 249 個工具（v1.67.0；`tools/list` 只列出呼叫者可呼叫的工具）；註冊於 `<agent>/.mcp.json`（v1.8.5，Claude CLI `-p` 僅讀取專案層級），gateway 啟動時自動建立／修復 |
-| ACP/A2A Server | 兩個指令：`duduclaw acp`（= `duduclaw acp client`），IDE agent panel 用的 Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` 串流，未設定時回 `AUTH_REQUIRED`）；`duduclaw acp server`（原 `acp-server`，v1.69.0 前仍可解析），A2A 協定（`agent/discover` / `message/send` / `tasks/*`，`/.well-known/agent-card.json` Agent Card，另有 legacy `/agent.json` 別名） |
+| ACP/A2A Server | 兩個指令：`duduclaw acp`（= `duduclaw acp client`），IDE agent panel 用的 Agent Client Protocol v1（Zed / JetBrains / nvim；`initialize` / `session/new` / `session/prompt` 串流，未設定時回 `AUTH_REQUIRED`）；`duduclaw acp server`（原 `acp-server`，已在 v1.69.0 移除），A2A 協定（`agent/discover` / `message/send` / `tasks/*`，`/.well-known/agent-card.json` Agent Card，另有 legacy `/agent.json` 別名） |
 | Agent 目錄結構 | `.claude/`、`.mcp.json`、`SOUL.md`、`CLAUDE.md`、`CONTRACT.toml`、`agent.toml`、`wiki/`、`SKILLS/`、`memory/`、`tasks/`、`state/` |
 | Sub-agent 編排 | `create_agent` / `spawn_agent` / `list_agents` + `reports_to` 階層 + D3.js 組織圖 + 系統 prompt 自動注入「## Your Team」 |
 | DelegationEnvelope | 結構化交接協議：context / constraints / task_chain / expected_output |
@@ -137,7 +137,7 @@
 |------|------|
 | Claude Runtime | Claude Code SDK（`claude` CLI）+ JSONL streaming + `--resume` 多輪 |
 | Codex Runtime | OpenAI Codex CLI + `--json` streaming 事件，以 `AGENTS.md` 檔案傳遞 system prompt |
-| Gemini Runtime（v1.67.0 棄用，v1.69.0 移除；請改用 Antigravity） | Google Gemini CLI + `--output-format stream-json`，以 `GEMINI_SYSTEM_MD` env 傳遞 system prompt，approval mode 依該 agent 的 capabilities 推導（預設 `auto_edit`，唯讀 agent 另加 `--sandbox`，只有完整存取的 agent 才用 `yolo`）。Google 於 2026-06-18 退役個人版 Gemini CLI 後，保留給付費 `GEMINI_API_KEY` 用戶 |
+| Gemini Runtime（v1.67.0 棄用，v1.70.0 移除；請改用 Antigravity） | Google Gemini CLI + `--output-format stream-json`，以 `GEMINI_SYSTEM_MD` env 傳遞 system prompt，approval mode 依該 agent 的 capabilities 推導（預設 `auto_edit`，唯讀 agent 另加 `--sandbox`，只有完整存取的 agent 才用 `yolo`）。Google 於 2026-06-18 退役個人版 Gemini CLI 後，保留給付費 `GEMINI_API_KEY` 用戶 |
 | Antigravity Runtime（v1.24.0） | Google Antigravity CLI（`agy`，2026-06-18 Gemini CLI 後繼者），走 oneshot `agy -p --dangerously-skip-permissions --print-timeout 300s`。二進位自動解析（PATH → `~/.local/bin/agy`）；無 `--system` 旗標，故 system prompt + 歷史內嵌進 prompt（CJK-safe）；認證用 Google 登入（在主機終端機執行 `agy`）或 API key 模式（`config.toml [antigravity] auth = "api_key"` + Gemini API key）；MCP 工具註冊在各 agent 工作區的 `.agents/mcp_config.json`；自動把 agent 目錄預植進 agy 的 `trustedWorkspaces`（跨程序檔鎖）以免 headless 卡在信任提示；token 用量為估算（print 模式無統計） |
 | Grok Runtime（R4） | xAI Grok CLI（「Grok Build」），走 oneshot `grok -p`（2026-07-13 對照 docs.x.ai 驗證）。二進位 `grok`（curl 安裝；第三方 `grok-cli` 作為備援探測）；`--model` 選模型；`--tools`/`--disallowed-tools` 限縮（+ `native_sandbox` 硬閘）；system prompt + 歷史內嵌進 prompt（CJK-safe）；duduclaw MCP server 以 `[mcp_servers.duduclaw]` TOML 寫入各 agent 的 `<agent_dir>/.grok/config.toml`（+ agent 身分經 spawn env 轉送）；以 `XAI_API_KEY` env 認證；token 用量為估算（純 stdout）。**殘餘項**（需實機 CLI）：`--tools` 清單分隔符、`mcp_servers` 的專案本地 `config.toml` 探索、真實用量的 `--output-format json` schema，以及完整 `--model` 清單（`grok models`），文件僅確認 `grok-4.5` / `grok-build-0.1` |
 | OpenAI-compat Runtime | HTTP 端點（MiniMax / DeepSeek 等）REST API |
@@ -218,7 +218,7 @@
 | Dedup 偵測 | `wiki_dedup`：標題匹配 + 標籤 Jaccard 相似度（≥0.8） |
 | 反向 backlink 索引 | 掃描 `related` frontmatter + body markdown 連結，建立雙向對應 |
 | 搜尋篩選 | `min_trust` / `layer` / `expand`（1-hop related/backlink 擴充） |
-| 共享 Wiki | `~/.duduclaw/shared/wiki/` 跨 Agent SOP／政策／規格；`wiki_visible_to` 可見度控制；MCP 工具 `wiki_ls/read/write/search/stats/lint` 搭配 `scope="shared"`（`shared_wiki_*` 寫法為已棄用別名，v1.69.0 移除），另有 `shared_wiki_delete` 與 `wiki_share`；`.scope.toml` SoT 政策（見「身分與存取」） |
+| 共享 Wiki | `~/.duduclaw/shared/wiki/` 跨 Agent SOP／政策／規格；`wiki_visible_to` 可見度控制；MCP 工具 `wiki_ls/read/write/search/stats/lint` 搭配 `scope="shared"`（六個 `shared_wiki_*` 寫法已在 v1.69.0 移除），另有 `shared_wiki_delete` 與 `wiki_share`；`.scope.toml` SoT 政策（見「身分與存取」） |
 | CLAUDE_WIKI 模板 | 新 Agent 建立時納入 CLAUDE.md，提供 wiki MCP 工具使用指引 |
 
 ## 技能生態
@@ -339,7 +339,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永久化（v1.8.12）；排程以 `tasks_create` + `schedule` 建立（舊的 `schedule_task` 工具為已棄用別名，v1.69.0 移除） |
+| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永久化（v1.8.12）；排程以 `tasks_create` + `schedule` 建立（舊的 `schedule_task` 工具已在 v1.69.0 移除） |
 | ReminderScheduler | 一次性提醒（相對 `5m`/`2h`/`1d` 或 ISO 8601），`direct` / `agent_callback` 兩種模式 |
 | HeartbeatScheduler | 每 Agent 統一排程：bus polling + GVU 沉默喚醒 + cron |
 | 排程器級任務板拉取（v1.9.3） | `poll_assigned_tasks` 移入 `HeartbeatScheduler::run` tick：每 30s 掃描整個 agent registry（不再略過 `enabled=false` 的 agent）；1 小時 LIKE-marker 冷卻防止 stampede |
@@ -379,7 +379,7 @@
 | Identity Resolution（`duduclaw-identity`，RFC-21 §1，v1.11.0） | `IdentityProvider` async trait：`WikiCacheIdentityProvider`（`shared/wiki/identity/people/*.md`）、`NotionIdentityProvider`（Notion `databases/query` + `field_map`）、`ChainedProvider`（cache → upstream，故障時優雅降級） |
 | `identity_resolve` MCP 工具 | 受 `Scope::IdentityRead` 閘控，回傳標準 `ResolvedPerson` 紀錄 |
 | Sender 自動注入 | 頻道回覆將 XML 分隔的 `<sender>` 區塊注入 system prompt（每輪解析一次），使 SOUL.md「拒絕非成員」規則可由資料判定 |
-| 共享 Wiki SoT 政策（RFC-21 §3，v1.11.0） | `~/.duduclaw/shared/wiki/.scope.toml` 宣告命名空間擁有權：`agent_writable`（預設）、`read_only { synced_from }`、`operator_only`；`shared_wiki_write` / `shared_wiki_delete` 遵循；`wiki_namespace_status` 揭示現行政策；檔案缺失／格式錯誤 ⇒ fail-safe 無政策 |
+| 共享 Wiki SoT 政策（RFC-21 §3，v1.11.0） | `~/.duduclaw/shared/wiki/.scope.toml` 宣告命名空間擁有權：`agent_writable`（預設）、`read_only { synced_from }`、`operator_only`；`wiki_write`（`scope="shared"`）與 `shared_wiki_delete` 遵循；`wiki_namespace_status` 揭示現行政策；檔案缺失／格式錯誤 ⇒ fail-safe 無政策 |
 
 ## Live Forking（RFC-26）
 

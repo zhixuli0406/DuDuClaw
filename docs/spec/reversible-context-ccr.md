@@ -74,7 +74,7 @@ Channel document delivery rechecks a guarded reply during file validation, after
 ```
 db_select · db_query · csv_read · xlsx_read · file_read
 web_fetch_cached · web_extract
-shared_wiki_read · wiki_read
+wiki_read
 memory_search · memory_fetch_batch
 ```
 

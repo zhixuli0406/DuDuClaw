@@ -131,7 +131,7 @@ Trial results for rules (adopted / rolled back / insufficient evidence) roll up 
 To export an agent's current rules in one batch (for manual review, or to later copy experience across agents):
 
 ```bash
-duduclaw playbook export --agent <agent id> --out rules.json
+duduclaw export playbook --agent <agent id> --out rules.json
 ```
 
 Each rule's fate is decided by its linked eval cases. To run a verification pass yourself, or to build and grow a suite:

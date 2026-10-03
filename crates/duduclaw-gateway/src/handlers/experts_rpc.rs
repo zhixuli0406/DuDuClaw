@@ -10,7 +10,7 @@ impl MethodHandler {
     // `crate::expert_admin` (also consumed by the `duduclaw expert` CLI).
     // Install reuses the FULL CLI pipeline (format detection, safe_zip
     // zip-slip fence + 50 MB cap, prompt-injection / skill-security scanning,
-    // hook quarantine) by spawning `duduclaw expert install <path>` — the
+    // hook quarantine) by spawning `duduclaw pack install <path>` — the
     // installer is entangled with cli-only agent scaffolding, so a subprocess
     // is the zero-drift reuse path (same pattern as doctor_probes → mcp-server).
 
@@ -64,7 +64,7 @@ impl MethodHandler {
             Ok(extra) => args.extend(extra),
             Err(frame) => return frame,
         }
-        match self.spawn_expert_cli(&args, 300).await {
+        match self.spawn_pack_cli(&args, 300).await {
             Ok(output) => WsFrame::ok_response("", json!({ "success": true, "output": output })),
             Err(e) => WsFrame::error_response("", &format!("安裝失敗：{e}")),
         }
@@ -100,9 +100,41 @@ impl MethodHandler {
         args: &[std::ffi::OsString],
         timeout_secs: u64,
     ) -> Result<String, String> {
+        self.spawn_cli_group("expert", args, timeout_secs).await
+    }
+
+    /// Spawn our own binary's `duduclaw pack <args…>` sub-command — the
+    /// install front door (`expert install` was removed in v1.69.0). Same
+    /// home pinning, timeout and output handling as [`Self::spawn_expert_cli`].
+    pub(crate) async fn spawn_pack_cli(
+        &self,
+        args: &[std::ffi::OsString],
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        self.spawn_cli_group("pack", args, timeout_secs).await
+    }
+
+    async fn spawn_cli_group(
+        &self,
+        group: &str,
+        args: &[std::ffi::OsString],
+        timeout_secs: u64,
+    ) -> Result<String, String> {
         let bin = duduclaw_core::resolve_duduclaw_bin();
-        let fut = tokio::process::Command::new(&bin)
-            .arg("expert")
+        self.spawn_cli_group_with_bin(&bin, group, args, timeout_secs).await
+    }
+
+    /// [`Self::spawn_cli_group`] with the binary given, so tests can observe
+    /// the argv without touching the process-wide `DUDUCLAW_BIN`.
+    pub(crate) async fn spawn_cli_group_with_bin(
+        &self,
+        bin: &std::path::Path,
+        group: &str,
+        args: &[std::ffi::OsString],
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let fut = tokio::process::Command::new(bin)
+            .arg(group)
             .args(args)
             .env("DUDUCLAW_HOME", &self.home_dir)
             .kill_on_drop(true)
@@ -222,7 +254,7 @@ impl MethodHandler {
 
     /// `experts.install_builtin` — convert (cached, idempotent) + install one
     /// built-in industry pack. Both steps reuse the CLI pipelines via
-    /// subprocess: `expert convert-teams` then `expert install` (full
+    /// subprocess: `expert convert-teams` then `pack install` (full
     /// security scanning, hooks fail-closed).
     pub(crate) async fn handle_experts_install_builtin(&self, params: Value) -> WsFrame {
         use crate::expert_generate as eg;
@@ -253,7 +285,7 @@ impl MethodHandler {
             }
             let mut args = vec!["install".into(), pack_dir.into_os_string()];
             args.extend(attach_args);
-            return match self.spawn_expert_cli(&args, 300).await {
+            return match self.spawn_pack_cli(&args, 300).await {
                 Ok(output) => WsFrame::ok_response(
                     "",
                     json!({ "success": true, "slug": slug, "output": output }),
@@ -308,7 +340,7 @@ impl MethodHandler {
 
         let mut args = vec!["install".into(), cache_pack.into_os_string()];
         args.extend(attach_args);
-        match self.spawn_expert_cli(&args, 300).await {
+        match self.spawn_pack_cli(&args, 300).await {
             Ok(output) => WsFrame::ok_response(
                 "",
                 json!({
@@ -549,7 +581,7 @@ impl MethodHandler {
             Ok(extra) => args.extend(extra),
             Err(frame) => return frame,
         }
-        match self.spawn_expert_cli(&args, 300).await {
+        match self.spawn_pack_cli(&args, 300).await {
             Ok(output) => {
                 if let Ok(dir) = eg::draft_dir(&self.home_dir, draft_id) {
                     let _ = tokio::fs::remove_dir_all(&dir).await;

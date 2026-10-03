@@ -6,7 +6,7 @@
 
 在 `data/templates.json` 的 `templates` 加一個 entry 即可：
 - `kind: "free"`＝內建 starter 板模（頁面顯示 onboard 精靈指令）
-- `kind: "pack"`＝expert pack（`install.pack_url` 指到 zip，頁面顯示 `duduclaw expert install <url>` 一鍵匯入指令）
+- `kind: "pack"`＝expert pack（`install.pack_url` 指到 zip，頁面顯示 `duduclaw pack install <url>` 一鍵匯入指令）
 
 降級包（premium 劇本 → 免費版，拍板挑 5–8 個高搜尋量產業）產完後照 `_notes` 加 entry 即上線。
 

@@ -44,7 +44,7 @@ DuDuClaw 1.52 は、複数人チーム向けの委任制御を導入しました
 - 未割り当て、または自分に割り当て済みのタスクの引き受け（`tasks_claim`）は制限なし。他の社員に割り当てられたタスクを引き受けるには、その社員と同じ関係が必要
 - ダッシュボードでの割り当て操作は制限なし（すべて人間の操作）
 
-**2b. マルチステップ計画と定期業務** — `create_task` の各ステップは実行者を指定でき、`schedule_task` は他人のために定期業務をスケジュールできる
+**2b. マルチステップ計画と定期業務** — `create_task` の各ステップは実行者を指定でき、`schedule` 付きの `tasks_create` は他人のために定期業務をスケジュールできる
 
 - どちらも委任であり、作成時点でチェックされる。`create_task` のステップは実際のディスパッチ直前にもう一度チェックされる
 - 自分のためのスケジュール、自分を実行者に指定するのは制限なし
@@ -137,7 +137,7 @@ allow = [
 拒否された委任の試みはすべて痕跡を残し、インターセプト地点によって 2 つのファイルに分かれます：
 
 - ディスパッチが実際に実行される直前にブロック（bus キュー、マルチステップ計画）→ `~/.duduclaw/security_audit.jsonl`、イベント型 `delegation_denied`
-- MCP ツールの時点でブロック（`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `tasks_claim` / `tasks_complete` / `tasks_block` / `activity_post` / `create_task` / `schedule_task` / cron 管理ツール / `create_reminder`）→ `~/.duduclaw/tool_calls.jsonl`、同じく `delegation_denied`。`create_agent` / `agent_update` による組織変更のブロックは `org_placement_denied`
+- MCP ツールの時点でブロック（`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `tasks_claim` / `tasks_complete` / `tasks_block` / `activity_post` / `create_task` / cron 管理ツール / `create_reminder`）→ `~/.duduclaw/tool_calls.jsonl`、同じく `delegation_denied`。`create_agent` / `agent_update` による組織変更のブロックは `org_placement_denied`
 - 関係そのものとは別の理由によるレコード変更の拒否も `tool_calls.jsonl` に `reason` 付きで記録される：`owner_unknown`、`caller_unknown`、`system_sender_identity`、`reserved_tag_change`、`goal_contract_frozen`。AI 社員が `agent_update` で自分の権限系設定を変えようとした場合は `agent_authority_refused`（reason `self_authority_change`）
 
 `security_audit.jsonl` のレコードはこのような形です：
@@ -245,11 +245,11 @@ allow = [
 - ディレクトリがないのに `org.toml` に記録が残っている、または
 - `_trash/` を一覧できないため確認できない（fail closed）。
 
-すべての MCP caller は AI の caller として扱われます。CLI のスキャフォールド経路（`duduclaw agent create`、pack と expert のインストール、`migrate-from`）は、環境にエージェントの身元（`DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN`）があるときに同じルールを適用し、`agent-file-guard` フックは Bash の `duduclaw agent create <予約された名前>` をブロックします。別の名前は常に許可されます。`agent_remove` は AI に、社員が削除されたこと、管理者が復元できること、名前が予約されていることを伝えます。ゴミ箱のパスや `rm -rf` のヒントはもう返しません。
+すべての MCP caller は AI の caller として扱われます。CLI のスキャフォールド経路（`duduclaw agent create`、pack のインストール、`migrate from`）は、環境にエージェントの身元（`DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN`）があるときに同じルールを適用し、`agent-file-guard` フックは Bash の `duduclaw agent create <予約された名前>` をブロックします。別の名前は常に許可されます。`agent_remove` は AI に、社員が削除されたこと、管理者が復元できること、名前が予約されていることを伝えます。ゴミ箱のパスや `rm -rf` のヒントはもう返しません。
 
 運用者は制限されません。ダッシュボードと、ターミナルの人間は名前を再利用できます。削除された社員の復元や完全削除は、`~/.duduclaw/agents/_trash/<id>_<timestamp>` を手作業で操作して行い、ダッシュボードにその操作はありません。拒否は `security_audit.jsonl` に `agent_name_reserved`（`requested_name`、`path_kind` = `mcp_create_agent` / `cli_scaffold` / `cli_bash_agent_create`、`reason` = `removed_to_trash` / `dangling_org_record` / `trash_unlistable`）として、削除は `agent_removed`（`subject`、`moved_to_trash`）として監査されます。
 
-制限：Claude、Codex、Gemini の社員は身元を Bash の環境ではなく `.mcp.json` に持つため、CLI は、その Bash から実行された `pack install`、`expert install`、`migrate-from` が AI セッションだと判別できません。Bash のルールはヒューリスティックであり、本当の封じ込めは Bash を与えないことです。社員自身の登録情報を使い、実際の MCP サーバー経由で確認済みです（削除、同名での再作成の拒否、別名での作成、hook によるブロック、監査行）。CLI の scaffold 経路は単体テストのみです。
+制限：Claude、Codex、Gemini の社員は身元を Bash の環境ではなく `.mcp.json` に持つため、CLI は、その Bash から実行された `pack install`、`migrate from` が AI セッションだと判別できません。Bash のルールはヒューリスティックであり、本当の封じ込めは Bash を与えないことです。社員自身の登録情報を使い、実際の MCP サーバー経由で確認済みです（削除、同名での再作成の拒否、別名での作成、hook によるブロック、監査行）。CLI の scaffold 経路は単体テストのみです。
 
 非内部の MCP キーで HTTP 越しに呼ばれた `create_agent` と `agent_remove` は、そのキー自身の client id で判定されます（以前はサーバープロセスの既定エージェントとして扱われていました）。そのため、上のサブツリーのチェックは実際の caller に適用されます。
 

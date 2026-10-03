@@ -113,7 +113,7 @@ pub(crate) fn collect_visible_shared_pages(
 pub(crate) async fn handle_shared_wiki_ls(home_dir: &Path, caller_agent: &str) -> Value {
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
     if !wiki_dir.exists() {
-        return tool_text("No shared wiki found. Use shared_wiki_write to create the first page.");
+        return tool_text("No shared wiki found. Use wiki_write with scope=\"shared\" to create the first page.");
     }
 
     // WP7 / F4: hide other departments' pages (read isolation always on).
@@ -280,10 +280,11 @@ pub(crate) async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, call
     duduclaw_security::audit::append_tool_call_with_extras(
         home_dir,
         caller_agent,
-        "shared_wiki_write",
+        "wiki_write",
         &format!("path={page_path} size={}", content.len()),
         write_result.is_ok(),
         &[
+            ("scope", "shared".into()),
             (
                 "claimed_authors_in_content",
                 serde_json::Value::Array(

@@ -668,12 +668,7 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
             // tool). The synthesized block message is ours — never registered.
             if executed {
                 if let Some(ledger) = ledger.as_mut() {
-                    let kind = cfg
-                        .tool_trust
-                        .get(&name)
-                        .copied()
-                        .unwrap_or(SourceKind::ToolResult);
-                    ledger.register(&content, kind);
+                    ledger.register(&content, cfg.result_trust(&name, &args));
                 }
             }
 

@@ -3,7 +3,7 @@
 //! Expert packs and premium team templates place their agents into the
 //! existing org primitives (`[agent] department` + `reports_to`). This module
 //! is the single source of the *default* placements so the CLI converter
-//! (`expert convert-teams`), the CLI installer (`expert install`), and the
+//! (`expert convert-teams`), the CLI installer (`pack install`), and the
 //! gateway team-staging path can never drift:
 //!
 //! - `department_for_kit` — which functional department a shared worker kit

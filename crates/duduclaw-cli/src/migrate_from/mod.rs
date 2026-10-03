@@ -1,4 +1,4 @@
-//! `duduclaw migrate-from <openclaw|hermes|paperclip>` — painless migration
+//! `duduclaw migrate from <openclaw|hermes|paperclip|claude-code>` — painless migration
 //! from the three big competitor platforms into DuDuClaw.
 //!
 //! Default is a **dry-run** that prints the migration plan; `--apply` performs
@@ -77,7 +77,7 @@ impl Ctx {
 
 // ─────────────────────────── Entry point ───────────────────────────
 
-/// CLI entry for `duduclaw migrate-from`.
+/// CLI entry for `duduclaw migrate from`.
 ///
 /// `json` switches the human console output for a single machine-readable JSON
 /// object on stdout (consumed by the dashboard `migrate.scan`/`migrate.apply`

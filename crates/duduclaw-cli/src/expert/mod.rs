@@ -53,32 +53,10 @@ pub(crate) use detect::resolve_root as resolve_pack_root;
 
 #[derive(Subcommand)]
 pub enum ExpertCommands {
-    /// Install an expert pack from a directory, `.zip`, or URL.
-    ///
-    /// Format is auto-detected (native `expert.toml` → Claude Code plugin →
-    /// single Agent Skill); an unrecognised layout is rejected. Foreign
-    /// personas/skills are scanned before landing; imported hooks are disabled.
-    Install {
-        /// Path to a pack directory, a `.zip`, or an `http(s)://…zip` URL.
-        source: String,
-        /// Preview the plan without writing anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Import under a `-imported` suffix on agent-id clashes instead of
-        /// reporting a conflict.
-        #[arg(long)]
-        rename: bool,
-        /// Explicitly trust and enable the pack's hooks (the codex / claude
-        /// plugin `--trust` convention). Without this flag hooks are imported
-        /// disabled and an ApprovalBroker request is filed (fail-closed).
-        #[arg(long)]
-        trust_hooks: bool,
-        /// Attach the pack's root agents (empty `reports_to`) under an
-        /// existing agent — e.g. your CEO / front-desk supervisor. The target
-        /// must already exist; a typo aborts before anything installs.
-        #[arg(long)]
-        attach_under: Option<String>,
-    },
+    /// Removed in v1.69.0 (use `duduclaw pack install`): prints the
+    /// replacement and exits 2.
+    #[command(hide = true, disable_help_flag = true)]
+    Install(crate::removed_spelling::RemovedArgs),
 
     /// Validate and package a pack directory into a distributable `.zip`.
     Pack {
@@ -158,31 +136,7 @@ pub enum ExpertCommands {
 pub async fn run(cmd: ExpertCommands) -> Result<()> {
     let home = crate::duduclaw_home();
     match cmd {
-        // T5/O2: `expert install` is now an alias for the unified front door
-        // (`duduclaw pack install`). Roster-shaped packs come straight back to
-        // `install::cmd_install` below, so this path is byte-identical for
-        // every expert.toml / Claude-plugin / Agent-Skill source; what it
-        // gains is the one premium-tier gate and the preset route.
-        ExpertCommands::Install {
-            source,
-            dry_run,
-            rename,
-            trust_hooks,
-            attach_under,
-        } => {
-            crate::pack_cmd::install_pack(
-                &home,
-                &source,
-                crate::pack_cmd::InstallOptions {
-                    dry_run,
-                    rename,
-                    trust_hooks,
-                    attach_under,
-                    force: false,
-                },
-            )
-            .await
-        }
+        ExpertCommands::Install(_) => crate::removed_spelling::RemovedSpelling::ExpertInstall.exit(),
         ExpertCommands::Pack { dir, out } => cmd_pack(&dir, out.as_deref()),
         ExpertCommands::Publish {
             dir,
@@ -631,7 +585,7 @@ fn cmd_list(home: &Path, json: bool) -> Result<()> {
         return Ok(());
     }
     if records.is_empty() {
-        println!("\n  尚未安裝任何專家包。用 `duduclaw expert install <path|zip|url>` 安裝。\n");
+        println!("\n  尚未安裝任何專家包。用 `duduclaw pack install <path|zip|url>` 安裝。\n");
         return Ok(());
     }
     println!("\n  {}\n", style("已安裝的專家包").bold());

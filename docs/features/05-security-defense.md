@@ -108,7 +108,7 @@ Where a match shows up (verified call sites):
 - MCP tool calls (`mcp_dispatch`, `scan_input_with_audit` over the serialized arguments): a call whose arguments quote a blocked sentence is refused and audited.
 - Conversation-fact, profile and knowledge-routing distillation (`wiki_ingest`, `profile_distill`, `knowledge_route`): content is dropped on **any** rule match, including the non-blocking extraction rule.
 - `user_profile_record`: the predicate and the value are scanned; a block-level hit is refused.
-- `duduclaw migrate-from` imports skip blocked items; expert-pack installation refuses a blocked pack.
+- `duduclaw migrate from` imports skip blocked items; expert-pack installation refuses a blocked pack.
 - Agent Mail: an inbound mail that matches is stored but flagged, and a flagged mail never triggers the agent.
 - Reminders: a reminder whose prompt is blocked does not run.
 

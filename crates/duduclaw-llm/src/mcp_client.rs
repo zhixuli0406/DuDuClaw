@@ -735,6 +735,15 @@ pub trait McpSourceVerifier: Send + Sync {
         args: &Value,
         content: &str,
     ) -> Result<VerifiedMcpSource, String>;
+
+    /// True when a call with these arguments is not the source this verifier
+    /// guards (for example the same tool pointed at a different store), so
+    /// its result is delivered as an ordinary tool result with CCR off
+    /// instead of being attested. Defaults to false: every call on the route
+    /// must verify or be withheld.
+    fn passes_through(&self, _args: &Value) -> bool {
+        false
+    }
 }
 
 /// Per-server tool visibility filter for mounted MCP servers.
@@ -880,6 +889,13 @@ impl ToolRegistry {
         result: ToolCallResult,
     ) -> ToolOutcome {
         if let Some(route) = self.source_verifiers.get(name) {
+            if route.verifier.passes_through(args) {
+                return if result.is_error {
+                    ToolOutcome::error(result.content)
+                } else {
+                    ToolOutcome::ok(result.content).without_ccr()
+                };
+            }
             // A trusted route must not pass unverified bytes through the
             // ordinary tool-result path, including upstream error bodies.
             if result.is_error {
@@ -1198,6 +1214,52 @@ mod tests {
                 retention_at: 42,
             })
         }
+    }
+
+    struct SplitVerifier;
+
+    #[async_trait]
+    impl McpSourceVerifier for SplitVerifier {
+        async fn verify(&self, _: &CcrScope, _: &Value, _: &str) -> Result<VerifiedMcpSource, String> {
+            Err("never verifies".into())
+        }
+        fn passes_through(&self, args: &Value) -> bool {
+            args["store"] == "other"
+        }
+    }
+
+    /// A call the verifier declares as another store is delivered as an
+    /// ordinary result with CCR off; every other call still has to verify.
+    #[tokio::test]
+    async fn pass_through_calls_skip_attestation_and_ccr() {
+        let mut registry = ToolRegistry {
+            clients: Vec::new(),
+            routes: HashMap::from([("get_source".into(), 0)]),
+            defs: Vec::new(),
+            server_names: vec!["causal-mcp".into()],
+            source_verifiers: HashMap::new(),
+            source_attestation_required: HashSet::new(),
+            ccr_disabled_tools: HashSet::new(),
+        };
+        let scope = CcrScope {
+            tenant_id: "local".into(),
+            agent_id: "agent".into(),
+            session_id: "session".into(),
+            source_acl: "principal".into(),
+        };
+        registry
+            .register_source_verifier(scope, "causal-mcp", "get_source", Arc::new(SplitVerifier))
+            .unwrap();
+        let ok = |content: &str| ToolCallResult { content: content.into(), is_error: false };
+        let other = registry
+            .outcome_from_result("get_source", &json!({"store": "other"}), ok("raw bytes"))
+            .await;
+        assert_eq!(other.content, "raw bytes");
+        assert!(!other.is_error && !other.ccr_eligible && other.source_artifact.is_none());
+        let bound = registry
+            .outcome_from_result("get_source", &json!({"store": "own"}), ok("raw bytes"))
+            .await;
+        assert!(bound.is_error, "an unverifiable call on the route is still withheld");
     }
 
     #[tokio::test]

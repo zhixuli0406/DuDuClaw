@@ -257,10 +257,9 @@ fn test_dangerous_tools_require_admin() {
         "create_agent",
         "send_to_agent",
         "evolution_toggle",
-        "schedule_task",
         "delete_cron_task",
         "run_cron_task",
-        "shared_wiki_write",
+        "wiki_write",
         "shared_wiki_delete",
     ] {
         let req = tool_requires_scope(tool);

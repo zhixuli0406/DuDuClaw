@@ -213,8 +213,10 @@ pub(crate) fn reject_moa_on_cli_path(model: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Wiki-read tools whose *results* are trusted (curated, scope-policed,
-/// citation-tracked content — see the v1.33 wiki ↔ memory boundary).
-pub(super) const PROVENANCE_TRUSTED_WIKI_TOOLS: &[&str] = &["shared_wiki_read", "shared_wiki_search"];
+/// citation-tracked content — see the v1.33 wiki ↔ memory boundary), but
+/// only when called with `scope = "shared"`: the same tools reading the
+/// agent's own wiki (scope omitted or `"agent"`) stay tainted.
+pub(super) const PROVENANCE_TRUSTED_SHARED_WIKI_TOOLS: &[&str] = &["wiki_read", "wiki_search"];
 
 /// Parse `config.toml [provenance]` into `(policy, sensitive tool names)`.
 ///
@@ -222,7 +224,7 @@ pub(super) const PROVENANCE_TRUSTED_WIKI_TOOLS: &[&str] = &["shared_wiki_read", 
 /// ```toml
 /// [provenance]
 /// policy = "off" | "warn" | "enforce"   # default (and any unknown value): off
-/// sensitive_tools = ["send_to_agent", "shared_wiki_write"]
+/// sensitive_tools = ["send_to_agent", "wiki_write"]
 /// ```
 /// Absent section / malformed values ⇒ `(Off, [])` — byte-identical loop
 /// behavior to pre-S2 (the library skips every provenance branch under Off).
@@ -265,34 +267,67 @@ pub fn parse_provenance_settings(
 ///   byte-identical to pre-S2 (no ledger, no checks).
 /// - Otherwise: the channel user input is seeded **Tainted**
 ///   ([`duduclaw_llm::SourceKind::ChannelUserInput`]) on the initial ledger,
-///   the listed sensitive tools are gated on all args, and the wiki-read
-///   tools' results are declared **Trusted** ([`duduclaw_llm::SourceKind::Wiki`]).
+///   the listed sensitive tools are gated on all args, and shared-wiki reads
+///   (`wiki_read` / `wiki_search` with `scope = "shared"`) are declared
+///   **Trusted** ([`duduclaw_llm::SourceKind::Wiki`]).
 pub fn build_channel_provenance_config(
     policy: duduclaw_llm::ProvenancePolicy,
     sensitive_tools: &[String],
     channel_user_input: &str,
 ) -> duduclaw_llm::ProvenanceConfig {
     use duduclaw_llm::{
-        ProvenanceConfig, ProvenanceLedger, ProvenancePolicy, SensitiveTool, SourceKind,
+        ProvenanceConfig, ProvenanceLedger, ProvenancePolicy, ScopedToolTrust, SensitiveTool,
+        SourceKind,
     };
     if policy == ProvenancePolicy::Off {
         return ProvenanceConfig::default();
     }
     let mut ledger = ProvenanceLedger::new();
     ledger.register(channel_user_input, SourceKind::ChannelUserInput);
-    let tool_trust = PROVENANCE_TRUSTED_WIKI_TOOLS
+    let scoped_tool_trust = PROVENANCE_TRUSTED_SHARED_WIKI_TOOLS
         .iter()
-        .map(|t| (t.to_string(), SourceKind::Wiki))
+        .map(|t| ScopedToolTrust {
+            tool: t.to_string(),
+            arg: "scope".to_string(),
+            value: "shared".to_string(),
+            kind: SourceKind::Wiki,
+        })
         .collect();
     ProvenanceConfig {
         policy,
-        sensitive_tools: sensitive_tools
-            .iter()
-            .map(|n| SensitiveTool::all_args(n.clone()))
+        sensitive_tools: sensitive_tool_names(sensitive_tools)
+            .into_iter()
+            .map(SensitiveTool::all_args)
             .collect(),
-        tool_trust,
+        tool_trust: Default::default(),
+        scoped_tool_trust,
         initial_ledger: Some(ledger),
     }
+}
+
+/// The configured sensitive tool names, plus the replacement of any name
+/// removed in v1.69.0 (`shared_wiki_write` → `wiki_write`), so a gate an
+/// operator set up does not lapse when the old name stops matching. The list
+/// matches by tool name only, so the replacement is gated in all its forms.
+fn sensitive_tool_names(configured: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(configured.len());
+    for name in configured {
+        if !out.contains(name) {
+            out.push(name.clone());
+        }
+        if let Some(row) = duduclaw_core::tool_catalog::removed_mcp_tool(name.trim()) {
+            warn!(
+                tool = row.name,
+                replacement = row.replacement,
+                "[provenance] sensitive_tools names a removed tool; gating its replacement instead"
+            );
+            let replacement = row.replacement.to_string();
+            if !out.contains(&replacement) {
+                out.push(replacement);
+            }
+        }
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)] // one extra pass-through param (account_pool)

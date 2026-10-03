@@ -365,7 +365,7 @@ impl TaskStore {
 
     /// A1-2: [`Self::mark_needs_human_with_pause`] for the **settle** path —
     /// a round that ends in `needs_human` without a judge ruling (evaluator
-    /// `blocked`, judge error, `human_only` / `evaluator_only` fail-closed).
+    /// `blocked`, judge error, a leftover removed `human_only`).
     ///
     /// The task-row write is byte-identical to `mark_needs_human_with_pause`
     /// (same statement, same result). Afterwards, only when that write took

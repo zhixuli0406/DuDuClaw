@@ -309,7 +309,6 @@ pub const BUILTIN_CCR_SOURCE_TOOLS: &[&str] = &[
     "file_read",
     "web_fetch_cached",
     "web_extract",
-    "shared_wiki_read",
     "wiki_read",
     "memory_search",
     "memory_fetch_batch",
@@ -621,6 +620,18 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A removed tool name routes nothing; `wiki_read` covers both wikis.
+    #[test]
+    fn builtin_routes_name_no_removed_tool() {
+        for tool in BUILTIN_CCR_SOURCE_TOOLS {
+            assert!(
+                duduclaw_core::tool_catalog::removed_mcp_tool(tool).is_none(),
+                "{tool} was removed"
+            );
+        }
+        assert!(BUILTIN_CCR_SOURCE_TOOLS.contains(&"wiki_read"));
     }
 
     #[test]

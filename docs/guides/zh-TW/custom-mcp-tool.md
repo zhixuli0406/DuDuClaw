@@ -306,4 +306,4 @@ static LIMITER: OnceLock<RateLimiter> = OnceLock::new();
 | `cost_*` | 成本遙測 | `cost_summary`, `cost_agents`, `cost_recent` |
 | `odoo_*` | Odoo ERP | `odoo_crm_leads`, `odoo_sale_orders` |
 | `skill_*` | Skill 生態系 | `skill_search`, `skill_list` |
-| （無） | 獨立工具 | `emergency_stop`, `tool_approve`, `schedule_task` |
+| （無） | 獨立工具 | `emergency_stop`, `tool_approve` |

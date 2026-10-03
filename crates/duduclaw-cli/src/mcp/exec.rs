@@ -315,10 +315,8 @@ pub(crate) async fn run_office_script(script_path: &Path, script_args: &[String]
 }
 
 // ── skill_bank_feedback handler ─────────────────────────────────
-// (`skill_bank_search`'s own handler was removed by T5/O13: the tool is now a
-// deprecated alias routing through `handle_skill_search` with source="bank",
-// so there is one entry point and one result format. The bank half of that
-// search lives in `skill_bank_hits`.)
+// (Searching the bank is `skill_search` with source="bank"; the bank half of
+// that search lives in `skill_bank_hits`.)
 
 pub(crate) async fn handle_session_restore_context(args: &Value) -> Value {
     let query = match args.get("query").and_then(|v| v.as_str()) {

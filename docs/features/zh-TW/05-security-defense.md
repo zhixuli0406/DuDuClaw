@@ -108,7 +108,7 @@ H10（2026-09）之前，這是放在 `<agent_dir>/.claude/hooks/data-file-guard
 - MCP 工具呼叫（`mcp_dispatch`，對序列化後的參數做 `scan_input_with_audit`）：參數引用了會被封鎖的句子時，呼叫被拒絕並記入稽核。
 - 對話事實、使用者輪廓與知識分流的萃取（`wiki_ingest`、`profile_distill`、`knowledge_route`）：只要比對到**任何**規則就丟棄，包括不封鎖的擷取規則。
 - `user_profile_record`：predicate 與值都會掃描，達到封鎖等級就拒絕。
-- `duduclaw migrate-from` 匯入會略過被封鎖的項目；expert pack 安裝會拒絕被封鎖的套件。
+- `duduclaw migrate from` 匯入會略過被封鎖的項目；expert pack 安裝會拒絕被封鎖的套件。
 - Agent Mail：比對到的來信照樣存下但會加上標記，有標記的信永遠不會觸發 AI 員工。
 - 提醒：提示內容被封鎖的提醒不會執行。
 

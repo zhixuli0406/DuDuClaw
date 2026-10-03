@@ -61,7 +61,7 @@ The `serverKey` (`photoshop` / `autocad-mcp`) becomes the tool-name prefix: on t
 
 See the next section. This step is required, not optional.
 
-> Both applications above have a matching paid expert pack (`marketing-designer`, `cad-drafter`) that bundles the soul, `.mcp.json` template, capability settings, and safety SOP into a single install. These single-role packs also appear in the dashboard's Expert Packs page built-in catalog, labeled by function/department; at install time you can use the "reports to" picker (or the CLI `duduclaw expert install <pack> --attach-under <agent-id>`) to attach the expert under an existing manager, folding it directly into the org chart and department.
+> Both applications above have a matching paid expert pack (`marketing-designer`, `cad-drafter`) that bundles the soul, `.mcp.json` template, capability settings, and safety SOP into a single install. These single-role packs also appear in the dashboard's Expert Packs page built-in catalog, labeled by function/department; at install time you can use the "reports to" picker (or the CLI `duduclaw pack install <pack> --attach-under <agent-id>`) to attach the expert under an existing manager, folding it directly into the org chart and department.
 
 ## Capability governance
 
