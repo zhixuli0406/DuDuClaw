@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.69.0] - 2026-10-04 — 員工間授權修補×棄用名稱移除×安全稽核第 2 版與紅隊帳本×驗收逐條帳本×設定存檔保留註解
+
 ### Added
 - **活測環境腳本**（`scripts/live-test/`）：`make-home.sh <目錄> [--port N]` 建立隔離的 DuDuClaw home（loopback、預設埠 18977，拒絕非空目錄與 `~/.duduclaw` 內的路徑），內含兩位員工，`plain`（沒有 allowlist）與 `prod-shaped`（照生產寫法：`allowed_tools = ["mcp__duduclaw__*", ...]`、`denied_tools`、`approval_required_tools`、四個 `[permissions]` 旗標、`[budget]`、`[evolution]`、`CONTRACT.toml`、`SOUL.md`）；`mcp-probe.sh <home> <agent-id> [tool ...]` 依該員工自己的 `.mcp.json` 啟動真的 `duduclaw mcp-server`，送出 `initialize`、`tools/list` 與每個工具的 `tools/call`，逐行印出 `ok` 或拒絕原因，`prod-shaped` 的預設工具（`tasks_list`、`memory_search`、`working_state_get`、`user_profile_get`）有任何被拒就以 exit 1 結束。背景：v1.68.1 修掉的萬用字元 allowlist 回歸，當時是因為活測員工沒有 allowlist 才漏測。實測：把 `prod-shaped` 的 `allowed_tools` 改成 `["Read"]` 後，探針如預期印出 REFUSED 並 exit 1。`make-home.sh` 另外建立一個空的作業系統家目錄 `<目錄>/os-home`，印出的啟動指令帶 `HOME=<目錄>/os-home`，`mcp-probe.sh` 啟動 `mcp-server` 時也用它；原因是閘道與它啟動的 AI CLI 會從家目錄找登入與設定，只換 `DUDUCLAW_HOME` 會用到操作者自己的帳號額度（有一次活測因此實際呼叫了模型），Antigravity 的 API key 模式還會改寫操作者自己的設定檔。說明與操作順序見 `scripts/live-test/README.md`，另見 `docs/guides/development-guide.md` 第 1.5 節。
 - **`scripts/clean-build-cache.sh`**：只清本 workspace 自己的 `target/debug` 產物（`deps/duduclaw*`、`deps/libduduclaw*`、`.fingerprint/duduclaw*`、`build/duduclaw*`、`examples`、`incremental`、頂層 `duduclaw*` 執行檔），保留第三方依賴；開頭與結尾印出剩餘磁碟空間與 `target/debug` 大小，`cargo` 或 `rustc` 還在跑時拒絕執行（`--force` 例外），`--dry-run` 只列出會刪的項目與大小，`target/release` 與其他 target triple 要加 `--all-profiles` 才會處理。有行程正從那個檔案執行的頂層執行檔會保留（例如從 `target/release` 啟動的 gateway）。起因：編譯快取兩度塞滿磁碟（`target/debug` 到過 134 GB），磁碟全滿讓 Docker Desktop 當機。
