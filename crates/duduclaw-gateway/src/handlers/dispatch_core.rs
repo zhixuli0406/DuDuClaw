@@ -260,7 +260,7 @@ impl MethodHandler {
             }
             "inference.update" => {
                 require_admin!();
-                self.handle_inference_update(params).await
+                self.handle_inference_update(params, ctx).await
             }
 
             // ── WP-D: appliance local model (llama.cpp server on loopback).

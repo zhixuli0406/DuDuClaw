@@ -149,13 +149,10 @@ pub(super) async fn build_reply_with_session_inner(
     // the L2-B system-prompt injection and the post-reply `finalize` call)
     // is computed unconditionally so classification runs on every turn that
     // reaches this far, exactly once.
-    if let Some(pending_reply) =
-        crate::goal_intent::intercept_pending_confirmation(ctx, session_id, user_id, text).await
-    {
-        return pending_reply;
-    }
-    let goal_intent_precheck =
-        crate::goal_intent::precheck(ctx, session_id, &agent_id, user_id, text).await;
+    //
+    // v1.68: the goal-intent calls run after the injection scan and the
+    // `[redaction.sources] user_input` pass below, so the pending goal
+    // description (→ goal task → model) never carries the raw text.
 
     // OTel: record resolved agent/model on the `invoke_agent` span. The
     // channel-reply path is Claude-first (rotator/CLI/Direct API); a routed
@@ -533,6 +530,14 @@ pub(super) async fn build_reply_with_session_inner(
         }
     }
 
+    // ── L2.4: KILLSWITCH.toml [triggers] (v1.68.0) — 24 h cost limit and
+    // per-scope reply rate; only keys the operator wrote are enforced.
+    if let Some(stop) =
+        crate::killswitch_triggers::gate_before_reply(ctx, session_id, user_id, &agent_id).await
+    {
+        return stop;
+    }
+
     // ── L2.5: Budget circuit breaker (cost enforcement) ──
     // If the agent has hit its hard spend cap, stop before any LLM call and tell
     // the user on their own channel — this reply IS the cross-channel budget
@@ -565,6 +570,38 @@ pub(super) async fn build_reply_with_session_inner(
         );
         return format!("⚠️ {}", scan.summary);
     }
+
+    // RFC-23 `[redaction.sources] user_input` (v1.68.0): the user's own words
+    // go through the same pipeline as tool results, ONCE, right after the
+    // injection scan — and `text` is rebound to the redacted form so every
+    // later consumer (goal intent, skill recorder, session, prompt, goal
+    // finalize) sees only that. Default mode is `off` (passthrough). Fail
+    // closed: a redaction error stops the turn instead of sending the raw text.
+    let redacted_user_text = match crate::redaction_sources::redact_text(
+        ctx.redaction_manager.as_ref(),
+        &agent_id,
+        Some(session_id),
+        text,
+        &duduclaw_redaction::Source::UserChannelInput {
+            channel_id: session_id.split(':').next().unwrap_or("").to_string(),
+        },
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(session_id, error = %e, "redaction of user input failed — turn stopped");
+            return REDACTION_FAILED_REPLY.to_string();
+        }
+    };
+    let text: &str = &redacted_user_text;
+
+    // ── Goal intent router (see the comment above) ──
+    if let Some(pending_reply) =
+        crate::goal_intent::intercept_pending_confirmation(ctx, session_id, user_id, text).await
+    {
+        return pending_reply;
+    }
+    let goal_intent_precheck =
+        crate::goal_intent::precheck(ctx, session_id, &agent_id, user_id, text).await;
 
     // ── All pre-filters passed — now create/load session ──
     let _ = session_mgr.get_or_create(session_id, &agent_id).await;
@@ -643,6 +680,8 @@ pub(super) async fn build_reply_with_session_inner(
     } else {
         text.to_string()
     };
+
+    // (`text` is already the redacted user input — see above.)
 
     // Prepend sender metadata so the agent can identify who is talking. This is
     // plumbing for the model, NOT something a human should ever read — strip it
@@ -1110,6 +1149,24 @@ pub(super) async fn build_reply_with_session_inner(
     {
         Some(note) => format!("{full_system_prompt}\n\n{note}"),
         None => full_system_prompt,
+    };
+    // RFC-23 `[redaction.sources] system_prompt` (v1.68.0): default
+    // `selective` — only rules marked `apply_to_system_prompt` fire. Fail
+    // closed like the user-input pass above.
+    let full_system_prompt = match crate::redaction_sources::redact_text(
+        ctx.redaction_manager.as_ref(),
+        &agent_id,
+        Some(session_id),
+        &full_system_prompt,
+        &duduclaw_redaction::Source::SystemPrompt {
+            component: "channel_reply".to_string(),
+        },
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(session_id, error = %e, "redaction of system prompt failed — turn stopped");
+            return REDACTION_FAILED_REPLY.to_string();
+        }
     };
 
     // Track the last underlying failure so the fallback message can
@@ -1631,6 +1688,10 @@ pub(super) async fn build_reply_with_session_inner(
             None
         }
     };
+
+    // KILLSWITCH [triggers] max_consecutive_errors / error_rate_threshold.
+    crate::killswitch_triggers::record_reply_outcome(ctx, session_id, &agent_id, reply.is_some())
+        .await;
 
     if let Some(mut reply) = reply {
         // ── Action-claim verifier (shadow mode) ─────────────────────
@@ -3282,7 +3343,7 @@ pub(super) async fn build_reply_with_session_inner(
         // documented, low-severity P0 gap (the tag is routing metadata, not
         // secret data; follow-up would move this earlier if it matters).
         //
-        // `text` (the raw function parameter), NOT `sanitized_text` — the
+        // `text` (the redacted user input), NOT `sanitized_text` — the
         // latter carries a `[user_id]\n` sender-metadata prefix
         // (`SENDER_PREFIX_OPEN`) that must never leak into a goal task's
         // description.
@@ -3411,3 +3472,7 @@ pub(crate) fn channel_gvu_trigger_allowed(agent_dir: &std::path::Path) -> bool {
     crate::gvu::trigger::agent_gvu_enabled(agent_dir)
 }
 
+/// Reply when a `[redaction.sources]` pass fails (fail closed: the text is
+/// never sent to the model).
+pub(crate) const REDACTION_FAILED_REPLY: &str =
+    "⚠️ 去識別化處理失敗，這則訊息沒有送給 AI。請稍後再試，或請管理員檢查去識別化設定。";

@@ -23,7 +23,7 @@
 //! (see `duduclaw_gateway::handlers::spawn_expert_cli`), so routing
 //! `expert install` through here converges them with no gateway change.
 //!
-//! Old names stay as aliases until **v1.68.0** (deprecation policy: two minor
+//! Old names stay as aliases until **v1.69.0** (deprecation policy: two minor
 //! versions), and so do all three legacy manifest dialects.
 
 use std::path::{Path, PathBuf};
@@ -352,7 +352,7 @@ async fn cmd_inspect(source: &str, json: bool, emit_canonical: bool) -> Result<(
         "  讀自      {}{}",
         pack.source.as_str(),
         if pack.source.is_legacy() {
-            "（舊格式，支援到 v1.68.0）"
+            "（舊格式，支援到 v1.69.0）"
         } else {
             ""
         }
@@ -1200,7 +1200,7 @@ reports_to = "front"
             _ => panic!("pack install parsed into the wrong command"),
         }
 
-        // The old verb must still parse — it is an alias until v1.68.0.
+        // The old verb must still parse — it is an alias until v1.69.0.
         let cli = crate::Cli::try_parse_from(["duduclaw", "expert", "install", "./x"])
             .expect("expert install still parses");
         assert!(matches!(

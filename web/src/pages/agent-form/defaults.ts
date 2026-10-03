@@ -1,11 +1,12 @@
 import type {
   AgentCapabilities,
+  AgentEffort,
+  AgentKvType,
+  AgentTeamRoleKey,
   AgentEvolutionAdvanced,
   AgentRuntime,
   AutonomyLevel,
   ComputerUseConfig,
-  ContainerEnvVar,
-  ContainerMount,
   RuntimeProvider,
   TemplateRoleSummary,
 } from '@/lib/api';
@@ -26,7 +27,17 @@ export const TEMPLATE_KIND_ORDER: Record<TemplateRoleSummary['kind'], number> = 
 export type MainTab = 'general' | 'advanced';
 export type AdvGroup = 'run' | 'access' | 'integration' | 'evo';
 
-export const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = ['claude', 'codex', 'antigravity', 'grok', 'openai_compat'];
+export const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = [
+  'claude', 'codex', 'antigravity', 'grok', 'openai_compat',
+  // v1.68 W1 — generic command-line runtimes (`runtime_catalog.rs`).
+  'qwen', 'kimi', 'copilot', 'kiro', 'cursor', 'vibe', 'opencode',
+];
+
+/** v1.68 W1 — runtimes driven as plain command-line tools. Per-employee tool
+ *  limits (allowed/denied tools, approval lists) do not reach them. */
+export const GENERIC_CLI_RUNTIMES: ReadonlySet<string> = new Set([
+  'qwen', 'kimi', 'copilot', 'kiro', 'cursor', 'vibe', 'opencode',
+]);
 
 export const AGENT_ROLES: ReadonlyArray<string> = ['main', 'specialist', 'worker', 'developer', 'qa', 'planner'];
 
@@ -46,7 +57,7 @@ export const AUTONOMY_LEVELS: ReadonlyArray<AutonomyLevel> = [
  *  from `agent.runtime` when available and falls back to these defaults
  *  otherwise. A partial update is still written only when the operator
  *  touches the tab. */
-export const DEFAULT_RUNTIME: Required<Omit<AgentRuntime, 'fallback'>> & { fallback: string } = {
+export const DEFAULT_RUNTIME: Required<Pick<AgentRuntime, 'provider'>> & { fallback: string } = {
   provider: 'claude',
   fallback: '',
 };
@@ -74,17 +85,6 @@ export const DEFAULT_EVOLUTION_ADVANCED: {
   skill_graduation_min_lift: 0.1,
 };
 
-/** CT — advanced container form defaults (write-only tab). */
-export const DEFAULT_CONTAINER_ADVANCED: {
-  additional_mounts: ContainerMount[];
-  cmd: string[];
-  env: ContainerEnvVar[];
-} = {
-  additional_mounts: [],
-  cmd: [],
-  env: [],
-};
-
 /** Default capability values, used until agents.inspect prefills the form on
  *  tab open. A partial update is written only for fields the operator changed. */
 export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_use_config'>> & {
@@ -97,6 +97,10 @@ export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_us
   denied_tools: [],
   wiki_visible_to: [],
   db_sources: [],
+  approval_required_tools: [],
+  irreversible_tools: [],
+  maybe_irreversible_tools: [],
+  scoped_tools: [],
   native_sandbox: false,
   policy: [],
   os_native: false,
@@ -169,16 +173,17 @@ export const DEFAULT_ODOO: {
   password: '',
 };
 
-/** Advanced (G.8 free-form scalar tables) — write-only. Stored as KV rows. */
-export interface KvRow { key: string; value: string }
+/** Advanced typed key/value editor row (v1.68 W1). `value` is the raw text
+ *  the operator typed; `type` decides how it is parsed before sending. */
+export interface KvRow { section: string; key: string; value: string; type: AgentKvType }
 export const DEFAULT_ADVANCED: {
   account_pool: string[];
   utility: string;
   heartbeat_max_concurrent_runs: number;
   heartbeat_cron_timezone: string;
-  proactive_token_budget_per_check: number;
   proactive_timezone: string;
-  proactive_max_turns: number;
+  /** null = not set in agent.toml (the gateway default applies). */
+  proactive_max_turns: number | null;
   /** [proactive] notify target — goal-loop + skill-digest push destination.
    *  Prefilled from agents.inspect (unlike the write-only extras above). */
   proactive_notify_channel: string;
@@ -189,30 +194,67 @@ export const DEFAULT_ADVANCED: {
    *  agent's OWN raw value, never the fallen-back effective one — see
    *  `ProactiveSettings.quiet_hours_own` in `lib/api.ts`). */
   proactive_quiet_hours: string;
-  stagnation_enabled: boolean;
-  stagnation_window_seconds: number;
-  stagnation_trigger_threshold: number;
-  stagnation_action: 'log_only' | 'suppress';
-  ptc: KvRow[];
-  prompt: KvRow[];
-  cultural_context: KvRow[];
+  kv: KvRow[];
 } = {
   account_pool: [],
   utility: '',
   heartbeat_max_concurrent_runs: 1,
   heartbeat_cron_timezone: '',
-  proactive_token_budget_per_check: 0,
   proactive_timezone: '',
-  proactive_max_turns: 1,
+  proactive_max_turns: null,
   proactive_notify_channel: '',
   proactive_notify_chat_id: '',
   proactive_notify_thread_id: '',
   proactive_quiet_hours: '',
-  stagnation_enabled: false,
-  stagnation_window_seconds: 3600,
-  stagnation_trigger_threshold: 3,
-  stagnation_action: 'log_only',
-  ptc: [],
-  prompt: [],
-  cultural_context: [],
+  kv: [],
+};
+
+/** v1.68 W1 — sections the advanced editor suggests (all have a reader). */
+export const KV_SECTION_SUGGESTIONS: ReadonlyArray<string> = [
+  'prompt', 'fork', 'night_engine', 'evolution', 'budget', 'planner', 'goal_intent', 'skills',
+];
+
+export const EFFORT_LEVELS: ReadonlyArray<Exclude<AgentEffort, ''>> = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+export const TEAM_ROLE_KEYS: ReadonlyArray<AgentTeamRoleKey> = ['planner', 'executor', 'verifier', 'utility'];
+
+export type TeamRoleForm = { runtime: string; model: string; effort: string };
+
+/** v1.68 W1 — the new per-employee controls. Shown empty/default until
+ *  `agents.inspect` prefills them; written only when the operator edits one. */
+export const DEFAULT_V168: {
+  daily_cap_cents: number;
+  effort: AgentEffort;
+  minimal_context: boolean;
+  fork_enabled: boolean;
+  team_enabled: boolean;
+  team_roles: Record<AgentTeamRoleKey, TeamRoleForm>;
+  guardrails_enabled: boolean;
+  guardrails_block_secrets: boolean;
+  guardrails_block_injection_echo: boolean;
+  guardrails_redact_pii: boolean;
+  guardrails_deny_phrases: string[];
+  decision_continuity: boolean;
+  decision_ttl_days: number;
+  night_engine_enabled: boolean;
+} = {
+  daily_cap_cents: 0,
+  effort: '',
+  minimal_context: true,
+  fork_enabled: false,
+  team_enabled: true,
+  team_roles: {
+    planner: { runtime: '', model: '', effort: '' },
+    executor: { runtime: '', model: '', effort: '' },
+    verifier: { runtime: '', model: '', effort: '' },
+    utility: { runtime: '', model: '', effort: '' },
+  },
+  guardrails_enabled: false,
+  guardrails_block_secrets: true,
+  guardrails_block_injection_echo: true,
+  guardrails_redact_pii: false,
+  guardrails_deny_phrases: [],
+  decision_continuity: false,
+  decision_ttl_days: 7,
+  night_engine_enabled: false,
 };

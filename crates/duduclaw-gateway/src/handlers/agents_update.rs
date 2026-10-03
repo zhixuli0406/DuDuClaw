@@ -10,7 +10,9 @@ impl MethodHandler {
     /// Only sends changed fields — unchanged fields are omitted from the request.
     #[cfg(test)]
     pub(crate) async fn handle_agents_update(&self, params: Value) -> WsFrame {
-        self.handle_agents_update_as(params, None).await
+        // Tests drive the operator path; authority-key gating is exercised
+        // through `handle_agents_update_as` with explicit contexts.
+        self.handle_agents_update_as(params, Some(&UserContext::admin_fallback())).await
     }
 
     /// `agents.update`. `caller` is the authenticated dashboard user; it is
@@ -135,54 +137,27 @@ impl MethodHandler {
         };
         let old_display_name_for_closure = old_display_name.clone();
 
-        // WP22 T1 — when this call moves the agent in the org tree, the
-        // authoritative `<home>/org.toml` record has to move with it. Only
-        // `reports_to` / `department` params trigger it: an unrelated edit must
-        // not quietly adopt a mirror value the operator has not synced. The
-        // same validation the mutation closure applies is repeated here so an
-        // invalid department can never reach the store (the closure rejects it,
-        // but only later).
+        // WP22 T1/T5 + v1.68 — the authoritative `<home>/org.toml` record
+        // follows the agent only when this write actually CHANGED
+        // `reports_to` / `department` in agent.toml (computed from the
+        // before/after diff inside the closure, committed after the mirror
+        // write succeeded). Re-sending the prefilled value on an unrelated
+        // autosave is no longer a change, so a hand-edited mirror is never
+        // promoted into the authority by a dashboard save.
         //
-        // # WP22 T5 — computed here, committed only after the mirror write
-        //
-        // This used to `upsert` right here, before the mutation closure ran.
-        // The closure can still fail for a reason unrelated to the org fields
-        // (an invalid `role`, `api_mode`, cron expression, …), and on failure
-        // `update_agent_toml` leaves `agent.toml` untouched — so a rejected
-        // request could still move the agent in the authority while telling
-        // the caller it had failed. Deferring to the `Ok` arm makes the only
-        // possible divergence the safe one: mirror moved, authority stale
-        // (visible as drift in `duduclaw doctor`, no privilege gained).
-        let pending_org_entry: Option<duduclaw_core::OrgEntry> = {
-            let new_reports_to = params.get("reports_to").and_then(|v| v.as_str());
-            let new_department = params
-                .get("department")
-                .and_then(|v| v.as_str())
-                .map(str::trim);
-            let department_ok = new_department
-                .is_none_or(|d| d.is_empty() || duduclaw_core::is_valid_department(d));
-            if (new_reports_to.is_some() || new_department.is_some()) && department_ok {
-                // Carry over whichever half this call does not touch, from
-                // the current authority (store entry, else the mirror).
-                let store = duduclaw_core::org_store::load(&self.home_dir);
-                let current = store.get(&agent_id).cloned().unwrap_or_else(|| {
-                    duduclaw_core::org_store::read_mirror(
-                        &self
-                            .home_dir
-                            .join("agents")
-                            .join(&agent_id)
-                            .join("agent.toml"),
-                    )
-                    .unwrap_or_default()
-                });
-                Some(duduclaw_core::OrgEntry::new(
-                    new_reports_to.unwrap_or(&current.reports_to),
-                    new_department.unwrap_or(&current.department),
-                ))
-            } else {
-                None
-            }
-        };
+        // v1.68 — authority keys (`AUTHORITY_KEYS`: org fields, all of
+        // `[capabilities]`, `[container] sandbox_enabled / network_access`,
+        // `[permissions] can_modify_own_soul`) may only be changed by an
+        // admin; `agents.update` itself stays Owner-level so non-admin owners
+        // keep every other field. `None` (no identity) is treated as
+        // non-admin: fail closed.
+        let caller_is_admin = caller.is_some_and(|c| c.is_admin());
+        let authority_changes: std::sync::Arc<
+            std::sync::Mutex<Vec<super::system_update_config_v168::ProtectedChange>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let authority_for_closure = authority_changes.clone();
+        let audit_agent_id = agent_id.clone();
+        let audit_user_id = caller.map(|c| c.user_id.clone()).unwrap_or_else(|| "unknown".into());
 
         let params_clone = params.clone();
         let mut changes: Vec<String> = Vec::new();
@@ -205,6 +180,12 @@ impl MethodHandler {
         let align_skipped_for_closure = align_skipped.clone();
 
         let result = self.update_agent_toml(&agent_id, move |table| {
+            // v1.68: snapshot for the authority diff and the final typed
+            // check (only enforced when the file parsed before this write, so
+            // an already-broken file can still be repaired through here).
+            let table_before = table.clone();
+            let parsed_before = super::agents_update_v168::agent_config_check(&table_before).is_ok();
+
             // ── Identity fields ([agent] section) ──
             if let Some(agent_section) = table.get_mut("agent").and_then(|v| v.as_table_mut()) {
                 if let Some(v) = params_clone.get("display_name").and_then(|v| v.as_str()) {
@@ -307,9 +288,13 @@ impl MethodHandler {
             }
 
             // ── Local model fields ([model.local] section) ──
+            // v1.68: `local_backend` / `local_context_length` / `local_gpu_layers`
+            // are no longer accepted (no reader). An empty `local_model`
+            // removes the key, and a `[model.local]` left without a model is
+            // removed entirely (`model` is required by the typed loader, and
+            // local inference with no model is not a setting).
             if let Some(model) = table.get_mut("model").and_then(|v| v.as_table_mut()) {
-                // Check if any local model param is provided
-                let has_local_params = ["local_model", "local_backend", "local_context_length", "local_gpu_layers", "prefer_local", "use_router"]
+                let has_local_params = ["local_model", "prefer_local", "use_router"]
                     .iter().any(|k| params_clone.get(*k).is_some());
 
                 if has_local_params {
@@ -318,28 +303,14 @@ impl MethodHandler {
                         .as_table_mut();
                     if let Some(local) = local {
                         if let Some(v) = params_clone.get("local_model").and_then(|v| v.as_str()) {
-                            local.insert("model".into(), toml::Value::String(v.into()));
-                            changes.push(format!("model.local.model = \"{v}\""));
-                        }
-                        if let Some(v) = params_clone.get("local_backend").and_then(|v| v.as_str()) {
-                            match v {
-                                // `llama_cpp` / `mistral_rs` were removed on 2026-09-29
-                                // (feature audit T1-D3 / T3-S5); `openai_compat` is the
-                                // only in-process local backend left.
-                                "openai_compat" => {
-                                    local.insert("backend".into(), toml::Value::String(v.into()));
-                                    changes.push(format!("model.local.backend = \"{v}\""));
-                                }
-                                _ => return Err(format!("Invalid local_backend '{v}'. Valid: openai_compat")),
+                            let v = v.trim();
+                            if v.is_empty() {
+                                local.remove("model");
+                                changes.push("model.local.model cleared".into());
+                            } else {
+                                local.insert("model".into(), toml::Value::String(v.into()));
+                                changes.push(format!("model.local.model = \"{v}\""));
                             }
-                        }
-                        if let Some(v) = params_clone.get("local_context_length").and_then(|v| v.as_u64()) {
-                            local.insert("context_length".into(), toml::Value::Integer(v as i64));
-                            changes.push(format!("model.local.context_length = {v}"));
-                        }
-                        if let Some(v) = params_clone.get("local_gpu_layers").and_then(|v| v.as_i64()) {
-                            local.insert("gpu_layers".into(), toml::Value::Integer(v));
-                            changes.push(format!("model.local.gpu_layers = {v}"));
                         }
                         if let Some(v) = params_clone.get("prefer_local").and_then(|v| v.as_bool()) {
                             local.insert("prefer_local".into(), toml::Value::Boolean(v));
@@ -349,6 +320,13 @@ impl MethodHandler {
                             local.insert("use_router".into(), toml::Value::Boolean(v));
                             changes.push(format!("model.local.use_router = {v}"));
                         }
+                    }
+                    if model
+                        .get("local")
+                        .and_then(|l| l.as_table())
+                        .is_some_and(|l| !l.contains_key("model"))
+                    {
+                        model.remove("local");
                     }
                 }
             }
@@ -404,14 +382,8 @@ impl MethodHandler {
                         pt.insert("enabled".into(), toml::Value::Boolean(v));
                         changes.push(format!("proactive.enabled = {v}"));
                     }
-                    if let Some(v) = p.get("check_interval").and_then(|v| v.as_str()) {
-                        let normalised = crate::cron_scheduler::normalise_cron(v);
-                        if normalised.parse::<cron::Schedule>().is_err() {
-                            return Err(format!("Invalid proactive check_interval cron expression: {v}"));
-                        }
-                        pt.insert("check_interval".into(), toml::Value::String(v.into()));
-                        changes.push(format!("proactive.check_interval = \"{v}\""));
-                    }
+                    // v1.68: `check_interval` is no longer accepted (validated
+                    // as cron but never read).
                     for key in &["quiet_hours_start", "quiet_hours_end"] {
                         if let Some(v) = p.get(*key).and_then(|v| v.as_u64()) {
                             if v > 23 {
@@ -478,6 +450,16 @@ impl MethodHandler {
                         changes.push(format!("permissions.{key} = {v}"));
                     }
                 }
+                // v1.68: an explicit write is an operator choice — mark the
+                // file so the boot migration never resets it.
+                if !perms.contains_key(super::agents_update_v168::PERMISSIONS_MARKER_KEY)
+                    && changes.iter().any(|c| c.starts_with("permissions."))
+                {
+                    perms.insert(
+                        super::agents_update_v168::PERMISSIONS_MARKER_KEY.into(),
+                        toml::Value::String(super::agents_update_v168::PERMISSIONS_MARKER_VALUE.into()),
+                    );
+                }
             }
 
             // ── Container fields ([container] section) ──
@@ -489,11 +471,10 @@ impl MethodHandler {
                     ct.insert("timeout_ms".into(), toml::Value::Integer(v as i64));
                     changes.push(format!("container.timeout_ms = {v}"));
                 }
-                if let Some(v) = params_clone.get("max_concurrent").and_then(|v| v.as_u64()) {
-                    ct.insert("max_concurrent".into(), toml::Value::Integer(v as i64));
-                    changes.push(format!("container.max_concurrent = {v}"));
-                }
-                for key in &["sandbox_enabled", "network_access", "readonly_project"] {
+                // v1.68: `max_concurrent` / `readonly_project` are no longer
+                // accepted (no reader; the task sandbox mounts its own
+                // allowlist). Existing values stay in the file untouched.
+                for key in &["sandbox_enabled", "network_access"] {
                     if let Some(v) = params_clone.get(*key).and_then(|v| v.as_bool()) {
                         ct.insert((*key).into(), toml::Value::Boolean(v));
                         changes.push(format!("container.{key} = {v}"));
@@ -510,7 +491,10 @@ impl MethodHandler {
                 // this list any more — the layer is always on, so a stale
                 // client that still posts the key is ignored rather than
                 // writing a dead flag back into agent.toml.
-                for key in &["skill_auto_activate", "skill_security_scan", "gvu_enabled"] {
+                // v1.68: `skill_auto_activate` (the activation path never read
+                // it) and `skill_security_scan` (the scanner always runs) are
+                // no longer accepted.
+                for key in &["gvu_enabled"] {
                     if let Some(v) = params_clone.get(*key).and_then(|v| v.as_bool()) {
                         evo.insert((*key).into(), toml::Value::Boolean(v));
                         changes.push(format!("evolution.{key} = {v}"));
@@ -529,69 +513,10 @@ impl MethodHandler {
                     }
                 }
 
-                // ── Stagnation detection sub-section ──────────────────────────
-                // Keys accepted: stagnation_enabled, stagnation_window_seconds,
-                //                stagnation_trigger_threshold, stagnation_action
-                {
-                    // SECURITY-2: validate stagnation params before writing to TOML.
-                    // Illegal values (window_seconds=0, trigger_threshold=0) must never
-                    // reach agent.toml as P1 stagnation-detection logic depends on them.
-                    let sd_validation = StagnationDetectionConfig {
-                        enabled: params_clone.get("stagnation_enabled").and_then(|v| v.as_bool()),
-                        window_seconds: params_clone.get("stagnation_window_seconds").and_then(|v| v.as_u64()),
-                        trigger_threshold: params_clone.get("stagnation_trigger_threshold").and_then(|v| v.as_u64()),
-                        action: params_clone.get("stagnation_action").and_then(|v| v.as_str()).map(|s| s.to_owned()),
-                    };
-                    if let Err(e) = sd_validation.validate() {
-                        return Err(format!("evolution_toggle: invalid stagnation config: {e}"));
-                    }
-
-                    let sd = evo
-                        .entry("stagnation_detection")
-                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-                        .as_table_mut();
-                    if let Some(sd) = sd {
-                        let mut sd_changed = false;
-
-                        if let Some(v) = params_clone.get("stagnation_enabled").and_then(|v| v.as_bool()) {
-                            sd.insert("enabled".into(), toml::Value::Boolean(v));
-                            changes.push(format!("evolution.stagnation_detection.enabled = {v}"));
-                            sd_changed = true;
-                        }
-                        if let Some(v) = params_clone.get("stagnation_window_seconds").and_then(|v| v.as_u64()) {
-                            sd.insert("window_seconds".into(), toml::Value::Integer(v as i64));
-                            changes.push(format!("evolution.stagnation_detection.window_seconds = {v}"));
-                            sd_changed = true;
-                        }
-                        if let Some(v) = params_clone.get("stagnation_trigger_threshold").and_then(|v| v.as_u64()) {
-                            sd.insert("trigger_threshold".into(), toml::Value::Integer(v as i64));
-                            changes.push(format!("evolution.stagnation_detection.trigger_threshold = {v}"));
-                            sd_changed = true;
-                        }
-                        // stagnation_action: "log_only" | "suppress" (P1)
-                        if let Some(v) = params_clone.get("stagnation_action").and_then(|v| v.as_str()) {
-                            match v {
-                                "log_only" | "suppress" => {
-                                    sd.insert("action".into(), toml::Value::String(v.to_owned()));
-                                    changes.push(format!("evolution.stagnation_detection.action = {v}"));
-                                    sd_changed = true;
-                                }
-                                other => {
-                                    tracing::warn!(
-                                        "evolution_toggle: unknown stagnation_action '{}', ignored",
-                                        other
-                                    );
-                                }
-                            }
-                        }
-
-                        // If no stagnation sub-keys were touched, remove the empty
-                        // sub-table so we don't dirty the TOML needlessly.
-                        if !sd_changed {
-                            evo.remove("stagnation_detection");
-                        }
-                    }
-                }
+                // v1.68: `stagnation_*` params are no longer accepted. The live
+                // detector (`gvu/stagnation.rs`) reads `gvu_stagnation_*` keys
+                // with different semantics; `[evolution.stagnation_detection]`
+                // only fed a stub that never suppressed anything.
             }
 
             // ── Per-agent channel tokens ([channels.*] sections) ──
@@ -702,11 +627,11 @@ impl MethodHandler {
                 ("telegram_bot_token", Some("bot_token")),
             ], &mut changes)?;
 
-            // LINE
-            set_channel_token(table, "line", &[
-                ("line_channel_token", Some("channel_token")),
-                ("line_channel_secret", Some("channel_secret")),
-            ], &mut changes)?;
+
+            // v1.68: per-agent LINE / WhatsApp / Feishu / WeCom / DingTalk
+            // credentials are no longer accepted — those channels read only
+            // the global `config.toml [channels]`. Discord / Telegram / Slack
+            // per-agent bots stay.
 
             // Slack
             set_channel_token(table, "slack", &[
@@ -714,74 +639,12 @@ impl MethodHandler {
                 ("slack_bot_token", Some("bot_token")),
             ], &mut changes)?;
 
-            // WhatsApp
-            set_channel_token(table, "whatsapp", &[
-                ("whatsapp_access_token", Some("access_token")),
-                ("whatsapp_verify_token", Some("verify_token")),
-                ("whatsapp_phone_number_id", Some("phone_number_id")),
-                ("whatsapp_app_secret", Some("app_secret")),
-            ], &mut changes)?;
 
-            // Feishu
-            set_channel_token(table, "feishu", &[
-                ("feishu_app_id", Some("app_id")),
-                ("feishu_app_secret", Some("app_secret")),
-                ("feishu_verification_token", Some("verification_token")),
-            ], &mut changes)?;
 
-            // WeCom (企業微信)
-            set_channel_token(table, "wecom", &[
-                ("wecom_corp_id", Some("corp_id")),
-                ("wecom_corp_secret", Some("corp_secret")),
-                ("wecom_agent_id", Some("agent_id")),
-                ("wecom_callback_token", Some("callback_token")),
-                ("wecom_encoding_aes_key", Some("encoding_aes_key")),
-            ], &mut changes)?;
 
-            // DingTalk (釘釘)
-            set_channel_token(table, "dingtalk", &[
-                ("dingtalk_app_key", Some("app_key")),
-                ("dingtalk_app_secret", Some("app_secret")),
-            ], &mut changes)?;
 
-            // ── Sticker fields ([sticker] section) ──
-            let sticker = table.entry("sticker")
-                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-                .as_table_mut();
-            if let Some(sticker) = sticker {
-                if let Some(v) = params_clone.get("sticker_enabled").and_then(|v| v.as_bool()) {
-                    sticker.insert("enabled".into(), toml::Value::Boolean(v));
-                    changes.push(format!("sticker.enabled = {v}"));
-                }
-                if let Some(v) = params_clone.get("sticker_probability").and_then(|v| v.as_f64()) {
-                    if !(0.0..=1.0).contains(&v) {
-                        return Err("sticker_probability must be 0.0-1.0".into());
-                    }
-                    sticker.insert("probability".into(), toml::Value::Float(v));
-                    changes.push(format!("sticker.probability = {v}"));
-                }
-                if let Some(v) = params_clone.get("sticker_intensity_threshold").and_then(|v| v.as_f64()) {
-                    if !(0.0..=1.0).contains(&v) {
-                        return Err("sticker_intensity_threshold must be 0.0-1.0".into());
-                    }
-                    sticker.insert("intensity_threshold".into(), toml::Value::Float(v));
-                    changes.push(format!("sticker.intensity_threshold = {v}"));
-                }
-                if let Some(v) = params_clone.get("sticker_cooldown_messages").and_then(|v| v.as_u64()) {
-                    if v > 100 {
-                        return Err("sticker_cooldown_messages must be 0-100".into());
-                    }
-                    sticker.insert("cooldown_messages".into(), toml::Value::Integer(v as i64));
-                    changes.push(format!("sticker.cooldown_messages = {v}"));
-                }
-                if let Some(v) = params_clone.get("sticker_expressiveness").and_then(|v| v.as_str()) {
-                    if !["minimal", "moderate", "expressive"].contains(&v) {
-                        return Err("sticker_expressiveness must be minimal|moderate|expressive".into());
-                    }
-                    sticker.insert("expressiveness".into(), toml::Value::String(v.into()));
-                    changes.push(format!("sticker.expressiveness = \"{v}\""));
-                }
-            }
+            // v1.68: `sticker_*` params are no longer accepted (nothing
+            // reads `[sticker]`).
 
             // ── Capabilities fields ([capabilities] section, CAP.1–CAP.4) ──
             // High-risk tool / computer-use / browser permissions. Delegated to
@@ -817,11 +680,9 @@ impl MethodHandler {
             let evo_adv_changes = apply_evolution_advanced_to_table(table, &params_clone)?;
             changes.extend(evo_adv_changes);
 
-            // ── Container advanced ([container.*] fields, CT.1–CT.2) ──
-            // additional_mounts / cmd / env. Does NOT duplicate the inline
-            // sandbox/network/timeout handling.
-            let ct_adv_changes = apply_container_advanced_to_table(table, &params_clone)?;
-            changes.extend(ct_adv_changes);
+            // v1.68: `container_advanced` (additional_mounts / cmd / env) is
+            // no longer accepted: the task sandbox mounts only its own
+            // allowlist and never read these.
 
             // ── Per-agent Odoo override ([odoo] section, ODO.1) ──
             // profile / allowed_models / allowed_actions (verb:model) /
@@ -854,8 +715,16 @@ impl MethodHandler {
                         changes.push(format!("model.account_pool = [{} entries]", pool.len()));
                     }
                     if let Some(v) = params_clone.get("utility").and_then(|v| v.as_str()) {
-                        model.insert("utility".into(), toml::Value::String(v.into()));
-                        changes.push(format!("model.utility = \"{v}\""));
+                        // v1.68: empty removes the key (the loader then uses
+                        // the default utility model) instead of writing "".
+                        let v = v.trim();
+                        if v.is_empty() {
+                            model.remove("utility");
+                            changes.push("model.utility cleared".into());
+                        } else {
+                            model.insert("utility".into(), toml::Value::String(v.into()));
+                            changes.push(format!("model.utility = \"{v}\""));
+                        }
                     }
                 }
             }
@@ -898,7 +767,6 @@ impl MethodHandler {
                     "enabled",
                     "base_threshold",
                     "max_per_hour",
-                    "token_budget_per_check",
                     "timezone",
                     "max_turns",
                 ]
@@ -931,10 +799,7 @@ impl MethodHandler {
                         pt.insert("max_per_hour".into(), toml::Value::Integer(v as i64));
                         changes.push(format!("proactive.max_per_hour = {v}"));
                     }
-                    if let Some(v) = p.get("token_budget_per_check").and_then(|v| v.as_u64()) {
-                        pt.insert("token_budget_per_check".into(), toml::Value::Integer(v as i64));
-                        changes.push(format!("proactive.token_budget_per_check = {v}"));
-                    }
+                    // v1.68: `token_budget_per_check` is no longer accepted (no reader).
                     if let Some(v) = p.get("timezone").and_then(|v| v.as_str()) {
                         if v.parse::<chrono_tz::Tz>().is_err() {
                             return Err(format!("Invalid proactive timezone '{v}' (IANA tz)"));
@@ -956,7 +821,10 @@ impl MethodHandler {
             // Each accepts a flat object of string|bool|int|float scalars; unknown
             // keys are written verbatim (these sections are free-form per-agent
             // tuning, not enum-validated). Empty object is a no-op.
-            for sect in &["ptc", "prompt", "cultural_context"] {
+            // v1.68: `[ptc]` / `[cultural_context]` had no reader and are no
+            // longer accepted; prefer the typed `advanced_kv` rows. The whole
+            // result is checked against `AgentConfig` below either way.
+            for sect in &["prompt"] {
                 if let Some(obj) = params_clone.get(*sect).and_then(|v| v.as_object()) {
                     if obj.is_empty() {
                         continue;
@@ -1062,8 +930,48 @@ impl MethodHandler {
                 }
             }
 
+            // ── v1.68 per-agent keys (budget.daily_cap_cents, model.effort,
+            // fork, team, guardrails, memory, night_engine,
+            // runtime.minimal_context, advanced_kv) ──
+            changes.extend(super::agents_update_v168::apply_agent_v168_keys(table, &params_clone, caller_is_admin)?);
+
+            // ── v1.68 authority guard: a real change to an org-guarded key
+            // needs an admin; every change is audited after the commit. ──
+            let authority = super::agents_update_v168::authority_diff(&table_before, table);
+            if !authority.is_empty() && !caller_is_admin {
+                let keys: Vec<&str> = authority.iter().map(|c| c.key.as_str()).collect();
+                crate::security_autopilot::audit_and_emit(
+                    &home_for_update,
+                    &duduclaw_security::audit::AuditEvent::new(
+                        "agent_authority_refused",
+                        audit_agent_id.as_str(),
+                        duduclaw_security::audit::Severity::Warning,
+                        json!({
+                            "agent_id": audit_agent_id,
+                            "keys": keys,
+                            "user_id": audit_user_id,
+                            "source": "agents.update",
+                        }),
+                    ),
+                );
+                return Err(format!(
+                    "Only an administrator can change {} — ask an admin, or leave those fields as they are",
+                    keys.join(", ")
+                ));
+            }
+            if let Ok(mut slot) = authority_for_closure.lock() {
+                *slot = authority;
+            }
+
             if changes.is_empty() {
                 return Err("No valid fields to update".into());
+            }
+
+            // ── v1.68: the file about to be written must load with the
+            // registry's typed parser, or the employee would silently drop
+            // out of the registry on the next scan. ──
+            if parsed_before {
+                super::agents_update_v168::agent_config_check(table)?;
             }
 
             Ok(())
@@ -1072,14 +980,41 @@ impl MethodHandler {
         match result {
             Ok(hot_reloaded) => {
                 // WP22 T5 — the mirror write committed, so the authority may
-                // now follow. See `pending_org_entry`'s comment for why this
-                // is not done before the closure.
-                if let Some(entry) = pending_org_entry {
+                // now follow, and only when the org pair actually changed
+                // (see the comment above `caller_is_admin`). A failed write
+                // never reaches here, so a rejected request cannot move the
+                // agent in the authority.
+                let authority = authority_changes.lock().map(|g| g.clone()).unwrap_or_default();
+                let org_moved = authority
+                    .iter()
+                    .any(|c| c.key == "agent.reports_to" || c.key == "agent.department");
+                if org_moved {
+                    // Carry the new mirror pair into the authority store.
+                    let mirror = duduclaw_core::org_store::read_mirror(
+                        &self.home_dir.join("agents").join(&agent_id).join("agent.toml"),
+                    )
+                    .unwrap_or_default();
                     if let Err(e) =
-                        duduclaw_core::org_store::upsert(&self.home_dir, &agent_id, entry)
+                        duduclaw_core::org_store::upsert(&self.home_dir, &agent_id, mirror)
                     {
                         warn!(agent = %agent_id, error = %e, "org.toml upsert failed on agents.update");
                     }
+                }
+                if !authority.is_empty() {
+                    crate::security_autopilot::audit_and_emit(
+                        &self.home_dir,
+                        &duduclaw_security::audit::AuditEvent::new(
+                            "agent_authority_changed",
+                            agent_id.as_str(),
+                            duduclaw_security::audit::Severity::Warning,
+                            json!({
+                                "agent_id": agent_id,
+                                "user_id": caller.map(|c| c.user_id.as_str()).unwrap_or("unknown"),
+                                "source": "agents.update",
+                                "changes": super::agents_update_v168::audit_details(&authority),
+                            }),
+                        ),
+                    );
                 }
 
                 // R1 (2026-10): the write committed; audit any deprecated

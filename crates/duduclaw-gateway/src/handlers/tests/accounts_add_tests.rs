@@ -503,6 +503,7 @@ fn accounts_list_row_surfaces_provider() {
         email: String::new(),
         subscription: String::new(),
         label: String::new(),
+        tags: Vec::new(),
         expires_at: None,
         days_until_expiry: None,
         credential_state: Default::default(),
@@ -513,6 +514,7 @@ fn accounts_list_row_surfaces_provider() {
     };
     let row = account_status_to_json(&status);
     assert_eq!(row["provider"], json!("gemini"));
+    assert_eq!(row["tags"], json!([]), "v1.68.0: tags are part of the row");
     assert_eq!(row["id"], json!("acct-gemini"));
 
     // D5: the credential badge fields must reach the dashboard. The

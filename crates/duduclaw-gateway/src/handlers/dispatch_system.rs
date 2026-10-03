@@ -150,6 +150,16 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_system_update_config(params, ctx).await
             }
+            // ── v1.68: raw config editor (admin; masked read, validated +
+            //    backed-up + audited write) ──
+            "config.raw.get" => {
+                require_admin!();
+                self.handle_config_raw_get(params).await
+            }
+            "config.raw.set" => {
+                require_admin!();
+                self.handle_config_raw_set(params, ctx).await
+            }
             // ── WP21 §2.8: delegation permissions (owner/admin only) ─────
             // Who may hand work to whom, org-wide. Admin-gated like every
             // other config-writing RPC; the write takes effect on the next

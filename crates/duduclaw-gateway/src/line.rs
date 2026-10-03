@@ -549,10 +549,10 @@ pub(crate) async fn handle_line_webhook(
                         if let Some(data) = content_data {
                             // Transcribe voice/audio messages to text.
                             if msg.msg_type == "audio" {
-                                match duduclaw_inference::whisper::transcribe(
+                                match crate::stt::transcribe_channel_audio(
+                                    &state.ctx.home_dir,
                                     &data,
                                     Some("zh"),
-                                    &duduclaw_inference::whisper::WhisperMode::Api,
                                 )
                                 .await
                                 {

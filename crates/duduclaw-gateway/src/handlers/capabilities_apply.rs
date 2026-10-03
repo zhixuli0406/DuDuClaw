@@ -118,6 +118,12 @@ pub(crate) fn apply_capabilities_to_table(
         ("allowed_tools", "allowed_tools"),
         ("denied_tools", "denied_tools"),
         ("wiki_visible_to", "wiki_visible_to"),
+        // v1.68: approval / irreversibility / task-scoped grant lists (read
+        // per call by `approval/gates.rs` and `capability_grants.rs`).
+        ("approval_required_tools", "approval_required_tools"),
+        ("irreversible_tools", "irreversible_tools"),
+        ("maybe_irreversible_tools", "maybe_irreversible_tools"),
+        ("scoped_tools", "scoped_tools"),
     ] {
         if let Some(arr) = cap.get(*param_key).and_then(|v| v.as_array()) {
             let mut out: Vec<toml::Value> = Vec::with_capacity(arr.len());

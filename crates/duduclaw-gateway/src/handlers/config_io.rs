@@ -21,11 +21,23 @@ impl MethodHandler {
     }
 
     /// Write a TOML table back to disk.
+    ///
+    /// v1.68: refuses when the file being replaced exists but does not parse.
+    /// Callers read through the lenient [`Self::read_config_table`], which
+    /// turns an unparsable file into an empty table — writing that back would
+    /// replace the whole config with the few keys the RPC carried. `path` may
+    /// be the `*.tmp` staging file; the check then looks at the real file.
     pub(crate) async fn write_config_table(
         &self,
         path: &std::path::Path,
         table: &toml::Table,
     ) -> std::io::Result<()> {
+        let target = if path.extension().is_some_and(|e| e == "tmp") {
+            path.with_extension("")
+        } else {
+            path.to_path_buf()
+        };
+        refuse_overwriting_unparsable(&target).await?;
         let content = toml::to_string_pretty(table)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         tokio::fs::write(path, content).await
@@ -149,5 +161,19 @@ impl MethodHandler {
         }
 
         checks
+    }
+}
+
+/// `Err` when `path` exists and is not valid TOML (see `write_config_table`).
+pub(crate) async fn refuse_overwriting_unparsable(path: &std::path::Path) -> std::io::Result<()> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) if text.parse::<toml::Table>().is_err() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} is not valid TOML — refusing to overwrite it (fix it in the raw editor or a terminal first)",
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("config file")
+            ),
+        )),
+        _ => Ok(()),
     }
 }

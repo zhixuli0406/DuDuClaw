@@ -216,6 +216,27 @@ pub(crate) fn apply_odoo_to_table(
         changes.push(format!("odoo.company_ids = [{} entries]", out.len()));
     }
 
+    // v1.68: a stored credential only follows the URL it was entered for.
+    // Changing `url` while keeping `api_key` / `password` (absent or a
+    // placeholder) is refused, so the secret is never sent to a new host.
+    if let Some(new_url) = odoo_in.get("url").and_then(|v| v.as_str()).map(str::trim)
+        && !new_url.is_empty()
+        && section.get("url").and_then(|v| v.as_str()) != Some(new_url)
+    {
+        for (param_key, enc_key) in [("api_key", "api_key_enc"), ("password", "password_enc")] {
+            let stored = section.contains_key(enc_key) || section.contains_key(param_key);
+            let kept = odoo_in
+                .get(param_key)
+                .and_then(|v| v.as_str())
+                .is_none_or(|v| super::config_commit::is_secret_placeholder(v.trim()));
+            if stored && kept {
+                return Err(format!(
+                    "odoo.url changed — re-enter odoo.{param_key} for the new server (or send \"\" to clear it)"
+                ));
+            }
+        }
+    }
+
     // url / db / username (plaintext scalars, optional overrides).
     // url + db are validated with the SAME SSRF / db-name validators as the
     // global `odoo.configure` path — an override must not be a bypass (I5).
@@ -250,7 +271,7 @@ pub(crate) fn apply_odoo_to_table(
     for (param_key, enc_key) in &[("api_key", "api_key_enc"), ("password", "password_enc")] {
         if let Some(v) = odoo_in.get(*param_key).and_then(|v| v.as_str()) {
             // Refuse to persist the masked placeholder back as a real secret.
-            if v == SECRET_MASK_SET {
+            if super::config_commit::is_secret_placeholder(v) {
                 continue;
             }
             // Drop any stale cleartext mirror.
@@ -275,4 +296,29 @@ pub(crate) fn apply_odoo_to_table(
     }
 
     Ok(changes)
+}
+
+#[cfg(test)]
+mod v168_url_binding_tests {
+    use super::*;
+
+    #[test]
+    fn kept_credential_cannot_follow_a_new_url() {
+        let home = tempfile::tempdir().unwrap();
+        let mut t: toml::Table =
+            toml::from_str("[odoo]\nurl = \"https://erp.example.com\"\napi_key_enc = \"ENC\"\n").unwrap();
+        let e = apply_odoo_to_table(&mut t, &json!({"odoo": {"url": "https://evil.example.com"}}), home.path())
+            .unwrap_err();
+        assert!(e.contains("odoo.api_key"), "{e}");
+        assert!(apply_odoo_to_table(
+            &mut t,
+            &json!({"odoo": {"url": "https://evil.example.com", "api_key": "«set»"}}),
+            home.path()
+        )
+        .is_err());
+        // Same URL re-sent with the placeholder is fine.
+        apply_odoo_to_table(&mut t, &json!({"odoo": {"url": "https://erp.example.com", "api_key": "***set***"}}), home.path())
+            .unwrap();
+        assert_eq!(t["odoo"]["api_key_enc"].as_str(), Some("ENC"));
+    }
 }

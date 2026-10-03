@@ -29,8 +29,10 @@ pub struct InferenceConfig {
     /// Auto-load default model on gateway startup
     pub auto_load: bool,
 
-    /// Maximum memory budget for inference in MB (0 = unlimited)
-    pub max_memory_mb: u64,
+    // v1.68: `max_memory_mb` and `[embedding]` were removed — nothing read
+    // them (semantic vectors are gated by `DUDUCLAW_SEMANTIC_VECTORS`). The
+    // struct has no `deny_unknown_fields`, so an existing file that still
+    // carries them keeps loading; the keys are simply ignored.
 
     /// OpenAI-compatible endpoint (for Exo, llamafile, vLLM, etc.)
     pub openai_compat: Option<OpenAiCompatConfig>,
@@ -41,115 +43,48 @@ pub struct InferenceConfig {
     /// llamafile subprocess settings
     pub llamafile: Option<crate::llamafile::LlamafileConfig>,
 
-    /// Voice / ASR / TTS settings
+    /// Voice output (TTS) settings
     pub voice: Option<VoiceConfig>,
-
-    /// Embedding model settings for semantic similarity in the prediction engine.
-    ///
-    /// ```toml
-    /// [embedding]
-    /// enabled = true
-    /// model = "bge-small-zh"
-    /// auto_download = true
-    /// max_history = 100
-    /// ```
-    pub embedding: Option<EmbeddingConfig>,
 }
 
-/// Embedding model configuration for the prediction engine.
+/// Voice output configuration (`inference.toml [voice]`).
 ///
-/// Default model: BGE-small-zh-v1.5 (33M params, 512-dim, INT8 ONNX ~24MB).
-/// Minimum hardware: +128MB RAM, +25MB disk. No GPU required.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct EmbeddingConfig {
-    /// Enable embedding-based prediction (requires `onnx` feature).
-    pub enabled: bool,
-    /// Model identifier: "bge-small-zh" (default) or "qwen3-embedding-0.6b"
-    pub model: String,
-    /// Custom model directory (default: ~/.duduclaw/models/embedding/)
-    pub model_dir: Option<String>,
-    /// Auto-download model on first use from HuggingFace
-    pub auto_download: bool,
-    /// Maximum embedding history per user-agent pair (rolling window)
-    pub max_history: usize,
-    /// ONNX intra-op thread count (default: auto, capped at 4)
-    pub threads: Option<usize>,
-}
-
-impl Default for EmbeddingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            model: "bge-small-zh".to_string(),
-            model_dir: None,
-            auto_download: true,
-            max_history: 100,
-            threads: None,
-        }
-    }
-}
-
-/// Voice pipeline configuration — ASR + TTS + language settings.
-///
-/// Configured in `inference.toml` under `[voice]`:
 /// ```toml
 /// [voice]
-/// asr_provider = "auto"       # "auto" | "whisper-api" | "whisper-local"
 /// tts_provider = "auto"       # "auto" | "edge-tts" | "minimax" | "openai-tts" | "piper"
-/// asr_language = "zh"         # BCP-47 language hint
 /// tts_voice = ""              # Empty = auto-detect from text content
-/// voice_reply_enabled = false # Enable voice reply by default (overridable via /voice)
 /// ```
+///
+/// v1.68 removed `asr_provider` / `asr_language` / `voice_reply_enabled`:
+/// nothing read them. Speech-to-text is `config.toml [voice] stt_*`. Old
+/// files that still carry the keys load unchanged (they are ignored).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VoiceConfig {
-    /// ASR provider selection: "auto", "whisper-api", "whisper-local"
-    pub asr_provider: String,
     /// TTS provider selection: "auto", "edge-tts", "minimax", "openai-tts", "piper"
     pub tts_provider: String,
-    /// Default ASR language hint (BCP-47)
-    pub asr_language: String,
     /// Default TTS voice name (empty = auto-detect from text content)
     pub tts_voice: String,
-    /// Enable voice reply mode by default for all sessions
-    pub voice_reply_enabled: bool,
 }
 
 impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
-            asr_provider: "auto".into(),
             tts_provider: "auto".into(),
-            asr_language: "zh".into(),
             tts_voice: String::new(),
-            voice_reply_enabled: false,
         }
     }
 }
 
 impl VoiceConfig {
-    /// Allowed ASR provider values.
-    const VALID_ASR_PROVIDERS: &[&str] = &["auto", "whisper-api", "whisper-local"];
     /// Allowed TTS provider values.
     const VALID_TTS_PROVIDERS: &[&str] = &["auto", "edge-tts", "minimax", "openai-tts", "piper"];
 
     /// Validate and normalize config values, falling back to "auto" for unknown providers.
     pub fn validate(&mut self) {
-        if !Self::VALID_ASR_PROVIDERS.contains(&self.asr_provider.as_str()) {
-            tracing::warn!(provider = %self.asr_provider, "Unknown ASR provider, falling back to auto");
-            self.asr_provider = "auto".into();
-        }
         if !Self::VALID_TTS_PROVIDERS.contains(&self.tts_provider.as_str()) {
             tracing::warn!(provider = %self.tts_provider, "Unknown TTS provider, falling back to auto");
             self.tts_provider = "auto".into();
-        }
-        // Sanitize language to alphanumeric + hyphen
-        self.asr_language = self.asr_language.chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .collect();
-        if self.asr_language.is_empty() {
-            self.asr_language = "zh".into();
         }
     }
 }
@@ -163,12 +98,10 @@ impl Default for InferenceConfig {
             default_model: None,
             generation: GenerationParams::default(),
             auto_load: false,
-            max_memory_mb: 0,
             openai_compat: None,
             router: None,
             llamafile: None,
             voice: None,
-            embedding: None,
         }
     }
 }
@@ -668,5 +601,45 @@ mod ucci_shadow_max_inflight_tests {
             ..RouterConfig::default()
         };
         assert_eq!(cfg.effective_ucci_shadow_max_inflight(), 3);
+    }
+}
+
+#[cfg(test)]
+mod v168_removed_keys_tests {
+    use super::InferenceConfig;
+
+    /// v1.68 removed `max_memory_mb`, `[embedding]`, `generation.gpu_layers`
+    /// / `context_size` and the `[voice]` ASR keys. A file written by an
+    /// older version must still load with every live value intact.
+    #[test]
+    fn a_file_with_removed_keys_still_loads() {
+        let text = r#"
+enabled = true
+max_memory_mb = 8192
+default_model = "m"
+
+[generation]
+max_tokens = 512
+gpu_layers = -1
+context_size = 4096
+capture_logprobs = true
+
+[embedding]
+enabled = true
+model = "bge-small-zh"
+
+[voice]
+asr_provider = "whisper-api"
+asr_language = "zh"
+voice_reply_enabled = true
+tts_provider = "edge-tts"
+"#;
+        let table: toml::Table = text.parse().unwrap();
+        let cfg: InferenceConfig = toml::Value::Table(table).try_into().expect("old file loads");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.default_model.as_deref(), Some("m"));
+        assert_eq!(cfg.generation.max_tokens, 512);
+        assert!(cfg.generation.capture_logprobs);
+        assert_eq!(cfg.voice.unwrap().tts_provider, "edge-tts");
     }
 }

@@ -91,6 +91,25 @@ pub struct ContainerSectionView {
     pub sandbox_enabled: Option<bool>,
 }
 
+/// `[permissions]` — the four permission flags the MCP dispatch gate
+/// enforces since v1.68 (`can_create_agents`, `can_send_cross_agent`,
+/// `can_schedule_tasks`, `can_modify_own_skills`). Each is `Option` so the
+/// gate can refuse only on an **explicit** `false`; an absent or wrong-typed
+/// key keeps the pre-1.68 behaviour (allowed, subject to every other gate).
+/// `can_modify_own_soul` is enforced elsewhere (`agent_update_soul`).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct PermissionsSectionView {
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub can_create_agents: Option<bool>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub can_send_cross_agent: Option<bool>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub can_schedule_tasks: Option<bool>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub can_modify_own_skills: Option<bool>,
+}
+
 /// The `[agent]` identity keys the former shadow readers consumed.
 ///
 /// A narrow projection rather than [`crate::types::AgentInfo`] for the same
@@ -339,6 +358,9 @@ pub struct AgentTomlSections {
     /// all-`None` ⇒ every value cascades to `config.toml [team]`.
     #[serde(deserialize_with = "crate::lenient::or_default")]
     pub team: TeamConfig,
+    /// `[permissions]` — see [`PermissionsSectionView`].
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub permissions: PermissionsSectionView,
 }
 
 /// Parse the sections out of an `agent.toml` string.

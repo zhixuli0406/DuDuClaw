@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { api } from '@/lib/api';
+import { useRestartRequiredStore } from '@/stores/restart-required-store';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
@@ -13,9 +14,20 @@ import {
 import { type SelectOption } from '@/components/settings/controls';
 import { RowSelect, RowSwitch, RowNumber } from '@/pages/agent-form/form-rows';
 import { AutonomyNote } from '@/components/AutonomyNote';
+import { Input, SettingsRow } from '@/components/mds';
+import { changedPayload, parseTomlSubset, tomlBool, tomlStr, type FlatValues } from '@/lib/config-toml';
+import { TakeoverMailSection } from './TakeoverMailSection';
+import { TickSettingsSection } from './TickSettingsSection';
+import { TeamDefaultsSection } from './TeamDefaultsSection';
 
 // dispatch.policy enum accepted by the gateway's system.update_config.
-const DISPATCH_POLICIES = ['fixed_hierarchy', 'round_robin', 'llm_select'] as const;
+// v1.68: `role_team` (one employee in four roles) is accepted by the reader
+// and, from v1.68, by the RPC as well.
+const DISPATCH_POLICIES = ['fixed_hierarchy', 'round_robin', 'llm_select', 'role_team'] as const;
+
+// `[dispatch] judge_provider` — a runtime id (`RuntimeType::parse`); empty =
+// no override, the judge runs on the default utility model.
+const JUDGE_PROVIDERS = ['', 'claude', 'codex', 'antigravity', 'grok', 'openai_compat'] as const;
 
 // goal_loop.resume_on_restart enum accepted by the gateway's
 // system.update_config — kept in "recommended first" order (pause is the
@@ -33,7 +45,7 @@ const JUDGE_MODES = ['mav', 'external'] as const;
 // T5/O12 (feature audit 2026-09-29): still accepted by the gateway and still
 // parsed byte-identically, but no longer offered as a new choice. A deployment
 // already on one keeps seeing it in the picker — marked 已棄用 — so the value
-// is never silently rewritten behind the operator's back. Removal: v1.68.0
+// is never silently rewritten behind the operator's back. Removal: v1.69.0
 // (docs/guides/deprecations.md).
 const DEPRECATED_JUDGE_MODES: readonly string[] = ['evaluator_only', 'human_only'];
 
@@ -142,6 +154,13 @@ export function AutomationTab() {
   const [dispatchPolicy, setDispatchPolicy] = useState('fixed_hierarchy');
   // [dispatch] judge — who adjudicates "is this task actually done" (WP-6B).
   const [judgeMode, setJudgeMode] = useState('mav');
+  // v1.68: run the judge on a different (runtime, model) than the worker.
+  const [judgeProvider, setJudgeProvider] = useState('');
+  const [judgeModel, setJudgeModel] = useState('');
+  // v1.68: `[night] llm_enabled` — the model-backed stage of night consolidation.
+  const [nightLlm, setNightLlm] = useState(false);
+  // What was loaded, flattened by TOML path — saves send only what changed.
+  const initialRef = useRef<FlatValues>({});
   // [topology_evolution]
   const [topologyEnabled, setTopologyEnabled] = useState(false);
   // [knowledge_guard]
@@ -187,6 +206,32 @@ export function AutomationTab() {
       setFlatBandPct(floatIn(tomlSection(raw, 'belief'), 'flat_band_pct', 0.3));
       setTickMapText(tickSubjectMapToLines(raw));
       setTickMapError(null);
+      const tables = parseTomlSubset(raw);
+      const jp = tomlStr(tables, 'dispatch', 'judge_provider', '');
+      const jm = tomlStr(tables, 'dispatch', 'judge_model', '');
+      const nl = tomlBool(tables, 'night', 'llm_enabled', false);
+      setJudgeProvider(jp);
+      setJudgeModel(jm);
+      setNightLlm(nl);
+      const parsedMap = parseTickMapText(tickSubjectMapToLines(raw));
+      initialRef.current = snapshotOf({
+        plannerEnabled: boolIn(gl, 'planner_enabled', false),
+        iterationCapSimple: intIn(gl, 'iteration_cap_simple', 3),
+        resumeOnRestart: strIn(gl, 'resume_on_restart', 'pause'),
+        dispatchEnabled: boolIn(dp, 'enabled', true),
+        dispatchPolicy: strIn(dp, 'policy', 'fixed_hierarchy'),
+        judgeMode: strIn(dp, 'judge', 'mav'),
+        judgeProvider: jp,
+        judgeModel: jm,
+        topologyEnabled: boolIn(tomlSection(raw, 'topology_evolution'), 'enabled', false),
+        kgEnabled: boolIn(kg, 'enabled', true),
+        kgWindowSecs: intIn(kg, 'window_secs', 3600),
+        kgMaxPerSubject: intIn(kg, 'max_per_subject', 5),
+        graphEmbedSeed: boolIn(tomlSection(raw, 'memory'), 'graph_embed_seed', false),
+        flatBandPct: floatIn(tomlSection(raw, 'belief'), 'flat_band_pct', 0.3),
+        tickMap: 'map' in parsedMap ? parsedMap.map : {},
+        nightLlm: nl,
+      });
     }).catch((e) => {
       console.warn('[api]', e);
       setLoadError(e);
@@ -219,18 +264,24 @@ export function AutomationTab() {
     setSaved(false);
     setSaveError(null);
     try {
-      const res = await api.system.updateConfig({
-        goal_loop: {
-          planner_enabled: plannerEnabled,
-          iteration_cap_simple: iterationCapSimple,
-          resume_on_restart: resumeOnRestart,
-        },
-        dispatch: { enabled: dispatchEnabled, policy: dispatchPolicy, judge: judgeMode },
-        topology_evolution: { enabled: topologyEnabled },
-        knowledge_guard: { enabled: kgEnabled, window_secs: kgWindowSecs, max_per_subject: kgMaxPerSubject },
-        memory: { graph_embed_seed: graphEmbedSeed },
-        belief: { flat_band_pct: flatBandPct, tick_subject_map: parsed.map },
+      // v1.68 (plan principle 3): send only the fields that changed, so a
+      // save never rewrites a stored value with what the form happened to
+      // show. Nothing changed ⇒ no call (the RPC rejects an empty payload).
+      const current = snapshotOf({
+        plannerEnabled, iterationCapSimple, resumeOnRestart, dispatchEnabled,
+        dispatchPolicy, judgeMode, judgeProvider, judgeModel: judgeModel.trim(),
+        topologyEnabled, kgEnabled, kgWindowSecs, kgMaxPerSubject, graphEmbedSeed,
+        flatBandPct, tickMap: parsed.map, nightLlm,
       });
+      const payload = changedPayload(initialRef.current, current);
+      if (Object.keys(payload).length === 0) {
+        toast.info(intl.formatMessage({ id: 'settings.noChanges' }));
+        return;
+      }
+      const res = await api.system.updateConfig(payload);
+      initialRef.current = current;
+      const restart = res.restart_required ?? [];
+      if (restart.length > 0) useRestartRequiredStore.getState().add(restart);
       // Surface which long-lived drivers were hot-reloaded (abort+respawn).
       const hot = res.hot_reloaded ?? [];
       if (hot.length > 0) {
@@ -267,6 +318,17 @@ export function AutomationTab() {
           label: `${intl.formatMessage({ id: `settings.automation.judgeMode.${judgeMode}` })}（${intl.formatMessage({ id: 'settings.automation.judgeMode.deprecated' })}）`,
           raw: judgeMode,
         }]
+      : []),
+  ];
+
+  const judgeProviderOptions: SelectOption[] = [
+    ...JUDGE_PROVIDERS.map((v) => ({
+      value: v as string,
+      label: v === '' ? t('settings.automation.judgeProvider.default') : t(`settings.automation.judgeProvider.${v}`),
+      raw: v as string,
+    })),
+    ...(judgeProvider && !(JUDGE_PROVIDERS as readonly string[]).includes(judgeProvider)
+      ? [{ value: judgeProvider, label: judgeProvider, raw: judgeProvider }]
       : []),
   ];
 
@@ -324,6 +386,28 @@ export function AutomationTab() {
             onChange={setJudgeMode}
             options={judgeModeOptions}
           />
+          {/* v1.68: judge on a different (runtime, model) than the worker —
+              read on every adjudication, so hot. */}
+          <RowSelect
+            label={t('settings.automation.judgeProvider')}
+            description={t('settings.automation.judgeProvider.help')}
+            value={judgeProvider}
+            onChange={setJudgeProvider}
+            options={judgeProviderOptions}
+          />
+          <SettingsRow
+            label={t('settings.automation.judgeModel')}
+            description={t('settings.automation.judgeModel.help')}
+            tier="text"
+          >
+            <Input
+              type="text"
+              value={judgeModel}
+              onChange={(e) => setJudgeModel(e.target.value)}
+              placeholder={t('settings.automation.judgeModel.placeholder')}
+              aria-label={t('settings.automation.judgeModel')}
+            />
+          </SettingsRow>
           <RowSwitch
             label={t('settings.automation.topologyEnabled')}
             description={t('settings.automation.topologyEnabled.help')}
@@ -400,6 +484,14 @@ export function AutomationTab() {
             checked={graphEmbedSeed}
             onChange={setGraphEmbedSeed}
           />
+          {/* v1.68: `[night] llm_enabled` — off by default; the zero-cost
+              stages of the night pass run either way. */}
+          <RowSwitch
+            label={t('settings.automation.nightLlm')}
+            description={t('settings.automation.nightLlm.help')}
+            checked={nightLlm}
+            onChange={setNightLlm}
+          />
         </SettingsCard>
         <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
           {t('settings.automation.appliedHint')}
@@ -469,6 +561,54 @@ export function AutomationTab() {
           {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
         </Button>
       </div>
+
+      {/* v1.68 (W2) — cards with their own save: each writes only its own
+          keys, so saving one never touches another card's settings. */}
+      <TakeoverMailSection />
+      <TeamDefaultsSection />
+      <TickSettingsSection />
     </div>
   );
+}
+
+interface AutomationSnapshotInput {
+  plannerEnabled: boolean;
+  iterationCapSimple: number;
+  resumeOnRestart: string;
+  dispatchEnabled: boolean;
+  dispatchPolicy: string;
+  judgeMode: string;
+  judgeProvider: string;
+  judgeModel: string;
+  topologyEnabled: boolean;
+  kgEnabled: boolean;
+  kgWindowSecs: number;
+  kgMaxPerSubject: number;
+  graphEmbedSeed: boolean;
+  flatBandPct: number;
+  tickMap: Record<string, string>;
+  nightLlm: boolean;
+}
+
+/** Flatten the form into `{ "<toml.path>": value }` — the RPC's nested
+ *  param names are the TOML paths (`system.update_config`). */
+function snapshotOf(v: AutomationSnapshotInput): FlatValues {
+  return {
+    'goal_loop.planner_enabled': v.plannerEnabled,
+    'goal_loop.iteration_cap_simple': v.iterationCapSimple,
+    'goal_loop.resume_on_restart': v.resumeOnRestart,
+    'dispatch.enabled': v.dispatchEnabled,
+    'dispatch.policy': v.dispatchPolicy,
+    'dispatch.judge': v.judgeMode,
+    'dispatch.judge_provider': v.judgeProvider,
+    'dispatch.judge_model': v.judgeModel,
+    'topology_evolution.enabled': v.topologyEnabled,
+    'knowledge_guard.enabled': v.kgEnabled,
+    'knowledge_guard.window_secs': v.kgWindowSecs,
+    'knowledge_guard.max_per_subject': v.kgMaxPerSubject,
+    'memory.graph_embed_seed': v.graphEmbedSeed,
+    'belief.flat_band_pct': v.flatBandPct,
+    'belief.tick_subject_map': v.tickMap,
+    'night.llm_enabled': v.nightLlm,
+  };
 }

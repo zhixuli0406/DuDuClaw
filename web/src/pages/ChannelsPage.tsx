@@ -18,6 +18,8 @@ import { useSystemStore } from '@/stores/system-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { isVisible, type Gated } from '@/lib/nav-visibility';
 import { ConfirmDialog } from '@/components/settings/controls';
+import { RestartRequiredBanner } from '@/components/settings/RestartRequiredBanner';
+import { WebChatWidgetCard } from '@/components/channels/WebChatWidgetCard';
 import { AddChannelDialog, CHANNEL_TYPES, DialogField } from '@/components/channels/AddChannelDialog';
 import {
   Button,
@@ -310,6 +312,9 @@ export function ChannelsPage() {
         </div>
       </div>
 
+      {/* v1.68 (W2): e.g. a webhook channel whose endpoint needs a restart */}
+      <RestartRequiredBanner />
+
       {/* Toast notification */}
       {toast && (
         <div className={cn(
@@ -361,6 +366,9 @@ export function ChannelsPage() {
           ))}
         </div>
       )}
+
+      {/* v1.68 (W2) — 網站聊天元件 (public WebChat widget) */}
+      <WebChatWidgetCard />
 
       {/* Add Channel Dialog */}
       <AddChannelDialog
@@ -784,6 +792,8 @@ function TelegramBindDialog({ open, onClose }: { open: boolean; onClose: () => v
  * (guild allowlist / auto-thread / response embed style / archive timer).
  * Shown conditionally so a Telegram/LINE admin never sees dead controls. */
 const DISCORD_ONLY_BEHAVIOR = true;
+/** v1.68: platforms that read `mention_only` / `allowed_channels`. */
+const GROUP_SETTING_PLATFORMS: readonly string[] = ['telegram', 'discord', 'line', 'slack', 'feishu', 'dingtalk'];
 
 const THREAD_ARCHIVE_MINUTES: ReadonlyArray<string> = ['60', '1440', '4320', '10080'];
 
@@ -1006,31 +1016,41 @@ function ChannelBehaviorTab({ platform, active }: { platform: string; active: bo
   }
 
   const isDiscord = DISCORD_ONLY_BEHAVIOR && platform === 'discord';
+  // v1.68: `mention_only` / `allowed_channels` are read only by these
+  // platforms; elsewhere (WhatsApp, WeCom, Google Chat, Teams) they would
+  // save and do nothing.
+  const hasGroupContext = GROUP_SETTING_PLATFORMS.includes(platform);
 
   return (
     <div className="space-y-5">
       <SettingsSection>
         <SettingsCard>
-          <SettingsRow
-            label={t('channels.detail.behavior.mentionOnly')}
-            description={t('channels.detail.behavior.mentionOnly.help')}
-          >
-            <Switch
-              checked={settings.mention_only}
-              onCheckedChange={(v) => update('mention_only', Boolean(v))}
-            />
-          </SettingsRow>
-          <SettingsRow
-            label={t('channels.detail.behavior.agentOverride')}
-            description={t('channels.detail.behavior.agentOverride.help')}
-            tier="text"
-          >
-            <Input
-              value={settings.agent_override}
-              onChange={(e) => update('agent_override', e.target.value)}
-              placeholder={t('channels.detail.behavior.agentOverride.placeholder')}
-            />
-          </SettingsRow>
+          {hasGroupContext && (
+            <SettingsRow
+              label={t('channels.detail.behavior.mentionOnly')}
+              description={t('channels.detail.behavior.mentionOnly.help')}
+            >
+              <Switch
+                checked={settings.mention_only}
+                onCheckedChange={(v) => update('mention_only', Boolean(v))}
+              />
+            </SettingsRow>
+          )}
+          {/* v1.68: only Discord reads `agent_override` (per server, falling
+              back to this value). */}
+          {isDiscord && (
+            <SettingsRow
+              label={t('channels.detail.behavior.agentOverride')}
+              description={t('channels.detail.behavior.agentOverride.help')}
+              tier="text"
+            >
+              <Input
+                value={settings.agent_override}
+                onChange={(e) => update('agent_override', e.target.value)}
+                placeholder={t('channels.detail.behavior.agentOverride.placeholder')}
+              />
+            </SettingsRow>
+          )}
           {isDiscord && (
             <SettingsRow
               label={t('channels.detail.behavior.autoThread')}
@@ -1086,13 +1106,17 @@ function ChannelBehaviorTab({ platform, active }: { platform: string; active: bo
         </SettingsCard>
       </SettingsSection>
 
-      <TagListEditor
-        label={t('channels.detail.behavior.allowedChannels')}
-        help={t('channels.detail.behavior.allowedChannels.help')}
-        value={settings.allowed_channels}
-        onChange={(v) => update('allowed_channels', v)}
-        placeholder={t('channels.detail.behavior.allowedChannels.placeholder')}
-      />
+      {hasGroupContext ? (
+        <TagListEditor
+          label={t('channels.detail.behavior.allowedChannels')}
+          help={t('channels.detail.behavior.allowedChannels.help')}
+          value={settings.allowed_channels}
+          onChange={(v) => update('allowed_channels', v)}
+          placeholder={t('channels.detail.behavior.allowedChannels.placeholder')}
+        />
+      ) : (
+        <p className="text-xs text-muted-foreground">{t('channels.detail.behavior.noGroupContext')}</p>
+      )}
       {isDiscord && (
         <TagListEditor
           label={t('channels.detail.behavior.allowedGuilds')}

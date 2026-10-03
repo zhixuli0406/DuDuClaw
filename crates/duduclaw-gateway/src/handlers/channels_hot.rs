@@ -148,14 +148,13 @@ impl MethodHandler {
         let config_path = self.home_dir.join("config.toml");
         let mut table = self.read_config_table(&config_path).await;
 
+        // v1.68: remove the keys (plaintext and `_enc`) instead of blanking
+        // them. With both gone the readers see "not configured", exactly as
+        // with the blank plaintext before, and no empty residue is left.
         if let Some(channels) = table.get_mut("channels").and_then(|v| v.as_table_mut()) {
-            channels.insert(token_key.to_string(), toml::Value::String(String::new()));
-            // Also clear the encrypted version
-            let enc_key = format!("{token_key}_enc");
-            channels.insert(enc_key, toml::Value::String(String::new()));
-            for field in companion_fields {
-                channels.insert((*field).to_string(), toml::Value::String(String::new()));
-                channels.insert(format!("{field}_enc"), toml::Value::String(String::new()));
+            for field in std::iter::once(&token_key).chain(companion_fields.iter()) {
+                channels.remove(*field);
+                channels.remove(&format!("{field}_enc"));
             }
         }
 
@@ -227,14 +226,20 @@ impl MethodHandler {
                 return true;
             }
             "whatsapp" | "feishu" | "googlechat" | "teams" | "wecom" | "dingtalk" => {
-                // These webhook routers are mounted at boot with their config
-                // baked into router state — a gateway restart is required for
-                // a first-time setup to take effect.
-                info!(
-                    channel_type,
-                    "Webhook channel config saved — restart the gateway to (re)mount the endpoint"
-                );
-                return false;
+                // Webhook paths are always mounted (crate::webhook_slots); a
+                // fresh router built from the saved config goes into the slot.
+                let router = crate::webhook_slots::start_webhook(channel_type, &home, ctx).await;
+                let started = router.is_some();
+                crate::webhook_slots::global().set(channel_type, router);
+                if started {
+                    info!(channel_type, "Webhook channel hot-started");
+                } else {
+                    warn!(
+                        channel_type,
+                        "Webhook channel not started: configuration incomplete or invalid"
+                    );
+                }
+                return started;
             }
             _ => None,
         };
@@ -264,6 +269,10 @@ impl MethodHandler {
         if let Some(handle) = handles.remove(channel_type) {
             handle.abort();
             info!(channel_type, "Channel bot stopped");
+        }
+        // Webhook channels: empty the slot so the endpoint answers 404.
+        if crate::webhook_slots::is_webhook_channel(channel_type) {
+            crate::webhook_slots::global().set(channel_type, None);
         }
         // Always clear runtime status (handle may already be gone if bot crashed)
         let mut status = self.channel_status.write().await;

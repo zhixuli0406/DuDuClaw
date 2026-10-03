@@ -325,6 +325,24 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
         return;
     }
 
+    // 通道→行為「允許的頻道」/「只在被 @ 時回覆」 (v1.68.0). `conversationType`
+    // "2" is a group; `isInAtList` says whether the robot was @-mentioned
+    // (group robots are normally only called when mentioned, so absent ⇒
+    // mentioned).
+    let is_group = payload.get("conversationType").and_then(|v| v.as_str()) == Some("2");
+    let mentioned = payload
+        .get("isInAtList")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !state
+        .ctx
+        .channel_settings
+        .group_message_allowed("dingtalk", &conversation_id, is_group, mentioned)
+        .await
+    {
+        return;
+    }
+
     // Persist the session webhook for later delegation forwarding.
     if !conversation_id.is_empty() {
         save_session_ref(
@@ -361,12 +379,12 @@ async fn handle_message(payload: &serde_json::Value, state: &Arc<DingTalkState>)
                     .map(|a| a.config.agent.name.clone())
                     .unwrap_or_default()
             };
-            let reply = crate::chat_commands::handle_command(
+            let reply = crate::chat_commands::handle_command_for_sender(
                 &cmd,
                 &state.ctx,
+                "dingtalk",
                 &session_id,
                 &agent_id,
-                true,
                 &sender,
             )
             .await;

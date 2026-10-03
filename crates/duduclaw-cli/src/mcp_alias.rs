@@ -13,7 +13,7 @@
 //! ## Deprecation contract (not a removal)
 //!
 //! Every old name stays **listed in `tools/list` and callable, byte-identical**
-//! for two minor versions (removal target **v1.68.0**). Only its
+//! for two minor versions (removal target **v1.69.0**). Only its
 //! `description` gains a `[deprecated → <new tool> <param>]` prefix, and
 //! `duduclaw_core::tool_catalog` marks it `deprecated: true`. Hiding a tool
 //! from `tools/list` would make it *uncallable* — MCP's list is the

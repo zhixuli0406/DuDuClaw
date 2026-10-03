@@ -3,37 +3,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// Convert a JSON value into a TOML value for generic pass-through sections.
-/// Returns None for null / unrepresentable values.
-pub(crate) fn json_to_toml(v: &Value) -> Option<toml::Value> {
-    match v {
-        Value::Bool(b) => Some(toml::Value::Boolean(*b)),
-        Value::String(s) => Some(toml::Value::String(s.clone())),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(toml::Value::Integer(i))
-            } else {
-                n.as_f64().map(toml::Value::Float)
-            }
-        }
-        Value::Array(a) => {
-            let mut out = Vec::with_capacity(a.len());
-            for item in a {
-                out.push(json_to_toml(item)?);
-            }
-            Some(toml::Value::Array(out))
-        }
-        Value::Object(o) => {
-            let mut m = toml::map::Map::new();
-            for (k, val) in o {
-                m.insert(k.clone(), json_to_toml(val)?);
-            }
-            Some(toml::Value::Table(m))
-        }
-        Value::Null => None,
-    }
-}
-
 /// Build the `[boundaries]` table for a CONTRACT.toml from `contract.update`
 /// params. Validates `max_tool_calls_per_turn` range. Returns the full table to
 /// serialise (the contract file only contains `[boundaries]`).

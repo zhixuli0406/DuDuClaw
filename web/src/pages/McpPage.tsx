@@ -12,6 +12,12 @@ import { toast } from '@/lib/toast';
 import { api, type McpServerDef, type McpCatalogItem, type McpOAuthProvider, type McpImportCandidate, type McpServerEntry } from '@/lib/api';
 import { DangerZone, ConfirmDialog } from '@/components/settings/controls';
 import { AutonomyNote } from '@/components/AutonomyNote';
+import {
+  RequiredEnvFields,
+  missingRequiredEnv,
+  requiredEnvPayload,
+  unmaskedEnv,
+} from '@/components/shared/RequiredEnvFields';
 import { OAUTH_REDIRECT_URI } from '@/components/IntegrationConnectPanel';
 import {
   Button,
@@ -335,12 +341,18 @@ export function McpPage() {
           setCatalogSearch={setCatalogSearch}
           isInstalled={isInstalled}
           agents={agents}
-          onInstall={async (agentId, item) => {
+          onInstall={async (agentId, item, env) => {
+            // v1.68: install through `marketplace.install`, which uses the
+            // catalogue's real definition server-side. `item.default_def.env`
+            // here holds masked status words (set / not_set / reference) and
+            // must never be echoed back as values.
             try {
-              await useMcpStore.getState().addServer(agentId, item.id, item.default_def);
+              await api.marketplace.install(item.id, agentId, env);
+              await useMcpStore.getState().fetchAll();
               showToast('success', intl.formatMessage({ id: 'mcp.added' }, { server: item.name, agent: agentLabel(agentId) }));
-            } catch {
-              showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
+            } catch (e) {
+              showToast('error', intl.formatMessage({ id: 'mcp.installFailed' }, { message: e instanceof Error ? e.message : String(e) }));
+              throw e;
             }
           }}
         />
@@ -466,7 +478,7 @@ function MarketplaceTab({
   setCatalogSearch: (v: string) => void;
   isInstalled: (id: string) => boolean;
   agents: ReadonlyArray<AgentLite>;
-  onInstall: (agentId: string, item: McpCatalogItem) => Promise<void>;
+  onInstall: (agentId: string, item: McpCatalogItem, env: Record<string, string>) => Promise<void>;
 }) {
   const intl = useIntl();
   return (
@@ -514,7 +526,7 @@ function MarketplaceTab({
               item={item}
               installed={isInstalled(item.id)}
               agents={agents}
-              onInstall={(agentId) => onInstall(agentId, item)}
+              onInstall={(agentId, env) => onInstall(agentId, item, env)}
             />
           ))}
         </div>
@@ -532,21 +544,31 @@ function CatalogRow({
   item: McpCatalogItem;
   installed: boolean;
   agents: ReadonlyArray<AgentLite>;
-  onInstall: (agentId: string) => Promise<void>;
+  onInstall: (agentId: string, env: Record<string, string>) => Promise<void>;
 }) {
   const intl = useIntl();
   const CatIcon = getCategoryIcon(item.category);
   const [showInstall, setShowInstall] = useState(false);
   const [targetAgent, setTargetAgent] = useState('');
   const [installing, setInstalling] = useState(false);
+  // Typed values for the item's required env names; cleared on close/success.
+  const [envValues, setEnvValues] = useState<Record<string, string>>({});
+  const envMissing = missingRequiredEnv(item.required_env, envValues).length > 0;
+
+  const closeInstall = () => {
+    setShowInstall(false);
+    setTargetAgent('');
+    setEnvValues({});
+  };
 
   const handleInstall = async () => {
-    if (!targetAgent) return;
+    if (!targetAgent || envMissing) return;
     setInstalling(true);
     try {
-      await onInstall(targetAgent);
-      setShowInstall(false);
-      setTargetAgent('');
+      await onInstall(targetAgent, requiredEnvPayload(item.required_env, envValues));
+      closeInstall();
+    } catch {
+      /* the parent already showed the error; keep the dialog open */
     } finally {
       setInstalling(false);
     }
@@ -579,7 +601,7 @@ function CatalogRow({
         <span className="hidden sm:inline">{intl.formatMessage({ id: 'mcp.catalog.install' })}</span>
       </Button>
 
-      <Dialog open={showInstall} onOpenChange={(o) => { if (!o) { setShowInstall(false); setTargetAgent(''); } }}>
+      <Dialog open={showInstall} onOpenChange={(o) => { if (!o) closeInstall(); }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>{intl.formatMessage({ id: 'mcp.catalog.install' })}</DialogTitle>
@@ -596,10 +618,11 @@ function CatalogRow({
               placeholder={intl.formatMessage({ id: 'mcp.targetAgent' })}
             />
           </div>
+          <RequiredEnvFields required={item.required_env} values={envValues} onChange={setEnvValues} />
           <AutonomyNote id="mcpInstall" />
           <DialogFooter>
             <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'mcp.cancel' })}</Button>} />
-            <Button variant="brand" onClick={handleInstall} disabled={installing || !targetAgent}>
+            <Button variant="brand" onClick={handleInstall} disabled={installing || !targetAgent || envMissing}>
               {installing ? intl.formatMessage({ id: 'mcp.adding' }) : intl.formatMessage({ id: 'mcp.catalog.install' })}
             </Button>
           </DialogFooter>
@@ -1259,6 +1282,8 @@ function AddServerDialog({
   const [command, setCommand] = useState('');
   const [args, setArgs] = useState('');
   const [envText, setEnvText] = useState('');
+  // v1.68: typed values for the catalogue item's required env names.
+  const [requiredValues, setRequiredValues] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -1270,11 +1295,16 @@ function AddServerDialog({
         setServerName(item.id);
         setCommand(item.default_def.command);
         setArgs(item.default_def.args.join(' '));
+        // v1.68: the catalogue env comes back masked (set / not_set /
+        // reference). Prefill only real values; required names are typed
+        // separately below.
         setEnvText(
-          Object.entries(item.default_def.env)
+          Object.entries(unmaskedEnv(item.default_def.env))
+            .filter(([k]) => !item.required_env.includes(k))
             .map(([k, v]) => `${k}=${v}`)
             .join('\n'),
         );
+        setRequiredValues({});
       }
     }
   }, [mode, selectedCatalogId, catalog]);
@@ -1286,6 +1316,7 @@ function AddServerDialog({
     setCommand('');
     setArgs('');
     setEnvText('');
+    setRequiredValues({});
     setError(null);
   };
 
@@ -1303,12 +1334,32 @@ function AddServerDialog({
           parsedEnv[t.slice(0, eqIdx)] = t.slice(eqIdx + 1);
         }
       }
-      const def: McpServerDef = {
-        command: command.trim(),
-        args: args.trim() ? args.trim().split(/\s+/) : [],
-        env: parsedEnv,
-      };
-      await useMcpStore.getState().addServer(targetAgent, serverName.trim(), def);
+      const item = mode === 'catalog' ? catalog.find((c) => c.id === selectedCatalogId) : undefined;
+      const required = item?.required_env ?? [];
+      if (missingRequiredEnv(required, requiredValues).length > 0) {
+        setError(intl.formatMessage({ id: 'mcp.requiredEnv.missing' }, { vars: missingRequiredEnv(required, requiredValues).join(', ') }));
+        return;
+      }
+      const argList = args.trim() ? args.trim().split(/\s+/) : [];
+      const untouched =
+        item !== undefined &&
+        serverName.trim() === item.id &&
+        command.trim() === item.default_def.command &&
+        argList.join(' ') === item.default_def.args.join(' ') &&
+        Object.keys(parsedEnv).length === Object.keys(unmaskedEnv(item.default_def.env)).filter((k) => !required.includes(k)).length;
+      if (item && untouched) {
+        // Unchanged catalogue item: let the gateway use its own definition.
+        await api.marketplace.install(item.id, targetAgent, requiredEnvPayload(required, requiredValues));
+        await useMcpStore.getState().fetchAll();
+      } else {
+        const def: McpServerDef = {
+          command: command.trim(),
+          args: argList,
+          env: { ...parsedEnv, ...requiredEnvPayload(required, requiredValues) },
+        };
+        await useMcpStore.getState().addServer(targetAgent, serverName.trim(), def);
+      }
+      setRequiredValues({});
       onAdded(serverName.trim(), targetAgent);
       onClose();
       resetForm();
@@ -1429,6 +1480,14 @@ function AddServerDialog({
               <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'mcp.env.help' })}</p>
             </div>
           </DangerZone>
+
+          {mode === 'catalog' && selectedCatalogItem && (
+            <RequiredEnvFields
+              required={selectedCatalogItem.required_env}
+              values={requiredValues}
+              onChange={setRequiredValues}
+            />
+          )}
 
           {error && (
             <div className="flex items-start gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">

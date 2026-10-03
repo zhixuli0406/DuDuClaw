@@ -214,12 +214,17 @@ pub(crate) fn maybe_with_semantic_embedder(
             "[memory] novelty_gate = false — B1 write-time near-duplicate rejection disabled"
         );
     }
-    engine
+    let mut engine = engine
         .with_novelty_gate_config(duduclaw_memory::NoveltyGateConfig {
             enabled: novelty_gate_enabled,
             ..duduclaw_memory::NoveltyGateConfig::default()
         })
-        .with_supersession_trust_guard(supersession_trust_guard_enabled_from_config(home_dir))
+        .with_supersession_trust_guard(supersession_trust_guard_enabled_from_config(home_dir));
+    // v1.68.0: `[memory] graph_embed_seed` reaches agent recall (it used to
+    // change only the dashboard's own memory search).
+    engine.retrieval_weights =
+        duduclaw_gateway::memory_factory::retrieval_weights_from_config(home_dir);
+    engine
 }
 
 #[cfg(test)]
@@ -292,6 +297,19 @@ mod novelty_gate_config_tests {
         .unwrap();
         let off = maybe_with_semantic_embedder(SqliteMemoryEngine::new(&db).unwrap(), dir.path());
         assert!(!off.supersession_trust_guard);
+    }
+
+    #[test]
+    fn maybe_with_semantic_embedder_applies_graph_embed_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[memory]\ngraph_embed_seed = true\n",
+        )
+        .unwrap();
+        let engine = SqliteMemoryEngine::new(&dir.path().join("memory.db")).unwrap();
+        let engine = maybe_with_semantic_embedder(engine, dir.path());
+        assert!(engine.retrieval_weights.graph_embed_seed);
     }
 
     /// Fix-2 M1 end-to-end: `maybe_with_semantic_embedder` wires the config

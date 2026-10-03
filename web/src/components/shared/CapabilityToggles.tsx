@@ -88,6 +88,8 @@ interface CapabilityTogglesProps {
   onDeniedChange: (next: string[]) => void;
   /** Clear the allowlist (leave allowlist mode). */
   onClearAllowlist: () => void;
+  /** Read-only (e.g. a non-admin viewing an admin-only section). */
+  disabled?: boolean;
 }
 
 export function CapabilityToggles({
@@ -95,6 +97,7 @@ export function CapabilityToggles({
   allowedTools,
   onDeniedChange,
   onClearAllowlist,
+  disabled = false,
 }: CapabilityTogglesProps) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
@@ -197,7 +200,7 @@ export function CapabilityToggles({
             >
               <Switch
                 checked={!off}
-                disabled={allowlistMode}
+                disabled={allowlistMode || disabled}
                 onCheckedChange={(v) => toggleGroup(g.members, Boolean(v))}
                 aria-label={t(`agents.cap.group.${g.id}`)}
               />

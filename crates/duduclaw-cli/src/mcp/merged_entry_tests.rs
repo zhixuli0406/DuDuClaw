@@ -66,7 +66,7 @@ fn deprecated_aliases_stay_listed_and_are_marked() {
             &t.description[..t.description.len().min(60)]
         );
         assert!(
-            t.description.contains("v1.68.0"),
+            t.description.contains("v1.69.0"),
             "{name} must name its removal version"
         );
     }

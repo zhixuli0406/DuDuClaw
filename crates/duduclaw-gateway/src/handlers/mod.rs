@@ -22,7 +22,6 @@ use crate::cron_store::{CronStore, CronTaskRow};
 use crate::distributor_store::{
     DistributorInput, DistributorPatch, DistributorStore, IssuedLicense,
 };
-use crate::evolution_events::schema::StagnationDetectionConfig;
 use crate::extension::GatewayExtension;
 use crate::gvu::stagnation::{GvuStagnationConfig, stagnation_snapshot};
 use crate::gvu::telemetry::telemetry_summary;
@@ -163,6 +162,12 @@ mod dispatch_knowledge;
 mod dispatch_system;
 mod dispatch_org;
 mod dispatch_ops;
+mod config_commit;
+mod config_schema;
+mod system_update_config_v168;
+mod tick_sources_rpc;
+mod config_raw_rpc;
+mod agents_update_v168;
 #[cfg(test)]
 mod tests;
 
@@ -298,6 +303,11 @@ pub struct MethodHandler {
     /// store) — `ticks.sources`/`ticks.recent` treat that identically to
     /// "feature never started": zero counts, empty records, never an error.
     tick_hub: RwLock<Option<Arc<crate::tick_source::TickHub>>>,
+    /// v1.68: what is needed to respawn the `[[tick.sources]]` poll tasks
+    /// after a dashboard edit (bus sender, events store, hub, live handles).
+    /// `None` when the autopilot engine block never ran — then a `[tick]`
+    /// edit reports `restart_required` instead.
+    tick_runtime: tokio::sync::Mutex<Option<tick_sources_rpc::TickRuntime>>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]

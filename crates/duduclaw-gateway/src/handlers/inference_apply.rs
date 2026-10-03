@@ -140,7 +140,8 @@ pub(crate) fn apply_inference_to_table(
         p,
         "inference",
         &["enabled", "auto_load"],
-        &["max_memory_mb"],
+        // `max_memory_mb` was removed in v1.68 (no reader).
+        &[],
         &[],
         &["models_dir", "default_model"],
         &[],
@@ -176,8 +177,11 @@ pub(crate) fn apply_inference_to_table(
             section,
             g,
             "generation",
-            &[],
-            &["max_tokens", "gpu_layers", "context_size"],
+            // v1.68: logprob capture for the UCCI calibrated cascade.
+            // `gpu_layers` / `context_size` were removed (only the deleted
+            // llama.cpp backend read them; llamafile has its own copies).
+            &["capture_logprobs", "capture_top_logprobs"],
+            &["max_tokens"],
             &["temperature", "top_p"],
             &[],
             &["stop"],
@@ -219,18 +223,48 @@ pub(crate) fn apply_inference_to_table(
                 }
             }
         }
+        if let Some(v) = r.get("ucci_shadow_max_inflight") {
+            if !v.as_u64().is_some_and(|n| (1..=16).contains(&n)) {
+                return Err("router.ucci_shadow_max_inflight must be an integer 1-16".into());
+            }
+        }
+        for k in ["local_tools", "ucci_shadow_strong", "ucci_drop_stop_token"] {
+            if r.get(k).is_some_and(|v| !v.is_boolean() && !v.is_null()) {
+                return Err(format!("router.{k} must be a boolean"));
+            }
+        }
         let section = inf_subtable(table, "router")?;
         inf_apply_scalars(
             section,
             r,
             "router",
-            &["enabled"],
-            &["max_fast_prompt_tokens"],
+            &["enabled", "local_tools", "ucci_shadow_strong", "ucci_drop_stop_token"],
+            &["max_fast_prompt_tokens", "ucci_shadow_max_inflight"],
             &["fast_threshold", "strong_threshold"],
             &["fast_model", "strong_model"],
             &["cloud_keywords", "fast_keywords"],
             &mut changes,
         )?;
+        // UCCI router / observation file paths (relative to the DuDuClaw
+        // home or absolute). Empty string removes the key = feature off.
+        for k in ["ucci_fast_router", "ucci_strong_router", "ucci_observations"] {
+            match r.get(k) {
+                None | Some(Value::Null) => {}
+                Some(Value::String(p)) => {
+                    let p = p.trim();
+                    if p.is_empty() {
+                        section.remove(k);
+                        changes.push(format!("router.{k} cleared"));
+                    } else if p.len() > 4096 || p.chars().any(char::is_control) {
+                        return Err(format!("router.{k} must be a file path"));
+                    } else {
+                        section.insert(k.into(), toml::Value::String(p.into()));
+                        changes.push(format!("router.{k} = \"{p}\""));
+                    }
+                }
+                Some(_) => return Err(format!("router.{k} must be a string")),
+            }
+        }
     }
 
     // ── [openai_compat] non-secret fields (INF.5; api_key handled in caller) ──
@@ -249,28 +283,115 @@ pub(crate) fn apply_inference_to_table(
         )?;
     }
 
-    // ── Generic pass-through sub-sections (INF.5) ──
-    // Each is a flat table of scalars/arrays; apply them generically so new
-    // backend fields don't require per-field plumbing. Secrets are not expected
-    // in these sections.
-    // `exo` / `mlx` / `mistralrs` dropped 2026-09-29 with their backends
-    // (`wiki/reports/feature-audit-2026-09-29.md` T1-D2, T3-S4/S5).
-    // `llmlingua` / `streaming_llm` dropped 2026-09-29 too (G8): the
-    // three-strategy compressor they configured was removed from
-    // `duduclaw-inference` in v1.33 — `grep -rn 'llmlingua\|streaming_llm'
-    // crates/` returns nothing outside this file, so writing those tables only
-    // produced config keys nothing would ever read.
-    for sect in &["llamafile", "embedding"] {
-        if let Some(obj) = p.get(*sect).and_then(|v| v.as_object()) {
-            let section = inf_subtable(table, sect)?;
-            for (k, val) in obj {
-                let tv = json_to_toml(val)
-                    .ok_or_else(|| format!("Unsupported value type for {sect}.{k}"))?;
-                section.insert(k.clone(), tv);
-            }
-            changes.push(format!("{sect} = [updated]"));
-        }
+    // ── [llamafile] (typed since v1.68; the generic pass-through could only
+    // edit keys that already existed in the file). `[embedding]` had no
+    // reader and is no longer accepted. ──
+    if let Some(lf) = p.get("llamafile").and_then(|v| v.as_object()) {
+        apply_llamafile(table, lf, &mut changes)?;
     }
 
     Ok(changes)
+}
+
+/// Keys `[llamafile]` accepts (see `duduclaw_inference::llamafile::LlamafileConfig`).
+const LLAMAFILE_KEYS: &[&str] = &[
+    "enabled", "dir", "default_file", "port", "host", "gpu_layers", "context_size", "extra_args",
+];
+
+/// Typed write of `[llamafile]`. The values reach a subprocess argv (no
+/// shell), so each one is bounded.
+pub(crate) fn apply_llamafile(
+    table: &mut toml::Table,
+    lf: &serde_json::Map<String, Value>,
+    changes: &mut Vec<String>,
+) -> Result<(), String> {
+    if let Some(k) = lf.keys().find(|k| !LLAMAFILE_KEYS.contains(&k.as_str())) {
+        return Err(format!("unknown llamafile key `{k}`"));
+    }
+    let text = |k: &str, v: &Value| -> Result<String, String> {
+        let s = v.as_str().ok_or_else(|| format!("llamafile.{k} must be a string"))?.trim();
+        if s.len() > 4096 || s.chars().any(char::is_control) {
+            return Err(format!("llamafile.{k} contains invalid characters"));
+        }
+        Ok(s.to_string())
+    };
+    // Validate everything before touching the table.
+    let mut writes: Vec<(&str, Option<toml::Value>)> = Vec::new();
+    for (k, v) in lf {
+        let k = LLAMAFILE_KEYS.iter().find(|x| **x == k.as_str()).copied().unwrap_or("");
+        // `null` (and an empty string for the text fields / `extra_args`)
+        // removes the key, so a saved value can be cleared from the form.
+        let clears = v.is_null()
+            || (matches!(k, "dir" | "host" | "default_file" | "extra_args")
+                && v.as_str().is_some_and(|s| s.trim().is_empty()))
+            || (k == "extra_args" && v.as_array().is_some_and(|a| a.is_empty()));
+        if clears {
+            writes.push((k, None));
+            continue;
+        }
+        let tv = match k {
+            "enabled" => Some(toml::Value::Boolean(v.as_bool().ok_or("llamafile.enabled must be a boolean")?)),
+            "dir" => Some(toml::Value::String(text(k, v)?)),
+            "default_file" => {
+                let s = text(k, v)?;
+                if s.contains('/') || s.contains('\\') || s == ".." {
+                    return Err("llamafile.default_file must be a file name, not a path".into());
+                }
+                (!s.is_empty()).then_some(toml::Value::String(s))
+            }
+            "host" => {
+                let s = text(k, v)?;
+                if s != "localhost" && s.parse::<std::net::IpAddr>().is_err() {
+                    return Err("llamafile.host must be an IP address or localhost".into());
+                }
+                Some(toml::Value::String(s))
+            }
+            "port" => {
+                let n = v.as_u64().filter(|n| (1..=65535).contains(n)).ok_or("llamafile.port must be 1-65535")?;
+                Some(toml::Value::Integer(n as i64))
+            }
+            "gpu_layers" => {
+                let n = v.as_i64().filter(|n| (-1..=10_000).contains(n)).ok_or("llamafile.gpu_layers must be -1 (all) to 10000")?;
+                Some(toml::Value::Integer(n))
+            }
+            "context_size" => {
+                let n = v
+                    .as_u64()
+                    .filter(|n| (256..=1_048_576).contains(n))
+                    .ok_or("llamafile.context_size must be 256-1048576")?;
+                Some(toml::Value::Integer(n as i64))
+            }
+            "extra_args" => {
+                let arr = v.as_array().ok_or("llamafile.extra_args must be an array of strings")?;
+                if arr.len() > 32 {
+                    return Err("llamafile.extra_args supports at most 32 entries".into());
+                }
+                let mut out = Vec::with_capacity(arr.len());
+                for a in arr {
+                    let s = a.as_str().ok_or("llamafile.extra_args must be an array of strings")?;
+                    if s.len() > 256 || s.contains('\0') {
+                        return Err("llamafile.extra_args entries must be at most 256 bytes".into());
+                    }
+                    out.push(toml::Value::String(s.to_string()));
+                }
+                Some(toml::Value::Array(out))
+            }
+            _ => unreachable!("filtered against LLAMAFILE_KEYS above"),
+        };
+        writes.push((k, tv));
+    }
+    let section = inf_subtable(table, "llamafile")?;
+    for (k, tv) in writes {
+        match tv {
+            Some(v) => {
+                changes.push(format!("llamafile.{k} updated"));
+                section.insert(k.into(), v);
+            }
+            None => {
+                section.remove(k);
+                changes.push(format!("llamafile.{k} cleared"));
+            }
+        }
+    }
+    Ok(())
 }

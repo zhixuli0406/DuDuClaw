@@ -130,63 +130,7 @@ fn evolution_absent_object_is_noop() {
     assert!(changes.is_empty());
 }
 
-// ── CT: mount parsing ──
-
-#[test]
-fn container_advanced_mounts_written() {
-    let mut t = toml::Table::new();
-    let params = json!({ "container_advanced": {
-        "additional_mounts": [
-            { "host": "~/projects", "container": "/projects", "readonly": false },
-            { "host": "~/Documents", "container": "/docs", "readonly": true },
-        ],
-        "cmd": ["bash", "-c", "echo hi"],
-        "env": [ { "key": "FOO", "value": "bar" }, ["BAZ", "qux"] ],
-    }});
-    let changes = apply_container_advanced_to_table(&mut t, &params).unwrap();
-    assert!(!changes.is_empty());
-    let ct = t.get("container").unwrap().as_table().unwrap();
-    let mounts = ct.get("additional_mounts").unwrap().as_array().unwrap();
-    assert_eq!(mounts.len(), 2);
-    let m0 = mounts[0].as_table().unwrap();
-    assert_eq!(m0.get("host").unwrap().as_str(), Some("~/projects"));
-    assert_eq!(m0.get("readonly").unwrap().as_bool(), Some(false));
-    let env = ct.get("env").unwrap().as_array().unwrap();
-    assert_eq!(env.len(), 2);
-    let e0 = env[0].as_array().unwrap();
-    assert_eq!(e0[0].as_str(), Some("FOO"));
-    assert_eq!(e0[1].as_str(), Some("bar"));
-    let e1 = env[1].as_array().unwrap();
-    assert_eq!(e1[0].as_str(), Some("BAZ"));
-}
-
-#[test]
-fn container_mount_blocked_pattern_rejected() {
-    let mut t = toml::Table::new();
-    let params = json!({ "container_advanced": {
-        "additional_mounts": [ { "host": "~/.ssh", "container": "/keys" } ]
-    }});
-    let err = apply_container_advanced_to_table(&mut t, &params).unwrap_err();
-    assert!(err.contains("blocked pattern"), "got: {err}");
-}
-
-#[test]
-fn container_mount_empty_path_rejected() {
-    let mut t = toml::Table::new();
-    let params = json!({ "container_advanced": {
-        "additional_mounts": [ { "host": "", "container": "/x" } ]
-    }});
-    let err = apply_container_advanced_to_table(&mut t, &params).unwrap_err();
-    assert!(err.contains("host"), "got: {err}");
-}
-
-#[test]
-fn container_env_bad_arity_rejected() {
-    let mut t = toml::Table::new();
-    let params = json!({ "container_advanced": { "env": [ ["ONLY_ONE"] ] } });
-    let err = apply_container_advanced_to_table(&mut t, &params).unwrap_err();
-    assert!(err.contains("2 elements"), "got: {err}");
-}
+// ── CT: `container_advanced` was removed in v1.68 (no reader). ──
 
 // ── INF: router cross-validation + secret masking ──
 
@@ -240,21 +184,44 @@ fn inference_generation_temperature_range_enforced() {
 }
 
 #[test]
-fn inference_root_and_passthrough_sections_written() {
+fn inference_root_and_typed_llamafile_written() {
     let mut t = toml::Table::new();
     let params = json!({
         "enabled": true,
         "backend": "openai_compat",
-        "max_memory_mb": 8192,
-        "llamafile": { "auto_start": true, "port": 8080 },
-        "embedding": { "enabled": false, "model": "bge-small-zh" },
+        "llamafile": { "enabled": true, "port": 8080, "host": "127.0.0.1", "extra_args": ["--mlock"] },
+        "generation": { "capture_logprobs": true, "capture_top_logprobs": true },
+        "router": { "local_tools": false, "ucci_fast_router": "ucci/fast.json", "ucci_shadow_max_inflight": 2 },
     });
     let changes = apply_inference_to_table(&mut t, &params).unwrap();
     assert!(!changes.is_empty());
     assert_eq!(t.get("enabled").unwrap().as_bool(), Some(true));
-    assert_eq!(t.get("max_memory_mb").unwrap().as_integer(), Some(8192));
     let lf = t.get("llamafile").unwrap().as_table().unwrap();
     assert_eq!(lf.get("port").unwrap().as_integer(), Some(8080));
+    assert_eq!(t["generation"]["capture_top_logprobs"].as_bool(), Some(true));
+    assert_eq!(t["router"]["local_tools"].as_bool(), Some(false));
+    assert_eq!(t["router"]["ucci_fast_router"].as_str(), Some("ucci/fast.json"));
+    // Clearing a UCCI path removes the key.
+    apply_inference_to_table(&mut t, &json!({ "router": { "ucci_fast_router": "" } })).unwrap();
+    assert!(t["router"].get("ucci_fast_router").is_none());
+}
+
+#[test]
+fn inference_removed_and_invalid_keys() {
+    // Removed keys are no longer written.
+    let mut t = toml::Table::new();
+    let _ = apply_inference_to_table(&mut t, &json!({ "max_memory_mb": 8192, "generation": { "gpu_layers": 1, "context_size": 2 } }));
+    assert!(t.get("max_memory_mb").is_none());
+    assert!(t.get("generation").and_then(|g| g.get("gpu_layers")).is_none());
+    // `[embedding]` and unknown llamafile keys are refused / ignored.
+    let mut t = toml::Table::new();
+    let _ = apply_inference_to_table(&mut t, &json!({ "embedding": { "enabled": true } }));
+    assert!(t.get("embedding").is_none());
+    assert!(apply_inference_to_table(&mut toml::Table::new(), &json!({ "llamafile": { "auto_start": true } })).is_err());
+    assert!(apply_inference_to_table(&mut toml::Table::new(), &json!({ "llamafile": { "port": 70000 } })).is_err());
+    assert!(apply_inference_to_table(&mut toml::Table::new(), &json!({ "llamafile": { "host": "evil.example" } })).is_err());
+    assert!(apply_inference_to_table(&mut toml::Table::new(), &json!({ "llamafile": { "default_file": "../x" } })).is_err());
+    assert!(apply_inference_to_table(&mut toml::Table::new(), &json!({ "router": { "ucci_shadow_max_inflight": 0 } })).is_err());
 }
 
 #[test]
@@ -366,4 +333,21 @@ fn inference_response_no_secret_reports_unset() {
     let oc = resp.get("openai_compat").unwrap();
     assert_eq!(oc.get("api_key_set").unwrap().as_bool(), Some(false));
     assert_eq!(oc.get("api_key").unwrap().as_str(), Some(""));
+}
+
+#[test]
+fn inference_llamafile_fields_can_be_cleared() {
+    let mut t = toml::Table::new();
+    apply_inference_to_table(
+        &mut t,
+        &json!({ "llamafile": { "dir": "/opt/lf", "host": "127.0.0.1", "port": 8081, "default_file": "m.llamafile", "extra_args": ["-t", "4"] } }),
+    )
+    .unwrap();
+    apply_inference_to_table(
+        &mut t,
+        &json!({ "llamafile": { "dir": "", "host": "", "port": null, "default_file": "", "extra_args": "" } }),
+    )
+    .unwrap();
+    let lf = t["llamafile"].as_table().unwrap();
+    assert!(lf.is_empty(), "{lf:?}");
 }

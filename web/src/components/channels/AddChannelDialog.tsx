@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { useIntl } from 'react-intl';
+import { useIntl, type IntlShape } from 'react-intl';
 import { api, type AgentInfo } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -17,6 +17,8 @@ import {
   DialogFooter,
 } from '@/components/mds';
 import { SecretSourceField } from '@/components/shared/SecretSourceField';
+import { normalizeRestartRequired } from '@/lib/config-toml';
+import { useRestartRequiredStore } from '@/stores/restart-required-store';
 import { AlertTriangle } from 'lucide-react';
 
 /** Channel type picker options — value ⇒ human label (spec §4 Select). */
@@ -34,6 +36,53 @@ export const CHANNEL_TYPES: ReadonlyArray<{ value: string; label: string }> = [
 ];
 
 export const SUPPORTS_PER_AGENT = ['discord', 'telegram', 'slack'];
+
+/**
+ * v1.68 (W2): `channels.add` reports whether the bot / webhook endpoint really
+ * came up. Saying "saved" alone used to send operators off to paste a
+ * callback address that answered 404.
+ *
+ * - `restart_required` (true / keys) ⇒ the endpoint exists only after a
+ *   restart (older gateways mounted webhook routes at boot only).
+ * - `hot_started: false` + `not_started_reason` (v1.68 gateways start every
+ *   transport live) ⇒ saved, but the credentials or the webhook settings need
+ *   another look.
+ * - `hot_started: false`, no reason, `restart_required` present ⇒ shown as an
+ *   error (a v1.68 gateway that could not start it).
+ * - `hot_started: false` and no `restart_required` at all ⇒ an older gateway:
+ *   a restart is the only thing that will start it.
+ */
+export function reportChannelStart(
+  channelType: string,
+  res:
+    | { hot_started?: boolean; restart_required?: boolean | string[]; not_started_reason?: string | null }
+    | null
+    | undefined,
+  intl: IntlShape,
+): 'started' | 'restart' | 'not_started' | 'unknown' {
+  const label = CHANNEL_TYPES.find((c) => c.value === channelType)?.label ?? channelType;
+  const restartKeys = normalizeRestartRequired(res?.restart_required, `channels.${channelType}`);
+  if (restartKeys.length > 0) {
+    useRestartRequiredStore.getState().add(restartKeys);
+    toast.info(intl.formatMessage({ id: 'channels.add.restartRequired' }, { name: label }), { durationMs: 15000 });
+    return 'restart';
+  }
+  if (res?.hot_started === false) {
+    const reason = res.not_started_reason;
+    if (reason === 'check_credentials' || reason === 'webhook_config_incomplete') {
+      toast.error(intl.formatMessage({ id: `channels.add.notStarted.${reason}` }, { name: label }), { durationMs: 15000 });
+    } else if (res.restart_required !== undefined) {
+      // A v1.68 gateway answered (it always sends `restart_required`) but
+      // gave no reason: it did not start, and a restart would not fix it.
+      toast.error(intl.formatMessage({ id: 'channels.add.notStarted.unknown' }, { name: label }), { durationMs: 15000 });
+    } else {
+      useRestartRequiredStore.getState().add([`channels.${channelType}`]);
+      toast.info(intl.formatMessage({ id: 'channels.add.notStarted' }, { name: label }), { durationMs: 15000 });
+    }
+    return 'not_started';
+  }
+  return res?.hot_started === true ? 'started' : 'unknown';
+}
 
 /** Stacked label + control block used across the channel dialogs (spec §5.3). */
 export function DialogField({
@@ -139,7 +188,8 @@ export function AddChannelDialog({
         if (wecomCallbackToken.trim()) config.wecom_callback_token = wecomCallbackToken.trim();
         if (wecomAesKey.trim()) config.wecom_encoding_aes_key = wecomAesKey.trim();
       }
-      await api.channels.add(channelType, config, selectedAgent || undefined);
+      const res = await api.channels.add(channelType, config, selectedAgent || undefined);
+      reportChannelStart(channelType, res, intl);
       onCreated(channelType);
       onClose();
       setToken('');

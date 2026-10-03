@@ -822,7 +822,8 @@ function EditAccountDialog({
   const [email, setEmail] = useState(account.email ?? '');
   const [subscription, setSubscription] = useState(account.subscription ?? '');
   const [profile, setProfile] = useState('');
-  const [tags, setTags] = useState<string[]>([]);
+  // v1.68: prefilled from `accounts.list` (older gateways send none).
+  const [tags, setTags] = useState<string[]>(account.tags ?? []);
   const [budget, setBudget] = useState(String((account.monthly_budget_cents ?? 0) / 100));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -835,7 +836,7 @@ function EditAccountDialog({
       setEmail(account.email ?? '');
       setSubscription(account.subscription ?? '');
       setProfile('');
-      setTags([]);
+      setTags(account.tags ?? []);
       setBudget(String((account.monthly_budget_cents ?? 0) / 100));
       setError(null);
     }
@@ -852,7 +853,9 @@ function EditAccountDialog({
         email,
         subscription,
         ...(profile.trim() !== '' ? { profile: profile.trim() } : {}),
-        ...(tags.length > 0 ? { tags } : {}),
+        // Send the list whenever the gateway reported one (so clearing sends
+        // `[]`); an older gateway without `tags` only gets typed tags.
+        ...(account.tags !== undefined || tags.length > 0 ? { tags } : {}),
         monthly_budget_cents: Math.round(Number(budget) * 100),
       });
       onSaved();
@@ -902,7 +905,10 @@ function EditAccountDialog({
           >
             <Input type="text" value={profile} onChange={(e) => setProfile(e.target.value)} />
           </Field>
-          <Field label={intl.formatMessage({ id: 'accounts.field.tags' })}>
+          <Field
+            label={intl.formatMessage({ id: 'accounts.field.tags' })}
+            hint={intl.formatMessage({ id: 'accounts.field.tags.hint' })}
+          >
             <ChipEditor values={tags} onChange={setTags} placeholder="prod" addLabel={intl.formatMessage({ id: 'common.add' })} />
           </Field>
           {error && <p className="text-sm text-destructive">{error}</p>}

@@ -192,9 +192,6 @@ impl MethodHandler {
 
             [container]
             timeout_ms = 1800000
-            max_concurrent = 1
-            readonly_project = true
-            additional_mounts = []
 
             [heartbeat]
             enabled = false
@@ -207,20 +204,24 @@ impl MethodHandler {
             warn_threshold_percent = 80
             hard_stop = true
 
+            // v1.68: the four flags are enforced at the MCP gate; scaffold
+            // them on (the marker tells the boot migration to leave this
+            // file alone, so a later `false` from the dashboard sticks).
             [permissions]
-            can_create_agents = false
+            can_create_agents = true
             can_send_cross_agent = true
             can_modify_own_skills = true
             can_modify_own_soul = false
-            can_schedule_tasks = false
+            can_schedule_tasks = true
             allowed_channels = ["*"]
+            permissions_enforced_since = "1.68.0"
 
+            // v1.68: the `*_reflection`, `skill_auto_activate` and
+            // `skill_security_scan` keys had no reader and are no longer
+            // scaffolded (nor are `[container] max_concurrent /
+            // readonly_project / additional_mounts`).
             [evolution]
-            micro_reflection = false
-            meso_reflection = false
-            macro_reflection = false
-            skill_auto_activate = false
-            skill_security_scan = true
+            enabled = true
         };
 
         // Optional `[runtime]` (provider/fallback) from the create params — lets

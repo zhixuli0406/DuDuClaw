@@ -22,6 +22,7 @@ pub(crate) fn account_status_to_json(a: &duduclaw_agent::account_rotator::Accoun
         "total_requests": a.total_requests,
         "is_available": a.is_available,
         "label": a.label,
+        "tags": a.tags,
         "email": a.email,
         "subscription": a.subscription,
         "expires_at": a.expires_at,
@@ -166,55 +167,31 @@ pub(crate) fn validate_migrate_source(source: Option<&str>) -> Result<(), String
     }
 }
 
-/// Upper bound for one `docker info` / `podman info` probe. A hung Docker
-/// Desktop VM makes `docker info` block indefinitely (observed 2026-09-28:
-/// the daemon processes were alive, the socket existed, and `docker info`
-/// never returned), which previously hung `system.doctor`, `doctor_repair`
-/// and the gateway test suite with it. The other doctor probes already cap
-/// themselves (mcp 10s, grok 15s); this one must too.
-pub(crate) const CONTAINER_RUNTIME_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Check if Docker (or Podman) is available by running `docker info`.
 /// Returns `("pass"/"warn", message)`.
 pub(crate) async fn check_docker() -> (&'static str, String) {
-    // Try `docker info` first, then `podman info`
-    for cmd_name in &["docker", "podman"] {
-        let probe = tokio::process::Command::new(cmd_name)
-            .arg("info")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            // Drop the child if the timeout below wins, so a stuck daemon
-            // does not leave a `docker info` process behind on every probe.
-            .kill_on_drop(true)
-            .output();
-        let result = tokio::time::timeout(CONTAINER_RUNTIME_PROBE_TIMEOUT, probe).await;
-
-        match result {
-            Ok(Ok(out)) if out.status.success() => {
-                return ("pass", format!("{cmd_name} daemon is running"));
-            }
-            Ok(Ok(_)) => {
-                return (
-                    "warn",
-                    format!("{cmd_name} found but daemon is not running"),
-                );
-            }
-            Err(_elapsed) => {
-                return (
-                    "warn",
-                    format!(
-                        "{cmd_name} info did not answer within {}s — the daemon appears hung; restart the container runtime",
-                        CONTAINER_RUNTIME_PROBE_TIMEOUT.as_secs()
-                    ),
-                );
-            }
-            Ok(Err(_)) => {} // binary not found — try next
+    // v1.68: the shared probe (`docker info` server version + `docker ps`,
+    // each bounded) — the same verdict the CLI doctor, the task sandbox and
+    // computer use act on. A half-dead daemon that still answers a ping no
+    // longer reads as healthy here.
+    use duduclaw_core::docker_probe::{DockerStatus, Unavailable};
+    let (status, detail) = crate::task_sandbox::container::docker_status_detail().await;
+    let said = detail.map(|d| format!(" Docker said: {d}")).unwrap_or_default();
+    match status {
+        DockerStatus::Reachable { server_version } => {
+            ("pass", format!("Docker daemon is reachable (server {server_version})"))
         }
+        DockerStatus::Unavailable(Unavailable::NoClient) => (
+            "warn",
+            "Docker not available: the docker client could not be run. Container mode won't work.".to_string(),
+        ),
+        DockerStatus::Unavailable(why) => (
+            "warn",
+            format!(
+                "Docker installed but not usable ({}): `docker info` / `docker ps` did not answer. Restart Docker; container mode won't work until then.{said}",
+                why.code()
+            ),
+        ),
     }
-
-    (
-        "warn",
-        "No container runtime (docker/podman) found in PATH".to_string(),
-    )
 }

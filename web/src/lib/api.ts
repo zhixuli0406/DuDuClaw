@@ -1,4 +1,13 @@
 import { client } from './ws-client';
+// v1.68 W2 — dashboard-switches RPC wire types.
+import type {
+  TickSourcesListResult,
+  TickSourceUpsert,
+  TickSourcesWriteResult,
+  ConfigRawFile,
+  ConfigRawGetResult,
+  ConfigRawSetResult,
+} from './config-rpc-types';
 import {
   fanOutByAgent,
   mergeById,
@@ -50,36 +59,17 @@ export interface AgentBudget {
   hard_stop: boolean;
 }
 
-export interface AgentLocalModel {
-  model: string;
-  backend: string;
-  context_length: number;
-  gpu_layers: number;
-  prefer_local: boolean;
-  use_router: boolean;
-}
-
 export interface AgentModel {
   preferred: string;
   fallback: string;
   account_pool: string[];
   api_mode?: string;
-  local?: AgentLocalModel | null;
-}
-
-export interface AgentSticker {
-  enabled: boolean;
-  probability: number;
-  intensity_threshold: number;
-  cooldown_messages: number;
-  expressiveness: 'minimal' | 'moderate' | 'expressive';
+  local?: { model: string; prefer_local: boolean; use_router: boolean } | null;
 }
 
 export interface AgentEvolution {
   gvu_enabled: boolean;
   cognitive_memory: boolean;
-  skill_auto_activate: boolean;
-  skill_security_scan: boolean;
   max_silence_hours: number;
 }
 
@@ -96,7 +86,6 @@ export interface AgentDetail extends AgentInfo {
   };
   skills: string[];
   permissions: Record<string, boolean>;
-  sticker?: AgentSticker;
   evolution?: AgentEvolution;
   proactive?: ProactiveSettings;
   /** WP4 — the uploaded avatar as an inline data URI, or null when none.
@@ -129,17 +118,15 @@ export interface AgentDetail extends AgentInfo {
   };
 }
 
+
+
 export interface VoiceSettings {
-  asr_provider: string;
   tts_provider: string;
-  asr_language: string;
   tts_voice: string;
-  voice_reply_enabled: boolean;
 }
 
 export interface ProactiveSettings {
   enabled: boolean;
-  check_interval: string;
   /** @deprecated Legacy numeric pair — deliberately NOT read by the W2-4
    *  notification gate (`notify_governance.rs`); kept only because the
    *  typed `ProactiveConfig` struct still round-trips it. Use `quiet_hours`
@@ -211,6 +198,8 @@ export interface CliCredentialInfo {
 
 export interface AccountInfo {
   id: string;
+  /** v1.68: `[[accounts]] tags` (matched by an employee's account pool). */
+  tags?: string[];
   auth_method: 'apikey' | 'oauth';
   account_type?: string; // legacy alias
   /** LLM provider this account authenticates against ("anthropic", "openai",
@@ -285,6 +274,9 @@ export interface SystemStatus {
    * gateway's own 404 middleware). Read through `useDecisionEnabled`.
    */
   decision_enabled?: boolean;
+  /** v1.68 W2: whether this build was compiled with OpenTelemetry tracing
+   *  (`otel` cargo feature). Absent on older gateways → treat as `false`. */
+  otel_compiled?: boolean;
 }
 
 /** Response of `system.autostart.status` / `system.autostart.set` — the
@@ -2389,52 +2381,31 @@ export interface AgentUpdateParams {
   can_schedule_tasks?: boolean;
   // Local model
   local_model?: string;
-  local_backend?: string;
-  local_context_length?: number;
-  local_gpu_layers?: number;
+  // v1.68: local_backend / local_context_length / local_gpu_layers removed
+  // (no runtime reader; deleted server-side).
   prefer_local?: boolean;
   use_router?: boolean;
   // Container
   timeout_ms?: number;
-  max_concurrent?: number;
   sandbox_enabled?: boolean;
   network_access?: boolean;
-  readonly_project?: boolean;
   // Evolution
-  skill_auto_activate?: boolean;
-  skill_security_scan?: boolean;
   gvu_enabled?: boolean;
   cognitive_memory?: boolean;
   max_active_skills?: number;
   max_silence_hours?: number;
   skill_token_budget?: number;
-  // Proactive ([proactive] section, nested object). Includes G.8 extras
-  // (token_budget_per_check / timezone / max_turns) accepted by the backend.
+
+  // Proactive ([proactive] section, nested object) + timezone / max_turns.
   proactive?: Partial<ProactiveSettings> & {
-    token_budget_per_check?: number;
     timezone?: string;
     max_turns?: number;
   };
   // Per-agent channels
   discord_bot_token?: string;
   telegram_bot_token?: string;
-  line_channel_token?: string;
-  line_channel_secret?: string;
   slack_app_token?: string;
   slack_bot_token?: string;
-  whatsapp_access_token?: string;
-  whatsapp_verify_token?: string;
-  whatsapp_phone_number_id?: string;
-  whatsapp_app_secret?: string;
-  feishu_app_id?: string;
-  feishu_app_secret?: string;
-  feishu_verification_token?: string;
-  // Sticker
-  sticker_enabled?: boolean;
-  sticker_probability?: number;
-  sticker_intensity_threshold?: number;
-  sticker_cooldown_messages?: number;
-  sticker_expressiveness?: 'minimal' | 'moderate' | 'expressive';
   // Capabilities ([capabilities] section, nested object)
   capabilities?: AgentCapabilities;
   // v1.39 — OS-native filesystem watch ([os_watch] top-level table)
@@ -2449,8 +2420,6 @@ export interface AgentUpdateParams {
   runtime?: AgentRuntime;
   // EVO — advanced evolution ([evolution.*] fields, nested object)
   evolution_advanced?: AgentEvolutionAdvanced;
-  // CT — advanced container ([container.*] fields, nested object)
-  container_advanced?: AgentContainerAdvanced;
   // ODO — per-agent [odoo] override (nested object). api_key/password write-only.
   odoo?: AgentOdooOverride;
   // G.8 — [model] extras
@@ -2459,15 +2428,8 @@ export interface AgentUpdateParams {
   // G.8 — [heartbeat] extras
   heartbeat_max_concurrent_runs?: number;
   heartbeat_cron_timezone?: string;
-  // UI.3 — stagnation detection ([evolution.stagnation_detection])
-  stagnation_enabled?: boolean;
-  stagnation_window_seconds?: number;
-  stagnation_trigger_threshold?: number;
-  stagnation_action?: 'log_only' | 'suppress';
   // G.8 — free-form scalar tables
-  ptc?: Record<string, string | number | boolean>;
   prompt?: Record<string, string | number | boolean>;
-  cultural_context?: Record<string, string | number | boolean>;
 }
 
 // ── WP4: agent handoff (offboard with transfer) ─────────────────
@@ -2523,7 +2485,10 @@ export interface AgentOdooOverride {
 
 // ── RT: per-agent [runtime] ─────────────────────────────────────
 
-export type RuntimeProvider = 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok' | 'openai_compat';
+export type RuntimeProvider =
+  | 'claude' | 'codex' | 'gemini' | 'antigravity' | 'grok' | 'openai_compat'
+  // v1.68 W1 — generic command-line runtimes from `runtime_catalog.rs`.
+  | 'qwen' | 'kimi' | 'copilot' | 'kiro' | 'cursor' | 'vibe' | 'opencode';
 
 /** The `runtime` object accepted by `agents.update`. All fields optional —
  *  the backend only writes fields that are present. An empty `fallback`
@@ -2532,7 +2497,123 @@ export interface AgentRuntime {
   provider?: RuntimeProvider;
   /** A provider name, or '' to clear. Must be a valid provider when non-empty. */
   fallback?: string;
+  /** v1.68 W1 — `[runtime] minimal_context` (精簡啟動內容). Default true. */
+  minimal_context?: boolean;
 }
+
+// ── BEGIN v1.68 W1: AI-employee edit page (agents.update / agents.inspect) ──
+// Contract: commercial/docs/TODO-dashboard-switches-v1.68-2026-10.md
+// (`agents.update` only writes the fields it receives; `agents.inspect`
+// returns every section). Every field below is optional so an older gateway
+// that does not return it simply leaves the control empty.
+
+/** `[model] effort`. '' = not set (the runtime's own default). */
+export type AgentEffort = '' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+/** The four team roles as `[team.roles.<role>]` keys. `utility` is the
+ *  合成 role (`duduclaw_core::types::Role::Utility`). */
+export type AgentTeamRoleKey = 'planner' | 'executor' | 'verifier' | 'utility';
+
+export interface AgentTeamRoleSpec {
+  runtime?: string;
+  model?: string;
+  effort?: string;
+}
+
+export interface AgentTeamSection {
+  enabled?: boolean;
+  roles?: Partial<Record<AgentTeamRoleKey, AgentTeamRoleSpec>>;
+}
+
+export interface AgentGuardrailsSection {
+  enabled?: boolean;
+  block_secrets?: boolean;
+  block_injection_echo?: boolean;
+  redact_pii?: boolean;
+  deny_phrases?: string[];
+}
+
+export interface AgentMemorySection {
+  decision_continuity?: boolean;
+  decision_ttl_days?: number;
+}
+
+/** Typed value kinds the advanced key/value editor can send. */
+export type AgentKvType = 'string' | 'integer' | 'float' | 'boolean' | 'string_array';
+
+/** One typed write from the advanced key/value editor. The server parses
+ *  the whole result as `AgentConfig` before writing and rejects the save
+ *  (with the parse error as the message) when it does not fit. */
+export interface AgentKvEntry {
+  section: string;
+  key: string;
+  value: string | number | boolean | string[];
+  type: AgentKvType;
+}
+
+/** v1.68 `agents.update` additions (all optional, partial writes). */
+export interface AgentUpdateParamsV168 {
+  budget?: { daily_cap_cents?: number };
+  model?: { effort?: AgentEffort };
+  fork?: { enabled?: boolean };
+  team?: AgentTeamSection;
+  guardrails?: AgentGuardrailsSection;
+  memory?: AgentMemorySection;
+  night_engine?: { enabled?: boolean };
+  advanced_kv?: AgentKvEntry[];
+}
+
+/** v1.68 `agents.inspect` additions. Older gateways omit them. */
+export interface AgentDetailV168 {
+  heartbeat?: {
+    cron?: string;
+    cron_timezone?: string;
+    max_concurrent_runs?: number;
+  };
+  budget?: { daily_cap_cents?: number };
+  model?: { effort?: string; utility?: string };
+  permissions?: { permissions_enforced_since?: string | number | null };
+  runtime?: { minimal_context?: boolean };
+  fork?: { enabled?: boolean };
+  team?: AgentTeamSection & {
+    roles?: Partial<Record<AgentTeamRoleKey | 'synthesizer', AgentTeamRoleSpec>>;
+  };
+  guardrails?: AgentGuardrailsSection;
+  memory?: AgentMemorySection;
+  night_engine?: { enabled?: boolean };
+  evolution?: {
+    max_active_skills?: number;
+    skill_token_budget?: number;
+    skill_synthesis_enabled?: boolean;
+    skill_synthesis_threshold?: number;
+    skill_synthesis_cooldown_hours?: number;
+    skill_trial_ttl?: number;
+    skill_graduation_min_lift?: number;
+    external_factors?: Partial<Record<
+      'user_feedback' | 'security_events' | 'channel_metrics' | 'business_context' | 'peer_signals',
+      boolean
+    >>;
+  };
+  container?: { timeout_ms?: number };
+
+  odoo?: {
+    profile?: string;
+    allowed_models?: string[];
+    unblock_models?: string[];
+    allowed_actions?: string[];
+    company_ids?: number[];
+    url?: string;
+    db?: string;
+    username?: string;
+  };
+  proactive?: {
+    timezone?: string;
+    max_turns?: number;
+  };
+  /** Raw `[prompt]` table for the advanced key/value editor. */
+  prompt?: Record<string, unknown>;
+}
+// ── END v1.68 W1 ──
 
 /** Result of `runtime.detect` — which AI backends are installed + Claude OAuth. */
 export interface RuntimeDetect {
@@ -3017,15 +3098,6 @@ export interface ContainerEnvVar {
   value: string;
 }
 
-/** The `container_advanced` object accepted by `agents.update`. All fields
- *  optional. Mount host paths matching the gateway blocked-pattern list
- *  (e.g. `.ssh`, `.env`) are rejected server-side. */
-export interface AgentContainerAdvanced {
-  additional_mounts?: ContainerMount[];
-  cmd?: string[];
-  env?: ContainerEnvVar[];
-}
-
 // ── INF: inference.toml ─────────────────────────────────────────
 
 export interface InferenceGeneration {
@@ -3033,8 +3105,13 @@ export interface InferenceGeneration {
   temperature?: number;
   top_p?: number;
   stop?: string[];
+  /** @deprecated v1.68: no reader (removed llama.cpp backend); never sent. */
   gpu_layers?: number;
+  /** @deprecated v1.68: no reader; never sent. */
   context_size?: number;
+  /** v1.68: per-token logprob capture for the UCCI cascade (advanced). */
+  capture_logprobs?: boolean;
+  capture_top_logprobs?: boolean;
 }
 
 export interface InferenceRouter {
@@ -3047,6 +3124,27 @@ export interface InferenceRouter {
   max_fast_prompt_tokens?: number;
   cloud_keywords?: string[];
   fast_keywords?: string[];
+  // v1.68 (W2) advanced router keys.
+  /** Lets the local tier use MCP tools. Unset ⇒ true. */
+  local_tools?: boolean;
+  ucci_fast_router?: string;
+  ucci_strong_router?: string;
+  ucci_shadow_strong?: boolean;
+  ucci_shadow_max_inflight?: number;
+  ucci_drop_stop_token?: boolean;
+  ucci_observations?: string;
+}
+
+/** v1.68 (W2): typed `[llamafile]` (replaces the raw-section editor). */
+export interface InferenceLlamafile {
+  enabled?: boolean;
+  dir?: string;
+  default_file?: string;
+  port?: number;
+  host?: string;
+  gpu_layers?: number;
+  context_size?: number;
+  extra_args?: string[];
 }
 
 /** `[openai_compat]` — the api_key is WRITE-ONLY. On read, the gateway returns
@@ -3073,7 +3171,6 @@ export interface InferenceConfig {
   models_dir?: string;
   default_model?: string;
   auto_load?: boolean;
-  max_memory_mb?: number;
   generation?: InferenceGeneration;
   router?: InferenceRouter;
   openai_compat?: InferenceOpenAiCompat;
@@ -3090,12 +3187,11 @@ export interface InferenceUpdate {
   models_dir?: string;
   default_model?: string;
   auto_load?: boolean;
-  max_memory_mb?: number;
   generation?: InferenceGeneration;
   router?: InferenceRouter;
   openai_compat?: InferenceOpenAiCompat;
-  llamafile?: InferenceBackendSection;
-  embedding?: InferenceBackendSection;
+  /** v1.68: typed (was a free-form section). */
+  llamafile?: InferenceLlamafile;
 }
 
 // ── IDR: [identity] identity resolution (RFC-21 §1) ─────────────
@@ -3259,6 +3355,15 @@ export interface AgentCapabilities {
    *  the set wholesale (`[]` revokes all); the server rejects any id not in
    *  the currently configured source list. */
   db_sources?: string[];
+  // v1.68 W1 — tool-name lists (bare MCP tool names, exact match server-side).
+  /** Always wait for a human before running these tools. */
+  approval_required_tools?: string[];
+  /** ActionGuard "always irreversible" — always ask a human. */
+  irreversible_tools?: string[];
+  /** ActionGuard "maybe irreversible" — the judge decides per call. */
+  maybe_irreversible_tools?: string[];
+  /** PORTICO — usable only with an active task-scoped grant. */
+  scoped_tools?: string[];
 }
 
 /** v1.39 — top-level `[os_watch]` table (gated by `capabilities.os_native`).
@@ -3933,7 +4038,7 @@ export interface BuiltinToolEntry {
   /** T5 (2026-09-29): a deprecated alias of a merged entry point. Still
    *  callable and still in `tools/list`, but the picker must not offer it as a
    *  new choice — it only stays visible when already selected. Removal target
-   *  v1.68.0; see `docs/guides/deprecations.md`. */
+   *  v1.69.0; see `docs/guides/deprecations.md`. */
   deprecated?: boolean;
 }
 
@@ -4306,27 +4411,25 @@ export interface KillswitchDefensivePrompt {
   languages: string[];
 }
 
-export interface KillswitchAudit {
-  enabled: boolean;
-  path: string;
-}
-
 export interface KillswitchConfig {
   triggers: KillswitchTriggers;
   circuit_breaker: KillswitchCircuitBreaker;
   failsafe: KillswitchFailsafe;
   safety_words: KillswitchSafetyWords;
   defensive_prompt: KillswitchDefensivePrompt;
-  audit: KillswitchAudit;
+  /** v1.68: which triggers are actually present in KILLSWITCH.toml (and so
+   *  enforced). The `triggers` values are display defaults for the rest.
+   *  Absent on older gateways (which enforced none of them). */
+  triggers_enforced?: Partial<Record<keyof KillswitchTriggers, boolean>>;
 }
 
 export interface KillswitchUpdate {
-  triggers?: Partial<KillswitchTriggers>;
+  /** v1.68: send only the triggers to arm or change; `null` asks to remove one. */
+  triggers?: Partial<{ [K in keyof KillswitchTriggers]: number | null }>;
   circuit_breaker?: Partial<KillswitchCircuitBreaker>;
   failsafe?: Partial<KillswitchFailsafe>;
   safety_words?: Partial<KillswitchSafetyWords>;
   defensive_prompt?: Partial<KillswitchDefensivePrompt>;
-  audit?: Partial<KillswitchAudit>;
 }
 
 // ── SCP: wiki namespace policy (.scope.toml) ────────────────────
@@ -5136,7 +5239,16 @@ export const api = {
     status: () =>
       client.call('channels.status') as Promise<{ channels: ChannelStatus[] }>,
     add: (type: string, config: Record<string, string>, agent?: string) =>
-      client.call('channels.add', { type, config, ...(agent ? { agent } : {}) }),
+      client.call('channels.add', { type, config, ...(agent ? { agent } : {}) }) as Promise<{
+        success?: boolean;
+        type?: string;
+        /** False when the bot / webhook endpoint did not come up yet. */
+        hot_started?: boolean;
+        /** v1.68: true (or the keys) when the endpoint only exists after a restart. */
+        restart_required?: boolean | string[];
+        /** v1.68: why `hot_started` is false (`check_credentials` / `webhook_config_incomplete`). */
+        not_started_reason?: string | null;
+      }>,
     // W0-2: the gateway actually sends a test message when it can find a
     // destination (`mode: "live"`); when no destination is known yet it
     // honestly degrades to `mode: "credential_only"` (only verified the
@@ -5703,8 +5815,6 @@ export const api = {
           agent_id: string;
           gvu_enabled: boolean;
           cognitive_memory: boolean;
-          skill_auto_activate: boolean;
-          skill_security_scan: boolean;
           max_silence_hours: number;
         }>;
       }>,
@@ -5811,7 +5921,7 @@ export const api = {
         daily_digest_at?: string;
       }>,
     updateConfig: (fields: Record<string, unknown>) =>
-      client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean; hot_reloaded?: string[] }>,
+      client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean; hot_reloaded?: string[]; /** v1.68: keys that only apply after a gateway restart. */ restart_required?: string[] }>,
     checkUpdate: () =>
       client.call('system.check_update') as Promise<{
         available: boolean;
@@ -6158,8 +6268,14 @@ export const api = {
   marketplace: {
     list: () =>
       client.call('marketplace.list') as Promise<{ servers: MarketplaceServer[] }>,
-    install: (id: string, agentId: string) =>
-      client.call('marketplace.install', { id, agent_id: agentId }) as Promise<{ success: boolean; agent_id: string }>,
+    /** v1.68: `env` carries a typed value for every name in the item's
+     *  `required_env` (the gateway refuses the install otherwise). */
+    install: (id: string, agentId: string, env?: Record<string, string>) =>
+      client.call('marketplace.install', {
+        id,
+        agent_id: agentId,
+        ...(env && Object.keys(env).length > 0 ? { env } : {}),
+      }) as Promise<{ success: boolean; agent_id: string }>,
   },
   odoo: {
     status: () =>
@@ -6821,6 +6937,8 @@ export const api = {
       client.call('inference.update', { ...fields }) as Promise<{
         success: boolean;
         changes: string[];
+        /** v1.68: the gateway dropped its cached engine, so the next reply uses the new settings. */
+        engine_reset?: boolean;
       }>,
     /** WP-D: the appliance's built-in local model engine. Admin-gated — the
      *  responses expose the machine's memory profile and state-root layout. */
@@ -7028,6 +7146,26 @@ export const api = {
      *  (live notification / frontmost / calendar / mdfind checks). */
     doctorRun: () => client.call('os.doctor.run') as Promise<OsDoctorRunResult>,
   },
+  // ── v1.68 W2 (dashboard switches) — BEGIN ──────────────────────────
+  // `[[tick.sources]]` CRUD and the raw config editor. Contract:
+  // commercial/docs/TODO-dashboard-switches-v1.68-2026-10.md. Both are
+  // admin-only server-side; an older gateway answers "unknown method" and
+  // the cards say so instead of pretending to work.
+  tickSources: {
+    list: () =>
+      client.call('tick.sources.list') as Promise<TickSourcesListResult>,
+    upsert: (source: TickSourceUpsert) =>
+      client.call('tick.sources.upsert', { ...source }) as Promise<TickSourcesWriteResult>,
+    remove: (id: string) =>
+      client.call('tick.sources.remove', { id }) as Promise<TickSourcesWriteResult>,
+  },
+  configRaw: {
+    get: (file: ConfigRawFile) =>
+      client.call('config.raw.get', { file }) as Promise<ConfigRawGetResult>,
+    set: (file: ConfigRawFile, content: string, baseHash?: string) =>
+      client.call('config.raw.set', { file, content, ...(baseHash ? { base_hash: baseHash } : {}) }) as Promise<ConfigRawSetResult>,
+  },
+  // ── v1.68 W2 (dashboard switches) — END ────────────────────────────
   // ── I-5: ⌘K cross-source content search ─────────────────────────
   search: {
     /** One bounded query fanned out over conversations / artifacts / memory /

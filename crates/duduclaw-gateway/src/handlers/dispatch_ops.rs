@@ -79,6 +79,19 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_ticks_recent(params).await
             }
+            // ── v1.68: [[tick.sources]] CRUD (admin; hot-respawns the tasks) ──
+            "tick.sources.list" => {
+                require_admin!();
+                self.handle_tick_sources_list().await
+            }
+            "tick.sources.upsert" => {
+                require_admin!();
+                self.handle_tick_sources_upsert(params, ctx).await
+            }
+            "tick.sources.remove" => {
+                require_admin!();
+                self.handle_tick_sources_remove(params, ctx).await
+            }
 
             // ── OS-native page (P4-3, admin management surface) ─
             "os.status" => {

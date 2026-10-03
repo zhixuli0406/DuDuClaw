@@ -224,3 +224,13 @@ function applyChrome(branding: BrandingConfig | null): void {
 // Apply once from the hydrated cache, then on every branding change.
 applyChrome(useBrandingStore.getState().branding);
 useBrandingStore.subscribe((s) => applyChrome(s.branding));
+
+/** v1.68 (W2): the distributor's 副標題, or `null` when none is set. Shown on
+ *  the login page under the product name (before this nothing rendered it,
+ *  so the 品牌 → 副標題 field had no effect). */
+export function useEffectiveSubtitle(): string | null {
+  return useBrandingStore((s) => {
+    const v = s.branding?.subtitle;
+    return typeof v === 'string' && v.trim() !== '' ? v.trim() : null;
+  });
+}

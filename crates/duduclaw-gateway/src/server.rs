@@ -1133,15 +1133,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // it feeds LINE webhooks received via `duduclaw-relay` into the exact
     // same verify+dispatch path `line_router` above mounts for direct HTTP.
     crate::relay_client::spawn_relay_client(&home_dir, reply_ctx.clone());
-    let whatsapp_router =
-        crate::whatsapp::start_whatsapp_webhook(&home_dir, reply_ctx.clone()).await;
-    let feishu_router = crate::feishu::start_feishu_webhook(&home_dir, reply_ctx.clone()).await;
-    let googlechat_router =
-        crate::googlechat::start_googlechat_webhook(&home_dir, reply_ctx.clone()).await;
-    let teams_router = crate::msteams::start_teams_webhook(&home_dir, reply_ctx.clone()).await;
-    let wecom_router = crate::wecom::start_wecom_webhook(&home_dir, reply_ctx.clone()).await;
-    let dingtalk_router =
-        crate::dingtalk::start_dingtalk_webhook(&home_dir, reply_ctx.clone()).await;
+    // Webhook channels: fill the always-mounted slots for the channels that
+    // are configured now; `channels.add` fills the rest later (hot start).
+    let webhook_slots = crate::webhook_slots::global();
+    for (channel, _) in crate::webhook_slots::WEBHOOK_CHANNELS {
+        let r = crate::webhook_slots::start_webhook(channel, &home_dir, reply_ctx.clone()).await;
+        webhook_slots.set(channel, r);
+    }
     let webchat_ctx = reply_ctx.clone();
     info!("boot: channel startup done — starting schedulers");
 
@@ -1691,23 +1689,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // live counters rather than a second, never-updated copy.
         handler.set_tick_hub(tick_hub.clone()).await;
         {
-            let tick_cfg = crate::tick_config::TickConfig::from_home(&home_dir);
-            let handles = crate::tick_source::spawn_tick_sources(
-                &tick_cfg,
-                &home_dir,
-                ap_tx.clone(),
-                tick_hub.clone(),
-                events_bus.clone(),
-            );
-            if handles.is_empty() {
+            // v1.68: the handler owns the source tasks so a dashboard edit
+            // (`system.update_config` [tick], `tick.sources.*`) can respawn
+            // them without a restart.
+            let n = handler
+                .install_tick_runtime(ap_tx.clone(), events_bus.clone(), tick_hub.clone())
+                .await;
+            if n == 0 {
                 info!("Resident sensing disabled (no active [tick] sources)");
             } else {
-                info!(
-                    sources = handles.len(),
-                    "Resident sensing tick sources started"
-                );
+                info!(sources = n, "Resident sensing tick sources started");
             }
-            bg_handles.extend(handles);
         }
 
         // ── G4: Odoo ERP changes → autopilot bus ───────────────────────
@@ -2640,25 +2632,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // Mount LINE webhook endpoint (always — the handler reads config per request)
     app = app.merge(line_router);
-    // Mount configured webhook channels (each returns None when unconfigured)
-    if let Some(r) = whatsapp_router {
-        app = app.merge(r);
-    }
-    if let Some(r) = feishu_router {
-        app = app.merge(r);
-    }
-    if let Some(r) = googlechat_router {
-        app = app.merge(r);
-    }
-    if let Some(r) = teams_router {
-        app = app.merge(r);
-    }
-    if let Some(r) = wecom_router {
-        app = app.merge(r);
-    }
-    if let Some(r) = dingtalk_router {
-        app = app.merge(r);
-    }
+    // Webhook channels are always mounted; an unconfigured channel's empty
+    // slot answers 404 (crate::webhook_slots).
+    app = app.merge(crate::webhook_slots::router(webhook_slots));
 
     // Merge plugin extension routes (if any)
     if let Some(extra) = extension.extra_routes() {
@@ -14859,11 +14835,43 @@ async fn handle_voice_config_set(
     }
 
     let config_path = state.home_dir.join("config.toml");
-    let mut table: toml::Table = tokio::fs::read_to_string(&config_path)
-        .await
-        .ok()
-        .and_then(|c| c.parse().ok())
-        .unwrap_or_default();
+    // v1.68: never rewrite an unparsable config.toml (it would be replaced
+    // by just the [voice] keys).
+    let mut table: toml::Table = match tokio::fs::read_to_string(&config_path).await {
+        Ok(c) => match c.parse() {
+            Ok(t) => t,
+            Err(_) => {
+                return (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "config.toml is not valid TOML — refusing to overwrite it" })),
+                )
+                    .into_response();
+            }
+        },
+        Err(_) => toml::Table::new(),
+    };
+    let stt_command_before = table
+        .get("voice")
+        .and_then(|v| v.get("stt_command"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // v1.68: the stored STT key only follows the endpoint it was entered for.
+    {
+        let stored = table.get("voice").and_then(|v| v.as_table());
+        let new_url = body.stt_base_url.trim();
+        let url_changed = !new_url.is_empty()
+            && stored.and_then(|v| v.get("stt_base_url")).and_then(|v| v.as_str()) != Some(new_url);
+        let has_key = stored.is_some_and(|v| v.contains_key("stt_api_key_enc") || v.contains_key("stt_api_key"));
+        let key_kept = matches!(body.stt_api_key.as_deref(), None | Some(""));
+        if url_changed && has_key && key_kept {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "stt_base_url changed — re-enter stt_api_key for the new endpoint (or clear it)" })),
+            )
+                .into_response();
+        }
+    }
 
     let voice = table
         .entry("voice".to_string())
@@ -14946,6 +14954,25 @@ async fn handle_voice_config_set(
             Json(serde_json::json!({ "error": format!("commit config.toml: {e}") })),
         )
             .into_response();
+    }
+
+    // v1.68: `stt_command` names a program the gateway runs — audit changes.
+    let stt_command_after = body.stt_command.trim();
+    if stt_command_after != stt_command_before {
+        crate::security_autopilot::audit_and_emit(
+            &state.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "config_protected_key_changed",
+                "admin",
+                duduclaw_security::audit::Severity::Warning,
+                serde_json::json!({
+                    "key": "voice.stt_command",
+                    "before": stt_command_before,
+                    "after": stt_command_after,
+                    "source": "/api/voice/config",
+                }),
+            ),
+        );
     }
 
     Json(serde_json::json!({ "success": true })).into_response()

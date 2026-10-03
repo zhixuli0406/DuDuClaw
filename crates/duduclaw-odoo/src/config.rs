@@ -75,7 +75,43 @@ impl Default for OdooConfig {
     }
 }
 
+/// The `features_*` module a model belongs to, by Odoo's model-name prefix.
+/// `None` ⇒ the model is outside the six switchable modules (e.g.
+/// `res.partner`) and no module switch applies.
+pub fn feature_module_for_model(model: &str) -> Option<&'static str> {
+    let model = model.trim();
+    let module = model.split('.').next().unwrap_or("");
+    match module {
+        "crm" => Some("crm"),
+        "sale" => Some("sale"),
+        "stock" | "product" => Some("inventory"),
+        "account" => Some("accounting"),
+        "project" => Some("project"),
+        "hr" => Some("hr"),
+        _ => None,
+    }
+}
+
 impl OdooConfig {
+    /// Whether the dashboard's 功能模組 switches allow a call on `model`.
+    /// Models outside the six modules are always allowed here (the security
+    /// block list and per-agent `allowed_models` still apply).
+    pub fn feature_allows_model(&self, model: &str) -> Result<(), &'static str> {
+        let Some(module) = feature_module_for_model(model) else {
+            return Ok(());
+        };
+        let on = match module {
+            "crm" => self.features_crm,
+            "sale" => self.features_sale,
+            "inventory" => self.features_inventory,
+            "accounting" => self.features_accounting,
+            "project" => self.features_project,
+            "hr" => self.features_hr,
+            _ => true,
+        };
+        if on { Ok(()) } else { Err(module) }
+    }
+
     /// Check if Odoo integration is configured (URL and DB are set).
     pub fn is_configured(&self) -> bool {
         !self.url.is_empty() && !self.db.is_empty()
@@ -144,6 +180,23 @@ api_key_enc = "encrypted_key_here"
         let config = OdooConfig::default();
         assert!(!config.poll_enabled);
         assert!(!config.webhook_enabled);
+    }
+
+    #[test]
+    fn feature_switches_gate_models_by_prefix() {
+        let mut c = OdooConfig::default();
+        assert_eq!(c.feature_allows_model("crm.lead"), Ok(()));
+        assert_eq!(c.feature_allows_model("project.task"), Err("project"));
+        assert_eq!(c.feature_allows_model("res.partner"), Ok(()));
+        c.features_crm = false;
+        assert_eq!(c.feature_allows_model("crm.lead"), Err("crm"));
+        c.features_inventory = false;
+        assert_eq!(c.feature_allows_model("stock.quant"), Err("inventory"));
+        assert_eq!(c.feature_allows_model("product.product"), Err("inventory"));
+        // Exact module token, not a substring: "crmx.foo" is not CRM.
+        assert_eq!(feature_module_for_model("crmx.foo"), None);
+        c.features_project = true;
+        assert_eq!(c.feature_allows_model("project.task"), Ok(()));
     }
 
     #[test]

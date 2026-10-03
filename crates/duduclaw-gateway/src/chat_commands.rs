@@ -389,6 +389,28 @@ pub fn parse_command(
     }
 }
 
+/// Run a chat command for a channel sender, computing admin status from that
+/// channel's `admin_users` setting (exact id match on the sender id or the
+/// session id, fail-closed). Webhook channels (whatsapp / feishu / teams /
+/// wecom / googlechat / dingtalk) call this instead of passing a literal
+/// `is_admin`; before v1.68.0 they hardcoded `true`, so any sender could run
+/// `!STOP ALL` / `!RESUME` there.
+pub async fn handle_command_for_sender(
+    cmd: &ChatCommand,
+    ctx: &ReplyContext,
+    channel: &str,
+    session_id: &str,
+    agent_id: &str,
+    sender_id: &str,
+) -> String {
+    let is_admin = if sender_id.is_empty() {
+        crate::channel_reply::is_channel_admin(ctx, channel, &[session_id]).await
+    } else {
+        crate::channel_reply::is_channel_admin(ctx, channel, &[sender_id, session_id]).await
+    };
+    handle_command(cmd, ctx, session_id, agent_id, is_admin, sender_id).await
+}
+
 /// Execute a chat command and return the response text.
 ///
 /// `is_admin` indicates whether the user has admin/owner privileges (the
@@ -2849,5 +2871,97 @@ mod goal_contract_tests {
             task.acceptance_criteria_baseline.as_deref(),
             Some("整理客戶資料成報表")
         );
+    }
+
+    // ── v1.68.0: webhook channels honour `admin_users` ─────────────────
+
+    fn admin_test_ctx(home: &std::path::Path) -> ReplyContext {
+        let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
+            duduclaw_agent::AgentRegistry::new(home.join("agents")),
+        ));
+        let sessions = std::sync::Arc::new(
+            crate::session::SessionManager::new(&home.join("sessions.db")).unwrap(),
+        );
+        let status: crate::channel_reply::ChannelStatusMap =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        ReplyContext::new(registry, home.to_path_buf(), sessions, status, tx)
+    }
+
+    const ADMIN_REFUSAL_PREFIX: &str = "⚠️ 此指令僅限管理員使用";
+
+    /// The six channels that used to hardcode `is_admin = true`. A sender
+    /// that is not in that channel's `admin_users` list cannot run
+    /// `!STOP ALL`; the listed admin can.
+    #[tokio::test]
+    async fn webhook_channels_refuse_stop_all_from_non_admin() {
+        for channel in ["whatsapp", "feishu", "teams", "wecom", "googlechat", "dingtalk"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ctx = admin_test_ctx(tmp.path());
+            ctx.channel_settings
+                .set(
+                    channel,
+                    "global",
+                    crate::channel_settings::keys::ADMIN_USERS,
+                    r#"["boss-1"]"#,
+                )
+                .await
+                .unwrap();
+            let cmd = parse_command("!STOP ALL", None).unwrap();
+            let session = format!("{channel}:intruder-1");
+            let reply =
+                handle_command_for_sender(&cmd, &ctx, channel, &session, "main", "intruder-1")
+                    .await;
+            assert!(
+                reply.starts_with(ADMIN_REFUSAL_PREFIX),
+                "{channel}: non-admin must be refused, got {reply}"
+            );
+            // A near-miss id never matches (exact equality only).
+            let reply =
+                handle_command_for_sender(&cmd, &ctx, channel, &session, "main", "boss-10").await;
+            assert!(reply.starts_with(ADMIN_REFUSAL_PREFIX), "{channel}: {reply}");
+            let reply =
+                handle_command_for_sender(&cmd, &ctx, channel, &session, "main", "boss-1").await;
+            assert!(
+                !reply.starts_with(ADMIN_REFUSAL_PREFIX),
+                "{channel}: listed admin must pass the gate, got {reply}"
+            );
+        }
+    }
+
+    /// No `admin_users` configured ⇒ nobody is admin (fail closed).
+    #[tokio::test]
+    async fn webhook_channel_without_admin_list_refuses_everyone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = admin_test_ctx(tmp.path());
+        let cmd = parse_command("!RESUME", None).unwrap();
+        let reply =
+            handle_command_for_sender(&cmd, &ctx, "whatsapp", "whatsapp:u", "main", "u").await;
+        assert!(reply.starts_with(ADMIN_REFUSAL_PREFIX), "{reply}");
+    }
+
+    /// Source guard: none of the six webhook channel handlers may pass a
+    /// literal admin flag into `handle_command` again.
+    #[test]
+    fn webhook_channels_never_hardcode_admin() {
+        let sources = [
+            ("whatsapp", include_str!("whatsapp.rs")),
+            ("feishu", include_str!("feishu.rs")),
+            ("teams", include_str!("msteams.rs")),
+            ("wecom", include_str!("wecom.rs")),
+            ("googlechat", include_str!("googlechat.rs")),
+            ("dingtalk", include_str!("dingtalk.rs")),
+        ];
+        for (channel, src) in sources {
+            assert!(
+                !src.contains("chat_commands::handle_command("),
+                "{channel} calls handle_command directly; use handle_command_for_sender"
+            );
+            assert!(
+                src.contains(&format!("\"{channel}\",")),
+                "{channel} must pass its own channel key to handle_command_for_sender"
+            );
+            assert!(src.contains("handle_command_for_sender("), "{channel}");
+        }
     }
 }

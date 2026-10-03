@@ -11,9 +11,31 @@ impl MethodHandler {
     /// Only allows safe, non-sensitive fields: `log_level`, `rotation_strategy`.
     /// Uses atomic write (temp + rename) and never touches token/key fields.
     pub(crate) async fn handle_system_update_config(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        // v1.68: the contract names parameters after their TOML path and may
+        // send them nested; map those onto the flat names this handler reads.
+        let params = super::system_update_config_v168::normalize_legacy_aliases(&params);
         let config_path = self.home_dir.join("config.toml");
-        let mut table = self.read_config_table(&config_path).await;
+        // Read the text (not just the table) so the commit below can refuse
+        // to overwrite a file another writer changed in the meantime. A
+        // present-but-unparsable file is refused outright: the previous
+        // `read_config_table` fallback turned it into an empty table and the
+        // save then replaced the whole config with the few keys it carried.
+        let original_text = match super::config_commit::read_text_or_empty(&config_path) {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let original_hash = super::config_commit::content_hash(&original_text);
+        let mut table: toml::Table = match original_text.parse::<toml::Table>() {
+            Ok(t) => t,
+            Err(e) => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("config.toml is not valid TOML, refusing to rewrite it (fix it in the raw editor first): {e}"),
+                );
+            }
+        };
         let mut changes: Vec<String> = Vec::new();
+        let mut restart_required: Vec<String> = Vec::new();
         // Cleaned remote-access allowlist to hot-apply AFTER a successful write
         // (Some(..) iff the payload carried `allowed_origins`).
         let mut applied_origins: Option<Vec<String>> = None;
@@ -118,15 +140,24 @@ impl MethodHandler {
                 if let Some(v) = params.get("auth_token").and_then(|v| v.as_str()) {
                     let v = v.trim();
                     // auth_token is the dashboard admin token — encrypt at rest.
-                    gateway.remove("auth_token");
-                    if v.is_empty() {
+                    // A placeholder (`«set»`, `***set***`, `****…`) keeps the
+                    // stored token; the plaintext key is only dropped once the
+                    // encrypted copy is in the same commit.
+                    if super::config_commit::is_secret_placeholder(v) {
+                        // untouched — leave existing value
+                    } else if v.is_empty() {
+                        gateway.remove("auth_token");
                         gateway.remove("auth_token_enc");
                         changes.push("gateway.auth_token cleared (restart required)".into());
-                    } else if v == SECRET_MASK_SET {
-                        // untouched — leave existing value
+                    } else if v.len() < 16 {
+                        return WsFrame::error_response(
+                            "",
+                            "gateway.auth_token must be at least 16 characters",
+                        );
                     } else if let Some(enc) = crate::config_crypto::encrypt_value(v, &self.home_dir)
                     {
                         gateway.insert("auth_token_enc".into(), toml::Value::String(enc));
+                        gateway.remove("auth_token");
                         changes.push("gateway.auth_token = [ENCRYPTED] (restart required)".into());
                     } else {
                         return WsFrame::error_response("", "Failed to encrypt gateway.auth_token");
@@ -425,30 +456,93 @@ impl MethodHandler {
                     }
                 }
             }
-            for (param_key, toml_key) in
-                &[("vault_addr", "vault_addr"), ("vault_mount", "vault_mount")]
-            {
-                if let Some(v) = sm.get(*param_key).and_then(|v| v.as_str()) {
-                    section.insert((*toml_key).into(), toml::Value::String(v.trim().into()));
-                    changes.push(format!("secret_manager.{toml_key} = \"{}\"", v.trim()));
+            // v1.68: every key the reader (`SecretManagerConfig`) knows is
+            // accepted; anything else is refused by name instead of being
+            // silently dropped while the rest of the payload saves.
+            const PLAIN_KEYS: &[&str] = &[
+                "vault_addr",
+                "vault_mount",
+                "onepassword_host",
+                "onepassword_vault",
+                "infisical_addr",
+                "infisical_project_id",
+                "infisical_environment",
+            ];
+            const SECRET_KEYS: &[&str] = &["vault_token", "onepassword_token", "infisical_token"];
+            // A stored token only follows the address it was entered for:
+            // changing the address while keeping the token (absent or a
+            // placeholder) is refused, so the token is never sent to a host
+            // chosen in this same edit.
+            for (addr, token) in [
+                ("vault_addr", "vault_token"),
+                ("onepassword_host", "onepassword_token"),
+                ("infisical_addr", "infisical_token"),
+            ] {
+                let new_addr = sm.get(addr).and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+                if new_addr.is_empty() || section.get(addr).and_then(|v| v.as_str()) == Some(new_addr) {
+                    continue;
+                }
+                let stored_token = section.contains_key(&format!("{token}_enc")) || section.contains_key(token);
+                let token_kept = sm
+                    .get(token)
+                    .and_then(|v| v.as_str())
+                    .is_none_or(|t| super::config_commit::is_secret_placeholder(t.trim()));
+                if stored_token && token_kept {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("secret_manager.{addr} changed — re-enter secret_manager.{token} for the new address"),
+                    );
                 }
             }
-            // vault_token → encrypt to vault_token_enc (G.7 / XC.5).
-            if let Some(v) = sm.get("vault_token").and_then(|v| v.as_str()) {
-                let v = v.trim();
-                section.remove("vault_token");
+            if let Some(unknown) = sm
+                .keys()
+                .find(|k| k.as_str() != "backend" && !PLAIN_KEYS.contains(&k.as_str()) && !SECRET_KEYS.contains(&k.as_str()))
+            {
+                return WsFrame::error_response("", &format!("Unknown secret_manager key `{unknown}`"));
+            }
+            for key in PLAIN_KEYS {
+                match sm.get(*key) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(v)) => {
+                        let v = v.trim();
+                        if v.chars().any(char::is_control) || v.len() > 2048 {
+                            return WsFrame::error_response("", &format!("secret_manager.{key} is not valid"));
+                        }
+                        if v.is_empty() {
+                            section.remove(*key);
+                            changes.push(format!("secret_manager.{key} cleared"));
+                        } else {
+                            section.insert((*key).into(), toml::Value::String(v.into()));
+                            changes.push(format!("secret_manager.{key} = \"{v}\""));
+                        }
+                    }
+                    Some(_) => {
+                        return WsFrame::error_response("", &format!("secret_manager.{key} must be a string"));
+                    }
+                }
+            }
+            // Tokens → `<key>_enc` (G.7 / XC.5); never stored or echoed in
+            // plaintext. A masked placeholder leaves the stored value alone.
+            for key in SECRET_KEYS {
+                let Some(raw) = sm.get(*key).filter(|v| !v.is_null()) else { continue };
+                let Some(v) = raw.as_str().map(str::trim) else {
+                    return WsFrame::error_response("", &format!("secret_manager.{key} must be a string"));
+                };
+                let enc_key = format!("{key}_enc");
+                if super::config_commit::is_secret_placeholder(v) {
+                    continue;
+                }
+                section.remove(*key);
                 if v.is_empty() {
-                    section.remove("vault_token_enc");
-                    changes.push("secret_manager.vault_token cleared".into());
-                } else if v == SECRET_MASK_SET {
-                    // untouched
+                    section.remove(&enc_key);
+                    changes.push(format!("secret_manager.{key} cleared"));
                 } else if let Some(enc) = crate::config_crypto::encrypt_value(v, &self.home_dir) {
-                    section.insert("vault_token_enc".into(), toml::Value::String(enc));
-                    changes.push("secret_manager.vault_token = [ENCRYPTED]".into());
+                    section.insert(enc_key, toml::Value::String(enc));
+                    changes.push(format!("secret_manager.{key} = [ENCRYPTED]"));
                 } else {
                     return WsFrame::error_response(
                         "",
-                        "Failed to encrypt secret_manager.vault_token",
+                        &format!("Failed to encrypt secret_manager.{key}"),
                     );
                 }
             }
@@ -575,8 +669,10 @@ impl MethodHandler {
                 reload_dispatch = true;
             }
             if let Some(v) = dp.get("policy").and_then(|v| v.as_str()) {
+                // `role_team` is accepted by the reader
+                // (`dispatch_policy.rs`) and was refused here until v1.68.
                 match v {
-                    "fixed_hierarchy" | "round_robin" | "llm_select" => {
+                    "fixed_hierarchy" | "round_robin" | "llm_select" | "role_team" => {
                         let section = table
                             .entry("dispatch")
                             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
@@ -589,7 +685,7 @@ impl MethodHandler {
                     _ => {
                         return WsFrame::error_response(
                             "",
-                            "Invalid dispatch.policy. Valid: fixed_hierarchy, round_robin, llm_select",
+                            "Invalid dispatch.policy. Valid: fixed_hierarchy, round_robin, llm_select, role_team",
                         );
                     }
                 }
@@ -625,13 +721,13 @@ impl MethodHandler {
                         // deployment already on one keeps working, and the
                         // dashboard keeps showing it), but every *write* of a
                         // deprecated value leaves a warning and an audit row
-                        // so the migration is traceable. Removal: v1.68.0.
+                        // so the migration is traceable. Removal: v1.69.0.
                         if mode.is_deprecated() {
                             warn!(
                                 value = mode.as_str(),
                                 replacement =
                                     mode.deprecation_replacement().unwrap_or("mav"),
-                                remove_in = "v1.68.0",
+                                remove_in = "v1.69.0",
                                 "dispatch.judge set to a deprecated mode via system.update_config"
                             );
                             crate::security_autopilot::audit_and_emit(
@@ -645,7 +741,7 @@ impl MethodHandler {
                                         "replacement": mode
                                             .deprecation_replacement()
                                             .unwrap_or("mav"),
-                                        "remove_in": "v1.68.0",
+                                        "remove_in": "v1.69.0",
                                         "source": "system.update_config",
                                     }),
                                 ),
@@ -742,12 +838,37 @@ impl MethodHandler {
             }
         }
 
+        // ── v1.68 contract keys (takeover / mail / webchat / tick / files /
+        // night / judge model / acp / telemetry / container.sandbox /
+        // computer_use / memory guard / team / github / redaction purge) ──
+        let v168 = match super::system_update_config_v168::apply_v168_keys(&mut table, &params) {
+            Ok(o) => o,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        changes.extend(v168.changes.iter().cloned());
+        restart_required.extend(v168.restart_required.iter().cloned());
+        if v168.applied_immediate {
+            applied_immediate = true;
+        }
+        for (flat, key) in super::system_update_config_v168::LEGACY_RESTART_KEYS {
+            if params.get(*flat).is_some() && changes.iter().any(|c| c.starts_with(*key)) {
+                restart_required.push((*key).to_string());
+            }
+        }
+        if super::config_commit::param_at(&params, "goal_loop.resume_on_restart").is_some() {
+            restart_required.push("goal_loop.resume_on_restart".into());
+        }
+        let rotation_cache_dirty = params.get("rotation_strategy").is_some()
+            || params.get("cooldown_after_rate_limit_seconds").is_some();
+
         // ── voice (persisted to inference.toml [voice], where VoiceConfig reads it) ──
         // Track how many config.toml changes were accumulated BEFORE the voice
         // block so the early-return below stays correct for mixed payloads.
+        // v1.68: `asr_provider` / `asr_language` / `voice_reply_enabled` had no
+        // reader and are no longer accepted (ignored if an old client sends
+        // them); speech-to-text lives in `config.toml [voice] stt_*`.
         let config_toml_changes = changes.len();
         if let Some(voice) = params.get("voice").and_then(|v| v.as_object()) {
-            const VALID_ASR: &[&str] = &["auto", "whisper-api", "whisper-local"];
             const VALID_TTS: &[&str] = &["auto", "edge-tts", "minimax", "openai-tts", "piper"];
 
             let inference_path = self.home_dir.join("inference.toml");
@@ -758,19 +879,6 @@ impl MethodHandler {
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                 .as_table_mut();
             if let Some(voice_table) = voice_table {
-                if let Some(v) = voice.get("asr_provider").and_then(|v| v.as_str()) {
-                    if !VALID_ASR.contains(&v) {
-                        return WsFrame::error_response(
-                            "",
-                            &format!(
-                                "Invalid asr_provider '{v}'. Valid: {}",
-                                VALID_ASR.join(", ")
-                            ),
-                        );
-                    }
-                    voice_table.insert("asr_provider".into(), toml::Value::String(v.into()));
-                    voice_dirty = true;
-                }
                 if let Some(v) = voice.get("tts_provider").and_then(|v| v.as_str()) {
                     if !VALID_TTS.contains(&v) {
                         return WsFrame::error_response(
@@ -784,16 +892,8 @@ impl MethodHandler {
                     voice_table.insert("tts_provider".into(), toml::Value::String(v.into()));
                     voice_dirty = true;
                 }
-                if let Some(v) = voice.get("asr_language").and_then(|v| v.as_str()) {
-                    voice_table.insert("asr_language".into(), toml::Value::String(v.into()));
-                    voice_dirty = true;
-                }
                 if let Some(v) = voice.get("tts_voice").and_then(|v| v.as_str()) {
                     voice_table.insert("tts_voice".into(), toml::Value::String(v.into()));
-                    voice_dirty = true;
-                }
-                if let Some(v) = voice.get("voice_reply_enabled").and_then(|v| v.as_bool()) {
-                    voice_table.insert("voice_reply_enabled".into(), toml::Value::Boolean(v));
                     voice_dirty = true;
                 }
             }
@@ -830,25 +930,52 @@ impl MethodHandler {
                 );
                 // C1 producer 甲 companion — see `security_autopilot.rs`.
                 crate::security_autopilot::emit_config_changed();
-                return WsFrame::ok_response("", json!({ "success": true, "changes": changes }));
+                return WsFrame::ok_response(
+                    "",
+                    json!({ "success": true, "changes": changes, "restart_required": [] }),
+                );
             }
         }
 
         if changes.is_empty() {
             return WsFrame::error_response(
                 "",
-                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple/resume_on_restart), dispatch(enabled/policy), memory(graph_embed_seed), topology_evolution(enabled), belief(flat_band_pct/tick_subject_map)",
+                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple/resume_on_restart), dispatch(enabled/policy), memory(graph_embed_seed), topology_evolution(enabled), belief(flat_band_pct/tick_subject_map), takeover, mail, webchat, tick, files.allowed_roots, night.llm_enabled, dispatch(judge_provider/judge_model), acp.trusted, telemetry.otlp_endpoint, container.sandbox, computer_use.image, memory.supersession_trust_guard, team, integrations.github, redaction.purge_after_expire_days",
             );
         }
 
-        // Atomic write: temp + rename
-        let tmp_path = config_path.with_extension("toml.tmp");
-        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
-            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
+        // Atomic write (temp + rename) under the cross-process config lock,
+        // refused when another writer changed the file since it was read.
+        if let Err(e) =
+            super::config_commit::commit_table_locked(&config_path, original_hash, &table).await
+        {
+            return WsFrame::error_response("", &e);
         }
-        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+
+        // v1.68: security-relevant keys get their own audit row with the
+        // before/after value (on top of the generic `config_changed` below).
+        for p in &v168.protected {
+            crate::security_autopilot::audit_and_emit(
+                &self.home_dir,
+                &duduclaw_security::audit::AuditEvent::new(
+                    "config_protected_key_changed",
+                    &ctx.user_id,
+                    duduclaw_security::audit::Severity::Warning,
+                    json!({
+                        "key": p.key,
+                        "before": p.before,
+                        "after": p.after,
+                        "user_id": ctx.user_id,
+                        "source": "system.update_config",
+                    }),
+                ),
+            );
+        }
+        // `[rotation] strategy` / `cooldown_after_rate_limit_seconds` are read
+        // when the account rotator is built; drop the cached one so the next
+        // call rebuilds it (otherwise up to a 30-minute lag).
+        if rotation_cache_dirty {
+            crate::claude_runner::invalidate_rotator_cache().await;
         }
 
         // Hot-apply the remote-access allowlist so the dashboard save takes
@@ -884,6 +1011,41 @@ impl MethodHandler {
             self.respawn_topology_driver().await;
             hot_reloaded.push("topology_evolution");
         }
+        // WP-S: `[general] log_level` applies to the running logger (reload
+        // handle in `crate::log`) unless RUST_LOG pins the level.
+        if let Some(level) = params.get("log_level").and_then(|v| v.as_str()) {
+            if crate::log::apply_log_level(level) == Ok(crate::log::LogLevelApply::Applied) {
+                hot_reloaded.push("log_level");
+            } else {
+                // RUST_LOG pins the level, or no reload handle is installed.
+                restart_required.push("general.log_level".into());
+            }
+        }
+        if rotation_cache_dirty {
+            hot_reloaded.push("rotation");
+        }
+        // `[tick]`: respawn the source tasks with the new config when the
+        // tick runtime is installed; otherwise the change waits for a restart.
+        if v168.reload_ticks {
+            if self.respawn_tick_sources().await.is_some() {
+                hot_reloaded.push("tick");
+            } else {
+                restart_required.push("tick".into());
+            }
+        }
+        // `[redaction] purge_after_expire_days` is taken by the vault GC when
+        // the pipeline is (re)built, so rebuild it the way `redaction.update`
+        // does.
+        if v168.reload_redaction {
+            let (applied, _warning) = self.apply_redaction_hot_reload(&table).await;
+            if applied {
+                hot_reloaded.push("redaction");
+            } else {
+                restart_required.push("redaction.purge_after_expire_days".into());
+            }
+        }
+        restart_required.sort();
+        restart_required.dedup();
 
         info!(?changes, ?hot_reloaded, "system.update_config completed");
         // B5 (OS security line P0): every accepted `config.toml` write is now
@@ -910,6 +1072,9 @@ impl MethodHandler {
                 "applied": origins_applied || applied_immediate,
                 // Drivers that were abort+respawned with the new config.
                 "hot_reloaded": hot_reloaded,
+                // v1.68: TOML keys (or a whole section, e.g. "tick") whose
+                // new value only takes effect after a gateway restart.
+                "restart_required": restart_required,
             }),
         )
     }

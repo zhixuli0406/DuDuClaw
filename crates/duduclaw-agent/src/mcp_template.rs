@@ -49,10 +49,19 @@ pub fn write_mcp_config(agent_dir: &Path, config: &McpConfig) -> Result<bool, St
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
 
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+    // Owner-only from the first byte (0600 at create on Unix), then the
+    // platform helper for Windows ACLs.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(&path) {
         Ok(mut f) => {
-            f.write_all(json.as_bytes()).map_err(|e| format!("Failed to write MCP config: {e}"))?;
             duduclaw_core::platform::set_owner_only(&path).ok();
+            f.write_all(json.as_bytes()).map_err(|e| format!("Failed to write MCP config: {e}"))?;
             info!(path = %path.display(), "MCP config written");
             Ok(true)
         }
@@ -96,21 +105,39 @@ pub fn ensure_playwright_in_config(agent_dir: &Path, headless: bool) -> Result<(
 
 /// Generate a Browserbase MCP server configuration.
 ///
-/// The `api_key` and `project_id` parameters are ignored; the generated config
-/// always uses environment variable references (`${BROWSERBASE_API_KEY}`,
-/// `${BROWSERBASE_PROJECT_ID}` and `${GEMINI_API_KEY}` for the server's
-/// default model) so that actual secrets are never written to `.mcp.json` on
-/// disk. Callers must ensure the corresponding environment variables are set
-/// at runtime.
-pub fn browserbase_mcp_config(_api_key: &str, _project_id: &str) -> McpConfig {
-    let mut servers = std::collections::HashMap::new();
-    servers.insert("browserbase".to_string(), McpServerDef {
+/// The three values are written into `env` as **literal strings**. A
+/// `${NAME}` reference cannot work here: the Claude CLI expands such a
+/// reference from its own process environment, and the gateway starts every
+/// employee CLI with the allowlisted environment of
+/// `duduclaw_core::spawn_env`, which drops every `*_API_KEY`-shaped name — so
+/// the reference resolved to an empty string and the server started without
+/// credentials. Literal values are how `claude mcp add -e NAME=value` stores
+/// them too; the file is written owner-only (0600) and the values are never
+/// logged. Fails when any value is empty or contains `${`.
+pub fn browserbase_mcp_config(
+    api_key: &str,
+    project_id: &str,
+    gemini_api_key: &str,
+) -> Result<McpConfig, String> {
+    let template = McpServerDef {
         command: "npx".to_string(),
         args: vec!["-y".to_string(), BROWSERBASE_MCP_PACKAGE.to_string()],
-        env: env_refs(&BROWSERBASE_REQUIRED_ENV),
-    });
+        env: env_placeholders(&BROWSERBASE_REQUIRED_ENV),
+    };
+    let supplied: std::collections::HashMap<String, String> = [
+        (BROWSERBASE_REQUIRED_ENV[0], api_key),
+        (BROWSERBASE_REQUIRED_ENV[1], project_id),
+        (BROWSERBASE_REQUIRED_ENV[2], gemini_api_key),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let required: Vec<String> = BROWSERBASE_REQUIRED_ENV.iter().map(|s| s.to_string()).collect();
+    let def = apply_required_env(&template, &required, &supplied)?;
 
-    McpConfig { mcp_servers: servers }
+    let mut servers = std::collections::HashMap::new();
+    servers.insert("browserbase".to_string(), def);
+    Ok(McpConfig { mcp_servers: servers })
 }
 
 /// Merge Browserbase server into an existing `.mcp.json`, preserving other servers.
@@ -118,32 +145,15 @@ pub fn ensure_browserbase_in_config(
     agent_dir: &Path,
     api_key: &str,
     project_id: &str,
+    gemini_api_key: &str,
 ) -> Result<(), String> {
-    let path = agent_dir.join(".mcp.json");
-
-    let mut config = if path.exists() {
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read MCP config: {e}"))?;
-        serde_json::from_str::<McpConfig>(&content)
-            .map_err(|e| format!("Failed to parse MCP config: {e}"))?
-    } else {
-        McpConfig { mcp_servers: std::collections::HashMap::new() }
-    };
-
-    if config.mcp_servers.contains_key("browserbase") {
+    if read_mcp_config(agent_dir)?.mcp_servers.contains_key("browserbase") {
         return Ok(());
     }
-
-    let bb = browserbase_mcp_config(api_key, project_id);
-    config.mcp_servers.extend(bb.mcp_servers);
-
-    let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("Failed to write MCP config: {e}"))?;
-    duduclaw_core::platform::set_owner_only(&path).ok();
-
-    info!(path = %path.display(), "Browserbase MCP server added to config");
+    let bb = browserbase_mcp_config(api_key, project_id, gemini_api_key)?;
+    let def = bb.mcp_servers.get("browserbase").cloned().ok_or("browserbase entry missing")?;
+    add_server_to_config(agent_dir, "browserbase", &def)?;
+    info!(dir = %agent_dir.display(), "Browserbase MCP server added to config");
     Ok(())
 }
 
@@ -513,9 +523,148 @@ pub const BROWSERBASE_MCP_PACKAGE: &str = "@browserbasehq/mcp";
 pub const BROWSERBASE_REQUIRED_ENV: [&str; 3] =
     ["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "GEMINI_API_KEY"];
 
-/// `${NAME}` references for each env name, so secrets never land in `.mcp.json`.
-fn env_refs(names: &[&str]) -> std::collections::HashMap<String, String> {
-    names.iter().map(|n| (n.to_string(), format!("${{{n}}}"))).collect()
+/// Empty placeholder value for each required env name. The catalogue only
+/// declares which names a server needs; the operator supplies the values at
+/// install time (see [`apply_required_env`]).
+fn env_placeholders(names: &[&str]) -> std::collections::HashMap<String, String> {
+    names.iter().map(|n| (n.to_string(), String::new())).collect()
+}
+
+/// Longest env value accepted at install time.
+pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+
+/// Why a supplied env value cannot be used. Never carries the value itself.
+fn env_value_problem(value: &str) -> Option<&'static str> {
+    if value.trim().is_empty() {
+        return Some("missing");
+    }
+    // The Claude CLI expands `${NAME}` (and `${NAME:-default}`) inside
+    // `.mcp.json` env values from its own environment, which the gateway
+    // strips of secret-shaped names. A reference therefore resolves to
+    // nothing; refuse it instead of writing a server that starts unkeyed.
+    if value.contains("${") {
+        return Some("reference");
+    }
+    if value.len() > MAX_ENV_VALUE_BYTES {
+        return Some("too_long");
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Some("control_chars");
+    }
+    None
+}
+
+/// Fill a server definition's required env names with literal values.
+///
+/// For each name in `required`, the value comes from `supplied` first and
+/// otherwise from `def.env` (so a full `server_def` from `mcp.update` is
+/// checked the same way as `marketplace.install`'s separate `env` map).
+/// Fails closed:
+/// - a required name whose value is absent, empty or a `${...}` reference →
+///   error naming every such variable (`Missing required environment values: …`);
+/// - a value that is too long or contains control characters → error naming it;
+/// - a `supplied` name that is not in `required` → error naming it (the
+///   install form cannot smuggle `NODE_OPTIONS` or similar into the server).
+///
+/// Error text names variables only, never values.
+pub fn apply_required_env(
+    def: &McpServerDef,
+    required: &[String],
+    supplied: &std::collections::HashMap<String, String>,
+) -> Result<McpServerDef, String> {
+    let mut unknown: Vec<&str> = supplied
+        .keys()
+        .filter(|k| !required.iter().any(|r| r == *k))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        return Err(format!(
+            "Unexpected environment variables for this server: {}",
+            unknown.join(", ")
+        ));
+    }
+
+    let mut out = def.clone();
+    let mut missing: Vec<&str> = Vec::new();
+    let mut invalid: Vec<&str> = Vec::new();
+    for name in required {
+        let value = supplied
+            .get(name)
+            .or_else(|| def.env.get(name))
+            .map(String::as_str)
+            .unwrap_or("");
+        match env_value_problem(value) {
+            None => {
+                out.env.insert(name.clone(), value.to_string());
+            }
+            Some("missing") | Some("reference") => missing.push(name),
+            Some(_) => invalid.push(name),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "Missing required environment values: {} (enter the values themselves; \
+             ${{NAME}} references are not passed to the employee's CLI)",
+            missing.join(", ")
+        ));
+    }
+    if !invalid.is_empty() {
+        return Err(format!(
+            "Invalid environment values (over {MAX_ENV_VALUE_BYTES} bytes or containing control characters): {}",
+            invalid.join(", ")
+        ));
+    }
+    Ok(out)
+}
+
+/// What the dashboard may learn about one env value: `set`, `not_set`, or
+/// `reference` (a `${NAME}` the CLI expands at spawn). Never the value.
+pub fn env_value_status(value: &str) -> &'static str {
+    if value.trim().is_empty() {
+        "not_set"
+    } else if value.contains("${") {
+        "reference"
+    } else {
+        "set"
+    }
+}
+
+/// Mask every env value of a server definition for an RPC answer.
+pub fn masked_env(
+    env: &std::collections::HashMap<String, String>,
+) -> std::collections::BTreeMap<String, &'static str> {
+    env.iter().map(|(k, v)| (k.clone(), env_value_status(v))).collect()
+}
+
+/// Write `bytes` to `path` atomically with owner-only permissions from the
+/// first byte: the temp file is restricted before anything is written, so a
+/// secret never sits world-readable between write and chmod.
+fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    let tmp_path = path.with_extension("json.tmp");
+    let _ = std::fs::remove_file(&tmp_path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&tmp_path)
+        .map_err(|e| format!("Failed to create temp MCP config: {e}"))?;
+    duduclaw_core::platform::set_owner_only(&tmp_path)
+        .map_err(|e| format!("Failed to restrict temp MCP config: {e}"))?;
+    f.write_all(bytes)
+        .and_then(|_| f.sync_all())
+        .map_err(|e| format!("Failed to write temp MCP config: {e}"))?;
+    drop(f);
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| format!("Failed to rename temp MCP config: {e}"))?;
+    duduclaw_core::platform::set_owner_only(path).ok();
+    Ok(())
 }
 
 /// Return the built-in MCP marketplace catalog.
@@ -555,7 +704,7 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             default_def: McpServerDef {
                 command: "npx".into(),
                 args: vec!["-y".into(), BROWSERBASE_MCP_PACKAGE.into()],
-                env: env_refs(&BROWSERBASE_REQUIRED_ENV),
+                env: env_placeholders(&BROWSERBASE_REQUIRED_ENV),
             },
             required_env: BROWSERBASE_REQUIRED_ENV.iter().map(|s| s.to_string()).collect(),
         },
@@ -621,12 +770,7 @@ pub fn add_server_to_config(agent_dir: &Path, name: &str, def: &McpServerDef) ->
     let json = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
 
-    let tmp_path = agent_dir.join(".mcp.json.tmp");
-    std::fs::write(&tmp_path, &json)
-        .map_err(|e| format!("Failed to write temp MCP config: {e}"))?;
-    std::fs::rename(&tmp_path, &path)
-        .map_err(|e| format!("Failed to rename temp MCP config: {e}"))?;
-    duduclaw_core::platform::set_owner_only(&path).ok();
+    write_owner_only_atomic(&path, json.as_bytes())?;
 
     info!(path = %path.display(), server = name, "MCP server added to config");
     Ok(())
@@ -645,12 +789,7 @@ pub fn remove_server_from_config(agent_dir: &Path, server_name: &str) -> Result<
     let json = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
 
-    let tmp_path = agent_dir.join(".mcp.json.tmp");
-    std::fs::write(&tmp_path, &json)
-        .map_err(|e| format!("Failed to write temp MCP config: {e}"))?;
-    std::fs::rename(&tmp_path, &path)
-        .map_err(|e| format!("Failed to rename temp MCP config: {e}"))?;
-    duduclaw_core::platform::set_owner_only(&path).ok();
+    write_owner_only_atomic(&path, json.as_bytes())?;
 
     info!(path = %path.display(), server = server_name, "MCP server removed from config");
     Ok(())
@@ -680,14 +819,119 @@ mod tests {
     }
 
     #[test]
-    fn browserbase_config_has_env() {
-        let config = browserbase_mcp_config("key123", "proj456");
+    fn browserbase_config_has_literal_env() {
+        let config = browserbase_mcp_config("key123", "proj456", "gem789").unwrap();
         let server = &config.mcp_servers["browserbase"];
-        // Values must be env var references, never the literal secret.
-        assert_eq!(server.env["BROWSERBASE_API_KEY"], "${BROWSERBASE_API_KEY}");
-        assert_eq!(server.env["BROWSERBASE_PROJECT_ID"], "${BROWSERBASE_PROJECT_ID}");
-        assert_eq!(server.env["GEMINI_API_KEY"], "${GEMINI_API_KEY}");
+        // Literal values: a `${NAME}` reference would resolve to nothing in
+        // the allowlisted environment the gateway spawns the CLI with.
+        assert_eq!(server.env["BROWSERBASE_API_KEY"], "key123");
+        assert_eq!(server.env["BROWSERBASE_PROJECT_ID"], "proj456");
+        assert_eq!(server.env["GEMINI_API_KEY"], "gem789");
         assert!(server.args.contains(&BROWSERBASE_MCP_PACKAGE.to_string()));
+    }
+
+    #[test]
+    fn browserbase_config_refuses_missing_or_reference_values() {
+        let err = browserbase_mcp_config("", "proj", "${GEMINI_API_KEY}").unwrap_err();
+        assert!(err.contains("BROWSERBASE_API_KEY"), "{err}");
+        assert!(err.contains("GEMINI_API_KEY"), "{err}");
+        assert!(!err.contains("BROWSERBASE_PROJECT_ID"), "{err}");
+    }
+
+    fn browserbase_item() -> McpCatalogItem {
+        marketplace_catalog().into_iter().find(|c| c.id == "browserbase").unwrap()
+    }
+
+    #[test]
+    fn apply_required_env_fills_supplied_values() {
+        let item = browserbase_item();
+        let supplied: std::collections::HashMap<String, String> = [
+            ("BROWSERBASE_API_KEY", "bb-key"),
+            ("BROWSERBASE_PROJECT_ID", "bb-proj"),
+            ("GEMINI_API_KEY", "gm-key"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let def = apply_required_env(&item.default_def, &item.required_env, &supplied).unwrap();
+        assert_eq!(def.env["BROWSERBASE_API_KEY"], "bb-key");
+        assert_eq!(def.env.len(), 3);
+    }
+
+    #[test]
+    fn apply_required_env_names_every_missing_variable_without_values() {
+        let item = browserbase_item();
+        let supplied: std::collections::HashMap<String, String> =
+            [("BROWSERBASE_API_KEY".to_string(), "secret-value-xyz".to_string())].into();
+        let err = apply_required_env(&item.default_def, &item.required_env, &supplied).unwrap_err();
+        assert!(err.contains("BROWSERBASE_PROJECT_ID") && err.contains("GEMINI_API_KEY"), "{err}");
+        assert!(!err.contains("secret-value-xyz"), "error must not echo values: {err}");
+    }
+
+    #[test]
+    fn apply_required_env_refuses_unknown_names_and_control_chars() {
+        let item = browserbase_item();
+        let mut supplied: std::collections::HashMap<String, String> = item
+            .required_env
+            .iter()
+            .map(|k| (k.clone(), "v".to_string()))
+            .collect();
+        supplied.insert("NODE_OPTIONS".into(), "--require /tmp/x".into());
+        let err = apply_required_env(&item.default_def, &item.required_env, &supplied).unwrap_err();
+        assert!(err.contains("NODE_OPTIONS"), "{err}");
+
+        supplied.remove("NODE_OPTIONS");
+        supplied.insert("GEMINI_API_KEY".into(), "a\nb".into());
+        let err = apply_required_env(&item.default_def, &item.required_env, &supplied).unwrap_err();
+        assert!(err.contains("GEMINI_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn apply_required_env_accepts_values_inside_def() {
+        // `mcp.update` carries the values in `server_def.env`.
+        let item = browserbase_item();
+        let mut def = item.default_def.clone();
+        for k in &item.required_env {
+            def.env.insert(k.clone(), format!("lit-{k}"));
+        }
+        let out = apply_required_env(&def, &item.required_env, &Default::default()).unwrap();
+        assert_eq!(out.env["GEMINI_API_KEY"], "lit-GEMINI_API_KEY");
+        // The old `${NAME}` default is refused.
+        let mut refs = item.default_def.clone();
+        for k in &item.required_env {
+            refs.env.insert(k.clone(), format!("${{{k}}}"));
+        }
+        assert!(apply_required_env(&refs, &item.required_env, &Default::default()).is_err());
+    }
+
+    #[test]
+    fn masked_env_never_returns_values() {
+        let env: std::collections::HashMap<String, String> = [
+            ("A".to_string(), "sk-live-123".to_string()),
+            ("B".to_string(), String::new()),
+            ("C".to_string(), "${HOME}".to_string()),
+        ]
+        .into();
+        let m = masked_env(&env);
+        assert_eq!(m["A"], "set");
+        assert_eq!(m["B"], "not_set");
+        assert_eq!(m["C"], "reference");
+        assert!(!serde_json::to_string(&m).unwrap().contains("sk-live-123"));
+    }
+
+    #[test]
+    fn installed_browserbase_entry_is_literal_and_owner_only() {
+        let dir = TempDir::new().unwrap();
+        ensure_browserbase_in_config(dir.path(), "k1", "p1", "g1").unwrap();
+        let cfg = read_mcp_config(dir.path()).unwrap();
+        assert_eq!(cfg.mcp_servers["browserbase"].env["BROWSERBASE_API_KEY"], "k1");
+        assert!(!dir.path().join(".mcp.json.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(".mcp.json")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     /// npm scopes/prefixes confirmed not to exist on the registry. A catalogue
@@ -740,15 +984,20 @@ mod tests {
             assert_def_sound(&item.id, &item.default_def);
             assert!(!item.author.trim().is_empty(), "{}: empty author", item.id);
 
-            // Declared env == the env the definition passes, and every env value
-            // is a reference to a declared name (never a literal secret).
+            // Declared env == the env the definition passes, and the catalogue
+            // carries no value at all: neither a literal secret nor a `${NAME}`
+            // reference (which the allowlisted spawn env cannot resolve).
             let declared: std::collections::BTreeSet<String> =
                 item.required_env.iter().cloned().collect();
             let passed: std::collections::BTreeSet<String> =
                 item.default_def.env.keys().cloned().collect();
             assert_eq!(declared, passed, "{}: required_env != env keys", item.id);
-            let referenced = referenced_env_names(&item.default_def);
-            assert_eq!(referenced, declared, "{}: env values must reference declared names", item.id);
+            assert!(referenced_env_names(&item.default_def).is_empty(), "{}: env reference", item.id);
+            assert!(
+                item.default_def.env.values().all(|v| v.is_empty()),
+                "{}: catalogue env must be empty placeholders",
+                item.id
+            );
             for name in &item.required_env {
                 assert!(!name.trim().is_empty(), "{}: empty env name", item.id);
             }
@@ -760,11 +1009,11 @@ mod tests {
         for (name, def) in playwright_mcp_config(true)
             .mcp_servers
             .into_iter()
-            .chain(browserbase_mcp_config("k", "p").mcp_servers)
+            .chain(browserbase_mcp_config("k", "p", "g").unwrap().mcp_servers)
         {
             assert_def_sound(&name, &def);
         }
-        let bb = browserbase_mcp_config("k", "p");
+        let bb = browserbase_mcp_config("k", "p", "g").unwrap();
         let env: std::collections::BTreeSet<&str> =
             bb.mcp_servers["browserbase"].env.keys().map(String::as_str).collect();
         assert_eq!(env, BROWSERBASE_REQUIRED_ENV.into_iter().collect());

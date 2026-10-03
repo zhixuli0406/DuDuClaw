@@ -96,7 +96,7 @@ impl MethodHandler {
                         "can_modify_own_soul": cfg.permissions.can_modify_own_soul,
                         "can_schedule_tasks": cfg.permissions.can_schedule_tasks,
                     },
-                    // Evolution + sticker need to be present here (not just in
+                    // Evolution needs to be present here (not just in
                     // agents.inspect) because the dashboard's edit dialog
                     // initialises from the list response and silently
                     // falls back to hardcoded defaults when these are absent —
@@ -106,20 +106,8 @@ impl MethodHandler {
                     "evolution": {
                         "gvu_enabled": cfg.evolution.gvu_enabled,
                         "cognitive_memory": cfg.evolution.cognitive_memory_enabled(),
-                        "skill_auto_activate": cfg.evolution.skill_auto_activate,
-                        "skill_security_scan": cfg.evolution.skill_security_scan,
+                        // v1.68: `skill_auto_activate` / `skill_security_scan` removed (no reader).
                         "max_silence_hours": cfg.evolution.max_silence_hours,
-                    },
-                    "sticker": {
-                        "enabled": cfg.sticker.enabled,
-                        "probability": cfg.sticker.probability,
-                        "intensity_threshold": cfg.sticker.intensity_threshold,
-                        "cooldown_messages": cfg.sticker.cooldown_messages,
-                        "expressiveness": match cfg.sticker.expressiveness {
-                            duduclaw_core::types::Expressiveness::Minimal => "minimal",
-                            duduclaw_core::types::Expressiveness::Moderate => "moderate",
-                            duduclaw_core::types::Expressiveness::Expressive => "expressive",
-                        },
                     },
                 })
             }).collect();

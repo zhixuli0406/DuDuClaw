@@ -115,7 +115,9 @@ const REDACTION_SOURCE_KEYS: ReadonlyArray<keyof RedactionSources> = [
   'tool_results',
   'user_input',
   'system_prompt',
-  'sub_agent',
+  // v1.68: `sub_agent` row removed — no path feeds one employee's reply into
+  // another's context, and a spawned employee's tool results are already
+  // covered by `tool_results`. The stored value still round-trips untouched.
   'cron_context',
 ];
 const REDACTION_MODES: ReadonlyArray<RedactionSourceMode> = ['on', 'off', 'selective', 'inherit'];
@@ -599,6 +601,7 @@ export function RedactionTab() {
                 />
               ))}
             </div>
+            <p className="mt-2 text-xs text-muted-foreground">{intl.formatMessage({ id: 'redaction.sources.subAgentNote' })}</p>
           </div>
 
           {/* Merged "外部系統與資料來源" card (canvas screen 9, §15) — replaces

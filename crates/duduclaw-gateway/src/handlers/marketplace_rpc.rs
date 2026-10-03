@@ -122,16 +122,38 @@ impl MethodHandler {
         map
     }
 
+    /// Built-in catalogue plus the optional user-contributed
+    /// `~/.duduclaw/marketplace.json` (unparseable file ⇒ built-in only).
+    pub(crate) async fn full_marketplace_catalog(
+        &self,
+    ) -> Vec<duduclaw_agent::mcp_template::McpCatalogItem> {
+        use duduclaw_agent::mcp_template::{McpCatalogItem, marketplace_catalog};
+
+        let mut catalog: Vec<McpCatalogItem> = marketplace_catalog();
+        let user_path = self.home_dir.join("marketplace.json");
+        if let Ok(content) = tokio::fs::read_to_string(&user_path).await {
+            #[derive(serde::Deserialize)]
+            struct UserCatalog {
+                #[serde(default)]
+                servers: Vec<McpCatalogItem>,
+            }
+            if let Ok(user) = serde_json::from_str::<UserCatalog>(&content) {
+                catalog.extend(user.servers);
+            }
+        }
+        catalog
+    }
+
     /// Install a marketplace catalog server into an agent's `.mcp.json`.
     ///
-    /// Params: `{ "id": "<catalog id>", "agent_id": "<agent>" }`.
+    /// Params: `{ "id": "<catalog id>", "agent_id": "<agent>",
+    /// "env"?: { "<NAME>": "<value>" } }` — `env` must hold a non-empty
+    /// literal for every name in the item's `required_env`.
     /// Looks the item up in the built-in catalog plus the optional
     /// user-contributed `~/.duduclaw/marketplace.json`, then reuses the
     /// same `add_server_to_config` path as `mcp.update`.
     pub(crate) async fn handle_marketplace_install(&self, params: Value) -> WsFrame {
-        use duduclaw_agent::mcp_template::{
-            McpCatalogItem, add_server_to_config, marketplace_catalog,
-        };
+        use duduclaw_agent::mcp_template::{McpCatalogItem, add_server_to_config, apply_required_env};
 
         let id = match params.get("id").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -149,20 +171,7 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Agent '{agent_id}' not found"));
         }
 
-        let mut catalog: Vec<McpCatalogItem> = marketplace_catalog();
-        let user_path = self.home_dir.join("marketplace.json");
-        if user_path.exists() {
-            if let Ok(content) = tokio::fs::read_to_string(&user_path).await {
-                #[derive(serde::Deserialize)]
-                struct UserCatalog {
-                    #[serde(default)]
-                    servers: Vec<McpCatalogItem>,
-                }
-                if let Ok(user) = serde_json::from_str::<UserCatalog>(&content) {
-                    catalog.extend(user.servers);
-                }
-            }
-        }
+        let catalog: Vec<McpCatalogItem> = self.full_marketplace_catalog().await;
 
         let item = match catalog.into_iter().find(|c| c.id == id) {
             Some(c) => c,
@@ -174,8 +183,42 @@ impl MethodHandler {
             }
         };
 
+        // Required env values arrive as `env: { NAME: value }` and are written
+        // into `.mcp.json` as literals (owner-only file, never logged). A
+        // missing one is refused with the variable names.
+        let supplied: std::collections::HashMap<String, String> = match params.get("env") {
+            None | Some(Value::Null) => Default::default(),
+            Some(Value::Object(map)) => {
+                let mut out = std::collections::HashMap::new();
+                for (k, v) in map {
+                    match v.as_str() {
+                        Some(s) => {
+                            out.insert(k.clone(), s.to_string());
+                        }
+                        None => {
+                            return WsFrame::error_response(
+                                "",
+                                &format!("env value for '{}' must be a string", duduclaw_core::truncate_chars(k, 64)),
+                            );
+                        }
+                    }
+                }
+                out
+            }
+            Some(_) => return WsFrame::error_response("", "env must be an object of NAME: value"),
+        };
         let server_name = item.id.clone();
-        let def = item.default_def;
+        let mut supplied = supplied;
+        if let Err(e) = super::mcp_rpc::resolve_masked_env(
+            &mut supplied,
+            super::mcp_rpc::stored_server_env(&agent_dir, &server_name).as_ref(),
+        ) {
+            return WsFrame::error_response("", &e);
+        }
+        let def = match apply_required_env(&item.default_def, &item.required_env, &supplied) {
+            Ok(d) => d,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         // Defense in depth: the user-contributed marketplace.json is plain
         // config on disk — scan the definition it hands us before spawning it
         // into an agent, same fail-closed policy as the import path.

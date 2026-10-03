@@ -17,6 +17,7 @@ import {
   Bot,
   Share2,
   Gauge,
+  FileCode,
 } from 'lucide-react';
 import {
   SettingsShell,
@@ -24,6 +25,11 @@ import {
   type SettingsNavGroup,
 } from '@/components/mds';
 import { useAuthStore } from '@/stores/auth-store';
+import { useSystemStore } from '@/stores/system-store';
+import { isNewFeature } from '@/apps/registry';
+
+/** v1.68 (W2): 設定檔進階編輯 tab — new-feature chip. */
+const CONFIG_RAW_NEW_IN = '1.68.0';
 import { GeneralTab } from '@/components/settings/sections/GeneralTab';
 import { AccountTab } from '@/components/settings/sections/AccountTab';
 import { SystemTab } from '@/components/settings/sections/SystemTab';
@@ -39,12 +45,16 @@ import { BrowserTab } from '@/components/settings/sections/BrowserTab';
 import { AutomationTab } from '@/components/settings/sections/AutomationTab';
 import { DelegationTab } from '@/components/settings/sections/DelegationTab';
 import { CalibrationTab } from '@/components/settings/sections/CalibrationTab';
+import { ConfigRawTab } from '@/components/settings/sections/ConfigRawTab';
+import { RestartRequiredBanner } from '@/components/settings/RestartRequiredBanner';
 
 /** Settings sub-tab whitelist (spec §5.3 式3). `?tab=` is validated against this
  *  set; unknown values fall back to `general`. */
 const VALID_TABS = [
   'general', 'account', 'system', 'container', 'heartbeat', 'voice',
   'proactive', 'automation', 'delegation', 'calibration', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser',
+  // v1.68 (W2): raw config.toml / inference.toml / agent.toml editor, admin-only.
+  'configRaw',
 ] as const;
 type TabId = (typeof VALID_TABS)[number];
 
@@ -81,8 +91,9 @@ export function SettingsPage() {
   // `?tab=delegation` deep link all disappear for anyone else. The gateway
   // gates `delegation.get/set` too — this is the courtesy layer.
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
+  const version = useSystemStore((s) => s.status?.version ?? null);
 
-  const ADMIN_ONLY_TABS = ['delegation', 'calibration'];
+  const ADMIN_ONLY_TABS = ['delegation', 'calibration', 'configRaw'];
   const tabAllowed = (tab: string) =>
     (VALID_TABS as readonly string[]).includes(tab) && (!ADMIN_ONLY_TABS.includes(tab) || isAdmin);
   const activeTab: TabId = tabAllowed(tabParam ?? '') ? (tabParam as TabId) : 'general';
@@ -125,12 +136,32 @@ export function SettingsPage() {
         { value: 'redaction', label: t('settings.redaction'), icon: EyeOff },
         { value: 'doctor', label: t('settings.doctor'), icon: Stethoscope },
         { value: 'browser', label: t('settings.browser'), icon: Globe },
+        ...(isAdmin
+          ? [{
+              value: 'configRaw',
+              // New-feature chip, same convention as the nav (`newIn` +
+              // `isNewFeature`): shown through the 1.68 release line only.
+              label: isNewFeature(CONFIG_RAW_NEW_IN, version) ? (
+                <span className="flex items-center gap-1.5">
+                  {t('settings.configRaw')}
+                  <span className="rounded border border-surface-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                    {t('nav.badge.new')}
+                  </span>
+                </span>
+              ) : t('settings.configRaw'),
+              icon: FileCode,
+            }]
+          : []),
       ],
     },
   ];
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      {/* v1.68 (W2): settings saved here that only apply after a restart. */}
+      <div className="px-4 pt-3 empty:hidden">
+        <RestartRequiredBanner />
+      </div>
       <SettingsShell value={activeTab} onValueChange={setTab} groups={navGroups}>
         <SettingsTab value="general" title={t('settings.general')}>
           <GeneralTab />
@@ -189,6 +220,11 @@ export function SettingsPage() {
         <SettingsTab value="browser" title={t('settings.browser')} description={t('settings.browser.desc')}>
           <BrowserTab />
         </SettingsTab>
+        {isAdmin && (
+          <SettingsTab value="configRaw" title={t('settings.configRaw')} description={t('settings.configRaw.desc')}>
+            <ConfigRawTab />
+          </SettingsTab>
+        )}
       </SettingsShell>
     </div>
   );

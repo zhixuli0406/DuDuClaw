@@ -133,6 +133,12 @@ impl OdooConnectorPool {
         self.resolver.read().await.for_agent(agent_id).cloned()
     }
 
+    /// `config.toml [odoo] features_*` gate for `model` (global switches;
+    /// `Err(module)` when that module is switched off).
+    pub async fn feature_gate(&self, model: &str) -> Result<(), &'static str> {
+        self.resolver.read().await.global().feature_allows_model(model)
+    }
+
     /// Effective `unblock_models` opt-out for `agent_id`. When the agent has an
     /// `agent.toml [odoo]` override block, that block's `unblock_models` is
     /// authoritative (even if empty — a deliberate "none"); otherwise the

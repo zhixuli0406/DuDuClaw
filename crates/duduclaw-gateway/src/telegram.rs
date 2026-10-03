@@ -857,7 +857,7 @@ async fn poll_loop(
                     strip_bot_mention(text, &bot_username)
                 } else if let Some(voice) = &msg.voice {
                     info!("🎙 Telegram [{sender}]: voice message");
-                    match transcribe_voice(&client, &api_base, &voice.file_id).await {
+                    match transcribe_voice(&client, &api_base, &voice.file_id, &ctx.home_dir).await {
                         Ok(text) => {
                             info!(
                                 "🎙 Telegram [{sender}] transcribed: {}",
@@ -882,7 +882,7 @@ async fn poll_loop(
                     }
                 } else if let Some(audio) = &msg.audio {
                     info!("🎵 Telegram [{sender}]: audio message");
-                    match transcribe_voice(&client, &api_base, &audio.file_id).await {
+                    match transcribe_voice(&client, &api_base, &audio.file_id, &ctx.home_dir).await {
                         Ok(text) => text,
                         Err(e) => {
                             warn!("Audio transcription failed: {e}");
@@ -2188,6 +2188,7 @@ async fn transcribe_voice(
     client: &reqwest::Client,
     api_base: &str,
     file_id: &str,
+    home_dir: &std::path::Path,
 ) -> Result<String, String> {
     let resp = client
         .get(format!("{api_base}/getFile"))
@@ -2244,13 +2245,13 @@ async fn transcribe_voice(
         "Voice file downloaded from Telegram"
     );
 
-    let text = duduclaw_inference::whisper::transcribe(
-        &audio_bytes,
-        Some("zh"),
-        &duduclaw_inference::whisper::WhisperMode::Api,
-    )
-    .await
-    .map_err(|_| "Voice transcription failed — please try again".to_string())?;
+    // Dashboard STT settings first; env OPENAI_API_KEY only when unset.
+    let text = crate::stt::transcribe_channel_audio(home_dir, &audio_bytes, Some("zh"))
+        .await
+        .map_err(|e| {
+            warn!("Telegram voice transcription failed: {e}");
+            "Voice transcription failed — please try again".to_string()
+        })?;
 
     if text.trim().is_empty() {
         return Err("Transcription returned empty text".into());

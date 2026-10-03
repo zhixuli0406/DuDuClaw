@@ -146,6 +146,20 @@ impl NotionIdentityProvider {
     }
 
     async fn query_database(&self, filter: Value) -> Result<Value, IdentityError> {
+        // `refresh_seconds` (dashboard 身分 →「重新整理間隔（秒）」, v1.68.0):
+        // successful answers are reused for that long; 0 disables the cache.
+        // Providers are rebuilt per request, so the cache is process-wide.
+        let ttl = Duration::from_secs(self.config.refresh_seconds);
+        let cache_key = query_cache_key(&self.config.database_id, &self.config.api_key, &filter);
+        if let Some(hit) = QUERY_CACHE.get(&cache_key, ttl, std::time::Instant::now()) {
+            return Ok(hit);
+        }
+        let body = self.query_database_uncached(filter).await?;
+        QUERY_CACHE.put(cache_key, body.clone(), ttl, std::time::Instant::now());
+        Ok(body)
+    }
+
+    async fn query_database_uncached(&self, filter: Value) -> Result<Value, IdentityError> {
         let url = format!(
             "https://api.notion.com/v1/databases/{}/query",
             self.config.database_id,
@@ -277,6 +291,58 @@ impl IdentityProvider for NotionIdentityProvider {
     }
 }
 
+// ── Query cache (refresh_seconds) ───────────────────────────────────────────
+
+const QUERY_CACHE_MAX: usize = 1024;
+
+/// TTL cache of successful `databases/query` answers.
+pub(crate) struct QueryCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
+}
+
+impl QueryCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub(crate) fn get(&self, key: &str, ttl: Duration, now: std::time::Instant) -> Option<Value> {
+        if ttl.is_zero() {
+            return None;
+        }
+        let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(key)
+            .filter(|(at, _)| now.duration_since(*at) < ttl)
+            .map(|(_, v)| v.clone())
+    }
+
+    pub(crate) fn put(&self, key: String, value: Value, ttl: Duration, now: std::time::Instant) {
+        if ttl.is_zero() {
+            return;
+        }
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= QUERY_CACHE_MAX && !map.contains_key(&key) {
+            map.retain(|_, (at, _)| now.duration_since(*at) < ttl);
+            if map.len() >= QUERY_CACHE_MAX {
+                map.clear();
+            }
+        }
+        map.insert(key, (now, value));
+    }
+}
+
+static QUERY_CACHE: std::sync::LazyLock<QueryCache> = std::sync::LazyLock::new(QueryCache::new);
+
+/// Cache key: database, a hash of the API key (never the key itself, so a
+/// changed key never reuses another key's answers) and the filter.
+fn query_cache_key(database_id: &str, api_key: &str, filter: &Value) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    api_key.hash(&mut h);
+    format!("{database_id}\u{1f}{:016x}\u{1f}{filter}", h.finish())
+}
+
 /// Outcome of narrowing a `databases/query` response to a single person.
 enum RowSelection<'a> {
     None,
@@ -379,6 +445,32 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn query_cache_respects_refresh_seconds() {
+        let cache = super::QueryCache::new();
+        let t0 = std::time::Instant::now();
+        let ttl = Duration::from_secs(60);
+        let v = serde_json::json!({ "results": [] });
+        cache.put("k".into(), v.clone(), ttl, t0);
+        assert_eq!(cache.get("k", ttl, t0 + Duration::from_secs(59)), Some(v.clone()));
+        assert_eq!(cache.get("k", ttl, t0 + Duration::from_secs(60)), None);
+        assert_eq!(cache.get("other", ttl, t0), None);
+        // refresh_seconds = 0 disables caching entirely.
+        let off = super::QueryCache::new();
+        off.put("k".into(), v, Duration::ZERO, t0);
+        assert_eq!(off.get("k", Duration::ZERO, t0), None);
+        assert!(off.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn query_cache_key_separates_api_keys_without_embedding_them() {
+        let f = serde_json::json!({ "property": "x" });
+        let a = super::query_cache_key("db", "secret_aaa", &f);
+        let b = super::query_cache_key("db", "secret_bbb", &f);
+        assert_ne!(a, b);
+        assert!(!a.contains("secret_aaa"));
+    }
+
     use super::*;
 
     fn provider_with_default_field_map() -> NotionIdentityProvider {

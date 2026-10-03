@@ -76,6 +76,9 @@ mod secaudit; // Code security audit MVP: intake + OSS scanner orchestration (`d
 mod service;
 pub mod weekly_report; // Per-agent weekly usage report
 mod knobs_survival;
+mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
+#[cfg(test)]
+mod namespace_unification_tests;
 mod discover_cli;
 pub mod wiki_scope; // RFC-21 §3: shared-wiki SoT namespace policy
 mod wizard;
@@ -1678,6 +1681,14 @@ enum OpsCommands {
         command: OrgCommands,
     },
 
+    /// (operator) Memory store maintenance — `memory migrate-namespace` moves
+    /// the pre-v1.68.0 shared MCP memory pool. Hidden from `--help`.
+    #[command(hide = true)]
+    Memory {
+        #[command(subcommand)]
+        command: memory_namespace_cmd::MemoryCommands,
+    },
+
     /// Manage AI 員工職務組合 (agent presets) — named, versioned configuration
     /// bundles an agent can reference (`~/.duduclaw/presets/`). See
     /// `commercial/docs/DESIGN-agent-presets-2026-08.md`.
@@ -1712,7 +1723,7 @@ enum OpsCommands {
     /// T5/O10 (feature audit 2026-09-29): these used to be three unrelated
     /// top-level commands (`migrate`, `migrate-from`, `data-migrate`) whose
     /// help text had to disclaim each other. The old spellings still work as
-    /// hidden aliases until v1.68.0 — see `docs/guides/deprecations.md`.
+    /// hidden aliases until v1.69.0 — see `docs/guides/deprecations.md`.
     Migrate {
         #[command(subcommand)]
         command: Option<MigrateCommands>,
@@ -1725,7 +1736,7 @@ enum OpsCommands {
     /// imported / skipped and why). Pass `--apply` to actually write.
     ///
     /// Deprecated spelling of `duduclaw migrate from <platform>`; removed in
-    /// v1.68.0.
+    /// v1.69.0.
     #[command(name = "migrate-from", hide = true)]
     MigrateFrom {
         /// Source platform: `openclaw`, `hermes`, `paperclip`, or `claude-code`.
@@ -1778,7 +1789,7 @@ enum OpsCommands {
     /// T5/O10 (feature audit 2026-09-29): four unrelated exports used to be
     /// told apart only by which command group they sat in. The old spellings
     /// (`duduclaw audit`, `duduclaw gdpr export`, `duduclaw playbook export`)
-    /// still work as hidden aliases until v1.68.0 — see
+    /// still work as hidden aliases until v1.69.0 — see
     /// `docs/guides/deprecations.md`.
     Export {
         #[command(subcommand)]
@@ -1806,7 +1817,7 @@ enum OpsCommands {
     /// events, channel failures) as NDJSON — write to a file and/or stream to a
     /// SIEM/webhook (Splunk HEC / Elastic / Datadog / generic).
     ///
-    /// Deprecated spelling of `duduclaw export audit`; removed in v1.68.0.
+    /// Deprecated spelling of `duduclaw export audit`; removed in v1.69.0.
     #[command(hide = true)]
     Audit {
         /// Only include records at/after this RFC3339 time (e.g.
@@ -2330,7 +2341,7 @@ enum MaintenanceCommands {
 
     /// A2A protocol server (agent-to-agent interop over stdio JSON-RPC).
     ///
-    /// Deprecated spelling of `duduclaw acp server`; removed in v1.68.0.
+    /// Deprecated spelling of `duduclaw acp server`; removed in v1.69.0.
     #[command(name = "acp-server", hide = true)]
     AcpServer,
 
@@ -2526,7 +2537,7 @@ enum MaintenanceCommands {
     ///     duduclaw migrate data --check       # exit 1 iff something is pending
     ///     duduclaw migrate data --run
     ///
-    /// Deprecated spelling of `duduclaw migrate data`; removed in v1.68.0.
+    /// Deprecated spelling of `duduclaw migrate data`; removed in v1.69.0.
     #[command(name = "data-migrate", hide = true)]
     DataMigrate {
         /// List pending migrations. Always exits 0 (a listing is
@@ -3546,7 +3557,7 @@ enum AcpCommands {
 enum GdprCommands {
     /// Export everything stored about a contact as a JSON bundle (read-only).
     ///
-    /// Deprecated spelling of `duduclaw export gdpr`; removed in v1.68.0.
+    /// Deprecated spelling of `duduclaw export gdpr`; removed in v1.69.0.
     #[command(hide = true)]
     Export {
         /// Contact id (matched as triple subject/object or free-text mention),
@@ -3586,7 +3597,7 @@ enum PlaybookCommands {
     /// Example:
     ///     duduclaw export playbook --agent support-bot --out genes.json
     ///
-    /// Deprecated spelling of `duduclaw export playbook`; removed in v1.68.0.
+    /// Deprecated spelling of `duduclaw export playbook`; removed in v1.69.0.
     #[command(hide = true)]
     Export {
         /// Agent id whose playbook to export.
@@ -3766,6 +3777,11 @@ fn duduclaw_home() -> PathBuf {
 ///
 /// Split from the env-coupled wrapper so tests can pass arbitrary paths
 /// without racing on `DUDUCLAW_HOME` under cargo's parallel test runner.
+///
+/// Since v1.68.0 the live logger init uses
+/// `duduclaw_gateway::log::resolve_env_filter` (same key, same precedence);
+/// this stays as the test-pinned statement of the parsing contract.
+#[cfg(test)]
 fn read_log_level_from_config(path: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let value: toml::Value = raw.parse().ok()?;
@@ -3774,10 +3790,6 @@ fn read_log_level_from_config(path: &std::path::Path) -> Option<String> {
         .and_then(|g| g.get("log_level"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-}
-
-fn read_config_log_level() -> Option<String> {
-    read_log_level_from_config(&duduclaw_home().join("config.toml"))
 }
 
 /// Entry point for the `duduclaw` / `duduclaw-pro` binaries.
@@ -3849,24 +3861,12 @@ pub async fn entry_point() {
     // dropped, making GVU debugging impossible. The `eprintln!` below
     // surfaces the effective level on stderr at startup so operators can
     // confirm the resolution chose what they expected.
-    let (env_filter, level_source) = match std::env::var("RUST_LOG") {
-        Ok(spec) => (
-            tracing_subscriber::EnvFilter::try_new(&spec)
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-            format!("RUST_LOG={spec}"),
-        ),
-        Err(_) => match read_config_log_level() {
-            Some(level) => (
-                tracing_subscriber::EnvFilter::try_new(&level)
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-                format!("config.toml [general] log_level={level}"),
-            ),
-            None => (
-                tracing_subscriber::EnvFilter::new("warn"),
-                "default=warn".to_string(),
-            ),
-        },
-    };
+    // Same resolution as the gateway's shared stack (one implementation):
+    // `duduclaw_gateway::log::resolve_env_filter`. The filter is installed
+    // through a reload layer so the dashboard's log level applies without a
+    // restart (unless RUST_LOG pins it).
+    let (env_filter, level_source, level_pinned) =
+        duduclaw_gateway::log::resolve_env_filter(&duduclaw_home());
     eprintln!("[duduclaw] effective log level: {level_source}");
     // Route the terminal fmt layer to stderr — stdout must stay clean for any
     // subcommand that uses it as a protocol channel. `mcp-server` is the
@@ -3893,15 +3893,14 @@ pub async fn entry_point() {
     let _otel_guard = duduclaw_gateway::otel::init(&duduclaw_home());
     // `Option<Layer>` composes as a pass-through, so the stack shape is
     // identical when the file writer is unavailable.
-    let file_layer = file_writer.map(|w| {
-        tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_writer(w)
-    });
+    // `[logging] format = "json"` (restart-only) switches stderr and the
+    // file log to JSON lines; both stay on stderr/file, never stdout.
+    let log_json = duduclaw_gateway::log::read_log_format(&duduclaw_home())
+        == duduclaw_gateway::log::LogFormat::Json;
     tracing_subscriber::registry()
-        .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .with(file_layer)
+        .with(duduclaw_gateway::log::reloadable_filter(env_filter, level_pinned))
+        .with(duduclaw_gateway::log::stderr_layer(log_json))
+        .with(duduclaw_gateway::log::file_layer(file_writer, log_json))
         .with(duduclaw_gateway::log::BroadcastLayer)
         .with(duduclaw_gateway::otel::subscriber_layer())
         .init();
@@ -5071,6 +5070,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             artifact,
         }) => causal_cmd::clear_revocation_fence(&db, &tenant, &acl, &artifact),
         Commands::Ops(OpsCommands::Doctor { fix_residue }) => cmd_doctor(fix_residue).await,
+        Commands::Ops(OpsCommands::Memory { command }) => {
+            memory_namespace_cmd::run(&duduclaw_home(), command).await
+        }
         Commands::Ops(OpsCommands::Org { command }) => match command {
             OrgCommands::Show => cmd_org_show(),
             OrgCommands::Sync { agent, dry_run } => cmd_org_sync(agent.as_deref(), dry_run),
@@ -7923,6 +7925,7 @@ can_modify_own_skills = true
 can_modify_own_soul = false
 can_schedule_tasks = true
 allowed_channels = ["*"]
+permissions_enforced_since = "1.68.0"
 
 [evolution]
 skill_auto_activate = true
@@ -8032,6 +8035,64 @@ max_active_skills = 5
 }
 
 /// `duduclaw run [--yes]` - Start the DuDuClaw server (gateway + dashboard).
+/// The gateway admin token: env `DUDUCLAW_AUTH_TOKEN` first, then
+/// `config.toml [gateway] auth_token_enc` (what the dashboard writes since the
+/// token became encrypted at rest), then legacy plaintext `auth_token`
+/// (also `secret://` references through the configured secret manager).
+/// Empty values count as unset. Before v1.68.0 only the plaintext key was
+/// read, so a token set from the dashboard vanished on the next restart.
+async fn resolve_admin_auth_token(home: &std::path::Path, env_value: Option<&str>) -> Option<String> {
+    if let Some(v) = env_value.map(str::trim).filter(|t| !t.is_empty()) {
+        return Some(v.to_string());
+    }
+    duduclaw_gateway::config_crypto::read_encrypted_config_field(home, "gateway", "auth_token")
+        .await
+        .filter(|t| !t.trim().is_empty())
+}
+
+#[cfg(test)]
+mod admin_auth_token_tests {
+    use super::resolve_admin_auth_token;
+
+    #[tokio::test]
+    async fn encrypted_token_written_by_dashboard_survives_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let enc = duduclaw_gateway::config_crypto::encrypt_value("tok-abc-123", home)
+            .expect("encrypt");
+        std::fs::write(
+            home.join("config.toml"),
+            format!("[gateway]\nauth_token_enc = \"{enc}\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_admin_auth_token(home, None).await.as_deref(),
+            Some("tok-abc-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn env_wins_and_plaintext_still_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::write(home.join("config.toml"), "[gateway]\nauth_token = \"plain-1\"\n").unwrap();
+        assert_eq!(resolve_admin_auth_token(home, None).await.as_deref(), Some("plain-1"));
+        assert_eq!(
+            resolve_admin_auth_token(home, Some("env-1")).await.as_deref(),
+            Some("env-1")
+        );
+        // Empty env falls through to the file.
+        assert_eq!(resolve_admin_auth_token(home, Some(" ")).await.as_deref(), Some("plain-1"));
+    }
+
+    #[tokio::test]
+    async fn no_token_anywhere_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "[gateway]\nport = 1\n").unwrap();
+        assert!(resolve_admin_auth_token(tmp.path(), None).await.is_none());
+    }
+}
+
 async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
 
@@ -8083,21 +8144,11 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     println!("   Press Ctrl+C to stop\n");
 
     // Read auth token from env, config.toml, or leave None for local-only mode
-    let auth_token = std::env::var("DUDUCLAW_AUTH_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .or_else(|| {
-            let config_path = home.join("config.toml");
-            let content = std::fs::read_to_string(&config_path).ok()?;
-            let table: toml::Table = content.parse().ok()?;
-            table
-                .get("gateway")?
-                .as_table()?
-                .get("auth_token")?
-                .as_str()
-                .filter(|t| !t.is_empty())
-                .map(|t| t.to_string())
-        });
+    let auth_token = resolve_admin_auth_token(
+        &home,
+        std::env::var("DUDUCLAW_AUTH_TOKEN").ok().as_deref(),
+    )
+    .await;
     if auth_token.is_none() {
         // The WS auth gate in `server::handle_socket` also requires JWT
         // when `users.db` has any rows — independent of `auth_token`. The
@@ -8469,16 +8520,44 @@ async fn cmd_status() -> duduclaw_core::error::Result<()> {
     };
     println!("Agents:  {}", agent_count);
 
-    // Docker status
-    match bollard::Docker::connect_with_local_defaults() {
-        Ok(docker) => match docker.ping().await {
-            Ok(_) => println!("Docker:  connected"),
-            Err(e) => println!("Docker:  not reachable ({})", e),
-        },
-        Err(e) => println!("Docker:  not available ({})", e),
+    // Docker status — the shared probe (`info` + container list), not
+    // `/_ping`, which a half-dead daemon still answers.
+    match duduclaw_gateway::task_sandbox::container::docker_status().await {
+        duduclaw_core::docker_probe::DockerStatus::Reachable { server_version } => {
+            println!("Docker:  connected ({server_version})")
+        }
+        duduclaw_core::docker_probe::DockerStatus::Unavailable(why) => {
+            println!("Docker:  not reachable ({})", why.code())
+        }
     }
 
     Ok(())
+}
+
+/// `duduclaw doctor`'s Docker row from the shared probe's verdict.
+fn docker_check(status: duduclaw_core::docker_probe::DockerStatus) -> (String, CheckStatus, String) {
+    use duduclaw_core::docker_probe::{DockerStatus, Unavailable};
+    match status {
+        DockerStatus::Reachable { server_version } => (
+            "Docker".into(),
+            CheckStatus::Pass,
+            format!("Docker daemon is reachable (server {server_version})."),
+        ),
+        DockerStatus::Unavailable(Unavailable::NoClient) => (
+            "Docker".into(),
+            CheckStatus::Warn,
+            "Docker not available: the docker client could not be run. Container mode won't work.".into(),
+        ),
+        DockerStatus::Unavailable(why) => (
+            "Docker".into(),
+            CheckStatus::Warn,
+            format!(
+                "Docker installed but not usable ({}): `docker info` / `docker ps` did not answer. \
+                 Restart Docker; container mode won't work until then.",
+                why.code()
+            ),
+        ),
+    }
 }
 
 /// `duduclaw doctor` row for the per-agent task sandbox: Docker reachable,
@@ -9188,31 +9267,17 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     }
     checks.extend(account_credential_checks(&home).await);
 
-    // Check 4: Docker availability
-    match bollard::Docker::connect_with_local_defaults() {
-        Ok(docker) => match docker.ping().await {
-            Ok(_) => {
-                checks.push((
-                    "Docker".into(),
-                    CheckStatus::Pass,
-                    "Docker daemon is reachable.".into(),
-                ));
-            }
-            Err(e) => {
-                checks.push((
-                    "Docker".into(),
-                    CheckStatus::Warn,
-                    format!("Docker installed but not reachable: {e}"),
-                ));
-            }
-        },
-        Err(e) => {
-            checks.push((
-                "Docker".into(),
-                CheckStatus::Warn,
-                format!("Docker not available: {e}. Container mode won't work."),
-            ));
+    // Check 4: Docker availability — the same probe the 任務沙箱 and 電腦操作
+    // rows below use (`docker info` + `docker ps`, short timeout, answer
+    // shared for a few seconds), so the three rows cannot disagree. A bare
+    // `/_ping` passed on 2026-10-03 while `/info` and `docker ps` hit EOF.
+    {
+        let (status, detail) = duduclaw_gateway::task_sandbox::container::docker_status_detail().await;
+        let (name, st, mut msg) = docker_check(status);
+        if let Some(d) = detail {
+            msg.push_str(&format!(" Docker said: {d}"));
         }
+        checks.push((name, st, msg));
     }
 
     // Check 4b: task sandbox prerequisites + sandbox-enabled agents.
@@ -9693,17 +9758,15 @@ warn_threshold_percent = 80
 hard_stop = true
 
 [permissions]
-can_create_agents = false
+can_create_agents = true
 can_send_cross_agent = true
 can_modify_own_skills = true
 can_modify_own_soul = false
-can_schedule_tasks = false
+can_schedule_tasks = true
 allowed_channels = ["*"]
+permissions_enforced_since = "1.68.0"
 
 [evolution]
-micro_reflection = true
-meso_reflection = true
-macro_reflection = true
 skill_auto_activate = false
 skill_security_scan = true
 "#
@@ -11589,6 +11652,28 @@ mod computer_use_doctor_tests {
         assert!(detail.contains("computer_use_mode = \"native\"：desk-bot。"), "{detail}");
         assert!(detail.contains("已移除"), "{detail}");
         assert!(!detail.contains("：desk-bot, plain-bot。"), "{detail}");
+    }
+}
+
+/// `duduclaw doctor`'s Docker row reads the shared probe: a daemon that
+/// answers `/_ping` but not `info` / `ps` is never reported reachable.
+#[cfg(test)]
+mod docker_doctor_row_tests {
+    use super::*;
+    use duduclaw_core::docker_probe::{DockerStatus, Unavailable};
+
+    #[test]
+    fn reachable_only_when_the_shared_probe_says_so() {
+        let (_, status, text) = docker_check(DockerStatus::Reachable { server_version: "27.3.1".into() });
+        assert!(matches!(status, CheckStatus::Pass) && text.contains("reachable"), "{text}");
+        for why in [Unavailable::InfoFailed, Unavailable::ListFailed, Unavailable::EmptyInfo, Unavailable::Timeout] {
+            let (_, status, text) = docker_check(DockerStatus::Unavailable(why));
+            assert!(matches!(status, CheckStatus::Warn), "{why:?}");
+            assert!(!text.contains("is reachable"), "{text}");
+            assert!(text.contains(why.code()), "{text}");
+        }
+        let (_, status, _) = docker_check(DockerStatus::Unavailable(Unavailable::NoClient));
+        assert!(matches!(status, CheckStatus::Warn));
     }
 }
 

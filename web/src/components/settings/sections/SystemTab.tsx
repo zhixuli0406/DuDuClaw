@@ -16,6 +16,27 @@ import {
 } from '@/components/mds';
 import { AdvancedSection, DangerZone, type SelectOption } from '@/components/settings/controls';
 import { RowSelect, RowSwitch } from '@/pages/agent-form/form-rows';
+import { useAuthStore } from '@/stores/auth-store';
+import { useRestartRequiredStore } from '@/stores/restart-required-store';
+import {
+  changedPayload,
+  parseTomlSubset,
+  tomlBool,
+  tomlNum,
+  tomlSecretSet,
+  tomlStr,
+  tomlStrList,
+  type FlatValues,
+  type TomlTables,
+} from '@/lib/config-toml';
+import {
+  FilesRootsSection,
+  SANDBOX_DEFAULTS,
+  SandboxSection,
+  SecretBackendFields,
+  TrustAndObservabilitySection,
+  sandboxSizesInvalid,
+} from './SystemTabExtras';
 
 // Secret-manager backends the gateway's system.update_config accepts.
 const SM_BACKENDS = ['local', 'vault', 'env', 'onepassword', 'infisical'];
@@ -68,6 +89,43 @@ const isValidIp = (raw: string): boolean => {
   return s.includes(':') && /^[0-9a-fA-F:]+$/.test(s);
 };
 
+/** v1.68 (W2) keys this tab reads from config.toml beyond the original set.
+ *  Flat `system.update_config` param paths (= TOML paths). */
+function readV168(tables: TomlTables): FlatValues {
+  const sb = 'container.sandbox';
+  return {
+    'container.sandbox.image': tomlStr(tables, sb, 'image', ''),
+    'container.sandbox.when_unavailable': tomlStr(tables, sb, 'when_unavailable', 'fail'),
+    'container.sandbox.script_when_unavailable': tomlStr(tables, sb, 'script_when_unavailable', 'fail'),
+    'container.sandbox.memory_bytes': tomlNum(tables, sb, 'memory_bytes', SANDBOX_DEFAULTS.memory_bytes),
+    'container.sandbox.pids': tomlNum(tables, sb, 'pids', SANDBOX_DEFAULTS.pids),
+    'container.sandbox.cpu_millis': tomlNum(tables, sb, 'cpu_millis', SANDBOX_DEFAULTS.cpu_millis),
+    'container.sandbox.tmp_bytes': tomlNum(tables, sb, 'tmp_bytes', SANDBOX_DEFAULTS.tmp_bytes),
+    'container.sandbox.workspace_bytes': tomlNum(tables, sb, 'workspace_bytes', SANDBOX_DEFAULTS.workspace_bytes),
+    'container.sandbox.max_turns': tomlNum(tables, sb, 'max_turns', SANDBOX_DEFAULTS.max_turns),
+    'computer_use.image': tomlStr(tables, 'computer_use', 'image', ''),
+    'memory.supersession_trust_guard': tomlBool(tables, 'memory', 'supersession_trust_guard', true),
+    'files.allowed_roots': tomlStrList(tables, 'files', 'allowed_roots'),
+    'telemetry.otlp_endpoint': tomlStr(tables, 'telemetry', 'otlp_endpoint', ''),
+    'acp.trusted': tomlBool(tables, 'acp', 'trusted', false),
+    'integrations.github': tomlBool(tables, 'integrations', 'github', false),
+    'secret_manager.onepassword_host': tomlStr(tables, 'secret_manager', 'onepassword_host', ''),
+    'secret_manager.onepassword_vault': tomlStr(tables, 'secret_manager', 'onepassword_vault', ''),
+    'secret_manager.infisical_addr': tomlStr(tables, 'secret_manager', 'infisical_addr', ''),
+    'secret_manager.infisical_project_id': tomlStr(tables, 'secret_manager', 'infisical_project_id', ''),
+    'secret_manager.infisical_environment': tomlStr(tables, 'secret_manager', 'infisical_environment', ''),
+  };
+}
+
+const SANDBOX_NUMERIC_KEYS = [
+  'container.sandbox.memory_bytes',
+  'container.sandbox.pids',
+  'container.sandbox.cpu_millis',
+  'container.sandbox.tmp_bytes',
+  'container.sandbox.workspace_bytes',
+  'container.sandbox.max_turns',
+] as const;
+
 // ── G — System tab (gateway / rotation / general / logging / secret_manager) ──
 
 export function SystemTab() {
@@ -106,6 +164,16 @@ export function SystemTab() {
   // (default: off, matching `notify_digest::DigestConfig::default()`).
   const [dailyDigest, setDailyDigest] = useState(false);
   const [dailyDigestAt, setDailyDigestAt] = useState('09:00');
+  // v1.68 (W2): the newer keys live in one flat map (see readV168).
+  const [extra, setExtra] = useState<FlatValues>({});
+  const setExtraKey = (key: string, value: unknown) => setExtra((prev) => ({ ...prev, [key]: value }));
+  // Write-only secret-backend tokens + whether one is stored.
+  const [smTokens, setSmTokens] = useState({ onepassword_token: '', infisical_token: '' });
+  const [smTokenSet, setSmTokenSet] = useState({ onepassword_token: false, infisical_token: false });
+  const [otelCompiled, setOtelCompiled] = useState(false);
+  const isAdmin = useAuthStore((st) => st.user?.role === 'admin');
+  // Loaded values, flattened — a save sends only what differs (plan principle 3).
+  const initialRef = useRef<FlatValues>({});
 
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -117,6 +185,15 @@ export function SystemTab() {
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
   useEffect(() => { fetchAgents(); }, [fetchAgents]);
+
+  // `otel_compiled` decides whether the OTLP field can do anything at all.
+  useEffect(() => {
+    // Wrapped so a partial test mock (no `status`) degrades to "not compiled".
+    Promise.resolve()
+      .then(() => api.system.status())
+      .then((st) => setOtelCompiled(st?.otel_compiled === true))
+      .catch(() => setOtelCompiled(false));
+  }, []);
 
   // Load non-secret current values from the TOML config string. Secrets
   // (auth_token / vault_token) are write-only — left blank, only sent if typed.
@@ -142,7 +219,8 @@ export function SystemTab() {
       setCooldown(m(/cooldown_after_rate_limit_seconds\s*=\s*(\d+)/) ?? '');
       setDefaultAgent(m(/default_agent\s*=\s*"([^"]*)"/) ?? '');
       setInferenceMode(m(/inference_mode\s*=\s*"(\w+)"/) ?? 'claude');
-      setLogFormat(m(/\bformat\s*=\s*"(\w+)"/) ?? 'pretty');
+      // `plain` is the contract spelling of the same output as `pretty`.
+      setLogFormat(tomlStr(parseTomlSubset(raw), 'logging', 'format', 'pretty') === 'json' ? 'json' : 'pretty');
       // Gateway accepts local/vault/env/onepassword/infisical (serde default:
       // "local"). Map absent or legacy values (config/keychain) to "local" so
       // a save never carries a value the gateway rejects.
@@ -161,6 +239,33 @@ export function SystemTab() {
       // daily_digest_enabled / daily_digest_at come back structured too.
       setDailyDigest(res.daily_digest_enabled ?? false);
       setDailyDigestAt(res.daily_digest_at ?? '09:00');
+      const tables = parseTomlSubset(raw);
+      const v168 = readV168(tables);
+      setExtra(v168);
+      setSmTokenSet({
+        onepassword_token: tomlSecretSet(tables, 'secret_manager', 'onepassword_token'),
+        infisical_token: tomlSecretSet(tables, 'secret_manager', 'infisical_token'),
+      });
+      initialRef.current = snapshotSystem({
+        name: general.match(/\bname\s*=\s*"([^"]*)"/)?.[1] ?? '',
+        mdnsAdvertise: /\bmdns_advertise\s*=\s*true\b/.test(server),
+        bind: bindVal,
+        port: m(/\bport\s*=\s*(\d+)/) ?? '',
+        healthInterval: m(/health_check_interval_seconds\s*=\s*(\d+)/) ?? '',
+        cooldown: m(/cooldown_after_rate_limit_seconds\s*=\s*(\d+)/) ?? '',
+        defaultAgent: m(/default_agent\s*=\s*"([^"]*)"/) ?? '',
+        inferenceMode: m(/inference_mode\s*=\s*"(\w+)"/) ?? 'claude',
+        logFormat: tomlStr(tables, 'logging', 'format', 'pretty') === 'json' ? 'json' : 'pretty',
+        smBackend: SM_BACKENDS.includes(smRaw) ? smRaw : 'local',
+        vaultAddr: m(/vault_addr\s*=\s*"([^"]*)"/) ?? '',
+        vaultMount: m(/vault_mount\s*=\s*"([^"]*)"/) ?? '',
+        origins: Array.isArray(ao) ? (ao.filter((v) => typeof v === 'string') as string[]) : [],
+        noveltyGate: res.novelty_gate_enabled ?? true,
+        miniappEnabled: res.miniapp_enabled ?? false,
+        dailyDigest: res.daily_digest_enabled ?? false,
+        dailyDigestAt: res.daily_digest_at ?? '09:00',
+        extra: v168,
+      });
     }).catch((e) => {
       console.warn('[api]', e);
       setLoadError(e);
@@ -190,37 +295,55 @@ export function SystemTab() {
       toast.error(intl.formatMessage({ id: 'settings.system.bind.invalid' }));
       return;
     }
+    // v1.68: the sandbox limits are validated as a whole server-side; catch
+    // the two mistakes the form can make before sending anything.
+    if (SANDBOX_NUMERIC_KEYS.some((k) => {
+      const n = extra[k];
+      return typeof n !== 'number' || !Number.isFinite(n) || n <= 0;
+    })) {
+      toast.error(intl.formatMessage({ id: 'settings.sandbox.invalidNumber' }));
+      return;
+    }
+    if (sandboxSizesInvalid(extra)) {
+      toast.error(intl.formatMessage({ id: 'settings.sandbox.sizeConstraint' }));
+      return;
+    }
+    // v1.68 (plan principle 3): send only what changed since load. Secrets
+    // are write-only and go out only when typed.
+    const current = snapshotSystem({
+      name: name.trim(), mdnsAdvertise, bind: bind.trim(), port: port.trim(),
+      healthInterval: healthInterval.trim(), cooldown: cooldown.trim(), defaultAgent,
+      inferenceMode, logFormat, smBackend, vaultAddr, vaultMount, origins, noveltyGate,
+      miniappEnabled, dailyDigest,
+      // An empty native time input must not be sent as "" — the gateway
+      // rejects an unparseable daily_digest_at outright (fail-closed).
+      dailyDigestAt: dailyDigestAt.trim() !== '' ? dailyDigestAt : '09:00',
+      extra,
+    });
+    const payload = changedPayload(initialRef.current, current);
+    if (authToken.trim() !== '') payload.auth_token = authToken.trim();
+    const smSecrets: Record<string, string> = {};
+    if (vaultToken.trim() !== '') smSecrets.vault_token = vaultToken.trim();
+    if (smTokens.onepassword_token.trim() !== '') smSecrets.onepassword_token = smTokens.onepassword_token.trim();
+    if (smTokens.infisical_token.trim() !== '') smSecrets.infisical_token = smTokens.infisical_token.trim();
+    if (Object.keys(smSecrets).length > 0) {
+      payload.secret_manager = { ...((payload.secret_manager as Record<string, unknown>) ?? {}), ...smSecrets };
+    }
+    if (Object.keys(payload).length === 0) {
+      toast.info(intl.formatMessage({ id: 'settings.noChanges' }));
+      return;
+    }
     setSaving(true);
     setSaved(false);
     setSaveError(null);
     try {
-      const payload: Record<string, unknown> = {};
-      payload.name = name.trim();
-      payload.mdns_advertise = mdnsAdvertise;
-      if (bind.trim() !== '') payload.bind = bind.trim();
-      if (port.trim() !== '') payload.port = Number(port);
-      if (authToken.trim() !== '') payload.auth_token = authToken.trim();
-      if (healthInterval.trim() !== '') payload.health_check_interval_seconds = Number(healthInterval);
-      if (cooldown.trim() !== '') payload.cooldown_after_rate_limit_seconds = Number(cooldown);
-      payload.default_agent = defaultAgent;
-      payload.inference_mode = inferenceMode;
-      payload.log_format = logFormat;
-      const sm: Record<string, unknown> = { backend: smBackend, vault_addr: vaultAddr, vault_mount: vaultMount };
-      if (vaultToken.trim() !== '') sm.vault_token = vaultToken.trim();
-      payload.secret_manager = sm;
-      // Always send the current allowlist so a save reflects add/remove edits.
-      // Empty array = loopback-only (the default). Hot-applied server-side.
-      payload.allowed_origins = origins;
-      payload.novelty_gate_enabled = noveltyGate;
-      payload.miniapp_enabled = miniappEnabled;
-      payload.daily_digest = dailyDigest;
-      // An empty native time input must not be sent as "" — the gateway
-      // rejects an unparseable daily_digest_at outright (fail-closed).
-      payload.daily_digest_at = dailyDigestAt.trim() !== '' ? dailyDigestAt : '09:00';
-
-      await api.system.updateConfig(payload);
+      const res = await api.system.updateConfig(payload);
+      initialRef.current = current;
+      const restart = res?.restart_required ?? [];
+      if (restart.length > 0) useRestartRequiredStore.getState().add(restart);
       setAuthToken('');
       setVaultToken('');
+      setSmTokens({ onepassword_token: '', infisical_token: '' });
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch (e) {
@@ -277,7 +400,7 @@ export function SystemTab() {
         <SettingsCard>
           <SettingsRow
             label={intl.formatMessage({ id: 'settings.system.name' })}
-            description={intl.formatMessage({ id: 'settings.system.name.help' })}
+            description={`${intl.formatMessage({ id: 'settings.system.name.help' })} ${intl.formatMessage({ id: 'settings.system.name.restartNote' })}`}
             tier="text"
           >
             <Input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Office Gateway" maxLength={64} />
@@ -401,7 +524,7 @@ export function SystemTab() {
       {/* Rotation */}
       <SettingsSection title={intl.formatMessage({ id: 'settings.system.rotation' })}>
         <SettingsCard>
-          <SettingsRow label={intl.formatMessage({ id: 'settings.system.healthInterval' })} description={intl.formatMessage({ id: 'settings.system.healthInterval.help' })} tier="select">
+          <SettingsRow label={intl.formatMessage({ id: 'settings.system.healthInterval' })} description={`${intl.formatMessage({ id: 'settings.system.healthInterval.help' })} ${intl.formatMessage({ id: 'settings.restartNote' })}`} tier="select">
             <Input type="number" min={1} max={86400} value={healthInterval} onChange={(e) => setHealthInterval(e.target.value)} placeholder="60" />
           </SettingsRow>
           <SettingsRow label={intl.formatMessage({ id: 'settings.system.cooldown' })} description={intl.formatMessage({ id: 'settings.system.cooldown.help' })} tier="select">
@@ -429,7 +552,7 @@ export function SystemTab() {
           />
           <RowSelect
             label={intl.formatMessage({ id: 'settings.system.logFormat' })}
-            description={intl.formatMessage({ id: 'settings.system.logFormat.help' })}
+            description={`${intl.formatMessage({ id: 'settings.system.logFormat.help' })} ${intl.formatMessage({ id: 'settings.restartNote' })}`}
             value={logFormat}
             onChange={setLogFormat}
             options={logFormatOptions}
@@ -448,6 +571,15 @@ export function SystemTab() {
           />
         </SettingsCard>
       </SettingsSection>
+
+      {/* v1.68 (W2) — memory trust guard, tracing, GitHub tools, A2A trust */}
+      <TrustAndObservabilitySection values={extra} set={setExtraKey} otelCompiled={otelCompiled} isAdmin={isAdmin} />
+
+      {/* v1.68 (W2) — local-file roots for file_read / csv_read / xlsx_read */}
+      <FilesRootsSection values={extra} set={setExtraKey} />
+
+      {/* v1.68 (W2) — task sandbox + computer-use image */}
+      <SandboxSection values={extra} set={setExtraKey} />
 
       {/* S20 — Telegram Mini App approval screen. Off by default; needs an
           https dashboard URL to render a button at all. */}
@@ -516,6 +648,16 @@ export function SystemTab() {
                 </SettingsRow>
               </>
             )}
+            {/* v1.68: onepassword / infisical could be selected but never
+                configured — every secret:// lookup then failed closed. */}
+            <SecretBackendFields
+              backend={smBackend}
+              values={extra}
+              set={setExtraKey}
+              tokens={smTokens}
+              setToken={(k, v) => setSmTokens((prev) => ({ ...prev, [k]: v }))}
+              tokenSet={smTokenSet}
+            />
           </SettingsCard>
         </AdvancedSection>
       </SettingsSection>
@@ -558,4 +700,51 @@ export function SystemTab() {
       </div>
     </div>
   );
+}
+
+interface SystemSnapshotInput {
+  name: string;
+  mdnsAdvertise: boolean;
+  bind: string;
+  port: string;
+  healthInterval: string;
+  cooldown: string;
+  defaultAgent: string;
+  inferenceMode: string;
+  logFormat: string;
+  smBackend: string;
+  vaultAddr: string;
+  vaultMount: string;
+  origins: string[];
+  noveltyGate: boolean;
+  miniappEnabled: boolean;
+  dailyDigest: boolean;
+  dailyDigestAt: string;
+  extra: FlatValues;
+}
+
+/** Flatten the form into `system.update_config` param paths. Blank numeric
+ *  fields are left out entirely (never sent as 0 / NaN), exactly as before. */
+function snapshotSystem(v: SystemSnapshotInput): FlatValues {
+  const out: FlatValues = {
+    name: v.name,
+    mdns_advertise: v.mdnsAdvertise,
+    default_agent: v.defaultAgent,
+    inference_mode: v.inferenceMode,
+    log_format: v.logFormat,
+    'secret_manager.backend': v.smBackend,
+    'secret_manager.vault_addr': v.vaultAddr,
+    'secret_manager.vault_mount': v.vaultMount,
+    allowed_origins: v.origins,
+    novelty_gate_enabled: v.noveltyGate,
+    miniapp_enabled: v.miniappEnabled,
+    daily_digest: v.dailyDigest,
+    daily_digest_at: v.dailyDigestAt,
+    ...v.extra,
+  };
+  if (v.bind !== '') out.bind = v.bind;
+  if (v.port !== '') out.port = Number(v.port);
+  if (v.healthInterval !== '') out.health_check_interval_seconds = Number(v.healthInterval);
+  if (v.cooldown !== '') out.cooldown_after_rate_limit_seconds = Number(v.cooldown);
+  return out;
 }

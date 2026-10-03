@@ -31,7 +31,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "evolution_toggle",
-        description: "Toggle evolution engine flags for an agent; effective within seconds. Supports the standard flags plus the stagnation-detection sub-fields.",
+        description: "Toggle evolution engine flags for an agent; effective within seconds.",
         params: &[
             ParamDef {
                 name: "agent_id",
@@ -40,12 +40,12 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "field",
-                description: "gvu_enabled / skill_auto_activate / skill_security_scan (bool); max_silence_hours / skill_token_budget / max_active_skills (number); stagnation_* (see docs/guides/evolution-switches.md).",
+                description: "gvu_enabled (bool); max_silence_hours / skill_token_budget / max_active_skills (number).",
                 required: true,
             },
             ParamDef {
                 name: "value",
-                description: "New value: true/false (for booleans), a number (for numeric fields), or a string (for stagnation_action)",
+                description: "New value: true/false (for gvu_enabled) or a number",
                 required: true,
             },
         ],

@@ -94,7 +94,8 @@ pub fn missing_message(image: &str) -> String {
     )
 }
 
-/// Session-start text when Docker did not answer the presence check.
+/// Session-start text when Docker is unavailable (shared probe) or did not
+/// answer the presence check.
 pub fn unchecked_message(image: &str) -> String {
     format!(
         "電腦操作無法啟動：無法確認 image {image} 是否在本機（Docker 沒有回應）。\
@@ -129,12 +130,23 @@ pub enum Presence {
     Unknown,
 }
 
-/// `docker image inspect <image>`, bounded by [`IMAGE_INSPECT_TIMEOUT`].
-/// Never pulls. An invalid reference is reported as missing without running
+/// `docker image inspect <image>`, bounded by [`IMAGE_INSPECT_TIMEOUT`],
+/// after the shared Docker probe (`task_sandbox::container::docker_status`)
+/// says the daemon is usable; otherwise [`Presence::Unknown`]. Never pulls. An invalid reference is reported as missing without running
 /// Docker at all.
 pub async fn image_presence(image: &str) -> Presence {
     if !acceptable(image) {
         return Presence::Missing;
+    }
+    // A half-dead daemon fails `image inspect` with a non-zero exit, which
+    // would read as "image missing" and send the operator to `docker pull`.
+    // Ask the shared probe first so session start, doctor and the task
+    // sandbox agree on whether Docker is usable at all.
+    if let duduclaw_core::docker_probe::DockerStatus::Unavailable(why) =
+        crate::task_sandbox::container::docker_status().await
+    {
+        warn!(reason = why.code(), "computer-use image check skipped: Docker unavailable");
+        return Presence::Unknown;
     }
     let args = ["image", "inspect", "--format", "{{.Id}}", image];
     match crate::computer_use_orchestrator::docker_output(&args, IMAGE_INSPECT_TIMEOUT, "Image inspect")

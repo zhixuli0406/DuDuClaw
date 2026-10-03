@@ -83,19 +83,24 @@ pub(crate) async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> 
         });
     }
 
+    // v1.68: `stagnation_*`, `skill_auto_activate` and `skill_security_scan`
+    // had no reader (the live stagnation detector reads `gvu_stagnation_*`;
+    // the skill scanner always runs) and are no longer writable here.
+    if field.starts_with("stagnation_") || field == "skill_auto_activate" || field == "skill_security_scan" {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "{field} is no longer configurable — nothing read it. Nothing was changed."
+            )}]
+        });
+    }
+
     // Validate field name and apply to the correct TOML section.
-    let boolean_fields = ["gvu_enabled", "skill_auto_activate", "skill_security_scan"];
+    let boolean_fields = ["gvu_enabled"];
     let numeric_fields = [
         "max_silence_hours",
         "skill_token_budget",
         "max_active_skills",
     ];
-    // Stagnation-detection sub-section fields (prefix: stagnation_*).
-    // These map into [evolution.stagnation_detection] in the TOML.
-    let stagnation_bool_fields = ["stagnation_enabled"];
-    let stagnation_int_fields = ["stagnation_window_seconds", "stagnation_trigger_threshold"];
-    let stagnation_str_fields = ["stagnation_action"];
-
     let parse_bool = |s: &str| -> std::result::Result<bool, String> {
         match s {
             "true" | "1" | "yes" | "on" => Ok(true),
@@ -127,91 +132,10 @@ pub(crate) async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> 
                 "isError": true
             });
         }
-    } else if stagnation_bool_fields.contains(&field)
-        || stagnation_int_fields.contains(&field)
-        || stagnation_str_fields.contains(&field)
-    {
-        // Write into the [evolution.stagnation_detection] sub-table.
-        let sd_key = field.trim_start_matches("stagnation_");
-
-        // Ensure [evolution.stagnation_detection] sub-table exists.
-        if !evo.contains_key("stagnation_detection") {
-            evo.insert(
-                "stagnation_detection".to_string(),
-                toml::Value::Table(toml::Table::new()),
-            );
-        }
-        let sd = evo
-            .get_mut("stagnation_detection")
-            .unwrap()
-            .as_table_mut()
-            .unwrap();
-
-        if stagnation_bool_fields.contains(&field) {
-            match parse_bool(value_str) {
-                Ok(v) => {
-                    sd.insert(sd_key.to_string(), toml::Value::Boolean(v));
-                }
-                Err(e) => {
-                    return serde_json::json!({
-                        "content": [{"type": "text", "text": format!("Error: {e}")}],
-                        "isError": true
-                    });
-                }
-            }
-        } else if stagnation_int_fields.contains(&field) {
-            let int_val: i64 = match value_str.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    return serde_json::json!({
-                        "content": [{"type": "text", "text": format!("Error: '{field}' requires an integer value, got '{value_str}'")}],
-                        "isError": true
-                    });
-                }
-            };
-            // Range validation matching StagnationDetectionConfig::validate()
-            let range_err = match sd_key {
-                "window_seconds" if !(60..=604_800).contains(&int_val) => Some(format!(
-                    "stagnation_window_seconds must be 60–604800, got {int_val}"
-                )),
-                "trigger_threshold" if !(1..=1000).contains(&int_val) => Some(format!(
-                    "stagnation_trigger_threshold must be 1–1000, got {int_val}"
-                )),
-                _ => None,
-            };
-            if let Some(e) = range_err {
-                return serde_json::json!({
-                    "content": [{"type": "text", "text": format!("Error: {e}")}],
-                    "isError": true
-                });
-            }
-            sd.insert(sd_key.to_string(), toml::Value::Integer(int_val));
-        } else {
-            // stagnation_action: "log_only" | "suppress" (P1 reserved)
-            match value_str {
-                "log_only" | "suppress" => {
-                    sd.insert(
-                        sd_key.to_string(),
-                        toml::Value::String(value_str.to_owned()),
-                    );
-                }
-                other => {
-                    return serde_json::json!({
-                        "content": [{"type": "text", "text": format!(
-                            "Error: stagnation_action must be 'log_only' or 'suppress', got '{other}'"
-                        )}],
-                        "isError": true
-                    });
-                }
-            }
-        }
     } else {
         let all_fields: Vec<&str> = boolean_fields
             .iter()
             .chain(numeric_fields.iter())
-            .chain(stagnation_bool_fields.iter())
-            .chain(stagnation_int_fields.iter())
-            .chain(stagnation_str_fields.iter())
             .copied()
             .collect();
         return serde_json::json!({
@@ -273,36 +197,20 @@ pub(crate) async fn handle_evolution_status_tool(
     };
 
     let evo = &config.evolution;
-    let sd = &evo.stagnation_detection;
     let status = format!(
         "Evolution status for agent '{agent_id}':\n\
          \n\
          GVU self-play:     {}\n\
          Cognitive memory:  always on\n\
          \n\
-         Skill auto-activate:  {}\n\
-         Skill security scan:  {}\n\
          Skill token budget:   {}\n\
          Max active skills:    {}\n\
          \n\
-         Max silence hours:         {:.1}\n\
-         \n\
-         Stagnation detection:\n\
-           enabled:           {}\n\
-           window_seconds:    {} ({:.1}h)\n\
-           trigger_threshold: {}\n\
-           action:            {}",
+         Max silence hours:         {:.1}",
         evo.gvu_enabled,
-        evo.skill_auto_activate,
-        evo.skill_security_scan,
         evo.skill_token_budget,
         evo.max_active_skills,
         evo.max_silence_hours,
-        sd.enabled,
-        sd.window_seconds,
-        sd.window_seconds as f64 / 3600.0,
-        sd.trigger_threshold,
-        sd.action,
     );
 
     serde_json::json!({

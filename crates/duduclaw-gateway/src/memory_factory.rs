@@ -92,6 +92,16 @@ pub fn supersession_trust_guard_enabled_from_config(home_dir: &Path) -> bool {
         .unwrap_or(default)
 }
 
+/// `[memory] graph_embed_seed` / `graph_embed_seed_top_k` from
+/// `<home_dir>/config.toml` as engine retrieval weights (absent or unreadable
+/// ⇒ engine defaults). Shared by the gateway factory and the MCP server.
+pub fn retrieval_weights_from_config(home_dir: &Path) -> duduclaw_memory::engine::RetrievalWeights {
+    let table = std::fs::read_to_string(home_dir.join("config.toml"))
+        .ok()
+        .and_then(|c| c.parse::<toml::Table>().ok());
+    crate::handlers::memory_retrieval_weights_from_table(table.as_ref())
+}
+
 /// Open a `SqliteMemoryEngine` at `db_path`, honoring `[memory] novelty_gate`
 /// and `[memory] supersession_trust_guard` from `<home_dir>/config.toml`.
 ///
@@ -116,8 +126,11 @@ pub fn supersession_trust_guard_enabled_from_config(home_dir: &Path) -> bool {
 /// on next construction / process restart); this module makes no caching
 /// decision of its own.
 pub fn build_memory_engine(db_path: &Path, home_dir: &Path) -> Result<SqliteMemoryEngine> {
-    let engine = SqliteMemoryEngine::new(db_path)?
+    let mut engine = SqliteMemoryEngine::new(db_path)?
         .with_supersession_trust_guard(supersession_trust_guard_enabled_from_config(home_dir));
+    // `[memory] graph_embed_seed(_top_k)` (v1.68.0): agent recall now uses
+    // the same retrieval weights as the dashboard's memory search.
+    engine.retrieval_weights = retrieval_weights_from_config(home_dir);
     let engine = if novelty_gate_enabled_from_config(home_dir) {
         engine
             .with_embedder(Arc::new(NgramHashEmbedder::new()))
@@ -188,6 +201,22 @@ mod tests {
         )
         .unwrap();
         assert!(!supersession_trust_guard_enabled_from_config(dir.path()));
+    }
+
+    #[test]
+    fn factory_applies_graph_embed_seed() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("memory.db");
+        let e = build_memory_engine(&db, home.path()).unwrap();
+        assert!(!e.retrieval_weights.graph_embed_seed);
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[memory]\ngraph_embed_seed = true\ngraph_embed_seed_top_k = 9\n",
+        )
+        .unwrap();
+        let e = build_memory_engine(&db, home.path()).unwrap();
+        assert!(e.retrieval_weights.graph_embed_seed);
+        assert_eq!(e.retrieval_weights.graph_embed_seed_top_k, 9);
     }
 
     #[test]

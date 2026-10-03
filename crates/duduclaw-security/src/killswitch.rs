@@ -23,7 +23,9 @@ pub struct KillswitchConfig {
     pub failsafe: FailsafeConfig,
     pub safety_words: SafetyWordsConfig,
     pub defensive_prompt: DefensivePromptConfig,
-    pub audit: AuditConfig,
+    // v1.68.0: `[audit] enabled/path` removed — nothing ever wrote to that
+    // file (killswitch events go to `security_audit.jsonl`). Old files that
+    // still carry `[audit]` parse fine (unknown sections are ignored).
 }
 
 /// Trigger thresholds that cause escalation.
@@ -121,16 +123,6 @@ pub struct DefensivePromptConfig {
     pub languages: Vec<String>,
 }
 
-/// Audit logging configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AuditConfig {
-    /// Whether audit logging is enabled.
-    pub enabled: bool,
-    /// Path to the audit JSONL file (supports `~` expansion).
-    pub path: String,
-}
-
 // ── Defaults ───────────────────────────────────────────────────
 
 
@@ -204,15 +196,6 @@ impl Default for DefensivePromptConfig {
     }
 }
 
-impl Default for AuditConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            path: "~/.duduclaw/killswitch_audit.jsonl".to_string(),
-        }
-    }
-}
-
 // ── Loading ────────────────────────────────────────────────────
 
 impl KillswitchConfig {
@@ -258,24 +241,6 @@ impl KillswitchConfig {
             Ok(())
         } else {
             Err(warnings.join("; "))
-        }
-    }
-
-    /// Resolve the audit log path, expanding `~/.duduclaw/` to `home_dir`.
-    ///
-    /// `home_dir` is expected to be `~/.duduclaw/` (the DuDuClaw home directory).
-    pub fn resolved_audit_path(&self, home_dir: &Path) -> std::path::PathBuf {
-        if self.audit.path.starts_with("~/.duduclaw/") {
-            home_dir.join(&self.audit.path["~/.duduclaw/".len()..])
-        } else if self.audit.path.starts_with("~/") {
-            // Generic ~ expansion: treat home_dir's parent as the user home
-            if let Some(parent) = home_dir.parent() {
-                parent.join(&self.audit.path[2..])
-            } else {
-                home_dir.join(&self.audit.path[2..])
-            }
-        } else {
-            std::path::PathBuf::from(&self.audit.path)
         }
     }
 }
@@ -343,6 +308,7 @@ status = ["!CHECK"]
 enabled = false
 languages = ["en"]
 
+# A legacy `[audit]` section is ignored, not an error.
 [audit]
 enabled = true
 path = "/var/log/killswitch.jsonl"
@@ -350,7 +316,6 @@ path = "/var/log/killswitch.jsonl"
         let config: KillswitchConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.circuit_breaker.cooldown_secs, 120);
         assert!(!config.defensive_prompt.enabled);
-        assert_eq!(config.audit.path, "/var/log/killswitch.jsonl");
     }
 
     #[test]
@@ -368,13 +333,5 @@ path = "/var/log/killswitch.jsonl"
     fn load_missing_file_returns_default() {
         let config = KillswitchConfig::load(Path::new("/nonexistent/KILLSWITCH.toml"));
         assert_eq!(config.triggers.max_replies_per_minute, 10);
-    }
-
-    #[test]
-    fn audit_path_resolution() {
-        let config = KillswitchConfig::default();
-        let home = Path::new("/home/user/.duduclaw");
-        let resolved = config.resolved_audit_path(home);
-        assert_eq!(resolved, std::path::PathBuf::from("/home/user/.duduclaw/killswitch_audit.jsonl"));
     }
 }

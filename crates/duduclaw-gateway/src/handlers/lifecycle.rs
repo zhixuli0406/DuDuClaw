@@ -11,6 +11,16 @@ impl MethodHandler {
     /// Create a new handler with a custom extension (used by Pro binary).
     pub async fn with_extension(home_dir: PathBuf, extension: Arc<dyn GatewayExtension>) -> Self {
         let agents_dir = home_dir.join("agents");
+        // v1.68: one-time reset of scaffold-noise `false` permission flags
+        // (they are enforced from now on); runs before the registry scan so
+        // the scan sees the migrated files.
+        {
+            let home = home_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                super::agents_update_v168::migrate_all_agent_permissions(&home)
+            })
+            .await;
+        }
         let mut registry = AgentRegistry::new(agents_dir.clone());
         if let Err(e) = registry.scan().await {
             tracing::warn!("Failed to scan agents directory: {e}");
@@ -79,6 +89,7 @@ impl MethodHandler {
             ),
             forward_model: RwLock::new(None),
             tick_hub: RwLock::new(None),
+            tick_runtime: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -166,9 +177,11 @@ impl MethodHandler {
             duduclaw_redaction::spawn_gc(
                 m.vault().clone(),
                 m.audit_sink().clone(),
-                duduclaw_redaction::GcConfig::default(),
+                // `[redaction] purge_after_expire_days` (was always 30).
+                crate::redaction_sources::gc_config_for(m),
             )
         });
+        crate::redaction_sources::set_current(manager.clone());
         *self.redaction_manager.write().await = manager;
         *self.redaction_gc.lock().await = gc;
     }

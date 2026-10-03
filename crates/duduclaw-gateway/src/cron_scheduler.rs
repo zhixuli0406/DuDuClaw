@@ -434,14 +434,28 @@ async fn execute_cron_task(
     trigger_message: Option<&str>,
     invoker: &dyn AgentInvoker,
 ) {
-    let prompt = match trigger_message {
-        Some(m) if !m.trim().is_empty() => {
+    // RFC-23 `[redaction.sources] cron_context` (v1.68.0): the trigger
+    // context a condition script produced is data, like a tool result, and
+    // is redacted before it reaches the model (default mode `on`). The task
+    // text itself is the operator's instruction and is left as written.
+    // Fail closed: a redaction error skips this run.
+    let redaction = crate::redaction_sources::current();
+    let redaction_session = format!("cron:{}", task.id);
+    let prompt_result: Result<String, String> = match trigger_message {
+        Some(m) if !m.trim().is_empty() => crate::redaction_sources::redact_text(
+            redaction.as_ref(),
+            &task.agent_id,
+            Some(&redaction_session),
+            m,
+            &duduclaw_redaction::Source::CronContext,
+        )
+        .map(|m| {
             format!(
                 "[Scheduled Task: {}] {}\n\n[Trigger context] {}",
                 task.name, task.task, m
             )
-        }
-        _ => format!("[Scheduled Task: {}] {}", task.name, task.task),
+        }),
+        _ => Ok(format!("[Scheduled Task: {}] {}", task.name, task.task)),
     };
 
     // Wrap cron execution in DELEGATION_ENV scope so the Claude CLI subprocess
@@ -484,9 +498,14 @@ async fn execute_cron_task(
     let typing_guard = build_cron_typing_guard(home_dir, task).await;
 
     let dispatch_fut = crate::claude_runner::DELEGATION_ENV.scope(delegation_env, async {
-        invoker
-            .invoke(home_dir, registry, &task.agent_id, &prompt)
-            .await
+        match prompt_result {
+            Ok(prompt) => {
+                invoker
+                    .invoke(home_dir, registry, &task.agent_id, &prompt)
+                    .await
+            }
+            Err(e) => Err(format!("cron context withheld: {e}")),
+        }
     });
     let result = match reply_channel_override {
         Some(rc) => {
@@ -513,7 +532,15 @@ async fn execute_cron_task(
             // notify_* target, forward the response to that channel so
             // Discord/Telegram/LINE/Slack users receive it automatically.
             if task.has_notify_target() {
-                if let Err(e) = deliver_cron_result(home_dir, task, &response).await {
+                // Tokens minted for the trigger context go back to their
+                // real values for the operator's own channel.
+                let delivered = crate::redaction_sources::restore_for_user(
+                    redaction.as_ref(),
+                    &task.agent_id,
+                    Some(&redaction_session),
+                    response.clone(),
+                );
+                if let Err(e) = deliver_cron_result(home_dir, task, &delivered).await {
                     warn!(
                         id = %task.id,
                         name = %task.name,

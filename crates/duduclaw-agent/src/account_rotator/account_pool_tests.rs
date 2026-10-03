@@ -258,3 +258,36 @@ async fn pool_does_not_cross_provider_boundaries() {
     assert_eq!(sel.id, "anthropic-1");
     assert_eq!(sel.provider, "anthropic");
 }
+
+// ── v1.68.0: [[accounts]] tags ───────────────────────────────────
+
+#[test]
+fn tags_are_parsed_trimmed_and_bounded() {
+    let t: toml::Table = r#"tags = ["work", " team-a ", "", 3, "x"]"#.parse().unwrap();
+    assert_eq!(
+        super::load::parse_account_tags(&t),
+        vec!["work".to_string(), "team-a".to_string(), "x".to_string()]
+    );
+    let none: toml::Table = "id = \"a\"".parse().unwrap();
+    assert!(super::load::parse_account_tags(&none).is_empty());
+}
+
+#[test]
+fn pool_entry_matches_a_tag_exactly() {
+    let mut a = oauth("acct-1", 1);
+    a.tags = vec!["Sales".to_string()];
+    let b = oauth("acct-2", 1);
+    let avail = vec![&a, &b];
+    match narrow_by_pool(&avail, &pool(&["sales"])) {
+        PoolNarrowing::Applied(v) => {
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].id, "acct-1");
+        }
+        other => panic!("expected Applied, got {other:?}"),
+    }
+    // Substring of a tag never matches.
+    assert!(matches!(
+        narrow_by_pool(&avail, &pool(&["sale"])),
+        PoolNarrowing::FailedOpen
+    ));
+}

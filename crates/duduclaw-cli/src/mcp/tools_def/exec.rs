@@ -68,7 +68,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "skill_bank_search",
-        description: "[deprecated → skill_search source=\"bank\"; removed in v1.68.0] Search the skill bank for learned skills matching a query. Returns ranked results with confidence scores.",
+        description: "[deprecated → skill_search source=\"bank\"; removed in v1.69.0] Search the skill bank for learned skills matching a query. Returns ranked results with confidence scores.",
         params: &[
             ParamDef {
                 name: "query",

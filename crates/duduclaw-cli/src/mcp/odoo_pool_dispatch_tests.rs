@@ -239,6 +239,38 @@ async fn odoo_tool_without_override_falls_through_to_connection_check() {
     assert!(text.contains("not connected"), "got: {text}");
 }
 
+/// v1.68.0: a module switched off in `[odoo] features_*` refuses its tools
+/// (and generic tools on that module's models) before any connection.
+#[tokio::test(flavor = "current_thread")]
+async fn odoo_feature_switch_off_blocks_module_tools() {
+    let global = duduclaw_odoo::OdooConfig {
+        features_sale: false,
+        ..Default::default()
+    };
+    let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::new(global));
+    for (tool, params) in [
+        ("odoo_sale_orders", serde_json::json!({})),
+        ("odoo_search", serde_json::json!({ "model": "sale.order.line" })),
+    ] {
+        let result =
+            handle_odoo_tool(tool, &params, std::path::Path::new("/tmp"), &pool, "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(result["isError"].as_bool().unwrap_or(false), "{tool}");
+        assert!(text.contains("module 'sale' is switched off"), "{tool}: {text}");
+    }
+    // A module still on goes on to the connection check.
+    let result = handle_odoo_tool(
+        "odoo_crm_leads",
+        &serde_json::json!({}),
+        std::path::Path::new("/tmp"),
+        &pool,
+        "agnes",
+    )
+    .await;
+    let text = result["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("not connected"), "got: {text}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn two_agents_get_isolated_pool_slots() {
     let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());

@@ -8,9 +8,10 @@ import {
   type InferenceGeneration,
   type InferenceRouter,
   type InferenceOpenAiCompat,
+  type InferenceLlamafile,
 } from '@/lib/api';
 import { ChipEditor } from '@/components/shared/ChipEditor';
-import type { SelectOption } from '@/components/settings/controls';
+import { AdvancedSection, type SelectOption } from '@/components/settings/controls';
 import { toast, formatError, formatErrorDetail } from '@/lib/toast';
 import {
   Button,
@@ -25,12 +26,48 @@ import {
 import { RowText, RowSecret, RowSwitch, RowSelect, FieldBlock } from '@/pages/agent-form/form-rows';
 import { Cpu, Save, RefreshCw, Loader2, AlertTriangle } from 'lucide-react';
 
-/** Read a flat backend sub-section value as a string for the input field. */
-function asStr(v: unknown): string {
-  if (v === undefined || v === null) return '';
-  if (typeof v === 'string') return v;
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-  return '';
+/** v1.68 (W2): read `[llamafile]` into the typed form, dropping anything of
+ *  the wrong type instead of guessing. */
+export function llamafileFromConfig(section: unknown): InferenceLlamafile {
+  const o = section && typeof section === 'object' ? (section as Record<string, unknown>) : {};
+  const str = (k: string) => (typeof o[k] === 'string' ? (o[k] as string) : undefined);
+  const num = (k: string) => (typeof o[k] === 'number' && Number.isFinite(o[k]) ? (o[k] as number) : undefined);
+  return {
+    enabled: typeof o.enabled === 'boolean' ? o.enabled : undefined,
+    dir: str('dir'),
+    default_file: str('default_file'),
+    port: num('port'),
+    host: str('host'),
+    gpu_layers: num('gpu_layers'),
+    context_size: num('context_size'),
+    extra_args: Array.isArray(o.extra_args) ? o.extra_args.filter((x): x is string => typeof x === 'string') : undefined,
+  };
+}
+
+/** Keys with a value are sent; a key that had a stored value and is now
+ *  empty is sent as `null` so the gateway removes it (v1.68). Untouched empty
+ *  keys stay absent. */
+export function llamafileToUpdate(
+  l: InferenceLlamafile,
+  stored: InferenceLlamafile = {},
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const keys: (keyof InferenceLlamafile)[] = ['enabled', 'dir', 'default_file', 'port', 'host', 'gpu_layers', 'context_size', 'extra_args'];
+  const empty = (v: unknown) => v === undefined || v === '' || (Array.isArray(v) && v.length === 0);
+  for (const k of keys) {
+    const v = l[k];
+    if (!empty(v)) out[k] = v;
+    else if (!empty(stored[k])) out[k] = null;
+  }
+  return out;
+}
+
+/** `generation` without the two keys nothing reads any more (v1.68). */
+function generationForUpdate(g: InferenceGeneration): InferenceGeneration {
+  const { gpu_layers: _gl, context_size: _cs, ...rest } = g;
+  void _gl;
+  void _cs;
+  return rest;
 }
 
 /**
@@ -105,24 +142,11 @@ export function InferencePage() {
   const [ocApiKey, setOcApiKey] = useState(''); // only sent when non-empty
   const [ocApiKeySet, setOcApiKeySet] = useState(false);
 
-  // Generic flat backend sections — stored as string maps for editing.
-  // G8 (2026-09 feature audit): the `llmlingua` / `streaming_llm` sections were
-  // removed — the three-strategy compressor they configured left the inference
-  // crate in v1.33, so the dashboard was writing keys nothing reads.
-  const [llamafile, setLlamafile] = useState<Record<string, string>>({});
-  const [embedding, setEmbedding] = useState<Record<string, string>>({});
-
-  const toStrMap = (section: unknown): Record<string, string> => {
-    const out: Record<string, string> = {};
-    if (section && typeof section === 'object') {
-      for (const [k, v] of Object.entries(section as Record<string, unknown>)) {
-        // Arrays are not handled by this generic editor; skip them.
-        if (Array.isArray(v)) continue;
-        out[k] = asStr(v);
-      }
-    }
-    return out;
-  };
+  // v1.68 (W2): typed `[llamafile]` fields. The old raw-section editor could
+  // only edit keys already in the file, so a fresh install could not set any.
+  // The `[embedding]` raw section was removed: nothing reads it.
+  const [llamafile, setLlamafile] = useState<InferenceLlamafile>({});
+  const [engineReset, setEngineReset] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -140,8 +164,7 @@ export function InferencePage() {
       setOc({ base_url: ocIn.base_url ?? '', model: ocIn.model ?? '' });
       setOcApiKeySet(Boolean(ocIn.api_key_set));
       setOcApiKey('');
-      setLlamafile(toStrMap(res.llamafile));
-      setEmbedding(toStrMap(res.embedding));
+      setLlamafile(llamafileFromConfig(res.llamafile));
     } catch (e) {
       console.warn('[api]', e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
@@ -163,20 +186,6 @@ export function InferencePage() {
     router.fast_threshold != null &&
     router.strong_threshold >= router.fast_threshold;
 
-  /** Coerce a string map back to typed values (number/bool inference). */
-  const coerceMap = (m: Record<string, string>): Record<string, unknown> => {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(m)) {
-      if (v === '') continue;
-      if (v === 'true') out[k] = true;
-      else if (v === 'false') out[k] = false;
-      else if (/^-?\d+$/.test(v)) out[k] = Number(v);
-      else if (/^-?\d*\.\d+$/.test(v)) out[k] = Number(v);
-      else out[k] = v;
-    }
-    return out;
-  };
-
   const handleSave = async () => {
     if (strongGteFast) {
       toast.error(t('inference.router.thresholdError'));
@@ -191,10 +200,11 @@ export function InferencePage() {
         // stored removed backend is really cleared; an unchanged value is a
         // no-op server-side (`inf_validate_backend`).
         backend,
-        models_dir: modelsDir || undefined,
-        default_model: defaultModel || undefined,
+        // v1.68: a cleared field is sent as "" so the stored value is removed.
+        models_dir: modelsDir || (config?.models_dir ? '' : undefined),
+        default_model: defaultModel || (config?.default_model ? '' : undefined),
         auto_load: autoLoad,
-        generation: gen,
+        generation: generationForUpdate(gen),
         router,
         openai_compat: {
           base_url: oc.base_url || undefined,
@@ -202,14 +212,16 @@ export function InferencePage() {
           // Write-only: only send api_key when the operator typed one.
           ...(ocApiKey !== '' ? { api_key: ocApiKey } : {}),
         },
-        llamafile: coerceMap(llamafile),
-        embedding: coerceMap(embedding),
+        llamafile: llamafileToUpdate(llamafile, llamafileFromConfig(config?.llamafile)),
       };
-      await api.inference.update(payload);
+      const res = await api.inference.update(payload);
+      // v1.68: `engine_reset` = the cached engine was dropped, so channel
+      // replies and dispatch use the new settings from the next request.
+      setEngineReset(res?.engine_reset === true);
       setSaved(true);
       if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2500);
-      toast.success(t('inference.saved'));
+      toast.success(res?.engine_reset === true ? t('inference.engineReset') : t('inference.saved'));
       // Re-load so masked secret state / authoritative values refresh.
       await load();
     } catch (e) {
@@ -218,25 +230,6 @@ export function InferencePage() {
     } finally {
       setSaving(false);
     }
-  };
-
-  // Generic editor for a flat backend section (string map) — each key becomes a
-  // labelled SettingsRow; the section title + raw-config notice carry the rest.
-  const BackendSection = ({ title, map, set }: { title: string; map: Record<string, string>; set: (m: Record<string, string>) => void }) => {
-    const keys = Object.keys(map);
-    return (
-      <SettingsSection title={title} description={t('inference.backend.rawNotice')}>
-        {keys.length === 0 ? (
-          <p className="text-xs text-muted-foreground">{t('inference.backend.emptySection')}</p>
-        ) : (
-          <SettingsCard>
-            {keys.map((k) => (
-              <RowText key={k} label={k} value={map[k]} onChange={(v) => set({ ...map, [k]: v })} />
-            ))}
-          </SettingsCard>
-        )}
-      </SettingsSection>
-    );
   };
 
   // The only backend the inference engine can start is `openai_compat`
@@ -276,6 +269,13 @@ export function InferencePage() {
           </Button>
         </div>
       </div>
+
+      {engineReset && (
+        <div role="status" className="flex items-start gap-2 rounded-lg border border-success/40 bg-success/10 px-3 py-2.5 text-sm text-foreground" data-testid="engine-reset">
+          <RefreshCw className="mt-0.5 size-4 shrink-0 text-success" aria-hidden="true" />
+          <span>{t('inference.engineReset')}</span>
+        </div>
+      )}
 
       {saveError != null && (
         <div
@@ -359,6 +359,25 @@ export function InferencePage() {
             <FieldBlock label={t('inference.router.fastKeywords')}>
               <ChipEditor values={router.fast_keywords ?? []} onChange={(v) => setRouter((p) => ({ ...p, fast_keywords: v }))} placeholder="hi" addLabel={t('common.add')} />
             </FieldBlock>
+            {/* v1.68 (W2): router keys that had a reader but no control. */}
+            <AdvancedSection storageKey="inference.router.advanced" label={t('inference.router.advanced')}>
+              <SettingsCard>
+                <RowSwitch
+                  label={t('inference.router.localTools')}
+                  description={t('inference.router.localTools.hint')}
+                  checked={router.local_tools !== false}
+                  onChange={(v) => setRouter((p) => ({ ...p, local_tools: v }))}
+                />
+                <RowText label={t('inference.router.ucciFast')} description={t('inference.router.ucciPath.hint')} value={router.ucci_fast_router ?? ''} onChange={(v) => setRouter((p) => ({ ...p, ucci_fast_router: v.trim() }))} />
+                <RowText label={t('inference.router.ucciStrong')} description={t('inference.router.ucciPath.hint')} value={router.ucci_strong_router ?? ''} onChange={(v) => setRouter((p) => ({ ...p, ucci_strong_router: v.trim() }))} />
+                <RowText label={t('inference.router.ucciObservations')} description={t('inference.router.ucciObservations.hint')} value={router.ucci_observations ?? ''} onChange={(v) => setRouter((p) => ({ ...p, ucci_observations: v.trim() }))} />
+                <RowSwitch label={t('inference.router.ucciShadowStrong')} description={t('inference.router.ucciShadowStrong.hint')} checked={Boolean(router.ucci_shadow_strong)} onChange={(v) => setRouter((p) => ({ ...p, ucci_shadow_strong: v }))} />
+                <RowNumOpt label={t('inference.router.ucciShadowMaxInflight')} value={router.ucci_shadow_max_inflight} onChange={(n) => setRouter((p) => ({ ...p, ucci_shadow_max_inflight: n }))} min={1} max={16} />
+                <RowSwitch label={t('inference.router.ucciDropStopToken')} description={t('inference.router.ucciDropStopToken.hint')} checked={Boolean(router.ucci_drop_stop_token)} onChange={(v) => setRouter((p) => ({ ...p, ucci_drop_stop_token: v }))} />
+                <RowSwitch label={t('inference.gen.captureLogprobs')} description={t('inference.gen.captureLogprobs.hint')} checked={Boolean(gen.capture_logprobs)} onChange={(v) => setGen((p) => ({ ...p, capture_logprobs: v }))} />
+                <RowSwitch label={t('inference.gen.captureTopLogprobs')} checked={Boolean(gen.capture_top_logprobs)} onChange={(v) => setGen((p) => ({ ...p, capture_top_logprobs: v }))} />
+              </SettingsCard>
+            </AdvancedSection>
           </SettingsSection>
 
           {/* openai_compat (typed local backend) */}
@@ -376,9 +395,21 @@ export function InferencePage() {
             </SettingsCard>
           </SettingsSection>
 
-          {/* Generic flat backend sections */}
-          <BackendSection title="llamafile" map={llamafile} set={setLlamafile} />
-          <BackendSection title="embedding" map={embedding} set={setEmbedding} />
+          {/* v1.68 (W2): typed llamafile fields */}
+          <SettingsSection title={t('inference.section.llamafile')} description={t('inference.llamafile.desc')}>
+            <SettingsCard>
+              <RowSwitch label={t('inference.llamafile.enabled')} checked={Boolean(llamafile.enabled)} onChange={(v) => setLlamafile((p) => ({ ...p, enabled: v }))} />
+              <RowText label={t('inference.llamafile.dir')} description={t('inference.llamafile.dir.hint')} value={llamafile.dir ?? ''} onChange={(v) => setLlamafile((p) => ({ ...p, dir: v }))} placeholder="~/.duduclaw/llamafile" />
+              <RowText label={t('inference.llamafile.defaultFile')} value={llamafile.default_file ?? ''} onChange={(v) => setLlamafile((p) => ({ ...p, default_file: v }))} />
+              <RowText label={t('inference.llamafile.host')} value={llamafile.host ?? ''} onChange={(v) => setLlamafile((p) => ({ ...p, host: v }))} placeholder="127.0.0.1" />
+              <RowNumOpt label={t('inference.llamafile.port')} value={llamafile.port} onChange={(n) => setLlamafile((p) => ({ ...p, port: n }))} min={1} max={65535} />
+              <RowNumOpt label={t('inference.llamafile.gpuLayers')} description={t('inference.llamafile.gpuLayers.hint')} value={llamafile.gpu_layers} onChange={(n) => setLlamafile((p) => ({ ...p, gpu_layers: n }))} min={-1} />
+              <RowNumOpt label={t('inference.llamafile.contextSize')} value={llamafile.context_size} onChange={(n) => setLlamafile((p) => ({ ...p, context_size: n }))} min={256} />
+            </SettingsCard>
+            <FieldBlock label={t('inference.llamafile.extraArgs')} description={t('inference.llamafile.extraArgs.hint')}>
+              <ChipEditor values={llamafile.extra_args ?? []} onChange={(v) => setLlamafile((p) => ({ ...p, extra_args: v }))} placeholder="--threads 8" addLabel={t('common.add')} />
+            </FieldBlock>
+          </SettingsSection>
         </div>
       )}
     </div>

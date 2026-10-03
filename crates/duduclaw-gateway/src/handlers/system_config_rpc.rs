@@ -80,6 +80,12 @@ impl MethodHandler {
                 // Mask sensitive fields
                 match content.parse::<toml::Table>() {
                     Ok(mut table) => {
+                        // v1.68: whether a WebChat widget key is stored (never the key).
+                        let webchat_widget_key_set = table
+                            .get("webchat")
+                            .and_then(|w| w.get("widget_key"))
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|k| !k.is_empty());
                         Self::mask_sensitive_fields(&mut table);
                         Self::mask_keyed_secret_tables(&mut table);
                         let masked =
@@ -95,6 +101,7 @@ impl MethodHandler {
                                 "miniapp_enabled": miniapp_enabled,
                                 "daily_digest_enabled": digest_cfg.enabled,
                                 "daily_digest_at": digest_cfg.at.format("%H:%M").to_string(),
+                                "webchat_widget_key_set": webchat_widget_key_set,
                             }),
                         )
                     }

@@ -833,12 +833,12 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
                     .map(|a| a.config.agent.name.clone())
                     .unwrap_or_default()
             };
-            let reply = crate::chat_commands::handle_command(
+            let reply = crate::chat_commands::handle_command_for_sender(
                 &cmd,
                 &state.ctx,
+                "teams",
                 &session_id,
                 &agent_id,
-                true,
                 &sender_id,
             )
             .await;

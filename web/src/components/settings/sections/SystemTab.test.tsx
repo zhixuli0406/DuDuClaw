@@ -45,7 +45,7 @@ describe('<SystemTab> remote-access allowlist', () => {
 
     const input = screen.getByLabelText('Add a URL') as HTMLInputElement;
     fireEvent.change(input, { target: { value: 'new.example.com' } });
-    fireEvent.click(screen.getByRole('button', { name: /Add/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^Add$/i }));
 
     await waitFor(() => expect(screen.getByText('new.example.com')).toBeInTheDocument());
     // Draft input is cleared after adding.
@@ -69,7 +69,7 @@ describe('<SystemTab> remote-access allowlist', () => {
     // Add one, remove one → payload should reflect the net set.
     const input = screen.getByLabelText('Add a URL');
     fireEvent.change(input, { target: { value: 'added.example.com' } });
-    fireEvent.click(screen.getByRole('button', { name: /Add/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^Add$/i }));
     fireEvent.click(screen.getByLabelText('Remove box.tailnet.ts.net'));
 
     fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));

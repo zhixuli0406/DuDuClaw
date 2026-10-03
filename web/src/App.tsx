@@ -11,7 +11,6 @@ import { FirstRunGate } from './components/FirstRunGate';
 import { LoginPage } from './pages/LoginPage';
 import { useConnectionStore } from './stores/connection-store';
 import { useAuthStore } from './stores/auth-store';
-import { ApprovalModal } from './components/ApprovalModal';
 import { AppRouteRedirect, LegacyRouteRedirect } from './apps/AppRouteRedirect';
 import { useIsAppliance } from './hooks/useIsAppliance';
 
@@ -192,7 +191,10 @@ export function App() {
 
   return (
     <>
-      <ApprovalModal />
+      {/* v1.68 (W2): the global browser-approval modal was removed. Its
+          approve/deny called `browser.respond_approval`, which no gateway
+          ever served, and nothing emits `browser.approval_request` either.
+          Approvals live in the inbox (ApprovalBroker → approvals.decide). */}
       <Suspense fallback={<PageFallback />}>
         <Routes>
           <Route path="login" element={<LoginPage />} />

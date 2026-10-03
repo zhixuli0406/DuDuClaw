@@ -366,6 +366,9 @@ pub struct AccountStatus {
     pub email: String,
     pub subscription: String,
     pub label: String,
+    /// `[[accounts]] tags` (v1.68.0) — shown and edited in the dashboard,
+    /// matched by `agent.toml [model] account_pool`.
+    pub tags: Vec<String>,
     pub expires_at: Option<String>,
     pub days_until_expiry: Option<i64>,
     /// Credential state as a flat string (`ok` / `unverified` / `broken` /

@@ -9,6 +9,7 @@ import { SidebarProvider } from '@/components/mds';
 import { EditAgentPage } from './EditAgentPage';
 import { useAgentsStore } from '@/stores/agents-store';
 import { toast } from '@/lib/toast';
+import { useAuthStore } from '@/stores/auth-store';
 
 // Keep the live model registry out of the smoke test — the ModelSelect only
 // needs a stable, empty list here.
@@ -61,6 +62,12 @@ function renderAt(path: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // v1.68 — capability / org / sandbox fields are admin-only; these tests
+  // exercise them as an administrator (non-admin gating is covered in
+  // EditAgentPage.v168.test.tsx).
+  useAuthStore.setState({
+    user: { id: 'u-admin', email: 'a@b.c', display_name: 'Admin', role: 'admin', status: 'active' },
+  } as never);
   mockWsClient.call.mockResolvedValue({ ...DETAIL });
   useAgentsStore.setState({
     agents: [],
@@ -368,7 +375,9 @@ describe('EditAgentPage', () => {
   });
 
   describe('saved gemini provider survives an unrelated runtime edit', () => {
-    it('still sends provider "gemini" when only the fallback changes, and labels it deprecated', async () => {
+    // v1.68 partial writes: an untouched provider is not sent at all, so the
+    // saved gemini value cannot be replaced by the picker.
+    it('sends only the fallback when only the fallback changes, keeping gemini labelled deprecated', async () => {
       const user = userEvent.setup();
       const updateAgent = vi.fn().mockResolvedValue(undefined);
       useAgentsStore.setState({ updateAgent } as never);
@@ -386,7 +395,7 @@ describe('EditAgentPage', () => {
           expect(updateAgent).toHaveBeenCalledWith(
             'my-bot',
             expect.objectContaining({
-              runtime: expect.objectContaining({ provider: 'gemini', fallback: 'antigravity' }),
+              runtime: { fallback: 'antigravity' },
             }),
           );
         },
@@ -440,7 +449,7 @@ describe('EditAgentPage', () => {
           expect(updateAgent).toHaveBeenCalledWith(
             'my-bot',
             expect.objectContaining({
-              capabilities: expect.objectContaining({ git_credentials: true, computer_use_mode: 'native' }),
+              capabilities: { git_credentials: true },
             }),
           );
         },

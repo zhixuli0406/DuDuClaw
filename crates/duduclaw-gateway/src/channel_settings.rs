@@ -60,6 +60,10 @@ pub mod keys {
 /// split the settings store into two unreachable halves.
 pub const VALID_CHANNEL_TYPES: &[&str] = &[
     "discord", "telegram", "slack", "line", "whatsapp", "feishu", "wecom", "dingtalk",
+    // v1.68.0: Google Chat and Teams gained a real `admin_users` gate
+    // (`chat_commands::handle_command_for_sender`), so the list must be
+    // settable for them. "teams" matches the dashboard's channel id.
+    "googlechat", "teams",
 ];
 
 /// "Behavior" setting keys — response shape / routing, not access control.
@@ -267,6 +271,26 @@ impl ChannelSettingsManager {
         default.to_string()
     }
 
+    /// Non-empty value at `scope_id`, else the non-empty `global` value.
+    /// (Unlike [`Self::get_with_fallback`], an empty string counts as unset
+    /// at both levels, so clearing a per-guild value falls back to global.)
+    pub async fn get_scoped_or_global(
+        &self,
+        channel_type: &str,
+        scope_id: &str,
+        key: &str,
+    ) -> Option<String> {
+        if let Some(v) = self.get(channel_type, scope_id, key).await.filter(|v| !v.is_empty()) {
+            return Some(v);
+        }
+        if scope_id == "global" {
+            return None;
+        }
+        self.get(channel_type, "global", key)
+            .await
+            .filter(|v| !v.is_empty())
+    }
+
     /// Get a boolean setting with fallback.
     pub async fn get_bool(
         &self,
@@ -408,6 +432,29 @@ impl ChannelSettingsManager {
         allowed.iter().any(|id| id == channel_id)
     }
 
+    /// Group-chat gate shared by the webhook channels that carry group
+    /// context (Feishu, DingTalk; v1.68.0): `allowed_channels` (global
+    /// whitelist of group/chat ids, exact match) and `mention_only` (per
+    /// chat, else global). Direct messages are never filtered, as on LINE.
+    pub async fn group_message_allowed(
+        &self,
+        channel_type: &str,
+        chat_id: &str,
+        is_group: bool,
+        mentioned: bool,
+    ) -> bool {
+        if !is_group {
+            return true;
+        }
+        if !self.is_channel_allowed(channel_type, "global", chat_id).await {
+            return false;
+        }
+        let mention_only = self
+            .get_bool(channel_type, chat_id, keys::MENTION_ONLY, false)
+            .await;
+        !mention_only || mentioned
+    }
+
     /// Check if a guild/server is allowed. The guild whitelist lives at the
     /// GLOBAL scope only (a guild can't whitelist itself). Missing/empty list
     /// or corrupt JSON = allow all, matching the channel-whitelist semantics.
@@ -453,6 +500,61 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let mgr = ChannelSettingsManager::new(tmp.path()).unwrap();
         (tmp, mgr)
+    }
+
+    #[tokio::test]
+    async fn group_gate_applies_whitelist_and_mention_only_to_groups_only() {
+        let (_tmp, mgr) = temp_db();
+        // Nothing configured ⇒ everything passes.
+        assert!(mgr.group_message_allowed("feishu", "oc_1", true, false).await);
+        mgr.set("feishu", "global", keys::ALLOWED_CHANNELS, r#"["oc_1"]"#)
+            .await
+            .unwrap();
+        assert!(mgr.group_message_allowed("feishu", "oc_1", true, false).await);
+        assert!(!mgr.group_message_allowed("feishu", "oc_2", true, true).await);
+        // Prefix of an allowed id is not allowed.
+        assert!(!mgr.group_message_allowed("feishu", "oc_", true, true).await);
+        // DMs are never filtered.
+        assert!(mgr.group_message_allowed("feishu", "ou_dm", false, false).await);
+        mgr.set("feishu", "global", keys::MENTION_ONLY, "true").await.unwrap();
+        assert!(!mgr.group_message_allowed("feishu", "oc_1", true, false).await);
+        assert!(mgr.group_message_allowed("feishu", "oc_1", true, true).await);
+        // Per-chat override wins over global.
+        mgr.set("feishu", "oc_1", keys::MENTION_ONLY, "false").await.unwrap();
+        assert!(mgr.group_message_allowed("feishu", "oc_1", true, false).await);
+        // Other platforms unaffected.
+        assert!(mgr.group_message_allowed("dingtalk", "oc_2", true, false).await);
+    }
+
+    /// The dashboard writes `agent_override` at `global`; Discord reads per
+    /// guild. A guild value wins; otherwise the global one applies.
+    #[tokio::test]
+    async fn agent_override_falls_back_to_global() {
+        let (_tmp, mgr) = temp_db();
+        let k = keys::AGENT_OVERRIDE;
+        assert_eq!(mgr.get_scoped_or_global("discord", "g1", k).await, None);
+        mgr.set("discord", "global", k, "sales").await.unwrap();
+        assert_eq!(
+            mgr.get_scoped_or_global("discord", "g1", k).await.as_deref(),
+            Some("sales")
+        );
+        assert_eq!(
+            mgr.get_scoped_or_global("discord", "dm", k).await.as_deref(),
+            Some("sales")
+        );
+        mgr.set("discord", "g1", k, "support").await.unwrap();
+        assert_eq!(
+            mgr.get_scoped_or_global("discord", "g1", k).await.as_deref(),
+            Some("support")
+        );
+        // Clearing the guild value falls back again.
+        mgr.set("discord", "g1", k, "").await.unwrap();
+        assert_eq!(
+            mgr.get_scoped_or_global("discord", "g1", k).await.as_deref(),
+            Some("sales")
+        );
+        // Another platform's global value does not leak.
+        assert_eq!(mgr.get_scoped_or_global("telegram", "g1", k).await, None);
     }
 
     #[tokio::test]

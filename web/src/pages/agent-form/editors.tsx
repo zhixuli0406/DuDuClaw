@@ -1,16 +1,13 @@
 import { useIntl } from 'react-intl';
 import type {
-  ContainerEnvVar,
-  ContainerMount,
   ToolPolicyEffect,
   ToolPolicyOp,
   ToolPolicyRule,
   ToolPolicyWhen,
 } from '@/lib/api';
 import { SettingField, OptionSelect, Switch as ControlSwitch, type SelectOption } from '@/components/settings/controls';
-import { Button, Input } from '@/components/mds';
-import { Plus, Trash2, X } from 'lucide-react';
-import type { KvRow } from './defaults';
+import { Input } from '@/components/mds';
+import { Plus, X } from 'lucide-react';
 
 // Small shared editors for the Create / Edit Agent pages. Moved out of
 // AgentsPage.tsx when the two dialogs became standalone routes.
@@ -174,112 +171,3 @@ export function ToolPolicyEditor({
   );
 }
 
-// ── CT — additional_mounts table editor ──
-
-export function MountTable({ mounts, onChange }: { mounts: ReadonlyArray<ContainerMount>; onChange: (next: ContainerMount[]) => void }) {
-  const intl = useIntl();
-  const update = (idx: number, patch: Partial<ContainerMount>) =>
-    onChange(mounts.map((m, i) => (i === idx ? { ...m, ...patch } : m)));
-  const remove = (idx: number) => onChange(mounts.filter((_, i) => i !== idx));
-  const add = () => onChange([...mounts, { host: '', container: '', readonly: true }]);
-
-  return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between">
-        <h4 className="text-xs font-semibold uppercase text-muted-foreground">{intl.formatMessage({ id: 'agents.container.mounts' })}</h4>
-        <Button type="button" size="sm" variant="ghost" onClick={add}>
-          <Plus />
-          {intl.formatMessage({ id: 'common.add' })}
-        </Button>
-      </div>
-      <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'agents.container.mounts.hint' })}</p>
-      {mounts.length === 0 ? (
-        <p className="py-2 text-center text-xs text-muted-foreground">{intl.formatMessage({ id: 'agents.container.mounts.empty' })}</p>
-      ) : (
-        <div className="space-y-2">
-          {mounts.map((m, idx) => (
-            <div key={idx} className="flex items-center gap-2">
-              <Input value={m.host} onChange={(e) => update(idx, { host: e.target.value })} placeholder={intl.formatMessage({ id: 'agents.container.mounts.host' })} className="flex-1" />
-              <Input value={m.container} onChange={(e) => update(idx, { container: e.target.value })} placeholder={intl.formatMessage({ id: 'agents.container.mounts.container' })} className="flex-1" />
-              <label className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
-                <input type="checkbox" checked={m.readonly} onChange={(e) => update(idx, { readonly: e.target.checked })} className="accent-brand" />
-                {intl.formatMessage({ id: 'agents.container.mounts.readonly' })}
-              </label>
-              <Button type="button" size="icon-sm" variant="ghost" onClick={() => remove(idx)} className="shrink-0 text-destructive hover:bg-destructive/10 hover:text-destructive" aria-label="remove mount"><Trash2 /></Button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Advanced — generic key/value scalar table editor (G.8 ptc/prompt/cultural) ──
-
-export function KvTable({ title, rows, onChange }: { title: string; rows: ReadonlyArray<KvRow>; onChange: (next: KvRow[]) => void }) {
-  const intl = useIntl();
-  const update = (idx: number, patch: Partial<KvRow>) =>
-    onChange(rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
-  const remove = (idx: number) => onChange(rows.filter((_, i) => i !== idx));
-  const add = () => onChange([...rows, { key: '', value: '' }]);
-
-  return (
-    <div className="space-y-2 border-t border-surface-border pt-4">
-      <div className="flex items-center justify-between">
-        <h4 className="text-xs font-semibold uppercase text-muted-foreground">{title}</h4>
-        <Button type="button" size="sm" variant="ghost" onClick={add}>
-          <Plus />
-          {intl.formatMessage({ id: 'common.add' })}
-        </Button>
-      </div>
-      {rows.length === 0 ? (
-        <p className="py-1 text-center text-xs text-muted-foreground">{intl.formatMessage({ id: 'agents.adv.kv.empty' })}</p>
-      ) : (
-        <div className="space-y-2">
-          {rows.map((r, idx) => (
-            <div key={idx} className="flex items-center gap-2">
-              <Input value={r.key} onChange={(e) => update(idx, { key: e.target.value })} placeholder="key" className="flex-1" />
-              <Input value={r.value} onChange={(e) => update(idx, { value: e.target.value })} placeholder="value" className="flex-1" />
-              <Button type="button" size="icon-sm" variant="ghost" onClick={() => remove(idx)} className="shrink-0 text-destructive hover:bg-destructive/10 hover:text-destructive" aria-label="remove row"><Trash2 /></Button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── CT — env table editor ──
-
-export function EnvTable({ env, onChange }: { env: ReadonlyArray<ContainerEnvVar>; onChange: (next: ContainerEnvVar[]) => void }) {
-  const intl = useIntl();
-  const update = (idx: number, patch: Partial<ContainerEnvVar>) =>
-    onChange(env.map((e, i) => (i === idx ? { ...e, ...patch } : e)));
-  const remove = (idx: number) => onChange(env.filter((_, i) => i !== idx));
-  const add = () => onChange([...env, { key: '', value: '' }]);
-
-  return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between">
-        <h4 className="text-xs font-semibold uppercase text-muted-foreground">{intl.formatMessage({ id: 'agents.container.env' })}</h4>
-        <Button type="button" size="sm" variant="ghost" onClick={add}>
-          <Plus />
-          {intl.formatMessage({ id: 'common.add' })}
-        </Button>
-      </div>
-      {env.length === 0 ? (
-        <p className="py-2 text-center text-xs text-muted-foreground">{intl.formatMessage({ id: 'agents.container.env.empty' })}</p>
-      ) : (
-        <div className="space-y-2">
-          {env.map((e, idx) => (
-            <div key={idx} className="flex items-center gap-2">
-              <Input value={e.key} onChange={(ev) => update(idx, { key: ev.target.value })} placeholder="KEY" className="flex-1" />
-              <Input value={e.value} onChange={(ev) => update(idx, { value: ev.target.value })} placeholder="value" className="flex-1" />
-              <Button type="button" size="icon-sm" variant="ghost" onClick={() => remove(idx)} className="shrink-0 text-destructive hover:bg-destructive/10 hover:text-destructive" aria-label="remove env"><Trash2 /></Button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}

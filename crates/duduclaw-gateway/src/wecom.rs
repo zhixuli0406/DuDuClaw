@@ -626,12 +626,12 @@ async fn handle_message(msg_xml: &str, state: &Arc<WeComState>) {
                     .map(|a| a.config.agent.name.clone())
                     .unwrap_or_default()
             };
-            let reply = crate::chat_commands::handle_command(
+            let reply = crate::chat_commands::handle_command_for_sender(
                 &cmd,
                 &state.ctx,
+                "wecom",
                 &session_id,
                 &agent_id,
-                true,
                 &from_user,
             )
             .await;

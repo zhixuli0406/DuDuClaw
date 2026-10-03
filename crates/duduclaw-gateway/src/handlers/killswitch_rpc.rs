@@ -17,7 +17,9 @@ impl MethodHandler {
     /// `killswitch.update` — atomic write of `~/.duduclaw/KILLSWITCH.toml`.
     /// Params (all sub-sections optional, partial update):
     /// `{ triggers{}, circuit_breaker{}, failsafe{}, safety_words{},
-    /// defensive_prompt{}, audit{} }`. Response: `{ success, changes[] }`.
+    /// defensive_prompt{} }` (`audit{}` is ignored since v1.68.0; a
+    /// `triggers.<key>: null` disarms that trigger). Response:
+    /// `{ success, changes[] }`.
     pub(crate) async fn handle_killswitch_update(&self, params: Value) -> WsFrame {
         let path = self.home_dir.join("KILLSWITCH.toml");
         let mut table = self.read_config_table(&path).await;

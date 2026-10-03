@@ -182,19 +182,10 @@ impl AccountRotator {
             monthly_budget_cents: a.monthly_budget_cents,
             total_requests: a.total_requests,
             is_available: a.is_available(),
-            email: {
-                if a.email.contains('@') {
-                    let parts: Vec<&str> = a.email.splitn(2, '@').collect();
-                    let prefix = &parts[0][..parts[0].len().min(2)];
-                    format!("{}***@{}", prefix, parts.get(1).unwrap_or(&""))
-                } else if a.email.is_empty() {
-                    String::new()
-                } else {
-                    "***".to_string()
-                }
-            },
+            email: mask_email(&a.email),
             subscription: a.subscription.clone(),
             label: a.label.clone(),
+            tags: a.tags.clone(),
             expires_at: a.expires_at.clone(),
             days_until_expiry: a.days_until_expiry(),
             credential_state: a.credential_state,
@@ -238,5 +229,35 @@ impl AccountRotator {
             .iter()
             .find(|a| a.id == account_id)
             .and_then(|a| a.cooldown_until)
+    }
+}
+
+/// Mask an account e-mail for status output: first two characters of the
+/// local part, then `***@domain`. Char-based, so a non-ASCII local part
+/// (e.g. `王小明@…`) cannot panic on a byte boundary (v1.68.0; was a byte
+/// slice).
+pub(crate) fn mask_email(email: &str) -> String {
+    match email.split_once('@') {
+        Some((local, domain)) => {
+            let prefix: String = local.chars().take(2).collect();
+            format!("{prefix}***@{domain}")
+        }
+        None if email.is_empty() => String::new(),
+        None => "***".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod mask_email_tests {
+    use super::mask_email;
+
+    #[test]
+    fn masks_ascii_and_non_ascii_local_parts() {
+        assert_eq!(mask_email("alice@example.com"), "al***@example.com");
+        assert_eq!(mask_email("王小明@example.com"), "王小***@example.com");
+        assert_eq!(mask_email("é@x.tw"), "é***@x.tw");
+        assert_eq!(mask_email("@x.tw"), "***@x.tw");
+        assert_eq!(mask_email(""), "");
+        assert_eq!(mask_email("no-at-sign"), "***");
     }
 }

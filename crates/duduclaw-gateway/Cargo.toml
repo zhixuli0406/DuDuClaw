@@ -47,6 +47,9 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 cron = { workspace = true }
 axum = { workspace = true, features = ["multipart"] }
+# `Router::oneshot` for the always-mounted webhook slots (webhook_slots.rs) —
+# already in the tree via axum, same version as the dev-dependency below.
+tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 serde = { workspace = true }

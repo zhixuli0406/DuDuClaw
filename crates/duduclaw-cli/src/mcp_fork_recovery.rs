@@ -95,8 +95,43 @@ fn sync_tree(directory: &Path) -> io::Result<()> {
         let entry = entry?;
         let kind = entry.file_type()?;
         if kind.is_dir() { sync_tree(&entry.path())?; }
-        else if kind.is_file() { std::fs::File::open(entry.path())?.sync_all()?; }
+        else if kind.is_file() { sync_file(&entry.path())?; }
     }
     #[cfg(unix)] std::fs::File::open(directory)?.sync_all()?;
     Ok(())
+}
+
+/// Flush one archived file to disk.
+///
+/// Unix: `fsync` works on a read-only descriptor. Windows: `sync_all` is
+/// `FlushFileBuffers`, which requires a handle with write access — on the
+/// read-only handle `File::open` returns it fails with "Access is denied",
+/// which made every `Recovery::prepare` with a non-empty archive fail on
+/// Windows (publication then aborted before touching the parent; the four
+/// `mcp_fork_exec` publication tests that failed only on the Windows runner).
+/// Opening for write does not change content (no truncate). A copy that
+/// carries the read-only attribute (git object files keep it) is made
+/// writable just for the flush and restored afterwards; it is our private
+/// copy under `fork_recovery/`, never the branch or the parent.
+fn sync_file(path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    { std::fs::File::open(path)?.sync_all() }
+    #[cfg(windows)]
+    {
+        let flush = || std::fs::OpenOptions::new().write(true).open(path)?.sync_all();
+        match flush() {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                let mut permissions = std::fs::symlink_metadata(path)?.permissions();
+                if !permissions.readonly() { return Err(error); }
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                std::fs::set_permissions(path, permissions.clone())?;
+                let flushed = flush();
+                permissions.set_readonly(true);
+                let restored = std::fs::set_permissions(path, permissions);
+                flushed.and(restored)
+            }
+            other => other,
+        }
+    }
 }

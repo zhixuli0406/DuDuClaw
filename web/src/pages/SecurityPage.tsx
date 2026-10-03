@@ -9,6 +9,15 @@ import { ChipEditor } from '@/components/shared/ChipEditor';
 import { CredentialHygienePanel } from '@/components/CredentialHygienePanel';
 import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel';
 import { toast, formatError } from '@/lib/toast';
+import { useEffectiveSubtitle } from '@/lib/branding';
+import {
+  TRIGGER_KEYS,
+  enforcedFrom,
+  triggersPayload,
+  type TriggerEnabled,
+  type TriggerKey,
+} from '@/lib/killswitch-triggers';
+import type { KillswitchTriggers } from '@/lib/api';
 import {
   Card,
   CardHeader,
@@ -74,6 +83,8 @@ export function SecurityPage() {
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
   const [status, setStatus] = useState<SecurityStatus | null>(null);
+  // v1.68: a distributor subtitle replaces the default tagline.
+  const brandSubtitle = useEffectiveSubtitle();
   const connectionState = useConnectionStore((s) => s.state);
 
   useEffect(() => {
@@ -99,7 +110,7 @@ export function SecurityPage() {
           <Shield className="size-5 text-muted-foreground" />
           <div>
             <h1 className="text-base font-medium">{intl.formatMessage({ id: 'nav.security' })}</h1>
-            <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'app.subtitle' })}</p>
+            <p className="text-sm text-muted-foreground">{brandSubtitle ?? intl.formatMessage({ id: 'app.subtitle' })}</p>
           </div>
         </div>
       </div>
@@ -275,6 +286,11 @@ function KillswitchSection() {
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
   const [config, setConfig] = useState<KillswitchConfig | null>(null);
+  // v1.68: per-trigger "armed" state. Loaded from `triggers_enforced`; only
+  // armed triggers are sent, and only when they changed.
+  const [enabled, setEnabled] = useState<TriggerEnabled | null>(null);
+  const initialRef = useRef<{ triggers: KillswitchTriggers; enabled: TriggerEnabled } | null>(null);
+  const [enforcedKnown, setEnforcedKnown] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -283,7 +299,12 @@ function KillswitchSection() {
 
   const load = useCallback(async () => {
     try {
-      setConfig(await api.killswitch.get());
+      const cfg = await api.killswitch.get();
+      const en = enforcedFrom(cfg);
+      setConfig(cfg);
+      setEnabled(en);
+      setEnforcedKnown(cfg.triggers_enforced != null);
+      initialRef.current = { triggers: { ...cfg.triggers }, enabled: en };
     } catch (e) {
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     }
@@ -295,15 +316,28 @@ function KillswitchSection() {
   }, [connectionState, load]);
 
   const handleSave = async () => {
-    if (!config) return;
+    if (!config || !enabled || !initialRef.current) return;
     setSaving(true);
     try {
+      const triggers = triggersPayload(initialRef.current.triggers, initialRef.current.enabled, config.triggers, enabled);
+      const removed = TRIGGER_KEYS.filter((k) => triggers?.[k] === null);
       await api.killswitch.update({
-        triggers: config.triggers,
+        ...(triggers ? { triggers } : {}),
         circuit_breaker: config.circuit_breaker,
         safety_words: config.safety_words,
         defensive_prompt: config.defensive_prompt,
       });
+      // Re-read what is really enforced. A gateway that cannot remove a
+      // trigger keeps it armed — say so instead of showing it as off.
+      const fresh = await api.killswitch.get();
+      const freshEnabled = enforcedFrom(fresh);
+      setConfig(fresh);
+      setEnabled(freshEnabled);
+      setEnforcedKnown(fresh.triggers_enforced != null);
+      initialRef.current = { triggers: { ...fresh.triggers }, enabled: freshEnabled };
+      if (removed.some((k) => freshEnabled[k])) {
+        toast.error(intl.formatMessage({ id: 'killswitch.triggerRemoveUnsupported' }));
+      }
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch (e) {
@@ -334,19 +368,20 @@ function KillswitchSection() {
           {/* Triggers */}
           <div className="space-y-3">
             <h3 className="text-sm font-medium text-foreground">{intl.formatMessage({ id: 'killswitch.triggers' })}</h3>
+            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'killswitch.triggers.armHint' })}</p>
             <div className="grid gap-4 sm:grid-cols-2">
-              <Field label={intl.formatMessage({ id: 'killswitch.maxRepliesPerMinute' })} hint={intl.formatMessage({ id: 'killswitch.maxRepliesPerMinute.help' })}>
-                <Input type="number" min={1} max={10000} value={config.triggers.max_replies_per_minute} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, max_replies_per_minute: Number(e.target.value) } })} />
-              </Field>
-              <Field label={intl.formatMessage({ id: 'killswitch.maxConsecutiveErrors' })} hint={intl.formatMessage({ id: 'killswitch.maxConsecutiveErrors.help' })}>
-                <Input type="number" min={1} max={1000} value={config.triggers.max_consecutive_errors} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, max_consecutive_errors: Number(e.target.value) } })} />
-              </Field>
-              <Field label={intl.formatMessage({ id: 'killswitch.errorRateThreshold' })} hint={intl.formatMessage({ id: 'killswitch.errorRateThreshold.help' })}>
-                <Input type="number" min={0} max={1} step={0.01} value={config.triggers.error_rate_threshold} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, error_rate_threshold: Number(e.target.value) } })} />
-              </Field>
-              <Field label={intl.formatMessage({ id: 'killswitch.costLimitUsd' })} hint={intl.formatMessage({ id: 'killswitch.costLimitUsd.help' })}>
-                <Input type="number" min={0} step={0.01} value={config.triggers.cost_limit_usd} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, cost_limit_usd: Number(e.target.value) } })} />
-              </Field>
+              {TRIGGER_FIELDS.map((f) => (
+                <TriggerField
+                  key={f.key}
+                  field={f}
+                  value={config.triggers[f.key]}
+                  armed={enabled?.[f.key] ?? false}
+                  enforced={initialRef.current?.enabled[f.key] ?? false}
+                  enforcedKnown={enforcedKnown}
+                  onArm={(v) => enabled && setEnabled({ ...enabled, [f.key]: v })}
+                  onValue={(n) => setConfig({ ...config, triggers: { ...config.triggers, [f.key]: n } })}
+                />
+              ))}
             </div>
           </div>
 
@@ -439,12 +474,12 @@ function KillswitchSection() {
       message={
         config
           ? intl.formatMessage(
-              { id: 'confirm.security.killswitchImpact' },
+              { id: 'killswitch.confirmArmed' },
               {
-                maxReplies: config.triggers.max_replies_per_minute,
-                maxErrors: config.triggers.max_consecutive_errors,
-                errorRate: Math.round(config.triggers.error_rate_threshold * 100),
-                costLimit: config.triggers.cost_limit_usd,
+                triggers:
+                  TRIGGER_FIELDS.filter((f) => enabled?.[f.key])
+                    .map((f) => `${intl.formatMessage({ id: f.labelId })} ${config.triggers[f.key]}`)
+                    .join('、') || intl.formatMessage({ id: 'killswitch.confirmArmed.none' }),
                 cooldown: config.circuit_breaker.cooldown_secs,
               },
             )
@@ -457,6 +492,79 @@ function KillswitchSection() {
       busy={saving}
     />
     </>
+  );
+}
+
+// ── v1.68 trigger rows ──────────────────────────────────────────
+
+interface TriggerFieldSpec {
+  key: TriggerKey;
+  labelId: string;
+  helpId: string;
+  min: number;
+  max?: number;
+  step?: number;
+}
+
+const TRIGGER_FIELDS: readonly TriggerFieldSpec[] = [
+  { key: 'max_replies_per_minute', labelId: 'killswitch.maxRepliesPerMinute', helpId: 'killswitch.maxRepliesPerMinute.help', min: 1, max: 10000 },
+  { key: 'max_consecutive_errors', labelId: 'killswitch.maxConsecutiveErrors', helpId: 'killswitch.maxConsecutiveErrors.help', min: 1, max: 1000 },
+  { key: 'error_rate_threshold', labelId: 'killswitch.errorRateThreshold', helpId: 'killswitch.errorRateThreshold.help', min: 0, max: 1, step: 0.01 },
+  { key: 'cost_limit_usd', labelId: 'killswitch.costLimitUsd', helpId: 'killswitch.costLimitUsd.help', min: 0, step: 0.01 },
+];
+
+/** One trigger: an explicit 啟用 checkbox, the value (disabled while off) and
+ *  whether KILLSWITCH.toml enforces it right now. */
+function TriggerField({
+  field,
+  value,
+  armed,
+  enforced,
+  enforcedKnown,
+  onArm,
+  onValue,
+}: {
+  field: TriggerFieldSpec;
+  value: number;
+  armed: boolean;
+  enforced: boolean;
+  enforcedKnown: boolean;
+  onArm: (v: boolean) => void;
+  onValue: (n: number) => void;
+}) {
+  const intl = useIntl();
+  const label = intl.formatMessage({ id: field.labelId });
+  return (
+    <div className="space-y-1.5" data-testid={`trigger-${field.key}`}>
+      <div className="flex items-center justify-between gap-2">
+        <label className="flex items-center gap-2 text-sm font-medium text-foreground">
+          <input
+            type="checkbox"
+            className="size-4 accent-[var(--brand,currentColor)]"
+            checked={armed}
+            onChange={(e) => onArm(e.target.checked)}
+            aria-label={intl.formatMessage({ id: 'killswitch.trigger.arm' }, { name: label })}
+          />
+          {label}
+        </label>
+        {enforcedKnown && (
+          <span className={cn('text-xs', enforced ? 'text-destructive' : 'text-muted-foreground')}>
+            {intl.formatMessage({ id: enforced ? 'killswitch.trigger.enforced' : 'killswitch.trigger.unset' })}
+          </span>
+        )}
+      </div>
+      <Input
+        type="number"
+        min={field.min}
+        max={field.max}
+        step={field.step}
+        value={value}
+        disabled={!armed}
+        aria-label={label}
+        onChange={(e) => onValue(Number(e.target.value))}
+      />
+      <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: field.helpId })}</p>
+    </div>
   );
 }
 

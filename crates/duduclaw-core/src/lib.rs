@@ -19,6 +19,7 @@ pub mod data_migrations;
 pub mod delegation_policy;
 pub mod department;
 pub mod dispatch_guard;
+pub mod docker_probe;
 pub mod error;
 pub mod fs_lock;
 pub mod grounding;
@@ -39,7 +40,6 @@ pub mod provider_env;
 pub mod relay_protocol;
 pub mod runtime_catalog;
 pub mod sandbox_image;
-pub mod secaudit_config;
 pub mod sensitivity;
 pub mod spawn_admission;
 pub mod spawn_env;
@@ -114,7 +114,6 @@ pub use platform::{duduclaw_home, duduclaw_instance, expand_tilde, home_dir, mcp
 pub use provider_env::{
     provider_env_key_names, resolve_env_key as resolve_provider_env_key, KNOWN_PROVIDER_IDS,
 };
-pub use secaudit_config::SecauditConfig;
 pub use sensitivity::{is_private_session, perception_source_sensitivity, Sensitivity};
 // `try_admit_role_member` is `#[deprecated]` (no production caller, superseded
 // by `ephemeral::admit_role_member`); re-exported so the deprecation is visible

@@ -424,6 +424,56 @@ impl CommandStt {
     }
 }
 
+// ── Channel voice messages ──────────────────────────────────────
+
+/// A filename whose extension matches the audio's container (magic bytes),
+/// for providers that infer the format from the name.
+pub fn channel_audio_filename(audio: &[u8]) -> &'static str {
+    if audio.starts_with(b"OggS") {
+        "voice.ogg"
+    } else if audio.starts_with(b"\xff\xfb") || audio.starts_with(b"\xff\xf3") || audio.starts_with(b"ID3") {
+        "voice.mp3"
+    } else if audio.starts_with(b"RIFF") {
+        "voice.wav"
+    } else if audio.starts_with(b"fLaC") {
+        "voice.flac"
+    } else if audio.len() > 8 && &audio[4..8] == b"ftyp" {
+        "voice.m4a"
+    } else {
+        // Telegram voice notes are Opus-in-Ogg; LINE audio is m4a (caught above).
+        "voice.ogg"
+    }
+}
+
+/// Transcribe a voice message received on a channel (Telegram, LINE).
+///
+/// Uses the dashboard's 語音轉文字 settings (`[voice] stt_*`, the same
+/// provider `/api/stt` uses). Only when no STT provider is configured does
+/// it fall back to the legacy path: OpenAI Whisper with env
+/// `OPENAI_API_KEY`. A configured-but-invalid provider is an error, not a
+/// silent fallback. Before v1.68.0 channels always used the env path.
+pub async fn transcribe_channel_audio(
+    home_dir: &Path,
+    audio: &[u8],
+    language: Option<&str>,
+) -> Result<String, String> {
+    match build_provider_from_config(home_dir).await? {
+        Some(provider) => {
+            provider
+                .transcribe(audio, channel_audio_filename(audio), language)
+                .await
+        }
+        None => {
+            duduclaw_inference::whisper::transcribe(
+                audio,
+                language,
+                &duduclaw_inference::whisper::WhisperMode::Api,
+            )
+            .await
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -589,5 +639,44 @@ mod tests {
             err.contains("not found"),
             "expected a not-found error, got: {err}"
         );
+    }
+
+    #[test]
+    fn channel_audio_filename_follows_magic_bytes() {
+        assert_eq!(channel_audio_filename(b"OggS...."), "voice.ogg");
+        assert_eq!(channel_audio_filename(b"ID3....."), "voice.mp3");
+        assert_eq!(channel_audio_filename(b"RIFF...."), "voice.wav");
+        assert_eq!(channel_audio_filename(b"fLaC...."), "voice.flac");
+        assert_eq!(channel_audio_filename(b"\0\0\0\x20ftypM4A "), "voice.m4a");
+        assert_eq!(channel_audio_filename(b"??"), "voice.ogg");
+    }
+
+    /// Channel voice uses the dashboard STT provider when one is configured.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn channel_audio_uses_dashboard_stt_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[voice]\nstt_provider = \"command\"\nstt_command = \"cat {audio}\"\n",
+        )
+        .unwrap();
+        let text = transcribe_channel_audio(tmp.path(), b"hello transcript", Some("zh"))
+            .await
+            .unwrap();
+        assert_eq!(text, "hello transcript");
+    }
+
+    /// A configured but broken provider fails instead of falling back.
+    #[tokio::test]
+    async fn channel_audio_misconfigured_provider_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[voice]\nstt_provider = \"command\"\n",
+        )
+        .unwrap();
+        let err = transcribe_channel_audio(tmp.path(), b"x", None).await.unwrap_err();
+        assert!(err.contains("stt_command"), "{err}");
     }
 }

@@ -35,6 +35,11 @@ interface ToolCatalogPickerProps {
   selected: ReadonlyArray<string>;
   /** Called with a fresh array whenever a tool is added/removed. */
   onChange: (next: string[]) => void;
+  /** Which entry field is written into the list. Default `qualified`;
+   *  `name` for lists matched against bare MCP tool names (approval lists). */
+  valueKey?: 'qualified' | 'name';
+  /** Optional filter on which catalog entries are offered. */
+  filter?: (entry: BuiltinToolEntry) => boolean;
 }
 
 /**
@@ -44,7 +49,7 @@ interface ToolCatalogPickerProps {
  * wildcards still go there). New tools appear automatically because the catalog
  * comes from the single source of truth in `duduclaw-core`.
  */
-export function ToolCatalogPicker({ triggerLabel, selected, onChange }: ToolCatalogPickerProps) {
+export function ToolCatalogPicker({ triggerLabel, selected, onChange, valueKey = 'qualified', filter }: ToolCatalogPickerProps) {
   const intl = useIntl();
   const t = (id: string, def?: string) => intl.formatMessage({ id, defaultMessage: def ?? id });
   const [open, setOpen] = useState(false);
@@ -83,7 +88,9 @@ export function ToolCatalogPicker({ triggerLabel, selected, onChange }: ToolCata
     // offered as a NEW choice, but one that is already in this agent's
     // allow/deny list stays visible — hiding a selected entry would make the
     // list look shorter than the config actually is.
-    const offered = tools.filter((e) => !e.deprecated || selectedSet.has(e.qualified));
+    const offered = tools.filter(
+      (e) => (!filter || filter(e)) && (!e.deprecated || selectedSet.has(e[valueKey])),
+    );
     const filtered = q
       ? offered.filter(
           (e) =>
@@ -99,7 +106,7 @@ export function ToolCatalogPicker({ triggerLabel, selected, onChange }: ToolCata
       byCat.set(e.category, arr);
     }
     return Array.from(byCat.entries());
-  }, [tools, query, selectedSet]);
+  }, [tools, query, selectedSet, filter, valueKey]);
 
   const toggle = (qualified: string) => {
     if (selectedSet.has(qualified)) {
@@ -156,12 +163,12 @@ export function ToolCatalogPicker({ triggerLabel, selected, onChange }: ToolCata
                   {catLabel(cat)}
                 </div>
                 {entries.map((e) => {
-                  const isSel = selectedSet.has(e.qualified);
+                  const isSel = selectedSet.has(e[valueKey]);
                   return (
                     <button
                       key={e.qualified}
                       type="button"
-                      onClick={() => toggle(e.qualified)}
+                      onClick={() => toggle(e[valueKey])}
                       className={cn(
                         'flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted/60',
                         isSel && 'bg-brand/8',

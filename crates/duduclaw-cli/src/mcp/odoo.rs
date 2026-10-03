@@ -53,6 +53,20 @@ pub(crate) async fn handle_odoo_tool(
     // HTTP round-trip leaves the process when `agent.toml [odoo]
     // .allowed_models` / `.allowed_actions` doesn't cover it.
     if let Some((verb, model)) = classify_odoo_call(tool, params) {
+        // v1.68.0: the dashboard's 功能模組 switches (`[odoo] features_*`).
+        if let Err(module) = odoo.feature_gate(&model).await {
+            duduclaw_security::audit::append_tool_call(
+                home_dir,
+                caller_agent,
+                tool,
+                &format!("DENIED: {model}/{verb} — Odoo module '{module}' is switched off"),
+                false,
+            );
+            return mcp_error(&format!(
+                "Odoo module '{module}' is switched off in the dashboard (Odoo → 功能模組); \
+                 '{model}' is not available."
+            ));
+        }
         let cfg = odoo.agent_override(caller_agent).await;
         if let Err(reason) = crate::odoo_pool::check_action_permission(cfg.as_ref(), verb, &model) {
             // Audit the policy denial so operators can spot misconfigured

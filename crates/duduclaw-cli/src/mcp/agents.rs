@@ -223,16 +223,15 @@ pub(crate) async fn handle_create_agent(params: &Value, home_dir: &Path, caller_
         hard_stop = true
 
         [permissions]
-        can_create_agents = false
+        can_create_agents = true
         can_send_cross_agent = true
         can_modify_own_skills = true
         can_modify_own_soul = false
-        can_schedule_tasks = false
+        can_schedule_tasks = true
         allowed_channels = []
+        permissions_enforced_since = "1.68.0"
 
         [evolution]
-        skill_auto_activate = false
-        skill_security_scan = true
         gvu_enabled = true
         strategy = "balanced"
         max_silence_hours = 12.0

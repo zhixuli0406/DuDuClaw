@@ -240,6 +240,7 @@ impl MethodHandler {
             {
                 cfg.protocol = pr.to_string();
             }
+
             if let Some(am) = a
                 .get("auth_method")
                 .and_then(|v| v.as_str())
@@ -247,6 +248,14 @@ impl MethodHandler {
             {
                 cfg.auth_method = am.to_string();
             }
+        }
+        // v1.68.0: JSON-RPC only, same rule as `odoo.configure` — whether
+        // `xmlrpc` came from the agent override or the global config.
+        if cfg.protocol == "xmlrpc" {
+            return WsFrame::error_response(
+                "",
+                "XML-RPC is not supported: DuDuClaw connects to Odoo over JSON-RPC only",
+            );
         }
 
         if !cfg.is_configured() {

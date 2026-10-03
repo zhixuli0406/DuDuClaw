@@ -180,7 +180,8 @@ async fn agents_update_channel_tokens_are_enc_only_roundtrip() {
     // 2026-07 MED: the agents.update `set_channel_token` path used to
     // write plaintext + `_enc` and never strip. It now mirrors
     // channels.add: enc-only on successful encryption (keyfile-unavailable
-    // falls back to legacy plaintext), including wecom/dingtalk secrets.
+    // falls back to legacy plaintext). Since v1.68 only the per-agent
+    // telegram/discord/slack tokens are accepted.
     let home = tempfile::tempdir().expect("tempdir");
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
@@ -238,19 +239,8 @@ async fn agents_update_channel_tokens_are_enc_only_roundtrip() {
         "enc-only roundtrip must recover the original token"
     );
 
-    let wecom = channels["wecom"].as_table().unwrap();
-    // corp_id is an identifier → plaintext canonical copy.
-    assert_eq!(wecom["corp_id"].as_str(), Some("corp-id-plain"));
-    assert!(
-        !wecom.contains_key("corp_secret"),
-        "wecom secret must be enc-only"
-    );
-    assert!(wecom.contains_key("corp_secret_enc"));
-
-    let dingtalk = channels["dingtalk"].as_table().unwrap();
-    assert!(
-        !dingtalk.contains_key("app_secret"),
-        "dingtalk secret must be enc-only"
-    );
-    assert!(dingtalk.contains_key("app_secret_enc"));
+    // v1.68: per-agent WeCom / DingTalk credentials are no longer accepted
+    // (those channels read only the global config), so nothing is written.
+    assert!(!channels.contains_key("wecom"), "{channels:?}");
+    assert!(!channels.contains_key("dingtalk"), "{channels:?}");
 }

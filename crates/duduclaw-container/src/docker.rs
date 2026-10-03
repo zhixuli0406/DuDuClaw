@@ -360,31 +360,51 @@ impl ContainerRuntime for DockerRuntime {
         Ok(ContainerExit { exit_code, logs })
     }
 
+    /// The shared availability rule (`duduclaw_core::docker_probe`) over the
+    /// Docker API this runtime will use: `info` must carry a server version
+    /// and a one-item container list must succeed, each within
+    /// `PROBE_TIMEOUT`. `/_ping` alone is not trusted — a half-dead daemon
+    /// answers it while `/info` returns EOF. Never `Err`: every failure is an
+    /// unhealthy answer the caller reports as "sandbox unavailable".
     async fn health_check(&self) -> Result<RuntimeHealth> {
-        match self.client.ping().await {
-            Ok(_) => {
-                // Get system info for uptime
-                let info = self.client.info().await.map_err(|e| {
-                    DuDuClawError::Container(format!("Failed to get Docker info: {}", e))
-                })?;
+        use duduclaw_core::docker_probe::{Answer, PROBE_TIMEOUT, classify, classify_info, DockerStatus};
 
-                let containers_running = info.containers_running.unwrap_or(0) as u64;
-
-                Ok(RuntimeHealth {
-                    healthy: true,
-                    message: format!(
-                        "Docker daemon is healthy, {} containers running",
-                        containers_running
-                    ),
-                    uptime_seconds: 0, // Docker API does not expose daemon uptime directly
-                })
-            }
-            Err(e) => Ok(RuntimeHealth {
+        let info = tokio::time::timeout(PROBE_TIMEOUT, self.client.info()).await;
+        let version = match &info {
+            Ok(Ok(i)) => i.server_version.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        let info_answer = Some(Answer {
+            success: matches!(info, Ok(Ok(_))),
+            timed_out: info.is_err(),
+            stdout: &version,
+            stderr: "",
+        });
+        let status = if classify_info(info_answer).is_err() {
+            classify(info_answer, None)
+        } else {
+            let options = bollard::container::ListContainersOptions::<String> {
+                limit: Some(1),
+                ..Default::default()
+            };
+            let list = tokio::time::timeout(PROBE_TIMEOUT, self.client.list_containers(Some(options))).await;
+            classify(
+                info_answer,
+                Some(Answer { success: matches!(list, Ok(Ok(_))), timed_out: list.is_err(), stdout: "", stderr: "" }),
+            )
+        };
+        Ok(match status {
+            DockerStatus::Reachable { server_version } => RuntimeHealth {
+                healthy: true,
+                message: format!("Docker daemon is healthy (server {server_version})"),
+                uptime_seconds: 0, // Docker API does not expose daemon uptime directly
+            },
+            DockerStatus::Unavailable(why) => RuntimeHealth {
                 healthy: false,
-                message: format!("Docker daemon unreachable: {}", e),
+                message: format!("Docker daemon unavailable ({}): info / container list did not answer", why.code()),
                 uptime_seconds: 0,
-            }),
-        }
+            },
+        })
     }
 }
 

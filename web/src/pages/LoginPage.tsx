@@ -5,7 +5,7 @@ import { useAuthStore } from '@/stores/auth-store';
 import { Card, Button, Input, Spinner } from '@/components/mds';
 import { Field } from '@/components/onboarding';
 import { DuDu } from '@/components/mascot';
-import { useEffectiveName, useEffectiveLogo } from '@/lib/branding';
+import { useEffectiveName, useEffectiveLogo, useEffectiveSubtitle } from '@/lib/branding';
 
 type Mode = 'password' | 'otp';
 type OtpStep = 'email' | 'code';
@@ -17,6 +17,8 @@ export function LoginPage() {
   // module load; a white-label distributor sees their brand on the login page.
   const brandName = useEffectiveName();
   const brandLogo = useEffectiveLogo();
+  // v1.68: a distributor subtitle replaces the default tagline.
+  const brandSubtitle = useEffectiveSubtitle();
   const login = useAuthStore((s) => s.login);
   const otpRequest = useAuthStore((s) => s.otpRequest);
   const otpVerify = useAuthStore((s) => s.otpVerify);
@@ -173,8 +175,8 @@ export function LoginPage() {
             <DuDu face="waving" size={72} label="DuDu" />
           )}
           <h1 className="mt-3 text-base font-medium text-foreground">{brandName}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {intl.formatMessage({ id: 'login.subtitle' })}
+          <p className="mt-1 text-sm text-muted-foreground" data-testid="login-subtitle">
+            {brandSubtitle ?? intl.formatMessage({ id: 'login.subtitle' })}
           </p>
         </div>
 

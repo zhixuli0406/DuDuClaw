@@ -1506,7 +1506,11 @@ pub struct MountConfig {
 #[serde(rename_all = "snake_case")]
 pub struct ContainerConfig {
     pub timeout_ms: u64,
+    /// No reader (v1.68 audit). Defaulted so scaffolds need not write it.
+    #[serde(default)]
     pub max_concurrent: u32,
+    /// No reader (v1.68 audit). Defaulted so scaffolds need not write it.
+    #[serde(default)]
     pub readonly_project: bool,
     // Default-empty: template agent.toml files (free templates/ and premium
     // packs/kits) ship `[container]` sections without this key, and a missing
@@ -2328,7 +2332,14 @@ pub struct EvolutionConfig {
     /// deliberately NOT governed by it (see `docs/guides/evolution-switches.md`).
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// No reader (v1.68 audit): the prediction-error activation path never
+    /// consulted it. Kept, defaulted, so files that still carry it parse and
+    /// scaffolds no longer have to write it.
+    #[serde(default)]
     pub skill_auto_activate: bool,
+    /// No reader (v1.68 audit): the skill scanner always runs. Kept,
+    /// defaulted, for the same reason as `skill_auto_activate`.
+    #[serde(default = "default_true")]
     pub skill_security_scan: bool,
     /// External factors to include in reflections.
     #[serde(default)]
@@ -3574,25 +3585,21 @@ impl Default for PromptConfig {
     }
 }
 
-/// Legacy memory configuration — no longer consumed at runtime.
+/// Per-agent `[memory]` section.
 ///
-/// Retained so existing `agent.toml` files with a `[memory]` section
-/// can still be deserialized without errors. All fields are ignored.
+/// v1.68.0 removed the six MemGPT leftovers (`enabled`, `core_tokens`,
+/// `recall_tokens`, `archival_tokens`, `recall_auto_inject`,
+/// `archival_auto_retrieve`; MemGPT itself went in v1.8.1). Old `agent.toml`
+/// files that still carry them deserialize fine (unknown keys are ignored)
+/// and the keys are no longer written back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct MemoryConfig {
-    pub enabled: bool,
-    pub core_tokens: u32,
-    pub recall_tokens: u32,
-    pub archival_tokens: u32,
-    pub recall_auto_inject: u32,
-    pub archival_auto_retrieve: u32,
-
     // ── Formerly-untyped `[memory]` keys (R2 unification) ───────────────
     //
-    // Unlike the fields above these ARE consumed at runtime (RFC-24 decision
-    // continuity); they were read by `gateway::runtime_config`'s raw-TOML
-    // accessors. `skip_serializing_if` keeps the on-disk shape unchanged.
+    // These ARE consumed at runtime (RFC-24 decision continuity); they were
+    // read by `gateway::runtime_config`'s raw-TOML accessors.
+    // `skip_serializing_if` keeps the on-disk shape unchanged.
     /// RFC-24 decision continuity. Opt-in; missing ⇒ `false` (feature off).
     #[serde(default, deserialize_with = "crate::lenient::opt")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3610,12 +3617,6 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            core_tokens: 0,
-            recall_tokens: 0,
-            archival_tokens: 0,
-            recall_auto_inject: 0,
-            archival_auto_retrieve: 0,
             decision_continuity: None,
             decision_ttl_days: None,
         }

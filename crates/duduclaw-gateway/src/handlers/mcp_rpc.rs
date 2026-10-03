@@ -7,7 +7,7 @@ impl MethodHandler {
     // ── MCP Management ──────────────────────────────────────────
 
     pub(crate) async fn handle_mcp_list(&self) -> WsFrame {
-        use duduclaw_agent::mcp_template::{marketplace_catalog, read_mcp_config};
+        use duduclaw_agent::mcp_template::{marketplace_catalog, masked_env, read_mcp_config};
 
         let agents_dir = self.home_dir.join("agents");
         let mut agents = Vec::new();
@@ -30,11 +30,14 @@ impl MethodHandler {
                     .mcp_servers
                     .iter()
                     .map(|(k, v)| {
+                        // Env values may be literal secrets (marketplace
+                        // installs write them that way): answer with
+                        // set / not_set / reference per name, never the value.
                         json!({
                             "name": k,
                             "command": v.command,
                             "args": v.args,
-                            "env": v.env,
+                            "env": masked_env(&v.env),
                         })
                     })
                     .collect();
@@ -57,7 +60,7 @@ impl MethodHandler {
                     "default_def": {
                         "command": item.default_def.command,
                         "args": item.default_def.args,
-                        "env": item.default_def.env,
+                        "env": masked_env(&item.default_def.env),
                     },
                     "required_env": item.required_env,
                 })
@@ -69,7 +72,7 @@ impl MethodHandler {
 
     pub(crate) async fn handle_mcp_update(&self, params: &Value) -> WsFrame {
         use duduclaw_agent::mcp_template::{
-            McpServerDef, add_server_to_config, remove_server_from_config,
+            McpServerDef, add_server_to_config, apply_required_env, remove_server_from_config,
         };
 
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
@@ -96,7 +99,7 @@ impl MethodHandler {
 
         match action {
             "add" => {
-                let def: McpServerDef = match params.get("server_def") {
+                let mut def: McpServerDef = match params.get("server_def") {
                     Some(v) => match serde_json::from_value(v.clone()) {
                         Ok(d) => d,
                         Err(e) => {
@@ -112,6 +115,24 @@ impl MethodHandler {
                             "server_def is required for add action",
                         );
                     }
+                };
+                if let Err(e) = resolve_masked_env(&mut def.env, stored_server_env(&agent_dir, server_name).as_ref()) {
+                    return WsFrame::error_response("", &e);
+                }
+                // A catalogue server installed under its catalogue id must carry
+                // literal values for every required env name (see
+                // `apply_required_env`); refuse with the missing names.
+                let def = match self
+                    .full_marketplace_catalog()
+                    .await
+                    .into_iter()
+                    .find(|c| c.id == server_name && !c.required_env.is_empty())
+                {
+                    Some(item) => match apply_required_env(&def, &item.required_env, &Default::default()) {
+                        Ok(d) => d,
+                        Err(e) => return WsFrame::error_response("", &e),
+                    },
+                    None => def,
                 };
                 // Same fail-closed gate as mcp.import.install — spawning an MCP
                 // server runs a real process, so a shell/downloader definition
@@ -158,5 +179,72 @@ impl MethodHandler {
                 &format!("Unknown action: {action}. Use 'add' or 'remove'"),
             ),
         }
+    }
+}
+
+/// `mcp.list` shows env values as `set` / `not_set` / `reference`. When a
+/// dialog echoes those words back, they must never be written as values:
+/// `set` keeps the value already stored for that variable on this server (if
+/// there is a real one), `not_set` / `reference` are refused with the name.
+pub(crate) fn resolve_masked_env(
+    env: &mut std::collections::HashMap<String, String>,
+    stored: Option<&std::collections::HashMap<String, String>>,
+) -> Result<(), String> {
+    for (name, value) in env.iter_mut() {
+        match value.trim() {
+            "set" => {
+                let prev = stored
+                    .and_then(|s| s.get(name))
+                    .filter(|v| duduclaw_agent::mcp_template::env_value_status(v) == "set");
+                match prev {
+                    Some(v) => *value = v.clone(),
+                    None => {
+                        return Err(format!(
+                            "{name}: no stored value to keep — enter the real value"
+                        ));
+                    }
+                }
+            }
+            "not_set" | "reference" => {
+                return Err(format!(
+                    "{name}: \"{}\" is a status label, not a value — enter the real value",
+                    value.trim()
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The env of server `name` as stored in the agent's `.mcp.json`, if any.
+pub(crate) fn stored_server_env(
+    agent_dir: &std::path::Path,
+    name: &str,
+) -> Option<std::collections::HashMap<String, String>> {
+    duduclaw_agent::mcp_template::read_mcp_config(agent_dir)
+        .ok()
+        .and_then(|c| c.mcp_servers.get(name).map(|d| d.env.clone()))
+}
+
+#[cfg(test)]
+mod masked_env_tests {
+    use super::*;
+
+    #[test]
+    fn status_words_are_refused_or_restored() {
+        let stored: std::collections::HashMap<String, String> =
+            [("K".to_string(), "real-secret".to_string())].into_iter().collect();
+        let mut env: std::collections::HashMap<String, String> =
+            [("K".to_string(), "set".to_string())].into_iter().collect();
+        resolve_masked_env(&mut env, Some(&stored)).unwrap();
+        assert_eq!(env["K"], "real-secret");
+        let mut env: std::collections::HashMap<String, String> =
+            [("BROWSERBASE_API_KEY".to_string(), "not_set".to_string())].into_iter().collect();
+        let e = resolve_masked_env(&mut env, None).unwrap_err();
+        assert!(e.contains("BROWSERBASE_API_KEY"), "{e}");
+        let mut env: std::collections::HashMap<String, String> =
+            [("K".to_string(), "set".to_string())].into_iter().collect();
+        assert!(resolve_masked_env(&mut env, None).is_err());
     }
 }

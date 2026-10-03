@@ -146,12 +146,9 @@ pub struct GenerationParams {
     /// Stop sequences
     #[serde(default)]
     pub stop: Vec<String>,
-    /// Number of GPU layers to offload (-1 = all)
-    #[serde(default = "default_gpu_layers")]
-    pub gpu_layers: i32,
-    /// Context window size
-    #[serde(default = "default_context_size")]
-    pub context_size: u32,
+    // v1.68: `gpu_layers` / `context_size` were removed — only the deleted
+    // in-process llama.cpp backend read them (llamafile has its own copies in
+    // `[llamafile]`). Not `deny_unknown_fields`, so old files still load.
     /// Request per-token logprobs from the backend (OpenAI-compat `logprobs: true`).
     /// Used by the calibrated cascade router for post-hoc confidence. Backends
     /// that cannot return logprobs simply leave `InferenceResponse::mean_logprob`
@@ -175,12 +172,6 @@ fn default_temperature() -> f32 {
 fn default_top_p() -> f32 {
     0.9
 }
-fn default_gpu_layers() -> i32 {
-    -1
-}
-fn default_context_size() -> u32 {
-    4096
-}
 
 impl Default for GenerationParams {
     fn default() -> Self {
@@ -189,8 +180,6 @@ impl Default for GenerationParams {
             temperature: default_temperature(),
             top_p: default_top_p(),
             stop: Vec::new(),
-            gpu_layers: default_gpu_layers(),
-            context_size: default_context_size(),
             capture_logprobs: false,
             capture_top_logprobs: false,
             ucci_drop_stop_token: false,

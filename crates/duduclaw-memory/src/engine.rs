@@ -4716,6 +4716,9 @@ pub fn word_jaccard(a: &str, b: &str) -> f64 {
     if union == 0 { 0.0 } else { intersection as f64 / union as f64 }
 }
 
+mod namespace_migration;
+pub use namespace_migration::{MigrationDisposition, NamespaceRow, OnRefused};
+
 #[cfg(test)]
 mod tests {
     use super::*;

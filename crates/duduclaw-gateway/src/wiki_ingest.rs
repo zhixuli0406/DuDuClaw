@@ -2742,6 +2742,52 @@ pub(crate) async fn sweep_unreviewed_quarantine_before(
     .map_err(|e| format!("spawn_blocking: {e}"))?
 }
 
+/// Audit `path` for supersession refusals met by the operator's namespace
+/// migration (`duduclaw memory migrate-namespace assign`).
+pub const MIGRATION_AUDIT_PATH: &str = "namespace_migration";
+
+/// Max chars of a statement that can be held for review (a card shows it in
+/// full); the migration leaves longer refused rows in place.
+pub fn max_review_card_chars() -> usize {
+    MAX_FACT_CONTENT_CHARS
+}
+
+/// File the review cards for claims an operator's namespace migration held
+/// in `agent_id` (rows converted in place by
+/// `SqliteMemoryEngine::migrate_namespace_rows`), plus one
+/// `memory_supersession_refused` audit row each (`path: namespace_migration`).
+/// Cards go through the same builder and approval kind as a distilled claim,
+/// so approving promotes the claim with operator authority and denying
+/// discards it. The per-employee daily review cap is not consumed: the move
+/// is an operator action, not an employee write. Best-effort like every
+/// other card path; returns how many held rows were handed to the card path.
+pub async fn file_migration_held_claims(
+    home_dir: &Path,
+    memory_db: &Path,
+    agent_id: &str,
+    held: &[(String, duduclaw_memory::SupersessionRefusal)],
+) -> usize {
+    let mut outcomes = Vec::new();
+    for (id, refusal) in held {
+        audit_supersession_refused(home_dir, agent_id, MIGRATION_AUDIT_PATH, refusal, Some(id), false);
+        outcomes.push(QuarantineOutcome {
+            origin: refusal.write_origin.clone(),
+            subject: refusal.subject.clone(),
+            reason: trust_held_reason(refusal),
+            snippet: String::new(),
+            ids: vec![id.clone()],
+            disposition: DISPOSITION_TRUST_HELD,
+            held: Some(HeldClaimDetail {
+                subject_label: held_subject_label(&refusal.subject, &refusal.predicate),
+                existing_content: String::new(),
+                newly_held: true,
+            }),
+        });
+    }
+    dispatch_quarantine_side_effects(agent_id, home_dir, memory_db, &outcomes, None).await;
+    outcomes.len()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

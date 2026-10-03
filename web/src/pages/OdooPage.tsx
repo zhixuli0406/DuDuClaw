@@ -49,7 +49,9 @@ export function OdooPage() {
   // Connection config
   const [url, setUrl] = useState('');
   const [db, setDb] = useState('');
-  const [protocol, setProtocol] = useState('jsonrpc');
+  // v1.68: the 通訊協定 select is gone — the connector only speaks JSON-RPC
+  // and the gateway now refuses `xmlrpc` instead of saving a value nothing read.
+  const protocol = 'jsonrpc';
   const [authMethod, setAuthMethod] = useState('api_key');
   const [username, setUsername] = useState('');
   const [apiKey, setApiKey] = useState('');
@@ -123,7 +125,6 @@ export function OdooPage() {
       if (configRes) {
         setUrl(configRes.url ?? '');
         setDb(configRes.db ?? '');
-        setProtocol(configRes.protocol ?? 'jsonrpc');
         setAuthMethod(configRes.auth_method ?? 'api_key');
         setUsername(configRes.username ?? '');
         setPollEnabled(configRes.poll_enabled ?? false);
@@ -296,10 +297,6 @@ export function OdooPage() {
     return m.model.toLowerCase().includes(q) || m.name.toLowerCase().includes(q);
   });
 
-  const protocolOptions: SelectOption[] = [
-    { value: 'jsonrpc', label: 'JSON-RPC' },
-    { value: 'xmlrpc', label: 'XML-RPC' },
-  ];
   const authOptions: SelectOption[] = [
     { value: 'api_key', label: t('odoo.authApiKey') },
     { value: 'password', label: t('odoo.authPassword') },
@@ -357,7 +354,6 @@ export function OdooPage() {
         <SettingsCard>
           <RowText label={t('odoo.url')} value={url} onChange={setUrl} placeholder="https://mycompany.odoo.com" tier="text" />
           <RowText label={t('odoo.db')} value={db} onChange={setDb} placeholder="mycompany" tier="text" />
-          <RowSelect label={t('odoo.protocol')} value={protocol} onChange={setProtocol} options={protocolOptions} />
           <RowSelect label={t('odoo.authMethod')} value={authMethod} onChange={setAuthMethod} options={authOptions} />
           <RowText label={t('odoo.username')} value={username} onChange={setUsername} placeholder="admin@mycompany.com" tier="text" />
           {authMethod === 'api_key' ? (
@@ -490,7 +486,7 @@ export function OdooPage() {
       </SettingsSection>
 
       {/* Feature modules */}
-      <SettingsSection title={t('odoo.features')} description={t('odoo.featuresDesc')}>
+      <SettingsSection title={t('odoo.features')} description={`${t('odoo.featuresDesc')} ${t('odoo.featuresBlockNote')}`}>
         <SettingsCard>
           {FEATURE_MODULES.map((key) => (
             <RowSwitch

@@ -58,6 +58,10 @@ impl MethodHandler {
             // Absent on older gateways ⇒ the web treats it as `true`, i.e.
             // byte-identical to the behaviour before this field existed.
             "decision_enabled": crate::decision_gate::DecisionConfig::from_home(&self.home_dir).enabled,
+            // v1.68: whether this binary was built with the `otel` feature.
+            // Without it `[telemetry] otlp_endpoint` is accepted and saved but
+            // exports nothing, so the settings page says so next to the field.
+            "otel_compiled": cfg!(feature = "otel"),
         })
     }
 

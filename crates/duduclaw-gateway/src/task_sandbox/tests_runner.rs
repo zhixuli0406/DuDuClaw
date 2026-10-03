@@ -27,7 +27,8 @@ impl Fixture {
     }
 }
 
-/// A fake `docker`: answers `version` / `image inspect`, records `create`
+/// A fake `docker`: answers the availability probe (`info` + `ps --last`) /
+/// `image inspect`, records `create`
 /// argv and the secret values it received by environment, replays
 /// `events.ndjson` on `start`, then runs `tail`.
 fn fixture(events: &[Value], tail: &str, image_present: bool) -> Fixture {
@@ -45,7 +46,8 @@ fn fixture(events: &[Value], tail: &str, image_present: bool) -> Fixture {
     let client = tools.join("docker");
     std::fs::write(&client, format!(
         "#!/bin/sh\nd=\"${{0%/*}}\"\ncase \"$1\" in\n\
-         version) echo 27.3.1;;\n\
+         info) echo 27.3.1;;\n\
+         ps) case \"$*\" in *--last*) ;; *) exit 3;; esac;;\n\
          image) {inspect};;\n\
          create) for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$d/create.args\"; \
 printf '%s|' \"$ANTHROPIC_API_KEY\" \"$OPENAI_API_KEY\" \"$CODEX_API_KEY\" \"$XAI_API_KEY\" \"$GEMINI_API_KEY\" > \"$d/keys\"; printf '%064d\\n' 1;;\n\
@@ -511,7 +513,10 @@ async fn task_cleanup_failure_is_audited() {
     let fx = fixture(&[claude_result("final reply")], "exit 0", true);
     let client = fx.tools.join("docker");
     let script = std::fs::read_to_string(&client).unwrap();
-    let script = script.replacen("rm) printf", "ps) printf '%064d\\n' 1;;\n         rm) exit 1; printf", 1);
+    // The container is still listed after `rm` fails (the probe's
+    // `ps --last 1` keeps answering empty).
+    let script = script.replacen("*) exit 3;; esac;;", "*) printf '%064d\\n' 1;; esac;;", 1);
+    let script = script.replacen("rm) printf", "rm) exit 1; printf", 1);
     assert!(script.contains("rm) exit 1"), "fixture rewritten");
     std::fs::write(&client, script).unwrap();
     let err = go(&fx, RuntimeType::Claude, "anthropic", "sk-ant-fake-0123456789", 30).await.unwrap_err();
@@ -557,4 +562,68 @@ async fn sweep_drains_a_large_backlog_in_bounded_batches() {
     assert!(report.failures.is_empty(), "no list_invalid: {report:?}");
     assert_eq!(std::fs::read_to_string(tools.join("removed")).unwrap().lines().count(), MAX_REMOVALS_PER_SWEEP);
     assert!(runs.join(&last_run).exists(), "a deferred container's directory is kept");
+}
+
+/// Install a fake `docker` client whose body is `script` (POSIX sh).
+fn fake_docker(script: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let client = dir.path().join("docker");
+    std::fs::write(&client, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+    DOCKER_PROGRAM.with(|p| *p.borrow_mut() = Some(client));
+    dir
+}
+
+/// The 2026-10-03 shape: the daemon still answers `/_ping` (`version`
+/// works here too) but `info` and `ps` return EOF. Unavailable.
+#[tokio::test]
+async fn docker_probe_half_dead_daemon_is_unavailable() {
+    use duduclaw_core::docker_probe::{DockerStatus, Unavailable};
+    let _dir = fake_docker(
+        "case \"$1\" in\n version) echo 27.3.1;;\n \
+         info) echo 'error during connect: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/info\": EOF' >&2; exit 1;;\n \
+         ps) echo 'error during connect: EOF' >&2; exit 1;;\n *) exit 3;;\nesac",
+    );
+    assert_eq!(super::container::docker_status().await, DockerStatus::Unavailable(Unavailable::InfoFailed));
+    assert!(!super::container::docker_reachable().await);
+}
+
+/// `info` answers but the container list fails: still unavailable.
+#[tokio::test]
+async fn docker_probe_list_failure_is_unavailable() {
+    use duduclaw_core::docker_probe::{DockerStatus, Unavailable};
+    let _dir = fake_docker("case \"$1\" in\n info) echo 27.3.1;;\n ps) exit 1;;\n *) exit 3;;\nesac");
+    assert_eq!(super::container::docker_status().await, DockerStatus::Unavailable(Unavailable::ListFailed));
+}
+
+/// `info` exits 0 but prints nothing usable (some CLI versions do this when
+/// the server half of `info` failed): unavailable.
+#[tokio::test]
+async fn docker_probe_empty_info_is_unavailable() {
+    use duduclaw_core::docker_probe::{DockerStatus, Unavailable};
+    let _dir = fake_docker("case \"$1\" in\n info) echo;;\n ps) ;;\n *) exit 3;;\nesac");
+    assert_eq!(super::container::docker_status().await, DockerStatus::Unavailable(Unavailable::EmptyInfo));
+}
+
+/// A healthy daemon: reachable, with its version.
+#[tokio::test]
+async fn docker_probe_healthy_daemon_is_reachable() {
+    use duduclaw_core::docker_probe::DockerStatus;
+    let _dir = fake_docker("case \"$1\" in\n info) echo 27.3.1;;\n ps) ;;\n *) exit 3;;\nesac");
+    assert_eq!(
+        super::container::docker_status().await,
+        DockerStatus::Reachable { server_version: "27.3.1".into() }
+    );
+}
+
+/// The task sandbox refuses a run against a half-dead daemon with its own
+/// reason code, before touching anything else.
+#[tokio::test]
+async fn half_dead_docker_makes_the_task_sandbox_unavailable() {
+    let fx = fixture(&[claude_result("final reply")], "exit 0", true);
+    let client = fx.tools.join("docker");
+    let script = std::fs::read_to_string(&client).unwrap();
+    std::fs::write(&client, script.replacen("info) echo 27.3.1;;", "info) echo EOF >&2; exit 1;;", 1)).unwrap();
+    let err = go(&fx, RuntimeType::Claude, "anthropic", "sk-ant-fake-0123456789", 30).await.unwrap_err();
+    assert!(matches!(err, SandboxError::Unavailable(Unavailable::DockerUnreachable)), "{err:?}");
 }

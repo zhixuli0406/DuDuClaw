@@ -283,6 +283,22 @@ fn resume_needs_acl_check(stored_agent: &str, default_agent: &str) -> bool {
     stored_agent != default_agent
 }
 
+/// Whether a WebChat caller may run admin-gated chat commands. Mirrors the
+/// other channels' `admin_users` gate (an explicit admin list, no manager
+/// tier): only an **active dashboard account with the Admin role**. A
+/// public-widget visitor (`widget-visitor:…`) is never an admin, and any
+/// lookup failure denies (fail closed).
+fn webchat_command_admin(user_db: &UserDb, auth_user: &str) -> bool {
+    if auth_user.starts_with("widget-visitor:") {
+        return false;
+    }
+    matches!(
+        user_db.get_user(auth_user),
+        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active
+            && u.role == duduclaw_auth::UserRole::Admin
+    )
+}
+
 /// Load `user_id`'s role + full agent-binding set from the auth DB — the one
 /// DB round-trip `WebChatState::agent_access_allowed` performs on a cache
 /// miss.
@@ -998,8 +1014,13 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         // a verified Admin/Manager here — `handle_rules_off`
                                         // correctly refuses with "use the dashboard" rather
                                         // than guessing at an identity.
+                                        // v1.68.0: admin-gated commands (`!STOP ALL`,
+                                        // `!RESUME`, `/model <x>`) need an active
+                                        // dashboard Admin account — never a
+                                        // public-widget visitor (was hardcoded `true`).
+                                        let is_admin = webchat_command_admin(&state.user_db, &auth_user);
                                         let reply = crate::chat_commands::handle_command(
-                                            &cmd, &state.ctx, sid, effective_agent_id, true, "",
+                                            &cmd, &state.ctx, sid, effective_agent_id, is_admin, "",
                                         ).await;
                                         let done = ChatMessage::AssistantDone {
                                             content: reply,
@@ -2077,6 +2098,42 @@ mod tests {
         assert_eq!(snap.role, UserRole::Employee);
         assert!(snap.bound_agents.contains("sales-bot"));
         assert!(!snap.bound_agents.contains("other-bot"));
+    }
+
+    /// v1.68.0: WebChat admin-gated commands — Admin accounts only; managers,
+    /// employees, unknown ids and public-widget visitors are refused.
+    #[test]
+    fn webchat_command_admin_only_for_active_admin_accounts() {
+        let (_jwt, db, _dir) = fixtures();
+        let admin = db
+            .create_user("ad@example.com", "Ad", "pw-strong-123", UserRole::Admin)
+            .unwrap();
+        let manager = db
+            .create_user("mg@example.com", "Mg", "pw-strong-123", UserRole::Manager)
+            .unwrap();
+        let employee = db
+            .create_user("em@example.com", "Em", "pw-strong-123", UserRole::Employee)
+            .unwrap();
+        assert!(webchat_command_admin(&db, &admin.id));
+        assert!(!webchat_command_admin(&db, &manager.id));
+        assert!(!webchat_command_admin(&db, &employee.id));
+        assert!(!webchat_command_admin(&db, "no-such-user"));
+        assert!(!webchat_command_admin(&db, "widget-visitor:1234"));
+    }
+
+    /// A real widget-authenticated identity is never an admin, even when its
+    /// id would otherwise be looked up.
+    #[test]
+    fn webchat_widget_visitor_is_never_admin() {
+        let (_jwt, db, _dir) = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[webchat]\npublic_widget = true\nwidget_key = \"0123456789abcdef\"\n",
+        )
+        .unwrap();
+        let visitor = widget_authenticate(dir.path(), "0123456789abcdef").unwrap();
+        assert!(!webchat_command_admin(&db, &visitor));
     }
 
     #[test]

@@ -341,6 +341,23 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
+    // 通道→行為「允許的頻道」/「只在被 @ 時回覆」 (v1.68.0). Feishu marks group
+    // chats with `chat_type = "group"` and lists @-mentions in `mentions`
+    // (the bot's own mention is not singled out, so any mention counts).
+    let is_group = message.get("chat_type").and_then(|v| v.as_str()) == Some("group");
+    let mentioned = message
+        .get("mentions")
+        .and_then(|v| v.as_array())
+        .is_some_and(|m| !m.is_empty());
+    if !state
+        .ctx
+        .channel_settings
+        .group_message_allowed("feishu", chat_id, is_group, mentioned)
+        .await
+    {
+        return;
+    }
+
     // WP1.3: download a file/image resource via the message resource API
     // (Bearer tenant token) into the resolved agent's dir.
     let mut attachment_lines: Vec<String> = Vec::new();
@@ -400,12 +417,12 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
                     .map(|a| a.config.agent.name.clone())
                     .unwrap_or_default()
             };
-            let reply = crate::chat_commands::handle_command(
+            let reply = crate::chat_commands::handle_command_for_sender(
                 &cmd,
                 &state.ctx,
+                "feishu",
                 &session_id,
                 &agent_id,
-                true,
                 sender,
             )
             .await;

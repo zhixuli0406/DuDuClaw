@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type AgentInfo, type MarketplaceServer } from '@/lib/api';
+import { RequiredEnvFields, missingRequiredEnv, requiredEnvPayload } from '@/components/shared/RequiredEnvFields';
 import {
   Badge,
   Button,
@@ -140,6 +141,9 @@ export function MarketplacePage() {
   const [agents, setAgents] = useState<ReadonlyArray<AgentInfo>>([]);
   const [installTarget, setInstallTarget] = useState<string | null>(null);
   const [installAgent, setInstallAgent] = useState('');
+  // v1.68: typed values for the target item's required env names. Cleared
+  // as soon as the dialog closes or the install succeeds.
+  const [envValues, setEnvValues] = useState<Record<string, string>>({});
   const [installing, setInstalling] = useState(false);
   const [loadError, setLoadError] = useState<unknown>(null);
 
@@ -194,6 +198,9 @@ export function MarketplacePage() {
     });
   }, [query, category, servers]);
 
+  const requiredEnv = servers.find((s) => s.id === installTarget)?.required_env ?? [];
+  const envMissing = missingRequiredEnv(requiredEnv, envValues).length > 0;
+
   // Installing requires a target agent — open a picker dialog first.
   const handleInstall = (serverId: string) => {
     setInstallError(null);
@@ -201,11 +208,12 @@ export function MarketplacePage() {
   };
 
   const confirmInstall = async () => {
-    if (!installTarget || !installAgent) return;
+    if (!installTarget || !installAgent || envMissing) return;
     setInstalling(true);
     setInstallError(null);
     try {
-      await api.marketplace.install(installTarget, installAgent);
+      await api.marketplace.install(installTarget, installAgent, requiredEnvPayload(requiredEnv, envValues));
+      setEnvValues({});
       setInstallTarget(null);
       // Refetch so installed_by reflects the new `.mcp.json` state.
       await load();
@@ -335,7 +343,7 @@ export function MarketplacePage() {
       )}
 
       {/* Install target agent picker */}
-      <Dialog open={installTarget !== null} onOpenChange={(o) => !o && setInstallTarget(null)}>
+      <Dialog open={installTarget !== null} onOpenChange={(o) => { if (!o) { setInstallTarget(null); setEnvValues({}); } }}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{intl.formatMessage({ id: 'marketplace.install' })}</DialogTitle>
@@ -369,12 +377,13 @@ export function MarketplacePage() {
                 </SelectContent>
               </Select>
             </Field>
+            <RequiredEnvFields required={requiredEnv} values={envValues} onChange={setEnvValues} />
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setInstallTarget(null)}>
+            <Button variant="outline" onClick={() => { setInstallTarget(null); setEnvValues({}); }}>
               {intl.formatMessage({ id: 'common.cancel' })}
             </Button>
-            <Button variant="brand" onClick={confirmInstall} disabled={installing || !installAgent}>
+            <Button variant="brand" onClick={confirmInstall} disabled={installing || !installAgent || envMissing}>
               {installing
                 ? intl.formatMessage({ id: 'common.saving' })
                 : intl.formatMessage({ id: 'marketplace.install' })}

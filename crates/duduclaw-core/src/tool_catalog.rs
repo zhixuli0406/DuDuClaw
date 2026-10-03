@@ -57,12 +57,12 @@ pub struct ToolCatalogEntry {
     /// *uncallable*, which is the opposite of what a deprecation window is for
     /// — but the dashboard should not offer it as a new choice, and its
     /// description carries a `[deprecated → …]` prefix. Removal target
-    /// v1.68.0; the full old→new table is `docs/guides/deprecations.md`.
+    /// v1.69.0; the full old→new table is `docs/guides/deprecations.md`.
     pub deprecated: bool,
 }
 
 /// MCP tool names that are deprecated aliases of a merged entry point
-/// (T5/O3 · O4 · O13, feature audit 2026-09-29). Removal target: **v1.68.0**.
+/// (T5/O3 · O4 · O13, feature audit 2026-09-29). Removal target: **v1.69.0**.
 ///
 /// Kept as a separate list rather than a fifth tuple column so adding or
 /// retiring a deprecation is a one-line diff instead of a 245-row rewrite.

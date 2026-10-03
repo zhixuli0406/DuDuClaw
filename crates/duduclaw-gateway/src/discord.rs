@@ -1634,7 +1634,15 @@ async fn handle_message_create(
     let mut created_thread = false;
     let reply_channel_id = if auto_thread && !is_thread && !guild_id.is_empty() {
         // Create a thread from this message
-        match create_thread(http, token, channel_id, message_id, clean_content).await {
+        // 通道→行為「討論串自動封存時間」 (per guild, else global; v1.68.0).
+        let archive_minutes = thread_archive_minutes(
+            &settings
+                .get_with_fallback("discord", scope_id, keys::THREAD_ARCHIVE_MINUTES, "1440")
+                .await,
+        );
+        match create_thread(http, token, channel_id, message_id, clean_content, archive_minutes)
+            .await
+        {
             Some(thread_id) => {
                 created_thread = true;
                 thread_id
@@ -1770,10 +1778,10 @@ async fn handle_message_create(
     // ── Resolve effective agent ──
     // Per-agent bot binding wins; otherwise a guild-level `/agent` override
     // (AGENT_OVERRIDE, written by the slash command / select menu) applies.
-    let guild_agent_override = if agent_name.is_none() && !guild_id.is_empty() {
-        match settings
-            .get("discord", scope_id, keys::AGENT_OVERRIDE)
-            .await
+    // v1.68.0: the dashboard's 「指定 AI 員工」 writes the `global` scope; it
+    // now applies (to guilds and DMs) wherever no per-guild value is set.
+    let guild_agent_override = if agent_name.is_none() {
+        match settings.get_scoped_or_global("discord", scope_id, keys::AGENT_OVERRIDE).await
         {
             Some(name) if !name.is_empty() => {
                 let reg = ctx.registry.read().await;
@@ -2003,12 +2011,22 @@ fn strip_bot_mention(text: &str, bot_id: &str) -> String {
 }
 
 /// Create a thread from a message. Returns the thread channel_id.
+/// Discord's allowed `auto_archive_duration` values (minutes). Anything
+/// else (unset, malformed) is the 24 h default.
+fn thread_archive_minutes(raw: &str) -> u32 {
+    match raw.trim().parse::<u32>() {
+        Ok(m @ (60 | 1440 | 4320 | 10080)) => m,
+        _ => 1440,
+    }
+}
+
 async fn create_thread(
     http: &reqwest::Client,
     token: &str,
     channel_id: &str,
     message_id: &str,
     content: &str,
+    archive_minutes: u32,
 ) -> Option<String> {
     // Thread name: first 97 chars, filter control characters (safe for CJK multi-byte)
     let name: String = content
@@ -2029,7 +2047,7 @@ async fn create_thread(
         .header("Authorization", format!("Bot {token}"))
         .json(&json!({
             "name": name,
-            "auto_archive_duration": 1440 // 24 hours
+            "auto_archive_duration": archive_minutes
         }))
         .send()
         .await
@@ -3219,5 +3237,21 @@ mod reply_context_tests {
         let block = discord_reply_context(&data, "BOT1").expect("quote block");
         assert!(block.contains("附件訊息"));
         assert!(block.contains("amy"));
+    }
+}
+
+#[cfg(test)]
+mod thread_archive_tests {
+    use super::thread_archive_minutes;
+
+    #[test]
+    fn archive_minutes_accepts_only_discord_values() {
+        assert_eq!(thread_archive_minutes("60"), 60);
+        assert_eq!(thread_archive_minutes("4320"), 4320);
+        assert_eq!(thread_archive_minutes(" 10080 "), 10080);
+        assert_eq!(thread_archive_minutes("1440"), 1440);
+        assert_eq!(thread_archive_minutes("30"), 1440);
+        assert_eq!(thread_archive_minutes(""), 1440);
+        assert_eq!(thread_archive_minutes("abc"), 1440);
     }
 }

@@ -152,11 +152,71 @@ pub(super) async fn client_probe(args: &[&str]) -> Option<String> {
         .map(|o| o.stdout)
 }
 
-/// `docker version` answers with a server version: the daemon is reachable.
+/// The shared Docker availability probe (`duduclaw_core::docker_probe`):
+/// `docker info` must name a server version AND `docker ps` must succeed,
+/// each within [`duduclaw_core::docker_probe::PROBE_TIMEOUT`]. A daemon that
+/// answers `/_ping` but returns EOF for `/info` or the list is unavailable.
+///
+/// Every surface — `duduclaw doctor`'s Docker / 任務沙箱 / 電腦操作 rows, the
+/// task sandbox before a run, a computer-use session start — calls this, and
+/// the answer is reused for [`STATUS_TTL`] so rows printed in one doctor run
+/// cannot disagree. Each surface keeps its own wording.
+pub async fn docker_status() -> duduclaw_core::docker_probe::DockerStatus {
+    docker_status_detail().await.0
+}
+
+/// [`docker_status`] plus, when unavailable, the first stderr line of the
+/// failing request (e.g. `unknown flag: --limit`) for doctor output.
+pub async fn docker_status_detail() -> (duduclaw_core::docker_probe::DockerStatus, Option<String>) {
+    #[cfg(test)]
+    if DOCKER_PROGRAM.with(|p| p.borrow().is_some()) {
+        // Fake clients differ per test thread: never share a memo with them.
+        return probe_docker_uncached().await;
+    }
+    type Memo = Option<(Instant, (duduclaw_core::docker_probe::DockerStatus, Option<String>))>;
+    static MEMO: std::sync::Mutex<Memo> = std::sync::Mutex::new(None);
+    if let Ok(memo) = MEMO.lock() {
+        if let Some((at, status)) = memo.as_ref() {
+            if at.elapsed() < STATUS_TTL {
+                return status.clone();
+            }
+        }
+    }
+    let status = probe_docker_uncached().await;
+    if let Ok(mut memo) = MEMO.lock() {
+        *memo = Some((Instant::now(), status.clone()));
+    }
+    status
+}
+
+/// How long one [`docker_status`] answer is reused.
+pub const STATUS_TTL: Duration = Duration::from_secs(5);
+
+async fn probe_docker_uncached() -> (duduclaw_core::docker_probe::DockerStatus, Option<String>) {
+    use duduclaw_core::docker_probe::{
+        Answer, INFO_ARGS, LIST_ARGS, PROBE_TIMEOUT, classify, classify_info, failure_detail,
+    };
+    fn answer(o: &ProcessOutput) -> Answer<'_> {
+        Answer {
+            success: o.status.success() && !o.output_truncated,
+            timed_out: o.timed_out,
+            stdout: &o.stdout,
+            stderr: &o.stderr,
+        }
+    }
+    let info = probe(&INFO_ARGS, PROBE_TIMEOUT).await;
+    let info_answer = info.as_ref().map(answer);
+    if classify_info(info_answer).is_err() {
+        return (classify(info_answer, None), failure_detail(info_answer, None));
+    }
+    let list = probe(&LIST_ARGS, PROBE_TIMEOUT).await;
+    let list_answer = list.as_ref().map(answer);
+    (classify(info_answer, list_answer), failure_detail(info_answer, list_answer))
+}
+
+/// [`docker_status`] as a yes/no.
 pub async fn docker_reachable() -> bool {
-    probe(&["version", "--format", "{{.Server.Version}}"], Duration::from_secs(10))
-        .await
-        .is_some_and(|o| o.status.success() && !o.timed_out && !o.stdout.trim().is_empty())
+    docker_status().await.is_reachable()
 }
 
 /// `docker image inspect` finds the image locally. Never pulls.

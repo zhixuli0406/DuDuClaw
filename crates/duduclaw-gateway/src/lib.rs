@@ -99,7 +99,10 @@ pub mod notion_workspace;
 pub mod rate_limit_watch;
 pub(crate) mod synthetic_connector_adapter;
 pub mod watchdog;
+pub mod killswitch_triggers;
+pub mod redaction_sources;
 pub mod webhook_jwt;
+pub mod webhook_slots;
 pub mod wecom;
 // WP1.6 (ecosystem): text-reply decisions — replying to a decision card with
 // a bare verb counts as a button press (wrist/watch clients have no buttons).

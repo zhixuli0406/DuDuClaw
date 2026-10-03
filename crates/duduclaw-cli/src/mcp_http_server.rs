@@ -30,7 +30,7 @@ use crate::mcp_auth::{Principal, authenticate_with_key};
 use crate::mcp_capability::{inject_capability_headers, negotiate_capabilities};
 use crate::mcp_dispatch::McpDispatcher;
 use crate::mcp_http_errors::into_axum_response;
-use crate::mcp_namespace::{NamespaceContext, resolve};
+use crate::mcp_namespace::{CallerIdentity, NamespaceContext, client_is_agent, resolve_for_caller};
 use crate::mcp_rate_limit::OpType;
 use crate::mcp_sse_store::SseEventStore;
 
@@ -136,7 +136,17 @@ pub(crate) fn authenticate_bearer(
             .into_response()
     })?;
 
-    let ns_ctx = resolve(&principal).map_err(|e| {
+    let ns_ctx = resolve_for_caller(
+        &principal,
+        // HTTP callers are remote: the internal key never inherits this
+        // process's employee identity here (it stays in the shared pool); a
+        // per-agent key still maps to its employee's own namespace.
+        CallerIdentity {
+            verified_agent: None,
+            client_is_agent: client_is_agent(home_dir, &principal.client_id),
+        },
+    )
+    .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(crate::mcp_dispatch::jsonrpc_error(
@@ -174,7 +184,17 @@ fn authenticate_bearer_or_query(
             )
                 .into_response()
         })?;
-        let ns_ctx = resolve(&principal).map_err(|e| {
+        let ns_ctx = resolve_for_caller(
+        &principal,
+        // HTTP callers are remote: the internal key never inherits this
+        // process's employee identity here (it stays in the shared pool); a
+        // per-agent key still maps to its employee's own namespace.
+        CallerIdentity {
+            verified_agent: None,
+            client_is_agent: client_is_agent(home_dir, &principal.client_id),
+        },
+    )
+    .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(crate::mcp_dispatch::jsonrpc_error(

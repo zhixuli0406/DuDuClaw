@@ -67,24 +67,10 @@ pub struct TaskForwardModelConfig {
     /// Master switch. **Defaults `true` (v1.54).** `false` ⇒ both hot-path
     /// hooks are no-ops.
     pub enabled: bool,
-    /// T3 (design §11, §2.3 stage 4): reserved for the cold-start LLM
-    /// prediction-source stage. **Not consumed** by
-    /// `TaskForwardModel::predict` in this version — a fully-cold bucket
-    /// always falls to `PredictionSource::Prior` regardless of this flag
-    /// (see that variant's doc comment in `task_forward.rs`). Parsed now so
-    /// a future wiring of stage 4 doesn't need a config schema change.
-    pub cold_start_llm: bool,
-    /// Design §2.3 stage 1/2 sample-count gate. **Not yet threaded into**
-    /// `TaskForwardModel::predict`, which uses the fixed [`MIN_SAMPLES`]
-    /// constant — parsed for forward-compatibility with a future change
-    /// that makes the cascade's thresholds runtime-configurable, not
-    /// currently load-bearing.
-    pub min_samples: u32,
-    /// Design §2.3 confidence-saturation sample count. Same
-    /// not-yet-threaded status as `min_samples` — see that field's doc
-    /// comment. `TaskForwardModel::predict` uses the fixed [`MATURE_N`]
-    /// constant today.
-    pub mature_n: u32,
+    // v1.68.0: `cold_start_llm`, `min_samples` and `mature_n` were removed —
+    // parsed but never read (`TaskForwardModel::predict` uses the fixed
+    // `MIN_SAMPLES` / `MATURE_N` constants and has no LLM stage). Old
+    // config files that still carry them parse fine (unknown keys ignored).
     /// WP-A4 sub-switch (design §6.5): the induce/inject/settle rule
     /// pipeline (`prediction::task_rule_induce`). Only consulted when
     /// `enabled = true` — A4 is a strict downstream of A3, so `enabled =
@@ -134,14 +120,11 @@ impl Default for TaskForwardModelConfig {
             // v1.54: the calibrated forward model is a default-ON platform
             // capability. The master switch is on so predict-act-verify,
             // proper-scoring, and the held-out rule gate actually run for every
-            // agent out of the box. `cold_start_llm` stays off, so cold starts
+            // agent out of the box. There is no LLM stage, so cold starts
             // remain zero-LLM (statistical/prior degradation only). Operators
             // opt out per-deployment via `config.toml [task_forward_model]` or
             // the dashboard toggle.
             enabled: true,
-            cold_start_llm: false,
-            min_samples: MIN_SAMPLES,
-            mature_n: MATURE_N,
             rule_induction: true,
             // calibrated forward model + held-out rule gate: on with the master.
             calibration_enabled: true,
@@ -1263,11 +1246,7 @@ mod tests {
         .unwrap();
         let cfg = TaskForwardModelConfig::from_home(dir.path());
         assert!(cfg.enabled);
-        assert_eq!(cfg.min_samples, 7);
-        assert_eq!(
-            cfg.mature_n, MATURE_N,
-            "unset field keeps the struct default"
-        );
+        // A removed key (`min_samples`) left in an old file is ignored.
         assert!(
             cfg.rule_induction,
             "WP-A4 sub-switch defaults true (opt-out, not opt-in)"

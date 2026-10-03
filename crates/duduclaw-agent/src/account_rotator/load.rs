@@ -372,10 +372,28 @@ pub(crate) fn narrow_by_pool<'a>(available: &[&'a Account], pool: &[String]) -> 
     }
 }
 
+/// `[[accounts]] tags` (dashboard 帳號 → 標籤). Non-string and blank entries
+/// are dropped; at most 32 tags of ≤64 chars are kept.
+pub(crate) fn parse_account_tags(acc_table: &toml::Table) -> Vec<String> {
+    acc_table
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|t| !t.is_empty() && t.chars().count() <= 64)
+                .take(32)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether `account` is named by the agent's `account_pool`.
 ///
 /// Matching is **exact** (after trimming, ASCII-case-insensitive) against the
-/// account `id` and the user-visible `label` — operators reference either one,
+/// account `id`, the user-visible `label` and the account's `tags` — operators reference any of them,
 /// since the dashboard picker shows the label. Deliberately NOT a substring
 /// test (project convention 2: no unanchored `contains` for routing decisions);
 /// `word_contains_ci`-style fuzziness would let a pool entry `main` capture an
@@ -390,7 +408,15 @@ pub(crate) fn account_in_pool(account: &Account, pool: &[String]) -> bool {
             return true;
         }
         let label = account.label.trim();
-        !label.is_empty() && entry.eq_ignore_ascii_case(label)
+        if !label.is_empty() && entry.eq_ignore_ascii_case(label) {
+            return true;
+        }
+        // v1.68.0: a pool entry may also name a tag shared by several
+        // accounts (exact, same rules as id / label).
+        account
+            .tags
+            .iter()
+            .any(|t| !t.trim().is_empty() && entry.eq_ignore_ascii_case(t.trim()))
     })
 }
 

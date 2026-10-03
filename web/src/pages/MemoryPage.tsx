@@ -335,8 +335,6 @@ interface EvolutionAgent {
   // WP5b / D7 — the backend still reports `cognitive_memory`, but it is
   // always-on infrastructure now, so the page no longer renders it as a
   // per-agent capability row.
-  skill_auto_activate: boolean;
-  skill_security_scan: boolean;
   max_silence_hours: number;
 }
 
@@ -413,14 +411,6 @@ function EvolutionView({ selectedAgent }: { selectedAgent: string }) {
                 </div>
                 <div className="space-y-2 text-sm">
                   <EvolutionRow label="GVU" enabled={agent.gvu_enabled} />
-                  <EvolutionRow
-                    label={intl.formatMessage({ id: 'agents.edit.skillAutoActivate' })}
-                    enabled={agent.skill_auto_activate}
-                  />
-                  <EvolutionRow
-                    label={intl.formatMessage({ id: 'agents.edit.skillSecurityScan' })}
-                    enabled={agent.skill_security_scan}
-                  />
                 </div>
                 <div className="grid grid-cols-1 gap-2 border-t border-surface-border pt-3">
                   <Metric value={`${agent.max_silence_hours}h`} label={intl.formatMessage({ id: 'evolution.maxSilence' })} />

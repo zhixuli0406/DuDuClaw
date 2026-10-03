@@ -691,12 +691,13 @@ warn_threshold_percent = 80
 hard_stop = false
 
 [permissions]
-can_create_agents = false
-can_send_cross_agent = false
-can_modify_own_skills = false
+can_create_agents = true
+can_send_cross_agent = true
+can_modify_own_skills = true
 can_modify_own_soul = false
 can_schedule_tasks = true
 allowed_channels = [{channel_lower_toml}]
+permissions_enforced_since = "1.68.0"
 
 [evolution]
 skill_auto_activate = true

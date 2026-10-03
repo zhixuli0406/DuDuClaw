@@ -1683,6 +1683,7 @@ dependencies = [
  "dialoguer",
  "dirs 6.0.0",
  "duduclaw-agent",
+ "duduclaw-auth",
  "duduclaw-container",
  "duduclaw-core",
  "duduclaw-db",

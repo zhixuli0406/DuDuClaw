@@ -143,7 +143,7 @@ impl JudgeMode {
     /// has `evaluator_only` or `human_only` in `config.toml` keeps behaving
     /// byte-identically — but the dashboard offers only `mav` / `external`,
     /// and both the read path and the write path say so once. Scheduled for
-    /// removal in **v1.68.0** (two minor versions), per
+    /// removal in **v1.69.0** (two minor versions), per
     /// `docs/guides/deprecations.md`.
     ///
     /// Replacements, stated so the warning is actionable:
@@ -255,7 +255,7 @@ fn warn_once_if_deprecated(mode: JudgeMode) {
         warn!(
             value = mode.as_str(),
             replacement = mode.deprecation_replacement().unwrap_or("mav"),
-            remove_in = "v1.68.0",
+            remove_in = "v1.69.0",
             "[dispatch] judge mode is deprecated and will be removed — see docs/guides/deprecations.md"
         );
     });

@@ -286,10 +286,13 @@ impl MethodHandler {
             _ => return Err("Missing 'db' parameter".into()),
         };
 
+        // v1.68.0: JSON-RPC only, same rule as `odoo.configure`.
         let protocol = match params.get("protocol").and_then(|v| v.as_str()) {
-            Some("xmlrpc") => "xmlrpc",
             Some("jsonrpc") | None => "jsonrpc",
-            _ => return Err("Invalid protocol: must be 'jsonrpc' or 'xmlrpc'".into()),
+            Some("xmlrpc") => {
+                return Err("XML-RPC is not supported: DuDuClaw connects to Odoo over JSON-RPC only".into());
+            }
+            _ => return Err("Invalid protocol: must be 'jsonrpc'".into()),
         };
 
         let auth_method = match params.get("auth_method").and_then(|v| v.as_str()) {

@@ -93,6 +93,8 @@ tempfile = "3"
 
 [dev-dependencies]
 tokio = { workspace = true }
+# v1.67.2 namespace tests drive the gateway `memory.forget` RPC as an admin.
+duduclaw-auth = { workspace = true }
 # W20-P1: HTTP integration test support
 tower = { version = "0.5", features = ["util"] }
 http = "1"

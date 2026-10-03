@@ -471,14 +471,14 @@ async fn receive_webhook(
                                     .map(|a| a.config.agent.name.clone())
                                     .unwrap_or_default()
                             };
-                            let reply = crate::chat_commands::handle_command(
-                                &cmd,
-                                &state.ctx,
-                                &session_id,
-                                &agent_id,
-                                true,
-                                sender,
-                            )
+                            let reply = crate::chat_commands::handle_command_for_sender(
+                &cmd,
+                &state.ctx,
+                "whatsapp",
+                &session_id,
+                &agent_id,
+                sender,
+            )
                             .await;
                             send_text(&state.http, &access_token, &phone_id, sender, &reply).await;
                             continue;

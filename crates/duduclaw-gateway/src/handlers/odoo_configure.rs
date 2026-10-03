@@ -41,14 +41,19 @@ impl MethodHandler {
         };
 
         // Validate protocol (whitelist)
+        // v1.68.0: the connector only speaks JSON-RPC (`duduclaw-odoo` has no
+        // XML-RPC transport), so `xmlrpc` is refused instead of being saved
+        // and silently ignored. The dashboard no longer offers the choice.
         let protocol = match params.get("protocol").and_then(|v| v.as_str()) {
-            Some("xmlrpc") => "xmlrpc",
             Some("jsonrpc") | None => "jsonrpc",
-            _ => {
+            Some("xmlrpc") => {
                 return WsFrame::error_response(
                     "",
-                    "Invalid protocol: must be 'jsonrpc' or 'xmlrpc'",
+                    "XML-RPC is not supported: DuDuClaw connects to Odoo over JSON-RPC only",
                 );
+            }
+            _ => {
+                return WsFrame::error_response("", "Invalid protocol: must be 'jsonrpc'");
             }
         };
 

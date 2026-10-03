@@ -3,16 +3,19 @@ import { useIntl } from 'react-intl';
 import { useNavigate, useParams, useSearchParams } from 'react-router';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useSystemStore } from '@/stores/system-store';
+import { useAuthStore } from '@/stores/auth-store';
 import { departmentsOf } from '@/lib/agents';
 import {
   api,
   type AgentDetail,
+  type AgentDetailV168,
+  type AgentEffort,
+  type AgentTeamRoleKey,
   type AgentUpdateParams,
   type ComputerUseMode,
   type ComputerUseConfig,
   type ContractConfig,
   type RuntimeProvider,
-  type AgentOdooOverride,
   type ChannelStatus,
   type DbSourceSummary,
 } from '@/lib/api';
@@ -70,20 +73,30 @@ import {
   type SettingsSaveStatus,
 } from '@/components/mds';
 import {
-  type KvRow,
   RUNTIME_PROVIDERS,
+  GENERIC_CLI_RUNTIMES,
+  EFFORT_LEVELS,
+  TEAM_ROLE_KEYS,
+  DEFAULT_V168,
   AGENT_ROLES,
   AUTONOMY_LEVELS,
   DEFAULT_RUNTIME,
   DEFAULT_EVOLUTION_ADVANCED,
-  DEFAULT_CONTAINER_ADVANCED,
   DEFAULT_CAPABILITIES,
   DEFAULT_OS_WATCH,
   DEFAULT_RESEARCH,
   DEFAULT_ODOO,
   DEFAULT_ADVANCED,
 } from './defaults';
-import { ToolPolicyEditor, MountTable, KvTable, EnvTable } from './editors';
+import { ToolPolicyEditor } from './editors';
+import {
+  buildUpdatePayload,
+  isAdminOnlyPath,
+  kvRowsFromTable,
+  teamRolesShareVendor,
+  type OdooFormState,
+} from './editPayload';
+import { ToolNameListField, TypedKvTable } from './v168-controls';
 import { RowText, RowNumber, RowSwitch, RowSelect, FieldBlock } from './form-rows';
 import { isDeprecatedRuntime } from '@/lib/deprecated-runtimes';
 import { buildDbSourceCapabilityRows, toggleDbSourceCapability } from './dbSourceCapability';
@@ -173,11 +186,6 @@ function CrossLink({ label, onClick }: { label: string; onClick: () => void }) {
  * shared default, which nothing else consumes today but shouldn't gain
  * page-specific UI-only fields.
  */
-type OdooFormState = typeof DEFAULT_ODOO & {
-  unblock_models: string[];
-  clear_api_key: boolean;
-  clear_password: boolean;
-};
 const DEFAULT_ODOO_FORM: OdooFormState = {
   ...DEFAULT_ODOO,
   unblock_models: [],
@@ -191,9 +199,12 @@ const DEFAULT_ODOO_FORM: OdooFormState = {
  * (spec §5.3 式2 Capabilities/Settings): a BreadcrumbHeader over a two-pane
  * `SettingsShell` (grouped left rail → `max-w-3xl` scrolling content). Every
  * field from the former 1234-line two-level-tab form is preserved and regrouped
- * into nine sub-tabs across two rail groups (能力 / 設定); the save decomposition,
- * write-only-tab semantics, and lazy prefill are unchanged — only the shell and
- * the control primitives (mds Input/Select/Switch/Textarea) changed.
+ * into nine sub-tabs across two rail groups (能力 / 設定).
+ *
+ * v1.68 W1: every section is prefilled from the one `agents.inspect` payload
+ * and a save sends only the fields the operator edited (`dirtyRef` +
+ * `buildUpdatePayload`), so an untouched or never-loaded saved value is never
+ * overwritten. Admin-only fields are disabled and never sent for non-admins.
  */
 export function EditAgentPage() {
   const intl = useIntl();
@@ -217,7 +228,7 @@ export function EditAgentPage() {
   );
 
   // ── Agent detail load (the dialog received it as a prop; the page owns it) ──
-  const [agent, setAgent] = useState<AgentDetail | null>(null);
+  const [agent, setAgent] = useState<(AgentDetail & AgentDetailV168) | null>(null);
   // Both of these were `formatError(e)` — the raw JS/API string rendered into
   // the page and into a toast (P05 Blocker, phase-4 audit). Keep the thrown
   // value; `ErrorState` / `useErrorMessage` do the plain-language translation.
@@ -264,15 +275,16 @@ export function EditAgentPage() {
     changeCounterRef.current += 1;
     setChangeCounter(changeCounterRef.current);
   }, []);
-  // Cycle-level dirty gates (refs so they read/reset synchronously across the
-  // async save loop). `sectionsDirtyRef` ⇒ call updateAgent; `contractDirtyRef`
-  // ⇒ call contract.update. A contract-only edit thus writes only the contract.
-  const sectionsDirtyRef = useRef(false);
+  // v1.68 W1 — per-field dirty map (a ref so it reads/resets synchronously
+  // across the async save loop). Every USER edit adds its field path
+  // (`form.display_name`, `caps.allowed_tools`, `v.team_roles.executor.model`,
+  // `kv` …); a save sends exactly those paths and nothing else, so a value the
+  // form never loaded or the operator never touched is never overwritten
+  // (audit F1/F2/F6). `contractDirtyRef` gates the separate contract.update.
+  const dirtyRef = useRef<Set<string>>(new Set());
   const contractDirtyRef = useRef(false);
-  // Every USER edit to a non-contract section marks it dirty and reschedules the
-  // debounce; contract editors mark the contract gate instead.
-  const markSectionEdit = useCallback(() => {
-    sectionsDirtyRef.current = true;
+  const markDirty = useCallback((path: string) => {
+    dirtyRef.current.add(path);
     bumpChange();
   }, [bumpChange]);
   const markContractEdit = useCallback(() => {
@@ -332,23 +344,14 @@ export function EditAgentPage() {
     refresh: modelsRefresh,
   } = useAvailableModels();
 
-  // Local form state — initialized from agent once the detail loads
+  // Local form state — initialized from agent once the detail loads. Every
+  // section below is prefilled from the one `agents.inspect` payload; a field
+  // the gateway did not return (older gateway) keeps its default and is never
+  // sent unless the operator edits it (see `dirtyRef`).
   const [form, setForm] = useState<AgentUpdateParams>({});
 
-  // CAP — capabilities form. Prefilled from agents.inspect on tab open (see the
-  // lazy effect below); a partial update is still written only when touched.
+  // CAP — capabilities form (admin-only server-side; see `isAdmin`).
   const [caps, setCaps] = useState<typeof DEFAULT_CAPABILITIES>(DEFAULT_CAPABILITIES);
-  // Tracks whether the operator touched the Capabilities tab — if untouched we
-  // omit `capabilities` from the update so we don't overwrite existing config.
-  const [capsDirty, setCapsDirty] = useState(false);
-  // Mirror capsDirty into a ref so the async prefill can tell, at resolution
-  // time, whether the operator already edited the tab (avoid clobbering edits).
-  const capsDirtyRef = useRef(false);
-  useEffect(() => { capsDirtyRef.current = capsDirty; }, [capsDirty]);
-  // Prefill the capability form (incl. the Progent policy rules) from
-  // agents.inspect the first time the 工具與權限 tab opens, so existing values are
-  // visible and editable rather than reset to defaults.
-  const [capsLoaded, setCapsLoaded] = useState(false);
   // Raw allowed/denied/policy editors collapse by default — the plain-language
   // CapabilityToggles are the primary surface; auto-opened by the prefill when
   // the agent already has an allowlist or Progent policy.
@@ -361,41 +364,42 @@ export function EditAgentPage() {
   const [dbSourceOptions, setDbSourceOptions] = useState<DbSourceSummary[] | null>(null);
   const [dbSourceOptionsLoaded, setDbSourceOptionsLoaded] = useState(false);
 
-  // OW — v1.39 OS-native [os_watch] form. Prefilled from agents.inspect
-  // (`os_watch`) alongside caps; only written when the operator edits it, so an
-  // untouched tab never clobbers the agent's existing paths.
+  // OW — v1.39 OS-native [os_watch] form.
   const [osWatch, setOsWatch] = useState<typeof DEFAULT_OS_WATCH>(DEFAULT_OS_WATCH);
-  const [osWatchDirty, setOsWatchDirty] = useState(false);
-  const osWatchDirtyRef = useRef(false);
-  useEffect(() => { osWatchDirtyRef.current = osWatchDirty; }, [osWatchDirty]);
 
-  // Belief loop × goal contract gap 2 — self-study [research] form. Prefilled
-  // from agents.inspect (`research`) alongside caps/os_watch; only written
-  // when the operator edits it.
+  // Belief loop × goal contract gap 2 — self-study [research] form.
   const [research, setResearch] = useState<typeof DEFAULT_RESEARCH>(DEFAULT_RESEARCH);
-  const [researchDirty, setResearchDirty] = useState(false);
-  const researchDirtyRef = useRef(false);
-  useEffect(() => { researchDirtyRef.current = researchDirty; }, [researchDirty]);
 
   // CON — contract form, loaded lazily via contract.get on first tab open
   const [contract, setContract] = useState<ContractConfig>({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
   const [contractLoaded, setContractLoaded] = useState(false);
 
-  // RT — runtime form (write-only; inspect doesn't return [runtime])
+  // RT — runtime form ([runtime] provider / fallback).
   const [runtime, setRuntime] = useState<typeof DEFAULT_RUNTIME>(DEFAULT_RUNTIME);
-  const [runtimeDirty, setRuntimeDirty] = useState(false);
 
-  // EVO — advanced evolution form (write-only)
+  // EVO — advanced evolution form.
   const [evoAdv, setEvoAdv] = useState<typeof DEFAULT_EVOLUTION_ADVANCED>(DEFAULT_EVOLUTION_ADVANCED);
-  const [evoAdvDirty, setEvoAdvDirty] = useState(false);
 
-  // CT — advanced container form (write-only)
-  const [ctAdv, setCtAdv] = useState<typeof DEFAULT_CONTAINER_ADVANCED>(DEFAULT_CONTAINER_ADVANCED);
-  const [ctAdvDirty, setCtAdvDirty] = useState(false);
 
-  // ODO — per-agent Odoo override form (write-only)
+  // ODO — per-agent Odoo override form. Non-secret fields prefill from
+  // inspect; api_key/password stay write-only.
   const [odoo, setOdoo] = useState<OdooFormState>(DEFAULT_ODOO_FORM);
-  const [odooDirty, setOdooDirty] = useState(false);
+
+  // v1.68 W1 — the new per-employee controls (budget daily cap, effort,
+  // minimal context, team roles, guardrails, decision continuity, night
+  // engine, live forking).
+  const [v168, setV168] = useState<typeof DEFAULT_V168>(DEFAULT_V168);
+
+  // v1.68 W1 — the server's message when a save carrying typed key/value
+  // entries was rejected (the gateway parses the result as `AgentConfig`).
+  const [kvServerError, setKvServerError] = useState<string | null>(null);
+
+  // Admin-only fields (org fields, the whole [capabilities] table, sandbox,
+  // can_modify_own_soul): the gateway refuses and audits them for anyone
+  // else, so the page disables them and never sends them for a non-admin.
+  const isAdmin = useAuthStore((st) => st.user?.role === 'admin');
+  const isAdminRef = useRef(isAdmin);
+  useEffect(() => { isAdminRef.current = isAdmin; }, [isAdmin]);
 
   // ── Channels (2026-08-13 unification) ──
   // The 整合 tab no longer keeps its own raw token fields — it shows this
@@ -445,108 +449,166 @@ export function EditAgentPage() {
     }
   }, [intl, fetchAgentChannels]);
 
-  // Advanced — G.8 scattered fields (write-only); account_pool prefilled from inspect.
+  // Advanced — G.8 scattered fields + the typed key/value editor.
   const [adv, setAdv] = useState<typeof DEFAULT_ADVANCED>(DEFAULT_ADVANCED);
-  const [advDirty, setAdvDirty] = useState(false);
 
+  // Prefill every section from the single `agents.inspect` payload. A pure
+  // prefill never marks anything dirty, so nothing here is ever written back
+  // unless the operator edits it.
   useEffect(() => {
-    if (agent) {
-      // Determine current preferred/fallback as unified IDs. No hardcoded model
-      // default — fall back to empty so ModelSelect prompts a live choice rather
-      // than fabricating a model that may not exist for this deployment.
-      const localModel = agent.model?.local?.model ?? '';
-      const preferLocal = agent.model?.local?.prefer_local ?? false;
-      const currentPreferred = preferLocal && localModel
-        ? `local:${localModel}`
-        : agent.model?.preferred ?? '';
-      const currentFallback = agent.model?.fallback ?? '';
+    if (!agent) return;
+    // Determine current preferred/fallback as unified IDs. No hardcoded model
+    // default — fall back to empty so ModelSelect prompts a live choice rather
+    // than fabricating a model that may not exist for this deployment.
+    const localModel = agent.model?.local?.model ?? '';
+    const preferLocal = agent.model?.local?.prefer_local ?? false;
+    const currentPreferred = preferLocal && localModel
+      ? `local:${localModel}`
+      : agent.model?.preferred ?? '';
+    const ev = agent.evolution;
+    const ct = agent.container;
 
-      setForm({
-        display_name: agent.display_name,
-        role: agent.role,
-        trigger: agent.trigger,
-        icon: agent.icon,
-        reports_to: agent.reports_to,
-        department: agent.department ?? '',
-        preferred: currentPreferred,
-        fallback: currentFallback,
-        api_mode: (agent.model?.api_mode ?? 'cli') as 'cli' | 'direct' | 'auto',
-        local_model: localModel,
-        local_backend: agent.model?.local?.backend ?? 'openai_compat',
-        local_context_length: agent.model?.local?.context_length ?? 4096,
-        local_gpu_layers: agent.model?.local?.gpu_layers ?? -1,
-        prefer_local: preferLocal,
-        use_router: agent.model?.local?.use_router ?? false,
-        monthly_limit_cents: agent.budget?.monthly_limit_cents ?? 5000,
-        warn_threshold_percent: agent.budget?.warn_threshold_percent ?? 80,
-        hard_stop: agent.budget?.hard_stop ?? true,
-        heartbeat_enabled: agent.heartbeat?.enabled ?? false,
-        heartbeat_interval: agent.heartbeat?.interval_seconds ?? 3600,
-        heartbeat_cron: '',
-        can_create_agents: agent.permissions?.can_create_agents ?? false,
-        can_send_cross_agent: agent.permissions?.can_send_cross_agent ?? true,
-        can_modify_own_skills: agent.permissions?.can_modify_own_skills ?? true,
-        can_modify_own_soul: agent.permissions?.can_modify_own_soul ?? false,
-        can_schedule_tasks: agent.permissions?.can_schedule_tasks ?? false,
-        skill_auto_activate: agent.evolution?.skill_auto_activate ?? false,
-        skill_security_scan: agent.evolution?.skill_security_scan ?? true,
-        gvu_enabled: agent.evolution?.gvu_enabled ?? true,
-        // WP5b / D7 — always-on, and no longer a writable field: the gateway
-        // dropped `cognitive_memory` from the agents.update allowlist, so this
-        // value is inert on save. A stale `false` left in an agent.toml is
-        // ignored at read time (one deprecation warning), never rewritten.
-        // Kept only so the form's shape still matches the API type.
-        cognitive_memory: true,
-        sticker_enabled: agent.sticker?.enabled ?? false,
-        sticker_probability: agent.sticker?.probability ?? 0.3,
-        sticker_intensity_threshold: agent.sticker?.intensity_threshold ?? 0.7,
-        sticker_cooldown_messages: agent.sticker?.cooldown_messages ?? 5,
-        sticker_expressiveness: (agent.sticker?.expressiveness ?? 'moderate') as 'minimal' | 'moderate' | 'expressive',
-        sandbox_enabled: agent.sandbox_enabled ?? false,
-        network_access: agent.network_access ?? false,
-      });
-      setSaveError(null);
-      setSaveStatus('idle');
-      // Reset CAP/CON state for the newly-loaded agent.
-      setCaps(DEFAULT_CAPABILITIES);
-      setCapsDirty(false);
-      setCapsLoaded(false);
-      setContract({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
-      setContractLoaded(false);
-      // RT — prefill the runtime form from the `[runtime]` block agents.inspect
-      // now returns (only keys present in agent.toml; missing ones fall back to
-      // DEFAULT_RUNTIME). A pure prefill keeps runtimeDirty false. Re-arm the
-      // one-time PTY-pool OAuth materialization guard for the new agent.
-      const rt = agent.runtime;
-      setRuntime({
-        provider: (rt?.provider as RuntimeProvider) ?? DEFAULT_RUNTIME.provider,
-        fallback: rt?.fallback ?? DEFAULT_RUNTIME.fallback,
-      });
-      setRuntimeDirty(false);
-      setEvoAdv(DEFAULT_EVOLUTION_ADVANCED);
-      setEvoAdvDirty(false);
-      setCtAdv(DEFAULT_CONTAINER_ADVANCED);
-      setCtAdvDirty(false);
-      // ODO — reset write-only Odoo override form.
-      setOdoo(DEFAULT_ODOO_FORM);
-      setOdooDirty(false);
-      // Advanced — seed account_pool + the [proactive] notify target from
-      // inspect (lazy prefill, keeps advDirty false); rest are write-only
-      // defaults.
-      setAdv({
-        ...DEFAULT_ADVANCED,
-        account_pool: agent.model?.account_pool ?? [],
-        proactive_notify_channel: agent.proactive?.notify_channel ?? '',
-        proactive_notify_chat_id: agent.proactive?.notify_chat_id ?? '',
-        proactive_notify_thread_id: agent.proactive?.notify_thread_id ?? '',
-        // W2-8 — the agent's OWN raw value, never `agent.proactive.quiet_hours`
-        // (which is the effective, possibly-fallen-back window — see
-        // `ProactiveSettings.quiet_hours_own` for why saving THAT unchanged
-        // would silently pin the deployment-wide default into this agent).
-        proactive_quiet_hours: agent.proactive?.quiet_hours_own ?? '',
-      });
-      setAdvDirty(false);
-    }
+    setForm({
+      display_name: agent.display_name,
+      role: agent.role,
+      status: agent.status ?? 'active',
+      trigger: agent.trigger,
+      icon: agent.icon,
+      reports_to: agent.reports_to,
+      department: agent.department ?? '',
+      preferred: currentPreferred,
+      fallback: agent.model?.fallback ?? '',
+      api_mode: (agent.model?.api_mode ?? 'cli') as 'cli' | 'direct' | 'auto',
+      local_model: localModel,
+      prefer_local: preferLocal,
+      use_router: agent.model?.local?.use_router ?? false,
+      monthly_limit_cents: agent.budget?.monthly_limit_cents ?? 5000,
+      warn_threshold_percent: agent.budget?.warn_threshold_percent ?? 80,
+      hard_stop: agent.budget?.hard_stop ?? true,
+      heartbeat_enabled: agent.heartbeat?.enabled ?? false,
+      heartbeat_interval: agent.heartbeat?.interval_seconds ?? 3600,
+      // F1 — the saved cron (older gateways do not return it: the field then
+      // shows empty and is only sent once the operator edits it).
+      heartbeat_cron: agent.heartbeat?.cron ?? '',
+      // Absent permission keys mean "allowed" server-side, so show ON.
+      can_create_agents: agent.permissions?.can_create_agents ?? true,
+      can_send_cross_agent: agent.permissions?.can_send_cross_agent ?? true,
+      can_modify_own_skills: agent.permissions?.can_modify_own_skills ?? true,
+      can_modify_own_soul: agent.permissions?.can_modify_own_soul ?? false,
+      can_schedule_tasks: agent.permissions?.can_schedule_tasks ?? true,
+      gvu_enabled: ev?.gvu_enabled ?? true,
+      max_active_skills: ev?.max_active_skills ?? 5,
+      skill_token_budget: ev?.skill_token_budget ?? 0,
+      max_silence_hours: ev?.max_silence_hours ?? 12,
+      sandbox_enabled: agent.sandbox_enabled ?? false,
+      network_access: agent.network_access ?? false,
+      timeout_ms: ct?.timeout_ms ?? 1800000,
+    });
+    dirtyRef.current = new Set();
+    setSaveError(null);
+    setSaveStatus('idle');
+    setKvServerError(null);
+
+    const c = agent.capabilities;
+    setCaps({
+      ...DEFAULT_CAPABILITIES,
+      ...(c ?? {}),
+      computer_use_config: { ...DEFAULT_CAPABILITIES.computer_use_config, ...(c?.computer_use_config ?? {}) },
+    } as typeof DEFAULT_CAPABILITIES);
+    // Auto-expand the advanced editors when the agent already carries
+    // engineer-level config an operator would otherwise not see.
+    setShowAdvancedTools((c?.allowed_tools?.length ?? 0) > 0 || (c?.policy?.length ?? 0) > 0);
+
+    const ow = agent.os_watch;
+    setOsWatch({
+      paths: ow?.paths ?? DEFAULT_OS_WATCH.paths,
+      ignore: ow?.ignore ?? DEFAULT_OS_WATCH.ignore,
+      debounce_ms: ow?.debounce_ms ?? DEFAULT_OS_WATCH.debounce_ms,
+      max_events_per_min: ow?.max_events_per_min ?? DEFAULT_OS_WATCH.max_events_per_min,
+    });
+    setResearch({
+      self_study: agent.research?.self_study ?? DEFAULT_RESEARCH.self_study,
+      self_study_hour: agent.research?.self_study_hour ?? DEFAULT_RESEARCH.self_study_hour,
+    });
+    setContract({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
+    setContractLoaded(false);
+
+    const rt = agent.runtime;
+    setRuntime({
+      provider: (rt?.provider as RuntimeProvider) ?? DEFAULT_RUNTIME.provider,
+      fallback: rt?.fallback ?? DEFAULT_RUNTIME.fallback,
+    });
+
+    const ef = ev?.external_factors ?? {};
+    setEvoAdv({
+      external_factors: { ...DEFAULT_EVOLUTION_ADVANCED.external_factors, ...ef },
+      skill_synthesis_enabled: ev?.skill_synthesis_enabled ?? DEFAULT_EVOLUTION_ADVANCED.skill_synthesis_enabled,
+      skill_synthesis_threshold: ev?.skill_synthesis_threshold ?? DEFAULT_EVOLUTION_ADVANCED.skill_synthesis_threshold,
+      skill_synthesis_cooldown_hours: ev?.skill_synthesis_cooldown_hours ?? DEFAULT_EVOLUTION_ADVANCED.skill_synthesis_cooldown_hours,
+      skill_trial_ttl: ev?.skill_trial_ttl ?? DEFAULT_EVOLUTION_ADVANCED.skill_trial_ttl,
+      skill_graduation_min_lift: ev?.skill_graduation_min_lift ?? DEFAULT_EVOLUTION_ADVANCED.skill_graduation_min_lift,
+    });
+
+    const od = agent.odoo;
+    setOdoo({
+      ...DEFAULT_ODOO_FORM,
+      profile: od?.profile ?? '',
+      allowed_models: od?.allowed_models ?? [],
+      unblock_models: od?.unblock_models ?? [],
+      allowed_actions: od?.allowed_actions ?? [],
+      company_ids: (od?.company_ids ?? []).join(', '),
+      url: od?.url ?? '',
+      db: od?.db ?? '',
+      username: od?.username ?? '',
+    });
+
+    setAdv({
+      ...DEFAULT_ADVANCED,
+      account_pool: agent.model?.account_pool ?? [],
+      utility: agent.model?.utility ?? '',
+      heartbeat_max_concurrent_runs: agent.heartbeat?.max_concurrent_runs ?? DEFAULT_ADVANCED.heartbeat_max_concurrent_runs,
+      heartbeat_cron_timezone: agent.heartbeat?.cron_timezone ?? '',
+      proactive_timezone: agent.proactive?.timezone ?? '',
+      proactive_max_turns: agent.proactive?.max_turns ?? null,
+      proactive_notify_channel: agent.proactive?.notify_channel ?? '',
+      proactive_notify_chat_id: agent.proactive?.notify_chat_id ?? '',
+      proactive_notify_thread_id: agent.proactive?.notify_thread_id ?? '',
+      // W2-8 — the agent's OWN raw value, never `agent.proactive.quiet_hours`
+      // (which is the effective, possibly-fallen-back window — see
+      // `ProactiveSettings.quiet_hours_own` for why saving THAT unchanged
+      // would silently pin the deployment-wide default into this agent).
+      proactive_quiet_hours: agent.proactive?.quiet_hours_own ?? '',
+      kv: kvRowsFromTable('prompt', agent.prompt),
+    });
+
+    const roles = agent.team?.roles;
+    const roleForm = (key: AgentTeamRoleKey) => {
+      const r = roles?.[key] ?? (key === 'utility' ? roles?.synthesizer : undefined);
+      return { runtime: r?.runtime ?? '', model: r?.model ?? '', effort: r?.effort ?? '' };
+    };
+    const g = agent.guardrails;
+    const effort = agent.model?.effort ?? '';
+    setV168({
+      daily_cap_cents: agent.budget?.daily_cap_cents ?? DEFAULT_V168.daily_cap_cents,
+      effort: ((EFFORT_LEVELS as readonly string[]).includes(effort) ? effort : '') as AgentEffort,
+      minimal_context: agent.runtime?.minimal_context ?? DEFAULT_V168.minimal_context,
+      fork_enabled: agent.fork?.enabled ?? DEFAULT_V168.fork_enabled,
+      team_enabled: agent.team?.enabled ?? DEFAULT_V168.team_enabled,
+      team_roles: {
+        planner: roleForm('planner'),
+        executor: roleForm('executor'),
+        verifier: roleForm('verifier'),
+        utility: roleForm('utility'),
+      },
+      guardrails_enabled: g?.enabled ?? DEFAULT_V168.guardrails_enabled,
+      guardrails_block_secrets: g?.block_secrets ?? DEFAULT_V168.guardrails_block_secrets,
+      guardrails_block_injection_echo: g?.block_injection_echo ?? DEFAULT_V168.guardrails_block_injection_echo,
+      guardrails_redact_pii: g?.redact_pii ?? DEFAULT_V168.guardrails_redact_pii,
+      guardrails_deny_phrases: g?.deny_phrases ?? [],
+      decision_continuity: agent.memory?.decision_continuity ?? DEFAULT_V168.decision_continuity,
+      decision_ttl_days: agent.memory?.decision_ttl_days ?? DEFAULT_V168.decision_ttl_days,
+      night_engine_enabled: agent.night_engine?.enabled ?? DEFAULT_V168.night_engine_enabled,
+    });
   }, [agent]);
 
   // CON — lazily load CONTRACT.toml when the 工具與權限 tab (which hosts the
@@ -567,67 +629,8 @@ export function EditAgentPage() {
     });
   }, [tab, agent, contractLoaded, intl]);
 
-  // CAP — lazily prefill the [capabilities] form (incl. Progent policy rules)
-  // from agents.inspect when the 工具與權限 tab first opens. Keeps capsDirty false
-  // so an untouched tab still omits `capabilities` from the update. Also
-  // fires on the 自動化 tab open — the same `agents.inspect` payload carries
-  // `[research]` (belief loop × goal contract gap 2), and that toggle lives
-  // there rather than under 工具與權限.
-  useEffect(() => {
-    if ((tab !== 'tools' && tab !== 'automation') || !agent || capsLoaded) return;
-    // Guard both races: (1) cross-agent — if the page switches agents while
-    // this inspect is in flight, `cancelled` (set by cleanup) drops the stale
-    // result so agent A's policy never lands in agent B's form; (2) operator
-    // edits made during the load window are preserved by skipping the merge
-    // when the tab is already dirty.
-    let cancelled = false;
-    api.agents.inspect(agent.name).then((detail) => {
-      if (cancelled) return;
-      const c = detail.capabilities;
-      if (c && !capsDirtyRef.current) {
-        setCaps((prev) => ({
-          ...prev,
-          ...c,
-          computer_use_config: { ...prev.computer_use_config, ...(c.computer_use_config ?? {}) },
-        }));
-        // Auto-expand the advanced editors when the agent already carries
-        // engineer-level config an operator would otherwise not see.
-        if ((c.allowed_tools?.length ?? 0) > 0 || (c.policy?.length ?? 0) > 0) {
-          setShowAdvancedTools(true);
-        }
-      }
-      // OW — prefill [os_watch] from the raw table (null when unset).
-      const ow = detail.os_watch;
-      if (ow && !osWatchDirtyRef.current) {
-        setOsWatch((prev) => ({
-          paths: ow.paths ?? prev.paths,
-          ignore: ow.ignore ?? prev.ignore,
-          debounce_ms: ow.debounce_ms ?? prev.debounce_ms,
-          max_events_per_min: ow.max_events_per_min ?? prev.max_events_per_min,
-        }));
-      }
-      // Belief loop × goal contract gap 2 — prefill [research]. Always
-      // present with concrete values (no "unset" state), unlike os_watch.
-      const rs = detail.research;
-      if (rs && !researchDirtyRef.current) {
-        setResearch({
-          self_study: rs.self_study,
-          self_study_hour: rs.self_study_hour,
-        });
-      }
-      setCapsLoaded(true);
-    }).catch((e) => {
-      if (cancelled) return;
-      console.warn('[api]', e);
-      setCapsLoaded(true);
-    });
-    return () => { cancelled = true; };
-  }, [tab, agent, capsLoaded]);
-
   // DB — load the configured source list once the 工具與權限 tab opens, for the
-  // "可使用的資料庫來源" checkbox list. Independent of the caps prefill above
-  // (a different RPC, admin-gated, and one whose failure means "hide the
-  // field" rather than "leave it at defaults").
+  // "可使用的資料庫來源" checkbox list (admin-gated; failure hides the field).
   useEffect(() => {
     if (tab !== 'tools' || dbSourceOptionsLoaded) return;
     let cancelled = false;
@@ -640,85 +643,80 @@ export function EditAgentPage() {
       setDbSourceOptionsLoaded(true);
     }).catch(() => {
       if (cancelled) return;
-      // Non-admin (or any other failure) — hide the field entirely, no
-      // error banner (WP-C: this is an optional field, not core to the tab).
       setDbSourceOptions(null);
       setDbSourceOptionsLoaded(true);
     });
     return () => { cancelled = true; };
   }, [tab, dbSourceOptionsLoaded]);
 
+  // ── Field updaters — each records its own dirty path ──────────────────
   const updateCap = useCallback(<K extends keyof typeof DEFAULT_CAPABILITIES>(key: K, value: (typeof DEFAULT_CAPABILITIES)[K]) => {
-    setCapsDirty(true);
-    markSectionEdit();
+    if (!isAdminRef.current) return;
+    markDirty(`caps.${String(key)}`);
     setCaps((prev) => ({ ...prev, [key]: value }));
-  }, [markSectionEdit]);
+  }, [markDirty]);
 
   const updateCapConfig = useCallback(<K extends keyof Required<ComputerUseConfig>>(key: K, value: Required<ComputerUseConfig>[K]) => {
-    setCapsDirty(true);
-    markSectionEdit();
+    if (!isAdminRef.current) return;
+    markDirty(`caps.computer_use_config.${String(key)}`);
     setCaps((prev) => ({ ...prev, computer_use_config: { ...prev.computer_use_config, [key]: value } }));
-  }, [markSectionEdit]);
+  }, [markDirty]);
 
-  // OW — v1.39 [os_watch] field updater.
   const updateOsWatch = useCallback(<K extends keyof typeof DEFAULT_OS_WATCH>(key: K, value: (typeof DEFAULT_OS_WATCH)[K]) => {
-    setOsWatchDirty(true);
-    markSectionEdit();
+    markDirty(`osWatch.${String(key)}`);
     setOsWatch((prev) => ({ ...prev, [key]: value }));
-  }, [markSectionEdit]);
+  }, [markDirty]);
 
-  // Belief loop × goal contract gap 2 — [research] field updater.
   const updateResearch = useCallback(<K extends keyof typeof DEFAULT_RESEARCH>(key: K, value: (typeof DEFAULT_RESEARCH)[K]) => {
-    setResearchDirty(true);
-    markSectionEdit();
+    markDirty(`research.${String(key)}`);
     setResearch((prev) => ({ ...prev, [key]: value }));
-  }, [markSectionEdit]);
+  }, [markDirty]);
 
-  // RT — runtime field updater.
   const updateRuntime = useCallback(<K extends keyof typeof DEFAULT_RUNTIME>(key: K, value: (typeof DEFAULT_RUNTIME)[K]) => {
-    setRuntimeDirty(true);
-    markSectionEdit();
+    markDirty(`runtime.${String(key)}`);
     setRuntime((prev) => ({ ...prev, [key]: value }));
-  }, [markSectionEdit]);
+  }, [markDirty]);
 
-  // EVO — advanced evolution field updater.
   const updateEvoAdv = useCallback(<K extends keyof typeof DEFAULT_EVOLUTION_ADVANCED>(key: K, value: (typeof DEFAULT_EVOLUTION_ADVANCED)[K]) => {
-    setEvoAdvDirty(true);
-    markSectionEdit();
+    markDirty(`evo.${String(key)}`);
     setEvoAdv((prev) => ({ ...prev, [key]: value }));
-  }, [markSectionEdit]);
+  }, [markDirty]);
 
   const updateEvoFactor = useCallback((key: keyof typeof DEFAULT_EVOLUTION_ADVANCED.external_factors, value: boolean) => {
-    setEvoAdvDirty(true);
-    markSectionEdit();
+    markDirty(`evo.external_factors.${key}`);
     setEvoAdv((prev) => ({ ...prev, external_factors: { ...prev.external_factors, [key]: value } }));
-  }, [markSectionEdit]);
+  }, [markDirty]);
 
-  // CT — advanced container field updater.
-  const updateCtAdv = useCallback(<K extends keyof typeof DEFAULT_CONTAINER_ADVANCED>(key: K, value: (typeof DEFAULT_CONTAINER_ADVANCED)[K]) => {
-    setCtAdvDirty(true);
-    markSectionEdit();
-    setCtAdv((prev) => ({ ...prev, [key]: value }));
-  }, [markSectionEdit]);
-
-  // ODO — per-agent Odoo override field updater.
   const updateOdoo = useCallback(<K extends keyof OdooFormState>(key: K, value: OdooFormState[K]) => {
-    setOdooDirty(true);
-    markSectionEdit();
+    markDirty(`odoo.${String(key)}`);
     setOdoo((prev) => ({ ...prev, [key]: value }));
-  }, [markSectionEdit]);
+  }, [markDirty]);
 
-  // Advanced — G.8 field updater.
   const updateAdv = useCallback(<K extends keyof typeof DEFAULT_ADVANCED>(key: K, value: (typeof DEFAULT_ADVANCED)[K]) => {
-    setAdvDirty(true);
-    markSectionEdit();
+    markDirty(key === 'kv' ? 'kv' : `adv.${String(key)}`);
     setAdv((prev) => ({ ...prev, [key]: value }));
-  }, [markSectionEdit]);
+  }, [markDirty]);
 
   const updateField = useCallback(<K extends keyof AgentUpdateParams>(key: K, value: AgentUpdateParams[K]) => {
-    markSectionEdit();
+    const path = `form.${String(key)}`;
+    if (!isAdminRef.current && isAdminOnlyPath(path)) return;
+    markDirty(path);
     setForm((prev) => ({ ...prev, [key]: value }));
-  }, [markSectionEdit]);
+  }, [markDirty]);
+
+  // v1.68 W1 — new-control updaters.
+  const updateV = useCallback(<K extends keyof typeof DEFAULT_V168>(key: K, value: (typeof DEFAULT_V168)[K]) => {
+    markDirty(`v.${String(key)}`);
+    setV168((prev) => ({ ...prev, [key]: value }));
+  }, [markDirty]);
+
+  const updateTeamRole = useCallback((role: AgentTeamRoleKey, field: 'runtime' | 'model' | 'effort', value: string) => {
+    markDirty(`v.team_roles.${role}.${field}`);
+    setV168((prev) => ({
+      ...prev,
+      team_roles: { ...prev.team_roles, [role]: { ...prev.team_roles[role], [field]: value } },
+    }));
+  }, [markDirty]);
 
   // CON — contract editor updater. Marks the contract gate (not the section gate)
   // so a contract-only edit debounces into a lone contract.update.
@@ -727,213 +725,49 @@ export function EditAgentPage() {
     setContract(updater);
   }, [markContractEdit]);
 
-  // performSave — one autosave pass. Assembles the same partial payload the old
-  // manual 儲存 built (model-ID decomposition + per-section dirty-flag gating),
-  // but does NOT navigate or reset the forms. `sectionsDirtyRef` gates the
-  // updateAgent call and `contractDirtyRef` the contract.update, so a
-  // contract-only edit writes only the contract. Both gates are consumed up
-  // front and re-armed on failure so the next cycle retries.
+  // performSave — one autosave pass. Consumes the dirty map up front (so
+  // edits landing mid-save start a fresh map for the trailing pass), sends
+  // exactly the dirty fields, and merges the consumed paths back on failure
+  // so the next cycle retries them.
   const performSave = useCallback(async () => {
     if (!agent) return;
-    const doSections = sectionsDirtyRef.current;
+    const consumed = dirtyRef.current;
     const doContract = contractDirtyRef.current;
-    if (!doSections && !doContract) return;
-    sectionsDirtyRef.current = false;
+    if (consumed.size === 0 && !doContract) return;
+    dirtyRef.current = new Set();
     contractDirtyRef.current = false;
+    // Never send admin-only fields for a non-admin (the gateway would refuse
+    // the whole save); the controls are disabled anyway.
+    const dirty = isAdminRef.current
+      ? consumed
+      : new Set([...consumed].filter((p) => !isAdminOnlyPath(p)));
+    const savedPref = agent.model?.preferred ?? '';
+    const savedFb = agent.model?.fallback ?? '';
+    const { payload, hasChanges, includesKv } = buildUpdatePayload(
+      { form, caps, osWatch, research, runtime, evoAdv, odoo, adv, v: v168 },
+      dirty,
+      {
+        savedCloudPreferred: savedPref.startsWith('local:') ? '' : savedPref,
+        savedCloudFallback: savedFb.startsWith('local:') ? '' : savedFb,
+        hasSavedLocal: agent.model?.local != null,
+        firstCloudModel: availableModels.find((m) => m.type === 'cloud')?.id ?? '',
+      },
+    );
+    if (!hasChanges && !doContract) return;
     if (savedResetTimerRef.current) {
       clearTimeout(savedResetTimerRef.current);
       savedResetTimerRef.current = null;
     }
     setSaveStatus('saving');
     setSaveError(null);
+    let sectionsSaved = false;
     try {
-      if (doSections) {
-        // Decompose unified model IDs into cloud preferred + local config.
-        const submitForm = { ...form };
-      const pref = submitForm.preferred ?? '';
-      const fb = submitForm.fallback ?? '';
-
-      // When a local model occupies the preferred/fallback slot the backend still
-      // needs a cloud model in the cloud slot. Derive it from live data — the
-      // agent's existing cloud preferred/fallback, else the first cloud model the
-      // registry reports — instead of hardcoding a model id.
-      const firstCloud = availableModels.find((m) => m.type === 'cloud')?.id ?? '';
-      const existingCloudPref = agent.model?.preferred && !agent.model.preferred.startsWith('local:')
-        ? agent.model.preferred : '';
-      const existingCloudFb = agent.model?.fallback && !agent.model.fallback.startsWith('local:')
-        ? agent.model.fallback : '';
-      const cloudPrefSlot = existingCloudPref || firstCloud;
-      const cloudFbSlot = existingCloudFb || firstCloud;
-
-      if (pref.startsWith('local:')) {
-        // Local model as preferred: set prefer_local + local_model, keep a cloud fallback
-        submitForm.local_model = pref.replace('local:', '');
-        submitForm.prefer_local = true;
-        submitForm.preferred = fb.startsWith('local:') ? cloudPrefSlot : (fb || cloudPrefSlot);
-      } else {
-        // Cloud model as preferred
-        submitForm.prefer_local = false;
-      }
-
-      if (fb.startsWith('local:')) {
-        submitForm.local_model = submitForm.local_model || fb.replace('local:', '');
-        submitForm.fallback = cloudFbSlot;
-      }
-
-      // CAP — only include capabilities when the operator edited that tab, so we
-      // never clobber an existing [capabilities] block with defaults.
-      if (capsDirty) {
-        submitForm.capabilities = {
-          computer_use: caps.computer_use,
-          computer_use_mode: caps.computer_use_mode,
-          browser_via_bash: caps.browser_via_bash,
-          allowed_tools: caps.allowed_tools,
-          denied_tools: caps.denied_tools,
-          wiki_visible_to: caps.wiki_visible_to,
-          db_sources: caps.db_sources,
-          native_sandbox: caps.native_sandbox,
-          policy: caps.policy,
-          os_native: caps.os_native,
-          recording: caps.recording,
-          git_credentials: caps.git_credentials,
-          system_operator: caps.system_operator,
-          codrive: caps.codrive,
-          autonomy_level: caps.autonomy_level,
-          computer_use_config: { ...caps.computer_use_config },
-        };
-      }
-
-      // OW — only include [os_watch] when the operator edited it. The backend
-      // hot stop/starts the agent's watcher after the write (os_native gates it).
-      if (osWatchDirty) {
-        submitForm.os_watch = {
-          paths: osWatch.paths,
-          ignore: osWatch.ignore,
-          debounce_ms: osWatch.debounce_ms,
-          max_events_per_min: osWatch.max_events_per_min,
-        };
-      }
-
-      // Belief loop × goal contract gap 2 — only include [research] when the
-      // operator edited it.
-      if (researchDirty) {
-        submitForm.research = {
-          self_study: research.self_study,
-          self_study_hour: research.self_study_hour,
-        };
-      }
-
-      // RT — only include runtime when the operator edited that tab.
-      if (runtimeDirty) {
-        submitForm.runtime = {
-          provider: runtime.provider,
-          fallback: runtime.fallback,
-        };
-      }
-
-      // EVO — only include evolution_advanced when edited.
-      if (evoAdvDirty) {
-        submitForm.evolution_advanced = {
-          external_factors: { ...evoAdv.external_factors },
-          skill_synthesis_enabled: evoAdv.skill_synthesis_enabled,
-          skill_synthesis_threshold: evoAdv.skill_synthesis_threshold,
-          skill_synthesis_cooldown_hours: evoAdv.skill_synthesis_cooldown_hours,
-          skill_trial_ttl: evoAdv.skill_trial_ttl,
-          skill_graduation_min_lift: evoAdv.skill_graduation_min_lift,
-        };
-      }
-
-      // CT — only include container_advanced when edited. Drop env vars with an
-      // empty key (backend rejects them).
-      if (ctAdvDirty) {
-        submitForm.container_advanced = {
-          additional_mounts: ctAdv.additional_mounts.filter(
-            (m) => m.host.trim() !== '' && m.container.trim() !== ''
-          ),
-          cmd: ctAdv.cmd,
-          env: ctAdv.env.filter((e) => e.key.trim() !== ''),
-        };
-      }
-
-      // ODO — only include odoo when the operator edited that tab. company_ids
-      // are parsed from the comma-separated form. api_key/password are sent only
-      // when non-empty (write-only — never echoed back) UNLESS the operator
-      // ticked "clear stored secret", which always sends '' so the gateway's
-      // `apply_odoo_to_table` drops the stored `*_enc` value — same
-      // empty-string-clears semantics the old per-agent form on OdooPage.tsx
-      // used via the separate `odoo.agent_config_set` RPC, ported here onto
-      // this tab's single `agents.update` writer instead of reintroducing a
-      // second write path (R-SINGLE-WRITER).
-      if (odooDirty) {
-        const companyIds = odoo.company_ids
-          .split(',')
-          .map((s) => s.trim())
-          .filter((s) => s !== '')
-          .map((s) => Number(s))
-          .filter((n) => Number.isInteger(n) && n >= 0);
-        // `unblock_models` isn't in the shared `AgentOdooOverride` type (api.ts)
-        // yet, but the gateway's `apply_odoo_to_table` already reads it off the
-        // same `odoo` object (handlers.rs) exactly like `allowed_models` — carry
-        // it as a typed extra field rather than widening the shared type.
-        const odooPayload: AgentOdooOverride & { unblock_models?: string[] } = {
-          profile: odoo.profile,
-          allowed_models: odoo.allowed_models,
-          unblock_models: odoo.unblock_models,
-          allowed_actions: odoo.allowed_actions,
-          company_ids: companyIds,
-          url: odoo.url,
-          db: odoo.db,
-          username: odoo.username,
-        };
-        if (odoo.clear_api_key) odooPayload.api_key = '';
-        else if (odoo.api_key.trim() !== '') odooPayload.api_key = odoo.api_key;
-        if (odoo.clear_password) odooPayload.password = '';
-        else if (odoo.password.trim() !== '') odooPayload.password = odoo.password;
-        submitForm.odoo = odooPayload;
-      }
-
-      // Advanced — G.8 scattered fields. Only include when edited.
-      if (advDirty) {
-        submitForm.account_pool = adv.account_pool;
-        submitForm.utility = adv.utility;
-        submitForm.heartbeat_max_concurrent_runs = adv.heartbeat_max_concurrent_runs;
-        if (adv.heartbeat_cron_timezone.trim() !== '') submitForm.heartbeat_cron_timezone = adv.heartbeat_cron_timezone.trim();
-        // proactive extras go under the nested proactive object.
-        submitForm.proactive = {
-          ...(submitForm.proactive ?? {}),
-          token_budget_per_check: adv.proactive_token_budget_per_check,
-          max_turns: adv.proactive_max_turns,
-          ...(adv.proactive_timezone.trim() !== '' ? { timezone: adv.proactive_timezone.trim() } : {}),
-          // Notify target (prefilled from inspect, so writing it back is safe;
-          // empty strings clear the target — readers treat empty as unset).
-          notify_channel: adv.proactive_notify_channel,
-          notify_chat_id: adv.proactive_notify_chat_id.trim(),
-          notify_thread_id: adv.proactive_notify_thread_id.trim(),
-          // W2-8 — quiet_hours. Prefilled from the agent's own raw value
-          // (never the effective/fallen-back one), so writing it back
-          // unchanged is safe; empty clears it. The gateway re-validates
-          // the same `HH:MM-HH:MM` format server-side (fail-closed).
-          quiet_hours: adv.proactive_quiet_hours.trim(),
-        };
-        // UI.3 — stagnation detection.
-        submitForm.stagnation_enabled = adv.stagnation_enabled;
-        submitForm.stagnation_window_seconds = adv.stagnation_window_seconds;
-        submitForm.stagnation_trigger_threshold = adv.stagnation_trigger_threshold;
-        submitForm.stagnation_action = adv.stagnation_action;
-        // Free-form scalar tables — drop empty keys.
-        const kvToObj = (rows: ReadonlyArray<KvRow>): Record<string, string> =>
-          Object.fromEntries(rows.filter((r) => r.key.trim() !== '').map((r) => [r.key.trim(), r.value]));
-        const ptc = kvToObj(adv.ptc);
-        const prompt = kvToObj(adv.prompt);
-        const cultural = kvToObj(adv.cultural_context);
-        if (Object.keys(ptc).length > 0) submitForm.ptc = ptc;
-        if (Object.keys(prompt).length > 0) submitForm.prompt = prompt;
-        if (Object.keys(cultural).length > 0) submitForm.cultural_context = cultural;
-      }
-
-      // updateAgent re-fetches the roster internally. Autosave never navigates
-      // away — the header SettingsSaveState indicator is the only feedback.
-        const res = await updateAgent(agent.name, submitForm);
+      if (hasChanges) {
+        // updateAgent re-fetches the roster internally. Autosave never
+        // navigates away — the header SettingsSaveState is the only feedback.
+        const res = await updateAgent(agent.name, payload as AgentUpdateParams);
+        sectionsSaved = true;
+        if (includesKv) setKvServerError(null);
         // Save-time auto-align: the gateway rewrote [runtime] provider to
         // match the model family — tell the operator instead of leaving a
         // silently-different config than what the form showed.
@@ -957,8 +791,7 @@ export function EditAgentPage() {
           );
         }
       }
-      // CON — a dirty contract writes through its own RPC (in addition to the
-      // section update above; a contract-only edit runs only this branch).
+      // CON — a dirty contract writes through its own RPC.
       if (doContract) {
         await api.contract.update(agent.name, contract);
       }
@@ -967,16 +800,21 @@ export function EditAgentPage() {
       savedResetTimerRef.current = setTimeout(() => setSaveStatus('idle'), 2000);
     } catch (e) {
       // Re-arm the gates so the next edit's cycle retries the failed write.
-      if (doSections) sectionsDirtyRef.current = true;
+      if (!sectionsSaved) {
+        // A rejected typed key/value write is not retried automatically —
+        // it would fail every later save too. Its message stays under the
+        // editor until the operator changes a row (which re-marks it).
+        for (const p of dirty) if (!(includesKv && p === 'kv')) dirtyRef.current.add(p);
+        if (includesKv) setKvServerError(e instanceof Error ? e.message : String(e));
+      }
       if (doContract) contractDirtyRef.current = true;
       setSaveStatus('error');
       setSaveError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: errorText(e) }));
     }
   }, [
-    agent, form, availableModels, updateAgent, intl,
-    capsDirty, caps, runtimeDirty, runtime, evoAdvDirty, evoAdv,
-    ctAdvDirty, ctAdv, odooDirty, odoo, advDirty, adv, contract,
+    agent, form, availableModels, updateAgent, intl, errorText,
+    caps, osWatch, research, runtime, evoAdv, odoo, adv, v168, contract,
   ]);
 
   // Keep the ref pointed at the latest closure so the debounce timer and the
@@ -1019,7 +857,7 @@ export function EditAgentPage() {
   useEffect(() => {
     return () => {
       if (savedResetTimerRef.current) clearTimeout(savedResetTimerRef.current);
-      if (sectionsDirtyRef.current || contractDirtyRef.current) {
+      if (dirtyRef.current.size > 0 || contractDirtyRef.current) {
         void performSaveRef.current();
       }
     };
@@ -1070,6 +908,7 @@ export function EditAgentPage() {
     { value: 'auto', label: intl.formatMessage({ id: 'agents.apiMode.auto' }), raw: 'auto' },
   ];
   const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));
+  const usesGenericCli = GENERIC_CLI_RUNTIMES.has(runtime.provider) || GENERIC_CLI_RUNTIMES.has(runtime.fallback);
   // A saved deprecated runtime (e.g. gemini) is no longer offered, but stays
   // visible and labelled so the current value is shown and can be kept.
   const withSavedDeprecated = (opts: SelectOption[], saved: string | undefined): SelectOption[] =>
@@ -1081,14 +920,17 @@ export function EditAgentPage() {
     { value: '', label: intl.formatMessage({ id: 'agents.runtime.fallback.none' }), raw: '' },
     ...providerOptions,
   ], runtime.fallback);
-  const localBackendOptions: SelectOption[] = [
-    { value: 'openai_compat', label: intl.formatMessage({ id: 'agents.backend.openaiCompat' }), raw: 'openai_compat' },
+  // v1.68 W1 — 推理力度 ('' = not set, the runtime's own default).
+  const effortOptions: SelectOption[] = [
+    { value: '', label: intl.formatMessage({ id: 'agents.v168.effort.unset' }), raw: '' },
+    ...EFFORT_LEVELS.map((e) => ({ value: e, label: intl.formatMessage({ id: `agents.v168.effort.${e}` }), raw: e })),
   ];
-  const expressivenessOptions: SelectOption[] = [
-    { value: 'minimal', label: intl.formatMessage({ id: 'agents.edit.stickerMinimal' }), raw: 'minimal' },
-    { value: 'moderate', label: intl.formatMessage({ id: 'agents.edit.stickerModerate' }), raw: 'moderate' },
-    { value: 'expressive', label: intl.formatMessage({ id: 'agents.edit.stickerExpressive' }), raw: 'expressive' },
+  // Team role runtime picker: '' = follow the employee's own runtime.
+  const teamRuntimeOptions: SelectOption[] = [
+    { value: '', label: intl.formatMessage({ id: 'agents.v168.team.followEmployee' }), raw: '' },
+    ...providerOptions,
   ];
+  const teamShareVendor = teamRolesShareVendor(v168.team_roles);
   // 'native' mode was removed: it is never offered as a new choice, but a saved
   // value stays visible and labelled (so the operator sees why computer use
   // does not start) and is kept until they pick another mode.
@@ -1108,10 +950,6 @@ export function EditAgentPage() {
     { value: 'slack', label: 'Slack', raw: 'slack' },
     { value: 'line', label: 'LINE', raw: 'line' },
   ];
-  const stagnationActionOptions: SelectOption[] = [
-    { value: 'log_only', label: intl.formatMessage({ id: 'agents.adv.stagnation.logOnly' }), raw: 'log_only' },
-    { value: 'suppress', label: intl.formatMessage({ id: 'agents.adv.stagnation.suppress' }), raw: 'suppress' },
-  ];
   const statusOptions: SelectOption[] = ['active', 'paused', 'terminated'].map((s) => ({ value: s, label: intl.formatMessage({ id: `status.${s}` }), raw: s }));
 
   // 上級 dropdown — existing agents (excluding self); keep the current value even
@@ -1130,8 +968,12 @@ export function EditAgentPage() {
     new Set([...departmentsOf(agents), ...registryDepartments]),
   ).sort();
 
-  const usesLocalModel =
-    (form.preferred ?? '').startsWith('local:') || (form.fallback ?? '').startsWith('local:');
+  // v1.68 W1 — one quiet line under every admin-only control for non-admins.
+  const adminHint = !isAdmin ? (
+    <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
+      {intl.formatMessage({ id: 'agents.v168.adminOnly.hint' })}
+    </p>
+  ) : null;
 
   // Rail groups (spec §5.3): 能力 (skills/tools/integration) + 設定 (general/…).
   const navGroups: SettingsNavGroup[] = [
@@ -1190,11 +1032,12 @@ export function EditAgentPage() {
           <SettingsSection>
             <SettingsCard>
               <RowNumber label={t('agents.edit.maxActiveSkills')} value={form.max_active_skills ?? 5} min={1} max={20} onChange={(v) => updateField('max_active_skills', v)} />
-              <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.edit.canModifySkills.help')} checked={form.can_modify_own_skills ?? true} onChange={(v) => updateField('can_modify_own_skills', v)} />
-              <RowSwitch label={t('agents.edit.skillSecurityScan')} description={t('agents.edit.skillSecurityScan.help')} checked={form.skill_security_scan ?? true} onChange={(v) => updateField('skill_security_scan', v)} />
+              <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.v168.perm.canModifySkills.help')} checked={form.can_modify_own_skills ?? true} onChange={(v) => updateField('can_modify_own_skills', v)} />
               <RowNumber label={t('agents.adv.skillTokenBudget')} value={form.skill_token_budget ?? 0} min={0} onChange={(v) => updateField('skill_token_budget', v)} />
             </SettingsCard>
           </SettingsSection>
+
+          <p className="px-1 text-xs text-muted-foreground">{t('agents.v168.skillScanAlways')}</p>
 
           <SettingsSection title={t('agents.evo.skillSynthesis')}>
             <SettingsCard>
@@ -1211,19 +1054,15 @@ export function EditAgentPage() {
             </SettingsCard>
           </SettingsSection>
 
-          <DangerZone title={t('agents.perm.danger.title')} description={t('agents.perm.danger.desc')}>
-            <SettingsCard>
-              <RowSwitch label={t('agents.edit.skillAutoActivate')} description={t('agents.edit.skillAutoActivate.help')} checked={form.skill_auto_activate ?? false} onChange={guardDanger(t('agents.edit.skillAutoActivate'), (v) => updateField('skill_auto_activate', v))} />
-            </SettingsCard>
-          </DangerZone>
         </SettingsTab>
 
         {/* ── 工具與權限 ────────────────────────────────────── */}
         <SettingsTab value="tools" title={t('agents.edit.nav.tools')} description={t('agents.edit.nav.tools.desc')}>
+          {adminHint}
           <SettingsSection title={t('agents.edit.section.permissions')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.canSendCrossAgent')} description={t('agents.edit.canSendCrossAgent.help')} checked={form.can_send_cross_agent ?? true} onChange={(v) => updateField('can_send_cross_agent', v)} />
-              <RowSwitch label={t('agents.edit.canScheduleTasks')} description={t('agents.edit.canScheduleTasks.help')} checked={form.can_schedule_tasks ?? false} onChange={(v) => updateField('can_schedule_tasks', v)} />
+              <RowSwitch label={t('agents.edit.canSendCrossAgent')} description={t('agents.v168.perm.canSendCrossAgent.help')} checked={form.can_send_cross_agent ?? true} onChange={(v) => updateField('can_send_cross_agent', v)} />
+              <RowSwitch label={t('agents.edit.canScheduleTasks')} description={t('agents.v168.perm.canScheduleTasks.help')} checked={form.can_schedule_tasks ?? true} onChange={(v) => updateField('can_schedule_tasks', v)} />
             </SettingsCard>
           </SettingsSection>
 
@@ -1232,6 +1071,10 @@ export function EditAgentPage() {
               `goal_loop::AutonomyLevel`). A single-select radio group (not a
               dropdown) so every level's plain-language consequence is visible
               at once, mirroring the 委派模式 pattern in DelegationTab. */}
+          {/* v1.68 W1 — the whole [capabilities] table is admin-only. A
+              disabled fieldset disables every native control inside; the
+              updaters also refuse for non-admins. */}
+          <fieldset disabled={!isAdmin} className="contents">
           <SettingsSection title={t('agents.autonomy.title')} description={t('agents.autonomy.desc')}>
             <SettingsCard>
               {AUTONOMY_LEVELS.map((level) => (
@@ -1268,6 +1111,7 @@ export function EditAgentPage() {
               allowedTools={caps.allowed_tools}
               onDeniedChange={(v) => updateCap('denied_tools', v)}
               onClearAllowlist={() => updateCap('allowed_tools', [])}
+              disabled={!isAdmin}
             />
           </SettingsSection>
 
@@ -1293,6 +1137,7 @@ export function EditAgentPage() {
                         className="flex cursor-pointer items-center gap-3 px-4 py-3 hover:bg-surface-hover"
                       >
                         <Checkbox
+                          disabled={!isAdmin}
                           checked={row.checked}
                           onCheckedChange={() => updateCap('db_sources', toggleDbSourceCapability(caps.db_sources, row.id))}
                         />
@@ -1340,12 +1185,49 @@ export function EditAgentPage() {
                   <ChipEditor values={caps.wiki_visible_to} onChange={(v) => updateCap('wiki_visible_to', v)} placeholder="coder" addLabel={t('common.add')} />
                 </FieldBlock>
                 <SettingsCard>
-                  <RowSwitch label={t('agents.cap.nativeSandbox')} description={t('agents.cap.nativeSandbox.help')} checked={caps.native_sandbox} onChange={(v) => updateCap('native_sandbox', v)} />
+                  <RowSwitch disabled={!isAdmin} label={t('agents.cap.nativeSandbox')} description={t('agents.cap.nativeSandbox.help')} checked={caps.native_sandbox} onChange={(v) => updateCap('native_sandbox', v)} />
                 </SettingsCard>
                 <FieldBlock label={t('agents.cap.policy')} description={t('agents.cap.policy.help')}>
                   <ToolPolicyEditor value={caps.policy} onChange={(v) => updateCap('policy', v)} />
                 </FieldBlock>
               </>
+            )}
+          </SettingsSection>
+
+          {/* v1.68 W1 — tools that need a checkpoint before they run
+              ([capabilities] approval_required_tools / irreversible_tools /
+              maybe_irreversible_tools / scoped_tools; bare tool names). */}
+          <SettingsSection title={t('agents.v168.toolGates.title')} description={t('agents.v168.toolGates.desc')}>
+            <ToolNameListField label={t('agents.v168.toolGates.approval')} description={t('agents.v168.toolGates.approval.help')} values={caps.approval_required_tools} onChange={(v) => updateCap('approval_required_tools', v)} disabled={!isAdmin} />
+            <ToolNameListField label={t('agents.v168.toolGates.irreversible')} description={t('agents.v168.toolGates.irreversible.help')} values={caps.irreversible_tools} onChange={(v) => updateCap('irreversible_tools', v)} disabled={!isAdmin} />
+            <ToolNameListField label={t('agents.v168.toolGates.maybe')} description={t('agents.v168.toolGates.maybe.help')} values={caps.maybe_irreversible_tools} onChange={(v) => updateCap('maybe_irreversible_tools', v)} disabled={!isAdmin} />
+            <ToolNameListField label={t('agents.v168.toolGates.scoped')} description={t('agents.v168.toolGates.scoped.help')} values={caps.scoped_tools} onChange={(v) => updateCap('scoped_tools', v)} disabled={!isAdmin} />
+            {usesGenericCli && (
+              <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.v168.genericCli.note')}</p>
+            )}
+          </SettingsSection>
+          </fieldset>
+
+          {/* v1.68 W1 — [fork] enabled (live forking). */}
+          <SettingsSection title={t('agents.v168.fork.title')}>
+            <SettingsCard>
+              <RowSwitch label={t('agents.v168.fork.enabled')} description={t('agents.v168.fork.enabled.help')} checked={v168.fork_enabled} onChange={(v) => updateV('fork_enabled', v)} />
+            </SettingsCard>
+          </SettingsSection>
+
+          {/* v1.68 W1 — [guardrails] outbound reply scanning. */}
+          <SettingsSection title={t('agents.v168.guardrails.title')} description={t('agents.v168.guardrails.desc')}>
+            <SettingsCard>
+              <RowSwitch label={t('agents.v168.guardrails.enabled')} checked={v168.guardrails_enabled} onChange={(v) => updateV('guardrails_enabled', v)} />
+              <RowSwitch label={t('agents.v168.guardrails.blockSecrets')} description={t('agents.v168.guardrails.blockSecrets.help')} checked={v168.guardrails_block_secrets} onChange={(v) => updateV('guardrails_block_secrets', v)} />
+              <RowSwitch label={t('agents.v168.guardrails.blockInjectionEcho')} description={t('agents.v168.guardrails.blockInjectionEcho.help')} checked={v168.guardrails_block_injection_echo} onChange={(v) => updateV('guardrails_block_injection_echo', v)} />
+              <RowSwitch label={t('agents.v168.guardrails.redactPii')} description={t('agents.v168.guardrails.redactPii.help')} checked={v168.guardrails_redact_pii} onChange={(v) => updateV('guardrails_redact_pii', v)} />
+            </SettingsCard>
+            <FieldBlock label={t('agents.v168.guardrails.denyPhrases')} description={t('agents.v168.guardrails.denyPhrases.help')}>
+              <ChipEditor values={v168.guardrails_deny_phrases} onChange={(v) => updateV('guardrails_deny_phrases', v)} placeholder={t('agents.v168.guardrails.denyPhrases.placeholder')} addLabel={t('common.add')} />
+            </FieldBlock>
+            {!v168.guardrails_enabled && (
+              <p className="px-1 text-xs text-muted-foreground">{t('agents.v168.guardrails.offNote')}</p>
             )}
           </SettingsSection>
 
@@ -1381,20 +1263,21 @@ export function EditAgentPage() {
 
           <DangerZone title={t('agents.perm.danger.title')} description={t('agents.perm.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.edit.canCreateAgents.help')} checked={form.can_create_agents ?? false} onChange={guardDanger(t('agents.edit.canCreateAgents'), (v) => updateField('can_create_agents', v), 'agents.edit.dangerConfirm.canCreateAgents')} />
-              <RowSwitch label={t('agents.edit.canModifySoul')} description={t('agents.edit.canModifySoul.help')} checked={form.can_modify_own_soul ?? false} onChange={guardDanger(t('agents.edit.canModifySoul'), (v) => updateField('can_modify_own_soul', v), 'agents.edit.dangerConfirm.canModifySoul')} />
+              <RowSwitch label={t('agents.edit.canCreateAgents')} description={t('agents.v168.perm.canCreateAgents.help')} checked={form.can_create_agents ?? true} onChange={guardDanger(t('agents.edit.canCreateAgents'), (v) => updateField('can_create_agents', v), 'agents.edit.dangerConfirm.canCreateAgents')} />
+              <RowSwitch label={t('agents.edit.canModifySoul')} description={t('agents.edit.canModifySoul.help')} checked={form.can_modify_own_soul ?? false} disabled={!isAdmin} onChange={guardDanger(t('agents.edit.canModifySoul'), (v) => updateField('can_modify_own_soul', v), 'agents.edit.dangerConfirm.canModifySoul')} />
             </SettingsCard>
           </DangerZone>
 
+          <fieldset disabled={!isAdmin} className="contents">
           <DangerZone title={t('agents.cap.danger.title')} description={t('agents.cap.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.cap.computerUse')} description={t('agents.cap.computerUse.help')} checked={caps.computer_use} onChange={guardDanger(t('agents.cap.computerUse'), (v) => updateCap('computer_use', v), 'agents.edit.dangerConfirm.computerUse')} />
-              <RowSelect label={t('agents.cap.computerUseMode')} description={t('agents.cap.computerUseMode.help')} value={caps.computer_use_mode} onChange={(v) => updateCap('computer_use_mode', v as ComputerUseMode)} options={computerUseModeOptions} />
-              <RowSwitch label={t('agents.cap.browserViaBash')} description={t('agents.cap.browserViaBash.help')} checked={caps.browser_via_bash} onChange={guardDanger(t('agents.cap.browserViaBash'), (v) => updateCap('browser_via_bash', v), 'agents.edit.dangerConfirm.browserViaBash')} />
-              <RowSwitch label={t('agents.cap.recording')} description={t('agents.cap.recording.help')} checked={caps.recording} onChange={guardDanger(t('agents.cap.recording'), (v) => updateCap('recording', v), 'agents.edit.dangerConfirm.recording')} />
-              <RowSwitch label={t('agents.cap.gitCredentials')} description={t('agents.cap.gitCredentials.help')} checked={caps.git_credentials} onChange={guardDanger(t('agents.cap.gitCredentials'), (v) => updateCap('git_credentials', v), 'agents.edit.dangerConfirm.gitCredentials')} />
-              <RowSwitch label={t('agents.cap.systemOperator')} description={t('agents.cap.systemOperator.help')} checked={caps.system_operator} onChange={guardDanger(t('agents.cap.systemOperator'), (v) => updateCap('system_operator', v), 'agents.edit.dangerConfirm.systemOperator')} />
-              <RowSwitch label={t('agents.cap.codrive')} description={t('agents.cap.codrive.help')} checked={caps.codrive} onChange={guardDanger(t('agents.cap.codrive'), (v) => updateCap('codrive', v), 'agents.edit.dangerConfirm.codrive')} />
+              <RowSwitch disabled={!isAdmin} label={t('agents.cap.computerUse')} description={t('agents.cap.computerUse.help')} checked={caps.computer_use} onChange={guardDanger(t('agents.cap.computerUse'), (v) => updateCap('computer_use', v), 'agents.edit.dangerConfirm.computerUse')} />
+              <RowSelect disabled={!isAdmin} label={t('agents.cap.computerUseMode')} description={t('agents.cap.computerUseMode.help')} value={caps.computer_use_mode} onChange={(v) => updateCap('computer_use_mode', v as ComputerUseMode)} options={computerUseModeOptions} />
+              <RowSwitch disabled={!isAdmin} label={t('agents.cap.browserViaBash')} description={t('agents.cap.browserViaBash.help')} checked={caps.browser_via_bash} onChange={guardDanger(t('agents.cap.browserViaBash'), (v) => updateCap('browser_via_bash', v), 'agents.edit.dangerConfirm.browserViaBash')} />
+              <RowSwitch disabled={!isAdmin} label={t('agents.cap.recording')} description={t('agents.cap.recording.help')} checked={caps.recording} onChange={guardDanger(t('agents.cap.recording'), (v) => updateCap('recording', v), 'agents.edit.dangerConfirm.recording')} />
+              <RowSwitch disabled={!isAdmin} label={t('agents.cap.gitCredentials')} description={t('agents.cap.gitCredentials.help')} checked={caps.git_credentials} onChange={guardDanger(t('agents.cap.gitCredentials'), (v) => updateCap('git_credentials', v), 'agents.edit.dangerConfirm.gitCredentials')} />
+              <RowSwitch disabled={!isAdmin} label={t('agents.cap.systemOperator')} description={t('agents.cap.systemOperator.help')} checked={caps.system_operator} onChange={guardDanger(t('agents.cap.systemOperator'), (v) => updateCap('system_operator', v), 'agents.edit.dangerConfirm.systemOperator')} />
+              <RowSwitch disabled={!isAdmin} label={t('agents.cap.codrive')} description={t('agents.cap.codrive.help')} checked={caps.codrive} onChange={guardDanger(t('agents.cap.codrive'), (v) => updateCap('codrive', v), 'agents.edit.dangerConfirm.codrive')} />
             </SettingsCard>
             {caps.computer_use_mode === 'native' && (
               <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.nativeRemoved')}</p>
@@ -1416,14 +1299,15 @@ export function EditAgentPage() {
               <RowNumber label={t('agents.cap.maxActions')} description="1-10000" value={caps.computer_use_config.max_actions} min={1} max={10000} onChange={(v) => updateCapConfig('max_actions', v)} />
               <RowNumber label={t('agents.cap.displayWidth')} description="320-7680" value={caps.computer_use_config.display_width} min={320} max={7680} onChange={(v) => updateCapConfig('display_width', v)} />
               <RowNumber label={t('agents.cap.displayHeight')} description="240-4320" value={caps.computer_use_config.display_height} min={240} max={4320} onChange={(v) => updateCapConfig('display_height', v)} />
-              <RowSwitch label={t('agents.cap.autoConfirmTrusted')} description={t('agents.cap.autoConfirmTrusted.help')} checked={caps.computer_use_config.auto_confirm_trusted ?? false} onChange={(v) => updateCapConfig('auto_confirm_trusted', v)} />
+              <RowSwitch disabled={!isAdmin} label={t('agents.cap.autoConfirmTrusted')} description={t('agents.cap.autoConfirmTrusted.help')} checked={caps.computer_use_config.auto_confirm_trusted ?? false} onChange={(v) => updateCapConfig('auto_confirm_trusted', v)} />
             </SettingsCard>
           </DangerZone>
+          </fieldset>
 
           {/* OW — v1.39 OS-native filesystem watch ([os_watch]) */}
           <SettingsSection title={t('agents.osWatch')} description={t('agents.osWatch.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.cap.osNative')} description={t('agents.cap.osNative.help')} checked={caps.os_native} onChange={(v) => updateCap('os_native', v)} />
+              <RowSwitch label={t('agents.cap.osNative')} description={t('agents.cap.osNative.help')} checked={caps.os_native} disabled={!isAdmin} onChange={(v) => updateCap('os_native', v)} />
             </SettingsCard>
             {caps.os_native && (
               <>
@@ -1552,13 +1436,14 @@ export function EditAgentPage() {
               <RowText label={t('agents.edit.icon')} description={t('agents.edit.icon.help')} tier="code" value={form.icon ?? ''} onChange={(v) => updateField('icon', v)} />
               <RowSelect label={t('agents.edit.role')} description={t('agents.edit.role.help')} value={form.role ?? 'specialist'} onChange={(v) => updateField('role', v)} options={roleOptions} />
               <RowText label={t('agents.edit.trigger')} description={t('agents.edit.trigger.help')} value={form.trigger ?? ''} onChange={(v) => updateField('trigger', v)} />
-              <RowSelect label={t('agents.edit.reportsTo')} description={t('agents.edit.reportsTo.help')} value={form.reports_to ?? ''} onChange={(v) => updateField('reports_to', v)} options={reportsToOptions} />
+              <RowSelect label={t('agents.edit.reportsTo')} description={t('agents.edit.reportsTo.help')} value={form.reports_to ?? ''} onChange={(v) => updateField('reports_to', v)} options={reportsToOptions} disabled={!isAdmin} />
               {!isPersonal && (
                 <SettingsRow label={t('agents.department.label')} description={t('agents.department.help')} tier="text">
                   <Input
                     list="agent-department-options"
                     value={form.department ?? ''}
                     placeholder={t('agents.department.placeholder')}
+                    disabled={!isAdmin}
                     onChange={(e) => updateField('department', e.target.value)}
                   />
                   <datalist id="agent-department-options">
@@ -1570,6 +1455,7 @@ export function EditAgentPage() {
               )}
               <RowSelect label={t('agents.adv.statusField')} value={form.status ?? 'active'} onChange={(v) => updateField('status', v)} options={statusOptions} />
             </SettingsCard>
+            {adminHint}
           </SettingsSection>
         </SettingsTab>
 
@@ -1588,6 +1474,7 @@ export function EditAgentPage() {
             </FieldBlock>
             <SettingsCard>
               <RowSelect label={t('agents.edit.apiMode')} description={t('agents.edit.apiMode.help')} value={form.api_mode ?? 'cli'} onChange={(v) => updateField('api_mode', v as 'cli' | 'direct' | 'auto')} options={apiModeOptions} />
+              <RowSelect label={t('agents.v168.effort')} description={t('agents.v168.effort.help')} value={v168.effort} onChange={(v) => updateV('effort', v as AgentEffort)} options={effortOptions} />
             </SettingsCard>
           </SettingsSection>
 
@@ -1595,22 +1482,40 @@ export function EditAgentPage() {
             <SettingsCard>
               <RowSelect label={t('agents.runtime.provider')} description={t('agents.runtime.provider.hint')} value={runtime.provider} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerPickerOptions} />
               <RowSelect label={t('agents.runtime.fallback')} description={t('agents.runtime.fallback.hint')} value={runtime.fallback} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
+              <RowSwitch label={t('agents.v168.minimalContext')} description={t('agents.v168.minimalContext.help')} checked={v168.minimal_context} onChange={(v) => updateV('minimal_context', v)} />
             </SettingsCard>
+            {usesGenericCli && (
+              <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.v168.genericCli.note')}</p>
+            )}
+          </SettingsSection>
+
+          {/* v1.68 W1 — 一員工四角色 ([team] enabled + [team.roles.*]). */}
+          <SettingsSection title={t('agents.v168.team.title')} description={t('agents.v168.team.desc')}>
+            <SettingsCard>
+              <RowSwitch label={t('agents.v168.team.enabled')} description={t('agents.v168.team.enabled.help')} checked={v168.team_enabled} onChange={(v) => updateV('team_enabled', v)} />
+            </SettingsCard>
+            {TEAM_ROLE_KEYS.map((role) => (
+              <FieldBlock key={role} label={t(`agents.v168.team.role.${role}`)} description={t(`agents.v168.team.role.${role}.help`)}>
+                <SettingsCard>
+                  <RowSelect label={intl.formatMessage({ id: 'agents.v168.team.runtime' }, { role: t(`agents.v168.team.role.${role}`) })} value={v168.team_roles[role].runtime} onChange={(v) => updateTeamRole(role, 'runtime', v)} options={teamRuntimeOptions} />
+                  <RowText label={intl.formatMessage({ id: 'agents.v168.team.model' }, { role: t(`agents.v168.team.role.${role}`) })} value={v168.team_roles[role].model} placeholder={t('agents.v168.team.model.placeholder')} onChange={(v) => updateTeamRole(role, 'model', v)} />
+                  <RowSelect label={intl.formatMessage({ id: 'agents.v168.team.effort' }, { role: t(`agents.v168.team.role.${role}`) })} value={v168.team_roles[role].effort} onChange={(v) => updateTeamRole(role, 'effort', v)} options={effortOptions} />
+                </SettingsCard>
+              </FieldBlock>
+            ))}
+            <p className="px-1 text-xs text-muted-foreground">{t('agents.v168.team.rule')}</p>
+            {teamShareVendor && (
+              <p role="alert" className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.v168.team.sameVendor')}</p>
+            )}
           </SettingsSection>
 
           <SettingsSection title={t('agentForm.brain.section.local')} description={t('agentForm.brain.section.local.desc')}>
             <SettingsCard>
               <RowSwitch label={t('agents.edit.confidenceRouter')} description={t('agents.edit.confidenceRouter.help')} checked={form.use_router ?? false} onChange={(v) => updateField('use_router', v)} />
             </SettingsCard>
-            {usesLocalModel && (
-              <SettingsCard>
-                {/* 「Context 長度」/「GPU Layers」 were removed: `[model.local]
-                    context_length` / `gpu_layers` have no runtime reader (the
-                    external OpenAI-compatible server owns both). Saved values
-                    are kept — the form still round-trips them as loaded. */}
-                <RowSelect label={t('agents.edit.inferenceBackend')} value={form.local_backend ?? 'openai_compat'} onChange={(v) => updateField('local_backend', v)} options={localBackendOptions} />
-              </SettingsCard>
-            )}
+            {/* v1.68: the 推理後端 / Context 長度 / GPU Layers rows are gone —
+                `[model.local] backend/context_length/gpu_layers` had no runtime
+                reader and were deleted server-side. */}
           </SettingsSection>
 
           {/* 帳號池 — picks from the accounts the deployment actually has
@@ -1631,27 +1536,20 @@ export function EditAgentPage() {
 
           <SettingsSection title={t('settings.container')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.sandbox')} description={t('agents.edit.sandbox.help')} checked={form.sandbox_enabled ?? false} onChange={(v) => updateField('sandbox_enabled', v)} />
-              <RowSwitch label={t('agents.edit.readonlyProject')} description={t('agents.edit.readonlyProject.help')} checked={form.readonly_project ?? true} onChange={(v) => updateField('readonly_project', v)} />
+              <RowSwitch label={t('agents.edit.sandbox')} description={t('agents.edit.sandbox.help')} checked={form.sandbox_enabled ?? false} disabled={!isAdmin} onChange={(v) => updateField('sandbox_enabled', v)} />
               <SettingsRow label={t('agents.edit.taskTimeout')} description={t('agents.edit.taskTimeout.help')} tier="select-wide">
                 <DurationField seconds={Math.round((form.timeout_ms ?? 1800000) / 1000)} onChange={(s) => updateField('timeout_ms', s * 1000)} units={['sec', 'min', 'hour']} min={0} />
               </SettingsRow>
-              <RowNumber label={t('agents.edit.maxConcurrent')} description={t('agents.edit.maxConcurrent.help')} value={form.max_concurrent ?? 1} min={1} max={10} onChange={(v) => updateField('max_concurrent', v)} />
             </SettingsCard>
             {(form.sandbox_enabled ?? false) && !(form.network_access ?? false) && (
               <p role="alert" className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.edit.sandbox.needsNetwork')}</p>
             )}
-            <FieldBlock label={t('agents.container.cmd')} description={t('agents.container.cmd.hint')}>
-              <ChipEditor values={ctAdv.cmd} onChange={(v) => updateCtAdv('cmd', v)} placeholder="bash" addLabel={t('common.add')} />
-            </FieldBlock>
-            <EnvTable env={ctAdv.env} onChange={(v) => updateCtAdv('env', v)} />
           </SettingsSection>
 
           <DangerZone title={t('agents.container.danger.title')} description={t('agents.container.danger.desc')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.edit.networkAccess')} description={t('agents.edit.networkAccess.help')} checked={form.network_access ?? false} onChange={guardDanger(t('agents.edit.networkAccess'), (v) => updateField('network_access', v), 'agents.edit.dangerConfirm.networkAccess')} />
+              <RowSwitch label={t('agents.edit.networkAccess')} description={t('agents.edit.networkAccess.help')} checked={form.network_access ?? false} disabled={!isAdmin} onChange={guardDanger(t('agents.edit.networkAccess'), (v) => updateField('network_access', v), 'agents.edit.dangerConfirm.networkAccess')} />
             </SettingsCard>
-            <MountTable mounts={ctAdv.additional_mounts} onChange={(v) => updateCtAdv('additional_mounts', v)} />
           </DangerZone>
         </SettingsTab>
 
@@ -1669,7 +1567,13 @@ export function EditAgentPage() {
               </SettingsRow>
               <RowNumber label={t('agents.edit.warnThreshold')} description={t('agents.edit.warnThreshold.help')} value={form.warn_threshold_percent ?? 80} min={0} max={100} onChange={(v) => updateField('warn_threshold_percent', v)} />
               <RowSwitch label={t('agents.edit.hardStop')} description={t('agents.edit.hardStop.help')} checked={form.hard_stop ?? true} onChange={(v) => updateField('hard_stop', v)} />
+              <SettingsRow label={t('agents.v168.dailyCap')} description={t('agents.v168.dailyCap.help')} tier="select">
+                <MoneyField cents={v168.daily_cap_cents} onChange={(c) => updateV('daily_cap_cents', c)} />
+              </SettingsRow>
             </SettingsCard>
+            {v168.daily_cap_cents > 0 && !(form.hard_stop ?? true) && (
+              <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.v168.dailyCap.needsHardStop')}</p>
+            )}
             <CrossLink label={t('agentForm.brain.budget.manageLink')} onClick={() => navigate('/app/system/accounts')} />
           </SettingsSection>
         </SettingsTab>
@@ -1683,7 +1587,7 @@ export function EditAgentPage() {
                 <DurationField seconds={form.heartbeat_interval ?? 3600} onChange={(s) => updateField('heartbeat_interval', s)} units={['sec', 'min', 'hour']} min={60} />
               </SettingsRow>
               <RowNumber label={t('agents.adv.maxConcurrentRuns')} value={adv.heartbeat_max_concurrent_runs} min={1} max={64} onChange={(v) => updateAdv('heartbeat_max_concurrent_runs', v)} />
-              <RowText label={t('agents.adv.cronTimezone')} description="Asia/Taipei" tier="select-wide" value={adv.heartbeat_cron_timezone} placeholder="Asia/Taipei" onChange={(v) => updateAdv('heartbeat_cron_timezone', v)} />
+              <RowText label={t('agents.adv.cronTimezone')} description={t('agents.v168.timezone.clearHint')} tier="select-wide" value={adv.heartbeat_cron_timezone} placeholder="Asia/Taipei" onChange={(v) => updateAdv('heartbeat_cron_timezone', v)} />
             </SettingsCard>
             <FieldBlock label={t('agents.edit.heartbeatCron')} description={t('agents.edit.heartbeatCron.help')}>
               <ScheduleBuilder value={form.heartbeat_cron ?? ''} onChange={(c) => updateField('heartbeat_cron', c)} />
@@ -1692,9 +1596,19 @@ export function EditAgentPage() {
 
           <SettingsSection title={t('agents.adv.status')}>
             <SettingsCard>
-              <RowNumber label={t('agents.adv.tokenBudgetPerCheck')} value={adv.proactive_token_budget_per_check} min={0} onChange={(v) => updateAdv('proactive_token_budget_per_check', v)} />
-              <RowNumber label={t('agents.adv.proactiveMaxTurns')} value={adv.proactive_max_turns} min={1} max={100} onChange={(v) => updateAdv('proactive_max_turns', v)} />
-              <RowText label={t('agents.adv.proactiveTimezone')} description="Asia/Taipei" tier="select-wide" value={adv.proactive_timezone} placeholder="Asia/Taipei" onChange={(v) => updateAdv('proactive_timezone', v)} />
+              {/* Absent in agent.toml ⇒ shown empty ("unset"), never a fabricated 1. */}
+              <SettingsRow label={t('agents.adv.proactiveMaxTurns')} tier="select">
+                <Input
+                  type="number"
+                  min={1}
+                  max={100}
+                  aria-label={t('agents.adv.proactiveMaxTurns')}
+                  placeholder={t('agents.v168.effort.unset')}
+                  value={adv.proactive_max_turns ?? ''}
+                  onChange={(e) => updateAdv('proactive_max_turns', e.target.value === '' ? null : Number(e.target.value))}
+                />
+              </SettingsRow>
+              <RowText label={t('agents.adv.proactiveTimezone')} description={t('agents.v168.timezone.clearHint')} tier="select-wide" value={adv.proactive_timezone} placeholder="Asia/Taipei" onChange={(v) => updateAdv('proactive_timezone', v)} />
               <RowNumber label={t('agents.edit.maxSilenceHours')} value={form.max_silence_hours ?? 12} min={1} step={0.5} onChange={(v) => updateField('max_silence_hours', v)} />
             </SettingsCard>
           </SettingsSection>
@@ -1744,6 +1658,21 @@ export function EditAgentPage() {
             </SettingsCard>
           </SettingsSection>
 
+          {/* v1.68 W1 — [night_engine] enabled. */}
+          <SettingsSection title={t('agents.v168.night.title')}>
+            <SettingsCard>
+              <RowSwitch label={t('agents.v168.night.enabled')} description={t('agents.v168.night.enabled.help')} checked={v168.night_engine_enabled} onChange={(v) => updateV('night_engine_enabled', v)} />
+            </SettingsCard>
+          </SettingsSection>
+
+          {/* v1.68 W1 — [memory] decision_continuity / decision_ttl_days. */}
+          <SettingsSection title={t('agents.v168.memory.title')}>
+            <SettingsCard>
+              <RowSwitch label={t('agents.v168.memory.decisionContinuity')} description={t('agents.v168.memory.decisionContinuity.help')} checked={v168.decision_continuity} onChange={(v) => updateV('decision_continuity', v)} />
+              <RowNumber label={t('agents.v168.memory.decisionTtlDays')} description={t('agents.v168.memory.decisionTtlDays.help')} value={v168.decision_ttl_days} min={1} max={3650} onChange={(v) => updateV('decision_ttl_days', v)} />
+            </SettingsCard>
+          </SettingsSection>
+
           <SettingsSection title={t('agents.evo.externalFactors')}>
             <SettingsCard>
               <RowSwitch label={t('agents.evo.userFeedback')} checked={evoAdv.external_factors.user_feedback} onChange={(v) => updateEvoFactor('user_feedback', v)} />
@@ -1751,15 +1680,6 @@ export function EditAgentPage() {
               <RowSwitch label={t('agents.evo.channelMetrics')} checked={evoAdv.external_factors.channel_metrics} onChange={(v) => updateEvoFactor('channel_metrics', v)} />
               <RowSwitch label={t('agents.evo.businessContext')} checked={evoAdv.external_factors.business_context} onChange={(v) => updateEvoFactor('business_context', v)} />
               <RowSwitch label={t('agents.evo.peerSignals')} checked={evoAdv.external_factors.peer_signals} onChange={(v) => updateEvoFactor('peer_signals', v)} />
-            </SettingsCard>
-          </SettingsSection>
-
-          <SettingsSection title={t('agents.adv.stagnation')}>
-            <SettingsCard>
-              <RowSwitch label={t('agents.evo.enabled')} checked={adv.stagnation_enabled} onChange={(v) => updateAdv('stagnation_enabled', v)} />
-              <RowNumber label={t('agents.adv.stagnationWindow')} value={adv.stagnation_window_seconds} min={1} onChange={(v) => updateAdv('stagnation_window_seconds', v)} />
-              <RowNumber label={t('agents.adv.stagnationThreshold')} value={adv.stagnation_trigger_threshold} min={1} onChange={(v) => updateAdv('stagnation_trigger_threshold', v)} />
-              <RowSelect label={t('agents.adv.stagnationAction')} value={adv.stagnation_action} onChange={(v) => updateAdv('stagnation_action', v as 'log_only' | 'suppress')} options={stagnationActionOptions} />
             </SettingsCard>
           </SettingsSection>
 
@@ -1787,31 +1707,9 @@ export function EditAgentPage() {
 
         {/* ── 進階 ─────────────────────────────────────────── */}
         <SettingsTab value="advanced" title={t('agents.edit.nav.advanced')} description={t('agents.edit.nav.advanced.desc')}>
-          <SettingsSection title={t('agents.edit.sticker')} description={t('agents.edit.stickerDesc')}>
-            <SettingsCard>
-              <RowSwitch label={t('agents.edit.stickerEnabled')} checked={form.sticker_enabled ?? false} onChange={(v) => updateField('sticker_enabled', v)} />
-              <SettingsRow label={t('agents.edit.stickerProbability')} tier="text">
-                <div className="flex items-center gap-2">
-                  <input type="range" min={0} max={1} step={0.05} value={form.sticker_probability ?? 0.3} onChange={(e) => updateField('sticker_probability', Number(e.target.value))} className="w-full accent-primary" aria-label={t('agents.edit.stickerProbability')} />
-                  <span className="w-10 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground">{((form.sticker_probability ?? 0.3) * 100).toFixed(0)}%</span>
-                </div>
-              </SettingsRow>
-              <SettingsRow label={t('agents.edit.stickerIntensity')} tier="text">
-                <div className="flex items-center gap-2">
-                  <input type="range" min={0} max={1} step={0.05} value={form.sticker_intensity_threshold ?? 0.7} onChange={(e) => updateField('sticker_intensity_threshold', Number(e.target.value))} className="w-full accent-primary" aria-label={t('agents.edit.stickerIntensity')} />
-                  <span className="w-10 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground">{((form.sticker_intensity_threshold ?? 0.7) * 100).toFixed(0)}%</span>
-                </div>
-              </SettingsRow>
-              <RowNumber label={t('agents.edit.stickerCooldown')} value={form.sticker_cooldown_messages ?? 5} min={0} max={100} onChange={(v) => updateField('sticker_cooldown_messages', v)} />
-              <RowSelect label={t('agents.edit.stickerExpressiveness')} value={form.sticker_expressiveness ?? 'moderate'} onChange={(v) => updateField('sticker_expressiveness', v as 'minimal' | 'moderate' | 'expressive')} options={expressivenessOptions} />
-            </SettingsCard>
-          </SettingsSection>
-
           <SettingsSection title={t('agents.adv.modelExtras')} description={t('agents.adv.desc')}>
             <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.adv.kv.warning')}</p>
-            <KvTable title={t('agents.adv.ptc')} rows={adv.ptc} onChange={(v) => updateAdv('ptc', v)} />
-            <KvTable title={t('agents.adv.prompt')} rows={adv.prompt} onChange={(v) => updateAdv('prompt', v)} />
-            <KvTable title={t('agents.adv.culturalContext')} rows={adv.cultural_context} onChange={(v) => updateAdv('cultural_context', v)} />
+            <TypedKvTable rows={adv.kv} onChange={(v) => { setKvServerError(null); updateAdv('kv', v); }} serverError={kvServerError} />
           </SettingsSection>
         </SettingsTab>
       </SettingsShell>

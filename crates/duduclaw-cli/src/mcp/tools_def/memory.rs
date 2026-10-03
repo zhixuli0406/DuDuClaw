@@ -10,7 +10,7 @@ use super::super::{ParamDef, ToolDef};
 pub(super) const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "memory_search",
-        description: "Search agent memory",
+        description: "Search your own memory: what you stored plus what the gateway learned from your conversations (the facts injected into your prompt).",
         params: &[ParamDef {
             name: "query",
             description: "Search query",
@@ -19,7 +19,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "memory_store",
-        description: "Store a memory entry",
+        description: "Store a memory entry in your own memory (the same store the gateway injects from and the dashboard shows).",
         params: &[
             ParamDef {
                 name: "content",

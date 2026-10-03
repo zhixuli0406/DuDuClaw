@@ -130,6 +130,7 @@ impl MethodHandler {
                 let handles: Vec<(String, tokio::task::JoinHandle<()>)> = match channel_type {
                     "discord" => crate::discord::start_discord_bots(&self.home_dir, ctx).await,
                     "telegram" => crate::telegram::start_telegram_bots(&self.home_dir, ctx).await,
+                    "slack" => crate::slack::start_slack_bots(&self.home_dir, ctx).await,
                     _ => Vec::new(),
                 };
                 for (l, h) in handles {
@@ -147,6 +148,10 @@ impl MethodHandler {
                     "success": true,
                     "type": label,
                     "hot_started": hot_started,
+                    // v1.68.0: every per-agent transport hot-starts; a false
+                    // `hot_started` means the credentials did not work.
+                    "restart_required": false,
+                    "not_started_reason": (!hot_started).then_some("check_credentials"),
                 }),
             );
         }
@@ -341,6 +346,17 @@ impl MethodHandler {
                 "success": true,
                 "type": channel_type,
                 "hot_started": hot_started,
+                // v1.68.0: all global transports (bots and webhooks) start
+                // without a restart. `hot_started: false` means the saved
+                // configuration is incomplete or the credentials failed.
+                "restart_required": false,
+                "not_started_reason": (!hot_started).then_some(
+                    if crate::webhook_slots::is_webhook_channel(channel_type) {
+                        "webhook_config_incomplete"
+                    } else {
+                        "check_credentials"
+                    }
+                ),
             }),
         )
     }

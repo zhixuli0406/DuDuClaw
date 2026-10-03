@@ -48,7 +48,23 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     let auth_cache = crate::mcp_auth::KeyRegistryCache::new();
     let principal = crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache)
         .map_err(|e| DuDuClawError::Gateway(format!("MCP authentication failed: {e}")))?;
-    let ns_ctx = crate::mcp_namespace::resolve(&principal)
+    // Memory namespace unification (v1.68.0): an internal-key caller whose
+    // `DUDUCLAW_AGENT_ID` is proven by `DUDUCLAW_AGENT_TOKEN` reads and writes
+    // memory under the bare employee id — the same rows the gateway distils,
+    // injects and shows on the dashboard. The environment does not change for
+    // the life of this process, so the proof is checked once here; without it
+    // the caller stays in the old shared pool (fail closed).
+    let verified_agent = crate::mcp_namespace::verified_employee_from_env(home_dir);
+    let resolve_ns = |p: &crate::mcp_auth::Principal| {
+        crate::mcp_namespace::resolve_for_caller(
+            p,
+            crate::mcp_namespace::CallerIdentity {
+                verified_agent: verified_agent.as_deref(),
+                client_is_agent: crate::mcp_namespace::client_is_agent(home_dir, &p.client_id),
+            },
+        )
+    };
+    let ns_ctx = resolve_ns(&principal)
         .map_err(|e| DuDuClawError::Gateway(format!("MCP namespace resolution failed: {e}")))?;
 
     // RFC-22 P1-10: Distinguish API key owner (`client_id`, used for namespace
@@ -243,7 +259,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // subprocess.
                 let params = request.get("params").cloned().unwrap_or(Value::Null);
                 match crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache) {
-                    Ok(p) => match crate::mcp_namespace::resolve(&p) {
+                    Ok(p) => match resolve_ns(&p) {
                         Ok(ns) => dispatcher.dispatch_tool_call(&p, &ns, &params, &id).await,
                         Err(e) => jsonrpc_error(
                             &id,

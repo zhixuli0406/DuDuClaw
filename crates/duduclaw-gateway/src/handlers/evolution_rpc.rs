@@ -21,8 +21,7 @@ impl MethodHandler {
                     "agent_id": cfg.agent.name,
                     "gvu_enabled": cfg.evolution.gvu_enabled,
                     "cognitive_memory": cfg.evolution.cognitive_memory_enabled(),
-                    "skill_auto_activate": cfg.evolution.skill_auto_activate,
-                    "skill_security_scan": cfg.evolution.skill_security_scan,
+                    // v1.68: `skill_auto_activate` / `skill_security_scan` removed (no reader).
                     "max_silence_hours": cfg.evolution.max_silence_hours,
                 })
             })

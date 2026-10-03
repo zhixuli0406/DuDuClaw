@@ -306,6 +306,127 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
     }
 }
 
+/// Tools always governed by a `[permissions]` flag (v1.68), by exact name.
+pub(crate) const PERMISSION_GATED_TOOLS: &[(&str, &str)] = &[
+    ("create_agent", "can_create_agents"),
+    ("spawn_ephemeral", "can_create_agents"),
+    ("send_to_agent", "can_send_cross_agent"),
+    ("spawn_agent", "can_send_cross_agent"),
+    ("team_handoff", "can_send_cross_agent"),
+    ("schedule_task", "can_schedule_tasks"),
+    ("create_reminder", "can_schedule_tasks"),
+    ("update_cron_task", "can_schedule_tasks"),
+    ("run_cron_task", "can_schedule_tasks"),
+    ("skill_hub_install", "can_modify_own_skills"),
+    ("shared_skill_adopt", "can_modify_own_skills"),
+    ("skill_graduate", "can_modify_own_skills"),
+    ("skill_pin", "can_modify_own_skills"),
+    ("skill_from_recording", "can_modify_own_skills"),
+    ("skill_extract", "can_modify_own_skills"),
+    ("skill_synthesis_run", "can_modify_own_skills"),
+    ("shared_skill_share", "can_modify_own_skills"),
+];
+
+/// Tools gated only for some arguments (see [`permissions_for_call`]).
+pub(crate) const PERMISSION_CONDITIONAL_TOOLS: &[&str] = &["tasks_create", "create_task"];
+
+/// The `[permissions]` flags governing this call. Exact tool-name matching.
+/// `tasks_create` needs `can_schedule_tasks` with a non-empty `schedule` and
+/// `can_send_cross_agent` when `assigned_to` names another employee;
+/// `create_task` needs `can_send_cross_agent` when a step names another
+/// employee.
+pub(crate) fn permissions_for_call(tool_name: &str, args: &Value, caller: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = PERMISSION_GATED_TOOLS
+        .iter()
+        .filter(|(t, _)| *t == tool_name)
+        .map(|(_, p)| *p)
+        .collect();
+    let other_agent = |v: Option<&Value>| {
+        v.and_then(|v| v.as_str())
+            .map(str::trim)
+            .is_some_and(|a| !a.is_empty() && a != caller)
+    };
+    match tool_name {
+        "tasks_create" => {
+            if args.get("schedule").and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty()) {
+                out.push("can_schedule_tasks");
+            }
+            if other_agent(args.get("assigned_to")) {
+                out.push("can_send_cross_agent");
+            }
+        }
+        "create_task" => {
+            let steps = args.get("steps").and_then(|v| v.as_array());
+            if steps.is_some_and(|steps| {
+                steps.iter().any(|st| ["agent", "agent_id", "assigned_to"].iter().any(|k| other_agent(st.get(*k))))
+            }) {
+                out.push("can_send_cross_agent");
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// `true` only when the flag is written as `false`.
+pub(crate) fn permission_explicitly_denied(
+    perms: &duduclaw_core::agent_toml::PermissionsSectionView,
+    permission: &str,
+) -> bool {
+    let flag = match permission {
+        "can_create_agents" => perms.can_create_agents,
+        "can_send_cross_agent" => perms.can_send_cross_agent,
+        "can_schedule_tasks" => perms.can_schedule_tasks,
+        "can_modify_own_skills" => perms.can_modify_own_skills,
+        _ => None,
+    };
+    flag == Some(false)
+}
+
+/// The acting agent's `[permissions]`. Fails closed (`Err`) when the agent
+/// id is not a valid id or its `agent.toml` exists but cannot be read as
+/// TOML / has a non-table `[permissions]` / a non-boolean flag — the gated
+/// tools are then refused. A missing file reads as "nothing written".
+async fn load_agent_permissions(
+    home_dir: &Path,
+    agent_id: &str,
+) -> Result<duduclaw_core::agent_toml::PermissionsSectionView, String> {
+    if agent_id.is_empty() {
+        return Ok(Default::default());
+    }
+    let dir = if duduclaw_gateway::ephemeral::is_ephemeral_id(agent_id) {
+        match duduclaw_gateway::ephemeral::resolve_agent_dir(home_dir, agent_id) {
+            Some(d) => d,
+            None => return Ok(Default::default()),
+        }
+    } else {
+        if !duduclaw_core::is_valid_agent_id(agent_id) {
+            return Err(format!("invalid agent id `{agent_id}`"));
+        }
+        home_dir.join("agents").join(agent_id)
+    };
+    tokio::task::spawn_blocking(move || {
+        let path = dir.join("agent.toml");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(e) => return Err(format!("agent.toml unreadable: {e}")),
+        };
+        let table: toml::Table = text.parse().map_err(|_| "agent.toml does not parse".to_string())?;
+        if let Some(p) = table.get("permissions") {
+            let p = p.as_table().ok_or("[permissions] is not a table")?;
+            for k in ["can_create_agents", "can_send_cross_agent", "can_schedule_tasks", "can_modify_own_skills"] {
+                if p.get(k).is_some_and(|v| !v.is_bool()) {
+                    return Err(format!("[permissions] {k} is not true/false"));
+                }
+            }
+        }
+        Ok(duduclaw_core::agent_toml::load(&dir).permissions)
+    })
+    .await
+    .map_err(|e| format!("permission check failed: {e}"))?
+}
+
 // Re-export OdooState so HTTP/SSE layers can reference it without depending on
 // the private type alias in mcp.rs.
 //
@@ -683,6 +804,61 @@ impl McpDispatcher {
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
                 self.audit_dispatch_denial(tool_name, &params_owned, error_class, &msg);
                 return jsonrpc_error(id, -32003, &msg);
+            }
+        }
+
+        // ── 3.46 [permissions] flags (v1.68) ──────────────────────────────────
+        // `agent.toml [permissions] can_create_agents / can_send_cross_agent /
+        // can_schedule_tasks / can_modify_own_skills` were written by the
+        // dashboard (as "danger" toggles) but read by nothing. They are now
+        // enforced here, in addition to the delegation policy and every other
+        // gate. Only an EXPLICIT `false` refuses; an absent or wrong-typed
+        // key keeps the pre-1.68 behaviour. Read through `AgentTomlSections`
+        // (preset-resolved file when the agent has one).
+        if !principal.is_external {
+            let needed = permissions_for_call(
+                tool_name,
+                params_owned.get("arguments").unwrap_or(&Value::Null),
+                gate_agent,
+            );
+            if !needed.is_empty() {
+                let refusal = match load_agent_permissions(&self.home_dir, gate_agent).await {
+                    Ok(perms) => needed
+                        .iter()
+                        .find(|p| permission_explicitly_denied(&perms, p))
+                        .map(|p| {
+                            (
+                                p.to_string(),
+                                format!(
+                                    "此 AI 員工的 [permissions] {p} = false，不能使用工具「{tool_name}」。請在儀表板「工具與權限」開啟後再試。"
+                                ),
+                            )
+                        }),
+                    Err(e) => Some((
+                        needed[0].to_string(),
+                        format!(
+                            "無法讀取此 AI 員工的 [permissions]（{e}），工具「{tool_name}」已拒絕。請修正 agent.toml 後再試。"
+                        ),
+                    )),
+                };
+                if let Some((permission, msg)) = refusal {
+                    duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+                    self.audit_dispatch_denial(tool_name, &params_owned, "permission_denied", &msg);
+                    duduclaw_security::audit::append_audit_event(
+                        &self.home_dir,
+                        &duduclaw_security::audit::AuditEvent::new(
+                            "permission_denied",
+                            gate_agent,
+                            duduclaw_security::audit::Severity::Warning,
+                            serde_json::json!({
+                                "agent_id": gate_agent,
+                                "permission": permission,
+                                "tool": tool_name,
+                            }),
+                        ),
+                    );
+                    return jsonrpc_error(id, -32003, &msg);
+                }
             }
         }
 
@@ -3020,5 +3196,162 @@ effect = "forbid"
             !msg.contains("hallucinated"),
             "the token minted for the acting agent must be found: {result}"
         );
+    }
+
+    // ── v1.68: [permissions] flags enforced at the dispatch gate ─────────────
+
+    #[test]
+    fn permission_mapping_is_exact() {
+        let none = &Value::Null;
+        assert_eq!(permissions_for_call("create_agent", none, "me"), vec!["can_create_agents"]);
+        assert_eq!(permissions_for_call("spawn_ephemeral", none, "me"), vec!["can_create_agents"]);
+        assert_eq!(permissions_for_call("team_handoff", none, "me"), vec!["can_send_cross_agent"]);
+        assert_eq!(permissions_for_call("run_cron_task", none, "me"), vec!["can_schedule_tasks"]);
+        assert_eq!(permissions_for_call("shared_skill_share", none, "me"), vec!["can_modify_own_skills"]);
+        assert!(permissions_for_call("tasks_create", &serde_json::json!({"title": "x", "assigned_to": "me"}), "me").is_empty());
+        assert_eq!(
+            permissions_for_call("tasks_create", &serde_json::json!({"schedule": "0 9 * * *", "assigned_to": "bob"}), "me"),
+            vec!["can_schedule_tasks", "can_send_cross_agent"]
+        );
+        assert_eq!(
+            permissions_for_call("create_task", &serde_json::json!({"steps": [{"agent": "bob"}]}), "me"),
+            vec!["can_send_cross_agent"]
+        );
+        assert!(permissions_for_call("create_agents", none, "me").is_empty(), "no prefix match");
+    }
+
+    /// Tools deliberately NOT governed by a `[permissions]` flag (read-only,
+    /// self-scoped, or governed by their own capability / approval gates).
+    const NOT_PERMISSION_GATED: &[&str] = &[
+        "activity_list", "activity_post", "agent_remove", "agent_status", "agent_update",
+        "agent_update_soul", "audit_trail_query", "autopilot_list", "belief_settle",
+        "belief_stats", "belief_submit", "browser_record_start", "browser_record_stop",
+        "calendar_create_event", "calendar_list_events", "cancel_reminder", "canvas_clear",
+        "canvas_push", "capability_request", "channel_config", "channel_config_list",
+        "channel_status", "check_responses", "code_map", "codrive_run", "codrive_status",
+        "computer_click", "computer_key", "computer_navigate", "computer_screenshot",
+        "computer_scroll", "computer_session_start", "computer_session_stop", "computer_type",
+        "cost_agents", "cost_multi_vs_single", "cost_recent", "cost_summary", "cost_users",
+        "csv_read", "db_query", "db_select", "db_sources", "db_tables", "decision_list",
+        "decision_resolve", "delete_cron_task", "desktop_record_start", "desktop_record_stop",
+        "diff_branches", "discovery_artifact", "discovery_cancel", "discovery_catalog",
+        "discovery_list", "discovery_tree", "docs_append", "docs_read", "drive_read",
+        "drive_search", "evolution_status", "evolution_toggle", "execute_program", "file_read",
+        "fork_cost", "fork_run", "forms_get", "forms_list_responses", "github_issue_comment",
+        "github_issue_read", "github_pr_read", "github_search_issues", "github_status",
+        "gmail_create_draft", "gmail_read", "gmail_search", "goals_create", "goals_list",
+        "google_status", "gtasks_complete", "gtasks_create", "gtasks_list", "gtasks_lists",
+        "hardware_info", "identity_resolve", "inference_mode", "inference_status",
+        "inspect_branches", "list_agents", "list_cron_tasks", "list_reminders",
+        "llamafile_list", "llamafile_start", "llamafile_stop", "mail_list", "mail_read",
+        "mail_send", "memory_alias_add", "memory_alias_list", "memory_consolidation_status",
+        "memory_episodic_pressure", "memory_fetch_batch", "memory_get_at", "memory_get_history",
+        "memory_improve", "memory_invalidate_by_origin", "memory_read", "memory_search",
+        "memory_search_by_layer", "memory_store", "memory_successful_conversations",
+        "merge_or_select", "model_download", "model_list", "model_load", "model_recommend",
+        "model_search", "model_unload", "notion_page_append", "notion_page_read",
+        "notion_search", "notion_status", "odoo_connect", "odoo_crm_create_lead",
+        "odoo_crm_leads", "odoo_crm_update_stage", "odoo_execute", "odoo_inventory_check",
+        "odoo_inventory_products", "odoo_invoice_list", "odoo_partner_search",
+        "odoo_payment_status", "odoo_report", "odoo_sale_confirm", "odoo_sale_create_quotation",
+        "odoo_sale_orders", "odoo_schema_fields", "odoo_search", "odoo_status", "office_script",
+        "os_apply_update", "os_audio_get", "os_audio_set", "os_backup_create", "os_backup_list",
+        "os_boot_assessment", "os_calendar_today", "os_check_update", "os_device_status",
+        "os_display_get", "os_display_set", "os_doctor_repair", "os_factory_reset",
+        "os_frontmost", "os_network_info", "os_notify", "os_open", "os_power",
+        "os_spotlight_search", "os_system_status", "os_update_rollback", "os_watch_status",
+        "os_wifi_connect", "os_wifi_scan", "os_wifi_status", "pairing_manage",
+        "pause_cron_task", "plan_get", "plan_start", "plan_update_step", "reliability_summary",
+        "route_query", "send_message", "send_photo", "send_sticker", "session_restore_context",
+        "shared_skill_list", "shared_wiki_delete", "shared_wiki_lint", "shared_wiki_ls",
+        "shared_wiki_read", "shared_wiki_search", "shared_wiki_stats", "shared_wiki_write",
+        "sheets_append", "sheets_read", "skill_bank_feedback", "skill_bank_search",
+        "skill_curator_status", "skill_gaps", "skill_list", "skill_search",
+        "skill_security_scan", "skill_synthesis_status", "slides_read", "submit_feedback",
+        "synthesize_speech", "task_status", "tasks_block", "tasks_claim", "tasks_complete",
+        "tasks_list", "tasks_renew", "tasks_update", "terminate_branch", "transcribe_audio",
+        "user_code_profile", "user_profile_get", "user_profile_record", "web_extract",
+        "web_fetch_cached", "web_search", "wiki_dedup", "wiki_export", "wiki_graph",
+        "wiki_lint", "wiki_ls", "wiki_namespace_status", "wiki_read", "wiki_rebuild_fts",
+        "wiki_search", "wiki_share", "wiki_stats", "wiki_trust_audit", "wiki_trust_history",
+        "wiki_write", "working_state_clear", "working_state_get", "working_state_handoff",
+        "working_state_set", "xlsx_read",
+    ];
+
+    /// Every advertised tool is classified explicitly, so a new tool cannot
+    /// silently escape the permission gate: it must be added either to
+    /// `PERMISSION_GATED_TOOLS` / `PERMISSION_CONDITIONAL_TOOLS` or to
+    /// `NOT_PERMISSION_GATED` below.
+    #[test]
+    fn every_tool_is_classified_for_the_permission_gate() {
+        let gated: std::collections::HashSet<&str> = PERMISSION_GATED_TOOLS
+            .iter()
+            .map(|(t, _)| *t)
+            .chain(PERMISSION_CONDITIONAL_TOOLS.iter().copied())
+            .collect();
+        let not_gated: std::collections::HashSet<&str> = NOT_PERMISSION_GATED.iter().copied().collect();
+        let names: Vec<String> = crate::mcp::tools()
+            .map(|t| crate::mcp::build_tool_schema(t)["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(names.len(), 249, "tool count changed — classify the new tool here");
+        let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        let unclassified: Vec<&&str> = all.iter().filter(|t| !gated.contains(**t) && !not_gated.contains(**t)).collect();
+        assert!(unclassified.is_empty(), "classify these tools for the [permissions] gate: {unclassified:?}");
+        let both: Vec<&&str> = gated.iter().filter(|t| not_gated.contains(**t)).collect();
+        assert!(both.is_empty(), "{both:?}");
+        let stale: Vec<&&str> = gated.iter().chain(not_gated.iter()).filter(|t| !all.contains(**t)).collect();
+        assert!(stale.is_empty(), "no such tool: {stale:?}");
+    }
+
+    #[tokio::test]
+    async fn unreadable_permissions_fail_closed_for_gated_tools_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[permissions]\ncan_schedule_tasks = \"no\"\n");
+        let principal = make_principal(vec![Scope::Admin], false);
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params("schedule_task", serde_json::json!({})), &serde_json::json!(3))
+            .await;
+        assert!(result["error"]["message"].as_str().unwrap_or("").contains("[permissions]"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn explicit_false_permission_refuses_and_audits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[permissions]\ncan_schedule_tasks = false\n");
+        let principal = make_principal(vec![Scope::Admin], false);
+        let result = dispatcher
+            .dispatch_tool_call(
+                &principal,
+                &make_ns_ctx(false),
+                &make_params("schedule_task", serde_json::json!({"cron": "0 9 * * *", "task": "x"})),
+                &serde_json::json!(1),
+            )
+            .await;
+        assert_eq!(result["error"]["code"], -32003, "{result}");
+        assert!(result["error"]["message"].as_str().unwrap().contains("can_schedule_tasks"));
+        let log = std::fs::read_to_string(tmp.path().join("security_audit.jsonl")).unwrap();
+        assert!(log.contains("\"permission_denied\"") && log.contains("can_schedule_tasks"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn absent_or_true_permission_keeps_todays_behaviour() {
+        for body in ["[permissions]\ncan_create_agents = true\n", "[agent]\nname = \"test-client\"\n"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dispatcher = make_dispatcher(&tmp).await;
+            write_scoped_toml(&tmp, body);
+            let principal = make_principal(vec![Scope::Admin], false);
+            let result = dispatcher
+                .dispatch_tool_call(
+                    &principal,
+                    &make_ns_ctx(false),
+                    &make_params("create_agent", serde_json::json!({"name": "x"})),
+                    &serde_json::json!(2),
+                )
+                .await;
+            let msg = result["error"]["message"].as_str().unwrap_or("");
+            assert!(!msg.contains("[permissions]"), "must not be refused by the permission gate: {result}");
+        }
     }
 }

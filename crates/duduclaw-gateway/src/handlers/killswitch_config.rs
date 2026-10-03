@@ -23,6 +23,19 @@ pub(crate) fn apply_killswitch_to_table(
     // ── [triggers] ──
     if let Some(t) = params.get("triggers").and_then(|v| v.as_object()) {
         let sect = sub(table, "triggers")?;
+        // v1.68.0: `null` disarms a trigger — the key is removed, and the
+        // reply path (`killswitch_triggers`) enforces only keys written in
+        // the file. An absent key stays unchanged.
+        for key in [
+            "max_replies_per_minute",
+            "max_consecutive_errors",
+            "error_rate_threshold",
+            "cost_limit_usd",
+        ] {
+            if t.get(key).is_some_and(|v| v.is_null()) && sect.remove(key).is_some() {
+                changes.push(format!("triggers.{key} removed (not enforced)"));
+            }
+        }
         if let Some(v) = t.get("max_replies_per_minute").and_then(|v| v.as_u64()) {
             if v == 0 || v > 10000 {
                 return Err("triggers.max_replies_per_minute must be 1-10000".into());
@@ -191,22 +204,8 @@ pub(crate) fn apply_killswitch_to_table(
         }
     }
 
-    // ── [audit] ──
-    if let Some(a) = params.get("audit").and_then(|v| v.as_object()) {
-        let sect = sub(table, "audit")?;
-        if let Some(v) = a.get("enabled").and_then(|v| v.as_bool()) {
-            sect.insert("enabled".into(), toml::Value::Boolean(v));
-            changes.push(format!("audit.enabled = {v}"));
-        }
-        if let Some(v) = a.get("path").and_then(|v| v.as_str()) {
-            let v = v.trim();
-            if v.is_empty() {
-                return Err("audit.path must be non-empty".into());
-            }
-            sect.insert("path".into(), toml::Value::String(v.into()));
-            changes.push("audit.path updated".to_string());
-        }
-    }
+    // `[audit]` (v1.68.0): removed — no reader. An `audit` object in the
+    // payload is ignored rather than written.
 
     Ok(changes)
 }
@@ -222,7 +221,6 @@ pub(crate) fn killswitch_table_to_response(table: &toml::Table) -> Value {
     let fs = table.get("failsafe").and_then(|v| v.as_table());
     let sw = table.get("safety_words").and_then(|v| v.as_table());
     let dp = table.get("defensive_prompt").and_then(|v| v.as_table());
-    let au = table.get("audit").and_then(|v| v.as_table());
 
     let int = |tbl: Option<&toml::Table>, key: &str, default: i64| -> i64 {
         tbl.and_then(|t| t.get(key))
@@ -256,7 +254,17 @@ pub(crate) fn killswitch_table_to_response(table: &toml::Table) -> Value {
             .unwrap_or_else(|| default.to_vec())
     };
 
+    // v1.68.0: which trigger keys the reply path actually enforces (only the
+    // ones written in the file; defaults above are display-only).
+    let enforced = crate::killswitch_triggers::EnforcedTriggers::from_table(table);
+
     json!({
+        "triggers_enforced": {
+            "max_replies_per_minute": enforced.max_replies_per_minute.is_some(),
+            "max_consecutive_errors": enforced.max_consecutive_errors.is_some(),
+            "error_rate_threshold": enforced.error_rate_threshold.is_some(),
+            "cost_limit_usd": enforced.cost_limit_usd.is_some(),
+        },
         "triggers": {
             "max_replies_per_minute": int(t, "max_replies_per_minute", ks.triggers.max_replies_per_minute as i64),
             "max_consecutive_errors": int(t, "max_consecutive_errors", ks.triggers.max_consecutive_errors as i64),
@@ -287,10 +295,6 @@ pub(crate) fn killswitch_table_to_response(table: &toml::Table) -> Value {
         "defensive_prompt": {
             "enabled": boolean(dp, "enabled", ks.defensive_prompt.enabled),
             "languages": arr(dp, "languages", &ks.defensive_prompt.languages),
-        },
-        "audit": {
-            "enabled": boolean(au, "enabled", ks.audit.enabled),
-            "path": strv(au, "path", &ks.audit.path),
         },
     })
 }

@@ -15,6 +15,8 @@ import {
 import { AdvancedSection, type SelectOption } from '@/components/settings/controls';
 import { RowSelect, RowSwitch } from '@/pages/agent-form/form-rows';
 import { SettingRow } from './shared';
+import { changedPayload, parseTomlSubset, tomlStr, type FlatValues } from '@/lib/config-toml';
+import { useRestartRequiredStore } from '@/stores/restart-required-store';
 
 export function GeneralTab() {
   const intl = useIntl();
@@ -37,19 +39,25 @@ export function GeneralTab() {
   const [saveError, setSaveError] = useState<unknown>(null);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
+  // v1.68: loaded values — a save sends only what changed, so an untouched
+  // boot-only log level does not raise a "restart required" notice.
+  const initialRef = useRef<FlatValues>({});
 
   const load = useCallback(() => {
     setLoadError(null);
     api.system.config().then((res) => {
       const raw = (res as Record<string, unknown>)?.config;
       if (typeof raw === 'string') {
-        // Parse TOML string for current values
-        const logMatch = raw.match(/level\s*=\s*"(\w+)"/);
-        if (logMatch) setLogLevel(logMatch[1]);
-        const rotMatch = raw.match(/strategy\s*=\s*"(\w+)"/);
-        if (rotMatch) setRotationStrategy(rotMatch[1]);
-        const langMatch = raw.match(/default_language\s*=\s*"([^"]*)"/);
-        if (langMatch) setDefaultLanguage(langMatch[1]);
+        // v1.68: read each key from its own section (the old unanchored
+        // regexes could pick up `level` / `strategy` from another table).
+        const tables = parseTomlSubset(raw);
+        const level = tomlStr(tables, 'general', 'log_level', 'info');
+        const strategy = tomlStr(tables, 'rotation', 'strategy', 'priority');
+        const language = tomlStr(tables, 'general', 'default_language', '');
+        setLogLevel(level);
+        setRotationStrategy(strategy);
+        setDefaultLanguage(language);
+        initialRef.current = { log_level: level, rotation_strategy: strategy, default_language: language };
       }
     }).catch((e) => {
       console.warn("[api]", e);
@@ -85,15 +93,24 @@ export function GeneralTab() {
   };
 
   const handleSave = async () => {
+    const current: FlatValues = {
+      log_level: logLevel,
+      rotation_strategy: rotationStrategy,
+      default_language: defaultLanguage,
+    };
+    const payload = changedPayload(initialRef.current, current);
+    if (Object.keys(payload).length === 0) {
+      toast.info(intl.formatMessage({ id: 'settings.noChanges' }));
+      return;
+    }
     setSaving(true);
     setSaved(false);
     setSaveError(null);
     try {
-      await api.system.updateConfig({
-        log_level: logLevel,
-        rotation_strategy: rotationStrategy,
-        default_language: defaultLanguage,
-      });
+      const res = await api.system.updateConfig(payload);
+      initialRef.current = current;
+      const restart = res?.restart_required ?? [];
+      if (restart.length > 0) useRestartRequiredStore.getState().add(restart);
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch (e) {
@@ -155,7 +172,7 @@ export function GeneralTab() {
           {/* Editable: Log Level */}
           <RowSelect
             label={intl.formatMessage({ id: 'settings.general.logLevel' })}
-            description={intl.formatMessage({ id: 'settings.general.logLevel.help' })}
+            description={`${intl.formatMessage({ id: 'settings.general.logLevel.help' })} ${intl.formatMessage({ id: 'settings.general.logLevel.liveNote' })}`}
             value={logLevel}
             onChange={setLogLevel}
             options={logLevelOptions}

@@ -50,14 +50,36 @@ impl MethodHandler {
 
     /// `inference.update` — atomic write of `~/.duduclaw/inference.toml`.
     /// Params (all optional, partial update): root (`enabled`/`backend`/
-    /// `models_dir`/`default_model`/`auto_load`/`max_memory_mb`), `generation`,
-    /// `router` (validates `strong_threshold < fast_threshold`), `openai_compat`
-    /// (`base_url`/`model`/`api_key` → encrypted to `api_key_enc`), and the
-    /// `llamafile`/`embedding` sub-sections (generic pass-through).
-    /// Response: `{ success, changes[] }`.
-    pub(crate) async fn handle_inference_update(&self, params: Value) -> WsFrame {
+    /// `models_dir`/`default_model`/`auto_load`), `generation`
+    /// (`max_tokens`/`temperature`/`top_p`/`stop`/`capture_logprobs`/
+    /// `capture_top_logprobs`), `router` (validates `strong_threshold <
+    /// fast_threshold`; plus `local_tools` and the `ucci_*` keys),
+    /// `openai_compat` (`base_url`/`model`/`api_key` → encrypted to
+    /// `api_key_enc`) and typed `llamafile`. Response: `{ success, changes[],
+    /// engine_reset: true, restart_required: [] }`.
+    pub(crate) async fn handle_inference_update(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let path = self.home_dir.join("inference.toml");
         let mut table = self.read_config_table(&path).await;
+        let before = table.clone();
+
+        // The stored API key only follows the endpoint it was entered for.
+        if let Some(oc) = params.get("openai_compat").and_then(|v| v.as_object()) {
+            let new_url = oc.get("base_url").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+            let stored = table.get("openai_compat").and_then(|v| v.as_table());
+            let url_changed = !new_url.is_empty()
+                && stored.and_then(|t| t.get("base_url")).and_then(|v| v.as_str()) != Some(new_url);
+            let has_key = stored.is_some_and(|t| t.contains_key("api_key_enc") || t.contains_key("api_key"));
+            let key_kept = oc
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .is_none_or(|k| super::config_commit::is_secret_placeholder(k));
+            if url_changed && has_key && key_kept {
+                return WsFrame::error_response(
+                    "",
+                    "openai_compat.base_url changed — re-enter openai_compat.api_key for the new endpoint (or send \"\" to clear it)",
+                );
+            }
+        }
 
         // Pure validation + field application (no secret handling).
         let mut changes = match apply_inference_to_table(&mut table, &params) {
@@ -75,7 +97,7 @@ impl MethodHandler {
         {
             // Refuse to persist the masked placeholder back as a real secret —
             // the dashboard echoes it when the field was left untouched.
-            if api_key != SECRET_MASK_SET {
+            if !super::config_commit::is_secret_placeholder(api_key) {
                 let section = match table
                     .entry("openai_compat")
                     .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
@@ -106,7 +128,39 @@ impl MethodHandler {
         if let Err(e) = self.atomic_write_toml(&path, &table).await {
             return WsFrame::error_response("", &e);
         }
+        // v1.68: the channel-reply / dispatch path caches the inference
+        // engine for the life of the process (`claude_runner`), so without
+        // this reset every saved setting was ignored until a restart. The
+        // next local-inference call rebuilds it from the file just written.
+        crate::claude_runner::reset_inference_engine().await;
+        // Paths / argv / bind address the local inference server runs with.
+        for key in ["llamafile.dir", "llamafile.default_file", "llamafile.extra_args", "llamafile.host", "router.ucci_observations"] {
+            let (b, a) = (
+                super::config_commit::toml_at_json(&before, key),
+                super::config_commit::toml_at_json(&table, key),
+            );
+            if b == a {
+                continue;
+            }
+            if key == "llamafile.host"
+                && a.as_str().is_some_and(|h| h == "localhost" || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()))
+            {
+                continue;
+            }
+            crate::security_autopilot::audit_and_emit(
+                &self.home_dir,
+                &duduclaw_security::audit::AuditEvent::new(
+                    "config_protected_key_changed",
+                    ctx.user_id.as_str(),
+                    duduclaw_security::audit::Severity::Warning,
+                    json!({ "key": key, "before": b, "after": a, "file": "inference", "user_id": ctx.user_id, "source": "inference.update" }),
+                ),
+            );
+        }
         info!(?changes, "inference.update completed");
-        WsFrame::ok_response("", json!({ "success": true, "changes": changes }))
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "changes": changes, "engine_reset": true, "restart_required": [] }),
+        )
     }
 }

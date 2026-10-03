@@ -93,7 +93,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "schedule_task",
-        description: "[deprecated → tasks_create schedule=\"<cron>\"; removed in v1.68.0] Schedule a recurring task in the persistent CronScheduler. Survives restarts; can target any agent via agent_id.",
+        description: "[deprecated → tasks_create schedule=\"<cron>\"; removed in v1.69.0] Schedule a recurring task in the persistent CronScheduler. Survives restarts; can target any agent via agent_id.",
         params: &[
             ParamDef {
                 name: "cron",
