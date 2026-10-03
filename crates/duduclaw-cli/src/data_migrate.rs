@@ -1,8 +1,8 @@
-//! `duduclaw data-migrate` — CLI front door for the `/data` forward-only
+//! `duduclaw migrate data` — CLI front door for the `/data` forward-only
 //! settings migrator (H3g).
 //!
 //! Not to be confused with `duduclaw migrate` (agent.toml → Claude Code
-//! format conversion) or `duduclaw migrate-from` (cross-platform state
+//! format conversion) or `duduclaw migrate from` (cross-platform state
 //! import) — this is a third, unrelated thing: replaying baked-in
 //! `/usr/share/duduclaw/migrations/*.sh` scripts against `<DUDUCLAW_HOME>`
 //! so `/data` keeps up with format changes that A/B root rollback can never
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use duduclaw_core::data_migrations::{self, MigrationScript, RunReport};
 
-/// Parsed `duduclaw data-migrate` flags. Exactly one action is expected;
+/// Parsed `duduclaw migrate data` flags. Exactly one action is expected;
 /// see [`run`] for the precedence when more than one (or none) is passed.
 pub struct DataMigrateOptions {
     pub pending: bool,
@@ -56,8 +56,8 @@ pub async fn run(opts: DataMigrateOptions) -> i32 {
         return cmd_pending(&migrations_dir, &marker_dir, opts.json);
     }
     eprintln!(
-        "duduclaw data-migrate: pass one of --pending, --check, or --run \
-         (see `duduclaw data-migrate --help`)."
+        "duduclaw migrate data: pass one of --pending, --check, or --run \
+         (see `duduclaw migrate data --help`)."
     );
     2
 }
@@ -75,7 +75,7 @@ fn cmd_pending(migrations_dir: &std::path::Path, marker_dir: &std::path::Path, j
     let pending = match data_migrations::list_pending(migrations_dir, marker_dir) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("duduclaw data-migrate --pending: {e}");
+            eprintln!("duduclaw migrate data --pending: {e}");
             return 1;
         }
     };
@@ -96,7 +96,7 @@ fn cmd_pending(migrations_dir: &std::path::Path, marker_dir: &std::path::Path, j
                 format_timestamp(script.timestamp)
             );
         }
-        println!("\nRun `duduclaw data-migrate --run` to apply them.");
+        println!("\nRun `duduclaw migrate data --run` to apply them.");
     }
     // Always 0 — a listing is informational, never a failure, per the task
     // spec's explicit rejection of Omarchy's inverted `--pending` exit code.
@@ -107,7 +107,7 @@ fn cmd_check(migrations_dir: &std::path::Path, marker_dir: &std::path::Path, jso
     let pending = match data_migrations::list_pending(migrations_dir, marker_dir) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("duduclaw data-migrate --check: {e}");
+            eprintln!("duduclaw migrate data --check: {e}");
             return 1;
         }
     };
@@ -134,7 +134,7 @@ fn cmd_run(
     let report = match data_migrations::run_pending(migrations_dir, marker_dir, home) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("duduclaw data-migrate --run: {e}");
+            eprintln!("duduclaw migrate data --run: {e}");
             return 1;
         }
     };
@@ -180,7 +180,7 @@ fn report_human(report: &RunReport) {
         eprintln!("-------------------");
         eprintln!(
             "This /data migration did not apply. It will be retried on the \
-             next run (boot or `duduclaw data-migrate --run`). Remaining \
+             next run (boot or `duduclaw migrate data --run`). Remaining \
              migrations after it, if any, were NOT attempted. This failure \
              is durably recorded — see \
              `duduclaw_core::data_migrations::read_failure` — and does not \

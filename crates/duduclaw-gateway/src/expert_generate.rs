@@ -8,7 +8,7 @@
 //!    packs. Conversion reuses the CLI `duduclaw expert convert-teams`
 //!    pipeline via subprocess (idempotent, byte-deterministic) into
 //!    `<home>/cache/experts-builtin-v2/`, then the normal
-//!    `duduclaw expert install` security pipeline.
+//!    `duduclaw pack install` security pipeline.
 //!
 //! 2. **LLM-guided authoring** (`experts.generate` / `experts.generate_revise`
 //!    / `experts.install_draft`): the model emits a STRICT JSON design (never
@@ -456,7 +456,7 @@ pub fn draft_dir(home: &Path, draft_id: &str) -> Result<PathBuf, String> {
 }
 
 /// The materialized pack inside a draft (`<draft>/pack/` — what
-/// `experts.install_draft` feeds to `duduclaw expert install`).
+/// `experts.install_draft` feeds to `duduclaw pack install`).
 pub fn draft_pack_dir(home: &Path, draft_id: &str) -> Result<PathBuf, String> {
     Ok(draft_dir(home, draft_id)?.join("pack"))
 }

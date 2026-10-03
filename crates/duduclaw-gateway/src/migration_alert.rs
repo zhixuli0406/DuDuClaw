@@ -41,7 +41,7 @@
 //! Everything here is best-effort telemetry, never control flow: every
 //! failure (missing home dir, task-store open error, marker write error)
 //! is logged and swallowed. This is a secondary notification path, not the
-//! source of truth — an operator can always run `duduclaw data-migrate
+//! source of truth — an operator can always run `duduclaw migrate data
 //! --check` directly against the same marker file.
 
 use std::path::{Path, PathBuf};
@@ -137,7 +137,7 @@ async fn post_activity_event(home: &Path, failure: &MigrationFailure) -> Result<
         task_id: None,
         summary: format!(
             "資料遷移腳本「{}」執行失敗（exit code {exit_code_text}），開機流程未中斷但需要人工檢查（{}）。",
-            failure.script, "duduclaw data-migrate --check"
+            failure.script, "duduclaw migrate data --check"
         ),
         timestamp: chrono::Utc::now().to_rfc3339(),
         metadata: Some(

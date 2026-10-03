@@ -73,12 +73,12 @@ ${body}
 const installBlock = (t) => {
   if (t.kind === 'pack' && t.install?.registry_slug) {
     return `<h2>一鍵匯入</h2>
-<pre>duduclaw expert install registry:${esc(t.install.registry_slug)}</pre>
+<pre>duduclaw pack install registry:${esc(t.install.registry_slug)}</pre>
 <p>安裝時自動驗證 sha256（含 hooks/skills 的包另驗發佈者簽章）。</p>`;
   }
   if (t.kind === 'pack' && t.install?.pack_url) {
     return `<h2>一鍵匯入</h2>
-<pre>duduclaw expert install ${esc(t.install.pack_url)}</pre>
+<pre>duduclaw pack install ${esc(t.install.pack_url)}</pre>
 <p>或在儀表板「AI 團隊包」頁貼上這個網址安裝。</p>`;
   }
   return `<h2>快速開始</h2>

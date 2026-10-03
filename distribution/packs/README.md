@@ -39,5 +39,5 @@ duduclaw expert publish distribution/packs/<slug> --zip distribution/packs/dist/
 #    registry entry 合併後 gallery generate.mjs 也會自動長出 registry 版頁面（去重以 slug 為準）。
 ```
 
-注意：畫廊頁渲染的安裝指令是 `duduclaw expert install registry:<slug>`——在 registry
+注意：畫廊頁渲染的安裝指令是 `duduclaw pack install registry:<slug>`——在 registry
 repo 上線並合併這六包 entry 之前，該指令會誠實回 404。部署畫廊（👤）前先完成 registry 送件。

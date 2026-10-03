@@ -144,8 +144,7 @@ impl PackTier {
 
 /// Which on-disk dialect a [`Pack`] was read from. Kept so
 /// `duduclaw pack inspect` can tell an author which generation their file
-/// belongs to during the deprecation window (legacy formats are read until
-/// v1.69.0).
+/// belongs to (legacy formats are still read; no removal date).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackSource {
     Canonical,
@@ -166,7 +165,7 @@ impl PackSource {
         }
     }
 
-    /// `true` for every format scheduled for removal in v1.69.0.
+    /// `true` for every format other than canonical `pack.toml`.
     pub fn is_legacy(self) -> bool {
         !matches!(self, PackSource::Canonical)
     }

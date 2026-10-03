@@ -1,4 +1,4 @@
-//! `expert install` — source resolution, format dispatch, and the native
+//! `duduclaw pack install` (expert pipeline) — source resolution, format dispatch, and the native
 //! `expert.toml` importer, plus shared skill/wiki install primitives used by
 //! the foreign-format importers ([`super::plugin`], [`super::skill_import`]).
 
@@ -30,7 +30,7 @@ pub(super) struct InstallCtx {
     pub attach_under: Option<String>,
 }
 
-/// Entry for `duduclaw expert install`.
+/// Entry for `duduclaw pack install` once it hands a roster-shaped pack over.
 pub async fn cmd_install(
     home: &Path,
     source: &str,

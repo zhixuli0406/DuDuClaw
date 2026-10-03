@@ -15,7 +15,7 @@ Expert pack 的社群索引。本目錄是 `github.com/zhixuli0406/duduclaw-regi
 
 ## 消費端（後續輪次的 CLI 工作）
 
-- `duduclaw expert install registry:<slug>`：抓 raw index JSON → 驗 sha256 →（code lane）驗 minisig → 走既有 install 管線
+- `duduclaw pack install registry:<slug>`：抓 raw index JSON → 驗 sha256 →（code lane）驗 minisig → 走既有 install 管線
 - `duduclaw expert publish`：從本機 pack 產 entry JSON＋算 sha256＋（選）簽章，印出「fork → 放檔 → PR」三步
 - 板模畫廊（`distribution/gallery/`）改為從本 index 生成 pack 頁
 
@@ -29,6 +29,6 @@ Expert pack 的社群索引。本目錄是 `github.com/zhixuli0406/duduclaw-regi
 ## 待辦（多輪拆解）
 
 - [x] R1：index 結構＋schema＋零依賴驗證器＋CI（本輪）
-- [ ] R2：`expert publish` 指令＋`expert install registry:<slug>` 解析
+- [ ] R2：`expert publish` 指令＋`pack install registry:<slug>` 解析
 - [ ] R3：install 端 minisign 驗證（sha256 之上）＋畫廊接 index
 - [ ] 👤：建 `duduclaw-registry` repo、開 auto-merge、branch protection

@@ -373,7 +373,7 @@ impl MethodHandler {
                 self.handle_fork_resolve(params)
             }
 
-            // ── Migrate-from (spawns the CLI's `migrate-from --json`) ──
+            // ── Migrate-from (spawns the CLI's `migrate from --json`) ──
             // scan = dry-run plan; apply = actual writes. Both shell out to
             // this same binary (`current_exe`) so the gateway never has to
             // depend on the duduclaw-cli crate.

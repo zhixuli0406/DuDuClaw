@@ -260,7 +260,7 @@ pub(super) fn print_export_help() {
     println!("  再執行：");
     println!(
         "    {}",
-        style("duduclaw migrate-from paperclip --source ./export [--apply]").bold()
+        style("duduclaw migrate from paperclip --source ./export [--apply]").bold()
     );
     println!();
 }

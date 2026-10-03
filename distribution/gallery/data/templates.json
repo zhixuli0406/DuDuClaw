@@ -175,7 +175,7 @@
     }
   ],
   "_notes": [
-    "降級包（premium 團隊劇本去 wiki 法規包後的免費版，拍板挑 5-8 個高搜尋量產業）產製完成後：每包一個 entry，kind 設 'pack'，install 加 pack_url（duduclaw expert install <url> 一鍵匯入），generate.mjs 會自動渲染安裝指令與 deep link。",
-    "kind: free = 內建 starter 板模（走 onboard 精靈）；pack = expert pack zip（走 expert install，支援 URL 一鍵匯入）。"
+    "降級包（premium 團隊劇本去 wiki 法規包後的免費版，拍板挑 5-8 個高搜尋量產業）產製完成後：每包一個 entry，kind 設 'pack'，install 加 pack_url（duduclaw pack install <url> 一鍵匯入），generate.mjs 會自動渲染安裝指令與 deep link。",
+    "kind: free = 內建 starter 板模（走 onboard 精靈）；pack = expert pack zip（走 pack install，支援 URL 一鍵匯入）。"
   ]
 }
