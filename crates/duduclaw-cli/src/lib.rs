@@ -1982,6 +1982,19 @@ enum ToolingCommands {
         /// A starter bank ships at `templates/redteam/starter-bank.jsonl`.
         #[arg(long)]
         bank: Option<PathBuf>,
+        /// Write one `duduclaw eval` case per red-team unit the deterministic
+        /// guard did not block (「待活體驗證」) into this directory, so the
+        /// live agent's refusal can actually be checked. Existing files are
+        /// skipped unless `--force`.
+        #[arg(long, value_name = "DIR")]
+        emit_evals: Option<PathBuf>,
+        /// Attack prompt languages: `en`, `zh-tw` or `all` (default). Any
+        /// other value is refused.
+        #[arg(long, default_value = "all", value_name = "en|zh-tw|all")]
+        locale: String,
+        /// With `--emit-evals`, overwrite eval files that already exist.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Run harness-level agent behavior eval suites (`evals/<suite>/<case>.toml`).
@@ -5273,7 +5286,15 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             .await
         }
         Commands::Tooling(ToolingCommands::Wizard) => wizard::cmd_wizard(&duduclaw_home()).await,
-        Commands::Tooling(ToolingCommands::Test { name, bank }) => cmd_test_agent(&name, bank.as_deref()).await,
+        Commands::Tooling(ToolingCommands::Test {
+            name,
+            bank,
+            emit_evals,
+            locale,
+            force,
+        }) => {
+            cmd_test_agent(&name, bank.as_deref(), emit_evals.as_deref(), &locale, force).await
+        }
         Commands::Tooling(ToolingCommands::Eval {
             path,
             filter,
@@ -10239,42 +10260,38 @@ async fn cmd_redteam(
         );
         return Ok(());
     }
-    let attacks = duduclaw_gateway::redteam::generate_attacks(&contract.boundaries.must_not);
     println!(
-        "{} Red-teaming '{agent}': {} attack(s) across {} rule(s)\n",
+        "{} Red-teaming '{agent}' ({} rule(s))\n",
         console::style("▶").cyan(),
-        attacks.len(),
         contract.boundaries.must_not.len()
     );
-    let mut caught = 0usize;
+    // Same ledger as `duduclaw test` (red-team v2); no eval emission here.
+    let ledger = run_redteam_ledger(
+        &agent,
+        &contract.boundaries.must_not,
+        duduclaw_gateway::redteam::Locale::ALL,
+        None,
+        false,
+        &[],
+    )?;
     let mut report = String::new();
-    for a in &attacks {
-        let r = duduclaw_security::input_guard::scan_input(
-            &a.prompt,
-            duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
-        );
-        let verdict = if r.blocked {
-            caught += 1;
-            console::style("BLOCKED").green().to_string()
-        } else {
-            console::style("passed ").red().to_string()
-        };
-        println!(
-            "  [{:<11}] {verdict} (risk {})  ← {}",
-            a.technique, r.risk_score, a.rule
-        );
+    for u in &ledger.units {
         report.push_str(&format!(
-            "technique={} blocked={} risk={} rule={}\nprompt={}\n\n",
-            a.technique, r.blocked, r.risk_score, a.rule, a.prompt
+            "unit={} technique={} locale={} reading={} prompt_blocked={} risk={} rule={}\nprompt={}\n\n",
+            u.unit.id,
+            u.technique,
+            u.locale,
+            if u.needs_validation() {
+                "needs_live_validation"
+            } else {
+                "covered"
+            },
+            u.guard.prompt_blocked,
+            u.guard.risk_score,
+            u.rule,
+            u.prompt
         ));
     }
-    println!(
-        "\n{} Deterministic input-guard caught {caught}/{} attacks. \
-         Uncaught variants rely on the model itself refusing — run them against \
-         the live agent for full coverage.",
-        console::style("Σ").bold(),
-        attacks.len()
-    );
     if let Some(path) = out {
         std::fs::write(&path, report)
             .map_err(|e| DuDuClawError::Gateway(format!("write report: {e}")))?;
@@ -10934,11 +10951,21 @@ async fn cmd_mcp(cmd: McpCommands, home: &std::path::Path) -> duduclaw_core::err
 }
 
 /// `duduclaw test <agent>` - Red-team test an agent against its behavioral contract.
-async fn cmd_test_agent(agent_name: &str, bank: Option<&Path>) -> duduclaw_core::error::Result<()> {
+async fn cmd_test_agent(
+    agent_name: &str,
+    bank: Option<&Path>,
+    emit_evals: Option<&Path>,
+    locale: &str,
+    force: bool,
+) -> duduclaw_core::error::Result<()> {
     use console::style;
     use duduclaw_agent::contract;
     use duduclaw_security::input_guard;
     use duduclaw_security::soul_guard;
+
+    // Fail closed on an unknown --locale before doing anything else.
+    let locales = duduclaw_gateway::redteam::parse_locale_selection(locale)
+        .map_err(duduclaw_core::error::DuDuClawError::Agent)?;
 
     let home = duduclaw_home();
 
@@ -11111,8 +11138,33 @@ async fn cmd_test_agent(agent_name: &str, bank: Option<&Path>) -> duduclaw_core:
         None
     };
 
+    // ── Red-team v2 coverage ledger (rule × technique × locale) ──
+    let must_not_use_tools = {
+        let caps = duduclaw_core::agent_toml::load(&agent_dir).capabilities;
+        let mut tools: Vec<String> = caps
+            .denied_tools
+            .into_iter()
+            .chain(caps.irreversible_tools)
+            .collect();
+        tools.sort();
+        tools.dedup();
+        tools
+    };
+    let redteam_report = run_redteam_ledger(
+        agent_name,
+        &contract.boundaries.must_not,
+        &locales,
+        emit_evals,
+        force,
+        &must_not_use_tools,
+    )?;
+    let redteam_json = serde_json::to_value(&redteam_report).map_err(|e| {
+        duduclaw_core::error::DuDuClawError::Agent(format!("serialize red-team ledger: {e}"))
+    })?;
+
     // ── Write JSON report ────────────────────────────────────
     let report = serde_json::json!({
+        "schema_version": duduclaw_gateway::redteam::REDTEAM_SCHEMA_VERSION,
         "agent": agent_name,
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "total": total,
@@ -11125,6 +11177,7 @@ async fn cmd_test_agent(agent_name: &str, bank: Option<&Path>) -> duduclaw_core:
             "detail": r.detail,
         })).collect::<Vec<_>>(),
         "bank": bank_report,
+        "redteam": redteam_json,
     });
 
     let report_path = home.join(format!("test-report-{agent_name}.json"));
@@ -11243,6 +11296,174 @@ fn run_redteam_bank(bank_path: &Path) -> duduclaw_core::error::Result<serde_json
             "over_defense": r.over_defense,
         })).collect::<Vec<_>>(),
     }))
+}
+
+/// Red-team v2 coverage ledger (design `DESIGN-llm-contract-secaudit-v2`
+/// §4): one unit per (`must_not` rule × technique × locale) through the
+/// deterministic input guard. Blocked ⇒ covered; not blocked ⇒ 「待活體驗證」
+/// (the live model's refusal is unobserved — not a vulnerability verdict).
+/// With `emit_evals`, writes one `duduclaw eval` case per unit that needs
+/// live validation. Shared by `duduclaw test` and `duduclaw ops redteam`.
+fn run_redteam_ledger(
+    agent: &str,
+    must_not: &[String],
+    locales: &[duduclaw_gateway::redteam::Locale],
+    emit_evals: Option<&Path>,
+    force: bool,
+    must_not_use_tools: &[String],
+) -> duduclaw_core::error::Result<duduclaw_gateway::redteam::RedteamReport> {
+    use console::style;
+    use duduclaw_core::error::DuDuClawError;
+    use duduclaw_gateway::redteam;
+    use duduclaw_security::input_guard;
+
+    let attacks = redteam::generate_attacks(must_not, locales);
+    let units = redteam::build_ledger(&attacks, |prompt| {
+        let scan = input_guard::scan_input(prompt, input_guard::DEFAULT_BLOCK_THRESHOLD);
+        (scan.blocked, scan.risk_score, scan.matched_rules)
+    });
+    // The ledger is built by code, so a violation is a program bug: refuse
+    // to report on it rather than print a wrong table.
+    let violations = redteam::validate_redteam_ledger(&units);
+    if !violations.is_empty() {
+        return Err(DuDuClawError::Agent(format!(
+            "red-team ledger failed validation (bug): {}",
+            violations.join("; ")
+        )));
+    }
+
+    // ── Optional eval emission ──
+    let mut emitted: Vec<String> = Vec::new();
+    let mut skipped_existing = 0usize;
+    let mut emitted_by_technique: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    if let Some(dir) = emit_evals {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            DuDuClawError::Agent(format!("create eval dir {}: {e}", dir.display()))
+        })?;
+        for u in units.iter().filter(|u| u.needs_validation()) {
+            let (file, text) = redteam::render_eval_case(u, agent, must_not_use_tools);
+            let path = dir.join(&file);
+            if path.symlink_metadata().is_ok() && !force {
+                skipped_existing += 1;
+                continue;
+            }
+            std::fs::write(&path, text).map_err(|e| {
+                DuDuClawError::Agent(format!("write eval case {}: {e}", path.display()))
+            })?;
+            *emitted_by_technique.entry(u.technique.clone()).or_default() += 1;
+            emitted.push(path.display().to_string());
+        }
+    }
+
+    let report = redteam::RedteamReport::new(units, emitted);
+
+    // ── Console ledger table ──
+    let locale_list = locales
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "  {} {}",
+        style("🧪").bold(),
+        style("Red-Team Coverage Ledger").bold()
+    );
+    let rule_count = {
+        let mut rules: Vec<&str> = report.units.iter().map(|u| u.rule.as_str()).collect();
+        rules.sort_unstable();
+        rules.dedup();
+        rules.len()
+    };
+    println!(
+        "  {} rule(s) × {} technique(s) × locale [{locale_list}] = {} unit(s)",
+        rule_count,
+        redteam::TECHNIQUE_COUNT,
+        report.summary.units
+    );
+    if report.summary.units == 0 {
+        println!(
+            "  {}",
+            style("No CONTRACT.toml must_not rules — nothing to red-team.").yellow()
+        );
+        println!();
+        return Ok(report);
+    }
+    println!();
+    for t in redteam::TECHNIQUES {
+        let Some(c) = report.summary.by_technique.get(t.name) else {
+            continue;
+        };
+        if c.needs_validation == 0 {
+            println!(
+                "  [{}] {:<22} {}/{} covered by input guard",
+                style("COVERED").green().bold(),
+                t.name,
+                c.covered,
+                c.total()
+            );
+        } else {
+            let evals = if emit_evals.is_some() {
+                format!(
+                    "（已產生 eval 案例 {} 個）",
+                    emitted_by_technique.get(t.name).copied().unwrap_or(0)
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "  [{}] {:<22} {}/{} covered — {} 待活體驗證{evals}",
+                style("待活體驗證").yellow().bold(),
+                t.name,
+                c.covered,
+                c.total(),
+                c.needs_validation
+            );
+        }
+    }
+    println!();
+    println!(
+        "  Ledger: {} covered by the deterministic guard, {} 待活體驗證 (live model refusal unobserved; not a vulnerability verdict).",
+        style(report.summary.covered).green().bold(),
+        style(report.summary.needs_validation).yellow().bold(),
+    );
+    if let Some(dir) = emit_evals {
+        const MAX_LISTED_EVALS: usize = 10;
+        for p in report.emitted_evals.iter().take(MAX_LISTED_EVALS) {
+            println!("    + {}", style(p).cyan());
+        }
+        let more = report.emitted_evals.len().saturating_sub(MAX_LISTED_EVALS);
+        if more > 0 {
+            println!(
+                "    {}",
+                style(format!(
+                    "…另有 {more} 個檔案（完整清單在報告 JSON 的 redteam.emitted_evals）"
+                ))
+                .dim()
+            );
+        }
+        if skipped_existing > 0 {
+            println!(
+                "  {}",
+                style(format!(
+                    "Skipped {skipped_existing} existing eval file(s) in {} (use --force to overwrite).",
+                    dir.display()
+                ))
+                .dim()
+            );
+        }
+        println!(
+            "  Run them live with: duduclaw eval {}",
+            style(dir.display()).cyan()
+        );
+    } else if report.summary.needs_validation > 0 {
+        println!(
+            "  {}",
+            style("Add --emit-evals <dir> to turn these units into duduclaw eval cases.").dim()
+        );
+    }
+    println!();
+    Ok(report)
 }
 
 // ── Manual delegation re-forward (v1.8.21) ──────────────────
