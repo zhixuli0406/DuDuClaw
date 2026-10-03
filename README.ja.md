@@ -100,7 +100,7 @@ Tauri 製のネイティブビルド。起動するだけでローカル gateway
 | Windows x64 | `DuDuClaw_*_x64_en-US.msi` | Authenticode 証明書は未購入のため SmartScreen が警告します。「詳細情報」→「実行」でインストール可能。解除手順は [docs/guides/desktop-unblock.md](docs/guides/desktop-unblock.md) を参照 |
 | Linux | `*_amd64.AppImage` / `.deb` | 署名不要 |
 
-> macOS 版デスクトップアプリの最新は v1.66.1([desktop-v1.66.1](https://github.com/zhixuli0406/DuDuClaw/releases/tag/desktop-v1.66.1))です。v1.67.0 の macOS 版は Apple の公証で失敗したため公開されていません。Windows と Linux は v1.67.0 があります。
+> macOS 版デスクトップアプリは v1.68.1 から再び提供しています(署名・Apple 公証済み)。v1.67.0 から v1.68.0 までは macOS 版がありません。Windows と Linux はこれらのバージョンでも提供しています。
 
 開けばそれだけで完結します——アプリ内のウィザードが AI バックエンドの選択と最初のエージェント作成まで案内してくれるので、コマンドを打つ必要はありません。
 

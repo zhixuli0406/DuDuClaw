@@ -100,7 +100,7 @@ A native Tauri build that starts the local gateway automatically when you launch
 | Windows x64 | `DuDuClaw_*_x64_en-US.msi` | No Authenticode certificate yet, so SmartScreen warns; click "More info" then "Run anyway" to install — unblock details in [docs/guides/desktop-unblock.md](docs/guides/desktop-unblock.md) |
 | Linux | `*_amd64.AppImage` / `.deb` | No signing needed |
 
-> The latest macOS desktop build is v1.66.1 ([desktop-v1.66.1](https://github.com/zhixuli0406/DuDuClaw/releases/tag/desktop-v1.66.1)). The v1.67.0 macOS build failed at Apple notarization and was not published; Windows and Linux have v1.67.0.
+> The macOS desktop build is available again from v1.68.1 (signed and notarized). v1.67.0 through v1.68.0 have no macOS build; Windows and Linux builds exist for those versions.
 
 Open it and you're done — the in-app wizard walks you through picking an AI backend and creating your first agent, no commands needed.
 
