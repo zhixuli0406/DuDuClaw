@@ -1,22 +1,24 @@
 # OpenClaw / Hermes / paperclip からのスムーズな移行
 
-`duduclaw migrate-from` は、既存の OpenClaw、Hermes、paperclip の設定を
+`duduclaw migrate from` は、既存の OpenClaw、Hermes、paperclip の設定を
 DuDuClaw に一発で移行するコマンドです。デフォルトは**プレビューモード**で、
 「何をインポートし、何をスキップし、なぜか」を表示するだけです。計画に問題が
 なければ `--apply` を付けて実際に書き込みます。
 
+旧い綴り `duduclaw migrate-from` は v1.69.0 で削除されました。実行すると新しい綴りを表示して終了コード 2 で終了します。
+
 ```bash
 # プレビュー（ファイルは一切書き込まない）
-duduclaw migrate-from openclaw
+duduclaw migrate from openclaw
 
 # 計画を確認したうえで実際に適用
-duduclaw migrate-from openclaw --apply
+duduclaw migrate from openclaw --apply
 ```
 
 ## コマンド
 
 ```
-duduclaw migrate-from <openclaw|hermes|paperclip> [--source <path>] [--apply] [--rename]
+duduclaw migrate from <openclaw|hermes|paperclip> [--source <path>] [--apply] [--rename]
 ```
 
 | フラグ | 動作 |
@@ -43,8 +45,8 @@ duduclaw migrate-from <openclaw|hermes|paperclip> [--source <path>] [--apply] [-
 ### OpenClaw（`~/.openclaw`）
 
 ```bash
-duduclaw migrate-from openclaw            # デフォルトの移行元は ~/.openclaw
-duduclaw migrate-from openclaw --source /path/to/.openclaw --apply
+duduclaw migrate from openclaw            # デフォルトの移行元は ~/.openclaw
+duduclaw migrate from openclaw --source /path/to/.openclaw --apply
 ```
 
 `openclaw.json`（JSON5）を読み込み、以下をインポートします。
@@ -68,9 +70,9 @@ duduclaw migrate-from openclaw --source /path/to/.openclaw --apply
 ### Hermes（`~/.hermes`）
 
 ```bash
-duduclaw migrate-from hermes --apply
+duduclaw migrate from hermes --apply
 # active ではない profile を移行する場合：
-duduclaw migrate-from hermes --source ~/.hermes/profiles/<name> --apply
+duduclaw migrate from hermes --source ~/.hermes/profiles/<name> --apply
 ```
 
 Hermes はシングル agent プラットフォームなので、DuDuClaw agent を 1 つ（id は
@@ -94,7 +96,7 @@ paperclip のデータは組み込みの PostgreSQL に格納されており、D
 paperclipai company export <company-id> --out ./export \
   --include company,agents,projects,issues,tasks,skills
 
-duduclaw migrate-from paperclip --source ./export --apply
+duduclaw migrate from paperclip --source ./export --apply
 ```
 
 `--source` は**必須**です（指定しない場合は上記の手順が表示されます）。インポート
@@ -147,5 +149,5 @@ CONFLICT は移行先にすでに値があり、既存の設定を守るため�
 
 **Q：Claude 以外のモデルはどうなりますか？**
 `[model] preferred` にそのまま保持され `PARTIAL` としてマークされます。どの
-runtime（codex / antigravity / openai_compat、または v1.67.0 で非推奨・v1.69.0 で削除の gemini。[非推奨ガイド](deprecations.md#gemini-cli-ランタイム)参照）にマッピングするかは人手での確認が
+runtime（codex / antigravity / openai_compat、または v1.67.0 で非推奨・v1.70.0 で削除の gemini。[非推奨ガイド](deprecations.md#gemini-cli-ランタイム)参照）にマッピングするかは人手での確認が
 必要になります。DuDuClaw が代わりに推測することはありません。

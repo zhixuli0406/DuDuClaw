@@ -1,22 +1,24 @@
 # Painless migration from OpenClaw / Hermes / paperclip
 
-`duduclaw migrate-from` moves an existing OpenClaw, Hermes, or paperclip setup into
+`duduclaw migrate from` moves an existing OpenClaw, Hermes, or paperclip setup into
 DuDuClaw with one command. It defaults to **preview mode**: it only prints what would
 be imported, what would be skipped, and why. Once the plan looks right, add `--apply`
 to actually write anything.
 
+The older spelling `duduclaw migrate-from` was removed in v1.69.0. It prints the new spelling and exits with code 2.
+
 ```bash
 # Preview (writes nothing)
-duduclaw migrate-from openclaw
+duduclaw migrate from openclaw
 
 # Apply after reviewing the plan
-duduclaw migrate-from openclaw --apply
+duduclaw migrate from openclaw --apply
 ```
 
 ## Command
 
 ```
-duduclaw migrate-from <openclaw|hermes|paperclip> [--source <path>] [--apply] [--rename]
+duduclaw migrate from <openclaw|hermes|paperclip> [--source <path>] [--apply] [--rename]
 ```
 
 | Flag | Effect |
@@ -43,8 +45,8 @@ the report.
 ### OpenClaw (`~/.openclaw`)
 
 ```bash
-duduclaw migrate-from openclaw            # defaults to ~/.openclaw
-duduclaw migrate-from openclaw --source /path/to/.openclaw --apply
+duduclaw migrate from openclaw            # defaults to ~/.openclaw
+duduclaw migrate from openclaw --source /path/to/.openclaw --apply
 ```
 
 Reads `openclaw.json` (JSON5) and imports:
@@ -68,9 +70,9 @@ The legacy directory names `~/.moltbot` and `~/.clawdbot` are also supported.
 ### Hermes (`~/.hermes`)
 
 ```bash
-duduclaw migrate-from hermes --apply
+duduclaw migrate from hermes --apply
 # migrate a non-active profile:
-duduclaw migrate-from hermes --source ~/.hermes/profiles/<name> --apply
+duduclaw migrate from hermes --source ~/.hermes/profiles/<name> --apply
 ```
 
 Hermes is a single-agent platform, so this produces one DuDuClaw agent (id `hermes`).
@@ -94,7 +96,7 @@ to that database directly. Export from the paperclip side first:
 paperclipai company export <company-id> --out ./export \
   --include company,agents,projects,issues,tasks,skills
 
-duduclaw migrate-from paperclip --source ./export --apply
+duduclaw migrate from paperclip --source ./export --apply
 ```
 
 `--source` is **required** (omitting it prints the instructions above). Imports:
@@ -145,5 +147,5 @@ value from config.toml first and rerun, or import as a separate agent with `--re
 
 **Q: What happens with a non-Claude model?**
 It is kept as-is in `[model] preferred` and marked `PARTIAL`, prompting you to manually
-confirm which runtime it maps to (codex / antigravity / openai_compat, or gemini, which is deprecated in v1.67.0 and removed in v1.69.0; see [deprecations](deprecations.md#gemini-cli-runtime)). DuDuClaw will not
+confirm which runtime it maps to (codex / antigravity / openai_compat, or gemini, which is deprecated in v1.67.0 and removed in v1.70.0; see [deprecations](deprecations.md#gemini-cli-runtime)). DuDuClaw will not
 guess on your behalf.

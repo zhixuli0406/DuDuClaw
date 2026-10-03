@@ -41,27 +41,11 @@ display_name = "Helper"
 
 Write the persona in `agents/helper/soul.md`. Identity / responsibilities / boundaries is a good starting structure — the clearer the boundaries, the more confidently people will install it.
 
-### Or write the canonical `pack.toml`
+### About `pack.toml`
 
-`expert.toml` above is the legacy dialect — fully supported until **v1.69.0**. New packs can instead declare a `pack.toml`, the one schema shared by teams, single-persona industry packs and job presets:
+Use `expert.toml` for team packs and industry packs. The newer `pack.toml` schema can describe teams, industry packs and job presets, and `duduclaw pack inspect` reads all of them. But `duduclaw pack install` can only install a `pack.toml` whose `kind` is `"preset"` (a job preset). A `pack.toml` with `kind = "team"` or `"template"` can be read and inspected and cannot be installed yet, because the installer behind it recognises a team or industry pack only by its `expert.toml`. For that reason `expert.toml` is deprecated but still read, and it will be removed together with the rewritten premium templates once a `pack.toml` team pack can be installed. No version number is set.
 
-```toml
-[pack]
-schema  = 1
-id      = "my-first-pack"
-kind    = "team"        # "preset" | "team" | "template"
-tier    = "free"
-version = "0.1.0"
-label   = "A friendly little helper"
-description = "Demo pack"
-
-[[pack.agents]]
-name = "helper"
-role = "main"
-display_name = "Helper"
-```
-
-Everything else in the directory (personas, skills, wiki pages) is unchanged. Have a legacy pack already? `duduclaw pack inspect <dir> --emit-canonical` prints the equivalent `pack.toml` for you to review and save — it never writes over your files.
+Have a pack and want to see how it looks under the canonical schema? `duduclaw pack inspect <dir> --emit-canonical` prints the equivalent `pack.toml` for you to review. It never writes over your files.
 
 ## 2. Local test loop
 
@@ -86,7 +70,7 @@ duduclaw pack install https://example.com/my-first-pack-0.1.0.zip
 duduclaw expert remove my-first-pack
 ```
 
-`duduclaw expert install` / `expert list` still work and are aliases of the first two — same code path, same output.
+`duduclaw expert install` was removed in v1.69.0: it prints `duduclaw pack install` and exits with code 2. `expert list` still works and lists the installed records.
 
 Install-side protections are built in: a zip-slip fence, a 50MB cap, content scanning. **Hooks always install disabled** into a quarantine directory (`hooks-disabled/`) and need an explicit operator trust decision before they run. Don't assume hooks will just work when you write a pack.
 
@@ -104,7 +88,7 @@ Install-side protections are built in: a zip-slip fence, a 50MB cap, content sca
 
 ## 5. Publishing and quality
 
-Today's publishing path: put the zip at any downloadable URL (a GitHub Release is the easiest), and others run `expert install <url>`. You're also welcome to add a page to the template gallery (`distribution/gallery/`). A centralized registry (PR submission + automated validation + signing) is under construction.
+Today's publishing path: put the zip at any downloadable URL (a GitHub Release is the easiest), and others run `pack install <url>`. You're also welcome to add a page to the template gallery (`distribution/gallery/`). A centralized registry (PR submission + automated validation + signing) is under construction.
 
 Quality checklist (a future tiered scorecard will look at these):
 - [ ] SOUL has a clear "boundaries" section

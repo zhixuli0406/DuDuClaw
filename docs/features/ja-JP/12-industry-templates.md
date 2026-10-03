@@ -96,7 +96,7 @@ duduclaw pack install ./my-team    # kindで経路分岐。プレミアム内容
 
 `kind`がインストール経路を決めます——プリセットはプリセットストア(`presets/<id>/preset.toml`、`duduclaw preset bind`で社員に紐付け)へ、チームパックと業種パックは[features/32](32-expert-packs.md)で説明する完全なセキュリティパイプラインを通ります。`tier`は唯一残ったプレミアム判定です:以前は4つの別々のコードパスがディレクトリパスから「これは有料コンテンツか」を各自導出していましたが、いまはパック自身がtierを持ち、1つの述語だけがそれを読みます。
 
-**3つの旧マニフェスト方言はv1.69.0まで動き続けます。** `expert.toml`、`team.toml`、`preset.toml`はそのまま読まれ、ディスク上は1文字も書き換えません——プレミアムコンテンツツリー(コンプライアンス規定を人間が1行ずつレビュー済み)を機械が変換することはありません。`duduclaw expert install`と`duduclaw preset`は同じコードパスのエイリアスとして残ります。旧ファイルが新スキーマでどう見えるかは`duduclaw pack inspect <dir> --emit-canonical`で確認できます——表示するだけで、書き込みはしません。
+**3つの旧マニフェスト方言は引き続き読み込まれます。** `expert.toml`、`team.toml`、`preset.toml`はそのまま読まれ、ディスク上は1文字も書き換えません——プレミアムコンテンツツリー(コンプライアンス規定を人間が1行ずつレビュー済み)を機械が変換することはありません。このうち`expert.toml`、`team.toml`、業種パックのディレクトリ構成は非推奨で、書き直された有料テンプレートと一緒に今後のバージョンで削除されます(バージョン番号は未定)。`preset.toml`は職務プリセットの保存形式で、非推奨ではありません。`duduclaw expert install`はv1.69.0で削除されました。代わりに`duduclaw pack install`を使ってください。旧ファイルが新スキーマでどう見えるかは`duduclaw pack inspect <dir> --emit-canonical`で確認できます——表示するだけで、書き込みはしません。
 
 ---
 

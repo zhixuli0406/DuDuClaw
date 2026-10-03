@@ -78,7 +78,7 @@ the failure mode the rule above exists to remove.
 
 Two new gates refuse a call without removing the tool from `tools/list`:
 
-- `agent.toml [permissions]`: a flag written as `false` refuses `create_agent` (`can_create_agents`); `send_to_agent`, `spawn_agent` (`can_send_cross_agent`); `schedule_task`, `create_reminder` and `tasks_create` with a `schedule` (`can_schedule_tasks`); `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording` (`can_modify_own_skills`). The refusal is JSON-RPC error -32003 and a `permission_denied` audit event. An `agent.toml` that exists but cannot be read or parsed refuses these tools; a missing one allows them. `tasks_create` without a `schedule` stays allowed, which is why these flags are checked per call. Ephemeral role members are scaffolded with `can_create_agents`, `can_modify_own_skills` and `can_schedule_tasks` set to `false`.
+- `agent.toml [permissions]`: a flag written as `false` refuses `create_agent` (`can_create_agents`); `send_to_agent`, `spawn_agent` (`can_send_cross_agent`); `create_reminder` and `tasks_create` with a `schedule` (`can_schedule_tasks`); `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording` (`can_modify_own_skills`). The refusal is JSON-RPC error -32003 and a `permission_denied` audit event. An `agent.toml` that exists but cannot be read or parsed refuses these tools; a missing one allows them. `tasks_create` without a `schedule` stays allowed, which is why these flags are checked per call. Ephemeral role members are scaffolded with `can_create_agents`, `can_modify_own_skills` and `can_schedule_tasks` set to `false`.
 - `config.toml [odoo] features_*`: Odoo tools stay listed and are refused per call for models of a switched-off module (project and hr are off by default).
 
 ### Record relationship checks: listed but refused
@@ -320,7 +320,7 @@ client id. Details:
 A deprecated tool name keeps appearing in `tools/list` with a
 `[deprecated → …]` prefix on its description, because hiding it would make it
 uncallable — the opposite of what a deprecation window is for. The full old →
-new table is [deprecations.md](deprecations.md).
+new table is [deprecations.md](deprecations.md). No MCP tool is deprecated at the moment: the aliases of the v1.66.0 window were removed in v1.69.0.
 
 ## Related
 

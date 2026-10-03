@@ -252,7 +252,7 @@ The entire system is automatic. Once configured, operators don't need to manuall
 
 ## Cross-Provider Failover
 
-With DuDuClaw's Multi-Runtime architecture (Claude / Codex / Antigravity / OpenAI-compat; the Gemini CLI runtime is deprecated in v1.67.0 and removed in v1.69.0), account rotation extends across providers. The **FailoverManager** coordinates cross-provider health:
+With DuDuClaw's Multi-Runtime architecture (Claude / Codex / Antigravity / OpenAI-compat; the Gemini CLI runtime is deprecated in v1.67.0 and removed in v1.70.0), account rotation extends across providers. The **FailoverManager** coordinates cross-provider health:
 
 ```
 Primary provider (Claude) rate-limited

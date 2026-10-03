@@ -13,7 +13,7 @@
 
 Zed、JetBrains、Neovim のような IDE は、DuDuClaw のチャネルインフラ全体を理解することなく、エージェントに「このタスクを引き受けられますか？」と尋ねたいのです。彼らに必要なのは予約専用回線——クリーンで安定した、プロトコル駆動のインターフェースです。
 
-それがこの 2 つのプロトコルサーバーの役割です。DuDuClaw はこれらを**別々のコマンド**として出荷しています：`duduclaw acp` は IDE agent panel 用の Agent Client Protocol（Zed／JetBrains／nvim——設定方法は下記「プロトコル範囲」参照）、`duduclaw acp-server` は A2A プロトコル（エージェント間・スクリプト／CI 統合、以降のセクションで説明する内容）を話します。
+それがこの 2 つのプロトコルサーバーの役割です。DuDuClaw はこれらを**別々のコマンド**として出荷しています：`duduclaw acp` は IDE agent panel 用の Agent Client Protocol（Zed／JetBrains／nvim——設定方法は下記「プロトコル範囲」参照）、`duduclaw acp server` は A2A プロトコル（エージェント間・スクリプト／CI 統合、以降のセクションで説明する内容）を話します。
 
 ---
 
@@ -26,7 +26,7 @@ Zed、JetBrains、Neovim のような IDE は、DuDuClaw のチャネルイン�
 DuDuClaw が提供するのは server 側です：
 
 ```
-duduclaw acp-server
+duduclaw acp server
      |
      v
 Listens on stdin, writes to stdout (line-delimited JSON-RPC 2.0)
@@ -39,7 +39,7 @@ Responds to:
   tasks/cancel     → cancel running task
 ```
 
-v1.8.9 より前は、`duduclaw acp-server` はメッセージを表示して戻るだけのプレースホルダーでした。v1.8.9 でそれを本物の `A2ATaskManager` に接続し、機能するようにしました。
+v1.8.9 より前は、`duduclaw acp server` はメッセージを表示して戻るだけのプレースホルダーでした。v1.8.9 でそれを本物の `A2ATaskManager` に接続し、機能するようにしました。
 
 ---
 
@@ -51,7 +51,7 @@ v1.8.9 より前は、`duduclaw acp-server` はメッセージを表示して戻
 {
   "name": "duduclaw-pm",
   "description": "Project manager for DuDuClaw v1.9 roadmap",
-  "url": "stdio://duduclaw acp-server --agent duduclaw-pm",
+  "url": "stdio://duduclaw acp server --agent duduclaw-pm",
   "version": "1.8.14",
   "capabilities": {
     "streaming": true,
@@ -153,7 +153,7 @@ stdio 上の JSON-RPC は MCP が使うトランスポートと同じです—�
 
 ## プロトコル範囲——最初にお読みください
 
-> **状態訂正（2026-08-13）。**`duduclaw acp-server` が現在話すのは **A2A（Agent2Agent）プロトコル**（stdio 上の `agent/discover`、`message/send`、`tasks/send|get|cancel`＋`.well-known` agent card）であり、IDE の agent panel が使う *Agent Client Protocol*（`initialize`／`authenticate`／`session/new`／`session/prompt` ストリーミング）は**未実装**です。現時点で Zed・JetBrains・`nvim-acp` を向けると `initialize` で Method not found になります。両プロトコルは不運にも「ACP」の略称を共有しており、本文書の旧版はこれらを混同していました。
+> **状態訂正（2026-08-13）。**`duduclaw acp server` が現在話すのは **A2A（Agent2Agent）プロトコル**（stdio 上の `agent/discover`、`message/send`、`tasks/send|get|cancel`＋`.well-known` agent card）であり、IDE の agent panel が使う *Agent Client Protocol*（`initialize`／`authenticate`／`session/new`／`session/prompt` ストリーミング）は**未実装**です。現時点で Zed・JetBrains・`nvim-acp` を向けると `initialize` で Method not found になります。両プロトコルは不運にも「ACP」の略称を共有しており、本文書の旧版はこれらを混同していました。
 >
 > **更新（2026-08-13 同日）：本物の Agent Client Protocol は独立コマンド `duduclaw acp` として出荷されました。** ACP **v1** を実装（`initialize` → `session/new` → `session/prompt`、`session/update` ストリーミング：`agent_message_chunk`、`tool_call`／`tool_call_update`、`plan`）し、`session/cancel` にも対応（進行中のターンは spec 通り `stopReason: "cancelled"` で応答）。home 未設定時は spec の `AUTH_REQUIRED`（`-32000`）を返し、ターミナルで `duduclaw onboard` を実行する認証メソッドを宣言します。prompt ターンはメッセージングチャネルと**同一の** gateway 応答パイプライン（セッション記憶、契約チェック）を通り、Main ロールの AI 社員が応答します。
 >
@@ -163,7 +163,7 @@ stdio 上の JSON-RPC は MCP が使うトランスポートと同じです—�
 > { "agent_servers": { "DuDuClaw": { "command": "duduclaw", "args": ["acp"] } } }
 > ```
 >
-> `duduclaw acp-server` は引き続き A2A 用です——2 つのプロトコルは意図的に別コマンドに分かれています。
+> `duduclaw acp server` は引き続き A2A 用です——2 つのプロトコルは意図的に別コマンドに分かれています。
 
 ## 現在使える機能（stdio 上の A2A）
 
@@ -175,7 +175,7 @@ stdio 上の JSON-RPC は MCP が使うトランスポートと同じです—�
 - name: Generate release notes via DuDuClaw
   run: |
     echo '{"jsonrpc":"2.0","id":1,"method":"tasks/send","params":{"task":"..."}}' \
-      | duduclaw acp-server --agent duduclaw-pm
+      | duduclaw acp server --agent duduclaw-pm
 ```
 
 HTTP server も認証トークンもポート管理も不要——コンテナ内の stdio だけです。
@@ -189,7 +189,7 @@ HTTP server も認証トークンもポート管理も不要——コンテナ�
 | プロトコル | 用途 | 方向 | コマンド |
 |----------|---------|-----------|---------|
 | **MCP** | DuDuClaw のツール（channel、memory、agent、wiki、task……）を AI runtime に公開 | Runtime → DuDuClaw | `duduclaw mcp-server` |
-| **ACP/A2A** | 外部クライアント（IDE、パイプライン、他のエージェント）が DuDuClaw にタスクを送信 | IDE → DuDuClaw | `duduclaw acp-server` |
+| **ACP/A2A** | 外部クライアント（IDE、パイプライン、他のエージェント）が DuDuClaw にタスクを送信 | IDE → DuDuClaw | `duduclaw acp server` |
 | **Runtime stdio** | DuDuClaw が runtime（Claude/Codex/Antigravity/Grok、非推奨期間中は Gemini も）サブプロセスを起動し stdio JSON で対話 | DuDuClaw → Runtime | *内部* |
 
 これらは3つの異なる会話で、すべて stdio 上にあり、すべて JSON-RPC に隣接しています。同じエージェントが実行時にこの3つすべてに同時に参加します。

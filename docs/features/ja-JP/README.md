@@ -25,7 +25,7 @@
 | 15 | [スキルライフサイクルエンジン](15-skill-lifecycle.md) | 6段階の自動スキル抽出・管理 |
 | 16 | [セッションメモリスタック](16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |
 | 17 | [Wiki 知識レイヤー](17-wiki-knowledge-layer.md) | L0-L3 信頼度加重知識の自動注入 |
-| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | `duduclaw acp` は IDE パネル（Zed / JetBrains / nvim）向けに Agent Client Protocol v1 を話し、`duduclaw acp-server` は A2A の stdio インターフェースです |
+| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | `duduclaw acp` は IDE パネル（Zed / JetBrains / nvim）向けに Agent Client Protocol v1 を話し、`duduclaw acp server` は A2A の stdio インターフェースです |
 | 20 | [メモリインテリジェンス](20-memory-intelligence.md) | 時系列ファクト + Reflexionループ + バッチ取得（v1.19.0） |
 | 23 | [Autopilot ルールエンジン](23-autopilot-engine.md) | イベント駆動の自動化 + サーキットブレーカー |
 | 24 | [タスクボードとアクティビティフィード](24-task-board.md) | チームメイトとしてのエージェントのタスク管理 |

@@ -175,7 +175,7 @@ policy = "fixed_hierarchy"  # 派工策略（選哪個 AI 員工接任務）。�
 grounding_precheck_enabled = true  # 驗收前的證據落地預檢（見「證據落地預檢」）。預設 true
 two_stage_judge = true  # 驗收前先跑便宜的第一階段評估（見「兩段式驗收裁決」）。預設 true
 strict_reply_parsing = "shadow"  # 判官回覆的嚴格 JSON 契約：off / shadow / enforce（見「判官回覆嚴格契約」）。預設 shadow
-judge = "mav"           # 由誰做驗收裁決（見「換掉驗收判官」）。mav / external（evaluator_only / human_only 已棄用，v1.69.0 移除）。預設 mav
+judge = "mav"           # 由誰做驗收裁決（見「換掉驗收判官」）。mav / external（evaluator_only / human_only 已在 v1.69.0 移除）。預設 mav
 judge_provider = "antigravity"      # 選填：讓判官跑在另一個 runtime 上（見「讓判官跑在另一個模型上」）。未設 ⇒ 預設的工具用 runtime
 judge_model = "gemini-3-pro-preview" # 選填：該 runtime 內的判官模型 id。未設 ⇒ 預設的工具用模型
 admission = "queue"     # 子代理（ephemeral spawn）撞並發上限時的處置，"queue" 或 "fail"。預設 queue（見下方「ephemeral spawn 准入排隊」）
@@ -412,7 +412,7 @@ AI 員工回報完成、任務進入驗收時，在呼叫驗收判官之前會�
 開啟後，goal loop 在每次派工前會依過往同類任務的統計先「預測」這次執行
 大概會如何（會不會失敗、大概動用哪些工具類別），執行結束後把預測與實際
 觀察比對並記錄成轉移，讓系統對「做這類事會發生什麼」累積出任務層的世界
-模型。每個 runtime 都會跑這套流程，但看得到多少，取決於該 runtime 有沒有把原生工具事件餵給收集器。Claude（派工的 stream-json 路徑）、Codex、Gemini CLI（v1.67.0 起棄用，v1.69.0 移除）、Antigravity 與 OpenAI 相容的 agent 會記錄原生工具事件，觀察可以達到 `Full`。Grok 與七個通用 print-mode CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）沒有接收集器，觀察只會是 `McpOnly`（只靠 `tool_calls.jsonl`），該輪在那個檔案裡沒有紀錄時則是 `None`。流程如下：
+模型。每個 runtime 都會跑這套流程，但看得到多少，取決於該 runtime 有沒有把原生工具事件餵給收集器。Claude（派工的 stream-json 路徑）、Codex、Gemini CLI（v1.67.0 起棄用，v1.70.0 移除）、Antigravity 與 OpenAI 相容的 agent 會記錄原生工具事件，觀察可以達到 `Full`。Grok 與七個通用 print-mode CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）沒有接收集器，觀察只會是 `McpOnly`（只靠 `tool_calls.jsonl`），該輪在那個檔案裡沒有紀錄時則是 `None`。流程如下：
 
 - **預測分層退化**：有同類統計用統計、沒有就用整體邊際、再沒有用先驗
   預設值，冷啟動不花任何 LLM 費用。
@@ -455,8 +455,8 @@ AI 員工回報完成、任務進入 `review` 之後，不是每次都直接燒�
 |---|---|---|
 | `mav`（預設） | 第一階段評估器 → MAV 三面向判官團 | 一般情況 |
 | `external` | 你自己的程式（`judge_command`） | 想接自家 CI、規則引擎、或第二個模型當判官 |
-| `evaluator_only` | 只跑第一階段評估器，`candidate_complete` 直接判過 | **已棄用，v1.69.0 移除。** 改用 `mav`：`two_stage_judge` 本來就先跑便宜的評估器，只有完成候選才付判官團的錢 |
-| `human_only` | 沒有機器裁決，每個 `review` 任務都轉 `needs_human` | **已棄用，v1.69.0 移除。** 改用 `mav` ＋ 每 agent 的 `[capabilities] autonomy_level` / `approval_required_tools` |
+| `evaluator_only` | 只跑第一階段評估器，`candidate_complete` 直接判過 | **已在 v1.69.0 移除。** 設定檔裡殘留的值會改用 `mav` 驗收（更嚴格，判官費用更高）。請改成 `mav`：`two_stage_judge` 本來就先跑便宜的評估器，只有完成候選才付判官團的錢 |
+| `human_only` | 沒有機器裁決，每個 `review` 任務都轉 `needs_human` | **已在 v1.69.0 移除。** 設定檔裡殘留的值不會退回機器驗收：每件送驗的工作都停在 `needs_human`，直到你標記完成，或改好設定後重試（重試會清掉舊成果）。請改用 `mav` ＋ 每 agent 的 `[capabilities] autonomy_level` / `approval_required_tools` |
 
 四個值仍然全部解析得到，已經設定棄用模式的部署行為完全不變，只會每個行程記一次警告；若該值是從儀表板寫入的，另記一筆 `judge_mode_deprecated` 審計事件。儀表板只提供 `mav` 與 `external`，但已存的舊值會照樣顯示（標「已棄用」），不會被偷偷換掉。詳見 [deprecations.md](deprecations.md)。
 
@@ -682,7 +682,7 @@ gateway 重啟或崩潰復原後，還在跑的目標任務預設會轉成 `need
 | 操作 | 新建／覆寫、修改、刪除、指令四種。 |
 | 狀態 | 失敗或被攔截的呼叫也會列出並標記「未成功」，這正是即時查詢工具狀態看不到的那一半。 |
 | 摘要片段 | 寫入內容或指令說明的片段，直接沿用稽核紀錄的遮罩結果（不會為了顯示而重讀原始檔案）。 |
-| 來源 | 執行期工具事件（Write / Edit / NotebookEdit / Bash……）或 MCP 稽核紀錄（`shared_wiki_write` 等）。 |
+| 來源 | 執行期工具事件（Write / Edit / NotebookEdit / Bash……）或 MCP 稽核紀錄（`wiki_write` 等）。 |
 
 證據來自兩條既有軌跡：執行期的原生工具事件在每一輪派工後落成檔案變更紀錄（以任務 id 歸屬），MCP 稽核紀錄則沿用判官 `<tool_activity>` 同一套「認領→驗收時間窗＋執行者」歸屬。**查無就是查無**：沒有紀錄時分頁直接顯示「此任務沒有留下檔案變更紀錄」，不會用敘述硬湊。
 

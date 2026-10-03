@@ -106,7 +106,7 @@ WikiFts SQLite virtual table
      v
 Search queries:
   wiki_search("rate limiting", min_trust=0.5, layer="core")
-  shared_wiki_search("SOP", expand=true)
+  wiki_search("SOP", scope="shared", expand=true)
 ```
 
 ### 検索フィルター
@@ -205,7 +205,7 @@ Report candidate duplicates:
 
 **ツールは一式、wiki は二つ。** `wiki_ls` / `wiki_read` / `wiki_write` / `wiki_search` / `wiki_stats` / `wiki_lint` はいずれも `scope` パラメータを取ります。`"agent"`（既定 — 自分の wiki、挙動は変わりません）か `"shared"`（エージェント横断の共有 wiki）です。`wiki_share` は自分の wiki のページを共有 wiki へコピーし、`shared_wiki_delete` はエージェントローカル側に削除入口を意図的に持たないため名前をそのまま残しています。
 
-6 つの `shared_wiki_*` の綴り（`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`）は非推奨エイリアスとして引き続き使え、まったく同じハンドラに到達します。v1.69.0 で削除されます。[非推奨となった名称](../../guides/ja-JP/deprecations.md)を参照。
+6 つの `shared_wiki_*` の綴り（`_ls` / `_read` / `_write` / `_search` / `_stats` / `_lint`）は v1.69.0 で削除されました。`tools/list` には出ず、呼び出すと置き換え先（`scope="shared"` を付けた `wiki_*`）を示すエラーが返ります。[非推奨と削除](../../guides/ja-JP/deprecations.md)を参照。
 
 ### ネームスペースSoTポリシー（`.scope.toml`）
 
@@ -239,7 +239,7 @@ mode         = "operator_only"
 | `read_only` | ❌ 拒否 | ✅ 許可 | ✅ 許可 |
 | `operator_only` | ❌ 拒否 | ❌ 拒否 | ✅ 許可 |
 
-`shared_wiki_write`と`shared_wiki_delete`の両方がこのポリシーを尊重します。リストにないネームスペースはデフォルトで`agent_writable`です——ポリシーは*締めるだけ*で、決して緩めません。
+`wiki_write`（`scope="shared"`）と`shared_wiki_delete`の両方がこのポリシーを尊重します。リストにないネームスペースはデフォルトで`agent_writable`です——ポリシーは*締めるだけ*で、決して緩めません。
 
 **フェイルセーフ：** ファイルなし ⇒ ポリシーなし ⇒ 既存の挙動。不正なTOML ⇒ 警告をログに記録 + ポリシーなしとして扱う。gatewayが壊れたポリシーファイルにブロックされることは決してありません。
 
@@ -249,7 +249,7 @@ mode         = "operator_only"
 
 ### 部門別の読み取り可視性（`visible_to_departments`）
 
-上記の`mode`は「誰が書き込めるか」を制御します。「誰が**部門**レベルで読み取れるか」を制御するには、同じ`[namespaces."x"]`テーブルに`visible_to_departments`配列を追加します。`[agent] department`がリストに含まれるエージェントだけがそのネームスペースを見ることができます——**プロンプトインジェクション**（自動注入されるL0/L1ページ）でも、**`shared_wiki_search` / `shared_wiki_read` / `shared_wiki_ls`**経由でも同様です。
+上記の`mode`は「誰が書き込めるか」を制御します。「誰が**部門**レベルで読み取れるか」を制御するには、同じ`[namespaces."x"]`テーブルに`visible_to_departments`配列を追加します。`[agent] department`がリストに含まれるエージェントだけがそのネームスペースを見ることができます——**プロンプトインジェクション**（自動注入されるL0/L1ページ）でも、**`wiki_search` / `wiki_read` / `wiki_ls`（`scope="shared"`）**経由でも同様です。
 
 ```toml
 # HRページはhrとlegal部門のみ閲覧可能

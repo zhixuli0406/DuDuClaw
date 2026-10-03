@@ -67,7 +67,7 @@ fallback = "claude"        # 後端偵測不到時改用此後端
 |----------|-----------|------|------|
 | `claude` | `claude`（永遠可用，核心） | OAuth / API Key 輪替 | 預設後端 |
 | `codex` | `codex` | OpenAI | — |
-| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | **v1.67.0 棄用，v1.69.0 移除**（見[已棄用名稱](deprecations.md#gemini-cli-runtime)）。個人版 OAuth 於 2026-06-18 停用；付費金鑰仍可用 |
+| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | **v1.67.0 棄用，v1.70.0 移除**（見[已棄用名稱](deprecations.md#gemini-cli-runtime)）。個人版 OAuth 於 2026-06-18 停用；付費金鑰仍可用 |
 | `antigravity` | `agy`（`~/.local/bin/agy`） | Google 登入（在終端機執行 `agy`）/ `GEMINI_API_KEY` | Gemini CLI 的官方後繼者，多模型（Gemini 3.x + Claude + GPT-OSS） |
 | `openai_compat` | HTTP（無 CLI） | per-provider key | Exo / llamafile / vLLM 等 OpenAI 相容端點 |
 
@@ -88,10 +88,12 @@ fallback = "claude"        # 後端偵測不到時改用此後端
 
 ```bash
 scripts/live-test/make-home.sh /tmp/ddc-live --port 18977
-DUDUCLAW_HOME=/tmp/ddc-live duduclaw run --yes &      # 開機一次，會寫出 .mcp.json
+HOME=/tmp/ddc-live/os-home DUDUCLAW_HOME=/tmp/ddc-live duduclaw run --yes &   # 開機一次，會寫出 .mcp.json
 scripts/live-test/mcp-probe.sh /tmp/ddc-live plain
 scripts/live-test/mcp-probe.sh /tmp/ddc-live prod-shaped
 ```
+
+啟動 gateway 時，一律把 `HOME` 指向 `make-home.sh` 在隔離 home 裡建立的 `os-home` 目錄。gateway 與它啟動的 AI CLI 會從 `HOME` 底下找登入與設定；只換 `DUDUCLAW_HOME` 的話，被啟動的 `claude` 會用操作者自己的登入，花掉操作者自己的額度，Antigravity 的 API key 模式還會改寫操作者自己的設定檔。`mcp-probe.sh` 啟動 MCP server 時也用同一個 `os-home`。
 
 這個 home 有兩位員工：`plain`（沒有 allowlist）與 `prod-shaped`（`allowed_tools = ["mcp__duduclaw__*", ...]`，另有 denied、核准清單、明確的權限旗標、預算與契約）。v1.67.0 起「萬用字元 allowlist 讓所有平台工具被拒」的回歸，就是因為活測員工沒有 allowlist 才漏測。規則：升級正式 home 之後，要透過每位員工自己的 MCP 註冊去呼叫真工具（`mcp-probe.sh ~/.duduclaw <agent-id>`）。隔離的 home 不會隔離操作者的 Claude 連接器（Drive、Gmail），請在測試任務裡明寫不要查外部服務。編譯快取塞滿磁碟時，先跑 `scripts/clean-build-cache.sh --dry-run`；它只清本 workspace 自己的產物、保留第三方依賴，且在 `cargo` 或 `rustc` 還在跑時拒絕執行。細節見 `scripts/live-test/README.md`。
 

@@ -1,21 +1,23 @@
 # 從 OpenClaw / Hermes / paperclip 無痛轉移
 
-`duduclaw migrate-from` 讓你用一行指令，把既有的 OpenClaw、Hermes 或 paperclip
+`duduclaw migrate from` 讓你用一行指令，把既有的 OpenClaw、Hermes 或 paperclip
 設定搬進 DuDuClaw。它預設是**預覽模式**：只印出「會匯入什麼、跳過什麼、為什麼」，
 確認無誤後再加 `--apply` 實際寫入。
 
+舊拼法 `duduclaw migrate-from` 已在 v1.69.0 移除，執行時會印出新拼法並以結束碼 2 離開。
+
 ```bash
 # 預覽（不寫任何檔案）
-duduclaw migrate-from openclaw
+duduclaw migrate from openclaw
 
 # 確認計畫後實際套用
-duduclaw migrate-from openclaw --apply
+duduclaw migrate from openclaw --apply
 ```
 
 ## 指令
 
 ```
-duduclaw migrate-from <openclaw|hermes|paperclip> [--source <path>] [--apply] [--rename]
+duduclaw migrate from <openclaw|hermes|paperclip> [--source <path>] [--apply] [--rename]
 ```
 
 | 旗標 | 作用 |
@@ -41,8 +43,8 @@ duduclaw migrate-from <openclaw|hermes|paperclip> [--source <path>] [--apply] [-
 ### OpenClaw（`~/.openclaw`）
 
 ```bash
-duduclaw migrate-from openclaw            # 預設來源 ~/.openclaw
-duduclaw migrate-from openclaw --source /path/to/.openclaw --apply
+duduclaw migrate from openclaw            # 預設來源 ~/.openclaw
+duduclaw migrate from openclaw --source /path/to/.openclaw --apply
 ```
 
 會讀取 `openclaw.json`（JSON5），並匯入：
@@ -62,9 +64,9 @@ duduclaw migrate-from openclaw --source /path/to/.openclaw --apply
 ### Hermes（`~/.hermes`）
 
 ```bash
-duduclaw migrate-from hermes --apply
+duduclaw migrate from hermes --apply
 # 轉移非 active 的 profile：
-duduclaw migrate-from hermes --source ~/.hermes/profiles/<name> --apply
+duduclaw migrate from hermes --source ~/.hermes/profiles/<name> --apply
 ```
 
 Hermes 是單一 agent 平台，會產生一個 DuDuClaw agent（id `hermes`）。匯入：
@@ -84,7 +86,7 @@ paperclip 的資料在內嵌 PostgreSQL，DuDuClaw 不直連資料庫。請先�
 paperclipai company export <company-id> --out ./export \
   --include company,agents,projects,issues,tasks,skills
 
-duduclaw migrate-from paperclip --source ./export --apply
+duduclaw migrate from paperclip --source ./export --apply
 ```
 
 `--source` 為**必填**（未給時會印出上面的教學）。匯入：
@@ -130,4 +132,4 @@ config.toml 裡的舊值再重跑，或改用 `--rename` 匯入成獨立 agent�
 
 **Q：非 Claude 模型會怎樣？**
 會原樣保留成 `[model] preferred` 並標 `PARTIAL`，提示你人工確認要對映到哪個 runtime
-（codex / antigravity / openai_compat，或已於 v1.67.0 棄用、v1.69.0 移除的 gemini，見[棄用說明](deprecations.md#gemini-cli-runtime)）。DuDuClaw 不會替你猜。
+（codex / antigravity / openai_compat，或已於 v1.67.0 棄用、v1.70.0 移除的 gemini，見[棄用說明](deprecations.md#gemini-cli-runtime)）。DuDuClaw 不會替你猜。

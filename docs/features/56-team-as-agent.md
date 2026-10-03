@@ -185,7 +185,7 @@ Declaring only a `model` is fine — the catalog binds it to the runtime that se
 
 ### 2. First-batch runtimes only
 
-`claude`, `codex`, `gemini` (deprecated in v1.67.0, removed in v1.69.0: use `antigravity`), `antigravity`, `grok`. Anything else — including `openai_compat`, `qwen`, `copilot`, `cursor` — is refused (`runtime_not_allowed`).
+`claude`, `codex`, `gemini` (deprecated in v1.67.0, removed in v1.70.0: use `antigravity`), `antigravity`, `grok`. Anything else — including `openai_compat`, `qwen`, `copilot`, `cursor` — is refused (`runtime_not_allowed`).
 
 The reason is tools, not capability: these five register DuDuClaw's MCP server natively, so a role running on one gets the full tool surface. A role that silently loses its tools produces confident tool-free narration, which the verifier cannot tell apart from actual work.
 
@@ -263,8 +263,8 @@ A member's `[capabilities] allowed_tools` is the role's tool subset, and it is d
 
 | Role | Tools | Effective sandbox for a codex member |
 |---|---|---|
-| `planner` | `team_handoff`, `shared_wiki_search`, `memory_search` | `read-only` |
-| `executor` | **the employee's own effective tools** + `team_handoff` + `memory_search` + `shared_wiki_read` | `workspace-write` |
+| `planner` | `team_handoff`, `wiki_search`, `memory_search` | `read-only` |
+| `executor` | **the employee's own effective tools** + `team_handoff` + `memory_search` + `wiki_read` | `workspace-write` |
 | `verifier` / `utility` | `team_handoff` | `read-only` |
 
 "The employee's own effective tools" means its `[capabilities] allowed_tools` verbatim when it has an allowlist, and otherwise the same default set an ordinary dispatch runs with (`Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `TodoWrite`, `WebFetch`, `WebSearch`, `mcp__duduclaw__*`). Either way the executor is a subset of the employee: a read-only employee still produces a read-only executor, and a tool in the employee's `denied_tools` is never requested.

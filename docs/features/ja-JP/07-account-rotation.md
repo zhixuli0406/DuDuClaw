@@ -229,7 +229,7 @@ LeastCost戦略が無料クォータ（サブスクリプションから）を�
 
 ## クロスプロバイダーフェイルオーバー
 
-DuDuClawのMulti-Runtimeアーキテクチャ（Claude / Codex / Antigravity / OpenAI-compat。Gemini CLI ランタイムは v1.67.0 で非推奨、v1.69.0 で削除予定）により、アカウントローテーションはプロバイダーをまたいで拡張されます。**FailoverManager** がクロスプロバイダーのヘルス状態を調整します：
+DuDuClawのMulti-Runtimeアーキテクチャ（Claude / Codex / Antigravity / OpenAI-compat。Gemini CLI ランタイムは v1.67.0 で非推奨、v1.70.0 で削除予定）により、アカウントローテーションはプロバイダーをまたいで拡張されます。**FailoverManager** がクロスプロバイダーのヘルス状態を調整します：
 
 ```
 プライマリプロバイダー（Claude）がレート制限

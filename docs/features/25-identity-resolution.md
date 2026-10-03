@@ -23,7 +23,7 @@ DuDuClaw's Identity Resolution is exactly this:
 
 ## The Problem Being Solved
 
-Before RFC-21 §1, a DuDuClaw agent had no way to ask "who is this person talking to me?" The only mechanism available was to call `shared_wiki_read` on a hand-known path like `identity/discord-users.md`. That file listed two people. Everyone else — team members, customer contacts, engineers — was an invisible stranger.
+Before RFC-21 §1, a DuDuClaw agent had no way to ask "who is this person talking to me?" The only mechanism available was to call `wiki_read` (`scope="shared"`) on a hand-known path like `identity/discord-users.md`. That file listed two people. Everyone else — team members, customer contacts, engineers — was an invisible stranger.
 
 Agents declared rules in SOUL.md like "reject non-project members," but they had no roster to evaluate that rule against and no mechanism to query the authoritative source. The boundary lived in prose, not in data.
 
@@ -224,7 +224,7 @@ System prompt
   └─ ... rest of context
 ```
 
-This is the visitor badge. Before this feature, a SOUL.md rule like "reject non-project members" required the agent to remember, mid-reasoning, to call `shared_wiki_read` — a step it often skipped. Now the membership data is already in front of it, in a high-attention slot, every single turn. The rule becomes evaluable from data the agent already holds.
+This is the visitor badge. Before this feature, a SOUL.md rule like "reject non-project members" required the agent to remember, mid-reasoning, to call `wiki_read` (`scope="shared"`) — a step it often skipped. Now the membership data is already in front of it, in a high-attention slot, every single turn. The rule becomes evaluable from data the agent already holds.
 
 When the provider is unconfigured or the sender is unknown, no `<sender>` block is injected — the agent simply treats the message as coming from a stranger, and SOUL.md's stranger-handling rules apply.
 

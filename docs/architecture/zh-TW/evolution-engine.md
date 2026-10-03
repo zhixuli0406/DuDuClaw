@@ -1074,7 +1074,7 @@ eval_suites_root = "evals"     # AEE 重放子行程找題庫的根目錄
 eval_binary = "/usr/local/bin/duduclaw"   # 選填，覆寫預設二進位路徑
 ```
 
-新 CLI：`duduclaw export playbook --agent <id> [--out <path>]`（舊寫法 `duduclaw playbook export` 在 v1.69.0 前仍可用；GEP-gene
+新 CLI：`duduclaw export playbook --agent <id> [--out <path>]`（舊寫法 `duduclaw playbook export` 已在 v1.69.0 移除，執行時會印出新寫法並以結束碼 2 離開；GEP-gene
 形 JSON 匯出，本地檔案，不接任何外部 hub）；`duduclaw playbook
 migrate-soul --agent <id> [--apply]`（WP1.4：舊 SOUL.md 行為規則抽成
 playbook 條目草稿，人審後 `--apply` 套用）；`duduclaw eval-scaffold

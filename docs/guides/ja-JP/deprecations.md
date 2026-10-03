@@ -1,185 +1,171 @@
-# 非推奨となった名称
+# 非推奨と削除
 
-このページに載っている名称はまだ使えますが、いずれ削除されます。現時点で削除された
-ものは一つもありません。古い名称はこれまでどおり受け付けられ、動作も変わりません。
-MCP ツールは `tools/list` にも残っているので、古い名前を覚えたモデルはそのまま
-呼び出せます。
+このページは、名前が変わった、または統合された公開名称について、すでに削除されたもの
+と、まだ非推奨期間にあるものを一覧にしています。
 
-**方針**: 古い名称は **マイナーバージョン 2 つ分** 残します。このページの項目は
-**v1.66.0** で非推奨になり、**v1.69.0** での削除を予定しています。Gemini CLI
-ランタイム（[ランタイム](#ランタイム)参照）は **v1.67.0** で非推奨になり、同じ **v1.69.0**
-での削除を予定しています。
+**方針**: 非推奨の名称は **マイナーバージョン 2 つ分** 残り、その後に削除されます。
+方針に変更はありません。v1.69.0 では、v1.66.0 で非推奨になった項目をすべて削除しました。
+例外は [引き続き非推奨](#引き続き非推奨) と
+[非推奨リストから外した名称](#非推奨リストから外した名称) に記載しています。
 
-> v1.66.0 で非推奨になった項目の削除は、v1.68.0 のリリース時に v1.68.0 から v1.69.0 へ延期されました。v1.68.0 を機能追加のみのリリースに保つためです。
-
-各面での示し方:
+非推奨期間中の、各面での示し方:
 
 | 面 | 示し方 | まだ使える？ |
 |---|---|---|
-| MCP ツール | `description` の先頭に `[deprecated → <新ツール> <パラメータ>]`、`tool_catalog` で `deprecated: true` | 使える。`tools/list` に残り、呼び出しも可能。隠すと「呼び出せなく」なり、非推奨期間の目的と正反対になる |
-| CLI サブコマンド | clap の `hide = true` — `--help` には出ないが解析される | 使える |
-| `config.toml` の値 | 読み込み時にプロセスごと 1 回 `warn!`、ダッシュボード経由の書き込み時には監査イベント | 使える。設定された挙動が黙って置き換わることはない |
-| ダッシュボード | 新しい名前だけを提示。保存済みの非推奨値は「非推奨」ラベル付きで表示 | 使える |
-| エージェントランタイム | 読み込み時にプロセスごと 1 回 `warn!`、ダッシュボード経由の書き込み時には監査イベント `runtime_provider_deprecated`。ダッシュボードは選択肢として提示しなくなり、保存済みの値には「非推奨」ラベルを付ける | 使える。解析も実行もこれまでどおり |
+| MCP ツール | `description` の先頭に `[deprecated → <新ツール> <パラメータ>]`、`tool_catalog` で `deprecated: true` | 使える。`tools/list` に残り呼び出しも可能。ツールを隠すと呼び出せなくなり、非推奨期間の目的に反するため |
+| CLI サブコマンド | clap の `hide = true`。`--help` には出ないが解析される | 使える |
+| `config.toml` の値 | 読み込み時にプロセスごとに `warn!` を 1 回、書き込み時は監査イベントも記録 | 使える。設定された動作が黙って置き換えられることはない |
+| ダッシュボード | 新しい名称だけを提示する。保存済みの旧い値は「非推奨」ラベル付きで表示 | 使える |
+| エージェントランタイム | 読み込み時にプロセスごとに `warn!` を 1 回。ダッシュボード経由の書き込みでは `runtime_provider_deprecated` の監査イベントも記録。ダッシュボードは提示をやめ、保存済みの値に「非推奨」ラベルを付ける | 使える。これまでどおり解析・実行される |
 
 ---
 
-## MCP ツール
+## v1.69.0 で削除したもの
 
-### wiki: `wiki_*` 一式に `scope` パラメータ
+### MCP ツール
 
-`wiki_*` と `shared_wiki_*` は、どちらの wiki を指すかだけが違うほぼ鏡像の API でした。
-これを `scope: "agent" | "shared"` を持つ一式に統合しました。既定は `agent` なので、
-既存の `wiki_*` 呼び出しは一切変わりません。
+8 つのツール名は宣言されなくなり、`tools/list` に出ません。呼び出すと、置き換え先の
+呼び出し方を示すツールエラーが返ります。ツールの総数は 249 から 241 になりました。
 
-| 旧 | 新 |
+| 削除されたもの | 代わりに使うもの |
 |---|---|
-| `shared_wiki_ls` | `wiki_ls` に `scope="shared"` |
-| `shared_wiki_read` | `wiki_read` に `scope="shared"` |
-| `shared_wiki_write` | `wiki_write` に `scope="shared"` |
-| `shared_wiki_search` | `wiki_search` に `scope="shared"` |
-| `shared_wiki_stats` | `wiki_stats` に `scope="shared"` |
-| `shared_wiki_lint` | `wiki_lint` に `scope="shared"` |
+| `shared_wiki_ls` | `wiki_ls`（`scope="shared"` を付ける） |
+| `shared_wiki_read` | `wiki_read`（`scope="shared"` を付ける） |
+| `shared_wiki_write` | `wiki_write`（`scope="shared"` を付ける） |
+| `shared_wiki_search` | `wiki_search`（`scope="shared"` を付ける） |
+| `shared_wiki_stats` | `wiki_stats`（`scope="shared"` を付ける） |
+| `shared_wiki_lint` | `wiki_lint`（`scope="shared"` を付ける） |
+| `schedule_task` | `tasks_create`（`schedule="<cron 式>"` を付ける） |
+| `skill_bank_search` | `skill_search`（`source="bank"` を付ける） |
 
-変わらないもの: `.scope.toml` の名前空間 SoT ポリシー、`wiki_visible_to` の可視性、
-削除時の「原著者またはメインエージェントのみ」判定。動いたのは入口だけです。
+`shared_wiki_delete` と `wiki_share` はもともとエイリアスではありません。名前は
+そのままで、影響を受けません。
 
-**`shared_wiki_delete` は意図的に統合していません**。エージェントローカル側に対応
-するものが無いため、`wiki_delete` に `scope="agent"` を作ると、重複を「減らす」のでは
-なく破壊的な権限を「増やす」ことになります。名前はそのまま、非推奨にもしません。
+**削除されたツール名を従業員がまだ使っている場合**: `agent.toml [capabilities]` の
+ツール一覧、プロンプト、スキルに旧い名前が残っていることがあります。旧い名前の効果は
+一覧ごとに異なります。
 
-### 作業の作成: `tasks_create` に一本化
-
-| 旧 | 新 |
+| 旧い名前を書いている場所 | アップグレード後の効果 |
 |---|---|
-| `schedule_task`（繰り返しの cron） | `tasks_create` に `schedule="<cron 式>"` |
+| `allowed_tools` | この項目はどのツールにも一致しなくなる。旧い名前だけを許可リストに載せている従業員は、その能力を失う。新しい名前に置き換える |
+| `denied_tools` | MCP のゲートは、対応する新しい呼び方（例: `scope="shared"` を付けた `wiki_write`）を引き続き拒否する。Claude CLI のフラグは一致しなくなるので、すべての場所で拒否するには新しい名前を書く |
+| `approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools` | ゲートは対応する新しい呼び方に引き続き適用される。`scope="shared"` を付けない `wiki_write` は影響を受けない |
+| `scoped_tools` | 対応する新しい呼び方には、引き続きタスク単位の付与が必要。付与は一覧に書かれた名前で申請され、記録される |
+| `config.toml [provenance] sensitive_tools` | ゲートウェイは、この新しい名前を引き続き代わりに保護する |
 
-`tasks_create` に任意パラメータが 2 つ増えました。
+`allowed_tools` 以外では、旧い名前は引き続き保護として働きますが、名前が古くなって
+いるため、新しい名前に置き換えることを勧めます。`duduclaw doctor` には削除済みの
+ツール名を探す検査があります。対象は、各従業員の `agent.toml [capabilities]` の一覧、
+従業員ディレクトリ直下のプロンプトファイル（`SOUL.md`、`IDENTITY.md`、`CLAUDE.md`、
+`AGENTS.md`、`GEMINI.md`、`CONTRACT.toml`）、`SKILLS/` と `wiki/` 以下の Markdown、
+`config.toml` の `[provenance]` と `[[ccr.allowed_sources]]` です。スケジュール済み
+タスクや自動化ルール内のプロンプト文、`evals/` と playbook のツールアサーション、
+`.mcp.json`、共有ナレッジベースは検査の対象外です。
 
-- **`kind`** — `"task"`（既定、カンバンのタスク）か `"goal"`（自律ゴール: 受け入れ
-  基準を作成時に凍結し、完了かどうかは AI 判定パネルが決める。任意の `plan_first`
-  で計画を作って人の承認待ちにできる）。`kind="goal"` はダッシュボードの依頼シートと
-  同じコード経路を通ります。
-- **`schedule`** — cron 式（5 または 6 フィールド）なら繰り返し作業、RFC3339 の時刻
-  （`2026-10-01T09:00:00+08:00`）なら 1 回だけの起動。どちらも結果を届けるために
-  `notify_channel` と `notify_chat_id` が必要で、1 回きりの指定でそれが無い場合は
-  届かないリマインダーを作らずに拒否します。
+統合された 3 つの入口は、これまでと同じ動作です。
 
-`kind="goal"` と `schedule` は併用できません。ゴールは一度だけ完了まで走るものです。
-この組み合わせは丸ごと拒否され、中途半端に適用されることはありません。
+- **wiki**: `wiki_*` は `scope: "agent" | "shared"` を受け取り、既定は `agent` です。
+  既存の `wiki_*` 呼び出しは変わりません。`.scope.toml` の名前空間ポリシー、
+  `wiki_visible_to` の可視性、削除時の「作成者本人またはメインエージェントのみ」の
+  ルールも変わっていません。
+- **作業の作成**: `tasks_create` は `kind`（既定の `"task"`、または `"goal"`）と
+  `schedule`（5 または 6 フィールドの cron 式は定期作業、`2026-10-01T09:00:00+08:00`
+  のような RFC3339 時刻は 1 回限りの起動）を受け取ります。どちらの形式も結果を届ける
+  ために `notify_channel` と `notify_chat_id` が必要で、欠けていると拒否されます。
+  `kind="goal"` と `schedule` の併用も拒否されます。委任ポリシーの検査（部門と階層）は、
+  この入口でどの分岐よりも先に 1 回だけ行われます。
+  `goals_create`（Initiative、Project、Issue 階層のノード）と `create_task`（明示的な
+  `steps` を持つ複数ステップの計画を TaskSpec ディスパッチャーに渡す）は用途の異なる
+  ツールで、非推奨になったことはありません。
+- **スキル検索**: `skill_search` は `source` を受け取ります。`"all"`（既定。ハブと学習
+  済みスキルバンクを、スキル名で重複排除）、`"github"`、`"hub"`、`"bank"` です。学習
+  済みスキルバンクは今もメモリ上の空のスタブなので、`source="bank"` は空であることを
+  返します。
 
-**`goals_create` と `create_task` はいずれも非推奨ではありません**。`goals_create`
-はゴール「階層」のノード（Initiative → Project → Issue）— 担当者が見る why-chain —
-を作ります。`create_task` は明示的な `steps` 配列からなる複数ステップの計画を
-TaskSpec ディスパッチャに渡すもので、`tasks_create` には対応するパラメータが
-ありません。非推奨にすると、存在しない代替を約束することになります。両方の説明文
-に、自分が何であるか、そして自分の担当ではないケースでは `tasks_create` を使うこと
-を明記しました。
+### CLI の旧い綴り
 
-委任ポリシー（部署 × 階層）の判定は、**統合された入口で一度だけ**、どの分岐よりも
-先に行われます。これが統合のセキュリティ上の要点です。呼び出し側が、古い 4 つの
-ツールのうち最も検査が緩いものを選んで部署をまたぐ割り当てを通す、ということが
-できなくなります。
+次の綴りは今も解析されますが、新しい綴りを示す 1 行を表示し、終了コード 2 で終了します。
+何も実行されません。
 
-### スキル検索: `skill_search` に `source` パラメータ
-
-| 旧 | 新 |
+| 削除されたもの | 代わりに使うもの |
 |---|---|
-| `skill_bank_search` | `skill_search` に `source="bank"` |
-
-`skill_search` に `source` が増えました。
-
-- `"all"`（既定）— 設定済みのスキルハブ **と** この環境が学習したスキルバンクを
-  検索し、スキル名で重複排除する
-- `"github"` — GitHub ハブのみ
-- `"hub"` — キュレーション済みレジストリ
-- `"bank"` — 学習済みスキルバンクのみ
-
-モデル向けの一文ルール: そのスキルがどこにあるか分かっている場合を除き、`source` は
-触らないこと。
-
-学習済みスキルバンクはまだ空のインメモリスタブなので、`source="bank"` は正直に
-「空である」と返します。ハブの結果でごまかすことはありません。
-
----
-
-## CLI サブコマンド
-
-古い綴りは `--help` から隠れますが、解析は従来どおりです。
-
-### `migrate`
-
-互いに無関係な 3 つのコマンドで、ヘルプ文で互いを打ち消す必要がありました。
-
-| 旧 | 新 |
-|---|---|
-| `duduclaw migrate` | `duduclaw migrate schema`（素の `duduclaw migrate` も引き続きこの意味） |
-| `duduclaw migrate-from <platform>` | `duduclaw migrate from <platform>` |
-| `duduclaw data-migrate` | `duduclaw migrate data` |
-
-### `export`
-
-意味がまったく違う 4 つのエクスポートが、所属グループだけで区別されていました。
-
-| 旧 | 新 |
-|---|---|
-| `duduclaw export --out …` | `duduclaw export data --out …`（素の形も引き続きこの意味） |
+| `duduclaw migrate-from <プラットフォーム>` | `duduclaw migrate from <プラットフォーム>` |
 | `duduclaw audit …` | `duduclaw export audit …` |
-| `duduclaw gdpr export <contact>` | `duduclaw export gdpr <contact>` |
-| `duduclaw playbook export --agent …` | `duduclaw export playbook --agent …` |
+| `duduclaw gdpr export <連絡先>` | `duduclaw export gdpr <連絡先>` |
+| `duduclaw playbook export --agent <従業員>` | `duduclaw export playbook --agent <従業員>` |
+| `duduclaw acp-server` | `duduclaw acp server` |
+| `duduclaw expert install <ソース>` | `duduclaw pack install <ソース>` |
 
-`duduclaw gdpr erase` と `duduclaw playbook migrate-soul` は影響を受けません。
+`duduclaw expert install` と `duduclaw pack install` は同じインストール処理を実行する
+ので、インストールされる結果は変わりません。ダッシュボードのワンクリックインストール、
+アップロードインストール、AI ドラフトのインストールは、`pack install` を呼ぶようになり
+ました。`duduclaw gdpr erase` と `duduclaw playbook migrate-soul` は影響を受けません。
 
-### `acp`
+### `config.toml [dispatch] judge`
 
-doc コメントの注意書きだけで区別されていた 2 つの別プロトコル:
+`evaluator_only` と `human_only`（およびエイリアスの `evaluator`、`human`）は削除
+されました。有効な値は `mav`（既定）と `external` だけです。ダッシュボードと
+`system.update_config` は、削除された値の書き込みを拒否します。
 
-| 旧 | 新 |
-|---|---|
-| `duduclaw acp`（エディタ向け Agent Client Protocol） | `duduclaw acp client`（素の `duduclaw acp` も引き続きこの意味） |
-| `duduclaw acp-server`（A2A エージェント間） | `duduclaw acp server` |
+`config.toml` に旧い値が残っている場合、ゲートウェイは次のように扱います。
 
----
-
-### `pack`
-
-3 つのインストール動詞が指していたのは、いつも同じもの――あらかじめ構成された AI 従業員の一式です。`duduclaw pack` が唯一の入口になりました（T5/O2）。`duduclaw expert install`／`expert list` は同じコードのエイリアスで、旧マニフェスト方言はすべてそのまま読み込まれます（ディスク移行なし）。
-
-| 旧 | 新 |
-|---|---|
-| `duduclaw expert install <src>` | `duduclaw pack install <src>` |
-| `duduclaw expert list` | `duduclaw pack list` |
-| `expert.toml`（エキスパートパックのマニフェスト） | `pack.toml`（`kind = "team"`） |
-| `team.toml`（有料チームプレイブック） | `pack.toml`（`kind = "team"`、`tier = "premium"`） |
-| `preset.toml`（職務プリセットの内容ファイル） | `pack.toml`（`kind = "preset"`） |
-
-`preset_bindings.toml`（どの従業員にどのプリセットを適用したか）は状態でありパック形式ではないため、非推奨の対象外です。作成側の動詞（`expert pack`／`publish`／`export`／`convert-teams`／`hooks`／`remove`）は `duduclaw expert` の下に残ります。
-
-## 設定値
-
-### `[dispatch] judge`
-
-| 旧い値 | 移行先 | 理由 |
+| 旧い値 | ゲートウェイの現在の動作 | 対応 |
 |---|---|---|
-| `evaluator_only` | `mav` | `[dispatch] two_stage_judge`（既定で有効）が先に安価な evaluator を走らせ、完了候補になったときだけパネルの費用を払うため、コスト面の動機はすでに満たされている |
-| `human_only` | `mav` ＋ エージェント単位の `[capabilities] autonomy_level` / `approval_required_tools` | 人が見るべき所で人を待たせる。プラットフォーム全体で機械判定を止める必要はない |
+| `evaluator_only` | 検収に `mav` を使う。以前より厳しくなり、判定の費用が増える。`[dispatch] two_stage_judge`（既定で有効）は引き続き安価な evaluator を先に走らせ、完了候補のときだけパネルの費用を払う | `judge = "mav"` に変更する |
+| `human_only` | 機械による検収には戻らない。検収に回ったすべての作業が `needs_human` で止まり、一時停止の理由はシステムの問題として表示され、直し方が添えられる | `judge = "mav"` または `external` に変更する。人の確認が必要な従業員には、従業員ごとの `[capabilities] autonomy_level` と `approval_required_tools` を使う。止まった作業を進めるには、タスクで「完了にする」を押すか、設定を直してから「再試行」を押す（再試行はタスクを `pending` に戻し、保存済みの結果の要約と担当の取得を消し、任意のメモを次のラウンドへの指示として使う。ラウンドの数え方は続きから始まり、すでに書き出されたファイルは削除されない） |
 
-`mav` と `external` は影響を受けません。4 つの値はすべて引き続き解析されます。
-非推奨モードで運用中の環境は設定どおりに動作し、プロセスごとに警告を 1 回記録
-します。ダッシュボード経由で書き込まれた場合は `judge_mode_deprecated` の監査
-イベントも残ります。ダッシュボードは `mav` と `external` だけを提示しますが、保存済み
-の非推奨値はラベル付きで表示し、黙って切り替えることはありません。
+どちらの値も、プロセスごとに警告を 1 回記録します。ゲートウェイのプロセスごと、
+データディレクトリごとに 1 回、最初の作業が検収に入ったときに、監査イベント
+`judge_mode_removed` を 1 件と Activity Feed の通知を 1 件書き込みます。ゲートウェイを
+再起動すると、もう一度書き込みます。監査イベント `judge_mode_deprecated` は発生しなく
+なりました。`duduclaw doctor` がこの状況を一覧表示します。`human_only` は、検収に回った
+すべての作業が止まるため失敗として、`evaluator_only` は警告として表示されます。
+`config.toml` を読めない、または解析できないときは、検査できなかったことを示す警告に
+なります。
+
+### アップグレード前の確認
+
+1. エージェントのプロンプト、スキル、自動化から、削除された 8 つの MCP ツール名を
+   grep し、各 `agent.toml [capabilities]` のツール一覧も確認する。
+2. スクリプト、cron エントリ、systemd unit から、削除された 6 つの CLI の綴りを grep
+   する。削除された綴りは、実行されずに終了コード 2 で終了するようになります。
+3. `config.toml [dispatch] judge` が `evaluator_only` や `human_only` のままでないか確認
+   する。
+4. `duduclaw doctor` を実行する。残っている削除済みツール名と、削除された judge の値
+   が一覧表示されます。
 
 ---
 
-## ランタイム
+## 引き続き非推奨
+
+### パックの旧形式
+
+パックの旧マニフェスト `expert.toml`、`team.toml`、業種パックのディレクトリ構成は非推奨
+です。v1.69.0 でもこれらはすべて読み込まれ、削除されたものはありません。書き直された
+有料テンプレートと一緒に、今後のバージョンで削除されます。バージョン番号は未定です。
+
+**残している理由**: 新形式の `pack.toml` は、現時点では職務プリセット
+（`kind = "preset"`）としてしかインストールできません。`duduclaw pack install` は
+`pack.toml` のチームパックや業種パックを読み取れますが、その後ディレクトリをエキスパート
+パックのインストーラーに渡します。このインストーラーは `expert.toml`（または Claude Code
+プラグイン、単体の Agent Skill）だけを認識し、それ以外はすべて拒否します。インストーラー
+が `pack.toml` のチームパックと業種パックをインストールできるようになるまで、旧形式は
+外せません。現時点での書き方は [独自パックの作り方](build-your-own-pack.md) を参照して
+ください。
+
+| 現状 | 状態 |
+|---|---|
+| `expert.toml`（チームパックと業種パック） | そのまま使う。非推奨だが読み込まれる |
+| `team.toml`、業種パックのディレクトリ | 非推奨。そのまま読み込まれる。ディスク上の移行は行わない |
+| `pack.toml` で `kind = "preset"` | 職務プリセットの現行形式 |
+| `pack.toml` で `kind = "team"` または `"template"` | 読み取りと確認（`pack inspect`）はできる。まだインストールはできない |
 
 ### Gemini CLI ランタイム
 
 **Gemini CLI エージェントランタイム**（ランタイム id `gemini`、実行ファイル `gemini`、
-npm パッケージ `@google/gemini-cli`）は **v1.67.0** で非推奨となり、**v1.69.0** での
-削除を予定しています。後継は **Antigravity CLI ランタイム**（`antigravity`、実行ファイル
-`agy`）です。
+npm パッケージ `@google/gemini-cli`）は **v1.67.0** で非推奨になりました。削除は
+v1.69.0 から **v1.70.0** に延期されました。後継は **Antigravity CLI ランタイム**
+（`antigravity`、実行ファイル `agy`）です。
 
 | 旧 | 新 |
 |---|---|
@@ -190,24 +176,30 @@ npm パッケージ `@google/gemini-cli`）は **v1.67.0** で非推奨となり
 | `[team.roles.*] runtime = "gemini"` | `runtime = "antigravity"` |
 | `[discovery.attempt.runtimes.gemini]` | `[discovery.attempt.runtimes.antigravity]` |
 
-**まだ使えるもの**: 上記の旧い値は v1.69.0 までこれまでどおり解析・実行されます。読み
-込み時にはプロセスごとに警告を 1 回記録し、ダッシュボード（`agents.create` /
-`agents.update`）経由で書き込むと監査イベント `runtime_provider_deprecated` も残ります。
-ダッシュボードは Gemini を提示しなくなりますが、保存済みの `gemini` は「非推奨」ラベル
-付きで表示されます。エージェント編集ページのランタイム選択肢には Antigravity が加わり
-ました。「選択したモデルに合わせてランタイムを揃える」処理は、非推奨のランタイムを書き
-込まなくなりました。初回セットアップウィザードの既定値は Gemini から Antigravity に
-変わりました。Docker イメージは削除まで Gemini CLI を同梱し続け、`duduclaw doctor` は
-`provider` または `fallback` が非推奨ランタイムのエージェントを一覧表示します。
+**延期の理由**: 当初告知した削除の前提条件は、Antigravity の API キーモードを実際の
+Gemini API キーで検証することでした。その検証で、既定の権限レベルの Antigravity 従業員
+がプラットフォームのツールを呼び出すと、Antigravity CLI 自身に拒否されることが分かり
+ました。修正は進行中です。この問題が直り、検証をやり直すまで、Gemini CLI ランタイムは
+削除されません。
+
+**まだ使えるもの**: 上記の旧い値は、これまでどおり解析・実行されます。読み込み時には
+プロセスごとに警告を 1 回記録し、ダッシュボード（`agents.create` / `agents.update`）
+経由で書き込むと監査イベント `runtime_provider_deprecated` も残ります。ダッシュボード
+は Gemini を提示しなくなりますが、保存済みの `gemini` は「非推奨」ラベル付きで表示され
+ます。エージェント編集ページのランタイム選択肢には Antigravity があります。「選択した
+モデルに合わせてランタイムを揃える」処理は、非推奨のランタイムを書き込まなくなりま
+した。初回セットアップウィザードの既定値は Antigravity です。Docker イメージは引き続き
+Gemini CLI を同梱し、`duduclaw doctor` は `provider` または `fallback` が非推奨ランタイム
+のエージェントを一覧表示します。
 
 **非推奨ではないもの**: **Gemini API プロバイダー**（プロバイダー id `gemini`、
 `GEMINI_API_KEY`、LLM 層の `generateContent` プロトコル、`gemini` プロバイダーアカウ
 ント）は影響を受けません。Antigravity の API キーモードもこれを使います。
 
-**理由**: Google は 2026-06-18 に、無料、Google AI Pro、Google AI Ultra の個人アカウ
-ントに対する Gemini CLI での提供を停止し、Antigravity CLI への移行を案内しています。
-API キーとエンタープライズ（Gemini Code Assist）のユーザーは影響を受けず、Gemini CLI
-自体は引き続きメンテナンスされています（出典: メンテナーの
+**Gemini CLI を廃止する理由**: Google は 2026-06-18 に、無料、Google AI Pro、Google AI
+Ultra の個人アカウントに対する Gemini CLI での提供を停止し、Antigravity CLI への移行を
+案内しています。API キーとエンタープライズ（Gemini Code Assist）のユーザーは影響を受け
+ず、Gemini CLI 自体は引き続きメンテナンスされています（出典: メンテナーの
 [告知](https://github.com/google-gemini/gemini-cli/discussions/28017)、Google の
 [移行ガイド](https://antigravity.google/docs/cli/gcli-migration/)）。Gemini CLI が終了
 したわけではありません。
@@ -225,31 +217,27 @@ API キーとエンタープライズ（Gemini Code Assist）のユーザーは�
 4. `duduclaw doctor` を実行すると、`provider` または `fallback` が非推奨ランタイムの
    エージェントが一覧表示される。
 
-**削除の前提条件**: v1.69.0 でこのランタイムを削除する前に、Antigravity の API キー
-モードを実際の Gemini API キーで検証しておく必要があります。これまでに試したのは、キー
-が無効な場合のエラー経路だけです。
+v1.70.0 での削除の前に、すべての `agent.toml` で `provider = "gemini"` と
+`fallback = "gemini"` を確認し、`config.toml` の `utility_provider`、
+`[dispatch] judge_provider`、`[team.roles.*] runtime`、
+`[discovery.attempt.runtimes.gemini]` が `gemini` のままでないかも確認してください。
 
 ---
 
-## 上記の名称に v1.69.0 で起きること
+## 非推奨リストから外した名称
 
-上記の古い名称はすべて v1.69.0 で削除されます（Gemini CLI ランタイムも同じリリース、次節）。v1.68.x より先へ上げる前に:
+次の名称は、いったん非推奨と告知されましたが、現在は通常のサポート対象の動作です。
 
-1. エージェントのプロンプト、スキル、自動化から古い MCP ツール名を grep する。
-2. スクリプト、cron エントリ、systemd unit から古い CLI の綴りを grep する。
-3. `config.toml [dispatch] judge` が非推奨の値のままでないか確認する。
+| 名称 | 状態 | 理由 |
+|---|---|---|
+| `duduclaw data-migrate` | `duduclaw migrate data` の隠しエイリアスとして維持 | 出荷済みの DuDuClaw OS イメージが、読み取り専用ルートファイルシステム上の起動 unit から `duduclaw data-migrate --run` を実行するため、この綴りは使えなければならない。新しいスクリプトでは `duduclaw migrate data` を使う |
+| `duduclaw migrate` | サポート。`duduclaw migrate schema` と同じ | 引数なしの形はドキュメント化された動作 |
+| `duduclaw export --out …` | サポート。`duduclaw export data --out …` と同じ | 引数なしの形はドキュメント化された動作 |
+| `duduclaw acp` | サポート。`duduclaw acp client` と同じ | 引数なしの形はドキュメント化された動作 |
+| `duduclaw expert list` | 維持 | インストール済みの記録を一覧表示するもので、`duduclaw pack list`（インストール済みのパックとインストール可能なもの）の表示内容とは異なる |
+| `preset.toml` | 維持 | 職務プリセットの保存形式。`pack.toml` に `kind = "preset"` を付ける書き方は、もう一つの作成方法 |
 
-対象ツールの説明の先頭にある `[deprecated → …]` は、grep できるように付けています。
-
-## v1.69.0 で起きること
-
-Gemini CLI ランタイムが削除されます（`runtime/gemini.rs`、カタログ項目、Discovery の
-Gemini ファミリー、Docker イメージ内の `gemini-cli` パッケージ）。Gemini API プロバイ
-ダーは残ります。v1.69.x より先へ上げる前に:
-
-1. すべての `agent.toml` から `provider = "gemini"` と `fallback = "gemini"` を grep
-   する。または `duduclaw doctor` を実行する。
-2. `config.toml` の `utility_provider`、`[dispatch] judge_provider`、
-   `[team.roles.*] runtime`、`[discovery.attempt.runtimes.gemini]` が `gemini` のまま
-   でないか確認する。
-3. 上記の Antigravity のサインインまたは API キー設定を済ませる。
+`preset_bindings.toml`（どの従業員にどのプリセットを適用したか）は状態でありパック形式
+ではないため、非推奨になったことはありません。作成側のコマンド `expert pack`、
+`publish`、`export`、`convert-teams`、`hooks`、`remove` は `duduclaw expert` の下に
+残ります。

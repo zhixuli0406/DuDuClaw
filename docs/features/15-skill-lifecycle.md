@@ -252,7 +252,7 @@ There are three places a skill can come from — GitHub, the curated skill hubs,
 | `hub` | The curated registries (anthropic-skills / clawhub / lobehub / skills-sh) | You want vetted, ranked results only |
 | `bank` | The learned skill bank | You are looking for something this deployment taught itself |
 
-The learned skill bank is currently an empty in-memory stub, so `source="bank"` reports an empty store rather than quietly returning hub results. `skill_bank_search` still works as a deprecated alias for `source="bank"` and is removed in v1.69.0 — see [deprecations](../guides/deprecations.md).
+The learned skill bank is currently an empty in-memory stub, so `source="bank"` reports an empty store rather than quietly returning hub results. `skill_bank_search` was a deprecated alias for `source="bank"` and was removed in v1.69.0; call `skill_search` with `source="bank"` instead — see [deprecations](../guides/deprecations.md).
 
 ### MCP Tools
 

@@ -151,7 +151,7 @@ v1.67.1 之前，同一個 `(agent, subject, predicate)` 的新事實一定會�
 | 對話事實萃取（`wiki_ingest`，來源 `channel`） | 暫存待審（見下） |
 | 使用者輪廓特徵萃取（`profile_distill`，來源 `user_profile`） | 暫存待審（見下） |
 | `user_profile_record` MCP 工具 | 回傳錯誤（"a more trusted value already exists for this field, so it was not changed"），不寫入 |
-| `duduclaw migrate-from` | 該項目回報為略過 |
+| `duduclaw migrate from` | 該項目回報為略過 |
 | 足跡萃取、reflexion 規則整併、夜間引擎的 schema 與整併 | 略過該項目並記錄 log |
 | 其他呼叫 `store_temporal` 的地方 | 收到寫出兩邊可信度的錯誤 |
 
@@ -166,7 +166,7 @@ v1.67.1 之前，同一個 `(agent, subject, predicate)` 的新事實一定會�
 - 資料主體的匯出與刪除（`gdpr.rs`）也會比對暫存說法的 subject 與 object；被刪除的暫存說法無法再被核准。`duduclaw gdpr erase <contact> --confirm` 另外會撤回涵蓋被刪資料列的待審項目、把審核紀錄裡所有這類項目（不論狀態）的文字換掉，並刪除對應的 `knowledge.quarantined` 事件。沒有帶資料列 id 的事件（例如注入掃描丟棄的紀錄）無法比對，會留到事件保存期限 7 天後清除。前一步失敗時後面的步驟照樣執行；失敗的步驟會列出來，指令以非零結束，並提示重新執行同一個指令即可完成，重複執行是安全的。重新執行時即使已找不到記憶資料列，仍會用完全相同的 subject 從審核項目與事件中移除這個人的文字。
 - 排程與系統提示（虛擬使用者 `system`）不再寫入使用者輪廓。`user_profile_record` 會拒絕虛擬使用者（`system`、`anonymous`、`unknown`），並對 predicate 與值都做提示注入掃描，達到封鎖等級就拒絕。
 
-`config.toml [memory] supersession_trust_guard`（預設 `true`）設成 `false` 會關閉這項檢查。讀取這個設定的是 gateway 經 `memory_factory::build_memory_engine` 建立的引擎，以及 `duduclaw mcp-server` 的記憶引擎。直接建立的引擎（例如儀表板的記憶 RPC 與 `duduclaw migrate-from`）不看這個設定，檢查一律開啟。尚未在真實聊天通道上驗證。
+`config.toml [memory] supersession_trust_guard`（預設 `true`）設成 `false` 會關閉這項檢查。讀取這個設定的是 gateway 經 `memory_factory::build_memory_engine` 建立的引擎，以及 `duduclaw mcp-server` 的記憶引擎。直接建立的引擎（例如儀表板的記憶 RPC 與 `duduclaw migrate from`）不看這個設定，檢查一律開啟。尚未在真實聊天通道上驗證。
 
 ### 記憶命名空間（v1.68.0）
 

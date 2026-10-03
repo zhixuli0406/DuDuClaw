@@ -228,7 +228,7 @@ LeastCost 策略確保免費配額（來自訂閱）優先消耗。付費 API �
 
 ## 跨供應商容錯
 
-搭配 DuDuClaw 的 Multi-Runtime 架構（Claude / Codex / Antigravity / OpenAI-compat；Gemini CLI runtime 於 v1.67.0 棄用、v1.69.0 移除），帳號輪替延伸到跨供應商層級。**FailoverManager** 協調跨供應商的健康狀態：
+搭配 DuDuClaw 的 Multi-Runtime 架構（Claude / Codex / Antigravity / OpenAI-compat；Gemini CLI runtime 於 v1.67.0 棄用、v1.70.0 移除），帳號輪替延伸到跨供應商層級。**FailoverManager** 協調跨供應商的健康狀態：
 
 ```
 主要供應商（Claude）被限速

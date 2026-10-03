@@ -167,7 +167,7 @@ Goose の Lead/Worker 機能は、モデル名だけを持つ役割設定を保�
 
 ### 2. 第一バッチの runtime のみ
 
-`claude`、`codex`、`gemini`（v1.67.0 で非推奨、v1.69.0 で削除。`antigravity` を使用）、`antigravity`、`grok`。それ以外は `openai_compat`、`qwen`、`copilot`、`cursor` を含めすべて拒否されます（`runtime_not_allowed`）。
+`claude`、`codex`、`gemini`（v1.67.0 で非推奨、v1.70.0 で削除。`antigravity` を使用）、`antigravity`、`grok`。それ以外は `openai_compat`、`qwen`、`copilot`、`cursor` を含めすべて拒否されます（`runtime_not_allowed`）。
 
 理由は能力ではなくツールです。この 5 つは DuDuClaw の MCP サーバーをネイティブに登録するため、その上で動く役割はツール群をすべて使えます。ツールを黙って失った役割は、ツール呼び出しのない自信満々の語りを生み、審核者はそれを本当の作業と区別できません。
 
@@ -245,8 +245,8 @@ DuDuClaw にすでにあった一時的なサブエージェントとの違い�
 
 | 役割 | ツール | codex メンバーの実効サンドボックス |
 |---|---|---|
-| `planner` | `team_handoff`、`shared_wiki_search`、`memory_search` | `read-only` |
-| `executor` | **従業員自身の実効ツール** + `team_handoff` + `memory_search` + `shared_wiki_read` | `workspace-write` |
+| `planner` | `team_handoff`、`wiki_search`、`memory_search` | `read-only` |
+| `executor` | **従業員自身の実効ツール** + `team_handoff` + `memory_search` + `wiki_read` | `workspace-write` |
 | `verifier` / `utility` | `team_handoff` | `read-only` |
 
 「従業員自身の実効ツール」とは、許可リストがあればその `[capabilities] allowed_tools` をそのまま、なければ通常のディスパッチが使うのと同じ既定の集合（`Read`、`Write`、`Edit`、`Bash`、`Glob`、`Grep`、`TodoWrite`、`WebFetch`、`WebSearch`、`mcp__duduclaw__*`）を指します。どちらでも執行者は従業員の部分集合です。読み取り専用の従業員からは読み取り専用の執行者が生まれ、従業員の `denied_tools` にあるツールは決して要求されません。

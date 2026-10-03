@@ -72,7 +72,7 @@ fallback = "claude"        # 検出できない場合に使うバックエンド
 |----------|-----------|------|------|
 | `claude` | `claude`（常に利用可能、コア） | OAuth / API Key ローテーション | デフォルトバックエンド |
 | `codex` | `codex` | OpenAI | — |
-| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | **v1.67.0 で非推奨、v1.69.0 で削除予定**（[非推奨となった名称](deprecations.md)参照）。個人版 OAuth は 2026-06-18 に廃止；有料 API キーは引き続き利用可 |
+| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | **v1.67.0 で非推奨、v1.70.0 で削除予定**（[非推奨となった名称](deprecations.md)参照）。個人版 OAuth は 2026-06-18 に廃止；有料 API キーは引き続き利用可 |
 | `antigravity` | `agy`（`~/.local/bin/agy`） | Google サインイン（ターミナルで `agy` を実行）/ `GEMINI_API_KEY` | Gemini CLI の公式後継、マルチモデル（Gemini 3.x + Claude + GPT-OSS） |
 | `openai_compat` | HTTP（CLI なし） | プロバイダーごとのキー | Exo / llamafile / vLLM などの OpenAI 互換エンドポイント |
 
@@ -97,10 +97,12 @@ fallback = "claude"        # 検出できない場合に使うバックエンド
 
 ```bash
 scripts/live-test/make-home.sh /tmp/ddc-live --port 18977
-DUDUCLAW_HOME=/tmp/ddc-live duduclaw run --yes &      # 一度起動すると .mcp.json が書かれる
+HOME=/tmp/ddc-live/os-home DUDUCLAW_HOME=/tmp/ddc-live duduclaw run --yes &   # 一度起動すると .mcp.json が書かれる
 scripts/live-test/mcp-probe.sh /tmp/ddc-live plain
 scripts/live-test/mcp-probe.sh /tmp/ddc-live prod-shaped
 ```
+
+gateway を起動するときは、必ず `HOME` を、`make-home.sh` が隔離ホームの中に作る `os-home` ディレクトリに向けてください。gateway と、それが起動する AI CLI は、`HOME` の下からログインと設定を探します。`DUDUCLAW_HOME` だけを変えると、起動された `claude` はオペレーター自身のログインを使い、オペレーター自身の利用枠を消費します。Antigravity の API キーモードでは、オペレーター自身の設定ファイルが書き換えられます。`mcp-probe.sh` も、MCP サーバーを起動するときに同じ `os-home` を使います。
 
 このホームには従業員が 2 人います。`plain`（allowlist なし）と `prod-shaped`（`allowed_tools = ["mcp__duduclaw__*", ...]`、denied と承認リスト、明示的な権限フラグ、予算、契約付き）です。v1.67.0 以降のワイルドカード allowlist がすべてのプラットフォームツールを拒否していた不具合は、検証用従業員に allowlist がなかったため見逃されました。ルール: 本番ホームをアップグレードしたら、各従業員自身の MCP 登録を通して実際のツールを呼びます（`mcp-probe.sh ~/.duduclaw <agent-id>`）。隔離ホームはオペレーターの Claude コネクタ（Drive、Gmail）までは隔離しないため、テストタスクには外部サービスを照会しないよう明記してください。ビルドキャッシュでディスクが埋まったときは、まず `scripts/clean-build-cache.sh --dry-run` を実行します。サードパーティの成果物は残し、`cargo` や `rustc` が動いている間は実行を拒否します。詳細は `scripts/live-test/README.md`。
 

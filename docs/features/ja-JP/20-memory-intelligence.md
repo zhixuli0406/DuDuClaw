@@ -151,7 +151,7 @@ v1.67.1 より前は、同じ `(agent, subject, predicate)` の新しい事実�
 | 会話事実の抽出（`wiki_ingest`、オリジン `channel`） | 審査待ちとして保留（後述） |
 | ユーザープロフィール特性の抽出（`profile_distill`、オリジン `user_profile`） | 審査待ちとして保留（後述） |
 | `user_profile_record` MCP ツール | エラー（"a more trusted value already exists for this field, so it was not changed"）を返し、書き込みません |
-| `duduclaw migrate-from` | その項目をスキップとして報告します |
+| `duduclaw migrate from` | その項目をスキップとして報告します |
 | フットプリント抽出、reflexion ルール統合、夜間エンジンのスキーマと統合 | その項目をスキップしてログに記録します |
 | その他の `store_temporal` 呼び出し元 | 双方の信頼度を記したエラーを受け取ります |
 
@@ -166,7 +166,7 @@ v1.67.1 より前は、同じ `(agent, subject, predicate)` の新しい事実�
 - データ主体のエクスポートと削除（`gdpr.rs`）は、保留された主張の subject と object も照合します。削除された保留主張は承認できなくなります。`duduclaw gdpr erase <contact> --confirm` は、削除された行を含む審査待ちの項目を取り下げ、状態にかかわらずそうした項目の本文を審査ストアから置き換え、対応する `knowledge.quarantined` イベントを削除します。行 id を持たないイベント（注入スキャンでの破棄など）は照合できず、7 日間のイベント保持期間が過ぎると削除されます。前の手順が失敗しても後の手順はすべて実行され、失敗は一覧表示され、コマンドは非ゼロで終了して同じコマンドの再実行を案内します（繰り返しても安全です）。再実行でメモリ行が見つからなくても、subject の完全一致で審査項目とイベントからその人の文字列を取り除きます。
 - スケジュールやシステムのプロンプト（疑似ユーザー `system`）はユーザープロフィールを書き込まなくなりました。`user_profile_record` は疑似ユーザー（`system`、`anonymous`、`unknown`）を拒否し、predicate と値の両方をプロンプトインジェクションのスキャンにかけ、ブロック水準に達すると拒否します。
 
-`config.toml [memory] supersession_trust_guard`（デフォルト `true`）を `false` にするとこのチェックを無効にできます。この設定を読むのは、gateway が `memory_factory::build_memory_engine` で作るエンジンと、`duduclaw mcp-server` のメモリエンジンです。直接作られるエンジン（ダッシュボードのメモリ RPC や `duduclaw migrate-from` など）は設定に関係なく常にチェックが有効です。実際のチャットチャネルでは未検証です。
+`config.toml [memory] supersession_trust_guard`（デフォルト `true`）を `false` にするとこのチェックを無効にできます。この設定を読むのは、gateway が `memory_factory::build_memory_engine` で作るエンジンと、`duduclaw mcp-server` のメモリエンジンです。直接作られるエンジン（ダッシュボードのメモリ RPC や `duduclaw migrate from` など）は設定に関係なく常にチェックが有効です。実際のチャットチャネルでは未検証です。
 
 ### メモリの名前空間（v1.68.0）
 

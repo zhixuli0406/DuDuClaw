@@ -41,27 +41,11 @@ display_name = "ヘルパー"
 
 `agents/helper/soul.md`にペルソナを書きます。アイデンティティ/責務/境界の3段構成が良い出発点です——境界が明確であるほど、インストールする側は安心して使えます。
 
-### あるいは新しい`pack.toml`を書く
+### `pack.toml`について
 
-上の`expert.toml`は旧方言で、**v1.69.0**まで完全にサポートされます。新しいパックは代わりに`pack.toml`を宣言できます——チームパック、単体業種パック、ジョブプリセットが共有する1つのスキーマです:
+チームパックと業種パックには`expert.toml`を使ってください。新しい`pack.toml`スキーマはチームパック、業種パック、職務プリセットを記述でき、`duduclaw pack inspect`はそのすべてを読めます。ただし`duduclaw pack install`でインストールできるのは、`kind`が`"preset"`の`pack.toml`(職務プリセット)だけです。`kind = "team"`または`"template"`の`pack.toml`は読み取りと確認はできますが、まだインストールできません。背後のインストーラーが、チームパックや業種パックを`expert.toml`でしか認識しないためです。そのため`expert.toml`は非推奨ですが引き続き読み込まれ、`pack.toml`のチームパックがインストールできるようになった後で、書き直された有料テンプレートと一緒に削除されます。バージョン番号は未定です。
 
-```toml
-[pack]
-schema  = 1
-id      = "my-first-pack"
-kind    = "team"        # "preset" | "team" | "template"
-tier    = "free"
-version = "0.1.0"
-label   = "フレンドリーな小さな助手"
-description = "デモパック"
-
-[[pack.agents]]
-name = "helper"
-role = "main"
-display_name = "ヘルパー"
-```
-
-ディレクトリ内のそれ以外(ペルソナ、スキル、wikiページ)は変更不要です。すでに旧フォーマットのパックがありますか? `duduclaw pack inspect <dir> --emit-canonical`が対応する`pack.toml`を表示するので、レビューして保存できます——あなたのファイルを上書きすることはありません。
+手元のパックが新スキーマでどう見えるかは、`duduclaw pack inspect <dir> --emit-canonical`で確認できます。対応する`pack.toml`を表示するので、レビューしてから保存できます。あなたのファイルを上書きすることはありません。
 
 ## 2. ローカルテストループ
 
@@ -86,7 +70,7 @@ duduclaw pack install https://example.com/my-first-pack-0.1.0.zip
 duduclaw expert remove my-first-pack
 ```
 
-`duduclaw expert install` / `expert list`も引き続き使えます——上の2行のエイリアスで、同じコードパス、同じ出力です。
+`duduclaw expert install`はv1.69.0で削除されました。実行すると`duduclaw pack install`を表示し、終了コード2で終了します。`expert list`は引き続き使え、インストール済みの記録を一覧表示します。
 
 インストール側の防御は組み込み済みです:zip-slipフェンス、50MB上限、コンテンツスキャン。**フックは常に隔離ディレクトリ(`hooks-disabled/`)に無効化された状態でインストール**され、オペレーターが明示的に信頼を許可するまで有効化されません。パックを書くときは、フックが自動的に有効になると想定しないでください。
 
@@ -104,7 +88,7 @@ duduclaw expert remove my-first-pack
 
 ## 5. 公開と品質
 
-現在の公開方法:zipをダウンロード可能な任意のURLに置く(GitHub Releaseが最も手軽です)。相手は`expert install <url>`でインストールします。テンプレートギャラリー(`distribution/gallery/`)にページを追加するのも歓迎です。集中型レジストリ(PR提出+自動検証+署名)は構築中です。
+現在の公開方法:zipをダウンロード可能な任意のURLに置く(GitHub Releaseが最も手軽です)。相手は`pack install <url>`でインストールします。テンプレートギャラリー(`distribution/gallery/`)にページを追加するのも歓迎です。集中型レジストリ(PR提出+自動検証+署名)は構築中です。
 
 品質の目安(将来の等級付きスコアカードはこれらを見ます):
 - [ ] SOULに明確な「境界」セクションがある

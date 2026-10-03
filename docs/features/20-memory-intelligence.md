@@ -151,7 +151,7 @@ What each write path does with a refusal:
 | Conversation fact distillation (`wiki_ingest`, origin `channel`) | Held for review (below) |
 | User-profile trait distillation (`profile_distill`, origin `user_profile`) | Held for review (below) |
 | `user_profile_record` MCP tool | Returns an error ("a more trusted value already exists for this field, so it was not changed"); nothing is written |
-| `duduclaw migrate-from` | The item is reported as skipped |
+| `duduclaw migrate from` | The item is reported as skipped |
 | Footprint distillation, reflexion rule consolidation, night-engine schemas and consolidation | The item is skipped and logged |
 | Any other `store_temporal` caller | Receives an error naming both trusts |
 
@@ -166,7 +166,7 @@ What each write path does with a refusal:
 - Data-subject export and erase (`gdpr.rs`) also match a held claim's subject and object, and an erased held claim can no longer be approved. `duduclaw gdpr erase <contact> --confirm` also withdraws pending review items that cover an erased row, replaces the text of every such item in the review store whatever its state, and deletes the matching `knowledge.quarantined` events. Events that carry no row id (for example injection drops) cannot be matched and stay until the 7-day event retention removes them. Every step runs even if an earlier one fails; failures are listed and the command exits non-zero, saying to re-run the same command, which is safe to repeat. A re-run that finds no memory rows left still removes the person's text from review items and events by exact subject match.
 - Scheduled and system prompts (pseudo-user `system`) no longer write a user profile. `user_profile_record` refuses pseudo-users (`system`, `anonymous`, `unknown`), and scans both the predicate and the value for prompt injection, refusing on a block-level hit.
 
-`config.toml [memory] supersession_trust_guard` (default `true`) switches the guard off when set to `false`. It is read by engines built through the gateway's `memory_factory::build_memory_engine` and by the `duduclaw mcp-server` memory engine. Engines constructed directly (for example the dashboard's memory RPCs and `duduclaw migrate-from`) keep the guard on regardless of the setting. Not verified on a real chat channel.
+`config.toml [memory] supersession_trust_guard` (default `true`) switches the guard off when set to `false`. It is read by engines built through the gateway's `memory_factory::build_memory_engine` and by the `duduclaw mcp-server` memory engine. Engines constructed directly (for example the dashboard's memory RPCs and `duduclaw migrate from`) keep the guard on regardless of the setting. Not verified on a real chat channel.
 
 ### Memory namespaces (v1.68.0)
 

@@ -130,7 +130,7 @@ strategy = "balanced"         # 每輪學習比較偏向修錯 / 優化 / 探索
 想把某位 AI 員工目前學到的規則整批匯出（例如做人工審查、或未來想跨員工複製一份經驗），可以用：
 
 ```bash
-duduclaw playbook export --agent <員工 id> --out rules.json
+duduclaw export playbook --agent <員工 id> --out rules.json
 ```
 
 每條規則的去留由連結的「驗證題庫」（eval case）決定。若你想自己手動跑一次驗證，或建立/擴充題庫：

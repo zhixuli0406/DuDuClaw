@@ -33,9 +33,9 @@ duduclaw pack install <src>        # kindで経路分岐。プレミアム内容
 
 `[pack] kind`が経路を選びます——`preset`(1つの職務設定、identityを持たない)、`team`(ロスター。エキスパートパックが元々そうであったもの)、`template`(単体の業種ペルソナ)。`[pack] tier`が唯一残ったプレミアム判定です:以前は4つのコードパスがディレクトリパスから「これは有料コンテンツか」を各自推測していましたが、いまはパックがtierを持ち、1つの述語だけがそれを読みます。読み取れないtierはプレミアム扱いです——読めないフィールドが有料コンテンツを解錠してはなりません。
 
-`duduclaw expert install`は`pack install`のエイリアスで、挙動は完全に同じです。制作側の動詞(`pack`、`publish`、`export`、`convert-teams`、`hooks`、`remove`)は`duduclaw expert`配下に残ります。ダッシュボードのワンクリックインストールと`experts.install`も同じコードに到達します——どちらも元々CLIを駆動しているためです。
+`duduclaw expert install`はv1.69.0で削除されました。実行すると`duduclaw pack install`を表示し、終了コード2で終了します。制作側の動詞(`pack`、`publish`、`export`、`convert-teams`、`hooks`、`remove`)と`expert list`(インストール済みの記録を一覧表示)は`duduclaw expert`配下に残ります。ダッシュボードのワンクリックインストールと`experts.install`も同じコードに到達します——どちらも元々CLIを駆動しているためです。
 
-**`expert.toml`、`team.toml`、`preset.toml`はv1.69.0まで動き続けます。** ディスク上は何も書き換えません。`duduclaw pack inspect <dir> --emit-canonical`は旧パックに対応する`pack.toml`を表示するので、自分でレビューしてから移行できます——あなたが責任を持つ内容を機械が書き換えるのではなく。
+**`expert.toml`、`team.toml`、`preset.toml`は引き続き読み込まれます。** ディスク上は何も書き換えません。`expert.toml`、`team.toml`、業種パックのディレクトリ構成は非推奨で、書き直された有料テンプレートと一緒に今後のバージョンで削除されます(バージョン番号は未定)。理由は、`pack.toml`のチームパックと業種パックがまだインストールできないことです。インストーラーが受け付けるのは`pack.toml`の職務プリセットだけです。`preset.toml`は職務プリセットの保存形式で、非推奨ではありません。`duduclaw pack inspect <dir> --emit-canonical`は旧パックに対応する`pack.toml`を表示するので、自分でレビューしてから移行できます——あなたが責任を持つ内容を機械が書き換えるのではなく。
 
 ## インストールパイプライン
 

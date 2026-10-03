@@ -27,7 +27,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/15-skill-lifecycle.md](features/15-skill-lifecycle.md) | Skill lifecycle engine — 6-stage automated extraction |
 | [features/16-session-memory-stack.md](features/16-session-memory-stack.md) | Session memory stack — pinned instructions + snowball recap + key facts |
 | [features/17-wiki-knowledge-layer.md](features/17-wiki-knowledge-layer.md) | Wiki knowledge layer — L0-L3 trust-weighted auto-injection |
-| [features/19-agent-client-protocol.md](features/19-agent-client-protocol.md) | Agent Client Protocol — `duduclaw acp` (ACP v1 for IDE panels: Zed / JetBrains / nvim) + `duduclaw acp-server` (A2A over stdio) |
+| [features/19-agent-client-protocol.md](features/19-agent-client-protocol.md) | Agent Client Protocol — `duduclaw acp` (ACP v1 for IDE panels: Zed / JetBrains / nvim) + `duduclaw acp server` (A2A over stdio) |
 | [features/20-memory-intelligence.md](features/20-memory-intelligence.md) | Memory intelligence — temporal facts + reflexion loop + batch fetch |
 | [features/23-autopilot-engine.md](features/23-autopilot-engine.md) | Autopilot rule engine — event-driven automation + circuit breaker |
 | [features/24-task-board.md](features/24-task-board.md) | Task Board & Activity Feed — agent-as-teammate task management |
@@ -150,7 +150,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/hardware-requirements.md](guides/hardware-requirements.md) | DuDuClaw OS 硬體需求與相容性指南（硬性條件 x86-64+AVX2／UEFI／SSD、最低/建議/舒適配置表、自組 PC 相容性檢查清單、x86 筆電評估、推薦迷你主機 N100/N305/8845HS、驅動缺口 MT7927/RTL8125、樹莓派/Arduino/ESP32 為何跑不了 OS＋作為 resident sensing 感測端點的接入方式、兩層總矩陣、為何不能用 ARM/Mac 模擬、燒 USB 而非光碟） | Current |
 | [guides/remote-gpu-host.md](guides/remote-gpu-host.md) | 遠端 GPU 主機準備指南（Ubuntu + CUDA 驅動、venv 安裝 LLaMA-Factory、工作目錄、選用 llama.cpp 轉 GGUF、SSH 金鑰授權與 `BatchMode` 驗證、表單欄位對照、先跑乾跑、template 對照表、故障排除） | Current |
 | guides/app-compat.md | 已移至 DuDuClaw-OS repo `docs/guides/app-compat.md`（2026-09-29） | Moved |
-| [guides/deprecations.md](guides/deprecations.md) | 已棄用名稱總表（T5：`shared_wiki_*`→`wiki_* scope`、`create_task`/`schedule_task`→`tasks_create kind`/`schedule`、`skill_bank_search`→`skill_search source`、CLI `migrate`/`export`/`acp` 收斂、`[dispatch] judge` 兩個模式；全部 v1.69.0 移除） | Current |
+| [guides/deprecations.md](guides/deprecations.md) | 棄用與移除總表（v1.69.0 已移除：`shared_wiki_*`→`wiki_* scope`、`schedule_task`→`tasks_create schedule`、`skill_bank_search`→`skill_search source`、舊 CLI 拼法與 `expert install`、`[dispatch] judge` 的 `evaluator_only`／`human_only`；仍在棄用期：Gemini CLI runtime（v1.70.0）、板模舊格式（未訂版號）） | Current |
 | [guides/desktop-build.md](guides/desktop-build.md) | Desktop app — local build guide (Tauri 2 shell running the gateway as a sidecar) | Current |
 | [guides/desktop-release.md](guides/desktop-release.md) | Desktop app — release, signing and auto-update pipeline | Current |
 | [guides/desktop-unblock.md](guides/desktop-unblock.md) | Desktop app — what the remaining blocked items need (toolchain, credentials, a second machine) | Current |
@@ -178,7 +178,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/observability.md](guides/observability.md) | OpenTelemetry GenAI tracing + OTLP export (`--features otel`, `[telemetry]` config) | Current |
 | [guides/personal-edition-portability.md](guides/personal-edition-portability.md) | 個人版資料可攜：自架 ↔ 代管互轉 | Current |
 | [guides/channels-googlechat-teams.md](guides/channels-googlechat-teams.md) | Google Chat & Microsoft Teams channel setup + per-channel formatting/typing matrix | Current |
-| [guides/migrate-from.md](guides/migrate-from.md) | 從 OpenClaw / Hermes / paperclip 無痛轉移（`duduclaw migrate-from`，預設 dry-run） | Current |
+| [guides/migrate-from.md](guides/migrate-from.md) | 從 OpenClaw / Hermes / paperclip 無痛轉移（`duduclaw migrate from`，預設 dry-run） | Current |
 | [guides/white-label.md](guides/white-label.md) | White-label branding (reseller logo/name) + distributor key console (`/manage/distributors`, `[distributor] issuer_key_path`) | Current |
 | [guides/recording-to-skill.md](guides/recording-to-skill.md) | 錄製 → 技能：瀏覽器/桌面示範錄製、HAR 脫敏、蒸餾成 SKILL.md 草稿＋審批安裝（`[capabilities] recording`） | Current |
 | [guides/feedback-page.md](guides/feedback-page.md) | 問題回報與建議網頁（GitHub Pages 表單 → issue 預填 → Actions + Haiku 自動分類/格式化/上標籤） | Current |
