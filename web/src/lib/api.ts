@@ -4195,8 +4195,8 @@ export interface BuiltinToolEntry {
   kind: string;
   /** T5 (2026-09-29): a deprecated alias of a merged entry point. Still
    *  callable and still in `tools/list`, but the picker must not offer it as a
-   *  new choice — it only stays visible when already selected. Removal target
-   *  v1.69.0; see `docs/guides/deprecations.md`. */
+   *  new choice — it only stays visible when already selected. The aliases were removed in
+   *  v1.69.0, so no row carries this flag now; see `docs/guides/deprecations.md`. */
   deprecated?: boolean;
 }
 

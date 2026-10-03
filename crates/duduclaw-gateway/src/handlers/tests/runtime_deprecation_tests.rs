@@ -70,7 +70,7 @@ async fn create_with_gemini_succeeds_and_is_audited_with_the_caller() {
         assert_eq!(d["agent_id"], "gem-agent");
         assert_eq!(d["value"], "gemini");
         assert_eq!(d["replacement"], "antigravity");
-        assert_eq!(d["remove_in"], "v1.69.0");
+        assert_eq!(d["remove_in"], "v1.70.0");
         assert_eq!(d["source"], "agents.create");
         assert_eq!(d["user_id"], "user-42");
     }
@@ -163,7 +163,7 @@ fn audit_payload_shape_is_stable() {
         field: "fallback",
         value: "gemini",
         replacement: "antigravity",
-        remove_in: "v1.69.0",
+        remove_in: "v1.70.0",
     };
     assert_eq!(
         deprecated_runtime_audit_details("a1", "agents.update", "u1", &w),
@@ -172,7 +172,7 @@ fn audit_payload_shape_is_stable() {
             "field": "runtime.fallback",
             "value": "gemini",
             "replacement": "antigravity",
-            "remove_in": "v1.69.0",
+            "remove_in": "v1.70.0",
             "source": "agents.update",
             "user_id": "u1",
         })
@@ -187,7 +187,7 @@ fn runtime_models_detect_row_carries_deprecation_fields() {
         if spec.id == "gemini" {
             assert_eq!(row["deprecated"], true);
             assert_eq!(row["replacement"], "antigravity");
-            assert_eq!(row["remove_in"], "v1.69.0");
+            assert_eq!(row["remove_in"], "v1.70.0");
         } else {
             assert_eq!(row["deprecated"], false, "{}", spec.id);
             assert!(row["replacement"].is_null(), "{}", spec.id);
