@@ -1,6 +1,6 @@
 {
   "name": "duduclaw",
-  "version": "1.67.1",
+  "version": "1.68.0",
   "mcpName": "io.github.zhixuli0406/duduclaw",
   "description": "Open-source AI agent platform for Claude Code, Codex, Antigravity and other AI CLIs: 249 MCP tools, 11 messaging channels, one Rust binary.",
   "license": "Apache-2.0",
@@ -42,10 +42,10 @@
     "postinstall": "node scripts/install.js"
   },
   "optionalDependencies": {
-    "@duduclaw/darwin-arm64": "1.67.1",
-    "@duduclaw/darwin-x64": "1.67.1",
-    "@duduclaw/linux-x64": "1.67.1",
-    "@duduclaw/linux-arm64": "1.67.1",
-    "@duduclaw/win32-x64": "1.67.1"
+    "@duduclaw/darwin-arm64": "1.68.0",
+    "@duduclaw/darwin-x64": "1.68.0",
+    "@duduclaw/linux-x64": "1.68.0",
+    "@duduclaw/linux-arm64": "1.68.0",
+    "@duduclaw/win32-x64": "1.68.0"
   }
 }

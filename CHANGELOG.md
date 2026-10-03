@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.68.0] - 2026-10-03 — 儀表板開關全面補齊×存檔無作用欄位修復×記憶命名空間統一×權限旗標生效×通道管理指令與管理權杖安全修補
+
 ### Added
 - **儀表板補上之前只能手改設定檔的開關**。完整對照（頁面、設定鍵、是否需要重啟）見 `docs/guides/dashboard-settings.md`（三語）。系統設定 → 進階設定 → 自動化引擎：派工策略 `role_team`、驗收判官的執行環境與模型（`[dispatch] judge_provider`／`judge_model`）、夜間整理模型階段（`[night] llm_enabled`），以及真人接手（`[takeover]`）、AI 員工信箱（`[mail]`）、一員工四角色全域預設（`[team]`）、常駐感知（`[tick]`）四張卡片。系統分頁：任務沙箱（`[container.sandbox]` 全部欄位，整段驗證）、電腦操作映像（`[computer_use] image`）、記憶可信度守門、OpenTelemetry 送往位址（只在含 `otel` 的版本顯示，`system.status` 新增 `otel_compiled`）、GitHub 工具開關（可關）、信任外部 A2A 請求（`[acp] trusted`，只限管理員）、地端檔案根目錄（`[files] allowed_roots`）、日誌格式、1Password／Infisical 密鑰後端欄位。通道管理：網站聊天元件（`[webchat] public_widget`／`widget_key`）。本地推理：llamafile 欄位、信心路由進階（`local_tools`、`ucci_*`）、`capture_logprobs`／`capture_top_logprobs`。AI 員工編輯頁：每日花費上限、四份需要把關的工具清單、平行分支、出站內容防護、推理力度、七個新執行環境（qwen、kimi、copilot、kiro、cursor、vibe、opencode）、員工層級的一員工四角色、精簡啟動內容、決策延續、夜間整理，以及帶型別的進階鍵值編輯器。
 - **常駐感知資料來源可以在儀表板新增、編輯、刪除**：新 RPC `tick.sources.list`／`upsert`／`remove`（管理員）。存檔後 gateway 已載入常駐感知時會立即重新啟動資料來源，否則回報需要重啟。`headers` 的值不回傳，只回傳數量。
