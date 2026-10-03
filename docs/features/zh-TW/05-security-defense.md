@@ -119,7 +119,7 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 
 **緊急停止門檻（v1.68.0）** — `KILLSWITCH.toml [triggers]` 的四個門檻以前沒有讀取端。現在只有寫在檔案裡且數值在範圍內的鍵才生效，安全設定頁每個門檻多了一個勾選框（取消勾選會送 `null`，把它移除）。檔案改動後會重讀。`cost_limit_usd` 比對所有員工 24 小時的花費，達到時把全域 failsafe 等級降為受限，直到 failsafe 自行恢復或有人送 `!RESUME`；`max_replies_per_minute` 依對話計算，超出的訊息靜默丟棄；`max_consecutive_errors` 與 `error_rate_threshold`（最近 20 次、至少 10 次）讓該對話的 failsafe 升一級。每次觸發記稽核 `killswitch_trigger`。`KILLSWITCH.toml` 的 `[audit]` 區段不再讀取。
 
-**去識別化的資料來源保護（v1.68.0）** — 「隱私 / 去識別化」分頁的「資料來源保護」開關開始生效：`user_input` 在通道訊息送進 AI 前遮蔽，`system_prompt` 遮蔽組好的提示（預設只套用標了 `apply_to_system_prompt` 的規則），`cron_context` 遮蔽條件腳本的觸發訊息。出錯時停止這一輪，不送出未遮蔽的內容。`sub_agent` 開關已移除。`purge_after_expire_days` 現在決定保管庫清理的天數。
+**去識別化的資料來源保護（v1.68.0）** — 「隱私 / 去識別化」分頁的「資料來源保護」開關開始生效：`user_input` 在通道訊息送進 AI 前遮蔽，`system_prompt` 遮蔽組好的提示（預設只套用標了 `apply_to_system_prompt` 的規則），`cron_context` 遮蔽條件腳本的觸發訊息。出錯時停止這一輪，不送出未遮蔽的內容。`sub_agent`（在同一個分頁或 `config.toml [redaction.sources]` 設定）負責受委派員工的回覆被 gateway 寫進委派方對話紀錄的那條路（`send_to_agent`、`spawn_agent`、`spawn_ephemeral` 的回覆，包含轉寫給發起整條委派鏈那位員工的副本）。設為 `on` 時，回覆先用接收方員工的規則遮蔽再存進紀錄，等那位員工回覆使用者時再還原。預設 `inherit` 照原樣寫入，因為子代理本來就在同一套 `[redaction]` 規則下執行。遮蔽出錯時改存一段固定的提示文字，不寫入原文。不涵蓋：送到使用者通道的那份回覆（那是使用者自己看的）、員工用 `check_responses` 自己去取的回覆（屬於工具結果，依 `tool_results` 處理）、團隊角色之間的交接、Agent Mail。`purge_after_expire_days` 現在決定保管庫清理的天數。
 
 **權限旗標（v1.68.0）** — `agent.toml [permissions]` 的 `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 寫成 `false` 時，MCP 分派閘會拒絕對應工具（稽核 `permission_denied`）。升級後第一次開機會把舊範本的 `false` 改成 `true`，見[儀表板設定對照](../../guides/zh-TW/dashboard-settings.md#ai-員工編輯頁)。
 

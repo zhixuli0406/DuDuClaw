@@ -36,6 +36,7 @@ fn fixture() -> (tempfile::TempDir, PublicDiscoverySpec, ApprovalBroker) {
     (dir,spec,ApprovalBroker::new(Arc::new(ApprovalStore::open_in_memory().unwrap())))
 }
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn release_grid_limit_rejects_single_and_cumulative_oversize_before_approval() {
     for (width, refine, rounds) in [(1000, 20, 1), (1000, 10, 2)] {
         let (dir, mut spec, broker) = fixture();
@@ -53,6 +54,7 @@ async fn release_grid_limit_rejects_single_and_cumulative_oversize_before_approv
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn release_grid_limit_accepts_exact_cumulative_boundary() {
     let (dir, mut spec, broker) = fixture();
     let home = dir.path().canonicalize().unwrap();
@@ -66,6 +68,7 @@ async fn release_grid_limit_accepts_exact_cumulative_boundary() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn release_grid_limit_legacy_oversize_tree_does_not_break_visible_list() {
     let (dir, spec, broker) = fixture();
     let home = dir.path().canonicalize().unwrap();
@@ -105,6 +108,7 @@ async fn release_grid_limit_legacy_oversize_tree_does_not_break_visible_list() {
     assert_eq!(list(&home, &user("stranger", UserRole::Employee), None, 20).await.unwrap()["runs"], json!([]));
 }
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn public_discovery_rejects_body_authority_and_arbitrary_paths() {
     let (_dir,spec,_broker)=fixture();
     for field in ["operator","starting_workspace","creator_origin","approval_id","beta","policy_source"] {
@@ -113,6 +117,7 @@ fn public_discovery_rejects_body_authority_and_arbitrary_paths() {
     }
 }
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn public_discovery_rejects_disabled_or_unverified_agent_identity() {
     let (dir,_,_)=fixture();
     assert!(TrustedCaller::from_signed_agent(dir.path(),"worker",None).is_err());
@@ -120,6 +125,7 @@ fn public_discovery_rejects_disabled_or_unverified_agent_identity() {
     assert!(TrustedCaller::from_signed_agent(dir.path(),"worker",Some("forged")).is_err());
 }
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_employee_approval_binds_frozen_request_and_never_self_grants() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap();
@@ -142,6 +148,7 @@ async fn discovery_employee_approval_binds_frozen_request_and_never_self_grants(
         ==crate::task_store::ClaimOutcome::NotClaimable);
 }
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_manager_and_owner_query_acl_precede_artifact_lookup() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap();
@@ -161,6 +168,7 @@ async fn discovery_manager_and_owner_query_acl_precede_artifact_lookup() {
     assert!(store.complete_task(&created.task_id,"fake success","ordinary").await.unwrap().is_none());
 }
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_public_none_and_unknown_root_fail_before_approval() {
     let (dir,mut spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap(); let employee=user("employee",UserRole::Employee);
@@ -175,6 +183,7 @@ async fn discovery_public_none_and_unknown_root_fail_before_approval() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_artifact_download_uses_checkpoint_digest_opaque_ids_and_owner_acl() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let manager=user("manager",UserRole::Manager); let task_store=TaskStore::open(&home).unwrap();
@@ -203,6 +212,7 @@ async fn discovery_artifact_download_uses_checkpoint_digest_opaque_ids_and_owner
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_signed_agent_always_waits_for_manager_even_with_autonomy_full() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let key=duduclaw_core::ensure_identity_key(&home).unwrap();
@@ -227,6 +237,7 @@ fn persist_approval(home: &Path, record: &crate::approval::ApprovalRecord) {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_approval_list_and_task_serialization_never_publish_frozen_policy_source() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let config=load_config(&home).unwrap();
@@ -263,6 +274,7 @@ async fn discovery_approval_list_and_task_serialization_never_publish_frozen_pol
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_legal_delegating_creator_retains_query_and_cancel_access() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     std::fs::create_dir_all(home.join("agents/lead")).unwrap();
@@ -281,6 +293,7 @@ async fn discovery_legal_delegating_creator_retains_query_and_cancel_access() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_active_reconciliation_is_not_hidden_by_thousand_terminal_rows() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap();
@@ -301,6 +314,7 @@ async fn discovery_active_reconciliation_is_not_hidden_by_thousand_terminal_rows
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_manager_decision_recovers_after_broker_commit_before_task_authorization() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap(); let manager=user("manager",UserRole::Manager);
@@ -319,6 +333,7 @@ async fn discovery_manager_decision_recovers_after_broker_commit_before_task_aut
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_catalog_and_create_share_the_production_runtime_capability_gate() {
     for runtime in ["codex","antigravity","agy","grok"] {
         let (dir,mut spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
@@ -501,6 +516,7 @@ async fn discovery_real_rpc_cancellation_stops_shared_budget_and_survives_restar
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_expired_task_overrides_stale_running_ledger_in_real_rpc_tree_and_list() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let manager=user("manager",UserRole::Manager); let store=TaskStore::open(&home).unwrap();
@@ -552,6 +568,7 @@ fn listed_run(listing: &Value, run_id: &str) -> Value {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_legacy_no_account_report_is_not_shown_as_missing_isolation() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap(); let manager=user("manager",UserRole::Manager);
@@ -573,6 +590,7 @@ async fn discovery_legacy_no_account_report_is_not_shown_as_missing_isolation() 
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_isolation_degraded_tracks_only_real_isolation_loss() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap(); let manager=user("manager",UserRole::Manager);
@@ -605,6 +623,7 @@ async fn discovery_isolation_degraded_tracks_only_real_isolation_loss() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_approval_status_pending_approved_denied_and_legacy() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap();
@@ -643,6 +662,7 @@ async fn discovery_approval_status_pending_approved_denied_and_legacy() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_ttl_expiry_is_reported_as_expired_not_denied() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap(); let employee=user("employee",UserRole::Employee);
@@ -660,6 +680,7 @@ async fn discovery_ttl_expiry_is_reported_as_expired_not_denied() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_withdrawal_resolves_the_manager_card_and_can_never_authorize() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap();
@@ -699,6 +720,7 @@ async fn discovery_withdrawal_resolves_the_manager_card_and_can_never_authorize(
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_cancel_after_manager_approval_keeps_approved_and_broker_row() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap();
@@ -724,6 +746,7 @@ async fn discovery_cancel_after_manager_approval_keeps_approved_and_broker_row()
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_withdrawn_is_visible_through_list() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap(); let employee=user("employee",UserRole::Employee);
@@ -737,6 +760,7 @@ async fn discovery_withdrawn_is_visible_through_list() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_unexplained_decision_without_receipt_is_neutral_never_approved() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap(); let employee=user("employee",UserRole::Employee);
@@ -763,6 +787,7 @@ async fn discovery_unexplained_decision_without_receipt_is_neutral_never_approve
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_withdraw_refuses_a_record_bound_to_another_task() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap(); let employee=user("employee",UserRole::Employee);
@@ -778,6 +803,7 @@ async fn discovery_withdraw_refuses_a_record_bound_to_another_task() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_generic_task_remove_and_handoff_cannot_touch_discovery_rows() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap(); let employee=user("employee",UserRole::Employee);
@@ -817,6 +843,7 @@ async fn discovery_generic_task_remove_and_handoff_cannot_touch_discovery_rows()
 }
 
 #[tokio::test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 async fn discovery_rows_carry_kind_through_the_real_tasks_list_rpc() {
     let (dir,spec,broker)=fixture(); let home=dir.path().canonicalize().unwrap();
     let store=TaskStore::open(&home).unwrap(); let employee=user("employee",UserRole::Employee);

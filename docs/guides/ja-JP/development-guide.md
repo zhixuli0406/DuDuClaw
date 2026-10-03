@@ -91,6 +91,19 @@ fallback = "claude"        # 検出できない場合に使うバックエンド
   `GEMINI_API_KEY`）を用意してください。keyring やブラウザのないコンテナ・リモートホストでは
   API キーモードを使います。
 
+### 1.5 ライブ検証用ホーム（Live validation home）
+
+新しいビルドは `~/.duduclaw` ではなく、隔離したホームで実際の gateway に対して検証します。
+
+```bash
+scripts/live-test/make-home.sh /tmp/ddc-live --port 18977
+DUDUCLAW_HOME=/tmp/ddc-live duduclaw run --yes &      # 一度起動すると .mcp.json が書かれる
+scripts/live-test/mcp-probe.sh /tmp/ddc-live plain
+scripts/live-test/mcp-probe.sh /tmp/ddc-live prod-shaped
+```
+
+このホームには従業員が 2 人います。`plain`（allowlist なし）と `prod-shaped`（`allowed_tools = ["mcp__duduclaw__*", ...]`、denied と承認リスト、明示的な権限フラグ、予算、契約付き）です。v1.67.0 以降のワイルドカード allowlist がすべてのプラットフォームツールを拒否していた不具合は、検証用従業員に allowlist がなかったため見逃されました。ルール: 本番ホームをアップグレードしたら、各従業員自身の MCP 登録を通して実際のツールを呼びます（`mcp-probe.sh ~/.duduclaw <agent-id>`）。隔離ホームはオペレーターの Claude コネクタ（Drive、Gmail）までは隔離しないため、テストタスクには外部サービスを照会しないよう明記してください。ビルドキャッシュでディスクが埋まったときは、まず `scripts/clean-build-cache.sh --dry-run` を実行します。サードパーティの成果物は残し、`cargo` や `rustc` が動いている間は実行を拒否します。詳細は `scripts/live-test/README.md`。
+
 ---
 
 ## 2. ブラウザ自動化と Computer Use のデバッグ

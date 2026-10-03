@@ -12,7 +12,7 @@
 //! the host.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::discovery::attempt_adapter::RuntimeFamily;
 
@@ -193,12 +193,17 @@ pub fn valid_image(image: &str) -> bool {
 
 /// An in-image executable: absolute, no `..` component, no NUL, no comma or
 /// line break, at most 256 bytes.
+///
+/// The path names a file inside the (Linux) sandbox image, so it is judged
+/// with POSIX rules on every host: `Path::is_absolute` on a Windows gateway
+/// would call `/usr/bin/claude` relative (no drive letter) and refuse every
+/// valid `[container.sandbox.executables]` entry.
 pub fn valid_executable(path: &Path) -> bool {
     let Some(text) = path.to_str() else { return false };
-    path.is_absolute()
+    text.starts_with('/')
         && text.len() <= 256
         && !text.bytes().any(|c| matches!(c, 0 | b',' | b'\n' | b'\r'))
-        && !path.components().any(|c| matches!(c, Component::ParentDir))
+        && !text.split('/').any(|segment| segment == "..")
 }
 
 /// Parse `config.toml` (already parsed as a table). A missing section is the

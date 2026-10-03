@@ -917,6 +917,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn stale_night_compare_and_swap_never_overwrites_a_newer_durable_default() {
         let home = tempfile::tempdir().unwrap();
         let first = DiscoveryStore::open(home.path()).unwrap();
@@ -949,6 +950,7 @@ mod tests {
         assert_eq!(reopened.load_discovery_default(&ns).unwrap(), promoted);
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn defaults_do_not_cross_runtime_model_or_approved_root_namespaces() {
         let home = tempfile::tempdir().unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();
@@ -967,6 +969,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn frozen_defaults_refuse_source_hash_mismatch_invalid_beta_and_unknown_knobs() {
         let home = tempfile::tempdir().unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();
@@ -998,6 +1001,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn fresh_holdout_is_consumed_before_evaluation_even_after_a_crash_or_rejection() {
         let home = tempfile::tempdir().unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();
@@ -1049,6 +1053,7 @@ mod tests {
             .collect()
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn night_receipt_cas_conflict_consumes_tasks_and_keeps_the_newer_default() {
         let home = tempfile::tempdir().unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();
@@ -1084,6 +1089,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn cancelled_night_does_not_adopt_or_release_previously_consumed_holdout() {
         let home = tempfile::tempdir().unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();
@@ -1104,6 +1110,7 @@ mod tests {
         assert!(store.fresh_night_tasks(&ns, &tasks).unwrap().is_empty());
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn successful_night_adoption_is_atomic_with_receipt_and_frozen_version_history() {
         let home = tempfile::tempdir().unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();
@@ -1200,6 +1207,7 @@ mod tests {
             .collect()
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn long_corpus_uses_bounded_complete_task_sample_independent_of_scores() {
         let home = tempfile::tempdir().unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();
@@ -1247,6 +1255,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn long_corpus_never_splits_a_task_group_and_skips_oversized_task() {
         let home = tempfile::tempdir().unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();
@@ -1273,6 +1282,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn long_corpus_selection_never_reuses_previously_claimed_heldout_tasks() {
         let home = tempfile::tempdir().unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();
@@ -1311,6 +1321,7 @@ mod tests {
         assert!(heldout >= 8);
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn candidate_overflow_is_report_only_before_removing_the_builtin_incumbent() {
         let home = tempfile::tempdir().unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();
@@ -1373,6 +1384,7 @@ mod tests {
         assert_eq!(reopened.fresh_night_tasks(&namespace(), &heldout).unwrap().len(), 8);
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn repeated_development_occurrences_do_not_hide_a_distinct_frozen_policy() {
         let home = tempfile::tempdir().unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();

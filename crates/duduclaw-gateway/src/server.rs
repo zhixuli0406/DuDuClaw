@@ -14837,18 +14837,16 @@ async fn handle_voice_config_set(
     let config_path = state.home_dir.join("config.toml");
     // v1.68: never rewrite an unparsable config.toml (it would be replaced
     // by just the [voice] keys).
-    let mut table: toml::Table = match tokio::fs::read_to_string(&config_path).await {
-        Ok(c) => match c.parse() {
-            Ok(t) => t,
-            Err(_) => {
-                return (
-                    axum::http::StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": "config.toml is not valid TOML — refusing to overwrite it" })),
-                )
-                    .into_response();
-            }
-        },
-        Err(_) => toml::Table::new(),
+    let original_text = tokio::fs::read_to_string(&config_path).await.unwrap_or_default();
+    let mut table: toml::Table = match original_text.parse() {
+        Ok(t) => t,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "config.toml is not valid TOML — refusing to overwrite it" })),
+            )
+                .into_response();
+        }
     };
     let stt_command_before = table
         .get("voice")
@@ -14928,30 +14926,16 @@ async fn handle_voice_config_set(
         }
     }
 
-    // Atomic write: temp file + rename, same pattern as the config handlers.
-    let serialized = match toml::to_string_pretty(&table) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("serialize config.toml: {e}") })),
-            )
-                .into_response();
-        }
-    };
-    let tmp = config_path.with_extension("toml.tmp");
-    if let Err(e) = tokio::fs::write(&tmp, serialized).await {
+    // Locked, format-preserving commit (temp + rename), refused when another
+    // writer changed the file since it was read — same path as the
+    // dashboard config RPCs.
+    let original_hash = crate::handlers::config_commit::content_hash(&original_text);
+    if let Err(e) =
+        crate::handlers::config_commit::commit_table_locked(&config_path, original_hash, &table).await
+    {
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("write config.toml: {e}") })),
-        )
-            .into_response();
-    }
-    if let Err(e) = tokio::fs::rename(&tmp, &config_path).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("commit config.toml: {e}") })),
         )
             .into_response();
     }

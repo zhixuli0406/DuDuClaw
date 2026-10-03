@@ -575,3 +575,110 @@ async fn raw_editor_unchanged_submission_is_a_true_no_op_and_types_are_checked()
         assert!(e.contains("line"), "{e}");
     }
 }
+
+// ── format preservation (comments, order, arrays of tables, *_enc) ───────────
+
+const COMMENTED: &str = r#"# DuDuClaw config, hand edited
+
+# Gateway section comment
+[gateway]
+port = 18789 # trailing on port
+bind = "127.0.0.1"
+# auth_token = "commented-out"
+
+# the mailbox
+[mail]
+# the switch
+enabled = false # off for now
+# who reads mail
+default_agent = "dudu"
+# drop folder
+dropfolder_enabled = true
+
+# who may hand work to whom
+[delegation]
+policy = "department" # the default
+
+[[accounts]]
+id = "a"
+api_key_enc = "ZW5jcnlwdGVk/base64=="
+
+[tick]
+enabled = false
+
+[[tick.sources]]
+id = "s1"
+kind = "http_poll"
+url = "https://example.com"
+
+[[channels.line.accounts]]
+name = "oa1"
+channel_token_enc = "abc=="
+
+# trailing comment at end
+"#;
+
+/// Write the fixture after the handler is built (construction may touch
+/// config.toml), then run one RPC and return the file text.
+async fn rpc_on_fixture(method: &str, params: Value) -> String {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    std::fs::write(home.path().join("config.toml"), COMMENTED).unwrap();
+    ok(&handler.handle(method, params, &admin()).await);
+    std::fs::read_to_string(home.path().join("config.toml")).unwrap()
+}
+
+#[tokio::test]
+async fn update_config_changes_only_the_target_line() {
+    let out = rpc_on_fixture("system.update_config", json!({ "mail": { "enabled": true } })).await;
+    assert_eq!(out, COMMENTED.replace("enabled = false # off for now", "enabled = true # off for now"));
+}
+
+#[tokio::test]
+async fn update_config_appends_a_new_key_inside_its_section() {
+    let out = rpc_on_fixture("system.update_config", json!({ "mail": { "auto_trigger": true } })).await;
+    assert_eq!(
+        out,
+        COMMENTED.replace("dropfolder_enabled = true\n", "dropfolder_enabled = true\nauto_trigger = true\n")
+    );
+}
+
+#[tokio::test]
+async fn update_config_creates_a_missing_section_at_the_end() {
+    let out = rpc_on_fixture("system.update_config", json!({ "night": { "llm_enabled": true } })).await;
+    let body = COMMENTED.trim_end_matches("\n# trailing comment at end\n");
+    assert!(out.starts_with(body), "{out}");
+    assert!(out.contains("[night]\nllm_enabled = true\n"), "{out}");
+    assert!(out.ends_with("# trailing comment at end\n"), "{out}");
+}
+
+#[tokio::test]
+async fn update_config_removing_a_key_keeps_neighbour_comments() {
+    let out = rpc_on_fixture("system.update_config", json!({ "mail": { "default_agent": "" } })).await;
+    assert_eq!(out, COMMENTED.replace("# who reads mail\ndefault_agent = \"dudu\"\n", ""));
+}
+
+#[tokio::test]
+async fn delegation_set_preserves_the_rest_of_the_file() {
+    let out = rpc_on_fixture("delegation.set", json!({ "policy": "hierarchy" })).await;
+    assert_eq!(
+        out,
+        COMMENTED.replace("policy = \"department\" # the default", "policy = \"hierarchy\" # the default")
+    );
+}
+
+#[tokio::test]
+async fn tick_source_upsert_appends_without_touching_other_tables() {
+    let out = rpc_on_fixture(
+        "tick.sources.upsert",
+        json!({ "source": { "id": "s2", "kind": "http_poll", "url": "https://example.org" } }),
+    )
+    .await;
+    let head = COMMENTED.split("[[channels.line.accounts]]").next().unwrap();
+    // Everything before the new element is untouched (comments, *_enc).
+    assert!(out.starts_with(head.trim_end()), "{out}");
+    assert!(out.contains("[[channels.line.accounts]]\nname = \"oa1\"\nchannel_token_enc = \"abc==\"\n"), "{out}");
+    assert!(out.contains("# trailing comment at end\n"), "{out}");
+    let t: toml::Table = out.parse().unwrap();
+    assert_eq!(t["tick"]["sources"].as_array().unwrap().len(), 2);
+}

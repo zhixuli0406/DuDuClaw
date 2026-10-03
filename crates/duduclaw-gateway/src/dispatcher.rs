@@ -2362,6 +2362,43 @@ async fn append_subagent_reply_to_parent_session(
     responder_agent: &str,
     response_text: &str,
 ) {
+    append_subagent_reply_to_parent_session_with(
+        home_dir,
+        channel_type,
+        channel_id,
+        thread_id,
+        parent_agent_id,
+        chain_root_agent,
+        responder_agent,
+        response_text,
+        crate::redaction_sources::current(),
+    )
+    .await
+}
+
+/// [`append_subagent_reply_to_parent_session`] with an explicit redaction
+/// manager (the live one in production, a test manager in tests).
+///
+/// RFC-23 `[redaction.sources] sub_agent`: the reply is passed through the
+/// rule engine of the agent that OWNS the session it lands in (the direct
+/// parent, or the chain root on a relayed append), keyed by that agent and
+/// that session id, so the tokens it mints restore through the same
+/// `(agent, session)` vault lookup the owner's channel reply already uses.
+/// The channel delivery in `forward_to_channel` is the end user's own view
+/// and stays unredacted. Fail closed: when the pass errors, the raw reply is
+/// not written; the turn carries [`crate::redaction_sources::SUB_AGENT_REPLY_WITHHELD`].
+#[allow(clippy::too_many_arguments)]
+async fn append_subagent_reply_to_parent_session_with(
+    home_dir: &Path,
+    channel_type: &str,
+    channel_id: &str,
+    thread_id: Option<&str>,
+    parent_agent_id: &str,
+    chain_root_agent: Option<&str>,
+    responder_agent: &str,
+    response_text: &str,
+    redaction: Option<std::sync::Arc<duduclaw_redaction::RedactionManager>>,
+) {
     let db_path = home_dir.join("sessions.db");
     if !db_path.exists() {
         // Brand-new install / no sessions yet — nothing to append to.
@@ -2375,15 +2412,11 @@ async fn append_subagent_reply_to_parent_session(
     let responder_for_tag = safe_agent_tag(responder_agent);
     let via_for_tag = safe_agent_tag(parent_agent_id);
 
-    // Two variants of the content — direct vs relayed. Both are built
-    // up-front so the spawn_blocking closure doesn't need the
-    // responder/parent strings by reference.
-    let direct_content = format!(
-        "<subagent_reply agent=\"{responder_for_tag}\">\n{response_text}\n</subagent_reply>"
-    );
-    let relayed_content = format!(
-        "<subagent_reply agent=\"{responder_for_tag}\" via=\"{via_for_tag}\">\n{response_text}\n</subagent_reply>"
-    );
+    // Two variants of the content — direct vs relayed. The reply body is
+    // redacted per owning agent inside the closure (the owner is only known
+    // once the session row is read), so only the owned strings move in.
+    let response_owned = response_text.to_string();
+    let responder_owned = responder_agent.to_string();
 
     let candidates = candidate_session_ids(channel_type, channel_id, thread_id);
     let parent = parent_agent_id.to_string();
@@ -2415,10 +2448,10 @@ async fn append_subagent_reply_to_parent_session(
 
             let Some(owner) = existing else { continue };
 
-            let (content, is_relayed) = if owner == parent {
-                (&direct_content, false)
+            let is_relayed = if owner == parent {
+                false
             } else if root.as_deref() == Some(owner.as_str()) {
-                (&relayed_content, true)
+                true
             } else {
                 tracing::debug!(
                     session_id = %sid,
@@ -2430,6 +2463,16 @@ async fn append_subagent_reply_to_parent_session(
                 continue;
             };
 
+            let content = subagent_reply_turn_content(
+                redaction.as_ref(),
+                &owner,
+                sid,
+                &responder_owned,
+                &responder_for_tag,
+                is_relayed.then_some(via_for_tag.as_str()),
+                &response_owned,
+            );
+            let content = &content;
             let tokens = subagent_reply_token_estimate(content);
             conn.execute(
                 "INSERT INTO session_messages (session_id, role, content, tokens, timestamp) \
@@ -2496,6 +2539,50 @@ async fn append_subagent_reply_to_parent_session(
                  (forward still succeeded)"
             );
         }
+    }
+}
+
+/// Build the `<subagent_reply>` turn written into the owner's session.
+///
+/// `[redaction.sources] sub_agent` decides the body: `inherit` / `off` /
+/// `selective` (and no manager at all) leave it byte-identical to the
+/// pre-wiring format; `on` replaces values matched by the owner's rules with
+/// tokens minted under `(owner, session_id)`. A redaction error never lets
+/// the raw body through: the turn carries the fixed withheld notice instead,
+/// so the owner still sees that a reply arrived.
+fn subagent_reply_turn_content(
+    redaction: Option<&std::sync::Arc<duduclaw_redaction::RedactionManager>>,
+    owner_agent: &str,
+    session_id: &str,
+    responder_agent: &str,
+    responder_tag: &str,
+    via_tag: Option<&str>,
+    response_text: &str,
+) -> String {
+    let body = match crate::redaction_sources::redact_sub_agent_reply(
+        redaction,
+        owner_agent,
+        session_id,
+        responder_agent,
+        response_text,
+    ) {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(
+                owner = %owner_agent,
+                session_id = %session_id,
+                responder = %responder_agent,
+                error = %e,
+                "redaction of sub-agent reply failed — reply withheld from parent session"
+            );
+            crate::redaction_sources::SUB_AGENT_REPLY_WITHHELD.to_string()
+        }
+    };
+    match via_tag {
+        None => format!("<subagent_reply agent=\"{responder_tag}\">\n{body}\n</subagent_reply>"),
+        Some(via) => format!(
+            "<subagent_reply agent=\"{responder_tag}\" via=\"{via}\">\n{body}\n</subagent_reply>"
+        ),
     }
 }
 
@@ -3805,6 +3892,114 @@ mod tests {
         assert_eq!(msgs[1].role, "assistant");
         assert!(msgs[1].content.contains("方案 A / B / C"));
         assert!(msgs[1].tokens > 0, "tokens should be estimated > 0");
+    }
+
+    fn sub_agent_redaction_manager(
+        home: &std::path::Path,
+        sources: &str,
+    ) -> std::sync::Arc<duduclaw_redaction::RedactionManager> {
+        let src = format!("enabled = true\nprofiles = [\"general\"]\n[sources]\n{sources}\n");
+        let cfg: duduclaw_redaction::RedactionConfig = toml::from_str(&src).unwrap();
+        std::sync::Arc::new(
+            duduclaw_redaction::RedactionManager::open(
+                cfg,
+                duduclaw_redaction::ManagerPaths::under_home(home),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// RFC-23 `sub_agent = "on"`: a sub-agent reply carrying a value the
+    /// parent's rules match lands in the parent's session as a token, and the
+    /// parent's channel-reply restore (owner, same session) gives it back.
+    #[tokio::test]
+    async fn sub_agent_reply_is_redacted_into_parent_session_and_restores() {
+        let (_tmp, home) = setup_parent_session("telegram:77", "agnes").await;
+        let m = sub_agent_redaction_manager(&home, "sub_agent = \"on\"");
+        append_subagent_reply_to_parent_session_with(
+            &home,
+            "telegram",
+            "77",
+            None,
+            "agnes",
+            None,
+            "duduclaw-tl",
+            "客戶信箱是 alice@example.com",
+            Some(m.clone()),
+        )
+        .await;
+        let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+        let msgs = sm.get_messages("telegram:77").await.unwrap();
+        let appended = &msgs.last().unwrap().content;
+        assert!(!appended.contains("alice@example.com"), "{appended}");
+        assert!(appended.contains(duduclaw_redaction::token::TOKEN_PREFIX));
+        assert!(appended.starts_with("<subagent_reply agent=\"duduclaw-tl\">"));
+        // Where the parent's reply is restored for its user (owner, session).
+        let restored = crate::redaction_sources::restore_for_user(
+            Some(&m),
+            "agnes",
+            Some("telegram:77"),
+            appended.clone(),
+        );
+        assert!(restored.contains("alice@example.com"), "{restored}");
+    }
+
+    /// Default mode (`inherit`) keeps the turn byte-identical to the
+    /// pre-wiring format, and a failing pass under `on` withholds the body.
+    #[tokio::test]
+    async fn sub_agent_reply_default_is_identical_and_errors_withhold() {
+        let (_tmp, home) = setup_parent_session("telegram:78", "agnes").await;
+        let m = sub_agent_redaction_manager(&home, "");
+        append_subagent_reply_to_parent_session_with(
+            &home,
+            "telegram",
+            "78",
+            None,
+            "agnes",
+            None,
+            "duduclaw-tl",
+            "客戶信箱是 alice@example.com",
+            Some(m),
+        )
+        .await;
+        let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+        let msgs = sm.get_messages("telegram:78").await.unwrap();
+        assert_eq!(
+            msgs.last().unwrap().content,
+            "<subagent_reply agent=\"duduclaw-tl\">\n客戶信箱是 alice@example.com\n</subagent_reply>"
+        );
+
+        let (_tmp2, home2) = setup_parent_session("telegram:79", "agnes").await;
+        let m2 = sub_agent_redaction_manager(&home2, "sub_agent = \"on\"");
+        let keys = home2.join("redaction/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("agnes.key"), b"short").unwrap();
+        append_subagent_reply_to_parent_session_with(
+            &home2,
+            "telegram",
+            "79",
+            None,
+            "agnes",
+            None,
+            "duduclaw-tl",
+            "客戶信箱是 alice@example.com",
+            Some(m2),
+        )
+        .await;
+        let sm2 = SessionManager::new(&home2.join("sessions.db")).unwrap();
+        let last = sm2
+            .get_messages("telegram:79")
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .content
+            .clone();
+        assert!(!last.contains("alice@example.com"), "{last}");
+        assert!(
+            last.contains(crate::redaction_sources::SUB_AGENT_REPLY_WITHHELD),
+            "{last}"
+        );
     }
 
     #[tokio::test]

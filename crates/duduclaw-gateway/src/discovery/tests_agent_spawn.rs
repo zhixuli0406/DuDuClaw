@@ -557,6 +557,7 @@ fn capture_fixture_retry_seed_with_limits(home:&Path,node:&Path,quota:crate::dis
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn retry_seed_is_private_and_associated_with_its_run_for_retention() {
     let (home,node)=retry_seed_fixture();
     let seed=capture_fixture_retry_seed(home.path(),&node).unwrap();
@@ -571,6 +572,7 @@ fn retry_seed_is_private_and_associated_with_its_run_for_retention() {
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn retained_retry_seeds_are_visible_to_global_and_per_run_quota_accounting() {
     let (home,node)=retry_seed_fixture();
     let discovery=home.path().join("discovery");
@@ -767,6 +769,7 @@ async fn container_attempt_without_family_credentials_refuses_before_spawn() {
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn retry_seed_refuses_run_and_global_exhaustion_before_copy_and_keeps_other_calls_accounted() {
     let (home,node)=retry_seed_fixture();
     let source=super::super::workspace::tree_bytes(&node).unwrap();
@@ -781,6 +784,7 @@ fn retry_seed_refuses_run_and_global_exhaustion_before_copy_and_keeps_other_call
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn retry_restore_direct_copy_preserves_private_workspace_and_reuses_the_reserved_seed_space() {
     let (home,node)=retry_seed_fixture();let node=node.canonicalize().unwrap();
     let source=super::super::workspace::tree_bytes(&node).unwrap();

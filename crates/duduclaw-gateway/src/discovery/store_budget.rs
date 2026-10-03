@@ -49,6 +49,7 @@ mod tests {
         (home, SharedBudget::new(limits).unwrap())
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn run_budget_survives_reopen_and_includes_pending_retry_and_development_calls_without_nodes() {
         let (home, budget) = fixture();
         budget.bind_run(home.path(), "run-1").unwrap();
@@ -71,6 +72,7 @@ mod tests {
         assert!(settled.spent_usd >= settled.reported_usd + settled.estimated_usd + settled.unknown_reserved_usd);
     }
     #[test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     fn a_shared_budget_cannot_rebind_to_another_run_or_home() {
         let (home, budget) = fixture();
         budget.bind_run(home.path(), "run-1").unwrap();

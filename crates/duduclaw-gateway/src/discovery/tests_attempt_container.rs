@@ -19,6 +19,7 @@ fn fixture() -> (tempfile::TempDir, AttemptRequest, AttemptSettings, AttemptRunt
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn container_has_hard_caps_trusted_pid1_and_only_explicit_snapshot_binds() {
     let (home, request, settings, runtime) = fixture();
     let prepared = prepare(home.path(), &request, &settings, QuotaLimits::default(), &runtime,
@@ -45,6 +46,7 @@ fn container_has_hard_caps_trusted_pid1_and_only_explicit_snapshot_binds() {
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn mutable_tags_zero_caps_host_executable_and_ledger_read_are_refused() {
     let (home, request, mut settings, mut runtime) = fixture();
     runtime.image="image:latest".into();
@@ -102,6 +104,7 @@ async fn timeout_and_dropped_future_finish_synchronous_cleanup() {
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn published_read_copy_is_immutable_and_tamper_prevents_result_delivery() {
     let (home,request,settings,runtime)=fixture();
     let prepared=prepare(home.path(),&request,&settings,QuotaLimits::default(),&runtime,&[],&BTreeMap::new(),Duration::from_secs(5)).unwrap();
@@ -148,6 +151,7 @@ async fn expired_prepared_container_never_spawns_even_when_caller_supplies_fresh
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn host_allocated_policy_developer_request_has_only_own_workspace_and_policy_scope() {
     let (home,mut request,settings,runtime)=fixture();
     let developer=create_policy_development_workspace(home.path(),&request.run_id).unwrap();
@@ -165,6 +169,7 @@ fn host_allocated_policy_developer_request_has_only_own_workspace_and_policy_sco
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn snapshots_respect_aggregate_run_and_global_quota_including_other_prepared_calls() {
     let (home,request,settings,runtime)=fixture();
     let existing=super::super::workspace::tree_bytes(&request.run_dir).unwrap();
@@ -179,6 +184,7 @@ fn snapshots_respect_aggregate_run_and_global_quota_including_other_prepared_cal
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn policy_development_rejects_foreign_or_shared_sessions_and_cross_workspace_reads() {
     let (home,mut request,settings,runtime)=fixture();
     let developer=create_policy_development_workspace(home.path(),&request.run_id).unwrap();
@@ -202,6 +208,7 @@ fn policy_development_rejects_foreign_or_shared_sessions_and_cross_workspace_rea
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn quota_counts_artifacts_policy_sessions_and_reports_before_allocating_a_snapshot() {
     for association in ["artifacts","policy-development","reports"] {
         let (home,request,settings,runtime)=fixture();
@@ -237,6 +244,7 @@ fn snapshot_quota_uses_the_workspace_sidecar_and_waits_only_within_deadline() {
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn controlled_bundle_preserves_private_permissions_and_checks_pre_and_post_write_quota() {
     let (home,request,_,_)=fixture();
     let limits=QuotaLimits {max_run_bytes:1024,max_total_bytes:4096};
@@ -259,6 +267,7 @@ fn controlled_bundle_preserves_private_permissions_and_checks_pre_and_post_write
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn runtime_files_are_validated_quota_counted_and_integrity_guarded() {
     let (home,request,settings,runtime)=fixture();
     let files=vec![("prompt.txt".to_string(),b"prompt".to_vec()),("home-seed/.gemini/config/hooks.json".to_string(),b"{}".to_vec())];
@@ -332,6 +341,7 @@ print(json.dumps({"type":"result","result":json.dumps(out)}),flush=True)"#;
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn secrets_reach_docker_create_by_name_only_and_never_start_or_rm() {
     let (home,request,settings,runtime)=fixture();
     let env=BTreeMap::from([("HOME".to_string(),"/tmp/dudu-private/home".to_string()),

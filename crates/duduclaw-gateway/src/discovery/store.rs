@@ -26,6 +26,11 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("corrupt row: {0}")]
     Corrupt(String),
+    /// Discovery's private store needs unix ownership/permission checks
+    /// (uid, mode, `O_NOFOLLOW`); other hosts refuse instead of opening an
+    /// unverified database.
+    #[error("discovery is unavailable on this platform: {0}")]
+    UnsupportedPlatform(&'static str),
 }
 
 /// One replay evaluation row (`discovery_policy_evals`).
@@ -49,6 +54,10 @@ pub struct PolicyEvalRow {
     pub out_of_support: bool,
 }
 
+/// Why the store refuses to open on a non-unix host.
+#[cfg_attr(unix, allow(dead_code))]
+const NON_UNIX_STORE: &str = "the private SQLite store needs a unix host to verify ownership and permissions";
+
 /// Handle on `discovery.db`.
 pub struct DiscoveryStore {
     conn: Connection,
@@ -59,7 +68,7 @@ pub struct DiscoveryStore {
 /// the same private file authority, including SQLite sidecar files.
 pub(crate) fn private_connection(path: &Path) -> Result<Connection, StoreError> {
     #[cfg(not(unix))]
-    { let _ = path; Err(StoreError::Corrupt("private SQLite ACL unavailable".into())) }
+    { let _ = path; Err(StoreError::UnsupportedPlatform(NON_UNIX_STORE)) }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -95,7 +104,7 @@ pub(crate) fn private_connection(path: &Path) -> Result<Connection, StoreError> 
 
 fn validate_private_files(path: &Path) -> Result<(), StoreError> {
     #[cfg(not(unix))]
-    { let _ = path; Err(StoreError::Corrupt("private SQLite ACL unavailable".into())) }
+    { let _ = path; Err(StoreError::UnsupportedPlatform(NON_UNIX_STORE)) }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};

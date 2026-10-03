@@ -55,9 +55,8 @@ pub fn integration_enabled(home_dir: &Path) -> bool {
 /// credentials): connecting IS the opt-in, so the default-hidden gate must not
 /// stay closed behind a working credential — that combination dead-ends every
 /// tool call while the credential test shows green. toml_edit round-trips the
-/// file so operator comments and formatting survive (unlike the wholesale
-/// `write_config_table` rewrite, which is fine for explicit saves but not for
-/// a side effect). Missing config.toml is created; malformed TOML is an error
+/// file so operator comments and formatting survive (the dashboard writers do
+/// the same through `config_commit::render_preserving`). Missing config.toml is created; malformed TOML is an error
 /// rather than a silent overwrite. Returns Ok(true) when the file changed,
 /// Ok(false) when the flag was already on.
 pub fn enable_integration(home_dir: &Path) -> std::io::Result<bool> {

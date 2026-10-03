@@ -295,9 +295,14 @@ impl MethodHandler {
             let table_for_write = table.clone();
             tokio::task::spawn_blocking(move || {
                 duduclaw_core::with_file_lock(&path_for_lock, || {
-                    let content = toml::to_string_pretty(&table_for_write).map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                    })?;
+                    // Format-preserving: only the stripped keys leave the
+                    // file; the operator's comments and order stay.
+                    let current = std::fs::read_to_string(&path_for_lock)?;
+                    let content =
+                        super::config_commit::render_preserving(&current, &table_for_write)
+                            .map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                            })?;
                     let tmp_path = path_for_lock.with_extension("toml.tmp");
                     std::fs::write(&tmp_path, content)?;
                     std::fs::rename(&tmp_path, &path_for_lock)?;

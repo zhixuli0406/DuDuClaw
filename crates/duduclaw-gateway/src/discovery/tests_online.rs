@@ -412,6 +412,7 @@ async fn changed_source_during_evaluation_never_becomes_a_scored_checkpoint() {
 struct NoisyScorer;
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn changed_source_before_export_preserves_prior_checkpoint_and_valid_ledger() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().canonicalize().unwrap();
@@ -451,6 +452,7 @@ fn changed_source_before_export_preserves_prior_checkpoint_and_valid_ledger() {
 }
 
 #[test]
+#[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn export_hash_comparison_rejects_transiently_changed_content_after_source_restore() {
     let source = tempfile::tempdir().unwrap();
     let export = tempfile::tempdir().unwrap();

@@ -199,7 +199,9 @@ pub fn ensure_internal_mcp_key(home_dir: &Path) -> Result<String, String> {
         }
 
         // Atomic write (temp + rename) so a crash never truncates config.toml.
-        let rendered = toml::to_string_pretty(&table)
+        // Format-preserving: only the [mcp_keys] rows that changed are
+        // edited, the operator's comments and key order stay.
+        let rendered = crate::handlers::config_commit::render_preserving(&content, &table)
             .map_err(|e| std::io::Error::other(format!("serialize config.toml: {e}")))?;
         let tmp = config_path.with_extension("toml.tmp");
         std::fs::write(&tmp, &rendered)?;

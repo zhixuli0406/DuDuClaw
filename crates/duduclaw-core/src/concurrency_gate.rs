@@ -395,9 +395,20 @@ pub fn renew_checked(home_dir: &Path, lease: &Lease, ttl_secs: u64) -> std::io::
     Ok(true)
 }
 
+/// `true` when a `try_lock_exclusive` failure means "another handle holds the
+/// lock" rather than a real I/O error. Unix reports `EWOULDBLOCK`
+/// (`ErrorKind::WouldBlock`); Windows reports `ERROR_LOCK_VIOLATION`, which
+/// `std` leaves uncategorised, so matching on `WouldBlock` alone turned every
+/// contended renewal into an immediate failure on Windows (a discovery
+/// operator heartbeat lost its lease the first time two renewals overlapped).
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || (error.raw_os_error().is_some()
+            && error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
 fn checked_state_lock(path: &Path) -> std::io::Result<std::fs::File> {
     use fs2::FileExt;
-    use std::io::ErrorKind;
     let mut lock_path = path.as_os_str().to_os_string();
     lock_path.push(".lock");
     let lock = std::fs::OpenOptions::new().create(true).truncate(false)
@@ -406,7 +417,7 @@ fn checked_state_lock(path: &Path) -> std::io::Result<std::fs::File> {
     loop {
         match lock.try_lock_exclusive() {
             Ok(()) => break,
-            Err(error) if error.kind() == ErrorKind::WouldBlock && std::time::Instant::now() < deadline => {
+            Err(error) if is_lock_contended(&error) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             Err(error) => return Err(error),
@@ -811,5 +822,33 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let d = ConcurrencyGateConfig::from_config_only(empty.path());
         assert_eq!(d.personal_max_concurrent, 2);
+    }
+
+    #[test]
+    fn the_platform_contention_error_counts_as_contended() {
+        // Windows reports ERROR_LOCK_VIOLATION, which std does not map to
+        // WouldBlock; the checked lock must still retry it until its deadline.
+        assert!(is_lock_contended(&fs2::lock_contended_error()));
+        assert!(is_lock_contended(&std::io::Error::from(std::io::ErrorKind::WouldBlock)));
+        assert!(!is_lock_contended(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+    }
+
+    #[test]
+    fn a_briefly_contended_renewal_waits_instead_of_failing() {
+        use fs2::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let lease = match try_acquire_checked(dir.path(), "renew-wait", Some(1), 30).unwrap() {
+            AcquireOutcome::Admitted(lease) => lease,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        let lock = std::fs::OpenOptions::new().read(true).write(true)
+            .open(dir.path().join(format!("{STATE_FILE}.lock"))).unwrap();
+        lock.lock_exclusive().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(lock);
+        });
+        assert!(renew_checked(dir.path(), &lease, 30).unwrap(), "contention shorter than the deadline must not fail");
+        releaser.join().unwrap();
     }
 }

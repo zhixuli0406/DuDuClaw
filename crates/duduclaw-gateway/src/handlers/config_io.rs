@@ -20,7 +20,9 @@ impl MethodHandler {
         }
     }
 
-    /// Write a TOML table back to disk.
+    /// Write a TOML table back to disk, format-preserving: only the keys
+    /// that differ from the file on disk are edited (see
+    /// `config_commit::render_preserving`).
     ///
     /// v1.68: refuses when the file being replaced exists but does not parse.
     /// Callers read through the lenient [`Self::read_config_table`], which
@@ -38,8 +40,15 @@ impl MethodHandler {
             path.to_path_buf()
         };
         refuse_overwriting_unparsable(&target).await?;
-        let content = toml::to_string_pretty(table)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        // Edit the file as it stands rather than re-serialising the table, so
+        // comments, blank lines and key order survive (`render_preserving`).
+        let original = match tokio::fs::read_to_string(&target).await {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e),
+        };
+        let content = super::config_commit::render_preserving(&original, table)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         tokio::fs::write(path, content).await
     }
 

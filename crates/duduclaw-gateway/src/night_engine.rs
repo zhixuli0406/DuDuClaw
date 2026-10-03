@@ -846,6 +846,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
     async fn discovery_night_runs_without_calling_a_supplied_provider() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct CountingProvider(AtomicUsize);

@@ -82,6 +82,19 @@ fallback = "claude"        # 後端偵測不到時改用此後端
   `[antigravity] auth = "api_key"`，並提供 Gemini API key（`gemini` provider 帳號，
   或環境變數 `GEMINI_API_KEY`）。容器或沒有 keyring、瀏覽器的遠端主機請用 API key 模式。
 
+### 1.5 活測環境（Live validation home）
+
+驗證新版時，請在隔離的 home 對真的 gateway 測，不要動 `~/.duduclaw`：
+
+```bash
+scripts/live-test/make-home.sh /tmp/ddc-live --port 18977
+DUDUCLAW_HOME=/tmp/ddc-live duduclaw run --yes &      # 開機一次，會寫出 .mcp.json
+scripts/live-test/mcp-probe.sh /tmp/ddc-live plain
+scripts/live-test/mcp-probe.sh /tmp/ddc-live prod-shaped
+```
+
+這個 home 有兩位員工：`plain`（沒有 allowlist）與 `prod-shaped`（`allowed_tools = ["mcp__duduclaw__*", ...]`，另有 denied、核准清單、明確的權限旗標、預算與契約）。v1.67.0 起「萬用字元 allowlist 讓所有平台工具被拒」的回歸，就是因為活測員工沒有 allowlist 才漏測。規則：升級正式 home 之後，要透過每位員工自己的 MCP 註冊去呼叫真工具（`mcp-probe.sh ~/.duduclaw <agent-id>`）。隔離的 home 不會隔離操作者的 Claude 連接器（Drive、Gmail），請在測試任務裡明寫不要查外部服務。編譯快取塞滿磁碟時，先跑 `scripts/clean-build-cache.sh --dry-run`；它只清本 workspace 自己的產物、保留第三方依賴，且在 `cargo` 或 `rustc` 還在跑時拒絕執行。細節見 `scripts/live-test/README.md`。
+
 ---
 
 ## 2. 瀏覽器自動化與 Computer Use 調試
