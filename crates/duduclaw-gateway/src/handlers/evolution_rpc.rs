@@ -349,10 +349,11 @@ impl MethodHandler {
         }
     }
 
-    /// `belief.summary` — per-agent belief calibration stats
-    /// (`agent_id` required). n<30 settled ⇒ `insufficient_samples: true`
-    /// and every derived metric is `null` (§0-3 small-sample discipline —
-    /// never a point estimate dressed up as a verdict).
+    /// `belief.summary` — per-agent belief stats (`agent_id` required).
+    /// Calibration figures live only under `stats.verified` (cross-checked
+    /// settlements); `stats.self_reported` is a count plus a descriptive
+    /// rate. Fewer than 30 verified settlements ⇒ `calibration_status` is not
+    /// `calibrated` and every derived figure is `null` (§0-3).
     pub(crate) async fn handle_belief_summary(&self, params: Value) -> WsFrame {
         let Some(agent_id) = params
             .get("agent_id")

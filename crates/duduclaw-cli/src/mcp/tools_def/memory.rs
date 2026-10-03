@@ -167,7 +167,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "belief_settle",
-        description: "Settle a belief you submitted, once its horizon passed. Scores hit/miss/flat_band deterministically from realized_value vs your submit-time ref_value. Never grade yourself in prose; report honestly.",
+        description: "Settle a belief after its horizon. Scores hit/miss/flat_band from realized_value vs your ref_value. Your own report is unverified and does not count toward calibration.",
         params: &[
             ParamDef {
                 name: "belief_id",
@@ -183,7 +183,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "belief_stats",
-        description: "Read your own calibration record: hit rate (Wilson lower bound), mean score, overconfidence, from settled beliefs, never recollection. Under 30 settled beliefs it returns counts only, no verdict.",
+        description: "Read your calibration record. Figures under `verified` use only cross-checked settlements; `self_reported` is a count, not calibration. Under 30 verified: counts only.",
         params: &[],
     },
     ToolDef {
