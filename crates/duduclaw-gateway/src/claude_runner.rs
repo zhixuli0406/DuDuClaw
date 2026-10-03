@@ -1570,32 +1570,6 @@ fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
     envs
 }
 
-/// Base tool name — the part before an optional `(` qualifier (e.g.
-/// `Bash(git:*)` → `Bash`), trimmed, with an `mcp__<server>__` namespace prefix
-/// stripped (`mcp__duduclaw__office_script` → `office_script`). Token-anchored
-/// (never substring), per the 2026-06 review conventions.
-///
-/// The prefix strip is what lets the Claude-CLI-qualified entries the dashboard
-/// tool picker writes into `[capabilities] allowed_tools` / `denied_tools`
-/// match the BARE tool names the API-path `ToolRegistry` advertises — without
-/// it, an allowlist of qualified names would drop every MCP tool for API-mode
-/// agents, and a qualified deny would silently not deny. Stripping ignores the
-/// server segment, so a deny of `mcp__other__foo` also drops a tool named
-/// `foo` from any server — over-matching on deny is fail-safe, and allowlist
-/// collisions across servers are an accepted trade-off (documented here).
-fn tool_base_name(entry: &str) -> &str {
-    let e = entry.split('(').next().unwrap_or(entry).trim();
-    if let Some(rest) = e.strip_prefix("mcp__") {
-        if let Some(idx) = rest.find("__") {
-            let bare = &rest[idx + 2..];
-            if !bare.is_empty() {
-                return bare;
-            }
-        }
-    }
-    e
-}
-
 /// Filter MCP tool defs by the agent's capabilities (G2, fail-closed): a tool
 /// whose base name is bare-denied is dropped, and when an explicit
 /// `allowed_tools` allowlist is set only tools named there survive. `None`
@@ -1609,23 +1583,13 @@ pub(crate) fn filter_tool_defs(
     };
     let denied = caps.disallowed_tools();
     let allowed = caps.allowed_tools();
+    // v1.68.1: the shared, wildcard-aware matcher (same decision as the MCP
+    // dispatch gate), so an allowlist entry `mcp__duduclaw__*` keeps every
+    // duduclaw tool instead of dropping them all.
     defs.into_iter()
         .filter(|d| {
-            let name = tool_base_name(&d.name);
-            if denied
-                .iter()
-                .any(|x| tool_base_name(x).eq_ignore_ascii_case(name))
-            {
-                return false;
-            }
-            if !allowed.is_empty()
-                && !allowed
-                    .iter()
-                    .any(|x| tool_base_name(x).eq_ignore_ascii_case(name))
-            {
-                return false;
-            }
-            true
+            duduclaw_core::tool_catalog::tool_list_verdict(&d.name, &denied, &allowed)
+                == duduclaw_core::tool_catalog::ToolListVerdict::Allowed
         })
         .collect()
 }

@@ -32,7 +32,7 @@ still reaches the real gate and is still refused, with the gate's own message.
 | External client whitelist | `principal.is_external` | Exactly 7 tools are listed |
 | Google Workspace | `config.toml [integrations] google_workspace` | 19 `gmail_*` / `calendar_*` / `sheets_*` / `forms_*` / `gtasks_*` / `drive_*` / `docs_*` / `slides_*` tools hidden |
 | GitHub | `config.toml [integrations] github` | 5 `github_*` tools hidden |
-| `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | Denied tools hidden; a non-empty allowlist hides everything else |
+| `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | Denied tools hidden; a non-empty allowlist hides everything else. An entry matches a tool exactly, or by a trailing `*`: `*`, `mcp__duduclaw__*` (every DuDuClaw tool), `mcp__duduclaw__odoo_*` / `memory_*` (anchored prefix). `mcp__<other server>__…` never names a DuDuClaw tool; a `*` elsewhere is literal. The approval lists and `scoped_tools` use the same rule |
 | `os_native` | `agent.toml [capabilities]` | 6 `os_*` automation tools hidden |
 | `recording` | `agent.toml [capabilities]` | 5 browser/desktop recording tools hidden |
 | `system_operator` | `agent.toml [capabilities]` | 19 appliance operation tools hidden |

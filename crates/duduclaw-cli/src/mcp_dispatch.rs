@@ -327,7 +327,9 @@ pub(crate) const PERMISSION_GATED_TOOLS: &[(&str, &str)] = &[
     ("shared_skill_share", "can_modify_own_skills"),
 ];
 
-/// Tools gated only for some arguments (see [`permissions_for_call`]).
+/// Tools gated only for some arguments (see [`permissions_for_call`]);
+/// listed for the classification test.
+#[cfg(test)]
 pub(crate) const PERMISSION_CONDITIONAL_TOOLS: &[&str] = &["tasks_create", "create_task"];
 
 /// The `[permissions]` flags governing this call. Exact tool-name matching.
@@ -3353,5 +3355,37 @@ effect = "forbid"
             let msg = result["error"]["message"].as_str().unwrap_or("");
             assert!(!msg.contains("[permissions]"), "must not be refused by the permission gate: {result}");
         }
+    }
+
+    // ── v1.68.1: wildcard allowlist entries at the dispatch gate ─────────────
+
+    #[tokio::test]
+    async fn production_wildcard_allowlist_reaches_platform_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(
+            &tmp,
+            "[capabilities]\nallowed_tools = [\"mcp__duduclaw__*\", \"mcp__masterlink__*\", \"WebSearch\", \"WebFetch\", \"Read\", \"Write\", \"Edit\", \"Glob\", \"Grep\", \"TodoWrite\"]\n",
+        );
+        let principal = make_principal(vec![Scope::Admin], false);
+        for tool in ["memory_store", "user_profile_get", "working_state_set"] {
+            let result = dispatcher
+                .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params(tool, serde_json::json!({})), &serde_json::json!(1))
+                .await;
+            let msg = result["error"]["message"].as_str().unwrap_or("");
+            assert!(!msg.contains("allowed_tools"), "{tool} must pass the allowlist: {result}");
+        }
+    }
+
+    #[tokio::test]
+    async fn another_servers_wildcard_does_not_allow_platform_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nallowed_tools = [\"mcp__masterlink__*\"]\n");
+        let principal = make_principal(vec![Scope::Admin], false);
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params("memory_store", serde_json::json!({"content": "x"})), &serde_json::json!(2))
+            .await;
+        assert!(result["error"]["message"].as_str().unwrap_or("").contains("allowed_tools"), "{result}");
     }
 }

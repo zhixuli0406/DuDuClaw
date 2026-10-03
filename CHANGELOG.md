@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **`allowed_tools` 寫成 `mcp__duduclaw__*` 的 AI 員工，所有平台工具都被拒絕**（影響 v1.67.0、v1.67.1、v1.68.0）。v1.67.0 起 MCP 閘門改用實際執行的員工身分查 `[capabilities]`，而清單比對只做完整名稱相等，`mcp__duduclaw__*` 被當成名為 `*` 的工具，什麼都對不上，每次呼叫都回「不在此代理的 allowed_tools 允許清單中」。我們自己的文件與付費範本都用這個寫法。現在清單項目照 Claude CLI 的規則比對，而且一律從開頭錨定：`*` 對應所有工具；`mcp__duduclaw__*`（或 `mcp__duduclaw`）對應所有 DuDuClaw 工具；結尾的 `*` 代表前綴（`mcp__duduclaw__odoo_*`、`memory_*`，`memory_*` 不會對到 `agent_memory_x`）；`*` 出現在其他位置只當一般字元；`mcp__<其他伺服器>__…` 不會對到任何 DuDuClaw 工具（舊的比對會把 `mcp__masterlink__foo` 當成 DuDuClaw 的 `foo`）。`denied_tools` 仍優先。MCP 派送閘門、`tools/list` 可見性、電腦操作工具、API 模式的工具清單、`scoped_tools`、`approval_required_tools`／`irreversible_tools`／`maybe_irreversible_tools` 與安全頁的權限摘要都改用同一個比對函式。傳給 Claude CLI 的 `--allowedTools`／`--disallowedTools` 內容不變。
+
 ## [1.68.0] - 2026-10-03 — 儀表板開關全面補齊×存檔無作用欄位修復×記憶命名空間統一×權限旗標生效×通道管理指令與管理權杖安全修補
 
 ### Added

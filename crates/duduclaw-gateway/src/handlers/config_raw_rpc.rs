@@ -406,6 +406,7 @@ fn restore_item(
 
 /// Turn the submitted (masked) text back into the text to write: placeholders
 /// take their stored values and hidden sections come back from disk.
+#[cfg(test)]
 pub(crate) fn restore_raw_toml(submitted: &str, stored: &str) -> Result<String, String> {
     restore_raw_toml_ctx(submitted, stored, &mut RestoreCtx::default())
 }

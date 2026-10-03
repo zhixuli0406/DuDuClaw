@@ -491,6 +491,7 @@ fn disposition_label(d: &MigrationDisposition) -> String {
     }
 }
 
+#[cfg(test)]
 pub async fn assign(
     home: &Path,
     to: &str,

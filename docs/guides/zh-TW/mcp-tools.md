@@ -22,7 +22,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 | 外部用戶端白名單 | `principal.is_external` | 只列 7 個工具 |
 | Google Workspace | `config.toml [integrations] google_workspace` | 隱藏 19 個 Google 工具 |
 | GitHub | `config.toml [integrations] github` | 隱藏 5 個 `github_*` |
-| `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 被拒的隱藏；允許清單非空時其餘全隱藏 |
+| `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 被拒的隱藏；允許清單非空時其餘全隱藏。清單項目完全相同才算，或用結尾的 `*` 比對：`*`、`mcp__duduclaw__*`（全部 DuDuClaw 工具）、`mcp__duduclaw__odoo_*`／`memory_*`（從開頭比對的前綴）。`mcp__<其他伺服器>__…` 不會對到 DuDuClaw 工具；其他位置的 `*` 只是一般字元。三份審批清單與 `scoped_tools` 用同一套規則 |
 | `os_native` | `agent.toml [capabilities]` | 隱藏 6 個 `os_*` 自動化工具 |
 | `recording` | `agent.toml [capabilities]` | 隱藏 5 個錄製工具 |
 | `system_operator` | `agent.toml [capabilities]` | 隱藏 19 個值班機操作工具 |

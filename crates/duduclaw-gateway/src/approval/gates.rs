@@ -31,10 +31,11 @@ pub fn approval_required_tools(agent_dir: &Path) -> HashSet<String> {
 }
 
 /// True when a tool name is listed in the agent's
-/// `approval_required_tools`. Exact match (no substring/`contains` — a
-/// routing/security decision, per project convention).
+/// `approval_required_tools`, under the shared anchored matcher
+/// (`tool_catalog::tool_entry_matches`: exact names, `mcp__duduclaw__` /
+/// bare prefixes ending in `*`, never a substring).
 pub fn tool_requires_approval(agent_dir: &Path, tool_name: &str) -> bool {
-    approval_required_tools(agent_dir).contains(tool_name)
+    duduclaw_core::tool_catalog::tool_list_matches(approval_required_tools(agent_dir), tool_name)
 }
 
 // ── P2b: ActionGuard three-value irreversibility gate ───────────
@@ -79,15 +80,15 @@ pub fn maybe_irreversible_tools(agent_dir: &Path) -> HashSet<String> {
 }
 
 /// True when a tool is listed in `irreversible_tools` (always-irreversible).
-/// Exact match — a routing/security decision (project convention 2).
+/// Shared anchored matcher (`tool_catalog::tool_entry_matches`).
 pub fn tool_is_irreversible(agent_dir: &Path, tool_name: &str) -> bool {
-    irreversible_tools(agent_dir).contains(tool_name)
+    duduclaw_core::tool_catalog::tool_list_matches(irreversible_tools(agent_dir), tool_name)
 }
 
 /// True when a tool is listed in `maybe_irreversible_tools` (judge decides).
-/// Exact match — a routing/security decision (project convention 2).
+/// Shared anchored matcher (`tool_catalog::tool_entry_matches`).
 pub fn tool_is_maybe_irreversible(agent_dir: &Path, tool_name: &str) -> bool {
-    maybe_irreversible_tools(agent_dir).contains(tool_name)
+    duduclaw_core::tool_catalog::tool_list_matches(maybe_irreversible_tools(agent_dir), tool_name)
 }
 
 /// The ActionGuard gate resolved for one tool call.

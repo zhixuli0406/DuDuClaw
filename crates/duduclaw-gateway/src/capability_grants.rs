@@ -79,9 +79,12 @@ pub fn tool_token_matches(a: &str, b: &str) -> bool {
     tool_base(a).eq_ignore_ascii_case(tool_base(b))
 }
 
-/// True when `tool` is present in `set` under token-anchored matching.
+/// True when `tool` is present in `set`: the shared anchored matcher
+/// (`tool_catalog::tool_entry_matches` — wildcard rules, server-aware), or
+/// the historical case-insensitive base-name match.
 pub fn set_contains_tool(set: &HashSet<String>, tool: &str) -> bool {
-    set.iter().any(|e| tool_token_matches(e, tool))
+    set.iter()
+        .any(|e| duduclaw_core::tool_catalog::tool_entry_matches(e, tool) || tool_token_matches(e, tool))
 }
 
 // ── Grant row ───────────────────────────────────────────────

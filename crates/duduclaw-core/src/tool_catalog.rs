@@ -1596,6 +1596,69 @@ pub fn mcp_tool_base_name(entry: &str) -> &str {
     e
 }
 
+/// The MCP server name DuDuClaw's own tools are served under
+/// (`mcp__duduclaw__<tool>` in Claude CLI permission rules).
+pub const DUDUCLAW_MCP_SERVER: &str = "duduclaw";
+
+/// Split a tool reference into `(server, name)`. A bare name belongs to the
+/// duduclaw server; `mcp__<server>__<name>` names `<server>`; a bare
+/// `mcp__<server>` (Claude CLI's server-level rule) is `(server, "*")`. An
+/// optional `(qualifier)` suffix is dropped.
+fn split_tool_ref(raw: &str) -> (&str, &str) {
+    let e = raw.split('(').next().unwrap_or(raw).trim();
+    match e.strip_prefix("mcp__") {
+        Some(rest) => match rest.find("__") {
+            Some(idx) => (&rest[..idx], &rest[idx + 2..]),
+            None => (rest, "*"),
+        },
+        None => (DUDUCLAW_MCP_SERVER, e),
+    }
+}
+
+/// Name part of a list entry against a tool name: exact, or — only when the
+/// entry ends in `*` and has no other `*` — an anchored prefix match (`*`
+/// alone matches every name). A `*` anywhere else is literal, so it only
+/// matches a tool literally named that way (none exists).
+fn name_pattern_matches(pattern: &str, name: &str) -> bool {
+    if pattern.is_empty() || name.is_empty() {
+        return false;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        if !prefix.contains('*') {
+            return name.starts_with(prefix);
+        }
+    }
+    pattern == name
+}
+
+/// Does one `[capabilities]` list entry (`allowed_tools`, `denied_tools`,
+/// `scoped_tools`, `approval_required_tools`, `irreversible_tools`,
+/// `maybe_irreversible_tools`) name `tool`?
+///
+/// The Claude CLI rule semantics, anchored — never a substring match:
+/// - `*` matches every tool;
+/// - `mcp__duduclaw__*` (or `mcp__duduclaw`) matches every duduclaw tool;
+/// - `mcp__duduclaw__<prefix>*` / bare `<prefix>*` match duduclaw tools whose
+///   name starts with `<prefix>` (`*` only at the end);
+/// - `mcp__duduclaw__<name>` / bare `<name>` match exactly that tool;
+/// - `mcp__<other-server>__…` never matches a duduclaw tool (it names
+///   another server), and vice versa.
+///
+/// `tool` is what the gate sees: a bare duduclaw name, or a qualified name.
+pub fn tool_entry_matches(entry: &str, tool: &str) -> bool {
+    if entry.trim() == "*" {
+        return true;
+    }
+    let (entry_server, entry_name) = split_tool_ref(entry);
+    let (tool_server, tool_name) = split_tool_ref(tool);
+    entry_server == tool_server && name_pattern_matches(entry_name, tool_name)
+}
+
+/// True when any entry of `list` names `tool` (see [`tool_entry_matches`]).
+pub fn tool_list_matches<S: AsRef<str>>(list: impl IntoIterator<Item = S>, tool: &str) -> bool {
+    list.into_iter().any(|e| tool_entry_matches(e.as_ref(), tool))
+}
+
 /// What `[capabilities] denied_tools` / `allowed_tools` decide for one tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolListVerdict {
@@ -1608,16 +1671,20 @@ pub enum ToolListVerdict {
 }
 
 /// The `denied_tools` / `allowed_tools` decision shared by every gate that
-/// enforces them (the MCP dispatch front door and the gateway's computer-use
-/// route): exact equality on [`mcp_tool_base_name`] of both sides, never a
-/// substring; `denied_tools` wins; a non-empty `allowed_tools` switches the
-/// agent into allowlist mode.
+/// enforces them (the MCP dispatch front door, the `tools/list` filter and
+/// the gateway's computer-use route), using [`tool_entry_matches`] (Claude
+/// CLI wildcard rules, anchored, server-aware); `denied_tools` wins; a
+/// non-empty `allowed_tools` switches the agent into allowlist mode.
+///
+/// v1.68.1: before this, entries were compared by exact base name, so the
+/// documented `mcp__duduclaw__*` allowlist entry reduced to `*` and matched
+/// nothing — every platform tool was refused for such employees — and
+/// `mcp__<other>__foo` wrongly matched a duduclaw tool named `foo`.
 pub fn tool_list_verdict(tool_name: &str, denied: &[String], allowed: &[String]) -> ToolListVerdict {
-    let base = mcp_tool_base_name(tool_name);
-    if denied.iter().any(|d| mcp_tool_base_name(d) == base) {
+    if tool_list_matches(denied, tool_name) {
         return ToolListVerdict::Denied;
     }
-    if !allowed.is_empty() && !allowed.iter().any(|a| mcp_tool_base_name(a) == base) {
+    if !allowed.is_empty() && !tool_list_matches(allowed, tool_name) {
         return ToolListVerdict::NotAllowlisted;
     }
     ToolListVerdict::Allowed
@@ -1627,6 +1694,46 @@ pub fn tool_list_verdict(tool_name: &str, denied: &[String], allowed: &[String])
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn production_wildcard_allowlist_allows_platform_tools() {
+        let allowed = strings(&[
+            "mcp__duduclaw__*", "mcp__masterlink__*", "WebSearch", "WebFetch", "Read", "Write", "Edit", "Glob",
+            "Grep", "TodoWrite",
+        ]);
+        for tool in ["memory_store", "user_profile_get", "working_state_set"] {
+            assert_eq!(tool_list_verdict(tool, &[], &allowed), ToolListVerdict::Allowed, "{tool}");
+        }
+        let other_only = strings(&["mcp__masterlink__*"]);
+        assert_eq!(tool_list_verdict("memory_store", &[], &other_only), ToolListVerdict::NotAllowlisted);
+    }
+
+    #[test]
+    fn wildcard_rules_are_anchored_and_server_aware() {
+        let denied = strings(&["mcp__duduclaw__odoo_*"]);
+        assert_eq!(tool_list_verdict("odoo_search", &denied, &[]), ToolListVerdict::Denied);
+        assert_eq!(tool_list_verdict("memory_search", &denied, &[]), ToolListVerdict::Allowed);
+        // Prefix is anchored at the start.
+        assert!(tool_entry_matches("memory_*", "memory_store"));
+        assert!(!tool_entry_matches("memory_*", "agent_memory_x"));
+        // `*` anywhere but the end is literal.
+        assert!(!tool_entry_matches("mem*ry_store", "memory_store"));
+        assert!(!tool_entry_matches("*_store", "memory_store"));
+        // Lone `*` and the server-level rule.
+        assert!(tool_entry_matches("*", "memory_store"));
+        assert!(tool_entry_matches("mcp__duduclaw", "memory_store"));
+        // Another server never names a duduclaw tool.
+        assert!(!tool_entry_matches("mcp__masterlink__foo", "foo"));
+        assert!(!tool_entry_matches("mcp__masterlink__*", "memory_store"));
+        assert_eq!(tool_list_verdict("foo", &strings(&["mcp__masterlink__foo"]), &[]), ToolListVerdict::Allowed);
+        // Qualified tool names on both sides.
+        assert!(tool_entry_matches("memory_store", "mcp__duduclaw__memory_store"));
+        assert!(!tool_entry_matches("mcp__duduclaw__", "memory_store"));
+    }
 
     #[test]
     fn tool_list_verdict_denied_wins_and_allowlist_is_exact() {

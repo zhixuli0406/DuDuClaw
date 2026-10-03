@@ -12,14 +12,22 @@ impl MethodHandler {
         // RBAC: derive from agent roles
         let rbac_entries: Vec<Value> = agents.iter().map(|a| {
             let cfg = &a.config;
+            let delegate = ["spawn_agent", "send_to_agent"].iter().any(|t| {
+                duduclaw_core::tool_catalog::tool_list_verdict(
+                    t,
+                    &cfg.capabilities.denied_tools,
+                    &cfg.capabilities.allowed_tools,
+                ) == duduclaw_core::tool_catalog::ToolListVerdict::Allowed
+            });
             json!({
                 "agent_id": cfg.agent.name,
                 "role": cfg.agent.role,
                 "tool_use": true,
                 "web_access": cfg.capabilities.browser_via_bash,
                 "file_write": true,
-                "shell_exec": !cfg.capabilities.denied_tools.iter().any(|t| t == "Bash"),
-                "delegate": cfg.capabilities.allowed_tools.iter().any(|t| t.contains("delegate") || t.contains("spawn")),
+                // v1.68.1: the shared matcher (anchored, wildcard-aware).
+                "shell_exec": !duduclaw_core::tool_catalog::tool_list_matches(&cfg.capabilities.denied_tools, "Bash"),
+                "delegate": delegate,
             })
         }).collect();
 

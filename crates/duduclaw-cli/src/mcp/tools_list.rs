@@ -288,20 +288,10 @@ async fn visible_tools(
         let Some((denied, allowed)) = cap_gate.as_ref() else {
             return true; // external / unresolved caller → not gated here
         };
-        let base = duduclaw_core::tool_catalog::mcp_tool_base_name(name);
-        let is_denied = denied
-            .iter()
-            .any(|d| duduclaw_core::tool_catalog::mcp_tool_base_name(d) == base);
-        if is_denied {
-            return false;
-        }
-        let allowlist_active = !allowed.is_empty();
-        if allowlist_active {
-            return allowed
-                .iter()
-                .any(|a| duduclaw_core::tool_catalog::mcp_tool_base_name(a) == base);
-        }
-        true
+        // The dispatch gate's own predicate (v1.68.1: shared wildcard-aware
+        // matcher), so discoverable ⇔ callable.
+        duduclaw_core::tool_catalog::tool_list_verdict(name, denied, allowed)
+            == duduclaw_core::tool_catalog::ToolListVerdict::Allowed
     };
 
     tools()

@@ -22,7 +22,7 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 | 外部クライアント許可リスト | `principal.is_external` | 7 ツールのみ掲載 |
 | Google Workspace | `config.toml [integrations] google_workspace` | Google 系 19 ツールを非表示 |
 | GitHub | `config.toml [integrations] github` | `github_*` 5 ツールを非表示 |
-| `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 拒否分を非表示。許可リストが非空なら他を全て非表示 |
+| `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 拒否分を非表示。許可リストが非空なら他を全て非表示。項目は完全一致、または末尾の `*` で照合：`*`、`mcp__duduclaw__*`（DuDuClaw の全ツール）、`mcp__duduclaw__odoo_*`／`memory_*`（先頭からの前方一致）。`mcp__<他のサーバー>__…` は DuDuClaw のツールに一致しない。それ以外の位置の `*` は通常の文字。3 つの承認リストと `scoped_tools` も同じ規則 |
 | `os_native` | `agent.toml [capabilities]` | `os_*` 自動化 6 ツールを非表示 |
 | `recording` | `agent.toml [capabilities]` | 録画系 5 ツールを非表示 |
 | `system_operator` | `agent.toml [capabilities]` | アプライアンス操作 19 ツールを非表示 |
