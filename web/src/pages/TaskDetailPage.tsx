@@ -511,7 +511,7 @@ export function TaskDetailPage() {
         {/* I-2c: goal contract — risk boundary / acceptance criteria / latest
             result / confirmed facts. Renders nothing for a plain board task
             or a goal task with no contract fields set. */}
-        <GoalContractCards task={task} />
+        <GoalContractCards task={task} ledger={timeline?.criteria_ledger ?? null} />
 
         {/* Description (inline edit, multiline) */}
         <div>

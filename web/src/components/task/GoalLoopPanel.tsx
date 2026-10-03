@@ -2,7 +2,7 @@ import { useCallback, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { CircleDot, Hand, Radar, UserCheck } from 'lucide-react';
-import { api, type GoalTimeline, type PauseReasonToken, type TaskInfo } from '@/lib/api';
+import { api, type CriteriaLedger, type GoalTimeline, type PauseReasonToken, type TaskInfo } from '@/lib/api';
 import { timeAgo, formatHms, secondsBetween } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import { Badge, Button } from '@/components/mds';
@@ -87,11 +87,106 @@ export function GoalTakeoverButton({
   );
 }
 
+const LEDGER_STATUS_STYLE: Record<string, string> = {
+  planned: 'border-border bg-background text-muted-foreground',
+  covered: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+  blocked: 'border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300',
+  candidate: 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+};
+
+/** WP-G2 — the frozen acceptance criteria as a per-criterion ledger. Evidence
+ *  and unresolved lists are collapsed by default; a blocked unit shows its
+ *  first unresolved item inline. */
+export function CriteriaLedgerView({ ledger }: { ledger: CriteriaLedger }) {
+  const intl = useIntl();
+  const total = ledger.units.length;
+  const done = ledger.units.filter((u) => u.status === 'covered').length;
+  const blocked = ledger.units.filter((u) => u.status === 'blocked').length;
+  return (
+    <div className="space-y-1.5">
+      <p className="text-muted-foreground">
+        {intl.formatMessage({ id: 'goals.ledger.summary' }, { n: total, done, blocked })}
+      </p>
+      {ledger.mode === 'enforce' && (
+        <p className="text-[11px] text-muted-foreground/80">
+          {intl.formatMessage({ id: 'goals.ledger.enforce' })}
+        </p>
+      )}
+      {ledger.invalid_reports > 0 && (
+        <p className="text-[11px] text-muted-foreground/80">
+          {intl.formatMessage({ id: 'goals.ledger.invalidReport' })}
+        </p>
+      )}
+      <ul className="space-y-1.5">
+        {ledger.units.map((u) => {
+          const status = u.status in LEDGER_STATUS_STYLE ? u.status : 'planned';
+          const hasDetail = u.evidence.length > 0 || u.unresolved.length > 0;
+          return (
+            <li key={u.id} className="rounded-md border border-border/60 bg-background/50 px-2 py-1.5">
+              <div className="flex items-start gap-2">
+                <span className="mt-0.5 shrink-0 rounded bg-secondary px-1.5 py-0.5 font-mono text-[10px] font-medium text-foreground">
+                  {u.handle}
+                </span>
+                <span className="min-w-0 flex-1 whitespace-pre-wrap text-foreground">{u.text}</span>
+                <span
+                  className={`shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-medium ${LEDGER_STATUS_STYLE[status]}`}
+                >
+                  {intl.formatMessage({ id: `goals.ledger.status.${status}` })}
+                </span>
+              </div>
+              {status === 'blocked' && u.unresolved[0] && (
+                <p className="mt-1 pl-8 text-rose-700 dark:text-rose-300">{u.unresolved[0]}</p>
+              )}
+              {hasDetail && (
+                <details className="mt-1 pl-8">
+                  <summary className="cursor-pointer text-muted-foreground/80">
+                    {intl.formatMessage({ id: 'goals.ledger.details' })}
+                  </summary>
+                  {u.evidence.length > 0 && (
+                    <div className="mt-1">
+                      <p className="font-medium text-foreground">
+                        {intl.formatMessage({ id: 'goals.ledger.evidence' })}
+                      </p>
+                      <ul className="list-disc pl-4 text-muted-foreground">
+                        {u.evidence.map((e, i) => (
+                          <li key={`e${i}`}>{e}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {u.unresolved.length > 0 && (
+                    <div className="mt-1">
+                      <p className="font-medium text-foreground">
+                        {intl.formatMessage({ id: 'goals.ledger.unresolved' })}
+                      </p>
+                      <ul className="list-disc pl-4 text-muted-foreground">
+                        {u.unresolved.map((e, i) => (
+                          <li key={`u${i}`}>{e}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </details>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 /** Goal contract cards: risk boundary / acceptance criteria / latest result /
  *  confirmed facts + pending hypotheses. Each renders only when present —
  *  a task with none of these (a plain board task, or a goal task with no
  *  contract fields set) contributes nothing to the DOM. */
-export function GoalContractCards({ task }: { task: TaskInfo }) {
+export function GoalContractCards({
+  task,
+  ledger,
+}: {
+  task: TaskInfo;
+  ledger?: CriteriaLedger | null;
+}) {
   const intl = useIntl();
   const hasState =
     !!task.goal_state &&
@@ -117,7 +212,11 @@ export function GoalContractCards({ task }: { task: TaskInfo }) {
           <p className="mb-0.5 font-medium text-foreground">
             {intl.formatMessage({ id: 'goals.detail.criteria' })}
           </p>
-          <p className="whitespace-pre-wrap text-muted-foreground">{task.acceptance_criteria}</p>
+          {ledger && ledger.units.length > 0 ? (
+            <CriteriaLedgerView ledger={ledger} />
+          ) : (
+            <p className="whitespace-pre-wrap text-muted-foreground">{task.acceptance_criteria}</p>
+          )}
         </div>
       )}
       {task.result_summary && (
@@ -312,9 +411,9 @@ export function GoalRoundTimeline({ task, timeline }: { task: TaskInfo; timeline
                   {/* Per-aspect MAV verdicts — the structured panel the
                       judge actually returned, not just the flattened
                       feedback string. */}
-                  {n.round.aspects && n.round.aspects.length > 0 && (
+                  {n.round.aspects && n.round.aspects.some((a) => !a.criterion) && (
                     <div className="flex flex-wrap gap-1.5">
-                      {n.round.aspects.map((a) => (
+                      {n.round.aspects.filter((a) => !a.criterion).map((a) => (
                         <span
                           key={a.name}
                           title={a.reason}
@@ -327,6 +426,28 @@ export function GoalRoundTimeline({ task, timeline }: { task: TaskInfo; timeline
                           {intl.formatMessage({ id: `goals.aspect.${a.name}`, defaultMessage: a.name })}
                           {a.pass ? ' ✓' : ' ✗'}
                         </span>
+                      ))}
+                    </div>
+                  )}
+                  {n.round.aspects && n.round.aspects.some((a) => a.criterion) && (
+                    <div className="space-y-1" data-testid="criterion-verdicts">
+                      <p className="font-medium text-foreground">
+                        {intl.formatMessage({ id: 'goals.ledger.verdicts' })}
+                      </p>
+                      {n.round.aspects.filter((a) => a.criterion).map((a) => (
+                        <div key={a.name} className="flex items-start gap-2">
+                          <span className="shrink-0 rounded bg-secondary px-1.5 py-0.5 font-mono text-[10px] font-medium text-foreground">
+                            {a.name}
+                          </span>
+                          <span
+                            className={`shrink-0 font-medium ${
+                              a.pass ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'
+                            }`}
+                          >
+                            {intl.formatMessage({ id: a.pass ? 'goals.ledger.verdict.pass' : 'goals.ledger.verdict.fail' })}
+                          </span>
+                          {a.reason && <span className="min-w-0 text-muted-foreground">{a.reason}</span>}
+                        </div>
                       ))}
                     </div>
                   )}
