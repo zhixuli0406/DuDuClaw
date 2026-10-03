@@ -1,4 +1,5 @@
 use super::*;
+use crate::mcp::caller_shims::handle_agent_update;
 
 #[tokio::test]
 async fn org_subject_gate_protects_other_teams() {

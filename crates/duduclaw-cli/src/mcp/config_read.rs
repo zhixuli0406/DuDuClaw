@@ -259,25 +259,72 @@ mod decrypt_channel_token_tests {
 /// `run_mcp_server` additionally refuses to boot on that verdict, so a
 /// misconfigured deployment fails loudly instead of running an agent that
 /// silently cannot do anything.
+///
+/// A system-sender name (`dashboard`, `cron`, `goal-loop-driver`, …) is never
+/// a process identity: every point that starts an MCP server for an employee
+/// stamps an agent directory id, and those names are reserved at agent
+/// creation (`duduclaw_core::is_reserved_agent_id`). Only a self-asserted
+/// identity can carry one, and it would inherit the system senders'
+/// unconditional delegation reach, so it resolves to the untrusted sentinel.
 pub async fn get_default_agent(home_dir: &Path) -> String {
     if caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
         return duduclaw_core::UNTRUSTED_AGENT_ID.to_string();
     }
 
-    if let Ok(env_id) = std::env::var(duduclaw_core::ENV_AGENT_ID)
+    let (resolved, source) = if let Ok(env_id) = std::env::var(duduclaw_core::ENV_AGENT_ID)
         && !env_id.trim().is_empty()
     {
-        return env_id;
+        (env_id, "env")
+    } else {
+        let config = read_config(home_dir).await;
+        let resolved = config
+            .as_ref()
+            .and_then(|t| t.get("general"))
+            .and_then(|g| g.get("default_agent"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("dudu")
+            .to_string();
+        (resolved, "config")
+    };
+    if duduclaw_core::is_system_sender(&resolved) {
+        audit_system_sender_identity_once(home_dir, resolved.trim(), source);
+        return duduclaw_core::UNTRUSTED_AGENT_ID.to_string();
     }
+    resolved
+}
 
-    let config = read_config(home_dir).await;
-    config
-        .as_ref()
-        .and_then(|t| t.get("general"))
-        .and_then(|g| g.get("default_agent"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("dudu")
-        .to_string()
+/// Record, once per process per home, that `get_default_agent` replaced a
+/// claimed system-sender identity with the untrusted sentinel. Everything
+/// downstream (refusals, audit rows) only sees `__untrusted__`, so this row is
+/// the one place that says what was claimed and where it came from (`env` =
+/// `DUDUCLAW_AGENT_ID`, `config` = `[general] default_agent`). `claimed` is
+/// always one of the fixed `SYSTEM_SENDERS` names, never free text.
+fn audit_system_sender_identity_once(home_dir: &Path, claimed: &str, source: &str) {
+    static SEEN: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+    {
+        let Ok(mut seen) = SEEN.lock() else { return };
+        if seen.iter().any(|h| h == home_dir) {
+            return;
+        }
+        seen.push(home_dir.to_path_buf());
+    }
+    tracing::warn!(
+        claimed = %claimed,
+        source,
+        "MCP process identity is a system-sender name — treated as untrusted"
+    );
+    duduclaw_security::audit::append_tool_call_with_extras(
+        home_dir,
+        duduclaw_core::UNTRUSTED_AGENT_ID,
+        "mcp_identity",
+        &format!("denied: process identity '{claimed}' (from {source}) is a system-sender name"),
+        false,
+        &[
+            ("reason", serde_json::json!("system_sender_identity")),
+            ("claimed", serde_json::json!(claimed)),
+            ("source", serde_json::json!(source)),
+        ],
+    );
 }
 
 /// Verify the ambient `DUDUCLAW_AGENT_ID` / `DUDUCLAW_AGENT_TOKEN` pair against

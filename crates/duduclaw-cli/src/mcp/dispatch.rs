@@ -168,6 +168,9 @@ pub(crate) async fn handle_tools_call(
             | "os_audio_get"
             | "os_audio_set"
     );
+    // Who this call acts as for the record-relationship checks
+    // (`record_authz.rs`), resolved once per call.
+    let record_actor = record_actor_for(home_dir, caller_client_id, default_agent);
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
         "web_search" => handle_web_search(&arguments, http).await,
@@ -272,11 +275,11 @@ pub(crate) async fn handle_tools_call(
         "send_sticker" => handle_send_media(&arguments, home_dir, http, "sticker").await,
         "schedule_task" => handle_schedule_task(&arguments, home_dir, default_agent).await,
         "list_cron_tasks" => handle_list_cron_tasks(&arguments, home_dir, default_agent).await,
-        "update_cron_task" => handle_update_cron_task(&arguments, home_dir).await,
-        "delete_cron_task" => handle_delete_cron_task(&arguments, home_dir).await,
-        "pause_cron_task" => handle_pause_cron_task(&arguments, home_dir).await,
-        "run_cron_task" => handle_run_cron_task(&arguments, home_dir).await,
-        "create_reminder" => handle_create_reminder(&arguments, home_dir, default_agent).await,
+        "update_cron_task" => handle_update_cron_task(&arguments, home_dir, record_actor).await,
+        "delete_cron_task" => handle_delete_cron_task(&arguments, home_dir, record_actor).await,
+        "pause_cron_task" => handle_pause_cron_task(&arguments, home_dir, record_actor).await,
+        "run_cron_task" => handle_run_cron_task(&arguments, home_dir, record_actor).await,
+        "create_reminder" => handle_create_reminder(&arguments, home_dir, record_actor).await,
         "list_reminders" => handle_list_reminders(&arguments, home_dir, default_agent).await,
         "cancel_reminder" => handle_cancel_reminder(&arguments, home_dir, default_agent).await,
         // The org gates and the removed-name reservation judge the agent the
@@ -293,7 +296,7 @@ pub(crate) async fn handle_tools_call(
         "agent_status" => handle_agent_status(&arguments, home_dir, default_agent).await,
         "spawn_agent" => handle_spawn_agent(&arguments, home_dir, default_agent).await,
         "spawn_ephemeral" => handle_spawn_ephemeral(&arguments, home_dir, default_agent).await,
-        "agent_update" => handle_agent_update(&arguments, home_dir, default_agent).await,
+        "agent_update" => handle_agent_update(&arguments, home_dir, record_actor).await,
         "agent_remove" => {
             handle_agent_remove(&arguments, home_dir, acting_agent_id(caller_client_id, default_agent))
                 .await
@@ -449,14 +452,14 @@ pub(crate) async fn handle_tools_call(
         "session_restore_context" => handle_session_restore_context(&arguments).await,
         // Task Board tools
         "tasks_list" => handle_tasks_list(&arguments, home_dir, default_agent).await,
-        "tasks_create" => handle_tasks_create(&arguments, home_dir, default_agent).await,
+        "tasks_create" => handle_tasks_create(&arguments, home_dir, record_actor).await,
         "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact" | "discovery_cancel" =>
             handle_discovery_query(tool_name, &arguments, home_dir, default_agent).await,
-        "tasks_update" => handle_tasks_update(&arguments, home_dir, default_agent).await,
-        "tasks_claim" => handle_tasks_claim(&arguments, home_dir, default_agent).await,
+        "tasks_update" => handle_tasks_update(&arguments, home_dir, record_actor).await,
+        "tasks_claim" => handle_tasks_claim(&arguments, home_dir, record_actor).await,
         "tasks_renew" => handle_tasks_renew(&arguments, home_dir, default_agent).await,
-        "tasks_complete" => handle_tasks_complete(&arguments, home_dir, default_agent).await,
-        "tasks_block" => handle_tasks_block(&arguments, home_dir, default_agent).await,
+        "tasks_complete" => handle_tasks_complete(&arguments, home_dir, record_actor).await,
+        "tasks_block" => handle_tasks_block(&arguments, home_dir, record_actor).await,
         // Goal chain tools (G8)
         "goals_create" => handle_goals_create(&arguments, home_dir, default_agent).await,
         "goals_list" => handle_goals_list(&arguments, home_dir).await,
@@ -464,7 +467,7 @@ pub(crate) async fn handle_tools_call(
         "plan_get" => handle_plan_get(&arguments, home_dir, default_agent).await,
         "plan_update_step" => handle_plan_update_step(&arguments, home_dir, default_agent).await,
         // Activity Feed tools
-        "activity_post" => handle_activity_post(&arguments, home_dir, default_agent).await,
+        "activity_post" => handle_activity_post(&arguments, home_dir, record_actor).await,
         "activity_list" => handle_activity_list(&arguments, home_dir, default_agent).await,
         // Autopilot tools
         "autopilot_list" => handle_autopilot_list(&arguments, home_dir).await,

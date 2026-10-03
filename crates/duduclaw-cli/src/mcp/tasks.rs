@@ -133,7 +133,17 @@ pub(crate) async fn handle_tasks_list(args: &Value, home_dir: &Path, default_age
 /// runs — that is the point of merging the entry points: a caller can no
 /// longer launder a cross-department assignment through whichever of the four
 /// old tools happened to check least.
-pub(crate) async fn handle_tasks_create(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+pub(crate) async fn handle_tasks_create(
+    args: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
+    // The one identity this call acts as: checked by every gate and stamped
+    // as `created_by` / activity author.
+    let default_agent = actor.id();
+    if let Err(reason) = check_actor_identity(home_dir, actor, "", "tasks_create") {
+        return tool_error(&reason);
+    }
     let kind = match crate::mcp_alias::resolve_task_kind(args) {
         Ok(k) => k,
         Err(e) => return tool_error(&e),
@@ -199,6 +209,16 @@ pub(crate) async fn handle_tasks_create(args: &Value, home_dir: &Path, default_a
     }
     if !is_valid_agent_id(default_agent) {
         return tool_error("invalid caller agent id");
+    }
+    // Reserved control tags (`outcome:` / `grant:` / `auto-research`) are
+    // only ever written by the server itself — `goal_create_core` builds the
+    // `outcome:` tag from the `outcome` argument — never taken from a caller.
+    if let Some(tags) = args.get("tags").and_then(|v| v.as_str()) {
+        if let Err(refusal) =
+            check_no_reserved_tags(home_dir, actor, "tasks_create", &assigned_to, tags)
+        {
+            return refusal;
+        }
     }
     // ── WP21 C3: department × hierarchy delegation gate ────────
     // Assigning to yourself never invokes the predicate (self-delegation is a
@@ -327,7 +347,7 @@ pub(crate) async fn handle_tasks_create(args: &Value, home_dir: &Path, default_a
                     "channel": args.get("notify_channel"),
                     "chat_id": args.get("notify_chat_id"),
                 });
-                handle_create_reminder(&synth, home_dir, default_agent).await
+                handle_create_reminder(&synth, home_dir, actor).await
             }
         };
     }
@@ -466,7 +486,93 @@ pub(crate) async fn handle_tasks_create(args: &Value, home_dir: &Path, default_a
     tool_text(&serde_json::json!({ "task": task_row_to_json(&row) }).to_string())
 }
 
-pub(crate) async fn handle_tasks_update(args: &Value, home_dir: &Path, caller: &str) -> Value {
+/// The `tasks_update` checks that apply only to an AI-employee caller
+/// (operators pass). Each refusal rejects the whole call and is audited.
+///
+/// - Record relationship: a caller that is not the task's `assigned_to`,
+///   `claimed_by` or `created_by` must pass [`check_record_change_allowed`]
+///   against the current `assigned_to`; taking somebody else's task for
+///   yourself (`assigned_to` = caller) needs that relationship whoever created
+///   the task.
+/// - Goal text freeze: on a goal_mode task `title` / `description` are the
+///   goal the judge reads, frozen like `acceptance_criteria`.
+/// - Reserved control tags (`outcome:` / `grant:` / `auto-research`, see
+///   [`is_reserved_task_tag`]) must stay exactly as they are, in order.
+pub(crate) async fn check_task_update_by_employee(
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+    current: &duduclaw_gateway::task_store::TaskRow,
+    args: &Value,
+) -> std::result::Result<(), Value> {
+    let Some(me) = actor.agent() else {
+        return Ok(());
+    };
+    let task_id = current.id.as_str();
+    let owner = current.assigned_to.as_str();
+    check_actor_identity(home_dir, actor, owner, "tasks_update").map_err(|r| tool_error(&r))?;
+    let is_party =
+        owner == me || current.claimed_by.as_deref() == Some(me) || current.created_by == me;
+    let takes_for_self = args
+        .get("assigned_to")
+        .and_then(|v| v.as_str())
+        .is_some_and(|new_owner| new_owner.trim() == me && !owner.is_empty() && owner != me);
+    if !is_party || takes_for_self {
+        check_record_change_allowed(home_dir, actor, owner, "tasks_update", RecordKind::Task)
+            .await
+            .map_err(|r| tool_error(&r))?;
+    }
+    if current.goal_mode {
+        if let Some(field) = ["title", "description"].into_iter().find(|f| args.get(*f).is_some()) {
+            audit_record_refused(
+                home_dir,
+                me,
+                "tasks_update",
+                owner,
+                "goal_contract_frozen",
+                &[
+                    ("task_id", serde_json::json!(task_id)),
+                    ("field", serde_json::json!(field)),
+                ],
+            );
+            return Err(tool_error(&format!(
+                "{field} on a goal_mode task is the goal the judge reads and is frozen at \
+                 creation time; only an operator can change it, from the dashboard — not via this tool"
+            )));
+        }
+    }
+    // The store applies `tags` only as a string, so any other shape changes
+    // nothing and is not compared.
+    if let Some(new_tags) = args.get("tags").and_then(|v| v.as_str()) {
+        let before = reserved_task_tags(&current.tags);
+        let after = reserved_task_tags(new_tags);
+        if before != after {
+            audit_record_refused(
+                home_dir,
+                me,
+                "tasks_update",
+                owner,
+                "reserved_tag_change",
+                &[
+                    ("task_id", serde_json::json!(task_id)),
+                    ("before", serde_json::json!(before)),
+                    ("after", serde_json::json!(after)),
+                ],
+            );
+            return Err(tool_error(RESERVED_TAG_REFUSAL));
+        }
+    }
+    Ok(())
+}
+
+/// Update a task board row. An AI-employee caller additionally passes
+/// [`check_task_update_by_employee`]; the acceptance-criteria freeze applies
+/// to every MCP caller.
+pub(crate) async fn handle_tasks_update(
+    args: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
+    let caller = actor.id();
     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
     if task_id.is_empty() {
         return tool_error("task_id is required");
@@ -474,6 +580,13 @@ pub(crate) async fn handle_tasks_update(args: &Value, home_dir: &Path, caller: &
     let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    // Every gate below judges the row as it is now; an unreadable row is
+    // refused rather than updated blind.
+    let current = match store.get_task(task_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return tool_error(&format!("task not found: {task_id}")),
+        Err(e) => return tool_error(&format!("update task: {e}")),
     };
     // ── H9-G goal contract freeze (harness-borrowings 2026-08 WP-D) ──────
     // An agent-identity caller may never modify the acceptance criteria of a
@@ -485,34 +598,28 @@ pub(crate) async fn handle_tasks_update(args: &Value, home_dir: &Path, caller: &
     // `fields` so the whole call fails closed (never silently drops just
     // this one key and proceeds with the rest) — same fail-closed posture as
     // every other security gate in this file (coding convention 4).
-    if args.get("acceptance_criteria").is_some() {
-        let target_is_goal_mode = store
-            .get_task(task_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|t| t.goal_mode)
-            .unwrap_or(false);
-        if target_is_goal_mode {
-            duduclaw_security::audit::append_tool_call_with_extras(
-                home_dir,
-                caller,
-                "tasks_update",
-                &format!(
-                    "denied: agent attempted to modify frozen acceptance_criteria on goal_mode task {task_id}"
-                ),
-                false,
-                &[
-                    ("task_id", serde_json::json!(task_id)),
-                    ("field", serde_json::json!("acceptance_criteria")),
-                    ("reason", serde_json::json!("goal_contract_frozen")),
-                ],
-            );
-            return tool_error(
-                "acceptance_criteria on a goal_mode task is frozen at creation time; only an \
-                 operator can change it, from the dashboard — not via this tool",
-            );
-        }
+    if args.get("acceptance_criteria").is_some() && current.goal_mode {
+        duduclaw_security::audit::append_tool_call_with_extras(
+            home_dir,
+            caller,
+            "tasks_update",
+            &format!(
+                "denied: agent attempted to modify frozen acceptance_criteria on goal_mode task {task_id}"
+            ),
+            false,
+            &[
+                ("task_id", serde_json::json!(task_id)),
+                ("field", serde_json::json!("acceptance_criteria")),
+                ("reason", serde_json::json!("goal_contract_frozen")),
+            ],
+        );
+        return tool_error(
+            "acceptance_criteria on a goal_mode task is frozen at creation time; only an \
+             operator can change it, from the dashboard — not via this tool",
+        );
+    }
+    if let Err(refusal) = check_task_update_by_employee(home_dir, actor, &current, args).await {
+        return refusal;
     }
     // Build fields map — only pass through allowed fields
     let mut fields = serde_json::Map::new();
@@ -583,7 +690,18 @@ pub(crate) async fn handle_tasks_update(args: &Value, home_dir: &Path, caller: &
     tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
 }
 
-pub(crate) async fn handle_tasks_claim(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+/// Claim a task board row.
+///
+/// An unassigned task, or one assigned to the caller, claims exactly as
+/// before. A task assigned to another employee is that employee's record:
+/// claiming it needs [`check_record_change_allowed`] against the assignee,
+/// checked before the atomic claim so a refused caller never holds the lease.
+pub(crate) async fn handle_tasks_claim(
+    args: &Value,
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+) -> Value {
+    let default_agent = actor.id();
     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
     if task_id.is_empty() {
         return tool_error("task_id is required");
@@ -595,6 +713,30 @@ pub(crate) async fn handle_tasks_claim(args: &Value, home_dir: &Path, default_ag
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
     };
+    if let Some(me) = actor.agent() {
+        match store.get_task(task_id).await {
+            Ok(Some(t)) => {
+                if let Err(reason) = check_actor_identity(home_dir, actor, &t.assigned_to, "tasks_claim") {
+                    return tool_error(&reason);
+                }
+                if !t.assigned_to.is_empty() && t.assigned_to != me {
+                    if let Err(reason) = check_record_change_allowed(
+                        home_dir,
+                        actor,
+                        &t.assigned_to,
+                        "tasks_claim",
+                        RecordKind::Task,
+                    )
+                    .await
+                    {
+                        return tool_error(&reason);
+                    }
+                }
+            }
+            Ok(None) => return tool_error(&format!("task not found: {task_id}")),
+            Err(e) => return tool_error(&format!("claim task: {e}")),
+        }
+    }
 
     // G1 durable claim: try the atomic compare-and-set first (only one worker
     // can win a `pending` task, and the claim stamps a lease so a crashed worker

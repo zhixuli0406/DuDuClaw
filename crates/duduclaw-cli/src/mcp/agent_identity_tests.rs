@@ -417,3 +417,82 @@ async fn strict_mode_unverified_claim_is_denied_even_with_flag_set() {
 
     assert_eq!(result.get("isError").and_then(|v| v.as_bool()), Some(true));
 }
+
+// ── System-sender names are never a process identity ─────────────────────
+
+/// A self-asserted `DUDUCLAW_AGENT_ID=dashboard` (or `cron`, …) would inherit
+/// the system senders' unconditional delegation reach; no gateway spawn path
+/// ever stamps one, so it resolves to the untrusted sentinel.
+#[tokio::test(flavor = "current_thread")]
+async fn system_sender_name_as_identity_is_untrusted() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let tmp = TempDir::new();
+    write_default_agent_config(tmp.path(), "agnes");
+
+    for sender in duduclaw_core::SYSTEM_SENDERS {
+        set_claim(sender, "");
+        let result = get_default_agent(tmp.path()).await;
+        clear_claim();
+        assert_eq!(result, duduclaw_core::UNTRUSTED_AGENT_ID, "{sender}");
+    }
+
+    // The config fallback is held to the same rule.
+    write_default_agent_config(tmp.path(), "cron");
+    clear_claim();
+    let result = get_default_agent(tmp.path()).await;
+    assert_eq!(result, duduclaw_core::UNTRUSTED_AGENT_ID);
+
+    // An ordinary id is unaffected.
+    set_claim("sales-rep", "");
+    let result = get_default_agent(tmp.path()).await;
+    clear_claim();
+    assert_eq!(result, "sales-rep");
+}
+
+/// Rows of `tool_calls.jsonl` recording a refused system-sender identity.
+fn identity_refusals(home: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(home.join("tool_calls.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|r| r["reason"] == "system_sender_identity")
+        .collect()
+}
+
+/// Replacing a claimed system-sender name with the sentinel must leave a
+/// trace of WHAT was claimed and WHERE it came from — everything downstream
+/// only ever sees `__untrusted__`. Once per process per home: the resolver
+/// runs several times in one process.
+#[tokio::test(flavor = "current_thread")]
+async fn system_sender_identity_refusal_is_audited_once_with_claim_and_source() {
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    let env_home = TempDir::new();
+    write_default_agent_config(env_home.path(), "agnes");
+    set_claim("heartbeat", "");
+    let first = get_default_agent(env_home.path()).await;
+    let second = get_default_agent(env_home.path()).await;
+    clear_claim();
+    assert_eq!(first, duduclaw_core::UNTRUSTED_AGENT_ID);
+    assert_eq!(second, duduclaw_core::UNTRUSTED_AGENT_ID);
+    let rows = identity_refusals(env_home.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["claimed"], "heartbeat");
+    assert_eq!(rows[0]["source"], "env");
+
+    let cfg_home = TempDir::new();
+    write_default_agent_config(cfg_home.path(), "autopilot");
+    clear_claim();
+    let _ = get_default_agent(cfg_home.path()).await;
+    let _ = get_default_agent(cfg_home.path()).await;
+    let rows = identity_refusals(cfg_home.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["claimed"], "autopilot");
+    assert_eq!(rows[0]["source"], "config");
+
+    // An ordinary identity leaves no such row.
+    let ok_home = TempDir::new();
+    write_default_agent_config(ok_home.path(), "agnes");
+    let _ = get_default_agent(ok_home.path()).await;
+    assert!(identity_refusals(ok_home.path()).is_empty());
+}

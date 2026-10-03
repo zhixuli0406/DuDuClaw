@@ -1,4 +1,5 @@
 use super::*;
+use crate::mcp::caller_shims::handle_agent_update;
 
 /// A system/human-interface caller (dashboard, ...) has no place of its
 /// own in the org tree, so an omitted `reports_to` must still default to
@@ -86,11 +87,11 @@ skill_security_scan = false
 }
 
 #[tokio::test]
-async fn agent_update_reports_to_unrestricted_for_system_sender_and_open_policy() {
+async fn agent_update_reports_to_operator_and_open_policy_but_never_self() {
     let tmp = delegation_home();
     let home = tmp.path();
 
-    // Human interface (dashboard RPC identity) is not gated.
+    // An operator (the shim maps the human-interface id to one) is not gated.
     let params = serde_json::json!({ "agent_id": "mkt-rep", "reports_to": "ceo" });
     let res = handle_agent_update(&params, home, "dashboard").await;
     assert_ne!(res["isError"], true, "{res}");
@@ -101,9 +102,15 @@ async fn agent_update_reports_to_unrestricted_for_system_sender_and_open_policy(
         "[delegation]\npolicy = \"open\"\n",
     )
     .unwrap();
+    // Under `open` another team's agent may be re-parented...
+    let params = serde_json::json!({ "agent_id": "mkt-rep", "reports_to": "sales-lead" });
+    let res = handle_agent_update(&params, home, "sales-lead").await;
+    assert_ne!(res["isError"], true, "{res}");
+    // ...but an employee still cannot re-parent itself: `reports_to` is an
+    // authority field and the self-edit guard is policy-independent.
     let params = serde_json::json!({ "agent_id": "sales-rep", "reports_to": "ceo" });
     let res = handle_agent_update(&params, home, "sales-rep").await;
-    assert_ne!(res["isError"], true, "{res}");
+    assert_eq!(res["isError"], true, "{res}");
 }
 
 #[tokio::test]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::mcp::caller_shims::handle_agent_update;
 
 /// `hierarchy` drops the department shortcut but keeps the ancestor chain.
 #[tokio::test]

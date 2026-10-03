@@ -1,4 +1,7 @@
 use super::*;
+use crate::mcp::caller_shims::{
+    handle_tasks_claim, handle_tasks_complete, handle_tasks_create, handle_tasks_update,
+};
 
 #[tokio::test(flavor = "current_thread")]
 async fn shared_skill_share_then_list_then_adopt() {
@@ -529,9 +532,10 @@ async fn tasks_update_on_a_non_goal_mode_task_leaves_acceptance_criteria_unsuppo
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn tasks_update_still_allows_other_fields_on_a_goal_mode_task() {
-    // The gate is scoped to the `acceptance_criteria` key only — title/
-    // description/priority/tags/depends_on remain agent-editable.
+async fn tasks_update_goal_mode_freezes_goal_text_but_allows_other_fields() {
+    // The contract freeze covers `acceptance_criteria`, `title` and
+    // `description` (the goal text the judge reads); priority / ordinary
+    // tags / depends_on remain agent-editable.
     let tmp = TempDir::new();
     let create = handle_tasks_create(
         &serde_json::json!({
@@ -548,14 +552,23 @@ async fn tasks_update_still_allows_other_fields_on_a_goal_mode_task() {
         .unwrap()
         .to_string();
 
-    let result = handle_tasks_update(
+    let renamed = handle_tasks_update(
         &serde_json::json!({ "task_id": id, "title": "Renamed goal task" }),
         tmp.path(),
         "agnes",
     )
     .await;
+    assert_eq!(renamed["isError"], true, "{renamed}");
+
+    let result = handle_tasks_update(
+        &serde_json::json!({ "task_id": id, "priority": "high" }),
+        tmp.path(),
+        "agnes",
+    )
+    .await;
     let updated = parse_ok(&result);
-    assert_eq!(updated["task"]["title"], "Renamed goal task");
+    assert_eq!(updated["task"]["priority"], "high");
+    assert_eq!(updated["task"]["title"], "Goal task");
     assert_eq!(
         updated["task"]["acceptance_criteria"],
         "must ship the report"
