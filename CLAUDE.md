@@ -1,5 +1,15 @@
 # DuDuClaw Project Guidelines
 
+## Highest directive: every new feature and every fix gets its own branch
+
+Owner instruction, 2026-10-03: 「每次有新功能與修復時都開分支」. It outranks every other workflow rule in this file.
+
+- Before starting a feature or a fix, create a branch from the latest `origin/main` (`feat/…`, `fix/…`, `docs/…`, `chore/…`). Feature and fix commits never go on `main` directly.
+- The change reaches `main` through a pull request. `main` requires four checks on a PR merge: Rust ubuntu-latest, Rust macos-latest, Dashboard, Python.
+- When another session is using the main checkout, work in a separate `git worktree` instead of switching branches there.
+- When several open PRs touch the same files, merge them in the order the owner gives; the later one rebases.
+- Opening a branch is not permission to merge or release. Merging a PR and cutting a release stay the owner's decision.
+
 ## Architecture Overview (v1.68.0)
 
 ### v1.68.0 (unreleased): dashboard switches, dead fields wired or removed, memory namespace unification
