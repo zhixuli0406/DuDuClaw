@@ -181,7 +181,7 @@ These saved a value that nothing read, so an operator could believe a protection
 
 Related hardening in the same release: changes to `acp.trusted`, `tick.allow_command_sources`, `container.sandbox.when_unavailable`, `container.sandbox.script_when_unavailable` and `memory.supersession_trust_guard` are audited as `config_protected_key_changed`; `system.update_config`, `tick.sources.*` and the new raw config editor (`config.raw.set`, admin-only, secrets masked as `«set»`, backup before write, audited as `config_raw_edited`) refuse to rewrite a `config.toml` that does not parse and refuse a write when the file changed since it was read.
 
-### AI employees could change other employees' records (fixed after v1.68.1, unreleased)
+### AI employees could change other employees' records (fixed in v1.69.0)
 
 **Released versions are affected.** Creating a task or a routine already ran the delegation predicate, but the tools that change or fire an existing record did not: an AI employee could rewrite or close another department's task, pause, delete, edit or run another employee's cron row, and file a reminder that wakes another employee with its own prompt. Now `tasks_update`, `tasks_claim`, `tasks_complete`, `tasks_block`, `activity_post` with a `task_id`, `update_cron_task`, `delete_cron_task`, `pause_cron_task`, `run_cron_task` and `create_reminder` check the caller against the record's owner (`duduclaw-cli/src/mcp/record_authz.rs`):
 
@@ -194,7 +194,7 @@ These tools act as the employee the calling key maps to. The shared internal key
 
 Same change: on a `goal_mode` task `title` and `description` are frozen for AI employees like `acceptance_criteria`; an AI employee cannot add, remove or reorder the control tags (`outcome:…`, `grant:…`, `auto-research`) through `tasks_update` or pass them to `tasks_create` (the `outcome:` tag that `kind = "goal"` builds server-side is unaffected); `agent_update` refuses an employee changing its own `reports_to`, `db_sources` / `db_sources_add` / `db_sources_remove`, `budget_cents` or `role` (audited as `agent_authority_refused`; editing a subordinate is unchanged); and cron tools addressed by `name` act on exactly one row, refusing an ambiguous name with the candidate ids (before, `delete_cron_task` and `pause_cron_task` acted on every row with that name).
 
-### Employees could write DuDuClaw home state and their own security settings (fixed after v1.68.1, unreleased)
+### Employees could write DuDuClaw home state and their own security settings (fixed in v1.69.0)
 
 **Released versions are affected.** The `agent-file-guard` hook only protected agent-structure files and other employees' directories, so an AI employee with Write/Edit or Bash could change files the platform treats as evidence or authority: the audit log the grounding check and judge digest read, eval suites including held-out sets, SQLite stores, breaker state, licence and org files, global skills and the shared wiki. It could also edit the sections of its own `agent.toml` that security checks read. Changes:
 
