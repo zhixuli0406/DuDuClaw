@@ -464,6 +464,31 @@ Three things to know before switching to API-key mode:
 - Two gateways running under one OS user with different `auth` values overwrite each other's value.
 - To go back to Google sign-in after using `api_key`, set `auth = "login"` explicitly. Removing the `auth` line is not enough: with no setting the gateway does not touch `modelProvider`, so the `"gemini"` value written earlier stays in agy's settings, and the gateway only logs a reminder. In `login` mode the gateway does not pass `GEMINI_API_KEY` / `GOOGLE_API_KEY` to agy or the commands it runs; in `api_key` mode the agent's shell can read the key (agy has to receive it through the environment).
 
+### Antigravity tool permissions (unreleased, after v1.69.0)
+
+In print mode, `agy` 1.2.16 refuses every confirmation it cannot ask a human about, and calling an MCP tool needs one. Until this fix an Antigravity employee at the default capability level (which runs with `--sandbox`) could not use any platform tool; only the full-access level, which passes `--dangerously-skip-permissions`, could. The defect dates from v1.67.0 and was found on 2026-10-04 with a real Gemini API key.
+
+Each time it runs an Antigravity turn, the gateway already adds the working root to `trustedWorkspaces` in agy's user-level `~/.gemini/antigravity-cli/settings.json`. The same locked write now also adds two rules to `permissions.allow`:
+
+- `mcp(duduclaw/*)` allows every tool of the MCP server registered under the name `duduclaw`.
+- `read_file(<HOME>/.gemini/antigravity-cli/mcp/duduclaw)` allows reading that server's tool description files. agy loads MCP tools lazily, and the model reads the description file before each call; in print mode that read is refused too. When `HOME` resolves to a different path (for example `/var` and `/private/var` on macOS), both spellings are written.
+
+The gateway adds no rule for shell commands, file writes or URLs, and the command-line flags are unchanged, so the default level still runs with `--sandbox`. In a test with agy 1.2.16 and a real Gemini API key, an employee at the default level could call DuDuClaw tools, while a shell command and a write outside the workspace in the same turn were still refused, and so were a path-traversal read and a read through a symbolic link that points outside the directory. Combining `--sandbox` with an auto-approve-everything flag was not adopted, because it let the file-write tool write outside the workspace.
+
+Operator rules are kept: existing `allow`, `deny` and `ask` entries stay as they are. If `permissions` is not an object, or `allow` is not an array, the gateway leaves it untouched and logs a warning; the workspace trust and `modelProvider` are still written, and a failed run says in its error that the rules could not be added. If the home path contains `(`, `)`, `,`, `*` or a line break, or is not valid UTF-8, the `read_file` rule is skipped with a warning and only `mcp(duduclaw/*)` is written.
+
+**Read-only level.** Because the rules live in a user-level file, they cannot depend on an employee's capability level. A read-only Antigravity employee therefore gets the same two rules and can call platform tools too; the MCP server's own `allowed_tools`, `denied_tools` and approval lists decide what it may do. This matches the Claude runtime. It differs from Codex, where every MCP tool call is rejected at the read-only level (see the table above).
+
+**Side effects to know about.**
+
+- The rules sit in the settings file that every `agy` of the OS user shares. When you use `agy` interactively in a terminal, calls to tools of an MCP server named `duduclaw` and reads of that schema directory are also approved without asking.
+- The rules are only ever added. After you remove an employee, uninstall DuDuClaw or stop using Antigravity, they stay in the file, as `trustedWorkspaces` entries already do. To remove them, edit `~/.gemini/antigravity-cli/settings.json` and delete the two entries from `permissions.allow`.
+- Two gateways under one OS user write the same rules, so they do not overwrite each other with different content.
+
+**Errors.** When agy refuses a tool, the gateway's error now names the refused tool and includes agy's own error text, with the key redacted before the text is truncated. If agy reports success but the reply is empty and a tool was refused, the run is an error; before, the raw result JSON became the employee's answer. A normal reply with a refused tool is kept and logged as a warning.
+
+**Not yet verified.** The end-to-end test with a real key has not been rerun since the last change to this code. It has not been run on Linux, inside a Docker container or on Windows. Two Antigravity problems are known and not addressed: agy can report a failure after it retried a 503 successfully, and the gateway then treats a complete reply as failed; and after an Antigravity failure, cross-vendor failover may switch to Claude.
+
 ### Antigravity stream parsing degrades instead of failing (2026-09-28)
 
 The `agy --output-format stream-json` decoder used to be strict in six

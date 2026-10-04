@@ -361,6 +361,31 @@ Codex spawn 透過每次呼叫的 `-c` 設定覆寫來註冊 duduclaw MCP server
 - 同一個使用者底下跑兩個 gateway、`auth` 設成不同值時，兩邊會互相覆蓋這個欄位。
 - 用過 `api_key` 之後要回到 Google 登入，請明確寫 `auth = "login"`。只刪掉 `auth` 這一行不夠：沒有設定時 gateway 不動 `modelProvider`，先前寫入的 `"gemini"` 會留在 agy 的設定裡，gateway 只會在紀錄裡提醒。`login` 模式下，gateway 不會把 `GEMINI_API_KEY`／`GOOGLE_API_KEY` 傳給 agy 與它執行的指令；`api_key` 模式下，員工的 shell 讀得到這把金鑰（agy 必須從環境變數取得它）。
 
+### Antigravity 的工具權限（尚未發布，v1.69.0 之後）
+
+`agy` 1.2.16 在 print mode 會自動拒絕所有無法詢問人類的確認，而呼叫 MCP 工具需要一次確認。這個修正之前，預設能力等級（帶 `--sandbox`）的 Antigravity 員工用不了任何平台工具，只有傳入 `--dangerously-skip-permissions` 的完全放行等級可以。這個缺陷從 v1.67.0 就存在，2026-10-04 用真的 Gemini API key 驗證時才發現。
+
+閘道每次執行 Antigravity 回合時，本來就會把工作根目錄寫進 agy 使用者層設定檔 `~/.gemini/antigravity-cli/settings.json` 的 `trustedWorkspaces`。同一次加鎖寫入現在也會在 `permissions.allow` 補上兩條規則：
+
+- `mcp(duduclaw/*)` 放行名為 `duduclaw` 的 MCP 伺服器的所有工具。
+- `read_file(<HOME>/.gemini/antigravity-cli/mcp/duduclaw)` 放行讀取該伺服器的工具說明檔。agy 的 MCP 工具是延後載入的，模型每次呼叫前要先讀說明檔，這個讀取在 print mode 同樣會被拒。`HOME` 正規化後路徑不同時（例如 macOS 的 `/var` 與 `/private/var`），兩種寫法都會寫入。
+
+閘道不加任何終端機指令、寫檔或網址的規則，命令列旗標也沒有改，所以預設等級仍是 `--sandbox`。以 agy 1.2.16 與真的 Gemini API key 實測：預設等級的員工可以呼叫 DuDuClaw 工具；同一輪的終端機指令與寫到工作區以外的檔案仍被拒絕，路徑穿越的讀取與透過指向目錄外的符號連結的讀取也被拒絕。把 `--sandbox` 與「全部自動核准」旗標合用會讓寫檔工具寫到工作區以外，所以沒有採用。
+
+操作者的規則會保留：既有的 `allow`、`deny`、`ask` 項目原樣不動。`permissions` 不是物件、或 `allow` 不是陣列時，閘道不改寫它並記一筆警告；工作區信任與 `modelProvider` 照寫，執行失敗時錯誤訊息會說明規則寫不進去。HOME 路徑含 `(`、`)`、`,`、`*` 或換行，或不是合法 UTF-8 時，會略過 `read_file` 規則並記警告，只寫 `mcp(duduclaw/*)`。
+
+**唯讀等級。** 這兩條規則寫在使用者層設定檔，無法依員工的能力等級區分，所以唯讀的 Antigravity 員工拿到同樣兩條規則，也可以呼叫平台工具；它能做什麼由 MCP 伺服器自己的 `allowed_tools`、`denied_tools` 與審批清單決定。這與 Claude runtime 相同，與 Codex 不同：Codex 在唯讀等級下所有 MCP 工具呼叫都會被拒（見上方表格）。
+
+**要知道的副作用。**
+
+- 規則寫在該作業系統使用者所有 `agy` 共用的設定檔裡。你自己在終端機互動使用 `agy` 時，名為 `duduclaw` 的 MCP 伺服器的工具呼叫與那個說明檔目錄的讀取，也會自動放行而不詢問。
+- 規則只增不減。移除員工、解除安裝 DuDuClaw 或不再使用 Antigravity 之後，規則會留在檔案裡，`trustedWorkspaces` 的項目原本就是這樣。要移除，編輯 `~/.gemini/antigravity-cli/settings.json`，從 `permissions.allow` 刪掉這兩條。
+- 同一個作業系統使用者跑兩個閘道時，兩邊寫的規則相同，不會互相覆蓋成不同內容。
+
+**錯誤訊息。** agy 拒絕工具時，閘道回報的錯誤現在會指名被拒的工具，並附上 agy 自己的錯誤文字，金鑰在截斷之前先遮蔽。agy 回報成功、回覆卻是空的、而且有工具被拒時，這次執行判為錯誤；以前會把原始的結果 JSON 當成員工的回答。回覆正常但有工具被拒時，回覆保留並記一筆警告。
+
+**尚未驗證。** 最後一次修改這段程式之後，真金鑰的端對端測試還沒有重跑；也沒有在 Linux、Docker 容器內與 Windows 上測過。另有兩個已知的 Antigravity 問題這次沒有處理：agy 遇到 503 重試成功後仍可能回報失敗，閘道會把完整的回覆當成失敗；Antigravity 失敗後，跨廠商容錯可能改用 Claude。
+
 ### Antigravity 串流解析改為降級而非失敗（2026-09-28）
 
 `agy --output-format stream-json` 的解碼器以前在六個獨立的地方都很嚴格：一行無法解析、缺少 `result` 事件、缺少 `response` 欄位，或 `usage` 區塊少一個整數，整次執行就變成錯誤。已經*回答完畢*的 `agy` 被回報成 spawn 失敗，角色成員也跟著丟了。

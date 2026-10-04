@@ -208,6 +208,23 @@ Same change: on a `goal_mode` task `title` and `description` are frozen for AI e
 
 Known limits. The Bash lane is a speed bump that reads command text and cannot see computed paths (nor where an extraction or download with no explicit destination writes after a change of directory), so real containment is still not granting Bash; it also refuses a judged path that cannot be resolved, a dangling link included, even outside the home; `Read` is not covered, only the Claude runtime runs the hook, state files in an employee's own directory are not protected and `attachments/` is shared. The full list is in [docs/features/05-security-defense.md](docs/features/05-security-defense.md#what-these-guards-do-not-cover).
 
+### Antigravity: allow rules the gateway writes into the operator's agy settings (unreleased, after v1.69.0)
+
+This is a change in what the gateway writes, not a fixed vulnerability. In print mode `agy` 1.2.16 refuses every tool confirmation it cannot ask a human about, so an Antigravity employee at the default permission level could not call any DuDuClaw MCP tool. To make those calls work, each time the gateway runs an Antigravity turn it adds two entries to `permissions.allow` in the operator's user-level `~/.gemini/antigravity-cli/settings.json`, in the same locked write that already adds the workspace to `trustedWorkspaces`:
+
+- `mcp(duduclaw/*)`, which approves every tool of the MCP server registered under the name `duduclaw`;
+- `read_file(<HOME>/.gemini/antigravity-cli/mcp/duduclaw)`, which approves reading that server's tool description files (agy loads MCP tools lazily and the model reads the description first). When `HOME` canonicalizes to another path, both spellings are written.
+
+What is not written: no rule for shell commands, file writes or URLs, and no change to the command-line flags (the default level still runs with `--sandbox`). The operator's own `allow`, `deny` and `ask` rules are kept. A `permissions` value that is not an object, or an `allow` that is not an array, is left untouched with a warning. A home path containing `(`, `)`, `,`, `*` or a line break, or that is not valid UTF-8, gets no `read_file` rule. In a test with agy 1.2.16 and a real Gemini API key, a shell command and a write outside the workspace in the same turn were still refused, as were a path-traversal read and a read through a symbolic link that points outside the directory.
+
+What the operator should know:
+
+- The file is shared by every `agy` of the OS user. When you use `agy` interactively in a terminal, calls to tools of an MCP server named `duduclaw`, and reads of that schema directory, are approved without asking.
+- A read-only Antigravity employee gets the same rules, because a user-level file cannot depend on an employee's capability level. What such an employee may do with platform tools is decided by the MCP server's `allowed_tools`, `denied_tools` and approval lists, as for the Claude runtime. Codex differs: at its read-only level every MCP tool call is rejected.
+- The rules are only added, never removed. They stay after you remove an employee or uninstall DuDuClaw. To remove them, edit `~/.gemini/antigravity-cli/settings.json` and delete the two entries from `permissions.allow`.
+
+Not yet verified: the end-to-end test with a real key has not been rerun since the last change to this code, and it has not been run on Linux, inside a Docker container or on Windows. See [docs/features/13-multi-runtime.md](docs/features/13-multi-runtime.md).
+
 ## Binary Distribution Security
 
 DuDuClaw binaries are:
