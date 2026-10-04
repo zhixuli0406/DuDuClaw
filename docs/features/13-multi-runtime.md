@@ -464,7 +464,7 @@ Three things to know before switching to API-key mode:
 - Two gateways running under one OS user with different `auth` values overwrite each other's value.
 - To go back to Google sign-in after using `api_key`, set `auth = "login"` explicitly. Removing the `auth` line is not enough: with no setting the gateway does not touch `modelProvider`, so the `"gemini"` value written earlier stays in agy's settings, and the gateway only logs a reminder. In `login` mode the gateway does not pass `GEMINI_API_KEY` / `GOOGLE_API_KEY` to agy or the commands it runs; in `api_key` mode the agent's shell can read the key (agy has to receive it through the environment).
 
-### Antigravity tool permissions (unreleased, after v1.69.0)
+### Antigravity tool permissions (v1.69.1)
 
 In print mode, `agy` 1.2.16 refuses every confirmation it cannot ask a human about, and calling an MCP tool needs one. Until this fix an Antigravity employee at the default capability level (which runs with `--sandbox`) could not use any platform tool; only the full-access level, which passes `--dangerously-skip-permissions`, could. The defect dates from v1.67.0 and was found on 2026-10-04 with a real Gemini API key.
 

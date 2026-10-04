@@ -179,7 +179,7 @@ v1.69.0 から **v1.70.0** に延期されました。後継は **Antigravity CL
 **延期の理由**: 当初告知した削除の前提条件は、Antigravity の API キーモードを実際の
 Gemini API キーで検証することでした。その検証で、既定の権限レベルの Antigravity 従業員
 がプラットフォームのツールを呼び出すと、Antigravity CLI 自身に拒否されることが分かり
-ました。修正は完了しており、次のリリースで出荷されます。gateway が、オペレーターの
+ました。修正は v1.69.1 に含まれます。gateway が、オペレーターの
 `~/.gemini/antigravity-cli/settings.json` に、`duduclaw` MCP サーバーを許可する 2 つの
 ルールを追加します（詳細は[マルチランタイム](../../features/ja-JP/13-multi-runtime.md)）。
 削除は引き続き v1.70.0 の予定で、その条件は、この修正の出荷後に実際の Gemini API キーで

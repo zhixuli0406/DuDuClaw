@@ -208,7 +208,7 @@ Same change: on a `goal_mode` task `title` and `description` are frozen for AI e
 
 Known limits. The Bash lane is a speed bump that reads command text and cannot see computed paths (nor where an extraction or download with no explicit destination writes after a change of directory), so real containment is still not granting Bash; it also refuses a judged path that cannot be resolved, a dangling link included, even outside the home; `Read` is not covered, only the Claude runtime runs the hook, state files in an employee's own directory are not protected and `attachments/` is shared. The full list is in [docs/features/05-security-defense.md](docs/features/05-security-defense.md#what-these-guards-do-not-cover).
 
-### Antigravity: allow rules the gateway writes into the operator's agy settings (unreleased, after v1.69.0)
+### Antigravity: allow rules the gateway writes into the operator's agy settings (v1.69.1)
 
 This is a change in what the gateway writes, not a fixed vulnerability. In print mode `agy` 1.2.16 refuses every tool confirmation it cannot ask a human about, so an Antigravity employee at the default permission level could not call any DuDuClaw MCP tool. To make those calls work, each time the gateway runs an Antigravity turn it adds two entries to `permissions.allow` in the operator's user-level `~/.gemini/antigravity-cli/settings.json`, in the same locked write that already adds the workspace to `trustedWorkspaces`:
 

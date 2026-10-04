@@ -183,8 +183,7 @@ from v1.69.0 to **v1.70.0**. Its replacement is the **Antigravity CLI runtime**
 **Why the date moved.** The announced precondition for removal was to verify
 Antigravity's API-key mode with a real Gemini API key. That verification found
 that an Antigravity employee at the default permission level is refused by the
-Antigravity CLI itself when it calls a platform tool. The fix is done and
-ships in the next release: the gateway adds two allow rules for the `duduclaw`
+Antigravity CLI itself when it calls a platform tool. The fix ships in v1.69.1: the gateway adds two allow rules for the `duduclaw`
 MCP server to the operator's `~/.gemini/antigravity-cli/settings.json`
 (details: [multi-runtime](../features/13-multi-runtime.md)). The removal stays
 scheduled for v1.70.0, on the condition that Antigravity is verified again with

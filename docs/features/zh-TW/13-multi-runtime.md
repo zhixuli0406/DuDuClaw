@@ -361,7 +361,7 @@ Codex spawn 透過每次呼叫的 `-c` 設定覆寫來註冊 duduclaw MCP server
 - 同一個使用者底下跑兩個 gateway、`auth` 設成不同值時，兩邊會互相覆蓋這個欄位。
 - 用過 `api_key` 之後要回到 Google 登入，請明確寫 `auth = "login"`。只刪掉 `auth` 這一行不夠：沒有設定時 gateway 不動 `modelProvider`，先前寫入的 `"gemini"` 會留在 agy 的設定裡，gateway 只會在紀錄裡提醒。`login` 模式下，gateway 不會把 `GEMINI_API_KEY`／`GOOGLE_API_KEY` 傳給 agy 與它執行的指令；`api_key` 模式下，員工的 shell 讀得到這把金鑰（agy 必須從環境變數取得它）。
 
-### Antigravity 的工具權限（尚未發布，v1.69.0 之後）
+### Antigravity 的工具權限（v1.69.1）
 
 `agy` 1.2.16 在 print mode 會自動拒絕所有無法詢問人類的確認，而呼叫 MCP 工具需要一次確認。這個修正之前，預設能力等級（帶 `--sandbox`）的 Antigravity 員工用不了任何平台工具，只有傳入 `--dangerously-skip-permissions` 的完全放行等級可以。這個缺陷從 v1.67.0 就存在，2026-10-04 用真的 Gemini API key 驗證時才發現。
 

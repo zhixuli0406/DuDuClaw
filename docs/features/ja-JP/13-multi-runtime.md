@@ -361,7 +361,7 @@ API key モードに切り替える前に知っておくこと：
 - 同じ OS ユーザーで 2 つの gateway を動かし、`auth` に異なる値を設定すると、互いにこの項目を上書きします。
 - `api_key` を使った後に Google サインインへ戻すには、`auth = "login"` を明示してください。`auth` の行を削除するだけでは戻りません。設定がない場合 gateway は `modelProvider` に触れないため、以前に書き込まれた `"gemini"` が agy の設定に残り、gateway はログで通知するだけです。`login` モードでは、gateway は `GEMINI_API_KEY`／`GOOGLE_API_KEY` を agy とその実行コマンドに渡しません。`api_key` モードでは、エージェントの shell からこのキーを読めます（agy は環境変数から受け取る必要があるため）。
 
-### Antigravity のツール権限（未リリース、v1.69.0 以降）
+### Antigravity のツール権限（v1.69.1）
 
 `agy` 1.2.16 は print mode で、人間に尋ねられない確認をすべて自動で拒否します。MCP ツールの呼び出しにはその確認が 1 回必要です。この修正の前は、既定のケーパビリティレベル（`--sandbox` 付き）の Antigravity 従業員はプラットフォームのツールを一切使えず、`--dangerously-skip-permissions` を渡すフルアクセスのレベルだけが使えました。この不具合は v1.67.0 からあり、2026-10-04 に実際の Gemini API キーで検証して初めて見つかりました。
 
