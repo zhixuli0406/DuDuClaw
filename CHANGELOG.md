@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- 修正 Antigravity 權限測試夾具的 Windows 路徑格式：逐層組合目錄並以 JSON 序列化既有規則，避免反斜線差異造成四項測試失敗；正式執行的權限行為不變。
 - **預設權限等級的 Antigravity（`agy`）員工現在可以呼叫平台工具**。agy 1.2.16 在 print mode 會自動拒絕模型對 MCP 工具的呼叫確認，所以預設能力等級（帶 `--sandbox`）的 Antigravity 員工用不了任何 DuDuClaw 的 MCP 工具，只有完全放行的等級（`--dangerously-skip-permissions`）可以。這個缺陷從 v1.67.0 就存在；2026-10-04 用真的 Gemini API key 驗證時才發現，先前的驗證只確認 MCP 伺服器有啟動，模型沒有真的呼叫過工具。修正方式見 Changed 的第一項。
 - **agy 拒絕工具時，錯誤訊息會指名被拒的工具**。閘道回報的錯誤現在會寫出「agy denied a tool permission it could not ask about in print mode: <工具名稱>」，並附上 agy 自己的錯誤文字作為次要說明。以前訊息只有 agy 的 `status` 與 `error`，而 agy 重試時遇到的暫時性 503 會蓋掉真正原因，看起來像容量問題。agy 的錯誤文字與工具名稱先遮蔽金鑰、再截斷，所以截斷不會留下金鑰的前綴。
 - **agy 回報成功、回覆卻是空的，而且有工具被拒時，現在判為錯誤**。以前閘道會把 agy 結果事件的原始 JSON 當成員工的回答。回覆正常、只是有工具被拒時，回覆照常保留，閘道另記一筆警告（只含 agy 的固定工具標籤，不含工具輸入）。

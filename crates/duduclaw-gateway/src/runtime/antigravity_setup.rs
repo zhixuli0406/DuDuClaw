@@ -872,16 +872,33 @@ mod tests {
         super::merge_user_settings(existing, trusted_dir, auth, &grants()).map(|m| m.content)
     }
 
-    const EXISTING: &str = r#"{"trustedWorkspaces":["/a"],"theme":"dark","modelProvider":"gemini","permissions":{"allow":["mcp(duduclaw/*)","read_file(/u/.gemini/antigravity-cli/mcp/duduclaw)"]}}"#;
+    fn existing_settings(provider: &str) -> String {
+        let schema_dir = Path::new(FAKE_HOME)
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("mcp")
+            .join("duduclaw");
+        serde_json::json!({
+            "trustedWorkspaces": ["/a"],
+            "theme": "dark",
+            "modelProvider": provider,
+            "permissions": {"allow": [
+                "mcp(duduclaw/*)",
+                format!("read_file({})", schema_dir.to_string_lossy()),
+            ]},
+        })
+        .to_string()
+    }
 
     #[test]
     fn unset_never_touches_model_provider() {
+        let existing = existing_settings("gemini");
         assert_eq!(
-            merge_user_settings(Some(EXISTING), Some("/a"), AntigravityAuth::Unset).unwrap(),
+            merge_user_settings(Some(&existing), Some("/a"), AntigravityAuth::Unset).unwrap(),
             None,
             "already trusted and Unset ⇒ no write"
         );
-        let out = merge_user_settings(Some(EXISTING), Some("/b"), AntigravityAuth::Unset)
+        let out = merge_user_settings(Some(&existing), Some("/b"), AntigravityAuth::Unset)
             .unwrap()
             .unwrap();
         let v = parse(&out);
@@ -927,7 +944,8 @@ mod tests {
 
     #[test]
     fn login_removes_model_provider_only_when_it_is_gemini() {
-        let out = merge_user_settings(Some(EXISTING), Some("/a"), AntigravityAuth::Login)
+        let existing = existing_settings("gemini");
+        let out = merge_user_settings(Some(&existing), Some("/a"), AntigravityAuth::Login)
             .unwrap()
             .unwrap();
         let v = parse(&out);
@@ -937,7 +955,7 @@ mod tests {
 
         assert_eq!(
             merge_user_settings(
-                Some(r#"{"modelProvider":"vertex","trustedWorkspaces":["/a"],"permissions":{"allow":["mcp(duduclaw/*)","read_file(/u/.gemini/antigravity-cli/mcp/duduclaw)"]}}"#),
+                Some(&existing_settings("vertex")),
                 Some("/a"),
                 AntigravityAuth::Login
             )
@@ -1117,7 +1135,10 @@ mod tests {
                 format!(
                     "read_file({})",
                     Path::new(FAKE_HOME)
-                        .join(".gemini/antigravity-cli/mcp/duduclaw")
+                        .join(".gemini")
+                        .join("antigravity-cli")
+                        .join("mcp")
+                        .join("duduclaw")
                         .to_string_lossy()
                 ),
             ]
