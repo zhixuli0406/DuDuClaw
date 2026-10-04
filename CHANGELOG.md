@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Fixed
+- **預設權限等級的 Antigravity（`agy`）員工現在可以呼叫平台工具**。agy 1.2.16 在 print mode 會自動拒絕模型對 MCP 工具的呼叫確認，所以預設能力等級（帶 `--sandbox`）的 Antigravity 員工用不了任何 DuDuClaw 的 MCP 工具，只有完全放行的等級（`--dangerously-skip-permissions`）可以。這個缺陷從 v1.67.0 就存在；2026-10-04 用真的 Gemini API key 驗證時才發現，先前的驗證只確認 MCP 伺服器有啟動，模型沒有真的呼叫過工具。修正方式見 Changed 的第一項。
+- **agy 拒絕工具時，錯誤訊息會指名被拒的工具**。閘道回報的錯誤現在會寫出「agy denied a tool permission it could not ask about in print mode: <工具名稱>」，並附上 agy 自己的錯誤文字作為次要說明。以前訊息只有 agy 的 `status` 與 `error`，而 agy 重試時遇到的暫時性 503 會蓋掉真正原因，看起來像容量問題。agy 的錯誤文字與工具名稱先遮蔽金鑰、再截斷，所以截斷不會留下金鑰的前綴。
+- **agy 回報成功、回覆卻是空的，而且有工具被拒時，現在判為錯誤**。以前閘道會把 agy 結果事件的原始 JSON 當成員工的回答。回覆正常、只是有工具被拒時，回覆照常保留，閘道另記一筆警告（只含 agy 的固定工具標籤，不含工具輸入）。
+- 平台工具的放行規則寫不進 agy 設定檔時（見 Changed），失敗訊息會說明這件事，不再只剩 agy 的拒絕文字。
+
+### Changed
+- **閘道會在操作者的 agy 使用者層設定檔寫入兩條放行規則**。閘道每次執行 Antigravity 前，本來就會把員工工作區寫進 `~/.gemini/antigravity-cli/settings.json` 的 `trustedWorkspaces`；現在同一次加鎖寫入會在 `permissions.allow` 補上：
+  - `mcp(duduclaw/*)`：放行名為 `duduclaw` 的 MCP 伺服器的所有工具。
+  - `read_file(<HOME>/.gemini/antigravity-cli/mcp/duduclaw)`：agy 的 MCP 工具是延後載入的，模型呼叫前要先讀這個目錄裡的工具說明檔，這個讀取在 print mode 同樣會被拒。`HOME` 正規化後路徑不同時（例如 macOS 的 `/var` 與 `/private/var`），兩種寫法都加。
+
+  閘道不加任何終端機指令、寫檔或網址的規則，命令列旗標也沒有改，預設等級仍是 `--sandbox`。實測（agy 1.2.16、真的 Gemini API key）：加了這兩條規則後，預設等級的員工可以呼叫 DuDuClaw 工具；同一輪的終端機指令與寫到工作區以外的檔案仍被 agy 拒絕，路徑穿越與指向目錄外的符號連結的讀取也被拒。把 `--sandbox` 與「全部自動核准」旗標合用會讓寫檔工具寫到工作區以外，所以沒有採用。
+  既有的 `allow`、`deny`、`ask` 規則保留。`permissions` 不是物件、或 `allow` 不是陣列時，閘道不改寫它並記警告，`trustedWorkspaces` 與 `modelProvider` 照寫。HOME 路徑含 `(`、`)`、`,`、`*`、換行，或不是合法 UTF-8 時，只加 `mcp(duduclaw/*)`，不加 `read_file` 規則並記警告。
+- **操作者要知道的副作用**：這兩條規則寫在整個作業系統使用者共用的 agy 設定檔裡，所以你自己在終端機互動使用 agy 時，名為 `duduclaw` 的 MCP 伺服器的工具呼叫與那個說明檔目錄的讀取也會自動放行，不再逐次詢問。規則只增不減：移除員工、解除安裝 DuDuClaw 或不再使用 Antigravity 之後，規則會留在檔案裡（`trustedWorkspaces` 的行為原本就是這樣）。要移除，手動編輯 `~/.gemini/antigravity-cli/settings.json`，從 `permissions.allow` 刪掉這兩條。同一個作業系統使用者跑兩個閘道時，兩邊寫的規則相同，不會互相覆蓋成不同內容。
+- **唯讀等級（ReadOnly）的 Antigravity 員工現在也可以呼叫平台工具**，由 MCP 伺服器端的 `allowed_tools`、`denied_tools` 與審批清單把關。原因是上面兩條規則寫在使用者層設定檔，無法依員工的能力等級區分，所以唯讀與預設等級拿到同一組放行規則。這與 Claude runtime 的做法相同，與 Codex 不同：Codex 的唯讀等級下所有 MCP 工具呼叫都會被拒。
+- **Gemini CLI runtime 的移除仍排在 v1.70.0**，前提是這個修正出貨後，以真的 Gemini API key 重新驗證 Antigravity。最後一輪修改之後的端對端測試尚未重跑，也還沒有在 Linux、Docker 容器內與 Windows 上測過。這次沒有處理的兩個 Antigravity 問題：agy 遇到 503 重試成功後仍可能回報失敗，閘道會把完整的回覆當成失敗；Antigravity 執行失敗後，跨廠商容錯可能改用 Claude。
+
 ## [1.69.0] - 2026-10-04 — 員工間授權修補×棄用名稱移除×安全稽核第 2 版與紅隊帳本×驗收逐條帳本×設定存檔保留註解
 
 ### Added

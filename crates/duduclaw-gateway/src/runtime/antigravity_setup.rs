@@ -25,6 +25,82 @@ pub(crate) const GEMINI_KEY_ENV: &str = "GEMINI_API_KEY";
 pub(crate) const GEMINI_PROVIDER: &str = "gemini";
 /// Name the DuDuClaw MCP server is registered under.
 pub(crate) const MCP_SERVER_NAME: &str = "duduclaw";
+/// The one `permissions.allow` rule the gateway adds to agy's user settings:
+/// every tool of the MCP server registered as [`MCP_SERVER_NAME`].
+///
+/// Why (agy 1.2.16, measured 2026-10-04): in print mode agy runs with
+/// `toolPermission = request-review` and soft-denies any tool confirmation it
+/// cannot ask a human about, so under `--sandbox` every DuDuClaw MCP call was
+/// refused and the run failed. agy matches `permissions.allow` rules per kind
+/// (`command(…)`, `read_file(…)`, `write_file(…)`, `read_url(…)`,
+/// `execute_url(…)`, `mcp(<server>/<tool>)`); an `mcp(…)` rule approves MCP
+/// calls only, so shell commands and file writes keep their confirmation and
+/// are still denied headless. The DuDuClaw MCP server authorizes every call
+/// itself (scopes, `[capabilities]`, approval lists).
+pub(crate) const MCP_TOOL_GRANT: &str = "mcp(duduclaw/*)";
+
+/// The `permissions.allow` rules the gateway needs for the duduclaw MCP server
+/// under `user_home`: [`MCP_TOOL_GRANT`] plus a read-only grant on agy's
+/// lazily generated schema directory for that one server,
+/// `<user_home>/.gemini/antigravity-cli/mcp/duduclaw` (agy 1.2.16 tells the
+/// model to read `<tool>.json` there before each call; outside the system temp
+/// dir that read is soft-denied in print mode exactly like the call itself).
+/// When `user_home` canonicalizes to another spelling (macOS `/var` →
+/// `/private/var`) both spellings are granted. Nothing here grants a shell
+/// command, a file write, or a read outside that directory.
+///
+/// A spelling that [`schema_read_grant`] refuses is left out with a `warn!`
+/// (the MCP grant is still returned): a broken or wider rule is worse than a
+/// missing one.
+pub(crate) fn tool_grants(user_home: &Path) -> Vec<String> {
+    let mut grants = vec![MCP_TOOL_GRANT.to_string()];
+    let mut spellings = vec![user_home.to_path_buf()];
+    if let Ok(canon) = user_home.canonicalize() {
+        if canon != user_home {
+            spellings.push(canon);
+        }
+    }
+    for home in spellings {
+        match schema_read_grant(&home) {
+            Ok(rule) => {
+                if !grants.contains(&rule) {
+                    grants.push(rule);
+                }
+            }
+            Err(reason) => tracing::warn!(
+                runtime = "antigravity",
+                reason = %reason,
+                "not adding the agy read rule for the duduclaw MCP schema directory; \
+                 agy may refuse to read tool schemas in print mode"
+            ),
+        }
+    }
+    grants
+}
+
+/// `read_file(<home>/.gemini/antigravity-cli/mcp/duduclaw)`, or why it is not
+/// written. Refused: a path that is not valid UTF-8, or that contains `(`,
+/// `)`, `,`, `*`, CR or LF — agy's parsing of those characters inside a rule
+/// is not known, so such a rule could be broken or match more than intended.
+pub(crate) fn schema_read_grant(home: &Path) -> Result<String, String> {
+    let dir = home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("mcp")
+        .join(MCP_SERVER_NAME);
+    let Some(text) = dir.to_str() else {
+        return Err("the user home path is not valid UTF-8".to_string());
+    };
+    if let Some(c) = text
+        .chars()
+        .find(|c| matches!(c, '(' | ')' | ',' | '*' | '\n' | '\r'))
+    {
+        return Err(format!(
+            "the user home path contains {c:?}, which an agy permission rule may not parse safely"
+        ));
+    }
+    Ok(format!("read_file({text})"))
+}
 
 // ── config.toml [antigravity] auth ──────────────────────────────
 
@@ -196,10 +272,22 @@ pub(crate) fn user_settings_path(user_home: &Path) -> PathBuf {
         .join("settings.json")
 }
 
-/// Pure merge of the user settings. Returns the new file content when anything
-/// changed, `Ok(None)` when the file already says what we want.
+/// What [`merge_user_settings`] produced.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MergedSettings {
+    /// New file content when anything changed, `None` when the file already
+    /// says what we want.
+    pub(crate) content: Option<String>,
+    /// Why the `permissions.allow` rules could not be added (the operator's
+    /// `permissions` has an unexpected shape and is left untouched). The
+    /// trust and `modelProvider` changes are still in `content`.
+    pub(crate) grant_issue: Option<String>,
+}
+
+/// Pure merge of the user settings.
 ///
-/// * `trusted_dir` is appended to `trustedWorkspaces` when missing.
+/// * `trusted_dir` is appended to `trustedWorkspaces` when missing, and each
+///   of `grants` (see [`tool_grants`]) to `permissions.allow` (every auth mode).
 /// * `ApiKey` sets `modelProvider = "gemini"`; `Login` removes it only when it
 ///   equals `"gemini"` (any other provider is the operator's own choice);
 ///   `Unset` never touches it.
@@ -209,7 +297,8 @@ pub(crate) fn merge_user_settings(
     existing: Option<&str>,
     trusted_dir: Option<&str>,
     auth: AntigravityAuth,
-) -> Result<Option<String>, String> {
+    grants: &[String],
+) -> Result<MergedSettings, String> {
     let mut settings: Value = match existing.map(str::trim) {
         None | Some("") => serde_json::json!({}),
         Some(s) => serde_json::from_str(s)
@@ -219,6 +308,7 @@ pub(crate) fn merge_user_settings(
         return Err("antigravity settings.json is not a JSON object; not rewriting it".to_string());
     };
     let mut changed = false;
+    let mut grant_issue = None;
 
     if let Some(dir) = trusted_dir {
         let mut list: Vec<Value> = match obj.get("trustedWorkspaces") {
@@ -235,6 +325,15 @@ pub(crate) fn merge_user_settings(
             list.push(Value::String(dir.to_string()));
             obj.insert("trustedWorkspaces".to_string(), Value::Array(list));
             changed = true;
+        }
+        // The trusted dir is the workspace whose `.agents/mcp_config.json`
+        // registers the duduclaw server; without the grants agy's print mode
+        // refuses every call to it.
+        // A malformed `permissions` must not block trust / modelProvider:
+        // those are what keep agy from hanging on its trust prompt.
+        match ensure_allow_rules(obj, grants) {
+            Ok(c) => changed |= c,
+            Err(e) => grant_issue = Some(e),
         }
     }
 
@@ -258,11 +357,53 @@ pub(crate) fn merge_user_settings(
     }
 
     if !changed {
-        return Ok(None);
+        return Ok(MergedSettings {
+            content: None,
+            grant_issue,
+        });
     }
     serde_json::to_string_pretty(&settings)
-        .map(Some)
+        .map(|out| MergedSettings {
+            content: Some(out),
+            grant_issue,
+        })
         .map_err(|e| e.to_string())
+}
+
+/// Append each of `rules` to `permissions.allow` when missing. Returns whether
+/// anything changed. The operator's own `allow`/`deny`/`ask` rules are
+/// kept as they are; a `permissions` value that is not an object, or an `allow`
+/// that is not an array, is refused rather than overwritten (`obj` is left
+/// unchanged on that path).
+fn ensure_allow_rules(
+    obj: &mut serde_json::Map<String, Value>,
+    rules: &[String],
+) -> Result<bool, String> {
+    let perms = obj
+        .entry("permissions")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(perms) = perms.as_object_mut() else {
+        return Err(
+            "antigravity settings.json has a non-object permissions; not rewriting it".to_string(),
+        );
+    };
+    let allow = perms
+        .entry("allow")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(allow) = allow.as_array_mut() else {
+        return Err(
+            "antigravity settings.json has a non-array permissions.allow; not rewriting it"
+                .to_string(),
+        );
+    };
+    let mut changed = false;
+    for rule in rules {
+        if !allow.iter().any(|v| v.as_str() == Some(rule.as_str())) {
+            allow.push(Value::String(rule.clone()));
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 /// Pure (C1): `true` when the settings still route agy through the Gemini key
@@ -284,11 +425,13 @@ pub(crate) fn stale_api_key_route(existing: Option<&str>, env_key_present: bool)
 }
 
 /// What [`ensure_user_settings`] did and saw.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SettingsOutcome {
     pub(crate) wrote: bool,
     /// The file (as read, before any write) had `modelProvider == "gemini"`.
     pub(crate) had_gemini_provider: bool,
+    /// See [`MergedSettings::grant_issue`].
+    pub(crate) grant_issue: Option<String>,
 }
 
 /// Apply [`merge_user_settings`] to `<user_home>/.gemini/antigravity-cli/settings.json`
@@ -321,6 +464,7 @@ pub(crate) fn ensure_user_settings(
         return Ok(SettingsOutcome {
             wrote: false,
             had_gemini_provider: had_gemini(existing.as_deref()),
+            grant_issue: None,
         });
     }
     if let Some(parent) = path.parent() {
@@ -330,14 +474,23 @@ pub(crate) fn ensure_user_settings(
         let target = resolve_write_target(&path)?;
         let existing = read_optional(&target)?;
         let had_gemini_provider = had_gemini(existing.as_deref());
-        match merge_user_settings(existing.as_deref(), trusted.as_deref(), auth) {
-            Ok(None) => Ok(SettingsOutcome {
+        let grants = tool_grants(user_home);
+        match merge_user_settings(existing.as_deref(), trusted.as_deref(), auth, &grants) {
+            Ok(MergedSettings {
+                content: None,
+                grant_issue,
+            }) => Ok(SettingsOutcome {
                 wrote: false,
                 had_gemini_provider,
+                grant_issue,
             }),
-            Ok(Some(out)) => write_user_file(&target, &out).map(|()| SettingsOutcome {
+            Ok(MergedSettings {
+                content: Some(out),
+                grant_issue,
+            }) => write_user_file(&target, &out).map(|()| SettingsOutcome {
                 wrote: true,
                 had_gemini_provider,
+                grant_issue,
             }),
             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
         }
@@ -702,7 +855,24 @@ mod tests {
 
     // ── user settings ──
 
-    const EXISTING: &str = r#"{"trustedWorkspaces":["/a"],"theme":"dark","modelProvider":"gemini"}"#;
+    /// Fixed fake home for the pure-merge tests (does not exist, so
+    /// [`tool_grants`] yields exactly one spelling).
+    const FAKE_HOME: &str = "/u";
+
+    fn grants() -> Vec<String> {
+        tool_grants(Path::new(FAKE_HOME))
+    }
+
+    /// The pure merge as `ensure_user_settings` calls it, for [`FAKE_HOME`].
+    fn merge_user_settings(
+        existing: Option<&str>,
+        trusted_dir: Option<&str>,
+        auth: AntigravityAuth,
+    ) -> Result<Option<String>, String> {
+        super::merge_user_settings(existing, trusted_dir, auth, &grants()).map(|m| m.content)
+    }
+
+    const EXISTING: &str = r#"{"trustedWorkspaces":["/a"],"theme":"dark","modelProvider":"gemini","permissions":{"allow":["mcp(duduclaw/*)","read_file(/u/.gemini/antigravity-cli/mcp/duduclaw)"]}}"#;
 
     #[test]
     fn unset_never_touches_model_provider() {
@@ -767,7 +937,7 @@ mod tests {
 
         assert_eq!(
             merge_user_settings(
-                Some(r#"{"modelProvider":"vertex","trustedWorkspaces":["/a"]}"#),
+                Some(r#"{"modelProvider":"vertex","trustedWorkspaces":["/a"],"permissions":{"allow":["mcp(duduclaw/*)","read_file(/u/.gemini/antigravity-cli/mcp/duduclaw)"]}}"#),
                 Some("/a"),
                 AntigravityAuth::Login
             )
@@ -928,6 +1098,152 @@ mod tests {
         );
     }
 
+    // ── 2026-10: MCP tool grant (agy print mode soft-denies unapproved calls) ──
+
+    fn allow_list(v: &Value) -> Vec<String> {
+        v["permissions"]["allow"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_grants_name_only_the_duduclaw_server_and_its_schema_dir() {
+        assert_eq!(MCP_TOOL_GRANT, "mcp(duduclaw/*)");
+        assert_eq!(
+            grants(),
+            vec![
+                "mcp(duduclaw/*)".to_string(),
+                format!(
+                    "read_file({})",
+                    Path::new(FAKE_HOME)
+                        .join(".gemini/antigravity-cli/mcp/duduclaw")
+                        .to_string_lossy()
+                ),
+            ]
+        );
+        // Never a shell, write, URL or wildcard grant.
+        for g in grants() {
+            assert!(g.starts_with("mcp(duduclaw/") || g.starts_with("read_file("), "{g}");
+            assert!(!g.contains("(*)") && !g.ends_with("(/)"), "{g}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_home_is_granted_under_both_spellings() {
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let home = links.path().join("home");
+        std::os::unix::fs::symlink(real.path(), &home).unwrap();
+        let g = tool_grants(&home);
+        assert_eq!(g.len(), 3, "{g:?}");
+        let canon = real.path().canonicalize().unwrap();
+        assert!(g.iter().any(|r| r.contains(&*home.to_string_lossy())), "{g:?}");
+        assert!(g.iter().any(|r| r.contains(&*canon.to_string_lossy())), "{g:?}");
+    }
+
+    #[test]
+    fn a_trusted_workspace_gets_the_duduclaw_mcp_grant_in_every_auth_mode() {
+        for auth in [AntigravityAuth::Unset, AntigravityAuth::Login, AntigravityAuth::ApiKey] {
+            let out = merge_user_settings(Some(r#"{"theme":"dark"}"#), Some("/w"), auth)
+                .unwrap()
+                .unwrap();
+            let v = parse(&out);
+            assert_eq!(allow_list(&v), grants(), "{auth:?}");
+            // Only `allow` is written: no deny/ask lists, no other grant kind.
+            assert_eq!(v["permissions"].as_object().unwrap().len(), 1, "{auth:?}");
+            assert_eq!(v["theme"], "dark");
+            // Idempotent.
+            assert_eq!(merge_user_settings(Some(&out), Some("/w"), auth).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn the_mcp_grant_is_appended_to_the_operators_own_rules() {
+        let existing = r#"{"trustedWorkspaces":["/w"],"permissions":{"allow":["command(git status)"],"deny":["command(rm)"],"ask":["read_url(example.com)"]}}"#;
+        let out = merge_user_settings(Some(existing), Some("/w"), AntigravityAuth::Unset)
+            .unwrap()
+            .unwrap();
+        let v = parse(&out);
+        let mut want = vec!["command(git status)".to_string()];
+        want.extend(grants());
+        assert_eq!(allow_list(&v), want);
+        assert_eq!(v["permissions"]["deny"], serde_json::json!(["command(rm)"]));
+        assert_eq!(v["permissions"]["ask"], serde_json::json!(["read_url(example.com)"]));
+    }
+
+    #[test]
+    fn ensure_user_settings_grants_the_schema_dir_of_the_given_home() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        ensure_user_settings(home.path(), Some(ws.path()), AntigravityAuth::Unset).unwrap();
+        let v = parse(&std::fs::read_to_string(user_settings_path(home.path())).unwrap());
+        assert_eq!(allow_list(&v), tool_grants(home.path()));
+        // Second call is a no-op.
+        assert!(!ensure_user_settings(home.path(), Some(ws.path()), AntigravityAuth::Unset).unwrap().wrote);
+    }
+
+    #[test]
+    fn no_workspace_means_no_grant() {
+        // Nothing registers the MCP server without a working root.
+        let out = merge_user_settings(None, None, AntigravityAuth::ApiKey).unwrap().unwrap();
+        assert!(parse(&out).get("permissions").is_none());
+    }
+
+    #[test]
+    fn malformed_permissions_are_left_alone_but_trust_and_provider_are_still_written() {
+        for (bad, kept) in [
+            (r#"{"permissions":"all"}"#, serde_json::json!("all")),
+            (
+                r#"{"permissions":{"allow":"mcp(duduclaw/*)"}}"#,
+                serde_json::json!({"allow": "mcp(duduclaw/*)"}),
+            ),
+        ] {
+            let m = super::merge_user_settings(Some(bad), Some("/w"), AntigravityAuth::ApiKey, &grants())
+                .unwrap();
+            let issue = m.grant_issue.expect("the skipped grant is reported");
+            assert!(issue.contains("permissions"), "{issue}");
+            let v = parse(&m.content.expect("trust/provider still written"));
+            assert_eq!(v["trustedWorkspaces"], serde_json::json!(["/w"]));
+            assert_eq!(v["modelProvider"], "gemini");
+            assert_eq!(v["permissions"], kept, "the operator's value is not overwritten");
+        }
+    }
+
+    #[test]
+    fn ensure_user_settings_reports_a_skipped_grant() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let path = user_settings_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"permissions":"all"}"#).unwrap();
+        let o = ensure_user_settings(home.path(), Some(ws.path()), AntigravityAuth::Unset).unwrap();
+        assert!(o.wrote);
+        assert!(o.grant_issue.is_some());
+        let v = parse(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(v["permissions"], "all");
+        assert!(v["trustedWorkspaces"].is_array());
+    }
+
+    #[test]
+    fn a_home_with_rule_syntax_characters_gets_no_read_rule() {
+        for home in ["/u(x", "/u)x", "/u,x", "/u*x", "/u\nx", "/u\rx"] {
+            assert!(schema_read_grant(Path::new(home)).is_err(), "{home:?}");
+            assert_eq!(tool_grants(Path::new(home)), vec![MCP_TOOL_GRANT.to_string()], "{home:?}");
+        }
+        assert!(schema_read_grant(Path::new("/home/a b/c-d.e_f")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_home_gets_no_read_rule() {
+        use std::os::unix::ffi::OsStrExt;
+        let home = Path::new(std::ffi::OsStr::from_bytes(b"/u/\xff"));
+        assert!(schema_read_grant(home).unwrap_err().contains("UTF-8"));
+        assert_eq!(tool_grants(home), vec![MCP_TOOL_GRANT.to_string()]);
+    }
+
     // ── 2026-10 review hardening ──
 
     #[test]
@@ -969,7 +1285,8 @@ mod tests {
             o,
             SettingsOutcome {
                 wrote: false,
-                had_gemini_provider: true
+                had_gemini_provider: true,
+                grant_issue: None,
             }
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"modelProvider":"gemini"}"#);

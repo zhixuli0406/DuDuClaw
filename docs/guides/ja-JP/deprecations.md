@@ -179,8 +179,11 @@ v1.69.0 から **v1.70.0** に延期されました。後継は **Antigravity CL
 **延期の理由**: 当初告知した削除の前提条件は、Antigravity の API キーモードを実際の
 Gemini API キーで検証することでした。その検証で、既定の権限レベルの Antigravity 従業員
 がプラットフォームのツールを呼び出すと、Antigravity CLI 自身に拒否されることが分かり
-ました。修正は進行中です。この問題が直り、検証をやり直すまで、Gemini CLI ランタイムは
-削除されません。
+ました。修正は完了しており、次のリリースで出荷されます。gateway が、オペレーターの
+`~/.gemini/antigravity-cli/settings.json` に、`duduclaw` MCP サーバーを許可する 2 つの
+ルールを追加します（詳細は[マルチランタイム](../../features/ja-JP/13-multi-runtime.md)）。
+削除は引き続き v1.70.0 の予定で、その条件は、この修正の出荷後に実際の Gemini API キーで
+Antigravity を再検証することです。再検証はまだ行っていません。
 
 **まだ使えるもの**: 上記の旧い値は、これまでどおり解析・実行されます。読み込み時には
 プロセスごとに警告を 1 回記録し、ダッシュボード（`agents.create` / `agents.update`）

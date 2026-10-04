@@ -112,6 +112,9 @@ struct ParsedStream {
     /// Set when the strict 1.2.10 shape was not found and this parse fell back.
     /// Logged once by the caller; never hidden.
     degraded: Option<&'static str>,
+    /// agy refused at least one tool in this run although it still answered
+    /// (redacted [`denial_summary`]). The caller logs it; the reply is kept.
+    denied: Option<String>,
 }
 
 /// Decode the observed agy 1.2.10 NDJSON stream. Only terminal tool states
@@ -137,6 +140,19 @@ struct ParsedStream {
 ///   case where refusing is the honest answer. An ABSENT `status` is a shape
 ///   question and degrades like the rest.
 fn parse_stream_output(raw: &str) -> Result<ParsedStream, String> {
+    parse_stream_output_keyed(raw, None)
+}
+
+/// [`parse_stream_output`] with the run's key, for redacting error text.
+///
+/// Every agy-supplied fragment (`error`, denial labels) is redacted BEFORE it
+/// is capped, so a cut can never leave a key prefix behind; the whole message
+/// is redacted once more at the end.
+fn parse_stream_output_keyed(raw: &str, key: Option<&str>) -> Result<ParsedStream, String> {
+    parse_stream_output_inner(raw, key).map_err(|e| setup::redact_key(&e, key))
+}
+
+fn parse_stream_output_inner(raw: &str, key: Option<&str>) -> Result<ParsedStream, String> {
     let mut result: Option<Value> = None;
     let mut tools = std::collections::BTreeMap::<u64, super::NativeToolEvent>::new();
     let mut unparseable_lines = 0usize;
@@ -196,7 +212,20 @@ fn parse_stream_output(raw: &str) -> Result<ParsedStream, String> {
         .and_then(Value::as_str)
     {
         if status != "SUCCESS" {
-            return Err(format!("Antigravity result status was {status}, not SUCCESS"));
+            // agy's own `error` text is kept as secondary detail: redacted,
+            // then capped.
+            let detail = result
+                .as_ref()
+                .and_then(|r| r.get("error"))
+                .and_then(Value::as_str)
+                .map(|e| format!(": {}", redact_then_cap(e.trim(), key, 300)))
+                .unwrap_or_default();
+            return Err(match result.as_ref().and_then(|r| denial_summary(r, key)) {
+                Some(denial) => format!(
+                    "{denial}; Antigravity result status was {status}, not SUCCESS{detail}"
+                ),
+                None => format!("Antigravity result status was {status}, not SUCCESS{detail}"),
+            });
         }
     }
 
@@ -222,6 +251,14 @@ fn parse_stream_output(raw: &str) -> Result<ParsedStream, String> {
 
     let (content, mut degraded) = match response {
         Some(c) => (c, None),
+        // A denied tool ended the turn without an answer: falling back to the
+        // last stream line would hand the raw result event over as the reply.
+        None if result.as_ref().and_then(|r| denial_summary(r, key)).is_some() => {
+            return Err(result
+                .as_ref()
+                .and_then(|r| denial_summary(r, key))
+                .unwrap_or_default());
+        }
         None => {
             // Last non-empty line as the answer — the same last-resort the
             // codex runtime already uses. Refusing here would throw away a
@@ -252,12 +289,100 @@ fn parse_stream_output(raw: &str) -> Result<ParsedStream, String> {
         degraded = Some("some stream lines were not valid JSON and were skipped");
     }
 
+    let denied = result.as_ref().and_then(|r| denial_summary(r, key));
     Ok(ParsedStream {
         content,
         usage,
         tools,
         degraded,
+        denied,
     })
+}
+
+/// The tools agy's print mode refused, from `result.denied_actions`, as one
+/// sentence — or `None` when nothing was denied.
+///
+/// Why: a soft-denied tool confirmation ends the turn, but agy reports that
+/// only in `denied_actions`; `status`/`error` (and stderr) may carry an
+/// unrelated earlier message, e.g. a transient 503 from a retried attempt,
+/// which made the failure look like a capacity problem. Only agy's fixed
+/// `display_name`/`action` labels are used (each redacted, then capped), never
+/// tool input.
+fn denial_summary(result: &Value, key: Option<&str>) -> Option<String> {
+    let denied = result.get("denied_actions")?.as_array()?;
+    let names: Vec<String> = denied
+        .iter()
+        .filter_map(|d| {
+            let label = d
+                .get("display_name")
+                .and_then(Value::as_str)
+                .or_else(|| d.get("action").and_then(Value::as_str))?;
+            let label = redact_then_cap(label.trim(), key, 64);
+            if label.is_empty() {
+                return None;
+            }
+            Some(match d.get("action").and_then(Value::as_str) {
+                Some(kind) if kind != label => {
+                    format!("{label} ({})", redact_then_cap(kind.trim(), key, 32))
+                }
+                _ => label.to_string(),
+            })
+        })
+        .take(8)
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "agy denied a tool permission it could not ask about in print mode: {} \
+         (this employee's capability level does not allow it unattended)",
+        names.join(", ")
+    ))
+}
+
+/// Redact the key (and any Google-key shape) from `text`, THEN cap it at
+/// `max_chars` — the other order could cut through a key and leave a prefix no
+/// redaction pass recognises.
+fn redact_then_cap(text: &str, key: Option<&str>, max_chars: usize) -> String {
+    duduclaw_core::truncate_chars(&setup::redact_key(text, key), max_chars)
+}
+
+/// [`denial_summary`] of the last `result` event in a raw stream.
+fn stream_denial_summary(raw: &str, key: Option<&str>) -> Option<String> {
+    raw.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e.get("event").and_then(Value::as_str) == Some("result"))
+        .filter_map(|e| e.get("result").cloned())
+        .last()
+        .and_then(|r| denial_summary(&r, key))
+}
+
+/// Error text for a non-zero agy exit. A permission denial in the stream leads;
+/// agy's own stderr follows as secondary detail. Each fragment is redacted
+/// before it is capped, and the whole message once more at the end.
+fn exit_failure_message(code: i32, stdout: &str, stderr: &str, key: Option<&str>) -> String {
+    let msg = match stream_denial_summary(stdout, key) {
+        Some(denial) => format!(
+            "Antigravity CLI exited with {code}: {denial}; agy also reported: {}",
+            redact_then_cap(stderr.trim(), key, 300)
+        ),
+        None => format!(
+            "Antigravity CLI exited with {code}: {}",
+            redact_then_cap(stderr, key, 500)
+        ),
+    };
+    setup::redact_key(&msg, key)
+}
+
+/// Append why the duduclaw permission rules are missing, when they are.
+fn with_grant_note(err: String, grant_issue: Option<&str>) -> String {
+    match grant_issue {
+        Some(issue) => format!(
+            "{err}; DuDuClaw could not add its agy permission rules to \
+             ~/.gemini/antigravity-cli/settings.json: {issue}"
+        ),
+        None => err,
+    }
 }
 
 /// Hard backstop on the whole subprocess. Kept a notch above `PRINT_TIMEOUT`
@@ -446,6 +571,9 @@ impl AgentRuntime for AntigravityRuntime {
         // Failure is a warning, except in `api_key` mode where agy would
         // silently ignore the key without `modelProvider` — fail closed there.
         let api_key_mode = auth == setup::AntigravityAuth::ApiKey;
+        // Set when the duduclaw permission rules could not be written; named in
+        // any failure below, since agy will then refuse the MCP tools.
+        let mut grant_issue: Option<String> = None;
         match self.user_home() {
             Some(home) => {
                 let trusted = work_root.clone();
@@ -455,6 +583,17 @@ impl AgentRuntime for AntigravityRuntime {
                 .await;
                 let failure = match outcome {
                     Ok(Ok(o)) => {
+                        if let Some(ref issue) = o.grant_issue {
+                            tracing::warn!(
+                                runtime = "antigravity",
+                                agent = %context.agent_id,
+                                issue = %issue,
+                                "could not add the duduclaw permission rules to agy settings.json \
+                                 (the operator's `permissions` was left as it is) — agy will \
+                                 refuse DuDuClaw MCP tool calls in print mode"
+                            );
+                            grant_issue = Some(issue.clone());
+                        }
                         // C1: a leftover `modelProvider = "gemini"` (from an
                         // earlier `api_key` setting) keeps agy on the key route
                         // even with the setting removed; without a key every
@@ -657,16 +796,21 @@ impl AgentRuntime for AntigravityRuntime {
 
         if !output.status.success() {
             let code = output.status.code().unwrap_or(-1);
-            let stderr = setup::redact_key(&String::from_utf8_lossy(&output.stderr), key_for_redaction);
-            return Err(format!(
-                "Antigravity CLI exited with {code}: {}",
-                stderr.chars().take(500).collect::<String>()
+            return Err(with_grant_note(
+                exit_failure_message(
+                    code,
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                    key_for_redaction,
+                ),
+                grant_issue.as_deref(),
             ));
         }
 
         let raw = String::from_utf8_lossy(&output.stdout);
         let parsed =
-            parse_stream_output(&raw).map_err(|e| setup::redact_key(&e, key_for_redaction))?;
+            parse_stream_output_keyed(&raw, key_for_redaction)
+                .map_err(|e| with_grant_note(e, grant_issue.as_deref()))?;
         if let Some(reason) = parsed.degraded {
             tracing::warn!(
                 runtime = "antigravity",
@@ -674,6 +818,16 @@ impl AgentRuntime for AntigravityRuntime {
                 reason = %reason,
                 "agy stream did not match the 1.2.10 shape — degraded parse (the reply is \
                  kept; usage may be reported as zero)"
+            );
+        }
+        if let Some(ref denied) = parsed.denied {
+            // Tool names only (agy's fixed labels), never tool input.
+            tracing::warn!(
+                runtime = "antigravity",
+                agent = %context.agent_id,
+                denied = %denied,
+                "agy answered, but refused at least one tool permission in print mode — the \
+                 reply may be incomplete"
             );
         }
         let ParsedStream {
@@ -969,6 +1123,169 @@ mod tests {
             sandbox_args(Some(&c)),
             vec!["--dangerously-skip-permissions"]
         );
+    }
+
+    /// Pins what each capability level hands agy today: the argv permission
+    /// flags differ by level; the `permissions.allow` rules do not, because
+    /// they live in agy's user-level settings file, shared by every agent of
+    /// this OS user, so they cannot be set per capability level. They consist
+    /// of the duduclaw MCP grant and a read of that server's schema
+    /// directory; no command, file-write or URL rule.
+    #[test]
+    fn capability_levels_map_to_flags_and_only_the_duduclaw_grants() {
+        let table: [(Option<CapabilitiesConfig>, &[&str]); 4] = [
+            (None, &["--sandbox"]),
+            (Some(caps(false, false, &[], &[])), &["--sandbox"]),
+            (Some(caps(false, false, &["Read", "Grep"], &[])), &["--sandbox"]),
+            (Some(caps(true, false, &[], &[])), &["--dangerously-skip-permissions"]),
+        ];
+        for (c, want) in table {
+            let got = sandbox_args(c.as_ref());
+            assert_eq!(got, want.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+            assert!(!got.iter().any(|a| a == "--mode"), "no execution-mode flag: {got:?}");
+        }
+        let home = std::path::Path::new("/u");
+        let grants = setup::tool_grants(home);
+        let out = setup::merge_user_settings(None, Some("/w"), setup::AntigravityAuth::Unset, &grants)
+            .unwrap()
+            .content
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let schema_dir = home.join(".gemini/antigravity-cli/mcp/duduclaw");
+        assert_eq!(
+            v["permissions"],
+            serde_json::json!({"allow": [
+                "mcp(duduclaw/*)",
+                format!("read_file({})", schema_dir.to_string_lossy()),
+            ]})
+        );
+    }
+
+    // ── 2026-10: agy's print-mode permission denials must be named ──────────
+
+    /// Observed on agy 1.2.16: a soft-denied write ended the turn, agy then hit
+    /// a transient 503 on its retry and reported `status: ERROR` with only the
+    /// 503 in `error`; the denial was only in `denied_actions`.
+    const DENIED_AFTER_503: &str = concat!(
+        "{\"event\":\"step_update\",\"step_update\":{\"step_index\":4,\"step_type\":\"tool\",\"state\":\"DONE\",\"tool_name\":\"call_mcp_tool\",\"tool_info\":{\"parameters\":{\"ServerName\":\"duduclaw\",\"ToolName\":\"ping\"},\"output\":\"TOKEN\"}}}\n",
+        "{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"response\":\"\",\"error\":\"API error (attempt 1): Error 503, Message: This model is currently experiencing high demand.\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1},\"denied_actions\":[{\"action\":\"write_file\",\"display_name\":\"WriteToFile\"}]}}\n"
+    );
+
+    #[test]
+    fn a_failed_run_names_the_denied_tool_not_only_the_503() {
+        let err = parse_stream_output(DENIED_AFTER_503).unwrap_err();
+        assert!(err.contains("WriteToFile"), "{err}");
+        assert!(err.contains("denied"), "{err}");
+        let denial = err.find("WriteToFile").unwrap();
+        if let Some(api) = err.find("503") {
+            assert!(denial < api, "the denial must lead, the 503 is secondary: {err}");
+        }
+    }
+
+    // ── 2026-10 review: redact BEFORE any cut ───────────────────────────────
+
+    /// A key with no Google `AIza` shape: only the exact-match pass of
+    /// `redact_key` can catch it, so a cut through it would leak a prefix.
+    const CUT_KEY: &str = "dudukey-0123456789abcdefghijklmnopqrstuvwxyz";
+
+    /// No 8-char window of `key` may survive in `text`.
+    fn assert_no_key_fragment(text: &str, key: &str) {
+        let k: Vec<char> = key.chars().collect();
+        for w in k.windows(8) {
+            let frag: String = w.iter().collect();
+            assert!(!text.contains(&frag), "key fragment {frag:?} leaked in: {text}");
+        }
+    }
+
+    /// `pad` chars of filler, then the key, so a cap of `cap` chars lands
+    /// inside the key.
+    fn key_across(cap: usize) -> String {
+        format!("{}{CUT_KEY} tail", "x".repeat(cap - 10))
+    }
+
+    #[test]
+    fn an_exit_failure_never_leaves_a_cut_key_fragment() {
+        // Plain path (500-char cap).
+        let msg = exit_failure_message(3, "", &key_across(500), Some(CUT_KEY));
+        assert_no_key_fragment(&msg, CUT_KEY);
+        // Denial path (300-char cap on stderr).
+        let msg = exit_failure_message(3, DENIED_AFTER_503, &key_across(300), Some(CUT_KEY));
+        assert!(msg.contains("WriteToFile"), "{msg}");
+        assert_no_key_fragment(&msg, CUT_KEY);
+    }
+
+    #[test]
+    fn agys_error_text_never_leaves_a_cut_key_fragment() {
+        let result = serde_json::json!({"event": "result", "result": {
+            "status": "ERROR", "response": "", "error": key_across(300),
+        }});
+        let err = parse_stream_output_keyed(&format!("{result}\n"), Some(CUT_KEY)).unwrap_err();
+        assert!(err.starts_with("Antigravity result status was ERROR"), "{err}");
+        assert_no_key_fragment(&err, CUT_KEY);
+    }
+
+    #[test]
+    fn a_denial_label_carrying_the_key_is_redacted_before_its_cut() {
+        let label = key_across(64);
+        let result = serde_json::json!({"event": "result", "result": {
+            "status": "SUCCESS", "response": "",
+            "denied_actions": [{"action": "command", "display_name": label}],
+        }});
+        let err = parse_stream_output_keyed(&format!("{result}\n"), Some(CUT_KEY)).unwrap_err();
+        assert_no_key_fragment(&err, CUT_KEY);
+    }
+
+    #[test]
+    fn a_failure_names_a_skipped_permission_grant() {
+        let e = with_grant_note("boom".into(), Some("non-object permissions"));
+        assert!(e.starts_with("boom; DuDuClaw could not add its agy permission rules"), "{e}");
+        assert!(e.ends_with("non-object permissions"), "{e}");
+        assert_eq!(with_grant_note("boom".into(), None), "boom");
+    }
+
+    #[test]
+    fn a_failed_run_without_a_denial_carries_agys_error_text() {
+        let raw = "{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"response\":\"\",\"error\":\"API error (attempt 1): Error 503\"}}\n";
+        let err = parse_stream_output(raw).unwrap_err();
+        assert!(err.starts_with("Antigravity result status was ERROR, not SUCCESS: "), "{err}");
+        assert!(err.contains("Error 503"), "{err}");
+    }
+
+    #[test]
+    fn a_success_status_with_no_answer_and_a_denial_is_an_error_naming_it() {
+        // Observed on agy 1.2.16 (RunCommand soft-denied): status SUCCESS,
+        // empty response. The old fallback returned the raw result JSON line
+        // as the employee's answer.
+        let raw = "{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1},\"denied_actions\":[{\"action\":\"command\",\"display_name\":\"RunCommand\"}]}}\n";
+        let err = parse_stream_output(raw).unwrap_err();
+        assert!(err.contains("RunCommand"), "{err}");
+        assert!(!err.contains("{\"event\""), "raw stream JSON leaked into the error: {err}");
+    }
+
+    #[test]
+    fn a_reply_that_also_saw_a_denial_is_kept() {
+        let raw = "{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1},\"denied_actions\":[{\"action\":\"command\",\"display_name\":\"RunCommand\"}]}}\n";
+        let parsed = parse_stream_output(raw).unwrap();
+        assert_eq!(parsed.content, "done");
+        // Reported for the caller's warn!, tool name only.
+        let denied = parsed.denied.expect("denial reported");
+        assert!(denied.contains("RunCommand"), "{denied}");
+        // A clean run reports none.
+        let clean = "{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n";
+        assert!(parse_stream_output(clean).unwrap().denied.is_none());
+    }
+
+    #[test]
+    fn a_non_zero_exit_leads_with_the_denied_tool() {
+        let stderr = "error: API error (attempt 1): Error 503, Message: high demand\n";
+        let msg = exit_failure_message(3, DENIED_AFTER_503, stderr, None);
+        assert!(msg.starts_with("Antigravity CLI exited with 3: "), "{msg}");
+        let denial = msg.find("WriteToFile").expect("denial named");
+        let api = msg.find("503").expect("agy's own error kept");
+        assert!(denial < api, "{msg}");
+        // No denial in the stream ⇒ the old shape (stderr only).
+        let plain = exit_failure_message(3, "", stderr, None);
+        assert_eq!(plain, format!("Antigravity CLI exited with 3: {stderr}"));
     }
 
     #[test]
@@ -1276,5 +1593,329 @@ for line in sys.stdin:
             started.lines().any(|l| l == "e2e-agy-mcp"),
             "stub MCP server was not started with the agent id; marker: {started:?}"
         );
+    }
+
+    // ── 2026-10 key route with a REAL Gemini API key (paid inference) ───────
+    //
+    // The removal precondition for the Gemini CLI runtime
+    // (docs/guides/deprecations.md): agy's `api_key` mode must answer with a
+    // real key. Same temp-HOME isolation as the two tests above — the
+    // developer's `~/.gemini` is never read or written. The key comes ONLY from
+    // `DUDUCLAW_AGY_REAL_GEMINI_KEY`; unset ⇒ the tests return without calling
+    // anything. Each test makes exactly one model call. Run with:
+    //   DUDUCLAW_AGY_REAL_GEMINI_KEY="$(cat <key file>)" cargo test -p duduclaw-gateway \
+    //     --lib e2e_agy_api_key_mode_real_key -- --ignored --nocapture --test-threads=1
+    // Optional: `DUDUCLAW_AGY_REAL_MODEL="<display name>"` picks the model for
+    // the named-model case (default: the first "Flash (Low)" entry `agy models`
+    // lists in key mode, else the catalog fallback name).
+
+    const REAL_KEY_ENV: &str = "DUDUCLAW_AGY_REAL_GEMINI_KEY";
+    /// Catalog fallback display name (`runtime_catalog.rs`), used only when
+    /// `agy models` lists nothing in key mode.
+    const CATALOG_FALLBACK_MODEL: &str = "Gemini 3.5 Flash (Medium)";
+
+    fn real_key() -> Option<String> {
+        match std::env::var(REAL_KEY_ENV) {
+            Ok(k) if !k.trim().is_empty() => Some(k.trim().to_string()),
+            _ => {
+                eprintln!(
+                    "{REAL_KEY_ENV} not set — skipping (this test spends one real Gemini call)"
+                );
+                None
+            }
+        }
+    }
+
+    fn write_stub_mcp(dir: &std::path::Path, marker: &std::path::Path) -> std::path::PathBuf {
+        let script = dir.join("stub_mcp.py");
+        std::fs::write(
+            &script,
+            format!(
+                r#"import json, os, sys
+with open({marker:?}, "a") as f:
+    f.write(os.environ.get("DUDUCLAW_AGENT_ID", "<none>") + "\n")
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if "id" not in msg:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {{"protocolVersion": msg.get("params", {{}}).get("protocolVersion", "2024-11-05"),
+                  "capabilities": {{"tools": {{}}}},
+                  "serverInfo": {{"name": "stub", "version": "0"}}}}
+        out = {{"jsonrpc": "2.0", "id": msg["id"], "result": result}}
+    elif method == "tools/list":
+        out = {{"jsonrpc": "2.0", "id": msg["id"], "result": {{"tools": []}}}}
+    else:
+        out = {{"jsonrpc": "2.0", "id": msg["id"], "error": {{"code": -32601, "message": "no"}}}}
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.stdout.flush()
+"#,
+                marker = marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        script
+    }
+
+    /// `agy models` under the temp HOME in key mode (a listing call, no
+    /// inference). Returns `(id, display name)` rows.
+    fn list_models_in_key_mode(agy: &str, user_home: &std::path::Path, key: &str) -> Vec<(String, String)> {
+        let settings = setup::user_settings_path(user_home);
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        if !settings.exists() {
+            std::fs::write(&settings, r#"{"modelProvider":"gemini"}"#).unwrap();
+        }
+        let out = std::process::Command::new(agy)
+            .arg("models")
+            .env("HOME", user_home)
+            .env("GEMINI_API_KEY", key)
+            .env_remove("GOOGLE_API_KEY")
+            .current_dir(user_home)
+            .output();
+        // Leave no settings behind: the runtime must write `modelProvider` itself.
+        let _ = std::fs::remove_file(&settings);
+        let Ok(out) = out else { return Vec::new() };
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(!text.contains(key), "agy models echoed the key");
+        text.lines()
+            .filter_map(|l| {
+                let (id, name) = l.split_once('\t')?;
+                Some((id.trim().to_string(), name.trim().to_string()))
+            })
+            .collect()
+    }
+
+    /// Print the model-selection lines of agy's own log under the temp HOME
+    /// (key-scrubbed), so the run shows which model agy actually used.
+    fn print_agy_model_log_lines(user_home: &std::path::Path, key: &str) {
+        let log_dir = user_home.join(".gemini").join("antigravity-cli").join("log");
+        let Ok(rd) = std::fs::read_dir(&log_dir) else {
+            eprintln!("[model-evidence] no agy log dir");
+            return;
+        };
+        for entry in rd.flatten() {
+            let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+            assert!(!text.contains(key), "agy log contains the key");
+            for line in text.lines() {
+                let lower = line.to_ascii_lowercase();
+                if lower.contains("model") || lower.contains("gemini-") {
+                    let shown = setup::redact_key(line, Some(key));
+                    eprintln!("[model-evidence] {}", duduclaw_core::truncate_bytes(&shown, 400));
+                }
+            }
+        }
+    }
+
+    async fn run_real_key_case(model: Option<String>, agent_id: &str) {
+        let Some(key) = real_key() else { return };
+        let Some(agy) = installed_agy() else {
+            eprintln!("agy not installed — skipping");
+            return;
+        };
+        let Some(python) = installed_python3() else {
+            eprintln!("python3 not installed — skipping");
+            return;
+        };
+        let dirs = e2e_dirs();
+        let marker = dirs.user_home.join("mcp-started.txt");
+        let script = write_stub_mcp(&dirs.user_home, &marker);
+
+        let model = match model {
+            Some(m) => {
+                let listed = list_models_in_key_mode(&agy, &dirs.user_home, &key);
+                eprintln!("[models] agy models in key mode listed {} entries:", listed.len());
+                for (id, name) in &listed {
+                    eprintln!("[models]   {id}\t{name}");
+                }
+                let chosen = if !m.is_empty() {
+                    m
+                } else if let Some((_, name)) = listed
+                    .iter()
+                    .find(|(_, n)| n.contains("Flash") && n.contains("(Low)"))
+                {
+                    name.clone()
+                } else if let Some((_, name)) = listed.first() {
+                    name.clone()
+                } else {
+                    CATALOG_FALLBACK_MODEL.to_string()
+                };
+                eprintln!("[models] using display name: {chosen:?}");
+                chosen
+            }
+            None => String::new(),
+        };
+
+        let mut rt = e2e_runtime(
+            agy,
+            &dirs,
+            (python, vec![script.to_string_lossy().into_owned()]),
+        );
+        rt.hooks.gemini_key = Some(key.clone());
+        let mut ctx = e2e_ctx(&dirs, agent_id);
+        ctx.model = model.clone();
+
+        let res = rt.execute("Reply with exactly: PONG", &ctx).await;
+        print_agy_model_log_lines(&dirs.user_home, &key);
+        let resp = match res {
+            Ok(r) => r,
+            Err(e) => {
+                assert!(!e.contains(&key), "the error text must not carry the key");
+                panic!("real-key agy call failed (model {model:?}): {e}");
+            }
+        };
+        eprintln!(
+            "agy replied (model {model:?}): {:?}; tokens in/out/cache = {}/{}/{}",
+            resp.content, resp.input_tokens, resp.output_tokens, resp.cache_read_tokens
+        );
+        assert!(!resp.content.contains(&key), "the reply must not carry the key");
+        assert!(!resp.content.trim().is_empty(), "empty reply");
+        assert!(resp.content.contains("PONG"), "reply lacks PONG: {:?}", resp.content);
+        assert_eq!(resp.runtime_name, "antigravity");
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(setup::user_settings_path(&dirs.user_home)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["modelProvider"], "gemini");
+
+        let started = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert!(
+            started.lines().any(|l| l == agent_id),
+            "stub MCP server was not started with the agent id; marker: {started:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "spends one real Gemini API call; needs DUDUCLAW_AGY_REAL_GEMINI_KEY"]
+    async fn e2e_agy_api_key_mode_real_key_replies_default_model() {
+        run_real_key_case(None, "e2e-agy-real-default").await;
+    }
+
+    /// A stub MCP server with ONE tool, `ping`, which returns `token` and
+    /// appends `called <tool> agent=<DUDUCLAW_AGENT_ID>` to `log`.
+    fn write_stub_mcp_with_tool(
+        dir: &std::path::Path,
+        log: &std::path::Path,
+        token: &str,
+    ) -> std::path::PathBuf {
+        let script = dir.join("stub_mcp_tool.py");
+        std::fs::write(
+            &script,
+            format!(
+                r#"import json, os, sys
+LOG = {log:?}
+AGENT = os.environ.get("DUDUCLAW_AGENT_ID", "<none>")
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if "id" not in msg:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {{"protocolVersion": msg.get("params", {{}}).get("protocolVersion", "2024-11-05"),
+                  "capabilities": {{"tools": {{}}}},
+                  "serverInfo": {{"name": "stub", "version": "0"}}}}
+        out = {{"jsonrpc": "2.0", "id": msg["id"], "result": result}}
+    elif method == "tools/list":
+        tool = {{"name": "ping", "description": "Returns a token.",
+                "inputSchema": {{"type": "object", "properties": {{}}}}}}
+        out = {{"jsonrpc": "2.0", "id": msg["id"], "result": {{"tools": [tool]}}}}
+    elif method == "tools/call":
+        with open(LOG, "a") as f:
+            f.write("called " + str(msg.get("params", {{}}).get("name")) + " agent=" + AGENT + "\n")
+        out = {{"jsonrpc": "2.0", "id": msg["id"],
+               "result": {{"content": [{{"type": "text", "text": {token:?}}}]}}}}
+    else:
+        out = {{"jsonrpc": "2.0", "id": msg["id"], "error": {{"code": -32601, "message": "no"}}}}
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.stdout.flush()
+"#,
+                log = log.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        script
+    }
+
+    /// The 2026-10 defect: with the default capability level (WorkspaceWrite ⇒
+    /// `--sandbox`) agy's print mode soft-denied every MCP tool call. The model
+    /// must actually call the duduclaw server's tool and get its result back.
+    #[tokio::test]
+    #[ignore = "spends one real Gemini API call; needs DUDUCLAW_AGY_REAL_GEMINI_KEY"]
+    async fn e2e_agy_real_key_default_level_calls_a_duduclaw_mcp_tool() {
+        let Some(key) = real_key() else { return };
+        let Some(agy) = installed_agy() else {
+            eprintln!("agy not installed — skipping");
+            return;
+        };
+        let Some(python) = installed_python3() else {
+            eprintln!("python3 not installed — skipping");
+            return;
+        };
+        let dirs = e2e_dirs();
+        let log = dirs.user_home.join("mcp-calls.txt");
+        let token = "TOKEN-K7Q4Z";
+        let script = write_stub_mcp_with_tool(&dirs.user_home, &log, token);
+
+        let model = match std::env::var("DUDUCLAW_AGY_REAL_MODEL") {
+            Ok(m) if !m.trim().is_empty() => m.trim().to_string(),
+            _ => list_models_in_key_mode(&agy, &dirs.user_home, &key)
+                .into_iter()
+                .map(|(_, name)| name)
+                .find(|n| n.contains("Flash") && n.contains("(Low)"))
+                .unwrap_or_else(|| CATALOG_FALLBACK_MODEL.to_string()),
+        };
+        eprintln!("[models] using display name: {model:?}");
+
+        let mut rt = e2e_runtime(
+            agy,
+            &dirs,
+            (python, vec![script.to_string_lossy().into_owned()]),
+        );
+        rt.hooks.gemini_key = Some(key.clone());
+        let agent_id = "e2e-agy-real-tool";
+        let mut ctx = e2e_ctx(&dirs, agent_id);
+        ctx.model = model.clone();
+        assert!(ctx.capabilities.is_none(), "the default level is under test");
+        assert_eq!(sandbox_args(ctx.capabilities.as_ref()), vec!["--sandbox"]);
+
+        let res = rt
+            .execute(
+                "Call the ping tool of the duduclaw MCP server, then reply with exactly the text it returned.",
+                &ctx,
+            )
+            .await;
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        eprintln!("[mcp] stub call log: {calls:?}");
+        let resp = match res {
+            Ok(r) => r,
+            Err(e) => {
+                assert!(!e.contains(&key), "the error text must not carry the key");
+                panic!("real-key agy tool call failed (model {model:?}): {e}");
+            }
+        };
+        eprintln!(
+            "agy replied (model {model:?}): {:?}; tokens in/out = {}/{}",
+            resp.content, resp.input_tokens, resp.output_tokens
+        );
+        assert!(!resp.content.contains(&key), "the reply must not carry the key");
+        assert!(
+            calls.lines().any(|l| l == format!("called ping agent={agent_id}")),
+            "the stub tool was not called with the agent identity: {calls:?}"
+        );
+        assert!(resp.content.contains(token), "reply lacks the tool result: {:?}", resp.content);
+    }
+
+    #[tokio::test]
+    #[ignore = "spends one real Gemini API call; needs DUDUCLAW_AGY_REAL_GEMINI_KEY"]
+    async fn e2e_agy_api_key_mode_real_key_replies_with_display_name() {
+        let pinned = std::env::var("DUDUCLAW_AGY_REAL_MODEL").unwrap_or_default();
+        run_real_key_case(Some(pinned), "e2e-agy-real-named").await;
     }
 }

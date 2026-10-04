@@ -159,8 +159,11 @@ v1.66.0 標為棄用的所有項目，例外見 [仍在棄用期](#仍在棄用�
 
 **為什麼延後**：原先公告的移除前提，是用真的 Gemini API key 驗證 Antigravity 的 API
 key 模式。驗證時發現，預設權限等級的 Antigravity 員工呼叫平台工具時，會被 Antigravity
-CLI 自己拒絕。修正正在進行。要等這個問題修好並重新驗證之後，才會移除 Gemini CLI
-runtime。
+CLI 自己拒絕。修正已完成，會在下一版出貨：閘道會在操作者的
+`~/.gemini/antigravity-cli/settings.json` 補上兩條放行 `duduclaw` MCP 伺服器的規則
+（細節見[多 runtime](../../features/zh-TW/13-multi-runtime.md)）。移除仍排在
+v1.70.0，前提是這個修正出貨後，再用真的 Gemini API key 重新驗證 Antigravity。重新
+驗證尚未進行。
 
 **還能用的部分**：上面每個舊值照樣解析、照樣執行。讀到時每個行程記一次警告；經儀表板
 （`agents.create`／`agents.update`）寫入時，另記一筆 `runtime_provider_deprecated`
