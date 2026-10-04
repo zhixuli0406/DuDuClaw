@@ -1151,7 +1151,11 @@ mod tests {
             .content
             .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
-        let schema_dir = home.join(".gemini/antigravity-cli/mcp/duduclaw");
+        let schema_dir = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("mcp")
+            .join("duduclaw");
         assert_eq!(
             v["permissions"],
             serde_json::json!({"allow": [
