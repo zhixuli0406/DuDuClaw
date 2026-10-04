@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.69.1] - 2026-10-04 — Antigravity 平台工具權限修正
+
 ### Fixed
 - 修正 Antigravity 權限測試夾具的 Windows 路徑格式：逐層組合目錄並以 JSON 序列化既有規則，避免反斜線差異造成四項測試失敗；正式執行的權限行為不變。
 - **預設權限等級的 Antigravity（`agy`）員工現在可以呼叫平台工具**。agy 1.2.16 在 print mode 會自動拒絕模型對 MCP 工具的呼叫確認，所以預設能力等級（帶 `--sandbox`）的 Antigravity 員工用不了任何 DuDuClaw 的 MCP 工具，只有完全放行的等級（`--dangerously-skip-permissions`）可以。這個缺陷從 v1.67.0 就存在；2026-10-04 用真的 Gemini API key 驗證時才發現，先前的驗證只確認 MCP 伺服器有啟動，模型沒有真的呼叫過工具。修正方式見 Changed 的第一項。
