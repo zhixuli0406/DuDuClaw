@@ -148,6 +148,10 @@ jobs:
           else
             echo "No Python tests found, skipping"
           fi
+      - name: Test distributor release tooling
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_*distributor*.py' -v
+          bash -n scripts/release.sh
 
   security:
     name: Security Audit

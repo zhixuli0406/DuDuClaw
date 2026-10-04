@@ -36,8 +36,9 @@
 #   4. POST-BUMP ASSERT: every platform manifest now reads the new version, else abort
 #   5. Update CHANGELOG.md
 #   6. cargo check
-#   7. git commit + tag
-#   8. Print next steps + the registry-verify command
+#   7. Generate versioned distributor HTML when commercial sources are present
+#   8. git commit + tag
+#   9. Print next steps + the registry-verify command
 #
 # Runtime note (2026-09-08 incident): a full bump run takes roughly 20-45
 # minutes end to end — `cargo check --workspace` right after the version
@@ -406,7 +407,8 @@ echo ""
 
 if $DRY_RUN; then
     echo "[DRY RUN] Would bump every manifest above to $NEW_VERSION, update CHANGELOG,"
-    echo "          cargo check, then commit + tag v$NEW_VERSION."
+    echo "          cargo check, generate distributor HTML when sources exist, then commit + tag v$NEW_VERSION."
+    echo "[DRY RUN] Distributor output: commercial/marketing/distributor/duduclaw-technology-brief-v$NEW_VERSION.html"
     echo "[DRY RUN] After tag push, CI release.yml publishes GitHub + npm + PyPI."
     echo "[DRY RUN] Confirm with: $0 verify $NEW_VERSION"
     exit 0
@@ -655,6 +657,20 @@ if [ -d "commercial/duduclaw-pro-gateway" ]; then
         git reset --hard HEAD
         exit 1
     fi
+fi
+
+# --- Distributor technical brief (private source, separate repository) ---
+# Keep content review dates and historical feature versions intact. The renderer
+# labels a newer release edition separately from the source's reviewed version.
+# A missing private checkout is normal; present but broken sources are fatal.
+# Never stage commercial artifacts in the public release commit.
+echo ""
+echo "Generating distributor technical brief..."
+if ! python3 "$(dirname "$0")/build-distributor-brief.py" --version "$NEW_VERSION" --skip-missing; then
+    echo "Error: distributor HTML generation failed; no release commit or tag was created."
+    echo "       Fix the document source and regenerate before retrying the release."
+    echo "       The version bump remains uncommitted for inspection."
+    exit 1
 fi
 
 # --- Git commit + tag ---
