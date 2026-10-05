@@ -284,6 +284,16 @@ pub(crate) async fn handle_wiki_write(args: &Value, home_dir: &Path, default_age
 
     let is_new = !full_path.exists();
 
+    // P2-B H-4: record where this write came from (host env only).
+    let stamped = match crate::mcp_memory_handlers::host_wiki_stamp(
+        content,
+        std::fs::read_to_string(&full_path).ok().as_deref(),
+    ) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&e),
+    };
+    let content = stamped.as_str();
+
     // Atomic write: temp file + rename
     let tmp_path = full_path.with_extension("md.tmp");
     if let Err(e) = std::fs::write(&tmp_path, content) {

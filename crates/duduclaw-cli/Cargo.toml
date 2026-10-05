@@ -92,6 +92,9 @@ calamine = { version = "=0.36.1", default-features = false, features = ["dates"]
 tempfile = "3"
 
 [dev-dependencies]
+# P2-B: `Provenance::test_only` exists only with this feature (never in a
+# production build).
+duduclaw-memory = { workspace = true, features = ["test-hooks"] }
 tokio = { workspace = true }
 # v1.67.2 namespace tests drive the gateway `memory.forget` RPC as an admin.
 duduclaw-auth = { workspace = true }

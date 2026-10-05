@@ -126,7 +126,7 @@ async fn assign_holds_a_row_a_trusted_fact_outranks() {
         "preferred_name",
         "Mr. Lee",
         duduclaw_memory::origin::OPERATOR.name,
-        1.0,
+        1.0, duduclaw_memory::lineage::Provenance::test_only(),
     )
     .await
     .unwrap();

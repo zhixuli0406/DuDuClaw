@@ -263,6 +263,15 @@ pub(crate) async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, call
         return tool_error(&e);
     }
 
+    // P2-B H-4: record where this write came from (host env only).
+    let stamped = match crate::mcp_memory_handlers::host_wiki_stamp(
+        content,
+        std::fs::read_to_string(wiki_dir.join(page_path)).ok().as_deref(),
+    ) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&e),
+    };
+    let content = stamped.as_str();
     let store = duduclaw_memory::WikiStore::new_shared(home_dir);
     let write_result = store.write_page_with_author(page_path, content, caller_agent);
 

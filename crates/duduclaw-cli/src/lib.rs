@@ -79,6 +79,8 @@ mod service;
 pub mod weekly_report; // Per-agent weekly usage report
 mod knobs_survival;
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
+mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
+mod ai_session_guard; // P2-B: shared "inside an AI employee turn?" check
 mod doctor_mcp_servers; // N5: doctor row for MCP servers DuDuClaw did not write
 #[cfg(test)]
 mod namespace_unification_tests;
