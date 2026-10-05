@@ -15,13 +15,14 @@ use tracing::info;
 /// Canonical column list for `tasks` SELECTs. Kept in one place so
 /// `row_to_task`'s positional indices stay in lock-step with every query.
 /// Order here == field order in `row_to_task`.
-const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_to, created_by, \
+pub(crate) const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_to, created_by, \
      created_at, updated_at, completed_at, blocked_reason, parent_task_id, tags, message_id, \
      claimed_by, claimed_at, lease_expires_at, depends_on, retry_count, max_retries, \
      goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
      source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json, \
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
-     pause_reason, plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id, criteria_ledger";
+     pause_reason, plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json,
+     discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -39,6 +40,7 @@ pub(crate) const CONTINUE_MESSAGE_PREFIX: &str = "\u{0}duduclaw:continue\u{0}";
 // ── Task row ────────────────────────────────────────────────
 
 mod activity;
+mod authority;
 mod claim;
 mod discovery;
 pub(crate) use discovery::DiscoveryDecisionReceipt;
@@ -55,6 +57,7 @@ mod tests;
 #[cfg(test)]
 mod tests_survival_evidence;
 
+pub use authority::{TaskAuthoritySnapshot, task_snapshot_hash};
 pub use plans::plan_order_for_insert;
 pub use pure::{
     deps_satisfied, introduces_dependency_cycle, introduces_parent_cycle, lease_is_expired,
@@ -66,7 +69,7 @@ pub use iterations::IterationDispatchLedger;
 use iterations::{
     iter_escalate_seal_conn, iter_submit_conn, iter_verdict_conn, list_iterations_conn,
 };
-use tasks::row_to_task;
+pub(crate) use tasks::row_to_task;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,9 +81,15 @@ pub enum TaskKind {
 }
 impl TaskKind {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Task => "task", Self::Goal => "goal", Self::Discovery => "discovery" }
+        match self {
+            Self::Task => "task",
+            Self::Goal => "goal",
+            Self::Discovery => "discovery",
+        }
     }
-    pub fn ordinary_worker(self) -> bool { matches!(self, Self::Task | Self::Goal) }
+    pub fn ordinary_worker(self) -> bool {
+        matches!(self, Self::Task | Self::Goal)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +103,11 @@ pub struct TaskRow {
     pub created_by: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Host-controlled contract/authority epoch for bound decisions. Unlike
+    /// `revision_round`, this also changes on edits, hand-offs and cancellation.
+    /// SQLite triggers advance it in the same transaction as every writer.
+    #[serde(default = "default_authority_revision")]
+    pub authority_revision: i64,
     pub completed_at: Option<String>,
     pub blocked_reason: Option<String>,
     pub parent_task_id: Option<String>,
@@ -332,6 +346,10 @@ fn empty_deps() -> String {
     "[]".to_string()
 }
 
+fn default_authority_revision() -> i64 {
+    1
+}
+
 fn default_max_retries() -> i64 {
     3
 }
@@ -356,6 +374,7 @@ impl TaskRow {
             created_by,
             created_at: now.clone(),
             updated_at: now,
+            authority_revision: default_authority_revision(),
             completed_at: None,
             blocked_reason: None,
             parent_task_id: None,

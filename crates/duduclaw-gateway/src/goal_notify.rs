@@ -459,7 +459,13 @@ pub async fn notify_goal_progress(
         // No source and no [proactive] destination — Activity-only, silent.
         return NotifyOutcome::NoTarget;
     };
-    let text = progress_body(task, &progress);
+    // V-M-10: a chat is not a dashboard identity; a task limited to an
+    // audience only announces that something happened.
+    let text = if crate::goal_notify_private::channel_may_carry(home_dir, &task.id, &channel) {
+        progress_body(task, &progress)
+    } else {
+        crate::goal_notify_private::private_progress_body(task, &progress)
+    };
     // W3-1 D5: never narrate progress into a conversation a human is running.
     if let Some(out) = takeover_defer(
         home_dir,
@@ -730,6 +736,15 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
               "goal-notify: agent has no [proactive] notify destination; skipping push");
         return NotifyOutcome::NoTarget;
     };
+    // V-M-10: limited task ⇒ no buttons, no reason, no trajectory (which
+    // would cost a model call over the private work); decide on the dashboard.
+    if !crate::goal_notify_private::channel_may_carry(home_dir, &task.id, &channel) {
+        let link =
+            crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
+        let text = crate::goal_notify_private::private_decision_notice(task, link.as_deref());
+        return send_private_notice(home_dir, task, &channel, &chat_id, "goal.needs_human", &text)
+            .await;
+    }
     // W3-1 D5: checked BEFORE the trajectory LLM call — a card that is going
     // to be held back must not also cost a model call to render.
     const NEEDS_HUMAN_NO_BUTTON_HINT: &str =
@@ -792,6 +807,40 @@ pub async fn notify_goal_needs_human(home_dir: &Path, task: &TaskRow) -> NotifyO
     .await
 }
 
+/// A content-free plain notice (V-M-10), with the same takeover deferral as
+/// the other goal pushes.
+async fn send_private_notice(
+    home_dir: &Path,
+    task: &TaskRow,
+    channel: &str,
+    chat_id: &str,
+    kind: &str,
+    text: &str,
+) -> NotifyOutcome {
+    if let Some(out) = takeover_defer(
+        home_dir,
+        &task.assigned_to,
+        channel,
+        chat_id,
+        NotifyLevel::Fyi,
+        kind,
+        text,
+        None,
+    ) {
+        return out;
+    }
+    let Some(token) = channel_token(home_dir, &task.assigned_to, channel).await else {
+        return NotifyOutcome::NoTarget;
+    };
+    let http = reqwest::Client::new();
+    if crate::channel_sender::send_plain_text(home_dir, &http, channel, &token, chat_id, text).await
+    {
+        NotifyOutcome::Sent
+    } else {
+        NotifyOutcome::SendFailed
+    }
+}
+
 /// O5: the shared push, mapped onto this module's three-state outcome.
 ///
 /// `attempted == 0` means the token vanished between the pre-render probe and
@@ -827,6 +876,14 @@ pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &
     let Some((channel, chat_id)) = agent_notify_target(home_dir, &task.assigned_to) else {
         return false;
     };
+    if !crate::goal_notify_private::channel_may_carry(home_dir, &task.id, &channel) {
+        let link =
+            crate::deep_link::deep_link(home_dir, crate::deep_link::DeepLinkKind::Task, &task.id);
+        let text = crate::goal_notify_private::private_decision_notice(task, link.as_deref());
+        return send_private_notice(home_dir, task, &channel, &chat_id, "goal.observer", &text)
+            .await
+            != NotifyOutcome::SendFailed;
+    }
     let reason = task
         .judge_feedback
         .as_deref()
@@ -1119,6 +1176,11 @@ pub(crate) async fn apply_needs_human(
     let Some(task) = task else {
         return Err("找不到此任務".into());
     };
+    // V-M-10: a press on an older card for a task now limited to an
+    // audience; the chat user cannot be checked against it.
+    if !crate::goal_notify_private::channel_may_carry(home_dir, &task.id, channel) {
+        return Err(crate::goal_notify_private::PRIVATE_CHANNEL_DECISION_REFUSED.into());
+    }
 
     // The same authorization matrix as every other decision source. Until
     // this gate existed, anyone who could see the card could retry, close or
