@@ -82,6 +82,11 @@ fn aged(age_secs: i64, ttl: i64, reminded: bool) -> ApprovalRecord {
         notify_chat_id: None,
         reminded_at: reminded.then(|| Utc::now().to_rfc3339()),
         simulation: None,
+        request_kind: crate::approval::RequestKind::Approval,
+        binding: None,
+        answer: None,
+        invalidated_reason: None,
     }
 }
 
+mod bound_cases;
