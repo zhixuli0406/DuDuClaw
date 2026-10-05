@@ -90,6 +90,7 @@ const DESCRIBED_KINDS = new Set([
   'support_pilot_review',
   'discovery',
   'knowledge_quarantine',
+  'memory_forget_source',
 ]);
 
 /** D1/D2: `true` when there is an actual narrative or risk point to show —

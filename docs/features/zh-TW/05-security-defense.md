@@ -128,6 +128,21 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 
 ---
 
+## 依來源忘記需要管理員核准
+
+`duduclaw memory forget-source` 會永久刪除記憶，所以前面有三道關。操作步驟見[忘記對話、排程執行或匯入檔案](../../guides/zh-TW/memory-and-knowledge.md#45-忘記對話排程執行或匯入檔案)，機制見[記憶智能](20-memory-intelligence.md#記憶來源與依來源忘記)。
+
+**儀表板核准。** `plan` 會送出一筆核准請求（`action_kind` 為 `memory_forget_source`），綁定計畫 id 與計畫雜湊。這筆請求只能在儀表板決定，也只有管理員能決定；通道按鈕與回覆一律拒絕。`apply --confirm` 只有在該請求已核准、仍指向同一個計畫雜湊、且計畫未過期時才會執行。請求與計畫一起到期（預設 30 分鐘，最長 24 小時）。卡片只放數量與來源標籤，不放記憶內容，並以固定文字說明這筆請求來自本機指令列、系統無法確認是誰下的指令。沒有任何設定能關掉這道核准；`[memory] forget_source = false` 只會停止建立新計畫與套用。
+
+**Bash 規則。** 對帶員工身分或身分未驗證的呼叫者，`agent-file-guard` 的 Bash 通道會拒絕 `duduclaw`、`duduclaw-pro`（含路徑或 `.exe`）後接 `memory forget-source` 或 `memory migrate-namespace` 的指令，任何子指令都擋，連唯讀的 `list` 也一樣。判定結果是 `BlockedOperatorMemoryCommand`，訊息會請員工去找操作者。`migrate-namespace` 以前不在 Bash 通道的涵蓋內。這是減速帶，不是沙箱，擋不住：
+
+- `memory` 與子指令之間插了全域選項，例如 `duduclaw memory --redact on forget-source …`；
+- 用指令替換組出執行檔，例如 `"$(command -v duduclaw)" memory forget-source …`；
+- 把指令字串經管線交給執行檔，例如 `echo memory forget-source … | xargs duduclaw`；
+- 其他能避開指令名稱比對的寫法，以及「這些守衛擋不住什麼」列出的其他繞法。
+
+**AI session 判斷。** 只要程序環境裡有 gateway 替員工程序設定的任何一個變數（即使是空值），指令本身就會拒絕執行：員工身分與 token、回合與對話 id、該回合的使用者訊息序號與時間、派工的 session 與 run id、委派的發送者／來源／深度、hop 深度、回覆通道。操作者自己的終端機不帶這些變數。這項檢查只是第一道。對直接從員工 Bash 執行的指令並不可靠，因為有 Bash 的員工可以把變數 unset。真正的隔離是不授予 Bash，或讓員工跑在任務沙箱裡。以同一個作業系統使用者執行、能跑任意指令並刻意繞過檔案守門的員工，仍然可以直接改寫本機資料庫（`approvals.db`、`memory.db`）。
+
 ## 支撐層
 
 **MCP 授權閘** — 每個 MCP 工具都在 scope 表裡逐項列舉；沒被列的工具預設需要 Admin scope。Scope、per-agent capability 授權、`denied_tools` 三者各自在分派總門強制，每次拒絕都帶 `error_class` 落稽核。
@@ -155,6 +170,7 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 - **Hook 看得到的是 Claude Code 自己的工具呼叫，不是 MCP 工具呼叫。** MCP 有自己的閘（scope、授權、`denied_tools`）；hook 是內建 `Write`／`Edit`／`Read`／`Bash` 那面的第二道鎖。
 - **`agent-file-guard` 的 Bash 通道是啟發式。** 它讀的是指令文字，下列情況都擋不住：由變數（`$DUDUCLAW_HOME`，以及資料目錄在預設位置時的 `~/.duduclaw`、`$HOME/.duduclaw` 除外）、指令替換或其他計算產生的路徑；編碼後的指令；先寫成腳本再執行；把 here-document 餵給直譯器；別名與函式；透過環境變數讓之後啟動的 shell 載入某個檔案；清單內唯讀指令沒有被考慮到的寫檔選項；沒有寫明目的地的解壓縮或下載指令，它們寫進目前的工作目錄，而這條通道不判斷目前目錄，所以先切換進資料目錄再執行就不會被擋；在同一條指令裡先建立連結再透過它寫入；硬連結；以及檢查與實際執行之間的時間差。
 - **Bash 通道也會誤擋一些無害的指令。** 受檢位置上的路徑解析失敗時一律拒絕，即使路徑在資料目錄以外；懸空的符號連結即使指向資料目錄以外也會被拒絕。
+- **只限操作者的記憶指令靠減速帶與核准把關，不是沙箱。** `memory forget-source` 與 `memory migrate-namespace` 的 Bash 規則擋不住子指令前的全域選項、用指令替換組出的執行檔名稱與經管線傳入的指令，AI session 判斷也能靠 unset 變數繞過。真正的關卡是儀表板核准，見[依來源忘記需要管理員核准](#依來源忘記需要管理員核准)。
 - **`agent-file-guard` 不涵蓋 `Read`。** 留出集與稽核紀錄員工仍然讀得到，hook 只擋寫入。
 - **只有 Claude runtime 會跑這些 hook。** Codex、Gemini、Antigravity 與其他 runtime 靠各自的沙箱旗標。
 - **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。

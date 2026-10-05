@@ -128,6 +128,21 @@ Legitimate changes keep every route they had: the MCP `agent_update` tool and th
 
 ---
 
+## Forget by source needs an Admin approval
+
+`duduclaw memory forget-source` deletes memories for good, so it has three layers in front of it. The procedure is in [Forgetting a conversation, a scheduled run or an imported file](../guides/memory-and-knowledge.md#45-forgetting-a-conversation-a-scheduled-run-or-an-imported-file); the mechanism is in [Memory Intelligence](20-memory-intelligence.md#source-lineage-and-forgetting-by-source).
+
+**Dashboard approval.** `plan` files one approval request (`action_kind` `memory_forget_source`) bound to the plan id and the plan hash. It can only be decided in the dashboard and only by an Admin; channel buttons and replies are refused. `apply --confirm` runs only when that request is approved, still names the same plan hash, and the plan has not expired. The request expires together with the plan (30 minutes by default, at most 24 hours). The card carries counts and source labels, never memory content, and says in fixed text that the request came from a local command line and that nothing proves who typed it. No setting turns this approval off. `[memory] forget_source = false` only stops new plans and applies.
+
+**Bash lane rule.** For an employee-identified or unverified caller, the Bash lane of `agent-file-guard` refuses `duduclaw` and `duduclaw-pro` (also by path or as `.exe`) followed by `memory forget-source` or `memory migrate-namespace`, with any subcommand, including the read-only `list`. The decision is `BlockedOperatorMemoryCommand` and the message tells the employee to ask the operator. `migrate-namespace` was not covered by the Bash lane before. This is a speed bump, not a sandbox. It does not catch:
+
+- a global option between `memory` and the subcommand, for example `duduclaw memory --redact on forget-source …`;
+- a binary named through command substitution, for example `"$(command -v duduclaw)" memory forget-source …`;
+- the words handed to the binary through a pipe, for example `echo memory forget-source … | xargs duduclaw`;
+- other spellings that avoid matching on the command name, and the evasions listed under "What these guards do not cover".
+
+**AI session check.** The command itself refuses to run when any variable that the gateway sets on a spawned employee process is present, even empty: the employee identity and token, the turn and session ids, the user-message pair of the turn, the dispatch session and run ids, the delegation sender, origin and depth, the hop depth and the reply channel. An operator's own terminal carries none of them. This check is only a first line. It is not reliable for a command run directly from an employee's Bash, because an employee with Bash can unset variables. Real isolation is not granting Bash, or running the employee in the task sandbox. An employee that runs as the same operating-system user, can execute arbitrary commands and deliberately evades the file guard can still rewrite the local databases (`approvals.db`, `memory.db`) directly.
+
 ## Supporting layers
 
 **MCP authorization gate** — every MCP tool is enumerated in a scope table; a tool that is not listed defaults to requiring Admin scope. Scope, per-agent capability grants and `denied_tools` are each enforced at the dispatcher front door, and every refusal is audited with an `error_class`.
@@ -154,6 +169,7 @@ Saying this plainly is part of the defense.
 
 - **The hooks see Claude Code's own tool calls, not MCP tool calls.** MCP has its own gate (scopes, grants, `denied_tools`); the hooks are the second lock, on the built-in `Write` / `Edit` / `Read` / `Bash` surface.
 - **The Bash lane of `agent-file-guard` is a heuristic.** It reads command text, so these get past it: a path computed from a variable (other than `$DUDUCLAW_HOME`, and `~/.duduclaw` / `$HOME/.duduclaw` when the home is in the default place), from command substitution or from any other calculation; an encoded command; a script written to disk and then run; a here-document fed to an interpreter; aliases and functions; an environment variable that makes a shell started later load a file; a write option of a listed read-only command that the list did not account for; an extraction or download command with no explicit destination, which writes into the current directory (the lane does not judge the current directory, so changing into the home first and then running it is not stopped); a link created and then written through within the same command; hard links; and the time gap between the check and the actual execution.
+- **Operator-only memory commands are guarded by a speed bump and an approval, not a sandbox.** The Bash lane rule for `memory forget-source` and `memory migrate-namespace` misses a global option before the subcommand, a binary named by command substitution and a piped command, and the AI-session check can be defeated by unsetting variables. The dashboard approval is the gate; see [Forget by source needs an Admin approval](#forget-by-source-needs-an-admin-approval).
 - **The Bash lane also refuses some harmless commands.** A judged path whose resolution fails is refused even when it lies outside the home, and a dangling symbolic link is refused even when it points outside the home.
 - **`agent-file-guard` does not cover `Read`.** Held-out eval sets and the audit log remain readable to an employee; the hook only stops writes.
 - **Only the Claude runtime runs these hooks.** Codex, Gemini, Antigravity and the other runtimes rely on their own sandbox flags.
