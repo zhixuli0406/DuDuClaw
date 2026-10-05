@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Clock, Play, Pause, Trash2, Plus, Pencil, MoreHorizontal, FlaskConical } from 'lucide-react';
 import { api } from '@/lib/api';
@@ -7,6 +7,8 @@ import { debounceTrailing } from '@/lib/debounce';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { toast } from '@/lib/toast';
+import { runStatusText } from '@/components/workflow/workflow-text';
+import { createRequestIdKeeper, serverAnswered } from '@/lib/request-id-keeper';
 import {
   CollectionPageHeader,
   CollectionPageState,
@@ -410,6 +412,45 @@ export function RoutinesPage() {
     };
   }, [connectionState, load]);
 
+  // One request id per "run now" press, kept until the server answers so a
+  // retry after a lost reply reconnects to the same run instead of starting
+  // another one (a routine bound to a workflow requires the id).
+  const runNowIds = useRef(createRequestIdKeeper());
+  const runNow = useCallback(
+    async (id: string) => {
+      const requestId = runNowIds.current.take(id);
+      setBusy((p) => ({ ...p, [id]: true }));
+      try {
+        const res = await api.cron.runNow(id, requestId);
+        runNowIds.current.settle(id);
+        toast.success(
+          res?.run_status
+            ? intl.formatMessage(
+                { id: 'routines.runNowStatus' },
+                { status: runStatusText(intl, res.run_status) },
+              )
+            : intl.formatMessage({ id: 'routines.runNowToast' }),
+        );
+        await load();
+      } catch (e) {
+        // A stated refusal ends this press; the next one is a new request.
+        // A timeout or lost connection keeps the id for the retry.
+        if (serverAnswered(e)) runNowIds.current.settle(id);
+        console.warn('[api]', e);
+        toast.error(
+          intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: errorText(e) }),
+        );
+      } finally {
+        setBusy((p) => {
+          const next = { ...p };
+          delete next[id];
+          return next;
+        });
+      }
+    },
+    [intl, load, errorText],
+  );
+
   const act = useCallback(
     async (id: string, fn: () => Promise<unknown>, successId: string) => {
       setBusy((p) => ({ ...p, [id]: true }));
@@ -514,7 +555,7 @@ export function RoutinesPage() {
                   }
                   onEdit={() => setDialog(r)}
                   onRemove={() => setToRemove(r)}
-                  onRunNow={() => act(r.id, () => api.cron.runNow(r.id), 'routines.runNowToast')}
+                  onRunNow={() => void runNow(r.id)}
                 />
               ))}
             </ListGridContainer>
