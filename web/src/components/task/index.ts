@@ -34,3 +34,6 @@ export {
 // I-3b: pin/rename/archive — not goal-specific, but currently only consumed
 // by `/goals`.
 export { TaskListActionsMenu, RenameTaskDialog } from './TaskListActionsMenu';
+// P2-A: operator direction for the next round, and stopping a task.
+export { SteeringPanel } from './SteeringPanel';
+export { StopTaskButton } from './StopTaskButton';

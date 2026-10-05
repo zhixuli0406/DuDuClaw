@@ -5085,6 +5085,45 @@ export interface TemplateCreateAgentResult {
   agent: { name: string; role: string; role_id: string };
 }
 
+/** P2-A: one operator direction for a goal task's next round. */
+export interface TaskSteeringEntry {
+  steering_id: string;
+  task_id: string;
+  seq: number;
+  body: string;
+  submitted_by: string;
+  /** `pending` | `delivering` | `applied` | `discarded` */
+  state: string;
+  applied_round: number | null;
+  /** `task_finished` | `task_cancelled` when discarded. */
+  discard_reason: string | null;
+  /** The server's injection-scan result for the text (JSON). */
+  guard_flags_json?: string;
+  created_at: string;
+}
+
+/** P2-A: a stop request as the server reports it. */
+export interface TaskStopStatus {
+  root_task_id: string;
+  /** `cancel_pending` | `stopped` | `stopped_uncertain` */
+  state: string;
+  affected_task_ids: string[];
+  detail: {
+    running_turns: number;
+    team_rounds_running: number;
+    operations_executing: number;
+    operations_uncertain: number;
+    approval_store_unavailable: boolean;
+    unverified_work_possible: boolean;
+    unverified_hold_until: string | null;
+    dispatch_in_flight?: number;
+    claims_running?: number;
+    claims_unconfirmed?: number;
+    tree_still_open?: number;
+    tree_beyond_scan?: boolean;
+  };
+}
+
 export const api = {
   /** WebChat past-conversation browsing + resume (WP3). Goes through the
    *  dashboard RPC (authz enforced server-side — a non-admin caller must pass a
@@ -6779,6 +6818,34 @@ export const api = {
         message: string;
         task: TaskInfo | null;
       }>,
+    // ── P2-A: operator direction for the next round, and stop ──
+    /** Directions given to a running goal task, oldest first, plus the
+     *  task's current authority revision (needed by `stop`). */
+    steering: (taskId: string) =>
+      client.call('tasks.steering', { task_id: taskId }) as Promise<{
+        steering: TaskSteeringEntry[];
+        authority_revision: number;
+      }>,
+    /** Give the employee one direction for its next round. `clientRequestId`
+     *  makes a retried submit idempotent. */
+    steer: (taskId: string, body: string, clientRequestId: string) =>
+      client.call('tasks.steer', { task_id: taskId, body, client_request_id: clientRequestId }) as Promise<{
+        steering: TaskSteeringEntry;
+        duplicate: boolean;
+      }>,
+    /** Where a stop stands (`stop: null` when none was requested). */
+    stopStatus: (taskId: string) =>
+      client.call('tasks.stop_status', { task_id: taskId }) as Promise<{
+        stop: TaskStopStatus | null;
+        authority_revision: number;
+      }>,
+    /** Stop the task and its sub-tasks. Fails if the task changed since
+     *  `expectedAuthorityRevision` was read. */
+    stop: (taskId: string, expectedAuthorityRevision: number) =>
+      client.call('tasks.stop', {
+        task_id: taskId,
+        expected_authority_revision: expectedAuthorityRevision,
+      }) as Promise<{ stop: TaskStopStatus }>,
     // ── I-3b: task list operations (search/pin/archive/rename, 2026-08-15) ──
     // Thin wrappers over `tasks.archive`/`tasks.unarchive`/`tasks.pin`/
     // `tasks.unpin`/`tasks.rename` — the gateway implements each as a
