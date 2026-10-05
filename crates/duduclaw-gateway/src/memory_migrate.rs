@@ -145,7 +145,8 @@ fn copy_all_tables(conn: &mut Connection) -> Result<(usize, usize), String> {
         0
     } else {
         let cols = shared_columns(&tx, "memories")?;
-        insert_missing(&tx, "memories", &cols)?;
+        insert_pending(&tx, "memories", &cols)?;
+        copy_lineage(&tx, "memories")?;
         for id in &new_memory_ids {
             tx.execute(
                 "INSERT INTO memories_fts (content, agent_id, memory_id)
@@ -166,7 +167,8 @@ fn copy_all_tables(conn: &mut Connection) -> Result<(usize, usize), String> {
         0
     } else {
         let cols = shared_columns(&tx, "key_facts")?;
-        insert_missing(&tx, "key_facts", &cols)?;
+        insert_pending(&tx, "key_facts", &cols)?;
+        copy_lineage(&tx, "key_facts")?;
         for id in &new_fact_ids {
             tx.execute(
                 "INSERT INTO key_facts_fts (rowid, fact)
@@ -179,11 +181,13 @@ fn copy_all_tables(conn: &mut Connection) -> Result<(usize, usize), String> {
     };
 
     // ── entity graph side tables (composite PKs → OR IGNORE suffices) ───
+    // Aliases are operator-curated data and are kept. `entity_embedding` is
+    // NOT copied (P2-B): it is a cache the search path rebuilds lazily from
+    // live triples only, and a stray file's rows may name entities whose
+    // triples were forgotten in the shared db.
     tx.execute_batch(
         "INSERT OR IGNORE INTO main.entity_alias (agent_id, canonical, alias, created_at)
-             SELECT agent_id, canonical, alias, created_at FROM src.entity_alias;
-         INSERT OR IGNORE INTO main.entity_embedding (agent_id, entity, model, vec, created_at)
-             SELECT agent_id, entity, model, vec, created_at FROM src.entity_embedding;",
+             SELECT agent_id, canonical, alias, created_at FROM src.entity_alias;",
     )
     .map_err(|e| format!("entity tables: {e}"))?;
 
@@ -204,19 +208,58 @@ fn copy_all_tables(conn: &mut Connection) -> Result<(usize, usize), String> {
                 source_event TEXT DEFAULT '',
                 archived_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            INSERT OR IGNORE INTO main.memories_archive
-                SELECT * FROM src.memories_archive;",
+",
         )
         .map_err(|e| format!("memories_archive: {e}"))?;
+        // P2-B: an archived copy of a forgotten row (by id or by source)
+        // must not come back with a stray file.
+        let sql = format!(
+            "INSERT OR IGNORE INTO main.memories_archive
+                SELECT * FROM src.memories_archive a
+                WHERE a.id NOT IN (SELECT memory_id FROM main.forgotten_memories
+                                   WHERE memory_store = 'memories')
+                  AND NOT {}",
+            src_lineage_fenced("memories", "a.id")
+        );
+        tx.execute_batch(&sql)
+            .map_err(|e| format!("memories_archive copy: {e}"))?;
     }
 
     tx.commit().map_err(|e| format!("commit: {e}"))?;
     Ok((mem_rows, fact_rows))
 }
 
-/// Ids present in `src.<table>` but not in `main.<table>`.
+/// P2-B: `NOT EXISTS`-ready predicate — true when the source-db row `id_expr`
+/// of `table` carries a lineage source the shared db has forgotten.
+fn src_lineage_fenced(table: &str, id_expr: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM src.memory_origins o
+                 WHERE o.memory_store = '{table}' AND o.memory_id = {id_expr}
+                   AND {})",
+        duduclaw_memory::lineage::tombstone_match_expr(
+            "main.forgotten_sources",
+            "o.agent_id",
+            "o.source_session",
+            "o.source_message",
+            "o.source_seq",
+            "o.source_observed_at",
+        )
+    )
+}
+
+/// Ids present in `src.<table>` but not in `main.<table>` that may be copied:
+/// never an id the shared db forgot, never a row whose recorded source the
+/// shared db forgot (P2-B, G17). Also loads them into `temp.merge_<table>`
+/// for [`insert_pending`] and [`copy_lineage`].
 fn pending_ids(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
-    let sql = format!("SELECT id FROM src.{table} WHERE id NOT IN (SELECT id FROM main.{table})");
+    let sql = format!(
+        "SELECT s.id FROM src.{table} s
+         WHERE s.id NOT IN (SELECT id FROM main.{table})
+           AND s.id NOT IN (SELECT memory_id FROM main.forgotten_memories
+                            WHERE memory_store = '{table}')
+           AND NOT {}",
+        src_lineage_fenced(table, "s.id")
+    );
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| format!("{table} ids: {e}"))?;
@@ -225,7 +268,32 @@ fn pending_ids(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
         .map_err(|e| format!("{table} ids: {e}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("{table} ids: {e}"))?;
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE IF NOT EXISTS merge_{table} (id TEXT PRIMARY KEY);
+         DELETE FROM temp.merge_{table};"
+    ))
+    .map_err(|e| format!("{table} merge set: {e}"))?;
+    for id in &ids {
+        conn.execute(&format!("INSERT OR IGNORE INTO temp.merge_{table} (id) VALUES (?1)"), [id])
+            .map_err(|e| format!("{table} merge set: {e}"))?;
+    }
     Ok(ids)
+}
+
+/// Copy the source rows' lineage for the merged ids (rows written by a
+/// lineage-aware binary into a stray file; older stray rows have none and
+/// arrive untracked).
+fn copy_lineage(conn: &Connection, table: &str) -> Result<(), String> {
+    let cols = "memory_store, memory_id, agent_id, source_kind, source_session, source_message, \
+                source_seq, source_observed_at, source_hash, role, via_memory_id, created_at";
+    let sql = format!(
+        "INSERT OR IGNORE INTO main.memory_origins ({cols})
+         SELECT {cols} FROM src.memory_origins
+         WHERE memory_store = '{table}' AND memory_id IN (SELECT id FROM temp.merge_{table})"
+    );
+    conn.execute_batch(&sql)
+        .map_err(|e| format!("{table} lineage copy: {e}"))?;
+    Ok(())
 }
 
 /// Column names present in BOTH `main.<table>` and `src.<table>`, in the
@@ -256,13 +324,13 @@ fn shared_columns(conn: &Connection, table: &str) -> Result<String, String> {
     Ok(cols.join(", "))
 }
 
-/// `INSERT INTO main.<table> (cols) SELECT cols FROM src.<table>` for rows
-/// whose id is not yet in main.
-fn insert_missing(conn: &Connection, table: &str, cols: &str) -> Result<(), String> {
+/// `INSERT INTO main.<table> (cols) SELECT cols FROM src.<table>` for the
+/// rows [`pending_ids`] admitted.
+fn insert_pending(conn: &Connection, table: &str, cols: &str) -> Result<(), String> {
     let sql = format!(
         "INSERT INTO main.{table} ({cols})
          SELECT {cols} FROM src.{table}
-         WHERE id NOT IN (SELECT id FROM main.{table})"
+         WHERE id IN (SELECT id FROM temp.merge_{table})"
     );
     conn.execute_batch(&sql)
         .map_err(|e| format!("{table} copy: {e}"))?;
@@ -357,7 +425,7 @@ mod tests {
                 "user prefers daily strategy briefings",
                 "telegram",
                 "c1",
-                "s1",
+                "s1", duduclaw_memory::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -369,7 +437,7 @@ mod tests {
                 "position: 36 shares of 00919",
                 "telegram",
                 "c1",
-                "s2",
+                "s2", duduclaw_memory::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();

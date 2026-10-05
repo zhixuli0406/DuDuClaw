@@ -968,7 +968,7 @@ mod tests {
             source_event: "conversation_summary".to_string(),
         };
         engine
-            .store_temporal(agent, entry, TemporalMeta::default())
+            .store_temporal(agent, entry, TemporalMeta::default(), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         drop(engine); // release the connection before re-opening in the helper

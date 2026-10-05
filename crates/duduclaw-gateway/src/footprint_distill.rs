@@ -429,10 +429,28 @@ async fn write_footprint_triples(
         };
         // L5: a supersession-guard refusal (a more trusted value holds this
         // key) skips this triple and logs; real errors still propagate.
-        match engine.store_temporal_outcome(agent_id, entry, meta).await? {
+        // P2-B (G7): the source is this employee's footprint day, not a
+        // conversation; it can be forgotten as `footprint:<agent>` / `day:<date>`.
+        let source = crate::memory_provenance::footprint_day_source(
+            agent_id,
+            &stats.date.format("%Y-%m-%d").to_string(),
+            Utc::now(),
+        );
+        match engine
+            .store_temporal_outcome(
+                agent_id,
+                entry,
+                meta,
+                duduclaw_memory::lineage::Provenance::source(source),
+            )
+            .await?
+        {
             duduclaw_memory::TemporalWriteOutcome::Stored(id) => ids.push(id),
             duduclaw_memory::TemporalWriteOutcome::Refused(r) => {
                 tracing::info!(agent = agent_id, "footprint triple skipped: {r}");
+            }
+            duduclaw_memory::TemporalWriteOutcome::Fenced(r) => {
+                tracing::info!(agent = agent_id, "footprint triple skipped (source forgotten): {r}");
             }
         }
     }
@@ -1157,7 +1175,7 @@ mod tests {
                     object: Some("operator".into()),
                     origin: Some("operator".into()),
                     ..TemporalMeta::default()
-                },
+                }, duduclaw_memory::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -1167,6 +1185,39 @@ mod tests {
         stats.hour_counts[9] = 3;
         let ids = write_footprint_triples(&engine, "agent-x", &stats).await.unwrap();
         assert_eq!(ids.len(), 2, "hours refused, app + directory written");
+    }
+
+    /// P2-B (G7): a forgotten footprint day is never written again; another
+    /// day still is.
+    #[tokio::test]
+    async fn forgotten_footprint_day_is_not_written_again() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let day = |d: u32| {
+            let mut s = AgentDayStats::new(NaiveDate::from_ymd_opt(2026, 7, d).unwrap());
+            s.app_seconds.insert("VSCode".into(), 3600);
+            s
+        };
+        assert_eq!(write_footprint_triples(&engine, "agent-x", &day(20)).await.unwrap().len(), 1);
+        let sel = duduclaw_memory::ForgetSelector {
+            session: "footprint:agent-x".into(),
+            messages: vec!["day:2026-07-20".into()],
+            upto_seq: None,
+            upto_time: None,
+        };
+        let plan = match engine
+            .plan_forget_source("agent-x", &sel, Default::default(), &Default::default())
+            .await
+            .unwrap()
+        {
+            duduclaw_memory::PlanOutcome::Planned(p) => p,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            engine.apply_forget_plan(&plan.plan_id, &Default::default()).await.unwrap(),
+            duduclaw_memory::ApplyOutcome::Applied(_)
+        ));
+        assert!(write_footprint_triples(&engine, "agent-x", &day(20)).await.unwrap().is_empty());
+        assert_eq!(write_footprint_triples(&engine, "agent-x", &day(21)).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

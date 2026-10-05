@@ -272,6 +272,25 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    // ── Forget by source: resume unfinished external steps (P2-B, D10) ───
+    // An apply already deleted the rows and wrote the tombstones; what may
+    // remain are its follow-up steps (auto wiki pages, review cards, hiding
+    // the messages, clearing the session summary). They are idempotent and
+    // only carry out what the operator confirmed, so they run in the
+    // background without delaying boot — and again every 10 minutes, so a
+    // CLI apply killed after commit is finished by the running gateway rather
+    // than at its next restart (P2-B L-2).
+    {
+        let home_for_forget = home_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                interval.tick().await;
+                crate::memory_forget_steps::resume_unfinished_at_boot(&home_for_forget).await;
+            }
+        });
+    }
+
     let extension = config.extension.clone();
     let edition_override = config.edition;
     {

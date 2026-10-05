@@ -176,17 +176,21 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
 /// could be the very person who made the claim.
 pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
     kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
+        || kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE
 }
 
 /// What a refused channel decision for a [`is_dashboard_only_kind`] approval
 /// says.
 pub(crate) const DASHBOARD_ONLY_REFUSAL: &str =
-    "這則知識審核只能在儀表板的待辦清單決定，請開啟儀表板處理（這裡的回覆不會生效）。";
+    "這則審核只能在儀表板的待辦清單決定，請開啟儀表板處理（這裡的回覆不會生效）。";
 
 /// The zh-TW body of the plain notice for a dashboard-only approval. Carries
 /// no claim text, no stored value and no decision verb — only that something
 /// is waiting, for which AI employee, and until when.
 pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
+    if rec.action_kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE {
+        return crate::memory_forget_approval::notice_body(rec, reminder, &deadline_phrase(rec));
+    }
     let head = if reminder {
         "⏰ 有一則知識審核快到期了，逾時會自動捨棄"
     } else {

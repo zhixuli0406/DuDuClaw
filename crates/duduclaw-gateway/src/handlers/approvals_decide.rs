@@ -39,7 +39,13 @@ impl MethodHandler {
                 let _ = broker.poll(&approval_id).await;
                 return WsFrame::error_response(
                     "",
-                    "這則知識審核已逾期，已自動捨棄，無法再核准。",
+                    if rec.action_kind
+                        == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE
+                    {
+                        "這筆忘記請求已逾期，已自動拒絕；請重新建立計畫。"
+                    } else {
+                        "這則知識審核已逾期，已自動捨棄，無法再核准。"
+                    },
                 );
             }
         }
@@ -59,6 +65,16 @@ impl MethodHandler {
             let kind = crate::governance::ApprovalKind::parse(&rec.action_kind);
             // Decision Lab is admin-only. A manager who cannot inspect the
             // exact synthetic run must not mint its human-inspection receipt.
+            // Forget by source deletes memory irreversibly: Admin only.
+            if rec.action_kind
+                == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE
+                && !ctx.is_admin()
+            {
+                return WsFrame::error_response(
+                    "",
+                    "依來源刪除記憶的請求只有管理員（Admin）能決定",
+                );
+            }
             if rec.action_kind == "support_pilot_review" && !ctx.is_admin() {
                 return WsFrame::error_response(
                     "",

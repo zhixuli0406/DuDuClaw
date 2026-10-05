@@ -18,6 +18,20 @@ pub enum DuDuClawError {
     #[error("memory error: {0}")]
     Memory(String),
 
+    /// A memory write refused by the source fence (forget by source): its
+    /// source, or a parent row, was forgotten, a parent is missing, or it
+    /// carries too many sources. Not a failure of the store. Carries only a
+    /// reason token and digests, never content or source keys.
+    #[error("source forgotten: {detail}")]
+    SourceFenced {
+        /// `source_forgotten` / `parent_forgotten` / `parent_missing` /
+        /// `lineage_overflow`.
+        reason: String,
+        source_digest: Option<String>,
+        /// Human-readable, digest-only description.
+        detail: String,
+    },
+
     #[error("gateway error: {0}")]
     Gateway(String),
 

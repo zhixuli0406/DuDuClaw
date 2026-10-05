@@ -807,6 +807,12 @@ pub fn check_bash_protected_write_in(
         .collect();
     let slashed = bash_parse::strip_fd_redirects(&slashed);
     for normalized in [unescaped.as_str(), slashed.as_str()] {
+        let d = bash_lane::bash_operator_memory_command(normalized, caller);
+        if !d.is_allowed() {
+            return d;
+        }
+    }
+    for normalized in [unescaped.as_str(), slashed.as_str()] {
         let d = bash_lane::bash_name_rules(normalized, home, caller);
         if !d.is_allowed() {
             return d;

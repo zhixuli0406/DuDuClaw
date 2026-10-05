@@ -360,6 +360,7 @@ pub(crate) async fn enqueue_goal_work(
         reply_channel: None,
         turn_id: None,
         session_id: None,
+        upstream_unknown: false,
     };
     let result = queue.enqueue(&msg).await.map(|()| msg.id.clone());
     // I-1c: the plan has now been injected into this round's payload —

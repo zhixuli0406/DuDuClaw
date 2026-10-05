@@ -66,7 +66,7 @@ pub(super) async fn seed_agent_memory(home: &std::path::Path, agent: &str) -> st
                 origin: Some("chan-good".into()),
                 origin_trust: Some(0.9),
                 ..Default::default()
-            },
+            }, duduclaw_memory::lineage::Provenance::test_only(),
         )
         .await
         .unwrap();
@@ -81,7 +81,7 @@ pub(super) async fn seed_agent_memory(home: &std::path::Path, agent: &str) -> st
                 origin: Some("chan-bad".into()),
                 origin_trust: Some(0.3),
                 ..Default::default()
-            },
+            }, duduclaw_memory::lineage::Provenance::test_only(),
         )
         .await
         .unwrap();

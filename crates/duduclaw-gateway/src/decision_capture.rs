@@ -346,7 +346,8 @@ pub async fn persist_decision(
     id: &str,
     draft: &DecisionDraft,
     ctx_meta: serde_json::Value,
-) -> Result<(), String> {
+    provenance: duduclaw_memory::lineage::Provenance,
+) -> duduclaw_core::error::Result<()> {
     let subject = decision_subject(id);
 
     write_triple(
@@ -356,6 +357,7 @@ pub async fn persist_decision(
         PRED_QUESTION,
         &draft.question,
         &ctx_meta,
+        &provenance,
     )
     .await?;
 
@@ -367,6 +369,7 @@ pub async fn persist_decision(
             &pred_option(key),
             content,
             &ctx_meta,
+            &provenance,
         )
         .await?;
     }
@@ -378,6 +381,7 @@ pub async fn persist_decision(
         PRED_STATUS,
         STATUS_OPEN,
         &ctx_meta,
+        &provenance,
     )
     .await?;
     Ok(())
@@ -390,7 +394,8 @@ async fn write_triple(
     predicate: &str,
     object: &str,
     ctx_meta: &serde_json::Value,
-) -> Result<(), String> {
+    provenance: &duduclaw_memory::lineage::Provenance,
+) -> duduclaw_core::error::Result<()> {
     let entry = MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: agent_id.to_string(),
@@ -417,10 +422,16 @@ async fn write_triple(
         ..Default::default()
     };
     engine
-        .store_temporal(agent_id, entry, meta)
+        .store_temporal(agent_id, entry, meta, provenance.clone())
         .await
         .map(|_| ())
-        .map_err(|e| format!("store decision triple ({predicate}): {e}"))
+        .map_err(|e| match e {
+            // A fence refusal keeps its type (callers audit it).
+            f @ duduclaw_core::error::DuDuClawError::SourceFenced { .. } => f,
+            other => duduclaw_core::error::DuDuClawError::Memory(format!(
+                "store decision triple ({predicate}): {other}"
+            )),
+        })
 }
 
 // ── P1.4 Injection ──────────────────────────────────────────────────────────
@@ -811,7 +822,7 @@ mod tests {
             "agent-a",
             &id,
             &draft,
-            serde_json::json!({"channel":"discord"}),
+            serde_json::json!({"channel":"discord"}), duduclaw_memory::lineage::Provenance::test_only(),
         )
         .await
         .unwrap();
@@ -836,7 +847,7 @@ mod tests {
             ],
         };
         let id = decision_id("agent-b", "m1");
-        persist_decision(&engine, "agent-b", &id, &draft, serde_json::json!({}))
+        persist_decision(&engine, "agent-b", &id, &draft, serde_json::json!({}), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -862,10 +873,10 @@ mod tests {
             options: vec![("A".into(), "one".into()), ("B".into(), "two".into())],
         };
         let id = decision_id("agent-c", "m1");
-        persist_decision(&engine, "agent-c", &id, &draft, serde_json::json!({}))
+        persist_decision(&engine, "agent-c", &id, &draft, serde_json::json!({}), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
-        persist_decision(&engine, "agent-c", &id, &draft, serde_json::json!({}))
+        persist_decision(&engine, "agent-c", &id, &draft, serde_json::json!({}), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -891,7 +902,7 @@ mod tests {
             ],
         };
         let id = decision_id("agent-d", "m1");
-        persist_decision(&engine, "agent-d", &id, &draft, serde_json::json!({}))
+        persist_decision(&engine, "agent-d", &id, &draft, serde_json::json!({}), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         let hits = engine.search("agent-d", "Hyperledger", 10).await.unwrap();
@@ -930,7 +941,7 @@ mod tests {
             agent,
             &id,
             &draft,
-            serde_json::json!({"channel":"discord"}),
+            serde_json::json!({"channel":"discord"}), duduclaw_memory::lineage::Provenance::test_only(),
         )
         .await
         .unwrap();
@@ -977,7 +988,7 @@ mod tests {
         let id = decision_id("agent-r", "m1");
         {
             let engine = SqliteMemoryEngine::new(&db).unwrap();
-            persist_decision(&engine, "agent-r", &id, &draft, serde_json::json!({}))
+            persist_decision(&engine, "agent-r", &id, &draft, serde_json::json!({}), duduclaw_memory::lineage::Provenance::test_only())
                 .await
                 .unwrap();
         } // engine dropped → connection closed
@@ -1003,12 +1014,12 @@ mod tests {
             ],
         };
         let id = decision_id("agnes", "m1");
-        persist_decision(&engine, "agnes", &id, &draft, serde_json::json!({}))
+        persist_decision(&engine, "agnes", &id, &draft, serde_json::json!({}), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
 
         // Resolve to C.
-        let outcome = engine.resolve_decision("agnes", &id, "C").await.unwrap();
+        let outcome = engine.resolve_decision("agnes", &id, "C", duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
         match outcome {
             DecisionResolveOutcome::Resolved {
                 chosen_key,
@@ -1052,26 +1063,26 @@ mod tests {
             options: vec![("A".into(), "one".into()), ("B".into(), "two".into())],
         };
         let id = decision_id("agnes", "m1");
-        persist_decision(&engine, "agnes", &id, &draft, serde_json::json!({}))
+        persist_decision(&engine, "agnes", &id, &draft, serde_json::json!({}), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
 
         // Unknown decision id → NotFound, nothing written.
         assert!(matches!(
             engine
-                .resolve_decision("agnes", "deadbeef", "A")
+                .resolve_decision("agnes", "deadbeef", "A", duduclaw_memory::lineage::Provenance::test_only())
                 .await
                 .unwrap(),
             DecisionResolveOutcome::NotFound
         ));
         // Unknown option key → UnknownKey, nothing written.
         assert!(matches!(
-            engine.resolve_decision("agnes", &id, "Z").await.unwrap(),
+            engine.resolve_decision("agnes", &id, "Z", duduclaw_memory::lineage::Provenance::test_only()).await.unwrap(),
             DecisionResolveOutcome::UnknownKey { .. }
         ));
         // Other agent cannot resolve this decision (namespace isolation).
         assert!(matches!(
-            engine.resolve_decision("intruder", &id, "A").await.unwrap(),
+            engine.resolve_decision("intruder", &id, "A", duduclaw_memory::lineage::Provenance::test_only()).await.unwrap(),
             DecisionResolveOutcome::NotFound
         ));
         // Still open after the failed attempts.
@@ -1081,9 +1092,9 @@ mod tests {
         );
 
         // Resolve, then a second resolve is rejected as AlreadyResolved.
-        engine.resolve_decision("agnes", &id, "A").await.unwrap();
+        engine.resolve_decision("agnes", &id, "A", duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
         assert!(matches!(
-            engine.resolve_decision("agnes", &id, "B").await.unwrap(),
+            engine.resolve_decision("agnes", &id, "B", duduclaw_memory::lineage::Provenance::test_only()).await.unwrap(),
             DecisionResolveOutcome::AlreadyResolved(_)
         ));
     }
@@ -1197,7 +1208,7 @@ mod tests {
                         confidence: Some(1.0),
                         metadata: None,
                         ..Default::default()
-                    },
+                    }, duduclaw_memory::lineage::Provenance::test_only(),
                 )
                 .await
                 .unwrap();
@@ -1208,7 +1219,7 @@ mod tests {
             options: vec![("A".into(), "x".into()), ("B".into(), "y".into())],
         };
         let fresh_id = decision_id("agnes", "fresh");
-        persist_decision(&engine, "agnes", &fresh_id, &fresh, serde_json::json!({}))
+        persist_decision(&engine, "agnes", &fresh_id, &fresh, serde_json::json!({}), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -1294,7 +1305,7 @@ mod tests {
             options: vec![("A".into(), "one".into()), ("B".into(), "two".into())],
         };
         let id = decision_id("agnes", "m1");
-        persist_decision(&engine, "agnes", &id, &draft, serde_json::json!({}))
+        persist_decision(&engine, "agnes", &id, &draft, serde_json::json!({}), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
 

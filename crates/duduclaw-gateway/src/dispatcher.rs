@@ -73,6 +73,9 @@ struct BusMessage {
     /// Originating channel session id — used by the per-conversation cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+    /// P2-B: the sender dropped a half upstream turn identity.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    upstream_unknown: bool,
 }
 
 /// Starts the agent dispatcher as a background task.
@@ -273,6 +276,24 @@ async fn poll_and_dispatch_sqlite(
         )
         .await;
 
+        // P2-B: half an upstream turn identity is not refused here; the run's
+        // memory writes record the upstream as unknown. Audited once.
+        let half_pair = crate::memory_provenance::incomplete_upstream(
+            msg.turn_id.as_deref(),
+            msg.session_id.as_deref(),
+        );
+        // The sender's explicit marker (it dropped a half pair) or a half
+        // pair received as-is: either way the upstream is unknown, not absent.
+        let upstream_unknown = msg.upstream_unknown || half_pair.is_some();
+        if let Some(missing) = half_pair {
+            crate::memory_provenance::audit_upstream_identity(
+                home_dir,
+                crate::memory_provenance::AUDIT_UPSTREAM_INCOMPLETE,
+                &msg.target,
+                &msg.id,
+                missing,
+            );
+        }
         let dispatch_fut =
             dispatch_to_agent_outcome(home_dir, registry, &msg.target, &msg.payload, &delegation);
         // v1.10: scope wiki RL trust feedback context so the sub-agent's
@@ -283,6 +304,8 @@ async fn poll_and_dispatch_sqlite(
             .scope(msg.session_id.clone(), dispatch_fut);
         let dispatch_fut =
             duduclaw_memory::feedback::CURRENT_TURN_ID.scope(msg.turn_id.clone(), dispatch_fut);
+        let dispatch_fut =
+            crate::memory_provenance::UPSTREAM_UNKNOWN.scope(upstream_unknown, dispatch_fut);
 
         // WP-A4/A5/T10: only goal-loop dispatches get a native-tool
         // collector scoped — the design's A3 forward model only observes
@@ -629,6 +652,7 @@ async fn poll_and_dispatch(
                         coalesced_ids: vec![],
                         turn_id: msg.turn_id.clone(),
                         session_id: msg.session_id.clone(),
+                        upstream_unknown: false,
                     };
                     consumed_without_dispatch += 1;
                     match serde_json::to_string(&err_response) {
@@ -694,6 +718,7 @@ async fn poll_and_dispatch(
             coalesced_ids: vec![],
             turn_id: msg.turn_id.clone(),
             session_id: msg.session_id.clone(),
+            upstream_unknown: false,
         };
         match serde_json::to_string(&err_response) {
             Ok(json) => synthetic_responses.push(json),
@@ -810,6 +835,20 @@ async fn poll_and_dispatch(
         // feedback for sub-agents is silently no-op.
         let turn_id_for_scope = msg.turn_id.clone();
         let session_id_for_scope = msg.session_id.clone();
+        let half_pair = crate::memory_provenance::incomplete_upstream(
+            turn_id_for_scope.as_deref(),
+            session_id_for_scope.as_deref(),
+        );
+        let upstream_unknown = msg.upstream_unknown || half_pair.is_some();
+        if let Some(missing) = half_pair {
+            crate::memory_provenance::audit_upstream_identity(
+                &home,
+                crate::memory_provenance::AUDIT_UPSTREAM_INCOMPLETE,
+                &msg.agent_id,
+                &msg.message_id,
+                missing,
+            );
+        }
 
         handles.push(tokio::spawn(async move {
             let dispatch_start = Utc::now().to_rfc3339();
@@ -837,6 +876,8 @@ async fn poll_and_dispatch(
                 .scope(session_id_for_scope, dispatch_fut);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
                 .scope(turn_id_for_scope, dispatch_fut);
+            let dispatch_fut =
+                crate::memory_provenance::UPSTREAM_UNKNOWN.scope(upstream_unknown, dispatch_fut);
             let result = dispatch_fut.await;
 
             // H19: this turn has concluded — any ephemeral spawn tickets it
@@ -1019,6 +1060,7 @@ async fn poll_and_dispatch(
                 coalesced_ids: vec![],
                 turn_id: msg.turn_id.clone(),
                 session_id: msg.session_id.clone(),
+                upstream_unknown: false,
             };
 
             if let Ok(json) = serde_json::to_string(&response_entry) {
@@ -1639,6 +1681,7 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
                 coalesced_ids: extra_ids,
                 turn_id: first.turn_id.clone(),
                 session_id: first.session_id.clone(),
+                upstream_unknown: first.upstream_unknown,
             });
         }
     }
@@ -3824,6 +3867,7 @@ mod tests {
             coalesced_ids: vec![],
             turn_id: None,
             session_id: None,
+            upstream_unknown: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         // None fields with skip_serializing_if should be absent
@@ -4335,6 +4379,7 @@ mod tests {
                 coalesced_ids: vec![],
                 turn_id: None,
                 session_id: None,
+                upstream_unknown: false,
             },
             BusMessage {
                 msg_type: "agent_message".to_string(),
@@ -4351,6 +4396,7 @@ mod tests {
                 coalesced_ids: vec![],
                 turn_id: None,
                 session_id: None,
+                upstream_unknown: false,
             },
         ];
         let coalesced = coalesce_messages(msgs);
