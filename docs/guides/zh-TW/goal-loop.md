@@ -195,6 +195,7 @@ resume_on_restart = "pause"  # gateway 重啟時 in-flight 目標任務的處置
 progress_report_minutes = 10  # 已認領任務多久沒進度訊號才通報一次，`0` 關閉（見「逾時進度通報」）。預設 10
 tool_streak_advisory = true   # 同工具同參數連擊 3/5/8 次時是否注入提醒（見「工具連擊 advisory」）。預設 true
 criteria_ledger = "report"    # 驗收標準逐條帳本：off / report / enforce（見「驗收帳本」）。預設 report
+steering_enabled = false      # 任務頁的「下一輪的指示」（見「任務頁的送指示與停止」）。預設 false
 
 [dispatch_guard]        # 回饋路徑斷路器（防再生型無限迴圈）
 window_secs = 60        # 滑動窗長度（秒）。預設 60
@@ -712,6 +713,15 @@ gateway 重啟或崩潰復原後，還在跑的目標任務預設會轉成 `need
 ### 規劃器失敗時
 
 呼叫工具用 LLM 產計畫的過程本身可能失敗（逾時、傳輸錯誤、或回覆整段空白）。這種情況任務照樣 fail-closed 停在 `needs_human`，但分類改成 `infra`（系統問題）而非 `blocked_needs_decision`，且不會帶 `plan_pending`。核准動作在這種任務上永遠只是把任務放行到「沒有計畫可注入」的第一輪，不會有計畫憑空消失或被悄悄跳過的情況。
+
+---
+
+## 任務頁的送指示與停止
+
+任務詳情頁對進行中的 goal 任務有兩個控制，完整規則見[持續任務、任務中送指示與停止](continuous-responsibilities.md#儀表板任務詳情頁)。
+
+- **下一輪的指示**（需要 `[goal_loop] steering_enabled = true`，預設關）：最多 4000 字的補充，在下一輪派出時交給 AI 員工，正在跑的這一輪不會被打斷。只有那一輪真的派出去才算送達（「已在第 N 輪交給員工」）；被擋下或派送失敗的那一輪，指示會退回等下一輪。指示不會動到凍結的驗收標準，判官也看不到。帶著指示的那一輪由 AI 員工單人執行，不走團隊回合。
+- **停止任務**：用儀表板的真實身分立即取消任務與所有子任務。已經在跑的那一輪會先跑完（`cancel_pending`），確認沒有任何工作還在跑才顯示 `stopped`；有無法確認的項目（認領租約過期卻沒有完成紀錄、外部動作結果不明、任務樹超過掃描上限）時顯示 `stopped_uncertain`。確認框會記下打開時的任務版本，確認前任務若已變動，會提示並等你再確認一次。停止的任務不能重試或接著做，要重做請建立新任務。
 
 ---
 
