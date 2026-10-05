@@ -74,8 +74,12 @@ mod bash_cmd;
 mod bash_lane;
 mod bash_parse;
 mod matcher;
+mod operator_cmd;
 mod real_path;
 
+pub use operator_cmd::{
+    bash_invokes_operator_command, bash_operator_command_decision, OperatorCommand,
+};
 pub use real_path::resolve_real_path;
 use real_path::with_real_path;
 mod rules;

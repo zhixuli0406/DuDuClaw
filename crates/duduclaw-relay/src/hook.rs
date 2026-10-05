@@ -14,6 +14,13 @@
 //! must not trigger a retry storm. An offline/unreachable device instead
 //! gets its frame placed on a small bounded per-device queue, flushed on
 //! reconnect (see `queue.rs`).
+//!
+//! Consequence for LINE: because the sender already has its 200, a frame the
+//! device does not accept (inbox unavailable, disk full, stop switch off) is
+//! lost and will not be redelivered. The relay path does not provide the
+//! gateway's durable acceptance; the device counts such frames
+//! (`relay_frames_total{outcome="not_accepted"}`) and raises an Activity Feed
+//! row. Deployments that need durable LINE intake use the direct webhook.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

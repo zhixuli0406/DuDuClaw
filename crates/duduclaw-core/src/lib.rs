@@ -10,6 +10,7 @@ pub mod autostart;
 #[cfg(feature = "app-compat")]
 pub mod compat_runners;
 pub mod concurrency_gate;
+pub mod gateway_instance;
 pub mod config;
 pub mod cron_tz;
 // H10 (2026-09 feature audit): the RFC-23 §14.4 data-file guard's decision
@@ -105,6 +106,7 @@ pub use match_utils::{is_valid_discord_snowflake, is_valid_egress_host, origin_h
 pub use org_field_guard::{
     check_bash_protected_write, check_bash_protected_write_in, check_caller_scope,
     check_identity_surface_write, resolve_real_path,
+    bash_invokes_operator_command, bash_operator_command_decision, OperatorCommand,
     check_own_contract_write, check_own_soul_write, check_protected_toml_write,
     check_protected_toml_write_as, classify_identity_surface,
     classify_protected_toml, HookCaller, ProtectedSurface, ProtectedTomlKind,
@@ -273,6 +275,32 @@ pub const ENV_REPLY_CHANNEL: &str = "DUDUCLAW_REPLY_CHANNEL";
 /// to the originating turn.
 pub const ENV_TRUST_TURN_ID: &str = "DUDUCLAW_TURN_ID";
 pub const ENV_TRUST_SESSION_ID: &str = "DUDUCLAW_SESSION_ID";
+
+/// The task a goal-loop round runs for (F5-D). Set by the gateway when it
+/// spawns the CLI for that round, from its own dispatch record (never from
+/// anything the model wrote); read by the MCP server to stamp the approval
+/// cards that round raises, so the dashboard can apply the task's audience.
+pub const ENV_TASK_ID: &str = "DUDUCLAW_TASK_ID";
+
+/// [`ENV_TASK_ID`] of this process, when present and well-formed.
+pub fn host_task_id() -> Option<String> {
+    std::env::var(ENV_TASK_ID)
+        .ok()
+        .filter(|t| is_valid_agent_id(t))
+}
+
+/// Stamp `payload` (an approval card's payload) with the host task id under
+/// `task_id`. Only object payloads are stamped; a host value always replaces
+/// one already there.
+pub fn with_host_task_id(payload: serde_json::Value, task_id: Option<&str>) -> serde_json::Value {
+    match (payload, task_id) {
+        (serde_json::Value::Object(mut map), Some(t)) => {
+            map.insert("task_id".into(), serde_json::Value::String(t.to_string()));
+            serde_json::Value::Object(map)
+        }
+        (other, _) => other,
+    }
+}
 
 /// RFC-23 §14.4 data-file guard mode: `"on"` / `"read_only"` / `"off"`.
 ///
@@ -1359,3 +1387,5 @@ pub mod effort;
 // team composer in P5). Appended last to stay conflict-free with the module
 // list above.
 pub mod role_model_matrix;
+
+pub mod workflow_mcp;
