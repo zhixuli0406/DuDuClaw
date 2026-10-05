@@ -558,3 +558,4 @@ mod store_identity_cases;
 mod preset_policy_cases;
 mod resume_cases;
 mod f1b_cases;
+mod stop_case;

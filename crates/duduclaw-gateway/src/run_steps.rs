@@ -280,7 +280,7 @@ impl RunStepStore {
         // truncation can mangle it) so the run row carries a durable
         // task/round linkage instead of leaving consumers to string-parse.
         let (task_id, round) =
-            match crate::dispatcher::extract_goal_loop_task_id_and_round(preview_in) {
+            match crate::dispatcher::goal_marker_linkage_for_display(preview_in) {
                 Some((t, r)) => (Some(t.to_string()), Some(r as i64)),
                 None => (None, None),
             };

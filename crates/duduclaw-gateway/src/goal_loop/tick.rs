@@ -8,7 +8,14 @@ use super::*;
 impl GoalLoopDriver {
     /// One driver pass. Public for tests and one-shot recovery.
     pub async fn tick_once(&self) -> Result<(), String> {
-        let now = Utc::now();
+        self.tick_at(Utc::now()).await
+    }
+
+    /// One driver pass at an explicit `now` (P2-A C3). `tick_once` is
+    /// exactly `tick_at(Utc::now())`; tests inject a clock here. Helpers
+    /// called from inside the pass that read their own clock are unchanged.
+    pub async fn tick_at(&self, now: DateTime<Utc>) -> Result<(), String> {
+        crate::responsibility::team_activity::mark_registry_live();
 
         // ── needs_human reconciliation ──────────────────────────
         // Detects the state transition INTO needs_human — from either this
@@ -17,6 +24,11 @@ impl GoalLoopDriver {
         // close). Runs before dispatch so a task escalated this tick is notified
         // next tick (avoids double-processing within one tick).
         self.reconcile_needs_human().await;
+
+        // ── P2-A: steering sweep, stop reconciliation, responsibility wake
+        //    pass (config-gated; SQL only). A new occurrence is a `todo` goal
+        //    task and is picked up by the candidate scan right below. ──
+        self.p2a_pre_candidates(now).await;
 
         // Candidates: goal_mode tasks awaiting a run, assigned to a concrete
         // agent. `todo` = freshly created; `pending` = a durable claim awaiting
@@ -241,6 +253,17 @@ impl GoalLoopDriver {
         };
 
         for task in &candidates {
+            // ── P2-A E-H2: register the dispatch, then re-check the task. A
+            // stop that lands from here on stays `cancel_pending` until this
+            // iteration is over (and the dispatcher fences the round); a stop
+            // that landed since the candidate scan skips the task now. Only the
+            // stop tree and status are checked here (M-1): a paused, expired or
+            // reassigned occurrence still meets the deadline guard below. ──
+            let _dispatch_guard = crate::responsibility::team_activity::DispatchGuard::register(&task.id);
+            if let Err(reason) = self.store.fence_candidate(&task.id).await {
+                debug!(task = %task.id, %reason, "goal loop: candidate no longer dispatchable");
+                continue;
+            }
             // ── W3-1 D5: a human holds this task's conversation ──
             // Freeze, do not escalate: the person who took over IS the human
             // an escalation would page, and parking the task `needs_human`
@@ -283,6 +306,21 @@ impl GoalLoopDriver {
                 )
                 .await?;
                 active = inflight.len();
+                continue;
+            }
+
+            // ── P2-A: durable rounds (responsibility occurrences, steering) ──
+            // `None` for every other goal task — the rest of this pass is then
+            // unchanged. A paused responsibility freezes its occurrence (the
+            // deadline above still runs). Unknown durable state ⇒ skip.
+            let durable = match self.durable_check(task).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(task = %task.id, error = %e, "goal loop: durable state unreadable — task skipped this tick");
+                    continue;
+                }
+            };
+            if durable.as_ref().is_some_and(Self::durable_frozen) {
                 continue;
             }
 
@@ -535,6 +573,12 @@ impl GoalLoopDriver {
 
             // ── Iteration guard (difficulty-scaled cap, D4 item 3) ──
             let current_iter = entry.as_ref().map(|e| e.iter).unwrap_or(0);
+            // P2-A: a durable round counts from the persistent intent ledger,
+            // so a restart or hot respawn never resets the cap.
+            let current_iter = match &durable {
+                Some(info) => Self::durable_iter(current_iter, info),
+                None => current_iter,
+            };
             if current_iter >= iter_cap {
                 // H11: a hard cap fired (same family as the deadline guard).
                 self.escalate(
@@ -546,6 +590,54 @@ impl GoalLoopDriver {
                 .await?;
                 active = inflight.len();
                 continue;
+            }
+
+            // ── P2-A: single-occurrence cost cap (measured spend; unreadable
+            //    ⇒ not dispatched this tick) and the employee's own budget
+            //    breaker. The cap is checked before each occurrence round, so
+            //    the occurrence's own rounds overrun by at most one round. ──
+            if let Some(info) = &durable {
+                match self.occurrence_cost(task, info).await {
+                    durable::OccurrenceCost::Within => {}
+                    durable::OccurrenceCost::Unavailable => continue,
+                    durable::OccurrenceCost::AgentBudget(message) => {
+                        self.post_activity(
+                            crate::responsibility::activity::OCCURRENCE_COST_CAP,
+                            &task.assigned_to,
+                            Some(&task.id),
+                            &format!("員工的預算上限已用完，責任這次執行轉人工 — {}（{}）", task.title,
+                                duduclaw_core::truncate_chars(&message, 120)),
+                        )
+                        .await;
+                        self.escalate(
+                            &mut inflight,
+                            task,
+                            "employee budget cap",
+                            crate::pause_reason::PauseReason::BudgetExhausted,
+                        )
+                        .await?;
+                        active = inflight.len();
+                        continue;
+                    }
+                    durable::OccurrenceCost::Exceeded { spent, cap } => {
+                        self.post_activity(
+                            crate::responsibility::activity::OCCURRENCE_COST_CAP,
+                            &task.assigned_to,
+                            Some(&task.id),
+                            &format!("本次責任執行已花費 {spent}，達到單次上限 {cap}，轉人工 — {}", task.title),
+                        )
+                        .await;
+                        self.escalate(
+                            &mut inflight,
+                            task,
+                            "responsibility occurrence cost cap",
+                            crate::pause_reason::PauseReason::BudgetExhausted,
+                        )
+                        .await?;
+                        active = inflight.len();
+                        continue;
+                    }
+                }
             }
 
             // ── Concurrency guard (only gates NEW admissions; re-dispatch of an
@@ -763,7 +855,7 @@ impl GoalLoopDriver {
             );
 
             // ── Dispatch: enqueue a work message on the existing wake-up rail ──
-            let next_iter = current_iter + 1;
+            let mut next_iter = current_iter + 1;
             let mut state_text = state_block.render();
             // WP-G2: the per-criterion ledger sits right after the `<state>`
             // block. No ledger (older goals) or `criteria_ledger = "off"` ⇒
@@ -801,8 +893,12 @@ impl GoalLoopDriver {
             {
                 continue;
             }
-            let (team_dispatch, gate_inputs_json) =
-                self.try_team_dispatch(task, next_iter, &state_text).await;
+            // P2-A: a durable round always runs Solo on the fixed-id rail.
+            let (team_dispatch, gate_inputs_json) = if durable.is_some() {
+                (None, None)
+            } else {
+                self.try_team_dispatch(task, next_iter, &state_text).await
+            };
             // Freeze the same title/description/criteria classifier the
             // difficulty-scaled guard used for this actual dispatch.
             let difficulty_text = format!(
@@ -824,9 +920,51 @@ impl GoalLoopDriver {
             gate_inputs["goal_difficulty"] = serde_json::Value::String(difficulty.to_string());
             let gate_inputs_json = Some(gate_inputs.to_string());
             let ran_as_team = team_dispatch.is_some();
-            let (dispatched_message_id, team_dispatched) = match team_dispatch {
-                Some((tracking_id, confirmed_team)) => (tracking_id, confirmed_team),
-                None => (
+            let (dispatched_message_id, team_dispatched) = match (team_dispatch, &durable) {
+                (Some((tracking_id, confirmed_team)), _) => (tracking_id, confirmed_team),
+                (None, Some(info)) => {
+                    match self
+                        .durable_enqueue(task, info, next_iter, &state_text, now)
+                        .await?
+                    {
+                        durable::DurableEnqueue::Enqueued { message_id, iter } => {
+                            next_iter = iter;
+                            (message_id, false)
+                        }
+                        durable::DurableEnqueue::AwaitingPickup { message_id, iter } => {
+                            // Still queued from an earlier tick: keep tracking
+                            // it, send nothing new.
+                            let lease = if is_new {
+                                acquired_lease.take()
+                            } else {
+                                inflight.get(&task.id).and_then(|e| e.lease.clone())
+                            };
+                            if is_new {
+                                active += 1;
+                            }
+                            inflight.insert(
+                                task.id.clone(),
+                                InFlight {
+                                    iter,
+                                    enqueued_at: now,
+                                    awaiting_pickup: true,
+                                    lease,
+                                    progress_reported_round: None,
+                                    message_id: Some(message_id),
+                                },
+                            );
+                            continue;
+                        }
+                        durable::DurableEnqueue::Refused(reason) => {
+                            if let Some(lease) = acquired_lease.take() {
+                                duduclaw_core::concurrency_release(&self.home_dir, &lease);
+                            }
+                            debug!(task = %task.id, reason, "goal loop: durable round refused");
+                            continue;
+                        }
+                    }
+                }
+                (None, None) => (
                     self.enqueue_work(task, next_iter, &state_text).await?,
                     false,
                 ),

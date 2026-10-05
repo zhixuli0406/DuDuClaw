@@ -191,6 +191,21 @@ impl MethodHandler {
             }
 
             // ── Task Board (agent-scoped — HS4 fix) ────
+            "responsibilities.create"
+            | "responsibilities.list"
+            | "responsibilities.get"
+            | "responsibilities.occurrences"
+            | "responsibilities.fires"
+            | "responsibilities.update_contract"
+            | "responsibilities.pause"
+            | "responsibilities.resume"
+            | "responsibilities.disable"
+            | "responsibilities.enable"
+            | "responsibilities.clear_failures"
+            | "tasks.steer"
+            | "tasks.steering"
+            | "tasks.stop"
+            | "tasks.stop_status" => self.handle_responsibilities_rpc(method, params, ctx).await,
             "tasks.review_snapshot" => super::workflow_errors::with_workflow_error_code(method, self.handle_tasks_review_snapshot(params,ctx).await),
             "tasks.review_accept" => super::workflow_errors::with_workflow_error_code(method, self.handle_tasks_review_accept(params,ctx).await),
             "workflow_drafts.create" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_create(params,ctx).await),

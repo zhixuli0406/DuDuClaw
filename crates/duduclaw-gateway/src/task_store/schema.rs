@@ -100,6 +100,8 @@ impl TaskStore {
         // ── Iterative Kanban: iteration detail table (v1.45) ──
         Self::init_iteration_schema(conn)?;
         Self::init_survival_evidence_schema(conn)?;
+        // ── P2-A responsibilities / steering / stop (new tables only) ──
+        Self::init_responsibility_schema(conn)?;
         Ok(())
     }
 

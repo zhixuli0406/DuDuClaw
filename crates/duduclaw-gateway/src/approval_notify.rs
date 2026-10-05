@@ -188,6 +188,8 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
         || kind == crate::approval::WORKFLOW_ACTIVATION_KIND
         // F2: operator-terminal LINE inbox changes (`duduclaw ops channel-ingress`).
         || kind == crate::channel_ingress::cli_approval::ACTION_KIND
+        // P2-A: operator-CLI changes that widen a responsibility.
+        || kind == crate::responsibility::operator_gate::ACTION_KIND
 }
 
 /// What the dashboard answers when a dashboard-only card is decided after it
@@ -200,6 +202,8 @@ pub(crate) fn dashboard_only_expired_text(kind: &str) -> &'static str {
         "這個工作流程啟用審核已逾期，工作流程不會啟用；要啟用請重新送審。"
     } else if kind == crate::channel_ingress::cli_approval::ACTION_KIND {
         "這則收件處理指令的審核已逾期，指令不會執行；需要的話請重新下指令。"
+    } else if kind == crate::responsibility::operator_gate::ACTION_KIND {
+        crate::responsibility::operator_gate::EXPIRED_TEXT
     } else {
         "這則審核已逾期，已自動拒絕，無法再核准。"
     }
@@ -210,6 +214,15 @@ pub(crate) fn dashboard_only_expired_text(kind: &str) -> &'static str {
 pub(crate) const DASHBOARD_ONLY_REFUSAL: &str =
     "這則審核只能在儀表板的待辦清單決定，請開啟儀表板處理（這裡的回覆不會生效）。";
 
+/// The refusal text for a channel decision on a dashboard-only `kind`.
+pub(crate) fn dashboard_only_refusal(kind: &str) -> &'static str {
+    if kind == crate::responsibility::operator_gate::ACTION_KIND {
+        crate::responsibility::operator_gate::CHANNEL_REFUSAL
+    } else {
+        DASHBOARD_ONLY_REFUSAL
+    }
+}
+
 /// The zh-TW body of the plain notice for a dashboard-only approval. Carries
 /// no claim text, no stored value and no decision verb — only that something
 /// is waiting, for which AI employee, and until when.
@@ -219,6 +232,9 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
     }
     if rec.action_kind == crate::channel_ingress::cli_approval::ACTION_KIND {
         return crate::channel_ingress::cli_approval::notice_body(rec, reminder);
+    }
+    if rec.action_kind == crate::responsibility::operator_gate::ACTION_KIND {
+        return crate::responsibility::operator_gate::notice_body(rec, reminder, &deadline_phrase(rec));
     }
     let head = if reminder {
         "⏰ 有一則知識審核快到期了，逾時會自動捨棄"
@@ -320,6 +336,14 @@ async fn push_dashboard_only(
     rec: &ApprovalRecord,
     reminder: bool,
 ) -> Option<(String, String)> {
+    // P2-A S-M4: terminal-filed responsibility requests have a per-target
+    // hourly push cap; past it the request stays in the dashboard inbox only.
+    if rec.action_kind == crate::responsibility::operator_gate::ACTION_KIND
+        && !reminder
+        && !crate::responsibility::operator_gate::push_allowed(home_dir, rec).await
+    {
+        return None;
+    }
     let targets = dashboard_only_targets(home_dir, rec, reminder);
     if targets.is_empty() {
         return None;
@@ -487,7 +511,7 @@ pub(crate) async fn apply_decision(
     // H1: decided in the dashboard only — an older card's button, a crafted
     // callback or a text reply never decides it; the approval stays pending.
     if is_dashboard_only_kind(&rec.action_kind) {
-        return Err(DASHBOARD_ONLY_REFUSAL.into());
+        return Err(dashboard_only_refusal(&rec.action_kind).into());
     }
     if rec.status.is_terminal() {
         return Ok(match rec.status {

@@ -3,6 +3,21 @@
 
 use super::*;
 
+/// Fields of an occurrence task nobody may change through `update_task`.
+pub(crate) const OCCURRENCE_FROZEN_FIELDS: [&str; 11] = [
+    "assigned_to",
+    "parent_task_id",
+    "goal_mode",
+    "acceptance_criteria",
+    "acceptance_criteria_baseline",
+    "tags",
+    "title",
+    "description",
+    "depends_on",
+    "deadline_at",
+    "kind",
+];
+
 impl TaskStore {
     pub async fn list_tasks(
         &self,
@@ -174,87 +189,8 @@ impl TaskStore {
     }
 
     pub async fn insert_task(&self, row: &TaskRow) -> Result<(), String> {
-        if row.kind == TaskKind::Discovery
-            && (row.goal_mode
-                || row.discovery_run_id.is_none()
-                || row.discovery_spec_json.is_none())
-        {
-            return Err(
-                "discovery requires a frozen specification and dedicated run identity".into(),
-            );
-        }
-        let kind = if row.kind == TaskKind::Task && row.goal_mode {
-            TaskKind::Goal
-        } else {
-            row.kind
-        };
         let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO tasks
-                (id, title, description, status, priority, assigned_to, created_by,
-                 created_at, updated_at, completed_at, blocked_reason,
-                 parent_task_id, tags, message_id,
-                 claimed_by, claimed_at, lease_expires_at, depends_on, retry_count,
-                 max_retries, goal_mode, acceptance_criteria, result_summary, judge_feedback,
-                 goal_id, lease_renewed_at, source_channel, source_chat_id,
-                 revision_round, diminishing, agent_seconds, source_discord_guild_id,
-                 deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason,
-                 plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id,
-                discovery_approval_id, criteria_ledger, authority_revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46)",
-            params![
-                row.id,
-                row.title,
-                row.description,
-                row.status,
-                row.priority,
-                row.assigned_to,
-                row.created_by,
-                row.created_at,
-                row.updated_at,
-                row.completed_at,
-                row.blocked_reason,
-                row.parent_task_id,
-                row.tags,
-                row.message_id,
-                row.claimed_by,
-                row.claimed_at,
-                row.lease_expires_at,
-                row.depends_on,
-                row.retry_count,
-                row.max_retries,
-                row.goal_mode as i64,
-                row.acceptance_criteria,
-                row.result_summary,
-                row.judge_feedback,
-                row.goal_id,
-                row.lease_renewed_at,
-                row.source_channel,
-                row.source_chat_id,
-                row.revision_round,
-                row.diminishing as i64,
-                row.agent_seconds,
-                row.source_discord_guild_id,
-                row.deadline_at,
-                row.risk_boundary,
-                row.acceptance_criteria_baseline,
-                row.pause_reason,
-                row.plan_pending,
-                row.archived as i64,
-                row.pinned as i64,
-                row.team_spec_json,
-                kind.as_str(),
-                row.discovery_spec_json,
-                row.discovery_run_id,
-                row.discovery_approval_id,
-                row.criteria_ledger,
-                row.authority_revision,
-            ],
-        )
-        .map_err(|e| format!("insert task: {e}"))?;
-        Ok(())
+        insert_task_tx(&conn, row)
     }
 
     /// Freeze this task's team spec, **once**.
@@ -316,6 +252,9 @@ impl TaskStore {
     /// moved. Idempotent — a re-run finds nothing left assigned to `from_agent`.
     /// Discovery rows are excluded: their run ledger is bound to the original
     /// agent, and reassigning them breaks attribution for every public view.
+    /// Runs of a continuous responsibility are left with their owner (M-1,
+    /// E-M5): a hand-off moves the employee's ordinary work only; the
+    /// responsibility itself is changed through its own controls.
     pub async fn reassign_open_tasks(
         &self,
         from_agent: &str,
@@ -329,7 +268,9 @@ impl TaskStore {
                     SET assigned_to = ?2,
                         claimed_by = CASE WHEN claimed_by = ?1 THEN ?2 ELSE claimed_by END,
                         updated_at = ?3
-                  WHERE assigned_to = ?1 AND status != 'done' AND kind IN ('task','goal')",
+                  WHERE assigned_to = ?1 AND status != 'done' AND kind IN ('task','goal')
+                    AND NOT EXISTS (SELECT 1 FROM responsibility_occurrences o
+                                     WHERE o.task_id = tasks.id)",
                 params![from_agent, to_agent, now],
             )
             .map_err(|e| format!("reassign open tasks: {e}"))?;
@@ -398,6 +339,40 @@ impl TaskStore {
                 .map_err(|e| e.to_string())?;
             if kind.as_deref() == Some("discovery") {
                 return Err("discovery tasks require the dedicated lifecycle service".into());
+            }
+            // P2-A E-M5: an occurrence of a responsibility is run by the
+            // system — nobody reassigns it or rewrites its control fields
+            // (status and progress writes stay allowed).
+            if OCCURRENCE_FROZEN_FIELDS.iter().any(|k| fields.get(*k).is_some()) {
+                let is_occurrence: bool = tx
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM responsibility_occurrences WHERE task_id = ?1)",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| format!("update task: occurrence check: {e}"))?;
+                if is_occurrence {
+                    return Err(format!(
+                        "task {id} is a run of a continuous responsibility; its assignee and \
+                         control fields are managed by the system"
+                    ));
+                }
+            }
+            // P2-A C7: a task an operator stopped stays stopped — no status
+            // write (dashboard `tasks.update` or MCP `tasks_update`) may move
+            // it out of `cancelled`. Only tasks with a stop request are
+            // affected; every other task is unchanged.
+            if fields.get("status").is_some() {
+                let stopped: bool = tx
+                    .query_row(&format!("SELECT {}", in_stop_tree_sql("?1")), params![id], |r| {
+                        r.get(0)
+                    })
+                    .map_err(|e| format!("update task: stop check: {e}"))?;
+                if stopped {
+                    return Err(format!(
+                        "task {id} was stopped by an operator; its status cannot be changed"
+                    ));
+                }
             }
             if let Some(deps) = &new_deps {
                 let edges = depends_edges_conn(&tx)?;
@@ -666,4 +641,119 @@ pub(crate) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         criteria_ledger: row.get(45)?,
         authority_revision: row.get(46)?,
     })
+}
+
+/// The `insert_task` SQL on a caller-held connection or transaction, shared
+/// with `materialize_occurrence` so an occurrence task is inserted in the same
+/// transaction as its link and its consumed wake fact.
+///
+/// P2-A C7: a task whose `parent_task_id` lies inside a stop request's tree is
+/// refused — an employee cannot open new sub-tasks under a stopped run.
+pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), String> {
+    if row.kind == TaskKind::Discovery
+        && (row.goal_mode || row.discovery_run_id.is_none() || row.discovery_spec_json.is_none())
+    {
+        return Err("discovery requires a frozen specification and dedicated run identity".into());
+    }
+    if let Some(parent) = row.parent_task_id.as_deref() {
+        let stopped: bool = conn
+            .query_row(&format!("SELECT {}", in_stop_tree_sql("?1")), params![parent], |r| {
+                r.get(0)
+            })
+            .map_err(|e| format!("insert task: stop check: {e}"))?;
+        if stopped {
+            return Err(format!(
+                "parent task {parent} was stopped by an operator; new sub-tasks are refused"
+            ));
+        }
+        // L-5: the stop check walks STOP_ANCESTRY_DEPTH levels up; a chain
+        // deeper than that would hide its root's stop, so it is not built.
+        let depth: i64 = conn
+            .query_row(
+                &format!(
+                    "WITH RECURSIVE anc(id, depth) AS ( \
+                       SELECT ?1, 1 UNION ALL SELECT t.parent_task_id, anc.depth + 1 FROM tasks t \
+                       JOIN anc ON t.id = anc.id WHERE t.parent_task_id IS NOT NULL \
+                         AND anc.depth <= {STOP_ANCESTRY_DEPTH}) SELECT MAX(depth) FROM anc"
+                ),
+                params![parent],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("insert task: depth check: {e}"))?;
+        if depth >= STOP_ANCESTRY_DEPTH as i64 {
+            return Err(format!(
+                "parent task {parent} is already {depth} levels deep; deeper sub-tasks are refused"
+            ));
+        }
+    }
+    let kind = if row.kind == TaskKind::Task && row.goal_mode {
+        TaskKind::Goal
+    } else {
+        row.kind
+    };
+    conn.execute(
+        "INSERT INTO tasks
+            (id, title, description, status, priority, assigned_to, created_by,
+             created_at, updated_at, completed_at, blocked_reason,
+             parent_task_id, tags, message_id,
+             claimed_by, claimed_at, lease_expires_at, depends_on, retry_count,
+             max_retries, goal_mode, acceptance_criteria, result_summary, judge_feedback,
+             goal_id, lease_renewed_at, source_channel, source_chat_id,
+             revision_round, diminishing, agent_seconds, source_discord_guild_id,
+             deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason,
+             plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+                 ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46)",
+        params![
+            row.id,
+            row.title,
+            row.description,
+            row.status,
+            row.priority,
+            row.assigned_to,
+            row.created_by,
+            row.created_at,
+            row.updated_at,
+            row.completed_at,
+            row.blocked_reason,
+            row.parent_task_id,
+            row.tags,
+            row.message_id,
+            row.claimed_by,
+            row.claimed_at,
+            row.lease_expires_at,
+            row.depends_on,
+            row.retry_count,
+            row.max_retries,
+            row.goal_mode as i64,
+            row.acceptance_criteria,
+            row.result_summary,
+            row.judge_feedback,
+            row.goal_id,
+            row.lease_renewed_at,
+            row.source_channel,
+            row.source_chat_id,
+            row.revision_round,
+            row.diminishing as i64,
+            row.agent_seconds,
+            row.source_discord_guild_id,
+            row.deadline_at,
+            row.risk_boundary,
+            row.acceptance_criteria_baseline,
+            row.pause_reason,
+            row.plan_pending,
+            row.archived as i64,
+            row.pinned as i64,
+            row.team_spec_json,
+            kind.as_str(),
+            row.discovery_spec_json,
+            row.discovery_run_id,
+            row.discovery_approval_id,
+            row.criteria_ledger,
+            row.authority_revision,
+        ],
+    )
+    .map_err(|e| format!("insert task: {e}"))?;
+    Ok(())
 }

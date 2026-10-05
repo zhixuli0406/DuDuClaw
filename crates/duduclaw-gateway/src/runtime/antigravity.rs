@@ -734,6 +734,9 @@ impl AgentRuntime for AntigravityRuntime {
         for (k, v) in setup::identity_env_pairs(&context.home_dir, &context.agent_id) {
             cmd.env(k, v);
         }
+        if let Some((k, v)) = super::round_task_env() {
+            cmd.env(k, v);
+        }
         match auth {
             setup::AntigravityAuth::ApiKey => {
                 // The resolved key is the only Gemini key agy sees.

@@ -464,6 +464,10 @@ pub mod update_report_reconcile;
 //        tasks, enforces iteration/wall-clock/concurrency caps, and re-dispatches
 //        judge-rejected tasks with feedback ──
 pub mod goal_loop;
+/// P2-A: continuous responsibilities, bounded wake-ups, steering, stop.
+pub mod responsibility;
+#[cfg(test)]
+pub(crate) mod model_call_probe;
 // ── Audit O8 (2026-09-29): the eight single-purpose goal-loop modules that
 //        used to live at the crate root were merged into three siblings under
 //        `goal_loop/` — `signals` (A1 gap fingerprint / A2 visit graph / H10

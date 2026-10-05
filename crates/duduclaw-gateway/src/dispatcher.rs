@@ -196,7 +196,7 @@ pub fn start_agent_dispatcher_with_crypto(
 }
 
 /// Poll the SQLite message queue for pending messages and dispatch them.
-async fn poll_and_dispatch_sqlite(
+pub(crate) async fn poll_and_dispatch_sqlite(
     queue: &Arc<crate::message_queue::MessageQueue>,
     home_dir: &Path,
     registry: &Arc<RwLock<AgentRegistry>>,
@@ -230,6 +230,53 @@ async fn poll_and_dispatch_sqlite(
         if crate::workflow::queue_task::is_workflow_message(&msg) {
             crate::workflow::queue_task::spawn(queue.clone(), home_dir.to_path_buf(), msg);
             continue;
+        }
+
+        // ── P2-A fence: a fixed-id durable goal round (`goal:<task>:<iter>`)
+        //    is re-checked against the task store before anything is
+        //    spawned — stopped, paused or moved-on tasks never get a turn.
+        //    Every other message is untouched. ──
+        if msg.id.starts_with("goal:") {
+            if let Err(reason) = crate::responsibility::fence_goal_message(home_dir, &msg.id).await {
+                warn!(msg_id = %msg.id, %reason, "SQLite queue: stale goal round fenced");
+                queue.fail(&msg.id, &reason).await?;
+                // E-M2: the directions this round carried were never
+                // delivered — back to pending for the next round.
+                crate::responsibility::return_unrun_round(home_dir, &msg.id).await;
+                continue;
+            }
+            crate::responsibility::test_hooks::pause_point("after_fence", &msg.id).await;
+        } else if msg.sender == crate::responsibility::HEARTBEAT_SENDER {
+            // M-2: a heartbeat task-board wake-up for a task inside a stopped
+            // tree never gets its turn.
+            if let Some(task_id) = extract_heartbeat_task_id(&msg.payload) {
+                match crate::responsibility::fence_heartbeat_message(home_dir, task_id).await {
+                    Ok(()) => {}
+                    Err(crate::responsibility::HeartbeatFence::Stopped(reason)) => {
+                        warn!(msg_id = %msg.id, %reason, "SQLite queue: stopped task's wake-up fenced");
+                        queue.fail(&msg.id, &reason).await?;
+                        continue;
+                    }
+                    Err(crate::responsibility::HeartbeatFence::Unreadable(reason)) => {
+                        warn!(msg_id = %msg.id, %reason, "SQLite queue: stop check unreadable — wake-up postponed");
+                        queue.reset_to_pending(&msg.id).await?;
+                        continue;
+                    }
+                }
+            }
+        } else if msg.sender == crate::responsibility::GOAL_LOOP_SENDER {
+            // E-H2: every goal round the driver sent (random id included) is
+            // re-checked: a task stopped or moved on after the driver read it
+            // never gets the round.
+            if let Some((task_id, _)) = extract_goal_loop_task_id_and_round(&msg.payload) {
+                if let Err(reason) =
+                    crate::responsibility::fence_plain_goal_message(home_dir, task_id).await
+                {
+                    warn!(msg_id = %msg.id, %reason, "SQLite queue: stale goal round fenced");
+                    queue.fail(&msg.id, &reason).await?;
+                    continue;
+                }
+            }
         }
 
         // ── WP21 C1: same gate as the JSONL rail ──────────────────────────
@@ -279,12 +326,33 @@ async fn poll_and_dispatch_sqlite(
         // covers plain `send_to_agent` delegation callbacks AND goal-loop
         // work items (which have no callback of their own; see the
         // fallback in `build_typing_guard_for_sqlite_message`).
+        // M3-1: a durable round records that it is being handed to a runtime
+        // before anything is started; cost accounting treats a round with
+        // this mark as one that ran, whatever its queue message does later.
+        if msg.id.starts_with("goal:") {
+            if let Err(e) = crate::responsibility::mark_round_started(home_dir, &msg.id).await {
+                warn!(msg_id = %msg.id, error = %e, "SQLite queue: round start not recorded — round not started");
+                queue
+                    .fail(&msg.id, &format!("round start could not be recorded: {e}"))
+                    .await?;
+                crate::responsibility::return_unrun_round(home_dir, &msg.id).await;
+                continue;
+            }
+        }
+
+        // L4-3: only the goal-loop driver's own messages may point the typing
+        // indicator at a goal task's source chat.
+        let typing_payload = if msg.sender == crate::responsibility::GOAL_LOOP_SENDER {
+            msg.payload.as_str()
+        } else {
+            ""
+        };
         let typing_guard = build_typing_guard_for_sqlite_message(
             home_dir,
             &msg.id,
             msg.origin_agent.as_deref(),
             &msg.target,
-            &msg.payload,
+            typing_payload,
         )
         .await;
 
@@ -306,7 +374,10 @@ async fn poll_and_dispatch_sqlite(
         // via the same `[goal-loop task_id=... iter=...]` marker
         // `build_typing_guard_for_sqlite_message` above already parses for
         // its own (unrelated) purpose.
-        let goal_loop_ref = extract_goal_loop_task_id_and_round(&msg.payload);
+        // M3-3: only the goal-loop driver's own messages carry a round.
+        let goal_loop_ref = (msg.sender == crate::responsibility::GOAL_LOOP_SENDER)
+            .then(|| extract_goal_loop_task_id_and_round(&msg.payload))
+            .flatten();
         let native_collector = goal_loop_ref.map(|_| {
             Arc::new(std::sync::Mutex::new(
                 Vec::<crate::runtime::NativeToolEvent>::new(),
@@ -332,6 +403,21 @@ async fn poll_and_dispatch_sqlite(
             episode_id: task_id.to_string(),
             round: goal_revision_round.map(|r| r + 1),
         });
+        // P2-A H-2(b): a heartbeat task-board wake-up's tokens are attributed
+        // to the task it wakes, so a sub-task of a responsibility run counts
+        // toward that run's spend (and tasks created in it hang under it).
+        let heartbeat_attr = if goal_attr.is_none()
+            && msg.sender == crate::responsibility::HEARTBEAT_SENDER
+        {
+            extract_heartbeat_task_id(&msg.payload).map(|task_id| {
+                crate::runtime::GoalRoundAttribution {
+                    episode_id: task_id.to_string(),
+                    round: None,
+                }
+            })
+        } else {
+            None
+        };
         let result = match (native_collector.clone().zip(goal_attr), msg.reply_channel.clone()) {
             (Some((collector, attr)), Some(rc)) if !rc.is_empty() => {
                 crate::runtime::NATIVE_TOOL_COLLECTOR
@@ -353,11 +439,16 @@ async fn poll_and_dispatch_sqlite(
                     .await
             }
             (None, Some(rc)) if !rc.is_empty() => {
-                crate::claude_runner::REPLY_CHANNEL
-                    .scope(rc, dispatch_fut)
-                    .await
+                let fut = crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut);
+                match heartbeat_attr {
+                    Some(attr) => crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(attr, fut).await,
+                    None => fut.await,
+                }
             }
-            (None, _) => dispatch_fut.await,
+            (None, _) => match heartbeat_attr {
+                Some(attr) => crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(attr, dispatch_fut).await,
+                None => dispatch_fut.await,
+            },
         };
         drop(typing_guard);
 
@@ -1134,6 +1225,16 @@ async fn dispatch_to_agent_outcome(
     prompt: &str,
     delegation: &DelegationEnv,
 ) -> Result<String, DispatchError> {
+    #[cfg(test)]
+    {
+        crate::model_call_probe::record("dispatch_to_agent_outcome");
+        if crate::model_call_probe::dry_run() {
+            crate::model_call_probe::set_last_round(
+                crate::runtime::round_task_env().map(|(_, v)| v),
+            );
+            return Ok("model-call-probe dry run".to_string());
+        }
+    }
     // O2: ephemeral synthesized agents (`eph-*`) live under
     // `<home>/agents/.ephemeral/` and are invisible to the registry scan.
     // Route them through the ephemeral loader; everything downstream
@@ -3364,13 +3465,16 @@ async fn peek_callback(
 /// Parse the `[goal-loop task_id=<id> iter=<n>]` marker that
 /// `goal_loop.rs::enqueue_work` stamps at the front of its payload.
 /// Returns `None` for any message that isn't a goal-loop dispatch.
+///
+/// M3-3: the marker must be the very start of the payload (the driver always
+/// writes it there); the same text later in a message, in a task title or in
+/// a colleague's `send_to_agent` body is not a marker. Callers that act on it
+/// (attribution, round information, fence) also require the goal-loop sender.
 fn extract_goal_loop_task_id(payload: &str) -> Option<&str> {
-    const MARKER: &str = "[goal-loop task_id=";
-    let start = payload.find(MARKER)? + MARKER.len();
-    let rest = &payload[start..];
-    let end = rest.find(' ')?;
-    let id = &rest[..end];
-    if id.is_empty() { None } else { Some(id) }
+    let rest = payload.strip_prefix("[goal-loop task_id=")?;
+    let inner = &rest[..rest.find(']')?];
+    let id = inner.split(' ').next().unwrap_or("");
+    (!id.is_empty()).then_some(id)
 }
 
 /// Like [`extract_goal_loop_task_id`] but also parses the `iter=<n>` round
@@ -3380,14 +3484,34 @@ fn extract_goal_loop_task_id(payload: &str) -> Option<&str> {
 /// `dispatch_engine.rs::settle_forward_model` computes on the review side
 /// (`task.revision_round + 1`, the same value `goal_loop.rs::enqueue_work`
 /// stamps here as `next_iter`).
-pub(crate) fn extract_goal_loop_task_id_and_round(payload: &str) -> Option<(&str, u32)> {
-    let task_id = extract_goal_loop_task_id(payload)?;
-    const ITER_MARKER: &str = " iter=";
-    let start = payload.find(ITER_MARKER)? + ITER_MARKER.len();
-    let rest = &payload[start..];
+/// The task a heartbeat task-board wake-up (`[heartbeat-pull task_id=…]` or
+/// `[heartbeat-stall task_id=…]` at the start of the payload) is about.
+pub(crate) fn extract_heartbeat_task_id(payload: &str) -> Option<&str> {
+    let rest = payload
+        .strip_prefix("[heartbeat-pull task_id=")
+        .or_else(|| payload.strip_prefix("[heartbeat-stall task_id="))?;
     let end = rest.find(']')?;
-    let round: u32 = rest[..end].parse().ok()?;
+    let id = &rest[..end];
+    (!id.is_empty() && !id.contains(char::is_whitespace)).then_some(id)
+}
+
+pub(crate) fn extract_goal_loop_task_id_and_round(payload: &str) -> Option<(&str, u32)> {
+    let rest = payload.strip_prefix("[goal-loop task_id=")?;
+    let inner = &rest[..rest.find(']')?];
+    let (task_id, round) = inner.split_once(" iter=")?;
+    if task_id.is_empty() || task_id.contains(char::is_whitespace) {
+        return None;
+    }
+    let round: u32 = round.parse().ok()?;
     Some((task_id, round))
+}
+
+/// Display-only linkage for the run history (`run_steps`): the goal marker
+/// wherever it sits in a recorded prompt. Never used for attribution,
+/// round information or a fence (those use the anchored parse above).
+pub(crate) fn goal_marker_linkage_for_display(prompt: &str) -> Option<(&str, u32)> {
+    let start = prompt.find("[goal-loop task_id=")?;
+    extract_goal_loop_task_id_and_round(&prompt[start..])
 }
 
 /// Round under which a goal-loop dispatch's native tool evidence (and its
@@ -3564,6 +3688,10 @@ async fn build_typing_guard_for_sqlite_message(
         &token,
     )
 }
+
+#[cfg(test)]
+#[path = "dispatcher_fence_tests.rs"]
+mod fence_tests;
 
 #[cfg(test)]
 mod tests {

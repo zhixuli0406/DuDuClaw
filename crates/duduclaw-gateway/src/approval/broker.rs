@@ -189,6 +189,12 @@ impl ApprovalBroker {
         if rec.binding.is_some() {
             return;
         }
+        // P2-A M-3: kinds whose pushes are capped elsewhere get no reminder —
+        // a reminder would bypass that cap (and, for a responsibility
+        // question, carry the employee's text with buttons).
+        if super::NO_REMINDER_KINDS.contains(&rec.action_kind.as_str()) {
+            return;
+        }
         let Some(home) = self.home_dir() else { return };
         // Claim first, send second: losing the race means someone else is
         // sending, and a claim that is never followed by a successful send is
