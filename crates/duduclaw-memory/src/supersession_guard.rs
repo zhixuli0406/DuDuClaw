@@ -80,6 +80,9 @@ pub enum TemporalWriteOutcome {
     Stored(String),
     /// Nothing was written; the current fact is untouched.
     Refused(SupersessionRefusal),
+    /// Nothing was written: the source fence refused it (a source or parent
+    /// was forgotten, a parent is missing, or too many sources — P2-B).
+    Fenced(crate::lineage::FenceRefusal),
 }
 
 impl TemporalWriteOutcome {
@@ -87,7 +90,7 @@ impl TemporalWriteOutcome {
     pub fn stored_id(&self) -> Option<&str> {
         match self {
             Self::Stored(id) => Some(id),
-            Self::Refused(_) => None,
+            Self::Refused(_) | Self::Fenced(_) => None,
         }
     }
 }

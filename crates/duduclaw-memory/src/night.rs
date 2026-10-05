@@ -92,6 +92,9 @@ pub struct ConsolidationResult {
     /// `Some(id)` when the merge passed verification and was written; `None`
     /// when it was rolled back (verification failed).
     pub stored_id: Option<String>,
+    /// `Some` when the source fence refused the write (P2-B): a source
+    /// episode was forgotten (or deleted) after this pass read it.
+    pub fenced: Option<crate::lineage::FenceRefusal>,
 }
 
 // ── Pure primitives ───────────────────────────────────────────
@@ -442,12 +445,24 @@ pub async fn induce_schema(
             })),
             ..Default::default()
         };
+        // P2-B: the schema is derived from its source episodes — it inherits
+        // all their sources, and a source forgotten after `list_recent` read
+        // it fences the write (checked again inside the write transaction).
+        let provenance = crate::lineage::Provenance::derived(theme.source_ids.clone());
         // L5: a supersession-guard refusal (a more trusted fact already holds
-        // this key) skips this theme only; real errors still propagate.
-        let id = match engine.store_temporal_outcome(agent_id, entry, meta).await? {
+        // this key) or a fence refusal skips this theme only; real errors
+        // still propagate.
+        let id = match engine
+            .store_temporal_outcome(agent_id, entry, meta, provenance)
+            .await?
+        {
             crate::supersession_guard::TemporalWriteOutcome::Stored(id) => id,
             crate::supersession_guard::TemporalWriteOutcome::Refused(r) => {
                 tracing::info!(agent = agent_id, "night schema skipped: {r}");
+                continue;
+            }
+            crate::supersession_guard::TemporalWriteOutcome::Fenced(r) => {
+                tracing::info!(agent = agent_id, "night schema skipped (source fence): {r}");
                 continue;
             }
         };
@@ -499,6 +514,7 @@ pub async fn consolidate_recurrent(
         let consolidated = consolidate_sources(&theme.key, &contents);
         let report = verify_consolidation(&source_refs, &consolidated);
 
+        let mut fenced = None;
         let stored_id = if report.passed {
             let entry = MemoryEntry {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -535,12 +551,25 @@ pub async fn consolidate_recurrent(
                 })),
                 ..Default::default()
             };
-            // L5: a guard refusal leaves this theme unstored (like a failed
-            // verification) instead of aborting the remaining themes.
-            match engine.store_temporal_outcome(agent_id, entry, meta).await? {
+            // P2-B: derived from the theme's source episodes (see N3 above).
+            let provenance = crate::lineage::Provenance::derived(theme.source_ids.clone());
+            // L5: a guard or fence refusal leaves this theme unstored (like a
+            // failed verification) instead of aborting the remaining themes.
+            match engine
+                .store_temporal_outcome(agent_id, entry, meta, provenance)
+                .await?
+            {
                 crate::supersession_guard::TemporalWriteOutcome::Stored(id) => Some(id),
                 crate::supersession_guard::TemporalWriteOutcome::Refused(r) => {
                     tracing::info!(agent = agent_id, "night consolidation skipped: {r}");
+                    None
+                }
+                crate::supersession_guard::TemporalWriteOutcome::Fenced(r) => {
+                    tracing::info!(
+                        agent = agent_id,
+                        "night consolidation skipped (source fence): {r}"
+                    );
+                    fenced = Some(r);
                     None
                 }
             }
@@ -561,6 +590,7 @@ pub async fn consolidate_recurrent(
             support: theme.support,
             report,
             stored_id,
+            fenced,
         });
     }
     Ok(results)
@@ -715,7 +745,7 @@ mod tests {
                     predicate: Some(predicate.to_string()),
                     origin: Some("operator".into()),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();

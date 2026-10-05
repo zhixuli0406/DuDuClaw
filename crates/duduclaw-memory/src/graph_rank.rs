@@ -91,6 +91,14 @@ fn normalize_entity(raw: &str) -> String {
     raw.trim().to_lowercase()
 }
 
+/// The node name a raw entity string becomes in a graph built with
+/// `aliases` (normalized, then alias-resolved) — the identity
+/// `entity_embedding.entity` rows are keyed by.
+pub(crate) fn canonical_entity(raw: &str, aliases: &HashMap<String, String>) -> String {
+    let n = normalize_entity(raw);
+    resolve_alias(aliases, &n).to_string()
+}
+
 /// Resolve a normalized entity name through the alias map to its canonical form
 /// (D3.2). Both keys and values in `aliases` are pre-normalized by the caller;
 /// an entity with no alias entry resolves to itself.

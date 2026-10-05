@@ -252,6 +252,9 @@ pub const GRAPH_CACHE_MIN_TRIPLES: usize = 500;
 struct CachedGraph {
     graph: crate::graph_rank::TripleGraph,
     generation: u64,
+    /// The namespace's forget epoch when built (P2-B): a forget applied by
+    /// another process bumps it, so this cache never serves forgotten triples.
+    forget_epoch: i64,
 }
 
 /// One entity node in a [`GraphExport`] (D3.3): a canonical entity string and
@@ -340,6 +343,19 @@ pub struct SqliteMemoryEngine {
     /// this engine was constructed (in-process only, like
     /// [`novelty_rejections`](Self::novelty_rejections)).
     supersession_refusals: std::sync::atomic::AtomicU64,
+    /// Count of writes refused by the source fence (P2-B) since this engine
+    /// was constructed (in-process only, like
+    /// [`supersession_refusals`](Self::supersession_refusals)).
+    fence_refusals: std::sync::atomic::AtomicU64,
+    /// Count of reaffirmations whose `reaffirm` lineage rows were not recorded
+    /// because the surviving row already had [`MAX_LINEAGE_SOURCES`] sources
+    /// (the reaffirmation itself still happened).
+    ///
+    /// [`MAX_LINEAGE_SOURCES`]: crate::lineage::MAX_LINEAGE_SOURCES
+    reaffirm_lineage_skipped: std::sync::atomic::AtomicU64,
+    /// Test-only pause / fault points (zero-sized unless built for tests or
+    /// with the `test-hooks` feature).
+    pub(crate) hooks: crate::lineage::hooks::TestHooks,
 }
 
 /// Bytes per gigabyte (binary GiB, matching SQLite page-size arithmetic).
@@ -577,6 +593,9 @@ impl SqliteMemoryEngine {
             held_claim_repeats: std::sync::atomic::AtomicU64::new(0),
             supersession_trust_guard: true,
             supersession_refusals: std::sync::atomic::AtomicU64::new(0),
+            fence_refusals: std::sync::atomic::AtomicU64::new(0),
+            reaffirm_lineage_skipped: std::sync::atomic::AtomicU64::new(0),
+            hooks: Default::default(),
         })
     }
 
@@ -598,6 +617,9 @@ impl SqliteMemoryEngine {
             held_claim_repeats: std::sync::atomic::AtomicU64::new(0),
             supersession_trust_guard: true,
             supersession_refusals: std::sync::atomic::AtomicU64::new(0),
+            fence_refusals: std::sync::atomic::AtomicU64::new(0),
+            reaffirm_lineage_skipped: std::sync::atomic::AtomicU64::new(0),
+            hooks: Default::default(),
         })
     }
 
@@ -877,11 +899,12 @@ impl SqliteMemoryEngine {
         now_rfc: &str,
     ) -> Result<Option<Vec<(String, f64)>>> {
         let cur_gen = self.graph_generation(agent_id);
+        let cur_epoch = crate::lineage::db::forget_epoch(conn, agent_id)?;
 
-        // Fast path: a cache entry whose generation still matches.
+        // Fast path: a cache entry whose generation and forget epoch match.
         if let Ok(cache) = self.graph_cache.read() {
             if let Some(c) = cache.get(agent_id) {
-                if c.generation == cur_gen {
+                if c.generation == cur_gen && c.forget_epoch == cur_epoch {
                     return self.rank_from_graph(conn, &c.graph, agent_id, query, now_rfc);
                 }
             }
@@ -918,6 +941,7 @@ impl SqliteMemoryEngine {
                     CachedGraph {
                         graph,
                         generation: cur_gen,
+                        forget_epoch: cur_epoch,
                     },
                 );
             }
@@ -1829,17 +1853,28 @@ impl SqliteMemoryEngine {
     /// an `Err` naming both trusts, so no caller can mistake it for a stored
     /// fact. Callers that want to act on a refusal (hand it to human review)
     /// use `store_temporal_outcome` instead.
+    ///
+    /// A write refused by the source fence (P2-B: a source or parent was
+    /// forgotten, a parent is missing, too many sources) is an `Err` whose
+    /// message starts with `source forgotten:`.
     pub async fn store_temporal(
         &self,
         agent_id: &str,
         entry: MemoryEntry,
         meta: TemporalMeta,
+        provenance: crate::lineage::Provenance,
     ) -> Result<String> {
-        match self.store_temporal_outcome(agent_id, entry, meta).await? {
+        match self
+            .store_temporal_outcome(agent_id, entry, meta, provenance)
+            .await?
+        {
             crate::supersession_guard::TemporalWriteOutcome::Stored(id) => Ok(id),
             crate::supersession_guard::TemporalWriteOutcome::Refused(r) => Err(
                 DuDuClawError::Memory(format!("supersession trust guard refused write: {r}")),
             ),
+            crate::supersession_guard::TemporalWriteOutcome::Fenced(r) => {
+                Err(r.into_error())
+            }
         }
     }
 
@@ -1859,14 +1894,75 @@ impl SqliteMemoryEngine {
     /// [`supersession_trust_guard`](Self::supersession_trust_guard).
     ///
     /// [`TemporalWriteOutcome::Refused`]: crate::supersession_guard::TemporalWriteOutcome::Refused
+    ///
+    /// Source fence (P2-B): `provenance` is resolved into lineage rows and
+    /// checked against the tombstones inside the same `BEGIN IMMEDIATE`
+    /// transaction as the write; a forgotten source, a forgotten or missing
+    /// parent, or too many sources returns
+    /// [`TemporalWriteOutcome::Fenced`](crate::supersession_guard::TemporalWriteOutcome::Fenced)
+    /// and writes nothing. The fence runs before the trust guard and the
+    /// novelty gate. The whole write (supersession, insert, lineage) is one
+    /// transaction, so it is atomic and mutually exclusive with a forget apply.
     pub async fn store_temporal_outcome(
         &self,
         agent_id: &str,
         entry: MemoryEntry,
         meta: TemporalMeta,
+        provenance: crate::lineage::Provenance,
     ) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
+        self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
-        self.store_temporal_locked(&conn, agent_id, entry, meta)
+        Self::in_immediate_txn(&conn, || {
+            self.store_temporal_locked(&conn, agent_id, entry, meta, &provenance)
+        })
+    }
+
+    /// Install a pause point on the publish path (tests / `test-hooks` only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_publish_hook(&self, hook: Option<crate::lineage::hooks::PublishHook>) {
+        if let Ok(mut g) = self.hooks.publish.write() {
+            *g = hook;
+        }
+    }
+
+    /// Install a pause / fault point on the forget-apply path (tests /
+    /// `test-hooks` only). Returning `Err` from inside the transaction makes
+    /// the apply roll back.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_apply_hook(&self, hook: Option<crate::lineage::hooks::ApplyHook>) {
+        if let Ok(mut g) = self.hooks.apply.write() {
+            *g = hook;
+        }
+    }
+
+    /// Count of writes refused by the source fence since construction.
+    pub fn fence_refusals(&self) -> u64 {
+        self.fence_refusals.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count of reaffirmations that went ahead without recording their
+    /// `reaffirm` lineage because the row was at the per-row source cap.
+    pub fn reaffirm_lineage_skipped(&self) -> u64 {
+        self.reaffirm_lineage_skipped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Resolve `provenance` for a write into `agent_id`, recording a refusal.
+    fn resolve_lineage(
+        &self,
+        conn: &Connection,
+        agent_id: &str,
+        provenance: &crate::lineage::Provenance,
+        derived_from: &[String],
+    ) -> Result<std::result::Result<Vec<crate::lineage::db::OriginRow>, crate::lineage::FenceRefusal>>
+    {
+        let r = crate::lineage::db::resolve(conn, agent_id, provenance, derived_from)?;
+        if let Err(refusal) = &r {
+            self.fence_refusals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!(agent_id, reason = refusal.reason.as_str(), "source fence refused write");
+        }
+        Ok(r)
     }
 
     /// Run `f` inside `BEGIN IMMEDIATE` on the locked connection. Any error
@@ -1974,17 +2070,28 @@ impl SqliteMemoryEngine {
     /// [`store_temporal_outcome`](Self::store_temporal_outcome) on an already
     /// locked connection, so callers can make a check-then-write sequence
     /// atomic (held claims, promotion, quarantine release).
+    ///
+    /// Must run inside a transaction the caller opened (it does not begin one).
     fn store_temporal_locked(
         &self,
         conn: &Connection,
         agent_id: &str,
         entry: MemoryEntry,
         meta: TemporalMeta,
+        provenance: &crate::lineage::Provenance,
     ) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
         use crate::supersession_guard::TemporalWriteOutcome;
         // M1 moat-gate: reject once the Cloud paid-tier quota is hit. No-op when
         // unlimited (quota 0). Runs before any write so a rejection loses nothing.
         self.enforce_quota(conn)?;
+
+        // ── P2-B source fence: before any UPDATE or INSERT ─────────────────
+        let derived_parents: Vec<String> = meta.derived_from.clone().unwrap_or_default();
+        let lineage = match self.resolve_lineage(conn, agent_id, provenance, &derived_parents)? {
+            Ok(rows) => rows,
+            Err(refusal) => return Ok(TemporalWriteOutcome::Fenced(refusal)),
+        };
+        self.hooks.fire_publish(crate::lineage::HookPoint::AfterFenceCheck);
 
         let now = Utc::now();
         let now_str = now.to_rfc3339();
@@ -2107,6 +2214,21 @@ impl SqliteMemoryEngine {
                     && object_opt_eq(&meta.object, &r.object)
                     && r.content.trim() == entry.content.trim()
             }) {
+                // P2-B: the reaffirming write's sources become `reaffirm`
+                // lineage of the survivor (the insert trigger re-checks them).
+                if let Some(refusal) =
+                    crate::lineage::db::add_reaffirm(
+                        conn,
+                        &row.id,
+                        agent_id,
+                        &lineage,
+                        &self.reaffirm_lineage_skipped,
+                    )?
+                {
+                    self.fence_refusals
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(TemporalWriteOutcome::Fenced(refusal));
+                }
                 let new_meta = append_reaffirmed_by(&row.metadata, &source_event, &origin_str);
 
                 // WP1 Sybil-resistant corroboration: only raise confidence when
@@ -2292,6 +2414,14 @@ impl SqliteMemoryEngine {
             params![entry.content, agent_id, entry.id],
         )
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        crate::lineage::db::insert_origins(
+            conn,
+            crate::lineage::db::STORE_MEMORIES,
+            &entry.id,
+            agent_id,
+            &lineage,
+        )?;
 
         self.embed_on_write(&conn, agent_id, &entry.id, &entry.content);
 
@@ -2480,6 +2610,17 @@ impl SqliteMemoryEngine {
             .find(|r| object_opt_eq(&object, &r.object) && r.content.trim() == content.trim())
         {
             let origin_name = origin.as_deref().unwrap_or(crate::origin::UNATTRIBUTED.name);
+            // P2-B: the released row's sources corroborate the survivor.
+            if let Some(r) = crate::lineage::db::copy_as_reaffirm(
+                conn,
+                agent_id,
+                id,
+                agent_id,
+                &survivor.id,
+                &self.reaffirm_lineage_skipped,
+            )? {
+                return Err(r.into_error());
+            }
             let new_meta = append_reaffirmed_by(&survivor.metadata, &source_event, origin_name);
             conn.execute(
                 "UPDATE memories SET metadata = ?1, access_count = access_count + 1
@@ -2654,8 +2795,12 @@ impl SqliteMemoryEngine {
         agent_id: &str,
         entry: MemoryEntry,
         meta: TemporalMeta,
+        provenance: crate::lineage::Provenance,
     ) -> Result<String> {
-        Ok(self.hold_refused_claim_outcome(agent_id, entry, meta).await?.id)
+        Ok(self
+            .hold_refused_claim_outcome(agent_id, entry, meta, provenance)
+            .await?
+            .id)
     }
 
     /// [`hold_refused_claim`](Self::hold_refused_claim), reporting whether a
@@ -2668,9 +2813,10 @@ impl SqliteMemoryEngine {
         agent_id: &str,
         entry: MemoryEntry,
         meta: TemporalMeta,
+        provenance: crate::lineage::Provenance,
     ) -> Result<crate::supersession_guard::HeldClaim> {
         let mut admit_all = || true;
-        self.hold_refused_claim_gated(agent_id, entry, meta, &mut admit_all)
+        self.hold_refused_claim_gated(agent_id, entry, meta, provenance, &mut admit_all)
             .await?
             .ok_or_else(|| DuDuClawError::Memory("held claim not admitted".to_string()))
     }
@@ -2683,15 +2829,22 @@ impl SqliteMemoryEngine {
     /// only when a NEW row would be written (a repeat of a pending claim
     /// never consumes it); returning `false` writes nothing and yields
     /// `Ok(None)` (the caller audits the cap).
+    ///
+    /// A claim whose source was forgotten is not held: `Err` starting with
+    /// `source forgotten:` (nothing written).
     pub async fn hold_refused_claim_gated(
         &self,
         agent_id: &str,
         entry: MemoryEntry,
         meta: TemporalMeta,
+        provenance: crate::lineage::Provenance,
         admit: &mut (dyn FnMut() -> bool + Send),
     ) -> Result<Option<crate::supersession_guard::HeldClaim>> {
+        self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
-        Self::in_immediate_txn(&conn, || self.hold_locked(&conn, agent_id, entry, meta, admit))
+        Self::in_immediate_txn(&conn, || {
+            self.hold_locked(&conn, agent_id, entry, meta, &provenance, admit)
+        })
     }
 
     fn hold_locked(
@@ -2700,6 +2853,7 @@ impl SqliteMemoryEngine {
         agent_id: &str,
         entry: MemoryEntry,
         meta: TemporalMeta,
+        provenance: &crate::lineage::Provenance,
         admit: &mut (dyn FnMut() -> bool + Send),
     ) -> Result<Option<crate::supersession_guard::HeldClaim>> {
         let mut conflicts_with: Option<String> = None;
@@ -2723,7 +2877,11 @@ impl SqliteMemoryEngine {
             let active = Self::load_active_triple(conn, agent_id, subject, predicate)?;
             conflicts_with = Self::strongest_clean_id(&active);
         }
-        if !admit() {
+        // L3: a claim the source fence refuses must not use a review slot.
+        // The fence itself is applied again (and counted) by the write below.
+        let derived = meta.derived_from.clone().unwrap_or_default();
+        let fenced = crate::lineage::db::resolve(conn, agent_id, provenance, &derived)?.is_err();
+        if !fenced && !admit() {
             return Ok(None);
         }
         let mut metadata = meta
@@ -2746,13 +2904,16 @@ impl SqliteMemoryEngine {
             quarantined: true,
             ..meta
         };
-        match self.store_temporal_locked(conn, agent_id, entry, held)? {
+        match self.store_temporal_locked(conn, agent_id, entry, held, provenance)? {
             crate::supersession_guard::TemporalWriteOutcome::Stored(id) => {
                 Ok(Some(crate::supersession_guard::HeldClaim { id, newly_held: true }))
             }
             // Unreachable: a write without a triple never meets the guard.
             crate::supersession_guard::TemporalWriteOutcome::Refused(r) => {
                 Err(DuDuClawError::Memory(format!("held claim refused: {r}")))
+            }
+            crate::supersession_guard::TemporalWriteOutcome::Fenced(r) => {
+                Err(r.into_error())
             }
         }
     }
@@ -3070,11 +3231,16 @@ impl SqliteMemoryEngine {
             origin_trust: Some(crate::origin::trust_ceiling(reviewer_origin)),
             ..Default::default()
         };
-        let new_id = match self.store_temporal_locked(conn, agent_id, entry, meta)? {
+        // P2-B: the promoted fact inherits every source of the held claim.
+        let provenance = crate::lineage::Provenance::derived(vec![held_id.to_string()]);
+        let new_id = match self.store_temporal_locked(conn, agent_id, entry, meta, &provenance)? {
             crate::supersession_guard::TemporalWriteOutcome::Stored(id) => id,
             crate::supersession_guard::TemporalWriteOutcome::Refused(r) => {
                 // Only reachable when the reviewer origin is not top-trust.
                 return Err(DuDuClawError::Memory(format!("promotion refused: {r}")));
+            }
+            crate::supersession_guard::TemporalWriteOutcome::Fenced(r) => {
+                return Err(r.into_error());
             }
         };
         conn.execute(
@@ -3618,11 +3784,17 @@ impl SqliteMemoryEngine {
     ///
     /// Orchestrates the other public helpers (no direct lock held here) to avoid
     /// re-entrant locking of the connection mutex.
+    ///
+    /// `provenance` names the choice (usually the user's message that picked
+    /// the option, P2-B); both written rows are derived from the decision's
+    /// currently valid rows plus those sources, so forgetting either the
+    /// decision's source or the choice removes them.
     pub async fn resolve_decision(
         &self,
         agent_id: &str,
         decision_id: &str,
         chosen_key: &str,
+        provenance: crate::lineage::Provenance,
     ) -> Result<DecisionResolveOutcome> {
         // Status gate.
         match self.decision_status(agent_id, decision_id).await? {
@@ -3642,6 +3814,8 @@ impl SqliteMemoryEngine {
         };
 
         let subject = format!("decision:{decision_id}");
+        let decision_rows = self.valid_row_ids_for_subject(agent_id, &subject).await?;
+        let provenance = provenance.with_parents(decision_rows);
 
         // 1. status → resolved:<key> (supersedes the open status row).
         self.store_temporal(
@@ -3657,6 +3831,7 @@ impl SqliteMemoryEngine {
                 metadata: None,
                 ..Default::default()
             },
+            provenance.clone(),
         )
         .await?;
 
@@ -3676,7 +3851,7 @@ impl SqliteMemoryEngine {
             "resolved".to_string(),
             subject.clone(),
         ];
-        self.store_temporal(agent_id, entry, TemporalMeta::default())
+        self.store_temporal(agent_id, entry, TemporalMeta::default(), provenance)
             .await?;
 
         Ok(DecisionResolveOutcome::Resolved {
@@ -3684,6 +3859,24 @@ impl SqliteMemoryEngine {
             chosen_content,
             question: view.question,
         })
+    }
+
+    /// Ids of the currently valid, non-quarantined rows of one subject.
+    async fn valid_row_ids_for_subject(&self, agent_id: &str, subject: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM memories
+                 WHERE agent_id = ?1 AND subject = ?2 AND valid_until IS NULL AND quarantined = 0
+                 ORDER BY id",
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let ids = stmt
+            .query_map(params![agent_id, subject], |r| r.get::<_, String>(0))
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Ok(ids)
     }
 
     /// Build a semantic `MemoryEntry` for a decision artifact / fact row (RFC-24).
@@ -4108,6 +4301,9 @@ impl SqliteMemoryEngine {
         )
         .map_err(|e| DuDuClawError::Memory(format!("entity_embedding table: {e}")))?;
 
+        // ── P2-B source lineage, tombstones, forget plans (2026-10) ──────────
+        crate::lineage::db::init_schema(conn)?;
+
         Ok(())
     }
 
@@ -4204,22 +4400,41 @@ impl MemoryEngine for SqliteMemoryEngine {
         let timestamp_str = entry.timestamp.to_rfc3339();
         let last_accessed_str = entry.last_accessed.map(|t| t.to_rfc3339());
 
-        conn.execute(
-            "INSERT INTO memories (id, agent_id, content, timestamp, tags, layer, importance, access_count, last_accessed, source_event)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                entry.id, agent_id, entry.content, timestamp_str, tags_json,
-                entry.layer.as_str(), entry.importance, entry.access_count,
-                last_accessed_str, entry.source_event
-            ],
-        )
-        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        // P2-B: the trait method has no caller-supplied provenance (its
+        // signature lives in duduclaw-core); it records itself as a system
+        // producer. Row, FTS and lineage are written in one transaction.
+        let provenance = crate::lineage::Provenance::System {
+            producer: "memory_engine_trait",
+        };
+        Self::in_immediate_txn(&conn, || {
+            let lineage = match self.resolve_lineage(&conn, agent_id, &provenance, &[])? {
+                Ok(rows) => rows,
+                Err(r) => return Err(r.into_error()),
+            };
+            conn.execute(
+                "INSERT INTO memories (id, agent_id, content, timestamp, tags, layer, importance, access_count, last_accessed, source_event)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    entry.id, agent_id, entry.content, timestamp_str, tags_json,
+                    entry.layer.as_str(), entry.importance, entry.access_count,
+                    last_accessed_str, entry.source_event
+                ],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
-        conn.execute(
-            "INSERT INTO memories_fts (content, agent_id, memory_id) VALUES (?1, ?2, ?3)",
-            params![entry.content, agent_id, entry.id],
-        )
-        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO memories_fts (content, agent_id, memory_id) VALUES (?1, ?2, ?3)",
+                params![entry.content, agent_id, entry.id],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            crate::lineage::db::insert_origins(
+                &conn,
+                crate::lineage::db::STORE_MEMORIES,
+                &entry.id,
+                agent_id,
+                &lineage,
+            )
+        })?;
 
         self.embed_on_write(&conn, agent_id, &entry.id, &entry.content);
 
@@ -4540,6 +4755,10 @@ async fn call_claude_summarize(raw_memories: &str) -> String {
 
 impl SqliteMemoryEngine {
     /// Store a key fact extracted from a conversation turn.
+    ///
+    /// A fact whose source was forgotten (P2-B) is an `Err` starting with
+    /// `source forgotten:`; use [`store_fact_outcome`](Self::store_fact_outcome)
+    /// to receive the refusal as a value.
     pub async fn store_fact(
         &self,
         agent_id: &str,
@@ -4547,25 +4766,63 @@ impl SqliteMemoryEngine {
         channel: &str,
         chat_id: &str,
         source_session: &str,
+        provenance: crate::lineage::Provenance,
     ) -> Result<String> {
+        match self
+            .store_fact_outcome(agent_id, fact, channel, chat_id, source_session, provenance)
+            .await?
+        {
+            crate::lineage::FactWriteOutcome::Stored(id) => Ok(id),
+            crate::lineage::FactWriteOutcome::Fenced(r) => {
+                Err(r.into_error())
+            }
+        }
+    }
+
+    /// [`store_fact`](Self::store_fact) with the source-fence refusal as a
+    /// value. The fence check, the fact, its FTS row and its lineage are one
+    /// `BEGIN IMMEDIATE` transaction.
+    pub async fn store_fact_outcome(
+        &self,
+        agent_id: &str,
+        fact: &str,
+        channel: &str,
+        chat_id: &str,
+        source_session: &str,
+        provenance: crate::lineage::Provenance,
+    ) -> Result<crate::lineage::FactWriteOutcome> {
+        self.hooks.fire_publish(crate::lineage::HookPoint::BeforeTxn);
         let conn = self.conn.lock().await;
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
-        conn.execute(
-            "INSERT INTO key_facts (id, agent_id, fact, channel, chat_id, source_session, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, agent_id, fact, channel, chat_id, source_session, now],
-        )
-        .map_err(|e| DuDuClawError::Memory(format!("store_fact: {e}")))?;
+        Self::in_immediate_txn(&conn, || {
+            let lineage = match self.resolve_lineage(&conn, agent_id, &provenance, &[])? {
+                Ok(rows) => rows,
+                Err(r) => return Ok(crate::lineage::FactWriteOutcome::Fenced(r)),
+            };
+            self.hooks.fire_publish(crate::lineage::HookPoint::AfterFenceCheck);
+            conn.execute(
+                "INSERT INTO key_facts (id, agent_id, fact, channel, chat_id, source_session, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, agent_id, fact, channel, chat_id, source_session, now],
+            )
+            .map_err(|e| DuDuClawError::Memory(format!("store_fact: {e}")))?;
 
-        // Sync FTS5 index
-        let _ = conn.execute(
-            "INSERT INTO key_facts_fts (rowid, fact) VALUES (last_insert_rowid(), ?1)",
-            params![fact],
-        );
-
-        Ok(id)
+            // Sync FTS5 index (best effort, as before).
+            let _ = conn.execute(
+                "INSERT INTO key_facts_fts (rowid, fact) VALUES (last_insert_rowid(), ?1)",
+                params![fact],
+            );
+            crate::lineage::db::insert_origins(
+                &conn,
+                crate::lineage::db::STORE_KEY_FACTS,
+                &id,
+                agent_id,
+                &lineage,
+            )?;
+            Ok(crate::lineage::FactWriteOutcome::Stored(id.clone()))
+        })
     }
 
     /// Get the most recent key facts for an agent.
@@ -4718,6 +4975,8 @@ pub fn word_jaccard(a: &str, b: &str) -> f64 {
 
 mod namespace_migration;
 pub use namespace_migration::{MigrationDisposition, NamespaceRow, OnRefused};
+
+pub mod forget_source;
 
 #[cfg(test)]
 mod tests {
@@ -5126,7 +5385,7 @@ mod tests {
 
         // store_temporal is gated on the same predicate.
         let temporal_err = engine
-            .store_temporal(agent, make_entry(agent, "temporal over cap", vec![]), TemporalMeta::default())
+            .store_temporal(agent, make_entry(agent, "temporal over cap", vec![]), TemporalMeta::default(), crate::lineage::Provenance::test_only())
             .await
             .expect_err("store_temporal over quota must also be rejected");
         assert!(matches!(temporal_err, DuDuClawError::Memory(_)));
@@ -5329,7 +5588,7 @@ mod tests {
         // First triple fact.
         let e1 = make_entry(agent, "the deploy target is asia-east1", vec![]);
         engine
-            .store_temporal(agent, e1, triple_meta("deploy", "target_is", "asia-east1"))
+            .store_temporal(agent, e1, triple_meta("deploy", "target_is", "asia-east1"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -5337,7 +5596,7 @@ mod tests {
         // still be accepted (the gate never runs on a triple-carrying write).
         let e2 = make_entry(agent, "the deploy target is asia-east1", vec![]);
         engine
-            .store_temporal(agent, e2, triple_meta("backup", "target_is", "asia-east1"))
+            .store_temporal(agent, e2, triple_meta("backup", "target_is", "asia-east1"), crate::lineage::Provenance::test_only())
             .await
             .expect("a triple-carrying write must bypass the B1 gate entirely");
         assert_eq!(engine.novelty_gate_rejections(), 0);
@@ -5356,14 +5615,14 @@ mod tests {
         let mut e1 = make_entry(agent, "always double-check the currency before quoting", vec![]);
         e1.layer = duduclaw_core::types::MemoryLayer::Semantic;
         engine
-            .store_temporal(agent, e1, TemporalMeta::default())
+            .store_temporal(agent, e1, TemporalMeta::default(), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
         let mut e2 = make_entry(agent, "always double-check the currency before quoting", vec![]);
         e2.layer = duduclaw_core::types::MemoryLayer::Semantic;
         let err = engine
-            .store_temporal(agent, e2, TemporalMeta::default())
+            .store_temporal(agent, e2, TemporalMeta::default(), crate::lineage::Provenance::test_only())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("novelty gate"));
@@ -5543,13 +5802,13 @@ mod tests {
 
         let e1 = make_entry(agent, "user prefers python", vec![]);
         let id1 = engine
-            .store_temporal(agent, e1, triple_meta("user:main", "prefers_language", "python"))
+            .store_temporal(agent, e1, triple_meta("user:main", "prefers_language", "python"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
         let e2 = make_entry(agent, "user prefers typescript", vec![]);
         let id2 = engine
-            .store_temporal(agent, e2, triple_meta("user:main", "prefers_language", "typescript"))
+            .store_temporal(agent, e2, triple_meta("user:main", "prefers_language", "typescript"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -5577,12 +5836,12 @@ mod tests {
 
         let e1 = make_entry(agent, "alpha keyword python rust", vec![]);
         engine
-            .store_temporal(agent, e1, triple_meta("s", "p", "old"))
+            .store_temporal(agent, e1, triple_meta("s", "p", "old"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         let e2 = make_entry(agent, "alpha keyword python rust", vec![]);
         let id2 = engine
-            .store_temporal(agent, e2, triple_meta("s", "p", "new"))
+            .store_temporal(agent, e2, triple_meta("s", "p", "new"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -5601,7 +5860,7 @@ mod tests {
             valid_until: Some(Utc::now() - Duration::hours(1)),
             ..Default::default()
         };
-        engine.store_temporal(agent, e, meta).await.unwrap();
+        engine.store_temporal(agent, e, meta, crate::lineage::Provenance::test_only()).await.unwrap();
 
         let results = engine.search(agent, "zzzkeyword", 10).await.unwrap();
         assert!(results.is_empty(), "expired memory must not be returned");
@@ -5619,12 +5878,12 @@ mod tests {
             valid_from: Some(t0),
             ..triple_meta("user", "lang", "python")
         };
-        engine.store_temporal(agent, e1, m1).await.unwrap();
+        engine.store_temporal(agent, e1, m1, crate::lineage::Provenance::test_only()).await.unwrap();
 
         // Switch happens "now"; supersession closes the python row at now.
         let e2 = make_entry(agent, "typescript era", vec![]);
         engine
-            .store_temporal(agent, e2, triple_meta("user", "lang", "typescript"))
+            .store_temporal(agent, e2, triple_meta("user", "lang", "typescript"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -5644,7 +5903,7 @@ mod tests {
 
         let e = make_entry(agent, "python era", vec![]);
         let id = engine
-            .store_temporal(agent, e, triple_meta("user", "lang", "python"))
+            .store_temporal(agent, e, triple_meta("user", "lang", "python"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -5659,7 +5918,7 @@ mod tests {
         // A plain (non-triple) row → None.
         let plain = make_entry(agent, "no triple here", vec![]);
         let plain_id = engine
-            .store_temporal(agent, plain, TemporalMeta::default())
+            .store_temporal(agent, plain, TemporalMeta::default(), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!(engine.triple_for_id(agent, &plain_id).await.unwrap(), None);
@@ -5679,7 +5938,7 @@ mod tests {
         let agent = "plain-agent";
         let e = make_entry(agent, "plain temporal content findme", vec![]);
         engine
-            .store_temporal(agent, e, TemporalMeta::default())
+            .store_temporal(agent, e, TemporalMeta::default(), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         let results = engine.search(agent, "findme", 10).await.unwrap();
@@ -5711,7 +5970,7 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "trust-default";
         let e = make_entry(agent, "x", vec![]);
-        let id = engine.store_temporal(agent, e, TemporalMeta::default()).await.unwrap();
+        let id = engine.store_temporal(agent, e, TemporalMeta::default(), crate::lineage::Provenance::test_only()).await.unwrap();
         assert_eq!(engine.get_origin_trust(agent, &id).await.unwrap(), Some(0.6));
         // origin is stamped, not left NULL.
         let origin = engine.get_origin(agent, &id).await.unwrap().flatten();
@@ -5724,7 +5983,7 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "trust-plain";
         let id = engine
-            .store_temporal(agent, make_entry(agent, "y", vec![]), TemporalMeta::default())
+            .store_temporal(agent, make_entry(agent, "y", vec![]), TemporalMeta::default(), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         let trust = engine.get_origin_trust(agent, &id).await.unwrap().unwrap();
@@ -5743,7 +6002,7 @@ mod tests {
             ..Default::default()
         };
         let id = engine
-            .store_temporal(agent, make_entry(agent, "self claim", vec![]), meta)
+            .store_temporal(agent, make_entry(agent, "self claim", vec![]), meta, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!(engine.get_origin_trust(agent, &id).await.unwrap(), Some(0.6));
@@ -5760,7 +6019,7 @@ mod tests {
             origin_trust: Some(0.3),
             ..Default::default()
         };
-        let id = engine.store_temporal(agent, e, meta).await.unwrap();
+        let id = engine.store_temporal(agent, e, meta, crate::lineage::Provenance::test_only()).await.unwrap();
         assert_eq!(engine.get_origin_trust(agent, &id).await.unwrap(), Some(0.3));
 
         // Above-range trust is clamped to 1.0 — under a full-trust origin
@@ -5775,7 +6034,7 @@ mod tests {
                     origin: Some("operator".into()),
                     origin_trust: Some(5.0),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -5793,7 +6052,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "hi src", vec![]),
-                TemporalMeta { origin_trust: Some(0.8), ..Default::default() },
+                TemporalMeta { origin_trust: Some(0.8), ..Default::default() }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -5801,7 +6060,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "lo src", vec![]),
-                TemporalMeta { origin_trust: Some(0.2), ..Default::default() },
+                TemporalMeta { origin_trust: Some(0.2), ..Default::default() }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -5815,31 +6074,45 @@ mod tests {
                     origin_trust: Some(0.9),
                     derived_from: Some(vec![hi.clone(), lo.clone()]),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
         assert_eq!(engine.get_origin_trust(agent, &derived).await.unwrap(), Some(0.2));
     }
 
-    /// An unknown source id contributes trust 0.0 (fail-closed): can't vouch for it.
+    /// An unknown source id is fail-closed: we cannot vouch for a source we
+    /// cannot find. Since P2-B (design D9, a specification change, not a
+    /// relaxed assertion) that means the write is refused outright — it used
+    /// to be stored with trust 0.0.
     #[tokio::test]
     async fn derived_from_unknown_source_is_fail_closed() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "trust-unknown";
-        let derived = engine
-            .store_temporal(
+        let entry = make_entry(agent, "derived from ghost", vec![]);
+        let id = entry.id.clone();
+        let outcome = engine
+            .store_temporal_outcome(
                 agent,
-                make_entry(agent, "derived from ghost", vec![]),
+                entry,
                 TemporalMeta {
                     origin_trust: Some(1.0),
                     derived_from: Some(vec!["does-not-exist".into()]),
                     ..Default::default()
                 },
+                crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
-        assert_eq!(engine.get_origin_trust(agent, &derived).await.unwrap(), Some(0.0));
+        match outcome {
+            crate::supersession_guard::TemporalWriteOutcome::Fenced(r) => {
+                assert_eq!(r.reason, crate::lineage::FenceReason::ParentMissing);
+                assert_eq!(r.parent_id.as_deref(), Some("does-not-exist"));
+            }
+            other => panic!("expected a fence refusal, got {other:?}"),
+        }
+        // Nothing was written.
+        assert_eq!(engine.get_origin_trust(agent, &id).await.unwrap(), None);
     }
 
     // ── D1: bi-temporal out-of-order resilience + provenance ────────────────────
@@ -5871,15 +6144,15 @@ mod tests {
 
         // Ingest order deliberately scrambled vs. world-time order.
         let divorce_id = engine
-            .store_temporal(agent, make_entry(agent, "divorced", vec![]), spouse_meta("none", t_mid))
+            .store_temporal(agent, make_entry(agent, "divorced", vec![]), spouse_meta("none", t_mid), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         engine
-            .store_temporal(agent, make_entry(agent, "married Alice", vec![]), spouse_meta("Alice", t_early))
+            .store_temporal(agent, make_entry(agent, "married Alice", vec![]), spouse_meta("Alice", t_early), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         let bob_id = engine
-            .store_temporal(agent, make_entry(agent, "married Bob", vec![]), spouse_meta("Bob", t_late))
+            .store_temporal(agent, make_entry(agent, "married Bob", vec![]), spouse_meta("Bob", t_late), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -5922,7 +6195,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "current spouse", vec![]),
-                spouse_meta("Current", now - Duration::days(100)),
+                spouse_meta("Current", now - Duration::days(100)), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -5931,7 +6204,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "old spouse", vec![]),
-                spouse_meta("Old", now - Duration::days(500)),
+                spouse_meta("Old", now - Duration::days(500)), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -5960,7 +6233,7 @@ mod tests {
             ..Default::default()
         };
         let id1 = engine
-            .store_temporal(agent, make_entry(agent, "likes python", vec![]), meta1)
+            .store_temporal(agent, make_entry(agent, "likes python", vec![]), meta1, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -5972,7 +6245,7 @@ mod tests {
             ..Default::default()
         };
         let id2 = engine
-            .store_temporal(agent, make_entry(agent, "likes python", vec![]), meta2)
+            .store_temporal(agent, make_entry(agent, "likes python", vec![]), meta2, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -6008,14 +6281,14 @@ mod tests {
         let content = "likes python";
 
         engine
-            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", "e0"))
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", "e0"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
         // Three reaffirmations, all from the SAME origin class.
         for ev in ["e1", "e2", "e3"] {
             engine
-                .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", ev))
+                .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", ev), crate::lineage::Provenance::test_only())
                 .await
                 .unwrap();
         }
@@ -6041,13 +6314,13 @@ mod tests {
 
         // Row origin = operator (corroborating class #1), confidence 0.85.
         engine
-            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("operator", "e0"))
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("operator", "e0"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
         // Reaffirm from import (distinct class #2) → boost to 0.95.
         engine
-            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("import", "e1"))
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("import", "e1"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         let h = engine.get_history(agent, "user", "lang").await.unwrap();
@@ -6055,7 +6328,7 @@ mod tests {
 
         // Reaffirm from channel (distinct class #3) → +0.1 but capped at 1.0.
         engine
-            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", "e2"))
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", "e2"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         let h = engine.get_history(agent, "user", "lang").await.unwrap();
@@ -6063,11 +6336,11 @@ mod tests {
 
         // Agent-derived reaffirm never corroborates; repeat-class does not boost.
         engine
-            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("agent_derived", "e3"))
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("agent_derived", "e3"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         engine
-            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", "e4"))
+            .store_temporal(agent, make_entry(agent, content, vec![]), reaffirm_meta("channel", "e4"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         let h = engine.get_history(agent, "user", "lang").await.unwrap();
@@ -6080,11 +6353,11 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "reaffirm-neg";
         engine
-            .store_temporal(agent, make_entry(agent, "old", vec![]), triple_meta("s", "p", "v1"))
+            .store_temporal(agent, make_entry(agent, "old", vec![]), triple_meta("s", "p", "v1"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         engine
-            .store_temporal(agent, make_entry(agent, "new", vec![]), triple_meta("s", "p", "v2"))
+            .store_temporal(agent, make_entry(agent, "new", vec![]), triple_meta("s", "p", "v2"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         let hist = engine.get_history(agent, "s", "p").await.unwrap();
@@ -6097,7 +6370,7 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "ingested";
         engine
-            .store_temporal(agent, make_entry(agent, "x", vec![]), triple_meta("s", "p", "o"))
+            .store_temporal(agent, make_entry(agent, "x", vec![]), triple_meta("s", "p", "o"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         let hist = engine.get_history(agent, "s", "p").await.unwrap();
@@ -6126,7 +6399,7 @@ mod tests {
                     origin: Some("chan-bad".into()),
                     origin_trust: Some(0.3),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6141,7 +6414,7 @@ mod tests {
                     origin_trust: Some(0.9),
                     derived_from: Some(vec![f1.clone()]),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6152,7 +6425,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "clean findmeee", vec![]),
-                TemporalMeta { origin: Some("chan-good".into()), ..Default::default() },
+                TemporalMeta { origin: Some("chan-good".into()), ..Default::default() }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6184,7 +6457,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "exact aaa", vec![]),
-                TemporalMeta { origin: Some("chan".into()), ..Default::default() },
+                TemporalMeta { origin: Some("chan".into()), ..Default::default() }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6192,7 +6465,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "prefix bbb", vec![]),
-                TemporalMeta { origin: Some("chan-extra".into()), ..Default::default() },
+                TemporalMeta { origin: Some("chan-extra".into()), ..Default::default() }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6213,7 +6486,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "sinceable ccc", vec![]),
-                TemporalMeta { origin: Some("chan".into()), ..Default::default() },
+                TemporalMeta { origin: Some("chan".into()), ..Default::default() }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6259,7 +6532,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "alice reports to bob", vec![]),
-                triple_meta("alice", "reports_to", "bob"),
+                triple_meta("alice", "reports_to", "bob"), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6267,7 +6540,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "bob leads the big initiative", vec![]),
-                triple_meta("bob", "leads", "project-x"),
+                triple_meta("bob", "leads", "project-x"), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6294,7 +6567,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "alice reports to bob", vec![]),
-                triple_meta("alice", "reports_to", "bob"),
+                triple_meta("alice", "reports_to", "bob"), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6304,7 +6577,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "bob leads codename zeta", vec![]),
-                triple_meta("bob", "leads", "project-x"),
+                triple_meta("bob", "leads", "project-x"), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6312,7 +6585,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "bob leads codename omega", vec![]),
-                triple_meta("bob", "leads", "project-y"),
+                triple_meta("bob", "leads", "project-y"), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6339,7 +6612,7 @@ mod tests {
             .store_temporal(
                 "agent-a",
                 make_entry("agent-a", "alice reports to bob", vec![]),
-                triple_meta("alice", "reports_to", "bob"),
+                triple_meta("alice", "reports_to", "bob"), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6347,7 +6620,7 @@ mod tests {
             .store_temporal(
                 "agent-a",
                 make_entry("agent-a", "bob leads project-x", vec![]),
-                triple_meta("bob", "leads", "project-x"),
+                triple_meta("bob", "leads", "project-x"), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6356,7 +6629,7 @@ mod tests {
             .store_temporal(
                 "agent-b",
                 make_entry("agent-b", "carol likes tea", vec![]),
-                triple_meta("carol", "likes", "tea"),
+                triple_meta("carol", "likes", "tea"), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6407,7 +6680,7 @@ mod tests {
             .store_temporal(
                 agent,
                 make_entry(agent, "alice reports to bob", vec![]),
-                triple_meta("alice", "reports_to", "bob"),
+                triple_meta("alice", "reports_to", "bob"), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -6432,7 +6705,7 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "facts-agent";
         engine
-            .store_fact(agent, "the deploy password is hunter2", "tg", "c1", "s1")
+            .store_fact(agent, "the deploy password is hunter2", "tg", "c1", "s1", crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -6452,7 +6725,7 @@ mod tests {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "facts-agent-2";
         engine
-            .store_fact(agent, "favorite editor is neovim", "tg", "c1", "s1")
+            .store_fact(agent, "favorite editor is neovim", "tg", "c1", "s1", crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -6512,7 +6785,7 @@ mod tests {
 
         let e = make_entry(agent, "superseding value", vec![]);
         let new_id = engine
-            .store_temporal(agent, e, triple_meta("s", "p", "z"))
+            .store_temporal(agent, e, triple_meta("s", "p", "z"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -6550,7 +6823,7 @@ mod tests {
 
         let e = make_entry(agent, "the vault password is hunter2", vec![]);
         let id = engine
-            .store_temporal(agent, e, quarantined_meta("vault", "password_is", "hunter2"))
+            .store_temporal(agent, e, quarantined_meta("vault", "password_is", "hunter2"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!(engine.is_quarantined(agent, &id).await.unwrap(), Some(true));
@@ -6580,14 +6853,14 @@ mod tests {
 
         let clean = make_entry(agent, "capital of france is paris", vec![]);
         let clean_id = engine
-            .store_temporal(agent, clean, triple_meta("france", "capital_is", "paris"))
+            .store_temporal(agent, clean, triple_meta("france", "capital_is", "paris"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
         // Poison: same (subject, predicate), quarantined.
         let poison = make_entry(agent, "capital of france is berlin", vec![]);
         let poison_id = engine
-            .store_temporal(agent, poison, quarantined_meta("france", "capital_is", "berlin"))
+            .store_temporal(agent, poison, quarantined_meta("france", "capital_is", "berlin"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -6612,7 +6885,7 @@ mod tests {
         let mut meta = quarantined_meta("acme", "status_is", "bankrupt");
         meta.origin = Some("channel".to_string());
         meta.origin_trust = Some(0.3);
-        let id = engine.store_temporal(agent, e, meta).await.unwrap();
+        let id = engine.store_temporal(agent, e, meta, crate::lineage::Provenance::test_only()).await.unwrap();
 
         let n = engine
             .reject_quarantine(agent, &[id.clone()], "quarantine_reject")
@@ -6645,7 +6918,7 @@ mod tests {
         // origin_trust. The high-trust one must rank first under default weights.
         let high = make_entry(agent, "widget price is 100 dollars", vec![]);
         let high_meta = TemporalMeta { origin_trust: Some(1.0), ..Default::default() };
-        engine.store_temporal(agent, high, high_meta).await.unwrap();
+        engine.store_temporal(agent, high, high_meta, crate::lineage::Provenance::test_only()).await.unwrap();
 
         let low = make_entry(agent, "widget price is 999 dollars", vec![]);
         let low_meta = TemporalMeta {
@@ -6653,7 +6926,7 @@ mod tests {
             origin_trust: Some(0.3),
             ..Default::default()
         };
-        engine.store_temporal(agent, low, low_meta).await.unwrap();
+        engine.store_temporal(agent, low, low_meta, crate::lineage::Provenance::test_only()).await.unwrap();
 
         let results = engine.search(agent, "widget price", 10).await.unwrap();
         assert_eq!(results.len(), 2);
@@ -6681,7 +6954,7 @@ mod tests {
         for i in 0..n {
             let e = make_entry(agent, &format!("person {i} knows the hub"), vec![]);
             engine
-                .store_temporal(agent, e, triple_meta(&format!("person{i}"), "knows", "hub"))
+                .store_temporal(agent, e, triple_meta(&format!("person{i}"), "knows", "hub"), crate::lineage::Provenance::test_only())
                 .await
                 .unwrap();
         }
@@ -6754,7 +7027,7 @@ mod tests {
         // A new triple on a fresh subject connected to "hub".
         let e = make_entry(agent, "newcomer knows the hub", vec![]);
         engine
-            .store_temporal(agent, e, triple_meta("newcomer", "knows", "hub"))
+            .store_temporal(agent, e, triple_meta("newcomer", "knows", "hub"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert!(engine.graph_generation(agent) > gen_before, "store must bump generation");
@@ -6812,7 +7085,7 @@ mod tests {
         // does NOT contain the alias, so only graph seeding can bridge it.
         let e = make_entry(agent, "李老闆 prefers oolong", vec![]);
         engine
-            .store_temporal(agent, e, triple_meta("李老闆", "prefers", "oolong"))
+            .store_temporal(agent, e, triple_meta("李老闆", "prefers", "oolong"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -6833,14 +7106,14 @@ mod tests {
         let agent = "export-agent";
         engine
             .store_temporal(agent, make_entry(agent, "alice knows bob", vec![]),
-                triple_meta("alice", "knows", "bob"))
+                triple_meta("alice", "knows", "bob"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         // A quarantined triple must still appear in the export, flagged.
         let mut qmeta = triple_meta("mallory", "claims", "admin");
         qmeta.quarantined = true;
         engine
-            .store_temporal(agent, make_entry(agent, "mallory claims admin", vec![]), qmeta)
+            .store_temporal(agent, make_entry(agent, "mallory claims admin", vec![]), qmeta, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -6861,7 +7134,7 @@ mod tests {
         for i in 0..5 {
             engine
                 .store_temporal(agent, make_entry(agent, &format!("f{i}"), vec![]),
-                    triple_meta(&format!("s{i}"), "rel", &format!("o{i}")))
+                    triple_meta(&format!("s{i}"), "rel", &format!("o{i}")), crate::lineage::Provenance::test_only())
                 .await
                 .unwrap();
         }
@@ -6952,18 +7225,18 @@ mod tests {
 
         // Fact A: superseded by a newer write of the same triple.
         let a = engine
-            .store_temporal(agent, make_entry(agent, "price is 100", vec![]), triple_meta("product:price", "is", "100"))
+            .store_temporal(agent, make_entry(agent, "price is 100", vec![]), triple_meta("product:price", "is", "100"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         // Newer value supersedes A.
         engine
-            .store_temporal(agent, make_entry(agent, "price is 120", vec![]), triple_meta("product:price", "is", "120"))
+            .store_temporal(agent, make_entry(agent, "price is 120", vec![]), triple_meta("product:price", "is", "120"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
         // Fact B: still valid, never superseded.
         let b = engine
-            .store_temporal(agent, make_entry(agent, "sky is blue", vec![]), triple_meta("sky", "color", "blue"))
+            .store_temporal(agent, make_entry(agent, "sky is blue", vec![]), triple_meta("sky", "color", "blue"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -6982,11 +7255,11 @@ mod tests {
         let other = "other";
 
         let a = engine
-            .store_temporal(owner, make_entry(owner, "v1", vec![]), triple_meta("k", "is", "1"))
+            .store_temporal(owner, make_entry(owner, "v1", vec![]), triple_meta("k", "is", "1"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         engine
-            .store_temporal(owner, make_entry(owner, "v2", vec![]), triple_meta("k", "is", "2"))
+            .store_temporal(owner, make_entry(owner, "v2", vec![]), triple_meta("k", "is", "2"), crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 

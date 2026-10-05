@@ -38,6 +38,10 @@ pub struct ReassignSummary {
     pub key_facts: u64,
     /// Rows moved out of `memories_archive` (0 when the table doesn't exist).
     pub archived: u64,
+    /// Rows left in the source namespace because their lineage matches a
+    /// source the target namespace has forgotten (P2-B), or because their id
+    /// was forgotten in the destination database.
+    pub fenced: u64,
 }
 
 impl ReassignSummary {
@@ -57,11 +61,79 @@ fn archive_table_exists(conn: &Connection) -> bool {
     .is_ok()
 }
 
+/// Fill `temp.reassign_fenced` with the rows of `from` (in `main`) that must
+/// stay behind: their lineage matches a tombstone of `to` in `fs`, or (for a
+/// cross-database move) their id is forgotten in `forgotten`.
+fn collect_fenced(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    fs: &str,
+    forgotten: Option<&str>,
+    has_archive: bool,
+) -> std::result::Result<u64, String> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS reassign_fenced (store TEXT NOT NULL, id TEXT NOT NULL,
+                                                         PRIMARY KEY (store, id));
+         DELETE FROM temp.reassign_fenced;",
+    )
+    .map_err(|e| format!("fence table: {e}"))?;
+    let hit = crate::lineage::db::tombstone_match_sql(
+        fs,
+        "?2",
+        "o.source_session",
+        "o.source_message",
+        "o.source_seq",
+        "o.source_observed_at",
+    );
+    let mut sources: Vec<(&str, &str, &str)> = vec![
+        ("memories", "main.memories", "memories"),
+        ("key_facts", "main.key_facts", "key_facts"),
+    ];
+    if has_archive {
+        sources.push(("archive", "main.memories_archive", "memories"));
+    }
+    for (label, table, store) in sources {
+        let by_id = forgotten
+            .map(|f| {
+                format!(
+                    " OR EXISTS (SELECT 1 FROM {f} g WHERE g.memory_store = '{store}' AND g.memory_id = t.id)"
+                )
+            })
+            .unwrap_or_default();
+        conn.execute(
+            &format!(
+                "INSERT OR IGNORE INTO temp.reassign_fenced (store, id)
+                 SELECT '{label}', t.id FROM {table} t
+                 WHERE t.agent_id = ?1 AND (
+                       EXISTS (SELECT 1 FROM main.memory_origins o
+                               WHERE o.memory_store = '{store}' AND o.memory_id = t.id
+                                 AND o.agent_id = ?1 AND {hit}){by_id})"
+            ),
+            params![from, to],
+        )
+        .map_err(|e| format!("fence check failed: {e}"))?;
+    }
+    conn.query_row("SELECT COUNT(*) FROM temp.reassign_fenced", [], |r| r.get::<_, i64>(0))
+        .map(|n| n.max(0) as u64)
+        .map_err(|e| format!("fence count failed: {e}"))
+}
+
+/// `AND <col> NOT IN (fenced ids of label)`.
+fn not_fenced(col: &str, label: &str) -> String {
+    format!(" AND {col} NOT IN (SELECT id FROM temp.reassign_fenced WHERE store = '{label}')")
+}
+
 /// In-place re-key: rewrite `agent_id` from `from_agent` to `to_agent` across
 /// every table in this one database. Use when both agents share a memory DB.
 ///
+/// P2-B: the rows' lineage moves with them, and `from_agent`'s source
+/// tombstones are copied to `to_agent` (so the successor cannot relearn what
+/// was forgotten). A row whose lineage matches a source `to_agent` has
+/// forgotten stays under `from_agent` and is counted as `fenced`.
+///
 /// No-op-safe: re-running after the first move updates zero rows (nothing is
-/// left tagged `from_agent`).
+/// left tagged `from_agent` except fenced rows).
 pub async fn reassign_agent(
     engine: &SqliteMemoryEngine,
     from_agent: &str,
@@ -79,9 +151,29 @@ pub async fn reassign_agent(
         conn.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| format!("BEGIN failed: {e}"))?;
 
+        crate::lineage::db::copy_tombstones(
+            &conn,
+            "main.forgotten_sources",
+            "main.forgotten_sources",
+            from_agent,
+            to_agent,
+        )
+        .map_err(|e| format!("tombstone copy failed: {e}"))?;
+        let fenced = collect_fenced(
+            &conn,
+            from_agent,
+            to_agent,
+            "main.forgotten_sources",
+            None,
+            has_archive,
+        )?;
+
         let memories = conn
             .execute(
-                "UPDATE memories SET agent_id = ?1 WHERE agent_id = ?2",
+                &format!(
+                    "UPDATE memories SET agent_id = ?1 WHERE agent_id = ?2{}",
+                    not_fenced("id", "memories")
+                ),
                 params![to_agent, from_agent],
             )
             .map_err(|e| format!("memories re-key failed: {e}"))? as u64;
@@ -90,14 +182,20 @@ pub async fn reassign_agent(
         // column that search filters on — it MUST be re-keyed too or the moved
         // rows become unfindable under the new agent.
         conn.execute(
-            "UPDATE memories_fts SET agent_id = ?1 WHERE agent_id = ?2",
+            &format!(
+                "UPDATE memories_fts SET agent_id = ?1 WHERE agent_id = ?2{}",
+                not_fenced("memory_id", "memories")
+            ),
             params![to_agent, from_agent],
         )
         .map_err(|e| format!("memories_fts re-key failed: {e}"))?;
 
         let key_facts = conn
             .execute(
-                "UPDATE key_facts SET agent_id = ?1 WHERE agent_id = ?2",
+                &format!(
+                    "UPDATE key_facts SET agent_id = ?1 WHERE agent_id = ?2{}",
+                    not_fenced("id", "key_facts")
+                ),
                 params![to_agent, from_agent],
             )
             .map_err(|e| format!("key_facts re-key failed: {e}"))? as u64;
@@ -106,7 +204,10 @@ pub async fn reassign_agent(
 
         let archived = if has_archive {
             conn.execute(
-                "UPDATE memories_archive SET agent_id = ?1 WHERE agent_id = ?2",
+                &format!(
+                    "UPDATE memories_archive SET agent_id = ?1 WHERE agent_id = ?2{}",
+                    not_fenced("id", "archive")
+                ),
                 params![to_agent, from_agent],
             )
             .map_err(|e| format!("memories_archive re-key failed: {e}"))? as u64
@@ -114,12 +215,22 @@ pub async fn reassign_agent(
             0
         };
 
+        // Lineage of every moved row (rows fenced above keep theirs).
+        conn.execute(
+            "UPDATE memory_origins SET agent_id = ?1
+             WHERE agent_id = ?2
+               AND memory_id NOT IN (SELECT id FROM temp.reassign_fenced)",
+            params![to_agent, from_agent],
+        )
+        .map_err(|e| format!("lineage re-key failed: {e}"))?;
+
         conn.execute_batch("COMMIT")
             .map_err(|e| format!("COMMIT failed: {e}"))?;
         Ok(ReassignSummary {
             memories,
             key_facts,
             archived,
+            fenced,
         })
     })();
 
@@ -143,10 +254,17 @@ pub async fn reassign_agent(
 /// into the database at `to_db_path`, re-tagged as `to_agent`, then delete them
 /// from the source. Used by the gateway's per-agent `memory.db` layout.
 ///
+/// P2-B: inside the one transaction, `from_agent`'s source tombstones are
+/// copied into the destination (as `to_agent`), rows whose id the destination
+/// has forgotten or whose lineage matches a destination tombstone of
+/// `to_agent` are not copied and stay in the source (`fenced`), and the
+/// lineage of every moved row moves with it (the destination's insert trigger
+/// re-checks each lineage row and each id).
+///
 /// The destination database must already exist with the current schema — open
 /// it once via [`SqliteMemoryEngine::new`] (which runs the migrations) before
 /// calling. Idempotent: after a successful move the source holds no `from_agent`
-/// rows, so a re-run copies and deletes nothing.
+/// rows except fenced ones, so a re-run copies and deletes nothing.
 pub async fn reassign_agent_cross_db(
     from_engine: &SqliteMemoryEngine,
     to_db_path: &Path,
@@ -182,14 +300,42 @@ pub async fn reassign_agent_cross_db(
     }
 
     let txn: std::result::Result<ReassignSummary, String> = (|| {
+        // Fail closed: a destination without the lineage tables (an older
+        // schema) cannot hold tombstones, so nothing is moved.
+        if !crate::lineage::db::table_exists(&conn, "hdst", "forgotten_sources")
+            .map_err(|e| e.to_string())?
+        {
+            return Err("destination database has no lineage tables".to_string());
+        }
         conn.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| format!("BEGIN failed: {e}"))?;
+
+        crate::lineage::db::copy_tombstones(
+            &conn,
+            "main.forgotten_sources",
+            "hdst.forgotten_sources",
+            from_agent,
+            to_agent,
+        )
+        .map_err(|e| format!("tombstone copy failed: {e}"))?;
+        let fenced = collect_fenced(
+            &conn,
+            from_agent,
+            to_agent,
+            "hdst.forgotten_sources",
+            Some("hdst.forgotten_memories"),
+            has_archive,
+        )?;
+        let nf_mem = not_fenced("id", "memories");
+        let nf_facts = not_fenced("id", "key_facts");
+        let nf_arch = not_fenced("id", "archive");
 
         // Copy memories into the destination re-tagged. A genuine id collision
         // (UUID clash) aborts here rather than silently skipping — honest fail.
         let memories = conn
             .execute(
-                "INSERT INTO hdst.memories
+                &format!(
+                    "INSERT INTO hdst.memories
                     (id, agent_id, content, timestamp, tags, created_at, layer,
                      importance, access_count, last_accessed, source_event,
                      valid_from, valid_until, superseded_by, supersedes, subject,
@@ -200,27 +346,32 @@ pub async fn reassign_agent_cross_db(
                         valid_from, valid_until, superseded_by, supersedes, subject,
                         predicate, object, confidence, metadata, origin, origin_trust,
                         derived_from, embedding, embedding_model
-                 FROM main.memories WHERE agent_id = ?2",
+                 FROM main.memories WHERE agent_id = ?2{nf_mem}"
+                ),
                 params![to_agent, from_agent],
             )
             .map_err(|e| format!("memories copy failed: {e}"))? as u64;
 
         // Destination FTS for exactly the copied rows.
         conn.execute(
-            "INSERT INTO hdst.memories_fts (content, agent_id, memory_id)
-             SELECT content, ?1, id FROM main.memories WHERE agent_id = ?2",
+            &format!(
+                "INSERT INTO hdst.memories_fts (content, agent_id, memory_id)
+             SELECT content, ?1, id FROM main.memories WHERE agent_id = ?2{nf_mem}"
+            ),
             params![to_agent, from_agent],
         )
         .map_err(|e| format!("memories_fts copy failed: {e}"))?;
 
         let key_facts = conn
             .execute(
-                "INSERT INTO hdst.key_facts
+                &format!(
+                    "INSERT INTO hdst.key_facts
                     (id, agent_id, fact, channel, chat_id, source_session,
                      timestamp, access_count)
                  SELECT id, ?1, fact, channel, chat_id, source_session,
                         timestamp, access_count
-                 FROM main.key_facts WHERE agent_id = ?2",
+                 FROM main.key_facts WHERE agent_id = ?2{nf_facts}"
+                ),
                 params![to_agent, from_agent],
             )
             .map_err(|e| format!("key_facts copy failed: {e}"))? as u64;
@@ -228,22 +379,26 @@ pub async fn reassign_agent_cross_db(
         // key_facts_fts is rowid-linked; use the destination rowids of the rows
         // we just inserted (matched by their globally-unique ids).
         conn.execute(
-            "INSERT INTO hdst.key_facts_fts (rowid, fact)
+            &format!(
+                "INSERT INTO hdst.key_facts_fts (rowid, fact)
              SELECT k.rowid, k.fact FROM hdst.key_facts AS k
              WHERE k.agent_id = ?1
-               AND k.id IN (SELECT id FROM main.key_facts WHERE agent_id = ?2)",
+               AND k.id IN (SELECT id FROM main.key_facts WHERE agent_id = ?2{nf_facts})"
+            ),
             params![to_agent, from_agent],
         )
         .map_err(|e| format!("key_facts_fts copy failed: {e}"))?;
 
         let archived = if has_archive {
             conn.execute(
-                "INSERT INTO hdst.memories_archive
+                &format!(
+                    "INSERT INTO hdst.memories_archive
                     (id, agent_id, content, timestamp, tags, layer, importance,
                      access_count, last_accessed, source_event, archived_at)
                  SELECT id, ?1, content, timestamp, tags, layer, importance,
                         access_count, last_accessed, source_event, archived_at
-                 FROM main.memories_archive WHERE agent_id = ?2",
+                 FROM main.memories_archive WHERE agent_id = ?2{nf_arch}"
+                ),
                 params![to_agent, from_agent],
             )
             .map_err(|e| format!("memories_archive copy failed: {e}"))? as u64
@@ -251,31 +406,82 @@ pub async fn reassign_agent_cross_db(
             0
         };
 
+        // Lineage of the moved rows (the destination trigger re-checks it).
+        let archived_lineage = |alias: &str, agent: &str| {
+            if has_archive {
+                format!(
+                    "\n                    OR EXISTS (SELECT 1 FROM main.memories_archive a
+                               WHERE a.id = {alias}.memory_id AND a.agent_id = {agent})"
+                )
+            } else {
+                String::new()
+            }
+        };
+        conn.execute(
+            &format!("INSERT OR IGNORE INTO hdst.memory_origins
+                (memory_store, memory_id, agent_id, source_kind, source_session,
+                 source_message, source_seq, source_observed_at, source_hash, role,
+                 via_memory_id, created_at)
+             SELECT memory_store, memory_id, ?1, source_kind, source_session,
+                    source_message, source_seq, source_observed_at, source_hash, role,
+                    via_memory_id, created_at
+             FROM main.memory_origins o
+             WHERE o.agent_id = ?2
+               AND o.memory_id NOT IN (SELECT id FROM temp.reassign_fenced)
+               AND (EXISTS (SELECT 1 FROM main.memories m
+                            WHERE m.id = o.memory_id AND m.agent_id = ?2)
+                    OR EXISTS (SELECT 1 FROM main.key_facts k
+                               WHERE k.id = o.memory_id AND k.agent_id = ?2){}
+                    )", archived_lineage("o", "?2")),
+            params![to_agent, from_agent],
+        )
+        .map_err(|e| format!("lineage copy failed: {e}"))?;
+
         // Delete the moved rows from the source (FTS first to avoid orphans).
         conn.execute(
-            "DELETE FROM main.memories_fts WHERE agent_id = ?1",
+            &format!(
+                "DELETE FROM main.memories_fts WHERE agent_id = ?1{}",
+                not_fenced("memory_id", "memories")
+            ),
             params![from_agent],
         )
         .map_err(|e| format!("source memories_fts delete failed: {e}"))?;
         conn.execute(
-            "DELETE FROM main.memories WHERE agent_id = ?1",
+            &format!(
+                "DELETE FROM main.memory_origins
+             WHERE agent_id = ?1
+               AND memory_id NOT IN (SELECT id FROM temp.reassign_fenced)
+               AND (EXISTS (SELECT 1 FROM main.memories m
+                            WHERE m.id = memory_origins.memory_id AND m.agent_id = ?1)
+                    OR EXISTS (SELECT 1 FROM main.key_facts k
+                               WHERE k.id = memory_origins.memory_id AND k.agent_id = ?1){}
+                    )",
+                archived_lineage("memory_origins", "?1")
+            ),
+            params![from_agent],
+        )
+        .map_err(|e| format!("source lineage delete failed: {e}"))?;
+        conn.execute(
+            &format!("DELETE FROM main.memories WHERE agent_id = ?1{nf_mem}"),
             params![from_agent],
         )
         .map_err(|e| format!("source memories delete failed: {e}"))?;
         conn.execute(
-            "DELETE FROM main.key_facts_fts
-             WHERE rowid IN (SELECT rowid FROM main.key_facts WHERE agent_id = ?1)",
+            &format!(
+                "DELETE FROM main.key_facts_fts
+             WHERE rowid IN (SELECT rowid FROM main.key_facts WHERE agent_id = ?1{nf_facts})"
+            ),
             params![from_agent],
         )
         .map_err(|e| format!("source key_facts_fts delete failed: {e}"))?;
         conn.execute(
-            "DELETE FROM main.key_facts WHERE agent_id = ?1",
+            &format!("DELETE FROM main.key_facts WHERE agent_id = ?1{nf_facts}"),
             params![from_agent],
         )
         .map_err(|e| format!("source key_facts delete failed: {e}"))?;
         if has_archive {
             conn.execute(
-                "DELETE FROM main.memories_archive WHERE agent_id = ?1",
+                &format!("DELETE FROM main.memories_archive WHERE agent_id = ?1{nf_arch}"),
                 params![from_agent],
             )
             .map_err(|e| format!("source memories_archive delete failed: {e}"))?;
@@ -287,6 +493,7 @@ pub async fn reassign_agent_cross_db(
             memories,
             key_facts,
             archived,
+            fenced,
         })
     })();
 
@@ -345,7 +552,7 @@ mod tests {
                     predicate: Some("prefers".into()),
                     object: Some("tea".into()),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -353,7 +560,7 @@ mod tests {
             .store_temporal(
                 agent,
                 entry(&format!("{agent}-m2"), agent, "handoff subject beta note"),
-                TemporalMeta::default(),
+                TemporalMeta::default(), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -427,7 +634,7 @@ mod tests {
                     predicate: Some("lives_in".into()),
                     object: Some("Taipei".into()),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -440,7 +647,7 @@ mod tests {
                     predicate: Some("lives_in".into()),
                     object: Some("Tainan".into()),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();

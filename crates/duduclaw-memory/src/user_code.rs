@@ -897,7 +897,7 @@ mod tests {
                     valid_from,
                     confidence,
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap()
@@ -1295,7 +1295,7 @@ mod tests {
             .store_temporal(
                 "a",
                 entry("a", "總之他人很好", vec!["user-profile"]),
-                TemporalMeta::default(),
+                TemporalMeta::default(), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -1304,7 +1304,7 @@ mod tests {
             .store_temporal(
                 "a",
                 entry("a", "timezone: Asia/Taipei", vec!["user-profile"]),
-                TemporalMeta::default(),
+                TemporalMeta::default(), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -1313,7 +1313,7 @@ mod tests {
             .store_temporal(
                 "a",
                 entry("a", "勿在深夜打擾", vec!["user-profile"]),
-                TemporalMeta::default(),
+                TemporalMeta::default(), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -1328,7 +1328,7 @@ mod tests {
                     predicate: Some("empty_pred".to_string()),
                     object: Some("   ".to_string()),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -1349,13 +1349,13 @@ mod tests {
     #[tokio::test]
     async fn profile_summary_row_is_excluded() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
-        crate::user_profile::record_trait(&engine, "a", "u1", "prefers", "tea", 1.0)
+        crate::user_profile::record_trait(&engine, "a", "u1", "prefers", "tea", 1.0, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
-        crate::user_profile::record_trait(&engine, "a", "u1", "timezone", "Asia/Taipei", 1.0)
+        crate::user_profile::record_trait(&engine, "a", "u1", "timezone", "Asia/Taipei", 1.0, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
-        crate::user_profile::record_trait(&engine, "a", "u1", "language", "zh-TW", 1.0)
+        crate::user_profile::record_trait(&engine, "a", "u1", "language", "zh-TW", 1.0, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         crate::user_profile::consolidate_profile(&engine, "a", "u1", 3)
