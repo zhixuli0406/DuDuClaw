@@ -79,6 +79,7 @@ mod service;
 pub mod weekly_report; // Per-agent weekly usage report
 mod knobs_survival;
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
+mod doctor_mcp_servers; // N5: doctor row for MCP servers DuDuClaw did not write
 #[cfg(test)]
 mod namespace_unification_tests;
 mod discover_cli;
@@ -6188,7 +6189,7 @@ fn content_stages(
     // guards the files that decide *who the caller is* and *whether this hook
     // runs at all*.
     check_protected_toml_tool_call(tool_name, envelope, file_path, home, caller)
-        .or_else(|| check_identity_surface_tool_call(tool_name, envelope, file_path, home))
+        .or_else(|| check_identity_surface_tool_call(tool_name, envelope, file_path, home, caller))
         .unwrap_or(located)
 }
 
@@ -6808,6 +6809,7 @@ fn check_identity_surface_tool_call(
     envelope: &serde_json::Value,
     file_path: &std::path::Path,
     home: &std::path::Path,
+    caller: &duduclaw_core::HookCaller,
 ) -> Option<duduclaw_core::GuardDecision> {
     let surface = duduclaw_core::classify_identity_surface(file_path, home)?;
     // Only `.mcp.json` is judged on content; the other two are refused
@@ -6823,9 +6825,10 @@ fn check_identity_surface_tool_call(
     } else {
         (None, None)
     };
-    Some(duduclaw_core::check_identity_surface_write(
+    Some(duduclaw_core::check_identity_surface_write_as(
         file_path,
         home,
+        caller,
         existing.as_deref(),
         new_content.as_deref(),
     ))
@@ -9621,6 +9624,10 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // Check 4d: MCP tool names and judge modes removed in v1.69.0.
     checks.push(removed_mcp_tools_check(&home));
     checks.push(removed_judge_mode_check(&home));
+
+    // Check 4e: MCP servers in employees' .mcp.json that DuDuClaw did not
+    // write (they run as the operator's OS user at every spawn).
+    checks.push(doctor_mcp_servers::mcp_servers_check(&home));
 
     // Print results
     let mut has_failure = false;
@@ -12984,19 +12991,32 @@ mod protected_toml_hook_tests {
         let mine = "{\"mcpServers\":{\"duduclaw\":{\"command\":\"/bin/duduclaw\",\"args\":[\"mcp-server\"],\"env\":{\"DUDUCLAW_AGENT_ID\":\"agnes\",\"DUDUCLAW_AGENT_TOKEN\":\"aa11\"}}}}";
         std::fs::write(&path, mine).unwrap();
 
+        let agent = duduclaw_core::HookCaller::Agent("agnes".into());
         // Pasting a peer's id (and, in strict mode, their stolen token).
         let env = edit_envelope(&path, "\"agnes\"", "\"ceo\"");
-        let d = check_identity_surface_tool_call("Edit", &env, &path, &home.0).unwrap();
+        let d = check_identity_surface_tool_call("Edit", &env, &path, &home.0, &agent).unwrap();
         assert!(matches!(d, GuardDecision::BlockedIdentitySurface { .. }));
 
-        // An unrelated server addition still goes through.
-        let ok_env = edit_envelope(
+        // Adding an "unrelated" server is refused too (2026-10-06): the CLI
+        // starts every server the file lists, so it would run its command as
+        // the operator's OS user. Was allowed before.
+        let add_env = edit_envelope(
             &path,
             "\"mcpServers\":{",
             "\"mcpServers\":{\"playwright\":{\"command\":\"npx\"},",
         );
+        let d = check_identity_surface_tool_call("Edit", &add_env, &path, &home.0, &agent).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedIdentitySurface { .. }), "{d:?}");
+        // An operator (no employee identity) may still add one.
         assert_eq!(
-            check_identity_surface_tool_call("Edit", &ok_env, &path, &home.0).unwrap(),
+            check_identity_surface_tool_call(
+                "Edit",
+                &add_env,
+                &path,
+                &home.0,
+                &duduclaw_core::HookCaller::Absent
+            )
+            .unwrap(),
             GuardDecision::AllowedAgentWrite
         );
     }
@@ -13008,7 +13028,7 @@ mod protected_toml_hook_tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{\"hooks\":{\"PreToolUse\":[]}}").unwrap();
         let env = write_envelope(&path, "{}");
-        let d = check_identity_surface_tool_call("Write", &env, &path, &home.0).unwrap();
+        let d = check_identity_surface_tool_call("Write", &env, &path, &home.0, &duduclaw_core::HookCaller::Absent).unwrap();
         assert!(matches!(d, GuardDecision::BlockedIdentitySurface { .. }));
         assert!(d.block_message().unwrap().contains("settings.json"));
     }
@@ -13018,8 +13038,49 @@ mod protected_toml_hook_tests {
         let home = TempHome::new();
         let path = home.0.join("identity.key");
         let env = write_envelope(&path, "x");
-        let d = check_identity_surface_tool_call("Write", &env, &path, &home.0).unwrap();
+        let d = check_identity_surface_tool_call("Write", &env, &path, &home.0, &duduclaw_core::HookCaller::Absent).unwrap();
         assert!(matches!(d, GuardDecision::BlockedIdentitySurface { .. }));
+    }
+
+    /// `.mcp.json` platform fix: an employee's Edit / MultiEdit that adds a
+    /// `DUDUCLAW_*` env key to the duduclaw entry is refused on the
+    /// reconstructed content; the same edit by an operator passes.
+    #[test]
+    fn agent_edit_and_multiedit_into_the_duduclaw_env_are_blocked() {
+        let home = TempHome::new();
+        let path = home.0.join("agents/agnes/.mcp.json");
+        let mine = "{\"mcpServers\":{\"duduclaw\":{\"command\":\"/bin/duduclaw\",\"args\":[\"mcp-server\"],\"env\":{\"DUDUCLAW_AGENT_ID\":\"agnes\"}}}}";
+        std::fs::write(&path, mine).unwrap();
+        let agent = duduclaw_core::HookCaller::Agent("agnes".into());
+        let edit = edit_envelope(
+            &path,
+            "\"DUDUCLAW_AGENT_ID\":\"agnes\"",
+            "\"DUDUCLAW_AGENT_ID\":\"agnes\",\"DUDUCLAW_TURN_ID\":\"\"",
+        );
+        let d = check_identity_surface_tool_call("Edit", &edit, &path, &home.0, &agent).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedIdentitySurface { .. }), "{d:?}");
+        let operator = check_identity_surface_tool_call(
+            "Edit",
+            &edit,
+            &path,
+            &home.0,
+            &duduclaw_core::HookCaller::Absent,
+        )
+        .unwrap();
+        assert_eq!(operator, GuardDecision::AllowedAgentWrite);
+
+        let multi = serde_json::json!({
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "file_path": path,
+                "edits": [
+                    { "old_string": "\"mcpServers\":{", "new_string": "\"mcpServers\":{\"x\":{\"command\":\"npx\"}," },
+                    { "old_string": "/bin/duduclaw", "new_string": "/tmp/evil" }
+                ]
+            }
+        });
+        let d = check_identity_surface_tool_call("MultiEdit", &multi, &path, &home.0, &agent).unwrap();
+        assert!(matches!(d, GuardDecision::BlockedIdentitySurface { .. }), "{d:?}");
     }
 
     #[test]
@@ -13027,7 +13088,7 @@ mod protected_toml_hook_tests {
         let home = TempHome::new();
         let path = home.0.join("agents/agnes/SOUL.md");
         let env = write_envelope(&path, "hi");
-        assert!(check_identity_surface_tool_call("Write", &env, &path, &home.0).is_none());
+        assert!(check_identity_surface_tool_call("Write", &env, &path, &home.0, &duduclaw_core::HookCaller::Absent).is_none());
     }
 }
 

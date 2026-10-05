@@ -104,7 +104,7 @@ pub use keychain::{resolve_master_key, KeychainError, MasterKeySource};
 pub use match_utils::{is_valid_discord_snowflake, is_valid_egress_host, origin_host_matches, word_contains_ci};
 pub use org_field_guard::{
     check_bash_protected_write, check_bash_protected_write_in, check_caller_scope,
-    check_identity_surface_write, resolve_real_path,
+    check_identity_surface_write, check_identity_surface_write_as, resolve_real_path,
     check_own_contract_write, check_own_soul_write, check_protected_toml_write,
     check_protected_toml_write_as, classify_identity_surface,
     classify_protected_toml, HookCaller, ProtectedSurface, ProtectedTomlKind,

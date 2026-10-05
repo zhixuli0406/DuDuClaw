@@ -422,19 +422,32 @@ pub(super) fn merge_agent_mcp(
     extra: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<usize> {
     let path = home.join("agents").join(agent_id).join(".mcp.json");
-    let mut doc: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| {
-            json5::from_str(&c)
+    // Same lock as every other `.mcp.json` writer (gateway repair, approved
+    // MCP installs), so a concurrent read–modify–write cannot drop entries.
+    duduclaw_agent::mcp_template::with_mcp_config_lock(&path, || {
+        // N11: a missing file starts empty; an existing file that cannot be
+        // read or parsed is an error (starting from an empty document would
+        // silently drop every entry it has, the duduclaw one included).
+        let mut doc: serde_json::Value = match std::fs::read_to_string(&path) {
+            Ok(c) => json5::from_str(&c)
                 .or_else(|_| serde_json::from_str(&c))
-                .ok()
-        })
-        .unwrap_or_else(|| serde_json::json!({ "mcpServers": {} }));
-    let written = merge_mcp_servers(&mut doc, extra);
-    let out = serde_json::to_string_pretty(&doc)
-        .map_err(|e| cfg_err(format!("序列化 .mcp.json 失敗: {e}")))?;
-    std::fs::write(&path, out).map_err(|e| io_err(format!("寫入 .mcp.json 失敗: {e}")))?;
-    Ok(written)
+                .map_err(|e| format!("{} 不是合法的 JSON，未合併：{e}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::json!({ "mcpServers": {} })
+            }
+            Err(e) => return Err(format!("無法讀取 {}：{e}", path.display())),
+        };
+        if !doc.is_object() {
+            return Err(format!("{} 不是 JSON 物件，未合併", path.display()));
+        }
+        let written = merge_mcp_servers(&mut doc, extra);
+        let out = serde_json::to_string_pretty(&doc)
+            .map_err(|e| format!("序列化 .mcp.json 失敗: {e}"))?;
+        duduclaw_agent::mcp_template::write_mcp_config_atomic(&path, out.as_bytes())
+            .map_err(|e| format!("寫入 .mcp.json 失敗: {e}"))?;
+        Ok(written)
+    })
+    .map_err(io_err)
 }
 
 fn io_err(msg: String) -> DuDuClawError {
@@ -737,5 +750,29 @@ mod unit_tests {
         extra.insert("x".into(), serde_json::json!({ "command": "x" }));
         assert_eq!(merge_mcp_servers(&mut doc, &extra), 1);
         assert!(doc["mcpServers"]["x"].is_object());
+    }
+
+    /// N11: an existing `.mcp.json` that is not valid JSON is not replaced by
+    /// an empty document (that would drop the duduclaw entry); a valid one is
+    /// merged and written atomically.
+    #[test]
+    fn merge_agent_mcp_refuses_an_unparseable_file_and_keeps_existing_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/agnes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".mcp.json");
+        let mut extra = serde_json::Map::new();
+        extra.insert("pw".into(), serde_json::json!({ "command": "npx" }));
+
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(merge_agent_mcp(home.path(), "agnes", &extra).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+
+        std::fs::write(&path, r#"{"mcpServers":{"duduclaw":{"command":"/x/duduclaw"}}}"#).unwrap();
+        assert_eq!(merge_agent_mcp(home.path(), "agnes", &extra).unwrap(), 1);
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(doc["mcpServers"]["duduclaw"].is_object());
+        assert!(doc["mcpServers"]["pw"].is_object());
     }
 }
