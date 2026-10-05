@@ -18,6 +18,8 @@ DuDuClaw 把 Claude Code、Codex、Antigravity 這類 AI 指令列工具，變�
 
 https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
+高風險 Computer Use 的頻道核准、完整 ID 回答與未知執行結果核對，見[操作指南](docs/guides/durable-channel-decisions.md)。
+
 ## 目錄
 
 - [為什麼需要 DuDuClaw?](#why)

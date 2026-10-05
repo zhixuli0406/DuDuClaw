@@ -157,7 +157,7 @@ Saying this plainly is part of the defense.
 - **Only the Claude runtime runs these hooks.** Codex, Gemini, Antigravity and the other runtimes rely on their own sandbox flags.
 - **State files inside the employee's own directory are not protected**, apart from `SOUL.md`, `CONTRACT.toml`, the identity files (`.mcp.json`, `.claude/settings.json`) and its `agent.toml`. The shared `attachments/` directory is writable by every employee.
 - **`data-file-guard` is a heuristic.** It matches filenames in a `Bash` command line; a dynamically-built path defeats it. (It is no longer inert on Windows — H10 made it a Rust subcommand.)
-- **There is no threat-level state machine.** `~/.duduclaw/threat_level` survives as an operator-controlled kill switch that the computer-use orchestrator polls (`RED` stops the run, `YELLOW` pauses it), but nothing inside the workspace writes it. Absent or unreadable means `GREEN`.
+- **There is no threat-level state machine.** `~/.duduclaw/threat_level` survives as an operator-controlled kill switch that the computer-use orchestrator polls (`RED` stops the run, `YELLOW` pauses it), but nothing inside the workspace writes it. A missing file means `GREEN`; a file that exists but cannot be read, or holds anything other than `GREEN` / `YELLOW` / `RED`, is treated as `RED` (fail closed) after two re-reads 50 ms apart; a leading UTF-8 BOM and surrounding whitespace are ignored.
 - *(Removed 2026-09.)* This section used to note that the PTY session pool sat outside the redaction rewrite. That pool no longer exists — every Claude spawn is a per-call spawn, which is exactly what the rewrite hooks into.
 
 ---
@@ -174,3 +174,7 @@ Saying this plainly is part of the defense.
 ## The takeaway
 
 Four guards with stated failure modes beat a three-layer story with no code behind it. When a defense is removed the documentation has to go with it: a page describing a shell script that does not exist is worse than no page, because it makes an operator stop looking.
+
+## Durable channel decisions
+
+High-risk Computer Use confirmations use the inbound account and exact conversation/thread. Reply with `確認 <full UUID>` or `取消 <full UUID>`; questions use `回答 <full UUID> <answer>` and never grant tool permission. Bare yes/A/B cannot select a request. Before execution, the host rechecks the live screen, title, policy and cancellation gates. Restart invalidates old GUI approvals instead of replaying coordinates; an execution without a receipt becomes `uncertain` and requires Admin reconciliation. See the [decision guide](../guides/durable-channel-decisions.md) for the exact supported inbound routes and current limitations.
