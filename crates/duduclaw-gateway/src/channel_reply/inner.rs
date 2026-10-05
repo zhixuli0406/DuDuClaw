@@ -33,8 +33,51 @@ pub(super) async fn build_reply_with_session_inner(
     // ── User access gate (allowlist / blocklist / pairing) ──
     // Single enforcement point for all channels. Open-by-default: returns
     // None unless the operator configured access settings for this channel.
-    if let Some(early_reply) = check_user_access_gate(ctx, session_id, user_id, text).await {
+    let normal_policy = crate::approval::CURRENT_TRUSTED_REPLY_TARGET
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .and_then(|target| target.user_access_policy().cloned());
+    let early_reply = if let Some(policy) = &normal_policy {
+        check_user_access_gate_with_policy(ctx, session_id, user_id, text, policy).await
+    } else {
+        check_user_access_gate(ctx, session_id, user_id, text).await
+    };
+    if let Some(early_reply) = early_reply {
         return early_reply;
+    }
+
+    // Bound decisions are consumed before takeover/budget/model work. Only
+    // verified adapters can supply this task-local context.
+    if let Ok(Some(target)) = crate::approval::CURRENT_TRUSTED_REPLY_TARGET.try_with(Clone::clone) {
+        if let Some(scope) = target.decision_access_scope() {
+            if let Some(result) =
+                crate::decision_notify::route_trusted_decision_fastlane_with_scope(
+                    ctx,
+                    &target.context,
+                    text,
+                    scope,
+                )
+                .await
+            {
+                return result.unwrap_or_else(|e| format!("⚠️ {e}"));
+            }
+        } else if crate::channel_decision_route::is_strict_decision(text) {
+            // Only a real decision command (verb + full request id) is
+            // refused here; a verb-first sentence is conversation (F4, M1).
+            return format!("⚠️ {}", crate::channel_decision_route::DECISION_REFUSED);
+        }
+    }
+
+    // Test seam: stands in for the model turn once every decision check above
+    // has passed, so tests can prove a message reached the model (F4).
+    #[cfg(test)]
+    if let Some(job) = crate::decision_notify::native_loop_fixture::take_job_for(
+        &crate::channel_decision_route::inner_test_seam_key(session_id),
+        text,
+    ) {
+        job.await;
+        return crate::channel_decision_route::INNER_TEST_SEAM_REPLY.into();
     }
 
     // ── W3-1 `/takeover` lifecycle command (D3) ──
@@ -167,7 +210,9 @@ pub(super) async fn build_reply_with_session_inner(
     let agent_dir = agent.map(|a| a.dir.clone());
     let capabilities = agent.map(|a| a.config.capabilities.clone());
     // Already-loaded registry config — no extra read on the per-message path.
-    let sandbox_enabled = agent.map(|a| a.config.container.sandbox_enabled).unwrap_or(false);
+    let sandbox_enabled = agent
+        .map(|a| a.config.container.sandbox_enabled)
+        .unwrap_or(false);
 
     // ── O-4: system-operator routing ────────────────────────────────────
     // ONLY for an agent explicitly opted in via `[capabilities]
@@ -3476,3 +3521,202 @@ pub(crate) fn channel_gvu_trigger_allowed(agent_dir: &std::path::Path) -> bool {
 /// never sent to the model).
 pub(crate) const REDACTION_FAILED_REPLY: &str =
     "⚠️ 去識別化處理失敗，這則訊息沒有送給 AI。請稍後再試，或請管理員檢查去識別化設定。";
+
+#[cfg(test)]
+mod bound_scope_acl_tests {
+    use super::*;
+    use crate::decision_notify::native_loop_fixture::*;
+    #[tokio::test]
+    async fn normal_inner_accepts_adapter_session_allowlist_for_slack_and_discord() {
+        for (channel, session, conversation, thread, guild) in [
+            ("slack", "slack:group:C1", "C1:123.45", Some("123.45"), None),
+            ("discord", "discord:thread:C1", "C1", None, Some("G1")),
+        ] {
+            let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+            let fixture = NativeCuFixture::new(&provider.token).await;
+            let context = crate::approval::DecisionContext {
+                channel: channel.into(),
+                account_id: "A1".into(),
+                conversation_id: conversation.into(),
+                principal_id: "H1".into(),
+            };
+            let id = pending_native_request(&fixture, context.clone()).await;
+            fixture
+                .ctx
+                .channel_settings
+                .set(
+                    channel,
+                    "global",
+                    "allowed_users",
+                    // F4: both the person and the conversation are listed.
+                    &serde_json::to_string(&[session, "H1"]).unwrap(),
+                )
+                .await
+                .unwrap();
+            let target = crate::approval::TrustedReplyTarget::new(
+                context,
+                provider.token.clone(),
+                "C1".into(),
+                thread.map(str::to_owned),
+            )
+            .map(|target| {
+                target.with_decision_access_scope(crate::decision_notify::DecisionAccessScope {
+                    channel_id: Some("C1"),
+                    guild_id: guild,
+                    session_id: Some(session),
+                })
+            });
+            let reply = crate::approval::scope_trusted_reply(
+                target,
+                build_reply_with_session_inner(
+                    &format!("approve {}", id.as_str()),
+                    &fixture.ctx,
+                    Some("fixture"),
+                    session,
+                    "H1",
+                    None,
+                ),
+            )
+            .await;
+            assert!(reply.contains("同意"), "{channel}: {reply}");
+            assert_native_approved(&fixture, &id).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod normal_policy_strict_decision_tests {
+    use super::*;
+    use crate::decision_notify::native_loop_fixture::*;
+    #[tokio::test]
+    async fn carried_normal_snapshot_never_replaces_fresh_bound_decision_authority() {
+        let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+        let fixture = NativeCuFixture::new(&provider.token).await;
+        let context = crate::approval::DecisionContext {
+            channel: "discord".into(),
+            account_id: "A1".into(),
+            conversation_id: "C1".into(),
+            principal_id: "H1".into(),
+        };
+        let id = pending_native_request(&fixture, context.clone()).await;
+        fixture
+            .ctx
+            .channel_settings
+            // F4: both the person and the conversation are listed, so the
+            // carried normal snapshot admits the turn and only the fresh
+            // decision read can refuse it.
+            .set(
+                "discord",
+                "global",
+                "allowed_users",
+                r#"["H1","discord:thread:C1"]"#,
+            )
+            .await
+            .unwrap();
+        let scope = crate::decision_notify::DecisionAccessScope {
+            channel_id: Some("C1"),
+            guild_id: Some("G1"),
+            session_id: Some("discord:thread:C1"),
+        };
+        let policy =
+            crate::decision_notify::read_trusted_channel_access(&fixture.ctx, &context, scope)
+                .await
+                .unwrap();
+        let target = crate::approval::TrustedReplyTarget::new(
+            context,
+            provider.token.clone(),
+            "C1".into(),
+            None,
+        )
+        .map(|t| {
+            t.with_user_access_policy(policy)
+                .with_decision_access_scope(scope)
+        });
+        revoke_native_access(&fixture, "discord", "G1", "blocked").await;
+        let reply = crate::approval::scope_trusted_reply(
+            target,
+            build_reply_with_session_inner(
+                &format!("approve {}", id.as_str()),
+                &fixture.ctx,
+                Some("fixture"),
+                "discord:thread:C1",
+                "H1",
+                None,
+            ),
+        )
+        .await;
+        assert!(reply.contains("⚠"));
+        assert_native_pending(&fixture, &id).await;
+    }
+}
+
+#[cfg(test)]
+mod f4_verb_only_tests {
+    //! P0-B F4 (review M1): the normal reply pipeline no longer swallows a
+    //! verb-first message that carries no request id.
+    use super::*;
+    use crate::decision_notify::native_loop_fixture::*;
+
+    /// Review M1 for the normal reply pipeline (LINE's general lane and every
+    /// adapter's converted text): 「確認」 reaches the model, with or without a
+    /// decision scope on the trusted target, and nothing is decided.
+    #[tokio::test]
+    async fn inner_pipeline_passes_verb_only_messages_to_the_model() {
+        for with_scope in [true, false] {
+            let fixture = NativeCuFixture::new(&format!("inner-m1-{with_scope}")).await;
+            let context = crate::approval::DecisionContext {
+                channel: "line".into(),
+                account_id: "line-bot-A".into(),
+                conversation_id: "group-1".into(),
+                principal_id: "U1".into(),
+            };
+            let id = pending_native_request(&fixture, context.clone()).await;
+            let session = format!("line:group-1:inner-m1-{with_scope}");
+            for text in ["確認", "approve the Q3 budget"] {
+                let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = reached.clone();
+                let seam = crate::channel_decision_route::inner_test_seam_key(&session);
+                let _job = install_named_job(&seam, text, async move {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                let target = crate::approval::TrustedReplyTarget::new(
+                    context.clone(),
+                    "line-token".into(),
+                    "group-1".into(),
+                    None,
+                )
+                .map(|t| {
+                    if with_scope {
+                        let scope = crate::decision_notify::DecisionAccessScope {
+                            channel_id: Some("group-1"),
+                            guild_id: None,
+                            session_id: None,
+                        };
+                        t.with_decision_access_scope(scope)
+                    } else {
+                        t
+                    }
+                });
+                let reply = crate::approval::scope_trusted_reply(
+                    target,
+                    build_reply_with_session_inner(
+                        text,
+                        &fixture.ctx,
+                        Some("fixture"),
+                        &session,
+                        "U1",
+                        None,
+                    ),
+                )
+                .await;
+                assert_eq!(
+                    reply,
+                    crate::channel_decision_route::INNER_TEST_SEAM_REPLY,
+                    "{text} scope={with_scope}"
+                );
+                assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+            }
+            assert_native_pending(&fixture, &id).await;
+        }
+    }
+}

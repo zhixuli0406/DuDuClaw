@@ -3961,6 +3961,13 @@ fn prepare_claude_cmd(
     {
         cmd.env(duduclaw_core::ENV_TRUST_SESSION_ID, &session_id);
     }
+    // F5-D: the goal task this round runs for, from the dispatcher's own
+    // attribution, so approval cards raised by this round carry it.
+    if let Ok(task_id) = crate::runtime::GOAL_ROUND_ATTRIBUTION.try_with(|a| a.episode_id.clone()) {
+        if duduclaw_core::is_valid_agent_id(&task_id) {
+            cmd.env(duduclaw_core::ENV_TASK_ID, &task_id);
+        }
+    }
 
     // The spawned employee is the one whose identity owns this spawn's
     // config directory (its `.mcp.json` names the same id). Recorded only

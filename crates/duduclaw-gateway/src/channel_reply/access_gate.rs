@@ -63,6 +63,14 @@ pub(crate) fn record_silent_reply(
     }
 }
 
+/// Typed settings from one successful SQL snapshot. Never client-supplied.
+#[derive(Clone)]
+pub(crate) struct UserAccessPolicy {
+    pub allowed: Option<Vec<String>>,
+    pub blocked: Vec<String>,
+    pub require_pairing: bool,
+}
+
 /// Central per-user access gate (allowlist / blocklist / pairing).
 /// Called once at the top of the reply pipeline so every channel is covered
 /// by one enforcement point. `pub(crate)` so the per-channel chat-command
@@ -126,6 +134,32 @@ pub(crate) async fn check_user_access_gate(
     )
     .unwrap_or_default();
 
+    check_user_access_gate_with_policy(
+        ctx,
+        session_id,
+        user_id,
+        text,
+        &UserAccessPolicy {
+            allowed,
+            blocked,
+            require_pairing,
+        },
+    )
+    .await
+}
+
+/// Preserve the normal `/pair` contract against the adapter's one validated
+/// snapshot. Strict decision routing separately rereads current SQL policy.
+pub(crate) async fn check_user_access_gate_with_policy(
+    ctx: &ReplyContext,
+    session_id: &str,
+    user_id: &str,
+    text: &str,
+    policy: &UserAccessPolicy,
+) -> Option<String> {
+    let allowed = &policy.allowed;
+    let blocked = &policy.blocked;
+    let require_pairing = policy.require_pairing;
     // Fast path: nothing configured → open access, zero overhead beyond reads.
     if !require_pairing && allowed.is_none() && blocked.is_empty() {
         return None;
@@ -222,4 +256,3 @@ pub(crate) async fn is_channel_admin(
         .await;
     admin_list_contains(raw.as_deref(), identities)
 }
-

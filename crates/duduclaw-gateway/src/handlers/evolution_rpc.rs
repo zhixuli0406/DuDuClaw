@@ -174,7 +174,7 @@ impl MethodHandler {
 
     /// `forward.recent` — newest predictions (settled + pending), newest
     /// first. Same access bar and fail-open shape as `forward.summary`.
-    pub(crate) async fn handle_forward_recent(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_forward_recent(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let agent_filter = params
             .get("agent_id")
             .and_then(|v| v.as_str())
@@ -203,30 +203,41 @@ impl MethodHandler {
         .await;
         match result {
             Ok(mut rows) => {
-                // Resolve task-board titles so the list reads as "which goal,
-                // which round" instead of a bare uuid prefix (forward_view
-                // reads only prediction.db; titles live in tasks.db). Missing
-                // store / vanished tasks simply leave the title `None`.
-                if let Ok(store) = self.task_store().await {
-                    let mut titles: std::collections::HashMap<String, Option<String>> =
-                        std::collections::HashMap::new();
-                    for row in &mut rows {
-                        let entry = match titles.entry(row.task_id.clone()) {
-                            std::collections::hash_map::Entry::Occupied(o) => o.get().clone(),
-                            std::collections::hash_map::Entry::Vacant(v) => {
-                                let t = store
-                                    .get_task(&row.task_id)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .map(|t| t.title);
-                                v.insert(t.clone());
-                                t
-                            }
-                        };
-                        row.task_title = entry;
-                    }
+                let reader = match TaskReader::new(&self.home_dir, ctx) {
+                    Ok(r) => r,
+                    Err(f) => return f,
+                };
+                // F5-D: a row belongs to its task. Rows of a task the reader
+                // may not read (no binding on its employee, outside its
+                // audience) are left out; rows of a removed task stay for
+                // admins only. Titles are resolved for the rows kept.
+                let mut seen: std::collections::HashMap<String, Option<String>> =
+                    std::collections::HashMap::new();
+                let store = self.task_store().await.ok();
+                let mut kept = Vec::with_capacity(rows.len());
+                for mut row in rows {
+                    let title = match seen.get(&row.task_id) {
+                        Some(t) => t.clone(),
+                        None => {
+                            let task = match &store {
+                                Some(s) => s.get_task(&row.task_id).await.ok().flatten(),
+                                None => None,
+                            };
+                            let visible: Option<String> = match task {
+                                Some(t) if reader.can_read(&t.id, &t.assigned_to) => Some(t.title),
+                                Some(_) => None,
+                                None if reader.live().is_admin() => Some(String::new()),
+                                None => None,
+                            };
+                            seen.insert(row.task_id.clone(), visible.clone());
+                            visible
+                        }
+                    };
+                    let Some(title) = title else { continue };
+                    row.task_title = (!title.is_empty()).then_some(title);
+                    kept.push(row);
                 }
+                let rows = kept;
                 WsFrame::ok_response("", json!({ "predictions": rows }))
             }
             Err(e) => WsFrame::error_response("", &format!("forward recent: {e}")),
@@ -237,7 +248,7 @@ impl MethodHandler {
     /// loop, oldest round first, with the stored prediction/observation JSON
     /// parsed into typed expected/observed sides. The drill-down the list
     /// views can't provide (their SELECT deliberately skips the JSON blobs).
-    pub(crate) async fn handle_forward_chain(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_forward_chain(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let Some(task_id) = params
             .get("task_id")
             .and_then(|v| v.as_str())
@@ -247,6 +258,25 @@ impl MethodHandler {
         else {
             return WsFrame::error_response("", "Missing 'task_id' parameter");
         };
+        // One task's predicted vs observed rounds are task content: the task
+        // gate applies while the task exists; a removed task's chain stays
+        // admin-only.
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        match store.get_task(&task_id).await {
+            Ok(Some(_)) => {
+                if let Err(f) = self
+                    .authorize_private_task_read(&store, ctx, &task_id, AccessLevel::Viewer)
+                    .await
+                {
+                    return f;
+                }
+            }
+            _ if ctx.is_admin() => {}
+            _ => return WsFrame::error_response("", PERMISSION_DENIED),
+        }
         let db_path = self.home_dir.join("prediction.db");
         let result = tokio::task::spawn_blocking(move || {
             crate::prediction::forward_view::forward_chain(&db_path, &task_id)

@@ -130,6 +130,8 @@ pub(crate) struct ToolCallRow {
     pub tool: String,
     pub ok: bool,
     pub preview: String,
+    /// The goal task the call was made for, when the round stamped one.
+    pub task_id: Option<String>,
 }
 
 /// Load the MCP tool audit trail (missing file / malformed lines ⇒ skipped;
@@ -154,6 +156,11 @@ pub(crate) fn load_tool_call_rows(home_dir: &Path) -> Vec<ToolCallRow> {
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
                     .to_string(),
+                task_id: v
+                    .get("task_id")
+                    .and_then(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
             })
         })
         .collect()
@@ -182,7 +189,9 @@ pub(crate) fn tool_row_in_run_window(
     run: &RunSummary,
     now: chrono::DateTime<Utc>,
 ) -> bool {
-    if t.agent_id != run.agent_id {
+    // A call stamped with a goal task belongs to that task's round, not to
+    // a conversation that happened to overlap it in time (F5-D, P-M3).
+    if t.agent_id != run.agent_id || t.task_id.is_some() {
         return false;
     }
     let (Some(ts), Some(start)) = (parse_timeline_ts(&t.ts), parse_timeline_ts(&run.started_at))

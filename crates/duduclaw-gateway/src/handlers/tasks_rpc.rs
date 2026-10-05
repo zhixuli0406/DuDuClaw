@@ -40,13 +40,34 @@ impl MethodHandler {
 
     // ── Task handlers ───────────────────────────────────────
 
-    pub(crate) async fn handle_tasks_list(&self, params: Value) -> WsFrame {
+    /// Live reader for a task listing. `check_agent_filter!` ran on the
+    /// connection's cached identity; the filtered agent is re-checked on the
+    /// live one so an unbound or downgraded session stops listing at once.
+    pub(crate) fn task_list_reader(
+        &self,
+        ctx: &UserContext,
+        agent_id: Option<&str>,
+    ) -> Result<TaskReader<'_>, WsFrame> {
+        let reader = TaskReader::new(&self.home_dir, ctx)?;
+        if !reader.live().is_admin()
+            && !agent_id.is_some_and(|a| reader.live().has_agent_access(a, AccessLevel::Viewer))
+        {
+            return Err(WsFrame::error_response("", PERMISSION_DENIED));
+        }
+        Ok(reader)
+    }
+
+    pub(crate) async fn handle_tasks_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
         };
         let status = params.get("status").and_then(|v| v.as_str());
         let agent_id = params.get("agent_id").and_then(|v| v.as_str());
+        let reader = match self.task_list_reader(ctx, agent_id) {
+            Ok(r) => r,
+            Err(f) => return f,
+        };
         let priority = params.get("priority").and_then(|v| v.as_str());
         // Goal-scoped callers (the `/goals` page) filter server-side so the
         // whole board never crosses the wire just to keep the goal rows.
@@ -68,7 +89,7 @@ impl MethodHandler {
                 // identifiers don't leak to the UI).
                 let mut tasks: Vec<Value> = Vec::with_capacity(rows.len());
                 for r in &rows {
-                    let mut v = task_row_to_json(r);
+                    let mut v = reader.task_json(r);
                     let channel_link =
                         match (r.source_channel.as_deref(), r.source_chat_id.as_deref()) {
                             (Some(channel), Some(chat_id))
@@ -220,11 +241,20 @@ impl MethodHandler {
         // HS4: enforce the caller is bound (Operator) to the task's agent before
         // any mutation. Resolving the agent from the task prevents an Employee
         // bound only to agent A from mutating agent B's tasks.
+        // F5-D: the live identity and the task's audience apply as for
+        // `tasks.goal_decide` — an update can decide a needs_human task.
+        let live = match live_reader_context(&self.home_dir, ctx) {
+            Ok(l) => l,
+            Err(()) => return WsFrame::error_response("", PERMISSION_DENIED),
+        };
+        let ctx = &live;
         let existing = store.get_task(task_id).await.ok().flatten();
         let owner_agent = existing.as_ref().map(|r| r.assigned_to.clone());
         if let Some(agent) = owner_agent.as_deref() {
-            if let Err(e) = acl::require_agent_access(ctx, agent, AccessLevel::Operator) {
-                return WsFrame::error_response("", &e);
+            if !task_content_visible(&self.home_dir, ctx, task_id, agent)
+                || !ctx.has_agent_access(agent, AccessLevel::Operator)
+            {
+                return WsFrame::error_response("", PERMISSION_DENIED);
             }
         } else if !ctx.is_admin() {
             // Unknown task → only admins may probe; others get a generic denial.
@@ -387,7 +417,14 @@ impl MethodHandler {
                     }
                 }
 
-                WsFrame::ok_response("", json!({ "task": task_json }))
+                // The caller's copy goes through the same reader gate as a
+                // list row: an operator outside the task's audience gets
+                // the board card only.
+                let reply = match TaskReader::new(&self.home_dir, ctx) {
+                    Ok(reader) => reader.task_json(&row),
+                    Err(_) => restricted_task_json(&task_json),
+                };
+                WsFrame::ok_response("", json!({ "task": reply }))
             }
             Ok(None) => WsFrame::error_response("", &format!("Task not found: {task_id}")),
             Err(e) => WsFrame::error_response("", &format!("update task: {e}")),
@@ -404,12 +441,18 @@ impl MethodHandler {
             return WsFrame::error_response("", "task_id is required");
         }
         // HS4: resolve the task's agent and require Operator binding before removal.
+        // F5-D: live identity and the task's audience, as for goal_decide.
+        let live = match live_reader_context(&self.home_dir, ctx) {
+            Ok(l) => l,
+            Err(()) => return WsFrame::error_response("", PERMISSION_DENIED),
+        };
+        let ctx = &live;
         match store.get_task(task_id).await.ok().flatten() {
             Some(row) => {
-                if let Err(e) =
-                    acl::require_agent_access(ctx, &row.assigned_to, AccessLevel::Operator)
+                if !ctx.has_agent_access(&row.assigned_to, AccessLevel::Operator)
+                    || !task_content_visible(&self.home_dir, ctx, task_id, &row.assigned_to)
                 {
-                    return WsFrame::error_response("", &e);
+                    return WsFrame::error_response("", PERMISSION_DENIED);
                 }
             }
             None if !ctx.is_admin() => {
@@ -509,13 +552,21 @@ impl MethodHandler {
     /// the `archived`/`pinned` fields that `task_row_to_json` doesn't carry
     /// (left untouched deliberately; this endpoint merges them in locally
     /// rather than editing that shared helper).
-    pub(crate) async fn handle_tasks_list_page(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_tasks_list_page(
+        &self,
+        params: Value,
+        ctx: &UserContext,
+    ) -> WsFrame {
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
         };
         let status = params.get("status").and_then(|v| v.as_str());
         let agent_id = params.get("agent_id").and_then(|v| v.as_str());
+        let reader = match self.task_list_reader(ctx, agent_id) {
+            Ok(r) => r,
+            Err(f) => return f,
+        };
         let priority = params.get("priority").and_then(|v| v.as_str());
         let goal_mode = params.get("goal_mode").and_then(|v| v.as_bool());
         let archived = params.get("archived").and_then(|v| v.as_bool());
@@ -530,7 +581,7 @@ impl MethodHandler {
             Ok((rows, total)) => {
                 let mut tasks: Vec<Value> = Vec::with_capacity(rows.len());
                 for r in &rows {
-                    let mut v = task_row_to_json(r);
+                    let mut v = reader.task_json(r);
                     v["archived"] = json!(r.archived);
                     v["pinned"] = json!(r.pinned);
                     let channel_link =

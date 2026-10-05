@@ -574,6 +574,22 @@ pub fn perform_pending_restore_swap(
         return Err(RestoreSwapError::StagingMissingOrEmpty);
     }
 
+    // LINE inbox (F2/F5): events restored from an archive may already have
+    // been handled on the device the archive came from. This one-shot marker
+    // makes the inbox hold them for an operator instead of running them
+    // again. It is written before anything moves; if it cannot be written
+    // the restore stops here (data untouched, pending marker kept, so the
+    // next boot tries again) rather than bringing the backlog back live.
+    std::fs::write(
+        home_dir.join(crate::channel_ingress::RESTORE_MARKER),
+        now_tag.as_bytes(),
+    )
+    .map_err(|e| {
+        RestoreSwapError::Io(format!(
+            "could not write the LINE inbox restore marker, restore not applied: {e}"
+        ))
+    })?;
+
     let preserved_dir = home_dir.join(format!("{RESTORE_BACKUP_PREFIX}{now_tag}"));
     std::fs::create_dir_all(&preserved_dir).map_err(|e| RestoreSwapError::Io(e.to_string()))?;
     let preserved_name = preserved_dir.file_name().map(|n| n.to_os_string());
@@ -583,6 +599,7 @@ pub fn perform_pending_restore_swap(
         let name = entry.file_name();
         if name == RESTORE_STAGING_DIRNAME
             || name == RESTORE_MARKER_FILE
+            || name == crate::channel_ingress::RESTORE_MARKER
             || Some(&name) == preserved_name.as_ref()
         {
             continue;
@@ -1063,6 +1080,37 @@ mod tests {
         // Staging and marker are gone.
         assert!(!staging.exists());
         assert!(read_marker(home).is_none());
+        // The LINE inbox is told the data came from an archive (F2).
+        assert!(home.join(crate::channel_ingress::RESTORE_MARKER).exists());
+    }
+
+    /// F5 L5: no inbox marker, no restore. Nothing moves, the pending
+    /// restore stays for the next boot.
+    #[test]
+    fn swap_stops_before_moving_anything_when_the_inbox_marker_cannot_be_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::write(home.join("config.toml"), b"old-config").unwrap();
+        // A directory where the marker file should go makes the write fail.
+        std::fs::create_dir_all(home.join(crate::channel_ingress::RESTORE_MARKER)).unwrap();
+        let staging = staging_dir(home);
+        let nested = staging.join(home.file_name().unwrap());
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("config.toml"), b"new-config").unwrap();
+        write_marker(
+            home,
+            &RestoreMarker {
+                staged_at: Utc::now(),
+                source_filename: "old-device.tar.gz".into(),
+            },
+        )
+        .unwrap();
+        let err = perform_pending_restore_swap(home, "20260101T000000Z").unwrap_err();
+        assert!(matches!(err, RestoreSwapError::Io(ref m) if m.contains("restore marker")));
+        assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), b"old-config");
+        assert!(!home.join("restore-backup-20260101T000000Z").exists());
+        assert!(read_marker(home).is_some(), "pending restore kept for the next boot");
+        assert!(nested.join("config.toml").exists());
     }
 
     #[test]

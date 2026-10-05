@@ -1,7 +1,7 @@
 //! Parameter validation and the risk gate for tool-driven actions (design
 //! §3.4 steps 1 and 3). Pure, so every branch is unit-tested.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::computer_use::ComputerAction;
 use crate::risk_detector::RiskLevel;
@@ -16,7 +16,7 @@ pub const SCROLL_AMOUNT_RANGE: std::ops::RangeInclusive<i64> = 1..=20;
 pub const DEFAULT_SCROLL_AMOUNT: i64 = 3;
 
 /// One action as the MCP client sends it.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionRequest {
     Click {
@@ -67,8 +67,15 @@ fn coordinate(x: i64, y: i64, width: u32, height: u32) -> Result<[u32; 2], OpErr
 /// `Escape`, the argv builder's last-resort fallback).
 pub fn to_action(req: &ActionRequest, width: u32, height: u32) -> Result<ComputerAction, OpError> {
     match req {
-        ActionRequest::Navigate { .. } => Err(invalid("導覽不是畫面操作，請改用 computer_navigate。".to_string())),
-        ActionRequest::Click { x, y, button, double } => {
+        ActionRequest::Navigate { .. } => Err(invalid(
+            "導覽不是畫面操作，請改用 computer_navigate。".to_string(),
+        )),
+        ActionRequest::Click {
+            x,
+            y,
+            button,
+            double,
+        } => {
             let coordinate = coordinate(*x, *y, width, height)?;
             let double = double.unwrap_or(false);
             match button.as_deref().unwrap_or("left") {
@@ -99,9 +106,16 @@ pub fn to_action(req: &ActionRequest, width: u32, height: u32) -> Result<Compute
                     duduclaw_core::truncate_chars(key, 64)
                 )));
             }
-            Ok(ComputerAction::Key { text: key.to_string() })
+            Ok(ComputerAction::Key {
+                text: key.to_string(),
+            })
         }
-        ActionRequest::Scroll { x, y, direction, amount } => {
+        ActionRequest::Scroll {
+            x,
+            y,
+            direction,
+            amount,
+        } => {
             let coordinate = coordinate(*x, *y, width, height)?;
             let direction = match direction.as_deref().unwrap_or("down") {
                 d @ ("up" | "down") => d.to_string(),
@@ -115,7 +129,11 @@ pub fn to_action(req: &ActionRequest, width: u32, height: u32) -> Result<Compute
                     SCROLL_AMOUNT_RANGE.end()
                 )));
             }
-            Ok(ComputerAction::Scroll { coordinate, direction, amount: amount as u32 })
+            Ok(ComputerAction::Scroll {
+                coordinate,
+                direction,
+                amount: amount as u32,
+            })
         }
     }
 }
@@ -170,8 +188,16 @@ pub fn describe(action: &ComputerAction) -> String {
         ComputerAction::RightClick { coordinate: [x, y] } => format!("右鍵點擊 ({x}, {y})"),
         ComputerAction::Type { text } => format!("輸入文字（{} 個字元）", text.chars().count()),
         ComputerAction::Key { text } => format!("按鍵 {text}"),
-        ComputerAction::Scroll { coordinate: [x, y], direction, amount } => {
-            let dir = if direction == "up" { "向上" } else { "向下" };
+        ComputerAction::Scroll {
+            coordinate: [x, y],
+            direction,
+            amount,
+        } => {
+            let dir = if direction == "up" {
+                "向上"
+            } else {
+                "向下"
+            };
             format!("在 ({x}, {y}) {dir}捲動 {amount} 次")
         }
         other => format!("{other:?}"),

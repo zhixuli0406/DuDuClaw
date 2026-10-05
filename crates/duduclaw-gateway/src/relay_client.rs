@@ -372,17 +372,59 @@ async fn inject_line_hook(frame: HookFrame, line_state: &LineState) {
 
     let status =
         crate::line::handle_line_webhook(line_state.clone(), &headers, Bytes::from(body)).await;
-    let outcome = if status.is_success() {
-        "ok"
-    } else {
-        "bad_signature"
-    };
-    if outcome == "bad_signature" {
-        warn!(frame_id = %frame.id, status = %status, "relay client: LINE webhook verification failed — dropped");
-    }
+    let outcome = relay_line_outcome(status);
     crate::metrics::global_metrics()
         .relay_frame("line", outcome)
         .await;
+    if status.is_success() {
+        return;
+    }
+    // The relay already answered LINE with 200, so this event is gone: the
+    // relay path does not give durable acceptance (review I-MEDIUM-1). Count
+    // it and make it visible.
+    warn!(frame_id = %frame.id, status = %status, outcome, "relay client: LINE webhook not accepted — dropped");
+    if relay_alert_due(status) {
+        crate::channel_ingress::alerts::raise_now(
+            line_state.home_dir(),
+            crate::channel_ingress::alerts::AlertKind::RelayRejected,
+            &frame.id,
+            outcome,
+        )
+        .await;
+    }
+}
+
+/// Metric label for a relayed LINE webhook: `ok`, `bad_signature` (the
+/// request itself was refused, 4xx) or `not_accepted` (the gateway could not
+/// store it, 5xx: stop switch off, inbox unavailable, disk full, …).
+fn relay_line_outcome(status: axum::http::StatusCode) -> &'static str {
+    if status.is_success() {
+        "ok"
+    } else if status.is_client_error() {
+        "bad_signature"
+    } else {
+        "not_accepted"
+    }
+}
+
+/// One Activity Feed row per outcome class per ten minutes; the metric
+/// counts every frame.
+fn relay_alert_due(status: axum::http::StatusCode) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<std::collections::HashMap<bool, std::time::Instant>>> =
+        OnceLock::new();
+    let Ok(mut last) = LAST.get_or_init(Default::default).lock() else {
+        return false;
+    };
+    let class = status.is_server_error();
+    if last
+        .get(&class)
+        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(600))
+    {
+        return false;
+    }
+    last.insert(class, std::time::Instant::now());
+    true
 }
 
 /// The box's LAN-facing IPv4 address, if it has one. Uses the standard
@@ -519,6 +561,17 @@ mod tests {
         handle_hook_text(&text, &line_state).await;
         let after = relay_frame_count("line", "ok").await;
         assert_eq!(after, before + 1, "a validly-signed frame must count as ok");
+    }
+
+    #[test]
+    fn relay_outcomes_separate_refused_from_not_stored() {
+        use axum::http::StatusCode;
+        assert_eq!(relay_line_outcome(StatusCode::OK), "ok");
+        assert_eq!(relay_line_outcome(StatusCode::UNAUTHORIZED), "bad_signature");
+        assert_eq!(
+            relay_line_outcome(StatusCode::SERVICE_UNAVAILABLE),
+            "not_accepted"
+        );
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ impl MethodHandler {
     // still NOT captured). `runs.get` states the remaining limits in its
     // response instead of fabricating events.
 
-    pub(crate) async fn handle_runs_list(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_runs_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let agent_filter = params
             .get("agent_id")
             .and_then(|v| v.as_str())
@@ -35,6 +35,12 @@ impl MethodHandler {
             .unwrap_or(RUNS_LIST_DEFAULT_LIMIT as u64)
             .min(RUNS_LIST_MAX_LIMIT as u64) as usize;
 
+        let reader = match self
+            .task_list_reader(ctx, Some(agent_filter.as_str()).filter(|a| !a.is_empty()))
+        {
+            Ok(r) => r,
+            Err(f) => return f,
+        };
         let db_path = self.home_dir.join("sessions.db");
         if !db_path.exists() {
             return WsFrame::ok_response("", json!({ "runs": [] }));
@@ -96,7 +102,25 @@ impl MethodHandler {
         let dispatch_runs = crate::run_steps::shared_store(&self.home_dir)
             .and_then(|s| s.list_dispatch_runs(&agent_filter, limit).ok())
             .unwrap_or_default();
+        let tasks = self.task_store().await.ok();
+        let mut readable = HashMap::new();
+        for task_id in dispatch_runs.iter().filter_map(|r| r.task_id.as_deref()) {
+            if readable.contains_key(task_id) {
+                continue;
+            }
+            let owner = match &tasks {
+                Some(t) => t.get_task(task_id).await.ok().flatten().map(|t| t.assigned_to),
+                None => None,
+            };
+            let ok = reader.can_read_owned(task_id, owner.as_deref());
+            readable.insert(task_id.to_string(), ok);
+        }
         runs_json.extend(dispatch_runs.iter().map(|r| {
+            // A round prompt of a task the reader may not read: no preview.
+            let preview = match r.task_id.as_deref() {
+                Some(t) if !readable.get(t).copied().unwrap_or(false) => None,
+                _ => Some(r.preview_in.clone()),
+            };
             json!({
                 "id": format!("dispatch:{}", r.id),
                 "session_id": format!("dispatch:{}", r.id),
@@ -106,7 +130,7 @@ impl MethodHandler {
                 "ended_at": r.ended_at,
                 "status": r.status,
                 "step_count": r.step_count,
-                "preview": r.preview_in,
+                "preview": preview,
                 "task_id": r.task_id,
                 "round": r.round,
             })
@@ -141,6 +165,20 @@ impl MethodHandler {
             if !ctx.is_admin() {
                 if let Err(e) = acl::require_agent_access(ctx, &run.agent_id, AccessLevel::Viewer) {
                     return WsFrame::error_response("", &e);
+                }
+            }
+            // A task round's transcript is task content: same gate as the
+            // task's own RPCs (live identity + audience).
+            if let Some(task_id) = run.task_id.as_deref().filter(|t| !t.is_empty()) {
+                let tasks = match self.task_store().await {
+                    Ok(s) => s,
+                    Err(_) => return WsFrame::error_response("", PERMISSION_DENIED),
+                };
+                if let Err(f) = self
+                    .authorize_task_content_read(&tasks, ctx, task_id, AccessLevel::Viewer)
+                    .await
+                {
+                    return f;
                 }
             }
             let mut events = vec![json!({
@@ -337,7 +375,10 @@ impl MethodHandler {
         }));
         if let (Some(ws), Some(we)) = (window_start, window_end) {
             for t in load_tool_call_rows(&self.home_dir) {
-                if t.agent_id != agent_id {
+                // Calls stamped with a goal task belong to that task's round
+                // (its own gate applies via the dispatch branch), not to
+                // this conversation (F5-D, P-M3).
+                if t.agent_id != agent_id || t.task_id.is_some() {
                     continue;
                 }
                 let Some(ts) = parse_timeline_ts(&t.ts) else {

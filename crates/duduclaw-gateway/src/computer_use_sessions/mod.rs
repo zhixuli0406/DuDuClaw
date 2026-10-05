@@ -192,7 +192,10 @@ pub struct OpError {
 
 impl OpError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn to_json(&self) -> Value {
@@ -250,9 +253,15 @@ impl EndReason {
     fn message(self) -> &'static str {
         match self {
             Self::Requested => "電腦操作 session 已結束。",
-            Self::Stopped => "電腦操作 session 已被緊急停止，容器已移除。需要的話請重新呼叫 computer_session_start。",
-            Self::Deadline => "電腦操作 session 已達時間上限，容器已移除。需要的話請重新呼叫 computer_session_start。",
-            Self::Idle => "電腦操作 session 閒置太久，已自動結束。需要的話請重新呼叫 computer_session_start。",
+            Self::Stopped => {
+                "電腦操作 session 已被緊急停止，容器已移除。需要的話請重新呼叫 computer_session_start。"
+            }
+            Self::Deadline => {
+                "電腦操作 session 已達時間上限，容器已移除。需要的話請重新呼叫 computer_session_start。"
+            }
+            Self::Idle => {
+                "電腦操作 session 閒置太久，已自動結束。需要的話請重新呼叫 computer_session_start。"
+            }
             Self::ThreatRed => "威脅等級為 RED，電腦操作已緊急終止，容器已移除。",
             Self::CapabilityRevoked => "此員工的電腦操作權限已被關閉，session 已結束。",
         }
@@ -294,24 +303,30 @@ pub fn end_reason(
 #[async_trait]
 pub(crate) trait ConfirmerResolver: Send + Sync {
     async fn resolve(&self, agent_id: &str, turn_id: &str) -> Option<Box<dyn ChannelSender>>;
+    async fn context(
+        &self,
+        agent_id: &str,
+        turn_id: &str,
+    ) -> Option<crate::approval::DecisionContext> {
+        turns::decision_context_for(agent_id, turn_id)
+    }
 }
 
 /// The production resolver: only a live channel-reply turn of this same
 /// employee names a chat.
 struct LiveTurnConfirmers {
-    home: PathBuf,
     http: reqwest::Client,
 }
 
 #[async_trait]
 impl ConfirmerResolver for LiveTurnConfirmers {
     async fn resolve(&self, agent_id: &str, turn_id: &str) -> Option<Box<dyn ChannelSender>> {
-        let reply_channel = turns::reply_channel_for(agent_id, turn_id)?;
-        let (channel, chat) = crate::decision_notify::parse_origin(&reply_channel)?;
-        let target = crate::channel_sender::resolve_channel_target(&self.home, &channel, &chat)
-            .await
-            .ok()?;
-        Some(crate::channel_sender::create_sender(&target, self.http.clone()))
+        let target = turns::target_for(agent_id, turn_id)?;
+        let context = turns::decision_context_for(agent_id, turn_id)?;
+        if context.validate().is_err() || target.context != context {
+            return None;
+        }
+        Some(target.sender(self.http.clone()))
     }
 }
 
@@ -432,6 +447,14 @@ pub struct ComputerUseSessions {
     resolver: Arc<dyn navigation::HostResolver>,
     pub(crate) approval_ttl_secs: i64,
     pub(crate) approval_poll: Duration,
+    #[cfg(test)]
+    action_boundary_pause: std::sync::Mutex<
+        Option<(
+            &'static str,
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+        )>,
+    >,
 }
 
 /// Removes an employee from `starting` when the start ends, however it ends.
@@ -442,7 +465,10 @@ struct StartingGuard<'a> {
 
 impl Drop for StartingGuard<'_> {
     fn drop(&mut self) {
-        self.set.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.agent);
+        self.set
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.agent);
     }
 }
 
@@ -458,7 +484,10 @@ fn active_registry() -> &'static std::sync::Mutex<Weak<ComputerUseSessions>> {
 /// unregister itself: each leaves the global registry when its container is
 /// gone, so the 5-session cap keeps counting it until then.
 pub async fn emergency_stop_tool_sessions() -> Vec<String> {
-    let active = active_registry().lock().unwrap_or_else(|p| p.into_inner()).upgrade();
+    let active = active_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upgrade();
     match active {
         Some(sessions) => sessions.stop_all_for_emergency(),
         None => Vec::new(),
@@ -478,7 +507,12 @@ async fn write_audit(home: PathBuf, entry: AuditEntry) {
     }
 }
 
-fn audit_entry(agent_id: &str, action: &str, details: Value, screenshot: Option<PathBuf>) -> AuditEntry {
+fn audit_entry(
+    agent_id: &str,
+    action: &str,
+    details: Value,
+    screenshot: Option<PathBuf>,
+) -> AuditEntry {
     AuditEntry {
         timestamp: chrono::Utc::now(),
         agent_id: agent_id.to_string(),
@@ -495,17 +529,25 @@ impl ComputerUseSessions {
     /// The production registry (real containers, [`IDLE_TIMEOUT`],
     /// confirmations through live channel-reply turns).
     pub fn new(home: PathBuf) -> Arc<Self> {
-        let sessions = Arc::new(Self::with_parts(home, backend::orchestrator_factory(), IDLE_TIMEOUT));
+        let sessions = Arc::new(Self::with_parts(
+            home,
+            backend::orchestrator_factory(),
+            IDLE_TIMEOUT,
+        ));
         *active_registry().lock().unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(&sessions);
         sessions
     }
 
-    pub(crate) fn with_parts(home: PathBuf, factory: BackendFactory, idle_timeout: Duration) -> Self {
+    pub(crate) fn with_parts(
+        home: PathBuf,
+        factory: BackendFactory,
+        idle_timeout: Duration,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_default();
-        let confirmers = Arc::new(LiveTurnConfirmers { home: home.clone(), http });
+        let confirmers = Arc::new(LiveTurnConfirmers { http });
         Self {
             home,
             sessions: std::sync::Mutex::new(HashMap::new()),
@@ -518,6 +560,8 @@ impl ComputerUseSessions {
             resolver: Arc::new(navigation::DnsResolver),
             approval_ttl_secs: gates::APPROVAL_TTL_SECS,
             approval_poll: gates::APPROVAL_POLL,
+            #[cfg(test)]
+            action_boundary_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -540,7 +584,11 @@ impl ComputerUseSessions {
     }
 
     fn entry(&self, agent_id: &str) -> Option<Entry> {
-        self.sessions.lock().unwrap_or_else(|p| p.into_inner()).get(agent_id).cloned()
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .cloned()
     }
 
     fn lookup(&self, agent_id: &str) -> Option<SessionRef> {
@@ -551,7 +599,10 @@ impl ComputerUseSessions {
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         // Only drop the entry if it is still this session (a newer one may
         // already have replaced it).
-        if sessions.get(agent_id).is_some_and(|e| e.session_id == session_id) {
+        if sessions
+            .get(agent_id)
+            .is_some_and(|e| e.session_id == session_id)
+        {
             sessions.remove(agent_id);
         }
     }
@@ -566,21 +617,37 @@ impl ComputerUseSessions {
             session: Arc::new(tokio::sync::Mutex::new(session)),
         };
         let session = Arc::clone(&entry.session);
-        self.sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(agent, entry);
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(agent, entry);
         session
     }
 
     /// Number of live tool-driven sessions.
     pub fn len(&self) -> usize {
-        self.sessions.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    async fn audit_line(&self, agent_id: &str, action: &str, details: Value, screenshot: Option<PathBuf>) {
-        write_audit(self.home.clone(), audit_entry(agent_id, action, details, screenshot)).await;
+    async fn audit_line(
+        &self,
+        agent_id: &str,
+        action: &str,
+        details: Value,
+        screenshot: Option<PathBuf>,
+    ) {
+        write_audit(
+            self.home.clone(),
+            audit_entry(agent_id, action, details, screenshot),
+        )
+        .await;
     }
 
     /// End a session whose lock the caller holds. Synchronous up to the point
@@ -590,14 +657,19 @@ impl ComputerUseSessions {
     /// release and the audit line run on a detached task; the handle lets a
     /// caller wait for them (waiting is optional and cancelling the wait
     /// cancels nothing). `None` when it had already ended.
-    fn end(&self, session: &mut ManagedSession, reason: EndReason) -> Option<tokio::task::JoinHandle<()>> {
+    fn end(
+        &self,
+        session: &mut ManagedSession,
+        reason: EndReason,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         if session.ended {
             return None;
         }
         session.ended = true;
         self.remove_entry(&session.agent_id, &session.session_id);
         let control = session.backend.control();
-        let mut backend = std::mem::replace(&mut session.backend, Box::new(EndedBackend { control }));
+        let mut backend =
+            std::mem::replace(&mut session.backend, Box::new(EndedBackend { control }));
         info!(
             agent = %session.agent_id,
             session = %session.session_id,
@@ -647,12 +719,21 @@ impl ComputerUseSessions {
         let threat = read_threat_level(&self.home).await;
         let stopped = session.backend.control().stopped.load(Ordering::Acquire);
         let now = Instant::now();
-        let activity = session.shared.effective_activity(session.last_activity, now);
-        let reason = end_reason(now, session.deadline, activity, self.idle_timeout, stopped, threat)
-            .or_else(|| {
-                capability_problem(&agent_capabilities(&self.home, &session.agent_id))
-                    .map(|_| EndReason::CapabilityRevoked)
-            });
+        let activity = session
+            .shared
+            .effective_activity(session.last_activity, now);
+        let reason = end_reason(
+            now,
+            session.deadline,
+            activity,
+            self.idle_timeout,
+            stopped,
+            threat,
+        )
+        .or_else(|| {
+            capability_problem(&agent_capabilities(&self.home, &session.agent_id))
+                .map(|_| EndReason::CapabilityRevoked)
+        });
         if let Some(reason) = reason {
             self.end_and_wait(session, reason).await;
             return Err(OpError::new(ErrorCode::SessionEnded, reason.message()));
@@ -700,7 +781,9 @@ impl ComputerUseSessions {
         if !gates::approval_required(&self.home, agent_id, tool) {
             return Ok(());
         }
-        let waiting = self.entry(agent_id).map(|e| ApprovalWaitGuard::new(e.shared));
+        let waiting = self
+            .entry(agent_id)
+            .map(|e| ApprovalWaitGuard::new(e.shared));
         let decided = gates::obtain_approval(
             &self.home,
             agent_id,
@@ -728,7 +811,10 @@ impl ComputerUseSessions {
     // ── start ────────────────────────────────────────────────────────────
 
     /// Capability and threat level for a new session.
-    async fn start_allowed(&self, agent_id: &str) -> Result<duduclaw_core::types::CapabilitiesConfig, OpError> {
+    async fn start_allowed(
+        &self,
+        agent_id: &str,
+    ) -> Result<duduclaw_core::types::CapabilitiesConfig, OpError> {
         let caps = agent_capabilities(&self.home, agent_id);
         if let Some(problem) = capability_problem(&caps) {
             return Err(problem);
@@ -792,20 +878,31 @@ impl ComputerUseSessions {
                     ));
                 }
             }
-            StartingGuard { set: &self.starting, agent: agent_id.to_string() }
+            StartingGuard {
+                set: &self.starting,
+                agent: agent_id.to_string(),
+            }
         };
         let (width, height) = display_size(&req, &caps.computer_use_config)?;
         let image = crate::computer_use_image::load(&self.home).map_err(|why| {
-            OpError::new(ErrorCode::Unavailable, crate::computer_use_image::invalid_config_message(&why))
+            OpError::new(
+                ErrorCode::Unavailable,
+                crate::computer_use_image::invalid_config_message(&why),
+            )
         })?;
         let cap = &caps.computer_use_config;
         // Navigation allowlist (design §7): resolved here, on the gateway;
         // the container never resolves a name itself.
         let nav = cap.navigation_hosts();
-        let (pinned_hosts, skipped_hosts) = navigation::resolve_hosts(self.resolver.as_ref(), &nav.hosts).await;
+        let (pinned_hosts, skipped_hosts) =
+            navigation::resolve_hosts(self.resolver.as_ref(), &nav.hosts).await;
         let nav_hosts: Vec<String> = pinned_hosts.iter().map(|p| p.host.clone()).collect();
-        let network_message =
-            navigation::start_message(nav.hosts.len(), &nav_hosts, &skipped_hosts, nav.dropped.len());
+        let network_message = navigation::start_message(
+            nav.hosts.len(),
+            &nav_hosts,
+            &skipped_hosts,
+            nav.dropped.len(),
+        );
         let config = ComputerUseConfig {
             container_image: image,
             max_session_minutes: cap.max_session_minutes.max(1),
@@ -836,7 +933,9 @@ impl ComputerUseSessions {
         if let Err(e) = backend.start().await {
             Self::stop_detached(backend).await;
             return Err(match e {
-                ComputerUseError::Unavailable(message) => OpError::new(ErrorCode::Unavailable, message),
+                ComputerUseError::Unavailable(message) => {
+                    OpError::new(ErrorCode::Unavailable, message)
+                }
                 other => {
                     warn!(agent = %agent_id, error = %other, "computer-use tool session failed to start");
                     OpError::new(
@@ -866,11 +965,18 @@ impl ComputerUseSessions {
             nav_hosts: nav_hosts.clone(),
             nav_configured: !nav.hosts.is_empty(),
         };
-        let task = req.task.as_deref().map(|t| duduclaw_core::truncate_chars(t, 200));
+        let task = req
+            .task
+            .as_deref()
+            .map(|t| duduclaw_core::truncate_chars(t, 200));
         let mut body = session.counters(now);
         body["ok"] = json!(true);
         body["confirmation_channel"] = json!(confirmation_channel);
-        body["network"] = json!(if nav_hosts.is_empty() { "none" } else { "allowlist" });
+        body["network"] = json!(if nav_hosts.is_empty() {
+            "none"
+        } else {
+            "allowlist"
+        });
         body["reachable_hosts"] = json!(nav_hosts);
         body["unreachable_hosts"] = json!(skipped_hosts);
         body["network_message"] = json!(network_message);
@@ -888,13 +994,18 @@ impl ComputerUseSessions {
         });
         self.insert(session);
         info!(agent = %agent_id, session = %session_id, "computer-use tool session started");
-        self.audit_line(agent_id, "session_start", details, None).await;
+        self.audit_line(agent_id, "session_start", details, None)
+            .await;
         Ok(body)
     }
 
     // ── screenshot ───────────────────────────────────────────────────────
 
-    pub async fn screenshot(&self, agent_id: &str, session_id: Option<&str>) -> Result<Value, OpError> {
+    pub async fn screenshot(
+        &self,
+        agent_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<Value, OpError> {
         self.admit(agent_id, gates::TOOL_SCREENSHOT, "").await?;
         let mut session = self.locked(agent_id, session_id).await?;
         let shot = session.backend.screenshot().await;
@@ -911,7 +1022,9 @@ impl ComputerUseSessions {
             Ok(png) => {
                 let (home, agent) = (self.home.clone(), agent_id.to_string());
                 tokio::task::spawn_blocking(move || {
-                    BrowserAuditLog::new(&home, AUDIT_RETENTION_DAYS).save_screenshot(&agent, &png).ok()
+                    BrowserAuditLog::new(&home, AUDIT_RETENTION_DAYS)
+                        .save_screenshot(&agent, &png)
+                        .ok()
                 })
                 .await
                 .ok()
@@ -961,7 +1074,8 @@ impl ComputerUseSessions {
             ActionRequest::Navigate { url } => {
                 gates::tool_gates(&self.home, agent_id, tool).await?;
                 let session = self.locked(agent_id, session_id).await?;
-                let checked = navigation::validate_url(url, &session.nav_hosts, session.nav_configured)?;
+                let checked =
+                    navigation::validate_url(url, &session.nav_hosts, session.nav_configured)?;
                 drop(session);
                 navigate_approval_detail(&checked)
             }
@@ -971,11 +1085,19 @@ impl ComputerUseSessions {
         let mut session = self.locked(agent_id, session_id).await?;
         session.last_activity = Instant::now();
         self.ensure_not_paused(&session).await?;
+        let policy_revision =
+            crate::approval::policy_revision(&self.home, agent_id).map_err(|_| {
+                OpError::new(ErrorCode::Forbidden, "無法核對目前操作政策，已拒絕執行。")
+            })?;
         if let ActionRequest::Navigate { url } = req {
-            return self.navigate(&mut session, url).await;
+            return self.navigate(&mut session, url, &policy_revision).await;
         }
         // 1. Parameters.
-        let action = actions::to_action(req, session.config.display_width, session.config.display_height)?;
+        let action = actions::to_action(
+            req,
+            session.config.display_width,
+            session.config.display_height,
+        )?;
         // 2. Action budget.
         action_budget(&session)?;
         // 3. Risk + contract. An unreadable title fails closed.
@@ -992,15 +1114,21 @@ impl ComputerUseSessions {
         let ctx = ActionContext {
             action: action.clone(),
             model_reasoning: None,
-            targets_sensitive_input: action_targets_input(&action) && window_is_sensitive(Some(&title)),
+            targets_sensitive_input: action_targets_input(&action)
+                && window_is_sensitive(Some(&title)),
             active_window_title: Some(title.clone()),
         };
         let risk = risk_detector::assess_risk(&ctx, &session.config);
-        let contract_hit = contract_must_not_violated(&session.config.contract_must_not, &action, &None);
+        let contract_hit =
+            contract_must_not_violated(&session.config.contract_must_not, &action, &None);
         // The confirmation target comes from the gateway's own record of this
         // employee's live turns, never from the request.
         let confirmer = match turn_id {
-            Some(turn) if risk == RiskLevel::High && !contract_hit && !session.config.auto_confirm_trusted => {
+            Some(turn)
+                if risk == RiskLevel::High
+                    && !contract_hit
+                    && !session.config.auto_confirm_trusted =>
+            {
                 self.confirmers.resolve(agent_id, turn).await
             }
             _ => None,
@@ -1012,18 +1140,60 @@ impl ComputerUseSessions {
             confirmer.is_some(),
         );
         let summary = actions::describe(&action);
+        let mut durable_execution = None;
+        let observed_screen_hash: String;
         match gate {
-            Gate::Execute => {}
+            Gate::Execute => {
+                let shot = session.backend.screenshot().await.map_err(|_| {
+                    OpError::new(
+                        ErrorCode::ScreenshotFailed,
+                        "無法觀察操作畫面，已拒絕執行。",
+                    )
+                })?;
+                if shot.fully_masked() {
+                    return Err(OpError::new(
+                        ErrorCode::ScreenshotFailed,
+                        "操作畫面無法辨識，請重新觀察。",
+                    ));
+                }
+                observed_screen_hash = crate::approval::payload_hash(&json!(shot.png_base64));
+            }
             Gate::Refuse(err) => {
-                self.audit_refusal(&session, &summary, &format!("{risk:?}"), err.code).await;
+                self.audit_refusal(&session, &summary, &format!("{risk:?}"), err.code)
+                    .await;
                 return Err(err);
             }
             Gate::Confirm => {
                 let prompt = actions::confirmation_prompt(agent_id, &action, &title);
-                let confirmed = match confirmer.as_deref() {
-                    Some(sender) => self.confirm_unless_interrupted(&session, sender, &prompt).await,
-                    None => false,
+                let shot = session.backend.screenshot().await.map_err(|_| {
+                    OpError::new(
+                        ErrorCode::ScreenshotFailed,
+                        "無法取得核准畫面，已拒絕執行。",
+                    )
+                })?;
+                if shot.fully_masked() {
+                    return Err(OpError::new(
+                        ErrorCode::ScreenshotFailed,
+                        "核准畫面無法辨識，請重新觀察。",
+                    ));
+                }
+                observed_screen_hash = crate::approval::payload_hash(&json!(shot.png_base64));
+                let payload = json!({
+                    "action": approval_action_snapshot(req),
+                    "session_id": session.session_id,
+                    "turn_id": turn_id,
+                    "window_title": title,
+                    "screen_hash": crate::approval::payload_hash(&json!(shot.png_base64)),
+                    "display": [session.config.display_width, session.config.display_height]
+                });
+                durable_execution = match (confirmer.as_deref(), turn_id) {
+                    (Some(sender), Some(turn)) => {
+                        self.confirm_unless_interrupted(&session, sender, turn, &prompt, payload)
+                            .await
+                    }
+                    _ => None,
                 };
+                let confirmed = durable_execution.is_some();
                 // Whatever happened during the wait wins over the answer.
                 self.check_alive(&mut session).await?;
                 self.ensure_not_paused(&session).await?;
@@ -1033,10 +1203,62 @@ impl ComputerUseSessions {
                         ErrorCode::ConfirmationDenied,
                         "高風險操作沒有得到確認（被拒絕或 60 秒內沒有回覆），已跳過。",
                     );
-                    self.audit_refusal(&session, &summary, &format!("{risk:?}"), err.code).await;
+                    self.audit_refusal(&session, &summary, &format!("{risk:?}"), err.code)
+                        .await;
                     return Err(err);
                 }
             }
+        }
+        let mut execution_claim = None;
+        let mut claim_deadline = None;
+        if let Some((broker, id, binding, operation_id, payload)) = &durable_execution {
+            let fresh_title = session.backend.window_title().await.map_err(|_| {
+                OpError::new(
+                    ErrorCode::WindowUnreadable,
+                    "無法再次確認視窗，已拒絕執行。",
+                )
+            })?;
+            let fresh = session.backend.screenshot().await.map_err(|_| {
+                OpError::new(
+                    ErrorCode::ScreenshotFailed,
+                    "無法再次確認畫面，已拒絕執行。",
+                )
+            })?;
+            if fresh.fully_masked()
+                || fresh_title != title
+                || crate::approval::payload_hash(&json!(fresh.png_base64))
+                    != payload["screen_hash"].as_str().unwrap_or("")
+            {
+                let _ = broker
+                    .invalidate_request(id, "screen_or_target_changed")
+                    .await;
+                return Err(OpError::new(
+                    ErrorCode::ConfirmationDenied,
+                    "畫面或目標已變動，請重新截圖並核准。",
+                ));
+            }
+            self.check_alive(&mut session).await?;
+            self.ensure_not_paused(&session).await?;
+            gates::tool_gates(&self.home, agent_id, tool).await?;
+            action_budget(&session)?;
+            claim_deadline = Some(Instant::now() + Duration::from_secs(120));
+            let claim = broker
+                .claim_operation(operation_id, binding, &session.session_id, 120)
+                .await
+                .map_err(|_| {
+                    OpError::new(
+                        ErrorCode::ConfirmationDenied,
+                        "核准內容或權限已失效，請重新核准。",
+                    )
+                })?;
+            #[cfg(test)]
+            self.pause_action_boundary("after_claim").await;
+            // Re-read native gates after the claim; policy/task/TTL are also
+            // checked at the durable execution boundary.
+            self.check_alive(&mut session).await?;
+            self.ensure_not_paused(&session).await?;
+            gates::tool_gates(&self.home, agent_id, tool).await?;
+            execution_claim = Some((broker.clone(), claim, binding.clone()));
         }
         // 4. Audit, execute, count.
         self.audit_line(
@@ -1051,12 +1273,120 @@ impl ComputerUseSessions {
             None,
         )
         .await;
+        #[cfg(test)]
+        self.pause_action_boundary("after_audit").await;
+        // Audit may await disk work: run the live gates once more after it.
+        self.check_alive(&mut session).await?;
+        self.ensure_not_paused(&session).await?;
+        gates::tool_gates(&self.home, agent_id, tool).await?;
+        if let Some((broker, claim, binding)) = &execution_claim {
+            broker
+                .begin_execution(claim, binding)
+                .await
+                .map_err(|_| OpError::new(ErrorCode::ConfirmationDenied, "執行前核准已失效。"))?;
+        }
+        #[cfg(test)]
+        self.pause_action_boundary("after_begin").await;
+        // No claim/audit/authorization await may follow the last observation.
+        // The session mutex stays held throughout; the desktop itself is not frozen.
+        let final_check = async {
+            self.check_alive(&mut session).await?;
+            self.ensure_not_paused(&session).await?;
+            gates::tool_gates(&self.home, agent_id, tool).await?;
+            action_budget(&session)?;
+            self.verify_action_frame(&session, &title, Some(observed_screen_hash.as_str()))
+                .await?;
+            self.final_control_gate(&session, &policy_revision)?;
+            if let Some((_, claim, binding)) = &execution_claim {
+                if claim.owner != session.session_id
+                    || claim_deadline.is_none_or(|deadline| Instant::now() >= deadline)
+                    || chrono::DateTime::parse_from_rfc3339(&binding.expires_at)
+                        .map(|expires| chrono::Utc::now() >= expires)
+                        .unwrap_or(true)
+                    || binding.policy_revision != policy_revision
+                {
+                    return Err(OpError::new(
+                        ErrorCode::ConfirmationDenied,
+                        "執行權限已到期或變動，請重新核准。",
+                    ));
+                }
+            }
+            Ok::<(), OpError>(())
+        }
+        .await;
+        if let Err(err) = final_check {
+            if let Some((broker, claim, _)) = &execution_claim {
+                if let Some((_, id, _, _, _)) = &durable_execution {
+                    let _ = broker
+                        .invalidate_request(id, "final_action_precondition_changed")
+                        .await;
+                }
+                // Only observation probes ran: the action backend was never invoked.
+                if broker.settle_operation(
+                    claim,
+                    crate::approval::OperationState::Failed,
+                    Some(json!({
+                        "session_id": session.session_id,
+                        "backend_invoked": false,
+                        "observations_only": true,
+                        "refusal_code": err.code.as_str()
+                    })),
+                    Some("final_action_precondition_failed"),
+                ).await.is_err() {
+                    session.backend.control().stopped.store(true, Ordering::Release);
+                }
+            }
+            return Err(err);
+        }
         session.actions_used += 1;
         let result = session.backend.execute(&action).await;
         session.last_activity = Instant::now();
+        if let Some((broker, claim, _)) = &execution_claim {
+            let (state, receipt, error) = match &result {
+                Ok(()) => (
+                    crate::approval::OperationState::Succeeded,
+                    Some(
+                        json!({"session_id":session.session_id,"backend_ack":true,"action_index":session.actions_used}),
+                    ),
+                    None,
+                ),
+                Err(_) => (
+                    crate::approval::OperationState::Uncertain,
+                    None,
+                    Some("backend_result_unknown"),
+                ),
+            };
+            if broker
+                .settle_operation(claim, state, receipt, error)
+                .await
+                .is_err()
+            {
+                // A backend may already have acted. A missing receipt never
+                // becomes a retryable failure or another click.
+                session
+                    .backend
+                    .control()
+                    .stopped
+                    .store(true, Ordering::Release);
+                return Err(OpError::new(
+                    ErrorCode::ExecutionFailed,
+                    "操作結果未能核對，已停止工作階段；請由管理員核對。",
+                ));
+            }
+            if result.is_err() {
+                session
+                    .backend
+                    .control()
+                    .stopped
+                    .store(true, Ordering::Release);
+            }
+        }
         if let Err(e) = result {
             warn!(agent = %agent_id, error = %e, "computer-use action failed");
-            return Err(OpError::new(ErrorCode::ExecutionFailed, format!("操作執行失敗：{summary}。")));
+            return Err(OpError::new(
+                ErrorCode::ExecutionFailed,
+                format!("操作執行失敗：{summary}。"),
+            ));
         }
         let now = Instant::now();
         let mut body = session.counters(now);
@@ -1065,11 +1395,105 @@ impl ComputerUseSessions {
         Ok(body)
     }
 
+    /// Observe after durable begin and all asynchronous gates, immediately before action dispatch.
+    async fn verify_action_frame(
+        &self,
+        session: &ManagedSession,
+        expected_title: &str,
+        expected_screen_hash: Option<&str>,
+    ) -> Result<(), OpError> {
+        let title = session.backend.window_title().await.map_err(|_| {
+            OpError::new(
+                ErrorCode::WindowUnreadable,
+                "無法再次確認視窗，已拒絕執行。",
+            )
+        })?;
+        let screen = session.backend.screenshot().await.map_err(|_| {
+            OpError::new(
+                ErrorCode::ScreenshotFailed,
+                "無法再次確認畫面，已拒絕執行。",
+            )
+        })?;
+        let after_title = session.backend.window_title().await.map_err(|_| {
+            OpError::new(
+                ErrorCode::WindowUnreadable,
+                "無法再次確認視窗，已拒絕執行。",
+            )
+        })?;
+        if screen.fully_masked()
+            || title != expected_title
+            || after_title != expected_title
+            || expected_screen_hash
+                .is_none_or(|hash| crate::approval::payload_hash(&json!(screen.png_base64)) != hash)
+        {
+            return Err(OpError::new(
+                ErrorCode::ConfirmationDenied,
+                "畫面或目標已變動，請重新截圖並核准。",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Local flags/policy are checked without another authorization or audit await.
+    /// This narrows the host-controlled wait window; it cannot atomically freeze the OS.
+    fn final_control_gate(&self, session: &ManagedSession, policy: &str) -> Result<(), OpError> {
+        let control = session.backend.control();
+        // Absent ⇒ GREEN; unreadable or unrecognised ⇒ RED (F4, review L6).
+        let level = crate::computer_use_orchestrator::read_threat_level_sync(&self.home);
+        if session.ended
+            || control.stopped.load(Ordering::Acquire)
+            || level == ThreatLevel::Red
+            || Instant::now() >= session.deadline
+            || capability_problem(&agent_capabilities(&self.home, &session.agent_id)).is_some()
+        {
+            return Err(OpError::new(
+                ErrorCode::SessionEnded,
+                "操作工作階段已停止、到期或撤權，已拒絕執行。",
+            ));
+        }
+        if control.paused.load(Ordering::Acquire) || level == ThreatLevel::Yellow {
+            return Err(paused());
+        }
+        if !crate::approval::policy_revision(&self.home, &session.agent_id)
+            .is_ok_and(|current| current == policy)
+        {
+            return Err(OpError::new(
+                ErrorCode::ConfirmationDenied,
+                "操作政策已變動，請重新觀察並核准。",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn pause_action_boundary(&self, phase: &'static str) {
+        let pause = {
+            let mut slot = self.action_boundary_pause.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|(expected, _, _)| *expected == phase)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+    }
+
     /// The `navigate` action (design §7.4), with the session lock held and
     /// liveness / pause already checked: URL against this session's pinned
     /// hosts, the action budget, the CONTRACT.toml `must_not` rules (risk is
     /// Low: no confirmation rule applies), the audit row, then the helper.
-    async fn navigate(&self, session: &mut ManagedSession, url: &str) -> Result<Value, OpError> {
+    async fn navigate(
+        &self,
+        session: &mut ManagedSession,
+        url: &str,
+        policy: &str,
+    ) -> Result<Value, OpError> {
         let agent_id = session.agent_id.clone();
         let checked = navigation::validate_url(url, &session.nav_hosts, session.nav_configured)?;
         action_budget(session)?;
@@ -1079,9 +1503,12 @@ impl ComputerUseSessions {
             &navigation::semantic_string(&checked),
             &None,
         );
-        if let Gate::Refuse(err) =
-            actions::risk_gate(RiskLevel::Low, contract_hit, session.config.auto_confirm_trusted, false)
-        {
+        if let Gate::Refuse(err) = actions::risk_gate(
+            RiskLevel::Low,
+            contract_hit,
+            session.config.auto_confirm_trusted,
+            false,
+        ) {
             self.audit_refusal(session, &summary, "Low", err.code).await;
             return Err(err);
         }
@@ -1100,6 +1527,11 @@ impl ComputerUseSessions {
         entry.url = Some(checked.audit_url.clone());
         entry.domain = Some(checked.host.clone());
         write_audit(self.home.clone(), entry).await;
+        self.check_alive(session).await?;
+        self.ensure_not_paused(session).await?;
+        gates::tool_gates(&self.home, &agent_id, gates::TOOL_NAVIGATE).await?;
+        action_budget(session)?;
+        self.final_control_gate(session, policy)?;
         session.actions_used += 1;
         let result = session.backend.navigate(&checked.url).await;
         session.last_activity = Instant::now();
@@ -1144,31 +1576,103 @@ impl ComputerUseSessions {
         &self,
         session: &ManagedSession,
         sender: &dyn ChannelSender,
+        turn: &str,
         prompt: &str,
-    ) -> bool {
+        mut payload: Value,
+    ) -> Option<(
+        crate::approval::ApprovalBroker,
+        crate::approval::ApprovalId,
+        crate::approval::ExecutionBinding,
+        String,
+        Value,
+    )> {
+        use crate::approval::{ApprovalBroker, ApprovalStatus, ExecutionBinding, RequestKind};
+        let context = self.confirmers.context(&session.agent_id, turn).await?;
+        let broker = ApprovalBroker::open(&self.home).ok()?;
+        let ingress_run_id = turns::target_for(&session.agent_id, turn)
+            .and_then(|target| target.ingress_run_id().map(str::to_owned));
+        let action_hash = crate::approval::payload_hash(&payload["action"]);
+        payload["action_hash"] = json!(action_hash);
+        let binding = ExecutionBinding {
+            schema_version: 1,
+            run_id: ingress_run_id.clone().unwrap_or_else(|| session.session_id.clone()),
+            run_origin_kind: if ingress_run_id.is_some() { "ingress" } else { "computer_session" }.into(),
+            actor_principal: session.agent_id.clone(),
+            decision_context: context,
+            task_id: None,
+            task_revision: None,
+            task_snapshot_hash: None,
+            payload_hash: crate::approval::payload_hash(&payload),
+            policy_revision: crate::approval::policy_revision(&self.home, &session.agent_id)
+                .ok()?,
+            cwd: None,
+            environment_hash: crate::approval::payload_hash(
+                &json!({
+                    "session": session.session_id,
+                    "display": [session.config.display_width,session.config.display_height]
+                }),
+            ),
+            file_hashes: Default::default(),
+            expires_at: (chrono::Utc::now()
+                + chrono::Duration::seconds(CONFIRM_TIMEOUT_SECS as i64))
+            .to_rfc3339(),
+            resume_handler: "computer_reobserve_v1".into(),
+            resume_version: 1,
+        };
+        let id = broker
+            .request_bound(
+                RequestKind::Approval,
+                &session.agent_id,
+                prompt,
+                payload.clone(),
+                binding.clone(),
+            )
+            .await
+            .ok()?;
+        let operation = broker
+            .prepare_operation(&id, &format!("action-request-{id}-{}", &action_hash[..12]), None)
+            .await
+            .ok()?;
+        let message = format!(
+            "{prompt}\n\n同意：確認 {id}\n拒絕：取消 {id}\n請於 {CONFIRM_TIMEOUT_SECS} 秒內回覆完整編號。核准後會再次核對畫面。"
+        );
+        if sender.send_text(&message).await.is_err() {
+            let _ = broker.invalidate_request(&id, "delivery_failed").await;
+            return None;
+        }
         let control = session.backend.control();
-        let wait = sender.request_confirmation(prompt, None, CONFIRM_TIMEOUT_SECS);
-        tokio::pin!(wait);
         let mut tick = tokio::time::interval(CONFIRM_INTERRUPT_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::select! {
-                answer = &mut wait => return answer.unwrap_or(false),
-                _ = tick.tick() => {
-                    let interrupted = control.stopped.load(Ordering::Acquire)
-                        || control.paused.load(Ordering::Acquire)
-                        || Instant::now() >= session.deadline
-                        || read_threat_level(&self.home).await != ThreatLevel::Green
-                        || capability_problem(&agent_capabilities(&self.home, &session.agent_id)).is_some();
-                    if interrupted {
-                        return false;
-                    }
+            tick.tick().await;
+            let interrupted = control.stopped.load(Ordering::Acquire)
+                || control.paused.load(Ordering::Acquire)
+                || Instant::now() >= session.deadline
+                || read_threat_level(&self.home).await != ThreatLevel::Green
+                || capability_problem(&agent_capabilities(&self.home, &session.agent_id)).is_some();
+            if interrupted {
+                let _ = broker
+                    .invalidate_request(&id, "live_session_interrupted")
+                    .await;
+                return None;
+            }
+            match broker.poll(&id).await {
+                Ok(ApprovalStatus::Approved) => {
+                    return Some((broker, id, binding, operation, payload));
                 }
+                Ok(ApprovalStatus::Pending) => {}
+                _ => return None,
             }
         }
     }
 
-    async fn audit_refusal(&self, session: &ManagedSession, summary: &str, risk: &str, code: ErrorCode) {
+    async fn audit_refusal(
+        &self,
+        session: &ManagedSession,
+        summary: &str,
+        risk: &str,
+        code: ErrorCode,
+    ) {
         self.audit_line(
             &session.agent_id,
             "action_refused",
@@ -1220,12 +1724,17 @@ impl ComputerUseSessions {
             return json!({"ok": true, "active": false});
         }
         let now = Instant::now();
-        let activity = session.shared.effective_activity(session.last_activity, now);
+        let activity = session
+            .shared
+            .effective_activity(session.last_activity, now);
         let mut body = session.counters(now);
         body["ok"] = json!(true);
         body["active"] = json!(true);
-        body["idle_seconds_left"] =
-            json!(self.idle_timeout.saturating_sub(now.saturating_duration_since(activity)).as_secs());
+        body["idle_seconds_left"] = json!(
+            self.idle_timeout
+                .saturating_sub(now.saturating_duration_since(activity))
+                .as_secs()
+        );
         body
     }
 
@@ -1250,8 +1759,17 @@ impl ComputerUseSessions {
             };
             let stopped = session.backend.control().stopped.load(Ordering::Acquire);
             let now = Instant::now();
-            let activity = session.shared.effective_activity(session.last_activity, now);
-            let reason = end_reason(now, session.deadline, activity, self.idle_timeout, stopped, threat);
+            let activity = session
+                .shared
+                .effective_activity(session.last_activity, now);
+            let reason = end_reason(
+                now,
+                session.deadline,
+                activity,
+                self.idle_timeout,
+                stopped,
+                threat,
+            );
             if let Some(reason) = reason
                 && let Some(handle) = self.end(&mut session, reason)
             {
@@ -1271,8 +1789,13 @@ impl ComputerUseSessions {
     /// and a waiter ends it as soon as the op releases it. Container stops
     /// run detached. Returns the session ids.
     fn stop_all_for_emergency(self: &Arc<Self>) -> Vec<String> {
-        let entries: Vec<Entry> =
-            self.sessions.lock().unwrap_or_else(|p| p.into_inner()).values().cloned().collect();
+        let entries: Vec<Entry> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect();
         let mut ids = Vec::with_capacity(entries.len());
         for entry in entries {
             entry.control.stopped.store(true, Ordering::Release);
@@ -1294,7 +1817,10 @@ impl ComputerUseSessions {
             }
         }
         if !ids.is_empty() {
-            info!(count = ids.len(), "computer-use tool sessions ended by emergency stop");
+            info!(
+                count = ids.len(),
+                "computer-use tool sessions ended by emergency stop"
+            );
         }
         ids
     }
@@ -1429,8 +1955,32 @@ fn contract_must_not_rules(agent_dir: &Path) -> Vec<String> {
     (|| {
         let content = std::fs::read_to_string(agent_dir.join("CONTRACT.toml")).ok()?;
         let table: toml::Table = content.parse().ok()?;
-        let rules = table.get("must_not")?.as_table()?.get("rules")?.as_array()?;
-        Some(rules.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        let rules = table
+            .get("must_not")?
+            .as_table()?
+            .get("rules")?
+            .as_array()?;
+        Some(
+            rules
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        )
     })()
     .unwrap_or_default()
+}
+
+/// GUI actions never resume from stored coordinates. Sensitive input is bound
+/// by its digest; the only plaintext copy remains in the live handler.
+fn approval_action_snapshot(req: &ActionRequest) -> Value {
+    match req {
+        ActionRequest::Type { text } => {
+            json!({
+                "type": "type",
+                "text_hash": crate::approval::payload_hash(&json!(text)),
+                "characters": text.chars().count()
+            })
+        }
+        _ => serde_json::to_value(req).expect("serializable action"),
+    }
 }
