@@ -271,6 +271,18 @@ impl MessageQueue {
     }
 
     /// Reset a stale message back to pending for retry.
+    /// Put a message back to pending without counting a retry: the work was
+    /// deferred (another execution holds the run), not attempted (R-L8).
+    pub async fn defer_to_pending(&self, message_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE message_queue SET status = 'pending', acked_at = NULL WHERE id = ?1",
+            params![message_id],
+        )
+        .map_err(|e| format!("defer_to_pending: {e}"))?;
+        Ok(())
+    }
+
     pub async fn reset_to_pending(&self, message_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
         conn.execute(
@@ -351,6 +363,43 @@ impl MessageQueue {
         )
         .optional()
         .map_err(|e| format!("get_by_id: {e}"))
+    }
+
+    /// Boot-only: messages with this id prefix that a previous process
+    /// picked up but never settled go back to `pending`. Returns how many.
+    pub async fn requeue_unsettled_with_prefix(&self, prefix: &str) -> Result<usize, String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE message_queue SET status = 'pending', acked_at = NULL
+             WHERE status IN ('acked', 'processing') AND id >= ?1 AND id < ?1 || char(1114111)",
+            params![prefix],
+        )
+        .map_err(|e| format!("requeue unsettled: {e}"))
+    }
+
+    /// Id and status of every message whose id starts with `prefix`
+    /// (exact leading-bytes compare, no pattern characters).
+    pub async fn statuses_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, MessageStatus)>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, status FROM message_queue WHERE id >= ?1 AND id < ?1 || char(1114111)",
+            )
+            .map_err(|e| format!("prepare prefix: {e}"))?;
+        let rows = stmt
+            .query_map(params![prefix], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    MessageStatus::from_str(&row.get::<_, String>(1)?),
+                ))
+            })
+            .map_err(|e| format!("query prefix: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect prefix: {e}"))?;
+        Ok(rows)
     }
 
     /// Single place to decode a `message_queue` row into a `QueueMessage`.

@@ -192,7 +192,10 @@ async fn resume_on_restart_pause_stamps_restart_on_the_open_round() {
     assert_eq!(rows[0].round, 1);
     assert_eq!(rows[0].pause_reason.as_deref(), Some("restart"));
     assert_eq!(rows[0].verdict, None, "a restart is not a verdict");
-    assert_eq!(rows[0].judged_at, None, "the round stays open for the retry");
+    assert_eq!(
+        rows[0].judged_at, None,
+        "the round stays open for the retry"
+    );
 }
 
 // ── H7: continuation feedback is single-instance, not accumulated ──
@@ -442,4 +445,70 @@ async fn collaborator_kickoff_gates_then_dispatches_on_approve() {
     let dispatched = queue.pending_messages(10).await.unwrap();
     assert_eq!(dispatched.len(), 1, "dispatched after kickoff approval");
     assert_eq!(dispatched[0].target, "alice");
+}
+
+#[tokio::test]
+async fn cached_approved_kickoff_expiry_matches_reopen_and_never_dispatches() {
+    for reopen in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        write_agent_toml(
+            dir.path(),
+            "alice",
+            "[capabilities]\nautonomy_level='collaborator'\n",
+        );
+        store
+            .insert_task(&goal_task("ttl-goal", "alice"))
+            .await
+            .unwrap();
+        let broker = Arc::new(crate::approval::ApprovalBroker::open(dir.path()).unwrap());
+        let cfg = GoalLoopConfig {
+            max_concurrent: 0,
+            ..small_cfg()
+        };
+        let d = GoalLoopDriver::new(store.clone(), queue.clone(), cfg.clone())
+            .with_home_dir(dir.path().to_path_buf())
+            .with_broker(broker.clone());
+        d.tick_once().await.unwrap();
+        let id = broker.list_pending(Some("alice")).await.unwrap()[0]
+            .id
+            .clone();
+        broker.decide(&id, true, "test:human").await.unwrap();
+        // Approve before TTL, then defer several ticks at the concurrency cap.
+        for _ in 0..3 {
+            d.tick_once().await.unwrap();
+        }
+        assert!(queue.pending_messages(10).await.unwrap().is_empty());
+        assert_eq!(
+            broker.get(&id).await.unwrap().unwrap().status,
+            ApprovalStatus::Approved
+        );
+        let conn = rusqlite::Connection::open(dir.path().join("approvals.db")).unwrap();
+        conn.execute(
+            "UPDATE approvals SET created_at='2000-01-01T00:00:00Z' WHERE id=?1",
+            rusqlite::params![id.as_str()],
+        )
+        .unwrap();
+        if reopen {
+            drop(d);
+            let d = GoalLoopDriver::new(store.clone(), queue.clone(), cfg)
+                .with_home_dir(dir.path().to_path_buf())
+                .with_broker(Arc::new(
+                    crate::approval::ApprovalBroker::open(dir.path()).unwrap(),
+                ));
+            d.tick_once().await.unwrap();
+        } else {
+            d.tick_once().await.unwrap();
+        }
+        assert!(queue.pending_messages(10).await.unwrap().is_empty());
+        assert_eq!(
+            store.get_task("ttl-goal").await.unwrap().unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(
+            broker.list_by_kind("goal_kickoff").await.unwrap().len(),
+            1,
+            "no expired approval replacement on restart"
+        );
+    }
 }

@@ -57,8 +57,8 @@ impl MethodHandler {
         }
 
         match method {
-            "discovery.catalog" | "discovery.list" | "discovery.tree" | "discovery.artifact" | "discovery.cancel" =>
-                self.handle_discovery_rpc(method, params, ctx).await,
+            "discovery.catalog" | "discovery.list" | "discovery.tree" | "discovery.artifact"
+            | "discovery.cancel" => self.handle_discovery_rpc(method, params, ctx).await,
             "dashboard.layout.view" => {
                 require_manager!();
                 self.handle_dashboard_layout_view(params, ctx).await
@@ -191,10 +191,23 @@ impl MethodHandler {
             }
 
             // ── Task Board (agent-scoped — HS4 fix) ────
+            "tasks.review_snapshot" => super::workflow_errors::with_workflow_error_code(method, self.handle_tasks_review_snapshot(params,ctx).await),
+            "tasks.review_accept" => super::workflow_errors::with_workflow_error_code(method, self.handle_tasks_review_accept(params,ctx).await),
+            "workflow_drafts.create" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_create(params,ctx).await),
+            "workflow_drafts.get" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_get(params,ctx).await),
+            "workflow_drafts.list" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_list(params,ctx).await),
+            "workflow_drafts.run_fixture" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_run_fixture(params,ctx).await),
+            "workflow_drafts.request_activation" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_request_activation(params,ctx).await),
+            "workflow_drafts.commit_activation" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_commit_activation(params,ctx).await),
+            "workflow_drafts.revoke_activation" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_drafts_revoke_activation(params,ctx).await),
+            "workflow_runs.get" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_runs_get(params,ctx).await),
+            "workflow_runs.list" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_runs_list(params,ctx).await),
+            "workflow_runs.cancel" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_runs_cancel(params,ctx).await),
+            "workflow_runs.reset_failures" => super::workflow_errors::with_workflow_error_code(method, self.handle_workflow_runs_reset_failures(params,ctx).await),
             "tasks.list" => {
                 // Non-admins must scope the listing to a bound agent.
                 check_agent_filter!(AccessLevel::Viewer);
-                self.handle_tasks_list(params).await
+                self.handle_tasks_list(params, ctx).await
             }
             "tasks.create" => {
                 // The target agent is `assigned_to`; creating work for an agent
@@ -227,7 +240,7 @@ impl MethodHandler {
             // `tasks.list`.
             "tasks.list_page" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                self.handle_tasks_list_page(params).await
+                self.handle_tasks_list_page(params, ctx).await
             }
             // L2: task comments. Access is gated inside the handler by the
             // task's owning agent (Viewer) — anyone who can see the task may
@@ -284,7 +297,7 @@ impl MethodHandler {
             // ── Activity Feed (agent-scoped — HS4 fix) ───
             "activity.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                self.handle_activity_list(params).await
+                self.handle_activity_list(params, ctx).await
             }
             // Per-topic filtering is NOT implemented: BroadcastLayer fans out every
             // activity event to every authenticated WS client unconditionally. This
@@ -303,7 +316,7 @@ impl MethodHandler {
             //    as activity.list: viewing is read-only, agent-scoped.
             "timeline.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                self.handle_timeline_list(params).await
+                self.handle_timeline_list(params, ctx).await
             }
 
             // ── Run inspector (G12) — per-run transcript derived from
@@ -311,7 +324,7 @@ impl MethodHandler {
             //    activity.list: read-only, agent-scoped, fail-closed.
             "runs.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                self.handle_runs_list(params).await
+                self.handle_runs_list(params, ctx).await
             }
             // Gated inside the handler by the run's owning agent (Viewer) —
             // the agent id is only known after resolving the run's session;
@@ -365,8 +378,16 @@ impl MethodHandler {
             }
 
             // ── Live Run Forking (RFC-26) ───────────────────
-            "fork.list" => self.handle_fork_list(params),
-            "fork.inspect" => self.handle_fork_inspect(params),
+            // F5-D: branch outputs are an employee's work; Manager role plus a
+            // live binding on the fork's employee (checked in the handler).
+            "fork.list" => {
+                require_manager!();
+                self.handle_fork_list(params, ctx)
+            }
+            "fork.inspect" => {
+                require_manager!();
+                self.handle_fork_inspect(params, ctx)
+            }
             // Resolving a fork promotes a winner's workspace → side-effecting.
             "fork.resolve" => {
                 require_manager!();
@@ -387,9 +408,17 @@ impl MethodHandler {
             }
 
             // ── Approvals (WP14-T14.7 approval center) ──────
+            "approvals.operations" => {
+                require_admin!();
+                self.handle_approval_operations(params, ctx, false).await
+            }
+            "approvals.resolve_uncertain" => {
+                require_admin!();
+                self.handle_approval_operations(params, ctx, true).await
+            }
             "approvals.list" => {
                 require_manager!();
-                self.handle_approvals_list(params).await
+                self.handle_approvals_list(params,ctx).await
             }
             "approvals.decide" => {
                 require_manager!();
