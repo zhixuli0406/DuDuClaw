@@ -286,7 +286,9 @@ pub async fn get_default_agent(home_dir: &Path) -> String {
             .to_string();
         (resolved, "config")
     };
-    if duduclaw_core::is_system_sender(&resolved) {
+    if duduclaw_core::is_system_sender(&resolved)
+        || duduclaw_core::is_reserved_queue_sender(&resolved)
+    {
         audit_system_sender_identity_once(home_dir, resolved.trim(), source);
         return duduclaw_core::UNTRUSTED_AGENT_ID.to_string();
     }
@@ -298,7 +300,8 @@ pub async fn get_default_agent(home_dir: &Path) -> String {
 /// downstream (refusals, audit rows) only sees `__untrusted__`, so this row is
 /// the one place that says what was claimed and where it came from (`env` =
 /// `DUDUCLAW_AGENT_ID`, `config` = `[general] default_agent`). `claimed` is
-/// always one of the fixed `SYSTEM_SENDERS` names, never free text.
+/// always one of the fixed `SYSTEM_SENDERS` / `RESERVED_QUEUE_SENDERS`
+/// names, never free text.
 fn audit_system_sender_identity_once(home_dir: &Path, claimed: &str, source: &str) {
     static SEEN: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
     {

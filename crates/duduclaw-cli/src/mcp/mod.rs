@@ -189,6 +189,7 @@ mod notion_github;
 mod odoo;
 mod os_tools;
 mod record_authz;
+mod responsibilities;
 mod reminders;
 mod server;
 mod skills;
@@ -210,6 +211,7 @@ mod wiki_util;
 mod working_state;
 
 pub(crate) use action_guard::*;
+pub(crate) use responsibilities::*;
 pub(crate) use agent_admin::*;
 pub(crate) use agent_update::*;
 pub(crate) use agents::*;
@@ -316,6 +318,12 @@ mod merged_entry_tests;
 // Caller ↔ record relationship checks (tasks / cron / reminders / agent_update).
 #[cfg(test)]
 mod record_authz_tests;
+// P2-A: employee responsibility tools.
+#[cfg(test)]
+mod responsibilities_tests;
+// P2-A round 4: host-decided parent for tasks created during a round.
+#[cfg(test)]
+mod round_parent_tests;
 /// Pre-`RecordActor` handler signatures for the existing tests.
 #[cfg(test)]
 mod caller_shims;

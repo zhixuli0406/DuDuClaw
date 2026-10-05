@@ -275,6 +275,17 @@ pub(crate) async fn handle_activity_post(
         .filter(|s| !s.is_empty())
         .unwrap_or("agent_comment")
         .to_string();
+    // P2-A S-M6: these event types are written by the gateway only (stop
+    // records, responsibility notices and their push counts).
+    if duduclaw_gateway::responsibility::activity::RESERVED_PREFIXES
+        .iter()
+        .any(|p| event_type.to_ascii_lowercase().starts_with(p))
+    {
+        return tool_error(&format!(
+            "activity_post 遭拒：「{}」是系統保留的事件類型。",
+            duduclaw_core::truncate_chars(&event_type, 64)
+        ));
+    }
     let task_id = args
         .get("task_id")
         .and_then(|v| v.as_str())
