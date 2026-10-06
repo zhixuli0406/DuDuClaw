@@ -631,7 +631,9 @@ fn workspace_sources() -> Vec<std::path::PathBuf> {
 }
 
 fn is_test_location(path: &std::path::Path, text: &str, offset: usize) -> bool {
-    let s = path.to_string_lossy();
+    // Windows paths use `\`; the test-file rules below are written with `/`
+    // (the CI Windows job reported every `…\tests.rs` as production code).
+    let s = path.to_string_lossy().replace('\\', "/");
     if s.contains("/tests/")
         || s.ends_with("/tests.rs")
         || s.ends_with("_tests.rs")
