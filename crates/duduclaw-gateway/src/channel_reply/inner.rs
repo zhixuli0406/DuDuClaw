@@ -1568,9 +1568,18 @@ pub(super) async fn build_reply_with_session_inner(
         }
     };
 
+    // `.mcp.json` spawn gate refused this employee: its MCP configuration
+    // could not be confirmed. Answering from a local model or the plain
+    // Direct API instead would hide that from the person, so skip both
+    // fallbacks and show the gate's own sentence (step 3 below).
+    let mcp_gate_refused = last_cli_error
+        .as_deref()
+        .is_some_and(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error);
+
     // 2. Fallback: Local model inference (if configured)
     let reply = match reply {
         Some(r) => Some(r),
+        None if mcp_gate_refused => None,
         None if local_attempted_first => {
             // inference_mode=local already tried (and failed) local FIRST —
             // don't retry the same engine; proceed to the Direct API fallback.
@@ -1616,6 +1625,7 @@ pub(super) async fn build_reply_with_session_inner(
     let fallback_api_key = get_api_key(&ctx.home_dir).await;
     let reply = match reply {
         Some(r) => Some(r),
+        None if mcp_gate_refused => None,
         // A `moa:` id is not an Anthropic model — the MoA branch above was
         // this request's API path; don't re-send the ensemble id upstream.
         None if fallback_api_key.is_some() && !duduclaw_llm::is_moa_model_id(&model) => {
@@ -3439,6 +3449,12 @@ pub(super) async fn build_reply_with_session_inner(
         }
     }
 
+    // The spawn gate already wrote its own audit event; the person sees the
+    // gate's sentence (which names the employee and asks the operator to
+    // check the file) instead of a generic "something failed" message.
+    if let Some(msg) = duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&err_str) {
+        return msg.to_string();
+    }
     format_fallback_message(&name, reason, &ctx.home_dir)
 }
 

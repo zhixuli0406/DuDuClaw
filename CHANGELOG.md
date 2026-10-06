@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Security
+- **員工不能再寫自己的 `.mcp.json` 與 CLI 設定（所有已出貨版本都受影響）**：Claude CLI 會啟動 `.mcp.json` 裡列的每一個 MCP 伺服器，而以前員工可以自己新增「無關的」伺服器項目，所以只有 Write／Edit、沒有 Bash 的員工，也能加一個指令是直譯器的項目，在下一次啟動時以管理者的系統身分執行任意指令。現在帶員工身分或身分未驗證的呼叫者，對自己目錄裡任何一層的 `.mcp.json` 一律不能寫，任何一層的 `.claude/` 與 `.claude.json`，以及最上層的 `.codex/`、`.gemini/`、`.grok/`、`.agents/` 也一樣（檔名比對不分大小寫）。**行為變更**：員工不能再自己加 MCP 伺服器，請改由儀表板安裝，或在儀表板提出 MCP 安裝申請（`mcp.install_request`）經管理者核准；複製到員工目錄裡的專案，員工可以讀它的 `.claude/`，不能寫。gateway 在每次把員工 `.mcp.json` 交給 Claude CLI 之前（通道回覆、派工、heartbeat 主動檢查、`duduclaw eval` 的 live 模式、live fork 複製分支之前的上層目錄）與開機時，整筆重新產生 DuDuClaw 項目（其他項目保留）；檔案無法確認、或 duduclaw 執行檔路徑不是絕對路徑時，這次不啟動並寫稽核 `mcp_config_unverified`。這種拒絕不算帳號失敗：不會讓帳號進入冷卻，也不會換下一個帳號重試，通道回覆不改用本地模型或 Direct API 代答，使用者看到的是說明哪位員工設定無法確認的中文訊息。所有寫 `.mcp.json` 的程式共用同一把檔案鎖，員工目錄的鎖放在 `<home>/locks/`（不在員工目錄裡，員工建立的同名檔案擋不住它），暫存檔名稱不可預測。live fork 採用分支回員工目錄時，也不會帶回 `.claude.json`、`.agents/`、`.codex/`、`.gemini/`、`.grok/`，以及任何一層的 `.claude/`、`.claude.json`、`.mcp.json`。**升級後請執行 `duduclaw doctor`**：新的一列「員工 MCP 設定中的其他伺服器」會列出每位員工 `.mcp.json` 裡不是 DuDuClaw 寫入的項目（只顯示名稱與指令的檔名，不顯示參數、環境變數或網址）；這些指令會在員工啟動時以你的系統使用者身分執行，請確認每一個都是你自己或經核准的安裝加入的，升級前就被加入的項目不會自動移除。限制：這是 hook，有不受限 Bash 的員工仍可改檔；Codex、Gemini、Grok、Antigravity 不跑 hook，它們的 MCP 設定也在員工目錄下，這類問題在那些 runtime 上沒有處理。
+
 ## [1.69.1] - 2026-10-04 — Antigravity 平台工具權限修正
 
 ### Fixed

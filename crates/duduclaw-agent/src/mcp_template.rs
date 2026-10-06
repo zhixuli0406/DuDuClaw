@@ -250,6 +250,31 @@ pub fn ensure_global_mcp_server() -> Result<bool, String> {
     Ok(true)
 }
 
+/// Audit event written when an employee's `.mcp.json` cannot be confirmed
+/// before a spawn (the spawn does not happen).
+pub const AUDIT_MCP_CONFIG_UNVERIFIED: &str = "mcp_config_unverified";
+
+/// Run `f` holding the advisory lock every writer of an agent's `.mcp.json`
+/// shares (this module's repair and `add_server_to_config` /
+/// `remove_server_from_config`, the expert-pack merge), so two read–modify–
+/// write sequences cannot overwrite each other. For an employee directory the
+/// lock lives under `<home>/locks/`, not in the employee directory
+/// ([`crate::mcp_spawn_gate::mcp_config_lock_base`]), so nothing the
+/// employee creates there can block or redirect it.
+pub fn with_mcp_config_lock<T>(
+    path: &Path,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let lock_base = crate::mcp_spawn_gate::mcp_config_lock_base(path);
+    let mut inner: Option<Result<T, String>> = None;
+    duduclaw_core::with_file_lock(&lock_base, || {
+        inner = Some(f());
+        Ok(())
+    })
+    .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+    inner.unwrap_or_else(|| Err("lock callback did not run".to_string()))
+}
+
 /// Derive the DuDuClaw home directory from an agent directory path.
 ///
 /// Normally `agent_dir` is `<home>/agents/<id>`, so walking up two levels
@@ -264,7 +289,7 @@ pub fn ensure_global_mcp_server() -> Result<bool, String> {
 /// Falls back to `duduclaw_core::duduclaw_home()` when `agent_dir` is too
 /// shallow to have the expected ancestors (matches the previous inline
 /// fail-safe behaviour — never panics on a malformed path).
-fn derive_home_from_agent_dir(agent_dir: &Path) -> std::path::PathBuf {
+pub(crate) fn derive_home_from_agent_dir(agent_dir: &Path) -> std::path::PathBuf {
     let Some(parent) = agent_dir.parent() else {
         return duduclaw_core::duduclaw_home();
     };
@@ -281,35 +306,54 @@ fn derive_home_from_agent_dir(agent_dir: &Path) -> std::path::PathBuf {
     home
 }
 
-/// Legacy per-agent `.mcp.json` fixup — kept for backwards compatibility.
+/// The `.mcp.json` entry names this module owns: `duduclaw`, the legacy
+/// `duduclaw-pro`, and this instance's `duduclaw-<instance>`.
+fn owned_entry_names() -> Vec<String> {
+    let mut names = vec!["duduclaw".to_string(), "duduclaw-pro".to_string()];
+    let key = duduclaw_core::mcp_server_key();
+    if !names.contains(&key) {
+        names.push(key);
+    }
+    names
+}
+
+/// Repair an agent's `.mcp.json` so its DuDuClaw MCP server entry is exactly
+/// what DuDuClaw writes.
 ///
-/// Prefer `ensure_global_mcp_server()` for new installations.
-/// This function is called after global migration to clean up stale entries.
+/// The `duduclaw` (and `duduclaw-pro` / `duduclaw-<instance>`, when present)
+/// entry is **regenerated whole** on every call: `command` = the resolved
+/// binary, `args` = `["mcp-server"]`, `env` = this agent's identity pair
+/// (`DUDUCLAW_AGENT_ID`, plus `DUDUCLAW_AGENT_TOKEN` when `<home>/identity.key`
+/// exists) and the forward set (`DUDUCLAW_HOME` derived from the agent
+/// directory, and whichever of `DUDUCLAW_PORT` / `DUDUCLAW_INSTANCE` /
+/// `DUDUCLAW_MCP_API_KEY` / `DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED` this process
+/// has). Nothing else in that entry survives — not another `DUDUCLAW_*` key,
+/// not `PATH` / `LD_PRELOAD` / `NODE_OPTIONS`, not a managed key this process
+/// has no value for — because the Claude CLI lets a server's configured env
+/// override the inherited one. Dropped key names (never values) are logged.
+/// Missing entry ⇒ a `duduclaw` entry is added; missing file ⇒ created.
 ///
-/// In addition to resolving the `duduclaw` server's command to an absolute
-/// path, this function ensures the server's `env` block contains
-/// `DUDUCLAW_AGENT_ID` pointing at the agent directory's name. The MCP
-/// subprocess uses this env var to self-identify — without it, every MCP
-/// call falls back to `config.toml [general] default_agent` and
-/// supervisor-relation authorization breaks for every agent except the
-/// global default.
+/// Other entries are copied through untouched (as JSON values, so an entry
+/// with fields this module does not model, such as an HTTP server, is kept).
 ///
-/// WP21 debt ⑧: `DUDUCLAW_AGENT_TOKEN` — the MAC proving that id was issued by
-/// DuDuClaw rather than typed by the agent — is written alongside it whenever
-/// `<home>/identity.key` exists. No key ⇒ the env block is byte-identical to
-/// before, so this is inert on installs that have not enabled the feature.
-///
-/// The `duduclaw` / `duduclaw-pro` server entries are the only ones
-/// touched; other servers (playwright, browserbase, …) are left alone.
+/// Errors (nothing written): the file exists but is not a regular file
+/// (directory, symbolic link), cannot be read, is not valid JSON, or its
+/// `mcpServers` is not an object; the duduclaw binary path is not absolute;
+/// or the write fails. Holds [`with_mcp_config_lock`]. Returns whether the
+/// file was written.
 pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
     let path = agent_dir.join(".mcp.json");
 
     let abs_bin = duduclaw_core::resolve_duduclaw_bin();
     let abs_str = abs_bin.to_string_lossy().into_owned();
 
-    // Still relative after resolution (fallback "duduclaw") — skip.
+    // Still relative after resolution (fallback "duduclaw"): the entry
+    // cannot be regenerated, so the file counts as unconfirmable (fail
+    // closed) instead of being passed on unchecked.
     if !std::path::Path::new(&abs_str).is_absolute() {
-        return Ok(false);
+        return Err(format!(
+            "the duduclaw binary path could not be resolved to an absolute path ({abs_str})"
+        ));
     }
 
     // Agent identity = directory name (matches the rest of the codebase,
@@ -320,127 +364,242 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
         .ok_or_else(|| format!("agent dir has no file_name: {}", agent_dir.display()))?
         .to_string();
 
-    // Shared forward set (home/port/instance + MCP auth). Claude CLI passes
-    // its full env to MCP children, but writing the pairs into `.mcp.json`
-    // keeps the agent dir working standalone (claude launched from a terminal
-    // that lacks the gateway env). See `duduclaw_core::mcp_forward_env_vars`.
+    // Shared forward set (home/port/instance + MCP auth). This function also
+    // scaffolds members under a cloned eval home. An inherited DUDUCLAW_HOME
+    // can name the source instance, so the MCP child must always use the same
+    // derived home as its identity token.
     let home_dir = derive_home_from_agent_dir(agent_dir);
     let mut forward_env = duduclaw_core::mcp_forward_env_vars();
-    // This function also scaffolds members under a cloned eval home. An
-    // inherited DUDUCLAW_HOME can name the source instance, so the MCP child
-    // must always use the same derived home as its identity token.
     forward_env.retain(|(name, _)| name != "DUDUCLAW_HOME");
     forward_env.push((
         "DUDUCLAW_HOME".to_string(),
         home_dir.to_string_lossy().to_string(),
     ));
-
-    // Per-agent identity pair: id + (when enabled) its WP21 debt ⑧ token. The
-    // home is derived from `<home>/agents/<id>` rather than `duduclaw_home()`
-    // so a caller operating on an explicit agents root (tests, migrations,
-    // a second instance) signs with that root's key, not the ambient one.
     let identity_env = duduclaw_core::agent_identity_env_vars(&home_dir, &agent_id);
 
-    // Case 1: No .mcp.json exists → create with duduclaw server entry
-    if !path.exists() {
-        let mut env = std::collections::HashMap::new();
-        env.extend(identity_env.iter().cloned());
-        env.extend(forward_env.iter().cloned());
-        let mut servers = std::collections::HashMap::new();
-        servers.insert("duduclaw".to_string(), McpServerDef {
-            command: abs_str.clone(),
-            args: vec!["mcp-server".to_string()],
-            env,
-        });
-        let config = McpConfig { mcp_servers: servers };
-        let json = serde_json::to_string_pretty(&config)
+    let mut env = serde_json::Map::new();
+    for (k, v) in identity_env.iter().chain(forward_env.iter()) {
+        env.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    let desired = serde_json::json!({
+        "command": abs_str,
+        "args": ["mcp-server"],
+        "env": serde_json::Value::Object(env),
+    });
+
+    with_mcp_config_lock(&path, || {
+        let (mut doc, created) = match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (serde_json::json!({ "mcpServers": {} }), true)
+            }
+            Err(e) => return Err(format!("Failed to inspect {}: {e}", path.display())),
+            Ok(m) if !m.file_type().is_file() => {
+                return Err(format!("{} is not a regular file", path.display()));
+            }
+            Ok(_) => {
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+                let doc: serde_json::Value = serde_json::from_str(&content)
+                    .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+                (doc, false)
+            }
+        };
+        let root = doc
+            .as_object_mut()
+            .ok_or_else(|| format!("{} is not a JSON object", path.display()))?;
+        let servers = root
+            .entry("mcpServers")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| format!("{}: mcpServers is not a JSON object", path.display()))?;
+
+        let mut targets: Vec<String> = owned_entry_names()
+            .into_iter()
+            .filter(|k| servers.contains_key(k))
+            .collect();
+        if targets.is_empty() {
+            targets.push("duduclaw".to_string());
+        }
+        // A key this process cannot supply must not be written away: an
+        // entry that carries the MCP API key while this process has none
+        // (the internal key not provisioned yet, a process without the
+        // gateway env) cannot be regenerated without breaking the server's
+        // authentication, so the file counts as unconfirmable.
+        let has_key_now = desired["env"].get(duduclaw_core::ENV_MCP_API_KEY).is_some();
+        if !has_key_now {
+            for key in &targets {
+                let had_key = servers
+                    .get(key)
+                    .and_then(|e| e.get("env"))
+                    .and_then(|e| e.get(duduclaw_core::ENV_MCP_API_KEY))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| !v.trim().is_empty());
+                if had_key {
+                    return Err(format!(
+                        "{}: the {key} entry carries {} but this process has no value for it; \
+                         not rewriting it",
+                        path.display(),
+                        duduclaw_core::ENV_MCP_API_KEY
+                    ));
+                }
+            }
+        }
+        let mut changed = created;
+        for key in &targets {
+            if servers.get(key) == Some(&desired) {
+                continue;
+            }
+            if let Some(old) = servers.get(key) {
+                let dropped: Vec<String> = old
+                    .get("env")
+                    .and_then(|e| e.as_object())
+                    .map(|e| {
+                        e.keys()
+                            .filter(|k| desired["env"].get(k.as_str()).is_none())
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !dropped.is_empty() {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        server = %key,
+                        dropped = ?dropped,
+                        "Removed env keys DuDuClaw does not write from its MCP server entry"
+                    );
+                }
+            }
+            servers.insert(key.clone(), desired.clone());
+            changed = true;
+        }
+        if !changed {
+            return Ok(false);
+        }
+        let json = serde_json::to_string_pretty(&doc)
             .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
-        std::fs::write(&path, &json)
-            .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
-        duduclaw_core::platform::set_owner_only(&path).ok();
+        write_owner_only_atomic(&path, json.as_bytes())?;
         info!(
             path = %path.display(),
             command = %abs_str,
             agent_id = %agent_id,
-            "Created .mcp.json with duduclaw server + agent identity"
+            "Repaired duduclaw MCP server entry (command, args, env regenerated)"
         );
-        return Ok(true);
-    }
+        Ok(true)
+    })
+}
 
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    let mut config: McpConfig = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
-
-    // Check if duduclaw / duduclaw-pro server needs any update (command
-    // path OR agent-id env var). Both entry names can appear in legacy
-    // installs; we migrate whichever one is present (or create a fresh
-    // `duduclaw` entry if neither is).
-    let legacy_keys = ["duduclaw", "duduclaw-pro"];
-    let target_key: String = legacy_keys
-        .iter()
-        .find(|k| config.mcp_servers.contains_key(**k))
-        .map(|k| (*k).to_string())
-        .unwrap_or_else(|| "duduclaw".to_string());
-
-    let needs_update = match config.mcp_servers.get(&target_key) {
-        None => true, // No duduclaw / duduclaw-pro entry at all — create one
-        Some(entry) => {
-            let cmd_path = std::path::Path::new(&entry.command);
-            let wrong_command = !cmd_path.is_absolute()
-                || !cmd_path.exists()
-                || entry.command != abs_str;
-            // Covers the identity token too: an install that enables
-            // `identity.key` after its agents were scaffolded shows up here as
-            // a missing pair and gets rewritten on the next startup sweep.
-            let missing_identity = identity_env
-                .iter()
-                .any(|(k, v)| entry.env.get(k) != Some(v));
-            let missing_forward = forward_env
-                .iter()
-                .any(|(k, v)| entry.env.get(k) != Some(v));
-            wrong_command || missing_identity || missing_forward
-        }
+/// Whether `agent_dir` is an employee directory this module repairs:
+/// `<home>/agents/<id>` (not `_` / `.` prefixed) or
+/// `<home>/agents/.ephemeral/<id>` (ephemeral employees and team role
+/// members).
+pub(crate) fn is_repairable_agent_dir(agent_dir: &Path) -> bool {
+    let Some(name) = agent_dir.file_name().and_then(|n| n.to_str()) else {
+        return false;
     };
-
-    if !needs_update {
-        return Ok(false);
+    if name.starts_with('_') || name.starts_with('.') {
+        return false;
     }
+    let Some(parent) = agent_dir.parent() else {
+        return false;
+    };
+    let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if parent_name.eq_ignore_ascii_case("agents") {
+        return true;
+    }
+    parent_name.eq_ignore_ascii_case(".ephemeral")
+        && parent
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("agents"))
+}
 
-    config
-        .mcp_servers
-        .entry(target_key.clone())
-        .and_modify(|e| {
-            e.command = abs_str.clone();
-            // Preserve other env vars; upsert the identity pair + forward set.
-            e.env.extend(identity_env.iter().cloned());
-            e.env.extend(forward_env.iter().cloned());
-        })
-        .or_insert_with(|| {
-            let mut env = std::collections::HashMap::new();
-            env.extend(identity_env.iter().cloned());
-            env.extend(forward_env.iter().cloned());
-            McpServerDef {
-                command: abs_str.clone(),
-                args: vec!["mcp-server".to_string()],
-                env,
+/// [`ensure_duduclaw_absolute_path`] for one working directory right before
+/// a spawn, so a `.mcp.json` changed since boot is repaired before the next
+/// Claude CLI reads it.
+///
+/// - `<home>/agents/<id>` or `<home>/agents/.ephemeral/<id>`: always
+///   confirmed. A missing directory is an error (the CLI would run with
+///   nothing confirmed); a failure is retried twice (50 ms apart) for
+///   transient IO, then returned.
+/// - Any other directory that holds an `agent.toml`: an error. It looks like
+///   an employee directory this module cannot place, so it is not passed on
+///   unchecked.
+/// - Any other directory: [`McpGateOutcome::NotApplicable`] with the reason.
+///
+/// [`McpGateOutcome::NotApplicable`]: crate::mcp_spawn_gate::McpGateOutcome::NotApplicable
+pub fn refresh_for_spawn(
+    agent_dir: &Path,
+) -> Result<crate::mcp_spawn_gate::McpGateOutcome, String> {
+    use crate::mcp_spawn_gate::McpGateOutcome;
+    if !is_repairable_agent_dir(agent_dir) {
+        if agent_dir.join("agent.toml").exists() {
+            return Err(format!(
+                "{} has an agent.toml but is not under <home>/agents/; its .mcp.json cannot be confirmed",
+                agent_dir.display()
+            ));
+        }
+        return Ok(McpGateOutcome::NotApplicable("not an employee directory"));
+    }
+    if !agent_dir.is_dir() {
+        return Err(format!("{} is not a directory", agent_dir.display()));
+    }
+    let mut last = String::new();
+    for attempt in 0..3 {
+        match ensure_duduclaw_absolute_path(agent_dir) {
+            Ok(_) => return Ok(McpGateOutcome::Confirmed),
+            Err(e) => last = e,
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    Err(last)
+}
+
+/// The spawn gate every Claude CLI spawn that hands an employee's
+/// `.mcp.json` to the CLI runs first: [`refresh_for_spawn`], and on failure
+/// an audit event ([`AUDIT_MCP_CONFIG_UNVERIFIED`], agent id and reason) plus
+/// an error for the caller to abort the spawn with (fail closed: the CLI
+/// would otherwise start every server listed in a file DuDuClaw could not
+/// confirm). The error starts with
+/// [`crate::mcp_spawn_gate::SPAWN_GATE_ERROR_PREFIX`]: spawn loops stop on it
+/// without booking it against the account, and
+/// [`crate::mcp_spawn_gate::spawn_gate_user_message`] gives the sentence to
+/// show a person.
+pub fn prepare_mcp_config_for_spawn(
+    agent_dir: &Path,
+) -> Result<crate::mcp_spawn_gate::McpGateOutcome, String> {
+    match refresh_for_spawn(agent_dir) {
+        Ok(outcome) => {
+            if let crate::mcp_spawn_gate::McpGateOutcome::NotApplicable(why) = &outcome {
+                tracing::debug!(dir = %agent_dir.display(), reason = %why, "MCP spawn gate not applicable");
             }
-        });
-
-    let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
-    duduclaw_core::platform::set_owner_only(&path).ok();
-
-    info!(
-        path = %path.display(),
-        command = %abs_str,
-        agent_id = %agent_id,
-        server = %target_key,
-        "Updated duduclaw MCP server (absolute path + agent identity)"
-    );
-    Ok(true)
+            Ok(outcome)
+        }
+        Err(reason) => {
+            let agent_id = agent_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let home = derive_home_from_agent_dir(agent_dir);
+            duduclaw_security::audit::append_audit_event(
+                &home,
+                &duduclaw_security::audit::AuditEvent::new(
+                    AUDIT_MCP_CONFIG_UNVERIFIED,
+                    &agent_id,
+                    duduclaw_security::audit::Severity::Warning,
+                    serde_json::json!({ "agent_id": agent_id, "reason": reason }),
+                ),
+            );
+            tracing::warn!(agent = %agent_id, %reason, "MCP config could not be confirmed; spawn refused");
+            Err(crate::mcp_spawn_gate::spawn_gate_error(&format!(
+                "員工 {agent_id} 的 MCP 設定（.mcp.json）無法確認，這次不啟動：{reason}。\
+                 請管理者檢查或修復這個檔案。"
+            )))
+        }
+    }
 }
 
 /// Scan all agent directories and fix relative `duduclaw` MCP server paths.
@@ -637,14 +796,27 @@ pub fn masked_env(
     env.iter().map(|(k, v)| (k.clone(), env_value_status(v))).collect()
 }
 
+/// [`write_owner_only_atomic`] for writers outside this module that already
+/// hold [`with_mcp_config_lock`] (the expert-pack merge).
+pub fn write_mcp_config_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_owner_only_atomic(path, bytes)
+}
+
 /// Write `bytes` to `path` atomically with owner-only permissions from the
 /// first byte: the temp file is restricted before anything is written, so a
 /// secret never sits world-readable between write and chmod.
 fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
 
-    let tmp_path = path.with_extension("json.tmp");
-    let _ = std::fs::remove_file(&tmp_path);
+    // Unpredictable temp name in the same directory: a fixed name could be
+    // pre-created by the employee (as a directory, a file or a link) and make
+    // every repair fail. `create_new` refuses an existing entry, links
+    // included.
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mcp.json".to_string());
+    let tmp_path = path.with_file_name(format!("{file_name}.{}.tmp", uuid::Uuid::new_v4().simple()));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -657,12 +829,16 @@ fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("Failed to create temp MCP config: {e}"))?;
     duduclaw_core::platform::set_owner_only(&tmp_path)
         .map_err(|e| format!("Failed to restrict temp MCP config: {e}"))?;
-    f.write_all(bytes)
-        .and_then(|_| f.sync_all())
-        .map_err(|e| format!("Failed to write temp MCP config: {e}"))?;
+    if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("Failed to write temp MCP config: {e}"));
+    }
     drop(f);
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| format!("Failed to rename temp MCP config: {e}"))?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("Failed to rename temp MCP config: {e}"));
+    }
     duduclaw_core::platform::set_owner_only(path).ok();
     Ok(())
 }
@@ -764,13 +940,13 @@ pub fn read_mcp_config(agent_dir: &Path) -> Result<McpConfig, String> {
 /// Writes atomically via temp file + rename.
 pub fn add_server_to_config(agent_dir: &Path, name: &str, def: &McpServerDef) -> Result<(), String> {
     let path = agent_dir.join(".mcp.json");
-    let mut config = read_mcp_config(agent_dir)?;
-    config.mcp_servers.insert(name.to_string(), def.clone());
-
-    let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
-
-    write_owner_only_atomic(&path, json.as_bytes())?;
+    with_mcp_config_lock(&path, || {
+        let mut config = read_mcp_config(agent_dir)?;
+        config.mcp_servers.insert(name.to_string(), def.clone());
+        let json = serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
+        write_owner_only_atomic(&path, json.as_bytes())
+    })?;
 
     info!(path = %path.display(), server = name, "MCP server added to config");
     Ok(())
@@ -780,16 +956,15 @@ pub fn add_server_to_config(agent_dir: &Path, name: &str, def: &McpServerDef) ->
 /// Returns an error if the server does not exist.
 pub fn remove_server_from_config(agent_dir: &Path, server_name: &str) -> Result<(), String> {
     let path = agent_dir.join(".mcp.json");
-    let mut config = read_mcp_config(agent_dir)?;
-
-    if config.mcp_servers.remove(server_name).is_none() {
-        return Err(format!("MCP server '{server_name}' not found in config"));
-    }
-
-    let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
-
-    write_owner_only_atomic(&path, json.as_bytes())?;
+    with_mcp_config_lock(&path, || {
+        let mut config = read_mcp_config(agent_dir)?;
+        if config.mcp_servers.remove(server_name).is_none() {
+            return Err(format!("MCP server '{server_name}' not found in config"));
+        }
+        let json = serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
+        write_owner_only_atomic(&path, json.as_bytes())
+    })?;
 
     info!(path = %path.display(), server = server_name, "MCP server removed from config");
     Ok(())
@@ -925,7 +1100,11 @@ mod tests {
         ensure_browserbase_in_config(dir.path(), "k1", "p1", "g1").unwrap();
         let cfg = read_mcp_config(dir.path()).unwrap();
         assert_eq!(cfg.mcp_servers["browserbase"].env["BROWSERBASE_API_KEY"], "k1");
-        assert!(!dir.path().join(".mcp.json.tmp").exists());
+        let tmp_left = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!tmp_left, "no temp file left behind");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1216,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_json_migration_preserves_other_env_vars() {
+    fn mcp_json_migration_drops_other_env_vars() {
         let _guard = lock_bin_env();
         let _bin = BinEnvOverride::new(&fake_bin_path());
 
@@ -1240,12 +1419,238 @@ mod tests {
 
         let got = read_mcp_json(&path);
         let env = &got["mcpServers"]["duduclaw"]["env"];
-        assert_eq!(env["FOO"].as_str(), Some("bar"), "FOO must survive migration");
-        assert_eq!(env["BAZ"].as_str(), Some("qux"), "BAZ must survive migration");
+        // F4 (2026-10-06): regenerated whole — was "must survive".
+        assert!(env.get("FOO").is_none(), "FOO must be dropped: {env}");
+        assert!(env.get("BAZ").is_none(), "BAZ must be dropped: {env}");
         assert_eq!(
             env["DUDUCLAW_AGENT_ID"].as_str(),
             Some("duduclaw-eng-agent"),
         );
+    }
+
+    /// `.mcp.json` platform fix: the duduclaw entry's env is regenerated to
+    /// what this module writes, and a second run with nothing to change does
+    /// not rewrite the file.
+    #[test]
+    fn mcp_json_rewrite_drops_unmanaged_duduclaw_env_and_is_idempotent() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("duduclaw-norm");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let path = agent_dir.join(".mcp.json");
+        write_json(&path, &serde_json::json!({
+            "mcpServers": {
+                "duduclaw": {
+                    "command": fake_bin_path().to_string_lossy(),
+                    "args": ["mcp-server"],
+                    "env": {
+                        "PATH": "/usr/bin",
+                        "DUDUCLAW_TURN_ID": "",
+                        "DUDUCLAW_SESSION_ID": "forged",
+                        "DUDUCLAW_UPSTREAM_UNKNOWN": "0"
+                    }
+                }
+            }
+        }));
+        assert!(ensure_duduclaw_absolute_path(&agent_dir).unwrap());
+        let env = read_mcp_json(&path)["mcpServers"]["duduclaw"]["env"].clone();
+        for k in ["DUDUCLAW_TURN_ID", "DUDUCLAW_SESSION_ID", "DUDUCLAW_UPSTREAM_UNKNOWN"] {
+            assert!(env.get(k).is_none(), "{k} must be removed: {env}");
+        }
+        // F4: a non-`DUDUCLAW_` key is dropped too (PATH, LD_PRELOAD, …).
+        assert!(env.get("PATH").is_none(), "{env}");
+        assert_eq!(env["DUDUCLAW_AGENT_ID"].as_str(), Some("duduclaw-norm"));
+
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!ensure_duduclaw_absolute_path(&agent_dir).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before);
+    }
+
+    #[test]
+    fn refresh_for_spawn_only_touches_canonical_agent_dirs() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        use crate::mcp_spawn_gate::McpGateOutcome;
+        assert!(matches!(refresh_for_spawn(&project).unwrap(), McpGateOutcome::NotApplicable(_)));
+        assert!(!project.join(".mcp.json").exists());
+        let eph = tmp.path().join("agents/.ephemeral/eph-1");
+        std::fs::create_dir_all(&eph).unwrap();
+        // F6: ephemeral employees and team role members are repaired too.
+        assert_eq!(refresh_for_spawn(&eph).unwrap(), McpGateOutcome::Confirmed);
+        assert!(eph.join(".mcp.json").is_file());
+        let trash = tmp.path().join("agents/_trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        assert!(matches!(refresh_for_spawn(&trash).unwrap(), McpGateOutcome::NotApplicable(_)));
+        let agent = tmp.path().join("agents/agnes");
+        std::fs::create_dir_all(&agent).unwrap();
+        assert_eq!(refresh_for_spawn(&agent).unwrap(), McpGateOutcome::Confirmed);
+        assert_eq!(refresh_for_spawn(&agent).unwrap(), McpGateOutcome::Confirmed);
+        // N4: an employee-shaped directory that does not exist is not passed
+        // on unchecked, and neither is a directory outside <home>/agents that
+        // holds an agent.toml.
+        assert!(refresh_for_spawn(&tmp.path().join("agents/ghost")).is_err());
+        let stray = tmp.path().join("elsewhere/agnes");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("agent.toml"), "[agent]\nname = \"agnes\"\n").unwrap();
+        assert!(refresh_for_spawn(&stray).is_err());
+    }
+
+    /// N4: a duduclaw binary path that is not absolute makes the file
+    /// unconfirmable (it used to return "nothing to do" and let the spawn go
+    /// ahead with whatever the file said).
+    #[test]
+    fn a_relative_binary_path_refuses_instead_of_skipping() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(std::path::Path::new("duduclaw"));
+        let tmp = TempDir::new().unwrap();
+        let agent = tmp.path().join("agents/agnes");
+        std::fs::create_dir_all(&agent).unwrap();
+        assert!(ensure_duduclaw_absolute_path(&agent).is_err());
+        let e = prepare_mcp_config_for_spawn(&agent).unwrap_err();
+        assert!(crate::mcp_spawn_gate::is_spawn_gate_error(&e), "{e}");
+    }
+
+    /// N1: a directory or file the employee creates under the old lock and
+    /// temp-file names in its own directory cannot block the repair: the lock
+    /// lives under `<home>/locks/` and the temp file name is unpredictable.
+    #[test]
+    fn decoys_in_the_employee_directory_do_not_block_the_repair() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+        let tmp = TempDir::new().unwrap();
+        let agent = tmp.path().join("agents/agnes");
+        std::fs::create_dir_all(agent.join(".mcp.json.lock")).unwrap();
+        std::fs::create_dir_all(agent.join(".mcp.json.tmp")).unwrap();
+        std::fs::write(agent.join("x.lock"), "decoy").unwrap();
+        assert_eq!(
+            prepare_mcp_config_for_spawn(&agent).unwrap(),
+            crate::mcp_spawn_gate::McpGateOutcome::Confirmed
+        );
+        assert!(agent.join(".mcp.json").is_file());
+        assert!(tmp.path().join("locks").is_dir(), "lock under <home>/locks");
+        let leftovers: Vec<_> = std::fs::read_dir(&agent)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp") && n != ".mcp.json.tmp")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// F4: `args` and other fields of the duduclaw entry are reset, and a
+    /// managed key this process has no value for (`DUDUCLAW_MCP_ALLOW_
+    /// UNAUTHENTICATED`) is not kept; another entry with fields this module
+    /// does not model (an HTTP server) is copied through untouched.
+    #[test]
+    fn mcp_json_entry_is_regenerated_whole_and_other_entries_kept_verbatim() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("agents/agnes");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let path = agent_dir.join(".mcp.json");
+        let http = serde_json::json!({ "type": "http", "url": "https://example.com/mcp" });
+        write_json(&path, &serde_json::json!({
+            "mcpServers": {
+                "duduclaw": {
+                    "command": fake_bin_path().to_string_lossy(),
+                    "args": ["mcp-server", "--extra"],
+                    "cwd": "/tmp",
+                    "env": { "DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED": "1" }
+                },
+                "remote": http.clone()
+            }
+        }));
+        // SAFETY: the bin-env lock serialises the env-mutating tests.
+        unsafe { std::env::remove_var("DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED") };
+        assert!(ensure_duduclaw_absolute_path(&agent_dir).unwrap());
+        let got = read_mcp_json(&path);
+        let entry = &got["mcpServers"]["duduclaw"];
+        assert_eq!(entry["args"], serde_json::json!(["mcp-server"]));
+        assert!(entry.get("cwd").is_none(), "{entry}");
+        assert!(entry["env"].get("DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED").is_none(), "{entry}");
+        assert_eq!(got["mcpServers"]["remote"], http);
+    }
+
+    /// F3: a `.mcp.json` that cannot be confirmed (a directory, invalid JSON)
+    /// fails the repair, and the spawn gate audits it and refuses.
+    #[test]
+    fn an_unconfirmable_mcp_json_refuses_the_spawn_and_is_audited() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let bad_json = home.join("agents/agnes");
+        std::fs::create_dir_all(&bad_json).unwrap();
+        std::fs::write(bad_json.join(".mcp.json"), "{not json").unwrap();
+        let as_dir = home.join("agents/bob");
+        std::fs::create_dir_all(as_dir.join(".mcp.json")).unwrap();
+        for dir in [&bad_json, &as_dir] {
+            assert!(ensure_duduclaw_absolute_path(dir).is_err());
+            let e = prepare_mcp_config_for_spawn(dir).unwrap_err();
+            assert!(e.contains("無法確認"), "{e}");
+        }
+        assert_eq!(std::fs::read_to_string(bad_json.join(".mcp.json")).unwrap(), "{not json");
+        let audit = std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap();
+        assert_eq!(audit.matches(AUDIT_MCP_CONFIG_UNVERIFIED).count(), 2, "{audit}");
+    }
+
+    /// An entry carrying the MCP API key is never rewritten by a process that
+    /// has no key: the repair refuses (nothing written) instead of dropping it.
+    #[test]
+    fn a_process_without_the_api_key_does_not_strip_it() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("agents/agnes");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let path = agent_dir.join(".mcp.json");
+        {
+            let _key = ApiKeyEnvOverride::set("ddc_prod_33333333333333333333333333333333");
+            assert!(ensure_duduclaw_absolute_path(&agent_dir).unwrap());
+        }
+        let before = std::fs::read(&path).unwrap();
+        if duduclaw_core::mcp_forward_env_vars()
+            .iter()
+            .any(|(k, _)| k == duduclaw_core::ENV_MCP_API_KEY)
+        {
+            // An internal key is provisioned in this test process; the case
+            // under test cannot be set up here.
+            return;
+        }
+        let e = ensure_duduclaw_absolute_path(&agent_dir).unwrap_err();
+        assert!(e.contains(duduclaw_core::ENV_MCP_API_KEY), "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(prepare_mcp_config_for_spawn(&agent_dir).is_err());
+    }
+
+    /// F9: the approved-install writer goes through the shared lock and keeps
+    /// the duduclaw entry; the repair afterwards keeps the new server.
+    #[test]
+    fn add_server_then_repair_keeps_both_entries() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("agents/agnes");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        assert!(ensure_duduclaw_absolute_path(&agent_dir).unwrap());
+        let def = McpServerDef {
+            command: "npx".into(),
+            args: vec!["-y".into(), "@playwright/mcp".into()],
+            env: Default::default(),
+        };
+        add_server_to_config(&agent_dir, "playwright", &def).unwrap();
+        ensure_duduclaw_absolute_path(&agent_dir).unwrap();
+        let got = read_mcp_json(&agent_dir.join(".mcp.json"));
+        assert!(got["mcpServers"].get("playwright").is_some());
+        assert!(got["mcpServers"].get("duduclaw").is_some());
     }
 
     #[test]
@@ -1439,7 +1844,9 @@ mod tests {
             &token
         ));
         assert_eq!(env["DUDUCLAW_AGENT_ID"].as_str(), Some("sales-rep"));
-        assert_eq!(env["FOO"].as_str(), Some("bar"), "foreign env var preserved");
+        // F4 (2026-10-06): the entry is regenerated whole, so a foreign var
+        // does not survive (it could be LD_PRELOAD as easily as FOO).
+        assert!(env.get("FOO").is_none(), "foreign env var dropped: {env}");
 
         // Idempotent once the fresh key is in place.
         assert!(!ensure_duduclaw_absolute_path(&agent_dir).unwrap());

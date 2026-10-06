@@ -68,7 +68,20 @@ const STRICT_EXTRA_PATTERNS: &[&str] = &[
 /// the MCP identity block, or unregister the hook itself — all by promotion.
 /// The parent's own copies stay untouched; branches still read them, because
 /// materializing a branch uses [`CopyPolicy::fork_default`].
-const AGENT_DIR_EXTRA_ROOT_ENTRIES: &[&str] = &[".claude"];
+///
+/// The other runtimes' configuration directories (`.agents/` holds the
+/// Antigravity MCP file, `.codex/`, `.gemini/`, `.grok/`) and `.claude.json`
+/// are excluded at the root for the same reason (N3): the CLI loads them at
+/// the next spawn.
+const AGENT_DIR_EXTRA_ROOT_ENTRIES: &[&str] =
+    &[".claude", ".claude.json", ".agents", ".codex", ".gemini", ".grok"];
+
+/// Names never promoted into an employee directory at **any** depth (N2/N3):
+/// a project cloned inside the employee directory is a place the CLI starts
+/// too, and it loads `.claude/`, `.claude.json` and `.mcp.json` from there.
+/// The agent-file-guard hook refuses an employee writing these; promotion
+/// runs outside the hook, so it must refuse them itself.
+const AGENT_DIR_CLI_CONFIG_ANY_DEPTH: &[&str] = &[".claude", ".claude.json", ".mcp.json"];
 
 /// Counts of what a copy did, for logging and tests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -143,6 +156,18 @@ impl CopyPolicy {
             .iter()
             .chain(AGENT_DIR_EXTRA_ROOT_ENTRIES)
             .fold(Self::fork_default(), |policy, name| policy.with_excluded_path(name))
+            .with_any_depth_cli_config()
+    }
+
+    /// This policy plus [`AGENT_DIR_CLI_CONFIG_ANY_DEPTH`] as name patterns
+    /// (matched at every depth, case-insensitively).
+    fn with_any_depth_cli_config(mut self) -> Self {
+        for name in AGENT_DIR_CLI_CONFIG_ANY_DEPTH {
+            if !self.exclude.iter().any(|p| p.as_str() == *name) {
+                self.exclude.push((*name).to_string());
+            }
+        }
+        self
     }
 
     /// Promotion policy chosen by what the parent workspace is:
@@ -152,9 +177,11 @@ impl CopyPolicy {
     /// - an ancestor of `<home>/agents` (the DuDuClaw home itself, or a
     ///   directory above it) → [`Self::fork_default`] plus the whole agents
     ///   tree, since any path below it would land in some agent's directory;
-    /// - any other directory (an ordinary project, a subdirectory of an agent
-    ///   directory) → [`Self::fork_default`], so a project file that happens to
-    ///   be named `CLAUDE.md` or `agent.toml` is promoted normally;
+    /// - a subdirectory of an agent directory → [`Self::fork_default`] plus
+    ///   [`AGENT_DIR_CLI_CONFIG_ANY_DEPTH`] (`.claude/`, `.claude.json`,
+    ///   `.mcp.json` at any depth), so a project file named `CLAUDE.md` or
+    ///   `agent.toml` is promoted normally but CLI configuration is not;
+    /// - any other directory (an ordinary project) → [`Self::fork_default`];
     /// - `<home>/agents` itself or `<home>/agents/.ephemeral` → nothing is
     ///   promoted (every child is an agent directory);
     /// - undeterminable (the parent cannot be canonicalized, or `<home>/agents`
@@ -162,6 +189,7 @@ impl CopyPolicy {
     pub fn promote_for_parent(parent: &Path, home: &Path) -> Self {
         match classify_parent(parent, home) {
             ParentKind::Project => Self::fork_default(),
+            ParentKind::InsideAgentDir => Self::fork_default().with_any_depth_cli_config(),
             ParentKind::AgentsAncestor(rel) => Self::fork_default().with_excluded_path(&rel),
             ParentKind::AgentDir | ParentKind::Unknown => Self::promote_default(),
             // Every child of the agents root is some agent's directory; there
@@ -436,6 +464,8 @@ enum ParentKind {
     AgentsRoot,
     /// Ancestor of `<home>/agents`; carries the `/`-joined relative path to it.
     AgentsAncestor(String),
+    /// A directory below an agent directory (a project inside it).
+    InsideAgentDir,
     Project,
     Unknown,
 }
@@ -467,8 +497,14 @@ fn classify_parent(parent: &Path, home: &Path) -> ParentKind {
             [eph] if eph == ".ephemeral" => ParentKind::AgentsRoot,
             [id] if !id.starts_with('.') => ParentKind::AgentDir,
             [eph, id] if eph == ".ephemeral" && !id.starts_with('.') => ParentKind::AgentDir,
-            // A subdirectory of an agent directory (or of `.ephemeral`): its
-            // root is not the agent root.
+            // A subdirectory of an agent directory: its root is not the
+            // agent root, but the CLI still starts there.
+            [id, _, ..] if !id.starts_with('.') => ParentKind::InsideAgentDir,
+            [eph, id, _, ..] if eph == ".ephemeral" && !id.starts_with('.') => {
+                ParentKind::InsideAgentDir
+            }
+            // Anything else below the agents root (`_trash/…`, other dot
+            // directories): not an agent root.
             _ => ParentKind::Project,
         };
     }
@@ -721,10 +757,57 @@ mod tests {
         policy.copy_tree(branch.path(), &project).unwrap();
         assert_eq!(fs::read_to_string(project.join("CLAUDE.md")).unwrap(), "branch");
         assert!(project.join(".claude/settings.json").is_file());
-        // A subdirectory of an agent directory is not the agent root either.
+        // A subdirectory of an agent directory is not the agent root either,
+        // but CLI configuration is not promoted into it (N2/N3).
         let sub = home.path().join("agents/a1/work");
         fs::create_dir_all(&sub).unwrap();
-        assert_eq!(CopyPolicy::promote_for_parent(&sub, home.path()), CopyPolicy::fork_default());
+        let sub_policy = CopyPolicy::promote_for_parent(&sub, home.path());
+        assert_eq!(sub_policy, CopyPolicy::fork_default().with_any_depth_cli_config());
+        sub_policy.copy_tree(branch.path(), &sub).unwrap();
+        assert_eq!(fs::read_to_string(sub.join("CLAUDE.md")).unwrap(), "branch");
+        assert!(!sub.join(".claude").exists());
+        assert!(!sub.join(".mcp.json").exists());
+    }
+
+    /// N3: the other runtimes' configuration directories and `.claude.json`
+    /// are not promoted into an agent directory, and `.claude/`,
+    /// `.claude.json` and `.mcp.json` are not promoted at any depth.
+    #[test]
+    fn promotion_never_carries_cli_configuration_into_an_agent_directory() {
+        let (home, agent, _) = home_layout();
+        let branch = tempfile::tempdir().unwrap();
+        for dir in [".agents", ".codex", ".gemini", ".grok", "project/.claude/commands", "a/b/.claude"] {
+            fs::create_dir_all(branch.path().join(dir)).unwrap();
+        }
+        for file in [
+            ".agents/mcp_config.json",
+            ".codex/config.toml",
+            ".gemini/settings.json",
+            ".grok/config.toml",
+            ".claude.json",
+            ".CLAUDE.JSON",
+            "project/.claude/commands/x.md",
+            "project/.mcp.json",
+            "project/.claude.json",
+            "a/b/.claude/x.md",
+            "project/readme.md",
+        ] {
+            fs::write(branch.path().join(file), "branch").unwrap();
+        }
+        let policy = CopyPolicy::promote_for_parent(&agent, home.path());
+        assert_eq!(policy, CopyPolicy::promote_default());
+        policy.copy_tree(branch.path(), &agent).unwrap();
+        for gone in [
+            ".agents", ".codex", ".gemini", ".grok", ".claude.json", ".CLAUDE.JSON",
+            "project/.claude", "project/.mcp.json", "project/.claude.json", "a/b/.claude",
+        ] {
+            assert!(!agent.join(gone).exists(), "{gone}");
+        }
+        assert_eq!(fs::read_to_string(agent.join("project/readme.md")).unwrap(), "branch");
+        // A branch is still materialized with them (fork_default).
+        let d = CopyPolicy::fork_default();
+        assert!(!d.is_excluded(OsStr::new(".codex")));
+        assert!(!d.is_excluded(OsStr::new(".mcp.json")));
     }
 
     #[test]
