@@ -375,3 +375,22 @@ fn every_known_agent_toml_section_is_frozen_or_listed_editable() {
         }
     }
 }
+
+/// P2-C §8.2: an employee cannot switch its own computer-use workspace on
+/// (the `[capabilities.computer_use_config]` sub-table is part of the frozen
+/// `[capabilities]` table).
+#[test]
+fn an_employee_cannot_turn_its_own_workspace_switch_on() {
+    let before = with("[capabilities]\ncomputer_use = true\n[capabilities.computer_use_config]\nworkspace = false");
+    let after = before.replace("workspace = false", "workspace = true");
+    assert!(matches!(
+        as_agent(&before, &after),
+        GuardDecision::BlockedProtectedField { .. }
+    ));
+    let added = with("[capabilities]\ncomputer_use = true\n[capabilities.computer_use_config]\nworkspace = true");
+    let without = with("[capabilities]\ncomputer_use = true");
+    assert!(matches!(
+        as_agent(&without, &added),
+        GuardDecision::BlockedProtectedField { .. }
+    ));
+}

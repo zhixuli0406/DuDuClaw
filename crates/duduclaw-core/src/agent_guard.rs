@@ -206,7 +206,8 @@ pub enum GuardDecision {
         reason: String,
     },
     /// An AI employee (or an unverified caller) ran an operator-only
-    /// command from Bash, e.g. `duduclaw ops channel-ingress`. Same
+    /// command from Bash, e.g. `duduclaw ops channel-ingress` or
+    /// `duduclaw ops computer-workspaces`. Same
     /// level as [`Self::BlockedReservedAgentName`]: a speed bump on the Bash
     /// lane; the command itself also refuses when DuDuClaw identity
     /// variables are present.
@@ -355,7 +356,10 @@ impl GuardDecision {
                     "duduclaw ops channel-ingress" => {
                         "需要結案或重新執行 LINE 收件事件，請由管理者在儀表板處理。"
                     }
-                    _ => "需要凍結、撤銷或刪除電腦操作工作區，請由管理者在儀表板處理。",
+                    "duduclaw ops computer-workspaces" => {
+                        "需要凍結、撤銷或刪除電腦操作工作區，請由管理者在儀表板處理。"
+                    }
+                    _ => "這項操作請由管理者處理。",
                 }
             )),
             Self::BlockedUnresolvablePath { attempted_path, reason } => Some(format!(

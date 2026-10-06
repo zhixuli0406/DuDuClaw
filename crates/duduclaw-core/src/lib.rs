@@ -1389,3 +1389,6 @@ pub mod effort;
 pub mod role_model_matrix;
 
 pub mod workflow_mcp;
+
+/// Shared hash of computer-use workspace paths (gateway and MCP audits).
+pub mod workspace_path;
