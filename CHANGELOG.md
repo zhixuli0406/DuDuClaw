@@ -32,6 +32,7 @@
 
 - LINE 收件匣：路由與授權快照補上之前，worker 不會領取該事件；讀不到快照時退避重試，連續 5 次或沒有快照的事件超過 5 分鐘就隔離成 `snapshot_unavailable`（可 `retry`，重試時以當下設定補快照），不再默默採用之後的設定。LINE 重送的 webhook（`deliveryContext.isRedelivery`）不再拿 reply token 去試，直接照 `line_late_reply` 處理；回覆期限從本機收件時間與事件 `timestamp` 較早者起算。Reply API 回 400 `Invalid reply token` 時，設為 `"push"` 重驗後改用 Push，設為 `"fail"` 記 `reply_token_invalid`。送出前重驗暫時讀不到時，約七秒內重讀數次，仍讀不到記 `revalidation_unavailable`，不再記成授權已變更。路由員工的 `agent.toml` 不存在視為已變更（`agent_removed`），不再退避。憑證讀不到而隔離時也會告警。裝置還原的標記改在搬動任何資料前寫入，寫不進去就中止還原；還原時 `failed_before_dispatch` 與可重試原因的 `quarantined` 也一併暫停。指令列等待中的核准卡在事件狀態變動時撤回重建，不再原地改寫。Bash 通道比對 `duduclaw ops channel-ingress` 改用 org_field_guard 的 shell 解析（換行續行、引號拼接、黏字重導向），比對函式抽成共用的 `duduclaw_core::bash_operator_command_decision`。
 ### Changed
+- **Gemini CLI runtime 的移除時間由 v1.70.0 再延到 v1.71.0**（runtime id `gemini`，仍是棄用狀態，行為不變）：v1.69.1 修正後用真的 Gemini 金鑰重驗 Antigravity 的步驟還沒做，移除等重驗完成。`duduclaw doctor` 與 `runtime.detect` 顯示的移除版本同步改為 v1.71.0。
 - 工作流程草稿不再要求停止條件（沒有任何地方執行它）；介面把「需要的工具」標明為只對照工具清單的上限估計。審查與草稿相關 RPC 的錯誤改回傳封閉代碼 `{code, message}`，不再回傳伺服器內部文字。移除沒有呼叫端的對話訊息草稿卡片。
 - `policy_revision` 改為只雜湊授權相關的已解析欄位（實際生效的 `[capabilities]`／`[permissions]`／`[agent]` 上級部門角色、`CONTRACT.toml`、職務範本綁定、`org.toml` 本人與上級、`config.toml` 的 `[delegation]`／`[acp]`／`[provenance]`／`[integrations]`、`KILLSWITCH.toml`）；改通道 token、即時監控來源或記錄等級不再讓待審卡片與已啟用工作流程失效。升級後所有既有 revision 值都會變一次：待審的綁定卡片需重新送出，已啟用的工作流程第一次執行時會進入暫停，需以新版本重新核准。
 - 已啟用工作流程遇到上述權限變動時，啟用進入 `suspended`：當次執行擋下、不再開新執行、排程關閉，動態牆與管理員通知列出變動類別；恢復需新版本重新核准。啟用後來源任務與產物的變更不再擋下執行。

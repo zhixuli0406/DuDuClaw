@@ -155,7 +155,7 @@ Discovery runs on six runtime families under the same guarantees: the attempt wo
 |---|---|---|---|---|
 | Claude | `claude` | Native `--max-turns` | `--tools` and `--allowedTools` | `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` |
 | Codex | `codex` | Counted by the gateway | MCP, web, multi-agent, hooks, plugins and memory switched off through `-c` overrides | `OPENAI_API_KEY` (also passed as `CODEX_API_KEY`), or a credential document |
-| Gemini (deprecated in v1.67.0, removed in v1.70.0; use Antigravity, see [deprecations](../guides/deprecations.md#gemini-cli-runtime)) | `gemini` | Native `maxSessionTurns` | `tools.core` allowlist | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
+| Gemini (deprecated in v1.67.0, removed in v1.71.0; use Antigravity, see [deprecations](../guides/deprecations.md#gemini-cli-runtime)) | `gemini` | Native `maxSessionTurns` | `tools.core` allowlist | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
 | Antigravity (`antigravity`, alias `agy`) | `antigravity` | Counted by the gateway | A `PreToolUse` hook denies every tool outside the file/shell set | `GEMINI_API_KEY` or `GOOGLE_API_KEY` only |
 | Grok | `grok` | Native `--max-turns` | `--tools`, `--disallowed-tools`, `--disable-web-search`, `--no-subagents`, `--no-plan` | `XAI_API_KEY`, or a credential document |
 | OpenAI-compatible (`openai-compat`, alias `openai_compat`) | `openai-compat` | The adapter's own loop | The adapter exposes file and shell tools only | The configured provider's key; also needs configured `base_url` |

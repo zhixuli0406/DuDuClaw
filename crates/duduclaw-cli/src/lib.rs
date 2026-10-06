@@ -12345,7 +12345,7 @@ mod deprecated_runtime_doctor_tests {
         assert_eq!(f.len(), 2, "{f:?}");
         assert!(f[0].starts_with("a: [runtime] provider = \"gemini\""), "{f:?}");
         assert!(f[1].starts_with("b: [runtime] fallback = \"gemini\""), "{f:?}");
-        assert!(f.iter().all(|l| l.contains("antigravity") && l.contains("v1.70.0")));
+        assert!(f.iter().all(|l| l.contains("antigravity") && l.contains("v1.71.0")));
     }
 
     #[tokio::test]
@@ -12376,7 +12376,7 @@ mod deprecated_runtime_doctor_tests {
     fn agent_create_notice_only_for_deprecated_runtimes() {
         use duduclaw_core::types::RuntimeType;
         let n = runtime_deprecation_notice(RuntimeType::Gemini).expect("gemini warns");
-        assert!(n.contains("antigravity") && n.contains("v1.70.0"), "{n}");
+        assert!(n.contains("antigravity") && n.contains("v1.71.0"), "{n}");
         assert!(runtime_deprecation_notice(RuntimeType::Antigravity).is_none());
         assert!(runtime_deprecation_notice(RuntimeType::Claude).is_none());
         // Still accepted by the strict parser.
