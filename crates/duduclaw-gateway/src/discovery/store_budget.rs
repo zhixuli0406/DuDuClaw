@@ -112,4 +112,57 @@ mod private_database_tests {
         std::fs::hard_link(&original, &linked).unwrap();
         assert!(DiscoveryStore::open_path(&linked).is_err(), "multiple names invalidate the private file authority");
     }
+
+    /// Whether some process other than the caller's child holds a lock on
+    /// SQLite's SHARED byte range of `path`. Asked from a forked child,
+    /// because POSIX locks are per process: only another process sees them.
+    fn shared_range_locked_by_parent(path: &std::path::Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the child only calls async-signal-safe functions (open,
+        // fcntl, _exit) before exiting.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY);
+                if fd < 0 { libc::_exit(2); }
+                let mut lock: libc::flock = std::mem::zeroed();
+                lock.l_type = libc::F_WRLCK as _;
+                lock.l_whence = libc::SEEK_SET as _;
+                lock.l_start = 0x4000_0002; // PENDING_BYTE + 2: SQLite SHARED range
+                lock.l_len = 510;
+                if libc::fcntl(fd, libc::F_GETLK, &mut lock) != 0 { libc::_exit(2); }
+                let unlocked = i32::from(lock.l_type) == i32::from(libc::F_UNLCK);
+                libc::_exit(if unlocked { 1 } else { 0 });
+            }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "lock probe child crashed");
+        match libc::WEXITSTATUS(status) {
+            0 => true,
+            1 => false,
+            _ => panic!("lock probe child could not inspect the database"),
+        }
+    }
+
+    /// Opening a second store on the same database must not strip the SQLite
+    /// locks a live store in this process holds: closing any descriptor on
+    /// the file drops all of this process's POSIX locks on it.
+    #[test]
+    fn opening_a_second_store_keeps_the_live_stores_sqlite_locks() {
+        let home = tempfile::tempdir().unwrap();
+        let live = DiscoveryStore::open(home.path()).unwrap();
+        let _: i64 = live.conn.query_row("SELECT count(*) FROM discovery_runs", [], |r| r.get(0)).unwrap();
+        let db = live.db_path().to_path_buf();
+        assert!(shared_range_locked_by_parent(&db), "a WAL connection holds its SHARED lock between reads");
+        drop(DiscoveryStore::open(home.path()).unwrap());
+        drop(open_budget_connection_for_test(home.path()));
+        assert!(shared_range_locked_by_parent(&db), "a later open in this process dropped the live store's lock");
+    }
+
+    fn open_budget_connection_for_test(home: &std::path::Path) -> rusqlite::Connection {
+        super::super::private_connection(&home.join(super::super::DB_FILE)).unwrap()
+    }
 }
