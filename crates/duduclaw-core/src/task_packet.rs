@@ -1701,3 +1701,23 @@ mod tests {
         assert!(!p.components().any(|c| c.as_os_str() == ".."));
     }
 }
+
+/// Audience narrows a separately established task ACL. Empty constraints inherit
+/// that ACL; they never grant access without it. Keys must be host derived.
+pub fn audience_allows(task_acl_allowed:bool,audience:&[String],trusted_keys:&[String])->bool {
+    task_acl_allowed && (audience.is_empty() || audience.iter().any(|key|trusted_keys.contains(key)))
+}
+#[cfg(test)]
+mod workflow_audience_tests {
+    use super::audience_allows;
+    #[test]
+    fn audience_requires_task_acl_and_exact_host_keys() {
+        let keys=vec!["user:alice".into(),"role:manager".into(),"channel:dashboard".into()];
+        assert!(!audience_allows(false,&[],&keys));
+        assert!(audience_allows(true,&[],&keys));
+        assert!(audience_allows(true,&["user:alice".into()],&keys));
+        assert!(!audience_allows(true,&["alice".into()],&keys));
+        assert!(!audience_allows(true,&["user:alic".into()],&keys));
+        assert!(!audience_allows(false,&["role:manager".into()],&keys));
+    }
+}

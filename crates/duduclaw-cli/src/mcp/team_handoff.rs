@@ -473,6 +473,10 @@ pub(crate) async fn handle_team_handoff(args: &Value, home_dir: &Path, default_a
         }
     };
 
+    // Who may see the task before this packet (F3 follow-up): a packet that
+    // first limits people is recorded on the Activity Feed and audit log.
+    let audience_before =
+        duduclaw_gateway::review_evidence::audience::task_audience(home_dir, &packet.goal_id);
     let write_canonical = canonical.clone();
     let write_id = packet.packet_id.clone();
     let write_bytes = bytes.clone();
@@ -539,6 +543,16 @@ pub(crate) async fn handle_team_handoff(args: &Value, home_dir: &Path, default_a
             }),
         ),
     );
+
+    duduclaw_gateway::review_evidence::audience::record_audience_restriction(
+        home_dir,
+        &packet.goal_id,
+        &audience_before,
+        packet.round,
+        &packet.from_role.to_string(),
+        &caller,
+    )
+    .await;
 
     tool_text(
         &serde_json::json!({ "ok": true, "path": relative, "bytes": bytes.len() }).to_string(),

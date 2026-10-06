@@ -65,7 +65,10 @@ fn token(home: &std::path::Path, agent: &str) -> String {
 }
 
 fn unix_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn fresh_nonce() -> String {
@@ -85,7 +88,8 @@ fn signed(
 ) -> HeaderMap {
     let tok = tok.unwrap_or_else(|| token(home, agent));
     let ts = ts.unwrap_or_else(unix_now).to_string();
-    let sig = duduclaw_core::internal_request_signature(key.as_bytes(), agent, &tok, &ts, nonce, body);
+    let sig =
+        duduclaw_core::internal_request_signature(key.as_bytes(), agent, &tok, &ts, nonce, body);
     let mut h = HeaderMap::new();
     h.insert(auth::AGENT_ID_HEADER, agent.parse().unwrap());
     h.insert(auth::TIMESTAMP_HEADER, ts.parse().unwrap());
@@ -120,6 +124,7 @@ struct FakeState {
     last_config: Mutex<Option<ComputerUseConfig>>,
     /// What `screenshot` reports as the full-mask reason.
     full_mask: Mutex<Option<FullMaskReason>>,
+    frame: Mutex<Option<String>>,
 }
 
 struct FakeBackend {
@@ -131,7 +136,9 @@ struct FakeBackend {
 impl SessionBackend for FakeBackend {
     async fn start(&mut self) -> Result<(), ComputerUseError> {
         if self.state.fail_start.load(Ordering::SeqCst) {
-            return Err(ComputerUseError::ApiError("docker said: secret /path".into()));
+            return Err(ComputerUseError::ApiError(
+                "docker said: secret /path".into(),
+            ));
         }
         self.state.starts.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -148,7 +155,7 @@ impl SessionBackend for FakeBackend {
     }
     async fn screenshot(&self) -> Result<MaskedScreenshot, ComputerUseError> {
         Ok(MaskedScreenshot {
-            png_base64: tiny_png_b64(),
+            png_base64: self.state.frame.lock().unwrap().clone().unwrap_or_else(tiny_png_b64),
             full_mask: *self.state.full_mask.lock().unwrap(),
         })
     }
@@ -207,19 +214,35 @@ fn tiny_png_b64() -> String {
 }
 
 fn fake_factory(state: Arc<FakeState>) -> BackendFactory {
-    Arc::new(move |_agent: &str, _home: &std::path::Path, cfg: ComputerUseConfig| {
-        *state.last_config.lock().unwrap() = Some(cfg);
-        Box::new(FakeBackend { state: Arc::clone(&state), control: Arc::new(OrchestratorControl::new()) })
-            as Box<dyn SessionBackend>
-    })
+    Arc::new(
+        move |_agent: &str, _home: &std::path::Path, cfg: ComputerUseConfig| {
+            *state.last_config.lock().unwrap() = Some(cfg);
+            Box::new(FakeBackend {
+                state: Arc::clone(&state),
+                control: Arc::new(OrchestratorControl::new()),
+            }) as Box<dyn SessionBackend>
+        },
+    )
 }
 
 /// Confirmation targets for tests: turn `yes` answers yes, `no` answers no,
 /// `slow` never answers within the test; anything else has no live turn.
-struct FakeConfirmers(Arc<AtomicU32>);
+struct FakeConfirmers(Arc<AtomicU32>, PathBuf);
 
 #[async_trait]
 impl ConfirmerResolver for FakeConfirmers {
+    async fn context(
+        &self,
+        _agent_id: &str,
+        turn_id: &str,
+    ) -> Option<crate::approval::DecisionContext> {
+        matches!(turn_id, "yes" | "no" | "slow").then(|| crate::approval::DecisionContext {
+            channel: "line".into(),
+            account_id: "test-bot".into(),
+            conversation_id: "human".into(),
+            principal_id: "human".into(),
+        })
+    }
     async fn resolve(&self, _agent_id: &str, turn_id: &str) -> Option<Box<dyn ChannelSender>> {
         let answer = match turn_id {
             "yes" => Some(true),
@@ -227,7 +250,11 @@ impl ConfirmerResolver for FakeConfirmers {
             "slow" => None,
             _ => return None,
         };
-        Some(Box::new(FakeConfirmer(answer, Arc::clone(&self.0))))
+        Some(Box::new(FakeConfirmer(
+            answer,
+            Arc::clone(&self.0),
+            self.1.clone(),
+        )))
     }
 }
 
@@ -241,9 +268,10 @@ fn manager_asking(
     idle: Duration,
     asked: Arc<AtomicU32>,
 ) -> ComputerUseSessions {
-    let mut mgr = ComputerUseSessions::with_parts(home.to_path_buf(), fake_factory(Arc::clone(state)), idle)
-        .with_confirmers(Arc::new(FakeConfirmers(asked)))
-        .with_resolver(Arc::new(FakeResolver));
+    let mut mgr =
+        ComputerUseSessions::with_parts(home.to_path_buf(), fake_factory(Arc::clone(state)), idle)
+            .with_confirmers(Arc::new(FakeConfirmers(asked, home.to_path_buf())))
+            .with_resolver(Arc::new(FakeResolver));
     mgr.approval_ttl_secs = 5;
     mgr.approval_poll = Duration::from_millis(20);
     mgr
@@ -279,11 +307,29 @@ fn insert_session(
 }
 
 /// A confirmer answering `Some(answer)` at once, or never (`None`).
-struct FakeConfirmer(Option<bool>, Arc<AtomicU32>);
+struct FakeConfirmer(Option<bool>, Arc<AtomicU32>, PathBuf);
 
 #[async_trait]
 impl ChannelSender for FakeConfirmer {
-    async fn send_text(&self, _text: &str) -> Result<(), ChannelSendError> {
+    async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
+        self.1.fetch_add(1, Ordering::SeqCst);
+        if let Some(answer) = self.0 {
+            let id = text
+                .lines()
+                .find_map(|l| l.strip_prefix("同意：確認 "))
+                .unwrap();
+            let ctx = crate::approval::DecisionContext {
+                channel: "line".into(),
+                account_id: "test-bot".into(),
+                conversation_id: "human".into(),
+                principal_id: "human".into(),
+            };
+            let command = format!("{} {id}", if answer { "確認" } else { "取消" });
+            crate::decision_notify::route_bound_text(&self.2, &ctx, &command)
+                .await
+                .unwrap()
+                .unwrap();
+        }
         Ok(())
     }
     async fn send_photo(&self, _png: &[u8], _caption: &str) -> Result<(), ChannelSendError> {
@@ -310,11 +356,18 @@ impl ChannelSender for FakeConfirmer {
 }
 
 fn click(x: i64, y: i64) -> ActionRequest {
-    ActionRequest::Click { x, y, button: None, double: None }
+    ActionRequest::Click {
+        x,
+        y,
+        button: None,
+        double: None,
+    }
 }
 
 fn typed(text: &str) -> ActionRequest {
-    ActionRequest::Type { text: text.to_string() }
+    ActionRequest::Type {
+        text: text.to_string(),
+    }
 }
 
 // ── authentication ───────────────────────────────────────────────────────
@@ -333,7 +386,15 @@ fn authentication_accepts_a_correct_signature_from_loopback() {
     let mapped: SocketAddr = "[::ffff:127.0.0.1]:5".parse().unwrap();
     assert!(auth::authenticate(h, mapped, &headers(h, "alice", BODY), BODY, now).is_ok());
     // A clock difference inside the window is accepted.
-    let skewed = signed(h, INTERNAL_KEY, "alice", None, Some(now - 59), &fresh_nonce(), BODY);
+    let skewed = signed(
+        h,
+        INTERNAL_KEY,
+        "alice",
+        None,
+        Some(now - 59),
+        &fresh_nonce(),
+        BODY,
+    );
     assert!(auth::authenticate(h, loopback(), &skewed, BODY, now).is_ok());
 }
 
@@ -350,38 +411,112 @@ fn authentication_refuses_each_check_on_its_own() {
     bad_nonce.insert(auth::NONCE_HEADER, "NOT-HEX".parse().unwrap());
     let cases: Vec<(SocketAddr, HeaderMap, &[u8], AuthFailure)> = vec![
         // A non-loopback peer with a perfect signature.
-        (lan, headers(h, "alice", BODY), BODY, AuthFailure::NotLoopback),
+        (
+            lan,
+            headers(h, "alice", BODY),
+            BODY,
+            AuthFailure::NotLoopback,
+        ),
         (loopback(), missing, BODY, AuthFailure::MissingHeaders),
-        (loopback(), HeaderMap::new(), BODY, AuthFailure::MissingHeaders),
-        (loopback(), bad_nonce, BODY, AuthFailure::MalformedHeaders),
-        // Signed with another client's valid key / a made-up key.
-        (loopback(), signed(h, EXTERNAL_KEY, "alice", None, None, &nonce, BODY), BODY, AuthFailure::BadSignature),
         (
             loopback(),
-            signed(h, "ddc_prod_00000000000000000000000000000000", "alice", None, None, &nonce, BODY),
+            HeaderMap::new(),
+            BODY,
+            AuthFailure::MissingHeaders,
+        ),
+        (loopback(), bad_nonce, BODY, AuthFailure::MalformedHeaders),
+        // Signed with another client's valid key / a made-up key.
+        (
+            loopback(),
+            signed(h, EXTERNAL_KEY, "alice", None, None, &nonce, BODY),
+            BODY,
+            AuthFailure::BadSignature,
+        ),
+        (
+            loopback(),
+            signed(
+                h,
+                "ddc_prod_00000000000000000000000000000000",
+                "alice",
+                None,
+                None,
+                &nonce,
+                BODY,
+            ),
             BODY,
             AuthFailure::BadSignature,
         ),
         // Someone else's identity token, or a guessed one.
-        (loopback(), signed(h, INTERNAL_KEY, "alice", Some(token(h, "bob")), None, &nonce, BODY), BODY, AuthFailure::BadSignature),
-        (loopback(), signed(h, INTERNAL_KEY, "alice", Some("00".into()), None, &nonce, BODY), BODY, AuthFailure::BadSignature),
+        (
+            loopback(),
+            signed(
+                h,
+                INTERNAL_KEY,
+                "alice",
+                Some(token(h, "bob")),
+                None,
+                &nonce,
+                BODY,
+            ),
+            BODY,
+            AuthFailure::BadSignature,
+        ),
+        (
+            loopback(),
+            signed(
+                h,
+                INTERNAL_KEY,
+                "alice",
+                Some("00".into()),
+                None,
+                &nonce,
+                BODY,
+            ),
+            BODY,
+            AuthFailure::BadSignature,
+        ),
         // The body is covered: a different body fails.
-        (loopback(), headers(h, "alice", BODY), br#"{"op":"stop"}"#, AuthFailure::BadSignature),
+        (
+            loopback(),
+            headers(h, "alice", BODY),
+            br#"{"op":"stop"}"#,
+            AuthFailure::BadSignature,
+        ),
         // Too old / too far ahead.
-        (loopback(), signed(h, INTERNAL_KEY, "alice", None, Some(now - 61), &nonce, BODY), BODY, AuthFailure::StaleTimestamp),
-        (loopback(), signed(h, INTERNAL_KEY, "alice", None, Some(now + 61), &nonce, BODY), BODY, AuthFailure::StaleTimestamp),
+        (
+            loopback(),
+            signed(h, INTERNAL_KEY, "alice", None, Some(now - 61), &nonce, BODY),
+            BODY,
+            AuthFailure::StaleTimestamp,
+        ),
+        (
+            loopback(),
+            signed(h, INTERNAL_KEY, "alice", None, Some(now + 61), &nonce, BODY),
+            BODY,
+            AuthFailure::StaleTimestamp,
+        ),
     ];
     for (i, (peer, hdrs, body, want)) in cases.into_iter().enumerate() {
-        assert_eq!(auth::authenticate(h, peer, &hdrs, body, now), Err(want), "case {i}");
+        assert_eq!(
+            auth::authenticate(h, peer, &hdrs, body, now),
+            Err(want),
+            "case {i}"
+        );
     }
     // A bad agent id is refused before any use.
     let mut bad_id = headers(h, "alice", BODY);
     bad_id.insert(auth::AGENT_ID_HEADER, "../x".parse().unwrap());
-    assert_eq!(auth::authenticate(h, loopback(), &bad_id, BODY, now), Err(AuthFailure::InvalidAgentId));
+    assert_eq!(
+        auth::authenticate(h, loopback(), &bad_id, BODY, now),
+        Err(AuthFailure::InvalidAgentId)
+    );
     // A forwarded header never turns a LAN peer into a local one.
     let mut fwd = headers(h, "alice", BODY);
     fwd.insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
-    assert_eq!(auth::authenticate(h, lan, &fwd, BODY, now), Err(AuthFailure::NotLoopback));
+    assert_eq!(
+        auth::authenticate(h, lan, &fwd, BODY, now),
+        Err(AuthFailure::NotLoopback)
+    );
 }
 
 #[test]
@@ -390,12 +525,18 @@ fn authentication_fails_closed_without_an_identity_key_or_an_internal_key() {
     let h = tmp.path();
     let good = headers(h, "alice", BODY);
     std::fs::remove_file(duduclaw_core::identity_key_path(h)).unwrap();
-    assert_eq!(auth::authenticate(h, loopback(), &good, BODY, unix_now()), Err(AuthFailure::NoIdentityKey));
+    assert_eq!(
+        auth::authenticate(h, loopback(), &good, BODY, unix_now()),
+        Err(AuthFailure::NoIdentityKey)
+    );
     let tmp = home();
     let h = tmp.path();
     let good = headers(h, "alice", BODY);
     std::fs::write(h.join("config.toml"), "").unwrap();
-    assert_eq!(auth::authenticate(h, loopback(), &good, BODY, unix_now()), Err(AuthFailure::BadSignature));
+    assert_eq!(
+        auth::authenticate(h, loopback(), &good, BODY, unix_now()),
+        Err(AuthFailure::BadSignature)
+    );
 }
 
 #[test]
@@ -403,9 +544,15 @@ fn a_nonce_is_accepted_once_within_the_window() {
     let guard = ReplayGuard::default();
     let t0 = Instant::now();
     assert!(guard.record("aa", t0));
-    assert!(!guard.record("aa", t0 + Duration::from_secs(1)), "replay refused");
+    assert!(
+        !guard.record("aa", t0 + Duration::from_secs(1)),
+        "replay refused"
+    );
     assert!(guard.record("bb", t0));
-    assert!(guard.record("aa", t0 + auth::NONCE_WINDOW), "forgotten after the window");
+    assert!(
+        guard.record("aa", t0 + auth::NONCE_WINDOW),
+        "forgotten after the window"
+    );
 }
 
 #[test]
@@ -416,7 +563,10 @@ fn rate_limit_is_per_employee_and_slides() {
         assert!(limiter.allow("alice", t0));
     }
     assert!(!limiter.allow("alice", t0));
-    assert!(limiter.allow("bob", t0), "another employee has their own window");
+    assert!(
+        limiter.allow("bob", t0),
+        "another employee has their own window"
+    );
     assert!(limiter.allow("alice", t0 + Duration::from_secs(61)));
 }
 
@@ -427,15 +577,44 @@ fn end_reason_orders_stop_threat_deadline_idle() {
     let t = Instant::now();
     let later = t + Duration::from_secs(1000);
     let idle = Duration::from_secs(120);
-    assert_eq!(end_reason(t, later, t, idle, false, ThreatLevel::Green), None);
-    assert_eq!(end_reason(t, later, t, idle, true, ThreatLevel::Red), Some(EndReason::Stopped));
-    assert_eq!(end_reason(t, later, t, idle, false, ThreatLevel::Red), Some(EndReason::ThreatRed));
-    assert_eq!(end_reason(later, later, later, idle, false, ThreatLevel::Yellow), Some(EndReason::Deadline));
     assert_eq!(
-        end_reason(t + Duration::from_secs(121), later, t, idle, false, ThreatLevel::Green),
+        end_reason(t, later, t, idle, false, ThreatLevel::Green),
+        None
+    );
+    assert_eq!(
+        end_reason(t, later, t, idle, true, ThreatLevel::Red),
+        Some(EndReason::Stopped)
+    );
+    assert_eq!(
+        end_reason(t, later, t, idle, false, ThreatLevel::Red),
+        Some(EndReason::ThreatRed)
+    );
+    assert_eq!(
+        end_reason(later, later, later, idle, false, ThreatLevel::Yellow),
+        Some(EndReason::Deadline)
+    );
+    assert_eq!(
+        end_reason(
+            t + Duration::from_secs(121),
+            later,
+            t,
+            idle,
+            false,
+            ThreatLevel::Green
+        ),
         Some(EndReason::Idle)
     );
-    assert_eq!(end_reason(t + Duration::from_secs(119), later, t, idle, false, ThreatLevel::Green), None);
+    assert_eq!(
+        end_reason(
+            t + Duration::from_secs(119),
+            later,
+            t,
+            idle,
+            false,
+            ThreatLevel::Green
+        ),
+        None
+    );
 }
 
 // ── parameter validation ────────────────────────────────────────────────
@@ -443,27 +622,64 @@ fn end_reason_orders_stop_threat_deadline_idle() {
 #[test]
 fn action_parameters_are_validated() {
     let ok = |r: &ActionRequest| actions::to_action(r, 1280, 800);
-    assert_eq!(ok(&click(0, 0)).unwrap(), ComputerAction::LeftClick { coordinate: [0, 0] });
     assert_eq!(
-        ok(&ActionRequest::Click { x: 5, y: 6, button: Some("left".into()), double: Some(true) }).unwrap(),
+        ok(&click(0, 0)).unwrap(),
+        ComputerAction::LeftClick { coordinate: [0, 0] }
+    );
+    assert_eq!(
+        ok(&ActionRequest::Click {
+            x: 5,
+            y: 6,
+            button: Some("left".into()),
+            double: Some(true)
+        })
+        .unwrap(),
         ComputerAction::DoubleClick { coordinate: [5, 6] }
     );
     assert_eq!(
-        ok(&ActionRequest::Click { x: 5, y: 6, button: Some("right".into()), double: None }).unwrap(),
+        ok(&ActionRequest::Click {
+            x: 5,
+            y: 6,
+            button: Some("right".into()),
+            double: None
+        })
+        .unwrap(),
         ComputerAction::RightClick { coordinate: [5, 6] }
     );
     for bad in [
         click(1280, 0),
         click(0, 800),
         click(-1, 5),
-        ActionRequest::Click { x: 1, y: 1, button: Some("middle".into()), double: None },
+        ActionRequest::Click {
+            x: 1,
+            y: 1,
+            button: Some("middle".into()),
+            double: None,
+        },
         typed(""),
         typed(&"字".repeat(actions::MAX_TYPE_CHARS + 1)),
-        ActionRequest::Key { key: "--window 0 ctrl+c".into() },
+        ActionRequest::Key {
+            key: "--window 0 ctrl+c".into(),
+        },
         ActionRequest::Key { key: "".into() },
-        ActionRequest::Scroll { x: 1, y: 1, direction: Some("left".into()), amount: None },
-        ActionRequest::Scroll { x: 1, y: 1, direction: None, amount: Some(0) },
-        ActionRequest::Scroll { x: 1, y: 1, direction: None, amount: Some(21) },
+        ActionRequest::Scroll {
+            x: 1,
+            y: 1,
+            direction: Some("left".into()),
+            amount: None,
+        },
+        ActionRequest::Scroll {
+            x: 1,
+            y: 1,
+            direction: None,
+            amount: Some(0),
+        },
+        ActionRequest::Scroll {
+            x: 1,
+            y: 1,
+            direction: None,
+            amount: Some(21),
+        },
     ] {
         let err = ok(&bad).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidAction, "{bad:?}");
@@ -471,26 +687,62 @@ fn action_parameters_are_validated() {
     // 2,000 CJK characters are fine (characters, not bytes).
     assert!(ok(&typed(&"字".repeat(actions::MAX_TYPE_CHARS))).is_ok());
     assert_eq!(
-        ok(&ActionRequest::Scroll { x: 1, y: 1, direction: None, amount: None }).unwrap(),
-        ComputerAction::Scroll { coordinate: [1, 1], direction: "down".into(), amount: 3 }
+        ok(&ActionRequest::Scroll {
+            x: 1,
+            y: 1,
+            direction: None,
+            amount: None
+        })
+        .unwrap(),
+        ComputerAction::Scroll {
+            coordinate: [1, 1],
+            direction: "down".into(),
+            amount: 3
+        }
     );
     // The invalid key is refused, never replaced by Escape.
-    assert!(ok(&ActionRequest::Key { key: "ctrl+s".into() }).is_ok());
+    assert!(
+        ok(&ActionRequest::Key {
+            key: "ctrl+s".into()
+        })
+        .is_ok()
+    );
 }
 
 #[test]
 fn risk_gate_covers_execute_confirm_and_refuse() {
-    assert_eq!(actions::risk_gate(RiskLevel::Low, false, false, false), Gate::Execute);
-    assert_eq!(actions::risk_gate(RiskLevel::Medium, false, false, false), Gate::Execute);
-    assert_eq!(actions::risk_gate(RiskLevel::High, false, true, false), Gate::Execute);
-    assert_eq!(actions::risk_gate(RiskLevel::High, false, false, true), Gate::Confirm);
+    assert_eq!(
+        actions::risk_gate(RiskLevel::Low, false, false, false),
+        Gate::Execute
+    );
+    assert_eq!(
+        actions::risk_gate(RiskLevel::Medium, false, false, false),
+        Gate::Execute
+    );
+    assert_eq!(
+        actions::risk_gate(RiskLevel::High, false, true, false),
+        Gate::Execute
+    );
+    assert_eq!(
+        actions::risk_gate(RiskLevel::High, false, false, true),
+        Gate::Confirm
+    );
     let refused = |g: Gate| match g {
         Gate::Refuse(e) => e.code,
         other => panic!("expected refusal, got {other:?}"),
     };
-    assert_eq!(refused(actions::risk_gate(RiskLevel::High, false, false, false)), ErrorCode::ConfirmationRequired);
-    assert_eq!(refused(actions::risk_gate(RiskLevel::Blocked, false, true, true)), ErrorCode::Blocked);
-    assert_eq!(refused(actions::risk_gate(RiskLevel::Low, true, true, true)), ErrorCode::Blocked);
+    assert_eq!(
+        refused(actions::risk_gate(RiskLevel::High, false, false, false)),
+        ErrorCode::ConfirmationRequired
+    );
+    assert_eq!(
+        refused(actions::risk_gate(RiskLevel::Blocked, false, true, true)),
+        ErrorCode::Blocked
+    );
+    assert_eq!(
+        refused(actions::risk_gate(RiskLevel::Low, true, true, true)),
+        ErrorCode::Blocked
+    );
 }
 
 // ── sweep decisions ─────────────────────────────────────────────────────
@@ -528,18 +780,43 @@ fn sweep_listing_and_removal_decisions() {
 #[tokio::test]
 async fn start_refuses_disabled_and_native_employees_and_a_second_session() {
     let tmp = home();
-    write_agent(tmp.path(), "carol", "[capabilities]\ncomputer_use = false\n");
-    write_agent(tmp.path(), "dave", "[capabilities]\ncomputer_use = true\ncomputer_use_mode = \"native\"\n");
+    write_agent(
+        tmp.path(),
+        "carol",
+        "[capabilities]\ncomputer_use = false\n",
+    );
+    write_agent(
+        tmp.path(),
+        "dave",
+        "[capabilities]\ncomputer_use = true\ncomputer_use_mode = \"native\"\n",
+    );
     let state = Arc::new(FakeState::default());
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
     let code = |r: Result<Value, OpError>| r.unwrap_err().code;
-    assert_eq!(code(mgr.start("carol", StartRequest::default()).await), ErrorCode::CapabilityDisabled);
-    assert_eq!(code(mgr.start("nobody", StartRequest::default()).await), ErrorCode::CapabilityDisabled);
-    let native = mgr.start("dave", StartRequest::default()).await.unwrap_err();
+    assert_eq!(
+        code(mgr.start("carol", StartRequest::default()).await),
+        ErrorCode::CapabilityDisabled
+    );
+    assert_eq!(
+        code(mgr.start("nobody", StartRequest::default()).await),
+        ErrorCode::CapabilityDisabled
+    );
+    let native = mgr
+        .start("dave", StartRequest::default())
+        .await
+        .unwrap_err();
     assert_eq!(native.code, ErrorCode::NativeUnsupported);
     // The removed mode is named, with the fix; no container was started for it.
-    assert!(native.message.contains("已移除") && native.message.contains("\"container\""), "{}", native.message);
-    assert_eq!(state.starts.load(Ordering::SeqCst), 0, "no container for a refused employee");
+    assert!(
+        native.message.contains("已移除") && native.message.contains("\"container\""),
+        "{}",
+        native.message
+    );
+    assert_eq!(
+        state.starts.load(Ordering::SeqCst),
+        0,
+        "no container for a refused employee"
+    );
 
     let started = mgr.start("alice", StartRequest::default()).await.unwrap();
     assert_eq!(started["ok"], true);
@@ -547,12 +824,24 @@ async fn start_refuses_disabled_and_native_employees_and_a_second_session() {
     assert_eq!(started["max_actions"], 50);
     assert_eq!(started["confirmation_channel"], false);
     let first = started["session_id"].as_str().unwrap().to_string();
-    let again = mgr.start("alice", StartRequest::default()).await.unwrap_err();
+    let again = mgr
+        .start("alice", StartRequest::default())
+        .await
+        .unwrap_err();
     assert_eq!(again.code, ErrorCode::SessionExists);
     assert!(again.message.contains(&first), "{}", again.message);
     // Display size bounds.
     assert_eq!(
-        code(mgr.start("bob", StartRequest { width: Some(100), ..Default::default() }).await),
+        code(
+            mgr.start(
+                "bob",
+                StartRequest {
+                    width: Some(100),
+                    ..Default::default()
+                }
+            )
+            .await
+        ),
         ErrorCode::BadRequest
     );
 }
@@ -563,11 +852,22 @@ async fn a_failed_start_is_operator_safe_and_leaves_nothing() {
     let state = Arc::new(FakeState::default());
     state.fail_start.store(true, Ordering::SeqCst);
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
-    let err = mgr.start("alice", StartRequest::default()).await.unwrap_err();
+    let err = mgr
+        .start("alice", StartRequest::default())
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::StartFailed);
-    assert!(!err.message.contains("secret") && !err.message.contains("/path"), "{}", err.message);
+    assert!(
+        !err.message.contains("secret") && !err.message.contains("/path"),
+        "{}",
+        err.message
+    );
     assert!(mgr.is_empty());
-    assert_eq!(state.stops.load(Ordering::SeqCst), 1, "a half-started container is cleaned up");
+    assert_eq!(
+        state.stops.load(Ordering::SeqCst),
+        1,
+        "a half-started container is cleaned up"
+    );
 }
 
 #[tokio::test]
@@ -577,13 +877,34 @@ async fn only_the_owner_can_see_or_drive_a_session() {
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
     let id = insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
 
-    assert_eq!(mgr.screenshot("bob", None).await.unwrap_err().code, ErrorCode::NotFound);
-    assert_eq!(mgr.screenshot("bob", Some(&id)).await.unwrap_err().code, ErrorCode::NotFound);
-    assert_eq!(mgr.action("bob", Some(&id), None, &click(1, 1)).await.unwrap_err().code, ErrorCode::NotFound);
-    assert_eq!(mgr.stop("bob", Some(&id)).await.unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(
+        mgr.screenshot("bob", None).await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        mgr.screenshot("bob", Some(&id)).await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        mgr.action("bob", Some(&id), None, &click(1, 1))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        mgr.stop("bob", Some(&id)).await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
     assert_eq!(mgr.status("bob").await["active"], false);
     // A wrong session id is "not found" for the owner too.
-    assert_eq!(mgr.screenshot("alice", Some("cu-other")).await.unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(
+        mgr.screenshot("alice", Some("cu-other"))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
 
     let shot = mgr.screenshot("alice", Some(&id)).await.unwrap();
     assert_eq!(shot["png_base64"], tiny_png_b64());
@@ -594,7 +915,10 @@ async fn only_the_owner_can_see_or_drive_a_session() {
     assert_eq!(stopped["session_id"], id.as_str());
     assert_eq!(state.stops.load(Ordering::SeqCst), 1);
     assert!(mgr.is_empty());
-    assert_eq!(mgr.screenshot("alice", None).await.unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(
+        mgr.screenshot("alice", None).await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
 }
 
 /// A fully masked screenshot says so, with its closed reason code, in the
@@ -618,7 +942,10 @@ async fn a_fully_masked_screenshot_carries_its_reason_to_the_response_and_audit(
     }
     *state.full_mask.lock().unwrap() = None;
     let shot = mgr.screenshot("alice", None).await.unwrap();
-    assert_eq!((shot["fully_masked"].clone(), shot["mask_reason"].clone()), (json!(false), Value::Null));
+    assert_eq!(
+        (shot["fully_masked"].clone(), shot["mask_reason"].clone()),
+        (json!(false), Value::Null)
+    );
 
     let rows: Vec<Value> = BrowserAuditLog::new(tmp.path(), AUDIT_RETENTION_DAYS)
         .entries_for_agent("alice", 1000)
@@ -630,7 +957,13 @@ async fn a_fully_masked_screenshot_carries_its_reason_to_the_response_and_audit(
     let reasons: Vec<Value> = rows.iter().map(|d| d["mask_reason"].clone()).collect();
     assert_eq!(
         reasons,
-        vec![json!("helper_failed"), json!("several_pages"), json!("title_sensitive"), json!("title_unreadable"), Value::Null]
+        vec![
+            json!("helper_failed"),
+            json!("several_pages"),
+            json!("title_sensitive"),
+            json!("title_unreadable"),
+            Value::Null
+        ]
     );
     assert_eq!(rows.iter().filter(|d| d["fully_masked"] == true).count(), 4);
 }
@@ -640,13 +973,21 @@ async fn the_action_budget_is_enforced_and_the_session_survives_it() {
     let tmp = home();
     let state = Arc::new(FakeState::default());
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
-    let cfg = ComputerUseConfig { max_actions: 2, ..Default::default() };
+    let cfg = ComputerUseConfig {
+        max_actions: 2,
+        ..Default::default()
+    };
     insert_session(&mgr, &state, "alice", cfg);
     let first = mgr.action("alice", None, None, &click(1, 1)).await.unwrap();
     assert_eq!(first["actions_used"], 1);
     assert_eq!(first["actions_remaining"], 1);
-    mgr.action("alice", None, None, &typed("hello")).await.unwrap();
-    let err = mgr.action("alice", None, None, &click(1, 1)).await.unwrap_err();
+    mgr.action("alice", None, None, &typed("hello"))
+        .await
+        .unwrap();
+    let err = mgr
+        .action("alice", None, None, &click(1, 1))
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::ActionLimit);
     assert_eq!(state.executed.lock().unwrap().len(), 2);
     // Screenshots and stop still work.
@@ -654,7 +995,10 @@ async fn the_action_budget_is_enforced_and_the_session_survives_it() {
     assert!(mgr.stop("alice", None).await.is_ok());
     // Invalid parameters never reach the backend nor count.
     insert_session(&mgr, &state, "bob", ComputerUseConfig::default());
-    let bad = mgr.action("bob", None, None, &click(5000, 1)).await.unwrap_err();
+    let bad = mgr
+        .action("bob", None, None, &click(5000, 1))
+        .await
+        .unwrap_err();
     assert_eq!(bad.code, ErrorCode::InvalidAction);
     assert_eq!(mgr.status("bob").await["actions_used"], 0);
 }
@@ -666,7 +1010,10 @@ async fn deadline_and_idle_end_the_session_on_the_next_op_and_in_the_reaper() {
     let mgr = manager(tmp.path(), &state, Duration::from_millis(50));
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     tokio::time::sleep(Duration::from_millis(80)).await;
-    let err = mgr.action("alice", None, None, &click(1, 1)).await.unwrap_err();
+    let err = mgr
+        .action("alice", None, None, &click(1, 1))
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::SessionEnded);
     assert!(mgr.is_empty());
     assert_eq!(state.stops.load(Ordering::SeqCst), 1);
@@ -698,15 +1045,34 @@ async fn emergency_stop_flag_and_threat_levels_are_honoured() {
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     // The chat emergency stop sets `stopped` on the control handle.
-    mgr.lookup("alice").unwrap().lock().await.backend.control().stopped.store(true, Ordering::SeqCst);
+    mgr.lookup("alice")
+        .unwrap()
+        .lock()
+        .await
+        .backend
+        .control()
+        .stopped
+        .store(true, Ordering::SeqCst);
     assert_eq!(mgr.reap_once().await, 1);
 
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     std::fs::write(tmp.path().join("threat_level"), "YELLOW\n").unwrap();
-    assert_eq!(mgr.action("alice", None, None, &click(1, 1)).await.unwrap_err().code, ErrorCode::Paused);
-    assert!(mgr.screenshot("alice", None).await.is_ok(), "YELLOW still allows screenshots");
+    assert_eq!(
+        mgr.action("alice", None, None, &click(1, 1))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Paused
+    );
+    assert!(
+        mgr.screenshot("alice", None).await.is_ok(),
+        "YELLOW still allows screenshots"
+    );
     std::fs::write(tmp.path().join("threat_level"), "RED\n").unwrap();
-    assert_eq!(mgr.screenshot("alice", None).await.unwrap_err().code, ErrorCode::SessionEnded);
+    assert_eq!(
+        mgr.screenshot("alice", None).await.unwrap_err().code,
+        ErrorCode::SessionEnded
+    );
     assert!(mgr.is_empty());
 }
 
@@ -716,8 +1082,15 @@ async fn revoking_the_capability_ends_the_session() {
     let state = Arc::new(FakeState::default());
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
-    write_agent(tmp.path(), "alice", "[capabilities]\ncomputer_use = false\n");
-    assert_eq!(mgr.screenshot("alice", None).await.unwrap_err().code, ErrorCode::SessionEnded);
+    write_agent(
+        tmp.path(),
+        "alice",
+        "[capabilities]\ncomputer_use = false\n",
+    );
+    assert_eq!(
+        mgr.screenshot("alice", None).await.unwrap_err().code,
+        ErrorCode::SessionEnded
+    );
     assert!(mgr.is_empty());
 }
 
@@ -731,17 +1104,32 @@ async fn risk_paths_block_confirm_or_refuse() {
     // Blocked: the focused window is a terminal (default blocked_actions).
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     *state.title.lock().unwrap() = Some(Ok("bash - Terminal".into()));
-    assert_eq!(mgr.action("alice", None, Some("yes"), &click(1, 1)).await.unwrap_err().code, ErrorCode::Blocked);
+    assert_eq!(
+        mgr.action("alice", None, Some("yes"), &click(1, 1))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Blocked
+    );
 
     // Unreadable title: fail closed.
     *state.title.lock().unwrap() = Some(Err("probe timed out".into()));
-    assert_eq!(mgr.action("alice", None, None, &click(1, 1)).await.unwrap_err().code, ErrorCode::WindowUnreadable);
+    assert_eq!(
+        mgr.action("alice", None, None, &click(1, 1))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::WindowUnreadable
+    );
 
     // High (typing into a password manager) with no live turn: refused.
     *state.title.lock().unwrap() = Some(Ok("Bitwarden".into()));
     for turn in [None, Some("not-a-live-turn")] {
         assert_eq!(
-            mgr.action("alice", None, turn, &typed("hunter2")).await.unwrap_err().code,
+            mgr.action("alice", None, turn, &typed("hunter2"))
+                .await
+                .unwrap_err()
+                .code,
             ErrorCode::ConfirmationRequired
         );
     }
@@ -749,34 +1137,64 @@ async fn risk_paths_block_confirm_or_refuse() {
 
     // High with a live turn: a "no" refuses, a "yes" executes.
     assert_eq!(
-        mgr.action("alice", None, Some("no"), &typed("hunter2")).await.unwrap_err().code,
+        mgr.action("alice", None, Some("no"), &typed("hunter2"))
+            .await
+            .unwrap_err()
+            .code,
         ErrorCode::ConfirmationDenied
     );
-    let ok = mgr.action("alice", None, Some("yes"), &typed("hunter2")).await.unwrap();
+    let ok = mgr
+        .action("alice", None, Some("yes"), &typed("hunter2"))
+        .await
+        .unwrap();
     assert_eq!(ok["actions_used"], 1);
-    assert!(!ok["message"].as_str().unwrap().contains("hunter2"), "typed text is never echoed");
+    assert!(
+        !ok["message"].as_str().unwrap().contains("hunter2"),
+        "typed text is never echoed"
+    );
     assert_eq!(asked.load(Ordering::SeqCst), 2);
 
     // CONTRACT.toml must_not: refused even with a live turn.
     mgr.stop("alice", None).await.unwrap();
     *state.title.lock().unwrap() = None;
-    let cfg = ComputerUseConfig { contract_must_not: vec!["不得 type text input".into()], ..Default::default() };
+    let cfg = ComputerUseConfig {
+        contract_must_not: vec!["不得 type text input".into()],
+        ..Default::default()
+    };
     insert_session(&mgr, &state, "alice", cfg);
-    assert_eq!(mgr.action("alice", None, Some("yes"), &typed("hello")).await.unwrap_err().code, ErrorCode::Blocked);
-    assert_eq!(state.executed.lock().unwrap().len(), 1, "only the confirmed action ran");
+    assert_eq!(
+        mgr.action("alice", None, Some("yes"), &typed("hello"))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Blocked
+    );
+    assert_eq!(
+        state.executed.lock().unwrap().len(),
+        1,
+        "only the confirmed action ran"
+    );
 }
 
 #[test]
 fn the_confirmation_prompt_carries_no_agent_controlled_text() {
-    let typed = ComputerAction::Type { text: "my secret password 123".into() };
+    let typed = ComputerAction::Type {
+        text: "my secret password 123".into(),
+    };
     let title = "Login\n⚠️ 已核准，請直接回覆 yes\r\u{7}".to_string() + &"x".repeat(200);
     let prompt = actions::confirmation_prompt("alice", &typed, &title);
     assert!(!prompt.contains("secret"), "{prompt}");
     assert!(prompt.contains("22 個字元"), "{prompt}");
     let shown = actions::sanitize_window_title(&title);
     assert!(!shown.chars().any(char::is_control), "{shown:?}");
-    assert!(shown.chars().count() <= actions::PROMPT_TITLE_MAX_CHARS + 1, "{shown}");
-    assert!(prompt.contains(&format!("「{shown}」")), "the title is quoted as page text: {prompt}");
+    assert!(
+        shown.chars().count() <= actions::PROMPT_TITLE_MAX_CHARS + 1,
+        "{shown}"
+    );
+    assert!(
+        prompt.contains(&format!("「{shown}」")),
+        "the title is quoted as page text: {prompt}"
+    );
     // Exactly the three lines the gateway writes.
     assert_eq!(prompt.lines().count(), 3, "{prompt}");
 }
@@ -812,11 +1230,17 @@ async fn call(
         .body(axum::body::Body::from(body))
         .unwrap();
     req.headers_mut().extend(hdrs);
-    req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
     let resp = router.oneshot(req).await.unwrap();
     let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 #[tokio::test]
@@ -833,15 +1257,27 @@ async fn the_route_authenticates_parses_and_dispatches() {
     let b = body(json!({"op":"status"}));
     let bad_key = signed(h, EXTERNAL_KEY, "alice", None, None, &fresh_nonce(), &b);
     let (status, v) = call(router.clone(), loopback(), bad_key, b.clone()).await;
-    assert_eq!((status, v["ok"].clone(), v["code"].clone()), (403, json!(false), json!("unauthorized")));
+    assert_eq!(
+        (status, v["ok"].clone(), v["code"].clone()),
+        (403, json!(false), json!("unauthorized"))
+    );
     let (hdrs, b) = as_agent("alice", body(json!({"op":"status"})));
     let (status, _) = call(router.clone(), "10.0.0.2:1".parse().unwrap(), hdrs, b).await;
     assert_eq!(status, 403);
     // The old bearer scheme alone gets nothing.
     let mut bearer = HeaderMap::new();
-    bearer.insert("authorization", format!("Bearer {INTERNAL_KEY}").parse().unwrap());
+    bearer.insert(
+        "authorization",
+        format!("Bearer {INTERNAL_KEY}").parse().unwrap(),
+    );
     bearer.insert(auth::AGENT_ID_HEADER, "alice".parse().unwrap());
-    let (status, v) = call(router.clone(), loopback(), bearer, body(json!({"op":"status"}))).await;
+    let (status, v) = call(
+        router.clone(),
+        loopback(),
+        bearer,
+        body(json!({"op":"status"})),
+    )
+    .await;
     assert_eq!((status, v["code"].clone()), (403, json!("unauthorized")));
     // A replayed request (same nonce and signature) is refused.
     let (hdrs, b) = as_agent("alice", body(json!({"op":"status"})));
@@ -859,7 +1295,10 @@ async fn the_route_authenticates_parses_and_dispatches() {
     assert_eq!((status, v["code"].clone()), (400, json!("bad_request")));
     let (hdrs, b) = as_agent("alice", vec![b' '; http::MAX_BODY_BYTES + 10]);
     let (status, v) = call(router.clone(), loopback(), hdrs, b).await;
-    assert_eq!((status, v["code"].clone()), (413, json!("payload_too_large")));
+    assert_eq!(
+        (status, v["code"].clone()),
+        (413, json!("payload_too_large"))
+    );
     // A caller-named chat is not even a field any more; a bad turn id is refused.
     let (hdrs, b) = as_agent("alice", body(json!({"op":"start","turn_id":"a\nb"})));
     let (status, v) = call(router.clone(), loopback(), hdrs, b).await;
@@ -869,21 +1308,36 @@ async fn the_route_authenticates_parses_and_dispatches() {
     let (hdrs, b) = as_agent("alice", body(json!({"op":"status"})));
     let (status, v) = call(router.clone(), loopback(), hdrs, b).await;
     assert_eq!((status, v["active"].clone()), (200, json!(false)));
-    let (hdrs, b) = as_agent("alice", body(json!({"op":"start","task":"t","reply_channel":"telegram:666"})));
+    let (hdrs, b) = as_agent(
+        "alice",
+        body(json!({"op":"start","task":"t","reply_channel":"telegram:666"})),
+    );
     let (status, v) = call(router.clone(), loopback(), hdrs, b).await;
     assert_eq!(status, 200, "{v}");
-    assert_eq!(v["confirmation_channel"], false, "a reply_channel in the body is ignored");
+    assert_eq!(
+        v["confirmation_channel"], false,
+        "a reply_channel in the body is ignored"
+    );
     let sid = v["session_id"].as_str().unwrap().to_string();
-    let (hdrs, b) = as_agent("alice", body(json!({"op":"action","action":{"type":"click","x":10,"y":20}})));
+    let (hdrs, b) = as_agent(
+        "alice",
+        body(json!({"op":"action","action":{"type":"click","x":10,"y":20}})),
+    );
     let (status, v) = call(router.clone(), loopback(), hdrs, b).await;
     assert_eq!((status, v["actions_used"].clone()), (200, json!(1)), "{v}");
-    let (hdrs, b) = as_agent("alice", body(json!({"op":"action","action":{"type":"key","key":"$(rm)"}})));
+    let (hdrs, b) = as_agent(
+        "alice",
+        body(json!({"op":"action","action":{"type":"key","key":"$(rm)"}})),
+    );
     let (status, v) = call(router.clone(), loopback(), hdrs, b).await;
     assert_eq!((status, v["code"].clone()), (400, json!("invalid_action")));
     let (hdrs, b) = as_agent("bob", body(json!({"op":"screenshot","session_id": sid})));
     let (status, v) = call(router.clone(), loopback(), hdrs, b).await;
     assert_eq!((status, v["code"].clone()), (404, json!("not_found")));
-    let (hdrs, b) = as_agent("alice", body(json!({"op":"screenshot","session_id":"../../x"})));
+    let (hdrs, b) = as_agent(
+        "alice",
+        body(json!({"op":"screenshot","session_id":"../../x"})),
+    );
     let (status, _) = call(router.clone(), loopback(), hdrs, b).await;
     assert_eq!(status, 404);
     let (hdrs, b) = as_agent("alice", body(json!({"op":"stop"})));
@@ -917,51 +1371,119 @@ async fn denied_allowed_and_scoped_tools_are_enforced_per_op() {
     let mgr = manager(h, &state, IDLE_TIMEOUT);
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
 
-    write_agent(h, "alice", "[capabilities]\ncomputer_use = true\ndenied_tools = [\"mcp__duduclaw__computer_type\"]\n");
-    let err = mgr.action("alice", None, None, &typed("x")).await.unwrap_err();
+    write_agent(
+        h,
+        "alice",
+        "[capabilities]\ncomputer_use = true\ndenied_tools = [\"mcp__duduclaw__computer_type\"]\n",
+    );
+    let err = mgr
+        .action("alice", None, None, &typed("x"))
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::Forbidden);
     assert!(err.message.contains("denied_tools"), "{}", err.message);
-    assert!(mgr.action("alice", None, None, &click(1, 1)).await.is_ok(), "other tools still run");
+    assert!(
+        mgr.action("alice", None, None, &click(1, 1)).await.is_ok(),
+        "other tools still run"
+    );
 
-    write_agent(h, "alice", "[capabilities]\ncomputer_use = true\nallowed_tools = [\"computer_screenshot\", \"computer_session_stop\"]\n");
-    assert_eq!(mgr.action("alice", None, None, &click(1, 1)).await.unwrap_err().code, ErrorCode::Forbidden);
+    write_agent(
+        h,
+        "alice",
+        "[capabilities]\ncomputer_use = true\nallowed_tools = [\"computer_screenshot\", \"computer_session_stop\"]\n",
+    );
+    assert_eq!(
+        mgr.action("alice", None, None, &click(1, 1))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Forbidden
+    );
     assert!(mgr.screenshot("alice", None).await.is_ok());
     // `status` is never gated.
     assert_eq!(mgr.status("alice").await["active"], true);
 
-    write_agent(h, "alice", "[capabilities]\ncomputer_use = true\nscoped_tools = [\"computer_key\"]\n");
+    write_agent(
+        h,
+        "alice",
+        "[capabilities]\ncomputer_use = true\nscoped_tools = [\"computer_key\"]\n",
+    );
     let key = ActionRequest::Key { key: "Tab".into() };
     let err = mgr.action("alice", None, None, &key).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Forbidden);
-    assert!(err.message.contains("capability_request"), "{}", err.message);
+    assert!(
+        err.message.contains("capability_request"),
+        "{}",
+        err.message
+    );
     let store = crate::capability_grants::CapabilityGrantStore::open(h).unwrap();
     store
-        .grant("alice", None, "computer_key", crate::capability_grants::GRANTED_BY_REQUEST, 600)
+        .grant(
+            "alice",
+            None,
+            "computer_key",
+            crate::capability_grants::GRANTED_BY_REQUEST,
+            600,
+        )
         .await
         .unwrap();
-    assert!(mgr.action("alice", None, None, &key).await.is_ok(), "an active grant lets it run");
+    assert!(
+        mgr.action("alice", None, None, &key).await.is_ok(),
+        "an active grant lets it run"
+    );
 
     // Refusals leave the MCP gate's denial rows.
     let audit = std::fs::read_to_string(h.join("tool_calls.jsonl")).unwrap();
-    assert!(audit.contains("\"denied_tools\"") && audit.contains("\"allowed_tools\""), "{audit}");
+    assert!(
+        audit.contains("\"denied_tools\"") && audit.contains("\"allowed_tools\""),
+        "{audit}"
+    );
     assert!(audit.contains("capability_grant_missing"), "{audit}");
-    assert!(!audit.contains("\"x\""), "typed text never reaches the audit");
+    assert!(
+        !audit.contains("\"x\""),
+        "typed text never reaches the audit"
+    );
     // Start and stop are gated too.
-    write_agent(h, "bob", "[capabilities]\ncomputer_use = true\ndenied_tools = [\"computer_session_start\"]\n");
-    assert_eq!(mgr.start("bob", StartRequest::default()).await.unwrap_err().code, ErrorCode::Forbidden);
-    write_agent(h, "alice", "[capabilities]\ncomputer_use = true\ndenied_tools = [\"computer_session_stop\"]\n");
-    assert_eq!(mgr.stop("alice", None).await.unwrap_err().code, ErrorCode::Forbidden);
+    write_agent(
+        h,
+        "bob",
+        "[capabilities]\ncomputer_use = true\ndenied_tools = [\"computer_session_start\"]\n",
+    );
+    assert_eq!(
+        mgr.start("bob", StartRequest::default())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Forbidden
+    );
+    write_agent(
+        h,
+        "alice",
+        "[capabilities]\ncomputer_use = true\ndenied_tools = [\"computer_session_stop\"]\n",
+    );
+    assert_eq!(
+        mgr.stop("alice", None).await.unwrap_err().code,
+        ErrorCode::Forbidden
+    );
 }
 
 /// Approve or deny the first pending approval of `agent` once it appears.
-fn decide_when_pending(home: std::path::PathBuf, agent: &'static str, approve: bool, after: Duration) -> tokio::task::JoinHandle<String> {
+fn decide_when_pending(
+    home: std::path::PathBuf,
+    agent: &'static str,
+    approve: bool,
+    after: Duration,
+) -> tokio::task::JoinHandle<String> {
     tokio::spawn(async move {
         let broker = crate::approval::ApprovalBroker::open(&home).unwrap();
         loop {
             let pending = broker.list_pending(Some(agent)).await.unwrap();
             if let Some(rec) = pending.first() {
                 tokio::time::sleep(after).await;
-                broker.decide(&rec.id, approve, "test-operator").await.unwrap();
+                broker
+                    .decide(&rec.id, approve, "test-operator")
+                    .await
+                    .unwrap();
                 return rec.summary.clone();
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -990,7 +1512,13 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
         tokio::time::sleep(Duration::from_millis(200)).await;
         mgr.reap_once().await
     };
-    let (done, reaped) = tokio::join!(async { let req = click(1, 1); mgr.action("alice", None, None, &req).await }, reaper);
+    let (done, reaped) = tokio::join!(
+        async {
+            let req = click(1, 1);
+            mgr.action("alice", None, None, &req).await
+        },
+        reaper
+    );
     assert_eq!(reaped, 0, "a pending approval is not idleness");
     assert_eq!(done.unwrap()["actions_used"], 1);
     let summary = decider.await.unwrap();
@@ -998,18 +1526,36 @@ async fn listed_tools_need_a_human_decision_and_the_session_survives_the_wait() 
 
     // Denied: refused, nothing runs. Typed text never reaches the summary.
     let decider = decide_when_pending(h.to_path_buf(), "alice", false, Duration::ZERO);
-    let err = mgr.action("alice", None, None, &typed("hunter2")).await.unwrap_err();
+    let err = mgr
+        .action("alice", None, None, &typed("hunter2"))
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalDenied);
     let summary = decider.await.unwrap();
-    assert!(summary.contains("7 個字元") && !summary.contains("hunter2"), "{summary}");
+    assert!(
+        summary.contains("7 個字元") && !summary.contains("hunter2"),
+        "{summary}"
+    );
 
     // maybe_irreversible is always asked about here (no judge); expiry refuses.
     let mut quick = manager(h, &state, IDLE_TIMEOUT);
     quick.approval_ttl_secs = 1;
     insert_session(&quick, &state, "alice", ComputerUseConfig::default());
-    let err = quick.action("alice", None, None, &ActionRequest::Key { key: "Tab".into() }).await.unwrap_err();
+    let err = quick
+        .action(
+            "alice",
+            None,
+            None,
+            &ActionRequest::Key { key: "Tab".into() },
+        )
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::ApprovalDenied);
-    assert_eq!(state.executed.lock().unwrap().len(), 1, "only the approved click ran");
+    assert_eq!(
+        state.executed.lock().unwrap().len(),
+        1,
+        "only the approved click ran"
+    );
 }
 
 #[tokio::test]
@@ -1019,13 +1565,27 @@ async fn an_emergency_stop_during_the_approval_wait_wins() {
     let state = Arc::new(FakeState::default());
     let mgr = manager(h, &state, IDLE_TIMEOUT);
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
-    write_agent(h, "alice", "[capabilities]\ncomputer_use = true\napproval_required_tools = [\"computer_click\"]\n");
+    write_agent(
+        h,
+        "alice",
+        "[capabilities]\ncomputer_use = true\napproval_required_tools = [\"computer_click\"]\n",
+    );
     let decider = decide_when_pending(h.to_path_buf(), "alice", true, Duration::from_millis(50));
     let stopper = async {
         tokio::time::sleep(Duration::from_millis(20)).await;
-        mgr.entry("alice").unwrap().control.stopped.store(true, Ordering::SeqCst);
+        mgr.entry("alice")
+            .unwrap()
+            .control
+            .stopped
+            .store(true, Ordering::SeqCst);
     };
-    let (done, ()) = tokio::join!(async { let req = click(1, 1); mgr.action("alice", None, None, &req).await }, stopper);
+    let (done, ()) = tokio::join!(
+        async {
+            let req = click(1, 1);
+            mgr.action("alice", None, None, &req).await
+        },
+        stopper
+    );
     decider.await.unwrap();
     assert_eq!(done.unwrap_err().code, ErrorCode::SessionEnded);
     assert!(state.executed.lock().unwrap().is_empty());
@@ -1050,9 +1610,18 @@ async fn a_stop_or_threat_change_during_a_confirmation_wins_over_the_answer() {
         control.stopped.store(true, Ordering::SeqCst);
     };
     let started = Instant::now();
-    let (done, ()) = tokio::join!(async { let req = typed("pw"); mgr.action("alice", None, Some("slow"), &req).await }, stopper);
+    let (done, ()) = tokio::join!(
+        async {
+            let req = typed("pw");
+            mgr.action("alice", None, Some("slow"), &req).await
+        },
+        stopper
+    );
     assert_eq!(done.unwrap_err().code, ErrorCode::SessionEnded);
-    assert!(started.elapsed() < Duration::from_secs(5), "gave up within a poll interval");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "gave up within a poll interval"
+    );
     assert!(mgr.is_empty());
 
     // YELLOW during the wait: paused, nothing typed.
@@ -1062,7 +1631,13 @@ async fn a_stop_or_threat_change_during_a_confirmation_wins_over_the_answer() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         std::fs::write(&path, "YELLOW\n").unwrap();
     };
-    let (done, ()) = tokio::join!(async { let req = typed("pw"); mgr.action("alice", None, Some("slow"), &req).await }, yellow);
+    let (done, ()) = tokio::join!(
+        async {
+            let req = typed("pw");
+            mgr.action("alice", None, Some("slow"), &req).await
+        },
+        yellow
+    );
     assert_eq!(done.unwrap_err().code, ErrorCode::Paused);
     std::fs::remove_file(&path).unwrap();
 
@@ -1071,7 +1646,13 @@ async fn a_stop_or_threat_change_during_a_confirmation_wins_over_the_answer() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         write_agent(h, "alice", "[capabilities]\ncomputer_use = false\n");
     };
-    let (done, ()) = tokio::join!(async { let req = typed("pw"); mgr.action("alice", None, Some("slow"), &req).await }, revoke);
+    let (done, ()) = tokio::join!(
+        async {
+            let req = typed("pw");
+            mgr.action("alice", None, Some("slow"), &req).await
+        },
+        revoke
+    );
     assert_eq!(done.unwrap_err().code, ErrorCode::SessionEnded);
     assert!(state.executed.lock().unwrap().is_empty());
 }
@@ -1086,10 +1667,16 @@ async fn a_stop_dropped_mid_way_still_removes_the_session_and_the_container() {
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     let dropped = tokio::time::timeout(Duration::from_millis(50), mgr.stop("alice", None)).await;
-    assert!(dropped.is_err(), "the request was dropped while the container was stopping");
+    assert!(
+        dropped.is_err(),
+        "the request was dropped while the container was stopping"
+    );
     // The entry is gone at once: a new start is not refused as "exists".
     assert!(mgr.is_empty());
-    assert_eq!(mgr.stop("alice", None).await.unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(
+        mgr.stop("alice", None).await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
     assert_eq!(mgr.status("alice").await["active"], false);
     // The container stop finished on its own.
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1105,7 +1692,10 @@ async fn an_ended_entry_left_in_the_map_counts_as_absent() {
     let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
     let stale = insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     mgr.lookup("alice").unwrap().lock().await.ended = true;
-    assert_eq!(mgr.screenshot("alice", None).await.unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(
+        mgr.screenshot("alice", None).await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
     assert!(mgr.is_empty(), "the lookup cleared it");
     insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
     mgr.lookup("alice").unwrap().lock().await.ended = true;
@@ -1123,14 +1713,27 @@ async fn start_refuses_threat_levels_and_ephemeral_identities() {
     let mgr = manager(h, &state, IDLE_TIMEOUT);
     for level in ["YELLOW\n", "RED\n"] {
         std::fs::write(h.join("threat_level"), level).unwrap();
-        assert_eq!(mgr.start("alice", StartRequest::default()).await.unwrap_err().code, ErrorCode::Paused);
+        assert_eq!(
+            mgr.start("alice", StartRequest::default())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Paused
+        );
     }
     std::fs::remove_file(h.join("threat_level")).unwrap();
     assert_eq!(
-        mgr.start("eph-alice-r1-executor-abc", StartRequest::default()).await.unwrap_err().code,
+        mgr.start("eph-alice-r1-executor-abc", StartRequest::default())
+            .await
+            .unwrap_err()
+            .code,
         ErrorCode::Forbidden
     );
-    assert_eq!(state.starts.load(Ordering::SeqCst), 0, "no container was started");
+    assert_eq!(
+        state.starts.load(Ordering::SeqCst),
+        0,
+        "no container was started"
+    );
 }
 
 /// Registers in a shared slot table (cap 1) before `start`; `start` fails
@@ -1147,7 +1750,11 @@ struct SlotBackend {
 impl SessionBackend for SlotBackend {
     async fn start(&mut self) -> Result<(), ComputerUseError> {
         self.events.lock().unwrap().push("start");
-        if self.fail_start { Err(ComputerUseError::ApiError("boom".into())) } else { Ok(()) }
+        if self.fail_start {
+            Err(ComputerUseError::ApiError("boom".into()))
+        } else {
+            Ok(())
+        }
     }
     async fn register(&mut self, session_id: &str) -> Result<(), ComputerUseError> {
         self.events.lock().unwrap().push("register");
@@ -1166,7 +1773,10 @@ impl SessionBackend for SlotBackend {
         }
     }
     async fn screenshot(&self) -> Result<MaskedScreenshot, ComputerUseError> {
-        Ok(MaskedScreenshot { png_base64: tiny_png_b64(), full_mask: None })
+        Ok(MaskedScreenshot {
+            png_base64: tiny_png_b64(),
+            full_mask: None,
+        })
     }
     async fn window_title(&self) -> Result<String, String> {
         Ok(String::new())
@@ -1187,27 +1797,45 @@ async fn the_global_slot_is_reserved_before_the_container_and_released_on_failur
     let fail = Arc::new(AtomicBool::new(true));
     let factory: BackendFactory = {
         let (slots, events, fail) = (Arc::clone(&slots), Arc::clone(&events), Arc::clone(&fail));
-        Arc::new(move |_a: &str, _h: &std::path::Path, _c: ComputerUseConfig| {
-            Box::new(SlotBackend {
-                slots: Arc::clone(&slots),
-                events: Arc::clone(&events),
-                mine: None,
-                fail_start: fail.load(Ordering::SeqCst),
-                control: Arc::new(OrchestratorControl::new()),
-            }) as Box<dyn SessionBackend>
-        })
+        Arc::new(
+            move |_a: &str, _h: &std::path::Path, _c: ComputerUseConfig| {
+                Box::new(SlotBackend {
+                    slots: Arc::clone(&slots),
+                    events: Arc::clone(&events),
+                    mine: None,
+                    fail_start: fail.load(Ordering::SeqCst),
+                    control: Arc::new(OrchestratorControl::new()),
+                }) as Box<dyn SessionBackend>
+            },
+        )
     };
     let mgr = ComputerUseSessions::with_parts(tmp.path().to_path_buf(), factory, IDLE_TIMEOUT);
     // A failed start released its slot.
-    assert_eq!(mgr.start("alice", StartRequest::default()).await.unwrap_err().code, ErrorCode::StartFailed);
+    assert_eq!(
+        mgr.start("alice", StartRequest::default())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::StartFailed
+    );
     assert_eq!(*events.lock().unwrap(), vec!["register", "start", "stop"]);
     assert!(slots.lock().unwrap().is_empty());
     // With the slot taken, the next start never runs a container.
     fail.store(false, Ordering::SeqCst);
     assert!(mgr.start("alice", StartRequest::default()).await.is_ok());
     events.lock().unwrap().clear();
-    assert_eq!(mgr.start("bob", StartRequest::default()).await.unwrap_err().code, ErrorCode::Capacity);
-    assert!(!events.lock().unwrap().contains(&"start"), "{:?}", events.lock().unwrap());
+    assert_eq!(
+        mgr.start("bob", StartRequest::default())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Capacity
+    );
+    assert!(
+        !events.lock().unwrap().contains(&"start"),
+        "{:?}",
+        events.lock().unwrap()
+    );
 }
 
 #[tokio::test]
@@ -1225,8 +1853,14 @@ async fn the_emergency_stop_ends_tool_sessions_at_once() {
     let mut want = vec![idle_id, busy_id];
     want.sort();
     assert_eq!(ids, want);
-    assert!(mgr.lookup("alice").is_none(), "the idle session ended at once");
-    assert!(held.backend.control().stopped.load(Ordering::SeqCst), "the busy one is flagged");
+    assert!(
+        mgr.lookup("alice").is_none(),
+        "the idle session ended at once"
+    );
+    assert!(
+        held.backend.control().stopped.load(Ordering::SeqCst),
+        "the busy one is flagged"
+    );
     drop(held);
     for _ in 0..100 {
         if mgr.is_empty() && state.stops.load(Ordering::SeqCst) == 2 {
@@ -1241,7 +1875,9 @@ async fn the_emergency_stop_ends_tool_sessions_at_once() {
 // ── navigation allowlist (design §7) ────────────────────────────────────
 
 fn navigate(url: &str) -> ActionRequest {
-    ActionRequest::Navigate { url: url.to_string() }
+    ActionRequest::Navigate {
+        url: url.to_string(),
+    }
 }
 
 fn browser_audit(home: &std::path::Path) -> Vec<Value> {
@@ -1269,8 +1905,14 @@ async fn an_allowlist_pins_resolved_hosts_and_navigate_only_opens_them() {
     assert_eq!(started["reachable_hosts"], json!(["example.com"]));
     assert_eq!(started["unreachable_hosts"], json!(["down.example"]));
     let msg = started["network_message"].as_str().unwrap();
-    assert!(msg.contains("example.com") && msg.contains("down.example") && msg.contains("2 個項目"), "{msg}");
-    assert!(!msg.contains("93.184"), "no addresses in the message: {msg}");
+    assert!(
+        msg.contains("example.com") && msg.contains("down.example") && msg.contains("2 個項目"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("93.184"),
+        "no addresses in the message: {msg}"
+    );
     let cfg = state.last_config.lock().unwrap().clone().unwrap();
     assert_eq!(
         cfg.pinned_hosts,
@@ -1281,18 +1923,43 @@ async fn an_allowlist_pins_resolved_hosts_and_navigate_only_opens_them() {
     );
     assert!(!cfg.network_access && cfg.allowed_domains.is_empty());
 
-    let v = mgr.action("alice", None, None, &navigate("https://EXAMPLE.com/docs?token=abc")).await.unwrap();
+    let v = mgr
+        .action(
+            "alice",
+            None,
+            None,
+            &navigate("https://EXAMPLE.com/docs?token=abc"),
+        )
+        .await
+        .unwrap();
     assert_eq!(v["actions_used"], 1);
     assert_eq!(v["host"], "example.com");
-    assert_eq!(*state.navigated.lock().unwrap(), vec!["https://example.com/docs?token=abc".to_string()]);
-    let row = browser_audit(h).into_iter().find(|r| r["action"] == "navigate").expect("audit row");
+    assert_eq!(
+        *state.navigated.lock().unwrap(),
+        vec!["https://example.com/docs?token=abc".to_string()]
+    );
+    let row = browser_audit(h)
+        .into_iter()
+        .find(|r| r["action"] == "navigate")
+        .expect("audit row");
     assert_eq!(row["url"], "https://example.com/docs");
     assert_eq!(row["domain"], "example.com");
-    assert!(!row.to_string().contains("token=abc"), "query string never audited");
+    assert!(
+        !row.to_string().contains("token=abc"),
+        "query string never audited"
+    );
 
     // Not resolved at start, not https, not in the list: refused, not counted.
-    for url in ["https://down.example/", "http://example.com/", "https://evil.example/", "https://example.com:8443/"] {
-        let e = mgr.action("alice", None, None, &navigate(url)).await.unwrap_err();
+    for url in [
+        "https://down.example/",
+        "http://example.com/",
+        "https://evil.example/",
+        "https://example.com:8443/",
+    ] {
+        let e = mgr
+            .action("alice", None, None, &navigate(url))
+            .await
+            .unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidAction, "{url}");
         assert!(e.message.contains("example.com"), "{}", e.message);
     }
@@ -1300,9 +1967,16 @@ async fn an_allowlist_pins_resolved_hosts_and_navigate_only_opens_them() {
 
     // A browser error is reported with its token only and still counts.
     state.nav_fail.store(true, Ordering::SeqCst);
-    let e = mgr.action("alice", None, None, &navigate("https://example.com/")).await.unwrap_err();
+    let e = mgr
+        .action("alice", None, None, &navigate("https://example.com/"))
+        .await
+        .unwrap_err();
     assert_eq!(e.code, ErrorCode::ExecutionFailed);
-    assert!(e.message.contains("net::ERR_CONNECTION_REFUSED"), "{}", e.message);
+    assert!(
+        e.message.contains("net::ERR_CONNECTION_REFUSED"),
+        "{}",
+        e.message
+    );
     assert_eq!(mgr.status("alice").await["actions_used"], 2);
 }
 
@@ -1314,11 +1988,33 @@ async fn without_an_allowlist_there_is_no_network_and_navigate_names_the_setting
     let started = mgr.start("alice", StartRequest::default()).await.unwrap();
     assert_eq!(started["network"], "none");
     assert_eq!(started["reachable_hosts"], json!([]));
-    assert!(started["network_message"].as_str().unwrap().contains("allowed_domains"));
-    assert!(state.last_config.lock().unwrap().as_ref().unwrap().pinned_hosts.is_empty());
-    let e = mgr.action("alice", None, None, &navigate("https://example.com/")).await.unwrap_err();
+    assert!(
+        started["network_message"]
+            .as_str()
+            .unwrap()
+            .contains("allowed_domains")
+    );
+    assert!(
+        state
+            .last_config
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .pinned_hosts
+            .is_empty()
+    );
+    let e = mgr
+        .action("alice", None, None, &navigate("https://example.com/"))
+        .await
+        .unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidAction);
-    assert!(e.message.contains("[capabilities.computer_use_config] allowed_domains"), "{}", e.message);
+    assert!(
+        e.message
+            .contains("[capabilities.computer_use_config] allowed_domains"),
+        "{}",
+        e.message
+    );
     assert!(state.navigated.lock().unwrap().is_empty());
 }
 
@@ -1332,14 +2028,26 @@ async fn navigate_goes_through_contract_budget_and_tool_gates() {
         "[capabilities]\ncomputer_use = true\n[capabilities.computer_use_config]\nmax_actions = 1\n\
          allowed_domains = [\"example.com\", \"docs.example.com\"]\n",
     );
-    std::fs::write(h.join("agents/alice/CONTRACT.toml"), "[must_not]\nrules = [\"不得 navigate docs\"]\n").unwrap();
+    std::fs::write(
+        h.join("agents/alice/CONTRACT.toml"),
+        "[must_not]\nrules = [\"不得 navigate docs\"]\n",
+    )
+    .unwrap();
     let state = Arc::new(FakeState::default());
     let mgr = manager(h, &state, IDLE_TIMEOUT);
     mgr.start("alice", StartRequest::default()).await.unwrap();
-    let e = mgr.action("alice", None, None, &navigate("https://docs.example.com/")).await.unwrap_err();
+    let e = mgr
+        .action("alice", None, None, &navigate("https://docs.example.com/"))
+        .await
+        .unwrap_err();
     assert_eq!(e.code, ErrorCode::Blocked);
-    mgr.action("alice", None, None, &navigate("https://example.com/")).await.unwrap();
-    let e = mgr.action("alice", None, None, &navigate("https://example.com/")).await.unwrap_err();
+    mgr.action("alice", None, None, &navigate("https://example.com/"))
+        .await
+        .unwrap();
+    let e = mgr
+        .action("alice", None, None, &navigate("https://example.com/"))
+        .await
+        .unwrap_err();
     assert_eq!(e.code, ErrorCode::ActionLimit);
     // denied_tools names the navigate tool on its own.
     write_agent(
@@ -1349,7 +2057,10 @@ async fn navigate_goes_through_contract_budget_and_tool_gates() {
          [capabilities.computer_use_config]\nallowed_domains = [\"example.com\"]\n",
     );
     mgr.start("bob", StartRequest::default()).await.unwrap();
-    let e = mgr.action("bob", None, None, &navigate("https://example.com/")).await.unwrap_err();
+    let e = mgr
+        .action("bob", None, None, &navigate("https://example.com/"))
+        .await
+        .unwrap_err();
     assert_eq!(e.code, ErrorCode::Forbidden);
     assert_eq!(state.navigated.lock().unwrap().len(), 1);
 }
@@ -1372,17 +2083,33 @@ async fn navigate_validates_before_approval_and_the_summary_names_the_host() {
     mgr.approval_ttl_secs = 2;
     mgr.start("alice", StartRequest::default()).await.unwrap();
     // A refused URL fails at once: no approval record is ever created.
-    let e = mgr.action("alice", None, None, &navigate("https://evil.example/")).await.unwrap_err();
+    let e = mgr
+        .action("alice", None, None, &navigate("https://evil.example/"))
+        .await
+        .unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidAction);
     let broker = crate::approval::ApprovalBroker::open(h).unwrap();
     assert!(broker.list_pending(Some("alice")).await.unwrap().is_empty());
     // An allowed URL: the approver sees the host, not the query.
     let decider = decide_when_pending(h.to_path_buf(), "alice", true, Duration::ZERO);
-    mgr.action("alice", None, None, &navigate("https://EXAMPLE.com/a?secret=1")).await.unwrap();
+    mgr.action(
+        "alice",
+        None,
+        None,
+        &navigate("https://EXAMPLE.com/a?secret=1"),
+    )
+    .await
+    .unwrap();
     let summary = decider.await.unwrap();
     assert!(summary.contains("開啟網頁：example.com"), "{summary}");
-    assert!(!summary.contains("secret") && !summary.contains("/a"), "{summary}");
-    assert_eq!(*state.navigated.lock().unwrap(), vec!["https://example.com/a?secret=1".to_string()]);
+    assert!(
+        !summary.contains("secret") && !summary.contains("/a"),
+        "{summary}"
+    );
+    assert_eq!(
+        *state.navigated.lock().unwrap(),
+        vec!["https://example.com/a?secret=1".to_string()]
+    );
 }
 
 // ── real Docker (opt-in) ────────────────────────────────────────────────
@@ -1391,7 +2118,10 @@ async fn navigate_validates_before_approval_and_the_summary_names_the_host() {
 /// two employees.
 fn docker_home(image: &str) -> tempfile::TempDir {
     let tmp = home();
-    write_config(tmp.path(), &format!("[computer_use]\nimage = \"{image}\"\n"));
+    write_config(
+        tmp.path(),
+        &format!("[computer_use]\nimage = \"{image}\"\n"),
+    );
     tmp
 }
 
@@ -1430,9 +2160,12 @@ async fn real_docker_tool_session_over_http() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let url = format!("http://{addr}{}", http::ROUTE);
@@ -1460,17 +2193,32 @@ async fn real_docker_tool_session_over_http() {
             .unwrap_or_default();
         match image::load_from_memory(&png) {
             Ok(img) if s == 200 && (img.width(), img.height()) == (1280, 800) => {}
-            other => failures.push(format!("screenshot: status {s}, {:?}", other.map(|i| (i.width(), i.height())))),
+            other => failures.push(format!(
+                "screenshot: status {s}, {:?}",
+                other.map(|i| (i.width(), i.height()))
+            )),
         }
-        let (s, v) = post("alice", json!({"op":"action","action":{"type":"click","x":640,"y":400}})).await;
+        let (s, v) = post(
+            "alice",
+            json!({"op":"action","action":{"type":"click","x":640,"y":400}}),
+        )
+        .await;
         if s != 200 {
             failures.push(format!("click: {v}"));
         }
-        let (s, v) = post("alice", json!({"op":"action","action":{"type":"type","text":"hello"}})).await;
+        let (s, v) = post(
+            "alice",
+            json!({"op":"action","action":{"type":"type","text":"hello"}}),
+        )
+        .await;
         if s != 200 || v["actions_used"] != 2 {
             failures.push(format!("type: {v}"));
         }
-        let (s, v) = post("bob", json!({"op":"screenshot","session_id": started["session_id"]})).await;
+        let (s, v) = post(
+            "bob",
+            json!({"op":"screenshot","session_id": started["session_id"]}),
+        )
+        .await;
         if s != 404 {
             failures.push(format!("bob saw alice's session: {s} {v}"));
         }
@@ -1558,9 +2306,12 @@ async fn real_docker_navigation_over_http() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let url = format!("http://{addr}{}", http::ROUTE);
@@ -1587,14 +2338,19 @@ async fn real_docker_navigation_over_http() {
     let (status, started) = post("alice", json!({"op":"start","task":"navigation test"})).await;
     let mut failures = Vec::new();
     if status == 200 {
-        if started["reachable_hosts"] != json!(["example.com"]) || started["network"] != "allowlist" {
+        if started["reachable_hosts"] != json!(["example.com"]) || started["network"] != "allowlist"
+        {
             failures.push(format!("start: {started}"));
         }
         // Let the kiosk page settle before the blank reference shot.
         tokio::time::sleep(Duration::from_secs(2)).await;
         let (_, blank) = post("alice", json!({"op":"screenshot"})).await;
         let blank_share = non_uniform_share(&shot(&blank));
-        let (s, v) = post("alice", json!({"op":"action","action":{"type":"navigate","url":"https://example.com/"}})).await;
+        let (s, v) = post(
+            "alice",
+            json!({"op":"action","action":{"type":"navigate","url":"https://example.com/"}}),
+        )
+        .await;
         if s != 200 || v["host"] != "example.com" {
             failures.push(format!("navigate: {s} {v}"));
         }
@@ -1616,13 +2372,21 @@ async fn real_docker_navigation_over_http() {
                 after["fully_masked"], after["mask_reason"]
             ));
         }
-        let (s, v) = post("alice", json!({"op":"action","action":{"type":"navigate","url":"https://www.iana.org/"}})).await;
+        let (s, v) = post(
+            "alice",
+            json!({"op":"action","action":{"type":"navigate","url":"https://www.iana.org/"}}),
+        )
+        .await;
         if s != 400 || v["code"] != "invalid_action" {
             failures.push(format!("outside host not refused: {s} {v}"));
         }
         // A second window: the masking helper cannot tell which page is on
         // top, so the whole screenshot is hidden and says why.
-        let (s, v) = post("alice", json!({"op":"action","action":{"type":"key","key":"ctrl+n"}})).await;
+        let (s, v) = post(
+            "alice",
+            json!({"op":"action","action":{"type":"key","key":"ctrl+n"}}),
+        )
+        .await;
         if s != 200 {
             failures.push(format!("ctrl+n: {s} {v}"));
         }
@@ -1638,7 +2402,11 @@ async fn real_docker_navigation_over_http() {
             failures.push("two windows: screenshot was not fully masked".to_string());
         }
         // Navigating closes the extra window; the next screenshot is normal.
-        let (s, v) = post("alice", json!({"op":"action","action":{"type":"navigate","url":"https://example.com/"}})).await;
+        let (s, v) = post(
+            "alice",
+            json!({"op":"action","action":{"type":"navigate","url":"https://example.com/"}}),
+        )
+        .await;
         if s != 200 {
             failures.push(format!("navigate after ctrl+n: {s} {v}"));
         }
@@ -1665,3 +2433,83 @@ async fn real_docker_navigation_over_http() {
     assert!(failures.is_empty(), "{failures:?}");
     assert!(left.is_empty(), "containers left behind: {left}");
 }
+
+#[tokio::test]
+async fn durable_confirmation_deny_then_new_request_can_execute_and_never_persists_type_text() {
+    let tmp = home();
+    let state = Arc::new(FakeState::default());
+    *state.title.lock().unwrap() = Some(Ok("Bitwarden".into()));
+    let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
+    insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
+    let secret = "CONFIDENTIAL_TYPE_MARKER_987";
+    let req = typed(secret);
+    assert_eq!(
+        mgr.action("alice", None, Some("no"), &req)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::ConfirmationDenied
+    );
+    mgr.action("alice", None, Some("yes"), &req).await.unwrap();
+    assert_eq!(state.executed.lock().unwrap().len(), 1);
+    let conn = rusqlite::Connection::open(tmp.path().join("approvals.db")).unwrap();
+    for table in ["approvals", "approval_operations"] {
+        let col = if table == "approvals" {
+            "payload"
+        } else {
+            "payload_json"
+        };
+        let mut q = conn.prepare(&format!("SELECT {col} FROM {table}")).unwrap();
+        for row in q.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+            assert!(!row.unwrap().contains(secret));
+        }
+    }
+    let b = crate::approval::ApprovalBroker::open(tmp.path()).unwrap();
+    let ops = b.list_operations().await.unwrap();
+    assert!(
+        ops.iter()
+            .any(|o| o.state == crate::approval::OperationState::Succeeded)
+    );
+}
+
+#[tokio::test]
+async fn fresh_window_change_invalidates_old_confirmation_then_allows_new_observation() {
+    let tmp = home();
+    let state = Arc::new(FakeState::default());
+    *state.title.lock().unwrap() = Some(Ok("Bitwarden".into()));
+    let mgr = manager(tmp.path(), &state, IDLE_TIMEOUT);
+    insert_session(&mgr, &state, "alice", ComputerUseConfig::default());
+    let b = crate::approval::ApprovalBroker::open(tmp.path()).unwrap();
+    let decider = async {
+        let mut found = None;
+        for _ in 0..100 {
+            let rows = b.list_pending(Some("alice")).await.unwrap();
+            if let Some(row) = rows.into_iter().find(|r| r.binding.is_some()) {
+                found = Some(row);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let row = found.expect("durable request exists before delivery wait");
+        *state.title.lock().unwrap() = Some(Ok("1Password".into()));
+        b.decide_bound(
+            &row.id,
+            &row.binding.as_ref().unwrap().decision_context,
+            true,
+        )
+        .await
+        .unwrap();
+    };
+    let req = typed("pw");
+    let (result, ()) = tokio::join!(mgr.action("alice", None, Some("slow"), &req), decider);
+    assert_eq!(result.unwrap_err().code, ErrorCode::ConfirmationDenied);
+    assert!(state.executed.lock().unwrap().is_empty());
+    mgr.action("alice", None, Some("yes"), &req).await.unwrap();
+    assert_eq!(state.executed.lock().unwrap().len(), 1);
+}
+
+#[path = "tests/action_boundary.rs"]
+mod action_boundary;
+
+#[path = "tests/secret_persistence.rs"]
+mod secret_persistence;

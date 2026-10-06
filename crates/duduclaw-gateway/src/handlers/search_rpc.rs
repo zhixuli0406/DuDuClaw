@@ -71,12 +71,53 @@ impl MethodHandler {
         }
 
         if wants("artifacts") {
-            hits.extend(crate::search_index::search_artifacts(
+            let found = crate::search_index::search_artifacts(
                 &self.home_dir,
                 agent_id,
                 query,
                 per_source_limit,
-            ));
+            );
+            // F5-D: a deliverable's name belongs to its task; hits the
+            // reader may not see (task audience, private archive binding)
+            // are left out, through the same gates as the task's own RPCs.
+            let reader = match TaskReader::new(&self.home_dir, ctx) {
+                Ok(r) => r,
+                Err(f) => return f,
+            };
+            let workflows = self.workflow_store().await.ok();
+            let tasks = self.task_store().await.ok();
+            for hit in found {
+                if let Some(task_id) = hit.jump.get("task_id").and_then(Value::as_str) {
+                    let owner = match &tasks {
+                        Some(t) => t.get_task(task_id).await.ok().flatten().map(|t| t.assigned_to),
+                        None => None,
+                    };
+                    let readable = match owner {
+                        Some(o) => reader.can_read(task_id, &o),
+                        // A removed task's deliverable: admins only.
+                        None => reader.live().is_admin(),
+                    };
+                    if !readable {
+                        continue;
+                    }
+                }
+                let agent = hit.agent_id.clone();
+                let allowed = match &workflows {
+                    Some(w) => crate::review_evidence::download::authorize_artifact_access(
+                        &self.home_dir,
+                        w,
+                        reader.live(),
+                        agent.as_deref(),
+                        &hit.id,
+                    )
+                    .await
+                    .is_ok(),
+                    None => false,
+                };
+                if allowed {
+                    hits.push(hit);
+                }
+            }
         }
 
         // Memory is one SQLite db per agent — a true cross-agent memory

@@ -80,8 +80,26 @@ jobs:
           cargo test -p duduclaw-cli --lib --features app-compat -- compat
       - name: Test (no dashboard)
         run: cargo test --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+      # The reviewable-workflow end-to-end tests drive a real stdio CLI and
+      # pause it at test checkpoints; they run in their own step below.
       - name: Test gateway
-        run: cargo test --no-fail-fast -p duduclaw-gateway --no-default-features
+        run: cargo test --no-fail-fast -p duduclaw-gateway --no-default-features -- --skip three_page_pilot_ --skip security_race_tests --skip resume_tests --skip f1b_e2e_tests --skip f5a_e2e_tests
+      - name: Test workflow stdio checkpoints (CLI, workflow-test-checkpoints)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --no-fail-fast -p duduclaw-cli --test workflow_stdio --features workflow-test-checkpoints
+      - name: Test workflow end to end (pilot, races, resume, F1b, F5-A) against the built CLI
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          DUDUCLAW_P1_PILOT_EVIDENCE_DIR: ${{ runner.temp }}/pilot-evidence
+        run: |
+          cargo build -p duduclaw-cli
+          mkdir -p "$DUDUCLAW_P1_PILOT_EVIDENCE_DIR"
+          export DUDUCLAW_P1_PILOT_BINARY="$GITHUB_WORKSPACE/target/debug/duduclaw"
+          cargo test --no-fail-fast -p duduclaw-gateway --no-default-features three_page_pilot_ -- --test-threads=1
+          cargo test --no-fail-fast -p duduclaw-gateway --no-default-features workflow::security_race_tests -- --test-threads=1
+          cargo test --no-fail-fast -p duduclaw-gateway --no-default-features workflow::resume_tests -- --test-threads=1
+          cargo test --no-fail-fast -p duduclaw-gateway --no-default-features workflow::f1b_e2e_tests -- --test-threads=1
+          cargo test --no-fail-fast -p duduclaw-gateway --no-default-features workflow::f5a_e2e_tests -- --test-threads=1
       # Clippy is advisory for now: `-D warnings` was never enforced (CI never
       # went green before, so the step never ran), leaving accumulated pre-existing
       # lints across the workspace. Kept running for visibility via continue-on-error

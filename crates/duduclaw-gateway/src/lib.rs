@@ -31,6 +31,10 @@
 #![allow(clippy::if_same_then_else)]
 pub mod a2a_signing;
 pub mod access_control;
+pub mod workflow;
+pub mod review_evidence;
+pub mod workflow_drafts;
+pub mod workflow_draft_context;
 pub mod agent_binding;
 pub mod agent_hook_installer;
 pub mod auth;
@@ -98,6 +102,8 @@ pub mod msteams;
 pub mod notion_workspace;
 pub mod rate_limit_watch;
 pub(crate) mod synthetic_connector_adapter;
+#[cfg(test)]
+pub(crate) mod test_channel_provider;
 pub mod watchdog;
 pub mod killswitch_triggers;
 pub mod redaction_sources;
@@ -107,6 +113,9 @@ pub mod wecom;
 // WP1.6 (ecosystem): text-reply decisions — replying to a decision card with
 // a bare verb counts as a button press (wrist/watch clients have no buttons).
 pub mod decision_text;
+// P0-B F4: what counts as a channel decision reply (verb + full request id),
+// Discord decision permits, Slack decision-identity status.
+pub mod channel_decision_route;
 // W2-4 notification governance: the gate every outbound notification passes
 // through (levels + quiet hours + deferred queue), its action-rate telemetry,
 // and the scheduled daily digest.
@@ -282,6 +291,7 @@ pub mod install_notify;
 pub mod install_requests;
 pub mod knowledge_route;
 pub mod lifecycle_flush;
+pub mod channel_ingress;
 pub mod line;
 pub mod local_llm;
 pub mod log;
@@ -494,6 +504,7 @@ pub mod topology_evolution;
 pub mod outcome_spec;
 // ── P2a: goal-loop channel push + decision (needs_human exit + autonomy kickoff) ──
 pub mod goal_notify;
+pub(crate) mod goal_notify_private;
 // ── H11: closed classification of WHY a goal task parked `needs_human`
 //        (grok-build §2.3 eight-state machine, adapted — a reason column, not
 //        a new task status). Audit O8 alias — lives in `goal_loop::state` ──

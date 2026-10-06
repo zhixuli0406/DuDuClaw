@@ -13,6 +13,31 @@ impl GoalLoopDriver {
             return Ok(KickoffGate::Proceed);
         };
         let mut kickoff = self.kickoff.lock().await;
+        // Reconstruct only this registered goal handler's exact task epoch.
+        // A legacy row without the host epoch never gains resume authority.
+        if !kickoff.contains_key(&task.id) {
+            let snapshot = task.authority_snapshot_hash();
+            if let Some(rec) = broker
+                .list_by_kind("goal_kickoff")
+                .await?
+                .into_iter()
+                .rev()
+                .find(|r| {
+                    r.payload["task_id"].as_str() == Some(task.id.as_str())
+                        && r.payload["task_authority_revision"].as_i64()
+                            == Some(task.authority_revision)
+                        && r.payload["task_snapshot_hash"].as_str() == Some(snapshot.as_str())
+                        && matches!(
+                            r.status,
+                            ApprovalStatus::Pending
+                                | ApprovalStatus::Approved
+                                | ApprovalStatus::Expired
+                        )
+                })
+            {
+                kickoff.insert(task.id.clone(), rec.id);
+            }
+        }
         match kickoff.get(&task.id).cloned() {
             None => {
                 // First encounter: request approval, push, and wait.
@@ -21,7 +46,13 @@ impl GoalLoopDriver {
                     task.title,
                     self.iteration_cap_for(task)
                 );
-                let payload = json!({ "task_id": task.id, "agent": task.assigned_to });
+                let payload = json!({
+                    "task_id": task.id,
+                    "agent": task.assigned_to,
+                    "task_authority_revision": task.authority_revision,
+                    "task_snapshot_hash": task.authority_snapshot_hash(),
+                    "resume_handler": "goal_kickoff_v1"
+                });
                 let id = broker
                     .request(
                         &task.assigned_to,
@@ -50,59 +81,88 @@ impl GoalLoopDriver {
                     .await;
                 Ok(KickoffGate::Waiting)
             }
-            Some(id) => match broker.poll(&id).await? {
-                ApprovalStatus::Approved => {
-                    // Keep the (terminal-approved) approval in the map: if the
-                    // dispatch is deferred this tick by the concurrency cap, the
-                    // next tick re-polls the SAME approval (Approved) instead of
-                    // filing a fresh one. Pruned once the task leaves candidates.
-                    self.post_activity(
-                        "goal_loop.kickoff_approved",
-                        &task.assigned_to,
-                        Some(&task.id),
-                        &format!("人工已核准 — 開始自主執行 {}", task.title),
-                    )
-                    .await;
-                    Ok(KickoffGate::Proceed)
-                }
-                ApprovalStatus::Pending => {
-                    drop(kickoff);
-                    // Retry a previously-failed notification (bounded) — the
-                    // approval already exists, so this only re-sends the push.
-                    if !self.kickoff_notified.lock().await.contains(&task.id) {
-                        let summary = format!(
-                            "目標:{} — 最多 {} 輪自主嘗試",
-                            task.title,
-                            self.iteration_cap_for(task)
-                        );
-                        self.notify_kickoff_with_retry(task, id.as_str(), &summary)
-                            .await;
-                    }
-                    Ok(KickoffGate::Waiting)
-                }
-                // Denied / Expired (TTL = deny, fail-closed) ⇒ abort the goal.
-                other => {
+            Some(id) => {
+                let rec = broker.get(&id).await?.ok_or("kickoff approval missing")?;
+                let current = self
+                    .store
+                    .get_task(&task.id)
+                    .await?
+                    .ok_or("kickoff task missing")?;
+                if rec.payload["task_authority_revision"].as_i64() != Some(task.authority_revision)
+                    || rec.payload["task_snapshot_hash"].as_str()
+                        != Some(task.authority_snapshot_hash().as_str())
+                    || current.authority_revision != task.authority_revision
+                    || current.authority_snapshot_hash() != task.authority_snapshot_hash()
+                    || !current.approval_eligible()
+                {
                     kickoff.remove(&task.id);
-                    let reason = format!("kickoff {} — 目標未啟動", other.as_str());
-                    if let Err(e) = self.store.cancel_task(&task.id, &reason).await {
-                        warn!(task = %task.id, error = %e, "goal loop: kickoff abort cancel failed");
-                    }
-                    // WP3 (PORTICO): task abandoned at kickoff → revoke any grants.
-                    self.revoke_task_grants(
-                        &task.id,
-                        crate::capability_grants::REVOKE_REASON_PHASE_END,
-                    )
-                    .await;
-                    self.post_activity(
-                        "goal_loop.kickoff_denied",
-                        &task.assigned_to,
-                        Some(&task.id),
-                        &format!("人工未核准({})— 目標放棄 {}", other.as_str(), task.title),
-                    )
-                    .await;
-                    Ok(KickoffGate::Aborted)
+                    let _ = broker
+                        .invalidate_request(&id, "task_contract_changed")
+                        .await;
+                    return Ok(KickoffGate::Waiting);
                 }
-            },
+                let status = if rec
+                    .expires_at_epoch()
+                    .is_some_and(|t| chrono::Utc::now().timestamp() < t)
+                {
+                    broker.poll(&id).await?
+                } else {
+                    ApprovalStatus::Expired
+                };
+                match status {
+                    ApprovalStatus::Approved => {
+                        // Keep the (terminal-approved) approval in the map: if the
+                        // dispatch is deferred this tick by the concurrency cap, the
+                        // next tick re-polls the SAME approval (Approved) instead of
+                        // filing a fresh one. Pruned once the task leaves candidates.
+                        self.post_activity(
+                            "goal_loop.kickoff_approved",
+                            &task.assigned_to,
+                            Some(&task.id),
+                            &format!("人工已核准 — 開始自主執行 {}", task.title),
+                        )
+                        .await;
+                        Ok(KickoffGate::Proceed)
+                    }
+                    ApprovalStatus::Pending => {
+                        drop(kickoff);
+                        // Retry a previously-failed notification (bounded) — the
+                        // approval already exists, so this only re-sends the push.
+                        if !self.kickoff_notified.lock().await.contains(&task.id) {
+                            let summary = format!(
+                                "目標:{} — 最多 {} 輪自主嘗試",
+                                task.title,
+                                self.iteration_cap_for(task)
+                            );
+                            self.notify_kickoff_with_retry(task, id.as_str(), &summary)
+                                .await;
+                        }
+                        Ok(KickoffGate::Waiting)
+                    }
+                    // Denied / Expired (TTL = deny, fail-closed) ⇒ abort the goal.
+                    other => {
+                        kickoff.remove(&task.id);
+                        let reason = format!("kickoff {} — 目標未啟動", other.as_str());
+                        if let Err(e) = self.store.cancel_task(&task.id, &reason).await {
+                            warn!(task = %task.id, error = %e, "goal loop: kickoff abort cancel failed");
+                        }
+                        // WP3 (PORTICO): task abandoned at kickoff → revoke any grants.
+                        self.revoke_task_grants(
+                            &task.id,
+                            crate::capability_grants::REVOKE_REASON_PHASE_END,
+                        )
+                        .await;
+                        self.post_activity(
+                            "goal_loop.kickoff_denied",
+                            &task.assigned_to,
+                            Some(&task.id),
+                            &format!("人工未核准({})— 目標放棄 {}", other.as_str(), task.title),
+                        )
+                        .await;
+                        Ok(KickoffGate::Aborted)
+                    }
+                }
+            }
         }
     }
 

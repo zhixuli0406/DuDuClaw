@@ -191,6 +191,10 @@ fn the_notice_names_counts_but_no_content() {
         notify_chat_id: None,
         reminded_at: None,
         simulation: None,
+        request_kind: crate::approval::RequestKind::Approval,
+        binding: None,
+        answer: None,
+        invalidated_reason: None,
     };
     let body = crate::approval_notify::dashboard_only_notice_body(&rec, false);
     assert!(

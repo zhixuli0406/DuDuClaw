@@ -4,7 +4,11 @@
 use super::*;
 
 impl MethodHandler {
-    pub(crate) async fn handle_approvals_decide(&self, params: Value, ctx: &UserContext) -> WsFrame {
+    pub(crate) async fn handle_approvals_decide(
+        &self,
+        params: Value,
+        ctx: &UserContext,
+    ) -> WsFrame {
         let id = match params.get("id").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return WsFrame::error_response("", "id is required"),
@@ -29,6 +33,60 @@ impl MethodHandler {
             Ok(rec) => Some(rec),
             Err(response) => return response,
         };
+        if let Some(r) = &record {
+            if self
+                .authorize_workflow_activation_record(&r.payload, ctx)
+                .await
+                .is_err()
+            {
+                return WsFrame::error_response("", "permission denied");
+            }
+            // A card built from a task is decided only by someone who may
+            // read that task (live identity + audience), as in the list.
+            // Bound cards are judged by `authorize_bound_decider` below.
+            if let Some(task_id) = approval_task_ref(&r.payload).filter(|_| r.binding.is_none()) {
+                let visible = live_reader_context(&self.home_dir, ctx).is_ok_and(|live| {
+                    task_owner_readonly(&self.home_dir, &task_id).is_some_and(|owner| {
+                        task_content_visible(&self.home_dir, &live, &task_id, &owner)
+                    })
+                });
+                if !visible {
+                    return WsFrame::error_response("", PERMISSION_DENIED);
+                }
+            }
+        }
+        if let Some(rec) = record.as_ref().filter(|r| r.binding.is_some()) {
+            if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind)
+                && rec.is_stale(chrono::Utc::now())
+            {
+                let _ = broker.poll(&approval_id).await;
+                return WsFrame::error_response(
+                    "",
+                    crate::approval_notify::dashboard_only_expired_text(&rec.action_kind),
+                );
+            }
+            // A-M-3 / U3: who may decide is re-derived from a fresh identity
+            // read (employee access, run audience, Admin for activations).
+            let decider = match Box::pin(self.authorize_bound_decider(rec, ctx)).await {
+                Ok(c) => c,
+                Err(e) => return WsFrame::error_response("", &e),
+            };
+            if let Err(e) = Box::pin(broker.decide_bound_dashboard(&approval_id, &decider, approve))
+                .await
+            {
+                return WsFrame::error_response("", &e);
+            }
+            self.audit_activation_decision(rec, &decider, approve);
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "id": id,
+                    "decided": if approve {"approved"}else{"denied"},
+                    "execution_status": "awaiting_execution",
+                    "submitter_is_decider": super::approval_decider::submitter_is_decider(rec, &decider),
+                }),
+            );
+        }
         // L1: a knowledge review past its deadline is a denial (TTL = DENY),
         // even before the expiry sweep has flipped its status — approving it
         // would write knowledge on a card the reviewer could no longer rely on.
@@ -39,13 +97,7 @@ impl MethodHandler {
                 let _ = broker.poll(&approval_id).await;
                 return WsFrame::error_response(
                     "",
-                    if rec.action_kind
-                        == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE
-                    {
-                        "這筆忘記請求已逾期，已自動拒絕；請重新建立計畫。"
-                    } else {
-                        "這則知識審核已逾期，已自動捨棄，無法再核准。"
-                    },
+                    crate::approval_notify::dashboard_only_expired_text(&rec.action_kind),
                 );
             }
         }
@@ -65,10 +117,30 @@ impl MethodHandler {
             let kind = crate::governance::ApprovalKind::parse(&rec.action_kind);
             // Decision Lab is admin-only. A manager who cannot inspect the
             // exact synthetic run must not mint its human-inspection receipt.
+            // F2: terminal-filed LINE inbox changes are decided by a current
+            // Admin only (role re-read from users.db, not the cached context).
+            if rec.action_kind == crate::channel_ingress::cli_approval::ACTION_KIND
+                && crate::approval::require_current_dashboard_role_in_home(
+                    &self.home_dir,
+                    ctx,
+                    UserRole::Admin,
+                )
+                .is_err()
+            {
+                return WsFrame::error_response(
+                    "",
+                    "LINE 收件匣的指令列請求只能由管理員（Admin）核准。",
+                );
+            }
             // Forget by source deletes memory irreversibly: Admin only.
             if rec.action_kind
                 == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE
-                && !ctx.is_admin()
+                && crate::approval::require_current_dashboard_role_in_home(
+                    &self.home_dir,
+                    ctx,
+                    UserRole::Admin,
+                )
+                .is_err()
             {
                 return WsFrame::error_response(
                     "",
@@ -88,12 +160,27 @@ impl MethodHandler {
                 );
             }
         }
-        if record.as_ref().is_some_and(|record| record.action_kind == "discovery") {
+        if record
+            .as_ref()
+            .is_some_and(|record| record.action_kind == "discovery")
+        {
             let caller = match crate::discovery::service::TrustedCaller::from_user(ctx) {
-                Ok(caller) => caller, Err(error) => return WsFrame::error_response("", &error),
+                Ok(caller) => caller,
+                Err(error) => return WsFrame::error_response("", &error),
             };
-            let store = match self.task_store().await { Ok(store) => store, Err(frame) => return frame };
-            if let Err(error) = crate::discovery::service::prepare_approval_decision(&store, &broker, &caller, &approval_id, approve).await {
+            let store = match self.task_store().await {
+                Ok(store) => store,
+                Err(frame) => return frame,
+            };
+            if let Err(error) = crate::discovery::service::prepare_approval_decision(
+                &store,
+                &broker,
+                &caller,
+                &approval_id,
+                approve,
+            )
+            .await
+            {
                 return WsFrame::error_response("", &error);
             }
         }
@@ -102,12 +189,26 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("decide: {e}"));
         }
 
-        if record.as_ref().is_some_and(|record| record.action_kind == "discovery") {
+        if record
+            .as_ref()
+            .is_some_and(|record| record.action_kind == "discovery")
+        {
             let caller = match crate::discovery::service::TrustedCaller::from_user(ctx) {
-                Ok(caller) => caller, Err(error) => return WsFrame::error_response("", &error),
+                Ok(caller) => caller,
+                Err(error) => return WsFrame::error_response("", &error),
             };
-            let store = match self.task_store().await { Ok(store) => store, Err(frame) => return frame };
-            if let Err(error) = crate::discovery::service::authorize_approved_request(&store, &broker, &caller, &approval_id).await {
+            let store = match self.task_store().await {
+                Ok(store) => store,
+                Err(frame) => return frame,
+            };
+            if let Err(error) = crate::discovery::service::authorize_approved_request(
+                &store,
+                &broker,
+                &caller,
+                &approval_id,
+            )
+            .await
+            {
                 return WsFrame::error_response("", &error);
             }
         }
@@ -299,7 +400,11 @@ impl MethodHandler {
             .payload
             .get("quarantined_ids")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
         // Trust-held claims are promoted with the approver's authority,
         // bound to the digest of the row the card showed (R-H1).
@@ -418,6 +523,74 @@ impl MethodHandler {
         )
     }
 
+    pub(crate) async fn handle_approval_operations(
+        &self,
+        params: Value,
+        ctx: &UserContext,
+        resolve: bool,
+    ) -> WsFrame {
+        if !ctx.is_admin() {
+            return WsFrame::error_response("", "admin required");
+        }
+        let broker = match crate::approval::ApprovalBroker::open(&self.home_dir) {
+            Ok(b) => b,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        if let Err(e) = broker.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin) {
+            return WsFrame::error_response("", &e);
+        }
+        if !resolve {
+            if let Err(e) = broker.recover_operations().await {
+                return WsFrame::error_response("", &e);
+            }
+            if let Some(id) = params["operation_id"].as_str() {
+                return match broker.inspect_operation(id).await {
+                    Ok(Some(row)) => WsFrame::ok_response("", json!({"operation":row})),
+                    Ok(None) => WsFrame::error_response("", "operation not found"),
+                    Err(e) => WsFrame::error_response("", &e),
+                };
+            }
+            return match broker
+                .list_operations_page(
+                    params["before_rowid"].as_i64(),
+                    params["limit"].as_u64().unwrap_or(200) as usize,
+                )
+                .await
+            {
+                Ok((rows, next)) => {
+                    WsFrame::ok_response("", json!({"operations":rows,"next_cursor":next}))
+                }
+                Err(e) => WsFrame::error_response("", &e),
+            };
+        }
+        let Some(id) = params["operation_id"].as_str() else {
+            return WsFrame::error_response("", "operation_id required");
+        };
+        let Some(fence) = params["expected_fence"].as_i64() else {
+            return WsFrame::error_response("", "expected_fence required");
+        };
+        let Some(succeeded) = params["succeeded"].as_bool() else {
+            return WsFrame::error_response("", "succeeded required");
+        };
+        match broker
+            .resolve_uncertain(
+                id,
+                fence,
+                succeeded,
+                params["receipt"].clone(),
+                &ctx.user_id,
+                params["reason"].as_str().unwrap_or(""),
+            )
+            .await
+        {
+            Ok(()) => WsFrame::ok_response(
+                "",
+                json!({"operation_id":id,"resolved":true,"retry_allowed":false}),
+            ),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
     /// WP14-T14.6: recent budget-breaker incidents from `budget_events.jsonl`,
     /// newest first, plus a per-agent open-count. `limit` default 50.
     pub(crate) async fn handle_budget_incidents(&self, params: Value) -> WsFrame {
@@ -512,7 +685,9 @@ pub(crate) const AUDIT_KNOWLEDGE_REVIEW_DECISION_UNRECORDED: &str =
 /// no request holds them.
 fn knowledge_review_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+        >,
     > = std::sync::OnceLock::new();
     let map = LOCKS.get_or_init(Default::default);
     let mut m = map.lock().unwrap_or_else(|p| p.into_inner());
@@ -526,7 +701,8 @@ fn knowledge_review_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
 }
 
 #[cfg(test)]
-static FORCED_DECIDE_FAILURE: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+static FORCED_DECIDE_FAILURE: std::sync::Mutex<Option<(String, String)>> =
+    std::sync::Mutex::new(None);
 
 /// Test seam: make the next `decide` for `id` fail with `err`.
 #[cfg(test)]

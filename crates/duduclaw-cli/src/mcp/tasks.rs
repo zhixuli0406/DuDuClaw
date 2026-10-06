@@ -160,7 +160,9 @@ pub(crate) async fn handle_tasks_create(
             Ok(spec) => Some(spec),
             Err(e) => return tool_error(&e),
         },
-        Some(_) => return tool_error("schedule must be a string (cron expression or RFC3339 instant)"),
+        Some(_) => {
+            return tool_error("schedule must be a string (cron expression or RFC3339 instant)");
+        }
     };
     let title = args
         .get("title")
@@ -265,7 +267,10 @@ pub(crate) async fn handle_tasks_create(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            outcome: args.get("outcome").and_then(|v| v.as_str()).map(str::to_string),
+            outcome: args
+                .get("outcome")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             duration_hours: args.get("duration_hours").and_then(|v| v.as_f64()),
             risk_boundary: args
                 .get("risk_boundary")
@@ -329,8 +334,14 @@ pub(crate) async fn handle_tasks_create(
                 // it runs detached, long after this call returned, so there is
                 // no ambient conversation to answer into. Say so instead of
                 // creating a reminder that can never be delivered.
-                if args.get("notify_channel").and_then(|v| v.as_str()).is_none()
-                    || args.get("notify_chat_id").and_then(|v| v.as_str()).is_none()
+                if args
+                    .get("notify_channel")
+                    .and_then(|v| v.as_str())
+                    .is_none()
+                    || args
+                        .get("notify_chat_id")
+                        .and_then(|v| v.as_str())
+                        .is_none()
                 {
                     return tool_error(
                         "a one-shot schedule (RFC3339 instant) also needs notify_channel and \
@@ -520,7 +531,10 @@ pub(crate) async fn check_task_update_by_employee(
             .map_err(|r| tool_error(&r))?;
     }
     if current.goal_mode {
-        if let Some(field) = ["title", "description"].into_iter().find(|f| args.get(*f).is_some()) {
+        if let Some(field) = ["title", "description"]
+            .into_iter()
+            .find(|f| args.get(*f).is_some())
+        {
             audit_record_refused(
                 home_dir,
                 me,
@@ -679,11 +693,28 @@ pub(crate) async fn handle_tasks_update(
     if fields.is_empty() {
         return tool_error("no fields to update");
     }
+    super::workflow_operation::effect_start();
     let updated = match store.update_task(task_id, &Value::Object(fields)).await {
         Ok(Some(r)) => r,
         Ok(None) => return tool_error(&format!("task not found: {task_id}")),
         Err(e) => return tool_error(&format!("update task: {e}")),
     };
+    // A successful SQLite write is confirmed by exact readback before receipt.
+    if let Ok(Some(readback)) = store.get_task(task_id).await {
+        let expected = task_row_to_json(&updated);
+        let observed = task_row_to_json(&readback);
+        if expected == observed {
+            super::workflow_operation::effect_committed(
+                serde_json::json!({
+                    "adapter": "tasks_update",
+                    "adapter_version": 1,
+                    "task_id": task_id,
+                    "row": observed,
+                    "row_hash": duduclaw_gateway::approval::payload_hash(&expected)
+                }),
+            );
+        }
+    }
     append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;
     tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
 }
@@ -714,7 +745,9 @@ pub(crate) async fn handle_tasks_claim(
     if let Some(me) = actor.agent() {
         match store.get_task(task_id).await {
             Ok(Some(t)) => {
-                if let Err(reason) = check_actor_identity(home_dir, actor, &t.assigned_to, "tasks_claim") {
+                if let Err(reason) =
+                    check_actor_identity(home_dir, actor, &t.assigned_to, "tasks_claim")
+                {
                     return tool_error(&reason);
                 }
                 if !t.assigned_to.is_empty() && t.assigned_to != me {
@@ -819,7 +852,11 @@ pub(crate) async fn handle_tasks_claim(
 /// G1: explicit lease heartbeat for external agent processes that claimed a
 /// task via `tasks_claim`. Extends the lease by one full window; only the
 /// claiming agent can renew (`claimed_by` guard in the store — fail-closed).
-pub(crate) async fn handle_tasks_renew(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+pub(crate) async fn handle_tasks_renew(
+    args: &Value,
+    home_dir: &Path,
+    default_agent: &str,
+) -> Value {
     let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
     if task_id.is_empty() {
         return tool_error("task_id is required");

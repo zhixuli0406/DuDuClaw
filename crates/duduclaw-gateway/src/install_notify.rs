@@ -329,7 +329,7 @@ pub(crate) async fn apply_decision(
     // one). Existing file only — filing a decision must never conjure an auth
     // database as a side effect; an absent one simply means nobody is
     // identified, which is the same refusal an unmapped account gets.
-    let Some(db) = crate::decision_notify::open_user_db(home_dir) else {
+    let Some(db) = crate::decision_notify::open_user_db(home_dir)? else {
         return Err(crate::decision_notify::refusal_text(
             crate::decision_notify::PressAuth::DenyUnknown,
             "核准",

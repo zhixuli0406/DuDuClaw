@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use cron::Schedule;
 use tokio::sync::{Notify, RwLock};
 use tracing::{info, warn};
@@ -111,6 +111,7 @@ pub struct CronScheduler {
     /// Fired by [`CronScheduler::reload_now`] to wake the run loop for an
     /// immediate reload. Consumed inside a `tokio::select!`.
     reload_notify: Arc<Notify>,
+    workflow_service: Option<Arc<crate::workflow::WorkflowService>>,
 }
 
 impl CronScheduler {
@@ -126,7 +127,95 @@ impl CronScheduler {
             tasks: Arc::new(RwLock::new(Vec::new())),
             semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CRON)),
             reload_notify: Arc::new(Notify::new()),
+            workflow_service: None,
         }
+    }
+
+    /// Inject the same production workflow service used by queue dispatch.
+    /// Useful when the CLI executable is configured explicitly rather than current_exe.
+    pub fn with_workflow_service(mut self, service: Arc<crate::workflow::WorkflowService>) -> Self {
+        self.workflow_service = Some(service);
+        self
+    }
+
+    pub(crate) async fn run_now_metadata(&self, task_id: &str) -> Result<(String, bool), String> {
+        let row = self.store.get(task_id).await?.ok_or("cron task missing")?;
+        Ok((row.name, self.store.workflow_binding(task_id).await?.is_some()))
+    }
+
+    /// Actual routine tick, shared by the live scheduler and recovery callers.
+    /// Missed occurrences coalesce to the latest slot in the past 24 hours;
+    /// older slots are deliberately skipped, never replayed as a burst.
+    /// Cursor advancement follows durable enqueue, so restart retries the same trigger.
+    pub async fn tick_at(&self, now: DateTime<Utc>) -> Result<Vec<String>, String> {
+        let mut runs = Vec::new();
+        let mut errors = Vec::new();
+        for row in self.store.list_enabled().await? {
+            let Some((_, material_hash)) = self.store.workflow_binding(&row.id).await? else { continue };
+            let outcome: Result<Option<String>, String> = async {
+                let mut cursor = self.store.routine_cursor(&row.id, &material_hash).await?;
+                // Occurrences older than the catch-up window are given up on
+                // once, with a durable record, instead of vanishing silently.
+                if let Some((from, to, slots)) = routine_skipped_slots(&row, cursor, now)? {
+                    self.store
+                        .record_routine_skip(&row.id, &material_hash, from, to, slots)
+                        .await?;
+                    warn!(id = %row.id, slots, "workflow routine occurrences skipped beyond catch-up window");
+                    cursor = to;
+                }
+                let Some(slot) = latest_routine_slot(&row, cursor, now)? else { return Ok(None) };
+                let trigger = crate::workflow::Trigger::Scheduled {
+                    cron_id: row.id.clone(),
+                    timezone: row.cron_timezone.clone().ok_or("workflow cron timezone missing")?,
+                    scheduled_at: slot.to_rfc3339(),
+                };
+                let run = enqueue_routine_trigger(
+                    &self.home_dir,
+                    &self.store,
+                    &row.id,
+                    trigger,
+                    self.workflow_service.as_deref()
+                )
+                .await?;
+                self.store
+                    .advance_routine_cursor(&row.id, &material_hash, slot.timestamp())
+                    .await?;
+                Ok(Some(run))
+            }.await;
+            match outcome {
+                Ok(Some(run)) => runs.push(run),
+                Ok(None) => (),
+                Err(error) => {
+                    // One routine's failure never stops the others, and the
+                    // same refusal is recorded once, not every tick.
+                    if row.last_error.as_deref() != Some(error.as_str()) {
+                        if let Err(e) = self.store.record_run(&row.id, false, Some(&error)).await {
+                            warn!(id = %row.id, error = %e, "routine refusal not recorded");
+                        }
+                    }
+                    errors.push(format!("{}: {error}", row.id));
+                }
+            }
+        }
+        if errors.is_empty() { Ok(runs) } else { Err(errors.join("; ")) }
+    }
+
+    /// Caller-stable manual request id is independent of all scheduled slots.
+    pub async fn run_now_with_request_id(&self, task_id: &str, request_id: &str) -> Result<String, String> {
+        if request_id.is_empty() || request_id.len() > 256 { return Err("invalid routine request id".into()); }
+        if self.store.workflow_binding(task_id).await?.is_some() {
+            return enqueue_routine_trigger(
+                &self.home_dir,
+                &self.store,
+                task_id,
+                crate::workflow::Trigger::Manual {
+                    request_id: request_id.into()
+                },
+                self.workflow_service.as_deref()
+            )
+            .await;
+        }
+        self.run_now_legacy(task_id).await
     }
 
     /// Signal the run loop to reload from the store **immediately**. Safe to
@@ -141,14 +230,25 @@ impl CronScheduler {
     /// same delegation env, same channel delivery, same run recording — so
     /// the outcome lands in the store's run history just like any other fire.
     ///
-    /// Works regardless of the task's `enabled` state (so a routine can be
-    /// tested before being switched on) and respects the same concurrency
+    /// Legacy prompt tasks can be tested regardless of `enabled`. Typed
+    /// routines require an enabled row plus current activation authority and
+    /// return their durable workflow run id synchronously. Legacy tasks respect the same concurrency
     /// semaphore as scheduled fires. The execution is spawned in the
     /// background and this returns immediately with the task's display name;
     /// the caller (dashboard RPC) polls the run history to see the result.
     /// Returns an error only when the id is unknown or the store is
     /// unreadable.
     pub async fn run_now(&self, task_id: &str) -> Result<String, String> {
+        // E-H4: a workflow routine's manual run is keyed by the caller's
+        // request id so a retry reconnects to the same run; a fresh random id
+        // here would start a second run on every retry.
+        if self.store.workflow_binding(task_id).await?.is_some() {
+            return Err(WORKFLOW_MANUAL_REQUEST_ID_REQUIRED.into());
+        }
+        self.run_now_legacy(task_id).await
+    }
+
+    async fn run_now_legacy(&self, task_id: &str) -> Result<String, String> {
         let row = self
             .store
             .get(task_id)
@@ -190,6 +290,13 @@ impl CronScheduler {
 
         let mut new_live = Vec::with_capacity(raw_tasks.len());
         for task in raw_tasks {
+            // Typed routines use the durable occurrence cursor in tick_at, not
+            // legacy last_run_at (which manual executions also modify).
+            match self.store.workflow_binding(&task.id).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => (),
+                Err(error) => { warn!(id=%task.id, "cron binding unavailable: {error}"); continue; }
+            }
             let expr = normalise_cron(&task.cron);
             match expr.parse::<Schedule>() {
                 Ok(schedule) => {
@@ -249,6 +356,10 @@ impl CronScheduler {
 
             self.reload().await;
 
+            if let Err(error) = self.tick_at(Utc::now()).await {
+                warn!("workflow routine tick refused: {error}");
+            }
+
             // ── WP2.6 P1: scheduler-level daily skill-gap digest ──
             // Rides the existing 30s tick (no new scheduler, mirroring the
             // heartbeat task-board pull precedent). Internally gated: default
@@ -306,6 +417,142 @@ impl CronScheduler {
     }
 }
 
+/// Routine timezone and schedule, failing closed on anything unparseable.
+fn routine_schedule(task: &CronTaskRow) -> Result<(chrono_tz::Tz, Schedule), String> {
+    if task.trigger_kind != "time" {
+        return Err("workflow cron requires time trigger".into());
+    }
+    let timezone: chrono_tz::Tz = task
+        .cron_timezone
+        .as_deref()
+        .ok_or("workflow cron timezone missing")?
+        .parse()
+        .map_err(|_| "invalid workflow cron timezone")?;
+    let schedule: Schedule = normalise_cron(&task.cron)
+        .parse()
+        .map_err(|_| "invalid workflow cron expression")?;
+    Ok((timezone, schedule))
+}
+
+/// Hours of missed occurrences a routine may still catch up on (one run).
+const ROUTINE_CATCH_UP_HOURS: i64 = 24;
+/// Upper bound when counting occurrences given up on, for the skip record.
+const ROUTINE_SKIP_COUNT_CAP: u64 = 10_000;
+
+/// Return a canonical UTC occurrence, preserving seconds and DST offsets.
+/// The UTC instant differentiates the two occurrences in a repeated local hour.
+/// Walks the schedule backwards from `now` (no per-second scan): the cron
+/// iterator yields both instants of a repeated local time and none in a gap.
+fn latest_routine_slot(
+    task: &CronTaskRow,
+    cursor: i64,
+    now: DateTime<Utc>
+) -> Result<Option<DateTime<Utc>>, String> {
+    let (timezone, schedule) = routine_schedule(task)?;
+    let horizon = now - chrono::Duration::hours(ROUTINE_CATCH_UP_HOURS);
+    let cursor = DateTime::<Utc>::from_timestamp(cursor, 0).ok_or("invalid routine cursor")?;
+    let now = DateTime::<Utc>::from_timestamp(now.timestamp(), 0).ok_or("invalid routine time")?;
+    if cursor >= now { return Ok(None); }
+    let start = cursor.max(horizon);
+    let probe = (now + chrono::Duration::seconds(1)).with_timezone(&timezone);
+    for candidate in schedule.after(&probe).rev() {
+        let instant = candidate.with_timezone(&Utc);
+        // Ambiguous local times yield their later instant first.
+        if instant > now { continue; }
+        if instant <= start { return Ok(None); }
+        if schedule.includes(instant.with_timezone(&timezone)) { return Ok(Some(instant)); }
+    }
+    Ok(None)
+}
+
+/// Occurrences after `cursor` that fell out of the catch-up window and are
+/// given up on: `(from, to, count)` with `to` the window start. `None` when
+/// the cursor is inside the window or nothing was scheduled in between.
+fn routine_skipped_slots(
+    task: &CronTaskRow,
+    cursor: i64,
+    now: DateTime<Utc>
+) -> Result<Option<(i64, i64, u64)>, String> {
+    let (timezone, schedule) = routine_schedule(task)?;
+    let horizon = DateTime::<Utc>::from_timestamp(now.timestamp(), 0)
+        .ok_or("invalid routine time")?
+        - chrono::Duration::hours(ROUTINE_CATCH_UP_HOURS);
+    let from = DateTime::<Utc>::from_timestamp(cursor, 0).ok_or("invalid routine cursor")?;
+    if from >= horizon { return Ok(None); }
+    let mut count = 0u64;
+    for candidate in schedule.after(&from.with_timezone(&timezone)) {
+        if candidate.with_timezone(&Utc) > horizon || count >= ROUTINE_SKIP_COUNT_CAP { break; }
+        count += 1;
+    }
+    Ok((count > 0).then_some((cursor, horizon.timestamp(), count)))
+}
+
+/// Server-side trigger validation seam; accepts only exact whole-second slots.
+pub(crate) fn routine_slot_matches(expression: &str, timezone: &str, scheduled_at: &str) -> Result<bool, String> {
+    let instant = DateTime::parse_from_rfc3339(scheduled_at).map_err(|_| "invalid scheduled slot")?;
+    let timezone: chrono_tz::Tz = timezone.parse().map_err(|_| "invalid routine timezone")?;
+    let schedule: Schedule = normalise_cron(expression).parse().map_err(|_| "invalid routine schedule")?;
+    Ok(instant.timestamp_subsec_nanos() == 0 && schedule.includes(instant.with_timezone(&timezone)))
+}
+
+/// Every typed entry point rereads the current cron row and server-owned binding.
+/// Authorization/fixed revision/fixtures/policy/skill checks belong to the service.
+async fn enqueue_routine_trigger(
+    home_dir: &Path, store: &Arc<CronStore>, task_id: &str,
+    trigger: crate::workflow::Trigger, injected: Option<&crate::workflow::WorkflowService>,
+) -> Result<String, String> {
+    let task = store.get(task_id).await?.ok_or("workflow cron missing")?;
+    if !task.enabled { return Err("workflow cron disabled".into()); }
+    let (activation_id, material_hash) = store.workflow_binding(task_id).await?.ok_or("workflow cron binding missing")?;
+    let owned;
+    let service = match injected {
+        Some(service) => service,
+        None => {
+            let workflow = Arc::new(crate::workflow::WorkflowStore::open(home_dir)?);
+            let broker = Arc::new(crate::approval::ApprovalBroker::open(home_dir)?);
+            owned = crate::workflow::WorkflowService::new(
+                home_dir.to_path_buf(),
+                std::env::current_exe().map_err(|e| e.to_string())?,
+                workflow,
+                broker
+            )?;
+            &owned
+        }
+    };
+    let activation = service
+        .activation(&activation_id)
+        .await?
+        .ok_or("workflow activation unavailable")?;
+    let cron = activation
+        .request
+        .cron
+        .as_ref()
+        .ok_or("workflow routine unavailable")?;
+    if task.trigger_kind != "time"
+        || activation.material_hash != material_hash
+        || cron.cron_id != task.id
+        || cron.expression != task.cron
+        || task.cron_timezone.as_deref() != Some(cron.timezone.as_str())
+        || activation.request.spec.actor != task.agent_id
+    {
+        return Err("workflow cron immutable binding changed".into());
+    }
+    if let crate::workflow::Trigger::Scheduled {
+        cron_id,
+        timezone,
+        scheduled_at
+    } = &trigger
+    {
+        if cron_id != &task.id
+            || timezone != &cron.timezone
+            || !routine_slot_matches(&task.cron, timezone, scheduled_at)?
+        {
+            return Err("scheduled trigger is not a routine occurrence".into());
+        }
+    }
+    service.enqueue_trigger(&activation_id, trigger, serde_json::json!({})).await
+}
+
 /// Route a due cron task through its trigger gate (G3), then execute it if the
 /// gate passes.
 ///
@@ -324,6 +571,47 @@ async fn dispatch_cron_task(
     task: &CronTaskRow,
     invoker: &dyn AgentInvoker,
 ) {
+    dispatch_cron_task_with_slot(home_dir,store,registry,task,invoker,None).await;
+}
+async fn dispatch_cron_task_with_slot(
+    home_dir:&std::path::Path,store:&Arc<CronStore>,registry:&Arc<RwLock<AgentRegistry>>,
+    task:&CronTaskRow,invoker:&dyn AgentInvoker,slot:Option<String>,
+) {
+    match store.workflow_binding(&task.id).await {
+        Ok(Some((activation_id,material_hash))) => {
+            let _ = (activation_id, material_hash);
+            let trigger = match slot {
+                Some(scheduled_at) => crate::workflow::Trigger::Scheduled {
+                    cron_id: task.id.clone(),
+                    timezone: task.cron_timezone.clone().unwrap_or_default(),
+                    scheduled_at
+                },
+                // A manual workflow run needs the caller's request id
+                // (`run_now_with_request_id`); never invent one here.
+                None => {
+                    let _ = store
+                        .record_run(&task.id, false, Some(WORKFLOW_MANUAL_REQUEST_ID_REQUIRED))
+                        .await;
+                    return;
+                }
+            };
+            let outcome = enqueue_routine_trigger(home_dir, store, &task.id, trigger, None).await;
+            // An enqueue is not an execution receipt. Never record success here.
+            if let Err(error) = outcome {
+                warn!(id=%task.id,"workflow cron enqueue refused: {error}");
+                let _ = store.record_run(&task.id, false, Some(&error)).await;
+            }
+            return;
+        },
+        Ok(None)=>(),
+        Err(error)=>{
+            warn!(id=%task.id,"workflow cron binding unreadable: {error}");
+            // Unreadable binding: refuse visibly, never fall back to the
+            // legacy prompt path.
+            let _ = store.record_run(&task.id, false, Some(&format!("workflow cron binding unreadable: {error}"))).await;
+            return;
+        },
+    }
     use crate::condition_eval::{TriggerKind, evaluate_condition, evaluate_on_exit};
 
     // ── P3 runaway guard: cross-process circuit breaker on the cron feedback
@@ -870,6 +1158,10 @@ pub fn start_cron_scheduler(
 /// cross-process `dispatch_guard` breaker exactly like a scheduled fire.
 ///
 /// Returns a short human-readable summary of the recorded run on success.
+/// Refusal for a manual run of a workflow-bound routine without a caller
+/// request id (MCP `run_cron_task`, `run_now`, any path that would invent one).
+pub const WORKFLOW_MANUAL_REQUEST_ID_REQUIRED: &str = "這是已啟用工作流的排程，手動觸發只能由儀表板帶 request_id 進行（重試會接回同一個執行，不會重跑）";
+
 pub async fn run_cron_task_now_standalone(
     home_dir: &Path,
     id_or_name: &str,
@@ -894,6 +1186,9 @@ async fn run_cron_task_now_with(
             .await?
             .ok_or_else(|| format!("找不到排程任務：{id_or_name}"))?,
     };
+    if store.workflow_binding(&row.id).await?.is_some() {
+        return Err(WORKFLOW_MANUAL_REQUEST_ID_REQUIRED.into());
+    }
 
     // Scan the agents directory so the invoker can resolve the target agent's
     // config exactly as the gateway would. Best-effort: a scan error still
@@ -920,6 +1215,10 @@ async fn run_cron_task_now_with(
         fails = updated.failure_count,
     ))
 }
+
+#[cfg(test)]
+#[path = "cron_routine_tests.rs"]
+mod routine_tests;
 
 #[cfg(test)]
 mod tests {

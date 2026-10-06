@@ -175,7 +175,7 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 - **只有 Claude runtime 會跑這些 hook。** Codex、Gemini、Antigravity 與其他 runtime 靠各自的沙箱旗標。
 - **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。
 - **`data-file-guard` 是啟發式。** 它比對 `Bash` 指令列裡的檔名，動態組出來的路徑就繞得過去。（它已不再在 Windows 上失效——H10 已把它改成 Rust 子命令。）
-- **沒有威脅等級狀態機。** `~/.duduclaw/threat_level` 還在，作為 computer use 協調器會輪詢的操作者 kill switch（`RED` 中止、`YELLOW` 暫停），但工作區內已沒有任何東西會寫它。檔案不存在或讀不到就視為 `GREEN`。
+- **沒有威脅等級狀態機。** `~/.duduclaw/threat_level` 還在，作為 computer use 協調器會輪詢的操作者 kill switch（`RED` 中止、`YELLOW` 暫停），但工作區內已沒有任何東西會寫它。檔案不存在才視為 `GREEN`；檔案存在卻讀不到，或內容不是 `GREEN`／`YELLOW`／`RED` 其中之一，間隔 50 毫秒再讀兩次後仍是如此，就視為 `RED`（fail closed）；開頭的 UTF-8 BOM 與前後空白會略過。
 - *（2026-09 移除。）* 本節原本註明 PTY session pool 不在去識別化改寫的涵蓋範圍內。該連線池已不存在——每次 Claude spawn 都是單次 spawn，正好就是改寫掛鉤的地方。
 
 ---
@@ -192,3 +192,7 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 ## 總結
 
 四道各自明講失效模式的守衛，勝過一個底下已經沒有程式碼的三層故事。防線被移除時，文件必須跟著移除：一頁描述著不存在的 shell 腳本的文件比沒有文件更糟，因為它會讓操作者停止繼續找。
+
+## 頻道核准的保存與核對
+
+高風險 Computer Use 使用原帳號及原對話或討論串送出確認，回覆 `確認 <完整 UUID>` 或 `取消 <完整 UUID>`；問題使用 `回答 <完整 UUID> <答案>`，不授權工具。單獨的是、A/B 不會選取請求。執行前重驗畫面、視窗、政策與取消狀態，重啟會讓舊畫面核准失效。沒有收據的執行成為 `uncertain`，需 Admin 核對。支援入口及限制見[操作指南](../../guides/durable-channel-decisions.md)。

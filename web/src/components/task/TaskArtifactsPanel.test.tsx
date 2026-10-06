@@ -102,8 +102,10 @@ describe('<TaskArtifactsList> (pure, props-driven)', () => {
       />,
     );
     expect(screen.queryByLabelText('Download')).not.toBeInTheDocument();
-    // It says where the file is instead of offering a link that would 404.
-    expect(screen.getByText(/no archived copy to download/)).toBeInTheDocument();
+    // It explains there is no copy instead of offering a link that would 404,
+    // and never prints the internal path.
+    expect(screen.getByText(/No archived copy of this file/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/\.duduclaw|\/home\//);
     expect(screen.getByText('Round 3')).toBeInTheDocument();
   });
 
@@ -129,6 +131,49 @@ describe('<TaskArtifactsPanel> (fetching wrapper)', () => {
   it('reports an RPC failure to the user', async () => {
     mockWsClient.call.mockRejectedValue(new Error('rpc down'));
     renderWithProviders(<TaskArtifactsPanel taskId="task-42" />);
-    expect(await screen.findByText('rpc down')).toBeInTheDocument();
+    expect(await screen.findByText('Could not load the deliverables. Try again later.')).toBeInTheDocument();
+    expect(screen.queryByText('rpc down')).not.toBeInTheDocument();
+  });
+});
+
+describe('P1 immutable artifact references', () => {
+  it('keeps legacy artifacts unverified', () => {
+    renderWithProviders(<TaskArtifactsList artifacts={[artifact()]} />);
+    expect(screen.getByText('Unverified')).toBeInTheDocument();
+    expect(screen.queryByText('Test evidence')).not.toBeInTheDocument();
+  });
+  it('shows a verified self-report beside stale bytes, with the captured hash', () => {
+    const row = { ...artifact(), evidence: { task_revision: 1, content_hash: 'captured-hash', evidence_kind: 'self_report' as const, run_id: 'actual-run', audience: [], snapshot_verified: true }, integrity: 'stale' as const, stale_reasons: ['artifact_content_changed'] };
+    renderWithProviders(<TaskArtifactsList artifacts={[row]} />);
+    expect(screen.getByText('Stale')).toBeInTheDocument();
+    expect(screen.getByText('Self-report')).toBeInTheDocument();
+    expect(screen.getByText('The file changed after it was captured')).toBeInTheDocument();
+    expect(screen.queryByText('artifact_content_changed')).not.toBeInTheDocument();
+    expect(screen.getByText(/captured-hash/)).toBeInTheDocument();
+    expect(screen.getByText(/actual-run/)).toBeInTheDocument();
+    expect(screen.queryByText('Test evidence')).not.toBeInTheDocument();
+  });
+  it('does not show an operator-accepted badge for a ledger row the server did not verify', () => {
+    const row = { ...artifact(), evidence: { task_revision: 1, content_hash: 'forged-hash', evidence_kind: 'operator' as const, run_id: 'forged-run', audience: [] }, integrity: 'current' as const };
+    renderWithProviders(<TaskArtifactsList artifacts={[row]} />);
+    expect(screen.queryByText('Operator accepted')).not.toBeInTheDocument();
+    expect(screen.getByText('Record not verified against a snapshot')).toBeInTheDocument();
+    expect(screen.queryByText(/forged-hash|forged-run/)).not.toBeInTheDocument();
+  });
+  it('shows the operator-accepted badge only when the server marks the row snapshot-verified', () => {
+    const row = { ...artifact(), evidence: { task_revision: 1, content_hash: 'h', evidence_kind: 'operator' as const, run_id: null, audience: [], snapshot_verified: true }, integrity: 'current' as const };
+    renderWithProviders(<TaskArtifactsList artifacts={[row]} />);
+    expect(screen.getByText('Operator accepted')).toBeInTheDocument();
+  });
+  it('ignores a late artifact response for the previous task', async () => {
+    let resolveOld!: (v: unknown) => void;
+    mockWsClient.call.mockImplementationOnce(() => new Promise((r) => { resolveOld = r; }));
+    mockWsClient.call.mockResolvedValueOnce({ artifacts: [artifact({ name: 'new-task.docx' })], truncated: false, inferred_count: 0 });
+    const rendered = renderWithProviders(<TaskArtifactsPanel taskId="task-a" />);
+    rendered.rerender(<TaskArtifactsPanel taskId="task-b" />);
+    expect(await screen.findByText('new-task.docx')).toBeInTheDocument();
+    resolveOld({ artifacts: [artifact({ name: 'old-task.docx' })], truncated: false, inferred_count: 0 });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByText('old-task.docx')).not.toBeInTheDocument();
   });
 });

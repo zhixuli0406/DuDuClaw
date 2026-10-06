@@ -47,6 +47,10 @@ impl ApprovalBroker {
             notify_chat_id: None,
             reminded_at: None,
             simulation: None,
+            request_kind: RequestKind::Approval,
+            binding: None,
+            answer: None,
+            invalidated_reason: None,
         };
         let id = rec.id.clone();
         self.store.insert(&rec).await?;
@@ -104,6 +108,10 @@ impl ApprovalBroker {
             notify_channel: None,
             notify_chat_id: None,
             reminded_at: None,
+            request_kind: RequestKind::Approval,
+            binding: None,
+            answer: None,
+            invalidated_reason: None,
             simulation: if simulation.is_empty() {
                 None
             } else {
@@ -130,7 +138,7 @@ impl ApprovalBroker {
     /// signature untouched (every existing caller keeps working) while making
     /// the notification automatically OFF under `open_in_memory` — so no unit
     /// test ever attempts a network send.
-    fn home_dir(&self) -> Option<PathBuf> {
+    pub(super) fn home_dir(&self) -> Option<PathBuf> {
         self.store
             .db_path
             .as_ref()
@@ -140,7 +148,7 @@ impl ApprovalBroker {
     /// WP20: push the freshly-filed approval to a channel and record where it
     /// landed. Silent no-op for in-memory stores and for kinds that own their
     /// own notification ([`SELF_NOTIFYING_KINDS`]).
-    async fn push_new_request(&self, rec: &ApprovalRecord) {
+    pub(super) async fn push_new_request(&self, rec: &ApprovalRecord) {
         if SELF_NOTIFYING_KINDS.contains(&rec.action_kind.as_str()) {
             return;
         }
@@ -172,6 +180,13 @@ impl ApprovalBroker {
     /// from the paths that already read a pending row, so no new loop exists.
     pub(super) async fn maybe_remind(&self, rec: &ApprovalRecord, now: DateTime<Utc>) {
         if !rec.reminder_due(now) {
+            return;
+        }
+        // F5-C (review F4-L7): a bound request is answered only in the exact
+        // account, conversation and person it is bound to, by full id. The
+        // legacy reminder would push a button card with an employee's bot
+        // token to `notify_chat_id`, so bound rows are never reminded here.
+        if rec.binding.is_some() {
             return;
         }
         let Some(home) = self.home_dir() else { return };
@@ -278,6 +293,20 @@ impl ApprovalBroker {
             .get(id)
             .await?
             .ok_or_else(|| format!("approval {id} not found"))?;
+        if rec.binding.is_some() || rec.request_kind != RequestKind::Approval {
+            return Err("bound requests require authenticated decision context".into());
+        }
+        if rec.is_stale(Utc::now()) {
+            self.store
+                .decide_if_pending(
+                    id,
+                    ApprovalStatus::Expired,
+                    DECIDED_BY_TTL,
+                    &Utc::now().to_rfc3339(),
+                )
+                .await?;
+            return Err("approval expired".into());
+        }
         if rec.status.is_terminal() {
             return Err(format!(
                 "approval {id} already {} — refusing to change terminal state",
@@ -335,14 +364,27 @@ impl ApprovalBroker {
     pub async fn withdraw(&self, id: &ApprovalId, decided_by: &str) -> Result<bool, String> {
         let n = self
             .store
-            .decide_if_pending(id, ApprovalStatus::Denied, decided_by, &Utc::now().to_rfc3339())
+            .decide_if_pending(
+                id,
+                ApprovalStatus::Denied,
+                decided_by,
+                &Utc::now().to_rfc3339(),
+            )
             .await?;
         Ok(n > 0)
     }
 
     /// Overwrite an approval's summary and payload (data-subject erase).
-    pub async fn replace_text(&self, id: &ApprovalId, summary: &str, payload: &Value) -> Result<(), String> {
-        self.store.replace_text(id, summary, payload).await.map(|_| ())
+    pub async fn replace_text(
+        &self,
+        id: &ApprovalId,
+        summary: &str,
+        payload: &Value,
+    ) -> Result<(), String> {
+        self.store
+            .replace_text(id, summary, payload)
+            .await
+            .map(|_| ())
     }
 
     /// Sweep: mark every pending approval past its TTL as `expired`.

@@ -80,6 +80,18 @@ impl MethodHandler {
                 self.handle_ticks_recent(params).await
             }
             // ── v1.68: [[tick.sources]] CRUD (admin; hot-respawns the tasks) ──
+            "channel_ingress.list" => {
+                require_admin!();
+                self.handle_channel_ingress_list(params, ctx).await
+            }
+            "channel_ingress.resolve" => {
+                require_admin!();
+                self.handle_channel_ingress_resolve(params, ctx).await
+            }
+            "channel_ingress.inspect" => {
+                require_admin!();
+                self.handle_channel_ingress_inspect(params, ctx).await
+            }
             "tick.sources.list" => {
                 require_admin!();
                 self.handle_tick_sources_list().await

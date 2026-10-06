@@ -434,7 +434,7 @@ async fn gate_consequential(
 
     match broker.await_decision(&id, APPROVAL_POLL_INTERVAL).await {
         Ok(ApprovalStatus::Approved) => Ok(id.to_string()),
-        Ok(ApprovalStatus::Denied) => {
+        Ok(ApprovalStatus::Denied | ApprovalStatus::Answered | ApprovalStatus::Invalidated) => {
             let detail = format!("審批已拒絕（審核編號 {id}）");
             duduclaw_security::audit::append_tool_call_denied(
                 home_dir,

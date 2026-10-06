@@ -17,6 +17,7 @@ import { Badge, Empty, Skeleton, buttonVariants } from '@/components/mds';
 import { cn } from '@/lib/utils';
 import { timeAgo } from '@/lib/format';
 import { useAuthStore } from '@/stores/auth-store';
+import { reasonList } from '@/components/workflow/workflow-text';
 import { api, type TaskArtifact, type TaskArtifacts } from '@/lib/api';
 
 /**
@@ -43,6 +44,15 @@ import { api, type TaskArtifact, type TaskArtifacts } from '@/lib/api';
  * reuse it with a different row source; `TaskArtifactsPanel` is the thin
  * fetching wrapper.
  */
+
+type ReviewedTaskArtifact = TaskArtifact & {
+  /** `snapshot_verified` is set by the server only when the row was checked
+   *  against a review snapshot; without it the row is a plain ledger entry
+   *  and must not be shown as test or operator evidence. */
+  evidence?: { task_revision: number; content_hash: string | null; evidence_kind: 'self_report' | 'test' | 'operator'; run_id: string | null; audience: string[]; snapshot_verified?: boolean } | null;
+  integrity?: 'current' | 'stale' | 'unverified';
+  stale_reasons?: string[];
+};
 
 const EXT_ICON: Array<[RegExp, typeof FileIcon]> = [
   [/\.(xlsx?|csv|ods)$/i, FileSpreadsheet],
@@ -90,12 +100,13 @@ function ArtifactRow({
   artifact,
   fileUrl,
 }: {
-  artifact: TaskArtifact;
+  artifact: ReviewedTaskArtifact;
   fileUrl: (base: string, a: TaskArtifact) => string | null;
 }) {
   const intl = useIntl();
   const Icon = artifactIcon(artifact.name);
   const preview = artifact.archived_name ? previewKind(artifact.name) : null;
+  const verified = artifact.evidence?.snapshot_verified === true;
   const downloadHref = fileUrl('/api/files/download', artifact);
   const previewHref =
     preview === 'office' ? fileUrl('/api/files/preview', artifact) : downloadHref;
@@ -113,6 +124,14 @@ function ArtifactRow({
           <Badge variant="secondary">
             {intl.formatMessage({ id: `tasks.artifacts.origin.${artifact.origin}` })}
           </Badge>
+          <Badge variant="outline">
+            {intl.formatMessage({ id: `workflow.integrity.${artifact.integrity ?? 'unverified'}` })}
+          </Badge>
+          {artifact.evidence && (
+            <Badge variant="secondary">
+              {intl.formatMessage({ id: verified ? `workflow.evidence.${artifact.evidence.evidence_kind}` : 'workflow.evidence.recorded' })}
+            </Badge>
+          )}
           {artifact.attribution === 'inferred' && (
             <Badge variant="outline">
               <Info aria-hidden="true" />
@@ -128,15 +147,18 @@ function ArtifactRow({
           <span className="font-mono tabular-nums">{timeAgo(artifact.produced_at)}</span>
         </div>
 
+        {verified && artifact.evidence?.content_hash && <p className="break-all text-[11px] text-muted-foreground">{intl.formatMessage({ id: 'workflow.review.capturedHash' })}: <span className="font-mono">{artifact.evidence.content_hash}</span></p>}
+        {verified && artifact.evidence?.run_id && <p className="break-all text-[11px]">{intl.formatMessage({ id: 'workflow.run' })} <span className="font-mono">{artifact.evidence.run_id}</span></p>}
+        {artifact.integrity === 'stale' && artifact.stale_reasons && artifact.stale_reasons.length > 0 && (
+          <ul className="list-inside list-disc text-xs text-amber-700 dark:text-amber-400">
+            {reasonList(intl, artifact.stale_reasons).map((r) => <li key={r}>{r}</li>)}
+          </ul>
+        )}
+
         {/* Written but never archived — say where it is instead of offering a
             link that cannot resolve. */}
         {!artifact.archived_name && artifact.source_path && (
-          <p className="break-all font-mono text-[11px] text-muted-foreground">
-            {intl.formatMessage(
-              { id: 'tasks.artifacts.writtenAt' },
-              { path: artifact.source_path },
-            )}
-          </p>
+          <p className="text-[11px] text-muted-foreground">{intl.formatMessage({ id: 'workflow.artifact.notArchived' })}</p>
         )}
       </div>
 
@@ -181,7 +203,7 @@ export function TaskArtifactsList({
   jwt,
   className,
 }: {
-  artifacts: readonly TaskArtifact[];
+  artifacts: readonly ReviewedTaskArtifact[];
   inferredCount?: number;
   truncated?: boolean;
   loading?: boolean;
@@ -261,15 +283,17 @@ export function TaskArtifactsList({
 
 /** `TaskArtifactsList` plus the `tasks.artifacts` fetch for one task. */
 export function TaskArtifactsPanel({ taskId, className }: { taskId: string; className?: string }) {
+  const intl = useIntl();
   const jwt = useAuthStore((s) => s.jwt);
   const [data, setData] = useState<TaskArtifacts | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    setError(null);
+    setFailed(false);
+    setData(null);
     api.tasks
       .artifacts(taskId)
       .then((res) => {
@@ -278,7 +302,8 @@ export function TaskArtifactsPanel({ taskId, className }: { taskId: string; clas
       })
       .catch((e: unknown) => {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
+        void e;
+        setFailed(true);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -294,7 +319,7 @@ export function TaskArtifactsPanel({ taskId, className }: { taskId: string; clas
       inferredCount={data?.inferred_count ?? 0}
       truncated={data?.truncated ?? false}
       loading={loading}
-      error={error}
+      error={failed ? intl.formatMessage({ id: 'workflow.artifact.loadError' }) : null}
       jwt={jwt}
       className={className}
     />

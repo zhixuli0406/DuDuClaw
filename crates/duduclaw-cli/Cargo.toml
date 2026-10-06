@@ -105,6 +105,8 @@ http-body-util = "0.1"
 axum = { workspace = true }
 
 [features]
+# Explicit non-shipping subprocess fault-injection build; never enabled by default.
+workflow-test-checkpoints = []
 # Aligned with `duduclaw-gateway/default = ["dashboard", "desktop"]` so that
 # `cargo build -p duduclaw-cli --release` produces a binary whose web UI
 # routes are mounted (RFC-22 Phase 3 dashboard 404 caveat — without this,

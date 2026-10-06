@@ -91,6 +91,8 @@ pub fn manager_display_name(
         _ => return None,
     }
     let display = crate::decision_notify::open_user_db(home_dir)
+        .ok()
+        .flatten()
         .and_then(|db| {
             db.find_verified_user_id_by_channel(channel, channel_user_id)
                 .ok()

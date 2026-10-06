@@ -154,6 +154,8 @@ pub async fn notify_new_approval(
     home_dir: &Path,
     rec: &ApprovalRecord,
 ) -> Option<(String, String)> {
+    // Workflow audiences are checked in authenticated, task-scoped dashboard RPCs.
+    // Generic channel fallback cannot establish the private audience identity.
     push(home_dir, rec, false).await
 }
 
@@ -169,14 +171,42 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
 /// text decision that still arrives for one is refused (see
 /// [`apply_decision`]).
 ///
-/// `knowledge_quarantine` is the only member: approving it writes knowledge
+/// Members: `knowledge_quarantine`, `workflow_activation` and the LINE
+/// inbox operator changes (`channel_ingress::cli_approval`).
+///
+/// `knowledge_quarantine`: approving it writes knowledge
 /// with operator authority (a held claim is promoted, a burst is released),
 /// and a channel press can only be authorised by the push destination when no
 /// identity system is configured — which, for a claim that came from a chat,
 /// could be the very person who made the claim.
+///
+/// `workflow_activation` joined in F1b: accepting a workflow version grants a
+/// standing authority to act, only an Admin may decide it, and a channel
+/// press cannot establish that the presser is a current Admin.
 pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
     kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
+        || kind == crate::approval::WORKFLOW_ACTIVATION_KIND
+        // F2: operator-terminal LINE inbox changes (`duduclaw ops channel-ingress`).
+        || kind == crate::channel_ingress::cli_approval::ACTION_KIND
+        // P2-B: forget-by-source plans filed from the operator terminal.
         || kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE
+}
+
+/// What the dashboard answers when a dashboard-only card is decided after it
+/// lapsed. Each kind names itself; any other kind gets the general wording
+/// (F5-A: a LINE inbox card used to be called a knowledge review here).
+pub(crate) fn dashboard_only_expired_text(kind: &str) -> &'static str {
+    if kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE {
+        "這則知識審核已逾期，已自動捨棄，無法再核准。"
+    } else if kind == crate::approval::WORKFLOW_ACTIVATION_KIND {
+        "這個工作流程啟用審核已逾期，工作流程不會啟用；要啟用請重新送審。"
+    } else if kind == crate::channel_ingress::cli_approval::ACTION_KIND {
+        "這則收件處理指令的審核已逾期，指令不會執行；需要的話請重新下指令。"
+    } else if kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE {
+        "這筆忘記請求已逾期，已自動拒絕；請重新建立計畫。"
+    } else {
+        "這則審核已逾期，已自動拒絕，無法再核准。"
+    }
 }
 
 /// What a refused channel decision for a [`is_dashboard_only_kind`] approval
@@ -188,6 +218,12 @@ pub(crate) const DASHBOARD_ONLY_REFUSAL: &str =
 /// no claim text, no stored value and no decision verb — only that something
 /// is waiting, for which AI employee, and until when.
 pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
+    if rec.action_kind == crate::approval::WORKFLOW_ACTIVATION_KIND {
+        return activation_notice_body(rec, reminder);
+    }
+    if rec.action_kind == crate::channel_ingress::cli_approval::ACTION_KIND {
+        return crate::channel_ingress::cli_approval::notice_body(rec, reminder);
+    }
     if rec.action_kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE {
         return crate::memory_forget_approval::notice_body(rec, reminder, &deadline_phrase(rec));
     }
@@ -215,11 +251,36 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
     )
 }
 
+/// The plain notice for a workflow activation: no workflow name, steps or
+/// targets (those live behind the dashboard's access checks), only that an
+/// activation waits for an Admin and when it lapses.
+pub(crate) fn activation_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
+    let head = if reminder {
+        "⏰ 有一個工作流啟用審核快到期了，逾時會自動拒絕，工作流不會啟用"
+    } else {
+        "📥 有一個工作流等待啟用審核"
+    };
+    format!(
+        "{head}\n\
+         AI 員工：{agent}\n\
+         啟用審核只能由管理員在儀表板的待辦清單決定，請開啟儀表板處理。\n\
+         期限：{deadline}未審核將自動拒絕\n\
+         編號：{id}",
+        agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
+        deadline = deadline_phrase(rec),
+        id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
+    )
+}
+
 /// Destinations for a dashboard-only notice: the agent's own control
 /// channel, else the approvers' linked chats — never the originating
 /// conversation, which is excluded explicitly rather than by relying on the
 /// reply-channel task-local being absent.
-fn dashboard_only_targets(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Vec<(String, String)> {
+fn dashboard_only_targets(
+    home_dir: &Path,
+    rec: &ApprovalRecord,
+    reminder: bool,
+) -> Vec<(String, String)> {
     let origin = origin_target();
     let base = match (
         reminder,
@@ -252,7 +313,10 @@ fn dashboard_only_targets(home_dir: &Path, rec: &ApprovalRecord, reminder: bool)
 
 /// Test seam: the notice targets for a first push of `rec`.
 #[cfg(test)]
-pub(crate) fn dashboard_only_targets_for_test(home_dir: &Path, rec: &ApprovalRecord) -> Vec<(String, String)> {
+pub(crate) fn dashboard_only_targets_for_test(
+    home_dir: &Path,
+    rec: &ApprovalRecord,
+) -> Vec<(String, String)> {
     dashboard_only_targets(home_dir, rec, false)
 }
 
@@ -286,12 +350,15 @@ async fn push_dashboard_only(
     }
     let http = reqwest::Client::new();
     for (channel, chat_id) in targets {
-        let Some(token) = crate::goal_notify::channel_token(home_dir, &rec.agent_id, &channel).await
+        let Some(token) =
+            crate::goal_notify::channel_token(home_dir, &rec.agent_id, &channel).await
         else {
             continue;
         };
-        if crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text)
-            .await
+        if crate::channel_sender::send_plain_text(
+            home_dir, &http, &channel, &token, &chat_id, &text,
+        )
+        .await
         {
             return Some((channel, chat_id));
         }
@@ -415,6 +482,9 @@ pub(crate) async fn apply_decision(
     let Some(rec) = broker.get(&id).await.map_err(|e| e.to_string())? else {
         return Err("找不到這筆核可（可能已過期並被清除）".into());
     };
+    if rec.binding.is_some() || rec.request_kind != crate::approval::RequestKind::Approval {
+        return Err("此請求需由完整的帳號與會話身分入口處理。".into());
+    }
     let role = mapped_role(home_dir, channel, channel_user_id);
     // A generic manager or destination-only channel press cannot inspect the
     // admin-only Decision Lab. Check terminal rows before disclosing status.
@@ -716,6 +786,10 @@ mod tests {
             notify_chat_id: None,
             reminded_at: None,
             simulation: None,
+            request_kind: crate::approval::RequestKind::Approval,
+            binding: None,
+            answer: None,
+            invalidated_reason: None,
         }
     }
 
@@ -1109,8 +1183,16 @@ mod tests {
             .await
             .unwrap();
         for data in [
-            crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Approve, id.as_str()),
-            crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Deny, id.as_str()),
+            crate::decision_action::encode(
+                DecisionSource::Approval,
+                DecisionAct::Approve,
+                id.as_str(),
+            ),
+            crate::decision_action::encode(
+                DecisionSource::Approval,
+                DecisionAct::Deny,
+                id.as_str(),
+            ),
             format!("duduclaw:approval_ok:{}", id.as_str()),
         ] {
             let out = decide_from_channel(dir.path(), "telegram", "555", &data)
@@ -1134,6 +1216,33 @@ mod tests {
         assert!(!body.contains("同意") && !body.contains("核准"));
         r.payload = json!({});
         assert!(dashboard_only_notice_body(&r, true).contains("快到期"));
+    }
+
+    #[test]
+    fn each_dashboard_only_kind_has_its_own_expiry_text() {
+        let knowledge = dashboard_only_expired_text(crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE);
+        let activation = dashboard_only_expired_text(crate::approval::WORKFLOW_ACTIVATION_KIND);
+        let ingress = dashboard_only_expired_text(crate::channel_ingress::cli_approval::ACTION_KIND);
+        let other = dashboard_only_expired_text("something_else");
+        assert!(knowledge.contains("知識"));
+        assert!(activation.contains("工作流程") && !activation.contains("知識"));
+        assert!(ingress.contains("收件") && !ingress.contains("知識"));
+        assert!(!other.contains("知識") && other.contains("逾期"));
+    }
+
+    #[test]
+    fn activation_is_dashboard_only_with_its_own_notice() {
+        assert!(is_dashboard_only_kind(crate::approval::WORKFLOW_ACTIVATION_KIND));
+        assert!(!DASHBOARD_ONLY_REFUSAL.contains("知識"));
+        let mut r = rec(crate::approval::WORKFLOW_ACTIVATION_KIND);
+        r.summary = "接受固定工作流版本與排程範圍".into();
+        r.payload = json!({"kind": "workflow_activation", "draft_id": "secret-draft"});
+        let body = dashboard_only_notice_body(&r, false);
+        assert!(body.contains("工作流等待啟用審核") && body.contains("管理員"));
+        assert!(!body.contains("知識") && !body.contains("secret-draft"));
+        assert!(!body.contains("同意") && !body.contains("核准"));
+        let reminder = dashboard_only_notice_body(&r, true);
+        assert!(reminder.contains("快到期") && reminder.contains("不會啟用"));
     }
 
     #[tokio::test]

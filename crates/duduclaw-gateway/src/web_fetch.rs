@@ -396,6 +396,37 @@ pub async fn web_fetch_cached(
     ttl_seconds: u64,
     cache_dir: &Path,
 ) -> Result<FetchResult, FetchError> {
+    web_fetch_inner(url, ttl_seconds, cache_dir, false).await
+}
+
+/// Workflow-only public-page read: same URL/DNS/SSRF limits, no redirects,
+/// no credential forwarding and no stale cache or disk effect.
+/// The CLI validates the exact URL against its immutable workflow step first.
+pub fn validate_workflow_public_url(url: &str) -> Result<reqwest::Url, FetchError> {
+    // Reject userinfo before URL logging, DNS, HTTP or source evidence. Reqwest
+    // otherwise extracts it and automatically sends HTTP Basic Authorization.
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| FetchError::SsrfBlocked("invalid workflow public URL".into()))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(FetchError::SsrfBlocked(
+            "workflow public URL must not contain userinfo".into(),
+        ));
+    }
+    // Preserve the existing scheme/host/IP policy. Its errors contain only a
+    // classified reason, never the supplied full credential-bearing URL.
+    validate_url(url)
+}
+pub async fn web_fetch_workflow(url: &str) -> Result<FetchResult, FetchError> {
+    validate_workflow_public_url(url)?;
+    web_fetch_inner(url, 0, Path::new(""), true).await
+}
+
+async fn web_fetch_inner(
+    url: &str,
+    ttl_seconds: u64,
+    cache_dir: &Path,
+    workflow: bool,
+) -> Result<FetchResult, FetchError> {
     // 1. SSRF check.
     let validated = validate_url(url)?;
 
@@ -406,9 +437,11 @@ pub async fn web_fetch_cached(
         ttl_seconds
     };
 
-    if let Some(hit) = load_cache(url, ttl, cache_dir) {
-        info!(url, "web_fetch cache hit");
-        return Ok(hit);
+    if !workflow {
+        if let Some(hit) = load_cache(url, ttl, cache_dir) {
+            info!(url, "web_fetch cache hit");
+            return Ok(hit);
+        }
     }
 
     // 3. Live fetch.
@@ -437,7 +470,10 @@ pub async fn web_fetch_cached(
     // target for SSRF. The default `limited(5)` follows redirects blindly and
     // can be used to bypass the initial SSRF check (e.g. open-redirect to
     // http://169.254.169.254/).
-    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if workflow {
+            return attempt.stop();
+        }
         let url = attempt.url();
         // Block non-http(s) schemes in redirects.
         if url.scheme() != "http" && url.scheme() != "https" {
@@ -481,7 +517,7 @@ pub async fn web_fetch_cached(
         .build()
         .map_err(|e| FetchError::IoError(format!("failed to build pinned client: {e}")))?;
 
-    let response = pinned_client
+    let mut response = pinned_client
         .get(validated.as_str())
         .header("User-Agent", "DuDuClaw/1.0")
         // Blocks GCP metadata server from responding to SSRF requests.
@@ -513,13 +549,32 @@ pub async fn web_fetch_cached(
         }
     }
 
-    let bytes = response.bytes().await.map_err(|e| {
-        if e.is_timeout() {
-            FetchError::Timeout
-        } else {
-            FetchError::IoError(e.to_string())
+    let bytes = if workflow {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| FetchError::IoError(e.to_string()))?
+        {
+            if bytes.len().saturating_add(chunk.len()) as u64 > MAX_RESPONSE_SIZE {
+                return Err(FetchError::TooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
         }
-    })?;
+        bytes
+    } else {
+        response
+            .bytes()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    FetchError::Timeout
+                } else {
+                    FetchError::IoError(e.to_string())
+                }
+            })?
+            .to_vec()
+    };
 
     if bytes.len() as u64 > MAX_RESPONSE_SIZE {
         return Err(FetchError::TooLarge);
@@ -532,7 +587,12 @@ pub async fn web_fetch_cached(
         ));
     }
 
-    let body = String::from_utf8_lossy(&bytes).into_owned();
+    let body = if workflow {
+        String::from_utf8(bytes)
+            .map_err(|_| FetchError::IoError("workflow page body is not UTF-8".into()))?
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
 
     let result = FetchResult {
         url: url.to_string(),
@@ -544,8 +604,10 @@ pub async fn web_fetch_cached(
     };
 
     // 4. Persist to cache (best-effort).
-    if let Err(e) = save_cache(&result, cache_dir) {
-        warn!(%e, "failed to save web_fetch cache");
+    if !workflow {
+        if let Err(e) = save_cache(&result, cache_dir) {
+            warn!(%e,"failed to save web_fetch cache");
+        }
     }
 
     Ok(result)
@@ -558,6 +620,28 @@ pub async fn web_fetch_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn workflow_public_url_refuses_userinfo_without_echoing_credentials() {
+        for url in [
+            "https://fixture-user:fixture-password@example.com/page",
+            "https://fixture-user@example.com/page",
+            "https://:fixture-password@example.com/page",
+            "https://fixture-user:@example.com/page",
+            "https://%66ixture-user:%66ixture-password@example.com/page",
+            "https://:%66ixture-password@example.com/page",
+        ] {
+            let error = validate_workflow_public_url(url).unwrap_err().to_string();
+            assert!(
+                !error.contains("fixture-user")
+                    && !error.contains("fixture-password")
+                    && !error.contains(url)
+            );
+        }
+        assert!(validate_workflow_public_url("https://example.com/page").is_ok());
+        assert!(validate_workflow_public_url("http://127.0.0.1/page").is_err());
+        // Ordinary behavior remains the existing URL policy.
+        assert!(validate_url("https://fixture-user:fixture-password@example.com/page").is_ok());
+    }
 
     // -- DNS re-pin (shared with the resident-sensing tick sources) --
 

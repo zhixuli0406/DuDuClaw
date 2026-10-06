@@ -142,6 +142,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/memory-and-knowledge.md](guides/memory-and-knowledge.md) | 記憶與知識庫完整使用說明（兩者差異、知識庫寫入/分類/L0–L3 層級、自動帶入 vs 主動搜尋、記憶刪除、FAQ） | Current |
 | [guides/memory-vs-knowledge.html](guides/memory-vs-knowledge.html) | 記憶 vs 知識庫（終端使用者版，自包含 HTML，可直接寄給客戶；WP5c 全自動分流上線後改寫） | Current |
 | [guides/goal-loop.md](guides/goal-loop.md) | 自主目標迴圈（`/goal` 入口、AutonomyLevel 五級、`[goal_loop]`/`[dispatch]`/`[dispatch_guard]` 設定、needs_human 按鈕） | Current |
+| [guides/reviewable-workflow-drafts.md](guides/reviewable-workflow-drafts.md) | 審查證據與工作流程草稿（擷取快照、接受最新快照、五種試跑與負面案例規則、送審與管理者核准、私有任務的可見對象與通知、啟用後的執行與暫停；另有 [zh-TW](guides/zh-TW/reviewable-workflow-drafts.md)、[ja-JP](guides/ja-JP/reviewable-workflow-drafts.md)） | Current |
 | [guides/topology-evolution.md](guides/topology-evolution.md) | 半自動拓撲演化（D5，human-gated 路由改派提案、`[topology_evolution]` 設定、觀察期自動回滾、`topology.list` RPC） | Current |
 | [guides/line-touch-nfc.md](guides/line-touch-nfc.md) | 實體觸點：QR 桌牌列印、自製 NFC 桌牌（NTAG213 寫入/鎖定）、LINE Touch readiness 檢查清單（藍盾認證＋OA Shop 標籤時程） | Current |
 | [guides/build-your-own-pack.md](guides/build-your-own-pack.md) | Expert pack 創作教學（最小可用包 10 分鐘、本機測試迴路、團隊/wiki/requires 進階、convert-teams/claude-plugin 轉出、品質建議） | Current |
@@ -172,6 +173,8 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/evals.md](guides/evals.md) | Agent behavior evals / regression suite (`duduclaw eval`), CI gate, GVU/AEE yardstick (`--case`/`--exclude-dir`/`--report`) | Current |
 | [guides/evolution-switches.md](guides/evolution-switches.md) | Evolution switches — master kill-switch, per-feature toggles, AEE vs legacy SOUL.md path, `strategy`/`noise_band`, freeze/unfreeze | Current |
 | [guides/docker.md](guides/docker.md) | Docker build & run | Current |
+| [guides/durable-channel-decisions.md](guides/durable-channel-decisions.md) | Approvals and answers in chat channels — only "verb + full request ID" is a decision, who may decide (the person who triggered the turn, a verified Admin/Manager once dashboard users exist), channels that cannot ask or decide, dashboard-only kinds, Slack `users:read`, execution ledger (also in `zh-TW/` and `ja-JP/`) | Current |
+| [guides/durable-line-ingress.md](guides/durable-line-ingress.md) | LINE durable ingress — acknowledge only after the event is stored, per-conversation order, `line_late_reply` (Push or fail), event states and alerts, operator actions in the dashboard and `duduclaw ops channel-ingress` (dashboard-approved), the stop switch, relay limits (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/task-sandbox.md](guides/task-sandbox.md) | Task sandbox how-to — run an agent's delegated tasks in a locked-down Docker container: prerequisites, `[container.sandbox]` settings, credentials per runtime, fail-closed behaviour, `duduclaw doctor` check (also in `zh-TW/` and `ja-JP/`) | Current |
 | [guides/multi-instance.md](guides/multi-instance.md) | Running multiple instances on one machine (DUDUCLAW_HOME / PORT / INSTANCE) | Current |
 | [guides/isolated-validation.md](guides/isolated-validation.md) | 驗證帳號來源限制：停用主機 OAuth 自偵測與環境金鑰備援；三語指南與隔離邊界 | Current |
@@ -251,3 +254,5 @@ docs/                                  # L1 PUBLIC — product & developer docum
 ```
 
 > **Confidentiality tiers** — `docs/` is **Public**. Internal operational reports (daily/sprint/eval) live under `wiki/` and `reports`-style trees; commercial plans, competitive analysis, and research notes are **Confidential** and kept in the gitignored `commercial/` and `research/` trees. See the project root `CLAUDE.md` → "Documentation Classification & Placement" for the full rule.
+
+- [頻道核准、問題回答與執行核對](guides/durable-channel-decisions.md)（[繁中](guides/zh-TW/durable-channel-decisions.md)、[日本語](guides/ja-JP/durable-channel-decisions.md)）

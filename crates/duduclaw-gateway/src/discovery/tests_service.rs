@@ -9,9 +9,25 @@ fn context(id: &str, role: UserRole) -> UserContext {
 fn user(id: &str, role: UserRole) -> TrustedCaller {
     TrustedCaller::from_user(&context(id,role)).unwrap()
 }
+/// The dashboard accounts behind `context()`. Task-content and approval RPCs
+/// re-read the caller from `users.db` on every call (F3), and in production a
+/// non-`system` dashboard identity always is a `users.db` row (JWT login
+/// requires one), so the fixture's callers exist there with the same ids,
+/// roles and Operator binding on `worker`.
+fn register_accounts(home: &Path) {
+    let db = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+    for (id, role) in [("employee", UserRole::Employee), ("manager", UserRole::Manager)] {
+        let email = format!("{id}@example.invalid");
+        let created = db.create_user(&email, id, "isolated-test-password", role).unwrap();
+        rusqlite::Connection::open(home.join("users.db")).unwrap()
+            .execute("UPDATE users SET id=?1 WHERE id=?2", rusqlite::params![id, created.id]).unwrap();
+        db.bind_agent(id, "worker", AccessLevel::Operator).unwrap();
+    }
+}
 fn fixture() -> (tempfile::TempDir, PublicDiscoverySpec, ApprovalBroker) {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().canonicalize().unwrap();
+    register_accounts(&home);
     std::fs::create_dir_all(home.join("agents/worker")).unwrap();
     std::fs::write(home.join("agents/worker/agent.toml"), "[agent]\nname='worker'\n").unwrap();
     let root = home.join("approved"); std::fs::create_dir(&root).unwrap();
@@ -258,7 +274,9 @@ async fn discovery_approval_list_and_task_serialization_never_publish_frozen_pol
     let record=broker.get(&ApprovalId::from(created.approval_id.unwrap())).await.unwrap().unwrap();
     persist_approval(&home,&record);
     let handler=crate::handlers::MethodHandler::new(home.clone()).await;
-    let response=handler.handle_approvals_list(json!({"action_kind":"discovery"})).await;
+    let response = handler
+        .handle_approvals_list(json!({"action_kind":"discovery"}), &context("manager", UserRole::Manager))
+        .await;
     let response=serde_json::to_value(response).unwrap();
     assert!(response.to_string().contains(record.id.as_str()),"exercise the real approvals.list output");
     assert!(!response.to_string().contains("PRIVATE_POLICY_SOURCE_CANARY"),"approvals.list must not disclose policy source");

@@ -27,6 +27,11 @@ pub(crate) async fn fetch_for_tool(
         ));
     }
 
+    if super::workflow_operation::is_workflow_read() {
+        return duduclaw_gateway::web_fetch::web_fetch_workflow(url)
+            .await
+            .map_err(|e| tool_error(&format!("Fetch failed: {e}")));
+    }
     let cache_dir = home_dir.join("web_cache");
     duduclaw_gateway::web_fetch::web_fetch_cached(url, ttl, &cache_dir)
         .await
@@ -52,6 +57,38 @@ pub(crate) async fn handle_web_fetch_cached(args: &Value, home_dir: &Path) -> Va
         "truncated": truncated,
         "body": body,
     });
+    if super::workflow_operation::is_workflow_read() {
+        // A public-page fetch cannot prove authenticated account state. A login
+        // challenge, empty/truncated response or old observation is unusable.
+        let lower = result.body.to_ascii_lowercase();
+        if truncated
+            || result.body.trim().is_empty()
+            || lower.contains("type=\"password\"")
+            || lower.contains("type='password'")
+            || chrono::Utc::now()
+                .signed_duration_since(result.fetched_at)
+                .num_seconds()
+                > 60
+        {
+            return tool_error("workflow public page empty/truncated/stale/login challenge");
+        }
+        use sha2::{Digest, Sha256};
+        let source_hash = format!("{:x}", Sha256::digest(result.body.as_bytes()));
+        super::workflow_operation::read_observed(
+            report.clone(),
+            serde_json::json!({
+                "adapter": "web_fetch_cached",
+                "adapter_version": 1,
+                "source_url": result.url,
+                "observed_at": result.fetched_at.to_rfc3339(),
+                "source_hash": source_hash,
+                "authenticated": false,
+                "login_state": "public_anonymous",
+                "redirects_followed": 0,
+                "cached": false
+            }),
+        );
+    }
     tool_text(&serde_json::to_string_pretty(&report).unwrap_or_default())
 }
 

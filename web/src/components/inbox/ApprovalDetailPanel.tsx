@@ -49,6 +49,7 @@ import { OpenInChannelButton } from './OpenInChannelButton';
 import { pilotReviewDeepLink } from '@/lib/decision-review-link';
 import { parseDiscoveryApproval, type DiscoveryApprovalSummary } from './discovery-approval-payload';
 import { parseKnowledgeQuarantine, type KnowledgeQuarantineView } from './knowledge-quarantine';
+import { WorkflowActivationFacts } from './WorkflowActivationFacts';
 
 // ── Local mds-token property primitives (replace the Calm Glass PropertyRow) ──
 
@@ -90,6 +91,7 @@ const DESCRIBED_KINDS = new Set([
   'support_pilot_review',
   'discovery',
   'knowledge_quarantine',
+  'workflow_activation',
   'memory_forget_source',
 ]);
 
@@ -311,6 +313,26 @@ function RiskBadge({ level, label }: { level: RiskLevel; label: string }) {
  * second time and hit the terminal-state guard). Instead it signals the parent
  * via `onDecided` so the row leaves the queue immediately.
  */
+function QuestionRequestView({ approval }: { approval: ApprovalItem }) {
+  const intl = useIntl();
+  const [answer, setAnswer] = useState('');
+  const command = `回答 ${approval.id} ${answer.trim() || '<答案>'}`;
+  if (approval.status === 'answered') {
+    return <div className="space-y-3 p-4"><h3>{intl.formatMessage({ id: 'approval.question.answered' })}</h3><p>{approval.summary}</p><p className="whitespace-pre-wrap">{typeof approval.answer === 'string' ? approval.answer : ''}</p></div>;
+  }
+  return (
+    <div className="space-y-3 p-4">
+      <h3 className="font-medium">{intl.formatMessage({ id: 'approval.question.title', defaultMessage: 'Question awaiting an answer' })}</h3>
+      <p className="whitespace-pre-wrap text-sm">{approval.summary}</p>
+      <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'approval.question.hint', defaultMessage: 'Reply in the original conversation with the complete request ID. An answer does not authorize an action.' })}</p>
+      <Textarea aria-label={intl.formatMessage({ id: 'approval.question.answer' })} value={answer} onChange={(e) => setAnswer(e.target.value)} />
+      <code className="block break-all text-xs">{command}</code>
+      <Button disabled={!answer.trim()} onClick={() => void navigator.clipboard.writeText(command)}>{intl.formatMessage({ id: 'approval.question.copy' })}</Button>
+      <OpenInChannelButton channel={approval.channel} link={approval.channel_link} />
+    </div>
+  );
+}
+
 export function ApprovalDetailPanel({
   approval,
   agentName,
@@ -329,6 +351,9 @@ export function ApprovalDetailPanel({
   /** Set when the parent's last decide failed; the item is still pending. */
   decideError?: unknown;
 }) {
+  if (approval.request_kind === 'question') {
+    return <QuestionRequestView approval={approval} />;
+  }
   // ── skill_create specialization ──
   if (approval.kind === 'skill_create') {
     const parsed = parseSkillCreatePayload(approval.payload);
@@ -451,6 +476,8 @@ function GenericApprovalView({
       {discoverySpec && <DiscoverySpecSection spec={discoverySpec} intl={intl} />}
 
       {knowledgeConflict && <KnowledgeConflictSection view={knowledgeConflict} t={t} />}
+
+      {approval.kind === 'workflow_activation' && <WorkflowActivationFacts approval={approval} />}
 
       {reviewLink && <div className="space-y-1 rounded-lg border p-3">
         {isAdminReviewer ? (

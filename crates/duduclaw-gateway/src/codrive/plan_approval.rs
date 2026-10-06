@@ -122,11 +122,13 @@ pub(super) async fn gate_plan_approval(
 
     match broker.await_decision(&id, APPROVAL_POLL_INTERVAL).await {
         Ok(ApprovalStatus::Approved) => Ok(id.to_string()),
-        Ok(ApprovalStatus::Denied) => Err(deny(
-            home_dir,
-            agent_id,
-            format!("共駕計畫已被拒絕（審核編號 {id}）"),
-        )),
+        Ok(ApprovalStatus::Denied | ApprovalStatus::Answered | ApprovalStatus::Invalidated) => {
+            Err(deny(
+                home_dir,
+                agent_id,
+                format!("共駕計畫已被拒絕（審核編號 {id}）"),
+            ))
+        }
         Ok(ApprovalStatus::Expired) => Err(deny(
             home_dir,
             agent_id,

@@ -37,7 +37,11 @@ pub(crate) fn is_install_class_tool(tool_name: &str) -> bool {
 ///     overrides the `auto_approve_install` exemption).
 ///
 /// Pure + deterministic so the branch logic is unit-testable without a broker.
-pub(crate) fn install_approval_required(agent_dir: &Path, tool_name: &str, _caller_is_admin: bool) -> bool {
+pub(crate) fn install_approval_required(
+    agent_dir: &Path,
+    tool_name: &str,
+    _caller_is_admin: bool,
+) -> bool {
     // Explicit per-tool listing always forces approval (wins over any exemption).
     if duduclaw_gateway::approval::tool_requires_approval(agent_dir, tool_name) {
         return true;
@@ -56,7 +60,11 @@ pub(crate) fn install_approval_required(agent_dir: &Path, tool_name: &str, _call
 /// (`wiki_write` with `scope="shared"`, `tasks_create` with `schedule`): the
 /// removed name only ever adds a match, so this is never looser than the
 /// plain tool-name check.
-pub(crate) fn static_gate_flags(agent_dir: &Path, tool_name: &str, payload: &Value) -> (bool, bool) {
+pub(crate) fn static_gate_flags(
+    agent_dir: &Path,
+    tool_name: &str,
+    payload: &Value,
+) -> (bool, bool) {
     let legacy_name = duduclaw_core::tool_catalog::removed_name_for_call(
         tool_name,
         payload.get("arguments").unwrap_or(&Value::Null),
@@ -167,6 +175,9 @@ pub(crate) async fn run_approval(
     // persisted or shown in the inbox (CJK-safe, no raw byte slicing).
     let summary = duduclaw_core::truncate_chars(summary, INSTALL_APPROVAL_SUMMARY_MAX_CHARS);
     let kind = subject.action_kind();
+    // F5-D: a card raised inside a goal round names that round's task (set
+    // by the gateway at spawn), so the inbox applies the task's audience.
+    let payload = duduclaw_core::with_host_task_id(payload, duduclaw_core::host_task_id().as_deref());
 
     let requested = match simulation {
         Some(sim) => {
@@ -174,20 +185,30 @@ pub(crate) async fn run_approval(
                 .request_with_simulation(agent_id, kind, &summary, payload, ttl_seconds, sim)
                 .await
         }
-        None => broker.request(agent_id, kind, &summary, payload, ttl_seconds).await,
+        None => {
+            broker
+                .request(agent_id, kind, &summary, payload, ttl_seconds)
+                .await
+        }
     };
     let approval_id = match requested {
         Ok(id) => id,
         Err(e) => {
             warn!(error = %e, "approval request failed — denying (fail-closed)");
-            return InstallApprovalOutcome::Denied(subject.failed_message("審批系統無法建立審核請求"));
+            return InstallApprovalOutcome::Denied(
+                subject.failed_message("審批系統無法建立審核請求"),
+            );
         }
     };
 
     match broker.await_decision(&approval_id, poll).await {
         Ok(ApprovalStatus::Approved) => InstallApprovalOutcome::Proceed,
-        Ok(ApprovalStatus::Denied) => InstallApprovalOutcome::Denied(subject.denied_message(&approval_id.to_string())),
-        Ok(ApprovalStatus::Expired) => InstallApprovalOutcome::Denied(subject.expired_message(&approval_id.to_string())),
+        Ok(ApprovalStatus::Denied | ApprovalStatus::Answered | ApprovalStatus::Invalidated) => {
+            InstallApprovalOutcome::Denied(subject.denied_message(&approval_id.to_string()))
+        }
+        Ok(ApprovalStatus::Expired) => {
+            InstallApprovalOutcome::Denied(subject.expired_message(&approval_id.to_string()))
+        }
         Ok(ApprovalStatus::Pending) => {
             InstallApprovalOutcome::Denied(subject.failed_message("審核狀態異常（仍為待審）"))
         }
@@ -210,8 +231,17 @@ pub(crate) async fn run_install_approval(
     ttl_seconds: i64,
     poll: std::time::Duration,
 ) -> InstallApprovalOutcome {
-    run_approval(broker, agent_id, ApprovalSubject::Install, summary, payload, ttl_seconds, poll, None)
-        .await
+    run_approval(
+        broker,
+        agent_id,
+        ApprovalSubject::Install,
+        summary,
+        payload,
+        ttl_seconds,
+        poll,
+        None,
+    )
+    .await
 }
 
 /// [`run_approval`] for one tool call (`mcp_call`, tool-call wording).
@@ -298,6 +328,16 @@ pub(crate) async fn gate_tool_approval_dispatch(
     agent_id: &str,
     tool_name: &str,
     payload: Value,
+) -> std::result::Result<(), String> {
+    gate_tool_approval_dispatch_workflow(home_dir, agent_id, tool_name, payload, None).await
+}
+
+pub(crate) async fn gate_tool_approval_dispatch_workflow(
+    home_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    payload: Value,
+    workflow: Option<&super::workflow_operation::WorkflowCall>,
 ) -> std::result::Result<(), String> {
     if tool_name == "skill_hub_install" {
         return Ok(());
@@ -411,6 +451,11 @@ pub(crate) async fn gate_tool_approval_dispatch(
     match gate {
         ActionGate::Auto => Ok(()),
         ActionGate::RequireApproval => {
+            if let Some(workflow) = workflow {
+                return workflow
+                    .require_human("action_guard_require_approval", &payload)
+                    .await;
+            }
             // The legacy path (approval_required_tools / install-class) keeps its
             // own summary via `install_approval_required`; but an
             // irreversible-only or judge-escalated tool is NOT covered by that
@@ -563,7 +608,8 @@ pub(crate) async fn gate_os_situation_dispatch(
 /// decision. Expiry counts as a denial (ApprovalBroker fail-closed).
 pub(crate) const CAPABILITY_REQUEST_APPROVAL_TTL_SECS: i64 = 300;
 /// Poll interval while blocking on that approval.
-pub(crate) const CAPABILITY_REQUEST_APPROVAL_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const CAPABILITY_REQUEST_APPROVAL_POLL: std::time::Duration =
+    std::time::Duration::from_secs(2);
 /// Max chars of the (agent-authored) reason persisted / surfaced to the human
 /// approver. CJK-safe via `truncate_chars` — never a raw byte slice.
 pub(crate) const CAPABILITY_REQUEST_REASON_MAX_CHARS: usize = 300;
@@ -582,7 +628,11 @@ pub(crate) const CAPABILITY_REQUEST_REASON_MAX_CHARS: usize = 300;
 /// Fail-closed throughout: a broker/store that will not open, a denied/expired
 /// approval, or a grant-write failure all return an error result and mint no
 /// grant.
-pub(crate) async fn handle_capability_request(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+pub(crate) async fn handle_capability_request(
+    args: &Value,
+    home_dir: &Path,
+    agent_id: &str,
+) -> Value {
     use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStatus};
     use duduclaw_gateway::capability_grants::{self, CapabilityGrantStore, GRANTED_BY_REQUEST};
 
@@ -704,7 +754,7 @@ pub(crate) async fn handle_capability_request(args: &Value, home_dir: &Path, age
                 }
             }
         }
-        Ok(ApprovalStatus::Denied) => {
+        Ok(ApprovalStatus::Denied | ApprovalStatus::Answered | ApprovalStatus::Invalidated) => {
             duduclaw_security::audit::append_tool_call_with_extras(
                 home_dir,
                 agent_id,

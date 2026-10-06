@@ -213,6 +213,15 @@ pub enum GuardDecision {
         caller: String,
         command: String,
     },
+    /// An AI employee (or an unverified caller) ran an operator-only
+    /// command from Bash, e.g. `duduclaw ops channel-ingress`. Same
+    /// level as [`Self::BlockedReservedAgentName`]: a speed bump on the Bash
+    /// lane; the command itself also refuses when DuDuClaw identity
+    /// variables are present.
+    BlockedOperatorCommand {
+        caller: String,
+        command: &'static str,
+    },
 }
 
 impl GuardDecision {
@@ -345,6 +354,17 @@ impl GuardDecision {
                  你可以寫入自己的資料夾（agents/{caller}/）或共用附件資料夾（attachments/）；\
                  其他資料請透過對應的 MCP 工具處理（例如 wiki_write、tasks_update），或請管理者從儀表板調整。",
                 attempted_path.display()
+            )),
+            Self::BlockedOperatorCommand { caller, command } => Some(format!(
+                "已封鎖：`{command}` 只能由管理者在自己的終端機執行，AI 員工不可使用。\n\
+                 你的身分：{caller}\n\
+                 {}",
+                match *command {
+                    "duduclaw ops channel-ingress" => {
+                        "需要結案或重新執行 LINE 收件事件，請由管理者在儀表板處理。"
+                    }
+                    _ => "需要凍結、撤銷或刪除電腦操作工作區，請由管理者在儀表板處理。",
+                }
             )),
             Self::BlockedUnresolvablePath { attempted_path, reason } => Some(format!(
                 "已封鎖：無法確認這次寫入實際會落在哪裡，為避免繞過資料夾保護一律拒絕。\n\

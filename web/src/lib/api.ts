@@ -737,6 +737,9 @@ export interface CriteriaLedger {
 }
 
 export interface TaskInfo {
+  /** Set by the server when the reader may see only this card: the task's
+   *  content is limited to an audience the reader is not in. */
+  restricted?: boolean;
   /** Discovery is orchestrated separately from the ordinary goal worker. */
   kind?: 'task' | 'goal' | 'discovery';
   id: string;
@@ -1828,6 +1831,12 @@ export interface TaskRoleTurn {
 
 export interface TaskRoleTurns { turns: TaskRoleTurn[] }
 
+export interface TaskAudienceRestriction {
+  state: 'open' | 'limited' | 'unreadable';
+  keys: string[];
+  sources: Array<{ round: string; from_role: string; packet_id: string; keys: string[] }>;
+}
+
 /** `tasks.timeline` — one goal task's whole loop story. */
 export interface GoalTimeline {
   task: TaskInfo;
@@ -1841,6 +1850,9 @@ export interface GoalTimeline {
   } | null;
   /** WP-G2 per-criterion ledger; null/absent renders the plain criteria text. */
   criteria_ledger?: CriteriaLedger | null;
+  /** Whether team packets (written by AI role members) limit who may see
+   *  this task, and which packet did it. */
+  audience_restriction?: TaskAudienceRestriction;
   /** Execution transcripts recorded for this task's rounds (durable
    *  dispatch_runs linkage). */
   runs: Array<{
@@ -4624,6 +4636,10 @@ export interface ApprovalSimulation {
 }
 
 export interface ApprovalItem {
+  request_kind?: 'approval' | 'question' | 'invalid';
+  status?: 'pending' | 'approved' | 'denied' | 'expired' | 'answered' | 'invalidated';
+  answer?: unknown;
+  invalidated_reason?: string | null;
   id: string;
   agent_id: string;
   kind: ApprovalKind;
@@ -4646,6 +4662,25 @@ export interface ApprovalItem {
    *  `channel_link.rs`). Render the button ONLY when this is a non-empty
    *  string. */
   channel_link?: string | null;
+  // ── F1b: bound-card authority ─────────────────────────────
+  /** Whether the viewer may decide this card (fresh role, employee
+   *  access, run audience; Admin for activations). Binding and answer
+   *  are omitted when false. */
+  may_decide?: boolean;
+  /** Decided in the dashboard only; channel presses never decide it. */
+  decided_in_dashboard_only?: boolean;
+  /** Activation submitted by the viewer (self-approval is allowed, shown). */
+  submitter_is_viewer?: boolean;
+  /** Activation card facts; null unless the viewer may decide. */
+  workflow_activation?: {
+    workflow_id?: string;
+    revision?: number;
+    effect_targets?: Array<{ step_id: string; tool: string; param: string | null; target: string | null }>;
+    submitted_by?: string | null;
+    /** U8: when the activation stops on its own once approved. */
+    expires_at?: string | null;
+    pricing?: { money_limits_effective: boolean; limits?: { max_runs_per_month: number; max_steps_per_run: number; max_reads_per_run: number; max_effects_per_run: number } } | null;
+  } | null;
 }
 
 // ── BUD: budget incident console (WP14-T14.6) ──────────────────
@@ -6160,12 +6195,18 @@ export const api = {
       client.call('cron.resume', { id }),
     remove: (id: string) =>
       client.call('cron.remove', { id }),
-    /** Trigger a single immediate ("test") execution of a routine. */
-    runNow: (id: string) =>
-      client.call('cron.run_now', { id }) as Promise<{
+    /** Trigger a single immediate ("test") execution of a routine.
+     *  `requestId` identifies one press: a retry of the same press sends the
+     *  same id and reconnects to the same run (required for a routine bound
+     *  to a workflow). */
+    runNow: (id: string, requestId: string) =>
+      client.call('cron.run_now', { id, request_id: requestId }) as Promise<{
         success: boolean;
         id: string;
         name: string;
+        request_id?: string;
+        run_id?: string | null;
+        run_status?: string | null;
       }>,
     /** Built-in office scheduling templates for prefilling the create dialog. */
     templates: () =>

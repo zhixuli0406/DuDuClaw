@@ -179,6 +179,14 @@ impl AccessController {
     /// approved either (the central gate verifies `/pair` per-user; the
     /// chat_commands path verifies per-session). Blocked on either subject
     /// wins; then Allowed; then pairing.
+    ///
+    /// With an `allowed_users` list and pairing off, **both** subjects must be
+    /// admitted (listed or runtime-approved): `check_access` returns `Blocked`
+    /// for an unlisted subject and that short-circuits. This is the shipped
+    /// (v1.69.1) behaviour; an unreleased P0-B change that admitted a sender
+    /// when either subject was listed — so listing a group session admitted
+    /// every member — was reverted in F4 (review L9). Decision routing may add
+    /// checks on top of this, never loosen it.
     pub async fn check_access_dual(
         &self,
         user_id: &str,
@@ -494,6 +502,66 @@ mod tests {
         // Probing a subject that has no pending code must fail without side effects.
         assert!(!ctrl.verify_pairing_code("nobody", "123456").await);
         assert!(ctrl.runtime_approved_users().await.is_empty());
+    }
+
+    /// F4 (review L9): pins the shipped `check_access_dual` semantics. With an
+    /// allowlist and pairing off, the person AND the conversation must both be
+    /// admitted; listing one of them (e.g. a group session) does not admit
+    /// everyone in it. A blocklisted subject still wins over a listed one.
+    #[tokio::test]
+    async fn dual_allowlist_requires_both_identities_and_block_wins() {
+        let ctrl = AccessController::new();
+        for allowed_id in ["human", "telegram:chat"] {
+            let allowed = vec![allowed_id.to_owned()];
+            assert_eq!(
+                ctrl.check_access_dual("human", "telegram:chat", Some(&allowed), &[], false)
+                    .await,
+                AccessDecision::Blocked,
+                "listing only {allowed_id} must not admit the sender"
+            );
+        }
+        let both = vec!["human".to_owned(), "telegram:chat".to_owned()];
+        assert_eq!(
+            ctrl.check_access_dual("human", "telegram:chat", Some(&both), &[], false)
+                .await,
+            AccessDecision::Allowed
+        );
+        for blocked in ["human", "telegram:chat"] {
+            assert_eq!(
+                ctrl.check_access_dual(
+                    "human",
+                    "telegram:chat",
+                    Some(&both),
+                    &[blocked.into()],
+                    false
+                )
+                .await,
+                AccessDecision::Blocked
+            );
+        }
+        assert_eq!(
+            ctrl.check_access_dual(
+                "human",
+                "telegram:chat",
+                Some(&["other".into()]),
+                &[],
+                false
+            )
+            .await,
+            AccessDecision::Blocked
+        );
+        // Pairing mode is unchanged: one admitted subject suffices.
+        assert_eq!(
+            ctrl.check_access_dual(
+                "human",
+                "telegram:chat",
+                Some(&["telegram:chat".into()]),
+                &[],
+                true
+            )
+            .await,
+            AccessDecision::Allowed
+        );
     }
 
     #[tokio::test]
