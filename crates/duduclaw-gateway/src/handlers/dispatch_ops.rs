@@ -92,6 +92,16 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_channel_ingress_inspect(params, ctx).await
             }
+            "computer_workspaces.list"
+            | "computer_workspaces.fence"
+            | "computer_workspaces.revoke"
+            | "computer_workspaces.regrant"
+            | "computer_workspaces.renew"
+            | "computer_workspaces.rebind_runner"
+            | "computer_workspaces.delete" => {
+                require_admin!();
+                self.handle_computer_workspaces(method, params, ctx).await
+            }
             "tick.sources.list" => {
                 require_admin!();
                 self.handle_tick_sources_list().await

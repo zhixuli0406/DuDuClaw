@@ -46,6 +46,9 @@ pub mod http;
 pub mod navigation;
 pub mod sweep;
 pub mod turns;
+mod workspace;
+pub mod workspace_admin;
+pub mod workspace_tools;
 
 #[cfg(test)]
 mod tests;
@@ -122,6 +125,15 @@ pub enum ErrorCode {
     ExecutionFailed,
     ScreenshotFailed,
     Timeout,
+    WorkspaceDisabled,
+    WorkspaceUnavailable,
+    WorkspaceBusy,
+    WorkspaceState,
+    WorkspaceQuota,
+    DiskFull,
+    MountFailed,
+    RunnerMismatch,
+    LeaseLost,
 }
 
 impl ErrorCode {
@@ -152,6 +164,15 @@ impl ErrorCode {
             Self::ExecutionFailed => "execution_failed",
             Self::ScreenshotFailed => "screenshot_failed",
             Self::Timeout => "timeout",
+            Self::WorkspaceDisabled => "workspace_disabled",
+            Self::WorkspaceUnavailable => "workspace_unavailable",
+            Self::WorkspaceBusy => "workspace_busy",
+            Self::WorkspaceState => "workspace_state",
+            Self::WorkspaceQuota => "workspace_quota",
+            Self::DiskFull => "disk_full",
+            Self::MountFailed => "mount_failed",
+            Self::RunnerMismatch => "runner_mismatch",
+            Self::LeaseLost => "lease_lost",
         }
     }
 
@@ -168,6 +189,15 @@ impl ErrorCode {
             Self::Unavailable | Self::Capacity => 503,
             Self::StartFailed | Self::ExecutionFailed | Self::ScreenshotFailed => 502,
             Self::Timeout => 504,
+            Self::WorkspaceDisabled => 403,
+            Self::WorkspaceUnavailable => 503,
+            Self::DiskFull => 507,
+            Self::MountFailed => 502,
+            Self::WorkspaceBusy
+            | Self::WorkspaceState
+            | Self::WorkspaceQuota
+            | Self::RunnerMismatch
+            | Self::LeaseLost => 409,
             Self::SessionExists
             | Self::SessionStarting
             | Self::SessionEnded
@@ -236,6 +266,9 @@ pub enum EndReason {
     ThreatRed,
     /// `[capabilities] computer_use` was turned off (or set to native).
     CapabilityRevoked,
+    /// The attached workspace's lease is no longer this session's (fenced,
+    /// revoked, expired, renewal failed, or a workspace switch turned off).
+    LeaseLost,
 }
 
 impl EndReason {
@@ -247,6 +280,7 @@ impl EndReason {
             Self::Idle => "idle",
             Self::ThreatRed => "threat_red",
             Self::CapabilityRevoked => "capability_revoked",
+            Self::LeaseLost => "lease_lost",
         }
     }
 
@@ -264,6 +298,9 @@ impl EndReason {
             }
             Self::ThreatRed => "威脅等級為 RED，電腦操作已緊急終止，容器已移除。",
             Self::CapabilityRevoked => "此員工的電腦操作權限已被關閉，session 已結束。",
+            Self::LeaseLost => {
+                "這個 session 掛載的工作區已失去控制權（被凍結、撤權、到期或功能被關閉），session 已結束，容器已移除。工作區資料仍保留。"
+            }
         }
     }
 }
@@ -343,6 +380,9 @@ pub struct StartRequest {
     /// The caller's `DUDUCLAW_TURN_ID`, only used to report whether a
     /// confirmation channel is reachable right now.
     pub turn_id: Option<String>,
+    /// `"new"` or a server-issued `ws-…` id: attach a durable workspace
+    /// (read-only at `/workspace/files`). `None` = no workspace (unchanged path).
+    pub workspace: Option<String>,
 }
 
 /// State an approval wait updates without taking the session lock.
@@ -353,6 +393,9 @@ pub(crate) struct SessionShared {
     approvals_waiting: AtomicU32,
     /// When the last approval wait ended (counts as activity).
     touched: std::sync::Mutex<Option<Instant>>,
+    /// The attached durable workspace (renewed by the reaper without the
+    /// session lock).
+    pub(crate) workspace: workspace::WorkspaceSlot,
 }
 
 impl SessionShared {
@@ -445,6 +488,7 @@ pub struct ComputerUseSessions {
     factory: BackendFactory,
     confirmers: Arc<dyn ConfirmerResolver>,
     resolver: Arc<dyn navigation::HostResolver>,
+    workspace_rt: Arc<dyn workspace::WorkspaceRuntime>,
     pub(crate) approval_ttl_secs: i64,
     pub(crate) approval_poll: Duration,
     #[cfg(test)]
@@ -558,6 +602,7 @@ impl ComputerUseSessions {
             factory,
             confirmers,
             resolver: Arc::new(navigation::DnsResolver),
+            workspace_rt: workspace::docker_runtime(),
             approval_ttl_secs: gates::APPROVAL_TTL_SECS,
             approval_poll: gates::APPROVAL_POLL,
             #[cfg(test)]
@@ -576,6 +621,13 @@ impl ComputerUseSessions {
     #[cfg(test)]
     pub(crate) fn with_resolver(mut self, resolver: Arc<dyn navigation::HostResolver>) -> Self {
         self.resolver = resolver;
+        self
+    }
+
+    /// Replace the Docker facts a workspace start needs (tests).
+    #[cfg(test)]
+    pub(crate) fn with_workspace_runtime(mut self, rt: Arc<dyn workspace::WorkspaceRuntime>) -> Self {
+        self.workspace_rt = rt;
         self
     }
 
@@ -689,8 +741,14 @@ impl ComputerUseSessions {
             None,
         );
         let home = self.home.clone();
+        let lease = workspace::take_lease(&session.shared);
         Some(tokio::spawn(async move {
             backend.stop().await;
+            // Only after the container is gone, and only as a CAS on this
+            // session's own epoch + holder.
+            if let Some(lease) = lease {
+                workspace::release_lease(home.clone(), lease, reason).await;
+            }
             write_audit(home, audit).await;
         }))
     }
@@ -722,18 +780,12 @@ impl ComputerUseSessions {
         let activity = session
             .shared
             .effective_activity(session.last_activity, now);
-        let reason = end_reason(
-            now,
-            session.deadline,
-            activity,
-            self.idle_timeout,
-            stopped,
-            threat,
-        )
-        .or_else(|| {
-            capability_problem(&agent_capabilities(&self.home, &session.agent_id))
-                .map(|_| EndReason::CapabilityRevoked)
-        });
+        let reason = workspace::lease_problem(&self.home, &session.agent_id, &session.shared)
+            .or_else(|| end_reason(now, session.deadline, activity, self.idle_timeout, stopped, threat))
+            .or_else(|| {
+                capability_problem(&agent_capabilities(&self.home, &session.agent_id))
+                    .map(|_| EndReason::CapabilityRevoked)
+            });
         if let Some(reason) = reason {
             self.end_and_wait(session, reason).await;
             return Err(OpError::new(ErrorCode::SessionEnded, reason.message()));
@@ -903,7 +955,7 @@ impl ComputerUseSessions {
             &skipped_hosts,
             nav.dropped.len(),
         );
-        let config = ComputerUseConfig {
+        let mut config = ComputerUseConfig {
             container_image: image,
             max_session_minutes: cap.max_session_minutes.max(1),
             max_actions: cap.max_actions,
@@ -921,18 +973,36 @@ impl ComputerUseSessions {
             contract_must_not: contract_must_not_rules(&gates::agent_dir(&self.home, agent_id)),
             ..Default::default()
         };
-        let mut backend = (self.factory)(agent_id, &self.home, config.clone());
+        // The id exists before any lease is taken (it is the lease holder).
         let session_id = format!("cu-{}", uuid::Uuid::new_v4().as_simple());
+        let attached = match req.workspace.as_deref() {
+            Some(spec) => Some(self.attach_workspace(agent_id, spec, &session_id, &mut config).await?),
+            None => None,
+        };
+        let release_on_failure = |attached: &Option<(workspace::AttachedWorkspace, _)>| {
+            attached.as_ref().map(|(a, _)| a.lease.clone())
+        };
+        let mut backend = (self.factory)(agent_id, &self.home, config.clone());
         // Reserve the global slot before any container runs; every failure
         // below releases it (`stop` leaves the registry, and a dropped
         // orchestrator does too).
         if backend.register(&session_id).await.is_err() {
             Self::stop_detached(backend).await;
+            if let Some(lease) = release_on_failure(&attached) {
+                workspace::release_lease(self.home.clone(), lease, EndReason::Requested).await;
+            }
             return Err(capacity());
         }
         if let Err(e) = backend.start().await {
             Self::stop_detached(backend).await;
+            if let Some(lease) = release_on_failure(&attached) {
+                workspace::release_lease(self.home.clone(), lease, EndReason::Requested).await;
+            }
             return Err(match e {
+                ComputerUseError::Unavailable(message) if attached.is_some() => {
+                    workspace::start_error_for_workspace(&message)
+                        .unwrap_or_else(|| OpError::new(ErrorCode::Unavailable, message))
+                }
                 ComputerUseError::Unavailable(message) => {
                     OpError::new(ErrorCode::Unavailable, message)
                 }
@@ -980,6 +1050,9 @@ impl ComputerUseSessions {
         body["reachable_hosts"] = json!(nav_hosts);
         body["unreachable_hosts"] = json!(skipped_hosts);
         body["network_message"] = json!(network_message);
+        if let Some((a, cfg)) = &attached {
+            self.workspace_fields(a, cfg, &mut body);
+        }
         let details = json!({
             "session_id": session_id,
             "task": task,
@@ -992,6 +1065,9 @@ impl ComputerUseSessions {
             "unreachable_hosts": skipped_hosts,
             "ignored_allowlist_entries": nav.dropped.len(),
         });
+        if let Some((a, _)) = attached {
+            *session.shared.workspace.attached.lock().unwrap_or_else(|p| p.into_inner()) = Some(a);
+        }
         self.insert(session);
         info!(agent = %agent_id, session = %session_id, "computer-use tool session started");
         self.audit_line(agent_id, "session_start", details, None)
@@ -1445,6 +1521,7 @@ impl ComputerUseSessions {
             || level == ThreatLevel::Red
             || Instant::now() >= session.deadline
             || capability_problem(&agent_capabilities(&self.home, &session.agent_id)).is_some()
+            || workspace::lease_problem(&self.home, &session.agent_id, &session.shared).is_some()
         {
             return Err(OpError::new(
                 ErrorCode::SessionEnded,
@@ -1606,12 +1683,7 @@ impl ComputerUseSessions {
             policy_revision: crate::approval::policy_revision(&self.home, &session.agent_id)
                 .ok()?,
             cwd: None,
-            environment_hash: crate::approval::payload_hash(
-                &json!({
-                    "session": session.session_id,
-                    "display": [session.config.display_width,session.config.display_height]
-                }),
-            ),
+            environment_hash: crate::approval::payload_hash(&workspace::environment_input(session)),
             file_hashes: Default::default(),
             expires_at: (chrono::Utc::now()
                 + chrono::Duration::seconds(CONFIRM_TIMEOUT_SECS as i64))
@@ -1654,6 +1726,10 @@ impl ComputerUseSessions {
                 let _ = broker
                     .invalidate_request(&id, "live_session_interrupted")
                     .await;
+                return None;
+            }
+            if workspace::lease_problem(&self.home, &session.agent_id, &session.shared).is_some() {
+                let _ = broker.invalidate_request(&id, "workspace_lease_lost").await;
                 return None;
             }
             match broker.poll(&id).await {
@@ -1744,6 +1820,7 @@ impl ComputerUseSessions {
     /// or under a RED threat level. A session busy with an op is skipped
     /// (its own op re-checks on entry). Returns how many were ended.
     pub async fn reap_once(&self) -> usize {
+        self.renew_leases().await;
         let entries: Vec<SessionRef> = self
             .sessions
             .lock()
@@ -1762,14 +1839,11 @@ impl ComputerUseSessions {
             let activity = session
                 .shared
                 .effective_activity(session.last_activity, now);
-            let reason = end_reason(
-                now,
-                session.deadline,
-                activity,
-                self.idle_timeout,
-                stopped,
-                threat,
-            );
+            let reason = if session.shared.workspace.lost.load(Ordering::Acquire) {
+                Some(EndReason::LeaseLost)
+            } else {
+                end_reason(now, session.deadline, activity, self.idle_timeout, stopped, threat)
+            };
             if let Some(reason) = reason
                 && let Some(handle) = self.end(&mut session, reason)
             {

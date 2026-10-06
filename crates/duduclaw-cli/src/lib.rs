@@ -78,6 +78,7 @@ mod secaudit; // Code security audit MVP: intake + OSS scanner orchestration (`d
 mod service;
 pub mod weekly_report; // Per-agent weekly usage report
 mod knobs_survival;
+mod computer_workspaces_cmd; // P2-C: `duduclaw ops computer-workspaces` (operator-only)
 mod responsibility_cmd; // P2-A: `duduclaw responsibility …` (operator)
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
 mod channel_ingress_cmd; // F2: `duduclaw ops channel-ingress` (operator-only, dashboard-approved changes)
@@ -1710,6 +1711,14 @@ enum OpsCommands {
     ChannelIngress {
         #[command(subcommand)]
         command: channel_ingress_cmd::ChannelIngressCommands,
+    },
+
+    /// (operator) Durable computer-use workspaces: list / fence / revoke /
+    /// regrant / renew / delete. Hidden from `--help`.
+    #[command(hide = true, name = "computer-workspaces")]
+    ComputerWorkspaces {
+        #[command(subcommand)]
+        command: computer_workspaces_cmd::ComputerWorkspaceCommands,
     },
 
     /// Manage AI 員工職務組合 (agent presets) — named, versioned configuration
@@ -5095,6 +5104,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Ops(OpsCommands::ChannelIngress { command }) => {
             channel_ingress_cmd::run(&duduclaw_home(), command).await
         }
+        Commands::Ops(OpsCommands::ComputerWorkspaces { command }) => {
+            computer_workspaces_cmd::run(&duduclaw_home(), command).await
+        }
         Commands::Ops(OpsCommands::Org { command }) => match command {
             OrgCommands::Show => cmd_org_show(),
             OrgCommands::Sync { agent, dry_run } => cmd_org_sync(agent.as_deref(), dry_run),
@@ -6209,6 +6221,9 @@ fn agent_file_guard_decision(
                     bash_reserved_agent_create(command, &home, &caller)
                         .or_else(|| {
                             channel_ingress_cmd::bash_channel_ingress_decision(command, &caller)
+                        })
+                        .or_else(|| {
+                            computer_workspaces_cmd::bash_workspace_ops_decision(command, &caller)
                         })
                         .or_else(|| {
                             responsibility_cmd::bash_responsibility_decision(command, &caller)
@@ -8821,6 +8836,12 @@ async fn computer_use_check(home: &std::path::Path) -> (String, CheckStatus, Str
     ("電腦操作".to_string(), status, message)
 }
 
+/// `duduclaw doctor` row 「電腦操作工作區」 (P2-C design §8.5).
+async fn computer_workspaces_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let (status, message) = duduclaw_gateway::computer_workspaces::doctor::check(home).await;
+    ("電腦操作工作區".to_string(), status, message)
+}
+
 /// Pure half of [`deprecated_runtime_check`]: one finding per agent field
 /// (`provider` / `fallback`) whose value is a deprecated runtime. Input rows
 /// are `(agent name, [runtime] provider, [runtime] fallback)` as written.
@@ -9771,6 +9792,8 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
 
     // Check 4b-2: computer-use image + employees that use computer use.
     checks.push(computer_use_check(&home).await);
+    // Check 4b-3: durable computer-use workspaces (P2-C).
+    checks.push(computer_workspaces_check(&home).await);
 
     // Check 4c: agents on a deprecated runtime (R1, 2026-10).
     checks.push(deprecated_runtime_check(&home).await);
@@ -13989,6 +14012,33 @@ mod removed_name_hook_tests {
         let d = agent_file_guard_decision(
             "Bash",
             &bash("duduclaw ops channel-ingress list"),
+            h.path(),
+            &HookCaller::Absent,
+        )
+        .unwrap();
+        assert!(d.is_allowed(), "{d:?}");
+    }
+
+    #[test]
+    fn bash_computer_workspaces_is_blocked_through_the_hook() {
+        let h = home_with_trash();
+        let d = agent_file_guard_decision(
+            "Bash",
+            &bash("duduclaw ops \\\ncomputer-work''spaces delete ws-1 --confirm"),
+            h.path(),
+            &agent("ceo"),
+        )
+        .unwrap();
+        assert!(
+            matches!(d, GuardDecision::BlockedOperatorCommand { ref command, .. }
+                if *command == "duduclaw ops computer-workspaces"),
+            "{d:?}"
+        );
+        let msg = d.block_message().unwrap();
+        assert!(msg.contains("電腦操作工作區"), "{msg}");
+        let d = agent_file_guard_decision(
+            "Bash",
+            &bash("duduclaw ops computer-workspaces list"),
             h.path(),
             &HookCaller::Absent,
         )

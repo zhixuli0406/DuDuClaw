@@ -1332,6 +1332,24 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "admin",
         "computer",
     ),
+    (
+        "computer_workspace_list",
+        "List your durable computer-use workspaces",
+        "admin",
+        "computer",
+    ),
+    (
+        "computer_workspace_read",
+        "Read a text file from your workspace",
+        "admin",
+        "computer",
+    ),
+    (
+        "computer_workspace_write",
+        "Write a text file into your attached workspace",
+        "admin",
+        "computer",
+    ),
     // ── Agent roster / delegation status (agent) ─────────────────────────
     (
         "list_agents",

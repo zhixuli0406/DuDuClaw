@@ -348,7 +348,9 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
     // through the ApprovalBroker for every op, because the internal route can
     // be called without passing through this dispatcher. Gating here too
     // would ask the human twice.
-    if crate::mcp_dispatch::COMPUTER_USE_TOOLS.contains(&tool_name) {
+    if crate::mcp_dispatch::COMPUTER_USE_TOOLS.contains(&tool_name)
+        || crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS.contains(&tool_name)
+    {
         return Ok(());
     }
     // W3-3b (a): caller-derived — `.ephemeral/` included (see

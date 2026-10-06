@@ -1928,6 +1928,12 @@ pub struct ComputerUseCapConfig {
     /// network.
     #[serde(deserialize_with = "crate::lenient::string_vec")]
     pub allowed_domains: Vec<String>,
+    /// Durable computer-use workspaces (`computer_session_start` with
+    /// `workspace`, the `computer_workspace_*` tools). Usable only when this
+    /// AND `config.toml [computer_use.workspaces] enabled` are true. Missing
+    /// or wrong-typed = false.
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub workspace: bool,
 }
 
 /// Most hosts a computer-use navigation allowlist may hold (after
@@ -2010,6 +2016,7 @@ impl Default for ComputerUseCapConfig {
             display_height: 800,
             auto_confirm_trusted: false,
             allowed_domains: Vec::new(),
+            workspace: false,
         }
     }
 }
@@ -5650,6 +5657,16 @@ credit_rate = 2.0
         assert_eq!(got.hosts.len(), COMPUTER_USE_MAX_ALLOWED_DOMAINS);
         assert_eq!(got.hosts[0], "h0.example.com");
         assert_eq!(got.dropped.len(), 5);
+    }
+
+    #[test]
+    fn computer_use_workspace_switch_defaults_off_and_tolerates_wrong_types() {
+        let parse = |t: &str| toml::from_str::<CapabilitiesConfig>(t).unwrap();
+        assert!(!parse("computer_use = true\n").computer_use_config.workspace);
+        assert!(parse("[computer_use_config]\nworkspace = true\n").computer_use_config.workspace);
+        let wrong = parse("[computer_use_config]\nworkspace = \"yes\"\nmax_actions = 9\n");
+        assert!(!wrong.computer_use_config.workspace);
+        assert_eq!(wrong.computer_use_config.max_actions, 9);
     }
 
     #[test]

@@ -258,6 +258,11 @@ pub(crate) fn audit_safe_arguments(tool_name: &str, args: &Value) -> Value {
             let (host, path_len) = navigate_url_summary(args);
             serde_json::json!({ "host": host, "path_len": path_len })
         }
+        // P2-C: never the content or the path itself.
+        "computer_workspace_write" | "computer_workspace_read" => {
+            let (ws, path_hash, chars) = workspace_args_summary(args);
+            serde_json::json!({ "workspace_id": ws, "path_sha256": path_hash, "chars": chars })
+        }
         _ => args.clone(),
     }
 }
@@ -276,8 +281,23 @@ fn navigate_url_summary(args: &Value) -> (Option<String>, usize) {
     }
 }
 
+/// A workspace tool's arguments reduced to the workspace id, the first 16
+/// hex of the path's sha256 and the content length in characters.
+fn workspace_args_summary(args: &Value) -> (String, String, usize) {
+    let ws = args.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("");
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    // Same hash as the gateway's browser audit (NFC, then sha256).
+    let hash = duduclaw_core::workspace_path::workspace_path_hash(path);
+    let chars = args.get("content").and_then(|v| v.as_str()).map(|t| t.chars().count()).unwrap_or(0);
+    (duduclaw_core::truncate_chars(ws, 40).to_string(), hash[..16].to_string(), chars)
+}
+
 pub(crate) fn build_params_summary(tool_name: &str, args: &Value) -> String {
     match tool_name {
+        "computer_workspace_write" | "computer_workspace_read" => {
+            let (ws, path_hash, chars) = workspace_args_summary(args);
+            format!("workspace={ws} path_sha256={path_hash} chars={chars}")
+        }
         // Computer use: coordinates / sizes only. Typed text is summarised by
         // its length and a screenshot by its name (the image never lands in
         // the audit).

@@ -216,3 +216,9 @@ L1 で答えが出る問いに L5 を持ち出すのが最も高くつく間違�
 ## チャネル確認の保存と照合
 
 高リスク Computer Use の確認は元のアカウントと会話・スレッドへ送信されます。`確認 <完全 UUID>` または `取消 <完全 UUID>` で返信します。質問は `回答 <完全 UUID> <回答>` で回答し、ツール実行を許可しません。単独の yes/A/B は要求を選択しません。実行前に画面、ウィンドウ、ポリシーとキャンセル状態を再確認します。再起動後は古い画面の承認を失効させ、レシートのない実行は `uncertain` として Admin が照合します。[対応経路と制限](../../guides/durable-channel-decisions.md)を参照してください。
+
+## コンピューター操作ワークスペース（セッション後も残るファイル）
+
+コンピューター操作のコンテナはセッション終了時に削除されます。社員がまとめた内容を残すには、セッションに**コンピューター操作ワークスペース**を接続します：`computer_session_start` に `workspace = "new"` か既存の `ws-…` id を渡します。書き込むのは gateway だけです（`computer_workspace_write`、社員の現在のセッションが接続したワークスペースへ）。`computer_workspace_list` と `computer_workspace_read` はセッションなしで使えます。コンテナ内のファイルは `/workspace/files` に読み取り専用で置かれ、root だけが入れる tmpfs の下にあるため、ブラウザのアカウントは入れません。既定は無効：`config.toml [computer_use.workspaces] enabled = true` と、社員の `[capabilities.computer_use_config] workspace = true` が必要です。macOS と Linux のみ対応です。
+
+クォータ、保持期限、同時に 1 セッションだけのリース、運用者コマンド（`duduclaw ops computer-workspaces`。状態を変える操作はすべて先にダッシュボードで Admin の承認が必要。緊急時はダッシュボードか全体スイッチ）、既知の制限（所有者による分離は 3 つのワークスペースツールにしか成り立たず、`Read` や Bash を持つ社員には成り立たないことを含む）は[コンピューター操作ワークスペースガイド](../../guides/ja-JP/computer-workspaces.md)を参照してください。

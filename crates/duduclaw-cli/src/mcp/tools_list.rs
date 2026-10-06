@@ -26,7 +26,7 @@
 use super::*;
 
 pub(crate) use crate::mcp_dispatch::{
-    CODRIVE_TOOLS, COMPUTER_USE_TOOLS, DB_SOURCE_TOOLS, FORK_TOOLS, OS_NATIVE_TOOLS,
+    CODRIVE_TOOLS, COMPUTER_USE_TOOLS, COMPUTER_WORKSPACE_TOOLS, DB_SOURCE_TOOLS, FORK_TOOLS, OS_NATIVE_TOOLS,
     RECORDING_TOOLS, SYSTEM_OPERATOR_TOOLS,
 };
 
@@ -230,6 +230,8 @@ async fn visible_tools(
     let allow_system_operator = gated_caller && !member_invalid && caps.system_operator;
     let allow_codrive = gated_caller && !member_invalid && caps.codrive;
     let allow_computer_use = gated_caller && !member_invalid && caps.computer_use;
+    // P2-C: the workspace tools also need the employee's own switch.
+    let allow_cu_workspace = allow_computer_use && caps.computer_use_config.workspace;
     // WP-D §13.7: the four `db_*` tools are deny-by-default per agent, so an
     // agent with no `[capabilities] db_sources` grant must not even see them
     // (discoverable ⊆ callable, same rule the `os_*` family follows). Read
@@ -315,6 +317,7 @@ async fn visible_tools(
         .filter(|t| allow_system_operator || !SYSTEM_OPERATOR_TOOLS.contains(&t.name))
         .filter(|t| allow_codrive || !CODRIVE_TOOLS.contains(&t.name))
         .filter(|t| allow_computer_use || !COMPUTER_USE_TOOLS.contains(&t.name))
+        .filter(|t| allow_cu_workspace || !COMPUTER_WORKSPACE_TOOLS.contains(&t.name))
         .filter(|t| allow_fork || !FORK_TOOLS.contains(&t.name))
         .filter(|t| {
             allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name)

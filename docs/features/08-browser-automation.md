@@ -216,3 +216,9 @@ The honest version is less impressive than the router story and easier to operat
 ## Durable channel decisions
 
 High-risk Computer Use confirmations use the inbound account and exact conversation/thread. Reply with `確認 <full UUID>` or `取消 <full UUID>`; questions use `回答 <full UUID> <answer>` and never grant tool permission. Bare yes/A/B cannot select a request. Before execution, the host rechecks the live screen, title, policy and cancellation gates. Restart invalidates old GUI approvals instead of replaying coordinates; an execution without a receipt becomes `uncertain` and requires Admin reconciliation. See the [decision guide](../guides/durable-channel-decisions.md) for the exact supported inbound routes and current limitations.
+
+## Durable workspaces (files that outlive a session)
+
+A computer-use container is removed when its session ends. To keep what an employee gathered, a session can attach a **computer-use workspace**: `computer_session_start` with `workspace = "new"` or an existing `ws-…` id. The gateway is the only writer (`computer_workspace_write`, into the workspace the employee's live session attached); `computer_workspace_list` and `computer_workspace_read` work without a session. Inside the container the files are read-only at `/workspace/files`, under a root-only tmpfs the browser's account cannot enter. Off by default: `config.toml [computer_use.workspaces] enabled = true` plus the employee's `[capabilities.computer_use_config] workspace = true`. macOS and Linux only.
+
+Quotas, retention, the one-session lease, operator commands (`duduclaw ops computer-workspaces`, where every state-changing action needs an Admin's approval in the dashboard; emergencies go through the dashboard or the master switch) and the known limitations, including that owner isolation holds for the three workspace tools only and not for an employee with `Read` or Bash, are in the [computer-use workspaces guide](../guides/computer-workspaces.md).

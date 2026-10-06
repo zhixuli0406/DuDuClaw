@@ -254,6 +254,31 @@ async fn each_master_switch_hides_exactly_its_own_tool_family() {
     }
 }
 
+/// P2-C: the workspace tools need `computer_use` AND the employee's own
+/// `[capabilities.computer_use_config] workspace`; together they reveal
+/// exactly those three. (Hiding is discovery only; the gateway re-checks.)
+#[tokio::test(flavor = "current_thread")]
+async fn workspace_tools_need_both_computer_use_and_the_workspace_switch() {
+    let cu_only = home_with("w", "[capabilities]\ncomputer_use = true\n");
+    let cu_only_names = names_for(cu_only.path(), "w").await;
+    let ws_only = home_with("w", "[capabilities]\n[capabilities.computer_use_config]\nworkspace = true\n");
+    let ws_only_names = names_for(ws_only.path(), "w").await;
+    for t in crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS {
+        assert!(!cu_only_names.contains(t), "{t} hidden without the workspace switch");
+        assert!(!ws_only_names.contains(t), "{t} hidden without computer_use");
+    }
+    let both = home_with(
+        "w",
+        "[capabilities]\ncomputer_use = true\n[capabilities.computer_use_config]\nworkspace = true\n",
+    );
+    let both_names = names_for(both.path(), "w").await;
+    let mut gained: Vec<_> = both_names.iter().filter(|n| !cu_only_names.contains(n)).copied().collect();
+    gained.sort_unstable();
+    let mut expected = crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(gained, expected);
+}
+
 /// `[fork] enabled` lives outside `[capabilities]`; same rule applies.
 #[tokio::test(flavor = "current_thread")]
 async fn fork_tools_follow_the_per_agent_fork_toggle() {

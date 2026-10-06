@@ -116,6 +116,7 @@ pub(crate) const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("computer_scroll", "amount", "integer"),
     ("computer_session_start", "width", "integer"),
     ("computer_session_start", "height", "integer"),
+    ("computer_workspace_write", "expected_revision", "integer"),
 ];
 
 /// The JSON Schema type of one parameter (see [`PARAM_TYPES`]).

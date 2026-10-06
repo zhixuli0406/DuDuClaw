@@ -8,6 +8,12 @@
 //! | `action` | `session_id?`, `turn_id?`, `action: {type: click/type/key/scroll/navigate, …}` | `message` (+ `host` for navigate) + counters |
 //! | `stop` | `session_id?` | statistics |
 //! | `status` | — | `active` + counters |
+//! | `workspace_list` | — | own workspaces: state, usage, quota, files |
+//! | `workspace_read` | `workspace_id`, `path` | fenced `content`, `sha256`, `injection_scan` |
+//! | `workspace_write` | `workspace_id`, `path`, `content`, `expected_revision?` | `data_revision`, usage |
+//!
+//! `start` also takes `workspace?` (`"new"` or a `ws-…` id); without it the
+//! answer is unchanged, with it the answer adds `workspace_id`.
 //!
 //! `turn_id` is the caller's `DUDUCLAW_TURN_ID`; the gateway looks it up in
 //! its own record of live turns of the verified employee to find where a
@@ -68,6 +74,8 @@ pub enum Request {
         task: Option<String>,
         #[serde(default)]
         turn_id: Option<String>,
+        #[serde(default)]
+        workspace: Option<String>,
     },
     Screenshot {
         #[serde(default)]
@@ -85,6 +93,18 @@ pub enum Request {
         session_id: Option<String>,
     },
     Status {},
+    WorkspaceList {},
+    WorkspaceRead {
+        workspace_id: String,
+        path: String,
+    },
+    WorkspaceWrite {
+        workspace_id: String,
+        path: String,
+        content: String,
+        #[serde(default)]
+        expected_revision: Option<i64>,
+    },
 }
 
 /// The total time one op may take on the server.
@@ -95,6 +115,10 @@ pub fn op_budget(request: &Request) -> Duration {
         Request::Action { .. } => ACTION_BUDGET,
         Request::Stop { .. } => STOP_BUDGET,
         Request::Status {} => STATUS_BUDGET,
+        // An approval may be asked (up to 300 s) before the file work.
+        Request::WorkspaceList {} | Request::WorkspaceRead { .. } | Request::WorkspaceWrite { .. } => {
+            STOP_BUDGET
+        }
     }
 }
 
@@ -188,9 +212,9 @@ async fn handle(
     let budget = op_budget(&request);
     let op = async {
         match request {
-            Request::Start { width, height, task, turn_id } if valid_turn_id(&turn_id) => {
+            Request::Start { width, height, task, turn_id, workspace } if valid_turn_id(&turn_id) => {
                 sessions
-                    .start(&agent_id, StartRequest { width, height, task, turn_id })
+                    .start(&agent_id, StartRequest { width, height, task, turn_id, workspace })
                     .await
             }
             Request::Start { .. } => Err(OpError::new(ErrorCode::BadRequest, "turn_id 格式不正確。")),
@@ -211,6 +235,15 @@ async fn handle(
                 sessions.stop(&agent_id, session_id.as_deref()).await
             }
             Request::Status {} => Ok(sessions.status(&agent_id).await),
+            Request::WorkspaceList {} => sessions.workspace_list(&agent_id).await,
+            Request::WorkspaceRead { workspace_id, path } => {
+                sessions.workspace_read(&agent_id, &workspace_id, &path).await
+            }
+            Request::WorkspaceWrite { workspace_id, path, content, expected_revision } => {
+                sessions
+                    .workspace_write(&agent_id, &workspace_id, &path, &content, expected_revision)
+                    .await
+            }
             // A malformed session id can never name a session of this employee.
             _ => Err(super::not_found()),
         }

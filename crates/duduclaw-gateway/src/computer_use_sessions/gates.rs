@@ -45,6 +45,12 @@ pub const TOOL_SCROLL: &str = "computer_scroll";
 pub const TOOL_STOP: &str = "computer_session_stop";
 /// `computer_navigate`.
 pub const TOOL_NAVIGATE: &str = "computer_navigate";
+/// `computer_workspace_list`.
+pub const TOOL_WS_LIST: &str = "computer_workspace_list";
+/// `computer_workspace_read`.
+pub const TOOL_WS_READ: &str = "computer_workspace_read";
+/// `computer_workspace_write`.
+pub const TOOL_WS_WRITE: &str = "computer_workspace_write";
 
 /// How long a computer-tool approval waits for a human.
 pub const APPROVAL_TTL_SECS: i64 = 300;

@@ -92,6 +92,10 @@ pub(crate) async fn handle_tools_call(
             | "computer_session_start"
             | "computer_session_stop"
             | "computer_navigate"
+            // P2-C: audited as workspace id + path hash + length only.
+            | "computer_workspace_write"
+            | "computer_workspace_list"
+            | "computer_workspace_read"
             | "shared_wiki_delete"
             | "canvas_push"
             | "canvas_clear"
@@ -477,7 +481,9 @@ pub(crate) async fn handle_tools_call(
         // O7: the arm reads `mcp_dispatch::COMPUTER_USE_TOOLS` rather than
         // re-listing the seven names, so this gate and the `tools/list` filter
         // cannot drift apart.
-        t if crate::mcp_dispatch::COMPUTER_USE_TOOLS.contains(&t) => {
+        t if crate::mcp_dispatch::COMPUTER_USE_TOOLS.contains(&t)
+            || crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS.contains(&t) =>
+        {
             // SEC: Validate agent ID before path construction (prevent traversal)
             if !is_valid_agent_id(default_agent) {
                 return jsonrpc_error(id, -32602, "Invalid agent ID");
@@ -767,7 +773,11 @@ pub(crate) async fn handle_tools_call(
         // capture entirely for these tools; they still get the `input` +
         // `success` audit fields like every other state-changing tool, only
         // the grounding-evidence field is suppressed.
-        let result_text_for_grounding = if duduclaw_core::grounding::is_self_echo_tool(tool_name) {
+        // P2-C: workspace answers carry file paths and file content; the
+        // audit row keeps only the argument summary (no result text).
+        let result_text_for_grounding = if duduclaw_core::grounding::is_self_echo_tool(tool_name)
+            || crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS.contains(&tool_name)
+        {
             None
         } else {
             extract_tool_result_text(&result)

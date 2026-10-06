@@ -500,7 +500,7 @@ pub(crate) fn ensure_user_settings(
 /// The path to actually write: `path` itself, or — when `path` is a symlink —
 /// its resolved target, which must be an existing regular file.
 fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
-    if !super::antigravity_fs::is_symlink(path) {
+    if !crate::fs_safe::is_symlink(path) {
         return Ok(path.to_path_buf());
     }
     let target = path.canonicalize()?;
@@ -597,7 +597,7 @@ pub(crate) fn merge_mcp_config(
 /// it wrote.
 ///
 /// The work root is agent-writable, so every step below `work_root` is
-/// symlink-safe ([`super::antigravity_fs::SafeDir`]): a symlinked `.agents`,
+/// symlink-safe ([`crate::fs_safe::SafeDir`]): a symlinked `.agents`,
 /// a symlinked or non-regular `mcp_config.json`, and a planted temp name are
 /// all refused or bypassed, and nothing outside the work root is created,
 /// read or modified. The lock lives under `duduclaw_home` ([`mcp_lock_path`]).
@@ -606,7 +606,7 @@ pub(crate) fn write_mcp_config(
     duduclaw_home: &Path,
     servers: &[(String, Value)],
 ) -> std::io::Result<bool> {
-    use super::antigravity_fs::SafeDir;
+    use crate::fs_safe::SafeDir;
     let root = SafeDir::open_root(work_root)?;
     let lock = mcp_lock_path(duduclaw_home, work_root);
     if let Some(parent) = lock.parent() {
@@ -654,7 +654,7 @@ pub(crate) fn legacy_settings_is_mcp_only(content: &str) -> bool {
 /// reads). Anything else is left alone. Returns whether it deleted; a symlink
 /// on the way is an `Err` so the caller can warn.
 pub(crate) fn remove_legacy_agent_settings(agent_dir: &Path) -> std::io::Result<bool> {
-    use super::antigravity_fs::SafeDir;
+    use crate::fs_safe::SafeDir;
     let root = SafeDir::open_root(agent_dir)?;
     let Some(gemini) = root.child_dir(".gemini", false)? else {
         return Ok(false);

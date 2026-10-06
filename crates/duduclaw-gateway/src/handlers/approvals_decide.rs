@@ -132,6 +132,22 @@ impl MethodHandler {
                     "LINE 收件匣的指令列請求只能由管理員（Admin）核准。",
                 );
             }
+            // P2-C: terminal-filed computer-workspace changes are decided by a
+            // current Admin only (role re-read from users.db, not the cached
+            // context), same rule as the LINE inbox requests above.
+            if rec.action_kind == crate::computer_workspaces::cli_approval::ACTION_KIND
+                && crate::approval::require_current_dashboard_role_in_home(
+                    &self.home_dir,
+                    ctx,
+                    UserRole::Admin,
+                )
+                .is_err()
+            {
+                return WsFrame::error_response(
+                    "",
+                    "電腦操作工作區的管理請求只能由管理員（Admin）核准。",
+                );
+            }
             // P2-A: a responsibility change filed from the operator CLI widens
             // spending or authority — only a current Admin may decide it (role
             // re-read from users.db). An expired one is refused above by the
