@@ -168,7 +168,7 @@ pack, the old formats cannot be taken away. See
 
 The **Gemini CLI agent runtime** (runtime id `gemini`, binary `gemini`, npm
 package `@google/gemini-cli`) was deprecated in **v1.67.0**. Its removal moved
-from v1.69.0 to **v1.70.0**. Its replacement is the **Antigravity CLI runtime**
+from v1.69.0 to **v1.70.0**, and on 2026-10-06 to **v1.71.0** (the repeat verification of Antigravity with a real Gemini key after v1.69.1 has not been done yet; the removal waits for it). Its replacement is the **Antigravity CLI runtime**
 (`antigravity`, binary `agy`).
 
 | Old | New |
@@ -186,7 +186,7 @@ that an Antigravity employee at the default permission level is refused by the
 Antigravity CLI itself when it calls a platform tool. The fix ships in v1.69.1: the gateway adds two allow rules for the `duduclaw`
 MCP server to the operator's `~/.gemini/antigravity-cli/settings.json`
 (details: [multi-runtime](../features/13-multi-runtime.md)). The removal stays
-scheduled for v1.70.0, on the condition that Antigravity is verified again with
+scheduled for v1.70.0 (since 2026-10-06: v1.71.0), on the condition that Antigravity is verified again with
 a real Gemini API key after that fix has shipped. That repeat verification has
 not been done yet.
 
@@ -227,7 +227,7 @@ Gemini CLI has not been shut down.
 4. Run `duduclaw doctor`; it lists agents whose `provider` or `fallback` is a
    deprecated runtime.
 
-Before the removal in v1.70.0, check every `agent.toml` for
+Before the removal in v1.71.0, check every `agent.toml` for
 `provider = "gemini"` and `fallback = "gemini"`, and check `config.toml` for
 `utility_provider`, `[dispatch] judge_provider`, `[team.roles.*] runtime` and
 `[discovery.attempt.runtimes.gemini]` set to `gemini`.
