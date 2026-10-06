@@ -164,14 +164,16 @@ pub async fn batch_request_or_apply(home: &Path, req: &BatchRequest) -> Result<C
         .collect();
     let broker = ApprovalBroker::open(home).map_err(|e| refuse("approvals_unavailable", e))?;
     let (subject, wanted, items) = (subject(req), batch_digest(req), items_of(&selected));
-    let same_request = |p: &Value| {
-        p.get("subject").and_then(Value::as_str) == Some(subject.as_str())
-            && p.get("request_digest").and_then(Value::as_str) == Some(wanted.as_str())
+    let same_request = |rec: &crate::approval::ApprovalRecord| {
+        crate::approval::operator_cli_gate::binding_of(rec).is_some_and(|b| {
+            b.action == act && b.target == subject && b.request_digest == wanted
+        })
     };
-    let same_state = |p: &Value| p.get("items") == Some(&items);
     let spec = GateSpec {
-        same_request: &same_request,
-        same_state: &same_state,
+        action: act.to_string(),
+        target: subject.clone(),
+        request_digest: wanted.clone(),
+        state: digest(&["items", &items.to_string()]),
         approval_needs_same_state: false,
         summary: summary(req, &selected),
         payload: json!({
@@ -195,7 +197,7 @@ pub async fn batch_request_or_apply(home: &Path, req: &BatchRequest) -> Result<C
             .await
             .map_err(|e| refuse("approvals_unavailable", e))?
             .iter()
-            .any(|r| r.status == ApprovalStatus::Approved && same_request(&r.payload));
+            .any(|r| r.status == ApprovalStatus::Approved && same_request(r));
         if !approved {
             return Err(refuse(
                 "nothing_selected",

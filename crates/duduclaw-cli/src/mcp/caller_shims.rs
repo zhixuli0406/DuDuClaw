@@ -45,3 +45,11 @@ pub(crate) async fn handle_agent_update(params: &Value, home_dir: &Path, caller:
 pub(crate) async fn handle_activity_post(args: &Value, home_dir: &Path, caller: &str) -> Value {
     super::handle_activity_post(args, home_dir, actor(caller)).await
 }
+
+pub(crate) async fn handle_tasks_list(args: &Value, home_dir: &Path, caller: &str) -> Value {
+    super::handle_tasks_list(args, home_dir, caller, actor(caller)).await
+}
+
+pub(crate) async fn handle_activity_list(args: &Value, home_dir: &Path, caller: &str) -> Value {
+    super::handle_activity_list(args, home_dir, caller, actor(caller)).await
+}

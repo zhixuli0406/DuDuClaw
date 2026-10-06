@@ -1,6 +1,7 @@
 use super::*;
 use crate::mcp::caller_shims::{
-    handle_tasks_claim, handle_tasks_complete, handle_tasks_create, handle_tasks_update,
+    handle_tasks_claim, handle_tasks_complete, handle_tasks_create, handle_tasks_list,
+    handle_tasks_update,
 };
 
 #[tokio::test(flavor = "current_thread")]

@@ -95,7 +95,7 @@
 | Aider 式コードシンボルグラフ(`code_map` MCP ツール) | tree-sitter シンボルグラフを HippoRAG-lite Personalized-PageRank エンジン上で実行し、クエリとの関連度でリポジトリのソースファイルをランク付け |
 | セマンティックベクトル記憶(`w_vec`) | FTS/graph に加えた第三の re-rank シグナル。依存ゼロ・CJK 安全の `NgramHashEmbedder`、`DUDUCLAW_SEMANTIC_VECTORS=1` で有効化 |
 | セッション横断ユーザープロファイル | ユーザーごとの嗜好 traits(temporal supersession)→ セッション安定な `## About This User` を返信に注入（gateway の抽出と承認済みの審査から）。`user_profile_record` / `user_profile_get` MCP ツールは gateway が起動する全従業員で共有される別の名前空間を読み書きするため、このブロックには反映されない（既知の制限、v1.67.1） |
-| GDPR エクスポート/消去 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`(旧表記 `gdpr export` は v1.69.0 で削除)が記憶(triple + 本文言及 + key_facts、4 テーブルのカスケード、SHA-256 仮名 tombstone)**と**セッションストア(`<channel>:<chat_id>` プレフィックス)を対象 |
+| GDPR エクスポート/消去 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`(旧表記 `gdpr export` は v1.69.0 で削除)が記憶(triple + 本文言及 + key_facts + 減衰/forget のアーカイブ複製、5 テーブルのカスケード、SHA-256 仮名 tombstone。アーカイブ複製は本文しか残らないため本文言及で照合。subject/object だけで本人と結び付き、本文が本人に触れていないアーカイブ行は見つからない。試行とエクスポートのアーカイブ件数は本文で一致した行だけを数え、実際の消去では削除した記憶と同じ id のアーカイブ行も消すため、消去件数のほうが多くなることがある)**と**セッションストア(`<channel>:<chat_id>` プレフィックス)を対象。連絡先が空、または前後の空白を除いて 3 文字未満の場合は、何も読む前に拒否 |
 | Custom Dashboard Widgets | サンドボックス化されたランタイムで動作する、AI ガイドまたは生 HTML のダッシュボードカード。Widget Studio での共有/インポート/エクスポート([30-custom-widgets.md](30-custom-widgets.md)) |
 | 予算サーキットブレーカー | エージェント単位のスライディングウィンドウ上限(`[budget] daily_cap_cents`)。上限到達で choke-point にて LLM 呼び出しを遮断。`budget_events.jsonl` |
 | バーンレート異常検知 | エージェントごとの日次支出に対し移動平均+標準偏差で外れ値を検出(`cost_anomaly.rs`) |

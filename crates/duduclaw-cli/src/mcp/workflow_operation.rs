@@ -4,7 +4,7 @@ use crate::mcp_auth::Principal;
 use chrono::Utc;
 use duduclaw_core::workflow_mcp::*;
 use duduclaw_gateway::approval::{
-    ApprovalBroker, ApprovalStatus, ExecutionBinding, OperationClaim, OperationRecord,
+    ApprovalBroker, ApprovalStatus, OperationClaim, OperationRecord,
     OperationState, RequestKind, payload_hash, policy_revision,
 };
 use duduclaw_gateway::workflow::schema::{

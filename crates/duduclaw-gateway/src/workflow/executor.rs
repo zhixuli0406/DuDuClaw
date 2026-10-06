@@ -1,9 +1,6 @@
 //! Only the verified internal stdio route executes MCP workflow steps.
 use super::*;
-use crate::approval::{
-    ApprovalBroker, DecisionContext, ExecutionBinding, OperationState, payload_hash,
-    policy_revision,
-};
+use crate::approval::{ApprovalBroker, ExecutionBinding, OperationState, payload_hash};
 use duduclaw_core::workflow_mcp::{self, ExecuteTicket, PrepareContext, PrepareTicket};
 use duduclaw_llm::{McpClient, McpError};
 use rand::RngCore;

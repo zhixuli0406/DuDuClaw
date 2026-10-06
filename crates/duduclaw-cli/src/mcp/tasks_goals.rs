@@ -338,7 +338,15 @@ pub(crate) async fn handle_activity_post(
     tool_text(&serde_json::json!({ "activity": activity_row_to_json(&row) }).to_string())
 }
 
-pub(crate) async fn handle_activity_list(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+/// List Activity Feed rows. An AI employee caller (`actor` = `Agent`) does not
+/// get rows tied to a task whose audience it may not read (see
+/// `agent_may_read_task`); operators are unrestricted.
+pub(crate) async fn handle_activity_list(
+    args: &Value,
+    home_dir: &Path,
+    default_agent: &str,
+    actor: RecordActor<'_>,
+) -> Value {
     let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
@@ -357,14 +365,18 @@ pub(crate) async fn handle_activity_list(args: &Value, home_dir: &Path, default_
         Ok(r) => r,
         Err(e) => return tool_error(&format!("list activity: {e}")),
     };
-    let items: Vec<Value> = rows
-        .iter()
+    let rows: Vec<_> = rows
+        .into_iter()
         .filter(|r| match task_id_filter {
             Some(t) => r.task_id.as_deref() == Some(t),
             None => true,
         })
-        .map(activity_row_to_json)
         .collect();
+    let rows = match actor.agent() {
+        Some(viewer) => activity_rows_visible_to(&store, home_dir, viewer, rows).await,
+        None => rows,
+    };
+    let items: Vec<Value> = rows.iter().map(activity_row_to_json).collect();
     tool_text(
         &serde_json::json!({
             "activities": items,
@@ -372,6 +384,53 @@ pub(crate) async fn handle_activity_list(args: &Value, home_dir: &Path, default_
         })
         .to_string(),
     )
+}
+
+/// Drop activity rows tied to a task the employee `viewer` may not read. One
+/// audience read per distinct task; the task row is looked up only when the
+/// audience limits it. A row the viewer wrote itself stays. A limited task
+/// that no longer exists has no owner, so only a list naming the viewer
+/// lets its rows through (fail closed).
+async fn activity_rows_visible_to(
+    store: &duduclaw_gateway::task_store::TaskStore,
+    home_dir: &Path,
+    viewer: &str,
+    rows: Vec<duduclaw_gateway::task_store::ActivityRow>,
+) -> Vec<duduclaw_gateway::task_store::ActivityRow> {
+    use duduclaw_gateway::review_evidence::audience::{
+        TaskAudience, agent_may_read_task, task_audience, task_owners,
+    };
+    let mut verdicts: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(task_id) = row.task_id.clone() else {
+            out.push(row);
+            continue;
+        };
+        if row.agent_id == viewer {
+            out.push(row);
+            continue;
+        }
+        let allowed = match verdicts.get(&task_id) {
+            Some(v) => *v,
+            None => {
+                let audience = task_audience(home_dir, &task_id);
+                let v = match &audience {
+                    TaskAudience::Open => true,
+                    _ => match store.get_task(&task_id).await {
+                        Ok(Some(task)) => agent_may_read_task(viewer, &task_owners(&task), &audience),
+                        _ => agent_may_read_task(viewer, &[], &audience),
+                    },
+                };
+                verdicts.insert(task_id, v);
+                v
+            }
+        };
+        if allowed {
+            out.push(row);
+        }
+    }
+    out
 }
 
 // ── Co-edited plan tools (U4) ───────────────────────────────────

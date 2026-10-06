@@ -1,10 +1,15 @@
 //! The human gate of forget by source (P2-B, C-1).
 //!
 //! `plan` files one approval request per plan, bound to the plan id and the
-//! plan hash. It can only be decided in the dashboard (channel buttons and
-//! replies are refused, `approval_notify::is_dashboard_only_kind`) and only by
-//! an Admin (`approvals.decide`). `apply` runs only when that request is
-//! approved, still names the same plan hash, and the plan has not expired.
+//! plan hash, through the shared operator-CLI gate
+//! (`approval::operator_cli_gate`, [`SPEC`]). It can only be decided in the
+//! dashboard (channel buttons and replies are refused,
+//! `approval_notify::is_dashboard_only_kind`) and only by an Admin
+//! (`approvals.decide`). `apply` runs only when that request was approved in
+//! the dashboard (`decided_by` starts with `dashboard:`), still names the
+//! same plan hash, and the plan has not expired. The approval is not
+//! consumed: the plan itself can be applied only once. At most a few
+//! requests wait at once and pushes are capped per namespace per hour.
 //! There is no setting that turns this gate off.
 //!
 //! What this does and does not guarantee (N1): through the product's own
@@ -21,7 +26,12 @@ use std::path::Path;
 
 use duduclaw_memory::ForgetPlan;
 
-use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord, ApprovalStatus};
+use crate::approval::operator_cli_gate::{
+    self as shared, Binding, Consume, Filing, KindSpec, StatePolicy, Validity,
+};
+use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord};
+#[cfg(test)]
+use crate::approval::ApprovalStatus;
 
 /// Fixed text on every forget card and its channel notice (N3). The system
 /// cannot tell who ran `plan`, so it says so instead of naming anyone.
@@ -33,6 +43,15 @@ pub const ACTION_KIND_MEMORY_FORGET_SOURCE: &str = "memory_forget_source";
 
 /// Shortest approval lifetime (a plan about to expire still gets a minute).
 const MIN_TTL_SECONDS: i64 = 60;
+
+/// The binding action of every forget request.
+const GATE_ACTION: &str = "forget_source";
+
+/// First pushes per namespace per hour.
+pub const PUSH_CAP_PER_HOUR: usize = 2;
+
+/// What the dashboard answers for a decision on an expired card.
+pub const EXPIRED_TEXT: &str = "這筆忘記請求已逾期，已自動拒絕；請重新建立計畫。";
 
 /// Where an apply stands with respect to the gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,15 +88,34 @@ pub async fn request_for_plan(
         "plan_expires_at": plan.document.expires_at,
         "counts": counts,
     });
-    broker
-        .request(
-            &plan.document.agent_id,
-            ACTION_KIND_MEMORY_FORGET_SOURCE,
-            summary,
-            payload,
-            ttl,
-        )
-        .await
+    let bind = binding(plan);
+    let filing = Filing {
+        agent_id: &plan.document.agent_id,
+        summary,
+        extra: payload,
+        ttl_secs: ttl,
+    };
+    let (decided, _) = shared::gate(&broker, &SPEC, &bind, filing, None, chrono::Utc::now()).await?;
+    match decided {
+        shared::Gate::Requested(id)
+        | shared::Gate::Pending(id)
+        | shared::Gate::AlreadyClaimed(id) => Ok(id),
+        shared::Gate::Proceed(claim) => Ok(claim.id),
+        shared::Gate::Throttled { waiting, .. } => Err(format!(
+            "已有 {waiting} 筆依來源刪除記憶的請求在等核准，請先到儀表板處理"
+        )),
+    }
+}
+
+fn binding(plan: &ForgetPlan) -> Binding<'_> {
+    Binding {
+        action: GATE_ACTION,
+        target: &plan.plan_id,
+        request_digest: plan.plan_hash.clone(),
+        state: String::new(),
+        state_policy: StatePolicy::MustMatch,
+        push_scope: Some(&plan.document.agent_id),
+    }
 }
 
 /// The zh-TW channel notice for a pending forget request: who, how much,
@@ -114,43 +152,69 @@ pub(crate) fn notice_body(rec: &ApprovalRecord, reminder: bool, deadline: &str) 
     )
 }
 
-fn payload_str<'a>(rec: &'a ApprovalRecord, key: &str) -> Option<&'a str> {
-    rec.payload.get(key).and_then(|v| v.as_str())
-}
-
 /// The gate for `plan`: the newest request filed for its plan id decides.
-/// Fails (an `Err`) when the approvals store cannot be read — the caller
-/// refuses to apply (fail closed).
+/// An approval counts only when decided in the dashboard. Fails (an `Err`)
+/// when the approvals store cannot be read — the caller refuses to apply
+/// (fail closed).
 pub async fn verdict_for_plan(home: &Path, plan: &ForgetPlan) -> Result<GateVerdict, String> {
     let broker = ApprovalBroker::open(home)?;
-    let newest = broker
-        .list_by_kind(ACTION_KIND_MEMORY_FORGET_SOURCE)
-        .await?
-        .into_iter()
-        .filter(|r| payload_str(r, "plan_id") == Some(plan.plan_id.as_str()))
-        .max_by(|a, b| a.created_at.cmp(&b.created_at));
-    let Some(rec) = newest else {
-        return Ok(GateVerdict::Missing);
-    };
-    let approval_id = rec.id.to_string();
-    Ok(match rec.status {
-        ApprovalStatus::Approved
-            if payload_str(&rec, "plan_hash") == Some(plan.plan_hash.as_str()) =>
-        {
-            GateVerdict::Approved { approval_id }
-        }
-        ApprovalStatus::Approved => GateVerdict::HashMismatch { approval_id },
-        ApprovalStatus::Pending if rec.is_stale(chrono::Utc::now()) => GateVerdict::Refused {
-            approval_id,
-            status: "expired".to_string(),
+    let v = shared::verdict(
+        &broker,
+        &SPEC,
+        GATE_ACTION,
+        &plan.plan_id,
+        &plan.plan_hash,
+        None,
+        chrono::Utc::now(),
+    )
+    .await?;
+    Ok(match v {
+        shared::Verdict::Approved { id } => GateVerdict::Approved {
+            approval_id: id.to_string(),
         },
-        ApprovalStatus::Pending => GateVerdict::Pending { approval_id },
-        other => GateVerdict::Refused {
-            approval_id,
-            status: other.as_str().to_string(),
+        shared::Verdict::Pending { id } => GateVerdict::Pending {
+            approval_id: id.to_string(),
         },
+        shared::Verdict::Refused { id, status } => GateVerdict::Refused {
+            approval_id: id.to_string(),
+            status,
+        },
+        shared::Verdict::Mismatch { id } => GateVerdict::HashMismatch {
+            approval_id: id.to_string(),
+        },
+        shared::Verdict::Missing => GateVerdict::Missing,
     })
 }
+
+/// Security audit row for a push past the hourly cap.
+fn audit_push_suppressed(home: &Path, rec: &ApprovalRecord, pushed: usize) {
+    duduclaw_security::audit::append_audit_event(
+        home,
+        &duduclaw_security::audit::AuditEvent::new(
+            "memory_forget_approval_push_suppressed",
+            &rec.agent_id,
+            duduclaw_security::audit::Severity::Info,
+            serde_json::json!({"pushed_last_hour": pushed}),
+        ),
+    );
+}
+
+/// This kind in the shared operator-CLI gate registry.
+pub const SPEC: KindSpec = KindSpec {
+    kind: ACTION_KIND_MEMORY_FORGET_SOURCE,
+    validity: Validity::UntilRequestExpiry,
+    consume: Consume::Never,
+    reminders: true,
+    max_pending_per_target: shared::DEFAULT_MAX_PENDING_PER_TARGET,
+    max_pending_per_kind: shared::DEFAULT_MAX_PENDING_PER_KIND,
+    push_cap_per_hour: Some(PUSH_CAP_PER_HOUR),
+    legacy_scope_key: "agent_id",
+    admin_refusal: "依來源刪除記憶的請求只有管理員（Admin）能決定",
+    expired_text: EXPIRED_TEXT,
+    channel_refusal: None,
+    notice: notice_body,
+    on_push_suppressed: audit_push_suppressed,
+};
 
 #[cfg(test)]
 #[path = "memory_forget_approval_tests.rs"]

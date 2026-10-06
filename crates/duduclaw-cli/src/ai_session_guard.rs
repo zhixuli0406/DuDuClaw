@@ -1,5 +1,8 @@
 //! "Is this process running inside an AI employee's turn?" for operator-only
-//! memory commands (`memory forget-source`, `memory migrate-namespace`).
+//! commands: `memory forget-source`, `memory migrate-namespace` and
+//! `responsibility …` (present even when empty counts), and
+//! `ops channel-ingress` / `ops computer-workspaces` (same list, non-empty
+//! values count there). One list for all of them.
 //!
 //! The gateway sets one or more of these variables on every process it
 //! spawns for an employee (identity, turn, session, delegation chain, run).
@@ -25,6 +28,12 @@ pub(crate) const AI_SESSION_ENV_VARS: &[&str] = &[
     duduclaw_core::ENV_DELEGATION_DEPTH,
     duduclaw_core::ENV_HOP_DEPTH,
     duduclaw_core::ENV_REPLY_CHANNEL,
+    // The task of a goal round (set per call by the gateway's runtimes).
+    duduclaw_core::ENV_TASK_ID,
+    // Also refused by the LINE inbox and computer-workspace commands before
+    // the lists were merged into this one.
+    "DUDUCLAW_MCP_API_KEY",
+    "DUDUCLAW_DATA_FILE_GUARD",
 ];
 
 /// The marker variables present according to `is_set`.
@@ -54,5 +63,6 @@ mod tests {
         }
         assert!(AI_SESSION_ENV_VARS.contains(&"DUDUCLAW_TURN_ID"));
         assert!(AI_SESSION_ENV_VARS.contains(&"DUDUCLAW_SESSION_ID"));
+        assert!(AI_SESSION_ENV_VARS.contains(&"DUDUCLAW_TASK_ID"));
     }
 }

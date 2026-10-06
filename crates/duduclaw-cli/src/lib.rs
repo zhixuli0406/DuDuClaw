@@ -11001,6 +11001,9 @@ async fn cmd_gdpr_export(
     agent: Option<String>,
     out: Option<PathBuf>,
 ) -> duduclaw_core::error::Result<()> {
+    // Refuse a blank or too-short contact before opening any store: it would
+    // become a `%…%` pattern matching most of the employee's data.
+    let contact = duduclaw_memory::gdpr_validate_contact(&contact)?.to_string();
     let agent = resolve_agent_arg(agent).await;
     let engine = open_memory_engine().await?;
     let mut bundle = duduclaw_memory::gdpr_export(&engine, &agent, &contact).await?;
@@ -11020,10 +11023,11 @@ async fn cmd_gdpr_export(
                 .map_err(|e| DuDuClawError::Memory(format!("write bundle: {e}")))?;
             let counts = &bundle["counts"];
             println!(
-                "{} Exported {} memories + {} key facts + {} sessions for '{}' → {}",
+                "{} Exported {} memories + {} key facts + {} archived memories + {} sessions for '{}' → {}",
                 console::style("✓").green(),
                 counts["memories"],
                 counts["key_facts"],
+                counts["archived_memories"],
                 counts["sessions"],
                 console::style(&contact).bold(),
                 console::style(path.display()).cyan(),
@@ -11040,6 +11044,10 @@ async fn cmd_gdpr_erase(
     confirm: bool,
     tombstone: bool,
 ) -> duduclaw_core::error::Result<()> {
+    // Refuse a blank or too-short contact before the dry-run summary and before
+    // any store is opened: an empty contact matches every memory of the
+    // employee, and the session and review-store steps use the same text.
+    let contact = duduclaw_memory::gdpr_validate_contact(&contact)?.to_string();
     let agent = resolve_agent_arg(agent).await;
     let engine = open_memory_engine().await?;
 
@@ -11049,11 +11057,12 @@ async fn cmd_gdpr_erase(
         let counts = &bundle["counts"];
         let (_, session_count) = gdpr_session_bundle(&contact).await?;
         eprintln!(
-            "{} DRY RUN — would erase {} memories + {} key facts + {} sessions for '{}' (agent {}). \
+            "{} DRY RUN — would erase {} memories + {} key facts + {} archived memories + {} sessions for '{}' (agent {}). \
              Re-run with --confirm to delete.",
             console::style("!").yellow(),
             counts["memories"],
             counts["key_facts"],
+            counts["archived_memories"],
             session_count,
             console::style(&contact).bold(),
             agent,
@@ -11123,10 +11132,11 @@ async fn cmd_gdpr_erase(
         }
     }
     println!(
-        "{} Erased {} memories + {} key facts + {} sessions ({} msgs) for '{}' (agent {}){}",
+        "{} Erased {} memories + {} key facts + {} archived memories + {} sessions ({} msgs) for '{}' (agent {}){}",
         console::style("✓").green(),
         summary.memories_deleted,
         summary.key_facts_deleted,
+        summary.archived_memories_deleted,
         sessions_deleted,
         session_messages_deleted,
         console::style(&contact).bold(),

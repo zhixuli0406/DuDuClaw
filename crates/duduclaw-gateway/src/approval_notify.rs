@@ -172,8 +172,11 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
 /// text decision that still arrives for one is refused (see
 /// [`apply_decision`]).
 ///
-/// Members: `knowledge_quarantine`, `workflow_activation` and the LINE
-/// inbox operator changes (`channel_ingress::cli_approval`).
+/// Members: `knowledge_quarantine`, `workflow_activation` and every
+/// operator-CLI kind registered in
+/// `approval::operator_cli_gate::OPERATOR_CLI_KINDS` (LINE inbox, continuous
+/// responsibilities, forget by source, computer workspaces: the terminal
+/// cannot prove who typed the command, so an Admin decides in the dashboard).
 ///
 /// `knowledge_quarantine`: approving it writes knowledge
 /// with operator authority (a held claim is promoted, a burst is released),
@@ -184,20 +187,10 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
 /// `workflow_activation` joined in F1b: accepting a workflow version grants a
 /// standing authority to act, only an Admin may decide it, and a channel
 /// press cannot establish that the presser is a current Admin.
-/// `computer_workspace_admin` (an operator-terminal regrant / renew / delete
-/// of a computer-use workspace, P2-C) is dashboard-only too: the terminal
-/// cannot prove who typed the command, so an Admin decides it in the dashboard.
 pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
     kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
         || kind == crate::approval::WORKFLOW_ACTIVATION_KIND
-        // F2: operator-terminal LINE inbox changes (`duduclaw ops channel-ingress`).
-        || kind == crate::channel_ingress::cli_approval::ACTION_KIND
-        // P2-C: operator-terminal workspace changes (`duduclaw ops computer-workspaces`).
-        || kind == crate::computer_workspaces::cli_approval::ACTION_KIND
-        // P2-A: operator-CLI changes that widen a responsibility.
-        || kind == crate::responsibility::operator_gate::ACTION_KIND
-        // P2-B: forget-by-source plans filed from the operator terminal.
-        || kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE
+        || crate::approval::operator_cli_gate::spec_for(kind).is_some()
 }
 
 /// What the dashboard answers when a dashboard-only card is decided after it
@@ -208,14 +201,8 @@ pub(crate) fn dashboard_only_expired_text(kind: &str) -> &'static str {
         "這則知識審核已逾期，已自動捨棄，無法再核准。"
     } else if kind == crate::approval::WORKFLOW_ACTIVATION_KIND {
         "這個工作流程啟用審核已逾期，工作流程不會啟用；要啟用請重新送審。"
-    } else if kind == crate::channel_ingress::cli_approval::ACTION_KIND {
-        "這則收件處理指令的審核已逾期，指令不會執行；需要的話請重新下指令。"
-    } else if kind == crate::computer_workspaces::cli_approval::ACTION_KIND {
-        crate::computer_workspaces::cli_approval::EXPIRED_TEXT
-    } else if kind == crate::responsibility::operator_gate::ACTION_KIND {
-        crate::responsibility::operator_gate::EXPIRED_TEXT
-    } else if kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE {
-        "這筆忘記請求已逾期，已自動拒絕；請重新建立計畫。"
+    } else if let Some(spec) = crate::approval::operator_cli_gate::spec_for(kind) {
+        spec.expired_text
     } else {
         "這則審核已逾期，已自動拒絕，無法再核准。"
     }
@@ -228,11 +215,9 @@ pub(crate) const DASHBOARD_ONLY_REFUSAL: &str =
 
 /// The refusal text for a channel decision on a dashboard-only `kind`.
 pub(crate) fn dashboard_only_refusal(kind: &str) -> &'static str {
-    if kind == crate::responsibility::operator_gate::ACTION_KIND {
-        crate::responsibility::operator_gate::CHANNEL_REFUSAL
-    } else {
-        DASHBOARD_ONLY_REFUSAL
-    }
+    crate::approval::operator_cli_gate::spec_for(kind)
+        .and_then(|s| s.channel_refusal)
+        .unwrap_or(DASHBOARD_ONLY_REFUSAL)
 }
 
 /// The zh-TW body of the plain notice for a dashboard-only approval. Carries
@@ -242,21 +227,8 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
     if rec.action_kind == crate::approval::WORKFLOW_ACTIVATION_KIND {
         return activation_notice_body(rec, reminder);
     }
-    if rec.action_kind == crate::channel_ingress::cli_approval::ACTION_KIND {
-        return crate::channel_ingress::cli_approval::notice_body(rec, reminder);
-    }
-    if rec.action_kind == crate::computer_workspaces::cli_approval::ACTION_KIND {
-        return crate::computer_workspaces::cli_approval::notice_body(
-            rec,
-            reminder,
-            &deadline_phrase(rec),
-        );
-    }
-    if rec.action_kind == crate::responsibility::operator_gate::ACTION_KIND {
-        return crate::responsibility::operator_gate::notice_body(rec, reminder, &deadline_phrase(rec));
-    }
-    if rec.action_kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE {
-        return crate::memory_forget_approval::notice_body(rec, reminder, &deadline_phrase(rec));
+    if let Some(spec) = crate::approval::operator_cli_gate::spec_for(&rec.action_kind) {
+        return (spec.notice)(rec, reminder, &deadline_phrase(rec));
     }
     let head = if reminder {
         "⏰ 有一則知識審核快到期了，逾時會自動捨棄"
@@ -358,24 +330,14 @@ async fn push_dashboard_only(
     rec: &ApprovalRecord,
     reminder: bool,
 ) -> Option<(String, String)> {
-    // P2-A S-M4: terminal-filed responsibility requests have a per-target
-    // hourly push cap; past it the request stays in the dashboard inbox only.
-    if rec.action_kind == crate::responsibility::operator_gate::ACTION_KIND
-        && !reminder
-        && !crate::responsibility::operator_gate::push_allowed(home_dir, rec).await
-    {
-        return None;
-    }
     let targets = dashboard_only_targets(home_dir, rec, reminder);
     if targets.is_empty() {
         return None;
     }
-    // Terminal-filed workspace requests: at most a few pushes per workspace
-    // per hour (review M-3); beyond that only the inbox and an audit row.
-    if !reminder
-        && rec.action_kind == crate::computer_workspaces::cli_approval::ACTION_KIND
-        && !crate::computer_workspaces::cli_approval::push_allowed(home_dir, rec).await
-    {
+    // Operator-CLI requests: at most a few first pushes per push scope per
+    // hour (`KindSpec::push_cap_per_hour`); beyond that only the inbox and
+    // the kind's suppression record.
+    if !reminder && !crate::approval::operator_cli_gate::push_allowed(home_dir, rec).await {
         return None;
     }
     let policy = crate::notify_governance::QuietPolicy {

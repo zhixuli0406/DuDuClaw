@@ -123,7 +123,9 @@ The flow: the first run only files a request in the dashboard inbox, prints `請
 - An approval is bound to the action, the workspace id and the workspace's state version. If the state changes after the approval (a session attaches, a fence), the approval is void and a new request is needed.
 - An approval is used once. If the action fails after the approval was used, the message says the approval was used and a new request is needed.
 - Only an Admin decides, and only in the dashboard; buttons and replies in chat channels never count, and non-Admin dashboard accounts cannot approve.
-- One pending request per workspace and action: a state change updates that request instead of filing another, without a new notification. At most 2 notifications per workspace per hour; beyond that the request stays in the inbox and an audit event is written.
+- One pending request per workspace, action and fence reason: a state change withdraws that request (`state_changed`) and files a new one, so an Admin never approves a card that was rewritten while it was open. A `fence` approval also covers its `--reason`; a different reason is a different request. At most 2 notifications per workspace per hour; beyond that the request stays in the inbox and an audit event is written.
+
+- These rules are shared with the other operator commands (see [Operator command-line approvals share one gate](../features/05-security-defense.md#operator-command-line-approvals-share-one-gate)). Two terminals re-running the same approved command at once apply it once; the other run is refused and files nothing.
 - The notice carries only the workspace id, owner, action, file and byte counts, and the sentence 「這筆請求由本機指令列建立，系統無法確認下指令的人是誰」 ("this request came from the local command line; the system cannot confirm who typed it").
 
 **Other rules:**

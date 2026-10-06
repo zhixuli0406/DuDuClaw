@@ -13,10 +13,14 @@
 //! [`APPROVAL_VALID_MINUTES`] or one not decided in the dashboard is void.
 //! Every requested, applied and refused action writes a security audit row
 //! (`channel_ingress_cli_action`). The dashboard's `channel_ingress.*` RPCs,
-//! which know who is asking, stay immediate.
+//! which know who is asking, stay immediate. Matching, merging, caps and
+//! consumption are the shared operator-CLI gate
+//! (`approval::operator_cli_gate`); this module supplies the binding, the
+//! texts and [`SPEC`].
 //!
 //! Limits: an AI employee with unrestricted Bash can still file requests
-//! (at most [`MAX_PENDING`] wait at once) and can edit the database files
+//! (at most [`MAX_PENDING`] wait at once, three different ones per event)
+//! and can edit the database files
 //! directly; real isolation is not granting Bash.
 
 use std::path::Path;
@@ -24,12 +28,15 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::{IngressRow, IngressStore, ResolveRequest, digest};
-use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord, ApprovalStatus};
+use crate::approval::operator_cli_gate::{
+    self as shared, Binding, Consume, Filing, KindSpec, StatePolicy, ThrottleScope, Validity,
+};
+use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord};
 
 /// The dashboard-only approval kind.
 pub const ACTION_KIND: &str = "channel_ingress_admin";
 /// The actor recorded for anything the terminal asks for.
-pub const UNVERIFIED_ACTOR: &str = "本機指令列（身分未驗證）";
+pub const UNVERIFIED_ACTOR: &str = shared::UNVERIFIED_ACTOR;
 /// The sentence every card carries.
 pub const CARD_NOTE: &str = "這筆請求由本機指令列建立，系統無法確認下指令的人是誰";
 /// What the terminal prints while no usable approval exists.
@@ -39,7 +46,12 @@ pub const TTL_SECS: i64 = 86_400;
 /// How long an approval stays usable after the decision.
 pub const APPROVAL_VALID_MINUTES: i64 = 30;
 /// Most terminal requests that may wait at once.
-pub const MAX_PENDING: usize = 20;
+pub const MAX_PENDING: usize = shared::DEFAULT_MAX_PENDING_PER_KIND;
+/// First pushes per event (or batch) per hour.
+pub const PUSH_CAP_PER_HOUR: usize = 2;
+/// What the dashboard answers for a decision on an expired card.
+pub const EXPIRED_TEXT: &str =
+    "這則收件處理指令的審核已逾期，指令不會執行；需要的話請重新下指令。";
 
 /// A state-changing terminal action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,16 +263,6 @@ pub(super) fn applicable(
     }
 }
 
-fn approval_still_valid(decided_at: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> bool {
-    decided_at
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .is_some_and(|t| {
-            let age = now.signed_duration_since(t.with_timezone(&chrono::Utc));
-            age >= chrono::Duration::zero()
-                && age <= chrono::Duration::minutes(APPROVAL_VALID_MINUTES)
-        })
-}
-
 pub(super) enum Gate {
     /// An approval was consumed: its id, decider and payload.
     Proceed(ApprovalId, String, Value),
@@ -270,92 +272,66 @@ pub(super) enum Gate {
 
 /// What one terminal request is matched on. A single-event request binds
 /// the event's state version: an approval granted for another state is
-/// void. A batch binds the item set: a pending card whose set no longer
-/// matches is withdrawn and filed again (review L14e: never rewritten in
-/// place), and an approved batch is checked item by item when applied.
-pub(super) struct GateSpec<'a> {
-    pub same_request: &'a (dyn Fn(&Value) -> bool + Sync),
-    pub same_state: &'a (dyn Fn(&Value) -> bool + Sync),
+/// void. A batch binds the item set only while it waits: a pending card
+/// whose set no longer matches is withdrawn and filed again (review L14e:
+/// never rewritten in place), and an approved batch is checked item by item
+/// when applied.
+pub(super) struct GateSpec {
+    pub action: String,
+    pub target: String,
+    pub request_digest: String,
+    pub state: String,
     pub approval_needs_same_state: bool,
     pub summary: String,
     pub payload: Value,
 }
 
-pub(super) async fn gate(broker: &ApprovalBroker, spec: GateSpec<'_>) -> Result<Gate, String> {
-    let now = chrono::Utc::now();
-    let mut pending: Option<ApprovalId> = None;
-    let mut live_pending = 0usize;
-    for rec in broker.list_by_kind(ACTION_KIND).await? {
-        let same_request = (spec.same_request)(&rec.payload);
-        let same_state = (spec.same_state)(&rec.payload);
-        match rec.status {
-            ApprovalStatus::Approved if same_request => {
-                let by = rec.decided_by.clone().unwrap_or_default();
-                let why = if !by.starts_with("dashboard:") {
-                    Some("not_dashboard_decision")
-                } else if spec.approval_needs_same_state && !same_state {
-                    Some("state_changed")
-                } else if !approval_still_valid(rec.decided_at.as_deref(), now) {
-                    Some("approval_expired")
-                } else {
-                    None
-                };
-                if let Some(why) = why {
-                    broker.invalidate_request(&rec.id, why).await?;
-                    continue;
-                }
-                // Consume: only the run whose nonce the row ends up carrying acts.
-                let nonce = format!("consumed:{}", uuid::Uuid::new_v4().as_simple());
-                broker.invalidate_request(&rec.id, &nonce).await?;
-                let after = broker.get(&rec.id).await?;
-                if after.is_some_and(|r| r.invalidated_reason.as_deref() == Some(nonce.as_str())) {
-                    return Ok(Gate::Proceed(rec.id, by, rec.payload));
-                }
-            }
-            ApprovalStatus::Pending => {
-                let live = broker
-                    .get(&rec.id)
-                    .await?
-                    .is_some_and(|r| r.status == ApprovalStatus::Pending && !r.is_stale(now));
-                if !live {
-                    continue;
-                }
-                if same_request && (pending.is_some() || !same_state) {
-                    // A duplicate, or a card describing a state that is gone.
-                    let why = if pending.is_some() {
-                        "duplicate"
-                    } else {
-                        "state_changed"
-                    };
-                    broker.invalidate_request(&rec.id, why).await?;
-                    continue;
-                }
-                live_pending += 1;
-                if same_request {
-                    pending = Some(rec.id);
-                }
-            }
-            _ => {}
-        }
+pub(super) async fn gate(broker: &ApprovalBroker, spec: GateSpec) -> Result<Gate, String> {
+    let bind = Binding {
+        action: &spec.action,
+        target: &spec.target,
+        request_digest: spec.request_digest.clone(),
+        state: spec.state.clone(),
+        state_policy: if spec.approval_needs_same_state {
+            StatePolicy::MustMatch
+        } else {
+            StatePolicy::PendingOnly
+        },
+        push_scope: None,
+    };
+    let filing = Filing {
+        agent_id: "gateway",
+        summary: &spec.summary,
+        extra: spec.payload,
+        ttl_secs: TTL_SECS,
+    };
+    let (decided, _voided) = shared::gate(
+        broker,
+        &SPEC,
+        &bind,
+        filing,
+        Some(APPROVAL_VALID_MINUTES),
+        chrono::Utc::now(),
+    )
+    .await?;
+    match decided {
+        shared::Gate::Proceed(claim) => Ok(Gate::Proceed(claim.id, claim.decided_by, claim.payload)),
+        shared::Gate::Requested(id) => Ok(Gate::Requested(id)),
+        shared::Gate::Pending(id) => Ok(Gate::Pending(id)),
+        shared::Gate::Throttled {
+            waiting,
+            scope: ThrottleScope::Kind,
+        } => Err(format!(
+            "已有 {waiting} 筆指令列請求等待核准，請先到儀表板處理後再送新的請求。"
+        )),
+        shared::Gate::Throttled { waiting, .. } => Err(format!(
+            "這筆事件已有 {waiting} 筆不同內容的請求等待核准，請先到儀表板處理後再送新的請求。"
+        )),
+        shared::Gate::AlreadyClaimed(id) => Err(format!(
+            "這筆核准（編號 {}）已被另一次執行用掉或作廢，這次沒有執行任何動作；需要的話請重新執行指令，送出新的核准請求。",
+            short(id.as_str())
+        )),
     }
-    if let Some(id) = pending {
-        return Ok(Gate::Pending(id));
-    }
-    if live_pending >= MAX_PENDING {
-        return Err(format!(
-            "已有 {live_pending} 筆指令列請求等待核准，請先到儀表板處理後再送新的請求。"
-        ));
-    }
-    let id = broker
-        .request(
-            "gateway",
-            ACTION_KIND,
-            &spec.summary,
-            spec.payload,
-            TTL_SECS,
-        )
-        .await?;
-    Ok(Gate::Requested(id))
 }
 
 async fn single_gate(
@@ -363,19 +339,13 @@ async fn single_gate(
     req: &CliRequest,
     row: &IngressRow,
 ) -> Result<Gate, String> {
-    let version = state_version(row);
-    let wanted = request_digest(req);
-    let same_request = |p: &Value| {
-        p.get("ingress_id").and_then(Value::as_str) == Some(row.id.as_str())
-            && p.get("request_digest").and_then(Value::as_str) == Some(wanted.as_str())
-    };
-    let same_state =
-        |p: &Value| p.get("state_version").and_then(Value::as_str) == Some(version.as_str());
     gate(
         broker,
         GateSpec {
-            same_request: &same_request,
-            same_state: &same_state,
+            action: req.action.as_str().to_string(),
+            target: row.id.clone(),
+            request_digest: request_digest(req),
+            state: state_version(row),
             approval_needs_same_state: true,
             summary: card_summary(req, row),
             payload: payload(req, row),
@@ -479,6 +449,43 @@ pub async fn request_or_apply(home: &Path, req: &CliRequest) -> Result<CliOutcom
         }
     }
 }
+
+fn spec_notice(rec: &ApprovalRecord, reminder: bool, _deadline: &str) -> String {
+    notice_body(rec, reminder)
+}
+
+/// Security audit row for a push past the hourly cap.
+fn audit_push_suppressed(home: &Path, rec: &ApprovalRecord, pushed: usize) {
+    duduclaw_security::audit::append_audit_event(
+        home,
+        &duduclaw_security::audit::AuditEvent::new(
+            "channel_ingress_approval_push_suppressed",
+            UNVERIFIED_ACTOR,
+            duduclaw_security::audit::Severity::Info,
+            json!({
+                "approval_id": duduclaw_core::truncate_chars(rec.id.as_str(), 36),
+                "pushed_last_hour": pushed,
+            }),
+        ),
+    );
+}
+
+/// This kind in the shared operator-CLI gate registry.
+pub const SPEC: KindSpec = KindSpec {
+    kind: ACTION_KIND,
+    validity: Validity::Fixed(APPROVAL_VALID_MINUTES),
+    consume: Consume::Once,
+    reminders: true,
+    max_pending_per_target: shared::DEFAULT_MAX_PENDING_PER_TARGET,
+    max_pending_per_kind: MAX_PENDING,
+    push_cap_per_hour: Some(PUSH_CAP_PER_HOUR),
+    legacy_scope_key: "ingress_id",
+    admin_refusal: "LINE 收件匣的指令列請求只能由管理員（Admin）核准。",
+    expired_text: EXPIRED_TEXT,
+    channel_refusal: None,
+    notice: spec_notice,
+    on_push_suppressed: audit_push_suppressed,
+};
 
 /// The plain channel notice for one of these requests: action, event,
 /// where to decide, deadline. No note text and no decision verb.

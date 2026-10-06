@@ -87,20 +87,9 @@ pub enum ChannelIngressCommands {
 }
 
 /// Variables a DuDuClaw-spawned process carries. Any of them present and
-/// non-empty refuses the command.
-pub const SESSION_ENV_VARS: &[&str] = &[
-    "DUDUCLAW_AGENT_ID",
-    "DUDUCLAW_AGENT_TOKEN",
-    "DUDUCLAW_TURN_ID",
-    "DUDUCLAW_SESSION_ID",
-    "DUDUCLAW_REPLY_CHANNEL",
-    "DUDUCLAW_HOP_DEPTH",
-    "DUDUCLAW_DELEGATION_SENDER",
-    "DUDUCLAW_DELEGATION_ORIGIN",
-    "DUDUCLAW_DELEGATION_DEPTH",
-    "DUDUCLAW_MCP_API_KEY",
-    "DUDUCLAW_DATA_FILE_GUARD",
-];
+/// non-empty refuses the command. One list for every operator-only command
+/// (`crate::ai_session_guard::AI_SESSION_ENV_VARS`).
+pub const SESSION_ENV_VARS: &[&str] = crate::ai_session_guard::AI_SESSION_ENV_VARS;
 
 /// The operator-only subcommands this module owns on the Bash lane. Other
 /// features add their own entries to their own lists and call the same
@@ -134,7 +123,12 @@ fn print(v: &serde_json::Value) {
 }
 
 pub async fn run(home: &Path, cmd: ChannelIngressCommands) -> Result<()> {
-    run_with_env(home, cmd, |k| std::env::var(k).ok()).await
+    // `var_os`, not `var`: a non-UTF-8 value must still count as present
+    // (`var(..).ok()` would read it as unset and skip the session check).
+    run_with_env(home, cmd, |k| {
+        std::env::var_os(k).map(|v| v.to_string_lossy().into_owned())
+    })
+    .await
 }
 
 /// [`run`] with the environment lookup injected (tests share one process).

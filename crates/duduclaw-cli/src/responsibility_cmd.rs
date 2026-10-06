@@ -125,13 +125,13 @@ pub enum ResponsibilityCommands {
 pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 fn process_env(key: &str) -> Option<String> {
-    std::env::var(key).ok()
+    std::env::var_os(key).map(|v| v.to_string_lossy().into_owned())
 }
 
+/// Any variable the gateway sets on an employee process, present even when
+/// empty (the one shared list, `crate::ai_session_guard`).
 fn in_agent_session(env: EnvLookup<'_>) -> bool {
-    [duduclaw_core::ENV_AGENT_ID, duduclaw_core::ENV_AGENT_TOKEN]
-        .iter()
-        .any(|k| env(k).is_some_and(|v| !v.trim().is_empty()))
+    !crate::ai_session_guard::markers_with(&|k| env(k).is_some()).is_empty()
 }
 
 const AGENT_SESSION_REFUSAL: &str =
@@ -212,22 +212,21 @@ pub async fn run_with_env(
         }
         return Err(DuDuClawError::Agent(AGENT_SESSION_REFUSAL.into()));
     }
-    if let Some((a, target)) = &action {
-        if widens(*a)
-            && !duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home).enabled
-        {
-            gate::audit(
-                home,
-                "refused",
-                *a,
-                target,
-                "",
-                json!({"reason": "feature_off"}),
-            );
-            return Err(err(
-                "持續任務功能目前關閉（config.toml [responsibilities] enabled = false），不接受這類變更。",
-            ));
-        }
+    if let Some((a, target)) = &action
+        && widens(*a)
+        && !duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home).enabled
+    {
+        gate::audit(
+            home,
+            "refused",
+            *a,
+            target,
+            "",
+            json!({"reason": "feature_off"}),
+        );
+        return Err(err(
+            "持續任務功能目前關閉（config.toml [responsibilities] enabled = false），不接受這類變更。",
+        ));
     }
     let store = TaskStore::open(home).map_err(err)?;
     let now = Utc::now();
@@ -444,6 +443,20 @@ async fn through_gate(home: &Path, req: &GateRequest<'_>, confirm: bool) -> Resu
             );
             Err(err(format!(
                 "這個對象已有 {n} 筆不同內容的請求在等核准，沒有再送出新的。請先到儀表板處理。"
+            )))
+        }
+        Gate::AlreadyClaimed(id) => {
+            gate::audit(
+                home,
+                "refused",
+                req.action,
+                req.target,
+                req.owner,
+                json!({"approval_id": id.as_str(), "reason": "already_claimed"}),
+            );
+            Err(err(format!(
+                "這筆核准（編號 {}）已被另一次執行用掉或作廢，這次沒有執行任何動作；需要的話請重新執行指令，送出新的核准請求。",
+                duduclaw_core::truncate_chars(id.as_str(), 8)
             )))
         }
         Gate::Pending(id) => {

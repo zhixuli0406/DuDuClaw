@@ -245,6 +245,13 @@ async fn build_pending_tasks_section(home_dir: &Path, agent_id: &str) -> Option<
             all.append(&mut rows);
         }
     }
+    // Task audience (U6): the same rule as MCP `tasks_list`. The board lists
+    // only this employee's own assigned tasks, which the rule lets their
+    // owner read, so today this removes nothing; it keeps the board on the
+    // one predicate if the query ever widens.
+    all.retain(|row| {
+        crate::review_evidence::audience::agent_may_read_task_row(home_dir, agent_id, row)
+    });
     if all.is_empty() {
         return None;
     }

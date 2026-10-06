@@ -88,9 +88,16 @@ pub(crate) fn private_connection(path: &Path) -> Result<Connection, StoreError> 
             Err(error) => return Err(fail(error)),
         }
         validate_private_files(&path)?;
-        let authority = std::fs::OpenOptions::new().read(true).write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path).map_err(fail)?;
-        let before = authority.metadata().map_err(fail)?;
+        // Identity is taken with `lstat`, never by opening the file: closing
+        // any descriptor on an existing database drops every POSIX lock this
+        // process holds on it, so a second open-and-close here would strip
+        // the SQLite locks of live stores in this process and let another
+        // process checkpoint and remove the WAL under them (same fix as
+        // approval/store.rs). `create_new` above never opens an existing file.
+        let before = std::fs::symlink_metadata(&path).map_err(fail)?;
+        if !before.is_file() {
+            return Err(StoreError::Corrupt("database is not a regular file".into()));
+        }
         let connection = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
         validate_private_files(&path)?;
