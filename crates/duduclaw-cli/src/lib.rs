@@ -3761,6 +3761,38 @@ fn read_log_level_from_config(path: &std::path::Path) -> Option<String> {
 ///
 /// Installs rustls provider, tracing subscriber, parses CLI args, and dispatches.
 /// Pro binary calls [`set_extension`] before this to inject Pro features into the gateway.
+/// Stack size of the thread that runs [`entry_point`] for the shipped
+/// binaries. The OS main thread is 8 MiB on macOS / Linux but only 1 MiB on
+/// Windows, and `#[tokio::main]` runs the root future right there: on the
+/// CI Windows runner `duduclaw mcp-server` died with "thread 'main' has
+/// overflowed its stack" before the MCP handshake (every `workflow_stdio`
+/// case failed with `McpError::Closed`). Same figure the clap-parse tests
+/// use (`test_support::run_on_big_stack`).
+pub const MAIN_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+/// Synchronous entry for the shipped binaries: runs [`entry_point`] on a
+/// named thread with [`MAIN_STACK_BYTES`] of stack inside a multi-thread
+/// tokio runtime (the same flavour `#[tokio::main]` builds). Worker threads
+/// keep tokio's default stack; only the root future moves off the OS main
+/// thread. A panic on that thread is re-raised here so the exit status is
+/// unchanged.
+pub fn entry_point_blocking() {
+    let handle = std::thread::Builder::new()
+        .name("duduclaw-main".into())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            runtime.block_on(entry_point());
+        })
+        .expect("spawn duduclaw-main thread");
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 pub async fn entry_point() {
     let cli = Cli::parse();
     if is_read_only_survival_command(&cli.command) {
