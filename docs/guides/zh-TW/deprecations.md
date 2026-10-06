@@ -145,7 +145,7 @@ v1.66.0 標為棄用的所有項目，例外見 [仍在棄用期](#仍在棄用�
 ### Gemini CLI runtime
 
 **Gemini CLI agent runtime**（runtime id `gemini`、執行檔 `gemini`、npm 套件
-`@google/gemini-cli`）在 **v1.67.0** 標為棄用。移除時間由 v1.69.0 改到 **v1.70.0**，2026-10-06 再改到 **v1.71.0**（v1.69.1 之後用真的 Gemini 金鑰重驗 Antigravity 還沒做，移除等它）。
+`@google/gemini-cli`）在 **v1.67.0** 標為棄用。移除時間由 v1.69.0 改到 **v1.71.0**，2026-10-06 再改到 **v1.71.0**（v1.69.1 之後用真的 Gemini 金鑰重驗 Antigravity 還沒做，移除等它）。
 接手的是 **Antigravity CLI runtime**（`antigravity`，執行檔 `agy`）。
 
 | 舊 | 新 |

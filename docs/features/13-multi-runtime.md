@@ -41,7 +41,7 @@ unloggable-into.
 |---|---|---|---|---|---|---|
 | Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token` (paste-back) | `~/.claude/.credentials.json` |
 | OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login` (localhost callback) | `~/.codex/auth.json` |
-| Gemini CLI (deprecated in v1.67.0, removed in v1.70.0) | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login` (localhost callback) | `~/.gemini/oauth_creds.json` |
+| Gemini CLI (deprecated in v1.67.0, removed in v1.71.0) | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login` (localhost callback) | `~/.gemini/oauth_creds.json` |
 | Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json (v1.2.10) | Google sign-in via `agy` in a terminal (no `login` subcommand), or API-key mode | OS keyring |
 | Grok Build | `grok` | `x.ai/cli/install.sh` (manual) | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
 | Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | none (API key only) | `~/.qwen/.env` |
@@ -133,7 +133,7 @@ Extract response
 
 **Gemini Runtime** — Calls the Google Gemini CLI with `--output-format stream-json` for structured output.
 
-> **Deprecated in v1.67.0, removed in v1.70.0.** Google stopped serving individual (free, AI Pro, AI Ultra) accounts through Gemini CLI on 2026-06-18; use the Antigravity runtime instead. It keeps working until removal. The Gemini API provider is not affected. Migration steps: [Deprecations](../guides/deprecations.md#gemini-cli-runtime).
+> **Deprecated in v1.67.0, removed in v1.71.0.** Google stopped serving individual (free, AI Pro, AI Ultra) accounts through Gemini CLI on 2026-06-18; use the Antigravity runtime instead. It keeps working until removal. The Gemini API provider is not affected. Migration steps: [Deprecations](../guides/deprecations.md#gemini-cli-runtime).
 
 ```
 Agent config: runtime = "gemini"

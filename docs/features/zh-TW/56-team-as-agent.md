@@ -167,7 +167,7 @@ Goose 的 Lead/Worker 功能儲存的角色設定只有模型名稱，結果 `qw
 
 ### 2. 只限第一批 runtime
 
-`claude`、`codex`、`gemini`（v1.67.0 起棄用，v1.70.0 移除：請改用 `antigravity`）、`antigravity`、`grok`。其他一律拒絕，包括 `openai_compat`、`qwen`、`copilot`、`cursor`（`runtime_not_allowed`）。
+`claude`、`codex`、`gemini`（v1.67.0 起棄用，v1.71.0 移除：請改用 `antigravity`）、`antigravity`、`grok`。其他一律拒絕，包括 `openai_compat`、`qwen`、`copilot`、`cursor`（`runtime_not_allowed`）。
 
 原因在工具，與能力無關：這五個 runtime 原生註冊 DuDuClaw 的 MCP server，所以跑在上面的角色拿得到完整的工具面。角色若靜默失去工具，會產生自信滿滿、沒有任何工具呼叫的敘述，審核者分不出它與真正做完的工作。
 

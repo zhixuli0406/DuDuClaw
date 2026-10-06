@@ -168,7 +168,7 @@ pack, the old formats cannot be taken away. See
 
 The **Gemini CLI agent runtime** (runtime id `gemini`, binary `gemini`, npm
 package `@google/gemini-cli`) was deprecated in **v1.67.0**. Its removal moved
-from v1.69.0 to **v1.70.0**, and on 2026-10-06 to **v1.71.0** (the repeat verification of Antigravity with a real Gemini key after v1.69.1 has not been done yet; the removal waits for it). Its replacement is the **Antigravity CLI runtime**
+from v1.69.0 to **v1.71.0**, and on 2026-10-06 to **v1.71.0** (the repeat verification of Antigravity with a real Gemini key after v1.69.1 has not been done yet; the removal waits for it). Its replacement is the **Antigravity CLI runtime**
 (`antigravity`, binary `agy`).
 
 | Old | New |
