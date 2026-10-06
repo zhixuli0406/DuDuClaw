@@ -72,6 +72,7 @@ pub(crate) fn zh_action_kind(kind: &str) -> &str {
         "bus_task" => "執行委派任務",
         "browser_action" => "操作瀏覽器",
         "support_pilot_review" => "檢視合成決策模擬",
+        "computer_workspace_admin" => "管理電腦操作工作區",
         _ => "執行需要核可的動作",
     }
 }
@@ -183,11 +184,16 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
 /// `workflow_activation` joined in F1b: accepting a workflow version grants a
 /// standing authority to act, only an Admin may decide it, and a channel
 /// press cannot establish that the presser is a current Admin.
+/// `computer_workspace_admin` (an operator-terminal regrant / renew / delete
+/// of a computer-use workspace, P2-C) is dashboard-only too: the terminal
+/// cannot prove who typed the command, so an Admin decides it in the dashboard.
 pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
     kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
         || kind == crate::approval::WORKFLOW_ACTIVATION_KIND
         // F2: operator-terminal LINE inbox changes (`duduclaw ops channel-ingress`).
         || kind == crate::channel_ingress::cli_approval::ACTION_KIND
+        // P2-C: operator-terminal workspace changes (`duduclaw ops computer-workspaces`).
+        || kind == crate::computer_workspaces::cli_approval::ACTION_KIND
 }
 
 /// What the dashboard answers when a dashboard-only card is decided after it
@@ -200,6 +206,8 @@ pub(crate) fn dashboard_only_expired_text(kind: &str) -> &'static str {
         "這個工作流程啟用審核已逾期，工作流程不會啟用；要啟用請重新送審。"
     } else if kind == crate::channel_ingress::cli_approval::ACTION_KIND {
         "這則收件處理指令的審核已逾期，指令不會執行；需要的話請重新下指令。"
+    } else if kind == crate::computer_workspaces::cli_approval::ACTION_KIND {
+        crate::computer_workspaces::cli_approval::EXPIRED_TEXT
     } else {
         "這則審核已逾期，已自動拒絕，無法再核准。"
     }
@@ -219,6 +227,13 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
     }
     if rec.action_kind == crate::channel_ingress::cli_approval::ACTION_KIND {
         return crate::channel_ingress::cli_approval::notice_body(rec, reminder);
+    }
+    if rec.action_kind == crate::computer_workspaces::cli_approval::ACTION_KIND {
+        return crate::computer_workspaces::cli_approval::notice_body(
+            rec,
+            reminder,
+            &deadline_phrase(rec),
+        );
     }
     let head = if reminder {
         "⏰ 有一則知識審核快到期了，逾時會自動捨棄"
@@ -322,6 +337,14 @@ async fn push_dashboard_only(
 ) -> Option<(String, String)> {
     let targets = dashboard_only_targets(home_dir, rec, reminder);
     if targets.is_empty() {
+        return None;
+    }
+    // Terminal-filed workspace requests: at most a few pushes per workspace
+    // per hour (review M-3); beyond that only the inbox and an audit row.
+    if !reminder
+        && rec.action_kind == crate::computer_workspaces::cli_approval::ACTION_KIND
+        && !crate::computer_workspaces::cli_approval::push_allowed(home_dir, rec).await
+    {
         return None;
     }
     let policy = crate::notify_governance::QuietPolicy {

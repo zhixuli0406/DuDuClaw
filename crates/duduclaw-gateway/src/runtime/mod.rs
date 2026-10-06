@@ -4,7 +4,6 @@
 //! Each runtime translates its JSONL output format into a unified `RuntimeResponse`.
 
 pub mod antigravity;
-mod antigravity_fs;
 mod antigravity_setup;
 pub mod claude;
 pub mod codex;

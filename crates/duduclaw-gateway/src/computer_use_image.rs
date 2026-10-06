@@ -38,7 +38,9 @@ pub(crate) const IMAGE_INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Keys `[computer_use]` may carry. Anything else is a typo and makes the
 /// table invalid (fail closed) instead of silently using the default.
-const KNOWN_KEYS: &[&str] = &["image"];
+/// `workspaces` is the `[computer_use.workspaces]` sub-table, parsed by
+/// `crate::computer_workspaces::config`.
+const KNOWN_KEYS: &[&str] = &["image", "workspaces"];
 
 /// `ghcr.io/zhixuli0406/duduclaw-computer-use:v<this gateway's version>`.
 pub fn default_image() -> String {
@@ -159,6 +161,42 @@ pub async fn image_presence(image: &str) -> Presence {
             Presence::Unknown
         }
     }
+}
+
+/// The local image id (`sha256:<64 hex>`) of `image`, from the same bounded
+/// `docker image inspect --format {{.Id}}` [`image_presence`] runs (it keeps
+/// the value that check discards). A workspace session runs the container by
+/// this id, so a tag moved between inspect and `docker run` cannot swap the
+/// image. `Err` carries the presence verdict: `Missing` when Docker answered
+/// without a usable id, `Unknown` when Docker did not answer.
+pub async fn image_id(image: &str) -> Result<String, Presence> {
+    if !acceptable(image) {
+        return Err(Presence::Missing);
+    }
+    if let duduclaw_core::docker_probe::DockerStatus::Unavailable(why) =
+        crate::task_sandbox::container::docker_status().await
+    {
+        warn!(reason = why.code(), "computer-use image id skipped: Docker unavailable");
+        return Err(Presence::Unknown);
+    }
+    let args = ["image", "inspect", "--format", "{{.Id}}", image];
+    match crate::computer_use_orchestrator::docker_output(&args, IMAGE_INSPECT_TIMEOUT, "Image inspect")
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if is_image_id(&id) { Ok(id) } else { Err(Presence::Missing) }
+        }
+        Ok(_) => Err(Presence::Missing),
+        Err(_) => Err(Presence::Unknown),
+    }
+}
+
+/// `sha256:` followed by exactly 64 lowercase hex digits.
+pub fn is_image_id(id: &str) -> bool {
+    id.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    })
 }
 
 /// The text a failed presence check turns into, or `None` when present.

@@ -76,12 +76,22 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// and the `output()` future is dropped, the `docker` client process is killed
 /// rather than left running. A timeout is returned as an `Err` exactly like a
 /// spawn failure, so every caller's existing failure path applies unchanged.
+/// `docker`, or (tests only) the fake client the current test thread set in
+/// `task_sandbox::container::DOCKER_PROGRAM`.
+fn docker_program() -> std::ffi::OsString {
+    #[cfg(test)]
+    if let Some(p) = crate::task_sandbox::container::DOCKER_PROGRAM.with(|p| p.borrow().clone()) {
+        return p.into_os_string();
+    }
+    "docker".into()
+}
+
 pub(crate) async fn docker_output<S: AsRef<std::ffi::OsStr>>(
     args: &[S],
     limit: Duration,
     what: &str,
 ) -> Result<std::process::Output, ComputerUseError> {
-    let fut = tokio::process::Command::new("docker")
+    let fut = tokio::process::Command::new(docker_program())
         .args(args)
         .kill_on_drop(true)
         .output();
@@ -341,6 +351,11 @@ pub struct ComputerUseConfig {
     /// are ignored. Never read from or written to configuration.
     #[serde(skip)]
     pub pinned_hosts: Vec<PinnedHost>,
+    /// The durable workspace attached to this session (P2-C), mounted
+    /// read-only at `/workspace/files` (under a root-only tmpfs). Set only by the session manager from the
+    /// registry; never read from or written to configuration.
+    #[serde(skip)]
+    pub workspace_mount: Option<WorkspaceMount>,
     /// CONTRACT.toml `must_not` rules — actions matching these are blocked.
     pub contract_must_not: Vec<String>,
 }
@@ -363,9 +378,52 @@ impl Default for ComputerUseConfig {
             network_access: false,
             allowed_domains: Vec::new(),
             pinned_hosts: Vec::new(),
+            workspace_mount: None,
             contract_must_not: Vec::new(),
         }
     }
+}
+
+/// A workspace bind mount for one session: the gateway-derived, verified
+/// canonical `data/` directory and the lease it was attached under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceMount {
+    pub workspace_id: String,
+    pub lease_epoch: i64,
+    /// Canonical `<home>/computer_workspaces/<id>/data`.
+    pub source: PathBuf,
+}
+
+/// `Unavailable` text when the last mount-source check before `docker run`
+/// refuses (the session manager maps it to `workspace_unavailable`).
+pub const WORKSPACE_MOUNT_UNSAFE: &str = "電腦操作工作區目前無法使用（掛載前檢查未通過）。";
+/// `Unavailable` text when Docker refused the workspace mount.
+pub const WORKSPACE_MOUNT_FAILED: &str =
+    "電腦環境無法掛上工作區，請管理員執行 duduclaw doctor。";
+
+/// The `--label`/`--mount` arguments for a workspace mount, or `None` when
+/// its source is not one safe `--mount` value.
+pub(crate) fn workspace_mount_args(mount: &WorkspaceMount) -> Option<Vec<String>> {
+    let src = mount.source.to_str()?;
+    let safe = mount.source.is_absolute()
+        && crate::computer_workspaces::paths::valid_workspace_id(&mount.workspace_id)
+        && !src.bytes().any(|c| matches!(c, b',' | b'\n' | b'\r' | b'"' | 0));
+    safe.then(|| {
+        vec![
+            "--label".to_string(),
+            format!("{}={}", crate::computer_workspaces::WORKSPACE_LABEL, mount.workspace_id),
+            "--label".to_string(),
+            format!("{}={}", crate::computer_workspaces::LEASE_LABEL, mount.lease_epoch),
+            // Root-only parent first, then the read-only bind inside it.
+            "--tmpfs".to_string(),
+            crate::computer_workspaces::paths::MOUNT_PARENT_TMPFS.to_string(),
+            "--mount".to_string(),
+            format!(
+                "type=bind,src={src},dst={},readonly,bind-propagation=rprivate",
+                crate::computer_workspaces::paths::MOUNT_TARGET
+            ),
+        ]
+    })
 }
 
 /// One navigation host the gateway resolved and vetted for a tool-driven
@@ -585,11 +643,36 @@ impl ComputerUseOrchestrator {
             deadline_unix: unix_now()
                 .saturating_add(u64::from(self.config.max_session_minutes).saturating_mul(60)),
         };
+        // Workspace sessions: the last check of the mount source right before
+        // `docker run` (Docker follows a symlinked bind source).
+        if let Some(mount) = &self.config.workspace_mount {
+            let verified =
+                crate::computer_workspaces::paths::verify_mount_source(&self.home_dir, &mount.workspace_id);
+            if verified.as_ref().ok() != Some(&mount.source) || workspace_mount_args(mount).is_none() {
+                warn!(agent = %self.agent_id, "computer-use workspace mount source refused before docker run");
+                return Err(ComputerUseError::Unavailable(WORKSPACE_MOUNT_UNSAFE.to_string()));
+            }
+        }
         let args = build_docker_run_args(&container_name, &self.config, &valid_domains, &labels);
 
         let output = docker_output(&args, DOCKER_RUN_TIMEOUT, "Container start").await?;
 
+        if !output.status.success() && self.config.workspace_mount.is_some() {
+            // A container may exist in `created` state; remove it by name.
+            let _ = docker_output(&["rm", "-f", &container_name], CLEANUP_TIMEOUT, "Container remove").await;
+            let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+            if ["mount", "bind", "file sharing", "not shared", "no such file"]
+                .iter()
+                .any(|k| stderr.contains(k))
+            {
+                return Err(ComputerUseError::Unavailable(WORKSPACE_MOUNT_FAILED.to_string()));
+            }
+            return Err(ComputerUseError::ApiError("Container start failed".to_string()));
+        }
         if !output.status.success() {
+            // `docker run -d` can leave the container it created behind
+            // (`created` state). Remove that one, by the name this call made.
+            let _ = docker_output(&["rm", "-f", &container_name], CLEANUP_TIMEOUT, "Container remove").await;
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(ComputerUseError::ApiError(format!(
                 "Container start failed: {stderr}"
@@ -1124,7 +1207,7 @@ pub(crate) struct ContainerLabels {
     pub deadline_unix: u64,
 }
 
-fn build_docker_run_args(
+pub(crate) fn build_docker_run_args(
     container_name: &str,
     config: &ComputerUseConfig,
     valid_domains: &[String],
@@ -1149,6 +1232,14 @@ fn build_docker_run_args(
         "--label".to_string(),
         format!("{DEADLINE_LABEL}={}", labels.deadline_unix),
     ];
+
+    // The durable workspace (P2-C): two labels, a root-only tmpfs at
+    // `/workspace` and one read-only bind mount at `/workspace/files`. Added here, before the network branches, so the
+    // pinned-egress early return and the general path both carry it.
+    // `start_container` refuses an unsafe source before building the argv.
+    if let Some(mount) = config.workspace_mount.as_ref().and_then(workspace_mount_args) {
+        args.extend(mount);
+    }
 
     // No privilege gain after start: setuid/setgid binaries and file
     // capabilities stop working inside the container. The entrypoint only
@@ -2118,5 +2209,54 @@ mod tests {
         let ctl = OrchestratorControl::new();
         assert!(!ctl.paused.load(Ordering::Relaxed));
         assert!(!ctl.stopped.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod failed_run_cleanup_tests {
+    use super::*;
+
+    /// A fake `docker`: image present, `run` fails, every call logged.
+    fn fake_docker(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let client = dir.join("docker");
+        std::fs::write(
+            &client,
+            "#!/bin/sh\nd=\"${0%/*}\"\necho \"$*\" >> \"$d/calls\"\ncase \"$1\" in\n\
+             info) echo 27.3.1;;\n\
+             ps) ;;\n\
+             image) printf 'sha256:%064d\\n' 7;;\n\
+             run) echo 'docker: Error response from daemon: boom' >&2; exit 125;;\n\
+             *) ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+        client
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_run_removes_only_the_container_it_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = fake_docker(dir.path());
+        crate::task_sandbox::container::DOCKER_PROGRAM.with(|p| *p.borrow_mut() = Some(client));
+        let mut orch = ComputerUseOrchestrator::new(
+            "alice".into(),
+            dir.path().to_path_buf(),
+            ComputerUseConfig { container_image: "duduclaw-computer-use:latest".into(), ..Default::default() },
+        );
+        let result = orch.start_container().await;
+        crate::task_sandbox::container::DOCKER_PROGRAM.with(|p| *p.borrow_mut() = None);
+        assert!(result.is_err());
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        let name = calls
+            .lines()
+            .find(|l| l.starts_with("run "))
+            .and_then(|l| l.split_whitespace().skip_while(|w| *w != "--name").nth(1))
+            .expect("run named its container")
+            .to_string();
+        assert!(name.starts_with("duduclaw-cu-"));
+        let removals: Vec<_> = calls.lines().filter(|l| l.starts_with("rm ")).collect();
+        assert_eq!(removals, vec![format!("rm -f {name}").as_str()], "{calls}");
+        assert!(!calls.contains("prune") && !calls.contains(" -v"));
     }
 }

@@ -2513,3 +2513,9 @@ mod action_boundary;
 
 #[path = "tests/secret_persistence.rs"]
 mod secret_persistence;
+
+#[path = "tests/workspace_cases.rs"]
+mod workspace_cases;
+
+#[path = "tests/workspace_docker.rs"]
+mod workspace_docker;
