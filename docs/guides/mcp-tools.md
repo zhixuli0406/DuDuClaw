@@ -38,6 +38,7 @@ still reaches the real gate and is still refused, with the gate's own message.
 | `system_operator` | `agent.toml [capabilities]` | 19 appliance operation tools hidden |
 | `codrive` | `agent.toml [capabilities]` | `codrive_run` / `codrive_status` hidden |
 | `computer_use` | `agent.toml [capabilities]` | 8 `computer_*` tools hidden (see [`computer_*`](#computer_--sessions-run-by-the-gateway) below) |
+| `computer_use_config.workspace` | `agent.toml [capabilities.computer_use_config]` (with `computer_use`) | 3 `computer_workspace_*` tools hidden (see [`computer_workspace_*`](#computer_workspace_--durable-workspaces) below) |
 | `db_sources` | `agent.toml [capabilities]` | 4 `db_*` tools hidden |
 | `[fork] enabled` | `agent.toml` | 6 forking tools hidden |
 | `scoped_tools` | `agent.toml [capabilities]` + live grant | Hidden until a task-scoped grant is active |
@@ -260,7 +261,7 @@ container and runs every check, so the gateway must be running. Hidden unless
 
 | Tool | Parameters | Notes |
 |---|---|---|
-| `computer_session_start` | `task` string, optional; `width` integer 320–1920; `height` integer 240–1200 | One session per employee. The result lists the limits, whether high-risk actions can be confirmed in a chat, and the sites `computer_navigate` can open |
+| `computer_session_start` | `task` string, optional; `width` integer 320–1920; `height` integer 240–1200; `workspace` string, optional: `"new"` or a `ws-…` id from `computer_workspace_list` | One session per employee. The result lists the limits, whether high-risk actions can be confirmed in a chat, and the sites `computer_navigate` can open. With `workspace` it also returns `workspace_id`, `mount_path` (`/workspace/files`, read-only, root only), the revision, usage and quota |
 | `computer_screenshot` | none | MCP image block (PNG, masked) followed by a text block with actions used and time left. A fully masked picture is reported as such in the text, with the reason (several windows, sensitive or unreadable front window, detection failure) and the next step |
 | `computer_click` | `x`, `y` integers (required); `button` string `left`/`right`; `double` boolean | `double` is left button only |
 | `computer_type` | `text` string (required), 1–2,000 characters | Audited as a character count only |
@@ -274,6 +275,27 @@ strings. Click, type, key, scroll and navigate each count as one action
 against `max_actions` (default 50). Limits, the approval and confirmation
 rules, the network allowlist and its residual risks are in
 [Browser automation](../features/08-browser-automation.md).
+
+### `computer_workspace_*` — durable workspaces
+
+A folder the gateway keeps for one employee across computer-use sessions.
+Listed only when `[capabilities] computer_use` and
+`[capabilities.computer_use_config] workspace` are both true; every call also
+needs `config.toml [computer_use.workspaces] enabled = true` (except that the
+owner may still list and read when the feature is switched off). A workspace
+of another employee, a malformed id and a missing one all get the same
+"not found" answer.
+
+| Tool | Parameters | Notes |
+|---|---|---|
+| `computer_workspace_list` | none | The caller's workspaces: `state`, `data_revision`, `bytes_used`, `files_used`, `quota`, `expires_at`, `leased`, and for readable ones `files` (`path`, `size`, `sha256`, `hash_unknown`), `files_truncated` (more than 200 files) and `unprocessable_items` (a count; names are never shown) |
+| `computer_workspace_read` | `workspace_id` string (required); `path` string (required) | One UTF-8 text file of at most 48 KiB. The content comes back inside a `<computer_workspace_file>` data fence with injection-scan flags |
+| `computer_workspace_write` | `workspace_id` string (required); `path` string (required); `content` string (required); `expected_revision` integer, optional | Only into the workspace the caller's live session attached. At most 48 KiB of UTF-8, and the whole request must fit 64 KiB after JSON encoding, so content full of quotes, backslashes, newlines or control characters fits less. Atomic; refused over quota, on a revision mismatch, and while the session is stopped or paused or the threat level is not GREEN. Content is never restored from redaction tokens |
+
+Paths are relative, at most 4 levels, letters, digits, inner spaces and
+`-_.()（）` only. The audit rows carry a path hash and a character count, never
+the path or the content. Settings, the lease, operator commands and known
+limitations: [Computer-use workspaces](computer-workspaces.md).
 
 ### `belief_stats` / `belief_settle` — verified and self-reported settlements
 

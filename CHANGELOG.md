@@ -48,6 +48,7 @@
 - 工作流程啟用卡與步驟卡會發不含內容的通知：啟用卡送給管理員已驗證的聊天，步驟卡送給能決定的人（經理或管理員、對該員工有操作權限、在執行可見對象內）；沒有人綁定聊天的部署只會在收件匣看到。`duduclaw doctor` 新增「單一 gateway」列。
 - LINE 收件匣的可見性與操作入口：事件進入 `uncertain`／`quarantined`／`undelivered`、逾期未執行或對話卡住超過 `stuck_alert_minutes`（預設 15）時寫 Activity Feed 並推播給管理者；relay 轉來但沒收下的 LINE webhook 計入 `relay_frames_total{outcome="not_accepted"}` 並寫 Activity Feed。隱藏指令 `duduclaw ops channel-ingress {list,show,resolve,rerun}`，會改變狀態的動作只建立儀表板核准請求，Admin 核准後才套用。已結束事件與其紀錄保留 `retention_days`（預設 90）天後刪除，容量超過 `capacity_alert_mb` 時告警。
 - `workflow_runs.get`／`list`（run 與每個步驟的狀態、錯誤碼、核准卡與 operation 狀態）、`workflow_runs.cancel`（停止單一 run 並撤回待決卡）、`workflow_runs.reset_failures`（Admin 解除連續失敗鎖定，不需重新啟用）。
+- **電腦操作工作區**：AI 員工的檔案可以在電腦操作 session 結束後留下來。`computer_session_start` 帶 `workspace`（`"new"` 或既有的 `ws-…`）掛上一個由 gateway 保管的工作區；新工具 `computer_workspace_list`／`computer_workspace_read`／`computer_workspace_write`（只能寫進自己這次 session 掛上的工作區，單檔 48 KiB 的 UTF-8 文字，可帶 `expected_revision`）。容器裡在 `/workspace/files` 唯讀，放在只有 root 能進的 tmpfs 底下，瀏覽器帳號讀不到。預設關閉：`config.toml [computer_use.workspaces] enabled` 加上員工的 `[capabilities.computer_use_config] workspace`；可設配額、保留期限（到期不刪檔、不佔名額）與磁碟下限。同一個工作區同時只有一個 session（租約 90 秒；gateway 在 session 啟動途中當掉，最多約 8.5 分鐘不能再掛）。工作區綁定建立它的那一位員工（隨機憑據），同名重建的員工拿不到。操作者指令 `duduclaw ops computer-workspaces`：除了 `list`，指令列上所有會改變狀態的動作（`fence`／`revoke`／`regrant`／`renew`／`delete`）都要先由管理員在儀表板核准（核准 30 分鐘內、狀態未變才有效，只能用一次），每次提出、套用與拒絕都寫安全稽核；緊急處置用儀表板或總開關。`duduclaw doctor` 新增「電腦操作工作區」一列。只支援 macOS 與 Linux。只有持有資料目錄實例鎖的 gateway 會整理工作區登錄並移除過期的工作區容器；同一資料目錄上的第二個 gateway 只服務並續約自己的 session，不做登錄維護。詳見[電腦操作工作區](docs/guides/computer-workspaces.md)。
 - 頻道請求區分核准與問題，完整 ID 回覆保存決定或答案；問題不授權工具。新增持久操作租約、fence、receipt 與 Admin 未知結果核對入口。
 
 - `duduclaw ops channel-ingress batch`：一次核准處理同一狀態（可加原因代碼）的一批 LINE 事件，最多 500 則；核准綁定每則事件的編號與狀態版本，套用時只處理狀態沒變的事件，並列出略過的。詳見 [LINE 收件復原](docs/guides/durable-line-ingress.md)。
@@ -61,6 +62,7 @@
 - 下載與預覽私有產物時，附件資料夾內指向它的符號連結或硬連結一律拒絕，不再當成沒有限制的檔案。
 - 通道上不合法的決定（編號不存在、屬於其他帳號／對話／人、發送者被通道設定拒絕）一律回同一句話，先做存取檢查再讀請求，無法用來打探請求編號。按鈕也先做存取檢查再讀請求。Telegram 匿名管理員、「以頻道身分發言」、連結頻道自動轉發、轉寄的訊息與 bot 的訊息不能建立或決定請求。綁定的請求不再收到舊式帶按鈕的提醒卡片。
 - Slack bot token 缺 `users:read`（`bots.info`）時，該 bot 上的決定會被拒絕；現在會回中文說明（只回給通過通道存取檢查的人）、第一次失敗寫 Activity Feed（`slack_decision_identity_unavailable`），`duduclaw doctor` 新增「Slack 決定身分」一列。
+- 電腦操作工作區的已知限制：擁有者隔離與終端機的核准閘只對產品工具與通道路徑成立；有 `Read` 或 Bash 的 AI 員工可以直接讀主機上的工作區目錄，有不受限 Bash 的員工也能繞過核准閘、直接改登錄與核准資料庫。真正的隔離是不給 Bash，或開任務沙箱。檔案在磁碟上是明文；`denied_tools` 擋不住帶 `workspace` 參數的唯讀掛載。詳見 `SECURITY.md`。
 - 工作流程試跑的任務與排程寫入需由操作者明列測試資源 ID；準備及執行前重讀清單，拒絕未登記目標與依名稱選取排程。缺少啟用權威的非試跑執行不再走單次人工核准例外。
 - Computer Use 高風險核准綁定帳號、使用者、對話或討論串、任務契約 revision、操作及政策摘要與期限，投遞使用原帳號；執行前重新觀察，重啟不重播舊座標。舊式或損毀綁定不能升權，Unix 核准資料庫與 sidecar 權限收緊為 0600，輸入文字不落盤。
 
