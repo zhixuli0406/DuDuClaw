@@ -2,14 +2,11 @@
 use super::executor::{EFFECT_TOOLS, READ_TOOLS, WorkflowExecutor};
 use super::runner::WorkflowRunner;
 use super::*;
-use crate::approval::{
-    AcceptedRevisionGrant, ApprovalBroker, ApprovalId, ApprovalStatus, CURRENT_DECISION_CONTEXT,
-    ExecutionBinding, RequestKind, payload_hash, policy_revision,
-};
+use crate::approval::{ApprovalBroker, CURRENT_DECISION_CONTEXT, payload_hash, policy_revision};
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 /// How long an activated run may wait for human decisions before it expires
 /// (capped by the grant's own expiry). Decision cards expire with it.

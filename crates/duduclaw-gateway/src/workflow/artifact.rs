@@ -1,12 +1,8 @@
 //! Stable, private report publication. File publication and SQL are a recoverable saga.
 use super::*;
-use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{io::Write, path::Path};
 
 fn file_hash(path: &Path) -> Result<(String, u64), String> {
     let m = std::fs::symlink_metadata(path).map_err(|_| "workflow artifact unavailable")?;
