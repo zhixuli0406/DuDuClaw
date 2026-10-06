@@ -92,6 +92,9 @@ mod bash_round3;
 mod bash_round4;
 /// G1 round 5: braced home variables, `--exec=` actions, dangling-link message path.
 mod bash_round5;
+/// `.mcp.json` and the CLI configuration directories are frozen for
+/// employees.
+mod mcp_json;
 
 // ── O9: the frozen-field table itself ───────────────────────────
 //

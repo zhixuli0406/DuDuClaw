@@ -1017,6 +1017,25 @@ async fn call_claude_for_agent_impl(
     }
 
     if agent_dir.exists() {
+        // `.mcp.json` platform fix: regenerate the DuDuClaw entry before the
+        // CLI starts every server the file lists; a file that cannot be
+        // confirmed refuses this spawn (fail closed, audited).
+        {
+            let dir_owned = agent_dir.to_path_buf();
+            match tokio::task::spawn_blocking(move || {
+                duduclaw_agent::mcp_template::prepare_mcp_config_for_spawn(&dir_owned)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(msg)) => return Err(msg),
+                Err(e) => {
+                    return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+                        "MCP 設定檢查無法執行：{e}"
+                    )));
+                }
+            }
+        }
         let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
         if let Err(e) =
             crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await
@@ -3049,6 +3068,14 @@ async fn call_with_rotation(
                 return Ok(response.text);
             }
             Err(e) => {
+                // Defensive: the `.mcp.json` spawn gate runs once before this
+                // loop (`call_claude_for_agent_impl`), so its refusal never
+                // reaches here today. Should a later change move it into the
+                // per-account spawn, it still must not count against the
+                // account or try the next one.
+                if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&e) {
+                    return Err(e);
+                }
                 last_error = e.clone();
                 if is_billing_error(&e) {
                     // Billing/credit exhaustion: long cooldown (24h), mark unhealthy immediately
@@ -3622,9 +3649,13 @@ pub(crate) fn mcp_proxy_cli_args(
 /// redaction is active, so a role member's external MCP servers are proxied
 /// exactly like anybody else's.
 ///
-/// A requested-but-missing explicit file degrades to the `None` behaviour with
-/// a `warn` rather than spawning with no MCP at all; the composer refuses to
-/// dispatch in that case, so this is a belt-and-braces branch.
+/// A requested-but-missing explicit file still names that file with
+/// `--strict-mcp-config` (and logs a `warn`), so the CLI fails to start
+/// instead of falling back to `<cwd>/.mcp.json`: the cwd is the *employee's*
+/// directory, whose servers would then start under a role member's spawn
+/// without that spawn's gate having looked at them. The composer refuses to
+/// dispatch in that case and the role member's own `.mcp.json` is created by
+/// the spawn gate, so this branch should not be reached.
 fn mcp_config_cli_args(
     home_dir: &Path,
     work_dir: Option<&Path>,
@@ -3636,9 +3667,17 @@ fn mcp_config_cli_args(
     if !path.exists() {
         warn!(
             path = %path.display(),
-            "explicit --mcp-config file is missing — falling back to cwd auto-discovery"
+            "explicit --mcp-config file is missing — naming it anyway so the CLI refuses \
+             instead of reading the working directory's .mcp.json"
         );
-        return mcp_proxy_cli_args(home_dir, work_dir).map(|(args, guard)| (args, Some(guard)));
+        return Some((
+            vec![
+                "--mcp-config".to_string(),
+                path.to_string_lossy().to_string(),
+                "--strict-mcp-config".to_string(),
+            ],
+            None,
+        ));
     }
     let (target, guard) = match crate::redaction_proxy::maybe_proxy_mcp_config(home_dir, path) {
         Some(proxied) => {
@@ -5097,14 +5136,25 @@ mod redaction_proxy_cli_args_tests {
     }
 
     #[test]
-    fn a_missing_explicit_mcp_config_degrades_instead_of_spawning_blind() {
+    fn a_missing_explicit_mcp_config_never_falls_back_to_the_working_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("agents").join("agnes");
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
         let missing = tmp.path().join("nope").join(".mcp.json");
-        // Same result as passing None — the composer refuses to dispatch in
-        // this case, so this is the belt-and-braces branch.
-        assert!(mcp_config_cli_args(tmp.path(), Some(&dir), Some(&missing)).is_none());
+        // N10: the missing file is still named with --strict-mcp-config, so
+        // the CLI cannot discover the employee's <cwd>/.mcp.json instead.
+        let (args, guard) =
+            mcp_config_cli_args(tmp.path(), Some(&dir), Some(&missing)).expect("flags");
+        assert_eq!(
+            args,
+            vec![
+                "--mcp-config".to_string(),
+                missing.to_string_lossy().to_string(),
+                "--strict-mcp-config".to_string(),
+            ]
+        );
+        assert!(guard.is_none());
     }
 
     #[test]

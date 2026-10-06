@@ -174,6 +174,25 @@ pub(super) async fn spawn_claude_cli_with_env(
     // Set working directory to agent dir so Claude can access agent config
     // (.claude/, CLAUDE.md, .mcp.json) and project files (docs/, etc.)
     if let Some(dir) = work_dir {
+        // `.mcp.json` platform fix: regenerate the DuDuClaw entry before the
+        // CLI starts every server the file lists; a file that cannot be
+        // confirmed refuses this spawn (fail closed, audited).
+        {
+            let dir_owned = dir.to_path_buf();
+            match tokio::task::spawn_blocking(move || {
+                duduclaw_agent::mcp_template::prepare_mcp_config_for_spawn(&dir_owned)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(msg)) => return Err(msg),
+                Err(e) => {
+                    return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+                        "MCP 設定檢查無法執行：{e}"
+                    )));
+                }
+            }
+        }
         // Install the agent-file-guard PreToolUse hook into
         // <agent_dir>/.claude/settings.json before spawning. This blocks
         // the sub-agent from using raw Write/Edit to create agent-structure

@@ -441,6 +441,28 @@ async fn run_live(
         Some(sp) if !sp.trim().is_empty() => Some(TempPromptFile::create(sp)?),
         _ => None,
     };
+    // `.mcp.json` spawn gate (N4): the CLI below is handed this employee's
+    // `.mcp.json` and starts every server it lists, so the DuDuClaw entry is
+    // regenerated first and a file that cannot be confirmed refuses the run
+    // (audited). This process is not the gateway, so it first adopts a valid
+    // internal MCP key from `config.toml` when it has none (read-only).
+    duduclaw_gateway::mcp_internal_key::adopt_internal_key_for_process(home);
+    {
+        let dir = agent_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            duduclaw_agent::mcp_template::prepare_mcp_config_for_spawn(&dir)
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_user_message(&e)
+                    .unwrap_or(&e)
+                    .to_string());
+            }
+            Err(e) => return Err(format!("MCP 設定檢查無法執行：{e}")),
+        }
+    }
     let mcp_original = agent_dir.join(".mcp.json");
     let mut mcp_temp: Option<TempMcpFile> = None;
     let mcp_path: Option<PathBuf> = if mcp_original.exists() {
