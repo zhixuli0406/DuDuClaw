@@ -37,7 +37,7 @@ AgentRuntime trait:
 |---|---|---|---|---|---|---|
 | Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token`（コード貼り付け） | `~/.claude/.credentials.json` |
 | OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login`（localhost コールバック） | `~/.codex/auth.json` |
-| Gemini CLI（v1.67.0 で非推奨、v1.70.0 で削除） | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login`（localhost コールバック） | `~/.gemini/oauth_creds.json` |
+| Gemini CLI（v1.67.0 で非推奨、v1.71.0 で削除） | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login`（localhost コールバック） | `~/.gemini/oauth_creds.json` |
 | Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | stream-json（v1.2.10） | ターミナルで `agy` を実行して Google サインイン（`login` サブコマンドなし）、または API キーモード | OS keyring |
 | Grok Build | `grok` | `x.ai/cli/install.sh`（手動） | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
 | Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | なし（API キーのみ） | `~/.qwen/.env` |
@@ -101,7 +101,7 @@ JSONL STDOUTイベントを解析
 
 **Gemini Runtime** — Google Gemini CLIを`--output-format stream-json`で呼び出し、構造化出力を取得します。
 
-> **v1.67.0 で非推奨、v1.70.0 で削除予定。** Google は 2026-06-18 に、個人アカウント（無料、AI Pro、AI Ultra）に対する Gemini CLI での提供を停止しました。Antigravity ランタイムをご利用ください。削除までは従来どおり動作します。Gemini API プロバイダーは影響を受けません。移行手順は[非推奨となった名称](../../guides/ja-JP/deprecations.md#gemini-cli-ランタイム)を参照してください。
+> **v1.67.0 で非推奨、v1.71.0 で削除予定。** Google は 2026-06-18 に、個人アカウント（無料、AI Pro、AI Ultra）に対する Gemini CLI での提供を停止しました。Antigravity ランタイムをご利用ください。削除までは従来どおり動作します。Gemini API プロバイダーは影響を受けません。移行手順は[非推奨となった名称](../../guides/ja-JP/deprecations.md#gemini-cli-ランタイム)を参照してください。
 
 ```
 Agent設定：runtime = "gemini"

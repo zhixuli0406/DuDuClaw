@@ -394,6 +394,16 @@ const PRINT_TIMEOUT: &str = "300s";
 /// Cap the system prompt embedded into the prompt argument (ARG_MAX safety).
 const MAX_SYSTEM_PROMPT_BYTES: usize = 65536;
 
+/// The env the agy spawn hands its MCP child: the identity pair (plus the
+/// MCP forward set and this call's home) and, P2-B N4, the turn/run source
+/// identity in scope, so the employee's memory writes are tied to their
+/// conversation.
+fn spawn_mcp_env(home_dir: &std::path::Path, agent_id: &str) -> Vec<(String, String)> {
+    let mut env = setup::identity_env_pairs(home_dir, agent_id);
+    env.extend(crate::memory_provenance::turn_source_env_pairs());
+    env
+}
+
 /// Runtime that delegates to the Google Antigravity CLI (`agy`).
 pub struct AntigravityRuntime {
     agy_path: String,
@@ -731,7 +741,11 @@ impl AgentRuntime for AntigravityRuntime {
 
         // Identity for the MCP child agy starts (it inherits this env), the MCP
         // forward set and this call's DUDUCLAW_HOME — same as the Grok runtime.
-        for (k, v) in setup::identity_env_pairs(&context.home_dir, &context.agent_id) {
+        // N13: agy inherits the gateway's environment; only the scoped
+        // upstream-unknown marker (added by `spawn_mcp_env`) may reach the
+        // MCP child.
+        cmd.env_remove(duduclaw_core::ENV_UPSTREAM_UNKNOWN);
+        for (k, v) in spawn_mcp_env(&context.home_dir, &context.agent_id) {
             cmd.env(k, v);
         }
         match auth {
@@ -944,6 +958,29 @@ impl AntigravityRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2-B N4: the agy spawn env (inherited by its duduclaw MCP child)
+    /// carries the turn and run in scope next to the identity pair.
+    #[tokio::test]
+    async fn spawn_env_carries_the_turn_and_run_in_scope() {
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::memory_provenance::TURN_USER_MESSAGE
+            .scope(Some((12, "2026-10-05T01:02:03Z".into())), async {
+                duduclaw_memory::feedback::CURRENT_SESSION_ID
+                    .scope(Some("telegram:4".into()), async {
+                        duduclaw_memory::feedback::CURRENT_TURN_ID
+                            .scope(Some("t-8".into()), async { spawn_mcp_env(home.path(), "agent-x") })
+                            .await
+                    })
+                    .await
+            })
+            .await;
+        let has = |k: &str, v: &str| env.iter().any(|(a, b)| a == k && b == v);
+        assert!(has(duduclaw_core::ENV_AGENT_ID, "agent-x"));
+        assert!(has(duduclaw_core::ENV_TRUST_TURN_ID, "t-8"), "{env:?}");
+        assert!(has(duduclaw_core::ENV_TRUST_SESSION_ID, "telegram:4"));
+        assert!(has(duduclaw_core::ENV_TURN_USER_MESSAGE_SEQ, "12"));
+    }
 
     #[test]
     fn stream_result_reports_measured_usage_and_terminal_tool_event() {

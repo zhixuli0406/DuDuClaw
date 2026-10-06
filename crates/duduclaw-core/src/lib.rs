@@ -105,7 +105,7 @@ pub use keychain::{resolve_master_key, KeychainError, MasterKeySource};
 pub use match_utils::{is_valid_discord_snowflake, is_valid_egress_host, origin_host_matches, word_contains_ci};
 pub use org_field_guard::{
     check_bash_protected_write, check_bash_protected_write_in, check_caller_scope,
-    check_identity_surface_write, resolve_real_path,
+    check_identity_surface_write, check_identity_surface_write_as, resolve_real_path,
     bash_invokes_operator_command, bash_operator_command_decision, OperatorCommand,
     check_own_contract_write, check_own_soul_write, check_protected_toml_write,
     check_protected_toml_write_as, classify_identity_surface,
@@ -301,6 +301,26 @@ pub fn with_host_task_id(payload: serde_json::Value, task_id: Option<&str>) -> s
         (other, _) => other,
     }
 }
+
+/// P2-B: the channel message that triggered this turn — its
+/// `session_messages.id` and the RFC3339 time it was stored. Set by the
+/// gateway next to [`ENV_TRUST_TURN_ID`] when spawning a CLI for a channel
+/// turn; the MCP memory tools add it as a source of what they store, so
+/// forgetting that message also forgets what was stored during its turn.
+pub const ENV_TURN_USER_MESSAGE_SEQ: &str = "DUDUCLAW_TURN_USER_MESSAGE_SEQ";
+pub const ENV_TURN_USER_MESSAGE_AT: &str = "DUDUCLAW_TURN_USER_MESSAGE_AT";
+
+/// P2-B: the dispatch / cron / goal run a CLI spawn belongs to. The gateway
+/// mints the run id before the spawn; MCP memory writes made during the run
+/// carry it as their source, and the run's own post-run distillation uses the
+/// same id, so forgetting the run reaches both. `SESSION` is the run's
+/// session (`"<request type>:<agent>"`), `ID` the run key without `run:`.
+pub const ENV_DISPATCH_SESSION: &str = "DUDUCLAW_DISPATCH_SESSION";
+pub const ENV_DISPATCH_RUN_ID: &str = "DUDUCLAW_DISPATCH_RUN_ID";
+/// Set (to `1`) on a dispatched run whose bus message said its upstream
+/// turn identity was incomplete and dropped by the sender (P2-B): the run's
+/// memory writes record the upstream as unknown.
+pub const ENV_UPSTREAM_UNKNOWN: &str = "DUDUCLAW_UPSTREAM_UNKNOWN";
 
 /// RFC-23 §14.4 data-file guard mode: `"on"` / `"read_only"` / `"off"`.
 ///

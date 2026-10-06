@@ -36,6 +36,11 @@ pub enum MemoryCommands {
         #[command(subcommand)]
         command: MigrateNamespaceCommands,
     },
+    /// Forget memories by the conversation they came from (plan, then apply)
+    ForgetSource {
+        #[command(subcommand)]
+        command: crate::memory_forget_cmd::ForgetSourceCommands,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -95,15 +100,17 @@ pub enum MigrateNamespaceCommands {
     },
 }
 
-/// Refuse inside an AI employee session (`DUDUCLAW_AGENT_ID` or
-/// `DUDUCLAW_AGENT_TOKEN` present), like `org sync`.
+/// Refuse inside an AI employee session: any gateway turn or identity
+/// variable present (`crate::ai_session_guard`, shared with
+/// `memory forget-source`).
 fn refuse_in_agent_session() -> Result<()> {
-    let id = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
-    let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
-    match agent_session_refusal(&id, &token) {
-        Some(msg) => Err(DuDuClawError::Agent(msg)),
-        None => Ok(()),
+    if crate::ai_session_guard::markers().is_empty() {
+        return Ok(());
     }
+    let id = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    Err(DuDuClawError::Agent(
+        agent_session_refusal(&id, "marker").unwrap_or_default(),
+    ))
 }
 
 /// The refusal for an agent-session environment, `None` for an operator
@@ -125,8 +132,19 @@ fn agent_session_refusal(id: &str, token: &str) -> Option<String> {
 }
 
 pub async fn run(home: &Path, cmd: MemoryCommands) -> Result<()> {
+    let command = match cmd {
+        MemoryCommands::MigrateNamespace { command } => command,
+        MemoryCommands::ForgetSource { command } => {
+            // Refuses AI sessions itself (and audits the refusal).
+            let out = crate::memory_forget_cmd::run(home, command).await?;
+            print!("{}", out.text);
+            if !out.complete {
+                std::process::exit(crate::memory_forget_cmd::EXIT_DEGRADED);
+            }
+            return Ok(());
+        }
+    };
     refuse_in_agent_session()?;
-    let MemoryCommands::MigrateNamespace { command } = cmd;
     let out = match command {
         MigrateNamespaceCommands::List => list(home).await?,
         MigrateNamespaceCommands::Export { out } => export(home, &out).await?,
@@ -469,6 +487,7 @@ fn disposition_label(d: &MigrationDisposition) -> String {
         }
         MigrationDisposition::MovedAsHistory => "搬移為歷史（早於目標的目前事實）".into(),
         MigrationDisposition::MovedDuplicate { of } => format!("搬移為歷史（與目標的 {of} 相同）"),
+        MigrationDisposition::Fenced => "留在原處（來源已在目標命名空間被忘記）".into(),
         MigrationDisposition::Held { refusal } => format!(
             "暫存待審（目標的 {} 可信度 {:.2} 高於 {:.2}）",
             refusal.existing_id, refusal.existing_trust, refusal.write_trust

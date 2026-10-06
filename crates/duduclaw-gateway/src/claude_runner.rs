@@ -483,6 +483,13 @@ where
         return fut.await;
     }
     let started_at = chrono::Utc::now().to_rfc3339();
+    // P2-B M-6: the run key is minted before the spawn and handed to it, so
+    // MCP memory writes made during the run and the post-run distillation
+    // below share one source.
+    let run_session = format!("{}:{agent_id}", request_type.as_str());
+    let run_key = crate::memory_provenance::new_dispatch_run_key();
+    let fut = crate::memory_provenance::DISPATCH_RUN
+        .scope(Some((run_session.clone(), run_key.clone())), fut);
     // Native-tool collection: REUSE an outer scope when the goal loop already
     // installed one — installing a nested scope would shadow it and starve
     // the settle-side evidence consumers (forward-model observe / grounding /
@@ -557,12 +564,21 @@ where
             let agent = agent_id.to_string();
             let home = home_dir.to_path_buf();
             let memory_db = home_dir.join("memory.db");
-            let session = format!("{}:{agent_id}", request_type.as_str());
+            let session = run_session.clone();
             // R-L1: captured before the spawn (task-locals do not cross it).
             let origin = crate::decision_notify::origin_target();
+            // P2-B: one host-made DispatchRun source per run (the shared
+            // `cron:<agent>` session has no message ids; the run is keyed by
+            // the run key minted before the spawn, M-6).
+            let sources = vec![crate::memory_provenance::dispatch_run_source_for(
+                &session,
+                &run_key,
+                chrono::Utc::now(),
+            )];
             tokio::spawn(async move {
                 crate::wiki_ingest::run_ingest(
                     &user_text, &reply, &agent, "system", &home, &memory_db, &session, origin,
+                    sources,
                 )
                 .await;
             });
@@ -1015,6 +1031,25 @@ async fn call_claude_for_agent_impl(
     }
 
     if agent_dir.exists() {
+        // `.mcp.json` platform fix: regenerate the DuDuClaw entry before the
+        // CLI starts every server the file lists; a file that cannot be
+        // confirmed refuses this spawn (fail closed, audited).
+        {
+            let dir_owned = agent_dir.to_path_buf();
+            match tokio::task::spawn_blocking(move || {
+                duduclaw_agent::mcp_template::prepare_mcp_config_for_spawn(&dir_owned)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(msg)) => return Err(msg),
+                Err(e) => {
+                    return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+                        "MCP 設定檢查無法執行：{e}"
+                    )));
+                }
+            }
+        }
         let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
         if let Err(e) =
             crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await
@@ -1567,6 +1602,9 @@ fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
     // this process env too, but the explicit pairs keep the tool loop working
     // even if a future spawn path sanitizes the child env.
     envs.extend(duduclaw_core::mcp_forward_env_vars());
+    // P2-B N4: the turn/run source identity, so the openai-compat tool loop's
+    // memory writes are tied to their conversation like the CLI paths.
+    envs.extend(crate::memory_provenance::turn_source_env_pairs());
     envs
 }
 
@@ -3045,6 +3083,14 @@ async fn call_with_rotation(
                 return Ok(response.text);
             }
             Err(e) => {
+                // Defensive: the `.mcp.json` spawn gate runs once before this
+                // loop (`call_claude_for_agent_impl`), so its refusal never
+                // reaches here today. Should a later change move it into the
+                // per-account spawn, it still must not count against the
+                // account or try the next one.
+                if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&e) {
+                    return Err(e);
+                }
                 last_error = e.clone();
                 if is_billing_error(&e) {
                     // Billing/credit exhaustion: long cooldown (24h), mark unhealthy immediately
@@ -3618,9 +3664,13 @@ pub(crate) fn mcp_proxy_cli_args(
 /// redaction is active, so a role member's external MCP servers are proxied
 /// exactly like anybody else's.
 ///
-/// A requested-but-missing explicit file degrades to the `None` behaviour with
-/// a `warn` rather than spawning with no MCP at all; the composer refuses to
-/// dispatch in that case, so this is a belt-and-braces branch.
+/// A requested-but-missing explicit file still names that file with
+/// `--strict-mcp-config` (and logs a `warn`), so the CLI fails to start
+/// instead of falling back to `<cwd>/.mcp.json`: the cwd is the *employee's*
+/// directory, whose servers would then start under a role member's spawn
+/// without that spawn's gate having looked at them. The composer refuses to
+/// dispatch in that case and the role member's own `.mcp.json` is created by
+/// the spawn gate, so this branch should not be reached.
 fn mcp_config_cli_args(
     home_dir: &Path,
     work_dir: Option<&Path>,
@@ -3632,9 +3682,17 @@ fn mcp_config_cli_args(
     if !path.exists() {
         warn!(
             path = %path.display(),
-            "explicit --mcp-config file is missing — falling back to cwd auto-discovery"
+            "explicit --mcp-config file is missing — naming it anyway so the CLI refuses \
+             instead of reading the working directory's .mcp.json"
         );
-        return mcp_proxy_cli_args(home_dir, work_dir).map(|(args, guard)| (args, Some(guard)));
+        return Some((
+            vec![
+                "--mcp-config".to_string(),
+                path.to_string_lossy().to_string(),
+                "--strict-mcp-config".to_string(),
+            ],
+            None,
+        ));
     }
     let (target, guard) = match crate::redaction_proxy::maybe_proxy_mcp_config(home_dir, path) {
         Some(proxied) => {
@@ -3968,6 +4026,8 @@ fn prepare_claude_cmd(
             cmd.env(duduclaw_core::ENV_TASK_ID, &task_id);
         }
     }
+    crate::memory_provenance::inject_turn_user_message_env(&mut cmd);
+    crate::memory_provenance::inject_dispatch_run_env(&mut cmd);
 
     // The spawned employee is the one whose identity owns this spawn's
     // config directory (its `.mcp.json` names the same id). Recorded only
@@ -4856,6 +4916,29 @@ mod chain_tests {
         );
     }
 
+    /// P2-B N4: the openai-compat tool loop's MCP server gets the turn and
+    /// run in scope.
+    #[tokio::test]
+    async fn mcp_client_envs_carry_the_turn_and_run_in_scope() {
+        let envs = crate::memory_provenance::DISPATCH_RUN
+            .scope(Some(("dispatch:agnes".into(), "k1".into())), async {
+                duduclaw_memory::feedback::CURRENT_TURN_ID
+                    .scope(Some("t-3".into()), async { mcp_client_envs("agnes") })
+                    .await
+            })
+            .await;
+        let has = |k: &str, v: &str| envs.iter().any(|(a, b)| a == k && b == v);
+        assert!(has(duduclaw_core::ENV_TRUST_TURN_ID, "t-3"), "{envs:?}");
+        assert!(has(duduclaw_core::ENV_DISPATCH_RUN_ID, "k1"), "{envs:?}");
+        assert!(has(duduclaw_core::ENV_DISPATCH_SESSION, "dispatch:agnes"));
+        assert!(
+            !mcp_client_envs("agnes")
+                .iter()
+                .any(|(k, _)| k == duduclaw_core::ENV_TRUST_TURN_ID),
+            "nothing outside a turn"
+        );
+    }
+
     // ── G3: rotation-vs-env key selection ───────────────────────────────
 
     #[test]
@@ -5093,14 +5176,25 @@ mod redaction_proxy_cli_args_tests {
     }
 
     #[test]
-    fn a_missing_explicit_mcp_config_degrades_instead_of_spawning_blind() {
+    fn a_missing_explicit_mcp_config_never_falls_back_to_the_working_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("agents").join("agnes");
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
         let missing = tmp.path().join("nope").join(".mcp.json");
-        // Same result as passing None — the composer refuses to dispatch in
-        // this case, so this is the belt-and-braces branch.
-        assert!(mcp_config_cli_args(tmp.path(), Some(&dir), Some(&missing)).is_none());
+        // N10: the missing file is still named with --strict-mcp-config, so
+        // the CLI cannot discover the employee's <cwd>/.mcp.json instead.
+        let (args, guard) =
+            mcp_config_cli_args(tmp.path(), Some(&dir), Some(&missing)).expect("flags");
+        assert_eq!(
+            args,
+            vec![
+                "--mcp-config".to_string(),
+                missing.to_string_lossy().to_string(),
+                "--strict-mcp-config".to_string(),
+            ]
+        );
+        assert!(guard.is_none());
     }
 
     #[test]

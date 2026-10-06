@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+這一批的功能尚未在真實的 gateway 與通道上做過活體驗證。
+
 ### Fixed
 - 審查快照只能接受任務最新的一份（畫面停在舊快照時被拒），沒收齊產物的快照不能接受也不能建立草稿；接受紀錄不可刪除。擷取、接受、試跑、送審、套用、撤銷與取消執行都需要對該 AI 員工有 Operator 以上的綁定。
 - 五種試跑的負面案例要真的帶著它所指的情況並以該關卡自己的錯誤碼結束（過期、注入、缺少權限各有固定的錯誤碼）；格式錯誤、人工拒絕或案例自帶的人工決定不再算通過。
@@ -29,9 +31,10 @@
 - 步驟卡片逾期而執行期限同時到了時，結局是 `failed`／`workflow_approval_expired`，不再是計入斷路器的 `workflow_deadline_expired`。
 - 每種只能在儀表板決定的卡片過期時各有自己的文字（知識審核、工作流程啟用、收件處理指令），其他種類用通用文字；LINE 指令列卡片過期不再顯示「知識審核」。
 - 決定與恢復佇列在 WAL 下跨資料庫不保證整體原子，文件改為「同一交易，當機時由巡檢補齊」。巡檢的佇列前綴查詢改走主鍵範圍，未投遞的恢復佇列加部分索引；`WORKFLOW_BUSY` 的延後重試不再累加重試次數。
-
 - LINE 收件匣：路由與授權快照補上之前，worker 不會領取該事件；讀不到快照時退避重試，連續 5 次或沒有快照的事件超過 5 分鐘就隔離成 `snapshot_unavailable`（可 `retry`，重試時以當下設定補快照），不再默默採用之後的設定。LINE 重送的 webhook（`deliveryContext.isRedelivery`）不再拿 reply token 去試，直接照 `line_late_reply` 處理；回覆期限從本機收件時間與事件 `timestamp` 較早者起算。Reply API 回 400 `Invalid reply token` 時，設為 `"push"` 重驗後改用 Push，設為 `"fail"` 記 `reply_token_invalid`。送出前重驗暫時讀不到時，約七秒內重讀數次，仍讀不到記 `revalidation_unavailable`，不再記成授權已變更。路由員工的 `agent.toml` 不存在視為已變更（`agent_removed`），不再退避。憑證讀不到而隔離時也會告警。裝置還原的標記改在搬動任何資料前寫入，寫不進去就中止還原；還原時 `failed_before_dispatch` 與可重試原因的 `quarantined` 也一併暫停。指令列等待中的核准卡在事件狀態變動時撤回重建，不再原地改寫。Bash 通道比對 `duduclaw ops channel-ingress` 改用 org_field_guard 的 shell 解析（換行續行、引號拼接、黏字重導向），比對函式抽成共用的 `duduclaw_core::bash_operator_command_decision`。
+
 ### Changed
+- **Gemini CLI runtime 的移除時間由 v1.70.0 再延到 v1.71.0**（runtime id `gemini`，仍是棄用狀態，行為不變）：v1.69.1 修正後用真的 Gemini 金鑰重驗 Antigravity 的步驟還沒做，移除等重驗完成。`duduclaw doctor` 與 `runtime.detect` 顯示的移除版本同步改為 v1.71.0。
 - 工作流程草稿不再要求停止條件（沒有任何地方執行它）；介面把「需要的工具」標明為只對照工具清單的上限估計。審查與草稿相關 RPC 的錯誤改回傳封閉代碼 `{code, message}`，不再回傳伺服器內部文字。移除沒有呼叫端的對話訊息草稿卡片。
 - `policy_revision` 改為只雜湊授權相關的已解析欄位（實際生效的 `[capabilities]`／`[permissions]`／`[agent]` 上級部門角色、`CONTRACT.toml`、職務範本綁定、`org.toml` 本人與上級、`config.toml` 的 `[delegation]`／`[acp]`／`[provenance]`／`[integrations]`、`KILLSWITCH.toml`）；改通道 token、即時監控來源或記錄等級不再讓待審卡片與已啟用工作流程失效。升級後所有既有 revision 值都會變一次：待審的綁定卡片需重新送出，已啟用的工作流程第一次執行時會進入暫停，需以新版本重新核准。
 - 已啟用工作流程遇到上述權限變動時，啟用進入 `suspended`：當次執行擋下、不再開新執行、排程關閉，動態牆與管理員通知列出變動類別；恢復需新版本重新核准。啟用後來源任務與產物的變更不再擋下執行。
@@ -39,8 +42,13 @@
 - 啟用時用定義本身比對次數上限與單次額度（步驟、讀取、寫入數，以及以目前單價計算最便宜一輪的費用），超過就無法啟用；之後上限調低到放不下，下一次觸發即拒絕並以 `limit` 暫停。連續 `max_consecutive_failures` 次因上限結束也會暫停並通知管理員。
 - 單價全為 0 時，草稿頁與啟用核准卡改說明目前生效的是次數上限，不再顯示費用上限（三種語言）。
 - LINE 回覆 token 逾期時依 `[channel_ingress] line_late_reply` 處理：`"push"`（預設，與舊版相同）在重驗後改用 Push 送給同一個對話並寫入回執；`"fail"` 在取件時就判定逾期、不執行回合並通知管理者。一般 worker 數改為 `line_workers`（預設 8）。收件狀態 `failed` 拆成 `failed_before_dispatch`（確定沒執行，可 `retry`）與 `undelivered`（已執行未送達）；`undelivered` 與 `uncertain` 只能用 `rerun` 並確認重複風險，確認、理由與 provider 回執一起保存；升級時舊的 `failed` 改為 `undelivered`。📎DELIVER 的文件通知附在回覆裡，走同一條重驗與回執。`line_enabled` 改稱停用開關（關閉即 LINE 停擺，不會回到舊版收件方式）。未配置憑證、停用或儲存失敗回 503。設為 `"fail"` 時，已超過原回覆期限的事件不能 `retry`／`rerun`（回覆 token 不會因重新執行而延長）。裝置還原（`device.backup_restore`）後，收件匣在任何 worker 取件前把備份裡排隊中的事件改成 `quarantined`／`restored_from_backup`，寫 Activity Feed 並通知管理者，由操作者結案或確認重複風險後 `rerun`。AI 員工在 Bash 執行 `duduclaw ops channel-ingress` 會被 agent-file-guard 擋下（`BlockedOperatorCommand`，減速而非隔離）。詳見 [LINE 收件復原](docs/guides/durable-line-ingress.md)（[繁體中文](docs/guides/zh-TW/durable-line-ingress.md)／[日本語](docs/guides/ja-JP/durable-line-ingress.md)）。
-
 - LINE 收件匣告警改為先記進收件匣資料庫的佇列，每 30 秒依種類、原因與十分鐘時間窗彙總成一筆帶數量的 Activity Feed；時間窗與推播節流存在資料庫裡，重啟不重複也不歸零。告警文字改指向指令列與儀表板的待辦核准（儀表板目前沒有收件匣頁面）。`undelivered` 與 `failed_before_dispatch` 超過 `retention_days` 由系統結案（`retention_closed`）並刪除。指令列 `list`／`show` 的 LINE 帳號與對話 ID 改印短摘要。`line_late_reply` 為非字串時記警告。
+- 衍生寫入若指名的父記憶不存在，現在會拒絕這次寫入；以前只是把這筆寫入的信任度壓低。
+- 匯入記憶的來源鍵改為內容定址：檔案以解析後的路徑識別，每筆紀錄以內容雜湊識別。同一個檔案換順序、重新匯入，仍算同一個來源，所以被忘記的檔案不會因為重新匯入而回來；放在另一個路徑的副本視為新來源。
+- 員工程序從 gateway 收到的回合或執行資訊格式不合法時，記憶工具現在會拒絕寫入，不再當成匿名的外部呼叫記下來。
+- 記憶寫入改在單一交易內完成：記憶列與它的來源列一起寫入或一起不寫。
+- `duduclaw memory migrate-namespace assign` 搬移記憶列時，如果列的來源已在目標命名空間被忘記，這一列留在原處不搬，輸出會標示原因。
+
 ### Added
 - `TypedSchema` 新增 `nullable`，回執資料中可為空的欄位寫得出正確的輸出結構。
 - 試跑案例可依步驟預寫人工決定（`approve`／`deny`／`answer`）：不建卡、不推播，只對試跑有效；缺少決定以 `fixture_decision_missing` 失敗。
@@ -50,8 +58,12 @@
 - `workflow_runs.get`／`list`（run 與每個步驟的狀態、錯誤碼、核准卡與 operation 狀態）、`workflow_runs.cancel`（停止單一 run 並撤回待決卡）、`workflow_runs.reset_failures`（Admin 解除連續失敗鎖定，不需重新啟用）。
 - **電腦操作工作區**：AI 員工的檔案可以在電腦操作 session 結束後留下來。`computer_session_start` 帶 `workspace`（`"new"` 或既有的 `ws-…`）掛上一個由 gateway 保管的工作區；新工具 `computer_workspace_list`／`computer_workspace_read`／`computer_workspace_write`（只能寫進自己這次 session 掛上的工作區，單檔 48 KiB 的 UTF-8 文字，可帶 `expected_revision`）。容器裡在 `/workspace/files` 唯讀，放在只有 root 能進的 tmpfs 底下，瀏覽器帳號讀不到。預設關閉：`config.toml [computer_use.workspaces] enabled` 加上員工的 `[capabilities.computer_use_config] workspace`；可設配額、保留期限（到期不刪檔、不佔名額）與磁碟下限。同一個工作區同時只有一個 session（租約 90 秒；gateway 在 session 啟動途中當掉，最多約 8.5 分鐘不能再掛）。工作區綁定建立它的那一位員工（隨機憑據），同名重建的員工拿不到。操作者指令 `duduclaw ops computer-workspaces`：除了 `list`，指令列上所有會改變狀態的動作（`fence`／`revoke`／`regrant`／`renew`／`delete`）都要先由管理員在儀表板核准（核准 30 分鐘內、狀態未變才有效，只能用一次），每次提出、套用與拒絕都寫安全稽核；緊急處置用儀表板或總開關。`duduclaw doctor` 新增「電腦操作工作區」一列。只支援 macOS 與 Linux。只有持有資料目錄實例鎖的 gateway 會整理工作區登錄並移除過期的工作區容器；同一資料目錄上的第二個 gateway 只服務並續約自己的 session，不做登錄維護。詳見[電腦操作工作區](docs/guides/computer-workspaces.md)。
 - 頻道請求區分核准與問題，完整 ID 回覆保存決定或答案；問題不授權工具。新增持久操作租約、fence、receipt 與 Admin 未知結果核對入口。
-
 - `duduclaw ops channel-ingress batch`：一次核准處理同一狀態（可加原因代碼）的一批 LINE 事件，最多 500 則；核准綁定每則事件的編號與狀態版本，套用時只處理狀態沒變的事件，並列出略過的。詳見 [LINE 收件復原](docs/guides/durable-line-ingress.md)。
+- **依來源忘記記憶**（`duduclaw memory forget-source`，只能在操作者的終端機執行）。操作者可以忘掉一個來源（一則訊息、一整段對話、一次排程或派工執行、一個匯入檔案）：硬刪由它直接或間接產生的記憶、關鍵事實與封存副本，寫下封鎖紀錄，之後同一個來源再寫入會被擋下，並記成稽核事件 `memory_write_fenced`。子指令有 `list`（列出來源）、`plan`（預演，不刪任何東西）、`show`、`apply --confirm` 與 `resume`。`plan` 會列出會刪的項目、連帶影響（一筆記憶若同時由被忘的來源與其他來源產生，整筆刪除；只是被再次提到的記憶保留）、需要人工檢視的 wiki 頁，以及不在範圍內的清單。`apply` 之後會續做 `memory.db` 以外的步驟（刪自動建檔頁、撤回審核卡、對員工隱藏被忘的訊息、清除對話的壓縮摘要）；沒做完時結果是 `DEGRADED`、結束碼 3，用 `resume` 重跑，gateway 開機時與之後每 10 分鐘也會重試。忘記一則使用者訊息時，同一輪的員工回覆與員工在那一輪自行存入的記憶一起忘記，之後只帶那一輪回合代號的寫入也會被擋；忘記整段對話則涵蓋其中每一輪。派工時 bus 訊息只帶了一半上游對話身分，員工的記憶照常寫入，上游記成不明，計入計畫的「沒有完整來源紀錄的記憶」。每次回覆後寫下的強化學習軌跡檔（`rl_trajectories.jsonl` 與 `rl_trajectories/`）含整段對話原文，不在範圍內。`[memory] forget_source = false` 可停止建立新計畫與套用。操作步驟見 `docs/guides/memory-and-knowledge.md` 的 4.5 節。
+- **記憶帶來源（來源譜系）**。每一筆寫進 `memories` 與 `key_facts` 的記憶，都在同一個交易內記下來源：通道訊息、排程或派工執行、員工的 MCP 回合、外部 MCP 用戶端的呼叫、匯入檔案的一筆紀錄、足跡日，或系統。由其他記憶衍生的記憶會帶著所有父記憶的來源。升級前寫入的記憶大多沒有來源紀錄，計畫會顯示它們的數量，但不會刪。
+- **忘記需要管理員在儀表板核准**。`plan` 會送出一筆核准請求，綁定計畫 id 與計畫雜湊；只有管理員能在儀表板決定，通道按鈕與回覆一律拒絕。`apply --confirm` 只有在核准有效、計畫未過期時才執行，核准期限等於計畫期限（預設 30 分鐘，最長 24 小時）。卡片只顯示數量與來源標籤，並註明請求來自本機指令列。這道核准沒有開關。
+- **`wiki_write` 記錄來源**。員工在回合或執行中用 `wiki_write` 寫的頁面，frontmatter 會多一個由主機維護的 `host_sources` 欄位（保留最近 20 筆）。忘記來源時，這類頁面不會自動刪除，只會列在計畫的「需要人工檢視」。
+
 ### Security
 - 任務的可見名單來自團隊回合裡 AI 角色成員寫的交接資料，不是操作者設定的隱私功能。只有 `user:`、`role:`、`channel:` 三種項目會限制人，角色名稱（例如 `verifier`）只限制角色之間的傳遞；管理者帳號與 gateway 管理權杖一律看得到、也能決定。名單會限制非管理者的儀表板使用者：任務變更、各輪結果、時間軸、留言、角色回合、產物、執行紀錄、由任務產生的核准卡片、預測鏈與儀表板即時推送都照名單與每次重讀的權限檢查，名單外的人在任務與活動列表只看到任務卡；讀取任務內容與作用在任務上的變更（狀態、決定、指派、封存、釘選、改名、刪除）每次重讀帳號與名單，撤銷綁定、調降角色或停用帳號後，開著的連線下一次就做不到；儀表板即時推送在 2 秒內跟上，其他儀表板請求維持原本的檢查。AI 員工經 MCP 工具（`tasks_list`、提示裡的任務板）讀任務時不看名單。第一份限制到人的交接資料會寫入動態牆與安全稽核（任務、輪次、角色、帳號、限制項目），管理者在任務頁看得到限制與來源；交接資料損壞時只有管理者看得到並會標明。共用規則在 `review_evidence/audience.rs`，任務內容 RPC 的入口在 `handlers/task_privacy.rs`。
 - 儀表板即時推送逐一事件種類過濾（表列於 `docs/guides/reviewable-workflow-drafts.md`「Live dashboard updates」）：別的 AI 員工的對話、計畫、畫布、排程、記憶、技能與通道設定變更只送給有該員工權限的帳號；登入與安裝輸出、聊天送達失敗與未列出的事件只送管理者；鎖定畫面只收閘道狀態。修正前，任何已登入帳號都收得到別的 AI 員工的回覆摘要與 CLI 登入輸出。影響已發布版本。
@@ -65,6 +77,11 @@
 - 電腦操作工作區的已知限制：擁有者隔離與終端機的核准閘只對產品工具與通道路徑成立；有 `Read` 或 Bash 的 AI 員工可以直接讀主機上的工作區目錄，有不受限 Bash 的員工也能繞過核准閘、直接改登錄與核准資料庫。真正的隔離是不給 Bash，或開任務沙箱。檔案在磁碟上是明文；`denied_tools` 擋不住帶 `workspace` 參數的唯讀掛載。詳見 `SECURITY.md`。
 - 工作流程試跑的任務與排程寫入需由操作者明列測試資源 ID；準備及執行前重讀清單，拒絕未登記目標與依名稱選取排程。缺少啟用權威的非試跑執行不再走單次人工核准例外。
 - Computer Use 高風險核准綁定帳號、使用者、對話或討論串、任務契約 revision、操作及政策摘要與期限，投遞使用原帳號；執行前重新觀察，重啟不重播舊座標。舊式或損毀綁定不能升權，Unix 核准資料庫與 sidecar 權限收緊為 0600，輸入文字不落盤。
+- **員工不能再寫自己的 `.mcp.json` 與 CLI 設定（所有已出貨版本都受影響）**：Claude CLI 會啟動 `.mcp.json` 裡列的每一個 MCP 伺服器，而以前員工可以自己新增「無關的」伺服器項目，所以只有 Write／Edit、沒有 Bash 的員工，也能加一個指令是直譯器的項目，在下一次啟動時以管理者的系統身分執行任意指令。現在帶員工身分或身分未驗證的呼叫者，對自己目錄裡任何一層的 `.mcp.json` 一律不能寫，任何一層的 `.claude/` 與 `.claude.json`，以及最上層的 `.codex/`、`.gemini/`、`.grok/`、`.agents/` 也一樣（檔名比對不分大小寫）。**行為變更**：員工不能再自己加 MCP 伺服器，請改由儀表板安裝，或在儀表板提出 MCP 安裝申請（`mcp.install_request`）經管理者核准；複製到員工目錄裡的專案，員工可以讀它的 `.claude/`，不能寫。gateway 在每次把員工 `.mcp.json` 交給 Claude CLI 之前（通道回覆、派工、heartbeat 主動檢查、`duduclaw eval` 的 live 模式、live fork 複製分支之前的上層目錄）與開機時，整筆重新產生 DuDuClaw 項目（其他項目保留）；檔案無法確認、或 duduclaw 執行檔路徑不是絕對路徑時，這次不啟動並寫稽核 `mcp_config_unverified`。這種拒絕不算帳號失敗：不會讓帳號進入冷卻，也不會換下一個帳號重試，通道回覆不改用本地模型或 Direct API 代答，使用者看到的是說明哪位員工設定無法確認的中文訊息。所有寫 `.mcp.json` 的程式共用同一把檔案鎖，員工目錄的鎖放在 `<home>/locks/`（不在員工目錄裡，員工建立的同名檔案擋不住它），暫存檔名稱不可預測。live fork 採用分支回員工目錄時，也不會帶回 `.claude.json`、`.agents/`、`.codex/`、`.gemini/`、`.grok/`，以及任何一層的 `.claude/`、`.claude.json`、`.mcp.json`。**升級後請執行 `duduclaw doctor`**：新的一列「員工 MCP 設定中的其他伺服器」會列出每位員工 `.mcp.json` 裡不是 DuDuClaw 寫入的項目（只顯示名稱與指令的檔名，不顯示參數、環境變數或網址）；這些指令會在員工啟動時以你的系統使用者身分執行，請確認每一個都是你自己或經核准的安裝加入的，升級前就被加入的項目不會自動移除。限制：這是 hook，有不受限 Bash 的員工仍可改檔；Codex、Gemini、Grok、Antigravity 不跑 hook，它們的 MCP 設定也在員工目錄下，這類問題在那些 runtime 上沒有處理。
+- **員工不能再寫自己的 `.mcp.json` 與 CLI 設定（所有已出貨版本都受影響）**：Claude CLI 會啟動 `.mcp.json` 裡列的每一個 MCP 伺服器，而以前員工可以自己新增「無關的」伺服器項目，所以只有 Write／Edit、沒有 Bash 的員工，也能加一個指令是直譯器的項目，在下一次啟動時以管理者的系統身分執行任意指令。現在帶員工身分或身分未驗證的呼叫者，對自己目錄裡任何一層的 `.mcp.json` 一律不能寫，任何一層的 `.claude/` 與 `.claude.json`，以及最上層的 `.codex/`、`.gemini/`、`.grok/`、`.agents/` 也一樣（檔名比對不分大小寫）。**行為變更**：員工不能再自己加 MCP 伺服器，請改由儀表板安裝，或在儀表板提出 MCP 安裝申請（`mcp.install_request`）經管理者核准；複製到員工目錄裡的專案，員工可以讀它的 `.claude/`，不能寫。gateway 在每次把員工 `.mcp.json` 交給 Claude CLI 之前（通道回覆、派工、heartbeat 主動檢查、`duduclaw eval` 的 live 模式、live fork 複製分支之前的上層目錄）與開機時，整筆重新產生 DuDuClaw 項目（其他項目保留）；檔案無法確認、或 duduclaw 執行檔路徑不是絕對路徑時，這次不啟動並寫稽核 `mcp_config_unverified`。這種拒絕不算帳號失敗：不會讓帳號進入冷卻，也不會換下一個帳號重試，通道回覆不改用本地模型或 Direct API 代答，使用者看到的是說明哪位員工設定無法確認的中文訊息。所有寫 `.mcp.json` 的程式共用同一把檔案鎖，員工目錄的鎖放在 `<home>/locks/`（不在員工目錄裡，員工建立的同名檔案擋不住它），暫存檔名稱不可預測。live fork 採用分支回員工目錄時，也不會帶回 `.claude.json`、`.agents/`、`.codex/`、`.gemini/`、`.grok/`，以及任何一層的 `.claude/`、`.claude.json`、`.mcp.json`。**升級後請執行 `duduclaw doctor`**：新的一列「員工 MCP 設定中的其他伺服器」會列出每位員工 `.mcp.json` 裡不是 DuDuClaw 寫入的項目（只顯示名稱與指令的檔名，不顯示參數、環境變數或網址）；這些指令會在員工啟動時以你的系統使用者身分執行，請確認每一個都是你自己或經核准的安裝加入的，升級前就被加入的項目不會自動移除。MCP 伺服器對自身身分變數「有設但空白」或半組一律拒絕寫入。限制：這是 hook，有不受限 Bash 的員工仍可改檔；Codex、Gemini、Grok、Antigravity 不跑 hook，它們的 MCP 設定也在員工目錄下，這類問題在那些 runtime 上沒有處理。
+- **Bash 守門新增規則**：帶員工身分或身分未驗證的呼叫者，不能透過 Bash 執行 `duduclaw memory forget-source` 與 `duduclaw memory migrate-namespace`（任何子指令，包含 `list`；`duduclaw-pro` 與帶路徑的寫法同樣適用）。這是減速帶，不是沙箱，擋不住子指令前的全域選項、用指令替換組出的執行檔名稱、經管線傳入的指令，以及其他能避開指令名稱比對的寫法。真正的隔離是不授予 Bash，或使用任務沙箱。
+- 判斷「是否在 AI 員工工作階段內」的檢查擴大：這兩個指令現在只要程序環境裡有任何 gateway 為員工程序設定的變數（身分、token、回合、對話、派工、委派、hop、回覆通道，空值也算）就拒絕執行；以前只看員工身分變數。對直接從員工 Bash 執行的指令，這項檢查不可靠，因為員工可以 unset 變數。
+
 
 ## [1.69.1] - 2026-10-04 — Antigravity 平台工具權限修正
 

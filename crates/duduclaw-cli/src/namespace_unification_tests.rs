@@ -81,7 +81,7 @@ async fn distill(home: &Path, agent: &str, said: &str) {
         agent,
         USER,
         &home.join("memory.db"),
-        home,
+        home, &[duduclaw_memory::SourceRef::channel_message("test:s", 1, chrono::Utc::now(), None)],
     )
     .await;
 }
@@ -168,7 +168,7 @@ async fn operator_approved_value_is_protected_from_both_sides() {
         "preferred_name",
         "Mr. Lee",
         duduclaw_memory::origin::OPERATOR.name,
-        1.0,
+        1.0, duduclaw_memory::lineage::Provenance::test_only(),
     )
     .await
     .unwrap();
@@ -219,7 +219,7 @@ async fn invalidate_by_origin_acts_on_the_callers_own_pool_only() {
             last_accessed: None,
             source_event: "test".into(),
         };
-        mem.store_temporal(agent, e, meta).await.unwrap();
+        mem.store_temporal(agent, e, meta, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     }
     let acting = h::ai_employee_caller(
         duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID,

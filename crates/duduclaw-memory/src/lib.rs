@@ -20,6 +20,7 @@ pub mod gdpr;
 pub mod graph_rank;
 pub mod import;
 pub mod janitor;
+pub mod lineage;
 pub mod lifecycle;
 pub mod novelty_gate;
 pub mod origin;
@@ -46,6 +47,16 @@ pub use feedback::{CitationTracker, DrainOnDrop, TrustSignal, WikiCitation};
 pub use gdpr::{gdpr_erase, gdpr_export, GdprEraseSummary};
 pub use janitor::{JanitorConfig, JanitorReport, WikiJanitor};
 pub use lifecycle::{reassign_agent, reassign_agent_cross_db, ReassignSummary};
+// `Provenance` stays under `lineage::` — the crate root already exports
+// `user_code::Provenance` (a different type).
+pub use lineage::{
+    format_ts, source_digest, FactWriteOutcome, FenceReason, FenceRefusal, SourceKind, SourceRef,
+    MAX_LINEAGE_SOURCES,
+};
+pub use engine::forget_source::{
+    ApplyOutcome, ApplyReport, ExternalInputs, ForgetPlan, ForgetSelector, ForgetStep,
+    PlanDocument, PlanOptions, PlanOutcome, SessionMessageRef, StaleReason, WikiPageRef,
+};
 pub use novelty_gate::{NoveltyGateConfig, NoveltyRejection};
 pub use origin::{trust_ceiling, OriginClass};
 pub use supersession_guard::{

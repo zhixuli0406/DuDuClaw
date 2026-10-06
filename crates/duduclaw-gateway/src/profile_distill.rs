@@ -646,7 +646,15 @@ pub(crate) async fn store_profile_traits_reported(
     user_id: &str,
     traits: &[ProfileTraitCandidate],
 ) -> (usize, Vec<HeldTrait>) {
-    let (written, held, _) = store_profile_traits_capped(engine, agent_id, user_id, traits, None).await;
+    let (written, held, _) = store_profile_traits_capped(
+        engine,
+        agent_id,
+        user_id,
+        traits,
+        None,
+        &duduclaw_memory::lineage::Provenance::test_only(),
+    )
+    .await;
     (written, held)
 }
 
@@ -659,6 +667,7 @@ pub(crate) async fn store_profile_traits_capped(
     user_id: &str,
     traits: &[ProfileTraitCandidate],
     home_dir: Option<&Path>,
+    provenance: &duduclaw_memory::lineage::Provenance,
 ) -> (usize, Vec<HeldTrait>, Vec<duduclaw_memory::SupersessionRefusal>) {
     let mut written = 0usize;
     let mut held: Vec<HeldTrait> = Vec::new();
@@ -683,10 +692,17 @@ pub(crate) async fn store_profile_traits_capped(
             &t.value,
             PROFILE_DISTILL_ORIGIN,
             PROFILE_DISTILL_ORIGIN_TRUST,
+            provenance.clone(),
         )
         .await
         {
             Ok(duduclaw_memory::TemporalWriteOutcome::Stored(_)) => written += 1,
+            Ok(duduclaw_memory::TemporalWriteOutcome::Fenced(refusal)) => {
+                // P2-B: the turn's source was forgotten — skip, not an error.
+                if let Some(h) = home_dir {
+                    crate::memory_provenance::record_fenced(h, agent_id, "profile_distill", &refusal);
+                }
+            }
             Ok(duduclaw_memory::TemporalWriteOutcome::Refused(refusal)) => {
                 // Idempotent: the same trait repeated while pending review is
                 // not held twice. A NEW held row consumes the daily cap.
@@ -714,6 +730,7 @@ pub(crate) async fn store_profile_traits_capped(
                     &t.value,
                     PROFILE_DISTILL_ORIGIN,
                     PROFILE_DISTILL_ORIGIN_TRUST,
+                    provenance.clone(),
                     &mut admit,
                 )
                 .await;
@@ -742,11 +759,23 @@ pub(crate) async fn store_profile_traits_capped(
                             existing_value,
                         })
                     }
-                    Err(e) => warn!(
-                        agent = agent_id,
-                        predicate = %t.predicate,
-                        "profile distill: refused trait could not be held for review: {e}"
-                    ),
+                    Err(e) => {
+                        let fenced = home_dir.is_some_and(|h| {
+                            crate::memory_provenance::record_fenced_error(
+                                h,
+                                agent_id,
+                                "profile_distill",
+                                &e,
+                            )
+                        });
+                        if !fenced {
+                            warn!(
+                                agent = agent_id,
+                                predicate = %t.predicate,
+                                "profile distill: refused trait could not be held for review: {e}"
+                            )
+                        }
+                    }
                 }
             }
             Err(e) => warn!(
@@ -774,6 +803,7 @@ pub async fn run_profile_distill(
     user_id: &str,
     memory_db: &Path,
     home_dir: &Path,
+    sources: &[duduclaw_memory::SourceRef],
 ) {
     if is_anonymous(user_id) {
         return;
@@ -782,6 +812,11 @@ pub async fn run_profile_distill(
     if traits.is_empty() {
         return;
     }
+    // P2-B: traits are stored only with the turn's host-generated sources.
+    let Some(provenance) = crate::memory_provenance::provenance_of(sources) else {
+        debug!(agent = agent_id, "profile distill: turn has no recorded source, nothing stored");
+        return;
+    };
 
     // M1 moat-gate: same quota resolution as `wiki_ingest::persist_facts`, so
     // profile writes cannot slip past the tier's memory quota.
@@ -809,6 +844,7 @@ pub async fn run_profile_distill(
                 &user,
                 &traits,
                 Some(home.as_path()),
+                &provenance,
             )),
         )
     })
@@ -1160,7 +1196,7 @@ mod tests {
             predicate,
             value,
             duduclaw_memory::origin::OPERATOR.name,
-            1.0,
+            1.0, duduclaw_memory::lineage::Provenance::test_only(),
         )
         .await
         .unwrap();
@@ -1218,7 +1254,7 @@ mod tests {
     async fn agent_record_and_user_statement_correct_each_other() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         // The agent recorded a (wrong) name at the trust it asked for.
-        duduclaw_memory::record_trait(&engine, "a1", "u1", PREDICATE_PREFERRED_NAME, "李總", 1.0)
+        duduclaw_memory::record_trait(&engine, "a1", "u1", PREDICATE_PREFERRED_NAME, "李總", 1.0, duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         // The user corrects it: written directly, nothing held.
@@ -1235,7 +1271,7 @@ mod tests {
             Some("老李".to_string())
         );
         // And the agent can record a later correction over the user's value.
-        duduclaw_memory::record_trait(&engine, "a1", "u1", PREDICATE_PREFERRED_NAME, "老李哥", 1.0)
+        duduclaw_memory::record_trait(&engine, "a1", "u1", PREDICATE_PREFERRED_NAME, "老李哥", 1.0, duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!(
@@ -1319,8 +1355,8 @@ mod tests {
         assert!(is_anonymous("system"));
         let home = tempfile::tempdir().unwrap();
         let db = home.path().join("memory.db");
-        run_profile_distill("以後請稱呼我老李。", "a1", "system", &db, home.path()).await;
-        run_profile_distill("以後請稱呼我老李。", "a1", "u1", &db, home.path()).await;
+        run_profile_distill("以後請稱呼我老李。", "a1", "system", &db, home.path(), &crate::memory_provenance::test_sources()).await;
+        run_profile_distill("以後請稱呼我老李。", "a1", "u1", &db, home.path(), &crate::memory_provenance::test_sources()).await;
         let engine = SqliteMemoryEngine::new(&db).unwrap();
         assert!(duduclaw_memory::user_profile::profile_block(&engine, "a1", "system")
             .await

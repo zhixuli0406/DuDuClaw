@@ -7,6 +7,7 @@ pub mod contract;
 pub mod credential_probe;
 pub mod heartbeat;
 pub mod ipc;
+pub mod mcp_spawn_gate;
 pub mod mcp_template;
 pub mod proactive;
 pub mod proactive_timing;

@@ -25,8 +25,17 @@ pub(crate) async fn handle_decision_resolve(
         return tool_error("Error: decision_id and chosen_key are both required");
     }
 
+    // P2-B: the agent's choice is recorded with its MCP turn as the source
+    // (the engine adds the decision rows as parents).
+    let provenance = match crate::mcp_memory_handlers::mcp_write_provenance(agent_id) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "decision_resolve refused: malformed host env");
+            return tool_error(&crate::mcp_memory_handlers::malformed_host_env(&e));
+        }
+    };
     match memory
-        .resolve_decision(agent_id, decision_id, chosen_key)
+        .resolve_decision(agent_id, decision_id, chosen_key, provenance)
         .await
     {
         Ok(duduclaw_memory::DecisionResolveOutcome::Resolved {
@@ -69,7 +78,18 @@ pub(crate) async fn handle_decision_resolve(
                 "isError": true
             })
         }
-        Err(e) => tool_error(&format!("Error resolving decision: {e}")),
+        Err(e) => {
+            if duduclaw_gateway::memory_provenance::record_fenced_error(
+                &duduclaw_core::duduclaw_home(),
+                agent_id,
+                "mcp_decision_resolve",
+                &e,
+            ) {
+                tool_error("Not resolved: the conversation this choice comes from was forgotten by the operator")
+            } else {
+                tool_error(&format!("Error resolving decision: {e}"))
+            }
+        }
     }
 }
 

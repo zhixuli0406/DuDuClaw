@@ -50,11 +50,11 @@ async fn held_claim_card(home: &std::path::Path, ttl: i64) -> (crate::approval::
     let db = home.join("memory.db");
     let engine = duduclaw_memory::SqliteMemoryEngine::new(&db).unwrap();
     engine
-        .store_temporal("support", entry("support", "7 days"), meta("7", "operator"))
+        .store_temporal("support", entry("support", "7 days"), meta("7", "operator"), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let held = engine
-        .hold_refused_claim("support", entry("support", "forever"), meta("forever", "channel"))
+        .hold_refused_claim("support", entry("support", "forever"), meta("forever", "channel"), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let digest = engine.held_claim_view("support", &held).await.unwrap().unwrap().claim_digest;
@@ -183,11 +183,11 @@ async fn card_with_non_held_or_foreign_ids_promotes_nothing() {
     let db = home.path().join("memory.db");
     let engine = duduclaw_memory::SqliteMemoryEngine::new(&db).unwrap();
     let fact = engine
-        .store_temporal("support", entry("support", "7 days"), meta("7", "operator"))
+        .store_temporal("support", entry("support", "7 days"), meta("7", "operator"), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let foreign = engine
-        .hold_refused_claim("other", entry("other", "x"), meta("x", "channel"))
+        .hold_refused_claim("other", entry("other", "x"), meta("x", "channel"), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let foreign_digest = engine.held_claim_view("other", &foreign).await.unwrap().unwrap().claim_digest;
@@ -217,13 +217,13 @@ async fn release_converted_rows_get_a_card_through_the_rpc() {
     let db = home.path().join("memory.db");
     let mut engine = duduclaw_memory::SqliteMemoryEngine::new(&db).unwrap();
     engine
-        .store_temporal("support", entry("support", "7 days"), meta("7", "operator"))
+        .store_temporal("support", entry("support", "7 days"), meta("7", "operator"), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     engine.supersession_trust_guard = false;
     let mut q = meta("forever", "channel");
     q.quarantined = true;
-    let row = engine.store_temporal("support", entry("support", "forever"), q).await.unwrap();
+    let row = engine.store_temporal("support", entry("support", "forever"), q, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     drop(engine);
     let burst = file_card(home.path(), "support", vec![row.clone()], false, None, 3600, &db).await;
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
@@ -257,13 +257,13 @@ async fn retried_release_files_the_missing_conflict_card() {
     let db = home.path().join("memory.db");
     let mut engine = duduclaw_memory::SqliteMemoryEngine::new(&db).unwrap();
     engine
-        .store_temporal("support", entry("support", "7 days"), meta("7", "operator"))
+        .store_temporal("support", entry("support", "7 days"), meta("7", "operator"), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     engine.supersession_trust_guard = false;
     let mut q = meta("forever", "channel");
     q.quarantined = true;
-    let x = engine.store_temporal("support", entry("support", "forever"), q).await.unwrap();
+    let x = engine.store_temporal("support", entry("support", "forever"), q, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     engine.supersession_trust_guard = true;
     let burst = file_card(home.path(), "support", vec![x.clone()], false, None, 3600, &db).await;
     // First attempt: converted X, then failed before any card was filed.

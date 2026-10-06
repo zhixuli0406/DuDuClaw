@@ -336,6 +336,7 @@ pub(super) async fn migrate_with_home(
             &agent_id,
             "workspace memory",
             &facts,
+            &ws.display().to_string(),
         )
         .await;
 

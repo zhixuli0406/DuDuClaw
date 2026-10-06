@@ -227,3 +227,42 @@ pub(super) fn bash_name_rules(normalized: &str, home: &Path, caller: &HookCaller
 
     GuardDecision::NotAgentFile
 }
+
+/// Operator-only memory subcommands (P2-B C-1): an employee must not run
+/// them through Bash, not even the read-only `list`.
+const OPERATOR_MEMORY_SUBCOMMANDS: &[&str] = &["forget-source", "migrate-namespace"];
+
+/// Refuses `duduclaw` / `duduclaw-pro` `memory forget-source …` and
+/// `memory migrate-namespace …` for agent and untrusted callers. `normalized`
+/// is the lower-cased command. A speed bump like the rest of the lane (a
+/// renamed binary or a computed command word evades it); the dashboard
+/// approval in front of `apply` is the real gate.
+pub(super) fn bash_operator_memory_command(normalized: &str, caller: &HookCaller) -> GuardDecision {
+    let caller_id = match caller {
+        HookCaller::Absent => return GuardDecision::NotAgentFile,
+        HookCaller::Agent(id) | HookCaller::Untrusted(id) => id,
+    };
+    for segment in normalized.split([';', '&', '|', '\n', '(', ')', '`']) {
+        let tokens: Vec<&str> = segment
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c: char| matches!(c, '\'' | '"')))
+            .collect();
+        let Some(bin_at) = tokens.iter().position(|t| {
+            let base = t.rsplit(['/', '\\']).next().unwrap_or(t);
+            matches!(base, "duduclaw" | "duduclaw.exe" | "duduclaw-pro" | "duduclaw-pro.exe")
+        }) else {
+            continue;
+        };
+        let rest = &tokens[bin_at + 1..];
+        let hit = rest.windows(2).find_map(|w| {
+            (w[0] == "memory" && OPERATOR_MEMORY_SUBCOMMANDS.contains(&w[1])).then_some(w[1])
+        });
+        if let Some(sub) = hit {
+            return GuardDecision::BlockedOperatorMemoryCommand {
+                caller: caller_id.clone(),
+                command: sub.to_string(),
+            };
+        }
+    }
+    GuardDecision::NotAgentFile
+}

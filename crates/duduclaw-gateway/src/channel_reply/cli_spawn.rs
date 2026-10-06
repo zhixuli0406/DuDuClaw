@@ -557,6 +557,17 @@ where
                 return Ok(text);
             }
             Err(e) => {
+                // `.mcp.json` spawn gate: the employee's MCP configuration
+                // could not be confirmed. That is not this account's fault —
+                // do not book it against account health, and do not try the
+                // next account (the same file would be refused again).
+                if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&e) {
+                    warn!(
+                        account = %selected.id,
+                        "MCP config could not be confirmed — not an account failure, not retried"
+                    );
+                    return Err(e);
+                }
                 last_error = e.clone();
                 if crate::claude_runner::is_billing_error(&e) {
                     warn!(account = %selected.id, error = %e, "Account billing exhausted — 24h cooldown");

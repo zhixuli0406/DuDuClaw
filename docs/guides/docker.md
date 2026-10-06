@@ -290,7 +290,7 @@ Billed by usage, at OpenAI API pricing.
 
 ### 6.3 Gemini (Google) CLI (deprecated)
 
-> **Deprecated in v1.67.0, removed in v1.70.0.** Google stopped serving free, Google AI Pro and Google AI Ultra individual accounts through Gemini CLI on 2026-06-18, so a personal Google login no longer works with it. API-key and enterprise (Gemini Code Assist) use is unaffected. The image keeps shipping the Gemini CLI until removal. Use the Antigravity runtime (`antigravity`, binary `agy`) instead; see [Deprecations](deprecations.md#gemini-cli-runtime).
+> **Deprecated in v1.67.0, removed in v1.71.0.** Google stopped serving free, Google AI Pro and Google AI Ultra individual accounts through Gemini CLI on 2026-06-18, so a personal Google login no longer works with it. API-key and enterprise (Gemini Code Assist) use is unaffected. The image keeps shipping the Gemini CLI until removal. Use the Antigravity runtime (`antigravity`, binary `agy`) instead; see [Deprecations](deprecations.md#gemini-cli-runtime).
 >
 > Signing in to Antigravity through `agy` needs a terminal and an OS keyring, which a container does not have, so containers use API-key mode: set `config.toml [antigravity] auth = "api_key"` and supply the same Gemini API key (a `gemini` provider account, or `GEMINI_API_KEY` below). Antigravity keeps its settings under `~/.gemini` as well, so the `duduclaw-gemini` volume below stays in place.
 

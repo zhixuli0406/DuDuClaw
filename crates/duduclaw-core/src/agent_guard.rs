@@ -205,6 +205,14 @@ pub enum GuardDecision {
         attempted_path: PathBuf,
         reason: String,
     },
+    /// P2-B (C-1): an agent-identified (or untrusted) caller ran an
+    /// operator-only memory command through Bash — `duduclaw memory
+    /// forget-source …` or `duduclaw memory migrate-namespace …` (any
+    /// subcommand, `list` included), also as `duduclaw-pro`.
+    BlockedOperatorMemoryCommand {
+        caller: String,
+        command: String,
+    },
     /// An AI employee (or an unverified caller) ran an operator-only
     /// command from Bash, e.g. `duduclaw ops channel-ingress` or
     /// `duduclaw ops computer-workspaces`. Same
@@ -376,6 +384,12 @@ impl GuardDecision {
                  原因：這些設定由安全檢查讀取，允許執行中的程序自行改寫等同自助放寬限制。",
                 attempted_path.display(),
                 changed.join("；")
+            )),
+            Self::BlockedOperatorMemoryCommand { caller, command } => Some(format!(
+                "已封鎖：`duduclaw memory {command}` 只能由管理者在自己的終端機執行，\
+                 AI 員工不能執行（包含只列出內容的子指令）。\n\
+                 你的身分：{caller}\n\
+                 需要忘記或搬移記憶，請告訴管理者；刪除還需要管理員在儀表板核准。"
             )),
             _ => None,
         }

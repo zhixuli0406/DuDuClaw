@@ -2024,6 +2024,7 @@ impl AutopilotEngine {
             reply_channel: None,
             turn_id: None,
             session_id: None,
+            upstream_unknown: false,
         };
         mq.enqueue(&msg).await
     }

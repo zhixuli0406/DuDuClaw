@@ -351,6 +351,21 @@ impl McpClient {
         envs: &[(String, String)],
         timeout: Duration,
     ) -> Result<Self, McpError> {
+        Self::connect_with_stderr(command, args, envs, timeout, std::process::Stdio::null()).await
+    }
+
+    /// [`connect`](Self::connect) with the child's stderr disposition chosen by
+    /// the caller. Production keeps `Stdio::null()` (a server's stderr is not
+    /// ours to relay); the CLI integration tests pass `Stdio::inherit()` so a
+    /// child that exits before the handshake leaves its reason in the test
+    /// output instead of a bare `Closed`.
+    pub async fn connect_with_stderr(
+        command: &str,
+        args: &[String],
+        envs: &[(String, String)],
+        timeout: Duration,
+        stderr: std::process::Stdio,
+    ) -> Result<Self, McpError> {
         let mut cmd = Command::new(command);
         let workflow_home = if envs
             .iter()
@@ -370,6 +385,19 @@ impl McpClient {
                     cmd.env(key, value);
                 }
             }
+            // Windows: `std::env::temp_dir` reads `TMP` / `TEMP`, the profile
+            // comes from `USERPROFILE`, and process start-up needs `SystemRoot`
+            // / `windir` / `ComSpec`; with only the three keys above the child
+            // `duduclaw mcp-server` exited before the MCP handshake on the CI
+            // Windows runner (13 `workflow_stdio` cases, `McpError::Closed`).
+            // Same system-only allow-list the agent CLI spawn uses; no
+            // secret-shaped names (pinned by spawn_env's shape test).
+            #[cfg(windows)]
+            for key in duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST_WINDOWS {
+                if let Some(value) = std::env::var_os(key) {
+                    cmd.env(key, value);
+                }
+            }
             Some(home)
         } else {
             None
@@ -378,7 +406,7 @@ impl McpClient {
             .envs(envs.iter().map(|(k, v)| (k.clone(), v.clone())))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(stderr)
             .kill_on_drop(true);
         if let Some(home) = workflow_home {
             cmd.env("HOME", home);

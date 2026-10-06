@@ -369,7 +369,7 @@ mod tests {
             metadata: Some(blob),
             ..Default::default()
         };
-        engine.store_temporal(agent, entry, temporal).await.unwrap()
+        engine.store_temporal(agent, entry, temporal, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap()
     }
 
     #[tokio::test]
@@ -519,7 +519,7 @@ mod tests {
                     predicate: Some("is".into()),
                     object: Some("100".into()),
                     ..Default::default()
-                },
+                }, duduclaw_memory::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -566,7 +566,7 @@ mod tests {
                 TemporalMeta {
                     metadata: Some(blob),
                     ..Default::default()
-                },
+                }, duduclaw_memory::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -598,7 +598,7 @@ mod tests {
                     predicate: Some("is".into()),
                     object: Some("120".into()),
                     ..Default::default()
-                },
+                }, duduclaw_memory::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();

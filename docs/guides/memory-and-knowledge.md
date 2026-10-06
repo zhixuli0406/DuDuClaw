@@ -165,6 +165,91 @@ Hover over any entry in the memory list and a trash icon appears on the right; t
 
 Underneath, this is a soft delete: the record moves to an archive table, an administrator can still recover it from the database, and it's only purged for good after the retention window passes.
 
+### 4.5 Forgetting a conversation, a scheduled run or an imported file
+
+Use this when someone asks you to make an AI employee forget something they said, or when a scheduled run or an import put content into memory that should not be there. Deleting entries one at a time (4.4) only removes the entries you can see. This procedure removes every memory that came from one source, including the ones derived from it, and blocks the same source from being learned again. Every command below runs in your own terminal, not in an employee's session.
+
+Before you start: the command only knows about memories written after the source-recording feature was installed. Older memories have no recorded source; the plan counts them (`沒有完整來源紀錄的記憶`) but never deletes them. The same count includes memories written by a dispatched run whose bus message carried only half of the upstream conversation's identity: they keep the run as their source, but forgetting the upstream conversation cannot reach them.
+
+1. List the sources.
+
+```bash
+duduclaw memory forget-source list --agent sales-rep
+```
+
+The output has one line per conversation (or per series of scheduled runs, or per imported file): the session key, the kinds of source in brackets (`聊天訊息` channel messages, `員工自行存入` what the employee stored itself during a turn, `排程／派工執行` scheduled or dispatched runs, `外部 MCP 用戶端`, `匯入`, `足跡`), how many memories carry it, and when the latest one was written. A memory is counted once per line even when it has several sources in that conversation. To see the individual messages or runs of one session:
+
+```bash
+duduclaw memory forget-source list --agent sales-rep --session <session>
+```
+
+Here each line is one message or one run and ends with `→ --message <value>`, the value to pass to `--message`. What the employee stored itself during a turn is listed under the user message that started the turn (`含員工在這一輪自行存入的記憶`), because forgetting that message forgets the turn too; a turn whose message was not recorded gets its own `turn:` line.
+
+`--agent` is the employee id, or `external/<client>` / `internal/<client>` for a memory namespace used by an MCP client.
+
+2. Create a plan. Pick the form that matches what you need to forget.
+
+| What to forget | Command |
+|---|---|
+| Specific messages | `duduclaw memory forget-source plan --agent sales-rep --session <session> --message 812,815` |
+| A whole conversation, up to now | `duduclaw memory forget-source plan --agent sales-rep --session <session>` |
+| One scheduled or dispatched run | `duduclaw memory forget-source plan --agent sales-rep --session <session> --message run:<key>` |
+| An imported file | `duduclaw memory forget-source plan --agent sales-rep --session import:/path/to/file` |
+
+`--message` takes the value after the arrow in `list --session`: a message number (`812` and `m:812` mean the same message) or a key such as `run:<key>`; `turn:`, `call:`, `item:` and `day:` keys are accepted the same way. Forgetting a user message also forgets the employee's reply in the same turn, because a reply often repeats what the user said, and whatever the employee stored itself during that turn: the turn counts as the same source, so a later write that names only the turn is blocked too. Forgetting a whole conversation covers every turn in it. `--show-snippets` prints the first 60 characters of each memory on screen (never stored). `--max-rows` and `--ttl-minutes` change the size limit (default 50,000 rows) and how long the plan stays valid (default 30 minutes, at most 1,440).
+
+`plan` deletes nothing. It records the plan, files an approval request, and prints the plan. Read these parts (the command prints Chinese; the quoted phrases below are its exact wording):
+
+- `將刪除 N 筆記憶、N 筆關鍵事實、N 份封存副本、N 個自動建檔頁面`: what will be deleted. Each target line shows the memory id, its kind and layer, and how it was reached: `直接` (the memory came from the source itself) or `衍生` (it was derived from something that came from it).
+- `同一輪的員工回覆也一併忘記` and `個回合也一併設為不再學到`: the reply and the employee's own writes in the same turn, which are part of the same source. `show` and the `apply` preview print the same lines.
+- `壓縮摘要`: a conversation has one compressed summary, which cannot be cut down to one message or one run, so every plan clears the whole conversation's summary (for a scheduled run, the whole `cron:<employee>` conversation). The line says so.
+- `連帶影響`: other sources that also supported a memory slated for deletion. Those memories are deleted whole, so you lose what the other source said too. Memories that were only mentioned again by the forgotten source stay (`保留，僅移除佐證紀錄`).
+- `需要人工檢視`: wiki pages the employee wrote itself whose recorded sources match. They are not deleted; open them and decide.
+- `對話紀錄`: how many messages the employee will stop seeing. The original text stays in the conversation record.
+- `其他命名空間也記錄了同一段對話`: ready-to-run `plan` commands for other employees that stored the same conversation. Each needs its own plan and approval. The command also reaches what an employee stored while doing work this turn handed to it, even after the first plan was applied.
+- `套用時會設下 N 筆防止再學到的紀錄`: how many blocks the apply writes. Forgetting a long conversation writes one per turn in which the employee stored something, so the number can be in the thousands.
+- `不在範圍內`: what this command does not reach. Read it every time (see the list at the end of this section).
+
+3. Approve in the dashboard. An Admin opens the dashboard to-do list and approves the request named in the plan output. The card shows counts and source labels, never memory content, and states that the request came from a local command line. The approval is tied to this exact plan. Channel buttons cannot approve it.
+
+To check where it stands without applying:
+
+```bash
+duduclaw memory forget-source apply --plan <plan-id>
+```
+
+Without `--confirm` this prints the plan again plus a line `核准狀態：` saying whether the approval is pending, granted or no longer valid.
+
+4. Apply.
+
+```bash
+duduclaw memory forget-source apply --plan <plan-id> --confirm
+```
+
+On success it prints how many memories, key facts and archive copies were deleted, then the follow-up result. The follow-up steps happen outside the memory database: deleting auto-filed wiki pages, withdrawing review cards, hiding the forgotten messages from the employee, and clearing the conversation's compressed summary.
+
+5. If the follow-up did not finish. A result of `DEGRADED` (exit status 3) means the memories are already deleted and the block is in place, but some follow-up steps failed. Run:
+
+```bash
+duduclaw memory forget-source resume --plan <plan-id>
+```
+
+A running gateway also retries unfinished steps every 10 minutes and at start-up. When nothing is left to run, `resume` says so (`沒有需要補跑的後續步驟`).
+
+If the plan expired or the data changed. An apply refused with `計畫已過期`, or with a message saying the data changed since the plan, deleted nothing. A stale refusal lists every reason that applies at once: another forget in the same namespace, memories added, removed or changed, and other parts of the plan that changed (for example review cards or conversation records). Writes that do not change what the apply would do, such as the background archiving of old memories or another employee storing the same conversation, do not make the plan stale; the apply output shows the two informational counts (`沒有完整來源紀錄的記憶` and the other namespaces) as they were at plan time and at apply time. Pause the employee, run `plan` again and get a new approval. The approval expires together with the plan, so an expired plan always needs a new one.
+
+Large plans. When a plan has more than 5,000 targets, `apply` locks the memory store for several seconds and the plan output says so. Pause the employee before applying.
+
+What this does not do.
+
+- It deletes memories derived from the source and blocks the system from learning from the same source again. It does not delete the conversation text (the employee just stops seeing it), messages already sent, backups, or content other employees received.
+- Content can still reach the employee through places this command does not touch: tool-call records and error notes that are put into the prompt every turn, the task board and `/goal` text, working state, Agent Mail, goal state and judge feedback, hand-off copies, replies passed between employees, other kinds of review cards, the Claude CLI's own transcripts under the user's home directory, the reinforcement-learning trajectory files written after every reply (`rl_trajectories.jsonl` and the `rl_trajectories/` directory, which hold the whole conversation's text and carry no message number that would identify what to remove), shared wiki copies, and wiki pages the employee wrote itself. Those are never deleted: pages written after the feature was installed are listed for you to review, and older ones have no recorded source, so they are not listed at all. Memories an employee stored through the Gemini CLI runtime are not tied to a conversation and are not reached; whether Grok employees' memories are tied has not been verified.
+- A turn is linked to its user message only when one of the employee's own writes in that turn recorded both as its sources (a write that only restated a memory it already had counts too). A turn in which the employee stored nothing has no recorded link, so forgetting the message does not reach a later write that names only that turn; forgetting the whole conversation still covers it.
+- When a channel reply is answered by the local model first (`inference_mode = local`), what the employee stores through tools in that step is not tied to the conversation, so forgetting the conversation does not reach it.
+- If the employee learns the same thing again in a new conversation, that is new information and is not blocked.
+- Restoring a backup taken before the forget brings back the deleted memories and removes the block. Do not downgrade to a version that does not have this feature after using it.
+- Setting `[memory] forget_source = false` in `config.toml` stops new plans and applies. It does not turn off the dashboard approval, which has no switch.
+
 ---
 
 ## 5. Which one should you use?
@@ -178,6 +263,7 @@ Underneath, this is a soft delete: the record moves to an archive table, an admi
 | Correct something it remembered wrong | Just say the correct version — the old one gets superseded automatically; if the old one came from a more trusted source, approve the review item in the dashboard inbox |
 | Remove one incorrect memory | Hover over it in the memory list and click the trash icon |
 | Make it forget a whole document | Delete that page from the knowledge base |
+| Someone asked it to forget a conversation, a scheduled run or an imported file | Forget by source, see 4.5 |
 | Paste in a company charter so it can look it up later | Just paste it — it auto-files; once confirmed as official knowledge in the curation station, it injects every time |
 | Remove one auto-filed page | Curation Station → Auto-filed → Remove |
 

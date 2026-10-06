@@ -344,7 +344,7 @@ mod tests {
                     predicate: Some("prefers".into()),
                     object: Some("tea".into()),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -357,7 +357,7 @@ mod tests {
                     agent,
                     "met user:alice at the conference",
                 ),
-                TemporalMeta::default(),
+                TemporalMeta::default(), crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -371,7 +371,7 @@ mod tests {
                     predicate: Some("likes".into()),
                     object: Some("coffee".into()),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -423,7 +423,7 @@ mod tests {
                     subject: Some("user_100".into()),
                     predicate: Some("p".into()),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -435,7 +435,7 @@ mod tests {
                     subject: Some("userX100".into()),
                     predicate: Some("p".into()),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -463,7 +463,7 @@ mod tests {
                     object: Some("tea".into()),
                     origin: Some("operator".into()),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -477,7 +477,7 @@ mod tests {
                     object: Some("coffee".into()),
                     origin: Some("channel".into()),
                     ..Default::default()
-                },
+                }, crate::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();

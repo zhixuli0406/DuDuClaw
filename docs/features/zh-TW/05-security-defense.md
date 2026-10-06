@@ -120,11 +120,28 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 
 **員工自己的安全設定。** 對帶員工身分（或身分無法驗證）的呼叫者，它自己 `agent.toml` 的其餘部分以允許清單凍結：只有可編輯的區段能改，其他區段一律受保護，日後版本新增的區段也預設受保護。可編輯的區段是 `[agent]`、`[model]`、`[prompt]`、`[heartbeat]`、`[proactive]`、`[research]`、`[goal_intent]`、`[memory]`、`[skills]`、`[sticker]`、`[cultural_context]`、`[preset]` 與 `[planner]`。這些區段裡，`[agent] role`、`[prompt] cli_bare_mode`（它會讓 Claude CLI 略過 hook）與 `[model] account_pool` 仍凍結，組織欄位 `[agent] reports_to`／`department`／`name` 也一樣；`[capabilities]` 整張表凍結。這份允許清單適用於所有帶員工身分的呼叫者，包括在員工目錄裡手動執行 `claude` 的操作者（見 Guard 1）；較早的組織欄位與 `[capabilities]` 規則照舊對所有呼叫者生效。操作者要改這些區段，請用儀表板，或直接用編輯器改。
 
+**員工自己的 `.mcp.json` 與 CLI 設定。** 帶員工身分（或身分無法驗證）的呼叫者，完全不能寫自己目錄裡任何一層的 `.mcp.json`（Write、Edit、MultiEdit、NotebookEdit；最上層那一個 Bash 規則本來就擋）。gateway 啟動 Claude CLI 時會帶這個檔，CLI 會把裡面列的每一個伺服器都啟動起來，所以只要多加一個指令是直譯器的項目，下一次啟動就能以管理者的系統身分執行任意指令，不需要 Bash 權限。所有已出貨的版本都有這個問題：以前員工可以自己新增「無關的」伺服器。現在新增 MCP 伺服器要走儀表板、在儀表板提出的 MCP 安裝申請（`mcp.install_request`，管理者核准後自動安裝）、expert pack，或由管理者直接編輯，這些都不經過 hook。同樣的呼叫者也不能寫自己目錄裡的 CLI 設定：任何一層的 `.claude/` 底下（設定、hook、自訂斜線指令、子代理、skill）與名為 `.claude.json` 的檔案，以及最上層的 Codex、Gemini、Grok、Antigravity 設定目錄（`.codex/`、`.gemini/`、`.grok/`、`.agents/`）。檔名比對不分大小寫。行為變更：複製到員工目錄裡的專案也是 CLI 會啟動的地方，所以員工可以讀那個專案的 `.claude/`，但不能寫。管理者維持舊規則（`.mcp.json` 只凍結身分鍵）。gateway 也會在每次把員工的 `.mcp.json` 交給 Claude CLI 之前（通道回覆、派工、heartbeat 主動檢查、`duduclaw eval` 的 live 模式、live fork 複製分支之前的上層目錄）與開機時，整筆重新產生 DuDuClaw 項目（指令、參數、環境變數），其他項目原樣保留；檔案無法確認（不是一般檔、讀不到、不是合法 JSON，或 duduclaw 執行檔路徑不是絕對路徑）時這次不啟動，並寫一筆稽核（`mcp_config_unverified`）。這種拒絕是檔案的問題，不是帳號的問題：帳號不會因此進入冷卻，也不會換下一個帳號重試，通道回覆不會改由本地模型或 Direct API 代答，使用者看到的是說明哪位員工設定無法確認的訊息。所有寫 `.mcp.json` 的程式共用的鎖放在 `<home>/locks/`，不在員工目錄裡，員工在那裡建立的檔案或目錄擋不住它。升級前就加入的項目會保留：`duduclaw doctor` 會列出每一個不是 DuDuClaw 寫入的項目（只顯示名稱與指令的檔名，不顯示參數、環境變數或網址），讓管理者逐一確認或移除。把 live fork 分支採用回員工目錄時，不會帶回 `.claude.json`、`.agents/`、`.codex/`、`.gemini/`、`.grok/`，也不會帶回任何一層的 `.claude/`、`.claude.json`、`.mcp.json`。限制：這是 hook，能任意執行 Bash 的員工仍可改檔；Codex、Gemini、Grok、Antigravity 這幾種 runtime 不跑 hook，而它們的 MCP 設定檔（上面四個目錄）同樣在員工目錄下，這類問題在那些 runtime 上沒有被這個修補處理。未以真實 CLI 驗證：Claude Code 會不會讀員工目錄裡的 `.claude.json`（反正已一併凍結）。
+
 依建構方式 fail-closed：新內容無法解析、既有內容無法解析、寫入意圖無法重建，三者全部拒絕。既有的 `agent.toml`、`config.toml` 或 `.mcp.json` 讀不到時也拒絕（以前當成新檔放行）。檔案還不存在則放行，因為建立走的是 `create_agent`，那裡有自己的閘。
 
 合法變更的既有路徑全部保留：MCP `agent_update` 工具與儀表板 `agents.update` RPC，兩者都不經過這個 hook。
 
 ---
+
+## 依來源忘記需要管理員核准
+
+`duduclaw memory forget-source` 會永久刪除記憶，所以前面有三道關。操作步驟見[忘記對話、排程執行或匯入檔案](../../guides/zh-TW/memory-and-knowledge.md#45-忘記對話排程執行或匯入檔案)，機制見[記憶智能](20-memory-intelligence.md#記憶來源與依來源忘記)。
+
+**儀表板核准。** `plan` 會送出一筆核准請求（`action_kind` 為 `memory_forget_source`），綁定計畫 id 與計畫雜湊。這筆請求只能在儀表板決定，也只有管理員能決定；通道按鈕與回覆一律拒絕。`apply --confirm` 只有在該請求已核准、仍指向同一個計畫雜湊、且計畫未過期時才會執行。請求與計畫一起到期（預設 30 分鐘，最長 24 小時）。卡片只放數量與來源標籤，不放記憶內容，並以固定文字說明這筆請求來自本機指令列、系統無法確認是誰下的指令。沒有任何設定能關掉這道核准；`[memory] forget_source = false` 只會停止建立新計畫與套用。
+
+**Bash 規則。** 對帶員工身分或身分未驗證的呼叫者，`agent-file-guard` 的 Bash 通道會拒絕 `duduclaw`、`duduclaw-pro`（含路徑或 `.exe`）後接 `memory forget-source` 或 `memory migrate-namespace` 的指令，任何子指令都擋，連唯讀的 `list` 也一樣。判定結果是 `BlockedOperatorMemoryCommand`，訊息會請員工去找操作者。`migrate-namespace` 以前不在 Bash 通道的涵蓋內。這是減速帶，不是沙箱，擋不住：
+
+- `memory` 與子指令之間插了全域選項，例如 `duduclaw memory --redact on forget-source …`；
+- 用指令替換組出執行檔，例如 `"$(command -v duduclaw)" memory forget-source …`；
+- 把指令字串經管線交給執行檔，例如 `echo memory forget-source … | xargs duduclaw`；
+- 其他能避開指令名稱比對的寫法，以及「這些守衛擋不住什麼」列出的其他繞法。
+
+**AI session 判斷。** 只要程序環境裡有 gateway 替員工程序設定的任何一個變數（即使是空值），指令本身就會拒絕執行：員工身分與 token、回合與對話 id、該回合的使用者訊息序號與時間、派工的 session 與 run id、委派的發送者／來源／深度、hop 深度、回覆通道。操作者自己的終端機不帶這些變數。這項檢查只是第一道。對直接從員工 Bash 執行的指令並不可靠，因為有 Bash 的員工可以把變數 unset。真正的隔離是不授予 Bash，或讓員工跑在任務沙箱裡。以同一個作業系統使用者執行、能跑任意指令並刻意繞過檔案守門的員工，仍然可以直接改寫本機資料庫（`approvals.db`、`memory.db`）。
 
 ## 支撐層
 
@@ -153,6 +170,7 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 - **Hook 看得到的是 Claude Code 自己的工具呼叫，不是 MCP 工具呼叫。** MCP 有自己的閘（scope、授權、`denied_tools`）；hook 是內建 `Write`／`Edit`／`Read`／`Bash` 那面的第二道鎖。
 - **`agent-file-guard` 的 Bash 通道是啟發式。** 它讀的是指令文字，下列情況都擋不住：由變數（`$DUDUCLAW_HOME`，以及資料目錄在預設位置時的 `~/.duduclaw`、`$HOME/.duduclaw` 除外）、指令替換或其他計算產生的路徑；編碼後的指令；先寫成腳本再執行；把 here-document 餵給直譯器；別名與函式；透過環境變數讓之後啟動的 shell 載入某個檔案；清單內唯讀指令沒有被考慮到的寫檔選項；沒有寫明目的地的解壓縮或下載指令，它們寫進目前的工作目錄，而這條通道不判斷目前目錄，所以先切換進資料目錄再執行就不會被擋；在同一條指令裡先建立連結再透過它寫入；硬連結；以及檢查與實際執行之間的時間差。
 - **Bash 通道也會誤擋一些無害的指令。** 受檢位置上的路徑解析失敗時一律拒絕，即使路徑在資料目錄以外；懸空的符號連結即使指向資料目錄以外也會被拒絕。
+- **只限操作者的記憶指令靠減速帶與核准把關，不是沙箱。** `memory forget-source` 與 `memory migrate-namespace` 的 Bash 規則擋不住子指令前的全域選項、用指令替換組出的執行檔名稱與經管線傳入的指令，AI session 判斷也能靠 unset 變數繞過。真正的關卡是儀表板核准，見[依來源忘記需要管理員核准](#依來源忘記需要管理員核准)。
 - **`agent-file-guard` 不涵蓋 `Read`。** 留出集與稽核紀錄員工仍然讀得到，hook 只擋寫入。
 - **只有 Claude runtime 會跑這些 hook。** Codex、Gemini、Antigravity 與其他 runtime 靠各自的沙箱旗標。
 - **員工自己目錄裡的狀態檔不在保護範圍**，只有 `SOUL.md`、`CONTRACT.toml`、身分檔（`.mcp.json`、`.claude/settings.json`）與 `agent.toml` 受保護。共用的 `attachments/` 每位員工都能寫。

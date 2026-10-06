@@ -285,6 +285,35 @@ pub fn valid_internal_keys(home_dir: &Path) -> Vec<String> {
     out
 }
 
+/// For a process that is not the gateway (`duduclaw eval`, `duduclaw acp`)
+/// but runs the `.mcp.json` spawn gate: when this process has no MCP API key
+/// (neither `DUDUCLAW_MCP_API_KEY` in its environment nor one recorded with
+/// `duduclaw_core::set_internal_mcp_api_key`), record a currently valid
+/// internal key read from `config.toml`. Without it the gate refuses every
+/// employee whose `.mcp.json` entry carries the key, because it will not
+/// rewrite that entry without one. Read-only: it never mints or rotates a
+/// key (only the gateway does, at boot). Returns whether a key was adopted.
+pub fn adopt_internal_key_for_process(home_dir: &Path) -> bool {
+    let has_key = duduclaw_core::mcp_forward_env_vars()
+        .iter()
+        .any(|(k, _)| k == duduclaw_core::ENV_MCP_API_KEY);
+    match adoptable_key(has_key, valid_internal_keys(home_dir)) {
+        Some(key) => {
+            duduclaw_core::set_internal_mcp_api_key(key);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Pure half of [`adopt_internal_key_for_process`].
+fn adoptable_key(process_has_key: bool, valid: Vec<String>) -> Option<String> {
+    if process_has_key {
+        return None;
+    }
+    valid.into_iter().find(|k| !k.trim().is_empty())
+}
+
 /// Whether `presented` is a currently valid `gateway-internal` key in
 /// `<home>/config.toml [mcp_keys]` (the acceptance rules of
 /// [`valid_internal_keys`]). The comparison runs over every valid entry
@@ -308,6 +337,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(test)]
 mod verify_tests {
+    #[test]
+    fn a_process_adopts_a_valid_key_only_when_it_has_none() {
+        assert_eq!(adoptable_key(true, vec!["k1".into()]), None);
+        assert_eq!(adoptable_key(false, vec![]), None);
+        assert_eq!(adoptable_key(false, vec![" ".into(), "k2".into()]), Some("k2".into()));
+    }
+
     use super::*;
 
     fn write(dir: &Path, body: &str) {
