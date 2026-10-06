@@ -48,9 +48,17 @@ async fn session_with_env(
     ]);
     env.extend(extra_env.iter().cloned());
     // Production spawn receives only per-child env; no set_var impersonation.
-    let client = McpClient::connect(CLI, &["mcp-server".into()], &env, Duration::from_secs(30))
-        .await
-        .unwrap();
+    // Child stderr is inherited so a server that exits before the handshake
+    // leaves its reason in the captured test output (not a bare `Closed`).
+    let client = McpClient::connect_with_stderr(
+        CLI,
+        &["mcp-server".into()],
+        &env,
+        Duration::from_secs(30),
+        std::process::Stdio::inherit(),
+    )
+    .await
+    .unwrap();
     Session {
         client,
         id,
