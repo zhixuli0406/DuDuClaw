@@ -398,6 +398,7 @@ impl MethodHandler {
         );
         let mut driver = crate::goal_loop::GoalLoopDriver::new(ts, mq, cfg)
             .with_home_dir(self.home_dir.clone())
+            .with_instance_lock(self.home_dir.clone())
             .with_concurrency_limit(
                 concurrency_limit,
                 concurrency_cfg.concurrency_lease_ttl_secs,

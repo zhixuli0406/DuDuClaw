@@ -593,3 +593,56 @@ impl ApprovalBroker {
         Ok(())
     }
 }
+
+/// P2-A (read-only): what a stopped task tree still has in the approval
+/// store — pending requests to invalidate and side-effect operations to
+/// report (prepared = will be refused, executing = cannot be recalled,
+/// uncertain = needs a human). Returns `(pending request ids, (operation id,
+/// state))`.
+impl ApprovalBroker {
+    #[allow(clippy::type_complexity)]
+    pub async fn task_bound_records(
+        &self,
+        task_ids: &[String],
+    ) -> Result<(Vec<ApprovalId>, Vec<(String, OperationState)>), String> {
+        let ids = serde_json::to_string(task_ids).map_err(|e| e.to_string())?;
+        let conn = self.store.conn.lock().await;
+        let mut q = conn
+            .prepare(
+                "SELECT id FROM approvals WHERE status = 'pending'
+                   AND (json_extract(payload,'$.task_id') IN (SELECT value FROM json_each(?1))
+                     OR json_extract(binding_json,'$.task_id') IN (SELECT value FROM json_each(?1)))",
+            )
+            .map_err(|e| e.to_string())?;
+        let pending_requests = q
+            .query_map(params![ids], |r| Ok(ApprovalId::from(r.get::<_, String>(0)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut q = conn
+            .prepare(
+                "SELECT operation_id, state FROM approval_operations
+                  WHERE json_extract(binding_json,'$.task_id') IN (SELECT value FROM json_each(?1))",
+            )
+            .map_err(|e| e.to_string())?;
+        let operations = q
+            .query_map(params![ids], |r| {
+                let state: String = r.get(1)?;
+                Ok((
+                    r.get::<_, String>(0)?,
+                    match state.as_str() {
+                        "prepared" => OperationState::Prepared,
+                        "executing" => OperationState::Executing,
+                        "succeeded" => OperationState::Succeeded,
+                        "failed" => OperationState::Failed,
+                        // Anything unknown reads as "needs a human" (fail closed).
+                        _ => OperationState::Uncertain,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok((pending_requests, operations))
+    }
+}

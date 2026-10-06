@@ -8,6 +8,8 @@ mod authority_cases;
 mod criteria_cases;
 mod goal_cases;
 mod ledger_cases;
+mod needs_human_guard_cases;
+mod responsibility_store_cases;
 mod plan_cases;
 mod pure_cases;
 mod review_cases;

@@ -49,7 +49,21 @@ pub const REMIND_MIN_TTL_SECONDS: i64 = 120;
 /// NOT receive the generic pending-approval push (it would double-notify with
 /// a second, conflicting set of buttons). `goal_kickoff` is pushed by
 /// `goal_notify::notify_goal_kickoff` with its own retry bookkeeping.
-const SELF_NOTIFYING_KINDS: &[&str] = &["goal_kickoff"];
+/// P2-A M-3: kinds that never get the generic "about to auto-deny"
+/// reminder: a responsibility question (its notice goes through the
+/// responsibility notifier and its per-window cap) and a terminal-filed
+/// responsibility change (per-target hourly cap). They still expire.
+pub(crate) const NO_REMINDER_KINDS: &[&str] = &[
+    crate::responsibility::DECISION_KIND,
+    crate::responsibility::operator_gate::ACTION_KIND,
+];
+
+const SELF_NOTIFYING_KINDS: &[&str] = &[
+    "goal_kickoff",
+    // P2-A S-M7: pushed as a responsibility notice (policy, proactive gate,
+    // durable per-window cap), never by the generic approval push.
+    crate::responsibility::DECISION_KIND,
+];
 
 /// Hard cap on the generic push so a hung channel API can never stall the
 /// caller that is filing the approval.

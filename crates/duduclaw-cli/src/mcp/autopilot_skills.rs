@@ -303,6 +303,10 @@ pub(crate) fn strip_frontmatter(content: &str) -> String {
 ///
 /// Best-effort: failures are logged but never fatal — the caller has
 /// already persisted the authoritative row in `tasks.db` / `activity`.
+/// The key [`append_bus_event`] stamps with the emitting employee
+/// (`duduclaw_gateway::responsibility::EVENT_EMITTED_BY_KEY`).
+const EMITTED_BY_KEY: &str = duduclaw_gateway::responsibility::EVENT_EMITTED_BY_KEY;
+
 pub(crate) async fn append_bus_event(home_dir: &Path, event: &str, payload: &Value) {
     let bus = match duduclaw_gateway::events_store::EventBusStore::open(home_dir) {
         Ok(b) => b,
@@ -311,6 +315,19 @@ pub(crate) async fn append_bus_event(home_dir: &Path, event: &str, payload: &Val
             return;
         }
     };
+    // P2-A E-M4: the employee process that emitted the event, so a
+    // responsibility never wakes on its own owner's events. Server-stamped,
+    // never taken from the tool arguments.
+    let mut payload = payload.clone();
+    if let (Some(obj), Ok(agent)) = (
+        payload.as_object_mut(),
+        std::env::var(duduclaw_core::ENV_AGENT_ID),
+    ) {
+        let agent = agent.trim();
+        if !agent.is_empty() {
+            obj.insert(EMITTED_BY_KEY.into(), Value::String(agent.to_string()));
+        }
+    }
     let payload_str = payload.to_string();
     if let Err(e) = bus.append(event, &payload_str).await {
         warn!(error = %e, event = %event, "append events.db");

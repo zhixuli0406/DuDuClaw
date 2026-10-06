@@ -442,6 +442,16 @@ async fn system_sender_name_as_identity_is_untrusted() {
     let result = get_default_agent(tmp.path()).await;
     assert_eq!(result, duduclaw_core::UNTRUSTED_AGENT_ID);
 
+    // P2-A L4-2: an employee created under a queue sender name before it
+    // was reserved (`heartbeat-scheduler`, `workflow`) is untrusted too.
+    write_default_agent_config(tmp.path(), "agnes");
+    for name in duduclaw_core::RESERVED_QUEUE_SENDERS {
+        set_claim(name, "");
+        let result = get_default_agent(tmp.path()).await;
+        clear_claim();
+        assert_eq!(result, duduclaw_core::UNTRUSTED_AGENT_ID, "{name}");
+    }
+
     // An ordinary id is unaffected.
     set_claim("sales-rep", "");
     let result = get_default_agent(tmp.path()).await;

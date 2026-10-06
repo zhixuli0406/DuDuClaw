@@ -40,6 +40,7 @@ still reaches the real gate and is still refused, with the gate's own message.
 | `computer_use` | `agent.toml [capabilities]` | 8 `computer_*` tools hidden (see [`computer_*`](#computer_--sessions-run-by-the-gateway) below) |
 | `db_sources` | `agent.toml [capabilities]` | 4 `db_*` tools hidden |
 | `[fork] enabled` | `agent.toml` | 6 forking tools hidden |
+| `[responsibilities] enabled` | `config.toml` | 3 `responsibility_*` tools hidden (see [responsibility tools](#responsibility_get--responsibility_followup--responsibility_ask--responsibility-tools) below) |
 | `scoped_tools` | `agent.toml [capabilities]` + live grant | Hidden until a task-scoped grant is active |
 
 A freshly created agent has none of these opted in, which is the point: the
@@ -98,6 +99,27 @@ listed for every caller and check the relationship per call:
   goal-mode task (`acceptance_criteria` is refused for every MCP caller), and
   cannot add, remove or reorder tags starting with `outcome:` or `grant:` or the
   `auto-research` tag, in `tasks_update` or in `tasks_create`'s `tags`.
+- **Parent of a new task**: the gateway tells the MCP server which task the
+  current round works on (`DUDUCLAW_TASK_ID`, the same value approval cards
+  carry). When that task is the caller's own and belongs to a
+  [continuous responsibility](continuous-responsibilities.md) run (the run's
+  task or any task under it, including a sub-task woken by the task board),
+  `tasks_create` (including `kind="goal"`) places the new task under it when no
+  `parent_task_id` is given, and a `parent_task_id` the employee gives must be
+  that task or one of its sub-tasks, or the call is refused. A value that is
+  present but empty or malformed is refused, never read as "no round". In every
+  other case (an ordinary goal round, a task-board wake-up of a task outside
+  any run, no round information) there is no default parent. New in this
+  release for every caller: a given `parent_task_id` needs a relationship to
+  the parent (assignee, claimer, creator, or the delegation policy), where v1.69
+  wrote it unchecked; `kind="goal"` accepts `parent_task_id`, which v1.69
+  ignored; and a task can hold at most 200 unfinished sub-tasks created by AI
+  employees (a `schedule`, routine or reminder, is not a sub-task). The round is
+  not passed to a server started from Bash, or under the Grok and Gemini CLI
+  runtimes; a task created there is not placed under a run unless the employee
+  names the run, and is not counted toward its spending. Correct placement
+  also relies on the employee not being able to rewrite the `duduclaw` entry of
+  its own `.mcp.json`, a separate platform fix that must ship first.
 - **Routines**: `update_cron_task`, `delete_cron_task`, `pause_cron_task` and
   `run_cron_task` need the caller to be the employee the routine runs as, or to
   have the relationship with it. Addressed by `name`, they act on exactly one
@@ -314,6 +336,30 @@ different name works. Operators can reuse the name from the dashboard or a
 terminal. Over HTTP with a non-internal key, both tools act as that key's own
 client id. Details:
 [Delegation isolation](../features/37-delegation-isolation.md#a-removed-employees-name-stays-reserved).
+
+### `responsibility_get` / `responsibility_followup` / `responsibility_ask` — responsibility tools
+
+The three tools for [continuous responsibilities](continuous-responsibilities.md).
+They are listed only while `config.toml [responsibilities] enabled` is true and
+the caller is an employee identity (external clients never see them), and every
+call is refused while the feature is off. Like the `tasks_*` tools they sit
+behind the Admin scope, which the gateway's own key carries.
+
+| Tool | Who may call | Rules |
+|---|---|---|
+| `responsibility_get` | Any employee; an operator key may read any responsibility | No `responsibility_id`: lists the caller's own. With an id: the summary (schedule, subscriptions, window spend and runs, the open run, `cost_not_counted`). Another employee's responsibility reads as not found unless the delegation policy relates the caller to its owner |
+| `responsibility_followup` | The owning employee, only while its own run of that responsibility is open and the responsibility is active | One one-shot wake-up at `due_at` (RFC 3339), at least `min_wake_interval_secs` from now and no later than `stop_at`. It counts toward the window's run limit and is refused when that limit is used up; it is never silently moved to another time |
+| `responsibility_ask` | Same as `responsibility_followup` | One question (at most 1,000 characters) with up to 5 options (each at most 1,000 characters); `ttl_secs` defaults to one day and is held between 60 seconds and `stop_at`. The question is scanned for prompt injection and shown to the operator as quoted text cut to 200 characters, with a warning when the scan matched. Any push goes through the responsibility's notification gates and per-window cap. The answer wakes the next run as data and grants nothing. Stopping the run withdraws the question |
+
+A responsibility holds at most one live wake-up armed by its employee, so a
+pending `responsibility_followup` and a pending `responsibility_ask` exclude
+each other. Operator keys cannot use the two wake-up tools, since that would be
+acting as the employee. Closed error codes: `not_found`, `not_active`,
+`no_open_occurrence`, `invalid_due_at`, `period_occurrence_limit`,
+`agent_followup_limit`, `epoch_changed`, `invalid_question`.
+
+There is no tool for creating, changing, resuming or re-enabling a
+responsibility, and none for steering a task.
 
 ### `memory_store` / `user_profile_record` / `decision_resolve` / `wiki_write` — sources and refusals
 

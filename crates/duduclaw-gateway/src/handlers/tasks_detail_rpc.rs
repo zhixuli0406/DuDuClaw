@@ -436,6 +436,7 @@ impl MethodHandler {
                 .get("plan_first")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            parent_task_id: None,
             source_label: "儀表板".to_string(),
         };
         let created = match crate::goal_create_core::create_goal_task(

@@ -64,6 +64,11 @@ pub struct GoalCreateRequest {
     pub require_beliefs: bool,
     /// I-1c: plan first, park for human approval instead of executing.
     pub plan_first: bool,
+    /// The task this goal hangs under (P2-A H-2): for an employee creating a
+    /// goal during a round, the host decides it (the round's task), so the
+    /// goal lands in that run's tree — its cost is counted there and a stop
+    /// of the run reaches it. `None` ⇒ a top-level goal (dashboard, chat).
+    pub parent_task_id: Option<String>,
     /// Human-readable origin used in the `goal_loop.created` activity line
     /// (e.g. `儀表板` / `AI 員工`). Empty ⇒ no prefix. Display only — never a
     /// permission or routing input.
@@ -149,6 +154,7 @@ pub async fn create_goal_task(
     );
     task.status = "todo".to_string();
     task.goal_mode = true;
+    task.parent_task_id = req.parent_task_id.clone();
     let mut acceptance_criteria = acceptance.unwrap_or_else(|| description.clone());
     if req.require_beliefs {
         acceptance_criteria.push_str("；至少一筆 belief_submit 申報且已知結果者皆已結算");
@@ -258,6 +264,7 @@ mod tests {
             risk_boundary: None,
             require_beliefs: false,
             plan_first: false,
+            parent_task_id: None,
             source_label: String::new(),
         }
     }
@@ -283,6 +290,23 @@ mod tests {
             Some("整理報表")
         );
         assert_eq!(created.task.priority, "medium");
+    }
+
+    /// Round 4 (H-2a): a goal created during a round carries the parent the
+    /// caller resolved (the round's task), so its spend counts toward it.
+    #[tokio::test]
+    async fn goal_create_core_keeps_the_parent() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let store = store_in(home.path()).await;
+        let parent = create_goal_task(home.path(), &store, req("a"))
+            .await
+            .expect("parent");
+        let mut r = req("a");
+        r.parent_task_id = Some(parent.task.id.clone());
+        let child = create_goal_task(home.path(), &store, r).await.expect("child");
+        assert_eq!(child.task.parent_task_id.as_deref(), Some(parent.task.id.as_str()));
+        let stored = store.get_task(&child.task.id).await.unwrap().unwrap();
+        assert_eq!(stored.parent_task_id.as_deref(), Some(parent.task.id.as_str()));
     }
 
     #[tokio::test]

@@ -45,6 +45,16 @@ impl TaskStore {
         if !matches!(status.as_str(), "pending" | "revising") || claimed_by.is_some() {
             return Ok(ClaimOutcome::NotClaimable);
         }
+        // P2-A M-2: nothing inside a stopped tree is claimed (members the
+        // batch cancel has not reached yet, or beyond the scan limit).
+        let stopped: bool = tx
+            .query_row(&format!("SELECT {}", in_stop_tree_sql("?1")), params![id], |r| {
+                r.get(0)
+            })
+            .map_err(|e| format!("atomic claim: stop check: {e}"))?;
+        if stopped {
+            return Ok(ClaimOutcome::NotClaimable);
+        }
 
         // Dependency gate inside the same transaction (HIGH-1): every
         // depends_on id must be an existing task in status `done`.

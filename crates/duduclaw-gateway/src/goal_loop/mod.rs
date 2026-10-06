@@ -116,6 +116,7 @@ const KICKOFF_TTL_SECS: i64 = 3600;
 mod config;
 mod dispatch;
 mod driver;
+mod durable;
 mod enqueue;
 mod escalate;
 mod kickoff;
@@ -386,6 +387,24 @@ pub struct GoalLoopDriver {
     /// RFC-27: crash-recovery TTL (seconds) for concurrency leases, renewed for
     /// every held lease each tick.
     concurrency_ttl_secs: u64,
+    /// P2-A: where responsibility budgets read measured spend. `None` ⇒
+    /// `<home>/cost_telemetry.db` (read-only). Tests inject a fixed source.
+    cost_source: Option<Arc<dyn crate::responsibility::CostSource>>,
+    /// P2-A C8: responsibility notice scoring and delivery.
+    notice_scorer: Arc<dyn crate::responsibility::notify::NoticeScorer>,
+    notice_sender: Arc<dyn crate::responsibility::notify::NoticeSender>,
+    /// P2-A E-H1: the responsibility switch as last seen (`None` = not yet).
+    /// An on → off transition marks the event cursor paused, once.
+    resp_feature_seen: std::sync::Mutex<Option<bool>>,
+    /// S9 single-gateway rule: when set, the responsibility wake pass, the
+    /// stop reconciliation, the steering sweep and the durable-handoff repair
+    /// run only while this process holds that home's gateway lock
+    /// (`duduclaw_core::gateway_instance`). `None` (tests, embedded drivers)
+    /// ⇒ always run.
+    instance_lock_home: Option<PathBuf>,
+    /// The boot durable-handoff repair was skipped because the lock was not
+    /// held yet; run it on the first tick that holds it.
+    durable_repair_pending: std::sync::atomic::AtomicBool,
 }
 
 /// Retry cap for a transient ([`crate::goal_notify::NotifyOutcome::SendFailed`])

@@ -73,6 +73,25 @@ pub const SYSTEM_SENDERS: [&str; 6] = [
     "autopilot",
 ];
 
+/// Queue `sender` values the gateway itself writes on `message_queue` rows
+/// that are not in [`SYSTEM_SENDERS`] (P2-A third review L3-2). The
+/// dispatcher gives these rows meaning (heartbeat wake-up attribution and
+/// stop fencing; workflow hand-offs), so no employee may carry one of these
+/// names: an employee named `heartbeat-scheduler` would otherwise send
+/// queue rows the dispatcher reads as the heartbeat's.
+pub const RESERVED_QUEUE_SENDERS: [&str; 2] = ["heartbeat-scheduler", "workflow"];
+
+/// Is this one of [`RESERVED_QUEUE_SENDERS`]? Exact after trimming,
+/// ASCII-case-insensitive. Identity checks treat such a name like a system
+/// sender: an employee created under it before it was reserved resolves to
+/// the untrusted sentinel (P2-A fourth review L4-2).
+pub fn is_reserved_queue_sender(name: &str) -> bool {
+    let s = name.trim();
+    RESERVED_QUEUE_SENDERS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(s))
+}
+
 /// Sender id stamped on bus tasks that entered through the ACP `message/send`
 /// endpoint. Intentionally **not** in [`SYSTEM_SENDERS`]; exposed as a constant
 /// so the opt-in (`config.toml [acp] trusted = true`) has one spelling.
@@ -109,6 +128,7 @@ pub fn is_system_sender(sender: &str) -> bool {
 ///   `agents.create`; the probe itself mints its token directly through
 ///   `agent_identity_env_vars`, which never consults this list, so the probe
 ///   keeps working unaffected.
+/// - [`RESERVED_QUEUE_SENDERS`] — queue sender names the dispatcher acts on.
 /// - any `__…` id — the namespace gateway-internal synthetic senders use
 ///   (e.g. `__deferred_gvu__`, which `is_valid_agent_id` otherwise accepts).
 ///
@@ -127,6 +147,7 @@ pub fn is_reserved_agent_id(id: &str) -> bool {
         .chain(std::iter::once(&ACP_CLIENT_SENDER))
         .chain(std::iter::once(&"default"))
         .chain(std::iter::once(&"doctor-probe"))
+        .chain(RESERVED_QUEUE_SENDERS.iter())
         .any(|known| known.eq_ignore_ascii_case(s))
 }
 
@@ -1064,6 +1085,19 @@ mod tests {
         // something that merely contains the reserved word.
         assert!(!is_reserved_agent_id("doctor-probe-2"));
         assert!(!is_reserved_agent_id("my-doctor-probe"));
+    }
+
+    /// P2-A L3-2: queue sender names the dispatcher acts on cannot be
+    /// employee names (an employee called `heartbeat-scheduler` would send
+    /// rows the dispatcher reads as heartbeat wake-ups).
+    #[test]
+    fn queue_sender_names_are_reserved() {
+        for name in RESERVED_QUEUE_SENDERS {
+            assert!(is_reserved_agent_id(name), "{name}");
+            assert!(is_reserved_agent_id(&name.to_ascii_uppercase()), "{name}");
+        }
+        assert!(is_reserved_agent_id("goal-loop-driver"));
+        assert!(!is_reserved_agent_id("heartbeat-scheduler-2"));
     }
 
     #[test]

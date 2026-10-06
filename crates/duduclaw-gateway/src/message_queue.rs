@@ -100,6 +100,15 @@ pub struct QueueMessage {
 // Store
 // ---------------------------------------------------------------------------
 
+/// P2-A M-5: open goal-loop / heartbeat messages (served by
+/// `idx_mq_sender_status`, pinned by a query-plan test).
+const OPEN_TASK_MESSAGES_SQL: &str = "SELECT id, sender, target, payload, status, retry_count, \
+     delegation_depth, origin_agent, sender_agent, error, response, created_at, acked_at, \
+     completed_at, reply_channel, turn_id, session_id, upstream_unknown \
+     FROM message_queue \
+     WHERE sender IN ('goal-loop-driver', 'heartbeat-scheduler') \
+       AND status IN ('pending', 'acked', 'processing')";
+
 /// Thread-safe SQLite message queue.
 pub struct MessageQueue {
     conn: Mutex<Connection>,
@@ -145,6 +154,7 @@ impl MessageQueue {
              CREATE INDEX IF NOT EXISTS idx_mq_status ON message_queue(status);
              CREATE INDEX IF NOT EXISTS idx_mq_target ON message_queue(target);
              CREATE INDEX IF NOT EXISTS idx_mq_created ON message_queue(created_at);
+             CREATE INDEX IF NOT EXISTS idx_mq_sender_status ON message_queue(sender, status);
 
              -- Delegation callbacks: maps bus message_id → originating channel context
              -- so the dispatcher can forward sub-agent responses back to the user.
@@ -440,6 +450,55 @@ impl MessageQueue {
         })
     }
 
+    /// P2-A M-5: every still-open (pending / acked / processing) message of
+    /// the goal-loop driver and the heartbeat scheduler — one indexed query
+    /// for a stop reconciliation, instead of one scan per tree member.
+    pub async fn open_task_messages(&self) -> Result<Vec<QueueMessage>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(OPEN_TASK_MESSAGES_SQL)
+            .map_err(|e| format!("prepare open task messages: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| Self::row_to_message(row))
+            .map_err(|e| format!("query open task messages: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect open task messages: {e}"))
+    }
+
+    /// P2-A: every goal-loop work message for one task — the fixed-id
+    /// durable form (`goal:<task>:<iter>`) and the marker form
+    /// (`[goal-loop task_id=<task> iter=…]` at the start of the payload).
+    /// Read-only; used by stop reconciliation.
+    /// Only rows the goal-loop driver enqueued count: a payload carrying a
+    /// forged `[goal-loop task_id=…` marker from any other sender is not a
+    /// round of that task (P2-A S-L13).
+    pub async fn goal_messages_for_task(&self, task_id: &str) -> Result<Vec<QueueMessage>, String> {
+        let escape = |s: &str| {
+            s.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        };
+        let id_pattern = format!("goal:{}:%", escape(task_id));
+        let marker_pattern = format!("[goal-loop task_id={} iter=%", escape(task_id));
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
+                 origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
+                 reply_channel, turn_id, session_id, upstream_unknown \
+                 FROM message_queue \
+                 WHERE sender = 'goal-loop-driver' \
+                   AND (id LIKE ?1 ESCAPE '\\' OR payload LIKE ?2 ESCAPE '\\') \
+                 ORDER BY created_at ASC",
+            )
+            .map_err(|e| format!("prepare goal messages: {e}"))?;
+        let rows = stmt
+            .query_map(params![id_pattern, marker_pattern], |row| Self::row_to_message(row))
+            .map_err(|e| format!("query goal messages: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect goal messages: {e}"))
+    }
+
     /// Count messages by status.
     pub async fn count_by_status(&self) -> Result<Vec<(String, i64)>, String> {
         let conn = self.conn.lock().await;
@@ -545,6 +604,25 @@ pub struct DelegationCallback {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Third review L3-9: the stop reconciliation's queue read uses the
+    /// `(sender, status)` index, not a table scan.
+    #[tokio::test]
+    async fn open_task_messages_uses_the_sender_status_index() {
+        let tmp = TempDir::new().unwrap();
+        let q = MessageQueue::open(tmp.path()).unwrap();
+        let conn = q.conn.lock().await;
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {OPEN_TASK_MESSAGES_SQL}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let text = plan.join(" | ");
+        assert!(text.contains("idx_mq_sender_status"), "{text}");
+        assert!(!text.contains("SCAN message_queue"), "{text}");
+    }
 
     fn sample_msg(id: &str, reply_channel: Option<&str>) -> QueueMessage {
         QueueMessage {

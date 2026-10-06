@@ -345,6 +345,9 @@ fn apply_simple_bools(table: &mut toml::Table, params: &Value, out: &mut V168Out
         ("night.llm_enabled", &["night"], "llm_enabled"),
         ("acp.trusted", &["acp"], "trusted"),
         ("integrations.github", &["integrations"], "github"),
+        // P2-A: both default off, both re-read on every driver tick / RPC.
+        ("responsibilities.enabled", &["responsibilities"], "enabled"),
+        ("goal_loop.steering_enabled", &["goal_loop"], "steering_enabled"),
     ];
     for (path, section, key) in KEYS {
         if let Some(v) = bool_param(params, path)? {

@@ -195,6 +195,7 @@ resume_on_restart = "pause"  # What happens to in-flight goal tasks on gateway r
 progress_report_minutes = 10  # How long a claimed task can go without a progress signal before one report fires; `0` disables it (see "Stall-timeout progress reports"). Default 10
 tool_streak_advisory = true   # Whether to inject a reminder at 3/5/8 consecutive calls to the same tool with the same arguments (see "Tool streak advisory"). Default true
 criteria_ledger = "report"    # Per-criterion acceptance ledger: off / report / enforce (see "Acceptance ledger"). Default report
+steering_enabled = false      # Directions for the next round from the task page (see "Directions and stopping on the task page"). Default false
 
 [dispatch_guard]        # Feedback-path circuit breaker (guards against self-reinforcing loops)
 window_secs = 60        # Sliding window length (seconds). Default 60
@@ -696,6 +697,15 @@ A plan is guidance, not a pass that skips acceptance. Once execution finishes it
 ### When the planner fails
 
 The utility-LLM call that drafts the plan can itself fail (timeout, a transport error, or an entirely blank reply). In that case the task still fails closed and sits at `needs_human`, but with its category changed to `infra` (system problem) instead of `blocked_needs_decision`, and with no `plan_pending` attached. Approving a task like this only ever releases it into a first round with "no plan to inject," never a plan vanishing or being silently skipped.
+
+---
+
+## Directions and stopping on the task page
+
+The task detail page has two controls for a goal task in progress. Full rules are in [Continuous responsibilities, mid-run directions and stopping a task](continuous-responsibilities.md#the-task-detail-page).
+
+- **Direction for the next round** (needs `[goal_loop] steering_enabled = true`, off by default): a note of up to 4,000 characters handed to the AI employee when the next round is dispatched. The current round is not interrupted. A note counts as delivered only when its round was actually dispatched ("Queued for round N"); a round that was refused or failed to dispatch gives its notes back to the queue. Notes never touch the frozen acceptance baseline and the judge never sees them. A round carrying notes runs with the single employee, not as a team round.
+- **Stop task**: cancels the task and every sub-task at once, with a real dashboard identity. A round already running finishes first (`cancel_pending`), so the page reports `stopped` only when nothing is running any more, and `stopped_uncertain` when something cannot be confirmed (a lapsed claim with no finished round, an external action with an unknown result, a tree past the scan limit). The dialog remembers the version you saw when it opened; if the task changed before you confirmed, it says so and waits for you to confirm again. A stopped task cannot be retried or continued; create a new task to redo the work.
 
 ---
 

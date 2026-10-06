@@ -183,7 +183,11 @@ impl FailoverManager {
                 // history — the user sees nothing and the conversation chain
                 // breaks. Route it through the same failover + classified-error
                 // path as a hard error.
-                match runtime.execute(prompt, context).await {
+                match {
+                    #[cfg(test)]
+                    crate::model_call_probe::record("failover_execute");
+                    runtime.execute(prompt, context).await
+                } {
                     Ok(response) if !response.content.trim().is_empty() => {
                         self.record_success(primary).await;
                         // Truthful attribution (live round 3 E2): tell a
@@ -356,7 +360,11 @@ impl FailoverManager {
                     let exec_context = fb_context.as_ref().unwrap_or(context);
 
                     info!(runtime = ?fb, "Trying fallback runtime");
-                    match runtime.execute(prompt, exec_context).await {
+                    match {
+                        #[cfg(test)]
+                        crate::model_call_probe::record("failover_execute");
+                        runtime.execute(prompt, exec_context).await
+                    } {
                         Ok(response) if !response.content.trim().is_empty() => {
                             self.record_success(fb).await;
                             // Truthful attribution (live round 3 E2): this

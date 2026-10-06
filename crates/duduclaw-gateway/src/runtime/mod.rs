@@ -768,11 +768,28 @@ pub fn duduclaw_mcp_server_json_for_home(
         "DUDUCLAW_HOME".to_string(),
         serde_json::Value::String(home_dir.to_string_lossy().to_string()),
     );
+    if let Some((k, v)) = round_task_env() {
+        env.insert(k, serde_json::Value::String(v));
+    }
     Some(serde_json::json!({
         "command": bin.to_string_lossy(),
         "args": ["mcp-server"],
         "env": serde_json::Value::Object(env),
     }))
+}
+
+/// `(DUDUCLAW_TASK_ID, task)` when this call runs inside a goal round's (or
+/// heartbeat wake-up's) cost attribution scope: the one host-provided "task
+/// this round runs for" (F5-D [`duduclaw_core::ENV_TASK_ID`]). Every runtime
+/// passes it to its MCP server from here, so approval cards (F5-D) and the
+/// parent of tasks created during a responsibility run (P2-A H-2) read the
+/// same value. Same validity rule as `duduclaw_core::host_task_id`.
+pub fn round_task_env() -> Option<(String, String)> {
+    GOAL_ROUND_ATTRIBUTION
+        .try_with(|g| g.episode_id.clone())
+        .ok()
+        .filter(|id| duduclaw_core::is_valid_agent_id(id))
+        .map(|id| (duduclaw_core::ENV_TASK_ID.to_string(), id))
 }
 
 /// Format conversation history as an XML-delimited prompt prefix.
