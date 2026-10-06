@@ -89,7 +89,16 @@ pub(crate) fn clamp_limit(args: &Value, default: i64, max: i64) -> i64 {
     n.max(1).min(max)
 }
 
-pub(crate) async fn handle_tasks_list(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+/// List tasks. `default_agent` is the default `assigned_to` filter; an AI
+/// employee caller (`actor` = `Agent`) only sees tasks the task audience lets
+/// it read (`agent_may_read_task_row`: open tasks, its own, or a list naming
+/// it); operators are unrestricted.
+pub(crate) async fn handle_tasks_list(
+    args: &Value,
+    home_dir: &Path,
+    default_agent: &str,
+    actor: RecordActor<'_>,
+) -> Value {
     let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
@@ -104,10 +113,17 @@ pub(crate) async fn handle_tasks_list(args: &Value, home_dir: &Path, default_age
         _ => Some(default_agent),
     };
 
-    let rows = match store.list_tasks(status, assigned_to, priority).await {
+    let mut rows = match store.list_tasks(status, assigned_to, priority).await {
         Ok(r) => r,
         Err(e) => return tool_error(&format!("list tasks: {e}")),
     };
+    if let Some(viewer) = actor.agent() {
+        rows.retain(|row| {
+            duduclaw_gateway::review_evidence::audience::agent_may_read_task_row(
+                home_dir, viewer, row,
+            )
+        });
+    }
     let limit = clamp_limit(args, 20, 100) as usize;
     let tasks: Vec<Value> = rows.iter().take(limit).map(task_row_to_json).collect();
     tool_text(

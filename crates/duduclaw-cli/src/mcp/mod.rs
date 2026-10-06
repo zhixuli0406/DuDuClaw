@@ -327,3 +327,6 @@ mod round_parent_tests;
 /// Pre-`RecordActor` handler signatures for the existing tests.
 #[cfg(test)]
 mod caller_shims;
+// Task audience (U6) in `tasks_list` / `activity_list`.
+#[cfg(test)]
+mod task_audience_mcp_tests;

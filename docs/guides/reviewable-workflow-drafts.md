@@ -51,7 +51,7 @@ Every live update the gateway sends a dashboard tab is checked against that tab'
 
 ### Known limits
 
-- AI employees read tasks through their own tools (`tasks_list`, the task board in their prompt) under their own access rules, without the list. The list limits what people see on the dashboard and in chats.
+- AI employees read tasks through their own tools (`tasks_list`, `activity_list`, the task board in their prompt). A task whose list limits it is shown there only to the employees it belongs to (assignee, claimer, creator) and to an employee the list names as `role:<employee id>`; a task whose packets cannot be read only to the employees it belongs to. Operators' MCP calls are not limited. The list otherwise limits what people see on the dashboard and in chats.
 - The log stream shows everything the gateway logs, across all AI employees, to every Manager and Admin.
 - A dashboard tab opened before the first account was created keeps the gateway administrator's access until it is closed.
 

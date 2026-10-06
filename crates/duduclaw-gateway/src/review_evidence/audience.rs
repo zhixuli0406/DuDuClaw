@@ -108,6 +108,60 @@ pub fn channel_may_read_task(channel: &str, audience: &TaskAudience) -> bool {
     }
 }
 
+/// Whether AI employee `agent_id` may see a task through its own task tools
+/// (MCP `tasks_list`, `activity_list`) and the prompt task board.
+///
+/// The audience limits people and channels, not the employee whose work the
+/// task is: an owner (`owners` = the task's assignee, claimer and creator,
+/// empty strings ignored) always reads it, like an Admin on the dashboard.
+/// Any other employee reads an open task as before, a limited one only when
+/// the list names it as `role:<agent_id>` (exact), and an unreadable one
+/// never (fail closed). `role:<x>` where `x` is a dashboard role name
+/// (`admin` / `manager` / `employee`) names dashboard accounts, so an
+/// employee with such an id is not matched by it. The internal client id and
+/// the untrusted sentinel own nothing and read only open tasks.
+pub fn agent_may_read_task(agent_id: &str, owners: &[&str], audience: &TaskAudience) -> bool {
+    if matches!(audience, TaskAudience::Open) {
+        return true;
+    }
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty()
+        || agent_id == crate::mcp_internal_key::INTERNAL_CLIENT_ID
+        || agent_id == duduclaw_core::identity_token::UNTRUSTED_AGENT_ID
+    {
+        return false;
+    }
+    if owners.iter().any(|o| !o.trim().is_empty() && o.trim() == agent_id) {
+        return true;
+    }
+    match audience {
+        TaskAudience::Limited(keys) => {
+            agent_id.parse::<duduclaw_auth::UserRole>().is_err()
+                && keys.iter().any(|k| k.strip_prefix("role:") == Some(agent_id))
+        }
+        _ => false,
+    }
+}
+
+/// [`agent_may_read_task`] for a task row: reads the task's packets once.
+pub fn agent_may_read_task_row(
+    home: &Path,
+    agent_id: &str,
+    task: &crate::task_store::TaskRow,
+) -> bool {
+    let audience = task_audience(home, &task.id);
+    agent_may_read_task(agent_id, &task_owners(task), &audience)
+}
+
+/// The employees a task belongs to: assignee, claimer, creator.
+pub fn task_owners(task: &crate::task_store::TaskRow) -> [&str; 3] {
+    [
+        task.assigned_to.as_str(),
+        task.claimed_by.as_deref().unwrap_or(""),
+        task.created_by.as_str(),
+    ]
+}
+
 /// One packet that limits people: who wrote it and to whom.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AudienceSource {
@@ -622,6 +676,33 @@ mod tests {
         assert!(dashboard_may_read_task(&admin, &TaskAudience::Unreadable));
         assert!(dashboard_may_read(&admin, &[NO_PERMITTED_AUDIENCE.into()]));
         assert!(!dashboard_may_read(&viewer, &[NO_PERMITTED_AUDIENCE.into()]));
+    }
+
+    #[test]
+    fn employees_read_limited_tasks_only_as_owner_or_named_role() {
+        let owners = ["sales", "", "planner"];
+        let open = TaskAudience::Open;
+        let limited = TaskAudience::Limited(vec!["user:alice".into(), "role:support".into()]);
+        // Open tasks: everyone, as before.
+        assert!(agent_may_read_task("support", &owners, &open));
+        assert!(agent_may_read_task("other", &owners, &open));
+        // Limited: owners (assignee, creator) and the named employee.
+        assert!(agent_may_read_task("sales", &owners, &limited));
+        assert!(agent_may_read_task("planner", &owners, &limited));
+        assert!(agent_may_read_task("support", &owners, &limited));
+        assert!(!agent_may_read_task("other", &owners, &limited));
+        // Exact match only, and the empty claimer slot matches nobody.
+        assert!(!agent_may_read_task("suppor", &owners, &limited));
+        assert!(!agent_may_read_task("", &owners, &limited));
+        // Unreadable: owners only.
+        assert!(agent_may_read_task("sales", &owners, &TaskAudience::Unreadable));
+        assert!(!agent_may_read_task("support", &owners, &TaskAudience::Unreadable));
+        // A dashboard role name is not an employee name; sentinels own nothing.
+        let managers = TaskAudience::Limited(vec!["role:manager".into()]);
+        assert!(!agent_may_read_task("manager", &owners, &managers));
+        let internal = crate::mcp_internal_key::INTERNAL_CLIENT_ID;
+        assert!(!agent_may_read_task(internal, &[internal, "", ""], &limited));
+        assert!(agent_may_read_task(internal, &owners, &open));
     }
 
     #[test]

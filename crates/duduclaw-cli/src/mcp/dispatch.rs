@@ -443,7 +443,7 @@ pub(crate) async fn handle_tools_call(
         // Session tools
         "session_restore_context" => handle_session_restore_context(&arguments).await,
         // Task Board tools
-        "tasks_list" => handle_tasks_list(&arguments, home_dir, default_agent).await,
+        "tasks_list" => handle_tasks_list(&arguments, home_dir, default_agent, record_actor).await,
         "tasks_create" => handle_tasks_create(&arguments, home_dir, record_actor).await,
         "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact" | "discovery_cancel" =>
             handle_discovery_query(tool_name, &arguments, home_dir, default_agent).await,
@@ -466,7 +466,9 @@ pub(crate) async fn handle_tools_call(
         "plan_update_step" => handle_plan_update_step(&arguments, home_dir, default_agent).await,
         // Activity Feed tools
         "activity_post" => handle_activity_post(&arguments, home_dir, record_actor).await,
-        "activity_list" => handle_activity_list(&arguments, home_dir, default_agent).await,
+        "activity_list" => {
+            handle_activity_list(&arguments, home_dir, default_agent, record_actor).await
+        }
         // Autopilot tools
         "autopilot_list" => handle_autopilot_list(&arguments, home_dir).await,
         // Shared Skills tools
