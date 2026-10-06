@@ -464,6 +464,34 @@ pub async fn execute_fork<P, S, J>(
         }
     };
 
+    // `.mcp.json` spawn gate (N4): each branch workspace is a copy of the
+    // parent (`CopyPolicy::fork_default` keeps `.mcp.json`), and the branch's
+    // `claude -p` starts every server in that copy. When the parent is an
+    // employee directory, confirm its file before any copy is made; a file
+    // that cannot be confirmed fails every branch (audited). A parent that is
+    // not an employee directory has no employee configuration to confirm.
+    duduclaw_gateway::mcp_internal_key::adopt_internal_key_for_process(&home_dir);
+    {
+        let parent = parent_workspace.clone();
+        match tokio::task::spawn_blocking(move || {
+            duduclaw_agent::mcp_template::prepare_mcp_config_for_spawn(&parent)
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::error!("fork {fork_id}: {e}");
+                let _ = store.set_all_branch_states(&fork_id, "failed");
+                return;
+            }
+            Err(e) => {
+                tracing::error!("fork {fork_id}: MCP config check could not run: {e}");
+                let _ = store.set_all_branch_states(&fork_id, "failed");
+                return;
+            }
+        }
+    }
+
     let aggregate = settings
         .aggregate_budget_usd
         .max(settings.default_budget_usd);

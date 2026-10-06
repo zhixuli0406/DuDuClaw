@@ -155,6 +155,12 @@ pub async fn handle_prompt_with_agent(
         duduclaw_gateway::task_sandbox::HostAction::RanOnHost,
     );
 
+    // The Claude path below runs the `.mcp.json` spawn gate; this process is
+    // not the gateway, so give it the internal MCP key from `config.toml`
+    // when it has none (read-only), or the gate refuses every employee whose
+    // entry carries the key (N6).
+    duduclaw_gateway::mcp_internal_key::adopt_internal_key_for_process(home_dir);
+
     // Execute through the gateway delegation path. The target agent's runtime
     // provider is honoured inside call_claude_for_agent_with_type.
     match duduclaw_gateway::claude_runner::call_claude_for_agent_with_type(

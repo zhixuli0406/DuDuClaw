@@ -1033,6 +1033,27 @@ async fn execute_proactive_check(
             if let Some(notice) = host_run_notice {
                 notice(home_dir, agent_id, agent_config.container.sandbox_enabled);
             }
+            // `.mcp.json` platform fix: regenerate the DuDuClaw entry before
+            // the CLI starts every server the file lists; refuse the check
+            // when the file cannot be confirmed (audited inside).
+            {
+                let dir_owned = agent_dir.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::mcp_template::prepare_mcp_config_for_spawn(&dir_owned)
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(msg)) => {
+                        warn!(agent = agent_id, "Proactive check skipped: {msg}");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(agent = agent_id, "Proactive check skipped: MCP config check failed: {e}");
+                        return;
+                    }
+                }
+            }
             // Write system prompt to a temp file — Claude CLI ≥2 supports
             // --system-prompt-file and this avoids cmdline length / leak issues.
             let prompt_file = match tempfile::NamedTempFile::new() {

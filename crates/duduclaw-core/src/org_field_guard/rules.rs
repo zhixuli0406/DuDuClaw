@@ -212,11 +212,21 @@ impl ProtectedTomlKind {
 /// *machinery*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtectedSurface {
-    /// `<home>/agents/<id>/.mcp.json` — carries `DUDUCLAW_AGENT_ID` and its
+    /// `<home>/agents/<id>/.mcp.json`, or a `.mcp.json` at any depth below the
+    /// employee directory (names compared case-insensitively) — carries `DUDUCLAW_AGENT_ID` and its
     /// `DUDUCLAW_AGENT_TOKEN`. Rewriting the id (soft mode) or pasting a peer's
     /// id+token pair lifted from *their* `.mcp.json` (strict mode) makes the
     /// next MCP server for this agent claim to be someone else.
     AgentMcpJson,
+    /// CLI configuration inside an employee directory: anything under a
+    /// `.claude/` directory or named `.claude.json` at **any** depth (a
+    /// project cloned into the employee directory included, since the CLI
+    /// loads it when it starts there), anything under a directory named
+    /// `.mcp.json`, and the top-level [`AGENT_RUNTIME_CONFIG_DIRS`]. Slash
+    /// commands, subagents, skills, hooks and the non-Claude runtimes' MCP
+    /// settings are loaded from there at the next spawn. Refused for agent and
+    /// untrusted callers only; reading is unaffected.
+    AgentRuntimeConfig,
     /// `<agent_dir>/.claude/settings.json` (or `settings.local.json`) — where
     /// the `duduclaw hook agent-file-guard` `PreToolUse` entry lives. An agent
     /// that may delete this entry may then rewrite everything above.
@@ -240,6 +250,7 @@ impl ProtectedSurface {
     pub(super) fn file_name(self) -> &'static str {
         match self {
             Self::AgentMcpJson => ".mcp.json",
+            Self::AgentRuntimeConfig => "CLI 設定檔",
             Self::HookSettings => "settings.json",
             Self::IdentityKey => crate::identity_token::IDENTITY_KEY_FILE,
             Self::OrgStore => crate::org_store::ORG_STORE_FILE,
@@ -249,6 +260,18 @@ impl ProtectedSurface {
 
 /// Env keys inside `.mcp.json` that carry the caller identity.
 pub(super) const IDENTITY_ENV_KEYS: [&str; 2] = [crate::ENV_AGENT_ID, crate::identity_token::ENV_AGENT_TOKEN];
+
+/// Top-level directories of an employee directory whose files a CLI loads
+/// as configuration at the next spawn — and can turn into executed commands
+/// (Claude Code: `.claude/` settings, hooks, slash commands, subagents and
+/// skills; the Codex, Gemini, Grok and Antigravity runtimes' own MCP and
+/// settings files). Frozen for agent and untrusted callers; DuDuClaw writes
+/// them itself, outside the hook.
+pub(super) const AGENT_RUNTIME_CONFIG_DIRS: [&str; 5] =
+    [".claude", ".codex", ".gemini", ".grok", ".agents"];
+
+/// Top-level files of an employee directory frozen the same way.
+pub(super) const AGENT_RUNTIME_CONFIG_FILES: [&str; 1] = [".claude.json"];
 
 /// Hook-configuration basenames under an agent's `.claude/` directory.
 pub(super) const HOOK_SETTINGS_FILES: [&str; 2] = ["settings.json", "settings.local.json"];

@@ -90,7 +90,10 @@ pub use rules::{
     CONFIG_PROTECTED_SECTIONS, HOME_WRITABLE_DIRS, ProtectedSurface, ProtectedTomlKind,
 };
 
-use rules::{EPHEMERAL_DIR_NAME, FrozenVerdict, HOOK_SETTINGS_FILES, IDENTITY_ENV_KEYS};
+use rules::{
+    AGENT_RUNTIME_CONFIG_DIRS, AGENT_RUNTIME_CONFIG_FILES, EPHEMERAL_DIR_NAME, FrozenVerdict,
+    HOOK_SETTINGS_FILES, IDENTITY_ENV_KEYS,
+};
 use matcher::{components_after_ci, describe_pairs, first_line, identity_env_pairs, owning_agent_dir};
 
 use std::path::Path;
@@ -309,19 +312,48 @@ pub fn classify_identity_surface(file_path: &Path, home: &Path) -> Option<Protec
         return None;
     }
 
-    if file_name == ".mcp.json" {
+    // Components inside the employee directory, file name included
+    // (`<id>/…` or `.ephemeral/<id>/…`). Every name below is compared ASCII
+    // case-insensitively (N7): the default macOS and Windows filesystems
+    // treat `.MCP.json` as `.mcp.json`, and the CLI would read it.
+    let base = if rest[0].eq_ignore_ascii_case(EPHEMERAL_DIR_NAME) { 2 } else { 1 };
+    let (last, dirs) = rest.get(base..)?.split_last()?;
+
+    // `.mcp.json` at any depth (N2): the CLI discovers it in whatever working
+    // directory it starts in, including a project cloned inside the employee
+    // directory. A directory that happens to carry that name is frozen too.
+    if last.eq_ignore_ascii_case(".mcp.json") {
         return Some(ProtectedSurface::AgentMcpJson);
     }
-    if HOOK_SETTINGS_FILES
+    // The hook registration is `<employee>/.claude/settings*.json` only
+    // (N9: a `settings.json` deeper under `.claude/` is ordinary
+    // configuration, frozen for employees but not for operators).
+    let is_hook_settings = HOOK_SETTINGS_FILES
         .iter()
         .any(|f| file_name.eq_ignore_ascii_case(f))
-        && rest
-            .get(rest.len() - 2)
-            .is_some_and(|parent| parent.eq_ignore_ascii_case(".claude"))
-    {
+        && matches!(dirs, [only] if only.eq_ignore_ascii_case(".claude"));
+    if is_hook_settings {
         return Some(ProtectedSurface::HookSettings);
     }
-    None
+    // `.claude/` and `.claude.json` at any depth (N2), `.mcp.json` as a
+    // directory name at any depth, and the other runtimes' directories at the
+    // top of the employee directory. `.claude/settings*.json` keeps its own
+    // every-caller rule above.
+    let any_depth = |c: &String| {
+        c.eq_ignore_ascii_case(".claude")
+            || c.eq_ignore_ascii_case(".claude.json")
+            || c.eq_ignore_ascii_case(".mcp.json")
+    };
+    let runtime_config = dirs.iter().any(any_depth)
+        || AGENT_RUNTIME_CONFIG_FILES
+            .iter()
+            .any(|f| last.eq_ignore_ascii_case(f))
+        || dirs.first().is_some_and(|top| {
+            AGENT_RUNTIME_CONFIG_DIRS
+                .iter()
+                .any(|d| top.eq_ignore_ascii_case(d))
+        });
+    runtime_config.then_some(ProtectedSurface::AgentRuntimeConfig)
 }
 
 /// Decide whether a write to an identity / enforcement-surface file may proceed.
@@ -337,9 +369,38 @@ pub fn classify_identity_surface(file_path: &Path, home: &Path) -> Option<Protec
 /// MCP server (Playwright, …) to its own file — only the identity env pairs are
 /// frozen, in **every** server entry, so a second `duduclaw`-shaped server with
 /// someone else's id cannot be appended either.
+///
+/// This entry judges as an operator ([`HookCaller::Absent`]); the hook uses
+/// [`check_identity_surface_write_as`], which also freezes the whole
+/// DuDuClaw server entry for agent and untrusted callers.
 pub fn check_identity_surface_write(
     file_path: &Path,
     home: &Path,
+    existing: Option<&str>,
+    new_content: Option<&str>,
+) -> GuardDecision {
+    check_identity_surface_write_as(file_path, home, &HookCaller::Absent, existing, new_content)
+}
+
+/// [`check_identity_surface_write`] for a known caller.
+///
+/// For [`HookCaller::Agent`] / [`HookCaller::Untrusted`]:
+/// - **any** write to the employee's `.mcp.json` is refused. The gateway
+///   starts the Claude CLI with that file (`--mcp-config … --strict-mcp-config`
+///   or cwd discovery), and the CLI starts every server it lists, so one added
+///   entry whose `command` is an interpreter runs arbitrary commands as the
+///   operator's OS user at the next spawn, with no Bash grant. New servers come
+///   from an approved MCP install, an expert pack, the dashboard or the
+///   operator, none of which runs through this hook.
+/// - a write under a top-level CLI configuration directory or file
+///   ([`ProtectedSurface::AgentRuntimeConfig`]) is refused for the same reason.
+///
+/// Operators ([`HookCaller::Absent`]) keep the identity-only `.mcp.json` rule
+/// and may write the runtime configuration.
+pub fn check_identity_surface_write_as(
+    file_path: &Path,
+    home: &Path,
+    caller: &HookCaller,
     existing: Option<&str>,
     new_content: Option<&str>,
 ) -> GuardDecision {
@@ -369,7 +430,17 @@ pub fn check_identity_surface_write(
             "這個檔案登記了檔案保護 hook，若可自行改寫等同解除保護；請透過儀表板或管理者調整。"
                 .to_string(),
         ),
+        ProtectedSurface::AgentRuntimeConfig => {
+            if matches!(caller, HookCaller::Absent) {
+                GuardDecision::AllowedAgentWrite
+            } else {
+                blocked(RUNTIME_CONFIG_EMPLOYEE_REFUSAL.to_string())
+            }
+        }
         ProtectedSurface::AgentMcpJson => {
+            if !matches!(caller, HookCaller::Absent) {
+                return blocked(MCP_JSON_EMPLOYEE_REFUSAL.to_string());
+            }
             let Some(new_content) = new_content else {
                 return GuardDecision::BlockedUnverifiable {
                     file_name: surface.file_name().to_string(),
@@ -400,19 +471,30 @@ pub fn check_identity_surface_write(
                     };
                 }
             };
-            if new_ids == old_ids {
-                GuardDecision::AllowedAgentWrite
-            } else {
-                blocked(format!(
+            if new_ids != old_ids {
+                return blocked(format!(
                     "MCP 身分設定（{}）被更動：{} → {}",
                     IDENTITY_ENV_KEYS.join(" / "),
                     describe_pairs(&old_ids),
                     describe_pairs(&new_ids)
-                ))
+                ));
             }
+            GuardDecision::AllowedAgentWrite
         }
     }
 }
+
+/// Why an employee may not write its `.mcp.json` (shown to the employee).
+const MCP_JSON_EMPLOYEE_REFUSAL: &str = "AI 員工不能修改自己目錄裡的 .mcp.json（任何一層）：這個檔案列出的每一個 MCP \
+    伺服器都會在員工下一次啟動時以管理者的系統身分執行。要新增 MCP 伺服器，請向管理者說明需求，\
+    由管理者在儀表板安裝，或由同仁在儀表板提出 MCP 安裝申請、經管理者核准後自動安裝。\
+    若你是管理者，請用儀表板或一般編輯器修改，不要在員工目錄裡直接執行 claude（那樣會被當成該員工判定）。";
+
+/// Why an employee may not write its CLI configuration directories.
+const RUNTIME_CONFIG_EMPLOYEE_REFUSAL: &str = "AI 員工不能修改自己目錄下的 CLI 設定（任何一層的 \
+    .claude/、.claude.json、.mcp.json，以及最上層的 .codex/、.gemini/、.grok/、.agents/）：\
+    裡面的設定、hook、自訂指令與子代理會在 CLI 於該目錄啟動時被載入，等同可以執行指令。\
+    放在員工目錄裡的專案也一樣：專案的 .claude/ 可以讀，不能寫。需要調整請找管理者。";
 
 // ── Caller-scoped directory isolation (WP22 T2) ──────────────────────────────
 

@@ -713,6 +713,54 @@ mod rotation_tests {
         // Last error is empty because no attempt was made
         assert!(err.ends_with("Last error: "));
     }
+
+    /// N1: a `.mcp.json` spawn-gate refusal is about the employee's file,
+    /// not the account. The loop stops after the first attempt, returns the
+    /// gate error unchanged, and leaves every account's health as it was.
+    #[tokio::test]
+    async fn spawn_gate_refusal_is_not_an_account_failure_and_is_not_retried() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("first", 1)).await;
+        rotator.push_account_for_test(fake_oauth_account("second", 2)).await;
+        let before = rotator.status().await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = calls.clone();
+        let gate_err = duduclaw_agent::mcp_spawn_gate::spawn_gate_error("員工 agnes 的 MCP 設定無法確認");
+        let gate_err_in = gate_err.clone();
+        let result = rotate_cli_spawn(
+            &rotator,
+            &[],
+            move |_env, _hint| {
+                calls_in.fetch_add(1, Ordering::SeqCst);
+                let e = gate_err_in.clone();
+                async move { Err::<String, String>(e) }
+            },
+            100,
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), gate_err);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no second account tried");
+        let after = rotator.status().await;
+        for (b, a) in before.iter().zip(after.iter()) {
+            assert_eq!(b.id, a.id);
+            assert_eq!(b.is_healthy, a.is_healthy, "{}", a.id);
+            assert_eq!(b.is_available, a.is_available, "{}", a.id);
+            assert_eq!(b.total_requests, a.total_requests, "{}", a.id);
+        }
+        // Ten more refusals would have tripped the three-strike cooldown if
+        // they were booked with `on_error`.
+        for _ in 0..10 {
+            let e = gate_err.clone();
+            let _ = rotate_cli_spawn(&rotator, &[], move |_env, _hint| {
+                let e = e.clone();
+                async move { Err::<String, String>(e) }
+            }, 100)
+            .await;
+        }
+        assert!(rotator.status().await.iter().all(|s| s.is_available && s.is_healthy));
+    }
 }
 
 // ── Python SDK subprocess ───────────────────────────────────
