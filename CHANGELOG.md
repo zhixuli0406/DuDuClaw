@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.70.1] - 2026-10-07 — 1.70.1 修補：discovery 鎖、GDPR 歸檔、AI 員工任務可見名單、操作者指令列核准閘統一
+
 ### Fixed
 - Discovery 的 `discovery.db` 開啟時會另外開一個檔案 handle 比對身分再關掉；在 POSIX 上關掉任何一個 handle 會讓本行程在該檔的所有鎖失效，同一行程裡先開的 Discovery store 可能失去 SQLite 鎖，另一個行程就可能在它底下 checkpoint 並移除 WAL。改成開啟前後各用 `lstat` 比對檔案身分，不再多開 handle（與 1.70.0 修好的核准、工作流程與 LINE 收件資料庫同一種修法）。
 - `duduclaw gdpr erase` 不會刪記憶衰減與 `forget` 移進 `memories_archive` 的副本，同一個人的資料留在歸檔表裡。現在 erase 在同一筆交易裡一併刪除（歸檔副本只留文字，所以用文字提及比對，另外也刪掉與被刪記憶同 id 的殘留副本），報告與指令列輸出多了歸檔筆數，`export gdpr` 也會列出歸檔副本。試跑（不帶 `--confirm`）與 `export gdpr` 的歸檔筆數只算文字提及這個人的歸檔列，實際刪除時另外刪掉與被刪記憶同 id 的副本，所以刪除後的筆數可能比試跑多。歸檔表只保存文字，只靠 subject／object 連到這個人、文字沒提到他的歸檔列找不到。
