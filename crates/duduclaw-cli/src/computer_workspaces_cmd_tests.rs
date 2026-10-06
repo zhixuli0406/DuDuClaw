@@ -98,6 +98,9 @@ fn revoked(home: &std::path::Path) -> String {
 }
 
 #[tokio::test]
+// The workspace registry is unix-only (Windows refuses every entry point), so
+// these store-backed cases run on unix only.
+#[cfg_attr(not(unix), ignore)]
 async fn regrant_runs_only_after_a_dashboard_approval() {
     let home = tempfile::tempdir().unwrap();
     let id = revoked(home.path());
@@ -163,6 +166,9 @@ fn cli_audit_phases(home: &std::path::Path) -> Vec<(String, String)> {
 }
 
 #[tokio::test]
+// The workspace registry is unix-only (Windows refuses every entry point), so
+// these store-backed cases run on unix only.
+#[cfg_attr(not(unix), ignore)]
 async fn revoke_from_the_terminal_waits_for_a_dashboard_approval() {
     let home = tempfile::tempdir().unwrap();
     let id = revoked(home.path());
@@ -218,6 +224,9 @@ async fn revoke_from_the_terminal_waits_for_a_dashboard_approval() {
 }
 
 #[tokio::test]
+// The workspace registry is unix-only (Windows refuses every entry point), so
+// these store-backed cases run on unix only.
+#[cfg_attr(not(unix), ignore)]
 async fn fence_from_the_terminal_waits_for_a_dashboard_approval() {
     let home = tempfile::tempdir().unwrap();
     let id = revoked(home.path());
@@ -266,6 +275,9 @@ async fn fence_from_the_terminal_waits_for_a_dashboard_approval() {
 }
 
 #[tokio::test]
+// The workspace registry is unix-only (Windows refuses every entry point), so
+// these store-backed cases run on unix only.
+#[cfg_attr(not(unix), ignore)]
 async fn a_refused_terminal_action_is_audited() {
     let home = tempfile::tempdir().unwrap();
     let id = revoked(home.path());
