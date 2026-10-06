@@ -174,10 +174,20 @@ impl TaskStore {
     }
 
     pub async fn insert_task(&self, row: &TaskRow) -> Result<(), String> {
-        if row.kind == TaskKind::Discovery && (row.goal_mode || row.discovery_run_id.is_none() || row.discovery_spec_json.is_none()) {
-            return Err("discovery requires a frozen specification and dedicated run identity".into());
+        if row.kind == TaskKind::Discovery
+            && (row.goal_mode
+                || row.discovery_run_id.is_none()
+                || row.discovery_spec_json.is_none())
+        {
+            return Err(
+                "discovery requires a frozen specification and dedicated run identity".into(),
+            );
         }
-        let kind = if row.kind == TaskKind::Task && row.goal_mode { TaskKind::Goal } else { row.kind };
+        let kind = if row.kind == TaskKind::Task && row.goal_mode {
+            TaskKind::Goal
+        } else {
+            row.kind
+        };
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO tasks
@@ -189,10 +199,11 @@ impl TaskStore {
                  goal_id, lease_renewed_at, source_channel, source_chat_id,
                  revision_round, diminishing, agent_seconds, source_discord_guild_id,
                  deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason,
-                 plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id, criteria_ledger)
+                 plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id,
+                discovery_approval_id, criteria_ledger, authority_revision)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)",
+                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46)",
             params![
                 row.id,
                 row.title,
@@ -239,6 +250,7 @@ impl TaskStore {
                 row.discovery_run_id,
                 row.discovery_approval_id,
                 row.criteria_ledger,
+                row.authority_revision,
             ],
         )
         .map_err(|e| format!("insert task: {e}"))?;
@@ -378,8 +390,12 @@ impl TaskStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| format!("update task: begin: {e}"))?;
-            let kind: Option<String> = tx.query_row("SELECT kind FROM tasks WHERE id=?1", params![id], |r| r.get(0))
-                .optional().map_err(|e| e.to_string())?;
+            let kind: Option<String> = tx
+                .query_row("SELECT kind FROM tasks WHERE id=?1", params![id], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .map_err(|e| e.to_string())?;
             if kind.as_deref() == Some("discovery") {
                 return Err("discovery tasks require the dedicated lifecycle service".into());
             }
@@ -557,11 +573,16 @@ impl TaskStore {
     pub async fn remove_task(&self, id: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let count = conn
-            .execute("DELETE FROM tasks WHERE id = ?1 AND kind <> 'discovery'", params![id])
+            .execute(
+                "DELETE FROM tasks WHERE id = ?1 AND kind <> 'discovery'",
+                params![id],
+            )
             .map_err(|e| format!("remove task: {e}"))?;
         if count == 0 {
             let kind: Option<String> = conn
-                .query_row("SELECT kind FROM tasks WHERE id = ?1", params![id], |r| r.get(0))
+                .query_row("SELECT kind FROM tasks WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
                 .optional()
                 .map_err(|e| format!("remove task: {e}"))?;
             if kind.is_some() {
@@ -581,7 +602,7 @@ impl TaskStore {
     // `done` / `review` (goal mode) / `failed` / `needs_human`.
 }
 
-pub(super) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
+pub(crate) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
     Ok(TaskRow {
         id: row.get(0)?,
         title: row.get(1)?,
@@ -625,13 +646,24 @@ pub(super) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         pinned: row.get::<_, i64>(39)? != 0,
         team_spec_json: row.get(40)?,
         kind: match row.get::<_, String>(41)?.as_str() {
-            "task" => TaskKind::Task, "goal" => TaskKind::Goal, "discovery" => TaskKind::Discovery,
-            value => return Err(rusqlite::Error::FromSqlConversionFailure(41, rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("unknown task kind: {value}"))))),
+            "task" => TaskKind::Task,
+            "goal" => TaskKind::Goal,
+            "discovery" => TaskKind::Discovery,
+            value => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    41,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown task kind: {value}"),
+                    )),
+                ));
+            }
         },
         discovery_spec_json: row.get(42)?,
         discovery_run_id: row.get(43)?,
         discovery_approval_id: row.get(44)?,
         criteria_ledger: row.get(45)?,
+        authority_revision: row.get(46)?,
     })
 }

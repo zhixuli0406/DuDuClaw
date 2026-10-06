@@ -214,8 +214,23 @@ async fn poll_and_dispatch_sqlite(
     );
 
     for msg in messages {
+        // R-M1: workflow messages belong to the gateway holding this home's
+        // instance lock; a second gateway leaves them untouched (not acked).
+        if crate::workflow::queue_task::is_workflow_message(&msg)
+            && !duduclaw_core::gateway_instance::held(home_dir)
+        {
+            continue;
+        }
         // ACK immediately to prevent double-pickup
         queue.ack(&msg.id).await?;
+        // Workflow queue rows are authorized by the server-owned handoff outbox,
+        // never by a sender spelling or a user-controlled JSON payload alone.
+        // A run executes in its own task so this loop keeps serving other
+        // employees; the run lease keeps executions of one run apart.
+        if crate::workflow::queue_task::is_workflow_message(&msg) {
+            crate::workflow::queue_task::spawn(queue.clone(), home_dir.to_path_buf(), msg);
+            continue;
+        }
 
         // ── WP21 C1: same gate as the JSONL rail ──────────────────────────
         // `send_to_agent` enqueues here, so this is the choke point for the

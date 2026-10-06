@@ -288,7 +288,10 @@ pub async fn apply_hooks_decision(home: &Path, slug: &str) -> Result<HooksApplyO
                     )?;
                     Ok(HooksApplyOutcome::Enabled { files: file_count })
                 }
-                ApprovalStatus::Denied | ApprovalStatus::Expired => {
+                ApprovalStatus::Denied
+                | ApprovalStatus::Expired
+                | ApprovalStatus::Answered
+                | ApprovalStatus::Invalidated => {
                     write_hooks_state(
                         home,
                         slug,

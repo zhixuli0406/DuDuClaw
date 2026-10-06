@@ -478,7 +478,7 @@ pub async fn settle_outbox(home_dir: &Path, broker: &ApprovalBroker) -> SettleRe
 
         match status {
             ApprovalStatus::Pending => report.still_pending += 1,
-            ApprovalStatus::Denied => {
+            ApprovalStatus::Denied | ApprovalStatus::Answered | ApprovalStatus::Invalidated => {
                 mail::record_outbox_settled(
                     home_dir,
                     &item.mail_id,

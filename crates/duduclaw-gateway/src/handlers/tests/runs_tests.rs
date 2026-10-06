@@ -95,6 +95,7 @@ fn tool_window_matches_agent_and_time_range_only() {
         tool: "wiki_read".into(),
         ok: true,
         preview: "path=sop".into(),
+        task_id: None,
     };
     let wrong_agent = ToolCallRow {
         agent_id: "agnes".into(),
@@ -108,6 +109,12 @@ fn tool_window_matches_agent_and_time_range_only() {
     assert!(tool_row_in_run_window(&inside, &run, now));
     assert!(!tool_row_in_run_window(&wrong_agent, &run, now));
     assert!(!tool_row_in_run_window(&too_late, &run, now));
+    // F5-D: a goal round's call is never folded into a conversation.
+    let goal_round = ToolCallRow {
+        task_id: Some("private-task".into()),
+        ..inside.clone()
+    };
+    assert!(!tool_row_in_run_window(&goal_round, &run, now));
 }
 
 #[test]

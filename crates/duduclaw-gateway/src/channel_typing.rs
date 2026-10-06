@@ -137,8 +137,12 @@ pub fn slack_status(
         let channel = channel_id.clone();
         let ts = thread_ts.clone();
         async move {
+            let url = "https://slack.com/api/assistant.threads.setStatus";
+            // Tests route this to the local channel provider (P0-B F4).
+            #[cfg(test)]
+            let url = crate::test_channel_provider::url(&token, url);
             let _ = client
-                .post("https://slack.com/api/assistant.threads.setStatus")
+                .post(url)
                 .header("Authorization", format!("Bearer {token}"))
                 .json(&serde_json::json!({
                     "channel_id": channel,

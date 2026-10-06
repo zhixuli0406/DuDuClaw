@@ -24,8 +24,30 @@ type Key = (String, String);
 
 /// `(agent, turn) → [(registration id, reply channel)]`, newest last. Leaf
 /// lock, never held across an `.await`.
-fn registry() -> &'static Mutex<HashMap<Key, Vec<(u64, String)>>> {
-    static TURNS: OnceLock<Mutex<HashMap<Key, Vec<(u64, String)>>>> = OnceLock::new();
+fn registry() -> &'static Mutex<
+    HashMap<
+        Key,
+        Vec<(
+            u64,
+            String,
+            Option<crate::approval::DecisionContext>,
+            Option<crate::approval::TrustedReplyTarget>,
+        )>,
+    >,
+> {
+    static TURNS: OnceLock<
+        Mutex<
+            HashMap<
+                Key,
+                Vec<(
+                    u64,
+                    String,
+                    Option<crate::approval::DecisionContext>,
+                    Option<crate::approval::TrustedReplyTarget>,
+                )>,
+            >,
+        >,
+    > = OnceLock::new();
     TURNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -48,7 +70,7 @@ impl Drop for TurnGuard {
     fn drop(&mut self) {
         let mut turns = registry().lock().unwrap_or_else(|p| p.into_inner());
         if let Some(list) = turns.get_mut(&self.key) {
-            list.retain(|(id, _)| *id != self.id);
+            list.retain(|(id, _, _, _)| *id != self.id);
             if list.is_empty() {
                 turns.remove(&self.key);
             }
@@ -76,7 +98,18 @@ pub fn register(agent_id: &str, turn_id: &str, reply_channel: &str) -> Option<Tu
         .unwrap_or_else(|p| p.into_inner())
         .entry(key.clone())
         .or_default()
-        .push((id, reply_channel.to_string()));
+        .push((
+            id,
+            reply_channel.to_string(),
+            crate::approval::CURRENT_DECISION_CONTEXT
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
+            crate::approval::CURRENT_TRUSTED_REPLY_TARGET
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
+        ));
     Some(TurnGuard { key, id })
 }
 
@@ -92,7 +125,7 @@ pub fn reply_channel_for(agent_id: &str, turn_id: &str) -> Option<String> {
         .unwrap_or_else(|p| p.into_inner())
         .get(&(agent_id.to_string(), turn_id.to_string()))
         .and_then(|list| list.last())
-        .map(|(_, channel)| channel.clone())
+        .map(|(_, channel, _, _)| channel.clone())
 }
 
 /// Register the turn the current task is answering, for a CLI spawn of
@@ -126,7 +159,10 @@ mod tests {
     #[test]
     fn registrations_are_keyed_by_agent_and_turn_and_end_with_the_guard() {
         let guard = register("turns-alice", "turn-1", "telegram:42").unwrap();
-        assert_eq!(reply_channel_for("turns-alice", "turn-1").as_deref(), Some("telegram:42"));
+        assert_eq!(
+            reply_channel_for("turns-alice", "turn-1").as_deref(),
+            Some("telegram:42")
+        );
         // Another employee with the same turn id, or another turn, sees nothing.
         assert_eq!(reply_channel_for("turns-bob", "turn-1"), None);
         assert_eq!(reply_channel_for("turns-alice", "turn-2"), None);
@@ -134,9 +170,15 @@ mod tests {
         // Overlapping spawns of one turn: the newest wins, each guard removes
         // only its own registration.
         let second = register("turns-alice", "turn-1", "discord:7").unwrap();
-        assert_eq!(reply_channel_for("turns-alice", "turn-1").as_deref(), Some("discord:7"));
+        assert_eq!(
+            reply_channel_for("turns-alice", "turn-1").as_deref(),
+            Some("discord:7")
+        );
         drop(second);
-        assert_eq!(reply_channel_for("turns-alice", "turn-1").as_deref(), Some("telegram:42"));
+        assert_eq!(
+            reply_channel_for("turns-alice", "turn-1").as_deref(),
+            Some("telegram:42")
+        );
         drop(guard);
         assert_eq!(reply_channel_for("turns-alice", "turn-1"), None);
     }
@@ -146,7 +188,14 @@ mod tests {
         assert!(register("../x", "t", "telegram:1").is_none());
         assert!(register("turns-carol", "", "telegram:1").is_none());
         assert!(register("turns-carol", "t\n", "telegram:1").is_none());
-        assert!(register("turns-carol", &"t".repeat(MAX_TURN_ID_LEN + 1), "telegram:1").is_none());
+        assert!(
+            register(
+                "turns-carol",
+                &"t".repeat(MAX_TURN_ID_LEN + 1),
+                "telegram:1"
+            )
+            .is_none()
+        );
         assert!(register("turns-carol", "t", "").is_none());
         assert!(register("turns-carol", "t", "telegram:1\r\n").is_none());
         assert_eq!(reply_channel_for("turns-carol", "t"), None);
@@ -162,9 +211,44 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(reply_channel_for("turns-dave", "turn-9").as_deref(), Some("line:abc"));
+        assert_eq!(
+            reply_channel_for("turns-dave", "turn-9").as_deref(),
+            Some("line:abc")
+        );
         drop(guard);
         // Outside any turn scope nothing is registered.
         assert!(register_current_turn("turns-dave").is_none());
     }
+}
+
+/// Principal/account/thread data comes from the verified adapter's registration.
+pub fn decision_context_for(
+    agent_id: &str,
+    turn_id: &str,
+) -> Option<crate::approval::DecisionContext> {
+    if !valid_turn_id(turn_id) {
+        return None;
+    }
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&(agent_id.into(), turn_id.into()))
+        .and_then(|v| v.last())
+        .and_then(|(_, _, c, _)| c.clone())
+}
+
+/// Never reconstruct a transport from a chat id or an employee-supplied token.
+pub(crate) fn target_for(
+    agent_id: &str,
+    turn_id: &str,
+) -> Option<crate::approval::TrustedReplyTarget> {
+    if !valid_turn_id(turn_id) {
+        return None;
+    }
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&(agent_id.into(), turn_id.into()))
+        .and_then(|v| v.last())
+        .and_then(|(_, _, _, t)| t.clone())
 }

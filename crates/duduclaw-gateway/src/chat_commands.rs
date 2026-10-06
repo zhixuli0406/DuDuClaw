@@ -934,7 +934,7 @@ async fn handle_goal(
 ) -> String {
     match goal {
         GoalCommand::Usage => goal_usage_text(),
-        GoalCommand::Status => handle_goal_status(ctx, agent_id).await,
+        GoalCommand::Status => handle_goal_status(ctx, session_id, agent_id).await,
         GoalCommand::Create {
             description,
             acceptance_criteria,
@@ -1287,7 +1287,9 @@ async fn try_decompose_goal(
 }
 
 /// List the current agent's in-progress goal tasks.
-async fn handle_goal_status(ctx: &ReplyContext, agent_id: &str) -> String {
+async fn handle_goal_status(ctx: &ReplyContext, session_id: &str, agent_id: &str) -> String {
+    // The channel this command came from (`<channel>:<chat>` session ids).
+    let channel = session_id.split(':').next().unwrap_or("");
     let store = match crate::task_store::TaskStore::open(&ctx.home_dir) {
         Ok(s) => s,
         Err(e) => return format!("⚠️ 無法讀取目標任務：{e}"),
@@ -1309,11 +1311,19 @@ async fn handle_goal_status(ctx: &ReplyContext, agent_id: &str) -> String {
         .filter(|t| t.goal_mode && ACTIVE.contains(&t.status.as_str()))
         .map(|t| {
             let short = duduclaw_core::truncate_chars(&t.id, 8);
+            // F5-D: a task limited to an audience that does not name this
+            // channel is listed by short id only (same rule as the pushes).
+            let title = if crate::goal_notify_private::channel_may_carry(&ctx.home_dir, &t.id, channel)
+            {
+                duduclaw_core::truncate_chars(&t.title, 40)
+            } else {
+                "（內容只開放給指定對象，請到儀表板查看）".to_string()
+            };
             format!(
                 "• #{short} [{}] 第 {} 輪 — {}",
                 goal_status_label(&t.status),
                 t.retry_count + 1,
-                duduclaw_core::truncate_chars(&t.title, 40),
+                title,
             )
         })
         .collect();
@@ -3013,5 +3023,64 @@ mod goal_contract_tests {
             );
             assert!(src.contains("handle_command_for_sender("), "{channel}");
         }
+    }
+}
+
+/// F5-D: `/goal status` in a channel lists a task limited to an audience
+/// that does not name that channel by short id only.
+#[cfg(test)]
+mod goal_status_privacy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn status_hides_titles_the_channel_may_not_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
+            duduclaw_agent::AgentRegistry::new(home.join("agents")),
+        ));
+        let sessions = std::sync::Arc::new(
+            crate::session::SessionManager::new(&home.join("sessions.db")).unwrap(),
+        );
+        let status: crate::channel_reply::ChannelStatusMap =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let ctx = ReplyContext::new(registry, home.to_path_buf(), sessions, status, tx);
+        let store = crate::task_store::TaskStore::open(home).unwrap();
+        for (id, title) in [("privgoal1", "機密報價"), ("opengoal1", "公開週報")] {
+            let mut t = crate::task_store::TaskRow::new(
+                id.into(),
+                title.into(),
+                String::new(),
+                "normal".into(),
+                "sales".into(),
+                "system".into(),
+            );
+            t.goal_mode = true;
+            t.status = "in_progress".into();
+            store.insert_task(&t).await.unwrap();
+        }
+        let dir1 = home
+            .join(duduclaw_core::task_packet::TEAM_PACKETS_DIR)
+            .join("privgoal1")
+            .join("1");
+        std::fs::create_dir_all(&dir1).unwrap();
+        std::fs::write(
+            dir1.join("p.json"),
+            serde_json::json!({
+                "packet_id": "p", "goal_id": "privgoal1", "round": 1,
+                "from_role": "executor", "to_role": "verifier",
+                "objective": "x", "output_format": "files",
+                "audience": ["channel:telegram"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let on_line = handle_goal_status(&ctx, "line:U1", "sales").await;
+        assert!(!on_line.contains("機密報價"), "{on_line}");
+        assert!(on_line.contains("#privgoa"));
+        assert!(on_line.contains("公開週報"));
+        let on_telegram = handle_goal_status(&ctx, "telegram:42", "sales").await;
+        assert!(on_telegram.contains("機密報價"));
     }
 }

@@ -8,7 +8,7 @@ impl MethodHandler {
 
     /// WP14-T14.7: list pending approvals for the approval center. Optional
     /// `agent_id` filter. Read-only; opens approvals.db per call.
-    pub(crate) async fn handle_approvals_list(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_approvals_list(&self, params: Value, ctx:&UserContext) -> WsFrame {
         let agent_filter = params.get("agent_id").and_then(|v| v.as_str());
         // Optional exact `action_kind` filter (e.g. "knowledge_quarantine" for the
         // D6 curation queue). Matches the raw stored action_kind string.
@@ -21,13 +21,54 @@ impl MethodHandler {
             Ok(b) => b,
             Err(e) => return WsFrame::error_response("", &format!("open approvals: {e}")),
         };
-        match broker.list_pending(agent_filter).await {
+        let rows = if let Some(id) = params.get("id").and_then(Value::as_str) {
+            broker
+                .get(&crate::approval::ApprovalId::from(id.to_owned()))
+                .await
+                .map(|row| {
+                    row.into_iter()
+                        .filter(|r| agent_filter.is_none_or(|agent| agent == r.agent_id))
+                        .collect()
+                })
+        } else {
+            broker.list_pending(agent_filter).await
+        };
+        // A-M-3: rows are filtered by the viewer's live role and employee
+        // bindings, not by the session's claims.
+        let fresh = match crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx) {
+            Ok(c) => c,
+            Err(_) => return WsFrame::error_response("", "permission denied"),
+        };
+        match rows {
             Ok(rows) => {
                 let mut items: Vec<Value> = Vec::with_capacity(rows.len());
                 for r in rows
                     .iter()
                     .filter(|r| action_kind_filter.map_or(true, |k| r.action_kind == k))
                 {
+                    if !fresh.has_agent_access(&r.agent_id, AccessLevel::Viewer) {
+                        continue;
+                    }
+                    if self.authorize_workflow_activation_record(&r.payload,&fresh).await.is_err(){continue;}
+                    // Cards built from a task (goal kickoff, task-triggered
+                    // automation) carry its text: same task gate as the
+                    // task's own RPCs. Bound cards (workflow steps) have their
+                    // own gate: employee access and run audience decide, and
+                    // the binding is withheld from anyone else below.
+                    if let Some(task_id) = approval_task_ref(&r.payload).filter(|_| r.binding.is_none()) {
+                        let visible = task_owner_readonly(&self.home_dir, &task_id)
+                            .is_some_and(|owner| {
+                                task_content_visible(&self.home_dir, &fresh, &task_id, &owner)
+                            });
+                        if !visible {
+                            continue;
+                        }
+                    }
+                    // Binding data and question answers go only to a viewer
+                    // who may decide this card.
+                    let may_decide = r.binding.is_none()
+                        || Box::pin(self.authorize_bound_decider(r, &fresh)).await.is_ok();
+                    let activation = super::approval_decider::is_activation_record(r);
                     let kind = crate::governance::ApprovalKind::parse(&r.action_kind);
                     // E8 reverse handoff: "在 <通道> 中開啟" — the WP20
                     // `notify_channel`/`notify_chat_id` columns already record
@@ -87,7 +128,26 @@ impl MethodHandler {
                         "agent_id": r.agent_id,
                         "kind": kind.as_str(),
                         "summary": r.summary,
-                        "payload": r.payload,
+                        "payload": if r.binding.is_some() {json!({
+                            "redacted": true,
+                            "payload_hash": r.binding.as_ref().map(|b|&b.payload_hash)
+                        })}else{r.payload.clone()},
+                        "request_kind":r.request_kind,
+                        "status":r.status,
+                        "binding": if may_decide { json!(r.binding) } else { Value::Null },
+                        "answer": if may_decide { json!(r.answer) } else { Value::Null },
+                        "may_decide": may_decide,
+                        "decided_in_dashboard_only": crate::approval_notify::is_dashboard_only_kind(&r.action_kind),
+                        "submitter_is_viewer": activation
+                            && super::approval_decider::submitter_is_decider(r, &fresh),
+                        // A-H-1: what an Admin accepts — each effect and the
+                        // one record it may change.
+                        "workflow_activation": if activation && may_decide {
+                            super::approval_decider::activation_facts(&self.home_dir, r)
+                        } else {
+                            Value::Null
+                        },
+                        "invalidated_reason":r.invalidated_reason,
                         "created_at": r.created_at,
                         "ttl_seconds": r.ttl_seconds,
                         // Epoch seconds the approval auto-denies at (TTL

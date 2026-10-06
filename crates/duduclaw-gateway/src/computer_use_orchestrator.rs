@@ -871,16 +871,95 @@ pub(crate) enum ThreatLevel {
     Red,
 }
 
-/// Read `<home>/threat_level`: absent or unreadable ⇒ `Green`.
-pub(crate) async fn read_threat_level(home_dir: &std::path::Path) -> ThreatLevel {
-    let level = tokio::fs::read_to_string(home_dir.join("threat_level"))
-        .await
-        .unwrap_or_else(|_| "GREEN".to_string());
-    match level.trim().to_uppercase().as_str() {
-        "RED" => ThreatLevel::Red,
-        "YELLOW" => ThreatLevel::Yellow,
-        _ => ThreatLevel::Green,
+/// One read of `<home>/threat_level`, before deciding (F4 L6, F5-C L1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreatRead {
+    /// The file does not exist: the documented "no kill switch" state.
+    Absent,
+    /// `GREEN` / `YELLOW` / `RED`, case-insensitive, surrounding whitespace
+    /// and a leading UTF-8 BOM ignored.
+    Level(ThreatLevel),
+    /// Exists but unreadable, not UTF-8, empty, or holding anything else.
+    /// May be an operator mid-write; re-read before treating it as RED.
+    Unclear,
+}
+
+/// Classify one read (pure).
+pub(crate) fn classify_threat_read(read: std::io::Result<String>) -> ThreatRead {
+    match read {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ThreatRead::Absent,
+        Err(_) => ThreatRead::Unclear,
+        Ok(raw) => {
+            let text = raw.trim_start_matches('\u{FEFF}').trim();
+            match text.to_ascii_uppercase().as_str() {
+                "GREEN" => ThreatRead::Level(ThreatLevel::Green),
+                "YELLOW" => ThreatRead::Level(ThreatLevel::Yellow),
+                "RED" => ThreatRead::Level(ThreatLevel::Red),
+                _ => ThreatRead::Unclear,
+            }
+        }
     }
+}
+
+/// Interpret one read with no retry (coding convention 4, fail closed):
+/// absent ⇒ `Green`; a recognised level ⇒ that level; anything unclear ⇒
+/// `Red`.
+pub(crate) fn threat_level_from_read(read: std::io::Result<String>) -> ThreatLevel {
+    match classify_threat_read(read) {
+        ThreatRead::Absent => ThreatLevel::Green,
+        ThreatRead::Level(level) => level,
+        ThreatRead::Unclear => ThreatLevel::Red,
+    }
+}
+
+/// Re-reads after an unclear read: an operator writing the file with
+/// `echo GREEN > threat_level` truncates first, so a read can land between
+/// the truncate and the write (F5-C, review F4-L1).
+const THREAT_LEVEL_RETRIES: usize = 2;
+const THREAT_LEVEL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn settle_unclear(path: &std::path::Path) -> ThreatLevel {
+    tracing::warn!(
+        path = %path.display(),
+        "threat_level exists but is unreadable, empty or not GREEN/YELLOW/RED; treating it as RED. \
+         Write the file atomically (temp file + rename)"
+    );
+    ThreatLevel::Red
+}
+
+/// Read `<home>/threat_level`: absent ⇒ `Green`; unclear ⇒ re-read up to
+/// twice 50 ms apart, still unclear ⇒ `Red`.
+pub(crate) async fn read_threat_level(home_dir: &std::path::Path) -> ThreatLevel {
+    let path = home_dir.join("threat_level");
+    for attempt in 0..=THREAT_LEVEL_RETRIES {
+        match classify_threat_read(tokio::fs::read_to_string(&path).await) {
+            ThreatRead::Absent => return ThreatLevel::Green,
+            ThreatRead::Level(level) => return level,
+            ThreatRead::Unclear if attempt < THREAT_LEVEL_RETRIES => {
+                tokio::time::sleep(THREAT_LEVEL_RETRY_DELAY).await;
+            }
+            ThreatRead::Unclear => {}
+        }
+    }
+    settle_unclear(&path)
+}
+
+/// Synchronous twin of [`read_threat_level`] for the last gate before an
+/// action, which must not await. The re-read sleeps block this thread for at
+/// most 100 ms, and only when the file is unclear.
+pub(crate) fn read_threat_level_sync(home_dir: &std::path::Path) -> ThreatLevel {
+    let path = home_dir.join("threat_level");
+    for attempt in 0..=THREAT_LEVEL_RETRIES {
+        match classify_threat_read(std::fs::read_to_string(&path)) {
+            ThreatRead::Absent => return ThreatLevel::Green,
+            ThreatRead::Level(level) => return level,
+            ThreatRead::Unclear if attempt < THREAT_LEVEL_RETRIES => {
+                std::thread::sleep(THREAT_LEVEL_RETRY_DELAY);
+            }
+            ThreatRead::Unclear => {}
+        }
+    }
+    settle_unclear(&path)
 }
 
 /// Whether `action` (plus optional model reasoning) violates one of the

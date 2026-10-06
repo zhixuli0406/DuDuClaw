@@ -160,7 +160,8 @@ pub(super) async fn obtain_approval(
     };
     match broker.await_decision(&id, poll).await {
         Ok(ApprovalStatus::Approved) => Ok(()),
-        Ok(ApprovalStatus::Denied) => Err(approval_denied(format!(
+        Ok(ApprovalStatus::Denied | ApprovalStatus::Answered | ApprovalStatus::Invalidated) =>
+            Err(approval_denied(format!(
             "工具「{tool}」的呼叫已被管理員拒絕（審核編號 {id}）。"
         ))),
         Ok(ApprovalStatus::Expired) => Err(approval_denied(format!(

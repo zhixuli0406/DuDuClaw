@@ -337,6 +337,7 @@ pub struct McpClient {
     timeout: Duration,
     /// Server name for diagnostics (the spawned command or the URL).
     label: String,
+    workflow_version: Option<u32>,
 }
 
 impl McpClient {
@@ -350,13 +351,66 @@ impl McpClient {
         envs: &[(String, String)],
         timeout: Duration,
     ) -> Result<Self, McpError> {
+        Self::connect_with_stderr(command, args, envs, timeout, std::process::Stdio::null()).await
+    }
+
+    /// [`connect`](Self::connect) with the child's stderr disposition chosen by
+    /// the caller. Production keeps `Stdio::null()` (a server's stderr is not
+    /// ours to relay); the CLI integration tests pass `Stdio::inherit()` so a
+    /// child that exits before the handshake leaves its reason in the test
+    /// output instead of a bare `Closed`.
+    pub async fn connect_with_stderr(
+        command: &str,
+        args: &[String],
+        envs: &[(String, String)],
+        timeout: Duration,
+        stderr: std::process::Stdio,
+    ) -> Result<Self, McpError> {
         let mut cmd = Command::new(command);
+        let workflow_home = if envs
+            .iter()
+            .any(|(key, _)| key == "DUDUCLAW_WORKFLOW_SESSION_ID")
+        {
+            let home = envs
+                .iter()
+                .find(|(key, _)| key == "DUDUCLAW_HOME")
+                .map(|(_, value)| value)
+                .ok_or_else(|| McpError::Spawn("workflow child requires explicit home".into()))?;
+            if !std::path::Path::new(home).is_absolute() {
+                return Err(McpError::Spawn("workflow home must be absolute".into()));
+            }
+            cmd.env_clear();
+            for key in ["PATH", "TMPDIR", "SystemRoot"] {
+                if let Some(value) = std::env::var_os(key) {
+                    cmd.env(key, value);
+                }
+            }
+            // Windows: `std::env::temp_dir` reads `TMP` / `TEMP`, the profile
+            // comes from `USERPROFILE`, and process start-up needs `SystemRoot`
+            // / `windir` / `ComSpec`; with only the three keys above the child
+            // `duduclaw mcp-server` exited before the MCP handshake on the CI
+            // Windows runner (13 `workflow_stdio` cases, `McpError::Closed`).
+            // Same system-only allow-list the agent CLI spawn uses; no
+            // secret-shaped names (pinned by spawn_env's shape test).
+            #[cfg(windows)]
+            for key in duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST_WINDOWS {
+                if let Some(value) = std::env::var_os(key) {
+                    cmd.env(key, value);
+                }
+            }
+            Some(home)
+        } else {
+            None
+        };
         cmd.args(args)
             .envs(envs.iter().map(|(k, v)| (k.clone(), v.clone())))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(stderr)
             .kill_on_drop(true);
+        if let Some(home) = workflow_home {
+            cmd.env("HOME", home);
+        }
 
         let mut child = cmd.spawn().map_err(|e| McpError::Spawn(e.to_string()))?;
         let stdin = child
@@ -377,6 +431,7 @@ impl McpClient {
             next_id: AtomicI64::new(1),
             timeout,
             label: command.to_string(),
+            workflow_version: None,
         };
 
         if let Err(e) = client.handshake().await {
@@ -420,6 +475,7 @@ impl McpClient {
             next_id: AtomicI64::new(1),
             timeout,
             label: url.to_string(),
+            workflow_version: None,
         };
         client.handshake().await?;
         Ok(client)
@@ -439,6 +495,10 @@ impl McpClient {
         if let Some(e) = rpc_error_of(&resp) {
             return Err(e);
         }
+        self.workflow_version = resp
+            .pointer("/result/capabilities/experimental/duduclaw_workflow/version")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok());
         // Announce readiness; notifications get no reply.
         let note = build_initialized_notification();
         if is_http {
@@ -471,6 +531,85 @@ impl McpClient {
             .request(build_tools_call_request(id, name, args), id)
             .await?;
         parse_tool_call_result(&resp)
+    }
+
+    /// Service extension calls preserve typed results and never retry an effect.
+    async fn workflow_request<T: serde::de::DeserializeOwned>(
+        &mut self,
+        call: Value,
+        metadata: Value,
+    ) -> Result<T, McpError> {
+        if !matches!(self.transport, McpTransport::Stdio { .. })
+            || self.workflow_version != Some(duduclaw_core::workflow_mcp::VERSION)
+        {
+            return Err(McpError::Parse(
+                "workflow extension unavailable on this session".into(),
+            ));
+        }
+        let name = call
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| McpError::Parse("missing workflow tool name".into()))?;
+        let args = call
+            .get("arguments")
+            .cloned()
+            .ok_or_else(|| McpError::Parse("missing workflow arguments".into()))?;
+        let id = self.alloc_id();
+        let mut frame = build_tools_call_request(id, name, args);
+        frame["params"]["_meta"] = serde_json::json!({"duduclaw_workflow":metadata});
+        duduclaw_core::workflow_mcp::canonical_bytes(&frame).map_err(McpError::Parse)?;
+        let response = self.request(frame, id).await?;
+        duduclaw_core::workflow_mcp::canonical_bytes(&response).map_err(McpError::Parse)?;
+        if let Some(error) = rpc_error_of(&response) {
+            return Err(error);
+        }
+        let version = response
+            .pointer("/result/version")
+            .or_else(|| response.pointer("/result/effective/version"))
+            .and_then(Value::as_u64);
+        if version != Some(u64::from(duduclaw_core::workflow_mcp::VERSION)) {
+            return Err(McpError::Parse("unknown workflow response version".into()));
+        }
+        serde_json::from_value(
+            response
+                .get("result")
+                .cloned()
+                .ok_or_else(|| McpError::Parse("missing workflow result".into()))?,
+        )
+        .map_err(|_| McpError::Parse("invalid typed workflow response".into()))
+    }
+    pub async fn prepare_workflow_call(
+        &mut self,
+        call: Value,
+        context: Value,
+    ) -> Result<duduclaw_core::workflow_mcp::PrepareTicket, McpError> {
+        self.workflow_request(
+            call,
+            serde_json::json!({"version":1,"phase":"prepare","context":context}),
+        )
+        .await
+    }
+    pub async fn read_workflow_call(
+        &mut self,
+        call: Value,
+        context: Value,
+    ) -> Result<duduclaw_core::workflow_mcp::ReadReply, McpError> {
+        self.workflow_request(
+            call,
+            serde_json::json!({"version":1,"phase":"read","context":context}),
+        )
+        .await
+    }
+    pub async fn execute_workflow_call(
+        &mut self,
+        call: Value,
+        ticket: duduclaw_core::workflow_mcp::ExecuteTicket,
+    ) -> Result<duduclaw_core::workflow_mcp::OperationReply, McpError> {
+        self.workflow_request(
+            call,
+            serde_json::json!({"version":1,"phase":"execute","ticket":ticket}),
+        )
+        .await
     }
 
     /// Server label (the spawned command), for diagnostics.
@@ -1220,7 +1359,12 @@ mod tests {
 
     #[async_trait]
     impl McpSourceVerifier for SplitVerifier {
-        async fn verify(&self, _: &CcrScope, _: &Value, _: &str) -> Result<VerifiedMcpSource, String> {
+        async fn verify(
+            &self,
+            _: &CcrScope,
+            _: &Value,
+            _: &str,
+        ) -> Result<VerifiedMcpSource, String> {
             Err("never verifies".into())
         }
         fn passes_through(&self, args: &Value) -> bool {
@@ -1250,7 +1394,10 @@ mod tests {
         registry
             .register_source_verifier(scope, "causal-mcp", "get_source", Arc::new(SplitVerifier))
             .unwrap();
-        let ok = |content: &str| ToolCallResult { content: content.into(), is_error: false };
+        let ok = |content: &str| ToolCallResult {
+            content: content.into(),
+            is_error: false,
+        };
         let other = registry
             .outcome_from_result("get_source", &json!({"store": "other"}), ok("raw bytes"))
             .await;
@@ -1259,7 +1406,10 @@ mod tests {
         let bound = registry
             .outcome_from_result("get_source", &json!({"store": "own"}), ok("raw bytes"))
             .await;
-        assert!(bound.is_error, "an unverifiable call on the route is still withheld");
+        assert!(
+            bound.is_error,
+            "an unverifiable call on the route is still withheld"
+        );
     }
 
     #[tokio::test]

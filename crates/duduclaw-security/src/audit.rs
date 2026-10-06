@@ -383,6 +383,14 @@ pub fn append_tool_call_with_extras(
         }
         map.insert((*key).to_string(), value.clone());
     }
+    // F5-D: a call made inside a goal round names the round's task (the
+    // gateway sets it at spawn), so readers can tell it apart from a
+    // conversation by the same employee.
+    if !map.contains_key("task_id") {
+        if let Some(task_id) = duduclaw_core::host_task_id() {
+            map.insert("task_id".into(), task_id.into());
+        }
+    }
 
     // 0600 on create: since result_text landed, rows can carry business
     // data (e.g. Odoo reads), so the file must not be world/group-readable.

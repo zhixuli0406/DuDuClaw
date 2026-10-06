@@ -123,6 +123,10 @@ fn channel_summary_is_zh_tw_and_xml_safe() {
         notify_chat_id: None,
         reminded_at: None,
         simulation: None,
+        request_kind: crate::approval::RequestKind::Approval,
+        binding: None,
+        answer: None,
+        invalidated_reason: None,
     };
     let msg = pending_summary_for_channel(&rec);
     assert!(msg.contains("需要您的核准"));

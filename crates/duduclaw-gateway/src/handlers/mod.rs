@@ -134,6 +134,19 @@ mod accounts_util;
 mod tasks_rpc;
 mod discovery_rpc;
 mod tasks_detail_rpc;
+mod task_privacy;
+mod push_filter;
+mod artifact_evidence;
+mod workflow_errors;
+#[cfg(test)]
+mod task_privacy_tests;
+#[cfg(test)]
+mod f5_privacy_tests;
+#[cfg(test)]
+mod workflow_review_tests;
+mod workflow_review_rpc;
+mod workflow_drafts_rpc;
+mod workflow_runs_rpc;
 mod plans_rpc;
 mod activity_timeline_rpc;
 mod runs_rpc;
@@ -142,6 +155,7 @@ mod fork_migrate_rpc;
 mod approvals_topology_rpc;
 mod mail_rpc;
 mod approvals_decide;
+mod approval_decider;
 mod growth_rpc;
 mod autopilot_rpc;
 mod ticks_rpc;
@@ -166,6 +180,7 @@ pub(crate) mod config_commit;
 mod config_schema;
 mod system_update_config_v168;
 mod tick_sources_rpc;
+mod channel_ingress_rpc;
 mod config_raw_rpc;
 mod agents_update_v168;
 #[cfg(test)]
@@ -196,6 +211,8 @@ pub(crate) use config_util::*;
 pub(crate) use channel_util::*;
 pub(crate) use accounts_util::*;
 pub(crate) use task_json::*;
+pub(crate) use task_privacy::*;
+pub use push_filter::{PUSH_CACHE_SECS, PushGate, filter_push_event};
 pub(crate) use timeline_util::*;
 pub(crate) use chat_history_util::*;
 pub(crate) use runs_util::*;
@@ -203,6 +220,8 @@ pub use device_backup::*;
 
 /// Dispatches incoming RPC methods to the appropriate handler.
 pub struct MethodHandler {
+    workflow_store: tokio::sync::OnceCell<Arc<crate::workflow::WorkflowStore>>,
+    workflow_service: tokio::sync::OnceCell<Arc<crate::workflow::WorkflowService>>,
     registry: Arc<RwLock<AgentRegistry>>,
     home_dir: PathBuf,
     start_time: Instant,

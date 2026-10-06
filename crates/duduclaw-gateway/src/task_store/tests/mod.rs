@@ -4,6 +4,7 @@
 //! files for size only.
 
 mod claim_cases;
+mod authority_cases;
 mod criteria_cases;
 mod goal_cases;
 mod ledger_cases;
@@ -98,4 +99,3 @@ fn goal_review_task(id: &str) -> TaskRow {
     t.result_summary = Some("attempt".into());
     t
 }
-
