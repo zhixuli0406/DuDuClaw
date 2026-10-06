@@ -145,6 +145,22 @@ pub(crate) const COMPUTER_USE_TOOLS: &[&str] = &[
     "computer_navigate",
 ];
 
+/// The durable-workspace tools (P2-C). Gated like [`COMPUTER_USE_TOOLS`] by
+/// `[capabilities] computer_use` at dispatch, and additionally hidden from
+/// `tools/list` unless `[capabilities.computer_use_config] workspace` is on.
+/// Hiding is discovery only: the gateway re-checks every switch per call.
+pub(crate) const COMPUTER_WORKSPACE_TOOLS: &[&str] = &[
+    "computer_workspace_list",
+    "computer_workspace_read",
+    "computer_workspace_write",
+];
+
+/// Tools whose arguments are NEVER restored from redaction tokens, whatever
+/// `[redaction.tool_egress]` says (an exact, `computer_*` or `*` rule
+/// included): the value lands on disk, so a de-identified placeholder must
+/// stay a placeholder (P2-C design B.4 3). Tokens pass through verbatim.
+pub(crate) const NEVER_RESTORE_ARGS_TOOLS: &[&str] = &["computer_workspace_write"];
+
 /// The RFC-26 Live Run Forking tools, gated by the per-agent `[fork] enabled`
 /// toggle. The hard gate stays inside each handler (`mcp_fork::require_enabled`);
 /// this list exists so `tools/list` can keep *discoverable ⇔ callable* for an
@@ -1099,7 +1115,7 @@ impl McpDispatcher {
                 .get("arguments")
                 .map(crate::mcp_redaction::McpRedactionLayer::args_contain_tokens)
                 .unwrap_or(false);
-            if has_tokens {
+            if has_tokens && !NEVER_RESTORE_ARGS_TOOLS.contains(&tool_name) {
                 let args = params_owned
                     .get("arguments")
                     .cloned()
@@ -2817,6 +2833,144 @@ effect = "forbid"
         );
     }
 
+    /// P2-C B.4 3: `computer_workspace_write`'s arguments are never restored,
+    /// even under a `*` restore rule that does restore `computer_type`. The
+    /// audit row's `chars` is the content length the handler received.
+    #[tokio::test]
+    async fn workspace_write_content_is_never_restored_from_tokens() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("agents").join("dudu");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ncomputer_use = true\n[capabilities.computer_use_config]\nworkspace = true\n",
+        )
+        .unwrap();
+        let layer = make_redaction_layer(tmp.path(), &["*"]);
+        for agent in ["test-client", "dudu"] {
+            layer
+                .manager
+                .vault()
+                .insert_mapping(
+                    EMAIL_TOKEN,
+                    "alice@acme.com",
+                    agent,
+                    Some("s1"),
+                    "EMAIL",
+                    "email",
+                    &duduclaw_redaction::RestoreScope::Owner,
+                    false,
+                    24,
+                )
+                .unwrap();
+        }
+        let dispatcher = make_dispatcher(&tmp).await.with_redaction(Some(layer));
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        unsafe {
+            std::env::set_var("DUDUCLAW_REDACTION_SCOPES", "RedactionAdmin");
+        }
+        let write = make_params(
+            "computer_workspace_write",
+            serde_json::json!({"workspace_id": "ws-0123456789abcdef0123456789abcdef", "path": "a.md", "content": EMAIL_TOKEN}),
+        );
+        let typed = make_params("computer_type", serde_json::json!({ "text": EMAIL_TOKEN }));
+        let w = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &write, &serde_json::json!(31)).await;
+        let _typed_result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &typed, &serde_json::json!(32)).await;
+        unsafe {
+            std::env::remove_var("DUDUCLAW_REDACTION_SCOPES");
+        }
+        assert_ne!(w["error"]["code"].as_i64().unwrap_or(0), -32007, "{w}");
+        // Find the two audit rows wherever the audit helper put them.
+        let mut rows = String::new();
+        for entry in walkdir_files(tmp.path()) {
+            if entry.ends_with("tool_calls.jsonl") {
+                rows.push_str(&std::fs::read_to_string(&entry).unwrap_or_default());
+            }
+        }
+        let chars_of = |tool: &str| -> Option<u64> {
+            rows.lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| v.to_string().contains(tool))
+                .find_map(|v| find_key(&v, "chars"))
+        };
+        let token_chars = EMAIL_TOKEN.chars().count() as u64;
+        assert_eq!(chars_of("computer_type"), Some("alice@acme.com".len() as u64), "control: the * rule does restore computer_type; rows: {rows}");
+        assert_eq!(chars_of("computer_workspace_write"), Some(token_chars), "workspace content stayed a token; rows: {rows}");
+        assert!(!rows.contains("alice@acme.com"));
+    }
+
+    /// P2-C: list / read / write are audited, and the rows carry neither
+    /// the path text nor any content.
+    #[tokio::test]
+    async fn workspace_tools_are_audited_without_paths_or_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("agents").join("dudu");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ncomputer_use = true\n[capabilities.computer_use_config]\nworkspace = true\n",
+        )
+        .unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let ws = "ws-0123456789abcdef0123456789abcdef";
+        for (i, (tool, args)) in [
+            ("computer_workspace_list", serde_json::json!({})),
+            ("computer_workspace_read", serde_json::json!({"workspace_id": ws, "path": "secret-dir/plan.md"})),
+            ("computer_workspace_write", serde_json::json!({"workspace_id": ws, "path": "secret-dir/plan.md", "content": "PRIVATE-BODY"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let params = make_params(tool, args);
+            let _ = dispatcher
+                .dispatch_tool_call(&principal, &ns_ctx, &params, &serde_json::json!(40 + i))
+                .await;
+        }
+        let mut rows = String::new();
+        for entry in walkdir_files(tmp.path()) {
+            if entry.ends_with("tool_calls.jsonl") {
+                rows.push_str(&std::fs::read_to_string(&entry).unwrap_or_default());
+            }
+        }
+        for tool in ["computer_workspace_list", "computer_workspace_read", "computer_workspace_write"] {
+            assert!(rows.contains(tool), "{tool} audited; rows: {rows}");
+        }
+        assert!(rows.contains("path_sha256"), "{rows}");
+        assert!(!rows.contains("secret-dir") && !rows.contains("plan.md") && !rows.contains("PRIVATE-BODY"), "{rows}");
+    }
+
+    fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walkdir_files(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    fn find_key(v: &serde_json::Value, key: &str) -> Option<u64> {
+        match v {
+            serde_json::Value::Object(m) => m
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| m.values().find_map(|x| find_key(x, key))),
+            serde_json::Value::Array(a) => a.iter().find_map(|x| find_key(x, key)),
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
+                .ok()
+                .and_then(|x| find_key(&x, key)),
+            _ => None,
+        }
+    }
+
     // (c) A non-whitelisted tool carrying a token → default-deny with -32007,
     //     even though the token itself is valid in the vault.
     #[tokio::test]
@@ -3590,6 +3744,9 @@ effect = "forbid"
         "computer_session_start",
         "computer_session_stop",
         "computer_type",
+        "computer_workspace_list",
+        "computer_workspace_read",
+        "computer_workspace_write",
         "cost_agents",
         "cost_multi_vs_single",
         "cost_recent",
@@ -3804,7 +3961,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            241,
+            244,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

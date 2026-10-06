@@ -101,13 +101,18 @@ pub(crate) fn build_request(tool: &str, args: &Value, turn_id: Option<String>) -
                     return Err(format!("參數 {name} 超出範圍。"));
                 }
             }
-            Ok(json!({
+            let mut body = json!({
                 "op": "start",
                 "width": width,
                 "height": height,
                 "task": str_arg(args, "task"),
                 "turn_id": turn_id,
-            }))
+            });
+            // Only when asked for: a start without it is byte-identical.
+            if let Some(ws) = str_arg(args, "workspace") {
+                body["workspace"] = json!(ws);
+            }
+            Ok(body)
         }
         "computer_screenshot" => {
             if str_arg(args, "display").is_some_and(|d| d != "container") {
@@ -155,6 +160,26 @@ pub(crate) fn build_request(tool: &str, args: &Value, turn_id: Option<String>) -
             Ok(json!({"op": "action", "session_id": session_id, "turn_id": turn_id, "action": {"type": "navigate", "url": url}}))
         }
         "computer_session_stop" => Ok(json!({"op": "stop", "session_id": session_id})),
+        "computer_workspace_list" => Ok(json!({"op": "workspace_list"})),
+        "computer_workspace_read" => Ok(json!({
+            "op": "workspace_read",
+            "workspace_id": str_arg(args, "workspace_id").ok_or("缺少必要參數 workspace_id。")?,
+            "path": str_arg(args, "path").ok_or("缺少必要參數 path。")?,
+        })),
+        "computer_workspace_write" => {
+            // `content` is passed through untrimmed: the file gets exactly it.
+            let content = args
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or("缺少必要參數 content（UTF-8 文字）。")?;
+            Ok(json!({
+                "op": "workspace_write",
+                "workspace_id": str_arg(args, "workspace_id").ok_or("缺少必要參數 workspace_id。")?,
+                "path": str_arg(args, "path").ok_or("缺少必要參數 path。")?,
+                "content": content,
+                "expected_revision": int_arg(args, "expected_revision")?,
+            }))
+        }
         _ => Err(format!("未知的電腦操作工具：{tool}")),
     }
 }
@@ -164,6 +189,8 @@ fn timeout_for(tool: &str) -> Duration {
         "computer_session_start" => START_TIMEOUT,
         "computer_screenshot" => SCREENSHOT_TIMEOUT,
         "computer_session_stop" => STOP_TIMEOUT,
+        // The gateway bound is the stop budget (an approval may come first).
+        "computer_workspace_list" | "computer_workspace_read" | "computer_workspace_write" => STOP_TIMEOUT,
         "computer_click" | "computer_type" | "computer_key" | "computer_scroll" | "computer_navigate" => {
             ACTION_TIMEOUT
         }
@@ -377,7 +404,25 @@ pub(crate) fn render(tool: &str, v: &Value) -> Value {
             if let Some(network) = v.get("network_message").and_then(Value::as_str) {
                 msg.push_str(&duduclaw_core::truncate_chars(network, MAX_MESSAGE_CHARS));
             }
+            if let Some(ws) = v.get("workspace_id").and_then(Value::as_str) {
+                msg.push_str(&format!(
+                    "已掛載工作區 {ws}（容器內唯讀路徑 /workspace/files，僅 root 可讀，版本 {}，{} 個檔案）。寫檔請用 computer_workspace_write。",
+                    u(v, "data_revision"),
+                    u(v, "files_used")
+                ));
+            }
             text(msg)
+        }
+        "computer_workspace_list" | "computer_workspace_read" | "computer_workspace_write" => {
+            let mut out = v.clone();
+            if let Some(map) = out.as_object_mut() {
+                map.remove("ok");
+                // The write answer is audited as result text: no path in it.
+                if tool == "computer_workspace_write" {
+                    map.remove("path");
+                }
+            }
+            text(serde_json::to_string_pretty(&out).unwrap_or_default())
         }
         "computer_screenshot" => {
             let data = v.get("png_base64").and_then(Value::as_str).unwrap_or("");
@@ -444,9 +489,20 @@ pub(crate) async fn handle_computer_use_tool(
         Err(msg) => return error(&msg),
     };
     match post(home, agent_id, &body, timeout_for(tool)).await {
+        Ok(v) if workspace_missing(&body, &v) => error(WORKSPACE_NOT_ATTACHED),
         Ok(v) => render(tool, &v),
         Err(msg) => error(&msg),
     }
+}
+
+/// Fail closed against an older gateway that ignores `workspace` and starts
+/// a session without one (design §7.4).
+const WORKSPACE_NOT_ATTACHED: &str = "要求掛載工作區，但 gateway 開出的 session 沒有工作區（gateway 版本可能較舊）。請呼叫 computer_session_stop 結束這個 session，並請管理員更新 DuDuClaw。";
+
+pub(crate) fn workspace_missing(request: &Value, answer: &Value) -> bool {
+    request.get("op").and_then(Value::as_str) == Some("start")
+        && request.get("workspace").is_some()
+        && answer.get("workspace_id").and_then(Value::as_str).is_none_or(str::is_empty)
 }
 
 #[cfg(test)]
@@ -652,5 +708,27 @@ mod tests {
         assert!(err.is_connect());
         let msg = transport_message(TransportFailure::Connect, port, START_TIMEOUT);
         assert!(msg.contains(&port.to_string()));
+    }
+
+    #[test]
+    fn workspace_requests_and_the_old_gateway_fail_closed() {
+        let plain = build_request("computer_session_start", &json!({}), None).unwrap();
+        assert!(plain.get("workspace").is_none(), "no workspace key unless asked for");
+        let ws = build_request("computer_session_start", &json!({"workspace": "new"}), None).unwrap();
+        assert_eq!(ws["workspace"], "new");
+        assert!(workspace_missing(&ws, &json!({"ok": true, "session_id": "cu-1"})));
+        assert!(!workspace_missing(&ws, &json!({"ok": true, "workspace_id": "ws-x"})));
+        assert!(!workspace_missing(&plain, &json!({"ok": true})));
+        let w = build_request(
+            "computer_workspace_write",
+            &json!({"workspace_id": "ws-a", "path": "a.md", "content": " x ", "expected_revision": "3"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(w, json!({"op": "workspace_write", "workspace_id": "ws-a", "path": "a.md", "content": " x ", "expected_revision": 3}));
+        assert!(build_request("computer_workspace_write", &json!({"workspace_id": "ws-a", "path": "a"}), None).is_err());
+        assert!(build_request("computer_workspace_read", &json!({"path": "a"}), None).is_err());
+        assert_eq!(build_request("computer_workspace_list", &json!({}), None).unwrap(), json!({"op": "workspace_list"}));
+        assert_eq!(timeout_for("computer_workspace_write"), STOP_TIMEOUT);
     }
 }
