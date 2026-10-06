@@ -192,7 +192,7 @@ impl ApprovalBroker {
         // P2-A M-3: kinds whose pushes are capped elsewhere get no reminder —
         // a reminder would bypass that cap (and, for a responsibility
         // question, carry the employee's text with buttons).
-        if super::NO_REMINDER_KINDS.contains(&rec.action_kind.as_str()) {
+        if super::no_reminder(&rec.action_kind) {
             return;
         }
         let Some(home) = self.home_dir() else { return };

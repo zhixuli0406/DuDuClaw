@@ -53,10 +53,11 @@ pub const REMIND_MIN_TTL_SECONDS: i64 = 120;
 /// reminder: a responsibility question (its notice goes through the
 /// responsibility notifier and its per-window cap) and a terminal-filed
 /// responsibility change (per-target hourly cap). They still expire.
-pub(crate) const NO_REMINDER_KINDS: &[&str] = &[
-    crate::responsibility::DECISION_KIND,
-    crate::responsibility::operator_gate::ACTION_KIND,
-];
+/// Operator-CLI kinds come from `operator_cli_gate::OPERATOR_CLI_KINDS`
+/// (`KindSpec::reminders`).
+pub(crate) fn no_reminder(kind: &str) -> bool {
+    kind == crate::responsibility::DECISION_KIND || operator_cli_gate::no_reminder(kind)
+}
 
 const SELF_NOTIFYING_KINDS: &[&str] = &[
     "goal_kickoff",
@@ -92,6 +93,7 @@ pub use binding::{
 };
 pub use operations::{OPERATION_LEASE_HELD, OperationClaim, OperationRecord, OperationState};
 mod gates;
+pub mod operator_cli_gate;
 mod simulation;
 mod store;
 

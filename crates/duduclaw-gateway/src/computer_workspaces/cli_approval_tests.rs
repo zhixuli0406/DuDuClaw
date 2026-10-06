@@ -168,29 +168,40 @@ async fn a_channel_decision_is_refused_and_the_request_stays_pending() {
 // ── second review (M-3, M-6) ─────────────────────────────────────────────
 
 #[tokio::test]
-async fn a_state_change_updates_the_one_pending_request_in_place() {
+async fn a_state_change_voids_the_waiting_request_and_files_a_new_one() {
     let home = tempfile::tempdir().unwrap();
     let (store, id) = revoked_workspace(home.path());
     let broker = ApprovalBroker::open(home.path()).unwrap();
     let row = store.get(&id).unwrap().unwrap();
-    let Gate::Requested(req) = gate(&broker, GatedAction::Delete, &row, 30).await.unwrap() else {
+    let Gate::Requested(mut req) = gate(&broker, GatedAction::Delete, &row, 30).await.unwrap() else {
         panic!("no request");
     };
-    // A fence moves the state version; repeated runs keep one request.
+    // A fence moves the state version: the waiting card describes a state
+    // that is gone, so it is invalidated and a new one is filed (never
+    // rewritten in place under an Admin who may be reading it).
     for _ in 0..3 {
         store.fence(&id, "operator:t", "loop").unwrap();
         let moved = store.get(&id).unwrap().unwrap();
-        assert_eq!(
-            gate(&broker, GatedAction::Delete, &moved, 30)
-                .await
-                .unwrap(),
-            Gate::Pending(req.clone())
-        );
+        let Gate::Requested(next) = gate(&broker, GatedAction::Delete, &moved, 30)
+            .await
+            .unwrap()
+        else {
+            panic!("a changed state files a new request");
+        };
+        assert_ne!(next, req);
+        let old = broker.get(&req).await.unwrap().unwrap();
+        assert_eq!(old.status, ApprovalStatus::Invalidated);
+        assert_eq!(old.invalidated_reason.as_deref(), Some("state_changed"));
+        req = next;
     }
     let all = broker.list_by_kind(ACTION_KIND).await.unwrap();
-    assert_eq!(all.len(), 1, "one request per (action, workspace)");
+    let waiting: Vec<_> = all
+        .iter()
+        .filter(|r| r.status == ApprovalStatus::Pending)
+        .collect();
+    assert_eq!(waiting.len(), 1, "one waiting request per (action, workspace)");
     let now = store.get(&id).unwrap().unwrap();
-    assert_eq!(all[0].payload["state_version"], state_version(&now));
+    assert_eq!(waiting[0].payload["state_version"], state_version(&now));
 }
 
 #[tokio::test]

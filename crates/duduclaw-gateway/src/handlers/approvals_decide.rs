@@ -115,69 +115,20 @@ impl MethodHandler {
         // Board-kind gate (WP17 invariant).
         if let Some(rec) = &record {
             let kind = crate::governance::ApprovalKind::parse(&rec.action_kind);
+            // U5: a request filed from an operator terminal (LINE inbox,
+            // continuous responsibilities, forget by source, computer
+            // workspaces) is decided only by a current Admin (role re-read
+            // from users.db, not the cached context). The kinds and their
+            // refusal texts come from one registry.
+            if let Some(spec) = crate::approval::operator_cli_gate::spec_for(&rec.action_kind) {
+                if crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx)
+                    .is_err()
+                {
+                    return WsFrame::error_response("", spec.admin_refusal);
+                }
+            }
             // Decision Lab is admin-only. A manager who cannot inspect the
             // exact synthetic run must not mint its human-inspection receipt.
-            // F2: terminal-filed LINE inbox changes are decided by a current
-            // Admin only (role re-read from users.db, not the cached context).
-            if rec.action_kind == crate::channel_ingress::cli_approval::ACTION_KIND
-                && crate::approval::require_current_dashboard_role_in_home(
-                    &self.home_dir,
-                    ctx,
-                    UserRole::Admin,
-                )
-                .is_err()
-            {
-                return WsFrame::error_response(
-                    "",
-                    "LINE 收件匣的指令列請求只能由管理員（Admin）核准。",
-                );
-            }
-            // P2-C: terminal-filed computer-workspace changes are decided by a
-            // current Admin only (role re-read from users.db, not the cached
-            // context), same rule as the LINE inbox requests above.
-            if rec.action_kind == crate::computer_workspaces::cli_approval::ACTION_KIND
-                && crate::approval::require_current_dashboard_role_in_home(
-                    &self.home_dir,
-                    ctx,
-                    UserRole::Admin,
-                )
-                .is_err()
-            {
-                return WsFrame::error_response(
-                    "",
-                    "電腦操作工作區的管理請求只能由管理員（Admin）核准。",
-                );
-            }
-            // P2-A: a responsibility change filed from the operator CLI widens
-            // spending or authority — only a current Admin may decide it (role
-            // re-read from users.db). An expired one is refused above by the
-            // shared dashboard-only stale check.
-            if rec.action_kind == crate::responsibility::operator_gate::ACTION_KIND
-                && (!ctx.is_admin()
-                    || crate::approval::require_current_dashboard_role_in_home(
-                        &self.home_dir,
-                        ctx,
-                        UserRole::Admin,
-                    )
-                    .is_err())
-            {
-                return WsFrame::error_response("", "這類持續任務變更只能由管理員決定。");
-            }
-            // Forget by source deletes memory irreversibly: Admin only.
-            if rec.action_kind
-                == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE
-                && crate::approval::require_current_dashboard_role_in_home(
-                    &self.home_dir,
-                    ctx,
-                    UserRole::Admin,
-                )
-                .is_err()
-            {
-                return WsFrame::error_response(
-                    "",
-                    "依來源刪除記憶的請求只有管理員（Admin）能決定",
-                );
-            }
             if rec.action_kind == "support_pilot_review" && !ctx.is_admin() {
                 return WsFrame::error_response(
                     "",

@@ -93,6 +93,9 @@ const DESCRIBED_KINDS = new Set([
   'knowledge_quarantine',
   'workflow_activation',
   'memory_forget_source',
+  'channel_ingress_admin',
+  'responsibility_operator_change',
+  'computer_workspace_admin',
 ]);
 
 /** D1/D2: `true` when there is an actual narrative or risk point to show —

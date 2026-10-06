@@ -17,9 +17,14 @@
 //!   so after pause → resume → pause an old approval no longer matches;
 //! - the approval is claimed before applying (exactly one run wins);
 //! - requests for the same (action, target) and the same content are merged;
-//!   different content is a separate request and invalidates nobody (the
-//!   first one applied changes the state, so the others stop matching);
+//!   different content is a separate request and invalidates nobody; a
+//!   waiting or approved request made against an older state is invalidated
+//!   (`state_changed`) and a new one filed;
 //! - pushes are capped per target per hour ([`PUSH_CAP_PER_HOUR`]).
+//!
+//! Matching, merging, caps and consumption are the shared operator-CLI gate
+//! (`approval::operator_cli_gate`); this module supplies the binding, the
+//! cards, the texts and [`SPEC`].
 //!
 //! The emergency route is the dashboard (the task page's stop button runs
 //! with a real identity) and the `[responsibilities] enabled` switch.
@@ -31,16 +36,19 @@
 
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde_json::{Value, json};
 
 use super::sha256_hex;
-use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord, ApprovalStatus};
+use crate::approval::operator_cli_gate::{
+    self as shared, Binding, Consume, Filing, KindSpec, StatePolicy, Validity,
+};
+use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord};
 use crate::task_store::{ResponsibilityRow, TaskRow, WakeupRow};
 
 pub const ACTION_KIND: &str = "responsibility_operator_change";
 /// The actor recorded for anything the terminal does.
-pub const UNVERIFIED_ACTOR: &str = "本機指令列（身分未驗證）";
+pub const UNVERIFIED_ACTOR: &str = shared::UNVERIFIED_ACTOR;
 const TTL_SECONDS: i64 = 24 * 3600;
 /// Pushes per target per hour for terminal-filed requests.
 pub const PUSH_CAP_PER_HOUR: usize = 2;
@@ -124,16 +132,20 @@ pub enum Gate {
     /// A request for this change and state is still waiting.
     Pending(ApprovalId),
     /// L-4: this (action, target) already has [`MAX_PENDING_PER_TARGET`]
-    /// different requests waiting; no new row is filed.
+    /// different requests waiting (or the kind has
+    /// `shared::DEFAULT_MAX_PENDING_PER_KIND`); no new row is filed.
     Throttled(usize),
+    /// A usable approval existed but another run consumed or invalidated it
+    /// first.
+    AlreadyClaimed(ApprovalId),
 }
 
 /// L-4: different-content requests waiting for one (action, target).
-pub const MAX_PENDING_PER_TARGET: usize = 3;
+pub const MAX_PENDING_PER_TARGET: usize = shared::DEFAULT_MAX_PENDING_PER_TARGET;
 
 /// What the gate did besides its answer: approvals it voided and why
-/// (`not_dashboard_decision` / `approval_expired` / `duplicate`), so the
-/// caller can audit them (D.1-3).
+/// (`not_dashboard_decision` / `state_changed` / `approval_expired` /
+/// `duplicate`), so the caller can audit them (D.1-3).
 pub type Voided = Vec<(ApprovalId, &'static str)>;
 
 /// The state a responsibility change is bound to (`None` for `create`).
@@ -165,17 +177,13 @@ pub fn request_hash(op: &str, target: &str, args: &Value, state: &Value) -> Stri
     sha256_hex(&json!([op, target, args, state]).to_string())
 }
 
-fn field<'a>(r: &'a ApprovalRecord, key: &str) -> Option<&'a str> {
-    r.payload.get(key).and_then(|v| v.as_str())
+/// Hash of the exact change alone (the state is bound separately).
+pub fn request_digest(op: &str, target: &str, args: &Value) -> String {
+    sha256_hex(&json!([op, target, args]).to_string())
 }
 
-fn decided_within(decided_at: Option<&str>, valid_minutes: i64, now: DateTime<Utc>) -> bool {
-    decided_at
-        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-        .is_some_and(|t| {
-            let age = now.signed_duration_since(t.with_timezone(&Utc));
-            age >= chrono::Duration::zero() && age <= chrono::Duration::minutes(valid_minutes)
-        })
+fn field<'a>(r: &'a ApprovalRecord, key: &str) -> Option<&'a str> {
+    r.payload.get(key).and_then(|v| v.as_str())
 }
 
 /// Everything a request carries besides its card text.
@@ -202,90 +210,39 @@ pub async fn gate_with_voided(
     broker: &ApprovalBroker,
     req: &GateRequest<'_>,
 ) -> Result<(Gate, Voided), String> {
-    let mut voided: Voided = Vec::new();
     let op = req.action.as_str();
-    let hash = request_hash(op, req.target, req.args, req.state);
-    let now = Utc::now();
-    let mut pending: Option<ApprovalId> = None;
-    for rec in broker.list_by_kind(ACTION_KIND).await? {
-        if field(&rec, "op") != Some(op)
-            || field(&rec, "target") != Some(req.target)
-            || field(&rec, "request_hash") != Some(hash.as_str())
-        {
-            continue;
-        }
-        match rec.status {
-            ApprovalStatus::Approved => {
-                let by_dashboard = rec
-                    .decided_by
-                    .as_deref()
-                    .is_some_and(|by| by.starts_with("dashboard:"));
-                if !by_dashboard {
-                    broker
-                        .invalidate_request(&rec.id, "not_dashboard_decision")
-                        .await?;
-                    voided.push((rec.id.clone(), "not_dashboard_decision"));
-                    continue;
-                }
-                if !decided_within(rec.decided_at.as_deref(), req.valid_minutes, now) {
-                    broker
-                        .invalidate_request(&rec.id, "approval_expired")
-                        .await?;
-                    voided.push((rec.id.clone(), "approval_expired"));
-                    continue;
-                }
-                if broker.consume_approved(&rec.id, "applied").await? {
-                    return Ok((Gate::Proceed(rec.id), voided));
-                }
-            }
-            ApprovalStatus::Pending => {
-                let live = broker
-                    .get(&rec.id)
-                    .await?
-                    .is_some_and(|r| r.status == ApprovalStatus::Pending && !r.is_stale(now));
-                if !live {
-                    continue;
-                }
-                if pending.is_some() {
-                    broker.invalidate_request(&rec.id, "duplicate").await?;
-                    voided.push((rec.id.clone(), "duplicate"));
-                    continue;
-                }
-                pending = Some(rec.id);
-            }
-            _ => {}
-        }
-    }
-    if let Some(id) = pending {
-        return Ok((Gate::Pending(id), voided));
-    }
-    // L-4: different content for the same (action, target) is a separate
-    // request, but only a few may wait at once.
-    let waiting = broker
-        .list_by_kind(ACTION_KIND)
-        .await?
-        .into_iter()
-        .filter(|r| {
-            r.status == ApprovalStatus::Pending
-                && !r.is_stale(now)
-                && field(r, "op") == Some(op)
-                && field(r, "target") == Some(req.target)
-        })
-        .count();
-    if waiting >= MAX_PENDING_PER_TARGET {
-        return Ok((Gate::Throttled(waiting), voided));
-    }
-    let payload = json!({
-        "op": op,
-        "target": req.target,
-        "request_hash": hash,
-        "args": req.args,
-        "requested_by": UNVERIFIED_ACTOR,
-    });
-    let id = broker
-        .request(req.owner, ACTION_KIND, req.card, payload, TTL_SECONDS)
-        .await?;
-    Ok((Gate::Requested(id), voided))
+    let digest = request_digest(op, req.target, req.args);
+    let bind = Binding {
+        action: op,
+        target: req.target,
+        request_digest: digest.clone(),
+        state: req.state.to_string(),
+        state_policy: StatePolicy::MustMatch,
+        push_scope: None,
+    };
+    let filing = Filing {
+        agent_id: req.owner,
+        summary: req.card,
+        extra: json!({
+            "op": op,
+            "target": req.target,
+            "request_hash": digest,
+            "args": req.args,
+            "requested_by": UNVERIFIED_ACTOR,
+        }),
+        ttl_secs: TTL_SECONDS,
+    };
+    let (decided, voided) =
+        shared::gate(broker, &SPEC, &bind, filing, Some(req.valid_minutes), Utc::now()).await?;
+    let voided: Voided = voided.into_iter().map(|(id, why)| (id, why.as_str())).collect();
+    let gate = match decided {
+        shared::Gate::Proceed(claim) => Gate::Proceed(claim.id),
+        shared::Gate::Requested(id) => Gate::Requested(id),
+        shared::Gate::Pending(id) => Gate::Pending(id),
+        shared::Gate::Throttled { waiting, .. } => Gate::Throttled(waiting),
+        shared::Gate::AlreadyClaimed(id) => Gate::AlreadyClaimed(id),
+    };
+    Ok((gate, voided))
 }
 
 /// Employee-controlled text on a card: quoted, labelled, cut.
@@ -495,31 +452,19 @@ pub(crate) fn notice_body(rec: &ApprovalRecord, reminder: bool, deadline: &str) 
     )
 }
 
-/// Whether one more push for `rec`'s target fits this hour's cap. Past it an
-/// audit row is written and the request stays in the dashboard inbox only.
+/// Whether one more push for `rec`'s target fits this hour's cap (the shared
+/// operator-CLI push cap). Past it an audit row is written and the request
+/// stays in the dashboard inbox only.
 pub async fn push_allowed(home: &Path, rec: &ApprovalRecord) -> bool {
-    let Some(target) = field(rec, "target").map(str::to_string) else {
-        return false;
-    };
-    let Ok(broker) = ApprovalBroker::open(home) else {
-        return false;
-    };
-    let Ok(all) = broker.list_by_kind(ACTION_KIND).await else {
-        return false;
-    };
-    let hour_ago = Utc::now() - chrono::Duration::hours(1);
-    let pushed = all
-        .iter()
-        .filter(|r| r.id != rec.id && r.notify_channel.is_some())
-        .filter(|r| field(r, "target") == Some(target.as_str()))
-        .filter(|r| {
-            DateTime::parse_from_rfc3339(&r.created_at)
-                .is_ok_and(|t| t.with_timezone(&Utc) >= hour_ago)
-        })
-        .count();
-    if pushed < PUSH_CAP_PER_HOUR {
-        return true;
-    }
+    shared::push_allowed(home, rec).await
+}
+
+/// Security audit row for a push past the hourly cap.
+fn audit_push_suppressed(home: &Path, rec: &ApprovalRecord, pushed: usize) {
+    let target = shared::binding_of(rec)
+        .map(|b| b.target)
+        .or_else(|| field(rec, "target").map(str::to_string))
+        .unwrap_or_default();
     duduclaw_security::audit::append_audit_event(
         home,
         &duduclaw_security::audit::AuditEvent::new(
@@ -529,8 +474,24 @@ pub async fn push_allowed(home: &Path, rec: &ApprovalRecord) -> bool {
             json!({"target": target, "pushed_last_hour": pushed}),
         ),
     );
-    false
 }
+
+/// This kind in the shared operator-CLI gate registry.
+pub const SPEC: KindSpec = KindSpec {
+    kind: ACTION_KIND,
+    validity: Validity::Config(valid_minutes),
+    consume: Consume::Once,
+    reminders: false,
+    max_pending_per_target: MAX_PENDING_PER_TARGET,
+    max_pending_per_kind: shared::DEFAULT_MAX_PENDING_PER_KIND,
+    push_cap_per_hour: Some(PUSH_CAP_PER_HOUR),
+    legacy_scope_key: "target",
+    admin_refusal: "這類持續任務變更只能由管理員決定。",
+    expired_text: EXPIRED_TEXT,
+    channel_refusal: Some(CHANNEL_REFUSAL),
+    notice: notice_body,
+    on_push_suppressed: audit_push_suppressed,
+};
 
 /// The validity window from `config.toml [responsibilities]
 /// operator_approval_minutes` (1..=1440, default 30; unreadable ⇒ default).

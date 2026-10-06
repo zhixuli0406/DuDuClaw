@@ -64,19 +64,9 @@ pub const NO_BARRIER_NOTE: &str = "已依核准更新工作區登錄：進行中
 
 /// Variables a DuDuClaw-spawned process (an employee's turn, a delegated
 /// task, an MCP server) carries. Any of them present and non-empty refuses.
-pub const SESSION_ENV_VARS: &[&str] = &[
-    "DUDUCLAW_AGENT_ID",
-    "DUDUCLAW_AGENT_TOKEN",
-    "DUDUCLAW_TURN_ID",
-    "DUDUCLAW_SESSION_ID",
-    "DUDUCLAW_REPLY_CHANNEL",
-    "DUDUCLAW_HOP_DEPTH",
-    "DUDUCLAW_DELEGATION_SENDER",
-    "DUDUCLAW_DELEGATION_ORIGIN",
-    "DUDUCLAW_DELEGATION_DEPTH",
-    "DUDUCLAW_MCP_API_KEY",
-    "DUDUCLAW_DATA_FILE_GUARD",
-];
+/// One list for every operator-only command
+/// (`crate::ai_session_guard::AI_SESSION_ENV_VARS`).
+pub const SESSION_ENV_VARS: &[&str] = crate::ai_session_guard::AI_SESSION_ENV_VARS;
 
 /// The refusal for an environment that carries any [`SESSION_ENV_VARS`],
 /// `None` for a plain terminal.
@@ -140,10 +130,23 @@ fn gated(cmd: &ComputerWorkspaceCommands) -> Option<(GatedAction, &str)> {
     }
 }
 
+/// The free text the approval also binds (a fence's reason).
+fn bound_reason(cmd: &ComputerWorkspaceCommands) -> Option<&str> {
+    match cmd {
+        ComputerWorkspaceCommands::Fence { reason, .. } => Some(reason.as_str()),
+        _ => None,
+    }
+}
+
 /// The dashboard approval of a gated action: the consumed approval id, or
 /// the error the terminal prints (non-zero exit). Requests and refusals are
 /// audited here.
-async fn require_approval(home: &Path, action: GatedAction, workspace_id: &str) -> Result<String> {
+async fn require_approval(
+    home: &Path,
+    action: GatedAction,
+    workspace_id: &str,
+    reason: Option<&str>,
+) -> Result<String> {
     let act = action.as_str();
     let refuse = |reason: &str, msg: String| {
         audit_cli_action(home, CliPhase::Refused, act, workspace_id, None, reason);
@@ -164,7 +167,7 @@ async fn require_approval(home: &Path, action: GatedAction, workspace_id: &str) 
     let valid_minutes = duduclaw_gateway::computer_workspaces::config::load(home)
         .map(|c| c.admin_approval_minutes)
         .unwrap_or(30);
-    let decided = cli_approval::gate(&broker, action, &row, i64::from(valid_minutes))
+    let decided = cli_approval::gate_with_reason(&broker, action, &row, reason, i64::from(valid_minutes))
         .await
         .map_err(|e| refuse("approvals_unavailable", e))?;
     match decided {
@@ -190,6 +193,32 @@ async fn require_approval(home: &Path, action: GatedAction, workspace_id: &str) 
             }
             Ok(id.as_str().to_string())
         }
+        Gate::AlreadyClaimed(id) => {
+            audit_cli_action(
+                home,
+                CliPhase::Refused,
+                act,
+                workspace_id,
+                Some(id.as_str()),
+                "already_claimed",
+            );
+            Err(DuDuClawError::Agent(format!(
+                "這筆核准（編號 {id}）已被另一次執行用掉或作廢，這次沒有執行任何動作；需要的話請重新執行指令，送出新的核准請求。"
+            )))
+        }
+        Gate::Throttled(waiting) => {
+            audit_cli_action(
+                home,
+                CliPhase::Refused,
+                act,
+                workspace_id,
+                None,
+                "too_many_waiting",
+            );
+            Err(DuDuClawError::Agent(format!(
+                "這個工作區已有 {waiting} 筆請求在等核准，沒有再送出新的。{GO_TO_DASHBOARD}。"
+            )))
+        }
         Gate::Requested(id) | Gate::Pending(id) => {
             audit_cli_action(
                 home,
@@ -211,7 +240,12 @@ async fn require_approval(home: &Path, action: GatedAction, workspace_id: &str) 
 const APPROVAL_SPENT: &str = "核准已使用，需要重新申請：";
 
 pub async fn run(home: &Path, cmd: ComputerWorkspaceCommands) -> Result<()> {
-    run_with_env(home, cmd, |k| std::env::var(k).ok()).await
+    // `var_os`, not `var`: a non-UTF-8 value must still count as present
+    // (`var(..).ok()` would read it as unset and skip the session check).
+    run_with_env(home, cmd, |k| {
+        std::env::var_os(k).map(|v| v.to_string_lossy().into_owned())
+    })
+    .await
 }
 
 /// [`run`] with the environment lookup injected (tests run in one process
@@ -253,7 +287,7 @@ async fn run_with_env(
     }
     let approved = match gated(&cmd) {
         Some((action, id)) => {
-            let approval = require_approval(home, action, id).await?;
+            let approval = require_approval(home, action, id, bound_reason(&cmd)).await?;
             Some((action.as_str(), id.to_string(), approval))
         }
         None => None,

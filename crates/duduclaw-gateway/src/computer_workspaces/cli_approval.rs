@@ -8,12 +8,16 @@
 //!
 //! 1. The first run files an ApprovalBroker request of the dashboard-only
 //!    kind [`ACTION_KIND`] (channel decisions refused, Admin only), bound to
-//!    the action, the workspace id and the workspace's state version, and
-//!    exits non-zero with [`GO_TO_DASHBOARD`].
+//!    the action, the workspace id, the fence reason and the workspace's
+//!    state version, and exits non-zero with [`GO_TO_DASHBOARD`].
 //! 2. Re-running the same command finds the approval; if the workspace's
 //!    state version is unchanged it consumes the approval (exactly one run
-//!    wins) and acts. A changed state invalidates the request and files a
-//!    new one.
+//!    wins) and acts. A changed state invalidates the request (approved or
+//!    waiting, reason `state_changed`) and files a new one.
+//!
+//! Matching, merging, caps and consumption are the shared operator-CLI gate
+//! (`approval::operator_cli_gate`); this module supplies the binding, the
+//! texts and [`SPEC`].
 //!
 //! No setting turns this off. Only `list` needs no approval.
 //!
@@ -27,12 +31,17 @@
 use serde_json::{Value, json};
 
 use super::store::WorkspaceRow;
-use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord, ApprovalStatus};
+use crate::approval::operator_cli_gate::{
+    self as shared, Binding, Consume, Filing, KindSpec, StatePolicy, Validity,
+};
+use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord};
+#[cfg(test)]
+use crate::approval::ApprovalStatus;
 
 /// The dashboard-only approval kind.
 pub const ACTION_KIND: &str = "computer_workspace_admin";
 /// The actor recorded for anything the terminal does.
-pub const UNVERIFIED_ACTOR: &str = "本機指令列（身分未驗證）";
+pub const UNVERIFIED_ACTOR: &str = shared::UNVERIFIED_ACTOR;
 /// The sentence every card carries.
 pub const CARD_NOTE: &str = "這筆請求由本機指令列建立，系統無法確認下指令的人是誰";
 /// What the terminal prints while no usable approval exists.
@@ -88,8 +97,20 @@ pub fn state_version(row: &WorkspaceRow) -> String {
 
 /// The card: workspace id, owner, action and counts only.
 pub fn card_summary(action: GatedAction, row: &WorkspaceRow) -> String {
+    card_with_reason(action, row, None)
+}
+
+fn card_with_reason(action: GatedAction, row: &WorkspaceRow, reason: Option<&str>) -> String {
+    let why = reason
+        .map(|r| {
+            format!(
+                "理由（使用者輸入，僅供參考）：「{}」。",
+                duduclaw_core::truncate_chars(r, 80)
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "電腦操作工作區：{}。工作區 {}，擁有者 {}，{} 個檔案、{} 位元組。{CARD_NOTE}。",
+        "電腦操作工作區：{}。工作區 {}，擁有者 {}，{} 個檔案、{} 位元組。{why}{CARD_NOTE}。",
         action.label(),
         row.workspace_id,
         row.owner_agent_id,
@@ -98,7 +119,7 @@ pub fn card_summary(action: GatedAction, row: &WorkspaceRow) -> String {
     )
 }
 
-fn payload(action: GatedAction, row: &WorkspaceRow) -> Value {
+fn payload(action: GatedAction, row: &WorkspaceRow, reason: Option<&str>) -> Value {
     json!({
         "action": action.as_str(),
         "workspace_id": row.workspace_id,
@@ -106,6 +127,7 @@ fn payload(action: GatedAction, row: &WorkspaceRow) -> Value {
         "state_version": state_version(row),
         "files_used": row.files_used,
         "bytes_used": row.bytes_used,
+        "reason": reason,
         "requested_by": UNVERIFIED_ACTOR,
     })
 }
@@ -119,118 +141,73 @@ pub enum Gate {
     Requested(ApprovalId),
     /// A request for this action and state is still waiting.
     Pending(ApprovalId),
+    /// Too many requests wait already; nothing was filed.
+    Throttled(usize),
+    /// The approval was used or invalidated by another run a moment ago.
+    AlreadyClaimed(ApprovalId),
 }
 
-fn matches(rec_payload: &Value, action: GatedAction, workspace_id: &str) -> bool {
-    rec_payload.get("action").and_then(Value::as_str) == Some(action.as_str())
-        && rec_payload.get("workspace_id").and_then(Value::as_str) == Some(workspace_id)
+/// The request digest: action, workspace and (for a fence) the reason.
+fn request_digest(action: GatedAction, workspace_id: &str, reason: Option<&str>) -> String {
+    shared::digest(&[action.as_str(), workspace_id, reason.unwrap_or("")])
 }
 
-/// Whether an approved request is still inside its validity window
-/// (`valid_minutes` after the decision). An unparsable or missing decision
-/// time is outside it (fail closed).
-fn still_valid(
-    decided_at: Option<&str>,
-    valid_minutes: i64,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    decided_at
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .is_some_and(|t| {
-            let age = now.signed_duration_since(t.with_timezone(&chrono::Utc));
-            age >= chrono::Duration::zero() && age <= chrono::Duration::minutes(valid_minutes)
-        })
-}
-
-/// Check for a usable approval, or file a request (see the module doc).
-///
-/// - An approval counts only when an Admin decided it in the dashboard
-///   (`dashboard:` prefix), it is bound to the current state version and it
-///   was decided within `valid_minutes`; anything else is invalidated so
-///   rows do not pile up.
-/// - At most one pending request per (action, workspace): a state change
-///   updates that request's text in place (no new push); duplicates are
-///   invalidated.
+/// [`gate_with_reason`] without a reason.
 pub async fn gate(
     broker: &ApprovalBroker,
     action: GatedAction,
     row: &WorkspaceRow,
     valid_minutes: i64,
 ) -> Result<Gate, String> {
-    let version = state_version(row);
-    let now = chrono::Utc::now();
-    let mut pending: Option<ApprovalId> = None;
-    for rec in broker.list_by_kind(ACTION_KIND).await? {
-        if !matches(&rec.payload, action, &row.workspace_id) {
-            continue;
-        }
-        let same_state =
-            rec.payload.get("state_version").and_then(Value::as_str) == Some(version.as_str());
-        match rec.status {
-            ApprovalStatus::Approved => {
-                let by_dashboard = rec
-                    .decided_by
-                    .as_deref()
-                    .is_some_and(|by| by.starts_with("dashboard:"));
-                let why = if !by_dashboard {
-                    Some("not_dashboard_decision")
-                } else if !same_state {
-                    Some("state_changed")
-                } else if !still_valid(rec.decided_at.as_deref(), valid_minutes, now) {
-                    Some("approval_expired")
-                } else {
-                    None
-                };
-                if let Some(why) = why {
-                    broker.invalidate_request(&rec.id, why).await?;
-                    continue;
-                }
-                // Consume: only the run whose nonce the row ends up carrying
-                // acts (the UPDATE only matches a still-approved row).
-                let nonce = format!("consumed:{}", uuid::Uuid::new_v4().as_simple());
-                broker.invalidate_request(&rec.id, &nonce).await?;
-                let after = broker.get(&rec.id).await?;
-                if after.is_some_and(|r| r.invalidated_reason.as_deref() == Some(nonce.as_str())) {
-                    return Ok(Gate::Proceed(rec.id));
-                }
-            }
-            ApprovalStatus::Pending => {
-                // `get` settles a pending row past its TTL (fail closed).
-                let live = broker
-                    .get(&rec.id)
-                    .await?
-                    .is_some_and(|r| r.status == ApprovalStatus::Pending && !r.is_stale(now));
-                if !live {
-                    continue;
-                }
-                if pending.is_some() {
-                    broker.invalidate_request(&rec.id, "duplicate").await?;
-                    continue;
-                }
-                if !same_state {
-                    // Same request, new state: update its text, no new push.
-                    broker
-                        .replace_text(&rec.id, &card_summary(action, row), &payload(action, row))
-                        .await?;
-                }
-                pending = Some(rec.id);
-            }
-            _ => {}
-        }
-    }
-    if let Some(id) = pending {
-        return Ok(Gate::Pending(id));
-    }
-    let id = broker
-        .request(
-            &row.owner_agent_id,
-            ACTION_KIND,
-            &card_summary(action, row),
-            payload(action, row),
-            TTL_SECS,
-        )
-        .await?;
-    Ok(Gate::Requested(id))
+    gate_with_reason(broker, action, row, None, valid_minutes).await
+}
+
+/// Check for a usable approval, or file a request (see the module doc).
+///
+/// - An approval counts only when an Admin decided it in the dashboard
+///   (`dashboard:` prefix), for the same reason, bound to the current state
+///   version and decided within `valid_minutes`; anything else is
+///   invalidated so rows do not pile up.
+/// - One waiting request per (action, workspace, reason): a state change
+///   invalidates it (`state_changed`) and files a new one.
+pub async fn gate_with_reason(
+    broker: &ApprovalBroker,
+    action: GatedAction,
+    row: &WorkspaceRow,
+    reason: Option<&str>,
+    valid_minutes: i64,
+) -> Result<Gate, String> {
+    let bind = Binding {
+        action: action.as_str(),
+        target: &row.workspace_id,
+        request_digest: request_digest(action, &row.workspace_id, reason),
+        state: state_version(row),
+        state_policy: StatePolicy::MustMatch,
+        push_scope: None,
+    };
+    let summary = card_with_reason(action, row, reason);
+    let filing = Filing {
+        agent_id: &row.owner_agent_id,
+        summary: &summary,
+        extra: payload(action, row, reason),
+        ttl_secs: TTL_SECS,
+    };
+    let (decided, _voided) = shared::gate(
+        broker,
+        &SPEC,
+        &bind,
+        filing,
+        Some(valid_minutes),
+        chrono::Utc::now(),
+    )
+    .await?;
+    Ok(match decided {
+        shared::Gate::Proceed(claim) => Gate::Proceed(claim.id),
+        shared::Gate::Requested(id) => Gate::Requested(id),
+        shared::Gate::Pending(id) => Gate::Pending(id),
+        shared::Gate::Throttled { waiting, .. } => Gate::Throttled(waiting),
+        shared::Gate::AlreadyClaimed(id) => Gate::AlreadyClaimed(id),
+    })
 }
 
 /// One phase of a terminal action, for the security audit log.
@@ -338,52 +315,59 @@ pub fn notice_body(rec: &ApprovalRecord, reminder: bool, deadline: &str) -> Stri
     )
 }
 
-/// Whether one more push for `rec`'s workspace fits this hour's cap. When
-/// it does not, an audit event `admin_approval_push_suppressed` is written
-/// and the request stays in the dashboard inbox only.
+/// Whether one more push for `rec`'s workspace fits this hour's cap (the
+/// shared operator-CLI push cap). When it does not, a workspace event
+/// `admin_approval_push_suppressed` is written and the request stays in the
+/// dashboard inbox only.
 pub async fn push_allowed(home: &std::path::Path, rec: &ApprovalRecord) -> bool {
-    let Some(ws) = rec
-        .payload
-        .get("workspace_id")
-        .and_then(Value::as_str)
-        .filter(|id| super::paths::valid_workspace_id(id))
-        .map(str::to_string)
-    else {
-        return false;
-    };
-    let Ok(broker) = ApprovalBroker::open(home) else {
-        return false;
-    };
-    let Ok(all) = broker.list_by_kind(ACTION_KIND).await else {
-        return false;
-    };
-    let hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
-    let pushed = all
-        .iter()
-        .filter(|r| r.id != rec.id && r.notify_channel.is_some())
-        .filter(|r| r.payload.get("workspace_id").and_then(Value::as_str) == Some(ws.as_str()))
-        .filter(|r| {
-            chrono::DateTime::parse_from_rfc3339(&r.created_at)
-                .is_ok_and(|t| t.with_timezone(&chrono::Utc) >= hour_ago)
-        })
-        .count();
-    if pushed < PUSH_CAP_PER_HOUR {
-        return true;
-    }
-    let home = home.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || {
-        super::shared::shared_blocking(&home).and_then(|s| {
-            s.note(
-                &ws,
-                "admin_approval_push_suppressed",
-                "system:approval_notify",
-                json!({"pushed_last_hour": pushed}),
-            )
-        })
-    })
-    .await;
-    false
+    shared::push_allowed(home, rec).await
 }
+
+/// Workspace event for a push past the hourly cap.
+fn note_push_suppressed(home: &std::path::Path, rec: &ApprovalRecord, pushed: usize) {
+    let ws = shared::binding_of(rec)
+        .map(|b| b.target)
+        .or_else(|| {
+            rec.payload
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|id| super::paths::valid_workspace_id(id));
+    let Some(ws) = ws else { return };
+    let _ = super::shared::shared_blocking(home).and_then(|s| {
+        s.note(
+            &ws,
+            "admin_approval_push_suppressed",
+            "system:approval_notify",
+            json!({"pushed_last_hour": pushed}),
+        )
+    });
+}
+
+/// `[computer_use.workspaces] admin_approval_minutes` (unreadable ⇒ 30).
+fn configured_minutes(home: &std::path::Path) -> i64 {
+    super::config::load(home)
+        .map(|c| i64::from(c.admin_approval_minutes))
+        .unwrap_or(30)
+}
+
+/// This kind in the shared operator-CLI gate registry.
+pub const SPEC: KindSpec = KindSpec {
+    kind: ACTION_KIND,
+    validity: Validity::Config(configured_minutes),
+    consume: Consume::Once,
+    reminders: true,
+    max_pending_per_target: shared::DEFAULT_MAX_PENDING_PER_TARGET,
+    max_pending_per_kind: shared::DEFAULT_MAX_PENDING_PER_KIND,
+    push_cap_per_hour: Some(PUSH_CAP_PER_HOUR),
+    legacy_scope_key: "workspace_id",
+    admin_refusal: "電腦操作工作區的管理請求只能由管理員（Admin）核准。",
+    expired_text: EXPIRED_TEXT,
+    channel_refusal: None,
+    notice: notice_body,
+    on_push_suppressed: note_push_suppressed,
+};
 
 #[cfg(all(test, unix))]
 #[path = "cli_approval_tests.rs"]
