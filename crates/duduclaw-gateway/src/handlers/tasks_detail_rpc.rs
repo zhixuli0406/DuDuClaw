@@ -57,7 +57,7 @@ impl MethodHandler {
         }
         // Viewer suffices to comment — anyone who can see the task may discuss it.
         if let Err(f) = self
-            .authorize_task_access(&store, ctx, task_id, AccessLevel::Viewer)
+            .authorize_private_task_read(&store, ctx, task_id, AccessLevel::Viewer)
             .await
         {
             return f;
@@ -96,7 +96,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "task_id is required");
         }
         if let Err(f) = self
-            .authorize_task_access(&store, ctx, task_id, AccessLevel::Viewer)
+            .authorize_private_task_read(&store, ctx, task_id, AccessLevel::Viewer)
             .await
         {
             return f;
@@ -122,7 +122,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "task_id is required");
         }
         if let Err(f) = self
-            .authorize_task_access(&store, ctx, task_id, AccessLevel::Viewer)
+            .authorize_private_task_read(&store, ctx, task_id, AccessLevel::Viewer)
             .await
         {
             return f;
@@ -157,8 +157,8 @@ impl MethodHandler {
         if task_id.is_empty() {
             return WsFrame::error_response("", "task_id is required");
         }
-        let task = match self
-            .authorize_task_access(&store, ctx, task_id, AccessLevel::Viewer)
+        let (task, _) = match self
+            .authorize_private_task_read(&store, ctx, task_id, AccessLevel::Viewer)
             .await
         {
             Ok(t) => t,
@@ -223,12 +223,17 @@ impl MethodHandler {
         if task_id.is_empty() {
             return WsFrame::error_response("", "task_id is required");
         }
-        let task = match self
-            .authorize_task_access(&store, ctx, task_id, AccessLevel::Viewer)
+        let (task, live) = match self
+            .authorize_private_task_read(&store, ctx, task_id, AccessLevel::Viewer)
             .await
         {
             Ok(t) => t,
             Err(f) => return f,
+        };
+        let ctx = &live;
+        let workflows = match self.workflow_store().await {
+            Ok(w) => w,
+            Err(_) => return WsFrame::error_response("", "permission denied")
         };
         let limit = params
             .get("limit")
@@ -258,11 +263,45 @@ impl MethodHandler {
             &until,
             limit,
         );
-        let artifacts: Vec<Value> = evidence
-            .artifacts
-            .iter()
-            .map(|a| a.to_wire_json())
-            .collect();
+        let current = crate::task_store::TaskAuthoritySnapshot {
+            task_id: task.id.clone(),
+            revision: task.authority_revision,
+            hash: task.authority_snapshot_hash(),
+            status: task.status.clone(),
+            claimed_by: task.claimed_by.clone(),
+            eligible: task.approval_eligible()
+        };
+        let candidates =
+            super::artifact_evidence::evidence_candidates(&workflows, task_id, &evidence.artifacts)
+                .await;
+        let mut projections = super::artifact_evidence::Projections::default();
+        let mut artifacts = Vec::new();
+        for row in &evidence.artifacts {
+            if let Some(name) = &row.archived_name {
+                if crate::review_evidence::download::authorize_artifact_access(
+                    &self.home_dir,
+                    &workflows,
+                    ctx,
+                    (!row.agent_id.is_empty()).then_some(row.agent_id.as_str()),
+                    name
+                )
+                .await
+                .is_err()
+                {
+                    continue;
+                }
+            }
+            let value = super::artifact_evidence::artifact_row_json(
+                &self.home_dir,
+                row,
+                task_id,
+                &current,
+                ctx,
+                &candidates,
+                &mut projections,
+            );
+            artifacts.push(value);
+        }
         WsFrame::ok_response(
             "",
             json!({
@@ -286,7 +325,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "task_id is required");
         }
         if let Err(f) = self
-            .authorize_task_access(&store, ctx, task_id, AccessLevel::Viewer)
+            .authorize_private_task_read(&store, ctx, task_id, AccessLevel::Viewer)
             .await
         {
             return f;
@@ -442,8 +481,8 @@ impl MethodHandler {
         if task_id.is_empty() {
             return WsFrame::error_response("", "task_id is required");
         }
-        let row = match self
-            .authorize_task_access(&store, ctx, task_id, AccessLevel::Viewer)
+        let (row, _) = match self
+            .authorize_private_task_read(&store, ctx, task_id, AccessLevel::Viewer)
             .await
         {
             Ok(r) => r,
@@ -506,6 +545,12 @@ impl MethodHandler {
                 // goal has none (older goals, or created with
                 // `[goal_loop] criteria_ledger = "off"`).
                 "criteria_ledger": criteria_ledger_json(&self.home_dir, &row),
+                // Whether team packets (written by AI role members) limit who
+                // may see this task, to which keys, and which packet did it.
+                "audience_restriction": crate::review_evidence::audience::audience_restriction_json(
+                    &self.home_dir,
+                    task_id,
+                ),
             }),
         )
     }
@@ -546,7 +591,7 @@ impl MethodHandler {
                 return WsFrame::error_response("", "接著做需要附上訊息");
             }
             if let Err(f) = self
-                .authorize_task_access(&store, ctx, task_id, AccessLevel::Operator)
+                .authorize_private_task_read(&store, ctx, task_id, AccessLevel::Operator)
                 .await
             {
                 return f;
@@ -593,7 +638,7 @@ impl MethodHandler {
             .map(|s| duduclaw_core::truncate_chars(s.trim(), 2000))
             .unwrap_or_default();
         if let Err(f) = self
-            .authorize_task_access(&store, ctx, task_id, AccessLevel::Operator)
+            .authorize_private_task_read(&store, ctx, task_id, AccessLevel::Operator)
             .await
         {
             return f;
@@ -688,6 +733,129 @@ mod criteria_ledger_rpc_tests {
     use super::*;
     use crate::goal_loop::criteria_ledger::{CriteriaLedger, CriteriaLedgerMode};
 
+    #[tokio::test]
+    async fn artifacts_source_only_rechecks_revoked_live_dashboard_context() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("agents/sales")).unwrap();
+        std::fs::write(home.path().join("agents/sales/report.md"), "private source").unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let user = db
+            .create_user(
+                "manager@test.invalid",
+                "Manager",
+                "isolated-test-password",
+                UserRole::Manager
+            )
+            .unwrap();
+        db.bind_agent(&user.id, "sales", AccessLevel::Viewer)
+            .unwrap();
+        let mut cached = UserContext::admin_fallback();
+        cached.user_id = user.id.clone();
+        cached.role = user.role;
+        cached
+            .agent_access
+            .insert("sales".into(), AccessLevel::Viewer);
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        // The gateway installs the task store at boot (`server.rs`); a bare
+        // handler has none, so the fixture installs one the same way.
+        handler
+            .set_task_store(Arc::new(TaskStore::open(home.path()).unwrap()))
+            .await;
+        let tasks = handler.task_store().await.unwrap();
+        let row = TaskRow::new(
+            "source-task".into(),
+            "Report".into(),
+            String::new(),
+            "normal".into(),
+            "sales".into(),
+            "system".into()
+        );
+        tasks.insert_task(&row).await.unwrap();
+        std::fs::write(home.path().join(crate::task_changes::TASK_CHANGES_FILE),format!("{}\n",json!({
+            "task_id": "source-task",
+            "agent_id": "sales",
+            "path": home.path().join("agents/sales/report.md"),
+            "op": "write",
+            "tool_name": "Write",
+            "timestamp": Utc::now().to_rfc3339(),
+            "success": true,
+            "source": "native",
+            "round": 1
+        }))).unwrap();
+        let packet_dir = home
+            .path()
+            .join(duduclaw_core::task_packet::TEAM_PACKETS_DIR)
+            .join("source-task")
+            .join("1");
+        std::fs::create_dir_all(&packet_dir).unwrap();
+        std::fs::write(packet_dir.join("review.json"),json!({
+            "packet_id": "review",
+            "goal_id": "source-task",
+            "round": 1,
+            "from_role": "executor",
+            "to_role": "verifier",
+            "objective": "Review",
+            "output_format": "files",
+            "audience": ["role:manager"]
+        }).to_string()).unwrap();
+        let current = handler
+            .handle_tasks_artifacts(json!({"task_id":"source-task"}), &cached)
+            .await;
+        assert!(matches!(current, WsFrame::Response { ok: true, .. }));
+        let produced = crate::artifacts::collect_task_artifacts(
+            home.path(),
+            "source-task",
+            "sales",
+            &row.created_at,
+            &row.updated_at,
+            32
+        );
+        assert!(produced.artifacts.iter().any(|a| a.archived_name.is_none()));
+        db.unbind_agent(&user.id, "sales").unwrap();
+        assert!(matches!(
+            handler
+                .handle_tasks_artifacts(json!({"task_id":"source-task"}), &cached)
+                .await,
+            WsFrame::Response { ok: false, .. }
+        ));
+        db.bind_agent(&user.id, "sales", AccessLevel::Viewer)
+            .unwrap();
+        db.update_user(&user.id, None, Some(UserRole::Employee), None)
+            .unwrap();
+        assert!(matches!(
+            handler
+                .handle_tasks_artifacts(json!({"task_id":"source-task"}), &cached)
+                .await,
+            WsFrame::Response { ok: false, .. }
+        ));
+        db.update_user(&user.id, None, Some(UserRole::Manager), None)
+            .unwrap();
+        let auth = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        auth.execute(
+            "UPDATE users SET must_change_password=1 WHERE id=?1",
+            [&user.id]
+        )
+        .unwrap();
+        assert!(matches!(
+            handler
+                .handle_tasks_artifacts(json!({"task_id":"source-task"}), &cached)
+                .await,
+            WsFrame::Response { ok: false, .. }
+        ));
+        auth.execute(
+            "UPDATE users SET must_change_password=0 WHERE id=?1",
+            [&user.id]
+        )
+        .unwrap();
+        db.set_user_status(&user.id, duduclaw_auth::UserStatus::Suspended)
+            .unwrap();
+        assert!(matches!(
+            handler
+                .handle_tasks_artifacts(json!({"task_id":"source-task"}), &cached)
+                .await,
+            WsFrame::Response { ok: false, .. }
+        ));
+    }
     #[test]
     fn tasks_timeline_criteria_ledger_shape_and_null() {
         let home = tempfile::tempdir().unwrap();

@@ -137,3 +137,12 @@ duduclaw-pets = { path = "crates/duduclaw-pets", default-features = false }
 duduclaw-relay = { path = "crates/duduclaw-relay" }
 duduclaw-sysd = { path = "crates/duduclaw-sysd" }
 duduclaw-db = { path = "crates/duduclaw-db" }
+
+# Debug builds only (the release profile is untouched). The workflow MCP path
+# hashes the whole running CLI binary (~336 MB in a debug build) with SHA-256
+# on every workflow tool call to detect environment drift. Unoptimized `sha2`
+# takes 13-19 s per hash, which made every debug workflow call (and every
+# timing-bounded stdio test) slow. Optimizing just this crate brings one hash
+# to under a second; the hash input, algorithm and every check are unchanged.
+[profile.dev.package.sha2]
+opt-level = 3

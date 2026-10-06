@@ -336,7 +336,11 @@ pub(crate) const PERMISSION_CONDITIONAL_TOOLS: &[&str] = &["tasks_create", "crea
 /// `can_send_cross_agent` when `assigned_to` names another employee;
 /// `create_task` needs `can_send_cross_agent` when a step names another
 /// employee.
-pub(crate) fn permissions_for_call(tool_name: &str, args: &Value, caller: &str) -> Vec<&'static str> {
+pub(crate) fn permissions_for_call(
+    tool_name: &str,
+    args: &Value,
+    caller: &str,
+) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = PERMISSION_GATED_TOOLS
         .iter()
         .filter(|(t, _)| *t == tool_name)
@@ -349,7 +353,11 @@ pub(crate) fn permissions_for_call(tool_name: &str, args: &Value, caller: &str) 
     };
     match tool_name {
         "tasks_create" => {
-            if args.get("schedule").and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty()) {
+            if args
+                .get("schedule")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty())
+            {
                 out.push("can_schedule_tasks");
             }
             if other_agent(args.get("assigned_to")) {
@@ -359,7 +367,11 @@ pub(crate) fn permissions_for_call(tool_name: &str, args: &Value, caller: &str) 
         "create_task" => {
             let steps = args.get("steps").and_then(|v| v.as_array());
             if steps.is_some_and(|steps| {
-                steps.iter().any(|st| ["agent", "agent_id", "assigned_to"].iter().any(|k| other_agent(st.get(*k))))
+                steps.iter().any(|st| {
+                    ["agent", "agent_id", "assigned_to"]
+                        .iter()
+                        .any(|k| other_agent(st.get(*k)))
+                })
             }) {
                 out.push("can_send_cross_agent");
             }
@@ -413,10 +425,17 @@ async fn load_agent_permissions(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
             Err(e) => return Err(format!("agent.toml unreadable: {e}")),
         };
-        let table: toml::Table = text.parse().map_err(|_| "agent.toml does not parse".to_string())?;
+        let table: toml::Table = text
+            .parse()
+            .map_err(|_| "agent.toml does not parse".to_string())?;
         if let Some(p) = table.get("permissions") {
             let p = p.as_table().ok_or("[permissions] is not a table")?;
-            for k in ["can_create_agents", "can_send_cross_agent", "can_schedule_tasks", "can_modify_own_skills"] {
+            for k in [
+                "can_create_agents",
+                "can_send_cross_agent",
+                "can_schedule_tasks",
+                "can_modify_own_skills",
+            ] {
                 if p.get(k).is_some_and(|v| !v.is_bool()) {
                     return Err(format!("[permissions] {k} is not true/false"));
                 }
@@ -480,6 +499,7 @@ pub struct McpDispatcher {
     /// stdio, HTTP, SSE — enforces egress at this one shared choke point
     /// (complete mediation, invariant I3). `Arc` keeps `Clone` cheap.
     pub redaction: Option<Arc<crate::mcp_redaction::McpRedactionLayer>>,
+    pub(crate) workflow_session: Option<Arc<crate::mcp::workflow_operation::WorkflowSession>>,
 }
 
 impl McpDispatcher {
@@ -504,7 +524,16 @@ impl McpDispatcher {
             rate_limiter,
             daily_quota,
             redaction: None,
+            workflow_session: None,
         }
+    }
+
+    pub(crate) fn with_workflow_session(
+        mut self,
+        session: Option<Arc<crate::mcp::workflow_operation::WorkflowSession>>,
+    ) -> Self {
+        self.workflow_session = session;
+        self
     }
 
     /// Attach an RFC-23 egress redaction layer (P2-4).
@@ -595,6 +624,23 @@ impl McpDispatcher {
         params: &Value,
         id: &Value,
     ) -> Value {
+        let workflow = match crate::mcp::workflow_operation::WorkflowCall::parse(
+            self.workflow_session.as_ref(),
+            principal,
+            params,
+        )
+        .await
+        {
+            Ok(call) => call,
+            Err(error) => return jsonrpc_error(id, -32003, &error),
+        };
+        let mut clean_params = params.clone();
+        if workflow.is_some() {
+            if let Some(object) = clean_params.as_object_mut() {
+                object.remove("_meta");
+            }
+        }
+        let params = &clean_params;
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         tracing::Span::current().record(duduclaw_gateway::otel::attrs::TOOL_NAME, tool_name);
 
@@ -642,7 +688,10 @@ impl McpDispatcher {
 
         // ── 1. Scope check ───────────────────────────────────────────────────
         if removed_reply.is_none()
-            && let Some(required) = crate::mcp_auth::tool_requires_scope_for_args(tool_name, params.get("arguments").unwrap_or(&Value::Null))
+            && let Some(required) = crate::mcp_auth::tool_requires_scope_for_args(
+                tool_name,
+                params.get("arguments").unwrap_or(&Value::Null),
+            )
         {
             if !principal.scopes.contains(&required) && !principal.scopes.contains(&Scope::Admin) {
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
@@ -812,8 +861,11 @@ impl McpDispatcher {
             use duduclaw_core::tool_catalog::{
                 ToolListVerdict, removed_name_for_call, tool_list_matches, tool_list_verdict,
             };
-            let mut verdict =
-                tool_list_verdict(tool_name, &agent_gate.denied_tools, &agent_gate.allowed_tools);
+            let mut verdict = tool_list_verdict(
+                tool_name,
+                &agent_gate.denied_tools,
+                &agent_gate.allowed_tools,
+            );
             // A `denied_tools` entry written for a removed name (e.g.
             // `shared_wiki_write`) keeps refusing the call that replaced it
             // (`wiki_write` with `scope="shared"`) rather than lapsing
@@ -938,15 +990,64 @@ impl McpDispatcher {
                     return jsonrpc_error(id, -32003, &format!("Denied by policy: {reason}"));
                 }
                 duduclaw_security::policy_kernel::Decision::Ask { risk } => {
-                    // D-2: lazily open the broker only on escalation (rare),
-                    // avoiding a constructor/signature change on every
-                    // McpDispatcher::new call site.
-                    let broker = match duduclaw_gateway::approval::ApprovalBroker::open(
-                        &self.home_dir,
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error = %e, "ApprovalBroker unavailable — denying (fail-closed)");
+                    if let Some(call) = &workflow {
+                        if let Err(error) = call.require_human("policy_ask", &params_owned).await {
+                            return jsonrpc_error(id, -32003, &error);
+                        }
+                    } else {
+                        // D-2: lazily open the broker only on escalation (rare),
+                        // avoiding a constructor/signature change on every
+                        // McpDispatcher::new call site.
+                        let broker = match duduclaw_gateway::approval::ApprovalBroker::open(
+                            &self.home_dir,
+                        ) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(error = %e, "ApprovalBroker unavailable — denying (fail-closed)");
+                                duduclaw_gateway::otel::record_tool_outcome(
+                                    &tracing::Span::current(),
+                                    false,
+                                );
+                                return jsonrpc_error(
+                                    id,
+                                    -32003,
+                                    "Approval required but broker unavailable (fail-closed deny)",
+                                );
+                            }
+                        };
+                        let approval_id = match broker
+                            .request(
+                                gate_agent,
+                                "mcp_call",
+                                &risk,
+                                duduclaw_core::with_host_task_id(
+                                    params_owned.clone(),
+                                    duduclaw_core::host_task_id().as_deref(),
+                                ),
+                                POLICY_ASK_TTL_SECONDS,
+                            )
+                            .await
+                        {
+                            Ok(aid) => aid,
+                            Err(e) => {
+                                warn!(error = %e, "approval request failed — denying (fail-closed)");
+                                duduclaw_gateway::otel::record_tool_outcome(
+                                    &tracing::Span::current(),
+                                    false,
+                                );
+                                return jsonrpc_error(
+                                    id,
+                                    -32003,
+                                    "Approval request failed (fail-closed deny)",
+                                );
+                            }
+                        };
+                        let granted = broker
+                            .await_decision(&approval_id, POLICY_ASK_POLL)
+                            .await
+                            .map(|s| s.is_granted())
+                            .unwrap_or(false);
+                        if !granted {
                             duduclaw_gateway::otel::record_tool_outcome(
                                 &tracing::Span::current(),
                                 false,
@@ -954,52 +1055,20 @@ impl McpDispatcher {
                             return jsonrpc_error(
                                 id,
                                 -32003,
-                                "Approval required but broker unavailable (fail-closed deny)",
+                                "Tool call denied or expired at human approval (fail-closed)",
                             );
                         }
-                    };
-                    let approval_id = match broker
-                        .request(
-                            gate_agent,
-                            "mcp_call",
-                            &risk,
-                            params_owned.clone(),
-                            POLICY_ASK_TTL_SECONDS,
-                        )
-                        .await
-                    {
-                        Ok(aid) => aid,
-                        Err(e) => {
-                            warn!(error = %e, "approval request failed — denying (fail-closed)");
-                            duduclaw_gateway::otel::record_tool_outcome(
-                                &tracing::Span::current(),
-                                false,
-                            );
-                            return jsonrpc_error(
-                                id,
-                                -32003,
-                                "Approval request failed (fail-closed deny)",
-                            );
-                        }
-                    };
-                    let granted = broker
-                        .await_decision(&approval_id, POLICY_ASK_POLL)
-                        .await
-                        .map(|s| s.is_granted())
-                        .unwrap_or(false);
-                    if !granted {
-                        duduclaw_gateway::otel::record_tool_outcome(
-                            &tracing::Span::current(),
-                            false,
-                        );
-                        return jsonrpc_error(
-                            id,
-                            -32003,
-                            "Tool call denied or expired at human approval (fail-closed)",
-                        );
                     }
                 }
             }
+        }
+
+        if workflow.is_some()
+            && params_owned
+                .get("arguments")
+                .is_some_and(|v| v.to_string().contains("<REDACT:"))
+        {
+            return jsonrpc_error(id, -32003, "workflow_secret_restore_unsupported");
         }
 
         // ── 3.6 Egress "secret in-use" decision (RFC-23 / P2-4) ──────────────
@@ -1300,11 +1369,22 @@ impl McpDispatcher {
 
         // Policy rewrites can change tasks_create.kind. Recheck the effective
         // arguments before either human approval or execution.
-        if let Some(required) = crate::mcp_auth::tool_requires_scope_for_args(tool_name,
-            params_owned.get("arguments").unwrap_or(&Value::Null)) {
+        if let Some(required) = crate::mcp_auth::tool_requires_scope_for_args(
+            tool_name,
+            params_owned.get("arguments").unwrap_or(&Value::Null),
+        ) {
             if !principal.scopes.contains(&required) && !principal.scopes.contains(&Scope::Admin) {
-                self.audit_dispatch_denial(tool_name, &params_owned, "insufficient_scope", "effective arguments exceed caller scope");
-                return jsonrpc_error(id, -32003, &format!("Insufficient scope: {required:?} required for '{tool_name}'"));
+                self.audit_dispatch_denial(
+                    tool_name,
+                    &params_owned,
+                    "insufficient_scope",
+                    "effective arguments exceed caller scope",
+                );
+                return jsonrpc_error(
+                    id,
+                    -32003,
+                    &format!("Insufficient scope: {required:?} required for '{tool_name}'"),
+                );
             }
         }
 
@@ -1323,11 +1403,12 @@ impl McpDispatcher {
             // is `gateway-internal`, whose `agents/gateway-internal/agent.toml`
             // does not exist, so approval_required_tools / irreversible_tools /
             // maybe_irreversible_tools were never enforced in production.
-            if let Err(msg) = crate::mcp::gate_tool_approval_dispatch(
+            if let Err(msg) = crate::mcp::approval::gate_tool_approval_dispatch_workflow(
                 &self.home_dir,
                 gate_agent,
                 tool_name,
                 params_owned.clone(),
+                workflow.as_ref(),
             )
             .await
             {
@@ -1336,9 +1417,35 @@ impl McpDispatcher {
             }
         }
 
+        if let Some(call) = &workflow {
+            if call.is_prepare() {
+                return match call.finish_prepare(&params_owned) {
+                    Ok(ticket) => jsonrpc_response(id, ticket),
+                    Err(error) => jsonrpc_error(id, -32003, &error),
+                };
+            }
+        }
+        let operation_claim = if let Some(call) = &workflow {
+            if !call.is_read() {
+                match call.before_effect(&params_owned).await {
+                    Ok(value) => Some(value),
+                    Err(error) => return jsonrpc_error(id, -32003, &error),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let effect_observation = Arc::new(std::sync::Mutex::new(
+            crate::mcp::workflow_operation::HandlerObservation::RejectedBeforeEffect,
+        ));
+        let read_observation = Arc::new(std::sync::Mutex::new(
+            crate::mcp::workflow_operation::ReadObservation::Unobserved,
+        ));
         // ── 4. Tool dispatch ─────────────────────────────────────────────────
         let caller_is_admin = principal.scopes.contains(&Scope::Admin);
-        let mut result = crate::mcp::handle_tools_call(
+        let handler = crate::mcp::handle_tools_call(
             id,
             &params_owned,
             &self.home_dir,
@@ -1350,8 +1457,47 @@ impl McpDispatcher {
             &self.daily_quota,
             &principal.client_id,
             caller_is_admin,
-        )
-        .await;
+        );
+        let mut result = if let Some(call) = &workflow {
+            if call.is_read() {
+                crate::mcp::workflow_operation::READ_OBSERVATION
+                    .scope(read_observation.clone(), handler)
+                    .await
+            } else {
+                crate::mcp::workflow_operation::EFFECT_OBSERVATION
+                    .scope(effect_observation.clone(), handler)
+                    .await
+            }
+        } else {
+            handler.await
+        };
+        let workflow_response = if let Some(call) = &workflow {
+            let response = if let Some((broker, claim)) = &operation_claim {
+                let observation = effect_observation
+                    .lock()
+                    .map(|o| o.clone())
+                    .unwrap_or(crate::mcp::workflow_operation::HandlerObservation::Unknown);
+                call.settle(broker, claim, &observation, &result).await
+            } else {
+                let observation = read_observation
+                    .lock()
+                    .map(|o| o.clone())
+                    .unwrap_or(crate::mcp::workflow_operation::ReadObservation::Unobserved);
+                call.read_reply(&params_owned, &result, &observation)
+            };
+            match response {
+                Ok(reply) => Some(reply),
+                Err(error) => {
+                    return jsonrpc_error(
+                        id,
+                        -32003,
+                        &format!("workflow_result_unconfirmed: {error}"),
+                    );
+                }
+            }
+        } else {
+            None
+        };
 
         // ── 4.5 Egress result redaction (RFC-23 / P2-4) ──────────────────────
         // Redact the tool result so the LLM never sees raw internal data; the
@@ -1381,6 +1527,25 @@ impl McpDispatcher {
             &tracing::Span::current(),
             result.get("error").is_none(),
         );
+        if let Some(mut reply) = workflow_response {
+            if operation_claim.is_some() {
+                reply["result"] = result.clone();
+            } else if let Some(layer) = &self.redaction {
+                if let Some(output) = reply.get_mut("result") {
+                    crate::mcp_redaction::redact_tool_result_with(
+                        &layer.manager,
+                        tool_name,
+                        output,
+                        redaction_agent,
+                        &layer.session_id,
+                        params_owned.get("arguments"),
+                    );
+                    let presentation_hash = duduclaw_gateway::approval::payload_hash(output);
+                    reply["result_hash"] = serde_json::json!(presentation_hash);
+                }
+            }
+            return jsonrpc_response(id, reply);
+        }
         result
     }
 }
@@ -1514,12 +1679,25 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_dispatcher(&tmp).await;
         let principal = make_principal(vec![Scope::MemoryRead], false);
-        let response = dispatcher.dispatch_tool_call(&principal, &make_ns_ctx(false),
-            &make_params("tasks_create",serde_json::json!({"kind":"discovery","title":"fixture"})),
-            &serde_json::json!(1)).await;
-        assert_eq!(response["error"]["code"],-32003);
-        assert!(response["error"]["message"].as_str().unwrap().contains("DiscoveryExecute"),
-            "the production pipeline must use the discovery argument scope, not the static Admin task scope: {response}");
+        let response = dispatcher
+            .dispatch_tool_call(
+                &principal,
+                &make_ns_ctx(false),
+                &make_params(
+                    "tasks_create",
+                    serde_json::json!({"kind":"discovery","title":"fixture"}),
+                ),
+                &serde_json::json!(1),
+            )
+            .await;
+        assert_eq!(response["error"]["code"], -32003);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("DiscoveryExecute"),
+            "the production pipeline must use the discovery argument scope, not the static Admin task scope: {response}"
+        );
     }
 
     #[tokio::test]
@@ -1527,22 +1705,66 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_dispatcher(&tmp).await;
         let principal = make_principal(vec![Scope::Admin], false);
-        let listed = crate::mcp::handle_tools_list_for_agent(&serde_json::json!(1), &principal, tmp.path(), "dudu").await;
+        let listed = crate::mcp::handle_tools_list_for_agent(
+            &serde_json::json!(1),
+            &principal,
+            tmp.path(),
+            "dudu",
+        )
+        .await;
         let tools = listed["result"]["tools"].as_array().unwrap();
-        let create = tools.iter().find(|tool| tool["name"] == "tasks_create").unwrap();
+        let create = tools
+            .iter()
+            .find(|tool| tool["name"] == "tasks_create")
+            .unwrap();
         let properties = &create["inputSchema"]["properties"];
-        assert!(properties["kind"]["enum"].as_array().unwrap().contains(&serde_json::json!("discovery")));
+        assert!(
+            properties["kind"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("discovery"))
+        );
         assert_eq!(properties["discovery"]["type"], "object");
-        assert_eq!(properties["discovery"]["properties"]["budget"]["type"], "object");
-        for name in ["discovery_catalog","discovery_list","discovery_tree","discovery_artifact","discovery_cancel"] {
-            assert!(tools.iter().any(|tool| tool["name"] == name), "real tools/list must declare {name}");
-            let response = dispatcher.dispatch_tool_call(&principal,&make_ns_ctx(false),
-                &make_params(name,serde_json::json!({"run_id":"fixture"})),&serde_json::json!(2)).await;
-            assert!(response.to_string().contains("signed caller identity"),"listed tool must reach its real trusted-caller gate, without any provider call: {response}");
-            let external = make_principal(vec![Scope::Admin],true);
-            let denied = dispatcher.dispatch_tool_call(&external,&make_ns_ctx(true),
-                &make_params(name,serde_json::json!({})),&serde_json::json!(3)).await;
-            assert_eq!(denied["error"]["code"],-32601,"external Admin cannot open the internal discovery surface");
+        assert_eq!(
+            properties["discovery"]["properties"]["budget"]["type"],
+            "object"
+        );
+        for name in [
+            "discovery_catalog",
+            "discovery_list",
+            "discovery_tree",
+            "discovery_artifact",
+            "discovery_cancel",
+        ] {
+            assert!(
+                tools.iter().any(|tool| tool["name"] == name),
+                "real tools/list must declare {name}"
+            );
+            let response = dispatcher
+                .dispatch_tool_call(
+                    &principal,
+                    &make_ns_ctx(false),
+                    &make_params(name, serde_json::json!({"run_id":"fixture"})),
+                    &serde_json::json!(2),
+                )
+                .await;
+            assert!(
+                response.to_string().contains("signed caller identity"),
+                "listed tool must reach its real trusted-caller gate, without any provider call: {response}"
+            );
+            let external = make_principal(vec![Scope::Admin], true);
+            let denied = dispatcher
+                .dispatch_tool_call(
+                    &external,
+                    &make_ns_ctx(true),
+                    &make_params(name, serde_json::json!({})),
+                    &serde_json::json!(3),
+                )
+                .await;
+            assert_eq!(
+                denied["error"]["code"], -32601,
+                "external Admin cannot open the internal discovery surface"
+            );
         }
     }
 
@@ -3039,7 +3261,10 @@ effect = "forbid"
             let result = task.await.unwrap();
             panic!("call was never held for approval (gate fell open): {result}");
         };
-        broker.decide(&rec.id, approve, "test-approver").await.unwrap();
+        broker
+            .decide(&rec.id, approve, "test-approver")
+            .await
+            .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(30), task)
             .await
             .expect("dispatch must return once the approval is decided")
@@ -3062,10 +3287,19 @@ effect = "forbid"
             false,
         )
         .await;
-        assert_eq!(rec.agent_id, "dudu", "approval must be filed for the acting agent");
-        assert_eq!(result["error"]["code"], -32003, "denied approval must block: {result}");
+        assert_eq!(
+            rec.agent_id, "dudu",
+            "approval must be filed for the acting agent"
+        );
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "denied approval must block: {result}"
+        );
         let msg = result["error"]["message"].as_str().unwrap_or("");
-        assert!(msg.contains("拒絕"), "denial must be reported to the agent: {msg}");
+        assert!(
+            msg.contains("拒絕"),
+            "denial must be reported to the agent: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -3111,7 +3345,10 @@ effect = "forbid"
             "irreversible tools go through the ActionGuard summary: {}",
             rec.summary
         );
-        assert_eq!(result["error"]["code"], -32003, "denied approval must block: {result}");
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "denied approval must block: {result}"
+        );
     }
 
     /// Control: a tool the acting agent does NOT list runs straight through —
@@ -3185,7 +3422,10 @@ effect = "forbid"
         assert_eq!(rec.agent_id, "dudu");
         assert_eq!(rec.action_kind, "mcp_call");
         let msg = result["error"]["message"].as_str().unwrap_or("");
-        assert!(msg.contains("denied or expired at human approval"), "got: {result}");
+        assert!(
+            msg.contains("denied or expired at human approval"),
+            "got: {result}"
+        );
     }
 
     /// The injection-scan audit row attributes the block to the acting agent.
@@ -3263,78 +3503,282 @@ effect = "forbid"
     #[test]
     fn permission_mapping_is_exact() {
         let none = &Value::Null;
-        assert_eq!(permissions_for_call("create_agent", none, "me"), vec!["can_create_agents"]);
-        assert_eq!(permissions_for_call("spawn_ephemeral", none, "me"), vec!["can_create_agents"]);
-        assert_eq!(permissions_for_call("team_handoff", none, "me"), vec!["can_send_cross_agent"]);
-        assert_eq!(permissions_for_call("run_cron_task", none, "me"), vec!["can_schedule_tasks"]);
-        assert_eq!(permissions_for_call("shared_skill_share", none, "me"), vec!["can_modify_own_skills"]);
-        assert!(permissions_for_call("tasks_create", &serde_json::json!({"title": "x", "assigned_to": "me"}), "me").is_empty());
         assert_eq!(
-            permissions_for_call("tasks_create", &serde_json::json!({"schedule": "0 9 * * *", "assigned_to": "bob"}), "me"),
+            permissions_for_call("create_agent", none, "me"),
+            vec!["can_create_agents"]
+        );
+        assert_eq!(
+            permissions_for_call("spawn_ephemeral", none, "me"),
+            vec!["can_create_agents"]
+        );
+        assert_eq!(
+            permissions_for_call("team_handoff", none, "me"),
+            vec!["can_send_cross_agent"]
+        );
+        assert_eq!(
+            permissions_for_call("run_cron_task", none, "me"),
+            vec!["can_schedule_tasks"]
+        );
+        assert_eq!(
+            permissions_for_call("shared_skill_share", none, "me"),
+            vec!["can_modify_own_skills"]
+        );
+        assert!(
+            permissions_for_call(
+                "tasks_create",
+                &serde_json::json!({"title": "x", "assigned_to": "me"}),
+                "me"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            permissions_for_call(
+                "tasks_create",
+                &serde_json::json!({"schedule": "0 9 * * *", "assigned_to": "bob"}),
+                "me"
+            ),
             vec!["can_schedule_tasks", "can_send_cross_agent"]
         );
         assert_eq!(
-            permissions_for_call("create_task", &serde_json::json!({"steps": [{"agent": "bob"}]}), "me"),
+            permissions_for_call(
+                "create_task",
+                &serde_json::json!({"steps": [{"agent": "bob"}]}),
+                "me"
+            ),
             vec!["can_send_cross_agent"]
         );
-        assert!(permissions_for_call("create_agents", none, "me").is_empty(), "no prefix match");
+        assert!(
+            permissions_for_call("create_agents", none, "me").is_empty(),
+            "no prefix match"
+        );
     }
 
     /// Tools deliberately NOT governed by a `[permissions]` flag (read-only,
     /// self-scoped, or governed by their own capability / approval gates).
     const NOT_PERMISSION_GATED: &[&str] = &[
-        "activity_list", "activity_post", "agent_remove", "agent_status", "agent_update",
-        "agent_update_soul", "audit_trail_query", "autopilot_list", "belief_settle",
-        "belief_stats", "belief_submit", "browser_record_start", "browser_record_stop",
-        "calendar_create_event", "calendar_list_events", "cancel_reminder", "canvas_clear",
-        "canvas_push", "capability_request", "channel_config", "channel_config_list",
-        "channel_status", "check_responses", "code_map", "codrive_run", "codrive_status",
-        "computer_click", "computer_key", "computer_navigate", "computer_screenshot",
-        "computer_scroll", "computer_session_start", "computer_session_stop", "computer_type",
-        "cost_agents", "cost_multi_vs_single", "cost_recent", "cost_summary", "cost_users",
-        "csv_read", "db_query", "db_select", "db_sources", "db_tables", "decision_list",
-        "decision_resolve", "delete_cron_task", "desktop_record_start", "desktop_record_stop",
-        "diff_branches", "discovery_artifact", "discovery_cancel", "discovery_catalog",
-        "discovery_list", "discovery_tree", "docs_append", "docs_read", "drive_read",
-        "drive_search", "evolution_status", "evolution_toggle", "execute_program", "file_read",
-        "fork_cost", "fork_run", "forms_get", "forms_list_responses", "github_issue_comment",
-        "github_issue_read", "github_pr_read", "github_search_issues", "github_status",
-        "gmail_create_draft", "gmail_read", "gmail_search", "goals_create", "goals_list",
-        "google_status", "gtasks_complete", "gtasks_create", "gtasks_list", "gtasks_lists",
-        "hardware_info", "identity_resolve", "inference_mode", "inference_status",
-        "inspect_branches", "list_agents", "list_cron_tasks", "list_reminders",
-        "llamafile_list", "llamafile_start", "llamafile_stop", "mail_list", "mail_read",
-        "mail_send", "memory_alias_add", "memory_alias_list", "memory_consolidation_status",
-        "memory_episodic_pressure", "memory_fetch_batch", "memory_get_at", "memory_get_history",
-        "memory_improve", "memory_invalidate_by_origin", "memory_read", "memory_search",
-        "memory_search_by_layer", "memory_store", "memory_successful_conversations",
-        "merge_or_select", "model_download", "model_list", "model_load", "model_recommend",
-        "model_search", "model_unload", "notion_page_append", "notion_page_read",
-        "notion_search", "notion_status", "odoo_connect", "odoo_crm_create_lead",
-        "odoo_crm_leads", "odoo_crm_update_stage", "odoo_execute", "odoo_inventory_check",
-        "odoo_inventory_products", "odoo_invoice_list", "odoo_partner_search",
-        "odoo_payment_status", "odoo_report", "odoo_sale_confirm", "odoo_sale_create_quotation",
-        "odoo_sale_orders", "odoo_schema_fields", "odoo_search", "odoo_status", "office_script",
-        "os_apply_update", "os_audio_get", "os_audio_set", "os_backup_create", "os_backup_list",
-        "os_boot_assessment", "os_calendar_today", "os_check_update", "os_device_status",
-        "os_display_get", "os_display_set", "os_doctor_repair", "os_factory_reset",
-        "os_frontmost", "os_network_info", "os_notify", "os_open", "os_power",
-        "os_spotlight_search", "os_system_status", "os_update_rollback", "os_watch_status",
-        "os_wifi_connect", "os_wifi_scan", "os_wifi_status", "pairing_manage",
-        "pause_cron_task", "plan_get", "plan_start", "plan_update_step", "reliability_summary",
-        "route_query", "send_message", "send_photo", "send_sticker", "session_restore_context",
-        "shared_skill_list", "shared_wiki_delete", "sheets_append", "sheets_read",
+        "activity_list",
+        "activity_post",
+        "agent_remove",
+        "agent_status",
+        "agent_update",
+        "agent_update_soul",
+        "audit_trail_query",
+        "autopilot_list",
+        "belief_settle",
+        "belief_stats",
+        "belief_submit",
+        "browser_record_start",
+        "browser_record_stop",
+        "calendar_create_event",
+        "calendar_list_events",
+        "cancel_reminder",
+        "canvas_clear",
+        "canvas_push",
+        "capability_request",
+        "channel_config",
+        "channel_config_list",
+        "channel_status",
+        "check_responses",
+        "code_map",
+        "codrive_run",
+        "codrive_status",
+        "computer_click",
+        "computer_key",
+        "computer_navigate",
+        "computer_screenshot",
+        "computer_scroll",
+        "computer_session_start",
+        "computer_session_stop",
+        "computer_type",
+        "cost_agents",
+        "cost_multi_vs_single",
+        "cost_recent",
+        "cost_summary",
+        "cost_users",
+        "csv_read",
+        "db_query",
+        "db_select",
+        "db_sources",
+        "db_tables",
+        "decision_list",
+        "decision_resolve",
+        "delete_cron_task",
+        "desktop_record_start",
+        "desktop_record_stop",
+        "diff_branches",
+        "discovery_artifact",
+        "discovery_cancel",
+        "discovery_catalog",
+        "discovery_list",
+        "discovery_tree",
+        "docs_append",
+        "docs_read",
+        "drive_read",
+        "drive_search",
+        "evolution_status",
+        "evolution_toggle",
+        "execute_program",
+        "file_read",
+        "fork_cost",
+        "fork_run",
+        "forms_get",
+        "forms_list_responses",
+        "github_issue_comment",
+        "github_issue_read",
+        "github_pr_read",
+        "github_search_issues",
+        "github_status",
+        "gmail_create_draft",
+        "gmail_read",
+        "gmail_search",
+        "goals_create",
+        "goals_list",
+        "google_status",
+        "gtasks_complete",
+        "gtasks_create",
+        "gtasks_list",
+        "gtasks_lists",
+        "hardware_info",
+        "identity_resolve",
+        "inference_mode",
+        "inference_status",
+        "inspect_branches",
+        "list_agents",
+        "list_cron_tasks",
+        "list_reminders",
+        "llamafile_list",
+        "llamafile_start",
+        "llamafile_stop",
+        "mail_list",
+        "mail_read",
+        "mail_send",
+        "memory_alias_add",
+        "memory_alias_list",
+        "memory_consolidation_status",
+        "memory_episodic_pressure",
+        "memory_fetch_batch",
+        "memory_get_at",
+        "memory_get_history",
+        "memory_improve",
+        "memory_invalidate_by_origin",
+        "memory_read",
+        "memory_search",
+        "memory_search_by_layer",
+        "memory_store",
+        "memory_successful_conversations",
+        "merge_or_select",
+        "model_download",
+        "model_list",
+        "model_load",
+        "model_recommend",
+        "model_search",
+        "model_unload",
+        "notion_page_append",
+        "notion_page_read",
+        "notion_search",
+        "notion_status",
+        "odoo_connect",
+        "odoo_crm_create_lead",
+        "odoo_crm_leads",
+        "odoo_crm_update_stage",
+        "odoo_execute",
+        "odoo_inventory_check",
+        "odoo_inventory_products",
+        "odoo_invoice_list",
+        "odoo_partner_search",
+        "odoo_payment_status",
+        "odoo_report",
+        "odoo_sale_confirm",
+        "odoo_sale_create_quotation",
+        "odoo_sale_orders",
+        "odoo_schema_fields",
+        "odoo_search",
+        "odoo_status",
+        "office_script",
+        "os_apply_update",
+        "os_audio_get",
+        "os_audio_set",
+        "os_backup_create",
+        "os_backup_list",
+        "os_boot_assessment",
+        "os_calendar_today",
+        "os_check_update",
+        "os_device_status",
+        "os_display_get",
+        "os_display_set",
+        "os_doctor_repair",
+        "os_factory_reset",
+        "os_frontmost",
+        "os_network_info",
+        "os_notify",
+        "os_open",
+        "os_power",
+        "os_spotlight_search",
+        "os_system_status",
+        "os_update_rollback",
+        "os_watch_status",
+        "os_wifi_connect",
+        "os_wifi_scan",
+        "os_wifi_status",
+        "pairing_manage",
+        "pause_cron_task",
+        "plan_get",
+        "plan_start",
+        "plan_update_step",
+        "reliability_summary",
+        "route_query",
+        "send_message",
+        "send_photo",
+        "send_sticker",
+        "session_restore_context",
+        "shared_skill_list",
+        "shared_wiki_delete",
+        "sheets_append",
+        "sheets_read",
         "skill_bank_feedback",
-        "skill_curator_status", "skill_gaps", "skill_list", "skill_search",
-        "skill_security_scan", "skill_synthesis_status", "slides_read", "submit_feedback",
-        "synthesize_speech", "task_status", "tasks_block", "tasks_claim", "tasks_complete",
-        "tasks_list", "tasks_renew", "tasks_update", "terminate_branch", "transcribe_audio",
-        "user_code_profile", "user_profile_get", "user_profile_record", "web_extract",
-        "web_fetch_cached", "web_search", "wiki_dedup", "wiki_export", "wiki_graph",
-        "wiki_lint", "wiki_ls", "wiki_namespace_status", "wiki_read", "wiki_rebuild_fts",
-        "wiki_search", "wiki_share", "wiki_stats", "wiki_trust_audit", "wiki_trust_history",
-        "wiki_write", "working_state_clear", "working_state_get", "working_state_handoff",
-        "working_state_set", "xlsx_read",
+        "skill_curator_status",
+        "skill_gaps",
+        "skill_list",
+        "skill_search",
+        "skill_security_scan",
+        "skill_synthesis_status",
+        "slides_read",
+        "submit_feedback",
+        "synthesize_speech",
+        "task_status",
+        "tasks_block",
+        "tasks_claim",
+        "tasks_complete",
+        "tasks_list",
+        "tasks_renew",
+        "tasks_update",
+        "terminate_branch",
+        "transcribe_audio",
+        "user_code_profile",
+        "user_profile_get",
+        "user_profile_record",
+        "web_extract",
+        "web_fetch_cached",
+        "web_search",
+        "wiki_dedup",
+        "wiki_export",
+        "wiki_graph",
+        "wiki_lint",
+        "wiki_ls",
+        "wiki_namespace_status",
+        "wiki_read",
+        "wiki_rebuild_fts",
+        "wiki_search",
+        "wiki_share",
+        "wiki_stats",
+        "wiki_trust_audit",
+        "wiki_trust_history",
+        "wiki_write",
+        "working_state_clear",
+        "working_state_get",
+        "working_state_handoff",
+        "working_state_set",
+        "xlsx_read",
     ];
 
     /// Every advertised tool is classified explicitly, so a new tool cannot
@@ -3348,17 +3792,37 @@ effect = "forbid"
             .map(|(t, _)| *t)
             .chain(PERMISSION_CONDITIONAL_TOOLS.iter().copied())
             .collect();
-        let not_gated: std::collections::HashSet<&str> = NOT_PERMISSION_GATED.iter().copied().collect();
+        let not_gated: std::collections::HashSet<&str> =
+            NOT_PERMISSION_GATED.iter().copied().collect();
         let names: Vec<String> = crate::mcp::tools()
-            .map(|t| crate::mcp::build_tool_schema(t)["name"].as_str().unwrap_or_default().to_string())
+            .map(|t| {
+                crate::mcp::build_tool_schema(t)["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect();
-        assert_eq!(names.len(), 241, "tool count changed — classify the new tool here");
+        assert_eq!(
+            names.len(),
+            241,
+            "tool count changed — classify the new tool here"
+        );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
-        let unclassified: Vec<&&str> = all.iter().filter(|t| !gated.contains(**t) && !not_gated.contains(**t)).collect();
-        assert!(unclassified.is_empty(), "classify these tools for the [permissions] gate: {unclassified:?}");
+        let unclassified: Vec<&&str> = all
+            .iter()
+            .filter(|t| !gated.contains(**t) && !not_gated.contains(**t))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "classify these tools for the [permissions] gate: {unclassified:?}"
+        );
         let both: Vec<&&str> = gated.iter().filter(|t| not_gated.contains(**t)).collect();
         assert!(both.is_empty(), "{both:?}");
-        let stale: Vec<&&str> = gated.iter().chain(not_gated.iter()).filter(|t| !all.contains(**t)).collect();
+        let stale: Vec<&&str> = gated
+            .iter()
+            .chain(not_gated.iter())
+            .filter(|t| !all.contains(**t))
+            .collect();
         assert!(stale.is_empty(), "no such tool: {stale:?}");
     }
 
@@ -3369,9 +3833,20 @@ effect = "forbid"
         write_scoped_toml(&tmp, "[permissions]\ncan_schedule_tasks = \"no\"\n");
         let principal = make_principal(vec![Scope::Admin], false);
         let result = dispatcher
-            .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params("create_reminder", serde_json::json!({})), &serde_json::json!(3))
+            .dispatch_tool_call(
+                &principal,
+                &make_ns_ctx(false),
+                &make_params("create_reminder", serde_json::json!({})),
+                &serde_json::json!(3),
+            )
             .await;
-        assert!(result["error"]["message"].as_str().unwrap_or("").contains("[permissions]"), "{result}");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("[permissions]"),
+            "{result}"
+        );
     }
 
     #[tokio::test]
@@ -3384,14 +3859,25 @@ effect = "forbid"
             .dispatch_tool_call(
                 &principal,
                 &make_ns_ctx(false),
-                &make_params("tasks_create", serde_json::json!({"title": "x", "schedule": "0 9 * * *"})),
+                &make_params(
+                    "tasks_create",
+                    serde_json::json!({"title": "x", "schedule": "0 9 * * *"}),
+                ),
                 &serde_json::json!(1),
             )
             .await;
         assert_eq!(result["error"]["code"], -32003, "{result}");
-        assert!(result["error"]["message"].as_str().unwrap().contains("can_schedule_tasks"));
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("can_schedule_tasks")
+        );
         let log = std::fs::read_to_string(tmp.path().join("security_audit.jsonl")).unwrap();
-        assert!(log.contains("\"permission_denied\"") && log.contains("can_schedule_tasks"), "{log}");
+        assert!(
+            log.contains("\"permission_denied\"") && log.contains("can_schedule_tasks"),
+            "{log}"
+        );
     }
 
     /// v1.69.0 (D8): a removed tool name is answered with a tool error that
@@ -3413,11 +3899,18 @@ effect = "forbid"
                 )
                 .await;
             assert!(result.get("error").is_none(), "{}: {result}", removed.name);
-            assert_eq!(result["result"]["isError"], true, "{}: {result}", removed.name);
-            let text = result["result"]["content"][0]["text"].as_str().unwrap_or("");
+            assert_eq!(
+                result["result"]["isError"], true,
+                "{}: {result}",
+                removed.name
+            );
+            let text = result["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("");
             assert_eq!(text, removed.message(), "{}", removed.name);
             assert!(text.contains(removed.replacement), "{text}");
-            let audit = std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap_or_default();
+            let audit =
+                std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap_or_default();
             let rows: Vec<serde_json::Value> = audit
                 .lines()
                 .filter_map(|l| serde_json::from_str(l).ok())
@@ -3435,28 +3928,46 @@ effect = "forbid"
     async fn a_denied_removed_name_still_refuses_its_replacement_call() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_dispatcher(&tmp).await;
-        write_scoped_toml(&tmp, "[capabilities]\ndenied_tools = [\"mcp__duduclaw__shared_wiki_write\"]\n");
+        write_scoped_toml(
+            &tmp,
+            "[capabilities]\ndenied_tools = [\"mcp__duduclaw__shared_wiki_write\"]\n",
+        );
         let principal = make_principal(vec![Scope::Admin], false);
         let shared = dispatcher
             .dispatch_tool_call(
                 &principal,
                 &make_ns_ctx(false),
-                &make_params("wiki_write", serde_json::json!({"scope": "shared", "page_path": "a.md", "content": "x"})),
+                &make_params(
+                    "wiki_write",
+                    serde_json::json!({"scope": "shared", "page_path": "a.md", "content": "x"}),
+                ),
                 &serde_json::json!(1),
             )
             .await;
         assert_eq!(shared["error"]["code"], -32003, "{shared}");
-        assert!(shared["error"]["message"].as_str().unwrap_or("").contains("denied_tools"), "{shared}");
+        assert!(
+            shared["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("denied_tools"),
+            "{shared}"
+        );
         let own = dispatcher
             .dispatch_tool_call(
                 &principal,
                 &make_ns_ctx(false),
-                &make_params("wiki_write", serde_json::json!({"page_path": "a.md", "content": "x"})),
+                &make_params(
+                    "wiki_write",
+                    serde_json::json!({"page_path": "a.md", "content": "x"}),
+                ),
                 &serde_json::json!(2),
             )
             .await;
         assert!(
-            !own["error"]["message"].as_str().unwrap_or("").contains("denied_tools"),
+            !own["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("denied_tools"),
             "the agent-wiki call was never what the entry denied: {own}"
         );
     }
@@ -3467,30 +3978,58 @@ effect = "forbid"
     async fn scoped_entry_for_a_removed_name_still_requires_a_grant_for_the_new_call() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_dispatcher(&tmp).await;
-        write_scoped_toml(&tmp, "[capabilities]\nscoped_tools = [\"shared_wiki_write\", \"schedule_task\"]\n");
+        write_scoped_toml(
+            &tmp,
+            "[capabilities]\nscoped_tools = [\"shared_wiki_write\", \"schedule_task\"]\n",
+        );
         let principal = make_principal(vec![Scope::Admin], false);
         for (tool, args) in [
-            ("wiki_write", serde_json::json!({"scope": "shared", "page_path": "a.md", "content": "x"})),
-            ("tasks_create", serde_json::json!({"title": "x", "schedule": "0 9 * * *"})),
+            (
+                "wiki_write",
+                serde_json::json!({"scope": "shared", "page_path": "a.md", "content": "x"}),
+            ),
+            (
+                "tasks_create",
+                serde_json::json!({"title": "x", "schedule": "0 9 * * *"}),
+            ),
         ] {
             let result = dispatcher
-                .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params(tool, args), &serde_json::json!(1))
+                .dispatch_tool_call(
+                    &principal,
+                    &make_ns_ctx(false),
+                    &make_params(tool, args),
+                    &serde_json::json!(1),
+                )
                 .await;
             assert_eq!(result["error"]["code"], -32003, "{tool}: {result}");
             assert!(
-                result["error"]["message"].as_str().unwrap_or("").contains("capability_request"),
+                result["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("capability_request"),
                 "{tool}: {result}"
             );
         }
         for (tool, args) in [
-            ("wiki_write", serde_json::json!({"page_path": "a.md", "content": "x"})),
+            (
+                "wiki_write",
+                serde_json::json!({"page_path": "a.md", "content": "x"}),
+            ),
             ("tasks_create", serde_json::json!({"title": "x"})),
         ] {
             let result = dispatcher
-                .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params(tool, args), &serde_json::json!(2))
+                .dispatch_tool_call(
+                    &principal,
+                    &make_ns_ctx(false),
+                    &make_params(tool, args),
+                    &serde_json::json!(2),
+                )
                 .await;
             assert!(
-                !result["error"]["message"].as_str().unwrap_or("").contains("capability_request"),
+                !result["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("capability_request"),
                 "{tool} without the argument was never scoped: {result}"
             );
         }
@@ -3505,7 +4044,12 @@ effect = "forbid"
         let principal = make_principal(vec![], false);
         let call = || make_params("shared_wiki_read", serde_json::json!({"page_path": "a.md"}));
         let first = dispatcher
-            .dispatch_tool_call(&principal, &make_ns_ctx(false), &call(), &serde_json::json!(1))
+            .dispatch_tool_call(
+                &principal,
+                &make_ns_ctx(false),
+                &call(),
+                &serde_json::json!(1),
+            )
             .await;
         assert_eq!(first["result"]["isError"], true, "{first}");
         let rows = |tmp: &tempfile::TempDir| {
@@ -3517,10 +4061,17 @@ effect = "forbid"
         assert_eq!(rows(&tmp), 1);
         // 1 token spent above; drain the rest of the Read bucket.
         for _ in 0..200 {
-            let _ = dispatcher.rate_limiter.check(&principal.client_id, OpType::Read);
+            let _ = dispatcher
+                .rate_limiter
+                .check(&principal.client_id, OpType::Read);
         }
         let limited = dispatcher
-            .dispatch_tool_call(&principal, &make_ns_ctx(false), &call(), &serde_json::json!(2))
+            .dispatch_tool_call(
+                &principal,
+                &make_ns_ctx(false),
+                &call(),
+                &serde_json::json!(2),
+            )
             .await;
         assert_eq!(limited["error"]["code"], -32029, "{limited}");
         assert_eq!(rows(&tmp), 1, "a rate-limited call writes no audit row");
@@ -3528,7 +4079,10 @@ effect = "forbid"
 
     #[tokio::test]
     async fn absent_or_true_permission_keeps_todays_behaviour() {
-        for body in ["[permissions]\ncan_create_agents = true\n", "[agent]\nname = \"test-client\"\n"] {
+        for body in [
+            "[permissions]\ncan_create_agents = true\n",
+            "[agent]\nname = \"test-client\"\n",
+        ] {
             let tmp = tempfile::TempDir::new().unwrap();
             let dispatcher = make_dispatcher(&tmp).await;
             write_scoped_toml(&tmp, body);
@@ -3542,7 +4096,10 @@ effect = "forbid"
                 )
                 .await;
             let msg = result["error"]["message"].as_str().unwrap_or("");
-            assert!(!msg.contains("[permissions]"), "must not be refused by the permission gate: {result}");
+            assert!(
+                !msg.contains("[permissions]"),
+                "must not be refused by the permission gate: {result}"
+            );
         }
     }
 
@@ -3559,10 +4116,18 @@ effect = "forbid"
         let principal = make_principal(vec![Scope::Admin], false);
         for tool in ["memory_store", "user_profile_get", "working_state_set"] {
             let result = dispatcher
-                .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params(tool, serde_json::json!({})), &serde_json::json!(1))
+                .dispatch_tool_call(
+                    &principal,
+                    &make_ns_ctx(false),
+                    &make_params(tool, serde_json::json!({})),
+                    &serde_json::json!(1),
+                )
                 .await;
             let msg = result["error"]["message"].as_str().unwrap_or("");
-            assert!(!msg.contains("allowed_tools"), "{tool} must pass the allowlist: {result}");
+            assert!(
+                !msg.contains("allowed_tools"),
+                "{tool} must pass the allowlist: {result}"
+            );
         }
     }
 
@@ -3570,11 +4135,25 @@ effect = "forbid"
     async fn another_servers_wildcard_does_not_allow_platform_tools() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_dispatcher(&tmp).await;
-        write_scoped_toml(&tmp, "[capabilities]\nallowed_tools = [\"mcp__masterlink__*\"]\n");
+        write_scoped_toml(
+            &tmp,
+            "[capabilities]\nallowed_tools = [\"mcp__masterlink__*\"]\n",
+        );
         let principal = make_principal(vec![Scope::Admin], false);
         let result = dispatcher
-            .dispatch_tool_call(&principal, &make_ns_ctx(false), &make_params("memory_store", serde_json::json!({"content": "x"})), &serde_json::json!(2))
+            .dispatch_tool_call(
+                &principal,
+                &make_ns_ctx(false),
+                &make_params("memory_store", serde_json::json!({"content": "x"})),
+                &serde_json::json!(2),
+            )
             .await;
-        assert!(result["error"]["message"].as_str().unwrap_or("").contains("allowed_tools"), "{result}");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("allowed_tools"),
+            "{result}"
+        );
     }
 }

@@ -55,6 +55,9 @@ struct TgUser {
     id: i64,
     username: Option<String>,
     first_name: Option<String>,
+    /// Bot API `User.is_bot`. A bot is never a decision maker (F4, L1).
+    #[serde(default)]
+    is_bot: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +133,11 @@ struct TgMessage {
     caption: Option<String>,
     chat: TgChat,
     from: Option<TgUser>,
+    /// Bot API `Message.sender_chat`: present when the message was sent on
+    /// behalf of a chat (anonymous admin, "send as channel", linked-channel
+    /// forward). `from` then holds a shared placeholder account, so such a
+    /// message is never a decision (F4, review L1).
+    sender_chat: Option<TgChat>,
     /// Thread ID for supergroup topics/forums.
     message_thread_id: Option<i64>,
     /// Entities (mentions, commands, etc.)
@@ -558,7 +566,7 @@ async fn poll_loop(
     label: String,
     agent_name: Option<String>,
 ) {
-    let mut api_base = format!("{TELEGRAM_API}/bot{token}");
+    let mut api_base = telegram_poll_api_base(&token);
     let mut offset: i64 = 0;
     let mut consecutive_errors: u32 = 0;
     /// Consecutive authoritative auth rejections (401/404) after which the
@@ -572,6 +580,8 @@ async fn poll_loop(
     const MAX_MISSING_TOKEN: u32 = 3;
     let mut missing_token_count: u32 = 0;
     info!("Telegram polling started");
+    let executor = crate::decision_notify::BoundedChannelExecutor::new();
+    let busy_acks = crate::decision_notify::BoundedChannelExecutor::new();
 
     // M4 note: `consecutive_errors` is intentionally NOT a give-up condition for
     // transport failures. An interleaved outage (fail, fail, succeed, fail…)
@@ -598,7 +608,7 @@ async fn poll_loop(
                         "Telegram [{label}] credential rotated — switching to the newly configured token, no restart needed"
                     );
                     token = fresh;
-                    api_base = format!("{TELEGRAM_API}/bot{token}");
+                    api_base = telegram_poll_api_base(&token);
                 }
             }
             None => {
@@ -618,6 +628,10 @@ async fn poll_loop(
             }
         }
 
+        let verified_account_id = get_bot_account_id(&client, &api_base)
+            .await
+            .map(|id| format!("{label}|{id}"))
+            .unwrap_or_default();
         let url = format!(
             "{api_base}/getUpdates?offset={offset}&timeout=25&allowed_updates=[\"message\",\"callback_query\"]"
         );
@@ -713,613 +727,671 @@ async fn poll_loop(
 
                 // ── Inline keyboard button presses ──
                 if let Some(cb) = update.callback_query {
-                    handle_callback_query(&cb, &client, &api_base, &ctx).await;
+                    handle_callback_query(&cb, &client, &api_base, &ctx, &verified_account_id)
+                        .await;
                     continue;
                 }
 
                 let Some(msg) = update.message else { continue };
-                let chat_id = msg.chat.id;
-                let msg_id = msg.message_id;
-                let thread_id = msg.message_thread_id;
-
-                // ── Forum topic lifecycle (service messages) ──
-                // Topic closed → close the mapped session so a reopened topic
-                // starts fresh (mirrors Discord thread auto-archive handling).
-                if msg.forum_topic_closed.is_some() {
-                    if let Some(tid) = thread_id {
-                        let session_id = format!("telegram:{chat_id}:{tid}");
-                        match ctx.session_manager.delete_session(&session_id).await {
-                            Ok(()) => info!("Telegram: forum topic {tid} closed — session cleared"),
-                            Err(e) => warn!(
-                                "Telegram: forum topic {tid} closed, session clear failed: {e}"
-                            ),
-                        }
-                    }
-                    continue;
-                }
-                if msg.forum_topic_created.is_some() {
-                    // Session is created lazily on the first real message.
-                    continue;
-                }
-                let chat_type = msg.chat.chat_type.as_deref().unwrap_or("private");
-                let is_group = chat_type == "group" || chat_type == "supergroup";
-                let sender = msg
-                    .from
-                    .as_ref()
-                    .and_then(|u| u.first_name.as_deref())
-                    .unwrap_or("someone");
-                let scope_id = chat_id.to_string();
-
-                // ── Mention-only filter for groups ──
-                // Per-agent bots default to mention-only to prevent all bots responding
-                let default_mention_only = agent_name.is_some();
-                let mention_only = ctx
-                    .channel_settings
-                    .get_bool(
-                        "telegram",
-                        &scope_id,
-                        keys::MENTION_ONLY,
-                        default_mention_only,
-                    )
-                    .await;
-
-                let text_content = msg.text.as_deref().unwrap_or("");
-                let bot_mentioned = is_bot_mentioned(text_content, &msg.entities, &bot_username);
-
-                // Replying to the bot's own message addresses the bot just
-                // like an @mention does — without this, mention-only groups
-                // silently ignore the natural "reply to the bot" gesture.
-                let replied_to_bot = !bot_username.is_empty()
-                    && msg
-                        .reply_to_message
-                        .as_deref()
-                        .and_then(|q| q.from.as_ref())
-                        .and_then(|u| u.username.as_deref())
-                        .is_some_and(|u| u.eq_ignore_ascii_case(&bot_username));
-
-                // Check for bot commands (always process, even in mention-only mode)
-                let is_command = text_content.starts_with('/');
-
-                if is_group && mention_only && !bot_mentioned && !is_command && !replied_to_bot {
-                    continue;
-                }
-
-                // WP1.6 (ecosystem): replying to a decision card with a bare
-                // verb (「同意」/「拒絕」…) counts as pressing its button —
-                // watch clients render the card but not the buttons. Same
-                // dispatch (auth + accounting) as a physical press; anything
-                // that isn't a whole-message verb on a live card falls
-                // through to normal chat.
-                if replied_to_bot && !text_content.is_empty() {
-                    if let Some(reply_mid) =
-                        msg.reply_to_message.as_deref().and_then(|q| q.message_id)
-                    {
-                        let presser = msg
-                            .from
-                            .as_ref()
-                            .map(|u| u.id.to_string())
-                            .unwrap_or_default();
-                        if let Some(outcome) = crate::decision_text::route_text_reply(
-                            &ctx.home_dir,
-                            "telegram",
-                            &presser,
-                            &chat_id.to_string(),
-                            &reply_mid.to_string(),
-                            text_content,
-                        )
-                        .await
-                        {
-                            let ack = match outcome {
-                                Ok(m) => m,
-                                Err(e) => format!("⚠ {e}"),
-                            };
-                            send_reply(&client, &api_base, chat_id, &ack, thread_id, msg_id, None)
-                                .await;
-                            continue;
-                        }
-                    }
-                }
-
-                // ── Channel whitelist ──
-                if is_group
-                    && !ctx
-                        .channel_settings
-                        .is_channel_allowed("telegram", "global", &scope_id)
-                        .await
+                if telegram_decision_fastlane(
+                    &msg,
+                    &client,
+                    &api_base,
+                    &ctx,
+                    &verified_account_id,
+                    &bot_username,
+                )
+                .await
                 {
                     continue;
                 }
-
-                // Extract text — from text field or transcribed from voice/audio
-                // Also collect attachment references for photo/document/video/sticker
-                let mut attachment_lines: Vec<String> = Vec::new();
-                let caption_text = msg.caption.as_deref().unwrap_or("");
-
-                let input_text = if let Some(text) = &msg.text {
-                    // Handle bot commands
-                    if text.starts_with('/') {
-                        let from_user_id = msg.from.as_ref().map(|u| u.id);
-                        handle_command(
-                            text,
-                            &client,
-                            &api_base,
-                            chat_id,
-                            thread_id,
-                            &ctx,
-                            &scope_id,
-                            agent_name.as_deref(),
-                            from_user_id,
-                        )
-                        .await;
-                        continue;
-                    }
-                    // Strip bot mention
-                    strip_bot_mention(text, &bot_username)
-                } else if let Some(voice) = &msg.voice {
-                    info!("🎙 Telegram [{sender}]: voice message");
-                    match transcribe_voice(&client, &api_base, &voice.file_id, &ctx.home_dir).await {
-                        Ok(text) => {
-                            info!(
-                                "🎙 Telegram [{sender}] transcribed: {}",
-                                truncate_bytes(&text, 80)
-                            );
-                            text
-                        }
-                        Err(e) => {
-                            warn!("Voice transcription failed: {e}");
-                            send_reply(
-                                &client,
-                                &api_base,
-                                chat_id,
-                                "⚠️ 語音轉文字失敗 — 請再試一次",
-                                thread_id,
-                                msg_id,
-                                None,
-                            )
-                            .await;
-                            continue;
-                        }
-                    }
-                } else if let Some(audio) = &msg.audio {
-                    info!("🎵 Telegram [{sender}]: audio message");
-                    match transcribe_voice(&client, &api_base, &audio.file_id, &ctx.home_dir).await {
-                        Ok(text) => text,
-                        Err(e) => {
-                            warn!("Audio transcription failed: {e}");
-                            send_reply(
-                                &client,
-                                &api_base,
-                                chat_id,
-                                "⚠️ 音訊轉文字失敗 — 請再試一次",
-                                thread_id,
-                                msg_id,
-                                None,
-                            )
-                            .await;
-                            continue;
-                        }
-                    }
-                } else {
-                    // No text/voice/audio — use caption as base text (or empty)
-                    caption_text.to_string()
+                let conversation = match msg.message_thread_id {
+                    Some(thread) => format!("{}:{thread}", msg.chat.id),
+                    None => msg.chat.id.to_string(),
                 };
-
-                // ── Quoted-reply / forward provenance ──
-                let input_text = match build_quoted_context(&msg, &bot_username) {
-                    Some(context_block) => format!("{context_block}\n{input_text}"),
-                    None => input_text,
-                };
-
-                // ── Attachment handling: photo/document/video/sticker ──
-                // WP1.3: land inbound files under the resolved agent's dir
-                // (`~/.duduclaw/agents/<id>/attachments/`); falls back to the
-                // shared home dir when no agent resolves.
-                let home_for_attach = crate::channel_reply::resolve_attachment_base(
-                    ctx.as_ref(),
-                    agent_name.as_deref(),
-                )
-                .await;
-                if let Some(photos) = &msg.photo {
-                    // Telegram sends multiple sizes; take the largest (last element)
-                    if let Some(largest) = photos.last() {
-                        info!("🖼️ Telegram [{sender}]: photo attachment");
-                        match download_telegram_file(&client, &api_base, &largest.file_id).await {
-                            Ok(data) => {
-                                let mime = crate::media::detect_mime(&data);
-                                let ext = crate::media::extension_from_mime(&mime);
-                                let fname = format!("photo.{ext}");
-                                match crate::media::save_attachment_to_disk(
-                                    &home_for_attach,
-                                    &data,
-                                    &fname,
-                                )
-                                .await
-                                {
-                                    Ok(path) => {
-                                        attachment_lines.push(crate::media::format_attachment_ref(
-                                            &crate::media::MediaType::Image,
-                                            &fname,
-                                            &path,
-                                        ));
-                                    }
-                                    Err(e) => warn!("Failed to save photo: {e}"),
-                                }
-                            }
-                            Err(e) => warn!("Failed to download photo: {e}"),
-                        }
-                    }
-                }
-
-                if let Some(doc) = &msg.document {
-                    info!("📎 Telegram [{sender}]: document attachment");
-                    let fname = doc.file_name.as_deref().unwrap_or("document");
-                    match download_telegram_file(&client, &api_base, &doc.file_id).await {
-                        Ok(data) => {
-                            let mime = doc
-                                .mime_type
-                                .as_deref()
-                                .unwrap_or("application/octet-stream");
-                            let mt = crate::media::media_type_from_mime(mime);
-                            match crate::media::save_attachment_to_disk(
-                                &home_for_attach,
-                                &data,
-                                fname,
-                            )
-                            .await
-                            {
-                                Ok(path) => {
-                                    attachment_lines.push(crate::media::format_attachment_ref(
-                                        &mt, fname, &path,
-                                    ));
-                                }
-                                Err(e) => warn!("Failed to save document: {e}"),
-                            }
-                        }
-                        Err(e) => warn!("Failed to download document: {e}"),
-                    }
-                }
-
-                if let Some(video) = &msg.video {
-                    info!("🎬 Telegram [{sender}]: video attachment");
-                    let mime = video.mime_type.as_deref().unwrap_or("video/mp4");
-                    let ext = crate::media::extension_from_mime(mime);
-                    let fname = format!("video.{ext}");
-                    match download_telegram_file(&client, &api_base, &video.file_id).await {
-                        Ok(data) => {
-                            match crate::media::save_attachment_to_disk(
-                                &home_for_attach,
-                                &data,
-                                &fname,
-                            )
-                            .await
-                            {
-                                Ok(path) => {
-                                    attachment_lines.push(crate::media::format_attachment_ref(
-                                        &crate::media::MediaType::Video,
-                                        &fname,
-                                        &path,
-                                    ));
-                                }
-                                Err(e) => warn!("Failed to save video: {e}"),
-                            }
-                        }
-                        Err(e) => warn!("Failed to download video: {e}"),
-                    }
-                }
-
-                if let Some(sticker) = &msg.sticker {
-                    let emoji_label = sticker.emoji.as_deref().unwrap_or("sticker");
-                    info!("🏷️ Telegram [{sender}]: sticker {emoji_label}");
-                    match download_telegram_file(&client, &api_base, &sticker.file_id).await {
-                        Ok(data) => {
-                            let mime = crate::media::detect_mime(&data);
-                            let ext = crate::media::extension_from_mime(&mime);
-                            let fname = format!("sticker.{ext}");
-                            match crate::media::save_attachment_to_disk(
-                                &home_for_attach,
-                                &data,
-                                &fname,
-                            )
-                            .await
-                            {
-                                Ok(path) => {
-                                    let label = format!("sticker {emoji_label}");
-                                    attachment_lines.push(crate::media::format_attachment_ref(
-                                        &crate::media::MediaType::Image,
-                                        &label,
-                                        &path,
-                                    ));
-                                }
-                                Err(e) => warn!("Failed to save sticker: {e}"),
-                            }
-                        }
-                        Err(e) => warn!("Failed to download sticker: {e}"),
-                    }
-                }
-
-                // Combine text + attachment references
-                let input_text = if attachment_lines.is_empty() {
-                    input_text
-                } else if input_text.trim().is_empty() {
-                    attachment_lines.join("\n")
-                } else {
-                    format!("{input_text}\n\n{}", attachment_lines.join("\n"))
-                };
-
-                if input_text.trim().is_empty() {
-                    continue;
-                }
-
-                info!(
-                    "📩 Telegram [{sender}]: {}",
-                    truncate_bytes(&input_text, 80)
-                );
-
-                // ── Build session ID (topic-aware) ──
-                let session_id = if let Some(tid) = thread_id {
-                    format!("telegram:{chat_id}:{tid}")
-                } else {
-                    format!("telegram:{chat_id}")
-                };
-
-                // Progress callback — edit-in-place: the first event posts a
-                // status message, later events edit it (no channel spam).
-                // TodoUpdate events bypass the 30s throttle so the task board
-                // always reflects the latest state.
-                let progress_client = client.clone();
-                let progress_api = api_base.clone();
-                let progress_chat_id = chat_id;
-                let progress_thread_id = thread_id;
-                let progress_msg_id: Arc<tokio::sync::Mutex<Option<i64>>> =
-                    Arc::new(tokio::sync::Mutex::new(None));
-                let progress_msg_cleanup = progress_msg_id.clone();
-                let last_progress = Arc::new(std::sync::Mutex::new(
-                    std::time::Instant::now()
-                        .checked_sub(std::time::Duration::from_secs(60))
-                        .unwrap_or_else(std::time::Instant::now),
-                ));
-                let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
-                    // Step / ModelInfo events are dashboard-only signals — never
-                    // rendered as channel text (would be an empty message).
-                    if matches!(
-                        event,
-                        crate::channel_reply::ProgressEvent::Step { .. }
-                            | crate::channel_reply::ProgressEvent::ModelInfo { .. }
-                    ) {
-                        return;
-                    }
-                    let is_todo = matches!(
-                        event,
-                        crate::channel_reply::ProgressEvent::TodoUpdate { .. }
-                    );
-                    {
-                        let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
-                        let throttle =
-                            crate::channel_capabilities::progress_throttle_secs("telegram")
-                                .unwrap_or(30);
-                        if !is_todo && last.elapsed().as_secs() < throttle {
-                            return;
-                        }
-                        *last = std::time::Instant::now();
-                    }
-
-                    let msg_text = event.to_display();
-                    let c = progress_client.clone();
-                    let api = progress_api.clone();
-                    let msg_id = progress_msg_id.clone();
-                    tokio::spawn(async move {
-                        let mut id_guard = msg_id.lock().await;
-                        match *id_guard {
-                            Some(mid) => {
-                                edit_progress_message(&c, &api, progress_chat_id, mid, &msg_text)
-                                    .await
-                            }
-                            None => {
-                                *id_guard = send_progress_message(
-                                    &c,
-                                    &api,
-                                    progress_chat_id,
-                                    &msg_text,
-                                    progress_thread_id,
-                                )
-                                .await;
-                            }
-                        }
-                    });
-                });
-
-                // Typing indicator while the reply is generated (RAII —
-                // stops on drop, including panic/early-continue paths).
-                let typing_guard = crate::channel_typing::telegram_typing(
+                let key = format!("{verified_account_id}:{conversation}");
+                let ack_chat = msg.chat.id;
+                let ack_thread = msg.message_thread_id;
+                let ack_id = msg.message_id;
+                let future = process_telegram_message(
+                    msg,
                     client.clone(),
                     api_base.clone(),
-                    chat_id,
-                    thread_id,
+                    token.clone(),
+                    ctx.clone(),
+                    label.clone(),
+                    agent_name.clone(),
+                    verified_account_id.clone(),
+                    bot_username.clone(),
                 );
+                if executor.try_submit(key, future).is_err() {
+                    warn!(
+                        "Telegram normal work queue is full; receiver remains available for decisions"
+                    );
+                    let _ = ctx.event_tx.send(json!({
+                        "type": "channel_queue_rejected",
+                        "channel": "telegram",
+                        "retryable": true
+                    }).to_string());
+                    let ack_client = client.clone();
+                    let ack_api = api_base.clone();
+                    let _ = busy_acks.try_submit("busy-ack".into(), async move {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            send_reply(
+                                &ack_client,
+                                &ack_api,
+                                ack_chat,
+                                "目前工作佇列已滿，這則訊息尚未受理；請稍後重新傳送。",
+                                ack_thread,
+                                ack_id,
+                                None,
+                            ),
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
+    }
+}
 
-                let user_id = msg
-                    .from
-                    .as_ref()
-                    .map(|u| u.id.to_string())
-                    .unwrap_or_default();
-                // WP1.3: track which agent produced the reply so DELIVER path
-                // validation uses the right sandbox root (None → resolver falls
-                // back to default/main agent).
-                let mut effective_agent: Option<String> = agent_name.clone();
-                let (reply, guarded) = if let Some(ref agent) = agent_name {
-                    // Per-agent bot: unchanged deterministic routing to its owner.
+#[allow(clippy::too_many_arguments)]
+async fn process_telegram_message(
+    msg: TgMessage,
+    client: reqwest::Client,
+    api_base: String,
+    token: String,
+    ctx: Arc<ReplyContext>,
+    label: String,
+    agent_name: Option<String>,
+    verified_account_id: String,
+    bot_username: String,
+) {
+    if ctx
+        .channel_settings
+        .refresh_channel_snapshot("telegram", "global")
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let chat_id = msg.chat.id;
+    let msg_id = msg.message_id;
+    let thread_id = msg.message_thread_id;
+
+    // ── Forum topic lifecycle (service messages) ──
+    // Topic closed → close the mapped session so a reopened topic
+    // starts fresh (mirrors Discord thread auto-archive handling).
+    if msg.forum_topic_closed.is_some() {
+        if let Some(tid) = thread_id {
+            let session_id = format!("telegram:{chat_id}:{tid}");
+            match ctx.session_manager.delete_session(&session_id).await {
+                Ok(()) => info!("Telegram: forum topic {tid} closed — session cleared"),
+                Err(e) => warn!("Telegram: forum topic {tid} closed, session clear failed: {e}"),
+            }
+        }
+        return;
+    }
+    if msg.forum_topic_created.is_some() {
+        // Session is created lazily on the first real message.
+        return;
+    }
+    let chat_type = msg.chat.chat_type.as_deref().unwrap_or("private");
+    let is_group = chat_type == "group" || chat_type == "supergroup";
+    let sender = msg
+        .from
+        .as_ref()
+        .and_then(|u| u.first_name.as_deref())
+        .unwrap_or("someone");
+    let scope_id = chat_id.to_string();
+
+    // ── Mention-only filter for groups ──
+    // Per-agent bots default to mention-only to prevent all bots responding
+    let default_mention_only = agent_name.is_some();
+    let mention_only = ctx
+        .channel_settings
+        .get_bool(
+            "telegram",
+            &scope_id,
+            keys::MENTION_ONLY,
+            default_mention_only,
+        )
+        .await;
+
+    let text_content = msg.text.as_deref().unwrap_or("");
+    let bot_mentioned = is_bot_mentioned(text_content, &msg.entities, &bot_username);
+
+    // Replying to the bot's own message addresses the bot just
+    // like an @mention does — without this, mention-only groups
+    // silently ignore the natural "reply to the bot" gesture.
+    let replied_to_bot = !bot_username.is_empty()
+        && msg
+            .reply_to_message
+            .as_deref()
+            .and_then(|q| q.from.as_ref())
+            .and_then(|u| u.username.as_deref())
+            .is_some_and(|u| u.eq_ignore_ascii_case(&bot_username));
+
+    // Check for bot commands (always process, even in mention-only mode)
+    let is_command = text_content.starts_with('/');
+
+    if is_group && mention_only && !bot_mentioned && !is_command && !replied_to_bot {
+        return;
+    }
+
+    // WP1.6 (ecosystem): replying to a decision card with a bare
+    // verb (「同意」/「拒絕」…) counts as pressing its button —
+    // watch clients render the card but not the buttons. Same
+    // dispatch (auth + accounting) as a physical press; anything
+    // that isn't a whole-message verb on a live card falls
+    // through to normal chat.
+    if replied_to_bot && !text_content.is_empty() {
+        if let Some(reply_mid) = msg.reply_to_message.as_deref().and_then(|q| q.message_id) {
+            let presser = msg
+                .from
+                .as_ref()
+                .map(|u| u.id.to_string())
+                .unwrap_or_default();
+            if let Some(outcome) = crate::decision_text::route_text_reply(
+                &ctx.home_dir,
+                "telegram",
+                &presser,
+                &chat_id.to_string(),
+                &reply_mid.to_string(),
+                text_content,
+            )
+            .await
+            {
+                let ack = match outcome {
+                    Ok(m) => m,
+                    Err(e) => format!("⚠ {e}"),
+                };
+                send_reply(&client, &api_base, chat_id, &ack, thread_id, msg_id, None).await;
+                return;
+            }
+        }
+    }
+
+    // ── Channel whitelist ──
+    if is_group
+        && !ctx
+            .channel_settings
+            .is_channel_allowed("telegram", "global", &scope_id)
+            .await
+    {
+        return;
+    }
+
+    // Extract text — from text field or transcribed from voice/audio
+    // Also collect attachment references for photo/document/video/sticker
+    let mut attachment_lines: Vec<String> = Vec::new();
+    let caption_text = msg.caption.as_deref().unwrap_or("");
+
+    let input_text = if let Some(text) = &msg.text {
+        // Handle bot commands
+        if text.starts_with('/') {
+            let from_user_id = msg.from.as_ref().map(|u| u.id);
+            handle_command(
+                text,
+                &client,
+                &api_base,
+                chat_id,
+                thread_id,
+                &ctx,
+                &scope_id,
+                agent_name.as_deref(),
+                from_user_id,
+            )
+            .await;
+            return;
+        }
+        // Strip bot mention
+        strip_bot_mention(text, &bot_username)
+    } else if let Some(voice) = &msg.voice {
+        info!("🎙 Telegram [{sender}]: voice message");
+        match transcribe_voice(&client, &api_base, &voice.file_id, &ctx.home_dir).await {
+            Ok(text) => {
+                info!(
+                    "🎙 Telegram [{sender}] transcribed: {}",
+                    truncate_bytes(&text, 80)
+                );
+                text
+            }
+            Err(e) => {
+                warn!("Voice transcription failed: {e}");
+                send_reply(
+                    &client,
+                    &api_base,
+                    chat_id,
+                    "⚠️ 語音轉文字失敗 — 請再試一次",
+                    thread_id,
+                    msg_id,
+                    None,
+                )
+                .await;
+                return;
+            }
+        }
+    } else if let Some(audio) = &msg.audio {
+        info!("🎵 Telegram [{sender}]: audio message");
+        match transcribe_voice(&client, &api_base, &audio.file_id, &ctx.home_dir).await {
+            Ok(text) => text,
+            Err(e) => {
+                warn!("Audio transcription failed: {e}");
+                send_reply(
+                    &client,
+                    &api_base,
+                    chat_id,
+                    "⚠️ 音訊轉文字失敗 — 請再試一次",
+                    thread_id,
+                    msg_id,
+                    None,
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        // No text/voice/audio — use caption as base text (or empty)
+        caption_text.to_string()
+    };
+
+    // ── Quoted-reply / forward provenance ──
+    let input_text = match build_quoted_context(&msg, &bot_username) {
+        Some(context_block) => format!("{context_block}\n{input_text}"),
+        None => input_text,
+    };
+
+    // ── Attachment handling: photo/document/video/sticker ──
+    // WP1.3: land inbound files under the resolved agent's dir
+    // (`~/.duduclaw/agents/<id>/attachments/`); falls back to the
+    // shared home dir when no agent resolves.
+    let home_for_attach =
+        crate::channel_reply::resolve_attachment_base(ctx.as_ref(), agent_name.as_deref()).await;
+    if let Some(photos) = &msg.photo {
+        // Telegram sends multiple sizes; take the largest (last element)
+        if let Some(largest) = photos.last() {
+            info!("🖼️ Telegram [{sender}]: photo attachment");
+            match download_telegram_file(&client, &api_base, &largest.file_id).await {
+                Ok(data) => {
+                    let mime = crate::media::detect_mime(&data);
+                    let ext = crate::media::extension_from_mime(&mime);
+                    let fname = format!("photo.{ext}");
+                    match crate::media::save_attachment_to_disk(&home_for_attach, &data, &fname)
+                        .await
+                    {
+                        Ok(path) => {
+                            attachment_lines.push(crate::media::format_attachment_ref(
+                                &crate::media::MediaType::Image,
+                                &fname,
+                                &path,
+                            ));
+                        }
+                        Err(e) => warn!("Failed to save photo: {e}"),
+                    }
+                }
+                Err(e) => warn!("Failed to download photo: {e}"),
+            }
+        }
+    }
+
+    if let Some(doc) = &msg.document {
+        info!("📎 Telegram [{sender}]: document attachment");
+        let fname = doc.file_name.as_deref().unwrap_or("document");
+        match download_telegram_file(&client, &api_base, &doc.file_id).await {
+            Ok(data) => {
+                let mime = doc
+                    .mime_type
+                    .as_deref()
+                    .unwrap_or("application/octet-stream");
+                let mt = crate::media::media_type_from_mime(mime);
+                match crate::media::save_attachment_to_disk(&home_for_attach, &data, fname).await {
+                    Ok(path) => {
+                        attachment_lines
+                            .push(crate::media::format_attachment_ref(&mt, fname, &path));
+                    }
+                    Err(e) => warn!("Failed to save document: {e}"),
+                }
+            }
+            Err(e) => warn!("Failed to download document: {e}"),
+        }
+    }
+
+    if let Some(video) = &msg.video {
+        info!("🎬 Telegram [{sender}]: video attachment");
+        let mime = video.mime_type.as_deref().unwrap_or("video/mp4");
+        let ext = crate::media::extension_from_mime(mime);
+        let fname = format!("video.{ext}");
+        match download_telegram_file(&client, &api_base, &video.file_id).await {
+            Ok(data) => {
+                match crate::media::save_attachment_to_disk(&home_for_attach, &data, &fname).await {
+                    Ok(path) => {
+                        attachment_lines.push(crate::media::format_attachment_ref(
+                            &crate::media::MediaType::Video,
+                            &fname,
+                            &path,
+                        ));
+                    }
+                    Err(e) => warn!("Failed to save video: {e}"),
+                }
+            }
+            Err(e) => warn!("Failed to download video: {e}"),
+        }
+    }
+
+    if let Some(sticker) = &msg.sticker {
+        let emoji_label = sticker.emoji.as_deref().unwrap_or("sticker");
+        info!("🏷️ Telegram [{sender}]: sticker {emoji_label}");
+        match download_telegram_file(&client, &api_base, &sticker.file_id).await {
+            Ok(data) => {
+                let mime = crate::media::detect_mime(&data);
+                let ext = crate::media::extension_from_mime(&mime);
+                let fname = format!("sticker.{ext}");
+                match crate::media::save_attachment_to_disk(&home_for_attach, &data, &fname).await {
+                    Ok(path) => {
+                        let label = format!("sticker {emoji_label}");
+                        attachment_lines.push(crate::media::format_attachment_ref(
+                            &crate::media::MediaType::Image,
+                            &label,
+                            &path,
+                        ));
+                    }
+                    Err(e) => warn!("Failed to save sticker: {e}"),
+                }
+            }
+            Err(e) => warn!("Failed to download sticker: {e}"),
+        }
+    }
+
+    // Combine text + attachment references
+    let input_text = if attachment_lines.is_empty() {
+        input_text
+    } else if input_text.trim().is_empty() {
+        attachment_lines.join("\n")
+    } else {
+        format!("{input_text}\n\n{}", attachment_lines.join("\n"))
+    };
+
+    if input_text.trim().is_empty() {
+        return;
+    }
+
+    info!(
+        "📩 Telegram [{sender}]: {}",
+        truncate_bytes(&input_text, 80)
+    );
+
+    // ── Build session ID (topic-aware) ──
+    let session_id = if let Some(tid) = thread_id {
+        format!("telegram:{chat_id}:{tid}")
+    } else {
+        format!("telegram:{chat_id}")
+    };
+
+    // Progress callback — edit-in-place: the first event posts a
+    // status message, later events edit it (no channel spam).
+    // TodoUpdate events bypass the 30s throttle so the task board
+    // always reflects the latest state.
+    let progress_client = client.clone();
+    let progress_api = api_base.clone();
+    let progress_chat_id = chat_id;
+    let progress_thread_id = thread_id;
+    let progress_msg_id: Arc<tokio::sync::Mutex<Option<i64>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let progress_msg_cleanup = progress_msg_id.clone();
+    let last_progress = Arc::new(std::sync::Mutex::new(
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap_or_else(std::time::Instant::now),
+    ));
+    let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
+        // Step / ModelInfo events are dashboard-only signals — never
+        // rendered as channel text (would be an empty message).
+        if matches!(
+            event,
+            crate::channel_reply::ProgressEvent::Step { .. }
+                | crate::channel_reply::ProgressEvent::ModelInfo { .. }
+        ) {
+            return;
+        }
+        let is_todo = matches!(
+            event,
+            crate::channel_reply::ProgressEvent::TodoUpdate { .. }
+        );
+        {
+            let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
+            let throttle =
+                crate::channel_capabilities::progress_throttle_secs("telegram").unwrap_or(30);
+            if !is_todo && last.elapsed().as_secs() < throttle {
+                return;
+            }
+            *last = std::time::Instant::now();
+        }
+
+        let msg_text = event.to_display();
+        let c = progress_client.clone();
+        let api = progress_api.clone();
+        let msg_id = progress_msg_id.clone();
+        tokio::spawn(async move {
+            let mut id_guard = msg_id.lock().await;
+            match *id_guard {
+                Some(mid) => {
+                    edit_progress_message(&c, &api, progress_chat_id, mid, &msg_text).await
+                }
+                None => {
+                    *id_guard = send_progress_message(
+                        &c,
+                        &api,
+                        progress_chat_id,
+                        &msg_text,
+                        progress_thread_id,
+                    )
+                    .await;
+                }
+            }
+        });
+    });
+
+    // Typing indicator while the reply is generated (RAII —
+    // stops on drop, including panic/early-continue paths).
+    let typing_guard = crate::channel_typing::telegram_typing(
+        client.clone(),
+        api_base.clone(),
+        chat_id,
+        thread_id,
+    );
+
+    let user_id = msg
+        .from
+        .as_ref()
+        .map(|u| u.id.to_string())
+        .unwrap_or_default();
+    // WP1.3: track which agent produced the reply so DELIVER path
+    // validation uses the right sandbox root (None → resolver falls
+    // back to default/main agent).
+    let mut effective_agent: Option<String> = agent_name.clone();
+    // Anonymous admins / "send as channel" share one placeholder `from.id`;
+    // their turns get no trusted reply target, so no confirmation can be
+    // bound to them (F4, review L1).
+    let decision_context = crate::approval::DecisionContext {
+        channel: "telegram".into(),
+        account_id: verified_account_id.clone(),
+        conversation_id: match msg.message_thread_id {
+            Some(t) => format!("{}:{t}", msg.chat.id),
+            None => msg.chat.id.to_string(),
+        },
+        principal_id: telegram_message_principal(&msg),
+    };
+    #[cfg(test)]
+    crate::decision_notify::native_loop_fixture::wait_before_inner(&token).await;
+    let chat_scope = chat_id.to_string();
+    let target = crate::approval::TrustedReplyTarget::new(
+        decision_context,
+        token.clone(),
+        chat_id.to_string(),
+        thread_id.map(|t| t.to_string()),
+    )
+    .map(|target| {
+        target.with_decision_access_scope(crate::decision_notify::DecisionAccessScope {
+            channel_id: (msg.chat.chat_type.as_deref() != Some("private"))
+                .then_some(chat_scope.as_str()),
+            guild_id: None,
+            session_id: None,
+        })
+    });
+    #[cfg(test)]
+    if let Some(work) =
+        crate::decision_notify::native_loop_fixture::take_job_for(&token, &input_text)
+    {
+        crate::approval::scope_trusted_reply(target, work).await;
+        drop(typing_guard);
+        return;
+    }
+    let (reply, guarded) = crate::approval::scope_trusted_reply(target, async {
+        if let Some(ref agent) = agent_name {
+            // Per-agent bot: unchanged deterministic routing to its owner.
+            let guard = build_guarded_reply_for_agent(
+                &input_text,
+                &ctx,
+                agent,
+                &session_id,
+                &user_id,
+                Some(on_progress),
+            )
+            .await;
+            (guard.text.clone(), Some(guard))
+        } else {
+            // Global/shared bot: route by the user→agent binding (WP9).
+            match resolve_shared_route(&ctx, &user_id).await {
+                SharedRoute::Bound(bound_agent) => {
                     let guard = build_guarded_reply_for_agent(
                         &input_text,
                         &ctx,
-                        agent,
+                        &bound_agent,
+                        &session_id,
+                        &user_id,
+                        Some(on_progress),
+                    )
+                    .await;
+                    effective_agent = Some(bound_agent);
+                    (guard.text.clone(), Some(guard))
+                }
+                SharedRoute::Unbound => {
+                    let guard = build_guarded_reply_with_session(
+                        &input_text,
+                        &ctx,
                         &session_id,
                         &user_id,
                         Some(on_progress),
                     )
                     .await;
                     (guard.text.clone(), Some(guard))
-                } else {
-                    // Global/shared bot: route by the user→agent binding (WP9).
-                    match resolve_shared_route(&ctx, &user_id).await {
-                        SharedRoute::Bound(bound_agent) => {
-                            let guard = build_guarded_reply_for_agent(
-                                &input_text,
-                                &ctx,
-                                &bound_agent,
-                                &session_id,
-                                &user_id,
-                                Some(on_progress),
-                            )
-                            .await;
-                            effective_agent = Some(bound_agent);
-                            (guard.text.clone(), Some(guard))
-                        }
-                        SharedRoute::Unbound => {
-                            let guard = build_guarded_reply_with_session(
-                                &input_text,
-                                &ctx,
-                                &session_id,
-                                &user_id,
-                                Some(on_progress),
-                            )
-                            .await;
-                            (guard.text.clone(), Some(guard))
-                        }
-                        SharedRoute::Guide(msg) => (msg, None),
-                    }
-                };
-                drop(typing_guard);
-
-                // WP1.3: 📎DELIVER: outbound — send any generated files back to
-                // Telegram (sendDocument) and strip the marker from the text.
-                // Byte-identical no-op when the reply carries no marker.
-                let reply = {
-                    // WP-8A: `token` is the loop's own first-class credential
-                    // state (see `resolve_current_token` above) — no more
-                    // reverse-parsing it back out of `api_base`.
-                    let sender = crate::channel_sender::TelegramSender {
-                        bot_token: token.clone(),
-                        chat_id: chat_id.to_string(),
-                        http: client.clone(),
-                    };
-                    if crate::channel_reply::guard_lost(guarded.as_ref()).await {
-                        continue;
-                    }
-                    crate::channel_reply::deliver_documents_for_reply_guarded(
-                        ctx.as_ref(),
-                        effective_agent.as_deref(),
-                        reply,
-                        &sender,
-                        guarded.as_ref(),
-                    )
-                    .await
-                };
-
-                // Guard: don't send empty replies (Telegram rejects empty text).
-                // Checked BEFORE deleting the interim progress message: this
-                // used to delete first and check emptiness after, which is
-                // fine functionally (both paths still delete) but reads as
-                // "decide what to do, THEN delete", not "delete only once we
-                // know what we're doing" — reordered so the emptiness
-                // decision comes first. Either way the progress message is
-                // removed so it never lingers as a stale "分析中…" bubble,
-                // even on the silent-by-design (blocked/muted) empty-reply path.
-                if reply.trim().is_empty() {
-                    warn!(chat_id, "Telegram: reply is empty — skipping send");
-                    if let Some(mid) = progress_msg_cleanup.lock().await.take() {
-                        let del_body = json!({ "chat_id": chat_id, "message_id": mid });
-                        let _ = client
-                            .post(format!("{api_base}/deleteMessage"))
-                            .json(&del_body)
-                            .send()
-                            .await;
-                    }
-                    continue;
                 }
+                SharedRoute::Guide(msg) => (msg, None),
+            }
+        }
+    })
+    .await;
+    drop(typing_guard);
 
-                // Non-empty reply — remove the interim progress/task-board
-                // message now; the final reply below supersedes it.
-                if let Some(mid) = progress_msg_cleanup.lock().await.take() {
-                    let del_body = json!({ "chat_id": chat_id, "message_id": mid });
-                    let _ = client
-                        .post(format!("{api_base}/deleteMessage"))
-                        .json(&del_body)
-                        .send()
+    // WP1.3: 📎DELIVER: outbound — send any generated files back to
+    // Telegram (sendDocument) and strip the marker from the text.
+    // Byte-identical no-op when the reply carries no marker.
+    let reply = {
+        // WP-8A: `token` is the loop's own first-class credential
+        // state (see `resolve_current_token` above) — no more
+        // reverse-parsing it back out of `api_base`.
+        let sender = crate::channel_sender::TelegramSender {
+            bot_token: token.clone(),
+            chat_id: chat_id.to_string(),
+            http: client.clone(),
+        };
+        if crate::channel_reply::guard_lost(guarded.as_ref()).await {
+            return;
+        }
+        crate::channel_reply::deliver_documents_for_reply_guarded(
+            ctx.as_ref(),
+            effective_agent.as_deref(),
+            reply,
+            &sender,
+            guarded.as_ref(),
+        )
+        .await
+    };
+
+    // Guard: don't send empty replies (Telegram rejects empty text).
+    // Checked BEFORE deleting the interim progress message: this
+    // used to delete first and check emptiness after, which is
+    // fine functionally (both paths still delete) but reads as
+    // "decide what to do, THEN delete", not "delete only once we
+    // know what we're doing" — reordered so the emptiness
+    // decision comes first. Either way the progress message is
+    // removed so it never lingers as a stale "分析中…" bubble,
+    // even on the silent-by-design (blocked/muted) empty-reply path.
+    if reply.trim().is_empty() {
+        warn!(chat_id, "Telegram: reply is empty — skipping send");
+        if let Some(mid) = progress_msg_cleanup.lock().await.take() {
+            let del_body = json!({ "chat_id": chat_id, "message_id": mid });
+            let _ = client
+                .post(format!("{api_base}/deleteMessage"))
+                .json(&del_body)
+                .send()
+                .await;
+        }
+        return;
+    }
+
+    // Non-empty reply — remove the interim progress/task-board
+    // message now; the final reply below supersedes it.
+    if let Some(mid) = progress_msg_cleanup.lock().await.take() {
+        let del_body = json!({ "chat_id": chat_id, "message_id": mid });
+        let _ = client
+            .post(format!("{api_base}/deleteMessage"))
+            .json(&del_body)
+            .send()
+            .await;
+    }
+
+    // Check voice mode
+    let session_key = format!("telegram:{chat_id}");
+    let voice_enabled = ctx.voice_sessions.lock().await.contains(&session_key);
+    let markup = conversation_markup(&session_id, &reply);
+
+    if voice_enabled {
+        let tts_provider = crate::tts::EdgeTtsProvider::new();
+        match tts_provider.synthesize(&reply, "").await {
+            Ok(audio_bytes) => {
+                if crate::channel_reply::guard_lost(guarded.as_ref()).await {
+                    return;
+                }
+                let voice_sent = send_voice(&client, &api_base, chat_id, audio_bytes).await;
+                if voice_sent {
+                    if reply.len() > 200 {
+                        if crate::channel_reply::guard_lost(guarded.as_ref()).await {
+                            return;
+                        }
+                        send_reply_with_guard(
+                            &client,
+                            &api_base,
+                            chat_id,
+                            &format!("📝 {}", truncate_bytes(&reply, 200)),
+                            thread_id,
+                            msg_id,
+                            None,
+                            guarded.as_ref(),
+                        )
                         .await;
-                }
-
-                // Check voice mode
-                let session_key = format!("telegram:{chat_id}");
-                let voice_enabled = ctx.voice_sessions.lock().await.contains(&session_key);
-                let markup = conversation_markup(&session_id, &reply);
-
-                if voice_enabled {
-                    let tts_provider = crate::tts::EdgeTtsProvider::new();
-                    match tts_provider.synthesize(&reply, "").await {
-                        Ok(audio_bytes) => {
-                            if crate::channel_reply::guard_lost(guarded.as_ref()).await {
-                                continue;
-                            }
-                            let voice_sent =
-                                send_voice(&client, &api_base, chat_id, audio_bytes).await;
-                            if voice_sent {
-                                if reply.len() > 200 {
-                                    if crate::channel_reply::guard_lost(guarded.as_ref()).await {
-                                        continue;
-                                    }
-                                    send_reply_with_guard(
-                                        &client,
-                                        &api_base,
-                                        chat_id,
-                                        &format!("📝 {}", truncate_bytes(&reply, 200)),
-                                        thread_id,
-                                        msg_id,
-                                        None,
-                                        guarded.as_ref(),
-                                    )
-                                    .await;
-                                }
-                            } else {
-                                // sendAudio failed — a short reply (≤200 chars) had NO
-                                // text companion at all, so a failed voice upload used
-                                // to leave the user with nothing. Send the full text
-                                // reply as a fallback so the turn is never silently lost.
-                                warn!(
-                                    chat_id,
-                                    "Telegram: sendAudio failed — falling back to text reply"
-                                );
-                                send_reply_markdown(
-                                    &client,
-                                    &api_base,
-                                    chat_id,
-                                    &reply,
-                                    thread_id,
-                                    msg_id,
-                                    Some(markup.clone()),
-                                    &ctx.home_dir,
-                                    guarded.as_ref(),
-                                )
-                                .await;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("TTS synthesis failed, falling back to text: {e}");
-                            send_reply_markdown(
-                                &client,
-                                &api_base,
-                                chat_id,
-                                &reply,
-                                thread_id,
-                                msg_id,
-                                Some(markup.clone()),
-                                &ctx.home_dir,
-                                guarded.as_ref(),
-                            )
-                            .await;
-                        }
                     }
                 } else {
-                    // Send with inline keyboard buttons
+                    // sendAudio failed — a short reply (≤200 chars) had NO
+                    // text companion at all, so a failed voice upload used
+                    // to leave the user with nothing. Send the full text
+                    // reply as a fallback so the turn is never silently lost.
+                    warn!(
+                        chat_id,
+                        "Telegram: sendAudio failed — falling back to text reply"
+                    );
                     send_reply_markdown(
                         &client,
                         &api_base,
@@ -1327,15 +1399,136 @@ async fn poll_loop(
                         &reply,
                         thread_id,
                         msg_id,
-                        Some(markup),
+                        Some(markup.clone()),
                         &ctx.home_dir,
                         guarded.as_ref(),
                     )
                     .await;
                 }
             }
+            Err(e) => {
+                warn!("TTS synthesis failed, falling back to text: {e}");
+                send_reply_markdown(
+                    &client,
+                    &api_base,
+                    chat_id,
+                    &reply,
+                    thread_id,
+                    msg_id,
+                    Some(markup.clone()),
+                    &ctx.home_dir,
+                    guarded.as_ref(),
+                )
+                .await;
+            }
         }
+    } else {
+        // Send with inline keyboard buttons
+        send_reply_markdown(
+            &client,
+            &api_base,
+            chat_id,
+            &reply,
+            thread_id,
+            msg_id,
+            Some(markup),
+            &ctx.home_dir,
+            guarded.as_ref(),
+        )
+        .await;
     }
+}
+
+/// The decision principal for a Telegram message: the sending person's id, or
+/// `""` for anonymous admins, "send as channel", linked-channel forwards,
+/// forwarded messages and bots
+/// (`channel_decision_route::telegram_decision_principal`, F4 L1, F5-C L8).
+fn telegram_message_principal(msg: &TgMessage) -> String {
+    crate::channel_decision_route::telegram_decision_principal(
+        msg.from.as_ref().map(|u| u.id),
+        msg.from.as_ref().is_some_and(|u| u.is_bot),
+        msg.sender_chat.is_some(),
+        msg.forward_origin.is_some(),
+    )
+}
+
+/// Receiver-side decision lane. Returns `true` when the message was consumed.
+///
+/// Only a strict decision command (verb + full request id, after removing a
+/// leading `@username` that addresses this bot, case-insensitively —
+/// `channel_decision_route::strip_leading_mention`) is consumed; every other message — including 「確認」 alone and WP1.6
+/// reply-to-card verbs — returns `false` and goes to the normal FIFO
+/// unchanged (F4 M1/M2). Stripping the mention here keeps
+/// `@bot 確認 <id>` off the conversation FIFO, where it would wait behind the
+/// very computer-use turn it is meant to release (F4 L3).
+async fn telegram_decision_fastlane(
+    msg: &TgMessage,
+    client: &reqwest::Client,
+    api_base: &str,
+    ctx: &Arc<ReplyContext>,
+    account: &str,
+    bot_username: &str,
+) -> bool {
+    let Some(raw) = msg.text.as_deref() else {
+        return false;
+    };
+    let text = crate::channel_decision_route::strip_leading_mention(raw, bot_username);
+    if !crate::channel_decision_route::is_strict_decision(text) {
+        return false;
+    }
+    let context = crate::approval::DecisionContext {
+        channel: "telegram".into(),
+        account_id: account.into(),
+        principal_id: telegram_message_principal(msg),
+        conversation_id: msg.message_thread_id.map_or_else(
+            || msg.chat.id.to_string(),
+            |thread| format!("{}:{thread}", msg.chat.id),
+        ),
+    };
+    // A non-whitelisted group gets no answer at all, as before P0-B.
+    if msg
+        .chat
+        .chat_type
+        .as_deref()
+        .is_some_and(|kind| kind == "group" || kind == "supergroup")
+        && !ctx
+            .channel_settings
+            .is_channel_allowed("telegram", "global", &msg.chat.id.to_string())
+            .await
+    {
+        return true;
+    }
+    let Some(outcome) = crate::decision_notify::route_trusted_decision_fastlane_with_scope(
+        ctx,
+        &context,
+        &text,
+        crate::decision_notify::DecisionAccessScope {
+            channel_id: (msg.chat.chat_type.as_deref() != Some("private"))
+                .then_some(msg.chat.id.to_string())
+                .as_deref(),
+            guild_id: None,
+            session_id: None,
+        },
+    )
+    .await
+    else {
+        return false;
+    };
+    let ack = outcome.unwrap_or_else(|e| format!("⚠ {e}"));
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        send_reply(
+            client,
+            api_base,
+            msg.chat.id,
+            &ack,
+            msg.message_thread_id,
+            msg.message_id,
+            None,
+        ),
+    )
+    .await;
+    true
 }
 
 /// Handle an inline-keyboard button press (`callback_query` update).
@@ -1348,6 +1541,7 @@ async fn handle_callback_query(
     client: &reqwest::Client,
     api_base: &str,
     ctx: &Arc<ReplyContext>,
+    account_id: &str,
 ) {
     let data = cb.data.as_deref().unwrap_or("");
     let sender = cb
@@ -1373,9 +1567,33 @@ async fn handle_callback_query(
     // role, or (deployments with no approver identity at all) by an exact
     // match against the individual account the card was delivered to — never
     // by "was in the same chat".
-    if let Some(tg_uid) = cb.from.as_ref().map(|u| u.id.to_string()) {
-        if let Some(result) =
-            crate::decision_notify::route_press(&ctx.home_dir, "telegram", &tg_uid, data).await
+    if let Some(tg_uid) = cb.from.as_ref().map(|u| {
+        crate::channel_decision_route::telegram_decision_principal(Some(u.id), u.is_bot, false, false)
+    }) {
+        let chat_id_string = chat_id.to_string();
+        if let Some(result) = crate::decision_notify::route_verified_bound_press(
+            ctx,
+            &crate::approval::DecisionContext {
+                channel: "telegram".into(),
+                account_id: account_id.into(),
+                conversation_id: match thread_id {
+                    Some(t) => format!("{chat_id}:{t}"),
+                    None => chat_id.to_string(),
+                },
+                principal_id: tg_uid.clone(),
+            },
+            data,
+            crate::decision_notify::DecisionAccessScope {
+                channel_id: if msg.chat.chat_type.as_deref() == Some("private") {
+                    None
+                } else {
+                    Some(&chat_id_string)
+                },
+                guild_id: None,
+                session_id: None,
+            },
+        )
+        .await
         {
             // The persistent card (this same message) is retired in place by
             // the decide path itself — a detached best-effort edit that
@@ -3085,8 +3303,8 @@ mod ccr_principal_tests {
 
         let alice_acl = source_acl_for_principal(AGENT, SESSION, &alice)
             .expect("a real sender id yields a scope");
-        let bob_acl =
-            source_acl_for_principal(AGENT, SESSION, &bob).expect("a real sender id yields a scope");
+        let bob_acl = source_acl_for_principal(AGENT, SESSION, &bob)
+            .expect("a real sender id yields a scope");
         let room_acl = source_acl_for_principal(AGENT, SESSION, &room)
             .expect("the old chat-id principal also yielded a scope — that was the bug");
 
@@ -3180,3 +3398,469 @@ mod ccr_principal_tests {
         parts
     }
 }
+
+async fn get_bot_account_id(client: &reqwest::Client, api_base: &str) -> Option<String> {
+    let data: TgResponse<TgUser> = client
+        .get(format!("{api_base}/getMe"))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    if !data.ok {
+        return None;
+    }
+    Some(data.result?.id.to_string())
+}
+
+fn telegram_poll_api_base(token: &str) -> String {
+    let original = format!("{TELEGRAM_API}/bot{token}");
+    #[cfg(test)]
+    let original = crate::test_channel_provider::url(token, &original);
+    original
+}
+
+#[cfg(test)]
+mod receiver_fastlane_tests {
+    use super::*;
+    use crate::decision_notify::native_loop_fixture::{NativeCuFixture, install_named_job};
+    use crate::test_channel_provider::TestChannelProvider;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    fn update(id: i64, chat: i64, thread: i64, user: i64, text: &str) -> serde_json::Value {
+        json!({
+            "ok": true,
+            "result": [
+                          {
+                              "update_id": id,
+                              "message": {
+                                             "message_id": id,
+                                             "chat": {"id":chat,"type":"private"},
+                                             "from": {"id":user,"first_name":"Human"},
+                                             "message_thread_id": thread,
+                                             "text": text
+                                         }
+                          }
+                      ]
+        })
+    }
+
+    #[tokio::test]
+    async fn saturated_poll_queue_rejects_overflow_but_still_consumes_confirmation() {
+        let provider = TestChannelProvider::start().await;
+        for _ in 0..64 {
+            provider.enqueue_response(
+                "getMe",
+                json!({"ok":true,"result":{"id":7,"username":"fixturebot","first_name":"Fixture"}}),
+            );
+        }
+        let fixture = NativeCuFixture::new(&provider.token).await;
+        let _cu = install_named_job(
+            &provider.token,
+            "run cu",
+            fixture.work("saturated-poll-turn"),
+        );
+        let _queued = install_named_job(&provider.token, "queued", std::future::pending::<()>());
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut guards = Vec::new();
+        for chat in 43..46 {
+            let count = started.clone();
+            guards.push(install_named_job(
+                &provider.token,
+                &format!("hold{chat}"),
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                },
+            ));
+        }
+        provider.enqueue_response("getUpdates", update(1, 42, 17, 11, "run cu"));
+        let poll = tokio::spawn(poll_loop(
+            reqwest::Client::new(),
+            provider.token.clone(),
+            fixture.ctx.clone(),
+            "telegram".into(),
+            None,
+        ));
+        let id = fixture.pending_id().await;
+        let mut messages = Vec::new();
+        for (i, chat) in (43..46).enumerate() {
+            messages.extend(
+                update(i as i64 + 2, chat, 17, 11, &format!("hold{chat}"))["result"]
+                    .as_array()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        // One waiting CU + three active conversations + 28 queued ordinary
+        // messages exactly fill the 32 accepted-work slots.
+        for i in 0..28 {
+            messages.extend(
+                update(i + 5, 42, 17, 11, "queued")["result"]
+                    .as_array()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        messages.extend(
+            update(33, 42, 17, 11, "overflow")["result"]
+                .as_array()
+                .unwrap()
+                .clone(),
+        );
+        messages.extend(
+            update(34, 42, 17, 11, &format!("確認 {id}"))["result"]
+                .as_array()
+                .unwrap()
+                .clone(),
+        );
+        provider.enqueue_response("getUpdates", json!({"ok":true,"result":messages}));
+        fixture.wait_executed().await;
+        assert_eq!(started.load(Ordering::SeqCst), 3);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !provider.requests().iter().any(|r| {
+                r.body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("尚未受理"))
+            }) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("overflow was silently dropped instead of rejected with retry instructions");
+        assert_eq!(fixture.executed.load(Ordering::SeqCst), 1);
+        poll.abort();
+        assert!(poll.await.unwrap_err().is_cancelled());
+    }
+    #[tokio::test]
+    async fn actual_poll_reads_confirm_while_cu_waits_and_preserves_conversation_fifo() {
+        let provider = TestChannelProvider::start().await;
+        for _ in 0..64 {
+            provider.enqueue_response(
+                "getMe",
+                json!({"ok":true,"result":{"id":7,"username":"fixturebot","first_name":"Fixture"}}),
+            );
+        }
+        let fixture = NativeCuFixture::new(&provider.token).await;
+        let _cu = install_named_job(&provider.token, "run cu", fixture.work("poll-cu-turn"));
+        let later = Arc::new(AtomicUsize::new(0));
+        let later_count = later.clone();
+        let executed = fixture.executed.clone();
+        let _later = install_named_job(&provider.token, "later", async move {
+            assert_eq!(executed.load(Ordering::SeqCst), 1);
+            later_count.fetch_add(1, Ordering::SeqCst);
+        });
+        let other = Arc::new(AtomicUsize::new(0));
+        let other_count = other.clone();
+        let _other = install_named_job(&provider.token, "other", async move {
+            other_count.fetch_add(1, Ordering::SeqCst);
+        });
+        provider.enqueue_response("getUpdates", update(1, 42, 17, 11, "run cu"));
+        let poll = tokio::spawn(poll_loop(
+            reqwest::Client::new(),
+            provider.token.clone(),
+            fixture.ctx.clone(),
+            "telegram".into(),
+            None,
+        ));
+        let id = fixture.pending_id().await;
+        // Queued same-conversation work cannot overtake the waiting action;
+        // another conversation remains runnable within the bounded executor.
+        provider.enqueue_response("getUpdates", update(2, 42, 17, 11, "later"));
+        provider.enqueue_response("getUpdates", update(3, 43, 17, 11, "other"));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while other.load(Ordering::SeqCst) != 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(later.load(Ordering::SeqCst), 0);
+        provider.enqueue_response("getUpdates", update(4, 42, 18, 11, &format!("確認 {id}")));
+        provider.enqueue_response("getUpdates", update(5, 42, 17, 22, &format!("確認 {id}")));
+        // A barrier in a different conversation proves earlier input frames
+        // have been read, while rejected decisions must not start the action.
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let _seen = install_named_job(&provider.token, "seen", async move {
+            let _ = seen_tx.send(());
+        });
+        provider.enqueue_response("getUpdates", update(6, 44, 17, 11, "seen"));
+        tokio::time::timeout(std::time::Duration::from_secs(3), seen_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixture.executed.load(Ordering::SeqCst), 0);
+        provider.enqueue_response("getUpdates", update(7, 42, 17, 11, &format!("確認 {id}")));
+        fixture.wait_executed().await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while later.load(Ordering::SeqCst) != 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fixture.executed.load(Ordering::SeqCst), 1);
+        assert!(provider.requests().iter().any(|r| {
+            r.path.ends_with("sendMessage")
+                && r.body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&id))
+        }));
+        let b = crate::approval::ApprovalBroker::open(fixture.home.path()).unwrap();
+        assert_eq!(
+            b.list_operations().await.unwrap()[0].state,
+            crate::approval::OperationState::Succeeded
+        );
+        poll.abort();
+        assert!(poll.await.unwrap_err().is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod native_callback_acl_tests {
+    use super::*;
+    use crate::decision_notify::native_loop_fixture::*;
+    use crate::test_channel_provider::TestChannelProvider;
+    #[tokio::test]
+    async fn actual_native_callback_rechecks_sql_revocation_and_fails_closed() {
+        for mode in [
+            "allow",
+            "listed_allow",
+            "human_only",
+            "session_only",
+            "user",
+            "blocked",
+            "channel",
+            "pairing",
+            "corrupt",
+            "db",
+            "binding",
+        ] {
+            let provider = TestChannelProvider::start().await;
+            let fixture = NativeCuFixture::new(&provider.token).await;
+            let context = crate::approval::DecisionContext {
+                channel: "telegram".into(),
+                account_id: "telegram|7".into(),
+                principal_id: "11".into(),
+                conversation_id: "-42:17".into(),
+            };
+            let id = pending_native_request(&fixture, context).await;
+            // F4: an allowlist admits a sender only when both the person and
+            // the conversation are listed (the shipped `check_access_dual`
+            // semantics); one of the two is not enough.
+            let allowed = matches!(mode, "allow" | "listed_allow");
+            if mode == "human_only" || mode == "session_only" {
+                fixture
+                    .ctx
+                    .channel_settings
+                    .set(
+                        "telegram",
+                        "global",
+                        "allowed_users",
+                        if mode == "human_only" {
+                            r#"["11"]"#
+                        } else {
+                            r#"["telegram:-42:17"]"#
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else if mode == "listed_allow" {
+                fixture
+                    .ctx
+                    .channel_settings
+                    .set(
+                        "telegram",
+                        "global",
+                        "allowed_users",
+                        r#"["11","telegram:-42:17"]"#,
+                    )
+                    .await
+                    .unwrap();
+                // Exercise text and native independently against one fresh policy.
+                let text_id = pending_native_request(
+                    &fixture,
+                    crate::approval::DecisionContext {
+                        channel: "telegram".into(),
+                        account_id: "telegram|7".into(),
+                        principal_id: "11".into(),
+                        conversation_id: "-42:17".into(),
+                    },
+                )
+                .await;
+                let message:TgMessage=serde_json::from_value(json!({
+                    "message_id": 3,
+                    "chat": {"id":-42,"type":"supergroup"},
+                    "from": {"id":11},
+                    "message_thread_id": 17,
+                    "text": format!("確認 {}",text_id.as_str())
+                })).unwrap();
+                assert!(
+                    telegram_decision_fastlane(
+                        &message,
+                        &reqwest::Client::new(),
+                        &telegram_poll_api_base(&provider.token),
+                        &fixture.ctx,
+                        "telegram|7",
+                        "fixturebot"
+                    )
+                    .await
+                );
+                let broker = crate::approval::ApprovalBroker::open(fixture.home.path()).unwrap();
+                assert_eq!(
+                    broker.get(&text_id).await.unwrap().unwrap().status,
+                    crate::approval::ApprovalStatus::Approved
+                );
+            } else {
+                revoke_native_access(&fixture, "telegram", "global", mode).await;
+            }
+            let callback:TgCallbackQuery=serde_json::from_value(json!({
+                "id": "native-test",
+                "from": {"id":11},
+                "message": {"message_id":1,"chat":{"id":-42,"type":"supergroup"},"message_thread_id":17},
+                "data": crate::decision_action::encode(
+                    crate::decision_action::DecisionSource::Approval,
+                    crate::decision_action::DecisionAct::Approve,
+                    id.as_str()
+                )
+            })).unwrap();
+            if !allowed {
+                let message:TgMessage=serde_json::from_value(json!({
+                    "message_id": 2,
+                    "chat": {"id":-42,"type":"supergroup"},
+                    "from": {"id":11},
+                    "message_thread_id": 17,
+                    "text": format!("確認 {}",id.as_str())
+                })).unwrap();
+                assert!(
+                    telegram_decision_fastlane(
+                        &message,
+                        &reqwest::Client::new(),
+                        &telegram_poll_api_base(&provider.token),
+                        &fixture.ctx,
+                        "telegram|7",
+                        "fixturebot"
+                    )
+                    .await
+                );
+                assert_native_pending(&fixture, &id).await;
+            }
+            handle_callback_query(
+                &callback,
+                &reqwest::Client::new(),
+                &telegram_poll_api_base(&provider.token),
+                &fixture.ctx,
+                "telegram|7",
+            )
+            .await;
+            if allowed {
+                assert_native_approved(&fixture, &id).await;
+            } else {
+                assert_native_pending(&fixture, &id).await;
+            }
+            assert!(
+                provider
+                    .requests()
+                    .iter()
+                    .any(|r| r.path.ends_with("answerCallbackQuery")
+                        && r.body["text"].as_str().is_some_and(|text| if allowed {
+                            text.contains("同意")
+                        } else {
+                            text.contains("⚠")
+                        })),
+                "native rejection did not ACK {mode}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod transformed_decision_acl_tests {
+    use super::*;
+    use crate::decision_notify::native_loop_fixture::*;
+    #[tokio::test]
+    async fn mention_transformed_normal_inner_rechecks_sql_after_await() {
+        for mode in [
+            "listed",
+            "human_only",
+            "session_only",
+            "user",
+            "channel",
+            "blocked",
+            "corrupt",
+        ] {
+            let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+            let fixture = NativeCuFixture::new(&provider.token).await;
+            let context = crate::approval::DecisionContext {
+                channel: "telegram".into(),
+                account_id: "A1".into(),
+                conversation_id: "-42".into(),
+                principal_id: "11".into(),
+            };
+            let id = pending_native_request(&fixture, context).await;
+            fixture
+                .ctx
+                .channel_settings
+                .set(
+                    "telegram",
+                    "global",
+                    "allowed_users",
+                    // F4: both the person and the conversation must be listed.
+                    match mode {
+                        "human_only" => r#"["11"]"#,
+                        "session_only" => r#"["telegram:-42"]"#,
+                        _ => r#"["11","telegram:-42"]"#,
+                    },
+                )
+                .await
+                .unwrap();
+            fixture
+                .ctx
+                .channel_settings
+                .set("telegram", "global", "allowed_channels", r#"["-42"]"#)
+                .await
+                .unwrap();
+            let pause = pause_before_inner(&provider.token);
+            let msg: TgMessage = serde_json::from_value(serde_json::json!({
+                "message_id": 1, "chat": {"id": -42, "type": "group"},
+                "from": {"id": 11, "first_name": "Human"},
+                "text": format!("@fixture approve {}", id.as_str())
+            }))
+            .unwrap();
+            let ctx = fixture.ctx.clone();
+            let token = provider.token.clone();
+            let api = telegram_poll_api_base(&provider.token);
+            let task = tokio::spawn(process_telegram_message(
+                msg,
+                reqwest::Client::new(),
+                api,
+                token,
+                ctx,
+                "fixture".into(),
+                Some("fixture".into()),
+                "A1".into(),
+                "fixture".into(),
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(5), pause.0.notified())
+                .await
+                .unwrap();
+            if !matches!(mode, "listed" | "human_only" | "session_only") {
+                revoke_native_access(&fixture, "telegram", "global", mode).await;
+            }
+            pause.1.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            if mode == "listed" {
+                assert_native_approved(&fixture, &id).await;
+            } else {
+                assert_native_pending(&fixture, &id).await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "channel_decision_route/adapter_tests/telegram.rs"]
+mod f4_decision_route_tests;

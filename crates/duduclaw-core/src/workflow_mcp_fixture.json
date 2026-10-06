@@ -1,0 +1,25 @@
+{
+  "authority_human": {
+    "kind": "bound_human_approval",
+    "approval_id": "request-1"
+  },
+  "authority_grant": {
+    "kind": "active_workflow_revision_grant",
+    "grant_id": "grant-1",
+    "epoch": 2,
+    "spec_hash": "spec-1"
+  },
+  "environment": {
+    "schema_version": 1,
+    "binary_version": "1.69.1",
+    "binary_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "home": "/isolated/home",
+    "cwd": "/isolated/home/agents/alice",
+    "receipt_adapter_version": 1
+  },
+  "digests": {
+    "authority_human": "c28d5c649795bdd86507e3a288b74906cc331080652b8de6790b2954b078325a",
+    "authority_grant": "29c76c38bbcaa29090f1244c3e6af03abdb93aafdf36bd363ed09cf463d238dd",
+    "environment": "dd15bcb5d9daf9ff19543e56d8a3782d01fbb376f8c9137963d2d9efd5e1c0c4"
+  }
+}

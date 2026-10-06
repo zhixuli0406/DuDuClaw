@@ -320,11 +320,11 @@ impl MethodHandler {
             }
             "forward.recent" => {
                 require_manager!();
-                self.handle_forward_recent(params).await
+                self.handle_forward_recent(params, ctx).await
             }
             "forward.chain" => {
                 require_manager!();
-                self.handle_forward_chain(params).await
+                self.handle_forward_chain(params, ctx).await
             }
             "forward.calibration" => {
                 require_manager!();

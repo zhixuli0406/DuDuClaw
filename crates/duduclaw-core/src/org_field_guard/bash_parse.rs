@@ -281,6 +281,24 @@ fn tokenize(s: &str) -> Vec<Tok> {
     st.toks
 }
 
+/// The plain words of each simple command in `s`, after undoing line
+/// continuations, quotes and backslash escapes the way bash does; output
+/// redirect targets and input redirect sources are dropped, separators
+/// (`;`, `&&`, `||`, `|`, `&`, newline, backquote, parentheses) split
+/// commands. Used by [`super::operator_cmd`].
+pub(super) fn command_words(s: &str) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = vec![Vec::new()];
+    for tok in tokenize(&strip_fd_redirects(s)) {
+        match tok {
+            Tok::Word(w) => out.last_mut().expect("one segment").push(w),
+            Tok::RedirOut(_) => {}
+            Tok::Sep | Tok::Open | Tok::Close => out.push(Vec::new()),
+        }
+    }
+    out.retain(|seg| !seg.is_empty());
+    out
+}
+
 /// Context for resolving one command's paths.
 pub(super) struct Ctx<'a> {
     pub home: &'a Path,

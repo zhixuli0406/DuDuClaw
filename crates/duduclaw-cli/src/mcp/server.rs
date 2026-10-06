@@ -96,6 +96,12 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
         crate::mcp_memory_quota::DailyQuota::new(),
     );
 
+    let workflow_session =
+        super::workflow_operation::WorkflowSession::from_env(home_dir, &default_agent, &principal)
+            .map_err(|e| DuDuClawError::Gateway(format!("workflow session rejected: {e}")))?;
+    let workflow_available = workflow_session.is_some();
+    let dispatcher = dispatcher.with_workflow_session(workflow_session);
+
     // ── RFC-23 redaction layer init ─────────────────────────────
     // None ⇒ pipeline not enabled in config.toml (the normal zero-overhead
     // path). An Err means the operator DID enable it and it failed to
@@ -224,7 +230,14 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
         let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
         let response = match method {
-            "initialize" => handle_initialize(&id, &request),
+            "initialize" => {
+                let mut response = handle_initialize(&id, &request);
+                if workflow_available {
+                    response["result"]["capabilities"]["experimental"] =
+                        serde_json::json!({"duduclaw_workflow":{"version":1}});
+                }
+                response
+            }
             "tools/list" => {
                 // Gap (a): re-authenticate per call instead of reusing the
                 // boot-time `principal` — a revoked/rescoped key must stop

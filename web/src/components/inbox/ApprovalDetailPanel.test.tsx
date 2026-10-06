@@ -480,3 +480,26 @@ describe('<ApprovalDetailPanel> full-write conflict card', () => {
   });
 });
 
+
+describe('typed question', () => {
+  it('collects an answer and copies its explicit ID command without approving', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const onApprove = vi.fn(); const onReject = vi.fn();
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval({ request_kind: 'question', id: 'request-full-id', summary: 'Pick the preferred option' })} onApprove={onApprove} onReject={onReject} />);
+    expect(screen.getByText('Pick the preferred option')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Approve/ })).not.toBeInTheDocument();
+    const copy = screen.getByRole('button', { name: 'Copy answer command' });
+    expect(copy).toBeDisabled();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Your answer' }), { target: { value: 'B' } });
+    fireEvent.click(copy);
+    expect(writeText).toHaveBeenCalledWith('回答 request-full-id B');
+    expect(onApprove).not.toHaveBeenCalled(); expect(onReject).not.toHaveBeenCalled();
+  });
+});
+
+it('shows persisted question answer without decision controls', () => {
+  renderWithProviders(<ApprovalDetailPanel approval={genericApproval({ request_kind: 'question', status: 'answered', answer: 'B' })} onApprove={vi.fn()} onReject={vi.fn()} />);
+  expect(screen.getByText('Answered')).toBeInTheDocument(); expect(screen.getByText('B')).toBeInTheDocument();
+  expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+});

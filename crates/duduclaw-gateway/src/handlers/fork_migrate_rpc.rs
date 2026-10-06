@@ -58,7 +58,14 @@ impl MethodHandler {
         )
     }
 
-    pub(crate) fn handle_fork_list(&self, params: Value) -> WsFrame {
+    pub(crate) fn handle_fork_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let live = match live_reader_context(&self.home_dir, ctx) {
+            Ok(l) => l,
+            Err(()) => return WsFrame::error_response("", PERMISSION_DENIED),
+        };
+        if !live.has_role(UserRole::Manager) {
+            return WsFrame::error_response("", PERMISSION_DENIED);
+        }
         // No fork has ever been created yet → the store file doesn't exist.
         // That's an empty list, not an error: return [] so the dashboard shows
         // its "no forks yet" empty state instead of a scary error banner.
@@ -78,6 +85,7 @@ impl MethodHandler {
             Ok(forks) => {
                 let rows: Vec<Value> = forks
                     .iter()
+                    .filter(|f| live.has_agent_access(&f.agent_id, AccessLevel::Viewer))
                     .map(|f| {
                         json!({
                             "fork_id": f.fork_id,
@@ -97,7 +105,14 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) fn handle_fork_inspect(&self, params: Value) -> WsFrame {
+    pub(crate) fn handle_fork_inspect(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let live = match live_reader_context(&self.home_dir, ctx) {
+            Ok(l) => l,
+            Err(()) => return WsFrame::error_response("", PERMISSION_DENIED),
+        };
+        if !live.has_role(UserRole::Manager) {
+            return WsFrame::error_response("", PERMISSION_DENIED);
+        }
         let store = match self.open_fork_store() {
             Ok(s) => s,
             Err(f) => return f,
@@ -107,8 +122,10 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "fork_id is required"),
         };
         let fork = match store.get_fork(fork_id) {
-            Ok(Some(f)) => f,
-            Ok(None) => return WsFrame::error_response("", "fork not found"),
+            Ok(Some(f)) if live.has_agent_access(&f.agent_id, AccessLevel::Viewer) => f,
+            Ok(Some(_)) => return WsFrame::error_response("", PERMISSION_DENIED),
+            Ok(None) if live.is_admin() => return WsFrame::error_response("", "fork not found"),
+            Ok(None) => return WsFrame::error_response("", PERMISSION_DENIED),
             Err(e) => return WsFrame::error_response("", &format!("get fork: {e}")),
         };
         let branches = store.list_branches(fork_id).unwrap_or_default();

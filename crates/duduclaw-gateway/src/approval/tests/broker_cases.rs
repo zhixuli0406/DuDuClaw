@@ -198,6 +198,10 @@ async fn ttl_expiry_treated_as_deny() {
         notify_chat_id: None,
         reminded_at: None,
         simulation: None,
+        request_kind: crate::approval::RequestKind::Approval,
+        binding: None,
+        answer: None,
+        invalidated_reason: None,
     };
     let id = rec.id.clone();
     b.store.insert(&rec).await.unwrap();
@@ -233,6 +237,10 @@ async fn poll_expires_stale_on_read() {
         notify_chat_id: None,
         reminded_at: None,
         simulation: None,
+        request_kind: crate::approval::RequestKind::Approval,
+        binding: None,
+        answer: None,
+        invalidated_reason: None,
     };
     let id = rec.id.clone();
     b.store.insert(&rec).await.unwrap();
@@ -287,6 +295,10 @@ async fn list_pending_sweeps_expired() {
         notify_chat_id: None,
         reminded_at: None,
         simulation: None,
+        request_kind: crate::approval::RequestKind::Approval,
+        binding: None,
+        answer: None,
+        invalidated_reason: None,
     };
     b.store.insert(&stale).await.unwrap();
     let pending = b.list_pending(None).await.unwrap();
@@ -333,6 +345,10 @@ async fn await_decision_returns_expired_past_ttl() {
         notify_chat_id: None,
         reminded_at: None,
         simulation: None,
+        request_kind: crate::approval::RequestKind::Approval,
+        binding: None,
+        answer: None,
+        invalidated_reason: None,
     };
     let id = rec.id.clone();
     b.store.insert(&rec).await.unwrap();

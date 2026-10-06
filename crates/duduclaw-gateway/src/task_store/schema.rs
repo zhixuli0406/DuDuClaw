@@ -94,6 +94,7 @@ impl TaskStore {
         // rewrite. Each ALTER is guarded by a column-existence check so re-running
         // is a no-op (rusqlite has no `ADD COLUMN IF NOT EXISTS`).
         Self::add_dispatch_columns(conn)?;
+        Self::init_authority_schema(conn)?;
         // ── U4 co-edited plans: idempotent table creation ──
         Self::init_plan_schema(conn)?;
         // ── Iterative Kanban: iteration detail table (v1.45) ──
@@ -371,6 +372,10 @@ impl TaskStore {
             // as JSON. Nullable — every pre-existing row reads back as "no
             // ledger", which behaves exactly as before WP-G2.
             ("criteria_ledger", "criteria_ledger TEXT"),
+            (
+                "authority_revision",
+                "authority_revision INTEGER NOT NULL DEFAULT 1 CHECK(authority_revision >= 1)",
+            ),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {

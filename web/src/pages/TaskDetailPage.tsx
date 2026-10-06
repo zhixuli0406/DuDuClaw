@@ -1,3 +1,5 @@
+import { TaskWorkflowReview } from '@/components/workflow/TaskWorkflowReview';
+import { TaskAudienceNotice } from '@/components/task/TaskAudienceNotice';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Link, useNavigate, useParams } from 'react-router';
@@ -511,6 +513,7 @@ export function TaskDetailPage() {
         {/* I-2c: goal contract — risk boundary / acceptance criteria / latest
             result / confirmed facts. Renders nothing for a plain board task
             or a goal task with no contract fields set. */}
+        <TaskAudienceNotice restriction={timeline?.audience_restriction ?? null} restricted={task.restricted} />
         <GoalContractCards task={task} ledger={timeline?.criteria_ledger ?? null} />
 
         {/* Description (inline edit, multiline) */}
@@ -618,6 +621,8 @@ export function TaskDetailPage() {
           {intl.formatMessage({ id: 'tasks.detail.updatedAgo' })}{' '}
           <span className="font-mono tabular-nums">{timeAgo(task.updated_at)}</span>
         </p>
+
+        <TaskWorkflowReview taskId={task.id} completed={task.status === 'done'} />
 
         {/* Bottom tabs — I-2a 產物／檔案／變更／過程 */}
         <TaskBottomTabs

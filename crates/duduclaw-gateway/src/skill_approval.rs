@@ -126,3 +126,11 @@ mod tests {
         assert!(rec.status.as_str() == "pending");
     }
 }
+
+/// Revision activation always uses the bound workflow service. The legacy skill
+/// inbox record alone never grants workflow effects or enables a routine.
+pub async fn request_workflow_revision_activation(
+    service:&crate::workflow::WorkflowService,
+    request:crate::workflow::ActivationRequest,
+    binding:crate::approval::ExecutionBinding,
+)->Result<String,String>{service.request_activation(request,binding).await}

@@ -59,11 +59,19 @@ pub mod keys {
 /// path validating "discord" while the other silently accepts "Discord" would
 /// split the settings store into two unreachable halves.
 pub const VALID_CHANNEL_TYPES: &[&str] = &[
-    "discord", "telegram", "slack", "line", "whatsapp", "feishu", "wecom", "dingtalk",
+    "discord",
+    "telegram",
+    "slack",
+    "line",
+    "whatsapp",
+    "feishu",
+    "wecom",
+    "dingtalk",
     // v1.68.0: Google Chat and Teams gained a real `admin_users` gate
     // (`chat_commands::handle_command_for_sender`), so the list must be
     // settable for them. "teams" matches the dashboard's channel id.
-    "googlechat", "teams",
+    "googlechat",
+    "teams",
 ];
 
 /// "Behavior" setting keys — response shape / routing, not access control.
@@ -223,6 +231,77 @@ impl ChannelSettingsManager {
         )
     }
 
+    /// Refresh a scope from authoritative SQLite before durable dispatch.
+    /// Never accept the in-memory fallback as an authorization snapshot.
+    pub(crate) async fn refresh_channel_snapshot(
+        &self,
+        channel: &str,
+        scope: &str,
+    ) -> Result<Vec<(String, String, String)>, String> {
+        self.refresh_snapshot_filtered(channel, scope, None).await
+    }
+
+    /// Like [`Self::refresh_channel_snapshot`], but only `keys` are validated
+    /// and returned: an invalid value under an unrelated key does not make
+    /// the snapshot unavailable (LINE ingress review I-MEDIUM-7). The cache
+    /// is still refreshed for every row of the two scopes.
+    pub(crate) async fn refresh_channel_snapshot_for(
+        &self,
+        channel: &str,
+        scope: &str,
+        keys: &[&str],
+    ) -> Result<Vec<(String, String, String)>, String> {
+        self.refresh_snapshot_filtered(channel, scope, Some(keys))
+            .await
+    }
+
+    async fn refresh_snapshot_filtered(
+        &self,
+        channel: &str,
+        scope: &str,
+        only: Option<&[&str]>,
+    ) -> Result<Vec<(String, String, String)>, String> {
+        let wanted = |key: &str| only.is_none_or(|keys| keys.contains(&key));
+        let conn = self.conn.lock().await;
+        let rows = {
+            let disk: String = conn
+                .query_row("PRAGMA database_list", [], |r| r.get(2))
+                .map_err(|e| e.to_string())?;
+            if disk.is_empty() {
+                return Err("durable authorization requires on-disk settings".into());
+            }
+            let mut stmt = conn
+                .prepare("SELECT scope_id,key,value FROM channel_settings WHERE channel_type=?1
+                    AND scope_id IN ('global',?2) ORDER BY scope_id,key")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map(params![channel, scope], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+        };
+        for (_, key, value) in &rows {
+            if wanted(key) {
+                validate_setting_value(key, value)?;
+            }
+        }
+        #[cfg(test)]
+        pause_after_settings_read().await;
+        // All database-to-cache publications keep the connection lock until
+        // cache installation completes. No reader holds cache while taking DB.
+        let mut cache = self.cache.write().await;
+        cache.retain(|(ch, sc, _), _| ch != channel || (sc != "global" && sc != scope));
+        for (sc, key, value) in &rows {
+            cache.insert(Self::cache_key(channel, sc, key), Some(value.clone()));
+        }
+        Ok(rows.into_iter().filter(|(_, key, _)| wanted(key)).collect())
+    }
+
     /// Get a setting value. Returns `None` if not set.
     /// Uses in-memory cache for read-heavy path.
     pub async fn get(&self, channel_type: &str, scope_id: &str, key: &str) -> Option<String> {
@@ -243,7 +322,8 @@ impl ChannelSettingsManager {
             params![channel_type, scope_id, key],
             |row| row.get(0),
         ).ok();
-        drop(conn);
+        #[cfg(test)]
+        pause_after_settings_read().await;
 
         // Store in cache (including None to avoid repeated DB misses)
         let mut cache = self.cache.write().await;
@@ -280,7 +360,11 @@ impl ChannelSettingsManager {
         scope_id: &str,
         key: &str,
     ) -> Option<String> {
-        if let Some(v) = self.get(channel_type, scope_id, key).await.filter(|v| !v.is_empty()) {
+        if let Some(v) = self
+            .get(channel_type, scope_id, key)
+            .await
+            .filter(|v| !v.is_empty())
+        {
             return Some(v);
         }
         if scope_id == "global" {
@@ -368,7 +452,6 @@ impl ChannelSettingsManager {
             params![channel_type, scope_id, key, value, now],
         )
         .map_err(|e| e.to_string())?;
-        drop(conn);
 
         // Invalidate cache
         let mut cache = self.cache.write().await;
@@ -391,7 +474,6 @@ impl ChannelSettingsManager {
             params![channel_type, scope_id, key],
         )
         .map_err(|e| e.to_string())?;
-        drop(conn);
 
         // Invalidate cache
         let mut cache = self.cache.write().await;
@@ -446,7 +528,10 @@ impl ChannelSettingsManager {
         if !is_group {
             return true;
         }
-        if !self.is_channel_allowed(channel_type, "global", chat_id).await {
+        if !self
+            .is_channel_allowed(channel_type, "global", chat_id)
+            .await
+        {
             return false;
         }
         let mention_only = self
@@ -492,9 +577,112 @@ impl ChannelSettingsManager {
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
+tokio::task_local! {
+    static SETTINGS_READ_HOOK: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
+#[cfg(test)]
+async fn pause_after_settings_read() {
+    if let Ok((read, resume)) = SETTINGS_READ_HOOK.try_with(Clone::clone) {
+        read.notify_one();
+        resume.notified().await;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn stale_refresh_and_cache_miss_cannot_overwrite_completed_set_or_delete() {
+        for refresh in [true, false] {
+            for delete in [true, false] {
+                let (_db, manager) = temp_db();
+                let manager = Arc::new(manager);
+                manager
+                    .set("line", "global", keys::BLOCKED_USERS, "[]")
+                    .await
+                    .unwrap();
+                manager.cache.write().await.clear();
+                let read = Arc::new(tokio::sync::Notify::new());
+                let resume = Arc::new(tokio::sync::Notify::new());
+                let reader_manager = manager.clone();
+                let reader = tokio::spawn(SETTINGS_READ_HOOK.scope(
+                    (read.clone(), resume.clone()),
+                    async move {
+                        if refresh {
+                            reader_manager
+                                .refresh_channel_snapshot("line", "global")
+                                .await
+                                .unwrap();
+                        } else {
+                            assert_eq!(
+                                reader_manager
+                                    .get("line", "global", keys::BLOCKED_USERS)
+                                    .await
+                                    .as_deref(),
+                                Some("[]")
+                            );
+                        }
+                    },
+                ));
+                read.notified().await;
+                let attempted = Arc::new(tokio::sync::Notify::new());
+                let completed = Arc::new(tokio::sync::Notify::new());
+                let writer_manager = manager.clone();
+                let writer_attempted = attempted.clone();
+                let writer_completed = completed.clone();
+                let writer = tokio::spawn(async move {
+                    writer_attempted.notify_one();
+                    if delete {
+                        writer_manager
+                            .delete("line", "global", keys::BLOCKED_USERS)
+                            .await
+                            .unwrap();
+                    } else {
+                        writer_manager
+                            .set("line", "global", keys::BLOCKED_USERS, "[\"revoked\"]")
+                            .await
+                            .unwrap();
+                    }
+                    writer_completed.notify_one();
+                });
+                attempted.notified().await;
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(40),
+                        completed.notified()
+                    )
+                    .await
+                    .is_err(),
+                    "writer must serialize behind the pending database-to-cache publication"
+                );
+                resume.notify_one();
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    reader.await.unwrap();
+                    writer.await.unwrap();
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    manager
+                        .get("line", "global", keys::BLOCKED_USERS)
+                        .await
+                        .as_deref(),
+                    if delete { None } else { Some("[\"revoked\"]") }
+                );
+                assert_eq!(
+                    manager
+                        .get_all("line", "global")
+                        .await
+                        .iter()
+                        .find(|(k, _)| k == keys::BLOCKED_USERS)
+                        .map(|(_, v)| v.as_str()),
+                    if delete { None } else { Some("[\"revoked\"]") }
+                );
+            }
+        }
+    }
 
     fn temp_db() -> (NamedTempFile, ChannelSettingsManager) {
         let tmp = NamedTempFile::new().unwrap();
@@ -506,24 +694,52 @@ mod tests {
     async fn group_gate_applies_whitelist_and_mention_only_to_groups_only() {
         let (_tmp, mgr) = temp_db();
         // Nothing configured ⇒ everything passes.
-        assert!(mgr.group_message_allowed("feishu", "oc_1", true, false).await);
+        assert!(
+            mgr.group_message_allowed("feishu", "oc_1", true, false)
+                .await
+        );
         mgr.set("feishu", "global", keys::ALLOWED_CHANNELS, r#"["oc_1"]"#)
             .await
             .unwrap();
-        assert!(mgr.group_message_allowed("feishu", "oc_1", true, false).await);
-        assert!(!mgr.group_message_allowed("feishu", "oc_2", true, true).await);
+        assert!(
+            mgr.group_message_allowed("feishu", "oc_1", true, false)
+                .await
+        );
+        assert!(
+            !mgr.group_message_allowed("feishu", "oc_2", true, true)
+                .await
+        );
         // Prefix of an allowed id is not allowed.
         assert!(!mgr.group_message_allowed("feishu", "oc_", true, true).await);
         // DMs are never filtered.
-        assert!(mgr.group_message_allowed("feishu", "ou_dm", false, false).await);
-        mgr.set("feishu", "global", keys::MENTION_ONLY, "true").await.unwrap();
-        assert!(!mgr.group_message_allowed("feishu", "oc_1", true, false).await);
-        assert!(mgr.group_message_allowed("feishu", "oc_1", true, true).await);
+        assert!(
+            mgr.group_message_allowed("feishu", "ou_dm", false, false)
+                .await
+        );
+        mgr.set("feishu", "global", keys::MENTION_ONLY, "true")
+            .await
+            .unwrap();
+        assert!(
+            !mgr.group_message_allowed("feishu", "oc_1", true, false)
+                .await
+        );
+        assert!(
+            mgr.group_message_allowed("feishu", "oc_1", true, true)
+                .await
+        );
         // Per-chat override wins over global.
-        mgr.set("feishu", "oc_1", keys::MENTION_ONLY, "false").await.unwrap();
-        assert!(mgr.group_message_allowed("feishu", "oc_1", true, false).await);
+        mgr.set("feishu", "oc_1", keys::MENTION_ONLY, "false")
+            .await
+            .unwrap();
+        assert!(
+            mgr.group_message_allowed("feishu", "oc_1", true, false)
+                .await
+        );
         // Other platforms unaffected.
-        assert!(mgr.group_message_allowed("dingtalk", "oc_2", true, false).await);
+        assert!(
+            mgr.group_message_allowed("dingtalk", "oc_2", true, false)
+                .await
+        );
     }
 
     /// The dashboard writes `agent_override` at `global`; Discord reads per
@@ -535,22 +751,30 @@ mod tests {
         assert_eq!(mgr.get_scoped_or_global("discord", "g1", k).await, None);
         mgr.set("discord", "global", k, "sales").await.unwrap();
         assert_eq!(
-            mgr.get_scoped_or_global("discord", "g1", k).await.as_deref(),
+            mgr.get_scoped_or_global("discord", "g1", k)
+                .await
+                .as_deref(),
             Some("sales")
         );
         assert_eq!(
-            mgr.get_scoped_or_global("discord", "dm", k).await.as_deref(),
+            mgr.get_scoped_or_global("discord", "dm", k)
+                .await
+                .as_deref(),
             Some("sales")
         );
         mgr.set("discord", "g1", k, "support").await.unwrap();
         assert_eq!(
-            mgr.get_scoped_or_global("discord", "g1", k).await.as_deref(),
+            mgr.get_scoped_or_global("discord", "g1", k)
+                .await
+                .as_deref(),
             Some("support")
         );
         // Clearing the guild value falls back again.
         mgr.set("discord", "g1", k, "").await.unwrap();
         assert_eq!(
-            mgr.get_scoped_or_global("discord", "g1", k).await.as_deref(),
+            mgr.get_scoped_or_global("discord", "g1", k)
+                .await
+                .as_deref(),
             Some("sales")
         );
         // Another platform's global value does not leak.

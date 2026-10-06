@@ -533,15 +533,51 @@ impl MethodHandler {
                 );
             }
         };
-        match scheduler.run_now(&id).await {
-            Ok(name) => {
+        // Reusing this id reconnects to the same typed workflow run; it never
+        // consumes or substitutes the next scheduled occurrence.
+        let (display_name, typed) = match scheduler.run_now_metadata(&id).await {
+            Ok(metadata) => metadata,
+            Err(error) => return WsFrame::error_response("", &error),
+        };
+        // E-H4: a workflow routine requires the caller's request id, so a
+        // retry of the same click reconnects to the same run.
+        let request_id = match params.get("request_id").and_then(Value::as_str) {
+            Some(r) if !r.is_empty() => r.to_owned(),
+            _ if typed => {
+                return WsFrame::error_response(
+                    "",
+                    crate::cron_scheduler::WORKFLOW_MANUAL_REQUEST_ID_REQUIRED,
+                );
+            }
+            _ => uuid::Uuid::new_v4().to_string(),
+        };
+        match scheduler.run_now_with_request_id(&id, &request_id).await {
+            Ok(result) => {
+                let run_id = typed.then_some(result);
+                // The run's actual state (a reconnect may find it finished).
+                let run_status = match &run_id {
+                    Some(run_id) => match self.workflow_store().await {
+                        Ok(store) => store
+                            .get_run(run_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|run| json!(run.status)),
+                        Err(_) => None,
+                    },
+                    None => None,
+                };
+                let name = display_name;
                 // The run itself is async; what changed synchronously is the
                 // task's run history, which `cron.list` carries — so a refetch
                 // is exactly the right reaction here too.
                 self.emit_cron_changed(json!({ "action": "ran", "id": id, "name": name }))
                     .await;
                 info!(id = %id, name = %name, "Cron task manual run-now triggered");
-                WsFrame::ok_response("", json!({ "success": true, "id": id, "name": name }))
+                WsFrame::ok_response(
+                    "",
+                    json!({ "success": true, "id": id, "name": name, "run_id": run_id, "run_status": run_status, "request_id": request_id })
+                )
             }
             Err(e) => WsFrame::error_response("", &format!("run cron task: {e}")),
         }

@@ -793,17 +793,31 @@ impl GoalLoopDriver {
             // A1 ledger: the `<state>` block exactly as dispatched (loop
             // warning included), serialized before the dispatch consumes it.
             let state_block_json = goal_state::state_block_ledger_json(&state_block, &state_hash);
+            // State-building hooks may await external work. Recheck the exact
+            // kickoff contract and expiry at the actual enqueue boundary.
+            if is_new
+                && level.requires_kickoff()
+                && !matches!(self.kickoff_gate(task).await?, KickoffGate::Proceed)
+            {
+                continue;
+            }
             let (team_dispatch, gate_inputs_json) =
                 self.try_team_dispatch(task, next_iter, &state_text).await;
             // Freeze the same title/description/criteria classifier the
             // difficulty-scaled guard used for this actual dispatch.
-            let difficulty_text = format!("{}\n{}\n{}", task.title, task.description,
-                task.acceptance_criteria.as_deref().unwrap_or(""));
-            let difficulty = match crate::dispatch_engine::classify_goal_difficulty(&difficulty_text) {
-                crate::dispatch_engine::Difficulty::Simple => "simple",
-                crate::dispatch_engine::Difficulty::Complex => "complex",
-            };
-            let mut gate_inputs = gate_inputs_json.as_deref()
+            let difficulty_text = format!(
+                "{}\n{}\n{}",
+                task.title,
+                task.description,
+                task.acceptance_criteria.as_deref().unwrap_or("")
+            );
+            let difficulty =
+                match crate::dispatch_engine::classify_goal_difficulty(&difficulty_text) {
+                    crate::dispatch_engine::Difficulty::Simple => "simple",
+                    crate::dispatch_engine::Difficulty::Complex => "complex",
+                };
+            let mut gate_inputs = gate_inputs_json
+                .as_deref()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
                 .filter(serde_json::Value::is_object)
                 .unwrap_or_else(|| serde_json::json!({}));

@@ -6,9 +6,69 @@ use super::*;
 impl ApprovalStore {
     /// Open (or create) the store at `<home>/approvals.db`.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
-        let db_path = home_dir.join("approvals.db");
-        let conn = Connection::open(&db_path).map_err(|e| format!("open approvals store: {e}"))?;
+        // SQLite NOFOLLOW rejects symlinked parent components too (e.g. macOS
+        // /var -> /private/var). Resolve the trusted home, while still refusing
+        // a symlink at the actual database or sidecar path.
+        let db_path = std::fs::canonicalize(home_dir)
+            .map_err(|e| format!("resolve approval home: {e}"))?
+            .join("approvals.db");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            for suffix in ["-wal", "-shm"] {
+                let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
+                if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err("approval sidecar symlink refused".into());
+                }
+                if path.exists() {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            if std::fs::symlink_metadata(&db_path).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err("approval database symlink refused".into());
+            }
+            // Never open-and-close an existing database file: closing any fd
+            // on it drops every POSIX lock this process holds there, so other
+            // live connections lose their WAL locks and another process may
+            // checkpoint and remove the WAL under them (stale reads, then
+            // "disk I/O error"; seen in workflow::resume_tests). Only create.
+            if !db_path.exists() {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&db_path)
+                {
+                    Ok(_) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+                    Err(e) => return Err(format!("private approval store: {e}")),
+                }
+            }
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+        }
+        let conn = Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|e| format!("open approvals store: {e}"))?;
         Self::init_schema(&conn)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let p = PathBuf::from(format!("{}{suffix}", db_path.display()));
+                if std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err("approval sidecar symlink refused".into());
+                }
+                if p.exists() {
+                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
         info!(?db_path, "ApprovalStore initialized");
         Ok(Self {
             conn: Mutex::new(conn),
@@ -28,7 +88,8 @@ impl ApprovalStore {
 
     fn init_schema(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
+            "PRAGMA secure_delete=ON;
+             PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;
 
              CREATE TABLE IF NOT EXISTS approvals (
@@ -50,6 +111,8 @@ impl ApprovalStore {
         )
         .map_err(|e| format!("init approvals schema: {e}"))?;
         Self::migrate(conn)?;
+        Self::init_operations(conn)?;
+        Self::migrate_workflow_authority(conn)?;
         Ok(())
     }
 
@@ -73,6 +136,13 @@ impl ApprovalStore {
             ("reminded_at", "reminded_at TEXT"),
             // D1: ActionGuard simulation narrative (JSON text, NULL when absent).
             ("simulation", "simulation TEXT"),
+            (
+                "request_kind",
+                "request_kind TEXT NOT NULL DEFAULT 'approval'",
+            ),
+            ("binding_json", "binding_json TEXT"),
+            ("answer_json", "answer_json TEXT"),
+            ("invalidated_reason", "invalidated_reason TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -84,15 +154,29 @@ impl ApprovalStore {
     }
 
     pub(super) async fn insert(&self, rec: &ApprovalRecord) -> Result<(), String> {
+        self.insert_row(rec, false).await.map(|_| ())
+    }
+
+    /// Insert unless a row with the same id exists. Returns true when inserted.
+    pub(super) async fn insert_if_absent(&self, rec: &ApprovalRecord) -> Result<bool, String> {
+        self.insert_row(rec, true).await
+    }
+
+    async fn insert_row(&self, rec: &ApprovalRecord, if_absent: bool) -> Result<bool, String> {
         let payload_text = rec.payload.to_string();
         let simulation_text = rec.simulation.as_ref().map(|v| v.to_string());
         let conn = self.conn.lock().await;
-        conn.execute(
+        let sql = format!(
             "INSERT INTO approvals
                 (id, agent_id, action_kind, summary, payload, status,
                  created_at, decided_at, decided_by, ttl_seconds,
-                 notify_channel, notify_chat_id, reminded_at, simulation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 notify_channel, notify_chat_id, reminded_at, simulation, request_kind, binding_json, answer_json,
+                invalidated_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18){}",
+            if if_absent { " ON CONFLICT(id) DO NOTHING" } else { "" }
+        );
+        conn.execute(
+            &sql,
             params![
                 rec.id.as_str(),
                 rec.agent_id,
@@ -108,10 +192,14 @@ impl ApprovalStore {
                 rec.notify_chat_id,
                 rec.reminded_at,
                 simulation_text,
+                rec.request_kind.as_str(),
+                rec.binding.as_ref().map(|v| serde_json::to_string(v).unwrap()),
+                rec.answer.as_ref().map(Value::to_string),
+                rec.invalidated_reason,
             ],
         )
-        .map_err(|e| format!("insert approval: {e}"))?;
-        Ok(())
+        .map(|n| n == 1)
+        .map_err(|e| format!("insert approval: {e}"))
     }
 
     /// WP20: record where the pending-approval push landed. Best-effort
@@ -152,7 +240,8 @@ impl ApprovalStore {
         conn.query_row(
             "SELECT id, agent_id, action_kind, summary, payload, status,
                     created_at, decided_at, decided_by, ttl_seconds,
-                    notify_channel, notify_chat_id, reminded_at, simulation
+                    notify_channel, notify_chat_id, reminded_at, simulation,
+                    request_kind, binding_json, answer_json, invalidated_reason
              FROM approvals WHERE id = ?1",
             params![id.as_str()],
             row_to_record,
@@ -176,7 +265,10 @@ impl ApprovalStore {
         conn.execute(
             "UPDATE approvals
              SET status = ?1, decided_by = ?2, decided_at = ?3
-             WHERE id = ?4 AND status = 'pending'",
+             WHERE id = ?4 AND status = 'pending'
+             AND (?1 NOT IN ('approved','denied','answered') OR
+                  (julianday(created_at) IS NOT NULL
+                   AND julianday(?3) < julianday(created_at) + ttl_seconds / 86400.0))",
             params![status.as_str(), decided_by, decided_at, id.as_str()],
         )
         .map_err(|e| format!("decide approval: {e}"))
@@ -189,7 +281,8 @@ impl ApprovalStore {
             .prepare(
                 "SELECT id, agent_id, action_kind, summary, payload, status,
                         created_at, decided_at, decided_by, ttl_seconds,
-                        notify_channel, notify_chat_id, reminded_at, simulation
+                        notify_channel, notify_chat_id, reminded_at, simulation,
+                        request_kind, binding_json, answer_json, invalidated_reason
                  FROM approvals WHERE action_kind = ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| format!("prepare list_by_kind: {e}"))?;
@@ -211,13 +304,19 @@ impl ApprovalStore {
     ) -> Result<usize, String> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE approvals SET summary = ?1, payload = ?2, simulation = NULL WHERE id = ?3",
+            "UPDATE approvals SET summary = ?1, payload = ?2, simulation = NULL,
+             status = CASE WHEN binding_json IS NOT NULL THEN 'invalidated' ELSE status END,
+             invalidated_reason = CASE WHEN binding_json IS NOT NULL THEN 'payload_scrubbed' ELSE invalidated_reason
+                END WHERE id = ?3",
             params![summary, payload.to_string(), id.as_str()],
         )
         .map_err(|e| format!("scrub approval: {e}"))
     }
 
-    pub(super) async fn list_pending(&self, agent_id: Option<&str>) -> Result<Vec<ApprovalRecord>, String> {
+    pub(super) async fn list_pending(
+        &self,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<ApprovalRecord>, String> {
         let conn = self.conn.lock().await;
         match agent_id {
             Some(aid) => {
@@ -225,7 +324,8 @@ impl ApprovalStore {
                     .prepare(
                         "SELECT id, agent_id, action_kind, summary, payload, status,
                                 created_at, decided_at, decided_by, ttl_seconds,
-                                notify_channel, notify_chat_id, reminded_at, simulation
+                                notify_channel, notify_chat_id, reminded_at, simulation,
+                                request_kind, binding_json, answer_json, invalidated_reason
                          FROM approvals
                          WHERE status = 'pending' AND agent_id = ?1
                          ORDER BY created_at ASC",
@@ -243,7 +343,8 @@ impl ApprovalStore {
                     .prepare(
                         "SELECT id, agent_id, action_kind, summary, payload, status,
                                 created_at, decided_at, decided_by, ttl_seconds,
-                                notify_channel, notify_chat_id, reminded_at, simulation
+                                notify_channel, notify_chat_id, reminded_at, simulation,
+                                request_kind, binding_json, answer_json, invalidated_reason
                          FROM approvals
                          WHERE status = 'pending'
                          ORDER BY created_at ASC",
@@ -266,6 +367,22 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ApprovalRecord> {
     let status_text: String = row.get(5)?;
     let simulation_text: Option<String> = row.get(13)?;
     let simulation = simulation_text.and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    let binding = row
+        .get::<_, Option<String>>(15)?
+        .map(|s| {
+            serde_json::from_str::<ExecutionBinding>(&s).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    15,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })
+        .transpose()?;
+    let action_kind: String = row.get(2)?;
+    if action_kind.starts_with("bound_") && binding.is_none() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     Ok(ApprovalRecord {
         id: ApprovalId::from(row.get::<_, String>(0)?),
         agent_id: row.get(1)?,
@@ -281,6 +398,12 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ApprovalRecord> {
         notify_chat_id: row.get(11)?,
         reminded_at: row.get(12)?,
         simulation,
+        request_kind: RequestKind::from_db(&row.get::<_, String>(14)?),
+        binding,
+        answer: row
+            .get::<_, Option<String>>(16)?
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        invalidated_reason: row.get(17)?,
     })
 }
 

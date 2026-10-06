@@ -4,6 +4,36 @@
 use super::*;
 
 impl MethodHandler {
+    /// Inject only a test-owned service with an explicitly verified CLI binary.
+    /// Production always uses current_exe; this cannot be enabled by runtime config.
+    #[cfg(test)]
+    pub(crate) fn install_workflow_fixture(
+        &self,
+        service: crate::workflow::WorkflowService,
+    ) -> Result<(), String> {
+        self.workflow_store.set(service.store.clone())
+            .map_err(|_| "workflow store already initialized".to_string())?;
+        self.workflow_service.set(Arc::new(service))
+            .map_err(|_| "workflow service already initialized".to_string())
+    }
+    pub(crate) async fn workflow_store(
+        &self
+    ) -> Result<Arc<crate::workflow::WorkflowStore>, String> {
+        self.workflow_store
+            .get_or_try_init(|| async {
+                crate::workflow::WorkflowStore::open(&self.home_dir).map(Arc::new)
+            })
+            .await
+            .cloned()
+    }
+    pub(crate) async fn workflow_service(&self)->Result<Arc<crate::workflow::WorkflowService>,String> {
+        self.workflow_service.get_or_try_init(||async{
+            let store=self.workflow_store().await?;
+            let broker=Arc::new(crate::approval::ApprovalBroker::open(&self.home_dir)?);
+            let binary=std::env::current_exe().map_err(|e|e.to_string())?;
+            crate::workflow::WorkflowService::new(self.home_dir.clone(),binary,store,broker).map(Arc::new)
+        }).await.cloned()
+    }
     pub async fn new(home_dir: PathBuf) -> Self {
         Self::with_extension(home_dir, Arc::new(crate::extension::NullExtension)).await
     }
@@ -54,6 +84,8 @@ impl MethodHandler {
         }
         let home_dir_for_registry = home_dir.clone();
         Self {
+            workflow_store: tokio::sync::OnceCell::new(),
+            workflow_service: tokio::sync::OnceCell::new(),
             registry: Arc::new(RwLock::new(registry)),
             home_dir,
             start_time: Instant::now(),

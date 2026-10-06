@@ -713,7 +713,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // orphaned run directories): at boot, then every 10 minutes so a failed
     // per-task cleanup does not wait for the next restart. Background:
     // never delays boot; a no-op while `<home>/sandbox` does not exist.
-    tokio::spawn(crate::task_sandbox::sweep::run_periodically(home_dir.clone()));
+    tokio::spawn(crate::task_sandbox::sweep::run_periodically(
+        home_dir.clone(),
+    ));
 
     // Tool-driven computer-use sessions (`computer_*` MCP tools →
     // `POST /api/internal/computer-use`): the reaper ends expired or idle
@@ -1154,8 +1156,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         tokio::sync::mpsc::unbounded_channel::<duduclaw_agent::SilenceBreakerEvent>();
     // The proactive check runs the agent's CLI on the host; for a
     // sandbox-enabled employee that is reported, never silent.
-    let proactive_notice: duduclaw_agent::HostRunNotice =
-        std::sync::Arc::new(|home: &std::path::Path, agent_id: &str, sandbox_enabled: bool| {
+    let proactive_notice: duduclaw_agent::HostRunNotice = std::sync::Arc::new(
+        |home: &std::path::Path, agent_id: &str, sandbox_enabled: bool| {
             crate::task_sandbox::note_not_applied(
                 home,
                 agent_id,
@@ -1163,7 +1165,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 crate::task_sandbox::HostPath::Proactive,
                 crate::task_sandbox::HostAction::RanOnHost,
             );
-        });
+        },
+    );
     let heartbeat = duduclaw_agent::heartbeat::start_heartbeat_scheduler_with(
         home_dir.clone(),
         handler.registry().clone(),
@@ -1266,16 +1269,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                     // novelty_gate` is honored on this path too (it used to
                     // call `SqliteMemoryEngine::new` directly, leaving the
                     // engine with no embedder).
-                    let engine = match crate::memory_factory::build_memory_engine(
-                        &db_path,
-                        &home_for_decay,
-                    ) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            tracing::warn!("Memory decay: failed to open memory.db: {e}");
-                            return;
-                        }
-                    };
+                    let engine =
+                        match crate::memory_factory::build_memory_engine(&db_path, &home_for_decay)
+                        {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!("Memory decay: failed to open memory.db: {e}");
+                                return;
+                            }
+                        };
                     let rt = tokio::runtime::Handle::current();
                     rt.block_on(duduclaw_memory::decay::run_decay(&engine, &p));
                 });
@@ -1791,6 +1793,27 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Called exactly once, here, at boot — never from the
     // `system.update_config` hot-reload paths (see
     // `MethodHandler::pause_inflight_goal_tasks_on_restart`'s doc comment).
+    if let Ok(broker) = crate::approval::ApprovalBroker::open(&home_dir) {
+        if let Err(e) = broker.invalidate_live_on_restart().await {
+            warn!(error=%e,"approval live recovery failed closed");
+        }
+        if let Err(e) = broker.recover_operations().await {
+            warn!(error=%e,"operation recovery failed");
+        }
+    }
+    // R-M1: releasing run leases and re-queuing workflow messages is only safe
+    // when no other gateway runs on this home. Without the lock this process
+    // does no workflow reconciliation, dispatch or sweep at all.
+    match duduclaw_core::gateway_instance::acquire(&home_dir) {
+        Ok(()) => {
+            reconcile_workflows_on_boot(&home_dir).await;
+            spawn_workflow_sweep(home_dir.to_path_buf());
+        }
+        Err(e) => error!(
+            error = %e,
+            "another gateway holds this data directory: workflow boot reconciliation, dispatch and sweep are disabled in this process (see `duduclaw doctor`)"
+        ),
+    }
     let resumed_paused = handler.pause_inflight_goal_tasks_on_restart().await;
     if resumed_paused > 0 {
         info!(
@@ -2356,7 +2379,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         )
         .route(
             "/api/decision/shadow-sla-screen/evaluate",
-            post(handle_decision_sla_shadow_screen_evaluate).layer(DefaultBodyLimit::max(16 * 1024)),
+            post(handle_decision_sla_shadow_screen_evaluate)
+                .layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
             "/api/decision/shadow-sla-screen/save",
@@ -4117,7 +4141,7 @@ fn authorize_file_access(
     headers: &axum::http::HeaderMap,
     token_query: Option<&str>,
     agent: Option<&str>,
-) -> Result<(), axum::response::Response> {
+) -> Result<UserContext, axum::response::Response> {
     let unauthorized = || {
         (
             axum::http::StatusCode::UNAUTHORIZED,
@@ -4142,7 +4166,7 @@ fn authorize_file_access(
         )
             .into_response());
     }
-    Ok(())
+    Ok(ctx)
 }
 
 /// This gateway has instance-wide admin roles but no tenant claim in its JWT.
@@ -4517,8 +4541,7 @@ async fn handle_decision_task_board_export(
     };
     let home = state.home_dir.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut config =
-            crate::decision_task_board_shadow::TaskBoardShadowConfig::from_home(&home);
+        let mut config = crate::decision_task_board_shadow::TaskBoardShadowConfig::from_home(&home);
         if let Some(queue) = request.queue {
             let queue = queue.trim().to_owned();
             if queue.is_empty() || queue.len() > 96 {
@@ -6537,7 +6560,8 @@ async fn handle_decision_synthetic_pilot_lifecycle(
     if let Err(response) = authorize_causal_admin(&state, &headers) {
         return response;
     }
-    let request: DecisionSyntheticPilotLifecycleRequest = match parse_decision_model_request(&body) {
+    let request: DecisionSyntheticPilotLifecycleRequest = match parse_decision_model_request(&body)
+    {
         Ok(request) => request,
         Err(response) => return response,
     };
@@ -9427,8 +9451,7 @@ mod decision_sla_shadow_api_tests {
             axum::http::StatusCode::PAYLOAD_TOO_LARGE
         );
         let mut past_source_cap = forecast_retry.clone();
-        past_source_cap["opening_source_json"] =
-            serde_json::json!("x".repeat(2 * 1024 * 1024 + 1));
+        past_source_cap["opening_source_json"] = serde_json::json!("x".repeat(2 * 1024 * 1024 + 1));
         let refused = handle_decision_shadow_sla_forecast_create(
             State(state.clone()),
             admin_headers.clone(),
@@ -9654,7 +9677,9 @@ mod decision_sla_shadow_api_tests {
             );
         }
 
-        store.revoke_source_version(&scope, &opening_sha256).unwrap();
+        store
+            .revoke_source_version(&scope, &opening_sha256)
+            .unwrap();
         let revoked_forecast = handle_decision_shadow_sla_forecast_load(
             State(state.clone()),
             admin_headers.clone(),
@@ -10625,9 +10650,8 @@ mod causal_curation_api_tests {
         });
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("origin", "http://localhost:18789".parse().unwrap());
-        let body = || {
-            Bytes::from_static(b"{\"tenant_id\":1,\"probe_schema_field\":\"probe-secret\"}")
-        };
+        let body =
+            || Bytes::from_static(b"{\"tenant_id\":1,\"probe_schema_field\":\"probe-secret\"}");
         let raw = || axum::extract::RawQuery(Some("probe_schema_field=probe-secret".into()));
 
         assert_denied(
@@ -11194,9 +11218,12 @@ mod causal_curation_api_tests {
         sla_only.baseline_event_replay_hash = None;
         sla_only.alternative_event_replay_hash = None;
         sla_only.forecast_validation_id = None;
-        let sla_only_response =
-            handle_decision_compare(State(state.clone()), admin_headers.clone(), decision_body(&sla_only))
-                .await;
+        let sla_only_response = handle_decision_compare(
+            State(state.clone()),
+            admin_headers.clone(),
+            decision_body(&sla_only),
+        )
+        .await;
         assert_eq!(sla_only_response.status(), axum::http::StatusCode::OK);
         let sla_only_body = axum::body::to_bytes(sla_only_response.into_body(), 100_000)
             .await
@@ -13760,6 +13787,33 @@ fn authorize_device_admin(
     Ok(())
 }
 
+async fn authorize_review_artifact(
+    state: &AppState,
+    ctx: &UserContext,
+    agent: Option<&str>,
+    name: &str
+) -> Result<(), axum::response::Response> {
+    let denied = ||
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"access denied"}))
+        )
+            .into_response();
+    let store = state.handler.workflow_store().await.map_err(|_| denied())?;
+    crate::review_evidence::download::authorize_artifact_access(
+        &state.home_dir,
+        &store,
+        ctx,
+        agent,
+        name
+    )
+    .await
+    .map_err(|_| denied())?;
+    crate::workflow::artifact::verify_download(&state.home_dir, &store, agent, name)
+        .await
+        .map_err(|_| denied())
+}
+
 #[derive(serde::Deserialize)]
 struct FilesListQuery {
     agent: Option<String>,
@@ -13780,9 +13834,7 @@ async fn handle_files_list(
     axum::extract::Query(q): axum::extract::Query<FilesListQuery>,
 ) -> axum::response::Response {
     let agent = q.agent.as_deref().filter(|s| !s.is_empty());
-    if let Err(resp) = authorize_file_access(&state, &headers, None, agent) {
-        return resp;
-    }
+    let ctx = match authorize_file_access(&state, &headers, None, agent) { Ok(ctx) => ctx, Err(resp) => return resp };
     let dir = match crate::files_api::attachments_dir(&state.home_dir, agent) {
         Some(d) => d,
         None => {
@@ -13793,7 +13845,10 @@ async fn handle_files_list(
                 .into_response();
         }
     };
-    let mut files = crate::files_api::list_files(&dir);
+    let mut files = Vec::new();
+    for file in crate::files_api::list_files(&dir) {
+        if authorize_review_artifact(&state, &ctx, agent, &file.name).await.is_ok() { files.push(file); }
+    }
     // I-2b: join the provenance ledger so the panel can say which task / AI
     // staff member delivered a file versus which files a human sent in.
     let index = crate::artifacts::provenance_index(&state.home_dir, agent);
@@ -13829,7 +13884,11 @@ async fn handle_files_download(
 ) -> axum::response::Response {
     let agent = q.agent.as_deref().filter(|s| !s.is_empty());
     // Auth (header or `token` query) + per-agent authorization, fail-closed.
-    if let Err(resp) = authorize_file_access(&state, &headers, q.token.as_deref(), agent) {
+    let ctx = match authorize_file_access(&state, &headers, q.token.as_deref(), agent) {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp
+    };
+    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
         return resp;
     }
 
@@ -13844,7 +13903,7 @@ async fn handle_files_download(
         }
     };
 
-    let path = match crate::files_api::resolve_download(&dir, &q.name) {
+    let path = match crate::files_api::resolve_attachment_file(&dir, &q.name) {
         Ok(p) => p,
         Err(crate::files_api::ResolveError::BadRequest) => {
             return (
@@ -13920,7 +13979,11 @@ async fn handle_files_preview(
     axum::extract::Query(q): axum::extract::Query<FilesDownloadQuery>,
 ) -> axum::response::Response {
     let agent = q.agent.as_deref().filter(|s| !s.is_empty());
-    if let Err(resp) = authorize_file_access(&state, &headers, q.token.as_deref(), agent) {
+    let ctx = match authorize_file_access(&state, &headers, q.token.as_deref(), agent) {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp
+    };
+    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
         return resp;
     }
     let dir = match crate::files_api::attachments_dir(&state.home_dir, agent) {
@@ -13933,7 +13996,7 @@ async fn handle_files_preview(
                 .into_response();
         }
     };
-    let path = match crate::files_api::resolve_download(&dir, &q.name) {
+    let path = match crate::files_api::resolve_attachment_file(&dir, &q.name) {
         Ok(p) => p,
         Err(crate::files_api::ResolveError::BadRequest) => {
             return (
@@ -14837,7 +14900,9 @@ async fn handle_voice_config_set(
     let config_path = state.home_dir.join("config.toml");
     // v1.68: never rewrite an unparsable config.toml (it would be replaced
     // by just the [voice] keys).
-    let original_text = tokio::fs::read_to_string(&config_path).await.unwrap_or_default();
+    let original_text = tokio::fs::read_to_string(&config_path)
+        .await
+        .unwrap_or_default();
     let mut table: toml::Table = match original_text.parse() {
         Ok(t) => t,
         Err(_) => {
@@ -14859,8 +14924,12 @@ async fn handle_voice_config_set(
         let stored = table.get("voice").and_then(|v| v.as_table());
         let new_url = body.stt_base_url.trim();
         let url_changed = !new_url.is_empty()
-            && stored.and_then(|v| v.get("stt_base_url")).and_then(|v| v.as_str()) != Some(new_url);
-        let has_key = stored.is_some_and(|v| v.contains_key("stt_api_key_enc") || v.contains_key("stt_api_key"));
+            && stored
+                .and_then(|v| v.get("stt_base_url"))
+                .and_then(|v| v.as_str())
+                != Some(new_url);
+        let has_key = stored
+            .is_some_and(|v| v.contains_key("stt_api_key_enc") || v.contains_key("stt_api_key"));
         let key_kept = matches!(body.stt_api_key.as_deref(), None | Some(""));
         if url_changed && has_key && key_kept {
             return (
@@ -14931,7 +15000,8 @@ async fn handle_voice_config_set(
     // dashboard config RPCs.
     let original_hash = crate::handlers::config_commit::content_hash(&original_text);
     if let Err(e) =
-        crate::handlers::config_commit::commit_table_locked(&config_path, original_hash, &table).await
+        crate::handlers::config_commit::commit_table_locked(&config_path, original_hash, &table)
+            .await
     {
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -15269,6 +15339,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     let (mut sink, mut stream) = socket.split();
     let mut log_rx = state.tx.subscribe();
     let mut event_rx = state.event_tx.subscribe();
+    // Per-connection gate for broadcast events (task gate, employee binding,
+    // admin-only kinds, lock screen); see `handlers/push_filter.rs`.
+    let mut push_gate = crate::handlers::PushGate::new(&state.home_dir, &user_ctx, pre_auth);
     let mut logs_subscribed = false;
 
     // ── P4-3+: OS-native live event tail (opt-in, admin-gated) ────────────
@@ -15303,9 +15376,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     // (experts.generate/install run minutes) stopped the heartbeat arm, the
     // 60s pong check then killed the connection MID-REQUEST (dashboard saw
     // "Connection closed") and every other RPC on the socket was head-of-line
-    // blocked. The Option<bool> is the response-gated os_events_subscribed
-    // update (see the os.events.subscribe authorization note below).
-    let (rpc_tx, mut rpc_rx) = tokio::sync::mpsc::channel::<(WsFrame, Option<bool>)>(64);
+    // blocked. The two Option<bool>s are the response-gated
+    // os_events_subscribed and logs_subscribed updates (see the
+    // os.events.subscribe authorization note below).
+    let (rpc_tx, mut rpc_rx) =
+        tokio::sync::mpsc::channel::<(WsFrame, Option<bool>, Option<bool>)>(64);
 
     loop {
         tokio::select! {
@@ -15343,13 +15418,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
 
                         match frame {
                             WsFrame::Request { id, method, params } => {
-                                // Track log subscription state (method-name
-                                // based, so it stays synchronous here).
-                                if method == "logs.subscribe" {
-                                    logs_subscribed = true;
-                                } else if method == "logs.unsubscribe" {
-                                    logs_subscribed = false;
-                                }
+                                // Log subscription state is gated on the
+                                // response below, like os.events (F5-D: the
+                                // flag used to flip on the method name before
+                                // `logs.subscribe` was authorized, so any
+                                // signed-in account got the log tail).
 
                                 // Handle the request in a spawned task — never
                                 // inline. See the `rpc_tx` comment above: a
@@ -15380,11 +15453,19 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                         "os.events.unsubscribe" => Some(false),
                                         _ => None,
                                     };
+                                    let logs_update = match method.as_str() {
+                                        "logs.subscribe" => {
+                                            matches!(&response, WsFrame::Response { ok: true, .. })
+                                                .then_some(true)
+                                        }
+                                        "logs.unsubscribe" => Some(false),
+                                        _ => None,
+                                    };
 
                                     if let WsFrame::Response { id: ref mut resp_id, .. } = response {
                                         *resp_id = id;
                                     }
-                                    let _ = task_tx.send((response, os_update)).await;
+                                    let _ = task_tx.send((response, os_update, logs_update)).await;
                                 });
                             }
                             other => { warn!("Received non-request frame: {:?}", other); }
@@ -15405,7 +15486,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
             // `rpc_tx` is held by this scope, so recv() can only yield None
             // after every in-flight task dropped its clone AND the local
             // sender was dropped — which never happens while this loop runs.
-            Some((response, os_update)) = rpc_rx.recv() => {
+            Some((response, os_update, logs_update)) = rpc_rx.recv() => {
+                if let Some(on) = logs_update {
+                    logs_subscribed = on;
+                }
                 match os_update {
                     Some(true) => {
                         os_events_subscribed = true;
@@ -15422,6 +15506,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
             // ── Outbound log broadcast (only when subscribed) ─
             log_line = log_rx.recv(), if logs_subscribed => {
                 match log_line {
+                    // The log tail is Manager+; a downgraded or suspended
+                    // account stops receiving it within the push cache window.
+                    Ok(_) if !push_gate.allows_log_tail() => {}
                     Ok(line) => {
                         // Send as WsFrame::Event so the frontend can parse it uniformly
                         let data = serde_json::from_str::<serde_json::Value>(&line)
@@ -15444,7 +15531,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
             event_line = event_rx.recv() => {
                 match event_line {
                     Ok(json) => {
-                        // Events are already serialized as WsFrame::Event JSON
+                        // Events are already serialized as WsFrame::Event JSON.
+                        // Task events pass the same per-reader gate as the
+                        // task RPCs (live identity + TaskPacket audience):
+                        // dropped or reduced to the board card per connection.
+                        let Some(json) = push_gate.filter(&json) else {
+                            continue;
+                        };
                         if sink.send(Message::Text(json.into())).await.is_err() { break; }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {} // drop missed events
@@ -16384,5 +16477,75 @@ mod shutdown_sequence_tests {
             step.is_some(),
             "the shadow flush must go through `bounded_step` with a 5s bound"
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "server_workflow_fixture.rs"]
+mod server_workflow_fixture;
+
+/// Resident workflow sweep every 60 s: resumes runs whose decision arrived or
+/// expired, re-wakes runs nobody owns and delivers outbox rows. A decision's
+/// own resume is written in the decision transaction; expiry is not an event,
+/// so only this sweep notices it.
+fn spawn_workflow_sweep(home_dir: std::path::PathBuf) {
+    tokio::spawn(async move {
+        let mut service: Option<crate::workflow::WorkflowService> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            if !home_dir.join("workflow.db").exists() {
+                continue;
+            }
+            if service.is_none() {
+                let opened = (|| {
+                    let store = Arc::new(crate::workflow::WorkflowStore::open(&home_dir)?);
+                    let broker = Arc::new(crate::approval::ApprovalBroker::open(&home_dir)?);
+                    let binary = std::env::current_exe().map_err(|e| e.to_string())?;
+                    crate::workflow::WorkflowService::new(home_dir.clone(), binary, store, broker)
+                })();
+                match opened {
+                    Ok(s) => service = Some(s),
+                    Err(e) => {
+                        warn!(error = %e, "workflow sweep unavailable");
+                        continue;
+                    }
+                }
+            }
+            if let Some(service) = &service {
+                let report = service.sweep().await;
+                for error in &report.errors {
+                    warn!(error = %error, "workflow sweep item not reconciled");
+                }
+                if report.resumed + report.requeued + report.outbox_delivered > 0 {
+                    info!(?report, "workflow sweep woke runs");
+                }
+            }
+        }
+    });
+}
+
+/// Boot-only: fail closed on workflow projections, routines and queue handoffs
+/// left by a previous process. Never enables a routine or advances a projection.
+async fn reconcile_workflows_on_boot(home_dir: &std::path::Path) {
+    if !home_dir.join("workflow.db").exists() {
+        return;
+    }
+    let service = (|| {
+        let store = Arc::new(crate::workflow::WorkflowStore::open(home_dir)?);
+        let broker = Arc::new(crate::approval::ApprovalBroker::open(home_dir)?);
+        let binary = std::env::current_exe().map_err(|e| e.to_string())?;
+        crate::workflow::WorkflowService::new(home_dir.to_path_buf(), binary, store, broker)
+    })();
+    match service {
+        Ok(service) => match service.reconcile_on_boot().await {
+            Ok(report) => {
+                for error in &report.errors {
+                    warn!(error = %error, "workflow outbox row not reconciled at boot");
+                }
+                info!(?report, "workflow boot reconciliation finished");
+            }
+            Err(e) => warn!(error = %e, "workflow boot reconciliation failed"),
+        },
+        Err(e) => warn!(error = %e, "workflow boot reconciliation unavailable"),
     }
 }

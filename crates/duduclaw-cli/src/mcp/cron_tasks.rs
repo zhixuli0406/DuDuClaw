@@ -55,7 +55,8 @@ pub(crate) async fn handle_schedule_task(params: &Value, home_dir: &Path, caller
     };
     if scheduled_target != caller {
         if let Err(reason) =
-            check_delegation_allowed(home_dir, caller, &scheduled_target, "tasks_create_schedule").await
+            check_delegation_allowed(home_dir, caller, &scheduled_target, "tasks_create_schedule")
+                .await
         {
             return serde_json::json!({
                 "content": [{"type": "text", "text": format!("Error: {reason}")}],
@@ -266,7 +267,10 @@ pub(crate) fn cron_created_receipt(name: &str, cron: &str, timezone: Option<&str
 /// The agent a cron row runs as — the record's owner. `"default"` is the
 /// scheduler's alias for the main agent, resolved the same way
 /// the cron rail resolves it at creation.
-pub(crate) async fn cron_row_owner(home_dir: &Path, row: &duduclaw_gateway::cron_store::CronTaskRow) -> String {
+pub(crate) async fn cron_row_owner(
+    home_dir: &Path,
+    row: &duduclaw_gateway::cron_store::CronTaskRow,
+) -> String {
     if row.agent_id == "default" {
         resolve_main_agent_name(home_dir).await
     } else {
@@ -333,7 +337,11 @@ pub(crate) async fn resolve_owned_cron_row(
 /// When `agent_id` is omitted, returns ALL tasks (not just the calling agent's).
 /// This matches dashboard behavior and allows the main agent to see sub-agent
 /// cron tasks — cron jobs are system resources, not session-scoped.
-pub(crate) async fn handle_list_cron_tasks(params: &Value, home_dir: &Path, _default_agent: &str) -> Value {
+pub(crate) async fn handle_list_cron_tasks(
+    params: &Value,
+    home_dir: &Path,
+    _default_agent: &str,
+) -> Value {
     use duduclaw_gateway::cron_store::CronStore;
 
     // Explicit agent_id filter — empty or absent means show all tasks.
@@ -468,6 +476,7 @@ pub(crate) async fn handle_update_cron_task(
         }
     }
 
+    super::workflow_operation::effect_start();
     match store
         .update_fields(
             &existing.id,
@@ -479,12 +488,31 @@ pub(crate) async fn handle_update_cron_task(
         )
         .await
     {
-        Ok(true) => serde_json::json!({
-            "content": [{"type": "text", "text": format!(
-                "Cron task '{}' updated (id: {}).",
-                new_name, &existing.id[..8]
-            )}]
-        }),
+        Ok(true) => {
+            if let Ok(Some(row)) = store.get(&existing.id).await {
+                if row.name == new_name
+                    && row.cron == new_cron
+                    && row.task == new_task
+                    && row.agent_id == existing.agent_id
+                    && row.enabled == existing.enabled
+                {
+                    let observed = serde_json::to_value(&row).unwrap_or(Value::Null);
+                    super::workflow_operation::effect_committed(
+                        serde_json::json!({
+                            "adapter": "update_cron_task",
+                            "adapter_version": 1,
+                            "cron_id": existing.id,
+                            "row_hash": duduclaw_gateway::approval::payload_hash(&observed),
+                            "row": observed
+                        }),
+                    );
+                }
+            }
+            serde_json::json!({"content":[{
+                "type": "text",
+                "text": format!("Cron task '{}' updated (id: {}).", new_name, &existing.id[..8])
+            }]})
+        }
         Ok(false) => tool_error("update returned no rows changed"),
         Err(e) => tool_error(&format!("update cron task: {e}")),
     }
@@ -513,11 +541,11 @@ pub(crate) async fn handle_delete_cron_task(
         Err(e) => return tool_error(&format!("open cron store: {e}")),
     };
 
-    let row = match resolve_owned_cron_row(&store, home_dir, params, actor, "delete_cron_task").await
-    {
-        Ok(row) => row,
-        Err(refusal) => return refusal,
-    };
+    let row =
+        match resolve_owned_cron_row(&store, home_dir, params, actor, "delete_cron_task").await {
+            Ok(row) => row,
+            Err(refusal) => return refusal,
+        };
     let key = if !id.is_empty() { id } else { name };
 
     match store.delete(&row.id).await {
@@ -559,7 +587,8 @@ pub(crate) async fn handle_pause_cron_task(
         Err(e) => return tool_error(&format!("open cron store: {e}")),
     };
 
-    let row = match resolve_owned_cron_row(&store, home_dir, params, actor, "pause_cron_task").await {
+    let row = match resolve_owned_cron_row(&store, home_dir, params, actor, "pause_cron_task").await
+    {
         Ok(row) => row,
         Err(refusal) => return refusal,
     };

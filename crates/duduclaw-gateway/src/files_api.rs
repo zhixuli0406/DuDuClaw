@@ -296,6 +296,34 @@ pub fn resolve_download(dir: &Path, name: &str) -> Result<PathBuf, ResolveError>
     Ok(canon)
 }
 
+/// [`resolve_download`] for files whose access is bound to the file name
+/// (task deliverables under `attachments/`, F3 V-M-1): the name must be the
+/// file itself, never a symbolic link to another one, and the file must have
+/// no second hard link. Otherwise a private archive could be republished
+/// under a new, unbound name in the same directory.
+pub fn resolve_attachment_file(dir: &Path, name: &str) -> Result<PathBuf, ResolveError> {
+    let canon = resolve_download(dir, name)?;
+    let meta = std::fs::symlink_metadata(dir.join(name)).map_err(|_| ResolveError::NotFound)?;
+    if meta.file_type().is_symlink() || !meta.is_file() || hard_link_count(&meta) > 1 {
+        return Err(ResolveError::Denied);
+    }
+    if canon.file_name().and_then(|n| n.to_str()) != Some(name) {
+        return Err(ResolveError::Denied);
+    }
+    Ok(canon)
+}
+
+#[cfg(unix)]
+fn hard_link_count(meta: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::nlink(meta)
+}
+#[cfg(not(unix))]
+fn hard_link_count(_meta: &std::fs::Metadata) -> u64 {
+    // No portable link count on this platform; the symlink and name checks
+    // still apply.
+    1
+}
+
 /// Best-effort `Content-Type` from the filename extension. Unknown types fall
 /// back to `application/octet-stream` (forces a download rather than guessing).
 pub fn content_type_for(name: &str) -> &'static str {
@@ -476,6 +504,30 @@ mod tests {
         assert_eq!(
             resolve_download(&dir, "nope.pdf"),
             Err(ResolveError::NotFound)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_file_refuses_links_inside_the_directory() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("attachments");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("1759_report.md"), b"private").unwrap();
+        assert!(resolve_attachment_file(&dir, "1759_report.md").is_ok());
+        symlink(dir.join("1759_report.md"), dir.join("public.md")).unwrap();
+        assert!(resolve_download(&dir, "public.md").is_ok(), "plain resolver follows");
+        assert_eq!(
+            resolve_attachment_file(&dir, "public.md"),
+            Err(ResolveError::Denied)
+        );
+        fs::hard_link(dir.join("1759_report.md"), dir.join("copy.md")).unwrap();
+        assert_eq!(resolve_attachment_file(&dir, "copy.md"), Err(ResolveError::Denied));
+        assert_eq!(
+            resolve_attachment_file(&dir, "1759_report.md"),
+            Err(ResolveError::Denied),
+            "the original also has a second name now"
         );
     }
 

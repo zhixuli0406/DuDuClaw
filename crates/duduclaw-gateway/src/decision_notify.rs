@@ -96,19 +96,50 @@ pub(crate) fn is_pushable_channel(channel: &str) -> bool {
 /// Open `users.db` ONLY if it already exists. `UserDb::new` would create the
 /// file; a channel dispatcher (or the `duduclaw mcp-server` child process)
 /// must not conjure an auth database as a side effect of handling a press.
-pub(crate) fn open_user_db(home_dir: &Path) -> Option<UserDb> {
+pub(crate) fn open_user_db(home_dir: &Path) -> Result<Option<UserDb>, String> {
     let path = home_dir.join("users.db");
-    if !path.exists() {
-        return None;
+    match std::fs::metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("identity store metadata unavailable".into()),
+        Ok(_) => UserDb::new(&path)
+            .map(Some)
+            .map_err(|_| "identity store unreadable or corrupt".into()),
     }
-    UserDb::new(&path).ok()
+}
+
+/// New bound decisions distinguish an absent identity deployment from every
+/// database/lookup failure. A configured system never downgrades to solo mode.
+fn bound_decision_authority(
+    home: &Path,
+    channel: &str,
+    principal: &str,
+) -> Result<(Option<UserRole>, bool), String> {
+    let Some(db) = open_user_db(home)? else {
+        return Ok((None, false));
+    };
+    let active = !db
+        .list_users()
+        .map_err(|_| "identity list unavailable")?
+        .is_empty();
+    let uid = db
+        .find_verified_user_id_by_channel(channel, principal)
+        .map_err(|_| "verified identity lookup failed")?;
+    let role = match uid {
+        Some(uid) => db
+            .get_user(&uid)
+            .map_err(|_| "principal lookup failed")?
+            .filter(|u| u.status == UserStatus::Active)
+            .map(|u| u.role),
+        None => None,
+    };
+    Ok((role, active))
 }
 
 /// Verified channel identities of every Active Admin/Manager — the humans the
 /// dashboard would let decide. Empty when `users.db` does not exist (a solo
 /// deployment that never onboarded dashboard users).
 pub(crate) fn approver_links(home_dir: &Path) -> Vec<(String, String)> {
-    let Some(db) = open_user_db(home_dir) else {
+    let Ok(Some(db)) = open_user_db(home_dir) else {
         return Vec::new();
     };
     let Ok(users) = db.list_users() else {
@@ -140,7 +171,7 @@ pub(crate) fn mapped_role(
     channel: &str,
     channel_user_id: &str,
 ) -> Option<UserRole> {
-    let db = open_user_db(home_dir)?;
+    let db = open_user_db(home_dir).ok().flatten()?;
     let uid = db
         .find_verified_user_id_by_channel(channel, channel_user_id)
         .ok()
@@ -153,7 +184,7 @@ pub(crate) fn mapped_role(
 /// all. When false, the only authority available is the destination the
 /// operator configured — see [`authorize_press`].
 pub(crate) fn identity_system_active(home_dir: &Path) -> bool {
-    !approver_links(home_dir).is_empty()
+    open_user_db(home_dir).is_err() || !approver_links(home_dir).is_empty()
 }
 
 // ── Authorization ───────────────────────────────────────────────
@@ -462,8 +493,10 @@ pub(crate) async fn deliver_now(
                 Some(url) => format!("{}\n\n👉 {url}", card.body),
                 None => card.body.to_string(),
             };
-            match crate::channel_sender::send_with_markup(http, channel, token, chat_id, &body, markup)
-                .await
+            match crate::channel_sender::send_with_markup(
+                http, channel, token, chat_id, &body, markup,
+            )
+            .await
             {
                 Ok(pushed) => {
                     if let Some(p) = &pushed {
@@ -1082,5 +1115,871 @@ mod tests {
                 "a missing row must refuse, not succeed: {data}"
             );
         }
+    }
+}
+
+/// A verified inbound adapter supplies all four identity dimensions. The legacy
+/// route is intentionally unable to decide bound requests.
+pub async fn route_bound_press(
+    home: &Path,
+    context: &crate::approval::DecisionContext,
+    data: &str,
+) -> Option<Result<String, String>> {
+    let action = crate::decision_action::parse(data)?;
+    if action.source != DecisionSource::Approval {
+        return route_press(home, &context.channel, &context.principal_id, data).await;
+    }
+    Some(apply_bound_request(home, context, &action.id, Some(action.approve()), None).await)
+}
+
+/// Bounded explicit-ID text commands, handled before model dispatch. Bare yes
+/// and A/B are data, never an implicit selection of the latest pending request.
+///
+/// `None` unless the text is a strict decision command (verb + complete
+/// request UUID, `channel_decision_route::parse_strict_decision`): a verb
+/// without a valid id is ordinary conversation and is never answered here
+/// (F4, review M1).
+pub async fn route_bound_text(
+    home: &Path,
+    context: &crate::approval::DecisionContext,
+    text: &str,
+) -> Option<Result<String, String>> {
+    let command = crate::channel_decision_route::parse_strict_decision(text)?;
+    if command.is_answer() {
+        let Some(answer) = command.rest else {
+            return Some(Err("請在請求編號後填寫答案。".into()));
+        };
+        Some(
+            apply_bound_request(
+                home,
+                context,
+                &command.id,
+                None,
+                Some(serde_json::json!(answer)),
+            )
+            .await,
+        )
+    } else {
+        if command.rest.is_some() {
+            return Some(Err("核准指令包含多餘內容，請重新確認編號。".into()));
+        }
+        Some(apply_bound_request(home, context, &command.id, Some(command.approves()), None).await)
+    }
+}
+async fn apply_bound_request(
+    home: &Path,
+    context: &crate::approval::DecisionContext,
+    id: &str,
+    approve: Option<bool>,
+    answer: Option<serde_json::Value>,
+) -> Result<String, String> {
+    use crate::channel_decision_route::DECISION_REFUSED;
+    let broker = crate::approval::ApprovalBroker::open(home)?;
+    let request = crate::approval::ApprovalId::from(id.to_string());
+    // Unknown, unreadable and foreign requests read the same (review L2).
+    let rec = match broker.get(&request).await {
+        Ok(Some(rec)) => rec,
+        Ok(None) => return Err(DECISION_REFUSED.into()),
+        Err(e) => {
+            tracing::warn!(error = %e, "bound decision: request row unreadable");
+            return Err(DECISION_REFUSED.into());
+        }
+    };
+    if rec.binding.is_none() {
+        if answer.is_some() {
+            return Err("這筆舊請求不是可回答的問題".into());
+        }
+        return crate::approval_notify::apply_decision(
+            home,
+            &context.channel,
+            &context.principal_id,
+            id,
+            approve.unwrap_or(false),
+        )
+        .await;
+    }
+    context
+        .validate()
+        .map_err(|_| DECISION_REFUSED.to_string())?;
+    let binding = rec.binding.as_ref().ok_or("缺少核准身分")?;
+    if &binding.decision_context != context {
+        return Err(DECISION_REFUSED.into());
+    }
+    let (role, identity_active) =
+        bound_decision_authority(home, &context.channel, &context.principal_id)?;
+    if rec.request_kind == crate::approval::RequestKind::Question {
+        let answer = answer.ok_or("此請求只收集答案，按同意不會授權動作。")?;
+        broker.answer_question(&request, context, answer).await?;
+        return Ok("已記錄答案；尚未授權任何動作。".into());
+    }
+    let auth = authorize_press(role, identity_active, true);
+    if auth != PressAuth::Allow {
+        return Err(refusal_text(auth, "核准"));
+    }
+    broker
+        .decide_bound(&request, context, approve.ok_or("請使用確認或取消指令")?)
+        .await?;
+    Ok(if approve == Some(true) {
+        "已同意；執行結果仍待核對。"
+    } else {
+        "已拒絕，動作不會執行。"
+    }
+    .into())
+}
+
+/// Scope is constructed from authenticated adapter metadata, never a client
+/// flag that claims a direct message to bypass a group/guild whitelist.
+#[derive(Clone, Copy)]
+pub(crate) struct DecisionAccessScope<'a> {
+    pub channel_id: Option<&'a str>,
+    pub guild_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+}
+pub(crate) async fn read_trusted_channel_access(
+    ctx: &crate::channel_reply::ReplyContext,
+    context: &crate::approval::DecisionContext,
+    scope: DecisionAccessScope<'_>,
+) -> Result<crate::channel_reply::UserAccessPolicy, String> {
+    context.validate()?;
+    if scope.session_id == Some("") {
+        return Err("無法確認此決策的頻道種類；請使用完整頻道資訊的互動或文字指令。".into());
+    }
+    let setting_scope = scope.guild_id.unwrap_or("global");
+    // Decide from this successful authoritative SQL read, not subsequent
+    // cache lookups which can turn a missing/read-failed row into allow-all.
+    let rows = ctx
+        .channel_settings
+        .refresh_channel_snapshot(&context.channel, setting_scope)
+        .await
+        .map_err(|_| "目前頻道權限無法確認".to_string())?;
+    let value = |sc: &str, key: &str| {
+        rows.iter()
+            .find(|(scope, k, _)| scope == sc && k == key)
+            .map(|(_, _, v)| v.as_str())
+    };
+    let list = |raw: Option<&str>| -> Result<Vec<String>, String> {
+        raw.map(serde_json::from_str::<Vec<String>>)
+            .transpose()
+            .map_err(|_| "目前頻道權限資料無法確認".to_string())
+            .map(Option::unwrap_or_default)
+    };
+    if let Some(guild) = scope.guild_id {
+        let allowed = list(value("global", "allowed_guilds"))?;
+        if !allowed.is_empty() && !allowed.iter().any(|id| id == guild) {
+            return Err("此伺服器目前未獲授權".into());
+        }
+    }
+    if let Some(channel) = scope.channel_id {
+        let allowed = list(
+            value(setting_scope, "allowed_channels")
+                .or_else(|| value("global", "allowed_channels")),
+        )?;
+        if !allowed.is_empty() && !allowed.iter().any(|id| id == channel) {
+            return Err("此頻道目前未獲授權".into());
+        }
+    }
+    let allowed = list(value("global", "allowed_users"))?;
+    let blocked = list(value("global", "blocked_users"))?;
+    let pairing = match value("global", "require_pairing") {
+        None | Some("false") => false,
+        Some("true") => true,
+        _ => return Err("目前配對權限無法確認".into()),
+    };
+    Ok(crate::channel_reply::UserAccessPolicy {
+        allowed: (!allowed.is_empty()).then_some(allowed),
+        blocked,
+        require_pairing: pairing,
+    })
+}
+pub(crate) async fn check_trusted_decision_access(
+    ctx: &crate::channel_reply::ReplyContext,
+    context: &crate::approval::DecisionContext,
+    scope: DecisionAccessScope<'_>,
+    _text: &str,
+) -> Result<(), String> {
+    let policy = read_trusted_channel_access(ctx, context, scope).await?;
+    let session = format!("{}:{}", context.channel, context.conversation_id);
+    match ctx
+        .access_control
+        .check_access_dual(
+            &context.principal_id,
+            scope.session_id.unwrap_or(&session),
+            policy.allowed.as_deref(),
+            &policy.blocked,
+            policy.require_pairing,
+        )
+        .await
+    {
+        crate::access_control::AccessDecision::Allowed => {}
+        _ => return Err("此使用者目前未獲授權".into()),
+    }
+    Ok(())
+}
+pub(crate) async fn route_verified_bound_press(
+    ctx: &crate::channel_reply::ReplyContext,
+    context: &crate::approval::DecisionContext,
+    data: &str,
+    scope: DecisionAccessScope<'_>,
+) -> Option<Result<String, String>> {
+    let action = crate::decision_action::parse(data)?;
+    if action.source == DecisionSource::Approval {
+        // Same order as the text lane (F5-C, review F4-L6): the channel
+        // access check runs before the request row is read, for every
+        // approval press, so an unknown id and someone else's id cost the
+        // same work. The result is applied only to bound rows; legacy
+        // (unbound) cards keep their shipped authorization below.
+        let access_ok = check_trusted_decision_access(ctx, context, scope, data)
+            .await
+            .is_ok();
+        let broker = match crate::approval::ApprovalBroker::open(&ctx.home_dir) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
+        let row = match broker
+            .get(&crate::approval::ApprovalId::from(action.id.clone()))
+            .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into()));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "bound press: request row unreadable");
+                return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into()));
+            }
+        };
+        if row.binding.is_some() && !access_ok {
+            return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into()));
+        }
+        // Only the successfully parsed persisted row can identify a legacy
+        // domain request. Corrupt/non-NULL bindings never downgrade here.
+    }
+    route_bound_press(&ctx.home_dir, context, data).await
+}
+
+/// Strict request replies are control traffic, processed by the authenticated
+/// receiver before ordinary conversation FIFO execution can wait for them.
+///
+/// `None` (the message continues to the normal pipeline, unchanged) unless
+/// the text is a strict decision command: verb + complete request UUID
+/// (`channel_decision_route::parse_strict_decision`). A verb-first message
+/// without one — 「確認」 answering "shall I send it?", "approve the Q3
+/// budget", a WP1.6 reply to an old card — is conversation (F4, review
+/// M1/M2).
+///
+/// Every refusal decided before the sender is shown to be the person the
+/// request is bound to returns the same sentence
+/// (`channel_decision_route::DECISION_REFUSED`), and the channel access check
+/// runs before the request row is read, so the reply reveals neither whether
+/// an id exists nor whose it is (review L2).
+pub(crate) async fn route_trusted_decision_fastlane_with_scope(
+    ctx: &crate::channel_reply::ReplyContext,
+    context: &crate::approval::DecisionContext,
+    text: &str,
+    scope: DecisionAccessScope<'_>,
+) -> Option<Result<String, String>> {
+    use crate::channel_decision_route::DECISION_REFUSED;
+    let command = crate::channel_decision_route::parse_strict_decision(text)?;
+    let refused = || Some(Err(DECISION_REFUSED.to_string()));
+    if context.validate().is_err() {
+        return refused();
+    }
+    if check_trusted_decision_access(ctx, context, scope, text)
+        .await
+        .is_err()
+    {
+        return refused();
+    }
+    let broker = match crate::approval::ApprovalBroker::open(&ctx.home_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "decision fastlane: approvals store unavailable");
+            return Some(Err("目前無法讀取核准資料，請稍後再試。".into()));
+        }
+    };
+    let row = match broker
+        .get(&crate::approval::ApprovalId::from(command.id.clone()))
+        .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => return refused(),
+        Err(e) => {
+            tracing::warn!(error = %e, "decision fastlane: request row unreadable");
+            return refused();
+        }
+    };
+    let Some(binding) = &row.binding else {
+        return refused();
+    };
+    if &binding.decision_context != context {
+        return refused();
+    }
+    // From here the sender is the person the request is bound to, in the same
+    // account and conversation, so specific answers reveal nothing new.
+    if row.status != crate::approval::ApprovalStatus::Pending {
+        return Some(Err("請求已決定或失效。".into()));
+    }
+    route_bound_text(&ctx.home_dir, context, text).await
+}
+
+struct ChannelWork {
+    key: String,
+    future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+/// A bounded conversation scheduler: four active conversations, one active
+/// job per conversation, and at most 32 accepted jobs including queued work.
+/// Dropping the receiver owner cancels all jobs and their trusted scopes.
+pub(crate) struct BoundedChannelExecutor {
+    sender: tokio::sync::mpsc::Sender<ChannelWork>,
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    dispatcher: tokio::task::JoinHandle<()>,
+}
+impl BoundedChannelExecutor {
+    pub(crate) fn new() -> Self {
+        use futures_util::FutureExt;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<ChannelWork>(32);
+        let dispatcher = tokio::spawn(async move {
+            let mut pending = std::collections::VecDeque::<ChannelWork>::new();
+            let mut active = std::collections::HashSet::<String>::new();
+            let mut jobs = tokio::task::JoinSet::new();
+            loop {
+                while jobs.len() < 4 {
+                    let Some(pos) = pending.iter().position(|work| !active.contains(&work.key))
+                    else {
+                        break;
+                    };
+                    let work = pending.remove(pos).unwrap();
+                    active.insert(work.key.clone());
+                    jobs.spawn(async move {
+                        let key = work.key;
+                        let _ = std::panic::AssertUnwindSafe(work.future)
+                            .catch_unwind()
+                            .await;
+                        drop(work._slot);
+                        key
+                    });
+                }
+                if receiver.is_closed() && pending.is_empty() && jobs.is_empty() {
+                    break;
+                }
+                tokio::select! {
+                    Some(work) = receiver.recv() => pending.push_back(work),
+                    Some(result) = jobs.join_next(), if !jobs.is_empty() => {
+                        if let Ok(key) = result {
+                            active.remove(&key);
+                        }
+                    },
+                    else => break,
+                }
+            }
+        });
+        Self {
+            sender,
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
+            dispatcher,
+        }
+    }
+    pub(crate) fn try_submit<F: std::future::Future<Output = ()> + Send + 'static>(
+        &self,
+        key: String,
+        future: F,
+    ) -> Result<(), String> {
+        if key.is_empty() || key.len() > 1024 {
+            return Err("invalid conversation key".into());
+        }
+        let slot = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "channel work queue full")?;
+        self.sender
+            .try_send(ChannelWork {
+                key,
+                future: Box::pin(future),
+                _slot: slot,
+            })
+            .map_err(|_| "channel work queue unavailable".into())
+    }
+}
+impl Drop for BoundedChannelExecutor {
+    fn drop(&mut self) {
+        self.dispatcher.abort();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod native_loop_fixture {
+    use super::*;
+    use crate::computer_use::{ComputerAction, ComputerUseError};
+    use crate::computer_use_orchestrator::{MaskedScreenshot, OrchestratorControl};
+    use crate::computer_use_sessions::{ComputerUseSessions, SessionBackend};
+    use std::sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    };
+    type Job = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+    type Pause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+    fn pauses() -> &'static Mutex<std::collections::HashMap<String, Pause>> {
+        static PAUSES: OnceLock<Mutex<std::collections::HashMap<String, Pause>>> = OnceLock::new();
+        PAUSES.get_or_init(Default::default)
+    }
+    pub(crate) fn pause_before_inner(token: &str) -> Pause {
+        let pause = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        pauses().lock().unwrap().insert(token.into(), pause.clone());
+        pause
+    }
+    pub(crate) async fn wait_before_inner(token: &str) {
+        let pause = pauses().lock().unwrap().remove(token);
+        if let Some((entered, resume)) = pause {
+            entered.notify_one();
+            resume.notified().await;
+        }
+    }
+
+    fn jobs() -> &'static Mutex<
+        std::collections::HashMap<String, std::collections::VecDeque<(Option<String>, Job)>>,
+    > {
+        static JOBS: OnceLock<
+            Mutex<
+                std::collections::HashMap<
+                    String,
+                    std::collections::VecDeque<(Option<String>, Job)>,
+                >,
+            >,
+        > = OnceLock::new();
+        JOBS.get_or_init(Default::default)
+    }
+    pub(crate) fn take_job(token: &str) -> Option<Job> {
+        jobs()
+            .lock()
+            .unwrap()
+            .get_mut(token)?
+            .pop_front()
+            .map(|(_, job)| job)
+    }
+    pub(crate) fn install_job<F: std::future::Future<Output = ()> + Send + 'static>(
+        token: &str,
+        work: F,
+    ) -> JobGuard {
+        jobs()
+            .lock()
+            .unwrap()
+            .entry(token.to_owned())
+            .or_default()
+            .push_back((None, Box::pin(work)));
+        JobGuard(token.to_owned())
+    }
+    pub(crate) fn take_job_for(token: &str, text: &str) -> Option<Job> {
+        let mut map = jobs().lock().unwrap();
+        let queue = map.get_mut(token)?;
+        let pos = queue
+            .iter()
+            .position(|(name, _)| name.as_deref().is_none_or(|name| name == text))?;
+        queue.remove(pos).map(|(_, job)| job)
+    }
+    pub(crate) fn install_named_job<F: std::future::Future<Output = ()> + Send + 'static>(
+        token: &str,
+        text: &str,
+        work: F,
+    ) -> JobGuard {
+        jobs()
+            .lock()
+            .unwrap()
+            .entry(token.to_owned())
+            .or_default()
+            .push_back((Some(text.to_owned()), Box::pin(work)));
+        JobGuard(token.to_owned())
+    }
+    pub(crate) struct JobGuard(String);
+    impl Drop for JobGuard {
+        fn drop(&mut self) {
+            jobs().lock().unwrap().remove(&self.0);
+        }
+    }
+    pub(crate) async fn pending_native_request(
+        fixture: &NativeCuFixture,
+        context: crate::approval::DecisionContext,
+    ) -> crate::approval::ApprovalId {
+        use crate::approval::*;
+        let payload = serde_json::json!({"action":"native-acl-fixture"});
+        let binding = ExecutionBinding {
+            schema_version: 1,
+            run_id: uuid::Uuid::new_v4().to_string(),
+            run_origin_kind: "workflow".into(),
+            actor_principal: "alice".into(),
+            decision_context: context,
+            task_id: None,
+            task_revision: None,
+            task_snapshot_hash: None,
+            payload_hash: payload_hash(&payload),
+            policy_revision: policy_revision(fixture.home.path(), "alice").unwrap(),
+            cwd: None,
+            environment_hash: payload_hash(&serde_json::json!({"fixture":true})),
+            file_hashes: Default::default(),
+            expires_at: (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+            resume_handler: "computer_reobserve_v1".into(),
+            resume_version: 1,
+        };
+        let broker = ApprovalBroker::open(fixture.home.path()).unwrap();
+        let id = broker
+            .request_bound(
+                RequestKind::Approval,
+                "alice",
+                "native ACL",
+                payload,
+                binding,
+            )
+            .await
+            .unwrap();
+        broker
+            .prepare_operation(&id, "native-acl", None)
+            .await
+            .unwrap();
+        id
+    }
+    // Prime the cache with access, then revoke through a second authoritative
+    // SQL writer. The adapter must not keep the previously allowed snapshot.
+    pub(crate) async fn revoke_native_access(
+        fixture: &NativeCuFixture,
+        channel: &str,
+        scope: &str,
+        mode: &str,
+    ) {
+        if mode == "binding" {
+            let db = rusqlite::Connection::open(fixture.home.path().join("approvals.db")).unwrap();
+            db.execute("UPDATE approvals SET binding_json='{'", [])
+                .unwrap();
+            return;
+        }
+        let (key, before, after) = match mode {
+            "user" => ("allowed_users", r#"["H1","11"]"#, r#"["OTHER"]"#),
+            "channel" => ("allowed_channels", r#"["C1","-42"]"#, r#"["OTHER"]"#),
+            "guild" => ("allowed_guilds", r#"["G1"]"#, r#"["OTHER"]"#),
+            "blocked" => ("blocked_users", "[]", r#"["H1","11"]"#),
+            "pairing" => ("require_pairing", "false", "true"),
+            "corrupt" => ("blocked_users", "[]", "invalid-json"),
+            "db" | "allow" => ("blocked_users", "[]", "[]"),
+            _ => panic!("unknown revocation fixture"),
+        };
+        let setting_scope = if mode == "channel" { scope } else { "global" };
+        fixture
+            .ctx
+            .channel_settings
+            .set(channel, setting_scope, key, before)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .ctx
+                .channel_settings
+                .get(channel, setting_scope, key)
+                .await
+                .is_some()
+        );
+        let db = rusqlite::Connection::open(fixture.home.path().join("sessions.db")).unwrap();
+        if mode == "db" {
+            db.execute("DROP TABLE channel_settings", []).unwrap();
+        } else {
+            db.execute(
+                "UPDATE channel_settings SET value=?1 WHERE channel_type=?2 AND scope_id=?3 AND key=?4",
+                rusqlite::params![after, channel, setting_scope, key]
+            )
+            .unwrap();
+        }
+    }
+    pub(crate) async fn assert_native_pending(
+        fixture: &NativeCuFixture,
+        id: &crate::approval::ApprovalId,
+    ) {
+        use crate::approval::*;
+        let broker = ApprovalBroker::open(fixture.home.path()).unwrap();
+        let raw = rusqlite::Connection::open(fixture.home.path().join("approvals.db")).unwrap();
+        let status: String = raw
+            .query_row(
+                "SELECT status FROM approvals WHERE id=?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+        // Corrupt bindings must be refused, never read as unbound legacy.
+        if let Ok(row) = broker.get(id).await {
+            assert_eq!(row.unwrap().status, ApprovalStatus::Pending);
+        }
+
+        let operations = broker.list_operations().await.unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].state, OperationState::Prepared);
+        assert_eq!(fixture.executed.load(Ordering::SeqCst), 0);
+    }
+    pub(crate) async fn assert_native_approved(
+        fixture: &NativeCuFixture,
+        id: &crate::approval::ApprovalId,
+    ) {
+        use crate::approval::*;
+        let broker = ApprovalBroker::open(fixture.home.path()).unwrap();
+        assert_eq!(
+            broker.get(id).await.unwrap().unwrap().status,
+            ApprovalStatus::Approved
+        );
+        assert_eq!(
+            broker.list_operations().await.unwrap()[0].state,
+            OperationState::Prepared
+        );
+        assert_eq!(
+            fixture.executed.load(Ordering::SeqCst),
+            0,
+            "approval is not an execution receipt"
+        );
+    }
+    pub(crate) struct NativeCuFixture {
+        pub home: tempfile::TempDir,
+        pub ctx: Arc<crate::channel_reply::ReplyContext>,
+        pub manager: Arc<ComputerUseSessions>,
+        pub executed: Arc<AtomicUsize>,
+    }
+    struct Backend {
+        executed: Arc<AtomicUsize>,
+        control: Arc<OrchestratorControl>,
+    }
+    #[async_trait::async_trait]
+    impl SessionBackend for Backend {
+        async fn start(&mut self) -> Result<(), ComputerUseError> {
+            Ok(())
+        }
+        async fn register(&mut self, _: &str) -> Result<(), ComputerUseError> {
+            Ok(())
+        }
+        async fn stop(&mut self) {}
+        async fn screenshot(&self) -> Result<MaskedScreenshot, ComputerUseError> {
+            use base64::Engine;
+            let mut buffer = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+                .write_to(&mut buffer, image::ImageFormat::Png)
+                .unwrap();
+            Ok(MaskedScreenshot {
+                png_base64: base64::engine::general_purpose::STANDARD.encode(buffer.into_inner()),
+                full_mask: None,
+            })
+        }
+        async fn window_title(&self) -> Result<String, String> {
+            Ok("Bank Login".into())
+        }
+        async fn execute(&self, _: &ComputerAction) -> Result<(), ComputerUseError> {
+            self.executed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn control(&self) -> Arc<OrchestratorControl> {
+            self.control.clone()
+        }
+    }
+    impl NativeCuFixture {
+        pub(crate) async fn new(token: &str) -> Self {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(home.path().join("agents/alice")).unwrap();
+            std::fs::write(
+                home.path().join("agents/alice/agent.toml"),
+                "[agent]\nname='alice'\n[capabilities]\ncomputer_use=true\n[capabilities.computer_use_config]\nallowed_apps=['Trusted Window']\n"
+            )
+            .unwrap();
+            std::fs::write(
+                home.path().join("config.toml"),
+                format!("[channels]\ntelegram_bot_token='{token}'\n"),
+            )
+            .unwrap();
+            let registry = duduclaw_agent::AgentRegistry::new(home.path().join("agents"));
+            let sessions = Arc::new(
+                crate::session::SessionManager::new(&home.path().join("sessions.db")).unwrap(),
+            );
+            let (event_tx, _) = tokio::sync::broadcast::channel(16);
+            let ctx = Arc::new(crate::channel_reply::ReplyContext::new(
+                Arc::new(tokio::sync::RwLock::new(registry)),
+                home.path().to_path_buf(),
+                sessions,
+                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+                event_tx,
+            ));
+            let executed = Arc::new(AtomicUsize::new(0));
+            let count = executed.clone();
+            let factory: crate::computer_use_sessions::BackendFactory = Arc::new(move |_, _, _| {
+                Box::new(Backend {
+                    executed: count.clone(),
+                    control: Arc::new(OrchestratorControl::new()),
+                })
+            });
+            let manager = Arc::new(ComputerUseSessions::with_parts(
+                home.path().to_path_buf(),
+                factory,
+                std::time::Duration::from_secs(120),
+            ));
+            Self {
+                home,
+                ctx,
+                manager,
+                executed,
+            }
+        }
+        pub(crate) fn work(
+            &self,
+            turn: &str,
+        ) -> impl std::future::Future<Output = ()> + Send + 'static {
+            let manager = self.manager.clone();
+            let turn = turn.to_owned();
+            async move {
+                let context = crate::approval::CURRENT_DECISION_CONTEXT
+                    .try_with(Clone::clone)
+                    .unwrap()
+                    .unwrap();
+                let guard = crate::computer_use_sessions::turns::register(
+                    "alice",
+                    &turn,
+                    &format!("{}:{}", context.channel, context.conversation_id),
+                )
+                .unwrap();
+                let started = manager
+                    .start(
+                        "alice",
+                        crate::computer_use_sessions::StartRequest {
+                            turn_id: Some(turn.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let id = started["session_id"].as_str().unwrap();
+                manager
+                    .action(
+                        "alice",
+                        Some(id),
+                        Some(&turn),
+                        &crate::computer_use_sessions::actions::ActionRequest::Type {
+                            text: "private marker".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                manager.stop("alice", Some(id)).await.unwrap();
+                drop(guard);
+            }
+        }
+        pub(crate) async fn pending_id(&self) -> String {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Ok(b) = crate::approval::ApprovalBroker::open(self.home.path()) {
+                        if let Ok(rows) = b.list_pending(Some("alice")).await {
+                            if let Some(row) = rows.first() {
+                                return row.id.as_str().to_owned();
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("actual CU never reached persisted approval wait")
+        }
+        pub(crate) async fn wait_executed(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if self.executed.load(Ordering::SeqCst) == 1 {
+                        if let Ok(broker) = crate::approval::ApprovalBroker::open(self.home.path())
+                        {
+                            if let Ok(rows) = broker.list_operations().await {
+                                if rows.iter().any(|row| {
+                                    row.state == crate::approval::OperationState::Succeeded
+                                }) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("receiver did not consume subsequent confirmation while CU was awaiting it");
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounded_execution_tests {
+    use super::*;
+    #[tokio::test]
+    async fn accepted_work_is_bounded_and_panics_release_conversation_fifo() {
+        let executor = BoundedChannelExecutor::new();
+        for _ in 0..32 {
+            executor
+                .try_submit("blocked".into(), std::future::pending())
+                .unwrap();
+        }
+        assert!(executor.try_submit("other".into(), async {}).is_err());
+        drop(executor);
+        let executor = BoundedChannelExecutor::new();
+        executor
+            .try_submit("same".into(), async {
+                panic!("injected normal worker error");
+            })
+            .unwrap();
+        let (done, received) = tokio::sync::oneshot::channel();
+        executor
+            .try_submit("same".into(), async move {
+                done.send(()).unwrap();
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), received)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn dropping_receiver_cancels_active_work_and_clears_live_turn_target() {
+        let executor = BoundedChannelExecutor::new();
+        let context = crate::approval::DecisionContext {
+            channel: "slack".into(),
+            account_id: "bot".into(),
+            principal_id: "user".into(),
+            conversation_id: "channel:thread".into(),
+        };
+        let target = crate::approval::TrustedReplyTarget::new(
+            context,
+            "secret".into(),
+            "channel".into(),
+            Some("thread".into()),
+        );
+        let (ready, received) = tokio::sync::oneshot::channel();
+        executor
+            .try_submit(
+                "channel".into(),
+                crate::approval::scope_trusted_reply(target, async move {
+                    let _guard = crate::computer_use_sessions::turns::register(
+                        "executor-cancelled",
+                        "turn",
+                        "slack:channel:thread",
+                    )
+                    .unwrap();
+                    ready.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                }),
+            )
+            .unwrap();
+        received.await.unwrap();
+        assert!(
+            crate::computer_use_sessions::turns::target_for("executor-cancelled", "turn").is_some()
+        );
+        drop(executor);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while crate::computer_use_sessions::turns::target_for("executor-cancelled", "turn")
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

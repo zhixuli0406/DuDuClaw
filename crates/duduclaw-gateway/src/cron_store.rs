@@ -128,6 +128,140 @@ pub struct CronStore {
 }
 
 impl CronStore {
+    /// A bound cron never falls back to its legacy prompt after disarm/rollback.
+    pub async fn bind_workflow(
+        &self,
+        id: &str,
+        activation_id: &str,
+        material_hash: &str
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        let existing: Option<(String, String)> = conn
+            .query_row(
+                "SELECT activation_id,material_hash FROM cron_workflow_bindings WHERE cron_id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?))
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(existing) = existing {
+            if existing != (activation_id.into(), material_hash.into()) {
+                return Err("cron already bound to different workflow".into());
+            }
+            return Ok(());
+        }
+        let disabled: bool = conn
+            .query_row(
+                "SELECT enabled=0 FROM cron_tasks WHERE id=?1",
+                params![id],
+                |r| r.get(0)
+            )
+            .map_err(|_| "workflow cron missing")?;
+        if !disabled {
+            return Err("workflow cron must start disabled".into());
+        }
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO cron_workflow_bindings VALUES(?1,?2,?3)",
+            params![id, activation_id, material_hash]
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO cron_routine_cursors VALUES(?1,?2,?3) ON CONFLICT(cron_id,material_hash) DO NOTHING",
+            params![id, material_hash, Utc::now().timestamp()]
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+    pub async fn workflow_binding(&self, id: &str) -> Result<Option<(String, String)>, String> {
+        self.conn
+            .lock()
+            .await
+            .query_row(
+                "SELECT activation_id,material_hash FROM cron_workflow_bindings WHERE cron_id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?))
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+    /// Cursor belongs to the immutable accepted routine, never to manual runs.
+    /// Initial observation starts at binding time; old pre-acceptance slots are not replayed.
+    pub async fn routine_cursor(&self, id: &str, material_hash: &str) -> Result<i64, String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO cron_routine_cursors(cron_id,material_hash,cursor_unix) VALUES(?1,?2,?3) ON CONFLICT(cron_id,
+                material_hash) DO NOTHING",
+            params![id, material_hash, Utc::now().timestamp()]
+        )
+        .map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT cursor_unix FROM cron_routine_cursors WHERE cron_id=?1 AND material_hash=?2",
+            params![id, material_hash],
+            |r| r.get(0)
+        )
+        .map_err(|e| e.to_string())
+    }
+    /// Advance only after the workflow run and its queue outbox are durable.
+    /// MAX makes competing schedulers and late acknowledgements monotonic.
+    pub async fn advance_routine_cursor(
+        &self,
+        id: &str,
+        material_hash: &str,
+        slot: i64
+    ) -> Result<(), String> {
+        self.conn
+            .lock()
+            .await
+            .execute(
+                "UPDATE cron_routine_cursors SET cursor_unix=MAX(cursor_unix,?3) WHERE cron_id=?1 AND material_hash=?2",
+                params![id, material_hash, slot]
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    /// Record occurrences in `(from, to]` as given up on and move the cursor
+    /// to `to`, in one transaction. The row's status shows `skipped` with the
+    /// count; the failure counter is not touched.
+    pub async fn record_routine_skip(
+        &self,
+        id: &str,
+        material_hash: &str,
+        from: i64,
+        to: i64,
+        slots: u64,
+    ) -> Result<(), String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO cron_routine_skips VALUES(?1,?2,?3,?4,?5,?6)
+                ON CONFLICT(cron_id,material_hash,from_unix) DO NOTHING",
+            params![id, material_hash, from, to, slots as i64, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE cron_routine_cursors SET cursor_unix=MAX(cursor_unix,?3) WHERE cron_id=?1 AND material_hash=?2",
+            params![id, material_hash, to],
+        )
+        .map_err(|e| e.to_string())?;
+        let from_text = chrono::DateTime::<Utc>::from_timestamp(from, 0)
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default();
+        let to_text = chrono::DateTime::<Utc>::from_timestamp(to, 0)
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default();
+        tx.execute(
+            "UPDATE cron_tasks SET last_status='skipped',last_error=?2,updated_at=?3 WHERE id=?1",
+            params![
+                id,
+                format!("workflow_routine_slots_skipped: {slots} occurrence(s) after {from_text} up to {to_text}"),
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     /// Open (or create) the cron store at `<home>/cron_tasks.db` and initialize the schema.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         let db_path = home_dir.join("cron_tasks.db");
@@ -165,6 +299,21 @@ impl CronStore {
              CREATE INDEX IF NOT EXISTS idx_cron_tasks_name    ON cron_tasks(name);",
         )
         .map_err(|e| format!("init cron store schema: {e}"))?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS cron_workflow_bindings(cron_id TEXT PRIMARY KEY,
+            activation_id TEXT NOT NULL,
+            material_hash TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS cron_routine_cursors(cron_id TEXT NOT NULL,
+            material_hash TEXT NOT NULL,cursor_unix INTEGER NOT NULL,PRIMARY KEY(cron_id,material_hash));
+            CREATE TABLE IF NOT EXISTS cron_routine_skips(cron_id TEXT NOT NULL,material_hash TEXT NOT NULL,
+            from_unix INTEGER NOT NULL,to_unix INTEGER NOT NULL,slots INTEGER NOT NULL,recorded_at TEXT NOT NULL,
+            PRIMARY KEY(cron_id,material_hash,from_unix));
+            -- Enabling a routine starts it from now: occurrences while it was
+            -- disabled are not run late. Covers every writer of `enabled`.
+            CREATE TRIGGER IF NOT EXISTS cron_routine_cursor_on_enable AFTER UPDATE OF enabled ON cron_tasks
+            WHEN OLD.enabled=0 AND NEW.enabled=1 BEGIN
+            UPDATE cron_routine_cursors SET cursor_unix=MAX(cursor_unix,CAST(strftime('%s','now') AS INTEGER))
+            WHERE cron_id=NEW.id; END;")
+            .map_err(|e| e.to_string())?;
 
         // v1.8.22 migration — add notify_* columns for cron-result channel
         // delivery (issue #15). v1.8.23 adds cron_timezone for Level 2 of

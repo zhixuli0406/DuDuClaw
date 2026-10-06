@@ -138,6 +138,19 @@ impl Attribution {
     }
 }
 
+/// Optional, immutable review reference. Missing on legacy rows means unverified.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactEvidenceRef {
+    pub task_revision: i64,
+    pub snapshot_id: String,
+    pub snapshot_hash: String,
+    pub content_hash: Option<String>,
+    pub evidence_kind: crate::review_evidence::EvidenceKind,
+    pub run_id: Option<String>,
+    pub audience: Vec<String>,
+}
+
 /// One provenance row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactRecord {
@@ -158,6 +171,7 @@ pub struct ArtifactRecord {
     pub channel: Option<String>,
     /// Where the agent produced it, when known (outbound rows only).
     pub source_path: Option<String>,
+    pub evidence: Option<ArtifactEvidenceRef>,
 }
 
 impl ArtifactRecord {
@@ -181,12 +195,19 @@ impl ArtifactRecord {
         if let Some(p) = &self.source_path {
             map.insert("source_path".into(), p.clone().into());
         }
+        if let Some(e) = &self.evidence {
+            map.insert(
+                "evidence".into(),
+                serde_json::to_value(e).expect("evidence serializable")
+            );
+        }
         serde_json::Value::Object(map)
     }
 
     fn from_line(line: &str) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_str(line).ok()?;
         Some(ArtifactRecord {
+            evidence: v.get("evidence").cloned().and_then(|e| serde_json::from_value(e).ok()),
             produced_at: v.get("produced_at").and_then(|x| x.as_str())?.to_string(),
             agent_id: v
                 .get("agent_id")
@@ -399,6 +420,7 @@ pub fn record_saved(
     };
     let (home, agent_id) = derive_home_and_agent(base_dir);
     let rec = ArtifactRecord {
+        evidence: None,
         produced_at: chrono::Utc::now().to_rfc3339(),
         agent_id,
         archived_name: truncate_bytes(archived_name, NAME_MAX_BYTES).to_string(),
@@ -414,6 +436,33 @@ pub fn record_saved(
             .map(|p| truncate_bytes(p, NAME_MAX_BYTES).to_string()),
     };
     append_rows(&home, std::slice::from_ref(&rec.to_json()));
+}
+
+/// Append a reference only after the immutable review snapshot was committed.
+/// The provenance log never becomes review acceptance or privacy authority.
+pub fn record_review_reference(
+    home: &Path,
+    row: &TaskArtifact,
+    task_id: &str,
+    reference: ArtifactEvidenceRef
+) {
+    let Some(name) = &row.archived_name else {
+        return;
+    };
+    let record = ArtifactRecord {
+        produced_at: row.produced_at.clone(),
+        agent_id: row.agent_id.clone(),
+        archived_name: name.clone(),
+        display_name: row.name.clone(),
+        size: row.size.unwrap_or(0),
+        origin: row.origin,
+        task_id: Some(task_id.into()),
+        round: row.round,
+        channel: row.channel.clone(),
+        source_path: row.source_path.clone(),
+        evidence: Some(reference)
+    };
+    append_rows(home, &[record.to_json()]);
 }
 
 fn append_rows(home_dir: &Path, rows: &[serde_json::Value]) {
@@ -554,6 +603,7 @@ pub struct TaskArtifact {
     pub channel: Option<String>,
     /// Where the agent wrote it, when known.
     pub source_path: Option<String>,
+    pub evidence: Option<ArtifactEvidenceRef>,
 }
 
 impl TaskArtifact {
@@ -569,6 +619,7 @@ impl TaskArtifact {
             "round": self.round,
             "channel": self.channel,
             "source_path": self.source_path,
+            "evidence": self.evidence,
         })
     }
 }
@@ -605,6 +656,7 @@ fn merge_key(rec: &TaskArtifact) -> String {
 /// whichever half knows it, and a real basename always beats a sanitized
 /// stand-in.
 fn merge_into(existing: &mut TaskArtifact, item: TaskArtifact) {
+    if existing.evidence.is_none() { existing.evidence = item.evidence.clone(); }
     let existing_is_sanitized = existing.name == sanitize_name(&existing.name);
     let item_is_sanitized = item.name == sanitize_name(&item.name);
     if existing_is_sanitized && !item_is_sanitized {
@@ -737,6 +789,7 @@ pub fn collect_task_artifacts(
             continue;
         }
         collected.push(TaskArtifact {
+            evidence: rec.evidence.clone(),
             name: if rec.display_name.is_empty() {
                 rec.archived_name.clone()
             } else {
@@ -784,6 +837,7 @@ pub fn collect_task_artifacts(
             .unwrap_or(&change.path)
             .to_string();
         collected.push(TaskArtifact {
+            evidence: None,
             name,
             archived_name: None,
             agent_id: agent_id.to_string(),
@@ -895,6 +949,7 @@ pub fn backfill(home_dir: &Path) -> BackfillReport {
                 Some((task_id, round)) => {
                     report.attributed += 1;
                     ArtifactRecord {
+                        evidence: None,
                         produced_at,
                         agent_id: agent_id.clone(),
                         archived_name: archived_name.clone(),
@@ -910,6 +965,7 @@ pub fn backfill(home_dir: &Path) -> BackfillReport {
                 None => {
                     report.unknown += 1;
                     ArtifactRecord {
+                        evidence: None,
                         produced_at,
                         agent_id: agent_id.clone(),
                         archived_name: archived_name.clone(),
@@ -1221,6 +1277,10 @@ pub async fn archive_goal_task_artifacts(
         return report;
     }
 
+    let audience=match crate::review_evidence::audience::task_packet_audience(home_dir,task_id){
+        Ok(a)=>a,
+        Err(e)=>{warn!(task=task_id,error=%e,"goal archive: audience unresolved; archive refused");return report;}
+    };
     let agent_dir = home_dir.join("agents").join(agent_id);
     let Ok(canon_root) = std::fs::canonicalize(&agent_dir) else {
         // No agent workspace to trust ⇒ nothing to archive from, fail-open
@@ -1336,8 +1396,20 @@ pub async fn archive_goal_task_artifacts(
             }
         };
 
-        match crate::media::save_attachment_in_base_untracked(&agent_dir, &data, display_name).await
-        {
+        let saved = if audience.is_empty() {
+            crate::media::save_attachment_in_base_untracked(&agent_dir, &data, display_name).await
+        } else {
+            crate::review_evidence::download::save_private_artifact(
+                home_dir,
+                task_id,
+                agent_id,
+                &data,
+                display_name,
+                &audience
+            )
+            .await
+        };
+        match saved {
             Ok(saved) => {
                 total_bytes = total_bytes.saturating_add(data.len() as u64);
                 report.archived += 1;

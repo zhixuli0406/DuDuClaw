@@ -1,51 +1,15 @@
-//! Universal Human-in-the-Loop (HITL) `ApprovalBroker`.
+//! One persisted broker for human approvals and typed questions.
 //!
-//! ONE interrupt/approval primitive — the LangGraph `interrupt()` /
-//! OpenAI-SDK HITL equivalent — spanning **MCP tools**, **autopilot
-//! actions**, and **bus tasks**. A caller that is about to perform a
-//! sensitive action `request()`s approval (storing the exact payload to
-//! re-dispatch), then either polls or `await_decision()`s. A human
-//! decides through a messaging channel reply or the dashboard; on
-//! approve, the caller re-reads the stored payload and re-dispatches.
+//! Legacy requests remain domain-owned and cannot gain resume authority.
+//! New bound approvals carry immutable identity, task, payload and policy
+//! snapshots; explicit inbound IDs resolve them. A question stores answer
+//! data and never grants execution. Computer Use captures an exact live
+//! account/conversation target and requires fresh observation after restart.
 //!
-//! ## Why one broker (migration note)
-//!
-//! Of the three ad-hoc, in-process approval implementations this broker was
-//! built to absorb, two are gone: `browser_router.rs` (dead code, removed
-//! 2026-09) and the `duduclaw-governance` approval workflow (crate removed in
-//! `b0639b96`). One remains, and wiring it is still a follow-up:
-//!
-//! 1. **`channel_sender.rs`** — a process-local `HashMap<user_id,
-//!    oneshot::Sender<bool>>` (`wait_for_confirmation` /
-//!    `resolve_confirmation`). Volatile (lost on restart), single-user,
-//!    no audit trail, no cross-process visibility. Migration: keep the
-//!    zh-TW reply-word matching (`is_confirmation_reply` /
-//!    `is_denial_reply`) but resolve against a persisted approval id via
-//!    [`ApprovalBroker::decide`] instead of an in-memory oneshot.
-//!
-//! ## Decision sources
-//!
-//! - `agent.toml [capabilities] approval_required_tools = [...]` — parsed
-//!   by [`approval_required_tools`]. The MCP dispatch path (owned by
-//!   another agent this wave) will call [`ApprovalBroker::request`] +
-//!   [`ApprovalBroker::await_decision`] before executing a listed tool.
-//! - autopilot rule `require_approval = true` in the action JSON — checked
-//!   by [`rule_requires_approval`] and wired into
-//!   `autopilot_engine::execute_action` (see `with_approval_broker`).
-//! - dashboard RPC `approvals.list / approvals.approve / approvals.deny`
-//!   (to be added in `handlers.rs` later) → [`list_pending`] / [`decide`].
-//!
-//! ## Fail-closed conventions
-//!
-//! - **TTL expiry counts as DENY.** A pending approval past its TTL is
-//!   marked `expired`; [`await_decision`] returns `Expired`, which callers
-//!   MUST treat as a denial (never fall through to execute).
-//! - **`decide` refuses to change a terminal state.** Once
-//!   approved/denied/expired, a second decision is rejected (no silent
-//!   flip). The `WHERE status = 'pending'` guard also closes the
-//!   two-decider race.
-//! - **Store idioms mirror `events_store.rs` / `autopilot_store.rs`**:
-//!   parameterized SQL only, WAL + `busy_timeout`, self-healing schema.
+//! Approval is permission, not a provider receipt. Registered callers use
+//! the durable operation ledger's lease and fence immediately before side
+//! effects. Unknown execution outcomes require operator reconciliation and
+//! are never replayed automatically. Decision and execution CAS recheck TTL.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -94,7 +58,25 @@ const NOTIFY_TIMEOUT: Duration = Duration::from_secs(15);
 // ── Types ───────────────────────────────────────────────────
 
 mod action_guard;
+mod binding;
+mod fixture_decision;
+pub use fixture_decision::FIXTURE_DECISION_KIND;
+pub mod policy_snapshot;
+mod delivery;
+pub(crate) use delivery::{CURRENT_TRUSTED_REPLY_TARGET, TrustedReplyTarget, scope_trusted_reply};
 mod broker;
+pub(crate) use binding::require_current_dashboard_role_in_home;
+mod operations;
+mod workflow_grants;
+mod workflow_resume;
+pub use workflow_grants::{
+    OperationAuthority, GrantRef, EffectTemplate, GrantSpec, AcceptedRevisionGrant, GrantRevocation
+};
+pub use binding::{
+    CURRENT_DECISION_CONTEXT, DecisionContext, ExecutionBinding, RequestKind, payload_hash,
+    policy_revision, WORKFLOW_ACTIVATION_KIND,
+};
+pub use operations::{OPERATION_LEASE_HELD, OperationClaim, OperationRecord, OperationState};
 mod gates;
 mod simulation;
 mod store;
@@ -130,23 +112,25 @@ pub(crate) fn notify_target_changed(rec: &ApprovalRecord, channel: &str, chat_id
     rec.notify_channel.as_deref() != Some(channel) || rec.notify_chat_id.as_deref() != Some(chat_id)
 }
 
-pub use action_guard::{ALL_ACTION_GUARD_FINDINGS, ActionGuardFinding, analyze_action_guard_findings};
+pub use action_guard::{
+    ALL_ACTION_GUARD_FINDINGS, ActionGuardFinding, analyze_action_guard_findings,
+};
 
 use action_guard::{
     SIMULATION_MAX_RISK_POINTS, SIMULATION_NARRATIVE_MAX_CHARS, SIMULATION_RISK_POINT_MAX_CHARS,
 };
 #[cfg(test)]
 use broker::reminder_navigate_path;
-#[cfg(test)]
-use simulation::{GROUNDING_MAX_SNIPPETS, GROUNDING_SNIPPET_MAX_CHARS, protected_wiki_namespaces};
 pub use gates::{
     ActionGate, JudgeVerdict, approval_required_tools, irreversible_tools,
     maybe_irreversible_tools, resolve_action_gate, tool_is_irreversible,
     tool_is_maybe_irreversible, tool_requires_approval,
 };
+#[cfg(test)]
+use simulation::{GROUNDING_MAX_SNIPPETS, GROUNDING_SNIPPET_MAX_CHARS, protected_wiki_namespaces};
 pub use simulation::{
-    SimulationNarrative, auto_approve_install, pending_summary_for_channel,
-    render_grounding_block, rule_requires_approval, simulation_grounding_snippets,
+    SimulationNarrative, auto_approve_install, pending_summary_for_channel, render_grounding_block,
+    rule_requires_approval, simulation_grounding_snippets,
 };
 
 /// Opaque approval identifier (UUIDv4 string).
@@ -189,6 +173,8 @@ pub enum ApprovalStatus {
     Approved,
     Denied,
     Expired,
+    Answered,
+    Invalidated,
 }
 
 impl ApprovalStatus {
@@ -198,6 +184,8 @@ impl ApprovalStatus {
             ApprovalStatus::Approved => "approved",
             ApprovalStatus::Denied => "denied",
             ApprovalStatus::Expired => "expired",
+            ApprovalStatus::Answered => "answered",
+            ApprovalStatus::Invalidated => "invalidated",
         }
     }
 
@@ -208,6 +196,8 @@ impl ApprovalStatus {
             "pending" => ApprovalStatus::Pending,
             "approved" => ApprovalStatus::Approved,
             "expired" => ApprovalStatus::Expired,
+            "answered" => ApprovalStatus::Answered,
+            "invalidated" => ApprovalStatus::Invalidated,
             _ => ApprovalStatus::Denied,
         }
     }
@@ -285,6 +275,14 @@ pub struct ApprovalRecord {
     /// a forward-trajectory line above the approve/deny buttons.
     #[serde(default)]
     pub simulation: Option<Value>,
+    #[serde(default)]
+    pub request_kind: RequestKind,
+    #[serde(default)]
+    pub binding: Option<ExecutionBinding>,
+    #[serde(default)]
+    pub answer: Option<Value>,
+    #[serde(default)]
+    pub invalidated_reason: Option<String>,
 }
 
 impl ApprovalRecord {

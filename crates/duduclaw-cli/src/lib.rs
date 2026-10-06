@@ -79,6 +79,7 @@ mod service;
 pub mod weekly_report; // Per-agent weekly usage report
 mod knobs_survival;
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
+mod channel_ingress_cmd; // F2: `duduclaw ops channel-ingress` (operator-only, dashboard-approved changes)
 mod doctor_mcp_servers; // N5: doctor row for MCP servers DuDuClaw did not write
 #[cfg(test)]
 mod namespace_unification_tests;
@@ -1690,6 +1691,14 @@ enum OpsCommands {
     Memory {
         #[command(subcommand)]
         command: memory_namespace_cmd::MemoryCommands,
+    },
+
+    /// (operator) LINE durable inbox — `list` / `show` / `resolve` / `rerun`.
+    /// State changes wait for an Admin approval in the dashboard. Hidden.
+    #[command(hide = true, name = "channel-ingress")]
+    ChannelIngress {
+        #[command(subcommand)]
+        command: channel_ingress_cmd::ChannelIngressCommands,
     },
 
     /// Manage AI 員工職務組合 (agent presets) — named, versioned configuration
@@ -5037,6 +5046,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Ops(OpsCommands::Memory { command }) => {
             memory_namespace_cmd::run(&duduclaw_home(), command).await
         }
+        Commands::Ops(OpsCommands::ChannelIngress { command }) => {
+            channel_ingress_cmd::run(&duduclaw_home(), command).await
+        }
         Commands::Ops(OpsCommands::Org { command }) => match command {
             OrgCommands::Show => cmd_org_show(),
             OrgCommands::Sync { agent, dry_run } => cmd_org_sync(agent.as_deref(), dry_run),
@@ -6148,7 +6160,11 @@ fn agent_file_guard_decision(
                 if !protected.is_allowed() {
                     protected
                 } else {
-                    bash_reserved_agent_create(command, &home, &caller).unwrap_or(protected)
+                    bash_reserved_agent_create(command, &home, &caller)
+                        .or_else(|| {
+                            channel_ingress_cmd::bash_channel_ingress_decision(command, &caller)
+                        })
+                        .unwrap_or(protected)
                 }
             }
         }
@@ -8956,6 +8972,45 @@ fn removed_mcp_tools_check(home: &std::path::Path) -> (String, CheckStatus, Stri
     (name, status, lines.join("\n         "))
 }
 
+/// `duduclaw doctor` row (P0-B F4, review L7): Slack bots whose own account
+/// could not be verified at connect time (`bots.info` usually needs the
+/// `users:read` scope). Decisions and computer-use confirmations on those bots
+/// fail closed. Reads the status file the gateway writes; never calls Slack.
+fn slack_decision_identity_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let (warn, message) = duduclaw_gateway::channel_decision_route::slack_identity_doctor(home);
+    let status = if warn {
+        CheckStatus::Warn
+    } else {
+        CheckStatus::Pass
+    };
+    ("Slack 決定身分".to_string(), status, message)
+}
+
+/// F5-A R-M1: who holds this home's gateway lock, and whether a second
+/// gateway was refused (that process ran without workflow reconciliation,
+/// dispatch or sweep).
+fn gateway_instance_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let name = "單一 gateway".to_string();
+    match duduclaw_core::gateway_instance::status(home) {
+        (_, Some(refused)) => (
+            name,
+            CheckStatus::Warn,
+            format!(
+                "曾有第二個 gateway 在這個資料目錄啟動並被拒絕（{refused}）；它不會執行工作流程。請只保留一個 gateway，之後正常啟動時這則提示會消失"
+            ),
+        ),
+        (Some(holder), None) if duduclaw_core::gateway_instance::locked_elsewhere(home) => {
+            (name, CheckStatus::Pass, format!("目前由 {holder} 持有"))
+        }
+        (Some(holder), None) => (
+            name,
+            CheckStatus::Pass,
+            format!("目前沒有 gateway 在執行（上次啟動：{holder}）"),
+        ),
+        (None, None) => (name, CheckStatus::Pass, "尚未有 gateway 在這個資料目錄啟動".into()),
+    }
+}
+
 /// `duduclaw doctor` row (v1.69.0): `config.toml [dispatch] judge` set to a
 /// mode removed in v1.69.0. Reports what the gateway does with the value now
 /// and how to fix it; never rewrites.
@@ -9624,6 +9679,12 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // Check 4d: MCP tool names and judge modes removed in v1.69.0.
     checks.push(removed_mcp_tools_check(&home));
     checks.push(removed_judge_mode_check(&home));
+    // F5-A R-M1: one gateway per data directory.
+    checks.push(gateway_instance_check(&home));
+
+    // Check 4e: Slack bots whose decision account could not be verified
+    // (P0-B F4): their approval replies and computer-use confirmations fail.
+    checks.push(slack_decision_identity_check(&home));
 
     // Check 4e: MCP servers in employees' .mcp.json that DuDuClaw did not
     // write (they run as the operator's OS user at every spawn).
@@ -13751,6 +13812,31 @@ mod removed_name_hook_tests {
         }
         let audit = std::fs::read_to_string(h.path().join("security_audit.jsonl")).unwrap();
         assert!(audit.contains("agent_name_reserved") && audit.contains("cli_bash_agent_create"));
+    }
+
+    #[test]
+    fn bash_channel_ingress_is_blocked_through_the_hook() {
+        let h = home_with_trash();
+        let d = agent_file_guard_decision(
+            "Bash",
+            &bash("duduclaw ops channel-ingress rerun abc --note x --confirm-duplicate-risk"),
+            h.path(),
+            &agent("ceo"),
+        )
+        .unwrap();
+        assert!(
+            matches!(d, GuardDecision::BlockedOperatorCommand { ref command, .. }
+                if *command == "duduclaw ops channel-ingress"),
+            "{d:?}"
+        );
+        let d = agent_file_guard_decision(
+            "Bash",
+            &bash("duduclaw ops channel-ingress list"),
+            h.path(),
+            &HookCaller::Absent,
+        )
+        .unwrap();
+        assert!(d.is_allowed(), "{d:?}");
     }
 
     #[test]
