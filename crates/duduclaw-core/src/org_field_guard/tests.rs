@@ -92,6 +92,8 @@ mod bash_round3;
 mod bash_round4;
 /// G1 round 5: braced home variables, `--exec=` actions, dangling-link message path.
 mod bash_round5;
+/// P2-B C-1: operator-only memory commands are refused for employees.
+mod operator_memory;
 /// `.mcp.json` and the CLI configuration directories are frozen for
 /// employees.
 mod mcp_json;

@@ -155,7 +155,7 @@ Discovery は 6 つの runtime ファミリーを同じ保証のもとで実行�
 |---|---|---|---|---|
 | Claude | `claude` | ネイティブの `--max-turns` | `--tools` と `--allowedTools` | `ANTHROPIC_API_KEY` または `CLAUDE_CODE_OAUTH_TOKEN` |
 | Codex | `codex` | gateway がカウント | `-c` の上書きで MCP、web、マルチエージェント、hook、プラグイン、メモリーを無効化 | `OPENAI_API_KEY`（同じ値を `CODEX_API_KEY` にも設定）、または認証情報ドキュメント |
-| Gemini（v1.67.0 で非推奨、v1.70.0 で削除。Antigravity を使用。[非推奨ガイド](../../guides/ja-JP/deprecations.md#gemini-cli-ランタイム)参照） | `gemini` | ネイティブの `maxSessionTurns` | `tools.core` の許可リスト | `GEMINI_API_KEY` または `GOOGLE_API_KEY` |
+| Gemini（v1.67.0 で非推奨、v1.71.0 で削除。Antigravity を使用。[非推奨ガイド](../../guides/ja-JP/deprecations.md#gemini-cli-ランタイム)参照） | `gemini` | ネイティブの `maxSessionTurns` | `tools.core` の許可リスト | `GEMINI_API_KEY` または `GOOGLE_API_KEY` |
 | Antigravity（`antigravity`、別名 `agy`） | `antigravity` | gateway がカウント | `PreToolUse` hook がファイル／shell 以外のツールをすべて拒否 | `GEMINI_API_KEY` または `GOOGLE_API_KEY` のみ |
 | Grok | `grok` | ネイティブの `--max-turns` | `--tools`、`--disallowed-tools`、`--disable-web-search`、`--no-subagents`、`--no-plan` | `XAI_API_KEY`、または認証情報ドキュメント |
 | OpenAI 互換（`openai-compat`、別名 `openai_compat`） | `openai-compat` | adapter 自身のループ | adapter はファイルと shell のツールのみ提供 | 設定された provider の key。`base_url` の設定も必要 |

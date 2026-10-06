@@ -361,6 +361,19 @@ acting as the employee. Closed error codes: `not_found`, `not_active`,
 There is no tool for creating, changing, resuming or re-enabling a
 responsibility, and none for steering a task.
 
+### `memory_store` / `user_profile_record` / `decision_resolve` / `wiki_write` — sources and refusals
+
+Every memory write records where it came from, and `wiki_write` stamps the page it writes. The gateway supplies the source through the environment of the employee process (turn id, conversation id, and the number and time of the user message of that turn, or the run key of a scheduled or dispatched run); the model cannot name or change it. A call from an external MCP client is recorded as one call of that client.
+
+A memory write is refused with a tool error in two cases:
+
+- The source was forgotten by the operator (`duduclaw memory forget-source`): "Not stored: the conversation this write comes from was forgotten by the operator (forget by source), so nothing derived from it may be stored again". `decision_resolve` answers "Not resolved: the conversation this choice comes from was forgotten by the operator". The refusal is audited as `memory_write_fenced`.
+- The employee process carries a conversation or run identity from the gateway that is malformed: "Not stored: this employee process carries a malformed conversation or run identity from the gateway, so the write could not be tied to its source. Restart the gateway; if it persists, report it." The write is not recorded as an anonymous external call.
+
+A write that is derived from other memories and names a parent memory that does not exist is also refused. The memory, key fact and its source rows are written in one transaction, so a write either has its source recorded or does not happen.
+
+`wiki_write` (both scopes) adds a `host_sources` key to the page's frontmatter with the sources of that write, keeping the newest 20 across rewrites. A `host_sources` value the employee writes itself is dropped. The key is only read by forget by source, which lists such pages for human review and never deletes them. No MCP tool performs a forget: it is an operator command, refused in an employee's session.
+
 ## Deprecated aliases are still listed
 
 A deprecated tool name keeps appearing in `tools/list` with a

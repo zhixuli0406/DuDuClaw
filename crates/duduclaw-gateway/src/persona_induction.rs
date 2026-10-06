@@ -605,8 +605,14 @@ async fn induce_rule(
         })),
         ..Default::default()
     };
+    // System content (G14): induced from proactive-feedback outcomes.
     let memory_id = engine
-        .store_temporal(agent_id, entry, meta)
+        .store_temporal(
+            agent_id,
+            entry,
+            meta,
+            duduclaw_memory::lineage::Provenance::System { producer: "persona_induction" },
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -619,6 +625,7 @@ async fn induce_rule(
             KEY_FACT_CHANNEL,
             KEY_FACT_CHAT_ID,
             &fingerprint,
+            duduclaw_memory::lineage::Provenance::System { producer: "persona_induction" },
         )
         .await
         .ok();
@@ -682,7 +689,12 @@ async fn revoke_rule(
         ..Default::default()
     };
     engine
-        .store_temporal(agent_id, entry, meta)
+        .store_temporal(
+            agent_id,
+            entry,
+            meta,
+            duduclaw_memory::lineage::Provenance::System { producer: "persona_induction" },
+        )
         .await
         .map_err(|e| e.to_string())
 }

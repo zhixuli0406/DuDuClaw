@@ -199,7 +199,17 @@ pub async fn apply_deltas_gated(
                     source_event: Some(PLAYBOOK_SOURCE_EVENT.to_string()),
                     ..Default::default()
                 };
-                if let Err(e) = engine.store_temporal(agent_id, entry, temporal).await {
+                // Playbook rules are system content (G16): they come from the
+                // evolution engine's evaluated candidates, not a conversation.
+                if let Err(e) = engine
+                    .store_temporal(
+                        agent_id,
+                        entry,
+                        temporal,
+                        duduclaw_memory::lineage::Provenance::System { producer: "playbook" },
+                    )
+                    .await
+                {
                     tracing::warn!(agent = %agent_id, "playbook: store Add failed: {e}");
                 }
             }
@@ -580,7 +590,7 @@ mod tests {
             metadata: Some(serde_json::json!({"rule_stats": {"helpful": 1, "harmful": 0}})),
             ..Default::default()
         };
-        let id = engine.store_temporal(agent, entry, meta).await.unwrap();
+        let id = engine.store_temporal(agent, entry, meta, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
 
         let active = list_active(&engine, agent).await;
         let (_, meta, stats) = active.iter().find(|(e, _, _)| e.id == id).unwrap();

@@ -436,6 +436,17 @@ fn split_env_overrides(
     (args, process_env)
 }
 
+/// `-c mcp_servers.duduclaw.env.<K>="<v>"` for the turn/run source pairs
+/// (P2-B N4). None of them is a credential, so the `env` form is used on
+/// every Codex version.
+fn turn_source_override_args(pairs: &[(String, String)]) -> Vec<String> {
+    let env: serde_json::Map<String, serde_json::Value> = pairs
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    mcp_env_override_args(&env)
+}
+
 /// The `-c mcp_servers.duduclaw.env.<K>=<V>` half of [`mcp_override_args`],
 /// split out so it can be tested against a synthetic env map (the production
 /// map comes from `duduclaw_mcp_server_json`, which reads process state).
@@ -1008,6 +1019,12 @@ impl AgentRuntime for CodexRuntime {
             cmd.env(k, v);
         }
         cmd.args(&mcp_overrides.args);
+        // P2-B N4: this turn's or run's source identity for the duduclaw MCP
+        // server, so what the employee stores there can be forgotten by its
+        // conversation. Per-spawn `-c` overrides, never a persisted config.
+        cmd.args(turn_source_override_args(
+            &crate::memory_provenance::turn_source_env_pairs(),
+        ));
 
         // Working root. Normally the agent's own directory; a caller may
         // override it via `super::SPAWN_OVERRIDE` (today: the team composer,
@@ -1881,6 +1898,38 @@ mod tests {
                 .iter()
                 .any(|a| a == "approval_policy=never"),
             "global approval policy must stay `never`"
+        );
+    }
+
+    /// P2-B N4: turn/run source pairs become `env.<K>` overrides.
+    #[test]
+    fn turn_source_pairs_become_env_overrides() {
+        let args = turn_source_override_args(&[
+            ("DUDUCLAW_TURN_ID".into(), "t-1".into()),
+            ("DUDUCLAW_DISPATCH_RUN_ID".into(), "abc".into()),
+        ]);
+        assert_eq!(args.len(), 4);
+        assert_eq!(args.iter().filter(|a| *a == "-c").count(), 2);
+        for want in [
+            "mcp_servers.duduclaw.env.DUDUCLAW_DISPATCH_RUN_ID=\"abc\"",
+            "mcp_servers.duduclaw.env.DUDUCLAW_TURN_ID=\"t-1\"",
+        ] {
+            assert!(args.iter().any(|a| a == want), "{args:?}");
+        }
+        assert!(turn_source_override_args(&[]).is_empty());
+    }
+
+    /// P2-B N4: inside a turn, the pairs the codex spawn adds name it.
+    #[tokio::test]
+    async fn the_codex_spawn_carries_the_turn_in_scope() {
+        let args = duduclaw_memory::feedback::CURRENT_TURN_ID
+            .scope(Some("t-5".into()), async {
+                turn_source_override_args(&crate::memory_provenance::turn_source_env_pairs())
+            })
+            .await;
+        assert!(
+            args.iter().any(|a| a == "mcp_servers.duduclaw.env.DUDUCLAW_TURN_ID=\"t-5\""),
+            "{args:?}"
         );
     }
 

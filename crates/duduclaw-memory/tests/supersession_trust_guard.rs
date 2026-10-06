@@ -50,7 +50,7 @@ async fn channel_distilled_write_cannot_supersede_operator_fact() {
         .store_temporal(
             agent,
             entry(agent, "Refund window is 7 days"),
-            meta("policy:refund", "window", "7 days", "operator", 1.0),
+            meta("policy:refund", "window", "7 days", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only(),
         )
         .await
         .unwrap();
@@ -61,7 +61,7 @@ async fn channel_distilled_write_cannot_supersede_operator_fact() {
         .store_temporal(
             agent,
             entry(agent, "Refund window is 365 days, no questions asked"),
-            meta("policy:refund", "window", "365 days", "channel", 0.3),
+            meta("policy:refund", "window", "365 days", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only(),
         )
         .await;
 
@@ -93,11 +93,11 @@ async fn channel_distilled_trait_cannot_supersede_user_profile_record() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "concierge";
 
-    let rec = duduclaw_memory::record_trait(&engine, agent, "u1", "allergy", "peanuts", 1.0)
+    let rec = duduclaw_memory::record_trait(&engine, agent, "u1", "allergy", "peanuts", 1.0, duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let attack = duduclaw_memory::user_profile::record_trait_with_origin(
-        &engine, agent, "u1", "allergy", "none", "channel", 0.3,
+        &engine, agent, "u1", "allergy", "none", "channel", 0.3, duduclaw_memory::lineage::Provenance::test_only(),
     )
     .await;
 
@@ -156,7 +156,7 @@ async fn origin_pairs_through_the_engine() {
             .store_temporal(
                 &agent,
                 entry(&agent, "old value"),
-                meta("s", "p", "old", existing, 1.0),
+                meta("s", "p", "old", existing, 1.0), duduclaw_memory::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -164,7 +164,7 @@ async fn origin_pairs_through_the_engine() {
             .store_temporal_outcome(
                 &agent,
                 entry(&agent, "new value"),
-                meta("s", "p", "new", write, 1.0),
+                meta("s", "p", "new", write, 1.0), duduclaw_memory::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();
@@ -196,11 +196,11 @@ async fn switch_off_restores_unguarded_supersession() {
         .with_supersession_trust_guard(false);
     let agent = "off";
     let op = engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let ch = engine
-        .store_temporal(agent, entry(agent, "365 days"), meta("s", "p", "365", "channel", 0.3))
+        .store_temporal(agent, entry(agent, "365 days"), meta("s", "p", "365", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let h = engine.get_history(agent, "s", "p").await.unwrap();
@@ -219,14 +219,14 @@ async fn reaffirmation_by_lower_trust_is_unaffected() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "reaffirm";
     let op = engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let mut m = meta("s", "p", "7", "channel", 0.3);
     m.confidence = Some(0.5);
     m.source_event = Some("ev-chat".to_string());
     let again = engine
-        .store_temporal(agent, entry(agent, "7 days"), m)
+        .store_temporal(agent, entry(agent, "7 days"), m, duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert_eq!(again, op, "a reaffirm returns the surviving row");
@@ -245,19 +245,19 @@ async fn corroborated_low_trust_fact_is_still_superseded_by_higher_trust() {
     let mut m = meta("s", "p", "x", "channel", 0.3);
     m.confidence = Some(0.5);
     let ch = engine
-        .store_temporal(agent, entry(agent, "x"), m)
+        .store_temporal(agent, entry(agent, "x"), m, duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let mut r = meta("s", "p", "x", "mcp_external", 0.3);
     r.source_event = Some("ev-2".to_string());
-    engine.store_temporal(agent, entry(agent, "x"), r).await.unwrap();
+    engine.store_temporal(agent, entry(agent, "x"), r, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     let h = engine.get_history(agent, "s", "p").await.unwrap();
     assert!(h[0].confidence > 0.5, "boosted by a second distinct origin");
     assert_eq!(engine.get_origin_trust(agent, &ch).await.unwrap(), Some(0.3));
 
     // Equal trust (another channel claim) still supersedes the corroborated row.
     let newer = engine
-        .store_temporal(agent, entry(agent, "y"), meta("s", "p", "y", "channel", 0.3))
+        .store_temporal(agent, entry(agent, "y"), meta("s", "p", "y", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert_eq!(current_ids(&engine, agent, "s", "p").await, vec![newer]);
@@ -273,13 +273,13 @@ async fn lowered_trust_is_compared_at_stored_value() {
         .store_temporal(agent, entry(agent, "source"), TemporalMeta {
             origin: Some("tool_echo".to_string()),
             ..Default::default()
-        })
+        }, duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let mut m = meta("s", "p", "derived", "operator", 1.0);
     m.derived_from = Some(vec![src.clone()]);
     let derived = engine
-        .store_temporal(agent, entry(agent, "derived"), m)
+        .store_temporal(agent, entry(agent, "derived"), m, duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     // Derived from a tool echo → stored at 0.5; an import (0.7) may replace it.
@@ -288,7 +288,7 @@ async fn lowered_trust_is_compared_at_stored_value() {
     assert_eq!(engine.get_origin_trust(agent, &derived).await.unwrap(), Some(0.1));
     // Now even a channel write (0.3) outranks the poisoned 0.1 row.
     let ch = engine
-        .store_temporal(agent, entry(agent, "chat"), meta("s", "p", "chat", "channel", 0.3))
+        .store_temporal(agent, entry(agent, "chat"), meta("s", "p", "chat", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert_eq!(current_ids(&engine, agent, "s", "p").await, vec![ch]);
@@ -301,16 +301,16 @@ async fn history_intact_after_refusal_and_higher_trust_write_proceeds() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "chain";
     let a = engine
-        .store_temporal(agent, entry(agent, "v1"), meta("s", "p", "v1", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "v1"), meta("s", "p", "v1", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let b = engine
-        .store_temporal(agent, entry(agent, "v2"), meta("s", "p", "v2", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "v2"), meta("s", "p", "v2", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let before = engine.get_history(agent, "s", "p").await.unwrap();
     assert!(engine
-        .store_temporal(agent, entry(agent, "evil"), meta("s", "p", "evil", "channel", 0.3))
+        .store_temporal(agent, entry(agent, "evil"), meta("s", "p", "evil", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .is_err());
     let after = engine.get_history(agent, "s", "p").await.unwrap();
@@ -327,7 +327,7 @@ async fn history_intact_after_refusal_and_higher_trust_write_proceeds() {
     assert_eq!(at.id, b);
 
     let c = engine
-        .store_temporal(agent, entry(agent, "v3"), meta("s", "p", "v3", "user_direct", 1.0))
+        .store_temporal(agent, entry(agent, "v3"), meta("s", "p", "v3", "user_direct", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let h = engine.get_history(agent, "s", "p").await.unwrap();
@@ -344,11 +344,11 @@ async fn historical_insert_is_not_a_supersession() {
     let agent = "history";
     let mut m = meta("s", "p", "now", "operator", 1.0);
     m.valid_from = Some(Utc::now());
-    let op = engine.store_temporal(agent, entry(agent, "now"), m).await.unwrap();
+    let op = engine.store_temporal(agent, entry(agent, "now"), m, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     let mut old = meta("s", "p", "then", "channel", 0.3);
     old.valid_from = Some(Utc::now() - chrono::Duration::days(30));
     engine
-        .store_temporal(agent, entry(agent, "then"), old)
+        .store_temporal(agent, entry(agent, "then"), old, duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert_eq!(current_ids(&engine, agent, "s", "p").await, vec![op]);
@@ -363,17 +363,17 @@ async fn held_claim_promoted_with_reviewer_authority() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "review";
     let op = engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let claim = meta("s", "p", "14", "channel", 0.3);
     let out = engine
-        .store_temporal_outcome(agent, entry(agent, "14 days"), claim.clone())
+        .store_temporal_outcome(agent, entry(agent, "14 days"), claim.clone(), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert!(matches!(out, TemporalWriteOutcome::Refused(_)));
     let held = engine
-        .hold_refused_claim(agent, entry(agent, "14 days"), claim)
+        .hold_refused_claim(agent, entry(agent, "14 days"), claim, duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert_eq!(engine.is_quarantined(agent, &held).await.unwrap(), Some(true));
@@ -388,7 +388,7 @@ async fn held_claim_promoted_with_reviewer_authority() {
     // A later channel claim is still refused by the operator fact (the held
     // row neither replaces nor shields anything).
     assert!(engine
-        .store_temporal(agent, entry(agent, "30 days"), meta("s", "p", "30", "channel", 0.3))
+        .store_temporal(agent, entry(agent, "30 days"), meta("s", "p", "30", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .is_err());
 
@@ -429,18 +429,18 @@ async fn repeated_held_claim_is_held_once_while_pending() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "review-dedup";
     engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
 
     let first = engine
-        .hold_refused_claim_outcome(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3))
+        .hold_refused_claim_outcome(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert!(first.newly_held);
     for _ in 0..3 {
         let again = engine
-            .hold_refused_claim_outcome(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3))
+            .hold_refused_claim_outcome(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert!(!again.newly_held);
@@ -449,14 +449,14 @@ async fn repeated_held_claim_is_held_once_while_pending() {
     assert_eq!(engine.held_claim_repeats(), 3);
     // The String-returning form is idempotent too.
     let plain = engine
-        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3))
+        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert_eq!(plain, first.id);
 
     // Different object ⇒ separate held claim.
     let other = engine
-        .hold_refused_claim_outcome(agent, entry(agent, "30 days"), meta("s", "p", "30", "channel", 0.3))
+        .hold_refused_claim_outcome(agent, entry(agent, "30 days"), meta("s", "p", "30", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert!(other.newly_held);
@@ -469,7 +469,7 @@ async fn repeated_held_claim_is_held_once_while_pending() {
 
     // Another agent's identical claim is not deduplicated against this one.
     let elsewhere = engine
-        .hold_refused_claim_outcome("other-agent", entry("other-agent", "14 days"), meta("s", "p", "14", "channel", 0.3))
+        .hold_refused_claim_outcome("other-agent", entry("other-agent", "14 days"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert!(elsewhere.newly_held);
@@ -481,7 +481,7 @@ async fn repeated_held_claim_is_held_once_while_pending() {
         .await
         .unwrap();
     let after = engine
-        .hold_refused_claim_outcome(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3))
+        .hold_refused_claim_outcome(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert!(after.newly_held);
@@ -497,16 +497,16 @@ async fn stale_card_is_not_promoted_over_a_newer_fact() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "stale";
     engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let held = engine
-        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3))
+        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     // The operator changes the fact after the card was filed.
     let newer = engine
-        .store_temporal(agent, entry(agent, "10 days"), meta("s", "p", "10", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "10 days"), meta("s", "p", "10", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let r = engine
@@ -523,7 +523,7 @@ async fn stale_card_is_not_promoted_over_a_newer_fact() {
     );
     assert_eq!(engine.find_pending_held_claim(agent, "s", "p", Some("14")).await.unwrap(), None);
     let again = engine
-        .hold_refused_claim_outcome(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3))
+        .hold_refused_claim_outcome(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert!(again.newly_held);
@@ -541,11 +541,11 @@ async fn held_row_records_the_fact_it_conflicts_with() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "conflicts-with";
     let op = engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let held = engine
-        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3))
+        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let m = engine.get_metadata(agent, &held).await.unwrap().unwrap();
@@ -561,7 +561,7 @@ async fn legacy_user_profile_row_is_capped_at_the_new_ceiling() {
     use duduclaw_memory::TemporalWriteOutcome;
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "legacy-profile";
-    let legacy = duduclaw_memory::record_trait(&engine, agent, "u1", "preferred_name", "李總", 1.0)
+    let legacy = duduclaw_memory::record_trait(&engine, agent, "u1", "preferred_name", "李總", 1.0, duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     // Simulate the pre-M2 stored value.
@@ -575,7 +575,7 @@ async fn legacy_user_profile_row_is_capped_at_the_new_ceiling() {
     }
     assert_eq!(engine.get_origin_trust(agent, &legacy).await.unwrap(), Some(1.0));
     let ch = duduclaw_memory::user_profile::record_trait_outcome(
-        &engine, agent, "u1", "preferred_name", "x", "channel", 0.3,
+        &engine, agent, "u1", "preferred_name", "x", "channel", 0.3, duduclaw_memory::lineage::Provenance::test_only(),
     )
     .await
     .unwrap();
@@ -584,7 +584,7 @@ async fn legacy_user_profile_row_is_capped_at_the_new_ceiling() {
         other => panic!("channel write must be refused: {other:?}"),
     }
     let own = duduclaw_memory::user_profile::record_trait_outcome(
-        &engine, agent, "u1", "preferred_name", "老李", "user_profile", 0.6,
+        &engine, agent, "u1", "preferred_name", "老李", "user_profile", 0.6, duduclaw_memory::lineage::Provenance::test_only(),
     )
     .await
     .unwrap();
@@ -600,13 +600,13 @@ async fn quarantined_write_outranked_by_current_fact_is_refused() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "burst";
     let op = engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let mut q = meta("s", "p", "365", "channel", 0.3);
     q.quarantined = true;
     let out = engine
-        .store_temporal_outcome(agent, entry(agent, "365 days"), q)
+        .store_temporal_outcome(agent, entry(agent, "365 days"), q, duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     match out {
@@ -617,7 +617,7 @@ async fn quarantined_write_outranked_by_current_fact_is_refused() {
     let mut same = meta("s", "p", "7", "channel", 0.3);
     same.quarantined = true;
     let id = engine
-        .store_temporal(agent, entry(agent, "7 days"), same)
+        .store_temporal(agent, entry(agent, "7 days"), same, duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert_ne!(id, op);
@@ -625,7 +625,7 @@ async fn quarantined_write_outranked_by_current_fact_is_refused() {
     // No current fact: stored inert.
     let mut fresh = meta("other", "p", "v", "channel", 0.3);
     fresh.quarantined = true;
-    let id = engine.store_temporal(agent, entry(agent, "v"), fresh).await.unwrap();
+    let id = engine.store_temporal(agent, entry(agent, "v"), fresh, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     assert_eq!(engine.is_quarantined(agent, &id).await.unwrap(), Some(true));
     assert_eq!(current_ids(&engine, agent, "s", "p").await.len(), 2, "op + inert row");
 }
@@ -641,12 +641,12 @@ async fn release_applies_supersession_semantics() {
 
     // (1) supersede an equal-trust current fact.
     let old = engine
-        .store_temporal(agent, entry(agent, "a"), meta("s1", "p", "a", "channel", 0.3))
+        .store_temporal(agent, entry(agent, "a"), meta("s1", "p", "a", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let mut q = meta("s1", "p", "b", "channel", 0.3);
     q.quarantined = true;
-    let b = engine.store_temporal(agent, entry(agent, "b"), q).await.unwrap();
+    let b = engine.store_temporal(agent, entry(agent, "b"), q, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     let r = engine.release_quarantine(agent, &[b.clone()]).await.unwrap();
     assert_eq!((r.released, r.held.len()), (1, 0));
     assert_eq!(current_ids(&engine, agent, "s1", "p").await, vec![b.clone()]);
@@ -657,26 +657,26 @@ async fn release_applies_supersession_semantics() {
 
     // (2) identical value → reaffirm, the released row is closed out.
     let cur = engine
-        .store_temporal(agent, entry(agent, "x"), meta("s2", "p", "x", "channel", 0.3))
+        .store_temporal(agent, entry(agent, "x"), meta("s2", "p", "x", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let mut q = meta("s2", "p", "x", "channel", 0.3);
     q.quarantined = true;
-    let dup = engine.store_temporal(agent, entry(agent, "x"), q).await.unwrap();
+    let dup = engine.store_temporal(agent, entry(agent, "x"), q, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     let r = engine.release_quarantine(agent, &[dup.clone()]).await.unwrap();
     assert_eq!(r.released, 1);
     assert_eq!(current_ids(&engine, agent, "s2", "p").await, vec![cur]);
 
     // (3) outranked at release (stored while the guard was off) → held claim.
     let op = engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s3", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s3", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let mut engine = engine;
     engine.supersession_trust_guard = false;
     let mut q = meta("s3", "p", "365", "channel", 0.3);
     q.quarantined = true;
-    let low = engine.store_temporal(agent, entry(agent, "365 days"), q).await.unwrap();
+    let low = engine.store_temporal(agent, entry(agent, "365 days"), q, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     engine.supersession_trust_guard = true;
     let r = engine.release_quarantine(agent, &[low.clone()]).await.unwrap();
     assert_eq!(r.released, 0);
@@ -713,7 +713,7 @@ async fn hold_admission_gate_caps_new_rows_only() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "gate";
     engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let mut calls = 0u32;
@@ -722,21 +722,21 @@ async fn hold_admission_gate_caps_new_rows_only() {
         calls == 1
     };
     let first = engine
-        .hold_refused_claim_gated(agent, entry(agent, "14"), meta("s", "p", "14", "channel", 0.3), &mut admit_once)
+        .hold_refused_claim_gated(agent, entry(agent, "14"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only(), &mut admit_once)
         .await
         .unwrap()
         .unwrap();
     assert!(first.newly_held);
     // Repeat: no gate call, same id.
     let again = engine
-        .hold_refused_claim_gated(agent, entry(agent, "14"), meta("s", "p", "14", "channel", 0.3), &mut admit_once)
+        .hold_refused_claim_gated(agent, entry(agent, "14"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only(), &mut admit_once)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(again.id, first.id);
     // A new claim: second gate call refuses → nothing written.
     let capped = engine
-        .hold_refused_claim_gated(agent, entry(agent, "30"), meta("s", "p", "30", "channel", 0.3), &mut admit_once)
+        .hold_refused_claim_gated(agent, entry(agent, "30"), meta("s", "p", "30", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only(), &mut admit_once)
         .await
         .unwrap();
     assert!(capped.is_none());
@@ -755,7 +755,7 @@ fn concurrent_identical_holds_yield_one_row() {
         rt.block_on(engine.store_temporal(
             "race",
             entry("race", "7 days"),
-            meta("s", "p", "7", "operator", 1.0),
+            meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only(),
         ))
         .unwrap();
     }
@@ -774,7 +774,7 @@ fn concurrent_identical_holds_yield_one_row() {
                     rt.block_on(engine.hold_refused_claim_outcome(
                         "race",
                         entry("race", &object),
-                        meta("s", "p", &object, "channel", 0.3),
+                        meta("s", "p", &object, "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only(),
                     ))
                     .unwrap()
                 })
@@ -806,15 +806,15 @@ async fn sweep_closes_quarantine_with_no_pending_review() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "sweep";
     engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let pending = engine
-        .hold_refused_claim(agent, entry(agent, "14"), meta("s", "p", "14", "channel", 0.3))
+        .hold_refused_claim(agent, entry(agent, "14"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let lapsed = engine
-        .hold_refused_claim(agent, entry(agent, "30"), meta("s", "p", "30", "channel", 0.3))
+        .hold_refused_claim(agent, entry(agent, "30"), meta("s", "p", "30", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let keep: std::collections::HashSet<String> = [pending.clone()].into_iter().collect();
@@ -846,9 +846,9 @@ async fn equal_value_does_not_reaffirm_a_quarantined_row() {
     let agent = "m2-write";
     let mut q = meta("s", "p", "v", "channel", 0.3);
     q.quarantined = true;
-    let pending = engine.store_temporal(agent, entry(agent, "v"), q).await.unwrap();
+    let pending = engine.store_temporal(agent, entry(agent, "v"), q, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     let id = engine
-        .store_temporal(agent, entry(agent, "v"), meta("s", "p", "v", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "v"), meta("s", "p", "v", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     assert_ne!(id, pending, "must not report the quarantined row as the stored fact");
@@ -863,11 +863,11 @@ async fn promotion_equal_to_a_pending_burst_row_still_writes() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "m2-promote";
     engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let held = engine
-        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3))
+        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     // A burst row with the same value sits pending (written while the guard
@@ -876,7 +876,7 @@ async fn promotion_equal_to_a_pending_burst_row_still_writes() {
     engine.supersession_trust_guard = false;
     let mut q = meta("s", "p", "14", "channel", 0.3);
     q.quarantined = true;
-    let burst = engine.store_temporal(agent, entry(agent, "14 days"), q).await.unwrap();
+    let burst = engine.store_temporal(agent, entry(agent, "14 days"), q, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     engine.supersession_trust_guard = true;
     let r = engine.promote_quarantined(agent, &[held], "operator").await.unwrap();
     assert_eq!(r.promoted, 1);
@@ -893,11 +893,11 @@ async fn bound_promotion_refuses_a_digest_mismatch() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "digest";
     engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let held = engine
-        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3))
+        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let view = engine.held_claim_view(agent, &held).await.unwrap().unwrap();
@@ -914,7 +914,7 @@ async fn bound_promotion_refuses_a_digest_mismatch() {
     assert!(engine.held_claim_view(agent, &held).await.unwrap().is_none(), "row closed");
 
     let held2 = engine
-        .hold_refused_claim(agent, entry(agent, "21 days"), meta("s", "p", "21", "channel", 0.3))
+        .hold_refused_claim(agent, entry(agent, "21 days"), meta("s", "p", "21", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let d = engine.held_claim_view(agent, &held2).await.unwrap().unwrap().claim_digest;
@@ -932,11 +932,11 @@ async fn failed_promotion_rolls_back_and_the_connection_stays_usable() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "rollback";
     engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let held = engine
-        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3))
+        .hold_refused_claim(agent, entry(agent, "14 days"), meta("s", "p", "14", "channel", 0.3), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     // A reviewer origin below the protected fact makes the write refuse → Err.
@@ -953,13 +953,13 @@ async fn release_conversion_refreshes_the_sweep_grace_period() {
     let mut engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "grace";
     engine
-        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0))
+        .store_temporal(agent, entry(agent, "7 days"), meta("s", "p", "7", "operator", 1.0), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     engine.supersession_trust_guard = false;
     let mut q = meta("s", "p", "365", "channel", 0.3);
     q.quarantined = true;
-    let low = engine.store_temporal(agent, entry(agent, "365 days"), q).await.unwrap();
+    let low = engine.store_temporal(agent, entry(agent, "365 days"), q, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     engine.supersession_trust_guard = true;
     // Backdate the row's ingestion: before the fix the sweep keyed on this.
     {
@@ -987,14 +987,14 @@ async fn release_caps_a_legacy_rows_trust_at_its_class() {
     let engine = SqliteMemoryEngine::in_memory().unwrap();
     let agent = "legacy-release";
     let imp = engine
-        .store_temporal(agent, entry(agent, "a"), meta("s", "p", "a", "import", 0.7))
+        .store_temporal(agent, entry(agent, "a"), meta("s", "p", "a", "import", 0.7), duduclaw_memory::lineage::Provenance::test_only())
         .await
         .unwrap();
     let mut engine = engine;
     engine.supersession_trust_guard = false;
     let mut q = meta("s", "p", "b", "channel", 0.3);
     q.quarantined = true;
-    let row = engine.store_temporal(agent, entry(agent, "b"), q).await.unwrap();
+    let row = engine.store_temporal(agent, entry(agent, "b"), q, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     engine.supersession_trust_guard = true;
     {
         let conn = engine.conn_for_maintenance().await;

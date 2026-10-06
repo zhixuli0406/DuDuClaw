@@ -100,6 +100,9 @@ pub enum MigrationDisposition {
     /// A quarantined / held row in the source: left in place (its review
     /// card names the source namespace).
     SkippedQuarantined,
+    /// Left in the source: its lineage carries a source the target
+    /// namespace has forgotten (P2-B), or its id was forgotten.
+    Fenced,
     /// Already in the target namespace (a re-run).
     AlreadyInTarget,
     /// No row with this id in the source namespace.
@@ -243,6 +246,16 @@ impl SqliteMemoryEngine {
         let conn = self.conn.lock().await;
         conn.execute_batch("BEGIN IMMEDIATE").map_err(mem_err)?;
         let work = (|| -> Result<(Vec<(String, MigrationDisposition)>, usize)> {
+            // L-5: a source forgotten in the pool stays forgotten in the
+            // target (as `reassign_agent` does), so moved rows and later
+            // writes cannot bring it back under the new namespace.
+            crate::lineage::db::copy_tombstones(
+                &conn,
+                "main.forgotten_sources",
+                "main.forgotten_sources",
+                from,
+                to,
+            )?;
             // Oldest world-time first so a chain's older rows land before the
             // row that is current.
             let mut ordered: Vec<(String, String)> = Vec::new();
@@ -311,6 +324,8 @@ impl SqliteMemoryEngine {
             params![to, id, from],
         )
         .map_err(mem_err)?;
+        // P2-B: the row's lineage moves with it.
+        crate::lineage::db::rekey_origins(conn, crate::lineage::db::STORE_MEMORIES, id, from, to)?;
         Ok(())
     }
 
@@ -349,6 +364,30 @@ impl SqliteMemoryEngine {
         if row.quarantined {
             return Ok(MigrationDisposition::SkippedQuarantined);
         }
+        // P2-B: a row carrying a source the target has forgotten (or a
+        // forgotten id) must not appear there.
+        let id_forgotten: bool = conn
+            .query_row(
+                "SELECT 1 FROM forgotten_memories WHERE memory_store = 'memories' AND memory_id = ?1",
+                params![id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(mem_err)?
+            .unwrap_or(false);
+        if id_forgotten
+            || crate::lineage::db::lineage_hits_tombstone(
+                conn,
+                "forgotten_sources",
+                "memory_origins",
+                crate::lineage::db::STORE_MEMORIES,
+                id,
+                from,
+                to,
+            )?
+        {
+            return Ok(MigrationDisposition::Fenced);
+        }
 
         let (subj, pred) = match (&row.subject, &row.predicate) {
             (Some(s), Some(p)) if row.valid_until.is_none() => (s.clone(), p.clone()),
@@ -372,6 +411,17 @@ impl SqliteMemoryEngine {
             .find(|r| object_opt_eq(&row.object, &r.object) && r.content.trim() == row.content.trim())
         {
             let source_event = row.source_event.clone().unwrap_or_default();
+            // P2-B: the duplicate's sources corroborate the survivor.
+            if let Some(r) = crate::lineage::db::copy_as_reaffirm(
+                conn,
+                from,
+                id,
+                to,
+                &survivor.id,
+                &self.reaffirm_lineage_skipped,
+            )? {
+                return Err(r.into_error());
+            }
             let new_meta = append_reaffirmed_by(&survivor.metadata, &source_event, &origin_name);
             conn.execute(
                 "UPDATE memories SET metadata = ?1, access_count = access_count + 1
@@ -610,7 +660,7 @@ mod tests {
     }
 
     async fn store(e: &SqliteMemoryEngine, ns: &str, content: &str, meta: TemporalMeta) -> String {
-        e.store_temporal(ns, entry(content), meta).await.unwrap()
+        e.store_temporal(ns, entry(content), meta, crate::lineage::Provenance::test_only()).await.unwrap()
     }
 
     fn ids(v: &[&str]) -> Vec<String> {

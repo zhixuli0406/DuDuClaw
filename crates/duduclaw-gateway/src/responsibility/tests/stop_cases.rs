@@ -25,6 +25,7 @@ fn queue_msg(id: &str, task_id: &str) -> QueueMessage {
         reply_channel: None,
         turn_id: None,
         session_id: None,
+        upstream_unknown: false,
     }
 }
 

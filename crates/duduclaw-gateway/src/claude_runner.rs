@@ -483,6 +483,13 @@ where
         return fut.await;
     }
     let started_at = chrono::Utc::now().to_rfc3339();
+    // P2-B M-6: the run key is minted before the spawn and handed to it, so
+    // MCP memory writes made during the run and the post-run distillation
+    // below share one source.
+    let run_session = format!("{}:{agent_id}", request_type.as_str());
+    let run_key = crate::memory_provenance::new_dispatch_run_key();
+    let fut = crate::memory_provenance::DISPATCH_RUN
+        .scope(Some((run_session.clone(), run_key.clone())), fut);
     // Native-tool collection: REUSE an outer scope when the goal loop already
     // installed one — installing a nested scope would shadow it and starve
     // the settle-side evidence consumers (forward-model observe / grounding /
@@ -557,12 +564,21 @@ where
             let agent = agent_id.to_string();
             let home = home_dir.to_path_buf();
             let memory_db = home_dir.join("memory.db");
-            let session = format!("{}:{agent_id}", request_type.as_str());
+            let session = run_session.clone();
             // R-L1: captured before the spawn (task-locals do not cross it).
             let origin = crate::decision_notify::origin_target();
+            // P2-B: one host-made DispatchRun source per run (the shared
+            // `cron:<agent>` session has no message ids; the run is keyed by
+            // the run key minted before the spawn, M-6).
+            let sources = vec![crate::memory_provenance::dispatch_run_source_for(
+                &session,
+                &run_key,
+                chrono::Utc::now(),
+            )];
             tokio::spawn(async move {
                 crate::wiki_ingest::run_ingest(
                     &user_text, &reply, &agent, "system", &home, &memory_db, &session, origin,
+                    sources,
                 )
                 .await;
             });
@@ -1590,6 +1606,9 @@ fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
     envs.extend(duduclaw_core::mcp_forward_env_vars());
     // P2-A H-2: the round this tool loop runs for (openai-compat runtime).
     envs.extend(crate::runtime::round_task_env());
+    // P2-B N4: the turn/run source identity, so the openai-compat tool loop's
+    // memory writes are tied to their conversation like the CLI paths.
+    envs.extend(crate::memory_provenance::turn_source_env_pairs());
     envs
 }
 
@@ -4011,6 +4030,8 @@ fn prepare_claude_cmd(
     if let Some((k, v)) = crate::runtime::round_task_env() {
         cmd.env(k, v);
     }
+    crate::memory_provenance::inject_turn_user_message_env(&mut cmd);
+    crate::memory_provenance::inject_dispatch_run_env(&mut cmd);
 
     // The spawned employee is the one whose identity owns this spawn's
     // config directory (its `.mcp.json` names the same id). Recorded only
@@ -4896,6 +4917,29 @@ mod chain_tests {
         assert!(
             envs.iter()
                 .any(|(k, v)| k == duduclaw_core::ENV_AGENT_ID && v == "agnes")
+        );
+    }
+
+    /// P2-B N4: the openai-compat tool loop's MCP server gets the turn and
+    /// run in scope.
+    #[tokio::test]
+    async fn mcp_client_envs_carry_the_turn_and_run_in_scope() {
+        let envs = crate::memory_provenance::DISPATCH_RUN
+            .scope(Some(("dispatch:agnes".into(), "k1".into())), async {
+                duduclaw_memory::feedback::CURRENT_TURN_ID
+                    .scope(Some("t-3".into()), async { mcp_client_envs("agnes") })
+                    .await
+            })
+            .await;
+        let has = |k: &str, v: &str| envs.iter().any(|(a, b)| a == k && b == v);
+        assert!(has(duduclaw_core::ENV_TRUST_TURN_ID, "t-3"), "{envs:?}");
+        assert!(has(duduclaw_core::ENV_DISPATCH_RUN_ID, "k1"), "{envs:?}");
+        assert!(has(duduclaw_core::ENV_DISPATCH_SESSION, "dispatch:agnes"));
+        assert!(
+            !mcp_client_envs("agnes")
+                .iter()
+                .any(|(k, _)| k == duduclaw_core::ENV_TRUST_TURN_ID),
+            "nothing outside a turn"
         );
     }
 

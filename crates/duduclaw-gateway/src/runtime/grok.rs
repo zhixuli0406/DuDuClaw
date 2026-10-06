@@ -520,6 +520,13 @@ impl AgentRuntime for GrokRuntime {
         for (k, v) in duduclaw_core::mcp_forward_env_vars() {
             cmd.env(k, v);
         }
+        // P2-B N4: the turn/run source identity, same channel as the id. Grok
+        // may hand its MCP child only the declared config env, in which case
+        // this does not arrive (unverified); the persisted config is not used
+        // for per-turn values.
+        for (k, v) in crate::memory_provenance::turn_source_env_pairs() {
+            cmd.env(k, v);
+        }
         // RuntimeContext is authoritative for isolated eval arms. The process
         // env can still name the source home, whose MCP auth/task state must
         // never receive a role member's calls.
@@ -730,6 +737,7 @@ impl GrokRuntime {
         env.extend(duduclaw_core::agent_identity_env_vars_default(
             &context.agent_id,
         ));
+        env.extend(crate::memory_provenance::turn_source_env_pairs());
         for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
             if let Ok(v) = std::env::var(var) {
                 if !v.trim().is_empty() {

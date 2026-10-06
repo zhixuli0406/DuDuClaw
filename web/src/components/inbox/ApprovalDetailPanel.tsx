@@ -92,6 +92,7 @@ const DESCRIBED_KINDS = new Set([
   'discovery',
   'knowledge_quarantine',
   'workflow_activation',
+  'memory_forget_source',
 ]);
 
 /** D1/D2: `true` when there is an actual narrative or risk point to show —

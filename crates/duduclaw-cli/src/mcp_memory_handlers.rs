@@ -32,6 +32,305 @@ fn client_id_from_ns(ns_ctx: &NamespaceContext) -> &str {
         .unwrap_or(&ns_ctx.write_namespace)
 }
 
+/// P2-B: the host-generated sources of an MCP memory write by `namespace`.
+///
+/// A host-spawned employee's MCP server inherits the turn identity the
+/// gateway set (`DUDUCLAW_SESSION_ID` / `DUDUCLAW_TURN_ID`) → `McpTurn`, so
+/// forgetting that conversation also fences what the employee stored during
+/// it. On a channel turn the gateway also passes the triggering user message
+/// (`DUDUCLAW_TURN_USER_MESSAGE_SEQ` / `_AT`), added as a second source so a
+/// forget of that one message reaches the write too. Anything else (an
+/// `external/` client, no turn env) is one `McpExternal` source keyed by the
+/// client. The content comes from the model; the sources never do. The env
+/// is set by the host, not proven cryptographically (§3.2).
+pub(crate) fn mcp_write_provenance(
+    namespace: &str,
+) -> Result<duduclaw_memory::lineage::Provenance, String> {
+    let env = |k: &str| std::env::var(k).ok();
+    mcp_write_sources_with(
+        namespace,
+        &McpTurnEnv {
+            session: env(duduclaw_core::ENV_TRUST_SESSION_ID),
+            turn: env(duduclaw_core::ENV_TRUST_TURN_ID),
+            user_seq: env(duduclaw_core::ENV_TURN_USER_MESSAGE_SEQ),
+            user_at: env(duduclaw_core::ENV_TURN_USER_MESSAGE_AT),
+            run_session: env(duduclaw_core::ENV_DISPATCH_SESSION),
+            run: env(duduclaw_core::ENV_DISPATCH_RUN_ID),
+            upstream_unknown: env(duduclaw_core::ENV_UPSTREAM_UNKNOWN),
+        },
+    )
+    .map(duduclaw_memory::lineage::Provenance::Sources)
+}
+
+/// The turn identity a host put into this process's env (raw strings).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct McpTurnEnv {
+    pub session: Option<String>,
+    pub turn: Option<String>,
+    pub user_seq: Option<String>,
+    pub user_at: Option<String>,
+    /// Dispatch / cron / goal run (M-6): its session and run key.
+    pub run_session: Option<String>,
+    pub run: Option<String>,
+    /// The dispatcher's marker that the bus message's upstream identity was
+    /// dropped by the sender or arrived as a half pair (`1`).
+    pub upstream_unknown: Option<String>,
+}
+
+/// `content` with the page's host-recorded sources (P2-B H-4): the sources
+/// of this process's turn or run (none for an external client) added to
+/// those already on the page (`old`). `Err` when the host env is malformed.
+pub(crate) fn host_wiki_stamp(content: &str, old: Option<&str>) -> Result<String, String> {
+    let sources = match mcp_write_provenance("agent") {
+        Ok(duduclaw_memory::lineage::Provenance::Sources(s)) => s,
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "wiki_write refused: malformed host env");
+            return Err(malformed_host_env(&e));
+        }
+    };
+    let entries = duduclaw_gateway::wiki_host_sources::entries_for(&sources);
+    Ok(duduclaw_gateway::wiki_host_sources::stamp_host_sources(
+        content, old, &entries,
+    ))
+}
+
+/// The tool error for a write refused because this process's own host
+/// identity is incomplete or malformed (L-4). `detail` names the field;
+/// restarting the gateway does not change a spawned process's env, so the
+/// message does not suggest it.
+pub(crate) fn malformed_host_env(detail: &str) -> String {
+    format!(
+        "Not stored: this employee process's conversation or run identity from the gateway \
+         is incomplete ({detail}), so the write could not be tied to its source. Report this \
+         to the operator."
+    )
+}
+
+fn present(v: &Option<String>) -> Option<&str> {
+    v.as_deref().filter(|s| !s.trim().is_empty())
+}
+
+/// The own turn of a channel-turn process: `turn:<id>` in its session.
+fn own_turn(
+    turn: &str,
+    session: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<duduclaw_memory::SourceRef, String> {
+    let s = duduclaw_memory::SourceRef::other(
+        duduclaw_memory::SourceKind::McpTurn,
+        session.trim(),
+        format!("turn:{}", turn.trim()),
+        now,
+    );
+    s.validate()
+        .map_err(|e| format!("DUDUCLAW_TURN_ID / DUDUCLAW_SESSION_ID malformed: {e}"))?;
+    Ok(s)
+}
+
+/// [`mcp_write_provenance`]'s sources from an explicit env (pure, testable).
+/// Never empty on success.
+///
+/// * A dispatch run (`DUDUCLAW_DISPATCH_RUN_ID` set) is this process's own
+///   identity: a run key without its session, or a malformed one, is refused
+///   (`Err`, L-4). Its turn / session variables are the **upstream** turn
+///   the bus message carried: a complete pair is recorded as before; an
+///   incomplete or malformed pair does not refuse the write — the write keeps
+///   its run source plus an upstream-unknown marker (counted with the
+///   untracked rows of a plan).
+/// * Without a run, the turn / session are this process's own turn: a turn
+///   id without a session, or a malformed pair, is refused (L-4).
+///
+/// The user-message pair (`DUDUCLAW_TURN_USER_MESSAGE_SEQ` / `_AT`):
+/// * without a run it is this process's own turn, and a half or malformed
+///   pair is refused by `check_own_identity`;
+/// * in a run it describes the upstream turn, and a half or malformed pair
+///   is ignored (the write keeps its run source; the turn key, when
+///   complete, still records the upstream).
+pub(crate) fn mcp_write_sources_with(
+    namespace: &str,
+    env: &McpTurnEnv,
+) -> Result<Vec<duduclaw_memory::SourceRef>, String> {
+    let now = chrono::Utc::now();
+    if !namespace.starts_with("external/") {
+        check_own_identity(env)?;
+        let run = match present(&env.run) {
+            Some(run) => {
+                let session = present(&env.run_session).ok_or(
+                    "DUDUCLAW_DISPATCH_RUN_ID is set but DUDUCLAW_DISPATCH_SESSION is missing",
+                )?;
+                let s = duduclaw_memory::SourceRef::other(
+                    duduclaw_memory::SourceKind::DispatchRun,
+                    session.trim(),
+                    format!("run:{}", run.trim()),
+                    now,
+                );
+                s.validate().map_err(|e| {
+                    format!("DUDUCLAW_DISPATCH_RUN_ID / DUDUCLAW_DISPATCH_SESSION malformed: {e}")
+                })?;
+                Some((run, s))
+            }
+            None => None,
+        };
+        let mut out = Vec::new();
+        match (present(&env.turn), present(&env.session), &run) {
+            (Some(turn), Some(session), None) => {
+                out.push(own_turn(turn, session, now)?);
+                out.extend(turn_user_message(session.trim(), env));
+            }
+            (Some(_), None, None) => {
+                return Err(
+                    "DUDUCLAW_TURN_ID is set but DUDUCLAW_SESSION_ID is missing".to_string(),
+                );
+            }
+            (Some(turn), Some(session), Some((key, _))) => match own_turn(turn, session, now) {
+                Ok(s) => {
+                    out.push(s);
+                    out.extend(turn_user_message(session.trim(), env));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "upstream turn identity malformed; recorded as unknown");
+                    out.push(duduclaw_memory::SourceRef::upstream_unknown(key, now));
+                }
+            },
+            (Some(_), None, Some((key, _))) | (None, Some(_), Some((key, _))) => {
+                tracing::warn!(
+                    turn = present(&env.turn).is_some(),
+                    session = present(&env.session).is_some(),
+                    "upstream turn identity incomplete; recorded as unknown"
+                );
+                out.push(duduclaw_memory::SourceRef::upstream_unknown(key, now));
+            }
+            // No upstream turn in a dispatch run: unknown when the dispatcher
+            // says the sender dropped a half pair, otherwise none (cron and
+            // other dispatches with no conversation behind them).
+            // Any value counts (the gateway writes `1`; a different or blank
+            // value is not a reason to drop the note, F12).
+            (None, None, Some((key, _))) if env.upstream_unknown.is_some() =>
+            {
+                out.push(duduclaw_memory::SourceRef::upstream_unknown(key, now));
+            }
+            // Own session without a turn, no run. Reached in production: a
+            // channel reply's local-first inference tool loop
+            // (`claude_runner::try_local_inference` → `local_llm` →
+            // `build_mcp_tool_registry`) runs inside `reply_identity_scope`
+            // (session only) before the turn id is scoped around the CLI
+            // future. The write falls through to `McpExternal`
+            // (`mcp:<namespace>`); forgetting that conversation does not reach
+            // it. Kept as is (refusing would break that path); see the
+            // not-covered list.
+            _ => {}
+        }
+        if let Some((_, s)) = run {
+            out.push(s);
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+    let client = namespace.strip_prefix("external/").unwrap_or(namespace);
+    Ok(vec![duduclaw_memory::SourceRef::other(
+        duduclaw_memory::SourceKind::McpExternal,
+        format!("mcp:{client}"),
+        format!("call:{}", uuid::Uuid::new_v4()),
+        now,
+    )])
+}
+
+/// A variable that is set but blank (empty or whitespace only).
+fn blank(v: &Option<String>) -> bool {
+    v.as_deref().is_some_and(|s| s.trim().is_empty())
+}
+
+/// Host variables of this process's **own** identity that are present but
+/// unusable are refused (fail closed; `.mcp.json` platform fix, item 3).
+///
+/// | variable | own identity when | set but blank / incomplete |
+/// |---|---|---|
+/// | `DUDUCLAW_DISPATCH_RUN_ID`, `DUDUCLAW_DISPATCH_SESSION` | always | refused; a session without a run key is refused |
+/// | `DUDUCLAW_TURN_ID`, `DUDUCLAW_SESSION_ID` | no run | refused (in a run they are the upstream: recorded as unknown) |
+/// | `DUDUCLAW_TURN_USER_MESSAGE_SEQ` / `_AT` | no run | refused; only one of the two, or no turn, or a value that does not parse, refused |
+/// | `DUDUCLAW_UPSTREAM_UNKNOWN` | never (a run's note about its upstream) | in a run with no upstream pair, any value (blank included) records the upstream as unknown; ignored without a run |
+fn check_own_identity(env: &McpTurnEnv) -> Result<(), String> {
+    let empty = |name: &str| format!("{name} is set but empty");
+    for (name, v) in [
+        (duduclaw_core::ENV_DISPATCH_RUN_ID, &env.run),
+        (duduclaw_core::ENV_DISPATCH_SESSION, &env.run_session),
+    ] {
+        if blank(v) {
+            return Err(empty(name));
+        }
+    }
+    if env.run_session.is_some() && env.run.is_none() {
+        return Err(
+            "DUDUCLAW_DISPATCH_SESSION is set but DUDUCLAW_DISPATCH_RUN_ID is missing".to_string(),
+        );
+    }
+    if env.run.is_some() {
+        return Ok(());
+    }
+    for (name, v) in [
+        (duduclaw_core::ENV_TRUST_TURN_ID, &env.turn),
+        (duduclaw_core::ENV_TRUST_SESSION_ID, &env.session),
+        (duduclaw_core::ENV_TURN_USER_MESSAGE_SEQ, &env.user_seq),
+        (duduclaw_core::ENV_TURN_USER_MESSAGE_AT, &env.user_at),
+    ] {
+        if blank(v) {
+            return Err(empty(name));
+        }
+    }
+    if env.user_seq.is_some() || env.user_at.is_some() {
+        if env.turn.is_none() {
+            return Err(
+                "DUDUCLAW_TURN_USER_MESSAGE_SEQ / _AT are set but DUDUCLAW_TURN_ID is missing"
+                    .to_string(),
+            );
+        }
+        if env.user_seq.is_none() || env.user_at.is_none() {
+            return Err(
+                "only one of DUDUCLAW_TURN_USER_MESSAGE_SEQ / _AT is set".to_string(),
+            );
+        }
+        if let Some(session) = present(&env.session)
+            && turn_user_message(session.trim(), env).is_none()
+        {
+            return Err("DUDUCLAW_TURN_USER_MESSAGE_SEQ / _AT malformed".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// The turn's triggering channel message, when the env names a valid one.
+fn turn_user_message(session: &str, env: &McpTurnEnv) -> Option<duduclaw_memory::SourceRef> {
+    let seq: i64 = env.user_seq.as_deref()?.trim().parse().ok()?;
+    if seq < 0 {
+        return None;
+    }
+    let at = chrono::DateTime::parse_from_rfc3339(env.user_at.as_deref()?.trim())
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let s = duduclaw_memory::SourceRef::channel_message(session, seq, at, None);
+    s.validate().is_ok().then_some(s)
+}
+
+/// The tool error for a write refused by the source fence (and its audit).
+pub(crate) fn mcp_fenced_error(
+    namespace: &str,
+    producer: &str,
+    refusal: &duduclaw_memory::FenceRefusal,
+) -> Value {
+    duduclaw_gateway::memory_provenance::record_fenced(
+        &duduclaw_core::duduclaw_home(),
+        namespace,
+        producer,
+        refusal,
+    );
+    mcp_error(
+        "Not stored: the conversation this write comes from was forgotten by the operator \
+         (forget by source), so nothing derived from it may be stored again",
+    )
+}
+
 /// Parse a JSON value (array or comma-separated string) into a `Vec<String>`.
 ///
 /// Accepts both formats for backward compatibility:
@@ -168,8 +467,24 @@ pub async fn handle_memory_store(
         origin: Some(origin.to_string()),
         ..Default::default()
     };
-    match memory.store_temporal(&namespace, entry, store_meta).await {
-        Ok(_) => {
+    let provenance = match mcp_write_provenance(&namespace) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "memory_store refused: malformed host env");
+            return mcp_error(&malformed_host_env(&e));
+        }
+    };
+    match memory
+        .store_temporal_outcome(&namespace, entry, store_meta, provenance)
+        .await
+    {
+        Ok(duduclaw_memory::TemporalWriteOutcome::Fenced(r)) => {
+            mcp_fenced_error(&namespace, "mcp_memory_store", &r)
+        }
+        Ok(duduclaw_memory::TemporalWriteOutcome::Refused(r)) => {
+            mcp_error(&format!("Error storing memory: supersession trust guard refused write: {r}"))
+        }
+        Ok(duduclaw_memory::TemporalWriteOutcome::Stored(_)) => {
             // MCP spec requires top-level `memory_id` for client-side chaining
             // (e.g. immediate memory_read after memory_store).
             // `id` is preserved for backward compat; `memory_id` is the canonical field.
@@ -892,6 +1207,13 @@ pub async fn handle_user_profile_record(
     // The AI employee's record of a user is stamped with the `user_profile`
     // origin class (ceiling 0.6, below operator-approved values) — see
     // `duduclaw_memory::origin::USER_PROFILE`.
+    let provenance = match mcp_write_provenance(&namespace) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "user_profile_record refused: malformed host env");
+            return mcp_error(&malformed_host_env(&e));
+        }
+    };
     match duduclaw_memory::user_profile::record_trait_outcome(
         memory,
         &namespace,
@@ -900,9 +1222,13 @@ pub async fn handle_user_profile_record(
         value,
         duduclaw_memory::origin::USER_PROFILE.name,
         origin_trust,
+        provenance,
     )
     .await
     {
+        Ok(duduclaw_memory::TemporalWriteOutcome::Fenced(r)) => {
+            mcp_fenced_error(&namespace, "mcp_user_profile_record", &r)
+        }
         Ok(duduclaw_memory::TemporalWriteOutcome::Stored(id)) => mcp_text(serde_json::json!({
             "memory_id": id,
             "user_id": user_id,
@@ -969,6 +1295,89 @@ pub async fn handle_user_code_profile(
 
 #[cfg(test)]
 mod tests {
+    /// F12: in a dispatch run with no upstream pair, any value of the
+    /// upstream-unknown marker (not only `1`) records the upstream as unknown.
+    #[test]
+    fn any_upstream_unknown_value_marks_the_upstream() {
+        for v in ["1", "0", "", "yes"] {
+            let env = super::McpTurnEnv {
+                run_session: Some("dispatch:bob".into()),
+                run: Some("r1".into()),
+                upstream_unknown: Some(v.into()),
+                ..Default::default()
+            };
+            let kinds: Vec<duduclaw_memory::SourceKind> = super::mcp_write_sources_with("bob", &env)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.kind)
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    duduclaw_memory::SourceKind::UpstreamUnknown,
+                    duduclaw_memory::SourceKind::DispatchRun
+                ],
+                "{v:?}"
+            );
+        }
+    }
+
+    /// `.mcp.json` platform fix, item 3: a host variable of the process's own
+    /// identity that is set but blank (or half of a pair) refuses the write.
+    #[test]
+    fn blank_or_half_own_identity_variables_are_refused() {
+        let at = duduclaw_memory::format_ts(chrono::Utc::now());
+        let refused = [
+            super::McpTurnEnv {
+                turn: Some("".into()),
+                session: Some("telegram:777".into()),
+                ..Default::default()
+            },
+            super::McpTurnEnv {
+                turn: Some("t-1".into()),
+                session: Some(" ".into()),
+                ..Default::default()
+            },
+            super::McpTurnEnv {
+                session: Some("".into()),
+                ..Default::default()
+            },
+            super::McpTurnEnv {
+                run: Some("".into()),
+                run_session: Some("dispatch:bob".into()),
+                ..Default::default()
+            },
+            super::McpTurnEnv {
+                run_session: Some("dispatch:bob".into()),
+                ..Default::default()
+            },
+            super::McpTurnEnv {
+                user_seq: Some("1".into()),
+                user_at: Some(at.clone()),
+                session: Some("telegram:777".into()),
+                ..Default::default()
+            },
+        ];
+        for env in refused {
+            assert!(super::mcp_write_sources_with("agnes", &env).is_err(), "{env:?}");
+        }
+        // In a dispatch run a blank upstream half is the upstream's problem: the
+        // write keeps its run and records the upstream as unknown.
+        let upstream = super::McpTurnEnv {
+            run_session: Some("dispatch:bob".into()),
+            run: Some("r1".into()),
+            turn: Some("".into()),
+            session: Some("telegram:777".into()),
+            ..Default::default()
+        };
+        let kinds: Vec<duduclaw_memory::SourceKind> = super::mcp_write_sources_with("bob", &upstream)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.kind)
+            .collect();
+        assert_eq!(kinds, vec![duduclaw_memory::SourceKind::UpstreamUnknown, duduclaw_memory::SourceKind::DispatchRun]);
+    }
+
     use super::*;
     use duduclaw_memory::SqliteMemoryEngine;
 
@@ -1622,7 +2031,7 @@ mod tests {
                     object: Some("7".into()),
                     origin: Some("operator".into()),
                     ..Default::default()
-                },
+                }, duduclaw_memory::lineage::Provenance::test_only(),
             )
             .await
             .unwrap();

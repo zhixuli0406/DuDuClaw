@@ -3,6 +3,11 @@ name = "duduclaw-memory"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Pause / fault points on the publish and forget-apply paths, for other
+# crates' race tests (enable through a dev-dependency). Off in production.
+test-hooks = []
+
 [dependencies]
 duduclaw-core = { workspace = true }
 tokio = { workspace = true }
@@ -27,3 +32,6 @@ ignore = "0.4.27"
 
 [dev-dependencies]
 tempfile = "3"
+# Integration tests (`tests/`) build the library without `cfg(test)`; they get
+# `Provenance::test_only` through the feature.
+duduclaw-memory = { path = ".", features = ["test-hooks"] }

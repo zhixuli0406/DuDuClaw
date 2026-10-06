@@ -170,6 +170,8 @@ impl WorkflowService {
             reply_channel: None,
             turn_id: None,
             session_id: None,
+            // A workflow step has no upstream channel turn to lose.
+            upstream_unknown: false,
         };
         if queue.get_by_id(message_id).await?.is_none() {
             queue.enqueue(&message).await?;

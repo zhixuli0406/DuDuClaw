@@ -288,8 +288,14 @@ pub async fn maybe_induce_task_rule(
         ..Default::default()
     };
 
+    // System content (G15): induced from repeated task transitions.
     engine
-        .store_temporal(agent_id, entry, meta)
+        .store_temporal(
+            agent_id,
+            entry,
+            meta,
+            duduclaw_memory::lineage::Provenance::System { producer: "task_rule_induce" },
+        )
         .await
         .map(Some)
         .map_err(|e| e.to_string())

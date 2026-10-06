@@ -750,6 +750,19 @@ pub(super) async fn build_reply_with_session_inner(
             None
         }
     };
+    // P2-B: the turn's memory sources are the stored rows' ids (host-made,
+    // never from the model). A message that could not be saved has none.
+    let mut turn_sources = crate::memory_provenance::TurnSources {
+        user: user_message_id.map(|id| {
+            crate::memory_provenance::channel_message_source(
+                session_id,
+                id,
+                &sanitized_text,
+                chrono::Utc::now(),
+            )
+        }),
+        assistant: None,
+    };
 
     // Build structured conversation history from session (for native multi-turn).
     // Filter out "system" role messages — these are post-compression summaries
@@ -1536,6 +1549,15 @@ pub(super) async fn build_reply_with_session_inner(
         .scope(Some(session_id.to_string()), cli_future);
     let cli_future =
         duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some(turn_id.clone()), cli_future);
+    // P2-B: the user message of this turn, so MCP memory writes made during
+    // it carry that message as a source.
+    let cli_future = crate::memory_provenance::TURN_USER_MESSAGE.scope(
+        turn_sources.user.as_ref().and_then(|s| {
+            s.seq
+                .map(|seq| (seq, duduclaw_memory::format_ts(s.observed_at)))
+        }),
+        cli_future,
+    );
     // RFC-22 P1-7: scope CHANNEL_REPLY_AGENT_ID so spawn_claude_cli_with_env
     // can record cost_telemetry against the correct agent. agent_id is empty
     // when no agent resolved — scope an empty string in that case; the spawn
@@ -1862,7 +1884,15 @@ pub(super) async fn build_reply_with_session_inner(
             .append_message_with_id(session_id, "assistant", &reply, reply_tokens)
             .await
         {
-            Ok(message_id) => record_turn_assistant_message(session_id, message_id),
+            Ok(message_id) => {
+                record_turn_assistant_message(session_id, message_id);
+                turn_sources.assistant = Some(crate::memory_provenance::channel_message_source(
+                    session_id,
+                    message_id,
+                    &reply,
+                    chrono::Utc::now(),
+                ));
+            }
             Err(e) => warn!("Failed to save assistant message to session: {e}"),
         }
 
@@ -1928,6 +1958,7 @@ pub(super) async fn build_reply_with_session_inner(
                     .map(crate::runtime_config::agent_utility_model)
                     .unwrap_or_else(|| crate::runtime_config::DEFAULT_UTILITY_MODEL.to_string());
                 let home_for_dec = ctx.home_dir.clone();
+                let decision_provenance = turn_sources.assistant_provenance();
                 let ctx_meta = {
                     let (ch, cid) = parse_session_id_parts(session_id);
                     serde_json::json!({ "channel": ch, "chat_id": cid, "session_id": session_id })
@@ -1988,6 +2019,12 @@ pub(super) async fn build_reply_with_session_inner(
                     };
 
                     let id = crate::decision_capture::decision_id(&agent_for_dec, &source_msg);
+                    // P2-B: a decision is offered in the assistant message; no
+                    // saved message ⇒ no source ⇒ not captured.
+                    let Some(decision_provenance) = decision_provenance else {
+                        tracing::debug!("decision capture: reply has no recorded source, skipped");
+                        return;
+                    };
                     // SqliteMemoryEngine is !Send (rusqlite) — persist on a blocking thread.
                     let _ = tokio::task::spawn_blocking(move || {
                         // H4: single construction point.
@@ -2008,6 +2045,7 @@ pub(super) async fn build_reply_with_session_inner(
                             &id,
                             &draft,
                             ctx_meta,
+                            decision_provenance,
                         )) {
                             Ok(()) => {
                                 crate::metrics::global_metrics().decision_captured();
@@ -2019,7 +2057,14 @@ pub(super) async fn build_reply_with_session_inner(
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, "decision capture: persist failed")
+                                if !crate::memory_provenance::record_fenced_error(
+                                    &home_for_dec,
+                                    &agent_for_dec,
+                                    "decision_capture",
+                                    &e,
+                                ) {
+                                    tracing::warn!(error = %e, "decision capture: persist failed")
+                                }
                             }
                         }
                     })
@@ -2039,6 +2084,7 @@ pub(super) async fn build_reply_with_session_inner(
                 let session_for_res = session_id.to_string();
                 let home_for_res = ctx.home_dir.clone();
                 let home_for_res_engine = home_for_res.clone();
+                let choice_provenance = turn_sources.user_provenance();
                 tokio::spawn(async move {
                     let _ = tokio::task::spawn_blocking(move || {
                         // H4: single construction point.
@@ -2060,7 +2106,18 @@ pub(super) async fn build_reply_with_session_inner(
                         if let Some((id, key)) =
                             crate::decision_capture::detect_decision_reference(&user_text, &open)
                         {
-                            match rt.block_on(engine.resolve_decision(&agent_for_res, &id, &key)) {
+                            // P2-B: the choice is the user's message (the
+                            // engine adds the decision rows as parents).
+                            let Some(choice_provenance) = choice_provenance else {
+                                tracing::debug!("decision auto-resolve: user message has no recorded source");
+                                return;
+                            };
+                            match rt.block_on(engine.resolve_decision(
+                                &agent_for_res,
+                                &id,
+                                &key,
+                                choice_provenance,
+                            )) {
                                 Ok(duduclaw_memory::DecisionResolveOutcome::Resolved {
                                     chosen_key,
                                     ..
@@ -2077,7 +2134,14 @@ pub(super) async fn build_reply_with_session_inner(
                                     tracing::debug!(?other, "decision auto-resolve: no-op outcome")
                                 }
                                 Err(e) => {
-                                    tracing::warn!(error = %e, "decision auto-resolve failed")
+                                    if !crate::memory_provenance::record_fenced_error(
+                                        &home_for_res,
+                                        &agent_for_res,
+                                        "decision_resolve",
+                                        &e,
+                                    ) {
+                                        tracing::warn!(error = %e, "decision auto-resolve failed")
+                                    }
                                 }
                             }
                             return;
@@ -2220,7 +2284,13 @@ pub(super) async fn build_reply_with_session_inner(
                 let home_for_facts = ctx.home_dir.clone();
                 let home_for_activity = ctx.home_dir.clone();
                 let tx_for_activity = ctx.event_tx.clone();
+                let fact_provenance = turn_sources.provenance();
                 tokio::spawn(async move {
+                    // P2-B: key facts carry the turn's two messages.
+                    let Some(fact_provenance) = fact_provenance else {
+                        debug!("key-fact extraction skipped: turn has no recorded source");
+                        return;
+                    };
                     let prompt = format!(
                         "Extract 2-4 key factual insights from this conversation turn \
                          that would be useful in FUTURE conversations with this user. \
@@ -2273,12 +2343,26 @@ pub(super) async fn build_reply_with_session_inner(
                                     continue;
                                 }
                             }
-                            if rt.block_on(engine.store_fact(
+                            match rt.block_on(engine.store_fact_outcome(
                                 &agent_id_for_facts, fact,
                                 &channel_for_facts, &chat_id_for_facts,
                                 &session_for_facts,
-                            )).is_ok() {
-                                stored += 1;
+                                fact_provenance.clone(),
+                            )) {
+                                Ok(duduclaw_memory::FactWriteOutcome::Stored(_)) => stored += 1,
+                                Ok(duduclaw_memory::FactWriteOutcome::Fenced(r)) => {
+                                    crate::memory_provenance::record_fenced(
+                                        &home_for_fact_store,
+                                        &agent_id_for_facts,
+                                        "key_fact",
+                                        &r,
+                                    );
+                                    // Every fact of this turn shares the source.
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "key fact not stored");
+                                }
                             }
                         }
                         stored
@@ -2314,6 +2398,7 @@ pub(super) async fn build_reply_with_session_inner(
             let gvu = ctx.gvu_loop.clone();
             let user_id_for_pred = user_id.to_string();
             let agent_id_for_pred = agent_id.clone();
+            let episodic_provenance = turn_sources.provenance();
             let session_id_for_pred = session_id.to_string();
             let turn_id_for_pred = turn_id.clone();
             let text_clone = text.to_string();
@@ -2925,7 +3010,12 @@ pub(super) async fn build_reply_with_session_inner(
                         // `memory_migrate::merge_per_agent_memory_dbs`.
                         if memory_db_path_for_pred.is_none() {
                             debug!(agent = %agent_id_for_pred, "Cognitive memory disabled — episodic observation not persisted");
-                        } else if let Some(ref db_path) = memory_db_path_for_pred {
+                        } else if episodic_provenance.is_none() {
+                            // P2-B: no recorded source for this turn.
+                            debug!(agent = %agent_id_for_pred, "episodic observation not persisted: turn has no recorded source");
+                        } else if let (Some(db_path), Some(ep_prov)) =
+                            (memory_db_path_for_pred.as_ref(), episodic_provenance.clone())
+                        {
                             match crate::memory_factory::build_memory_engine(
                                 db_path,
                                 &home_for_pred,
@@ -2952,11 +3042,23 @@ pub(super) async fn build_reply_with_session_inner(
                                         ..Default::default()
                                     };
                                     match engine
-                                        .store_temporal(&agent_id_for_pred, entry, ep_meta)
+                                        .store_temporal(
+                                            &agent_id_for_pred,
+                                            entry,
+                                            ep_meta,
+                                            ep_prov,
+                                        )
                                         .await
                                     {
                                         Err(e) => {
-                                            warn!(agent = %agent_id_for_pred, "Failed to store episodic memory: {e}");
+                                            if !crate::memory_provenance::record_fenced_error(
+                                                &home_for_pred,
+                                                &agent_id_for_pred,
+                                                "prediction_episodic",
+                                                &e,
+                                            ) {
+                                                warn!(agent = %agent_id_for_pred, "Failed to store episodic memory: {e}");
+                                            }
                                         }
                                         // WP6: this is the "對話餵資料 → 記憶"
                                         // path. Tell the dashboard so
@@ -3300,6 +3402,7 @@ pub(super) async fn build_reply_with_session_inner(
             // R-L1: the reply-channel task-local does not cross the spawn
             // below; capture the originating conversation here.
             let origin_for_distill = crate::decision_notify::origin_target();
+            let sources_for_distill = turn_sources.all();
             tokio::spawn(async move {
                 if let Some(verdict) = delivery_verdict {
                     if !matches!(verdict.await, Ok(true)) {
@@ -3315,6 +3418,7 @@ pub(super) async fn build_reply_with_session_inner(
                     &memory_db_for_distill,
                     &session_for_distill,
                     origin_for_distill,
+                    sources_for_distill,
                 )
                 .await;
             });

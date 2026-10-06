@@ -99,12 +99,24 @@ pub(crate) async fn send_to_agent_with_ctx(
         // v1.10: Forward wiki RL trust feedback context so the dispatcher
         // can re-establish task_locals around the sub-agent dispatch and
         // sub-agent RAG citations attribute back to the originating turn.
-        let trust_turn_id = std::env::var(duduclaw_core::ENV_TRUST_TURN_ID)
-            .ok()
-            .filter(|s| !s.is_empty());
-        let trust_session_id = std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID)
-            .ok()
-            .filter(|s| !s.is_empty());
+        // P2-B: the upstream turn identity goes as a pair or not at all; the
+        // receiving run's memory sources depend on it.
+        let (trust_turn_id, trust_session_id, missing) =
+            duduclaw_gateway::memory_provenance::complete_upstream_pair(
+                std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
+                std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok(),
+            );
+        // Tell the receiver the upstream is unknown rather than absent.
+        let upstream_dropped = missing.is_some();
+        if let Some(missing) = missing {
+            duduclaw_gateway::memory_provenance::audit_upstream_identity(
+                home_dir,
+                duduclaw_gateway::memory_provenance::AUDIT_UPSTREAM_DROPPED,
+                caller,
+                &msg_id,
+                missing,
+            );
+        }
         tokio::task::spawn_blocking(move || -> bool {
             let Ok(conn) = rusqlite::Connection::open(&db_path) else {
                 return false;
@@ -113,8 +125,9 @@ pub(crate) async fn send_to_agent_with_ctx(
             let inserted = conn.execute(
                 "INSERT OR IGNORE INTO message_queue \
                  (id, sender, target, payload, status, retry_count, delegation_depth, \
-                  origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id) \
-                 VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id, \
+                  upstream_unknown) \
+                 VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     msg_id_cl,
                     caller_cl,
@@ -127,6 +140,7 @@ pub(crate) async fn send_to_agent_with_ctx(
                     reply_channel,
                     trust_turn_id,
                     trust_session_id,
+                    upstream_dropped,
                 ],
             );
             if let Ok(rows) = inserted {

@@ -44,7 +44,7 @@ duduclaw eval evals/support --report eval-report.json
 | `--baseline <report.json>` | 與先前寫出的 `--report` 檔案做成對統計比較。見[誠實統計](#誠實統計)。 |
 | `--mde <fraction>` | 解析度檢查所宣告的最小可偵測效應，以通過率的小數表示（預設 `0.10` = 10 個百分點）。見[誠實統計](#誠實統計)。 |
 | `--cluster-by <key>` | cluster-robust 標準誤的分群鍵。目前只實作 `dir`（預設，以每個 case 所在目錄分群），其他值一律拒絕。見[誠實統計](#誠實統計)。 |
-| `--runtime <id>` | 由哪個後端執行每個 case（`claude` 為預設，也是 P2 之前的路徑；另有 `codex`、`gemini`（v1.67.0 棄用，v1.70.0 移除，見 [deprecations](deprecations.md#gemini-cli-runtime)）、`antigravity`、`grok`、`openai_compat`，或任何其他 catalog 內的 runtime id）。未知的 id 會被拒絕，不會當成 `claude`。**省略時採用各 case 自己的 `[case] runtime`，沒有則用 `claude`。** 見[能力矩陣](#能力矩陣--matrix)。 |
+| `--runtime <id>` | 由哪個後端執行每個 case（`claude` 為預設，也是 P2 之前的路徑；另有 `codex`、`gemini`（v1.67.0 棄用，v1.71.0 移除，見 [deprecations](deprecations.md#gemini-cli-runtime)）、`antigravity`、`grok`、`openai_compat`，或任何其他 catalog 內的 runtime id）。未知的 id 會被拒絕，不會當成 `claude`。**省略時採用各 case 自己的 `[case] runtime`，沒有則用 `claude`。** 見[能力矩陣](#能力矩陣--matrix)。 |
 | `--model <id>` | 在 `--runtime` 範圍內，對每個 case 覆寫 model id。省略時採用各 case 自己的 `[case] model`。報告標頭的 `model` 一律寫明實際跑的是哪個。 |
 | `--paired-seeds` | 為每組 `(case id, repeat)` 推導出確定性的 seed，讓同一批抽樣能跨 model 對齊（Miller 的成對設計）。**只記錄，不套用**：本版本沒有任何 runtime 能吃 seed，每次執行都會以 `seed_applied: false` 註明這點。 |
 | `--agent <id>` | 改用**這個**已佈署的 agent 執行每個 case，而不是各 case 自己的 `[case] agent`。報告標頭會記為 `agent_override`，每次執行也會記錄 `agent`。見[借用單一 agent](#借用單一-agent--agent)。 |

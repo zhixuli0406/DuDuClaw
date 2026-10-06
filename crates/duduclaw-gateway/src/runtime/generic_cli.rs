@@ -603,6 +603,14 @@ impl GenericCliRuntime {
             for (k, v) in duduclaw_core::mcp_forward_env_vars() {
                 cmd.env(k, v);
             }
+            // P2-B N4: the turn/run source identity, same channel as the id.
+            // N13: this CLI inherits the gateway's environment, so a
+            // `DUDUCLAW_UPSTREAM_UNKNOWN` the operator happened to export
+            // would mark every run's writes; only the scoped value counts.
+            cmd.env_remove(duduclaw_core::ENV_UPSTREAM_UNKNOWN);
+            for (k, v) in crate::memory_provenance::turn_source_env_pairs() {
+                cmd.env(k, v);
+            }
         }
 
         let stdin_prompt = self.spec.headless.prompt_via_stdin();
@@ -1038,6 +1046,29 @@ mod tests {
         assert_eq!(resp.content, "the plain answer");
         assert_eq!(resp.runtime_name, "copilot");
         assert!(resp.input_tokens > 0, "tokens are estimated, not zero");
+    }
+
+    /// P2-B N4: the turn and run in scope reach the CLI's env, which its
+    /// duduclaw MCP child inherits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn turn_and_run_identity_reach_the_spawn_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_bin(
+            dir.path(),
+            "copilot",
+            "echo \"$DUDUCLAW_TURN_ID|$DUDUCLAW_SESSION_ID|$DUDUCLAW_DISPATCH_RUN_ID\"",
+        );
+        let rt =
+            GenericCliRuntime::with_program(spec_for("copilot").unwrap(), bin.to_string_lossy());
+        let ctx = ctx(dir.path());
+        let fut = rt.execute("hi", &ctx);
+        let fut = crate::memory_provenance::DISPATCH_RUN
+            .scope(Some(("cron:tester".into(), "abc123".into())), fut);
+        let fut = duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(Some("telegram:9".into()), fut);
+        let fut = duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some("t-77".into()), fut);
+        let resp = fut.await.unwrap();
+        assert_eq!(resp.content, "t-77|telegram:9|abc123");
     }
 
     #[cfg(unix)]

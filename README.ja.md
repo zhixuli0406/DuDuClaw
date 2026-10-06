@@ -82,7 +82,7 @@ Rust ワークスペースは 24 crate 構成:基盤の `duduclaw-core`、サー
 
 DuDuClaw 自体には LLM が含まれません。まず AI の頭脳を用意してください(ブラウザのセットアップウィザードで後から設定することも可能です):
 
-- 対応する AI CLI を 1 つ入れて API キーを設定する。例:[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、Antigravity(全一覧は [multi-runtime](docs/features/ja-JP/13-multi-runtime.md)。[Gemini CLI](https://github.com/google-gemini/gemini-cli) は非推奨で v1.70.0 で削除)。Anthropic と Google はサードパーティ製品で使われる個人向けサブスクリプションのトークンをブロックしており、停止されたアカウントもあるため、API キーを使ってください
+- 対応する AI CLI を 1 つ入れて API キーを設定する。例:[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、Antigravity(全一覧は [multi-runtime](docs/features/ja-JP/13-multi-runtime.md)。[Gemini CLI](https://github.com/google-gemini/gemini-cli) は非推奨で v1.71.0 で削除)。Anthropic と Google はサードパーティ製品で使われる個人向けサブスクリプションのトークンをブロックしており、停止されたアカウントもあるため、API キーを使ってください
 - 任意の OpenAI 互換プロバイダの API キーを用意する
 - あるいはローカルモデルを OpenAI 互換サーバー(llama-server、Ollama、vLLM、llamafile)の背後で動かす(クラウドアカウント不要)
 
@@ -173,7 +173,7 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 | 領域 | 内蔵機能 | 詳細 |
 |------|----------|------|
 | チャネル | 11 チャネル(Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat)、エージェントごとの bot、ホット起動/停止、プラットフォーム最適レンダリング、入力中インジケータ、長時間タスクの進捗ボード。Telegram の音声メッセージは OpenAI Whisper API で文字起こし。Discord のボイスチャンネルは既定外のビルド機能で、リリース版バイナリには含まれない | [docs/features](docs/features/README.md) |
-| マルチランタイム | 13 のランタイム ID:Claude Code / Codex / Antigravity / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode / Gemini CLI(非推奨、v1.70.0 で削除)と OpenAI-compat。自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [docs/features/13](docs/features/ja-JP/13-multi-runtime.md) |
+| マルチランタイム | 13 のランタイム ID:Claude Code / Codex / Antigravity / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode / Gemini CLI(非推奨、v1.71.0 で削除)と OpenAI-compat。自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [docs/features/13](docs/features/ja-JP/13-multi-runtime.md) |
 | 統一 LLM API 層 | `duduclaw-llm` が 4 つのネイティブプロトコル(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat)を単一の正規化リクエストでカバー。8 つの OpenAI-compat プリセット(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 価格レジストリ + クロスプロバイダ fallback を内蔵 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | MCP サーバー | 249 ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート。外部クライアントのキーは既定で 7 つの基本ツールのみ使え、オペレーターがメモリ・wiki・メッセージ系のスコープを追加付与できる。コネクタ・実行系・管理系のツールは外部に公開しない | [docs/api](docs/api/README.md) |
 | メモリ | SQLite 時系列メモリ(事実の置換チェーン)、HippoRAG-lite 知識グラフ検索(Personalized PageRank)、エビングハウス忘却曲線によるアーカイブ、エージェント横断の共有 wiki | [docs/features](docs/features/README.md) |

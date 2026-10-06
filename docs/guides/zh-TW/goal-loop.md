@@ -413,7 +413,7 @@ AI 員工回報完成、任務進入驗收時，在呼叫驗收判官之前會�
 開啟後，goal loop 在每次派工前會依過往同類任務的統計先「預測」這次執行
 大概會如何（會不會失敗、大概動用哪些工具類別），執行結束後把預測與實際
 觀察比對並記錄成轉移，讓系統對「做這類事會發生什麼」累積出任務層的世界
-模型。每個 runtime 都會跑這套流程，但看得到多少，取決於該 runtime 有沒有把原生工具事件餵給收集器。Claude（派工的 stream-json 路徑）、Codex、Gemini CLI（v1.67.0 起棄用，v1.70.0 移除）、Antigravity 與 OpenAI 相容的 agent 會記錄原生工具事件，觀察可以達到 `Full`。Grok 與七個通用 print-mode CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）沒有接收集器，觀察只會是 `McpOnly`（只靠 `tool_calls.jsonl`），該輪在那個檔案裡沒有紀錄時則是 `None`。流程如下：
+模型。每個 runtime 都會跑這套流程，但看得到多少，取決於該 runtime 有沒有把原生工具事件餵給收集器。Claude（派工的 stream-json 路徑）、Codex、Gemini CLI（v1.67.0 起棄用，v1.71.0 移除）、Antigravity 與 OpenAI 相容的 agent 會記錄原生工具事件，觀察可以達到 `Full`。Grok 與七個通用 print-mode CLI（Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）沒有接收集器，觀察只會是 `McpOnly`（只靠 `tool_calls.jsonl`），該輪在那個檔案裡沒有紀錄時則是 `None`。流程如下：
 
 - **預測分層退化**：有同類統計用統計、沒有就用整體邊際、再沒有用先驗
   預設值，冷啟動不花任何 LLM 費用。

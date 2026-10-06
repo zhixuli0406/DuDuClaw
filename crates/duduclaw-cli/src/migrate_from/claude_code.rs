@@ -371,7 +371,19 @@ async fn import_memory_shards(
             ..Default::default()
         };
 
-        store_import_memory(engine, ctx, report, agent_id, &label, &content, tags, meta).await;
+        let source_id = path.display().to_string();
+        store_import_memory(
+            engine,
+            ctx,
+            report,
+            agent_id,
+            &label,
+            &content,
+            tags,
+            meta,
+            &source_id,
+        )
+        .await;
         caps.memory_written += 1;
     }
 
@@ -697,6 +709,7 @@ async fn import_session_summary(
             "session-summary".to_string(),
         ],
         meta,
+        &format!("claude-code-session:{uuid}"),
     )
     .await;
     caps.memory_written += 1;

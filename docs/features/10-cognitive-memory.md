@@ -113,6 +113,14 @@ Stability `S` depends on importance and recall:
 
 This prevents the memory store from growing unboundedly. Old, unimportant memories naturally fade away, keeping the retrieval system fast and focused.
 
+### Where a Memory Came From, and Forgetting by Source
+
+Decay removes memories that nobody uses. Sometimes you need the opposite: remove memories that someone is still using, because the conversation they came from should not have been remembered. For that, every memory write now records its source: which message of which conversation, which scheduled or dispatched run, or which imported file. A memory derived from other memories carries all of their sources.
+
+An operator can run `duduclaw memory forget-source` to plan the removal of one source (one message, a whole conversation, one run, one imported file), have an Admin approve it in the dashboard, and apply it. Apply hard-deletes the memories that source produced, directly or through derivation, and records a block so the same source cannot be learned again. It does not delete the conversation text, sent messages or backups, and some places that can feed content back to the employee are outside its reach. Memories written before this feature have no recorded source and are not deleted. This has not yet been verified on a live gateway with real channels.
+
+How the record and the block work: [Memory Intelligence](20-memory-intelligence.md#source-lineage-and-forgetting-by-source). Steps: [Forgetting a conversation, a scheduled run or an imported file](../guides/memory-and-knowledge.md#45-forgetting-a-conversation-a-scheduled-run-or-an-imported-file).
+
 ---
 
 ## Full-Text Search

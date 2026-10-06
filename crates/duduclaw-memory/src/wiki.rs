@@ -715,6 +715,41 @@ impl WikiStore {
         Ok(())
     }
 
+    /// Like [`Self::delete_page`], but a failure to drop the page from the
+    /// index is an error instead of a warning, so the caller can retry. A
+    /// retry finds the file gone and only repairs the index (forget by
+    /// source, P2-B L-2).
+    pub fn delete_page_checked(&self, path: &str) -> Result<()> {
+        self.validate_page_path(path)?;
+        let _fence = self.delivery_fence().exclusive_for_write()?;
+        let full = self.wiki_dir.join(path);
+        let existed = full.exists();
+        if existed {
+            std::fs::remove_file(&full)
+                .map_err(|e| DuDuClawError::Memory(format!("delete {path}: {e}")))?;
+        }
+        let indexed = match std::fs::read_to_string(self.wiki_dir.join("_index.md")) {
+            Ok(t) => t.contains(&format!("]({path})")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(DuDuClawError::Memory(format!("read index for {path}: {e}")));
+            }
+        };
+        if indexed {
+            self.remove_from_index(path).map_err(|e| {
+                DuDuClawError::Memory(format!("remove {path} from index: {e}"))
+            })?;
+        }
+        self.fts_sync_remove(path);
+        if existed {
+            if let Err(e) = self.append_log("delete", path) {
+                warn!("Failed to log delete {path}: {e}");
+            }
+            info!(page = path, "Wiki page deleted");
+        }
+        Ok(())
+    }
+
     // ── Search ──────────────────────────────────────────────────
 
     /// Full-text keyword search across all wiki pages.
