@@ -148,6 +148,21 @@ impl MethodHandler {
                     "電腦操作工作區的管理請求只能由管理員（Admin）核准。",
                 );
             }
+            // P2-A: a responsibility change filed from the operator CLI widens
+            // spending or authority — only a current Admin may decide it (role
+            // re-read from users.db). An expired one is refused above by the
+            // shared dashboard-only stale check.
+            if rec.action_kind == crate::responsibility::operator_gate::ACTION_KIND
+                && (!ctx.is_admin()
+                    || crate::approval::require_current_dashboard_role_in_home(
+                        &self.home_dir,
+                        ctx,
+                        UserRole::Admin,
+                    )
+                    .is_err())
+            {
+                return WsFrame::error_response("", "這類持續任務變更只能由管理員決定。");
+            }
             // Forget by source deletes memory irreversibly: Admin only.
             if rec.action_kind
                 == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE

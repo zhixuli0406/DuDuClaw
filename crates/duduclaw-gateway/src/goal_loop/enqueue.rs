@@ -175,7 +175,11 @@ impl GoalLoopDriver {
             episode_id: task.id.clone(),
             round: Some(task.revision_round + 1),
         };
+        // P2-A: registered before the spawn so a stop never reports
+        // "stopped" while this round may still run (the queue never sees it).
+        let round_guard = crate::responsibility::team_activity::RoundGuard::register(&task.id);
         tokio::spawn(async move {
+            let _round_guard = round_guard;
             let outcome = crate::runtime::GOAL_ROUND_ATTRIBUTION
                 .scope(
                     goal_attr,
@@ -257,6 +261,38 @@ pub(crate) async fn enqueue_goal_work(
     iter: u32,
     state_text: &str,
 ) -> Result<String, String> {
+    let payload = build_goal_payload(task, iter, state_text);
+    let msg = goal_queue_message(uuid::Uuid::new_v4().to_string(), task, payload);
+    let result = queue.enqueue(&msg).await.map(|()| msg.id.clone());
+    // I-1c: the plan has now been injected into this round's payload —
+    // consume it so it is not re-injected on every later round. Cleared
+    // only after a successful enqueue (an enqueue failure leaves it in
+    // place, so the next tick's retry still carries the plan). A failed
+    // clear is logged and otherwise harmless: the plan is simply
+    // re-injected next dispatch, which repeats guidance rather than
+    // losing anything.
+    if result.is_ok() {
+        clear_consumed_plan(store, task).await;
+    }
+    result
+}
+
+/// I-1c: clear an injected plan-first plan once its round is enqueued.
+pub(super) async fn clear_consumed_plan(store: &Arc<TaskStore>, task: &TaskRow) {
+    if task.plan_pending.is_some() {
+        if let Err(e) = store.clear_plan_pending(&task.id).await {
+            warn!(
+                task = %task.id,
+                error = %e,
+                "goal loop: failed to clear plan_pending after injecting it — will re-inject next dispatch (harmless)"
+            );
+        }
+    }
+}
+
+/// The work payload of one goal round (P2-A: shared by the random-id rail
+/// above and the fixed-id durable rail, so the text is one implementation).
+pub(super) fn build_goal_payload(task: &TaskRow, iter: u32, state_text: &str) -> String {
     let marker = format!("[goal-loop task_id={} iter={iter}]", task.id);
     // I-3a: a task continued from `done`/`failed`/`cancelled` via the
     // dashboard's "接著做" action stamps `judge_feedback` with
@@ -334,9 +370,13 @@ pub(crate) async fn enqueue_goal_work(
              說明原因。{feedback_block}{plan_block}",
         task.id, task.title, task.description,
     );
+    payload
+}
 
-    let msg = QueueMessage {
-        id: uuid::Uuid::new_v4().to_string(),
+/// The queue row of one goal round with the given message id.
+pub(super) fn goal_queue_message(id: String, task: &TaskRow, payload: String) -> QueueMessage {
+    QueueMessage {
+        id,
         sender: "goal-loop-driver".to_string(),
         target: task.assigned_to.clone(),
         payload,
@@ -360,24 +400,7 @@ pub(crate) async fn enqueue_goal_work(
         reply_channel: None,
         turn_id: None,
         session_id: None,
+        // P2-B: a goal round carries no upstream channel turn to lose.
         upstream_unknown: false,
-    };
-    let result = queue.enqueue(&msg).await.map(|()| msg.id.clone());
-    // I-1c: the plan has now been injected into this round's payload —
-    // consume it so it is not re-injected on every later round. Cleared
-    // only after a successful enqueue (an enqueue failure leaves it in
-    // place, so the next tick's retry still carries the plan). A failed
-    // clear is logged and otherwise harmless: the plan is simply
-    // re-injected next dispatch, which repeats guidance rather than
-    // losing anything.
-    if result.is_ok() && task.plan_pending.is_some() {
-        if let Err(e) = store.clear_plan_pending(&task.id).await {
-            warn!(
-                task = %task.id,
-                error = %e,
-                "goal loop: failed to clear plan_pending after injecting it — will re-inject next dispatch (harmless)"
-            );
-        }
     }
-    result
 }

@@ -241,6 +241,11 @@ async fn visible_tools(
     // an unresolved caller has no agent config to consult — in both cases the
     // dispatch gate denies, so hide the tools here too.
     let allow_db_sources = gated_caller && !member_invalid && !caps.db_sources.is_empty();
+    // P2-A: the responsibility tools refuse every call while the feature is
+    // off, and only an employee identity can use them — hidden otherwise.
+    let allow_responsibilities = gated_caller
+        && !member_invalid
+        && duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home_dir).enabled;
 
     // RFC-26: `[fork] enabled` is opt-in per agent and `mcp_fork`'s handlers
     // refuse every fork tool without it. Read through the same shared typed
@@ -314,6 +319,9 @@ async fn visible_tools(
         .filter(|t| allow_computer_use || !COMPUTER_USE_TOOLS.contains(&t.name))
         .filter(|t| allow_cu_workspace || !COMPUTER_WORKSPACE_TOOLS.contains(&t.name))
         .filter(|t| allow_fork || !FORK_TOOLS.contains(&t.name))
+        .filter(|t| {
+            allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name)
+        })
         // O7: PORTICO scoped tools without an active grant.
         .filter(|t| !scoped_without_grant.contains(t.name))
         // WP-7A bug2: internal per-agent capability filter (mirror of §3.45).

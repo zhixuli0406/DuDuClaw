@@ -473,6 +473,21 @@ impl ApprovalBroker {
         .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    /// Single-use claim of an approved request: `approved → invalidated`.
+    /// `true` only for the one caller whose update changed the row, so two
+    /// concurrent appliers can never both act on one approval.
+    pub async fn consume_approved(&self, id: &ApprovalId, reason: &str) -> Result<bool, String> {
+        let conn = self.store.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE approvals SET status='invalidated',invalidated_reason=?1
+                  WHERE id=?2 AND status='approved'",
+                params![reason, id.as_str()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n == 1)
+    }
 }
 
 /// Read fresh identity without creating an unrelated approvals database.

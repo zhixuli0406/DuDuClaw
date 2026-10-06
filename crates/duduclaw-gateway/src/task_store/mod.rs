@@ -48,8 +48,15 @@ mod goals;
 mod iterations;
 mod plans;
 mod pure;
+mod resp_occurrence;
+mod resp_schema;
+mod resp_notice;
+mod resp_types;
+mod responsibility;
 mod review;
 mod schema;
+mod steering;
+mod stop;
 mod tasks;
 
 #[cfg(test)]
@@ -58,6 +65,12 @@ mod tests;
 mod tests_survival_evidence;
 
 pub use authority::{TaskAuthoritySnapshot, task_snapshot_hash};
+pub use resp_occurrence::{MaterializeOutcome, MaterializeRequest, PeriodUsage};
+pub use resp_schema::{RESP_SCHEMA_OWNER, RESP_SCHEMA_VERSION};
+pub use resp_types::*;
+pub use responsibility::ResponsibilityContract;
+pub use steering::{DurableInfo, IntentBegin, NewSteering, SteeringSubmit};
+pub use stop::StopTreeOutcome;
 pub use plans::plan_order_for_insert;
 pub use pure::{
     deps_satisfied, introduces_dependency_cycle, introduces_parent_cycle, lease_is_expired,

@@ -69,6 +69,8 @@ pub(crate) async fn handle_tools_call(
             | "tasks_renew"
             | "tasks_complete"
             | "tasks_block"
+            | "responsibility_followup"
+            | "responsibility_ask"
             | "goals_create"
             | "plan_update_step"
             | "activity_post"
@@ -450,6 +452,12 @@ pub(crate) async fn handle_tools_call(
         "tasks_renew" => handle_tasks_renew(&arguments, home_dir, default_agent).await,
         "tasks_complete" => handle_tasks_complete(&arguments, home_dir, record_actor).await,
         "tasks_block" => handle_tasks_block(&arguments, home_dir, record_actor).await,
+        // P2-A continuous responsibilities (employee side)
+        "responsibility_get" => handle_responsibility_get(&arguments, home_dir, record_actor).await,
+        "responsibility_followup" => {
+            handle_responsibility_followup(&arguments, home_dir, record_actor).await
+        }
+        "responsibility_ask" => handle_responsibility_ask(&arguments, home_dir, record_actor).await,
         // Goal chain tools (G8)
         "goals_create" => handle_goals_create(&arguments, home_dir, default_agent).await,
         "goals_list" => handle_goals_list(&arguments, home_dir).await,

@@ -748,6 +748,8 @@ async fn call_claude_for_agent_impl(
     // every other caller passes and is behaviourally a no-op.
     overrides: DispatchOverrides,
 ) -> Result<String, String> {
+    #[cfg(test)]
+    crate::model_call_probe::record("claude_runner");
     let reg = registry.read().await;
 
     let agent = match preloaded {
@@ -1602,6 +1604,8 @@ fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
     // this process env too, but the explicit pairs keep the tool loop working
     // even if a future spawn path sanitizes the child env.
     envs.extend(duduclaw_core::mcp_forward_env_vars());
+    // P2-A H-2: the round this tool loop runs for (openai-compat runtime).
+    envs.extend(crate::runtime::round_task_env());
     // P2-B N4: the turn/run source identity, so the openai-compat tool loop's
     // memory writes are tied to their conversation like the CLI paths.
     envs.extend(crate::memory_provenance::turn_source_env_pairs());
@@ -4020,11 +4024,11 @@ fn prepare_claude_cmd(
         cmd.env(duduclaw_core::ENV_TRUST_SESSION_ID, &session_id);
     }
     // F5-D: the goal task this round runs for, from the dispatcher's own
-    // attribution, so approval cards raised by this round carry it.
-    if let Ok(task_id) = crate::runtime::GOAL_ROUND_ATTRIBUTION.try_with(|a| a.episode_id.clone()) {
-        if duduclaw_core::is_valid_agent_id(&task_id) {
-            cmd.env(duduclaw_core::ENV_TASK_ID, &task_id);
-        }
+    // attribution, so approval cards raised by this round carry it. P2-A
+    // reads the same variable for the parent of tasks created during a
+    // responsibility run (`runtime::round_task_env`, shared by every runtime).
+    if let Some((k, v)) = crate::runtime::round_task_env() {
+        cmd.env(k, v);
     }
     crate::memory_provenance::inject_turn_user_message_env(&mut cmd);
     crate::memory_provenance::inject_dispatch_run_env(&mut cmd);

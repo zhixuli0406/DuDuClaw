@@ -236,6 +236,18 @@ pub(crate) async fn handle_tasks_create(
         }
     }
 
+    // ── P2-A H-2 / S-M2: where the new task hangs ────────────────────────
+    // A schedule (cron routine or reminder) is not a sub-task: it takes no
+    // parent and is not held to the sub-task cap (M3-4).
+    let parent_task_id = if schedule.is_some() {
+        None
+    } else {
+        match resolve_parent(home_dir, actor, args, round_env_from_process().as_deref()).await {
+            Ok(p) => p,
+            Err(refusal) => return refusal,
+        }
+    };
+
     // ── O4 branch 1: kind="goal" ─────────────────────────────────────────
     // The SAME function the dashboard `tasks.goal_create` RPC calls — the
     // H9-G acceptance-contract freeze, the structured-outcome parse, the
@@ -284,6 +296,7 @@ pub(crate) async fn handle_tasks_create(
                 .get("plan_first")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            parent_task_id: parent_task_id.clone(),
             source_label: String::new(),
         };
         return match duduclaw_gateway::goal_create_core::create_goal_task(home_dir, &store, req)
@@ -366,10 +379,6 @@ pub(crate) async fn handle_tasks_create(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let parent_task_id = args
-        .get("parent_task_id")
-        .and_then(|v| v.as_str())
-        .map(String::from);
 
     let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
         Ok(s) => s,
@@ -913,4 +922,157 @@ mod criteria_tag_tests {
         r.criteria_ledger = Some("{}".into());
         assert_eq!(task_row_to_json(&r)["result_summary"], "完成");
     }
+}
+
+/// The round information the gateway put in this MCP server's environment
+/// ([`duduclaw_core::ENV_TASK_ID`], the same host-provided task id F5-D uses
+/// for approval cards). `None` only when the variable is absent; a value that
+/// is not valid Unicode comes back as an empty string, which
+/// [`resolve_parent`] refuses (H3-1: present-but-damaged is never read as
+/// "no round"; `duduclaw_core::host_task_id` would read it as absent).
+fn round_env_from_process() -> Option<String> {
+    std::env::var_os(duduclaw_core::ENV_TASK_ID).map(|v| v.into_string().unwrap_or_default())
+}
+
+/// A round value the host could have written: the same rule the gateway
+/// applies before setting it (`duduclaw_core::is_valid_agent_id`).
+fn round_value_well_formed(v: &str) -> bool {
+    duduclaw_core::is_valid_agent_id(v)
+}
+
+/// The parent a new task gets (P2-A H-2 / S-M2, third review M3-4 / H3-1).
+///
+/// - `round_env` is the gateway's round information. Absent (`None`): no
+///   round is known (no goal round, a Bash-started server, the Grok and
+///   Gemini runtimes) and the old rule applies. Present but empty or
+///   malformed: refused — a damaged value is not read as "no round".
+/// - Present and naming a task the caller works on (assignee or claimer)
+///   that belongs to a continuous-responsibility run's tree: that task is the
+///   default parent, and a `parent_task_id` the model gives must be that
+///   task or one of its descendants, otherwise the call is refused (a task
+///   cannot be hung outside the run to escape its cost cap or its stop).
+/// - Any other round (an ordinary goal round, a heartbeat wake-up, someone
+///   else's task): no default parent; the old rule applies.
+/// - Old rule: a model-given `parent_task_id` needs a relationship to the
+///   parent (assignee, claimer, creator, or the delegation predicate against
+///   the parent's assignee).
+/// - Operators keep what they asked for.
+/// - An employee cannot hang more than `MAX_CHILDREN_PER_TASK` open sub-tasks
+///   under one task.
+///
+/// Known dependency: an employee that can rewrite the `env` of its own MCP
+/// server entry could drop the variable entirely; closing that is the
+/// platform-level freeze of the `.mcp.json` duduclaw entry, not this check.
+pub(crate) async fn resolve_parent(
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+    args: &Value,
+    round_env: Option<&str>,
+) -> std::result::Result<Option<String>, Value> {
+    let parent = resolve_parent_inner(home_dir, actor, args, round_env).await?;
+    if let (Some(p), Some(_)) = (parent.as_deref(), actor.agent()) {
+        let store = duduclaw_gateway::task_store::TaskStore::open(home_dir)
+            .map_err(|e| tool_error(&format!("open task store: {e}")))?;
+        let n = store
+            .child_count(p)
+            .await
+            .map_err(|e| tool_error(&format!("count sub-tasks: {e}")))?;
+        if n >= duduclaw_gateway::task_store::MAX_CHILDREN_PER_TASK {
+            return Err(tool_error(&format!(
+                "tasks_create 遭拒：任務 {p} 底下已有 {n} 個尚未結束的子任務，達到上限。"
+            )));
+        }
+    }
+    Ok(parent)
+}
+
+async fn resolve_parent_inner(
+    home_dir: &Path,
+    actor: RecordActor<'_>,
+    args: &Value,
+    round_env: Option<&str>,
+) -> std::result::Result<Option<String>, Value> {
+    let requested = args
+        .get("parent_task_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    let Some(caller) = actor.agent().map(str::trim).filter(|c| !c.is_empty()) else {
+        return Ok(requested);
+    };
+    let store = duduclaw_gateway::task_store::TaskStore::open(home_dir)
+        .map_err(|e| tool_error(&format!("open task store: {e}")))?;
+    // The round this call runs in, only when it is the caller's own task in a
+    // responsibility run's tree; `None` means the old rule applies.
+    let run_round = match round_env {
+        None => None,
+        Some(r) if !round_value_well_formed(r) => {
+            return Err(tool_error(
+                "tasks_create 遭拒：這一輪的執行資訊不完整或格式不對，新任務沒有建立。",
+            ));
+        }
+        Some(r) => match store.get_task(r).await {
+            Ok(Some(t))
+                if t.assigned_to == caller || t.claimed_by.as_deref() == Some(caller) =>
+            {
+                let in_run = store
+                    .in_occurrence_tree(&t.id)
+                    .await
+                    .map_err(|e| tool_error(&format!("check round: {e}")))?;
+                in_run.then_some(t.id)
+            }
+            // Not this caller's task (a team role member, a reassigned task):
+            // the old rule. Runs are always solo, so this is never a run.
+            Ok(Some(_)) => None,
+            // The host named a round that cannot be read: refuse rather
+            // than create a task outside it.
+            Ok(None) => {
+                return Err(tool_error(
+                    "tasks_create 遭拒：無法確認這一輪執行的是哪個任務，新任務沒有建立。",
+                ));
+            }
+            Err(e) => return Err(tool_error(&format!("open round task: {e}"))),
+        },
+    };
+    if let Some(round) = run_round {
+        return match requested {
+            None => Ok(Some(round)),
+            Some(p) if p == round => Ok(Some(p)),
+            Some(p) => match store.is_descendant_of(&p, &round).await {
+                Ok(true) => Ok(Some(p)),
+                Ok(false) => Err(tool_error(&format!(
+                    "tasks_create 遭拒：這一輪執行的是持續任務的任務 {round}，新任務只能掛在它底下（parent_task_id 必須是它或它的子任務）。"
+                ))),
+                Err(e) => Err(tool_error(&format!("check parent: {e}"))),
+            },
+        };
+    }
+    // Old rule: the parent the model gave, if any, after the relationship
+    // check. A task created this way during a run is outside the run's tree
+    // unless the parent named is in it (`tasks_created_without_round_information`).
+    let Some(parent_id) = requested else {
+        return Ok(None);
+    };
+    let parent = match store.get_task(&parent_id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return Err(tool_error("tasks_create 遭拒：找不到指定的上層任務。")),
+        Err(e) => return Err(tool_error(&format!("open parent task: {e}"))),
+    };
+    let related = [Some(&parent.assigned_to), parent.claimed_by.as_ref(), Some(&parent.created_by)]
+        .into_iter()
+        .flatten()
+        .any(|who| who.trim() == caller);
+    if !related {
+        check_record_change_allowed(
+            home_dir,
+            actor,
+            &parent.assigned_to,
+            "tasks_create",
+            RecordKind::Task,
+        )
+        .await
+        .map_err(|reason| tool_error(&reason))?;
+    }
+    Ok(Some(parent_id))
 }

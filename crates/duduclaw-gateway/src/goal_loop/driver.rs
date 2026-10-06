@@ -32,11 +32,43 @@ impl GoalLoopDriver {
             concurrency_limit: None,
             concurrency_ttl_secs: duduclaw_core::ConcurrencyGateConfig::default()
                 .concurrency_lease_ttl_secs,
+            cost_source: None,
+            // A gate of its own: the server's instance is not reachable from
+            // the hot-respawned driver. Its in-memory hourly limit is backed by
+            // the durable per-window cap in `responsibility::notify`.
+            resp_feature_seen: std::sync::Mutex::new(None),
+            notice_scorer: Arc::new(crate::proactive_gate::ProactiveGate::new(
+                PathBuf::from("."),
+                Arc::new(crate::interruptibility::InterruptibilityTracker::new()),
+            )),
+            notice_sender: Arc::new(crate::responsibility::notify::ChannelSender),
+            instance_lock_home: None,
+            durable_repair_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Set the DuDuClaw home dir (per-agent autonomy + channel push).
+    /// Gate the P2-A housekeeping on this home's single-gateway lock (set by
+    /// the gateway; see [`Self::holds_instance_lock`]).
+    pub fn with_instance_lock(mut self, home_dir: PathBuf) -> Self {
+        self.instance_lock_home = Some(home_dir);
+        self
+    }
+
+    /// Whether this driver may run the P2-A housekeeping now: no lock gate
+    /// configured, or this process holds the home's gateway lock.
+    pub(super) fn holds_instance_lock(&self) -> bool {
+        self.instance_lock_home
+            .as_deref()
+            .is_none_or(duduclaw_core::gateway_instance::held)
+    }
+
     pub fn with_home_dir(mut self, home_dir: PathBuf) -> Self {
+        // P2-A C8: the notice gate writes its decision log under the home.
+        self.notice_scorer = Arc::new(crate::proactive_gate::ProactiveGate::new(
+            home_dir.clone(),
+            Arc::new(crate::interruptibility::InterruptibilityTracker::new()),
+        ));
         self.home_dir = home_dir;
         self
     }
@@ -106,6 +138,16 @@ impl GoalLoopDriver {
             "Goal loop driver started (autonomous goal_mode dispatch)"
         );
         self.release_stale_goal_leases();
+        // P2-A: repair durable handoffs a previous process left half-done
+        // before the first tick (no duplicate send, no lost steering). Only
+        // the gateway holding the home's lock repairs; one that does not hold
+        // it yet (boot order) repairs on its first tick that does.
+        if self.holds_instance_lock() {
+            self.repair_durable_handoffs().await;
+        } else {
+            self.durable_repair_pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         while self.running.load(Ordering::SeqCst) {
             time::sleep(Duration::from_secs(self.config.tick_secs.max(1))).await;
             if let Err(e) = self.tick_once().await {

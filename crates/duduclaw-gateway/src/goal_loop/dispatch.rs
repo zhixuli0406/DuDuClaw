@@ -46,6 +46,24 @@ impl GoalLoopDriver {
     ) -> Result<bool, String> {
         if let Some(removed) = inflight.remove(task_id) {
             self.release_lease(&removed);
+            // E-M2 / H-1: a round that failed before any agent ran it gives
+            // its directions back and its intent is abandoned (no iteration,
+            // no presumed spend). Only fixed-id durable rounds have intents.
+            let msg_id = removed
+                .message_id
+                .clone()
+                .unwrap_or_else(|| format!("goal:{task_id}:{}", removed.iter));
+            if let Err(e) = self.store.return_unrun_round(&msg_id, Utc::now()).await {
+                warn!(task = %task_id, error = %e, "could not return undelivered directions");
+            }
+        }
+        // P2-A: the dispatcher fenced a stale durable `goal:` round (task
+        // stopped, paused or moved on). Nothing failed to run — free the slot
+        // without counting a dispatch failure. Only fixed-id durable rounds
+        // can carry this text.
+        if error.starts_with(crate::responsibility::FENCE_ERROR_PREFIX) {
+            debug!(task = %task_id, "goal loop: durable round fenced by the dispatcher — slot released");
+            return Ok(false);
         }
         let now = Utc::now();
         let failures = {

@@ -42,6 +42,8 @@ import {
   GoalRoundBadge,
   GoalDiminishingBadge,
   GoalDeadlineBadge,
+  SteeringPanel,
+  StopTaskButton,
 } from '@/components/task';
 import { OpenInChannelButton } from '@/components/inbox/OpenInChannelButton';
 import { NeedsHumanActions } from '@/components/inbox/NeedsHumanTaskPanel';
@@ -183,6 +185,7 @@ export function TaskDetailPage() {
   // description / priority / assign / pin / archive) on it, so none of those
   // controls are offered here.
   const lifecycleLocked = task?.kind === 'discovery';
+  const taskTerminal = ['done', 'failed', 'cancelled'].includes(task?.status ?? '');
 
   // I-3a "接著做": a goal-mode task that already reached a terminal state
   // (done / failed / cancelled) can take a follow-up message and be reopened
@@ -448,6 +451,9 @@ export function TaskDetailPage() {
             )}
             {/* W2-3 reverse handoff (E8): jump back to the /goal conversation. */}
             <OpenInChannelButton channel={task.channel} link={task.channel_link} className="ml-auto" />
+            {!lifecycleLocked && (
+              <StopTaskButton taskId={task.id} terminal={taskTerminal} onStopped={fetchTasks} />
+            )}
           </div>
         </div>
 
@@ -515,6 +521,9 @@ export function TaskDetailPage() {
             or a goal task with no contract fields set. */}
         <TaskAudienceNotice restriction={timeline?.audience_restriction ?? null} restricted={task.restricted} />
         <GoalContractCards task={task} ledger={timeline?.criteria_ledger ?? null} />
+
+        {/* P2-A: one direction for the employee's next round (goal tasks). */}
+        {task.goal_mode && !lifecycleLocked && <SteeringPanel taskId={task.id} terminal={taskTerminal} />}
 
         {/* Description (inline edit, multiline) */}
         <div>

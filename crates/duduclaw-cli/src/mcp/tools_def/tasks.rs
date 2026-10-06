@@ -138,7 +138,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "parent_task_id",
-                description: "Parent task ID for sub-tasks",
+                description: "Parent task ID. In a responsibility run's round the default is the round's task and a given parent must be inside its tree.",
                 required: false,
             },
             ParamDef {
@@ -246,6 +246,33 @@ pub(super) const TOOLS: &[ToolDef] = &[
                 description: "Optional completion summary (posted to the activity feed)",
                 required: false,
             },
+        ],
+    },
+    ToolDef {
+        name: "responsibility_get",
+        description: "Read a continuous responsibility you own: schedule, subscriptions, window usage, open run. Omit the id to list yours.",
+        params: &[ParamDef {
+            name: "responsibility_id",
+            description: "Responsibility id; omit to list your own",
+            required: false,
+        }],
+    },
+    ToolDef {
+        name: "responsibility_followup",
+        description: "While running your own responsibility, schedule one follow-up wake-up (counts toward the window limit).",
+        params: &[
+            ParamDef { name: "responsibility_id", description: "Responsibility id", required: true },
+            ParamDef { name: "due_at", description: "RFC3339 time, at least the minimum wake interval from now and before stop_at", required: true },
+        ],
+    },
+    ToolDef {
+        name: "responsibility_ask",
+        description: "While running your own responsibility, ask the operator one question; the answer wakes you as data, never as a grant.",
+        params: &[
+            ParamDef { name: "responsibility_id", description: "Responsibility id", required: true },
+            ParamDef { name: "question", description: "Question for the operator (max 1000 characters)", required: true },
+            ParamDef { name: "options", description: "Up to 5 answer options", required: false },
+            ParamDef { name: "ttl_secs", description: "Seconds the question stays open (default 1 day, capped at stop_at)", required: false },
         ],
     },
     ToolDef {

@@ -30,6 +30,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 | `computer_use` | `agent.toml [capabilities]` | 隱藏 8 個 `computer_*`（見下方 [`computer_*`](#computer_由-gateway-執行的-session)） |
 | `db_sources` | `agent.toml [capabilities]` | 隱藏 4 個 `db_*` |
 | `[fork] enabled` | `agent.toml` | 隱藏 6 個分支工具 |
+| `[responsibilities] enabled` | `config.toml` | 隱藏 3 個 `responsibility_*`（見下方[持續任務工具](#responsibility_get--responsibility_followup--responsibility_ask持續任務工具)） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有效授權 | 在階段性授權生效前一律隱藏 |
 
 新建的 AI 員工以上全部都沒開，這正是重點：預設部署只為自己用得到的工具付費。
@@ -64,6 +65,7 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 
 - **任務**：`tasks_update` 與帶 `task_id` 的 `activity_post`，任務的受派者、認領者或建立者可以直接操作；`tasks_complete` 與 `tasks_block` 只認受派者與認領者；`tasks_claim` 可以認領未指派或本來就指派給自己的任務。其他情況都要與受派者有委派關係（同部門、`reports_to` 上下級，或白名單配對，依 `[delegation] policy`）。未指派、未認領的任務要先認領。用 `tasks_update` 把別人的任務改派給自己，一律要有這個關係。
 - **任務欄位**：AI 員工不能改 goal 模式任務的 `title` 或 `description`（`acceptance_criteria` 則所有 MCP 呼叫者都不能改），也不能在 `tasks_update` 或 `tasks_create` 的 `tags` 新增、移除或調換以 `outcome:`、`grant:` 開頭的 tag 與 `auto-research` tag。
+- **新任務的上層任務**：閘道會告訴 MCP 伺服器這一輪在處理哪個任務（`DUDUCLAW_TASK_ID`，和核准卡片帶的是同一個值）。這個任務是呼叫者自己的、而且屬於[持續任務](continuous-responsibilities.md)的某一次執行（執行本身或它底下的任務，包括任務看板喚醒的子任務）時，沒給 `parent_task_id` 的 `tasks_create`（含 `kind="goal"`）會掛在它底下，員工自己給的 `parent_task_id` 必須是那個任務或它的子任務，否則拒絕。這個值存在但是空白或格式不對時一律拒絕，不會當成「沒有輪次」。其他情況（一般 goal 輪次、執行之外任務的看板喚醒、沒有輪次資訊）不預設上層任務。這一版對所有呼叫者都新增的規則：給了 `parent_task_id` 需要與上層任務有關係（指派、認領、建立或委派規則），v1.69 原本不檢查；`kind="goal"` 也接受 `parent_task_id`，v1.69 原本忽略；AI 員工在一個任務底下最多建 200 個尚未結束的子任務（`schedule` 建的例行工作與提醒不是子任務）。從 Bash 啟動的伺服器，以及 Grok、Gemini CLI 執行環境，拿不到輪次資訊；在那裡建立的任務除非員工指定這次執行為上層任務，否則不會掛到執行底下，也不計入它的花費。掛對位置還要靠員工改不了自己 `.mcp.json` 裡的 `duduclaw` 項目，這是另一項平台修補，必須先合併。
 - **例行工作**：`update_cron_task`、`delete_cron_task`、`pause_cron_task`、`run_cron_task` 要求呼叫者就是這筆例行工作的執行員工，或與它有關係。以 `name` 指定時只作用於一筆；多筆同名會被拒絕，並列出候選 id。
 - **提醒**：`create_reminder` 的 `agent_id` 不是呼叫者自己時，要與該員工有關係。
 - **對自己用 `agent_update`**：AI 員工不能對自己送出 `reports_to`、`db_sources`、`db_sources_add`、`db_sources_remove`、`budget_cents` 或 `role`（稽核 `agent_authority_refused`）。修改下屬不變。
@@ -176,6 +178,20 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 ### `create_agent` / `agent_remove`：移除後的名稱會被保留
 
 `agent_remove` 會把該員工移到 `~/.duduclaw/agents/_trash/`，並回覆該員工已被移除、管理員可以還原、名稱已被保留，不會回傳路徑。接著 `create_agent` 會對所有 MCP 呼叫端拒絕這個名稱，條件是 trash 裡還有對應項目、`org.toml` 仍記錄這個 id 但沒有對應目錄，或 trash 無法列出；換一個名稱則可以建立。操作者可以從 Dashboard 或終端機重用這個名稱。透過 HTTP 且使用非內部金鑰時，兩個工具都以該金鑰自己的 client id 作為身分執行。細節見[委派隔離](../../features/zh-TW/37-delegation-isolation.md#被移除員工的名稱仍被保留)。
+
+### `responsibility_get` / `responsibility_followup` / `responsibility_ask`：持續任務工具
+
+[持續任務](continuous-responsibilities.md)的三個工具。只有 `config.toml [responsibilities] enabled` 為真、而且呼叫端是 AI 員工身分時才會列出（外部用戶端看不到）；功能關閉時每次呼叫都會被拒絕。它們和 `tasks_*` 工具一樣需要 Admin scope，閘道自己的金鑰帶有這個 scope。
+
+| 工具 | 誰能呼叫 | 規則 |
+|---|---|---|
+| `responsibility_get` | 任何 AI 員工；操作者金鑰可以讀任何持續任務 | 不帶 `responsibility_id`：列出呼叫者自己的。帶 id：回傳摘要（排程、訂閱、本期花費與次數、進行中的那一次、`cost_not_counted`）。別的員工的持續任務會回「找不到」，除非委派規則讓呼叫者與擁有者有關係 |
+| `responsibility_followup` | 擁有這個持續任務的 AI 員工，而且只能在它自己的那一次執行進行中、持續任務為 active 時 | 在 `due_at`（RFC 3339）安排一次性喚醒，至少距現在 `min_wake_interval_secs`，不晚於 `stop_at`。計入本期次數上限，額度用完就拒絕；不會被悄悄改到別的時間 |
+| `responsibility_ask` | 同 `responsibility_followup` | 一個問題（最多 1000 字），最多 5 個選項（每個最多 1000 字）；`ttl_secs` 預設一天，限制在 60 秒到 `stop_at` 之間。問題會做注入掃描，給操作者看時以引用文字呈現並截到 200 字，掃描命中時附警告。推播走持續任務的通知條件與每期上限。答案在下一次執行以資料形式交給員工，不給任何權限。停止那一次執行會一併撤回這個問題 |
+
+每個持續任務同時最多一個由 AI 員工安排、還在等的喚醒，所以等待中的 `responsibility_followup` 與 `responsibility_ask` 互斥。操作者金鑰不能用這兩個喚醒工具，因為那等於冒充員工。封閉的錯誤代碼：`not_found`、`not_active`、`no_open_occurrence`、`invalid_due_at`、`period_occurrence_limit`、`agent_followup_limit`、`epoch_changed`、`invalid_question`。
+
+沒有建立、修改、恢復或重新啟用持續任務的工具，也沒有送指示的工具。
 
 ## 已棄用的別名仍會列出
 

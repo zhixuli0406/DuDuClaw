@@ -46,6 +46,18 @@ impl TaskStore {
             let Some((goal_mode, claimed_by, revision_round, claimed_at, created_at)) = row else {
                 return Ok(None);
             };
+            // P2-A M-2: a task inside a stopped tree is never recorded as
+            // done (a member the batch cancel has not reached yet included).
+            let stopped: bool = tx
+                .query_row(&format!("SELECT {}", in_stop_tree_sql("?1")), params![id], |r| {
+                    r.get(0)
+                })
+                .map_err(|e| format!("complete: stop check: {e}"))?;
+            if stopped {
+                return Err(format!(
+                    "task {id} was stopped by an operator; it cannot be completed"
+                ));
+            }
             if let Some(holder) = claimed_by.as_deref() {
                 if holder != caller {
                     return Err(format!(
@@ -344,6 +356,12 @@ impl TaskStore {
     /// real token rather than `NULL` so "explicitly unclassified" and "row
     /// predates the column" are the same at read time and neither can be
     /// mistaken for a confident class.
+    ///
+    /// P2-A D10: a task that already reached a terminal state (`done`,
+    /// `cancelled`, `failed`) is never moved back to `needs_human` — a tick
+    /// or settle that read an older snapshot would otherwise reopen a
+    /// cancelled task, and the next human "retry" would revive it. Such a
+    /// call affects 0 rows and returns `Ok(false)`.
     pub async fn mark_needs_human_with_pause(
         &self,
         id: &str,
@@ -356,7 +374,8 @@ impl TaskStore {
             .execute(
                 "UPDATE tasks SET status = 'needs_human', judge_feedback = ?2, pause_reason = ?4,
                         updated_at = ?3
-                  WHERE id = ?1 AND kind IN ('task','goal')",
+                  WHERE id = ?1 AND kind IN ('task','goal')
+                    AND status NOT IN ('done', 'cancelled', 'failed')",
                 params![id, reason, now, pause.as_str()],
             )
             .map_err(|e| format!("mark needs_human: {e}"))?;
@@ -368,7 +387,7 @@ impl TaskStore {
     /// `blocked`, judge error, a leftover removed `human_only`).
     ///
     /// The task-row write is byte-identical to `mark_needs_human_with_pause`
-    /// (same statement, same result). Afterwards, only when that write took
+    /// (same statement, same result, same terminal-state guard). Afterwards, only when that write took
     /// effect, the latest un-judged round is sealed `escalated` with the pause
     /// class, the round's own output excerpt and the knob snapshot (see
     /// `iter_escalate_seal_conn` for why `judge_feedback` stays NULL). The
@@ -386,7 +405,8 @@ impl TaskStore {
             .execute(
                 "UPDATE tasks SET status = 'needs_human', judge_feedback = ?2, pause_reason = ?4,
                         updated_at = ?3
-                  WHERE id = ?1 AND kind IN ('task','goal')",
+                  WHERE id = ?1 AND kind IN ('task','goal')
+                    AND status NOT IN ('done', 'cancelled', 'failed')",
                 params![id, reason, now, pause.as_str()],
             )
             .map_err(|e| format!("mark needs_human: {e}"))?;
@@ -568,6 +588,14 @@ impl TaskStore {
         let mut conn = self.conn.lock().await;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("continue from terminal: begin: {e}"))?;
+        // P2-A C7: a run an operator stopped is not reopened by "接著做" —
+        // the documented path is a successor task under a new contract.
+        let stopped: bool = tx
+            .query_row(&format!("SELECT {}", in_stop_tree_sql("?1")), params![id], |r| r.get(0))
+            .map_err(|e| format!("continue from terminal: stop check: {e}"))?;
+        if stopped {
+            return Err("這次執行已被操作者停止，不能接著做；請建立新的後繼任務".into());
+        }
         let now = Utc::now().to_rfc3339();
         let n = tx
             .execute(
@@ -576,7 +604,8 @@ impl TaskStore {
                         lease_expires_at = NULL, result_summary = NULL, completed_at = NULL,
                         judge_feedback = ?2, updated_at = ?3
                   WHERE id = ?1 AND kind IN ('task','goal') AND status IN ('done', 'failed', 'cancelled')
-                    AND COALESCE(goal_mode, 0) = 1",
+                    AND COALESCE(goal_mode, 0) = 1
+                    AND NOT EXISTS (SELECT 1 FROM responsibility_occurrences WHERE task_id = ?1)",
                 params![id, stamped, now],
             )
             .map_err(|e| format!("continue from terminal: {e}"))?;

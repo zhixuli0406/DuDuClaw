@@ -177,7 +177,7 @@ pub(crate) fn check_actor_identity(
         audit_record_refused(home_dir, caller, tool, target, "caller_unknown", &[]);
         return Err(format!("{tool} 遭拒：無法確認呼叫者身分，未做任何變更。"));
     }
-    if duduclaw_core::is_system_sender(caller) {
+    if duduclaw_core::is_system_sender(caller) || duduclaw_core::is_reserved_queue_sender(caller) {
         audit_record_refused(home_dir, caller, tool, target, "system_sender_identity", &[]);
         return Err(format!(
             "{tool} 遭拒：「{}」是系統保留名稱，不能當作 AI 員工身分使用，未做任何變更。",

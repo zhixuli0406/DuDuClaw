@@ -393,9 +393,8 @@ impl HeartbeatScheduler {
             };
             for (home, aid) in pull_targets {
                 tokio::spawn(async move {
-                    if let Err(e) = poll_assigned_tasks(&home, &aid).await {
-                        debug!(agent = %aid, error = %e, "Task board poll skipped");
-                    }
+                    let result = poll_assigned_tasks(&home, &aid).await;
+                    note_task_board_poll(&home, &aid, &result);
                 });
             }
 
@@ -678,6 +677,63 @@ async fn check_soul_integrity_with_audit(home_dir: &Path, agent_id: &str) {
 /// We track which (task_id, kind) pairs have been nudged in `tasks.db`'s
 /// `metadata` field of an injected `activity` row, so a single backlog item
 /// doesn't generate one wake-up per heartbeat tick. Cooldown: 1 hour.
+/// Consecutive failures before the task-board pull is reported in the
+/// Activity Feed (P2-A fourth review L4-1).
+const TASK_BOARD_FAILURE_REPORT_AFTER: u32 = 3;
+
+/// Per (home, agent): consecutive failures, and whether this process already
+/// reported the outage in the Activity Feed.
+fn task_board_failures() -> &'static std::sync::Mutex<HashMap<(PathBuf, String), (u32, bool)>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<HashMap<(PathBuf, String), (u32, bool)>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// P2-A L4-1: a failing task-board pull is a `warn!` every time, and after
+/// [`TASK_BOARD_FAILURE_REPORT_AFTER`] failures in a row one Activity Feed
+/// row per employee per process says the employee's task-board wake-ups
+/// have stopped and why. A success resets the streak.
+fn note_task_board_poll(home: &Path, agent: &str, result: &Result<(), String>) {
+    let key = (home.to_path_buf(), agent.to_string());
+    let Ok(mut map) = task_board_failures().lock() else { return };
+    let entry = map.entry(key).or_insert((0, false));
+    let Err(e) = result else {
+        entry.0 = 0;
+        return;
+    };
+    entry.0 = entry.0.saturating_add(1);
+    warn!(agent = %agent, failures = entry.0, error = %e, "Task board poll failed");
+    if entry.0 >= TASK_BOARD_FAILURE_REPORT_AFTER && !entry.1 {
+        entry.1 = true;
+        let summary = format!(
+            "{agent} 的任務看板喚醒連續 {} 次失敗，待辦任務暫時不會被叫醒：{}",
+            entry.0,
+            duduclaw_core::truncate_chars(e, 200)
+        );
+        if let Err(write_err) = append_task_board_activity(home, agent, &summary) {
+            warn!(agent = %agent, error = %write_err, "could not record the task-board outage");
+        }
+    }
+}
+
+fn append_task_board_activity(home: &Path, agent: &str, summary: &str) -> Result<(), String> {
+    let conn = rusqlite::Connection::open(home.join("tasks.db")).map_err(|e| e.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO activity (id, event_type, agent_id, task_id, summary, timestamp, metadata)
+         VALUES (?1, 'heartbeat.task_board_unavailable', ?2, NULL, ?3, ?4, NULL)",
+        rusqlite::params![
+            uuid::Uuid::new_v4().to_string(),
+            agent,
+            summary,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
 async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), String> {
     let tasks_db = home_dir.join("tasks.db");
     let queue_db = home_dir.join("message_queue.db");
@@ -729,6 +785,16 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
             names.iter().any(|name| name == "kind")
         };
         let kind_gate = if has_kind { "AND kind IN ('task','goal')" } else { "" };
+        // P2-A M3-5: tasks inside a stopped tree are excluded in the query
+        // itself, so a stopped member at the top of the ordering cannot hide
+        // the employee's other work. `None` => the stop table cannot be read:
+        // skip this pass (fail closed, retried on the next tick).
+        let Some(has_stops) = stop_table_present(&tdb) else {
+            warn!(agent = %agent, "Heartbeat: stop records unreadable — task-board wake-up skipped this pass");
+            return Ok(());
+        };
+        let stall_filter =
+            format!("assigned_to = ?1 AND status = 'in_progress' AND updated_at < ?2 {kind_gate}");
 
         // Highest-priority unstarted task for this agent. `pending` = durable
         // dispatch-engine tasks awaiting a claim — without it here they are
@@ -740,17 +806,7 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
         // heartbeat pull remains the fallback wake-up for ordinary tasks.
         let todo: Option<(String, String, String)> = tdb
             .query_row(
-                &format!("SELECT id, title, priority, source_channel, source_chat_id FROM tasks
-                 WHERE assigned_to = ?1 AND status IN ('todo', 'pending')
-                   AND COALESCE(goal_mode, 0) = 0 {kind_gate}
-                 ORDER BY CASE priority
-                     WHEN 'critical' THEN 0
-                     WHEN 'urgent'   THEN 1
-                     WHEN 'high'     THEN 2
-                     WHEN 'medium'   THEN 3
-                     ELSE 4
-                   END, created_at ASC
-                 LIMIT 1"),
+                &todo_query(has_stops, kind_gate),
                 rusqlite::params![&agent],
                 |row| {
                     Ok((
@@ -777,11 +833,13 @@ async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), Stri
         let stall_cutoff = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
         let stalled: Option<(String, String)> = tdb
             .query_row(
-                &format!("SELECT id, title, source_channel, source_chat_id FROM tasks
-                 WHERE assigned_to = ?1 AND status = 'in_progress'
-                   AND updated_at < ?2 {kind_gate}
+                &format!("{} SELECT id, title, source_channel, source_chat_id FROM tasks
+                 WHERE {stall_filter} {}
                  ORDER BY updated_at ASC
-                 LIMIT 1"),
+                 LIMIT 1",
+                    stop_exclusion_cte(has_stops, &stall_filter),
+                    stop_exclusion_filter(has_stops)
+                ),
                 rusqlite::params![&agent, stall_cutoff],
                 |row| {
                     Ok((
@@ -1752,5 +1810,198 @@ mod tests {
         begin_takeover_for(home, "telegram", "1");
         poll_assigned_tasks(home, "worker").await.unwrap();
         assert_eq!(queued_count(&queue_path), 1);
+    }
+}
+
+/// Whether `task_stop_requests` exists (`Some(false)` before the P2-A schema
+/// was ever created); `None` when that cannot be read.
+fn stop_table_present(tdb: &rusqlite::Connection) -> Option<bool> {
+    tdb.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_stop_requests')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )
+    .ok()
+}
+
+/// P2-A M3-5: CTE naming the candidate rows (`candidate_filter`, the same
+/// `WHERE` as the main query) whose own id or any ancestor (64 levels, as the
+/// gateway's stop check) is the root of a stop request. The walk starts from
+/// this employee's candidates only, so its cost is bounded by their number.
+fn stop_exclusion_cte(has_stops: bool, candidate_filter: &str) -> String {
+    if !has_stops {
+        return String::new();
+    }
+    format!(
+        "WITH RECURSIVE hb_anc(cid, id, depth) AS ( \
+           SELECT id, id, 0 FROM tasks WHERE {candidate_filter} \
+           UNION ALL SELECT hb_anc.cid, t.parent_task_id, hb_anc.depth + 1 FROM tasks t \
+             JOIN hb_anc ON t.id = hb_anc.id \
+            WHERE t.parent_task_id IS NOT NULL AND hb_anc.depth < 64), \
+         hb_stopped(cid) AS (SELECT DISTINCT cid FROM hb_anc \
+            WHERE id IN (SELECT root_task_id FROM task_stop_requests))"
+    )
+}
+
+fn stop_exclusion_filter(has_stops: bool) -> &'static str {
+    if has_stops {
+        "AND id NOT IN (SELECT cid FROM hb_stopped)"
+    } else {
+        ""
+    }
+}
+
+/// The task-board pull's pick: this employee's highest-priority unstarted
+/// ordinary task, with stopped-tree members excluded in the query (M3-5).
+fn todo_query(has_stops: bool, kind_gate: &str) -> String {
+    let todo_filter = format!(
+        "assigned_to = ?1 AND status IN ('todo', 'pending') AND COALESCE(goal_mode, 0) = 0 {kind_gate}"
+    );
+    format!(
+        "{} SELECT id, title, priority, source_channel, source_chat_id FROM tasks
+          WHERE {todo_filter} {}
+          ORDER BY CASE priority
+              WHEN 'critical' THEN 0
+              WHEN 'urgent'   THEN 1
+              WHEN 'high'     THEN 2
+              WHEN 'medium'   THEN 3
+              ELSE 4
+            END, created_at ASC
+          LIMIT 1",
+        stop_exclusion_cte(has_stops, &todo_filter),
+        stop_exclusion_filter(has_stops)
+    )
+}
+
+/// Whether `task_id` lies in a stopped tree, by the same rule the queries
+/// above apply (tests). Unreadable => treated as stopped.
+#[cfg(test)]
+fn in_stopped_tree(tdb: &rusqlite::Connection, task_id: &str) -> bool {
+    let Some(has) = stop_table_present(tdb) else {
+        return true;
+    };
+    if !has {
+        return false;
+    }
+    tdb.query_row(
+        &format!(
+            "{} SELECT EXISTS(SELECT 1 FROM hb_stopped)",
+            stop_exclusion_cte(true, "id = ?1")
+        ),
+        rusqlite::params![task_id],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod stop_tree_tests {
+    use super::{in_stopped_tree, todo_query};
+
+    fn db(with_stop_table: bool) -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE tasks (id TEXT PRIMARY KEY, parent_task_id TEXT);")
+            .unwrap();
+        if with_stop_table {
+            c.execute_batch("CREATE TABLE task_stop_requests (root_task_id TEXT PRIMARY KEY);")
+                .unwrap();
+        }
+        c
+    }
+
+    /// Round 4 (M-2): the task-board wake-up skips a task whose ancestor (or
+    /// itself) was stopped by an operator, so a stopped tree is not woken.
+    #[test]
+    fn a_task_under_a_stopped_root_is_skipped() {
+        let c = db(true);
+        c.execute_batch(
+            "INSERT INTO tasks VALUES ('root', NULL), ('child', 'root'), ('grand', 'child'), ('other', NULL);
+             INSERT INTO task_stop_requests VALUES ('root');",
+        )
+        .unwrap();
+        assert!(in_stopped_tree(&c, "root"));
+        assert!(in_stopped_tree(&c, "child"));
+        assert!(in_stopped_tree(&c, "grand"));
+        assert!(!in_stopped_tree(&c, "other"));
+    }
+
+    /// Before the responsibilities schema exists nothing has been stopped.
+    #[test]
+    fn no_stop_table_means_nothing_is_stopped() {
+        let c = db(false);
+        c.execute_batch("INSERT INTO tasks VALUES ('t', NULL);").unwrap();
+        assert!(!in_stopped_tree(&c, "t"));
+    }
+
+    /// A store that cannot be queried counts as stopped (fail closed).
+    #[test]
+    fn an_unreadable_store_counts_as_stopped() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        // The stop table exists but `tasks` does not: the ancestry query fails.
+        c.execute_batch("CREATE TABLE task_stop_requests (root_task_id TEXT PRIMARY KEY);")
+            .unwrap();
+        assert!(in_stopped_tree(&c, "t"));
+    }
+
+    /// M3-5: a stopped member at the top of the ordering does not hide the
+    /// employee's other work; the pick skips it in the query.
+    #[test]
+    fn the_pick_skips_stopped_members_and_finds_other_work() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, priority TEXT,
+                source_channel TEXT, source_chat_id TEXT, assigned_to TEXT, status TEXT,
+                goal_mode INTEGER, created_at TEXT, parent_task_id TEXT, kind TEXT);
+             CREATE TABLE task_stop_requests (root_task_id TEXT PRIMARY KEY);
+             INSERT INTO tasks VALUES
+               ('root', 'r', 'medium', NULL, NULL, 'other', 'cancelled', 0, '1', NULL, 'task'),
+               ('left', 'l', 'critical', NULL, NULL, 'bob', 'todo', 0, '2', 'root', 'task'),
+               ('mine', 'm', 'low', NULL, NULL, 'bob', 'todo', 0, '3', NULL, 'task');
+             INSERT INTO task_stop_requests VALUES ('root');",
+        )
+        .unwrap();
+        let pick = |has_stops: bool| -> String {
+            c.query_row(
+                &todo_query(has_stops, "AND kind IN ('task','goal')"),
+                rusqlite::params!["bob"],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(pick(true), "mine");
+        // Without the stop table the old ordering applies.
+        assert_eq!(pick(false), "left");
+    }
+
+    /// P2-A L4-1: repeated task-board failures reach the Activity Feed once.
+    #[test]
+    fn repeated_task_board_failures_are_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+        c.execute_batch(
+            "CREATE TABLE activity (id TEXT PRIMARY KEY, event_type TEXT NOT NULL,
+                agent_id TEXT NOT NULL, task_id TEXT, summary TEXT NOT NULL,
+                timestamp TEXT NOT NULL, metadata TEXT);",
+        )
+        .unwrap();
+        let rows = || -> i64 {
+            c.query_row(
+                "SELECT COUNT(*) FROM activity WHERE event_type = 'heartbeat.task_board_unavailable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let err: Result<(), String> = Err("query todo: disk I/O error".into());
+        super::note_task_board_poll(dir.path(), "bob", &err);
+        super::note_task_board_poll(dir.path(), "bob", &err);
+        assert_eq!(rows(), 0, "below the threshold");
+        super::note_task_board_poll(dir.path(), "bob", &err);
+        assert_eq!(rows(), 1);
+        super::note_task_board_poll(dir.path(), "bob", &Ok(()));
+        for _ in 0..5 {
+            super::note_task_board_poll(dir.path(), "bob", &err);
+        }
+        assert_eq!(rows(), 1, "once per process per employee");
     }
 }

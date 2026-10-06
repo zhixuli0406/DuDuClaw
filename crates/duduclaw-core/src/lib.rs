@@ -72,11 +72,12 @@ pub use cron_tz::{parse_timezone, should_fire_in_tz};
 pub use delegation_policy::{
     can_delegate, can_delegate_ext, can_delegate_rules, can_delegate_rules_ext,
     delegation_rules_from_home, is_ancestor as is_org_ancestor, is_reserved_agent_id,
-    is_system_sender,
+    is_reserved_queue_sender, is_system_sender,
     policy_from_home as delegation_policy_from_home, require_identity_token_from_home,
     resolve_allow_pairs, DelegationConfig,
     DelegationDenied, DelegationPolicy, DelegationRules, DenyReason as DelegationDenyReason,
-    MapOrgView, OrgNode, OrgView, ACP_CLIENT_SENDER, MAX_ANCESTOR_HOPS, SYSTEM_SENDERS,
+    MapOrgView, OrgNode, OrgView, ACP_CLIENT_SENDER, MAX_ANCESTOR_HOPS, RESERVED_QUEUE_SENDERS,
+    SYSTEM_SENDERS,
 };
 pub use department::{
     department_of_page, department_page_visible, is_valid_department,

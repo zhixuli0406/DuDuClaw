@@ -79,6 +79,7 @@ mod service;
 pub mod weekly_report; // Per-agent weekly usage report
 mod knobs_survival;
 mod computer_workspaces_cmd; // P2-C: `duduclaw ops computer-workspaces` (operator-only)
+mod responsibility_cmd; // P2-A: `duduclaw responsibility …` (operator)
 mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (operator-only)
 mod channel_ingress_cmd; // F2: `duduclaw ops channel-ingress` (operator-only, dashboard-approved changes)
 mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
@@ -1686,6 +1687,14 @@ enum OpsCommands {
     Org {
         #[command(subcommand)]
         command: OrgCommands,
+    },
+
+    /// (operator) Continuous responsibilities: list, inspect, pause/disable/stop
+    /// at once; create/enable/resume/update-contract/clear-failures need a
+    /// dashboard approval.
+    Responsibility {
+        #[command(subcommand)]
+        command: responsibility_cmd::ResponsibilityCommands,
     },
 
     /// (operator) Memory store maintenance — `memory migrate-namespace` moves
@@ -5086,6 +5095,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             artifact,
         }) => causal_cmd::clear_revocation_fence(&db, &tenant, &acl, &artifact),
         Commands::Ops(OpsCommands::Doctor { fix_residue }) => cmd_doctor(fix_residue).await,
+        Commands::Ops(OpsCommands::Responsibility { command }) => {
+            responsibility_cmd::run(&duduclaw_home(), command).await
+        }
         Commands::Ops(OpsCommands::Memory { command }) => {
             memory_namespace_cmd::run(&duduclaw_home(), command).await
         }
@@ -6212,6 +6224,9 @@ fn agent_file_guard_decision(
                         })
                         .or_else(|| {
                             computer_workspaces_cmd::bash_workspace_ops_decision(command, &caller)
+                        })
+                        .or_else(|| {
+                            responsibility_cmd::bash_responsibility_decision(command, &caller)
                         })
                         .unwrap_or(protected)
                 }
@@ -9066,6 +9081,56 @@ fn gateway_instance_check(home: &std::path::Path) -> (String, CheckStatus, Strin
     }
 }
 
+/// `duduclaw doctor` row (P2-A M3-2): continuous responsibilities whose
+/// employee or acceptance judge runs on a runtime that may not report token
+/// usage. Such a run is charged its full per-run cap for every unmeasured
+/// round. Advisory: Warn, never Fail. Reads `tasks.db` only when it exists.
+async fn responsibility_usage_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    let name = "持續任務的用量回報".to_string();
+    let db = home.join("tasks.db");
+    if !db.exists() {
+        return (name, CheckStatus::Pass, "沒有持續任務".to_string());
+    }
+    // L4-9: a read-only look; doctor never migrates or locks `tasks.db`.
+    let rows: Vec<(String, String)> = match (|| -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let has: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='responsibilities')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare(
+            "SELECT responsibility_id, owner_agent_id FROM responsibilities
+              WHERE state NOT IN ('disabled', 'expired')",
+        )?;
+        let out = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>();
+        out
+    })() {
+        Ok(r) => r,
+        Err(e) => return (name, CheckStatus::Warn, format!("讀不到持續任務：{e}")),
+    };
+    let mut lines = Vec::new();
+    for (id, owner) in &rows {
+        for w in duduclaw_gateway::responsibility::usage_hint::usage_warnings(home, owner) {
+            lines.push(format!("{id}（{owner}）：{w}"));
+        }
+    }
+    if lines.is_empty() {
+        (name, CheckStatus::Pass, format!("{} 個進行中的持續任務，用量都由服務商回報", rows.len()))
+    } else {
+        (name, CheckStatus::Warn, lines.join("\n         "))
+    }
+}
+
 /// `duduclaw doctor` row (v1.69.0): `config.toml [dispatch] judge` set to a
 /// mode removed in v1.69.0. Reports what the gateway does with the value now
 /// and how to fix it; never rewrites.
@@ -9746,6 +9811,9 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // Check 4e: MCP servers in employees' .mcp.json that DuDuClaw did not
     // write (they run as the operator's OS user at every spawn).
     checks.push(doctor_mcp_servers::mcp_servers_check(&home));
+
+    // Check 4f: responsibilities whose runtimes may not report usage (M3-2).
+    checks.push(responsibility_usage_check(&home).await);
 
     // Print results
     let mut has_failure = false;
@@ -13869,6 +13937,61 @@ mod removed_name_hook_tests {
         }
         let audit = std::fs::read_to_string(h.path().join("security_audit.jsonl")).unwrap();
         assert!(audit.contains("agent_name_reserved") && audit.contains("cli_bash_agent_create"));
+    }
+
+    /// P2-A appendix D.1 (moved from core onto the shared operator-command
+    /// matcher at the S9 rebase): `duduclaw responsibility …`, every
+    /// subcommand, is refused for employees and unverified callers.
+    #[test]
+    fn bash_responsibility_is_blocked_through_the_hook() {
+        let h = home_with_trash();
+        let untrusted = HookCaller::Untrusted("ceo".into());
+        for cmd in [
+            "duduclaw responsibility stop 0d3c --confirm",
+            "duduclaw responsibility pause r1 --confirm",
+            "duduclaw responsibility list",
+            "/usr/local/bin/duduclaw responsibility disable r1 --confirm",
+            "duduclaw-pro responsibility create --file x.json --confirm",
+            "env -u DUDUCLAW_AGENT_ID duduclaw responsibility resume r1 --confirm",
+            "cd /tmp && \"duduclaw\" responsibility get r1",
+            "DUDUCLAW.EXE RESPONSIBILITY STOP t1",
+            "echo hi; duduclaw --verbose responsibility fires r1",
+            "duduclaw respons''ibility list",
+        ] {
+            let d = agent_file_guard_decision("Bash", &bash(cmd), h.path(), &agent("ceo")).unwrap();
+            assert!(
+                matches!(d, GuardDecision::BlockedOperatorCommand { ref command, .. }
+                    if *command == "duduclaw responsibility"),
+                "{cmd:?}: {d:?}"
+            );
+            // An unverified caller is refused too (the base lane's broader
+            // untrusted-caller rule may answer first).
+            let d = agent_file_guard_decision("Bash", &bash(cmd), h.path(), &untrusted).unwrap();
+            assert!(!d.is_allowed(), "{cmd:?}: {d:?}");
+        }
+        for cmd in [
+            "duduclaw agent list",
+            "echo responsibility",
+            "grep -r 'responsibility' docs/",
+            "duduclawx responsibility list",
+            // Known evasions (speed bump): a renamed binary, a computed word.
+            "cp $(which duduclaw) /tmp/dc && /tmp/dc responsibility stop t1",
+            "x=respons; duduclaw ${x}ibility stop t1",
+        ] {
+            let d = agent_file_guard_decision("Bash", &bash(cmd), h.path(), &agent("ceo")).unwrap();
+            assert!(
+                !matches!(d, GuardDecision::BlockedOperatorCommand { .. }),
+                "{cmd:?}: {d:?}"
+            );
+        }
+        let d = agent_file_guard_decision(
+            "Bash",
+            &bash("duduclaw responsibility stop t1 --confirm"),
+            h.path(),
+            &HookCaller::Absent,
+        )
+        .unwrap();
+        assert!(d.is_allowed(), "{d:?}");
     }
 
     #[test]

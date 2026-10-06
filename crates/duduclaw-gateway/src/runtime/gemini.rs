@@ -566,9 +566,16 @@ impl GeminiRuntime {
         agent_id: &str,
         home_dir: &std::path::Path,
     ) -> Result<bool, String> {
-        let Some(def) = super::duduclaw_mcp_server_json_for_home(agent_id, home_dir) else {
+        let Some(mut def) = super::duduclaw_mcp_server_json_for_home(agent_id, home_dir) else {
             return Err("duduclaw binary did not resolve to an absolute path".to_string());
         };
+        // P2-A H-2: this file persists across calls, so a per-round task id
+        // must never be written into it (a later non-round call would inherit
+        // it). Gemini rounds therefore do not attach created tasks to the
+        // round (deprecated runtime; documented).
+        if let Some(env) = def.get_mut("env").and_then(|e| e.as_object_mut()) {
+            env.remove(duduclaw_core::ENV_TASK_ID);
+        }
         let mut servers = std::collections::HashMap::new();
         servers.insert("duduclaw".to_string(), def);
         Self::write_mcp_config(Some(agent_dir), &servers).await

@@ -30,6 +30,7 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 | `computer_use` | `agent.toml [capabilities]` | `computer_*` 8 ツールを非表示（下の [`computer_*`](#computer_--gateway-が実行するセッション) を参照） |
 | `db_sources` | `agent.toml [capabilities]` | `db_*` 4 ツールを非表示 |
 | `[fork] enabled` | `agent.toml` | 分岐系 6 ツールを非表示 |
+| `[responsibilities] enabled` | `config.toml` | `responsibility_*` 3 ツールを非表示（下の[継続タスクのツール](#responsibility_get--responsibility_followup--responsibility_ask--継続タスクのツール)を参照） |
 | `scoped_tools` | `agent.toml [capabilities]` ＋ 有効な付与 | タスクスコープの付与が有効になるまで非表示 |
 
 新規作成したエージェントは上記のいずれも有効ではありません。それが狙いで、既定の構成は使えるツールの分だけを支払います。
@@ -64,6 +65,7 @@ AI 社員のものになっているレコードを変更・起動するツー�
 
 - **タスク**：`tasks_update` と `task_id` 付きの `activity_post` は、タスクの割り当て先・引き受け者・作成者ならそのまま通ります。`tasks_complete` と `tasks_block` は割り当て先と引き受け者だけ、`tasks_claim` は未割り当てか自分に割り当て済みのタスクなら通ります。それ以外は割り当て先との委任関係が必要です（同じ部署、`reports_to` の上下、またはホワイトリストのペア。`[delegation] policy` に従う）。未割り当て・未引き受けのタスクは先に引き受けます。`tasks_update` で他人のタスクを自分に割り当て直すには、常にその関係が必要です。
 - **タスクのフィールド**：AI 社員はゴールモードのタスクの `title` と `description` を変更できず（`acceptance_criteria` はすべての MCP 呼び出し元が変更不可）、`tasks_update` でも `tasks_create` の `tags` でも、`outcome:`・`grant:` で始まるタグと `auto-research` タグを追加・削除・並べ替えできません。
+- **新しいタスクの親**：ゲートウェイは、いまのラウンドが扱っているタスクを MCP サーバーに伝えます（`DUDUCLAW_TASK_ID`。承認カードが持つ値と同じ）。そのタスクが呼び出し元自身のもので、[継続タスク](continuous-responsibilities.md)のある 1 回の実行に属する（実行そのもの、またはその配下のタスク。タスクボードから起動されたサブタスクを含む）場合、`parent_task_id` を指定しない `tasks_create`（`kind="goal"` を含む）はその下に置かれ、社員が指定する `parent_task_id` はそのタスクかその子タスクでなければ拒否されます。値があるのに空や形式違いの場合は拒否され、「ラウンドなし」とは扱われません。それ以外（通常の goal ラウンド、実行の外にあるタスクのタスクボード起動、ラウンドの情報がない場合）は親を既定にしません。このリリースですべての呼び出し元に新しく加わる規則：指定した `parent_task_id` には親タスクとの関係（担当、引き受け、作成者、または委任ポリシー）が必要です（v1.69 は確認せずに書き込んでいました）。`kind="goal"` も `parent_task_id` を受け付けます（v1.69 は無視していました）。AI 社員が 1 つのタスクの下に作れる未完了の子タスクは最大 200 件です（`schedule` で作る定期業務やリマインダーは子タスクではありません）。Bash から起動したサーバーと、Grok・Gemini CLI ランタイムにはラウンドの情報が渡りません。そこで作られたタスクは、社員がその実行を親に指定しない限り実行の配下に置かれず、その費用にも含まれません。正しく配下に置かれるには、社員が自分の `.mcp.json` の `duduclaw` 項目を書き換えられないことも必要で、これは先に合併すべき別のプラットフォーム修正です。
 - **定期業務**：`update_cron_task`、`delete_cron_task`、`pause_cron_task`、`run_cron_task` は、呼び出し元がその定期業務を実行する社員本人か、その社員と関係がある場合に通ります。`name` で指定すると 1 件だけに作用し、同名が複数あれば候補 id を示して拒否します。
 - **リマインダー**：`create_reminder` の `agent_id` が呼び出し元以外なら、その社員との関係が必要です。
 - **自分への `agent_update`**：AI 社員は自分について `reports_to`、`db_sources`、`db_sources_add`、`db_sources_remove`、`budget_cents`、`role` を送れません（監査 `agent_authority_refused`）。部下の編集は従来どおりです。
@@ -176,6 +178,20 @@ AI 社員のものになっているレコードを変更・起動するツー�
 ### `create_agent` / `agent_remove` — 削除された名前は予約される
 
 `agent_remove` は社員を `~/.duduclaw/agents/_trash/` に移動し、社員が削除されたこと、管理者が復元できること、名前が予約されていることを答えます。パスは返しません。その後 `create_agent` は、ゴミ箱にエントリがある間、`org.toml` がディレクトリのない id を記録している間、またはゴミ箱を一覧できない間、すべての MCP caller についてその名前を拒否します。別の名前なら動作します。運用者はダッシュボードまたはターミナルから名前を再利用できます。非内部キーで HTTP 越しに呼ぶと、どちらのツールもそのキー自身の client id として動作します。詳細：[委譲の隔離](../../features/ja-JP/37-delegation-isolation.md#削除された社員の名前は予約されたままになる)。
+
+### `responsibility_get` / `responsibility_followup` / `responsibility_ask` — 継続タスクのツール
+
+[継続タスク](continuous-responsibilities.md)用の 3 つのツールです。`config.toml [responsibilities] enabled` が true で、呼び出し元が AI従業員の身元であるときだけ掲載されます（外部クライアントには見えません）。機能がオフの間はすべての呼び出しが拒否されます。`tasks_*` と同じく Admin スコープが必要で、ゲートウェイ自身のキーはこのスコープを持っています。
+
+| ツール | 呼べる人 | ルール |
+|---|---|---|
+| `responsibility_get` | どの AI従業員も可。運用者キーはどの継続タスクも読める | `responsibility_id` なし：呼び出し元自身のものを一覧。id あり：概要（スケジュール、購読、今期の費用と回数、実行中の 1 回、`cost_not_counted`）。他の従業員の継続タスクは、委譲ポリシー上で呼び出し元と持ち主に関係がない限り「見つからない」になる |
+| `responsibility_followup` | その継続タスクを持つ AI従業員。自分の実行が開いていて、継続タスクが active のときだけ | `due_at`（RFC 3339）に 1 回限りの起床を予約。現在から `min_wake_interval_secs` 以上先、`stop_at` 以前。今期の回数上限に数えられ、使い切っていれば拒否。黙って別の時刻にずらすことはない |
+| `responsibility_ask` | `responsibility_followup` と同じ | 質問 1 つ（最大 1000 文字）、選択肢は最大 5 つ（各 1000 文字まで）。`ttl_secs` は既定 1 日で、60 秒から `stop_at` までに収める。質問はインジェクション検査を受け、担当者には 200 文字に切った引用として見せ、該当があれば警告を付ける。プッシュは継続タスクの通知条件と期間ごとの上限に従う。回答は次の実行にデータとして渡され、権限は与えない。その実行を停止すると質問も取り下げられる |
+
+1 つの継続タスクで AI従業員が予約した待機中の起床は同時に 1 つだけなので、待機中の `responsibility_followup` と `responsibility_ask` は両立しません。運用者キーはこの 2 つの起床ツールを使えません（従業員になりすますことになるため）。固定のエラーコード：`not_found`、`not_active`、`no_open_occurrence`、`invalid_due_at`、`period_occurrence_limit`、`agent_followup_limit`、`epoch_changed`、`invalid_question`。
+
+継続タスクを作成・変更・再開・再有効化するツールはなく、指示を送るツールもありません。
 
 ## 非推奨エイリアスは引き続き掲載されます
 

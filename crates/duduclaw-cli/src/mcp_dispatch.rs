@@ -3883,6 +3883,9 @@ effect = "forbid"
         "plan_start",
         "plan_update_step",
         "reliability_summary",
+        "responsibility_ask",
+        "responsibility_followup",
+        "responsibility_get",
         "route_query",
         "send_message",
         "send_photo",
@@ -3961,7 +3964,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            244,
+            247,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
@@ -4313,4 +4316,7 @@ effect = "forbid"
             "{result}"
         );
     }
+
+    /// P2-A Q7: the responsibility tools through the real gates.
+    mod resp_tests;
 }

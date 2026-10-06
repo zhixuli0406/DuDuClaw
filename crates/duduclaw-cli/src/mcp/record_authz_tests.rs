@@ -756,3 +756,40 @@ async fn agent_update_unproven_internal_caller_cannot_edit_the_default_agent() {
     assert!(is_error(&out), "{out}");
     assert_eq!(budget_of(h, "ceo"), 1000);
 }
+
+// ── P2-A round 3 ────────────────────────────────────────────────────────────
+
+/// S-M2: a sub-task can only be hung under a task the caller is related to.
+#[tokio::test]
+async fn tasks_create_under_a_parent_needs_a_relationship() {
+    let home = Home::new();
+    let h = home.path();
+    let parent = seed_task(h, "sales-rep", "sales-lead", "in_progress", false, "").await;
+    let child = |p: &str| serde_json::json!({ "title": "sub", "parent_task_id": p });
+
+    let out = handle_tasks_create(&child(&parent), h, A("mkt-rep")).await;
+    assert!(is_error(&out), "{out}");
+    for actor in [A("sales-rep"), A("sales-lead"), OP] {
+        let out = handle_tasks_create(&child(&parent), h, actor).await;
+        assert!(!is_error(&out), "{actor:?}: {out}");
+    }
+    let out = handle_tasks_create(&child("no-such-task"), h, A("sales-rep")).await;
+    assert!(is_error(&out), "{out}");
+}
+
+/// E-M4: an employee cannot post Activity rows that pose as the system's
+/// responsibility or stop records.
+#[tokio::test]
+async fn activity_post_refuses_reserved_event_types() {
+    let home = Home::new();
+    let h = home.path();
+    for kind in ["responsibility.notified", "task.stop_reconciled"] {
+        let out = handle_activity_post(
+            &serde_json::json!({ "summary": "x", "event_type": kind }),
+            h,
+            A("sales-rep"),
+        )
+        .await;
+        assert!(is_error(&out), "{kind}: {out}");
+    }
+}

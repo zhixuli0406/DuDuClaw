@@ -597,6 +597,8 @@ pub async fn run_utility_prompt_with_hint(
     max_tokens: u32,
     hint: Option<&UtilityModelHint>,
 ) -> Result<String, String> {
+    #[cfg(test)]
+    crate::model_call_probe::record("run_utility_prompt");
     let base = crate::runtime_config::resolve_utility(home_dir, agent_dir);
     let spec = apply_utility_hint(base, hint)?;
     // A hinted utility call is, by construction, the judge/evaluator path — so

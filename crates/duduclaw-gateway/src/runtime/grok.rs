@@ -531,6 +531,11 @@ impl AgentRuntime for GrokRuntime {
         // env can still name the source home, whose MCP auth/task state must
         // never receive a role member's calls.
         cmd.env("DUDUCLAW_HOME", &context.home_dir);
+        // P2-A H-2: only reaches the MCP child if Grok passes its own env on
+        // (its declared per-agent block is persistent and never carries it).
+        if let Some((k, v)) = super::round_task_env() {
+            cmd.env(k, v);
+        }
 
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1003,6 +1008,28 @@ impl GrokRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2-A third review (必查): Grok's MCP registration is a persistent
+    /// file. It must never carry this round's task id, or the next round
+    /// (or a later, unrelated turn) would read a stale round.
+    #[tokio::test]
+    async fn the_persistent_mcp_entry_never_carries_the_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let attr = crate::runtime::GoalRoundAttribution {
+            episode_id: "task-in-round".into(),
+            round: Some(1),
+        };
+        crate::runtime::GOAL_ROUND_ATTRIBUTION
+            .scope(attr, async {
+                assert!(crate::runtime::round_task_env().is_some(), "inside a round");
+                if let Some(def) = GrokRuntime::duduclaw_server_toml("worker", dir.path()) {
+                    let env = def.get("env").and_then(|e| e.as_table()).unwrap();
+                    assert!(!env.contains_key(duduclaw_core::ENV_TASK_ID), "{env:?}");
+                    assert!(!toml::to_string(&def).unwrap().contains("task-in-round"));
+                }
+            })
+            .await;
+    }
 
     #[tokio::test]
     async fn eval_sandbox_off_is_scoped_to_its_task() {

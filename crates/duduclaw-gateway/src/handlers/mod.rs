@@ -144,6 +144,7 @@ mod task_privacy_tests;
 mod f5_privacy_tests;
 #[cfg(test)]
 mod workflow_review_tests;
+mod responsibilities_rpc;
 mod workflow_review_rpc;
 mod workflow_drafts_rpc;
 mod workflow_runs_rpc;
