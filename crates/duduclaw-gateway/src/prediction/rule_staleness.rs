@@ -335,7 +335,7 @@ mod tests {
             source_event: "test_fact".to_string(),
         };
         engine
-            .store_temporal(agent, entry, fact_meta(subject, predicate, object))
+            .store_temporal(agent, entry, fact_meta(subject, predicate, object), duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap()
     }
@@ -368,7 +368,7 @@ mod tests {
             metadata: Some(metadata),
             ..Default::default()
         };
-        engine.store_temporal(agent, entry, meta).await.unwrap()
+        engine.store_temporal(agent, entry, meta, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap()
     }
 
     #[test]

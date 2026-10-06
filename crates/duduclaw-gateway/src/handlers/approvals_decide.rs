@@ -132,6 +132,21 @@ impl MethodHandler {
                     "LINE 收件匣的指令列請求只能由管理員（Admin）核准。",
                 );
             }
+            // Forget by source deletes memory irreversibly: Admin only.
+            if rec.action_kind
+                == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE
+                && crate::approval::require_current_dashboard_role_in_home(
+                    &self.home_dir,
+                    ctx,
+                    UserRole::Admin,
+                )
+                .is_err()
+            {
+                return WsFrame::error_response(
+                    "",
+                    "依來源刪除記憶的請求只有管理員（Admin）能決定",
+                );
+            }
             if rec.action_kind == "support_pilot_review" && !ctx.is_admin() {
                 return WsFrame::error_response(
                     "",

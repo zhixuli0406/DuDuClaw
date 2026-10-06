@@ -39,6 +39,7 @@ const BASE_RISK: Record<string, RiskLevel> = {
   browser_action: 'medium', // reaches the open web; can act on external state
   skill_create: 'high', // installs code that runs later
   agent_hire: 'high', // spins up an autonomous worker that spends budget
+  memory_forget_source: 'high', // deletes memory irreversibly (forget by source)
 };
 
 /** Default when the kind is unrecognised — see BASE_RISK note. */

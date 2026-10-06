@@ -2028,6 +2028,7 @@ dependencies = [
  "chrono",
  "csv",
  "duduclaw-core",
+ "duduclaw-memory",
  "fs2",
  "ignore",
  "rusqlite",

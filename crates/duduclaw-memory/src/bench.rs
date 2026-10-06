@@ -135,7 +135,7 @@ mod tests {
                         predicate: Some("relates".into()),
                         object: Some("widgets".into()),
                         ..Default::default()
-                    },
+                    }, crate::lineage::Provenance::test_only(),
                 )
                 .await
                 .unwrap();

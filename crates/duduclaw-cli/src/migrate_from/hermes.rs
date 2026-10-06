@@ -210,6 +210,7 @@ pub(super) async fn migrate(ctx: &Ctx, source: Option<PathBuf>) -> Result<Report
             &agent_id,
             "memories",
             &facts,
+            &profile_root.display().to_string(),
         )
         .await;
         for file in ["MEMORY.md", "USER.md"] {

@@ -212,6 +212,10 @@ pub mod maintenance;
 pub mod mast;
 pub mod memory_factory;
 pub mod memory_migrate;
+pub mod memory_forget_approval;
+pub mod memory_forget_steps;
+pub mod wiki_host_sources;
+pub mod memory_provenance;
 pub mod message_queue;
 pub mod miniapp;
 // G4 (2026-09 feature audit) — Odoo ERP change bridge: `/webhook/odoo` +

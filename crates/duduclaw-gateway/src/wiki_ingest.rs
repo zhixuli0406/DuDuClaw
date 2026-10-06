@@ -1009,6 +1009,9 @@ enum KnowledgeBranch {
     /// facts already extracted (when the utility call succeeded), or from
     /// scratch (`None`).
     Fallback(Option<Vec<DistilledFact>>),
+    /// P2-B: the turn's source was forgotten (or could not be checked).
+    /// Nothing may be written from this turn — neither page nor facts.
+    Fenced,
 }
 
 /// Run the WP5c knowledge route for one turn.
@@ -1023,9 +1026,25 @@ async fn run_knowledge_branch(
     home_dir: &Path,
     memory_db: &Path,
     session_id: &str,
+    sources: &[duduclaw_memory::SourceRef],
     utility_override: Option<UtilityResponse>,
 ) -> KnowledgeBranch {
     use crate::auto_wiki_page::{self, AutoPageError, AutoPageRequest, QuotaKind};
+
+    // P2-B: a page is a derived artifact outside memory.db, so it checks the
+    // source fence before it is written and again after (G3). No source ⇒
+    // no page (never a fabricated source).
+    let Some(source_id) = crate::memory_provenance::wiki_source_id(sources) else {
+        return KnowledgeBranch::Fallback(None);
+    };
+    match page_fence(memory_db, home_dir, agent_id, sources).await {
+        PageFence::Clear => {}
+        PageFence::Fenced => return KnowledgeBranch::Fenced,
+        // M5: a check that could not be made gives up the page only; the
+        // facts still take the memory path, which fences inside its own
+        // transaction.
+        PageFence::Unknown => return KnowledgeBranch::Fallback(None),
+    }
     use crate::knowledge_route::{self as kr, KnowledgeGrade};
 
     // Grey band spends an L2 arbitration slot; the decisive band does not need
@@ -1145,7 +1164,7 @@ async fn run_knowledge_branch(
         summary: summary.clone(),
         original: user_text.trim().to_string(),
         source_label: source_label_from_session(session_id).to_string(),
-        source_id: format!("conversation:{session_id}:{}", Utc::now().to_rfc3339()),
+        source_id,
     };
 
     let wiki_dir = home_dir.join("agents").join(agent_id).join("wiki");
@@ -1277,6 +1296,43 @@ async fn run_knowledge_branch(
     };
 
     let page_path = outcome.path().to_string();
+
+    #[cfg(test)]
+    p2b_tests::fire_page_written_hook(agent_id);
+
+    // P2-B post-check: a forget applied while the page was being written
+    // would not have seen it. Checking again now closes that window — if the
+    // source is gone, the page goes too (D5: any recorded source ⇒ delete).
+    let post = page_fence(memory_db, home_dir, agent_id, sources).await;
+    if post != PageFence::Clear {
+        let wiki_dir = home_dir.join("agents").join(agent_id).join("wiki");
+        let path = page_path.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            duduclaw_memory::WikiStore::new(wiki_dir).delete_page(&path)
+        })
+        .await;
+        match removed {
+            Ok(Ok(())) => info!(
+                agent = agent_id,
+                page = %page_path,
+                "knowledge route: source forgotten during write — page removed"
+            ),
+            Ok(Err(e)) => warn!(
+                agent = agent_id,
+                page = %page_path,
+                "knowledge route: source forgotten during write, page removal failed: {e}"
+            ),
+            Err(e) => warn!(agent = agent_id, "knowledge route: page removal task failed: {e}"),
+        }
+        // A real refusal stops the turn; an unverifiable check only cost the
+        // page (M5) and the facts continue on the memory path.
+        return if post == PageFence::Fenced {
+            KnowledgeBranch::Fenced
+        } else {
+            KnowledgeBranch::Fallback(facts)
+        };
+    }
+
     info!(
         agent = agent_id,
         page = %page_path,
@@ -1286,8 +1342,10 @@ async fn run_knowledge_branch(
     );
 
     // Memory keeps a pointer, never the full text (G3).
-    let pointer_written =
-        persist_wiki_pointer(agent_id, memory_db, home_dir, &page_path, &title, &summary).await;
+    let pointer_written = persist_wiki_pointer(
+        agent_id, memory_db, home_dir, &page_path, &title, &summary, sources,
+    )
+    .await;
 
     // WP6: the auto-filed page also produced a memory row, so MemoryBrowser
     // must refresh. Reusing `memory.changed` (rather than widening the
@@ -1346,7 +1404,12 @@ pub async fn persist_wiki_pointer(
     page_path: &str,
     title: &str,
     summary: &str,
+    sources: &[duduclaw_memory::SourceRef],
 ) -> bool {
+    // P2-B: the pointer carries the same turn's sources as its page (G2).
+    let Some(provenance) = crate::memory_provenance::provenance_of(sources) else {
+        return false;
+    };
     let subject = crate::auto_wiki_page::pointer_subject(page_path);
     let content = format!(
         "「{title}」已建檔於知識庫：{page_path}（{}）",
@@ -1386,13 +1449,24 @@ pub async fn persist_wiki_pointer(
         let engine = crate::memory_factory::build_memory_engine(&db, &home)
             .map_err(|e| format!("open memory engine: {e}"))?;
         let rt = tokio::runtime::Handle::current();
-        rt.block_on(engine.store_temporal(&agent, entry, meta))
+        rt.block_on(engine.store_temporal_outcome(&agent, entry, meta, provenance))
             .map_err(|e| format!("store pointer: {e}"))
     })
     .await;
 
     match result {
-        Ok(Ok(_)) => true,
+        Ok(Ok(duduclaw_memory::TemporalWriteOutcome::Stored(_))) => true,
+        Ok(Ok(duduclaw_memory::TemporalWriteOutcome::Fenced(r))) => {
+            crate::memory_provenance::record_fenced(home_dir, agent_id, "wiki_pointer", &r);
+            false
+        }
+        Ok(Ok(duduclaw_memory::TemporalWriteOutcome::Refused(r))) => {
+            warn!(
+                agent = agent_id,
+                "knowledge route: pointer refused by the supersession guard: {r}"
+            );
+            false
+        }
         Ok(Err(e)) => {
             warn!(
                 agent = agent_id,
@@ -1406,6 +1480,38 @@ pub async fn persist_wiki_pointer(
                 "knowledge route: pointer task panicked: {e}"
             );
             false
+        }
+    }
+}
+
+/// P2-B: the source fence for an auto page of this turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageFence {
+    /// No source of the turn was forgotten.
+    Clear,
+    /// A source was forgotten (audited): nothing from this turn is written.
+    Fenced,
+    /// The check could not be made: no page (fail closed), but the facts may
+    /// still take the memory path, which checks again in its transaction.
+    Unknown,
+}
+
+async fn page_fence(
+    memory_db: &Path,
+    home_dir: &Path,
+    agent_id: &str,
+    sources: &[duduclaw_memory::SourceRef],
+) -> PageFence {
+    match crate::memory_provenance::sources_forgotten(memory_db, home_dir, agent_id, sources).await
+    {
+        Ok(None) => PageFence::Clear,
+        Ok(Some(r)) => {
+            crate::memory_provenance::record_fenced(home_dir, agent_id, "auto_wiki_page", &r);
+            PageFence::Fenced
+        }
+        Err(e) => {
+            warn!(agent = agent_id, "knowledge route: source check failed, page not written: {e}");
+            PageFence::Unknown
         }
     }
 }
@@ -1433,6 +1539,7 @@ pub async fn run_ingest(
     memory_db: &Path,
     session_id: &str,
     origin: Option<(String, String)>,
+    sources: Vec<duduclaw_memory::SourceRef>,
 ) {
     INGEST_ORIGIN
         .scope(
@@ -1445,6 +1552,7 @@ pub async fn run_ingest(
                 home_dir,
                 memory_db,
                 session_id,
+                &sources,
                 None,
             ),
         )
@@ -1476,6 +1584,7 @@ async fn run_ingest_inner(
     home_dir: &Path,
     memory_db: &Path,
     session_id: &str,
+    sources: &[duduclaw_memory::SourceRef],
     utility_override: Option<UtilityResponse>,
 ) {
     // WP-2 role members never distil. A team role member is scaffolded per
@@ -1507,8 +1616,10 @@ async fn run_ingest_inner(
     // Deliberately ahead of the tier gate: "請叫我老李" is 5 chars and would be
     // classified `Skip`, yet it is exactly the kind of statement that must
     // stick. Zero LLM cost, best-effort, never affects the reply path.
-    crate::profile_distill::run_profile_distill(user_text, agent_id, user_id, memory_db, home_dir)
-        .await;
+    crate::profile_distill::run_profile_distill(
+        user_text, agent_id, user_id, memory_db, home_dir, sources,
+    )
+    .await;
 
     // WP5c stage 1: knowledge-base grading. Runs BEFORE `classify_for_ingest`
     // and looks only at the user's text, so a long pasted document answered
@@ -1527,11 +1638,12 @@ async fn run_ingest_inner(
             home_dir,
             memory_db,
             session_id,
+            sources,
             utility_override.clone(),
         )
         .await
         {
-            KnowledgeBranch::Filed => return,
+            KnowledgeBranch::Filed | KnowledgeBranch::Fenced => return,
             KnowledgeBranch::Fallback(facts) => pre_extracted = facts,
         }
     }
@@ -1548,7 +1660,7 @@ async fn run_ingest_inner(
             );
             return;
         }
-        persist_facts(agent_id, home_dir, memory_db, facts).await;
+        persist_facts(agent_id, home_dir, memory_db, facts, sources).await;
         return;
     }
 
@@ -1616,7 +1728,7 @@ async fn run_ingest_inner(
         return;
     }
 
-    persist_facts(agent_id, home_dir, memory_db, facts).await;
+    persist_facts(agent_id, home_dir, memory_db, facts, sources).await;
 }
 
 /// D2: what the write-side guard did to one `(origin, subject)` group.
@@ -1683,7 +1795,16 @@ async fn persist_facts(
     home_dir: &Path,
     memory_db: &Path,
     facts: Vec<DistilledFact>,
+    sources: &[duduclaw_memory::SourceRef],
 ) {
+    // P2-B: a fact is stored only with the turn's host-generated sources.
+    let Some(provenance) = crate::memory_provenance::provenance_of(sources) else {
+        info!(
+            agent = agent_id,
+            "Conversation distill: turn has no recorded source, nothing stored"
+        );
+        return;
+    };
     let agent = agent_id.to_string();
     let home = home_dir.to_path_buf();
     let db = memory_db.to_path_buf();
@@ -1716,6 +1837,7 @@ async fn persist_facts(
             &agent,
             &facts,
             &home_for_blocking,
+            &provenance,
         ))
     })
     .await;
@@ -1798,6 +1920,34 @@ pub(crate) async fn dispatch_quarantine_side_effects(
 
     for outcome in outcomes {
         let trust_held = outcome.disposition == DISPOSITION_TRUST_HELD;
+
+        // P2-B (G5): a card is filed only for rows that still exist and were
+        // not forgotten since they were written. Fail closed: when the rows
+        // cannot be checked, no card (the inert rows are swept later).
+        let live_outcome;
+        let outcome = if outcome.ids.is_empty() {
+            outcome
+        } else {
+            match live_memory_ids(home_dir, memory_db, agent_id, &outcome.ids).await {
+                Ok(live) if live.is_empty() => {
+                    info!(
+                        agent = agent_id,
+                        "review card not filed: its rows no longer exist (forgotten or removed)"
+                    );
+                    continue;
+                }
+                Ok(live) => {
+                    let mut o = outcome.clone();
+                    o.ids = live;
+                    live_outcome = o;
+                    &live_outcome
+                }
+                Err(e) => {
+                    warn!(agent = agent_id, "review card not filed: rows could not be checked: {e}");
+                    continue;
+                }
+            }
+        };
 
         // A held claim repeated while its review card is still open: no new
         // card and no new events row (the audit event already counted it). If
@@ -1883,9 +2033,49 @@ pub(crate) async fn dispatch_quarantine_side_effects(
                 .await
             {
                 warn!(agent = agent_id, "quarantine approval request failed: {e}");
+            } else {
+                // P2-B (G5) post-check: a forget applied while the card was
+                // being filed did not see it. Re-check; withdraw if gone.
+                // L-2: a check that cannot be made withdraws the card too
+                // (fail closed; the held rows stay quarantined).
+                let gone = match live_memory_ids(home_dir, memory_db, agent_id, &outcome.ids).await
+                {
+                    Ok(live) => live.is_empty(),
+                    Err(e) => {
+                        warn!(agent = agent_id, "card post-check failed, withdrawing: {e}");
+                        true
+                    }
+                };
+                if gone {
+                    if let Err(e) = scrub_review_store_for_forgotten(home_dir, &outcome.ids).await {
+                        warn!(agent = agent_id, "withdraw card of forgotten rows failed: {e}");
+                    }
+                }
             }
         }
     }
+}
+
+/// The subset of `ids` still live in `memory_db` (on a blocking thread).
+async fn live_memory_ids(
+    home_dir: &Path,
+    memory_db: &Path,
+    agent_id: &str,
+    ids: &[String],
+) -> Result<Vec<String>, String> {
+    let home = home_dir.to_path_buf();
+    let db = memory_db.to_path_buf();
+    let agent = agent_id.to_string();
+    let ids = ids.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let engine = crate::memory_factory::build_memory_engine(&db, &home)
+            .map_err(|e| format!("open memory engine: {e}"))?;
+        tokio::runtime::Handle::current()
+            .block_on(engine.live_memory_ids(&agent, &ids))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("live ids task: {e}"))?
 }
 
 /// Read a held claim as stored (on a blocking thread, through the factory).
@@ -2083,7 +2273,7 @@ pub(crate) async fn store_facts(
         };
 
         engine
-            .store_temporal(agent_id, entry, meta)
+            .store_temporal(agent_id, entry, meta, duduclaw_memory::lineage::Provenance::test_only())
             .await
             .map_err(|e| format!("store fact: {e}"))?;
         stored += 1;
@@ -2170,6 +2360,7 @@ async fn store_facts_protected(
     agent_id: &str,
     facts: &[DistilledFact],
     home_dir: &Path,
+    provenance: &duduclaw_memory::lineage::Provenance,
 ) -> Result<ProtectedStoreReport, String> {
     let mut report = ProtectedStoreReport::default();
 
@@ -2297,11 +2488,22 @@ async fn store_facts_protected(
         };
 
         let outcome = engine
-            .store_temporal_outcome(agent_id, entry.clone(), meta.clone())
+            .store_temporal_outcome(agent_id, entry.clone(), meta.clone(), provenance.clone())
             .await
             .map_err(|e| format!("store fact: {e}"))?;
         let id = match outcome {
             duduclaw_memory::TemporalWriteOutcome::Stored(id) => id,
+            duduclaw_memory::TemporalWriteOutcome::Fenced(refusal) => {
+                // P2-B: the turn's source was forgotten — not an error, skip.
+                report.skipped += 1;
+                crate::memory_provenance::record_fenced(
+                    home_dir,
+                    agent_id,
+                    "conversation_distill",
+                    &refusal,
+                );
+                continue;
+            }
             duduclaw_memory::TemporalWriteOutcome::Refused(refusal) => {
                 // The claim would have replaced a more trusted current fact.
                 // Hold it inert for human review instead of dropping it.
@@ -2322,7 +2524,13 @@ async fn store_facts_protected(
                 }
                 let mut admitter = held_claim_admitter(home_dir, agent_id);
                 let held = engine
-                    .hold_refused_claim_gated(agent_id, entry, meta, &mut || admitter.admit())
+                    .hold_refused_claim_gated(
+                        agent_id,
+                        entry,
+                        meta,
+                        provenance.clone(),
+                        &mut || admitter.admit(),
+                    )
                     .await;
                 let held = match held {
                     Ok(Some(h)) => h,
@@ -2344,7 +2552,14 @@ async fn store_facts_protected(
                         // R-L8: one fact that cannot be held must not stop
                         // the rest of the batch.
                         report.skipped += 1;
-                        warn!(agent = agent_id, "hold refused fact failed (skipped): {e}");
+                        if !crate::memory_provenance::record_fenced_error(
+                            home_dir,
+                            agent_id,
+                            "conversation_distill",
+                            &e,
+                        ) {
+                            warn!(agent = agent_id, "hold refused fact failed (skipped): {e}");
+                        }
                         continue;
                     }
                 };
@@ -2586,6 +2801,65 @@ pub struct ErasedReviewScrub {
 /// `decided_by` of a review card withdrawn because its rows were erased.
 pub const DECIDED_BY_GDPR_ERASE: &str = "system:gdpr_erase";
 
+/// `decided_by` of a review card withdrawn because its rows were forgotten
+/// by source (P2-B).
+pub const DECIDED_BY_FORGET_SOURCE: &str = "system:memory_forget_source";
+
+/// Text a forgotten card's summary and fields are replaced with.
+const FORGOTTEN_CARD_TEXT: &str = "（內容已依來源刪除移除）";
+const ERASED_CARD_TEXT: &str = "（內容已依資料刪除請求移除）";
+
+/// Forget-by-source follow-up (P2-B step `review_scrub`): every review card
+/// covering one of `forgotten_ids` is withdrawn when pending and has its
+/// text replaced in any status; matching `knowledge.quarantined` events.db
+/// rows are deleted. Idempotent.
+pub async fn scrub_review_store_for_forgotten(
+    home_dir: &Path,
+    forgotten_ids: &[String],
+) -> Result<ErasedReviewScrub, String> {
+    if forgotten_ids.is_empty() {
+        return Ok(ErasedReviewScrub::default());
+    }
+    let ids: HashSet<String> = forgotten_ids.iter().cloned().collect();
+    let mut out = scrub_cards(
+        home_dir,
+        DECIDED_BY_FORGET_SOURCE,
+        FORGOTTEN_CARD_TEXT,
+        |rec| card_quarantined_ids(rec).iter().any(|i| ids.contains(i)),
+    )
+    .await?;
+    let events = crate::events_store::EventBusStore::open(home_dir)
+        .map_err(|e| format!("events store (cards were scrubbed): {e}"))?;
+    out.events_deleted = events
+        .delete_by_quarantined_ids("knowledge.quarantined", &ids)
+        .await?;
+    Ok(out)
+}
+
+/// Number of review cards (any status) covering one of `ids` — the plan's
+/// `review_cards_matching`. Fails when the approvals store cannot be read.
+pub async fn count_review_cards_for_ids(home_dir: &Path, ids: &[String]) -> Result<u64, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let broker = crate::approval::ApprovalBroker::open(home_dir)?;
+    Ok(broker
+        .list_by_kind(ACTION_KIND_KNOWLEDGE_QUARANTINE)
+        .await?
+        .iter()
+        .filter(|rec| card_quarantined_ids(rec).iter().any(|i| ids.contains(i.as_str())))
+        .count() as u64)
+}
+
+fn card_quarantined_ids(rec: &crate::approval::ApprovalRecord) -> Vec<String> {
+    rec.payload
+        .get("quarantined_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
 /// Data-subject erase follow-up (R-M3): after `gdpr_erase` deleted
 /// `erased_ids`, remove the person's text from the review store too — every
 /// pending `knowledge_quarantine` card covering an erased row is withdrawn
@@ -2610,7 +2884,10 @@ pub async fn scrub_review_store_for_erased(
             .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
             .unwrap_or_default()
     };
-    let mut out = scrub_cards(home_dir, |rec| card_ids(rec).iter().any(|i| erased.contains(i))).await?;
+    let mut out = scrub_cards(home_dir, DECIDED_BY_GDPR_ERASE, ERASED_CARD_TEXT, |rec| {
+        card_ids(rec).iter().any(|i| erased.contains(i))
+    })
+    .await?;
     let events = crate::events_store::EventBusStore::open(home_dir)
         .map_err(|e| format!("events store (cards were scrubbed): {e}"))?;
     out.events_deleted = events
@@ -2630,7 +2907,7 @@ pub async fn scrub_review_store_for_contact(
     if contact.is_empty() {
         return Ok(ErasedReviewScrub::default());
     }
-    let mut out = scrub_cards(home_dir, |rec| {
+    let mut out = scrub_cards(home_dir, DECIDED_BY_GDPR_ERASE, ERASED_CARD_TEXT, |rec| {
         rec.payload.get("subject").and_then(|v| v.as_str()) == Some(contact)
     })
     .await?;
@@ -2659,6 +2936,8 @@ pub async fn scrub_review_store_after_erase(
 /// Withdraw (when pending) and scrub every knowledge-review card `matches`.
 async fn scrub_cards(
     home_dir: &Path,
+    decided_by: &str,
+    replacement: &str,
     matches: impl Fn(&crate::approval::ApprovalRecord) -> bool,
 ) -> Result<ErasedReviewScrub, String> {
     let mut out = ErasedReviewScrub::default();
@@ -2668,7 +2947,7 @@ async fn scrub_cards(
             continue;
         }
         if rec.status == crate::approval::ApprovalStatus::Pending
-            && broker.withdraw(&rec.id, DECIDED_BY_GDPR_ERASE).await?
+            && broker.withdraw(&rec.id, decided_by).await?
         {
             out.withdrawn += 1;
         }
@@ -2680,7 +2959,7 @@ async fn scrub_cards(
             "erased": true,
         });
         broker
-            .replace_text(&rec.id, "（內容已依資料刪除請求移除）", &payload)
+            .replace_text(&rec.id, replacement, &payload)
             .await?;
         out.scrubbed += 1;
     }
@@ -2791,6 +3070,10 @@ pub async fn file_migration_held_claims(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "wiki_ingest_p2b_tests.rs"]
+mod p2b_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3104,7 +3387,7 @@ mod tests {
             origin_trust: Some(1.0),
             ..TemporalMeta::default()
         };
-        engine.store_temporal(agent, entry, meta).await.unwrap();
+        engine.store_temporal(agent, entry, meta, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
     }
 
     /// Red-team: 5 poisoned facts pointing at ONE subject from ONE origin, in a
@@ -3143,7 +3426,7 @@ mod tests {
             })
             .collect();
 
-        let report = store_facts_protected(&engine, agent, &poison, home.path())
+        let report = store_facts_protected(&engine, agent, &poison, home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!(report.stored, 5, "all 5 written (as quarantined)");
@@ -3208,7 +3491,7 @@ mod tests {
             },
         ];
 
-        let report = store_facts_protected(&engine, agent, &facts, home.path())
+        let report = store_facts_protected(&engine, agent, &facts, home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!(report.stored, 1, "only the clean fact is stored");
@@ -3276,7 +3559,7 @@ mod tests {
             .id
             .clone();
 
-        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!(report.stored, 0);
@@ -3417,7 +3700,7 @@ mod tests {
             .id
             .clone();
 
-        let first = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+        let first = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         let held_id = first.outcomes[0].ids[0].clone();
@@ -3429,7 +3712,7 @@ mod tests {
         // the same-origin burst limit — 5 facts about one subject per hour —
         // past which the burst quarantine takes over, as before.)
         for _ in 0..2 {
-            let again = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+            let again = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
                 .await
                 .unwrap();
             assert_eq!(again.outcomes[0].ids, vec![held_id.clone()]);
@@ -3448,7 +3731,7 @@ mod tests {
         assert_eq!(repeats, 2, "every repeat is still audited");
 
         // A different object is a separate claim with its own card.
-        let other = store_facts_protected(&engine, agent, &[refund_fact("30 days")], home.path())
+        let other = store_facts_protected(&engine, agent, &[refund_fact("30 days")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_ne!(other.outcomes[0].ids[0], held_id);
@@ -3515,7 +3798,7 @@ mod tests {
         let agent = "support";
         store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
             .await;
-        let report = store_facts_protected(&engine, agent, &[refund_fact("365 days")], home.path())
+        let report = store_facts_protected(&engine, agent, &[refund_fact("365 days")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         let ids = report.outcomes[0].ids.clone();
@@ -3557,7 +3840,7 @@ mod tests {
         let agent = "support";
         store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
             .await;
-        let report = store_facts_protected(&engine, agent, &[refund_fact("365 days")], home.path())
+        let report = store_facts_protected(&engine, agent, &[refund_fact("365 days")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!((report.stored, report.held), (1, 0));
@@ -3574,10 +3857,10 @@ mod tests {
         let home = tmp_home();
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let agent = "support";
-        store_facts_protected(&engine, agent, &[refund_fact("7 days")], home.path())
+        store_facts_protected(&engine, agent, &[refund_fact("7 days")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
-        let report = store_facts_protected(&engine, agent, &[refund_fact("14 days")], home.path())
+        let report = store_facts_protected(&engine, agent, &[refund_fact("14 days")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!((report.stored, report.held), (1, 0));
@@ -3658,7 +3941,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:12345:0",
+            "telegram:12345:0", &crate::memory_provenance::test_sources(),
             // Model unreachable — the heuristic path must stand on its own.
             Some(Err("offline".to_string())),
         )
@@ -3739,7 +4022,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "dispatch:eph-agnes-r1-planner-9d9044",
+            "dispatch:eph-agnes-r1-planner-9d9044", &crate::memory_provenance::test_sources(),
             Some(Err("offline".to_string())),
         )
         .await;
@@ -3762,7 +4045,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:12345:0",
+            "telegram:12345:0", &crate::memory_provenance::test_sources(),
             Some(Err("offline".to_string())),
         )
         .await;
@@ -3784,7 +4067,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:12345:0",
+            "telegram:12345:0", &crate::memory_provenance::test_sources(),
             Some(Err("offline".to_string())),
         )
         .await;
@@ -3823,7 +4106,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:1:0",
+            "telegram:1:0", &crate::memory_provenance::test_sources(),
             llm("本公司的組織章程。"),
         )
         .await;
@@ -3838,7 +4121,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:1:0",
+            "telegram:1:0", &crate::memory_provenance::test_sources(),
             llm("本公司的組織章程，已新增第六條。"),
         )
         .await;
@@ -3885,7 +4168,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "webchat:abc",
+            "webchat:abc", &crate::memory_provenance::test_sources(),
             Some(Ok(r#"```json
             {"facts": [], "knowledge_grade": true, "doc_type": "policy",
              "page_title": "營運政策", "page_slug": "operating-policy",
@@ -3917,7 +4200,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "webchat:abc",
+            "webchat:abc", &crate::memory_provenance::test_sources(),
             Some(Ok(
                 r#"{"facts": [], "knowledge_grade": true, "doc_type": "charter",
                         "page_title": "公司章程",
@@ -3965,7 +4248,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:1:0",
+            "telegram:1:0", &crate::memory_provenance::test_sources(),
             Some(Err("offline".to_string())),
         )
         .await;
@@ -4002,7 +4285,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:1:0",
+            "telegram:1:0", &crate::memory_provenance::test_sources(),
             Some(Ok(
                 r#"{"facts": [{"content": "團隊的內部政策說明已更新。"}],
                         "knowledge_grade": false}"#
@@ -4037,7 +4320,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:1:0",
+            "telegram:1:0", &crate::memory_provenance::test_sources(),
             Some(Ok(
                 r#"{"facts": [], "knowledge_grade": true, "doc_type": "policy",
                         "page_title": "內部政策", "page_slug": "internal-policy",
@@ -4089,7 +4372,7 @@ mod tests {
                 "u1",
                 home.path(),
                 &db,
-                "telegram:1:0",
+                "telegram:1:0", &crate::memory_provenance::test_sources(),
                 llm(&format!("章程修訂版 {i}")),
             )
             .await;
@@ -4110,7 +4393,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:1:0",
+            "telegram:1:0", &crate::memory_provenance::test_sources(),
             llm("章程修訂版 4"),
         )
         .await;
@@ -4160,7 +4443,7 @@ mod tests {
                 "u1",
                 home.path(),
                 &db,
-                "telegram:1:0",
+                "telegram:1:0", &crate::memory_provenance::test_sources(),
                 llm.clone(),
             )
             .await;
@@ -4176,7 +4459,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:1:0",
+            "telegram:1:0", &crate::memory_provenance::test_sources(),
             llm.clone(),
         )
         .await;
@@ -4211,7 +4494,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:1:0",
+            "telegram:1:0", &crate::memory_provenance::test_sources(),
             Some(Ok(r#"{"facts": [{"content": "公司章程共有五條。"}],
                         "knowledge_grade": true, "doc_type": "charter",
                         "page_title": "公司章程", "page_slug": "company-charter"}"#
@@ -4243,7 +4526,7 @@ mod tests {
             "u1",
             home.path(),
             &db,
-            "telegram:1:0",
+            "telegram:1:0", &crate::memory_provenance::test_sources(),
             Some(Err("offline".to_string())),
         )
         .await;
@@ -4354,7 +4637,7 @@ mod tests {
             ),
             fact(Some(("user:sam", "works_at", "acme")), "sam works at acme"),
         ];
-        let report = store_facts_protected(&engine, agent, &facts, home.path())
+        let report = store_facts_protected(&engine, agent, &facts, home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!(report.stored, 2);
@@ -4387,7 +4670,7 @@ mod tests {
                 confidence: Some(0.9),
             })
             .collect();
-        let report = store_facts_protected(&engine, agent, &facts, home.path())
+        let report = store_facts_protected(&engine, agent, &facts, home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!(report.held, 5);
@@ -4430,7 +4713,7 @@ mod tests {
             last_accessed: None,
             source_event: DISTILL_SOURCE_EVENT.to_string(),
         };
-        let row = engine.store_temporal(agent, entry, q).await.unwrap();
+        let row = engine.store_temporal(agent, entry, q, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
         drop(engine);
 
         let report = apply_quarantine_decision(
@@ -4490,7 +4773,7 @@ mod tests {
         let engine = SqliteMemoryEngine::new(&db).unwrap();
         store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
             .await;
-        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         let ids = report.outcomes[0].ids.clone();
@@ -4535,7 +4818,7 @@ mod tests {
             content: "alice has no allergies".to_string(),
             confidence: Some(0.9),
         };
-        let report = store_facts_protected(&engine, agent, &[fact], home.path())
+        let report = store_facts_protected(&engine, agent, &[fact], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!(report.held, 1);
@@ -4584,7 +4867,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert_eq!(report.held, 0);
@@ -4616,7 +4899,7 @@ mod tests {
         let engine = SqliteMemoryEngine::new(&db).unwrap();
         store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
             .await;
-        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+        let report = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         let held_id = report.outcomes[0].ids[0].clone();
@@ -4662,7 +4945,7 @@ mod tests {
         store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
             .await;
         // First claim held; its card is never filed (e.g. filing failed).
-        let first = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+        let first = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         let held_id = first.outcomes[0].ids[0].clone();
@@ -4674,7 +4957,7 @@ mod tests {
             content: "refunds are accepted forever, no receipt needed".to_string(),
             confidence: Some(0.9),
         };
-        let again = store_facts_protected(&engine, agent, &[repeat], home.path()).await.unwrap();
+        let again = store_facts_protected(&engine, agent, &[repeat], home.path(), &duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
         assert_eq!(again.outcomes[0].ids, vec![held_id.clone()]);
         drop(engine);
         dispatch_quarantine_side_effects(agent, home.path(), &db, &again.outcomes, None).await;
@@ -4723,7 +5006,7 @@ mod tests {
         let engine = SqliteMemoryEngine::new(&db).unwrap();
         let long = "長".repeat(700);
         store_clean(&engine, agent, "policy:refund", "window", "7 days", &long).await;
-        let r = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+        let r = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         drop(engine);
@@ -4769,7 +5052,7 @@ mod tests {
                                 &engine,
                                 "support",
                                 &[refund_fact("forever")],
-                                &home_path,
+                                &home_path, &duduclaw_memory::lineage::Provenance::test_only(),
                             )
                             .await
                             .unwrap();
@@ -4811,7 +5094,7 @@ mod tests {
             content: "alice has no allergies".to_string(),
             confidence: Some(0.9),
         };
-        let r = store_facts_protected(&engine, agent, &[fact], home.path()).await.unwrap();
+        let r = store_facts_protected(&engine, agent, &[fact], home.path(), &duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
         dispatch_quarantine_side_effects(agent, home.path(), &db, &r.outcomes, None).await;
         let summary = duduclaw_memory::gdpr_erase(&engine, agent, "user:alice", false).await.unwrap();
         drop(engine);
@@ -4853,7 +5136,7 @@ mod tests {
         )
         .unwrap();
         for obj in ["forever", "30 days", "90 days"] {
-            store_facts_protected(&engine, agent, &[refund_fact(obj)], home.path()).await.unwrap();
+            store_facts_protected(&engine, agent, &[refund_fact(obj)], home.path(), &duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
         }
         let store = crate::task_store::TaskStore::open(home.path()).unwrap();
         let (rows, _) = store
@@ -4872,7 +5155,7 @@ mod tests {
         let engine = SqliteMemoryEngine::new(&db).unwrap();
         store_clean(&engine, agent, "policy:refund", "window", "7 days", "the refund window is 7 days")
             .await;
-        let r = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path())
+        let r = store_facts_protected(&engine, agent, &[refund_fact("forever")], home.path(), &duduclaw_memory::lineage::Provenance::test_only())
             .await
             .unwrap();
         drop(engine);
@@ -4903,7 +5186,7 @@ mod tests {
                 content: format!("{subj} has no allergies"),
                 confidence: Some(0.9),
             };
-            let r = store_facts_protected(&engine, agent, &[fact], home.path()).await.unwrap();
+            let r = store_facts_protected(&engine, agent, &[fact], home.path(), &duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
             dispatch_quarantine_side_effects(agent, home.path(), &db, &r.outcomes, None).await;
         }
         // First run: memory erased, review scrub "failed" (not run).
@@ -4954,7 +5237,7 @@ mod tests {
             last_accessed: None,
             source_event: DISTILL_SOURCE_EVENT.to_string(),
         };
-        let row = engine.store_temporal(agent, entry, q).await.unwrap();
+        let row = engine.store_temporal(agent, entry, q, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap();
         drop(engine);
         let report = apply_quarantine_decision(
             home.path().to_path_buf(),

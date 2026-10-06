@@ -86,6 +86,7 @@ pub async fn record_trait(
     predicate: &str,
     value: &str,
     origin_trust: f64,
+    provenance: crate::lineage::Provenance,
 ) -> Result<String> {
     record_trait_with_origin(
         engine,
@@ -95,6 +96,7 @@ pub async fn record_trait(
         value,
         DEFAULT_PROFILE_ORIGIN,
         origin_trust,
+        provenance,
     )
     .await
 }
@@ -112,9 +114,10 @@ pub async fn record_trait_with_origin(
     value: &str,
     origin: &str,
     origin_trust: f64,
+    provenance: crate::lineage::Provenance,
 ) -> Result<String> {
     let (entry, meta) = trait_write(agent_id, user_id, predicate, value, origin, origin_trust);
-    engine.store_temporal(agent_id, entry, meta).await
+    engine.store_temporal(agent_id, entry, meta, provenance).await
 }
 
 /// [`record_trait_with_origin`] with the typed outcome of
@@ -130,9 +133,12 @@ pub async fn record_trait_outcome(
     value: &str,
     origin: &str,
     origin_trust: f64,
+    provenance: crate::lineage::Provenance,
 ) -> Result<crate::supersession_guard::TemporalWriteOutcome> {
     let (entry, meta) = trait_write(agent_id, user_id, predicate, value, origin, origin_trust);
-    engine.store_temporal_outcome(agent_id, entry, meta).await
+    engine
+        .store_temporal_outcome(agent_id, entry, meta, provenance)
+        .await
 }
 
 /// Hold a refused trait inert for human review
@@ -146,10 +152,20 @@ pub async fn hold_trait(
     value: &str,
     origin: &str,
     origin_trust: f64,
+    provenance: crate::lineage::Provenance,
 ) -> Result<String> {
-    Ok(hold_trait_outcome(engine, agent_id, user_id, predicate, value, origin, origin_trust)
-        .await?
-        .id)
+    Ok(hold_trait_outcome(
+        engine,
+        agent_id,
+        user_id,
+        predicate,
+        value,
+        origin,
+        origin_trust,
+        provenance,
+    )
+    .await?
+    .id)
 }
 
 /// [`hold_trait`], reporting whether the trait was newly held or an identical
@@ -164,9 +180,12 @@ pub async fn hold_trait_outcome(
     value: &str,
     origin: &str,
     origin_trust: f64,
+    provenance: crate::lineage::Provenance,
 ) -> Result<crate::supersession_guard::HeldClaim> {
     let (entry, meta) = trait_write(agent_id, user_id, predicate, value, origin, origin_trust);
-    engine.hold_refused_claim_outcome(agent_id, entry, meta).await
+    engine
+        .hold_refused_claim_outcome(agent_id, entry, meta, provenance)
+        .await
 }
 
 /// [`hold_trait_outcome`] with an admission gate for NEW held rows
@@ -181,10 +200,13 @@ pub async fn hold_trait_gated(
     value: &str,
     origin: &str,
     origin_trust: f64,
+    provenance: crate::lineage::Provenance,
     admit: &mut (dyn FnMut() -> bool + Send),
 ) -> Result<Option<crate::supersession_guard::HeldClaim>> {
     let (entry, meta) = trait_write(agent_id, user_id, predicate, value, origin, origin_trust);
-    engine.hold_refused_claim_gated(agent_id, entry, meta, admit).await
+    engine
+        .hold_refused_claim_gated(agent_id, entry, meta, provenance, admit)
+        .await
 }
 
 /// The entry + temporal metadata one trait write stores.
@@ -333,11 +355,22 @@ pub async fn consolidate_profile(
         object: Some(summary),
         confidence: Some(0.9),
         origin: Some(DEFAULT_PROFILE_ORIGIN.to_string()),
-        derived_from: Some(source_ids),
+        derived_from: Some(source_ids.clone()),
         ..Default::default()
     };
-    match engine.store_temporal_outcome(agent_id, entry, meta).await? {
+    // P2-B: the summary inherits every source of the traits it summarizes.
+    let provenance = crate::lineage::Provenance::derived(source_ids);
+    match engine
+        .store_temporal_outcome(agent_id, entry, meta, provenance)
+        .await?
+    {
         crate::supersession_guard::TemporalWriteOutcome::Stored(id) => Ok(Some(id)),
+        // A trait it was built from was forgotten (or deleted) after it was
+        // read: no summary this time.
+        crate::supersession_guard::TemporalWriteOutcome::Fenced(r) => {
+            tracing::warn!(agent = agent_id, "profile summary not written: {r}");
+            Ok(None)
+        }
         // An older summary is more trusted than the traits it is rebuilt from
         // now (e.g. a trait was re-recorded at lower trust): keep it rather
         // than fail the caller; the next consolidation retries.
@@ -384,14 +417,14 @@ mod tests {
     #[tokio::test]
     async fn record_supersede_and_render() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
-        record_trait(&engine, "a", "u1", "prefers", "tea", 1.0)
+        record_trait(&engine, "a", "u1", "prefers", "tea", 1.0, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
-        record_trait(&engine, "a", "u1", "timezone", "Asia/Taipei", 1.0)
+        record_trait(&engine, "a", "u1", "timezone", "Asia/Taipei", 1.0, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         // Supersede the first trait.
-        record_trait(&engine, "a", "u1", "prefers", "coffee", 1.0)
+        record_trait(&engine, "a", "u1", "prefers", "coffee", 1.0, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
 
@@ -420,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn consolidation_respects_threshold_and_supersedes() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
-        record_trait(&engine, "a", "u1", "prefers", "tea", 1.0)
+        record_trait(&engine, "a", "u1", "prefers", "tea", 1.0, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         // Below threshold(3) → no summary.
@@ -429,10 +462,10 @@ mod tests {
             .unwrap()
             .is_none());
 
-        record_trait(&engine, "a", "u1", "timezone", "Asia/Taipei", 1.0)
+        record_trait(&engine, "a", "u1", "timezone", "Asia/Taipei", 1.0, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
-        record_trait(&engine, "a", "u1", "language", "zh-TW", 1.0)
+        record_trait(&engine, "a", "u1", "language", "zh-TW", 1.0, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         let first = consolidate_profile(&engine, "a", "u1", 3).await.unwrap();
@@ -472,7 +505,7 @@ mod tests {
     async fn webchat_profile_survives_a_reconnect() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         // Recorded on one WebSocket connection…
-        record_trait(&engine, "a", "webchat:alice:aaaa1111", "prefers", "tea", 1.0)
+        record_trait(&engine, "a", "webchat:alice:aaaa1111", "prefers", "tea", 1.0, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         // …must still be visible after a page reload mints a new nonce.
@@ -486,7 +519,7 @@ mod tests {
     #[tokio::test]
     async fn cross_agent_isolation() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
-        record_trait(&engine, "a1", "u1", "prefers", "tea", 1.0)
+        record_trait(&engine, "a1", "u1", "prefers", "tea", 1.0, crate::lineage::Provenance::test_only())
             .await
             .unwrap();
         assert!(profile_block(&engine, "a2", "u1").await.unwrap().is_none());

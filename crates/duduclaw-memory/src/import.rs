@@ -29,6 +29,59 @@ fn import_meta() -> TemporalMeta {
     }
 }
 
+/// P2-B source of one imported record: the file (by canonical path) and the
+/// record's content (`item:<hash>`), never its position, so a reordered or
+/// edited file cannot shift a forgotten record onto another key (H-3 / M-9).
+/// Forgetting a whole import source blocks it regardless of time, so a
+/// `touch` or a re-import of the same path cannot bring it back.
+struct ImportSource {
+    path: String,
+    observed_at: chrono::DateTime<Utc>,
+}
+
+impl ImportSource {
+    fn for_file(path: &Path) -> Self {
+        let abs = crate::lineage::canonical_import_id(&path.to_string_lossy());
+        let observed_at = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map(chrono::DateTime::<Utc>::from)
+            .unwrap_or_else(|_| Utc::now());
+        Self {
+            path: abs,
+            observed_at,
+        }
+    }
+
+    fn provenance(&self, record: &str) -> crate::lineage::Provenance {
+        crate::lineage::Provenance::source(crate::lineage::SourceRef::import_item(
+            &self.path,
+            record.as_bytes(),
+            self.observed_at,
+        ))
+    }
+}
+
+/// Store one imported record; `false` when the source fence refused it (its
+/// source was forgotten) — the import skips it and goes on.
+async fn store_imported(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    entry: MemoryEntry,
+    provenance: crate::lineage::Provenance,
+) -> Result<bool> {
+    match engine
+        .store_temporal_outcome(agent_id, entry, import_meta(), provenance)
+        .await?
+    {
+        crate::supersession_guard::TemporalWriteOutcome::Fenced(r) => {
+            tracing::warn!(agent_id, "imported record skipped: {r}");
+            Ok(false)
+        }
+        // An import carries no triple, so the trust guard never refuses it.
+        _ => Ok(true),
+    }
+}
+
 // ── File size guard ─────────────────────────────────────────
 
 /// Maximum allowed import file size (50 MB).
@@ -120,6 +173,7 @@ pub async fn import_csv(
         .map_err(|e| DuDuClawError::Memory(format!("Failed to read CSV file: {e}")))?;
 
     let mut count = 0usize;
+    let source = ImportSource::for_file(path);
 
     if entry_type == "faq" {
         let mut rdr = csv::Reader::from_reader(file_content.as_bytes());
@@ -129,8 +183,10 @@ pub async fn import_csv(
             let content = format!("Q: {}\nA: {}", row.question.trim(), row.answer.trim());
             let tags = vec!["faq".to_string()];
             let entry = build_memory_entry(agent_id, &content, &tags, 5.0);
-            engine.store_temporal(agent_id, entry, import_meta()).await?;
-            count += 1;
+            let prov = source.provenance(&entry.content);
+            if store_imported(engine, agent_id, entry, prov).await? {
+                count += 1;
+            }
         }
     } else {
         let mut rdr = csv::Reader::from_reader(file_content.as_bytes());
@@ -145,8 +201,10 @@ pub async fn import_csv(
                 .filter(|s| !s.is_empty())
                 .collect();
             let entry = build_memory_entry(agent_id, row.content.trim(), &tags, 5.0);
-            engine.store_temporal(agent_id, entry, import_meta()).await?;
-            count += 1;
+            let prov = source.provenance(&entry.content);
+            if store_imported(engine, agent_id, entry, prov).await? {
+                count += 1;
+            }
         }
     }
 
@@ -171,12 +229,15 @@ pub async fn import_json(
         .map_err(|e| DuDuClawError::Memory(format!("JSON parse error: {e}")))?;
 
     let mut count = 0usize;
+    let source = ImportSource::for_file(path);
     for record in records {
         let tags = record.tags.unwrap_or_default();
         let importance = record.importance.unwrap_or(5.0).clamp(0.0, 10.0);
         let entry = build_memory_entry(agent_id, record.content.trim(), &tags, importance);
-        engine.store_temporal(agent_id, entry, import_meta()).await?;
-        count += 1;
+        let prov = source.provenance(&entry.content);
+        if store_imported(engine, agent_id, entry, prov).await? {
+            count += 1;
+        }
     }
 
     info!(agent_id, count, path = %path.display(), "JSON import complete");
@@ -197,6 +258,7 @@ pub async fn import_jsonl(
         .map_err(|e| DuDuClawError::Memory(format!("Failed to read JSONL file: {e}")))?;
 
     let mut count = 0usize;
+    let source = ImportSource::for_file(path);
     for (line_num, line) in file_content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -208,8 +270,10 @@ pub async fn import_jsonl(
         let tags = record.tags.unwrap_or_default();
         let importance = record.importance.unwrap_or(5.0).clamp(0.0, 10.0);
         let entry = build_memory_entry(agent_id, record.content.trim(), &tags, importance);
-        engine.store_temporal(agent_id, entry, import_meta()).await?;
-        count += 1;
+        let prov = source.provenance(&entry.content);
+        if store_imported(engine, agent_id, entry, prov).await? {
+            count += 1;
+        }
     }
 
     info!(agent_id, count, path = %path.display(), "JSONL import complete");

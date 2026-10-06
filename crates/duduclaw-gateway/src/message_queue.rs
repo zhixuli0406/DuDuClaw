@@ -90,6 +90,10 @@ pub struct QueueMessage {
     /// Wiki RL trust feedback session id (v1.10). Channel session id used
     /// as the per-conversation cap budget key.
     pub session_id: Option<String>,
+    /// P2-B: the sender had only half of its upstream turn identity and
+    /// dropped both halves; the receiving run records the upstream as
+    /// unknown instead of treating the message as having no upstream.
+    pub upstream_unknown: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +174,13 @@ impl MessageQueue {
         // citation tracking (correct fallback — no signal to apply).
         Self::ensure_column(conn, "message_queue", "turn_id", "TEXT")?;
         Self::ensure_column(conn, "message_queue", "session_id", "TEXT")?;
+        // P2-B: explicit "upstream identity dropped" marker.
+        Self::ensure_column(
+            conn,
+            "message_queue",
+            "upstream_unknown",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 
@@ -210,8 +221,9 @@ impl MessageQueue {
         conn.execute(
             "INSERT INTO message_queue \
              (id, sender, target, payload, status, retry_count, delegation_depth, \
-              origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id, \
+              upstream_unknown) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 msg.id,
                 msg.sender,
@@ -226,6 +238,7 @@ impl MessageQueue {
                 msg.reply_channel,
                 msg.turn_id,
                 msg.session_id,
+                msg.upstream_unknown,
             ],
         )
         .map_err(|e| format!("enqueue: {e}"))?;
@@ -303,7 +316,7 @@ impl MessageQueue {
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
                  origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-                 reply_channel, turn_id, session_id \
+                 reply_channel, turn_id, session_id, upstream_unknown \
                  FROM message_queue WHERE status = 'pending' \
                  ORDER BY created_at ASC LIMIT ?1",
             )
@@ -331,7 +344,7 @@ impl MessageQueue {
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
                  origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-                 reply_channel, turn_id, session_id \
+                 reply_channel, turn_id, session_id, upstream_unknown \
                  FROM message_queue WHERE status = 'acked' AND acked_at < ?1",
             )
             .map_err(|e| format!("prepare stale: {e}"))?;
@@ -356,7 +369,7 @@ impl MessageQueue {
         conn.query_row(
             "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
              origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-             reply_channel, turn_id, session_id \
+             reply_channel, turn_id, session_id, upstream_unknown \
              FROM message_queue WHERE id = ?1",
             params![message_id],
             |row| Self::row_to_message(row),
@@ -423,6 +436,7 @@ impl MessageQueue {
             reply_channel: row.get(14)?,
             turn_id: row.get(15)?,
             session_id: row.get(16)?,
+            upstream_unknown: row.get::<_, Option<bool>>(17)?.unwrap_or(false),
         })
     }
 
@@ -551,6 +565,7 @@ mod tests {
             reply_channel: reply_channel.map(str::to_string),
             turn_id: None,
             session_id: None,
+            upstream_unknown: false,
         }
     }
 

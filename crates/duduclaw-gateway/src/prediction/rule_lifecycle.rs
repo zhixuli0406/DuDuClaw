@@ -942,7 +942,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        engine.store_temporal(agent, entry, meta).await.unwrap()
+        engine.store_temporal(agent, entry, meta, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap()
     }
 
     async fn read_stats(engine: &SqliteMemoryEngine, agent: &str, id: &str) -> RuleStats {
@@ -978,7 +978,7 @@ mod tests {
             metadata: Some(serde_json::json!({ "rule_stats": stats })),
             ..Default::default()
         };
-        engine.store_temporal(agent, entry, meta).await.unwrap()
+        engine.store_temporal(agent, entry, meta, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap()
     }
 
     #[tokio::test]
@@ -1623,7 +1623,7 @@ mod tests {
             metadata: Some(metadata),
             ..Default::default()
         };
-        engine.store_temporal(agent, entry, meta).await.unwrap()
+        engine.store_temporal(agent, entry, meta, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap()
     }
 
     #[tokio::test]
@@ -1830,7 +1830,7 @@ mod tests {
             metadata: Some(metadata),
             ..Default::default()
         };
-        engine.store_temporal(agent, entry, meta).await.unwrap()
+        engine.store_temporal(agent, entry, meta, duduclaw_memory::lineage::Provenance::test_only()).await.unwrap()
     }
 
     #[tokio::test]

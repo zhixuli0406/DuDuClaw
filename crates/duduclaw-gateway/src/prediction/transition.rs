@@ -264,8 +264,14 @@ pub async fn write_transition(
     else {
         return Ok(None);
     };
+    // System content (G15): a task outcome transition, not a conversation.
     engine
-        .store_temporal(agent_id, entry, meta)
+        .store_temporal(
+            agent_id,
+            entry,
+            meta,
+            duduclaw_memory::lineage::Provenance::System { producer: "task_transition" },
+        )
         .await
         .map(Some)
         .map_err(|e| e.to_string())

@@ -124,6 +124,27 @@ The temporal store tracks **two** time axes: `valid_from`/`valid_until` (world-t
 
 Since v1.67.1 a caller treated as an AI employee may only invalidate the `channel`, `mcp_external` and `tool_echo` classes, the ones below the agent-derived ceiling. Any other origin is refused and audited as `memory_invalidate_refused`. The check fails closed: any caller on the gateway's shared internal key counts as an AI employee, whether or not an employee identity is present in the process, and so does a key that belongs to an employee or to an ephemeral employee (`eph-` ids). Only an admin key that maps to no employee is unrestricted. Before, a steered AI employee could expire every operator-level fact in its namespace in one call (since v1.68.0 that is the employee's own namespace, see [Memory namespaces](#memory-namespaces-v1680)).
 
+### Source lineage and forgetting by source
+
+Every write into `memories` or `key_facts` records where it came from, in a `memory_origins` row written in the same SQLite transaction as the memory itself. The gateway builds the source, never the model: one channel message (conversation id plus message number), one scheduled or dispatched run, one MCP turn of an employee, one call from an external MCP client, one record of an imported file, one day of usage footprint, or the system. An imported file is identified by its resolved path and each record by a hash of its content, so the same file imported again in a different order is still the same source; a copy at another path is a different source.
+
+A memory derived from other memories (a reflexion rule, a consolidated fact, a superseding statement) copies all of its parents' sources when it is written, up to 512 per row, so "everything that came from this source" is one indexed lookup. A derived write that names a parent memory which does not exist is refused. Before, an unknown parent only lowered the trust of the write.
+
+`duduclaw memory forget-source` (operator terminal only) uses this record:
+
+1. `plan` is a dry run. It computes which memories, key facts and archive copies came from the source, directly or through derivation, records the plan with an expiry, and files an approval request.
+2. An Admin approves that exact plan in the dashboard.
+3. `apply --confirm` deletes those rows in one transaction in `memory.db` and writes tombstones (`forgotten_sources`, `forgotten_memories`). Every write path checks the tombstones inside its own transaction, and a database trigger aborts any insert the check missed, so the same source cannot be learned from again. A refused write is audited as `memory_write_fenced` (digests only, at most 50 rows per employee per UTC day, after which it only counts).
+4. Steps outside `memory.db` follow, each recorded and safe to repeat: delete auto-filed wiki pages that still list the source, withdraw review cards, hide the forgotten messages from the employee (the original text stays in `sessions.db`), and clear the conversation's compressed summary. `resume` re-runs the ones that failed, and the gateway retries them at start-up and every 10 minutes.
+
+A memory supported by the forgotten source and by another source is deleted whole, because its content may include what the forgotten source said. A memory the source only mentioned again (a reaffirmation) stays, and its confidence does not go back down. Links in a supersession chain that pass through a deleted memory are cut; an older version it had superseded stays expired and is not restored as the current value.
+
+Pages an employee writes itself with `wiki_write` during a turn or a run now carry a `host_sources` frontmatter key holding the sources of that write (the newest 20). The key belongs to the host, and a value the employee writes is dropped. Forgetting a source never deletes such a page, because the employee may have written things that did not come from that source. The plan lists the pages whose recorded sources match, for you to review.
+
+Limits that matter: the command does not delete conversation text, sent messages, backups, content other employees received, or what the tool-call log, error notes, task board, working state and Agent Mail hold. Memories written before this feature have no recorded source; the plan counts them and does not delete them. Restoring a backup taken before a forget brings the memories back and removes the tombstones, and downgrading to a version without this feature is not supported. The step-by-step procedure is [Forgetting a conversation, a scheduled run or an imported file](../guides/memory-and-knowledge.md#45-forgetting-a-conversation-a-scheduled-run-or-an-imported-file); the approval and guard behavior is in [Security Defense](05-security-defense.md#forget-by-source-needs-an-admin-approval).
+
+Set `[memory] forget_source = false` in `config.toml` to stop new plans and applies. The dashboard approval in front of `apply` has no switch. This feature has not yet been verified on a live gateway with real channels.
+
 ### Write-side poison protection (D2)
 
 D1 lets you *undo* a poisoned source; D2 stops most poison from landing in the first place (PoisonedRAG, arXiv:2402.07867). The auto-distillation write path is guarded at two ends:

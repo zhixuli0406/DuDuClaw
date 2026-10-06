@@ -463,13 +463,24 @@ async fn consolidate_group(
     // approved) value already governs this category key. The rule is not
     // stored, but the sources are still resolved below — otherwise every
     // later settle would rebuild and re-refuse the same rule (a retry loop).
+    // System content (G13): consolidated from MistakeNotebook entries, not
+    // from a memory row or a conversation turn the engine can trace.
     let semantic_id = match engine
-        .store_temporal_outcome(agent_id, entry, meta)
+        .store_temporal_outcome(
+            agent_id,
+            entry,
+            meta,
+            duduclaw_memory::lineage::Provenance::System { producer: "reflexion" },
+        )
         .await
         .map_err(|e| format!("store semantic rule: {e}"))?
     {
         duduclaw_memory::TemporalWriteOutcome::Stored(id) => Some(id),
         duduclaw_memory::TemporalWriteOutcome::Refused(r) => {
+            tracing::info!(agent = agent_id, "reflexion rule not stored: {r}");
+            None
+        }
+        duduclaw_memory::TemporalWriteOutcome::Fenced(r) => {
             tracing::info!(agent = agent_id, "reflexion rule not stored: {r}");
             None
         }
@@ -1045,7 +1056,7 @@ mod tests {
                         predicate: Some("requires_care".into()),
                         origin: Some("operator".into()),
                         ..Default::default()
-                    },
+                    }, duduclaw_memory::lineage::Provenance::test_only(),
                 )
                 .await
                 .unwrap();

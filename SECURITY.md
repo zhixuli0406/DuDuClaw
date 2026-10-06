@@ -225,6 +225,18 @@ What the operator should know:
 
 Not yet verified: the end-to-end test with a real key has not been rerun since the last change to this code, and it has not been run on Linux, inside a Docker container or on Windows. See [docs/features/13-multi-runtime.md](docs/features/13-multi-runtime.md).
 
+### Forget by source: residual risks (not yet released)
+
+`duduclaw memory forget-source` deletes the memories a source produced and blocks that source from being learned again. It is gated by a dashboard approval from an Admin, a refusal inside an employee's session, and a Bash-lane rule. Not yet verified on a live gateway with real channels. What it does not do, and where it can be bypassed:
+
+- It does not delete conversation text (the messages are hidden from the employee, the original stays in `sessions.db`), sent messages, backups or content other employees received. Tool-call records and error notes that are put into the prompt each turn, the task board, working state, Agent Mail, goal state, hand-off copies, replies between employees, the Claude CLI's own transcripts, shared wiki copies and wiki pages the employee wrote itself (an older page has no recorded source, a newer one is only listed for review) can still carry the forgotten text back to the employee. The full list is printed with every plan.
+- Memories stored through the Gemini CLI runtime are not tied to a conversation and are not reached; Grok has not been verified. An imported file copied to another path is a new source.
+- What the employee learns again in a new conversation is new information and is not blocked. Restoring a backup from before a forget brings the memories back and removes the block. Memories written before the feature have no recorded source and are never deleted by it.
+- The Bash-lane rule for `memory forget-source` and `memory migrate-namespace` is a speed bump. A global option between `memory` and the subcommand, a binary named by command substitution, a command fed through a pipe and other spellings that avoid matching on the command name get past it. The command's own AI-session check can be defeated by unsetting the gateway's variables. The dashboard approval is the gate. An employee that runs as the same operating-system user, can execute arbitrary commands and deliberately evades the file guard can still rewrite `approvals.db` and `memory.db` directly. Real isolation is not granting Bash, or running the employee in the task sandbox.
+- The approval card says the request came from a local command line; the system cannot tell who typed it. An Admin approves on that basis.
+
+See [docs/features/05-security-defense.md](docs/features/05-security-defense.md#forget-by-source-needs-an-admin-approval).
+
 ## Binary Distribution Security
 
 DuDuClaw binaries are:

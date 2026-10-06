@@ -188,6 +188,8 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
         || kind == crate::approval::WORKFLOW_ACTIVATION_KIND
         // F2: operator-terminal LINE inbox changes (`duduclaw ops channel-ingress`).
         || kind == crate::channel_ingress::cli_approval::ACTION_KIND
+        // P2-B: forget-by-source plans filed from the operator terminal.
+        || kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE
 }
 
 /// What the dashboard answers when a dashboard-only card is decided after it
@@ -200,6 +202,8 @@ pub(crate) fn dashboard_only_expired_text(kind: &str) -> &'static str {
         "這個工作流程啟用審核已逾期，工作流程不會啟用；要啟用請重新送審。"
     } else if kind == crate::channel_ingress::cli_approval::ACTION_KIND {
         "這則收件處理指令的審核已逾期，指令不會執行；需要的話請重新下指令。"
+    } else if kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE {
+        "這筆忘記請求已逾期，已自動拒絕；請重新建立計畫。"
     } else {
         "這則審核已逾期，已自動拒絕，無法再核准。"
     }
@@ -219,6 +223,9 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
     }
     if rec.action_kind == crate::channel_ingress::cli_approval::ACTION_KIND {
         return crate::channel_ingress::cli_approval::notice_body(rec, reminder);
+    }
+    if rec.action_kind == crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE {
+        return crate::memory_forget_approval::notice_body(rec, reminder, &deadline_phrase(rec));
     }
     let head = if reminder {
         "⏰ 有一則知識審核快到期了，逾時會自動捨棄"

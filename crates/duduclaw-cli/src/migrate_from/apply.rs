@@ -48,6 +48,7 @@ pub(super) async fn import_facts(
     agent_id: &str,
     label: &str,
     facts: &[String],
+    source_id: &str,
 ) {
     if facts.is_empty() {
         return;
@@ -61,14 +62,23 @@ pub(super) async fn import_facts(
         return;
     };
     let mut ok = 0usize;
-    for f in facts {
+    let now = chrono::Utc::now();
+    // H-3 / N8: the file is identified by its canonical path and each record
+    // by its content, so the same file re-imported (reordered, touched) stays
+    // forgotten. A copy at another path is a different source.
+    let canonical_id = duduclaw_memory::lineage::canonical_import_id(source_id);
+    for f in facts.iter() {
         let entry = build_semantic_entry(agent_id, f, ctx.platform);
         // WP1: migrated facts carry the `import` origin (ceiling 0.7).
         let meta = duduclaw_memory::TemporalMeta {
             origin: Some("import".to_string()),
             ..Default::default()
         };
-        if eng.store_temporal(agent_id, entry, meta).await.is_ok() {
+        // P2-B: an imported record's source is its file and its content.
+        let prov = duduclaw_memory::lineage::Provenance::source(
+            duduclaw_memory::SourceRef::import_item(&canonical_id, f.as_bytes(), now),
+        );
+        if eng.store_temporal(agent_id, entry, meta, prov).await.is_ok() {
             ok += 1;
         }
     }
@@ -101,6 +111,7 @@ pub(super) async fn store_import_memory(
     content: &str,
     tags: Vec<String>,
     mut meta: duduclaw_memory::TemporalMeta,
+    source_id: &str,
 ) {
     let scan = duduclaw_security::input_guard::scan_input(
         content,
@@ -140,8 +151,16 @@ pub(super) async fn store_import_memory(
         source_event: format!("migrate-from-{}", ctx.platform.as_str()),
     };
     meta.origin = Some("import".to_string());
-    match eng.store_temporal_outcome(agent_id, entry, meta).await {
+    let prov = duduclaw_memory::lineage::Provenance::source(duduclaw_memory::SourceRef::import_item(
+        &duduclaw_memory::lineage::canonical_import_id(source_id),
+        content.as_bytes(),
+        chrono::Utc::now(),
+    ));
+    match eng.store_temporal_outcome(agent_id, entry, meta, prov).await {
         Ok(duduclaw_memory::TemporalWriteOutcome::Stored(_)) => report.imported("memory", label),
+        Ok(duduclaw_memory::TemporalWriteOutcome::Fenced(_)) => {
+            report.skipped("memory", label, "此來源先前已依來源刪除，不再匯入")
+        }
         // L5: a more trusted current value (operator-set or approved) is kept;
         // the import does not overwrite it. Not a failure.
         Ok(duduclaw_memory::TemporalWriteOutcome::Refused(_)) => {
