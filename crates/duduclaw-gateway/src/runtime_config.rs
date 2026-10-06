@@ -758,7 +758,7 @@ mod tests {
         assert!(first.contains("(agent `writer`)"), "{first}");
         assert!(first.contains("agent.toml [runtime] provider"), "{first}");
         assert!(first.contains("antigravity"), "{first}");
-        assert!(first.contains("v1.70.0"), "{first}");
+        assert!(first.contains("v1.71.0"), "{first}");
         assert!(first.contains("docs/guides/deprecations.md"), "{first}");
         assert!(deprecated_runtime_first_notice(
             &mut seen,
