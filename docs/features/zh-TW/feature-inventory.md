@@ -97,7 +97,7 @@
 | Aider 式程式碼符號圖（`code_map` MCP 工具） | tree-sitter 符號圖疊在 HippoRAG-lite Personalized-PageRank 引擎上；依查詢相關度排序 repo 檔案 |
 | 語意向量記憶（`w_vec`） | FTS/graph 之外的第三個 re-rank 訊號；零依賴、CJK-safe 的 `NgramHashEmbedder`，以 `DUDUCLAW_SEMANTIC_VECTORS=1` 開啟 |
 | 跨 session 使用者畫像 | 每使用者偏好 traits（temporal supersession）→ session-stable 的 `## About This User` 回覆注入（來自 gateway 萃取與核准的審核）；`user_profile_record` / `user_profile_get` MCP 工具讀寫的是所有 gateway 啟動的員工共用的另一個命名空間，不會進入這個區塊（已知限制，v1.67.1） |
-| GDPR 匯出／抹除 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`（舊寫法 `gdpr export` 已在 v1.69.0 移除），涵蓋記憶（triple + 提及 + key_facts，四表級聯，SHA-256 tombstone）**與** session 儲存（`<channel>:<chat_id>` prefix） |
+| GDPR 匯出／抹除 | `duduclaw export gdpr <contact>` / `duduclaw gdpr erase <contact> --confirm`（舊寫法 `gdpr export` 已在 v1.69.0 移除），涵蓋記憶（triple + 提及 + key_facts + 衰減／forget 歸檔副本，五表級聯，SHA-256 tombstone；歸檔副本只留文字，以提及比對：只靠 subject／object 連到這個人、文字沒提到他的歸檔列找不到；試跑與匯出的歸檔筆數只算文字比對到的列，實際刪除時另外刪掉與被刪記憶同 id 的歸檔列，所以刪除筆數可能較多）**與** session 儲存（`<channel>:<chat_id>` prefix）；聯絡人空白或去掉前後空白後少於 3 個字元時，在讀取任何資料前就拒絕 |
 | Custom Dashboard Widgets | 在沙盒 runtime 中執行的 AI 引導或原始 HTML 儀表板卡片；Widget Studio 分享／匯入／匯出（[30-custom-widgets.md](30-custom-widgets.md)） |
 | 預算斷路器 | 每 agent 滑動視窗硬上限（`[budget] daily_cap_cents`），到頂即於 choke-point 阻斷 LLM 呼叫；寫 `budget_events.jsonl` |
 | 燒錢速率異常偵測 | 對每日花費做滾動平均＋標準差離群偵測（`cost_anomaly.rs`） |

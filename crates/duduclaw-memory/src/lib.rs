@@ -44,7 +44,7 @@ pub use engine::{
     SYSTEM_SIGNAL_SOURCE_EVENTS,
 };
 pub use feedback::{CitationTracker, DrainOnDrop, TrustSignal, WikiCitation};
-pub use gdpr::{gdpr_erase, gdpr_export, GdprEraseSummary};
+pub use gdpr::{gdpr_erase, gdpr_export, validate_contact as gdpr_validate_contact, GdprEraseSummary};
 pub use janitor::{JanitorConfig, JanitorReport, WikiJanitor};
 pub use lifecycle::{reassign_agent, reassign_agent_cross_db, ReassignSummary};
 // `Provenance` stays under `lineage::` — the crate root already exports
