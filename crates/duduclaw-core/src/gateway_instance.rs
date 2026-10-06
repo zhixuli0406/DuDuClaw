@@ -14,14 +14,23 @@
 //! Locks are per home: two homes in one process (tests) never block each
 //! other, and the same home locked twice in one process is refused like a
 //! second process would be.
+//!
+//! The holder line (`pid=… since=…`) lives in the sidecar
+//! `<home>/locks/gateway.lock.holder`, not in the lock file itself: on
+//! Windows `LockFileEx` guards the locked byte range against every other
+//! handle, so a holder line written into the lock file could not be read by
+//! `duduclaw doctor`, by a refused second gateway, or by this module's own
+//! `status` (the 2026-10-06 Windows CI failure of
+//! `one_holder_per_home_and_homes_do_not_block_each_other`). The lock file
+//! stays empty.
 use fs2::FileExt;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 const LOCK_FILE: &str = "gateway.lock";
+const HOLDER_FILE: &str = "gateway.lock.holder";
 const REFUSED_FILE: &str = "gateway.lock.refused";
 
 fn held_locks() -> &'static Mutex<HashMap<PathBuf, File>> {
@@ -39,6 +48,11 @@ pub fn lock_path(home: &Path) -> PathBuf {
 
 pub fn refused_marker_path(home: &Path) -> PathBuf {
     home.join("locks").join(REFUSED_FILE)
+}
+
+/// Where the current (or last) holder's `pid=… since=…` line is written.
+pub fn holder_path(home: &Path) -> PathBuf {
+    home.join("locks").join(HOLDER_FILE)
 }
 
 /// Take this home's gateway lock for the rest of the process. `Ok` when this
@@ -62,18 +76,21 @@ pub fn acquire(home: &Path) -> Result<(), String> {
             .open(lock_path(home))
             .map_err(|e| e.to_string())?;
         file.try_lock_exclusive().map_err(|_| {
-            let holder = std::fs::read_to_string(lock_path(home)).unwrap_or_default();
+            let holder = std::fs::read_to_string(holder_path(home)).unwrap_or_default();
             format!(
                 "another gateway already runs on this data directory ({})",
                 holder.trim()
             )
         })?;
-        file.set_len(0).map_err(|e| e.to_string())?;
-        writeln!(
-            file,
-            "pid={} since={}",
-            std::process::id(),
-            chrono::Utc::now().to_rfc3339()
+        // The holder line goes to the sidecar (see the module doc): readers
+        // on Windows cannot see bytes inside the locked file.
+        std::fs::write(
+            holder_path(home),
+            format!(
+                "pid={} since={}\n",
+                std::process::id(),
+                chrono::Utc::now().to_rfc3339()
+            ),
         )
         .map_err(|e| e.to_string())?;
         Ok(file)
@@ -136,7 +153,7 @@ pub fn status(home: &Path) -> (Option<String>, Option<String>) {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
-    (read(lock_path(home)), read(refused_marker_path(home)))
+    (read(holder_path(home)), read(refused_marker_path(home)))
 }
 
 #[cfg(test)]
