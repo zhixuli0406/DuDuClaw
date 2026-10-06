@@ -239,13 +239,13 @@ pub(super) async fn process_fixture() -> (
         isolated_home: String::new(),
     };
     let broker = Arc::new(ApprovalBroker::open(home.path()).unwrap());
-    let service = WorkflowService::new(
-        home.path().to_path_buf(),
-        "/usr/bin/true".into(),
-        store,
-        broker,
-    )
-    .unwrap();
+    // These fixtures never spawn the CLI; the executor only canonicalizes
+    // and hashes the path, so any existing file will do. A file inside the
+    // temp home works on every OS (`/usr/bin/true` does not exist on
+    // Windows, where the four tests using this helper failed in CI).
+    let binary = home.path().join("placeholder-duduclaw");
+    std::fs::write(&binary, b"placeholder").unwrap();
+    let service = WorkflowService::new(home.path().to_path_buf(), binary, store, broker).unwrap();
     (home, service, request, context)
 }
 #[tokio::test]
