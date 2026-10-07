@@ -130,7 +130,7 @@ mod mcp_import;
 mod mcp_rpc;
 mod mcp_oauth;
 mod mcp_ecosystem_rpc;
-pub use mcp_ecosystem_rpc::install_remote_entry_for_callback;
+pub use mcp_ecosystem_rpc::{finish_remote_sign_in, install_remote_entry_for_callback};
 mod google_rpc;
 mod accounts_util;
 mod tasks_rpc;

@@ -223,7 +223,7 @@ async fn oauth_connect_callback_bridge_and_refresh() {
     )
     .await
     .expect("start_connect");
-    let connect::ConnectOutcome::Authorize { authorize_url } = outcome else {
+    let connect::ConnectOutcome::Authorize { authorize_url, .. } = outcome else {
         panic!("expected an authorize URL")
     };
     assert!(authorize_url.starts_with(&format!("{base}/as/authorize?")));
@@ -327,4 +327,51 @@ async fn bearer_connect_probes_and_a_refused_token_is_reported() {
     assert!(!raw.contains("static-1"));
     let out = run(home, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n").await;
     assert_eq!(out[0]["result"]["protocolVersion"], "2025-06-18", "{out:?}");
+}
+
+/// A dashboard opened on a LAN address over plain http cannot receive the
+/// OAuth redirect. The provider is sent to the browser machine's loopback
+/// address on the dashboard port instead, and the operator pastes the
+/// address-bar URL back (`mcp.remote_complete`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lan_http_dashboard_signs_in_through_a_pasted_loopback_callback() {
+    let (fake, base) = start_fake().await;
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = home_dir.path();
+    std::fs::create_dir_all(home.join("agents").join("a1")).unwrap();
+
+    let outcome = connect::start_connect(
+        home,
+        connect::ConnectRequest {
+            agent_id: "a1".into(),
+            server: "fake".into(),
+            url: Some(format!("{base}/mcp")),
+            auth: store::AuthKind::Oauth,
+            bearer: None,
+            redirect_origin: Some("http://192.168.1.20:18789".into()),
+            client_id: None,
+            client_secret: None,
+            allowed_origins: vec![],
+        },
+    )
+    .await
+    .expect("start_connect from a LAN http dashboard");
+    let connect::ConnectOutcome::Authorize { authorize_url, completion, redirect_uri } = outcome else {
+        panic!("expected an authorize URL")
+    };
+    assert_eq!(completion, connect::Completion::Paste);
+    assert_eq!(redirect_uri, "http://127.0.0.1:18789/oauth/mcp/callback");
+
+    let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let resp = http.get(&authorize_url).send().await.unwrap();
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    assert!(location.starts_with("http://127.0.0.1:18789/oauth/mcp/callback?"), "{location}");
+
+    // What the operator copies from the address bar of the failed page.
+    let done = connect::complete_pasted(home, &location).await.expect("pasted callback");
+    assert_eq!((done.agent_id.as_str(), done.server.as_str()), ("a1", "fake"));
+    assert!(connect::complete_pasted(home, &location).await.is_err(), "single use");
+    assert_eq!(fake.lock().unwrap().grants, vec!["authorization_code"]);
+    let rec = store::get(home, "a1", "fake").unwrap().unwrap();
+    assert_eq!(rec.status, store::ConnStatus::Connected);
 }

@@ -1,6 +1,6 @@
 //! MCP Registry search / install and native remote MCP connections
 //! (`mcp.registry_search`, `mcp.registry_install`, `mcp.remote_connect`,
-//! `mcp.remote_status`, `mcp.remote_disconnect`).
+//! `mcp.remote_complete`, `mcp.remote_status`, `mcp.remote_disconnect`).
 //!
 //! Registry installs reuse the existing install path end to end: the fetched
 //! `server.json` goes through `parse_mcp_manifest_value`, then
@@ -45,6 +45,23 @@ pub(crate) fn install_remote_entry(home: &Path, agent_id: &str, server: &str) ->
 /// [`install_remote_entry`] for the HTTP callback in `server.rs`.
 pub fn install_remote_entry_for_callback(home: &Path, agent_id: &str, server: &str) -> Result<(), String> {
     install_remote_entry(home, agent_id, server)
+}
+
+/// After a finished OAuth sign-in (the HTTP callback or a pasted callback
+/// URL): write the bridge entry and audit. Both routes call this, so they
+/// cannot drift apart.
+pub async fn finish_remote_sign_in(home: &Path, done: &connect::Completed) -> Result<(), String> {
+    let (h, a, s) = (home.to_path_buf(), done.agent_id.clone(), done.server.clone());
+    let installed = tokio::task::spawn_blocking(move || install_remote_entry(&h, &a, &s))
+        .await
+        .unwrap_or_else(|e| Err(format!("internal error: {e}")));
+    remote_mcp::audit(
+        home,
+        remote_mcp::AUDIT_CONNECTED,
+        &done.agent_id,
+        json!({ "agent_id": done.agent_id, "server": done.server, "auth": "oauth", "entry_written": installed.is_ok() }),
+    );
+    installed
 }
 
 fn str_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
@@ -263,13 +280,24 @@ impl MethodHandler {
                 info!(agent = %agent_id, server = %server, "remote MCP server connected");
                 WsFrame::ok_response("", json!({ "status": "connected", "agent_id": agent_id, "server": server }))
             }
-            Ok(connect::ConnectOutcome::Authorize { authorize_url }) => {
-                remote_mcp::audit(&self.home_dir, remote_mcp::AUDIT_CONNECT_STARTED, &agent_id, details(json!({})));
+            Ok(connect::ConnectOutcome::Authorize { authorize_url, completion, redirect_uri }) => {
+                remote_mcp::audit(
+                    &self.home_dir,
+                    remote_mcp::AUDIT_CONNECT_STARTED,
+                    &agent_id,
+                    details(json!({ "completion": completion.as_str() })),
+                );
                 WsFrame::ok_response(
                     "",
                     json!({
                         "status": "authorize",
                         "authorize_url": authorize_url,
+                        // `paste`: the dashboard address cannot receive the
+                        // OAuth redirect (plain http on a LAN address); the
+                        // operator pastes the address-bar URL into
+                        // `mcp.remote_complete`.
+                        "completion": completion.as_str(),
+                        "redirect_uri": redirect_uri,
                         "expires_in": connect::PENDING_TTL.as_secs(),
                         "agent_id": agent_id,
                         "server": server,
@@ -283,6 +311,34 @@ impl MethodHandler {
                     &agent_id,
                     details(json!({ "error": duduclaw_core::truncate_chars(&e, 300) })),
                 );
+                WsFrame::error_response("", &e)
+            }
+        }
+    }
+
+    /// `mcp.remote_complete { callback_url }` — Admin only. Finishes a
+    /// sign-in started with `completion: "paste"` from the address the
+    /// browser showed after the provider redirected to the loopback address.
+    pub(crate) async fn handle_mcp_remote_complete(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let Some(pasted) = params.get("callback_url").and_then(|v| v.as_str()) else {
+            return WsFrame::error_response("", "callback_url is required");
+        };
+        match connect::complete_pasted(&self.home_dir, pasted).await {
+            Ok(done) => match finish_remote_sign_in(&self.home_dir, &done).await {
+                Ok(()) => {
+                    info!(agent = %done.agent_id, server = %done.server, actor = %ctx.email, "remote MCP sign-in completed (pasted callback)");
+                    WsFrame::ok_response(
+                        "",
+                        json!({ "status": "connected", "agent_id": done.agent_id, "server": done.server }),
+                    )
+                }
+                Err(e) => WsFrame::error_response(
+                    "",
+                    &format!("Signed in, but the employee's MCP settings could not be updated: {e}"),
+                ),
+            },
+            Err(e) => {
+                warn!(error = %e, "pasted remote MCP callback refused");
                 WsFrame::error_response("", &e)
             }
         }

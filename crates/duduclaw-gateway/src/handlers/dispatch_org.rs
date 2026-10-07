@@ -154,6 +154,10 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_mcp_remote_connect(params, ctx).await
             }
+            "mcp.remote_complete" => {
+                require_admin!();
+                self.handle_mcp_remote_complete(params, ctx).await
+            }
             "mcp.remote_status" => {
                 require_admin!();
                 self.handle_mcp_remote_status(params).await

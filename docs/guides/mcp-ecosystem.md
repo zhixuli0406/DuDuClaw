@@ -152,12 +152,26 @@ The redirect goes to the dashboard address you are using
 - an `https` address listed in `config.toml [gateway] allowed_origins` (or
   `DUDUCLAW_ALLOWED_ORIGINS`), compared by exact host and port.
 
-Plain `http` on any other host is refused (OAuth 2.1 allows non-https redirect
-URIs only for loopback). If you reach the dashboard over the LAN by IP, either
-open it as `http://localhost:<port>` on the gateway machine for the sign-in, or
-serve it over https and add the host to `allowed_origins`. The callback page is
-served by the gateway itself at `/oauth/mcp/callback`; it needs no login (the
-single-use state is the guard).
+Any other address (plain `http` on a LAN IP such as `http://192.168.1.20:18789`
+or a host name such as `http://duduclaw.local:18789`, or an https address not
+in `allowed_origins`) cannot receive the redirect, because OAuth 2.1 allows
+non-https redirect URIs only for loopback. For those, the sign-in still works
+in two steps:
+
+1. The provider is sent to `http://127.0.0.1:<dashboard port>/oauth/mcp/callback`,
+   the loopback address of the computer your browser runs on (RFC 8252 §7.3,
+   accepted by every OAuth 2.1 server). If the browser runs on the gateway
+   machine, that is the gateway itself and the sign-in finishes as usual.
+2. On another computer the page fails to load ("can't be reached"). That is
+   expected: copy the whole address from the address bar and paste it into
+   the box the connect dialog shows (RPC `mcp.remote_complete`). The gateway
+   accepts only a loopback address on `/oauth/mcp/callback` whose host, port
+   and path match the redirect this sign-in registered, and the state is used
+   once. The pasted address carries the one-time code and the state; the PKCE
+   verifier never leaves the gateway.
+
+The callback page is served by the gateway itself at `/oauth/mcp/callback`; it
+needs no login (the single-use state is the guard).
 
 ### What addresses the gateway may reach
 

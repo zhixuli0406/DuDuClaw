@@ -98,6 +98,41 @@ describe('RemoteConnectDialog', () => {
     expect(await screen.findByTestId('remote-waiting')).toBeInTheDocument();
   });
 
+  it('falls back to pasting the callback address when the dashboard address cannot receive the redirect', async () => {
+    const onConnected = vi.fn();
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'mcp.remote_connect') {
+        return Promise.resolve({
+          status: 'authorize', authorize_url: 'https://auth.example.com/authorize?x=2', expires_in: 600,
+          completion: 'paste', redirect_uri: 'http://127.0.0.1:18789/oauth/mcp/callback',
+          agent_id: 'nova', server: 'zapier',
+        });
+      }
+      if (method === 'mcp.remote_complete') return Promise.resolve({ status: 'connected', agent_id: 'nova', server: 'zapier' });
+      if (method === 'mcp.remote_status') return Promise.resolve({ servers: [] });
+      return Promise.resolve({});
+    });
+    renderWithProviders(
+      <RemoteConnectDialog
+        open
+        onClose={() => {}}
+        onConnected={onConnected}
+        agents={agents}
+        initial={{ agentId: 'nova', name: 'zapier', url: 'https://mcp.zapier.com/api/v1/connect', auth: 'oauth' }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /^sign in$/i }));
+    const box = await screen.findByTestId('remote-paste');
+    expect(box).toHaveTextContent('http://127.0.0.1:18789/oauth/mcp/callback');
+    const finish = screen.getByRole('button', { name: /finish sign-in/i });
+    expect(finish).toBeDisabled();
+    const pasted = 'http://127.0.0.1:18789/oauth/mcp/callback?code=c1&state=s1';
+    fireEvent.change(screen.getByLabelText(/address bar/i), { target: { value: pasted } });
+    fireEvent.click(finish);
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('mcp.remote_complete', { callback_url: pasted }));
+    await waitFor(() => expect(onConnected).toHaveBeenCalledWith('nova', 'zapier'));
+  });
+
   it('requires a token for bearer and never sends one otherwise', async () => {
     mockWsClient.call.mockResolvedValue({ status: 'connected', agent_id: 'nova', server: 'srv' });
     renderWithProviders(

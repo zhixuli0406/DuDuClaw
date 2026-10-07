@@ -2439,7 +2439,16 @@ export interface McpRemoteServerStatus {
 
 export type McpRemoteConnectResult =
   | { status: 'connected'; agent_id: string; server: string }
-  | { status: 'authorize'; authorize_url: string; expires_in: number; agent_id: string; server: string };
+  | {
+      status: 'authorize';
+      authorize_url: string;
+      /** `paste`: the dashboard address cannot receive the OAuth redirect; paste the address-bar URL into `remoteComplete`. */
+      completion?: 'redirect' | 'paste';
+      redirect_uri?: string;
+      expires_in: number;
+      agent_id: string;
+      server: string;
+    };
 
 export interface McpScanFinding {
   category: string;
@@ -6772,6 +6781,13 @@ export const api = {
       client_id?: string;
       client_secret?: string;
     }) => client.call('mcp.remote_connect', params) as Promise<McpRemoteConnectResult>,
+    /** Admin: finish a `completion: "paste"` sign-in with the URL from the browser's address bar. */
+    remoteComplete: (callbackUrl: string) =>
+      client.call('mcp.remote_complete', { callback_url: callbackUrl }) as Promise<{
+        status: 'connected';
+        agent_id: string;
+        server: string;
+      }>,
     /** Admin: connected remote servers (no secrets). */
     remoteStatus: (agentId?: string) =>
       client.call('mcp.remote_status', agentId ? { agent_id: agentId } : {}) as Promise<{

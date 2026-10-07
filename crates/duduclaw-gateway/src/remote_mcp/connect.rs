@@ -28,6 +28,9 @@ struct PendingConnect {
     mcp_url: String,
     redirect_uri: String,
     redirect_origin: String,
+    /// `true` when the browser cannot be sent back to the dashboard and the
+    /// operator pastes the callback URL instead ([`RedirectPlan::Paste`]).
+    paste: bool,
     code_verifier: String,
     token_endpoint: Url,
     issuer: String,
@@ -76,17 +79,10 @@ fn take_pending(state: &str) -> Option<PendingConnect> {
 /// origins (`[gateway] allowed_origins` + `DUDUCLAW_ALLOWED_ORIGINS`, matched
 /// with `duduclaw_core::origin_host_matches`). Plain http to a non-loopback
 /// origin is refused: OAuth 2.1 requires https redirect URIs except loopback.
+/// [`plan_redirect`] turns such an origin into the paste-back flow instead.
 pub fn validate_redirect_origin(raw: &str, allowed: &[String]) -> Result<String, String> {
-    let raw = raw.trim();
-    let url = Url::parse(raw).map_err(|e| format!("redirect_origin is not a valid origin: {e}"))?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("redirect_origin must not contain a user name or password".into());
-    }
-    if !(url.path() == "/" || url.path().is_empty()) || url.query().is_some() || url.fragment().is_some() {
-        return Err("redirect_origin must be an origin (scheme, host and port only)".into());
-    }
+    let (url, origin) = parse_origin(raw)?;
     let host = url.host().ok_or_else(|| "redirect_origin has no host".to_string())?;
-    let origin = url.origin().ascii_serialization();
     match url.scheme() {
         "http" | "https" if is_loopback_host(&host) => Ok(origin),
         "https" => {
@@ -99,6 +95,158 @@ pub fn validate_redirect_origin(raw: &str, allowed: &[String]) -> Result<String,
         }
         "http" => Err("a non-loopback dashboard origin must use https to receive an OAuth redirect".into()),
         other => Err(format!("unsupported redirect_origin scheme {other}")),
+    }
+}
+
+/// Parse a dashboard origin: http(s), no user info, no path / query /
+/// fragment. Returns the URL and its `scheme://host[:port]` serialization.
+fn parse_origin(raw: &str) -> Result<(Url, String), String> {
+    let raw = raw.trim();
+    let url = Url::parse(raw).map_err(|e| format!("redirect_origin is not a valid origin: {e}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("redirect_origin must not contain a user name or password".into());
+    }
+    if !(url.path() == "/" || url.path().is_empty()) || url.query().is_some() || url.fragment().is_some() {
+        return Err("redirect_origin must be an origin (scheme, host and port only)".into());
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("unsupported redirect_origin scheme {}", url.scheme()));
+    }
+    if url.host().is_none() {
+        return Err("redirect_origin has no host".into());
+    }
+    let origin = url.origin().ascii_serialization();
+    Ok((url, origin))
+}
+
+/// Where the authorization server sends the browser after sign-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedirectPlan {
+    /// The dashboard origin can receive the redirect itself (loopback, or
+    /// an https origin in `[gateway] allowed_origins`): the browser lands
+    /// on `<origin>/oauth/mcp/callback` and the gateway finishes.
+    Direct { origin: String, redirect_uri: String },
+    /// The dashboard was opened on an address that cannot receive an OAuth
+    /// redirect (plain http on a LAN IP or host name, or an https origin
+    /// not in the allowlist). The redirect goes to the loopback address of
+    /// the browser's own machine (RFC 8252 §7.3, the native-app rule every
+    /// OAuth 2.1 server accepts) on the dashboard's port. On the gateway
+    /// host that is the gateway itself and the sign-in finishes as usual;
+    /// on another machine the page fails to load, and the operator pastes
+    /// the address-bar URL back into the dashboard (`mcp.remote_complete`).
+    /// The pasted URL carries only the one-time code and the state; the
+    /// PKCE verifier never left the gateway.
+    Paste { origin: String, redirect_uri: String },
+}
+
+impl RedirectPlan {
+    pub fn redirect_uri(&self) -> &str {
+        match self {
+            RedirectPlan::Direct { redirect_uri, .. } | RedirectPlan::Paste { redirect_uri, .. } => redirect_uri,
+        }
+    }
+}
+
+/// Choose the redirect for a dashboard origin. Malformed origins are
+/// refused; a well-formed origin that cannot receive the redirect falls
+/// back to [`RedirectPlan::Paste`] instead of failing.
+pub fn plan_redirect(raw: &str, allowed: &[String]) -> Result<RedirectPlan, String> {
+    let (url, origin) = parse_origin(raw)?;
+    if let Ok(origin) = validate_redirect_origin(raw, allowed) {
+        let redirect_uri = format!("{origin}{CALLBACK_PATH}");
+        return Ok(RedirectPlan::Direct { origin, redirect_uri });
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "redirect_origin has no port".to_string())?;
+    let redirect_uri = if port == 80 {
+        format!("http://127.0.0.1{CALLBACK_PATH}")
+    } else {
+        format!("http://127.0.0.1:{port}{CALLBACK_PATH}")
+    };
+    Ok(RedirectPlan::Paste { origin, redirect_uri })
+}
+
+/// How the dashboard should wait for a started sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completion {
+    /// The gateway callback route finishes it; poll `mcp.remote_status`.
+    Redirect,
+    /// The operator pastes the callback URL (`mcp.remote_complete`); the
+    /// callback route still finishes it when the browser is on the gateway.
+    Paste,
+}
+
+impl Completion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Completion::Redirect => "redirect",
+            Completion::Paste => "paste",
+        }
+    }
+}
+
+/// A pasted callback URL, split into what the sign-in needs.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PastedCallback {
+    Code { state: String, code: String, redirect_uri: String },
+    Error { state: String, error: String, description: String },
+}
+
+/// Parse the address-bar URL the operator pasted after a
+/// [`RedirectPlan::Paste`] sign-in. It must be a loopback http(s) URL on
+/// [`CALLBACK_PATH`] carrying `state` and either `code` or `error`.
+pub fn parse_pasted_callback(raw: &str) -> Result<PastedCallback, String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > 8192 {
+        return Err("paste the full address from the browser's address bar".into());
+    }
+    let url = Url::parse(raw).map_err(|_| "that is not a URL; paste the full address from the browser's address bar".to_string())?;
+    let host = url.host().ok_or_else(|| "the pasted URL has no host".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || !is_loopback_host(&host) || url.path() != CALLBACK_PATH {
+        return Err(format!("the pasted URL is not a sign-in callback (expected http://127.0.0.1:<port>{CALLBACK_PATH}?…)"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("the pasted URL must not contain a user name or password".into());
+    }
+    let mut state = None;
+    let mut code = None;
+    let mut error = None;
+    let mut description = String::new();
+    for (k, v) in url.query_pairs() {
+        match k.as_ref() {
+            "state" if state.is_none() => state = Some(v.into_owned()),
+            "code" if code.is_none() => code = Some(v.into_owned()),
+            "error" if error.is_none() => error = Some(v.into_owned()),
+            "error_description" if description.is_empty() => description = v.into_owned(),
+            // A repeated parameter is ambiguous: refuse rather than pick one.
+            "state" | "code" | "error" => return Err(format!("the pasted URL repeats the {k} parameter")),
+            _ => {}
+        }
+    }
+    let state = state.filter(|s| !s.is_empty()).ok_or_else(|| "the pasted URL has no state".to_string())?;
+    if let Some(error) = error {
+        return Ok(PastedCallback::Error { state, error, description });
+    }
+    let code = code.filter(|c| !c.is_empty()).ok_or_else(|| "the pasted URL has no authorization code".to_string())?;
+    let mut base = url.clone();
+    base.set_query(None);
+    base.set_fragment(None);
+    Ok(PastedCallback::Code { state, code, redirect_uri: base.to_string() })
+}
+
+/// Normalize a redirect URI for comparison (`localhost` and `127.0.0.1`
+/// are not interchangeable to an authorization server, so only the parsed
+/// form is compared, never a substring).
+fn same_redirect(a: &str, b: &str) -> bool {
+    match (Url::parse(a), Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme()
+                && a.host_str() == b.host_str()
+                && a.port_or_known_default() == b.port_or_known_default()
+                && a.path() == b.path()
+        }
+        _ => false,
     }
 }
 
@@ -122,8 +270,9 @@ pub struct ConnectRequest {
 pub enum ConnectOutcome {
     /// Stored and usable now (`none` / `bearer`).
     Connected,
-    /// The dashboard must open this URL; the callback finishes the job.
-    Authorize { authorize_url: String },
+    /// The dashboard must open this URL; the callback finishes the job
+    /// (or, for [`Completion::Paste`], the pasted address does).
+    Authorize { authorize_url: String, completion: Completion, redirect_uri: String },
 }
 
 fn resolve_url(home: &Path, req: &ConnectRequest) -> Result<Url, String> {
@@ -211,11 +360,11 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
             Ok(ConnectOutcome::Connected)
         }
         AuthKind::Oauth => {
-            let origin = validate_redirect_origin(
-                req.redirect_origin.as_deref().unwrap_or(""),
-                &req.allowed_origins,
-            )?;
-            let redirect_uri = format!("{origin}{CALLBACK_PATH}");
+            let plan = plan_redirect(req.redirect_origin.as_deref().unwrap_or(""), &req.allowed_origins)?;
+            let (origin, redirect_uri, paste) = match plan {
+                RedirectPlan::Direct { origin, redirect_uri } => (origin, redirect_uri, false),
+                RedirectPlan::Paste { origin, redirect_uri } => (origin, redirect_uri, true),
+            };
             let disc = oauth::discover(&url, policy).await?;
             let creds = match req.client_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 Some(cid) => {
@@ -273,8 +422,9 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
                 agent_id: req.agent_id,
                 server: req.server,
                 mcp_url: url.to_string(),
-                redirect_uri,
+                redirect_uri: redirect_uri.clone(),
                 redirect_origin: origin,
+                paste,
                 code_verifier: verifier,
                 token_endpoint: disc.metadata.token_endpoint.clone(),
                 issuer: disc.metadata.issuer.clone(),
@@ -288,7 +438,8 @@ pub async fn start_connect(home: &Path, req: ConnectRequest) -> Result<ConnectOu
                 prune(&mut map);
                 map.insert(state, entry);
             }
-            Ok(ConnectOutcome::Authorize { authorize_url: authorize_url.to_string() })
+            let completion = if paste { Completion::Paste } else { Completion::Redirect };
+            Ok(ConnectOutcome::Authorize { authorize_url: authorize_url.to_string(), completion, redirect_uri })
         }
     }
 }
@@ -353,6 +504,34 @@ pub fn cancel_pending(state: &str) -> Option<Completed> {
 /// (single use — a replayed callback finds nothing), then the code is
 /// exchanged and the tokens stored encrypted.
 pub async fn complete_callback(home: &Path, state: &str, code: &str) -> Result<Completed, String> {
+    complete_inner(home, state, code, None).await
+}
+
+/// Finish a sign-in from the address the operator pasted after a
+/// [`RedirectPlan::Paste`] redirect. The pasted URL must be the redirect URI
+/// this sign-in registered (same scheme, host, port and path); an error
+/// answer from the authorization server abandons the sign-in.
+pub async fn complete_pasted(home: &Path, pasted: &str) -> Result<Completed, String> {
+    match parse_pasted_callback(pasted)? {
+        PastedCallback::Error { state, error, description } => {
+            let what = duduclaw_core::truncate_chars(&format!("{error} {description}"), 300);
+            match cancel_pending(&state) {
+                Some(_) => Err(format!("The authorization server answered: {what}")),
+                None => Err("unknown or expired sign-in; start again from the dashboard".into()),
+            }
+        }
+        PastedCallback::Code { state, code, redirect_uri } => {
+            complete_inner(home, &state, &code, Some(&redirect_uri)).await
+        }
+    }
+}
+
+async fn complete_inner(
+    home: &Path,
+    state: &str,
+    code: &str,
+    pasted_redirect: Option<&str>,
+) -> Result<Completed, String> {
     if state.is_empty() || state.len() > 256 {
         return Err("missing or invalid state".into());
     }
@@ -361,6 +540,12 @@ pub async fn complete_callback(home: &Path, state: &str, code: &str) -> Result<C
     }
     let p = take_pending(state)
         .ok_or_else(|| "unknown or expired sign-in; start again from the dashboard".to_string())?;
+    if let Some(pasted) = pasted_redirect
+        && !(p.paste && same_redirect(pasted, &p.redirect_uri))
+    {
+        // The state was single use, so this sign-in is gone either way.
+        return Err("the pasted address does not belong to this sign-in; start again from the dashboard".into());
+    }
     let url = validate_remote_url(&p.mcp_url)?;
     let policy = OutboundPolicy::for_mcp_url(&url);
     let tokens = oauth::exchange_code(
@@ -651,6 +836,112 @@ mod tests {
         assert!(validate_redirect_origin("", &allowed).is_err());
     }
 
+    #[test]
+    fn lan_http_dashboard_falls_back_to_a_loopback_redirect_and_paste() {
+        let allowed = vec!["dash.example.com".to_string()];
+        // Loopback and allowlisted https stay direct.
+        assert_eq!(
+            plan_redirect("http://localhost:18789", &allowed).unwrap(),
+            RedirectPlan::Direct {
+                origin: "http://localhost:18789".into(),
+                redirect_uri: "http://localhost:18789/oauth/mcp/callback".into(),
+            }
+        );
+        assert!(matches!(plan_redirect("https://dash.example.com", &allowed).unwrap(), RedirectPlan::Direct { .. }));
+        // A LAN IP, a LAN host name and an unlisted https origin: paste,
+        // redirected to the browser machine's loopback on the same port.
+        for (raw, uri) in [
+            ("http://192.168.1.20:18789", "http://127.0.0.1:18789/oauth/mcp/callback"),
+            ("http://duduclaw.local:8080/", "http://127.0.0.1:8080/oauth/mcp/callback"),
+            ("http://10.0.0.5", "http://127.0.0.1/oauth/mcp/callback"),
+            ("https://evil.example.org", "http://127.0.0.1:443/oauth/mcp/callback"),
+        ] {
+            match plan_redirect(raw, &allowed).unwrap() {
+                RedirectPlan::Paste { redirect_uri, .. } => assert_eq!(redirect_uri, uri, "{raw}"),
+                other => panic!("{raw}: expected paste, got {other:?}"),
+            }
+        }
+        // Malformed origins are still refused, never turned into paste.
+        for raw in ["", "javascript:alert(1)", "http://u:p@192.168.1.20", "http://192.168.1.20/app", "ftp://192.168.1.20"] {
+            assert!(plan_redirect(raw, &allowed).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn pasted_callback_parsing() {
+        assert_eq!(
+            parse_pasted_callback("  http://127.0.0.1:18789/oauth/mcp/callback?code=abc&state=st1  ").unwrap(),
+            PastedCallback::Code {
+                state: "st1".into(),
+                code: "abc".into(),
+                redirect_uri: "http://127.0.0.1:18789/oauth/mcp/callback".into(),
+            }
+        );
+        assert_eq!(
+            parse_pasted_callback("http://127.0.0.1:18789/oauth/mcp/callback?error=access_denied&error_description=no&state=st1").unwrap(),
+            PastedCallback::Error { state: "st1".into(), error: "access_denied".into(), description: "no".into() }
+        );
+        for bad in [
+            "",
+            "code=abc&state=st1",
+            "http://192.168.1.20:18789/oauth/mcp/callback?code=abc&state=st1",
+            "http://localhost.evil.com/oauth/mcp/callback?code=abc&state=st1",
+            "http://127.0.0.1:18789/elsewhere?code=abc&state=st1",
+            "http://127.0.0.1:18789/oauth/mcp/callback?code=abc",
+            "http://127.0.0.1:18789/oauth/mcp/callback?state=st1",
+            "http://127.0.0.1:18789/oauth/mcp/callback?code=a&code=b&state=st1",
+            "http://u:p@127.0.0.1:18789/oauth/mcp/callback?code=abc&state=st1",
+        ] {
+            assert!(parse_pasted_callback(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pasted_url_must_match_a_paste_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let insert = |state: &str, paste: bool| {
+            let mut map = pending().lock().unwrap();
+            map.insert(
+                state.into(),
+                PendingConnect {
+                    agent_id: "a1".into(),
+                    server: "s".into(),
+                    mcp_url: "https://mcp.example.com/mcp".into(),
+                    redirect_uri: "http://127.0.0.1:18789/oauth/mcp/callback".into(),
+                    redirect_origin: "http://192.168.1.20:18789".into(),
+                    paste,
+                    code_verifier: "v".into(),
+                    token_endpoint: Url::parse("https://auth.example.com/token").unwrap(),
+                    issuer: "https://auth.example.com".into(),
+                    creds: ClientCredentials { client_id: "c".into(), client_secret: None, token_endpoint_auth: "none".into() },
+                    resource: "https://mcp.example.com/mcp".into(),
+                    scope: None,
+                    created: Instant::now(),
+                },
+            );
+        };
+        // Wrong port ⇒ refused, and the one-time state is consumed.
+        insert("st-paste-port", true);
+        let err = complete_pasted(dir.path(), "http://127.0.0.1:9999/oauth/mcp/callback?code=c&state=st-paste-port")
+            .await
+            .unwrap_err();
+        assert!(err.contains("does not belong"), "{err}");
+        assert!(take_pending("st-paste-port").is_none());
+        // A direct (non-paste) sign-in cannot be finished by pasting.
+        insert("st-direct", false);
+        assert!(complete_pasted(dir.path(), "http://127.0.0.1:18789/oauth/mcp/callback?code=c&state=st-direct").await.is_err());
+        // An error answer abandons the sign-in.
+        insert("st-denied", true);
+        let err = complete_pasted(
+            dir.path(),
+            "http://127.0.0.1:18789/oauth/mcp/callback?error=access_denied&state=st-denied",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("access_denied"), "{err}");
+        assert!(take_pending("st-denied").is_none());
+    }
+
     #[tokio::test]
     async fn callback_state_is_single_use_and_unknown_state_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -667,6 +958,7 @@ mod tests {
                     mcp_url: "https://mcp.example.com/mcp".into(),
                     redirect_uri: "http://localhost:1/oauth/mcp/callback".into(),
                     redirect_origin: "http://localhost:1".into(),
+                    paste: false,
                     code_verifier: "v".into(),
                     token_endpoint: Url::parse("https://auth.example.com/token").unwrap(),
                     issuer: "https://auth.example.com".into(),

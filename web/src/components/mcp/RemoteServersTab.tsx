@@ -85,6 +85,11 @@ export function RemoteConnectDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authorizeUrl, setAuthorizeUrl] = useState<string | null>(null);
+  // Set when the dashboard address cannot receive the OAuth redirect (plain
+  // http on a LAN address): the provider sends the browser to this loopback
+  // address and the operator pastes the address-bar URL back.
+  const [pasteRedirect, setPasteRedirect] = useState<string | null>(null);
+  const [pasted, setPasted] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const stopPolling = useCallback(() => {
@@ -103,6 +108,8 @@ export function RemoteConnectDialog({
     setClientSecret('');
     setError(null);
     setAuthorizeUrl(null);
+    setPasteRedirect(null);
+    setPasted('');
   }, [open, initial.agentId, initial.name, initial.url, initial.auth]);
 
   useEffect(() => stopPolling, [stopPolling]);
@@ -167,9 +174,30 @@ export function RemoteConnectDialog({
         close();
       } else {
         setAuthorizeUrl(res.authorize_url);
+        setPasteRedirect(res.completion === 'paste' ? (res.redirect_uri ?? '') : null);
         openExternal(res.authorize_url);
+        // Polling also covers the paste case: a browser on the gateway host
+        // lands on the gateway's own callback and finishes by itself.
         waitForCallback(res.expires_in, startedAt);
       }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitPasted = async () => {
+    const value = pasted.trim();
+    if (!value || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.mcp.remoteComplete(value);
+      stopPolling();
+      toast.success(intl.formatMessage({ id: 'mcp.remote.connected' }, { server: res.server }));
+      onConnected?.(res.agent_id, res.server);
+      close();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -219,6 +247,28 @@ export function RemoteConnectDialog({
               <ExternalLink className="size-3" />
               {intl.formatMessage({ id: 'mcp.remote.openSignIn' })}
             </a>
+            {pasteRedirect !== null && (
+              <div className="space-y-2 rounded-lg border border-border bg-muted/40 p-3" data-testid="remote-paste">
+                <p className="text-xs text-foreground">
+                  {intl.formatMessage({ id: 'mcp.remote.pasteHint' }, { address: pasteRedirect })}
+                </p>
+                <label className="sr-only" htmlFor="remote-pasted">
+                  {intl.formatMessage({ id: 'mcp.remote.pasteLabel' })}
+                </label>
+                <Input
+                  id="remote-pasted"
+                  value={pasted}
+                  inputMode="url"
+                  spellCheck={false}
+                  autoComplete="off"
+                  placeholder={`${pasteRedirect}?code=…`}
+                  onChange={(e) => setPasted(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') void submitPasted();
+                  }}
+                />
+              </div>
+            )}
           </div>
         ) : (
           <div className="space-y-3">
@@ -339,6 +389,12 @@ export function RemoteConnectDialog({
 
         <DialogFooter>
           <DialogClose render={<Button variant="outline">{intl.formatMessage({ id: 'mcp.cancel' })}</Button>} />
+          {authorizeUrl && pasteRedirect !== null && (
+            <Button variant="brand" onClick={submitPasted} disabled={busy || pasted.trim() === ''}>
+              {busy ? <Loader2 className="animate-spin" /> : null}
+              {intl.formatMessage({ id: 'mcp.remote.pasteSubmit' })}
+            </Button>
+          )}
           {!authorizeUrl && (
             <Button variant="brand" onClick={submit} disabled={!canSubmit}>
               {busy ? <Loader2 className="animate-spin" /> : null}

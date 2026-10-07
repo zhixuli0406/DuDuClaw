@@ -16066,35 +16066,21 @@ async fn handle_remote_mcp_oauth_callback(
     }
     let code = params.get("code").map(String::as_str).unwrap_or("");
     match remote_mcp::connect::complete_callback(&home, st, code).await {
-        Ok(done) => {
-            let (h, a, s) = (home.clone(), done.agent_id.clone(), done.server.clone());
-            let installed = tokio::task::spawn_blocking(move || {
-                crate::handlers::install_remote_entry_for_callback(&h, &a, &s)
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("internal error: {e}")));
-            remote_mcp::audit(
-                &home,
-                remote_mcp::AUDIT_CONNECTED,
-                &done.agent_id,
-                serde_json::json!({ "agent_id": done.agent_id, "server": done.server, "auth": "oauth", "entry_written": installed.is_ok() }),
-            );
-            match installed {
-                Ok(()) => {
-                    info!(agent = %done.agent_id, server = %done.server, "remote MCP sign-in completed");
-                    remote_mcp_result_page(
-                        true,
-                        &format!("{} is connected for {}. Return to the dashboard.", done.server, done.agent_id),
-                        Some(&done.redirect_origin),
-                    )
-                }
-                Err(e) => remote_mcp_result_page(
-                    false,
-                    &format!("Signed in, but the employee's MCP settings could not be updated: {e}"),
+        Ok(done) => match crate::handlers::finish_remote_sign_in(&home, &done).await {
+            Ok(()) => {
+                info!(agent = %done.agent_id, server = %done.server, "remote MCP sign-in completed");
+                remote_mcp_result_page(
+                    true,
+                    &format!("{} is connected for {}. Return to the dashboard.", done.server, done.agent_id),
                     Some(&done.redirect_origin),
-                ),
+                )
             }
-        }
+            Err(e) => remote_mcp_result_page(
+                false,
+                &format!("Signed in, but the employee's MCP settings could not be updated: {e}"),
+                Some(&done.redirect_origin),
+            ),
+        },
         Err(e) => {
             warn!(error = %e, "remote MCP sign-in callback failed");
             remote_mcp_result_page(false, &e, None)

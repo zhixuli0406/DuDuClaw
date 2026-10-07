@@ -120,6 +120,7 @@ impl MethodHandler {
                     { "name": "mcp.registry_search", "description": "Search the official MCP Registry (read-only, fixed host, cached)" },
                     { "name": "mcp.registry_install", "description": "Install a Registry server through the scanned install path (non-admin: install request)" },
                     { "name": "mcp.remote_connect", "description": "Connect a remote MCP server (OAuth / bearer / none) for an agent (admin)" },
+                    { "name": "mcp.remote_complete", "description": "Finish a remote MCP sign-in from a pasted callback URL (admin)" },
                     { "name": "mcp.remote_status", "description": "List connected remote MCP servers, no secrets (admin)" },
                     { "name": "mcp.remote_disconnect", "description": "Delete a remote MCP server's stored credentials (admin)" },
                     { "name": "install_requests.list", "description": "List install requests actionable by the caller (manager+)" },

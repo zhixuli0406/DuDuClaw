@@ -79,7 +79,12 @@ Client ID Metadata Documents（CIMD）は実装していません。公開 URL �
 - ループバック（`localhost`、`127.0.0.1`、`[::1]`）。http・https どちらも可。
 - `config.toml [gateway] allowed_origins`（または `DUDUCLAW_ALLOWED_ORIGINS`）に載っている `https` のアドレス。ホストとポートの完全一致で比較します。
 
-それ以外のホストの `http` は拒否します（OAuth 2.1 で https 以外のリダイレクト URI が許されるのはループバックだけです）。LAN の IP でダッシュボードを開いている場合は、サインイン時だけ Gateway マシン上で `http://localhost:<port>` を開くか、https で公開して `allowed_origins` にホストを追加してください。コールバックページは Gateway 自身が `/oauth/mcp/callback` で返し、ログインは不要です（一回限りの state が防御です）。
+それ以外のアドレス（LAN の IP `http://192.168.1.20:18789`、ホスト名 `http://duduclaw.local:18789`、`allowed_origins` にない https など）はリダイレクトを直接受け取れません。OAuth 2.1 で https 以外のリダイレクト URI が許されるのはループバックだけだからです。その場合は 2 段階でサインインします。
+
+1. サインインページはブラウザを `http://127.0.0.1:<ダッシュボードのポート>/oauth/mcp/callback`、つまり「ブラウザが動いているコンピューター」のループバックに戻します（RFC 8252 §7.3、すべての OAuth 2.1 サーバーが受け付けます）。ブラウザが Gateway マシン上にあれば、それは Gateway 自身なので通常どおり完了します。
+2. 別のコンピューターではそのページは開けません（「接続できません」）。これは想定どおりです。アドレスバーのアドレスをすべてコピーし、接続ダイアログに表示される欄に貼り付けてください（RPC `mcp.remote_complete`）。Gateway は `/oauth/mcp/callback` 上のループバックアドレスで、ホスト・ポート・パスがこのサインインで登録したリダイレクトと一致するものだけを受け付け、state は一度しか使えません。貼り付けるアドレスには一回限りの認可コードと state しか含まれず、PKCE の検証子は Gateway から出ません。
+
+コールバックページは Gateway 自身が `/oauth/mcp/callback` で返し、ログインは不要です（一回限りの state が防御です）。
 
 ### Gateway が接続してよいアドレス
 
