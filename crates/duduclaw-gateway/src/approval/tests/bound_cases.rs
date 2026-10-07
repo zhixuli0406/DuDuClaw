@@ -387,7 +387,10 @@ fn operation_crash_child() {
             .await
             .unwrap();
         b.decide_bound(&id, &context(), true).await.unwrap();
-        let claim = b.claim_operation(&op, &bound, "child", 1).await.unwrap();
+        // A generous lease: `begin_execution` requires `lease_until > now` in
+        // whole seconds, so a 1-second lease could lapse before it on a slow
+        // runner. The parent expires the lease itself before recovery.
+        let claim = b.claim_operation(&op, &bound, "child", 30).await.unwrap();
         b.begin_execution(&claim, &bound).await.unwrap();
         std::fs::write(
             home.join("provider-receipt.json"),
@@ -496,7 +499,9 @@ async fn task_deadline_is_rechecked_inside_claim_and_execution_transaction() {
         "human".into(),
     );
     task.status = "pending".into();
-    task.deadline_at = Some((Utc::now() + chrono::Duration::seconds(2)).to_rfc3339());
+    // A far deadline so a slow runner cannot cross it before the claim; the
+    // deadline is moved into the past directly in the store after the claim.
+    task.deadline_at = Some((Utc::now() + chrono::Duration::seconds(600)).to_rfc3339());
     store.insert_task(&task).await.unwrap();
     let snap = store.authority_snapshot("deadline").await.unwrap().unwrap();
     let p = json!({"write":1});
@@ -512,7 +517,13 @@ async fn task_deadline_is_rechecked_inside_claim_and_execution_transaction() {
     let op = b.prepare_operation(&id, "work", None).await.unwrap();
     b.decide_bound(&id, &context(), true).await.unwrap();
     let claim = b.claim_operation(&op, &bound, "runner", 30).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(2100)).await;
+    rusqlite::Connection::open(home.path().join("tasks.db"))
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET deadline_at=?1 WHERE id='deadline'",
+            rusqlite::params![(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()],
+        )
+        .unwrap();
     assert!(
         b.begin_execution(&claim, &bound)
             .await

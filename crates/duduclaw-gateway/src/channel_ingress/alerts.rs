@@ -126,7 +126,12 @@ pub(crate) fn alert_text(
 
 /// Queue one alert. Cheap; never fails the caller (errors are logged).
 pub(crate) async fn record(store: &IngressStore, kind: AlertKind, subject: &str, reason: &str) {
-    let now = chrono::Utc::now().timestamp();
+    record_at(store, kind, subject, reason, chrono::Utc::now().timestamp()).await;
+}
+
+/// [`record`] with an explicit timestamp, so tests can place alerts in a
+/// known window instead of depending on the wall clock.
+async fn record_at(store: &IngressStore, kind: AlertKind, subject: &str, reason: &str, now: i64) {
     let result = store.connection().lock().await.execute(
         "INSERT INTO ingress_alert_queue(kind,reason,subject,at) VALUES (?1,?2,?3,?4)",
         params![
@@ -269,16 +274,20 @@ mod tests {
     async fn a_burst_becomes_one_row_with_a_count_and_points_at_real_entries() {
         let dir = tempfile::tempdir().unwrap();
         let store = IngressStore::open(dir.path()).unwrap();
+        // Every alert and flush below sits in one window. With the wall clock
+        // a slow run could cross a ten-minute boundary between the batches
+        // and turn the second batch into a new window's first row.
+        let now = 3_000_000 * WINDOW_SECS + WINDOW_SECS / 2;
         for i in 0..500 {
-            record(
+            record_at(
                 &store,
                 AlertKind::Quarantined,
                 &format!("{i:064x}"),
                 "account_route_authorization_changed",
+                now - 1,
             )
             .await;
         }
-        let now = chrono::Utc::now().timestamp();
         flush(&store, dir.path(), None, now).await;
         let rows = activity(dir.path(), AlertKind::Quarantined).await;
         assert_eq!(rows.len(), 1);
@@ -290,11 +299,12 @@ mod tests {
         );
         // More of the same in the same window wait for the window to close.
         for i in 0..3 {
-            record(
+            record_at(
                 &store,
                 AlertKind::Quarantined,
                 &format!("{i:064x}"),
                 "account_route_authorization_changed",
+                now + 1,
             )
             .await;
         }
