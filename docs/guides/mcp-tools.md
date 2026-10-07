@@ -8,7 +8,8 @@ call. This page explains two things that are easy to get wrong:
 
 If you are adding a tool, read
 [custom-mcp-tool.md](custom-mcp-tool.md) first; this page is about the
-declaration surface, not the implementation.
+declaration surface, not the implementation. To run the server on its own,
+without the gateway, see [mcp-standalone.md](mcp-standalone.md).
 
 ## The rule: discoverable ⇔ callable
 
@@ -29,7 +30,8 @@ still reaches the real gate and is still refused, with the gate's own message.
 
 | Filter | Source | Effect when off / empty |
 |---|---|---|
-| External client whitelist | `principal.is_external` | Exactly 7 tools are listed |
+| External client whitelist | `principal.is_external` | Only the 7 legacy whitelist tools plus tools in explicitly granted scopes; then the scope row below applies |
+| Scopes of a non-employee caller | `principal.scopes`, for a key that holds no `admin` and is not an AI employee (not the gateway-internal key, not a per-agent key, not a process the gateway spawned for an employee) | Only tools whose minimum scope the key holds; tools that act for the process's own agent (`working_state_*`, `canvas_*`, `shared_wiki_delete`, `memory_search_by_layer` and three consolidation reads, …) are hidden from it, and from every external key, and the dispatch gate refuses them by the same rule (`process_agent_tool`). See [mcp-standalone.md](mcp-standalone.md) |
 | Google Workspace | `config.toml [integrations] google_workspace` | 19 `gmail_*` / `calendar_*` / `sheets_*` / `forms_*` / `gtasks_*` / `drive_*` / `docs_*` / `slides_*` tools hidden |
 | GitHub | `config.toml [integrations] github` | 5 `github_*` tools hidden |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | Denied tools hidden; a non-empty allowlist hides everything else. An entry matches a tool exactly, or by a trailing `*`: `*`, `mcp__duduclaw__*` (every DuDuClaw tool), `mcp__duduclaw__odoo_*` / `memory_*` (anchored prefix). `mcp__<other server>__…` never names a DuDuClaw tool; a `*` elsewhere is literal. The approval lists and `scoped_tools` use the same rule |

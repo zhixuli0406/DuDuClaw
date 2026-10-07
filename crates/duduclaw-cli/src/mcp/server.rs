@@ -47,7 +47,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     // very next call, not only after a restart.
     let auth_cache = crate::mcp_auth::KeyRegistryCache::new();
     let principal = crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache)
-        .map_err(|e| DuDuClawError::Gateway(format!("MCP authentication failed: {e}")))?;
+        .map_err(|e| DuDuClawError::Gateway(startup_auth_error(&e)))?;
     // Memory namespace unification (v1.68.0): an internal-key caller whose
     // `DUDUCLAW_AGENT_ID` is proven by `DUDUCLAW_AGENT_TOKEN` reads and writes
     // memory under the bare employee id — the same rows the gateway distils,
@@ -296,4 +296,39 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The boot-time authentication failure message. A missing key is the first
+/// thing a developer arriving from an MCP directory listing hits, so it names
+/// the one command that issues one.
+pub(crate) fn startup_auth_error(e: &crate::mcp_auth::AuthError) -> String {
+    match e {
+        crate::mcp_auth::AuthError::MissingKey => format!(
+            "MCP authentication failed: {e}. Run: duduclaw mcp init --client claude-code"
+        ),
+        _ => format!("MCP authentication failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod startup_auth_error_tests {
+    use super::startup_auth_error;
+    use crate::mcp_auth::AuthError;
+
+    #[test]
+    fn missing_key_names_the_init_command() {
+        assert_eq!(
+            startup_auth_error(&AuthError::MissingKey),
+            "MCP authentication failed: DUDUCLAW_MCP_API_KEY environment variable not set. \
+             Run: duduclaw mcp init --client claude-code"
+        );
+    }
+
+    #[test]
+    fn other_errors_keep_their_text() {
+        assert_eq!(
+            startup_auth_error(&AuthError::UnknownKey),
+            "MCP authentication failed: API key not found in registry"
+        );
+    }
 }

@@ -97,6 +97,11 @@ pub fn is_reserved_queue_sender(name: &str) -> bool {
 /// so the opt-in (`config.toml [acp] trusted = true`) has one spelling.
 pub const ACP_CLIENT_SENDER: &str = "a2a-client";
 
+/// Prefix of the client ids `duduclaw mcp init` issues standalone MCP keys
+/// under (`standalone-claude-code`, `standalone-codex`, …). Reserved at
+/// employee creation by [`is_reserved_agent_id`].
+pub const STANDALONE_CLIENT_PREFIX: &str = "standalone-";
+
 /// Is this sender a system/human interface rather than an agent?
 ///
 /// Exact match after trimming — never a substring test (project convention #2:
@@ -131,6 +136,10 @@ pub fn is_system_sender(sender: &str) -> bool {
 /// - [`RESERVED_QUEUE_SENDERS`] — queue sender names the dispatcher acts on.
 /// - any `__…` id — the namespace gateway-internal synthetic senders use
 ///   (e.g. `__deferred_gvu__`, which `is_valid_agent_id` otherwise accepts).
+/// - any [`STANDALONE_CLIENT_PREFIX`] id — the client ids `duduclaw mcp init`
+///   issues external keys under. Such a key keeps its wiki in
+///   `agents/<client_id>/wiki/`; an employee created under the same name
+///   would share that directory with the external key.
 ///
 /// Case-insensitive on purpose: it costs nothing and covers the day someone
 /// makes [`is_system_sender`] case-insensitive too.
@@ -140,6 +149,11 @@ pub fn is_reserved_agent_id(id: &str) -> bool {
         return false;
     }
     if s.starts_with("__") {
+        return true;
+    }
+    if s.get(..STANDALONE_CLIENT_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(STANDALONE_CLIENT_PREFIX))
+    {
         return true;
     }
     SYSTEM_SENDERS
@@ -1013,6 +1027,23 @@ mod tests {
             let d = denial(p, "sales_rep", "sales_rep");
             assert_eq!(d.reason, DenyReason::SelfDelegation, "{p:?}");
             assert!(d.message_zh().contains("不可委派給自己"));
+        }
+    }
+
+    /// Standalone profile: `duduclaw mcp init` client ids are not employee
+    /// names. Prefix match, case-insensitive; the bare word stays free.
+    #[test]
+    fn standalone_client_prefix_is_reserved() {
+        for id in [
+            "standalone-claude-code",
+            "standalone-codex",
+            "Standalone-X",
+            " standalone-a ",
+        ] {
+            assert!(is_reserved_agent_id(id), "{id:?}");
+        }
+        for id in ["standalone", "my-standalone-bot", "standalon-x", "嘟嘟"] {
+            assert!(!is_reserved_agent_id(id), "{id:?}");
         }
     }
 

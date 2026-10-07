@@ -22,6 +22,21 @@ pub struct OperatorCommand {
     pub path: &'static [&'static str],
 }
 
+/// The commands that issue an MCP key. A key is a credential for the MCP
+/// server with whatever scopes the command grants, so an AI employee must
+/// not mint one for itself: `mcp init` also refuses in an AI session
+/// (`ai_session_guard`), `mcp issue-refresh-token` is for operators only.
+pub const MCP_KEY_COMMANDS: &[OperatorCommand] = &[
+    OperatorCommand {
+        name: "duduclaw mcp init",
+        path: &["mcp", "init"],
+    },
+    OperatorCommand {
+        name: "duduclaw mcp issue-refresh-token",
+        path: &["mcp", "issue-refresh-token"],
+    },
+];
+
 const BINARIES: &[&str] = &[
     "duduclaw",
     "duduclaw.exe",
@@ -119,6 +134,71 @@ mod tests {
         ] {
             assert_eq!(bash_invokes_operator_command(cmd, INGRESS), None, "{cmd:?}");
         }
+    }
+
+    #[test]
+    fn mcp_key_commands_match_and_neighbours_do_not() {
+        for (cmd, want) in [
+            (
+                "duduclaw mcp init --client claude-code --yes",
+                "duduclaw mcp init",
+            ),
+            ("npx duduclaw mcp init", "duduclaw mcp init"),
+            (
+                "/usr/local/bin/duduclaw --home /x mcp \\\ninit",
+                "duduclaw mcp init",
+            ),
+            (
+                "duduclaw-pro MCP In''it --client print",
+                "duduclaw mcp init",
+            ),
+            (
+                "duduclaw mcp issue-refresh-token --client-id x --scopes admin",
+                "duduclaw mcp issue-refresh-token",
+            ),
+            (
+                "echo ok && duduclaw.exe mcp issue-refresh-token",
+                "duduclaw mcp issue-refresh-token",
+            ),
+        ] {
+            assert_eq!(
+                bash_invokes_operator_command(cmd, MCP_KEY_COMMANDS),
+                Some(want),
+                "{cmd:?}"
+            );
+        }
+        for cmd in [
+            "duduclaw mcp-server",
+            "duduclaw mcp list-tokens",
+            "duduclaw mcp revoke-token abc",
+            "grep 'mcp init' docs/guides/mcp-standalone.md",
+            "duduclaw mcp initx",
+        ] {
+            assert_eq!(
+                bash_invokes_operator_command(cmd, MCP_KEY_COMMANDS),
+                None,
+                "{cmd:?}"
+            );
+        }
+        assert!(matches!(
+            bash_operator_command_decision(
+                "duduclaw mcp init --client codex",
+                &HookCaller::Agent("ceo".into()),
+                MCP_KEY_COMMANDS
+            ),
+            Some(GuardDecision::BlockedOperatorCommand {
+                command: "duduclaw mcp init",
+                ..
+            })
+        ));
+        assert!(
+            bash_operator_command_decision(
+                "duduclaw mcp init --client codex",
+                &HookCaller::Absent,
+                MCP_KEY_COMMANDS
+            )
+            .is_none()
+        );
     }
 
     #[test]

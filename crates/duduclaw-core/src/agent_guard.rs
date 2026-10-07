@@ -367,6 +367,9 @@ impl GuardDecision {
                     "duduclaw ops computer-workspaces" => {
                         "需要凍結、撤銷或刪除電腦操作工作區，請由管理者在儀表板處理。"
                     }
+                    "duduclaw mcp init" | "duduclaw mcp issue-refresh-token" => {
+                        "MCP 金鑰只能由管理者簽發，AI 員工不可為自己簽發金鑰。"
+                    }
                     _ => "這項操作請由管理者處理。",
                 }
             )),

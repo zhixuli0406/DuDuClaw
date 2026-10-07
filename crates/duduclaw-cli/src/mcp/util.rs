@@ -144,6 +144,33 @@ pub(crate) fn wiki_agent_from_ns<'a>(
         .unwrap_or(default_agent)
 }
 
+/// Is this caller an external key? Same rule as [`wiki_agent_from_ns`]: an
+/// external key's write namespace is `external/<client_id>`.
+pub(crate) fn ns_is_external(ns_ctx: &crate::mcp_namespace::NamespaceContext) -> bool {
+    ns_ctx.write_namespace.starts_with("external/")
+}
+
+/// The identity shared-wiki reads (`wiki_ls` / `_read` / `_search` /
+/// `_stats` / `_lint` with `scope="shared"`) are judged by.
+///
+/// An employee reads as itself (`default_agent`), which decides the
+/// department pages it may see. An external key is not an employee and must
+/// not inherit the process agent's department, so it reads as nobody: the
+/// empty id resolves to no department (`resolve_agent_department` refuses an
+/// invalid id), which shows only pages every caller may see (no
+/// `departments/<dept>/` page, no namespace limited by
+/// `visible_to_departments`).
+pub(crate) fn shared_wiki_reader<'a>(
+    ns_ctx: &crate::mcp_namespace::NamespaceContext,
+    default_agent: &'a str,
+) -> &'a str {
+    if ns_is_external(ns_ctx) {
+        ""
+    } else {
+        default_agent
+    }
+}
+
 /// Resolve the agent identity to stamp on execution-attribution records for
 /// this MCP call — `tool_calls.jsonl` audit rows and dashboard live-feedback
 /// events. NOT for delegation-policy decisions (see below).

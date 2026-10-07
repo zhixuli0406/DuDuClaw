@@ -32,7 +32,7 @@ pub(crate) async fn handle_create_agent(params: &Value, home_dir: &Path, caller_
             "content": [{"type": "text", "text": format!(
                 "Error: 「{name}」是系統保留名稱,不能用來建立 AI 員工。\
                  保留名稱包含 dashboard / webhook / cron / heartbeat / autopilot / \
-                 goal-loop-driver / a2a-client / default 以及任何以 __ 開頭的名稱,\
+                 goal-loop-driver / a2a-client / default 以及任何以 __ 或 standalone- 開頭的名稱,\
                  請換一個名稱。"
             )}],
             "isError": true
