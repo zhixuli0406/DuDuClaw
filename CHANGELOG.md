@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.71.0] - 2026-10-07 — MCP 獨立模式（mcp init）、外部金鑰的 MCP 授權修補、預設英文 README、商業連結改導總經銷
+
 ### Added
 - `duduclaw mcp init`：不裝 gateway 也能用 MCP server。指令會在資料目錄不存在時建立它、簽發一把只帶 `memory:read`、`memory:write`、`wiki:read`、`wiki:write` 的外部金鑰（client id `standalone-<用戶端>`，效期 90 天，只存雜湊），然後依 `--client` 印出設定：`claude-code` 問過之後執行 `claude mcp add duduclaw -s user`（`--yes` 不問；沒裝 Claude Code CLI 就只印指令），`codex` 印 `~/.codex/config.toml` 區塊，`cursor` 印 `~/.cursor/mcp.json`，`print`（預設）三種都印、不替任何用戶端註冊。每次執行都會簽發一把新金鑰（`print` 也一樣），不同的 `--client` 是不同的金鑰與記憶命名空間（`external/standalone-<用戶端>`）。Claude Code 已有 `duduclaw` 時，先讀 user 設定檔（`$CLAUDE_CONFIG_DIR/.claude.json` 或 `~/.claude.json`）：之前 `mcp init` 寫的直接取代，其他的在簽發金鑰前就拒絕並列出（密鑰遮蔽），要加 `--replace`；取代前舊項存到 `~/.duduclaw/mcp_init/`（0600），新的加不進去時用 `claude mcp add-json` 放回。從 npx 快取執行時，設定寫 `npx -y duduclaw@<這一版> mcp-server` 而不是快取裡的路徑；其他情況用執行檔啟動時的路徑，不展開連結（Homebrew／nvm 的版本目錄升級後會消失）；印出的指令在 Windows 版改用雙引號；有設 `DUDUCLAW_HOME` 時設定會帶同一個值。`--scopes` 只接受外部用戶端可以持有的 scope。在 AI 員工的工作階段裡執行會被拒絕（與 `memory forget-source` 同一份環境變數清單；訊息英文在前，並列出是哪個變數）；Bash 通道也把 `duduclaw mcp init` 與 `duduclaw mcp issue-refresh-token` 列為員工不可執行的操作者指令（`duduclaw_core::MCP_KEY_COMMANDS`）。`standalone-` 開頭的名稱保留，不能用來建立 AI 員工（`is_reserved_agent_id`）。說明：`docs/guides/mcp-standalone.md`（三種語言）。
 - 官方 MCP Registry 的 `distribution/registries/mcp/server.json` 改成單獨模式的介紹與實際工具數（24），加上 `DUDUCLAW_MCP_API_KEY` 環境變數（必填、secret，說明指向 `duduclaw mcp init`），版本改為 1.70.1。`scripts/release.sh` 會隨其他平台一起改這兩個版本號（新類別 `mcp_registry`），`audit` 與改版後的檢查兩個欄位都讀，不一致即算落差。`distribution/registries/README.md` 註明第一次送件要等含有 `mcp init` 的版本發佈到 npm。原本的說明超過 schema 的 100 字元上限，送件會被擋；版本停在 1.56.0。`distribution/registries/README.md` 的送件步驟一併更新。

@@ -8,13 +8,13 @@
     "url": "https://github.com/zhixuli0406/DuDuClaw",
     "source": "github"
   },
-  "version": "1.70.1",
+  "version": "1.71.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "duduclaw",
-      "version": "1.70.1",
+      "version": "1.71.0",
       "transport": {
         "type": "stdio"
       },
