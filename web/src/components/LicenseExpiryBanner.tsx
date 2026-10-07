@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle, X } from 'lucide-react';
 import { api, type LicenseSnapshot } from '@/lib/api';
+import { useCommercialContact } from '@/lib/commercial-contact';
 
 type Urgency = 'expired' | 'critical' | 'warning' | null;
 
@@ -44,6 +45,7 @@ const MESSAGE_ID: Record<Exclude<Urgency, null>, string> = {
  */
 export function LicenseExpiryBanner() {
   const intl = useIntl();
+  const contact = useCommercialContact();
   const [snapshot, setSnapshot] = useState<LicenseSnapshot | null>(null);
   const [dismissed, setDismissed] = useState<Urgency>(null);
 
@@ -75,7 +77,7 @@ export function LicenseExpiryBanner() {
           {intl.formatMessage({ id: MESSAGE_ID[urgency] }, { days })}
         </p>
         <a
-          href="https://duduclaw.dudustudio.monster#pricing"
+          href={contact.url}
           target="_blank"
           rel="noreferrer"
           className="mt-1 inline-block font-medium underline underline-offset-2 hover:opacity-80"

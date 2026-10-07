@@ -294,7 +294,7 @@ What we do **not** do:
 - ❌ Auto-execute untrusted downloaded code
 - ❌ Require root / privileged escalation
 
-Verification instructions are in the [README Trust & Security section](README.en.md#-trust--security).
+Verification instructions are in the [README Trust and security section](README.md#trust).
 
 ## Disclosure Policy
 

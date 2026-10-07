@@ -4,6 +4,8 @@ DuDuClaw 採用 **Apache License 2.0** 開源授權。
 
 本 repo 的程式碼全部採 Apache 2.0，可自由使用、修改、分發。執行檔裡有少數行為依授權金鑰（license key）的方案而定，見下方「授權金鑰控管的項目」。付費產業包等商業內容放在 `commercial/`，不在本 repo。
 
+商用授權、企業導入、培訓與支援由授權總經銷 [未來企業股份有限公司](https://www.futurecorp.tw/) 提供，原廠不直接販售。
+
 ---
 
 ## 開源模組（Apache 2.0）
