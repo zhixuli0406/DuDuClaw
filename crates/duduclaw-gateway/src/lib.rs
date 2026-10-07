@@ -358,6 +358,7 @@ mod wiki_mcp_source;
 pub mod wiki_trust_federation;
 pub mod workforce_private;
 pub mod xml_fence;
+pub mod decide;
 
 // ── Hermes-learnings modules (Phase 3, 4, 6) ──
 pub mod rl;
