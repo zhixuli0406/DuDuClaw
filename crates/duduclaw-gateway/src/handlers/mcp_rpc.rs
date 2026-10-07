@@ -63,6 +63,7 @@ impl MethodHandler {
                         "env": masked_env(&item.default_def.env),
                     },
                     "required_env": item.required_env,
+                    "remote": item.remote,
                 })
             })
             .collect();

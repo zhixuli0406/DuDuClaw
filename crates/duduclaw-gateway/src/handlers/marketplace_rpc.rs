@@ -182,6 +182,14 @@ impl MethodHandler {
                 );
             }
         };
+        // A remote card has no package to install: it is connected (URL +
+        // sign-in) with `mcp.remote_connect`, which writes the bridge entry.
+        if item.remote.is_some() {
+            return WsFrame::error_response(
+                "",
+                &format!("'{id}' is a remote server; connect it with mcp.remote_connect (dashboard: Connect)"),
+            );
+        }
 
         // Required env values arrive as `env: { NAME: value }` and are written
         // into `.mcp.json` as literals (owner-only file, never logged). A

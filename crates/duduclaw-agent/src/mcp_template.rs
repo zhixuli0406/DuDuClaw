@@ -680,6 +680,40 @@ pub struct McpCatalogItem {
     pub requires_oauth: bool,
     pub default_def: McpServerDef,
     pub required_env: Vec<String>,
+    /// Set for a hosted remote server (Streamable HTTP). Such a card is not
+    /// installed with `marketplace.install`: an administrator connects it
+    /// (URL + sign-in) with `mcp.remote_connect`, which writes the
+    /// `duduclaw mcp-remote-bridge` entry. `default_def` is only the bridge
+    /// placeholder then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<McpRemoteHint>,
+}
+
+/// Connection hints for a remote catalogue card. No secret ever lives here:
+/// the operator supplies their own endpoint and signs in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpRemoteHint {
+    /// The endpoint to prefill (the operator may replace it with the one
+    /// their account shows).
+    pub url_hint: String,
+    /// Suggested sign-in: `oauth`, `bearer` or `none`.
+    pub auth: String,
+    /// The provider's documentation for its MCP endpoint.
+    pub docs_url: String,
+    /// The provider relays tool calls and their data through its own cloud.
+    #[serde(default)]
+    pub third_party: bool,
+}
+
+/// The placeholder definition of a remote card (the bridge subcommand
+/// without a target; installing it directly is refused because no
+/// connection exists yet).
+fn remote_placeholder_def() -> McpServerDef {
+    McpServerDef {
+        command: "duduclaw".into(),
+        args: vec!["mcp-remote-bridge".into()],
+        env: Default::default(),
+    }
 }
 
 /// npm package that serves the Playwright MCP server (Microsoft; `--headless` supported).
@@ -877,6 +911,7 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
                 env: Default::default(),
             },
             required_env: vec![],
+            remote: None,
         },
         McpCatalogItem {
             id: "browserbase".into(),
@@ -893,6 +928,7 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
                 env: env_placeholders(&BROWSERBASE_REQUIRED_ENV),
             },
             required_env: BROWSERBASE_REQUIRED_ENV.iter().map(|s| s.to_string()).collect(),
+            remote: None,
         },
         McpCatalogItem {
             id: "filesystem".into(),
@@ -913,6 +949,7 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
                 env: Default::default(),
             },
             required_env: vec![],
+            remote: None,
         },
         McpCatalogItem {
             id: "memory".into(),
@@ -929,6 +966,47 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
                 env: Default::default(),
             },
             required_env: vec![],
+            remote: None,
+        },
+        // Hosted aggregators: thousands of third-party apps behind one remote
+        // MCP endpoint. The endpoints are the ones each provider publishes in
+        // the official MCP Registry (checked 2026-10-07); no account was used
+        // to test them.
+        McpCatalogItem {
+            id: "zapier".into(),
+            name: "Zapier".into(),
+            description: "Thousands of apps via Zapier (hosted)".into(),
+            category: "aggregator".into(),
+            author: "Zapier".into(),
+            tags: vec!["aggregator".into(), "remote".into(), "automation".into()],
+            featured: false,
+            requires_oauth: true,
+            default_def: remote_placeholder_def(),
+            required_env: vec![],
+            remote: Some(McpRemoteHint {
+                url_hint: "https://mcp.zapier.com/api/v1/connect".into(),
+                auth: "oauth".into(),
+                docs_url: "https://docs.zapier.com/mcp/home".into(),
+                third_party: true,
+            }),
+        },
+        McpCatalogItem {
+            id: "composio".into(),
+            name: "Composio".into(),
+            description: "1000+ apps with managed auth (hosted)".into(),
+            category: "aggregator".into(),
+            author: "Composio".into(),
+            tags: vec!["aggregator".into(), "remote".into(), "integrations".into()],
+            featured: false,
+            requires_oauth: true,
+            default_def: remote_placeholder_def(),
+            required_env: vec![],
+            remote: Some(McpRemoteHint {
+                url_hint: "https://connect.composio.dev/mcp".into(),
+                auth: "oauth".into(),
+                docs_url: "https://composio.dev".into(),
+                third_party: true,
+            }),
         },
     ]
 }
@@ -1170,7 +1248,17 @@ mod tests {
         let mut ids = std::collections::BTreeSet::new();
         for item in &catalog {
             assert!(ids.insert(item.id.clone()), "duplicate catalogue id '{}'", item.id);
-            assert_def_sound(&item.id, &item.default_def);
+            match &item.remote {
+                // Remote cards: an https endpoint hint, a known sign-in kind,
+                // and only the bridge placeholder as definition.
+                Some(hint) => {
+                    assert!(hint.url_hint.starts_with("https://"), "{}: url_hint", item.id);
+                    assert!(["oauth", "bearer", "none"].contains(&hint.auth.as_str()), "{}: auth", item.id);
+                    assert_eq!(item.default_def.args, vec!["mcp-remote-bridge".to_string()], "{}", item.id);
+                    assert!(item.required_env.is_empty(), "{}: remote cards carry no env", item.id);
+                }
+                None => assert_def_sound(&item.id, &item.default_def),
+            }
             assert!(!item.author.trim().is_empty(), "{}: empty author", item.id);
 
             // Declared env == the env the definition passes, and the catalogue

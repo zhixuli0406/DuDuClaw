@@ -479,6 +479,7 @@ impl MethodHandler {
             requires_oauth: false,
             default_def: def.clone(),
             required_env: Vec::new(),
+            remote: None,
         });
 
         let serialized = serde_json::to_string_pretty(&catalog)
