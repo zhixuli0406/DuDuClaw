@@ -40,7 +40,7 @@ fn rejects_garbage_shapes() {
 }
 
 #[test]
-fn registry_server_json_remotes_bridged_via_mcp_remote() {
+fn registry_server_json_remotes_become_native_bridge_candidates() {
     // Real-world shape: Perspective-AI/mcp ships an MCP Registry
     // server.json with remotes only (no packages).
     let text = r#"{
@@ -52,11 +52,26 @@ fn registry_server_json_remotes_bridged_via_mcp_remote() {
     let out = MethodHandler::parse_mcp_manifest(text, "fb").unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].0, "ai.getperspective-mcp");
-    assert_eq!(out[0].1.command, "npx");
+    // 2026-10-07: remotes go through the native bridge (encrypted token
+    // store, dashboard sign-in) instead of `npx mcp-remote`, which signs in
+    // with a browser on the gateway host and stores tokens in plaintext.
+    assert_eq!(out[0].1.command, "duduclaw");
     assert_eq!(
         out[0].1.args,
-        vec!["-y", "mcp-remote", "https://getperspective.ai/mcp"]
+        vec!["mcp-remote-bridge", "--url", "https://getperspective.ai/mcp"]
     );
+    assert!(crate::remote_mcp::bridge_def::is_bridge_def(&out[0].1));
+}
+
+#[test]
+fn legacy_sse_remotes_keep_the_labelled_mcp_remote_fallback() {
+    let text = r#"{
+            "name": "io.example/legacy",
+            "remotes": [ { "type": "sse", "url": "https://legacy.example/sse" } ]
+        }"#;
+    let out = MethodHandler::parse_mcp_manifest(text, "fb").unwrap();
+    assert_eq!(out[0].1.args, vec!["-y", "mcp-remote", "https://legacy.example/sse"]);
+    assert!(out[0].2.contains("legacy SSE"));
 }
 
 #[test]
@@ -85,7 +100,8 @@ fn mcp_servers_url_entry_bridged_command_entry_kept() {
     let out = MethodHandler::parse_mcp_manifest(text, "fb").unwrap();
     assert_eq!(out.len(), 2);
     let remote = out.iter().find(|(n, _, _)| n == "remote").unwrap();
-    assert_eq!(remote.1.args[1], "mcp-remote");
+    assert_eq!(remote.1.args[0], "mcp-remote-bridge");
+    assert_eq!(crate::remote_mcp::bridge_def::carried_url(&remote.1), Some("https://x.example/mcp"));
     let local = out.iter().find(|(n, _, _)| n == "local").unwrap();
     assert_eq!(local.1.command, "npx");
 }

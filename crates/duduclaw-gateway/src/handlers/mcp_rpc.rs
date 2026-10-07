@@ -63,6 +63,7 @@ impl MethodHandler {
                         "env": masked_env(&item.default_def.env),
                     },
                     "required_env": item.required_env,
+                    "remote": item.remote,
                 })
             })
             .collect();
@@ -156,8 +157,14 @@ impl MethodHandler {
                 }
                 let ad = agent_dir.clone();
                 let sn = server_name.to_string();
-                match tokio::task::spawn_blocking(move || add_server_to_config(&ad, &sn, &def))
-                    .await
+                let home = self.home_dir.clone();
+                let aid = agent_id.to_string();
+                match tokio::task::spawn_blocking(move || {
+                    let (installed, _) =
+                        crate::remote_mcp::bridge_def::prepare_for_install(&home, &aid, &sn, &def)?;
+                    add_server_to_config(&ad, &sn, &installed)
+                })
+                .await
                 {
                     Ok(Ok(())) => WsFrame::ok_response("", json!({ "success": true })),
                     Ok(Err(e)) => WsFrame::error_response("", &e),
@@ -167,7 +174,22 @@ impl MethodHandler {
             "remove" => {
                 let ad = agent_dir.clone();
                 let sn = server_name.to_string();
-                match tokio::task::spawn_blocking(move || remove_server_from_config(&ad, &sn)).await
+                let home = self.home_dir.clone();
+                let aid = agent_id.to_string();
+                match tokio::task::spawn_blocking(move || {
+                    let was_bridge = duduclaw_agent::mcp_template::read_mcp_config(&ad)
+                        .ok()
+                        .and_then(|c| c.mcp_servers.get(&sn).cloned())
+                        .is_some_and(|d| crate::remote_mcp::bridge_def::is_bridge_def(&d));
+                    remove_server_from_config(&ad, &sn)?;
+                    // Removing a remote server also deletes its stored
+                    // credentials (no orphaned tokens).
+                    if was_bridge && let Err(e) = crate::remote_mcp::connect::disconnect(&home, &aid, &sn, true) {
+                        warn!(agent = %aid, server = %sn, error = %e, "remote MCP credentials not removed");
+                    }
+                    Ok::<(), String>(())
+                })
+                .await
                 {
                     Ok(Ok(())) => WsFrame::ok_response("", json!({ "success": true })),
                     Ok(Err(e)) => WsFrame::error_response("", &e),

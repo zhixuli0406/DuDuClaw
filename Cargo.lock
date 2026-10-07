@@ -1885,6 +1885,7 @@ dependencies = [
  "duduclaw-sysd",
  "ed25519-dalek",
  "flate2",
+ "fs2",
  "futures-util",
  "hex",
  "hmac",

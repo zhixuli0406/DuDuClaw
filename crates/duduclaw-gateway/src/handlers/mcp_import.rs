@@ -361,11 +361,23 @@ impl MethodHandler {
         let ad = agent_dir.clone();
         let sn = server_name.clone();
         let d = def.clone();
-        match tokio::task::spawn_blocking(move || add_server_to_config(&ad, &sn, &d)).await {
-            Ok(Ok(())) => {}
+        let home = self.home_dir.clone();
+        let aid = agent_id.clone();
+        // A remote (bridge) candidate records its URL in the encrypted
+        // remote-server store and is written in its installed form, which
+        // carries no URL or token (`remote_mcp::bridge_def`).
+        let needs_connect = match tokio::task::spawn_blocking(move || {
+            let (installed, needs_connect) =
+                crate::remote_mcp::bridge_def::prepare_for_install(&home, &aid, &sn, &d)?;
+            add_server_to_config(&ad, &sn, &installed)?;
+            Ok::<bool, String>(needs_connect)
+        })
+        .await
+        {
+            Ok(Ok(n)) => n,
             Ok(Err(e)) => return WsFrame::error_response("", &e),
             Err(e) => return WsFrame::error_response("", &format!("Internal error: {e}")),
-        }
+        };
 
         // Optionally persist into the user marketplace catalog so the server
         // shows up alongside the built-ins for future installs.
@@ -401,6 +413,7 @@ impl MethodHandler {
                             "agent_id": agent_id,
                             "server_name": server_name,
                             "catalog_added": false,
+                            "needs_connect": needs_connect,
                             "warning": format!("installed, but adding to the marketplace catalog failed: {e}"),
                         }),
                     );
@@ -416,6 +429,7 @@ impl MethodHandler {
                 "agent_id": agent_id,
                 "server_name": server_name,
                 "catalog_added": catalog_added,
+                "needs_connect": needs_connect,
             }),
         )
     }
@@ -465,6 +479,7 @@ impl MethodHandler {
             requires_oauth: false,
             default_def: def.clone(),
             required_env: Vec::new(),
+            remote: None,
         });
 
         let serialized = serde_json::to_string_pretty(&catalog)

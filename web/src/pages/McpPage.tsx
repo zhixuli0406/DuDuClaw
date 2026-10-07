@@ -12,6 +12,9 @@ import { toast } from '@/lib/toast';
 import { api, type McpServerDef, type McpCatalogItem, type McpOAuthProvider, type McpImportCandidate, type McpServerEntry } from '@/lib/api';
 import { DangerZone, ConfirmDialog } from '@/components/settings/controls';
 import { AutonomyNote } from '@/components/AutonomyNote';
+import { AgentSelect, type AgentLite } from '@/components/mcp/AgentSelect';
+import { McpRegistryTab } from '@/components/mcp/McpRegistryTab';
+import { RemoteServersTab, RemoteConnectDialog } from '@/components/mcp/RemoteServersTab';
 import {
   RequiredEnvFields,
   missingRequiredEnv,
@@ -72,17 +75,18 @@ import {
   Download,
   RefreshCw,
   MoreHorizontal,
+  Cloud,
 } from 'lucide-react';
 
-const TABS = ['agents', 'marketplace'] as const;
+const TABS = ['agents', 'marketplace', 'registry', 'remote'] as const;
 type Tab = (typeof TABS)[number];
-type AgentLite = { name: string; display_name: string };
 
 const categoryIcons: Record<string, typeof Globe> = {
   browser: Globe,
   data: Database,
   communication: MessageSquare,
   google: Globe,
+  aggregator: Cloud,
 };
 
 function getCategoryIcon(category: string) {
@@ -98,39 +102,6 @@ function transportOf(def: McpServerDef): 'stdio' | 'http' {
 /** Column template shared by the MCP-server ListGrid header + rows (spec §4). */
 const SERVER_COLUMNS =
   'minmax(0,1.4fr) minmax(0,1.6fr) minmax(0,0.7fr) minmax(0,0.5fr) 2.5rem';
-
-/** Small agent picker (MDS Select) shared by the add/import/install dialogs. */
-function AgentSelect({
-  value,
-  onChange,
-  agents,
-  placeholder,
-  className,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  agents: ReadonlyArray<AgentLite>;
-  placeholder?: string;
-  className?: string;
-}) {
-  const current = agents.find((a) => a.name === value);
-  return (
-    <Select value={value} onValueChange={(v) => onChange(String(v))}>
-      <SelectTrigger className={cn('w-full', className)}>
-        <SelectValue placeholder={placeholder}>
-          {current ? current.display_name || current.name : placeholder}
-        </SelectValue>
-      </SelectTrigger>
-      <SelectContent>
-        {agents.map((a) => (
-          <SelectItem key={a.name} value={a.name}>
-            {a.display_name || a.name}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
-  );
-}
 
 export function McpPage() {
   const intl = useIntl();
@@ -221,6 +192,8 @@ export function McpPage() {
   const tabOptions: SegmentedOption<Tab>[] = [
     { value: 'agents', label: intl.formatMessage({ id: 'mcp.tab.agents' }) },
     { value: 'marketplace', label: intl.formatMessage({ id: 'mcp.tab.marketplace' }) },
+    { value: 'registry', label: intl.formatMessage({ id: 'mcp.tab.registry' }) },
+    { value: 'remote', label: intl.formatMessage({ id: 'mcp.tab.remote' }) },
   ];
 
   // Google keeps its own dedicated tab on the integrations page (19 Workspace
@@ -331,6 +304,10 @@ export function McpPage() {
           {/* Services that need a sign-in before their tools work (D19). */}
           <OAuthTab providers={connectProviders} showToast={showToast} />
         </div>
+      ) : activeTab === 'registry' ? (
+        <McpRegistryTab agents={agents} onInstalled={() => void fetchAll()} />
+      ) : activeTab === 'remote' ? (
+        <RemoteServersTab agents={agents} />
       ) : (
         <MarketplaceTab
           catalog={filteredCatalog}
@@ -549,6 +526,9 @@ function CatalogRow({
   const intl = useIntl();
   const CatIcon = getCategoryIcon(item.category);
   const [showInstall, setShowInstall] = useState(false);
+  // E3: a remote card (hosted aggregator) is connected, not installed.
+  const [showConnect, setShowConnect] = useState(false);
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [targetAgent, setTargetAgent] = useState('');
   const [installing, setInstalling] = useState(false);
   // Typed values for the item's required env names; cleared on close/success.
@@ -595,11 +575,46 @@ function CatalogRow({
             {intl.formatMessage({ id: 'mcp.catalog.requiresEnv' }, { vars: item.required_env.join(', ') })}
           </p>
         )}
+        {item.remote?.third_party && (
+          <p className="mt-0.5 text-xs text-muted-foreground/80">
+            {intl.formatMessage({ id: 'mcp.catalog.remoteThirdParty' }, { provider: item.name })}
+          </p>
+        )}
       </div>
-      <Button variant="outline" size="sm" onClick={() => setShowInstall(true)} className="shrink-0">
-        <Plus />
-        <span className="hidden sm:inline">{intl.formatMessage({ id: 'mcp.catalog.install' })}</span>
-      </Button>
+      {item.remote ? (
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setShowConnect(true)}
+          className="shrink-0"
+          disabled={!isAdmin}
+          title={isAdmin ? undefined : intl.formatMessage({ id: 'mcp.remote.adminOnly' })}
+        >
+          <Cloud />
+          <span className="hidden sm:inline">{intl.formatMessage({ id: 'mcp.remote.connect' })}</span>
+        </Button>
+      ) : (
+        <Button variant="outline" size="sm" onClick={() => setShowInstall(true)} className="shrink-0">
+          <Plus />
+          <span className="hidden sm:inline">{intl.formatMessage({ id: 'mcp.catalog.install' })}</span>
+        </Button>
+      )}
+      {item.remote && (
+        <RemoteConnectDialog
+          open={showConnect}
+          onClose={() => setShowConnect(false)}
+          agents={agents}
+          initial={{
+            name: item.id,
+            url: item.remote.url_hint,
+            auth: item.remote.auth,
+            provider: item.name,
+            thirdParty: item.remote.third_party,
+            docsUrl: item.remote.docs_url,
+          }}
+          onConnected={() => void useMcpStore.getState().fetchAll()}
+        />
+      )}
 
       <Dialog open={showInstall} onOpenChange={(o) => { if (!o) closeInstall(); }}>
         <DialogContent className="sm:max-w-md">

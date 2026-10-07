@@ -10,14 +10,14 @@ impl MethodHandler {
     ///
     /// Accepted shapes:
     /// 1. `.mcp.json`: `{ "mcpServers": { "<name>": { command, args, env } } }`
-    ///    — entries with a `url` instead of a `command` (remote HTTP/SSE
-    ///    servers) are bridged via `npx -y mcp-remote <url>`, the standard
-    ///    stdio adapter those projects themselves document.
+    ///    — entries with a `url` instead of a `command` (remote Streamable
+    ///    HTTP servers) become a native bridge candidate
+    ///    (`duduclaw mcp-remote-bridge`, see [`Self::remote_candidate_def`]).
     /// 2. user catalog: `{ "servers": [ { id, name?, description?, default_def } ] }`
     /// 3. single catalog item: `{ "id": ..., "default_def": { ... } }`
     /// 4. bare def: `{ "command": ..., "args": [...], "env": {...} }`
     /// 5. MCP Registry `server.json` (2025 schema): `packages[]` (npm → npx,
-    ///    pypi → uvx, oci → docker) and `remotes[]` (→ mcp-remote bridge).
+    ///    pypi → uvx, oci → docker) and `remotes[]` (→ native bridge).
     pub(crate) fn parse_mcp_manifest(
         text: &str,
         fallback_name: &str,
@@ -27,13 +27,41 @@ impl MethodHandler {
         Self::parse_mcp_manifest_value(&value, fallback_name)
     }
 
-    /// Build the `npx -y mcp-remote <url>` bridge definition for a remote
-    /// HTTP/SSE MCP server so stdio-only runtimes can use it.
-    pub(crate) fn mcp_remote_bridge_def(url: &str) -> duduclaw_agent::mcp_template::McpServerDef {
-        duduclaw_agent::mcp_template::McpServerDef {
-            command: "npx".to_string(),
-            args: vec!["-y".to_string(), "mcp-remote".to_string(), url.to_string()],
-            env: std::collections::HashMap::new(),
+    /// The candidate definition for a remote MCP server found in a manifest,
+    /// with a description suffix.
+    ///
+    /// Streamable HTTP (the default, and `type` `streamable-http` / `http`)
+    /// becomes the native bridge candidate
+    /// (`crate::remote_mcp::bridge_def::candidate_def`): installing it records
+    /// the URL in the encrypted remote-server store and writes
+    /// `<duduclaw> mcp-remote-bridge --agent <id> --server <name>`; an
+    /// administrator then connects it (bearer or OAuth sign-in) from the
+    /// dashboard.
+    ///
+    /// Fallback, legacy HTTP+SSE transport only (`type = "sse"`, the
+    /// 2024-11-05 protocol the native bridge does not speak): `npx -y
+    /// mcp-remote <url>`. That package signs in by opening a browser on the
+    /// gateway host and keeps its tokens in plaintext under `~/.mcp-auth`, so
+    /// the description says so; it is kept only because such servers have no
+    /// other path.
+    pub(crate) fn remote_candidate_def(
+        url: &str,
+        transport: &str,
+    ) -> (duduclaw_agent::mcp_template::McpServerDef, &'static str) {
+        if transport.eq_ignore_ascii_case("sse") {
+            (
+                duduclaw_agent::mcp_template::McpServerDef {
+                    command: "npx".to_string(),
+                    args: vec!["-y".to_string(), "mcp-remote".to_string(), url.to_string()],
+                    env: std::collections::HashMap::new(),
+                },
+                "legacy SSE transport, bridged via npx mcp-remote (signs in with a browser on the gateway host; tokens stored by mcp-remote outside DuDuClaw)",
+            )
+        } else {
+            (
+                crate::remote_mcp::bridge_def::candidate_def(url),
+                "remote, connect it in the dashboard after install",
+            )
         }
     }
 
@@ -76,11 +104,9 @@ impl MethodHandler {
                         Err(e) => skipped.push(format!("{name}: {e}")),
                     }
                 } else if let Some(url) = def_val.get("url").and_then(|v| v.as_str()) {
-                    out.push((
-                        name.clone(),
-                        Self::mcp_remote_bridge_def(url),
-                        format!("Remote MCP ({url}) bridged via mcp-remote"),
-                    ));
+                    let transport = def_val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let (def, note) = Self::remote_candidate_def(url, transport);
+                    out.push((name.clone(), def, format!("Remote MCP ({note})")));
                 } else {
                     skipped.push(format!("{name}: no command or url"));
                 }
@@ -164,13 +190,15 @@ impl MethodHandler {
                 .unwrap_or(&[])
             {
                 if let Some(url) = remote.get("url").and_then(|v| v.as_str()) {
+                    let transport = remote.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let (def, note) = Self::remote_candidate_def(url, transport);
                     out.push((
                         base_name.clone(),
-                        Self::mcp_remote_bridge_def(url),
+                        def,
                         if description.is_empty() {
-                            format!("Remote MCP ({url}) bridged via mcp-remote")
+                            format!("Remote MCP ({note})")
                         } else {
-                            format!("{description} (remote, bridged via mcp-remote)")
+                            format!("{description} ({note})")
                         },
                     ));
                 }

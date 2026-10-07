@@ -234,6 +234,18 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "Missing 'server_def' parameter"),
         };
 
+        // A remote (bridge) candidate: check its URL and name now so a bad
+        // one is refused before anyone is asked to approve it.
+        if crate::remote_mcp::bridge_def::is_bridge_def(&def) {
+            if let Err(e) = crate::remote_mcp::store::validate_ids(&agent_id, &server_name) {
+                return WsFrame::error_response("", &e);
+            }
+            if let Some(url) = crate::remote_mcp::bridge_def::carried_url(&def)
+                && let Err(e) = crate::remote_mcp::url_policy::validate_remote_url(url)
+            {
+                return WsFrame::error_response("", &format!("Remote MCP URL refused: {e}"));
+            }
+        }
         let scan = crate::mcp_scan::scan_mcp_server_def(&server_name, &def);
         if !scan.passed {
             return WsFrame::error_response(
@@ -611,9 +623,15 @@ impl MethodHandler {
                 let ad = agent_dir.clone();
                 let sn = server_name.to_string();
                 let d = def.clone();
-                tokio::task::spawn_blocking(move || add_server_to_config(&ad, &sn, &d))
-                    .await
-                    .map_err(|e| format!("join: {e}"))??;
+                let home = self.home_dir.clone();
+                let aid = agent_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let (installed, _) =
+                        crate::remote_mcp::bridge_def::prepare_for_install(&home, &aid, &sn, &d)?;
+                    add_server_to_config(&ad, &sn, &installed)
+                })
+                .await
+                .map_err(|e| format!("join: {e}"))??;
                 if req
                     .payload
                     .get("add_to_catalog")

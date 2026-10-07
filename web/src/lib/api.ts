@@ -2383,7 +2383,72 @@ export interface McpCatalogItem {
   requires_oauth: boolean;
   default_def: McpServerDef;
   required_env: string[];
+  /** Set for a hosted remote server: connect it (URL + sign-in) instead of installing a package. */
+  remote?: McpRemoteHint | null;
 }
+
+export interface McpRemoteHint {
+  url_hint: string;
+  auth: McpRemoteAuth;
+  docs_url: string;
+  /** Tool calls and their data pass through the provider's cloud. */
+  third_party?: boolean;
+}
+
+export type McpRemoteAuth = 'oauth' | 'bearer' | 'none';
+
+/** One MCP Registry search result (normalized server-side). */
+export interface McpRegistryHit {
+  name: string;
+  title: string;
+  description: string;
+  version: string;
+  package_kinds: string[];
+  has_remotes: boolean;
+  remote_kinds: string[];
+  remote_needs_bearer: boolean;
+  repository_url: string | null;
+  website_url: string | null;
+  required_env: { name: string; description: string; required: boolean; secret: boolean }[];
+  installable: boolean;
+  /** no_supported_transport | sse_remote_only | custom_headers | deprecated | deleted */
+  reason: string | null;
+  install_is_remote: boolean;
+}
+
+export interface McpRegistrySearchResult {
+  servers: McpRegistryHit[];
+  next_cursor: string | null;
+  cached: boolean;
+}
+
+/** A connected (or pending) remote MCP server; never carries a secret. */
+export interface McpRemoteServerStatus {
+  agent_id: string;
+  server: string;
+  auth: McpRemoteAuth;
+  host: string;
+  status: 'not_connected' | 'connected' | 'needs_reauth';
+  access_expires_at: number | null;
+  access_token_expired: boolean;
+  has_refresh_token: boolean;
+  installed: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export type McpRemoteConnectResult =
+  | { status: 'connected'; agent_id: string; server: string }
+  | {
+      status: 'authorize';
+      authorize_url: string;
+      /** `paste`: the dashboard address cannot receive the OAuth redirect; paste the address-bar URL into `remoteComplete`. */
+      completion?: 'redirect' | 'paste';
+      redirect_uri?: string;
+      expires_in: number;
+      agent_id: string;
+      server: string;
+    };
 
 export interface McpScanFinding {
   category: string;
@@ -6695,6 +6760,61 @@ export const api = {
         server_name: string;
         catalog_added: boolean;
         warning?: string;
+      }>,
+    /** Search the official MCP Registry (read-only, cached ~10 min server-side). */
+    registrySearch: (query: string, cursor?: string | null) =>
+      client.call('mcp.registry_search', {
+        query,
+        ...(cursor ? { cursor } : {}),
+      }) as Promise<McpRegistrySearchResult>,
+    /** Install a Registry server; non-admins get an install request instead. */
+    registryInstall: (params: {
+      name: string;
+      version?: string;
+      agent_id: string;
+      remote?: boolean;
+      server_name?: string;
+      env?: Record<string, string>;
+    }) =>
+      client.call('mcp.registry_install', params) as Promise<{
+        mode: 'installed' | 'requested';
+        server_name?: string;
+        agent_id?: string;
+        remote: boolean;
+        remote_needs_bearer: boolean;
+        needs_connect?: boolean;
+        request_id?: string;
+        registry_name: string;
+        registry_version: string;
+      }>,
+    /** Admin: connect a remote MCP server for an agent (OAuth returns an authorize URL). */
+    remoteConnect: (params: {
+      agent_id: string;
+      name: string;
+      url?: string;
+      auth: McpRemoteAuth;
+      bearer?: string;
+      redirect_origin?: string;
+      client_id?: string;
+      client_secret?: string;
+    }) => client.call('mcp.remote_connect', params) as Promise<McpRemoteConnectResult>,
+    /** Admin: finish a `completion: "paste"` sign-in with the URL from the browser's address bar. */
+    remoteComplete: (callbackUrl: string) =>
+      client.call('mcp.remote_complete', { callback_url: callbackUrl }) as Promise<{
+        status: 'connected';
+        agent_id: string;
+        server: string;
+      }>,
+    /** Admin: connected remote servers (no secrets). */
+    remoteStatus: (agentId?: string) =>
+      client.call('mcp.remote_status', agentId ? { agent_id: agentId } : {}) as Promise<{
+        servers: McpRemoteServerStatus[];
+      }>,
+    /** Admin: delete stored credentials; `forget` also removes the entry. */
+    remoteDisconnect: (agentId: string, name: string, forget = false) =>
+      client.call('mcp.remote_disconnect', { agent_id: agentId, name, forget }) as Promise<{
+        success: boolean;
+        existed: boolean;
       }>,
     /** Non-admin: file an MCP install request for the manager→admin chain. */
     installRequest: (params: {

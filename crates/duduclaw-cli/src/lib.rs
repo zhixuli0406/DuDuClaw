@@ -1891,6 +1891,22 @@ enum ToolingCommands {
         upstream: Vec<String>,
     },
 
+    /// (internal) stdio ⇄ Streamable HTTP bridge for a remote MCP server an
+    /// administrator connected in the dashboard. Written into an employee's
+    /// `.mcp.json` by the gateway; reads the URL and token from the encrypted
+    /// remote-server store, never from argv or env. Hidden from help.
+    ///
+    /// `duduclaw mcp-remote-bridge --agent <id> --server <name>`
+    #[command(hide = true)]
+    McpRemoteBridge {
+        /// The employee whose connection to use.
+        #[arg(long)]
+        agent: String,
+        /// The server name (the `.mcp.json` key).
+        #[arg(long)]
+        server: String,
+    },
+
     /// (internal) Desktop recording worker loop — spawned detached by the
     /// `desktop_record_start` MCP tool (WP3.3 R3). Hidden from help.
     #[command(hide = true)]
@@ -5300,6 +5316,29 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 )
             })?;
             let code = mcp_proxy::run_mcp_proxy(&home, &server, cmd, args).await?;
+            std::process::exit(code);
+        }
+        Commands::Tooling(ToolingCommands::McpRemoteBridge { agent, server }) => {
+            // stdout is the JSON-RPC channel; tracing goes to stderr.
+            // A process started for one employee must not borrow another
+            // employee's connection.
+            if let Some(own) = std::env::var_os("DUDUCLAW_AGENT_ID")
+                && !own.is_empty()
+                && own.to_str() != Some(agent.as_str())
+            {
+                eprintln!("mcp-remote-bridge: refusing --agent {agent}: this process runs as a different employee");
+                std::process::exit(2);
+            }
+            let home = duduclaw_home();
+            let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+            let code = duduclaw_gateway::remote_mcp::bridge::run_bridge(
+                &home,
+                &agent,
+                &server,
+                stdin,
+                tokio::io::stdout(),
+            )
+            .await;
             std::process::exit(code);
         }
         Commands::Tooling(ToolingCommands::DesktopRecordWorker {

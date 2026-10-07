@@ -37,6 +37,34 @@ fn display_safe(s: &str) -> String {
     }
 }
 
+/// How a DuDuClaw remote MCP bridge entry is described: host and connection
+/// state from the remote-server store (never the URL path or a token).
+fn describe_bridge(entry_agent: &str, server: &str, owner: Option<&str>, home: Option<&Path>) -> String {
+    use duduclaw_gateway::remote_mcp::store;
+    let mut out = format!("DuDuClaw 遠端 MCP 橋接 {}", display_safe(server));
+    if let Some(owner) = owner
+        && owner != entry_agent
+    {
+        out.push_str(&format!("，指向其他員工 {} 的連線", display_safe(entry_agent)));
+    }
+    let Some(home) = home else {
+        return out;
+    };
+    let state = match store::get(home, entry_agent, server) {
+        Ok(Some(rec)) => {
+            let status = match rec.status {
+                store::ConnStatus::Connected => "已連線",
+                store::ConnStatus::NotConnected => "尚未連線，請在儀表板連線",
+                store::ConnStatus::NeedsReauth => "需要重新登入",
+            };
+            format!("{}，{status}", display_safe(&rec.host))
+        }
+        Ok(None) => "沒有連線紀錄，啟動時會回報未連線".to_string(),
+        Err(e) => format!("無法讀取連線紀錄（{}）", display_safe(&e)),
+    };
+    format!("{out}（{state}）")
+}
+
 /// How one entry is described: the command's executable file name, or that
 /// it is a remote server (the URL is not shown).
 fn describe_entry(entry: &serde_json::Value) -> String {
@@ -58,6 +86,16 @@ fn describe_entry(entry: &serde_json::Value) -> String {
 /// JSON object with an object `mcpServers` (the spawn gate refuses such a
 /// file too).
 pub(crate) fn other_servers(raw: &str) -> Result<Vec<String>, String> {
+    other_servers_with(raw, None, None)
+}
+
+/// [`other_servers`] with the employee id and home, so a remote MCP bridge
+/// entry is described with its connection state.
+pub(crate) fn other_servers_with(
+    raw: &str,
+    owner: Option<&str>,
+    home: Option<&Path>,
+) -> Result<Vec<String>, String> {
     let doc: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| format!("不是合法的 JSON（{e}）"))?;
     let Some(servers) = doc.get("mcpServers") else {
@@ -70,7 +108,13 @@ pub(crate) fn other_servers(raw: &str) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = servers
         .iter()
         .filter(|(name, _)| !owned.iter().any(|o| o == *name))
-        .map(|(name, entry)| format!("{}（{}）", display_safe(name), describe_entry(entry)))
+        .map(|(name, entry)| {
+            let desc = match duduclaw_gateway::remote_mcp::bridge_def::installed_target(entry) {
+                Some((agent, server)) => describe_bridge(&agent, &server, owner, home),
+                None => describe_entry(entry),
+            };
+            format!("{}（{}）", display_safe(name), desc)
+        })
         .collect();
     out.sort();
     Ok(out)
@@ -94,7 +138,7 @@ pub(crate) fn mcp_servers_check(home: &Path) -> (String, CheckStatus, String) {
                         continue;
                     }
                 };
-                match other_servers(&raw) {
+                match other_servers_with(&raw, Some(id.as_str()), Some(home)) {
                     Ok(list) if list.is_empty() => {}
                     Ok(list) => {
                         found_any = true;
@@ -127,6 +171,29 @@ pub(crate) fn mcp_servers_check(home: &Path) -> (String, CheckStatus, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_bridge_entries_are_recognised_with_their_connection_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let def = duduclaw_gateway::remote_mcp::bridge_def::installed_def(home, "a1", "zap").unwrap();
+        let raw = serde_json::json!({ "mcpServers": { "zap": def } }).to_string();
+        let list = other_servers_with(&raw, Some("a1"), Some(home)).unwrap();
+        assert!(list[0].contains("DuDuClaw 遠端 MCP 橋接"), "{list:?}");
+        assert!(list[0].contains("沒有連線紀錄"), "{list:?}");
+        duduclaw_gateway::remote_mcp::bridge_def::prepare_for_install(
+            home,
+            "a1",
+            "zap",
+            &duduclaw_gateway::remote_mcp::bridge_def::candidate_def("https://mcp.example.com/s/KEY/mcp"),
+        )
+        .unwrap();
+        let list = other_servers_with(&raw, Some("a1"), Some(home)).unwrap();
+        assert!(list[0].contains("mcp.example.com") && list[0].contains("尚未連線"), "{list:?}");
+        assert!(!list[0].contains("KEY"), "URL path must not be shown");
+        let list = other_servers_with(&raw, Some("other"), Some(home)).unwrap();
+        assert!(list[0].contains("指向其他員工"), "{list:?}");
+    }
 
     #[test]
     fn only_entries_duduclaw_did_not_write_are_listed_without_args_or_env() {
