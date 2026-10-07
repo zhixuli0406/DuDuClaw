@@ -162,6 +162,29 @@ pub(crate) fn process_agent_tool_refused(
             || scope_listing_applies(principal, client_is_agent, employee_process))
 }
 
+/// Why the process lane refuses `name`, or `None` when it may be listed and
+/// called. The dispatch gate (error class `explore_lane`) and
+/// [`visible_tools_with`] both read this, so discoverable ⇔ callable.
+pub(crate) fn lane_refusal(lane: &duduclaw_core::ProcessLane, name: &str) -> Option<String> {
+    use duduclaw_core::ProcessLane;
+    let effect = duduclaw_core::effect_of(name);
+    match lane {
+        ProcessLane::Normal => None,
+        ProcessLane::Explore if lane.permits(effect) => None,
+        ProcessLane::Explore => Some(format!(
+            "Tool '{name}' ({effect}) is not available in the read-only explore lane: \
+             this run may only read and draft. Leave the action for a normal run."
+        )),
+        ProcessLane::Invalid => Some(format!(
+            "{} is set to a value other than \"{}\", so this MCP server refuses every \
+             tool call (fail closed). Unset it or set it to \"{}\".",
+            duduclaw_core::ENV_LANE,
+            duduclaw_core::LANE_EXPLORE,
+            duduclaw_core::LANE_EXPLORE
+        )),
+    }
+}
+
 /// Whether this process was spawned by the gateway for an employee.
 pub(crate) fn employee_process_from_env() -> bool {
     std::env::var(duduclaw_core::ENV_AGENT_ID).is_ok_and(|v| !v.trim().is_empty())
@@ -284,6 +307,25 @@ pub(crate) async fn visible_tools_with(
     home_dir: &Path,
     default_agent: &str,
     employee_process: bool,
+) -> Vec<&'static ToolDef> {
+    visible_tools_in_lane(
+        principal,
+        home_dir,
+        default_agent,
+        employee_process,
+        &duduclaw_core::ProcessLane::current(),
+    )
+    .await
+}
+
+/// [`visible_tools_with`] with the process lane passed in, so tests do not
+/// depend on this process's environment.
+pub(crate) async fn visible_tools_in_lane(
+    principal: &crate::mcp_auth::Principal,
+    home_dir: &Path,
+    default_agent: &str,
+    employee_process: bool,
+    lane: &duduclaw_core::ProcessLane,
 ) -> Vec<&'static ToolDef> {
     // Scoped non-employee callers (standalone `duduclaw mcp init` clients,
     // external keys): list only what the scope gate lets through and what does
@@ -476,6 +518,8 @@ pub(crate) async fn visible_tools_with(
             crate::mcp_dispatch::action_rule_verdict(&action_rules, t.name)
                 != Some(duduclaw_core::ActionVerdict::Block)
         })
+        // 2026-10: read-only explore lane (mirror of dispatch §0b).
+        .filter(|t| lane_refusal(lane, t.name).is_none())
         // Standalone profile (2026-10-07): scope gate + process-agent tools.
         .filter(|t| !scope_listing || scoped_caller_can_call(t.name, principal))
         .filter(|t| {

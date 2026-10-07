@@ -435,6 +435,58 @@ impl Serialize for ActionRules {
     }
 }
 
+// ── Explore lane ─────────────────────────────────────────────────────────
+
+/// Environment variable naming the lane an MCP server process runs in. Set
+/// by the gateway on spawns that must stay read-only (the heartbeat
+/// proactive check). Only [`LANE_EXPLORE`] is defined.
+pub const ENV_LANE: &str = "DUDUCLAW_LANE";
+
+/// The read-only explore lane: only `read` and `draft` tools are listed and
+/// callable.
+pub const LANE_EXPLORE: &str = "explore";
+
+/// The lane an MCP server process runs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessLane {
+    /// [`ENV_LANE`] absent: no lane restriction.
+    Normal,
+    /// `explore`: read-only tools only.
+    Explore,
+    /// Present but empty, unknown or not UTF-8: every call is refused.
+    Invalid,
+}
+
+impl ProcessLane {
+    /// Decide from the raw environment value (`None` = absent).
+    pub fn from_env_value(value: Option<&std::ffi::OsStr>) -> Self {
+        match value {
+            None => ProcessLane::Normal,
+            Some(v) => match v.to_str() {
+                Some(LANE_EXPLORE) => ProcessLane::Explore,
+                _ => ProcessLane::Invalid,
+            },
+        }
+    }
+
+    /// This process's lane.
+    pub fn current() -> Self {
+        Self::from_env_value(std::env::var_os(ENV_LANE).as_deref())
+    }
+
+    /// May a tool of this class be listed and called in this lane?
+    pub fn permits(&self, effect: ToolEffect) -> bool {
+        match self {
+            ProcessLane::Normal => true,
+            ProcessLane::Explore => !effect.is_side_effecting(),
+            ProcessLane::Invalid => false,
+        }
+    }
+}
+
+/// Claude Code built-in tools a read-only lane keeps (`--tools` list).
+pub const EXPLORE_LANE_BUILTIN_TOOLS: &[&str] = &["Read", "Glob", "Grep", "WebFetch", "WebSearch"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,5 +602,20 @@ mod tests {
         let absent: Caps = toml::from_str("other = false\n").unwrap();
         assert!(absent.action_rules.is_absent());
         assert!(!toml::to_string(&absent).unwrap().contains("action_rules"));
+    }
+
+    #[test]
+    fn lane_values() {
+        use std::ffi::OsStr;
+        assert_eq!(ProcessLane::from_env_value(None), ProcessLane::Normal);
+        assert_eq!(ProcessLane::from_env_value(Some(OsStr::new("explore"))), ProcessLane::Explore);
+        for bad in ["", "Explore", " explore", "read", "normal"] {
+            assert_eq!(ProcessLane::from_env_value(Some(OsStr::new(bad))), ProcessLane::Invalid, "{bad:?}");
+        }
+        assert!(ProcessLane::Explore.permits(ToolEffect::Read));
+        assert!(ProcessLane::Explore.permits(ToolEffect::Draft));
+        assert!(!ProcessLane::Explore.permits(ToolEffect::Send));
+        assert!(!ProcessLane::Invalid.permits(ToolEffect::Read));
+        assert!(ProcessLane::Normal.permits(ToolEffect::Admin));
     }
 }

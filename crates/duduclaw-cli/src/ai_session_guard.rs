@@ -30,6 +30,8 @@ pub(crate) const AI_SESSION_ENV_VARS: &[&str] = &[
     duduclaw_core::ENV_REPLY_CHANNEL,
     // The task of a goal round (set per call by the gateway's runtimes).
     duduclaw_core::ENV_TASK_ID,
+    // The read-only explore lane (heartbeat proactive check, 2026-10).
+    duduclaw_core::ENV_LANE,
     // Also refused by the LINE inbox and computer-workspace commands before
     // the lists were merged into this one.
     "DUDUCLAW_MCP_API_KEY",
@@ -64,5 +66,6 @@ mod tests {
         assert!(AI_SESSION_ENV_VARS.contains(&"DUDUCLAW_TURN_ID"));
         assert!(AI_SESSION_ENV_VARS.contains(&"DUDUCLAW_SESSION_ID"));
         assert!(AI_SESSION_ENV_VARS.contains(&"DUDUCLAW_TASK_ID"));
+        assert!(AI_SESSION_ENV_VARS.contains(&"DUDUCLAW_LANE"));
     }
 }

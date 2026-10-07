@@ -724,6 +724,18 @@ impl McpDispatcher {
             );
         }
 
+        // ── 0b. Read-only explore lane (2026-10) ─────────────────────────────
+        // A process the gateway spawned with `DUDUCLAW_LANE=explore` (the
+        // heartbeat proactive check) may call only `read` / `draft` tools; a
+        // present but empty or unknown value refuses every call (fail
+        // closed). `tools/list` hides the same tools through the same
+        // predicate (`mcp::tools_list::lane_permits`).
+        if let Some(msg) = crate::mcp::lane_refusal(&duduclaw_core::ProcessLane::current(), tool_name) {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            self.audit_dispatch_denial(tool_name, params, "explore_lane", &msg);
+            return jsonrpc_error(id, -32003, &msg);
+        }
+
         // ── 1. Scope check ───────────────────────────────────────────────────
         if removed_reply.is_none()
             && let Some(required) = crate::mcp_auth::tool_requires_scope_for_args(

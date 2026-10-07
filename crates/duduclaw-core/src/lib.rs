@@ -149,7 +149,8 @@ pub use takeover_state::{
 pub use text_utils::{truncate_bytes, truncate_chars};
 pub use tool_catalog::{builtin_tool_catalog, ToolCatalogEntry};
 pub use tool_effect::{
-    effect_of, effect_of_builtin, ActionRule, ActionRules, ActionTarget, ActionVerdict, ToolEffect,
+    effect_of, effect_of_builtin, ActionRule, ActionRules, ActionTarget, ActionVerdict, ProcessLane,
+    ToolEffect, ENV_LANE, LANE_EXPLORE,
 };
 pub use traits::{Channel, ContainerRuntime, MemoryEngine};
 pub use types::*;

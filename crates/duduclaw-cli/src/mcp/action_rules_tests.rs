@@ -1,10 +1,10 @@
-//! 2026-10: tool effect classes and `[capabilities] action_rules` — the
-//! parts that live on the MCP server side.
+//! 2026-10: tool effect classes, `[capabilities] action_rules` and the
+//! read-only explore lane — the parts that live on the MCP server side.
 //! Dispatch-gate refusals are tested next to the other gates in
 //! `mcp_dispatch.rs`.
 
 use super::*;
-use duduclaw_core::ToolEffect;
+use duduclaw_core::{ProcessLane, ToolEffect};
 use std::collections::BTreeSet;
 
 /// Every advertised `ToolDef` must have an explicit entry in the effect
@@ -53,8 +53,8 @@ fn home_with_rules(rules: &str) -> tempfile::TempDir {
     home
 }
 
-async fn listed(home: &std::path::Path) -> BTreeSet<&'static str> {
-    visible_tools_with(&test_principal(false), home, "", false)
+async fn listed(home: &std::path::Path, lane: &ProcessLane) -> BTreeSet<&'static str> {
+    visible_tools_in_lane(&test_principal(false), home, "", false, lane)
         .await
         .into_iter()
         .map(|t| t.name)
@@ -64,14 +64,14 @@ async fn listed(home: &std::path::Path) -> BTreeSet<&'static str> {
 #[tokio::test(flavor = "current_thread")]
 async fn blocked_tools_are_hidden_and_asked_tools_stay_listed() {
     let plain = home_with_rules("[]");
-    let before = listed(plain.path()).await;
+    let before = listed(plain.path(), &ProcessLane::Normal).await;
     assert!(before.contains("send_message") && before.contains("wiki_write"));
 
     let home = home_with_rules(
         "[{ effect = \"send\", verdict = \"block\" }, { tool = \"send_message\", verdict = \"ask\" }, \
          { effect = \"modify\", verdict = \"ask\" }]",
     );
-    let after = listed(home.path()).await;
+    let after = listed(home.path(), &ProcessLane::Normal).await;
     // Effect block hides every send tool …
     assert!(!after.contains("mail_send"));
     assert!(!after.contains("send_to_agent"));
@@ -87,7 +87,7 @@ async fn blocked_tools_are_hidden_and_asked_tools_stay_listed() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_malformed_rule_list_hides_nothing_but_asks_for_side_effects() {
     let home = home_with_rules("\"block everything\"");
-    let names = listed(home.path()).await;
+    let names = listed(home.path(), &ProcessLane::Normal).await;
     assert!(names.contains("send_message"));
     let dir = home.path().join("agents").join("test");
     let (always, _) = static_gate_flags(&dir, "send_message", &serde_json::json!({ "arguments": {} }));
@@ -114,4 +114,31 @@ fn ask_rules_fold_into_the_static_always_flag_and_allow_never_removes_a_list() {
     )
     .unwrap();
     assert!(static_gate_flags(&dir, "wiki_write", &payload).0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explore_lane_lists_only_read_and_draft_tools() {
+    let home = tmp_home_with_all_capabilities();
+    let normal = listed(home.path(), &ProcessLane::Normal).await;
+    let explore = listed(home.path(), &ProcessLane::Explore).await;
+    assert!(!explore.is_empty());
+    assert!(explore.contains("memory_search"));
+    assert!(explore.contains("gmail_create_draft") || !normal.contains("gmail_create_draft"));
+    for name in &explore {
+        assert!(!duduclaw_core::effect_of(name).is_side_effecting(), "{name}");
+    }
+    for name in normal.difference(&explore) {
+        assert!(duduclaw_core::effect_of(name).is_side_effecting(), "{name}");
+    }
+    assert!(listed(home.path(), &ProcessLane::Invalid).await.is_empty());
+}
+
+#[test]
+fn lane_refusal_names_the_tool_and_the_variable() {
+    assert!(lane_refusal(&ProcessLane::Normal, "agent_remove").is_none());
+    assert!(lane_refusal(&ProcessLane::Explore, "wiki_read").is_none());
+    let msg = lane_refusal(&ProcessLane::Explore, "send_message").unwrap();
+    assert!(msg.contains("send_message") && msg.contains("explore"), "{msg}");
+    let msg = lane_refusal(&ProcessLane::Invalid, "wiki_read").unwrap();
+    assert!(msg.contains(duduclaw_core::ENV_LANE), "{msg}");
 }
