@@ -52,6 +52,149 @@ fn str_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 impl MethodHandler {
+    /// `mcp.registry_search { query, cursor? }` — any signed-in user (same as
+    /// `mcp.import.fetch`): read-only, fixed host.
+    pub(crate) async fn handle_mcp_registry_search(&self, params: Value) -> WsFrame {
+        let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let cursor = params.get("cursor").and_then(|v| v.as_str());
+        match crate::mcp_registry::search(query, cursor).await {
+            Ok(v) => WsFrame::ok_response("", v),
+            Err(e) => WsFrame::error_response("", &format!("MCP Registry search failed: {e}")),
+        }
+    }
+
+    /// `mcp.registry_install { name, version?, agent_id, remote?, server_name?,
+    /// env?, add_to_catalog? }`. Admin installs directly; anyone else files an
+    /// install request (operator access to the employee required there).
+    pub(crate) async fn handle_mcp_registry_install(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let Some(name) = str_param(&params, "name") else {
+            return WsFrame::error_response("", "Missing 'name' parameter");
+        };
+        let name = name.to_string();
+        let version = str_param(&params, "version").map(str::to_string);
+        let agent_id = match str_param(&params, "agent_id") {
+            Some(a) if is_valid_agent_id(a) => a.to_string(),
+            Some(_) => return WsFrame::error_response("", "Invalid agent_id"),
+            None => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        if !self.home_dir.join("agents").join(&agent_id).is_dir() {
+            return WsFrame::error_response("", &format!("Agent '{agent_id}' not found"));
+        }
+        let want_remote = params.get("remote").and_then(|v| v.as_bool());
+
+        let (server, meta) = match crate::mcp_registry::fetch_server(&name, version.as_deref()).await {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &format!("MCP Registry: {e}")),
+        };
+        let hit = crate::mcp_registry::normalize_server(&server, meta.as_ref());
+        if let Some(reason) = &hit.reason {
+            return WsFrame::error_response("", &format!("This registry server cannot be installed ({reason})"));
+        }
+        let fallback = Self::sanitize_mcp_name(&name, "registry-server");
+        let candidates = match Self::parse_mcp_manifest_value(&server, &fallback) {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &format!("Cannot use this server.json: {e}")),
+        };
+        // Package candidates first (registry order), then native-bridge
+        // remotes; the legacy SSE fallback is never offered here.
+        let is_remote = |d: &duduclaw_agent::mcp_template::McpServerDef| bridge_def::is_bridge_def(d);
+        let is_legacy = |d: &duduclaw_agent::mcp_template::McpServerDef| {
+            d.args.iter().any(|a| a == "mcp-remote")
+        };
+        let pick = match want_remote {
+            Some(true) => candidates.iter().find(|(_, d, _)| is_remote(d)),
+            Some(false) => candidates.iter().find(|(_, d, _)| !is_remote(d) && !is_legacy(d)),
+            None => candidates
+                .iter()
+                .find(|(_, d, _)| !is_remote(d) && !is_legacy(d))
+                .or_else(|| candidates.iter().find(|(_, d, _)| is_remote(d))),
+        };
+        let Some((cand_name, cand_def, _)) = pick.cloned() else {
+            return WsFrame::error_response(
+                "",
+                if want_remote == Some(true) {
+                    "This server has no remote endpoint DuDuClaw can connect to"
+                } else {
+                    "This server has no npm / PyPI / OCI package DuDuClaw can run"
+                },
+            );
+        };
+        let remote = is_remote(&cand_def);
+        let server_name = str_param(&params, "server_name").map(str::to_string).unwrap_or(cand_name);
+        if !crate::mcp_scan::is_valid_mcp_server_name(&server_name)
+            || server_name.to_ascii_lowercase().starts_with("duduclaw")
+        {
+            return WsFrame::error_response("", "Invalid server_name (A-Za-z0-9._- max 64, not starting with duduclaw)");
+        }
+
+        let mut def = cand_def;
+        if !remote && let Some(pkg) = crate::mcp_registry::first_supported_package(&server) {
+            crate::mcp_registry::pin_package_version(&mut def, pkg);
+            // Declared env: required names must be filled; optional names may
+            // be. Any other name is refused by `apply_required_env`.
+            let declared = crate::mcp_registry::package_env(pkg);
+            let supplied: std::collections::HashMap<String, String> = match params.get("env") {
+                None | Some(Value::Null) => Default::default(),
+                Some(Value::Object(m)) => {
+                    let mut out = std::collections::HashMap::new();
+                    for (k, v) in m {
+                        match v.as_str() {
+                            Some(s) if !s.trim().is_empty() => {
+                                out.insert(k.clone(), s.to_string());
+                            }
+                            Some(_) => {}
+                            None => return WsFrame::error_response("", &format!("env value for {k} must be a string")),
+                        }
+                    }
+                    out
+                }
+                Some(_) => return WsFrame::error_response("", "env must be an object"),
+            };
+            let mut names: Vec<String> = declared.iter().filter(|e| e.required).map(|e| e.name.clone()).collect();
+            for e in declared.iter().filter(|e| !e.required) {
+                if supplied.contains_key(&e.name) {
+                    names.push(e.name.clone());
+                }
+            }
+            def = match duduclaw_agent::mcp_template::apply_required_env(&def, &names, &supplied) {
+                Ok(d) => d,
+                Err(e) => return WsFrame::error_response("", &e),
+            };
+        }
+
+        let version_label = if hit.version.is_empty() { "latest".to_string() } else { hit.version.clone() };
+        let display = if hit.title.is_empty() { hit.name.clone() } else { hit.title.clone() };
+        let description = duduclaw_core::truncate_chars(
+            &format!("{display} — {} (MCP Registry {}@{version_label})", hit.description, hit.name),
+            300,
+        );
+        let mut install_params = json!({
+            "agent_id": agent_id,
+            "server_name": server_name,
+            "server_def": def,
+            "description": description,
+            "source_url": format!("{}/v0/servers/{}", crate::mcp_registry::REGISTRY_BASE, hit.name),
+            "add_to_catalog": params.get("add_to_catalog").and_then(|v| v.as_bool()).unwrap_or(false),
+        });
+        let is_admin = ctx.role == UserRole::Admin;
+        let frame = if is_admin {
+            self.handle_mcp_import_install(install_params.take()).await
+        } else {
+            self.handle_mcp_install_request(install_params.take(), ctx).await
+        };
+        match frame {
+            WsFrame::Response { id, ok: true, payload: Some(Value::Object(mut map)), error } => {
+                map.insert("registry_name".into(), json!(hit.name));
+                map.insert("registry_version".into(), json!(version_label));
+                map.insert("remote".into(), json!(remote));
+                map.insert("remote_needs_bearer".into(), json!(hit.remote_needs_bearer));
+                map.insert("mode".into(), json!(if is_admin { "installed" } else { "requested" }));
+                WsFrame::Response { id, ok: true, payload: Some(Value::Object(map)), error }
+            }
+            other => other,
+        }
+    }
+
     /// `mcp.remote_connect { agent_id, name, url?, auth, bearer?,
     /// redirect_origin?, client_id?, client_secret? }` — Admin only.
     pub(crate) async fn handle_mcp_remote_connect(&self, params: Value, ctx: &UserContext) -> WsFrame {

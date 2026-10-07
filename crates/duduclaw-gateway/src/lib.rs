@@ -301,6 +301,7 @@ pub mod log;
 pub mod mail;
 pub mod mail_worker;
 pub mod mcp_oauth;
+pub mod mcp_registry;
 pub mod mcp_scan;
 pub mod mdns;
 pub mod media;
