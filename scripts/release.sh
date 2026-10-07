@@ -95,7 +95,7 @@ platform_manifests() {
         if [[ -f "$p" ]]; then echo "npm|$p"; fi
     done
     local r
-    for r in README.md README.en.md README.ja.md; do
+    for r in README.md README.zh-TW.md README.ja.md; do
         if [[ -f "$r" ]]; then echo "badge|$r"; fi
     done
     # Installer fallback versions (used only when the GitHub "latest release" API

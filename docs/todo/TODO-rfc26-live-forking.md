@@ -276,4 +276,4 @@ process that owns the child, which is where kill must originate.
 - [x] `agent.toml [fork] enabled = false` default verified — disabled-agent gate test; zero behavior change when off
 - [x] Smoke script `scripts/smoke-fork.{sh,ps1}` (build + fork crate tests + cli fork surface + checkpoint + fork clippy)
 - [x] CHANGELOG entry (`[Unreleased]` — RFC-26)
-- [x] **Done**: README feature blurb shipped in all three locales (`README.md` zh-TW, `README.en.md`, `README.ja.md`) now that the user-facing path (dashboard `ForkPage` + cross-process `ForkStore` + gateway `/metrics`) has landed.
+- [x] **Done**: README feature blurb shipped in all three locales (then `README.md` zh-TW, `README.en.md`, `README.ja.md`; since 2026-10 the English page is `README.md` and the zh-TW page is `README.zh-TW.md`) now that the user-facing path (dashboard `ForkPage` + cross-process `ForkStore` + gateway `/metrics`) has landed.

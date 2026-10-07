@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[繁體中文](README.md) · [English](README.en.md) · **日本語**
+[English](README.md) · [繁體中文](README.zh-TW.md) · **日本語**
 
 </div>
 
@@ -15,6 +15,13 @@ DuDuClaw は、Claude Code・Codex・Antigravity などの AI コマンドライ
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
+**クイックスタート**([Node.js](https://nodejs.org/) 20+ が必要。デスクトップアプリは[インストール](#install)を参照):
+
+```bash
+npm install -g duduclaw
+duduclaw run                  # 起動後 http://localhost:18789 を開く
+```
 
 https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
@@ -44,7 +51,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | マルチ LLM フェイルオーバー | 手動再起動 | 4 種のローテーション戦略 + クロスプロバイダ failover |
 | LLM 切替時のコンテキスト | 消失 | 完全保持 |
 | 会話メモリと知識ベース | 単発セッション | SQLite 時系列メモリ + 階層 wiki を自動注入 |
-| ツールの LLM 間共有 | ベンダーごとに書き直し | 249 MCP ツールを一度書けば、Claude・Codex・Gemini・Antigravity・Grok・OpenAI 互換の各ランタイムから呼び出せる |
+| ツールの LLM 間共有 | ベンダーごとに書き直し | 247 MCP ツールを一度書けば、Claude・Codex・Gemini・Antigravity・Grok・OpenAI 互換の各ランタイムから呼び出せる |
 | ガードレール / 監査 / 秘密情報管理 | 自作 | ポリシーカーネル + OS サンドボックス + AES-256-GCM 内蔵 |
 | 顧客に渡す一台まるごとの専用機 | Linux を自分で入れ、更新と改ざん対策も自前 | DuDuClaw OS イメージ:A/B アップデートとロールバック + 読み取り専用ルート、電源を入れるだけ;人と AI がデスクトップを共用しても日常利用の邪魔をしない |
 
@@ -62,7 +69,7 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 13 のランタイム ID(12 CLI + OpenAI-compat)、自動検出、エージェントごとに設定
   ├─ Session Memory — ネイティブ --resume + 時系列メモリ + key facts + 階層 wiki
-  ├─ MCP Server — 249 ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
+  ├─ MCP Server — 247 ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
   ├─ Evolution Engine — 予測駆動 + AEE playbook ルール + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS サンドボックス + redaction vault
   ├─ Inference Engine — OpenAI 互換ローカルサーバー(llama-server / Ollama / vLLM)/ llamafile
@@ -175,7 +182,7 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 | チャネル | 11 チャネル(Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat)、エージェントごとの bot、ホット起動/停止、プラットフォーム最適レンダリング、入力中インジケータ、長時間タスクの進捗ボード。Telegram の音声メッセージは OpenAI Whisper API で文字起こし。Discord のボイスチャンネルは既定外のビルド機能で、リリース版バイナリには含まれない | [docs/features](docs/features/README.md) |
 | マルチランタイム | 13 のランタイム ID:Claude Code / Codex / Antigravity / Grok / Qwen Code / Kimi Code / GitHub Copilot CLI / Kiro / Cursor / Mistral Vibe / OpenCode / Gemini CLI(非推奨、v1.71.0 で削除)と OpenAI-compat。自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [docs/features/13](docs/features/ja-JP/13-multi-runtime.md) |
 | 統一 LLM API 層 | `duduclaw-llm` が 4 つのネイティブプロトコル(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat)を単一の正規化リクエストでカバー。8 つの OpenAI-compat プリセット(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 価格レジストリ + クロスプロバイダ fallback を内蔵 | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP サーバー | 249 ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート。外部クライアントのキーは既定で 7 つの基本ツールのみ使え、オペレーターがメモリ・wiki・メッセージ系のスコープを追加付与できる。コネクタ・実行系・管理系のツールは外部に公開しない | [docs/api](docs/api/README.md) |
+| MCP サーバー | 247 ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート。外部クライアントのキーは既定で 7 つの基本ツールのみ使え、オペレーターがメモリ・wiki・メッセージ系のスコープを追加付与できる。コネクタ・実行系・管理系のツールは外部に公開しない | [docs/api](docs/api/README.md) |
 | メモリ | SQLite 時系列メモリ(事実の置換チェーン)、HippoRAG-lite 知識グラフ検索(Personalized PageRank)、エビングハウス忘却曲線によるアーカイブ、エージェント横断の共有 wiki | [docs/features](docs/features/README.md) |
 | 自己進化 | 予測駆動(設計上、多くの会話は LLM を呼ばずに終わる)+ AEE playbook 進化:SOUL.md はエージェントに対して読み取り専用。学習するのは各々 eval ケースに紐づく小さなルールで、現在の playbook 以上の場合のみコミットされ、24 時間後にルールごとに清算される。MistakeNotebook のターン横断メモリ | [evolution-engine.md](docs/architecture/evolution-engine.md) |
 | セキュリティ | PolicyKernel reference monitor(LLM 不使用、fail-closed)、macOS Seatbelt / Linux Landlock ネイティブサンドボックス(エージェントごと、既定オフ)、コンテナサンドボックス(タスクサンドボックスは Docker のみで既定オフ、スクリプトサンドボックスは Docker で Windows では WSL2 を先に試行)、secret redaction vault、CONTRACT.toml 行動契約 + レッドチーム CLI | [SECURITY.md](SECURITY.md) |
@@ -226,6 +233,7 @@ duduclaw license             # ライセンス管理(activate / status / redeem 
 - **テレメトリなし**:利用データや会話内容を当社に送信することはありません。gateway は 6 時間ごとに GitHub Releases で更新を確認します。有償ライセンスを入れている場合は、ライセンスサーバーでライセンスを更新し(プランにより 3〜7 日ごと)、失効リストを毎日取得します。ライセンスファイルがなければライセンス関連の通信はありません。秘密情報は AES-256-GCM で暗号化され、あなたのマシンに残ります
 - **特権昇格なし**:完全にユーザー空間で動作
 - **メンテナ**:嘟嘟數位科技有限公司(台湾登記企業、統一編号 94139082)
+- **チャネルでの高リスク操作**:AI社員がチャネルで高リスクな Computer Use ステップの承認を求めたら、リクエストの完全な ID を付けて返信します。結果が不明な操作は自動で再送されず、Admin がダッシュボードで確定させます。詳しくは[運用ガイド](docs/guides/ja-JP/durable-channel-decisions.md)
 
 各リリース資産には 3 種類の検証手段が付属します:SHA-256 チェックサム、[cosign](https://github.com/sigstore/cosign) keyless 署名、minisign Ed25519 署名(内蔵オートアップデータはこの署名を必須とし、未署名・改竄されたリリースを拒否します):
 
@@ -251,7 +259,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | 言語 | Rust | TypeScript | Rust | Python |
 | チャネル | 11 | 25+ | 8 | 0(API)|
 | マルチランタイム | 13 のランタイム ID(12 CLI + OpenAI-compat) | 単一 | 単一 | マルチ LLM |
-| MCP サーバー | 249 ツール | なし | なし | なし |
+| MCP サーバー | 247 ツール | なし | なし | なし |
 | 自己進化エンジン | AEE playbook ルール(予測駆動) | なし | なし | なし |
 | ローカル推論 | OpenAI 互換ローカルサーバー / llamafile + 信頼度ルーティング | なし | なし | なし |
 | 行動契約 | CONTRACT.toml + レッドチーム | なし | WASM サンドボックス | なし |
@@ -275,6 +283,8 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 ## ライセンス
 
 オープンコアモデル:コアは [Apache License 2.0](LICENSE) で、自由に使用・改変・再配布できます。商用アドオン(`commercial/`、本リポジトリには含まれない)はクローズドソースの有償で、有償の業種パックなどがあり、ライセンスキーで有効になります。ライセンス検証のクライアント(`crates/duduclaw-license`)は Apache 2.0 のコアに含まれます。詳細は [LICENSING.md](LICENSING.md)。
+
+商用ライセンス、企業導入、トレーニングとサポートは正規総代理店の [未來企業股份有限公司（Future Corp）](https://www.futurecorp.tw/) が提供します。開発元は直接販売していません。
 
 <p align="center">
   🐾 Built with louis.li
