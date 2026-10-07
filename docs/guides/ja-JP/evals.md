@@ -45,7 +45,7 @@ duduclaw eval evals/support --report eval-report.json
 | `--baseline <report.json>` | 以前に書き出した `--report` ファイルとの対応のある統計的比較を行います。[誠実な統計](#誠実な統計) を参照してください。 |
 | `--mde <fraction>` | 解像度チェックのために宣言する最小検出効果。合格率の割合で指定します（デフォルト `0.10` ＝ 10 パーセンテージポイント）。[誠実な統計](#誠実な統計) を参照してください。 |
 | `--cluster-by <key>` | クラスターロバスト標準誤差のためのクラスターキー。実装されているのは `dir`（デフォルト、各 case のディレクトリ）だけで、それ以外の値は拒否されます。[誠実な統計](#誠実な統計) を参照してください。 |
-| `--runtime <id>` | すべての case を実行するバックエンド（`claude` がデフォルトで P2 以前の経路、ほかに `codex`、`gemini`（v1.67.0 で非推奨、v1.71.0 で削除。[deprecations](deprecations.md#gemini-cli-ランタイム) を参照）、`antigravity`、`grok`、`openai_compat`、またはカタログ内のその他の runtime id）。未知の id は拒否され、`claude` として扱われることはありません。**省略した場合は各 case 自身の `[case] runtime`、それもなければ `claude` です。** [能力マトリクス](#能力マトリクス--matrix) を参照してください。 |
+| `--runtime <id>` | すべての case を実行するバックエンド（`claude` がデフォルトで P2 以前の経路、ほかに `codex`、`gemini`（v1.67.0 で非推奨、v1.72.0 で削除。[deprecations](deprecations.md#gemini-cli-ランタイム) を参照）、`antigravity`、`grok`、`openai_compat`、またはカタログ内のその他の runtime id）。未知の id は拒否され、`claude` として扱われることはありません。**省略した場合は各 case 自身の `[case] runtime`、それもなければ `claude` です。** [能力マトリクス](#能力マトリクス--matrix) を参照してください。 |
 | `--model <id>` | `--runtime` の範囲内で、すべての case に対する model id の上書き。省略すると各 case 自身の `[case] model` を使います。レポートヘッダーの `model` には、常に実際に動いたものが書かれます。 |
 | `--paired-seeds` | `(case id, repeat)` ごとに決定的な seed を導出し、同じ抽選が model 間で揃うようにします（Miller の対応のある設計）。**記録するだけで適用はしません**。このビルドの runtime には seed を受け付けられるものがなく、各実行は `seed_applied: false` でそのことを示します。 |
 | `--agent <id>` | すべての case を、各 case 自身の `[case] agent` の代わりに**この**デプロイ済みエージェントで実行します。レポートヘッダーに `agent_override` として、各実行に `agent` として記録されます。[1 つのエージェントを借りる](#1-つのエージェントを借りる--agent) を参照してください。 |

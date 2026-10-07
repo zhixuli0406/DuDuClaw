@@ -164,7 +164,7 @@
 
 **Gemini CLI エージェントランタイム**（ランタイム id `gemini`、実行ファイル `gemini`、
 npm パッケージ `@google/gemini-cli`）は **v1.67.0** で非推奨になりました。削除は
-v1.69.0 から **v1.71.0** に、さらに 2026-10-06 に **v1.71.0** に延期されました（v1.69.1 以降、実際の Gemini キーによる Antigravity の再検証がまだ行われていないため）。後継は **Antigravity CLI ランタイム**
+v1.69.0 から v1.70.0 に、2026-10-06 に v1.71.0 に、さらに 2026-10-07 に **v1.72.0** に延期されました（v1.69.1 以降、実際の Gemini キーによる Antigravity の再検証がまだ行われていないため）。後継は **Antigravity CLI ランタイム**
 （`antigravity`、実行ファイル `agy`）です。
 
 | 旧 | 新 |
@@ -182,7 +182,7 @@ Gemini API キーで検証することでした。その検証で、既定の権
 ました。修正は v1.69.1 に含まれます。gateway が、オペレーターの
 `~/.gemini/antigravity-cli/settings.json` に、`duduclaw` MCP サーバーを許可する 2 つの
 ルールを追加します（詳細は[マルチランタイム](../../features/ja-JP/13-multi-runtime.md)）。
-削除は引き続き v1.70.0（2026-10-06 以降は v1.71.0）の予定で、その条件は、この修正の出荷後に実際の Gemini API キーで
+削除は引き続き v1.70.0（2026-10-06 以降は v1.71.0、2026-10-07 以降は v1.72.0）の予定で、その条件は、この修正の出荷後に実際の Gemini API キーで
 Antigravity を再検証することです。再検証はまだ行っていません。
 
 **まだ使えるもの**: 上記の旧い値は、これまでどおり解析・実行されます。読み込み時には
@@ -220,7 +220,7 @@ Ultra の個人アカウントに対する Gemini CLI での提供を停止し�
 4. `duduclaw doctor` を実行すると、`provider` または `fallback` が非推奨ランタイムの
    エージェントが一覧表示される。
 
-v1.71.0 での削除の前に、すべての `agent.toml` で `provider = "gemini"` と
+v1.72.0 での削除の前に、すべての `agent.toml` で `provider = "gemini"` と
 `fallback = "gemini"` を確認し、`config.toml` の `utility_provider`、
 `[dispatch] judge_provider`、`[team.roles.*] runtime`、
 `[discovery.attempt.runtimes.gemini]` が `gemini` のままでないかも確認してください。

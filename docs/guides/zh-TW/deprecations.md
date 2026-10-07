@@ -145,7 +145,7 @@ v1.66.0 標為棄用的所有項目，例外見 [仍在棄用期](#仍在棄用�
 ### Gemini CLI runtime
 
 **Gemini CLI agent runtime**（runtime id `gemini`、執行檔 `gemini`、npm 套件
-`@google/gemini-cli`）在 **v1.67.0** 標為棄用。移除時間由 v1.69.0 改到 **v1.71.0**，2026-10-06 再改到 **v1.71.0**（v1.69.1 之後用真的 Gemini 金鑰重驗 Antigravity 還沒做，移除等它）。
+`@google/gemini-cli`）在 **v1.67.0** 標為棄用。移除時間由 v1.69.0 改到 v1.70.0，2026-10-06 改到 v1.71.0，2026-10-07 再改到 **v1.72.0**（v1.69.1 之後用真的 Gemini 金鑰重驗 Antigravity 還沒做，移除等它）。
 接手的是 **Antigravity CLI runtime**（`antigravity`，執行檔 `agy`）。
 
 | 舊 | 新 |
@@ -162,7 +162,7 @@ key 模式。驗證時發現，預設權限等級的 Antigravity 員工呼叫平
 CLI 自己拒絕。修正隨 v1.69.1 出貨：閘道會在操作者的
 `~/.gemini/antigravity-cli/settings.json` 補上兩條放行 `duduclaw` MCP 伺服器的規則
 （細節見[多 runtime](../../features/zh-TW/13-multi-runtime.md)）。移除仍排在
-v1.70.0（2026-10-06 起改為 v1.71.0），前提是這個修正出貨後，再用真的 Gemini API key 重新驗證 Antigravity。重新
+v1.70.0（2026-10-06 起改為 v1.71.0，2026-10-07 起改為 v1.72.0），前提是這個修正出貨後，再用真的 Gemini API key 重新驗證 Antigravity。重新
 驗證尚未進行。
 
 **還能用的部分**：上面每個舊值照樣解析、照樣執行。讀到時每個行程記一次警告；經儀表板
@@ -196,7 +196,7 @@ API key 與企業（Gemini Code Assist）使用者不受影響，Gemini CLI 本�
 4. 執行 `duduclaw doctor`，它會列出 `provider` 或 `fallback` 用到已棄用 runtime 的
    員工。
 
-在 v1.71.0 移除之前，請檢查每個 `agent.toml` 有沒有 `provider = "gemini"` 與
+在 v1.72.0 移除之前，請檢查每個 `agent.toml` 有沒有 `provider = "gemini"` 與
 `fallback = "gemini"`，也檢查 `config.toml` 的 `utility_provider`、
 `[dispatch] judge_provider`、`[team.roles.*] runtime` 與
 `[discovery.attempt.runtimes.gemini]` 有沒有還設成 `gemini`。

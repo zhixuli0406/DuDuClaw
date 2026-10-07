@@ -12,6 +12,7 @@
 - `tools/list` 對「不持有 `admin`、也不是 AI 員工」的金鑰只列它的 scope 叫得動的工具（儀表板 `mcp_keys.create` 建立、不帶 `admin` 也不對應員工的內部金鑰也在其中，清單因此變短），並且不列替行程本身的 agent 動作的工具（`working_state_*`、`memory_search_by_layer`、`memory_successful_conversations`、`memory_episodic_pressure`、`memory_consolidation_status`、`shared_wiki_delete`、`wiki_namespace_status`、`canvas_push`、`canvas_clear`、`team_handoff`、`mail_*`、`office_script`；對這類呼叫者它們會回 `unknown agent`、讀到預設員工的資料，或在預設員工的畫布上作畫）。gateway 內部金鑰、單一員工金鑰、gateway 為員工啟動的行程，以及持有 `admin` 的金鑰，清單不變（腳手架員工仍是 167 個）。外部金鑰也適用：沒有 scope 的外部金鑰原本會列出 7 個舊白名單工具，每個呼叫都被 scope 檢查拒絕，現在清單是空的。
 - gateway 開機時只替有 `agent.toml` 的員工目錄建立／修正 `.mcp.json`（`ensure_mcp_absolute_paths_all`）；外部金鑰的 wiki 目錄 `agents/<client_id>/` 不再被寫入一份帶內部金鑰的 `.mcp.json`。即將啟動員工前的修正（`refresh_for_spawn`）不變。
 - `duduclaw mcp-server` 沒有 `DUDUCLAW_MCP_API_KEY` 時的錯誤訊息多一句 `Run: duduclaw mcp init --client claude-code`。
+- **Gemini CLI runtime 的移除時間由 v1.71.0 再延到 v1.72.0**（runtime id `gemini`，仍是棄用狀態，行為不變）：v1.69.1 修正後用真的 Gemini 金鑰重驗 Antigravity 的步驟還沒做，移除等重驗完成。`duduclaw doctor` 與 `runtime.detect` 顯示的移除版本同步改為 v1.72.0，三種語言的文件一併更新。
 
 ### Security
 - 替行程 agent 動作的工具（見上方 Changed 第一項的清單）改由 dispatch 閘依清單同一條規則拒絕（`-32003`，稽核 `error_class` = `process_agent_tool`）：對象是清單規則適用的金鑰，以及所有外部金鑰（帶 `admin` 的也算）。已發佈版本受影響：自外部金鑰可授予 scope 起，帶 `memory:read`／`memory:write`／`wiki:write` 的外部金鑰（OAuth 用戶端也是）就能直接呼叫這些工具，讀到預設員工的記憶、改寫它的 working state、在它的畫布上作畫。
