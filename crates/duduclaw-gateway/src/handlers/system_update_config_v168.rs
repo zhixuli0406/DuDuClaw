@@ -55,6 +55,8 @@ const PROTECTED_KEYS: &[&str] = &[
     "container.sandbox.when_unavailable",
     "container.sandbox.script_when_unavailable",
     "memory.supersession_trust_guard",
+    // 2026-10: turning the action review off removes a gate.
+    "action_review.mode",
 ];
 
 /// Team role slots. The dashboard contract says `synthesizer`; the config
@@ -354,6 +356,16 @@ fn apply_simple_bools(table: &mut toml::Table, params: &Value, out: &mut V168Out
             set_bool(table, section, key, v, out)?;
             out.applied_immediate = true;
         }
+    }
+    // 2026-10: `[action_review] mode`, read on every tool call.
+    if let Some(v) = str_param(params, "action_review.mode")? {
+        let v = v.trim().to_ascii_lowercase();
+        if !matches!(v.as_str(), "off" | "shadow" | "enforce") {
+            return Err("action_review.mode must be one of: off, shadow, enforce".into());
+        }
+        table_at_mut(table, &["action_review"])?.insert("mode".into(), toml::Value::String(v.clone()));
+        out.changes.push(format!("action_review.mode = \"{v}\""));
+        out.applied_immediate = true;
     }
     // Read when a memory engine is built, i.e. by the next agent session.
     if let Some(v) = bool_param(params, "memory.supersession_trust_guard")? {

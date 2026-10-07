@@ -460,13 +460,65 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
         );
     }
 
+    // ── P3 action review (2026-10, `[action_review] mode`, default off) ──
+    // Only for a call every static gate resolved to auto-run AND whose
+    // effect class is side-effecting. Structured input only (tool, effect,
+    // argument keys, closed ActionGuard findings, CONTRACT.toml `must_not`);
+    // argument values never reach the reviewer. Shadow records and never
+    // changes the outcome; enforce refuses on `block` and asks a person on
+    // `ask` or when no verdict came back (fail closed).
+    let mut gate = gate;
+    let mut asked_by_review = false;
+    if gate == ActionGate::Auto && duduclaw_core::effect_of(tool_name).is_side_effecting() {
+        use duduclaw_gateway::action_review::{self, ActionReviewMode, ReviewOutcome};
+        let mode = ActionReviewMode::from_home(home_dir);
+        if mode != ActionReviewMode::Off {
+            let input = action_review::ReviewInput::build(tool_name, &payload, &agent_dir);
+            let verdict = action_review::review(home_dir, &agent_dir, &input).await;
+            let result = action_review::outcome(mode, verdict);
+            duduclaw_security::audit::append_tool_call_with_extras(
+                home_dir,
+                agent_id,
+                tool_name,
+                &format!(
+                    "action review ({}) → {}",
+                    mode.as_str(),
+                    action_review::audit_value(verdict)
+                ),
+                result == ReviewOutcome::Run,
+                &[
+                    (
+                        "action_review",
+                        Value::String(action_review::audit_value(verdict).to_string()),
+                    ),
+                    ("action_review_mode", Value::String(mode.as_str().to_string())),
+                ],
+            );
+            match result {
+                ReviewOutcome::Run => {}
+                ReviewOutcome::Refuse => {
+                    return Err(format!(
+                        "工具「{tool_name}」的呼叫經動作審查（[action_review] enforce）判定會越過此員工的界線，已拒絕執行。"
+                    ));
+                }
+                ReviewOutcome::AskPerson => {
+                    gate = ActionGate::RequireApproval;
+                    asked_by_review = true;
+                }
+            }
+        }
+    }
+
     match gate {
         ActionGate::Auto => Ok(()),
         ActionGate::RequireApproval => {
             if let Some(workflow) = workflow {
-                return workflow
-                    .require_human("action_guard_require_approval", &payload)
-                    .await;
+                let reason = if asked_by_review {
+                    "action_review_require_approval"
+                } else {
+                    "action_guard_require_approval"
+                };
+                return workflow.require_human(reason, &payload).await;
             }
             // The legacy path (approval_required_tools / install-class) keeps its
             // own summary via `install_approval_required`; but an
@@ -480,9 +532,15 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
             // 說明") and stamp it structurally on the approval row
             // (`request_with_simulation`) so the D2 channel push can render
             // the "若核准，接下來預計" forward-trajectory line.
-            let mut summary = format!(
-                "工具「{tool_name}」判定為不可逆／高風險，需經管理員核可後才能執行（ActionGuard 不可逆性審批閘）"
-            );
+            let mut summary = if asked_by_review {
+                format!(
+                    "工具「{tool_name}」的呼叫經動作審查（[action_review] enforce）要求人工確認，需經管理員核可後才能執行"
+                )
+            } else {
+                format!(
+                    "工具「{tool_name}」判定為不可逆／高風險，需經管理員核可後才能執行（ActionGuard 不可逆性審批閘）"
+                )
+            };
             if let Some(n) = &narrative {
                 let rendered = n.render();
                 if !rendered.is_empty() {

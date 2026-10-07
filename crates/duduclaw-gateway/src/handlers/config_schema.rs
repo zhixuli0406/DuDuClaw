@@ -32,6 +32,9 @@ pub(crate) enum Ty {
 /// `[dispatch] strict_reply_parsing` values (WP-G1).
 const STRICT_REPLY_PARSING_VALUES: &[&str] = &["off", "shadow", "enforce"];
 
+/// `[action_review] mode` values (2026-10).
+const ACTION_REVIEW_MODE_VALUES: &[&str] = &["off", "shadow", "enforce"];
+
 /// `[goal_loop] criteria_ledger` values (WP-G2).
 const CRITERIA_LEDGER_VALUES: &[&str] = &["off", "report", "enforce"];
 
@@ -133,6 +136,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("dispatch", "judge_timeout_secs", UInt),
     ("dispatch", "two_stage_judge", Bool),
     ("dispatch", "strict_reply_parsing", OneOf(STRICT_REPLY_PARSING_VALUES)),
+    ("action_review", "mode", OneOf(ACTION_REVIEW_MODE_VALUES)),
     ("dispatch", "grounding_precheck_enabled", Bool),
     ("dispatch", "grounding_min_overlap_chars", UInt),
     ("dispatch", "admission", Str),
