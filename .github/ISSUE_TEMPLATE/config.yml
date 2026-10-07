@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/zhixuli0406/DuDuClaw/discussions
+    about: Ask how to set something up, or share what you built.
+  - name: Report a security vulnerability
+    url: https://github.com/zhixuli0406/DuDuClaw/security/advisories/new
+    about: Please report security problems privately, not in a public issue.
+  - name: Commercial license, rollout and support
+    url: https://www.futurecorp.tw/
+    about: Provided by our authorised distributor, Future Corp (未來企業股份有限公司).
