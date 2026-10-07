@@ -5,6 +5,7 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { api, type LicenseSnapshot } from '@/lib/api';
 import { TIER_LABELS } from '@/lib/license-labels';
+import { useCommercialContact } from '@/lib/commercial-contact';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -45,8 +46,6 @@ import {
   Ticket,
   FlaskConical,
 } from 'lucide-react';
-
-const PRICING_URL = 'https://duduclaw.dudustudio.monster#pricing';
 
 /** Commercial-module feature flags advertised on the LicensePage matrix. */
 const COMMERCIAL_FEATURES: ReadonlyArray<{
@@ -224,6 +223,7 @@ function PhoneHomeIndicator({
 
 export function LicensePage() {
   const intl = useIntl();
+  const contact = useCommercialContact();
   const connectionState = useConnectionStore((s) => s.state);
   const [snapshot, setSnapshot] = useState<LicenseSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
@@ -479,11 +479,11 @@ export function LicensePage() {
             <Card>
               <CardHeader>
                 <CardTitle>{intl.formatMessage({ id: 'license.cta.opensource.title' })}</CardTitle>
-                <CardDescription>{intl.formatMessage({ id: 'license.cta.opensource.body' })}</CardDescription>
+                <CardDescription>{intl.formatMessage({ id: 'license.cta.opensource.body' }, { distributor: contact.name })}</CardDescription>
               </CardHeader>
               <CardContent>
                 <div className="flex flex-wrap gap-3">
-                  <a href={PRICING_URL} target="_blank" rel="noopener noreferrer">
+                  <a href={contact.url} target="_blank" rel="noopener noreferrer">
                     <Button variant="brand">
                       {intl.formatMessage({ id: 'license.cta.pricing' })}
                       <ExternalLink />
@@ -508,11 +508,11 @@ export function LicensePage() {
             <Card>
               <CardHeader>
                 <CardTitle>{intl.formatMessage({ id: 'license.cta.renew.title' })}</CardTitle>
-                <CardDescription>{intl.formatMessage({ id: 'license.cta.renew.body' })}</CardDescription>
+                <CardDescription>{intl.formatMessage({ id: 'license.cta.renew.body' }, { distributor: contact.name })}</CardDescription>
               </CardHeader>
               <CardContent>
                 <div className="flex flex-wrap gap-3">
-                  <a href={PRICING_URL} target="_blank" rel="noopener noreferrer">
+                  <a href={contact.url} target="_blank" rel="noopener noreferrer">
                     <Button variant="brand">
                       {intl.formatMessage({ id: 'license.cta.renew.action' })}
                       <ExternalLink />
@@ -578,6 +578,7 @@ function ActivateLicenseCard({
   readonly onActivated: () => void;
 }) {
   const intl = useIntl();
+  const contact = useCommercialContact();
   const navigate = useNavigate();
   // Zero agents ⇒ the operator is still mid-onboarding (came here from the
   // welcome wizard's industry step) — offer a way back after activating.
@@ -668,7 +669,7 @@ function ActivateLicenseCard({
         <p className="text-xs text-muted-foreground">
           {intl.formatMessage({ id: 'license.activate.fingerprint.hint' })}{' '}
           <a
-            href={PRICING_URL}
+            href={contact.url}
             target="_blank"
             rel="noopener noreferrer"
             className="font-medium text-brand hover:underline"

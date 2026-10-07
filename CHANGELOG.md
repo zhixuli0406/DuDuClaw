@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+- 儲存庫預設的 README 改成英文，讓從 Hacker News、Reddit 與 awesome 清單來的訪客先看到英文：原本的繁體中文 README 改名為 `README.zh-TW.md`，原本的 `README.en.md` 改名為 `README.md`。三個語言版本的語言切換列、`SECURITY.md` 的連結與 `scripts/release.sh` 的版號徽章清單一併更新；三個 README 首屏在徽章下方加上兩行快速開始指令，MCP 工具數改為 247（npm 與 PyPI 套件描述原本分別寫 249 與 243，也一併改為 247），Computer Use 頻道核准的說明移到「信任與安全」一節。
+- 儀表板的升級、續期與商用連結改指向授權總經銷 未來企業（https://www.futurecorp.tw/），文案不再提訂閱方案；已啟用白標且設有經銷商網站與公司名稱時，連結與文案改用白標品牌的值。原本指向 `duduclaw.dudustudio.monster#pricing` 的四處入口（授權到期橫幅、授權等級提示橫幅、AI 員工頁的成長提示、授權頁）與 zh-TW／en／ja-JP 的相關字串一併更新。
+
 ## [1.70.1] - 2026-10-07 — 1.70.1 修補：discovery 鎖、GDPR 歸檔、AI 員工任務可見名單、操作者指令列核准閘統一
 
 ### Fixed

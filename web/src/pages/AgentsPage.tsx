@@ -33,6 +33,7 @@ import { toast } from '@/lib/toast';
 import { agentTaskStats } from '@/components/agent';
 import { OffboardDialog } from '@/components/agent/OffboardDialog';
 import { timeAgo } from '@/lib/format';
+import { useCommercialContact } from '@/lib/commercial-contact';
 import {
   Bot,
   Plus,
@@ -92,6 +93,7 @@ function actorStatus(status: string, archived: boolean): ActorStatus {
 
 export function AgentsPage() {
   const intl = useIntl();
+  const commercialContact = useCommercialContact();
   const navigate = useNavigate();
   const errorText = useErrorMessage();
   const {
@@ -232,10 +234,10 @@ export function AgentsPage() {
               {intl.formatMessage({ id: 'agents.growthHint.title' })}
             </p>
             <p className="mt-0.5 text-muted-foreground">
-              {intl.formatMessage({ id: 'agents.growthHint.body' }, { count: activeAgentCount })}
+              {intl.formatMessage({ id: 'agents.growthHint.body' }, { count: activeAgentCount, distributor: commercialContact.name })}
             </p>
             <a
-              href="https://duduclaw.dudustudio.monster#pricing"
+              href={commercialContact.url}
               target="_blank"
               rel="noreferrer"
               className="mt-1.5 inline-block font-medium text-brand hover:underline"
