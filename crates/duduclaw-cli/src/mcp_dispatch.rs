@@ -232,6 +232,11 @@ struct AgentGateConfig {
     denied_tools: Vec<String>,
     allowed_tools: Vec<String>,
     db_sources: Vec<String>,
+    /// `[capabilities] action_rules`, read through the fail-closed
+    /// [`duduclaw_core::agent_toml::load_action_rules`] (an unreadable file
+    /// raises side-effecting calls to `ask`) rather than the strict parse
+    /// above, so a broken unrelated key cannot make the rules vanish.
+    action_rules: duduclaw_core::ActionRules,
 }
 
 /// The agent a `tools/call` acts for — the identity whose per-agent config,
@@ -281,6 +286,7 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
         home_dir.join("agents").join(agent_id)
     };
     let toml_path = agent_dir.join("agent.toml");
+    let action_rules = duduclaw_core::agent_toml::load_action_rules(&agent_dir);
     let Ok(content) = tokio::fs::read_to_string(&toml_path).await else {
         return if ephemeral {
             AgentGateConfig {
@@ -288,7 +294,10 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
                 ..AgentGateConfig::default()
             }
         } else {
-            AgentGateConfig::default()
+            AgentGateConfig {
+                action_rules,
+                ..AgentGateConfig::default()
+            }
         };
     };
     match toml::from_str::<PolicyOnlyConfig>(&content) {
@@ -301,6 +310,7 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
             denied_tools: cfg.capabilities.denied_tools,
             allowed_tools: cfg.capabilities.allowed_tools,
             db_sources: cfg.capabilities.db_sources,
+            action_rules,
         },
         Err(e) => {
             warn!(
@@ -316,10 +326,22 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
                     ..AgentGateConfig::default()
                 }
             } else {
-                AgentGateConfig::default()
+                AgentGateConfig {
+                    action_rules,
+                    ..AgentGateConfig::default()
+                }
             }
         }
     }
+}
+
+/// The action-rule verdict for one call (`None` = no rule applies). One
+/// function so the dispatch gate and `tools/list` cannot disagree.
+pub(crate) fn action_rule_verdict(
+    rules: &duduclaw_core::ActionRules,
+    tool_name: &str,
+) -> Option<duduclaw_core::ActionVerdict> {
+    rules.resolve(tool_name, duduclaw_core::effect_of(tool_name))
 }
 
 /// Tools always governed by a `[permissions]` flag (v1.68), by exact name.
@@ -966,6 +988,27 @@ impl McpDispatcher {
                 self.audit_dispatch_denial(tool_name, &params_owned, error_class, &msg);
                 return jsonrpc_error(id, -32003, &msg);
             }
+        }
+
+        // ── 3.455 action rules `block` (2026-10) ─────────────────────────────
+        // `[capabilities] action_rules` by effect class or by tool. `block`
+        // refuses here, next to `denied_tools`; `ask` is folded into the
+        // approval gate's static `always` flag (`mcp::approval::
+        // static_gate_flags`), so the ApprovalBroker flow runs. A rule never
+        // loosens a name-list gate: `allow` only means "no friction from this
+        // layer". The `computer_*` tools apply the same resolution in the
+        // gateway (`computer_use_sessions::gates`), which owns their session.
+        if !principal.is_external
+            && action_rule_verdict(&agent_gate.action_rules, tool_name)
+                == Some(duduclaw_core::ActionVerdict::Block)
+        {
+            let effect = duduclaw_core::effect_of(tool_name);
+            let msg = format!(
+                "工具「{tool_name}」（{effect} 類動作）已被此代理的 [capabilities] action_rules 設定阻擋。"
+            );
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            self.audit_dispatch_denial(tool_name, &params_owned, "action_rule", &msg);
+            return jsonrpc_error(id, -32003, &msg);
         }
 
         // ── 3.46 [permissions] flags (v1.68) ──────────────────────────────────
@@ -2201,6 +2244,59 @@ effect = "forbid"
         let agent_dir = tmp.path().join("agents").join("test-client");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("agent.toml"), body).unwrap();
+    }
+
+    // ── 2026-10: action rules ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn action_rule_block_refuses_with_its_own_error_class() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(
+            &tmp,
+            "[capabilities]\naction_rules = [{ effect = \"modify\", verdict = \"block\" }, \
+             { tool = \"memory_store\", verdict = \"allow\" }]\n",
+        );
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+
+        let params = make_params("wiki_write", serde_json::json!({ "path": "a.md", "content": "x" }));
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &ns_ctx, &params, &serde_json::json!(90))
+            .await;
+        assert_eq!(result["error"]["code"], -32003, "got: {result}");
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("action_rules"), "got: {msg}");
+        let audit = std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap_or_default();
+        assert!(audit.contains("\"action_rule\""), "audit row expected: {audit}");
+
+        // A tool rule beats the effect rule; reads are untouched.
+        for tool in ["memory_store", "memory_search"] {
+            let params = make_params(tool, serde_json::json!({ "content": "x", "query": "x" }));
+            let result = dispatcher
+                .dispatch_tool_call(&principal, &ns_ctx, &params, &serde_json::json!(91))
+                .await;
+            let msg = result["error"]["message"].as_str().unwrap_or("");
+            assert!(!msg.contains("action_rules"), "{tool}: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn action_rules_never_loosen_denied_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(
+            &tmp,
+            "[capabilities]\ndenied_tools = [\"memory_search\"]\n\
+             action_rules = [{ tool = \"memory_search\", verdict = \"allow\" }]\n",
+        );
+        let principal = make_principal(vec![Scope::Admin], false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let result = dispatcher
+            .dispatch_tool_call(&principal, &make_ns_ctx(false), &params, &serde_json::json!(92))
+            .await;
+        assert_eq!(result["error"]["code"], -32003, "got: {result}");
+        assert!(result["error"]["message"].as_str().unwrap_or("").contains("denied_tools"));
     }
 
     // A scoped tool with NO active grant is denied (fail-closed) with guidance

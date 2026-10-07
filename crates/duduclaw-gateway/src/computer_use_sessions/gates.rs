@@ -12,7 +12,11 @@
 //!   `maybe_irreversible_tools` — a human decision through the
 //!   [`ApprovalBroker`] (no LLM judge here: a maybe-irreversible computer
 //!   tool is always asked about). The MCP-side approval gate skips the eight
-//!   `computer_*` tools so nobody is asked twice.
+//!   `computer_*` tools so nobody is asked twice;
+//! - `[capabilities] action_rules` (2026-10) — the same resolution the MCP
+//!   gate uses ([`duduclaw_core::ActionRules::resolve`] over
+//!   [`duduclaw_core::agent_toml::load_action_rules`]): `block` refuses
+//!   (`action_rule`), `ask` joins the approval lists above.
 //!
 //! Every gate fails closed. Refusals carry operator-safe messages and the
 //! `forbidden` / `approval_denied` codes; tool-gate refusals write the same
@@ -99,6 +103,15 @@ pub(super) async fn tool_gates(home: &Path, agent_id: &str, tool: &'static str) 
         return Err(forbidden(message));
     }
 
+    if action_rule_verdict(&dir, tool) == Some(duduclaw_core::ActionVerdict::Block) {
+        let message = format!(
+            "工具「{tool}」（{} 類動作）已被此員工的 [capabilities] action_rules 設定阻擋，已拒絕執行。",
+            duduclaw_core::effect_of(tool)
+        );
+        audit_denial(home, agent_id, tool, "action_rule", &message).await;
+        return Err(forbidden(message));
+    }
+
     let scoped = capability_grants::scoped_tools(&dir);
     if capability_grants::set_contains_tool(&scoped, tool) {
         let granted = match capability_grants::CapabilityGrantStore::open(home) {
@@ -119,12 +132,19 @@ pub(super) async fn tool_gates(home: &Path, agent_id: &str, tool: &'static str) 
     Ok(())
 }
 
-/// Whether `tool` is in any of the employee's approval lists.
+/// The employee's `[capabilities] action_rules` verdict for `tool`.
+fn action_rule_verdict(dir: &Path, tool: &str) -> Option<duduclaw_core::ActionVerdict> {
+    duduclaw_core::agent_toml::load_action_rules(dir).resolve(tool, duduclaw_core::effect_of(tool))
+}
+
+/// Whether `tool` is in any of the employee's approval lists, or an action
+/// rule asks (or blocks) it.
 pub(super) fn approval_required(home: &Path, agent_id: &str, tool: &str) -> bool {
     let dir = agent_dir(home, agent_id);
     crate::approval::tool_requires_approval(&dir, tool)
         || crate::approval::tool_is_irreversible(&dir, tool)
         || crate::approval::tool_is_maybe_irreversible(&dir, tool)
+        || action_rule_verdict(&dir, tool).is_some_and(|v| v >= duduclaw_core::ActionVerdict::Ask)
 }
 
 fn approval_denied(message: String) -> OpError {

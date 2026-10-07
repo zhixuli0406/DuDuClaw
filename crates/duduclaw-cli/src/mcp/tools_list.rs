@@ -422,6 +422,20 @@ pub(crate) async fn visible_tools_with(
         }
     }
 
+    // 2026-10: `[capabilities] action_rules` — a `block`ed tool is hidden
+    // (mirror of dispatch §3.455, same `action_rule_verdict`); `ask` stays
+    // listed because it is callable after an approval.
+    let action_rules = if gated_caller && !member_invalid {
+        let agent_dir =
+            match duduclaw_gateway::ephemeral::resolve_agent_dir(home_dir, effective_agent) {
+                Some(dir) => dir,
+                None => home_dir.join("agents").join(effective_agent),
+            };
+        duduclaw_core::agent_toml::load_action_rules(&agent_dir)
+    } else {
+        duduclaw_core::ActionRules::default()
+    };
+
     let tool_allowed_by_capability = |name: &str| -> bool {
         let Some((denied, allowed)) = cap_gate.as_ref() else {
             return true; // external / unresolved caller → not gated here
@@ -457,6 +471,11 @@ pub(crate) async fn visible_tools_with(
         .filter(|t| !scoped_without_grant.contains(t.name))
         // WP-7A bug2: internal per-agent capability filter (mirror of §3.45).
         .filter(|t| tool_allowed_by_capability(t.name))
+        // 2026-10: action rules `block` (mirror of §3.455).
+        .filter(|t| {
+            crate::mcp_dispatch::action_rule_verdict(&action_rules, t.name)
+                != Some(duduclaw_core::ActionVerdict::Block)
+        })
         // Standalone profile (2026-10-07): scope gate + process-agent tools.
         .filter(|t| !scope_listing || scoped_caller_can_call(t.name, principal))
         .filter(|t| {

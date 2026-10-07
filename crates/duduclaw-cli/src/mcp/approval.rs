@@ -60,6 +60,11 @@ pub(crate) fn install_approval_required(
 /// (`wiki_write` with `scope="shared"`, `tasks_create` with `schedule`): the
 /// removed name only ever adds a match, so this is never looser than the
 /// plain tool-name check.
+///
+/// `always` also folds in an `[capabilities] action_rules` verdict of `ask`
+/// (or `block`, which the dispatch gate refuses earlier). Rules only ever add
+/// to `always`, so an `allow` rule cannot remove an approval a name list
+/// imposes (take-the-stricter).
 pub(crate) fn static_gate_flags(
     agent_dir: &Path,
     tool_name: &str,
@@ -71,6 +76,11 @@ pub(crate) fn static_gate_flags(
     );
     let always = install_approval_required(agent_dir, tool_name, false)
         || duduclaw_gateway::approval::tool_is_irreversible(agent_dir, tool_name)
+        || crate::mcp_dispatch::action_rule_verdict(
+            &duduclaw_core::agent_toml::load_action_rules(agent_dir),
+            tool_name,
+        )
+        .is_some_and(|v| v >= duduclaw_core::ActionVerdict::Ask)
         || legacy_name.is_some_and(|legacy| {
             duduclaw_gateway::approval::tool_requires_approval(agent_dir, legacy)
                 || duduclaw_gateway::approval::tool_is_irreversible(agent_dir, legacy)

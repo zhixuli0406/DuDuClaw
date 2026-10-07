@@ -2519,3 +2519,26 @@ mod workspace_cases;
 
 #[path = "tests/workspace_docker.rs"]
 mod workspace_docker;
+
+// ── 2026-10: action rules on the computer-use route ─────────────────────
+
+#[tokio::test]
+async fn action_rules_block_and_ask_computer_tools_like_the_mcp_gate() {
+    let tmp = home();
+    write_agent(
+        tmp.path(),
+        "alice",
+        "[capabilities]\ncomputer_use = true\n\
+         action_rules = [{ tool = \"computer_click\", verdict = \"block\" }, \
+         { effect = \"modify\", verdict = \"ask\" }]\n",
+    );
+    let err = gates::tool_gates(tmp.path(), "alice", gates::TOOL_CLICK).await.unwrap_err();
+    assert!(err.message.contains("action_rules"), "{}", err.message);
+    // Reads pass both gates; a modify tool passes `tool_gates` but needs a person.
+    assert!(gates::tool_gates(tmp.path(), "alice", gates::TOOL_SCREENSHOT).await.is_ok());
+    assert!(!gates::approval_required(tmp.path(), "alice", gates::TOOL_SCREENSHOT));
+    assert!(gates::tool_gates(tmp.path(), "alice", gates::TOOL_TYPE).await.is_ok());
+    assert!(gates::approval_required(tmp.path(), "alice", gates::TOOL_TYPE));
+    // No rules: unchanged.
+    assert!(!gates::approval_required(tmp.path(), "bob", gates::TOOL_TYPE));
+}

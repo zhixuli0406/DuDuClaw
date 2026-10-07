@@ -408,6 +408,41 @@ pub fn load(agent_dir: &Path) -> AgentTomlSections {
     }
 }
 
+/// `[capabilities] action_rules` for the agent at `agent_dir`, read from the
+/// same file [`load`] reads (the preset-resolved artifact when there is one).
+///
+/// Unlike [`load`], which turns an unparsable file into all-defaults, this is
+/// fail-closed: a file that exists but cannot be read, is not valid TOML, or
+/// whose `[capabilities]` is not a table yields
+/// [`crate::tool_effect::ActionRules::unreadable`], which makes every
+/// side-effecting call at least `ask`. A missing file (or a missing key) means
+/// no rules. Every gate that applies action rules (the MCP dispatch gate, the
+/// approval gate, `tools/list`, the computer-use gate) reads through here.
+pub fn load_action_rules(agent_dir: &Path) -> crate::tool_effect::ActionRules {
+    use crate::tool_effect::ActionRules;
+    use serde::Deserialize;
+    let read = |p: &Path| std::fs::read_to_string(p);
+    let text = match resolved_override_path(agent_dir).map(|p| read(&p)) {
+        Some(Ok(text)) => text,
+        _ => match read(&agent_dir.join("agent.toml")) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ActionRules::default(),
+            Err(_) => return ActionRules::unreadable(),
+        },
+    };
+    let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
+        return ActionRules::unreadable();
+    };
+    match doc.get("capabilities") {
+        None => ActionRules::default(),
+        Some(toml::Value::Table(caps)) => match caps.get("action_rules") {
+            None => ActionRules::default(),
+            Some(v) => ActionRules::deserialize(v.clone()).unwrap_or_else(|_| ActionRules::unreadable()),
+        },
+        Some(_) => ActionRules::unreadable(),
+    }
+}
+
 /// Env kill-switch for the minimal-context spawn optimization (WP-7A). Set to
 /// `0`/`false`/`no`/`off` to disable globally, `1`/`true`/`yes`/`on` to
 /// force-enable; unset defers to per-agent `[runtime] minimal_context`, then the
@@ -464,6 +499,34 @@ pub fn load_for_agent(home_dir: &Path, agent_id: &str) -> AgentTomlSections {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_rules_loader_is_fail_closed_on_an_unreadable_file() {
+        use crate::tool_effect::{ActionVerdict, ToolEffect};
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file: no rules.
+        assert!(load_action_rules(dir.path()).rules.is_empty());
+        assert!(!load_action_rules(dir.path()).malformed);
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[capabilities]\naction_rules = [{ effect = \"send\", verdict = \"block\" }]\n",
+        )
+        .unwrap();
+        let r = load_action_rules(dir.path());
+        assert_eq!(r.resolve("send_message", ToolEffect::Send), Some(ActionVerdict::Block));
+        // Broken TOML: every side effect asks.
+        std::fs::write(dir.path().join("agent.toml"), "[capabilities\n").unwrap();
+        let r = load_action_rules(dir.path());
+        assert!(r.malformed);
+        assert_eq!(r.resolve("wiki_write", ToolEffect::Modify), Some(ActionVerdict::Ask));
+        assert_eq!(r.resolve("memory_search", ToolEffect::Read), None);
+        // `[capabilities]` of the wrong shape: same.
+        std::fs::write(dir.path().join("agent.toml"), "capabilities = 3\n").unwrap();
+        assert!(load_action_rules(dir.path()).malformed);
+        // No key: no rules.
+        std::fs::write(dir.path().join("agent.toml"), "[capabilities]\nos_native = true\n").unwrap();
+        assert!(load_action_rules(dir.path()).is_absent());
+    }
 
     /// The sections `AgentConfig` requires, with no migrated keys in them.
     /// Kept minimal-but-valid so the tests below exercise the migrated

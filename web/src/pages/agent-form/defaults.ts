@@ -101,6 +101,7 @@ export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_us
   irreversible_tools: [],
   maybe_irreversible_tools: [],
   scoped_tools: [],
+  action_rules: [],
   native_sandbox: false,
   policy: [],
   os_native: false,

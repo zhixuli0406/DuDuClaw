@@ -59,6 +59,11 @@ pub struct ToolCatalogEntry {
     /// description carries a `[deprecated → …]` prefix. The old→new table is
     /// `docs/guides/deprecations.md`; removed names are [`REMOVED_MCP_TOOLS`].
     pub deprecated: bool,
+    /// Side-effect class ([`crate::tool_effect::ToolEffect`]) for the
+    /// capability editor and the action-rules section. An MCP tool missing
+    /// from the classification table shows `admin`, the class the gate
+    /// applies to it (fail closed).
+    pub effect: crate::tool_effect::ToolEffect,
 }
 
 /// MCP tool names that are deprecated aliases of a merged entry point: still
@@ -1591,6 +1596,7 @@ pub fn builtin_tool_catalog() -> Vec<ToolCatalogEntry> {
             category,
             kind: "mcp",
             deprecated: is_deprecated_tool(name),
+            effect: crate::tool_effect::effect_of(name),
         });
     }
     for &(name, description) in CLAUDE_TOOLS {
@@ -1602,6 +1608,8 @@ pub fn builtin_tool_catalog() -> Vec<ToolCatalogEntry> {
             category: "claude",
             kind: "claude",
             deprecated: false,
+            effect: crate::tool_effect::effect_of_native(name)
+                .unwrap_or(crate::tool_effect::ToolEffect::Admin),
         });
     }
     out
