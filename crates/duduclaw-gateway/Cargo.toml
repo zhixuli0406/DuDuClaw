@@ -106,6 +106,9 @@ async-trait = { workspace = true }
 
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 hex = "0.4"
+# Remote MCP refresh lock held across an await (`remote_mcp::connect`). Already in
+# the tree via duduclaw-core.
+fs2 = "0.4"
 openssl-sys = { version = "0.9", optional = true }
 # WP-4H: delivery-gate zip-container integrity check for docx/xlsx/pptx
 # (OOXML packages). Was Windows-only (`updater.rs`'s zip-extraction path);

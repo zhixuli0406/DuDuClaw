@@ -229,6 +229,7 @@ pub mod proactive_gate;
 pub mod profile_distill;
 pub mod redteam;
 pub mod relay_client;
+pub mod remote_mcp;
 pub mod relay_config;
 pub mod relay_device;
 pub mod rule_induction;

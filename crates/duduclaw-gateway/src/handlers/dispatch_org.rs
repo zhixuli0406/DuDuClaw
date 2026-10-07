@@ -144,6 +144,19 @@ impl MethodHandler {
                 self.handle_mcp_import_install(params).await
             }
             "mcp.install_request" => self.handle_mcp_install_request(params, ctx).await,
+            // Native remote MCP connections hold credentials: Admin only.
+            "mcp.remote_connect" => {
+                require_admin!();
+                self.handle_mcp_remote_connect(params, ctx).await
+            }
+            "mcp.remote_status" => {
+                require_admin!();
+                self.handle_mcp_remote_status(params).await
+            }
+            "mcp.remote_disconnect" => {
+                require_admin!();
+                self.handle_mcp_remote_disconnect(params, ctx).await
+            }
 
             // ── MCP OAuth (admin only) ──────────────────────────
             "mcp.oauth.providers" => {

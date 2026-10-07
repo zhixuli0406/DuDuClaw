@@ -2551,6 +2551,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             post(handle_causal_alias_revoke).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
+        // Native remote MCP sign-in (remote_mcp). Unauthenticated by design
+        // (a browser redirect from the authorization server); the single-use,
+        // ten-minute `state` bound to the pending sign-in is the guard.
+        .route(
+            crate::remote_mcp::connect::CALLBACK_PATH,
+            get(handle_remote_mcp_oauth_callback),
+        )
         .route(
             "/api/reliability/summary",
             get(handle_reliability_summary_http),
@@ -4062,6 +4069,16 @@ pub(crate) fn set_allowed_origins(config_entries: Vec<String>) -> Vec<String> {
     }
     *allowed_origins_cell().write().unwrap() = merged.clone();
     merged
+}
+
+/// The operator-configured extra allowed origins (normalized `host[:port]`),
+/// as currently applied. Used by the remote MCP sign-in to decide which
+/// dashboard origins may receive an OAuth redirect.
+pub(crate) fn allowed_origins_snapshot() -> Vec<String> {
+    allowed_origins_cell()
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
 /// Whether the request's `Origin` is an allowed dashboard origin.
@@ -15971,6 +15988,118 @@ async fn handle_mcp_oauth_callback(
          </div></body></html>"
             .to_string(),
     )
+}
+
+// ── Remote MCP OAuth callback (remote_mcp) ──────────────────
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The small page the browser lands on after a remote MCP sign-in. Every
+/// inserted value is HTML-escaped.
+fn remote_mcp_result_page(ok: bool, message: &str, back: Option<&str>) -> axum::response::Response {
+    let title = if ok { "Connected" } else { "Sign-in did not complete" };
+    let link = match back {
+        Some(origin) => format!(
+            "<p><a href=\"{}\" style=\"color:#b45309\">Back to the dashboard</a></p>",
+            html_escape(&format!("{origin}/manage/integrations?tab=mcp&mcp_tab=remote"))
+        ),
+        None => "<p style=\"color:#78716c\">You can close this window.</p>".to_string(),
+    };
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
+         <title>DuDuClaw</title></head><body style=\"font-family:system-ui,sans-serif;display:flex;justify-content:center;\
+         align-items:center;min-height:100vh;margin:0;background:#fafaf9;color:#1c1917\"><div style=\"max-width:32rem;padding:1.5rem;text-align:center\">\
+         <h2>{}</h2><p style=\"color:#57534e\">{}</p>{link}</div></body></html>",
+        html_escape(title),
+        html_escape(message),
+    );
+    let mut resp = axum::response::Html(body).into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("referrer-policy"),
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    resp
+}
+
+/// GET /oauth/mcp/callback — finish a remote MCP sign-in started by
+/// `mcp.remote_connect`.
+async fn handle_remote_mcp_oauth_callback(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use crate::remote_mcp;
+    let home = state.handler.home_dir().to_path_buf();
+    let st = params.get("state").map(String::as_str).unwrap_or("");
+    if let Some(err) = params.get("error") {
+        let pending = remote_mcp::connect::cancel_pending(st);
+        let back = pending.as_ref().map(|p| p.redirect_origin.clone());
+        if let Some(p) = &pending {
+            remote_mcp::audit(
+                &home,
+                remote_mcp::AUDIT_CONNECT_FAILED,
+                &p.agent_id,
+                serde_json::json!({ "agent_id": p.agent_id, "server": p.server, "error": duduclaw_core::truncate_chars(err, 100) }),
+            );
+        }
+        let desc = params.get("error_description").map(String::as_str).unwrap_or("");
+        let msg = duduclaw_core::truncate_chars(&format!("The authorization server answered: {err} {desc}"), 300);
+        return remote_mcp_result_page(false, &msg, back.as_deref());
+    }
+    let code = params.get("code").map(String::as_str).unwrap_or("");
+    match remote_mcp::connect::complete_callback(&home, st, code).await {
+        Ok(done) => {
+            let (h, a, s) = (home.clone(), done.agent_id.clone(), done.server.clone());
+            let installed = tokio::task::spawn_blocking(move || {
+                crate::handlers::install_remote_entry_for_callback(&h, &a, &s)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("internal error: {e}")));
+            remote_mcp::audit(
+                &home,
+                remote_mcp::AUDIT_CONNECTED,
+                &done.agent_id,
+                serde_json::json!({ "agent_id": done.agent_id, "server": done.server, "auth": "oauth", "entry_written": installed.is_ok() }),
+            );
+            match installed {
+                Ok(()) => {
+                    info!(agent = %done.agent_id, server = %done.server, "remote MCP sign-in completed");
+                    remote_mcp_result_page(
+                        true,
+                        &format!("{} is connected for {}. Return to the dashboard.", done.server, done.agent_id),
+                        Some(&done.redirect_origin),
+                    )
+                }
+                Err(e) => remote_mcp_result_page(
+                    false,
+                    &format!("Signed in, but the employee's MCP settings could not be updated: {e}"),
+                    Some(&done.redirect_origin),
+                ),
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "remote MCP sign-in callback failed");
+            remote_mcp_result_page(false, &e, None)
+        }
+    }
 }
 
 // ── .well-known endpoints for protocol discovery ──────────────
