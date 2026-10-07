@@ -312,6 +312,9 @@ mod mail_tool_tests;
 /// O7: the `tools/list` fixed-cost budget (golden bytes + description caps).
 #[cfg(test)]
 mod tools_list_budget_tests;
+/// 2026-10: tool effect classes, action rules and the explore lane.
+#[cfg(test)]
+mod action_rules_tests;
 /// Standalone profile: `tools/list` for scoped non-employee callers.
 #[cfg(test)]
 mod standalone_listing_tests;

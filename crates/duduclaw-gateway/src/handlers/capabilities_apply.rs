@@ -162,6 +162,64 @@ pub(crate) fn apply_capabilities_to_table(
         changes.push(format!("capabilities.db_sources = [{n} entries]"));
     }
 
+    // ── action_rules (2026-10) — allow / ask / block per effect or tool ──
+    // REPLACE semantics like the arrays above (an empty array removes every
+    // rule). Validated strictly here so the dashboard can never write a rule
+    // the gate would read as malformed (which it would treat fail-closed as
+    // `ask` for every side effect): each entry is `{effect, verdict}` or
+    // `{tool, verdict}` with known tokens and no other keys. Changing it is
+    // an authority change (`[capabilities]` is compared whole by
+    // `agents_update_v168::AUTHORITY_KEYS`).
+    if let Some(raw) = cap.get("action_rules") {
+        let arr = raw
+            .as_array()
+            .ok_or_else(|| "capabilities.action_rules must be an array".to_string())?;
+        let mut out: Vec<toml::Value> = Vec::with_capacity(arr.len());
+        for (i, item) in arr.iter().enumerate() {
+            let obj = item
+                .as_object()
+                .ok_or_else(|| format!("capabilities.action_rules[{i}] must be an object"))?;
+            if let Some(k) = obj.keys().find(|k| !matches!(k.as_str(), "effect" | "tool" | "verdict")) {
+                return Err(format!("capabilities.action_rules[{i}] has an unknown key '{k}'"));
+            }
+            let verdict: duduclaw_core::ActionVerdict = obj
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .parse()
+                .map_err(|_| format!("capabilities.action_rules[{i}].verdict must be one of: allow, ask, block"))?;
+            let mut rule = toml::map::Map::new();
+            match (obj.get("effect"), obj.get("tool")) {
+                (Some(e), None) => {
+                    let effect: duduclaw_core::ToolEffect = e.as_str().unwrap_or("").parse().map_err(|_| {
+                        format!(
+                            "capabilities.action_rules[{i}].effect must be one of: read, draft, send, publish, purchase, delete, modify, admin"
+                        )
+                    })?;
+                    rule.insert("effect".into(), toml::Value::String(effect.as_str().into()));
+                }
+                (None, Some(t)) => {
+                    let tool = t
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| format!("capabilities.action_rules[{i}].tool must be a non-empty string"))?;
+                    rule.insert("tool".into(), toml::Value::String(tool.into()));
+                }
+                _ => {
+                    return Err(format!(
+                        "capabilities.action_rules[{i}] must name exactly one of effect or tool"
+                    ));
+                }
+            }
+            rule.insert("verdict".into(), toml::Value::String(verdict.as_str().into()));
+            out.push(toml::Value::Table(rule));
+        }
+        let n = out.len();
+        section.insert("action_rules".into(), toml::Value::Array(out));
+        changes.push(format!("capabilities.action_rules = [{n} rules]"));
+    }
+
     // ── [capabilities.computer_use_config] sub-table ──
     if let Some(cfg) = cap.get("computer_use_config").and_then(|v| v.as_object()) {
         let sub = section

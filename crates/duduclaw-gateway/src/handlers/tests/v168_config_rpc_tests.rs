@@ -128,6 +128,24 @@ async fn acp_trusted_writes_a_protected_audit_row() {
 }
 
 #[tokio::test]
+async fn action_review_mode_is_validated_and_audited_as_protected() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    ok(&handler
+        .handle("system.update_config", json!({ "action_review": { "mode": "shadow" } }), &admin())
+        .await);
+    assert_eq!(config(home.path())["action_review"]["mode"].as_str(), Some("shadow"));
+    let rows = audit_rows(home.path(), "config_protected_key_changed");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["details"]["key"], "action_review.mode");
+    let e = err(&handler
+        .handle("system.update_config", json!({ "action_review": { "mode": "on" } }), &admin())
+        .await);
+    assert!(e.contains("action_review.mode"), "{e}");
+    assert_eq!(config(home.path())["action_review"]["mode"].as_str(), Some("shadow"));
+}
+
+#[tokio::test]
 async fn admin_rpcs_refuse_non_admin() {
     let (_home, handler) = handler_with_agent().await;
     let user = owner_of_a1();

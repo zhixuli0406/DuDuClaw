@@ -3534,6 +3534,21 @@ export interface AgentCapabilities {
   maybe_irreversible_tools?: string[];
   /** PORTICO — usable only with an active task-scoped grant. */
   scoped_tools?: string[];
+  /** 2026-10 — allow / ask / block per effect class or per tool. Rules only
+   *  add friction: they never lift an approval or a denial set above. */
+  action_rules?: ActionRule[];
+}
+
+/** Side-effect class of a tool (`duduclaw_core::tool_effect::ToolEffect`). */
+export type ToolEffect = 'read' | 'draft' | 'send' | 'publish' | 'purchase' | 'delete' | 'modify' | 'admin';
+
+export type ActionVerdict = 'allow' | 'ask' | 'block';
+
+/** One `[capabilities] action_rules` entry: exactly one of `effect` / `tool`. */
+export interface ActionRule {
+  effect?: ToolEffect;
+  tool?: string;
+  verdict: ActionVerdict;
 }
 
 /** v1.39 — top-level `[os_watch]` table (gated by `capabilities.os_native`).
@@ -4210,6 +4225,8 @@ export interface BuiltinToolEntry {
    *  new choice — it only stays visible when already selected. The aliases were removed in
    *  v1.69.0, so no row carries this flag now; see `docs/guides/deprecations.md`. */
   deprecated?: boolean;
+  /** 2026-10 — side-effect class the action rules match on. */
+  effect?: ToolEffect;
 }
 
 // ── SKS: global [skill_synthesis] auto-run (W19-P1) ─────────────
