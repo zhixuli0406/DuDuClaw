@@ -1,0 +1,80 @@
+name: Bug report
+description: Something does not work the way the docs say it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. Please remove API keys, bot tokens, chat IDs and personal data from anything you paste.
+        Security problems go to the [private vulnerability report](https://github.com/zhixuli0406/DuDuClaw/security/advisories/new), not here.
+  - type: input
+    id: version
+    attributes:
+      label: DuDuClaw version
+      description: Output of `duduclaw --version`.
+      placeholder: duduclaw 1.71.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - npm (npm install -g duduclaw / npx)
+        - Desktop app (dmg / msi / AppImage / deb)
+        - Docker image
+        - Built from source
+        - DuDuClaw OS image
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Linux x64
+        - Linux arm64
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where does it happen?
+      multiple: true
+      options:
+        - Standalone MCP server (duduclaw mcp init / mcp-server)
+        - Gateway / dashboard
+        - A chat channel (Telegram, LINE, Discord, Slack, ...)
+        - AI runtime (Claude Code, Codex, Antigravity, Grok, OpenAI-compatible)
+        - Memory or wiki
+        - Goals, tasks or approvals
+        - Install or update
+        - Docs
+        - Not sure
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run ...
+        2. Send ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or `duduclaw doctor` output
+      description: Optional. Redact secrets first.
+      render: text

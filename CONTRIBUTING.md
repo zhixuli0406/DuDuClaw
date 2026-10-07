@@ -22,6 +22,7 @@ Thanks for wanting to extend DuDuClaw! This page is the map — where each kind 
 
 - **Setup**: `cargo build` (workspace), `cd web && npm install && npm run dev` for the dashboard. `cargo test -p <crate> --lib` for focused test runs.
 - **Style**: match the file you're in. The repo is not rustfmt-clean — format only the lines you touch, never whole files. No unanchored `contains` for security/routing decisions; no raw byte-index string slicing (see `CLAUDE.md` → Coding Conventions).
+- **Branches and PRs**: branch from `main` (`feat/…`, `fix/…`, `docs/…`, `chore/…`) and open the PR against `main`. CI runs Rust on Ubuntu, macOS and Windows, the dashboard tests and the Python tests.
 - **Commits**: [Conventional Commits](https://www.conventionalcommits.org/) (`feat:` / `fix:` / `docs:` …).
 - **Definition of done**: builds + tests pass locally, behavior changes update the docs **in the same PR** (README/CHANGELOG/guides — stale docs are treated as bugs), and `CHANGELOG.md [Unreleased]` gets a human-readable entry.
 - **Security gates fail closed**: if your change adds a permission/authz/parsing decision point, the unknown case must DENY. PRs that loosen a gate need an explicit rationale in the description.
@@ -30,9 +31,16 @@ Thanks for wanting to extend DuDuClaw! This page is the map — where each kind 
 
 Public docs live under `docs/` by type (`guides/`, `features/`, `spec/`, `rfc/`, `adr/`); update `docs/README.md`'s index in the same PR. Feature docs have `zh-TW/` and `ja-JP/` siblings — updating all three is appreciated but English-first PRs are fine.
 
-## Reporting issues
+## Reporting issues and asking questions
 
-Use GitHub Issues. For suspected security vulnerabilities, see `SECURITY.md` instead of filing a public issue.
+- **Bugs and feature requests**: open a GitHub Issue; the bug form asks for your version, install method and OS.
+- **Questions, setup help, things you built**: use [Discussions](https://github.com/zhixuli0406/DuDuClaw/discussions).
+- **Security vulnerabilities**: report them privately through [GitHub's vulnerability reporting](https://github.com/zhixuli0406/DuDuClaw/security/advisories/new); see `SECURITY.md`. Please do not open a public issue.
+- **Want a first task?** Issues labelled [`good first issue`](https://github.com/zhixuli0406/DuDuClaw/labels/good%20first%20issue) are small and self-contained.
+
+## Code of Conduct
+
+This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). Report unacceptable behaviour to info@dudustudio.monster.
 
 ## License
 
