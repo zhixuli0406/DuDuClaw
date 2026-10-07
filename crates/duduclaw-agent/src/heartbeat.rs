@@ -1140,6 +1140,26 @@ async fn execute_proactive_check(
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
+            // Read-only explore lane (2026-10): a proactive check is
+            // background exploration, so it gets read-only tools only. The
+            // built-in surface is narrowed to `EXPLORE_LANE_BUILTIN_TOOLS`
+            // (minus the employee's own `denied_tools`; an allowlist can only
+            // remove more, never add Write/Edit/Bash back), and
+            // `DUDUCLAW_LANE=explore` reaches the DuDuClaw MCP server through
+            // the CLI's inherited environment (the `.mcp.json` entry does not
+            // set the variable, so nothing overrides it), where `tools/list`
+            // shows only `read` / `draft` tools and every other call is
+            // refused. A notification the check wants to send is still
+            // delivered by this function from the reply, not by a tool.
+            let explore_tools: Vec<String> = agent_config
+                .capabilities
+                .minimal_builtin_tools(duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS)
+                .into_iter()
+                .filter(|t| duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS.contains(&t.as_str()))
+                .collect();
+            cmd.args(["--tools", &explore_tools.join(",")]);
+            cmd.env(duduclaw_core::ENV_LANE, duduclaw_core::LANE_EXPLORE);
+
             // Attach agent's MCP server definitions so Notion/Gmail/etc tools
             // are available during the proactive run. `--strict-mcp-config`
             // prevents ambient global MCP from leaking in.

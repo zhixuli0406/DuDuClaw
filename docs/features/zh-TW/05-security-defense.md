@@ -149,6 +149,30 @@ A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[ag
 
 **升級須知。** 這道閘把綁定資訊存在請求內容的 `gate` 物件裡。v1.70.0 以前建立的請求沒有這個物件，新版本不會比對到、也不會計數。升級前送出的請求，就算已經核准、還沒套用，升級後也不會被套用：再執行一次指令會另建一筆新請求，要重新核准。舊的等待中卡片在過期前照常收到提醒推播（持續任務的請求本來就不提醒），但核准它不會有任何作用。
 
+## 動作規則、探索通道與動作審查
+
+2026-10 新增（尚未發佈）。三層都只會收緊員工能做的事，不會解除其他閘門設下的核准或拒絕。
+
+**動作類型。** 每個 DuDuClaw MCP 工具都有一個副作用類型（`duduclaw_core::tool_effect::effect_of_builtin`）：`read`（讀取）、`draft`（擬稿）、`send`（傳送）、`publish`（發布）、`purchase`（花錢或承諾交易）、`delete`（刪除）、`modify`（修改資料）、`admin`（管理操作）。`read` 與 `draft` 在回覆之外不留下任何東西，其餘六類都有副作用。效果會隨參數改變的工具取較嚴格的類型（`wiki_write` 兩種 scope 都是 `modify`）。`mail_send` 只會建立一份要人核可的草稿，但它歸在 `send`，因為它最後的效果是寄出；`gmail_create_draft` 永遠不寄，歸在 `draft`。表裡沒有的工具名稱當作 `admin`（fail closed），並有測試逐一檢查每個對外宣告的工具，新工具沒分類就無法通過。內建工具目錄（`tools.catalog`）以 `effect` 欄位帶出類型。
+
+**動作規則。** `agent.toml [capabilities] action_rules` 依類型或依工具設定 `allow`、`ask` 或 `block`：
+
+```toml
+[capabilities]
+action_rules = [
+  { effect = "send", verdict = "ask" },
+  { tool = "mail_send", verdict = "block" },
+]
+```
+
+`tool` 規則（與其他 `[capabilities]` 工具清單同一套有錨定的比對，`mcp__duduclaw__mail_send`、`wiki_*` 都可用）優先於 `effect` 規則；同一種規則之間取最嚴格的判定。`block` 在 MCP dispatch 閘與 `denied_tools` 同一處拒絕（JSON-RPC `-32003`，稽核 `error_class` `action_rule`），並從 `tools/list` 隱藏；`ask` 併入核准閘的靜態「一律詢問」集合，所以跟 `approval_required_tools` 一樣走 ApprovalBroker。`allow` 只代表「這一層不加阻力」，不會解除 `denied_tools`、核准清單、能力開關或 scope。八個 `computer_*` 工具與三個 `computer_workspace_*` 工具在 gateway 的電腦操作路由用同一套判定，因為工作階段由 gateway 持有。這個鍵刻意放在 `[capabilities]`：`org_field_guard` 會凍結整張表，員工無法自己改。清單或某一筆格式錯誤（不認得的判定或類型、`effect` 與 `tool` 同時有或都沒有、多出的鍵、不是陣列）不會讓整個檔案失效：原樣保留，並讓每個有副作用的呼叫至少要「先問人」，其中有效的 `block` 仍然擋下。`agent.toml` 存在但讀不到或不是合法 TOML 時也一樣處理。儀表板在員工編輯頁編輯這份清單（依動作類型的規則，加上個別工具的例外），走只限管理員的 `agents.update` capabilities 路徑，每一筆都會檢查，變更記為 `agent_authority_changed`。
+
+**探索通道。** 以 `DUDUCLAW_LANE=explore` 啟動的 MCP server 只列出、只執行 `read` 與 `draft` 工具，其他呼叫一律以 `-32003` 拒絕，稽核 `error_class` `explore_lane`。變數存在但是其他值（包含空字串）時拒絕所有呼叫。gateway 在心跳的主動檢查（proactive check）設定這個變數，這次 Claude CLI 的內建工具也只剩 `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`（再扣掉員工自己的 `denied_tools`）。檢查決定要發的通知仍由心跳根據回覆送出。變數透過 CLI 繼承的環境傳到 MCP 子行程，`.mcp.json` 的項目不設定它。主動檢查只在 Claude CLI 上執行，所以不牽涉其他 runtime。`DUDUCLAW_LANE` 也列入操作者指令拒絕的 AI 工作階段變數清單。
+
+**動作審查。** `config.toml [action_review] mode = "off" | "shadow" | "enforce"`，預設 `off`，每次呼叫都重讀（`system.update_config` 接受 `action_review.mode`，變更記為受保護鍵）。只在所有靜態閘門都判定可自動執行、且工具有副作用時才審查。審查者是 utility 模型，透過封閉選項的 `decide()`（`duduclaw-gateway/src/decide.rs`）：回覆必須剛好是 `{"choice":"allow"|"ask"|"block"}` 並符合嚴格 JSON 契約，其他一律視為沒有判定。輸入只有結構化資料：工具名稱、類型、參數的鍵（不像識別字的鍵只計數）、ActionGuard 的封閉 finding token，以及員工 `CONTRACT.toml` 的 `must_not`。參數值不會進入提示。`shadow` 不改變結果，只在 `tool_calls.jsonl` 寫一列，`action_review` 欄位是判定或 `unavailable`。`enforce` 遇到 `block` 拒絕，遇到 `ask` 或沒有判定時透過 ApprovalBroker 問人。不認得的 mode 值，或 `config.toml` 存在但讀不到、無法解析時，視為 `enforce`。
+
+**未涵蓋與未驗證。** 動作規則只管 DuDuClaw 自己的 MCP 工具；Claude Code 內建工具只受 `allowed_tools`／`denied_tools` 管，`.mcp.json` 裡其他 MCP server 的工具沒有分類。點名已移除工具名稱的 `tool` 規則不會跟著取代它的呼叫。動作審查不會對 OS 動作工具（它們有自己的情境分類器）、`skill_hub_install`（安全掃描後有自己的核准）與 `computer_*` 工具執行。分類以工具名稱為準，所以效果隨參數改變的工具一律取較嚴格的類型。三層都還沒在真的 gateway 與真的模型上跑過，目前只有單元測試與 dispatcher 層級的測試。
+
 ## 支撐層
 
 **MCP 授權閘** — 每個 MCP 工具都在 scope 表裡逐項列舉；沒被列的工具預設需要 Admin scope。Scope、per-agent capability 授權、`denied_tools` 三者各自在分派總門強制，每次拒絕都帶 `error_class` 落稽核。

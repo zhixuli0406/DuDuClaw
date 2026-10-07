@@ -452,7 +452,7 @@ pub fn build_proactive_prompt(proactive_md: &str, agent_name: &str) -> String {
     format!(
         r#"You are running a scheduled proactive check for agent "{agent_name}".
 
-Execute the checks described in the <proactive_checks> block below. Use available tools (web_fetch, odoo_search, system commands, etc.) as needed.
+Execute the checks described in the <proactive_checks> block below. Use the available read-only tools (web_fetch, odoo_search, memory and wiki reads, etc.) as needed. This run is read-only: it cannot send, change or delete anything; report what should be done instead.
 
 IMPORTANT RULES:
 - If there is NOTHING to report, respond with exactly: PROACTIVE_OK

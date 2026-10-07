@@ -718,3 +718,49 @@ pub(super) fn cap_computer_use_allowed_domains_refuses_invalid_and_oversize() {
     )
     .is_err());
 }
+
+// ── 2026-10: [capabilities] action_rules ─────────────────────────────────
+
+#[test]
+pub(super) fn cap_action_rules_round_trip_and_fail_closed_on_bad_entries() {
+    let mut table = toml::Table::new();
+    let changes = apply_capabilities_to_table(
+        &mut table,
+        &json!({ "capabilities": { "action_rules": [
+            { "effect": "Send", "verdict": "ask" },
+            { "tool": " mail_send ", "verdict": "block" },
+        ] } }),
+    )
+    .expect("apply");
+    assert!(changes.iter().any(|c| c.contains("action_rules = [2 rules]")));
+    let cap = table.get("capabilities").unwrap().as_table().unwrap();
+    let cfg: duduclaw_core::types::CapabilitiesConfig =
+        cap.clone().try_into().expect("deserializes into CapabilitiesConfig");
+    assert!(!cfg.action_rules.malformed);
+    assert_eq!(cfg.action_rules.rules.len(), 2);
+    assert_eq!(
+        cfg.action_rules.resolve("mail_send", duduclaw_core::ToolEffect::Send),
+        Some(duduclaw_core::ActionVerdict::Block)
+    );
+    assert_eq!(
+        cfg.action_rules.resolve("send_message", duduclaw_core::ToolEffect::Send),
+        Some(duduclaw_core::ActionVerdict::Ask)
+    );
+
+    for bad in [
+        json!("send"),
+        json!([{ "effect": "send", "verdict": "maybe" }]),
+        json!([{ "effect": "shout", "verdict": "ask" }]),
+        json!([{ "effect": "send", "tool": "x", "verdict": "ask" }]),
+        json!([{ "verdict": "ask" }]),
+        json!([{ "tool": "", "verdict": "ask" }]),
+        json!([{ "effect": "send", "verdict": "ask", "why": "x" }]),
+    ] {
+        let mut t = toml::Table::new();
+        assert!(
+            apply_capabilities_to_table(&mut t, &json!({ "capabilities": { "action_rules": bad.clone() } }))
+                .is_err(),
+            "{bad}"
+        );
+    }
+}

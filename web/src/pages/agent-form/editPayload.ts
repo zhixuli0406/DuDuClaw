@@ -160,6 +160,7 @@ const CAP_LIST_KEYS: ReadonlyArray<keyof AgentCapabilities> = [
   'db_sources', 'native_sandbox', 'policy', 'os_native', 'recording', 'git_credentials', 'system_operator',
   'codrive', 'autonomy_level',
   'approval_required_tools', 'irreversible_tools', 'maybe_irreversible_tools', 'scoped_tools',
+  'action_rules',
 ];
 
 const COMPUTER_USE_CONFIG_KEYS: ReadonlyArray<keyof ComputerUseConfig> = [

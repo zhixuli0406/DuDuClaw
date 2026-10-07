@@ -291,6 +291,37 @@ fn a_future_capability_key_is_frozen_without_a_list_update() {
     }
 }
 
+/// `[capabilities] action_rules` (2026-10) is frozen like every other
+/// capability key: an employee can neither add a rule list, nor loosen an
+/// existing one, nor rewrite a single verdict. This is why the key lives in
+/// `[capabilities]` rather than a section of its own.
+#[test]
+fn action_rules_are_frozen_against_the_employees_own_write() {
+    let with_rules = BASE_WITH_CAPS.replace(
+        "[capabilities]\n",
+        "[capabilities]\naction_rules = [{ effect = \"send\", verdict = \"ask\" }]\n",
+    );
+    let added = check_protected_toml_write(&agent_toml(), &home(), Some(BASE_WITH_CAPS), &with_rules);
+    match added {
+        GuardDecision::BlockedProtectedField { changed, .. } => {
+            assert!(changed[0].contains("action_rules"), "{changed:?}");
+        }
+        other => panic!("adding rules: expected BlockedProtectedField, got {other:?}"),
+    }
+    for loosened in [
+        with_rules.replace("verdict = \"ask\"", "verdict = \"allow\""),
+        with_rules.replace("action_rules = [{ effect = \"send\", verdict = \"ask\" }]\n", ""),
+    ] {
+        assert!(
+            matches!(
+                check_protected_toml_write(&agent_toml(), &home(), Some(&with_rules), &loosened),
+                GuardDecision::BlockedProtectedField { .. }
+            ),
+            "{loosened}"
+        );
+    }
+}
+
 /// The guard stays narrow: a write that touches neither the org fields nor
 /// `[capabilities]` is still allowed, and an unchanged `[capabilities]`
 /// never blocks a legitimate edit elsewhere in the file.

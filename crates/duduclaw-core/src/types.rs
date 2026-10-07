@@ -1819,6 +1819,20 @@ pub struct CapabilitiesConfig {
     #[serde(default, deserialize_with = "crate::lenient::opt")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_approve_install: Option<bool>,
+
+    /// Per-effect / per-tool `allow` / `ask` / `block` rules
+    /// (`action_rules = [{ effect = "send", verdict = "ask" }, { tool =
+    /// "mail_send", verdict = "block" }]`), enforced by the MCP dispatch gate
+    /// on top of the name lists above, take-the-stricter: a rule never
+    /// removes an approval or a denial the name lists impose.
+    ///
+    /// Lives in `[capabilities]` on purpose: `org_field_guard` freezes the
+    /// whole table against the employee's own writes. Parsing never fails the
+    /// section; a malformed list or entry is kept verbatim and makes every
+    /// side-effecting call at least `ask` (fail closed). See
+    /// [`crate::tool_effect::ActionRules`].
+    #[serde(default, skip_serializing_if = "crate::tool_effect::ActionRules::is_absent")]
+    pub action_rules: crate::tool_effect::ActionRules,
 }
 
 /// Effect of a [`ToolPolicy`] rule.
@@ -2050,6 +2064,7 @@ impl Default for CapabilitiesConfig {
             maybe_irreversible_tools: Vec::new(),
             autonomy_level: None,
             auto_approve_install: None,
+            action_rules: crate::tool_effect::ActionRules::default(),
         }
     }
 }

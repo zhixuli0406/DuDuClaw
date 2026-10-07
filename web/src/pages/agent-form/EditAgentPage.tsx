@@ -97,6 +97,7 @@ import {
   type OdooFormState,
 } from './editPayload';
 import { ToolNameListField, TypedKvTable } from './v168-controls';
+import { ActionRulesEditor } from './ActionRulesEditor';
 import { RowText, RowNumber, RowSwitch, RowSelect, FieldBlock } from './form-rows';
 import { isDeprecatedRuntime } from '@/lib/deprecated-runtimes';
 import { buildDbSourceCapabilityRows, toggleDbSourceCapability } from './dbSourceCapability';
@@ -1192,6 +1193,12 @@ export function EditAgentPage() {
                 </FieldBlock>
               </>
             )}
+          </SettingsSection>
+
+          {/* 2026-10 — [capabilities] action_rules: allow / ask / block per
+              kind of action, plus per-tool overrides. */}
+          <SettingsSection title={t('agents.actionRules.title')} description={t('agents.actionRules.desc')}>
+            <ActionRulesEditor rules={caps.action_rules} onChange={(v) => updateCap('action_rules', v)} disabled={!isAdmin} />
           </SettingsSection>
 
           {/* v1.68 W1 — tools that need a checkpoint before they run
