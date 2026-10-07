@@ -167,7 +167,7 @@ Goose の Lead/Worker 機能は、モデル名だけを持つ役割設定を保�
 
 ### 2. 第一バッチの runtime のみ
 
-`claude`、`codex`、`gemini`（v1.67.0 で非推奨、v1.71.0 で削除。`antigravity` を使用）、`antigravity`、`grok`。それ以外は `openai_compat`、`qwen`、`copilot`、`cursor` を含めすべて拒否されます（`runtime_not_allowed`）。
+`claude`、`codex`、`gemini`（v1.67.0 で非推奨、v1.72.0 で削除。`antigravity` を使用）、`antigravity`、`grok`。それ以外は `openai_compat`、`qwen`、`copilot`、`cursor` を含めすべて拒否されます（`runtime_not_allowed`）。
 
 理由は能力ではなくツールです。この 5 つは DuDuClaw の MCP サーバーをネイティブに登録するため、その上で動く役割はツール群をすべて使えます。ツールを黙って失った役割は、ツール呼び出しのない自信満々の語りを生み、審核者はそれを本当の作業と区別できません。
 

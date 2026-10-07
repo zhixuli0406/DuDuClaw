@@ -550,7 +550,7 @@ pub const CATALOG: &[RuntimeSpec] = &[
         // keeps parsing and running for the deprecation window.
         deprecation: Some(RuntimeDeprecation {
             since: "v1.67.0",
-            remove_in: "v1.71.0",
+            remove_in: "v1.72.0",
             replacement: "antigravity",
         }),
     },
@@ -1592,7 +1592,7 @@ mod tests {
             if spec.id == "gemini" {
                 let dep = spec.deprecation.expect("gemini is deprecated");
                 assert_eq!(dep.since, "v1.67.0");
-                assert_eq!(dep.remove_in, "v1.71.0");
+                assert_eq!(dep.remove_in, "v1.72.0");
                 assert_eq!(dep.replacement, "antigravity");
                 let repl = spec_for(dep.replacement).expect("replacement is a catalog id");
                 assert!(repl.deprecation.is_none(), "replacement must not itself be deprecated");
@@ -1608,7 +1608,7 @@ mod tests {
         let n = dep.notice("gemini");
         assert!(n.contains("\"gemini\""), "{n}");
         assert!(n.contains("\"antigravity\""), "{n}");
-        assert!(n.contains("v1.71.0"), "{n}");
+        assert!(n.contains("v1.72.0"), "{n}");
         assert!(n.contains(DEPRECATIONS_DOC), "{n}");
     }
 
