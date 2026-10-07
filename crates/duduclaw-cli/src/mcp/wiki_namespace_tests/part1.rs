@@ -229,33 +229,41 @@ fn tool_catalog_covers_all_advertised_tools() {
     }
 }
 
-// ── TC-INT-外部工具過濾: external tools/list returns exactly 7 tools ────────
+// ── TC-INT-外部工具過濾: external tools/list = the callable whitelist ──────
+// Until the standalone profile (2026-10-07) an external key with no scopes
+// was shown the seven legacy whitelist tools, and the dispatch gate's scope
+// check refused every one of them (-32003). The listing now follows the gate:
+// a whitelist tool appears only with the scope it needs.
 #[tokio::test(flavor = "current_thread")]
-async fn external_tools_list_returns_exactly_7_tools() {
+async fn external_tools_list_lists_only_whitelist_tools_its_scopes_reach() {
     use serde_json::json;
     let id = json!(1);
+    let home = tmp_home_for_tools_list();
 
-    // External principal → should see exactly 7 whitelisted tools
-    let response = super::handle_tools_list(
-        &id,
-        &super::test_principal(true),
-        tmp_home_for_tools_list().path(),
-    ).await;
+    // No scopes: nothing is callable, so nothing is listed.
+    let response = super::handle_tools_list(&id, &super::test_principal(true), home.path()).await;
     let tools = response["result"]["tools"]
         .as_array()
         .expect("tools must be array");
-    assert_eq!(
-        tools.len(),
-        7,
-        "External principal must see exactly 7 tools, got {}: {:?}",
-        tools.len(),
+    assert!(
+        tools.is_empty(),
+        "an external key without scopes can call nothing, got {:?}",
         tools
             .iter()
             .map(|t| t["name"].as_str().unwrap_or("?"))
             .collect::<Vec<_>>()
     );
 
-    let names: Vec<&str> = tools
+    // The scopes the whitelist needs: every whitelist tool is listed.
+    let mut principal = super::test_principal(true);
+    principal.scopes = crate::mcp_auth::parse_scopes(
+        "memory:read,memory:write,wiki:read,wiki:write,messaging:send",
+    )
+    .unwrap();
+    let response = super::handle_tools_list(&id, &principal, home.path()).await;
+    let names: Vec<&str> = response["result"]["tools"]
+        .as_array()
+        .expect("tools must be array")
         .iter()
         .map(|t| t["name"].as_str().unwrap_or(""))
         .collect();
@@ -273,6 +281,13 @@ async fn external_tools_list_returns_exactly_7_tools() {
             "External tool list must contain '{}'; got: {:?}",
             expected,
             names
+        );
+    }
+    // Tools that act for the process's agent stay hidden from an external key.
+    for hidden in &["working_state_set", "canvas_push", "shared_wiki_delete"] {
+        assert!(
+            !names.contains(hidden),
+            "{hidden} must not be listed: {names:?}"
         );
     }
 }
@@ -437,16 +452,31 @@ async fn role_member_tools_list_uses_ephemeral_capabilities() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn internal_tools_list_no_agent_toml_is_unrestricted() {
+async fn internal_key_without_agent_toml_lists_everything_with_admin_and_nothing_without() {
     use serde_json::json;
     // No agent.toml for this caller → empty gate → full list (matches the
-    // dispatch gate's own fail-safe-to-empty posture).
-    let resp = super::handle_tools_list(
-        &json!(1),
+    // dispatch gate's own fail-safe-to-empty posture) for a key holding
+    // `admin`. Since the standalone profile (2026-10-07) a non-employee key
+    // without scopes lists nothing, because every tool needs a scope it
+    // lacks. That half goes through `visible_tools_with(.., false)`: the
+    // env-reading listing would see `DUDUCLAW_AGENT_ID` set by other tests
+    // under a different lock and treat this process as an employee.
+    let mut admin = internal_principal_named("ghost");
+    admin.scopes.insert(crate::mcp_auth::Scope::Admin);
+    let resp = super::handle_tools_list(&json!(1), &admin, tmp_home_for_tools_list().path()).await;
+    assert!(names_of(&resp).len() > 7);
+    let scopeless = super::visible_tools_with(
         &internal_principal_named("ghost"),
         tmp_home_for_tools_list().path(),
-    ).await;
-    assert!(names_of(&resp).len() > 7);
+        "",
+        false,
+    )
+    .await;
+    assert!(
+        scopeless.is_empty(),
+        "{:?}",
+        scopeless.iter().map(|t| t.name).collect::<Vec<_>>()
+    );
 }
 
 // ── Test 7: wiki_write succeeds for external client WITHOUT pre-created dir ──

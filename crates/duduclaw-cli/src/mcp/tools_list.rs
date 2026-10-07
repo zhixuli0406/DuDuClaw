@@ -67,15 +67,123 @@ pub(crate) const GITHUB_WORKSPACE_TOOLS: &[&str] = &[
     "github_issue_comment",
 ];
 
+/// Tools whose handler acts for the MCP **process's** agent (`default_agent`,
+/// i.e. `DUDUCLAW_AGENT_ID` or `[general] default_agent`) instead of the
+/// caller's own namespace.
+///
+/// For an employee that is the same identity, so these work. For a caller that
+/// is not an employee (a standalone `duduclaw mcp init` client, an external
+/// key) they either fail (`working_state_*` answer `unknown agent: <id>`,
+/// `office_script` needs an agent directory, `mail_*` need the gateway's mail
+/// worker, `shared_wiki_delete` judges authorship by the process agent) or
+/// read and write another agent's data (`memory_search_by_layer` and the
+/// three consolidation reads look at the process agent's memories, `canvas_*`
+/// draw on the process agent's dashboard canvas, `wiki_namespace_status`
+/// reports the process agent's department). Measured 2026-10-07 on an
+/// isolated home with the 1.70.1 binary; see `docs/guides/mcp-standalone.md`.
+///
+/// Hidden from such callers by [`visible_tools`] and refused to them by the
+/// dispatch gate (`mcp_dispatch.rs`, error class `process_agent_tool`), both
+/// through [`process_agent_tool_refused`], so discoverable ⇔ callable.
+pub(crate) const PROCESS_AGENT_TOOLS: &[&str] = &[
+    "working_state_get",
+    "working_state_set",
+    "working_state_clear",
+    "working_state_handoff",
+    "memory_search_by_layer",
+    "memory_successful_conversations",
+    "memory_episodic_pressure",
+    "memory_consolidation_status",
+    "shared_wiki_delete",
+    "wiki_namespace_status",
+    "canvas_push",
+    "canvas_clear",
+    "team_handoff",
+    "mail_list",
+    "mail_read",
+    "mail_send",
+    "office_script",
+];
+
+/// Does `tools/list` for this caller list only the tools its scopes reach?
+///
+/// True for every principal that holds no `admin` scope and is not an AI
+/// employee: not the gateway-internal key, not a per-agent key (whose
+/// `client_id` names an existing `agents/<id>/agent.toml`), and, for an
+/// internal key, not a process the gateway spawned for an employee
+/// (`DUDUCLAW_AGENT_ID` set). External keys are included: the dispatch gate's
+/// scope check applies to them too, so the legacy whitelist was listed but
+/// not callable without the matching scope.
+///
+/// An `admin` holder passes every scope check, so its listing is unchanged.
+pub(crate) fn scope_listing_applies(
+    principal: &crate::mcp_auth::Principal,
+    client_is_agent: bool,
+    employee_process: bool,
+) -> bool {
+    if principal.scopes.contains(&crate::mcp_auth::Scope::Admin) {
+        return false;
+    }
+    if principal.is_external {
+        return true;
+    }
+    !principal.client_id.is_empty()
+        && principal.client_id != duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID
+        && !client_is_agent
+        && !employee_process
+}
+
+/// For a caller [`scope_listing_applies`] to: is `name` callable?
+///
+/// The tool's minimum scope must be one the caller holds (the dispatch gate's
+/// own table, `tool_requires_scope`, read here so the two cannot drift), and
+/// the tool must not act for the process's agent ([`PROCESS_AGENT_TOOLS`]).
+pub(crate) fn scoped_caller_can_call(name: &str, principal: &crate::mcp_auth::Principal) -> bool {
+    !PROCESS_AGENT_TOOLS.contains(&name)
+        && crate::mcp_auth::tool_requires_scope(name)
+            .is_some_and(|required| principal.scopes.contains(&required))
+}
+
+/// Must this caller be kept away from `name` because the tool acts for the
+/// process's agent ([`PROCESS_AGENT_TOOLS`])?
+///
+/// True for an external key whatever scopes it holds (an external key is
+/// never an employee; `admin` on one only widens within the externally
+/// grantable set) and for every other caller [`scope_listing_applies`] to.
+/// `tools/list` hides and the dispatch gate refuses by this one predicate.
+pub(crate) fn process_agent_tool_refused(
+    name: &str,
+    principal: &crate::mcp_auth::Principal,
+    client_is_agent: bool,
+    employee_process: bool,
+) -> bool {
+    PROCESS_AGENT_TOOLS.contains(&name)
+        && (principal.is_external
+            || scope_listing_applies(principal, client_is_agent, employee_process))
+}
+
+/// Whether this process was spawned by the gateway for an employee.
+pub(crate) fn employee_process_from_env() -> bool {
+    std::env::var(duduclaw_core::ENV_AGENT_ID).is_ok_and(|v| !v.trim().is_empty())
+}
+
 /// Test helper: tools/list needs a home_dir (the Google and, since H8, GitHub
 /// integration gates). An empty tempdir has no config.toml, so both gates read
 /// closed (the fail-closed default) and neither group is listed.
-
+///
+/// The internal (`is_external = false`) principal carries `admin`, like the
+/// gateway-internal key it stands for; without it the scoped-caller listing
+/// rule would hide every tool from a non-agent client id.
 #[cfg(test)]
 pub(crate) fn test_principal(is_external: bool) -> crate::mcp_auth::Principal {
+    let scopes = if is_external {
+        std::collections::HashSet::new()
+    } else {
+        [crate::mcp_auth::Scope::Admin].into_iter().collect()
+    };
     crate::mcp_auth::Principal {
         client_id: "test".into(),
-        scopes: std::collections::HashSet::new(),
+        scopes,
         is_external,
         created_at: chrono::Utc::now(),
     }
@@ -160,6 +268,29 @@ async fn visible_tools(
     home_dir: &Path,
     default_agent: &str,
 ) -> Vec<&'static ToolDef> {
+    visible_tools_with(
+        principal,
+        home_dir,
+        default_agent,
+        employee_process_from_env(),
+    )
+    .await
+}
+
+/// [`visible_tools`] with the "spawned for an employee" fact passed in, so
+/// tests do not depend on this process's environment.
+pub(crate) async fn visible_tools_with(
+    principal: &crate::mcp_auth::Principal,
+    home_dir: &Path,
+    default_agent: &str,
+    employee_process: bool,
+) -> Vec<&'static ToolDef> {
+    // Scoped non-employee callers (standalone `duduclaw mcp init` clients,
+    // external keys): list only what the scope gate lets through and what does
+    // not act for the process's agent. Discovery filter only.
+    let client_is_agent = crate::mcp_namespace::client_is_agent(home_dir, &principal.client_id);
+    let scope_listing = scope_listing_applies(principal, client_is_agent, employee_process);
+
     let google_enabled = duduclaw_gateway::google_workspace::integration_enabled(home_dir);
     // H8: same deny-by-default gate for GitHub — discoverable ⇔ callable.
     let github_enabled = duduclaw_gateway::github_workspace::integration_enabled(home_dir);
@@ -326,6 +457,11 @@ async fn visible_tools(
         .filter(|t| !scoped_without_grant.contains(t.name))
         // WP-7A bug2: internal per-agent capability filter (mirror of §3.45).
         .filter(|t| tool_allowed_by_capability(t.name))
+        // Standalone profile (2026-10-07): scope gate + process-agent tools.
+        .filter(|t| !scope_listing || scoped_caller_can_call(t.name, principal))
+        .filter(|t| {
+            !process_agent_tool_refused(t.name, principal, client_is_agent, employee_process)
+        })
         .collect()
 }
 

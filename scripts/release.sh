@@ -109,6 +109,13 @@ platform_manifests() {
     # releases because this file was bumped by hand and the desktop-v* tag was
     # a separate manual step nobody ran).
     if [[ -f src-tauri/tauri.conf.json ]]; then echo "tauri|src-tauri/tauri.conf.json"; fi
+    # Official MCP Registry metadata. Both `version` fields (top level and
+    # packages[0]) must name an npm version that is actually published, so it
+    # moves with the npm wrapper. It sat at 1.56.0 for fourteen releases
+    # because nothing bumped it.
+    if [[ -f distribution/registries/mcp/server.json ]]; then
+        echo "mcp_registry|distribution/registries/mcp/server.json"
+    fi
     # NOTE: the DuDuClaw OS Yocto layer (meta-duduclaw/) is deliberately NOT
     # enumerated here. Since the 2026-09 repo split it lives in the separate
     # DuDuClaw-OS repo with its own independent version (see the header
@@ -130,6 +137,20 @@ extract_version() {
         npm|tauri)
             { grep -m1 -E "\"version\"[[:space:]]*:" "$file" \
                 | sed -E "s/.*\"version\"[[:space:]]*:[[:space:]]*\"($SEMVER)\".*/\1/"; } 2>/dev/null || true
+            ;;
+        mcp_registry)
+            # Two `version` fields (top level and packages[0]). Both must agree:
+            # the registry checks packages[0].version against npm. One value
+            # when they match; "a/b" (never equal to a release version, so the
+            # audit flags it and the post-bump assert fails) when they do not;
+            # empty when either is missing.
+            { local vs n
+              vs="$(grep -E "\"version\"[[:space:]]*:" "$file" \
+                | sed -E "s/.*\"version\"[[:space:]]*:[[:space:]]*\"($SEMVER)\".*/\1/")"
+              n="$(printf '%s\n' "$vs" | grep -c .)"
+              if [[ "$n" -ge 2 ]]; then
+                  printf '%s\n' "$vs" | sort -u | paste -sd/ -
+              fi; } 2>/dev/null || true
             ;;
         badge)
             { grep -m1 -oE "badge/version-$SEMVER" "$file" \
@@ -510,7 +531,10 @@ while IFS='|' read -r kind file; do
             sed -i '' -E "s/(\"version\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$file"
             sed -i '' -E "s/(\"@duduclaw\/[a-z0-9-]+\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$file"
             ;;
-        tauri)
+        tauri|mcp_registry)
+            # mcp_registry: rewrites both `version` fields (top level and the
+            # npm package entry); extract_version reads both and reports a
+            # mismatch, so the audit and the post-bump assert check both.
             sed -i '' -E "s/(\"version\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$file"
             ;;
         badge)

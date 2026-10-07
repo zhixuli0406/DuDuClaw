@@ -160,6 +160,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |
 | [guides/dashboard-settings.md](guides/dashboard-settings.md) | 儀表板設定對照（v1.68.0）：每個開關的頁面位置、寫入的設定鍵、是否需要重啟；AI 員工編輯頁欄位與管理員限定欄位；`[permissions]` 生效與開機遷移；「設定檔進階編輯」（遮罩、驗證、備份、稽核、衝突偵測）（also in `zh-TW/` and `ja-JP/`） | Current |
+| [guides/mcp-standalone.md](guides/mcp-standalone.md) | 單獨使用 MCP server（不裝 gateway）：`duduclaw mcp init` 為 Claude Code／Codex／Cursor 簽發金鑰並寫好設定、24 個記憶與 wiki 工具、實測的 scope 對照表、升級到完整平台、MCP Registry 上架（also in `zh-TW/` and `ja-JP/`） | Current |
 | [guides/mcp-tools.md](guides/mcp-tools.md) | `tools/list` 宣告面（O7）：依呼叫者能力裁剪的規則表、`notifications/tools/list_changed`、200-byte 說明預算與唯一例外，以及從說明搬出的長版細節（`codrive_run` 三段階梯、`working_state_handoff` 結構化模式、`skill_search` source、`evolution_toggle` 停滯子欄位） | Current |
 | [guides/mcp-bridge.md](guides/mcp-bridge.md) | Mounting external MCP servers (`[[mcp.external]]`, stdio + Streamable HTTP `url` mounts) + `secret://`/`bearer_token` credentials + per-SaaS recipes (Gmail/Plane/Chatwoot/Invoice Ninja/WooCommerce) | Current |
 | [guides/google-workspace-integration.md](guides/google-workspace-integration.md) | Google Workspace 設定指南（選路徑導覽：自建 OAuth client／服務帳號網域委派／Apps Script 橋接三選一，逐步操作 + 11 個 scope 用途一覽 + 設定頁按鈕對照，D5：不預埋官方憑證） | Current |
@@ -241,6 +242,7 @@ docs/                                  # L1 PUBLIC — product & developer docum
 │   ├── development-guide.md
 │   ├── custom-mcp-tool.md
 │   ├── mcp-tools.md
+│   ├── mcp-standalone.md
 │   ├── evals.md
 │   ├── observability.md
 │   ├── docker.md

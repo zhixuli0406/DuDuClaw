@@ -724,6 +724,56 @@ impl McpDispatcher {
             }
         }
 
+        // ── 1.2 Tools that act for the process's agent (standalone profile) ──
+        // `working_state_*`, `canvas_*`, `mail_*`, the four process-agent
+        // memory reads, … run as `default_agent`, not as the caller. A caller
+        // that is not an AI employee (any external key, or an internal key
+        // with no `admin` that is no per-agent key and runs in no employee
+        // process) would read or write that employee's data. `tools/list`
+        // hides these by the same predicate, so discoverable ⇔ callable.
+        if crate::mcp::PROCESS_AGENT_TOOLS.contains(&tool_name)
+            && crate::mcp::process_agent_tool_refused(
+                tool_name,
+                principal,
+                crate::mcp_namespace::client_is_agent(&self.home_dir, &principal.client_id),
+                crate::mcp::employee_process_from_env(),
+            )
+        {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            let msg = format!(
+                "Tool '{tool_name}' acts for the AI employee that runs this MCP server, \
+                 not for this key, so it is not available to a caller that is not an employee."
+            );
+            self.audit_dispatch_denial(tool_name, params, "process_agent_tool", &msg);
+            return jsonrpc_error(id, -32003, &msg);
+        }
+
+        // ── 1.3 Shared-wiki writes from an external key ──────────────────────
+        // `wiki_write` with `scope="shared"` judges department, `.scope.toml`
+        // write permission and authorship by the process's `default_agent`
+        // (`handle_shared_wiki_write`), so an external key would write as
+        // that employee. Refused (fail closed). Shared reads stay open: the
+        // handler gives an external key no department, so it sees only pages
+        // every caller may see. `wiki_share` is unaffected: it writes under
+        // the key's own client id.
+        if principal.is_external
+            && tool_name == "wiki_write"
+            && matches!(
+                crate::mcp_alias::resolve_wiki_scope(
+                    params.get("arguments").unwrap_or(&Value::Null)
+                ),
+                Ok(crate::mcp_alias::WikiScope::Shared)
+            )
+        {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            let msg = "wiki_write with scope=\"shared\" is not available to an external key: \
+                       shared-wiki writes are made as an AI employee. Write to your own wiki \
+                       (scope=\"agent\") and publish a page with wiki_share."
+                .to_string();
+            self.audit_dispatch_denial(tool_name, params, "external_shared_wiki_write", &msg);
+            return jsonrpc_error(id, -32003, &msg);
+        }
+
         // ── 1.5 Injection scan (complete mediation — every runtime's MCP call) ──
         // Reference-monitor invariant I3: all runtime tool calls flow through
         // this one choke point, so scanning the tool arguments here covers

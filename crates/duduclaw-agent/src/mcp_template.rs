@@ -602,7 +602,8 @@ pub fn prepare_mcp_config_for_spawn(
     }
 }
 
-/// Scan all agent directories and fix relative `duduclaw` MCP server paths.
+/// Scan every employee directory (one holding an `agent.toml`) and create or
+/// fix its `duduclaw` MCP server entry.
 ///
 /// Called on gateway startup to ensure subprocess-spawned Claude CLI can
 /// discover the MCP server without PATH inheritance.
@@ -629,6 +630,15 @@ pub fn ensure_mcp_absolute_paths_all(agents_dir: &Path) -> usize {
         if let Some(name) = dir.file_name().and_then(|n| n.to_str())
             && (name.starts_with('_') || name.starts_with('.'))
         {
+            continue;
+        }
+        // Only employees get a `.mcp.json`. A directory without `agent.toml`
+        // is not one: the wiki of an external MCP key lives in
+        // `agents/<client_id>/wiki/` (e.g. `standalone-claude-code`), and
+        // writing a `.mcp.json` with the internal key there would turn it into
+        // half an employee directory. The spawn gate (`refresh_for_spawn`)
+        // still repairs a directory it is about to start, agent.toml or not.
+        if !dir.join("agent.toml").is_file() {
             continue;
         }
         match ensure_duduclaw_absolute_path(&dir) {
@@ -1468,6 +1478,27 @@ mod tests {
         assert!(!ensure_duduclaw_absolute_path(&agent_dir).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before);
+    }
+
+    /// Standalone profile: the boot sweep writes `.mcp.json` only into
+    /// employee directories. An external MCP key's wiki directory
+    /// (`agents/standalone-<client>/wiki/`) has no `agent.toml` and must not
+    /// receive the internal key.
+    #[test]
+    fn boot_sweep_skips_directories_without_agent_toml() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+        let tmp = TempDir::new().unwrap();
+        let agents = tmp.path().join("agents");
+        let employee = agents.join("agnes");
+        std::fs::create_dir_all(&employee).unwrap();
+        std::fs::write(employee.join("agent.toml"), "[agent]\nname = \"agnes\"\n").unwrap();
+        let wiki_only = agents.join("standalone-claude-code");
+        std::fs::create_dir_all(wiki_only.join("wiki")).unwrap();
+
+        assert_eq!(ensure_mcp_absolute_paths_all(&agents), 1);
+        assert!(employee.join(".mcp.json").is_file());
+        assert!(!wiki_only.join(".mcp.json").exists());
     }
 
     #[test]

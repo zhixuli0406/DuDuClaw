@@ -1,9 +1,10 @@
 //! What an EXTERNAL principal may reach (ecosystem WP3.2 C4).
 //!
 //! Split out of `mcp_auth.rs` on 2026-09-29 (audit O14). The grantable-scope
-//! list and the `external_tool_allowed` predicate are moved verbatim — this
-//! is the one place that decides whether a non-local client can call a tool,
-//! and `tools/list` filters with the same predicate so callable ⇔
+//! list and the `external_tool_allowed` predicate are moved verbatim. This
+//! is the first gate a non-local client's call meets, not the only one: the
+//! scope check and the process-agent rule (see [`external_tool_allowed`])
+//! follow, and `tools/list` filters with all of them so callable ⇔
 //! discoverable.
 
 use super::{Principal, Scope, tool_requires_scope};
@@ -32,7 +33,15 @@ pub const EXTERNALLY_GRANTABLE_SCOPES: &[Scope] = &[
 ///   3. that scope must be externally grantable ([`EXTERNALLY_GRANTABLE_SCOPES`]), and
 ///   4. the key must carry that scope EXPLICITLY — Admin does not substitute
 ///      here (an external Admin key still only widens within the grantable set).
-/// Callable ⇔ discoverable: `tools/list` filters with this same predicate.
+///
+/// This is one of several gates an external call passes. Rule 1 lets a
+/// legacy whitelist tool through without a scope, but the dispatch gate's
+/// scope check then still needs that tool's scope (or `admin`), and tools
+/// that act for the process's agent (`tools_list::PROCESS_AGENT_TOOLS`) are
+/// refused to every external key. `tools/list` applies all three (this
+/// predicate, `scope_listing_applies` / `scoped_caller_can_call` and
+/// `process_agent_tool_refused`), so callable ⇔ discoverable holds for the
+/// combination, not for this predicate alone.
 pub fn external_tool_allowed(tool_name: &str, principal: &Principal) -> bool {
     if crate::mcp::EXTERNAL_TOOLS_WHITELIST.contains(&tool_name) {
         return true;

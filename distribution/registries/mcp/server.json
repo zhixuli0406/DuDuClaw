@@ -2,19 +2,19 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.zhixuli0406/duduclaw",
   "title": "DuDuClaw",
-  "description": "Multi-runtime AI agent platform: channels (LINE/Telegram/Discord/Slack…), persistent memory, task board, shared wiki, skills, Odoo ERP and cost telemetry — 249 tools over one stdio MCP server.",
-  "websiteUrl": "https://github.com/zhixuli0406/DuDuClaw",
+  "description": "Local persistent memory and Markdown wiki for AI coding agents: 24 MCP tools, no gateway required.",
+  "websiteUrl": "https://github.com/zhixuli0406/DuDuClaw/blob/main/docs/guides/mcp-standalone.md",
   "repository": {
     "url": "https://github.com/zhixuli0406/DuDuClaw",
     "source": "github"
   },
-  "version": "1.56.0",
+  "version": "1.70.1",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "duduclaw",
-      "version": "1.56.0",
+      "version": "1.70.1",
       "transport": {
         "type": "stdio"
       },
@@ -22,6 +22,15 @@
         {
           "type": "positional",
           "value": "mcp-server"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "DUDUCLAW_MCP_API_KEY",
+          "description": "Key for the standalone server. Create one with `npx duduclaw mcp init` (prints it once; stored only as a hash).",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
         }
       ]
     }

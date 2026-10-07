@@ -385,22 +385,27 @@ pub(crate) async fn handle_tools_call(
         | "wiki_stats") => {
             match crate::mcp_alias::resolve_wiki_scope(&arguments) {
                 Err(e) => tool_error(&e),
-                Ok(crate::mcp_alias::WikiScope::Shared) => match name {
-                    "wiki_ls" => handle_shared_wiki_ls(home_dir, default_agent).await,
-                    "wiki_read" => {
-                        handle_shared_wiki_read(&arguments, home_dir, default_agent).await
+                // An external key reads with no department and never writes
+                // here (the dispatch gate refuses it first, with an audit row;
+                // this arm is the second line).
+                Ok(crate::mcp_alias::WikiScope::Shared) => {
+                    let reader = shared_wiki_reader(ns_ctx, default_agent);
+                    match name {
+                        "wiki_ls" => handle_shared_wiki_ls(home_dir, reader).await,
+                        "wiki_read" => handle_shared_wiki_read(&arguments, home_dir, reader).await,
+                        "wiki_write" if ns_is_external(ns_ctx) => tool_error(
+                            "wiki_write with scope=\"shared\" is not available to an external key.",
+                        ),
+                        "wiki_write" => {
+                            handle_shared_wiki_write(&arguments, home_dir, default_agent).await
+                        }
+                        "wiki_search" => {
+                            handle_shared_wiki_search(&arguments, home_dir, reader).await
+                        }
+                        "wiki_stats" => handle_shared_wiki_stats(home_dir, reader).await,
+                        _ => handle_shared_wiki_lint(home_dir, reader).await,
                     }
-                    "wiki_write" => {
-                        handle_shared_wiki_write(&arguments, home_dir, default_agent).await
-                    }
-                    "wiki_search" => {
-                        handle_shared_wiki_search(&arguments, home_dir, default_agent).await
-                    }
-                    "wiki_stats" => {
-                        handle_shared_wiki_stats(home_dir, default_agent).await
-                    }
-                    _ => handle_shared_wiki_lint(home_dir, default_agent).await,
-                },
+                }
                 Ok(crate::mcp_alias::WikiScope::Agent) => match name {
                     "wiki_ls" => handle_wiki_ls(&arguments, home_dir, wiki_agent).await,
                     "wiki_read" => handle_wiki_read(&arguments, home_dir, wiki_agent).await,

@@ -2,9 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+- `duduclaw mcp init`：不裝 gateway 也能用 MCP server。指令會在資料目錄不存在時建立它、簽發一把只帶 `memory:read`、`memory:write`、`wiki:read`、`wiki:write` 的外部金鑰（client id `standalone-<用戶端>`，效期 90 天，只存雜湊），然後依 `--client` 印出設定：`claude-code` 問過之後執行 `claude mcp add duduclaw -s user`（`--yes` 不問；沒裝 Claude Code CLI 就只印指令），`codex` 印 `~/.codex/config.toml` 區塊，`cursor` 印 `~/.cursor/mcp.json`，`print`（預設）三種都印、不替任何用戶端註冊。每次執行都會簽發一把新金鑰（`print` 也一樣），不同的 `--client` 是不同的金鑰與記憶命名空間（`external/standalone-<用戶端>`）。Claude Code 已有 `duduclaw` 時，先讀 user 設定檔（`$CLAUDE_CONFIG_DIR/.claude.json` 或 `~/.claude.json`）：之前 `mcp init` 寫的直接取代，其他的在簽發金鑰前就拒絕並列出（密鑰遮蔽），要加 `--replace`；取代前舊項存到 `~/.duduclaw/mcp_init/`（0600），新的加不進去時用 `claude mcp add-json` 放回。從 npx 快取執行時，設定寫 `npx -y duduclaw@<這一版> mcp-server` 而不是快取裡的路徑；其他情況用執行檔啟動時的路徑，不展開連結（Homebrew／nvm 的版本目錄升級後會消失）；印出的指令在 Windows 版改用雙引號；有設 `DUDUCLAW_HOME` 時設定會帶同一個值。`--scopes` 只接受外部用戶端可以持有的 scope。在 AI 員工的工作階段裡執行會被拒絕（與 `memory forget-source` 同一份環境變數清單；訊息英文在前，並列出是哪個變數）；Bash 通道也把 `duduclaw mcp init` 與 `duduclaw mcp issue-refresh-token` 列為員工不可執行的操作者指令（`duduclaw_core::MCP_KEY_COMMANDS`）。`standalone-` 開頭的名稱保留，不能用來建立 AI 員工（`is_reserved_agent_id`）。說明：`docs/guides/mcp-standalone.md`（三種語言）。
+- 官方 MCP Registry 的 `distribution/registries/mcp/server.json` 改成單獨模式的介紹與實際工具數（24），加上 `DUDUCLAW_MCP_API_KEY` 環境變數（必填、secret，說明指向 `duduclaw mcp init`），版本改為 1.70.1。`scripts/release.sh` 會隨其他平台一起改這兩個版本號（新類別 `mcp_registry`），`audit` 與改版後的檢查兩個欄位都讀，不一致即算落差。`distribution/registries/README.md` 註明第一次送件要等含有 `mcp init` 的版本發佈到 npm。原本的說明超過 schema 的 100 字元上限，送件會被擋；版本停在 1.56.0。`distribution/registries/README.md` 的送件步驟一併更新。
+
 ### Changed
 - 儲存庫預設的 README 改成英文，讓從 Hacker News、Reddit 與 awesome 清單來的訪客先看到英文：原本的繁體中文 README 改名為 `README.zh-TW.md`，原本的 `README.en.md` 改名為 `README.md`。三個語言版本的語言切換列、`SECURITY.md` 的連結與 `scripts/release.sh` 的版號徽章清單一併更新；三個 README 首屏在徽章下方加上兩行快速開始指令，MCP 工具數改為 247（npm 與 PyPI 套件描述原本分別寫 249 與 243，也一併改為 247），Computer Use 頻道核准的說明移到「信任與安全」一節。
 - 儀表板的升級、續期與商用連結改指向授權總經銷 未來企業（https://www.futurecorp.tw/），文案不再提訂閱方案；已啟用白標且設有經銷商網站與公司名稱時，連結與文案改用白標品牌的值。原本指向 `duduclaw.dudustudio.monster#pricing` 的四處入口（授權到期橫幅、授權等級提示橫幅、AI 員工頁的成長提示、授權頁）與 zh-TW／en／ja-JP 的相關字串一併更新。
+- `tools/list` 對「不持有 `admin`、也不是 AI 員工」的金鑰只列它的 scope 叫得動的工具（儀表板 `mcp_keys.create` 建立、不帶 `admin` 也不對應員工的內部金鑰也在其中，清單因此變短），並且不列替行程本身的 agent 動作的工具（`working_state_*`、`memory_search_by_layer`、`memory_successful_conversations`、`memory_episodic_pressure`、`memory_consolidation_status`、`shared_wiki_delete`、`wiki_namespace_status`、`canvas_push`、`canvas_clear`、`team_handoff`、`mail_*`、`office_script`；對這類呼叫者它們會回 `unknown agent`、讀到預設員工的資料，或在預設員工的畫布上作畫）。gateway 內部金鑰、單一員工金鑰、gateway 為員工啟動的行程，以及持有 `admin` 的金鑰，清單不變（腳手架員工仍是 167 個）。外部金鑰也適用：沒有 scope 的外部金鑰原本會列出 7 個舊白名單工具，每個呼叫都被 scope 檢查拒絕，現在清單是空的。
+- gateway 開機時只替有 `agent.toml` 的員工目錄建立／修正 `.mcp.json`（`ensure_mcp_absolute_paths_all`）；外部金鑰的 wiki 目錄 `agents/<client_id>/` 不再被寫入一份帶內部金鑰的 `.mcp.json`。即將啟動員工前的修正（`refresh_for_spawn`）不變。
+- `duduclaw mcp-server` 沒有 `DUDUCLAW_MCP_API_KEY` 時的錯誤訊息多一句 `Run: duduclaw mcp init --client claude-code`。
+
+### Security
+- 替行程 agent 動作的工具（見上方 Changed 第一項的清單）改由 dispatch 閘依清單同一條規則拒絕（`-32003`，稽核 `error_class` = `process_agent_tool`）：對象是清單規則適用的金鑰，以及所有外部金鑰（帶 `admin` 的也算）。已發佈版本受影響：自外部金鑰可授予 scope 起，帶 `memory:read`／`memory:write`／`wiki:write` 的外部金鑰（OAuth 用戶端也是）就能直接呼叫這些工具，讀到預設員工的記憶、改寫它的 working state、在它的畫布上作畫。
+- 外部金鑰用 `wiki_write` 帶 `scope="shared"` 一律拒絕（`-32003`，稽核 `external_shared_wiki_write`）：共享 wiki 的寫入會以行程的預設員工判斷部門、`.scope.toml` 權限與作者。外部金鑰的共享 wiki 讀取（`wiki_ls`／`_read`／`_search`／`_stats`／`_lint`）改用「沒有部門」的身分，只看得到所有呼叫者都能看的頁面；之前會帶著預設員工的部門可見範圍（已發佈版本受影響）。`wiki_share` 不變（以金鑰自己的 client id 寫入）。
 
 ## [1.70.1] - 2026-10-07 — 1.70.1 修補：discovery 鎖、GDPR 歸檔、AI 員工任務可見名單、操作者指令列核准閘統一
 

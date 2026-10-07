@@ -267,6 +267,19 @@ pub fn authenticate_with_refresh_token(token: &str, home: &Path) -> Result<Princ
     })
 }
 
+/// Metadata of `token` whatever its state (active, expired or revoked).
+///
+/// Unlike [`authenticate_with_refresh_token`] this never creates the token
+/// database: `None` when the format is wrong, `<home>/mcp_tokens.db` does
+/// not exist, or the token is not in it. Used by `duduclaw mcp init` to tell
+/// its own earlier Claude Code entry from someone else's.
+pub fn find_token_meta(home: &Path, token: &str) -> Option<RefreshTokenMeta> {
+    if !is_refresh_token_format(token) || !token_db_path(home).is_file() {
+        return None;
+    }
+    lookup_refresh_token(home, token).ok()
+}
+
 /// Revoke a refresh token by its jti. Returns `true` if a row was updated.
 pub fn revoke_token(home: &Path, jti: &str) -> rusqlite::Result<bool> {
     init_schema(home)?;

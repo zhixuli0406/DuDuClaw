@@ -84,6 +84,7 @@ mod memory_namespace_cmd; // v1.68.0: `duduclaw memory migrate-namespace` (opera
 mod channel_ingress_cmd; // F2: `duduclaw ops channel-ingress` (operator-only, dashboard-approved changes)
 mod memory_forget_cmd; // P2-B: `duduclaw memory forget-source` (operator-only)
 mod ai_session_guard; // P2-B: shared "inside an AI employee turn?" check
+mod mcp_init_cmd; // standalone MCP profile: `duduclaw mcp init`
 mod doctor_mcp_servers; // N5: doctor row for MCP servers DuDuClaw did not write
 #[cfg(test)]
 mod namespace_unification_tests;
@@ -3620,6 +3621,36 @@ enum PlaybookCommands {
 
 #[derive(Subcommand)]
 enum McpCommands {
+    /// Set up the standalone MCP server for one AI client (no gateway needed).
+    ///
+    /// Creates the data directory when missing, issues a new key limited to
+    /// the standalone scopes (memory and wiki by default) on every run, and
+    /// prints the client configuration. Each `--client` value is its own key
+    /// and its own memory namespace (`external/standalone-<client>`). With
+    /// `--client claude-code` it also registers the server with
+    /// `claude mcp add` (user scope) after asking, or at once with --yes.
+    ///
+    /// Example:
+    ///     duduclaw mcp init --client claude-code
+    Init {
+        /// Which client to configure.
+        #[arg(long, value_enum, default_value = "print")]
+        client: mcp_init_cmd::InitClient,
+
+        /// Comma-separated scopes (externally grantable ones only).
+        #[arg(long, default_value = mcp_init_cmd::STANDALONE_SCOPES)]
+        scopes: String,
+
+        /// Register with Claude Code without asking.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+
+        /// Replace a `duduclaw` entry in Claude Code that `mcp init` did not
+        /// write (the old entry is saved to a file first).
+        #[arg(long, default_value_t = false)]
+        replace: bool,
+    },
+
     /// Issue a new refresh token for an MCP client.
     ///
     /// The raw token is printed to stdout once — capture it immediately and
@@ -6227,6 +6258,13 @@ fn agent_file_guard_decision(
                         })
                         .or_else(|| {
                             responsibility_cmd::bash_responsibility_decision(command, &caller)
+                        })
+                        .or_else(|| {
+                            duduclaw_core::bash_operator_command_decision(
+                                command,
+                                &caller,
+                                duduclaw_core::MCP_KEY_COMMANDS,
+                            )
                         })
                         .unwrap_or(protected)
                 }
@@ -11379,6 +11417,21 @@ async fn cmd_mcp(cmd: McpCommands, home: &std::path::Path) -> duduclaw_core::err
     use mcp_refresh::{issue_refresh_token, list_tokens, revoke_token};
 
     match cmd {
+        McpCommands::Init {
+            client,
+            scopes,
+            yes,
+            replace,
+        } => mcp_init_cmd::run(
+            home,
+            mcp_init_cmd::InitOptions {
+                client,
+                scopes,
+                yes,
+                replace,
+            },
+        ),
+
         McpCommands::IssueRefreshToken {
             env,
             client_id,
@@ -14002,6 +14055,45 @@ mod removed_name_hook_tests {
         )
         .unwrap();
         assert!(d.is_allowed(), "{d:?}");
+    }
+
+    /// Standalone profile: an employee may not issue itself an MCP key.
+    #[test]
+    fn bash_mcp_key_commands_are_blocked_through_the_hook() {
+        let h = home_with_trash();
+        for (cmd, name) in [
+            (
+                "duduclaw mcp init --client claude-code --yes",
+                "duduclaw mcp init",
+            ),
+            ("npx -y duduclaw mcp init", "duduclaw mcp init"),
+            (
+                "duduclaw mcp issue-refresh-token --client-id x --scopes admin",
+                "duduclaw mcp issue-refresh-token",
+            ),
+        ] {
+            let d = agent_file_guard_decision("Bash", &bash(cmd), h.path(), &agent("ceo")).unwrap();
+            assert!(
+                matches!(d, GuardDecision::BlockedOperatorCommand { ref command, .. }
+                    if *command == name),
+                "{cmd:?}: {d:?}"
+            );
+            assert!(d.block_message().unwrap().contains("MCP 金鑰"), "{cmd:?}");
+            let d = agent_file_guard_decision("Bash", &bash(cmd), h.path(), &HookCaller::Absent)
+                .unwrap();
+            assert!(d.is_allowed(), "{cmd:?}: {d:?}");
+        }
+        let d = agent_file_guard_decision(
+            "Bash",
+            &bash("duduclaw mcp list-tokens"),
+            h.path(),
+            &agent("ceo"),
+        )
+        .unwrap();
+        assert!(
+            !matches!(d, GuardDecision::BlockedOperatorCommand { .. }),
+            "{d:?}"
+        );
     }
 
     #[test]

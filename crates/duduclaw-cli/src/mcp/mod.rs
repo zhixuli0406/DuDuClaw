@@ -312,6 +312,9 @@ mod mail_tool_tests;
 /// O7: the `tools/list` fixed-cost budget (golden bytes + description caps).
 #[cfg(test)]
 mod tools_list_budget_tests;
+/// Standalone profile: `tools/list` for scoped non-employee callers.
+#[cfg(test)]
+mod standalone_listing_tests;
 // ── T5 merged-entry-point regression tests (O3 / O4 / O13) ─────────────────
 #[cfg(test)]
 mod merged_entry_tests;

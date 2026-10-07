@@ -79,6 +79,7 @@ mod real_path;
 
 pub use operator_cmd::{
     bash_invokes_operator_command, bash_operator_command_decision, OperatorCommand,
+    MCP_KEY_COMMANDS,
 };
 pub use real_path::resolve_real_path;
 use real_path::with_real_path;
