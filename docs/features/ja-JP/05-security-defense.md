@@ -149,6 +149,30 @@ A2A 委譲の述語（`delegation_policy::can_delegate`）は、`agent.toml` の
 
 **アップグレード時の注意。** このゲートは結び付け情報をリクエスト内容の `gate` オブジェクトに保存します。v1.70.0 以前に作られたリクエストにはこのオブジェクトがないため、新しいバージョンは照合も件数への算入もしません。アップグレード前に作られたリクエストは、承認済みで未適用のものでも、アップグレード後には適用されません。コマンドをもう一度実行すると新しいリクエストが作られ、改めて承認が必要です。古い待機中のカードには期限切れまで通常どおりリマインダーの通知が届きます（継続タスクのリクエストはもともと送りません）が、承認しても何も起きません。
 
+## 操作ルール、探索レーン、操作レビュー
+
+2026-10 追加（未リリース）。3 つのレイヤーはいずれも社員にできることを狭めるだけで、他のゲートが課す承認や拒否を外すことはありません。
+
+**操作の種類（effect）。** DuDuClaw の MCP ツールにはそれぞれ 1 つの副作用の種類があります（`duduclaw_core::tool_effect::effect_of_builtin`）：`read`、`draft`、`send`、`publish`、`purchase`、`delete`、`modify`、`admin`。`read` と `draft` は応答以外に何も残さず、残りの 6 つは副作用を持ちます。引数で効果が変わるツールは厳しいほうの種類になります（`wiki_write` はどちらの scope でも `modify`）。`mail_send` は人の承認が必要な下書きを作るだけですが、最終的な効果は送信なので `send` です。`gmail_create_draft` は決して送信しないので `draft` です。表にないツール名は `admin` として扱われ（fail closed）、公開されている全ツールを調べるテストがあるため、分類されていない新しいツールは出荷できません。組み込みツールカタログ（`tools.catalog`）は種類を `effect` として返します。
+
+**操作ルール。** `agent.toml [capabilities] action_rules` で種類ごと、またはツールごとに `allow`、`ask`、`block` を設定します。
+
+```toml
+[capabilities]
+action_rules = [
+  { effect = "send", verdict = "ask" },
+  { tool = "mail_send", verdict = "block" },
+]
+```
+
+`tool` ルール（他の `[capabilities]` ツール一覧と同じアンカー付きの照合なので、`mcp__duduclaw__mail_send` や `wiki_*` も使えます）は `effect` ルールより優先され、同じ種類のルール同士では最も厳しい判定が採用されます。`block` は MCP の dispatch ゲートで `denied_tools` と同じ場所で拒否し（JSON-RPC `-32003`、監査 `error_class` `action_rule`）、`tools/list` からも隠します。`ask` は承認ゲートの静的な「常に確認」の集合に加わるため、`approval_required_tools` と同様に ApprovalBroker の流れになります。`allow` は「このレイヤーでは何も足さない」という意味だけで、`denied_tools`、承認リスト、機能スイッチ、scope を外すことはありません。8 つの `computer_*` ツールと 3 つの `computer_workspace_*` ツールは、セッションを持つ gateway の computer-use ルートで同じ判定を適用します。このキーは意図的に `[capabilities]` に置いています。`org_field_guard` がこの表全体を社員自身の書き込みから凍結するためです。一覧やエントリの形式が不正な場合（未知の判定や種類、`effect` と `tool` の両方またはどちらもない、余分なキー、配列でない値）でもファイル全体は失敗せず、書かれたまま保持され、副作用のある呼び出しはすべて少なくとも「先に確認」になります。有効な `block` ルールは引き続き拒否します。`agent.toml` が存在するのに読めない、または正しい TOML でない場合も同じ扱いです。ダッシュボードでは社員の編集ページ（操作の種類ごとのルールと個別ツールの例外）から、管理者専用の `agents.update` の capabilities 経路で編集します。各エントリは検証され、変更は `agent_authority_changed` として監査されます。
+
+**探索レーン。** `DUDUCLAW_LANE=explore` で起動した MCP サーバーは `read` と `draft` のツールだけを一覧に出し、実行します。それ以外の呼び出しは `-32003`、監査 `error_class` `explore_lane` で拒否されます。変数が他の値（空文字列を含む）で存在する場合はすべての呼び出しを拒否します。gateway はハートビートの能動チェック（proactive check）でこの変数を設定し、その Claude CLI の組み込みツールも `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`（から社員自身の `denied_tools` を除いたもの）だけになります。チェックが送ると決めた通知は、引き続きハートビートが応答から送ります。変数は CLI が継承する環境を通じて MCP の子プロセスに届き、`.mcp.json` のエントリでは設定しません。能動チェックは Claude CLI でしか動かないため、他のランタイムは関係しません。`DUDUCLAW_LANE` は運用者コマンドが拒否する AI セッション変数の一覧にも入っています。
+
+**操作レビュー。** `config.toml [action_review] mode = "off" | "shadow" | "enforce"`、既定は `off` で、呼び出しのたびに読み直します（`system.update_config` は `action_review.mode` を受け付け、変更を保護キーとして監査します）。すべての静的ゲートが自動実行と判定し、かつツールに副作用がある場合だけ適用されます。レビュー担当はクローズドな選択肢の `decide()`（`duduclaw-gateway/src/decide.rs`）を通した utility モデルです。応答は厳密な JSON 契約のもとで `{"choice":"allow"|"ask"|"block"}` そのものでなければならず、それ以外は判定なしとして扱います。入力は構造化された情報だけです：ツール名、種類、引数のキー（識別子らしくないキーは数だけ）、ActionGuard のクローズドな finding トークン、社員の `CONTRACT.toml` の `must_not`。引数の値はプロンプトに入りません。`shadow` は結果を変えず、`tool_calls.jsonl` に `action_review` が判定または `unavailable` の行を追加します。`enforce` は `block` なら拒否し、`ask` または判定がない場合は ApprovalBroker で人に確認します。未知の mode 値や、存在するのに読めない・解析できない `config.toml` は `enforce` として扱います。
+
+**カバー外・未検証。** 操作ルールが対象とするのは DuDuClaw 自身の MCP ツールだけです。Claude Code の組み込みツールは `allowed_tools`／`denied_tools` だけで管理され、`.mcp.json` の他の MCP サーバーのツールは分類されていません。削除済みのツール名を指す `tool` ルールは、それを置き換えた呼び出しには適用されません。操作レビューは OS 操作ツール（独自の状況分類器があります）、`skill_hub_install`（セキュリティスキャン後に独自の承認があります）、`computer_*` ツールでは実行されません。分類はツール名単位なので、引数で効果が変わるツールは常に厳しいほうの種類になります。3 つのレイヤーはいずれも実際の gateway と実際のモデルではまだ動かしておらず、テストは単体テストと dispatcher レベルです。
+
 ## 補助レイヤー
 
 **MCP 認可ゲート** — すべての MCP ツールはスコープ表に列挙されており、表にないツールは既定で Admin スコープを要求します。スコープ、エージェント単位の capability 付与、`denied_tools` はそれぞれディスパッチのフロントドアで強制され、拒否はすべて `error_class` 付きで監査されます。
