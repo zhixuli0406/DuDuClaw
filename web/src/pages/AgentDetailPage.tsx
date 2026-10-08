@@ -66,6 +66,7 @@ import { StatusIcon } from '@/components/ui';
 import { agentTaskStats, isLiveState, type AgentTaskStats } from '@/components/agent';
 import { OffboardDialog } from '@/components/agent/OffboardDialog';
 import { WardrobeDialog } from '@/components/agent/WardrobeDialog';
+import { ComputerSessionPanel } from '@/components/agent/ComputerSessionPanel';
 import { computeMood } from '@/lib/mascot-mood';
 import { toStatusKey } from '@/lib/task-status';
 import { timeAgo, formatCents } from '@/lib/format';
@@ -75,7 +76,7 @@ const MAX_AVATAR_BYTES = 512 * 1024;
 const AVATAR_ACCEPT = '.png,.jpg,.jpeg,.webp';
 const AVATAR_MIME = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
-const TAB_IDS = ['overview', 'work', 'records'] as const;
+const TAB_IDS = ['overview', 'work', 'records', 'computer'] as const;
 type TabId = (typeof TAB_IDS)[number];
 
 const MOOD_EMOJI: Record<string, string> = {
@@ -513,6 +514,9 @@ export function AgentDetailPage() {
               <TabsTab value="overview">{intl.formatMessage({ id: 'agentDetail.tab.overview' })}</TabsTab>
               <TabsTab value="work">{intl.formatMessage({ id: 'agentDetail.tab.work' })}</TabsTab>
               <TabsTab value="records">{intl.formatMessage({ id: 'agentDetail.tab.records' })}</TabsTab>
+              {(detail.capabilities?.computer_use || tab === 'computer') && (
+                <TabsTab value="computer">{intl.formatMessage({ id: 'agentDetail.tab.computer' })}</TabsTab>
+              )}
             </TabsList>
           </div>
         </div>
@@ -531,6 +535,9 @@ export function AgentDetailPage() {
         </TabsPanel>
         <TabsPanel value="records">
           <RecordsTab activities={activities} />
+        </TabsPanel>
+        <TabsPanel value="computer">
+          {tab === 'computer' && <ComputerSessionPanel agentId={id} />}
         </TabsPanel>
       </Tabs>
 

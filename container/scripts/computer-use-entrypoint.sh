@@ -1,6 +1,8 @@
 #!/bin/bash
 # Entrypoint for the DuDuClaw Computer Use (L5) container.
-# Starts the Xvfb display, openbox, optional VNC, and Chromium in kiosk mode.
+# Starts the Xvfb display, openbox, and Chromium in kiosk mode. The live-view
+# VNC server is not started here: the gateway starts it on demand with
+# `duduclaw-vnc` (unix socket in /tmp/duduclaw-root only, no TCP port).
 #
 # Contract with the gateway (computer_use_orchestrator.rs / computer_use.rs):
 #   - DISPLAY=:99, size from DISPLAY_SIZE (<w>x<h>, default 1280x800).
@@ -69,8 +71,6 @@ mkdir -m 0700 "$ROOT_TMP"
 
 DISPLAY_SIZE="${DISPLAY_SIZE:-1280x800}"
 DISPLAY_DEPTH="${DISPLAY_DEPTH:-24}"
-VNC_ENABLED="${VNC_ENABLED:-false}"
-VNC_PASSWORD="${VNC_PASSWORD:-duduclaw}"
 CDP_PORT="${DUDUCLAW_CDP_PORT:-9222}"
 START_URL="${START_URL:-about:blank}"
 SCREEN_W="${DISPLAY_SIZE%x*}"
@@ -97,13 +97,6 @@ if ! kill -0 "$XVFB_PID" 2>/dev/null || [ ! -S /tmp/.X11-unix/X99 ]; then
     exit 1
 fi
 echo "[computer-use] Xvfb started (PID: $XVFB_PID)"
-
-# Optional: Start VNC server
-if [ "$VNC_ENABLED" = "true" ]; then
-    echo "[computer-use] Starting VNC server on :5900"
-    x11vnc -display :99 -forever -passwd "$VNC_PASSWORD" -rfbport 5900 -bg -q
-    echo "[computer-use] VNC server started"
-fi
 
 # Everything below runs as the unprivileged `sandbox` user with HOME in /tmp.
 SANDBOX_HOME=/tmp/sandbox-home

@@ -6,6 +6,7 @@ export const mockWsClient = {
   subscribe: vi.fn().mockReturnValue(vi.fn()),
   connect: vi.fn().mockResolvedValue(undefined),
   disconnect: vi.fn(),
+  socketUrl: vi.fn().mockReturnValue(''),
 };
 
 vi.mock('@/lib/ws-client', () => ({

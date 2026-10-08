@@ -77,7 +77,7 @@ Session 規則：
 
 - **每位員工一個 session。** 已有 session 在執行時再呼叫 `computer_session_start` 會被拒絕，並指出現有的 session。只有該員工能看到或驅動它。
 - **整個 gateway 同時最多五個 session。**
-- **上限。** Session 在 `max_session_minutes`（預設 10）之後、連續 2 分鐘沒有任何操作之後（等待審批的時間不算閒置），或呼叫 `computer_session_stop` 時結束。每次點擊、輸入、按鍵、捲動與導覽都計入 `max_actions`（預設 50），截圖不計。額度用完後，session 仍可截圖與停止。
+- **上限。** Session 在 `max_session_minutes`（預設 10）之後、連續 2 分鐘沒有任何操作之後（等待審批、儀表板有人觀看或有人接手的時間不算閒置；設了 `keep_alive_minutes` 時改為暫停容器，見[閒置保留、即時畫面與接手](#閒置保留即時畫面與接手)），或呼叫 `computer_session_stop` 時結束。每次點擊、輸入、按鍵、捲動與導覽都計入 `max_actions`（預設 50），截圖不計。額度用完後，session 仍可截圖與停止。
 - **被拒絕的呼叫端與模式。** 臨時（ephemeral）agent 不能啟動 session，包含 Team-as-Agent 的角色成員（它們會複製父員工的 capabilities）。`[capabilities] computer_use_mode` 為 `"native"` 的員工會被拒絕，錯誤碼為 `native_unsupported`，訊息說明這個模式已移除，並請刪掉該鍵或設為 `"container"`；不會悄悄退回容器。`"auto"` 或沒有這個鍵時，行為等同 `"container"`。
 - **威脅等級。** 只有在 `~/.duduclaw/threat_level` 為 GREEN（或不存在）時才能啟動新 session。YELLOW 只允許截圖與停止；RED 會結束所有 session。內容恰好是緊急停止詞（`停止`、`stop`、`abort`、`やめて` 等）的聊天訊息，會結束所有電腦操作 session。
 - **清理。** 清掃程式每 15 秒檢查一次是否有 session 超過期限或閒置上限。容器帶有一個標示所屬 DuDuClaw home 的標籤與一個期限標籤；gateway 啟動時與之後每 10 分鐘，會掃除本 home 已結束、或超過期限 10 分鐘以上的容器，Docker 無法列出時則什麼都不移除。
@@ -95,7 +95,7 @@ gateway 自己套用的閘，因為這條路由不經過 MCP 分派器也能到�
 
 現在，提到點擊或截圖的通道訊息走一般回覆路徑，要不要呼叫這些工具由 AI 員工決定。電腦操作不讀取任何 Anthropic API 金鑰（直接 API 的回覆 fallback 仍然會讀）。
 
-**映像內容。** `container/Dockerfile.computer-use` 建出一個以 Debian（`debian:trixie-slim`）為基底、約 1.09 GB 的映像：Xvfb、視窗管理器 `openbox`、以 kiosk 模式執行的 Chromium（Debian 真正的 `chromium` 套件）、可選的 VNC、負責動作與截圖的 `xdotool` 和 `scrot`、網域過濾器、遮罩輔助程式 `duduclaw-eval-dom`，以及 `computer_navigate` 使用的 `duduclaw-navigate` 輔助程式。瀏覽器與視窗管理器以非特權使用者 `sandbox` 執行。這個映像在 2026-10-01 之前從來沒有正常運作過（Ubuntu 的瀏覽器套件只是 snap 過渡用的空殼，在容器裡無法啟動；entrypoint 在 `--network=none` 下會中止；也沒有視窗管理器與遮罩輔助程式），當天修好並完成驗證。
+**映像內容。** `container/Dockerfile.computer-use` 建出一個以 Debian（`debian:trixie-slim`）為基底、約 1.09 GB 的映像：Xvfb、視窗管理器 `openbox`、以 kiosk 模式執行的 Chromium（Debian 真正的 `chromium` 套件）、給儀表板即時畫面用的隨需 VNC 伺服器（只聽 unix socket）、負責動作與截圖的 `xdotool` 和 `scrot`、網域過濾器、遮罩輔助程式 `duduclaw-eval-dom`，以及 `computer_navigate` 使用的 `duduclaw-navigate` 輔助程式。瀏覽器與視窗管理器以非特權使用者 `sandbox` 執行。這個映像在 2026-10-01 之前從來沒有正常運作過（Ubuntu 的瀏覽器套件只是 snap 過渡用的空殼，在容器裡無法啟動；entrypoint 在 `--network=none` 下會中止；也沒有視窗管理器與遮罩輔助程式），當天修好並完成驗證。
 
 發布由 release workflow `.github/workflows/computer-use-image.yml` 負責。它在 git tag `v*` 或手動觸發時執行，在原生 runner 上分別建置 `linux/amd64` 與 `linux/arm64`，推送前先用 gateway 自己的容器參數做 smoke test（視窗管理器起來、拍到一張截圖、DOM 輔助程式回傳 `[]`、`duduclaw-navigate` 在沒有網路時能乾淨地失敗），再發布 `ghcr.io/zhixuli0406/duduclaw-computer-use:<tag>` 與 `:latest`。這個 workflow 從 v1.66.1 之後的第一個 release tag 才開始執行，所以 v1.66.1 以前的版本都沒有已發布的映像。`scripts/release.sh verify` 不會檢查這個映像。
 
@@ -118,7 +118,7 @@ image = "duduclaw-computer-use:latest"
 
 DOM 遮罩之後，gateway 會讀取目前焦點視窗的標題。標題含有憑證相關標記時，整張截圖會被遮掉。標題讀不到（指令錯誤、逾時、非零結束碼、輸出不是 UTF-8）時，整張截圖同樣會被遮掉。成功讀到但內容為空的標題不會觸發遮罩。
 
-整張遮罩的截圖會明說這件事。gateway 的回應帶有 `fully_masked`（true/false）與 `mask_reason`（`several_pages`、`title_sensitive`、`title_unreadable`、`helper_failed`，或無）；輔助程式失敗時不會再去查標題。這時工具文字會告訴 AI 整張畫面因安全考量被隱藏，並說明該怎麼做：有多個視窗時，再呼叫一次 `computer_navigate`，它會關掉多出來的視窗；焦點視窗敏感或標題讀不到時，只要該視窗還在最前面，畫面就無法顯示；其他情況則再截一次圖，若一直發生就停止 session 並開新的。部分遮罩與未遮罩的截圖維持原本的文字。
+整張遮罩的截圖會明說這件事。gateway 的回應帶有 `fully_masked`（true/false）與 `mask_reason`（`several_pages`、`title_sensitive`、`title_unreadable`、`helper_failed`、`injection_suspected`、`text_unscanned`，或無；最後兩個見[疑似注入時暫停](#疑似注入時暫停)）；輔助程式失敗時不會再去查標題。這時工具文字會告訴 AI 整張畫面因安全考量被隱藏，並說明該怎麼做：有多個視窗時，再呼叫一次 `computer_navigate`，它會關掉多出來的視窗；焦點視窗敏感或標題讀不到時，只要該視窗還在最前面，畫面就無法顯示；其他情況則再截一次圖，若一直發生就停止 session 並開新的。部分遮罩與未遮罩的截圖維持原本的文字。
 
 **網路與網站白名單。** Session 沒有網路，除非該員工在 `agent.toml` 設了網站白名單：
 
@@ -222,3 +222,66 @@ L1 就答得出來的問題卻動用 L5，是最昂貴的誤用，而且要靠 a
 電腦操作的容器在 session 結束時就刪除。要留下員工整理的內容，可以在 session 掛上一個**電腦操作工作區**：`computer_session_start` 帶 `workspace = "new"` 或既有的 `ws-…` id。只有 gateway 會寫入（`computer_workspace_write`，寫進員工這次 session 掛上的工作區）；`computer_workspace_list` 與 `computer_workspace_read` 不需要開著 session。容器裡的檔案在 `/workspace/files`，唯讀，放在只有 root 能進的 tmpfs 底下，瀏覽器的帳號進不去。預設關閉：要打開 `config.toml [computer_use.workspaces] enabled = true`，以及該員工的 `[capabilities.computer_use_config] workspace = true`。只支援 macOS 與 Linux。
 
 配額、保留期限、同時只能一個 session 的租約、操作者指令（`duduclaw ops computer-workspaces`，指令列上所有會改變狀態的動作都要先由管理員在儀表板核准；緊急處置用儀表板或總開關），以及已知限制（包括擁有者隔離只對三個工作區工具成立，對有 `Read` 或 Bash 的員工不成立），見[電腦操作工作區指南](../../guides/zh-TW/computer-workspaces.md)。
+
+## 閒置保留、即時畫面與接手
+
+這三項讓人可以看著員工的電腦、必要時接手，也讓 session 在工作中斷時不必重來。三項都只會收緊員工能做的事。程式碼：`crates/duduclaw-gateway/src/computer_use_sessions/`（`keepalive.rs`、`live_view.rs`、`live_ops.rs`、`view_ws.rs`、`rfb.rs`），儀表板 `web/src/components/agent/ComputerSessionPanel.tsx`。
+
+### 閒置保留
+
+```toml
+[capabilities.computer_use_config]
+keep_alive_minutes = 30      # 預設 0 = 和以前一樣閒置 2 分鐘就結束；最多 240
+takeover_idle_minutes = 10   # 預設 10；最多 60
+```
+
+`keep_alive_minutes` 大於 0 時，閒置 2 分鐘的 session 不會結束，而是由清掃程式暫停它的容器（`docker pause`）。員工下一次呼叫 `computer_*`，或儀表板有人要觀看時，會恢復容器（`docker unpause`）再繼續。暫停超過 `keep_alive_minutes` 就結束。暫停期間其他規則照常：`max_session_minutes` 期限繼續倒數、`max_actions` 不變，威脅等級 RED、聊天緊急停止、權限被關、工作區失去控制權與 `computer_session_stop` 都會結束它。暫停中的 session 保留名額，所以仍計入同時 5 個的上限。調低或移除 `keep_alive_minutes` 會對進行中的 session 生效，調高則不會。容器恢復不了時 session 結束（`resume_failed`）。持有 gateway 實例鎖的 gateway 會把超過期限標籤的暫停容器先恢復再移除，不等平常的 10 分鐘寬限；每個 gateway 仍會在期限過後 10 分鐘移除它。暫停與恢復都寫入稽核（`session_pause`、`session_resume`）。
+
+### 即時畫面
+
+員工頁有一個「電腦」分頁（員工開了 `computer_use` 時顯示），每 5 秒更新：session 是執行中、已暫停、暫停待確認還是有人接手中，已用動作、剩餘時間、閒置保留時間與正在觀看的人數。按「觀看」打開畫面。
+
+誰能做什麼（每次請求與每條觀看連線都重新從 `users.db` 讀取角色與綁定）：
+
+| | 管理員 | 綁定該員工的主管 | 以 Operator 以上綁定該員工的帳號 |
+|---|---|---|---|
+| 狀態、觀看、結束 | 可以 | 可以（任何綁定層級） | 可以 |
+| 接手、交還、疑似注入後恢復 | 可以 | 需以 Operator 以上綁定 | 不行 |
+
+畫面怎麼送到儀表板：有人觀看時，gateway 在容器裡啟動 `x11vnc`（`docker exec … duduclaw-vnc start viewonly`，新的 8 字元隨機密碼從 stdin 傳入）。它只在 root 專用的 `/tmp/duduclaw-root` 裡的 unix socket 監聽，不開任何 TCP port（若 5900–5999 有任何監聽，輔助程式會拒絕繼續執行），所以網路與瀏覽器的非特權帳號都碰不到它，主機上也沒有公開任何 port。儀表板向 `computer_sessions.view` RPC 取得一張 30 秒內有效、只能用一次的票，再開啟 gateway 的 `/ws/computer-view?ticket=…`；gateway 像儀表板 socket 一樣檢查 Origin、用掉這張票、重新讀取並判斷帳號權限、每個 session 最多 4 位觀看者，然後把 WebSocket 接到 `docker exec -i … duduclaw-vnc-relay`（unix socket 與 stdio 之間的轉送）。Session 結束或帳號失去權限（每 30 秒檢查）時連線就關閉。儀表板用 noVNC 畫出畫面。
+
+另一個選項是在 127.0.0.1 公開 port 再由 gateway 轉送；沒有採用，因為主機上任何使用者的任何程式都能連那個 port，而 `docker exec` 轉送需要 Docker daemon 的權限。
+
+gateway 會解析觀看端送來的協定內容（RFB 3.7/3.8）：鍵盤、滑鼠、剪貼簿與延伸按鍵訊息只放行持有接手權的帳號；調整畫面大小（`SetDesktopSize`，會破壞截圖遮罩）與 `xvp` 關機／重開機請求一律丟棄；認不得的內容直接關閉連線。沒有人接手時 VNC 伺服器另外以 `-viewonly` 執行，而且一律帶 `-noremote -nocmds -nosel`（雙向都不交換剪貼簿）。每條觀看連線都在瀏覽器稽核紀錄寫入 `view_start` 與 `view_stop`（誰、多久、轉送了幾則輸入），不記錄畫面與按鍵內容。
+
+### 接手與交還
+
+按「接手」會讓這個帳號取得 session 的接手權。持有期間：
+
+- 員工的 `computer_click`、`computer_type`、`computer_key`、`computer_scroll`、`computer_navigate` 與 `computer_workspace_write` 一律以 `human_has_control` 拒絕，並請它等待；截圖、狀態與結束照常，截圖照樣遮罩；
+- 串流以輸入模式、新密碼重新啟動，只有持有者的鍵盤滑鼠能到達畫面；
+- session 不會因閒置而結束或暫停。
+
+接手權在以下情況結束：按「交還」（持有者或管理員）、持有者 `takeover_idle_minutes` 分鐘沒有輸入、串流啟動失敗、session 結束。之後串流回到唯讀。員工會透過工作狀態（與 `working_state_handoff` 同一個儲存）收到一則結構化的 `continue` 交接：誰接手、多久、送出幾次輸入、為什麼結束、對方選填的留言（經過 `input_guard`，可疑的留言改成一句提示）、接手前的交接（縮短），以及下一步「先截圖，不要沿用舊座標」。稽核：`takeover_start`、`takeover_end`。接手時已通過最後一道檢查的動作會做完，之後的都會被擋。
+
+### 疑似注入時暫停
+
+每次 `computer_screenshot` 也會透過 `duduclaw-eval-dom`（isolated world）讀出可見頁面的文字（`document.body.innerText`，最多 32,768 字元），以封鎖門檻交給 `input_guard`。命中封鎖等級時 session 會被暫停：
+
+- 這張與之後的每張截圖都整張遮罩，`mask_reason` 為 `injection_suspected`，直到有人恢復；
+- 員工的每個動作與工作區寫入都以 `injection_suspected` 拒絕；
+- Activity Feed 與員工通知頻道的 L3 推播會寫出命中的規則類別；
+- 稽核 `injection_suspected` 只記規則類別，從不記頁面文字。
+
+在「電腦」分頁按「恢復」解除（稽核 `injection_resume`）。讀不到頁面文字時，截圖整張遮罩、`mask_reason` 為 `text_unscanned`（原本已整張遮罩則維持原因），session 不會暫停。文字在截圖後立刻讀取，所以中間變動的頁面會以較新的內容掃描。`input_guard` 本身的限制照舊：它比對句型，一般頁面也可能誤判，偽裝得好的文字也可能過關。
+
+### 未涵蓋與未驗證
+
+- 開發環境沒有 Docker：暫停／恢復、VNC 輔助程式、轉送與串流只用替身與單元測試驗證。轉送腳本與 TCP port 檢查在一般 Linux 上跑過；映像 workflow 的 smoke test 已加上透過轉送讀 RFB 開頭、瀏覽器帳號連不到 socket、沒有 VNC TCP port 的檢查，但還沒跑過。Debian 映像裡的 `x11vnc` 是否完全照用法接受 `-rfbport 0 -unixsock` 未驗證；不接受時串流會拒絕啟動，不會暴露任何東西。
+- 真實瀏覽器中的 noVNC 畫面、真實容器的 `docker pause`／`docker unpause` 以及對暫停中容器的 `docker rm --force` 都未驗證。
+- VNC 認證是 8 字元密碼與 DES；真正的保護是 root 專用的 unix socket 與 gateway 經過驗證、過濾的轉送。密碼會送到有權觀看者的瀏覽器。
+- 綁定該員工的主管或 Operator 看得到整個畫面（遮罩只套用在員工拿到的截圖，不套用在即時串流），包括網站顯示的內容。
+- 在唯讀與輸入模式之間切換會重啟 VNC 伺服器，正在觀看的人會斷線後重連。
+- 閒置保留、接手與觀看人數都存在 gateway 行程裡：gateway 重新啟動時 session 一樣會結束。
+- 設定只能寫在 `agent.toml`，員工編輯頁還沒有對應欄位。
+

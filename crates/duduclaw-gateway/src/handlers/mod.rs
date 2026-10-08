@@ -186,6 +186,7 @@ mod system_update_config_v168;
 mod tick_sources_rpc;
 mod channel_ingress_rpc;
 mod computer_workspaces_rpc;
+mod computer_sessions_rpc;
 mod config_raw_rpc;
 mod agents_update_v168;
 #[cfg(test)]

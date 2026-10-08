@@ -22,7 +22,7 @@ use duduclaw_memory::causal_identify::AdjustmentReadiness;
 static WS_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn check_ws_rate_limit(ip: IpAddr) -> bool {
+pub(crate) fn check_ws_rate_limit(ip: IpAddr) -> bool {
     let mut map = WS_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     // Cleanup stale entries every time the map grows large
@@ -2657,6 +2657,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // the gateway-internal MCP key and a verified employee identity token
     // (`computer_use_sessions::auth`). Own state + 64 KiB body cap.
     app = app.merge(crate::computer_use_sessions::http::router(
+        computer_use_sessions.clone(),
+    ));
+    // ── Computer-use live view (P8) ───────────────────────────────
+    // `/ws/computer-view?ticket=…`: one-time tickets from the
+    // `computer_sessions.*` RPCs; Origin, identity and authorization are
+    // re-checked on connect (`computer_use_sessions::view_ws`).
+    app = app.merge(crate::computer_use_sessions::view_ws::router(
         computer_use_sessions.clone(),
     ));
 
