@@ -82,6 +82,7 @@ async fn rig() -> Rig {
         min_wake_interval_secs: 300,
         max_consecutive_failures: 3,
         stop_at: now + chrono::Duration::days(5),
+        lane: None,
     };
     let r = crate::responsibility::service::create(&store, dir.path(), &input, "op", now)
         .await
@@ -441,4 +442,52 @@ async fn clearing_failures_needs_a_manager() {
         )
         .await;
     assert!(is_ok(&f), "{f:?}");
+}
+
+/// P5: the page's feature state is readable by any signed-in account and
+/// reports the configuration, never rows.
+#[tokio::test]
+async fn status_reports_the_switches() {
+    let r = rig().await;
+    let viewer = bound_ctx(&r, "alice", AccessLevel::Viewer);
+    let f = r.call("responsibilities.status", json!({}), &viewer).await;
+    let WsFrame::Response { ok: true, payload: Some(p), .. } = &f else {
+        panic!("{f:?}");
+    };
+    assert_eq!(p["enabled"], json!(true));
+    assert_eq!(p["dispatch_enabled"], json!(true));
+    assert_eq!(p["lanes"], json!(["explore"]));
+}
+
+/// P5: a read-only preset stores the explore lane in the contract scope; an
+/// unknown lane is refused.
+#[tokio::test]
+async fn create_with_explore_lane_records_it() {
+    let r = rig().await;
+    let op = bound_ctx(&r, "alice", AccessLevel::Operator);
+    let mut input = json!({
+        "owner_agent_id": "alice",
+        "objective": "每日簡報",
+        "acceptance_template": "三點摘要",
+        "schedule": {"cron": "0 0 8 * * *", "timezone": "Asia/Taipei"},
+        "occurrence_hours": 1,
+        "occurrence_cost_cap_cents": 50,
+        "budget_period": "day",
+        "budget_timezone": "Asia/Taipei",
+        "period_cost_limit_cents": 50,
+        "period_occurrence_limit": 1,
+        "min_wake_interval_secs": 3600,
+        "stop_at": (Utc::now() + chrono::Duration::days(7)).to_rfc3339(),
+        "lane": "explore",
+    });
+    let f = r.call("responsibilities.create", input.clone(), &op).await;
+    let WsFrame::Response { ok: true, payload: Some(p), .. } = &f else {
+        panic!("{f:?}");
+    };
+    let scope: Value =
+        serde_json::from_str(p["responsibility"]["scope_json"].as_str().unwrap()).unwrap();
+    assert_eq!(scope["lane"], json!("explore"));
+    input["lane"] = json!("write");
+    let f = r.call("responsibilities.create", input, &op).await;
+    assert!(!is_ok(&f), "{f:?}");
 }

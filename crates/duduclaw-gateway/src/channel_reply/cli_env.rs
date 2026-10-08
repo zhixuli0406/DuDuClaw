@@ -124,8 +124,14 @@ pub(super) async fn spawn_claude_cli_with_env(
     {
         let caps = capabilities.cloned().unwrap_or_default();
         // HS12: enforce a per-agent allowlist when configured.
+        // P5: inside an explore-lane responsibility round (this path is the
+        // `ClaudeRuntime` choke-point a failover can reach) only DuDuClaw MCP
+        // tools and read-only built-ins are auto-approved or present.
+        let explore_lane = crate::runtime::explore_lane_claude_tools(&caps);
         let allowed = caps.allowed_tools();
-        if !allowed.is_empty() {
+        if let Some((_, lane_allowed)) = &explore_lane {
+            cmd.args(["--allowedTools", &lane_allowed.join(",")]);
+        } else if !allowed.is_empty() {
             cmd.args(["--allowedTools", &allowed.join(",")]);
         }
         let denied = caps.disallowed_tools();
@@ -162,8 +168,15 @@ pub(super) async fn spawn_claude_cli_with_env(
         // minimal_context = false opts out.
         if duduclaw_core::agent_toml::resolve_minimal_context(work_dir) {
             cmd.args(["--setting-sources", "project,local"]);
-            let tools = caps.minimal_builtin_tools(&duduclaw_core::types::CURATED_BUILTIN_TOOLS);
-            cmd.args(["--tools", &tools.join(",")]);
+            if explore_lane.is_none() {
+                let tools =
+                    caps.minimal_builtin_tools(&duduclaw_core::types::CURATED_BUILTIN_TOOLS);
+                cmd.args(["--tools", &tools.join(",")]);
+            }
+        }
+        if let Some((lane_tools, _)) = &explore_lane {
+            cmd.args(["--tools", &lane_tools.join(",")]);
+            cmd.env(duduclaw_core::ENV_LANE, duduclaw_core::LANE_EXPLORE);
         }
     }
     // RFC-23 §13.6: when redaction is active this holds the per-spawn

@@ -214,6 +214,7 @@ impl MethodHandler {
 
             // ── Task Board (agent-scoped — HS4 fix) ────
             "responsibilities.create"
+            | "responsibilities.status"
             | "responsibilities.list"
             | "responsibilities.get"
             | "responsibilities.occurrences"

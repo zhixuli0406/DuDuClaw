@@ -321,6 +321,8 @@ impl AgentRuntime for GrokRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        // P5: this runtime cannot carry the read-only explore lane.
+        super::refuse_unsupported_lane("grok")?;
         info!(agent = %context.agent_id, "GrokRuntime: executing via grok -p");
 
         // MCP wiring: register the duduclaw MCP server before spawning. Grok is

@@ -15,6 +15,7 @@
 mod agent_wake;
 pub mod cost;
 pub mod events;
+pub mod lane;
 pub mod notify;
 pub mod operator_gate;
 pub mod service;
@@ -252,4 +253,20 @@ pub async fn return_unrun_round(home: &Path, message_id: &str) {
 pub(crate) fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(s.as_bytes()))
+}
+
+/// P5: whether a goal-loop round for `task_id` must run in the explore lane.
+/// `Ok(false)` for any task that is not a responsibility occurrence (and when
+/// no task store exists yet); an unreadable store or lane is an error, and
+/// the caller refuses the round (fail closed).
+pub async fn round_requires_explore_lane(home: &Path, task_id: &str) -> Result<bool, String> {
+    if !home.join("tasks.db").exists() {
+        return Ok(false);
+    }
+    let store = crate::task_store::TaskStore::open(home)
+        .map_err(|e| format!("task store unavailable: {e}"))?;
+    match store.occurrence_for_task(task_id).await? {
+        None => Ok(false),
+        Some((_, resp)) => Ok(lane::lane_of(&resp)? == lane::RespLane::Explore),
+    }
 }
