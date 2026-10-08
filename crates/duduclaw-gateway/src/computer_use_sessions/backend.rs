@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use super::live_view::{DockerLiveView, LiveViewAccess};
 use crate::computer_use::{ComputerAction, ComputerUseError};
 use crate::computer_use_orchestrator::{
     ComputerUseConfig, ComputerUseOrchestrator, MaskedScreenshot, NavigateOutcome,
@@ -33,6 +34,23 @@ pub(crate) trait SessionBackend: Send + Sync {
     /// Open an already-validated `https://` URL in the container's browser.
     async fn navigate(&self, _url: &str) -> Result<NavigateOutcome, ComputerUseError> {
         Err(ComputerUseError::ApiError("navigation not supported".into()))
+    }
+    /// Pause the container (keep-alive). Default: unsupported.
+    async fn freeze(&self) -> Result<(), ComputerUseError> {
+        Err(ComputerUseError::ApiError("pause not supported".into()))
+    }
+    /// Resume a paused container. Default: unsupported.
+    async fn thaw(&self) -> Result<(), ComputerUseError> {
+        Err(ComputerUseError::ApiError("resume not supported".into()))
+    }
+    /// The visible page's text for the injection scan. Default: unreadable
+    /// (the caller then fails closed).
+    async fn page_text(&self) -> Result<String, ComputerUseError> {
+        Err(ComputerUseError::ApiError("page text not supported".into()))
+    }
+    /// Container access for dashboard viewers, once the container runs.
+    fn live_view(&self) -> Option<Arc<dyn LiveViewAccess>> {
+        None
     }
     /// The control flags shared with the registry.
     fn control(&self) -> Arc<OrchestratorControl>;
@@ -86,6 +104,26 @@ impl SessionBackend for OrchestratorBackend {
 
     async fn navigate(&self, url: &str) -> Result<NavigateOutcome, ComputerUseError> {
         self.inner.navigate(url).await
+    }
+
+    async fn freeze(&self) -> Result<(), ComputerUseError> {
+        self.inner.freeze().await
+    }
+
+    async fn thaw(&self) -> Result<(), ComputerUseError> {
+        self.inner.thaw().await
+    }
+
+    async fn page_text(&self) -> Result<String, ComputerUseError> {
+        self.inner.read_page_text().await
+    }
+
+    fn live_view(&self) -> Option<Arc<dyn LiveViewAccess>> {
+        self.inner.container_name().map(|name| {
+            Arc::new(DockerLiveView {
+                container: name.to_string(),
+            }) as Arc<dyn LiveViewAccess>
+        })
     }
 
     fn control(&self) -> Arc<OrchestratorControl> {

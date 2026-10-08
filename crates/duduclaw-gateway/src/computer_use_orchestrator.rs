@@ -358,6 +358,13 @@ pub struct ComputerUseConfig {
     pub workspace_mount: Option<WorkspaceMount>,
     /// CONTRACT.toml `must_not` rules — actions matching these are blocked.
     pub contract_must_not: Vec<String>,
+    /// Minutes an idle session is kept with its container paused before it
+    /// ends (`[capabilities.computer_use_config] keep_alive_minutes`, already
+    /// capped). 0 = no keep-alive.
+    pub keep_alive_minutes: u32,
+    /// Minutes without viewer input before a dashboard takeover lease
+    /// expires (already defaulted and capped).
+    pub takeover_idle_minutes: u32,
 }
 
 impl Default for ComputerUseConfig {
@@ -380,6 +387,8 @@ impl Default for ComputerUseConfig {
             pinned_hosts: Vec::new(),
             workspace_mount: None,
             contract_must_not: Vec::new(),
+            keep_alive_minutes: 0,
+            takeover_idle_minutes: duduclaw_core::types::COMPUTER_USE_DEFAULT_TAKEOVER_IDLE_MINUTES,
         }
     }
 }
@@ -436,6 +445,25 @@ pub struct PinnedHost {
     pub host: String,
     /// The first public IPv4 address the host resolved to.
     pub ip: std::net::Ipv4Addr,
+}
+
+/// Most characters of page text read for the injection scan.
+pub const PAGE_TEXT_MAX_CHARS: usize = 32_768;
+/// Upper bound on the page-text exec (the helper gives up after 5 s).
+const PAGE_TEXT_EXEC_TIMEOUT: Duration = Duration::from_secs(10);
+/// The fixed expression `read_page_text` hands to `duduclaw-eval-dom`. The
+/// text is wrapped in an object so the helper never mistakes it for a list
+/// of mask rectangles and prints it unchanged as one JSON line.
+const PAGE_TEXT_JS: &str = "JSON.stringify({duduclaw_page_text: String((document.body && document.body.innerText) || '').slice(0, 32768)})";
+
+/// Parse the page-text helper's stdout: one JSON object with a string
+/// `duduclaw_page_text`. Anything else is `None`.
+pub(crate) fn parse_page_text_output(stdout: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(stdout).ok()?;
+    let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let page = value.get("duduclaw_page_text")?.as_str()?;
+    Some(duduclaw_core::truncate_chars(page, PAGE_TEXT_MAX_CHARS))
 }
 
 /// What `duduclaw-navigate` reported (one JSON line on stdout).
@@ -497,6 +525,8 @@ pub struct ComputerUseOrchestrator {
     /// The id this orchestrator's control handle is registered under in the
     /// global registry (set by [`Self::register`]).
     registered_as: Option<String>,
+    /// Whether the container is paused (`docker pause`, keep-alive).
+    frozen: AtomicBool,
 }
 
 /// SEC: Ensure the container is cleaned up even on panic/task cancellation.
@@ -551,6 +581,7 @@ impl ComputerUseOrchestrator {
             control: Arc::new(OrchestratorControl::new()),
             masking: MaskingConfig::default(),
             registered_as: None,
+            frozen: AtomicBool::new(false),
         }
     }
 
@@ -597,6 +628,62 @@ impl ComputerUseOrchestrator {
         parse_navigate_output(&output.stdout).ok_or_else(|| {
             ComputerUseError::ApiError("duduclaw-navigate printed no result line".to_string())
         })
+    }
+
+    /// The container's name once it was started (`duduclaw-cu-<32 hex>`).
+    pub fn container_name(&self) -> Option<&str> {
+        self.container_id.as_deref()
+    }
+
+    /// Pause the container (`docker pause`; keep-alive). Every process in
+    /// it is frozen; nothing runs until [`Self::thaw`].
+    pub async fn freeze(&self) -> Result<(), ComputerUseError> {
+        let container = self
+            .container_id
+            .as_deref()
+            .ok_or_else(|| ComputerUseError::ApiError("No active container".to_string()))?;
+        let out = docker_output(&["pause", container], CLEANUP_TIMEOUT, "Container pause").await?;
+        if !out.status.success() {
+            return Err(ComputerUseError::ApiError("docker pause failed".to_string()));
+        }
+        self.frozen.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Resume a paused container (`docker unpause`).
+    pub async fn thaw(&self) -> Result<(), ComputerUseError> {
+        let container = self
+            .container_id
+            .as_deref()
+            .ok_or_else(|| ComputerUseError::ApiError("No active container".to_string()))?;
+        let out = docker_output(&["unpause", container], CLEANUP_TIMEOUT, "Container unpause").await?;
+        if !out.status.success() {
+            return Err(ComputerUseError::ApiError("docker unpause failed".to_string()));
+        }
+        self.frozen.store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// The visible page's text (`document.body.innerText`, at most
+    /// [`PAGE_TEXT_MAX_CHARS`] characters) through `duduclaw-eval-dom`,
+    /// evaluated in an isolated world of the one visible page. `Err` when
+    /// the helper fails or prints anything but the expected JSON object.
+    pub async fn read_page_text(&self) -> Result<String, ComputerUseError> {
+        let container = self
+            .container_id
+            .as_deref()
+            .ok_or_else(|| ComputerUseError::ApiError("No active container".to_string()))?;
+        let output = docker_output(
+            &["exec", container, "duduclaw-eval-dom", PAGE_TEXT_JS],
+            PAGE_TEXT_EXEC_TIMEOUT,
+            "Page text",
+        )
+        .await?;
+        if !output.status.success() {
+            return Err(ComputerUseError::ApiError("page text helper failed".to_string()));
+        }
+        parse_page_text_output(&output.stdout)
+            .ok_or_else(|| ComputerUseError::ApiError("page text helper printed no result".to_string()))
     }
 
     /// Get a shareable handle to the control flags.
@@ -725,6 +812,12 @@ impl ComputerUseOrchestrator {
     pub async fn stop_session(&mut self) {
         if let Some(ref name) = self.container_id {
             info!(container = %name, "Stopping computer use session");
+            // A paused (keep-alive) container is resumed first so `stop`
+            // can deliver its signal; `rm -f` follows either way.
+            if self.frozen.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let _ = docker_output(&["unpause", name], CLEANUP_TIMEOUT, "Container unpause")
+                    .await;
+            }
             // Best-effort cleanup (each step bounded; `rm -f` still runs if
             // `stop` hangs or times out).
             let _ = docker_output(&["stop", "-t", "5", name], CLEANUP_TIMEOUT, "Container stop")
@@ -1782,6 +1875,60 @@ mod tests {
             assert_eq!(args[at - 1], "--label");
             assert!(at < args.len() - 1, "labels must precede the image");
         }
+    }
+
+    /// Live view (P8): the VNC server is reached only through `docker exec`
+    /// into the container; no network mode may publish a port, share the
+    /// host network or pass VNC settings through the environment.
+    #[test]
+    fn docker_run_args_never_expose_vnc_or_the_host_network() {
+        let isolated = ComputerUseConfig { keep_alive_minutes: 240, ..Default::default() };
+        let filtered = ComputerUseConfig {
+            network_access: true,
+            allowed_domains: vec!["example.com".into()],
+            ..Default::default()
+        };
+        let pinned_cfg = ComputerUseConfig {
+            pinned_hosts: vec![pinned("example.com", [93, 184, 215, 14])],
+            ..Default::default()
+        };
+        let cases = [
+            build_docker_run_args("duduclaw-cu-a", &isolated, &[], &test_labels()),
+            build_docker_run_args("duduclaw-cu-b", &filtered, &["example.com".to_string()], &test_labels()),
+            build_docker_run_args("duduclaw-cu-c", &pinned_cfg, &[], &test_labels()),
+        ];
+        for args in &cases {
+            for a in args {
+                let lower = a.to_ascii_lowercase();
+                assert!(
+                    !matches!(a.as_str(), "-p" | "-P" | "--publish" | "--publish-all" | "--expose")
+                        && !lower.starts_with("--publish")
+                        && !lower.starts_with("--expose")
+                        && !lower.contains("5900")
+                        && !lower.contains("vnc")
+                        && lower != "--network=host"
+                        && lower != "host",
+                    "unexpected argument {a:?} in {args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn page_text_output_needs_the_wrapped_object() {
+        assert_eq!(
+            parse_page_text_output(br#"{"duduclaw_page_text":"\u4f60\u597d world"}"#).as_deref(),
+            Some("你好 world")
+        );
+        assert_eq!(parse_page_text_output(b"[[1,2,3,4]]\n"), None);
+        assert_eq!(parse_page_text_output(b"\"just text\"\n"), None);
+        assert_eq!(parse_page_text_output(b"{\"duduclaw_page_text\":7}"), None);
+        assert_eq!(parse_page_text_output(&[0xff, 0xfe]), None);
+        let long = format!("{{\"duduclaw_page_text\":\"{}\"}}", "字".repeat(PAGE_TEXT_MAX_CHARS + 10));
+        assert_eq!(
+            parse_page_text_output(long.as_bytes()).unwrap().chars().count(),
+            PAGE_TEXT_MAX_CHARS
+        );
     }
 
     #[test]

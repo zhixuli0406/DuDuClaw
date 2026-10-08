@@ -92,6 +92,17 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_channel_ingress_inspect(params, ctx).await
             }
+            // Live view / takeover (P8): role and binding re-read and
+            // judged per call inside the handler (Admin, or bound Manager /
+            // Operator), so no blanket role gate here.
+            "computer_sessions.status"
+            | "computer_sessions.view"
+            | "computer_sessions.takeover"
+            | "computer_sessions.hand_back"
+            | "computer_sessions.resume"
+            | "computer_sessions.stop" => {
+                self.handle_computer_sessions(method, params, ctx).await
+            }
             "computer_workspaces.list"
             | "computer_workspaces.fence"
             | "computer_workspaces.revoke"
