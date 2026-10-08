@@ -28,6 +28,9 @@
 ### Changed
 - 主動訊息的「被忽略」判斷略過 `feedback.jsonl` 中 `source = "deliverable"` 的列。
 
+### Fixed
+- Windows：委派佇列 `bus_queue.jsonl` 的回覆一直寫不進去（`dispatcher::append_line` 以只附加模式開檔，Windows 的 `LockFileEx` 需要讀或寫權限，鎖定失敗後整筆回覆被丟棄）；改為同時要求讀權限。已發佈版本受影響。
+
 ### Not verified
 - MCP Events、遠端橋接補強與 Client ID Metadata Document 都只對本機假伺服器測試：沒有真的 MCP Events 提供者、沒有真的 ChatGPT 帳號、沒有真的會撤銷權杖或要求自訂標頭的服務商。MCP Events 未實作推播模式、`notifications/events/list_changed` 與 `v1a` 簽章；輪詢、cursor 補抓與 `deliveryStatus` 只對本機假伺服器測試。Codex 唯讀通道依賴 0.156.1 上驗證過的「`-s read-only` 下所有 MCP 呼叫被拒」行為，這次沒有重跑真的 Codex。
 
