@@ -1749,7 +1749,7 @@
   "mcp.registry.repository": "Source",
   "mcp.registry.reason.no_supported_transport": "No package or remote DuDuClaw can run",
   "mcp.registry.reason.sse_remote_only": "Only the legacy SSE transport (not supported here)",
-  "mcp.registry.reason.custom_headers": "Needs custom request headers (not supported)",
+  "mcp.registry.reason.custom_headers": "Requires a request header DuDuClaw cannot send",
   "mcp.registry.reason.deprecated": "Marked deprecated in the registry",
   "mcp.registry.reason.deleted": "Removed from the registry",
   "mcp.registry.requested": "Install request for {server} filed; an approver will review it.",
@@ -7588,5 +7588,8 @@
   "computerSession.viewer.ended.closed": "The live view closed. Press Watch to open it again.",
   "computerSession.viewer.ended.failed": "The live view was interrupted (the stream may have switched modes). Press Watch to reconnect.",
   "computerSession.viewer.ended.refused": "The live view was refused. Refresh the page and try again.",
-  "computerSession.footnote": "The view comes through the gateway only; the computer itself has no open port. Every watch, takeover and hand back is recorded in the audit log."
+  "computerSession.footnote": "The view comes through the gateway only; the computer itself has no open port. Every watch, takeover and hand back is recorded in the audit log.",
+  "mcp.registry.remoteHeaders": "The connect step asks for these request headers: {headers}",
+  "mcp.remote.declaredHeaders": "Request headers this server declares",
+  "mcp.remote.declaredHeadersHelp": "Values are stored encrypted with the connection and sent only to this server. * = required."
 }

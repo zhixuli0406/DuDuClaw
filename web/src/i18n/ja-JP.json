@@ -1748,7 +1748,7 @@
   "mcp.registry.repository": "ソース",
   "mcp.registry.reason.no_supported_transport": "DuDuClaw が実行できるパッケージやリモートがありません",
   "mcp.registry.reason.sse_remote_only": "旧式の SSE 接続のみ（ここでは非対応）",
-  "mcp.registry.reason.custom_headers": "カスタムリクエストヘッダーが必要（非対応）",
+  "mcp.registry.reason.custom_headers": "DuDuClaw が送れないリクエストヘッダーが必要です",
   "mcp.registry.reason.deprecated": "レジストリで非推奨に指定されています",
   "mcp.registry.reason.deleted": "レジストリから削除されています",
   "mcp.registry.requested": "{server} のインストール申請を送信しました。承認者が確認します。",
@@ -7588,5 +7588,8 @@
   "computerSession.viewer.ended.closed": "ライブ表示が閉じました。「見る」で再度開けます。",
   "computerSession.viewer.ended.failed": "ライブ表示が中断しました（ストリームのモードが切り替わった可能性があります）。「見る」で再接続してください。",
   "computerSession.viewer.ended.refused": "ライブ表示が拒否されました。ページを更新してもう一度お試しください。",
-  "computerSession.footnote": "表示は gateway 経由のみで、コンピューター自体には公開ポートがありません。視聴・引き継ぎ・返却はすべて監査ログに記録されます。"
+  "computerSession.footnote": "表示は gateway 経由のみで、コンピューター自体には公開ポートがありません。視聴・引き継ぎ・返却はすべて監査ログに記録されます。",
+  "mcp.registry.remoteHeaders": "接続時に次のリクエストヘッダーの入力を求めます：{headers}",
+  "mcp.remote.declaredHeaders": "このサーバーが宣言するリクエストヘッダー",
+  "mcp.remote.declaredHeadersHelp": "値は接続と一緒に暗号化して保存され、このサーバーにだけ送られます。* は必須です。"
 }

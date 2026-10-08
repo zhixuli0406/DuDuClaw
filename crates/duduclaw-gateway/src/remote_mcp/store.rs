@@ -169,6 +169,12 @@ pub fn validate_custom_headers(raw: &[(String, String)]) -> Result<Vec<(String, 
     Ok(out)
 }
 
+/// Whether an operator may supply a header with this name (the name rules
+/// of [`validate_custom_headers`]).
+pub fn custom_header_name_allowed(name: &str) -> bool {
+    validate_custom_headers(&[(name.to_string(), String::new())]).is_ok()
+}
+
 impl std::fmt::Debug for RemoteSecrets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteSecrets")

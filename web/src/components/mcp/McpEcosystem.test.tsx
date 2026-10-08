@@ -4,7 +4,7 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { useAuthStore } from '@/stores/auth-store';
 import { McpRegistryTab } from './McpRegistryTab';
-import { RemoteConnectDialog, isValidServerName, sanitizeServerName } from './RemoteServersTab';
+import { RemoteConnectDialog, isValidServerName, mergeDeclaredHeaders, sanitizeServerName } from './RemoteServersTab';
 
 vi.mock('@/lib/external-link', () => ({ openExternal: vi.fn() }));
 import { openExternal } from '@/lib/external-link';
@@ -148,6 +148,47 @@ describe('RemoteConnectDialog', () => {
     );
     const call = mockWsClient.call.mock.calls.find((c) => c[0] === 'mcp.remote_connect');
     expect(call?.[1]).not.toHaveProperty('redirect_origin');
+  });
+
+  it('asks for each declared registry header, masks secret ones and requires the required ones', async () => {
+    mockWsClient.call.mockResolvedValue({ status: 'connected', agent_id: 'nova', server: 'srv' });
+    renderWithProviders(
+      <RemoteConnectDialog
+        open
+        onClose={() => {}}
+        agents={agents}
+        initial={{
+          agentId: 'nova', name: 'srv', auth: 'none', locked: true,
+          declaredHeaders: [
+            { name: 'X-API-Key', description: 'Your key', required: true, secret: true },
+            { name: 'X-Region', description: '', required: false, secret: false },
+          ],
+        }}
+      />,
+    );
+    const submit = screen.getByRole('button', { name: /^connect$/i });
+    expect(submit).toBeDisabled();
+    const key = screen.getByLabelText(/X-API-Key/);
+    expect(key).toHaveAttribute('type', 'password');
+    expect(screen.getByLabelText(/X-Region/)).toHaveAttribute('type', 'text');
+    fireEvent.change(key, { target: { value: 'k-1' } });
+    expect(submit).not.toBeDisabled();
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenCalledWith('mcp.remote_connect', expect.objectContaining({ headers: { 'X-API-Key': 'k-1' } })),
+    );
+  });
+});
+
+describe('mergeDeclaredHeaders', () => {
+  it('lets declared fields win over a same-named free-text line and drops empty optional ones', () => {
+    const declared = [
+      { name: 'X-API-Key', description: '', required: true, secret: true },
+      { name: 'X-Region', description: '', required: false, secret: false },
+    ];
+    expect(mergeDeclaredHeaders(declared, { 'X-API-Key': ' k ' }, 'x-api-key: old\nX-Other: o')).toEqual({ 'X-Other': 'o', 'X-API-Key': 'k' });
+    expect(mergeDeclaredHeaders(declared, {}, 'bad line')).toBeNull();
+    expect(mergeDeclaredHeaders([], {}, '')).toEqual({});
   });
 });
 

@@ -205,6 +205,8 @@ impl MethodHandler {
                 map.insert("registry_version".into(), json!(version_label));
                 map.insert("remote".into(), json!(remote));
                 map.insert("remote_needs_bearer".into(), json!(hit.remote_needs_bearer));
+                // Declared headers the connect dialog asks for (2026-10-08).
+                map.insert("remote_headers".into(), json!(if remote { hit.remote_headers.clone() } else { Vec::new() }));
                 map.insert("mode".into(), json!(if is_admin { "installed" } else { "requested" }));
                 WsFrame::Response { id, ok: true, payload: Some(Value::Object(map)), error }
             }

@@ -2411,9 +2411,19 @@ export interface McpRegistryHit {
   website_url: string | null;
   required_env: { name: string; description: string; required: boolean; secret: boolean }[];
   installable: boolean;
-  /** no_supported_transport | sse_remote_only | custom_headers | deprecated | deleted */
+  /** no_supported_transport | sse_remote_only | custom_headers (a required header DuDuClaw cannot send) | deprecated | deleted */
   reason: string | null;
   install_is_remote: boolean;
+  /** Headers the remote declares (not Authorization); asked for when connecting. */
+  remote_headers?: McpRegistryHeader[];
+}
+
+/** A request header a registry remote declares (2026-10-08). */
+export interface McpRegistryHeader {
+  name: string;
+  description: string;
+  required: boolean;
+  secret: boolean;
 }
 
 export interface McpRegistrySearchResult {
@@ -7001,6 +7011,7 @@ export const api = {
         agent_id?: string;
         remote: boolean;
         remote_needs_bearer: boolean;
+        remote_headers?: McpRegistryHeader[];
         needs_connect?: boolean;
         request_id?: string;
         registry_name: string;

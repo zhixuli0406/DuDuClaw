@@ -1748,7 +1748,7 @@
   "mcp.registry.repository": "原始碼",
   "mcp.registry.reason.no_supported_transport": "沒有 DuDuClaw 能執行的套件或遠端端點",
   "mcp.registry.reason.sse_remote_only": "只提供舊版 SSE 連線方式（這裡不支援）",
-  "mcp.registry.reason.custom_headers": "需要自訂請求標頭（不支援）",
+  "mcp.registry.reason.custom_headers": "需要 DuDuClaw 無法送出的請求標頭",
   "mcp.registry.reason.deprecated": "註冊表已標示為停用",
   "mcp.registry.reason.deleted": "已從註冊表移除",
   "mcp.registry.requested": "已送出 {server} 的安裝申請，等待審核。",
@@ -7588,5 +7588,8 @@
   "computerSession.viewer.ended.closed": "即時畫面已關閉，按「觀看」可重新開啟。",
   "computerSession.viewer.ended.failed": "即時畫面中斷了（串流可能切換了模式），按「觀看」重新連線。",
   "computerSession.viewer.ended.refused": "即時畫面連線被拒絕，請重新整理頁面再試。",
-  "computerSession.footnote": "畫面只經由 gateway 轉送，電腦本身沒有對外開放的 port。每次觀看、接手與交還都會寫入稽核紀錄。"
+  "computerSession.footnote": "畫面只經由 gateway 轉送，電腦本身沒有對外開放的 port。每次觀看、接手與交還都會寫入稽核紀錄。",
+  "mcp.registry.remoteHeaders": "連線時會請你填寫這些請求標頭：{headers}",
+  "mcp.remote.declaredHeaders": "這個伺服器宣告的請求標頭",
+  "mcp.remote.declaredHeadersHelp": "值會隨連線加密保存，只送給這個伺服器。* 為必填。"
 }
