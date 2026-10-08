@@ -1875,8 +1875,12 @@ pub async fn append_line(path: &Path, line: &str) -> Result<(), String> {
     let line = line.to_string();
     tokio::task::spawn_blocking(move || {
         use std::io::Write;
+        // `read(true)`: on Windows an append-only handle lacks FILE_WRITE_DATA,
+        // and LockFileEx needs read or write access, so the lock (and with it
+        // every bus response) failed there.
         let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
