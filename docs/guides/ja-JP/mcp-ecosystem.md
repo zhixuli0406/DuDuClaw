@@ -173,7 +173,7 @@ action_rules = [
 - **自動化ルール**：トリガー `mcp_event`（項目 `server`、`name`、`agent_id`、`lane`、`suspicious`、`data.*`）。ここから作られるプロンプトの先頭には固定のセキュリティ注意書きが付きます。
 - **継続責任**：イベントソース `mcp.event`、購読の従業員のものです。
 
-**既定は読み取り専用。** イベントで始まる作業（自動化ルールの `delegate` や `run_skill`）は読み取り専用レーンで動きます。キューのメッセージに `lane = "explore"` が付き、Claude CLI は `DUDUCLAW_LANE=explore`（DuDuClaw のツールは `read`／`draft` のみ）、組み込みツールは `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch` だけ、サードパーティサーバーは制御付きプロキシ経由（第 4 節）で起動します。ほかのランタイム、MoA モデル、ローカル推論のみの従業員はこの作業を実行できません（拒否。ハイブリッドのローカル振り分けは使いません）。購読時に「通常モードを許可」をオンにすると、イベントが従業員の通常の権限で作業を始められます。継続責任を起こすのはこの購読だけで（occurrence は通常の目標タスクです）、読み取り専用の購読のイベントはそこで `dropped(explore_lane)` と記録されます。
+**既定は読み取り専用。** イベントで始まる作業（自動化ルールの `delegate` や `run_skill`）は読み取り専用レーンで動きます。キューのメッセージに `lane = "explore"` が付き、Claude CLI は `DUDUCLAW_LANE=explore`（DuDuClaw のツールは `read`／`draft` のみ）、組み込みツールは `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch` だけ、サードパーティサーバーは制御付きプロキシ経由（第 4 節）で起動します。これは[読み取り専用の継続タスク](continuous-responsibilities.md)と同じレーン・同じフラグで、規則も同じです：OpenAI 互換ランタイムの従業員は実行でき、DuDuClaw のツールは同じく制限され、`agent.toml [mcp.external]` のサーバーはマウントされません。ほかのランタイムやタスクサンドボックスの従業員は開始前に拒否され（`explore_lane_unsupported`）、MoA モデルとローカル推論のみの設定も拒否されます（ハイブリッドのローカル振り分けは使いません）。購読時に「通常モードを許可」をオンにすると、イベントが従業員の通常の権限で作業を始められます。継続責任を起こすのはこの購読だけで（occurrence は通常の目標タスクです）、読み取り専用の購読のイベントはそこで `dropped(explore_lane)` と記録されます。
 
 **シークレット**：Gateway のキーファイルで暗号化し `<home>/mcp_events/subscriptions.json`（0600）に保存します。「署名用シークレットを交換」は購読の更新で新しいものをサーバーに送り、古いものは 15 分間受け付けます。「購読を解除」はまずローカルの購読を消し（コールバックはすぐ `404`）、その後ベストエフォートで `events/unsubscribe` を呼びます。監査：`mcp_event_subscription_created`／`_rotated`／`_revoked`／`_refresh_failed`、`mcp_event_delivered`、`mcp_event_delivery_rejected`、`mcp_event_control`（id、名前、件数のみ）。
 

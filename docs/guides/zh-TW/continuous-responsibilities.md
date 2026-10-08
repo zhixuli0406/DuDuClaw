@@ -214,14 +214,15 @@ v1.70.0 之後的版本起，等待中的請求如果是在已經改變的狀態
 
 持續任務的合約可以帶 `"lane": "explore"`（RPC `responsibilities.create`／`update_contract`，以及指令列的合約檔）。這個欄位存在合約的 scope 裡，因此算進合約雜湊；沒有這個欄位的持續任務與以前逐位相同。其他值一律拒絕（`invalid_lane`）。
 
-這種持續任務每一次執行的每一輪，都在原本為 heartbeat 主動檢查做的唯讀 explore lane 裡跑：
+這種持續任務每一次執行的每一輪，都在原本為 heartbeat 主動檢查做的唯讀 explore lane 裡跑。MCP Events 投遞喚醒的工作也用同一條 lane（見 [MCP 生態系](mcp-ecosystem.md)）：派工器對兩種來源設定同一個旗標，所以下表對兩者都一樣。
 
 | 執行環境 | 行為 |
 |---|---|
-| Claude CLI | 啟動時帶 `DUDUCLAW_LANE=explore`（DuDuClaw MCP 伺服器繼承後只列出、只執行 `read`／`draft` 工具）；`--tools` 只剩 `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`（扣掉 `denied_tools`）；`--allowedTools` 只剩 DuDuClaw MCP 工具與這些內建工具（不會比員工自己的允許清單寬；`.mcp.json` 其他伺服器的工具不自動核准） |
-| OpenAI 相容執行環境、本地推論工具迴圈 | 沒有內建工具；MCP 子程序拿到 `DUDUCLAW_LANE=explore` |
+| Claude CLI | 啟動時帶 `DUDUCLAW_LANE=explore`（DuDuClaw MCP 伺服器繼承後只列出、只執行 `read`／`draft` 工具）；`--tools` 只剩 `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`（扣掉 `denied_tools`）；`--allowedTools` 只剩 DuDuClaw MCP 工具與這些內建工具（不會比員工自己的允許清單寬；`.mcp.json` 其他伺服器的工具不自動核准）；`.mcp.json` 其他 stdio 伺服器經過管制的 proxy，只列出 `read` 工具 |
+| OpenAI 相容執行環境 | 沒有內建工具；DuDuClaw MCP 子程序拿到 `DUDUCLAW_LANE=explore`；lane 內不掛載 `agent.toml [mcp.external]` 伺服器，這個執行環境也從不啟動 `.mcp.json` 的伺服器 |
+| MoA 模型、`inference_mode = "local"` | 拒絕（`explore_lane_unsupported`）；lane 內略過混合模式的本機分流 |
 | Codex、Gemini CLI、Antigravity、Grok、通用 CLI | 拒絕：這一輪在派工前失敗（`explore_lane_unsupported`），而且這些執行環境的 `execute` 裡也有同樣的拒絕，以防備援切換到它們 |
-| 任務沙箱（`[container] sandbox_enabled`） | 拒絕（沙箱給員工一個 shell） |
+| 任務沙箱（`[container] sandbox_enabled`） | 派工前拒絕（沙箱給員工一個 shell） |
 
 被拒絕的一輪算一次不成功的執行，所以連續失敗最後會讓持續任務暫停。lane 讀不出來也會讓這一輪失敗（`explore_lane_unreadable`）。未涵蓋：之後由 heartbeat 叫醒的子任務不在 lane 內（在 lane 內 `tasks_create` 屬於 `modify`，會被拒絕，所以唯讀執行本身建不了子任務）；尚未在真實 gateway 上跑過。
 

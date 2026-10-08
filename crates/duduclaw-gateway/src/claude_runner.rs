@@ -925,16 +925,21 @@ async fn call_claude_for_agent_impl(
     // attributes get the same value, matching what the `chat` spans below do.
     record_runtime_on_span(delegation_settings.provider);
 
-    // 2026-10-08: the read-only explore lane is wired for the Claude CLI
-    // spawn only (`crate::explore_lane`). Any other route would run the
-    // employee's tools without the lane, so it is refused here.
+    // The read-only explore lane (`crate::explore_lane`) is carried by the
+    // Claude CLI spawn and the OpenAI-compatible runtime only. Any other
+    // route (another runtime, a MoA ensemble) would run the employee without
+    // the lane, so it is refused here (the dispatcher already refused it
+    // before the run started; this is the second line).
     if crate::explore_lane::in_explore()
-        && (delegation_settings.non_claude_provider().is_some()
+        && (delegation_settings
+            .non_claude_provider()
+            .is_some_and(|p| !crate::explore_lane::runtime_supported(p))
             || duduclaw_llm::is_moa_model_id(&claude_model))
     {
         return Err(format!(
-            "Agent '{agent_id}' cannot run this read-only (explore lane) task: the lane is only \
-             enforced on the Claude CLI runtime"
+            "explore_lane_unsupported: Agent '{agent_id}' cannot run this read-only (explore \
+             lane) task: the lane is only enforced on the Claude CLI and OpenAI-compatible \
+             runtimes"
         ));
     }
 
@@ -1098,8 +1103,8 @@ async fn call_claude_for_agent_impl(
     match inference_mode.as_str() {
         "local" if crate::explore_lane::in_explore() => {
             return Err(format!(
-                "Agent '{agent_name}' cannot run this read-only (explore lane) task in local-only \
-                 inference mode: the lane is only enforced on the Claude CLI runtime"
+                "explore_lane_unsupported: Agent '{agent_name}' cannot run this read-only \
+                 (explore lane) task in local-only inference mode"
             ));
         }
         "local" => {
@@ -1634,9 +1639,9 @@ fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
     envs.extend(duduclaw_core::mcp_forward_env_vars());
     // P2-A H-2: the round this tool loop runs for (openai-compat runtime).
     envs.extend(crate::runtime::round_task_env());
-    // P5: an explore-lane responsibility round (openai-compat runtime and
-    // the local tool loop have no built-ins; the MCP server is the gate).
-    envs.extend(crate::runtime::round_lane_env());
+    // The explore lane (`crate::explore_lane`, either source): the
+    // openai-compat runtime has no built-ins, the MCP server is the gate.
+    envs.extend(crate::explore_lane::lane_env());
     // P2-B N4: the turn/run source identity, so the openai-compat tool loop's
     // memory writes are tied to their conversation like the CLI paths.
     envs.extend(crate::memory_provenance::turn_source_env_pairs());
@@ -1730,8 +1735,13 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
     // a server with an unresolvable credential is dropped fail-safe.
     let home_dir = duduclaw_core::platform::duduclaw_home();
     let agent_dir = home_dir.join("agents").join(agent_id);
-    let externals =
-        crate::mcp_external::load_external_mcp_servers_resolved(&agent_dir, &home_dir).await;
+    // In the explore lane no third-party server is mounted: nothing here
+    // would hold it to read-only tools (`crate::explore_lane`).
+    let externals = if crate::explore_lane::in_explore() {
+        Vec::new()
+    } else {
+        crate::mcp_external::load_external_mcp_servers_resolved(&agent_dir, &home_dir).await
+    };
 
     // RFC-23 §13.6: server names are recorded so `ToolExecutor::server_of`
     // can give a `ToolInterceptor` the `<server>.<tool>` namespace the
@@ -3931,10 +3941,10 @@ fn prepare_claude_cmd(
     // the curated default that restores WebSearch/WebFetch research capability.
     const DEFAULT_ALLOWED_TOOLS: &str =
         "mcp__duduclaw__*,WebSearch,WebFetch,Read,Write,Edit,Glob,Grep,Bash,TodoWrite";
-    // P5: an explore-lane responsibility round only auto-approves DuDuClaw
-    // MCP tools and the read-only built-ins (never wider than the employee's
-    // own allowlist).
-    let explore_lane = crate::runtime::explore_lane_claude_tools(&caps);
+    // Explore lane (`crate::explore_lane`, either source): only DuDuClaw MCP
+    // tools and the read-only built-ins are auto-approved (never wider than
+    // the employee's own allowlist).
+    let explore_lane = crate::explore_lane::claude_tools(&caps);
     let allowed = caps.allowed_tools();
     let allowed_csv = if let Some((_, lane_allowed)) = &explore_lane {
         lane_allowed.join(",")
@@ -3974,32 +3984,18 @@ fn prepare_claude_cmd(
     // schema the allowlist would not auto-approve is pure token waste here.
     // `project,local` keeps the agent's own `.claude/settings.json`. Default ON;
     // env kill-switch / per-agent [runtime] minimal_context = false opts out.
-    let event_lane = crate::explore_lane::in_explore();
-    if event_lane {
-        // Read-only explore lane (2026-10-08): only the read built-ins exist,
-        // whatever minimal_context says; the MCP children inherit the lane.
+    if let Some((lane_tools, _)) = &explore_lane {
+        // Read-only explore lane: only the read built-ins exist, whatever
+        // minimal_context says, and the DuDuClaw MCP server (inherited env)
+        // lists and allows only read / draft tools.
         cmd.args(["--setting-sources", "project,local"]);
-        let tools: Vec<String> = caps
-            .minimal_builtin_tools(duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS)
-            .into_iter()
-            .filter(|t| duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS.contains(&t.as_str()))
-            .collect();
-        cmd.args(["--tools", &tools.join(",")]);
+        cmd.args(["--tools", &lane_tools.join(",")]);
         cmd.env(duduclaw_core::ENV_LANE, duduclaw_core::LANE_EXPLORE);
     } else if duduclaw_core::agent_toml::resolve_minimal_context(config_dir) {
         cmd.args(["--setting-sources", "project,local"]);
-        if explore_lane.is_none() {
-            let tools =
-                caps.minimal_builtin_tools(&duduclaw_core::types::DISPATCH_DEFAULT_BUILTIN_TOOLS);
-            cmd.args(["--tools", &tools.join(",")]);
-        }
-    }
-    // P5: the explore lane narrows the built-ins whatever `minimal_context`
-    // says, and tells the DuDuClaw MCP server (inherited env) to list and
-    // allow only read / draft tools.
-    if let Some((lane_tools, _)) = &explore_lane {
-        cmd.args(["--tools", &lane_tools.join(",")]);
-        cmd.env(duduclaw_core::ENV_LANE, duduclaw_core::LANE_EXPLORE);
+        let tools =
+            caps.minimal_builtin_tools(&duduclaw_core::types::DISPATCH_DEFAULT_BUILTIN_TOOLS);
+        cmd.args(["--tools", &tools.join(",")]);
     }
 
     // NOTE: `caps.browser_via_bash` deliberately injects no env flag. The

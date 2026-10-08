@@ -173,7 +173,7 @@ action_rules = [
 - **自動化規則**：觸發 `mcp_event`（欄位 `server`、`name`、`agent_id`、`lane`、`suspicious` 與 `data.*`），由它產生的提示開頭有固定的安全提醒。
 - **持續責任**：事件來源 `mcp.event`，屬於訂閱的員工。
 
-**預設唯讀。** 事件啟動的工作（自動化規則的 `delegate` 或 `run_skill`）在唯讀通道執行：佇列訊息帶 `lane = "explore"`，Claude CLI 啟動時帶 `DUDUCLAW_LANE=explore`（DuDuClaw 工具只剩 `read`、`draft`）、內建工具只有 `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`，第三方伺服器經過管制的 proxy（第 4 節）。使用其他 runtime、MoA 模型或純本機推論的員工無法執行這類工作（拒絕；混合模式的本機分流略過）。訂閱時開啟「允許一般模式」，事件就能以員工平常的權限啟動工作；只有這種訂閱會喚醒持續責任（occurrence 是一般的目標任務），唯讀訂閱的事件在那裡記為 `dropped(explore_lane)`。
+**預設唯讀。** 事件啟動的工作（自動化規則的 `delegate` 或 `run_skill`）在唯讀通道執行：佇列訊息帶 `lane = "explore"`，Claude CLI 啟動時帶 `DUDUCLAW_LANE=explore`（DuDuClaw 工具只剩 `read`、`draft`）、內建工具只有 `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`，第三方伺服器經過管制的 proxy（第 4 節）。這與[唯讀持續任務](continuous-responsibilities.md)是同一條通道、同一個旗標，規則也相同：OpenAI 相容執行環境的員工可以執行，DuDuClaw 工具同樣受限，且不掛載 `agent.toml [mcp.external]` 伺服器；使用其他 runtime 或任務沙箱的員工在開始前就被拒絕（`explore_lane_unsupported`），MoA 模型與純本機推論也被拒絕（混合模式的本機分流略過）。訂閱時開啟「允許一般模式」，事件就能以員工平常的權限啟動工作；只有這種訂閱會喚醒持續責任（occurrence 是一般的目標任務），唯讀訂閱的事件在那裡記為 `dropped(explore_lane)`。
 
 **金鑰**：以 Gateway 金鑰檔加密存在 `<home>/mcp_events/subscriptions.json`（0600）。「更換簽章金鑰」會在更新訂閱時把新的送給伺服器，舊的 15 分鐘內仍接受。「取消訂閱」先刪除本機訂閱（回呼位址立即回 `404`），再盡力呼叫 `events/unsubscribe`。稽核：`mcp_event_subscription_created`／`_rotated`／`_revoked`／`_refresh_failed`、`mcp_event_delivered`、`mcp_event_delivery_rejected`、`mcp_event_control`（只有 id、名稱與數量）。
 

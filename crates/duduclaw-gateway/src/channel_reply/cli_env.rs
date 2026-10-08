@@ -124,10 +124,10 @@ pub(super) async fn spawn_claude_cli_with_env(
     {
         let caps = capabilities.cloned().unwrap_or_default();
         // HS12: enforce a per-agent allowlist when configured.
-        // P5: inside an explore-lane responsibility round (this path is the
-        // `ClaudeRuntime` choke-point a failover can reach) only DuDuClaw MCP
-        // tools and read-only built-ins are auto-approved or present.
-        let explore_lane = crate::runtime::explore_lane_claude_tools(&caps);
+        // Inside the explore lane (`crate::explore_lane`, either source; this
+        // path is the `ClaudeRuntime` choke-point a failover can reach) only
+        // DuDuClaw MCP tools and read-only built-ins are auto-approved or present.
+        let explore_lane = crate::explore_lane::claude_tools(&caps);
         let allowed = caps.allowed_tools();
         if let Some((_, lane_allowed)) = &explore_lane {
             cmd.args(["--allowedTools", &lane_allowed.join(",")]);
@@ -230,7 +230,13 @@ pub(super) async fn spawn_claude_cli_with_env(
             // point. With redaction active, hand the CLI a rewritten config
             // that routes each of them through `duduclaw mcp-proxy` instead.
             // `None` (redaction off / nothing to proxy) ⇒ byte-identical.
-            _mcp_proxy_guard = crate::redaction_proxy::maybe_proxy_mcp_config(home_dir, &mcp_json);
+            // In the explore lane third-party servers are proxied too, so
+            // they list and run only read tools (`crate::explore_lane`).
+            _mcp_proxy_guard = crate::redaction_proxy::maybe_proxy_mcp_config_in_lane(
+                home_dir,
+                &mcp_json,
+                crate::explore_lane::in_explore(),
+            );
             match _mcp_proxy_guard.as_ref() {
                 Some(proxied) => cmd.args(["--mcp-config", &proxied.to_string_lossy()]),
                 None => cmd.args(["--mcp-config", &mcp_json.to_string_lossy()]),

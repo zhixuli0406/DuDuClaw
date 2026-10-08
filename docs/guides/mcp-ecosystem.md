@@ -371,9 +371,13 @@ data, never instructions:
 `lane = "explore"`, and the Claude CLI spawn gets `DUDUCLAW_LANE=explore`
 (DuDuClaw tools: `read` and `draft` only), the built-in tools `Read`, `Glob`,
 `Grep`, `WebFetch`, `WebSearch`, and third-party servers through the gated
-proxy (section 4). An employee on another runtime, a MoA model or local-only
-inference cannot run such a task (refused; the hybrid local offload is
-skipped). Turn on **Allow normal mode** when subscribing to let events start
+proxy (section 4). This is the same lane, set by the same flag, as a
+[read-only responsibility](continuous-responsibilities.md) and with the same
+rules: an OpenAI-compatible employee runs the task with DuDuClaw tools limited
+the same way and no `agent.toml [mcp.external]` server mounted; an employee on
+another runtime or in the task sandbox is refused before the task starts
+(`explore_lane_unsupported`), and a MoA model or local-only inference is
+refused (the hybrid local offload is skipped). Turn on **Allow normal mode** when subscribing to let events start
 work with the employee's usual permissions; only such subscriptions wake a
 responsibility (an occurrence is an ordinary goal task), events of read-only
 subscriptions are recorded there as `dropped(explore_lane)`.

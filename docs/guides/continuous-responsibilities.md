@@ -215,14 +215,15 @@ To stop everything: `disable` first, then stop the open run.
 
 A responsibility's contract may carry `"lane": "explore"` (RPC `responsibilities.create` / `update_contract`, and the command line's contract file). The lane is stored in the contract's scope, so it is part of the contract hash; a responsibility without it is byte-identical to before. Any other value is refused (`invalid_lane`).
 
-Every round of every run of such a responsibility runs in the read-only explore lane introduced for the heartbeat proactive check:
+Every round of every run of such a responsibility runs in the read-only explore lane introduced for the heartbeat proactive check. Work woken by an MCP Events delivery uses the same lane ([MCP ecosystem](mcp-ecosystem.md)): the dispatcher sets one flag for both, so the rules below are the same for either source.
 
 | Runtime | What happens |
 |---|---|
-| Claude CLI | `DUDUCLAW_LANE=explore` on the spawn (inherited by the DuDuClaw MCP server, which then lists and runs only `read` / `draft` tools), `--tools` limited to `Read`, `Glob`, `Grep`, `WebFetch`, `WebSearch` minus `denied_tools`, and `--allowedTools` limited to DuDuClaw MCP tools and those built-ins (never wider than the employee's own allowlist; tools of other `.mcp.json` servers are not auto-approved) |
-| OpenAI-compatible runtime, local-inference tool loop | No built-in tools; the MCP child gets `DUDUCLAW_LANE=explore` |
+| Claude CLI | `DUDUCLAW_LANE=explore` on the spawn (inherited by the DuDuClaw MCP server, which then lists and runs only `read` / `draft` tools), `--tools` limited to `Read`, `Glob`, `Grep`, `WebFetch`, `WebSearch` minus `denied_tools`, and `--allowedTools` limited to DuDuClaw MCP tools and those built-ins (never wider than the employee's own allowlist; tools of other `.mcp.json` servers are not auto-approved); other `.mcp.json` stdio servers go through the gated proxy and list only `read` tools |
+| OpenAI-compatible runtime | No built-in tools; the DuDuClaw MCP child gets `DUDUCLAW_LANE=explore`; no `agent.toml [mcp.external]` server is mounted in the lane, and this runtime never starts `.mcp.json` servers |
+| MoA model, `inference_mode = "local"` | Refused (`explore_lane_unsupported`); the hybrid local offload is skipped in the lane |
 | Codex, Gemini CLI, Antigravity, Grok, generic CLI | Refused: the round fails before dispatch (`explore_lane_unsupported`), and the same refusal sits in each of those runtimes' `execute` in case a failover reaches them |
-| Task sandbox (`[container] sandbox_enabled`) | Refused (the sandbox gives the employee a shell) |
+| Task sandbox (`[container] sandbox_enabled`) | Refused before dispatch (the sandbox gives the employee a shell) |
 
 A refused round counts as an unsuccessful run, so the failure streak eventually pauses the responsibility. An unreadable lane fails the round too (`explore_lane_unreadable`). Not covered: a run's sub-tasks woken later by the heartbeat run outside the lane (in the lane, `tasks_create` is a `modify` tool and is refused, so a read-only run cannot create them itself); not exercised against a live gateway.
 
