@@ -97,6 +97,13 @@ export class DuDuClawClient {
   }
 
   // H7 fix: accept a getter function instead of a static token
+  /** The dashboard socket URL this client connected to (`''` before the
+   *  first connect). Other gateway WebSocket routes, such as the computer
+   *  live view, are derived from it. */
+  socketUrl(): string {
+    return this.url;
+  }
+
   connect(url: string, getToken?: TokenGetter, authRefreshHook?: AuthRefreshHook): Promise<void> {
     this.url = url;
     this.getToken = getToken;
