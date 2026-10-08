@@ -497,7 +497,7 @@ mod tests {
         // connect dialog asks for each one.
         let hdr = json!({"name": "a.b/c", "remotes": [{"type": "streamable-http", "url": "https://x.example/mcp",
             "headers": [
-                {"name": "X-API-Key", "isRequired": true, "isSecret": true, "description": "Your key\u0007"},
+                {"name": "X-API-Key", "isRequired": true, "isSecret": true, "description": "Your key\u{0007}"},
                 {"name": "X-Region", "isRequired": false},
                 {"name": "Authorization", "isRequired": true}
             ]}]});
