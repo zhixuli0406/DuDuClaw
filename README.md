@@ -23,8 +23,6 @@ npm install -g duduclaw
 duduclaw run                  # then open http://localhost:18789
 ```
 
-https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
-
 ## Table of contents
 
 - [Why DuDuClaw?](#why)
