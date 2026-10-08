@@ -522,13 +522,13 @@ pub fn rpc_action(method: &str) -> Option<LiveAction> {
 }
 
 /// After a session ended with a lease still held: the handoff and audit.
-pub(crate) fn release_on_end(
+pub(crate) async fn release_on_end(
     home: std::path::PathBuf,
     agent_id: String,
     session_id: String,
     lease: TakeoverLease,
-) -> impl std::future::Future<Output = ()> + Send {
-    async move {
+) {
+    {
         let entry = super::audit_entry(
             &agent_id,
             "takeover_end",
