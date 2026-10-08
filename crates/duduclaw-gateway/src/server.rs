@@ -295,6 +295,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Re-calls `events/subscribe` before each grant runs out; does nothing
     // on an install with no subscriptions file.
     crate::mcp_events::service::spawn_refresh_sweep(home_dir.clone());
+    // Poll-mode subscriptions: only the process holding the gateway lock
+    // polls (see `mcp_events::poll`).
+    crate::mcp_events::poll::spawn_poll_loop(home_dir.clone());
 
     let extension = config.extension.clone();
     let edition_override = config.edition;
