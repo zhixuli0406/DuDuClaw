@@ -2259,7 +2259,9 @@ impl CapabilitiesConfig {
     /// Logic:
     /// 1. If `denied_tools` is non-empty, those are always blocked.
     /// 2. Individual capability flags control built-in high-risk tools.
-    /// 3. Returns a deduplicated, sorted Vec suitable for `--disallowedTools`.
+    /// 3. Claude Code built-ins that `action_rules` block or ask
+    ///    ([`crate::tool_effect::ActionRules::builtins_refused`]).
+    /// 4. Returns a deduplicated, sorted Vec suitable for `--disallowedTools`.
     pub fn disallowed_tools(&self) -> Vec<String> {
         let mut denied: Vec<String> = self.denied_tools.clone();
 
@@ -2267,6 +2269,12 @@ impl CapabilitiesConfig {
         if !self.computer_use {
             denied.push("computer".to_string());
         }
+
+        // `action_rules` (2026-10) also reach the Claude Code built-ins: a
+        // built-in whose class (or name) the rules `block` or `ask` is kept
+        // away from the CLI. A built-in call never passes through the
+        // ApprovalBroker, so `ask` cannot be honoured and counts as `block`.
+        denied.extend(self.action_rules.builtins_refused());
 
         // Deduplicate and sort for deterministic CLI args
         denied.sort();
@@ -4197,6 +4205,27 @@ mod tests {
         let got = caps.minimal_builtin_tools(&CURATED_BUILTIN_TOOLS);
         assert!(!got.iter().any(|t| t == "Bash"));
         assert!(got.iter().any(|t| t == "Read"));
+    }
+
+    /// `action_rules` reach the Claude Code built-ins at spawn: `block` and
+    /// `ask` (which a built-in cannot route to a person) both keep the tool
+    /// out of `--disallowedTools` / `--tools`.
+    #[test]
+    fn action_rules_keep_blocked_or_asked_builtins_away_from_the_cli() {
+        let caps: CapabilitiesConfig = toml::from_str(
+            "action_rules = [{ effect = \"modify\", verdict = \"ask\" }, { tool = \"Bash\", verdict = \"block\" }]\n",
+        )
+        .unwrap();
+        let denied = caps.disallowed_tools();
+        for t in ["Bash", "Edit", "MultiEdit", "NotebookEdit", "Write"] {
+            assert!(denied.iter().any(|d| d == t), "{t}: {denied:?}");
+        }
+        assert!(!denied.iter().any(|d| d == "Read"));
+        let tools = caps.minimal_builtin_tools(&CURATED_BUILTIN_TOOLS);
+        assert!(!tools.iter().any(|t| t == "Bash" || t == "Write" || t == "Edit"), "{tools:?}");
+        assert!(tools.iter().any(|t| t == "Read"));
+        // No rules ⇒ unchanged.
+        assert_eq!(CapabilitiesConfig::default().disallowed_tools(), vec!["computer".to_string()]);
     }
 
     /// An MCP-only allowlist yields an empty built-in set (`--tools ""`),

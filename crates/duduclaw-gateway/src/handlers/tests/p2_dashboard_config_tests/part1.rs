@@ -764,3 +764,38 @@ pub(super) fn cap_action_rules_round_trip_and_fail_closed_on_bad_entries() {
         );
     }
 }
+
+// ── P8 (2026-10-08): keep-alive and takeover windows from the edit page ──
+
+#[test]
+pub(super) fn cap_computer_use_keep_alive_and_takeover_are_validated() {
+    let mut table = toml::Table::new();
+    let changes = apply_capabilities_to_table(
+        &mut table,
+        &json!({ "capabilities": { "computer_use_config": {
+            "keep_alive_minutes": 30, "takeover_idle_minutes": 5
+        } } }),
+    )
+    .expect("apply");
+    assert!(changes.iter().any(|c| c.contains("keep_alive_minutes = 30")));
+    let cap = table.get("capabilities").unwrap().as_table().unwrap();
+    let cfg: duduclaw_core::types::CapabilitiesConfig =
+        cap.clone().try_into().expect("deserializes into CapabilitiesConfig");
+    assert_eq!(cfg.computer_use_config.keep_alive_minutes(), 30);
+    assert_eq!(cfg.computer_use_config.takeover_idle_minutes(), 5);
+    // 0 keeps the old idle end; the edges are accepted.
+    for ok in [json!({ "keep_alive_minutes": 0 }), json!({ "keep_alive_minutes": 240 }),
+               json!({ "takeover_idle_minutes": 1 }), json!({ "takeover_idle_minutes": 60 })] {
+        let mut t = toml::Table::new();
+        assert!(apply_capabilities_to_table(&mut t, &json!({ "capabilities": { "computer_use_config": ok } })).is_ok());
+    }
+    for bad in [json!({ "keep_alive_minutes": 241 }), json!({ "keep_alive_minutes": -1 }),
+                json!({ "keep_alive_minutes": "30" }), json!({ "takeover_idle_minutes": 0 }),
+                json!({ "takeover_idle_minutes": 61 }), json!({ "takeover_idle_minutes": 1.5 })] {
+        let mut t = toml::Table::new();
+        assert!(
+            apply_capabilities_to_table(&mut t, &json!({ "capabilities": { "computer_use_config": bad.clone() } })).is_err(),
+            "{bad}"
+        );
+    }
+}

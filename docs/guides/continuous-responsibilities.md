@@ -215,7 +215,7 @@ To stop everything: `disable` first, then stop the open run.
 
 A responsibility's contract may carry `"lane": "explore"` (RPC `responsibilities.create` / `update_contract`, and the command line's contract file). The lane is stored in the contract's scope, so it is part of the contract hash; a responsibility without it is byte-identical to before. Any other value is refused (`invalid_lane`).
 
-Every round of every run of such a responsibility runs in the read-only explore lane introduced for the heartbeat proactive check. Work woken by an MCP Events delivery uses the same lane ([MCP ecosystem](mcp-ecosystem.md)): the dispatcher sets one flag for both, so the rules below are the same for either source.
+Every round of every run of such a responsibility runs in the read-only explore lane introduced for the heartbeat proactive check, and so does all later work on any task in that run's tree: a goal round of a sub-goal, and a heartbeat task-board wake-up for any task under the run (the dispatcher walks the parent chain up to 64 levels and uses the explore lane when any responsibility run containing the task has it). Work woken by an MCP Events delivery uses the same lane ([MCP ecosystem](mcp-ecosystem.md)): the dispatcher sets one flag for both, so the rules below are the same for either source.
 
 | Runtime | What happens |
 |---|---|
@@ -225,7 +225,7 @@ Every round of every run of such a responsibility runs in the read-only explore 
 | Codex, Gemini CLI, Antigravity, Grok, generic CLI | Refused: the round fails before dispatch (`explore_lane_unsupported`), and the same refusal sits in each of those runtimes' `execute` in case a failover reaches them |
 | Task sandbox (`[container] sandbox_enabled`) | Refused before dispatch (the sandbox gives the employee a shell) |
 
-A refused round counts as an unsuccessful run, so the failure streak eventually pauses the responsibility. An unreadable lane fails the round too (`explore_lane_unreadable`). Not covered: a run's sub-tasks woken later by the heartbeat run outside the lane (in the lane, `tasks_create` is a `modify` tool and is refused, so a read-only run cannot create them itself); not exercised against a live gateway.
+A refused round counts as an unsuccessful run, so the failure streak eventually pauses the responsibility. An unreadable lane fails the round too (`explore_lane_unreadable`), and so does a heartbeat wake-up for a task under a run whose lane cannot be read. Not exercised against a live gateway.
 
 ## The task detail page
 

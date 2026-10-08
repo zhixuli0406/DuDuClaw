@@ -98,7 +98,7 @@ impl ComputerUseSessions {
     }
 
     pub async fn workspace_list(&self, agent_id: &str) -> Result<Value, OpError> {
-        self.admit(agent_id, gates::TOOL_WS_LIST, "").await?;
+        self.admit(agent_id, gates::TOOL_WS_LIST, "", &json!({})).await?;
         self.workspace_capability(agent_id)?;
         if !cfg!(unix) {
             return Err(workspace::unavailable());
@@ -166,7 +166,13 @@ impl ComputerUseSessions {
         workspace_id: &str,
         path: &str,
     ) -> Result<Value, OpError> {
-        self.admit(agent_id, gates::TOOL_WS_READ, "").await?;
+        self.admit(
+            agent_id,
+            gates::TOOL_WS_READ,
+            "",
+            &json!({ "workspace_id": workspace_id, "path": path }),
+        )
+        .await?;
         self.workspace_capability(agent_id)?;
         if !cw::paths::valid_workspace_id(workspace_id) {
             return Err(workspace::ws_not_found());
@@ -234,7 +240,19 @@ impl ComputerUseSessions {
         content: &str,
         expected_revision: Option<i64>,
     ) -> Result<Value, OpError> {
-        self.admit(agent_id, gates::TOOL_WS_WRITE, "").await?;
+        self.admit(
+            agent_id,
+            gates::TOOL_WS_WRITE,
+            "",
+            &json!({
+                "workspace_id": workspace_id,
+                "path": path,
+                "content_hash": crate::approval::payload_hash(&json!(content)),
+                "bytes": content.len(),
+                "expected_revision": expected_revision,
+            }),
+        )
+        .await?;
         self.workspace_capability(agent_id)?;
         if !cw::paths::valid_workspace_id(workspace_id) {
             return Err(workspace::ws_not_found());

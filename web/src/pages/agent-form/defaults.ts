@@ -122,6 +122,8 @@ export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_us
     display_width: 1280,
     display_height: 800,
     auto_confirm_trusted: false,
+    keep_alive_minutes: 0,
+    takeover_idle_minutes: 10,
   },
 };
 

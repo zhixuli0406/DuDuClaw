@@ -1116,6 +1116,83 @@ pub fn line_autopilot_pause_quick_reply(rule_id: &str) -> Value {
     })
 }
 
+// ── Daily digest feedback (P9) — 👍 / 👎 / needs changes per numbered item ──
+//
+// One row of three buttons per numbered item of the digest message (the
+// number is the `[n]` shown in the text). The id is the digest-item
+// reference `digest::feedback_ref` builds (`<yyyymmdd>.<n>`), decoded and
+// authorized by `digest::apply_channel_feedback` through the shared
+// `decision_notify::route_press`.
+
+/// Most items a digest message carries buttons for: Discord allows five
+/// action rows per message and LINE thirteen quick-reply items (4 × 3 = 12).
+pub const DIGEST_BUTTON_ITEMS: usize = 4;
+
+/// Per-platform feedback buttons for the numbered digest items `refs`
+/// (`(number, reference)`), or `None` for a channel without buttons or an
+/// empty list. Items past [`DIGEST_BUTTON_ITEMS`] get no buttons.
+pub fn digest_feedback_markup(channel: &str, refs: &[(u32, String)]) -> Option<Value> {
+    let refs: Vec<&(u32, String)> = refs.iter().take(DIGEST_BUTTON_ITEMS).collect();
+    if refs.is_empty() {
+        return None;
+    }
+    let acts = [
+        (DecisionAct::Up, "👍"),
+        (DecisionAct::Down, "👎"),
+        (DecisionAct::Changes, "✏️"),
+    ];
+    let markup = match channel {
+        "telegram" => json!({
+            "inline_keyboard": refs.iter().map(|(n, id)| {
+                acts.iter().map(|(act, emoji)| json!({
+                    "text": format!("{emoji} {n}"),
+                    "callback_data": encode(DecisionSource::Digest, *act, id),
+                })).collect::<Vec<_>>()
+            }).collect::<Vec<_>>()
+        }),
+        "discord" => Value::Array(
+            refs.iter()
+                .map(|(n, id)| {
+                    json!({
+                        "type": 1,
+                        "components": acts.iter().map(|(act, emoji)| json!({
+                            "type": 2, "style": 2,
+                            "label": format!("{emoji} {n}"),
+                            "custom_id": encode(DecisionSource::Digest, *act, id),
+                        })).collect::<Vec<_>>()
+                    })
+                })
+                .collect(),
+        ),
+        "slack" => json!({
+            "type": "actions",
+            "elements": refs.iter().flat_map(|(n, id)| {
+                acts.iter().map(move |(act, emoji)| json!({
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": format!("{emoji} {n}") },
+                    "action_id": encode(DecisionSource::Digest, *act, id),
+                    "value": id,
+                }))
+            }).collect::<Vec<_>>()
+        }),
+        "line" => json!({
+            "items": refs.iter().flat_map(|(n, id)| {
+                acts.iter().map(move |(act, emoji)| json!({
+                    "type": "action",
+                    "action": {
+                        "type": "postback",
+                        "label": format!("{emoji} {n}"),
+                        "data": encode(DecisionSource::Digest, *act, id),
+                        "displayText": format!("{emoji} {n}"),
+                    }
+                }))
+            }).collect::<Vec<_>>()
+        }),
+        _ => return None,
+    };
+    Some(markup)
+}
+
 // ── Goal-intent confirmation (P1) — accept as goal / plan first / dismiss ──
 //
 // A separate, deliberately UN-authorized codec from `decision_action`'s

@@ -116,6 +116,25 @@ fn ask_rules_fold_into_the_static_always_flag_and_allow_never_removes_a_list() {
     assert!(static_gate_flags(&dir, "wiki_write", &payload).0);
 }
 
+#[test]
+fn a_rule_for_a_removed_tool_name_gates_the_replacement_call() {
+    let home = home_with_rules("[{ tool = \"shared_wiki_write\", verdict = \"ask\" }]");
+    let dir = home.path().join("agents").join("test");
+    let shared = serde_json::json!({ "arguments": { "scope": "shared" } });
+    let own = serde_json::json!({ "arguments": { "scope": "agent" } });
+    assert!(static_gate_flags(&dir, "wiki_write", &shared).0);
+    assert!(!static_gate_flags(&dir, "wiki_write", &own).0);
+    let rules = duduclaw_core::agent_toml::load_action_rules(&dir);
+    assert_eq!(
+        crate::mcp_dispatch::action_rule_verdict_for_call(
+            &rules,
+            "wiki_write",
+            &serde_json::json!({ "scope": "shared" })
+        ),
+        Some(duduclaw_core::ActionVerdict::Ask)
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn explore_lane_lists_only_read_and_draft_tools() {
     let home = tmp_home_with_all_capabilities();

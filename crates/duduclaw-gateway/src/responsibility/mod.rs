@@ -261,18 +261,24 @@ pub(crate) fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
-/// P5: whether a goal-loop round for `task_id` must run in the explore lane.
-/// `Ok(false)` for any task that is not a responsibility occurrence (and when
-/// no task store exists yet); an unreadable store or lane is an error, and
-/// the caller refuses the round (fail closed).
+/// P5: whether work for `task_id` (a goal-loop round, or a heartbeat
+/// task-board wake-up) must run in the explore lane: the task is a
+/// responsibility occurrence, or sits anywhere in the tree under one, whose
+/// contract says `lane = "explore"`. `Ok(false)` for a task in no
+/// occurrence tree (and when no task store exists yet); an unreadable store
+/// or lane is an error, and the caller refuses the run (fail closed). When
+/// several responsibility runs contain the task, any explore lane wins.
 pub async fn round_requires_explore_lane(home: &Path, task_id: &str) -> Result<bool, String> {
     if !home.join("tasks.db").exists() {
         return Ok(false);
     }
     let store = crate::task_store::TaskStore::open(home)
         .map_err(|e| format!("task store unavailable: {e}"))?;
-    match store.occurrence_for_task(task_id).await? {
-        None => Ok(false),
-        Some((_, resp)) => Ok(lane::lane_of(&resp)? == lane::RespLane::Explore),
+    let mut explore = false;
+    for resp in store.occurrence_tree_responsibilities(task_id).await? {
+        // Every lane is read, so one unreadable contract refuses the run
+        // even when another already says explore.
+        explore |= lane::lane_of(&resp)? == lane::RespLane::Explore;
     }
+    Ok(explore)
 }

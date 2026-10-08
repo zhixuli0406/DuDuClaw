@@ -76,9 +76,10 @@ pub(crate) fn static_gate_flags(
     );
     let always = install_approval_required(agent_dir, tool_name, false)
         || duduclaw_gateway::approval::tool_is_irreversible(agent_dir, tool_name)
-        || crate::mcp_dispatch::action_rule_verdict(
+        || crate::mcp_dispatch::action_rule_verdict_for_call(
             &duduclaw_core::agent_toml::load_action_rules(agent_dir),
             tool_name,
+            payload.get("arguments").unwrap_or(&Value::Null),
         )
         .is_some_and(|v| v >= duduclaw_core::ActionVerdict::Ask)
         || legacy_name.is_some_and(|legacy| {
@@ -408,6 +409,16 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
     workflow: Option<&super::workflow_operation::WorkflowCall>,
 ) -> std::result::Result<(), String> {
     if tool_name == "skill_hub_install" {
+        // Keeps its own post-scan install gate (`handle_skill_hub_install`);
+        // the action review (default off) only adds a refusal or a person's
+        // approval in front of it.
+        let agent_dir = caller_agent_dir(home_dir, agent_id);
+        if run_action_review(home_dir, &agent_dir, agent_id, tool_name, &payload).await? {
+            return approval_after_review(
+                home_dir, &agent_dir, agent_id, tool_name, payload, workflow,
+            )
+            .await;
+        }
         return Ok(());
     }
     // The eight `computer_*` tools are gated in the gateway, which owns the
@@ -527,44 +538,11 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
     // `ask` or when no verdict came back (fail closed).
     let mut gate = gate;
     let mut asked_by_review = false;
-    if gate == ActionGate::Auto && duduclaw_core::effect_of(tool_name).is_side_effecting() {
-        use duduclaw_gateway::action_review::{self, ActionReviewMode, ReviewOutcome};
-        let mode = ActionReviewMode::from_home(home_dir);
-        if mode != ActionReviewMode::Off {
-            let input = action_review::ReviewInput::build(tool_name, &payload, &agent_dir);
-            let verdict = action_review::review(home_dir, &agent_dir, &input).await;
-            let result = action_review::outcome(mode, verdict);
-            duduclaw_security::audit::append_tool_call_with_extras(
-                home_dir,
-                agent_id,
-                tool_name,
-                &format!(
-                    "action review ({}) → {}",
-                    mode.as_str(),
-                    action_review::audit_value(verdict)
-                ),
-                result == ReviewOutcome::Run,
-                &[
-                    (
-                        "action_review",
-                        Value::String(action_review::audit_value(verdict).to_string()),
-                    ),
-                    ("action_review_mode", Value::String(mode.as_str().to_string())),
-                ],
-            );
-            match result {
-                ReviewOutcome::Run => {}
-                ReviewOutcome::Refuse => {
-                    return Err(format!(
-                        "工具「{tool_name}」的呼叫經動作審查（[action_review] enforce）判定會越過此員工的界線，已拒絕執行。"
-                    ));
-                }
-                ReviewOutcome::AskPerson => {
-                    gate = ActionGate::RequireApproval;
-                    asked_by_review = true;
-                }
-            }
-        }
+    if gate == ActionGate::Auto
+        && run_action_review(home_dir, &agent_dir, agent_id, tool_name, &payload).await?
+    {
+        gate = ActionGate::RequireApproval;
+        asked_by_review = true;
     }
 
     match gate {
@@ -617,9 +595,10 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
             // P7: a send / purchase call, or one an `action_rules` `ask`
             // routed here, gets a single-use approval bound to its exact
             // arguments.
-            let ask_rule = crate::mcp_dispatch::action_rule_verdict(
+            let ask_rule = crate::mcp_dispatch::action_rule_verdict_for_call(
                 &duduclaw_core::agent_toml::load_action_rules(&agent_dir),
                 tool_name,
+                payload.get("arguments").unwrap_or(&Value::Null),
             )
             .is_some_and(|v| v >= duduclaw_core::ActionVerdict::Ask);
             let grant = duduclaw_gateway::approval::action_grant::binding_applies(tool_name, ask_rule)
@@ -647,6 +626,118 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
         }
         // Resolved to a concrete gate above; ConsultJudge cannot reach here.
         ActionGate::ConsultJudge => Ok(()),
+    }
+}
+
+/// P3 action review (`[action_review] mode`, default off) for one call every
+/// other gate let run. `Ok(false)`: run (also `off`, `shadow`, a read/draft
+/// tool, or `allow` under `enforce`); `Ok(true)`: a person must approve
+/// first (`ask`, or no verdict under `enforce` — fail closed); `Err`: the
+/// call is refused (`block` under `enforce`). Every review writes one
+/// `tool_calls.jsonl` row. Structured input only (tool, effect, argument
+/// keys, closed ActionGuard findings, `CONTRACT.toml` `must_not`); argument
+/// values never reach the reviewer.
+pub(crate) async fn run_action_review(
+    home_dir: &Path,
+    agent_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    payload: &Value,
+) -> std::result::Result<bool, String> {
+    use duduclaw_gateway::action_review::{self, ActionReviewMode, ReviewOutcome};
+    if !duduclaw_core::effect_of(tool_name).is_side_effecting() {
+        return Ok(false);
+    }
+    let mode = ActionReviewMode::from_home(home_dir);
+    if mode == ActionReviewMode::Off {
+        return Ok(false);
+    }
+    let input = action_review::ReviewInput::build(tool_name, payload, agent_dir);
+    let verdict = action_review::review(home_dir, agent_dir, &input).await;
+    let result = action_review::outcome(mode, verdict);
+    duduclaw_security::audit::append_tool_call_with_extras(
+        home_dir,
+        agent_id,
+        tool_name,
+        &format!(
+            "action review ({}) → {}",
+            mode.as_str(),
+            action_review::audit_value(verdict)
+        ),
+        result == ReviewOutcome::Run,
+        &[
+            (
+                "action_review",
+                Value::String(action_review::audit_value(verdict).to_string()),
+            ),
+            ("action_review_mode", Value::String(mode.as_str().to_string())),
+        ],
+    );
+    match result {
+        ReviewOutcome::Run => Ok(false),
+        ReviewOutcome::Refuse => Err(format!(
+            "工具「{tool_name}」的呼叫經動作審查（[action_review] enforce）判定會越過此員工的界線，已拒絕執行。"
+        )),
+        ReviewOutcome::AskPerson => Ok(true),
+    }
+}
+
+/// A person's approval for a call the action review sent to them (`ask` or
+/// no verdict under `enforce`), outside the main ActionGuard path. Bound to
+/// the exact call (P7) when [`binding_applies`] says so.
+///
+/// [`binding_applies`]: duduclaw_gateway::approval::action_grant::binding_applies
+async fn approval_after_review(
+    home_dir: &Path,
+    agent_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    payload: Value,
+    workflow: Option<&super::workflow_operation::WorkflowCall>,
+) -> std::result::Result<(), String> {
+    if let Some(workflow) = workflow {
+        return workflow
+            .require_human("action_review_require_approval", &payload)
+            .await;
+    }
+    let subject = ApprovalSubject::for_tool(tool_name);
+    let broker = match duduclaw_gateway::approval::ApprovalBroker::open(home_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "ApprovalBroker unavailable — denying tool call (fail-closed)");
+            return Err(subject.broker_unavailable_message());
+        }
+    };
+    let ask_rule = crate::mcp_dispatch::action_rule_verdict_for_call(
+        &duduclaw_core::agent_toml::load_action_rules(agent_dir),
+        tool_name,
+        payload.get("arguments").unwrap_or(&Value::Null),
+    )
+    .is_some_and(|v| v >= duduclaw_core::ActionVerdict::Ask);
+    let grant = duduclaw_gateway::approval::action_grant::binding_applies(tool_name, ask_rule)
+        .then(|| {
+            duduclaw_gateway::approval::action_grant::ActionGrant::build(
+                agent_id, tool_name, &payload,
+            )
+        });
+    let summary = format!(
+        "工具「{tool_name}」的呼叫經動作審查（[action_review] enforce）要求人工確認，需經管理員核可後才能執行"
+    );
+    match run_approval_bound(
+        &broker,
+        agent_id,
+        subject,
+        &summary,
+        payload,
+        INSTALL_APPROVAL_TTL_SECONDS,
+        INSTALL_APPROVAL_POLL,
+        None,
+        grant.as_ref(),
+    )
+    .await
+    {
+        InstallApprovalOutcome::Proceed => Ok(()),
+        InstallApprovalOutcome::Denied(msg) => Err(msg),
     }
 }
 
@@ -710,14 +801,33 @@ pub(crate) async fn gate_os_situation_dispatch(
         ],
     );
 
+    // P3: a call the situation gate lets run still passes the action review
+    // (default off); `ask` / no verdict under `enforce` sends it to a person.
+    let (decision, asked_by_review) = match decision {
+        sc::SituationDecision::Proceed => {
+            if run_action_review(home_dir, agent_dir, agent_id, tool_name, &payload).await? {
+                (sc::SituationDecision::RequireApproval, true)
+            } else {
+                (sc::SituationDecision::Proceed, false)
+            }
+        }
+        other => (other, false),
+    };
+
     match decision {
         sc::SituationDecision::Proceed => Ok(()),
         sc::SituationDecision::Ask(msg) => Err(msg),
         sc::SituationDecision::RequireApproval => {
-            let summary = format!(
-                "工具「{tool_name}」情境判定為「{}」，需經管理員核可後才能執行（VeriOS 情境分類 ASK 閘）",
-                cr.class.as_str()
-            );
+            let summary = if asked_by_review {
+                format!(
+                    "工具「{tool_name}」的呼叫經動作審查（[action_review] enforce）要求人工確認，需經管理員核可後才能執行"
+                )
+            } else {
+                format!(
+                    "工具「{tool_name}」情境判定為「{}」，需經管理員核可後才能執行（VeriOS 情境分類 ASK 閘）",
+                    cr.class.as_str()
+                )
+            };
             let subject = ApprovalSubject::for_tool(tool_name);
             let broker = match duduclaw_gateway::approval::ApprovalBroker::open(home_dir) {
                 Ok(b) => b,
@@ -726,7 +836,12 @@ pub(crate) async fn gate_os_situation_dispatch(
                     return Err(subject.broker_unavailable_message());
                 }
             };
-            match run_approval(
+            // P7: an OS action approval covers exactly this call
+            // (employee, tool, canonical arguments) and is used once.
+            let grant = duduclaw_gateway::approval::action_grant::ActionGrant::build(
+                agent_id, tool_name, &payload,
+            );
+            match run_approval_bound(
                 &broker,
                 agent_id,
                 subject,
@@ -735,6 +850,7 @@ pub(crate) async fn gate_os_situation_dispatch(
                 sc::SITUATION_APPROVAL_TTL_SECS,
                 INSTALL_APPROVAL_POLL,
                 None,
+                Some(&grant),
             )
             .await
             {

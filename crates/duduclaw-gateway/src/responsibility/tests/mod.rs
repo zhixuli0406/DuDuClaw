@@ -6,6 +6,7 @@
 
 mod control_cases;
 mod driver_cases;
+mod lane_cases;
 mod notify_cases;
 mod round3_answer_cases;
 mod round3_cases;

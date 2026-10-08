@@ -350,6 +350,29 @@ pub(crate) fn apply_capabilities_to_table(
                 "capabilities.computer_use_config.display_height = {v}"
             ));
         }
+        // 2026-10-08 keep-alive / takeover windows (P8). Strict: a present
+        // key must be an integer in range, never silently skipped.
+        for (key, lo, hi) in [
+            (
+                "keep_alive_minutes",
+                0u64,
+                duduclaw_core::types::COMPUTER_USE_MAX_KEEP_ALIVE_MINUTES as u64,
+            ),
+            (
+                "takeover_idle_minutes",
+                1u64,
+                duduclaw_core::types::COMPUTER_USE_MAX_TAKEOVER_IDLE_MINUTES as u64,
+            ),
+        ] {
+            if let Some(raw) = cfg.get(key) {
+                let v = raw
+                    .as_u64()
+                    .filter(|v| (lo..=hi).contains(v))
+                    .ok_or_else(|| format!("{key} must be an integer {lo}-{hi}"))?;
+                sub.insert(key.into(), toml::Value::Integer(v as i64));
+                changes.push(format!("capabilities.computer_use_config.{key} = {v}"));
+            }
+        }
         if let Some(v) = cfg.get("auto_confirm_trusted").and_then(|v| v.as_bool()) {
             sub.insert("auto_confirm_trusted".into(), toml::Value::Boolean(v));
             changes.push(format!(

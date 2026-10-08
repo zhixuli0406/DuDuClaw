@@ -3550,6 +3550,10 @@ export interface ComputerUseConfig {
   display_width?: number;
   display_height?: number;
   auto_confirm_trusted?: boolean;
+  /** Minutes an idle session stays paused before it ends (0 = end at idle, max 240). */
+  keep_alive_minutes?: number;
+  /** Minutes without input after which a dashboard takeover returns control (1–60; 0 on disk = 10). */
+  takeover_idle_minutes?: number;
 }
 
 /** One clause of a `ToolPolicy` rule — an argument match tested with `op`. */
@@ -5251,6 +5255,24 @@ export interface DigestItem {
   id: string;
   title: string;
   completed_at: string | null;
+  /** The `[n]` the channel message shows (0 = dashboard only). */
+  no?: number;
+}
+
+/** P9: one file the employee handed over in the digest window. */
+export interface DigestArtifact {
+  agent_id: string;
+  /** The `/api/files/download?name=` key. */
+  archived_name: string;
+  name: string;
+  task_id: string | null;
+  produced_at: string;
+  no?: number;
+}
+
+/** The `feedback` map key of a delivered file (matches the server's `artifact_item_id`). */
+export function digestArtifactKey(a: Pick<DigestArtifact, 'agent_id' | 'archived_name'>): string {
+  return `artifact:${a.agent_id}/${a.archived_name}`;
 }
 
 export interface DigestAgent {
@@ -5262,6 +5284,8 @@ export interface DigestAgent {
   runs_done: number;
   runs_not_done: number;
   spend_usd: number | null;
+  artifacts?: DigestArtifact[];
+  artifacts_total?: number;
 }
 
 export interface EmployeeDigest {
@@ -5703,6 +5727,16 @@ export const api = {
         task_id: string;
         verdict: DeliverableVerdict;
       }>,
+    feedbackArtifact: (
+      artifact: { agent_id: string; archived_name: string },
+      verdict: DeliverableVerdict,
+      note?: string,
+    ) =>
+      client.call('digest.feedback', {
+        artifact: { agent_id: artifact.agent_id, archived_name: artifact.archived_name },
+        verdict,
+        ...(note ? { note } : {}),
+      }) as Promise<{ item_id: string; verdict: DeliverableVerdict }>,
   },
   /** P5 — standing responsibilities (P2-A backend). Every call is checked
    *  server-side against the caller's binding to the owner employee. */

@@ -64,6 +64,8 @@ pub fn notify_level(source: DecisionSource) -> NotifyLevel {
             NotifyLevel::Act
         }
         DecisionSource::Kickoff | DecisionSource::Autopilot => NotifyLevel::Confirm,
+        // A digest is a report: nothing waits on it.
+        DecisionSource::Digest => NotifyLevel::Fyi,
     }
 }
 
@@ -78,6 +80,7 @@ pub fn notify_type(source: DecisionSource) -> &'static str {
         DecisionSource::Approval => "decision.approval",
         DecisionSource::Install => "decision.install",
         DecisionSource::Autopilot => "decision.autopilot",
+        DecisionSource::Digest => "digest.feedback",
     }
 }
 
@@ -659,6 +662,16 @@ async fn dispatch_inner(
             crate::autopilot_notify::apply_pause(home_dir, channel, channel_user_id, &action.id)
                 .await
         }
+        DecisionSource::Digest => {
+            crate::digest::apply_channel_feedback(
+                home_dir,
+                channel,
+                channel_user_id,
+                &action.id,
+                action.act,
+            )
+            .await
+        }
     }
 }
 
@@ -678,6 +691,9 @@ pub(crate) fn settled_verb(
         (_, DecisionAct::Pause) => DecisionVerb::Paused,
         (_, DecisionAct::Approve) => DecisionVerb::Approved,
         (_, DecisionAct::Takeover) => DecisionVerb::TakenOver,
+        (_, DecisionAct::Up | DecisionAct::Down | DecisionAct::Changes) => {
+            DecisionVerb::FeedbackRecorded
+        }
         (DecisionSource::Install, DecisionAct::Deny) => DecisionVerb::DeclinedInstall,
         (_, DecisionAct::Deny) => DecisionVerb::Denied,
     }
@@ -698,6 +714,7 @@ pub fn reason_prefix(source: DecisionSource) -> &'static str {
         DecisionSource::Approval => "⚠️ 高風險動作需要你同意",
         DecisionSource::Install => "📦 安裝申請",
         DecisionSource::Autopilot => "🔁 自動規則已暫停",
+        DecisionSource::Digest => "🐾 你不在的時候",
     }
 }
 
@@ -1322,6 +1339,19 @@ pub(crate) async fn route_verified_bound_press(
     scope: DecisionAccessScope<'_>,
 ) -> Option<Result<String, String>> {
     let action = crate::decision_action::parse(data)?;
+    if action.source == DecisionSource::Digest {
+        // P9: a digest feedback press passes the same channel access check
+        // as a bound decision (allowed guilds / channels / users, pairing)
+        // before anything is read; the press itself is then authorized
+        // against the presser's verified dashboard account.
+        if context.validate().is_err()
+            || check_trusted_decision_access(ctx, context, scope, data)
+                .await
+                .is_err()
+        {
+            return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into()));
+        }
+    }
     if action.source == DecisionSource::Approval {
         // Same order as the text lane (F5-C, review F4-L6): the channel
         // access check runs before the request row is read, for every

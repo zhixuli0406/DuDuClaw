@@ -165,7 +165,7 @@ const CAP_LIST_KEYS: ReadonlyArray<keyof AgentCapabilities> = [
 
 const COMPUTER_USE_CONFIG_KEYS: ReadonlyArray<keyof ComputerUseConfig> = [
   'allowed_apps', 'blocked_actions', 'max_session_minutes', 'max_actions', 'display_width', 'display_height',
-  'auto_confirm_trusted',
+  'auto_confirm_trusted', 'keep_alive_minutes', 'takeover_idle_minutes',
 ];
 
 /** Dirty paths that touch the admin-only surface (backend refuses + audits
@@ -397,4 +397,11 @@ export function teamRolesShareVendor(roles: Record<AgentTeamRoleKey, TeamRoleFor
     return em !== '' && em === roles.verifier.model.trim();
   }
   return ex === ve;
+}
+
+/** A whole number clamped to `[min, max]` (non-numbers become `min`); the
+ *  server validates the same range and refuses anything outside it. */
+export function clampInt(v: number, min: number, max: number): number {
+  if (!Number.isFinite(v)) return min;
+  return Math.min(max, Math.max(min, Math.round(v)));
 }
