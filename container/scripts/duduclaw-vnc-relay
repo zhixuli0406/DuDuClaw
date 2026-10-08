@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""duduclaw-vnc-relay: one viewer connection to the live-view VNC server.
+
+Contract with the Rust side (crates/duduclaw-gateway/src/
+computer_use_sessions/live_view.rs, `DockerLiveView::open_relay`):
+
+  input     `docker exec -i <container> duduclaw-vnc-relay`, no arguments,
+            as root. Connects to the unix socket /tmp/duduclaw-root/vnc.sock
+            that `duduclaw-vnc start` created (a socket owned by root inside
+            the root-only scratch directory; anything else is refused) and
+            copies bytes stdin -> socket and socket -> stdout until either
+            side closes.
+  exit      0 after a normal close; 1 when the socket is missing, not a
+            socket, not root's, or refuses the connection; 2 for arguments
+            or a non-root caller.
+
+It never parses or logs the stream. The gateway filters the viewer's half
+(RFB messages) before it gets here. Standard library only; the root
+filesystem is read-only.
+"""
+
+import os
+import select
+import socket
+import stat
+import sys
+
+sys.dont_write_bytecode = True
+
+SOCK = "/tmp/duduclaw-root/vnc.sock"
+CHUNK = 64 * 1024
+
+
+def fail(msg, code=1):
+    sys.stderr.write(f"duduclaw-vnc-relay: {msg}\n")
+    sys.stderr.flush()
+    os._exit(code)
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+def main():
+    if len(sys.argv) != 1:
+        fail("usage: duduclaw-vnc-relay (no arguments)", 2)
+    if os.getuid() != 0:
+        fail("must run as root", 2)
+    try:
+        st = os.lstat(SOCK)
+    except OSError:
+        fail("VNC server is not running")
+    if not stat.S_ISSOCK(st.st_mode) or st.st_uid != 0:
+        fail("unexpected VNC socket")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(5)
+    try:
+        sock.connect(SOCK)
+    except OSError:
+        fail("VNC server refused the connection")
+    sock.setblocking(True)
+    sock.settimeout(None)
+    stdin_fd, stdout_fd = 0, 1
+    stdin_open = True
+    try:
+        while True:
+            watch = [stdin_fd, sock] if stdin_open else [sock]
+            ready, _, _ = select.select(watch, [], [])
+            if stdin_open and stdin_fd in ready:
+                data = os.read(stdin_fd, CHUNK)
+                if data:
+                    sock.sendall(data)
+                else:
+                    # The viewer side closed: half-close and drain the rest.
+                    stdin_open = False
+                    sock.shutdown(socket.SHUT_WR)
+            if sock in ready:
+                data = sock.recv(CHUNK)
+                if not data:
+                    break
+                write_all(stdout_fd, data)
+    except (OSError, BrokenPipeError):
+        pass
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    main()

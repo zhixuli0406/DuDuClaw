@@ -1,5 +1,5 @@
 # DuDuClaw Computer Use — L5 Container
-# Virtual display (Xvfb) + window manager + Chromium (kiosk) + optional VNC,
+# Virtual display (Xvfb) + window manager + Chromium (kiosk) + on-demand live-view VNC (unix socket only),
 # driven by the gateway's computer_use_orchestrator through `docker exec`.
 #
 # Contract with the Rust side (crates/duduclaw-gateway/src/computer_use_orchestrator.rs):
@@ -70,8 +70,13 @@ COPY container/scripts/domain-filter.sh /usr/local/bin/domain-filter.sh
 COPY container/scripts/duduclaw-eval-dom /usr/local/bin/duduclaw-eval-dom
 COPY container/scripts/duduclaw-navigate /usr/local/bin/duduclaw-navigate
 COPY container/scripts/duduclaw_cdp.py /usr/local/bin/duduclaw_cdp.py
+# Live view (P8): started on demand by the gateway through `docker exec`;
+# x11vnc listens only on a unix socket in the root-only /tmp/duduclaw-root.
+COPY container/scripts/duduclaw-vnc /usr/local/bin/duduclaw-vnc
+COPY container/scripts/duduclaw-vnc-relay /usr/local/bin/duduclaw-vnc-relay
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/domain-filter.sh \
         /usr/local/bin/duduclaw-eval-dom /usr/local/bin/duduclaw-navigate \
+        /usr/local/bin/duduclaw-vnc /usr/local/bin/duduclaw-vnc-relay \
     && chmod 0644 /usr/local/bin/duduclaw_cdp.py
 
 # Managed Chromium policies (container/scripts/chromium-policy.json):
@@ -99,8 +104,8 @@ RUN chmod 0644 /etc/chromium/policies/managed/duduclaw.json
 RUN mkdir -p /agent /workspace /screenshots && \
     chown sandbox:sandbox /workspace /screenshots
 
-# VNC (only when VNC_ENABLED=true and the port is published)
-EXPOSE 5900
+# No EXPOSE: the live-view VNC server never listens on TCP; the gateway
+# reaches it through `docker exec … duduclaw-vnc-relay` (see duduclaw-vnc).
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
     CMD xdotool getactivewindow || exit 1

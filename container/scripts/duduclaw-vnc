@@ -1,0 +1,115 @@
+#!/bin/bash
+# duduclaw-vnc: start or stop the live-view VNC server of a computer-use
+# container (P8). Run by the gateway only, as root, through `docker exec`:
+#
+#   docker exec -i <container> duduclaw-vnc start viewonly|control
+#       (password on stdin: one line, exactly 8 characters [A-Za-z0-9];
+#        never in argv, never in the environment)
+#   docker exec <container> duduclaw-vnc stop
+#
+# Contract with the Rust side (crates/duduclaw-gateway/src/
+# computer_use_sessions/live_view.rs, `DockerLiveView`):
+#   - x11vnc listens ONLY on the unix socket /tmp/duduclaw-root/vnc.sock,
+#     inside the root-only (0700) scratch directory the entrypoint created,
+#     so the browser's unprivileged `sandbox` user cannot connect to it, and
+#     no TCP port is opened (-rfbport 0; -localhost as a second fence). After
+#     start the script checks /proc/net/tcp{,6} and refuses (stops the
+#     server, exits 1) if anything listens on 5900-5999.
+#   - The gateway reaches the socket only through `duduclaw-vnc-relay`
+#     (`docker exec -i`, stdio <-> socket); nothing is published.
+#   - `viewonly` passes -viewonly (all viewer input ignored). `control`
+#     accepts input; the gateway still forwards only the takeover holder's.
+#   - The password file is written 0600 in the scratch directory and read
+#     and removed by x11vnc itself (-passwdfile rm:...).
+#   - Starting again replaces the running server (existing viewers drop).
+#   - Hardening: -noremote (no remote-control commands), -nocmds (no
+#     external commands), -nosel (no clipboard exchange either way), -shared.
+#   - Exit 0 on success; 1 with a reason on stderr otherwise.
+
+set -euo pipefail
+
+ROOT_TMP=/tmp/duduclaw-root
+SOCK="$ROOT_TMP/vnc.sock"
+PASSFILE="$ROOT_TMP/vnc.pass"
+LOG="$ROOT_TMP/vnc.log"
+
+fail() {
+    echo "duduclaw-vnc: $*" >&2
+    exit 1
+}
+
+[ "$(id -u)" = 0 ] || fail "must run as root"
+if [ ! -d "$ROOT_TMP" ] || [ -L "$ROOT_TMP" ]; then
+    fail "root scratch directory missing"
+fi
+[ "$(stat -c '%u %a' "$ROOT_TMP")" = "0 700" ] || fail "root scratch directory is not root-only"
+
+stop_server() {
+    pkill -x -u root x11vnc 2>/dev/null || true
+    for _ in $(seq 1 50); do
+        pgrep -x -u root x11vnc >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    pkill -9 -x -u root x11vnc 2>/dev/null || true
+    rm -f "$SOCK" "$PASSFILE"
+}
+
+# Any LISTEN socket on a VNC port in this network namespace?
+tcp_listening_vnc() {
+    local f local_addr state port
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "$f" ] || continue
+        while read -r _ local_addr _ state _; do
+            [ "$state" = "0A" ] || continue
+            port=$((16#${local_addr##*:}))
+            if [ "$port" -ge 5900 ] && [ "$port" -le 5999 ]; then
+                return 0
+            fi
+        done < <(tail -n +2 "$f")
+    done
+    return 1
+}
+
+case "${1:-}" in
+    stop)
+        [ "$#" -eq 1 ] || fail "usage: duduclaw-vnc stop"
+        stop_server
+        ;;
+    start)
+        [ "$#" -eq 2 ] || fail "usage: duduclaw-vnc start viewonly|control"
+        case "$2" in
+            viewonly) mode_args=(-viewonly) ;;
+            control) mode_args=() ;;
+            *) fail "usage: duduclaw-vnc start viewonly|control" ;;
+        esac
+        IFS= read -r -t 5 pass || fail "no password on stdin"
+        [[ "$pass" =~ ^[A-Za-z0-9]{8}$ ]] || fail "bad password"
+        stop_server
+        (umask 077 && printf '%s\n' "$pass" >"$PASSFILE")
+        unset pass
+        x11vnc -display :99 -rfbport 0 -unixsock "$SOCK" -localhost -noipv6 \
+            -forever -shared -noremote -nocmds -nosel \
+            -passwdfile "rm:$PASSFILE" "${mode_args[@]}" \
+            -bg -o "$LOG" -q >/dev/null 2>&1 || {
+            stop_server
+            fail "x11vnc failed to start"
+        }
+        for _ in $(seq 1 50); do
+            [ -S "$SOCK" ] && break
+            sleep 0.1
+        done
+        if [ ! -S "$SOCK" ]; then
+            stop_server
+            fail "VNC socket did not appear"
+        fi
+        if tcp_listening_vnc; then
+            stop_server
+            fail "a VNC TCP port is listening; refusing"
+        fi
+        chmod 0600 "$SOCK"
+        rm -f "$PASSFILE"
+        ;;
+    *)
+        fail "usage: duduclaw-vnc start viewonly|control | stop"
+        ;;
+esac

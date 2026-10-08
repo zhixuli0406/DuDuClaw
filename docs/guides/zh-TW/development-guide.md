@@ -224,23 +224,21 @@ docker pull ghcr.io/zhixuli0406/duduclaw-computer-use:v<版本>
 #                    image = "duduclaw-computer-use:latest"
 docker build -f container/Dockerfile.computer-use -t duduclaw-computer-use:latest .
 
-# 手動啟動並開 VNC，觀看虛擬顯示器
-# （範例用本機 tag；拉取的 ghcr 映像用法相同）。
-# 對外開 port 需要網路，所以網域過濾器需要 NET_ADMIN，
-# 而且 ALLOWED_DOMAINS 不能是空的，VNC 的回應封包才放得出去。
-docker run --rm -p 5900:5900 \
-  --cap-add=NET_ADMIN \
-  -e ALLOWED_DOMAINS=example.com \
+# 手動啟動（和 gateway 一樣不給網路），再啟動隨需的 VNC 伺服器觀看。
+# VNC 伺服器只在容器內的 unix socket 監聽；主機上用 socat 把一個本機 port
+# 接到 relay（範例用本機 tag；拉取的 ghcr 映像用法相同）。
+docker run -d --rm --name duduclaw-cu-debug --network=none \
   -e DISPLAY_SIZE=1280x800 \
-  -e VNC_ENABLED=true \
-  -e VNC_PASSWORD=debug123 \
   duduclaw-computer-use:latest
+printf 'Debug123\n' | docker exec -i duduclaw-cu-debug duduclaw-vnc start viewonly
+socat TCP-LISTEN:5900,bind=127.0.0.1,reuseaddr,fork \
+  EXEC:'docker exec -i duduclaw-cu-debug duduclaw-vnc-relay'
 
-# 用 VNC 客戶端連線觀看
+# 用 VNC 客戶端連線觀看（密碼 Debug123）
 # macOS: open vnc://localhost:5900
 ```
 
-映像（約 1.09 GB）以 `debian:trixie-slim` 為基底，內含 Debian 的 `chromium` 套件、Xvfb、視窗管理器 `openbox`、可選的 VNC（`x11vnc`）、`xdotool`、`scrot`、網域過濾器、`xdotool getactivewindow` 健康檢查，以及給 `duduclaw-eval-dom` 輔助程式用的 Python 3（見 3.5 節）。Openbox 與 Chromium 以非特權使用者 `sandbox` 執行；entrypoint 保留 root 只是為了設定 iptables。Chromium 以 kiosk 模式從 0,0 開始鋪滿整個虛擬顯示器，裝置縮放比例固定為 1，所以頁面座標等於截圖像素；它的 DevTools port 只在容器內的 127.0.0.1 監聽。瀏覽器若結束（例如 agent 關掉視窗），entrypoint 會重新啟動它。Chromium 從 `container/scripts/chromium-policy.json` 讀取受管政策（頁面不能存取本地網路或 loopback、沒有無痕或訪客視窗、沒有檔案對話框、列印與下載、彈出視窗與裝置權限被封鎖、`file://`／`chrome://`／`devtools://`／`view-source:`／`javascript://` 被封鎖；完整清單見[瀏覽器自動化](../../features/zh-TW/08-browser-automation.md)）。`DeveloperToolsAvailability` 刻意不設：設了它也會停用輔助程式需要的 loopback DevTools 協定。`duduclaw-navigate` 只從 stdin 讀 URL（`printf 'https://example.com/\n' | docker exec -i <container> duduclaw-navigate`），任何參數都是用法錯誤。截圖寫在 `/tmp/duduclaw-root/screen.png`（由 root 擁有、權限 0700、在瀏覽器啟動前建立的目錄），Chromium 的 log 也在那裡。
+映像（約 1.09 GB）以 `debian:trixie-slim` 為基底，內含 Debian 的 `chromium` 套件、Xvfb、視窗管理器 `openbox`、隨需啟動的 VNC（`x11vnc`，只聽 unix socket，由 `duduclaw-vnc` 啟動）、`xdotool`、`scrot`、網域過濾器、`xdotool getactivewindow` 健康檢查，以及給 `duduclaw-eval-dom` 輔助程式用的 Python 3（見 3.5 節）。Openbox 與 Chromium 以非特權使用者 `sandbox` 執行；entrypoint 保留 root 只是為了設定 iptables。Chromium 以 kiosk 模式從 0,0 開始鋪滿整個虛擬顯示器，裝置縮放比例固定為 1，所以頁面座標等於截圖像素；它的 DevTools port 只在容器內的 127.0.0.1 監聽。瀏覽器若結束（例如 agent 關掉視窗），entrypoint 會重新啟動它。Chromium 從 `container/scripts/chromium-policy.json` 讀取受管政策（頁面不能存取本地網路或 loopback、沒有無痕或訪客視窗、沒有檔案對話框、列印與下載、彈出視窗與裝置權限被封鎖、`file://`／`chrome://`／`devtools://`／`view-source:`／`javascript://` 被封鎖；完整清單見[瀏覽器自動化](../../features/zh-TW/08-browser-automation.md)）。`DeveloperToolsAvailability` 刻意不設：設了它也會停用輔助程式需要的 loopback DevTools 協定。`duduclaw-navigate` 只從 stdin 讀 URL（`printf 'https://example.com/\n' | docker exec -i <container> duduclaw-navigate`），任何參數都是用法錯誤。截圖寫在 `/tmp/duduclaw-root/screen.png`（由 root 擁有、權限 0700、在瀏覽器啟動前建立的目錄），Chromium 的 log 也在那裡。
 
 Session 使用哪個映像：預設是 `ghcr.io/zhixuli0406/duduclaw-computer-use:v<gateway 版本>`，由 `.github/workflows/computer-use-image.yml` 在 git tag `v*`（或手動觸發）時發布。這個 workflow 在原生 runner 上分別建置 `linux/amd64` 與 `linux/arm64`，推送 `:<tag>` 與 `:latest` 之前，先用 gateway 自己的容器參數對每個建置做 smoke test（視窗管理器起來、拍到一張截圖、`duduclaw-eval-dom` 回傳 `[]`）。它從 v1.66.1 之後的第一個 release tag 才開始執行，所以 v1.66.1 以前沒有已發布的映像，`scripts/release.sh verify` 也不會檢查它。唯一的覆寫方式是全域的 `config.toml [computer_use] image = "<ref>"`（可用 digest 參照），沒有逐員工的映像鍵。`[computer_use]` 區段無效時，電腦操作會停用並附上說明，不會退回預設值（`crates/duduclaw-gateway/src/computer_use_image.rs`）。映像永遠不會自動下載：`docker run` 帶 `--pull never`，每個 session 開始前也會先做存在檢查（`docker image inspect`）。只有本機自建 `duduclaw-computer-use:latest`（舊預設值）的機器，必須拉取帶版本號的映像，或設定覆寫鍵。
 
