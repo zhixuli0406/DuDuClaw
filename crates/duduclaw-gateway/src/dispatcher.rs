@@ -76,6 +76,11 @@ struct BusMessage {
     /// P2-B: the sender dropped a half upstream turn identity.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     upstream_unknown: bool,
+    /// Lane of the run that wrote this delegation (`explore` ⇒ the receiving
+    /// run is read-only too, like `message_queue.lane`; any other present
+    /// value is read as explore as well). Absent ⇒ normal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane: Option<String>,
 }
 
 /// Starts the agent dispatcher as a background task.
@@ -803,6 +808,7 @@ async fn poll_and_dispatch(
                         turn_id: msg.turn_id.clone(),
                         session_id: msg.session_id.clone(),
                         upstream_unknown: false,
+                        lane: None,
                     };
                     consumed_without_dispatch += 1;
                     match serde_json::to_string(&err_response) {
@@ -869,6 +875,7 @@ async fn poll_and_dispatch(
             turn_id: msg.turn_id.clone(),
             session_id: msg.session_id.clone(),
             upstream_unknown: false,
+            lane: None,
         };
         match serde_json::to_string(&err_response) {
             Ok(json) => synthetic_responses.push(json),
@@ -1028,7 +1035,17 @@ async fn poll_and_dispatch(
                 .scope(turn_id_for_scope, dispatch_fut);
             let dispatch_fut =
                 crate::memory_provenance::UPSTREAM_UNKNOWN.scope(upstream_unknown, dispatch_fut);
-            let result = dispatch_fut.await;
+            // The delegation's lane (written by a run in the explore lane,
+            // `spawn_agent` / `spawn_ephemeral`): the receiving run stays
+            // read-only too, or is refused when the employee cannot carry
+            // the lane (fail closed, same rule as `message_queue.lane`).
+            let result = match resolve_dispatch_lane(&home, &msg.agent_id, Ok(false), msg.lane.as_deref()) {
+                Ok(lane) => crate::explore_lane::EXPLORE.scope(lane, dispatch_fut).await,
+                Err(reason) => {
+                    warn!(id = %msg.message_id, agent = %msg.agent_id, reason = %reason, "bus queue: explore-lane run refused");
+                    Err(DispatchError::Other(reason))
+                }
+            };
 
             // H19: this turn has concluded — any ephemeral spawn tickets it
             // enqueued while over capacity are now moot (the turn that would
@@ -1211,6 +1228,7 @@ async fn poll_and_dispatch(
                 turn_id: msg.turn_id.clone(),
                 session_id: msg.session_id.clone(),
                 upstream_unknown: false,
+                lane: None,
             };
 
             if let Ok(json) = serde_json::to_string(&response_entry) {
@@ -1318,6 +1336,7 @@ async fn dispatch_to_agent_outcome(
             crate::model_call_probe::set_last_round(
                 crate::runtime::round_task_env().map(|(_, v)| v),
             );
+            crate::model_call_probe::set_last_lane(crate::explore_lane::in_explore());
             return Ok("model-call-probe dry run".to_string());
         }
     }
@@ -1768,7 +1787,9 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
     let mut order: Vec<String> = Vec::new();
 
     for msg in messages {
-        let key = msg.agent_id.clone();
+        // A read-only (lane) delegation is never merged with an ordinary one:
+        // the merged run would take the lane of whichever came first.
+        let key = format!("{}\u{0}{}", msg.agent_id, if msg.lane.is_some() { "L" } else { "" });
         let entry = groups.entry(key.clone()).or_default();
         if entry.is_empty() {
             order.push(key);
@@ -1842,6 +1863,7 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
                 turn_id: first.turn_id.clone(),
                 session_id: first.session_id.clone(),
                 upstream_unknown: first.upstream_unknown,
+                lane: first.lane.clone(),
             });
         }
     }
@@ -3941,6 +3963,67 @@ mod tests {
         );
     }
 
+    /// A bus delegation written by a run in the explore lane carries
+    /// `lane`; the dispatcher runs it in the lane like `message_queue.lane`,
+    /// refuses it for an employee whose runtime cannot carry the lane (no
+    /// model call is made), and never merges it with an ordinary message.
+    #[tokio::test]
+    async fn bus_delegation_lane_is_honoured_and_never_coalesced_away() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        for (name, extra) in [("reader", ""), ("coder", "[runtime]\nprovider = \"gemini\"\n")] {
+            let dir = home.join("agents").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("agent.toml"),
+                format!("[agent]\nname = \"{name}\"\nrole = \"worker\"\nreports_to = \"\"\n{extra}"),
+            )
+            .unwrap();
+        }
+        let line = |id: &str, agent: &str, lane: Option<&str>| {
+            let mut v = serde_json::json!({
+                "type": "agent_message", "message_id": id, "agent_id": agent, "payload": "look",
+                "timestamp": "2026-10-08T00:00:00Z", "delegation_depth": 0,
+            });
+            if let Some(l) = lane {
+                v["lane"] = serde_json::json!(l);
+            }
+            v.to_string()
+        };
+        // Coalescing keeps the two lanes apart.
+        let a: BusMessage = serde_json::from_str(&line("m1", "reader", Some("explore"))).unwrap();
+        let b: BusMessage = serde_json::from_str(&line("m2", "reader", None)).unwrap();
+        let c: BusMessage = serde_json::from_str(&line("m3", "reader", Some("explore"))).unwrap();
+        let merged = coalesce_messages(vec![a.clone(), b.clone(), c]);
+        assert_eq!(merged.len(), 2, "lane and ordinary messages stay separate");
+        assert!(merged.iter().any(|m| m.lane.is_some() && m.payload.contains("[Message 2]")));
+        assert!(merged.iter().any(|m| m.lane.is_none() && m.message_id == "m2"));
+        assert!(serde_json::to_string(&b).unwrap().find("lane").is_none());
+
+        crate::model_call_probe::set_dry_run(true);
+        let queue_path = home.join("bus_queue.jsonl");
+        let registry = Arc::new(RwLock::new(AgentRegistry::new(home.join("agents"))));
+        let mut answered = Vec::new();
+        for (id, agent, lane, expect_call, expect_lane) in [
+            ("l1", "reader", Some("explore"), true, Some(true)),
+            ("l3", "coder", None, true, Some(false)),
+            ("l2", "coder", Some("explore"), false, None),
+        ] {
+            std::fs::write(&queue_path, format!("{}\n", line(id, agent, lane))).unwrap();
+            let before = crate::model_call_probe::calls();
+            poll_and_dispatch(&home, &registry, None, None).await.unwrap();
+            let called = crate::model_call_probe::calls() - before;
+            assert_eq!(called, usize::from(expect_call), "{id}: model call made = {expect_call}");
+            if expect_call {
+                assert_eq!(crate::model_call_probe::last_lane(), expect_lane, "{id}: lane flag");
+            }
+            let content = std::fs::read_to_string(&queue_path).unwrap();
+            answered.push(content.contains(&format!("\"in_reply_to\":\"{id}\"")));
+        }
+        crate::model_call_probe::set_dry_run(false);
+        assert_eq!(answered, vec![true, true, true], "each is answered, the refused one with a failure reply");
+    }
+
     /// `[delegation] policy = "open"` is the escape hatch: the same forged line
     /// passes the gate. Stops before the spawn by asserting on the *reason* the
     /// gate returns rather than running the dispatcher (which would launch a
@@ -4077,6 +4160,7 @@ mod tests {
             turn_id: None,
             session_id: None,
             upstream_unknown: false,
+            lane: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         // None fields with skip_serializing_if should be absent
@@ -4589,6 +4673,7 @@ mod tests {
                 turn_id: None,
                 session_id: None,
                 upstream_unknown: false,
+                lane: None,
             },
             BusMessage {
                 msg_type: "agent_message".to_string(),
@@ -4606,6 +4691,7 @@ mod tests {
                 turn_id: None,
                 session_id: None,
                 upstream_unknown: false,
+                lane: None,
             },
         ];
         let coalesced = coalesce_messages(msgs);
@@ -5458,15 +5544,16 @@ bot_token = "{token}"
             "[agent]\nname = \"compat\"\n[runtime]\nprovider = \"openai-compat\"\n",
         );
         write("codex", "[agent]\nname = \"codex\"\n[runtime]\nprovider = \"codex\"\n");
+        write("gemini", "[agent]\nname = \"gemini\"\n[runtime]\nprovider = \"gemini\"\n");
         write(
             "boxed",
             "[agent]\nname = \"boxed\"\n[container]\nsandbox_enabled = true\n",
         );
 
         // Neither source ⇒ normal lane, whatever the runtime.
-        assert_eq!(resolve_dispatch_lane(home, "codex", Ok(false), None), Ok(false));
+        assert_eq!(resolve_dispatch_lane(home, "gemini", Ok(false), None), Ok(false));
         // Each source alone puts a supported runtime in the lane.
-        for agent in ["claude", "compat"] {
+        for agent in ["claude", "compat", "codex"] {
             assert_eq!(resolve_dispatch_lane(home, agent, Ok(true), None), Ok(true));
             assert_eq!(
                 resolve_dispatch_lane(home, agent, Ok(false), Some("explore")),
@@ -5474,7 +5561,7 @@ bot_token = "{token}"
             );
         }
         // Each source refuses an unsupported runtime and a sandboxed employee.
-        for agent in ["codex", "boxed"] {
+        for agent in ["gemini", "boxed"] {
             for (resp, lane) in [(Ok(true), None), (Ok(false), Some("explore"))] {
                 let err = resolve_dispatch_lane(home, agent, resp, lane).unwrap_err();
                 assert!(err.starts_with("explore_lane_unsupported"), "{agent}: {err}");
@@ -5491,7 +5578,7 @@ bot_token = "{token}"
                     (
                         crate::explore_lane::in_explore(),
                         crate::explore_lane::lane_env().is_some(),
-                        crate::explore_lane::refuse_unsupported_runtime("codex").is_err(),
+                        crate::explore_lane::refuse_unsupported_runtime("gemini").is_err(),
                     )
                 })
                 .await;

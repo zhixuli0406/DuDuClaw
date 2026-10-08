@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { api, type McpRemoteAuth, type McpRemoteServerStatus } from '@/lib/api';
+import { api, type McpRegistryHeader, type McpRemoteAuth, type McpRemoteServerStatus } from '@/lib/api';
 import { openExternal } from '@/lib/external-link';
 import { toast } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
@@ -73,6 +73,39 @@ export interface RemoteConnectInitial {
   provider?: string;
   thirdParty?: boolean;
   docsUrl?: string;
+  /** Headers a registry remote declares: one field each (secret ones masked). */
+  declaredHeaders?: ReadonlyArray<McpRegistryHeader>;
+}
+
+/**
+ * Merge the declared-header fields with the free-text box. Declared values
+ * win over a same-named line; empty optional fields are left out. `null`
+ * when the free text is malformed.
+ */
+export function mergeDeclaredHeaders(
+  declared: ReadonlyArray<McpRegistryHeader>,
+  values: Record<string, string>,
+  freeText: string,
+): Record<string, string> | null {
+  const extra = freeText.trim() === '' ? {} : parseHeaderLines(freeText);
+  if (extra === null) return null;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(extra)) {
+    if (!declared.some((d) => d.name.toLowerCase() === k.toLowerCase())) out[k] = v;
+  }
+  for (const d of declared) {
+    const v = (values[d.name] ?? '').trim();
+    if (v !== '') out[d.name] = v;
+  }
+  return out;
+}
+
+/** Declared required headers still empty. */
+export function missingDeclaredHeaders(
+  declared: ReadonlyArray<McpRegistryHeader>,
+  values: Record<string, string>,
+): string[] {
+  return declared.filter((d) => d.required && (values[d.name] ?? '').trim() === '').map((d) => d.name);
 }
 
 /**
@@ -103,6 +136,8 @@ export function RemoteConnectDialog({
   const [clientSecret, setClientSecret] = useState('');
   // Empty = keep the headers already stored for this server.
   const [headerText, setHeaderText] = useState('');
+  const [declaredValues, setDeclaredValues] = useState<Record<string, string>>({});
+  const declared = initial.declaredHeaders ?? [];
   const [serverStream, setServerStream] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -129,6 +164,7 @@ export function RemoteConnectDialog({
     setClientId('');
     setClientSecret('');
     setHeaderText('');
+    setDeclaredValues({});
     setServerStream(false);
     setError(null);
     setAuthorizeUrl(null);
@@ -142,13 +178,19 @@ export function RemoteConnectDialog({
     stopPolling();
     setBearer('');
     setClientSecret('');
+    setDeclaredValues({});
     onClose();
   };
 
   const nameOk = isValidServerName(name);
   const urlNeeded = !initial.locked;
   const canSubmit =
-    !busy && agentId !== '' && nameOk && (!urlNeeded || url.trim() !== '') && (auth !== 'bearer' || bearer.trim() !== '');
+    !busy &&
+    agentId !== '' &&
+    nameOk &&
+    (!urlNeeded || url.trim() !== '') &&
+    (auth !== 'bearer' || bearer.trim() !== '') &&
+    missingDeclaredHeaders(declared, declaredValues).length === 0;
 
   const waitForCallback = (expiresInSec: number, startedAt: number) => {
     stopPolling();
@@ -179,8 +221,10 @@ export function RemoteConnectDialog({
     setBusy(true);
     setError(null);
     const startedAt = Date.now();
-    const headers = headerText.trim() === '' ? null : parseHeaderLines(headerText);
-    if (headerText.trim() !== '' && headers === null) {
+    const merged = mergeDeclaredHeaders(declared, declaredValues, headerText);
+    // Nothing typed anywhere ⇒ keep the headers already stored.
+    const headers = merged !== null && Object.keys(merged).length === 0 ? null : merged;
+    if (merged === null) {
       setError(intl.formatMessage({ id: 'mcp.remote.headersInvalid' }));
       setBusy(false);
       return;
@@ -201,6 +245,7 @@ export function RemoteConnectDialog({
       setBearer('');
       setClientSecret('');
       setHeaderText('');
+      setDeclaredValues({});
       if (res.status === 'connected') {
         toast.success(intl.formatMessage({ id: 'mcp.remote.connected' }, { server: name }));
         onConnected?.(agentId, name);
@@ -385,6 +430,32 @@ export function RemoteConnectDialog({
                   value={bearer}
                   onChange={(e) => setBearer(e.target.value)}
                 />
+              </div>
+            )}
+            {declared.length > 0 && (
+              <div className="space-y-2" role="group" aria-label={intl.formatMessage({ id: 'mcp.remote.declaredHeaders' })}>
+                <span className="text-xs font-medium text-muted-foreground">
+                  {intl.formatMessage({ id: 'mcp.remote.declaredHeaders' })}
+                </span>
+                {declared.map((h) => (
+                  <div key={h.name} className="space-y-1">
+                    <label className="text-xs font-mono text-muted-foreground" htmlFor={`remote-hdr-${h.name}`}>
+                      {h.name}
+                      {h.required ? ' *' : ''}
+                    </label>
+                    <Input
+                      id={`remote-hdr-${h.name}`}
+                      type={h.secret ? 'password' : 'text'}
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={declaredValues[h.name] ?? ''}
+                      onChange={(e) => setDeclaredValues((prev) => ({ ...prev, [h.name]: e.target.value }))}
+                      aria-required={h.required}
+                    />
+                    {h.description && <p className="text-xs text-muted-foreground">{h.description}</p>}
+                  </div>
+                ))}
+                <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'mcp.remote.declaredHeadersHelp' })}</p>
               </div>
             )}
             {auth === 'oauth' && (

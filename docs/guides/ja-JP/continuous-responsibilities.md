@@ -222,7 +222,8 @@ v1.70.0 の次のリリースから、すでに変わった状態に対して出
 | Claude CLI | 起動時に `DUDUCLAW_LANE=explore`（継承した DuDuClaw MCP サーバーは `read`／`draft` ツールだけを一覧・実行）、`--tools` は `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`（`denied_tools` を除く）だけ、`--allowedTools` は DuDuClaw MCP ツールとそれらの組み込みツールだけ（従業員自身の許可リストより広くならず、`.mcp.json` の他のサーバーのツールは自動承認されません）。`.mcp.json` の他の stdio サーバーは制御付きプロキシを通り、`read` ツールだけを一覧します |
 | OpenAI 互換ランタイム | 組み込みツールなし。DuDuClaw MCP 子プロセスに `DUDUCLAW_LANE=explore` が渡ります。lane 内では `agent.toml [mcp.external]` のサーバーをマウントせず、このランタイムは `.mcp.json` のサーバーを起動しません |
 | MoA モデル、`inference_mode = "local"` | 拒否（`explore_lane_unsupported`）。lane 内ではハイブリッドのローカル振り分けを使いません |
-| Codex、Gemini CLI、Antigravity、Grok、汎用 CLI | 拒否：そのラウンドはディスパッチ前に失敗し（`explore_lane_unsupported`）、フェイルオーバーで到達した場合に備えて各ランタイムの `execute` にも同じ拒否があります |
+| Codex | 従業員自身の権限レベルにかかわらず `-s read-only` と `approval_policy=never` で実行（書き込みとネットワークを遮断し、設定ファイルの許可リストを無視する OS レベルのサンドボックス）。DuDuClaw MCP サーバーは `DUDUCLAW_LANE=explore` 付きで登録し、サードパーティサーバーは追加しません。Codex 0.156.1 は `-s read-only` ではすべての MCP 呼び出しを拒否するため、呼び出せるツールはありません（2026-09-24 に 0.156.1 で確認、今回は再実行していません） |
+| Gemini CLI、Antigravity、Grok、汎用 CLI | 拒否：そのラウンドはディスパッチ前に失敗し（`explore_lane_unsupported`）、フェイルオーバーで到達した場合に備えて各ランタイムの `execute` にも同じ拒否があります。Antigravity には読み取り専用モードがありません（`agy --sandbox` はターミナルを制限するだけで、ユーザーレベルの `permissions.allow` は同じ OS ユーザーのすべての従業員で共有されます）。Gemini CLI、Grok、汎用 CLI には読み取り専用と示せる仕組みがありません |
 | タスクサンドボックス（`[container] sandbox_enabled`） | ディスパッチ前に拒否（サンドボックスでは従業員がシェルを使えるため） |
 
 拒否されたラウンドは不成功の実行として数えられ、連続失敗でいずれ継続タスクは一時停止します。lane を読み取れない場合もそのラウンドは失敗します（`explore_lane_unreadable`）。属する実行の lane を読み取れないときは、heartbeat が起こすサブタスクも同様に失敗します。実際のゲートウェイではまだ動かしていません。

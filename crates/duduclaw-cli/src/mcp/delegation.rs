@@ -117,34 +117,69 @@ pub(crate) async fn send_to_agent_with_ctx(
                 missing,
             );
         }
+        // A run in the explore lane hands read-only work on (`lane`); the
+        // legacy-schema fallback below cannot carry it, so it is not used.
+        let lane = duduclaw_core::ProcessLane::current().delegation_stamp();
         tokio::task::spawn_blocking(move || -> bool {
             let Ok(conn) = rusqlite::Connection::open(&db_path) else {
                 return false;
             };
             let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
-            let inserted = conn.execute(
-                "INSERT OR IGNORE INTO message_queue \
-                 (id, sender, target, payload, status, retry_count, delegation_depth, \
-                  origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id, \
-                  upstream_unknown) \
-                 VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                rusqlite::params![
-                    msg_id_cl,
-                    caller_cl,
-                    target_cl,
-                    prompt_cl,
-                    outgoing_depth,
-                    origin_cl,
-                    caller_cl,
-                    ts_now,
-                    reply_channel,
-                    trust_turn_id,
-                    trust_session_id,
-                    upstream_dropped,
-                ],
-            );
+            if lane.is_some() {
+                // Same column the gateway adds; ignore "duplicate column".
+                let _ = conn.execute("ALTER TABLE message_queue ADD COLUMN lane TEXT", []);
+            }
+            let inserted = if lane.is_some() {
+                conn.execute(
+                    "INSERT OR IGNORE INTO message_queue \
+                     (id, sender, target, payload, status, retry_count, delegation_depth, \
+                      origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id, \
+                      upstream_unknown, lane) \
+                     VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    rusqlite::params![
+                        msg_id_cl,
+                        caller_cl,
+                        target_cl,
+                        prompt_cl,
+                        outgoing_depth,
+                        origin_cl,
+                        caller_cl,
+                        ts_now,
+                        reply_channel,
+                        trust_turn_id,
+                        trust_session_id,
+                        upstream_dropped,
+                        lane,
+                    ],
+                )
+            } else {
+                conn.execute(
+                    "INSERT OR IGNORE INTO message_queue \
+                     (id, sender, target, payload, status, retry_count, delegation_depth, \
+                      origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id, \
+                      upstream_unknown) \
+                     VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    rusqlite::params![
+                        msg_id_cl,
+                        caller_cl,
+                        target_cl,
+                        prompt_cl,
+                        outgoing_depth,
+                        origin_cl,
+                        caller_cl,
+                        ts_now,
+                        reply_channel,
+                        trust_turn_id,
+                        trust_session_id,
+                        upstream_dropped,
+                    ],
+                )
+            };
             if let Ok(rows) = inserted {
                 return rows > 0;
+            }
+            if lane.is_some() {
+                return false;
             }
             // Legacy schema fallback (pre-v1.8.16 — no reply_channel,
             // turn_id, session_id columns). Gateway migrates on next start.

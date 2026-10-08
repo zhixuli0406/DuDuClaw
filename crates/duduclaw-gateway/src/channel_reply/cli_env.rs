@@ -232,11 +232,14 @@ pub(super) async fn spawn_claude_cli_with_env(
             // `None` (redaction off / nothing to proxy) ⇒ byte-identical.
             // In the explore lane third-party servers are proxied too, so
             // they list and run only read tools (`crate::explore_lane`).
+            // A gate that is needed but cannot be built refuses the spawn
+            // (2026-10-08 close-out) instead of handing the CLI the ungated
+            // file.
             _mcp_proxy_guard = crate::redaction_proxy::maybe_proxy_mcp_config_in_lane(
                 home_dir,
                 &mcp_json,
                 crate::explore_lane::in_explore(),
-            );
+            )?;
             match _mcp_proxy_guard.as_ref() {
                 Some(proxied) => cmd.args(["--mcp-config", &proxied.to_string_lossy()]),
                 None => cmd.args(["--mcp-config", &mcp_json.to_string_lossy()]),

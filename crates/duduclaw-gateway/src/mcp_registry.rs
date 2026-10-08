@@ -49,10 +49,14 @@ pub struct RegistryHit {
     pub required_env: Vec<EnvVarInfo>,
     pub installable: bool,
     /// Why not installable (code): `no_supported_transport`,
-    /// `sse_remote_only`, `custom_headers`, `deprecated`, `deleted`.
+    /// `sse_remote_only`, `custom_headers` (a required header DuDuClaw
+    /// cannot send, e.g. `Cookie`), `deprecated`, `deleted`.
     pub reason: Option<String>,
     /// The install will create a remote connection that must be signed in.
     pub install_is_remote: bool,
+    /// Headers the first supported remote declares (not `Authorization`),
+    /// asked for in the connect dialog.
+    pub remote_headers: Vec<HeaderInfo>,
 }
 
 /// One declared environment variable.
@@ -96,19 +100,52 @@ pub fn remote_kind(remote: &Value) -> String {
     if t.is_empty() { "streamable-http".into() } else { t.to_ascii_lowercase() }
 }
 
-/// Whether a remote declares headers other than `Authorization`, which the
-/// bridge cannot send (it supports none / bearer / OAuth only).
-fn custom_required_headers(remote: &Value) -> bool {
+/// One header a remote declares (other than `Authorization`), which the
+/// connect dialog asks for and the bridge sends (2026-10-08 close-out; the
+/// value is stored encrypted with the connection like any custom header).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct HeaderInfo {
+    pub name: String,
+    pub description: String,
+    pub required: bool,
+    pub secret: bool,
+}
+
+/// The declared non-`Authorization` headers of a remote, in order.
+fn declared_headers(remote: &Value) -> Vec<&Value> {
     remote
         .get("headers")
         .and_then(|h| h.as_array())
-        .is_some_and(|hs| {
-            hs.iter().any(|h| {
-                let name = s(h, "name");
-                !name.eq_ignore_ascii_case("authorization")
-                    && h.get("isRequired").and_then(|v| v.as_bool()).unwrap_or(false)
-            })
+        .map(|hs| hs.iter().filter(|h| !s(h, "name").eq_ignore_ascii_case("authorization")).collect())
+        .unwrap_or_default()
+}
+
+/// Whether a remote requires a header DuDuClaw cannot send (a reserved or
+/// malformed name such as `Cookie` or `Host`), or more than
+/// `store::MAX_CUSTOM_HEADERS` of them.
+fn unsendable_required_headers(remote: &Value) -> bool {
+    let hs = declared_headers(remote);
+    hs.len() > crate::remote_mcp::store::MAX_CUSTOM_HEADERS
+        || hs.iter().any(|h| {
+            h.get("isRequired").and_then(|v| v.as_bool()).unwrap_or(false)
+                && !crate::remote_mcp::store::custom_header_name_allowed(s(h, "name"))
         })
+}
+
+/// The headers of `remote` the connect dialog should ask for: sendable
+/// declared names only (an optional unsendable one is left out).
+pub fn remote_header_prompts(remote: &Value) -> Vec<HeaderInfo> {
+    declared_headers(remote)
+        .into_iter()
+        .filter(|h| crate::remote_mcp::store::custom_header_name_allowed(s(h, "name")))
+        .take(crate::remote_mcp::store::MAX_CUSTOM_HEADERS)
+        .map(|h| HeaderInfo {
+            name: s(h, "name").to_string(),
+            description: clean(s(h, "description"), 200),
+            required: h.get("isRequired").and_then(|v| v.as_bool()).unwrap_or(false),
+            secret: h.get("isSecret").and_then(|v| v.as_bool()).unwrap_or(false),
+        })
+        .collect()
 }
 
 fn needs_bearer(remote: &Value) -> bool {
@@ -123,7 +160,7 @@ pub fn remote_supported(remote: &Value) -> bool {
     let kind = remote_kind(remote);
     (kind == "streamable-http" || kind == "streamable_http" || kind == "http")
         && !s(remote, "url").is_empty()
-        && !custom_required_headers(remote)
+        && !unsendable_required_headers(remote)
 }
 
 /// Declared env vars of a package.
@@ -185,7 +222,7 @@ pub fn normalize_server(server: &Value, meta: Option<&Value>) -> RegistryHit {
         Some(status.clone())
     } else if pkg.is_some() || remote_ok {
         None
-    } else if !remotes.is_empty() && remotes.iter().any(|r| custom_required_headers(r)) {
+    } else if !remotes.is_empty() && remotes.iter().any(|r| unsendable_required_headers(r)) {
         Some("custom_headers".into())
     } else if !remotes.is_empty() && remote_kinds.iter().all(|k| k == "sse") {
         Some("sse_remote_only".into())
@@ -211,6 +248,11 @@ pub fn normalize_server(server: &Value, meta: Option<&Value>) -> RegistryHit {
         installable: reason.is_none(),
         reason,
         install_is_remote: pkg.is_none() && remote_ok,
+        remote_headers: remotes
+            .iter()
+            .find(|r| remote_supported(r))
+            .map(|r| remote_header_prompts(r))
+            .unwrap_or_default(),
     }
 }
 
@@ -451,9 +493,32 @@ mod tests {
     fn unsupported_shapes_carry_a_reason() {
         let sse = json!({"name": "a.b/c", "remotes": [{"type": "sse", "url": "https://x.example/sse"}]});
         assert_eq!(normalize_server(&sse, None).reason.as_deref(), Some("sse_remote_only"));
+        // Declared custom headers are installable since 2026-10-08: the
+        // connect dialog asks for each one.
         let hdr = json!({"name": "a.b/c", "remotes": [{"type": "streamable-http", "url": "https://x.example/mcp",
-            "headers": [{"name": "X-API-Key", "isRequired": true}]}]});
-        assert_eq!(normalize_server(&hdr, None).reason.as_deref(), Some("custom_headers"));
+            "headers": [
+                {"name": "X-API-Key", "isRequired": true, "isSecret": true, "description": "Your key\u{0007}"},
+                {"name": "X-Region", "isRequired": false},
+                {"name": "Authorization", "isRequired": true}
+            ]}]});
+        let h = normalize_server(&hdr, None);
+        assert!(h.installable && h.install_is_remote, "{h:?}");
+        assert_eq!(
+            h.remote_headers,
+            vec![
+                HeaderInfo { name: "X-API-Key".into(), description: "Your key".into(), required: true, secret: true },
+                HeaderInfo { name: "X-Region".into(), description: String::new(), required: false, secret: false },
+            ]
+        );
+        // A required header DuDuClaw cannot send stays not installable.
+        let cookie = json!({"name": "a.b/c", "remotes": [{"type": "streamable-http", "url": "https://x.example/mcp",
+            "headers": [{"name": "Cookie", "isRequired": true}]}]});
+        assert_eq!(normalize_server(&cookie, None).reason.as_deref(), Some("custom_headers"));
+        // An optional one is simply not asked for.
+        let opt = json!({"name": "a.b/c", "remotes": [{"type": "streamable-http", "url": "https://x.example/mcp",
+            "headers": [{"name": "Cookie", "isRequired": false}]}]});
+        let h = normalize_server(&opt, None);
+        assert!(h.installable && h.remote_headers.is_empty());
         let bearer = json!({"name": "a.b/c", "remotes": [{"type": "streamable-http", "url": "https://x.example/mcp",
             "headers": [{"name": "Authorization", "isRequired": true, "value": "Bearer {k}"}]}]});
         let h = normalize_server(&bearer, None);

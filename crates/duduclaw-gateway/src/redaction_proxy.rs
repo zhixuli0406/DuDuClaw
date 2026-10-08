@@ -40,7 +40,7 @@ use duduclaw_redaction::{EgressDecision, RedactionManager};
 /// `duduclaw_cli::mcp_proxy::PROXY_UPSTREAM_ENV_VAR`** (checked by
 /// `proxy_env_var_name_is_the_documented_contract` in `duduclaw-cli`).
 pub use duduclaw_core::mcp_proxy_rewrite::{PROXY_CARRY_ENV, PROXY_UPSTREAM_ENV_VAR};
-use duduclaw_core::mcp_proxy_rewrite::{ProxyPurpose, rewrite_mcp_config_for_proxy_with};
+use duduclaw_core::mcp_proxy_rewrite::{ProxyPurpose, rewrite_mcp_config_for_gate, rewrite_mcp_config_for_proxy_with};
 
 /// Placeholder substituted for a tool result the pipeline could not redact.
 /// Mirrors `duduclaw_cli::mcp_redaction::REDACTION_FAILED_PLACEHOLDER`.
@@ -160,7 +160,7 @@ pub fn data_file_guard_env_for_spawn(home_dir: &Path) -> Option<String> {
 
 /// Produce the `--mcp-config` path this spawn should use.
 ///
-/// `None` ⇒ use the agent's `.mcp.json` unchanged (neither redaction nor the
+/// `Ok(None)` ⇒ use the agent's `.mcp.json` unchanged (neither redaction nor the
 /// third-party tool gate needs the proxy, no `.mcp.json`, a config we cannot
 /// read/parse, or a config with nothing to proxy). `Some(temp)` ⇒ pass
 /// `temp`'s path; the returned [`tempfile::TempPath`] deletes the file when
@@ -169,7 +169,10 @@ pub fn data_file_guard_env_for_spawn(home_dir: &Path) -> Option<String> {
 /// spawn sites.
 ///
 /// Same as [`maybe_proxy_mcp_config_in_lane`] outside the explore lane.
-pub fn maybe_proxy_mcp_config(home_dir: &Path, mcp_json: &Path) -> Option<tempfile::TempPath> {
+pub fn maybe_proxy_mcp_config(
+    home_dir: &Path,
+    mcp_json: &Path,
+) -> Result<Option<tempfile::TempPath>, String> {
     maybe_proxy_mcp_config_in_lane(home_dir, mcp_json, false)
 }
 
@@ -180,37 +183,91 @@ pub fn maybe_proxy_mcp_config(home_dir: &Path, mcp_json: &Path) -> Option<tempfi
 /// stdio server, remote bridges included) or when the third-party tool gate
 /// needs it (2026-10-08: the employee has `[capabilities] action_rules`, or
 /// `explore_lane`; remote bridges are left alone because they gate
-/// themselves). The employee directory is the `.mcp.json`'s parent.
+/// themselves; direct `url` / `type` entries are removed and audited
+/// `third_party_remote_entry_dropped`, see
+/// `duduclaw_core::mcp_proxy_rewrite::rewrite_mcp_config_for_gate`). The
+/// employee directory is the `.mcp.json`'s parent.
 ///
-/// Known limit: if the temp file cannot be written the original file is
-/// used (logged), so the gate does not reach stdio servers for that spawn.
+/// `Err` (2026-10-08 close-out, fail closed): the gate is needed and the
+/// gated copy cannot be produced (unreadable or malformed `.mcp.json`, no
+/// path to this binary, temp file not written). The caller must refuse the
+/// spawn; the message carries `mcp_spawn_gate::SPAWN_GATE_ERROR_PREFIX` and
+/// an audit row `third_party_gate_config_unavailable` is written. When only
+/// redaction asked for the proxy, the old fallback stays: `Ok(None)` (use
+/// the original file, logged).
 pub fn maybe_proxy_mcp_config_in_lane(
     home_dir: &Path,
     mcp_json: &Path,
     explore_lane: bool,
-) -> Option<tempfile::TempPath> {
+) -> Result<Option<tempfile::TempPath>, String> {
+    let agent_dir = mcp_json.parent();
     let purpose = ProxyPurpose {
         redaction: redaction_active_for_spawn(home_dir),
-        tool_gate: mcp_json
-            .parent()
+        tool_gate: agent_dir
             .is_some_and(|dir| duduclaw_core::agent_toml::third_party_gate_needed(dir, explore_lane)),
     };
     if purpose.none() {
-        return None;
+        return Ok(None);
     }
-    let self_exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "mcp-proxy: current_exe() failed — external MCP servers stay unproxied");
-            return None;
+    let agent_id = agent_dir
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let produced = std::env::current_exe()
+        .map_err(|e| format!("cannot locate the duduclaw binary: {e}"))
+        .and_then(|exe| write_gated_mcp_config(mcp_json, &exe, purpose));
+    match produced {
+        Ok((guard, dropped)) => {
+            for server in &dropped {
+                audit_spawn_config(
+                    home_dir,
+                    "third_party_remote_entry_dropped",
+                    &agent_id,
+                    serde_json::json!({
+                        "server": server,
+                        "explore_lane": explore_lane,
+                        "fix": "connect it with mcp.remote_connect so it runs through the bridge",
+                    }),
+                );
+            }
+            Ok(guard)
         }
-    };
-    write_proxy_mcp_config_for(mcp_json, &self_exe, purpose)
+        Err(e) if purpose.tool_gate => {
+            warn!(agent = %agent_id, error = %e, "third-party tool gate: gated .mcp.json unavailable — refusing the spawn");
+            audit_spawn_config(
+                home_dir,
+                "third_party_gate_config_unavailable",
+                &agent_id,
+                serde_json::json!({ "error": duduclaw_core::truncate_bytes(&e, 300), "explore_lane": explore_lane }),
+            );
+            Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+                "這次工作需要過濾第三方 MCP 工具，但無法產生過濾後的設定（{}），所以沒有啟動。",
+                duduclaw_core::truncate_bytes(&e, 200)
+            )))
+        }
+        Err(e) => {
+            warn!(agent = %agent_id, error = %e, "mcp-proxy: gated copy unavailable — external MCP servers stay unproxied for this spawn");
+            Ok(None)
+        }
+    }
+}
+
+fn audit_spawn_config(home_dir: &Path, event: &str, agent_id: &str, details: Value) {
+    duduclaw_security::audit::append_audit_event(
+        home_dir,
+        &duduclaw_security::audit::AuditEvent::new(
+            event,
+            agent_id,
+            duduclaw_security::audit::Severity::Warning,
+            details,
+        ),
+    );
 }
 
 /// The IO half of [`maybe_proxy_mcp_config`] for redaction, split out so the
 /// rewrite can be exercised against a real file without touching process
-/// state.
+/// state. Any failure ⇒ `None` (the redaction-only fallback).
 pub fn write_proxy_mcp_config(mcp_json: &Path, self_exe: &Path) -> Option<tempfile::TempPath> {
     write_proxy_mcp_config_for(
         mcp_json,
@@ -219,44 +276,51 @@ pub fn write_proxy_mcp_config(mcp_json: &Path, self_exe: &Path) -> Option<tempfi
     )
 }
 
-/// [`write_proxy_mcp_config`] for any [`ProxyPurpose`].
+/// [`write_proxy_mcp_config`] for any [`ProxyPurpose`]; failures ⇒ `None`.
 pub fn write_proxy_mcp_config_for(
     mcp_json: &Path,
     self_exe: &Path,
     purpose: ProxyPurpose,
 ) -> Option<tempfile::TempPath> {
-    let raw = std::fs::read_to_string(mcp_json)
-        .map_err(|e| warn!(path = %mcp_json.display(), error = %e, "mcp-proxy: unreadable .mcp.json"))
-        .ok()?;
-    let parsed: Value = serde_json::from_str(&raw)
-        .map_err(|e| warn!(path = %mcp_json.display(), error = %e, "mcp-proxy: malformed .mcp.json"))
-        .ok()?;
+    write_gated_mcp_config(mcp_json, self_exe, purpose)
+        .map_err(|e| warn!(path = %mcp_json.display(), error = %e, "mcp-proxy: gated copy unavailable"))
+        .ok()
+        .and_then(|(guard, _)| guard)
+}
 
-    let rewritten = rewrite_mcp_config_for_proxy_with(&parsed, self_exe, purpose);
-    if rewritten == parsed {
+/// Produce the rewritten temp config. `Ok((None, _))` ⇒ nothing changed;
+/// the second half lists direct remote entries removed by the gate.
+pub fn write_gated_mcp_config(
+    mcp_json: &Path,
+    self_exe: &Path,
+    purpose: ProxyPurpose,
+) -> Result<(Option<tempfile::TempPath>, Vec<String>), String> {
+    let raw = std::fs::read_to_string(mcp_json).map_err(|e| format!("unreadable .mcp.json: {e}"))?;
+    let parsed: Value = serde_json::from_str(&raw).map_err(|e| format!("malformed .mcp.json: {e}"))?;
+
+    let rewrite = rewrite_mcp_config_for_gate(&parsed, self_exe, purpose);
+    if rewrite.config == parsed {
         debug!("mcp-proxy: nothing to proxy in this .mcp.json");
-        return None;
+        return Ok((None, Vec::new()));
     }
 
     let mut file = tempfile::Builder::new()
         .prefix("duduclaw-mcp-")
         .suffix(".json")
         .tempfile()
-        .map_err(|e| warn!(error = %e, "mcp-proxy: temp file creation failed"))
-        .ok()?;
+        .map_err(|e| format!("temp file creation failed: {e}"))?;
     {
         use std::io::Write;
-        let body = serde_json::to_string_pretty(&rewritten).ok()?;
+        let body = serde_json::to_string_pretty(&rewrite.config).map_err(|e| e.to_string())?;
         file.write_all(body.as_bytes())
-            .map_err(|e| warn!(error = %e, "mcp-proxy: temp file write failed"))
-            .ok()?;
-        file.flush().ok()?;
+            .map_err(|e| format!("temp file write failed: {e}"))?;
+        file.flush().map_err(|e| format!("temp file flush failed: {e}"))?;
     }
     let path = file.into_temp_path();
     // The file carries the upstream servers' own credentials, same as the
     // `.mcp.json` it was derived from.
     duduclaw_core::platform::set_owner_only(&path).ok();
-    Some(path)
+    Ok((Some(path), rewrite.dropped_remote))
 }
 
 // ── 2. Direct-API tool-loop interceptor ─────────────────────────────────────
@@ -720,7 +784,7 @@ mod mcp_config_proxy_tests {
         let mcp = dir.path().join(".mcp.json");
         std::fs::write(&mcp, sample().to_string()).unwrap();
         assert!(
-            maybe_proxy_mcp_config(dir.path(), &mcp).is_none(),
+            maybe_proxy_mcp_config(dir.path(), &mcp).unwrap().is_none(),
             "redaction off ⇒ the spawn must be byte-identical to today"
         );
     }

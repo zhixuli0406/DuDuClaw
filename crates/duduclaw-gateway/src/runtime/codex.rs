@@ -70,6 +70,16 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// reading, and loses the duduclaw tool surface. That is the correct trade for a
 /// level whose whole meaning is "this agent may not change anything", and
 /// [`AgentRuntime::execute`] emits one `warn!` per spawn saying so.
+/// [`sandbox_args`], or in the explore lane the read-only sandbox whatever
+/// the employee's own level (the lane only narrows).
+fn sandbox_args_for(caps: Option<&CapabilitiesConfig>, explore: bool) -> Vec<String> {
+    if explore {
+        crate::explore_lane::codex_sandbox_args()
+    } else {
+        sandbox_args(caps)
+    }
+}
+
 fn sandbox_args(caps: Option<&CapabilitiesConfig>) -> Vec<String> {
     let level = sandbox_level_for(caps);
     // Live-verified on Codex 0.156.1 (2026-09-24, eight variants):
@@ -910,8 +920,9 @@ impl AgentRuntime for CodexRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
-        // P5: this runtime cannot carry the read-only explore lane.
-        crate::explore_lane::refuse_unsupported_runtime("codex")?;
+        // Explore lane: `-s read-only` whatever the capability level, and the
+        // duduclaw MCP server registered with the lane variable (below).
+        let explore = crate::explore_lane::in_explore();
         info!(agent = %context.agent_id, "CodexRuntime: executing via codex exec --json");
 
         // Limit system_prompt to 64KB to avoid ARG_MAX issues.
@@ -944,7 +955,7 @@ impl AgentRuntime for CodexRuntime {
         // the price of the MCP tool surface, because `-s read-only` and
         // `--approve-for-me` cannot coexist. Said once per spawn so the
         // shrinkage is discoverable from the log rather than from behaviour.
-        if level == duduclaw_core::types::SandboxLevel::ReadOnly {
+        if level == duduclaw_core::types::SandboxLevel::ReadOnly && !explore {
             warn!(
                 runtime = "codex",
                 agent = %context.agent_id,
@@ -991,7 +1002,7 @@ impl AgentRuntime for CodexRuntime {
         // --skip-git-repo-check was not specified." (exit 1). Reproduced in a
         // plain temp dir; the same invocation succeeds with the flag.
         cmd.arg("--skip-git-repo-check");
-        cmd.args(sandbox_args(caps));
+        cmd.args(sandbox_args_for(caps, explore));
         cmd.args(effort_args(context.effort));
         // Live round 8: a caller-required reply schema, when one is scoped.
         // `_schema_file` is held to the end of this function on purpose — the
@@ -1024,9 +1035,12 @@ impl AgentRuntime for CodexRuntime {
         // P2-B N4: this turn's or run's source identity for the duduclaw MCP
         // server, so what the employee stores there can be forgotten by its
         // conversation. Per-spawn `-c` overrides, never a persisted config.
-        cmd.args(turn_source_override_args(
-            &crate::memory_provenance::turn_source_env_pairs(),
-        ));
+        // In the explore lane the same table carries `DUDUCLAW_LANE=explore`,
+        // so the MCP server (should Codex ever call it) lists and runs
+        // read-only tools only.
+        let mut source_pairs = crate::memory_provenance::turn_source_env_pairs();
+        source_pairs.extend(crate::explore_lane::lane_env());
+        cmd.args(turn_source_override_args(&source_pairs));
 
         // Working root. Normally the agent's own directory; a caller may
         // override it via `super::SPAWN_OVERRIDE` (today: the team composer,
@@ -1539,6 +1553,30 @@ mod tests {
                     .find(|w| w[0] == "-s" || w[0] == "--sandbox")
                     .map(|w| w[1].clone())
             })
+    }
+
+    /// Explore lane: read-only sandbox for every level, including an explicit
+    /// full-access grant; outside the lane the argv is unchanged; the lane
+    /// variable rides the same `-c` env table as the turn identity.
+    #[test]
+    fn explore_lane_forces_the_read_only_sandbox_and_the_lane_env() {
+        for c in [
+            caps(false, false, &[], &[]),
+            caps(false, false, &["Read"], &[]),
+            caps(true, false, &[], &[]),
+        ] {
+            let lane = sandbox_args_for(Some(&c), true);
+            assert_eq!(declared_sandbox(&lane).as_deref(), Some("read-only"), "{lane:?}");
+            assert!(lane.windows(2).any(|w| w[0] == "-c" && w[1] == "approval_policy=never"));
+            assert!(!lane.iter().any(|a| a.contains("bypass") || a == "--approve-for-me"), "{lane:?}");
+            assert_eq!(sandbox_args_for(Some(&c), false), sandbox_args(Some(&c)));
+        }
+        assert_eq!(sandbox_args_for(None, true), crate::explore_lane::codex_sandbox_args());
+        let env = turn_source_override_args(&[(
+            duduclaw_core::ENV_LANE.to_string(),
+            duduclaw_core::LANE_EXPLORE.to_string(),
+        )]);
+        assert_eq!(env, vec!["-c".to_string(), "mcp_servers.duduclaw.env.DUDUCLAW_LANE=\"explore\"".to_string()]);
     }
 
     #[test]

@@ -13,7 +13,9 @@
 //!   bridges included, because the bridge itself does not redact.
 //! - **Third-party tool gate** (2026-10-08: `action_rules`, explore lane):
 //!   bridges are left alone, because the bridge applies the same gate itself
-//!   and wrapping it would ask twice.
+//!   and wrapping it would ask twice; direct remote entries (`url` / `type`)
+//!   are removed, because nothing can gate them
+//!   ([`rewrite_mcp_config_for_gate`]).
 
 use std::path::Path;
 
@@ -86,14 +88,49 @@ impl ProxyPurpose {
 /// bridge entries. The original `env` map rides along in
 /// [`PROXY_UPSTREAM_ENV_VAR`] rather than in argv.
 pub fn rewrite_mcp_config_for_proxy_with(json: &Value, self_exe: &Path, purpose: ProxyPurpose) -> Value {
+    rewrite_mcp_config_for_gate(json, self_exe, purpose).config
+}
+
+/// What [`rewrite_mcp_config_for_gate`] produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProxyRewrite {
+    /// The config to hand the Claude CLI.
+    pub config: Value,
+    /// Direct remote entries (`url` / `type`) removed because the
+    /// third-party tool gate was a purpose and nothing can gate them. Sorted
+    /// server names; the caller audits each one.
+    pub dropped_remote: Vec<String>,
+}
+
+/// Is this `.mcp.json` entry a direct remote server (`url`, or a `type`
+/// such as `http` / `sse`) that the Claude CLI would reach without any
+/// child process DuDuClaw could wrap?
+pub fn is_direct_remote_entry(def: &Value) -> bool {
+    def.get("url").is_some() || def.get("type").is_some()
+}
+
+/// [`rewrite_mcp_config_for_proxy_with`] that also reports what it removed.
+///
+/// Direct remote entries (`url` / `type: http|sse`, not DuDuClaw's
+/// `mcp-remote-bridge`) are reached by the Claude CLI itself, so neither
+/// redaction nor the third-party tool gate sees their tools. When the tool
+/// gate is a purpose (`action_rules` present or the explore lane) they are
+/// **removed** from the spawn config (2026-10-08 close-out): the operator
+/// connects them with `mcp.remote_connect`, which writes a bridge entry the
+/// gate does cover. They are not rewritten to the bridge on the fly because
+/// the bridge reads its URL and credentials from the encrypted remote store,
+/// and a spawn must not create store records or probe the network. With
+/// redaction as the only purpose they stay (logged), as before.
+pub fn rewrite_mcp_config_for_gate(json: &Value, self_exe: &Path, purpose: ProxyPurpose) -> ProxyRewrite {
     let mut out = json.clone();
+    let mut dropped_remote = Vec::new();
     if purpose.none() {
-        return out;
+        return ProxyRewrite { config: out, dropped_remote };
     }
     let exe = self_exe.to_string_lossy().into_owned();
 
     let Some(servers) = out.get_mut("mcpServers").and_then(|v| v.as_object_mut()) else {
-        return out;
+        return ProxyRewrite { config: out, dropped_remote };
     };
 
     let carry = carry_env(servers);
@@ -106,11 +143,20 @@ pub fn rewrite_mcp_config_for_proxy_with(json: &Value, self_exe: &Path, purpose:
         let Some(def) = servers.get(&name).cloned() else {
             continue;
         };
-        if def.get("url").is_some() || def.get("type").is_some() {
-            tracing::warn!(
-                server = %name,
-                "HTTP/SSE MCP server is NOT proxied — redaction and the third-party tool gate do not reach it"
-            );
+        if is_direct_remote_entry(&def) {
+            if purpose.tool_gate {
+                tracing::warn!(
+                    server = %name,
+                    "direct HTTP/SSE MCP server removed from this spawn — the third-party tool gate cannot reach it; connect it with mcp.remote_connect"
+                );
+                servers.remove(&name);
+                dropped_remote.push(name);
+            } else {
+                tracing::warn!(
+                    server = %name,
+                    "HTTP/SSE MCP server is NOT proxied — redaction does not reach it"
+                );
+            }
             continue;
         }
         let Some(command) = def.get("command").and_then(|c| c.as_str()) else {
@@ -154,7 +200,8 @@ pub fn rewrite_mcp_config_for_proxy_with(json: &Value, self_exe: &Path, purpose:
             json!({ "command": exe, "args": args, "env": Value::Object(env) }),
         );
     }
-    out
+    dropped_remote.sort();
+    ProxyRewrite { config: out, dropped_remote }
 }
 
 /// The env pairs the proxy needs, lifted off whichever DuDuClaw entry this
@@ -205,13 +252,33 @@ mod tests {
         let gate = rewrite_mcp_config_for_proxy_with(&cfg(exe), p, ProxyPurpose { redaction: false, tool_gate: true });
         assert_eq!(gate["mcpServers"]["pg"]["args"][0], "mcp-proxy");
         assert_eq!(gate["mcpServers"]["zap"]["args"][0], "mcp-remote-bridge");
-        assert_eq!(gate["mcpServers"]["web"], cfg(exe)["mcpServers"]["web"]);
+        assert!(gate["mcpServers"].get("web").is_none(), "a direct remote entry cannot be gated");
         assert!(gate["mcpServers"]["pg"]["env"].get("DUDUCLAW_AGENT_TOKEN").is_none());
         assert_eq!(gate["mcpServers"]["pg"]["env"]["DUDUCLAW_AGENT_ID"], "a1");
         let red = rewrite_mcp_config_for_proxy_with(&cfg(exe), p, ProxyPurpose { redaction: true, tool_gate: false });
         assert_eq!(red["mcpServers"]["zap"]["args"][0], "mcp-proxy");
         let none = rewrite_mcp_config_for_proxy_with(&cfg(exe), p, ProxyPurpose { redaction: false, tool_gate: false });
         assert_eq!(none, cfg(exe));
+    }
+
+    #[test]
+    fn the_gate_reports_every_direct_remote_entry_it_drops() {
+        let exe = "/opt/duduclaw";
+        let mut c = cfg(exe);
+        c["mcpServers"]["sse"] = json!({ "type": "sse", "url": "https://x.example/sse" });
+        c["mcpServers"]["http"] = json!({ "type": "http", "url": "https://y.example/mcp" });
+        let r = rewrite_mcp_config_for_gate(&c, Path::new(exe), ProxyPurpose { redaction: true, tool_gate: true });
+        assert_eq!(r.dropped_remote, vec!["http", "sse", "web"]);
+        for n in ["http", "sse", "web"] {
+            assert!(r.config["mcpServers"].get(n).is_none());
+        }
+        // The bridge and the duduclaw entry survive.
+        assert!(r.config["mcpServers"].get("zap").is_some());
+        assert!(r.config["mcpServers"].get("duduclaw").is_some());
+        // Redaction alone keeps them (the old behaviour).
+        let r = rewrite_mcp_config_for_gate(&c, Path::new(exe), ProxyPurpose { redaction: true, tool_gate: false });
+        assert!(r.dropped_remote.is_empty());
+        assert_eq!(r.config["mcpServers"]["web"], c["mcpServers"]["web"]);
     }
 
     #[test]
