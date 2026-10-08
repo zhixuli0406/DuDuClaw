@@ -80,6 +80,20 @@ impl MethodHandler {
         params: Value,
         ctx: &UserContext,
     ) -> WsFrame {
+        // P5: the page's honest "feature off" state. Configuration only, no
+        // rows, so any signed-in account may read it.
+        if method == "responsibilities.status" {
+            let cfg = crate::responsibility::ResponsibilityConfig::from_home(&self.home_dir);
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "enabled": cfg.enabled,
+                    "dispatch_enabled": crate::dispatch_engine::dispatch_engine_enabled(&self.home_dir),
+                    "max_stop_at_days": cfg.max_stop_at_days,
+                    "lanes": [crate::responsibility::lane::LANE_EXPLORE],
+                }),
+            );
+        }
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,

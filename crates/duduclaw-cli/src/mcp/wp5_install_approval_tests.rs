@@ -712,3 +712,65 @@ fn maybe_irreversible_entry_for_a_removed_name_marks_the_new_call() {
     assert_eq!(call("wiki_write", serde_json::json!({})), (false, false));
     assert_eq!(call("skill_search", serde_json::json!({})), (false, false));
 }
+
+// ── P7: single-use approvals bound to the call's arguments ─────────────
+
+#[tokio::test(flavor = "current_thread")]
+async fn bound_approval_shows_what_it_covers_and_is_consumed_once() {
+    use duduclaw_gateway::approval::ApprovalStatus;
+    use duduclaw_gateway::approval::action_grant::{ACTION_GRANT_KEY, ActionGrant, CONSUMED_PREFIX};
+    let broker = in_mem_broker();
+    let b2 = broker.clone();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let seen2 = Arc::clone(&seen);
+    tokio::spawn(async move {
+        for _ in 0..100 {
+            if let Ok(pending) = b2.list_pending(Some("dudu")).await {
+                if let Some(rec) = pending.first() {
+                    *seen2.lock().unwrap() = Some(rec.clone());
+                    b2.decide(&rec.id, true, "dashboard:admin").await.unwrap();
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    let payload = serde_json::json!({
+        "name": "odoo_sale_confirm",
+        "arguments": {"order_id": 42, "api_key": "sk-ant-secretsecretsecret"},
+    });
+    let grant = ActionGrant::build("dudu", "odoo_sale_confirm", &payload);
+    let out = run_approval_bound(
+        &broker,
+        "dudu",
+        ApprovalSubject::ToolCall("odoo_sale_confirm"),
+        "需核可",
+        payload,
+        60,
+        Duration::from_millis(10),
+        None,
+        Some(&grant),
+    )
+    .await;
+    assert!(matches!(out, InstallApprovalOutcome::Proceed));
+    let rec = seen.lock().unwrap().clone().expect("a card was filed");
+    // The card names the tool, its effect and the bound arguments, masked.
+    assert!(rec.summary.contains("odoo_sale_confirm"), "{}", rec.summary);
+    assert!(rec.summary.contains("purchase"), "{}", rec.summary);
+    assert!(rec.summary.contains("order_id = 42"), "{}", rec.summary);
+    assert!(!rec.summary.contains("secretsecret"), "{}", rec.summary);
+    assert_eq!(
+        rec.payload[ACTION_GRANT_KEY]["args_digest"],
+        serde_json::json!(grant.args_digest)
+    );
+    // Consumed: the approval cannot be used a second time.
+    let after = broker.get(&rec.id).await.unwrap().unwrap();
+    assert_eq!(after.status, ApprovalStatus::Invalidated);
+    assert!(
+        after
+            .invalidated_reason
+            .as_deref()
+            .unwrap_or("")
+            .starts_with(CONSUMED_PREFIX)
+    );
+}

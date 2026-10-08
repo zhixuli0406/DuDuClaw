@@ -84,6 +84,10 @@ pub struct ResponsibilityInput {
     #[serde(default = "default_max_failures")]
     pub max_consecutive_failures: i64,
     pub stop_at: DateTime<Utc>,
+    /// P5: `"explore"` runs every occurrence round in the read-only explore
+    /// lane ([`super::lane`]); absent = no lane restriction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
 }
 
 fn default_max_failures() -> i64 {
@@ -265,7 +269,17 @@ fn validate(
         .map(|e| e.event_name.as_str())
         .collect();
     names.sort_unstable();
-    let scope_json = serde_json::json!({ "event_names": names }).to_string();
+    let lane = super::lane::parse_input_lane(input.lane.as_deref())
+        .map_err(|d| ServiceError::new("invalid_lane", d))?;
+    // P5: the lane key is written only when set, so a responsibility without
+    // it keeps a byte-identical scope (and contract hash).
+    let scope_json = match lane {
+        super::lane::RespLane::Normal => serde_json::json!({ "event_names": names }),
+        super::lane::RespLane::Explore => {
+            serde_json::json!({ "event_names": names, "lane": super::lane::LANE_EXPLORE })
+        }
+    }
+    .to_string();
     let source_refs_json =
         serde_json::to_string(&input.source_refs).map_err(|e| internal(e.to_string()))?;
     let notification_policy_json = input
@@ -557,7 +571,8 @@ pub async fn update_contract(
         )
     }));
     let sub_changed = current.schedule_json != v.contract.schedule_json
-        || current.scope_json != v.contract.scope_json
+        || super::lane::scope_event_names(&current.scope_json)
+            != super::lane::scope_event_names(&v.contract.scope_json)
         || current_subs != new_subs;
     let floor = event_floor(home, sub_changed && !v.events.is_empty()).await?;
     let schedule = v.schedule.clone();

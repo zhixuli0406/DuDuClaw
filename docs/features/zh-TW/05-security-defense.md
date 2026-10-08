@@ -173,6 +173,15 @@ action_rules = [
 
 **未涵蓋與未驗證。** 動作規則只管 DuDuClaw 自己的 MCP 工具；Claude Code 內建工具只受 `allowed_tools`／`denied_tools` 管，`.mcp.json` 裡其他 MCP server 的工具沒有分類。點名已移除工具名稱的 `tool` 規則不會跟著取代它的呼叫。動作審查不會對 OS 動作工具（它們有自己的情境分類器）、`skill_hub_install`（安全掃描後有自己的核准）與 `computer_*` 工具執行。分類以工具名稱為準，所以效果隨參數改變的工具一律取較嚴格的類型。三層都還沒在真的 gateway 與真的模型上跑過，目前只有單元測試與 dispatcher 層級的測試。
 
+## 員工動作的單次核准（ActionGrant）
+
+2026-10-08 新增（尚未發行）。改動前，每個需要人核准的工具呼叫都會建立自己的請求、等那一筆的決定，所以核准不會被之後的呼叫重複使用；缺的是「綁定」：卡片看不到參數，決定也沒有綁在實際執行的那次呼叫上。現在，工具屬於 `send` 或 `purchase` 類（例如 `mail_send`、`odoo_sale_confirm`），或因 `action_rules` 的 `ask` 而需要人核准的呼叫，請求會帶 `payload.action_grant`（`duduclaw-gateway/src/approval/action_grant.rs`）：
+
+- 員工、工具、動作類別、員工＋工具＋正規化參數（物件鍵排序）的 SHA-256 指紋，以及最多八行 `鍵 = 值` 的摘要（只取識別字形狀的參數鍵與純量值；看起來像機密的鍵與值用 `tool_calls.jsonl` 同一套遮蔽，字串截 60 字，巢狀值只顯示數量）。卡片文字與收件匣詳細面板（「這份核准涵蓋的內容」）都會顯示。
+- 核准後，存下的綁定必須與即將執行的呼叫一致（同員工、工具、指紋），並在呼叫前消耗一次（`approved → invalidated`，原因 `consumed:action_grant:<uuid>`）。不一致、搶輸或第二次使用都算拒絕。
+
+其他核准路徑（安裝核准、OS 情境閘、PolicyKernel `ask`、workflow、`computer_*`）不變。未涵蓋：指紋算的是核准閘當下的參數，這時 PolicyKernel 改寫與機密還原已經發生；能存取資料庫的人可以同時改掉存下的內容與卡片。目前只有單元與 broker 測試。
+
 ## 支撐層
 
 **MCP 授權閘** — 每個 MCP 工具都在 scope 表裡逐項列舉；沒被列的工具預設需要 Admin scope。Scope、per-agent capability 授權、`denied_tools` 三者各自在分派總門強制，每次拒絕都帶 `error_class` 落稽核。

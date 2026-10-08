@@ -144,6 +144,7 @@ pub(super) fn input(now: DateTime<Utc>) -> ResponsibilityInput {
         min_wake_interval_secs: 300,
         max_consecutive_failures: 3,
         stop_at: now + Duration::days(10),
+        lane: None,
     }
 }
 

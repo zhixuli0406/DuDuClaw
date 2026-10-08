@@ -1019,6 +1019,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         );
     }
 
+    // P9 per-employee "while you were away" digest. Self-gating on
+    // `config.toml [digest] enabled` (default off) and on holding the
+    // gateway instance lock; separate from `[notify] daily_digest` above
+    // (deployment-wide counts through the default employee's target).
+    crate::digest::spawn(home_dir.clone());
+    info!("Employee digest scheduled — 5 min interval (off unless [digest] enabled = true)");
+
     // Belief loop × goal contract gap 2 (design-market-belief-loop-2026-08.md
     // §3 「自主研究」): sweeps every agent every 5 minutes, self-gating on
     // per-agent `agent.toml [research] self_study` (off by default) — a

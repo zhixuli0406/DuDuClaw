@@ -535,6 +535,8 @@ impl AgentRuntime for AntigravityRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        // P5: this runtime cannot carry the read-only explore lane.
+        super::refuse_unsupported_lane("antigravity")?;
         info!(agent = %context.agent_id, "AntigravityRuntime: executing via agy -p");
 
         // P0-3: agy DOES expose `--sandbox` (verified via real `agy --help`,

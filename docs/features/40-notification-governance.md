@@ -153,6 +153,36 @@ The one-per-day cap is hard: a state file records the last local date a digest w
 
 ---
 
+## Employee digest ("while you were away")
+
+Added 2026-10-08 (unreleased), separate from the deployment-wide `[notify] daily_digest` above.
+
+```toml
+# ~/.duduclaw/config.toml
+[digest]
+enabled = true             # on by default; false turns it off
+hour = 8                   # local hour (0–23)
+timezone = "Asia/Taipei"   # IANA zone, default UTC
+exclude_agents = []        # employees left out
+```
+
+Once a day, after `hour` in `timezone`, the gateway holding the instance lock (`duduclaw_core::gateway_instance`) assembles a per-employee summary without any model call (`duduclaw-gateway/src/digest.rs`): tasks and goals finished since the last digest (at most 7 days back), Activity Feed rows, pending approvals, settled responsibility runs and spend. Employees with nothing to report are left out. The digest is saved to `<home>/digest/<date>.json`, shown on the dashboard home page (RPC `digest.latest`, cut to the employees and tasks the viewer may read) and sent as plain text to every active Admin's verified linked channels. `<home>/digest/state.json` claims each local date under a file lock before anything is sent, so restarts and a second gateway never send twice (a crash between the claim and the send skips that day). On by default (owner decision 2026-10-08): with no `[digest]` section it runs at 08:00 UTC. `enabled = false` turns it off, and so does a `config.toml` that exists but cannot be parsed or a wrong value anywhere in `[digest]`.
+
+Each finished item on the home page has 👍 / 👎 / "needs changes" (with an optional note). RPC `digest.feedback` needs Operator on the employee and passes the task's audience gate; only a `done` task takes feedback. The row is appended to `<home>/feedback.jsonl`, the store the evolution reflection's user-feedback signal already reads, as `type` `positive` / `negative` / `correction` with `source = "deliverable"`, `item_kind`, `item_id`, `verdict`, `user_id` and `note`. The proactive-message dismissal probe ignores these rows. Not done: buttons in channels, feedback on artifacts, artifacts in the digest; not verified with real channels.
+
+## Interim status while a reply is slow
+
+Added 2026-10-08 (unreleased), on by default (owner decision 2026-10-08).
+
+```toml
+[channel_reply]
+interim_status = true             # one status line per slow turn; false turns it off
+interim_status_secs = 8           # 0 = off (max 600)
+interim_status_show_task = false  # name the employee's running task
+```
+
+When a reply on an external channel (Telegram, Discord, Slack, LINE, WhatsApp, Feishu, Google Chat, Teams, WeCom, DingTalk; never WebChat or internal sessions) has shown nothing after `interim_status_secs`, the reply's own progress callback gets one line built without a model: how long it has waited and, if the employee also holds a claimed task-board run, how long that run has been going. The task title is included only with `interim_status_show_task = true` and when the task's audience lets that channel read it, because a channel user can be an outside customer. Once per turn; nothing when the channel passed no progress callback. Edit-in-place channels show it as the first state of the progress message the answer later replaces; others post it as a message (on LINE and WhatsApp that uses push quota). Since most CLI replies take longer than 8 seconds, those channels get an extra message on nearly every turn; set `interim_status = false` (or raise `interim_status_secs`) where that costs quota. A `config.toml` that cannot be parsed or a wrong type turns it off (`duduclaw-gateway/src/channel_reply/interim.rs`).
+
 ## Action-rate measurement
 
 One record is written every time a notification goes out, and another every time someone actually resolves a decision. Both land in `~/.duduclaw/notify_events.jsonl`.

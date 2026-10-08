@@ -44,6 +44,7 @@ import {
   LogIn,
   Download,
   Crosshair,
+  CalendarSync,
   Radar as RadarIcon,
   Layers,
   ShieldCheck,
@@ -293,6 +294,10 @@ export const navGroups: NavGroup[] = [
       // Goal-loop console (2026-08-14) — assign autonomous goals and intervene
       // at the human nodes (kickoff approvals, needs_human escalations).
       { to: '/goals', icon: Crosshair, label: 'nav.goals', desc: 'nav.goals.desc', ownScope: true, newIn: '1.58.0' },
+      // 持續任務 (P5, 2026-10-08) — standing responsibilities: an employee
+      // keeps an eye on something on a schedule, within caps. Own scope: the
+      // RPCs check the viewer's binding to each owner employee.
+      { to: '/responsibilities', icon: CalendarSync, label: 'nav.responsibilities', desc: 'nav.responsibilities.desc', ownScope: true },
       // G12 run inspector — per-run transcripts (session turns + tool receipts).
       { to: '/runs', icon: ScrollText, label: 'nav.runs', desc: 'nav.runs.desc', ownScope: true },
       // G15 Live Canvas — agent-pushed HTML workspace, sandbox-rendered.
@@ -454,6 +459,7 @@ export const personalPrimaryItems: NavItem[] = pickItems([
   // 2026-08-14 user directive: the two new loop consoles live on the primary
   // rail, not folded into 進階 — assigning/monitoring goals is daily work.
   '/goals',
+  '/responsibilities',
   '/foresight',
   '/skills',
   '/memory',
