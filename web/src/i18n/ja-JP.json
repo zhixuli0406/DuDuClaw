@@ -7489,5 +7489,12 @@
   "responsibilities.preset.daily_briefing.objective": "毎朝タスクボードと最近の動きを確認し、変化と今日私が対応すべきことを短くまとめてください。",
   "responsibilities.preset.daily_briefing.acceptance": "最大5項目、それぞれ出典のタスクや項目を明記。",
   "responsibilities.preset.weekly_review.objective": "毎週月曜に先週完了した仕事と滞っている仕事を振り返り、要約してください。",
-  "responsibilities.preset.weekly_review.acceptance": "2つの短いリスト（完了／停滞）、各項目1行。"
+  "responsibilities.preset.weekly_review.acceptance": "2つの短いリスト（完了／停滞）、各項目1行。",
+  "approval.grant.title": "この承認の対象",
+  "approval.grant.singleUse": "この1回の呼び出しだけが対象です。実行時に使い切られ、引数が違う場合や2回目の呼び出しは再度確認されます。",
+  "approval.grant.tool": "ツール",
+  "approval.grant.effect": "動作の種類",
+  "approval.grant.args": "引数（機密は伏せ字）",
+  "approval.grant.noArgs": "（なし）",
+  "approval.grant.digest": "引数の指紋："
 }

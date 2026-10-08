@@ -7489,5 +7489,12 @@
   "responsibilities.preset.daily_briefing.objective": "每天早上看一遍我的任務看板和最近動態，寫一份簡短簡報：有什麼變化、今天有哪些事需要我。",
   "responsibilities.preset.daily_briefing.acceptance": "最多五點，每點都標明來源任務或項目。",
   "responsibilities.preset.weekly_review.objective": "每週一回顧上週完成與卡住的工作，整理成摘要。",
-  "responsibilities.preset.weekly_review.acceptance": "兩份簡短清單（完成／卡住），每項一行。"
+  "responsibilities.preset.weekly_review.acceptance": "兩份簡短清單（完成／卡住），每項一行。",
+  "approval.grant.title": "這份核准涵蓋的內容",
+  "approval.grant.singleUse": "只涵蓋這一次呼叫，執行時即用掉；參數不同或再呼叫一次都會重新詢問。",
+  "approval.grant.tool": "工具",
+  "approval.grant.effect": "動作類別",
+  "approval.grant.args": "參數（機密已遮蔽）",
+  "approval.grant.noArgs": "（無）",
+  "approval.grant.digest": "參數指紋："
 }
