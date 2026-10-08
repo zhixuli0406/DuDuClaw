@@ -49,6 +49,18 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     Option<Vec<duduclaw_llm::CcrDeliveryGuards>>,
     Arc<CcrTurnDelivery>,
 ) {
+    // P10: one model-free status line if this turn stays silent too long
+    // (off by default; external channel sessions only).
+    let (on_progress, interim) = super::interim::arm(
+        &ctx.home_dir,
+        match agent_override {
+            _ if !super::interim::wanted(&ctx.home_dir, session_id) => None,
+            Some(a) => Some(a.to_string()),
+            None => Some(resolve_agent_for_restore(ctx, session_id).await),
+        },
+        session_id,
+        on_progress,
+    );
     let collector: std::sync::Arc<std::sync::Mutex<Vec<crate::runtime::NativeToolEvent>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let ccr_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -61,7 +73,9 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     // for the whole turn. CCR history validation runs before the native tool
     // loop, and handle persistence runs after it; scoping only `cli_future`
     // leaves both paths (and local-first inference) without an identity.
-    let raw = reply_identity_scope(
+    // Boxed: the reply future is large, and the interim watcher must not
+    // add a second copy of it to the caller's stack.
+    let turn = Box::pin(reply_identity_scope(
         session_id,
         user_id,
         CCR_TURN_DELIVERY.scope(
@@ -84,8 +98,11 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
                 ),
             ),
         ),
-    )
-    .await;
+    ));
+    let raw = match interim {
+        Some(w) => w.run(turn).await,
+        None => turn.await,
+    };
     let operator_result_artifact = collector.lock().ok().and_then(|events| {
         crate::os_operator::extract_wifi_password_request_artifact(&events)
             .or_else(|| crate::os_operator::extract_readonly_result_artifact(&events))

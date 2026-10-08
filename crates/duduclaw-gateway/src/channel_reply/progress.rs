@@ -35,6 +35,10 @@ pub enum ProgressEvent {
     /// frame's `model` field so the UI shows the real model, not the
     /// configured intent.
     ModelInfo { model: String },
+    /// P10: one model-free "still working" line, sent at most once per turn
+    /// when the reply has shown nothing for `[channel_reply]
+    /// interim_status_secs` ([`super::interim`]).
+    Interim { text: String },
 }
 
 /// Phase of a tool step in the agentic task tree.
@@ -402,6 +406,7 @@ impl ProgressEvent {
             Self::Step(_) => String::new(),
             // Dashboard-only metadata — same contract as `Step`.
             Self::ModelInfo { .. } => String::new(),
+            Self::Interim { text } => text.clone(),
         }
     }
 }

@@ -1107,6 +1107,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                     content, kind: Some("keepalive".into()), tool: None, detail: None,
                                                     conv: conv_nonce.clone(),
                                                 },
+                                                ProgressEvent::Interim { .. } => ChatMessage::Progress {
+                                                    content, kind: Some("status".into()), tool: None, detail: None,
+                                                    conv: conv_nonce.clone(),
+                                                },
                                                 // C-P1: structured step boundary → dedicated `step` frame.
                                                 ProgressEvent::Step(step) => ChatMessage::Step {
                                                     phase: step.phase.as_str().to_string(),
