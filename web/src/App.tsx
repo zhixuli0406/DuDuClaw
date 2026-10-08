@@ -50,6 +50,7 @@ const EditAgentPage = lazyPage(() => import('./pages/agent-form/EditAgentPage'),
 const TaskBoardPage = lazyPage(() => import('./pages/TaskBoardPage'), 'TaskBoardPage');
 const PlansPage = lazyPage(() => import('./pages/PlansPage'), 'PlansPage');
 const GoalsPage = lazyPage(() => import('./pages/GoalsPage'), 'GoalsPage');
+const ResponsibilitiesPage = lazyPage(() => import('./pages/ResponsibilitiesPage'), 'ResponsibilitiesPage');
 const ForesightPage = lazyPage(() => import('./pages/ForesightPage'), 'ForesightPage');
 const ForkPage = lazyPage(() => import('./pages/ForkPage'), 'ForkPage');
 const MarketplacePage = lazyPage(() => import('./pages/MarketplacePage'), 'MarketplacePage');
@@ -253,6 +254,9 @@ export function App() {
               <Route path="tasks" element={<TaskBoardPage />} />
               <Route path="tasks/:id" element={<TaskDetailPage />} />
               <Route path="goals" element={<GoalsPage />} />
+              {/* P5 持續任務 — every `responsibilities.*` RPC re-checks the
+                  caller's binding to the owner employee server-side. */}
+              <Route path="responsibilities" element={<ResponsibilitiesPage />} />
               <Route path="foresight" element={<ForesightPage />} />
               {/* U4 co-edited plans — shared step lists between the user and
                   an AI employee (agent-scoped; the gateway fails closed). */}

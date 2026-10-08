@@ -503,3 +503,35 @@ it('shows persisted question answer without decision controls', () => {
   expect(screen.getByText('Answered')).toBeInTheDocument(); expect(screen.getByText('B')).toBeInTheDocument();
   expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
 });
+
+describe('<ApprovalDetailPanel> P7 bound tool-call approval', () => {
+  it('shows the tool, effect and masked argument lines the approval is bound to', () => {
+    const approval: ApprovalItem = {
+      id: 'apr-g',
+      agent_id: 'agent-a',
+      kind: 'mcp_call',
+      summary: 'needs approval',
+      created_at: '2026-10-08T00:00:00Z',
+      ttl_seconds: 3600,
+      payload: {
+        name: 'odoo_sale_confirm',
+        arguments: { order_id: 42 },
+        action_grant: {
+          agent_id: 'agent-a',
+          tool: 'odoo_sale_confirm',
+          effect: 'purchase',
+          args_digest: '0123456789abcdef0123456789abcdef',
+          args_summary: ['order_id = 42', 'api_key = "***"'],
+          single_use: true,
+        },
+      },
+    };
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    const box = screen.getByTestId('action-grant');
+    expect(box).toHaveTextContent('odoo_sale_confirm');
+    expect(box).toHaveTextContent('purchase');
+    expect(box).toHaveTextContent('order_id = 42');
+    expect(box).toHaveTextContent('0123456789abcdef');
+    expect(box).toHaveTextContent('Covers exactly this one call');
+  });
+});

@@ -72,6 +72,7 @@ const NOTIFY_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ── Types ───────────────────────────────────────────────────
 
+pub mod action_grant;
 mod action_guard;
 mod binding;
 mod fixture_decision;

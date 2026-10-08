@@ -179,15 +179,54 @@ pub(crate) async fn run_approval(
     poll: std::time::Duration,
     simulation: Option<Value>,
 ) -> InstallApprovalOutcome {
+    run_approval_bound(
+        broker, agent_id, subject, summary, payload, ttl_seconds, poll, simulation, None,
+    )
+    .await
+}
+
+/// [`run_approval`] with an optional P7 [`ActionGrant`] binding: the request
+/// stores the binding and its card text, and an approval is used only after
+/// [`verify_and_consume`] confirmed it covers exactly this call and claimed
+/// it once (a second use, a changed row or a lost claim is a denial).
+///
+/// [`ActionGrant`]: duduclaw_gateway::approval::action_grant::ActionGrant
+/// [`verify_and_consume`]: duduclaw_gateway::approval::action_grant::verify_and_consume
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_approval_bound(
+    broker: &duduclaw_gateway::approval::ApprovalBroker,
+    agent_id: &str,
+    subject: ApprovalSubject<'_>,
+    summary: &str,
+    payload: Value,
+    ttl_seconds: i64,
+    poll: std::time::Duration,
+    simulation: Option<Value>,
+    grant: Option<&duduclaw_gateway::approval::action_grant::ActionGrant>,
+) -> InstallApprovalOutcome {
     use duduclaw_gateway::approval::ApprovalStatus;
 
     // External content (skill name/description) is truncated before it is
     // persisted or shown in the inbox (CJK-safe, no raw byte slicing).
     let summary = duduclaw_core::truncate_chars(summary, INSTALL_APPROVAL_SUMMARY_MAX_CHARS);
+    // P7: the binding's card text is appended after the cut, so the person
+    // always sees what exactly the approval covers.
+    let summary = match grant {
+        Some(g) => format!("{summary}\n\n{}", g.card_text()),
+        None => summary.to_string(),
+    };
+    let summary = summary.as_str();
     let kind = subject.action_kind();
     // F5-D: a card raised inside a goal round names that round's task (set
     // by the gateway at spawn), so the inbox applies the task's audience.
-    let payload = duduclaw_core::with_host_task_id(payload, duduclaw_core::host_task_id().as_deref());
+    let mut payload =
+        duduclaw_core::with_host_task_id(payload, duduclaw_core::host_task_id().as_deref());
+    if let (Some(g), Some(obj)) = (grant, payload.as_object_mut()) {
+        obj.insert(
+            duduclaw_gateway::approval::action_grant::ACTION_GRANT_KEY.to_string(),
+            g.to_json(),
+        );
+    }
 
     let requested = match simulation {
         Some(sim) => {
@@ -212,7 +251,26 @@ pub(crate) async fn run_approval(
     };
 
     match broker.await_decision(&approval_id, poll).await {
-        Ok(ApprovalStatus::Approved) => InstallApprovalOutcome::Proceed,
+        Ok(ApprovalStatus::Approved) => match grant {
+            None => InstallApprovalOutcome::Proceed,
+            Some(g) => {
+                use duduclaw_gateway::approval::action_grant::{GrantRefusal, verify_and_consume};
+                match verify_and_consume(broker, &approval_id, g).await {
+                    Ok(()) => InstallApprovalOutcome::Proceed,
+                    Err(refusal) => {
+                        warn!(approval = %approval_id, ?refusal, "bound approval not usable — denying (fail-closed)");
+                        let what = match refusal {
+                            GrantRefusal::Mismatch => "核准內容與這次呼叫不符",
+                            GrantRefusal::AlreadyUsed | GrantRefusal::NotApproved => {
+                                "這份核准已被使用或已失效"
+                            }
+                            GrantRefusal::Store(_) => "無法確認核准內容",
+                        };
+                        InstallApprovalOutcome::Denied(subject.failed_message(what))
+                    }
+                }
+            }
+        },
         Ok(ApprovalStatus::Denied | ApprovalStatus::Answered | ApprovalStatus::Invalidated) => {
             InstallApprovalOutcome::Denied(subject.denied_message(&approval_id.to_string()))
         }
@@ -556,7 +614,21 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
                     return Err(subject.broker_unavailable_message());
                 }
             };
-            let outcome = run_approval(
+            // P7: a send / purchase call, or one an `action_rules` `ask`
+            // routed here, gets a single-use approval bound to its exact
+            // arguments.
+            let ask_rule = crate::mcp_dispatch::action_rule_verdict(
+                &duduclaw_core::agent_toml::load_action_rules(&agent_dir),
+                tool_name,
+            )
+            .is_some_and(|v| v >= duduclaw_core::ActionVerdict::Ask);
+            let grant = duduclaw_gateway::approval::action_grant::binding_applies(tool_name, ask_rule)
+                .then(|| {
+                    duduclaw_gateway::approval::action_grant::ActionGrant::build(
+                        agent_id, tool_name, &payload,
+                    )
+                });
+            let outcome = run_approval_bound(
                 &broker,
                 agent_id,
                 subject,
@@ -565,6 +637,7 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
                 INSTALL_APPROVAL_TTL_SECONDS,
                 INSTALL_APPROVAL_POLL,
                 narrative.as_ref().map(|n| n.to_json()),
+                grant.as_ref(),
             )
             .await;
             match outcome {

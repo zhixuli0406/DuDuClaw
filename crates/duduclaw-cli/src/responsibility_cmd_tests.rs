@@ -51,6 +51,7 @@ impl Rig {
             min_wake_interval_secs: 300,
             max_consecutive_failures: 3,
             stop_at: now + chrono::Duration::days(5),
+            lane: None,
         }
     }
     fn write_input(&self, objective: &str) -> PathBuf {

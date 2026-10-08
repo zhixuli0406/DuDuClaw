@@ -228,6 +228,7 @@ mod failure_message;
 mod guarded;
 mod history;
 mod inner;
+pub mod interim;
 mod progress;
 mod prompt_build;
 

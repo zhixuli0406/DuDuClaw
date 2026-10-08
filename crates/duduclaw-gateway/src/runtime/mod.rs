@@ -398,6 +398,78 @@ tokio::task_local! {
 
     /// See [`GoalRoundAttribution`].
     pub static GOAL_ROUND_ATTRIBUTION: GoalRoundAttribution;
+
+    /// P5: set (to `true`) by the dispatcher around a responsibility round
+    /// whose contract carries `lane = "explore"`. Absent scope ⇒ no lane.
+    pub static EXPLORE_ROUND_LANE: bool;
+}
+
+/// Whether this call runs inside an explore-lane responsibility round.
+pub fn in_explore_round_lane() -> bool {
+    EXPLORE_ROUND_LANE.try_with(|b| *b).unwrap_or(false)
+}
+
+/// `(DUDUCLAW_LANE, "explore")` inside an explore-lane round, for spawn and
+/// MCP-client environments. `None` everywhere else (byte-identical env).
+pub fn round_lane_env() -> Option<(String, String)> {
+    in_explore_round_lane().then(|| {
+        (
+            duduclaw_core::ENV_LANE.to_string(),
+            duduclaw_core::LANE_EXPLORE.to_string(),
+        )
+    })
+}
+
+/// Fail-closed guard for runtimes that cannot carry the explore lane
+/// (they would run with their full tool surface). `Err` inside an
+/// explore-lane round, `Ok` otherwise.
+pub fn refuse_unsupported_lane(runtime: &str) -> Result<(), String> {
+    if in_explore_round_lane() {
+        return Err(format!(
+            "explore_lane_unsupported: the {runtime} runtime cannot run a read-only \
+             (explore lane) responsibility round"
+        ));
+    }
+    Ok(())
+}
+
+/// Claude CLI argument values inside an explore-lane round: the built-in
+/// tool list (`--tools`) and the auto-approve list (`--allowedTools`), both
+/// only ever narrower than the employee's own. `None` outside a lane round.
+pub fn explore_lane_claude_tools(
+    caps: &duduclaw_core::types::CapabilitiesConfig,
+) -> Option<(Vec<String>, Vec<String>)> {
+    if !in_explore_round_lane() {
+        return None;
+    }
+    let explore = duduclaw_core::tool_effect::EXPLORE_LANE_BUILTIN_TOOLS;
+    let builtins: Vec<String> = caps
+        .minimal_builtin_tools(explore)
+        .into_iter()
+        .filter(|t| explore.contains(&t.as_str()))
+        .collect();
+    let allowlist = caps.allowed_tools();
+    let allowed: Vec<String> = if allowlist.is_empty() {
+        std::iter::once("mcp__duduclaw__*".to_string())
+            .chain(builtins.iter().cloned())
+            .collect()
+    } else {
+        // An explicit allowlist can only narrow further: keep the entries
+        // that are DuDuClaw MCP tools or read-only built-ins.
+        // Never empty: an empty `--allowedTools` value would not mean
+        // "nothing"; DuDuClaw MCP calls stay gated by the server itself
+        // (lane + `allowed_tools`), so naming them here adds nothing.
+        let kept: Vec<String> = allowlist
+            .into_iter()
+            .filter(|t| t.starts_with("mcp__duduclaw__") || explore.contains(&t.as_str()))
+            .collect();
+        if kept.is_empty() {
+            vec!["mcp__duduclaw__*".to_string()]
+        } else {
+            kept
+        }
+    };
+    Some((builtins, allowed))
 }
 
 /// The caller's cwd override for this spawn, if any. `None` outside a

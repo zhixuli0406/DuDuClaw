@@ -910,6 +910,8 @@ impl AgentRuntime for CodexRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        // P5: this runtime cannot carry the read-only explore lane.
+        super::refuse_unsupported_lane("codex")?;
         info!(agent = %context.agent_id, "CodexRuntime: executing via codex exec --json");
 
         // Limit system_prompt to 64KB to avoid ARG_MAX issues.

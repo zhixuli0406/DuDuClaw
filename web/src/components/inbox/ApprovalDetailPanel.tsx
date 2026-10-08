@@ -106,6 +106,72 @@ function hasSimulation(sim: ApprovalSimulation | null | undefined): sim is Appro
   return sim.world_state_change.trim() !== '' || sim.risk_points.length > 0;
 }
 
+/** P7: the single-use binding an employee tool-call approval carries
+ *  (`payload.action_grant`), or `null` when the card has none. */
+export interface ActionGrantView {
+  tool: string;
+  effect: string;
+  argsSummary: string[];
+  digest: string;
+}
+
+export function parseActionGrant(payload: unknown): ActionGrantView | null {
+  let p: unknown = payload;
+  if (typeof p === 'string') {
+    try {
+      p = JSON.parse(p);
+    } catch {
+      return null;
+    }
+  }
+  const g = (p as { action_grant?: Record<string, unknown> } | null)?.action_grant;
+  if (!g || typeof g !== 'object') return null;
+  const tool = typeof g.tool === 'string' ? g.tool : '';
+  const digest = typeof g.args_digest === 'string' ? g.args_digest : '';
+  if (!tool || !digest) return null;
+  return {
+    tool,
+    effect: typeof g.effect === 'string' ? g.effect : '',
+    argsSummary: Array.isArray(g.args_summary) ? g.args_summary.filter((x): x is string => typeof x === 'string') : [],
+    digest,
+  };
+}
+
+function ActionGrantSection({ grant, t }: { grant: ActionGrantView; t: (id: string) => string }) {
+  return (
+    <Section title={t('approval.grant.title')}>
+      <div className="space-y-1 rounded-lg border p-3 text-sm" data-testid="action-grant">
+        <p className="text-xs text-muted-foreground">{t('approval.grant.singleUse')}</p>
+        <Row label={t('approval.grant.tool')}>
+          <Mono>{grant.tool}</Mono>
+        </Row>
+        {grant.effect && (
+          <Row label={t('approval.grant.effect')}>
+            <Mono>{grant.effect}</Mono>
+          </Row>
+        )}
+        <div className="pt-1">
+          <p className="text-xs text-muted-foreground">{t('approval.grant.args')}</p>
+          {grant.argsSummary.length === 0 ? (
+            <p className="text-xs">{t('approval.grant.noArgs')}</p>
+          ) : (
+            <ul className="space-y-0.5">
+              {grant.argsSummary.map((line, i) => (
+                <li key={i}>
+                  <Mono className="text-xs">{line}</Mono>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          {t('approval.grant.digest')} <Mono className="text-[11px]">{grant.digest.slice(0, 16)}</Mono>
+        </p>
+      </div>
+    </Section>
+  );
+}
+
 /**
  * D1/D2 (WebDreamer arXiv:2411.06559): "if approved, what happens next" —
  * the ActionGuard judge's forward-simulation narrative, when the backend ran
@@ -421,6 +487,7 @@ function GenericApprovalView({
     ? t('approval.plan.kind.knowledge_quarantine.conflict')
     : described ? t(`approval.plan.kind.${approval.kind}`) : t('approval.plan.kind.unknown');
   const discoverySpec = approval.kind === 'discovery' ? parseDiscoveryApproval(approval.payload) : null;
+  const actionGrant = parseActionGrant(approval.payload);
   const reviewLink = approval.kind === 'support_pilot_review'
     ? pilotReviewDeepLink(approval.payload, approval.id) : null;
   // The Decision Lab deep link is admin-only (`RoleGuard minRole="admin"` on
@@ -475,6 +542,8 @@ function GenericApprovalView({
           )}
         </div>
       </Section>
+
+      {actionGrant && <ActionGrantSection grant={actionGrant} t={t} />}
 
       {discoverySpec && <DiscoverySpecSection spec={discoverySpec} intl={intl} />}
 

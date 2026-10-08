@@ -329,6 +329,43 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         // covers plain `send_to_agent` delegation callbacks AND goal-loop
         // work items (which have no callback of their own; see the
         // fallback in `build_typing_guard_for_sqlite_message`).
+        // P5: a responsibility round whose contract carries the read-only
+        // explore lane runs only on a runtime that can carry it; anything
+        // else (or an unreadable lane) fails the round before it starts.
+        let explore_lane = if msg.sender == crate::responsibility::GOAL_LOOP_SENDER {
+            match extract_goal_loop_task_id_and_round(&msg.payload) {
+                Some((task_id, _)) => {
+                    match crate::responsibility::round_requires_explore_lane(home_dir, task_id)
+                        .await
+                    {
+                        Ok(true) => match crate::responsibility::lane::explore_round_refusal(
+                            home_dir,
+                            &msg.target,
+                        ) {
+                            None => Ok(true),
+                            Some(reason) => Err(reason),
+                        },
+                        Ok(false) => Ok(false),
+                        Err(e) => Err(format!("explore_lane_unreadable: {e}")),
+                    }
+                }
+                None => Ok(false),
+            }
+        } else {
+            Ok(false)
+        };
+        let explore_lane = match explore_lane {
+            Ok(v) => v,
+            Err(reason) => {
+                warn!(msg_id = %msg.id, agent = %msg.target, reason = %reason, "SQLite queue: explore-lane round refused");
+                queue.fail(&msg.id, &reason).await?;
+                if msg.id.starts_with("goal:") {
+                    crate::responsibility::return_unrun_round(home_dir, &msg.id).await;
+                }
+                continue;
+            }
+        };
+
         // M3-1: a durable round records that it is being handed to a runtime
         // before anything is started; cost accounting treats a round with
         // this mark as one that ran, whatever its queue message does later.
@@ -389,6 +426,9 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             duduclaw_memory::feedback::CURRENT_TURN_ID.scope(msg.turn_id.clone(), dispatch_fut);
         let dispatch_fut =
             crate::memory_provenance::UPSTREAM_UNKNOWN.scope(upstream_unknown, dispatch_fut);
+        // P5: every spawn of this round (Claude CLI, the openai-compat tool
+        // loop's MCP child) carries the read-only lane; other runtimes refuse.
+        let dispatch_fut = crate::runtime::EXPLORE_ROUND_LANE.scope(explore_lane, dispatch_fut);
 
         // WP-A4/A5/T10: only goal-loop dispatches get a native-tool
         // collector scoped — the design's A3 forward model only observes
