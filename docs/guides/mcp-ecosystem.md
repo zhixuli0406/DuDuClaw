@@ -33,8 +33,14 @@ hosted endpoint (`remote`), the version, the repository, required settings, and
 |--------|---------|
 | No package or remote DuDuClaw can run | only `nuget`, `mcpb` or similar packages |
 | Only the legacy SSE transport | the 2024-11-05 HTTP+SSE protocol, which the native bridge does not speak |
-| Needs custom request headers | e.g. `X-API-Key`; the bridge sends only `Authorization` |
+| Needs a request header DuDuClaw cannot send | e.g. `Cookie` or `Host`; other declared headers (such as `X-API-Key`) are asked for when connecting |
 | Marked deprecated / removed | the registry says so |
+
+A hosted endpoint that declares headers other than `Authorization` can be
+installed: the connect step then asks for each declared header (secret ones as
+password fields; required ones must be filled) and stores the values encrypted
+like **Extra headers**. At most 16 headers are asked for; an optional header
+DuDuClaw cannot send is left out.
 
 **Install** picks the employee and a server name, and asks for the package's
 required environment values (stored in that employee's `.mcp.json`, which only
@@ -71,7 +77,12 @@ A remote server's entry in the employee's `.mcp.json` is
 The Claude CLI starts it like any stdio MCP server. The hidden
 `duduclaw mcp-remote-bridge` forwards every JSON-RPC message (requests,
 notifications and responses) to the server over Streamable HTTP, writes the
-server's answers (JSON or `text/event-stream`) back, keeps the
+server's answers (JSON or `text/event-stream`) back, resumes an answer stream
+that breaks before the response (`GET` with `Last-Event-ID`, the server's
+`retry:` hint capped at 30 seconds or 1 second doubling, at most 5 attempts
+in a row without a new event and 20 per request; `405`/`404`/`401`/`403` or a
+non-stream answer fail the request; needs the server to number its events),
+keeps the
 `Mcp-Session-Id`, sends the negotiated `MCP-Protocol-Version`, and adds a
 fresh `Authorization: Bearer …` to every request.
 
@@ -315,14 +326,18 @@ spawn hands it the rewritten config). Codex, Gemini, Antigravity and Grok
 employees are registered with DuDuClaw's own server only, and the
 openai-compat tool loop starts only `duduclaw mcp-server`, so they have no
 third-party servers to gate. `url` / `type` entries in `.mcp.json` (the CLI
-talks to them directly) are not covered; connect them as remote servers
-instead.
+talks to them directly) cannot be gated, so a spawn that is gated (an
+`action_rules` key, or the read-only lane) removes them from the config it
+hands the CLI (audit `third_party_remote_entry_dropped`; `duduclaw doctor`
+says so); connect them as remote servers instead. If the gated copy of
+`.mcp.json` cannot be built, that spawn is refused (audit
+`third_party_gate_config_unavailable`) rather than started ungated.
 
 ## 5. Events from remote servers (MCP Events)
 
 A remote server that supports the draft MCP Events extension can tell the
 gateway when something happens (a new incident, a new mail…). Implemented:
-the webhook mode of the Triggers & Events working group's design sketch
+the webhook and poll modes of the Triggers & Events working group's design sketch
 (`modelcontextprotocol/experimental-ext-triggers-events`,
 `docs/design-sketch-proposal.md`, draft dated 2026-02-19).
 
@@ -341,6 +356,55 @@ the webhook mode of the Triggers & Events working group's design sketch
    `delivery: { mode: "webhook", url, secret }` and a one-day `ttlMs`, and
    answers the server's verification challenge. A sweep (boot, then every 10
    minutes) subscribes again before each grant's `refreshBefore`.
+
+**Choosing what to subscribe to.** **List server events** calls the server's
+`events/list` (up to 10 pages / 200 event types; names, descriptions and
+schemas are the server's text and are shown as data) and lists each event type
+with the delivery modes it offers (`poll`, `push`, `webhook`) and the names of
+its subscription arguments. Optional **Arguments per event type** is a JSON
+object `{ "<event name>": { ... } }` (an object per name, at most 4 KiB), sent
+as the `arguments` of `events/subscribe` / `events/poll`. **Delivery** is
+`Webhook` (the default), `Poll`, or `Follow the server's list` (`auto`:
+webhook when `public_base_url` is set and the server lists it for every named
+event type, else poll when the server lists it). A choice the server's list
+says an event type does not offer is refused; a server whose list is empty or
+incomplete is asked as you chose and its refusal is shown.
+
+**Cursors, gaps and delivery status.** The gateway keeps the replay position
+(the draft's opaque `cursor`) of every event name: it moves with each event
+that carries one, with a refresh or poll answer and with a `gap` notice, and
+is sent back on every refresh together with `maxAgeMs`
+(`config.toml [mcp_events] max_age_ms`, default 300000 = 5 minutes, 1 second
+to 7 days), so a gateway that was down catches up on what the server still
+holds without receiving an unbounded backlog. `eventId` de-duplicates replays
+(the last 64 per event name). When the server answers `truncated: true` or
+sends a `gap` body, the subscription is flagged and audited; the position
+held before the gap is polled once, best effort, if the event type offers
+`poll`. A refresh's `deliveryStatus` is kept in reduced form (`lastError` only
+if it is one of `connection_refused`, `timeout`, `tls_error`, `http_4xx`,
+`http_5xx`, `challenge_failed`) and shown on the subscription.
+
+**Poll mode.** No callback address and no signing secret. Subscribing sends
+`events/poll` with `cursor: null` once (this also proves the name and the
+arguments), then the gateway polls: only in the process that holds the gateway
+lock (a second gateway on the same data directory never polls), at most 20
+poll subscriptions, never more often than `[mcp_events] poll_floor_ms`
+(default 5000, at least 1000) per event name and at least every hour (the
+server's `nextPollMs` is clamped to that range), 4 requests at a time, a
+`hasMore` backlog is drained for at most 10 batches per pass, and failures back
+off (doubling up to 15 minutes). The cursor is stored after the batch was
+recorded, so a crash re-reads it and `eventId` drops the repeats. Events from
+polling are recorded exactly like webhook events (same scan, size cap and
+read-only lane).
+
+**Push mode is not implemented.** In the draft, `events/stream` is its own
+long-lived POST per subscription whose SSE answer carries only
+`notifications/events/*` ("not a general server-to-client channel"), so it
+cannot ride the bridge's optional server-initiated `GET` stream, which carries
+every other message the server sends. Doing it properly needs one held
+connection per subscription in the gateway with a heartbeat watchdog and
+reconnects. `notifications/events/list_changed` is not listened for either
+(**List server events** reads the list on demand).
 
 **Receiving** (`POST /webhook/mcp-events/{id}`, always mounted): unknown id ⇒
 `404`; body over 256 KiB ⇒ `413`; more than 120 deliveries a minute per
@@ -375,7 +439,10 @@ proxy (section 4). This is the same lane, set by the same flag, as a
 [read-only responsibility](continuous-responsibilities.md) and with the same
 rules: an OpenAI-compatible employee runs the task with DuDuClaw tools limited
 the same way and no `agent.toml [mcp.external]` server mounted; an employee on
-another runtime or in the task sandbox is refused before the task starts
+a Codex employee runs it with `-s read-only` and `approval_policy=never`
+(an operating-system read-only sandbox whatever the employee's own level; Codex
+rejects every MCP call in that mode, so no tool is callable); an employee on
+another runtime (Gemini CLI, Antigravity, Grok) or in the task sandbox is refused before the task starts
 (`explore_lane_unsupported`), and a MoA model or local-only inference is
 refused (the hybrid local offload is skipped). Turn on **Allow normal mode** when subscribing to let events start
 work with the employee's usual permissions; only such subscriptions wake a
@@ -391,12 +458,14 @@ minutes. **Unsubscribe** deletes the subscription first (the callback answers
 `_refresh_failed`, `mcp_event_delivered`, `mcp_event_delivery_rejected`,
 `mcp_event_control` (ids, names and counts only).
 
-What was verified and what was assumed: only the design sketch could be read
-(OpenAI's page about ChatGPT's support could not be fetched). Poll and push
-delivery, cursors and replay (subscriptions always start from "now"),
-`deliveryStatus`, `maxAgeMs`, `events/list`, subscription `arguments` (always
-`{}`) and the optional `v1a` server signature are not implemented. Tested
-against a loopback fake server only.
+What was verified and what was assumed: the design sketch (draft 2026-02-19)
+was re-read on 2026-10-08 and the request and answer shapes above follow it;
+OpenAI's page about ChatGPT's support could not be fetched. Not implemented:
+push delivery, `notifications/events/list_changed` and the optional `v1a`
+server signature. Tested against a loopback fake server only (discovery
+paging, poll bootstrap / drain / de-duplication / floor, the bounds, the
+single-gateway rule, refresh with a cursor, `deliveryStatus`, `gap` catch-up);
+no real MCP Events provider.
 
 ## RPC reference
 
@@ -408,10 +477,11 @@ against a loopback fake server only.
 | `mcp.remote_status { agent_id? }` | Admin | Records without secrets (`header_names`, `server_stream`) |
 | `mcp.remote_disconnect { agent_id, name, forget? }` | Admin | Delete credentials (`forget` also removes the entry), then revoke at the provider when possible |
 | `mcp.tool_effects { agent_id }` | Admin | Third-party tools last listed, with kind and verdict |
-| `mcp.events_subscribe { agent_id, server, event_types, mode? }` | Admin | Subscribe (`mode` `explore` default, or `normal`) |
+| `mcp.events_subscribe { agent_id, server, event_types, mode?, delivery?, arguments? }` | Admin | Subscribe (`mode` `explore` default, or `normal`; `delivery` `webhook` default, `poll` or `auto`; `arguments` `{ event name: object }`) |
+| `mcp.events_discover { agent_id, server }` | Admin | The server's `events/list` |
 | `mcp.events_list { agent_id? }` | Admin | Subscriptions without secrets |
 | `mcp.events_unsubscribe { id }` | Admin | Delete, then unsubscribe upstream |
-| `mcp.events_rotate { id }` | Admin | New signing secret |
+| `mcp.events_rotate { id }` | Admin | New signing secret (webhook subscriptions) |
 
 Audit events (`security_audit.jsonl`): `remote_mcp_connect_started`,
 `remote_mcp_connected`, `remote_mcp_connect_failed`,
@@ -425,18 +495,20 @@ bridge entries with their host and connection state.
 - No real Zapier or Composio account, and no real third-party OAuth provider,
   was used to test this; the flow is verified against a local fake
   authorization server and MCP server only.
-- The bridge does not resume a broken event stream that answers a POST; the
-  server-initiated `GET` stream is opt-in per server and tested against a
-  loopback fake only.
+- A broken answer stream is resumed only when the server numbers its events
+  (`id:`) and supports `GET` resumption; the server-initiated `GET` stream is
+  opt-in per server and tested against a loopback fake only.
 - Legacy HTTP+SSE servers still go through `npx mcp-remote` (see above).
-  Registry entries that declare required headers are still shown as not
-  installable; connect them by URL with **Extra headers** instead.
+  Registry entries that require a header DuDuClaw cannot send (such as
+  `Cookie`) are shown as not installable; connect them by URL if the server
+  accepts another way to sign in.
 - Revocation at the provider runs only when the authorization server
   advertises `revocation_endpoint`, and is best effort.
 - Third-party tool classification trusts the server's annotations as
   described in section 4; the snapshot file the dashboard reads is written by
   the employee's own process tree.
-- MCP Events: see the end of section 5; the gateway must be reachable at an
+- MCP Events: see the end of section 5; push delivery is not implemented;
+  the gateway must be reachable at an
   https address the server accepts.
 - The desktop app's dashboard origin (`tauri://…`) is not an accepted redirect
   origin; sign in from a browser.
