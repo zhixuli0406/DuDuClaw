@@ -5,7 +5,7 @@
 Owner instruction, 2026-10-03: 「每次有新功能與修復時都開分支」. It outranks every other workflow rule in this file.
 
 - Before starting a feature or a fix, create a branch from the latest `origin/main` (`feat/…`, `fix/…`, `docs/…`, `chore/…`). Feature and fix commits never go on `main` directly.
-- The change reaches `main` through a pull request. `main` requires four checks on a PR merge: Rust ubuntu-latest, Rust macos-latest, Dashboard, Python.
+- The change reaches `main` through a pull request. `main` requires five checks on a PR merge: Rust ubuntu-latest, Rust macos-latest, Dashboard, Python, Security Audit (`cargo audit`, required since 2026-10-08). The ECC Tools app comments on PRs (security evidence, risk taxonomy and other audits); its results are advisory and not required checks.
 - When another session is using the main checkout, work in a separate `git worktree` instead of switching branches there.
 - When several open PRs touch the same files, merge them in the order the owner gives; the later one rebases.
 - Opening a branch is not permission to merge or release. Merging a PR and cutting a release stay the owner's decision.
