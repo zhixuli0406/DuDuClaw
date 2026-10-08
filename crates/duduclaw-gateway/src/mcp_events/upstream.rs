@@ -185,8 +185,16 @@ impl Session {
         };
         if let Some(err) = answer.get("error") {
             let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
-            return Err(UpstreamError::Rpc(code, duduclaw_core::truncate_chars(msg, 200).to_string()));
+            let mut msg = duduclaw_core::truncate_chars(err.get("message").and_then(|m| m.as_str()).unwrap_or(""), 200).to_string();
+            // `-32015 CallbackEndpointError`: name the draft's fixed reason
+            // category (never a raw string from the server).
+            if code == -32015
+                && let Some(reason) = err.get("data").and_then(|d| d.get("reason")).and_then(|r| r.as_str())
+                && super::store::DELIVERY_ERROR_CATEGORIES.contains(&reason)
+            {
+                msg = format!("{msg} [{reason}]");
+            }
+            return Err(UpstreamError::Rpc(code, msg));
         }
         answer
             .get("result")
@@ -229,46 +237,213 @@ async fn read_sse_answer(mut resp: reqwest::Response, id: i64) -> Result<Value, 
     Err(UpstreamError::Other("the event stream ended without an answer".into()))
 }
 
-/// `events/subscribe` for one event name. Returns `(upstream id,
-/// refreshBefore)`.
+/// The server's answer to `events/subscribe`.
+#[derive(Debug, Clone, Default)]
+pub struct SubscribeReply {
+    pub id: Option<String>,
+    pub refresh_before: Option<String>,
+    pub cursor: Option<String>,
+    pub truncated: bool,
+    pub delivery_status: Option<super::store::DeliveryStatus>,
+}
+
+fn clean_token(v: Option<&Value>, max: usize) -> Option<String> {
+    v.and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty() && v.len() <= max && v.chars().all(|c| c.is_ascii_graphic()))
+        .map(str::to_string)
+}
+
+/// A cursor is an opaque server token: kept only when it is a bounded
+/// printable string (it is sent back verbatim).
+fn clean_cursor(v: Option<&Value>) -> Option<String> {
+    v.and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty() && v.len() <= 1024 && v.chars().all(|c| !c.is_control()))
+        .map(str::to_string)
+}
+
+fn parse_delivery_status(v: &Value) -> Option<super::store::DeliveryStatus> {
+    let o = v.as_object()?;
+    let ts = |k: &str| {
+        o.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|t| chrono::DateTime::parse_from_rfc3339(t).is_ok())
+            .map(str::to_string)
+    };
+    Some(super::store::DeliveryStatus {
+        active: o.get("active").and_then(|v| v.as_bool()).unwrap_or(true),
+        last_delivery_at: ts("lastDeliveryAt"),
+        last_error: o
+            .get("lastError")
+            .and_then(|v| v.as_str())
+            .filter(|e| super::store::DELIVERY_ERROR_CATEGORIES.contains(e))
+            .map(str::to_string),
+        failed_since: ts("failedSince"),
+        throttled: o.get("throttled").and_then(|v| v.as_bool()).unwrap_or(false),
+        retry_after_ms: o.get("retryAfterMs").and_then(|v| v.as_u64()).map(|n| n.min(86_400_000)),
+    })
+}
+
+/// `events/subscribe` for one event name (also the refresh: same key).
 pub async fn subscribe(
     s: &mut Session,
     name: &str,
+    arguments: &Value,
     url: &str,
     secret: &str,
+    cursor: Option<&str>,
+    max_age_ms: Option<u64>,
     ttl_ms: u64,
-) -> Result<(Option<String>, Option<String>), UpstreamError> {
-    let r = s
-        .request(
-            "events/subscribe",
-            json!({
-                "name": name,
-                "arguments": {},
-                "delivery": { "mode": "webhook", "url": url, "secret": secret },
-                "cursor": null,
-                "ttlMs": ttl_ms,
-            }),
-        )
-        .await?;
-    let id = r
-        .get("id")
-        .and_then(|v| v.as_str())
-        .filter(|v| !v.is_empty() && v.len() <= 256 && v.chars().all(|c| c.is_ascii_graphic()))
-        .map(str::to_string);
-    let refresh = r
-        .get("refreshBefore")
-        .and_then(|v| v.as_str())
-        .filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok())
-        .map(str::to_string);
-    Ok((id, refresh))
+) -> Result<SubscribeReply, UpstreamError> {
+    let mut params = json!({
+        "name": name,
+        "arguments": arguments,
+        "delivery": { "mode": "webhook", "url": url, "secret": secret },
+        "cursor": cursor,
+        "ttlMs": ttl_ms,
+    });
+    if cursor.is_some()
+        && let Some(ms) = max_age_ms
+    {
+        params["maxAgeMs"] = json!(ms);
+    }
+    let r = s.request("events/subscribe", params).await?;
+    Ok(SubscribeReply {
+        id: clean_token(r.get("id"), 256),
+        refresh_before: r
+            .get("refreshBefore")
+            .and_then(|v| v.as_str())
+            .filter(|v| chrono::DateTime::parse_from_rfc3339(v).is_ok())
+            .map(str::to_string),
+        cursor: clean_cursor(r.get("cursor")),
+        truncated: r.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false),
+        delivery_status: r.get("deliveryStatus").and_then(parse_delivery_status),
+    })
 }
 
 /// `events/unsubscribe` for one event name.
-pub async fn unsubscribe(s: &mut Session, name: &str, url: &str) -> Result<(), UpstreamError> {
+pub async fn unsubscribe(s: &mut Session, name: &str, arguments: &Value, url: &str) -> Result<(), UpstreamError> {
     s.request(
         "events/unsubscribe",
-        json!({ "name": name, "arguments": {}, "delivery": { "url": url } }),
+        json!({ "name": name, "arguments": arguments, "delivery": { "url": url } }),
     )
     .await
     .map(|_| ())
+}
+
+/// One event type from `events/list`.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct EventDescriptor {
+    pub name: String,
+    pub description: String,
+    /// Subset of `poll`, `push`, `webhook` the server advertises.
+    pub delivery: Vec<String>,
+    /// JSON Schema of the subscription arguments (`null` when over 8 KiB).
+    pub input_schema: Value,
+    pub payload_schema: Value,
+}
+
+const MAX_SCHEMA_BYTES: usize = 8 * 1024;
+/// Pages and descriptors read from `events/list`.
+const MAX_LIST_PAGES: usize = 10;
+pub const MAX_DESCRIPTORS: usize = 200;
+
+fn bounded_schema(v: Option<&Value>) -> Value {
+    match v {
+        Some(v) if v.is_object() && v.to_string().len() <= MAX_SCHEMA_BYTES => v.clone(),
+        _ => Value::Null,
+    }
+}
+
+/// `events/list`, following `nextCursor` (≤10 pages, ≤200 descriptors).
+/// Server text is data: descriptions are cut and stripped of control
+/// characters; names must be valid event names.
+pub async fn list_events(s: &mut Session) -> Result<Vec<EventDescriptor>, UpstreamError> {
+    let mut out: Vec<EventDescriptor> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_LIST_PAGES {
+        let params = match &cursor {
+            Some(c) => json!({ "cursor": c }),
+            None => json!({}),
+        };
+        let r = s.request("events/list", params).await?;
+        for e in r.get("events").and_then(|e| e.as_array()).map(|a| a.as_slice()).unwrap_or(&[]) {
+            let name = e.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if !super::store::is_valid_event_name(name) || out.len() >= MAX_DESCRIPTORS {
+                continue;
+            }
+            let delivery: Vec<String> = e
+                .get("delivery")
+                .and_then(|d| d.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.as_str())
+                        .filter(|m| matches!(*m, "poll" | "push" | "webhook"))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let desc: String = e
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect();
+            out.push(EventDescriptor {
+                name: name.to_string(),
+                description: duduclaw_core::truncate_chars(&desc, 300).to_string(),
+                delivery,
+                input_schema: bounded_schema(e.get("inputSchema")),
+                payload_schema: bounded_schema(e.get("payloadSchema")),
+            });
+        }
+        cursor = clean_cursor(r.get("nextCursor"));
+        if cursor.is_none() || out.len() >= MAX_DESCRIPTORS {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// The answer to one `events/poll`.
+#[derive(Debug, Clone, Default)]
+pub struct PollReply {
+    /// Raw `EventOccurrence` objects (at most `maxEvents`).
+    pub events: Vec<Value>,
+    pub cursor: Option<String>,
+    pub truncated: bool,
+    pub has_more: bool,
+    pub next_poll_ms: Option<u64>,
+}
+
+/// Most events taken from one poll answer.
+pub const POLL_MAX_EVENTS: usize = 50;
+
+/// `events/poll` for one subscription. `cursor: None` = start from now.
+pub async fn poll(
+    s: &mut Session,
+    name: &str,
+    arguments: &Value,
+    cursor: Option<&str>,
+    max_age_ms: Option<u64>,
+) -> Result<PollReply, UpstreamError> {
+    let mut params = json!({ "name": name, "arguments": arguments, "cursor": cursor, "maxEvents": POLL_MAX_EVENTS });
+    if cursor.is_some()
+        && let Some(ms) = max_age_ms
+    {
+        params["maxAgeMs"] = json!(ms);
+    }
+    let r = s.request("events/poll", params).await?;
+    let events: Vec<Value> = r
+        .get("events")
+        .and_then(|e| e.as_array())
+        .map(|a| a.iter().filter(|e| e.is_object()).take(POLL_MAX_EVENTS).cloned().collect())
+        .unwrap_or_default();
+    Ok(PollReply {
+        events,
+        cursor: clean_cursor(r.get("cursor")),
+        truncated: r.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false),
+        has_more: r.get("hasMore").and_then(|v| v.as_bool()).unwrap_or(false),
+        next_poll_ms: r.get("nextPollMs").and_then(|v| v.as_u64()),
+    })
 }

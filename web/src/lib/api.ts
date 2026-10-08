@@ -2411,9 +2411,19 @@ export interface McpRegistryHit {
   website_url: string | null;
   required_env: { name: string; description: string; required: boolean; secret: boolean }[];
   installable: boolean;
-  /** no_supported_transport | sse_remote_only | custom_headers | deprecated | deleted */
+  /** no_supported_transport | sse_remote_only | custom_headers (a required header DuDuClaw cannot send) | deprecated | deleted */
   reason: string | null;
   install_is_remote: boolean;
+  /** Headers the remote declares (not Authorization); asked for when connecting. */
+  remote_headers?: McpRegistryHeader[];
+}
+
+/** A request header a registry remote declares (2026-10-08). */
+export interface McpRegistryHeader {
+  name: string;
+  description: string;
+  required: boolean;
+  secret: boolean;
 }
 
 export interface McpRegistrySearchResult {
@@ -2441,6 +2451,37 @@ export interface McpRemoteServerStatus {
   header_names?: string[];
 }
 
+/** One event name of a subscription: replay position held, gaps, server delivery status. */
+export interface McpEventUpstream {
+  name: string;
+  upstream_id?: string | null;
+  refresh_before?: string | null;
+  last_error?: string | null;
+  has_cursor?: boolean;
+  /** The server (or a `gap` notice) said events were skipped. */
+  truncated?: boolean;
+  gap_at?: string | null;
+  delivery_status?: {
+    active: boolean;
+    last_delivery_at?: string | null;
+    last_error?: string | null;
+    failed_since?: string | null;
+    throttled?: boolean;
+    retry_after_ms?: number | null;
+  } | null;
+  last_polled_at?: string | null;
+  arguments?: Record<string, unknown>;
+}
+
+/** One event type from the server's `events/list`. */
+export interface McpEventDescriptor {
+  name: string;
+  description: string;
+  delivery: string[];
+  input_schema: { properties?: Record<string, unknown> } | null;
+  payload_schema: Record<string, unknown> | null;
+}
+
 /** An MCP Events subscription (2026-10-08). No secret is ever returned. */
 export interface McpEventSubscription {
   id: string;
@@ -2448,9 +2489,11 @@ export interface McpEventSubscription {
   server: string;
   event_types: string[];
   mode: 'explore' | 'normal';
+  /** How events arrive: the server calls our webhook, or the gateway polls. */
+  delivery?: 'webhook' | 'poll';
   status: 'pending' | 'active' | 'failed' | 'terminated';
   callback_url: string | null;
-  upstream: { name: string; upstream_id?: string | null; refresh_before?: string | null; last_error?: string | null }[];
+  upstream: McpEventUpstream[];
   created_at: string;
   updated_at: string;
   rotated_at: string | null;
@@ -7001,6 +7044,7 @@ export const api = {
         agent_id?: string;
         remote: boolean;
         remote_needs_bearer: boolean;
+        remote_headers?: McpRegistryHeader[];
         needs_connect?: boolean;
         request_id?: string;
         registry_name: string;
@@ -7040,8 +7084,19 @@ export const api = {
         public_base_url_problem: string | null;
       }>,
     /** Admin: subscribe a connected remote server's events. */
-    eventsSubscribe: (params: { agent_id: string; server: string; event_types: string[]; mode: 'explore' | 'normal' }) =>
-      client.call('mcp.events_subscribe', params) as Promise<{ subscription: McpEventSubscription }>,
+    eventsSubscribe: (params: {
+      agent_id: string;
+      server: string;
+      event_types: string[];
+      mode: 'explore' | 'normal';
+      /** Default webhook. `auto` follows the server's own list. */
+      delivery?: 'webhook' | 'poll' | 'auto';
+      /** Subscription arguments per event name. */
+      arguments?: Record<string, Record<string, unknown>>;
+    }) => client.call('mcp.events_subscribe', params) as Promise<{ subscription: McpEventSubscription }>,
+    /** Admin: the remote server's `events/list` (names, delivery modes, argument schemas). */
+    eventsDiscover: (agentId: string, server: string) =>
+      client.call('mcp.events_discover', { agent_id: agentId, server }) as Promise<{ events: McpEventDescriptor[] }>,
     eventsUnsubscribe: (id: string) =>
       client.call('mcp.events_unsubscribe', { id }) as Promise<{ success: boolean; upstream_acknowledged: boolean }>,
     eventsRotate: (id: string) =>

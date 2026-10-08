@@ -125,6 +125,7 @@ impl MethodHandler {
                     { "name": "mcp.remote_disconnect", "description": "Delete a remote MCP server's stored credentials (admin)" },
                     { "name": "mcp.tool_effects", "description": "Third-party MCP tools last listed for an agent, with derived effect class and verdict (admin)" },
                     { "name": "mcp.events_subscribe", "description": "Subscribe a remote MCP server's events to this gateway's webhook (admin)" },
+                    { "name": "mcp.events_discover", "description": "List a remote MCP server's event types with delivery modes and argument schemas (admin)" },
                     { "name": "mcp.events_list", "description": "List MCP Events subscriptions, no secrets (admin)" },
                     { "name": "mcp.events_unsubscribe", "description": "Delete an MCP Events subscription and unsubscribe upstream (admin)" },
                     { "name": "mcp.events_rotate", "description": "Rotate an MCP Events subscription's signing secret (admin)" },

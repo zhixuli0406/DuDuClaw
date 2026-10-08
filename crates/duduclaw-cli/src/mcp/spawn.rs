@@ -109,6 +109,12 @@ pub(crate) async fn spawn_agent_with_ctx(
         "origin_agent": origin,
         "sender_agent": caller,
     });
+    let mut entry = entry;
+    // A run in the explore lane hands read-only work on: the dispatcher
+    // reads this like `message_queue.lane`.
+    if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
+        entry["lane"] = serde_json::json!(lane);
+    }
 
     // RFC-22 Decision 2-C (Phase 3 W1): on bus_queue write failure, surface
     // the underlying I/O error to the caller. Previously we returned an
@@ -430,6 +436,10 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
         "origin_agent": origin,
         "sender_agent": parent,
     });
+    let mut entry = entry;
+    if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
+        entry["lane"] = serde_json::json!(lane);
+    }
     let queued: std::result::Result<(), String> = tokio::task::spawn_blocking({
         let path = queue_path.clone();
         let entry_str = entry.to_string();

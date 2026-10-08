@@ -21,8 +21,9 @@
 //! every message on it to stdout, remembers the last SSE `id:` and reconnects
 //! with `Last-Event-ID` (backoff 1 s doubling to 30 s, reset by an event); a
 //! `405` (the server offers no such stream) or `404` (session gone) stops it,
-//! and it is aborted when stdin ends. Resuming a broken *POST* answer stream
-//! is still not implemented. Legacy HTTP+SSE (2024-11-05) servers are not
+//! and it is aborted when stdin ends. A broken *POST* answer stream is
+//! resumed the same way (`GET` + `Last-Event-ID`, bounded; see
+//! `Bridge::relay_sse`). Legacy HTTP+SSE (2024-11-05) servers are not
 //! supported by this bridge.
 
 use std::path::{Path, PathBuf};
@@ -290,47 +291,152 @@ impl Bridge {
 
     /// Relay SSE events until the response to `expect_id` arrives (or the
     /// stream ends).
+    ///
+    /// Resumption (2026-10-08 close-out, Streamable HTTP "Resumability and
+    /// Redelivery"): when the stream breaks or ends before the answer and
+    /// the server has given its events an `id:`, the bridge reconnects with
+    /// `GET` + `Last-Event-ID` (the server replays what followed on the same
+    /// stream) after the server's `retry:` hint (capped at
+    /// [`RESUME_DELAY_MAX`]) or a 1 s doubling backoff, at most
+    /// [`MAX_RESUME_ATTEMPTS`] times in a row without a new event and
+    /// [`MAX_RESUMES_TOTAL`] times per request. No event id seen ⇒ nothing to
+    /// resume from, the request fails as before. A `405`/`404`/`401`/`403` or a
+    /// non-SSE answer to the resume ends it with an error.
     async fn relay_sse(
         &self,
-        mut resp: reqwest::Response,
+        resp: reqwest::Response,
         expect_id: Option<&Value>,
         is_initialize: bool,
         list_id: Option<&Value>,
     ) -> Result<(), String> {
-        let mut buf: Vec<u8> = Vec::new();
+        let mut resp: Option<reqwest::Response> = Some(resp);
         let mut answered = expect_id.is_none();
+        let mut last_event_id: Option<String> = None;
+        let mut retry_hint: Option<Duration> = None;
+        let mut failed_resumes = 0u32;
+        let mut total_resumes = 0u32;
+        let mut backoff = RESUME_BACKOFF_START;
         loop {
-            let chunk = match resp.chunk().await {
-                Ok(Some(c)) => c,
-                Ok(None) => break,
-                Err(e) => return Err(format!("the remote event stream broke: {e}")),
-            };
-            buf.extend_from_slice(&chunk);
-            if buf.len() > MAX_MESSAGE_BYTES {
-                return Err("a remote event is larger than the bridge accepts".into());
-            }
-            while let Some((event, rest)) = split_event(&buf) {
-                buf = rest;
-                if let Some(data) = event_data(&event)
-                    && let Ok(v) = serde_json::from_str::<Value>(&data)
-                {
-                    let is_answer = expect_id.is_some_and(|id| {
-                        v.get("id") == Some(id) && v.get("method").is_none()
-                    });
-                    self.deliver(v, is_initialize, list_id).await;
-                    if is_answer {
-                        answered = true;
+            let mut buf: Vec<u8> = Vec::new();
+            let broke: Option<String> = loop {
+                let Some(r) = resp.as_mut() else {
+                    break Some("the resume request could not connect".to_string());
+                };
+                let chunk = match r.chunk().await {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break None,
+                    Err(e) => break Some(format!("the remote event stream broke: {e}")),
+                };
+                buf.extend_from_slice(&chunk);
+                if buf.len() > MAX_MESSAGE_BYTES {
+                    return Err("a remote event is larger than the bridge accepts".into());
+                }
+                while let Some((event, rest)) = split_event(&buf) {
+                    buf = rest;
+                    if let Some(id) = event_id(&event) {
+                        last_event_id = Some(id);
+                        failed_resumes = 0;
+                        backoff = RESUME_BACKOFF_START;
+                    }
+                    if let Some(ms) = event_retry_ms(&event) {
+                        retry_hint = Some(Duration::from_millis(ms).min(RESUME_DELAY_MAX));
+                    }
+                    if let Some(data) = event_data(&event)
+                        && let Ok(v) = serde_json::from_str::<Value>(&data)
+                    {
+                        let is_answer = expect_id.is_some_and(|id| {
+                            v.get("id") == Some(id) && v.get("method").is_none()
+                        });
+                        self.deliver(v, is_initialize, list_id).await;
+                        if is_answer {
+                            answered = true;
+                        }
+                    }
+                    if answered && expect_id.is_some() {
+                        return Ok(());
                     }
                 }
-                if answered && expect_id.is_some() {
-                    return Ok(());
+            };
+            if answered {
+                return Ok(());
+            }
+            let Some(resume_from) = last_event_id.clone() else {
+                return Err(broke.unwrap_or_else(|| "the remote event stream ended without an answer".into()));
+            };
+            if failed_resumes >= MAX_RESUME_ATTEMPTS || total_resumes >= MAX_RESUMES_TOTAL {
+                return Err(format!(
+                    "the remote event stream ended without an answer after {total_resumes} resume attempts"
+                ));
+            }
+            failed_resumes += 1;
+            total_resumes += 1;
+            let delay = retry_hint.unwrap_or(backoff);
+            backoff = (backoff * 2).min(RESUME_DELAY_MAX);
+            tokio::time::sleep(delay).await;
+            tracing::debug!(server = %self.server, attempt = total_resumes, "resuming a broken answer stream");
+            resp = match self.open_get_stream(Some(&resume_from)).await {
+                Ok(r) => Some(r),
+                Err(GetStreamError::Fatal(why)) => {
+                    return Err(format!("the remote event stream broke and cannot be resumed ({why})"));
+                }
+                // Counted as a failed attempt; retried within the bounds.
+                Err(GetStreamError::Transient) => None,
+            };
+        }
+    }
+
+    /// Open `GET <url>` with `Accept: text/event-stream`, the session
+    /// headers and (optionally) `Last-Event-ID`; one forced refresh on 401.
+    async fn open_get_stream(&self, last_event_id: Option<&str>) -> Result<reqwest::Response, GetStreamError> {
+        let mut forced = false;
+        let resp = loop {
+            let auth = self
+                .auth(forced)
+                .await
+                .map_err(|_| GetStreamError::Fatal("credential unavailable"))?;
+            let client = self
+                .client_for(&auth.url)
+                .await
+                .map_err(|_| GetStreamError::Transient)?;
+            // Long-lived: no overall timeout, only connect/idle limits of the
+            // pinned client.
+            let mut req = client.get(auth.url.clone()).header("Accept", "text/event-stream");
+            req = super::connect::apply_upstream_headers(req, &auth);
+            {
+                let s = self.session.lock().await;
+                if let Some(id) = &s.session_id {
+                    req = req.header("Mcp-Session-Id", id);
+                }
+                if let Some(v) = &s.protocol_version {
+                    req = req.header("MCP-Protocol-Version", v);
                 }
             }
+            if let Some(id) = last_event_id {
+                req = req.header("Last-Event-ID", id);
+            }
+            let resp = req.send().await.map_err(|_| GetStreamError::Transient)?;
+            if resp.status().as_u16() == 401 && !forced {
+                forced = true;
+                continue;
+            }
+            break resp;
+        };
+        match resp.status().as_u16() {
+            405 => return Err(GetStreamError::Fatal("server offers no GET stream")),
+            404 => return Err(GetStreamError::Fatal("session gone")),
+            401 | 403 => return Err(GetStreamError::Fatal("credential refused")),
+            s if !(200..300).contains(&s) => return Err(GetStreamError::Transient),
+            _ => {}
         }
-        if !answered {
-            return Err("the remote event stream ended without an answer".into());
+        let is_sse = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|c| c.to_ascii_lowercase().starts_with("text/event-stream"));
+        if !is_sse {
+            return Err(GetStreamError::Fatal("not an event stream"));
         }
-        Ok(())
+        Ok(resp)
     }
 
     async fn close_session(&self) {
@@ -366,57 +472,11 @@ impl Bridge {
     }
 
     async fn server_stream_once(&self, last_event_id: &mut Option<String>) -> StreamEnd {
-        let mut forced = false;
-        let resp = loop {
-            let auth = match self.auth(forced).await {
-                Ok(a) => a,
-                Err(_) => return StreamEnd::Stop("credential unavailable"),
-            };
-            let client = match self.client_for(&auth.url).await {
-                Ok(c) => c,
-                Err(_) => return StreamEnd::Retry,
-            };
-            // Long-lived: no overall timeout, only connect/idle limits of the
-            // pinned client.
-            let mut req = client.get(auth.url.clone()).header("Accept", "text/event-stream");
-            req = super::connect::apply_upstream_headers(req, &auth);
-            {
-                let s = self.session.lock().await;
-                if let Some(id) = &s.session_id {
-                    req = req.header("Mcp-Session-Id", id);
-                }
-                if let Some(v) = &s.protocol_version {
-                    req = req.header("MCP-Protocol-Version", v);
-                }
-            }
-            if let Some(id) = last_event_id.as_deref() {
-                req = req.header("Last-Event-ID", id);
-            }
-            let resp = match req.send().await {
-                Ok(r) => r,
-                Err(_) => return StreamEnd::Retry,
-            };
-            if resp.status().as_u16() == 401 && !forced {
-                forced = true;
-                continue;
-            }
-            break resp;
+        let resp = match self.open_get_stream(last_event_id.as_deref()).await {
+            Ok(r) => r,
+            Err(GetStreamError::Fatal(why)) => return StreamEnd::Stop(why),
+            Err(GetStreamError::Transient) => return StreamEnd::Retry,
         };
-        match resp.status().as_u16() {
-            405 => return StreamEnd::Stop("server offers no GET stream"),
-            404 => return StreamEnd::Stop("session gone"),
-            401 | 403 => return StreamEnd::Stop("credential refused"),
-            s if !(200..300).contains(&s) => return StreamEnd::Retry,
-            _ => {}
-        }
-        let is_sse = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|c| c.to_ascii_lowercase().starts_with("text/event-stream"));
-        if !is_sse {
-            return StreamEnd::Stop("not an event stream");
-        }
         let mut resp = resp;
         let mut buf: Vec<u8> = Vec::new();
         let mut progressed = false;
@@ -454,6 +514,38 @@ enum StreamEnd {
     Progress,
     /// Reconnect after the current backoff.
     Retry,
+}
+
+/// Why opening a `GET` stream failed.
+enum GetStreamError {
+    /// Do not try again (the reason is a fixed phrase).
+    Fatal(&'static str),
+    /// Network trouble or a 5xx: may be tried again.
+    Transient,
+}
+
+/// Resume attempts in a row without a new event id before a request fails.
+pub(crate) const MAX_RESUME_ATTEMPTS: u32 = 5;
+/// Resume attempts for one request in total.
+pub(crate) const MAX_RESUMES_TOTAL: u32 = 20;
+const RESUME_BACKOFF_START: Duration = Duration::from_secs(1);
+/// Cap on the server's `retry:` hint and on the backoff.
+const RESUME_DELAY_MAX: Duration = Duration::from_secs(30);
+
+/// The `retry:` field of one SSE event in milliseconds (digits only).
+pub(crate) fn event_retry_ms(event: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(event);
+    let mut out = None;
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(rest) = line.strip_prefix("retry:") {
+            let v = rest.strip_prefix(' ').unwrap_or(rest);
+            if !v.is_empty() && v.len() <= 10 && v.bytes().all(|b| b.is_ascii_digit()) {
+                out = v.parse().ok();
+            }
+        }
+    }
+    out
 }
 
 const STREAM_BACKOFF_START: Duration = Duration::from_secs(1);
@@ -612,6 +704,9 @@ mod tests {
         assert!(event_data(b": comment only").is_none());
         assert_eq!(event_id(b"id: 42\ndata: {}").as_deref(), Some("42"));
         assert_eq!(event_id(b"data: {}"), None);
+        assert_eq!(event_retry_ms(b"id: 1\nretry: 250\ndata:"), Some(250));
+        assert_eq!(event_retry_ms(b"retry: -5"), None);
+        assert_eq!(event_retry_ms(b"data: {}"), None);
     }
 
     #[test]

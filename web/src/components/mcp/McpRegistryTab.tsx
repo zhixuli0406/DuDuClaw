@@ -246,7 +246,13 @@ function RegistryInstallDialog({
         onDone(null);
       } else if (res.remote && res.needs_connect) {
         toast.success(intl.formatMessage({ id: 'mcp.registry.installedConnect' }, { server: name }));
-        onDone({ agentId, name, auth: res.remote_needs_bearer ? 'bearer' : 'oauth', locked: true });
+        onDone({
+          agentId,
+          name,
+          auth: res.remote_needs_bearer ? 'bearer' : 'oauth',
+          locked: true,
+          declaredHeaders: res.remote_headers ?? hit.remote_headers ?? [],
+        });
       } else {
         toast.success(intl.formatMessage({ id: 'mcp.added' }, { server: name, agent: agentId }));
         onDone(null);
@@ -296,6 +302,14 @@ function RegistryInstallDialog({
           {mode === 'remote' && (
             <p className="text-xs text-muted-foreground">
               {intl.formatMessage({ id: isAdmin ? 'mcp.registry.remoteNext' : 'mcp.registry.remoteNextNonAdmin' })}
+            </p>
+          )}
+          {mode === 'remote' && (hit.remote_headers?.length ?? 0) > 0 && (
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage(
+                { id: 'mcp.registry.remoteHeaders' },
+                { headers: (hit.remote_headers ?? []).map((h) => h.name).join(', ') },
+              )}
             </p>
           )}
           {!isAdmin && <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'mcp.registry.requestNote' })}</p>}

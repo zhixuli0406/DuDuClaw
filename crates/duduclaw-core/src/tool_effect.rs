@@ -643,6 +643,17 @@ impl ProcessLane {
         Self::from_env_value(std::env::var_os(ENV_LANE).as_deref())
     }
 
+    /// The `lane` a delegation written by a process in this lane carries
+    /// (`message_queue.lane`, a `bus_queue.jsonl` entry's `lane`): `Some`
+    /// for every lane but the normal one (an invalid value stays read-only),
+    /// so the receiving run cannot leave the lane by being handed the work.
+    pub fn delegation_stamp(&self) -> Option<&'static str> {
+        match self {
+            ProcessLane::Normal => None,
+            ProcessLane::Explore | ProcessLane::Invalid => Some(LANE_EXPLORE),
+        }
+    }
+
     /// May a tool of this class be listed and called in this lane?
     pub fn permits(&self, effect: ToolEffect) -> bool {
         match self {
@@ -842,5 +853,13 @@ mod tests {
         assert!(!ProcessLane::Explore.permits(ToolEffect::Send));
         assert!(!ProcessLane::Invalid.permits(ToolEffect::Read));
         assert!(ProcessLane::Normal.permits(ToolEffect::Admin));
+    }
+
+    #[test]
+    fn a_delegation_written_in_any_restricted_lane_is_read_only_too() {
+        assert_eq!(ProcessLane::Normal.delegation_stamp(), None);
+        assert_eq!(ProcessLane::Explore.delegation_stamp(), Some(LANE_EXPLORE));
+        // An unrecognised value never turns into "normal" on the next hop.
+        assert_eq!(ProcessLane::Invalid.delegation_stamp(), Some(LANE_EXPLORE));
     }
 }

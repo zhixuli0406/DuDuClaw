@@ -205,6 +205,8 @@ impl MethodHandler {
                 map.insert("registry_version".into(), json!(version_label));
                 map.insert("remote".into(), json!(remote));
                 map.insert("remote_needs_bearer".into(), json!(hit.remote_needs_bearer));
+                // Declared headers the connect dialog asks for (2026-10-08).
+                map.insert("remote_headers".into(), json!(if remote { hit.remote_headers.clone() } else { Vec::new() }));
                 map.insert("mode".into(), json!(if is_admin { "installed" } else { "requested" }));
                 WsFrame::Response { id, ok: true, payload: Some(Value::Object(map)), error }
             }
@@ -401,7 +403,8 @@ impl MethodHandler {
         }
     }
 
-    /// `mcp.events_subscribe { agent_id, server, event_types, mode? }` —
+    /// `mcp.events_subscribe { agent_id, server, event_types, mode?, delivery?,
+    /// arguments? }` (`delivery`: webhook default, poll, auto) —
     /// Admin only. Subscribes the employee's remote server's events to this
     /// gateway's webhook. `mode`: `explore` (default, read-only runs) or
     /// `normal` (an explicit operator opt-in).
@@ -417,8 +420,32 @@ impl MethodHandler {
             "normal" => crate::mcp_events::store::EventMode::Normal,
             _ => return WsFrame::error_response("", "mode must be explore or normal"),
         };
-        match crate::mcp_events::service::subscribe(&self.home_dir, &agent_id, &server, &types, mode).await {
+        let delivery = match str_param(&params, "delivery").unwrap_or("webhook") {
+            "webhook" => crate::mcp_events::service::DeliveryChoice::Webhook,
+            "poll" => crate::mcp_events::service::DeliveryChoice::Poll,
+            "auto" => crate::mcp_events::service::DeliveryChoice::Auto,
+            _ => return WsFrame::error_response("", "delivery must be webhook, poll or auto"),
+        };
+        let arguments: std::collections::BTreeMap<String, Value> = match params.get("arguments") {
+            None | Some(Value::Null) => Default::default(),
+            Some(Value::Object(o)) => o.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            Some(_) => return WsFrame::error_response("", "arguments must be an object of event name: arguments object"),
+        };
+        let opts = crate::mcp_events::service::SubscribeOptions { delivery, arguments };
+        match crate::mcp_events::service::subscribe_with(&self.home_dir, &agent_id, &server, &types, mode, opts).await {
             Ok(v) => WsFrame::ok_response("", json!({ "subscription": v })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `mcp.events_discover { agent_id, server }` — Admin only. The remote
+    /// server's `events/list` (names, delivery modes, argument and payload
+    /// schemas) for the subscribe form. Server text is data.
+    pub(crate) async fn handle_mcp_events_discover(&self, params: Value) -> WsFrame {
+        let agent_id = str_param(&params, "agent_id").unwrap_or("").to_string();
+        let server = str_param(&params, "server").unwrap_or("").to_string();
+        match crate::mcp_events::service::discover(&self.home_dir, &agent_id, &server).await {
+            Ok(events) => WsFrame::ok_response("", json!({ "events": events })),
             Err(e) => WsFrame::error_response("", &e),
         }
     }

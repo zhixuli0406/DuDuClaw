@@ -176,6 +176,10 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_mcp_events_subscribe(params).await
             }
+            "mcp.events_discover" => {
+                require_admin!();
+                self.handle_mcp_events_discover(params).await
+            }
             "mcp.events_list" => {
                 require_admin!();
                 self.handle_mcp_events_list(params).await

@@ -4,7 +4,7 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { useAuthStore } from '@/stores/auth-store';
 import { McpRegistryTab } from './McpRegistryTab';
-import { RemoteConnectDialog, isValidServerName, sanitizeServerName } from './RemoteServersTab';
+import { RemoteConnectDialog, isValidServerName, mergeDeclaredHeaders, sanitizeServerName } from './RemoteServersTab';
 
 vi.mock('@/lib/external-link', () => ({ openExternal: vi.fn() }));
 import { openExternal } from '@/lib/external-link';
@@ -149,6 +149,47 @@ describe('RemoteConnectDialog', () => {
     const call = mockWsClient.call.mock.calls.find((c) => c[0] === 'mcp.remote_connect');
     expect(call?.[1]).not.toHaveProperty('redirect_origin');
   });
+
+  it('asks for each declared registry header, masks secret ones and requires the required ones', async () => {
+    mockWsClient.call.mockResolvedValue({ status: 'connected', agent_id: 'nova', server: 'srv' });
+    renderWithProviders(
+      <RemoteConnectDialog
+        open
+        onClose={() => {}}
+        agents={agents}
+        initial={{
+          agentId: 'nova', name: 'srv', auth: 'none', locked: true,
+          declaredHeaders: [
+            { name: 'X-API-Key', description: 'Your key', required: true, secret: true },
+            { name: 'X-Region', description: '', required: false, secret: false },
+          ],
+        }}
+      />,
+    );
+    const submit = screen.getByRole('button', { name: /^connect$/i });
+    expect(submit).toBeDisabled();
+    const key = screen.getByLabelText(/X-API-Key/);
+    expect(key).toHaveAttribute('type', 'password');
+    expect(screen.getByLabelText(/X-Region/)).toHaveAttribute('type', 'text');
+    fireEvent.change(key, { target: { value: 'k-1' } });
+    expect(submit).not.toBeDisabled();
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenCalledWith('mcp.remote_connect', expect.objectContaining({ headers: { 'X-API-Key': 'k-1' } })),
+    );
+  });
+});
+
+describe('mergeDeclaredHeaders', () => {
+  it('lets declared fields win over a same-named free-text line and drops empty optional ones', () => {
+    const declared = [
+      { name: 'X-API-Key', description: '', required: true, secret: true },
+      { name: 'X-Region', description: '', required: false, secret: false },
+    ];
+    expect(mergeDeclaredHeaders(declared, { 'X-API-Key': ' k ' }, 'x-api-key: old\nX-Other: o')).toEqual({ 'X-Other': 'o', 'X-API-Key': 'k' });
+    expect(mergeDeclaredHeaders(declared, {}, 'bad line')).toBeNull();
+    expect(mergeDeclaredHeaders([], {}, '')).toEqual({});
+  });
 });
 
 describe('McpPage remote catalogue cards (E3)', () => {
@@ -238,14 +279,93 @@ describe('McpEventsPanel', () => {
     renderWithProviders(<McpEventsPanel servers={servers} />);
     expect(await screen.findAllByTestId('event-sub-row')).toHaveLength(1);
     expect(screen.getByText(/public_base_url/)).toBeInTheDocument();
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'nova/pager' } });
-    fireEvent.change(screen.getByPlaceholderText(/incident.created/), { target: { value: 'a.b, c' } });
+    fireEvent.change(screen.getByLabelText('Server'), { target: { value: 'nova/pager' } });
+    fireEvent.change(screen.getByPlaceholderText('incident.created, email.received'), { target: { value: 'a.b, c' } });
     fireEvent.click(screen.getByRole('button', { name: /^subscribe$/i }));
     await waitFor(() =>
       expect(mockWsClient.call).toHaveBeenCalledWith('mcp.events_subscribe', {
         agent_id: 'nova', server: 'pager', event_types: ['a.b', 'c'], mode: 'explore',
       }),
     );
+  });
+});
+
+describe('McpEventsPanel discovery and poll mode', () => {
+  const servers = [
+    {
+      agent_id: 'nova', server: 'pager', auth: 'none' as const, host: 'x', status: 'connected' as const,
+      access_expires_at: null, access_token_expired: false, has_refresh_token: false, installed: true,
+      created_at: '', updated_at: '',
+    },
+  ];
+
+  it('lists the server events, adds one to the form and subscribes by poll with arguments', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'mcp.events_list') {
+        return Promise.resolve({ public_base_url_set: false, public_base_url_problem: 'set it', subscriptions: [] });
+      }
+      if (method === 'mcp.events_discover') {
+        return Promise.resolve({
+          events: [
+            { name: 'incident.created', description: 'New incident', delivery: ['poll'], input_schema: { properties: { severity: {} } }, payload_schema: null },
+          ],
+        });
+      }
+      return Promise.resolve({ subscription: {} });
+    });
+    const { McpEventsPanel } = await import('./McpEventsPanel');
+    renderWithProviders(<McpEventsPanel servers={servers} />);
+    fireEvent.change(await screen.findByLabelText('Server'), { target: { value: 'nova/pager' } });
+    fireEvent.click(screen.getByRole('button', { name: /list server events/i }));
+    const found = await screen.findByTestId('events-discovered');
+    expect(found).toHaveTextContent('incident.created');
+    expect(found).toHaveTextContent('poll');
+    expect(found).toHaveTextContent('severity');
+    fireEvent.click(screen.getByRole('button', { name: /incident\.created/ }));
+    expect(screen.getByPlaceholderText('incident.created, email.received')).toHaveValue('incident.created');
+    fireEvent.change(screen.getByLabelText(/^delivery$/i), { target: { value: 'poll' } });
+    // Poll needs no public base URL: the warning goes away.
+    expect(screen.queryByText(/public_base_url/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/arguments per event type/i), { target: { value: '{"incident.created": {"severity": "P1"}}' } });
+    fireEvent.click(screen.getByRole('button', { name: /^subscribe$/i }));
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenCalledWith('mcp.events_subscribe', {
+        agent_id: 'nova', server: 'pager', event_types: ['incident.created'], mode: 'explore',
+        delivery: 'poll', arguments: { 'incident.created': { severity: 'P1' } },
+      }),
+    );
+  });
+
+  it('refuses malformed arguments before calling the gateway and shows gaps and delivery problems', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'mcp.events_list') {
+        return Promise.resolve({
+          public_base_url_set: true,
+          public_base_url_problem: null,
+          subscriptions: [
+            {
+              id: 'mev_2', agent_id: 'nova', server: 'pager', event_types: ['x'], mode: 'explore', delivery: 'poll',
+              status: 'active', callback_url: null, created_at: '', updated_at: '', rotated_at: null,
+              last_delivery_at: null, deliveries: 0,
+              upstream: [{ name: 'x', truncated: true, delivery_status: { active: false, last_error: 'http_4xx' } }],
+            },
+          ],
+        });
+      }
+      return Promise.resolve({ subscription: {} });
+    });
+    const { McpEventsPanel } = await import('./McpEventsPanel');
+    renderWithProviders(<McpEventsPanel servers={servers} />);
+    expect(await screen.findByTestId('event-gap')).toBeInTheDocument();
+    expect(screen.getByTestId('event-delivery-problem')).toHaveTextContent('http_4xx');
+    // A poll subscription has no signing secret to replace.
+    expect(screen.queryByRole('button', { name: /replace signing secret/i })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Server'), { target: { value: 'nova/pager' } });
+    fireEvent.change(screen.getByPlaceholderText('incident.created, email.received'), { target: { value: 'x' } });
+    fireEvent.change(screen.getByLabelText(/arguments per event type/i), { target: { value: '[1]' } });
+    mockWsClient.call.mockClear();
+    fireEvent.click(screen.getByRole('button', { name: /^subscribe$/i }));
+    await waitFor(() => expect(mockWsClient.call).not.toHaveBeenCalledWith('mcp.events_subscribe', expect.anything()));
   });
 });
 

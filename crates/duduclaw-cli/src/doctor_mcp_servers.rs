@@ -76,7 +76,13 @@ fn describe_entry(entry: &serde_json::Value) -> String {
                 .unwrap_or_else(|| cmd.trim().to_string());
             format!("指令 {}", display_safe(&exe))
         }
-        _ if entry.get("url").is_some() => "遠端伺服器（網址不顯示）".to_string(),
+        _ if duduclaw_core::mcp_proxy_rewrite::is_direct_remote_entry(entry) => {
+            // 2026-10-08 close-out: the third-party tool gate cannot reach a
+            // direct remote entry, so gated runs drop it.
+            "遠端伺服器直連（網址不顯示）；有 action_rules 的員工與探索通道的工作不會載入它，\
+             請在儀表板「遠端伺服器」用 mcp.remote_connect 重新連線，改走 DuDuClaw 橋接"
+                .to_string()
+        }
         _ => "沒有指令欄位".to_string(),
     }
 }
@@ -171,6 +177,17 @@ pub(crate) fn mcp_servers_check(home: &Path) -> (String, CheckStatus, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_remote_entries_tell_the_operator_to_connect_them() {
+        let raw = serde_json::json!({ "mcpServers": {
+            "web": { "type": "http", "url": "https://mcp.example.com/s/KEY" }
+        }})
+        .to_string();
+        let list = other_servers(&raw).unwrap();
+        assert!(list[0].contains("mcp.remote_connect"), "{list:?}");
+        assert!(!list[0].contains("KEY"));
+    }
 
     #[test]
     fn remote_bridge_entries_are_recognised_with_their_connection_state() {

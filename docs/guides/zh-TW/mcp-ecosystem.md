@@ -18,8 +18,10 @@ DuDuClaw 的 AI 員工透過自己 `.mcp.json` 裡列的 MCP server 使用工具
 |------|------|
 | 沒有 DuDuClaw 能執行的套件或遠端端點 | 只有 `nuget`、`mcpb` 等套件 |
 | 只提供舊版 SSE 連線方式 | 2024-11-05 的 HTTP+SSE 協定，原生橋接不支援 |
-| 需要自訂請求標頭 | 例如 `X-API-Key`；橋接只送 `Authorization` |
+| 需要 DuDuClaw 無法送出的請求標頭 | 例如 `Cookie`、`Host`；其他宣告的標頭（如 `X-API-Key`）會在連線時詢問 |
 | 已標示停用／已移除 | 註冊表如此標示 |
+
+宣告了 `Authorization` 以外標頭的代管端點可以安裝：連線步驟會為每個宣告的標頭詢問一個欄位（機密的是密碼欄，必填的一定要填），值與「額外標頭」一樣加密保存。最多詢問 16 個標頭；DuDuClaw 無法送出的選填標頭不會詢問。
 
 **安裝**時選擇員工與伺服器名稱，並填入套件的必填環境變數（存在該員工的 `.mcp.json`，只有操作者的系統使用者讀得到）。同時有套件與代管端點時，可以選要用哪一種。
 
@@ -45,7 +47,7 @@ Gateway 端的處理（`mcp.registry_install`）：
 }
 ```
 
-Claude CLI 把它當一般的 stdio MCP server 啟動。隱藏指令 `duduclaw mcp-remote-bridge` 把每一則 JSON-RPC 訊息（請求、通知與回應）以 Streamable HTTP 轉給伺服器，再把伺服器的回答（JSON 或 `text/event-stream`）寫回，記住 `Mcp-Session-Id`、送出協商好的 `MCP-Protocol-Version`，並在每個請求加上最新的 `Authorization: Bearer …`。
+Claude CLI 把它當一般的 stdio MCP server 啟動。隱藏指令 `duduclaw mcp-remote-bridge` 把每一則 JSON-RPC 訊息（請求、通知與回應）以 Streamable HTTP 轉給伺服器，再把伺服器的回答（JSON 或 `text/event-stream`）寫回，記住 `Mcp-Session-Id`、送出協商好的 `MCP-Protocol-Version`，並在每個請求加上最新的 `Authorization: Bearer …`。回應串流在回答送達前中斷時，橋接會續傳（`GET` 加 `Last-Event-ID`，遵守伺服器的 `retry:` 提示，上限 30 秒，否則從 1 秒倍增；連續 5 次沒有新事件或單一請求 20 次就失敗；`405`／`404`／`401`／`403` 或非串流回應直接失敗；伺服器必須替事件編號）。
 
 網址與所有登入資訊只存在 `<home>/remote_mcp/servers.json`（權限 0600、跨行程鎖），用 Gateway 的本機金鑰檔加密（AES-256-GCM，與頻道權杖、OAuth 權杖同一把）。無法加密時什麼都不存。`.mcp.json`、橋接的命令列與環境變數裡都沒有任何秘密。檔案中只有這些是明文：員工、伺服器名稱、登入方式、網址的主機、狀態、時間與是否有 refresh token。
 
@@ -154,17 +156,25 @@ action_rules = [
 
 **儀表板**：`MCP → 遠端伺服器 →「第三方工具與其動作類型」` 依員工顯示每個伺服器最近一次經 proxy 或橋接列出的工具（`<home>/mcp_tool_effects/<員工>/<伺服器>.json`），類型與決定依目前設定重新計算。伺服器要在某次工作階段經 DuDuClaw 列出工具後才會出現。這份快照只用於顯示；管制一律依當下的清單。
 
-**涵蓋的 runtime**：Claude CLI（它啟動 `.mcp.json` 的伺服器，spawn 交給它改寫後的設定）。Codex、Gemini、Antigravity、Grok 員工只登記 DuDuClaw 自己的伺服器，openai-compat 工具迴圈也只啟動 `duduclaw mcp-server`，沒有第三方伺服器可管。`.mcp.json` 中的 `url`／`type` 項目（CLI 直接連線）不涵蓋，請改以遠端伺服器連線。
+**涵蓋的 runtime**：Claude CLI（它啟動 `.mcp.json` 的伺服器，spawn 交給它改寫後的設定）。Codex、Gemini、Antigravity、Grok 員工只登記 DuDuClaw 自己的伺服器，openai-compat 工具迴圈也只啟動 `duduclaw mcp-server`，沒有第三方伺服器可管。`.mcp.json` 中的 `url`／`type` 項目（CLI 直接連線）無法管制，所以受管制的 spawn（有 `action_rules` 或在唯讀通道）會把它們從交給 CLI 的設定移除（稽核 `third_party_remote_entry_dropped`，`duduclaw doctor` 也會說明）；請改以遠端伺服器連線。管制用的 `.mcp.json` 副本建不出來時，這次 spawn 會被拒絕（稽核 `third_party_gate_config_unavailable`），不會在沒有管制的情況下啟動。
 
 ## 5. 遠端伺服器的事件（MCP Events）
 
-支援草案 MCP Events 擴充的遠端伺服器，可以在事情發生時（新事故、新郵件⋯）通知 Gateway。實作的是 Triggers & Events 工作小組設計草稿（`modelcontextprotocol/experimental-ext-triggers-events` 的 `docs/design-sketch-proposal.md`，2026-02-19 草案）中的 webhook 模式。
+支援草案 MCP Events 擴充的遠端伺服器，可以在事情發生時（新事故、新郵件⋯）通知 Gateway。實作的是 Triggers & Events 工作小組設計草稿（`modelcontextprotocol/experimental-ext-triggers-events` 的 `docs/design-sketch-proposal.md`，2026-02-19 草案）中的 webhook 與輪詢模式。
 
 **設定**
 
 1. 給 Gateway 一個伺服器連得到的位址：`config.toml [mcp_events] public_base_url = "https://hooks.example.com"`（反向代理或通道接到 Gateway 埠；只接受 `https`，測試時 loopback 位址可用 `http`）。單一訂閱的回呼位址是 `<public_base_url>/webhook/mcp-events/<id>`。
 2. 在**遠端伺服器**連線該伺服器（任何登入方式）。
 3. 在「遠端伺服器的事件」選擇伺服器、輸入事件名稱後**訂閱**。Gateway 會詢問伺服器（`initialize` 必須宣告 `capabilities.events`）、產生 `whsec_` 簽章金鑰、每個事件名稱呼叫一次 `events/subscribe`（`delivery: { mode: "webhook", url, secret }`，`ttlMs` 一天），並回應伺服器的驗證挑戰。排程（開機後每 10 分鐘）會在每份授權的 `refreshBefore` 之前重新訂閱。
+
+**選擇要訂閱什麼。**「列出伺服器的事件」會呼叫伺服器的 `events/list`（最多 10 頁／200 個事件類型；名稱、說明與 schema 都是伺服器的文字，只當資料顯示），列出每個事件類型提供的送達方式（`poll`、`push`、`webhook`）與訂閱參數名稱。選填的「各事件類型的參數」是 JSON 物件 `{ "<事件名稱>": { ... } }`（每個名稱一個物件，最多 4 KiB），會當作 `events/subscribe`／`events/poll` 的 `arguments` 送出。「送達方式」可選 Webhook（預設）、輪詢，或「依伺服器的清單」（`auto`：設了 `public_base_url` 且伺服器對每個事件類型都列出 webhook 時用 webhook，否則伺服器列出 poll 時用輪詢）。伺服器清單明說某事件類型不提供的方式會被拒絕；清單是空的或不完整的伺服器，則照你的選擇詢問，並顯示它的拒絕訊息。
+
+**Cursor、gap 與送達狀態。** Gateway 為每個事件名稱保存重播位置（草稿中不透明的 `cursor`）：帶 cursor 的事件、refresh 或 poll 的回應、`gap` 通知都會推進它；每次 refresh 會連同 `maxAgeMs`（`config.toml [mcp_events] max_age_ms`，預設 300000 = 5 分鐘，範圍 1 秒到 7 天）一起送回，所以停機過的 Gateway 能補上伺服器還留著的部分，而不會一次收到無上限的積壓。`eventId` 用來去除重播（每個事件名稱記最近 64 個）。伺服器回 `truncated: true` 或送來 `gap` 本文時，訂閱會被標記並寫入稽核；若事件類型提供 `poll`，會盡力用 gap 之前保存的位置輪詢一次。refresh 回應的 `deliveryStatus` 以精簡形式保存（`lastError` 只有 `connection_refused`、`timeout`、`tls_error`、`http_4xx`、`http_5xx`、`challenge_failed` 之一才保留）並顯示在訂閱上。
+
+**輪詢模式。** 不需要回呼位址也沒有簽章金鑰。訂閱時先送一次 `cursor: null` 的 `events/poll`（同時驗證名稱與參數），之後由 Gateway 輪詢：只在持有 Gateway 鎖的行程執行（同一資料目錄上的第二個 Gateway 不會輪詢）、最多 20 個輪詢訂閱、每個事件名稱不會比 `[mcp_events] poll_floor_ms`（預設 5000，至少 1000）更頻繁、至少每小時一次（伺服器的 `nextPollMs` 會被限制在這個範圍）、同時最多 4 個請求、`hasMore` 的積壓每輪最多接 10 批、失敗則退避（倍增到 15 分鐘）。cursor 在該批事件入庫後才存，當機後會重讀，`eventId` 負責丟掉重複。輪詢來的事件與 webhook 事件的處理完全相同（同樣的掃描、大小上限與唯讀通道）。
+
+**推播模式未實作。** 草稿中 `events/stream` 是每個訂閱一條獨立的長連線 POST，其 SSE 回應只承載 `notifications/events/*`（「不是通用的伺服器對用戶端通道」），所以不能借用橋接器可選的伺服器主動 `GET` 串流（那條串流承載伺服器送的所有其他訊息）。要做對，需要 Gateway 為每個訂閱維持一條連線、心跳看門狗與重連。也沒有監聽 `notifications/events/list_changed`（「列出伺服器的事件」是按需讀取清單）。
 
 **接收**（`POST /webhook/mcp-events/{id}`，一律掛載）：不認得的 id ⇒ `404`；超過 256 KiB ⇒ `413`；每個訂閱每分鐘超過 120 次 ⇒ `429`；必須有 Standard Webhooks 簽章（`webhook-id`、`webhook-timestamp`、`webhook-signature`，對 `id.timestamp.body` 的 HMAC-SHA256，常數時間比對，接受多個簽章）且時間戳記在 5 分鐘內，否則 `401`；有送 `X-MCP-Subscription-Id` 時必須是伺服器回傳過的 id；重複的 `webhook-id` 回覆成功但丟棄。控制訊息：`verification` 回傳挑戰值、`gap` 記入稽核、`terminated` 結束訂閱（之後的投遞回 `410`）。訂閱沒要求的事件名稱回 `410`（不會重送）。
 
@@ -173,11 +183,11 @@ action_rules = [
 - **自動化規則**：觸發 `mcp_event`（欄位 `server`、`name`、`agent_id`、`lane`、`suspicious` 與 `data.*`），由它產生的提示開頭有固定的安全提醒。
 - **持續責任**：事件來源 `mcp.event`，屬於訂閱的員工。
 
-**預設唯讀。** 事件啟動的工作（自動化規則的 `delegate` 或 `run_skill`）在唯讀通道執行：佇列訊息帶 `lane = "explore"`，Claude CLI 啟動時帶 `DUDUCLAW_LANE=explore`（DuDuClaw 工具只剩 `read`、`draft`）、內建工具只有 `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`，第三方伺服器經過管制的 proxy（第 4 節）。這與[唯讀持續任務](continuous-responsibilities.md)是同一條通道、同一個旗標，規則也相同：OpenAI 相容執行環境的員工可以執行，DuDuClaw 工具同樣受限，且不掛載 `agent.toml [mcp.external]` 伺服器；使用其他 runtime 或任務沙箱的員工在開始前就被拒絕（`explore_lane_unsupported`），MoA 模型與純本機推論也被拒絕（混合模式的本機分流略過）。訂閱時開啟「允許一般模式」，事件就能以員工平常的權限啟動工作；只有這種訂閱會喚醒持續責任（occurrence 是一般的目標任務），唯讀訂閱的事件在那裡記為 `dropped(explore_lane)`。
+**預設唯讀。** 事件啟動的工作（自動化規則的 `delegate` 或 `run_skill`）在唯讀通道執行：佇列訊息帶 `lane = "explore"`，Claude CLI 啟動時帶 `DUDUCLAW_LANE=explore`（DuDuClaw 工具只剩 `read`、`draft`）、內建工具只有 `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch`，第三方伺服器經過管制的 proxy（第 4 節）。這與[唯讀持續任務](continuous-responsibilities.md)是同一條通道、同一個旗標，規則也相同：OpenAI 相容執行環境的員工可以執行，DuDuClaw 工具同樣受限，且不掛載 `agent.toml [mcp.external]` 伺服器；Codex 員工以 `-s read-only` 與 `approval_policy=never` 執行（作業系統層的唯讀沙箱，不論員工自己的等級；Codex 在這個模式下拒絕所有 MCP 呼叫，所以沒有工具可呼叫）；使用其他 runtime（Gemini CLI、Antigravity、Grok）或任務沙箱的員工在開始前就被拒絕（`explore_lane_unsupported`），MoA 模型與純本機推論也被拒絕（混合模式的本機分流略過）。訂閱時開啟「允許一般模式」，事件就能以員工平常的權限啟動工作；只有這種訂閱會喚醒持續責任（occurrence 是一般的目標任務），唯讀訂閱的事件在那裡記為 `dropped(explore_lane)`。
 
 **金鑰**：以 Gateway 金鑰檔加密存在 `<home>/mcp_events/subscriptions.json`（0600）。「更換簽章金鑰」會在更新訂閱時把新的送給伺服器，舊的 15 分鐘內仍接受。「取消訂閱」先刪除本機訂閱（回呼位址立即回 `404`），再盡力呼叫 `events/unsubscribe`。稽核：`mcp_event_subscription_created`／`_rotated`／`_revoked`／`_refresh_failed`、`mcp_event_delivered`、`mcp_event_delivery_rejected`、`mcp_event_control`（只有 id、名稱與數量）。
 
-已驗證與假設：只讀得到設計草稿（OpenAI 關於 ChatGPT 支援的頁面無法取得）。未實作：poll 與 push 投遞、cursor 與重播（訂閱一律從「現在」開始）、`deliveryStatus`、`maxAgeMs`、`events/list`、訂閱 `arguments`（一律 `{}`）與選用的 `v1a` 伺服器簽章。只對本機假伺服器測試過。
+已驗證與假設：設計草稿（2026-02-19 草案）已在 2026-10-08 重新閱讀，上面的請求與回應形狀依它實作；OpenAI 關於 ChatGPT 支援的頁面無法取得。未實作：推播、`notifications/events/list_changed` 與選用的 `v1a` 伺服器簽章。只對本機假伺服器測試過（探索分頁、輪詢的啟動／積壓／去重／間隔下限、各項上限、單一 Gateway 規則、帶 cursor 的 refresh、`deliveryStatus`、`gap` 補抓）；沒有真的 MCP Events 提供者。
 
 ## RPC 一覽
 
@@ -189,21 +199,22 @@ action_rules = [
 | `mcp.remote_status { agent_id? }` | 管理者 | 不含秘密的紀錄（`header_names`、`server_stream`） |
 | `mcp.remote_disconnect { agent_id, name, forget? }` | 管理者 | 刪除登入資訊（`forget` 連項目一起移除），可行時再到服務商撤銷 |
 | `mcp.tool_effects { agent_id }` | 管理者 | 最近列出的第三方工具與類型、決定 |
-| `mcp.events_subscribe { agent_id, server, event_types, mode? }` | 管理者 | 訂閱（`mode` 預設 `explore`，或 `normal`） |
+| `mcp.events_subscribe { agent_id, server, event_types, mode?, delivery?, arguments? }` | 管理者 | 訂閱（`mode` 預設 `explore`，或 `normal`；`delivery` 預設 `webhook`，或 `poll`、`auto`；`arguments` 為 `{ 事件名稱: 物件 }`） |
+| `mcp.events_discover { agent_id, server }` | 管理者 | 伺服器的 `events/list` |
 | `mcp.events_list { agent_id? }` | 管理者 | 不含秘密的訂閱 |
 | `mcp.events_unsubscribe { id }` | 管理者 | 刪除後向伺服器取消訂閱 |
-| `mcp.events_rotate { id }` | 管理者 | 更換簽章金鑰 |
+| `mcp.events_rotate { id }` | 管理者 | 更換簽章金鑰（webhook 訂閱） |
 
 稽核事件（`security_audit.jsonl`）：`remote_mcp_connect_started`、`remote_mcp_connected`、`remote_mcp_connect_failed`、`remote_mcp_disconnected`、`remote_mcp_token_revocation`（員工、伺服器、主機、登入方式；不含網址路徑或權杖），以及第 4、5 節的事件。`duduclaw doctor` 的「員工 MCP 設定中的其他伺服器」一列會標出橋接項目的主機與連線狀態。
 
 ## 未涵蓋／未驗證
 
 - 沒有用真的 Zapier、Composio 帳號或真的第三方 OAuth 服務商測試；流程只對本機的假授權伺服器與假 MCP 伺服器驗證過。
-- 橋接不會續接回應 POST 的中斷事件串流；伺服器主動推送的 `GET` 串流需逐一開啟，只對本機假伺服器測試過。
-- 舊版 HTTP+SSE 伺服器仍走 `npx mcp-remote`（見上方）。註冊表中宣告必填標頭的項目仍顯示為無法安裝，請改用網址連線並填「額外標頭」。
+- 只有伺服器替事件編號（`id:`）並支援 `GET` 續傳時，才會續接中斷的回應串流；伺服器主動推送的 `GET` 串流需逐一開啟，只對本機假伺服器測試過。
+- 舊版 HTTP+SSE 伺服器仍走 `npx mcp-remote`（見上方）。註冊表中要求 DuDuClaw 無法送出的標頭（例如 `Cookie`）的項目顯示為無法安裝；若伺服器接受其他登入方式，請改用網址連線。
 - 只有授權伺服器宣告 `revocation_endpoint` 時才會到服務商撤銷，且為盡力而為。
 - 第三方工具分類依第 4 節所述採信伺服器的標記；儀表板讀的快照檔由員工自己的行程寫入。
-- MCP Events：見第 5 節結尾；Gateway 必須能以伺服器接受的 https 位址連到。
+- MCP Events：見第 5 節結尾；未實作推播；Gateway 必須能以伺服器接受的 https 位址連到。
 - 桌面版的儀表板來源（`tauri://…`）不是可接受的轉回來源；請用瀏覽器登入。
 - 員工與 Gateway 是同一個系統使用者：擁有不受限 Bash 的員工可以讀取金鑰檔與紀錄檔，或自行以自己的 `--agent` 啟動橋接。橋接會拒絕與行程 `DUDUCLAW_AGENT_ID` 不同的 `--agent`，但真正的隔離是不要開放 Bash。
 - 進行中的登入只存在 Gateway 記憶體：登入途中重啟 Gateway 就要重新開始。

@@ -16,8 +16,8 @@
 //!
 //! Before anything starts, the dispatcher refuses a run in the lane whose
 //! employee cannot carry it ([`dispatch_refusal`]): runtimes other than
-//! Claude and OpenAI-compatible, and task-sandboxed employees (the sandbox
-//! has a shell). The message is failed; a refused goal round is returned
+//! Claude, Codex and OpenAI-compatible, and task-sandboxed employees (the
+//! sandbox has a shell). The message is failed; a refused goal round is returned
 //! unrun. Inside the run, whichever source set the flag:
 //!
 //! - **Claude CLI** (`claude_runner::prepare_claude_cmd`, and
@@ -34,8 +34,17 @@
 //!   starts the DuDuClaw MCP server with the lane variable ([`lane_env`]) and,
 //!   in the lane, mounts no `agent.toml [mcp.external]` server (those would
 //!   run ungated).
+//! - **Codex** (`runtime::codex`): `-s read-only` + `approval_policy=never`
+//!   ([`codex_sandbox_args`]) whatever the employee's capability level (the
+//!   lane only narrows; the OS sandbox ignores config allow lists and blocks
+//!   writes and network), the DuDuClaw server registered with
+//!   `DUDUCLAW_LANE=explore` in its `-c` env overrides, and no third-party
+//!   server added by the gateway. Codex 0.156.1 rejects every MCP call under
+//!   `-s read-only` (live-verified 2026-09-24), so no MCP tool, DuDuClaw or
+//!   third-party, is callable in the lane; servers in the operator's own
+//!   `~/.codex/config.toml` may still be started by Codex but cannot be used.
 //! - **Refused inside the run** (fail closed, `explore_lane_unsupported`):
-//!   Codex, Gemini CLI, Antigravity, Grok and generic CLI `execute`
+//!   Gemini CLI, Antigravity, Grok and generic CLI `execute`
 //!   ([`refuse_unsupported_runtime`], reachable through failover); a MoA
 //!   model and `inference_mode = "local"` in `claude_runner`. The hybrid
 //!   local offload is skipped.
@@ -62,8 +71,31 @@ pub fn is_explore(raw: Option<&str>) -> bool {
 
 /// Whether an employee whose `[runtime] provider` is `provider` can run
 /// work in the explore lane.
+///
+/// Claude (tool allowlist + gated MCP), Codex (`-s read-only` OS sandbox) and
+/// OpenAI-compatible (no built-in tools). Antigravity, Gemini CLI, Grok and
+/// generic CLIs have no mechanism this gateway can show to be read-only and
+/// are refused.
 pub fn runtime_supported(provider: RuntimeType) -> bool {
-    matches!(provider, RuntimeType::Claude | RuntimeType::OpenAiCompat)
+    matches!(
+        provider,
+        RuntimeType::Claude | RuntimeType::Codex | RuntimeType::OpenAiCompat
+    )
+}
+
+/// Codex argument values inside the lane: always the OS-level read-only
+/// sandbox with `approval_policy=never`, whatever the employee's own
+/// capability level (the lane only narrows). Under `-s read-only` Codex
+/// rejects every MCP tool call (live-verified on 0.156.1, see
+/// `runtime::codex::sandbox_args`), so neither the DuDuClaw server nor any
+/// server in the operator's Codex configuration is callable in the lane.
+pub fn codex_sandbox_args() -> Vec<String> {
+    vec![
+        "-s".to_string(),
+        "read-only".to_string(),
+        "-c".to_string(),
+        "approval_policy=never".to_string(),
+    ]
 }
 
 /// Pre-dispatch check for a run of `agent_id` in the explore lane: the
@@ -74,7 +106,7 @@ pub fn dispatch_refusal(home: &std::path::Path, agent_id: &str) -> Option<String
     if !runtime_supported(settings.provider) {
         return Some(format!(
             "explore_lane_unsupported: runtime {} cannot run read-only (explore lane) work; \
-             switch the employee to Claude or an OpenAI-compatible runtime, or remove the lane",
+             switch the employee to Claude, Codex or an OpenAI-compatible runtime, or remove the lane",
             settings.provider.as_str()
         ));
     }
@@ -173,16 +205,20 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_and_openai_compat_carry_the_lane() {
-        assert!(runtime_supported(RuntimeType::Claude));
-        assert!(runtime_supported(RuntimeType::OpenAiCompat));
-        for r in [RuntimeType::Codex, RuntimeType::Gemini] {
-            assert!(!runtime_supported(r));
+    fn only_claude_codex_and_openai_compat_carry_the_lane() {
+        for r in [RuntimeType::Claude, RuntimeType::Codex, RuntimeType::OpenAiCompat] {
+            assert!(runtime_supported(r), "{r:?}");
         }
+        for r in [RuntimeType::Gemini, RuntimeType::Antigravity, RuntimeType::Grok] {
+            assert!(!runtime_supported(r), "{r:?}");
+        }
+        let args = codex_sandbox_args();
+        assert_eq!(args[..2], ["-s", "read-only"]);
+        assert!(!args.iter().any(|a| a.contains("bypass") || a.contains("approve")));
     }
 
     #[test]
-    fn sandboxed_or_codex_employee_is_refused() {
+    fn sandboxed_or_gemini_employee_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("agents").join("a");
         std::fs::create_dir_all(&a).unwrap();
@@ -196,12 +232,18 @@ mod tests {
         assert!(dispatch_refusal(dir.path(), "a").is_some());
         std::fs::write(
             a.join("agent.toml"),
-            "[agent]\nname = \"a\"\n[runtime]\nprovider = \"codex\"\n",
+            "[agent]\nname = \"a\"\n[runtime]\nprovider = \"gemini\"\n",
         )
         .unwrap();
         assert!(dispatch_refusal(dir.path(), "a")
             .unwrap()
             .starts_with("explore_lane_unsupported"));
+        std::fs::write(
+            a.join("agent.toml"),
+            "[agent]\nname = \"a\"\n[runtime]\nprovider = \"codex\"\n",
+        )
+        .unwrap();
+        assert!(dispatch_refusal(dir.path(), "a").is_none(), "Codex carries the lane");
     }
 
     #[tokio::test]
@@ -209,7 +251,7 @@ mod tests {
         let caps = CapabilitiesConfig::default();
         assert!(claude_tools(&caps).is_none());
         assert!(lane_env().is_none());
-        assert!(refuse_unsupported_runtime("codex").is_ok());
+        assert!(refuse_unsupported_runtime("gemini").is_ok());
         EXPLORE
             .scope(true, async {
                 let (tools, allowed) = claude_tools(&caps).unwrap();
@@ -223,7 +265,7 @@ mod tests {
                     lane_env(),
                     Some(("DUDUCLAW_LANE".to_string(), "explore".to_string()))
                 );
-                assert!(refuse_unsupported_runtime("codex").is_err());
+                assert!(refuse_unsupported_runtime("gemini").is_err());
                 // An explicit allowlist only narrows: Bash and other servers drop out.
                 let mut narrow = CapabilitiesConfig::default();
                 narrow.allowed_tools = vec!["Bash".into(), "Read".into(), "mcp__notion__*".into()];

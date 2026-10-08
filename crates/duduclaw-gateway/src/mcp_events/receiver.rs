@@ -169,9 +169,14 @@ pub async fn handle_at(home: &Path, id: &str, h: DeliveryHeaders<'_>, body: &[u8
     };
 
     if let Some(kind) = msg.get("type").and_then(|t| t.as_str()) {
-        return control(home, &rec, kind, &msg).await;
+        return control(home, &rec, kind, &msg, h.subscription_id).await;
     }
-    event(home, &rec, &msg, msg_id, now).await
+    match ingest_occurrence(home, &rec, &msg, msg_id, now).await {
+        Ok(Ingested::Recorded) => Answer::new(200, json!({ "ok": true })),
+        Ok(Ingested::Duplicate) => Answer::new(200, json!({ "ok": true, "duplicate": true })),
+        Ok(Ingested::NotSubscribed) => Answer::error(410, "event not subscribed"),
+        Err(()) => Answer::error(503, "temporarily unavailable"),
+    }
 }
 
 async fn control(
@@ -179,6 +184,7 @@ async fn control(
     rec: &store::EventSubscription,
     kind: &str,
     msg: &serde_json::Map<String, Value>,
+    upstream_id: Option<&str>,
 ) -> Answer {
     match kind {
         "verification" => {
@@ -203,32 +209,97 @@ async fn control(
             Answer::new(200, json!({ "ok": true }))
         }
         "gap" => {
-            super::audit(home, super::AUDIT_CONTROL, &rec.agent_id, json!({ "subscription": rec.id, "server": rec.server, "type": "gap" }));
+            // The server skipped events and names the position it resumes
+            // from: persist it (the old one is kept for one best-effort
+            // catch-up poll) and say so in the audit log.
+            let fresh = msg
+                .get("cursor")
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.is_empty() && c.len() <= 1024 && c.chars().all(|ch| !ch.is_control()))
+                .map(str::to_string);
+            let (home_o, id, up, fresh_o) = (home.to_path_buf(), rec.id.clone(), upstream_id.map(str::to_string), fresh.clone());
+            let marked = tokio::task::spawn_blocking(move || {
+                store::update(&home_o, &id, |r| {
+                    let mut hit = false;
+                    for u in r.upstream.iter_mut() {
+                        if up.as_deref().is_some_and(|x| u.upstream_id.as_deref() != Some(x)) {
+                            continue;
+                        }
+                        hit = true;
+                        u.truncated = true;
+                        u.gap_at = Some(store::now_rfc3339());
+                        if u.cursor.is_some() && u.cursor != fresh_o {
+                            u.gap_cursor = u.cursor.clone();
+                        }
+                        if fresh_o.is_some() {
+                            u.cursor = fresh_o.clone();
+                        }
+                    }
+                    Ok(hit)
+                })
+            })
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(false);
+            super::audit(home, super::AUDIT_CONTROL, &rec.agent_id, json!({ "subscription": rec.id, "server": rec.server, "type": "gap", "cursor_updated": marked && fresh.is_some() }));
+            if marked {
+                let (h2, id2) = (home.to_path_buf(), rec.id.clone());
+                tokio::spawn(async move {
+                    super::poll::catch_up_gaps(&h2, &id2).await;
+                });
+            }
             Answer::new(200, json!({ "ok": true }))
         }
         _ => Answer::new(200, json!({ "ok": true, "ignored": true })),
     }
 }
 
-/// Turn an accepted `EventOccurrence` into an `events.db` row.
-async fn event(
+/// What happened to one `EventOccurrence`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ingested {
+    Recorded,
+    /// Its `eventId` was recorded before (a replay): acknowledged, dropped.
+    Duplicate,
+    /// The name is not one this subscription asked for.
+    NotSubscribed,
+}
+
+/// Turn an accepted `EventOccurrence` (webhook body or poll entry) into an
+/// `events.db` row: de-duplicated by `eventId`, scanned, capped, marked with
+/// the subscription's lane; then the cursor and the id are remembered.
+/// `Err(())` = events.db or the store is unavailable (the caller retries).
+pub(crate) async fn ingest_occurrence(
     home: &Path,
     rec: &store::EventSubscription,
     msg: &serde_json::Map<String, Value>,
-    msg_id: &str,
+    fallback_id: &str,
     now: i64,
-) -> Answer {
+) -> Result<Ingested, ()> {
     let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("");
     if !rec.event_types.iter().any(|t| t == name) {
         // Not something this subscription asked for: do not retry it.
         super::audit(home, super::AUDIT_REJECTED, &rec.agent_id, json!({ "subscription": rec.id, "server": rec.server, "reason": "unexpected_event_name" }));
-        return Answer::error(410, "event not subscribed");
+        return Ok(Ingested::NotSubscribed);
     }
     let event_id = msg
         .get("eventId")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .map(|s| duduclaw_core::truncate_chars(s, 256).to_string())
-        .unwrap_or_else(|| msg_id.to_string());
+        .unwrap_or_else(|| fallback_id.to_string());
+    // A replay after a refresh or a poll catch-up can repeat an event.
+    let fresh_rec = {
+        let (h, id) = (home.to_path_buf(), rec.id.clone());
+        match tokio::task::spawn_blocking(move || store::get(&h, &id)).await {
+            Ok(Ok(Some(r))) => r,
+            Ok(Ok(None)) => return Ok(Ingested::NotSubscribed),
+            _ => return Err(()),
+        }
+    };
+    if store::seen_event(&fresh_rec, name, &event_id) {
+        return Ok(Ingested::Duplicate);
+    }
     let raw_data = msg.get("data").cloned().unwrap_or(Value::Null);
     let (data, suspicious, risk) = sanitize_data(&raw_data);
     let timestamp = msg
@@ -251,29 +322,27 @@ async fn event(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "mcp-events: events.db unavailable");
-            return Answer::error(503, "temporarily unavailable");
+            return Err(());
         }
     };
     if let Err(e) = bus.append(EVENT_NAME, &payload.to_string()).await {
         tracing::warn!(error = %e, "mcp-events: could not record the event");
-        return Answer::error(503, "temporarily unavailable");
+        return Err(());
     }
-    let (home_o, id) = (home.to_path_buf(), rec.id.clone());
-    let _ = tokio::task::spawn_blocking(move || {
-        store::update(&home_o, &id, |r| {
-            r.deliveries = r.deliveries.saturating_add(1);
-            r.last_delivery_at = Some(store::now_rfc3339());
-            Ok(true)
-        })
-    })
-    .await;
+    let cursor = msg
+        .get("cursor")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty() && c.len() <= 1024 && c.chars().all(|ch| !ch.is_control()))
+        .map(str::to_string);
+    let (home_o, id, name_o, eid) = (home.to_path_buf(), rec.id.clone(), name.to_string(), event_id.clone());
+    let _ = tokio::task::spawn_blocking(move || store::note_event(&home_o, &id, &name_o, &eid, cursor.as_deref())).await;
     super::audit(
         home,
         super::AUDIT_DELIVERED,
         &rec.agent_id,
         json!({ "subscription": rec.id, "server": rec.server, "name": name, "suspicious": suspicious, "risk_score": risk, "bytes": msg.get("data").map(|d| d.to_string().len()).unwrap_or(0) }),
     );
-    Answer::new(200, json!({ "ok": true }))
+    Ok(Ingested::Recorded)
 }
 
 /// Scan the event data with `input_guard` (never blocks: the operator chose

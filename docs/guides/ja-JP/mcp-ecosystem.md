@@ -18,8 +18,10 @@ DuDuClaw の AI 従業員は、自分の `.mcp.json` に並んだ MCP サーバ�
 |------|------|
 | DuDuClaw が実行できるパッケージやリモートがない | `nuget`、`mcpb` などのパッケージのみ |
 | 旧式の SSE 接続のみ | 2024-11-05 の HTTP+SSE プロトコル。ネイティブブリッジは非対応 |
-| カスタムリクエストヘッダーが必要 | 例：`X-API-Key`。ブリッジが送るのは `Authorization` だけ |
+| DuDuClaw が送れないリクエストヘッダーが必要 | 例：`Cookie`、`Host`。宣言された他のヘッダー（`X-API-Key` など）は接続時に入力を求めます |
 | 非推奨／削除済み | レジストリ上の表示 |
+
+`Authorization` 以外のヘッダーを宣言するホスト型エンドポイントはインストールできます。接続の手順で宣言されたヘッダーごとに入力欄が出ます（機密のものはパスワード欄、必須のものは入力が必要）。値は「追加ヘッダー」と同様に暗号化して保存されます。入力を求めるのは最大 16 ヘッダーで、DuDuClaw が送れない任意のヘッダーは含まれません。
 
 **インストール**では従業員とサーバー名を選び、パッケージの必須環境変数を入力します（その従業員の `.mcp.json` に保存され、オペレーターの OS ユーザーだけが読めます）。パッケージとホスト型エンドポイントの両方がある場合は、どちらを使うか選べます。
 
@@ -45,7 +47,7 @@ Gateway 側の処理（`mcp.registry_install`）：
 }
 ```
 
-Claude CLI はこれを通常の stdio MCP サーバーとして起動します。非表示コマンド `duduclaw mcp-remote-bridge` は、すべての JSON-RPC メッセージ（リクエスト、通知、レスポンス）を Streamable HTTP でサーバーに転送し、サーバーの応答（JSON または `text/event-stream`）を書き戻します。`Mcp-Session-Id` を保持し、ネゴシエートした `MCP-Protocol-Version` を送り、各リクエストに最新の `Authorization: Bearer …` を付けます。
+Claude CLI はこれを通常の stdio MCP サーバーとして起動します。非表示コマンド `duduclaw mcp-remote-bridge` は、すべての JSON-RPC メッセージ（リクエスト、通知、レスポンス）を Streamable HTTP でサーバーに転送し、サーバーの応答（JSON または `text/event-stream`）を書き戻します。`Mcp-Session-Id` を保持し、ネゴシエートした `MCP-Protocol-Version` を送り、各リクエストに最新の `Authorization: Bearer …` を付けます。応答が届く前にレスポンスストリームが切れた場合は再開します（`GET` と `Last-Event-ID`、サーバーの `retry:` ヒント（上限 30 秒）または 1 秒から倍増、新しいイベントなしの連続 5 回またはリクエストあたり 20 回で失敗、`405`／`404`／`401`／`403` やストリームでない応答は即失敗、サーバーがイベントに番号を付けている必要があります）。
 
 URL とすべての認証情報は `<home>/remote_mcp/servers.json`（権限 0600、プロセス間ロック）にだけ保存され、Gateway のマシン固有キーファイル（AES-256-GCM。チャネルトークンや OAuth トークンを守っているのと同じ鍵）で暗号化されます。暗号化できない場合は何も保存しません。`.mcp.json`、ブリッジのコマンドライン、環境変数のどこにも秘密情報は入りません。平文で残るのは、従業員、サーバー名、サインイン方式、URL のホスト、状態、時刻、リフレッシュトークンの有無だけです。
 
@@ -154,17 +156,25 @@ action_rules = [
 
 **ダッシュボード**：`MCP → リモートサーバー →「サードパーティのツールと動作の種類」` で、従業員ごとに各サーバーがプロキシまたはブリッジ経由で最後に一覧化したツール（`<home>/mcp_tool_effects/<従業員>/<サーバー>.json`）を、現在の設定で再計算した種類と判断付きで表示します。セッションが DuDuClaw 経由で一覧化した後にだけ表示されます。スナップショットは表示専用で、制御は常にその時点の一覧に従います。
 
-**対象ランタイム**：Claude CLI（`.mcp.json` のサーバーを起動し、spawn は書き換えた設定を渡します）。Codex、Gemini、Antigravity、Grok の従業員には DuDuClaw 自身のサーバーだけが登録され、openai-compat のツールループも `duduclaw mcp-server` しか起動しないため、制御すべきサードパーティサーバーはありません。`.mcp.json` の `url`／`type` 項目（CLI が直接接続）は対象外なので、リモートサーバーとして接続してください。
+**対象ランタイム**：Claude CLI（`.mcp.json` のサーバーを起動し、spawn は書き換えた設定を渡します）。Codex、Gemini、Antigravity、Grok の従業員には DuDuClaw 自身のサーバーだけが登録され、openai-compat のツールループも `duduclaw mcp-server` しか起動しないため、制御すべきサードパーティサーバーはありません。`.mcp.json` の `url`／`type` 項目（CLI が直接接続）は制御できないため、制御付きの spawn（`action_rules` がある、または読み取り専用レーン）では CLI に渡す設定から取り除かれます（監査 `third_party_remote_entry_dropped`、`duduclaw doctor` も案内します）。リモートサーバーとして接続してください。制御用の `.mcp.json` コピーを作れない場合、その spawn は拒否され（監査 `third_party_gate_config_unavailable`）、制御なしでは起動しません。
 
 ## 5. リモートサーバーからのイベント（MCP Events）
 
-草案の MCP Events 拡張に対応したリモートサーバーは、何かが起きたとき（新しいインシデント、新着メール…）に Gateway へ知らせられます。実装したのは Triggers & Events ワーキンググループの設計スケッチ（`modelcontextprotocol/experimental-ext-triggers-events` の `docs/design-sketch-proposal.md`、2026-02-19 付けの草案）の webhook モードです。
+草案の MCP Events 拡張に対応したリモートサーバーは、何かが起きたとき（新しいインシデント、新着メール…）に Gateway へ知らせられます。実装したのは Triggers & Events ワーキンググループの設計スケッチ（`modelcontextprotocol/experimental-ext-triggers-events` の `docs/design-sketch-proposal.md`、2026-02-19 付けの草案）の webhook モードとポーリングモードです。
 
 **設定**
 
 1. サーバーが到達できるアドレスを Gateway に与えます：`config.toml [mcp_events] public_base_url = "https://hooks.example.com"`（Gateway のポートへのリバースプロキシやトンネル。`https` のみ、テスト時はループバックに限り `http`）。購読ごとのコールバックは `<public_base_url>/webhook/mcp-events/<id>` です。
 2. **リモートサーバー**でそのサーバーに接続します（サインイン方式は問いません）。
 3. 「リモートサーバーからのイベント」でサーバーを選び、イベント名を入力して**購読**します。Gateway はサーバーに問い合わせ（`initialize` が `capabilities.events` を宣言している必要があります）、`whsec_` 署名用シークレットを作り、イベント名ごとに `events/subscribe`（`delivery: { mode: "webhook", url, secret }`、`ttlMs` は 1 日）を呼び、サーバーの検証チャレンジに応答します。スイープ（起動時とその後 10 分ごと）が各許可の `refreshBefore` の前に購読し直します。
+
+**購読対象の選択。**「サーバーのイベントを一覧表示」はサーバーの `events/list` を呼び出し（最大 10 ページ／200 イベント種別。名前・説明・スキーマはサーバーのテキストであり、データとして表示されます）、各イベント種別が提供する配信方法（`poll`、`push`、`webhook`）と購読引数の名前を表示します。任意の「イベント種別ごとの引数」は JSON オブジェクト `{ "<イベント名>": { ... } }`（名前ごとにオブジェクト、最大 4 KiB）で、`events/subscribe`／`events/poll` の `arguments` として送られます。「配信方法」は Webhook（既定）、ポーリング、「サーバーの一覧に従う」（`auto`：`public_base_url` が設定済みで、サーバーが指定したすべてのイベント種別に webhook を挙げていれば webhook、そうでなく poll を挙げていればポーリング）から選びます。サーバーの一覧がそのイベント種別では提供しないと示している方法は拒否されます。一覧が空または不完全なサーバーには選んだとおりに問い合わせ、その拒否メッセージを表示します。
+
+**カーソル、gap、配信ステータス。** Gateway はイベント名ごとに再生位置（草案の不透明な `cursor`）を保持します。カーソル付きのイベント、refresh や poll の応答、`gap` 通知で進み、refresh のたびに `maxAgeMs`（`config.toml [mcp_events] max_age_ms`、既定 300000 = 5 分、範囲 1 秒〜7 日）とともに送り返されるため、停止していた Gateway も、無制限のバックログを受け取らずにサーバーがまだ保持している分を取り戻せます。`eventId` で再生の重複を除きます（イベント名ごとに直近 64 件）。サーバーが `truncated: true` を返すか `gap` 本文を送ると、購読にフラグが付き監査に記録されます。イベント種別が `poll` を提供する場合は、gap 以前の位置でベストエフォートの poll を 1 回行います。refresh 応答の `deliveryStatus` は縮約して保持し（`lastError` は `connection_refused`、`timeout`、`tls_error`、`http_4xx`、`http_5xx`、`challenge_failed` のいずれかのときだけ残ります）、購読に表示されます。
+
+**ポーリングモード。** コールバックアドレスも署名用シークレットも要りません。購読時に `cursor: null` の `events/poll` を 1 回送り（名前と引数の確認も兼ねます）、その後は Gateway がポーリングします。Gateway ロックを持つプロセスだけが実行し（同じデータディレクトリの 2 つ目の Gateway は行いません）、ポーリング購読は最大 20 件、イベント名ごとに `[mcp_events] poll_floor_ms`（既定 5000、最小 1000）より頻繁にはならず、少なくとも 1 時間に 1 回（サーバーの `nextPollMs` はこの範囲に丸められます）、同時に 4 リクエストまで、`hasMore` のバックログは 1 回の巡回で最大 10 バッチ、失敗時は待ち時間を倍にして最大 15 分まで退避します。カーソルはバッチを記録した後で保存されるので、クラッシュ後は再読み込みされ、重複は `eventId` で捨てられます。ポーリングのイベントは webhook のイベントとまったく同じ扱い（同じスキャン、サイズ上限、読み取り専用レーン）です。
+
+**プッシュモードは未実装です。** 草案では `events/stream` は購読ごとの独立した長時間 POST で、その SSE 応答は `notifications/events/*` だけを運びます（「サーバーからクライアントへの汎用チャネルではない」）。そのため、サーバーが送る他のすべてのメッセージを運ぶ、ブリッジの任意のサーバー起点 `GET` ストリームには載せられません。きちんと実現するには、購読ごとに Gateway が接続を保持し、ハートビート監視と再接続が必要です。`notifications/events/list_changed` も待ち受けていません（「サーバーのイベントを一覧表示」は必要なときに一覧を読み込みます）。
 
 **受信**（`POST /webhook/mcp-events/{id}`、常にマウント）：不明な id ⇒ `404`、256 KiB 超 ⇒ `413`、購読ごとに毎分 120 件超 ⇒ `429`。Standard Webhooks の署名（`webhook-id`、`webhook-timestamp`、`webhook-signature`、`id.timestamp.body` の HMAC-SHA256、定数時間比較、複数署名可）と 5 分以内のタイムスタンプが必要で、なければ `401`。`X-MCP-Subscription-Id` が送られたら、サーバーが返した id でなければなりません。同じ `webhook-id` は成功を返して破棄します。制御メッセージ：`verification` はチャレンジを返し、`gap` は監査に記録、`terminated` は購読を終了（以後の配信は `410`）。購読していないイベント名は `410`（再送なし）。
 
@@ -173,13 +183,11 @@ action_rules = [
 - **自動化ルール**：トリガー `mcp_event`（項目 `server`、`name`、`agent_id`、`lane`、`suspicious`、`data.*`）。ここから作られるプロンプトの先頭には固定のセキュリティ注意書きが付きます。
 - **継続責任**：イベントソース `mcp.event`、購読の従業員のものです。
 
-**既定は読み取り専用。** イベントで始まる作業（自動化ルールの `delegate` や `run_skill`）は読み取り専用レーンで動きます。キューのメッセージに `lane = "explore"` が付き、Claude CLI は `DUDUCLAW_LANE=explore`（DuDuClaw のツールは `read`／`draft` のみ）、組み込みツールは `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch` だけ、サードパーティサーバーは制御付きプロキシ経由（第 4 節）で起動します。これは[読み取り専用の継続タスク](continuous-responsibilities.md)と同じレーン・同じフラグで、規則も同じです：OpenAI 互換ランタイムの従業員は実行でき、DuDuClaw のツールは同じく制限され、`agent.toml [mcp.external]` のサーバーはマウントされません。ほかのランタイムやタスクサンドボックスの従業員は開始前に拒否され（`explore_lane_unsupported`）、MoA モデルとローカル推論のみの設定も拒否されます（ハイブリッドのローカル振り分けは使いません）。購読時に「通常モードを許可」をオンにすると、イベントが従業員の通常の権限で作業を始められます。継続責任を起こすのはこの購読だけで（occurrence は通常の目標タスクです）、読み取り専用の購読のイベントはそこで `dropped(explore_lane)` と記録されます。
+**既定は読み取り専用。** イベントで始まる作業（自動化ルールの `delegate` や `run_skill`）は読み取り専用レーンで動きます。キューのメッセージに `lane = "explore"` が付き、Claude CLI は `DUDUCLAW_LANE=explore`（DuDuClaw のツールは `read`／`draft` のみ）、組み込みツールは `Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch` だけ、サードパーティサーバーは制御付きプロキシ経由（第 4 節）で起動します。これは[読み取り専用の継続タスク](continuous-responsibilities.md)と同じレーン・同じフラグで、規則も同じです：OpenAI 互換ランタイムの従業員は実行でき、DuDuClaw のツールは同じく制限され、`agent.toml [mcp.external]` のサーバーはマウントされません。Codex の従業員は `-s read-only` と `approval_policy=never` で実行されます（従業員自身のレベルにかかわらず OS レベルの読み取り専用サンドボックス。Codex はこのモードですべての MCP 呼び出しを拒否するため、呼び出せるツールはありません）。ほかのランタイム（Gemini CLI、Antigravity、Grok）やタスクサンドボックスの従業員は開始前に拒否され（`explore_lane_unsupported`）、MoA モデルとローカル推論のみの設定も拒否されます（ハイブリッドのローカル振り分けは使いません）。購読時に「通常モードを許可」をオンにすると、イベントが従業員の通常の権限で作業を始められます。継続責任を起こすのはこの購読だけで（occurrence は通常の目標タスクです）、読み取り専用の購読のイベントはそこで `dropped(explore_lane)` と記録されます。
 
 **シークレット**：Gateway のキーファイルで暗号化し `<home>/mcp_events/subscriptions.json`（0600）に保存します。「署名用シークレットを交換」は購読の更新で新しいものをサーバーに送り、古いものは 15 分間受け付けます。「購読を解除」はまずローカルの購読を消し（コールバックはすぐ `404`）、その後ベストエフォートで `events/unsubscribe` を呼びます。監査：`mcp_event_subscription_created`／`_rotated`／`_revoked`／`_refresh_failed`、`mcp_event_delivered`、`mcp_event_delivery_rejected`、`mcp_event_control`（id、名前、件数のみ）。
 
-検証済みと仮定：読めたのは設計スケッチだけです（ChatGPT の対応についての OpenAI のページは取得できませんでした）。poll と push の配信、カーソルと再生（購読は常に「今」から）、`deliveryStatus`、`maxAgeMs`、`events/list`、購読の `arguments`（常に `{}`）、任意の `v1a` サーバー署名は未実装です。テストはローカルの偽サーバーに対してのみです。
-
-## RPC 一覧
+検証済みと仮定：設計スケッチ（2026-02-19 草案）を 2026-10-08 に読み直し、上のリクエストと応答の形はそれに従っています。ChatGPT の対応についての OpenAI のページは取得できませんでした。未実装：プッシュ配信、`notifications/events/list_changed`、任意の `v1a` サーバー署名。テストはローカルの偽サーバーに対してのみです（探索ページング、ポーリングの開始／バックログ消化／重複排除／間隔の下限、各上限、単一 Gateway の規則、カーソル付き refresh、`deliveryStatus`、`gap` の取り戻し）。実際の MCP Events プロバイダーはありません。
 
 | メソッド | 対象 | 用途 |
 |----------|------|------|
@@ -189,21 +197,22 @@ action_rules = [
 | `mcp.remote_status { agent_id? }` | 管理者 | 秘密情報を含まない記録（`header_names`、`server_stream`） |
 | `mcp.remote_disconnect { agent_id, name, forget? }` | 管理者 | 認証情報の削除（`forget` で項目も削除）、可能ならプロバイダーで失効 |
 | `mcp.tool_effects { agent_id }` | 管理者 | 最後に一覧化されたサードパーティツールと種類・判断 |
-| `mcp.events_subscribe { agent_id, server, event_types, mode? }` | 管理者 | 購読（`mode` は既定 `explore`、または `normal`） |
+| `mcp.events_subscribe { agent_id, server, event_types, mode?, delivery?, arguments? }` | 管理者 | 購読（`mode` は既定 `explore`、または `normal`。`delivery` は既定 `webhook`、`poll`、`auto`。`arguments` は `{ イベント名: オブジェクト }`） |
+| `mcp.events_discover { agent_id, server }` | 管理者 | サーバーの `events/list` |
 | `mcp.events_list { agent_id? }` | 管理者 | 秘密情報を含まない購読 |
 | `mcp.events_unsubscribe { id }` | 管理者 | 削除してからサーバーで購読解除 |
-| `mcp.events_rotate { id }` | 管理者 | 署名用シークレットの交換 |
+| `mcp.events_rotate { id }` | 管理者 | 署名用シークレットの交換（webhook 購読） |
 
 監査イベント（`security_audit.jsonl`）：`remote_mcp_connect_started`、`remote_mcp_connected`、`remote_mcp_connect_failed`、`remote_mcp_disconnected`、`remote_mcp_token_revocation`（従業員、サーバー、ホスト、サインイン方式。URL のパスやトークンは含みません）、および第 4・5 節のイベント。`duduclaw doctor` の「員工 MCP 設定中的其他伺服器」行は、ブリッジ項目をホストと接続状態付きで表示します。
 
 ## 対象外／未検証
 
 - 実際の Zapier・Composio アカウントや、実在するサードパーティの OAuth プロバイダーではテストしていません。検証はローカルの偽の認可サーバーと偽の MCP サーバーに対してのみです。
-- ブリッジは POST への応答として切れたイベントストリームを再開しません。サーバー起点の `GET` ストリームはサーバーごとのオプトインで、ローカルの偽サーバーでのみテストしています。
-- 旧式の HTTP+SSE サーバーは引き続き `npx mcp-remote` を使います（上記）。必須ヘッダーを宣言するレジストリ項目は今もインストール不可と表示されるので、URL で接続して「追加ヘッダー」を使ってください。
+- 切れた応答ストリームは、サーバーがイベントに番号（`id:`）を付けて `GET` での再開に対応している場合だけ再開します。サーバー起点の `GET` ストリームはサーバーごとのオプトインで、ローカルの偽サーバーでのみテストしています。
+- 旧式の HTTP+SSE サーバーは引き続き `npx mcp-remote` を使います（上記）。DuDuClaw が送れないヘッダー（`Cookie` など）を要求するレジストリ項目はインストール不可と表示されます。サーバーが別のサインイン方法を受け付けるなら URL で接続してください。
 - プロバイダーでの失効は、認可サーバーが `revocation_endpoint` を宣言している場合だけで、ベストエフォートです。
 - サードパーティツールの分類は第 4 節のとおりサーバーのアノテーションを信じます。ダッシュボードが読むスナップショットは従業員自身のプロセスツリーが書きます。
-- MCP Events：第 5 節の最後を参照。Gateway はサーバーが受け付ける https アドレスで到達できる必要があります。
+- MCP Events：第 5 節の最後を参照。プッシュ配信は未実装です。Gateway はサーバーが受け付ける https アドレスで到達できる必要があります。
 - デスクトップアプリのダッシュボードのオリジン（`tauri://…`）はリダイレクト先として受け付けません。ブラウザからサインインしてください。
 - 従業員は Gateway と同じ OS ユーザーで動きます。制限のない Bash を持つ従業員はキーファイルや記録ファイルを読めたり、自分の `--agent` でブリッジを手動起動したりできます。ブリッジはプロセスの `DUDUCLAW_AGENT_ID` と異なる `--agent` を拒否しますが、本当の隔離は Bash を与えないことです。
 - 進行中のサインインは Gateway のメモリにだけあります。サインイン中に Gateway を再起動した場合はやり直してください。

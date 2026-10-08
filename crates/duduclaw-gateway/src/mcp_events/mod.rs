@@ -57,6 +57,7 @@
 //! ([`crate::explore_lane`]) unless the operator created the subscription
 //! with `mode = "normal"`.
 
+pub mod poll;
 pub mod receiver;
 pub mod service;
 pub mod signature;
