@@ -8,9 +8,11 @@
 //! Feed rows, pending approvals, settled responsibility runs and spend
 //! (`cost_telemetry.db`). It is saved as `<home>/digest/<date>.json` (what
 //! the dashboard home shows, RPC `digest.latest`) and sent as plain text to
-//! every active Admin account's verified linked channels. Off by default
-//! (`config.toml [digest] enabled = false`); `exclude_agents` opts employees
-//! out. Deduplicated per local date across restarts by
+//! every active Admin account's verified linked channels. On by default
+//! (owner decision 2026-10-08; `config.toml [digest] enabled = false` turns it
+//! off, and a `config.toml` that exists but cannot be read or parsed, or any
+//! wrong value in `[digest]`, also reads as off); `exclude_agents` opts
+//! employees out. Deduplicated per local date across restarts by
 //! `<home>/digest/state.json` (claimed under a file lock before anything is
 //! sent, so a crash between claim and send skips that day rather than
 //! sending twice).
@@ -51,31 +53,45 @@ impl DigestConfig {
     fn off() -> Self {
         Self {
             enabled: false,
+            ..Self::defaults()
+        }
+    }
+
+    fn defaults() -> Self {
+        Self {
+            enabled: true,
             hour: 8,
             timezone: chrono_tz::UTC,
             exclude_agents: Vec::new(),
         }
     }
 
-    /// `[digest] enabled` (bool, default false), `hour` (0–23, default 8),
+    /// `[digest] enabled` (bool, default true), `hour` (0–23, default 8),
     /// `timezone` (IANA, default UTC), `exclude_agents` (employee ids). Read
-    /// per tick. A wrong type or value anywhere reads as off.
+    /// per tick. No `config.toml` or no `[digest]` section ⇒ the defaults
+    /// (on). A `config.toml` that exists but cannot be read or parsed, a
+    /// non-table `[digest]`, or a wrong type or value anywhere reads as off.
     pub fn from_home(home: &Path) -> Self {
-        let Some(table) = std::fs::read_to_string(home.join("config.toml"))
-            .ok()
-            .and_then(|s| s.parse::<toml::Table>().ok())
-        else {
+        let text = match std::fs::read_to_string(home.join("config.toml")) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::defaults(),
+            Err(_) => return Self::off(),
+        };
+        let Ok(table) = text.parse::<toml::Table>() else {
             return Self::off();
         };
-        let Some(sec) = table.get("digest").and_then(|v| v.as_table()) else {
-            return Self::off();
-        };
-        Self::from_table(sec).unwrap_or_else(Self::off)
+        match table.get("digest") {
+            None => Self::defaults(),
+            Some(v) => match v.as_table() {
+                Some(sec) => Self::from_table(sec).unwrap_or_else(Self::off),
+                None => Self::off(),
+            },
+        }
     }
 
     fn from_table(sec: &toml::Table) -> Option<Self> {
         let enabled = match sec.get("enabled") {
-            None => false,
+            None => true,
             Some(v) => v.as_bool()?,
         };
         let hour = match sec.get("hour") {
@@ -626,9 +642,14 @@ mod digest_tests {
     }
 
     #[test]
-    fn config_is_off_by_default_and_fails_closed() {
+    fn config_is_on_by_default_and_fails_closed() {
         let d = tempfile::tempdir().unwrap();
-        assert!(!DigestConfig::from_home(d.path()).enabled);
+        assert!(DigestConfig::from_home(d.path()).enabled, "no config.toml");
+        assert!(DigestConfig::from_home(home_with("[gateway]\n").path()).enabled, "no [digest]");
+        assert!(DigestConfig::from_home(home_with("[digest]\nhour = 9\n").path()).enabled);
+        assert!(!DigestConfig::from_home(home_with("[digest]\nenabled = false\n").path()).enabled);
+        assert!(!DigestConfig::from_home(home_with("not = [valid").path()).enabled, "unparsable");
+        assert!(!DigestConfig::from_home(home_with("digest = 1\n").path()).enabled, "non-table");
         let d = home_with("[digest]\nenabled = true\nhour = 7\ntimezone = \"Asia/Taipei\"\n");
         let c = DigestConfig::from_home(d.path());
         assert!(c.enabled);

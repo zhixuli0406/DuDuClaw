@@ -160,28 +160,28 @@ daily_digest_at = "09:00"   # ローカル時刻
 ```toml
 # ~/.duduclaw/config.toml
 [digest]
-enabled = false            # 既定はオフ
+enabled = true             # 既定はオン。false でオフ
 hour = 8                   # 現地時刻の時（0–23）
 timezone = "Asia/Taipei"   # IANA タイムゾーン、既定は UTC
 exclude_agents = []        # 対象外にする従業員
 ```
 
-毎日 `timezone` の `hour` 以降に、ゲートウェイのインスタンスロック（`duduclaw_core::gateway_instance`）を持つゲートウェイが、モデルを呼ばずに従業員ごとの要約を組み立てます（`duduclaw-gateway/src/digest.rs`）：前回のダイジェスト以降（最大 7 日前まで）に完了したタスクとゴール、アクティビティ、承認待ち、精算済みの継続タスク実行、費用。報告することのない従業員は省きます。ダイジェストは `<home>/digest/<date>.json` に保存され、ダッシュボードのホーム（RPC `digest.latest`、閲覧者が読める従業員とタスクだけ）に表示され、有効な管理者全員の確認済み連携チャネルへプレーンテキストで送られます。`<home>/digest/state.json` が送信前にファイルロック下で現地日付を確保するため、再起動や 2 台目のゲートウェイで二重送信はしません（確保後・送信前のクラッシュではその日はスキップ）。`[digest]` のどこかに不正な値があればオフ扱いです。
+毎日 `timezone` の `hour` 以降に、ゲートウェイのインスタンスロック（`duduclaw_core::gateway_instance`）を持つゲートウェイが、モデルを呼ばずに従業員ごとの要約を組み立てます（`duduclaw-gateway/src/digest.rs`）：前回のダイジェスト以降（最大 7 日前まで）に完了したタスクとゴール、アクティビティ、承認待ち、精算済みの継続タスク実行、費用。報告することのない従業員は省きます。ダイジェストは `<home>/digest/<date>.json` に保存され、ダッシュボードのホーム（RPC `digest.latest`、閲覧者が読める従業員とタスクだけ）に表示され、有効な管理者全員の確認済み連携チャネルへプレーンテキストで送られます。`<home>/digest/state.json` が送信前にファイルロック下で現地日付を確保するため、再起動や 2 台目のゲートウェイで二重送信はしません（確保後・送信前のクラッシュではその日はスキップ）。既定はオンです（2026-10-08 オーナー決定）。`[digest]` セクションがなければ UTC 08:00 に動きます。`enabled = false` でオフになり、解析できない `config.toml` や `[digest]` 内の不正な値もオフ扱いです。
 
 ホームの完了項目にはそれぞれ 👍／👎／「修正が必要」（任意のメモ付き）があります。RPC `digest.feedback` には従業員に対する Operator とタスクの公開範囲チェックが必要で、`done` のタスクだけが対象です。行は `<home>/feedback.jsonl`（進化の振り返りのユーザーフィードバック信号が既に読むファイル）に、`type` `positive`／`negative`／`correction` と `source = "deliverable"`、`item_kind`、`item_id`、`verdict`、`user_id`、`note` 付きで追記されます。能動メッセージの「無視された」判定はこれらの行を読み飛ばします。未対応：チャネルのボタン、成果物へのフィードバック、ダイジェストへの成果物の掲載。実チャネルでは未検証です。
 
 ## 返信が遅いときの途中経過
 
-2026-10-08 追加（未リリース）、既定はオフ。
+2026-10-08 追加（未リリース）、既定はオン（2026-10-08 オーナー決定）。
 
 ```toml
 [channel_reply]
-interim_status = false            # 遅いターンに 1 行の状況を送る
+interim_status = true             # 遅いターンに 1 行の状況を送る。false でオフ
 interim_status_secs = 8           # 0 = オフ（最大 600）
 interim_status_show_task = false  # 従業員が実行中のタスク名を出すか
 ```
 
-外部チャネル（Telegram、Discord、Slack、LINE、WhatsApp、Feishu、Google Chat、Teams、WeCom、DingTalk。WebChat と内部セッションは対象外）の返信が `interim_status_secs` 秒たっても何も表示していないとき、その返信の進捗コールバックにモデルを使わない 1 行が送られます：待った時間と、従業員が取得済みのタスクボードの作業を別に抱えていればその経過時間。タスク名は `interim_status_show_task = true` で、かつタスクの公開範囲がそのチャネルに読み取りを許す場合だけ含まれます（チャネルの利用者は外部の顧客かもしれないため）。1 ターンに最大 1 回、進捗コールバックのないチャネルでは送りません。その場で編集できるチャネルでは、後で回答に置き換わる進捗メッセージの最初の状態として表示され、それ以外では別メッセージになります（LINE と WhatsApp ではプッシュ枠を使います）。そのため既定はオフです（`duduclaw-gateway/src/channel_reply/interim.rs`）。
+外部チャネル（Telegram、Discord、Slack、LINE、WhatsApp、Feishu、Google Chat、Teams、WeCom、DingTalk。WebChat と内部セッションは対象外）の返信が `interim_status_secs` 秒たっても何も表示していないとき、その返信の進捗コールバックにモデルを使わない 1 行が送られます：待った時間と、従業員が取得済みのタスクボードの作業を別に抱えていればその経過時間。タスク名は `interim_status_show_task = true` で、かつタスクの公開範囲がそのチャネルに読み取りを許す場合だけ含まれます（チャネルの利用者は外部の顧客かもしれないため）。1 ターンに最大 1 回、進捗コールバックのないチャネルでは送りません。その場で編集できるチャネルでは、後で回答に置き換わる進捗メッセージの最初の状態として表示され、それ以外では別メッセージになります（LINE と WhatsApp ではプッシュ枠を使います）。CLI の返信の多くは 8 秒を超えるため、そうしたチャネルではほぼ毎ターン 1 通増えます。枠が気になる場合は `interim_status = false` にするか `interim_status_secs` を上げてください。解析できない `config.toml` や型の誤りはオフ扱いです（`duduclaw-gateway/src/channel_reply/interim.rs`）。
 
 ## 行動率の計測
 

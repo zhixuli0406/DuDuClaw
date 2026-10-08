@@ -7,12 +7,13 @@
 //! reply has been running and whether the employee is also busy with a
 //! claimed task-board run (and for how long).
 //!
-//! * Off by default (`[channel_reply] interim_status = false`): most CLI
-//!   replies take longer than the 8-second default, so turning it on adds a
-//!   message to nearly every turn on channels that post progress as a new
-//!   message (and costs push quota on LINE / WhatsApp). Edit-in-place
-//!   channels (Telegram, Slack, Discord, Teams, Google Chat) show it as the
-//!   first state of the progress message that the answer later replaces.
+//! * On by default (owner decision 2026-10-08; `[channel_reply]
+//!   interim_status = false` turns it off). Cost of the default: most CLI
+//!   replies take longer than the 8-second delay, so channels that post
+//!   progress as a new message get one extra message on nearly every turn
+//!   (push quota on LINE / WhatsApp). Edit-in-place channels (Telegram,
+//!   Slack, Discord, Teams, Google Chat) show it as the first state of the
+//!   progress message that the answer later replaces.
 //! * Once per turn; never for internal sessions (only the external channel
 //!   session prefixes the branding footer uses); never when the channel gave
 //!   no progress callback (a channel that cannot post interim messages).
@@ -40,26 +41,42 @@ pub struct InterimConfig {
 }
 
 impl InterimConfig {
-    /// `config.toml [channel_reply] interim_status` (bool, default false),
+    /// `config.toml [channel_reply] interim_status` (bool, default true),
     /// `interim_status_secs` (default 8, `0` = off, capped at 600) and
-    /// `interim_status_show_task` (bool, default false). Read per turn; an
-    /// unreadable file or a wrong type reads as off.
+    /// `interim_status_show_task` (bool, default false). Read per turn. No
+    /// `config.toml` or no `[channel_reply]` section ⇒ the defaults (on); a
+    /// file that exists but cannot be read or parsed, or a wrong type, reads
+    /// as off.
     pub fn from_home(home: &Path) -> Self {
         let off = Self {
             delay: None,
             show_task: false,
         };
-        let Some(table) = std::fs::read_to_string(home.join("config.toml"))
-            .ok()
-            .and_then(|s| s.parse::<toml::Table>().ok())
-        else {
+        let defaults = Self {
+            delay: Some(Duration::from_secs(DEFAULT_INTERIM_SECS)),
+            show_task: false,
+        };
+        let text = match std::fs::read_to_string(home.join("config.toml")) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return defaults,
+            Err(_) => return off,
+        };
+        let Ok(table) = text.parse::<toml::Table>() else {
             return off;
         };
-        let Some(sec) = table.get("channel_reply").and_then(|v| v.as_table()) else {
-            return off;
+        let sec = match table.get("channel_reply") {
+            None => return defaults,
+            Some(v) => match v.as_table() {
+                Some(sec) => sec,
+                None => return off,
+            },
         };
-        if sec.get("interim_status").and_then(|v| v.as_bool()) != Some(true) {
-            return off;
+        match sec.get("interim_status") {
+            None => {}
+            Some(v) => match v.as_bool() {
+                Some(true) => {}
+                _ => return off,
+            },
         }
         let secs = match sec.get("interim_status_secs") {
             None => DEFAULT_INTERIM_SECS,
@@ -239,9 +256,24 @@ mod interim_tests {
     use std::sync::Mutex;
 
     #[test]
-    fn config_defaults_off_and_reads_the_switch() {
+    fn config_defaults_on_and_reads_the_switch() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(InterimConfig::from_home(dir.path()).delay, None);
+        assert_eq!(
+            InterimConfig::from_home(dir.path()).delay,
+            Some(Duration::from_secs(8)),
+            "no config.toml"
+        );
+        for (cfg, want) in [
+            ("[gateway]\n", Some(Duration::from_secs(8))),
+            ("[channel_reply]\ninterim_status_secs = 3\n", Some(Duration::from_secs(3))),
+            ("[channel_reply]\ninterim_status = false\n", None),
+            ("[channel_reply]\ninterim_status = \"yes\"\n", None),
+            ("channel_reply = 1\n", None),
+            ("not = [valid", None),
+        ] {
+            std::fs::write(dir.path().join("config.toml"), cfg).unwrap();
+            assert_eq!(InterimConfig::from_home(dir.path()).delay, want, "{cfg}");
+        }
         std::fs::write(
             dir.path().join("config.toml"),
             "[channel_reply]\ninterim_status = true\n",
