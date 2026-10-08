@@ -7,6 +7,7 @@ use std::cell::{Cell, RefCell};
 thread_local! {
     static CALLS: Cell<usize> = const { Cell::new(0) };
     static DRY_RUN: Cell<bool> = const { Cell::new(false) };
+    static LAST_LANE: Cell<Option<bool>> = const { Cell::new(None) };
     static LAST_ROUND: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
@@ -18,6 +19,15 @@ pub(crate) fn last_round() -> Option<String> {
 
 pub(crate) fn set_last_round(v: Option<String>) {
     LAST_ROUND.with(|r| *r.borrow_mut() = v);
+}
+
+/// Whether the last dry-run call ran in the explore lane.
+pub(crate) fn last_lane() -> Option<bool> {
+    LAST_LANE.with(Cell::get)
+}
+
+pub(crate) fn set_last_lane(v: bool) {
+    LAST_LANE.with(|l| l.set(Some(v)));
 }
 
 /// While set, `dispatch_to_agent_outcome` records the call and returns a

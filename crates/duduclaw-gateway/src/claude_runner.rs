@@ -938,8 +938,8 @@ async fn call_claude_for_agent_impl(
     {
         return Err(format!(
             "explore_lane_unsupported: Agent '{agent_id}' cannot run this read-only (explore \
-             lane) task: the lane is only enforced on the Claude CLI and OpenAI-compatible \
-             runtimes"
+             lane) task: the lane is only enforced on the Claude CLI, Codex and \
+             OpenAI-compatible runtimes"
         ));
     }
 
