@@ -125,6 +125,41 @@ struct FakeState {
     /// What `screenshot` reports as the full-mask reason.
     full_mask: Mutex<Option<FullMaskReason>>,
     frame: Mutex<Option<String>>,
+    /// Keep-alive pauses / resumes (P8).
+    freezes: AtomicU32,
+    thaws: AtomicU32,
+    fail_thaw: AtomicBool,
+    /// What `page_text` answers (`None` = an empty page).
+    page_text: Mutex<Option<Result<String, String>>>,
+    /// VNC server starts, by mode.
+    vnc_starts: Mutex<Vec<&'static str>>,
+    fail_vnc: AtomicBool,
+}
+
+/// The fake container access a viewer gets.
+struct FakeLive(Arc<FakeState>);
+
+#[async_trait]
+impl live_view::LiveViewAccess for FakeLive {
+    async fn start_vnc(
+        &self,
+        mode: live_view::VncMode,
+        password: &str,
+    ) -> Result<(), ComputerUseError> {
+        assert!(live_view::valid_password(password));
+        if self.0.fail_vnc.load(Ordering::SeqCst) {
+            return Err(ComputerUseError::ApiError("no vnc".into()));
+        }
+        self.0.vnc_starts.lock().unwrap().push(mode.as_str());
+        Ok(())
+    }
+    async fn stop_vnc(&self) {
+        self.0.vnc_starts.lock().unwrap().push("stopped");
+    }
+    async fn open_relay(&self) -> Result<Box<dyn live_view::RelayStream>, ComputerUseError> {
+        let (a, _b) = tokio::io::duplex(1024);
+        Ok(Box::new(a))
+    }
 }
 
 struct FakeBackend {
@@ -182,6 +217,27 @@ impl SessionBackend for FakeBackend {
             host: (!failed).then(|| "example.com".to_string()),
             error: failed.then(|| "net::ERR_CONNECTION_REFUSED".to_string()),
         })
+    }
+    async fn freeze(&self) -> Result<(), ComputerUseError> {
+        self.state.freezes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn thaw(&self) -> Result<(), ComputerUseError> {
+        if self.state.fail_thaw.load(Ordering::SeqCst) {
+            return Err(ComputerUseError::ApiError("no".into()));
+        }
+        self.state.thaws.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn page_text(&self) -> Result<String, ComputerUseError> {
+        match self.state.page_text.lock().unwrap().clone() {
+            None => Ok(String::new()),
+            Some(Ok(t)) => Ok(t),
+            Some(Err(e)) => Err(ComputerUseError::ApiError(e)),
+        }
+    }
+    fn live_view(&self) -> Option<Arc<dyn live_view::LiveViewAccess>> {
+        Some(Arc::new(FakeLive(Arc::clone(&self.state))))
     }
     fn control(&self) -> Arc<OrchestratorControl> {
         Arc::clone(&self.control)
@@ -2519,6 +2575,9 @@ mod workspace_cases;
 
 #[path = "tests/workspace_docker.rs"]
 mod workspace_docker;
+
+#[path = "tests/live_cases.rs"]
+mod live_cases;
 
 // ── 2026-10: action rules on the computer-use route ─────────────────────
 

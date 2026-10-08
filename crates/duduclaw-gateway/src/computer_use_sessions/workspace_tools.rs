@@ -261,6 +261,8 @@ impl ComputerUseSessions {
         // A stopped or paused session, or a threat level above GREEN,
         // refuses writes (reads and lists stay allowed).
         write_gate(&entry.control, &self.home)?;
+        // A human takeover or an injection hold refuses writes too (P8).
+        super::live_hold_problem(&entry.shared)?;
         if super::read_threat_level(&self.home).await != super::ThreatLevel::Green {
             return Err(super::paused());
         }

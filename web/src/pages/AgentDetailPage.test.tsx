@@ -72,6 +72,23 @@ describe('AgentDetailPage', () => {
     expect(screen.getByRole('tab', { name: 'Records' })).toBeInTheDocument();
   });
 
+  it('adds the computer tab only for an employee with computer use', async () => {
+    const { unmount } = renderAt('my-bot');
+    await screen.findByRole('heading', { name: 'My Bot' });
+    expect(screen.queryByRole('tab', { name: 'Computer' })).not.toBeInTheDocument();
+    unmount();
+    mockWsClient.call.mockResolvedValue({
+      ...DETAIL,
+      capabilities: { computer_use: true },
+      tasks: [],
+      events: [],
+      agents: [],
+      active: false,
+    });
+    renderAt('my-bot');
+    expect(await screen.findByRole('tab', { name: 'Computer' })).toBeInTheDocument();
+  });
+
   it('shows the runtime-true GVU toggle on the overview summary card', async () => {
     mockWsClient.call.mockResolvedValue({
       ...DETAIL,

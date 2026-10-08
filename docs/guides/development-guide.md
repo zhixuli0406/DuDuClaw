@@ -247,23 +247,22 @@ docker pull ghcr.io/zhixuli0406/duduclaw-computer-use:v<version>
 #                    image = "duduclaw-computer-use:latest"
 docker build -f container/Dockerfile.computer-use -t duduclaw-computer-use:latest .
 
-# Start it by hand with VNC to watch the virtual display
-# (shown with the local tag; the pulled ghcr image works the same way).
-# Publishing a port needs a network, so the domain filter needs NET_ADMIN,
-# and a non-empty ALLOWED_DOMAINS so that VNC reply packets are let out.
-docker run --rm -p 5900:5900 \
-  --cap-add=NET_ADMIN \
-  -e ALLOWED_DOMAINS=example.com \
+# Start it by hand (no network, like the gateway does), then start the
+# on-demand VNC server and watch it. The VNC server listens only on a unix
+# socket inside the container; socat on the host bridges one local port to
+# the relay (shown with the local tag; the pulled ghcr image works the same way).
+docker run -d --rm --name duduclaw-cu-debug --network=none \
   -e DISPLAY_SIZE=1280x800 \
-  -e VNC_ENABLED=true \
-  -e VNC_PASSWORD=debug123 \
   duduclaw-computer-use:latest
+printf 'Debug123\n' | docker exec -i duduclaw-cu-debug duduclaw-vnc start viewonly
+socat TCP-LISTEN:5900,bind=127.0.0.1,reuseaddr,fork \
+  EXEC:'docker exec -i duduclaw-cu-debug duduclaw-vnc-relay'
 
-# Connect with a VNC client to watch
+# Connect with a VNC client (password Debug123) to watch
 # macOS: open vnc://localhost:5900
 ```
 
-The image (about 1.09 GB) is built on `debian:trixie-slim` with the Debian `chromium` package, Xvfb, `openbox` as window manager, optional VNC (`x11vnc`), `xdotool`, `scrot`, the domain filter, a `xdotool getactivewindow` health check and Python 3 for the `duduclaw-eval-dom` helper (section 3.5). Openbox and Chromium run as the unprivileged `sandbox` user; the entrypoint stays root only to program iptables. Chromium starts in kiosk mode at 0,0 covering the whole virtual display with device scale factor 1, so page coordinates equal screenshot pixels, and its DevTools port listens on 127.0.0.1 inside the container only. If the browser exits (for example the agent closed the window), the entrypoint restarts it. Chromium reads a managed policy from `container/scripts/chromium-policy.json` (no local-network or loopback access for pages, no incognito/guest windows, no file dialogs, printing or downloads, pop-ups and device permissions blocked, `file://` / `chrome://` / `devtools://` / `view-source:` / `javascript://` blocked; see [Browser automation](../features/08-browser-automation.md) for the list). `DeveloperToolsAvailability` is left unset on purpose: setting it also disables the loopback DevTools protocol the helpers need. `duduclaw-navigate` reads the URL from stdin only (`printf 'https://example.com/\n' | docker exec -i <container> duduclaw-navigate`); any argument is a usage error. Screenshots are captured to `/tmp/duduclaw-root/screen.png` (root-owned directory, mode 0700, created before the browser starts), where the Chromium log also lives.
+The image (about 1.09 GB) is built on `debian:trixie-slim` with the Debian `chromium` package, Xvfb, `openbox` as window manager, on-demand VNC (`x11vnc`, unix socket only, started by `duduclaw-vnc`), `xdotool`, `scrot`, the domain filter, a `xdotool getactivewindow` health check and Python 3 for the `duduclaw-eval-dom` helper (section 3.5). Openbox and Chromium run as the unprivileged `sandbox` user; the entrypoint stays root only to program iptables. Chromium starts in kiosk mode at 0,0 covering the whole virtual display with device scale factor 1, so page coordinates equal screenshot pixels, and its DevTools port listens on 127.0.0.1 inside the container only. If the browser exits (for example the agent closed the window), the entrypoint restarts it. Chromium reads a managed policy from `container/scripts/chromium-policy.json` (no local-network or loopback access for pages, no incognito/guest windows, no file dialogs, printing or downloads, pop-ups and device permissions blocked, `file://` / `chrome://` / `devtools://` / `view-source:` / `javascript://` blocked; see [Browser automation](../features/08-browser-automation.md) for the list). `DeveloperToolsAvailability` is left unset on purpose: setting it also disables the loopback DevTools protocol the helpers need. `duduclaw-navigate` reads the URL from stdin only (`printf 'https://example.com/\n' | docker exec -i <container> duduclaw-navigate`); any argument is a usage error. Screenshots are captured to `/tmp/duduclaw-root/screen.png` (root-owned directory, mode 0700, created before the browser starts), where the Chromium log also lives.
 
 Which image a session runs: by default `ghcr.io/zhixuli0406/duduclaw-computer-use:v<gateway version>`, published by `.github/workflows/computer-use-image.yml` on git tags `v*` (or manual dispatch). That workflow builds `linux/amd64` and `linux/arm64` on native runners and smoke-tests each build with the gateway's own container flags (window manager up, a screenshot, `duduclaw-eval-dom` returning `[]`) before pushing `:<tag>` and `:latest`. It first runs on the first release tag after v1.66.1, so no published image exists for v1.66.1 or earlier, and `scripts/release.sh verify` does not check it. The only override is the global `config.toml [computer_use] image = "<ref>"` (a digest reference is accepted); there is no per-agent image key. An invalid `[computer_use]` section makes computer use unavailable with a message and never falls back to the default (`crates/duduclaw-gateway/src/computer_use_image.rs`). The image is never pulled automatically: `docker run` carries `--pull never` and a presence check (`docker image inspect`) runs before each session. A machine that only has a locally built `duduclaw-computer-use:latest` (the old default) must pull the versioned image or set the override key.
 

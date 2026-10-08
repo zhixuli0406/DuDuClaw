@@ -1948,7 +1948,29 @@ pub struct ComputerUseCapConfig {
     /// or wrong-typed = false.
     #[serde(deserialize_with = "crate::lenient::or_default")]
     pub workspace: bool,
+    /// Keep an idle tool-driven session for this many minutes with its
+    /// container paused (`docker pause`) instead of ending it after the
+    /// idle timeout; resumed on the next tool call or dashboard viewer.
+    /// 0 (default, also for a missing or wrong-typed value) = end after the
+    /// idle timeout as before. Read through [`Self::keep_alive_minutes`],
+    /// which caps it at [`COMPUTER_USE_MAX_KEEP_ALIVE_MINUTES`].
+    /// `max_session_minutes` and `max_actions` still apply while paused.
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub keep_alive_minutes: u32,
+    /// Minutes without any viewer input after which a dashboard takeover
+    /// lease expires and control returns to the employee. 0 or missing =
+    /// [`COMPUTER_USE_DEFAULT_TAKEOVER_IDLE_MINUTES`]; read through
+    /// [`Self::takeover_idle_minutes`] (capped at 60).
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub takeover_idle_minutes: u32,
 }
+
+/// Upper bound on `computer_use_config.keep_alive_minutes`.
+pub const COMPUTER_USE_MAX_KEEP_ALIVE_MINUTES: u32 = 240;
+/// Default takeover idle limit (minutes without viewer input).
+pub const COMPUTER_USE_DEFAULT_TAKEOVER_IDLE_MINUTES: u32 = 10;
+/// Upper bound on `computer_use_config.takeover_idle_minutes`.
+pub const COMPUTER_USE_MAX_TAKEOVER_IDLE_MINUTES: u32 = 60;
 
 /// Most hosts a computer-use navigation allowlist may hold (after
 /// de-duplication); later entries are dropped.
@@ -1984,6 +2006,21 @@ pub fn normalize_navigation_host(entry: &str) -> Option<String> {
 }
 
 impl ComputerUseCapConfig {
+    /// The keep-alive window in minutes, capped at
+    /// [`COMPUTER_USE_MAX_KEEP_ALIVE_MINUTES`] (0 = off).
+    pub fn keep_alive_minutes(&self) -> u32 {
+        self.keep_alive_minutes.min(COMPUTER_USE_MAX_KEEP_ALIVE_MINUTES)
+    }
+
+    /// The takeover idle limit in minutes: the default when 0, at most
+    /// [`COMPUTER_USE_MAX_TAKEOVER_IDLE_MINUTES`].
+    pub fn takeover_idle_minutes(&self) -> u32 {
+        match self.takeover_idle_minutes {
+            0 => COMPUTER_USE_DEFAULT_TAKEOVER_IDLE_MINUTES,
+            n => n.min(COMPUTER_USE_MAX_TAKEOVER_IDLE_MINUTES),
+        }
+    }
+
     /// The usable navigation allowlist: every entry normalized with
     /// [`normalize_navigation_host`], duplicates removed, capped at
     /// [`COMPUTER_USE_MAX_ALLOWED_DOMAINS`]. Each dropped entry logs a
@@ -2031,6 +2068,8 @@ impl Default for ComputerUseCapConfig {
             auto_confirm_trusted: false,
             allowed_domains: Vec::new(),
             workspace: false,
+            keep_alive_minutes: 0,
+            takeover_idle_minutes: 0,
         }
     }
 }
@@ -5672,6 +5711,25 @@ credit_rate = 2.0
         assert_eq!(got.hosts.len(), COMPUTER_USE_MAX_ALLOWED_DOMAINS);
         assert_eq!(got.hosts[0], "h0.example.com");
         assert_eq!(got.dropped.len(), 5);
+    }
+
+    #[test]
+    fn computer_use_keep_alive_and_takeover_limits_default_cap_and_tolerate_wrong_types() {
+        let parse = |t: &str| toml::from_str::<CapabilitiesConfig>(t).unwrap();
+        let none = parse("computer_use = true\n").computer_use_config;
+        assert_eq!(none.keep_alive_minutes(), 0);
+        assert_eq!(none.takeover_idle_minutes(), COMPUTER_USE_DEFAULT_TAKEOVER_IDLE_MINUTES);
+        let set = parse("[computer_use_config]\nkeep_alive_minutes = 30\ntakeover_idle_minutes = 5\n")
+            .computer_use_config;
+        assert_eq!((set.keep_alive_minutes(), set.takeover_idle_minutes()), (30, 5));
+        let big = parse("[computer_use_config]\nkeep_alive_minutes = 9999\ntakeover_idle_minutes = 999\n")
+            .computer_use_config;
+        assert_eq!(big.keep_alive_minutes(), COMPUTER_USE_MAX_KEEP_ALIVE_MINUTES);
+        assert_eq!(big.takeover_idle_minutes(), COMPUTER_USE_MAX_TAKEOVER_IDLE_MINUTES);
+        let wrong = parse("[computer_use_config]\nkeep_alive_minutes = \"forever\"\nmax_actions = 9\n")
+            .computer_use_config;
+        assert_eq!(wrong.keep_alive_minutes(), 0);
+        assert_eq!(wrong.max_actions, 9);
     }
 
     #[test]

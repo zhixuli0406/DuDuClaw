@@ -132,7 +132,25 @@ jobs:
             echo "::error::duduclaw-navigate without network returned rc=$nav_rc '$nav', expected a non-zero exit and one JSON line with ok=false"
             exit 1
           fi
-          echo "smoke test passed: display ready, screenshot taken, DOM helper answered [], navigate failed cleanly ($nav)"
+          # Live view (P8): the on-demand VNC server listens on its unix
+          # socket only, the relay speaks RFB, the browser user cannot reach
+          # the socket, and no TCP port is listening.
+          printf 'Smoke123\n' | docker exec -i "$c" duduclaw-vnc start viewonly
+          banner="$( (sleep 2) | docker exec -i "$c" duduclaw-vnc-relay | head -c 11 || true)"
+          if [ "$banner" != "RFB 003.008" ]; then
+            echo "::error::duduclaw-vnc-relay answered '$banner', expected an RFB 3.8 banner"
+            exit 1
+          fi
+          if docker exec -u sandbox "$c" python3 -c 'import socket; s=socket.socket(socket.AF_UNIX); s.connect("/tmp/duduclaw-root/vnc.sock")' 2>/dev/null; then
+            echo "::error::the sandbox user reached the VNC socket"
+            exit 1
+          fi
+          if docker exec "$c" sh -c 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null' | awk '$4 == "0A"' | grep -Eq ':(170C|17[0-9A-F]{2}) '; then
+            echo "::error::a VNC TCP port is listening"
+            exit 1
+          fi
+          docker exec "$c" duduclaw-vnc stop
+          echo "smoke test passed: display ready, screenshot taken, DOM helper answered [], navigate failed cleanly ($nav), live view on its unix socket only"
 
       # Push by digest only: the per-arch image gets no tag of its own, the
       # merge job below is the only thing that names it. Same builder, same

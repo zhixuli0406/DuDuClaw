@@ -16,6 +16,10 @@
 //!   Containers without the workspace label follow the rules above only.
 //!   Removal never uses `-v`, so a bind-mounted workspace is never touched.
 //!
+//! - A `paused` container (P8 keep-alive) past its deadline label is removed
+//!   without the grace period, by the gateway holding the instance lock
+//!   ([`paused_past_deadline`]); it is unpaused first.
+//!
 //! Runs at gateway start and every [`SWEEP_INTERVAL`]; each pass first
 //! (only in the gateway holding the home's instance lock; the workspace rule
 //! above is gated the same way, the orphan rule is not) reconciles the
@@ -101,6 +105,21 @@ pub fn removable(container: &Listed, now: u64) -> bool {
         return true;
     }
     container.deadline.is_some_and(|deadline| now > deadline.saturating_add(GRACE.as_secs()))
+}
+
+/// The keep-alive rule (P8, single-gateway maintenance): a computer-use
+/// container that is `paused` and past its deadline label is removed at
+/// once, without the [`GRACE`] the orphan rule gives a running container (a
+/// paused container cannot be finishing anything). Paused containers before
+/// their deadline belong to a live session in some gateway and are left
+/// alone; the orphan rule still removes them [`GRACE`] after the deadline in
+/// every gateway.
+pub fn paused_past_deadline(container: &Listed, now: u64) -> bool {
+    let is_cu = container
+        .name
+        .strip_prefix("duduclaw-cu-")
+        .is_some_and(|rest| rest.len() == 32 && rest.bytes().all(|c| c.is_ascii_hexdigit()));
+    is_cu && container.state == "paused" && container.deadline.is_some_and(|d| now > d)
 }
 
 /// The workspace rule (design §4.6 step 2): a computer-use container with
@@ -230,7 +249,11 @@ pub fn select_removable<'a>(
 ) -> Vec<&'a Listed> {
     containers
         .iter()
-        .filter(|c| removable(c, now) || (maintain && stale_workspace_container(c, &live_epoch)))
+        .filter(|c| {
+            removable(c, now)
+                || (maintain
+                    && (paused_past_deadline(c, now) || stale_workspace_container(c, &live_epoch)))
+        })
         .take(MAX_REMOVALS_PER_SWEEP)
         .collect()
 }
@@ -287,6 +310,12 @@ pub async fn sweep_once_with(home: &Path, maintain: bool) -> usize {
     };
     let mut removed = 0;
     for container in select_removable(&containers, now, maintain, live_epoch) {
+        // A paused (keep-alive) container is resumed first so the forced
+        // removal can kill it on every Docker version.
+        if container.state == "paused" {
+            let unpause = ["unpause", container.id.as_str()];
+            let _ = docker_output(&unpause, DOCKER_CALL_TIMEOUT, "Computer-use sweep unpause").await;
+        }
         let rm = ["rm", "--force", container.id.as_str()];
         match docker_output(&rm, DOCKER_CALL_TIMEOUT, "Computer-use sweep remove").await {
             Ok(out) if out.status.success() => removed += 1,

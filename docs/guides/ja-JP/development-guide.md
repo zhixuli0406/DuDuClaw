@@ -234,23 +234,22 @@ docker pull ghcr.io/zhixuli0406/duduclaw-computer-use:v<バージョン>
 #                    image = "duduclaw-computer-use:latest"
 docker build -f container/Dockerfile.computer-use -t duduclaw-computer-use:latest .
 
-# 手動で起動し、VNC で仮想ディスプレイを確認
-# （例はローカルタグ。pull した ghcr イメージでも同じです）。
-# ポートの公開にはネットワークが必要なので、ドメインフィルタには NET_ADMIN が必要です。
-# また ALLOWED_DOMAINS が空でない場合だけ VNC の応答パケットが外に出られます。
-docker run --rm -p 5900:5900 \
-  --cap-add=NET_ADMIN \
-  -e ALLOWED_DOMAINS=example.com \
+# 手動で起動し（gateway と同じくネットワークなし）、オンデマンドの VNC
+# サーバーを起動して確認します。VNC サーバーはコンテナ内の unix socket
+# だけで待ち受けるため、ホスト側は socat でローカルポートを relay に
+# つなぎます（例はローカルタグ。pull した ghcr イメージでも同じです）。
+docker run -d --rm --name duduclaw-cu-debug --network=none \
   -e DISPLAY_SIZE=1280x800 \
-  -e VNC_ENABLED=true \
-  -e VNC_PASSWORD=debug123 \
   duduclaw-computer-use:latest
+printf 'Debug123\n' | docker exec -i duduclaw-cu-debug duduclaw-vnc start viewonly
+socat TCP-LISTEN:5900,bind=127.0.0.1,reuseaddr,fork \
+  EXEC:'docker exec -i duduclaw-cu-debug duduclaw-vnc-relay'
 
-# VNC クライアントで接続して確認
+# VNC クライアントで接続して確認（パスワード Debug123）
 # macOS: open vnc://localhost:5900
 ```
 
-イメージ（約 1.09 GB）は `debian:trixie-slim` をベースに、Debian の `chromium` パッケージ、Xvfb、ウィンドウマネージャ `openbox`、任意の VNC（`x11vnc`）、`xdotool`、`scrot`、ドメインフィルタ、`xdotool getactivewindow` によるヘルスチェック、`duduclaw-eval-dom` ヘルパー用の Python 3（3.5 節を参照）を含みます。Openbox と Chromium は非特権ユーザー `sandbox` で動きます。entrypoint が root のままなのは iptables を設定するためだけです。Chromium はキオスクモードで 0,0 から仮想ディスプレイ全体を覆い、デバイススケールファクタは 1 に固定されるため、ページ座標がそのままスクリーンショットのピクセルになります。DevTools ポートはコンテナ内の 127.0.0.1 だけで待ち受けます。ブラウザが終了した場合（エージェントがウィンドウを閉じた場合など）、entrypoint が再起動します。Chromium は `container/scripts/chromium-policy.json` のマネージドポリシーを読み込みます（ページからのローカルネットワークや loopback へのアクセスなし、シークレット／ゲストウィンドウなし、ファイルダイアログ・印刷・ダウンロードなし、ポップアップとデバイス権限はブロック、`file://` / `chrome://` / `devtools://` / `view-source:` / `javascript://` はブロック。一覧は[ブラウザ自動化](../../features/ja-JP/08-browser-automation.md)を参照）。`DeveloperToolsAvailability` は意図的に未設定にしています。設定すると、ヘルパーが必要とする loopback の DevTools プロトコルまで無効になるためです。`duduclaw-navigate` は URL を stdin からのみ読みます（`printf 'https://example.com/\n' | docker exec -i <container> duduclaw-navigate`）。引数を渡すと使い方エラーになります。スクリーンショットは `/tmp/duduclaw-root/screen.png`（root 所有でモード 0700、ブラウザの起動前に作成されるディレクトリ）に保存され、Chromium のログもそこにあります。
+イメージ（約 1.09 GB）は `debian:trixie-slim` をベースに、Debian の `chromium` パッケージ、Xvfb、ウィンドウマネージャ `openbox`、オンデマンドの VNC（`x11vnc`、unix socket のみ、`duduclaw-vnc` が起動）、`xdotool`、`scrot`、ドメインフィルタ、`xdotool getactivewindow` によるヘルスチェック、`duduclaw-eval-dom` ヘルパー用の Python 3（3.5 節を参照）を含みます。Openbox と Chromium は非特権ユーザー `sandbox` で動きます。entrypoint が root のままなのは iptables を設定するためだけです。Chromium はキオスクモードで 0,0 から仮想ディスプレイ全体を覆い、デバイススケールファクタは 1 に固定されるため、ページ座標がそのままスクリーンショットのピクセルになります。DevTools ポートはコンテナ内の 127.0.0.1 だけで待ち受けます。ブラウザが終了した場合（エージェントがウィンドウを閉じた場合など）、entrypoint が再起動します。Chromium は `container/scripts/chromium-policy.json` のマネージドポリシーを読み込みます（ページからのローカルネットワークや loopback へのアクセスなし、シークレット／ゲストウィンドウなし、ファイルダイアログ・印刷・ダウンロードなし、ポップアップとデバイス権限はブロック、`file://` / `chrome://` / `devtools://` / `view-source:` / `javascript://` はブロック。一覧は[ブラウザ自動化](../../features/ja-JP/08-browser-automation.md)を参照）。`DeveloperToolsAvailability` は意図的に未設定にしています。設定すると、ヘルパーが必要とする loopback の DevTools プロトコルまで無効になるためです。`duduclaw-navigate` は URL を stdin からのみ読みます（`printf 'https://example.com/\n' | docker exec -i <container> duduclaw-navigate`）。引数を渡すと使い方エラーになります。スクリーンショットは `/tmp/duduclaw-root/screen.png`（root 所有でモード 0700、ブラウザの起動前に作成されるディレクトリ）に保存され、Chromium のログもそこにあります。
 
 セッションが使うイメージ：既定は `ghcr.io/zhixuli0406/duduclaw-computer-use:v<gateway のバージョン>` で、`.github/workflows/computer-use-image.yml` が git タグ `v*`（または手動実行）で公開します。このワークフローはネイティブランナー上で `linux/amd64` と `linux/arm64` をそれぞれビルドし、`:<tag>` と `:latest` を push する前に gateway 自身のコンテナフラグで各ビルドをスモークテスト（ウィンドウマネージャの起動、スクリーンショット 1 枚、`duduclaw-eval-dom` が `[]` を返すこと）します。初めて動くのは v1.66.1 の次のリリースタグなので、v1.66.1 以前には公開済みイメージがなく、`scripts/release.sh verify` もこれを確認しません。上書きはグローバルな `config.toml [computer_use] image = "<ref>"`（digest 参照も可）だけで、エージェントごとのイメージキーはありません。`[computer_use]` セクションが無効な場合、Computer Use はメッセージ付きで利用不可になり、既定値には戻りません（`crates/duduclaw-gateway/src/computer_use_image.rs`）。イメージは自動で pull されません：`docker run` は `--pull never` を付け、各セッションの前に存在確認（`docker image inspect`）を行います。ローカルビルドの `duduclaw-computer-use:latest`（旧既定値）しかないマシンでは、バージョン付きイメージを pull するか上書きキーを設定する必要があります。
 
