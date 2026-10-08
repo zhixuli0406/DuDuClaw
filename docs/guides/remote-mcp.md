@@ -27,6 +27,48 @@ takes you to DuDuClaw's authorization page. Paste in an **internal MCP API key**
 `config.toml [mcp_keys]` with `is_external = false`) and click "Agree to connect" (同意連線) to
 finish.
 
+## Use it from ChatGPT
+
+ChatGPT can add DuDuClaw as a custom connector (an "app" in developer mode).
+Nothing is published to any store; the connector exists only in your ChatGPT
+account.
+
+1. Expose `duduclaw http-server` at a fixed **https** address (a reverse proxy
+   or a named tunnel; ChatGPT reaches it from OpenAI's servers, so loopback or
+   a LAN address does not work).
+2. In ChatGPT, turn on developer mode (Settings → Apps & Connectors →
+   Advanced settings; which plans offer it depends on OpenAI), then create a
+   connector with the server URL `https://<your-address>/mcp` and OAuth as
+   the authentication.
+3. ChatGPT discovers the authorization server (RFC 9728 → RFC 8414) and
+   registers itself, either through dynamic client registration
+   (`POST /oauth/register`) or with a Client ID Metadata Document (its
+   `client_id` is an https URL that DuDuClaw fetches; supported since
+   2026-10-08, see below). Its redirect URI, as given in third-party guides,
+   is `https://chatgpt.com/connector_platform_oauth_redirect`; DuDuClaw
+   accepts any https redirect URI, so nothing has to be configured for it.
+4. DuDuClaw's consent page opens: paste an **internal** MCP API key and
+   approve.
+
+What ChatGPT gets: the same external-client tier as every OAuth client
+(below) — the base tools plus at most `memory:read`, `memory:write`,
+`wiki:read`, `wiki:write` and `messaging:send`. Connector, execution, roster
+and Admin tools are never exposed over OAuth.
+
+Client ID Metadata Documents: when a `client_id` is an `https://` URL with a
+path and is not a registered id, DuDuClaw fetches it (public addresses only,
+pinned, no redirects, 5 s, 5 KiB, cached for an hour). The document's
+`client_id` must equal the URL, its `redirect_uris` must be https (or
+loopback http) URLs and include the one used, and only public clients
+(`token_endpoint_auth_method` absent or `none`) are accepted. The
+authorization server metadata advertises
+`client_id_metadata_document_supported: true`.
+
+Not verified: no real ChatGPT account was used. The redirect URI and the
+registration methods come from third-party connector guides (OpenAI's own
+pages could not be fetched while writing this); the flow is tested against
+local requests only.
+
 ## Authorization model (read this part)
 
 Access tokens issued through OAuth are **always treated as "external client" tier**, sharing
@@ -51,7 +93,7 @@ token is stored on disk only as a SHA-256 hash (`~/.duduclaw/mcp_oauth_issued.js
 | `POST /mcp` | Standard MCP endpoint (initialize / tools/list / tools/call / ping) |
 | `GET /.well-known/oauth-protected-resource` | RFC 9728 resource metadata (a 401's `WWW-Authenticate` header points here) |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 authorization server metadata |
-| `POST /oauth/register` | RFC 7591 dynamic client registration (public client) |
+| `POST /oauth/register` | RFC 7591 dynamic client registration (public client); an unregistered https `client_id` is read as a Client ID Metadata Document |
 | `GET /oauth/authorize` → `POST /oauth/decision` | Authorization code flow plus the operator consent page |
 | `POST /oauth/token` | Token issuance / refresh |
 | `POST /mcp/v1/call`, `GET /mcp/v1/stream` | The existing DuDuClaw REST/SSE surface (unchanged) |

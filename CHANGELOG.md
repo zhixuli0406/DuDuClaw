@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+- **第三方 MCP 工具的動作類型與動作規則**：`.mcp.json` 其他 MCP server 的工具，依其 `tools/list` 的 `annotations` 分類（`destructiveHint` ⇒ `delete`；`readOnlyHint` 只有在 `agent.toml [capabilities] trusted_read_hint_servers` 列出該伺服器時才算 `read`，否則 `modify`；沒有標記一律 `modify`），並在 `duduclaw mcp-proxy` 與 `duduclaw mcp-remote-bridge` 套用 `action_rules`：`block` 從員工看到的 `tools/list` 隱藏並以 `-32003` 拒絕（稽核 `third_party_tool_refused`），`ask` 走 ApprovalBroker（核准系統不可用即拒絕，稽核 `third_party_tool_approval`），探索通道只開放 `read`。工具規則可寫 `<伺服器>.<工具>`。啟動時的 `.mcp.json` 改寫在員工有 `action_rules` 或處於探索通道時也會把 stdio 伺服器包進 proxy（原本只有遮蔽啟用時），心跳主動檢查的 spawn 一併改用。儀表板 `MCP → 遠端伺服器` 新增「第三方工具與其動作類型」（RPC `mcp.tool_effects`，管理者）。只有 Claude CLI 涉及；`url`／`type` 項目不涵蓋。
+- **MCP Events 接收端**（草案 MCP Events 擴充的 webhook 模式，依 Triggers & Events 工作小組設計草稿實作）：管理者 RPC `mcp.events_subscribe`／`_list`／`_unsubscribe`／`_rotate`，對已連線的遠端伺服器呼叫 `events/subscribe`，事件送到一律掛載的 `POST /webhook/mcp-events/{id}`（不認得的 id 回 404）。每個訂閱有自己的 `whsec_` 簽章金鑰（以本機金鑰檔加密，可更換、可撤銷），投遞依 Standard Webhooks 以常數時間驗證，5 分鐘時間窗、重播快取、256 KiB 上限、每訂閱每分鐘 120 次；回應驗證挑戰，記錄 `gap`／`terminated`，排程在授權到期前重新訂閱。接受的事件寫成 `events.db` 的 `mcp.event`（`input_guard` 掃描、資料上限 16 KiB），自動化規則新增觸發 `mcp_event`，持續責任新增事件來源 `mcp.event`。事件啟動的工作預設在唯讀探索通道執行（佇列新增 `lane` 欄位、Claude CLI 帶 `DUDUCLAW_LANE=explore` 與唯讀內建工具），訂閱時明確允許才用一般模式；非 Claude runtime 的員工無法執行這類工作。需要 `config.toml [mcp_events] public_base_url`。儀表板「遠端伺服器的事件」區塊，三種語言。
+- **遠端 MCP 橋接補強**：連線時可設定額外請求標頭（加密保存，不進 `.mcp.json`／argv／環境變數；`Authorization`、`Host`、`Content-Length`、`Mcp-Session-Id` 等傳輸用標頭與含 CR/LF 的值一律拒絕）；中斷連線或移除時，若授權伺服器宣告 `revocation_endpoint` 則在本機刪除後於背景依 RFC 7009 撤銷權杖（稽核 `remote_mcp_token_revocation`）；可逐一開啟的伺服器主動推送 `GET` 串流（預設關，帶 `Last-Event-ID` 續接，405/404 停止）。
+- **`duduclaw http-server` 接受 Client ID Metadata Document**：未註冊、帶路徑的 https `client_id` 會被讀取為用戶端中繼資料（只連公開位址、5 秒、5 KiB、快取一小時、`client_id` 必須相符、只接受公開用戶端），授權伺服器中繼資料宣告 `client_id_metadata_document_supported`。`docs/guides/remote-mcp.md` 新增「從 ChatGPT 使用」（三種語言）。
+
+### Not verified
+- 以上都只對本機假伺服器測試：沒有真的 MCP Events 提供者、沒有真的 ChatGPT 帳號、沒有真的會撤銷權杖或要求自訂標頭的服務商。MCP Events 未實作 poll／push、cursor 重播、`deliveryStatus` 與 `v1a` 簽章。
+
 ## [1.71.0] - 2026-10-07 — MCP 獨立模式（mcp init）、外部金鑰的 MCP 授權修補、預設英文 README、商業連結改導總經銷
 
 ### Added
